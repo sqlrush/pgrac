@@ -5739,7 +5739,7 @@ XLogFileRead(XLogSegNo segno, int emode, TimeLineID tli,
 	 * An absent segment may be native EOF; an absent identity never is. */
 	if (cluster_enabled && cluster_shared_config)
 	{
-		ClusterWalDurablePrefixRef input;
+		ClusterWalSourceRef input;
 		ClusterControlRootResult result;
 
 		if (source != XLOG_FROM_PG_WAL || !cluster_wal_thread_restart_v2_ref(&input))

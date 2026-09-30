@@ -50,7 +50,7 @@ static PGAlignedBlock buffers[3], written, image;
 #define space buffers[0]
 #define source_page buffers[1]
 #define target_page buffers[2]
-static ClusterWalDurablePrefixRef ref;
+static ClusterWalSourceRef ref;
 static ClusterSpaceIdentity identity;
 static RfPageVersionEdgeEntryV1 entry;
 static ForkNumber test_fork;
@@ -108,14 +108,14 @@ RecoveryInProgress(void)
 }
 
 bool
-cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
 	*out = ref;
 	return true;
 }
 
 bool
-cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
 {
 	(void)out;
 	abort();

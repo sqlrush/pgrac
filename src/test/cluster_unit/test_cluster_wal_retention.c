@@ -26,7 +26,7 @@
 #include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_wal_retention.h"
-#include "cluster/cluster_wal_durable_prefix.h"
+#include "cluster/cluster_wal_source.h"
 #include "common/cryptohash.h"
 #include "storage/lock.h"
 #include "utils/resowner.h"
@@ -89,11 +89,11 @@ cluster_lock_owner_request_release(const ClusterLockAcquireRequest *request)
 	return cluster_lock_acquire_s6_release(request);
 }
 static bool fake_v2_ref_ready;
-static ClusterWalDurablePrefixRef fake_v2_ref;
+static ClusterWalSourceRef fake_v2_ref;
 ResourceOwner CurrentResourceOwner = (ResourceOwner)(uintptr_t)0x1;
 
 bool
-cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
 	memset(out, 0, sizeof(*out));
 	if (!fake_v2_ref_ready)

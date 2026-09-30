@@ -1077,7 +1077,7 @@ static bool ut_recovery_in_progress = false;
  * simulation. Author: SqlRush <sqlrush@gmail.com> */
 static bool ut_startup_writer_installed;
 bool
-cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
 	memset(out, 0, sizeof(*out));
 	if (!ut_startup_writer_installed)

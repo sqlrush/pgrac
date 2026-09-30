@@ -5,10 +5,9 @@
 #define CLUSTER_WAL_TAIL_H
 
 #include "catalog/pg_control.h"
-#include "cluster/cluster_wal_durable_prefix.h"
+#include "cluster/cluster_wal_source.h"
 
 typedef struct ClusterWalTailObservation {
-	ClusterWalDurablePrefix durable_prefix;
 	XLogRecPtr complete_end;
 	XLogRecPtr last_record_start;
 	pg_crc32c last_record_crc;
@@ -20,11 +19,11 @@ typedef bool (*ClusterWalRecordVisitor)(struct XLogReaderState *reader, void *ar
 
 /* Read-only provisional records: a visitor must not publish or mutate shared
  * state. Later input/revalidation failure invalidates every record it saw.
- * A real EMPTY promise is allowed only against this exact sealed root cut;
- * missing promises, different checkpoints or complete suffixes still refuse.
+ * The exact checkpoint and last-record cut must match the selected root;
+ * missing required records and any complete suffix outside that cut refuse.
  * Author: SqlRush <sqlrush@gmail.com> */
 extern ClusterControlRootResult
-cluster_wal_tail_visit_sealed(const char *wal_root, const ClusterWalDurablePrefixRef *ref,
+cluster_wal_tail_visit_sealed(const char *wal_root, const ClusterWalSourceRef *ref,
 							  int segment_size, const ClusterControlRootSnapshot *sealed,
 							  XLogRecPtr checkpoint_start, ClusterWalRecordVisitor visitor,
 							  void *arg, ClusterWalTailObservation *out);
@@ -60,24 +59,25 @@ typedef struct ClusterWalStartupObservation {
 } ClusterWalStartupObservation;
 
 /* Read the root-selected independent stream from its fresh segment boundary.
- * Unlike ordinary tail observation this accepts an actual EMPTY prefix, not
- * an absent one. It still scans complete unpromised records. The first record
- * must have no predecessor link. No archive/local/other-generation fallback.
+ * This reports every complete native record, including a zero-record result.
+ * Only the caller's selected initializer owner and native-side census can
+ * qualify EMPTY. The first record must have no predecessor link; there is
+ * no archive/local/other-generation fallback.
  * Caller owns immutable, nonaliasing input plus retention/isolation and root
  * revalidation; provisional bootstrap reads grant none of those permissions.
  * Author: SqlRush <sqlrush@gmail.com> */
 extern ClusterControlRootResult cluster_wal_startup_observe(const char *wal_root,
-															const ClusterWalDurablePrefixRef *ref,
+															const ClusterWalSourceRef *ref,
 															int segment_size,
 															XLogRecPtr first_segment,
 															ClusterWalStartupObservation *out);
 
-/* Recovery-owner-only physical sync of the exact stream, including observed
- * unpromised records, claim, promise and directory entries. Never advances the
- * writer's promise or grants permission. Caller must own/revalidate isolation,
- * WALR and purpose-bound IR before and after this operation. */
+/* Recovery-owner-only physical sync of the observed stream, actual claim
+ * and directory entries. This grants no writer or recovery permission.
+ * Caller must own/revalidate isolation, WALR and purpose-bound IR before and
+ * after this operation. */
 extern ClusterControlRootResult cluster_wal_startup_sync(const char *wal_root,
-														 const ClusterWalDurablePrefixRef *ref,
+														 const ClusterWalSourceRef *ref,
 														 int segment_size, XLogRecPtr first_segment,
 														 ClusterWalStartupObservation *out);
 
@@ -89,7 +89,7 @@ extern ClusterControlRootResult cluster_wal_startup_sync(const char *wal_root,
  * All outputs are cleared on refusal; ERROR/cancellation releases owned FDs.
  */
 extern ClusterControlRootResult cluster_wal_tail_observe(const char *wal_root,
-														 const ClusterWalDurablePrefixRef *ref,
+														 const ClusterWalSourceRef *ref,
 														 int segment_size, XLogRecPtr scan_lower,
 														 XLogRecPtr minimum_end,
 														 ClusterWalTailObservation *out);
@@ -98,7 +98,7 @@ extern ClusterControlRootResult cluster_wal_tail_observe(const char *wal_root,
  * prefix. A CRC-valid but different checkpoint cannot seal this root.
  * Author: SqlRush <sqlrush@gmail.com> */
 extern ClusterControlRootResult
-cluster_wal_tail_observe_checkpoint(const char *wal_root, const ClusterWalDurablePrefixRef *ref,
+cluster_wal_tail_observe_checkpoint(const char *wal_root, const ClusterWalSourceRef *ref,
 									int segment_size, XLogRecPtr scan_lower, XLogRecPtr minimum_end,
 									XLogRecPtr checkpoint_start, pg_crc32c checkpoint_crc,
 									ClusterWalTailObservation *out);

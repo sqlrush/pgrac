@@ -185,7 +185,7 @@ cluster_wal_state_publish_stopped(void)
 }
 
 bool
-cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
 	memset(out, 0, sizeof(*out));
 	out->claim.identity.origin_thread_id = 1;
@@ -193,7 +193,7 @@ cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
 }
 
 ClusterControlRootResult
-cluster_control_root_v3_shutdown_observe(const ClusterWalDurablePrefixRef *ref,
+cluster_control_root_v3_shutdown_observe(const ClusterWalSourceRef *ref,
 										 ClusterControlRootSnapshot *out,
 										 ClusterControlRootFileToken *token)
 {

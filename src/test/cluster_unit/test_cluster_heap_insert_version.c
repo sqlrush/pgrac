@@ -60,7 +60,7 @@ static uint64 next_token, edge_token;
 static unsigned inserts, vm_clears, itl_stamps, data_calls, origin_flags;
 static RfPageProducerBatchV1 prepared;
 static ClusterSpaceIdentity identity;
-static ClusterWalDurablePrefixRef ref;
+static ClusterWalSourceRef ref;
 static RelFileLocator tags[4];
 static ForkNumber forks[4];
 static BlockNumber blocks[4];
@@ -109,14 +109,14 @@ RecoveryInProgress(void)
 }
 
 bool
-cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
 	*out = ref;
 	return claim_ready;
 }
 
 bool
-cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
 {
 	(void)out;
 	abort();

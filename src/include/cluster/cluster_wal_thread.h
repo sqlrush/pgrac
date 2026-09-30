@@ -191,15 +191,15 @@ cluster_wal_thread_dir_name(uint16 thread_id, char *buf, size_t buflen)
 
 #ifndef FRONTEND
 
-#include "cluster/cluster_wal_durable_prefix.h"
+#include "cluster/cluster_wal_source.h"
 
 /* Root-selected writer routing reference, not write/flush/recovery authority.
  * False until the exact initializer completes INSTALL and publishes the new
  * reference, or outside PRE2. Callers still need their runtime gates. */
-extern bool cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out);
+extern bool cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out);
 /* Immutable restart input, independent of the ordinary writer reference.
  * Reading this mirror never authorizes WAL insertion or serving. */
-extern bool cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out);
+extern bool cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out);
 struct ClusterWalStartupImage;
 /* StartupProcess-only INSTALL plus exact route check, then once-only shared
  * writer-reference publication. This never overwrites the restart input and

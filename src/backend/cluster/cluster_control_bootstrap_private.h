@@ -8,7 +8,7 @@
 
 #include "catalog/pg_control.h"
 #include "cluster/cluster_shared_config.h"
-#include "cluster/cluster_wal_durable_prefix.h"
+#include "cluster/cluster_wal_source.h"
 #include "common/pgrac_control_binding.h"
 
 typedef struct ClusterControlBootstrapBytes {
@@ -36,11 +36,11 @@ typedef struct ClusterControlBootstrapInput {
 typedef struct ClusterControlBootstrapSnapshot {
 	PgracControlBinding binding;
 	ClusterControlRootIdentity thread;
-	ClusterWalDurablePrefixRef wal;
+	ClusterWalSourceRef wal;
 	/* Physical route alternative only, never a replay/writer grant. The
 	 * collector fills this from the selected own INITIALIZING/DURABLE PGWG;
 	 * the immutable current/restart input above does not change. */
-	ClusterWalDurablePrefixRef pending_wal;
+	ClusterWalSourceRef pending_wal;
 	bool pending_wal_valid;
 	ClusterSharedConfigRef config;
 	ControlFileData control;
@@ -84,7 +84,7 @@ typedef struct ClusterControlBootstrapObservation {
  * No .bak/projection fallback, retry, mutation or GUC application. Every present
  * current and retained writer's claim/anchor contributes recovery capacities;
  * selected pending DURABLE writers contribute their own claim/anchor, while
- * INITIALIZING consumes the exact actual WAL/PGWP and native parameter records,
+ * INITIALIZING consumes the exact actual WAL and native parameter records,
  * not an unselected anchor or guessed empty stream. This is sizing, not replay.
  * RESERVED permits no WAL mutation and contributes no new capacity minimum.
  * no lifecycle or serving bit bypasses input checks. These are root-selected
@@ -105,7 +105,7 @@ cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, cons
  * or grant writer admission, and never creates a missing claim or prefix. */
 extern ClusterControlRootResult
 cluster_control_bootstrap_wal_route(const char *pgdata, const char *wal_root,
-									const ClusterWalDurablePrefixRef *ref);
+									const ClusterWalSourceRef *ref);
 /* Before native startup, an interrupted initialization may have durably
  * exchanged pg_wal while the predecessor remains the immutable read input.
  * Select by pinned directory identity, not validation-error fallback. */
@@ -167,6 +167,6 @@ extern void cluster_control_bootstrap_prepare(const char *pgdata, const char *sh
  * early preparation before putting this read-only reference in shared memory.
  * FATAL when unprepared, changed, misrouted or called from a child. */
 extern void cluster_control_bootstrap_wal_recheck(const char *pgdata,
-												  ClusterWalDurablePrefixRef *out);
+												  ClusterWalSourceRef *out);
 
 #endif /* CLUSTER_CONTROL_BOOTSTRAP_PRIVATE_H */

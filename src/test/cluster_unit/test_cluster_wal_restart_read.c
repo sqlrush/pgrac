@@ -19,6 +19,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_wal_writer.h"
 
 #include <fcntl.h>
 #include <setjmp.h>
@@ -26,7 +27,7 @@
 #include <unistd.h>
 
 #include "access/xlog_internal.h"
-#include "cluster/cluster_wal_durable_prefix.h"
+#include "cluster/cluster_wal_source.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_restart_read.h"
 #include "../../backend/cluster/cluster_control_root_private.h"
@@ -55,8 +56,8 @@ static TimeLineID curFileTLI;
 static XLogSource readSource, XLogReceiptSource;
 static TimestampTz XLogReceiptTime;
 static bool InRedo;
-static ClusterWalDurablePrefixRef input;
-static ClusterWalDurablePrefixRef installed_writer;
+static ClusterWalSourceRef input;
+static ClusterWalSourceRef installed_writer;
 static ClusterControlRootResult install_result, route_result;
 static bool startup_binding, lose_binding_on_route;
 static unsigned install_calls, route_calls;
@@ -83,14 +84,14 @@ static int intercepted_close(int fd);
  * initialization/accessors must preserve it independently of the writer. */
 void
 cluster_control_bootstrap_wal_recheck(const char *dir pg_attribute_unused(),
-									  ClusterWalDurablePrefixRef *out)
+									  ClusterWalSourceRef *out)
 {
 	*out = input;
 }
 
 ClusterControlRootResult
 cluster_control_root_v3_startup_install_writer(
-	const ClusterWalStartupImage *expected pg_attribute_unused(), ClusterWalDurablePrefixRef *out)
+	const ClusterWalStartupImage *expected pg_attribute_unused(), ClusterWalSourceRef *out)
 {
 	++install_calls;
 	memset(out, 0, sizeof(*out));
@@ -102,7 +103,7 @@ cluster_control_root_v3_startup_install_writer(
 ClusterControlRootResult
 cluster_control_bootstrap_wal_route(const char *pgdata pg_attribute_unused(),
 									const char *wal_root pg_attribute_unused(),
-									const ClusterWalDurablePrefixRef *ref)
+									const ClusterWalSourceRef *ref)
 {
 	++route_calls;
 	UT_ASSERT(memcmp(ref, &installed_writer, sizeof(*ref)) == 0);
@@ -112,7 +113,7 @@ cluster_control_bootstrap_wal_route(const char *pgdata pg_attribute_unused(),
 }
 
 bool
-cluster_wal_durable_startup_matches(const ClusterControlRootIdentity *self, const uint8 uuid[16],
+cluster_wal_writer_startup_matches(const ClusterControlRootIdentity *self, const uint8 uuid[16],
 									XLogRecPtr first)
 {
 	return startup_binding && uuid[0] == 0x27 && first == 2 * wal_segment_size
@@ -551,11 +552,11 @@ UT_TEST(repeated_refusals_do_not_leak_descriptors)
 
 UT_TEST(restart_mirror_is_independent_and_profile_bound)
 {
-	ClusterWalDurablePrefixRef observed;
+	ClusterWalSourceRef observed;
 	ClusterWalStartupImage expected = { 0 };
 	fixture();
 	UT_ASSERT(!cluster_wal_thread_current_v2_ref(&observed));
-	UT_ASSERT(memcmp(&observed, &(ClusterWalDurablePrefixRef){ 0 }, sizeof(observed)) == 0);
+	UT_ASSERT(memcmp(&observed, &(ClusterWalSourceRef){ 0 }, sizeof(observed)) == 0);
 	expected.claim.identity = installed_writer.claim.identity;
 	expected.operation_uuid[0] = 0x27;
 	expected.first_segment_lsn = 2 * wal_segment_size;
@@ -591,7 +592,7 @@ UT_TEST(writer_mirror_requires_install_route_and_live_initializer)
 {
 	for (unsigned fault = 0; fault < 10; ++fault) {
 		ClusterWalStartupImage expected = { 0 };
-		ClusterWalDurablePrefixRef observed;
+		ClusterWalSourceRef observed;
 		fixture();
 		expected.claim.identity = installed_writer.claim.identity;
 		expected.operation_uuid[0] = 0x27;
@@ -630,7 +631,7 @@ UT_TEST(writer_mirror_requires_install_route_and_live_initializer)
 		}
 		UT_ASSERT(cluster_wal_thread_install_startup(&expected) != 0);
 		UT_ASSERT(!cluster_wal_thread_current_v2_ref(&observed));
-		UT_ASSERT(memcmp(&observed, &(ClusterWalDurablePrefixRef){ 0 }, sizeof(observed)) == 0);
+		UT_ASSERT(memcmp(&observed, &(ClusterWalSourceRef){ 0 }, sizeof(observed)) == 0);
 		UT_ASSERT(memcmp(&mirror.restart_ref, &input, sizeof(input)) == 0);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&mirror.writer_ref_state), fault == 3 ? 1 : 0);
 		if (fault == 0)
@@ -646,7 +647,7 @@ UT_TEST(writer_mirror_requires_install_route_and_live_initializer)
 UT_TEST(writer_mirror_is_once_only_and_hidden_while_copying)
 {
 	ClusterWalStartupImage expected = { 0 };
-	ClusterWalDurablePrefixRef first, observed;
+	ClusterWalSourceRef first, observed;
 	fixture();
 	expected.claim.identity = installed_writer.claim.identity;
 	expected.operation_uuid[0] = 0x27;
@@ -655,7 +656,7 @@ UT_TEST(writer_mirror_is_once_only_and_hidden_while_copying)
 	pg_atomic_write_u32(&mirror.writer_ref_state, 1);
 	mirror.v2_ref = installed_writer;
 	UT_ASSERT(!cluster_wal_thread_current_v2_ref(&observed));
-	UT_ASSERT(memcmp(&observed, &(ClusterWalDurablePrefixRef){ 0 }, sizeof(observed)) == 0);
+	UT_ASSERT(memcmp(&observed, &(ClusterWalSourceRef){ 0 }, sizeof(observed)) == 0);
 	pg_atomic_write_u32(&mirror.writer_ref_state, 0);
 	UT_ASSERT_EQ(cluster_wal_thread_install_startup(&expected), 0);
 	UT_ASSERT(cluster_wal_thread_current_v2_ref(&first));

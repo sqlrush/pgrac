@@ -20,7 +20,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_wal_claim.h"
-#include "cluster/cluster_wal_durable_prefix.h"
+#include "cluster/cluster_wal_source.h"
 #include "cluster/cluster_wal_thread.h"
 #include "../../../backend/cluster/cluster_control_bootstrap_private.h"
 #include "../../../backend/cluster/cluster_control_root_private.h"
@@ -473,7 +473,7 @@ bootstrap_test_prepare(void)
 {
 	char local[MAXPGPATH], shared[MAXPGPATH], wal[MAXPGPATH], undo[MAXPGPATH];
 	ClusterControlBootstrapPrepared out;
-	ClusterWalDurablePrefixRef wal_ref;
+	ClusterWalSourceRef wal_ref;
 	ResourceOwner saved = CurrentResourceOwner;
 	uint64 sysid = GetSystemIdentifier();
 	bootstrap_test_path(local, "local");
@@ -482,7 +482,7 @@ bootstrap_test_prepare(void)
 	bootstrap_test_path(undo, "undo");
 	memset(&wal_ref, 0xa5, sizeof(wal_ref));
 	if (cluster_wal_thread_current_v2_ref(&wal_ref)
-		|| memcmp(&wal_ref, &(ClusterWalDurablePrefixRef){ 0 }, sizeof(wal_ref)) != 0)
+		|| memcmp(&wal_ref, &(ClusterWalSourceRef){ 0 }, sizeof(wal_ref)) != 0)
 		ereport(FATAL, (errmsg("test uninitialized WAL reference was exposed")));
 	cluster_control_bootstrap_prepare(local, shared, wal, undo, 0, true, &out);
 	if (out.snapshot.binding.system_identifier != sysid || out.snapshot.root_sequence != 7
@@ -511,7 +511,7 @@ bootstrap_test_prepare(void)
 		bootstrap_test_path(target, test_prepare_race == 9 ? "local/pg_xact"
 									: test_prepare_race == 6
 										? "local/pg_wal"
-										: "wal/thread_1/generation_99/durable_prefix/current");
+										: "wal/thread_1/generation_99/pgrac_thread.claim");
 		if (unlink(target) != 0)
 			ereport(FATAL, (errmsg("test WAL recheck unlink failed")));
 	}
@@ -784,13 +784,11 @@ test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
 	ClusterControlRootSnapshot *record;
 	ClusterRecoveryAnchorV2 anchor = { 0 };
 	ClusterWalThreadClaimV2 claim = { 0 };
-	ClusterWalDurablePrefixRef prefix_ref = { 0 };
-	ClusterWalDurablePrefix prefix = { .sequence = 1 };
 	ClusterSharedConfigIdentity config = { 0 };
 	PgracControlBinding binding = { 0 };
 	ControlFileData native;
 	uint8 common[PG_CONTROL_FILE_SIZE], claim_bytes[112], anchor_bytes[512], binding_bytes[256];
-	uint8 prefix_bytes[CLUSTER_WAL_DURABLE_PREFIX_BYTES];
+	uint8 prefix_bytes[256] = { 0 };
 	char pgwal[MAXPGPATH], generation[MAXPGPATH];
 	char shared[MAXPGPATH], wal[MAXPGPATH], undo[MAXPGPATH], suffix[MAXPGPATH], hex[65];
 	char config_bytes[8192];
@@ -889,7 +887,7 @@ test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
 		entries[3].value = "5";
 	else if (strcmp(mutation, "recheck-route") == 0)
 		entries[3].value = "6";
-	else if (strcmp(mutation, "recheck-prefix") == 0)
+	else if (strcmp(mutation, "recheck-claim") == 0)
 		entries[3].value = "7";
 	else if (strcmp(mutation, "recheck-pgdata") == 0)
 		entries[3].value = "8";
@@ -989,16 +987,11 @@ test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errmsg("test bootstrap binding encoding failed")));
 	bootstrap_test_write("local/global/pgrac_control_binding", binding_bytes,
 						 sizeof(binding_bytes));
-	/* Routing/prefix fixture only, not a never-written or physical WAL proof. */
-	prefix_ref.claim.identity = record->identity;
-	prefix_ref.claim.database_incarnation = 41;
-	prefix_ref.claim.max_config_generation = 47;
-	memcpy(prefix_ref.claim.claim_sha256, root->refs[0].claim_sha256, 32);
-	prefix_ref.timeline = native.checkPointCopy.ThisTimeLineID;
+	/* Obsolete sidefile bytes are ignored. The exact claim and pg_wal
+	 * route below remain authoritative for source discovery. */
+	memcpy(prefix_bytes, "PGWP", 4);
 	if (strcmp(mutation, "prefix-identity") == 0)
-		prefix_ref.timeline++;
-	if (cluster_wal_durable_prefix_encode(&prefix_ref, &prefix, prefix_bytes) != 0)
-		ereport(ERROR, (errmsg("test bootstrap prefix encoding failed")));
+		prefix_bytes[112] = 3;
 	if (strcmp(mutation, "prefix-corrupt") == 0)
 		prefix_bytes[140] ^= 1;
 	bootstrap_test_write("wal/thread_1/generation_99/durable_prefix/current", prefix_bytes,

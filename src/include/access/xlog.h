@@ -256,6 +256,10 @@ extern void GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p)
 extern XLogRecPtr GetRedoRecPtr(void);
 extern XLogRecPtr GetInsertRecPtr(void);
 extern XLogRecPtr GetFlushRecPtr(TimeLineID *insertTLI);
+#ifdef USE_PGRAC_CLUSTER
+/* Bound startup EOR only; this observes native fsync, not writer admission. */
+extern bool ClusterXLogStartupFlushCovers(XLogRecPtr end, TimeLineID timeline);
+#endif
 extern TimeLineID GetWALInsertionTimeLine(void);
 extern XLogRecPtr GetLastImportantRecPtr(void);
 

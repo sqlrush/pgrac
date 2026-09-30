@@ -189,7 +189,7 @@ static ClusterControlRootResult
 startup_empty_file(int dir, const char *name, const uint8 *expected, Size length, bool create,
 				   bool sync)
 {
-	uint8 bytes[CLUSTER_WAL_DURABLE_PREFIX_BYTES + 1];
+	uint8 bytes[CLUSTER_WAL_CLAIM_V2_BYTES + 1];
 	struct stat st, named;
 	int flags = O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY;
 	int fd = -1;
@@ -253,18 +253,14 @@ cluster_wal_startup_empty_locked(const ControlRootImage *root, uint32 node, bool
 {
 	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
 	ClusterWalStartupImage op;
-	ClusterWalDurablePrefixRef ref;
-	ClusterWalDurablePrefix empty = { 1, 0, 0, 0 };
-	uint8 claim[CLUSTER_WAL_CLAIM_V2_BYTES], prefix[CLUSTER_WAL_DURABLE_PREFIX_BYTES];
-	pg_cryptohash_ctx *ctx;
+	uint8 claim[CLUSTER_WAL_CLAIM_V2_BYTES];
 	char thread[32], generation[48];
-	/* WAL root/thread/generation/prefix/archive; shared/global/anchors/thread/generation/stage. */
-	int fds[11];
-	int parents[] = { -1, 0, 1, 2, 2, -1, 5, 6, 7, 8, 9 };
+	/* WAL root/thread/generation/archive; shared/global/anchors/thread/generation/stage. */
+	int fds[10];
+	int parents[] = { -1, 0, 1, 2, -1, 4, 5, 6, 7, 8 };
 	const char *names[] = { cluster_wal_threads_dir,
 							thread,
 							generation,
-							"durable_prefix",
 							"archive_status",
 							cluster_shared_data_dir,
 							"global",
@@ -272,8 +268,8 @@ cluster_wal_startup_empty_locked(const ControlRootImage *root, uint32 node, bool
 							thread,
 							generation,
 							".staging" };
-	struct stat opened[11], named;
-	bool created, hashed;
+	struct stat opened[10], named;
+	bool created;
 	ClusterControlRootResult result;
 
 	if (!cluster_cf_held_is_clusterwide(ExclusiveLock))
@@ -291,21 +287,6 @@ cluster_wal_startup_empty_locked(const ControlRootImage *root, uint32 node, bool
 	result = cluster_wal_claim_v2_encode(&op.claim, claim);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	memset(&ref, 0, sizeof(ref));
-	ref.claim.identity = op.claim.identity;
-	ref.claim.database_incarnation = op.database_incarnation;
-	ref.claim.max_config_generation = op.config_generation;
-	ref.timeline = op.timeline;
-	ctx = pg_cryptohash_create(PG_SHA256);
-	if (ctx == NULL)
-		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	hashed = history_hash(ctx, claim, sizeof(claim), ref.claim.claim_sha256);
-	pg_cryptohash_free(ctx);
-	if (!hashed)
-		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	result = cluster_wal_durable_prefix_encode(&ref, &empty, prefix);
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		return result;
 	snprintf(thread, sizeof(thread), "thread_%u", node + 1);
 	snprintf(generation, sizeof(generation), "generation_" UINT64_FORMAT,
 			 op.claim.identity.origin_owner_incarnation);
@@ -318,7 +299,7 @@ cluster_wal_startup_empty_locked(const ControlRootImage *root, uint32 node, bool
 			fds[i] = open(names[i], flags);
 		else
 			fds[i] = startup_empty_dir(fds[parents[i]], names[i],
-									   create && (i == 2 || i == 3 || i == 4 || i == 9 || i == 10),
+									   create && (i == 2 || i == 3 || i == 8 || i == 9),
 									   &created);
 		if (fds[i] < 0) {
 			result = errno == ENOENT ? CLUSTER_CONTROL_ROOT_ABSENT : CLUSTER_CONTROL_ROOT_IO_ERROR;
@@ -340,26 +321,17 @@ cluster_wal_startup_empty_locked(const ControlRootImage *root, uint32 node, bool
 										sizeof(claim), create && created, sync);
 			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 				goto done;
-			if (!startup_empty_entries(fds[2], CLUSTER_WAL_THREAD_CLAIM_FILENAME, "durable_prefix",
-									   "archive_status")) {
+			if (!startup_empty_entries(fds[2], CLUSTER_WAL_THREAD_CLAIM_FILENAME,
+									   "archive_status", NULL)) {
 				result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 				goto done;
 			}
 		}
-		if (i == 3) {
-			if (!startup_empty_entries(fds[3], "current", NULL, NULL)) {
-				result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
-				goto done;
-			}
-			result = startup_empty_file(fds[3], "current", prefix, sizeof(prefix), create, sync);
-			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-				goto done;
-		}
-		if ((i == 4 || i == 10) && !startup_empty_entries(fds[i], NULL, NULL, NULL)) {
+		if ((i == 3 || i == 9) && !startup_empty_entries(fds[i], NULL, NULL, NULL)) {
 			result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 			goto done;
 		}
-		if (i == 9 && !startup_empty_entries(fds[i], ".staging", NULL, NULL)) {
+		if (i == 8 && !startup_empty_entries(fds[i], ".staging", NULL, NULL)) {
 			result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 			goto done;
 		}
@@ -425,13 +397,13 @@ startup_route_link(int dir, const char *name, struct stat *st)
 
 ClusterControlRootResult
 cluster_wal_startup_route_locked(const ControlRootImage *root, uint32 node, const char *pgdata,
-								 const ClusterWalDurablePrefixRef *restart)
+								 const ClusterWalSourceRef *restart)
 {
 	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
 	ClusterWalStartupImage op;
-	ClusterWalDurablePrefixRef next = { 0 };
+	ClusterWalSourceRef next = { 0 };
 	ClusterWalThreadClaimV2 old_claim;
-	ClusterWalDurablePrefix old_prefix, fresh_prefix;
+	ClusterWalTailObservation old_tail, fresh_tail;
 	ClusterControlRootResult result;
 	uint8 claim[CLUSTER_WAL_CLAIM_V2_BYTES], random[16];
 	pg_cryptohash_ctx *ctx;
@@ -461,12 +433,14 @@ cluster_wal_startup_route_locked(const ControlRootImage *root, uint32 node, cons
 	result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &restart->claim, &old_claim);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	result = cluster_wal_durable_prefix_read(cluster_wal_threads_dir, restart, &old_prefix);
+	result = cluster_wal_tail_observe_checkpoint(
+		cluster_wal_threads_dir, restart, op.segment_size, op.input_record_start,
+		op.sealed_input_end, op.input_record_start, op.input_record_crc, &old_tail);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (old_prefix.exclusive_end != op.sealed_input_end
-		|| old_prefix.record_start != op.input_record_start
-		|| old_prefix.record_crc != op.input_record_crc)
+	if (old_tail.complete_end != op.sealed_input_end
+		|| old_tail.last_record_start != op.predecessor.snapshot.tail_last_record_lsn
+		|| old_tail.last_record_crc != op.predecessor.snapshot.tail_last_record_crc32c)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	result = cluster_wal_startup_empty_locked(root, node, false, false);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -561,9 +535,11 @@ done:
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &restart->claim, &old_claim);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		result = cluster_wal_durable_prefix_read(cluster_wal_threads_dir, restart, &fresh_prefix);
+		result = cluster_wal_tail_observe_checkpoint(
+			cluster_wal_threads_dir, restart, op.segment_size, op.input_record_start,
+			op.sealed_input_end, op.input_record_start, op.input_record_crc, &fresh_tail);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		&& memcmp(&fresh_prefix, &old_prefix, sizeof(old_prefix)) != 0)
+		&& memcmp(&fresh_tail, &old_tail, sizeof(old_tail)) != 0)
 		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		result = cluster_control_bootstrap_wal_route(pgdata, cluster_wal_threads_dir, &next);

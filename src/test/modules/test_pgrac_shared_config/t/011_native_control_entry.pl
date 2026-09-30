@@ -38,7 +38,7 @@ for my $case (
 	['capacity', 0, qr/native bootstrap recovery capacity is insufficient.*max_connections/s],
 	['native-format', 0, qr/BLCKSZ/],
 	['identity', 0, qr/native bootstrap observation failed/],
-	['prefix-missing', 0, qr/native bootstrap WAL routing is not exact/],
+	['prefix-missing', 0, $later_guard],
 	['root-corrupt', 0, qr/native bootstrap observation failed/],
 	['missing-binding', 0, qr/native bootstrap observation failed/])
 {

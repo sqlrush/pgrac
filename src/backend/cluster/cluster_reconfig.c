@@ -8814,7 +8814,7 @@ cluster_reconfig_startup_formation_current_locked(void)
 static void
 cluster_reconfig_startup_formation_progress(void)
 {
-	ClusterWalDurablePrefixRef writer;
+	ClusterWalSourceRef writer;
 	ClusterXidStripeJoinVerdict stripe;
 	uint64 generation;
 	uint64 incarnation;
@@ -8827,7 +8827,7 @@ cluster_reconfig_startup_formation_progress(void)
 	generation = ReconfigShmem->startup_formation.formation_generation;
 	incarnation = ReconfigShmem->startup_formation_incarnations[cluster_node_id];
 	LWLockRelease(&ReconfigShmem->lock);
-	/* The exact native writer is installed only by the typed root/PGWP/anchor
+	/* The exact native writer is installed only by the typed root/claim/anchor
 	 * path. Never call the WAL-producing stripe gate on the predecessor. */
 	if (RecoveryInProgress() || !cluster_wal_thread_current_v2_ref(&writer)
 		|| writer.claim.identity.origin_node_id != cluster_node_id

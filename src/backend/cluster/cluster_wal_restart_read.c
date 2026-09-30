@@ -100,7 +100,7 @@ done:
 
 /* No allocator, ereport or other error-throwing backend call with FDs open. */
 static ClusterControlRootResult
-restart_open_selected(const char *wal_root, const ClusterWalDurablePrefixRef *input,
+restart_open_selected(const char *wal_root, const ClusterWalSourceRef *input,
 					  XLogSegNo segno, int segsize, const uint8 *claim, int *fd_out)
 {
 	const int dirflags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
@@ -157,7 +157,7 @@ done:
 }
 
 ClusterControlRootResult
-cluster_wal_restart_segment_open(const char *wal_root, const ClusterWalDurablePrefixRef *input,
+cluster_wal_restart_segment_open(const char *wal_root, const ClusterWalSourceRef *input,
 								 TimeLineID timeline, XLogSegNo segno, int segsize, int *fd_out)
 {
 	ClusterWalThreadClaimV2 claim;

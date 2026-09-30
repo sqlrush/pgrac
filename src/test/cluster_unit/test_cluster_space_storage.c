@@ -54,7 +54,7 @@ MemoryContext TopTransactionContext = (MemoryContext)2;
 
 static PGAlignedBlock page;
 static SMgrRelationData storage;
-static ClusterWalDurablePrefixRef ref;
+static ClusterWalSourceRef ref;
 static bool have_ref, shared, exists, recovering, pinned, locked;
 static unsigned io_calls, create_calls, wal_calls, dirty_calls, release_calls;
 static BlockNumber blocks;
@@ -95,7 +95,7 @@ rf_page_mutation_token_next(void)
 }
 
 bool
-cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
 	current_ref_reads++;
 	*out = ref;
@@ -103,7 +103,7 @@ cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
 }
 
 bool
-cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
 {
 	restart_ref_reads++;
 	*out = ref;

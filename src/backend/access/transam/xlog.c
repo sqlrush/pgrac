@@ -190,7 +190,7 @@
 #include "cluster/cluster_wal_state.h" /* PGRAC: checkpoint redo / fpw sticky (spec-4.5) */
 #include "cluster/cluster_wal_retention.h" /* PGRAC: STOP-05 guarded WAL reuse */
 #include "cluster/cluster_wal_thread.h"
-#include "cluster/cluster_wal_durable_prefix.h" /* PGRAC: durable group-flush promise */
+#include "cluster/cluster_wal_writer.h" /* PGRAC: durable group-flush promise */
 #include "cluster/cluster_backup.h" /* PGRAC: spec-6.5 durable backup WAL pin */
 #include "cluster/cluster_tt_durable.h" /* PGRAC: spec-4.8 D1 crash-left ACTIVE resolution */
 #include "cluster/cluster_cf_authority.h" /* PGRAC: spec-5.6 shared pg_control authority write */
@@ -781,7 +781,7 @@ static void AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli,
 								  bool opportunistic);
 static bool XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible);
 #ifdef USE_PGRAC_CLUSTER
-static void ClusterWALWaitForPublish(TimeLineID tli, TimestampTz *wait_started);
+static void ClusterWALWaitForWriter(TimeLineID tli, TimestampTz *wait_started);
 #endif
 static bool InstallXLogFileSegment(XLogSegNo *segno, char *tmppath,
 								   bool find_free, XLogSegNo max_segno,
@@ -2016,7 +2016,7 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 				WaitXLogInsertionsToFinish(OldPageRqstPtr);
 
 #ifdef USE_PGRAC_CLUSTER
-				ClusterWALWaitForPublish(tli, &publish_wait_started);
+				ClusterWALWaitForWriter(tli, &publish_wait_started);
 #endif
 				LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
 
@@ -2281,21 +2281,21 @@ XLogCheckpointNeeded(XLogSegNo new_segno)
 
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: only a healthy same-writer reconfiguration is waitable. This never
- * authorizes I/O; XLogWrite and the durable-prefix publisher recheck again.
+ * authorizes I/O; XLogWrite rechecks before I/O and after fsync.
  * Callers may already be in a native outer critical section (commit or WAL
  * insertion), which cannot be unwound as a query ERROR. Do not hold the WAL
  * write/mapping lock while QVOTEC catches up. The existing checkpoint's ten
  * second hang envelope is retained across retries, not renewed by each race.
  * Author: SqlRush <sqlrush@gmail.com> */
 static void
-ClusterWALWaitForPublish(TimeLineID tli, TimestampTz *wait_started)
+ClusterWALWaitForWriter(TimeLineID tli, TimestampTz *wait_started)
 {
 	if (!cluster_enabled || !cluster_shared_config)
 		return;
 	Assert(!LWLockHeldByMeInMode(WALWriteLock, LW_EXCLUSIVE));
 	Assert(!LWLockHeldByMeInMode(WALBufMappingLock, LW_EXCLUSIVE));
 	for (;;) {
-		ClusterControlRootResult result = cluster_wal_durable_publish_ready(tli);
+		ClusterControlRootResult result = cluster_wal_writer_ready(tli);
 		TimestampTz now;
 
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -2341,6 +2341,9 @@ static bool
 XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 {
 	bool completed = true;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterWalWriterToken writer;
+#endif
 	bool		ispartialpage;
 	bool		last_iteration;
 	bool		finishing_seg;
@@ -2359,7 +2362,7 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_enabled && cluster_shared_config) {
-		ClusterControlRootResult result = cluster_wal_durable_publish_ready(tli);
+		ClusterControlRootResult result = cluster_wal_writer_begin(tli, &writer);
 
 		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
 			return false;
@@ -2623,31 +2626,23 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 	}
 
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: WAL bytes and their exact durable-prefix promise both precede
-	 * native Flush visibility (commit acknowledgement and DATA writeback).
-	 * A full-page flush may end inside a record; expose only the verified
-	 * complete prefix. WALWriteLock is the sole publisher serialization.
+	/* Preserve the exact writer across device I/O. A healthy epoch race
+	 * defers completion to the caller after releasing the WAL locks.
+	 * Native Flush retains its physical byte position, including partial
+	 * records; recovery independently decodes complete records.
 	 * Author: SqlRush <sqlrush@gmail.com> */
 	if (cluster_enabled && cluster_shared_config &&
 		LogwrtResult.Flush > XLogCtl->LogwrtResult.Flush)
 	{
-		XLogRecPtr covered = InvalidXLogRecPtr;
-		ClusterControlRootResult result;
-
-		result = cluster_wal_durable_publish(tli, LogwrtResult.Flush,
-											XLogCtl->LogwrtResult.Flush, &covered);
+		ClusterControlRootResult result = cluster_wal_writer_check(&writer);
 		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT) {
-			/* No durability promise may escape from this attempt. The caller
-			 * drops WALWriteLock before waiting; a fresh pass rereads the exact
-			 * prefix even when its rename already completed. */
-			covered = XLogCtl->LogwrtResult.Flush;
+			LogwrtResult.Flush = XLogCtl->LogwrtResult.Flush;
 			completed = false;
 		} else if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			ereport(PANIC,
-					(errmsg("could not publish durable WAL prefix"),
-					 errdetail("PGRAC_FAMILY=WAL_THREAD PGRAC_REASON=DURABLE_PREFIX_UNPROVEN result=%d",
+					(errmsg("native WAL flush lost writer authority"),
+					 errdetail("PGRAC_FAMILY=WAL_THREAD PGRAC_REASON=FLUSH_AUTHORITY_UNPROVEN result=%d",
 							   (int) result)));
-		LogwrtResult.Flush = covered;
 	}
 #endif
 
@@ -2866,7 +2861,7 @@ XLogFlush(XLogRecPtr record)
 #endif
 
 #ifdef USE_PGRAC_CLUSTER
-	ClusterWALWaitForPublish(insertTLI, &publish_wait_started);
+	ClusterWALWaitForWriter(insertTLI, &publish_wait_started);
 #endif
 	START_CRIT_SECTION();
 
@@ -2901,7 +2896,7 @@ XLogFlush(XLogRecPtr record)
 			break;
 
 #ifdef USE_PGRAC_CLUSTER
-		ClusterWALWaitForPublish(insertTLI, &publish_wait_started);
+		ClusterWALWaitForWriter(insertTLI, &publish_wait_started);
 #endif
 		/*
 		 * Before actually performing the write, wait for all in-flight
@@ -3144,7 +3139,7 @@ XLogBackgroundFlush(void)
 		bool completed = true;
 
 #ifdef USE_PGRAC_CLUSTER
-		ClusterWALWaitForPublish(insertTLI, &publish_wait_started);
+		ClusterWALWaitForWriter(insertTLI, &publish_wait_started);
 #endif
 		START_CRIT_SECTION();
 		/* now wait for in-progress insertions to finish and get write lock */
@@ -6124,7 +6119,7 @@ ClusterStartupConfigurationRequire(void)
 static void
 ClusterStartupWriterSelect(void)
 {
-	ClusterWalDurablePrefixRef restart;
+	ClusterWalSourceRef restart;
 	ClusterWalStartupImage selected;
 	ClusterControlRootResult result;
 
@@ -6217,7 +6212,7 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 		&& memcmp(&routed, &selected, sizeof(selected)) != 0)
 		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		result = cluster_wal_durable_startup_prepare(&selected.claim.identity,
+		result = cluster_wal_writer_startup_prepare(&selected.claim.identity,
 													 selected.operation_uuid, &first);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || first != selected.first_segment_lsn)
 		ereport(FATAL,
@@ -7811,6 +7806,27 @@ GetFlushRecPtr(TimeLineID *insertTLI)
 	return LogwrtResult.Flush;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* EOR writes native WAL before SharedRecoveryState becomes DONE. Keep the
+ * general GetFlushRecPtr contract intact and expose only the bound startup
+ * writer's exact timeline here. Callers separately revalidate root/ownership.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+ClusterXLogStartupFlushCovers(XLogRecPtr end, TimeLineID timeline)
+{
+	XLogRecPtr flushed;
+	if (MyBackendType != B_STARTUP || !cluster_enabled || !cluster_shared_config
+		|| !enableFsync || !clusterStartupWriterBound || clusterStartupWriterInstalled
+		|| ShutdownRequestPending || end == InvalidXLogRecPtr || timeline == 0
+		|| clusterStartupWriter.timeline != timeline || XLogCtl->InsertTimeLineID != timeline)
+		return false;
+	SpinLockAcquire(&XLogCtl->info_lck);
+	flushed = XLogCtl->LogwrtResult.Flush;
+	SpinLockRelease(&XLogCtl->info_lck);
+	return flushed >= end;
+}
+#endif
+
 /*
  * GetWALInsertionTimeLine -- Returns the current timeline of a system that
  * is not in recovery.
@@ -8171,7 +8187,7 @@ ClusterStartupCheckpointPrepare(int flags, ControlFileData *selected)
 		|| clusterStartupWriter.phase != CLUSTER_WAL_STARTUP_INITIALIZING
 		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
 		|| cluster_cf_held(ExclusiveLock)
-		|| !cluster_wal_durable_startup_matches(&clusterStartupWriter.claim.identity,
+		|| !cluster_wal_writer_startup_matches(&clusterStartupWriter.claim.identity,
 												clusterStartupWriter.operation_uuid,
 												clusterStartupWriter.first_segment_lsn)
 		|| ControlFile->state != DB_SHUTDOWNED
@@ -8214,7 +8230,7 @@ ClusterStartupCheckpointPublish(const ControlFileData *candidate, XLogRecPtr end
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		if (ShutdownRequestPending
-			|| !cluster_wal_durable_startup_matches(&clusterStartupWriter.claim.identity,
+			|| !cluster_wal_writer_startup_matches(&clusterStartupWriter.claim.identity,
 													clusterStartupWriter.operation_uuid,
 													clusterStartupWriter.first_segment_lsn))
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -8280,7 +8296,7 @@ ClusterStartupCheckpointPublish(const ControlFileData *candidate, XLogRecPtr end
 			|| selected.state != DB_IN_PRODUCTION || selected.checkPoint != candidate->checkPoint
 			|| selected.system_identifier != clusterStartupWriter.claim.identity.system_identifier
 			|| selected.checkPointCopy.ThisTimeLineID != clusterStartupWriter.timeline
-			|| !cluster_wal_durable_startup_matches(&clusterStartupWriter.claim.identity,
+			|| !cluster_wal_writer_startup_matches(&clusterStartupWriter.claim.identity,
 													clusterStartupWriter.operation_uuid,
 													clusterStartupWriter.first_segment_lsn)))
 		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
@@ -8302,7 +8318,7 @@ ClusterStartupCheckpointPublish(const ControlFileData *candidate, XLogRecPtr end
 static void
 ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 {
-	ClusterWalDurablePrefixRef ref;
+	ClusterWalSourceRef ref;
 	bool readable;
 	uint64 epoch = cluster_epoch_get_current();
 
@@ -8356,7 +8372,7 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 static void
 ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 {
-	ClusterWalDurablePrefixRef ref;
+	ClusterWalSourceRef ref;
 	ControlFileData selected;
 	ClusterControlRootSnapshot published;
 	ClusterControlRootFileToken token;

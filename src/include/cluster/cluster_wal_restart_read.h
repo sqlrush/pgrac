@@ -20,13 +20,13 @@
 #ifndef CLUSTER_WAL_RESTART_READ_H
 #define CLUSTER_WAL_RESTART_READ_H
 
-#include "cluster/cluster_wal_durable_prefix.h"
+#include "cluster/cluster_wal_source.h"
 
 /* OK_PRIMARY returns one owned O_RDONLY fd; every other result leaves -1.
  * ABSENT means only a missing segment in an otherwise validated namespace.
  * Native XLogReader remains responsible for record/page validation. */
 extern ClusterControlRootResult
-cluster_wal_restart_segment_open(const char *wal_root, const ClusterWalDurablePrefixRef *input,
+cluster_wal_restart_segment_open(const char *wal_root, const ClusterWalSourceRef *input,
 								 TimeLineID timeline, XLogSegNo segno, int segsize, int *fd_out);
 
 #endif /* CLUSTER_WAL_RESTART_READ_H */

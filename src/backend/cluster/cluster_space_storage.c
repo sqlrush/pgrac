@@ -87,7 +87,7 @@ space_identity_key_matches(const ClusterSpaceIdentityKey *a, const ClusterSpaceI
 static bool
 space_namespace(RelFileLocator locator, bool redo, ClusterSpaceIdentityKey *out, uint16 *thread)
 {
-	ClusterWalDurablePrefixRef ref;
+	ClusterWalSourceRef ref;
 
 	if (!cluster_enabled || !cluster_shared_config || cluster_node_id < 0 || cluster_node_id >= 16
 		|| cluster_smgr_which_for(locator, InvalidBackendId) != 1)

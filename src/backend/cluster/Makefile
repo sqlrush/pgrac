@@ -309,8 +309,7 @@ OBJS = \
 	cluster_views.o \
 	cluster_wal_claim.o \
 	cluster_wal_restart_read.o \
-	cluster_wal_durable_prefix.o \
-	cluster_wal_durable_publish.o \
+	cluster_wal_writer.o \
 	cluster_wal_state.o \
 	cluster_wal_thread.o \
 	cluster_xid_authority.o \
@@ -370,7 +369,7 @@ endif
 cluster_control_root.o cluster_control_bootstrap_read.o cluster_wal_history.o \
 cluster_clean_leave.o cluster_cf_authority.o cluster_recovery_duty.o \
 cluster_thread_recovery_finalize.o cluster_thread_recovery_worker.o \
-cluster_wal_thread.o cluster_wal_durable_publish.o cluster_wal_retention.o: \
+cluster_wal_thread.o cluster_wal_writer.o cluster_wal_retention.o: \
 	$(srcdir)/cluster_control_root_private.h
 
 cluster_control_bootstrap.o cluster_control_bootstrap_read.o cluster_control_root.o \

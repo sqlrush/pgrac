@@ -86,7 +86,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_r4_itl_capacity \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
-        test_cluster_wal_thread test_cluster_wal_restart_read test_cluster_wal_durable_prefix test_cluster_wal_durable_publish test_cluster_thread_tail test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
+        test_cluster_wal_thread test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_thread_tail test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
         test_cluster_backup test_cluster_retained_remote \
         test_cluster_recovery_worker test_cluster_recovery_merge test_cluster_remote_xact test_cluster_remote_xact_writer \
         test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay \
@@ -497,7 +497,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 	$(CC) $(CFLAGS) -Wno-unused-variable -Wno-unused-but-set-variable $(CPPFLAGS) $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
-SIMPLE_TESTS := $(filter-out test_cluster_wal_restart_read test_cluster_wal_durable_prefix test_cluster_wal_durable_publish test_cluster_thread_tail,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_thread_tail,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_request,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire,$(SIMPLE_TESTS))
@@ -870,7 +870,8 @@ test_cluster_startup_lsn_native.inc: $(top_srcdir)/src/backend/access/transam/xl
 
 test_cluster_startup_reserve_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^ReserveXLogInsertLocation\(/ { print "static void"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	     /^ClusterXLogStartupFlushCovers\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_checkpoint_candidate.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
@@ -2344,14 +2345,13 @@ test_cluster_control_native_xid.inc: $(top_srcdir)/src/backend/cluster/cluster_x
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_control_root: test_cluster_control_root.c unit_test.h test_cluster_control_root_worker.inc \
+test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc \
 		test_cluster_control_native_xid.inc \
 		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
 		cluster_control_bootstrap_read_test.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
-		$(top_builddir)/src/backend/cluster/cluster_wal_durable_prefix.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
@@ -2360,7 +2360,6 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h test_cluster_
 		cluster_control_bootstrap_read_test.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
-		$(top_builddir)/src/backend/cluster/cluster_wal_durable_prefix.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
 		xlogreader_fs.o \
 		$(top_builddir)/src/common/libpgcommon.a \
@@ -3605,7 +3604,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc
-	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib bench_wal_publish_cost \
+	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib \
 		test_cluster_heap_inplace_version.inc test_cluster_heap_inplace_legacy_version.inc \
 		test_cluster_heap_confirm_version.inc test_cluster_heap_spec_abort_version.inc \
 		test_cluster_heap_confirm_capture.inc test_cluster_heap_spec_abort_capture.inc \
@@ -6498,7 +6497,6 @@ test_cluster_recovery_plan: test_cluster_recovery_plan.c unit_test.h \
 # PGRAC: legacy routing helpers plus real v2 claim codec/filesystem reader.
 # Author: SqlRush <sqlrush@gmail.com>
 CLUSTER_WAL_CLAIM_O = $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
-CLUSTER_WAL_DURABLE_PREFIX_O = $(top_builddir)/src/backend/cluster/cluster_wal_durable_prefix.o
 # PGRAC: actual native segment selection with real generation files.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_native_wal_read.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
@@ -6537,21 +6535,14 @@ test_cluster_thread_tail_legacy.inc: $(top_srcdir)/src/backend/cluster/cluster_t
 	     emit { print } /^}/ { emit=0 } END { if (count != 6) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_thread_tail: test_cluster_thread_tail.c unit_test.h test_cluster_thread_tail_legacy.inc \
+test_cluster_thread_tail: test_cluster_thread_tail.c unit_test.h wal_test_fixture.h test_cluster_thread_tail_legacy.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_tail.c $(top_srcdir)/src/include/cluster/cluster_wal_tail.h \
-		$(CLUSTER_WAL_DURABLE_PREFIX_O) $(CLUSTER_WAL_CLAIM_O) xlogreader_fs.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_WAL_DURABLE_PREFIX_O) $(CLUSTER_WAL_CLAIM_O) \
+		$(CLUSTER_WAL_CLAIM_O) xlogreader_fs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_WAL_CLAIM_O) \
 		xlogreader_fs.o $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
-test_cluster_wal_durable_prefix: test_cluster_wal_durable_prefix.c unit_test.h \
-		$(CLUSTER_WAL_DURABLE_PREFIX_O) $(top_srcdir)/src/include/cluster/cluster_wal_durable_prefix.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_WAL_DURABLE_PREFIX_O) \
-		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
-		$(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
-
-# PGRAC: production publisher body with syscall-only fault boundaries and the
-# real WAL decoder/claim/prefix codecs. Author: SqlRush <sqlrush@gmail.com>
+# PGRAC: actual native flush entry, completion and caller control flow. Author: SqlRush <sqlrush@gmail.com>
 test_cluster_wal_publish_tail.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^XLogWrite\(/ { owner=1 } \
 	     owner && /^\t\t\/\* signal that we need to wakeup walsenders later/ { emit=1; count++; print "static bool native_flush_tail(TimeLineID tli pg_attribute_unused()) { bool completed = true; if (true) {"; next } \
@@ -6562,7 +6553,7 @@ test_cluster_wal_publish_tail.inc: $(top_srcdir)/src/backend/access/transam/xlog
 # and scheduler boundaries are supplied by the real-file C fixture.
 test_cluster_wal_publish_callers.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^AdvanceXLInsertBuffer\(/ { print "static void"; emit=1; count++ } \
-	     /^ClusterWALWaitForPublish\(/ { print "static void"; emit=1 } \
+	     /^ClusterWALWaitForWriter\(/ { print "static void"; emit=1 } \
 	     /^XLogFlush\(/ { print "void"; emit=1; count++ } \
 	     /^XLogBackgroundFlush\(/ { print "bool"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 3) exit 1 }' $< > $@.tmp
@@ -6575,16 +6566,14 @@ test_cluster_wal_publish_entry.inc: $(top_srcdir)/src/backend/access/transam/xlo
 	     END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_wal_durable_publish: test_cluster_wal_durable_publish.c
-bench_wal_publish_cost: bench_wal_publish_cost.c test_cluster_wal_durable_publish.c
+test_cluster_wal_writer: test_cluster_wal_writer.c
 
-# PGRAC: the optional cost executable shares the real publisher fixture and
-# is never built into postgres. Author: SqlRush <sqlrush@gmail.com>
-test_cluster_wal_durable_publish bench_wal_publish_cost: unit_test.h \
-		$(top_srcdir)/src/backend/cluster/cluster_wal_durable_publish.c \
-		$(CLUSTER_WAL_DURABLE_PREFIX_O) $(CLUSTER_WAL_CLAIM_O) xlogreader_fs.o \
+# PGRAC: writer runtime checks with native caller boundaries. Author: SqlRush <sqlrush@gmail.com>
+test_cluster_wal_writer: unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_writer.c \
+		$(CLUSTER_WAL_CLAIM_O) xlogreader_fs.o \
 		test_cluster_wal_publish_tail.inc test_cluster_wal_publish_callers.inc test_cluster_wal_publish_entry.inc
-	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c $(CLUSTER_WAL_DURABLE_PREFIX_O) $(CLUSTER_WAL_CLAIM_O) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c $(CLUSTER_WAL_CLAIM_O) \
 		xlogreader_fs.o $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 

@@ -189,7 +189,7 @@ cluster_control_bootstrap_prepare(const char *pgdata, const char *shared_root, c
 }
 
 void
-cluster_control_bootstrap_wal_recheck(const char *pgdata, ClusterWalDurablePrefixRef *out)
+cluster_control_bootstrap_wal_recheck(const char *pgdata, ClusterWalSourceRef *out)
 {
 	ClusterControlBootstrapObservation *fresh;
 	ClusterControlRootResult result;

@@ -98,7 +98,7 @@ RecoveryInProgress(void)
 	return false;
 }
 bool
-cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
 	memset(out, 0, sizeof(*out));
 	out->claim.identity.system_identifier = 11;
@@ -107,7 +107,7 @@ cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
 	return true;
 }
 bool
-cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
 {
 	(void)out;
 	abort();

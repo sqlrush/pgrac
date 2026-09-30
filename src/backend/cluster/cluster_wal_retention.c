@@ -1570,7 +1570,7 @@ wal_reuse_open_v2_target(const ClusterWalFileIdentity *file, const ClusterRecove
 						 ClusterWalFileObjectStamp *out_stamp, intptr_t *out_dir_handle,
 						 intptr_t *out_handle)
 {
-	ClusterWalDurablePrefixRef ref;
+	ClusterWalSourceRef ref;
 	ClusterWalThreadClaimV2 claim;
 	uint8 expected[CLUSTER_WAL_CLAIM_V2_BYTES];
 	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
@@ -2086,7 +2086,7 @@ wal_retention_e1_read_root(ClusterWalRetentionE1Context *context, bool discover_
 	ClusterControlRootResult result;
 
 	if (cluster_shared_config) {
-		ClusterWalDurablePrefixRef ref;
+		ClusterWalSourceRef ref;
 		if (!cluster_wal_thread_current_v2_ref(&ref)
 			|| ref.claim.identity.origin_thread_id != context->thread_id)
 			return false;

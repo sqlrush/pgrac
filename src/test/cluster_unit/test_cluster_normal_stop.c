@@ -2207,7 +2207,7 @@ cluster_control_root_v3_normal_stop_close(const ClusterPhase1FullStopPlan *plan,
 	return durable_close_result;
 }
 
-/* CF/file/PGWP behavior is exercised by test_cluster_control_root. This
+/* CF/file/native-WAL behavior is exercised by test_cluster_control_root. This
  * explicit boundary drives the real normal-stop consumer across pending,
  * exact completion and an identity change while that observation blocks. */
 ClusterControlRootResult

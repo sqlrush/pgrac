@@ -52,7 +52,7 @@ static PGAlignedBlock page;
 static SMgrRelationData smgr;
 static RelationData relation_data;
 static FormData_pg_class catalog;
-static ClusterWalDurablePrefixRef ref;
+static ClusterWalSourceRef ref;
 static ClusterSpaceIdentity disk_identity;
 static unsigned exists_calls, size_calls, read_calls;
 static bool pinned, locked, recovering, have_ref, have_space, invalidate_on_release;
@@ -168,14 +168,14 @@ RecoveryInProgress(void)
 }
 
 bool
-cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
 	*out = ref;
 	return have_ref;
 }
 
 bool
-cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
 {
 	abort();
 }

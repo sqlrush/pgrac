@@ -391,14 +391,14 @@ done:
 }
 
 static ClusterControlRootResult
-read_wal_routes(const char *pgdata, const char *wal_root, const ClusterWalDurablePrefixRef *ref,
-				const ClusterWalDurablePrefixRef *pending)
+read_wal_routes(const char *pgdata, const char *wal_root, const ClusterWalSourceRef *ref,
+				const ClusterWalSourceRef *pending)
 {
 	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 #if !defined(WIN32) && defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)           \
 	&& defined(AT_SYMLINK_NOFOLLOW)
 	int dirs[6] = { -1, -1, -1, -1, -1, -1 };
-	const ClusterWalDurablePrefixRef *refs[] = { ref, pending };
+	const ClusterWalSourceRef *refs[] = { ref, pending };
 	const unsigned generation_fds[] = { 3, 5 };
 	unsigned count = pending != NULL ? 2 : 1;
 	char thread[32], generation[2][48];
@@ -499,7 +499,7 @@ done:
 
 ClusterControlRootResult
 cluster_control_bootstrap_wal_route(const char *pgdata, const char *wal_root,
-									const ClusterWalDurablePrefixRef *ref)
+									const ClusterWalSourceRef *ref)
 {
 	return read_wal_routes(pgdata, wal_root, ref, NULL);
 }
@@ -1078,7 +1078,7 @@ read_source_capacity(BootstrapReadWork *work, const char *shared_root, const cha
 
 static ClusterControlRootResult
 read_startup_ref(const uint8 startup[CLUSTER_WAL_STARTUP_BYTES],
-				 const ClusterWalStartupImage *pending, ClusterWalDurablePrefixRef *ref)
+				 const ClusterWalStartupImage *pending, ClusterWalSourceRef *ref)
 {
 	pg_cryptohash_ctx *ctx;
 	bool hashed;
@@ -1117,7 +1117,7 @@ read_startup_maxima(const ClusterWalStartupObservation *input,
 
 static ClusterControlRootResult
 read_initializing_capacity(BootstrapReadWork *work, const char *wal_root,
-						   const ClusterWalDurablePrefixRef *ref,
+						   const ClusterWalSourceRef *ref,
 						   ClusterControlRecoveryCapacity *required)
 {
 	ClusterWalStartupObservation input;
@@ -1137,7 +1137,7 @@ static ClusterControlRootResult
 read_terminal_capacity(BootstrapReadWork *work, const char *shared_root, const char *wal_root,
 					   uint32 node, uint32 index, ClusterControlRecoveryCapacity *required)
 {
-	ClusterWalDurablePrefixRef ref;
+	ClusterWalSourceRef ref;
 	ClusterWalStartupObservation actual;
 	ClusterWalTerminalImage *terminal = &work->terminated;
 	ClusterControlRootResult result;
@@ -1208,7 +1208,7 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 			}
 		}
 		if (root->header.format_version == 3 && root->startup[node].generation != 0) {
-			ClusterWalDurablePrefixRef pending;
+			ClusterWalSourceRef pending;
 			result = read_again(work, shared_root, wal_root, BOOTSTRAP_STARTUP,
 								&root->records[node], NULL);
 			if (result != 0)

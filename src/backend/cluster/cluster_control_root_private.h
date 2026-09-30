@@ -10,7 +10,7 @@
 
 #include "catalog/pg_control.h"
 #include "cluster/cluster_control_root.h"
-#include "cluster/cluster_wal_durable_prefix.h"
+#include "cluster/cluster_wal_source.h"
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_startup_exit.h"
 #include "cluster_control_bootstrap_private.h"
@@ -175,8 +175,6 @@ typedef struct ClusterWalStartupImage {
 	ClusterWalHistoryRecord predecessor;
 	ClusterWalHistoryRecord successor;
 	ClusterWalThreadClaimV2 claim;
-	ClusterWalDurablePrefix prefix;
-	TimeLineID prefix_timeline;
 } ClusterWalStartupImage;
 
 /* Checkpoint-less initialization terminal. Logical carrier only: the embedded
@@ -279,7 +277,7 @@ extern ClusterControlRootResult cluster_wal_origin_inputs_read_locked(const Cont
  * OK returns this target's INITIALIZING operation, not serving permission.
  * An interrupted initialized writer needs recovery, never caller adoption. */
 extern ClusterControlRootResult
-cluster_control_root_v3_startup_advance_clean(const ClusterWalDurablePrefixRef *restart,
+cluster_control_root_v3_startup_advance_clean(const ClusterWalSourceRef *restart,
 											  ClusterWalStartupImage *out);
 
 /* Exact target StartupProcess, RESERVED only. Creates/reobserves empty
@@ -317,7 +315,7 @@ extern ClusterControlRootResult cluster_control_root_v3_startup_checkpoint(
  * admits SQL or publishes the runtime writer mirror. Refusal clears out. */
 extern ClusterControlRootResult
 cluster_control_root_v3_startup_install_writer(const ClusterWalStartupImage *expected,
-											   ClusterWalDurablePrefixRef *out);
+											   ClusterWalSourceRef *out);
 
 /* PGRAC: membership consumes the provider operation, not restart history.
  * An exact terminal stays selected (RECONFIG_WAIT, consumed=false) until the
@@ -442,7 +440,7 @@ extern ClusterControlRootResult cluster_wal_startup_empty_locked(const ControlRo
 																 bool sync);
 extern ClusterControlRootResult
 cluster_wal_startup_route_locked(const ControlRootImage *root, uint32 origin_node,
-								 const char *pgdata, const ClusterWalDurablePrefixRef *restart);
+								 const char *pgdata, const ClusterWalSourceRef *restart);
 
 /* Exact read-only consumption under existing clusterwide CF-S/X. No staging
  * directory or write permission required; refusal clears the whole output. */
@@ -572,14 +570,14 @@ extern ClusterControlRootResult cluster_control_root_v3_shutdown_checkpoint_publ
 	ClusterControlRootFileToken *out_token, ControlFileData *out_control);
 
 /* PGRAC: own checkpointer only; reads the exact root-selected shutdown WAL
- * and durable prefix. No lifecycle/serving/registry write. Not clean-close.
+ * and native end. No lifecycle/serving/registry write. Not clean-close.
  * Author: SqlRush <sqlrush@gmail.com> */
 extern ClusterControlRootResult
-cluster_control_root_v2_shutdown_observe(const ClusterWalDurablePrefixRef *expected,
+cluster_control_root_v2_shutdown_observe(const ClusterWalSourceRef *expected,
 										 ClusterControlRootSnapshot *out,
 										 ClusterControlRootFileToken *out_token);
 extern ClusterControlRootResult
-cluster_control_root_v3_shutdown_observe(const ClusterWalDurablePrefixRef *expected,
+cluster_control_root_v3_shutdown_observe(const ClusterWalSourceRef *expected,
 										 ClusterControlRootSnapshot *out,
 										 ClusterControlRootFileToken *out_token);
 
@@ -636,7 +634,7 @@ cluster_control_root_v3_stop_phase_read(uint16 thread, uint64 admitted_incarnati
 /* PGRAC: exact failed-writer control publishers. The request is a carrier,
  * not authority: each operation authenticates its opaque formation/fence
  * owners and the current physical v2 root. OPEN clears the checkpoint's old
- * tail; SEAL owns WALR-S and input-only IR-X, scans physical WAL/PGWP and
+ * tail; SEAL owns WALR-S and input-only IR-X, scans physical WAL and
  * publishes the final input. Neither operation replays data or opens serving.
  * All owned releases must be confirmed before outputs become usable.
  * Author: SqlRush <sqlrush@gmail.com> */

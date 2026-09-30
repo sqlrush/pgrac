@@ -69,10 +69,6 @@ CREATE FUNCTION test_pgrac_bootstrap_control_late(boolean)
 RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_bootstrap_control_late'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_bootstrap_control_late(boolean) FROM PUBLIC;
-CREATE FUNCTION test_pgrac_wal_publish_native(boolean)
-RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_wal_publish_native'
-LANGUAGE C STRICT;
-REVOKE ALL ON FUNCTION test_pgrac_wal_publish_native(boolean) FROM PUBLIC;
 CREATE FUNCTION test_pgrac_wal_history_native()
 RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_wal_history_native'
 LANGUAGE C STRICT;

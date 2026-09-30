@@ -696,7 +696,7 @@ HandleCheckpointerInterrupts(void)
 		 * fence-gated write inside the still-valid pre-handoff authority.
 		 */
 		if (cluster_shared_config) {
-			ClusterWalDurablePrefixRef ref;
+			ClusterWalSourceRef ref;
 			ClusterControlRootSnapshot stopped;
 			ClusterControlRootFileToken token;
 			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;

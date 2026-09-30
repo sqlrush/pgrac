@@ -52,6 +52,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_state.h" /* spec-4.2 ensure() */
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_writer.h"
 #include "cluster_control_bootstrap_private.h"
 #include "cluster_control_root_private.h"
 #include "miscadmin.h" /* IsUnderPostmaster, DataDir */
@@ -78,9 +79,9 @@ typedef struct ClusterWalThreadShmemData {
 	uint8 dir_validated;  /* routing validation passed */
 	uint8 claim_created;  /* this boot created the claim file */
 	uint8 _pad[3];
-	ClusterWalDurablePrefixRef v2_ref;
+	ClusterWalSourceRef v2_ref;
 	pg_atomic_uint32 writer_ref_state;
-	ClusterWalDurablePrefixRef restart_ref;
+	ClusterWalSourceRef restart_ref;
 	bool restart_ref_valid;
 
 	/* spec-4.2 D5: WAL-state registry refresh-failure counter (bumped by
@@ -120,11 +121,6 @@ cluster_wal_thread_shmem_init(void)
 		pg_atomic_init_u64(&cluster_wal_thread_shmem->wal_state_refresh_fail_count, 0);
 		memset(cluster_wal_thread_shmem->_reserved, 0, sizeof(cluster_wal_thread_shmem->_reserved));
 	}
-	/* PGRAC: allocate process-local flush resources before any WAL critical
-	 * section (also on EXEC_BACKEND attachment). No descriptors are inherited.
-	 * Author: SqlRush <sqlrush@gmail.com> */
-	if (cluster_enabled && cluster_shared_config)
-		cluster_wal_durable_publish_init();
 }
 
 static const ClusterShmemRegion cluster_wal_thread_region = {
@@ -202,7 +198,7 @@ cluster_wal_thread_dir_validated(void)
 }
 
 bool
-cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
 	if (out == NULL)
 		return false;
@@ -222,7 +218,7 @@ cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
 }
 
 bool
-cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
 {
 	if (out == NULL)
 		return false;
@@ -240,7 +236,7 @@ cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out)
 ClusterControlRootResult
 cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 {
-	ClusterWalDurablePrefixRef installed;
+	ClusterWalSourceRef installed;
 	ClusterControlRootResult result;
 	uint32 state = 0;
 	if (expected == NULL || !cluster_enabled || !cluster_shared_config
@@ -257,7 +253,7 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 		return result;
 	if (installed.claim.identity.origin_node_id != cluster_node_id
 		|| installed.claim.identity.origin_thread_id != cluster_wal_thread_id()
-		|| !cluster_wal_durable_startup_matches(&installed.claim.identity, expected->operation_uuid,
+		|| !cluster_wal_writer_startup_matches(&installed.claim.identity, expected->operation_uuid,
 												expected->first_segment_lsn))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (!pg_atomic_compare_exchange_u32(&cluster_wal_thread_shmem->writer_ref_state, &state, 1)) {
@@ -516,7 +512,7 @@ cluster_wal_thread_init(void)
 	 * Preparation and reobservation remain read-only namespace checks. The
 	 * subsequent physical/fence/recovery/serving gates still own admission. */
 	if (cluster_shared_config) {
-		ClusterWalDurablePrefixRef ref;
+		ClusterWalSourceRef ref;
 		if (cluster_wal_thread_shmem == NULL)
 			ereport(FATAL, (errmsg("shared WAL identity state is not initialized")));
 		/* All actual DataDir reads/crypto stay in the adapter's temporary owner;

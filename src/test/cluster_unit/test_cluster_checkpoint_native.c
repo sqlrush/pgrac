@@ -13,7 +13,8 @@
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_wal_thread.h"
-#include "cluster/cluster_wal_durable_prefix.h"
+#include "cluster/cluster_wal_source.h"
+#include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_write_fence.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_reconfig.h"
@@ -36,6 +37,7 @@
 UT_DEFINE_GLOBALS();
 
 bool cluster_shared_config = true, cluster_enabled = true;
+bool enableFsync = true;
 bool cluster_controlfile_shared_authority = true;
 AuxProcType MyAuxProcType = CheckpointerProcess;
 volatile uint32 CritSectionCount;
@@ -47,7 +49,7 @@ ErrorContextCallback *error_context_stack;
 static sigjmp_buf error_boundary;
 static ControlFileData current, selected, candidate;
 static ControlFileData *ControlFile = &current;
-static ClusterWalDurablePrefixRef ref;
+static ClusterWalSourceRef ref;
 static LWLockPadded locks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = locks;
 static Latch latch;
@@ -203,7 +205,7 @@ cluster_cf_authority_read(ControlFileData *o)
 	return read_ok;
 }
 bool
-cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *o)
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *o)
 {
 	*o = ref;
 	return ref_ok;
@@ -302,7 +304,7 @@ cluster_control_root_v3_shutdown_checkpoint_publish(const ClusterControlRootIden
 }
 
 bool
-cluster_wal_durable_startup_matches(const ClusterControlRootIdentity *self, const uint8 uuid[16],
+cluster_wal_writer_startup_matches(const ClusterControlRootIdentity *self, const uint8 uuid[16],
 									XLogRecPtr first)
 {
 	return startup_binding_ok && fence_ok && provider_ok && !prebump
@@ -320,7 +322,7 @@ cluster_control_root_v3_startup_checkpoint(const ClusterControlRootIdentity *sel
 	UT_ASSERT_EQ(cf_mode, NoLock);
 	UT_ASSERT(!local_lock && CritSectionCount == 0 && MyBackendType == B_STARTUP);
 	UT_ASSERT(
-		cluster_wal_durable_startup_matches(self, uuid, clusterStartupWriter.first_segment_lsn));
+		cluster_wal_writer_startup_matches(self, uuid, clusterStartupWriter.first_segment_lsn));
 	UT_ASSERT(c == &candidate && c->state == DB_SHUTDOWNED && end == 220);
 	UT_ASSERT_EQ(current.checkPoint, 100);
 	*out = clusterStartupWriter;
@@ -366,14 +368,14 @@ cluster_control_root_v3_read_thread_locked(const ClusterControlRootIdentity *sel
 }
 
 bool
-cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out)
+cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
 {
 	*out = ref;
 	return restart_ok;
 }
 
 ClusterControlRootResult
-cluster_control_root_v3_startup_advance_clean(const ClusterWalDurablePrefixRef *restart,
+cluster_control_root_v3_startup_advance_clean(const ClusterWalSourceRef *restart,
 											  ClusterWalStartupImage *out)
 {
 	UT_ASSERT(cf_mode == NoLock && !local_lock && CritSectionCount == 0);
@@ -413,7 +415,7 @@ cluster_control_root_v3_startup_route_writer(const ClusterControlRootIdentity *s
 }
 
 ClusterControlRootResult
-cluster_wal_durable_startup_prepare(const ClusterControlRootIdentity *self, const uint8 uuid[16],
+cluster_wal_writer_startup_prepare(const ClusterControlRootIdentity *self, const uint8 uuid[16],
 									XLogRecPtr *first)
 {
 	UT_ASSERT(cf_mode == NoLock && !local_lock && CritSectionCount == 0);
@@ -1139,12 +1141,44 @@ typedef struct {
 } XLogCtlInsert;
 static struct {
 	XLogCtlInsert Insert;
+	int info_lck;
+	TimeLineID InsertTimeLineID;
+	struct { XLogRecPtr Write, Flush; } LogwrtResult;
 } reserve_ctl, *XLogCtl = &reserve_ctl;
 #define SpinLockAcquire(l) ((void)(l))
 #define SpinLockRelease(l) ((void)(l))
 #include "test_cluster_startup_reserve_native.inc"
 #undef SpinLockAcquire
 #undef SpinLockRelease
+
+UT_TEST(native_startup_flush_requires_bound_owner_and_exact_timeline)
+{
+	for (unsigned fault = 0; fault < 14; fault++) {
+		XLogRecPtr end = 256;
+		TimeLineID timeline = 1;
+		startup_fixture();
+		enableFsync = true;
+		reserve_ctl.InsertTimeLineID = timeline;
+		reserve_ctl.LogwrtResult.Flush = end;
+		switch (fault) {
+		case 1: reserve_ctl.LogwrtResult.Flush--; break;
+		case 2: clusterStartupWriterBound = false; break;
+		case 3: clusterStartupWriterInstalled = true; break;
+		case 4: MyBackendType = B_BACKEND; break;
+		case 5: cluster_enabled = false; break;
+		case 6: cluster_shared_config = false; break;
+		case 7: enableFsync = false; break;
+		case 8: ShutdownRequestPending = true; break;
+		case 9: clusterStartupWriter.timeline++; break;
+		case 10: reserve_ctl.InsertTimeLineID++; break;
+		case 11: end = InvalidXLogRecPtr; break;
+		case 12: timeline = 0; break;
+		case 13: reserve_ctl.LogwrtResult.Flush++; break;
+		}
+		UT_ASSERT_EQ(ClusterXLogStartupFlushCovers(end, timeline), fault == 0 || fault == 13);
+	}
+	enableFsync = true;
+}
 
 UT_TEST(native_first_record_has_zero_xl_prev_only_for_bound_successor)
 {
@@ -1223,7 +1257,7 @@ UT_TEST(native_startup_insert_has_no_link_or_page_from_predecessor)
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(31);
 	UT_RUN(static_common_wait_precedes_initializer_and_native_directory);
 	UT_RUN(static_common_mismatch_or_cancel_never_writes);
 	UT_RUN(static_common_is_rechecked_before_new_wal_binding);
@@ -1254,6 +1288,7 @@ main(void)
 	UT_RUN(writer_begin_rejects_wrong_input_or_failed_route_without_binding);
 	UT_RUN(native_startup_insert_has_no_link_or_page_from_predecessor);
 	UT_RUN(native_first_record_has_zero_xl_prev_only_for_bound_successor);
+	UT_RUN(native_startup_flush_requires_bound_owner_and_exact_timeline);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
