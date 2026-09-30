@@ -348,16 +348,140 @@ UT_TEST(test_record_identity_binds_full_decoded_tuple)
 	rf_page_online_plan_destroy_v1(&plan);
 }
 
+/* Execute the old production arrival path until the dependency collector is
+ * present, so the baseline fails on the actual reverse-arrival behavior. */
+static RfPageProofDetailV1
+queue_record(RfPageOnlinePlanV1 *plan, FakeRecord *record, uint16 participant)
+{
+	RfPageOnlineRecordIdentityV1 id = record_identity(record);
+	id.participant_index = participant;
+	id.record.origin_thread = participant + 1;
+#ifdef CLUSTER_PAGE_DEPENDENCY_QUEUE_V1
+	return rf_page_online_plan_queue_record_v1(plan, &record->plan, &id);
+#else
+	return rf_page_online_plan_feed_record_v1(plan, &record->plan, &id);
+#endif
+}
+
+static RfPageOnlinePlanV1 *
+three_stream_plan(void)
+{
+	RfContributorStreamCutV1 cuts[3] = {{0}};
+	RfPageOnlinePlanRequestV1 request = {0};
+	RfPageOnlinePlanV1 *plan = NULL;
+	int i;
+	for (i = 0; i < 3; i++) {
+		cuts[i].failed_thread = i + 1;
+		cuts[i].timeline_id = 1;
+		cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		cuts[i].scan_begin_inclusive = 0x100;
+		cuts[i].scan_end_exclusive = 0x200;
+	}
+	request.system_identifier = 99;
+	memset(request.storage_uuid, 3, 16);
+	request.physical_cuts = cuts;
+	request.participant_count = 3;
+	request.retention_binding_cookie = 41;
+	UT_ASSERT_EQ(rf_page_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+UT_TEST(test_reverse_arrival_uses_exact_edges_even_with_later_fpi)
+{
+	RfPageOnlinePlanV1 *plan = three_stream_plan();
+	FakeRecord record;
+	RfPageOnlineTargetViewV1 target;
+
+	/* Same LSN/SCN in distinct streams. Tokens deliberately decrease. Reuse
+	 * the caller's decoded storage before seal; the plan must own its bytes. */
+	init_record(&record, 0x100, 0x200, 1);
+	set_component(&record, 0, 10, 1, 60, 7, true);
+	UT_ASSERT_EQ(queue_record(plan, &record, 2), RF_PAGE_PROOF_DETAIL_OK);
+	init_record(&record, 0x100, 0x200, 1);
+	set_component(&record, 0, 10, 1, 900, 60, false);
+	UT_ASSERT_EQ(queue_record(plan, &record, 1), RF_PAGE_PROOF_DETAIL_OK);
+	init_record(&record, 0x100, 0x200, 1);
+	set_component(&record, 0, 10, 1, 10, 900, true);
+	UT_ASSERT_EQ(queue_record(plan, &record, 0), RF_PAGE_PROOF_DETAIL_OK);
+	memset(&record, 0xcc, sizeof(record));
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_page_online_plan_target_v1(plan, 0, &target));
+	if (rf_page_online_plan_target_v1(plan, 0, &target)) {
+		UT_ASSERT_EQ(target.expected_before.mutation_token, 10);
+		UT_ASSERT_EQ(target.expected_result.mutation_token, 7);
+		UT_ASSERT_EQ(((PageHeader)target.canonical_page)->pd_block_scn, 7);
+		UT_ASSERT_EQ(target.contributors->edge_count, 3);
+	}
+	rf_page_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_multi_page_record_waits_for_both_predecessors)
+{
+	RfPageOnlinePlanV1 *plan = three_stream_plan();
+	FakeRecord record;
+	RfPageOnlineTargetViewV1 target;
+	init_record(&record, 0x100, 0x200, 2);
+	set_component(&record, 0, 10, 1, 900, 7, false);
+	set_component(&record, 1, 10, 2, 600, 7, false);
+	UT_ASSERT_EQ(queue_record(plan, &record, 2), RF_PAGE_PROOF_DETAIL_OK);
+	init_record(&record, 0x100, 0x200, 1);
+	set_component(&record, 0, 10, 1, 10, 900, true);
+	UT_ASSERT_EQ(queue_record(plan, &record, 0), RF_PAGE_PROOF_DETAIL_OK);
+	init_record(&record, 0x100, 0x200, 1);
+	set_component(&record, 0, 10, 2, 20, 600, true);
+	UT_ASSERT_EQ(queue_record(plan, &record, 1), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_target_count_v1(plan), 2);
+	for (int i = 0; i < 2; i++) {
+		UT_ASSERT(rf_page_online_plan_target_v1(plan, i, &target));
+		if (rf_page_online_plan_target_v1(plan, i, &target))
+			UT_ASSERT_EQ(target.expected_result.mutation_token, 7);
+	}
+	rf_page_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_closed_input_without_base_has_no_published_target)
+{
+	RfPageOnlinePlanV1 *plan = create_plan(0x100, 0x200);
+	FakeRecord record;
+	init_record(&record, 0x100, 0x200, 1);
+	set_component(&record, 0, 10, 1, 10, 11, false);
+	UT_ASSERT_EQ(queue_record(plan, &record, 0), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_ANCHOR_MISSING);
+	UT_ASSERT_EQ(rf_page_online_plan_target_count_v1(plan), 0);
+	rf_page_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_ordered_side_only_feed_cannot_mix_with_queued_input)
+{
+	RfPageOnlinePlanV1 *plan = create_plan(0x100, 0x300);
+	FakeRecord record;
+	RfPageOnlineRecordIdentityV1 id;
+
+	init_record(&record, 0x100, 0x200, 0);
+	id = record_identity(&record);
+	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	init_record(&record, 0x200, 0x300, 1);
+	set_component(&record, 0, 10, 1, 10, 11, true);
+	UT_ASSERT_EQ(queue_record(plan, &record, 0), RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT);
+	rf_page_online_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(10);
 	UT_RUN(test_two_record_chain_builds_canonical_target);
 	UT_RUN(test_record_failure_is_atomic_and_retryable);
 	UT_RUN(test_first_delta_requires_full_anchor);
 	UT_RUN(test_edge_gap_does_not_advance_stream);
 	UT_RUN(test_seal_requires_complete_physical_cut);
 	UT_RUN(test_record_identity_binds_full_decoded_tuple);
+	UT_RUN(test_reverse_arrival_uses_exact_edges_even_with_later_fpi);
+	UT_RUN(test_multi_page_record_waits_for_both_predecessors);
+	UT_RUN(test_closed_input_without_base_has_no_published_target);
+	UT_RUN(test_ordered_side_only_feed_cannot_mix_with_queued_input);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

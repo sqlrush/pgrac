@@ -11,6 +11,7 @@
 #include "cluster/cluster_page_detached.h"
 
 #define CLUSTER_PAGE_ONLINE_PLAN_INTERFACE_V1 1
+#define CLUSTER_PAGE_DEPENDENCY_QUEUE_V1 1
 #define RF_PAGE_ONLINE_PLAN_MAX_BYTES (8 * 1024 * 1024)
 
 typedef struct RfPageOnlinePlanV1 RfPageOnlinePlanV1;
@@ -48,6 +49,12 @@ extern RfPageProofDetailV1
 rf_page_online_plan_feed_record_v1(RfPageOnlinePlanV1 *plan,
 								   const RfDetachedRecordPlanV1 *record_plan,
 								   const RfPageOnlineRecordIdentityV1 *identity);
+/* Closed-input callers collect immutable records before seal resolves exact
+ * cross-participant dependencies. Never mix queue and direct ordered feed. */
+extern RfPageProofDetailV1
+rf_page_online_plan_queue_record_v1(RfPageOnlinePlanV1 *plan,
+									const RfDetachedRecordPlanV1 *record_plan,
+									const RfPageOnlineRecordIdentityV1 *identity);
 extern RfPageProofDetailV1 rf_page_online_plan_seal_v1(RfPageOnlinePlanV1 *plan);
 extern uint32 rf_page_online_plan_target_count_v1(const RfPageOnlinePlanV1 *plan);
 extern bool rf_page_online_plan_target_v1(const RfPageOnlinePlanV1 *plan, uint32 index,

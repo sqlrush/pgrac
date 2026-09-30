@@ -184,7 +184,7 @@ cluster_thread_recovery_fabric_plan_feed_record_v1(ClusterThreadRecoveryFabricPl
 	identity.record.rmid = decoded->header.xl_rmid;
 	identity.record.info = decoded->header.xl_info;
 	identity.participant_index = participant_index;
-	detail = rf_page_online_plan_feed_record_v1(plan->page_plan, &record_plan, &identity);
+	detail = rf_page_online_plan_queue_record_v1(plan->page_plan, &record_plan, &identity);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		goto fail;
 	detail = rf_side_online_plan_feed_record_v1(plan->side_plan, &record_plan, &identity);

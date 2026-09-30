@@ -79,7 +79,7 @@ rf_page_detached_preflight_v1(XLogReaderState *record, bool space_active,
 }
 
 RfPageProofDetailV1
-rf_page_online_plan_feed_record_v1(RfPageOnlinePlanV1 *plan,
+rf_page_online_plan_queue_record_v1(RfPageOnlinePlanV1 *plan,
 								   const RfDetachedRecordPlanV1 *record_plan,
 								   const RfPageOnlineRecordIdentityV1 *identity)
 {

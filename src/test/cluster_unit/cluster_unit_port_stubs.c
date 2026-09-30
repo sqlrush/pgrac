@@ -22,6 +22,10 @@ bool cluster_update_trace_enabled __attribute__((weak)) = false;
 bool cluster_xnode_profile_enabled __attribute__((weak)) = false;
 ClusterXnodeProfileShared *ClusterXnodeProfileCtl __attribute__((weak)) = NULL;
 
+/* PageSetLSN reads the static shared-storage profile. Legacy standalone
+ * fixtures default to off; shared-profile tests supply their own value. */
+bool cluster_shared_config __attribute__((weak)) = false;
+
 void __attribute__((weak))
 cluster_update_trace_event_at(const ClusterUpdateTraceEvent *event pg_attribute_unused(),
 							  uint64 now pg_attribute_unused())

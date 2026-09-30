@@ -432,6 +432,7 @@ TESTS += test_cluster_sequence_version
 TESTS += test_cluster_relation_wal_policy
 TESTS += test_cluster_heap_small_redo
 TESTS += test_cluster_btree_redo
+TESTS += test_cluster_page_dependency
 CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o \
 		test_cluster_block_apply_btree_product.o
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
@@ -1252,6 +1253,21 @@ test_cluster_page_online_plan: test_cluster_page_online_plan.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
 		-lssl -lcrypto -o $@
+
+test_cluster_page_dependency_base.o: $(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_page_dependency: test_cluster_page_dependency.c unit_test.h \
+		$(top_srcdir)/src/include/storage/bufpage.h \
+		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
+		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o \
+		test_cluster_page_dependency_base.o xlogreader_fs.o $(XLOG_PAGE_EDGE_ENCODER_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_PAGE_ONLINE_PLAN_O) \
+		$(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) $(CLUSTER_BLOCK_APPLY_O) \
+		test_cluster_space_bufpage_product.o test_cluster_page_dependency_base.o xlogreader_fs.o \
+		$(XLOG_PAGE_EDGE_ENCODER_O) \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto -llz4 -lzstd -o $@
 
 $(CLUSTER_PAGE_REPLAY_BATCH_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_page_replay_batch.c \
@@ -3687,6 +3703,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_space_fsm_hint.inc
 	rm -f test_cluster_space_fsm_truncate.inc test_cluster_space_fsm_product.o
 	rm -f test_cluster_space_xmax_hint.inc
+	rm -f test_cluster_page_dependency_base.o
 	rm -f test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc
