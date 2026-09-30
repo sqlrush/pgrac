@@ -343,6 +343,8 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	SMgrRelation reln;
 
 #ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceTruncateState *space_truncate = NULL;
+
 	/*
 	 * PGRAC: spec-5.7 D6 (KO).  Before shrinking the relfilenode's file, make
 	 * every alive peer flush + drop its buffers for this relfilenode so a stale
@@ -398,6 +400,15 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 		}
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config && RelationIsPermanent(rel)
+		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1)
+	{
+		space_truncate = cluster_space_truncate_prepare(rel, nblocks);
+		if (space_truncate == NULL)
+			elog(ERROR, "cannot prepare exact SPACE truncate");
+	}
+#endif
 	RelationPreTruncate(rel);
 
 	/*
@@ -450,17 +461,22 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 		 * Make an XLOG entry reporting the file truncation.
 		 */
 		XLogRecPtr	lsn;
-		xl_smgr_truncate xlrec;
+#ifdef USE_PGRAC_CLUSTER
+		if (space_truncate != NULL)
+			lsn = cluster_space_truncate_log(space_truncate);
+		else
+#endif
+		{
+			xl_smgr_truncate xlrec;
 
-		xlrec.blkno = nblocks;
-		xlrec.rlocator = rel->rd_locator;
-		xlrec.flags = SMGR_TRUNCATE_ALL;
-
-		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec, sizeof(xlrec));
-
-		lsn = XLogInsert(RM_SMGR_ID,
-						 XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
+			xlrec.blkno = nblocks;
+			xlrec.rlocator = rel->rd_locator;
+			xlrec.flags = SMGR_TRUNCATE_ALL;
+			XLogBeginInsert();
+			XLogRegisterData((char *) &xlrec, sizeof(xlrec));
+			lsn = XLogInsert(RM_SMGR_ID,
+							 XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
+		}
 
 		/*
 		 * Flush, because otherwise the truncation of the main relation might
@@ -479,11 +495,19 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	 * corresponding files on disk.
 	 */
 	smgrtruncate2(RelationGetSmgr(rel), forks, nforks, old_blocks, blocks);
+#ifdef USE_PGRAC_CLUSTER
+	if (space_truncate != NULL)
+		cluster_space_truncate_publish(space_truncate);
+#endif
 
 	END_CRIT_SECTION();
 
 	/* We've done all the critical work, so checkpoints are OK now. */
 	MyProc->delayChkptFlags &= ~(DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE);
+#ifdef USE_PGRAC_CLUSTER
+	if (space_truncate != NULL)
+		cluster_space_truncate_finish(space_truncate, rel);
+#endif
 
 	/*
 	 * Update upper-level FSM pages to account for the truncation. This is

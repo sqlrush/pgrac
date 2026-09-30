@@ -36,7 +36,9 @@
 #include "storage/buf_internals.h"
 #include "storage/freespace.h"
 #include "storage/smgr.h"
+#include "storage/proc.h"
 #include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "unit_test.h"
@@ -86,6 +88,10 @@ sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 static BufferDescPadded descriptors[2];
 BufferDescPadded *BufferDescriptors = descriptors;
+static bool truncate_owner, expecting_error;
+static unsigned relation_flushes, fork_syncs, invalidations, random_calls;
+static PGPROC proc;
+PGPROC *MyProc = &proc;
 
 void
 pg_re_throw(void)
@@ -123,8 +129,11 @@ bool
 cluster_bufmgr_pcm_x_content_holder_write_permitted(BufferDesc *buffer)
 {
 	UT_ASSERT(reserve_owner);
-	UT_ASSERT(buffer == GetBufferDescriptor(1));
-	UT_ASSERT_EQ(locked, 2);
+	if (!truncate_owner) {
+		UT_ASSERT(buffer == GetBufferDescriptor(1));
+		UT_ASSERT_EQ(locked, 2);
+	} else
+		UT_ASSERT(locked & (1 << buffer->buf_id));
 	return writer_allowed;
 }
 
@@ -138,7 +147,7 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 bool
 pg_strong_random(void *bytes, size_t len)
 {
-	memset(bytes, 0x45, len);
+	memset(bytes, 0x45 + random_calls++, len);
 	return true;
 }
 
@@ -192,8 +201,10 @@ smgrexists(SMgrRelation rel, ForkNumber forknum)
 {
 	if (rel != &storage)
 		abort();
-	if (recovering && (forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM))
+	if ((recovering || truncate_owner) && (forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM))
 		return auxiliary_forks;
+	if (truncate_owner && forknum == MAIN_FORKNUM)
+		return true;
 	if (forknum != SPACE_FORKNUM)
 		abort();
 	return exists;
@@ -219,11 +230,11 @@ smgrnblocks(SMgrRelation rel, ForkNumber forknum)
 {
 	if (rel != &storage)
 		abort();
-	if (recovering && forknum == MAIN_FORKNUM)
+	if ((recovering || truncate_owner) && forknum == MAIN_FORKNUM)
 		return main_blocks;
-	if (recovering && auxiliary_forks && forknum == FSM_FORKNUM)
+	if ((recovering || truncate_owner) && auxiliary_forks && forknum == FSM_FORKNUM)
 		return 8;
-	if (recovering && auxiliary_forks && forknum == VISIBILITYMAP_FORKNUM)
+	if ((recovering || truncate_owner) && auxiliary_forks && forknum == VISIBILITYMAP_FORKNUM)
 		return 3;
 	if (forknum != SPACE_FORKNUM)
 		abort();
@@ -233,6 +244,12 @@ smgrnblocks(SMgrRelation rel, ForkNumber forknum)
 void
 XLogFlush(XLogRecPtr lsn)
 {
+	if (truncate_owner) {
+		UT_ASSERT_EQ(lsn, UINT64_C(0x10000200));
+		UT_ASSERT_EQ(CritSectionCount, 1);
+		flush_calls++;
+		return;
+	}
 	if (reserve_owner) {
 		if (recovering || lsn != UINT64_C(0x10000200) || locked != 2 || CritSectionCount != 0)
 			abort();
@@ -262,6 +279,13 @@ smgrclearowner(SMgrRelation *owner, SMgrRelation rel)
 		abort();
 	*owner = NULL;
 	rel->smgr_owner = NULL;
+}
+void
+smgrsetowner(SMgrRelation *owner, SMgrRelation rel)
+{
+	UT_ASSERT(rel == &storage);
+	*owner = rel;
+	rel->smgr_owner = owner;
 }
 
 BlockNumber
@@ -294,7 +318,8 @@ smgrtruncate2(SMgrRelation rel, ForkNumber *forks, int nforks, BlockNumber *oldb
 			  BlockNumber *newblocks)
 {
 	if (rel != &storage || nforks != (auxiliary_forks ? 3 : 1) || forks[0] != MAIN_FORKNUM
-		|| locked != 3 || pinned != 3 || CritSectionCount == 0 || flush_calls != truncate_calls + 1
+		|| (!truncate_owner && (locked != 3 || pinned != 3))
+		|| CritSectionCount == 0 || flush_calls != truncate_calls + 1
 		|| oldblocks[0] != main_blocks || newblocks[0] != 4)
 		abort();
 	if (auxiliary_forks
@@ -367,6 +392,10 @@ MarkBufferDirty(Buffer buffer)
 void
 XLogBeginInsert(void)
 {
+	if (truncate_owner) {
+		UT_ASSERT_EQ(CritSectionCount, 1);
+		return;
+	}
 	if ((!locked && !native_owner) || CritSectionCount != 0)
 		abort();
 }
@@ -377,6 +406,10 @@ XLogRegisterData(char *bytes, uint32 len)
 	registered_len = len;
 	if (native_owner && len == sizeof(xl_smgr_create) && CritSectionCount == 0)
 		return;
+	if (truncate_owner && len == sizeof(xl_smgr_truncate)) {
+		memcpy(wal_bytes, bytes, len);
+		return;
+	}
 	if ((len != sizeof(wal_bytes) && len != CLUSTER_SPACE_WAL_BYTES
 		&& len != CLUSTER_SPACE_RESERVATION_WAL_BYTES) || CritSectionCount != 1)
 		abort();
@@ -392,6 +425,25 @@ XLogInsert(RmgrId rmid, uint8 info)
 	ClusterSpaceReservation reservation;
 	uint64 token;
 
+	if (truncate_owner) {
+		UT_ASSERT_EQ(CritSectionCount, 1);
+		UT_ASSERT_EQ(rmid, RM_SMGR_ID);
+		if (info == (XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE)) {
+			UT_ASSERT_EQ(locked, 3);
+			UT_ASSERT_EQ(relation_flushes, 1);
+			UT_ASSERT(fork_syncs >= 2);
+			UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, registered_len, &pair));
+			UT_ASSERT_EQ(pair.identity.action, CLUSTER_SPACE_WAL_TRUNCATE);
+			/* Both buffers are selected for checkpoint, but retain before
+			 * until the original physical shrink has completed. */
+			UT_ASSERT_EQ(dirty_calls, 2);
+			UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, pair.identity.before_token);
+			UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, pair.reservation.before_token);
+		}
+		wal_calls++;
+		wal_info = info;
+		return UINT64_C(0x10000200);
+	}
 	if (native_owner && info == (XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE)
 		&& registered_len == sizeof(xl_smgr_create) && rmid == RM_SMGR_ID)
 		return UINT64_C(0x10000100);
@@ -458,6 +510,8 @@ palloc0(Size size)
 	 * recovery memory context, which disallows allocation in a critical
 	 * section, rather than masking the native allocation with a static rel. */
 	UT_ASSERT_EQ(CritSectionCount, 0);
+	if (truncate_owner && fake_relation != NULL)
+		return calloc(1, size);
 	if (fake_relation != NULL || size < sizeof(RelationData))
 		abort();
 	fake_relation = calloc(1, size);
@@ -496,6 +550,8 @@ hash_search(HTAB *hash, const void *key, HASHACTION action, bool *found)
 	(void)found;
 	abort();
 }
+void hash_seq_init(HASH_SEQ_STATUS *status, HTAB *hash) { abort(); }
+void *hash_seq_search(HASH_SEQ_STATUS *status) { abort(); }
 void
 smgrdounlinkall(SMgrRelation *rels, int count, bool redo)
 {
@@ -524,6 +580,38 @@ errmsg(const char *fmt, ...)
 	(void)fmt;
 	abort();
 }
+bool errstart(int level, const char *domain) { return level >= ERROR; }
+bool errstart_cold(int level, const char *domain) { return errstart(level, domain); }
+int errmsg_internal(const char *fmt, ...) { return 0; }
+void
+errfinish(const char *file, int line, const char *function)
+{
+	if (expecting_error) pg_re_throw();
+	fprintf(stderr, "unexpected error %s:%d %s\n", file, line, function);
+	abort();
+}
+void
+FlushRelationBuffers(Relation rel)
+{
+	UT_ASSERT(truncate_owner && rel == fake_relation && locked == 0);
+	UT_ASSERT_EQ(ko_calls, 1);
+	relation_flushes++;
+}
+void
+smgrimmedsync(SMgrRelation rel, ForkNumber fork)
+{
+	UT_ASSERT(truncate_owner && rel == &storage && locked == 0);
+	UT_ASSERT_EQ(relation_flushes, 1);
+	fork_syncs++;
+}
+void
+CacheInvalidateRelcache(Relation rel)
+{
+	UT_ASSERT(rel == fake_relation && truncate_owner);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(locked, 0);
+	invalidations++;
+}
 int
 errcode(int code)
 {
@@ -537,6 +625,11 @@ reset(void)
 	if (fake_relation != NULL)
 		abort();
 	fake_allocations = fake_frees = 0;
+	truncate_owner = expecting_error = false;
+	relation_flushes = fork_syncs = invalidations = random_calls = 0;
+	memset(&proc, 0, sizeof(proc));
+	descriptors[0].bufferdesc.buf_id = 0;
+	descriptors[1].bufferdesc.buf_id = 1;
 	memset(pages, 0, sizeof(pages));
 	memset(wal_bytes, 0, sizeof(wal_bytes));
 	memset(&storage, 0, sizeof(storage));
@@ -1285,11 +1378,84 @@ UT_TEST(test_private_owner_releases_hw_on_wal_flush_error)
 	UT_ASSERT_EQ(CritSectionCount, 0);
 }
 
+static Relation
+native_truncate_relation(void)
+{
+	ClusterSpaceIdentity identity;
+	ClusterSpaceReservation reservation = {0};
+	HwLock lock;
+	Relation rel;
+
+	reservation_owner(&identity, &lock);
+	reservation.identity = identity;
+	reservation.next_block = 10;
+	if (!cluster_space_reservation_page_encode(&reservation, 23, pages[1].data, BLCKSZ))
+		abort();
+	rel = CreateFakeRelcacheEntry(locator);
+	rel->rd_id = locator.relNumber;
+	rel->rd_smgr = &storage;
+	truncate_owner = true;
+	wal_calls = dirty_calls = flush_calls = 0;
+	return rel;
+}
+
+UT_TEST(test_native_truncate_logs_pair_after_durable_base_before_publish)
+{
+	ClusterSpaceStructureChange change;
+	Relation rel = native_truncate_relation();
+	ClusterSpaceIdentity identity;
+	ClusterSpaceReservation reservation;
+	uint64 token;
+
+	RelationTruncate(rel, 4);
+	UT_ASSERT_EQ(wal_info, XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE);
+	UT_ASSERT_EQ(main_blocks, 4);
+	UT_ASSERT_EQ(truncate_calls, 1);
+	UT_ASSERT_EQ(relation_flushes, 1);
+	UT_ASSERT_EQ(fork_syncs, 2);
+	UT_ASSERT_EQ(invalidations, 1);
+	UT_ASSERT_EQ(MyProc->delayChkptFlags, 0);
+	UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, registered_len, &change));
+	if (registered_len == CLUSTER_SPACE_STRUCTURE_WAL_BYTES) {
+		UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
+			&change.identity.result.key, &identity, &token));
+		UT_ASSERT_EQ(token, change.identity.result_token);
+		UT_ASSERT_EQ(identity.sequence, 2);
+		UT_ASSERT(memcmp(identity.incarnation, change.identity.expected.incarnation, 16) != 0);
+		UT_ASSERT(cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1,
+			&identity.key, &reservation, &token));
+		UT_ASSERT_EQ(reservation.next_block, 4);
+		UT_ASSERT_EQ(token, change.identity.result_token);
+	}
+	UT_ASSERT(!pinned && !locked);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_native_truncate_bad_pair_refuses_before_physical_change)
+{
+	Relation rel = native_truncate_relation();
+	PGAlignedBlock saved[2];
+	volatile bool caught = false;
+
+	pages[1].data[BLCKSZ - 1] = 1;
+	memcpy(saved, pages, sizeof(pages));
+	expecting_error = true;
+	PG_TRY(); { RelationTruncate(rel, 4); }
+	PG_CATCH(); { caught = true; } PG_END_TRY();
+	expecting_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(main_blocks, 10);
+	UT_ASSERT_EQ(truncate_calls + wal_calls + dirty_calls + invalidations, 0);
+	UT_ASSERT(memcmp(saved, pages, sizeof(pages)) == 0);
+	UT_ASSERT(!pinned && !locked);
+	FreeFakeRelcacheEntry(rel);
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(25);
+	UT_PLAN(27);
 	UT_RUN(test_real_create_binds_selected_namespace_and_wal);
 	UT_RUN(test_no_create_on_legacy_or_unproved_namespace);
 	UT_RUN(test_existing_identity_is_never_recreated);
@@ -1315,6 +1481,8 @@ main(void)
 	UT_RUN(test_reservation_opcode_cannot_perform_structural_init);
 	UT_RUN(test_private_owner_requires_exact_range_and_releases_hw);
 	UT_RUN(test_private_owner_releases_hw_on_wal_flush_error);
+	UT_RUN(test_native_truncate_logs_pair_after_durable_base_before_publish);
+	UT_RUN(test_native_truncate_bad_pair_refuses_before_physical_change);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

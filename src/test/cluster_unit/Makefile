@@ -5105,9 +5105,9 @@ test_cluster_rdma_stop: test_cluster_rdma_stop.c test_cluster_rdma_stop.inc unit
 test_cluster_rdma_stop_disabled: test_cluster_rdma_stop.c test_cluster_rdma_stop.inc unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DPGRAC_TEST_RDMA_DISABLED $< -o $@
 
-test_cluster_ko_stop: test_cluster_ko_stop.c unit_test.h \
+test_cluster_ko_stop: test_cluster_ko_stop.c unit_test.h $(CLUSTER_HW_LEASE_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_HW_LEASE_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@

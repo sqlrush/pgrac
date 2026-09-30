@@ -3324,7 +3324,8 @@ cluster_init_guc(void)
 		gettext_noop(
 			"Flush a relation's buffers on every peer before its storage is removed or truncated."),
 		gettext_noop(
-			"off skips the cross-node flush barrier: a peer's stale dirty buffers could be written "
+			"The shared profile always requires this barrier. Otherwise, off skips it: "
+			"a peer's stale dirty buffers could be written "
 			"back after the file is unlinked, recreating the file or corrupting a reused "
 			"relfilenode in a multi-node cluster."),
 		&cluster_object_reuse_flush_enabled, true, PGC_SUSET, 0, NULL, NULL, NULL);

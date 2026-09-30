@@ -53,6 +53,7 @@
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_hw_lease.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_inject.h"
@@ -433,6 +434,10 @@ cluster_ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence)
 		return;
 	if (cluster_node_id < 0 || RecoveryInProgress())
 		return;
+	/* The caller holds exclusive lifecycle authority. A parked range from
+	 * before a truncate/reset must not survive until this file regrows.
+	 * Discard even when there are no peers; aborted DDL only orphans it. */
+	cluster_hw_lease_discard(rloc, MAIN_FORKNUM);
 	/*
 	 * MXA-K14 / §12.8: the AccessExclusiveLock held by the DDL caller
 	 * prevents a new reference publication while this bounded journal census
@@ -449,7 +454,7 @@ cluster_ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence)
 						(unsigned)rloc.spcOid, (unsigned)rloc.dbOid, (unsigned)rloc.relNumber),
 				 errhint("Wait for canonical terminal-reference cleanout and retry.")));
 	}
-	if (!cluster_object_reuse_flush_enabled)
+	if (!cluster_object_reuse_flush_enabled && !cluster_shared_config)
 		return;
 	/*
 	 * Engage from runtime liveness, not the static configured node count
@@ -669,6 +674,7 @@ cluster_ko_drain_inbound_and_apply(void)
 		 */
 		FlushRelationsAllBuffers(&smgr, 1);
 		DropRelationsAllBuffers(&smgr, 1);
+		cluster_hw_lease_discard(rloc, MAIN_FORKNUM);
 		KO_BUMP(peer_apply_count);
 
 		/*

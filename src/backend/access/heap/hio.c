@@ -52,11 +52,10 @@ struct ClusterSpaceIdentity;
  * the relation, validated against the CURRENT relation size: VACUUM can
  * truncate the trailing zero pages out from under a live lease (they are
  * empty by construction), leaving the parked range pointing past EOF.  A
- * stale range is discarded (bookkeeping only -- the storage was already
- * reclaimed by the truncation) and reads as a lease miss, so the caller
- * falls through to the native FSM / extend path.  A residual race with a
- * concurrent truncation ends in the ordinary read-beyond-EOF error --
- * fail-closed, never a wrong page.
+ * stale range is discarded and reads as a lease miss, so the caller falls
+ * through to the native FSM / extend path. This EOF check does not certify
+ * an allocation generation: the exclusive lifecycle/KO barrier discards
+ * every node's old lease before RESET, including when the file later regrows.
  */
 static BlockNumber
 cluster_hio_lease_target_block(Relation relation)

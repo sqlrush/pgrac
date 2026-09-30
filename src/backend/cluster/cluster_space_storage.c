@@ -678,6 +678,127 @@ cluster_space_reserve_exact(const ClusterSpaceIdentity *identity, BlockNumber fi
 	return reserved == first && granted == count;
 }
 
+struct ClusterSpaceTruncateState {
+	Buffer buffers[2];
+	PGAlignedBlock result[2];
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	uint64 token;
+	XLogRecPtr lsn;
+};
+
+static void
+space_truncate_release(ClusterSpaceTruncateState *state)
+{
+	for (int i = 1; i >= 0; i--)
+		if (BufferIsValid(state->buffers[i]))
+			UnlockReleaseBuffer(state->buffers[i]);
+	pfree(state);
+}
+
+ClusterSpaceTruncateState *
+cluster_space_truncate_prepare(Relation rel, BlockNumber nblocks)
+{
+	ClusterSpaceTruncateState *state;
+	ClusterSpaceIdentityKey expected;
+	ClusterSpaceStructureChange change = {0};
+	ClusterSpaceWalChange *identity = &change.identity;
+	ClusterSpaceReservationChange *reservation = &change.reservation;
+	SMgrRelation smgr;
+	uint8 apply_mask;
+
+	if (rel == NULL || RecoveryInProgress() || !RelationIsPermanent(rel)
+		|| !RelationNeedsWAL(rel) || nblocks == InvalidBlockNumber
+		|| !space_namespace(rel->rd_locator, false, &expected, NULL))
+		return NULL;
+	smgr = smgropen(expected.locator, InvalidBackendId);
+	if (!smgrexists(smgr, SPACE_FORKNUM) || smgrnblocks(smgr, SPACE_FORKNUM) != 2)
+		return NULL;
+	/* KO has drained peer buffers. Finish this instance's writeback and
+	 * fsync all surviving forks before binding their bytes to a new UUID.
+	 * No SPACE content lock is held during buffer traversal or SMgr reopen. */
+	FlushRelationBuffers(rel);
+	for (ForkNumber fork = MAIN_FORKNUM; fork <= SPACE_FORKNUM; fork++) {
+		if (fork == INIT_FORKNUM)
+			continue;
+		smgr = smgropen(expected.locator, InvalidBackendId);
+		if (smgrexists(smgr, fork))
+			smgrimmedsync(smgr, fork);
+	}
+	state = palloc0(sizeof(*state));
+	for (int i = 0; i < 2; i++) {
+		state->buffers[i] = ReadBufferWithoutRelcache(expected.locator, SPACE_FORKNUM, i,
+			RBM_NORMAL, NULL, true);
+		LockBuffer(state->buffers[i], BUFFER_LOCK_EXCLUSIVE);
+		if (BufferIsLocal(state->buffers[i]) || BufferGetBlockNumber(state->buffers[i]) != i
+			|| !cluster_bufmgr_pcm_x_content_holder_write_permitted(
+				GetBufferDescriptor(state->buffers[i] - 1)))
+			goto refused;
+		memcpy(state->result[i].data, BufferGetPage(state->buffers[i]), BLCKSZ);
+	}
+	if (!cluster_space_identity_page_decode(state->result[0].data, BLCKSZ, SPACE_FORKNUM, 0,
+			&expected, &identity->expected, &identity->before_token)
+		|| !cluster_space_reservation_page_decode(state->result[1].data, BLCKSZ, SPACE_FORKNUM, 1,
+			&expected, &reservation->before, &reservation->before_token)
+		|| identity->expected.state != CLUSTER_SPACE_IDENTITY_LIVE
+		|| identity->expected.sequence == UINT64_MAX || nblocks > reservation->before.next_block)
+		goto refused;
+	identity->action = CLUSTER_SPACE_WAL_TRUNCATE;
+	identity->nblocks = nblocks;
+	identity->result = identity->expected;
+	identity->result.sequence++;
+	if (!pg_strong_random(identity->result.incarnation, sizeof(identity->result.incarnation)))
+		goto refused;
+	identity->result.operation = identity->result_token = rf_page_mutation_token_next();
+	reservation->action = CLUSTER_SPACE_RESERVATION_RESET;
+	reservation->result.identity = identity->result;
+	reservation->first_block = reservation->result.next_block = nblocks;
+	reservation->result_token = identity->result_token;
+	if (!cluster_space_structure_wal_encode(&change, state->wal, sizeof(state->wal))
+		|| cluster_space_structure_apply(&change, &expected, state->result[0].data,
+			state->result[1].data, BLCKSZ, &apply_mask) != CLUSTER_SPACE_IDENTITY_APPLY
+		|| apply_mask != 3)
+		goto refused;
+	state->token = identity->result_token;
+	return state;
+refused:
+	space_truncate_release(state);
+	return NULL;
+}
+
+XLogRecPtr
+cluster_space_truncate_log(ClusterSpaceTruncateState *state)
+{
+	Assert(state != NULL && CritSectionCount > 0);
+	/* Mark before WAL insertion so a concurrent checkpoint cannot advance
+	 * its redo past this record without selecting both still-locked pages. */
+	for (int i = 0; i < 2; i++)
+		MarkBufferDirty(state->buffers[i]);
+	XLogBeginInsert();
+	XLogRegisterData((char *)state->wal, sizeof(state->wal));
+	state->lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE);
+	return state->lsn;
+}
+
+void
+cluster_space_truncate_publish(ClusterSpaceTruncateState *state)
+{
+	Assert(state != NULL && CritSectionCount > 0 && !XLogRecPtrIsInvalid(state->lsn));
+	for (int i = 0; i < 2; i++) {
+		memcpy(BufferGetPage(state->buffers[i]), state->result[i].data, BLCKSZ);
+		space_set_lsn(BufferGetPage(state->buffers[i]), state->lsn, state->token);
+	}
+}
+
+void
+cluster_space_truncate_finish(ClusterSpaceTruncateState *state, Relation rel)
+{
+	Assert(state != NULL && CritSectionCount == 0);
+	space_truncate_release(state);
+	if (space_identity_cache != NULL)
+		space_identity_invalidate((Datum)0, RelationGetRelid(rel));
+	CacheInvalidateRelcache(rel);
+}
+
 static bool
 space_reservation_redo(XLogReaderState *record)
 {

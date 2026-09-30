@@ -138,4 +138,16 @@ extern BlockNumber cluster_space_reserve(const ClusterSpaceIdentity *identity,
 extern bool cluster_space_reserve_exact(const ClusterSpaceIdentity *identity,
 									   BlockNumber first, uint32 count);
 
+typedef struct ClusterSpaceTruncateState ClusterSpaceTruncateState;
+
+/* Native RelationTruncate owner after its exclusive lifecycle/KO barrier and
+ * auxiliary-fork preparation. No content locks on entry. Prepare makes the
+ * surviving DATA base durable, then holds both SPACE pages through native
+ * critical WAL/flush/shrink/publish. Finish releases pins and invalidates the
+ * identity observation. This API does not grant lifecycle authority. */
+extern ClusterSpaceTruncateState *cluster_space_truncate_prepare(Relation rel, BlockNumber nblocks);
+extern XLogRecPtr cluster_space_truncate_log(ClusterSpaceTruncateState *state);
+extern void cluster_space_truncate_publish(ClusterSpaceTruncateState *state);
+extern void cluster_space_truncate_finish(ClusterSpaceTruncateState *state, Relation rel);
+
 #endif /* CLUSTER_SPACE_STORAGE_H */
