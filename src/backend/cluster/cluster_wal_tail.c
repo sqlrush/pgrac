@@ -781,6 +781,7 @@ wal_tail_observe_common(const char *wal_root, const ClusterWalSourceRef *ref,
 	PG_END_TRY();
 	result = wal_tail_release(work, result);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		work->observed.database_incarnation = work->ref.claim.database_incarnation;
 		*out = work->observed;
 		if (startup != NULL) {
 			*startup = work->startup;

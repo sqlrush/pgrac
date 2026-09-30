@@ -84,16 +84,16 @@ find_manifest_route(uint8 rmid, uint8 normalized_info, RfOpcodeRouteV1 *route, b
 UT_TEST(test_route_abi_and_counts)
 {
 	UT_ASSERT_EQ(sizeof(RfOpcodeRouteV1), 8);
-	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 139);
-	UT_ASSERT_EQ(rf_opcode_route_manifest_live_count_v1(), 139);
+	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 140);
+	UT_ASSERT_EQ(rf_opcode_route_manifest_live_count_v1(), 140);
 }
 
 UT_TEST(test_route_canonical_key_stream)
 {
 	static const uint8 expected[PG_SHA256_DIGEST_LENGTH]
-		= { 0x11, 0x79, 0x47, 0xf3, 0x0f, 0x89, 0xa8, 0x17, 0x67, 0x1c, 0xd4,
-			0xff, 0xd7, 0x11, 0x07, 0x90, 0x1d, 0xfe, 0x2d, 0xd1, 0x10, 0xbc,
-			0xb6, 0x82, 0xe3, 0x37, 0xcf, 0x92, 0x72, 0x7f, 0x8f, 0xed };
+		= { 0x52, 0x19, 0x05, 0xe7, 0x02, 0xcc, 0x62, 0x90, 0xd3, 0xca, 0x14,
+			0x16, 0x8e, 0xa1, 0x97, 0xa3, 0x59, 0x79, 0x2b, 0x93, 0x28, 0x6d,
+			0xea, 0x8a, 0xb7, 0x22, 0xb2, 0x24, 0x78, 0xa0, 0x40, 0x37 };
 	char stream[1024];
 	uint8 digest[PG_SHA256_DIGEST_LENGTH];
 	RfOpcodeRouteV1 route;
@@ -115,7 +115,7 @@ UT_TEST(test_route_canonical_key_stream)
 		used += pg_snprintf(stream + used, sizeof(stream) - used, "%03u:%02X\n", route.rmid,
 							route.normalized_info);
 	}
-	UT_ASSERT_EQ(used, 973);
+	UT_ASSERT_EQ(used, 980);
 	sha256_bytes((const uint8 *)stream, used, digest);
 	if (memcmp(digest, expected, sizeof(expected)) != 0) {
 		size_t j;
@@ -249,7 +249,7 @@ UT_TEST(test_every_manifest_row_has_one_total_route)
 	}
 
 	UT_ASSERT_EQ(page_count, 77);
-	UT_ASSERT_EQ(side_count, 61);
+	UT_ASSERT_EQ(side_count, 62);
 	UT_ASSERT_EQ(logical_count, 1);
 }
 

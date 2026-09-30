@@ -10,6 +10,7 @@
 #include "cluster/cluster_side_projection.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_side_xact.h"
+#include "cluster/cluster_space_reservation.h"
 
 #define CLUSTER_SIDE_ONLINE_PLAN_INTERFACE_V1 1
 #define RF_SIDE_ONLINE_PLAN_MAX_BYTES (4 * 1024 * 1024)
@@ -20,7 +21,8 @@ typedef enum RfSideOnlineOperationKindV1 {
 	RF_SIDE_ONLINE_OPERATION_INVALID = 0,
 	RF_SIDE_ONLINE_OPERATION_XACT = 1,
 	RF_SIDE_ONLINE_OPERATION_UNDO = 2,
-	RF_SIDE_ONLINE_OPERATION_PROJECTION = 3
+	RF_SIDE_ONLINE_OPERATION_PROJECTION = 3,
+	RF_SIDE_ONLINE_OPERATION_SPACE = 4
 } RfSideOnlineOperationKindV1;
 
 typedef struct RfSideOnlinePlanRequestV1 {
@@ -41,6 +43,7 @@ typedef struct RfSideOnlineOperationV1 {
 	RfSideXactOperationV1 xact;
 	ClusterUndoDecoded undo;
 	ClusterSideProjectionOperationV1 projection;
+	ClusterSpaceIdentityKey space_key;
 } RfSideOnlineOperationV1;
 
 typedef bool (*RfSideOnlineApplyXactV1)(void *arg, const RfSideOnlineOperationV1 *operation);
@@ -50,6 +53,7 @@ typedef bool (*RfSideOnlinePreflightXactV1)(void *arg, const RfSideOnlineOperati
 typedef bool (*RfSideOnlinePreflightUndoV1)(void *arg, const RfSideOnlineOperationV1 *operation);
 typedef bool (*RfSideOnlinePreflightProjectionV1)(void *arg,
 												  const RfSideOnlineOperationV1 *operation);
+typedef bool (*RfSideOnlineSpaceV1)(void *arg, const RfSideOnlineOperationV1 *operation);
 typedef bool (*RfSideOnlineBeginProtectedSetV1)(void *arg);
 typedef void (*RfSideOnlineEndProtectedSetV1)(void *arg, bool complete);
 
@@ -64,6 +68,8 @@ typedef struct RfSideOnlineApplyOpsV1 {
 	RfSideOnlineApplyXactV1 apply_xact;
 	RfSideOnlineApplyUndoV1 apply_undo;
 	RfSideOnlineApplyProjectionV1 apply_projection;
+	RfSideOnlineSpaceV1 preflight_space;
+	RfSideOnlineSpaceV1 apply_space;
 } RfSideOnlineApplyOpsV1;
 
 /* Production owner for the RF-SIDE v2 non-authoritative projections.  The
@@ -84,6 +90,17 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 								   const RfDetachedRecordPlanV1 *record_plan,
 								   const RfPageOnlineRecordIdentityV1 *identity);
 extern RfPageProofDetailV1 rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan);
+/* The physical source owner supplies this after the entire scan and root
+ * revalidation, never by copying a provisional SPACE payload's namespace. */
+extern bool rf_side_online_plan_bind_database_v1(RfSideOnlinePlanV1 *plan,
+												uint64 database_incarnation);
+/* Private preparation only, under the caller's independently protected target
+ * read. Returned order contains SIDE operation indices for every exact input
+ * on this locator; it does not retire any structural or durability obligation. */
+extern RfPageProofDetailV1 rf_side_online_plan_prepare_space_v1(
+	const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKey *expected,
+	const void *identity_page, const void *reservation_page, uint32 *order,
+	uint32 capacity, uint32 *out_count, ClusterSpaceRecoveryImage *out);
 extern uint32 rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan);
 extern bool rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 											 RfSideOnlineOperationV1 *out_operation);

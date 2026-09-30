@@ -12,6 +12,8 @@ typedef struct ClusterWalTailObservation {
 	XLogRecPtr last_record_start;
 	pg_crc32c last_record_crc;
 	uint64 records;
+	/* Exact claim namespace, published only after input validation succeeds. */
+	uint64 database_incarnation;
 } ClusterWalTailObservation;
 
 struct XLogReaderState;

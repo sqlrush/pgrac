@@ -157,7 +157,7 @@ UT_TEST(test_route_consumes_the_exhaustive_manifest)
 	bool active;
 	size_t i;
 
-	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 139);
+	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 140);
 	for (i = 0; i < rf_opcode_route_manifest_count_v1(); i++) {
 		UT_ASSERT(rf_opcode_route_manifest_entry_v1(i, &route, &active));
 		UT_ASSERT(cluster_side_route_lookup(route.rmid, route.normalized_info, &side));

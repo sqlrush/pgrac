@@ -4844,6 +4844,7 @@ UT_TEST(test_terminal_literal_is_distinct_from_checkpoint_or_active_writer)
 		UT_ASSERT_EQ(out.initialization.claim.identity.origin_owner_incarnation, 199);
 		UT_ASSERT_EQ(out.initialization.predecessor.snapshot.identity.origin_owner_incarnation, 99);
 		UT_ASSERT_EQ(out.observation.tail.records, parameters);
+		UT_ASSERT_EQ(out.observation.tail.database_incarnation, 41);
 		UT_ASSERT_EQ(out.observation.checkpoint_records, 0);
 		UT_ASSERT_EQ(out.observation.max_connections, parameters ? 900 : 0);
 		UT_ASSERT_EQ(cluster_wal_terminal_encode(&root, 0, &history, &out, encoded, &encoded_ref),
@@ -4857,6 +4858,12 @@ UT_TEST(test_terminal_literal_is_distinct_from_checkpoint_or_active_writer)
 		out.observation.unsupported_records = 1;
 		UT_ASSERT_EQ(cluster_wal_terminal_encode(&root, 0, &history, &out, encoded, &encoded_ref),
 					 CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+		UT_ASSERT(v2_zero(encoded, sizeof(encoded)));
+		UT_ASSERT(v2_zero(&encoded_ref, sizeof(encoded_ref)));
+		out.observation.unsupported_records = 0;
+		out.observation.tail.database_incarnation = 42;
+		UT_ASSERT_EQ(cluster_wal_terminal_encode(&root, 0, &history, &out, encoded, &encoded_ref),
+					 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
 		UT_ASSERT(v2_zero(encoded, sizeof(encoded)));
 		UT_ASSERT(v2_zero(&encoded_ref, sizeof(encoded_ref)));
 	}
@@ -9825,6 +9832,7 @@ v3_install_add_history(ControlRootImage *root, ClusterWalStartupImage *op,
 		memcpy(terminal.operation_uuid, interrupted.operation_uuid, 16);
 		terminal.generation = ++old_generation;
 		terminal.database_incarnation = op->database_incarnation;
+		terminal.observation.tail.database_incarnation = op->database_incarnation;
 		terminal.sealing_sequence = root->header.file_txn_seq;
 		sha256_bytes(root->bytes, sizeof(root->bytes), terminal.sealing_sha256);
 		terminal.formation_epoch = op->formation_epoch;
@@ -11810,6 +11818,7 @@ UT_TEST(test_runtime_pending_checkpoint_promotes_without_claiming_recovery_done)
 			UT_ASSERT_EQ(visit.calls, 1);
 			UT_ASSERT_EQ(observed.complete_end, snapshot.validated_tail_lsn_exclusive);
 			UT_ASSERT_EQ(observed.last_record_crc, snapshot.tail_last_record_crc32c);
+			UT_ASSERT_EQ(observed.database_incarnation, op.claim.database_incarnation);
 		}
 		test_actual_cf = test_cf_mode = ShareLock;
 		UT_ASSERT_EQ(

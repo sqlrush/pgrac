@@ -117,6 +117,13 @@ rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
+bool
+rf_side_online_plan_bind_database_v1(RfSideOnlinePlanV1 *plan, uint64 database_incarnation)
+{
+	UT_ASSERT(plan == (RfSideOnlinePlanV1 *)&side_plan_object);
+	return database_incarnation == 42;
+}
+
 void
 rf_page_online_plan_destroy_v1(RfPageOnlinePlanV1 **plan)
 {
@@ -197,6 +204,9 @@ UT_TEST(test_record_is_preflighted_then_fed_to_page_and_side)
 	UT_ASSERT_EQ(observed_identity.record.record_crc, 0x12345678);
 	UT_ASSERT_EQ(observed_identity.record.rmid, RM_XLOG_ID);
 	UT_ASSERT_EQ(observed_identity.record.info, 0x50);
+	UT_ASSERT(!cluster_thread_recovery_fabric_bind_database_v1(plan, 0));
+	UT_ASSERT(!cluster_thread_recovery_fabric_bind_database_v1(plan, 43));
+	UT_ASSERT(cluster_thread_recovery_fabric_bind_database_v1(plan, 42));
 	cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
 	UT_ASSERT(plan == NULL);
 }

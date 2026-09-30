@@ -13,6 +13,8 @@
 #include "access/twophase_rmgr.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "catalog/storage_xlog.h"
+#include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_side_undo.h"
@@ -284,7 +286,7 @@ cluster_remote_commit_timestamp(int origin_node pg_attribute_unused(),
 
 typedef struct FakeXactRecord {
 	XLogReaderState reader;
-	uint8 data[512];
+	uint8 data[1024];
 	union {
 		DecodedXLogRecord decoded;
 		char pad[sizeof(DecodedXLogRecord) + 2 * sizeof(DecodedBkpBlock)];
@@ -1836,10 +1838,214 @@ UT_TEST(test_protected_set_released_on_preflight_or_apply_error)
 	free(capture);
 }
 
+static ClusterSpaceReservationChange
+space_advance_fixture(void)
+{
+	ClusterSpaceReservationChange c = {0};
+
+	c.action = CLUSTER_SPACE_RESERVATION_ADVANCE;
+	c.before.identity.key.system_identifier = UINT64_C(0x11223344);
+	c.before.identity.key.database_incarnation = 42;
+	memset(c.before.identity.key.storage_uuid, 0x44, 16);
+	c.before.identity.key.locator = (RelFileLocator){DEFAULTTABLESPACE_OID, 5, 16384};
+	memset(c.before.identity.incarnation, 0x17, 16);
+	c.before.identity.sequence = c.before.identity.operation = 1;
+	c.before.identity.state = CLUSTER_SPACE_IDENTITY_LIVE;
+	c.before.next_block = c.first_block = 3;
+	c.granted = 4;
+	c.result = c.before;
+	c.result.next_block += c.granted;
+	c.before_token = 100;
+	c.result_token = 80;
+	return c;
+}
+
+static RfSideOnlinePlanV1 *
+space_online_plan(uint64 end)
+{
+	RfSideOnlinePlanV1 *plan = NULL;
+	RfContributorStreamCutV1 cut = {0};
+	RfSideOnlinePlanRequestV1 request = {0};
+
+	cut.failed_thread = 3;
+	cut.timeline_id = 7;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	cut.scan_begin_inclusive = 100;
+	cut.scan_end_exclusive = end;
+	request.system_identifier = UINT64_C(0x11223344);
+	memset(request.storage_uuid, 0x44, 16);
+	request.physical_cuts = &cut;
+	request.participant_count = 1;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+static RfPageProofDetailV1
+space_online_feed(RfSideOnlinePlanV1 *plan, uint8 info, const void *wal, uint32 length,
+	XLogRecPtr begin, bool block_ref)
+{
+	FakeXactRecord fake;
+	RfDetachedRecordPlanV1 record;
+	RfPageOnlineRecordIdentityV1 identity;
+	uint8 storage_uuid[16];
+
+	memset(storage_uuid, 0x44, sizeof(storage_uuid));
+	make_projection_record(&fake, RM_SMGR_ID, info | XLR_SPECIAL_REL_UPDATE, wal, length);
+	fake.u.decoded.max_block_id = block_ref ? 0 : -1;
+	identity = make_identity(&fake, storage_uuid);
+	set_identity_range(&fake, &identity, begin, begin + 100);
+	record = make_projection_record_plan(&fake);
+	return rf_side_online_plan_feed_record_v1(plan, &record, &identity);
+}
+
+UT_TEST(test_space_plan_owns_exact_chain_and_requires_observed_namespace)
+{
+	ClusterSpaceReservationChange c = space_advance_fixture();
+	ClusterSpaceIdentityKey key = c.result.identity.key;
+	RfSideOnlinePlanV1 *plan = space_online_plan(300);
+	RfSideOnlineApplyOpsV1 ops = {0};
+	ApplyCapture capture = {0};
+	ClusterSpaceRecoveryImage out = {0};
+	PGAlignedBlock pages[2] = {0};
+	uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
+	uint32 order[2] = {99, 99}, count = 99;
+	RfOpcodeRouteV1 route;
+	ClusterSpaceReservation final;
+	uint64 token;
+
+	UT_ASSERT_EQ(rf_opcode_route_lookup_v1(RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION,
+		false, false, &route), RF_OPCODE_ROUTE_OK);
+	UT_ASSERT_EQ(route.record_owner, RF_ROUTE_OWNER_SIDE_TYPED);
+
+	UT_ASSERT(cluster_space_identity_page_encode(&c.before.identity, 123, pages[0].data, BLCKSZ));
+	UT_ASSERT(cluster_space_reservation_page_encode(&c.before, c.before_token, pages[1].data, BLCKSZ));
+	for (int i = 0; i < 2; i++) {
+		UT_ASSERT(cluster_space_reservation_wal_encode(&c, wal, sizeof(wal)));
+		UT_ASSERT_EQ(space_online_feed(plan, XLOG_SMGR_SPACE_RESERVATION, wal, sizeof(wal),
+			100 + i * 100, false), RF_PAGE_PROOF_DETAIL_OK);
+		c.before = c.result;
+		c.before_token = c.result_token;
+		c.first_block = c.before.next_block;
+		c.result.next_block += c.granted;
+		c.result_token -= 20;
+	}
+	memset(wal, 0xee, sizeof(wal));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+	UT_ASSERT(!rf_side_online_plan_bind_database_v1(plan, 0));
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT(!rf_side_online_plan_bind_database_v1(plan, 43));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 2);
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_space_v1(plan, &key, pages[0].data, pages[1].data,
+		order, 2, &count, &out), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(count, 2);
+	UT_ASSERT_EQ(order[0], 0);
+	UT_ASSERT_EQ(order[1], 1);
+	UT_ASSERT_EQ(out.apply_mask, 2);
+	UT_ASSERT(memcmp(out.pages[0].data, pages[0].data, BLCKSZ) == 0);
+	UT_ASSERT(cluster_space_reservation_page_decode(out.pages[1].data, BLCKSZ,
+		SPACE_FORKNUM, 1, &key, &final, &token));
+	UT_ASSERT_EQ(final.next_block, 11);
+	UT_ASSERT_EQ(token, 60);
+	/* Collecting source bytes cannot supply the missing protected writer. */
+	ops.arg = &capture;
+	ops.begin_protected_set = capture_begin;
+	ops.end_protected_set = capture_end;
+	UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &ops), RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(capture.begin_count, 0);
+	if (count == 2) {
+		ClusterSpaceRecoveryImage saved = out;
+
+		count = 99;
+		UT_ASSERT_EQ(rf_side_online_plan_prepare_space_v1(plan, &key, pages[0].data,
+			pages[1].data, order, 1, &count, &out), RF_PAGE_PROOF_DETAIL_CAPACITY);
+		UT_ASSERT_EQ(count, 99);
+		UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+		key.database_incarnation++;
+		UT_ASSERT_EQ(rf_side_online_plan_prepare_space_v1(plan, &key, pages[0].data,
+			pages[1].data, order, 2, &count, &out), RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+		UT_ASSERT_EQ(count, 99);
+		UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	}
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_space_plan_structural_pair_and_standalone_tombstone)
+{
+	ClusterSpaceStructureChange change = {0};
+	ClusterSpaceReservationChange advance = space_advance_fixture();
+	RfSideOnlinePlanV1 *plan = space_online_plan(200);
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	PGAlignedBlock zero = {0};
+	ClusterSpaceRecoveryImage out;
+	uint32 order, count = 0;
+
+	change.identity.action = CLUSTER_SPACE_WAL_CREATE;
+	change.identity.result = advance.result.identity;
+	change.identity.result_token = 50;
+	change.identity.nblocks = InvalidBlockNumber;
+	change.reservation.action = CLUSTER_SPACE_RESERVATION_INIT;
+	change.reservation.result.identity = change.identity.result;
+	change.reservation.result_token = 50;
+	UT_ASSERT(cluster_space_structure_wal_encode(&change, wal, sizeof(wal)));
+	UT_ASSERT_EQ(space_online_feed(plan, XLOG_SMGR_SPACE_IDENTITY, wal, sizeof(wal), 100, false),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(!rf_side_online_plan_bind_database_v1(plan, 43));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_space_v1(plan, &change.identity.result.key,
+		zero.data, zero.data, &order, 1, &count, &out), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT_EQ(out.apply_mask, 3);
+	UT_ASSERT(!rf_side_online_plan_bind_database_v1(plan, 42));
+	rf_side_online_plan_destroy_v1(&plan);
+	change.identity.action = CLUSTER_SPACE_WAL_TOMBSTONE;
+	change.identity.expected = change.identity.result;
+	change.identity.before_token = change.identity.result_token;
+	change.identity.result.sequence++;
+	change.identity.result.operation++;
+	change.identity.result.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+	change.identity.result_token++;
+	change.reservation.action = CLUSTER_SPACE_RESERVATION_TOMBSTONE;
+	change.reservation.before = change.reservation.result;
+	change.reservation.before_token = change.identity.before_token;
+	change.reservation.result.identity = change.identity.result;
+	change.reservation.result_token = change.identity.result_token;
+	UT_ASSERT(cluster_space_structure_wal_encode(&change, wal, sizeof(wal)));
+	plan = space_online_plan(200);
+	UT_ASSERT(space_online_feed(plan, XLOG_SMGR_SPACE_IDENTITY, wal, sizeof(wal), 100, false)
+		!= RF_PAGE_PROOF_DETAIL_OK);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_space_plan_rejects_unbound_native_shapes)
+{
+	for (int variant = 0; variant < 5; variant++) {
+		ClusterSpaceReservationChange c = space_advance_fixture();
+		RfSideOnlinePlanV1 *plan = space_online_plan(200);
+		uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
+		uint8 opcode = XLOG_SMGR_SPACE_RESERVATION;
+		uint32 len = sizeof(wal);
+
+		if (variant == 0) c.result.identity.key.system_identifier++;
+		if (variant == 1) c.result.identity.key.storage_uuid[0]++;
+		if (variant <= 1) c.before.identity.key = c.result.identity.key;
+		UT_ASSERT(cluster_space_reservation_wal_encode(&c, wal, sizeof(wal)));
+		if (variant == 2) len--;
+		if (variant == 3) opcode = XLOG_SMGR_SPACE_IDENTITY;
+		UT_ASSERT(space_online_feed(plan, opcode, wal, len, 100, variant == 4)
+			!= RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 0);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(27);
 	UT_RUN(test_commit_decodes_to_immutable_truth_operation);
 	UT_RUN(test_commit_tt_conflict_is_blocked_before_apply);
 	UT_RUN(test_non_xact_and_missing_tt_are_blocked);
@@ -1864,6 +2070,9 @@ main(void)
 	UT_RUN(test_online_plan_accepts_exact_preceding_tt_abort_dependency);
 	UT_RUN(test_online_plan_denies_nonempty_abort_without_undo_completion);
 	UT_RUN(test_protected_set_released_on_preflight_or_apply_error);
+	UT_RUN(test_space_plan_owns_exact_chain_and_requires_observed_namespace);
+	UT_RUN(test_space_plan_rejects_unbound_native_shapes);
+	UT_RUN(test_space_plan_structural_pair_and_standalone_tombstone);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

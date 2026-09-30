@@ -1544,6 +1544,9 @@ cluster_wal_terminal_decode(const uint8 *bytes, size_t length, const ControlRoot
 		|| read_u32_le(bytes + 2068) != out->initialization.timeline)
 		goto refused;
 	observation = &out->observation;
+	/* The selected embedded claim already binds this namespace. Keep the
+	 * in-memory observation complete without adding a second disk field. */
+	observation->tail.database_incarnation = out->initialization.claim.database_incarnation;
 	observation->tail.complete_end = read_u64_le(bytes + 2048);
 	observation->tail.last_record_start = read_u64_le(bytes + 2056);
 	observation->tail.last_record_crc = read_u32_le(bytes + 2064);
@@ -1614,6 +1617,8 @@ cluster_wal_terminal_encode(const ControlRootImage *root, uint32 node,
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	o = &terminal->observation;
+	if (o->tail.database_incarnation != check.initialization.claim.database_incarnation)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (o->checkpoint_records != 0 || o->checkpoint_start != 0 || o->checkpoint_end != 0
 		|| o->checkpoint_crc != 0 || o->checkpoint_info != 0 || o->unsupported_records != 0
 		|| !bytes_are_zero((const uint8 *)&o->checkpoint, sizeof(o->checkpoint)))

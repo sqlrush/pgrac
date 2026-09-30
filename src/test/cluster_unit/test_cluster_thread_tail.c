@@ -1446,6 +1446,7 @@ UT_TEST(sealed_reader_needs_native_cut_and_claim)
 			UT_ASSERT_EQ(visit.calls, 1);
 			UT_ASSERT_EQ(out.records, 1);
 			UT_ASSERT_EQ(out.complete_end, root.validated_tail_lsn_exclusive);
+			UT_ASSERT_EQ(out.database_incarnation, ref.claim.database_incarnation);
 		} else {
 			UT_ASSERT(cluster_wal_tail_visit_sealed(scratch, &ref, wal_segment_size, &root,
 													root.checkpoint_lower_lsn, sealed_visit, &visit,

@@ -439,6 +439,14 @@ typedef struct SpaceRecoveryIndex {
 	uint32 index;
 } SpaceRecoveryIndex;
 
+size_t
+cluster_space_recovery_scratch_bytes(uint32 count)
+{
+	const size_t per_input = sizeof(SpaceRecoveryNode) + 2 * sizeof(SpaceRecoveryIndex) + sizeof(uint32);
+
+	return count > SIZE_MAX / per_input ? 0 : (size_t)count * per_input;
+}
+
 static int
 recovery_index_compare(const void *a, const void *b)
 {
@@ -508,9 +516,7 @@ cluster_space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs,
 
 	if (inputs == NULL || count == 0 || expected == NULL || identity_page == NULL
 		|| reservation_page == NULL || order == NULL || out == NULL
-		|| (uint64) count * sizeof(*nodes) > SIZE_MAX
-		|| (uint64) count * sizeof(*before) > SIZE_MAX
-		|| (uint64) count * sizeof(*ordered) > SIZE_MAX)
+		|| cluster_space_recovery_scratch_bytes(count) == 0)
 		return false;
 	if ((!all_zero(identity_page, BLCKSZ)
 		 && !cluster_space_identity_page_decode(identity_page, BLCKSZ, SPACE_FORKNUM, 0,

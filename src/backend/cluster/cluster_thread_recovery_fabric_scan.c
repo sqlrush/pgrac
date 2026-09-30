@@ -135,6 +135,10 @@ cluster_thread_recovery_fabric_scan_root_v1(uint16 dead_thread, XLogRecPtr scan_
 			detail = RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 			goto done;
 		}
+		if (!cluster_thread_recovery_fabric_bind_database_v1(plan, observed.database_incarnation)) {
+			detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+			goto done;
+		}
 		record_count = visit.records;
 		goto validate_plan;
 	}

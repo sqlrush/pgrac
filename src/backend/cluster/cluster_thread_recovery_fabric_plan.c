@@ -198,6 +198,15 @@ fail:
 	return detail;
 }
 
+bool
+cluster_thread_recovery_fabric_bind_database_v1(ClusterThreadRecoveryFabricPlanV1 *plan,
+	uint64 database_incarnation)
+{
+	return plan != NULL && plan->magic == CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_MAGIC
+		&& !plan->sealed && !plan->failed
+		&& rf_side_online_plan_bind_database_v1(plan->side_plan, database_incarnation);
+}
+
 RfPageProofDetailV1
 cluster_thread_recovery_fabric_plan_seal_v1(ClusterThreadRecoveryFabricPlanV1 *plan)
 {

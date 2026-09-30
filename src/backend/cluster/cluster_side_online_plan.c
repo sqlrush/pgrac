@@ -10,6 +10,7 @@
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/multixact.h"
+#include "catalog/storage_xlog.h"
 #include "cluster/cluster_side_online_plan.h"
 
 #ifdef RF_SIDE_ONLINE_TESTING
@@ -30,6 +31,7 @@ struct RfSideOnlinePlanV1 {
 	bool sealed;
 	uint8 reserved5[3];
 	uint64 system_identifier;
+	uint64 database_incarnation;
 	uint8 storage_uuid[16];
 	Size memory_budget;
 	Size memory_used;
@@ -172,6 +174,42 @@ side_ensure_payload_capacity(RfSideOnlinePlanV1 *plan, uint32 additional)
 	}
 	plan->owned_payload = payload;
 	plan->owned_payload_capacity = capacity;
+	return true;
+}
+
+static bool
+side_space_decode(const RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *record_plan,
+				  RfSideOnlineOperationV1 *candidate)
+{
+	XLogReaderState *record = record_plan->source_record;
+	uint8 info = record_plan->route.normalized_info;
+	ClusterSpaceIdentityKey key;
+
+	if (XLogRecHasAnyBlockRefs(record))
+		return false;
+	if (info == XLOG_SMGR_SPACE_IDENTITY) {
+		ClusterSpaceStructureChange change;
+
+		if (!cluster_space_structure_wal_decode(XLogRecGetData(record), XLogRecGetDataLen(record),
+			&change) || change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE)
+			return false;
+		key = change.identity.result.key;
+	} else if (info == XLOG_SMGR_SPACE_RESERVATION) {
+		ClusterSpaceReservationChange change;
+
+		if (!cluster_space_reservation_wal_decode(XLogRecGetData(record), XLogRecGetDataLen(record),
+			&change) || change.action != CLUSTER_SPACE_RESERVATION_ADVANCE)
+			return false;
+		key = change.result.identity.key;
+	} else
+		return false;
+	if (key.system_identifier != plan->system_identifier
+		|| memcmp(key.storage_uuid, plan->storage_uuid, 16) != 0
+		|| (plan->database_incarnation != 0 && key.database_incarnation != plan->database_incarnation))
+		return false;
+	candidate->kind = RF_SIDE_ONLINE_OPERATION_SPACE;
+	candidate->space_key = key;
+	candidate->owned_payload_length = XLogRecGetDataLen(record);
 	return true;
 }
 
@@ -488,6 +526,17 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 					   record_data + candidate.undo.payload_offset, candidate.owned_payload_length);
 				plan->owned_payload_bytes += candidate.owned_payload_length;
 			}
+		} else if (record_plan->route.rmid == RM_SMGR_ID
+				   && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD) {
+			if (!side_space_decode(plan, record_plan, &candidate))
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			if (!side_ensure_operation_capacity(plan)
+				|| !side_ensure_payload_capacity(plan, candidate.owned_payload_length))
+				return RF_PAGE_PROOF_DETAIL_CAPACITY;
+			candidate.owned_payload_offset = plan->owned_payload_bytes;
+			memcpy(plan->owned_payload + plan->owned_payload_bytes,
+				XLogRecGetData(record_plan->source_record), candidate.owned_payload_length);
+			plan->owned_payload_bytes += candidate.owned_payload_length;
 		} else if ((record_plan->route.rmid == RM_CLOG_ID
 					|| record_plan->route.rmid == RM_MULTIXACT_ID
 					|| record_plan->route.rmid == RM_COMMIT_TS_ID)
@@ -525,6 +574,91 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
+bool
+rf_side_online_plan_bind_database_v1(RfSideOnlinePlanV1 *plan, uint64 database_incarnation)
+{
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || plan->sealed
+		|| database_incarnation == 0
+		|| (plan->database_incarnation != 0 && plan->database_incarnation != database_incarnation))
+		return false;
+	for (uint32 i = 0; i < plan->operation_count; i++)
+		if (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_SPACE
+			&& plan->operations[i].space_key.database_incarnation != database_incarnation)
+			return false;
+	plan->database_incarnation = database_incarnation;
+	return true;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_space_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterSpaceIdentityKey *expected, const void *identity_page, const void *reservation_page,
+	uint32 *order, uint32 capacity, uint32 *out_count, ClusterSpaceRecoveryImage *out)
+{
+	ClusterSpaceRecoveryInput *inputs = NULL;
+	uint32 *indices = NULL, *sorted = NULL;
+	ClusterSpaceRecoveryImage prepared;
+	uint32 count = 0, next = 0;
+	Size bytes;
+	size_t scratch;
+	RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| expected == NULL || identity_page == NULL || reservation_page == NULL
+		|| order == NULL || out_count == NULL || out == NULL)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (plan->database_incarnation == 0 || expected->database_incarnation != plan->database_incarnation
+		|| expected->system_identifier != plan->system_identifier
+		|| memcmp(expected->storage_uuid, plan->storage_uuid, 16) != 0)
+		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+	for (uint32 i = 0; i < plan->operation_count; i++)
+		if (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_SPACE
+			&& RelFileLocatorEquals(plan->operations[i].space_key.locator, expected->locator))
+			count++;
+	if (count == 0)
+		return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+	bytes = (Size)count * (sizeof(*inputs) + sizeof(*indices) + sizeof(*sorted));
+	scratch = cluster_space_recovery_scratch_bytes(count);
+	if (scratch == 0 || scratch > SIZE_MAX - bytes)
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	bytes += scratch;
+	if (count > capacity || bytes > plan->memory_budget
+		|| plan->memory_used > plan->memory_budget - bytes)
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	inputs = side_alloc0((Size)count * sizeof(*inputs));
+	indices = side_alloc0((Size)count * sizeof(*indices));
+	sorted = side_alloc0((Size)count * sizeof(*sorted));
+	if (inputs == NULL || indices == NULL || sorted == NULL) {
+		detail = RF_PAGE_PROOF_DETAIL_OOM;
+		goto done;
+	}
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *op = &plan->operations[i];
+
+		if (op->kind != RF_SIDE_ONLINE_OPERATION_SPACE
+			|| !RelFileLocatorEquals(op->space_key.locator, expected->locator))
+			continue;
+		inputs[next] = (ClusterSpaceRecoveryInput){plan->owned_payload + op->owned_payload_offset,
+			op->owned_payload_length};
+		indices[next++] = i;
+	}
+	if (!cluster_space_recovery_prepare(inputs, count, expected, identity_page,
+		reservation_page, sorted, &prepared))
+		goto done;
+	for (uint32 i = 0; i < count; i++)
+		order[i] = indices[sorted[i]];
+	for (uint32 i = 0; i < 2; i++)
+		if (prepared.source_index[i] != UINT32_MAX)
+			prepared.source_index[i] = indices[prepared.source_index[i]];
+	*out = prepared;
+	*out_count = count;
+	detail = RF_PAGE_PROOF_DETAIL_OK;
+done:
+	if (sorted != NULL) side_free(sorted);
+	if (indices != NULL) side_free(indices);
+	if (inputs != NULL) side_free(inputs);
+	return detail;
+}
+
 RfPageProofDetailV1
 rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
 {
@@ -532,6 +666,11 @@ rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || plan->sealed)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	for (i = 0; i < plan->operation_count; i++)
+		if (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_SPACE
+			&& (plan->database_incarnation == 0
+				|| plan->operations[i].space_key.database_incarnation != plan->database_incarnation))
+			return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 	for (i = 0; i < plan->participant_count; i++) {
 		const RfContributorStreamCutV1 *cut = &plan->physical_cuts[i];
 		bool empty = (cut->flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0;
@@ -583,6 +722,8 @@ side_plan_apply_ops_valid(const RfSideOnlinePlanV1 *plan, const RfSideOnlineAppl
 				&& (ops->preflight_undo == NULL || ops->apply_undo == NULL))
 			|| (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_PROJECTION
 				&& (ops->preflight_projection == NULL || ops->apply_projection == NULL))
+			|| (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_SPACE
+				&& (ops->preflight_space == NULL || ops->apply_space == NULL))
 			|| plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_INVALID)
 			return false;
 	return true;
@@ -616,6 +757,8 @@ side_plan_preflight_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApp
 			accepted = ops->preflight_xact(ops->arg, &operation);
 		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO)
 			accepted = ops->preflight_undo(ops->arg, &operation);
+		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE)
+			accepted = ops->preflight_space(ops->arg, &operation);
 		else
 			accepted = ops->preflight_projection(ops->arg, &operation);
 		if (!accepted)
@@ -667,6 +810,8 @@ side_plan_apply_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOp
 			applied = ops->apply_xact(ops->arg, &operation);
 		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO)
 			applied = ops->apply_undo(ops->arg, &operation);
+		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE)
+			applied = ops->apply_space(ops->arg, &operation);
 		else
 			applied = ops->apply_projection(ops->arg, &operation);
 		if (!applied)

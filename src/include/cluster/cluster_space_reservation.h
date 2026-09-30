@@ -120,6 +120,8 @@ extern bool cluster_space_recovery_prepare(const ClusterSpaceRecoveryInput *inpu
 										  uint32 count, const ClusterSpaceIdentityKey *expected,
 										  const void *identity_page, const void *reservation_page,
 										  uint32 *order, ClusterSpaceRecoveryImage *out);
+/* Heap scratch used by preparation, or zero for an unrepresentable size. */
+extern size_t cluster_space_recovery_scratch_bytes(uint32 count);
 
 #endif
 #endif

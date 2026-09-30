@@ -44,6 +44,8 @@ extern RfPageProofDetailV1 cluster_thread_recovery_fabric_plan_feed_record_v1(
 	ClusterThreadRecoveryFabricPlanV1 *plan, XLogReaderState *record, uint16 participant_index);
 extern RfPageProofDetailV1
 cluster_thread_recovery_fabric_plan_seal_v1(ClusterThreadRecoveryFabricPlanV1 *plan);
+extern bool cluster_thread_recovery_fabric_bind_database_v1(
+	ClusterThreadRecoveryFabricPlanV1 *plan, uint64 database_incarnation);
 extern const RfPageOnlinePlanV1 *
 cluster_thread_recovery_fabric_page_plan_v1(const ClusterThreadRecoveryFabricPlanV1 *plan);
 extern const RfSideOnlinePlanV1 *

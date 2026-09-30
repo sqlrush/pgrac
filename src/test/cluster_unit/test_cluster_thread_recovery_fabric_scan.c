@@ -55,6 +55,7 @@ static XLogRecPtr begin_read_lsn;
 static bool authority_current;
 static int exact_source_count;
 static int exact_source_fault;
+static int database_bind_count;
 
 ClusterThreadRecoveryAuthorityResultV1
 cluster_thread_recovery_authority_revalidate_nowait_v1(
@@ -148,6 +149,7 @@ cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *expected,
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	out->records = record_count;
 	out->complete_end = record_end[record_count - 1];
+	out->database_incarnation = exact_source_fault == 4 ? 43 : 42;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -188,6 +190,17 @@ cluster_thread_recovery_fabric_plan_seal_v1(ClusterThreadRecoveryFabricPlanV1 *p
 	UT_ASSERT(plan == (ClusterThreadRecoveryFabricPlanV1 *)&fabric_object);
 	plan_seal_count++;
 	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+bool
+cluster_thread_recovery_fabric_bind_database_v1(ClusterThreadRecoveryFabricPlanV1 *plan,
+	uint64 database_incarnation)
+{
+	UT_ASSERT(plan == (ClusterThreadRecoveryFabricPlanV1 *)&fabric_object);
+	UT_ASSERT_EQ(plan_feed_count, 2);
+	UT_ASSERT_EQ(plan_seal_count, 0);
+	database_bind_count++;
+	return database_incarnation == 42;
 }
 
 void
@@ -234,6 +247,7 @@ init_case(ClusterThreadRecoveryAuthorityV1 *authority)
 	authority_current = true;
 	cluster_shared_config = false;
 	exact_source_count = exact_source_fault = 0;
+	database_bind_count = 0;
 }
 
 UT_TEST(test_shared_config_uses_exact_source_without_legacy_fallback)
@@ -250,6 +264,7 @@ UT_TEST(test_shared_config_uses_exact_source_without_legacy_fallback)
 	UT_ASSERT(plan == (ClusterThreadRecoveryFabricPlanV1 *)&fabric_object && records == 2);
 	UT_ASSERT_EQ(reader_make_count, 0);
 	UT_ASSERT_EQ(exact_source_count, 1);
+	UT_ASSERT_EQ(database_bind_count, 1);
 	UT_ASSERT_EQ(plan_feed_count, 2);
 	UT_ASSERT_EQ(plan_seal_count, 1);
 	UT_ASSERT_EQ(plan_destroy_count, 0);
@@ -257,7 +272,7 @@ UT_TEST(test_shared_config_uses_exact_source_without_legacy_fallback)
 
 UT_TEST(test_shared_source_failure_discards_every_provisional_record)
 {
-	for (int fault = 1; fault <= 3; fault++) {
+	for (int fault = 1; fault <= 4; fault++) {
 		ClusterThreadRecoveryAuthorityV1 authority;
 		ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
 		uint64 records = 7;
@@ -270,7 +285,7 @@ UT_TEST(test_shared_source_failure_discards_every_provisional_record)
 			RfPageProofDetailV1 detail = cluster_thread_recovery_fabric_scan_root_v1(
 				2, 0x100, 0x200, &authority, false, &plan, &records);
 			UT_ASSERT_EQ(detail, fault == 1 ? RF_PAGE_PROOF_DETAIL_ROOT_STALE
-											: RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+				: fault == 4 ? RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH : RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
 		}
 		PG_CATCH();
 		{
