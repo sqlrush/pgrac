@@ -8,11 +8,13 @@
 #define USE_PGRAC_CLUSTER 1
 
 #include "postgres.h"
+#include "access/xlog.h"
 
 #if defined(__has_include)
 #if __has_include("cluster/cluster_page_install.h")
 #include "cluster/cluster_page_install.h"
 #include "storage/bufpage.h"
+#include "storage/smgr.h"
 #define TEST_HAVE_CLUSTER_PAGE_INSTALL 1
 #endif
 #endif
@@ -87,6 +89,22 @@ typedef struct InstallCase {
 	RfPageInstallAuthorityOpsV1 authority;
 	RfPageStorageInstallRequestV1 request;
 } InstallCase;
+
+#include "test_cluster_page_install_smgr_types.inc"
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	abort();
+}
+
+bool
+DataChecksumsEnabled(void)
+{
+	return false;
+}
 
 bool
 rf_page_identity_valid_v1(const RfPageIdentityV1 *identity)
@@ -195,6 +213,39 @@ authority_identity(void *arg, const RfPageIdentityV1 *identity, const uint8 inca
 	return fixture->identity_ok;
 }
 
+/* Execute the native SMGR owner/authority wrapper; only storage I/O is a
+ * fixture. This catches callback loss when it rebuilds the authority table. */
+static bool
+page_smgr_read(void *arg, uint32 index, const RfPageIdentityV1 *identity,
+			   char page[BLCKSZ], bool *exists)
+{
+	RfPageSmgrPreopenV1 *preopen = (RfPageSmgrPreopenV1 *)arg;
+	return storage_read(preopen->request->authority->arg, index, identity, page, exists);
+}
+
+static bool
+page_smgr_write(void *arg, uint32 index, const RfPageIdentityV1 *identity,
+				const char page[BLCKSZ], bool extend)
+{
+	RfPageSmgrPreopenV1 *preopen = (RfPageSmgrPreopenV1 *)arg;
+	return storage_write(preopen->request->authority->arg, index, identity, page, extend);
+}
+
+static bool
+page_smgr_sync(void *arg, uint32 index, const RfPageIdentityV1 *identity)
+{
+	RfPageSmgrPreopenV1 *preopen = (RfPageSmgrPreopenV1 *)arg;
+	return storage_sync(preopen->request->authority->arg, index, identity);
+}
+
+static uint16
+page_smgr_checksum(void *arg, const char page[BLCKSZ], BlockNumber blockno)
+{
+	return storage_checksum(NULL, page, blockno);
+}
+
+#include "test_cluster_page_install_smgr_owner.inc"
+
 static bool
 authority_promote(void *arg)
 {
@@ -224,6 +275,19 @@ authority_release(void *arg)
 	fixture->step++;
 	fixture->release_calls++;
 	return fixture->release_ok;
+}
+
+static bool
+authority_covers_version(void *arg, const RfPageIdentityV1 *identity,
+						 const RfPageVersionV1 *version, const RfPageVersionV1 *result)
+{
+	InstallFixture *fixture = (InstallFixture *)arg;
+
+	UT_ASSERT_EQ(fixture->promote_calls, 1);
+	UT_ASSERT_EQ(fixture->release_calls, 0);
+	return fixture->identity_ok && identity->locator.relNumber == 100
+		&& version->mutation_token == 30 && result->mutation_token == 11
+		&& memcmp(version->segment_incarnation, result->segment_incarnation, 16) == 0;
 }
 
 static void
@@ -329,6 +393,66 @@ UT_TEST(test_result_target_skips_write_but_proves_durability)
 	UT_ASSERT_EQ(test_case.fixture.sync_calls, 1);
 	UT_ASSERT_EQ(test_case.fixture.read_calls, 2);
 	UT_ASSERT_EQ(proof.result_skip_count, 1);
+}
+
+UT_TEST(test_proven_intermediate_version_is_reconstructed)
+{
+	InstallCase test_case;
+	RfPageStorageInstallProofV1 proof;
+
+	init_case(&test_case, 1);
+	test_case.authority.covers_version = authority_covers_version;
+	init_page(test_case.fixture.disk[0].data, 30, 0x77);
+	UT_ASSERT_EQ(rf_page_storage_install_execute_v1(&test_case.request, &proof),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(test_case.fixture.write_calls, 1);
+	UT_ASSERT_EQ(test_case.fixture.sync_calls, 1);
+	UT_ASSERT_EQ(test_case.fixture.publish_calls, 1);
+	UT_ASSERT(memcmp(test_case.fixture.disk[0].data, test_case.canonical[0].data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_intermediate_requires_exact_proof_for_every_target)
+{
+	InstallCase test_case;
+	RfPageStorageInstallProofV1 proof;
+
+	init_case(&test_case, 1);
+	init_page(test_case.fixture.disk[0].data, 30, 0x77);
+	UT_ASSERT_EQ(rf_page_storage_install_execute_v1(&test_case.request, &proof),
+				 RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH);
+	UT_ASSERT_EQ(test_case.fixture.write_calls, 0);
+	init_case(&test_case, 2);
+	test_case.authority.covers_version = authority_covers_version;
+	init_page(test_case.fixture.disk[0].data, 30, 0x77);
+	init_page(test_case.fixture.disk[1].data, 31, 0x78);
+	UT_ASSERT_EQ(rf_page_storage_install_execute_v1(&test_case.request, &proof),
+				 RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH);
+	UT_ASSERT_EQ(test_case.fixture.write_calls, 0);
+	UT_ASSERT_EQ(test_case.fixture.publish_calls, 0);
+	UT_ASSERT_EQ(test_case.fixture.release_calls, 1);
+}
+
+UT_TEST(test_native_smgr_wrapper_preserves_optional_ancestor_proof)
+{
+	for (int have_proof = 0; have_proof < 2; have_proof++) {
+		InstallCase test_case;
+		RfPageStorageInstallProofV1 proof;
+		RfPageSmgrPreopenV1 preopen = {0};
+
+		init_case(&test_case, 1);
+		test_case.request.storage = NULL;
+		preopen.request = &test_case.request;
+		if (have_proof)
+			test_case.authority.covers_version = authority_covers_version;
+		init_page(test_case.fixture.disk[0].data, 30, 0x77);
+		UT_ASSERT_EQ(rf_page_storage_install_smgr_preopened_v1(&test_case.request,
+																&preopen, &proof),
+					 have_proof ? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH);
+		UT_ASSERT_EQ(test_case.fixture.write_calls, have_proof);
+		UT_ASSERT_EQ(test_case.fixture.sync_calls, have_proof);
+		UT_ASSERT_EQ(test_case.fixture.publish_calls, have_proof);
+		UT_ASSERT_EQ(test_case.fixture.release_calls, 1);
+	}
 }
 
 UT_TEST(test_noncanonical_result_target_blocks_whole_batch_before_promote)
@@ -496,9 +620,12 @@ UT_TEST(test_reserved_and_nonordinary_fork_are_rejected)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(16);
 	UT_RUN(test_expected_target_write_sync_postread_publish_release);
 	UT_RUN(test_result_target_skips_write_but_proves_durability);
+	UT_RUN(test_proven_intermediate_version_is_reconstructed);
+	UT_RUN(test_intermediate_requires_exact_proof_for_every_target);
+	UT_RUN(test_native_smgr_wrapper_preserves_optional_ancestor_proof);
 	UT_RUN(test_noncanonical_result_target_blocks_whole_batch_before_promote);
 	UT_RUN(test_absent_target_extends_only_for_absent_edge);
 	UT_RUN(test_absent_target_with_present_edge_is_zero_mutation);

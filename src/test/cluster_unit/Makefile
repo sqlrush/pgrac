@@ -1286,7 +1286,20 @@ $(CLUSTER_PAGE_INSTALL_O): \
 		$(top_srcdir)/src/include/cluster/cluster_page_install.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
+test_cluster_page_install_smgr_types.inc: $(top_srcdir)/src/backend/cluster/cluster_page_install.c Makefile
+	awk '/^(struct RfPageSmgrPreopenV1|typedef struct RfPageSmgrAuthorityContextV1) / { emit=1; found++ } \
+	     emit { print } /^};|^} RfPageSmgrAuthorityContextV1;/ { emit=0 } \
+	     END { if (found != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_page_install_smgr_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_page_install.c Makefile
+	awk '/^page_smgr_authority_[a-z_]+\(/ { print "static bool"; emit=1 } \
+	     /^rf_page_storage_install_smgr_preopened_v1\(/ { print "RfPageProofDetailV1"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_page_install: test_cluster_page_install.c unit_test.h \
+		test_cluster_page_install_smgr_types.inc test_cluster_page_install_smgr_owner.inc \
 		$(CLUSTER_PAGE_INSTALL_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_PAGE_INSTALL_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \

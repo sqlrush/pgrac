@@ -449,6 +449,30 @@ adapter_promote(void *arg)
 }
 
 static bool
+adapter_covers_version(void *arg, const RfPageIdentityV1 *identity,
+					   const RfPageVersionV1 *version, const RfPageVersionV1 *result)
+{
+	RfPageInstallAuthorityAdapterV1 *adapter = (RfPageInstallAuthorityAdapterV1 *)arg;
+	uint32 i;
+
+	if (adapter == NULL || adapter->guard == NULL || result == NULL
+		|| rf_page_authority_batch_revalidate_nowait_v1(adapter->guard, adapter->serial_guard)
+			   != RF_PAGE_AUTHORITY_OK)
+		return false;
+	for (i = 0; i < adapter->preflight->target_count; i++) {
+		const RfPageAuthorityTargetV1 *target = &adapter->preflight->targets[i];
+
+		if (authority_identity_equal(identity, &target->page_identity)
+			&& result->mutation_token == target->expected_result.mutation_token
+			&& memcmp(result->segment_incarnation,
+					  target->expected_result.segment_incarnation, 16) == 0)
+			return rf_page_stable_base_proof_covers_version_v1(target->stable_base, identity,
+																 version);
+	}
+	return false;
+}
+
+static bool
 adapter_publish(void *arg)
 {
 	RfPageInstallAuthorityAdapterV1 *adapter = (RfPageInstallAuthorityAdapterV1 *)arg;
@@ -489,5 +513,6 @@ rf_page_install_authority_adapter_init_v1(RfPageAuthorityPreflightV1 *preflight,
 	adapter->ops.promote = adapter_promote;
 	adapter->ops.publish = adapter_publish;
 	adapter->ops.release = adapter_release;
+	adapter->ops.covers_version = adapter_covers_version;
 	return true;
 }

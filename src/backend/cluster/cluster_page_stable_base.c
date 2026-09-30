@@ -681,6 +681,41 @@ rf_page_stable_base_proof_destroy_v1(RfPageStableBaseProofV1 **proof_pointer)
 	*proof_pointer = NULL;
 }
 
+bool
+rf_page_stable_base_proof_covers_version_v1(const RfPageStableBaseProofV1 *proof,
+											 const RfPageIdentityV1 *identity,
+											 const RfPageVersionV1 *version)
+{
+	const RfContributorVectorV1 *vector;
+	uint32 i;
+
+	if (proof == NULL || proof->magic != RF_PAGE_STABLE_PROOF_MAGIC
+		|| !rf_page_identity_equal_v1(&proof->page_identity, identity)
+		|| !rf_page_version_present_v1(version)
+		|| memcmp(version->segment_incarnation, proof->expected_result.segment_incarnation, 16) != 0
+		|| rf_page_version_equal_v1(version, &proof->expected_result))
+		return false;
+	vector = proof->contributors;
+	if (vector == NULL || vector->edges == NULL || vector->edge_count == 0
+		|| vector->edge_count > RF_PAGE_STABLE_MAX_EDGES)
+		return false;
+	/* Proof construction rejected every branch, cycle and off-chain edge,
+	 * including ancestors preceding the nearest full-image anchor. */
+	for (i = 0; i < vector->edge_count; i++) {
+		const RfPageStableEdgeInputV1 *edge = &vector->edges[i];
+		RfPageVersionV1 result;
+
+		if (!rf_page_identity_equal_v1(&edge->page_identity, identity))
+			return false;
+		edge_result_version(edge, &result);
+		if (rf_page_version_equal_v1(version, &result)
+			|| (edge->edge.before_kind == RF_PAGE_STATE_PRESENT
+				&& rf_page_version_equal_v1(version, &edge->edge.before)))
+			return true;
+	}
+	return false;
+}
+
 #ifdef USE_CLUSTER_UNIT
 
 static bool

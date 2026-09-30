@@ -39,6 +39,10 @@ typedef struct RfPageInstallAuthorityOpsV1 {
 	bool (*promote)(void *arg);
 	bool (*publish)(void *arg);
 	bool (*release)(void *arg);
+	/* Optional: exact membership in the protected, complete contributor chain.
+	 * Called only after promotion; absence preserves the strict before/result gate. */
+	bool (*covers_version)(void *arg, const RfPageIdentityV1 *identity,
+						   const RfPageVersionV1 *version, const RfPageVersionV1 *result);
 } RfPageInstallAuthorityOpsV1;
 
 typedef struct RfPageStorageInstallRequestV1 {

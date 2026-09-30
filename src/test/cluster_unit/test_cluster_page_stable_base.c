@@ -381,6 +381,42 @@ UT_TEST(test_stable_proof_accepts_only_current_bound_pin)
 	UT_ASSERT_EQ(bound_pin_checks, 2);
 }
 
+UT_TEST(test_stable_proof_covers_exact_ancestors_before_nearest_anchor)
+{
+	GraphFixture fixture;
+	RfPageStableBaseProofRequestV1 request;
+	RfPageStableBaseProofV1 *proof = NULL;
+	RfPageVersionV1 first = make_version(1, 11);
+	RfPageVersionV1 middle = make_version(1, 30);
+	RfPageVersionV1 last = make_version(1, 10);
+	RfPageVersionV1 unknown = make_version(1, 29);
+	RfPageIdentityV1 wrong;
+
+	graph_init(&fixture);
+	set_edge(&fixture.edges[1], &fixture.identity, RF_PAGE_STATE_PRESENT, &first, &middle,
+			 0, 2, 0);
+	set_edge(&fixture.edges[2], &fixture.identity, RF_PAGE_STATE_PRESENT, &middle, &last,
+			 RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE, 3, 0);
+	fixture.request.expected_result = last;
+	graph_recount(&fixture, 1, 3);
+	proof_request(&fixture, &request);
+	UT_ASSERT_EQ(rf_page_stable_base_proof_build_bound_v1(&request, fixture.chain,
+													 lengthof(fixture.chain), &proof),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(proof != NULL);
+	UT_ASSERT(rf_page_stable_base_proof_covers_version_v1(proof, &fixture.identity, &first));
+	UT_ASSERT(rf_page_stable_base_proof_covers_version_v1(proof, &fixture.identity, &middle));
+	UT_ASSERT(!rf_page_stable_base_proof_covers_version_v1(proof, &fixture.identity, &last));
+	UT_ASSERT(!rf_page_stable_base_proof_covers_version_v1(proof, &fixture.identity, &unknown));
+	wrong = fixture.identity;
+	wrong.blockno++;
+	UT_ASSERT(!rf_page_stable_base_proof_covers_version_v1(proof, &wrong, &middle));
+	middle.segment_incarnation[0]++;
+	UT_ASSERT(!rf_page_stable_base_proof_covers_version_v1(proof, &fixture.identity, &middle));
+	rf_page_stable_base_proof_destroy_v1(&proof);
+	UT_ASSERT(!rf_page_stable_base_proof_covers_version_v1(proof, &fixture.identity, &first));
+}
+
 UT_TEST(test_stable_proof_rejects_duplicate_owner_scalars)
 {
 	GraphFixture fixture;
@@ -1142,9 +1178,10 @@ UT_TEST(test_complete_release_order)
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(49);
 	UT_RUN(test_stable_proof_binds_exact_borrowed_owners);
 	UT_RUN(test_stable_proof_accepts_only_current_bound_pin);
+	UT_RUN(test_stable_proof_covers_exact_ancestors_before_nearest_anchor);
 	UT_RUN(test_stable_proof_rejects_duplicate_owner_scalars);
 	UT_RUN(test_stable_proof_rejects_root_cut_order_mismatch);
 	UT_RUN(test_stable_proof_rejects_forged_root_current_boolean);
