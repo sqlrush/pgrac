@@ -8,6 +8,7 @@
 #include "postgres.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/cluster_block_apply.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -19134,7 +19135,22 @@ static uint16 inputs_pin_threads[128], inputs_pin_count;
 static ClusterWalWriterToken inputs_native_writer;
 static ClusterWalWriterFlushV1 inputs_native_flush;
 static unsigned inputs_native_begin_calls, inputs_native_flush_calls;
-static bool inputs_native_wait, inputs_native_recovery;
+static bool inputs_native_wait, inputs_native_recovery, inputs_native_reconfigured;
+
+/* The actual contribution graph and FPI/generic codecs are linked below.
+ * These ROOT fixtures never execute heap delta redo or cold-merge globals. */
+bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
+uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
+
+ClusterBlkApplyResult
+cluster_block_apply_heap(XLogReaderState *record, uint8 block_id, char *page)
+{
+	(void)record;
+	(void)block_id;
+	(void)page;
+	UT_ASSERT(false);
+	return CLUSTER_BLKAPPLY_UNSUPPORTED;
+}
 
 bool
 RecoveryInProgress(void)
@@ -19158,7 +19174,8 @@ cluster_wal_writer_check(const ClusterWalWriterToken *token)
 	UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
 	return memcmp(token, &inputs_native_writer, sizeof(*token)) == 0
 			   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			   : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		   : inputs_native_reconfigured ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+										: CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 }
 
 ClusterControlRootResult
@@ -19231,7 +19248,7 @@ inputs_fixture(uint8 bytes[66048], ClusterRecoveryAnchorV2 anchors[2])
 	test_cf_grant = test_cf_release_confirmed = true;
 	inputs_pin_held = inputs_pin_refuse = inputs_pin_race = inputs_pin_throw = false;
 	inputs_native_begin_calls = inputs_native_flush_calls = 0;
-	inputs_native_wait = inputs_native_recovery = false;
+	inputs_native_wait = inputs_native_recovery = inputs_native_reconfigured = false;
 	cluster_shared_config = true;
 	MyBackendType = B_BG_WORKER;
 }
@@ -19443,6 +19460,40 @@ UT_TEST(test_wal_inputs_live_local_uses_original_complete_end)
 	inputs_live_done(&inputs);
 }
 
+UT_TEST(test_wal_inputs_live_accepted_cut_never_expands_during_plan_build)
+{
+	ClusterWalInputsV1 *inputs = inputs_live_wal_fixture(0);
+	ClusterWalTailObservation out;
+	InputsVisitTest visit = { 0 };
+	XLogRecPtr accepted = inputs_native_flush.complete_end;
+	UT_ASSERT_EQ(
+		cluster_wal_inputs_visit_live_local_v1(inputs, 0, inputs_visit_record, &visit, &out), 0);
+	UT_ASSERT_EQ(out.complete_end, accepted);
+	/* Another backend inserts after the job has selected its physical cut.
+	 * It must not change this job's participant interval or require a second
+	 * native sample. The actual file still ends at the original cut. */
+	test_insert += XLOG_BLCKSZ;
+	inputs_native_flush.complete_end += XLOG_BLCKSZ;
+	inputs_native_flush.flushed_end = inputs_native_flush.complete_end;
+	UT_ASSERT_EQ(
+		cluster_wal_inputs_visit_live_local_v1(inputs, 0, inputs_visit_record, &visit, &out), 0);
+	UT_ASSERT_EQ(out.complete_end, accepted);
+	UT_ASSERT_EQ(visit.calls, 2);
+	UT_ASSERT_EQ(inputs_native_flush_calls, 1);
+	/* check(old epoch) may continue to report WAIT after a successful
+	 * reconfiguration. A fresh current token must invalidate this scope,
+	 * without moving the already accepted endpoint. */
+	inputs_native_writer.epoch++;
+	inputs_native_reconfigured = true;
+	UT_ASSERT_EQ(
+		cluster_wal_inputs_visit_live_local_v1(inputs, 0, inputs_visit_record, &visit, &out),
+		CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT_EQ(out.complete_end, 0);
+	UT_ASSERT_EQ(visit.calls, 2);
+	UT_ASSERT_EQ(inputs_native_flush_calls, 1);
+	inputs_live_done(&inputs);
+}
+
 UT_TEST(test_wal_inputs_live_cut_rejects_earlier_pending_job_without_moving_minimum)
 {
 	for (unsigned pending = 0; pending < 2; pending++) {
@@ -19468,6 +19519,142 @@ UT_TEST(test_wal_inputs_live_cut_rejects_earlier_pending_job_without_moving_mini
 			0);
 		UT_ASSERT_EQ(out.complete_end, required);
 		UT_ASSERT_EQ(visit.calls, 1);
+		inputs_live_done(&inputs);
+	}
+}
+
+/* ROOT metadata tests deliberately use thread 128. PAGE's frozen origin
+ * encoding supports 16 origins; use real claims/anchors/WAL for threads 1/2
+ * when testing an accepted contribution graph, without relaxing that limit. */
+static ClusterWalInputsV1 *
+inputs_contribution_fixture(int open_node)
+{
+	ClusterWalInputsV1 *inputs = inputs_live_wal_fixture(0);
+	ControlRootImage root;
+	ControlFileData common, native = { 0 };
+	ClusterControlRootFileToken token;
+	ClusterRecoveryAnchorV2 anchor;
+	ClusterRecoveryAnchorRefV2 ref = { 0 };
+	uint8 bytes[66048], anchor_bytes[CLUSTER_RECOVERY_ANCHOR_SIZE];
+	char path[MAXPGPATH], hex[65];
+	cluster_wal_inputs_release_v1(&inputs);
+	test_actual_cf = ShareLock;
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, &root, &common, &token),
+		0);
+	ref.identity = root.records[127].identity;
+	ref.database_incarnation = root.header.v2.database_incarnation;
+	ref.max_config_generation = root.header.v2.config_generation;
+	ref.anchor_generation = root.refs[127].anchor_generation;
+	memcpy(ref.anchor_sha256, root.refs[127].anchor_sha256, 32);
+	memcpy(ref.claim_sha256, root.refs[127].claim_sha256, 32);
+	for (unsigned i = 0; i < 32; i++)
+		snprintf(hex + i * 2, 3, "%02x", ref.anchor_sha256[i]);
+	snprintf(path, sizeof(path),
+			 "%s/global/anchor_images/thread_%u/generation_" UINT64_FORMAT "/anchor_" UINT64_FORMAT
+			 "-%s.bin",
+			 cluster_shared_data_dir, ref.identity.origin_thread_id,
+			 ref.identity.origin_owner_incarnation, ref.anchor_generation, hex);
+	read_all_or_abort(path, anchor_bytes, sizeof(anchor_bytes));
+	UT_ASSERT_EQ(
+		cluster_recovery_anchor_v2_decode(anchor_bytes, sizeof(anchor_bytes), &ref, &anchor), 0);
+	root.records[1] = root.records[127];
+	root.records[1].identity.origin_node_id = 1;
+	root.records[1].identity.origin_thread_id = 2;
+	root.refs[1] = root.refs[127];
+	root.publisher_node[1] = 1;
+	root.publisher_incarnation[1] = root.publisher_incarnation[127];
+	root.present[1] = true;
+	memset(&root.records[127], 0, sizeof(root.records[127]));
+	memset(&root.refs[127], 0, sizeof(root.refs[127]));
+	root.publisher_node[127] = 0;
+	root.publisher_incarnation[127] = 0;
+	root.present[127] = false;
+	for (int i = 0; i < 2; i++)
+		root.records[i].lifecycle = i == open_node ? CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+												   : CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	memcpy(bytes, root.bytes, sizeof(bytes));
+	v2_claim_object(bytes, 1, &root);
+	anchor.identity = root.records[1].identity;
+	memcpy(anchor.claim_sha256, root.refs[1].claim_sha256, 32);
+	v2_anchor_object(bytes, &anchor, &anchor.identity, path);
+	native.state = anchor.state;
+	native.checkPoint = anchor.checkpoint;
+	native.checkPointCopy = anchor.checkpoint_copy;
+	v2_checkpoint_wal_record(&anchor.identity, &native, 8);
+	test_insert = inputs_native_flush.complete_end;
+	v2_write_roots(bytes);
+	test_actual_cf = NoLock;
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+	return inputs;
+}
+
+UT_TEST(test_wal_inputs_contributions_all_closed_or_local_live)
+{
+	for (unsigned live = 0; live < 2; live++) {
+		ClusterWalInputsV1 *inputs = inputs_contribution_fixture(live ? 0 : -1);
+		ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
+		RfPageProofDetailV1 detail;
+		uint64 records = 0;
+		UT_ASSERT_EQ(cluster_wal_inputs_contributions_v1(inputs, true, &plan, &records, &detail),
+					 0);
+		UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(plan != NULL);
+		UT_ASSERT_EQ(records, 2);
+		UT_ASSERT_EQ(cluster_thread_recovery_fabric_participant_count_v1(plan), 2);
+		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(
+						 cluster_thread_recovery_fabric_side_plan_v1(plan)),
+					 2);
+		for (unsigned i = 0; i < 2 && plan != NULL; i++) {
+			RfContributorStreamCutV1 cut;
+			ClusterWalSourceRef source;
+			RfSideOnlineOperationV1 control;
+			const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, i);
+			UT_ASSERT(cluster_thread_recovery_fabric_cut_v1(plan, i, &cut));
+			UT_ASSERT_EQ(cut.origin_owner_incarnation,
+						 item->source.claim.identity.origin_owner_incarnation);
+			UT_ASSERT_EQ(cut.scan_begin_inclusive, item->checkpoint.checkpoint_lower_lsn);
+			UT_ASSERT_EQ(cut.scan_end_exclusive, item->checkpoint.validated_tail_lsn_exclusive);
+			UT_ASSERT(rf_page_online_plan_source_v1(
+				cluster_thread_recovery_fabric_page_plan_v1(plan), i, &source));
+			UT_ASSERT_EQ(memcmp(&source, &item->source, sizeof(source)), 0);
+			UT_ASSERT(rf_side_online_plan_operation_v1(
+				cluster_thread_recovery_fabric_side_plan_v1(plan), i, &control));
+			UT_ASSERT_EQ(control.kind, RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL);
+			UT_ASSERT(!control.history_only);
+		}
+		cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+		inputs_live_done(&inputs);
+	}
+}
+
+UT_TEST(test_wal_inputs_contributions_waits_whole_set_and_discards_on_source_failure)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterWalInputsV1 *inputs = inputs_contribution_fixture(fault == 0 ? 1 : 0);
+		ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
+		RfPageProofDetailV1 detail;
+		uint64 records = 99;
+		ClusterControlRootResult result;
+		if (fault == 1)
+			inputs_native_wait = true;
+		if (fault == 2) {
+			const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, 1);
+			char path[MAXPGPATH];
+			v2_claim_path(&item->source.claim.identity, path);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		result = cluster_wal_inputs_contributions_v1(inputs, true, &plan, &records, &detail);
+		UT_ASSERT_NE(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		if (fault < 2)
+			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		UT_ASSERT(plan == NULL);
+		UT_ASSERT_EQ(records, 0);
+		UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+		if (fault == 0)
+			UT_ASSERT_EQ(inputs_native_begin_calls + inputs_native_flush_calls, 0);
+		cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
 		inputs_live_done(&inputs);
 	}
 }
@@ -19879,8 +20066,11 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_WAL_INPUTS") != NULL) {
-		UT_PLAN(13);
+		UT_PLAN(16);
+		UT_RUN(test_wal_inputs_contributions_all_closed_or_local_live);
+		UT_RUN(test_wal_inputs_contributions_waits_whole_set_and_discards_on_source_failure);
 		UT_RUN(test_wal_inputs_live_local_uses_original_complete_end);
+		UT_RUN(test_wal_inputs_live_accepted_cut_never_expands_during_plan_build);
 		UT_RUN(test_wal_inputs_live_cut_rejects_earlier_pending_job_without_moving_minimum);
 		UT_RUN(test_wal_inputs_live_refuses_foreign_writer_and_changed_owner);
 		UT_RUN(test_wal_inputs_physically_visit_exact_nonserving_closed_sources);
@@ -19903,8 +20093,11 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(362);
+	UT_PLAN(365);
+	UT_RUN(test_wal_inputs_contributions_all_closed_or_local_live);
+	UT_RUN(test_wal_inputs_contributions_waits_whole_set_and_discards_on_source_failure);
 	UT_RUN(test_wal_inputs_live_local_uses_original_complete_end);
+	UT_RUN(test_wal_inputs_live_accepted_cut_never_expands_during_plan_build);
 	UT_RUN(test_wal_inputs_live_cut_rejects_earlier_pending_job_without_moving_minimum);
 	UT_RUN(test_wal_inputs_live_refuses_foreign_writer_and_changed_owner);
 	UT_RUN(test_wal_inputs_physically_visit_exact_nonserving_closed_sources);

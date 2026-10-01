@@ -4,6 +4,7 @@
 #define CLUSTER_WAL_INPUTS_H
 
 #include "cluster/cluster_wal_tail.h"
+#include "cluster/cluster_thread_recovery_fabric.h"
 
 #define CLUSTER_WAL_INPUTS_MAX 128
 
@@ -65,6 +66,26 @@ extern ClusterControlRootResult
 cluster_wal_inputs_visit_live_local_v1(ClusterWalInputsV1 *inputs, uint32 index,
 									   ClusterWalRecordVisitor visitor, void *arg,
 									   ClusterWalTailObservation *out);
+
+/* Fix a local OPEN endpoint before constructing an immutable contribution
+ * plan. Once accepted, retries/visits reuse that exact complete end and still
+ * recheck the original writer. Metadata only, no physical validation yet. */
+extern ClusterControlRootResult
+cluster_wal_inputs_prepare_live_local_v1(ClusterWalInputsV1 *inputs, uint32 index,
+										 XLogRecPtr *out_complete_end);
+
+/* Read every selected source into one sealed contribution graph. All retained
+ * records remain obligations, including records before native redo. This is
+ * NOT a replay plan: it grants no recovery/mutation/PI/ROOT/GC authority. The
+ * scope must remain held and be revalidated before consuming the result. A
+ * foreign OPEN source without its original writer's cut returns WAIT with no
+ * partial output. Explicit empty terminals remain participants and are read.
+ * The fabric destructor owns the output; release it before the input scope.
+ * detail reports a PAGE/SIDE refusal; root errors are returned directly. */
+extern ClusterControlRootResult
+cluster_wal_inputs_contributions_v1(ClusterWalInputsV1 *inputs, bool space_active,
+									ClusterThreadRecoveryFabricPlanV1 **out_plan,
+									uint64 *out_record_count, RfPageProofDetailV1 *out_detail);
 extern void cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs);
 
 #endif

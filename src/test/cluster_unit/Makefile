@@ -2750,8 +2750,18 @@ test_cluster_control_native_xid.inc: $(top_srcdir)/src/backend/cluster/cluster_x
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# The full-source owner feeds actual PAGE/SIDE plans, not graph stubs.
+WAL_INPUT_CONTRIBUTION_TEST_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
+		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
+		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o \
+		test_cluster_page_dependency_base.o $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
+		$(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) $(SIDE_XACT_TT_2PC_RECORD_O) \
+		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) \
+		$(CLUSTER_REMOTE_XACT_IDENTITY_O)
+
 test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc \
 		test_cluster_control_native_xid.inc \
+		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
 		$(top_builddir)/src/backend/cluster/cluster_wal_inputs.o \
 		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
@@ -2762,6 +2772,7 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixt
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
+		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_inputs.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \

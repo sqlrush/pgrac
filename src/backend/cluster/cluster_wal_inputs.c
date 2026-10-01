@@ -36,6 +36,7 @@ struct ClusterWalInputsV1 {
 	ClusterWalWriterToken local_writer;
 	XLogRecPtr local_minimum;
 	uint32 local_index;
+	ClusterWalWriterFlushV1 local_cut;
 };
 
 typedef struct WalInputsWork {
@@ -345,6 +346,15 @@ inputs_live_sample(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriterFlu
 	result = cluster_wal_writer_begin(item->source.timeline, &current);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
+	if (inputs->local_cut.complete_end != InvalidXLogRecPtr) {
+		if (inputs->local_index != index
+			|| memcmp(&current, &inputs->local_cut.writer, sizeof(current)) != 0)
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		result = cluster_wal_writer_check(&inputs->local_cut.writer);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			*out = inputs->local_cut;
+		return result;
+	}
 	/* ROOT's later configuration ceiling may cover this same immutable
 	 * native claim. The original writer token itself remains byte-exact. */
 	if (!cluster_control_root_identity_equal(&current.ref.claim.identity,
@@ -379,25 +389,23 @@ inputs_live_sample(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriterFlu
 	/* The process-local sampler may have completed an earlier job's pending
 	 * reservation. Consuming that sample is safe, using it for this job is
 	 * not. The next poll samples anew without moving our fixed minimum. */
-	return out->complete_end < inputs->local_minimum ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
-													 : CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	if (out->complete_end < inputs->local_minimum)
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	inputs->local_cut = *out;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 ClusterControlRootResult
-cluster_wal_inputs_visit_live_local_v1(ClusterWalInputsV1 *inputs, uint32 index,
-									   ClusterWalRecordVisitor visitor, void *arg,
-									   ClusterWalTailObservation *out)
+cluster_wal_inputs_prepare_live_local_v1(ClusterWalInputsV1 *inputs, uint32 index,
+										 XLogRecPtr *out_complete_end)
 {
-	ClusterWalTailObservation observed = { 0 };
 	ClusterWalWriterFlushV1 native;
-	WalInputsVisit visit = { inputs, visitor, arg };
 	const ClusterWalInputV1 *item;
 	ClusterControlRootResult result;
-	bool visited = false;
 
-	if (out == NULL)
+	if (out_complete_end == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	memset(out, 0, sizeof(*out));
+	*out_complete_end = InvalidXLogRecPtr;
 	if (!inputs_current(inputs) || index >= inputs->count || CritSectionCount != 0
 		|| ShutdownRequestPending || RecoveryInProgress())
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
@@ -414,14 +422,6 @@ cluster_wal_inputs_visit_live_local_v1(ClusterWalInputsV1 *inputs, uint32 index,
 			else
 				result = inputs_live_sample(inputs, index, &native);
 		}
-		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
-			visited = true;
-			result = cluster_wal_flushed_prefix_visit(
-				cluster_wal_threads_dir, &item->source, wal_segment_size,
-				item->checkpoint.checkpoint_lower_lsn, inputs->local_minimum, native.complete_end,
-				native.flushed_end, item->checkpoint_start,
-				item->checkpoint.checkpoint_record_crc32c, inputs_visit_record, &visit, &observed);
-		}
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = cluster_wal_writer_check(&native.writer);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -434,9 +434,233 @@ cluster_wal_inputs_visit_live_local_v1(ClusterWalInputsV1 *inputs, uint32 index,
 	}
 	PG_END_TRY();
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		*out = observed;
-	else if (visited || result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
+		*out_complete_end = native.complete_end;
+	else if (result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
 		inputs->stale = true;
+	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_visit_live_local_v1(ClusterWalInputsV1 *inputs, uint32 index,
+									   ClusterWalRecordVisitor visitor, void *arg,
+									   ClusterWalTailObservation *out)
+{
+	ClusterWalTailObservation observed = { 0 };
+	WalInputsVisit visit = { inputs, visitor, arg };
+	ClusterControlRootResult result;
+	const ClusterWalInputV1 *item;
+	XLogRecPtr end;
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	result = cluster_wal_inputs_prepare_live_local_v1(inputs, index, &end);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	item = &inputs->items[index];
+	PG_TRY();
+	{
+		result = cluster_wal_flushed_prefix_visit(
+			cluster_wal_threads_dir, &item->source, wal_segment_size,
+			item->checkpoint.checkpoint_lower_lsn, inputs->local_minimum, end,
+			inputs->local_cut.flushed_end, item->checkpoint_start,
+			item->checkpoint.checkpoint_record_crc32c, inputs_visit_record, &visit, &observed);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_writer_check(&inputs->local_cut.writer);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_inputs_revalidate_v1(inputs);
+	}
+	PG_CATCH();
+	{
+		inputs->stale = true;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = observed;
+	else
+		inputs->stale = true;
+	return result;
+}
+
+typedef struct WalContributionWork {
+	ClusterThreadRecoveryFabricPlanV1 *plan;
+	RfContributorStreamCutV1 cuts[CLUSTER_WAL_INPUTS_MAX];
+	ClusterWalSourceRef sources[CLUSTER_WAL_INPUTS_MAX];
+	uint32 indices[CLUSTER_WAL_INPUTS_MAX];
+	uint32 count;
+	uint16 participant;
+	uint64 records;
+	RfPageProofDetailV1 detail;
+} WalContributionWork;
+
+static ClusterControlRootResult
+inputs_contribution_cuts(ClusterWalInputsV1 *inputs, WalContributionWork *work)
+{
+	ClusterControlRootResult result = cluster_wal_inputs_revalidate_v1(inputs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	work->count = inputs->count;
+	for (uint32 i = 0; i < work->count; i++) {
+		const ClusterWalInputV1 *item = &inputs->items[i];
+		RfContributorStreamCutV1 cut = { 0 };
+		uint32 at = i;
+		cut.failed_thread = item->source.claim.identity.origin_thread_id;
+		cut.origin_owner_incarnation = item->source.claim.identity.origin_owner_incarnation;
+		cut.timeline_id = item->source.timeline;
+		cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		if (cut.origin_owner_incarnation == 0)
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		if (item->kind == CLUSTER_WAL_INPUT_CHECKPOINT) {
+			cut.scan_begin_inclusive = item->checkpoint.checkpoint_lower_lsn;
+			cut.scan_end_exclusive = item->checkpoint.validated_tail_lsn_exclusive;
+			if (item->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
+				result
+					= cluster_wal_inputs_prepare_live_local_v1(inputs, i, &cut.scan_end_exclusive);
+				if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+					return result;
+			}
+		} else if (item->kind == CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL) {
+			cut.scan_begin_inclusive = item->first_segment + SizeOfXLogLongPHD;
+			cut.scan_end_exclusive = item->terminal.tail.complete_end;
+			if (item->terminal.tail.records == 0) {
+				cut.flags |= RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY;
+				cut.scan_end_exclusive = cut.scan_begin_inclusive;
+			}
+		} else
+			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		/* History and checkpoint-less terminal lists can interleave writer
+		 * incarnations. Keep every input, in the graph's full-source order. */
+		while (at > 0 && rf_contributor_cut_precedes_v1(&cut, &work->cuts[at - 1])) {
+			work->cuts[at] = work->cuts[at - 1];
+			work->sources[at] = work->sources[at - 1];
+			work->indices[at] = work->indices[at - 1];
+			at--;
+		}
+		work->cuts[at] = cut;
+		work->sources[at] = item->source;
+		work->indices[at] = i;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static bool
+inputs_contribution_record(XLogReaderState *reader, void *arg)
+{
+	WalContributionWork *work = arg;
+	if (work->records == UINT64_MAX) {
+		work->detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+		return false;
+	}
+	work->detail
+		= cluster_thread_recovery_fabric_plan_feed_record_v1(work->plan, reader, work->participant);
+	if (work->detail != RF_PAGE_PROOF_DETAIL_OK)
+		return false;
+	work->records++;
+	return true;
+}
+
+static ClusterControlRootResult
+inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalContributionWork *work)
+{
+	ClusterThreadRecoveryFabricPlanRequestV1 request = { 0 };
+	ClusterControlRootResult result = inputs_contribution_cuts(inputs, work);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	request.system_identifier = inputs->system_identifier;
+	memcpy(request.storage_uuid, inputs->storage_uuid, 16);
+	request.physical_cuts = work->cuts;
+	request.sources = work->sources;
+	request.participant_count = work->count;
+	request.retention_binding_cookie = (uint64)(uintptr_t)inputs;
+	request.space_active = space_active;
+	/* NULL redo_starts deliberately keeps every retained contribution.
+	 * This graph cannot authorize replay; native recovery has a different
+	 * owner and must select its same-anchor actual redo start. */
+	work->detail = cluster_thread_recovery_fabric_plan_create_v1(&request, &work->plan);
+	if (work->detail != RF_PAGE_PROOF_DETAIL_OK)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (!cluster_thread_recovery_fabric_bind_database_v1(
+			work->plan, work->sources[0].claim.database_incarnation)) {
+		work->detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	}
+	for (uint32 i = 0; i < work->count; i++) {
+		uint32 index = work->indices[i];
+		const ClusterWalInputV1 *item = &inputs->items[index];
+		ClusterWalTailObservation observed;
+		uint64 previous = work->records;
+		bool empty = (work->cuts[i].flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0;
+		work->participant = i;
+		if (item->kind == CLUSTER_WAL_INPUT_CHECKPOINT
+			&& item->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
+			result = cluster_wal_inputs_visit_live_local_v1(
+				inputs, index, inputs_contribution_record, work, &observed);
+		else
+			result = cluster_wal_inputs_visit_retained_v1(inputs, index, inputs_contribution_record,
+														  work, &observed);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		if (observed.records != work->records - previous
+			|| (empty ? observed.records != 0 || observed.complete_end != 0
+					  : observed.records == 0
+							|| observed.complete_end != work->cuts[i].scan_end_exclusive)
+			|| (observed.records != 0
+				&& observed.database_incarnation != work->sources[i].claim.database_incarnation)) {
+			work->detail = RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		}
+	}
+	result = cluster_wal_inputs_revalidate_v1(inputs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	work->detail = cluster_thread_recovery_fabric_plan_seal_v1(work->plan);
+	if (work->detail != RF_PAGE_PROOF_DETAIL_OK)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	result = cluster_wal_inputs_revalidate_v1(inputs);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& inputs->local_cut.complete_end != InvalidXLogRecPtr)
+		result = cluster_wal_writer_check(&inputs->local_cut.writer);
+	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_contributions_v1(ClusterWalInputsV1 *inputs, bool space_active,
+									ClusterThreadRecoveryFabricPlanV1 **out_plan,
+									uint64 *out_record_count, RfPageProofDetailV1 *out_detail)
+{
+	WalContributionWork *work;
+	ClusterControlRootResult result;
+	if (out_plan == NULL || out_record_count == NULL || out_detail == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	*out_plan = NULL;
+	*out_record_count = 0;
+	*out_detail = RF_PAGE_PROOF_DETAIL_OK;
+	if (!inputs_current(inputs) || CritSectionCount != 0 || ShutdownRequestPending)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	work = palloc0(sizeof(*work));
+	PG_TRY();
+	{
+		result = inputs_contribution_build(inputs, space_active, work);
+	}
+	PG_CATCH();
+	{
+		cluster_thread_recovery_fabric_plan_destroy_v1(&work->plan);
+		pfree(work);
+		inputs->stale = true;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	*out_detail = work->detail;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		*out_plan = work->plan;
+		*out_record_count = work->records;
+	} else {
+		cluster_thread_recovery_fabric_plan_destroy_v1(&work->plan);
+		if (result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
+			inputs->stale = true;
+	}
+	pfree(work);
 	return result;
 }
 

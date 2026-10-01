@@ -22,7 +22,10 @@ typedef enum RfSideOnlineOperationKindV1 {
 	RF_SIDE_ONLINE_OPERATION_XACT = 1,
 	RF_SIDE_ONLINE_OPERATION_UNDO = 2,
 	RF_SIDE_ONLINE_OPERATION_PROJECTION = 3,
-	RF_SIDE_ONLINE_OPERATION_SPACE = 4
+	RF_SIDE_ONLINE_OPERATION_SPACE = 4,
+	/* Original RM_XLOG payload. Retained as an obligation, never a no-op or
+	 * a projection. Execution needs the original native control owner. */
+	RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL = 5
 } RfSideOnlineOperationKindV1;
 
 typedef struct RfSideOnlinePlanRequestV1 {

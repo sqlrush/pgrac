@@ -3636,10 +3636,158 @@ UT_TEST(test_retained_generations_refuse_ambiguous_thread_selectors)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+static uint32
+native_control_payload(uint8 info, uint8 *payload)
+{
+	CheckPoint checkpoint = { 0 };
+	xl_parameter_change parameters = { 0 };
+	xl_restore_point restore = { 0 };
+	xl_end_of_recovery end = { 0 };
+	xl_overwrite_contrecord overwrite = { 0 };
+	Oid oid = 5;
+	XLogRecPtr backup = 50;
+	checkpoint.ThisTimeLineID = checkpoint.PrevTimeLineID = 7;
+	checkpoint.redo = 100;
+	checkpoint.nextXid = FullTransactionIdFromU64(20);
+	checkpoint.fullPageWrites = true;
+	parameters.MaxConnections = parameters.max_locks_per_xact = 20;
+	parameters.wal_level = WAL_LEVEL_REPLICA;
+	end.ThisTimeLineID = end.PrevTimeLineID = 7;
+	overwrite.overwritten_lsn = 50;
+#define CONTROL_COPY(value_)                                                                       \
+	do {                                                                                           \
+		memcpy(payload, &(value_), sizeof(value_));                                                \
+		return sizeof(value_);                                                                     \
+	} while (0)
+	switch (info) {
+	case XLOG_CHECKPOINT_SHUTDOWN:
+	case XLOG_CHECKPOINT_ONLINE:
+		CONTROL_COPY(checkpoint);
+	case XLOG_PARAMETER_CHANGE:
+		CONTROL_COPY(parameters);
+	case XLOG_FPW_CHANGE:
+		payload[0] = 1;
+		return sizeof(bool);
+	case XLOG_NEXTOID:
+		CONTROL_COPY(oid);
+	case XLOG_BACKUP_END:
+		CONTROL_COPY(backup);
+	case XLOG_RESTORE_POINT:
+		CONTROL_COPY(restore);
+	case XLOG_END_OF_RECOVERY:
+		CONTROL_COPY(end);
+	case XLOG_OVERWRITE_CONTRECORD:
+		CONTROL_COPY(overwrite);
+	case XLOG_SWITCH:
+		return 0;
+	default:
+		payload[0] = 0x52;
+		return 1;
+	}
+#undef CONTROL_COPY
+}
+
+UT_TEST(test_native_control_is_owned_input_and_not_replay_permission)
+{
+	static const uint8 infos[] = { XLOG_CHECKPOINT_SHUTDOWN,
+								   XLOG_CHECKPOINT_ONLINE,
+								   XLOG_PARAMETER_CHANGE,
+								   XLOG_FPW_CHANGE,
+								   XLOG_NEXTOID,
+								   XLOG_NOOP,
+								   XLOG_SWITCH,
+								   XLOG_BACKUP_END,
+								   XLOG_RESTORE_POINT,
+								   XLOG_END_OF_RECOVERY,
+								   XLOG_OVERWRITE_CONTRECORD };
+	for (unsigned i = 0; i < lengthof(infos); i++) {
+		RfSideOnlinePlanV1 *plan = space_online_plan(200);
+		FakeXactRecord fake;
+		uint8 payload[512] = { 0 }, uuid[16];
+		uint32 length = native_control_payload(infos[i], payload);
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		RfSideOnlineOperationV1 operation;
+		RfSideOnlineApplyOpsV1 ops = { 0 };
+		ApplyCapture capture = { 0 };
+		memset(uuid, 0x44, sizeof(uuid));
+		make_projection_record(&fake, RM_XLOG_ID, infos[i], payload, length);
+		identity = make_identity(&fake, uuid);
+		fake.u.decoded.max_block_id = -1;
+		record = make_projection_record_plan(&fake);
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		memset(fake.data, 0xa5, length);
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 1);
+		if (rf_side_online_plan_operation_v1(plan, 0, &operation)) {
+			UT_ASSERT_EQ(operation.kind, RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL);
+			UT_ASSERT_EQ(operation.owned_payload_length, length);
+			if (length > 0)
+				UT_ASSERT_EQ(memcmp(operation.owned_payload, payload, length), 0);
+			UT_ASSERT(!operation.history_only);
+		} else
+			UT_ASSERT(false);
+		ops.arg = &capture;
+		ops.begin_protected_set = capture_begin;
+		ops.end_protected_set = capture_end;
+		ops.preflight_projection = accept_preflight;
+		ops.apply_projection = capture_apply_projection;
+		UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &ops),
+					 RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT);
+		UT_ASSERT_EQ(capture.begin_count + capture.projection_count, 0);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_native_control_rejects_bad_shape_and_identity)
+{
+	for (unsigned fault = 0; fault < 9; fault++) {
+		RfSideOnlinePlanV1 *plan = space_online_plan(200);
+		FakeXactRecord fake;
+		uint8 payload[512] = { 0 }, uuid[16];
+		uint8 info = fault < 5	 ? XLOG_CHECKPOINT_SHUTDOWN
+					 : fault < 8 ? XLOG_PARAMETER_CHANGE
+								 : 0xc0;
+		uint32 length = native_control_payload(info, payload);
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		if (fault == 0)
+			length--;
+		if (fault == 1)
+			payload[offsetof(CheckPoint, fullPageWrites)] = 2;
+		if (fault == 2) {
+			TimeLineID tli = 9;
+			memcpy(payload + offsetof(CheckPoint, ThisTimeLineID), &tli, sizeof(tli));
+		}
+		if (fault == 3) {
+			XLogRecPtr redo = 101;
+			memcpy(payload + offsetof(CheckPoint, redo), &redo, sizeof(redo));
+		}
+		if (fault == 5)
+			payload[offsetof(xl_parameter_change, track_commit_timestamp)] = 2;
+		if (fault == 6)
+			memset(payload + offsetof(xl_parameter_change, MaxConnections), 0, sizeof(int));
+		if (fault == 7)
+			memset(payload + offsetof(xl_parameter_change, wal_level), 0xff, sizeof(int));
+		memset(uuid, 0x44, sizeof(uuid));
+		make_projection_record(&fake, RM_XLOG_ID, info, payload, length);
+		identity = make_identity(&fake, uuid);
+		fake.u.decoded.max_block_id = fault == 4 ? 0 : -1;
+		record = make_projection_record_plan(&fake);
+		UT_ASSERT_NE(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(52);
+	UT_PLAN(54);
+	UT_RUN(test_native_control_is_owned_input_and_not_replay_permission);
+	UT_RUN(test_native_control_rejects_bad_shape_and_identity);
 	UT_RUN(test_retained_generations_refuse_ambiguous_thread_selectors);
 	UT_RUN(test_side_plan_does_not_drop_unowned_page_components);
 	UT_RUN(test_retained_side_history_is_validated_but_never_dispatched);

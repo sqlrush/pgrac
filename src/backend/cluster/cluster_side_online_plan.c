@@ -11,6 +11,9 @@
 #include "access/commit_ts.h"
 #include "access/multixact.h"
 #include "access/slru.h"
+#include "access/xlog.h"
+#include "access/xlog_internal.h"
+#include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_native_startup.h"
@@ -620,6 +623,83 @@ rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request,
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
+/* Native control records retain their exact payload and source identity.
+ * They are not PAGE work, but dropping them would lose checkpoint/capacity/
+ * OID/recovery obligations. The native control consumer must close them. */
+static bool
+side_native_control_valid(XLogReaderState *reader, const RfPageOnlineRecordIdentityV1 *identity)
+{
+	uint32 length = XLogRecGetDataLen(reader);
+	const uint8 *data = (const uint8 *)XLogRecGetData(reader);
+	uint8 info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+	if (XLogRecGetRmid(reader) != RM_XLOG_ID || XLogRecMaxBlockId(reader) >= 0
+		|| reader->record->has_page_version_edge || (length > 0 && data == NULL)
+		|| (XLogRecGetInfo(reader) & XLR_INFO_MASK) != 0)
+		return false;
+	switch (info) {
+	case XLOG_CHECKPOINT_SHUTDOWN:
+	case XLOG_CHECKPOINT_ONLINE: {
+		CheckPoint checkpoint;
+		if (length != sizeof(checkpoint) || data[offsetof(CheckPoint, fullPageWrites)] > 1)
+			return false;
+		memcpy(&checkpoint, data, sizeof(checkpoint));
+		return checkpoint.ThisTimeLineID == identity->record.timeline_id
+			   && checkpoint.PrevTimeLineID > 0
+			   && checkpoint.PrevTimeLineID <= checkpoint.ThisTimeLineID
+			   && checkpoint.redo != InvalidXLogRecPtr && checkpoint.redo <= reader->ReadRecPtr
+			   && (info != XLOG_CHECKPOINT_SHUTDOWN || checkpoint.redo == reader->ReadRecPtr)
+			   && TransactionIdIsNormal(XidFromFullTransactionId(checkpoint.nextXid));
+	}
+	case XLOG_PARAMETER_CHANGE: {
+		xl_parameter_change parameters;
+		if (length != sizeof(parameters) || data[offsetof(xl_parameter_change, wal_log_hints)] > 1
+			|| data[offsetof(xl_parameter_change, track_commit_timestamp)] > 1)
+			return false;
+		memcpy(&parameters, data, sizeof(parameters));
+		return parameters.MaxConnections > 0 && parameters.max_worker_processes >= 0
+			   && parameters.max_wal_senders >= 0 && parameters.max_prepared_xacts >= 0
+			   && parameters.max_locks_per_xact > 0 && parameters.wal_level >= WAL_LEVEL_MINIMAL
+			   && parameters.wal_level <= WAL_LEVEL_LOGICAL;
+	}
+	case XLOG_FPW_CHANGE:
+		return length == sizeof(bool) && data[0] <= 1;
+	case XLOG_NEXTOID:
+		/* Preserve native OID wrap semantics; payload is not allocator authority. */
+		return length == sizeof(Oid);
+	case XLOG_SWITCH:
+		return length == 0;
+	case XLOG_NOOP:
+		return true;
+	case XLOG_BACKUP_END: {
+		XLogRecPtr start;
+		if (length != sizeof(start))
+			return false;
+		memcpy(&start, data, sizeof(start));
+		return start != InvalidXLogRecPtr;
+	}
+	case XLOG_RESTORE_POINT:
+		return length == sizeof(xl_restore_point)
+			   && memchr(data + offsetof(xl_restore_point, rp_name), '\0', MAXFNAMELEN) != NULL;
+	case XLOG_END_OF_RECOVERY: {
+		xl_end_of_recovery end;
+		if (length != sizeof(end))
+			return false;
+		memcpy(&end, data, sizeof(end));
+		return end.ThisTimeLineID == identity->record.timeline_id && end.PrevTimeLineID > 0
+			   && end.PrevTimeLineID <= end.ThisTimeLineID;
+	}
+	case XLOG_OVERWRITE_CONTRECORD: {
+		xl_overwrite_contrecord overwrite;
+		if (length != sizeof(overwrite))
+			return false;
+		memcpy(&overwrite, data, sizeof(overwrite));
+		return overwrite.overwritten_lsn != InvalidXLogRecPtr;
+	}
+	default:
+		return false;
+	}
+}
+
 RfPageProofDetailV1
 rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 								   const RfDetachedRecordPlanV1 *record_plan,
@@ -657,8 +737,23 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 	}
 	memset(&candidate, 0, sizeof(candidate));
 	if (record_plan->route.record_owner == RF_ROUTE_OWNER_SIDE_TYPED) {
-		if (record_plan->route.rmid == RM_XACT_ID
+		if (record_plan->route.rmid == RM_XLOG_ID
 			&& record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD) {
+			uint32 length = XLogRecGetDataLen(record_plan->source_record);
+			if (!side_native_control_valid(record_plan->source_record, identity))
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			candidate.kind = RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;
+			if (length > 0) {
+				if (!side_ensure_payload_capacity(plan, length))
+					return RF_PAGE_PROOF_DETAIL_CAPACITY;
+				candidate.owned_payload_offset = plan->owned_payload_bytes;
+				candidate.owned_payload_length = length;
+				memcpy(plan->owned_payload + plan->owned_payload_bytes,
+					   XLogRecGetData(record_plan->source_record), length);
+				plan->owned_payload_bytes += length;
+			}
+		} else if (record_plan->route.rmid == RM_XACT_ID
+				   && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD) {
 			if (!rf_side_xact_decode_v1(record_plan->source_record, plan->system_identifier,
 										identity->record.origin_thread, &candidate.xact))
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
@@ -1443,6 +1538,8 @@ side_plan_apply_ops_valid(const RfSideOnlinePlanV1 *plan, const RfSideOnlineAppl
 				&& (ops->preflight_projection == NULL || ops->apply_projection == NULL))
 			|| (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_SPACE
 				&& (ops->preflight_space == NULL || ops->apply_space == NULL))
+			/* No projection/TT callback may stand in for native control. */
+			|| plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
 			|| plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_INVALID)
 			return false;
 	}
