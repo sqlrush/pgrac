@@ -32,12 +32,13 @@
 
 UT_DEFINE_GLOBALS();
 
-/* Actual rebuild entry, terminal publication and result name. These fixtures
+/* Actual authority selector, rebuild entry, terminal publication and result name. These fixtures
  * deliberately make the legacy snapshot unavailable and forbid any replay,
  * adoption write or shard opening. Shared mode must select the typed owner
- * before allocating or touching the retired snapshot route. */
+ * without allocating or touching the retired snapshot route. */
 static bool active = true, recoverable = true;
 bool cluster_shared_config;
+char *cluster_shared_data_dir = "/fixture/shared";
 int cluster_node_id;
 static unsigned snapshot_reads, allocations, blocked, done;
 static ClusterHwRemasterResult terminal;
@@ -48,7 +49,7 @@ test_alloc(Size size)
 	allocations++;
 	return malloc(size);
 }
-#define cluster_hw_authority_active() active
+#define cluster_conf_node_count() (active ? 4 : 1)
 #define cluster_hw_remaster_recoverable() recoverable
 #define cluster_hw_bump_failclosed() ((void)0)
 #define cluster_wal_thread_id_for(cluster, node) ((uint16)((node) + 1))
@@ -188,33 +189,31 @@ UT_TEST(test_backoff_exponential_cap)
 	UT_ASSERT_EQ(cluster_hw_remaster_compute_backoff_ms(100, 20), 60000);
 }
 
-UT_TEST(test_shared_rebuild_waits_without_legacy_io)
+UT_TEST(test_shared_rebuild_has_no_legacy_authority_or_io)
 {
 	active = recoverable = cluster_shared_config = true;
 	snapshot_reads = allocations = 0;
-	UT_ASSERT_EQ(cluster_hw_remaster_rebuild_origin(1, 12),
-				 CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY);
+	UT_ASSERT_EQ(cluster_hw_remaster_rebuild_origin(1, 12), CLUSTER_HW_REMASTER_NOT_APPLICABLE);
+	UT_ASSERT(!cluster_hw_authority_active());
 	UT_ASSERT_EQ(snapshot_reads, 0);
 	UT_ASSERT_EQ(allocations, 0);
-	UT_ASSERT(strcmp(cluster_hw_remaster_result_name(CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY),
-					 "wait_typed_space_recovery")
-			  == 0);
 }
 
-UT_TEST(test_typed_wait_does_not_complete_or_retry_legacy)
+UT_TEST(test_canonical_nonparticipant_has_no_completion_or_retry_debt)
 {
 	ClusterHwRemasterRelaunchDecision d;
 	blocked = done = 0;
 	terminal = CLUSTER_HW_REMASTER_RUNNING;
 	deadline = 0;
-	hw_remaster_record_terminal(1, CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY);
-	UT_ASSERT_EQ(terminal, CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY);
-	UT_ASSERT_EQ(deadline, CLUSTER_HW_REMASTER_NO_DEADLINE);
+	deadline = CLUSTER_HW_REMASTER_NO_DEADLINE;
+	hw_remaster_record_terminal(1, CLUSTER_HW_REMASTER_NOT_APPLICABLE);
+	UT_ASSERT_EQ(terminal, CLUSTER_HW_REMASTER_NOT_APPLICABLE);
+	UT_ASSERT_EQ(deadline, 0);
 	UT_ASSERT_EQ(done, 0);
-	UT_ASSERT_EQ(blocked, 1);
+	UT_ASSERT_EQ(blocked, 0);
 	d = decide(12, 12, terminal, 0, deadline, 60000, 16);
 	UT_ASSERT_EQ(d.action, CLUSTER_HW_REMASTER_LAUNCH_SKIP);
-	UT_ASSERT_EQ(d.next_result, CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY);
+	UT_ASSERT_EQ(d.next_result, CLUSTER_HW_REMASTER_NOT_APPLICABLE);
 }
 
 UT_TEST(test_unshared_and_inactive_keep_original_route)
@@ -247,8 +246,8 @@ main(void)
 	UT_RUN(test_zero_max_attempts_disables_retry);
 	UT_RUN(test_none_result_registration_failed_falls_back_to_initial);
 	UT_RUN(test_backoff_exponential_cap);
-	UT_RUN(test_shared_rebuild_waits_without_legacy_io);
-	UT_RUN(test_typed_wait_does_not_complete_or_retry_legacy);
+	UT_RUN(test_shared_rebuild_has_no_legacy_authority_or_io);
+	UT_RUN(test_canonical_nonparticipant_has_no_completion_or_retry_debt);
 	UT_RUN(test_unshared_and_inactive_keep_original_route);
 	UT_DONE();
 

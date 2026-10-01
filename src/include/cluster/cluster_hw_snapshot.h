@@ -205,9 +205,10 @@ cluster_hw_snapshot_normal_read(uint32 owner_node_id, uint64 expected_sysid,
 
 /*
  * cluster_hw_authority_active -- gate for multi-node allocation + recovery load:
- * true only in a multi-node cluster with shared storage (where the HW authority
- * is engaged and a survivor must read a dead master's snapshot).  Single-node
- * allocation is a no-op. Normal seed metadata is maintained independently.
+ * true only for the legacy allocator in a multi-node cluster with shared storage,
+ * where a survivor must read a dead master's snapshot. Single-node
+ * allocation is a no-op. Canonical SPACE is excluded; its HW enqueue and
+ * original DATA recovery gates remain. Seed metadata is maintained independently.
  * Defined in cluster_hw_shmem.c.
  */
 extern bool cluster_hw_authority_active(void);

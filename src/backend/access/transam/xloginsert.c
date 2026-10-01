@@ -775,6 +775,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 		for (uint8 i = 0; i < registered_page_version_entry_count; i++) {
 			const RfPageVersionEdgeEntryV1 *edge = &registered_page_version_entries[i];
 			registered_buffer *rb;
+			ClusterPageWalCaptureResultV1 capture;
 
 			if (edge->page_class != RF_PAGE_CLASS_ORDINARY)
 				continue;
@@ -787,10 +788,13 @@ XLogInsert(RmgrId rmid, uint8 info)
 				elog(PANIC, "versioned WAL lost its registered page");
 			if (rb->page_version_buffer == InvalidBuffer || BufferIsLocal(rb->page_version_buffer))
 				continue;
-			if (!cluster_page_wal_capture_native_v1(
-					rb->page_version_buffer, edge, registered_page_version_result_token,
-					ProcLastRecPtr, EndPos, ((XLogRecord *)hdr_scratch)->xl_crc,
-					((XLogRecord *)hdr_scratch)->xl_rmid, ((XLogRecord *)hdr_scratch)->xl_info)
+			capture = cluster_page_wal_capture_native_v1(
+				rb->page_version_buffer, edge, registered_page_version_result_token, ProcLastRecPtr,
+				EndPos, ((XLogRecord *)hdr_scratch)->xl_crc, ((XLogRecord *)hdr_scratch)->xl_rmid,
+				((XLogRecord *)hdr_scratch)->xl_info);
+			if (capture != CLUSTER_PAGE_WAL_CAPTURED && capture != CLUSTER_PAGE_WAL_UNATTRIBUTED)
+				elog(PANIC, "versioned WAL lost its buffer mutation invariant");
+			if (capture == CLUSTER_PAGE_WAL_UNATTRIBUTED
 				&& !cluster_page_wal_forget_v1(rb->page_version_buffer))
 				elog(PANIC, "versioned WAL lost its buffer attribution owner");
 		}

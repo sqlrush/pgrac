@@ -298,6 +298,11 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply)
 			Assert(memcmp(BufferGetPage(batch->buffers[1]), target->before[1].data, BLCKSZ) == 0);
 			state = LockBufHdr(buf);
 			Assert((state & BM_IO_IN_PROGRESS) == 0);
+			/* Checkpointer can select a previously dirty page while we hold
+			 * content-X. Restoring its old bytes must retain that new duty;
+			 * otherwise its redo cut could pass the original SPACE WAL. */
+			if (before_state & BM_DIRTY)
+				before_state |= state & BM_CHECKPOINT_NEEDED;
 			state = (state & ~mask) | (before_state & mask);
 			UnlockBufHdr(buf, state);
 		}

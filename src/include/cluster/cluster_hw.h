@@ -315,8 +315,8 @@ extern void cluster_hw_mark_shard_rebuilt(uint32 shard_id, uint32 generation);
  * Per-dead-origin online-remaster launch state (S5d / spec-4.6a).  The GRD FSM
  * records the episode it last launched a rebuild worker for a dead origin under,
  * and the worker records a terminal result.  BLOCKED is retryable within the same
- * episode; BLOCKED_STRUCTURAL is not. Shared canonical mode returns
- * WAIT_TYPED_SPACE_RECOVERY without legacy snapshot I/O or shard opening.
+ * episode; BLOCKED_STRUCTURAL is not. Shared canonical mode has no legacy
+ * HW authority: no worker is launched and direct rebuild is NOT_APPLICABLE.
  */
 typedef enum ClusterHwRemasterResult {
 	CLUSTER_HW_REMASTER_NONE = 0,
@@ -325,7 +325,6 @@ typedef enum ClusterHwRemasterResult {
 	CLUSTER_HW_REMASTER_BLOCKED,
 	CLUSTER_HW_REMASTER_BLOCKED_STRUCTURAL,
 	CLUSTER_HW_REMASTER_NOT_APPLICABLE,
-	CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY,
 } ClusterHwRemasterResult;
 
 extern uint64 cluster_hw_remaster_launched_episode(int node_id);

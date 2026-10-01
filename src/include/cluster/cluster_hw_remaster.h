@@ -148,9 +148,9 @@ cluster_hw_remaster_relaunch_decide(uint64 launched_episode, uint64 current_epis
  * WAL gap, or the episode advancing mid-rebuild), NOT_APPLICABLE when the HW
  * authority is not active.  Runs in the dedicated rebuild worker (off the LMON
  * tick).
- * Shared canonical mode instead returns WAIT_TYPED_SPACE_RECOVERY, with no
- * legacy snapshot read/adoption write or generation publication. Only the
- * original typed recovery owner may later prove the unfreeze prerequisite.
+ * Shared canonical mode has no legacy HW authority and returns NOT_APPLICABLE,
+ * with no snapshot read/adoption write or generation publication. Its original
+ * thread recovery barrier and per-resource SPACE GCS isolation remain required.
  */
 extern ClusterHwRemasterResult cluster_hw_remaster_rebuild_origin(int dead_node_id,
 																  uint64 episode_epoch);

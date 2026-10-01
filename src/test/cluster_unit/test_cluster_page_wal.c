@@ -288,7 +288,8 @@ reset(void)
 static bool
 capture(void)
 {
-	return cluster_page_wal_capture_native_v1(1, &edge, 80, 0x120, 0x200, 0x9192, RM_HEAP_ID, 0);
+	return cluster_page_wal_capture_native_v1(1, &edge, 80, 0x120, 0x200, 0x9192, RM_HEAP_ID, 0)
+		   == CLUSTER_PAGE_WAL_CAPTURED;
 }
 static void
 native_insert_source(void)
@@ -393,6 +394,28 @@ stale_page_or_space_never_reads(void)
 			pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_VALID);
 		UT_ASSERT(!cluster_page_wal_read_v1(1, &space, &out));
 		UT_ASSERT(memcmp(&out, &before, sizeof(out)) == 0);
+	}
+}
+
+static void
+native_capture_invariant_failure_is_not_attribution_loss(void)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		reset();
+		UT_ASSERT(capture());
+		if (variant % 2 == 0)
+			permitted = false;
+		else
+			((PageHeader)page.data)->pd_block_scn = 19;
+		if (variant >= 2)
+			selected = false; /* missing source cannot hide a broken page owner */
+		XLogRegisterBuffer(0, 1, REGBUF_STANDARD);
+		catch_native_errors = true;
+		if (sigsetjmp(native_error_target, 1) == 0)
+			(void)XLogInsert(RM_HEAP_ID, 0);
+		catch_native_errors = false;
+		UT_ASSERT(native_panicked);
+		UT_ASSERT_EQ(insert_calls, 1);
 	}
 }
 static void
@@ -625,7 +648,7 @@ flush_refusal_never_certifies(void)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 	printf("# Native WAL binding: %zu bytes per buffer\n", sizeof(ClusterPageWalBindingV1));
 	cluster_page_wal_shmem_register();
 	UT_ASSERT(registered_region != NULL);
@@ -633,6 +656,7 @@ main(void)
 	UT_RUN(exact_generation_survives_new_writer);
 	UT_RUN(native_capture_refusal_clears_old_binding);
 	UT_RUN(native_capture_requires_clear_owner);
+	UT_RUN(native_capture_invariant_failure_is_not_attribution_loss);
 	UT_RUN(stale_page_or_space_never_reads);
 	UT_RUN(capture_requires_original_owner);
 	UT_RUN(private_page_and_nonshared_skip);

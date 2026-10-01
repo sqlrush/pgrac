@@ -128,13 +128,6 @@ hw_remaster_record_terminal(int dead_node, ClusterHwRemasterResult res)
 		pg_memory_barrier();
 		cluster_hw_remaster_set_result(dead_node, res);
 		cluster_hw_bump_remaster_blocked();
-	} else if (res == CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY) {
-		/* Only the typed recovery owner can discharge this dependency.
-		 * Retrying the retired snapshot path cannot make progress. */
-		cluster_hw_remaster_set_next_attempt_at(dead_node, CLUSTER_HW_REMASTER_NO_DEADLINE);
-		pg_memory_barrier();
-		cluster_hw_remaster_set_result(dead_node, res);
-		cluster_hw_bump_remaster_blocked();
 	} else if (res == CLUSTER_HW_REMASTER_BLOCKED_STRUCTURAL) {
 		/* Amendment v1.2 (R7): leave next_attempt_at at 0 (not NO_DEADLINE)
 		 * so the FSM's next tick takes the MARK_STRUCTURAL decision branch
@@ -429,16 +422,6 @@ cluster_hw_remaster_rebuild_origin(int dead_node_id, uint64 episode_epoch)
 		return CLUSTER_HW_REMASTER_NOT_APPLICABLE;
 	if (dead_node_id < 0 || dead_node_id == cluster_node_id)
 		return CLUSTER_HW_REMASTER_NOT_APPLICABLE;
-	if (cluster_shared_config) {
-		/* Canonical SPACE stopped publishing legacy HWM snapshots. Never
-		 * treat their absence as a transient input or use an older snapshot
-		 * to open an adopted shard. The original typed recovery owner must
-		 * prove the whole window before marking its generation rebuilt. */
-		ereport(LOG, (errmsg("cluster HW remaster: dead node %d waits for typed SPACE recovery; "
-							 "adopted shards stay frozen",
-							 dead_node_id)));
-		return CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY;
-	}
 	if (!cluster_hw_remaster_recoverable()) {
 		cluster_hw_bump_failclosed();
 		ereport(LOG, (errmsg("cluster HW remaster: cluster.wal_threads_dir is not configured; "

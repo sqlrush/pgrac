@@ -169,7 +169,7 @@ cluster_page_wal_shmem_register(void)
 	cluster_shmem_register_region(&page_wal_region);
 }
 
-bool
+ClusterPageWalCaptureResultV1
 cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
 								   uint64 result_token, XLogRecPtr start, XLogRecPtr end,
 								   uint32 crc, uint8 rmid, uint8 info)
@@ -183,33 +183,37 @@ cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1
 		|| !cluster_shared_config || RecoveryInProgress() || result_token == 0
 		|| XLogRecPtrIsInvalid(start) || start >= end || edge->page_class != RF_PAGE_CLASS_ORDINARY
 		|| edge->result_kind != RF_PAGE_STATE_PRESENT)
-		return false;
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
 	buf = GetBufferDescriptor(buffer - 1);
 	if (!LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE)
 		|| !cluster_bufmgr_pcm_x_content_holder_write_permitted(buf))
-		return false;
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
 	state = pg_atomic_read_u32(&buf->state);
 	if ((state & (BM_VALID | BM_TAG_VALID | BM_PERMANENT))
 			!= (BM_VALID | BM_TAG_VALID | BM_PERMANENT)
 		|| (state & BM_IO_ERROR) != 0
 		|| (buf->tag.forkNum != MAIN_FORKNUM && buf->tag.forkNum != VISIBILITYMAP_FORKNUM)
-		|| cluster_smgr_which_for(BufTagGetRelFileLocator(&buf->tag), InvalidBackendId) != 1
-		|| !cluster_wal_thread_current_v2_ref(&value.source)
-		|| value.source.claim.database_incarnation == 0 || value.source.timeline == 0
+		|| cluster_smgr_which_for(BufTagGetRelFileLocator(&buf->tag), InvalidBackendId) != 1)
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	page = BufferGetPage(buffer);
+	memcpy(value.version.segment_incarnation, edge->result_incarnation, 16);
+	value.version.mutation_token = result_token;
+	if (!rf_page_version_present_v1(&value.version) || PageIsNew(page)
+		|| ((PageHeader)page)->pd_block_scn != result_token)
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	if (!cluster_wal_thread_current_v2_ref(&value.source))
+		return CLUSTER_PAGE_WAL_UNATTRIBUTED;
+	if (value.source.claim.database_incarnation == 0 || value.source.timeline == 0
 		|| value.source.claim.identity.origin_thread_id == 0
 		|| value.source.claim.identity.origin_thread_id > PGRAC_PAGE_LSN_ORIGIN_MAX + 1)
-		return false;
-	page = BufferGetPage(buffer);
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
 	value.identity.system_identifier = value.source.claim.identity.system_identifier;
 	memcpy(value.identity.storage_uuid, value.source.claim.identity.storage_uuid, 16);
 	value.identity.locator = BufTagGetRelFileLocator(&buf->tag);
 	value.identity.forknum = buf->tag.forkNum;
 	value.identity.blockno = buf->tag.blockNum;
-	memcpy(value.version.segment_incarnation, edge->result_incarnation, 16);
-	value.version.mutation_token = result_token;
-	if (!rf_page_identity_valid_v1(&value.identity) || !rf_page_version_present_v1(&value.version)
-		|| PageIsNew(page) || ((PageHeader)page)->pd_block_scn != result_token)
-		return false;
+	if (!rf_page_identity_valid_v1(&value.identity))
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
 	value.record_start = start;
 	value.record_end = end;
 	value.record_crc = crc;
@@ -218,7 +222,7 @@ cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1
 	/* This exact successful record owns the new version. Native callers set
 	 * PageLSN after XLogInsert returns, still under this content lock. */
 	bindings[buffer - 1] = value;
-	return true;
+	return CLUSTER_PAGE_WAL_CAPTURED;
 }
 
 bool

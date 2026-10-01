@@ -60,6 +60,7 @@
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_hw.h"			/* spec-4.6a HW remaster watchdog stubs */
+#include "cluster/cluster_hw_snapshot.h"
 #include "cluster/cluster_lmd.h"		/* spec-5.8 D1b — WFG vertex + submit/cancel edge */
 #include "cluster/cluster_undo_resid.h" /* spec-5.22a D1-5 — undo-class hash-route guard */
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -546,20 +547,21 @@ cluster_thread_recovery_launch_workers(const uint64 *dead pg_attribute_unused(),
 									   uint64 episode_epoch pg_attribute_unused())
 {}
 
-/* spec-5.7 D3 S5d stubs:  cluster_grd.c's WAIT_CLUSTER tick now also launches the
- * HW authority rebuild worker and consults its unfreeze gate before P7.  These
- * tests drive the GES/GRD remaster FSM, not the HW authority, so both are out of
- * scope -> no-op (launch registers nothing; gate returns false so P7 proceeds). */
+/* Worker registration remains a fixture. The original HW authority selector
+ * and unfreeze gate below are extracted verbatim, so canonical-mode recovery
+ * cannot pass merely because a test stub unconditionally returns false. */
 void
 cluster_hw_remaster_launch_workers(const uint64 *dead pg_attribute_unused(),
 								   int nwords pg_attribute_unused(),
 								   uint64 episode_epoch pg_attribute_unused())
 {}
-bool
-cluster_hw_remaster_gate_unfreeze(void)
+char *cluster_shared_data_dir;
+uint32
+cluster_hw_shard_rebuilt_generation(uint32 shard)
 {
-	return false;
+	return 0; /* no legacy shard was rebuilt in this fixture */
 }
+#include "test_cluster_hw_authority_gate.inc"
 
 ClusterHwRemasterResult
 cluster_hw_remaster_result(int node_id pg_attribute_unused())
@@ -5525,6 +5527,27 @@ finish_recovery_control_fixture(void)
 	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
 }
 
+UT_TEST(test_canonical_space_dead_node_returns_grd_to_normal_after_data_recovery)
+{
+	setup_recovery_control_fixture(true);
+	cluster_shared_data_dir = "/fixture/shared";
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_CLUSTER);
+	/* Canonical mode does not waive the original DATA recovery barrier. */
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_CLUSTER);
+	ut_thread_recovery_blocked = false;
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_IDLE);
+	for (uint32 shard = 0; shard < PGRAC_GRD_SHARD_COUNT; shard++) {
+		UT_ASSERT_EQ(cluster_grd_shard_phase(shard), GRD_SHARD_NORMAL);
+		UT_ASSERT_EQ(cluster_hw_shard_rebuilt_generation(shard), 0);
+	}
+	cluster_shared_config = false;
+	cluster_shared_data_dir = NULL;
+	finish_recovery_control_fixture();
+}
+
 UT_TEST(test_recovery_control_observes_protocol_cut_without_data_thaw)
 {
 	ClusterGrdRecoveryControlSnapshotV1 snapshot;
@@ -6635,7 +6658,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(139);
+	UT_PLAN(140);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
@@ -6770,6 +6793,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_recovery_idle_joiner_accounts_done_epoch_for_fence);
 	UT_RUN(test_rejoin_clear_snapshot_requires_exact_all_survivor_done_cut);
 	UT_RUN(test_recovery_control_observes_protocol_cut_without_data_thaw);
+	UT_RUN(test_canonical_space_dead_node_returns_grd_to_normal_after_data_recovery);
 	UT_RUN(test_control_acquire_waits_for_common_barrier_even_on_normal_shard);
 	UT_RUN(test_control_gate_unknown_cut_never_proves_frozen_or_ready);
 	UT_RUN(test_recovery_control_uses_accepted_epoch_after_observer_bump);

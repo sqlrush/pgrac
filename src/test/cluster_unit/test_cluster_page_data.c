@@ -408,7 +408,8 @@ bind_native_record(uint8 rmid, uint8 info)
 	source_capture = locks[1] = true;
 	HOLD_INTERRUPTS();
 	UT_ASSERT(cluster_page_wal_capture_native_v1(2, &e, target.version.mutation_token, 0x100, 0x200,
-												 0x9192, rmid, info));
+												 0x9192, rmid, info)
+			  == CLUSTER_PAGE_WAL_CAPTURED);
 	RESUME_INTERRUPTS();
 	source_capture = locks[1] = false;
 }
@@ -1086,7 +1087,8 @@ physical_receipts_close_only_exact_contributions(void)
 													 : i == 2 ? 0x108
 															  : 0x100,
 													 end, i == 0 ? 0x9193 : 0x9192, RM_XLOG_ID,
-													 i == 1 ? XLOG_FPI_FOR_HINT : XLOG_FPI));
+													 i == 1 ? XLOG_FPI_FOR_HINT : XLOG_FPI)
+				  == CLUSTER_PAGE_WAL_CAPTURED);
 		RESUME_INTERRUPTS();
 		source_capture = locks[1] = false;
 		pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_DIRTY);

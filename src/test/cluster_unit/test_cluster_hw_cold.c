@@ -247,6 +247,7 @@ UT_TEST(shared_space_startup_does_not_load_or_admit_legacy_cache)
 	reads = cold_reads;
 	cluster_shared_config = true;
 	UT_ASSERT(cluster_hw_startup_prepare(false, true, 4096, &reason));
+	UT_ASSERT(!cluster_hw_authority_active());
 	UT_ASSERT(reason == NULL);
 	UT_ASSERT_EQ(cluster_hw_cold_boot_mode(), CLUSTER_HW_BOOT_CANONICAL_SPACE);
 	UT_ASSERT(cluster_hw_startup_complete(&reason));

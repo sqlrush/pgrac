@@ -222,11 +222,10 @@ cluster_hw_normal_stop_poll(const char **domain_out, uint64 *key_out, int *backe
 
 	for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
 		uint32 status = pg_atomic_read_u32(&hw_state->remaster_result[node]);
-		bool invalid = status > CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY
+		bool invalid = status > CLUSTER_HW_REMASTER_NOT_APPLICABLE
 					   || status == CLUSTER_HW_REMASTER_BLOCKED_STRUCTURAL;
 		bool pending = status == CLUSTER_HW_REMASTER_RUNNING
 					   || status == CLUSTER_HW_REMASTER_BLOCKED
-					   || status == CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY
 					   || pg_atomic_read_u64(&hw_state->remaster_next_attempt_at[node]) != 0;
 		if (invalid || (pending && result == CLUSTER_NORMAL_STOP_READY)) {
 			result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
@@ -601,8 +600,6 @@ cluster_hw_remaster_result_name(ClusterHwRemasterResult result)
 		return "blocked_structural";
 	case CLUSTER_HW_REMASTER_NOT_APPLICABLE:
 		return "not_applicable";
-	case CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY:
-		return "wait_typed_space_recovery";
 	}
 	return "unknown";
 }
@@ -620,17 +617,20 @@ cluster_hw_remaster_recoverable(void)
  * ============================================================ */
 
 /*
- * cluster_hw_authority_active -- is multi-node HW allocation in play?
+ * cluster_hw_authority_active -- is the legacy multi-node HW cache in play?
  * Only in a multi-node cluster backed by shared storage: that is the
  * only configuration where a relation extend is globalized (D2) and where a
  * survivor must read a dead master's snapshot.  Normal seed metadata has its
  * own gate, independent of node count; existing recovery retains this gate.
+ * Canonical SPACE uses the HW enqueue but never this allocator/snapshot
+ * authority. Its original thread recovery and SPACE GCS owners retain the
+ * DATA/isolation duties; no fabricated legacy rebuilt generation is needed.
  */
 bool
 cluster_hw_authority_active(void)
 {
-	return cluster_shared_data_dir != NULL && cluster_shared_data_dir[0] != '\0'
-		   && cluster_conf_node_count() > 1;
+	return !cluster_shared_config && cluster_shared_data_dir != NULL
+		   && cluster_shared_data_dir[0] != '\0' && cluster_conf_node_count() > 1;
 }
 
 bool

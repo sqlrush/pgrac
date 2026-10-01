@@ -4394,7 +4394,9 @@ cluster_grd_recovery_lmon_tick(void)
 			 * master_generation).  Otherwise P7 would set the shard NORMAL while its
 			 * HWM is unknown, and a first HW_ALLOC could auto-create at block 0 over
 			 * an already-allocated range (R9, 8.A).  A NO-OP when the HW authority is
-			 * inactive, so the spec-4.6/4.7 unfreeze path is unchanged.
+			 * inactive, including canonical SPACE mode. That mode keeps the
+			 * preceding thread DATA barrier and per-resource GCS isolation;
+			 * it cannot be discharged by a legacy rebuilt-generation counter.
 			 */
 			if (cluster_hw_remaster_gate_unfreeze()) {
 				ereport(

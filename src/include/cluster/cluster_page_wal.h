@@ -24,6 +24,12 @@ typedef struct ClusterPageWalBindingV1 {
 
 #define CLUSTER_PAGE_WAL_NATIVE_FLUSHED UINT16_C(1)
 
+typedef enum ClusterPageWalCaptureResultV1 {
+	CLUSTER_PAGE_WAL_CAPTURED,
+	CLUSTER_PAGE_WAL_UNATTRIBUTED,
+	CLUSTER_PAGE_WAL_INVARIANT_BROKEN,
+} ClusterPageWalCaptureResultV1;
+
 /* Pure carrier consistency. Validation cannot certify a new flush or grant
  * authority. The match helper also requires aligned page bytes and an
  * independently selected physical address. */
@@ -84,10 +90,13 @@ extern void cluster_page_wal_shmem_register(void);
  * lock upgrade. On ordinary attribution failure the insertion owner must
  * clear the previous binding under the same content-X; absence is not a
  * durability receipt and does not discharge the original DATA obligation.
+ * Broken buffer ownership or a mismatched result page is an invariant
+ * failure, even when a source reference is temporarily unavailable.
  * End/start/CRC belong to the actual inserted record, not its retry candidate. */
-extern bool cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
-											   uint64 result_token, XLogRecPtr start,
-											   XLogRecPtr end, uint32 crc, uint8 rmid, uint8 info);
+extern ClusterPageWalCaptureResultV1
+cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
+								   uint64 result_token, XLogRecPtr start, XLogRecPtr end,
+								   uint32 crc, uint8 rmid, uint8 info);
 
 /* Clear attribution under the original pin/content-X, without allocation or
  * I/O. False means the caller no longer has the required buffer invariant. */

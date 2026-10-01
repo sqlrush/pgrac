@@ -2619,10 +2619,17 @@ test_cluster_hw_remaster_native.inc: $(top_srcdir)/src/backend/cluster/cluster_h
 	awk '/^cluster_hw_remaster_rebuild_origin\(/ { print "ClusterHwRemasterResult"; emit=1; n++ } \
 	     /^hw_remaster_record_terminal\(/ { print "static void"; emit=1; n++ } \
 	     /^cluster_hw_remaster_result_name\(/ { print "const char *"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3) exit 1 }' \
+	     /^cluster_hw_authority_active\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 4) exit 1 }' \
 	     $(filter %.c,$^) > $@
 
 test_cluster_hw_remaster_retry: test_cluster_hw_remaster_native.inc
+
+test_cluster_hw_authority_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_hw_shmem.c \
+		$(top_srcdir)/src/backend/cluster/cluster_hw_remaster.c Makefile
+	awk '/^cluster_hw_(authority_active|remaster_gate_unfreeze)\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2) exit 1 }' \
+	     $(filter %.c,$^) > $@
 
 # spec-5.7 D3 S1: test_cluster_hw_snapshot links cluster_hw_snapshot.o (the HW
 # authority durable-snapshot envelope: serialize / deserialize+validate /
@@ -3972,6 +3979,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_page_data.inc
 	rm -f test_cluster_page_wal_insert.inc
 	rm -f test_cluster_hw_remaster_native.inc
+	rm -f test_cluster_hw_authority_gate.inc
 	rm -f test_cluster_page_wal_image.inc
 	rm -f test_cluster_page_flush.inc
 	rm -f test_cluster_pcm_s_prepare.inc
@@ -4315,6 +4323,7 @@ test_cluster_grd_stop_types.inc: $(top_srcdir)/src/backend/cluster/cluster_grd.c
 	mv $@.tmp $@
 
 test_cluster_grd: test_cluster_grd.c unit_test.h test_cluster_grd_stop_types.inc \
+		test_cluster_hw_authority_gate.inc \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GRD_O) $(CLUSTER_GES_MODE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GRD_O) $(CLUSTER_GES_MODE_O) \

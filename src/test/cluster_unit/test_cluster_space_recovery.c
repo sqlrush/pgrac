@@ -74,6 +74,7 @@ bool cluster_smart_fusion, cluster_past_image;
 ClusterPcmOwnEntry *ClusterPcmOwnArray;
 BufferUsage pgBufferUsage;
 static bool sf_blocked, stale_during_io, stale_after_write;
+static bool checkpoint_during_flush;
 static unsigned wal_flushes, io_aborts;
 static bool cluster_pcm_x_finish_retain_flush_active;
 static bool cluster_pcm_x_finish_retain_flush_io_active;
@@ -397,6 +398,8 @@ XLogFlush(XLogRecPtr lsn)
 bool
 cluster_sf_dep_buffer_flush_blocked(BufferDesc *buf)
 {
+	if (checkpoint_during_flush)
+		pg_atomic_fetch_or_u32(&buf->state, BM_CHECKPOINT_NEEDED);
 	return sf_blocked;
 }
 void
@@ -842,6 +845,34 @@ UT_TEST(test_ordinary_native_flush_keeps_local_wal)
 	UT_ASSERT_EQ(io_aborts, 0);
 }
 
+UT_TEST(test_failed_install_preserves_checkpoint_of_original_dirty_page)
+{
+	for (int was_dirty = 0; was_dirty < 2; was_dirty++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		PGAlignedBlock before;
+		uint32 expected;
+		reset();
+		if (was_dirty)
+			pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_DIRTY);
+		before = pages[1];
+		expected = pg_atomic_read_u32(&descriptors[1].bufferdesc.state);
+		UT_ASSERT(cluster_space_recovery_preflight_v1(fabric, sources, 2, &batch));
+		if (!batch)
+			continue;
+		cluster_smart_fusion = sf_blocked = checkpoint_during_flush = true;
+		UT_ASSERT(!cluster_space_recovery_apply_v1(batch));
+		checkpoint_during_flush = false;
+		if (was_dirty)
+			expected |= BM_CHECKPOINT_NEEDED;
+		UT_ASSERT_EQ(pg_atomic_read_u32(&descriptors[1].bufferdesc.state), expected);
+		UT_ASSERT(memcmp(pages[1].data, before.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(syncs, 0);
+		UT_ASSERT(!pins && !locks && !hw_held);
+		cluster_space_recovery_destroy_v1(&batch);
+	}
+}
+
 UT_TEST(test_reject_unrelated_resource_owner)
 {
 	ClusterSpaceRecoveryBatchV1 *batch = NULL;
@@ -989,7 +1020,8 @@ UT_TEST(test_successor_cache_without_physical_proof_refuses)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
+	UT_RUN(test_failed_install_preserves_checkpoint_of_original_dirty_page);
 	UT_RUN(test_interleaved_writers_use_durable_successor_before_suffix);
 	UT_RUN(test_survivor_extension_after_preflight_is_not_overwritten);
 	UT_RUN(test_install_then_survivor_extend_then_retry);
