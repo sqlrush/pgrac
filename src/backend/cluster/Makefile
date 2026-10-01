@@ -311,6 +311,7 @@ OBJS = \
 	cluster_version.o \
 	cluster_views.o \
 	cluster_wal_claim.o \
+	cluster_wal_inputs.o \
 	cluster_wal_restart_read.o \
 	cluster_wal_writer.o \
 	cluster_wal_state.o \
@@ -377,6 +378,8 @@ cluster_wal_thread.o cluster_wal_writer.o cluster_wal_retention.o: \
 
 cluster_control_bootstrap.o cluster_control_bootstrap_read.o cluster_control_root.o \
 cluster_wal_tail.o: $(top_srcdir)/src/include/cluster/cluster_wal_tail.h
+cluster_wal_inputs.o: $(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+	$(srcdir)/cluster_control_root_private.h $(srcdir)/cluster_recovery_anchor_private.h
 
 cluster_reconfig.o cluster_thread_recovery_worker.o: \
 	$(top_srcdir)/src/include/cluster/cluster_thread_recovery.h

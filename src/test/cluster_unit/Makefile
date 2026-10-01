@@ -2752,6 +2752,8 @@ test_cluster_control_native_xid.inc: $(top_srcdir)/src/backend/cluster/cluster_x
 
 test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc \
 		test_cluster_control_native_xid.inc \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+		$(top_builddir)/src/backend/cluster/cluster_wal_inputs.o \
 		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
@@ -2760,6 +2762,7 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixt
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
+		$(top_builddir)/src/backend/cluster/cluster_wal_inputs.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
 		cluster_control_bootstrap_read_test.o \

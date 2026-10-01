@@ -7,6 +7,7 @@
  */
 #include "postgres.h"
 #include "cluster/cluster_wal_writer.h"
+#include "cluster/cluster_wal_inputs.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -508,6 +509,8 @@ cluster_cf_held(LOCKMODE mode)
 {
 	(void)mode;
 	if (MyBackendType == B_LMON || MyBackendType == B_LMS)
+		return test_actual_cf == mode;
+	if (MyBackendType == B_BG_WORKER)
 		return test_actual_cf == mode;
 	if (MyBackendType == B_BACKEND && test_reserve_mode)
 		return test_actual_cf == mode || (test_checkpoint_mode && test_checkpoint_outer_cf);
@@ -19121,6 +19124,390 @@ UT_TEST(test_config_poll_requires_background_role_and_preserves_aliased_input)
 	MyBackendType = B_INVALID;
 }
 
+/* Only the WALR transport is a fixture. ROOT, claim, anchor and history
+ * readers below use the actual encoded files and production selection. */
+static bool inputs_pin_held, inputs_pin_current;
+static bool inputs_pin_refuse, inputs_pin_race, inputs_pin_throw;
+static uint16 inputs_pin_threads[128], inputs_pin_count;
+
+ClusterWalPinResult
+cluster_wal_read_pin_acquire_v1(const uint16 *threads, uint16 count, ClusterWalReadPinV1 **out)
+{
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	*out = NULL;
+	if (inputs_pin_refuse)
+		return CLUSTER_WAL_PIN_UNAVAILABLE;
+	UT_ASSERT(!inputs_pin_held);
+	UT_ASSERT(count > 0 && count <= 128);
+	for (uint16 i = 1; i < count; i++)
+		UT_ASSERT(threads[i - 1] < threads[i]);
+	memcpy(inputs_pin_threads, threads, count * sizeof(*threads));
+	inputs_pin_count = count;
+	inputs_pin_held = inputs_pin_current = true;
+	*out = (ClusterWalReadPinV1 *)&inputs_pin_held;
+	if (inputs_pin_race)
+		v2_checkpoint_root_race();
+	if (inputs_pin_throw)
+		test_throw_root_read = true;
+	return CLUSTER_WAL_PIN_OK;
+}
+
+bool
+cluster_wal_read_pin_covers_v1(ClusterWalReadPinV1 *pin, uint16 thread)
+{
+	if (pin != (ClusterWalReadPinV1 *)&inputs_pin_held || !inputs_pin_held || !inputs_pin_current)
+		return false;
+	for (uint16 i = 0; i < inputs_pin_count; i++)
+		if (inputs_pin_threads[i] == thread)
+			return true;
+	return false;
+}
+
+ClusterWalrReleaseResult
+cluster_wal_read_pin_release_v1(ClusterWalReadPinV1 **pin)
+{
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT(*pin == (ClusterWalReadPinV1 *)&inputs_pin_held && inputs_pin_held);
+	inputs_pin_held = false;
+	*pin = NULL;
+	return CLUSTER_WALR_RELEASE_CONFIRMED;
+}
+
+static void
+inputs_fixture(uint8 bytes[66048], ClusterRecoveryAnchorV2 anchors[2])
+{
+	v2_thread_fixture(bytes, anchors);
+	/* The older projection fixture intentionally names an absent history;
+	 * this complete-input baseline starts with an explicitly empty history. */
+	memset(bytes + 512 + 216, 0, 40);
+	memset(bytes + 512 + 127 * 512 + 216, 0, 40);
+	root_fixture_version3(bytes);
+	v2_write_roots(bytes);
+	test_actual_cf = test_cf_mode = NoLock;
+	test_cf_local_caller = NULL;
+	test_cf_grant = test_cf_release_confirmed = true;
+	inputs_pin_held = inputs_pin_refuse = inputs_pin_race = inputs_pin_throw = false;
+	cluster_shared_config = true;
+	MyBackendType = B_BG_WORKER;
+}
+
+UT_TEST(test_wal_inputs_all_origins_exact_native_anchor)
+{
+	uint8 bytes[66048];
+	ClusterRecoveryAnchorV2 anchors[2];
+	ControlRootImage root;
+	ClusterWalInputsV1 *inputs = NULL;
+	const ClusterWalInputV1 *item;
+	char path[MAXPGPATH];
+
+	inputs_fixture(bytes, anchors);
+	/* A closed, non-serving peer remains a source, and physical lower is
+	 * independent of its native redo. No WAL scan is hidden under CF. */
+	anchors[1].state = DB_SHUTDOWNED;
+	anchors[1].min_recovery_point = 0;
+	anchors[1].min_recovery_tli = 0;
+	anchors[1].checkpoint_copy.redo += 32;
+	v2_anchor_object(bytes, &anchors[1], &anchors[1].identity, path);
+	put_u64_le(bytes + 240, 0);
+	bytes[512 + 127 * 512 + 10] = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	v2_checksums(bytes);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
+	root.records[127].root_flags
+		|= CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+	root.records[127].tail_tli = root.records[127].checkpoint_tli;
+	root.records[127].tail_validation_kind = CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
+	root.records[127].tail_last_record_lsn = anchors[1].checkpoint;
+	root.records[127].validated_tail_lsn_exclusive = anchors[1].checkpoint + 128;
+	root.records[127].tail_last_record_crc32c = root.records[127].checkpoint_record_crc32c;
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	v2_write_roots(root.bytes);
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+	UT_ASSERT(inputs != NULL && inputs_pin_held);
+	if (inputs == NULL)
+		return;
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(inputs_pin_count, 2);
+	UT_ASSERT_EQ(inputs_pin_threads[0], 1);
+	UT_ASSERT_EQ(inputs_pin_threads[1], 128);
+	UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 2);
+	for (uint32 i = 0; i < 2; i++) {
+		item = cluster_wal_inputs_at_v1(inputs, i);
+		UT_ASSERT(item != NULL && item->current);
+		UT_ASSERT_EQ(item->kind, CLUSTER_WAL_INPUT_CHECKPOINT);
+		UT_ASSERT(cluster_control_root_identity_equal(&item->source.claim.identity,
+													  &anchors[i].identity));
+		UT_ASSERT_EQ(item->native_redo, anchors[i].checkpoint_copy.redo);
+		UT_ASSERT_EQ(item->checkpoint_start, anchors[i].checkpoint);
+		UT_ASSERT_EQ(memcmp(item->source.claim.claim_sha256, anchors[i].claim_sha256, 32), 0);
+	}
+	UT_ASSERT(cluster_wal_inputs_at_v1(inputs, 2) == NULL);
+	UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), 0);
+	inputs_pin_current = false;
+	UT_ASSERT(cluster_wal_inputs_revalidate_v1(inputs) != 0);
+	UT_ASSERT(cluster_wal_inputs_at_v1(inputs, 0) == NULL);
+	cluster_wal_inputs_release_v1(&inputs);
+	UT_ASSERT(inputs == NULL && !inputs_pin_held);
+	cluster_wal_inputs_release_v1(&inputs);
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_wal_inputs_missing_peer_or_pending_never_partial)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		uint8 bytes[66048];
+		ClusterRecoveryAnchorV2 anchors[2];
+		ClusterWalInputsV1 *inputs = NULL;
+		char path[MAXPGPATH];
+		inputs_fixture(bytes, anchors);
+		if (fault == 0) {
+			v2_claim_path(&anchors[1].identity, path);
+			UT_ASSERT_EQ(unlink(path), 0);
+		} else if (fault == 1) {
+			v2_anchor_object(bytes, &anchors[1], &anchors[1].identity, path);
+			UT_ASSERT_EQ(unlink(path), 0);
+		} else if (fault == 2) {
+			put_u64_le(bytes + 240, 0);
+			bytes[512 + 127 * 512 + 10] = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+			put_u64_le(bytes + 512 + 127 * 512 + 328, 77);
+			memset(bytes + 512 + 127 * 512 + 336, 0x71, 32);
+			v2_checksums(bytes);
+			v2_write_roots(bytes);
+		} else {
+			put_u64_le(bytes + 512 + 127 * 512 + 216, 85);
+			memset(bytes + 512 + 127 * 512 + 224, 0x62, 32);
+			v2_checksums(bytes);
+			v2_write_roots(bytes);
+		}
+		UT_ASSERT(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs) != 0);
+		UT_ASSERT(inputs == NULL && !inputs_pin_held);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+	}
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_wal_inputs_retained_generations_remain_distinct)
+{
+	uint8 bytes[66048];
+	ClusterPhase1FullStopPlan plan;
+	ClusterWalHistoryImage history;
+	ClusterWalHistoryStage stage;
+	ClusterWalInputsV1 *inputs = NULL;
+	bool seen[2] = { false, false };
+
+	v2_close_history_fixture(bytes, &plan, &history, &stage, 2);
+	root_fixture_version3(bytes);
+	v2_write_roots(bytes);
+	test_actual_cf = test_cf_mode = NoLock;
+	test_cf_local_caller = NULL;
+	cluster_shared_config = true;
+	MyBackendType = B_BG_WORKER;
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+	UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 3);
+	if (inputs == NULL)
+		return;
+	for (uint32 i = 0; i < cluster_wal_inputs_count_v1(inputs); i++) {
+		const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, i);
+		for (uint32 j = 0; j < 2; j++)
+			if (cluster_control_root_identity_equal(&item->source.claim.identity,
+													&history.records[j].snapshot.identity)) {
+				seen[j] = true;
+				UT_ASSERT(!item->current);
+				UT_ASSERT_EQ(memcmp(&item->checkpoint, &history.records[j].snapshot,
+									sizeof(item->checkpoint)),
+							 0);
+			}
+	}
+	UT_ASSERT(seen[0] && seen[1]);
+	cluster_wal_inputs_release_v1(&inputs);
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_wal_inputs_roster_race_busy_and_stale_scope)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		uint8 bytes[66048];
+		ClusterRecoveryAnchorV2 anchors[2];
+		ClusterWalInputsV1 *inputs = NULL;
+		inputs_fixture(bytes, anchors);
+		inputs_pin_refuse = fault == 0;
+		inputs_pin_race = fault == 1;
+		test_cf_grant = fault != 2;
+		if (fault == 3) {
+			UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+			v2_checkpoint_root_race();
+			UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs),
+						 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+			cluster_wal_inputs_release_v1(&inputs);
+		} else
+			UT_ASSERT(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs) != 0);
+		UT_ASSERT(inputs == NULL && !inputs_pin_held);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+	}
+	test_cf_grant = true;
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_wal_inputs_terminal_and_pending_are_not_checkpoint_sources)
+{
+	ClusterRecoverySerialGuard serial;
+	ClusterThreadRecLaunchEligibility eligibility;
+	ClusterWalStartupImage op = pending_worker_fixture(&serial, &eligibility);
+	ClusterWalInputsV1 *inputs = NULL;
+	ControlRootImage root;
+	ControlFileData control;
+	ClusterControlRootFileToken token;
+	unsigned terminals = 0;
+
+	if (ut_current_failed)
+		return;
+	MyBackendType = B_BG_WORKER;
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs),
+				 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(inputs == NULL && !inputs_pin_held);
+	MyBackendType = B_INVALID;
+	test_worker_pin_held = false;
+	test_history_sync_count = 0;
+	test_history_fail_sync = UINT_MAX;
+	UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), CLUSTER_THREADREC_DONE);
+	test_history_fail_sync = 0;
+	MyBackendType = B_BG_WORKER;
+	/* Completing origin 1 cannot hide origin 4's independent reservation. */
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs),
+				 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(inputs == NULL && !inputs_pin_held);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, &root,
+															 &control, &token),
+				 0);
+	UT_ASSERT(root.startup[0].generation == 0 && root.startup[3].generation != 0);
+	/* A separate read-only fixture has the same authentic terminal and both
+	 * predecessor origins, without an outstanding peer initialization. This
+	 * raw fixture edit is not a production retirement or admission test. */
+	memset(&root.startup[3], 0, sizeof(root.startup[3]));
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	v2_write_roots(root.bytes);
+	test_actual_cf = test_cf_mode = NoLock;
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+	UT_ASSERT(inputs != NULL);
+	for (uint32 i = 0; i < cluster_wal_inputs_count_v1(inputs); i++) {
+		const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, i);
+		if (item->kind != CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL)
+			continue;
+		terminals++;
+		UT_ASSERT(
+			cluster_control_root_identity_equal(&item->source.claim.identity, &op.claim.identity));
+		UT_ASSERT_EQ(item->first_segment, op.first_segment_lsn);
+		UT_ASSERT_EQ(item->terminal.tail.database_incarnation, op.claim.database_incarnation);
+		UT_ASSERT_EQ(item->terminal.checkpoint_records, 0);
+		UT_ASSERT(item->checkpoint_start == 0 && item->native_redo == 0 && !item->current);
+		UT_ASSERT(v2_zero(&item->checkpoint, sizeof(item->checkpoint)));
+	}
+	UT_ASSERT_EQ(terminals, 1);
+	cluster_wal_inputs_release_v1(&inputs);
+	test_reserve_mode = false;
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_wal_inputs_capacity_never_truncates_history)
+{
+	uint8 bytes[66048], history_bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], uuid[16] = { 0x28 };
+	ClusterRecoveryAnchorV2 anchors[2];
+	ControlRootImage root, raw;
+	ClusterWalHistoryImage history;
+	ClusterWalHistoryStage stage;
+	ClusterWalInputsV1 *inputs = NULL;
+	size_t length;
+
+	inputs_fixture(bytes, anchors);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
+	length = history_fixture(history_bytes, &raw, 0, 128);
+	root.refs[0].history_generation = raw.refs[0].history_generation;
+	memcpy(root.refs[0].history_sha256, raw.refs[0].history_sha256, 32);
+	UT_ASSERT_EQ(cluster_control_root_v3_history_decode(history_bytes, length, &root, 0, &history),
+				 0);
+	history_stage_dirs(0);
+	test_actual_cf = test_cf_mode = ExclusiveLock;
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 71001, uuid, &stage), 0);
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), 0);
+	root.refs[0].history_generation = stage.generation;
+	memcpy(root.refs[0].history_sha256, stage.sha256, 32);
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	v2_write_roots(root.bytes);
+	test_actual_cf = test_cf_mode = NoLock;
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs),
+				 CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+	UT_ASSERT(inputs == NULL && !inputs_pin_held && test_actual_cf == NoLock);
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_wal_inputs_error_releases_exact_scope_and_foreign_cf_is_untouched)
+{
+	uint8 bytes[66048];
+	ClusterRecoveryAnchorV2 anchors[2];
+	ClusterWalInputsV1 *inputs = NULL;
+	volatile bool caught = false;
+	static const char unrelated;
+	unsigned releases;
+
+	inputs_fixture(bytes, anchors);
+	inputs_pin_throw = true;
+	PG_TRY();
+	{
+		(void)cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	test_throw_root_read = inputs_pin_throw = false;
+	UT_ASSERT(caught && inputs == NULL && !inputs_pin_held && test_actual_cf == NoLock);
+	test_actual_cf = ShareLock;
+	test_cf_local_caller = &unrelated;
+	releases = test_cf_release_order;
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	UT_ASSERT(test_actual_cf == ShareLock && test_cf_local_caller == &unrelated);
+	UT_ASSERT_EQ(test_cf_release_order, releases);
+	test_actual_cf = NoLock;
+	test_cf_local_caller = NULL;
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_wal_inputs_rejects_dispatch_and_retires_failed_native_acquire)
+{
+	uint8 bytes[66048];
+	ClusterRecoveryAnchorV2 anchors[2];
+	ClusterWalInputsV1 *inputs = NULL;
+	const BackendType refused[] = { B_LMON, B_LMS, B_BACKEND, B_INVALID };
+	unsigned calls;
+
+	inputs_fixture(bytes, anchors);
+	calls = test_cf_lock_calls;
+	for (unsigned i = 0; i < lengthof(refused); i++) {
+		MyBackendType = refused[i];
+		UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs),
+					 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+		UT_ASSERT(inputs == NULL && !inputs_pin_held);
+		if (inputs != NULL) {
+			MyBackendType = B_BG_WORKER;
+			cluster_wal_inputs_release_v1(&inputs);
+		}
+	}
+	UT_ASSERT_EQ(test_cf_lock_calls, calls);
+	MyBackendType = B_BG_WORKER;
+	test_cf_grant = false;
+	test_config_failed_acquire_retains = true;
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	UT_ASSERT(inputs == NULL && !inputs_pin_held && test_actual_cf == NoLock);
+	test_cf_grant = true;
+	test_config_failed_acquire_retains = false;
+	MyBackendType = B_INVALID;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -19133,6 +19520,19 @@ main(int argc, char **argv)
 	if (argc > 1)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_WAL_INPUTS") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_wal_inputs_all_origins_exact_native_anchor);
+		UT_RUN(test_wal_inputs_missing_peer_or_pending_never_partial);
+		UT_RUN(test_wal_inputs_retained_generations_remain_distinct);
+		UT_RUN(test_wal_inputs_roster_race_busy_and_stale_scope);
+		UT_RUN(test_wal_inputs_terminal_and_pending_are_not_checkpoint_sources);
+		UT_RUN(test_wal_inputs_capacity_never_truncates_history);
+		UT_RUN(test_wal_inputs_error_releases_exact_scope_and_foreign_cf_is_untouched);
+		UT_RUN(test_wal_inputs_rejects_dispatch_and_retires_failed_native_acquire);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 
 	if (getenv("PGRAC_PRE2_TEST_ROOT_POLL_RED") != NULL) {
 		UT_PLAN(1);
@@ -19140,7 +19540,15 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(349);
+	UT_PLAN(357);
+	UT_RUN(test_wal_inputs_all_origins_exact_native_anchor);
+	UT_RUN(test_wal_inputs_missing_peer_or_pending_never_partial);
+	UT_RUN(test_wal_inputs_retained_generations_remain_distinct);
+	UT_RUN(test_wal_inputs_roster_race_busy_and_stale_scope);
+	UT_RUN(test_wal_inputs_terminal_and_pending_are_not_checkpoint_sources);
+	UT_RUN(test_wal_inputs_capacity_never_truncates_history);
+	UT_RUN(test_wal_inputs_error_releases_exact_scope_and_foreign_cf_is_untouched);
+	UT_RUN(test_wal_inputs_rejects_dispatch_and_retires_failed_native_acquire);
 	UT_RUN(test_config_failed_acquire_retires_before_retry);
 	UT_RUN(test_config_poll_delivers_only_after_its_exact_release);
 	UT_RUN(test_config_poll_cut_or_prior_drift_discards_retained_observation);
