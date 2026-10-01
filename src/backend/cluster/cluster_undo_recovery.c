@@ -113,4 +113,13 @@ cluster_undo_recovery_path_resolve_v1(uint8 owner, uint32 segment, char *path, s
 	strlcpy(path, resolved, size);
 	return 0;
 }
+
+bool
+cluster_undo_recovery_multixact_page_retired_v1(int origin_node,
+	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn, bool members, uint32 page)
+{
+	return cluster_undo_recovery_origin_authorized_v1(origin_node)
+		&& rf_side_online_plan_multixact_page_retired_v1(active_scope->plan,
+			origin_node + 1, source_lsn, source_end_lsn, members, page);
+}
 #endif

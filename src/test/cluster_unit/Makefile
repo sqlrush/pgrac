@@ -438,6 +438,7 @@ TESTS += test_cluster_undo_producer
 TESTS += test_cluster_undo_native_lifecycle
 TESTS += test_cluster_undo_recovery
 TESTS += test_cluster_remote_xact_directory
+TESTS += test_cluster_multixact_recovery
 TESTS += test_cluster_space_reservation
 CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o \
 		test_cluster_block_apply_btree_product.o
@@ -2485,6 +2486,8 @@ test_cluster_side_prepared: test_cluster_side_prepared.c unit_test.h \
 # RF-SIDE D-SIDE-04: CLOG/MULTIXACT/COMMIT_TS derived-projection
 # judgements (verified / rebuildable / fail-closed lookup).
 CLUSTER_SIDE_PROJECTION_O = $(top_builddir)/src/backend/cluster/cluster_side_projection.o
+$(CLUSTER_SIDE_PROJECTION_O): $(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_xact.h
 test_cluster_side_projection: test_cluster_side_projection.c unit_test.h \
 		$(CLUSTER_SIDE_PROJECTION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_PROJECTION_O) \
@@ -3453,6 +3456,14 @@ test_cluster_multixact_startup: test_cluster_multixact_startup.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/multixact.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
 		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+# PGRAC: actual MultiXact and SLRU recovery against disposable origin files.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_multixact_recovery: test_cluster_multixact_recovery.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/multixact.c \
+		$(top_srcdir)/src/backend/access/transam/slru.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_commit_ts_startup: test_cluster_commit_ts_startup.c unit_test.h \
 		$(top_srcdir)/src/backend/access/transam/commit_ts.c

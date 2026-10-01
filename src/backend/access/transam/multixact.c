@@ -66,6 +66,9 @@
  *
  *-------------------------------------------------------------------------
  * PGRAC MODIFICATIONS
+ *    Shared recovery writes native offsets/members in the failed origin's
+ *    namespace before publishing a derived overlay.  Author: SqlRush <sqlrush@gmail.com>
+ *    Spec: spec-s9p2-03-shared-wal-and-checkpoint.md
  *
  * Modified by: SqlRush <sqlrush@gmail.com>
  *
@@ -86,6 +89,10 @@
  */
 #include "postgres.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "access/multixact.h"
 #include "access/slru.h"
 #include "access/transam.h"
@@ -101,6 +108,7 @@
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "postmaster/autovacuum.h"
+#include "storage/fd.h"
 #include "storage/lmgr.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
@@ -131,6 +139,8 @@
 #include "cluster/cluster_multixact.h"		/* overlay install + types */
 #include "cluster/cluster_multixact_current.h" /* requester-local proven create cap */
 #include "cluster/cluster_mxid_stripe.h"	/* PGRAC: spec-7.1 D3-a striped candidate */
+#include "cluster/cluster_side_projection.h"
+#include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_tt_local.h"		/* peek_binding */
 #include "cluster/cluster_tt_status_hint.h" /* emit_multixact_overlay */
 #endif
@@ -237,6 +247,15 @@ static SlruCtlData MultiXactMemberCtlData;
 
 #define MultiXactOffsetCtl (&MultiXactOffsetCtlData)
 #define MultiXactMemberCtl (&MultiXactMemberCtlData)
+
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: foreign recovery caches are never used by the local native writer. */
+#define MULTIXACT_RECOVERY_ORIGINS 128
+#define MULTIXACT_RECOVERY_BUFFERS 8
+static SlruCtlData MultiXactRecoveryOffsetCtl[MULTIXACT_RECOVERY_ORIGINS];
+static SlruCtlData MultiXactRecoveryMemberCtl[MULTIXACT_RECOVERY_ORIGINS];
+static LWLockPadded *MultiXactRecoveryLocks;
+#endif
 
 /*
  * MultiXact state shared across all backends.  All this state is protected
@@ -1060,9 +1079,15 @@ MultiXactIdCreateFromCurrentMembers(int nmembers, MultiXactMember *members)
  * This is broken out of MultiXactIdCreateFromMembers so that xlog replay can
  * use it.
  */
+/*
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * Explicit controls preserve the native layout for original-origin recovery;
+ * only the normal native caller accepts the older-WAL initialization fixup.
+ */
 static void
-RecordNewMultiXact(MultiXactId multi, MultiXactOffset offset, int nmembers,
-				   MultiXactMember *members)
+RecordNewMultiXactInto(SlruCtl offset_ctl, SlruCtl member_ctl, int *pre_initialized,
+					  MultiXactId multi, MultiXactOffset offset, int nmembers,
+					  const MultiXactMember *members)
 {
 	int pageno;
 	int prev_pageno;
@@ -1075,7 +1100,7 @@ RecordNewMultiXact(MultiXactId multi, MultiXactOffset offset, int nmembers,
 	MultiXactOffset *next_offptr;
 	MultiXactOffset next_offset;
 
-	LWLockAcquire(MultiXactOffsetSLRULock, LW_EXCLUSIVE);
+	LWLockAcquire(offset_ctl->shared->ControlLock, LW_EXCLUSIVE);
 
 	/* position of this multixid in the offsets SLRU area  */
 	pageno = MultiXactIdToOffsetPage(multi);
@@ -1095,22 +1120,22 @@ RecordNewMultiXact(MultiXactId multi, MultiXactOffset offset, int nmembers,
 	 * such a version, the next page might not be initialized yet.  Initialize
 	 * it now.
 	 */
-	if (InRecovery && next_pageno != pageno
-		&& MultiXactOffsetCtl->shared->latest_page_number == pageno) {
+	if (InRecovery && pre_initialized != NULL && next_pageno != pageno
+		&& offset_ctl->shared->latest_page_number == pageno) {
 		elog(DEBUG1, "next offsets page is not initialized, initializing it now");
 
 		/* Create and zero the page */
-		slotno = SimpleLruZeroPage(MultiXactOffsetCtl, next_pageno);
+		slotno = SimpleLruZeroPage(offset_ctl, next_pageno);
 
 		/* Make sure it's written out */
-		SimpleLruWritePage(MultiXactOffsetCtl, slotno);
-		Assert(!MultiXactOffsetCtl->shared->page_dirty[slotno]);
+		SimpleLruWritePage(offset_ctl, slotno);
+		Assert(!offset_ctl->shared->page_dirty[slotno]);
 
 		/*
 		 * Remember that we initialized the page, so that we don't zero it
 		 * again at the XLOG_MULTIXACT_ZERO_OFF_PAGE record.
 		 */
-		pre_initialized_offsets_page = next_pageno;
+		*pre_initialized = next_pageno;
 	}
 
 	/*
@@ -1130,15 +1155,15 @@ RecordNewMultiXact(MultiXactId multi, MultiXactOffset offset, int nmembers,
 	 * enough that a MultiXactId is really involved.  Perhaps someday we'll
 	 * take the trouble to generalize the slru.c error reporting code.
 	 */
-	slotno = SimpleLruReadPage(MultiXactOffsetCtl, pageno, true, multi);
-	offptr = (MultiXactOffset *)MultiXactOffsetCtl->shared->page_buffer[slotno];
+	slotno = SimpleLruReadPage(offset_ctl, pageno, true, multi);
+	offptr = (MultiXactOffset *)offset_ctl->shared->page_buffer[slotno];
 	offptr += entryno;
 
 	if (*offptr != offset) {
 		/* should already be set to the correct value, or not at all */
 		Assert(*offptr == 0);
 		*offptr = offset;
-		MultiXactOffsetCtl->shared->page_dirty[slotno] = true;
+		offset_ctl->shared->page_dirty[slotno] = true;
 	}
 
 	/*
@@ -1149,8 +1174,8 @@ RecordNewMultiXact(MultiXactId multi, MultiXactOffset offset, int nmembers,
 	} else {
 		/* must be the first entry on the page */
 		Assert(next_entryno == 0 || next == FirstMultiXactId);
-		slotno = SimpleLruReadPage(MultiXactOffsetCtl, next_pageno, true, next);
-		next_offptr = (MultiXactOffset *)MultiXactOffsetCtl->shared->page_buffer[slotno];
+		slotno = SimpleLruReadPage(offset_ctl, next_pageno, true, next);
+		next_offptr = (MultiXactOffset *)offset_ctl->shared->page_buffer[slotno];
 		next_offptr += next_entryno;
 	}
 
@@ -1162,13 +1187,13 @@ RecordNewMultiXact(MultiXactId multi, MultiXactOffset offset, int nmembers,
 		/* should already be set to the correct value, or not at all */
 		Assert(*next_offptr == 0);
 		*next_offptr = next_offset;
-		MultiXactOffsetCtl->shared->page_dirty[slotno] = true;
+		offset_ctl->shared->page_dirty[slotno] = true;
 	}
 
 	/* Exchange our lock */
-	LWLockRelease(MultiXactOffsetSLRULock);
+	LWLockRelease(offset_ctl->shared->ControlLock);
 
-	LWLockAcquire(MultiXactMemberSLRULock, LW_EXCLUSIVE);
+	LWLockAcquire(member_ctl->shared->ControlLock, LW_EXCLUSIVE);
 
 	prev_pageno = -1;
 
@@ -1188,25 +1213,33 @@ RecordNewMultiXact(MultiXactId multi, MultiXactOffset offset, int nmembers,
 		bshift = MXOffsetToFlagsBitShift(offset);
 
 		if (pageno != prev_pageno) {
-			slotno = SimpleLruReadPage(MultiXactMemberCtl, pageno, true, multi);
+			slotno = SimpleLruReadPage(member_ctl, pageno, true, multi);
 			prev_pageno = pageno;
 		}
 
-		memberptr = (TransactionId *)(MultiXactMemberCtl->shared->page_buffer[slotno] + memberoff);
+		memberptr = (TransactionId *)(member_ctl->shared->page_buffer[slotno] + memberoff);
 
 		*memberptr = members[i].xid;
 
-		flagsptr = (uint32 *)(MultiXactMemberCtl->shared->page_buffer[slotno] + flagsoff);
+		flagsptr = (uint32 *)(member_ctl->shared->page_buffer[slotno] + flagsoff);
 
 		flagsval = *flagsptr;
 		flagsval &= ~(((1 << MXACT_MEMBER_BITS_PER_XACT) - 1) << bshift);
 		flagsval |= (members[i].status << bshift);
 		*flagsptr = flagsval;
 
-		MultiXactMemberCtl->shared->page_dirty[slotno] = true;
+		member_ctl->shared->page_dirty[slotno] = true;
 	}
 
-	LWLockRelease(MultiXactMemberSLRULock);
+	LWLockRelease(member_ctl->shared->ControlLock);
+}
+
+static void
+RecordNewMultiXact(MultiXactId multi, MultiXactOffset offset, int nmembers,
+				   MultiXactMember *members)
+{
+	RecordNewMultiXactInto(MultiXactOffsetCtl, MultiXactMemberCtl,
+		&pre_initialized_offsets_page, multi, offset, nmembers, members);
 }
 
 /*
@@ -2263,6 +2296,48 @@ multixact_twophase_postabort(TransactionId xid, uint16 info, void *recdata, uint
 	multixact_twophase_postcommit(xid, info, recdata, len);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+static void
+multi_recovery_shmem_init(void)
+{
+	bool found;
+
+	MultiXactRecoveryLocks = ShmemInitStruct("MultiXact recovery locks",
+		3 * MULTIXACT_RECOVERY_ORIGINS * sizeof(LWLockPadded), &found);
+	for (int origin = 0; origin < MULTIXACT_RECOVERY_ORIGINS; origin++) {
+		for (int family = 0; family < 2; family++) {
+			SlruCtl ctl = family == 0 ? &MultiXactRecoveryOffsetCtl[origin]
+				: &MultiXactRecoveryMemberCtl[origin];
+			char name[64];
+			char path[MAXPGPATH];
+			int length;
+			LWLock *lock = &MultiXactRecoveryLocks[origin * 3 + family].lock;
+
+			if (!found)
+				LWLockInitialize(lock, family == 0 ? LWTRANCHE_MULTIXACTOFFSET_BUFFER
+					: LWTRANCHE_MULTIXACTMEMBER_BUFFER);
+			if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] != '/')
+				ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					errmsg("shared MultiXact recovery requires an absolute shared root")));
+			length = snprintf(path, sizeof(path), "%s/native_side/origin_%d/pg_multixact/%s",
+				cluster_shared_data_dir, origin, family == 0 ? "offsets" : "members");
+			if (length < 0 || length >= sizeof(path) - 16)
+				ereport(FATAL, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					errmsg("shared MultiXact recovery path is too long")));
+			snprintf(name, sizeof(name), "MultiXact recovery %d %d", origin, family);
+			ctl->PagePrecedes = family == 0 ? MultiXactOffsetPagePrecedes
+				: MultiXactMemberPagePrecedes;
+			SimpleLruInit(ctl, name, MULTIXACT_RECOVERY_BUFFERS, 0, lock, path,
+				family == 0 ? LWTRANCHE_MULTIXACTOFFSET_BUFFER : LWTRANCHE_MULTIXACTMEMBER_BUFFER,
+				SYNC_HANDLER_NONE);
+		}
+		if (!found)
+			LWLockInitialize(&MultiXactRecoveryLocks[origin * 3 + 2].lock,
+				LWTRANCHE_MULTIXACTOFFSET_BUFFER);
+	}
+}
+#endif
+
 /*
  * Initialization of shared memory for MultiXact.  We use two SLRU areas,
  * thus double memory.  Also, reserve space for the shared MultiXactState
@@ -2281,6 +2356,15 @@ MultiXactShmemSize(void)
 	size = SHARED_MULTIXACT_STATE_SIZE;
 	size = add_size(size, SimpleLruShmemSize(NUM_MULTIXACTOFFSET_BUFFERS, 0));
 	size = add_size(size, SimpleLruShmemSize(NUM_MULTIXACTMEMBER_BUFFERS, 0));
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: separate, bounded caches for original-origin recovery only. */
+	if (cluster_shared_config) {
+		size = add_size(size, mul_size(MULTIXACT_RECOVERY_ORIGINS * 2,
+			SimpleLruShmemSize(MULTIXACT_RECOVERY_BUFFERS, 0)));
+		size = add_size(size, MAXALIGN(3 * MULTIXACT_RECOVERY_ORIGINS * sizeof(LWLockPadded)));
+	}
+#endif
 
 	return size;
 }
@@ -2320,6 +2404,12 @@ MultiXactShmemInit(void)
 	 */
 	OldestMemberMXactId = MultiXactState->perBackendXactIds;
 	OldestVisibleMXactId = OldestMemberMXactId + MaxOldestSlot;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: fixed paths; no caller switches the normal native controls. */
+	if (cluster_shared_config)
+		multi_recovery_shmem_init();
+#endif
 }
 
 /*
@@ -3699,6 +3789,404 @@ WriteMTruncateXlogRec(Oid oldestMultiDB, MultiXactId startTruncOff, MultiXactId 
 	recptr = XLogInsert(RM_MULTIXACT_ID, XLOG_MULTIXACT_TRUNCATE_ID);
 	XLogFlush(recptr);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC: these controls belong exclusively to the scoped recovery operation.
+ * Discard on entry, successful exit and ERROR so a later owner cannot write
+ * stale dirty state left by an interrupted operation.
+ */
+static void
+multi_recovery_cache_discard(SlruCtl ctl)
+{
+	SlruShared shared = ctl->shared;
+
+	if (!LWLockHeldByMe(shared->ControlLock))
+		LWLockAcquire(shared->ControlLock, LW_EXCLUSIVE);
+	for (int slot = 0; slot < shared->num_slots; slot++) {
+		if ((shared->page_status[slot] == SLRU_PAGE_READ_IN_PROGRESS
+			 || shared->page_status[slot] == SLRU_PAGE_WRITE_IN_PROGRESS)
+			&& LWLockHeldByMe(&shared->buffer_locks[slot].lock))
+			LWLockRelease(&shared->buffer_locks[slot].lock);
+		shared->page_status[slot] = SLRU_PAGE_EMPTY;
+		shared->page_dirty[slot] = false;
+	}
+	LWLockRelease(shared->ControlLock);
+}
+
+static bool
+multi_recovery_permitted(int origin)
+{
+	/* Own-origin native startup retains its original SLRU/counter owner. */
+	return cluster_shared_config && origin >= 0 && origin < MULTIXACT_RECOVERY_ORIGINS
+		&& origin != cluster_node_id && MultiXactRecoveryLocks != NULL
+		&& cluster_undo_recovery_origin_authorized_v1(origin);
+}
+
+static bool
+multi_recovery_directory_ready(int origin)
+{
+	const char *children[5] = {"native_side", NULL, "pg_multixact", "offsets", "members"};
+	int dirs[6] = {-1, -1, -1, -1, -1, -1};
+	char origin_name[32];
+	char expected[MAXPGPATH];
+	struct stat st, routed;
+	bool ok = false;
+
+	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] != '/')
+		return false;
+	snprintf(origin_name, sizeof(origin_name), "origin_%d", origin);
+	children[1] = origin_name;
+	dirs[0] = open(cluster_shared_data_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (dirs[0] < 0)
+		goto done;
+	for (int i = 1; i < 6; i++) {
+		int parent = i == 5 ? 3 : i - 1;
+
+		dirs[i] = openat(dirs[parent], children[i - 1],
+			O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		if (dirs[i] < 0)
+			goto done;
+	}
+	for (int i = 0; i < 6; i++) {
+		if (fstat(dirs[i], &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid()
+			|| (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+			goto done;
+		if (i >= 4) {
+			SlruCtl ctl = i == 4 ? &MultiXactRecoveryOffsetCtl[origin]
+				: &MultiXactRecoveryMemberCtl[origin];
+			int length = snprintf(expected, sizeof(expected), "%s/native_side/%s/pg_multixact/%s",
+				cluster_shared_data_dir, origin_name, children[i - 1]);
+
+			if (length < 0 || length >= sizeof(expected) || strcmp(expected, ctl->Dir) != 0
+				|| lstat(ctl->Dir, &routed) != 0 || !S_ISDIR(routed.st_mode)
+				|| st.st_dev != routed.st_dev || st.st_ino != routed.st_ino)
+				goto done;
+		}
+	}
+	ok = multi_recovery_permitted(origin);
+done:
+	for (int i = 5; i >= 0; i--)
+		if (dirs[i] >= 0 && close(dirs[i]) != 0)
+			ok = false;
+	return ok;
+}
+
+static bool
+multi_recovery_input_valid(int origin, const ClusterSideProjectionOperationV1 *op,
+	const uint8 *payload, uint32 length)
+{
+	if (op == NULL || op->kind != CLUSTER_SIDE_PROJECTION_MULTIXACT)
+		return false;
+	if (op->action == CLUSTER_SIDE_PROJECTION_ACTION_CREATE) {
+		const MultiXactMember *members = (const MultiXactMember *)payload;
+
+		if (op->normalized_info != XLOG_MULTIXACT_CREATE_ID || !MultiXactIdIsValid(op->multixact_id)
+			|| cluster_mxid_origin_slot(op->multixact_id) != origin || op->member_offset == 0
+			|| op->member_count == 0 || op->member_count > 256 || members == NULL
+			|| length != op->member_count * sizeof(*members))
+			return false;
+		for (uint32 i = 0; i < op->member_count; i++)
+			if (!TransactionIdIsNormal(members[i].xid)
+				|| members[i].status < MultiXactStatusForKeyShare
+				|| members[i].status > MaxMultiXactStatus)
+				return false;
+		return true;
+	}
+	if (length != 0)
+		return false;
+	if (op->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE)
+		return op->page_number >= 0
+			&& ((op->normalized_info == XLOG_MULTIXACT_ZERO_OFF_PAGE
+				 && (uint32)op->page_number <= MultiXactIdToOffsetPage(MaxMultiXactId))
+				|| (op->normalized_info == XLOG_MULTIXACT_ZERO_MEM_PAGE
+					&& (uint32)op->page_number <= MXOffsetToMemberPage(MaxMultiXactOffset)));
+	return op->action == CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE
+		&& op->normalized_info == XLOG_MULTIXACT_TRUNCATE_ID && OidIsValid(op->oldest_database)
+		&& MultiXactIdIsValid(op->truncate_start_multixact)
+		&& MultiXactIdIsValid(op->truncate_end_multixact)
+		&& (int32)(op->truncate_end_multixact - op->truncate_start_multixact) >= 0;
+}
+
+/* Reject aliases and short CREATE inputs before native SLRU can touch them. */
+static bool
+multi_recovery_page_ready(SlruCtl ctl, int page, bool zero)
+{
+	char path[MAXPGPATH];
+	struct stat st;
+
+	snprintf(path, sizeof(path), "%s/%04X", ctl->Dir, page / SLRU_PAGES_PER_SEGMENT);
+	if (lstat(path, &st) != 0)
+		return zero && errno == ENOENT;
+	return S_ISREG(st.st_mode) && st.st_nlink == 1 && st.st_uid == geteuid()
+		&& (st.st_mode & (S_IWGRP | S_IWOTH)) == 0
+		&& (zero || st.st_size >= (off_t)(page % SLRU_PAGES_PER_SEGMENT + 1) * BLCKSZ);
+}
+
+/* A fully retired segment may already be absent or partly recreated by an
+ * interrupted replay. Only its later, source-proven TRUNCATE permits a private
+ * zero base; surviving pages and every post-read must use real disk bytes. */
+static bool
+multi_recovery_read_page(SlruCtl ctl, int origin, XLogRecPtr source_lsn,
+	XLogRecPtr source_end_lsn, bool members, int page, bool verify, int *slot)
+{
+	bool retired = !verify && cluster_undo_recovery_multixact_page_retired_v1(
+		origin, source_lsn, source_end_lsn, members, page);
+
+	if (!multi_recovery_page_ready(ctl, page, retired))
+		return false;
+	*slot = retired ? SimpleLruZeroPage(ctl, page)
+		: SimpleLruReadPage(ctl, page, true, InvalidTransactionId);
+	return true;
+}
+
+static bool
+multi_recovery_offsets(SlruCtl ctl, const ClusterSideProjectionOperationV1 *op, bool verify,
+	int origin, XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+{
+	MultiXactId ids[2] = {op->multixact_id, op->multixact_id + 1};
+	MultiXactOffset values[2] = {op->member_offset, op->member_offset + op->member_count};
+	bool ok = true;
+
+	if (ids[1] < FirstMultiXactId)
+		ids[1] = FirstMultiXactId;
+	if (values[1] == 0)
+		values[1] = 1;
+	for (int i = 0; i < 2; i++) {
+		int page = MultiXactIdToOffsetPage(ids[i]);
+		int slot;
+		MultiXactOffset value;
+
+		LWLockAcquire(ctl->shared->ControlLock, LW_EXCLUSIVE);
+		if (!multi_recovery_read_page(ctl, origin, source_lsn, source_end_lsn,
+				false, page, verify, &slot)) {
+			LWLockRelease(ctl->shared->ControlLock);
+			return false;
+		}
+		value = ((MultiXactOffset *)ctl->shared->page_buffer[slot])[MultiXactIdToOffsetEntry(ids[i])];
+		ok = value == values[i] || (!verify && value == 0);
+		LWLockRelease(ctl->shared->ControlLock);
+		if (!ok)
+			break;
+	}
+	return ok;
+}
+
+static bool
+multi_recovery_members(SlruCtl ctl, const ClusterSideProjectionOperationV1 *op,
+	const MultiXactMember *members, bool verify,
+	int origin, XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+{
+	MultiXactOffset offset = op->member_offset;
+	int previous = -1;
+	int slot = -1;
+	bool ok = true;
+
+	LWLockAcquire(ctl->shared->ControlLock, LW_EXCLUSIVE);
+	for (uint32 i = 0; i < op->member_count; i++, offset++) {
+		int page = MXOffsetToMemberPage(offset);
+		char *data;
+		uint32 flags;
+
+		if (page != previous) {
+			if (!multi_recovery_read_page(ctl, origin, source_lsn, source_end_lsn,
+					true, page, verify, &slot)) {
+				ok = false;
+				break;
+			}
+			previous = page;
+		}
+		if (!verify)
+			continue;
+		data = ctl->shared->page_buffer[slot];
+		flags = *(uint32 *)(data + MXOffsetToFlagsOffset(offset));
+		if (*(TransactionId *)(data + MXOffsetToMemberOffset(offset)) != members[i].xid
+			|| ((flags >> MXOffsetToFlagsBitShift(offset)) & MXACT_MEMBER_XACT_BITMASK)
+				!= members[i].status) {
+			ok = false;
+			break;
+		}
+	}
+	LWLockRelease(ctl->shared->ControlLock);
+	return ok;
+}
+
+static bool
+multi_recovery_sync(SlruCtl ctl, int origin)
+{
+	FileTag tag;
+	char path[MAXPGPATH];
+	int segments[MULTIXACT_RECOVERY_BUFFERS];
+	int count = 0;
+
+	/* At most two pages per family per CREATE, without dirty eviction. */
+	for (int slot = 0; slot < ctl->shared->num_slots; slot++) {
+		int seg;
+		int i;
+
+		if (ctl->shared->page_status[slot] == SLRU_PAGE_EMPTY)
+			continue;
+		seg = ctl->shared->page_number[slot] / SLRU_PAGES_PER_SEGMENT;
+		for (i = 0; i < count; i++)
+			if (segments[i] == seg)
+				break;
+		if (i == count) {
+			if (count == lengthof(segments))
+				return false;
+			segments[count++] = seg;
+		}
+	}
+	if (!multi_recovery_permitted(origin))
+		return false;
+	SimpleLruWriteAll(ctl, false);
+	for (int i = 0; i < count; i++) {
+		memset(&tag, 0, sizeof(tag));
+		tag.segno = segments[i];
+		if (!multi_recovery_permitted(origin) || SlruSyncFileTag(ctl, &tag, path) != 0)
+			return false;
+	}
+	fsync_fname(ctl->Dir, true);
+	return multi_recovery_permitted(origin);
+}
+
+/* Use the record's exact native range, retaining the final partial segment. */
+static bool
+multi_recovery_truncate(SlruCtl ctl, int origin, int start, int end, int maximum, bool verify)
+{
+	for (int segment = start; segment != end; segment = segment == maximum ? 0 : segment + 1) {
+		char path[MAXPGPATH];
+		struct stat st;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!multi_recovery_permitted(origin))
+			return false;
+		snprintf(path, sizeof(path), "%s/%04X", ctl->Dir, segment);
+		if (!verify)
+			SlruDeleteSegment(ctl, segment);
+		/* Native unlink ignores errors; recovery must prove actual absence. */
+		if (lstat(path, &st) == 0 || errno != ENOENT)
+			return false;
+	}
+	return true;
+}
+
+static bool
+multi_recovery_operation(int origin, const ClusterSideProjectionOperationV1 *op,
+	const uint8 *payload, bool verify, XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+{
+	SlruCtl offsets = &MultiXactRecoveryOffsetCtl[origin];
+	SlruCtl members = &MultiXactRecoveryMemberCtl[origin];
+	bool ok;
+
+	if (op->action == CLUSTER_SIDE_PROJECTION_ACTION_CREATE) {
+		if (!multi_recovery_offsets(offsets, op, verify, origin, source_lsn, source_end_lsn)
+			|| !multi_recovery_members(members, op, (const MultiXactMember *)payload, verify,
+				origin, source_lsn, source_end_lsn))
+			return false;
+		if (!verify) {
+			if (!multi_recovery_permitted(origin))
+				return false;
+			RecordNewMultiXactInto(offsets, members, NULL, op->multixact_id, op->member_offset,
+				op->member_count, (const MultiXactMember *)payload);
+		}
+	} else if (op->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE) {
+		SlruCtl ctl = op->normalized_info == XLOG_MULTIXACT_ZERO_OFF_PAGE ? offsets : members;
+		int slot;
+
+		if (!multi_recovery_page_ready(ctl, op->page_number, !verify)
+			|| !multi_recovery_permitted(origin))
+			return false;
+		LWLockAcquire(ctl->shared->ControlLock, LW_EXCLUSIVE);
+		if (verify) {
+			slot = SimpleLruReadPage(ctl, op->page_number, true, InvalidTransactionId);
+			ok = true;
+			for (int i = 0; i < BLCKSZ; i++)
+				if (ctl->shared->page_buffer[slot][i] != 0) {
+					ok = false;
+					break;
+				}
+		} else {
+			(void)SimpleLruZeroPage(ctl, op->page_number);
+			ok = true;
+		}
+		LWLockRelease(ctl->shared->ControlLock);
+		if (!ok)
+			return false;
+	} else {
+		if (!multi_recovery_truncate(members, origin,
+				MXOffsetToMemberSegment(op->truncate_start_member),
+				MXOffsetToMemberSegment(op->truncate_end_member),
+				MXOffsetToMemberSegment(MaxMultiXactOffset), verify))
+			return false;
+		if (op->truncate_start_multixact != op->truncate_end_multixact
+			&& !multi_recovery_truncate(offsets, origin,
+				MultiXactIdToOffsetSegment(PreviousMultiXactId(op->truncate_start_multixact)),
+				MultiXactIdToOffsetSegment(PreviousMultiXactId(op->truncate_end_multixact)),
+				MultiXactIdToOffsetSegment(MaxMultiXactId), verify))
+			return false;
+	}
+	return (verify || (multi_recovery_sync(members, origin) && multi_recovery_sync(offsets, origin)))
+		&& multi_recovery_directory_ready(origin);
+}
+
+static bool
+multi_recovery_access(int origin, const ClusterSideProjectionOperationV1 *op,
+	const uint8 *payload, uint32 length, bool verify, XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+{
+	volatile bool locked = false;
+	volatile bool ok = false;
+	LWLock *lock;
+
+	if (source_lsn == InvalidXLogRecPtr || source_end_lsn <= source_lsn
+		|| !multi_recovery_permitted(origin) || !multi_recovery_input_valid(origin, op, payload, length)
+		|| MultiXactRecoveryOffsetCtl[origin].shared == NULL
+		|| MultiXactRecoveryMemberCtl[origin].shared == NULL)
+		return false;
+	lock = &MultiXactRecoveryLocks[origin * 3 + 2].lock;
+	PG_TRY();
+	{
+		LWLockAcquire(lock, LW_EXCLUSIVE);
+		locked = true;
+		multi_recovery_cache_discard(&MultiXactRecoveryOffsetCtl[origin]);
+		multi_recovery_cache_discard(&MultiXactRecoveryMemberCtl[origin]);
+		if (multi_recovery_directory_ready(origin))
+			ok = multi_recovery_operation(origin, op, payload, verify, source_lsn, source_end_lsn);
+	}
+	PG_FINALLY();
+	{
+		if (locked) {
+			multi_recovery_cache_discard(&MultiXactRecoveryOffsetCtl[origin]);
+			multi_recovery_cache_discard(&MultiXactRecoveryMemberCtl[origin]);
+			LWLockRelease(lock);
+		}
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+/*
+ * cluster_multixact_native_recovery_apply -- Persist one retained native input.
+ * Inputs: the immutable original-origin SIDE operation and its owned members.
+ * Returns: false if original authority, input or persistence is not proven.
+ * Side Effects: only the failed origin's native offsets/members are changed;
+ * local allocation counters and ordinary reader authority are untouched.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+bool
+cluster_multixact_native_recovery_apply(int origin, const ClusterSideProjectionOperationV1 *op,
+	const uint8 *payload, uint32 length, XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+{
+	return multi_recovery_access(origin, op, payload, length, false, source_lsn, source_end_lsn);
+}
+
+/* Read again through an empty cache under the same original recovery scope. */
+bool
+cluster_multixact_native_recovery_verify(int origin, const ClusterSideProjectionOperationV1 *op,
+	const uint8 *payload, uint32 length, XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+{
+	return multi_recovery_access(origin, op, payload, length, true, source_lsn, source_end_lsn);
+}
+#endif
 
 /*
  * MULTIXACT resource manager's routines

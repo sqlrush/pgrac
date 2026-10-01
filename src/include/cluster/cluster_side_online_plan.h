@@ -100,6 +100,11 @@ extern bool rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan
 	const RfContributorStreamCutV1 *cut);
 extern bool rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
 	const RfSideXactOperationV1 *operation);
+/* Only later native TRUNCATE in this exact sealed source can justify an
+ * absent CREATE page. No visibility or mutation authority is returned. */
+extern bool rf_side_online_plan_multixact_page_retired_v1(const RfSideOnlinePlanV1 *plan,
+	uint32 origin_thread, XLogRecPtr source_lsn, XLogRecPtr source_end_lsn,
+	bool members, uint32 page);
 /* Private preparation only, under the caller's independently protected target
  * read. Returned order contains SIDE operation indices for every exact input
  * on this locator; it does not retire any structural or durability obligation. */

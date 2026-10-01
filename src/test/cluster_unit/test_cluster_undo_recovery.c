@@ -84,6 +84,14 @@ cluster_shared_fs_undo_path_resolve(uint8 owner, uint32 segment, char *path, siz
 	return length < 0 || (size_t)length >= size ? -1 : 0;
 }
 
+bool
+rf_side_online_plan_multixact_page_retired_v1(const RfSideOnlinePlanV1 *p,
+	uint32 origin_thread, XLogRecPtr source_lsn, XLogRecPtr source_end_lsn, bool members, uint32 page)
+{
+	return p == plan && origin_thread == 3 && source_lsn == 100 && source_end_lsn == 200
+		&& members && page == 0;
+}
+
 #undef ereport
 #define ereport(level_, rest_) \
 	do { if (expect_failure) longjmp(failure_jump, 1); abort(); } while (0)
@@ -334,16 +342,36 @@ UT_TEST(test_native_fsync_closes_only_the_canonical_write_obligation)
 	cluster_undo_recovery_scope_leave_v1(&scope);
 }
 
+UT_TEST(test_multixact_retirement_evidence_requires_current_original_scope)
+{
+	ClusterUndoRecoveryScopeV1 scope = {0};
+
+	reset_authority();
+	UT_ASSERT(!cluster_undo_recovery_multixact_page_retired_v1(2, 100, 200, true, 0));
+	if (!cluster_undo_recovery_scope_enter_v1(&scope, &authority, plan)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(cluster_undo_recovery_multixact_page_retired_v1(2, 100, 200, true, 0));
+	UT_ASSERT(!cluster_undo_recovery_multixact_page_retired_v1(1, 100, 200, true, 0));
+	UT_ASSERT(!cluster_undo_recovery_multixact_page_retired_v1(2, 101, 200, true, 0));
+	UT_ASSERT(!cluster_undo_recovery_multixact_page_retired_v1(2, 100, 200, false, 0));
+	authority_result = CLUSTER_THREAD_AUTHORITY_FENCE_STALE;
+	UT_ASSERT(!cluster_undo_recovery_multixact_page_retired_v1(2, 100, 200, true, 0));
+	cluster_undo_recovery_scope_leave_v1(&scope);
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_native_fsync_closes_only_the_canonical_write_obligation);
 	UT_RUN(test_native_directory_creation_uses_same_qualified_namespace);
 	UT_RUN(test_cached_native_fd_rechecks_recovery_authority);
 	UT_RUN(test_original_resolver_reaches_only_scoped_canonical_origin);
 	UT_RUN(test_scope_rejects_missing_or_non_mutation_authority);
 	UT_RUN(test_stale_scope_never_falls_back_to_local_path);
+	UT_RUN(test_multixact_retirement_evidence_requires_current_original_scope);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

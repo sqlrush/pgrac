@@ -3149,10 +3149,83 @@ UT_TEST(test_sealed_source_match_requires_observed_namespace_and_exact_cut)
 	rf_side_online_plan_destroy_v1(&p);
 }
 
+UT_TEST(test_multixact_retired_page_requires_exact_later_sealed_truncate)
+{
+	for (int scenario = 0; scenario < 4; scenario++) {
+		bool earlier = scenario == 1;
+		bool crossing = scenario == 2;
+		FakeXactRecord create_fake, truncate_fake;
+		RfDetachedRecordPlanV1 create_plan, truncate_plan;
+		RfPageOnlineRecordIdentityV1 create_identity, truncate_identity;
+		RfSideOnlinePlanRequestV1 request = {0};
+		RfContributorStreamCutV1 cut = {0};
+		RfSideOnlinePlanV1 *plan = NULL;
+		PGAlignedBlock payload;
+		xl_multixact_create *create = (xl_multixact_create *)payload.data;
+		xl_multixact_truncate trunc = {0};
+		uint8 uuid[16];
+		XLogRecPtr begin = earlier ? 200 : 100;
+
+		memset(uuid, 0x45, sizeof(uuid));
+		memset(&payload, 0, sizeof(payload));
+		create->mid = crossing ? (BLCKSZ / sizeof(MultiXactOffset)) * 32 - 1 : 17;
+		create->moff = crossing ? (BLCKSZ / 20) * 4 * 32 - 1 : 71;
+		create->nmembers = 2;
+		create->members[0].xid = 800;
+		create->members[0].status = MultiXactStatusForShare;
+		create->members[1].xid = 816;
+		create->members[1].status = MultiXactStatusForShare;
+		make_projection_record(&create_fake, RM_MULTIXACT_ID, XLOG_MULTIXACT_CREATE_ID,
+			payload.data, SizeOfMultiXactCreate + 2 * sizeof(MultiXactMember));
+		trunc.oldestMultiDB = 1;
+		trunc.startTruncOff = 1;
+		trunc.endTruncOff = (BLCKSZ / sizeof(MultiXactOffset)) * 32 + (scenario == 3 ? 0 : 1);
+		trunc.endTruncMemb = (BLCKSZ / 20) * 4 * 32;
+		make_projection_record(&truncate_fake, RM_MULTIXACT_ID, XLOG_MULTIXACT_TRUNCATE_ID,
+			&trunc, SizeOfMultiXactTruncate);
+		create_identity = make_identity(&create_fake, uuid);
+		truncate_identity = make_identity(&truncate_fake, uuid);
+		set_identity_range(&create_fake, &create_identity, begin, begin + 100);
+		set_identity_range(&truncate_fake, &truncate_identity, earlier ? 100 : 200,
+			earlier ? 200 : 300);
+		create_plan = make_projection_record_plan(&create_fake);
+		truncate_plan = make_projection_record_plan(&truncate_fake);
+		cut.failed_thread = 3;
+		cut.timeline_id = 7;
+		cut.scan_begin_inclusive = 100;
+		cut.scan_end_exclusive = 300;
+		cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		request.system_identifier = create_identity.record.system_identifier;
+		memcpy(request.storage_uuid, uuid, sizeof(uuid));
+		request.physical_cuts = &cut;
+		request.participant_count = 1;
+		UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan,
+			earlier ? &truncate_plan : &create_plan,
+			earlier ? &truncate_identity : &create_identity), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan,
+			earlier ? &create_plan : &truncate_plan,
+			earlier ? &create_identity : &truncate_identity), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(!rf_side_online_plan_multixact_page_retired_v1(plan, 3, begin, begin + 100, false, 0));
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_multixact_page_retired_v1(plan, 3, begin, begin + 100, false,
+			crossing ? 31 : 0), !earlier && scenario != 3);
+		UT_ASSERT_EQ(rf_side_online_plan_multixact_page_retired_v1(plan, 3, begin, begin + 100, true,
+			crossing ? 31 : 0), !earlier);
+		UT_ASSERT(!rf_side_online_plan_multixact_page_retired_v1(plan, 3, begin, begin + 100, false, 32));
+		UT_ASSERT(!rf_side_online_plan_multixact_page_retired_v1(plan, 3, begin, begin + 100, true, 32));
+		UT_ASSERT(!rf_side_online_plan_multixact_page_retired_v1(plan, 2, begin, begin + 100, false, 0));
+		UT_ASSERT(!rf_side_online_plan_multixact_page_retired_v1(plan, 3, begin, begin + 101, false, 0));
+		UT_ASSERT(!rf_side_online_plan_multixact_page_retired_v1(plan, 3, begin, begin + 100, false, 1));
+		UT_ASSERT(!rf_side_online_plan_multixact_page_retired_v1(plan, 3, begin, begin + 100, true, UINT32_MAX));
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(45);
 	UT_RUN(test_reuse_owner_covers_retired_commit_only_after_new_physical_and_tt);
 	UT_RUN(test_init_owner_repairs_short_segment_before_header_and_commit);
 	UT_RUN(test_lifecycle_header_requires_known_generation_and_complete_source_chain);
@@ -3197,6 +3270,7 @@ main(void)
 	UT_RUN(test_space_commit_owned_multiple_targets_close_exact_source_chains);
 	UT_RUN(test_space_commit_rejects_unowned_duplicate_or_malformed_drop_inputs);
 	UT_RUN(test_space_commit_retains_all_native_side_effects_and_refuses_tt_only_owner);
+	UT_RUN(test_multixact_retired_page_requires_exact_later_sealed_truncate);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

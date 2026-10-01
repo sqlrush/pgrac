@@ -10,8 +10,10 @@
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/multixact.h"
+#include "access/slru.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_side_online_plan.h"
+#include "cluster/cluster_native_startup.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 
 #ifdef RF_SIDE_ONLINE_TESTING
@@ -57,6 +59,76 @@ side_bytes_nonzero(const uint8 *bytes, Size length)
 	for (i = 0; i < length; i++)
 		seen |= bytes[i];
 	return seen != 0;
+}
+
+/* Native offsets retain the page containing the ID immediately before the
+ * horizon; members retain the segment containing the new member offset. */
+bool
+rf_side_online_plan_multixact_page_retired_v1(const RfSideOnlinePlanV1 *plan,
+	uint32 origin_thread, XLogRecPtr source_lsn, XLogRecPtr source_end_lsn,
+	bool members, uint32 page)
+{
+	uint32 per_page = members ? CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE
+		: CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE;
+	uint32 source_index = UINT32_MAX;
+	uint32 segment = page / SLRU_PAGES_PER_SEGMENT;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| page > UINT32_MAX / per_page || source_lsn == InvalidXLogRecPtr
+		|| source_end_lsn <= source_lsn)
+		return false;
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *entry = &plan->operations[i];
+		const ClusterSideProjectionOperationV1 *op = &entry->projection;
+		uint32 first, last;
+
+		if (entry->identity.record.origin_thread != origin_thread
+			|| entry->identity.record.read_rec_ptr != source_lsn
+			|| entry->identity.record.end_rec_ptr != source_end_lsn
+			|| entry->kind != RF_SIDE_ONLINE_OPERATION_PROJECTION
+			|| op->kind != CLUSTER_SIDE_PROJECTION_MULTIXACT
+			|| op->action != CLUSTER_SIDE_PROJECTION_ACTION_CREATE)
+			continue;
+		first = members ? op->member_offset : op->multixact_id;
+		last = members ? op->member_offset + op->member_count - 1 : op->multixact_id + 1;
+		if (!members && last < FirstMultiXactId)
+			last = FirstMultiXactId;
+		if (page != first / per_page && page != last / per_page)
+			return false;
+		source_index = i;
+		break;
+	}
+	if (source_index == UINT32_MAX)
+		return false;
+	for (uint32 i = source_index + 1; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *entry = &plan->operations[i];
+		const ClusterSideProjectionOperationV1 *op = &entry->projection;
+		uint32 first, last;
+
+		if (entry->identity.record.origin_thread != origin_thread
+			|| entry->kind != RF_SIDE_ONLINE_OPERATION_PROJECTION
+			|| op->kind != CLUSTER_SIDE_PROJECTION_MULTIXACT
+			|| op->action != CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE)
+			continue;
+		if (members) {
+			first = op->truncate_start_member;
+			last = op->truncate_end_member;
+		} else {
+			if (op->truncate_start_multixact == op->truncate_end_multixact
+				|| (int32)(op->truncate_end_multixact - op->truncate_start_multixact) < 0)
+				continue;
+			first = op->truncate_start_multixact == FirstMultiXactId ? MaxMultiXactId
+				: op->truncate_start_multixact - 1;
+			last = op->truncate_end_multixact == FirstMultiXactId ? MaxMultiXactId
+				: op->truncate_end_multixact - 1;
+		}
+		first /= per_page * SLRU_PAGES_PER_SEGMENT;
+		last /= per_page * SLRU_PAGES_PER_SEGMENT;
+		if (first < last ? segment >= first && segment < last
+			: first > last && (segment >= first || segment < last))
+			return true;
+	}
+	return false;
 }
 
 static bool
