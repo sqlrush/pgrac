@@ -138,15 +138,17 @@ cluster_epoch_get_current(void)
 }
 
 RfPageProofDetailV1
-rf_page_stable_base_proof_build_bound_v1(const RfPageStableBaseProofRequestV1 *request,
-										 uint32 *chain_indices, uint32 chain_capacity,
-										 RfPageStableBaseProofV1 **out_proof)
+rf_page_stable_base_proof_build_sources_v1(const RfPageStableGraphRequestV1 *graph,
+										   const ClusterThreadRecoveryAuthorityV1 *authorities,
+										   uint32 count, uint32 *chain_indices,
+										   uint32 chain_capacity,
+										   RfPageStableBaseProofV1 **out_proof)
 {
 	int index;
 
-	UT_ASSERT(request != NULL && request->graph != NULL && chain_indices != NULL
-			  && chain_capacity != 0);
-	index = request->graph == &graphs[0] ? 0 : (request->graph == &graphs[1] ? 1 : -1);
+	UT_ASSERT(graph != NULL && chain_indices != NULL && chain_capacity != 0 && authorities != NULL
+			  && authorities->duty->origin_thread_id == 2 && count == 1);
+	index = graph == &graphs[0] ? 0 : (graph == &graphs[1] ? 1 : -1);
 	UT_ASSERT(index >= 0);
 	*out_proof = (RfPageStableBaseProofV1 *)&proof_objects[index];
 	proof_step = ++step;
@@ -166,6 +168,9 @@ rf_page_authority_batch_preflight_wait_v1(const RfPageAuthorityBatchRequestV1 *r
 {
 	UT_ASSERT(request != NULL && request->target_count == (uint32)target_count
 			  && timeout_ms == 1000);
+	UT_ASSERT(request->source_authorities != NULL && request->participant_count == 1
+			  && request->formation == NULL && request->duties == NULL
+			  && request->retention_pin == NULL);
 	if (target_count == 2) {
 		UT_ASSERT(request->targets[0].contributors == &contributors[0]);
 		UT_ASSERT(request->targets[1].contributors == &contributors[1]);

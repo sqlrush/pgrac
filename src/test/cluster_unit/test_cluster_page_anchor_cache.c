@@ -11,6 +11,7 @@
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_wal_retention.h"
+#include "cluster/cluster_thread_recovery_authority.h"
 
 #if defined(__has_include)
 #if __has_include("cluster/cluster_page_anchor_cache.h")
@@ -32,6 +33,13 @@ ExceptionalCondition(const char *condition_name, const char *file_name, int line
 
 /* This binary links stable-base only for shared key helpers.  Keep every
  * external authority seam fail closed if its owner branch becomes reachable. */
+ClusterThreadRecoveryAuthorityResultV1
+cluster_thread_recovery_authority_revalidate_nowait_v1(
+	const ClusterThreadRecoveryAuthorityV1 *authority pg_attribute_unused())
+{
+	return CLUSTER_THREAD_AUTHORITY_INVALID;
+}
+
 ClusterControlRootResult
 cluster_control_root_revalidate(const ClusterControlRootReadToken *token pg_attribute_unused(),
 								const ClusterControlRootIdentity *expected_identity

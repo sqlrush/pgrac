@@ -218,18 +218,9 @@ cluster_thread_recovery_fabric_apply_v1(const ClusterThreadRecoveryFabricPlanV1 
 			goto done;
 		}
 		for (i = 0; i < target_count; i++) {
-			RfPageStableBaseProofRequestV1 proof_request;
-
-			memset(&proof_request, 0, sizeof(proof_request));
-			proof_request.graph = state.views[i].graph;
-			proof_request.duties = authority->duty;
-			proof_request.root_tokens = authority->root_token;
-			proof_request.formation = authority->formation;
-			proof_request.fence_need_set = authority->fence_need_set;
-			proof_request.fence_admission_set = authority->fence_admission_set;
-			proof_request.retention_pin = authority->retention_pin;
-			detail = rf_page_stable_base_proof_build_bound_v1(&proof_request, state.chain_indices,
-															  max_chain_count, &state.proofs[i]);
+			detail = rf_page_stable_base_proof_build_sources_v1(
+				state.views[i].graph, authority, participant_count, state.chain_indices,
+				max_chain_count, &state.proofs[i]);
 			if (detail != RF_PAGE_PROOF_DETAIL_OK)
 				goto done;
 			state.authority_targets[i].page_identity = state.views[i].page_identity;
@@ -246,12 +237,7 @@ cluster_thread_recovery_fabric_apply_v1(const ClusterThreadRecoveryFabricPlanV1 
 		memset(&authority_request, 0, sizeof(authority_request));
 		authority_request.targets = state.authority_targets;
 		authority_request.target_count = target_count;
-		authority_request.formation = authority->formation;
-		authority_request.fence_need_set = authority->fence_need_set;
-		authority_request.fence_admission_set = authority->fence_admission_set;
-		authority_request.retention_pin = authority->retention_pin;
-		authority_request.duties = authority->duty;
-		authority_request.root_tokens = authority->root_token;
+		authority_request.source_authorities = authority;
 		authority_request.participant_count = participant_count;
 		detail = fabric_apply_map_authority(rf_page_authority_batch_preflight_wait_v1(
 			&authority_request, 1000, &state.page_preflight));

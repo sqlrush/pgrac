@@ -73,6 +73,18 @@ static ClusterRecoverySerialRevalidateResult serial_result;
 #define DUTIES (duty_objects)
 
 bool
+rf_page_stable_base_proof_matches_sources_v1(
+	const RfPageStableBaseProofV1 *proof, const RfPageIdentityV1 *page_identity,
+	const RfPageVersionV1 *expected_result,
+	const struct ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count,
+	const RfPagePinnedSourceV1 *source, const RfContributorVectorV1 *contributors)
+{
+	/* This fixture covers the legacy one-owner interface. Real multi-owner
+	 * proof/authority integration is in test_cluster_page_stable_base. */
+	return false;
+}
+
+bool
 rf_page_stable_base_proof_matches_v1(
 	const RfPageStableBaseProofV1 *proof, const RfPageIdentityV1 *page_identity,
 	const RfPageVersionV1 *expected_result, const ClusterRecoveryDutyKey *duties,

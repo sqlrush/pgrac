@@ -175,6 +175,7 @@ typedef struct PgracExternalFenceNeedSetV1 PgracExternalFenceNeedSetV1;
 typedef struct ClusterFormationWitnessV1 ClusterFormationWitnessV1;
 typedef struct ClusterWalRetentionPin ClusterWalRetentionPin;
 typedef struct RfPageStableBaseProofV1 RfPageStableBaseProofV1;
+struct ClusterThreadRecoveryAuthorityV1;
 
 typedef struct RfPageStableBaseProofRequestV1 {
 	const RfPageStableGraphRequestV1 *graph;
@@ -208,6 +209,17 @@ extern RfPageProofDetailV1
 rf_page_stable_base_proof_build_bound_v1(const RfPageStableBaseProofRequestV1 *request,
 										 uint32 *chain_indices, uint32 chain_capacity,
 										 RfPageStableBaseProofV1 **out_proof);
+/* Borrow each original owner from one already bound retention set.  Neither
+ * this proof nor its PAGE guard acquires exclusion from ordinary writers. */
+extern RfPageProofDetailV1 rf_page_stable_base_proof_build_sources_v1(
+	const RfPageStableGraphRequestV1 *graph,
+	const struct ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count, uint32 *chain_indices,
+	uint32 chain_capacity, RfPageStableBaseProofV1 **out_proof);
+extern bool rf_page_stable_base_proof_matches_sources_v1(
+	const RfPageStableBaseProofV1 *proof, const RfPageIdentityV1 *page_identity,
+	const RfPageVersionV1 *expected_result,
+	const struct ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count,
+	const RfPagePinnedSourceV1 *source, const RfContributorVectorV1 *contributors);
 extern bool rf_page_stable_base_proof_matches_v1(
 	const RfPageStableBaseProofV1 *proof, const RfPageIdentityV1 *page_identity,
 	const RfPageVersionV1 *expected_result, const ClusterRecoveryDutyKey *duties,

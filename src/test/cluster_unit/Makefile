@@ -2208,9 +2208,11 @@ $(CLUSTER_PAGE_STABLE_BASE_O): \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
 test_cluster_page_stable_base: test_cluster_page_stable_base.c unit_test.h \
-		$(CLUSTER_PAGE_STABLE_BASE_O) xlogreader_fs.o
+		$(CLUSTER_PAGE_STABLE_BASE_O) xlogreader_fs.o \
+		cluster_thread_recovery_authority_test.o $(CLUSTER_PAGE_AUTHORITY_O) $(CLUSTER_PAGE_GUARD_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< \
 		$(CLUSTER_PAGE_STABLE_BASE_O) xlogreader_fs.o \
+		cluster_thread_recovery_authority_test.o $(CLUSTER_PAGE_AUTHORITY_O) $(CLUSTER_PAGE_GUARD_O) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
 		-lssl -lcrypto -llz4 -lzstd -o $@

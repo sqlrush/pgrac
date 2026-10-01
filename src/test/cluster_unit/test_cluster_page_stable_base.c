@@ -7,6 +7,8 @@
  */
 #include "postgres.h"
 #include "access/xlogreader.h"
+#include "cluster/cluster_page_authority.h"
+#include "cluster/cluster_thread_recovery_authority.h"
 
 #if defined(__has_include)
 #if __has_include("cluster/cluster_page_stable_base.h")
@@ -21,6 +23,7 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+bool cluster_shared_config = true;
 
 void
 ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
@@ -87,12 +90,46 @@ static bool canonical_root_current;
 static bool bound_pin_current;
 static int preflight_pin_checks;
 static int bound_pin_checks;
+static uint32 source_count;
+static const ClusterThreadRecoveryAuthorityV1 *source_owners;
+static uint16 stale_source;
+static uint32 source_serial_checks[4];
+
+ClusterRecoveryDutyCompare
+cluster_recovery_duty_key_compare_for_claim(const ClusterRecoveryDutyKey *expected,
+											const ClusterRecoveryDutyKey *observed, bool claim_v2)
+{
+	return memcmp(expected, observed, sizeof(*expected)) == 0
+			   ? CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
+			   : CLUSTER_RECOVERY_DUTY_COMPARE_DIFFERENT;
+}
+
+ClusterRecoverySerialRevalidateResult
+cluster_recovery_serial_revalidate(ClusterRecoverySerialGuard *guard)
+{
+	for (uint32 i = 0; i < source_count; i++)
+		if (guard == source_owners[i].serial_guard) {
+			source_serial_checks[i]++;
+			return guard->held && guard->mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+						   && guard->duty.origin_thread_id != stale_source
+					   ? CLUSTER_RECOVERY_SERIAL_CURRENT
+					   : CLUSTER_RECOVERY_SERIAL_NOT_HELD;
+		}
+	return CLUSTER_RECOVERY_SERIAL_NOT_HELD;
+}
 
 ClusterControlRootResult
 cluster_control_root_revalidate(const ClusterControlRootReadToken *token,
 								const ClusterControlRootIdentity *identity,
 								ClusterControlRootSnapshot *snapshot)
 {
+	for (uint32 i = 0; i < source_count; i++)
+		if (token == source_owners[i].root_token && identity == source_owners[i].duty) {
+			if (!canonical_root_current || identity->origin_thread_id == stale_source)
+				return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			*snapshot = *source_owners[i].root_snapshot;
+			return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		}
 	if (!canonical_root_current || token != expected_root_tokens || identity != expected_duties)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (snapshot != NULL) {
@@ -107,6 +144,9 @@ cluster_control_root_revalidate(const ClusterControlRootReadToken *token,
 ClusterFormationWitnessResult
 cluster_formation_witness_revalidate_nowait(const ClusterFormationWitnessV1 *formation)
 {
+	for (uint32 i = 0; i < source_count; i++)
+		if (formation == source_owners[i].formation)
+			return CLUSTER_FORMATION_WITNESS_READY;
 	return formation == expected_formation ? CLUSTER_FORMATION_WITNESS_READY
 										   : CLUSTER_FORMATION_WITNESS_UNSTABLE;
 }
@@ -118,6 +158,10 @@ cluster_external_fence_need_set_revalidate_nowait(const PgracExternalFenceNeedSe
 {
 	if (reason != NULL)
 		*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+	for (uint32 i = 0; i < source_count; i++)
+		if (needs == source_owners[i].serial_guard->fence_need_set
+			&& formation == source_owners[i].serial_guard->formation)
+			return source_owners[i].duty->origin_thread_id != stale_source;
 	return needs == expected_needs && formation == expected_formation;
 }
 
@@ -129,6 +173,11 @@ cluster_external_fence_revalidate_set_nowait(const PgracExternalFenceAdmissionSe
 {
 	if (reason != NULL)
 		*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+	for (uint32 i = 0; i < source_count; i++)
+		if (admissions == source_owners[i].serial_guard->fence_admission_set
+			&& needs == source_owners[i].serial_guard->fence_need_set
+			&& formation == source_owners[i].serial_guard->formation)
+			return source_owners[i].duty->origin_thread_id != stale_source;
 	return admissions == expected_admissions && needs == expected_needs
 		   && formation == expected_formation;
 }
@@ -268,6 +317,9 @@ graph_init(GraphFixture *fixture)
 	RfPageVersionV1 result = make_version(1, 11);
 
 	memset(fixture, 0, sizeof(*fixture));
+	source_count = 0;
+	source_owners = NULL;
+	stale_source = 0;
 	fixture->identity = make_identity(7);
 	set_edge(&fixture->edges[0], &fixture->identity, RF_PAGE_STATE_ABSENT, NULL, &result,
 			 RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE, 1, 0);
@@ -334,6 +386,302 @@ proof_request(GraphFixture *fixture, RfPageStableBaseProofRequestV1 *request)
 	bound_pin_current = true;
 	preflight_pin_checks = 0;
 	bound_pin_checks = 0;
+}
+
+typedef struct SourceFixture {
+	GraphFixture graph;
+	ClusterThreadRecoveryAuthorityV1 authorities[3];
+	ClusterControlRootSnapshot roots[3];
+	ClusterRecoverySerialGuard serials[3];
+	char formations[3], needs[3], admissions[3];
+} SourceFixture;
+
+static void
+sources_init(SourceFixture *fixture)
+{
+	GraphFixture *g = &fixture->graph;
+	RfPageStableBaseProofRequestV1 legacy;
+	RfPageVersionV1 first = make_version(1, 900);
+	RfPageVersionV1 middle = make_version(1, 60);
+	RfPageVersionV1 last = make_version(1, 7);
+
+	memset(fixture, 0, sizeof(*fixture));
+	graph_init(g);
+	proof_request(g, &legacy);
+	set_edge(&g->edges[0], &g->identity, RF_PAGE_STATE_ABSENT, NULL, &first,
+			 RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE, 1, 0);
+	set_edge(&g->edges[1], &g->identity, RF_PAGE_STATE_PRESENT, &first, &middle, 0, 1, 1);
+	set_edge(&g->edges[2], &g->identity, RF_PAGE_STATE_PRESENT, &middle, &last, 0, 1, 2);
+	g->request.expected_result = last;
+	graph_recount(g, 3, 3);
+	for (uint32 i = 0; i < 3; i++) {
+		ClusterThreadRecoveryAuthorityV1 *a = &fixture->authorities[i];
+		ClusterControlRootSnapshot *r = &fixture->roots[i];
+		ClusterRecoverySerialGuard *s = &fixture->serials[i];
+		ClusterRecoveryDutyKey *d = &g->duties[i];
+		ClusterControlRootReadToken *t = &g->root_tokens[i];
+
+		*d = g->duties[0];
+		d->system_identifier = g->identity.system_identifier;
+		memcpy(d->storage_uuid, g->identity.storage_uuid, 16);
+		d->origin_thread_id = i + 1;
+		r->identity = *d;
+		r->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+		r->root_flags
+			= CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID;
+		r->checkpoint_tli = r->tail_tli = 1;
+		r->checkpoint_lower_lsn = 100;
+		r->validated_tail_lsn_exclusive = 200;
+		*t = g->root_tokens[0];
+		t->origin_thread_id = i + 1;
+		t->lifecycle = r->lifecycle;
+		t->root_flags = r->root_flags;
+		a->duty = d;
+		a->root_snapshot = r;
+		a->root_token = t;
+		a->formation = (const ClusterFormationWitnessV1 *)&fixture->formations[i];
+		a->fence_need_set = (const PgracExternalFenceNeedSetV1 *)&fixture->needs[i];
+		a->fence_admission_set = (const PgracExternalFenceAdmissionSetV1 *)&fixture->admissions[i];
+		a->retention_pin = expected_pin;
+		a->serial_guard = s;
+		s->held = true;
+		s->mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		s->duty = *d;
+		s->root_read_token = *t;
+		s->formation = a->formation;
+		s->fence_need_set = a->fence_need_set;
+		s->fence_admission_set = a->fence_admission_set;
+	}
+	source_owners = fixture->authorities;
+	source_count = 3;
+	memset(source_serial_checks, 0, sizeof(source_serial_checks));
+}
+
+static RfPageProofDetailV1
+sources_build(SourceFixture *fixture, RfPageStableBaseProofV1 **proof)
+{
+	return rf_page_stable_base_proof_build_sources_v1(&fixture->graph.request, fixture->authorities,
+													  3, fixture->graph.chain,
+													  lengthof(fixture->graph.chain), proof);
+}
+
+static bool
+sources_match(SourceFixture *fixture, RfPageStableBaseProofV1 *proof)
+{
+	return rf_page_stable_base_proof_matches_sources_v1(
+		proof, &fixture->graph.identity, &fixture->graph.request.expected_result,
+		fixture->authorities, 3, &fixture->graph.source, &fixture->graph.vector);
+}
+
+UT_TEST(test_sources_bind_each_original_owner)
+{
+	SourceFixture f;
+	RfPageStableBaseProofV1 *proof = NULL;
+
+	sources_init(&f);
+	UT_ASSERT_EQ(sources_build(&f, &proof), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(sources_match(&f, proof));
+	for (uint32 i = 0; i < 3; i++)
+		UT_ASSERT(source_serial_checks[i] > 0);
+	UT_ASSERT_EQ(f.graph.chain[0], 0);
+	UT_ASSERT_EQ(f.graph.chain[1], 1);
+	UT_ASSERT_EQ(f.graph.chain[2], 2);
+	UT_ASSERT(rf_page_stable_base_proof_covers_version_v1(proof, &f.graph.identity,
+														  &f.graph.edges[2].edge.before));
+	rf_page_stable_base_proof_destroy_v1(&proof);
+	UT_ASSERT_NULL(proof);
+}
+
+UT_TEST(test_sources_do_not_borrow_first_fence_for_later_origin)
+{
+	SourceFixture f;
+	RfPageStableBaseProofV1 *proof = NULL;
+
+	sources_init(&f);
+	f.authorities[2].formation = f.authorities[0].formation;
+	f.authorities[2].fence_need_set = f.authorities[0].fence_need_set;
+	f.authorities[2].fence_admission_set = f.authorities[0].fence_admission_set;
+	UT_ASSERT(sources_build(&f, &proof) != RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_NULL(proof);
+}
+
+UT_TEST(test_sources_reject_stale_later_member_and_pin)
+{
+	SourceFixture f;
+	RfPageStableBaseProofV1 *proof = NULL;
+
+	sources_init(&f);
+	stale_source = 3;
+	UT_ASSERT(sources_build(&f, &proof) != RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_NULL(proof);
+	stale_source = 0;
+	bound_pin_current = false;
+	UT_ASSERT_EQ(sources_build(&f, &proof), RF_PAGE_PROOF_DETAIL_RETENTION_STALE);
+	UT_ASSERT_NULL(proof);
+}
+
+UT_TEST(test_sources_require_exact_cuts_and_namespace)
+{
+	SourceFixture f;
+	RfPageStableBaseProofV1 *proof = NULL;
+
+	for (int variant = 0; variant < 8; variant++) {
+		sources_init(&f);
+		switch (variant) {
+		case 0:
+			f.graph.cuts[1].scan_begin_inclusive = 99;
+			break;
+		case 1:
+			f.graph.cuts[1].scan_end_exclusive = 201;
+			break;
+		case 2:
+			f.graph.cuts[1].timeline_id++;
+			break;
+		case 3:
+			f.graph.cuts[1].failed_thread = 1;
+			break;
+		case 4:
+			f.graph.identity.storage_uuid[0]++;
+			f.graph.request.page_identity = f.graph.identity;
+			break;
+		case 5:
+			f.authorities[1].retention_pin = (ClusterWalRetentionPin *)&f;
+			break;
+		case 6:
+			f.roots[1].tail_tli++;
+			break;
+		case 7:
+			f.graph.cuts[1].flags = RF_CONTRIBUTOR_CUT_KNOWN_MASK;
+			break;
+		}
+		UT_ASSERT(sources_build(&f, &proof) != RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_NULL(proof);
+	}
+}
+
+UT_TEST(test_sources_proof_rejects_rebound_original_objects)
+{
+	SourceFixture f;
+	RfPageStableBaseProofV1 *proof = NULL;
+	ClusterControlRootSnapshot copied_root;
+	ClusterThreadRecoveryAuthorityV1 copied[3];
+
+	sources_init(&f);
+	UT_ASSERT_EQ(sources_build(&f, &proof), RF_PAGE_PROOF_DETAIL_OK);
+	memcpy(copied, f.authorities, sizeof(copied));
+	UT_ASSERT(!rf_page_stable_base_proof_matches_sources_v1(
+		proof, &f.graph.identity, &f.graph.request.expected_result, copied, 3, &f.graph.source,
+		&f.graph.vector));
+	copied_root = f.roots[2];
+	f.authorities[2].root_snapshot = &copied_root;
+	UT_ASSERT(!sources_match(&f, proof));
+	f.authorities[2].root_snapshot = &f.roots[2];
+	UT_ASSERT(sources_match(&f, proof));
+	stale_source = 2;
+	UT_ASSERT(!sources_match(&f, proof));
+	rf_page_stable_base_proof_destroy_v1(&proof);
+}
+
+UT_TEST(test_sources_reject_incomplete_input_and_readonly_ir)
+{
+	SourceFixture f;
+	RfPageStableBaseProofV1 *proof = NULL;
+
+	sources_init(&f);
+	f.graph.edges[2].edge.before.mutation_token++;
+	UT_ASSERT(sources_build(&f, &proof) != RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_NULL(proof);
+	sources_init(&f);
+	f.serials[2].mode = CLUSTER_RECOVERY_SERIAL_INPUT_SEAL;
+	UT_ASSERT(sources_build(&f, &proof) != RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_NULL(proof);
+}
+
+UT_TEST(test_sources_keep_authority_for_projected_empty_origin)
+{
+	SourceFixture f;
+	RfPageStableBaseProofV1 *proof = NULL;
+
+	sources_init(&f);
+	f.graph.request.expected_result = make_version(1, 60);
+	graph_recount(&f.graph, 3, 2);
+	/* Target edges need only occupy a subinterval of the original cut. */
+	f.graph.cuts[0].scan_begin_inclusive = f.graph.cuts[1].scan_begin_inclusive = 101;
+	f.graph.cuts[0].scan_end_exclusive = f.graph.cuts[1].scan_end_exclusive = 102;
+	UT_ASSERT_EQ(sources_build(&f, &proof), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(sources_match(&f, proof));
+	stale_source = 3;
+	UT_ASSERT(!sources_match(&f, proof));
+	rf_page_stable_base_proof_destroy_v1(&proof);
+}
+
+UT_TEST(test_sources_page_adapter_rechecks_all_members)
+{
+	SourceFixture f;
+	RfPageStableBaseProofV1 *proof = NULL;
+	RfPageAuthorityBatchRequestV1 request = { 0 };
+	RfPageAuthorityTargetV1 target = { 0 };
+	RfPageAuthorityPreflightV1 *preflight = NULL;
+	RfPageInstallAuthorityAdapterV1 adapter = { 0 };
+
+	sources_init(&f);
+	UT_ASSERT_EQ(sources_build(&f, &proof), RF_PAGE_PROOF_DETAIL_OK);
+	target.page_identity = f.graph.identity;
+	target.expected_result = f.graph.request.expected_result;
+	target.stable_base = proof;
+	target.source = &f.graph.source;
+	target.contributors = &f.graph.vector;
+	request.targets = &target;
+	request.target_count = 1;
+	request.participant_count = 3;
+	request.source_authorities = f.authorities;
+	request.formation = f.authorities[0].formation;
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 0, &preflight),
+				 RF_PAGE_AUTHORITY_INVALID_ARGUMENT);
+	UT_ASSERT_NULL(preflight);
+	request.formation = NULL;
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 0, &preflight),
+				 RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT(rf_page_install_authority_adapter_init_v1(preflight, &f.serials[0], &adapter));
+	if (ut_current_failed)
+		goto cleanup;
+	adapter.serial_guard = &f.serials[1];
+	UT_ASSERT(!adapter.ops.promote(adapter.ops.arg));
+	UT_ASSERT_NULL(adapter.guard);
+	adapter.serial_guard = &f.serials[0];
+	stale_source = 2;
+	UT_ASSERT(!adapter.ops.promote(adapter.ops.arg));
+	UT_ASSERT_NULL(adapter.guard);
+	stale_source = 0;
+	UT_ASSERT(adapter.ops.promote(adapter.ops.arg));
+	UT_ASSERT(adapter.ops.validate_identity(adapter.ops.arg, &target.page_identity,
+											target.expected_result.segment_incarnation));
+	stale_source = 3;
+	UT_ASSERT(!adapter.ops.validate_identity(adapter.ops.arg, &target.page_identity,
+											 target.expected_result.segment_incarnation));
+	UT_ASSERT(!adapter.ops.publish(adapter.ops.arg));
+	UT_ASSERT(adapter.ops.release(adapter.ops.arg));
+	rf_page_authority_preflight_destroy_v1(&preflight);
+	UT_ASSERT_NULL(preflight);
+	rf_page_stable_base_proof_destroy_v1(&proof);
+
+	/* A failed publication must not strand the original PAGE guard. */
+	sources_init(&f);
+	UT_ASSERT_EQ(sources_build(&f, &proof), RF_PAGE_PROOF_DETAIL_OK);
+	target.stable_base = proof;
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 0, &preflight),
+				 RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT(rf_page_install_authority_adapter_init_v1(preflight, &f.serials[0], &adapter));
+	if (ut_current_failed)
+		goto cleanup;
+	UT_ASSERT(adapter.ops.promote(adapter.ops.arg));
+	UT_ASSERT(adapter.ops.publish(adapter.ops.arg));
+	UT_ASSERT(adapter.ops.release(adapter.ops.arg));
+cleanup:
+	if (adapter.guard != NULL)
+		rf_page_authority_guard_release_v1(&adapter.guard);
+	rf_page_authority_preflight_destroy_v1(&preflight);
+	rf_page_stable_base_proof_destroy_v1(&proof);
 }
 
 UT_TEST(test_stable_proof_binds_exact_borrowed_owners)
@@ -1178,7 +1526,15 @@ UT_TEST(test_complete_release_order)
 int
 main(void)
 {
-	UT_PLAN(49);
+	UT_PLAN(57);
+	UT_RUN(test_sources_bind_each_original_owner);
+	UT_RUN(test_sources_do_not_borrow_first_fence_for_later_origin);
+	UT_RUN(test_sources_reject_stale_later_member_and_pin);
+	UT_RUN(test_sources_require_exact_cuts_and_namespace);
+	UT_RUN(test_sources_proof_rejects_rebound_original_objects);
+	UT_RUN(test_sources_reject_incomplete_input_and_readonly_ir);
+	UT_RUN(test_sources_keep_authority_for_projected_empty_origin);
+	UT_RUN(test_sources_page_adapter_rechecks_all_members);
 	UT_RUN(test_stable_proof_binds_exact_borrowed_owners);
 	UT_RUN(test_stable_proof_accepts_only_current_bound_pin);
 	UT_RUN(test_stable_proof_covers_exact_ancestors_before_nearest_anchor);

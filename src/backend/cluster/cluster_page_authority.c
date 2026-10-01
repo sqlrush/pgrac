@@ -9,6 +9,7 @@
 
 #include "cluster/cluster_page_authority.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_thread_recovery_authority.h"
 
 #ifdef USE_CLUSTER_UNIT
 #define authority_alloc0(size_) calloc(1, (size_))
@@ -50,6 +51,7 @@ struct RfPageAuthorityPreflightV1 {
 	const ClusterRecoveryDutyKey *duties;
 	const ClusterControlRootReadToken *root_tokens;
 	uint32 participant_count;
+	const ClusterThreadRecoveryAuthorityV1 *source_authorities;
 	RfPageAuthorityTargetV1 *targets;
 	RfPageGuardPreflightV1 *page_preflights;
 	uint8 *target_guard_index;
@@ -146,6 +148,14 @@ stable_proofs_current(const RfPageAuthorityPreflightV1 *preflight)
 	for (i = 0; i < preflight->target_count; i++) {
 		const RfPageAuthorityTargetV1 *target = &preflight->targets[i];
 
+		if (preflight->source_authorities != NULL) {
+			if (!rf_page_stable_base_proof_matches_sources_v1(
+					target->stable_base, &target->page_identity, &target->expected_result,
+					preflight->source_authorities, preflight->participant_count, target->source,
+					target->contributors))
+				return false;
+			continue;
+		}
 		if (!rf_page_stable_base_proof_matches_v1(
 				target->stable_base, &target->page_identity, &target->expected_result,
 				preflight->duties, preflight->root_tokens, preflight->formation,
@@ -168,6 +178,14 @@ owners_current(const RfPageAuthorityPreflightV1 *preflight,
 		return RF_PAGE_AUTHORITY_INVALID_ARGUMENT;
 	if (!serial_guard->held)
 		return RF_PAGE_AUTHORITY_SERIAL_NOT_HELD;
+	if (preflight->source_authorities != NULL) {
+		/* The adapter's first guard is an identity anchor, never a substitute
+		 * for the other original guards. Proof matching revalidates them all. */
+		if (serial_guard != preflight->source_authorities[0].serial_guard)
+			return RF_PAGE_AUTHORITY_SERIAL_NOT_HELD;
+		return stable_proofs_current(preflight) ? RF_PAGE_AUTHORITY_OK
+												: RF_PAGE_AUTHORITY_NO_STABLE_BASE;
+	}
 	if (serial_guard->formation != preflight->formation
 		|| serial_guard->fence_need_set != preflight->fence_need_set
 		|| serial_guard->fence_admission_set != preflight->fence_admission_set)
@@ -212,11 +230,19 @@ rf_page_authority_batch_preflight_wait_v1(const RfPageAuthorityBatchRequestV1 *r
 		return RF_PAGE_AUTHORITY_INVALID_ARGUMENT;
 	*out_preflight = NULL;
 	if (request == NULL || request->targets == NULL || request->target_count == 0
-		|| request->target_count > RF_PAGE_STABLE_MAX_EDGES || request->formation == NULL
-		|| request->fence_need_set == NULL || request->fence_admission_set == NULL
-		|| request->retention_pin == NULL || request->duties == NULL || request->root_tokens == NULL
-		|| request->participant_count == 0 || request->participant_count != 1 || request->flags != 0
+		|| request->target_count > RF_PAGE_STABLE_MAX_EDGES || request->participant_count == 0
+		|| request->participant_count > RF_PAGE_STABLE_MAX_PARTICIPANTS || request->flags != 0
 		|| timeout_ms < 0)
+		return RF_PAGE_AUTHORITY_INVALID_ARGUMENT;
+	if (request->source_authorities != NULL) {
+		if (request->formation != NULL || request->fence_need_set != NULL
+			|| request->fence_admission_set != NULL || request->retention_pin != NULL
+			|| request->duties != NULL || request->root_tokens != NULL)
+			return RF_PAGE_AUTHORITY_INVALID_ARGUMENT;
+	} else if (request->participant_count != 1 || request->formation == NULL
+			   || request->fence_need_set == NULL || request->fence_admission_set == NULL
+			   || request->retention_pin == NULL || request->duties == NULL
+			   || request->root_tokens == NULL)
 		return RF_PAGE_AUTHORITY_INVALID_ARGUMENT;
 	for (i = 0; i < request->target_count; i++) {
 		if (!authority_identity_valid(&request->targets[i].page_identity)
@@ -258,6 +284,7 @@ rf_page_authority_batch_preflight_wait_v1(const RfPageAuthorityBatchRequestV1 *r
 	preflight->duties = request->duties;
 	preflight->root_tokens = request->root_tokens;
 	preflight->participant_count = request->participant_count;
+	preflight->source_authorities = request->source_authorities;
 	for (i = 0; i < request->target_count; i++) {
 		preflight->targets[i] = request->targets[i];
 		if (!rf_page_guard_preflight_v1(&request->targets[i].page_identity,
@@ -266,7 +293,7 @@ rf_page_authority_batch_preflight_wait_v1(const RfPageAuthorityBatchRequestV1 *r
 			return RF_PAGE_AUTHORITY_INTERNAL;
 		}
 	}
-	if (!fence_current(preflight)) {
+	if (preflight->source_authorities == NULL && !fence_current(preflight)) {
 		authority_preflight_free(preflight);
 		return RF_PAGE_AUTHORITY_FENCE_STALE;
 	}
