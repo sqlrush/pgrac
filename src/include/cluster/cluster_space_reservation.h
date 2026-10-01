@@ -108,12 +108,20 @@ typedef struct ClusterSpaceRecoveryImage {
 	/* Input responsible for each final page, UINT32_MAX if unchanged by WAL. */
 	uint32 source_index[2];
 	uint8 apply_mask;
+	/* Existing canonical target covers omitted predecessor reservations.
+	 * Caller must prove these original target pages durable before publishing
+	 * any coverage. This is not permission to write unknown successor WAL. */
+	uint8 covered_by_successor_mask;
 } ClusterSpaceRecoveryImage;
 
-/* Validate one complete, nonbranching exact chain, then prepare both pages.
+/* Validate a complete, nonbranching structural chain, then prepare both pages.
  * order has count entries and preserves every structural action, even when
- * both pages already match the final result. Unknown targets and gaps refuse;
- * no numeric token/LSN ordering is evidence. All outputs stay intact on refusal.
+ * both pages already match the final result. ADVANCE-only input permits
+ * disjoint monotone ranges inside one exact LIVE identity. The observed
+ * target may cover earlier ranges; the remaining suffix must begin at its
+ * exact token/state. Such successor coverage is explicit in the output and
+ * still requires the original owner's physical durability qualification.
+ * No numeric token/LSN ordering is evidence. All outputs stay intact on refusal.
  * The original owner still performs physical actions, WAL/source revalidation,
  * write/fsync/post-read and contribution publication under its protected set. */
 extern bool cluster_space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs,
@@ -123,9 +131,10 @@ extern bool cluster_space_recovery_prepare(const ClusterSpaceRecoveryInput *inpu
 /* Heap scratch used by preparation, or zero for an unrepresentable size. */
 extern size_t cluster_space_recovery_scratch_bytes(uint32 count);
 
-/* Validate and order only the complete retained source chain. No target is
+/* Validate and order retained inputs (a full structural chain, or disjoint
+ * ADVANCE-only ranges in one LIVE identity). No target is
  * read or certified, no page image or mutation permission is returned. The
- * same chain checks are also mandatory in prepare with the real target. */
+ * same input checks are also mandatory in prepare with the real target. */
 extern bool cluster_space_recovery_order(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 										 const ClusterSpaceIdentityKey *expected, uint32 *order);
 

@@ -498,6 +498,104 @@ recovery_reservation_member(const ClusterSpaceReservation *target, uint64 target
 	return target_token == token && (token == 0 || reservation_equal(target, state));
 }
 
+/* ADVANCE is monotone only inside one exact LIVE incarnation. A survivor may
+ * own the missing intervals; no token/LSN ordering can stand in for those
+ * intervals. The original owner must durably qualify the observed target
+ * whenever it covers an omitted predecessor or an unknown later version. */
+static bool
+recovery_advances_prepare(SpaceRecoveryNode *nodes, uint32 count,
+						  const ClusterSpaceIdentity *target_id, uint64 target_id_token,
+						  const ClusterSpaceReservation *target_res, uint64 target_res_token,
+						  const void *identity_page, const void *reservation_page,
+						  SpaceRecoveryIndex *before, SpaceRecoveryIndex *result, uint32 *ordered,
+						  ClusterSpaceRecoveryImage *prepared, bool check_target)
+{
+	const ClusterSpaceIdentity *identity = &nodes[0].change.reservation.before.identity;
+	ClusterSpaceReservation current;
+	uint64 token;
+	bool gap = false, known_target = false;
+
+	qsort(before, count, sizeof(*before), recovery_index_compare);
+	qsort(result, count, sizeof(*result), recovery_index_compare);
+	for (uint32 i = 0; i < count; i++) {
+		ClusterSpaceReservationChange *change = &nodes[i].change.reservation;
+		uint32 previous;
+
+		if (i > 0
+			&& (before[i - 1].token == before[i].token || result[i - 1].token == result[i].token))
+			return false;
+		if (!recovery_identity_equal(identity, &change->before.identity))
+			return false;
+		previous = recovery_index_find(result, count, change->before_token);
+		if (previous != UINT32_MAX
+			&& !reservation_equal(&nodes[previous].change.reservation.result, &change->before))
+			return false;
+		if (check_target && target_res_token == change->before_token) {
+			if (!reservation_equal(target_res, &change->before))
+				return false;
+			known_target = true;
+		}
+		if (check_target && target_res_token == change->result_token) {
+			if (!reservation_equal(target_res, &change->result))
+				return false;
+			known_target = true;
+		}
+	}
+	/* Reuse bounded index scratch to sort allocation ranges, not opaque
+	 * mutation tokens. Overlapping or conflicting contiguous edges refuse. */
+	for (uint32 i = 0; i < count; i++)
+		before[i] = (SpaceRecoveryIndex){ nodes[i].change.reservation.before.next_block, i };
+	qsort(before, count, sizeof(*before), recovery_index_compare);
+	for (uint32 i = 0; i < count; i++) {
+		ClusterSpaceReservationChange *change = &nodes[before[i].index].change.reservation;
+		ordered[i] = before[i].index;
+		if (i > 0) {
+			ClusterSpaceReservationChange *previous = &nodes[ordered[i - 1]].change.reservation;
+			if (previous->result.next_block > change->before.next_block
+				|| (previous->result.next_block == change->before.next_block
+					&& previous->result_token != change->before_token))
+				return false;
+			gap |= previous->result.next_block < change->before.next_block;
+		}
+	}
+	if (!check_target)
+		return true;
+	if (target_id_token == 0 || target_res_token == 0
+		|| !recovery_identity_equal(identity, target_id)
+		|| !recovery_identity_equal(identity, &target_res->identity))
+		return false;
+	current = *target_res;
+	token = target_res_token;
+	prepared->source_index[0] = prepared->source_index[1] = UINT32_MAX;
+	for (uint32 i = 0; i < count; i++) {
+		ClusterSpaceReservationChange *change = &nodes[ordered[i]].change.reservation;
+		if (change->result.next_block <= current.next_block) {
+			if (change->result.next_block == current.next_block && change->result_token != token)
+				return false;
+			continue;
+		}
+		if (!recovery_reservation_member(&current, token, &change->before, change->before_token))
+			return false;
+		current = change->result;
+		token = change->result_token;
+		prepared->source_index[1] = ordered[i];
+	}
+	if (prepared->source_index[1] == UINT32_MAX && known_target)
+		prepared->source_index[1] = ordered[count - 1];
+	memcpy(prepared->pages[0].data, identity_page, BLCKSZ);
+	if (recovery_reservation_member(target_res, target_res_token, &current, token))
+		memcpy(prepared->pages[1].data, reservation_page, BLCKSZ);
+	else {
+		if (!cluster_space_reservation_page_encode(&current, token, prepared->pages[1].data,
+												   BLCKSZ))
+			return false;
+		prepared->apply_mask = 2;
+	}
+	if (gap || !known_target)
+		prepared->covered_by_successor_mask = 2;
+	return true;
+}
+
 static bool
 space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 					   const ClusterSpaceIdentityKey *expected, const void *identity_page,
@@ -556,6 +654,17 @@ space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 			goto done;
 		before[i] = (SpaceRecoveryIndex){change->before_token, i};
 		result[i] = (SpaceRecoveryIndex){change->result_token, i};
+	}
+	if (!has_structural) {
+		if (!recovery_advances_prepare(nodes, count, &target_id, target_id_token, &target_res,
+									   target_res_token, identity_page, reservation_page, before,
+									   result, ordered, &prepared, check_target))
+			goto done;
+		memcpy(order, ordered, (size_t)count * sizeof(*order));
+		if (check_target)
+			*out = prepared;
+		ok = true;
+		goto done;
 	}
 	qsort(before, count, sizeof(*before), recovery_index_compare);
 	qsort(result, count, sizeof(*result), recovery_index_compare);

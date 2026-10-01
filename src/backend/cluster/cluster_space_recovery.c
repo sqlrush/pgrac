@@ -224,28 +224,47 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply)
 													BufferGetPage(batch->buffers[1]), batch->order,
 													batch->operation_count, &count, &prepared)
 				   != RF_PAGE_PROOF_DETAIL_OK
-			|| prepared.source_index[0] != UINT32_MAX || prepared.source_index[1] == UINT32_MAX
-			|| !rf_side_online_plan_operation_v1(batch->side, prepared.source_index[1], &source))
+			|| prepared.source_index[0] != UINT32_MAX)
 			goto done;
-		PageSetLSNPreserveOrigin(prepared.pages[1].data, source.identity.record.end_rec_ptr);
-		if (!PageSetLSNOrigin(prepared.pages[1].data, source.identity.record.origin_thread - 1))
+		if (prepared.source_index[1] == UINT32_MAX) {
+			if (prepared.covered_by_successor_mask != 2 || prepared.apply_mask != 0)
+				goto done;
+		} else {
+			if (!rf_side_online_plan_operation_v1(batch->side, prepared.source_index[1], &source))
+				goto done;
+			PageSetLSNPreserveOrigin(prepared.pages[1].data, source.identity.record.end_rec_ptr);
+			if (!PageSetLSNOrigin(prepared.pages[1].data, source.identity.record.origin_thread - 1))
+				goto done;
+		}
+		/* A successor's bytes cannot borrow a failed origin's WAL owner.
+		 * Require its canonical physical image before qualifying coverage. */
+		if (prepared.covered_by_successor_mask != 0
+			&& !space_disk_matches(rel, 1, BufferGetPage(batch->buffers[1])))
 			goto done;
 		/* ADVANCE cannot supply missing identity-page bytes or their WAL. */
 		if (!space_disk_matches(rel, 0, prepared.pages[0].data))
 			goto done;
+		/* Re-prepare under this HW/current-X hold. A legitimate survivor
+		 * extension since preflight may cover the old cut; never overwrite
+		 * it with the previously prepared lower HWM. Rollback uses this
+		 * apply's own original bytes, not the earlier preflight snapshot. */
+		for (int i = 0; i < 2; i++)
+			memcpy(target->before[i].data, BufferGetPage(batch->buffers[i]), BLCKSZ);
+		target->final = prepared;
 		if (!apply) {
-			for (int i = 0; i < 2; i++)
-				memcpy(target->before[i].data, BufferGetPage(batch->buffers[i]), BLCKSZ);
-			target->final = prepared;
 			ok = true;
 			goto done;
 		}
-		/* Concurrent ordinary allocation is not overwritten, even if the
- * source still owns recovery of a failed predecessor. */
-		for (int i = 0; i < 2; i++)
-			if (memcmp(target->before[i].data, BufferGetPage(batch->buffers[i]), BLCKSZ) != 0
-				|| memcmp(target->final.pages[i].data, prepared.pages[i].data, BLCKSZ) != 0)
+		if (prepared.covered_by_successor_mask != 0) {
+			smgrimmedsync(rel, SPACE_FORKNUM);
+			if (!space_sources_fresh(batch) || !space_disk_matches(rel, 0, target->before[0].data)
+				|| !space_disk_matches(rel, 1, target->before[1].data))
 				goto done;
+			if (prepared.source_index[1] == UINT32_MAX) {
+				ok = true;
+				goto done;
+			}
+		}
 		if (!space_sources_fresh(batch))
 			goto done;
 		/* The strict MarkBufferDirty predicate was checked before entering

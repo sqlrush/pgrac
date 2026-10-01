@@ -647,10 +647,112 @@ UT_TEST(test_source_order_refuses_missing_or_inconsistent_chain_atomically)
 	UT_ASSERT(memcmp(order, saved, sizeof(order)) == 0);
 }
 
+UT_TEST(test_recovery_interleaved_advances_and_later_target)
+{
+	ClusterSpaceReservationChange changes[2] = { advance(), advance() };
+	uint8 wal[2][CLUSTER_SPACE_RESERVATION_WAL_BYTES];
+	ClusterSpaceRecoveryInput input[2];
+	ClusterSpaceRecoveryImage out;
+	PGAlignedBlock id, target;
+	uint32 order[2] = { 77, 77 };
+
+	/* Source A 11->18, survivor 18->25, source C 25->32. Arrival is
+	 * reversed and opaque tokens decrease. The survivor WAL is not input. */
+	changes[1].before.next_block = changes[1].first_block = 25;
+	changes[1].result.next_block = 32;
+	changes[1].before_token = 7;
+	changes[1].result_token = 3;
+	for (int i = 0; i < 2; i++) {
+		UT_ASSERT(cluster_space_reservation_wal_encode(&changes[i], wal[i], sizeof(wal[i])));
+		input[1 - i] = (ClusterSpaceRecoveryInput){ wal[i], sizeof(wal[i]) };
+	}
+	UT_ASSERT(cluster_space_recovery_order(input, 2, &changes[0].before.identity.key, order));
+	UT_ASSERT_EQ(order[0], 1);
+	UT_ASSERT_EQ(order[1], 0);
+	UT_ASSERT(
+		cluster_space_identity_page_encode(&changes[0].before.identity, 9001, id.data, BLCKSZ));
+	for (int variant = 0; variant < 3; variant++) {
+		ClusterSpaceReservation at = variant == 0 ? changes[1].before : changes[1].result;
+		uint64 token = variant == 0 ? 7 : 3;
+		if (variant == 2) {
+			at.next_block = 39;
+			token = 1;
+		}
+		UT_ASSERT(cluster_space_reservation_page_encode(&at, token, target.data, BLCKSZ));
+		memset(&out, 0, sizeof(out));
+		UT_ASSERT(cluster_space_recovery_prepare(input, 2, &at.identity.key, id.data, target.data,
+												 order, &out));
+		UT_ASSERT_EQ(out.covered_by_successor_mask, 2);
+		UT_ASSERT_EQ(out.source_index[0], UINT32_MAX);
+		UT_ASSERT_EQ(out.source_index[1], variant == 2 ? UINT32_MAX : 0);
+		UT_ASSERT_EQ(out.apply_mask, variant == 0 ? 2 : 0);
+		UT_ASSERT(memcmp(out.pages[0].data, id.data, BLCKSZ) == 0);
+		if (variant != 0)
+			UT_ASSERT(memcmp(out.pages[1].data, target.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_recovery_successor_does_not_cover_gaps_ahead_or_conflicts)
+{
+	for (int variant = 0; variant < 7; variant++) {
+		ClusterSpaceReservationChange changes[2] = { advance(), advance() };
+		ClusterSpaceReservation at;
+		uint8 wal[2][CLUSTER_SPACE_RESERVATION_WAL_BYTES];
+		ClusterSpaceRecoveryInput input[2];
+		ClusterSpaceRecoveryImage out, saved;
+		PGAlignedBlock id, target;
+		uint32 order[2] = { 77, 77 };
+		uint64 token = 1;
+		changes[1].before.next_block = changes[1].first_block = 25;
+		changes[1].result.next_block = 32;
+		changes[1].before_token = 7;
+		changes[1].result_token = 3;
+		at = changes[0].before;
+		at.next_block = 39;
+		if (variant == 0) {
+			at = changes[0].before;
+			token = changes[0].before_token;
+		}
+		if (variant == 1) {
+			at.next_block = 32;
+			token = 2;
+		} /* equal HWM, wrong version */
+		if (variant == 2)
+			token = changes[0].result_token; /* known token, false bytes */
+		if (variant == 3) {
+			changes[1].before.next_block = changes[1].first_block = 17;
+			changes[1].result.next_block = 24; /* overlapping allocations */
+		}
+		if (variant == 4)
+			changes[1].before_token = changes[0].result_token; /* false link */
+		if (variant == 5)
+			changes[1].result_token = changes[0].result_token; /* merge */
+		if (variant == 6) {
+			changes[1].before.identity.incarnation[0]++;
+			changes[1].result.identity = changes[1].before.identity;
+		}
+		for (int i = 0; i < 2; i++) {
+			UT_ASSERT(cluster_space_reservation_wal_encode(&changes[i], wal[i], sizeof(wal[i])));
+			input[i] = (ClusterSpaceRecoveryInput){ wal[i], sizeof(wal[i]) };
+		}
+		UT_ASSERT(cluster_space_identity_page_encode(&at.identity, 9001, id.data, BLCKSZ));
+		UT_ASSERT(cluster_space_reservation_page_encode(&at, token, target.data, BLCKSZ));
+		memset(&saved, 0xa5, sizeof(saved));
+		out = saved;
+		UT_ASSERT(!cluster_space_recovery_prepare(input, 2, &at.identity.key, id.data, target.data,
+												  order, &out));
+		UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+		UT_ASSERT_EQ(order[0], 77);
+		UT_ASSERT_EQ(order[1], 77);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(19);
+	UT_RUN(test_recovery_interleaved_advances_and_later_target);
+	UT_RUN(test_recovery_successor_does_not_cover_gaps_ahead_or_conflicts);
 	UT_RUN(test_source_order_never_needs_or_certifies_target_pages);
 	UT_RUN(test_source_order_refuses_missing_or_inconsistent_chain_atomically);
 	UT_RUN(test_literal_unaligned_payload_and_wal);

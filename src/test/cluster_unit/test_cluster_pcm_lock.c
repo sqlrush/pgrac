@@ -102,6 +102,7 @@ UT_DEFINE_GLOBALS();
 
 int cluster_node_id = 0;
 bool cluster_enabled = false;
+bool cluster_shared_config = false;
 bool IsUnderPostmaster = false;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 int NBuffers = 0;
@@ -18127,6 +18128,42 @@ UT_TEST(test_pcm_x_transfer_commit_is_exact_and_late_reply_safe)
 }
 
 
+UT_TEST(test_dead_space_reservation_holder_cannot_become_cold_n)
+{
+	BufferTag tag = make_tag(95);
+	ResourceXDecodedFrame request, reply;
+	ResourceXMasterSnapshot snapshot = { 0 };
+
+	tag.forkNum = SPACE_FORKNUM;
+	tag.blockNum = 1;
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0; /* live resource home; the writer is a different node */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_X, 2),
+				 PCM_GCS_TRANSITION_APPLIED);
+	cluster_shared_config = true;
+	fake_cssd_dead_node = 2;
+	UT_ASSERT_EQ(cluster_pcm_lock_cleanup_on_node_dead(2), 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_query(tag), PCM_LOCK_MODE_X);
+	UT_ASSERT_EQ(cluster_pcm_master_holder_node_by_tag(tag), 2);
+	request = make_resource_x_bootstrap_request(tag, 1);
+	request.common.flags = UINT8_C(0x08);
+	request.common.semantic_crc32c = 0;
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_bootstrap_request_exact(&request, 1, 61, 77, 31, 71, &reply),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(reply.kind, RESOURCE_X_WIRE_ASSERT_X);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+					 &request.common.logical_assertion, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
+	UT_ASSERT_EQ(snapshot.incompatible_holders_bitmap, UINT32_C(1) << 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_query(tag), PCM_LOCK_MODE_X);
+	cluster_shared_config = false;
+	fake_cssd_dead_node = -1;
+}
+
 UT_TEST(test_pcm_dead_node_cleanup_drops_holder_records)
 {
 	BufferTag stag = make_tag(94);
@@ -19197,7 +19234,7 @@ UT_TEST(test_stop_seal_keeps_original_identity_validation_first)
 int
 main(void)
 {
-	UT_PLAN(282);
+	UT_PLAN(283);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -19457,6 +19494,7 @@ main(void)
 	UT_RUN(test_pcm_acquire_buffer_routes_unchanged_remote_x_with_exact_authority);
 	UT_RUN(test_pcm_x_transfer_commit_is_exact_and_late_reply_safe);
 	UT_RUN(test_pcm_dead_node_cleanup_drops_holder_records);
+	UT_RUN(test_dead_space_reservation_holder_cannot_become_cold_n);
 	UT_RUN(test_pcm_authority_snapshot_is_one_entry_lock_view);
 	UT_RUN(test_pcm_r4_route_snapshot_co_samples_master_generation_and_watermark);
 	UT_RUN(test_pcm_queue_pending_x_reservation_never_overwrites_another_node);

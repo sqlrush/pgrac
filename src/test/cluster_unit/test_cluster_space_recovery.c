@@ -885,10 +885,115 @@ UT_TEST(test_physical_checksum_is_strict)
 	}
 }
 
+static void
+survivor_advance(BlockNumber next, uint64 token, bool durable)
+{
+	ClusterSpaceReservation value = changes[0].before;
+	value.next_block = next;
+	UT_ASSERT(cluster_space_reservation_page_encode(&value, token, pages[1].data, BLCKSZ));
+	PageSetLSNPreserveOrigin(pages[1].data, 987);
+	UT_ASSERT(PageSetLSNOrigin(pages[1].data, 0));
+	if (durable) {
+		UT_ASSERT_EQ(pwrite(fileno(file), PageSetChecksumCopy(pages[1].data, 1), BLCKSZ, BLCKSZ),
+					 BLCKSZ);
+		UT_ASSERT_EQ(fsync(fileno(file)), 0);
+	} else
+		pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_DIRTY);
+}
+
+UT_TEST(test_interleaved_writers_use_durable_successor_before_suffix)
+{
+	ClusterSpaceRecoveryBatchV1 *batch = NULL;
+	ClusterSpaceReservation got;
+	uint64 token;
+	reset();
+	changes[1].before.next_block = changes[1].first_block = 9;
+	changes[1].result.next_block = 13;
+	changes[1].before_token = 7;
+	UT_ASSERT(cluster_space_reservation_wal_encode(&changes[1], payload[1], sizeof(payload[1])));
+	make_plan();
+	survivor_advance(9, 7, true);
+	UT_ASSERT(cluster_space_recovery_preflight_v1(fabric, sources, 2, &batch));
+	if (!batch)
+		return;
+	UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(syncs, 2); /* original survivor base, then recovered suffix */
+	UT_ASSERT(cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1, &key,
+													&got, &token));
+	UT_ASSERT_EQ(got.next_block, 13);
+	UT_ASSERT_EQ(token, 19);
+	cluster_space_recovery_destroy_v1(&batch);
+}
+
+UT_TEST(test_survivor_extension_after_preflight_is_not_overwritten)
+{
+	ClusterSpaceRecoveryBatchV1 *batch = NULL;
+	PGAlignedBlock before;
+	reset();
+	UT_ASSERT(cluster_space_recovery_preflight_v1(fabric, sources, 2, &batch));
+	if (!batch)
+		return;
+	survivor_advance(15, 7, true);
+	before = pages[1];
+	UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT_EQ(syncs, 1);
+	UT_ASSERT(memcmp(pages[1].data, before.data, BLCKSZ) == 0);
+	cluster_space_recovery_destroy_v1(&batch);
+}
+
+UT_TEST(test_install_then_survivor_extend_then_retry)
+{
+	ClusterSpaceRecoveryBatchV1 *batch = NULL;
+	PGAlignedBlock before;
+	reset();
+	UT_ASSERT(cluster_space_recovery_preflight_v1(fabric, sources, 2, &batch));
+	if (!batch)
+		return;
+	UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+	cluster_space_recovery_destroy_v1(&batch);
+	survivor_advance(15, 7, true);
+	before = pages[1];
+	UT_ASSERT(cluster_space_recovery_preflight_v1(fabric, sources, 2, &batch));
+	if (!batch)
+		return;
+	UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+	UT_ASSERT_EQ(writes, 1); /* only the original install */
+	UT_ASSERT_EQ(syncs, 2);
+	UT_ASSERT(memcmp(pages[1].data, before.data, BLCKSZ) == 0);
+	cluster_space_recovery_destroy_v1(&batch);
+}
+
+UT_TEST(test_successor_cache_without_physical_proof_refuses)
+{
+	for (int variant = 0; variant < 2; variant++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		PGAlignedBlock before;
+		reset();
+		if (variant == 1)
+			UT_ASSERT(cluster_space_recovery_preflight_v1(fabric, sources, 2, &batch));
+		survivor_advance(15, 7, false);
+		before = pages[1];
+		if (variant == 0)
+			UT_ASSERT(!cluster_space_recovery_preflight_v1(fabric, sources, 2, &batch));
+		else
+			UT_ASSERT(!cluster_space_recovery_apply_v1(batch));
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(syncs, 0);
+		UT_ASSERT(memcmp(pages[1].data, before.data, BLCKSZ) == 0);
+		cluster_space_recovery_destroy_v1(&batch);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(13);
+	UT_RUN(test_interleaved_writers_use_durable_successor_before_suffix);
+	UT_RUN(test_survivor_extension_after_preflight_is_not_overwritten);
+	UT_RUN(test_install_then_survivor_extend_then_retry);
+	UT_RUN(test_successor_cache_without_physical_proof_refuses);
 	UT_RUN(test_actual_reservation_install_and_repeat);
 	UT_RUN(test_sources_and_structure_refuse_before_mutation);
 	UT_RUN(test_target_and_late_authority_refuse);

@@ -51,6 +51,7 @@
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_space_reservation.h"
 #include "miscadmin.h"
 #include "port/atomics.h" /* PGRAC: spec-2.30 D1 — pg_atomic_uint32/64 */
 #include "portability/instr_time.h"
@@ -5717,6 +5718,17 @@ cluster_pcm_lock_cleanup_on_node_dead(int32 dead_node)
 			continue;
 
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		/* A dead canonical reservation writer may have durable grants that
+		 * have not reached SPACE DATA yet. DEAD is not a recovery proof:
+		 * preserving its X prevents a live master from advertising cold N
+		 * and reallocating those blocks. Only the typed recovery owner may
+		 * install the recovered HWM and retire this exact holder. */
+		if (cluster_shared_config && entry->tag.forkNum == SPACE_FORKNUM
+			&& entry->tag.blockNum == CLUSTER_SPACE_RESERVATION_BLOCK
+			&& entry->x_holder_node == dead_node) {
+			LWLockRelease(&entry->entry_lock.lock);
+			continue;
+		}
 		before_state = (PcmState)pg_atomic_read_u32(&entry->master_state);
 		master_holder_was_dead
 			= pcm_master_holder_is_valid(entry) && (int32)entry->master_holder.node_id == dead_node;
