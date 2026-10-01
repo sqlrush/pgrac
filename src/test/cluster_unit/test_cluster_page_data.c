@@ -18,6 +18,8 @@
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_writer.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -43,6 +45,7 @@ int cluster_node_id = 0, NBuffers = 2, NLocBuffer;
 bool cluster_enabled = true, cluster_shared_config = true, cluster_shared_catalog = true;
 bool cluster_smart_fusion, cluster_past_image;
 ResourceOwner CurrentResourceOwner = (void *)1;
+BackendType MyBackendType = B_BG_WRITER;
 MemoryContext TopMemoryContext = (void *)1;
 BufferUsage pgBufferUsage;
 static BufferDescPadded descriptors[2];
@@ -67,6 +70,8 @@ static FILE *file;
 static SMgrRelationData relation;
 static ClusterPageDataTargetV1 target;
 static ClusterWalSourceRef writer;
+static uint64 ack_writer_epoch = 1, ack_boot = 9;
+static bool ack_writer_ready = true, ack_epoch_race;
 static void *page_sources_memory;
 static bool source_capture;
 static ClusterSpaceIdentity identity;
@@ -79,6 +84,26 @@ static bool cluster_pcm_x_finish_retain_flush_fault_active;
 #define CLUSTER_INJECTION_POINT(name) ((void)0)
 #define cluster_injection_should_skip(name) false
 #endif
+
+/* Original native token/boot are the external boundary for this buffer
+ * fixture. test_cluster_wal_writer exercises their actual native owner. */
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	return ack_boot;
+}
+
+ClusterControlRootResult
+cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!ack_writer_ready || timeline != writer.timeline)
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	out->ref = writer;
+	out->epoch = ack_writer_epoch;
+	out->startup_first_lsn = 0x80;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
 
 void
 ExceptionalCondition(const char *a, const char *b, int c)
@@ -415,6 +440,10 @@ static bool
 InvalidateBufferCommitLocked(BufferDesc *buf, BufferTag *tag, uint32 hash, LWLock *partition,
 							 uint32 state)
 {
+	if (ack_epoch_race) {
+		ack_writer_epoch++;
+		ack_epoch_race = false;
+	}
 	UT_ASSERT(state & BM_LOCKED);
 	UT_ASSERT(BufferTagsEqual(&buf->tag, tag));
 	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(state), 0);
@@ -487,6 +516,12 @@ reset(void)
 {
 	PageHeader p = (PageHeader)pages[1].data;
 	local_insert_end = 0x500;
+	ack_writer_epoch = 1;
+	ack_boot = 9;
+	ack_writer_ready = true;
+	ack_epoch_race = false;
+	CurrentResourceOwner = (void *)1;
+	MyBackendType = B_BG_WRITER;
 	cluster_node_id = 0;
 	if (file)
 		fclose(file);
@@ -1511,6 +1546,118 @@ physical_pi_discard_is_ancestry_and_generation_exact(void)
 }
 
 static void
+physical_ack_requires_actual_consumption_and_original_boot(void)
+{
+	for (int c = 0; c < 11; c++) {
+		ClusterWalSourceRef sources[3], native;
+		ClusterPcmPiStorageCutV1 cut;
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		ClusterPiPhysicalAckV1 *ack = NULL;
+		RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &cut);
+		int32 node = 99;
+		native = writer;
+		if (c == 4) {
+			rf_page_online_plan_destroy_v1(&plan);
+			sources[0].claim.identity.origin_owner_incarnation--;
+			plan = data_contribution_plan(sources);
+		}
+		if (c == 7)
+			cut.pi_holders_bitmap = 6;
+		UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt));
+		physical_pi_from_source(&sources[0], 80);
+		writer = native;
+		if (c == 1)
+			resident[1] = false;
+		if (c == 2) {
+			descriptors[1].bufferdesc.pcm_state = PCM_STATE_S;
+			descriptors[1].bufferdesc.buffer_type = BUF_TYPE_SCUR;
+			pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_VALID);
+		}
+		if (c == 3)
+			pg_atomic_fetch_add_u32(&descriptors[1].bufferdesc.state, 1);
+		if (c == 5)
+			ack_writer_ready = false;
+		if (c == 6)
+			ack_boot++;
+		if (c == 8)
+			CurrentResourceOwner = NULL;
+		if (c == 9)
+			MyBackendType = B_LMON;
+		if (c == 10)
+			ack_epoch_race = true;
+		UT_ASSERT_EQ(cluster_bufmgr_ack_pi_at_data_v1(receipt, plan, sources, 3, &ack), c < 3);
+		UT_ASSERT_EQ(pi_discards, c == 0 || c == 10 ? 1 : 0);
+		if (c < 3) {
+			UT_ASSERT(cluster_page_data_pi_ack_read_v1(ack, receipt, &node));
+			UT_ASSERT_EQ(node, 0);
+		} else
+			UT_ASSERT(ack == NULL);
+		if (c == 10) {
+			/* Failure after discard keeps master responsibility; a retry
+			 * observes actual absence under the new token. */
+			UT_ASSERT(cluster_bufmgr_ack_pi_at_data_v1(receipt, plan, sources, 3, &ack));
+			UT_ASSERT(cluster_page_data_pi_ack_read_v1(ack, receipt, &node));
+			UT_ASSERT_EQ(pi_discards, 1);
+		}
+		cluster_page_data_pi_ack_free_v1(&ack);
+		UT_ASSERT(ack == NULL);
+		CurrentResourceOwner = (void *)1;
+		MyBackendType = B_BG_WRITER;
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&plan);
+		clean();
+	}
+}
+
+static void
+physical_ack_cannot_change_data_cut_or_owner(void)
+{
+	ClusterWalSourceRef sources[3];
+	ClusterPcmPiStorageCutV1 cut;
+	ClusterPageDataReceiptV1 *receipt = NULL;
+	ClusterPiPhysicalAckV1 *ack = NULL;
+	RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &cut);
+	ClusterPageDataReceiptV1 original;
+	ClusterWalSourceRef native = writer;
+	int32 node;
+	UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt));
+	physical_pi_from_source(&sources[0], 80);
+	UT_ASSERT(cluster_bufmgr_ack_pi_at_data_v1(receipt, plan, sources, 3, &ack));
+	original = *receipt;
+	for (int c = 0; c < 8; c++) {
+		if (c == 0)
+			receipt->target.version.mutation_token++;
+		if (c == 1)
+			receipt->wal.record_crc++;
+		if (c == 2)
+			receipt->storage_cut.authority.transition_count++;
+		if (c == 3)
+			CurrentResourceOwner = (void *)2;
+		if (c == 4)
+			ack_writer_epoch++;
+		if (c == 5)
+			writer.claim.identity.authority_uuid[0]++;
+		if (c == 6)
+			ack_boot++;
+		if (c == 7)
+			cluster_node_id = 1;
+		UT_ASSERT(!cluster_page_data_pi_ack_read_v1(ack, receipt, &node));
+		UT_ASSERT_EQ(node, -1);
+		*receipt = original;
+		CurrentResourceOwner = (void *)1;
+		ack_writer_epoch = 1;
+		writer = native;
+		ack_boot = 9;
+		cluster_node_id = 0;
+		UT_ASSERT(cluster_page_data_pi_ack_read_v1(ack, receipt, &node));
+	}
+	cluster_page_data_pi_ack_free_v1(&ack);
+	cluster_page_data_receipt_free_v1(&receipt);
+	rf_page_online_plan_destroy_v1(&plan);
+	clean();
+}
+
+static void
 same_claim_data_under_later_root_ceiling(void)
 {
 	ClusterWalSourceRef sources[3];
@@ -1617,7 +1764,9 @@ physical_pi_newer_than_actual_data_is_not_discarded(void)
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(22);
+	UT_RUN(physical_ack_requires_actual_consumption_and_original_boot);
+	UT_RUN(physical_ack_cannot_change_data_cut_or_owner);
 	UT_RUN(same_claim_data_under_later_root_ceiling);
 	UT_RUN(same_claim_pi_under_later_root_ceiling);
 	UT_RUN(success_and_old_completion);

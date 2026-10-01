@@ -82,6 +82,8 @@
 #include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_writer.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/storage/cluster_smgr.h"
 
 /*
@@ -10506,6 +10508,15 @@ struct ClusterPageDataReceiptV1 {
 	ClusterPcmPiStorageCutV1 storage_cut;
 };
 
+struct ClusterPiPhysicalAckV1 {
+	uint64 magic;
+	ClusterPageDataReceiptV1 data;
+	ClusterWalWriterToken writer;
+	ResourceOwner owner;
+	pid_t pid;
+	int32 node;
+};
+
 /* Neither a tag nor a pin grants write authority. Check every live fence
  * while the original descriptor remains content-locked. SPACE may be S;
  * DATA must be the current X holder. Do not borrow an in-flight transfer. */
@@ -11217,6 +11228,106 @@ cluster_bufmgr_discard_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 	if (InvalidateBufferCommitLocked(buf, &tag, hash, partition, state))
 		result = CLUSTER_PI_PHYSICAL_DISCARDED;
 	return result;
+}
+
+static bool
+cluster_pi_ack_local_writer(ClusterWalWriterToken *out)
+{
+	ClusterWalSourceRef source;
+	uint64 boot = cluster_qvotec_get_self_incarnation();
+	return cluster_enabled && cluster_shared_config && !RecoveryInProgress()
+		   && (MyBackendType == B_BG_WORKER || MyBackendType == B_BG_WRITER
+			   || MyBackendType == B_CHECKPOINTER)
+		   && CurrentResourceOwner != NULL && cluster_node_id >= 0
+		   && cluster_node_id < RESOURCE_X_PROTOCOL_NODE_LIMIT && boot != 0 && boot != UINT64_MAX
+		   && cluster_wal_thread_current_v2_ref(&source)
+		   && source.claim.identity.origin_node_id == cluster_node_id
+		   && source.claim.identity.origin_owner_incarnation == boot
+		   && cluster_wal_writer_begin(source.timeline, out) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		   && cluster_page_data_source_same(&source, &out->ref);
+}
+
+bool
+cluster_bufmgr_ack_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
+								 const RfPageOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
+								 uint32 source_count, ClusterPiPhysicalAckV1 **out)
+{
+	ClusterWalWriterToken writer, after;
+	ClusterPcmPiWriteCutV1 x_cut;
+	ClusterPcmPiStorageCutV1 storage_cut;
+	ClusterPiPhysicalAckV1 *ack;
+	ClusterPiPhysicalResultV1 result;
+	uint32 expected;
+	bool found = false;
+
+	if (out == NULL || *out != NULL || sources == NULL || source_count == 0
+		|| source_count > RF_PAGE_STABLE_MAX_PARTICIPANTS || !cluster_pi_ack_local_writer(&writer))
+		return false;
+	if (cluster_page_data_pi_proof_v1(receipt, plan, sources, source_count, &x_cut))
+		expected = x_cut.pi_holders_bitmap;
+	else if (cluster_page_data_pi_storage_proof_v1(receipt, plan, sources, source_count,
+												   &storage_cut))
+		expected = storage_cut.pi_holders_bitmap;
+	else
+		return false;
+	if ((expected & ((uint32)1u << cluster_node_id)) == 0)
+		return false;
+	for (uint32 i = 0; i < source_count; i++) {
+		const ClusterWalSourceRef *source = &sources[i];
+		if (source->claim.identity.origin_node_id != cluster_node_id)
+			continue;
+		/* Current memory cannot answer for a prior incarnation. Even an
+		 * absent buffer or a CLOSED root is not old-process retirement. */
+		if (source->claim.identity.origin_owner_incarnation
+			!= writer.ref.claim.identity.origin_owner_incarnation)
+			return false;
+		if (cluster_page_data_source_covered_by(&writer.ref, source))
+			found = true;
+	}
+	if (!found)
+		return false;
+	result = cluster_bufmgr_discard_pi_at_data_v1(receipt, plan, sources, source_count);
+	if ((result != CLUSTER_PI_PHYSICAL_ABSENT && result != CLUSTER_PI_PHYSICAL_REPLACED
+		 && result != CLUSTER_PI_PHYSICAL_DISCARDED)
+		|| !cluster_pi_ack_local_writer(&after) || memcmp(&writer, &after, sizeof(writer)) != 0)
+		return false;
+	ack = palloc0(sizeof(*ack));
+	ack->magic = UINT64_C(0x5047504941434b31);
+	ack->data = *receipt;
+	ack->writer = writer;
+	ack->owner = CurrentResourceOwner;
+	ack->pid = getpid();
+	ack->node = cluster_node_id;
+	*out = ack;
+	return true;
+}
+
+bool
+cluster_page_data_pi_ack_read_v1(const ClusterPiPhysicalAckV1 *ack,
+								 const ClusterPageDataReceiptV1 *receipt, int32 *out_node)
+{
+	ClusterWalWriterToken current;
+	if (out_node != NULL)
+		*out_node = -1;
+	if (ack == NULL || receipt == NULL || out_node == NULL
+		|| ack->magic != UINT64_C(0x5047504941434b31) || ack->pid != getpid()
+		|| ack->owner != CurrentResourceOwner || ack->node != cluster_node_id
+		|| memcmp(&ack->data, receipt, sizeof(*receipt)) != 0
+		|| !cluster_pi_ack_local_writer(&current)
+		|| memcmp(&ack->writer, &current, sizeof(current)) != 0)
+		return false;
+	*out_node = ack->node;
+	return true;
+}
+
+void
+cluster_page_data_pi_ack_free_v1(ClusterPiPhysicalAckV1 **ack)
+{
+	if (ack == NULL || *ack == NULL)
+		return;
+	explicit_bzero(*ack, sizeof(**ack));
+	pfree(*ack);
+	*ack = NULL;
 }
 #endif
 

@@ -115,6 +115,24 @@ cluster_bufmgr_discard_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 									 const RfPageOnlinePlanV1 *plan,
 									 const ClusterWalSourceRef *sources, uint32 source_count);
 
+typedef struct ClusterPiPhysicalAckV1 ClusterPiPhysicalAckV1;
+
+/* Actual local physical completion, qualified for the original writer/boot.
+ * It covers this instance only, and refuses retained sources from its older
+ * boots until their separate retirement owner is connected. Remote node ids,
+ * caller bitmaps and physical-result enums cannot construct an acknowledgement.
+ * The caller retains the complete input scope throughout this background job.
+ * Output must start NULL; failure leaves it unchanged. The acknowledgement is
+ * process/ResourceOwner local, never a wire object or ROOT/GC permission. */
+extern bool cluster_bufmgr_ack_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
+											 const RfPageOnlinePlanV1 *plan,
+											 const ClusterWalSourceRef *sources,
+											 uint32 source_count, ClusterPiPhysicalAckV1 **out);
+extern bool cluster_page_data_pi_ack_read_v1(const ClusterPiPhysicalAckV1 *ack,
+											 const ClusterPageDataReceiptV1 *receipt,
+											 int32 *out_node);
+extern void cluster_page_data_pi_ack_free_v1(ClusterPiPhysicalAckV1 **ack);
+
 static inline bool
 cluster_pcm_pi_write_cut_valid_v1(const ClusterPcmPiWriteCutV1 *cut)
 {
@@ -166,13 +184,24 @@ extern bool cluster_page_data_pi_proof_v1(const ClusterPageDataReceiptV1 *receip
 										  const ClusterWalSourceRef *sources, uint32 source_count,
 										  ClusterPcmPiWriteCutV1 *out);
 
-/* Clear only the unchanged master cut after exact DATA/ancestry proof.
- * The caller retains the returned holders until their background discard
- * notification is delivered. An unchanged already-cleared cut is idempotent.
- * False clears holders_out but no shared state. */
+/* Clear only the unchanged master cut after exact DATA/ancestry proof AND
+ * qualified physical acknowledgements for every original holder. Missing,
+ * duplicate or foreign-cut acknowledgements never retire a subset. A retry
+ * against an unchanged already-cleared cut is idempotent. holders_out reports
+ * the completed set, never a queue of notifications still owed. The retained
+ * input scope must remain valid; these endpoints do not authorize ROOT/GC.
+ * False clears holders_out but no shared directory state. */
 extern bool cluster_pcm_lock_pi_write_complete_v1(const ClusterPageDataReceiptV1 *receipt,
 												  const RfPageOnlinePlanV1 *plan,
 												  const ClusterWalSourceRef *sources,
-												  uint32 source_count, uint32 *holders_out);
+												  uint32 source_count,
+												  const ClusterPiPhysicalAckV1 *const *acks,
+												  uint32 ack_count, uint32 *holders_out);
+extern bool cluster_pcm_lock_pi_storage_complete_v1(const ClusterPageDataReceiptV1 *receipt,
+													const RfPageOnlinePlanV1 *plan,
+													const ClusterWalSourceRef *sources,
+													uint32 source_count,
+													const ClusterPiPhysicalAckV1 *const *acks,
+													uint32 ack_count, uint32 *holders_out);
 #endif
 #endif /* CLUSTER_PI_WRITE_H */

@@ -10007,10 +10007,34 @@ cluster_pcm_lock_pi_write_snapshot_v1(BufferTag tag, ClusterPcmPiWriteCutV1 *out
 	return valid;
 }
 
+/* All potentially allocating proof work precedes directory locks. Only the
+ * original physical owner can expose a node for this exact DATA/cut. */
+static bool
+pcm_pi_acks_complete(const ClusterPageDataReceiptV1 *receipt, uint32 expected,
+					 const ClusterPiPhysicalAckV1 *const *acks, uint32 count)
+{
+	uint32 confirmed = 0;
+	if (expected == 0 || acks == NULL || count == 0 || count > RESOURCE_X_PROTOCOL_NODE_LIMIT)
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		int32 node;
+		uint32 bit;
+		if (!cluster_page_data_pi_ack_read_v1(acks[i], receipt, &node) || node < 0
+			|| node >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
+			return false;
+		bit = (uint32)1u << node;
+		if ((expected & bit) == 0 || (confirmed & bit) != 0)
+			return false;
+		confirmed |= bit;
+	}
+	return confirmed == expected;
+}
+
 bool
 cluster_pcm_lock_pi_write_complete_v1(const ClusterPageDataReceiptV1 *receipt,
 									  const RfPageOnlinePlanV1 *plan,
 									  const ClusterWalSourceRef *sources, uint32 source_count,
+									  const ClusterPiPhysicalAckV1 *const *acks, uint32 ack_count,
 									  uint32 *holders_out)
 {
 	ClusterPcmPiWriteCutV1 cut, current;
@@ -10024,6 +10048,7 @@ cluster_pcm_lock_pi_write_complete_v1(const ClusterPageDataReceiptV1 *receipt,
 		|| cluster_pcm_htab == NULL
 		|| !cluster_page_data_pi_proof_v1(receipt, plan, sources, source_count, &cut)
 		|| !cluster_pcm_pi_write_cut_valid_v1(&cut) || cut.pi_holders_bitmap == 0
+		|| !pcm_pi_acks_complete(receipt, cut.pi_holders_bitmap, acks, ack_count)
 		|| cut.master_node != cluster_node_id
 		|| cluster_gcs_lookup_master(cut.holder.assertion.resource) != cluster_node_id)
 		return false;
@@ -10032,8 +10057,50 @@ cluster_pcm_lock_pi_write_complete_v1(const ClusterPageDataReceiptV1 *receipt,
 	if (found && entry != NULL) {
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
 		if (pcm_pi_write_snapshot_locked(entry, &current)) {
-			/* A retry may resend the same qualified notification. New PI
+			/* Every physical notification is already confirmed. New PI
 			 * from another handoff changes the holder/transition cut. */
+			if (current.pi_holders_bitmap == 0 && entry->pi_watermark_lsn == InvalidXLogRecPtr
+				&& entry->pi_watermark_scn == InvalidScn)
+				current.pi_holders_bitmap = cut.pi_holders_bitmap;
+			if (memcmp(&cut, &current, sizeof(cut)) == 0) {
+				*holders_out = cut.pi_holders_bitmap;
+				pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
+				entry->pi_watermark_lsn = InvalidXLogRecPtr;
+				entry->pi_watermark_scn = InvalidScn;
+				complete = true;
+			}
+		}
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	return complete;
+}
+
+bool
+cluster_pcm_lock_pi_storage_complete_v1(const ClusterPageDataReceiptV1 *receipt,
+										const RfPageOnlinePlanV1 *plan,
+										const ClusterWalSourceRef *sources, uint32 source_count,
+										const ClusterPiPhysicalAckV1 *const *acks, uint32 ack_count,
+										uint32 *holders_out)
+{
+	ClusterPcmPiStorageCutV1 cut, current;
+	struct GrdEntry *entry;
+	bool found, complete = false;
+	if (holders_out != NULL)
+		*holders_out = 0;
+	if (holders_out == NULL || !cluster_shared_config || ClusterPcm == NULL
+		|| cluster_pcm_htab == NULL
+		|| !cluster_page_data_pi_storage_proof_v1(receipt, plan, sources, source_count, &cut)
+		|| !cluster_pcm_pi_storage_cut_valid_v1(&cut) || cut.pi_holders_bitmap == 0
+		|| !pcm_pi_acks_complete(receipt, cut.pi_holders_bitmap, acks, ack_count)
+		|| cut.master_node != cluster_node_id
+		|| cluster_gcs_lookup_master(cut.resource) != cluster_node_id)
+		return false;
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = hash_search(cluster_pcm_htab, &cut.resource, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		if (pcm_pi_storage_snapshot_locked(entry, &current)) {
 			if (current.pi_holders_bitmap == 0 && entry->pi_watermark_lsn == InvalidXLogRecPtr
 				&& entry->pi_watermark_scn == InvalidScn)
 				current.pi_holders_bitmap = cut.pi_holders_bitmap;
