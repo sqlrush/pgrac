@@ -217,7 +217,9 @@ typedef enum ClusterHwColdBootMode {
 	CLUSTER_HW_BOOT_UNCLASSIFIED = 0,
 	CLUSTER_HW_BOOT_DISABLED,
 	CLUSTER_HW_BOOT_NORMAL_SELF,
-	CLUSTER_HW_BOOT_EXISTING_RECOVERY
+	CLUSTER_HW_BOOT_EXISTING_RECOVERY,
+	/* SPACE buffers own reservations; this does not make the old cache READY. */
+	CLUSTER_HW_BOOT_CANONICAL_SPACE
 } ClusterHwColdBootMode;
 
 typedef enum ClusterHwColdBootState {

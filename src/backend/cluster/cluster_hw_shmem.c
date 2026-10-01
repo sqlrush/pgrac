@@ -350,6 +350,12 @@ cluster_hw_try_advance(const ClusterResId *resid, uint32 want, BlockNumber seed_
 	Assert(resid != NULL && first != NULL && granted != NULL && new_hwm != NULL);
 	Assert(want > 0);
 
+	/* Shared reservations come from the exact SPACE current page, including
+	 * after restart/remaster. No old READY state or FileSize seed may grant. */
+	if (cluster_shared_config) {
+		cluster_hw_bump_not_ready();
+		return CLUSTER_HW_NOT_READY;
+	}
 	if (hw_htab == NULL)
 		return CLUSTER_HW_FULL; /* shmem absent: caller fails closed */
 	boot_mode = cluster_hw_cold_boot_mode();
@@ -774,7 +780,7 @@ cluster_hw_startup_prepare(bool in_recovery, bool own_clean_shutdown, XLogRecPtr
 	if (failure_out == NULL)
 		return false;
 	*failure_out = "STARTUP_ROLE_OR_REGION";
-	if (!has_root && hw_state == NULL)
+	if (!cluster_shared_config && !has_root && hw_state == NULL)
 		return true; /* Non-cluster startup with no HW region. */
 	if (hw_state == NULL || hw_htab == NULL || (has_root && !AmStartupProcess()))
 		return false;
@@ -782,9 +788,20 @@ cluster_hw_startup_prepare(bool in_recovery, bool own_clean_shutdown, XLogRecPtr
 		*failure_out = "METADATA_IDENTITY";
 		return false;
 	}
-	mode = !has_root	 ? CLUSTER_HW_BOOT_DISABLED
-		   : in_recovery ? CLUSTER_HW_BOOT_EXISTING_RECOVERY
-						 : CLUSTER_HW_BOOT_NORMAL_SELF;
+	if (cluster_shared_config
+		&& (!has_root
+			|| (!in_recovery && (!own_clean_shutdown || XLogRecPtrIsInvalid(own_redo))))) {
+		*failure_out = "CANONICAL_SPACE_STARTUP_INPUT";
+		return false;
+	}
+	/* Native startup already owns the exact selected generation. This only
+	 * selects the reservation representation; it grants no SPACE access and
+	 * never publishes legacy cache READY. Buffer checkpoint/recovery owners
+	 * must still close canonical SPACE before allocation can resume. */
+	mode = cluster_shared_config ? CLUSTER_HW_BOOT_CANONICAL_SPACE
+		   : !has_root			 ? CLUSTER_HW_BOOT_DISABLED
+		   : in_recovery		 ? CLUSTER_HW_BOOT_EXISTING_RECOVERY
+								 : CLUSTER_HW_BOOT_NORMAL_SELF;
 	if (!pg_atomic_compare_exchange_u32(&hw_state->cold_boot_mode, &expected, mode)) {
 		*failure_out = "BOOT_MODE_ALREADY_SELECTED";
 		return false;
@@ -808,6 +825,14 @@ cluster_hw_startup_complete(const char **failure_out)
 	if (failure_out == NULL)
 		return false;
 	*failure_out = NULL;
+	if (cluster_shared_config) {
+		if (!AmStartupProcess() || !cluster_hw_metadata_configured()
+			|| mode != CLUSTER_HW_BOOT_CANONICAL_SPACE) {
+			*failure_out = "CANONICAL_SPACE_STARTUP_MODE";
+			return false;
+		}
+		return true;
+	}
 	if (mode == CLUSTER_HW_BOOT_DISABLED || (hw_state == NULL && !cluster_hw_metadata_configured()))
 		return true;
 	if (!AmStartupProcess() || !cluster_hw_metadata_configured()) {
@@ -888,6 +913,10 @@ cluster_hw_snapshot_checkpoint_write(XLogRecPtr redo_lsn)
 {
 	ClusterHwColdBootMode mode;
 	ClusterHwColdBootState state;
+	/* Shared reservations are already in the ordinary SPACE buffer/WAL
+	 * checkpoint domain. An empty master cache snapshot proves nothing. */
+	if (cluster_shared_config)
+		return;
 	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')
 		return;
 	mode = cluster_hw_cold_boot_mode();
@@ -921,6 +950,8 @@ cluster_hw_snapshot_checkpoint_write(XLogRecPtr redo_lsn)
 void
 cluster_hw_snapshot_adoption_write(void)
 {
+	if (cluster_shared_config)
+		return;
 	hw_snapshot_capture_and_write(CLUSTER_HW_SNAPSHOT_ADOPTION, GetXLogInsertRecPtr(),
 								  (uint32)cluster_epoch_get_current());
 }
@@ -948,7 +979,7 @@ cluster_hw_snapshot_recovery_load(void)
 	ClusterHwSnapshotValidity v;
 	uint32 self;
 
-	if (hw_htab == NULL || !cluster_hw_authority_active())
+	if (cluster_shared_config || hw_htab == NULL || !cluster_hw_authority_active())
 		return;
 
 	self = (uint32)cluster_node_id;

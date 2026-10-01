@@ -233,6 +233,103 @@ UT_TEST(unclassified_cannot_allocate_or_publish_empty_checkpoint)
 	UT_ASSERT(cold_checkpoint_rejected(4096));
 	UT_ASSERT_EQ(cold_writes, 0);
 }
+
+UT_TEST(shared_space_startup_does_not_load_or_admit_legacy_cache)
+{
+	const char *reason = NULL;
+	BlockNumber first = 999;
+	unsigned reads;
+
+	cold_setup();
+	/* This would be rejected as a normal restart snapshot. Its contents
+	 * must never become a second authority for canonical SPACE. */
+	cold_snapshot(CLUSTER_HW_SNAPSHOT_ADOPTION, 123, GetSystemIdentifier(), 1);
+	reads = cold_reads;
+	cluster_shared_config = true;
+	UT_ASSERT(cluster_hw_startup_prepare(false, true, 4096, &reason));
+	UT_ASSERT(reason == NULL);
+	UT_ASSERT_EQ(cluster_hw_cold_boot_mode(), CLUSTER_HW_BOOT_CANONICAL_SPACE);
+	UT_ASSERT(cluster_hw_startup_complete(&reason));
+	UT_ASSERT_EQ(cluster_hw_cold_boot_state(), CLUSTER_HW_COLD);
+	UT_ASSERT_EQ(cold_reads, reads);
+	UT_ASSERT_EQ(cold_advance(20000, 0, &first), CLUSTER_HW_NOT_READY);
+	UT_ASSERT_EQ(first, 999);
+	/* Even old in-memory READY bytes cannot select the previous allocator. */
+	pg_atomic_write_u32(&hw_state->cold_boot_mode, CLUSTER_HW_BOOT_NORMAL_SELF);
+	pg_atomic_write_u32(&hw_state->cold_boot_state, CLUSTER_HW_READY);
+	UT_ASSERT_EQ(cold_advance(21000, 123, &first), CLUSTER_HW_NOT_READY);
+	UT_ASSERT_EQ(first, 999);
+	UT_ASSERT(!cluster_hw_startup_complete(&reason));
+	LWLockAcquire(&hw_state->lwlock, LW_SHARED);
+	UT_ASSERT_EQ(hash_get_num_entries(hw_htab), 0);
+	LWLockRelease(&hw_state->lwlock);
+}
+
+UT_TEST(shared_space_checkpoint_and_recovery_have_no_snapshot_io)
+{
+	const char *reason = NULL;
+	unsigned reads, writes;
+
+	cold_setup();
+	cold_snapshot(CLUSTER_HW_SNAPSHOT_ADOPTION, 123, GetSystemIdentifier(), 1);
+	reads = cold_reads;
+	writes = cold_writes;
+	cluster_shared_config = true;
+	UT_ASSERT(cluster_hw_startup_prepare(true, false, 4096, &reason));
+	cluster_hw_snapshot_recovery_load();
+	UT_ASSERT(!cold_checkpoint_rejected(8192));
+	cluster_hw_snapshot_adoption_write();
+	UT_ASSERT_EQ(cold_reads, reads);
+	UT_ASSERT_EQ(cold_writes, writes);
+	UT_ASSERT_EQ(cluster_hw_cold_boot_state(), CLUSTER_HW_COLD);
+	LWLockAcquire(&hw_state->lwlock, LW_SHARED);
+	UT_ASSERT_EQ(hash_get_num_entries(hw_htab), 0);
+	LWLockRelease(&hw_state->lwlock);
+}
+
+UT_TEST(shared_space_native_startup_keeps_role_and_checkpoint_prerequisites)
+{
+	const char *reason = NULL;
+	volatile bool caught = false;
+
+	cold_setup();
+	cluster_shared_config = true;
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT(!cluster_hw_startup_prepare(false, true, 4096, &reason));
+	MyAuxProcType = StartupProcess;
+	UT_ASSERT(!cluster_hw_startup_prepare(false, false, 4096, &reason));
+	UT_ASSERT_EQ(cold_reads + cold_writes, 0);
+	cold_setup();
+	cluster_shared_config = true;
+	UT_ASSERT(!cluster_hw_startup_prepare(false, true, InvalidXLogRecPtr, &reason));
+	cluster_shared_data_dir = NULL;
+	UT_ASSERT(!cluster_hw_startup_prepare(false, true, 4096, &reason));
+	{
+		ClusterHwShared *saved = hw_state;
+		hw_state = NULL;
+		UT_ASSERT(!cluster_hw_startup_prepare(false, true, 4096, &reason));
+		hw_state = saved;
+	}
+	cold_setup();
+	cluster_shared_config = true;
+	PG_TRY();
+	{
+		actual_init_tail(true, false, false, false, 4096);
+		actual_checkpoint_call(8192);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		while (held_lock != NULL)
+			LWLockRelease(held_lock);
+	}
+	PG_END_TRY();
+	UT_ASSERT(!caught);
+	UT_ASSERT_EQ(cluster_hw_cold_boot_mode(), CLUSTER_HW_BOOT_CANONICAL_SPACE);
+	UT_ASSERT(cluster_hw_startup_complete(&reason));
+	UT_ASSERT_EQ(cold_reads + cold_writes, 0);
+	UT_ASSERT_EQ(cluster_hw_cold_boot_state(), CLUSTER_HW_COLD);
+}
 UT_TEST(normal_load_precedes_ready_and_first_allocation_uses_durable_hwm)
 {
 	const char *reason = NULL;
@@ -444,7 +541,10 @@ main(void)
 {
 	if (mkdtemp(cold_root) == NULL)
 		return 2;
-	UT_PLAN(12);
+	UT_PLAN(15);
+	UT_RUN(shared_space_startup_does_not_load_or_admit_legacy_cache);
+	UT_RUN(shared_space_checkpoint_and_recovery_have_no_snapshot_io);
+	UT_RUN(shared_space_native_startup_keeps_role_and_checkpoint_prerequisites);
 	UT_RUN(unclassified_cannot_allocate_or_publish_empty_checkpoint);
 	UT_RUN(normal_load_precedes_ready_and_first_allocation_uses_durable_hwm);
 	UT_RUN(normal_rebuilt_allows_closing_checkpoint_but_not_service);
