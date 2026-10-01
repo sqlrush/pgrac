@@ -74,6 +74,10 @@ extern RfPageProofDetailV1
 cluster_thread_recovery_fabric_apply_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
 										const struct ClusterThreadRecoveryAuthorityV1 *authority,
 										ClusterThreadRecoveryFabricApplyResultV1 *result);
+extern RfPageProofDetailV1 cluster_thread_recovery_fabric_apply_sources_v1(
+	const ClusterThreadRecoveryFabricPlanV1 *plan,
+	const struct ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count,
+	ClusterThreadRecoveryFabricApplyResultV1 *result);
 extern RfPageProofDetailV1 cluster_thread_recovery_fabric_execute_root_v1(
 	uint16 dead_thread, XLogRecPtr scan_begin_inclusive, XLogRecPtr scan_end_exclusive,
 	const struct ClusterThreadRecoveryAuthorityV1 *authority, bool space_active,

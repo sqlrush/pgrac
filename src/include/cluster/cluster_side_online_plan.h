@@ -70,6 +70,9 @@ typedef struct RfSideOnlineApplyOpsV1 {
 	RfSideOnlineApplyProjectionV1 apply_projection;
 	RfSideOnlineSpaceV1 preflight_space;
 	RfSideOnlineSpaceV1 apply_space;
+	/* Zero selects the whole plan. A nonzero original thread selects only
+	 * its operations; this is a selector, never recovery authority. */
+	uint16 source_thread;
 } RfSideOnlineApplyOpsV1;
 
 /* Production owner for the RF-SIDE v2 non-authoritative projections.  The
@@ -135,6 +138,10 @@ extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_header_v1(
 	const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 segment_id,
 	const char *base, RfSideUndoHeaderImageV1 *out);
 extern uint32 rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan);
+/* UINT32_MAX denotes an invalid plan or absent source; zero is a proven
+ * empty projection of a source that belongs to this sealed plan. */
+extern uint32 rf_side_online_plan_origin_operation_count_v1(const RfSideOnlinePlanV1 *plan,
+															uint16 source_thread);
 extern Size rf_side_online_plan_scratch_available_v1(const RfSideOnlinePlanV1 *plan);
 extern bool rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 											 RfSideOnlineOperationV1 *out_operation);

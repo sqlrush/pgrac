@@ -88,6 +88,7 @@ typedef struct PrepareApplyCapture {
 
 static PrepareApplyCapture prepare_apply;
 static FILE *canonical_file;
+static const ClusterRecoveryDutyKey canonical_duty = { .origin_thread_id = 3 };
 static ClusterUndoRecoveryScopeV1 *canonical_scope;
 static uint32 canonical_writes, canonical_syncs, canonical_writer_depth;
 static SCN canonical_projection_scn;
@@ -852,6 +853,7 @@ typedef struct ApplyCapture {
 	uint8 undo_first_byte;
 	uint8 projection_first_byte;
 	bool end_complete;
+	uint16 projection_origin;
 } ApplyCapture;
 
 static bool
@@ -900,6 +902,7 @@ capture_apply_projection(void *arg, const RfSideOnlineOperationV1 *operation)
 	ApplyCapture *capture = (ApplyCapture *)arg;
 
 	capture->projection_count++;
+	capture->projection_origin = operation->identity.record.origin_thread;
 	if (operation->owned_payload_length > 0)
 		capture->projection_first_byte = operation->owned_payload[0];
 	return operation->kind == RF_SIDE_ONLINE_OPERATION_PROJECTION;
@@ -1991,6 +1994,7 @@ UT_TEST(test_protected_set_released_on_preflight_or_apply_error)
 	ops.arg = capture;
 	ops.begin_protected_set = capture_begin;
 	ops.end_protected_set = capture_end;
+	ops.source_thread = 3;
 	for (int cutpoint = 0; cutpoint < 3; cutpoint++) {
 		volatile bool caught = false;
 
@@ -2682,14 +2686,32 @@ UT_TEST(test_recycle_window_repeated_terminal_and_init_unknown_generation)
 }
 
 static RfSideOnlinePlanV1 *
-undo_repeated_slot_plan(bool wrong_second_xid)
+undo_repeated_slot_plan_sources(bool wrong_second_xid, bool with_peer)
 {
-	RfSideOnlinePlanV1 *plan = space_online_plan(500);
+	RfSideOnlinePlanV1 *plan = NULL;
 	FakeXactRecord fake;
 	xl_undo_tt_slot_bind bind;
 	xl_xact_tt_commit delta;
 	uint32 offset;
 
+	if (with_peer) {
+		RfContributorStreamCutV1 cuts[2] = { { 0 } };
+		RfSideOnlinePlanRequestV1 request = { 0 };
+
+		for (uint32 i = 0; i < 2; i++) {
+			cuts[i].failed_thread = i + 3;
+			cuts[i].timeline_id = 7;
+			cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+			cuts[i].scan_begin_inclusive = 100;
+			cuts[i].scan_end_exclusive = i == 0 ? 500 : 200;
+		}
+		request.system_identifier = UINT64_C(0x11223344);
+		memset(request.storage_uuid, 0x44, 16);
+		request.physical_cuts = cuts;
+		request.participant_count = 2;
+		UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+	} else
+		plan = space_online_plan(500);
 	undo_header_bind(&fake, 0);
 	undo_header_feed(plan, &fake, 100);
 	undo_header_commit(&fake, 0, 802);
@@ -2706,8 +2728,31 @@ undo_repeated_slot_plan(bool wrong_second_xid)
 	delta.wrap = 8;
 	memcpy(fake.data + offset, &delta, sizeof(delta));
 	undo_header_feed(plan, &fake, 400);
+	if (with_peer) {
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		uint8 uuid[16];
+		int page = 17;
+
+		memset(uuid, 0x44, 16);
+		make_projection_record(&fake, RM_MULTIXACT_ID, XLOG_MULTIXACT_ZERO_OFF_PAGE, &page,
+							   sizeof(page));
+		identity = make_identity(&fake, uuid);
+		identity.participant_index = 1;
+		identity.record.origin_thread = 4;
+		record = make_projection_record_plan(&fake);
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	}
 	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 	return plan;
+}
+
+static RfSideOnlinePlanV1 *
+undo_repeated_slot_plan(bool wrong_second_xid)
+{
+	return undo_repeated_slot_plan_sources(wrong_second_xid, false);
 }
 
 UT_TEST(test_undo_header_repeated_slot_exact_source_membership_without_init)
@@ -2796,9 +2841,10 @@ canonical_authority_fresh(void *arg)
 
 UT_TEST(test_real_plan_owner_and_xact_install_final_header_before_older_commit_projection)
 {
-	for (int conflict = 0; conflict < 2; conflict++) {
-		RfSideOnlinePlanV1 *plan = undo_repeated_slot_plan(conflict);
-		ClusterThreadRecoveryAuthorityV1 authority = {0};
+	for (int scenario = 0; scenario < 4; scenario++) {
+		bool conflict = (scenario & 1) != 0;
+		RfSideOnlinePlanV1 *plan = undo_repeated_slot_plan_sources(conflict, scenario >= 2);
+		ClusterThreadRecoveryAuthorityV1 authority = { .duty = &canonical_duty };
 		RfSideOnlineProductionOwnerV1 owner;
 		PGAlignedBlock initial, after;
 
@@ -2842,7 +2888,7 @@ UT_TEST(test_physical_undo_is_durable_before_canonical_tt_publication)
 {
 	for (int fault = 0; fault < 4; fault++) {
 		RfSideOnlinePlanV1 *plan = space_online_plan(fault == 1 ? 400 : 500);
-		ClusterThreadRecoveryAuthorityV1 authority = {0};
+		ClusterThreadRecoveryAuthorityV1 authority = { .duty = &canonical_duty };
 		RfSideOnlineProductionOwnerV1 owner;
 		FakeXactRecord fake;
 		PGAlignedBlock initial, after;
@@ -2905,7 +2951,7 @@ UT_TEST(test_init_owner_repairs_short_segment_before_header_and_commit)
 {
 	for (int partial = 0; partial < 5; partial++) {
 		RfSideOnlinePlanV1 *plan = space_online_plan(500);
-		ClusterThreadRecoveryAuthorityV1 authority = {0};
+		ClusterThreadRecoveryAuthorityV1 authority = { .duty = &canonical_duty };
 		RfSideOnlineProductionOwnerV1 owner;
 		FakeXactRecord fake;
 		PGAlignedBlock after;
@@ -2973,7 +3019,7 @@ UT_TEST(test_init_owner_repairs_short_segment_before_header_and_commit)
 UT_TEST(test_reuse_owner_covers_retired_commit_only_after_new_physical_and_tt)
 {
 	RfSideOnlinePlanV1 *plan = space_online_plan(800);
-	ClusterThreadRecoveryAuthorityV1 authority = {0};
+	ClusterThreadRecoveryAuthorityV1 authority = { .duty = &canonical_duty };
 	RfSideOnlineProductionOwnerV1 owner;
 	FakeXactRecord fake;
 	PGAlignedBlock initial, after;
@@ -3065,7 +3111,7 @@ UT_TEST(test_physical_only_cut_and_reuse_anchor_boundary)
 		if (reuse) UT_ASSERT(memcmp(&image, &saved, sizeof(image)) == 0);
 		else {
 			RfSideOnlineProductionOwnerV1 owner;
-			ClusterThreadRecoveryAuthorityV1 authority = {0};
+			ClusterThreadRecoveryAuthorityV1 authority = { .duty = &canonical_duty };
 			PGAlignedBlock initial, actual;
 
 			canonical_file = tmpfile();
@@ -3222,10 +3268,83 @@ UT_TEST(test_multixact_retired_page_requires_exact_later_sealed_truncate)
 	}
 }
 
+UT_TEST(test_multi_origin_side_selection_keeps_exact_source_and_original_plan)
+{
+	RfSideOnlinePlanRequestV1 request = { 0 };
+	RfContributorStreamCutV1 cuts[3] = { { 0 } };
+	RfSideOnlinePlanV1 *plan = NULL;
+	RfSideOnlineApplyOpsV1 ops = { 0 };
+	ApplyCapture capture = { 0 };
+	FakeXactRecord fake;
+	RfPageOnlineRecordIdentityV1 identity;
+	RfDetachedRecordPlanV1 record_plan;
+	int page = 17;
+
+	request.system_identifier = UINT64_C(0x11223344);
+	memset(request.storage_uuid, 0x45, 16);
+	request.participant_count = 3;
+	request.physical_cuts = cuts;
+	for (uint32 i = 0; i < 3; i++) {
+		cuts[i].failed_thread = i + 3;
+		cuts[i].timeline_id = 7;
+		cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		cuts[i].scan_begin_inclusive = 100;
+		cuts[i].scan_end_exclusive = 200;
+	}
+	/* Third origin has a physically empty input, not a missing origin. */
+	cuts[2].scan_end_exclusive = 100;
+	cuts[2].flags |= RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+	if (plan == NULL)
+		return;
+	for (uint32 i = 0; i < 2; i++) {
+		make_projection_record(&fake, RM_MULTIXACT_ID, XLOG_MULTIXACT_ZERO_OFF_PAGE, &page,
+							   sizeof(page));
+		identity = make_identity(&fake, request.storage_uuid);
+		identity.participant_index = i;
+		identity.record.origin_thread = i + 3;
+		record_plan = make_projection_record_plan(&fake);
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record_plan, &identity),
+					 RF_PAGE_PROOF_DETAIL_OK);
+	}
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_side_online_plan_source_matches_v1(plan, request.system_identifier,
+													request.storage_uuid, &cuts[0]));
+	UT_ASSERT(rf_side_online_plan_source_matches_v1(plan, request.system_identifier,
+													request.storage_uuid, &cuts[1]));
+	UT_ASSERT_EQ(rf_side_online_plan_origin_operation_count_v1(plan, 0), 2);
+	UT_ASSERT_EQ(rf_side_online_plan_origin_operation_count_v1(plan, 3), 1);
+	UT_ASSERT_EQ(rf_side_online_plan_origin_operation_count_v1(plan, 4), 1);
+	UT_ASSERT_EQ(rf_side_online_plan_origin_operation_count_v1(plan, 5), 0);
+	UT_ASSERT_EQ(rf_side_online_plan_origin_operation_count_v1(plan, 6), UINT32_MAX);
+	ops.arg = &capture;
+	ops.begin_protected_set = capture_begin;
+	ops.end_protected_set = capture_end;
+	ops.preflight_projection = accept_preflight;
+	ops.apply_projection = capture_apply_projection;
+	for (uint16 origin = 3; origin <= 6; origin++) {
+		memset(&capture, 0, sizeof(capture));
+		ops.source_thread = origin;
+		UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &ops),
+					 origin == 6 ? RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT : RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(capture.projection_count, origin < 5 ? 1 : 0);
+		UT_ASSERT_EQ(capture.projection_origin, origin < 5 ? origin : 0);
+		UT_ASSERT_EQ(capture.begin_count, origin < 5 ? 1 : 0);
+		UT_ASSERT_EQ(capture.end_count, capture.begin_count);
+	}
+	/* The selector leaves the complete immutable input available. */
+	UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 2);
+	UT_ASSERT(rf_side_online_plan_source_matches_v1(plan, request.system_identifier,
+													request.storage_uuid, &cuts[0]));
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(45);
+	UT_PLAN(46);
+	UT_RUN(test_multi_origin_side_selection_keeps_exact_source_and_original_plan);
 	UT_RUN(test_reuse_owner_covers_retired_commit_only_after_new_physical_and_tt);
 	UT_RUN(test_init_owner_repairs_short_segment_before_header_and_commit);
 	UT_RUN(test_lifecycle_header_requires_known_generation_and_complete_source_chain);

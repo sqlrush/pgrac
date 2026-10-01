@@ -57,7 +57,8 @@ typedef struct OwnerCapture {
 } OwnerCapture;
 
 static OwnerCapture capture;
-static ClusterThreadRecoveryAuthorityV1 canonical_authority;
+static const ClusterRecoveryDutyKey canonical_duty = { .origin_thread_id = 3 };
+static ClusterThreadRecoveryAuthorityV1 canonical_authority = { .duty = &canonical_duty };
 static ClusterUndoRecoveryScopeV1 *active_scope;
 static PGAlignedBlock canonical_header;
 
@@ -208,6 +209,13 @@ rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan)
 	return capture.plan_operation_count;
 }
 
+uint32
+rf_side_online_plan_origin_operation_count_v1(const RfSideOnlinePlanV1 *plan, uint16 thread)
+{
+	UT_ASSERT(thread == 0 || thread == 3);
+	return rf_side_online_plan_operation_count_v1(plan);
+}
+
 static bool
 fresh_authority(void *arg)
 {
@@ -353,6 +361,7 @@ rf_side_online_plan_preflight_v1(const RfSideOnlinePlanV1 *plan, const RfSideOnl
 	uint32 i;
 
 	UT_ASSERT(plan != NULL);
+	UT_ASSERT_EQ(ops->source_thread, capture.canonical_batch ? 3 : 0);
 	make_operations(operations);
 	if (!ops->begin_protected_set(ops->arg))
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
@@ -377,6 +386,7 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan, const RfSideOnlineA
 	uint32 i;
 
 	UT_ASSERT(plan != NULL);
+	UT_ASSERT_EQ(ops->source_thread, capture.canonical_batch ? 3 : 0);
 	if (capture.plan_operation_count == 0)
 		return RF_PAGE_PROOF_DETAIL_OK;
 	make_operations(operations);

@@ -735,11 +735,17 @@ rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan,
 	const RfContributorStreamCutV1 *source;
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed
-		|| plan->database_incarnation == 0 || plan->participant_count != 1
-		|| system_identifier != plan->system_identifier || storage_uuid == NULL || cut == NULL
-		|| memcmp(storage_uuid, plan->storage_uuid, 16) != 0)
+		|| plan->database_incarnation == 0 || system_identifier != plan->system_identifier
+		|| storage_uuid == NULL || cut == NULL || memcmp(storage_uuid, plan->storage_uuid, 16) != 0)
 		return false;
-	source = &plan->physical_cuts[0];
+	source = NULL;
+	for (uint32 i = 0; i < plan->participant_count; i++)
+		if (plan->physical_cuts[i].failed_thread == cut->failed_thread) {
+			source = &plan->physical_cuts[i];
+			break;
+		}
+	if (source == NULL)
+		return false;
 	return cut->flags == RF_CONTRIBUTOR_CUT_COMPLETE && cut->flags == source->flags
 		&& cut->failed_thread == source->failed_thread && cut->timeline_id == source->timeline_id
 		&& cut->scan_begin_inclusive == source->scan_begin_inclusive
@@ -1214,6 +1220,27 @@ rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 	return true;
 }
 
+uint32
+rf_side_online_plan_origin_operation_count_v1(const RfSideOnlinePlanV1 *plan, uint16 source_thread)
+{
+	bool found = false;
+	uint32 count = 0;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed)
+		return UINT32_MAX;
+	if (source_thread == 0)
+		return plan->operation_count;
+	for (uint32 i = 0; i < plan->participant_count; i++)
+		if (plan->physical_cuts[i].failed_thread == source_thread)
+			found = true;
+	if (!found)
+		return UINT32_MAX;
+	for (uint32 i = 0; i < plan->operation_count; i++)
+		if (plan->operations[i].identity.record.origin_thread == source_thread)
+			count++;
+	return count;
+}
+
 static bool
 side_plan_apply_ops_valid(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOpsV1 *ops)
 {
@@ -1223,7 +1250,12 @@ side_plan_apply_ops_valid(const RfSideOnlinePlanV1 *plan, const RfSideOnlineAppl
 		return false;
 	if (ops->begin_protected_set == NULL || ops->end_protected_set == NULL)
 		return false;
-	for (i = 0; i < plan->operation_count; i++)
+	if (rf_side_online_plan_origin_operation_count_v1(plan, ops->source_thread) == UINT32_MAX)
+		return false;
+	for (i = 0; i < plan->operation_count; i++) {
+		if (ops->source_thread != 0
+			&& plan->operations[i].identity.record.origin_thread != ops->source_thread)
+			continue;
 		if ((plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_XACT
 			 && (ops->preflight_xact == NULL || ops->apply_xact == NULL))
 			|| (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_UNDO
@@ -1234,6 +1266,7 @@ side_plan_apply_ops_valid(const RfSideOnlinePlanV1 *plan, const RfSideOnlineAppl
 				&& (ops->preflight_space == NULL || ops->apply_space == NULL))
 			|| plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_INVALID)
 			return false;
+	}
 	return true;
 }
 
@@ -1251,6 +1284,9 @@ side_plan_preflight_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApp
 		RfSideOnlineOperationV1 operation = plan->operations[i];
 		bool accepted;
 
+		if (ops->source_thread != 0
+			&& operation.identity.record.origin_thread != ops->source_thread)
+			continue;
 		if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT
 			&& operation.xact.kind == RF_SIDE_XACT_COMMIT_PREPARED
 			&& !side_plan_commit_prepared_dependencies_closed(plan, i))
@@ -1282,7 +1318,7 @@ rf_side_online_plan_preflight_v1(const RfSideOnlinePlanV1 *plan, const RfSideOnl
 
 	if (!side_plan_apply_ops_valid(plan, ops))
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
-	if (plan->operation_count == 0)
+	if (rf_side_online_plan_origin_operation_count_v1(plan, ops->source_thread) == 0)
 		return RF_PAGE_PROOF_DETAIL_OK;
 	if (!ops->begin_protected_set(ops->arg))
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
@@ -1312,6 +1348,9 @@ side_plan_apply_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOp
 		RfSideOnlineOperationV1 operation = plan->operations[i];
 		bool applied;
 
+		if (ops->source_thread != 0
+			&& operation.identity.record.origin_thread != ops->source_thread)
+			continue;
 		if (operation.owned_payload_length > 0)
 			operation.owned_payload = plan->owned_payload + operation.owned_payload_offset;
 		if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT)
@@ -1336,7 +1375,7 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan, const RfSideOnlineA
 
 	if (!side_plan_apply_ops_valid(plan, ops))
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
-	if (plan->operation_count == 0)
+	if (rf_side_online_plan_origin_operation_count_v1(plan, ops->source_thread) == 0)
 		return RF_PAGE_PROOF_DETAIL_OK;
 	if (!ops->begin_protected_set(ops->arg))
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;

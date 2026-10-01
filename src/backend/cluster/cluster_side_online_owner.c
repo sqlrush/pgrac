@@ -330,10 +330,22 @@ rf_side_online_production_bind_undo_v1(RfSideOnlineProductionOwnerV1 *owner,
 	const ClusterThreadRecoveryAuthorityV1 *authority)
 {
 	if (owner == NULL || owner->protected_set_active || authority == NULL
-		|| owner->authority_arg != authority)
+		|| owner->authority_arg != authority || authority->duty == NULL
+		|| authority->duty->origin_thread_id == 0 || authority->duty->origin_thread_id > 128)
 		return false;
 	owner->undo_authority = authority;
 	return true;
+}
+
+static uint16
+side_owner_source_thread(const RfSideOnlineProductionOwnerV1 *owner)
+{
+	if (owner->undo_authority == NULL)
+		return 0;
+	if (owner->undo_authority->duty == NULL || owner->undo_authority->duty->origin_thread_id == 0
+		|| owner->undo_authority->duty->origin_thread_id > 128)
+		return UINT16_MAX;
+	return owner->undo_authority->duty->origin_thread_id;
 }
 
 RfPageProofDetailV1
@@ -349,6 +361,7 @@ rf_side_online_production_preflight_v1(const RfSideOnlinePlanV1 *plan,
 	owner->protected_plan = plan;
 	memset(&ops, 0, sizeof(ops));
 	ops.arg = owner;
+	ops.source_thread = side_owner_source_thread(owner);
 	ops.begin_protected_set = side_owner_begin_protected_set;
 	ops.end_protected_set = side_owner_end_protected_set;
 	ops.preflight_xact = side_owner_preflight_xact;
@@ -375,6 +388,7 @@ rf_side_online_production_apply_v1(const RfSideOnlinePlanV1 *plan,
 	owner->protected_plan = plan;
 	memset(&ops, 0, sizeof(ops));
 	ops.arg = owner;
+	ops.source_thread = side_owner_source_thread(owner);
 	ops.begin_protected_set = side_owner_begin_protected_set;
 	ops.end_protected_set = side_owner_end_protected_set;
 	ops.preflight_xact = side_owner_preflight_xact;
@@ -387,7 +401,7 @@ rf_side_online_production_apply_v1(const RfSideOnlinePlanV1 *plan,
 	owner->protected_plan = NULL;
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		return detail;
-	if (rf_side_online_plan_operation_count_v1(plan) == 0) {
+	if (rf_side_online_plan_origin_operation_count_v1(plan, ops.source_thread) == 0) {
 		/*
 		 * A sealed empty SIDE proof set closes without taking the online
 		 * writer barrier: there are no SIDE bytes to protect or mutate.  It

@@ -43,6 +43,30 @@ fabric_apply_authority_fresh(void *arg)
 		   == CLUSTER_THREAD_AUTHORITY_OK;
 }
 
+static bool
+fabric_apply_sources_fresh(const ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count)
+{
+	for (uint32 i = 0; i < count; i++)
+		if (!fabric_apply_authority_fresh((void *)&authorities[i]))
+			return false;
+	return true;
+}
+
+static RfPageProofDetailV1
+fabric_apply_side_origin(const RfSideOnlinePlanV1 *plan,
+						 const ClusterThreadRecoveryAuthorityV1 *authority, uint32 epoch,
+						 bool preflight_only)
+{
+	RfSideOnlineProductionOwnerV1 owner;
+
+	if (!rf_side_online_production_owner_init_v1(&owner, (void *)authority,
+												 fabric_apply_authority_fresh, epoch, true)
+		|| !rf_side_online_production_bind_undo_v1(&owner, authority))
+		return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+	return preflight_only ? rf_side_online_production_preflight_v1(plan, &owner)
+						  : rf_side_online_production_apply_v1(plan, &owner);
+}
+
 static RfPageProofDetailV1
 fabric_apply_map_authority(RfPageAuthorityVerdictV1 verdict)
 {
@@ -117,15 +141,15 @@ fabric_apply_state_free(ClusterThreadRecoveryFabricApplyStateV1 *state, uint32 t
 }
 
 RfPageProofDetailV1
-cluster_thread_recovery_fabric_apply_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
-										const ClusterThreadRecoveryAuthorityV1 *authority,
-										ClusterThreadRecoveryFabricApplyResultV1 *result)
+cluster_thread_recovery_fabric_apply_sources_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
+												const ClusterThreadRecoveryAuthorityV1 *authority,
+												uint32 count,
+												ClusterThreadRecoveryFabricApplyResultV1 *result)
 {
 	const RfPageOnlinePlanV1 *page_plan;
 	const RfSideOnlinePlanV1 *side_plan;
 	ClusterThreadRecoveryFabricApplyStateV1 state;
 	ClusterThreadRecoveryFabricApplyResultV1 completed;
-	RfSideOnlineProductionOwnerV1 side_owner;
 	RfPageInstallAuthorityAdapterV1 page_adapter;
 	RfPageStorageInstallRequestV1 install_request;
 	RfPageStorageInstallProofV1 install_proof;
@@ -137,41 +161,48 @@ cluster_thread_recovery_fabric_apply_v1(const ClusterThreadRecoveryFabricPlanV1 
 	uint32 target_count;
 	uint32 max_chain_count = 0;
 	uint32 i;
-	bool retained_source_current = false;
 
 	if (result == NULL)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	memset(result, 0, sizeof(*result));
+	if (authority == NULL || count == 0 || count > RF_PAGE_STABLE_MAX_PARTICIPANTS)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	page_plan = cluster_thread_recovery_fabric_page_plan_v1(plan);
 	side_plan = cluster_thread_recovery_fabric_side_plan_v1(plan);
-	if (page_plan == NULL || side_plan == NULL || authority == NULL
-		|| !fabric_apply_authority_fresh((void *)authority))
+	if (page_plan == NULL || side_plan == NULL || !fabric_apply_sources_fresh(authority, count))
 		return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 	participant_count = cluster_thread_recovery_fabric_participant_count_v1(plan);
-	if (participant_count != 1)
+	if (participant_count != count)
 		return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
-	if (authority->duty == NULL || authority->root_snapshot == NULL
-		|| !cluster_thread_recovery_fabric_identity_matches_v1(
-			plan, authority->duty->system_identifier, authority->duty->storage_uuid)
-		|| !cluster_thread_recovery_fabric_identity_matches_v1(
-			plan, authority->root_snapshot->identity.system_identifier,
-			authority->root_snapshot->identity.storage_uuid))
-		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
-	if (!cluster_thread_recovery_fabric_cut_v1(plan, 0, &cut))
-		return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
-	if (cut.failed_thread == 0 || cut.failed_thread != authority->duty->origin_thread_id
-		|| cut.failed_thread != authority->root_snapshot->identity.origin_thread_id
-		|| cut.timeline_id == 0 || cut.timeline_id != authority->root_snapshot->checkpoint_tli
-		|| cut.timeline_id != authority->root_snapshot->tail_tli
-		|| cut.flags != RF_CONTRIBUTOR_CUT_COMPLETE || cut.scan_begin_inclusive == InvalidXLogRecPtr
-		|| cut.scan_end_exclusive <= cut.scan_begin_inclusive
-		|| cut.scan_begin_inclusive != authority->root_snapshot->checkpoint_lower_lsn
-		|| cut.scan_end_exclusive != authority->root_snapshot->validated_tail_lsn_exclusive)
-		return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
-	if (!cluster_thread_recovery_authority_covers_window_v1(
-			authority, cut.failed_thread, cut.scan_begin_inclusive, cut.scan_end_exclusive))
-		return RF_PAGE_PROOF_DETAIL_RETENTION_STALE;
-	retained_source_current = true;
+	for (i = 0; i < participant_count; i++) {
+		const ClusterThreadRecoveryAuthorityV1 *source = &authority[i];
+
+		if (source->duty == NULL || source->root_snapshot == NULL
+			|| !cluster_thread_recovery_fabric_identity_matches_v1(
+				plan, source->duty->system_identifier, source->duty->storage_uuid)
+			|| !cluster_thread_recovery_fabric_identity_matches_v1(
+				plan, source->root_snapshot->identity.system_identifier,
+				source->root_snapshot->identity.storage_uuid))
+			return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+		if (source->retention_pin == NULL || source->retention_pin != authority[0].retention_pin)
+			return RF_PAGE_PROOF_DETAIL_RETENTION_STALE;
+		if (!cluster_thread_recovery_fabric_cut_v1(plan, i, &cut))
+			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+		if (cut.failed_thread == 0 || cut.failed_thread != source->duty->origin_thread_id
+			|| cut.failed_thread != source->root_snapshot->identity.origin_thread_id
+			|| (i > 0 && source->duty->origin_thread_id <= authority[i - 1].duty->origin_thread_id)
+			|| cut.timeline_id == 0 || cut.timeline_id != source->root_snapshot->checkpoint_tli
+			|| cut.timeline_id != source->root_snapshot->tail_tli
+			|| cut.flags != RF_CONTRIBUTOR_CUT_COMPLETE
+			|| cut.scan_begin_inclusive == InvalidXLogRecPtr
+			|| cut.scan_end_exclusive <= cut.scan_begin_inclusive
+			|| cut.scan_begin_inclusive != source->root_snapshot->checkpoint_lower_lsn
+			|| cut.scan_end_exclusive != source->root_snapshot->validated_tail_lsn_exclusive)
+			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+		if (!cluster_thread_recovery_authority_covers_window_v1(
+				source, cut.failed_thread, cut.scan_begin_inclusive, cut.scan_end_exclusive))
+			return RF_PAGE_PROOF_DETAIL_RETENTION_STALE;
+	}
 	current_epoch = cluster_epoch_get_current();
 	if (current_epoch == 0 || current_epoch > UINT32_MAX)
 		return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
@@ -262,16 +293,19 @@ cluster_thread_recovery_fabric_apply_v1(const ClusterThreadRecoveryFabricPlanV1 
 			goto done;
 	}
 
-	if (!rf_side_online_production_owner_init_v1(&side_owner, (void *)authority,
-												 fabric_apply_authority_fresh,
-												 (uint32)current_epoch, retained_source_current)
-		|| !rf_side_online_production_bind_undo_v1(&side_owner, authority)) {
+	for (i = 0; i < participant_count; i++) {
+		if (!fabric_apply_sources_fresh(authority, count)) {
+			detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+			goto done;
+		}
+		detail = fabric_apply_side_origin(side_plan, &authority[i], (uint32)current_epoch, true);
+		if (detail != RF_PAGE_PROOF_DETAIL_OK)
+			goto done;
+	}
+	if (!fabric_apply_sources_fresh(authority, count)) {
 		detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 		goto done;
 	}
-	detail = rf_side_online_production_preflight_v1(side_plan, &side_owner);
-	if (detail != RF_PAGE_PROOF_DETAIL_OK)
-		goto done;
 	if (target_count > 0) {
 		memset(&install_proof, 0, sizeof(install_proof));
 		detail = rf_page_storage_install_smgr_preopened_v1(&install_request, state.smgr_preopen,
@@ -288,11 +322,17 @@ cluster_thread_recovery_fabric_apply_v1(const ClusterThreadRecoveryFabricPlanV1 
 			goto done;
 		}
 	}
-	detail = rf_side_online_production_apply_v1(side_plan, &side_owner);
-	if (detail != RF_PAGE_PROOF_DETAIL_OK)
-		goto done;
+	for (i = 0; i < participant_count; i++) {
+		if (!fabric_apply_sources_fresh(authority, count)) {
+			detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+			goto done;
+		}
+		detail = fabric_apply_side_origin(side_plan, &authority[i], (uint32)current_epoch, false);
+		if (detail != RF_PAGE_PROOF_DETAIL_OK)
+			goto done;
+	}
 	completed.side_apply_complete = true;
-	if (!fabric_apply_authority_fresh((void *)authority)) {
+	if (!fabric_apply_sources_fresh(authority, count)) {
 		detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 		goto done;
 	}
@@ -302,6 +342,14 @@ cluster_thread_recovery_fabric_apply_v1(const ClusterThreadRecoveryFabricPlanV1 
 done:
 	fabric_apply_state_free(&state, target_count);
 	return detail;
+}
+
+RfPageProofDetailV1
+cluster_thread_recovery_fabric_apply_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
+										const ClusterThreadRecoveryAuthorityV1 *authority,
+										ClusterThreadRecoveryFabricApplyResultV1 *result)
+{
+	return cluster_thread_recovery_fabric_apply_sources_v1(plan, authority, 1, result);
 }
 
 #endif
