@@ -12,6 +12,10 @@
 #include "cluster/cluster_block_apply.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_page_online_plan.h"
+#include "cluster/cluster_thread_recovery.h"
+#include "cluster/cluster_thread_recovery_authority.h"
+#include "cluster/cluster_thread_recovery_fabric.h"
+#include "cluster/cluster_wal_tail.h"
 #include "storage/bufpage.h"
 #include "unit_test.h"
 
@@ -20,6 +24,16 @@ bool cluster_enabled = true, cluster_shared_config = true;
 bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
 int cluster_node_id;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -101,6 +115,174 @@ record_init(RecordFixture *fixture, uint64 before, uint64 result, bool image,
 	edge->before.mutation_token = before;
 	if (image)
 		edge->edge_flags = RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE;
+}
+
+/* Only the authority/root I/O and the empty SIDE lane are fixtures below.
+ * The production scanner, fabric barrier, detached PAGE decoder, dependency
+ * queue and native image/delta codecs execute together. */
+static char empty_side_plan, source_pin;
+static unsigned source_visits;
+static int source_failure;
+
+ClusterThreadRecoveryAuthorityResultV1
+cluster_thread_recovery_authority_revalidate_nowait_v1(
+	const ClusterThreadRecoveryAuthorityV1 *authority)
+{
+	return authority != NULL && authority->duty != NULL
+		? CLUSTER_THREAD_AUTHORITY_OK : CLUSTER_THREAD_AUTHORITY_INVALID;
+}
+
+bool
+cluster_thread_recovery_authority_covers_window_v1(
+	const ClusterThreadRecoveryAuthorityV1 *authority, uint16 thread, XLogRecPtr begin,
+	XLogRecPtr end)
+{
+	return authority != NULL && authority->duty->origin_thread_id == thread
+		&& begin == 0x100 && end == 0x200;
+}
+
+XLogReaderState *
+cluster_thread_wal_reader_make(uint16 thread, void **private_out)
+{
+	abort();
+}
+
+void
+cluster_thread_wal_reader_free(XLogReaderState *reader, void *private_state)
+{
+	abort();
+}
+
+ClusterControlRootResult
+cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *root,
+	const ClusterControlRootReadToken *token, ClusterWalRecordVisitor visitor, void *arg,
+	ClusterWalTailObservation *out)
+{
+	RecordFixture fixture;
+	uint16 thread = root->identity.origin_thread_id;
+
+	source_visits++;
+	UT_ASSERT_EQ(root->checkpoint_lower_lsn, 0x100);
+	UT_ASSERT_EQ(root->validated_tail_lsn_exclusive, 0x200);
+	UT_ASSERT_EQ(token->origin_thread_id, thread);
+	if (source_failure == 1 && thread == 2)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (thread == 1)
+		record_init(&fixture, 60, 7, false, BLCKSZ - 1, 0xc3);
+	else if (thread == 2)
+		record_init(&fixture, source_failure == 2 ? 901 : 900, 60, false, BLCKSZ - 2, 0xb2);
+	else
+		record_init(&fixture, 10, 900, true, 0, 0xa1);
+	fixture.reader.seg.ws_tli = root->checkpoint_tli;
+	if (!visitor(&fixture.reader, arg))
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	memset(&fixture, 0xdd, sizeof(fixture));
+	memset(out, 0, sizeof(*out));
+	out->records = 1;
+	out->complete_end = 0x200;
+	out->database_incarnation = 42;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request,
+	RfSideOnlinePlanV1 **out)
+{
+	UT_ASSERT_EQ(request->participant_count, 3);
+	*out = (RfSideOnlinePlanV1 *)&empty_side_plan;
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
+	const RfDetachedRecordPlanV1 *record, const RfPageOnlineRecordIdentityV1 *identity)
+{
+	UT_ASSERT(plan == (RfSideOnlinePlanV1 *)&empty_side_plan);
+	UT_ASSERT_EQ(record->route.record_owner, RF_ROUTE_OWNER_PAGE_CODEC);
+	UT_ASSERT_EQ(identity->record.origin_thread, source_visits);
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+bool
+rf_side_online_plan_bind_database_v1(RfSideOnlinePlanV1 *plan, uint64 database_incarnation)
+{
+	return plan == (RfSideOnlinePlanV1 *)&empty_side_plan && database_incarnation == 42;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
+{
+	UT_ASSERT(plan == (RfSideOnlinePlanV1 *)&empty_side_plan);
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+void
+rf_side_online_plan_destroy_v1(RfSideOnlinePlanV1 **plan)
+{
+	*plan = NULL;
+}
+
+static RfPageProofDetailV1
+scan_three_roots(ClusterThreadRecoveryFabricPlanV1 **out, uint64 *records)
+{
+	ClusterThreadRecoveryAuthorityV1 authorities[3] = { 0 };
+	ClusterRecoveryDutyKey duties[3] = { 0 };
+	ClusterControlRootSnapshot roots[3] = { 0 };
+	ClusterControlRootReadToken tokens[3] = { 0 };
+	unsigned i;
+
+	source_visits = 0;
+	for (i = 0; i < 3; i++) {
+		duties[i].system_identifier = 99;
+		memset(duties[i].storage_uuid, 3, 16);
+		duties[i].origin_thread_id = i + 1;
+		roots[i].identity = duties[i];
+		roots[i].checkpoint_tli = roots[i].tail_tli = i + 1;
+		roots[i].checkpoint_lower_lsn = 0x100;
+		roots[i].validated_tail_lsn_exclusive = 0x200;
+		tokens[i].origin_thread_id = i + 1;
+		authorities[i].duty = &duties[i];
+		authorities[i].root_snapshot = &roots[i];
+		authorities[i].root_token = &tokens[i];
+		authorities[i].retention_pin = (ClusterWalRetentionPin *)&source_pin;
+	}
+	return cluster_thread_recovery_fabric_scan_roots_v1(authorities, 3, false, out, records);
+}
+
+UT_TEST(test_original_root_scanner_resolves_reverse_three_origin_native_page_chain)
+{
+	ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
+	RfPageOnlineTargetViewV1 view;
+	uint64 records = 0;
+
+	source_failure = 0;
+	UT_ASSERT_EQ(scan_three_roots(&plan, &records), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(records, 3);
+	UT_ASSERT_EQ(source_visits, 3);
+	UT_ASSERT(rf_page_online_plan_target_v1(cluster_thread_recovery_fabric_page_plan_v1(plan), 0, &view));
+	if (rf_page_online_plan_target_v1(cluster_thread_recovery_fabric_page_plan_v1(plan), 0, &view)) {
+		UT_ASSERT_EQ(view.expected_before.mutation_token, 10);
+		UT_ASSERT_EQ(view.expected_result.mutation_token, 7);
+		UT_ASSERT_EQ(view.contributors->edge_count, 3);
+		UT_ASSERT_EQ((uint8)view.canonical_page[BLCKSZ - 3], 0xa1);
+		UT_ASSERT_EQ((uint8)view.canonical_page[BLCKSZ - 2], 0xb2);
+		UT_ASSERT_EQ((uint8)view.canonical_page[BLCKSZ - 1], 0xc3);
+	}
+	cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_original_root_scanner_refuses_missing_source_or_version_dependency)
+{
+	for (source_failure = 1; source_failure <= 2; source_failure++) {
+		ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
+		uint64 records = 99;
+
+		UT_ASSERT_EQ(scan_three_roots(&plan, &records), source_failure == 1
+			? RF_PAGE_PROOF_DETAIL_SOURCE_GAP : RF_PAGE_PROOF_DETAIL_EDGE_GAP);
+		UT_ASSERT(plan == NULL && records == 0);
+		UT_ASSERT_EQ(source_visits, source_failure == 1 ? 2 : 3);
+	}
+	source_failure = 0;
 }
 
 static RfPageOnlinePlanV1 *
@@ -292,12 +474,14 @@ UT_TEST(test_native_delta_decode_ignores_absent_image_fields)
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(7);
 	UT_RUN(test_reverse_real_fpi_delta_chain_owns_reader_bytes);
 	UT_RUN(test_cycle_and_branch_do_not_expose_canonical_pages);
 	UT_RUN(test_corrupt_owned_fpi_is_refused_by_real_decoder);
 	UT_RUN(test_shared_page_lsn_keeps_opaque_version_in_merge_window);
 	UT_RUN(test_native_delta_decode_ignores_absent_image_fields);
+	UT_RUN(test_original_root_scanner_resolves_reverse_three_origin_native_page_chain);
+	UT_RUN(test_original_root_scanner_refuses_missing_source_or_version_dependency);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

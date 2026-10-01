@@ -37,6 +37,14 @@ typedef struct ClusterThreadRecoveryFabricApplyResultV1 {
 
 struct ClusterThreadRecoveryAuthorityV1;
 
+/* Collect all exact original cuts before resolving PAGE dependencies. Every
+ * authority must borrow the same held retention set; observed generation
+ * claims must name one database. This creates no mutation authority. */
+extern RfPageProofDetailV1 cluster_thread_recovery_fabric_scan_roots_v1(
+	const struct ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count,
+	bool space_active, ClusterThreadRecoveryFabricPlanV1 **out_plan,
+	uint64 *out_record_count);
+
 extern RfPageProofDetailV1 cluster_thread_recovery_fabric_plan_create_v1(
 	const ClusterThreadRecoveryFabricPlanRequestV1 *request,
 	ClusterThreadRecoveryFabricPlanV1 **out_plan);

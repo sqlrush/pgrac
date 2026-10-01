@@ -1276,10 +1276,12 @@ test_cluster_page_dependency_base.o: $(top_srcdir)/src/backend/cluster/cluster_p
 
 test_cluster_page_dependency: test_cluster_page_dependency.c unit_test.h \
 		$(top_srcdir)/src/include/storage/bufpage.h \
+		$(CLUSTER_THREAD_RECOVERY_FABRIC_SCAN_O) $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o \
 		test_cluster_page_dependency_base.o xlogreader_fs.o $(XLOG_PAGE_EDGE_ENCODER_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_PAGE_ONLINE_PLAN_O) \
+		$(CLUSTER_THREAD_RECOVERY_FABRIC_SCAN_O) $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 		$(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) $(CLUSTER_BLOCK_APPLY_O) \
 		test_cluster_space_bufpage_product.o test_cluster_page_dependency_base.o xlogreader_fs.o \
 		$(XLOG_PAGE_EDGE_ENCODER_O) \
