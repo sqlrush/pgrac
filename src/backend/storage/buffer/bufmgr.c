@@ -10503,6 +10503,7 @@ struct ClusterPageDataReceiptV1 {
 	ClusterPageDataTargetV1 target;
 	ClusterPageWalBindingV1 wal;
 	ClusterPcmPiWriteCutV1 pi_cut;
+	ClusterPcmPiStorageCutV1 storage_cut;
 };
 
 /* Neither a tag nor a pin grants write authority. Check every live fence
@@ -10726,7 +10727,7 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 	PG_END_TRY();
 	if (!complete)
 		return false;
-	receipt = palloc(sizeof(*receipt));
+	receipt = palloc0(sizeof(*receipt));
 	receipt->magic = UINT64_C(0x5047444154413031);
 	receipt->target = written_target;
 	receipt->wal = binding;
@@ -10889,6 +10890,190 @@ cluster_page_data_pi_proof_v1(const ClusterPageDataReceiptV1 *receipt,
 	 * local redirty can appear in the plan without invalidating this DATA;
 	 * the PAGE prefix leaves those later contributions uncovered. */
 	*out = receipt->pi_cut;
+	return true;
+}
+
+static bool
+cluster_page_data_terminal_binding(const ClusterPageDataTargetV1 *target,
+								   const RfPageOnlinePlanV1 *plan,
+								   const ClusterWalSourceRef *sources, uint32 source_count,
+								   ClusterPageWalBindingV1 *out)
+{
+	RfPageContributionPrefixV1 prefixes[RF_PAGE_STABLE_MAX_PARTICIPANTS];
+	uint32 count = rf_page_online_plan_target_count_v1(plan);
+
+	if (target == NULL || !rf_page_identity_valid_v1(&target->identity)
+		|| !rf_page_version_present_v1(&target->version)
+		|| !cluster_page_data_prefix_v1(plan, sources, source_count, NULL, 0, prefixes)
+		|| target->database_incarnation != sources[0].claim.database_incarnation)
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		RfPageOnlineTargetViewV1 view;
+		const RfPageStableEdgeInputV1 *edge;
+		ClusterPageWalBindingV1 binding = { 0 };
+		if (!rf_page_online_plan_target_v1(plan, i, &view))
+			return false;
+		if (!rf_page_identity_equal_v1(&view.page_identity, &target->identity))
+			continue;
+		if (!rf_page_version_equal_v1(&view.expected_result, &target->version)
+			|| view.contributors == NULL || view.contributors->edge_count == 0)
+			return false;
+		edge = &view.contributors->edges[view.contributors->edge_count - 1];
+		if (edge->participant_index >= source_count
+			|| edge->edge.page_class != RF_PAGE_CLASS_ORDINARY
+			|| edge->edge.result_kind != RF_PAGE_STATE_PRESENT
+			|| edge->result_token != target->version.mutation_token
+			|| memcmp(edge->edge.result_incarnation, target->version.segment_incarnation, 16) != 0)
+			return false;
+		binding.source = sources[edge->participant_index];
+		binding.identity = target->identity;
+		binding.version = target->version;
+		binding.record_start = edge->record_identity.read_rec_ptr;
+		binding.record_end = edge->record_identity.end_rec_ptr;
+		binding.record_crc = edge->record_identity.record_crc;
+		binding.rmid = edge->record_identity.rmid;
+		binding.info = edge->record_identity.info;
+		if (!cluster_page_wal_binding_shape_v1(&binding))
+			return false;
+		*out = binding;
+		return true;
+	}
+	return false;
+}
+
+static bool
+cluster_page_data_storage_page_valid(const ClusterPageWalBindingV1 *binding, Page page)
+{
+	PageHeader header = (PageHeader)page;
+	uint16 checksum = header->pd_checksum;
+	if (!cluster_page_wal_binding_matches_v1(binding, binding->identity.locator,
+											 binding->identity.forknum, binding->identity.blockno,
+											 page)
+		|| PageGetPageSize(page) != BLCKSZ
+		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+		|| (header->pd_flags & (~PD_VALID_FLAG_BITS | PD_SPACE_METADATA | PD_UNDO_SEG_HEADER)) != 0
+		|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ)
+		return false;
+	PageSetChecksumInplace(page, binding->identity.blockno);
+	if (DataChecksumsEnabled() && checksum != header->pd_checksum)
+		return false;
+	header->pd_checksum = 0;
+	return true;
+}
+
+bool
+cluster_bufmgr_observe_pi_storage_v1(const ClusterPageDataTargetV1 *target,
+									 const ClusterPcmPiStorageCutV1 *cut,
+									 const RfPageOnlinePlanV1 *plan,
+									 const ClusterWalSourceRef *sources, uint32 source_count,
+									 ClusterPageDataReceiptV1 **out)
+{
+	ClusterWalSourceRef source, current;
+	ClusterPageWalBindingV1 binding;
+	ClusterSpaceIdentityKey key = { 0 };
+	ClusterSpaceIdentity identity;
+	ClusterPcmOwnSnapshot space_owner, live;
+	ClusterPcmPiStorageCutV1 observed;
+	BufferTag space_tag, data_tag;
+	BufferDesc *volatile space = NULL;
+	ErrorContextCallback *saved_context = error_context_stack;
+	PGAlignedBlock before, after;
+	volatile bool complete = false;
+	uint64 token;
+	ClusterPageDataReceiptV1 *receipt;
+
+	if (out == NULL || *out != NULL || CurrentResourceOwner == NULL || !cluster_enabled
+		|| !cluster_shared_config || RecoveryInProgress()
+		|| !cluster_pcm_pi_storage_cut_valid_v1(cut) || cut->pi_holders_bitmap == 0
+		|| cut->master_node != cluster_node_id
+		|| !cluster_page_data_terminal_binding(target, plan, sources, source_count, &binding)
+		|| cluster_smgr_which_for(target->identity.locator, InvalidBackendId) != 1
+		|| !cluster_wal_thread_current_v2_ref(&source)
+		|| source.claim.identity.system_identifier != target->identity.system_identifier
+		|| source.claim.database_incarnation != target->database_incarnation
+		|| memcmp(source.claim.identity.storage_uuid, target->identity.storage_uuid, 16) != 0)
+		return false;
+	observed = *cut;
+	InitBufferTag(&data_tag, &target->identity.locator, target->identity.forknum,
+				  target->identity.blockno);
+	if (!BufferTagsEqual(&data_tag, &observed.resource)
+		|| !cluster_pcm_lock_pi_storage_matches_v1(&observed))
+		return false;
+	key.system_identifier = target->identity.system_identifier;
+	key.database_incarnation = target->database_incarnation;
+	memcpy(key.storage_uuid, target->identity.storage_uuid, 16);
+	key.locator = target->identity.locator;
+	InitBufferTag(&space_tag, &key.locator, SPACE_FORKNUM, 0);
+	PG_TRY();
+	{
+		do {
+			SMgrRelation rel;
+			space = cluster_page_data_try_hold(space_tag, false, &space_owner);
+			if (space == NULL
+				|| !cluster_space_identity_page_decode(BufHdrGetBlock(space), BLCKSZ, SPACE_FORKNUM,
+													   0, &key, &identity, &token)
+				|| identity.state != CLUSTER_SPACE_IDENTITY_LIVE
+				|| memcmp(identity.incarnation, target->version.segment_incarnation, 16) != 0)
+				break;
+			rel = smgropen(key.locator, InvalidBackendId);
+			smgrread(rel, target->identity.forknum, target->identity.blockno, before.data);
+			if (!cluster_page_data_storage_page_valid(&binding, before.data))
+				break;
+			smgrimmedsync(rel, target->identity.forknum);
+			smgrread(rel, target->identity.forknum, target->identity.blockno, after.data);
+			if (!cluster_page_data_storage_page_valid(&binding, after.data)
+				|| memcmp(before.data, after.data, BLCKSZ) != 0
+				|| !cluster_page_data_holder_ready(space, &space_tag, false, &live)
+				|| !cluster_pcm_own_fence_equal_exact(&space_owner, &live)
+				|| !cluster_wal_thread_current_v2_ref(&current)
+				|| !cluster_page_data_source_same(&source, &current)
+				|| !cluster_pcm_lock_pi_storage_matches_v1(&observed))
+				break;
+			complete = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		error_context_stack = saved_context;
+		if (space != NULL) {
+			if (InterruptHoldoffCount == 0)
+				HOLD_INTERRUPTS();
+			LWLockRelease(BufferDescriptorGetContentLock(space));
+			cluster_bufmgr_unpin_for_gcs(space);
+		}
+	}
+	PG_END_TRY();
+	if (!complete)
+		return false;
+	receipt = palloc0(sizeof(*receipt));
+	receipt->magic = UINT64_C(0x5047444154413031);
+	receipt->target = *target;
+	receipt->wal = binding;
+	receipt->storage_cut = observed;
+	*out = receipt;
+	return true;
+}
+
+bool
+cluster_page_data_pi_storage_proof_v1(const ClusterPageDataReceiptV1 *receipt,
+									  const RfPageOnlinePlanV1 *plan,
+									  const ClusterWalSourceRef *sources, uint32 source_count,
+									  ClusterPcmPiStorageCutV1 *out)
+{
+	ClusterPageDataTargetV1 target;
+	ClusterPageWalBindingV1 terminal;
+	BufferTag tag;
+	if (out == NULL || !cluster_page_data_receipt_read_v1(receipt, &target)
+		|| !cluster_pcm_pi_storage_cut_valid_v1(&receipt->storage_cut)
+		|| receipt->storage_cut.pi_holders_bitmap == 0
+		|| !cluster_page_data_terminal_binding(&target, plan, sources, source_count, &terminal)
+		|| !cluster_page_wal_same_mutation_v1(&terminal, &receipt->wal))
+		return false;
+	InitBufferTag(&tag, &target.identity.locator, target.identity.forknum, target.identity.blockno);
+	if (!BufferTagsEqual(&tag, &receipt->storage_cut.resource))
+		return false;
+	*out = receipt->storage_cut;
 	return true;
 }
 #endif

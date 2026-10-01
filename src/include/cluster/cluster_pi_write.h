@@ -26,6 +26,78 @@ typedef struct ClusterPcmPiWriteCutV1 {
 StaticAssertDecl(sizeof(ClusterPcmPiWriteCutV1) == 128,
 				 "PI write cut must remain a bounded value projection");
 
+/* No current X exists. Capture residency and any not-yet-granted storage
+ * waiter independently of the current-holder write certificate. */
+typedef struct ClusterPcmPiStorageCutV1 {
+	PcmAuthoritySnapshot authority;
+	ResourceXMasterSnapshot waiting;
+	BufferTag resource;
+	uint32 pi_holders_bitmap;
+	uint64 binding_generation;
+	uint64 resource_formation;
+	uint64 authority_generation;
+	uint64 master_generation;
+	uint64 master_session_incarnation;
+	int32 master_node;
+	uint32 reserved;
+} ClusterPcmPiStorageCutV1;
+
+StaticAssertDecl(sizeof(ClusterPcmPiStorageCutV1) == 232,
+				 "PI storage cut must remain a bounded transient projection");
+
+static inline bool
+cluster_pcm_pi_storage_cut_valid_v1(const ClusterPcmPiStorageCutV1 *cut)
+{
+	static const ResourceXMasterSnapshot no_waiter = { 0 };
+	const PcmAuthoritySnapshot *a;
+	if (cut == NULL)
+		return false;
+	a = &cut->authority;
+	return cut->reserved == 0 && cut->binding_generation != 0
+		   && cut->binding_generation != UINT64_MAX && cut->resource_formation != 0
+		   && cut->resource_formation != UINT64_MAX && cut->authority_generation != 0
+		   && cut->authority_generation != UINT64_MAX && cut->master_generation != 0
+		   && cut->master_generation != UINT64_MAX && cut->master_session_incarnation != 0
+		   && cut->master_session_incarnation != UINT64_MAX && cut->master_node >= 0
+		   && cut->master_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
+		   && (cut->resource.forkNum == MAIN_FORKNUM
+			   || cut->resource.forkNum == VISIBILITYMAP_FORKNUM)
+		   && a->reserved[0] == 0 && a->reserved[1] == 0 && a->transition_count != 0
+		   && a->transition_count != UINT64_MAX && a->x_holder_node == -1
+		   && ((a->state == PCM_STATE_N && a->s_holders_bitmap == 0
+				&& a->master_holder.node_id == UINT32_MAX)
+			   || (a->state == PCM_STATE_S && a->master_holder.node_id < 32
+				   && (a->s_holders_bitmap & ((uint32)1u << a->master_holder.node_id)) != 0))
+		   && ((a->pending_x_requester_node == -1 && a->pending_x_since_lsn == 0)
+			   || (a->pending_x_requester_node >= 0 && a->pending_x_requester_node < 32
+				   && a->pending_x_since_lsn != 0))
+		   && (memcmp(&cut->waiting, &no_waiter, sizeof(no_waiter)) == 0
+			   || (a->state == PCM_STATE_N && cut->waiting.phase == RESOURCE_X_MASTER_WAIT_PROOF
+				   && cut->waiting.resource_formation == cut->resource_formation
+				   && cut->waiting.master_session_incarnation == cut->master_session_incarnation
+				   && BufferTagsEqual(&cut->waiting.assertion.resource, &cut->resource)));
+}
+
+/* Master-local, read-only. An X grant or any exact cut change invalidates
+ * the observation. A WAIT_PROOF head may coexist with N + unpaid PI. */
+extern bool cluster_pcm_lock_pi_storage_snapshot_v1(BufferTag tag, ClusterPcmPiStorageCutV1 *out);
+extern bool cluster_pcm_lock_pi_storage_matches_v1(const ClusterPcmPiStorageCutV1 *cut);
+
+/* Read/fsync/read storage under the original SPACE0 identity owner. The
+ * requested version must be terminal in the sealed full-source plan.
+ * No DATA write or X acquisition. Output/ERROR ownership matches DATA. */
+extern bool cluster_bufmgr_observe_pi_storage_v1(const ClusterPageDataTargetV1 *target,
+												 const ClusterPcmPiStorageCutV1 *cut,
+												 const RfPageOnlinePlanV1 *plan,
+												 const ClusterWalSourceRef *sources,
+												 uint32 source_count,
+												 ClusterPageDataReceiptV1 **out);
+extern bool cluster_page_data_pi_storage_proof_v1(const ClusterPageDataReceiptV1 *receipt,
+												  const RfPageOnlinePlanV1 *plan,
+												  const ClusterWalSourceRef *sources,
+												  uint32 source_count,
+												  ClusterPcmPiStorageCutV1 *out);
+
 static inline bool
 cluster_pcm_pi_write_cut_valid_v1(const ClusterPcmPiWriteCutV1 *cut)
 {

@@ -2106,6 +2106,7 @@ test_cluster_page_wal: test_cluster_page_wal.c unit_test.h test_cluster_page_wal
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -lm -o $@
 
 test_cluster_page_data: test_cluster_page_data.c unit_test.h test_cluster_page_data.inc \
+		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		test_cluster_page_flush.inc \
 		test_cluster_space_recovery_flush.inc test_cluster_page_data_stable.o test_cluster_page_wal_product.o \
@@ -4518,6 +4519,7 @@ test_cluster_advisory: test_cluster_advisory.c unit_test.h \
 # No test clock or test-only branch enters the production object.
 test_cluster_pcm_lock_clock_product.o: \
 		$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c \
+		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
 		$(top_srcdir)/src/include/cluster/cluster_pcm_lock.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-Dclock_gettime=cluster_test_pcm_clock_gettime -c $< -o $@
@@ -4567,6 +4569,7 @@ test_cluster_pcm_stop_fields.inc: $(top_srcdir)/src/backend/cluster/cluster_pcm_
 	mv $@.tmp $@
 
 test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
 		test_cluster_pcm_stop_fields.inc \
 		test_cluster_pcm_predecessor_consumer.inc \
 		test_cluster_pcm_source_owner_layout.inc \

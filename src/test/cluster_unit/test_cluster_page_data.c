@@ -57,6 +57,7 @@ static unsigned pins[2];
 static bool locks[2], resident[2], busy[2], selected, sf_blocked, bad_checksum, bad_bytes;
 static bool stale_sync, redirty_sync, checksums = true;
 static bool zero_disk, late_fence;
+static bool storage_read, storage_cut_current = true, storage_cut_changed, storage_space_changed;
 static int throw_at;
 static unsigned writes, syncs, reads, wal_flushes, aborts;
 static XLogRecPtr local_insert_end;
@@ -359,7 +360,7 @@ smgrwrite(SMgrRelation r, ForkNumber f, BlockNumber b, const void *data, bool sk
 void
 smgrimmedsync(SMgrRelation r, ForkNumber f)
 {
-	UT_ASSERT(locks[0] && locks[1]);
+	UT_ASSERT(locks[0] && (storage_read ? !locks[1] : locks[1]));
 	fault(3);
 	UT_ASSERT_EQ(fsync(fileno(file)), 0);
 	syncs++;
@@ -369,12 +370,16 @@ smgrimmedsync(SMgrRelation r, ForkNumber f)
 		pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_DIRTY);
 	if (late_fence)
 		pg_atomic_write_u32(&own[1].flags, PCM_OWN_FLAG_REVOKING);
+	if (storage_cut_changed)
+		storage_cut_current = false;
+	if (storage_space_changed)
+		pg_atomic_fetch_add_u64(&own[0].generation, 1);
 }
 void
 smgrread(SMgrRelation r, ForkNumber f, BlockNumber b, void *out)
 {
-	UT_ASSERT(locks[0] && locks[1] && syncs);
-	fault(4);
+	UT_ASSERT(locks[0] && (storage_read ? !locks[1] : (locks[1] && syncs)));
+	fault(storage_read && reads > 0 ? 5 : 4);
 	reads++;
 	UT_ASSERT_EQ(pread(fileno(file), out, BLCKSZ, 0), BLCKSZ);
 	if (zero_disk) {
@@ -383,10 +388,15 @@ smgrread(SMgrRelation r, ForkNumber f, BlockNumber b, void *out)
 	}
 	if (bad_checksum)
 		((PageHeader)out)->pd_checksum ^= 1;
-	if (bad_bytes) {
+	if (bad_bytes && (!storage_read || reads > 1)) {
 		((char *)out)[500] ^= 1;
 		PageSetChecksumInplace(out, b);
 	}
+}
+bool
+cluster_pcm_lock_pi_storage_matches_v1(const ClusterPcmPiStorageCutV1 *cut)
+{
+	return storage_cut_current && cluster_pcm_pi_storage_cut_valid_v1(cut);
 }
 static void
 shared_buffer_write_error_callback(void *arg)
@@ -508,6 +518,8 @@ reset(void)
 	selected = true;
 	sf_blocked = bad_checksum = bad_bytes = stale_sync = redirty_sync = false;
 	zero_disk = late_fence = false;
+	storage_read = storage_cut_changed = storage_space_changed = false;
+	storage_cut_current = true;
 	checksums = true;
 	throw_at = 0;
 	writes = syncs = reads = wal_flushes = aborts = 0;
@@ -923,6 +935,145 @@ data_contribution_plan(const ClusterWalSourceRef sources[3])
 	return plan;
 }
 
+static RfPageOnlinePlanV1 *
+prepare_storage_observation(ClusterWalSourceRef sources[3], ClusterPcmPiStorageCutV1 *cut)
+{
+	RfPageOnlinePlanV1 *plan;
+	reset();
+	memset(cut, 0, sizeof(*cut));
+	for (int i = 0; i < 3; i++) {
+		sources[i] = writer;
+		sources[i].claim.identity.origin_thread_id = i + 1;
+		sources[i].claim.identity.origin_node_id = i;
+		sources[i].claim.claim_sha256[1] = i;
+	}
+	plan = data_contribution_plan(sources);
+	cut->authority.state = PCM_STATE_N;
+	cut->authority.master_holder.node_id = UINT32_MAX;
+	cut->authority.x_holder_node = cut->authority.pending_x_requester_node = -1;
+	cut->authority.transition_count = 6;
+	cut->resource = descriptors[1].bufferdesc.tag;
+	cut->pi_holders_bitmap = 7;
+	cut->binding_generation = 1;
+	cut->resource_formation = 17;
+	cut->authority_generation = 3;
+	cut->master_generation = 4;
+	cut->master_session_incarnation = 31;
+	/* Original C bytes are already on disk. No current DATA buffer is
+	 * involved in the actual owner below; only SPACE0 stays resident. */
+	resident[1] = false;
+	storage_read = true;
+	target.version.mutation_token = ((PageHeader)pages[1].data)->pd_block_scn = 7;
+	UT_ASSERT(PageSetLSNOrigin(pages[1].data, 2));
+	PageSetChecksumInplace(pages[1].data, 7);
+	UT_ASSERT_EQ(pwrite(fileno(file), pages[1].data, BLCKSZ, 0), BLCKSZ);
+	return plan;
+}
+
+static void
+n_s_storage_observation_qualifies_only_terminal_data(void)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		ClusterWalSourceRef sources[3];
+		ClusterPcmPiStorageCutV1 cut, proven;
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		RfPageContributionPrefixV1 prefixes[3];
+		RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &cut);
+		if (mode) {
+			cut.authority.state = PCM_STATE_S;
+			cut.authority.master_holder.node_id = 2;
+			cut.authority.s_holders_bitmap = 4;
+		}
+		UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt));
+		UT_ASSERT(receipt != NULL);
+		UT_ASSERT_EQ(writes + wal_flushes, 0);
+		UT_ASSERT_EQ(syncs, 1);
+		UT_ASSERT_EQ(reads, 2);
+		UT_ASSERT(cluster_page_data_pi_storage_proof_v1(receipt, plan, sources, 3, &proven));
+		UT_ASSERT_EQ(memcmp(&proven, &cut, sizeof(cut)), 0);
+		UT_ASSERT(cluster_page_data_prefix_v1(
+			plan, sources, 3, (const ClusterPageDataReceiptV1 *const *)&receipt, 1, prefixes));
+		UT_ASSERT_EQ(prefixes[0].first_uncovered_lsn, 0x200);
+		UT_ASSERT_EQ(prefixes[1].first_uncovered_lsn, 0x200);
+		UT_ASSERT_EQ(prefixes[2].first_uncovered_lsn, 0x100); /* Unwritten VM remains. */
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&plan);
+		clean();
+	}
+}
+
+static void
+storage_observation_rejects_incomplete_or_changed_proof(void)
+{
+	for (int c = 0; c < 11; c++) {
+		ClusterWalSourceRef sources[3];
+		ClusterPcmPiStorageCutV1 cut;
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &cut);
+		if (c == 0)
+			target.version.mutation_token
+				= 80; /* A's earlier completion is insufficient for N/S. */
+		if (c == 1)
+			sources[1].claim.identity.origin_owner_incarnation++;
+		if (c == 2)
+			bad_checksum = true;
+		if (c == 3)
+			bad_bytes = true;
+		if (c == 4)
+			storage_cut_changed = true;
+		if (c == 5)
+			storage_space_changed = true;
+		if (c == 6)
+			stale_sync = true;
+		if (c == 7)
+			zero_disk = true;
+		if (c == 8)
+			resident[0] = false;
+		if (c == 9)
+			storage_cut_current = false;
+		if (c == 10) {
+			UT_ASSERT(PageSetLSNOrigin(pages[1].data, 1));
+			PageSetChecksumInplace(pages[1].data, 7);
+			UT_ASSERT_EQ(pwrite(fileno(file), pages[1].data, BLCKSZ, 0), BLCKSZ);
+		}
+		UT_ASSERT(!cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt));
+		UT_ASSERT(receipt == NULL);
+		UT_ASSERT_EQ(writes + wal_flushes, 0);
+		if (c < 2 || c == 8 || c == 9)
+			UT_ASSERT_EQ(reads + syncs, 0);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&plan);
+		clean();
+	}
+}
+
+static void
+storage_observation_releases_space_on_io_error(void)
+{
+	for (int at = 3; at <= 5; at++) {
+		ClusterWalSourceRef sources[3];
+		ClusterPcmPiStorageCutV1 cut;
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &cut);
+		volatile bool caught = false;
+		throw_at = at;
+		PG_TRY();
+		{
+			(void)cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT(receipt == NULL);
+		UT_ASSERT_EQ(writes + wal_flushes + aborts, 0);
+		rf_page_online_plan_destroy_v1(&plan);
+		clean();
+	}
+}
+
 static void
 plan_sources_are_immutable(void)
 {
@@ -1246,7 +1397,7 @@ physical_receipts_close_only_exact_contributions(void)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(16);
 	UT_RUN(success_and_old_completion);
 	UT_RUN(identity_refusals);
 	UT_RUN(authority_refusals);
@@ -1260,6 +1411,9 @@ main(void)
 	UT_RUN(plan_sources_are_immutable);
 	UT_RUN(pi_cut_must_match_current_holder_before_data);
 	UT_RUN(physical_receipts_close_only_exact_contributions);
+	UT_RUN(n_s_storage_observation_qualifies_only_terminal_data);
+	UT_RUN(storage_observation_rejects_incomplete_or_changed_proof);
+	UT_RUN(storage_observation_releases_space_on_io_error);
 	if (file)
 		fclose(file);
 	UT_DONE();

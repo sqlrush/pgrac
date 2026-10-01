@@ -53,6 +53,7 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pi_write.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_resource_x_identity.h"
@@ -110,6 +111,12 @@ int NBuffers = 0;
 int cluster_injection_armed_count = 0;
 int cluster_gcs_reply_timeout_ms = 1;
 static uint64 ut_lms_master_generation = (UINT64_C(1) << 32) | UINT64_C(1);
+static uint64 ut_master_session = 31;
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	return ut_master_session;
+}
 static uint32 ut_wait_event_info_storage = 0;
 static bool stop_new_work_allowed = true;
 static int stop_new_work_calls;
@@ -9453,6 +9460,79 @@ UT_TEST(test_shared_legacy_grant_keeps_departed_writers_without_physical_pi)
 		cluster_pcm_lock_master_grant_x_to(tag, 2, 101, (SCN)11, 2, 17);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), shared ? 3 : 0);
 	}
+}
+
+UT_TEST(test_pi_storage_cut_tracks_n_s_and_rejects_changed_authority)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		BufferTag tag = make_tag(6514 + mode);
+		ClusterPcmPiStorageCutV1 cut, current, sentinel;
+		struct StopPcmEntryLayout *entry, before;
+		setup_pi_write_master(tag);
+		memset(&sentinel, 0xa5, sizeof(sentinel));
+		current = sentinel;
+		UT_ASSERT(!cluster_pcm_lock_pi_storage_snapshot_v1(tag, &current));
+		UT_ASSERT_EQ(memcmp(&current, &sentinel, sizeof(current)), 0);
+		UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(
+						 tag, mode ? PCM_TRANS_X_TO_S_DOWNGRADE : PCM_TRANS_X_TO_N_DOWNGRADE, 2),
+					 PCM_GCS_TRANSITION_APPLIED);
+		entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+		UT_ASSERT_NOT_NULL(entry);
+		before = *entry;
+		UT_ASSERT(cluster_pcm_lock_pi_storage_snapshot_v1(tag, &cut));
+		UT_ASSERT_EQ(cut.authority.state, mode ? PCM_STATE_S : PCM_STATE_N);
+		UT_ASSERT_EQ(cut.pi_holders_bitmap, 7);
+		UT_ASSERT(cluster_pcm_lock_pi_storage_matches_v1(&cut));
+		UT_ASSERT_EQ(memcmp(entry, &before, sizeof(before)), 0);
+		ut_master_session++;
+		UT_ASSERT(!cluster_pcm_lock_pi_storage_matches_v1(&cut));
+		ut_master_session--;
+		ut_lms_master_generation++;
+		UT_ASSERT(!cluster_pcm_lock_pi_storage_matches_v1(&cut));
+		ut_lms_master_generation--;
+		for (int field = 0; field < 5; field++) {
+			*entry = before;
+			if (field == 0)
+				entry->binding_generation++;
+			if (field == 1)
+				pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
+			if (field == 2)
+				pg_atomic_fetch_or_u32(&entry->pi_holders_bitmap, 8);
+			if (field == 3)
+				pg_atomic_write_u32(&entry->master_state, PCM_STATE_X);
+			if (field == 4)
+				entry->pending_x_requester_node = 3;
+			UT_ASSERT(!cluster_pcm_lock_pi_storage_matches_v1(&cut));
+		}
+		*entry = before;
+		UT_ASSERT(cluster_pcm_lock_pi_storage_matches_v1(&cut));
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pi_storage_cut_allows_waiting_storage_x_without_grant)
+{
+	BufferTag tag = make_tag(6516);
+	ClusterPcmPiStorageCutV1 cut;
+	ResourceXDecodedFrame assertion;
+	ResourceXMasterSnapshot snapshot;
+	reset_fake_pcm_runtime(4);
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_X, 0),
+				 PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_X_TO_N_DOWNGRADE, 0),
+				 PCM_GCS_TRANSITION_APPLIED);
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 2, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 2, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_PROOF);
+	UT_ASSERT(cluster_pcm_lock_pi_storage_snapshot_v1(tag, &cut));
+	UT_ASSERT_EQ(cut.authority.state, PCM_STATE_N);
+	UT_ASSERT_EQ(cut.waiting.phase, RESOURCE_X_MASTER_WAIT_PROOF);
+	UT_ASSERT(cluster_pcm_lock_pi_storage_matches_v1(&cut));
+	cluster_shared_config = false;
 }
 
 UT_TEST(test_pi_write_master_exact_retirement)
@@ -19507,7 +19587,7 @@ UT_TEST(test_stop_seal_keeps_original_identity_validation_first)
 int
 main(void)
 {
-	UT_PLAN(288);
+	UT_PLAN(290);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -19648,6 +19728,8 @@ main(void)
 	UT_RUN(test_resource_x_settled_retirement_tombstone_replays_and_frees_live_slot);
 	UT_RUN(test_pi_write_master_exact_retirement);
 	UT_RUN(test_shared_legacy_grant_keeps_departed_writers_without_physical_pi);
+	UT_RUN(test_pi_storage_cut_tracks_n_s_and_rejects_changed_authority);
+	UT_RUN(test_pi_storage_cut_allows_waiting_storage_x_without_grant);
 	UT_RUN(test_pi_write_master_refuses_later_handoff_and_pending);
 	UT_RUN(test_resource_x_tombstone_lineage_drift_remains_terminal);
 	UT_RUN(test_pcm_protocol_debt_projection_rejects_settled_without_cached_or_pi);

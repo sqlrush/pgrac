@@ -48,6 +48,7 @@
 #include "cluster/cluster_cssd.h" /* PGRAC: spec-4.7a D4 — peer liveness for other-holder check */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_scn.h"
@@ -9870,6 +9871,79 @@ pcm_resource_x_terminal_tombstone_snapshot(const BufferTag *tag,
 	pcm_resource_x_master_snapshot(tag, tombstone->requester_node, state, &tombstone->request, out);
 	if (out != NULL)
 		out->is_head = 0;
+}
+
+static bool
+pcm_pi_storage_snapshot_locked(struct GrdEntry *entry, ClusterPcmPiStorageCutV1 *out)
+{
+	ClusterPcmPiStorageCutV1 cut = { 0 };
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmResourceXMasterRequest *head;
+	ResourceXGateSnapshot gate;
+	int32 head_node = -1;
+
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
+		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	if (pg_atomic_read_u32(&entry->lifecycle) != PCM_ENTRY_LIVE
+		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
+		|| !cluster_pcm_lock_resource_x_gate_open_exact(gate.formation)
+		|| (entry->resource_x_formation != 0 && entry->resource_x_formation != gate.formation))
+		return false;
+	state = pcm_resource_x_master_state_for_entry(entry);
+	if (state == NULL)
+		return false;
+	pcm_authority_snapshot_locked(entry, &cut.authority);
+	cut.resource = entry->tag;
+	cut.pi_holders_bitmap = pg_atomic_read_u32(&entry->pi_holders_bitmap);
+	cut.binding_generation = entry->binding_generation;
+	cut.resource_formation = gate.formation;
+	cut.authority_generation = state->authority_generation;
+	cut.master_generation = cluster_lms_get_shard_master_generation();
+	cut.master_session_incarnation = cluster_qvotec_get_self_incarnation();
+	cut.master_node = cluster_node_id;
+	/* A storage-X waiter cannot acquire X while unpaid PI remains. Allow
+	 * its exact pre-grant state so PI retirement can unblock that proof. */
+	head = pcm_resource_x_master_head(state, &head_node);
+	if (head != NULL) {
+		if (head->phase != RESOURCE_X_MASTER_WAIT_PROOF || cut.authority.state != PCM_STATE_N)
+			return false;
+		pcm_resource_x_master_snapshot(&entry->tag, head_node, state, head, &cut.waiting);
+	}
+	if (!cluster_pcm_pi_storage_cut_valid_v1(&cut))
+		return false;
+	*out = cut;
+	return true;
+}
+
+bool
+cluster_pcm_lock_pi_storage_snapshot_v1(BufferTag tag, ClusterPcmPiStorageCutV1 *out)
+{
+	ClusterPcmPiStorageCutV1 cut;
+	struct GrdEntry *entry;
+	bool found, valid = false;
+	if (out == NULL || !cluster_shared_config || ClusterPcm == NULL || cluster_pcm_htab == NULL
+		|| cluster_gcs_lookup_master(tag) != cluster_node_id)
+		return false;
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+		valid = pcm_pi_storage_snapshot_locked(entry, &cut) && cut.pi_holders_bitmap != 0;
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	if (valid)
+		*out = cut;
+	return valid;
+}
+
+bool
+cluster_pcm_lock_pi_storage_matches_v1(const ClusterPcmPiStorageCutV1 *cut)
+{
+	ClusterPcmPiStorageCutV1 current;
+	return cluster_pcm_pi_storage_cut_valid_v1(cut)
+		   && cluster_pcm_lock_pi_storage_snapshot_v1(cut->resource, &current)
+		   && memcmp(cut, &current, sizeof(current)) == 0;
 }
 
 static bool
