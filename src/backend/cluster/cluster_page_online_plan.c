@@ -1042,6 +1042,64 @@ rf_page_online_plan_page_prefix_v1(const RfPageOnlinePlanV1 *plan,
 	return true;
 }
 
+bool
+rf_page_online_plan_dependency_prefix_v1(const RfPageOnlinePlanV1 *plan,
+										 const RfPageContributionPrefixV1 *checkpoints,
+										 uint32 participant_count,
+										 RfPageContributionPrefixV1 *retained)
+{
+	RfPageContributionPrefixV1 candidate[RF_PAGE_STABLE_MAX_PARTICIPANTS] = { { 0 } };
+
+	if (plan == NULL || plan->magic != RF_PAGE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| checkpoints == NULL || retained == NULL || participant_count != plan->participant_count
+		|| participant_count == 0 || participant_count > RF_PAGE_STABLE_MAX_PARTICIPANTS)
+		return false;
+	for (uint32 i = 0; i < participant_count; i++) {
+		const RfContributorStreamCutV1 *cut = &plan->physical_cuts[i];
+		const RfPageContributionPrefixV1 *checkpoint = &checkpoints[i];
+
+		if (checkpoint->origin_thread != cut->failed_thread
+			|| checkpoint->timeline != cut->timeline_id || checkpoint->reserved_zero != 0
+			|| checkpoint->first_uncovered_lsn < cut->scan_begin_inclusive
+			|| checkpoint->first_uncovered_lsn > cut->scan_end_exclusive)
+			return false;
+		candidate[i] = *checkpoint;
+	}
+	for (uint32 i = 0; i < plan->target_count; i++) {
+		const RfPageOnlineTargetV1 *target = plan->targets[i];
+		bool needed = false;
+
+		for (uint32 j = 0; j < target->edge_count; j++) {
+			const RfPageStableEdgeInputV1 *edge = &target->edges[j];
+			XLogRecPtr checkpoint;
+
+			if (edge->participant_index >= participant_count)
+				return false;
+			checkpoint = checkpoints[edge->participant_index].first_uncovered_lsn;
+			if (checkpoint > edge->record_identity.read_rec_ptr
+				&& checkpoint < edge->record_identity.end_rec_ptr)
+				return false;
+			if (checkpoint < edge->record_identity.end_rec_ptr)
+				needed = true;
+		}
+		if (!needed)
+			continue;
+		/* Keep both ancestors needed to reconstruct a base and successors
+		 * needed to prove that a later DATA version covers this obligation.
+		 * Use the original checkpoint inputs above, never candidate: retained
+		 * history is not a newly uncovered obligation on another page. */
+		for (uint32 j = 0; j < target->edge_count; j++) {
+			const RfPageStableEdgeInputV1 *edge = &target->edges[j];
+			RfPageContributionPrefixV1 *prefix = &candidate[edge->participant_index];
+
+			prefix->first_uncovered_lsn
+				= Min(prefix->first_uncovered_lsn, edge->record_identity.read_rec_ptr);
+		}
+	}
+	memcpy(retained, candidate, participant_count * sizeof(*retained));
+	return true;
+}
+
 void
 rf_page_online_plan_destroy_v1(RfPageOnlinePlanV1 **plan_pointer)
 {

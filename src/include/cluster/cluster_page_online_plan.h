@@ -94,6 +94,17 @@ extern bool rf_page_online_plan_page_prefix_v1(const RfPageOnlinePlanV1 *plan,
 											   uint32 coverage_count,
 											   RfPageContributionPrefixV1 *prefixes,
 											   uint32 participant_count);
+/* PAGE ancestry constraint for independently qualified original checkpoint
+ * prefixes. While any edge on a page remains a recovery obligation, retain
+ * that page's complete input chain, including its FPI base. These are only
+ * necessary retention bounds; the caller still owns full source identity,
+ * durable checkpoint publication and every non-PAGE dependency. This does
+ * not turn a DATA receipt into a published checkpoint or authorize WAL GC.
+ * Failure leaves output unchanged; input and output may be the same array. */
+extern bool rf_page_online_plan_dependency_prefix_v1(const RfPageOnlinePlanV1 *plan,
+													 const RfPageContributionPrefixV1 *checkpoints,
+													 uint32 participant_count,
+													 RfPageContributionPrefixV1 *retained);
 extern void rf_page_online_plan_destroy_v1(RfPageOnlinePlanV1 **plan);
 
 #endif /* CLUSTER_PAGE_ONLINE_PLAN_H */

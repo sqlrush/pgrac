@@ -345,7 +345,7 @@ UT_TEST(test_original_root_scanner_refuses_missing_source_or_version_dependency)
 }
 
 static RfPageOnlinePlanV1 *
-make_plan(uint32 participants)
+make_plan_to(uint32 participants, XLogRecPtr end)
 {
 	RfContributorStreamCutV1 cuts[3] = {{0}};
 	RfPageOnlinePlanRequestV1 request = {0};
@@ -356,7 +356,7 @@ make_plan(uint32 participants)
 		cuts[i].timeline_id = 1;
 		cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
 		cuts[i].scan_begin_inclusive = 0x100;
-		cuts[i].scan_end_exclusive = 0x200;
+		cuts[i].scan_end_exclusive = end;
 	}
 	request.system_identifier = 99;
 	memset(request.storage_uuid, 3, 16);
@@ -365,6 +365,12 @@ make_plan(uint32 participants)
 	request.retention_binding_cookie = 41;
 	UT_ASSERT_EQ(rf_page_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
 	return plan;
+}
+
+static RfPageOnlinePlanV1 *
+make_plan(uint32 participants)
+{
+	return make_plan_to(participants, 0x200);
 }
 
 static RfPageProofDetailV1
@@ -531,6 +537,108 @@ UT_TEST(test_native_delta_decode_ignores_absent_image_fields)
 	rf_page_online_plan_destroy_v1(&plan);
 }
 
+UT_TEST(test_checkpoint_prefix_keeps_complete_three_origin_ancestry)
+{
+	RfPageOnlinePlanV1 *plan = make_plan(3);
+	RecordFixture fixture;
+	RfPageContributionPrefixV1 checkpoints[3] = { { 0 } }, retained[3], sentinel[3];
+
+	memset(sentinel, 0xa5, sizeof(sentinel));
+	memcpy(retained, sentinel, sizeof(retained));
+	UT_ASSERT(!rf_page_online_plan_dependency_prefix_v1(plan, checkpoints, 3, retained));
+	UT_ASSERT_EQ(memcmp(retained, sentinel, sizeof(retained)), 0);
+	record_init(&fixture, 60, 7, false, BLCKSZ - 1, 0xc3);
+	UT_ASSERT_EQ(enqueue(plan, &fixture, 2), RF_PAGE_PROOF_DETAIL_OK);
+	record_init(&fixture, 900, 60, false, BLCKSZ - 2, 0xb2);
+	UT_ASSERT_EQ(enqueue(plan, &fixture, 1), RF_PAGE_PROOF_DETAIL_OK);
+	record_init(&fixture, 10, 900, true, 0, 0xa1);
+	UT_ASSERT_EQ(enqueue(plan, &fixture, 0), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	for (unsigned completed = 0; completed < 8; completed++) {
+		for (int i = 0; i < 3; i++) {
+			checkpoints[i].origin_thread = i + 1;
+			checkpoints[i].timeline = 1;
+			checkpoints[i].first_uncovered_lsn = (completed & (1U << i)) ? 0x200 : 0x100;
+		}
+		UT_ASSERT(rf_page_online_plan_dependency_prefix_v1(plan, checkpoints, 3, retained));
+		for (int i = 0; i < 3; i++) {
+			UT_ASSERT_EQ(retained[i].origin_thread, i + 1);
+			UT_ASSERT_EQ(retained[i].timeline, 1);
+			UT_ASSERT_EQ(retained[i].first_uncovered_lsn, completed == 7 ? 0x200 : 0x100);
+		}
+	}
+	for (int bad = 0; bad < 7; bad++) {
+		RfPageContributionPrefixV1 changed[3];
+		memcpy(changed, checkpoints, sizeof(changed));
+		memcpy(retained, sentinel, sizeof(retained));
+		switch (bad) {
+		case 0:
+			changed[1].origin_thread = 1;
+			break;
+		case 1:
+			changed[1].timeline = 2;
+			break;
+		case 2:
+			changed[1].reserved_zero = 1;
+			break;
+		case 3:
+			changed[1].first_uncovered_lsn = 0xff;
+			break;
+		case 4:
+			changed[1].first_uncovered_lsn = 0x201;
+			break;
+		case 5:
+			changed[1].first_uncovered_lsn = 0x108;
+			break;
+		case 6:
+			changed[1].first_uncovered_lsn = InvalidXLogRecPtr;
+			break;
+		}
+		UT_ASSERT(!rf_page_online_plan_dependency_prefix_v1(plan, changed, 3, retained));
+		UT_ASSERT_EQ(memcmp(retained, sentinel, sizeof(retained)), 0);
+	}
+	checkpoints[0].first_uncovered_lsn = 0x100;
+	UT_ASSERT(rf_page_online_plan_dependency_prefix_v1(plan, checkpoints, 3, checkpoints));
+	for (int i = 0; i < 3; i++)
+		UT_ASSERT_EQ(checkpoints[i].first_uncovered_lsn, 0x100);
+	rf_page_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_retained_history_does_not_reopen_completed_other_page)
+{
+	RfPageOnlinePlanV1 *plan = make_plan_to(2, 0x300);
+	RecordFixture fixture;
+	RfPageContributionPrefixV1 checkpoints[2] = { { 1, 0, 1, 0x300 }, { 2, 0, 1, 0x200 } };
+	RfPageContributionPrefixV1 retained[2] = { { 0 } };
+
+	/* Page 4: A -> B, B is still an obligation. Page 5: B -> A, both
+	 * completed. Retaining A's earlier page 4 record is not a new duty on
+	 * page 5 and must not recursively pull B's old page 5 record back in. */
+	record_init(&fixture, 10, 900, true, 0, 0xa1);
+	UT_ASSERT_EQ(enqueue(plan, &fixture, 0), RF_PAGE_PROOF_DETAIL_OK);
+	record_init(&fixture, 19, 3, false, BLCKSZ - 1, 0xa2);
+	fixture.reader.ReadRecPtr = fixture.decoded.record.lsn = 0x200;
+	fixture.reader.EndRecPtr = fixture.decoded.record.next_lsn = 0x300;
+	fixture.decoded.record.blocks[0].blkno = 5;
+	UT_ASSERT_EQ(enqueue(plan, &fixture, 0), RF_PAGE_PROOF_DETAIL_OK);
+	record_init(&fixture, 20, 19, true, 0, 0xb1);
+	fixture.decoded.record.blocks[0].blkno = 5;
+	UT_ASSERT_EQ(enqueue(plan, &fixture, 1), RF_PAGE_PROOF_DETAIL_OK);
+	record_init(&fixture, 900, 7, false, BLCKSZ - 1, 0xb2);
+	fixture.reader.ReadRecPtr = fixture.decoded.record.lsn = 0x200;
+	fixture.reader.EndRecPtr = fixture.decoded.record.next_lsn = 0x300;
+	UT_ASSERT_EQ(enqueue(plan, &fixture, 1), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_page_online_plan_dependency_prefix_v1(plan, checkpoints, 2, retained));
+	UT_ASSERT_EQ(retained[0].first_uncovered_lsn, 0x100);
+	UT_ASSERT_EQ(retained[1].first_uncovered_lsn, 0x200);
+	checkpoints[1].first_uncovered_lsn = 0x300;
+	UT_ASSERT(rf_page_online_plan_dependency_prefix_v1(plan, checkpoints, 2, retained));
+	UT_ASSERT_EQ(retained[0].first_uncovered_lsn, 0x300);
+	UT_ASSERT_EQ(retained[1].first_uncovered_lsn, 0x300);
+	rf_page_online_plan_destroy_v1(&plan);
+}
+
 UT_TEST(test_actual_fabric_refuses_routed_components_without_side_consumer)
 {
 	for (source_failure = 3; source_failure <= 5; source_failure++) {
@@ -549,7 +657,7 @@ UT_TEST(test_actual_fabric_refuses_routed_components_without_side_consumer)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(10);
 	UT_RUN(test_reverse_real_fpi_delta_chain_owns_reader_bytes);
 	UT_RUN(test_cycle_and_branch_do_not_expose_canonical_pages);
 	UT_RUN(test_corrupt_owned_fpi_is_refused_by_real_decoder);
@@ -557,6 +665,8 @@ main(void)
 	UT_RUN(test_native_delta_decode_ignores_absent_image_fields);
 	UT_RUN(test_original_root_scanner_resolves_reverse_three_origin_native_page_chain);
 	UT_RUN(test_original_root_scanner_refuses_missing_source_or_version_dependency);
+	UT_RUN(test_checkpoint_prefix_keeps_complete_three_origin_ancestry);
+	UT_RUN(test_retained_history_does_not_reopen_completed_other_page);
 	UT_RUN(test_actual_fabric_refuses_routed_components_without_side_consumer);
 	UT_DONE();
 	return ut_failed_count != 0;

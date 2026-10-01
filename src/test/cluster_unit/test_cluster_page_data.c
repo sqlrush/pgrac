@@ -1024,7 +1024,7 @@ physical_receipts_close_only_exact_contributions(void)
 	ClusterPageDataReceiptV1 *old = NULL, *main = NULL, *vm = NULL;
 	const ClusterPageDataReceiptV1 *receipts[2];
 	ClusterWalSourceRef sources[3];
-	RfPageContributionPrefixV1 prefixes[3] = { { 0 } }, sentinel[3];
+	RfPageContributionPrefixV1 prefixes[3] = { { 0 } }, retained[3] = { { 0 } }, sentinel[3];
 	RfPageOnlinePlanV1 *plan;
 	FILE *main_file;
 	reset();
@@ -1042,6 +1042,9 @@ physical_receipts_close_only_exact_contributions(void)
 	UT_ASSERT_EQ(prefixes[0].first_uncovered_lsn, 0x200);
 	UT_ASSERT_EQ(prefixes[1].first_uncovered_lsn, 0x100);
 	UT_ASSERT_EQ(prefixes[2].first_uncovered_lsn, 0x100);
+	UT_ASSERT(rf_page_online_plan_dependency_prefix_v1(plan, prefixes, 3, retained));
+	for (int i = 0; i < 3; i++)
+		UT_ASSERT_EQ(retained[i].first_uncovered_lsn, 0x100);
 	writer = sources[2];
 	cluster_node_id = 2;
 	target.version.mutation_token = ((PageHeader)pages[1].data)->pd_block_scn = 7;
@@ -1054,6 +1057,9 @@ physical_receipts_close_only_exact_contributions(void)
 	UT_ASSERT_EQ(prefixes[0].first_uncovered_lsn, 0x200);
 	UT_ASSERT_EQ(prefixes[1].first_uncovered_lsn, 0x200);
 	UT_ASSERT_EQ(prefixes[2].first_uncovered_lsn, 0x100); /* C's VM is not written. */
+	UT_ASSERT(rf_page_online_plan_dependency_prefix_v1(plan, prefixes, 3, retained));
+	for (int i = 0; i < 3; i++)
+		UT_ASSERT_EQ(retained[i].first_uncovered_lsn, 0x100);
 	main_file = file;
 	file = tmpfile(); /* Physical fork routing remains the explicit smgr fixture. */
 	UT_ASSERT(file != NULL);
@@ -1065,6 +1071,15 @@ physical_receipts_close_only_exact_contributions(void)
 	UT_ASSERT(cluster_page_data_prefix_v1(plan, sources, 3, receipts, 2, prefixes));
 	for (int i = 0; i < 3; i++)
 		UT_ASSERT_EQ(prefixes[i].first_uncovered_lsn, 0x200);
+	UT_ASSERT(rf_page_online_plan_dependency_prefix_v1(plan, prefixes, 3, retained));
+	for (int i = 0; i < 3; i++)
+		UT_ASSERT_EQ(retained[i].first_uncovered_lsn, 0x200);
+	/* Even these actual completions do not publish A's root. If its durable
+	 * checkpoint has not advanced, B/C still retain the ancestry A needs. */
+	prefixes[0].first_uncovered_lsn = 0x100;
+	UT_ASSERT(rf_page_online_plan_dependency_prefix_v1(plan, prefixes, 3, retained));
+	for (int i = 0; i < 3; i++)
+		UT_ASSERT_EQ(retained[i].first_uncovered_lsn, 0x100);
 	/* An old completion plus C's VM still cannot cover B/C's main page. */
 	receipts[0] = old;
 	UT_ASSERT(cluster_page_data_prefix_v1(plan, sources, 3, receipts, 2, prefixes));
