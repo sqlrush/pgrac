@@ -1151,7 +1151,7 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 {
 	PGAlignedBlock verified;
 	PGAlignedBlock previous;
-	ClusterPageWalBindingV1 prepared_wal;
+	ClusterPageWalInstallV1 prepared_wal = { 0 };
 	ClusterPageWalBindingV1 installed_wal = { 0 };
 	BufferDesc *buf;
 	BufferTag lookup_tag;
@@ -1258,7 +1258,8 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 					|| PageGetLSN(page) != image->page_lsn
 					|| ((PageHeader)page)->pd_block_scn != image->page_scn
 					|| (cluster_shared_config
-						&& memcmp(&installed_wal, &prepared_wal, sizeof(prepared_wal)) != 0))
+						&& memcmp(&installed_wal, &prepared_wal.binding, sizeof(installed_wal))
+							   != 0))
 					result = RESOURCE_X_BUFFER_CORRUPT;
 				else
 					result = RESOURCE_X_BUFFER_ALREADY_INSTALLED;
@@ -1300,6 +1301,7 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 		UnlockBufHdr(buf, buf_state);
 	}
 
+	cluster_page_wal_release_install_v1(&prepared_wal);
 	LWLockRelease(content_lock);
 	cluster_bufmgr_unpin_for_gcs(buf);
 	return result;
@@ -6195,6 +6197,7 @@ cluster_bufmgr_resource_x_target_evict_locked(
 		buf_state = LockBufHdr(buf);
 	}
 	old_flags = buf_state & BUF_FLAG_MASK;
+	cluster_page_wal_reset_reuse_locked(buf);
 	ClearBufferTag(&buf->tag);
 	buf_state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
 	buf->buffer_type = (uint8)BUF_TYPE_CURRENT;
@@ -6347,6 +6350,9 @@ InvalidateBufferCommitTailLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldH
 	 * linear scans of the buffer array don't think the buffer is valid.
 	 */
 	oldFlags = buf_state & BUF_FLAG_MASK;
+#ifdef USE_PGRAC_CLUSTER
+	cluster_page_wal_reset_reuse_locked(buf);
+#endif
 	ClearBufferTag(&buf->tag);
 	buf_state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
 #ifdef USE_PGRAC_CLUSTER
@@ -6627,6 +6633,9 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	 * cheaper pre-check for several linear scans of shared buffers use the
 	 * tag (see e.g. FlushDatabaseBuffers()).
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	cluster_page_wal_reset_reuse_locked(buf_hdr);
+#endif
 	ClearBufferTag(&buf_hdr->tag);
 	buf_state &= ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK);
 #ifdef USE_PGRAC_CLUSTER

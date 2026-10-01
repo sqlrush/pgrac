@@ -12,8 +12,35 @@
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/shmem.h"
+#include "storage/spin.h"
 
-static ClusterPageWalBindingV1 *bindings;
+#define PAGE_WAL_SOURCE_SLOTS 256
+#define PAGE_WAL_SOURCE_MASK UINT16_C(0x7fff)
+#define PAGE_WAL_SLOT_FLUSHED UINT16_C(0x8000)
+
+typedef struct PageWalSlot {
+	uint8 incarnation[16];
+	uint64 token;
+	XLogRecPtr start, end;
+	uint32 crc;
+	uint16 source_flags; /* 1-based source slot; high bit is native flush */
+	uint8 rmid, info;
+} PageWalSlot;
+StaticAssertDecl(sizeof(PageWalSlot) == 48, "page WAL resident slot budget");
+
+typedef struct PageWalSource {
+	ClusterWalSourceRef source;
+	uint32 references;
+} PageWalSource;
+
+typedef struct PageWalShared {
+	slock_t source_lock;
+	PageWalSource sources[PAGE_WAL_SOURCE_SLOTS];
+	PageWalSlot slots[FLEXIBLE_ARRAY_MEMBER];
+} PageWalShared;
+
+static PageWalShared *page_wal_shared;
+#define bindings (page_wal_shared == NULL ? NULL : page_wal_shared->slots)
 
 static bool
 page_wal_same_source(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b)
@@ -23,6 +50,97 @@ page_wal_same_source(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b)
 		   && a->claim.max_config_generation == b->claim.max_config_generation
 		   && memcmp(a->claim.claim_sha256, b->claim.claim_sha256, 32) == 0
 		   && a->timeline == b->timeline;
+}
+
+/* Only this bounded local pool lock is taken under the original content or
+ * descriptor reuse lock. Never allocate, do I/O, or acquire a buffer/GCS lock
+ * while holding it. A slot/T2 reference keeps its full source immutable. */
+static uint16
+page_wal_source_acquire(const ClusterWalSourceRef *source)
+{
+	uint16 chosen = 0, unused = 0;
+	SpinLockAcquire(&page_wal_shared->source_lock);
+	for (uint16 i = 1; i <= PAGE_WAL_SOURCE_SLOTS; i++) {
+		PageWalSource *entry = &page_wal_shared->sources[i - 1];
+		if (entry->references == 0) {
+			if (unused == 0)
+				unused = i;
+		} else if (page_wal_same_source(source, &entry->source)) {
+			if (entry->references != UINT32_MAX) {
+				entry->references++;
+				chosen = i;
+			}
+			goto done;
+		}
+	}
+	if (unused != 0) {
+		PageWalSource *entry = &page_wal_shared->sources[unused - 1];
+		entry->source = *source;
+		entry->references = 1;
+		chosen = unused;
+	}
+done:
+	SpinLockRelease(&page_wal_shared->source_lock);
+	return chosen;
+}
+
+static bool
+page_wal_source_release(uint16 index)
+{
+	bool valid;
+	if (index == 0)
+		return true;
+	if (page_wal_shared == NULL || index > PAGE_WAL_SOURCE_SLOTS)
+		return false;
+	SpinLockAcquire(&page_wal_shared->source_lock);
+	valid = page_wal_shared->sources[index - 1].references != 0;
+	if (valid)
+		page_wal_shared->sources[index - 1].references--;
+	SpinLockRelease(&page_wal_shared->source_lock);
+	return valid;
+}
+
+static void
+page_wal_slot_encode(PageWalSlot *slot, const ClusterPageWalBindingV1 *value, uint16 source)
+{
+	memcpy(slot->incarnation, value->version.segment_incarnation, 16);
+	slot->token = value->version.mutation_token;
+	slot->start = value->record_start;
+	slot->end = value->record_end;
+	slot->crc = value->record_crc;
+	slot->source_flags = source;
+	if (value->flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED)
+		slot->source_flags |= PAGE_WAL_SLOT_FLUSHED;
+	slot->rmid = value->rmid;
+	slot->info = value->info;
+}
+
+static bool
+page_wal_expand(BufferDesc *buf, ClusterPageWalBindingV1 *value)
+{
+	const PageWalSlot *slot = &bindings[buf->buf_id];
+	uint16 source = slot->source_flags & PAGE_WAL_SOURCE_MASK;
+	if (source == 0 || source > PAGE_WAL_SOURCE_SLOTS)
+		return false;
+	memset(value, 0, sizeof(*value));
+	/* The caller's original pin/content lock protects the resident reference;
+	 * another buffer may alter its refcount but cannot replace these bytes. */
+	value->source = page_wal_shared->sources[source - 1].source;
+	value->identity.system_identifier = value->source.claim.identity.system_identifier;
+	memcpy(value->identity.storage_uuid, value->source.claim.identity.storage_uuid, 16);
+	value->identity.locator = BufTagGetRelFileLocator(&buf->tag);
+	value->identity.forknum = buf->tag.forkNum;
+	value->identity.blockno = buf->tag.blockNum;
+	memcpy(value->version.segment_incarnation, slot->incarnation, 16);
+	value->version.mutation_token = slot->token;
+	value->record_start = slot->start;
+	value->record_end = slot->end;
+	value->record_crc = slot->crc;
+	value->rmid = slot->rmid;
+	value->info = slot->info;
+	value->flags
+		= (slot->source_flags & PAGE_WAL_SLOT_FLUSHED) ? CLUSTER_PAGE_WAL_NATIVE_FLUSHED : 0;
+	return true;
 }
 
 bool
@@ -71,6 +189,7 @@ bool
 cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
 {
 	BufferDesc *buf;
+	ClusterPageWalBindingV1 value;
 	uint32 state;
 	if (bindings == NULL || buffer <= 0 || buffer > NBuffers || out == NULL)
 		return false;
@@ -80,19 +199,20 @@ cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
 	state = pg_atomic_read_u32(&buf->state);
 	if ((state & (BM_VALID | BM_TAG_VALID | BM_PERMANENT))
 			!= (BM_VALID | BM_TAG_VALID | BM_PERMANENT)
-		|| (state & BM_IO_ERROR) != 0
-		|| !cluster_page_wal_binding_matches_v1(
-			&bindings[buffer - 1], BufTagGetRelFileLocator(&buf->tag), buf->tag.forkNum,
-			buf->tag.blockNum, BufferGetPage(buffer)))
+		|| (state & BM_IO_ERROR) != 0 || !page_wal_expand(buf, &value)
+		|| !cluster_page_wal_binding_matches_v1(&value, BufTagGetRelFileLocator(&buf->tag),
+												buf->tag.forkNum, buf->tag.blockNum,
+												BufferGetPage(buffer)))
 		return false;
-	*out = bindings[buffer - 1];
+	*out = value;
 	return true;
 }
 bool
 cluster_page_wal_prepare_install_v1(Buffer buffer, const ClusterPageWalBindingV1 *carrier,
-									Page image, ClusterPageWalBindingV1 *prepared)
+									Page image, ClusterPageWalInstallV1 *prepared)
 {
 	static const ClusterPageWalBindingV1 zero = { 0 };
+	ClusterPageWalInstallV1 result = { 0 };
 	ClusterWalSourceRef current;
 	BufferDesc *buf;
 	uint32 state;
@@ -117,41 +237,79 @@ cluster_page_wal_prepare_install_v1(Buffer buffer, const ClusterPageWalBindingV1
 			|| ((carrier->flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
 				&& !page_wal_same_source(&current, &carrier->source)))
 			return false;
+		result.source_slot = page_wal_source_acquire(&carrier->source);
+		if (result.source_slot == 0)
+			return false;
 	}
-	*prepared = *carrier;
+	result.binding = *carrier;
+	*prepared = result;
 	return true;
 }
 bool
-cluster_page_wal_publish_install_v1(Buffer buffer, const ClusterPageWalBindingV1 *prepared)
+cluster_page_wal_publish_install_v1(Buffer buffer, ClusterPageWalInstallV1 *prepared)
 {
+	static const ClusterPageWalBindingV1 zero = { 0 };
 	if (bindings == NULL || buffer <= 0 || buffer > NBuffers || prepared == NULL
 		|| !LWLockHeldByMeInMode(BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)),
 								 LW_EXCLUSIVE))
 		return false;
-	bindings[buffer - 1] = *prepared;
+	if (memcmp(&prepared->binding, &zero, sizeof(zero)) != 0
+		&& (prepared->source_slot == 0 || prepared->source_slot > PAGE_WAL_SOURCE_SLOTS
+			|| !page_wal_same_source(&prepared->binding.source,
+									 &page_wal_shared->sources[prepared->source_slot - 1].source)))
+		return false;
+	if (!page_wal_source_release(bindings[buffer - 1].source_flags & PAGE_WAL_SOURCE_MASK))
+		return false;
+	page_wal_slot_encode(&bindings[buffer - 1], &prepared->binding, prepared->source_slot);
+	prepared->source_slot = 0;
 	return true;
+}
+
+void
+cluster_page_wal_release_install_v1(ClusterPageWalInstallV1 *prepared)
+{
+	if (prepared != NULL) {
+		if (!page_wal_source_release(prepared->source_slot))
+			elog(PANIC, "page WAL preparation lost its source reference");
+		prepared->source_slot = 0;
+	}
 }
 
 bool
 cluster_page_wal_forget_v1(Buffer buffer)
 {
-	static const ClusterPageWalBindingV1 zero = { 0 };
+	ClusterPageWalInstallV1 zero = { 0 };
 	return cluster_page_wal_publish_install_v1(buffer, &zero);
+}
+
+void
+cluster_page_wal_reset_reuse_locked(BufferDesc *buf)
+{
+	if (bindings == NULL)
+		return;
+	if (buf == NULL || buf->buf_id < 0 || buf->buf_id >= NBuffers
+		|| (pg_atomic_read_u32(&buf->state) & BM_LOCKED) == 0
+		|| !page_wal_source_release(bindings[buf->buf_id].source_flags & PAGE_WAL_SOURCE_MASK))
+		elog(PANIC, "page WAL descriptor reuse lost its source owner");
+	memset(&bindings[buf->buf_id], 0, sizeof(PageWalSlot));
 }
 
 Size
 cluster_page_wal_shmem_size(void)
 {
-	return mul_size((Size)NBuffers, sizeof(ClusterPageWalBindingV1));
+	return add_size(offsetof(PageWalShared, slots), mul_size((Size)NBuffers, sizeof(PageWalSlot)));
 }
 
 void
 cluster_page_wal_shmem_init(void)
 {
 	bool found;
-	bindings = ShmemInitStruct("pgrac page WAL binding", cluster_page_wal_shmem_size(), &found);
-	if (!found)
-		memset(bindings, 0, cluster_page_wal_shmem_size());
+	page_wal_shared
+		= ShmemInitStruct("pgrac page WAL binding", cluster_page_wal_shmem_size(), &found);
+	if (!found) {
+		memset(page_wal_shared, 0, cluster_page_wal_shmem_size());
+		SpinLockInit(&page_wal_shared->source_lock);
+	}
 }
 
 static const ClusterShmemRegion page_wal_region = {
@@ -178,6 +336,7 @@ cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1
 	BufferDesc *buf;
 	Page page;
 	uint32 state;
+	uint16 old_source, source;
 
 	if (bindings == NULL || buffer <= 0 || buffer > NBuffers || edge == NULL || !cluster_enabled
 		|| !cluster_shared_config || RecoveryInProgress() || result_token == 0
@@ -221,7 +380,22 @@ cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1
 	value.info = info;
 	/* This exact successful record owns the new version. Native callers set
 	 * PageLSN after XLogInsert returns, still under this content lock. */
-	bindings[buffer - 1] = value;
+	old_source = bindings[buffer - 1].source_flags & PAGE_WAL_SOURCE_MASK;
+	if (old_source > PAGE_WAL_SOURCE_SLOTS)
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	if (old_source != 0
+		&& page_wal_same_source(&page_wal_shared->sources[old_source - 1].source, &value.source))
+		source = old_source; /* ordinary same-writer hot path needs no pool lock */
+	else {
+		source = page_wal_source_acquire(&value.source);
+		if (source == 0)
+			return CLUSTER_PAGE_WAL_UNATTRIBUTED;
+		if (!page_wal_source_release(old_source)) {
+			(void)page_wal_source_release(source);
+			return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+		}
+	}
+	page_wal_slot_encode(&bindings[buffer - 1], &value, source);
 	return CLUSTER_PAGE_WAL_CAPTURED;
 }
 
@@ -229,7 +403,8 @@ bool
 cluster_page_wal_read_v1(Buffer buffer, const ClusterSpaceIdentity *identity,
 						 ClusterPageWalBindingV1 *out)
 {
-	const ClusterPageWalBindingV1 *value;
+	ClusterPageWalBindingV1 binding;
+	const ClusterPageWalBindingV1 *value = &binding;
 	BufferDesc *buf;
 	Page page;
 	int origin;
@@ -244,9 +419,8 @@ cluster_page_wal_read_v1(Buffer buffer, const ClusterSpaceIdentity *identity,
 	state = pg_atomic_read_u32(&buf->state);
 	if ((state & (BM_VALID | BM_TAG_VALID | BM_PERMANENT))
 			!= (BM_VALID | BM_TAG_VALID | BM_PERMANENT)
-		|| (state & BM_IO_ERROR) != 0)
+		|| (state & BM_IO_ERROR) != 0 || !page_wal_expand(buf, &binding))
 		return false;
-	value = &bindings[buffer - 1];
 	page = BufferGetPage(buffer);
 	if (value->record_start == InvalidXLogRecPtr || value->record_start >= value->record_end
 		|| (value->flags & ~CLUSTER_PAGE_WAL_NATIVE_FLUSHED) != 0

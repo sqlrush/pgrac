@@ -22,9 +22,11 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
-static BufferDescPadded desc;
+static uint32 wait_event;
+uint32 *my_wait_event_info = &wait_event;
+static BufferDescPadded desc, many_descriptors[258];
 BufferDescPadded *BufferDescriptors = &desc;
-static PGAlignedBlock page, private_page;
+static PGAlignedBlock page, private_page, many_pages[258];
 char *BufferBlocks = page.data;
 Block *LocalBufferBlockPointers;
 int NBuffers = 1, NLocBuffer, cluster_node_id = 0;
@@ -32,7 +34,8 @@ bool cluster_enabled = true, cluster_shared_config = true;
 static bool locked, exclusive, permitted, selected;
 static ClusterSpaceIdentity space;
 static ClusterWalSourceRef writer;
-static ClusterPageWalBindingV1 shared_binding;
+static void *shared_memory;
+static Size shared_bytes;
 static const ClusterShmemRegion *registered_region;
 static RfPageVersionEdgeEntryV1 edge;
 static unsigned allocations, insert_calls, assemble_calls;
@@ -48,6 +51,34 @@ ProcessingMode Mode = NormalProcessing;
 
 #include "test_cluster_pcm_checksum_owner.inc"
 #include "test_cluster_page_wal_image.inc"
+
+/* Real pre-grant caller; ownership checks are controlled boundaries so all
+ * of its early exits must release the actual source-pool preparation. */
+static unsigned pregrant_variant, pregrant_snapshots, pregrant_failclosed;
+static ClusterPcmOwnResult
+pregrant_snapshot(BufferDesc *buf, ClusterPcmOwnSnapshot *out)
+{
+	memset(out, 0, sizeof(*out));
+	pregrant_snapshots++;
+	return ((pregrant_variant == 1 && pregrant_snapshots == 1)
+			|| (pregrant_variant == 4 && pregrant_snapshots == 2))
+			   ? CLUSTER_PCM_OWN_STALE
+			   : CLUSTER_PCM_OWN_OK;
+}
+#define cluster_bufmgr_pcm_own_snapshot pregrant_snapshot
+#define gcs_block_pcm_x_reserved_image_write_exact(...) (pregrant_variant != 2)
+#define cluster_pcm_own_classify_live_flags(...) CLUSTER_PCM_OWN_CORRUPT
+#define cluster_bufmgr_pcm_own_publish_installed_x_image(...)                                      \
+	(pregrant_variant == 3 ? CLUSTER_PCM_OWN_CORRUPT : CLUSTER_PCM_OWN_OK)
+#define gcs_block_resource_x_fail_closed_current() (pregrant_failclosed++)
+#define gcs_block_note_install_copy() ((void)0)
+#include "test_cluster_page_wal_pregrant.inc"
+#undef cluster_bufmgr_pcm_own_snapshot
+#undef gcs_block_pcm_x_reserved_image_write_exact
+#undef cluster_pcm_own_classify_live_flags
+#undef cluster_bufmgr_pcm_own_publish_installed_x_image
+#undef gcs_block_resource_x_fail_closed_current
+#undef gcs_block_note_install_copy
 
 bool
 errstart(int level, const char *domain)
@@ -108,13 +139,21 @@ mul_size(Size a, Size b)
 {
 	return a * b;
 }
+Size
+add_size(Size a, Size b)
+{
+	return a + b;
+}
 void *
 ShmemInitStruct(const char *name, Size size, bool *found)
 {
-	UT_ASSERT_EQ(size, sizeof(shared_binding));
+	free(shared_memory);
+	shared_memory = calloc(1, size);
+	UT_ASSERT(shared_memory != NULL);
+	shared_bytes = size;
 	allocations++;
 	*found = false;
-	return &shared_binding;
+	return shared_memory;
 }
 void
 cluster_shmem_register_region(const ClusterShmemRegion *region)
@@ -228,6 +267,9 @@ static void
 reset(void)
 {
 	PageHeader h = (PageHeader)page.data;
+	NBuffers = 1;
+	BufferDescriptors = &desc;
+	BufferBlocks = page.data;
 	memset(&desc, 0, sizeof(desc));
 	memset(&page, 0, sizeof(page));
 	memset(&space, 0, sizeof(space));
@@ -291,6 +333,27 @@ capture(void)
 	return cluster_page_wal_capture_native_v1(1, &edge, 80, 0x120, 0x200, 0x9192, RM_HEAP_ID, 0)
 		   == CLUSTER_PAGE_WAL_CAPTURED;
 }
+static ClusterPageWalBindingV1
+current_binding(void)
+{
+	ClusterPageWalBindingV1 result = { 0 };
+	UT_ASSERT(cluster_page_wal_snapshot_v1(1, &result));
+	return result;
+}
+static void
+resident_binding_memory_budget(void)
+{
+	Size one, many;
+	NBuffers = 1;
+	one = cluster_page_wal_shmem_size();
+	NBuffers = 16384;
+	many = cluster_page_wal_shmem_size();
+	printf("# Resident WAL bytes per buffer: %zu; 16384-buffer region: %zu bytes\n",
+		   (many - one) / 16383, many);
+	UT_ASSERT_EQ(many - one, (Size)48 * 16383);
+	UT_ASSERT(many <= (Size)48 * NBuffers + 65536);
+	NBuffers = 1;
+}
 static void
 native_insert_source(void)
 {
@@ -336,7 +399,7 @@ exact_generation_survives_new_writer(void)
 static void
 native_capture_refusal_clears_old_binding(void)
 {
-	ClusterPageWalBindingV1 zero = { 0 };
+	ClusterPageWalBindingV1 out;
 	reset();
 	UT_ASSERT(capture());
 	selected = false;
@@ -348,15 +411,17 @@ native_capture_refusal_clears_old_binding(void)
 	UT_ASSERT(!native_panicked);
 	UT_ASSERT_EQ(insert_calls, 1);
 	UT_ASSERT(!begininsert_called && !page_version_edge_registered);
-	UT_ASSERT(memcmp(&shared_binding, &zero, sizeof(zero)) == 0);
+	PageSetLSNPreserveOrigin(page.data, 0x200);
+	UT_ASSERT(!cluster_page_wal_snapshot_v1(1, &out));
 }
 static void
 native_capture_requires_clear_owner(void)
 {
-	ClusterPageWalBindingV1 before;
+	void *before;
 	reset();
 	UT_ASSERT(capture());
-	before = shared_binding;
+	before = malloc(shared_bytes);
+	memcpy(before, shared_memory, shared_bytes);
 	exclusive = false;
 	XLogRegisterBuffer(0, 1, REGBUF_STANDARD);
 	catch_native_errors = true;
@@ -364,7 +429,8 @@ native_capture_requires_clear_owner(void)
 		(void)XLogInsert(RM_HEAP_ID, 0);
 	catch_native_errors = false;
 	UT_ASSERT(native_panicked);
-	UT_ASSERT(memcmp(&shared_binding, &before, sizeof(before)) == 0);
+	UT_ASSERT(memcmp(shared_memory, before, shared_bytes) == 0);
+	free(before);
 }
 static void
 stale_page_or_space_never_reads(void)
@@ -422,6 +488,7 @@ static void
 capture_requires_original_owner(void)
 {
 	for (int i = 0; i < 6; i++) {
+		ClusterPageWalBindingV1 out;
 		reset();
 		if (i == 0)
 			exclusive = false;
@@ -436,21 +503,25 @@ capture_requires_original_owner(void)
 		if (i == 5)
 			edge.page_class = RF_PAGE_CLASS_REBUILDABLE_FSM;
 		UT_ASSERT(!capture());
-		UT_ASSERT_EQ(shared_binding.record_end, 0);
+		PageSetLSNPreserveOrigin(page.data, 0x200);
+		UT_ASSERT(!cluster_page_wal_snapshot_v1(1, &out));
 	}
 }
 static void
 private_page_and_nonshared_skip(void)
 {
+	ClusterPageWalBindingV1 out;
 	reset();
 	memcpy(private_page.data, page.data, BLCKSZ);
 	XLogRegisterBlock(0, &space.key.locator, MAIN_FORKNUM, 7, private_page.data, REGBUF_STANDARD);
 	UT_ASSERT_EQ(XLogInsert(RM_HEAP_ID, 0), 0x200);
-	UT_ASSERT_EQ(shared_binding.record_end, 0);
+	PageSetLSNPreserveOrigin(page.data, 0x200);
+	UT_ASSERT(!cluster_page_wal_snapshot_v1(1, &out));
 	reset();
 	XLogRegisterBuffer(0, 1, REGBUF_STANDARD);
 	UT_ASSERT_EQ(XLogInsert(RM_HEAP_ID, 0), 0x200);
-	UT_ASSERT_EQ(shared_binding.version.mutation_token, 80);
+	PageSetLSNPreserveOrigin(page.data, 0x200);
+	UT_ASSERT_EQ(current_binding().version.mutation_token, 80);
 	/* Reuse the same native registration slot for a private build page. */
 	begininsert_called = page_version_edge_registered = true;
 	registered_page_version_result_token = 19;
@@ -459,12 +530,13 @@ private_page_and_nonshared_skip(void)
 	((PageHeader)private_page.data)->pd_block_scn = 19;
 	XLogRegisterBlock(0, &space.key.locator, MAIN_FORKNUM, 7, private_page.data, REGBUF_STANDARD);
 	UT_ASSERT_EQ(XLogInsert(RM_HEAP_ID, 0), 0x200);
-	UT_ASSERT_EQ(shared_binding.version.mutation_token, 80);
+	UT_ASSERT_EQ(current_binding().version.mutation_token, 80);
 	reset();
 	cluster_shared_config = false;
 	XLogRegisterBuffer(0, 1, REGBUF_STANDARD);
 	UT_ASSERT_EQ(XLogInsert(RM_HEAP_ID, 0), 0x200);
-	UT_ASSERT_EQ(shared_binding.record_end, 0);
+	PageSetLSNPreserveOrigin(page.data, 0x200);
+	UT_ASSERT(!cluster_page_wal_snapshot_v1(1, &out));
 }
 static void
 global_catalog_identity(void)
@@ -489,7 +561,9 @@ global_catalog_identity(void)
 static void
 carrier_install_keeps_original_generation(void)
 {
-	ClusterPageWalBindingV1 carrier, prepared, out;
+	ClusterPageWalBindingV1 carrier, out;
+	ClusterPageWalInstallV1 prepared = { 0 };
+	bool ready;
 	ResourceXDecodedFrame block = { 0 }, status, image;
 	ClusterPcmOwnSnapshot revoking = { 0 };
 	reset();
@@ -524,12 +598,14 @@ carrier_install_keeps_original_generation(void)
 	writer.claim.identity.origin_node_id = 1;
 	writer.claim.identity.origin_owner_incarnation = 12;
 	writer.claim.claim_sha256[0] = 99;
-	memset(&shared_binding, 0, sizeof(shared_binding));
-	UT_ASSERT(cluster_page_wal_prepare_install_v1(1, &carrier, page.data, &prepared));
-	if (!cluster_page_wal_prepare_install_v1(1, &carrier, page.data, &prepared))
+	UT_ASSERT(cluster_page_wal_forget_v1(1));
+	ready = cluster_page_wal_prepare_install_v1(1, &carrier, page.data, &prepared);
+	UT_ASSERT(ready);
+	if (!ready)
 		return;
-	UT_ASSERT_EQ(shared_binding.record_end, 0);
-	cluster_page_wal_publish_install_v1(1, &prepared);
+	UT_ASSERT(!cluster_page_wal_snapshot_v1(1, &out));
+	UT_ASSERT(cluster_page_wal_publish_install_v1(1, &prepared));
+	cluster_page_wal_release_install_v1(&prepared);
 	UT_ASSERT(cluster_page_wal_read_v1(1, &space, &out));
 	UT_ASSERT_EQ(out.source.claim.identity.origin_thread_id, 1);
 	UT_ASSERT_EQ(out.source.claim.claim_sha256[0], 13);
@@ -543,14 +619,17 @@ static void
 carrier_preflight_refuses_without_mutation(void)
 {
 	for (int i = 0; i < 9; i++) {
-		ClusterPageWalBindingV1 carrier, prepared, before;
+		ClusterPageWalBindingV1 carrier;
+		ClusterPageWalInstallV1 prepared;
+		void *before;
 		reset();
 		UT_ASSERT(capture());
 		PageSetLSNPreserveOrigin(page.data, 0x200);
 		UT_ASSERT(cluster_page_wal_snapshot_v1(1, &carrier));
 		if (!cluster_page_wal_snapshot_v1(1, &carrier))
 			return;
-		before = shared_binding;
+		before = malloc(shared_bytes);
+		memcpy(before, shared_memory, shared_bytes);
 		memset(&prepared, 0x59, sizeof(prepared));
 		if (i == 0)
 			writer.claim.database_incarnation++;
@@ -574,34 +653,41 @@ carrier_preflight_refuses_without_mutation(void)
 		}
 		UT_ASSERT(!cluster_page_wal_prepare_install_v1(1, &carrier, page.data, &prepared));
 		UT_ASSERT_EQ(((uint8 *)&prepared)[0], 0x59);
-		UT_ASSERT_EQ(memcmp(&shared_binding, &before, sizeof(before)), 0);
+		UT_ASSERT_EQ(memcmp(shared_memory, before, shared_bytes), 0);
+		free(before);
 	}
 }
 static void
 unattributed_carrier_clears_old_source(void)
 {
-	ClusterPageWalBindingV1 zero = { 0 }, prepared, out;
+	ClusterPageWalBindingV1 zero = { 0 }, out;
+	ClusterPageWalInstallV1 prepared = { 0 };
+	bool ready;
 	reset();
 	UT_ASSERT(capture());
 	PageSetLSNPreserveOrigin(page.data, 0x200);
-	UT_ASSERT(cluster_page_wal_prepare_install_v1(1, &zero, page.data, &prepared));
-	if (!cluster_page_wal_prepare_install_v1(1, &zero, page.data, &prepared))
+	ready = cluster_page_wal_prepare_install_v1(1, &zero, page.data, &prepared);
+	UT_ASSERT(ready);
+	if (!ready)
 		return;
-	cluster_page_wal_publish_install_v1(1, &prepared);
+	UT_ASSERT(cluster_page_wal_publish_install_v1(1, &prepared));
+	cluster_page_wal_release_install_v1(&prepared);
 	UT_ASSERT(!cluster_page_wal_read_v1(1, &space, &out));
 	UT_ASSERT(!cluster_page_wal_snapshot_v1(1, &out));
 }
 static void
 flush_certification_is_source_exact(void)
 {
-	ClusterPageWalBindingV1 certified, copied;
+	ClusterPageWalBindingV1 certified, copied, original;
+	ClusterPageWalInstallV1 prepared = { 0 };
 	reset();
 	UT_ASSERT(capture());
 	PageSetLSNPreserveOrigin(page.data, 0x200);
-	UT_ASSERT(cluster_page_wal_flush_source_v1(&shared_binding, &certified));
+	original = current_binding();
+	UT_ASSERT(cluster_page_wal_flush_source_v1(&original, &certified));
 	UT_ASSERT_EQ(flush_calls, 1);
 	UT_ASSERT_EQ(certified.flags, CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
-	UT_ASSERT_EQ(shared_binding.flags, 0);
+	UT_ASSERT_EQ(current_binding().flags, 0);
 	UT_ASSERT_EQ(flush_calls, 1);
 	writer.claim.identity.origin_thread_id = 2;
 	writer.claim.identity.origin_node_id = 1;
@@ -609,20 +695,24 @@ flush_certification_is_source_exact(void)
 	insert_end = 0x10;
 	UT_ASSERT(cluster_page_wal_flush_source_v1(&certified, &copied));
 	UT_ASSERT_EQ(flush_calls, 1);
-	UT_ASSERT(cluster_page_wal_same_mutation_v1(&copied, &shared_binding));
-	UT_ASSERT(cluster_page_wal_prepare_install_v1(1, &copied, page.data, &certified));
-	UT_ASSERT(cluster_page_wal_publish_install_v1(1, &certified));
-	UT_ASSERT_EQ(shared_binding.flags, CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
+	UT_ASSERT(cluster_page_wal_same_mutation_v1(&copied, &original));
+	UT_ASSERT(cluster_page_wal_prepare_install_v1(1, &copied, page.data, &prepared));
+	UT_ASSERT(cluster_page_wal_publish_install_v1(1, &prepared));
+	cluster_page_wal_release_install_v1(&prepared);
+	UT_ASSERT_EQ(current_binding().flags, CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
 	UT_ASSERT(capture());
-	UT_ASSERT_EQ(shared_binding.flags, 0);
+	UT_ASSERT(PageSetLSNOrigin(page.data, 1));
+	UT_ASSERT_EQ(current_binding().flags, 0);
 }
 static void
 flush_refusal_never_certifies(void)
 {
 	for (int i = 0; i < 7; i++) {
-		ClusterPageWalBindingV1 out;
+		ClusterPageWalBindingV1 out, binding;
 		reset();
 		UT_ASSERT(capture());
+		PageSetLSNPreserveOrigin(page.data, 0x200);
+		binding = current_binding();
 		if (i == 0)
 			writer.claim.identity.origin_owner_incarnation++;
 		if (i == 1)
@@ -636,20 +726,148 @@ flush_refusal_never_certifies(void)
 		if (i == 5)
 			flush_changes_source = true;
 		if (i == 6) {
-			shared_binding.flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+			binding.flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
 			writer.claim.database_incarnation++;
 		}
 		memset(&out, 0x59, sizeof(out));
-		UT_ASSERT(!cluster_page_wal_flush_source_v1(&shared_binding, &out));
+		UT_ASSERT(!cluster_page_wal_flush_source_v1(&binding, &out));
 		UT_ASSERT_EQ(((uint8 *)&out)[0], 0x59);
 		UT_ASSERT_EQ(flush_calls, i == 5 ? 1 : 0);
+	}
+}
+
+static void
+reset_many(void)
+{
+	reset();
+	for (int i = 0; i < lengthof(many_pages); i++) {
+		many_pages[i] = page;
+		many_descriptors[i] = desc;
+		many_descriptors[i].bufferdesc.buf_id = i;
+		many_descriptors[i].bufferdesc.tag.blockNum = 7 + i;
+		PageSetLSNPreserveOrigin(many_pages[i].data, 0x200);
+	}
+	NBuffers = lengthof(many_pages);
+	BufferDescriptors = many_descriptors;
+	BufferBlocks = many_pages[0].data;
+	cluster_page_wal_shmem_init();
+}
+
+static ClusterPageWalCaptureResultV1
+capture_many(int index, uint32 generation)
+{
+	writer.claim.identity.origin_owner_incarnation = generation;
+	memcpy(writer.claim.claim_sha256 + 1, &generation, sizeof(generation));
+	return cluster_page_wal_capture_native_v1(index + 1, &edge, 80, 0x120, 0x200, 0x9192,
+											  RM_HEAP_ID, 0);
+}
+
+static void
+shared_claim_and_descriptor_reuse_do_not_alias(void)
+{
+	ClusterPageWalBindingV1 first, other;
+	unsigned before_allocations;
+	reset_many();
+	before_allocations = allocations;
+	/* More buffers than source slots still consume one shared claim. */
+	for (int i = 0; i < NBuffers; i++)
+		UT_ASSERT_EQ(capture_many(i, 7), CLUSTER_PAGE_WAL_CAPTURED);
+	UT_ASSERT(cluster_page_wal_snapshot_v1(1, &first));
+	UT_ASSERT(cluster_page_wal_snapshot_v1(2, &other));
+	UT_ASSERT_EQ(memcmp(&first.source, &other.source, sizeof(first.source)), 0);
+	locked = exclusive = false;
+	pg_atomic_fetch_or_u32(&many_descriptors[0].bufferdesc.state, BM_LOCKED);
+	cluster_page_wal_reset_reuse_locked(&many_descriptors[0].bufferdesc);
+	many_descriptors[0].bufferdesc.tag.relNumber++;
+	pg_atomic_fetch_and_u32(&many_descriptors[0].bufferdesc.state, ~BM_LOCKED);
+	locked = exclusive = true;
+	/* Even identical old token/LSN bytes must not revive another tag's source. */
+	UT_ASSERT(!cluster_page_wal_snapshot_v1(1, &first));
+	UT_ASSERT(cluster_page_wal_snapshot_v1(2, &other));
+	UT_ASSERT_EQ(other.source.claim.identity.origin_owner_incarnation, 7);
+	UT_ASSERT_EQ(capture_many(0, 9), CLUSTER_PAGE_WAL_CAPTURED);
+	UT_ASSERT(cluster_page_wal_snapshot_v1(1, &first));
+	UT_ASSERT_EQ(first.source.claim.identity.origin_owner_incarnation, 9);
+	UT_ASSERT(cluster_page_wal_snapshot_v1(2, &other));
+	UT_ASSERT_EQ(other.source.claim.identity.origin_owner_incarnation, 7);
+	UT_ASSERT_EQ(allocations, before_allocations);
+}
+
+static void
+bounded_claim_pool_and_t2_reservation_release(void)
+{
+	ClusterPageWalBindingV1 carrier, observed;
+	ClusterPageWalInstallV1 prepared = { 0 };
+	unsigned before_allocations;
+	reset_many();
+	before_allocations = allocations;
+	for (int i = 0; i < 256; i++)
+		UT_ASSERT_EQ(capture_many(i, i + 1), CLUSTER_PAGE_WAL_CAPTURED);
+	UT_ASSERT_EQ(capture_many(256, 500), CLUSTER_PAGE_WAL_UNATTRIBUTED);
+	UT_ASSERT(!cluster_page_wal_snapshot_v1(257, &observed));
+	UT_ASSERT(cluster_page_wal_snapshot_v1(1, &carrier));
+	carrier.identity.blockno = many_descriptors[257].bufferdesc.tag.blockNum;
+	carrier.source = writer;
+	carrier.flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	UT_ASSERT(!cluster_page_wal_prepare_install_v1(258, &carrier, many_pages[257].data, &prepared));
+	UT_ASSERT_EQ(prepared.source_slot, 0);
+	UT_ASSERT(cluster_page_wal_forget_v1(1));
+	UT_ASSERT(cluster_page_wal_prepare_install_v1(258, &carrier, many_pages[257].data, &prepared));
+	/* Preparation pins its source before any page or authority mutation. */
+	UT_ASSERT_EQ(capture_many(256, 501), CLUSTER_PAGE_WAL_UNATTRIBUTED);
+	cluster_page_wal_release_install_v1(&prepared); /* failed/duplicate T2 */
+	UT_ASSERT_EQ(capture_many(256, 501), CLUSTER_PAGE_WAL_CAPTURED);
+	UT_ASSERT(cluster_page_wal_forget_v1(257));
+	UT_ASSERT(cluster_page_wal_prepare_install_v1(258, &carrier, many_pages[257].data, &prepared));
+	UT_ASSERT(cluster_page_wal_publish_install_v1(258, &prepared));
+	UT_ASSERT_EQ(prepared.source_slot, 0);
+	UT_ASSERT(!cluster_page_wal_publish_install_v1(258, &prepared));
+	cluster_page_wal_release_install_v1(&prepared);
+	UT_ASSERT_EQ(capture_many(256, 501), CLUSTER_PAGE_WAL_UNATTRIBUTED);
+	UT_ASSERT(cluster_page_wal_snapshot_v1(258, &observed));
+	UT_ASSERT_EQ(memcmp(&observed, &carrier, sizeof(carrier)), 0);
+	UT_ASSERT(cluster_page_wal_forget_v1(258));
+	UT_ASSERT_EQ(capture_many(256, 501), CLUSTER_PAGE_WAL_CAPTURED);
+	UT_ASSERT(cluster_page_wal_snapshot_v1(2, &observed));
+	UT_ASSERT_EQ(observed.source.claim.identity.origin_owner_incarnation, 2);
+	UT_ASSERT_EQ(allocations, before_allocations);
+}
+
+static void
+pregrant_owner_releases_preparation_on_all_outcomes(void)
+{
+	for (pregrant_variant = 0; pregrant_variant < 5; pregrant_variant++) {
+		ClusterPcmOwnSnapshot base = { 0 };
+		ResourceXCurrentImage image = { 0 };
+		ClusterPcmOwnResult result;
+		reset_many();
+		for (int i = 0; i < 255; i++)
+			UT_ASSERT_EQ(capture_many(i, i + 1), CLUSTER_PAGE_WAL_CAPTURED);
+		UT_ASSERT(cluster_page_wal_snapshot_v1(1, &image.page_wal));
+		image.page_wal.identity.blockno = many_descriptors[257].bufferdesc.tag.blockNum;
+		image.page_wal.source.claim.identity.origin_owner_incarnation = 800;
+		image.page_wal.flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+		image.page_bytes = many_pages[257].data;
+		image.image_length = BLCKSZ;
+		image.page_lsn = 0x200;
+		image.page_scn = 80;
+		image.page_checksum = cluster_gcs_block_compute_checksum(image.page_bytes);
+		pregrant_snapshots = pregrant_failclosed = 0;
+		result = gcs_block_pcm_x_resource_x_install_target_image_exact(
+			&many_descriptors[257].bufferdesc, &base, 9, &image);
+		UT_ASSERT_EQ(result, pregrant_variant == 0	 ? CLUSTER_PCM_OWN_OK
+							 : pregrant_variant == 1 ? CLUSTER_PCM_OWN_STALE
+													 : CLUSTER_PCM_OWN_CORRUPT);
+		UT_ASSERT_EQ(pregrant_failclosed, pregrant_variant >= 3 ? 1 : 0);
+		UT_ASSERT_EQ(capture_many(256, 900), CLUSTER_PAGE_WAL_CAPTURED);
 	}
 }
 int
 main(void)
 {
-	UT_PLAN(14);
-	printf("# Native WAL binding: %zu bytes per buffer\n", sizeof(ClusterPageWalBindingV1));
+	UT_PLAN(18);
+	UT_RUN(resident_binding_memory_budget);
+	printf("# Complete private/wire carrier: %zu bytes\n", sizeof(ClusterPageWalBindingV1));
 	cluster_page_wal_shmem_register();
 	UT_ASSERT(registered_region != NULL);
 	UT_RUN(native_insert_source);
@@ -666,6 +884,10 @@ main(void)
 	UT_RUN(unattributed_carrier_clears_old_source);
 	UT_RUN(flush_certification_is_source_exact);
 	UT_RUN(flush_refusal_never_certifies);
+	UT_RUN(shared_claim_and_descriptor_reuse_do_not_alias);
+	UT_RUN(bounded_claim_pool_and_t2_reservation_release);
+	UT_RUN(pregrant_owner_releases_preparation_on_all_outcomes);
+	free(shared_memory);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

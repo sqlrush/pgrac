@@ -30,6 +30,13 @@ typedef enum ClusterPageWalCaptureResultV1 {
 	CLUSTER_PAGE_WAL_INVARIANT_BROKEN,
 } ClusterPageWalCaptureResultV1;
 
+/* Process-local T2 preparation owns one source reference until publication
+ * or release. Never copy a live preparation or prepare twice into it. */
+typedef struct ClusterPageWalInstallV1 {
+	ClusterPageWalBindingV1 binding;
+	uint16 source_slot;
+} ClusterPageWalInstallV1;
+
 /* Pure carrier consistency. Validation cannot certify a new flush or grant
  * authority. The match helper also requires aligned page bytes and an
  * independently selected physical address. */
@@ -102,6 +109,11 @@ cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1
  * I/O. False means the caller no longer has the required buffer invariant. */
 extern bool cluster_page_wal_forget_v1(Buffer buffer);
 
+/* Original shared descriptor invalidation/reuse owner, with header locked
+ * and no other user of the old residency. Never acquires a buffer lock. */
+struct BufferDesc;
+extern void cluster_page_wal_reset_reuse_locked(struct BufferDesc *buf);
+
 /* Caller already pins and content-locks this descriptor and supplies the
  * lifecycle-qualified SPACE identity. Does not acquire any page or grant
  * write/flush authority. Failure leaves output untouched. */
@@ -113,13 +125,15 @@ extern bool cluster_page_wal_read_v1(Buffer buffer, const ClusterSpaceIdentity *
 extern bool cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out);
 
 /* Original T2 owner preflights under content-X before touching page/authority.
- * An all-zero carrier explicitly clears old attribution. Prepared values are
- * process-local and must be published in the same uninterrupted lock hold,
- * only after exact T2 succeeds. Neither function grants ownership. */
+ * An all-zero carrier explicitly clears old attribution. A successful prepare
+ * reserves its source before page/authority mutation. The process-local value
+ * must be published in the same uninterrupted lock hold, only after exact T2
+ * succeeds, or released on any other outcome. Publication consumes the held
+ * reference. Neither function grants ownership. Failure leaves output intact. */
 extern bool cluster_page_wal_prepare_install_v1(Buffer buffer,
 												const ClusterPageWalBindingV1 *carrier, Page image,
-												ClusterPageWalBindingV1 *prepared);
-extern bool cluster_page_wal_publish_install_v1(Buffer buffer,
-												const ClusterPageWalBindingV1 *prepared);
+												ClusterPageWalInstallV1 *prepared);
+extern bool cluster_page_wal_publish_install_v1(Buffer buffer, ClusterPageWalInstallV1 *prepared);
+extern void cluster_page_wal_release_install_v1(ClusterPageWalInstallV1 *prepared);
 
 #endif

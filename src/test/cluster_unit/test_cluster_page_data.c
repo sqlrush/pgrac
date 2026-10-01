@@ -33,6 +33,8 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+static uint32 wait_event;
+uint32 *my_wait_event_info = &wait_event;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 volatile uint32 CritSectionCount, InterruptHoldoffCount;
@@ -61,7 +63,7 @@ static FILE *file;
 static SMgrRelationData relation;
 static ClusterPageDataTargetV1 target;
 static ClusterWalSourceRef writer;
-static ClusterPageWalBindingV1 page_sources[2];
+static void *page_sources_memory;
 static bool source_capture;
 static ClusterSpaceIdentity identity;
 static bool cluster_pcm_x_finish_retain_flush_active;
@@ -268,12 +270,19 @@ mul_size(Size a, Size b)
 {
 	return a * b;
 }
+Size
+add_size(Size a, Size b)
+{
+	return a + b;
+}
 void *
 ShmemInitStruct(const char *name, Size size, bool *found)
 {
-	UT_ASSERT_EQ(size, sizeof(page_sources));
+	free(page_sources_memory);
+	page_sources_memory = calloc(1, size);
+	UT_ASSERT(page_sources_memory != NULL);
 	*found = false;
-	return page_sources;
+	return page_sources_memory;
 }
 bool
 cluster_space_recovery_flush_permitted_v1(const ClusterSpaceRecoveryBatchV1 *b, Buffer buf)
@@ -418,6 +427,16 @@ static void
 bind_native_source(void)
 {
 	bind_native_record(RM_HEAP_ID, 0);
+}
+
+static ClusterPageWalBindingV1
+read_page_source(void)
+{
+	ClusterPageWalBindingV1 result = { 0 };
+	locks[1] = true;
+	UT_ASSERT(cluster_page_wal_snapshot_v1(2, &result));
+	locks[1] = false;
+	return result;
 }
 
 static void
@@ -720,8 +739,11 @@ new_claim_never_flushes_old_coordinate(void)
 			writer.claim.identity.origin_owner_incarnation++;
 		if (c == 1)
 			writer.claim.claim_sha256[15]++;
-		if (c == 2)
-			memset(page_sources, 0, sizeof(page_sources));
+		if (c == 2) {
+			source_capture = locks[1] = true;
+			UT_ASSERT(cluster_page_wal_forget_v1(2));
+			source_capture = locks[1] = false;
+		}
 		UT_ASSERT(!cluster_bufmgr_write_page_data_v1(&target, &r));
 		UT_ASSERT(r == NULL);
 		UT_ASSERT_EQ(writes + syncs + wal_flushes, 0);
@@ -735,9 +757,11 @@ foreign_certified_image_uses_original_wal(void)
 {
 	for (int c = 0; c < 2; c++) {
 		ClusterPageDataReceiptV1 *r = NULL;
-		ClusterPageWalBindingV1 certified, prepared;
+		ClusterPageWalBindingV1 certified, original;
+		ClusterPageWalInstallV1 prepared = { 0 };
 		reset();
-		UT_ASSERT(cluster_page_wal_flush_source_v1(&page_sources[1], &certified));
+		original = read_page_source();
+		UT_ASSERT(cluster_page_wal_flush_source_v1(&original, &certified));
 		UT_ASSERT_EQ(wal_flushes, 1);
 		writer.claim.identity.origin_thread_id = 2;
 		writer.claim.identity.origin_node_id = cluster_node_id = 1;
@@ -751,6 +775,7 @@ foreign_certified_image_uses_original_wal(void)
 		HOLD_INTERRUPTS();
 		UT_ASSERT(cluster_page_wal_prepare_install_v1(2, &certified, pages[1].data, &prepared));
 		UT_ASSERT(cluster_page_wal_publish_install_v1(2, &prepared));
+		cluster_page_wal_release_install_v1(&prepared);
 		RESUME_INTERRUPTS();
 		source_capture = locks[1] = false;
 		UT_ASSERT(cluster_bufmgr_write_page_data_v1(&target, &r));
@@ -766,11 +791,13 @@ static void
 ordinary_flush_uses_original_source(void)
 {
 	for (int scenario = 0; scenario < 4; scenario++) {
-		ClusterPageWalBindingV1 certified, prepared;
+		ClusterPageWalBindingV1 certified, original;
+		ClusterPageWalInstallV1 prepared = { 0 };
 		volatile bool threw = false;
 		reset();
 		if (scenario > 0) {
-			UT_ASSERT(cluster_page_wal_flush_source_v1(&page_sources[1], &certified));
+			original = read_page_source();
+			UT_ASSERT(cluster_page_wal_flush_source_v1(&original, &certified));
 			writer.claim.identity.origin_thread_id = 2;
 			writer.claim.identity.origin_node_id = cluster_node_id = 1;
 			writer.claim.claim_sha256[0]++;
@@ -781,6 +808,7 @@ ordinary_flush_uses_original_source(void)
 				UT_ASSERT(
 					cluster_page_wal_prepare_install_v1(2, &certified, pages[1].data, &prepared));
 				UT_ASSERT(cluster_page_wal_publish_install_v1(2, &prepared));
+				cluster_page_wal_release_install_v1(&prepared);
 				RESUME_INTERRUPTS();
 				source_capture = locks[1] = false;
 			}

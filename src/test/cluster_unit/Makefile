@@ -2081,17 +2081,25 @@ test_cluster_page_wal_image.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_b
 	     /^gcs_block_pcm_x_resource_x_build_source_frames\(/ { print "static bool"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 4) exit 1 }' $< > $@
 
+test_cluster_page_wal_pregrant.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^[[:space:]]gcs_block_pcm_x_resource_x_install_target_image_exact\(/ { print "static ClusterPcmOwnResult"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@
+
 test_cluster_page_wal: test_cluster_page_wal.c unit_test.h test_cluster_page_wal_insert.inc \
+		test_cluster_page_wal_pregrant.inc \
 		test_cluster_page_wal_image.inc test_cluster_pcm_checksum_owner.inc \
+		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
-		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -o $@
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -lm -o $@
 
 test_cluster_page_data: test_cluster_page_data.c unit_test.h test_cluster_page_data.inc \
+		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		test_cluster_page_flush.inc \
 		test_cluster_space_recovery_flush.inc test_cluster_page_data_stable.o test_cluster_page_wal_product.o \
 		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
@@ -2100,12 +2108,13 @@ test_cluster_page_data: test_cluster_page_data.c unit_test.h test_cluster_page_d
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_page_data_stable.o test_cluster_page_wal_product.o \
+		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o xlogreader_fs.o \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
-		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -llz4 -lzstd -o $@
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -llz4 -lzstd -lm -o $@
 
 test_cluster_space_recovery: test_cluster_space_recovery.c unit_test.h test_cluster_space_recovery_flush.inc \
 		test_cluster_space_recovery_product.o $(CLUSTER_HW_O) $(CLUSTER_UNIT_CRYPTOHASH_O) \
@@ -3980,6 +3989,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_page_wal_insert.inc
 	rm -f test_cluster_hw_remaster_native.inc
 	rm -f test_cluster_hw_authority_gate.inc
+	rm -f test_cluster_page_wal_pregrant.inc
 	rm -f test_cluster_page_wal_image.inc
 	rm -f test_cluster_page_flush.inc
 	rm -f test_cluster_pcm_s_prepare.inc

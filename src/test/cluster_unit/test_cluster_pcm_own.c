@@ -107,24 +107,35 @@ cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
 }
 bool
 cluster_page_wal_prepare_install_v1(Buffer buffer, const ClusterPageWalBindingV1 *carrier,
-									Page image, ClusterPageWalBindingV1 *prepared)
+									Page image, ClusterPageWalInstallV1 *prepared)
 {
 	UT_ASSERT(transition_content_held);
 	if (!transition_wal_prepare_ok)
 		return false;
-	*prepared = *carrier;
+	memset(prepared, 0, sizeof(*prepared));
+	prepared->binding = *carrier;
 	return true;
 }
 bool
-cluster_page_wal_publish_install_v1(Buffer buffer, const ClusterPageWalBindingV1 *prepared)
+cluster_page_wal_publish_install_v1(Buffer buffer, ClusterPageWalInstallV1 *prepared)
 {
 	UT_ASSERT(transition_content_held);
 	UT_ASSERT(pg_atomic_read_u64(
 				  &ClusterPcmOwnArray[transition_buf->buf_id].resource_x_activation_generation)
 			  != 0);
-	transition_page_wal = *prepared;
+	transition_page_wal = prepared->binding;
 	transition_wal_publishes++;
 	return true;
+}
+void
+cluster_page_wal_release_install_v1(ClusterPageWalInstallV1 *prepared)
+{
+	UT_ASSERT(transition_content_held);
+}
+void
+cluster_page_wal_reset_reuse_locked(BufferDesc *buf)
+{
+	UT_ASSERT((pg_atomic_read_u32(&buf->state) & BM_LOCKED) != 0);
 }
 static bool transition_real_flush;
 static unsigned transition_owned_io, transition_io_wakes, transition_io_aborts;

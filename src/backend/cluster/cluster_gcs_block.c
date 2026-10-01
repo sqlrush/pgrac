@@ -10697,7 +10697,7 @@ PGRAC_PCM_X_FENCE_DOMINATED(gcs_block_pcm_x_reserved_image_write_exact)
 		const ResourceXCurrentImage *image)
 {
 	PGAlignedBlock verified;
-	ClusterPageWalBindingV1 prepared_wal;
+	ClusterPageWalInstallV1 prepared_wal = { 0 };
 	ClusterPcmOwnSnapshot live;
 	ClusterPcmOwnResult own_result;
 	Page page;
@@ -10716,12 +10716,14 @@ PGRAC_PCM_X_FENCE_DOMINATED(gcs_block_pcm_x_reserved_image_write_exact)
 		return CLUSTER_PCM_OWN_CORRUPT;
 	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
 	if (own_result != CLUSTER_PCM_OWN_OK)
-		return own_result;
-	if (!gcs_block_pcm_x_reserved_image_write_exact(&live, reservation_base, reservation_token))
-		return cluster_pcm_own_classify_live_flags(live.flags, live.reservation_token)
-					   == CLUSTER_PCM_OWN_CORRUPT
-				   ? CLUSTER_PCM_OWN_CORRUPT
-				   : CLUSTER_PCM_OWN_STALE;
+		goto done;
+	if (!gcs_block_pcm_x_reserved_image_write_exact(&live, reservation_base, reservation_token)) {
+		own_result = cluster_pcm_own_classify_live_flags(live.flags, live.reservation_token)
+							 == CLUSTER_PCM_OWN_CORRUPT
+						 ? CLUSTER_PCM_OWN_CORRUPT
+						 : CLUSTER_PCM_OWN_STALE;
+		goto done;
+	}
 
 	page = BufferGetPage(BufferDescriptorGetBuffer(buf));
 	memcpy(page, verified.data, BLCKSZ);
@@ -10732,16 +10734,21 @@ PGRAC_PCM_X_FENCE_DOMINATED(gcs_block_pcm_x_reserved_image_write_exact)
 																  reservation_token);
 	if (own_result != CLUSTER_PCM_OWN_OK) {
 		gcs_block_resource_x_fail_closed_current();
-		return CLUSTER_PCM_OWN_CORRUPT;
+		own_result = CLUSTER_PCM_OWN_CORRUPT;
+		goto done;
 	}
 	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
 	if (own_result != CLUSTER_PCM_OWN_OK
 		|| !gcs_block_pcm_x_reserved_image_write_exact(&live, reservation_base,
 													   reservation_token)) {
 		gcs_block_resource_x_fail_closed_current();
-		return CLUSTER_PCM_OWN_CORRUPT;
+		own_result = CLUSTER_PCM_OWN_CORRUPT;
 	}
-	return CLUSTER_PCM_OWN_OK;
+done:
+	/* This pre-grant copy is still non-authoritative. T2 subsequently
+	 * reserves/publishes the exact retained carrier with its activation. */
+	cluster_page_wal_release_install_v1(&prepared_wal);
+	return own_result;
 }
 
 static ResourceXBufferActivationResult
