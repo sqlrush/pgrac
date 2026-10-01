@@ -1511,6 +1511,79 @@ physical_pi_discard_is_ancestry_and_generation_exact(void)
 }
 
 static void
+same_claim_data_under_later_root_ceiling(void)
+{
+	ClusterWalSourceRef sources[3];
+	ClusterPageDataReceiptV1 *receipt = NULL;
+	ClusterPcmPiWriteCutV1 cut, proven;
+	RfPageContributionPrefixV1 prefixes[3] = { { 0 } };
+	RfPageOnlinePlanV1 *plan;
+	reset();
+	writer.claim.max_config_generation = 3;
+	for (unsigned i = 0; i < 3; i++) {
+		sources[i] = writer;
+		sources[i].claim.identity.origin_thread_id = i + 1;
+		sources[i].claim.identity.origin_node_id = i;
+		sources[i].claim.claim_sha256[1] = i;
+	}
+	bind_native_record(RM_XLOG_ID, XLOG_FPI);
+	cut = data_pi_cut();
+	UT_ASSERT(cluster_bufmgr_write_page_data_at_cut_v1(&target, &cut, &receipt));
+	for (unsigned i = 0; i < 3; i++)
+		sources[i].claim.max_config_generation++;
+	plan = data_contribution_plan(sources);
+	UT_ASSERT(cluster_page_data_prefix_v1(
+		plan, sources, 3, (const ClusterPageDataReceiptV1 *const *)&receipt, 1, prefixes));
+	UT_ASSERT_EQ(prefixes[0].first_uncovered_lsn, 0x200);
+	UT_ASSERT_EQ(prefixes[1].first_uncovered_lsn, 0x100);
+	UT_ASSERT(cluster_page_data_pi_proof_v1(receipt, plan, sources, 3, &proven));
+	/* Caller arrays must still match the sealed selection exactly. This
+	 * change never grants authority to an edited source reference. */
+	sources[0].claim.max_config_generation++;
+	UT_ASSERT(!cluster_page_data_prefix_v1(
+		plan, sources, 3, (const ClusterPageDataReceiptV1 *const *)&receipt, 1, prefixes));
+	sources[0].claim.max_config_generation--;
+	rf_page_online_plan_destroy_v1(&plan);
+	for (unsigned i = 0; i < 3; i++)
+		sources[i].claim.max_config_generation -= 2;
+	plan = data_contribution_plan(sources);
+	UT_ASSERT(!cluster_page_data_prefix_v1(
+		plan, sources, 3, (const ClusterPageDataReceiptV1 *const *)&receipt, 1, prefixes));
+	cluster_page_data_receipt_free_v1(&receipt);
+	rf_page_online_plan_destroy_v1(&plan);
+	clean();
+}
+
+static void
+same_claim_pi_under_later_root_ceiling(void)
+{
+	for (int future = 0; future < 2; future++) {
+		ClusterWalSourceRef sources[3], original;
+		ClusterPcmPiStorageCutV1 cut;
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &cut);
+		rf_page_online_plan_destroy_v1(&plan);
+		for (unsigned i = 0; i < 3; i++)
+			sources[i].claim.max_config_generation++;
+		plan = data_contribution_plan(sources);
+		UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt));
+		original = sources[0];
+		if (future)
+			original.claim.max_config_generation++;
+		else
+			original.claim.max_config_generation--;
+		physical_pi_from_source(&original, 80);
+		UT_ASSERT_EQ(cluster_bufmgr_discard_pi_at_data_v1(receipt, plan, sources, 3),
+					 future ? CLUSTER_PI_PHYSICAL_RETRY : CLUSTER_PI_PHYSICAL_DISCARDED);
+		UT_ASSERT_EQ(pi_discards, future ? 0 : 1);
+		UT_ASSERT_EQ(writes + wal_flushes, 0);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&plan);
+		clean();
+	}
+}
+
+static void
 physical_pi_newer_than_actual_data_is_not_discarded(void)
 {
 	ClusterWalSourceRef sources[3];
@@ -1544,7 +1617,9 @@ physical_pi_newer_than_actual_data_is_not_discarded(void)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(20);
+	UT_RUN(same_claim_data_under_later_root_ceiling);
+	UT_RUN(same_claim_pi_under_later_root_ceiling);
 	UT_RUN(success_and_old_completion);
 	UT_RUN(identity_refusals);
 	UT_RUN(authority_refusals);

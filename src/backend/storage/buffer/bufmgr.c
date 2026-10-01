@@ -10580,6 +10580,24 @@ cluster_page_data_source_same(const ClusterWalSourceRef *before, const ClusterWa
 		   && before->timeline == after->timeline;
 }
 
+/* Join an already qualified original DATA/PI binding to a later sealed
+ * ROOT selection. max_config_generation is the claim decoder's ceiling,
+ * not part of its immutable identity. Only this contribution join permits
+ * the ceiling to advance; writer/descriptor checks and the caller's source
+ * array must still match their original owners exactly. No file I/O here. */
+static bool
+cluster_page_data_source_covered_by(const ClusterWalSourceRef *original,
+									const ClusterWalSourceRef *selected)
+{
+	return original->claim.max_config_generation != 0
+		   && original->claim.max_config_generation <= selected->claim.max_config_generation
+		   && cluster_control_root_identity_equal(&original->claim.identity,
+												  &selected->claim.identity)
+		   && original->claim.database_incarnation == selected->claim.database_incarnation
+		   && memcmp(original->claim.claim_sha256, selected->claim.claim_sha256, 32) == 0
+		   && original->timeline == selected->timeline;
+}
+
 static bool
 cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 										const ClusterPcmPiWriteCutV1 *cut, bool sample_current,
@@ -10839,7 +10857,8 @@ cluster_page_data_prefix_v1(const RfPageOnlinePlanV1 *plan, const ClusterWalSour
 					   != 0)
 				continue;
 			if (edge->participant_index >= participant_count
-				|| !cluster_page_data_source_same(&wal->source, &sources[edge->participant_index])
+				|| !cluster_page_data_source_covered_by(&wal->source,
+														&sources[edge->participant_index])
 				|| !rf_page_identity_equal_v1(&wal->identity, &completed.identity)
 				|| !rf_page_version_equal_v1(&wal->version, &completed.version)
 				|| record->origin_thread != wal->source.claim.identity.origin_thread_id
@@ -11102,8 +11121,8 @@ cluster_page_data_covers_pi(const ClusterPageDataReceiptV1 *receipt, const RfPag
 				&& memcmp(edge->edge.result_incarnation, pi->version.segment_incarnation, 16)
 					   == 0) {
 				if (edge->participant_index >= source_count
-					|| !cluster_page_data_source_same(&pi->source,
-													  &sources[edge->participant_index])
+					|| !cluster_page_data_source_covered_by(&pi->source,
+															&sources[edge->participant_index])
 					|| record->read_rec_ptr != pi->record_start
 					|| record->end_rec_ptr != pi->record_end || record->record_crc != pi->record_crc
 					|| record->rmid != pi->rmid || record->info != pi->info)
