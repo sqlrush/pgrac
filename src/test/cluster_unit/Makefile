@@ -86,7 +86,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_r4_itl_capacity \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
-        test_cluster_wal_thread test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_thread_tail test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
+        test_cluster_wal_thread test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_wal_cut test_cluster_thread_tail test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
         test_cluster_backup test_cluster_retained_remote \
         test_cluster_recovery_worker test_cluster_recovery_merge test_cluster_remote_xact test_cluster_remote_xact_writer \
         test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay \
@@ -509,7 +509,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 	$(CC) $(CFLAGS) -Wno-unused-variable -Wno-unused-but-set-variable $(CPPFLAGS) $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
-SIMPLE_TESTS := $(filter-out test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_thread_tail,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_wal_cut test_cluster_thread_tail,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers test_cluster_page_data test_cluster_page_wal,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_request,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire,$(SIMPLE_TESTS))
@@ -7051,6 +7051,15 @@ test_cluster_wal_publish_entry.inc: $(top_srcdir)/src/backend/access/transam/xlo
 	mv $@.tmp $@
 
 test_cluster_wal_writer: test_cluster_wal_writer.c
+
+test_cluster_wal_cut: test_cluster_wal_cut.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_cut.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_cut.h $(CLUSTER_WAL_CLAIM_O) \
+		$(top_builddir)/src/backend/storage/lmgr/s_lock.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_WAL_CLAIM_O) \
+		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # PGRAC: writer runtime checks with native caller boundaries. Author: SqlRush <sqlrush@gmail.com>
 test_cluster_wal_writer: unit_test.h \

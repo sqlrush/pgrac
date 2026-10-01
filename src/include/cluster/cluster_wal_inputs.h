@@ -74,11 +74,23 @@ extern ClusterControlRootResult
 cluster_wal_inputs_prepare_live_local_v1(ClusterWalInputsV1 *inputs, uint32 index,
 										 XLogRecPtr *out_complete_end);
 
+/* Same cut/reader rules, with original-writer CONTROL observation for foreign
+ * OPEN sources. Pending returns WAIT; accepted endpoints never move. These
+ * calls are still background I/O owners, never CONTROL dispatch. */
+extern ClusterControlRootResult cluster_wal_inputs_prepare_live_v1(ClusterWalInputsV1 *inputs,
+																   uint32 index,
+																   XLogRecPtr *out_complete_end);
+extern ClusterControlRootResult cluster_wal_inputs_visit_live_v1(ClusterWalInputsV1 *inputs,
+																 uint32 index,
+																 ClusterWalRecordVisitor visitor,
+																 void *arg,
+																 ClusterWalTailObservation *out);
+
 /* Read every selected source into one sealed contribution graph. All retained
  * records remain obligations, including records before native redo. This is
  * NOT a replay plan: it grants no recovery/mutation/PI/ROOT/GC authority. The
  * scope must remain held and be revalidated before consuming the result. A
- * foreign OPEN source without its original writer's cut returns WAIT with no
+ * foreign OPEN source pending its original writer's cut returns WAIT with no
  * partial output. Explicit empty terminals remain participants and are read.
  * The fabric destructor owns the output; release it before the input scope.
  * detail reports a PAGE/SIDE refusal; root errors are returned directly. */

@@ -1045,10 +1045,118 @@ UT_TEST(test_background_pending_cut_cannot_cross_writer_token)
 	}
 }
 
+UT_TEST(test_explicit_writer_samples_remain_independent)
+{
+	ClusterWalWriterSampleV1 first, second;
+	ClusterWalWriterFlushV1 flushed;
+	static const ClusterWalWriterFlushV1 zero;
+	fixture();
+	CritSectionCount = 0;
+	held = false;
+	MyBackendType = B_LMON;
+	flush_probe_calls = flush_probe_drift = 0;
+	native_ctl.InsertTimeLineID = 1;
+	reserved_end = wal_segment_size + XLOG_BLCKSZ;
+	native_ctl.LogwrtResult.Flush = reserved_end - 1;
+	UT_ASSERT_EQ(cluster_wal_writer_sample_v1(&first), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(first.reserved_end, reserved_end);
+	UT_ASSERT_EQ(cluster_wal_writer_confirm_v1(&first, &flushed),
+				 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT_EQ(memcmp(&flushed, &zero, sizeof(zero)), 0);
+	reserved_end += XLOG_BLCKSZ;
+	UT_ASSERT_EQ(cluster_wal_writer_sample_v1(&second), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	native_ctl.LogwrtResult.Flush = first.reserved_end;
+	reserved_end += XLOG_BLCKSZ;
+	UT_ASSERT_EQ(cluster_wal_writer_confirm_v1(&first, &flushed), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(flushed.complete_end, first.reserved_end);
+	UT_ASSERT_EQ(cluster_wal_writer_confirm_v1(&second, &flushed),
+				 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	native_ctl.LogwrtResult.Flush = second.reserved_end;
+	UT_ASSERT_EQ(cluster_wal_writer_confirm_v1(&second, &flushed), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(flushed.complete_end, second.reserved_end);
+	UT_ASSERT_EQ(sync_calls + rename_calls, 0);
+}
+
+UT_TEST(test_explicit_sample_cannot_adopt_a_later_writer)
+{
+	for (int change = 0; change < 5; change++) {
+		ClusterWalWriterSampleV1 sample;
+		ClusterWalWriterFlushV1 flushed;
+		static const ClusterWalWriterFlushV1 zero;
+		fixture();
+		CritSectionCount = 0;
+		held = false;
+		MyBackendType = B_LMON;
+		flush_probe_calls = flush_probe_drift = 0;
+		native_ctl.InsertTimeLineID = 1;
+		reserved_end = native_ctl.LogwrtResult.Flush = wal_segment_size + XLOG_BLCKSZ;
+		UT_ASSERT_EQ(cluster_wal_writer_sample_v1(&sample), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		if (change == 0)
+			epoch++;
+		if (change == 1)
+			ref.claim.claim_sha256[0]++;
+		if (change == 2) {
+			incarnation++;
+			ref.claim.identity.origin_owner_incarnation = incarnation;
+		}
+		if (change == 3)
+			reserved_end--;
+		if (change == 4)
+			sample.writer.startup_first_lsn = 0x80;
+		memset(&flushed, 0xa5, sizeof(flushed));
+		UT_ASSERT_NE(cluster_wal_writer_confirm_v1(&sample, &flushed),
+					 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(memcmp(&flushed, &zero, sizeof(zero)), 0);
+	}
+}
+
+UT_TEST(test_explicit_sample_refuses_unsafe_context_or_changed_flush)
+{
+	for (int change = 0; change < 10; change++) {
+		ClusterWalWriterSampleV1 sample;
+		ClusterWalWriterFlushV1 flushed;
+		static const ClusterWalWriterFlushV1 zero;
+		fixture();
+		flush_probe_recovery = false;
+		ShutdownRequestPending = false;
+		CritSectionCount = 0;
+		held = false;
+		MyBackendType = B_LMON;
+		flush_probe_calls = flush_probe_drift = 0;
+		native_ctl.InsertTimeLineID = 1;
+		reserved_end = native_ctl.LogwrtResult.Flush = wal_segment_size + XLOG_BLCKSZ;
+		UT_ASSERT_EQ(cluster_wal_writer_sample_v1(&sample), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		if (change < 4)
+			flush_probe_drift = change + 1;
+		if (change == 4)
+			MyBackendType = B_STARTUP;
+		if (change == 5)
+			MyBackendType = B_LMS;
+		if (change == 6)
+			CritSectionCount = 1;
+		if (change == 7)
+			ShutdownRequestPending = true;
+		if (change == 8)
+			flush_probe_recovery = true;
+		if (change == 9)
+			sample.reserved_end = 0;
+		UT_ASSERT_NE(cluster_wal_writer_confirm_v1(&sample, &flushed),
+					 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(memcmp(&flushed, &zero, sizeof(zero)), 0);
+		UT_ASSERT_EQ(sync_calls + rename_calls, 0);
+	}
+	flush_probe_recovery = false;
+	flush_probe_drift = 0;
+	ShutdownRequestPending = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(26);
+	UT_RUN(test_explicit_writer_samples_remain_independent);
+	UT_RUN(test_explicit_sample_cannot_adopt_a_later_writer);
+	UT_RUN(test_explicit_sample_refuses_unsafe_context_or_changed_flush);
 	UT_RUN(test_background_pending_cut_cannot_cross_writer_token);
 	UT_RUN(test_background_complete_prefix_waits_for_reserved_record_end);
 	UT_RUN(test_background_flush_snapshot_preserves_native_byte_boundary);

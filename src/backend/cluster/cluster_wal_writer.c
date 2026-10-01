@@ -104,6 +104,74 @@ cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *work)
 }
 
 ClusterControlRootResult
+cluster_wal_writer_sample_v1(ClusterWalWriterSampleV1 *out)
+{
+	ClusterWalWriterSampleV1 sample = { 0 };
+	ClusterControlRootResult result;
+	TimeLineID timeline;
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if ((MyBackendType != B_LMON && MyBackendType != B_BG_WORKER && MyBackendType != B_BG_WRITER
+		 && MyBackendType != B_CHECKPOINTER)
+		|| CritSectionCount != 0 || ShutdownRequestPending || !cluster_enabled
+		|| !cluster_shared_config || RecoveryInProgress())
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	(void)GetFlushRecPtr(&timeline);
+	result = cluster_wal_writer_begin(timeline, &sample.writer);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	sample.reserved_end = GetXLogInsertEndRecPtr();
+	if (sample.reserved_end == InvalidXLogRecPtr || sample.reserved_end == UINT64_MAX)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	result = cluster_wal_writer_check(&sample.writer);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = sample;
+	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_writer_confirm_v1(const ClusterWalWriterSampleV1 *sample, ClusterWalWriterFlushV1 *out)
+{
+	ClusterWalWriterFlushV1 work = { 0 };
+	ClusterControlRootResult result;
+	TimeLineID timeline;
+	uintptr_t a = (uintptr_t)sample, b = (uintptr_t)out;
+	if (sample != NULL && out != NULL && (a <= b ? b - a < sizeof(*sample) : a - b < sizeof(*out)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (sample == NULL || sample->reserved_end == InvalidXLogRecPtr
+		|| sample->reserved_end == UINT64_MAX || sample->writer.startup_first_lsn != 0
+		|| (MyBackendType != B_LMON && MyBackendType != B_BG_WORKER && MyBackendType != B_BG_WRITER
+			&& MyBackendType != B_CHECKPOINTER)
+		|| CritSectionCount != 0 || ShutdownRequestPending || !cluster_enabled
+		|| !cluster_shared_config || RecoveryInProgress())
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	/* Fresh begin distinguishes a fully changed epoch from a temporarily
+	 * unavailable original writer. Do not wait forever on an obsolete token. */
+	result = cluster_wal_writer_begin(sample->writer.ref.timeline, &work.writer);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(&work.writer, &sample->writer, sizeof(work.writer)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (sample->reserved_end > GetXLogInsertEndRecPtr())
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	work.complete_end = sample->reserved_end;
+	work.flushed_end = GetFlushRecPtr(&timeline);
+	if (timeline != work.writer.ref.timeline)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	result = cluster_wal_writer_check(&work.writer);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (work.flushed_end < work.complete_end)
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	*out = work;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
 cluster_wal_writer_flushed_v1(ClusterWalWriterFlushV1 *out)
 {
 	ClusterWalWriterFlushV1 work = { 0 };

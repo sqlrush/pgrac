@@ -16,6 +16,24 @@ typedef struct ClusterWalWriterFlushV1 {
 	XLogRecPtr complete_end;
 } ClusterWalWriterFlushV1;
 
+/* A native reservation observation, NOT a complete/durable prefix. Keep
+ * one per background job after its directory cut. Only the original writer
+ * may confirm it; callers must not construct it from a byte/LSN guess. */
+typedef struct ClusterWalWriterSampleV1 {
+	ClusterWalWriterToken writer;
+	XLogRecPtr reserved_end;
+} ClusterWalWriterSampleV1;
+
+/* Nonblocking original-writer observations. Safe for LMON CONTROL dispatch
+ * and native I/O background roles: no file I/O, force-flush, allocation or
+ * native LWLock wait. Sample output is not itself a Flush promise. Confirm
+ * preserves this job's exact end even if later insertions advance. A changed
+ * full writer token is rejected, never adopted. Errors clear nonalias output;
+ * overlapping input/output is rejected without modifying either. */
+extern ClusterControlRootResult cluster_wal_writer_sample_v1(ClusterWalWriterSampleV1 *out);
+extern ClusterControlRootResult
+cluster_wal_writer_confirm_v1(const ClusterWalWriterSampleV1 *sample, ClusterWalWriterFlushV1 *out);
+
 /* Background physical input only, not ROOT/recovery/GC permission. Native
  * Flush may bisect a later record. complete_end is sampled from the native
  * reservation owner and then confirmed by native Flush >= complete_end.

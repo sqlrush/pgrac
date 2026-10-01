@@ -12,6 +12,7 @@
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_wal_writer.h"
+#include "cluster/cluster_wal_cut.h"
 #include "common/cryptohash.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
@@ -37,6 +38,7 @@ struct ClusterWalInputsV1 {
 	XLogRecPtr local_minimum;
 	uint32 local_index;
 	ClusterWalWriterFlushV1 local_cut;
+	ClusterWalCutV1 *remote[CLUSTER_WAL_INPUTS_MAX];
 };
 
 typedef struct WalInputsWork {
@@ -90,6 +92,8 @@ cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 		return;
 	if (!inputs_owned(*inputs))
 		elog(ERROR, "WAL input scope belongs to another resource owner");
+	for (uint32 i = 0; i < CLUSTER_WAL_INPUTS_MAX; i++)
+		cluster_wal_cut_release_v1(&(*inputs)->remote[i]);
 	if ((*inputs)->pin != NULL
 		&& cluster_wal_read_pin_release_v1(&(*inputs)->pin) != CLUSTER_WALR_RELEASE_CONFIRMED)
 		elog(FATAL, "could not release WAL input retention owner");
@@ -483,6 +487,128 @@ cluster_wal_inputs_visit_live_local_v1(ClusterWalInputsV1 *inputs, uint32 index,
 	return result;
 }
 
+static ClusterControlRootResult
+inputs_remote_sample(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriterFlushV1 *out)
+{
+	const ClusterWalInputV1 *item = &inputs->items[index];
+	ClusterControlRootResult result;
+	ClusterWalSourceRef selected;
+	if (inputs->remote[index] == NULL) {
+		result = cluster_wal_cut_begin_v1(&item->source, &inputs->remote[index]);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	}
+	result = cluster_wal_cut_poll_v1(inputs->remote[index], out);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	selected = out->writer.ref;
+	if (selected.claim.max_config_generation == 0
+		|| selected.claim.max_config_generation > item->source.claim.max_config_generation)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	selected.claim.max_config_generation = item->source.claim.max_config_generation;
+	if (memcmp(&selected, &item->source, sizeof(selected)) != 0
+		|| out->writer.startup_first_lsn != 0 || out->writer.epoch == 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (out->complete_end <= item->checkpoint_start
+		|| out->complete_end < item->checkpoint.validated_tail_lsn_exclusive
+		|| out->flushed_end < out->complete_end)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_prepare_live_v1(ClusterWalInputsV1 *inputs, uint32 index,
+								   XLogRecPtr *out_complete_end)
+{
+	const ClusterWalInputV1 *item;
+	ClusterWalWriterFlushV1 native;
+	ClusterControlRootResult result;
+	if (out_complete_end == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	*out_complete_end = 0;
+	if (!inputs_current(inputs) || index >= inputs->count || CritSectionCount != 0
+		|| ShutdownRequestPending || RecoveryInProgress())
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	item = &inputs->items[index];
+	if (!item->current || item->kind != CLUSTER_WAL_INPUT_CHECKPOINT
+		|| item->checkpoint.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (item->source.claim.identity.origin_node_id == cluster_node_id)
+		return cluster_wal_inputs_prepare_live_local_v1(inputs, index, out_complete_end);
+	PG_TRY();
+	{
+		result = cluster_wal_inputs_revalidate_v1(inputs);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = inputs_remote_sample(inputs, index, &native);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_inputs_revalidate_v1(inputs);
+	}
+	PG_CATCH();
+	{
+		inputs->stale = true;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out_complete_end = native.complete_end;
+	else if (result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
+		inputs->stale = true;
+	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_visit_live_v1(ClusterWalInputsV1 *inputs, uint32 index,
+								 ClusterWalRecordVisitor visitor, void *arg,
+								 ClusterWalTailObservation *out)
+{
+	ClusterWalTailObservation observed = { 0 };
+	ClusterWalWriterFlushV1 native, after;
+	WalInputsVisit visit = { inputs, visitor, arg };
+	ClusterControlRootResult result;
+	const ClusterWalInputV1 *item;
+	XLogRecPtr end;
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (inputs_current(inputs) && index < inputs->count
+		&& inputs->items[index].source.claim.identity.origin_node_id == cluster_node_id)
+		return cluster_wal_inputs_visit_live_local_v1(inputs, index, visitor, arg, out);
+	result = cluster_wal_inputs_prepare_live_v1(inputs, index, &end);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	item = &inputs->items[index];
+	PG_TRY();
+	{
+		result = inputs_remote_sample(inputs, index, &native);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && native.complete_end != end)
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_flushed_prefix_visit(
+				cluster_wal_threads_dir, &item->source, wal_segment_size,
+				item->checkpoint.checkpoint_lower_lsn, end, end, native.flushed_end,
+				item->checkpoint_start, item->checkpoint.checkpoint_record_crc32c,
+				inputs_visit_record, &visit, &observed);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = inputs_remote_sample(inputs, index, &after);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& memcmp(&native, &after, sizeof(native)) != 0)
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_inputs_revalidate_v1(inputs);
+	}
+	PG_CATCH();
+	{
+		inputs->stale = true;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = observed;
+	else
+		inputs->stale = true;
+	return result;
+}
+
 typedef struct WalContributionWork {
 	ClusterThreadRecoveryFabricPlanV1 *plan;
 	RfContributorStreamCutV1 cuts[CLUSTER_WAL_INPUTS_MAX];
@@ -515,8 +641,7 @@ inputs_contribution_cuts(ClusterWalInputsV1 *inputs, WalContributionWork *work)
 			cut.scan_begin_inclusive = item->checkpoint.checkpoint_lower_lsn;
 			cut.scan_end_exclusive = item->checkpoint.validated_tail_lsn_exclusive;
 			if (item->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
-				result
-					= cluster_wal_inputs_prepare_live_local_v1(inputs, i, &cut.scan_end_exclusive);
+				result = cluster_wal_inputs_prepare_live_v1(inputs, i, &cut.scan_end_exclusive);
 				if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 					return result;
 			}
@@ -594,8 +719,8 @@ inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalCont
 		work->participant = i;
 		if (item->kind == CLUSTER_WAL_INPUT_CHECKPOINT
 			&& item->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
-			result = cluster_wal_inputs_visit_live_local_v1(
-				inputs, index, inputs_contribution_record, work, &observed);
+			result = cluster_wal_inputs_visit_live_v1(inputs, index, inputs_contribution_record,
+													  work, &observed);
 		else
 			result = cluster_wal_inputs_visit_retained_v1(inputs, index, inputs_contribution_record,
 														  work, &observed);
@@ -621,6 +746,12 @@ inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalCont
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& inputs->local_cut.complete_end != InvalidXLogRecPtr)
 		result = cluster_wal_writer_check(&inputs->local_cut.writer);
+	for (uint32 i = 0; i < inputs->count && result == CLUSTER_CONTROL_ROOT_OK_PRIMARY; i++) {
+		if (inputs->remote[i] != NULL) {
+			ClusterWalWriterFlushV1 current;
+			result = inputs_remote_sample(inputs, i, &current);
+		}
+	}
 	return result;
 }
 

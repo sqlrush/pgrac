@@ -8,6 +8,7 @@
 #include "postgres.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/cluster_wal_cut.h"
 #include "cluster/cluster_block_apply.h"
 
 #include <errno.h>
@@ -19136,6 +19137,54 @@ static ClusterWalWriterToken inputs_native_writer;
 static ClusterWalWriterFlushV1 inputs_native_flush;
 static unsigned inputs_native_begin_calls, inputs_native_flush_calls;
 static bool inputs_native_wait, inputs_native_recovery, inputs_native_reconfigured;
+static ClusterControlRootResult inputs_peer_result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+static ClusterWalWriterFlushV1 inputs_peer_flush;
+static unsigned inputs_peer_begins, inputs_peer_releases;
+
+/* The actual CONTROL owner is exercised by test_cluster_wal_cut. This
+ * explicit boundary lets the real ROOT/WAL readers observe pending, stale
+ * and malformed peer results without running networking inside this test. */
+struct ClusterWalCutV1 {
+	ClusterWalWriterFlushV1 accepted;
+	bool complete;
+};
+
+ClusterControlRootResult
+cluster_wal_cut_begin_v1(const ClusterWalSourceRef *source, ClusterWalCutV1 **out)
+{
+	UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+	UT_ASSERT(source->claim.identity.origin_node_id != cluster_node_id);
+	UT_ASSERT(*out == NULL);
+	*out = palloc0(sizeof(**out));
+	inputs_peer_begins++;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_wal_cut_poll_v1(ClusterWalCutV1 *cut, ClusterWalWriterFlushV1 *out)
+{
+	UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock && cut != NULL);
+	memset(out, 0, sizeof(*out));
+	if (inputs_peer_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return inputs_peer_result;
+	if (!cut->complete) {
+		cut->accepted = inputs_peer_flush;
+		cut->complete = true;
+	}
+	*out = cut->accepted;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+void
+cluster_wal_cut_release_v1(ClusterWalCutV1 **cut)
+{
+	if (*cut != NULL) {
+		UT_ASSERT(test_actual_cf == NoLock && inputs_pin_held);
+		inputs_peer_releases++;
+		pfree(*cut);
+		*cut = NULL;
+	}
+}
 
 /* The actual contribution graph and FPI/generic codecs are linked below.
  * These ROOT fixtures never execute heap delta redo or cold-merge globals. */
@@ -19249,6 +19298,9 @@ inputs_fixture(uint8 bytes[66048], ClusterRecoveryAnchorV2 anchors[2])
 	inputs_pin_held = inputs_pin_refuse = inputs_pin_race = inputs_pin_throw = false;
 	inputs_native_begin_calls = inputs_native_flush_calls = 0;
 	inputs_native_wait = inputs_native_recovery = inputs_native_reconfigured = false;
+	inputs_peer_result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	inputs_peer_begins = inputs_peer_releases = 0;
+	memset(&inputs_peer_flush, 0, sizeof(inputs_peer_flush));
 	cluster_shared_config = true;
 	MyBackendType = B_BG_WORKER;
 }
@@ -19283,6 +19335,8 @@ inputs_visit_record(XLogReaderState *reader, void *arg)
 		pg_re_throw();
 	if (visit->fault == 5)
 		inputs_native_writer.epoch++;
+	if (visit->fault == 6)
+		inputs_peer_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	return true;
 }
 
@@ -19588,6 +19642,77 @@ inputs_contribution_fixture(int open_node)
 	test_actual_cf = NoLock;
 	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
 	return inputs;
+}
+
+static void
+inputs_peer_confirm(const ClusterWalInputV1 *item)
+{
+	inputs_peer_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	inputs_peer_flush.writer.ref = item->source;
+	inputs_peer_flush.writer.ref.claim.max_config_generation--;
+	inputs_peer_flush.writer.epoch = 7;
+	inputs_peer_flush.complete_end = item->checkpoint.validated_tail_lsn_exclusive;
+	inputs_peer_flush.flushed_end = inputs_peer_flush.complete_end;
+}
+
+UT_TEST(test_wal_inputs_remote_confirmation_feeds_complete_contribution_plan)
+{
+	ClusterWalInputsV1 *inputs = inputs_contribution_fixture(1);
+	ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
+	const ClusterWalInputV1 *peer = cluster_wal_inputs_at_v1(inputs, 1);
+	RfPageProofDetailV1 detail;
+	uint64 records = 99;
+	UT_ASSERT_EQ(cluster_wal_inputs_contributions_v1(inputs, true, &plan, &records, &detail),
+				 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(plan == NULL);
+	UT_ASSERT_EQ(records, 0);
+	inputs_peer_confirm(peer);
+	UT_ASSERT_EQ(cluster_wal_inputs_contributions_v1(inputs, true, &plan, &records, &detail), 0);
+	UT_ASSERT_EQ(records, 2);
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_participant_count_v1(plan), 2);
+	UT_ASSERT_EQ(inputs_peer_begins, 1);
+	UT_ASSERT_EQ(inputs_native_begin_calls + inputs_native_flush_calls, 0);
+	cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+	/* Later peer writes cannot extend this scope's already accepted cut. */
+	inputs_peer_flush.complete_end += 100;
+	inputs_peer_flush.flushed_end += 100;
+	UT_ASSERT_EQ(cluster_wal_inputs_contributions_v1(inputs, true, &plan, &records, &detail), 0);
+	UT_ASSERT_EQ(records, 2);
+	cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+	inputs_live_done(&inputs);
+	UT_ASSERT_EQ(inputs_peer_releases, 1);
+}
+
+UT_TEST(test_wal_inputs_remote_requires_exact_identity_end_and_postread_scope)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		ClusterWalInputsV1 *inputs = inputs_contribution_fixture(1);
+		const ClusterWalInputV1 *peer = cluster_wal_inputs_at_v1(inputs, 1);
+		ClusterWalTailObservation out, zero = { 0 };
+		InputsVisitTest visit = { 0 };
+		inputs_peer_confirm(peer);
+		if (fault == 0)
+			inputs_peer_flush.writer.ref.claim.identity.origin_owner_incarnation++;
+		if (fault == 1)
+			inputs_peer_flush.flushed_end--;
+		if (fault == 2)
+			inputs_peer_flush.complete_end = peer->checkpoint_start;
+		if (fault == 3) {
+			inputs_peer_flush.complete_end++;
+			inputs_peer_flush.flushed_end++;
+		}
+		if (fault == 4)
+			visit.fault = 1;
+		if (fault == 5)
+			visit.fault = 6;
+		UT_ASSERT_NE(cluster_wal_inputs_visit_live_v1(inputs, 1, inputs_visit_record, &visit, &out),
+					 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 0);
+		UT_ASSERT_EQ(inputs_native_begin_calls + inputs_native_flush_calls, 0);
+		inputs_live_done(&inputs);
+		UT_ASSERT_EQ(inputs_peer_releases, 1);
+	}
 }
 
 UT_TEST(test_wal_inputs_contributions_all_closed_or_local_live)
@@ -20066,7 +20191,9 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_WAL_INPUTS") != NULL) {
-		UT_PLAN(16);
+		UT_PLAN(18);
+		UT_RUN(test_wal_inputs_remote_confirmation_feeds_complete_contribution_plan);
+		UT_RUN(test_wal_inputs_remote_requires_exact_identity_end_and_postread_scope);
 		UT_RUN(test_wal_inputs_contributions_all_closed_or_local_live);
 		UT_RUN(test_wal_inputs_contributions_waits_whole_set_and_discards_on_source_failure);
 		UT_RUN(test_wal_inputs_live_local_uses_original_complete_end);
@@ -20093,7 +20220,9 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(365);
+	UT_PLAN(367);
+	UT_RUN(test_wal_inputs_remote_confirmation_feeds_complete_contribution_plan);
+	UT_RUN(test_wal_inputs_remote_requires_exact_identity_end_and_postread_scope);
 	UT_RUN(test_wal_inputs_contributions_all_closed_or_local_live);
 	UT_RUN(test_wal_inputs_contributions_waits_whole_set_and_discards_on_source_failure);
 	UT_RUN(test_wal_inputs_live_local_uses_original_complete_end);

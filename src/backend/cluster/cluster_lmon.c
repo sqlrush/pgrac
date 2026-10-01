@@ -78,6 +78,7 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_lmon_tick (spec-2.29 Step 2 D3) */
 #include "cluster/cluster_startup_exit.h"
+#include "cluster/cluster_wal_cut.h"
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_service_observe.h"
 #include "cluster/cluster_config_members.h"
@@ -225,6 +226,7 @@ cluster_lmon_shmem_init(void)
 		 * admit writers. Author: SqlRush <sqlrush@gmail.com> */
 		if (cluster_shared_config) {
 			cluster_startup_exit_register();
+			cluster_wal_cut_register_v1();
 			cluster_config_members_register();
 		}
 		heartbeat_registered = true;
@@ -533,8 +535,10 @@ void
 cluster_lmon_shmem_register(void)
 {
 	cluster_shmem_register_region(&cluster_lmon_region);
-	if (cluster_shared_config)
+	if (cluster_shared_config) {
 		cluster_startup_exit_shmem_register();
+		cluster_wal_cut_shmem_register_v1();
+	}
 }
 
 
@@ -1474,6 +1478,7 @@ LmonMain(void)
 				if (cluster_shared_config) {
 					cluster_control_retire_lmon_tick();
 					cluster_startup_exit_lmon_tick();
+					cluster_wal_cut_lmon_tick_v1();
 					cluster_shared_config_delivery_lmon_tick();
 				}
 				/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
@@ -2284,6 +2289,7 @@ LmonMain(void)
 				if (cluster_shared_config) {
 					cluster_control_retire_lmon_tick();
 					cluster_startup_exit_lmon_tick();
+					cluster_wal_cut_lmon_tick_v1();
 					cluster_shared_config_delivery_lmon_tick();
 				}
 				(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
