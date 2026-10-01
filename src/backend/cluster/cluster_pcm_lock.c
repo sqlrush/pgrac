@@ -5744,7 +5744,8 @@ cluster_pcm_lock_cleanup_on_node_dead(int32 dead_node)
 			changed = true;
 		}
 		pi_bitmap = pg_atomic_read_u32(&entry->pi_holders_bitmap);
-		if ((pi_bitmap & dead_bit) != 0) {
+		/* Membership removal cannot discharge shared DATA obligations. */
+		if (!cluster_shared_config && (pi_bitmap & dead_bit) != 0) {
 			pg_atomic_write_u32(&entry->pi_holders_bitmap, pi_bitmap & ~dead_bit);
 			changed = true;
 		}
@@ -5836,7 +5837,10 @@ cluster_pcm_lock_clean_leave_release_all_self(uint64 leave_epoch)
 			pg_atomic_fetch_and_u32(&entry->s_holders_bitmap, ~self_bit);
 			changed = true;
 		}
-		if ((pg_atomic_read_u32(&entry->pi_holders_bitmap) & self_bit) != 0) {
+		/* A departing node may have handed its dirty page to another node.
+		 * Its local flush/release is not that current holder's DATA proof. */
+		if (!cluster_shared_config
+			&& (pg_atomic_read_u32(&entry->pi_holders_bitmap) & self_bit) != 0) {
 			pg_atomic_fetch_and_u32(&entry->pi_holders_bitmap, ~self_bit);
 			changed = true;
 		}
@@ -6607,7 +6611,8 @@ cluster_pcm_lock_pi_watermark_retire_if_durable(BufferTag tag, XLogRecPtr writte
 	bool found;
 	bool retired = false;
 
-	if (cluster_pcm_htab == NULL || XLogRecPtrIsInvalid(written_page_lsn))
+	/* Shared page versions are opaque and WAL positions are per source. */
+	if (cluster_shared_config || cluster_pcm_htab == NULL || XLogRecPtrIsInvalid(written_page_lsn))
 		return false;
 
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
@@ -6684,7 +6689,9 @@ cluster_pcm_lock_pi_discard_collect(BufferTag tag, SCN written_scn, uint32 *hold
 
 	if (holders_out != NULL)
 		*holders_out = 0;
-	if (cluster_pcm_htab == NULL)
+	/* The legacy numeric watermark cannot certify an exact shared version
+	 * or distinguish a late completion from a successor handoff. */
+	if (cluster_shared_config || cluster_pcm_htab == NULL)
 		return false;
 
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);

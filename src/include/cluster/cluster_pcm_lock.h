@@ -2410,7 +2410,9 @@ extern bool cluster_pcm_lock_pi_watermark_retire_if_durable(BufferTag tag,
 															XLogRecPtr written_page_lsn);
 
 /* ============================================================
- * PGRAC: spec-6.12h D-h2 — PI-holder discard protocol (master side).
+ * PGRAC: spec-6.12h D-h2 — legacy PI-holder discard protocol (master side).
+ * These numeric retirement APIs refuse canonical shared mode. Its opaque
+ * page versions require qualified DATA completion, not SCN/LSN ordering.
  *
  *   cluster_pcm_pi_discard_covered:  the PURE coverage judge.  A durable
  *     write of the block's CURRENT copy proves every Past Image obsolete

@@ -17869,6 +17869,12 @@ cluster_bufmgr_discard_pi_block(BufferTag tag)
 	BufferDesc *buf;
 	uint32		buf_state;
 
+	/* Tag-only notifications cannot discharge opaque shared versions. The
+	 * all-member shutdown checkpoint is the existing qualified caller. */
+	if (cluster_shared_config
+		&& (!AmCheckpointerProcess() || !cluster_normal_stop_pi_retirement_allowed()))
+		return false;
+
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hash);
 	LWLockRelease(partition_lock);

@@ -2987,6 +2987,74 @@ UT_TEST(test_pcm_d5_durable_pi_discard_fast_retires_exact_binding)
 	pcm_entry_ref_release(&ref);
 }
 
+UT_TEST(test_shared_pi_responsibilities_survive_legacy_retirement)
+{
+	BufferTag tag = make_tag(228);
+	struct StopPcmEntryLayout *entry, before;
+	uint32 holders = UINT32_MAX;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	/* A -> B -> C: the master keeps both departed writers, independently
+	 * of the latest resident page's single WAL binding. */
+	for (int node = 0; node < 3; node++) {
+		UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_X, node),
+					 PCM_GCS_TRANSITION_APPLIED);
+		if (node < 2)
+			UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(
+							 tag, PCM_TRANS_X_TO_N_DOWNGRADE, node),
+						 PCM_GCS_TRANSITION_APPLIED);
+	}
+	cluster_pcm_lock_pi_watermark_scn_advance(tag, (SCN)0x5500, CLUSTER_PCM_WM_SRC_REDECLARE, 0, 31,
+											  17);
+	cluster_pcm_lock_pi_watermark_lsn_advance(tag, (XLogRecPtr)0x6600);
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 3);
+	before = *entry;
+	cluster_shared_config = true;
+	UT_ASSERT(!cluster_pcm_lock_pi_discard_collect(tag, (SCN)0xffff, &holders));
+	UT_ASSERT_EQ(holders, 0);
+	UT_ASSERT_EQ(memcmp(entry, &before, sizeof(before)), 0);
+	*entry = before;
+	UT_ASSERT(!cluster_pcm_lock_pi_watermark_retire_if_durable(tag, (XLogRecPtr)0xffff));
+	UT_ASSERT_EQ(memcmp(entry, &before, sizeof(before)), 0);
+	*entry = before;
+	UT_ASSERT_EQ(cluster_pcm_lock_cleanup_on_node_dead(0), 0);
+	UT_ASSERT_EQ(memcmp(entry, &before, sizeof(before)), 0);
+	*entry = before;
+	UT_ASSERT_EQ(cluster_pcm_lock_clean_leave_release_all_self(17), 0);
+	UT_ASSERT_EQ(memcmp(entry, &before, sizeof(before)), 0);
+	UT_ASSERT(!cluster_pcm_lock_clean_leave_verify_no_leftover(0));
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_shared_pi_normal_stop_cut_remains_the_retirement_owner)
+{
+	BufferTag tag = make_tag(229);
+	struct StopPcmEntryLayout *entry;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+	cluster_pcm_lock_downgrade(tag, PCM_LOCK_MODE_N, true);
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_pcm_lock_clean_leave_release_all_self(17), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 1);
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(stop_pcm_retire(), CLUSTER_NORMAL_STOP_INVALID);
+	stop_pi_cut_allowed = true;
+	UT_ASSERT_EQ(stop_pcm_retire(), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 0);
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_pcm_d5_resource_x_terminal_release_fast_retires_exact_binding)
 {
 	BufferTag tag = make_tag(226);
@@ -19282,6 +19350,8 @@ main(void)
 	UT_RUN(test_pcm_d5_remote_master_s_eviction_never_retires_rebound_projection);
 	UT_RUN(test_pcm_d7_remote_s_eviction_closes_pending_x_to_s_master_state);
 	UT_RUN(test_pcm_d5_durable_pi_discard_fast_retires_exact_binding);
+	UT_RUN(test_shared_pi_responsibilities_survive_legacy_retirement);
+	UT_RUN(test_shared_pi_normal_stop_cut_remains_the_retirement_owner);
 	UT_RUN(test_pcm_d5_resource_x_terminal_release_fast_retires_exact_binding);
 	UT_RUN(test_pcm_d5_lifecycle_stats_are_exact_not_legacy_aliases);
 	UT_RUN(test_pcm_d1_bootstrap_no_capacity_is_pre_mutation_backpressure);

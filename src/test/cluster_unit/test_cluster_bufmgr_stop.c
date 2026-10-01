@@ -26,6 +26,7 @@ bool cluster_enabled = true;
 bool IsUnderPostmaster = true;
 AuxProcType MyAuxProcType = CheckpointerProcess;
 bool cluster_past_image = true;
+bool cluster_shared_config = false;
 static BufferDescPadded descriptors[4];
 BufferDescPadded *BufferDescriptors = descriptors;
 static ConditionVariableMinimallyPadded io_cvs[4];
@@ -195,6 +196,7 @@ reset_fixture(void)
 	BufferDescriptors = descriptors;
 	ClusterPiShadow = shadow;
 	cluster_enabled = IsUnderPostmaster = cluster_past_image = true;
+	cluster_shared_config = false;
 	memset(descriptors, 0, sizeof(descriptors));
 	memset(shadow, 0, sizeof(shadow));
 	cluster_pcm_own_shmem_init();
@@ -334,6 +336,30 @@ test_original_pi_convert_preserve_discard(void)
 	UT_ASSERT(cluster_bufmgr_discard_pi_block(tag));
 	UT_ASSERT_EQ(discarded, 1);
 	UT_ASSERT_EQ(poll_stop(true), CLUSTER_NORMAL_STOP_READY);
+}
+
+static void
+test_shared_pi_requires_qualified_completion_before_discard(void)
+{
+	BufferDesc *buf;
+	BufferTag tag;
+	BufferDescPadded before[4];
+	uint32 state;
+	reset_fixture();
+	buf = resident(1);
+	tag = buf->tag;
+	state = LockBufHdr(buf);
+	buf->pcm_state = PCM_STATE_N;
+	UT_ASSERT(cluster_bufmgr_convert_to_pi_locked(buf, state));
+	memcpy(before, descriptors, sizeof(before));
+	cluster_shared_config = true;
+	UT_ASSERT(!cluster_bufmgr_discard_pi_block(tag));
+	UT_ASSERT_EQ(discarded, 0);
+	UT_ASSERT_EQ(memcmp(before, descriptors, sizeof(before)), 0);
+	all_checkpoints = true;
+	UT_ASSERT_EQ(cluster_bufmgr_normal_stop_pi_retire(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(discarded, 1);
+	cluster_shared_config = false;
 }
 
 static void
@@ -511,6 +537,7 @@ main(void)
 	UT_RUN(test_required_init_and_lock_boundary);
 	UT_RUN(test_original_reservation_activation_delivery_completion);
 	UT_RUN(test_original_pi_convert_preserve_discard);
+	UT_RUN(test_shared_pi_requires_qualified_completion_before_discard);
 	UT_RUN(test_io_original_completion_and_failure);
 	UT_RUN(test_global_cut_uses_real_pi_owner_preserves_current_and_owned_negative);
 	UT_RUN(test_retained_cache_is_not_live_pi);
