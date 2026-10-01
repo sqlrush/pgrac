@@ -34,6 +34,14 @@ extern ClusterControlRootResult cluster_wal_writer_sample_v1(ClusterWalWriterSam
 extern ClusterControlRootResult
 cluster_wal_writer_confirm_v1(const ClusterWalWriterSampleV1 *sample, ClusterWalWriterFlushV1 *out);
 
+/* Original background I/O owner only. Qualify a previously sampled fixed
+ * reservation, invoke native XLogFlush when necessary, then recheck the same
+ * writer and complete end. Never called by CONTROL dispatch. Native I/O
+ * errors propagate without producing a completion. */
+extern ClusterControlRootResult
+cluster_wal_writer_flush_sample_v1(const ClusterWalWriterSampleV1 *sample,
+								   ClusterWalWriterFlushV1 *out);
+
 /* Background physical input only, not ROOT/recovery/GC permission. Native
  * Flush may bisect a later record. complete_end is sampled from the native
  * reservation owner and then confirmed by native Flush >= complete_end.

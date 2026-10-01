@@ -302,6 +302,11 @@ cluster_wal_inputs_visit_retained_v1(ClusterWalInputsV1 *inputs, uint32 index,
 	if (!inputs_current(inputs) || index >= inputs->count)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	item = &inputs->items[index];
+	/* An OPEN source belongs to the live writer's fixed-cut reader. Merely
+	 * choosing the retained visitor must not poison this still-held scope. */
+	if (item->kind == CLUSTER_WAL_INPUT_CHECKPOINT
+		&& item->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 	PG_TRY();
 	{
 		result = cluster_wal_inputs_revalidate_v1(inputs);
@@ -345,6 +350,7 @@ inputs_live_sample(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriterFlu
 {
 	const ClusterWalInputV1 *item = &inputs->items[index];
 	ClusterWalWriterToken current;
+	ClusterWalWriterSampleV1 sample;
 	ClusterControlRootResult result;
 
 	result = cluster_wal_writer_begin(item->source.timeline, &current);
@@ -383,18 +389,17 @@ inputs_live_sample(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriterFlu
 	} else if (inputs->local_index != index
 			   || memcmp(&current, &inputs->local_writer, sizeof(current)) != 0)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	result = cluster_wal_writer_flushed_v1(out);
+	sample.writer = inputs->local_writer;
+	sample.reserved_end = inputs->local_minimum;
+	result = cluster_wal_writer_flush_sample_v1(&sample, out);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(&out->writer, &inputs->local_writer, sizeof(out->writer)) != 0)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (out->complete_end == InvalidXLogRecPtr || out->flushed_end < out->complete_end)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
-	/* The process-local sampler may have completed an earlier job's pending
-	 * reservation. Consuming that sample is safe, using it for this job is
-	 * not. The next poll samples anew without moving our fixed minimum. */
-	if (out->complete_end < inputs->local_minimum)
-		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	if (out->complete_end != inputs->local_minimum)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	inputs->local_cut = *out;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }

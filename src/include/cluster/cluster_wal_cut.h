@@ -5,6 +5,7 @@
 
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_wal_writer.h"
+#include "cluster/cluster_clean_leave.h"
 
 #define CLUSTER_WAL_CUT_BYTES 200
 #define CLUSTER_WAL_CUT_SAMPLE 1
@@ -34,8 +35,9 @@ extern bool cluster_wal_cut_decode_v1(const void *bytes, Size length, ClusterWal
  * pending background observations at this postmaster; capacity returns WAIT.
  * Each handle keeps its accepted end fixed. A proposal without original native
  * Flush coverage cannot escape poll as success. The original ROOT/WALR scope
- * and a physical decode through this end remain mandatory. No source-side job,
- * force-flush, retention grant or replay permission is created.
+ * and a physical decode through this end remain mandatory. The source queues
+ * its sampled end to the native bgwriter for original-writer flush; CONTROL
+ * never executes I/O. No retention grant or replay permission is created.
  *
  * Handles are process/ResourceOwner local. Release all handles explicitly;
  * ResourceOwner/child-exit cleanup cancels a still-pending observation. */
@@ -48,6 +50,8 @@ extern void cluster_wal_cut_release_v1(ClusterWalCutV1 **cut);
 /* Existing CONTROL owner only; no CF, WAL I/O, native LWLock wait or SQL. */
 extern void cluster_wal_cut_ingress_v1(const ClusterICEnvelope *env, const void *payload);
 extern void cluster_wal_cut_lmon_tick_v1(void);
+extern bool cluster_wal_cut_bgwriter_tick_v1(void);
+extern ClusterNormalStopPollResult cluster_wal_cut_normal_stop_poll_v1(const char **reason);
 extern void cluster_wal_cut_register_v1(void);
 extern void cluster_wal_cut_shmem_register_v1(void);
 

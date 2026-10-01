@@ -19239,6 +19239,25 @@ cluster_wal_writer_flushed_v1(ClusterWalWriterFlushV1 *out)
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+ClusterControlRootResult
+cluster_wal_writer_flush_sample_v1(const ClusterWalWriterSampleV1 *sample,
+								   ClusterWalWriterFlushV1 *out)
+{
+	UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+	inputs_native_flush_calls++;
+	memset(out, 0, sizeof(*out));
+	if (memcmp(&sample->writer, &inputs_native_writer, sizeof(sample->writer)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (memcmp(&sample->writer, &inputs_native_flush.writer, sizeof(sample->writer)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (inputs_native_wait || inputs_native_flush.flushed_end < sample->reserved_end)
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	*out = inputs_native_flush;
+	out->writer = sample->writer;
+	out->complete_end = sample->reserved_end;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 ClusterWalPinResult
 cluster_wal_read_pin_acquire_v1(const uint16 *threads, uint16 count, ClusterWalReadPinV1 **out)
 {
@@ -19504,6 +19523,11 @@ UT_TEST(test_wal_inputs_live_local_uses_original_complete_end)
 		CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
 	UT_ASSERT_EQ(inputs_native_begin_calls + inputs_native_flush_calls + visit.calls, 0);
 	inputs_native_recovery = false;
+	/* Wrong visitor for an OPEN source is a retryable routing choice; it
+	 * must not invalidate the held ROOT/WALR scope before the live owner. */
+	UT_ASSERT_EQ(cluster_wal_inputs_visit_retained_v1(inputs, 0, inputs_visit_record, &visit, &out),
+				 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 2);
 	UT_ASSERT_EQ(
 		cluster_wal_inputs_visit_live_local_v1(inputs, 0, inputs_visit_record, &visit, &out), 0);
 	UT_ASSERT_EQ(visit.calls, 1);
@@ -19548,7 +19572,7 @@ UT_TEST(test_wal_inputs_live_accepted_cut_never_expands_during_plan_build)
 	inputs_live_done(&inputs);
 }
 
-UT_TEST(test_wal_inputs_live_cut_rejects_earlier_pending_job_without_moving_minimum)
+UT_TEST(test_wal_inputs_live_cut_uses_its_own_fixed_native_flush_job)
 {
 	for (unsigned pending = 0; pending < 2; pending++) {
 		ClusterWalInputsV1 *inputs = inputs_live_wal_fixture(0);
@@ -19561,9 +19585,10 @@ UT_TEST(test_wal_inputs_live_cut_rejects_earlier_pending_job_without_moving_mini
 			inputs_native_wait = true;
 		UT_ASSERT_EQ(
 			cluster_wal_inputs_visit_live_local_v1(inputs, 0, inputs_visit_record, &visit, &out),
-			CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
-		UT_ASSERT_EQ(visit.calls, 0);
-		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+			pending == 0 ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		UT_ASSERT_EQ(visit.calls, pending == 0 ? 1 : 0);
+		if (pending != 0)
+			UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
 		UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 2);
 		inputs_native_wait = false;
 		inputs_native_flush.complete_end = required;
@@ -19572,7 +19597,7 @@ UT_TEST(test_wal_inputs_live_cut_rejects_earlier_pending_job_without_moving_mini
 			cluster_wal_inputs_visit_live_local_v1(inputs, 0, inputs_visit_record, &visit, &out),
 			0);
 		UT_ASSERT_EQ(out.complete_end, required);
-		UT_ASSERT_EQ(visit.calls, 1);
+		UT_ASSERT_EQ(visit.calls, pending == 0 ? 2 : 1);
 		inputs_live_done(&inputs);
 	}
 }
@@ -19817,6 +19842,9 @@ UT_TEST(test_wal_inputs_live_refuses_foreign_writer_and_changed_owner)
 		if (fault == 0) {
 			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
 			UT_ASSERT_EQ(inputs_native_begin_calls + inputs_native_flush_calls, 0);
+		} else if (fault == 2) {
+			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+			UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 2);
 		} else
 			UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 0);
 		inputs_live_done(&inputs);
@@ -20198,7 +20226,7 @@ main(int argc, char **argv)
 		UT_RUN(test_wal_inputs_contributions_waits_whole_set_and_discards_on_source_failure);
 		UT_RUN(test_wal_inputs_live_local_uses_original_complete_end);
 		UT_RUN(test_wal_inputs_live_accepted_cut_never_expands_during_plan_build);
-		UT_RUN(test_wal_inputs_live_cut_rejects_earlier_pending_job_without_moving_minimum);
+		UT_RUN(test_wal_inputs_live_cut_uses_its_own_fixed_native_flush_job);
 		UT_RUN(test_wal_inputs_live_refuses_foreign_writer_and_changed_owner);
 		UT_RUN(test_wal_inputs_physically_visit_exact_nonserving_closed_sources);
 		UT_RUN(test_wal_inputs_physical_failure_invalidates_provisional_scope);
@@ -20227,7 +20255,7 @@ main(int argc, char **argv)
 	UT_RUN(test_wal_inputs_contributions_waits_whole_set_and_discards_on_source_failure);
 	UT_RUN(test_wal_inputs_live_local_uses_original_complete_end);
 	UT_RUN(test_wal_inputs_live_accepted_cut_never_expands_during_plan_build);
-	UT_RUN(test_wal_inputs_live_cut_rejects_earlier_pending_job_without_moving_minimum);
+	UT_RUN(test_wal_inputs_live_cut_uses_its_own_fixed_native_flush_job);
 	UT_RUN(test_wal_inputs_live_refuses_foreign_writer_and_changed_owner);
 	UT_RUN(test_wal_inputs_physically_visit_exact_nonserving_closed_sources);
 	UT_RUN(test_wal_inputs_physical_failure_invalidates_provisional_scope);

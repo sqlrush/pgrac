@@ -10007,6 +10007,46 @@ cluster_pcm_lock_pi_write_snapshot_v1(BufferTag tag, ClusterPcmPiWriteCutV1 *out
 	return valid;
 }
 
+uint32
+cluster_pcm_lock_pi_candidates_v1(uint32 *cursor, uint32 probe_budget, BufferTag *tags,
+								  uint32 capacity)
+{
+	uint32 count = 0, examined = 0, position;
+	if (cursor == NULL || tags == NULL || capacity == 0 || capacity > 128 || probe_budget == 0
+		|| probe_budget > 128 || !cluster_shared_config || ClusterPcm == NULL
+		|| cluster_pcm_htab == NULL || cluster_pcm_resource_x_slots == NULL
+		|| pcm_grd_effective <= 0
+		|| pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase) != RESOURCE_X_GATE_OPEN)
+		return 0;
+	position = *cursor < (uint32)pcm_grd_effective ? *cursor : 0;
+	while (examined < probe_budget && count < capacity && position < (uint32)pcm_grd_effective) {
+		BufferTag tag;
+		bool live;
+		uint64 generation = 0;
+		ClusterPcmPiWriteCutV1 x;
+		ClusterPcmPiStorageCutV1 s;
+		LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+		live = cluster_pcm_resource_x_slots[position].state == PCM_REGISTRY_LIVE
+			   && cluster_pcm_resource_x_slots[position].reserved == 0
+			   && cluster_pcm_resource_x_slots[position].retired_authority_generation == 0;
+		if (live) {
+			tag = cluster_pcm_resource_x_slots[position].tag;
+			generation = cluster_pcm_resource_x_slots[position].binding_generation;
+		}
+		LWLockRelease(&ClusterPcm->htab_lock.lock);
+		position++;
+		examined++;
+		if (live && generation != 0 && generation != UINT64_MAX
+			&& ((cluster_pcm_lock_pi_write_snapshot_v1(tag, &x)
+				 && x.binding_generation == generation)
+				|| (cluster_pcm_lock_pi_storage_snapshot_v1(tag, &s)
+					&& s.binding_generation == generation)))
+			tags[count++] = tag;
+	}
+	*cursor = position == (uint32)pcm_grd_effective ? 0 : position;
+	return count;
+}
+
 /* All potentially allocating proof work precedes directory locks. Only the
  * original physical owner can expose a node for this exact DATA/cut. */
 static bool

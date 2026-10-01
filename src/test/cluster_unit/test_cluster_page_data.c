@@ -14,6 +14,7 @@
 #include "cluster/cluster_page_data.h"
 #include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_pi_data.h"
+#include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
@@ -65,6 +66,39 @@ static bool storage_read, storage_cut_current = true, storage_cut_changed, stora
 static bool remote_data_ready;
 static ClusterPageWalBindingV1 remote_data_binding;
 static ClusterPcmPiWriteCutV1 remote_data_cut;
+static ClusterPiDataFactV1 notice_fact;
+static bool notice_ready, remote_ack_ready, remote_ack_current;
+static ClusterWalWriterToken remote_ack_writer;
+
+#ifndef PGRAC_TEST_REAL_PI_WRITEBACK
+bool
+cluster_pi_writeback_notice_read_v1(const ClusterPiWritebackNoticeV1 *notice, uint32 index,
+									ClusterPiDataFactV1 *out)
+{
+	if (!notice_ready || notice != (const void *)1 || index != 0)
+		return false;
+	*out = notice_fact;
+	return true;
+}
+
+bool
+cluster_pi_writeback_ack_read_v1(const ClusterPiWritebackJobV1 *job, uint32 index,
+								 const ClusterPageDataReceiptV1 *receipt,
+								 ClusterWalWriterToken *out)
+{
+	if (!remote_ack_ready || job != (const void *)1 || index != 0)
+		return false;
+	*out = remote_ack_writer;
+	return true;
+}
+
+bool
+cluster_pi_writeback_ack_current_v1(const ClusterPiDataFactV1 *fact,
+									const ClusterWalWriterToken *peer)
+{
+	return remote_ack_current && memcmp(peer, &remote_ack_writer, sizeof(*peer)) == 0;
+}
+#endif
 
 bool
 cluster_pi_data_read_v1(const ClusterPiDataV1 *job, ClusterPageWalBindingV1 *binding,
@@ -116,7 +150,7 @@ cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *out)
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 	out->ref = writer;
 	out->epoch = ack_writer_epoch;
-	out->startup_first_lsn = 0x80;
+	out->startup_first_lsn = 0;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -945,6 +979,7 @@ data_contribution_plan(const ClusterWalSourceRef sources[3])
 	uint64 tokens[] = { 10, 80, 19, 7 };
 	for (int i = 0; i < 3; i++) {
 		cuts[i].failed_thread = i + 1;
+		cuts[i].origin_owner_incarnation = sources[i].claim.identity.origin_owner_incarnation;
 		cuts[i].timeline_id = 1;
 		cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
 		cuts[i].scan_begin_inclusive = 0x100;
@@ -1169,6 +1204,7 @@ plan_sources_are_immutable(void)
 
 	reset();
 	cut.failed_thread = cut.timeline_id = 1;
+	cut.origin_owner_incarnation = writer.claim.identity.origin_owner_incarnation;
 	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE | RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY;
 	cut.scan_begin_inclusive = cut.scan_end_exclusive = 0x100;
 	request.system_identifier = writer.claim.identity.system_identifier;
@@ -1911,10 +1947,74 @@ physical_pi_newer_than_actual_data_is_not_discarded(void)
 	clean();
 }
 
+static void
+notice_import_requires_actual_fact_and_qualified_master_job(void)
+{
+	ClusterPageDataReceiptV1 *written = NULL, *received = NULL;
+	ClusterPcmPiWriteCutV1 cut;
+	ClusterPiDataFactV1 observed;
+	reset();
+	cut = data_pi_cut();
+	UT_ASSERT(cluster_bufmgr_write_tag_data_at_cut_v1(&identity.key, &cut, &written));
+	UT_ASSERT(cluster_page_data_pi_fact_v1(written, &notice_fact));
+	notice_ready = false;
+	UT_ASSERT(!cluster_page_data_from_notice_v1((const void *)1, 0, &received));
+	notice_ready = true;
+	UT_ASSERT(!cluster_page_data_from_notice_v1((const void *)1, 1, &received));
+	UT_ASSERT(cluster_page_data_from_notice_v1((const void *)1, 0, &received));
+	UT_ASSERT(cluster_page_data_pi_fact_v1(received, &observed));
+	UT_ASSERT_EQ(memcmp(&observed, &notice_fact, sizeof(observed)), 0);
+	cluster_page_data_receipt_free_v1(&received);
+	notice_fact.binding.flags = 0;
+	UT_ASSERT(!cluster_page_data_from_notice_v1((const void *)1, 0, &received));
+	UT_ASSERT(received == NULL);
+	cluster_page_data_receipt_free_v1(&written);
+	clean();
+}
+
+static void
+remote_ack_import_preserves_peer_and_resource_owner(void)
+{
+	ClusterPageDataReceiptV1 *written = NULL;
+	ClusterPiPhysicalAckV1 *ack = NULL;
+	ClusterPcmPiWriteCutV1 cut;
+	int32 node;
+	reset();
+	cut = data_pi_cut();
+	UT_ASSERT(cluster_bufmgr_write_tag_data_at_cut_v1(&identity.key, &cut, &written));
+	UT_ASSERT_EQ(cluster_wal_writer_begin(writer.timeline, &remote_ack_writer), 0);
+	/* The actual transport peer/notice boundary is explicit in this buffer
+	 * fixture. Its real protocol owner is exercised by writeback tests. */
+	cluster_node_id = 1;
+	writer.claim.identity.origin_node_id = 1;
+	writer.claim.identity.origin_thread_id = 2;
+	writer.claim.identity.origin_owner_incarnation = ack_boot = 31;
+	remote_ack_ready = false;
+	remote_ack_current = true;
+	UT_ASSERT(!cluster_page_data_pi_ack_import_v1((const void *)1, 0, written, &ack));
+	remote_ack_ready = true;
+	UT_ASSERT(cluster_page_data_pi_ack_import_v1((const void *)1, 0, written, &ack));
+	UT_ASSERT(cluster_page_data_pi_ack_read_v1(ack, written, &node));
+	UT_ASSERT_EQ(node, 0);
+	CurrentResourceOwner = (void *)2;
+	UT_ASSERT(!cluster_page_data_pi_ack_read_v1(ack, written, &node));
+	CurrentResourceOwner = (void *)1;
+	remote_ack_current = false;
+	UT_ASSERT(!cluster_page_data_pi_ack_read_v1(ack, written, &node));
+	remote_ack_current = true;
+	ack_writer_epoch++;
+	UT_ASSERT(!cluster_page_data_pi_ack_read_v1(ack, written, &node));
+	cluster_page_data_pi_ack_free_v1(&ack);
+	cluster_page_data_receipt_free_v1(&written);
+	clean();
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(28);
+	UT_RUN(notice_import_requires_actual_fact_and_qualified_master_job);
+	UT_RUN(remote_ack_import_preserves_peer_and_resource_owner);
 	UT_RUN(tag_write_io_failure_never_exports_completion);
 	UT_RUN(remote_import_requires_original_job);
 	UT_RUN(tag_write_samples_real_identity_and_version);

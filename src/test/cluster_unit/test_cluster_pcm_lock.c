@@ -132,6 +132,7 @@ static bool pi_storage_receipt_valid;
 static char pi_receipt_fixture;
 static char pi_ack_fixtures[3];
 static uint32 pi_ack_available;
+static uint32 pi_ack_imported;
 static const ClusterPiPhysicalAckV1 *pi_acks[3]
 	= { (const void *)&pi_ack_fixtures[0], (const void *)&pi_ack_fixtures[1],
 		(const void *)&pi_ack_fixtures[2] };
@@ -159,8 +160,10 @@ cluster_page_data_pi_storage_proof_v1(const ClusterPageDataReceiptV1 *receipt,
 	return true;
 }
 
-/* Physical owner/session authentication is the explicit external boundary
- * here; the actual local producer is exercised by test_cluster_page_data. */
+/* Physical owner/session authentication is the explicit external boundary.
+ * Foreign acknowledgements require the completed import owner; the actual
+ * local and remote producers run in test_cluster_pi_writeback. These PCM
+ * fixtures alone are not evidence of physical consumption or transport. */
 bool
 cluster_page_data_pi_ack_read_v1(const ClusterPiPhysicalAckV1 *ack,
 								 const ClusterPageDataReceiptV1 *receipt, int32 *out_node)
@@ -174,7 +177,8 @@ cluster_page_data_pi_ack_read_v1(const ClusterPiPhysicalAckV1 *ack,
 				   || memcmp(&pi_receipt_cut, &pi_ack_cut, sizeof(pi_ack_cut)) != 0)))
 		return false;
 	for (int32 i = 0; i < 3; i++)
-		if (ack == pi_acks[i] && (pi_ack_available & ((uint32)1u << i))) {
+		if (ack == pi_acks[i] && (pi_ack_available & ((uint32)1u << i))
+			&& (i == cluster_node_id || (pi_ack_imported & ((uint32)1u << i)))) {
 			*out_node = i;
 			return true;
 		}
@@ -9437,6 +9441,7 @@ setup_pi_write_master(BufferTag tag)
 	pi_receipt_valid = false;
 	pi_storage_receipt_valid = false;
 	pi_ack_available = 7;
+	pi_ack_imported = 6; /* Explicit successful remote-import boundary. */
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
 				 RESOURCE_X_APPLY_APPLIED);
 	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 2, 2);
@@ -9688,6 +9693,30 @@ UT_TEST(test_pi_write_master_requires_physical_confirmation)
 													 NULL, 0, &holders));
 	UT_ASSERT_EQ(holders, 0);
 	UT_ASSERT_EQ(memcmp(entry, &before, sizeof(before)), 0);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pi_master_rejects_unqualified_foreign_ack_and_scans_bounded)
+{
+	BufferTag tag = make_tag(6590), tags[2];
+	uint32 cursor = 0, holders, count = 0;
+	setup_pi_write_master(tag);
+	pi_receipt_valid = true;
+	pi_ack_imported = 0;
+	UT_ASSERT(!cluster_pcm_lock_pi_write_complete_v1((void *)&pi_receipt_fixture, NULL, NULL, 0,
+													 pi_acks, 2, &holders));
+	UT_ASSERT_EQ(holders, 0);
+	for (unsigned i = 0; i < 4; i++)
+		count += cluster_pcm_lock_pi_candidates_v1(&cursor, 1, tags, lengthof(tags));
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT(BufferTagsEqual(&tags[0], &tag));
+	UT_ASSERT_EQ(cursor, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_pi_candidates_v1(&cursor, 0, tags, lengthof(tags)), 0);
+	pi_ack_imported = 2;
+	UT_ASSERT(cluster_pcm_lock_pi_write_complete_v1((void *)&pi_receipt_fixture, NULL, NULL, 0,
+													pi_acks, 2, &holders));
+	UT_ASSERT_EQ(holders, 3);
+	UT_ASSERT_EQ(cluster_pcm_lock_pi_candidates_v1(&cursor, 4, tags, lengthof(tags)), 0);
 	cluster_shared_config = false;
 }
 
@@ -19743,7 +19772,7 @@ UT_TEST(test_stop_seal_keeps_original_identity_validation_first)
 int
 main(void)
 {
-	UT_PLAN(293);
+	UT_PLAN(294);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -19884,6 +19913,7 @@ main(void)
 	UT_RUN(test_resource_x_settled_retirement_tombstone_replays_and_frees_live_slot);
 	UT_RUN(test_pi_write_master_exact_retirement);
 	UT_RUN(test_pi_write_master_requires_physical_confirmation);
+	UT_RUN(test_pi_master_rejects_unqualified_foreign_ack_and_scans_bounded);
 	UT_RUN(test_pi_completion_requires_entire_unique_confirmation_set);
 	UT_RUN(test_pi_storage_completion_is_exact_and_idempotent);
 	UT_RUN(test_shared_legacy_grant_keeps_departed_writers_without_physical_pi);

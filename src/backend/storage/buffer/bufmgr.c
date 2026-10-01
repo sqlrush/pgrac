@@ -81,6 +81,7 @@
 #include "cluster/cluster_page_data.h"
 #include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_pi_data.h"
+#include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_writer.h"
@@ -10513,9 +10514,11 @@ struct ClusterPiPhysicalAckV1 {
 	uint64 magic;
 	ClusterPageDataReceiptV1 data;
 	ClusterWalWriterToken writer;
+	ClusterWalWriterToken collector;
 	ResourceOwner owner;
 	pid_t pid;
 	int32 node;
+	bool remote;
 };
 
 /* Neither a tag nor a pin grants write authority. Check every live fence
@@ -10869,6 +10872,71 @@ cluster_page_data_from_remote_v1(const ClusterPiDataV1 *job, ClusterPageDataRece
 	receipt->target.version = binding.version;
 	receipt->wal = binding;
 	receipt->pi_cut = cut;
+	*out = receipt;
+	return true;
+}
+
+static bool
+cluster_page_data_fact_shape(const ClusterPiDataFactV1 *fact)
+{
+	static const ClusterPcmPiWriteCutV1 no_x;
+	static const ClusterPcmPiStorageCutV1 no_storage;
+	const BufferTag *expected;
+	BufferTag tag;
+	if (fact == NULL || !cluster_page_wal_binding_shape_v1(&fact->binding))
+		return false;
+	if (cluster_pcm_pi_write_cut_valid_v1(&fact->write_cut)
+		&& fact->write_cut.pi_holders_bitmap != 0
+		&& memcmp(&fact->storage_cut, &no_storage, sizeof(no_storage)) == 0
+		&& fact->binding.flags == CLUSTER_PAGE_WAL_NATIVE_FLUSHED)
+		expected = &fact->write_cut.holder.assertion.resource;
+	else if (cluster_pcm_pi_storage_cut_valid_v1(&fact->storage_cut)
+			 && fact->storage_cut.pi_holders_bitmap != 0
+			 && memcmp(&fact->write_cut, &no_x, sizeof(no_x)) == 0)
+		expected = &fact->storage_cut.resource;
+	else
+		return false;
+	InitBufferTag(&tag, &fact->binding.identity.locator, fact->binding.identity.forknum,
+				  fact->binding.identity.blockno);
+	return BufferTagsEqual(&tag, expected);
+}
+
+bool
+cluster_page_data_pi_fact_v1(const ClusterPageDataReceiptV1 *receipt, ClusterPiDataFactV1 *out)
+{
+	ClusterPiDataFactV1 fact = { 0 };
+	ClusterPageDataTargetV1 target;
+	if (out == NULL || !cluster_page_data_receipt_read_v1(receipt, &target))
+		return false;
+	fact.binding = receipt->wal;
+	fact.write_cut = receipt->pi_cut;
+	fact.storage_cut = receipt->storage_cut;
+	if (!cluster_page_data_fact_shape(&fact)
+		|| target.database_incarnation != fact.binding.source.claim.database_incarnation
+		|| !rf_page_identity_equal_v1(&target.identity, &fact.binding.identity)
+		|| !rf_page_version_equal_v1(&target.version, &fact.binding.version))
+		return false;
+	*out = fact;
+	return true;
+}
+
+bool
+cluster_page_data_from_notice_v1(const ClusterPiWritebackNoticeV1 *notice, uint32 index,
+								 ClusterPageDataReceiptV1 **out)
+{
+	ClusterPiDataFactV1 fact;
+	ClusterPageDataReceiptV1 *receipt;
+	if (out == NULL || *out != NULL || !cluster_pi_writeback_notice_read_v1(notice, index, &fact)
+		|| !cluster_page_data_fact_shape(&fact))
+		return false;
+	receipt = palloc0(sizeof(*receipt));
+	receipt->magic = UINT64_C(0x5047444154413031);
+	receipt->target.database_incarnation = fact.binding.source.claim.database_incarnation;
+	receipt->target.identity = fact.binding.identity;
+	receipt->target.version = fact.binding.version;
+	receipt->wal = fact.binding;
+	receipt->pi_cut = fact.write_cut;
+	receipt->storage_cut = fact.storage_cut;
 	*out = receipt;
 	return true;
 }
@@ -11327,6 +11395,7 @@ cluster_pi_ack_local_writer(ClusterWalWriterToken *out)
 		   && source.claim.identity.origin_node_id == cluster_node_id
 		   && source.claim.identity.origin_owner_incarnation == boot
 		   && cluster_wal_writer_begin(source.timeline, out) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		   && out->startup_first_lsn == InvalidXLogRecPtr
 		   && cluster_page_data_source_same(&source, &out->ref);
 }
 
@@ -11394,12 +11463,75 @@ cluster_page_data_pi_ack_read_v1(const ClusterPiPhysicalAckV1 *ack,
 		*out_node = -1;
 	if (ack == NULL || receipt == NULL || out_node == NULL
 		|| ack->magic != UINT64_C(0x5047504941434b31) || ack->pid != getpid()
-		|| ack->owner != CurrentResourceOwner || ack->node != cluster_node_id
-		|| memcmp(&ack->data, receipt, sizeof(*receipt)) != 0
-		|| !cluster_pi_ack_local_writer(&current)
-		|| memcmp(&ack->writer, &current, sizeof(current)) != 0)
+		|| ack->owner != CurrentResourceOwner || memcmp(&ack->data, receipt, sizeof(*receipt)) != 0
+		|| !cluster_pi_ack_local_writer(&current))
+		return false;
+	if (ack->remote) {
+		ClusterPiDataFactV1 fact;
+		if (ack->node == cluster_node_id || memcmp(&ack->collector, &current, sizeof(current)) != 0
+			|| !cluster_page_data_pi_fact_v1(receipt, &fact)
+			|| !cluster_pi_writeback_ack_current_v1(&fact, &ack->writer))
+			return false;
+	} else if (ack->node != cluster_node_id || memcmp(&ack->writer, &current, sizeof(current)) != 0)
 		return false;
 	*out_node = ack->node;
+	return true;
+}
+
+bool
+cluster_page_data_pi_ack_export_v1(const ClusterPiPhysicalAckV1 *ack,
+								   const ClusterPageDataReceiptV1 *receipt,
+								   ClusterWalWriterToken *out)
+{
+	int32 node;
+	if (out == NULL || ack == NULL || ack->remote
+		|| !cluster_page_data_pi_ack_read_v1(ack, receipt, &node) || node != cluster_node_id)
+		return false;
+	*out = ack->writer;
+	return true;
+}
+
+bool
+cluster_page_data_pi_ack_import_v1(const ClusterPiWritebackJobV1 *job, uint32 index,
+								   const ClusterPageDataReceiptV1 *receipt,
+								   ClusterPiPhysicalAckV1 **out)
+{
+	ClusterWalWriterToken collector, peer;
+	ClusterPiDataFactV1 fact;
+	ClusterPiPhysicalAckV1 *ack;
+	uint32 holders;
+	int32 node, master;
+	if (out == NULL || *out != NULL || !cluster_pi_ack_local_writer(&collector)
+		|| !cluster_page_data_pi_fact_v1(receipt, &fact)
+		|| !cluster_pi_writeback_ack_read_v1(job, index, receipt, &peer)
+		|| !cluster_wal_claim_v2_ref_valid(&peer.ref.claim) || peer.startup_first_lsn != 0
+		|| peer.epoch != collector.epoch
+		|| peer.ref.claim.identity.system_identifier != fact.binding.identity.system_identifier
+		|| peer.ref.claim.database_incarnation != fact.binding.source.claim.database_incarnation
+		|| memcmp(peer.ref.claim.identity.storage_uuid, fact.binding.identity.storage_uuid, 16) != 0
+		|| !cluster_pi_writeback_ack_current_v1(&fact, &peer))
+		return false;
+	if (cluster_pcm_pi_write_cut_valid_v1(&fact.write_cut)) {
+		holders = fact.write_cut.pi_holders_bitmap;
+		master = fact.write_cut.master_node;
+	} else {
+		holders = fact.storage_cut.pi_holders_bitmap;
+		master = fact.storage_cut.master_node;
+	}
+	node = peer.ref.claim.identity.origin_node_id;
+	if (master != cluster_node_id || node < 0 || node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| node == cluster_node_id || (holders & ((uint32)1u << node)) == 0)
+		return false;
+	ack = palloc0(sizeof(*ack));
+	ack->magic = UINT64_C(0x5047504941434b31);
+	ack->data = *receipt;
+	ack->writer = peer;
+	ack->collector = collector;
+	ack->node = node;
+	ack->pid = getpid();
+	ack->owner = CurrentResourceOwner;
+	ack->remote = true;
+	*out = ack;
 	return true;
 }
 

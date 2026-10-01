@@ -671,10 +671,46 @@ UT_TEST(test_source_origin_must_fit_page_coordinate)
 	rf_page_online_plan_destroy_v1(&plan);
 }
 
+UT_TEST(test_full_source_binding_requires_exact_nonzero_writer_incarnation)
+{
+	RfContributorStreamCutV1 cut = { .failed_thread = 1,
+									 .timeline_id = 1,
+									 .flags = RF_CONTRIBUTOR_CUT_COMPLETE,
+									 .scan_begin_inclusive = 0x100,
+									 .scan_end_exclusive = 0x200 };
+	RfPageOnlinePlanRequestV1 request = { .system_identifier = 99,
+										  .physical_cuts = &cut,
+										  .participant_count = 1,
+										  .retention_binding_cookie = 41 };
+	ClusterWalSourceRef source = { 0 };
+	ClusterControlRootIdentity *id = &source.claim.identity;
+	memset(request.storage_uuid, 3, 16);
+	id->system_identifier = 99;
+	memcpy(id->storage_uuid, request.storage_uuid, 16);
+	id->authority_uuid[0] = 1;
+	id->origin_thread_id = 1;
+	id->origin_node_id = 0;
+	id->thread_claim_created_at = 1;
+	id->origin_owner_incarnation = 71;
+	id->root_lineage_seq = 1;
+	source.claim.database_incarnation = 5;
+	source.claim.max_config_generation = 8;
+	source.claim.claim_sha256[0] = 3;
+	source.timeline = 1;
+	for (unsigned mode = 0; mode < 3; mode++) {
+		RfPageOnlinePlanV1 *plan = NULL;
+		cut.origin_owner_incarnation = mode == 0 ? 0 : mode == 1 ? 72 : 71;
+		UT_ASSERT_EQ(rf_page_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_page_online_plan_bind_sources_v1(plan, &source, 1), mode == 2);
+		rf_page_online_plan_destroy_v1(&plan);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
+	UT_RUN(test_full_source_binding_requires_exact_nonzero_writer_incarnation);
 	UT_RUN(test_two_record_chain_builds_canonical_target);
 	UT_RUN(test_record_failure_is_atomic_and_retryable);
 	UT_RUN(test_first_delta_requires_full_anchor);

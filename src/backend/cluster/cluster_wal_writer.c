@@ -172,6 +172,40 @@ cluster_wal_writer_confirm_v1(const ClusterWalWriterSampleV1 *sample, ClusterWal
 }
 
 ClusterControlRootResult
+cluster_wal_writer_flush_sample_v1(const ClusterWalWriterSampleV1 *sample,
+								   ClusterWalWriterFlushV1 *out)
+{
+	ClusterControlRootResult result;
+	ClusterWalWriterToken current;
+	uintptr_t a = (uintptr_t)sample, b = (uintptr_t)out;
+	if (sample != NULL && out != NULL && (a <= b ? b - a < sizeof(*sample) : a - b < sizeof(*out)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (MyBackendType != B_BG_WORKER && MyBackendType != B_BG_WRITER
+		&& MyBackendType != B_CHECKPOINTER)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = cluster_wal_writer_confirm_v1(sample, out);
+	if (result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
+		return result;
+	/* WAIT may also mean the writer fence is temporarily unavailable. No
+	 * device call is allowed until this exact writer is qualified again. */
+	result = cluster_wal_writer_begin(sample->writer.ref.timeline, &current);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(&current, &sample->writer, sizeof(current)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (sample->reserved_end > GetXLogInsertEndRecPtr())
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	result = cluster_wal_writer_check(&current);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	XLogFlush(sample->reserved_end);
+	return cluster_wal_writer_confirm_v1(sample, out);
+}
+
+ClusterControlRootResult
 cluster_wal_writer_flushed_v1(ClusterWalWriterFlushV1 *out)
 {
 	ClusterWalWriterFlushV1 work = { 0 };

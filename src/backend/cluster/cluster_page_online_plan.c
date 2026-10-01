@@ -349,8 +349,7 @@ rf_page_online_plan_bind_sources_v1(RfPageOnlinePlanV1 *plan, const ClusterWalSo
 		if (plan->participant_seen[i] || id->system_identifier != plan->system_identifier
 			|| memcmp(id->storage_uuid, plan->storage_uuid, 16) != 0
 			|| id->origin_thread_id != cut->failed_thread
-			|| (cut->origin_owner_incarnation != 0
-				&& cut->origin_owner_incarnation != id->origin_owner_incarnation)
+			|| cut->origin_owner_incarnation != id->origin_owner_incarnation
 			|| id->origin_thread_id > PGRAC_PAGE_LSN_ORIGIN_MAX + 1
 			|| id->origin_node_id != (int32)id->origin_thread_id - 1 || id->reserved42 != 0
 			|| id->reserved60 != 0 || id->thread_claim_created_at <= 0

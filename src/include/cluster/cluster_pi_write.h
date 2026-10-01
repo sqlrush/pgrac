@@ -163,6 +163,11 @@ cluster_pcm_pi_write_cut_valid_v1(const ClusterPcmPiWriteCutV1 *cut)
  * A zero PI set has no work. False leaves out unchanged and creates no entry. */
 extern bool cluster_pcm_lock_pi_write_snapshot_v1(BufferTag tag, ClusterPcmPiWriteCutV1 *out);
 
+/* Read-only bounded registry walk for the existing background writer. Tags
+ * are candidates only; the consumer must capture/recheck an exact cut. */
+extern uint32 cluster_pcm_lock_pi_candidates_v1(uint32 *cursor, uint32 probe_budget,
+												BufferTag *tags, uint32 capacity);
+
 /* Actual holder DATA write. The cut is captured before this call; it must
  * match the installed current-X buffer generation. No ownership acquisition.
  * A receipt from the ordinary endpoint cannot retire master PI obligations. */

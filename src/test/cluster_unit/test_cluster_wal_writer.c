@@ -1150,10 +1150,77 @@ UT_TEST(test_explicit_sample_refuses_unsafe_context_or_changed_flush)
 	ShutdownRequestPending = false;
 }
 
+UT_TEST(test_requested_background_cut_actively_flushes_fixed_end)
+{
+	ClusterWalWriterSampleV1 sample;
+	ClusterWalWriterFlushV1 out;
+	TestWalRecord a, b;
+	fixture();
+	a = base_record();
+	b = record_write(a.exclusive_end, a.record_start, 24);
+	memset(&native_ctl, 0, sizeof(native_ctl));
+	native_ctl.LogwrtResult.Write = native_ctl.LogwrtResult.Flush = a.exclusive_end;
+	LogwrtResult = native_ctl.LogwrtResult;
+	native_ctl.LogwrtRqst.Write = native_ctl.LogwrtRqst.Flush = b.exclusive_end;
+	native_ctl.InsertTimeLineID = 1;
+	native_ctl.XLogCacheBlck = 1;
+	reserved_end = b.exclusive_end;
+	held = false;
+	CritSectionCount = 0;
+	MyBackendType = B_BG_WRITER;
+	flush_probe_calls = flush_probe_drift = native_waits = native_writes = 0;
+	change_epoch = 0;
+	UT_ASSERT_EQ(cluster_wal_writer_sample_v1(&sample), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	/* Later insertions cannot move this requested cut. Native Flush waits
+	 * for completion only through the original reservation. */
+	reserved_end += XLOG_BLCKSZ;
+	UT_ASSERT_EQ(cluster_wal_writer_flush_sample_v1(&sample, &out),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(out.complete_end, b.exclusive_end);
+	UT_ASSERT(out.flushed_end >= b.exclusive_end);
+	UT_ASSERT(native_writes > 0);
+	UT_ASSERT(!held);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+}
+
+UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterWalWriterSampleV1 sample;
+		ClusterWalWriterFlushV1 out, zero = { 0 };
+		fixture();
+		held = false;
+		CritSectionCount = 0;
+		MyBackendType = B_BG_WRITER;
+		flush_probe_calls = flush_probe_drift = native_writes = 0;
+		native_ctl.InsertTimeLineID = 1;
+		reserved_end = wal_segment_size + 100;
+		native_ctl.LogwrtResult.Flush = reserved_end - 1;
+		UT_ASSERT_EQ(cluster_wal_writer_sample_v1(&sample), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		if (fault == 0)
+			MyBackendType = B_LMON;
+		if (fault == 1)
+			sample.writer.ref.claim.identity.origin_node_id++;
+		if (fault == 2)
+			sample.reserved_end++;
+		if (fault == 3)
+			CritSectionCount++;
+		if (fault == 4)
+			epoch++;
+		memset(&out, 0x55, sizeof(out));
+		UT_ASSERT_NE(cluster_wal_writer_flush_sample_v1(&sample, &out),
+					 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		UT_ASSERT_EQ(native_writes, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(28);
+	UT_RUN(test_requested_background_cut_actively_flushes_fixed_end);
+	UT_RUN(test_requested_flush_rejects_foreign_or_unsafe_context_without_io);
 	UT_RUN(test_explicit_writer_samples_remain_independent);
 	UT_RUN(test_explicit_sample_cannot_adopt_a_later_writer);
 	UT_RUN(test_explicit_sample_refuses_unsafe_context_or_changed_flush);

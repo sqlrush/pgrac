@@ -80,6 +80,7 @@
 #include "cluster/cluster_startup_exit.h"
 #include "cluster/cluster_wal_cut.h"
 #include "cluster/cluster_pi_data.h"
+#include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_service_observe.h"
 #include "cluster/cluster_config_members.h"
@@ -229,6 +230,7 @@ cluster_lmon_shmem_init(void)
 			cluster_startup_exit_register();
 			cluster_wal_cut_register_v1();
 			cluster_pi_data_register_v1();
+			cluster_pi_writeback_register_v1();
 			cluster_config_members_register();
 		}
 		heartbeat_registered = true;
@@ -541,6 +543,7 @@ cluster_lmon_shmem_register(void)
 		cluster_startup_exit_shmem_register();
 		cluster_wal_cut_shmem_register_v1();
 		cluster_pi_data_shmem_register_v1();
+		cluster_pi_writeback_shmem_register_v1();
 	}
 }
 
@@ -1127,8 +1130,16 @@ lmon_normal_stop_observe(bool final_observation)
 	aggregate = cluster_service_normal_stop_observe(&observation);
 	if (aggregate == CLUSTER_NORMAL_STOP_READY && cluster_shared_config) {
 		aggregate = cluster_pi_data_normal_stop_poll_v1(&observation.reason);
+		observation.domain = "current-holder-data";
+		if (aggregate == CLUSTER_NORMAL_STOP_READY) {
+			aggregate = cluster_wal_cut_normal_stop_poll_v1(&observation.reason);
+			observation.domain = "native-wal-cut";
+		}
+		if (aggregate == CLUSTER_NORMAL_STOP_READY) {
+			aggregate = cluster_pi_writeback_normal_stop_poll_v1(&observation.reason);
+			observation.domain = "physical-pi-writeback";
+		}
 		if (aggregate != CLUSTER_NORMAL_STOP_READY) {
-			observation.domain = "current-holder-data";
 			observation.slot = -1;
 			observation.key = 0;
 		}
@@ -1491,6 +1502,7 @@ LmonMain(void)
 					cluster_startup_exit_lmon_tick();
 					cluster_wal_cut_lmon_tick_v1();
 					cluster_pi_data_lmon_tick_v1();
+					cluster_pi_writeback_lmon_tick_v1();
 					cluster_shared_config_delivery_lmon_tick();
 				}
 				/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
@@ -2303,6 +2315,7 @@ LmonMain(void)
 					cluster_startup_exit_lmon_tick();
 					cluster_wal_cut_lmon_tick_v1();
 					cluster_pi_data_lmon_tick_v1();
+					cluster_pi_writeback_lmon_tick_v1();
 					cluster_shared_config_delivery_lmon_tick();
 				}
 				(void)cluster_gcs_block_lmon_drain_direct_land_aborts();

@@ -15,6 +15,7 @@
 #include "cluster/cluster_wal_cut.h"
 #include "miscadmin.h"
 #include "storage/ipc.h"
+#include "storage/proc.h"
 #include "storage/shmem.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
@@ -31,6 +32,13 @@ ResourceOwner CurrentResourceOwner = (void *)1;
 MemoryContext TopMemoryContext = (void *)1;
 static uint64 epoch = 17, incarnations[2] = { 31, 41 }, random_counter;
 static bool quorum = true, pending, native_ready = true;
+static bool flush_ready = true, stop_requested, flush_error;
+static unsigned force_flushes;
+PGPROC *MyProc;
+PROC_HDR *ProcGlobal;
+volatile uint32 CritSectionCount;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
 static TimestampTz now_us = 1000000;
 static ClusterWalSourceRef sources[2];
 static XLogRecPtr reserved = 0x1200, flushed = 0x1100;
@@ -39,10 +47,30 @@ static uint8 sent[CLUSTER_WAL_CUT_BYTES];
 static int32 destination;
 static ClusterICMsgTypeInfo registration;
 static const ClusterShmemRegion *region;
-static char shared_bytes[1024] pg_attribute_aligned(MAXIMUM_ALIGNOF);
-static bool shared_found;
+static char shared_bytes[2][2048] pg_attribute_aligned(MAXIMUM_ALIGNOF);
+static bool shared_found[2];
 static ResourceReleaseCallback release_callback;
 static pg_on_exit_callback exit_callback;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+
+void
+SetLatch(Latch *latch)
+{
+	wakeups++;
+}
+
+bool
+cluster_normal_stop_requested(void)
+{
+	return stop_requested;
+}
 
 void
 ExceptionalCondition(const char *a, const char *b, int c)
@@ -122,10 +150,10 @@ cluster_shmem_register_region(const ClusterShmemRegion *r)
 void *
 ShmemInitStruct(const char *name, Size n, bool *found)
 {
-	UT_ASSERT(n <= sizeof(shared_bytes));
-	*found = shared_found;
-	shared_found = true;
-	return shared_bytes;
+	UT_ASSERT(n <= sizeof(shared_bytes[0]));
+	*found = shared_found[cluster_node_id];
+	shared_found[cluster_node_id] = true;
+	return shared_bytes[cluster_node_id];
 }
 void
 RegisterResourceReleaseCallback(ResourceReleaseCallback c, void *arg)
@@ -174,7 +202,7 @@ cluster_wal_writer_sample_v1(ClusterWalWriterSampleV1 *out)
 ClusterControlRootResult
 cluster_wal_writer_confirm_v1(const ClusterWalWriterSampleV1 *sample, ClusterWalWriterFlushV1 *out)
 {
-	UT_ASSERT_EQ(MyBackendType, B_LMON);
+	UT_ASSERT(MyBackendType == B_LMON || MyBackendType == B_BG_WRITER);
 	memset(out, 0, sizeof(*out));
 	confirms++;
 	if (!native_ready || sample->writer.epoch != epoch
@@ -190,7 +218,30 @@ cluster_wal_writer_confirm_v1(const ClusterWalWriterSampleV1 *sample, ClusterWal
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+ClusterControlRootResult
+cluster_wal_writer_flush_sample_v1(const ClusterWalWriterSampleV1 *sample,
+								   ClusterWalWriterFlushV1 *out)
+{
+	ClusterControlRootResult result;
+	UT_ASSERT_EQ(MyBackendType, B_BG_WRITER);
+	result = cluster_wal_writer_confirm_v1(sample, out);
+	if (result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT || !flush_ready)
+		return result;
+	force_flushes++;
+	if (flush_error)
+		pg_re_throw();
+	flushed = sample->reserved_end;
+	return cluster_wal_writer_confirm_v1(sample, out);
+}
+
 #include "../../backend/cluster/cluster_wal_cut.c"
+
+static void
+select_node(int node)
+{
+	cluster_node_id = node;
+	cut_shared = (WalCutShared *)shared_bytes[node];
+}
 
 static void
 reset(void)
@@ -202,6 +253,11 @@ reset(void)
 	incarnations[0] = 31;
 	incarnations[1] = 41;
 	quorum = native_ready = true;
+	flush_ready = true;
+	stop_requested = flush_error = false;
+	force_flushes = 0;
+	CritSectionCount = 0;
+	memset(shared_found, 0, sizeof(shared_found));
 	pending = false;
 	reserved = 0x1200;
 	flushed = 0x1100;
@@ -225,6 +281,9 @@ reset(void)
 		sources[i].timeline = 1;
 	}
 	cluster_wal_cut_shmem_register_v1();
+	cluster_node_id = 1;
+	region->init_fn();
+	cluster_node_id = 0;
 	region->init_fn();
 	cluster_wal_cut_register_v1();
 	UT_ASSERT_EQ(registration.plane, CLUSTER_IC_PLANE_CONTROL);
@@ -235,7 +294,7 @@ static void
 deliver(int source, int dest, const uint8 *wire)
 {
 	ClusterICEnvelope env = { 0 };
-	cluster_node_id = dest;
+	select_node(dest);
 	MyBackendType = B_LMON;
 	env.msg_type = PGRAC_IC_MSG_WAL_CUT;
 	env.source_node_id = source;
@@ -250,7 +309,7 @@ roundtrip(void)
 {
 	uint8 wire[CLUSTER_WAL_CUT_BYTES];
 	unsigned before = sends;
-	cluster_node_id = 0;
+	select_node(0);
 	MyBackendType = B_LMON;
 	now_us += 100001;
 	cluster_wal_cut_lmon_tick_v1();
@@ -258,16 +317,21 @@ roundtrip(void)
 	UT_ASSERT_EQ(destination, 1);
 	memcpy(wire, sent, sizeof(wire));
 	deliver(0, 1, wire);
+	UT_ASSERT_EQ(sends, before + 1); /* CONTROL cannot flush or reply early. */
+	MyBackendType = B_BG_WRITER;
+	(void)cluster_wal_cut_bgwriter_tick_v1();
+	MyBackendType = B_LMON;
+	cluster_wal_cut_lmon_tick_v1();
 	if (sends == before + 2) {
 		UT_ASSERT_EQ(destination, 0);
 		memcpy(wire, sent, sizeof(wire));
 		deliver(1, 0, wire);
 	}
-	cluster_node_id = 0;
+	select_node(0);
 	MyBackendType = B_BG_WRITER;
 }
 
-UT_TEST(fixed_remote_cut_waits_for_original_flush)
+UT_TEST(fixed_remote_cut_actively_flushes_idle_original_writer)
 {
 	ClusterWalCutV1 *cut = NULL;
 	ClusterWalWriterFlushV1 out;
@@ -275,6 +339,7 @@ UT_TEST(fixed_remote_cut_waits_for_original_flush)
 	reset();
 	UT_ASSERT_EQ(cluster_wal_cut_begin_v1(&sources[1], &cut), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	UT_ASSERT_EQ(cluster_wal_cut_poll_v1(cut, &out), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	flush_ready = false;
 	roundtrip();
 	UT_ASSERT_EQ(cluster_wal_cut_poll_v1(cut, &out), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
 	UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
@@ -282,11 +347,12 @@ UT_TEST(fixed_remote_cut_waits_for_original_flush)
 	roundtrip();
 	UT_ASSERT_EQ(samples, 1);
 	UT_ASSERT_EQ(cluster_wal_cut_poll_v1(cut, &out), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
-	flushed = 0x1200;
+	flush_ready = true;
 	roundtrip();
 	UT_ASSERT_EQ(cluster_wal_cut_poll_v1(cut, &out), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	UT_ASSERT_EQ(out.complete_end, 0x1200);
 	UT_ASSERT_EQ(out.flushed_end, 0x1200);
+	UT_ASSERT_EQ(force_flushes, 1);
 	flushed = reserved;
 	UT_ASSERT_EQ(cluster_wal_cut_poll_v1(cut, &out), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	UT_ASSERT_EQ(out.complete_end, 0x1200);
@@ -407,10 +473,16 @@ UT_TEST(reordered_samples_and_wrong_sender_do_not_replace_fixed_minimum)
 	ClusterWalCutMessageV1 sampled;
 	uint8 old[CLUSTER_WAL_CUT_BYTES];
 	reset();
+	flush_ready = false;
 	UT_ASSERT_EQ(cluster_wal_cut_begin_v1(&sources[1], &cut), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	roundtrip();
 	UT_ASSERT(cluster_wal_cut_decode_v1(sent, sizeof(sent), &sampled));
-	UT_ASSERT_EQ(sampled.verb, CLUSTER_WAL_CUT_SAMPLED);
+	sampled.verb = CLUSTER_WAL_CUT_SAMPLED;
+	sampled.native_config_generation = 4;
+	sampled.reserved_end = 0x1200;
+	sampled.flushed_end = 0;
+	UT_ASSERT(cluster_wal_cut_encode_v1(&sampled, old));
+	deliver(1, 0, old);
 	/* A late initial reply may have sampled a later end. The first proposal
 	 * already fixed this job's end; only its matching confirmation can finish. */
 	sampled.reserved_end += 0x1000;
@@ -454,17 +526,56 @@ UT_TEST(native_writer_refusal_and_later_selected_ceiling)
 	cluster_wal_cut_release_v1(&cut);
 }
 
+UT_TEST(source_error_and_stop_preserve_pending_without_success)
+{
+	ClusterWalCutV1 *cut = NULL;
+	ClusterWalWriterFlushV1 out;
+	uint8 wire[CLUSTER_WAL_CUT_BYTES];
+	volatile bool failed = false;
+	const char *reason;
+	reset();
+	UT_ASSERT_EQ(cluster_wal_cut_begin_v1(&sources[1], &cut), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	MyBackendType = B_LMON;
+	cluster_wal_cut_lmon_tick_v1();
+	memcpy(wire, sent, sizeof(wire));
+	deliver(0, 1, wire);
+	UT_ASSERT_EQ(cluster_wal_cut_normal_stop_poll_v1(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	MyBackendType = B_BG_WRITER;
+	flush_error = true;
+	PG_TRY();
+	{
+		(void)cluster_wal_cut_bgwriter_tick_v1();
+	}
+	PG_CATCH();
+	{
+		failed = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(failed);
+	select_node(0);
+	UT_ASSERT_EQ(cluster_wal_cut_poll_v1(cut, &out), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	flush_error = false;
+	stop_requested = true;
+	MyBackendType = B_LMON;
+	cluster_wal_cut_lmon_tick_v1();
+	UT_ASSERT_EQ(cluster_wal_cut_normal_stop_poll_v1(&reason), CLUSTER_NORMAL_STOP_READY);
+	MyBackendType = B_BG_WRITER;
+	UT_ASSERT_NE(cluster_wal_cut_poll_v1(cut, &out), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	cluster_wal_cut_release_v1(&cut);
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
-	UT_RUN(fixed_remote_cut_waits_for_original_flush);
+	UT_PLAN(8);
+	UT_RUN(fixed_remote_cut_actively_flushes_idle_original_writer);
 	UT_RUN(old_reply_and_other_owner_cannot_complete_new_job);
 	UT_RUN(cancellation_releases_mailbox_without_inventing_completion);
 	UT_RUN(completed_cut_refuses_new_epoch_boot_or_quorum);
 	UT_RUN(codec_preserves_full_identity_and_rejects_unconfirmed_success);
 	UT_RUN(reordered_samples_and_wrong_sender_do_not_replace_fixed_minimum);
 	UT_RUN(native_writer_refusal_and_later_selected_ceiling);
+	UT_RUN(source_error_and_stop_preserve_pending_without_success);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

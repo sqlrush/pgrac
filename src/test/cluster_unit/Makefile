@@ -136,7 +136,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_control_root \
 		test_cluster_checkpoint_native \
 		test_cluster_checkpoint_buffers \
-		test_cluster_page_data \
+		test_cluster_page_data test_cluster_pi_writeback \
 		test_cluster_page_wal \
 		test_cluster_wal_retention \
 		test_cluster_recovery_duty \
@@ -510,7 +510,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
 SIMPLE_TESTS := $(filter-out test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_wal_cut test_cluster_pi_data test_cluster_thread_tail,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers test_cluster_page_data test_cluster_page_wal,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers test_cluster_page_data test_cluster_pi_writeback test_cluster_page_wal,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_request,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire_master,$(SIMPLE_TESTS))
@@ -2105,8 +2105,13 @@ test_cluster_page_wal: test_cluster_page_wal.c unit_test.h test_cluster_page_wal
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -lm -o $@
 
-test_cluster_page_data: test_cluster_page_data.c unit_test.h test_cluster_page_data.inc \
+test_cluster_page_data: test_cluster_page_data.c
+test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c \
+		$(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c \
+		$(top_srcdir)/src/backend/cluster/cluster_pi_data_wire.h
+test_cluster_page_data test_cluster_pi_writeback: unit_test.h test_cluster_page_data.inc \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
+		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h $(CLUSTER_WAL_CLAIM_O) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		test_cluster_page_flush.inc \
 		test_cluster_space_recovery_flush.inc test_cluster_page_data_stable.o test_cluster_page_wal_product.o \
@@ -2115,7 +2120,7 @@ test_cluster_page_data: test_cluster_page_data.c unit_test.h test_cluster_page_d
 		$(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_page_data_stable.o test_cluster_page_wal_product.o \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c test_cluster_page_data_stable.o test_cluster_page_wal_product.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o xlogreader_fs.o \
@@ -7054,6 +7059,7 @@ test_cluster_wal_writer: test_cluster_wal_writer.c
 
 test_cluster_pi_data: test_cluster_pi_data.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_data.c \
+		$(top_srcdir)/src/backend/cluster/cluster_pi_data_wire.h \
 		$(top_srcdir)/src/include/cluster/cluster_pi_data.h \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \

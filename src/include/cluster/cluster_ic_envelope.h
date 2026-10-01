@@ -305,8 +305,10 @@ typedef enum ClusterICMsgType {
 	/* Original-writer background reservation/Flush observations. CONTROL only. */
 	PGRAC_IC_MSG_WAL_CUT = 68,
 	/* GCS background holder write/completion. CONTROL routes; bgwriter does I/O. */
-	PGRAC_IC_MSG_PI_DATA = 69
-	/* values 70..254 available; 255 is the chunk carrier */
+	PGRAC_IC_MSG_PI_DATA = 69,
+	/* Master DATA notification and original physical PI acknowledgement. */
+	PGRAC_IC_MSG_PI_WRITEBACK = 70
+	/* values 71..254 available; 255 is the chunk carrier */
 } ClusterICMsgType;
 
 /* Spec-8.4C D13 full-member semantic-activation acknowledgement carrier. */

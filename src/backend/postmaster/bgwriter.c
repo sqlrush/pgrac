@@ -57,6 +57,8 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_pi_data.h"
+#include "cluster/cluster_pi_writeback.h"
+#include "cluster/cluster_wal_cut.h"
 #endif
 
 /*
@@ -245,7 +247,11 @@ BackgroundWriterMain(void)
 #ifdef USE_PGRAC_CLUSTER
 		/* GCS write requests execute here, outside CONTROL dispatch and with
 		 * the native auxiliary ResourceOwner/error cleanup. */
+		if (cluster_wal_cut_bgwriter_tick_v1())
+			can_hibernate = false;
 		if (cluster_pi_data_bgwriter_tick_v1())
+			can_hibernate = false;
+		if (cluster_pi_writeback_bgwriter_tick_v1())
 			can_hibernate = false;
 #endif
 

@@ -49,6 +49,7 @@
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_shared_config.h" /* PGRAC: idle common-value retry */
+#include "cluster/cluster_pi_writeback.h"
 #include "../cluster/cluster_control_root_private.h"
 #endif
 #include "libpq/pqsignal.h"
@@ -373,6 +374,9 @@ CheckpointerMain(void)
 		pg_time_t	now;
 		int			elapsed_secs;
 		int			cur_timeout;
+#ifdef USE_PGRAC_CLUSTER
+		bool pi_pending = false;
+#endif
 
 		/* Clear any already-pending wakeups */
 		ResetLatch(MyLatch);
@@ -388,6 +392,7 @@ CheckpointerMain(void)
 		 * control cleanup. Author: SqlRush <sqlrush@gmail.com> */
 		cluster_cf_retirement_poll();
 		cluster_lock_owners_service_poll();
+		pi_pending = cluster_pi_writeback_checkpointer_tick_v1();
 #endif
 
 		/*
@@ -424,6 +429,12 @@ CheckpointerMain(void)
 		{
 			bool		ckpt_performed = false;
 			bool		do_restartpoint;
+
+#ifdef USE_PGRAC_CLUSTER
+			/* Native checkpoint owns the next ROOT/WALR operation. */
+			cluster_pi_writeback_checkpointer_release_v1();
+			pi_pending = false;
+#endif
 
 			/* Check if we should perform a checkpoint or a restartpoint. */
 			do_restartpoint = RecoveryInProgress();
@@ -574,10 +585,14 @@ CheckpointerMain(void)
 			cur_timeout = Min(cur_timeout, XLogArchiveTimeout - elapsed_secs);
 		}
 
-		(void) WaitLatch(MyLatch,
-						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						 cur_timeout * 1000L /* convert to ms */ ,
-						 WAIT_EVENT_CHECKPOINTER_MAIN);
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+#ifdef USE_PGRAC_CLUSTER
+						cluster_enabled && cluster_shared_config
+							? Min(cur_timeout * 1000L, pi_pending ? 100L : 1000L)
+							:
+#endif
+							cur_timeout * 1000L /* convert to ms */,
+						WAIT_EVENT_CHECKPOINTER_MAIN);
 	}
 }
 
@@ -625,6 +640,7 @@ HandleCheckpointerInterrupts(void)
 		ClusterNormalStopModuleObservation normal_stop_observation;
 		ClusterPhase1FullStopPrepareResult phase1_full_stop_prepare_result;
 		ClusterPhase1FullStopPlan phase1_full_stop_plan;
+		cluster_pi_writeback_checkpointer_release_v1();
 #endif
 
 		/*

@@ -44,7 +44,7 @@ extern uint32 cluster_wal_inputs_count_v1(ClusterWalInputsV1 *inputs);
 extern const ClusterWalInputV1 *cluster_wal_inputs_at_v1(ClusterWalInputsV1 *inputs, uint32 index);
 
 /* Physically visit one selected retained source outside CF, under this exact
- * ROOT/WALR scope. OPEN refuses: its original live writer must first confirm
+ * ROOT/WALR scope. OPEN returns WAIT without invalidating the scope: its original live writer must first confirm
  * a complete end after the directory cut. Terminal input is fully reclassified
  * and compared with the selected terminal. Callbacks are provisional; any
  * failure invalidates the scope and clears output. The caller must release
@@ -56,10 +56,10 @@ cluster_wal_inputs_visit_retained_v1(ClusterWalInputsV1 *inputs, uint32 index,
 									 ClusterWalTailObservation *out);
 
 /* Original local OPEN writer only. Invoke first after capturing the exact
- * directory cut for this job. Keeps a fixed native reserved-end minimum in
- * this scope, waits for the writer's confirmed complete end to cover it, then
- * decodes without CF. A pending sample from an earlier job cannot satisfy a
- * later cut. RECONFIG_WAIT before visiting retains the minimum; any visited
+ * directory cut for this job. Keeps a fixed native reserved end in this scope,
+ * explicitly flushes this original writer through that end, then decodes
+ * without CF. No pending sample from another job is borrowed. RECONFIG_WAIT
+ * before visiting retains the reservation; any visited
  * failure invalidates the scope. Remote sources require their own writer
  * transport and return RECONFIG_WAIT here, never use the receiver's Flush. */
 extern ClusterControlRootResult

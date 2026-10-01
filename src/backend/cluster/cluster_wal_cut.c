@@ -15,6 +15,7 @@
 #include "cluster/cluster_wal_cut.h"
 #include "miscadmin.h"
 #include "storage/ipc.h"
+#include "storage/proc.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
 #include "utils/memutils.h"
@@ -23,6 +24,13 @@
 
 #define WAL_CUT_RETRY_US INT64CONST(100000)
 
+typedef enum WalCutSourceState {
+	WAL_CUT_SOURCE_EMPTY,
+	WAL_CUT_SOURCE_QUEUED,
+	WAL_CUT_SOURCE_RUNNING,
+	WAL_CUT_SOURCE_REPLIED
+} WalCutSourceState;
+
 typedef struct WalCutShared {
 	slock_t lock;
 	int32 owner_pid;
@@ -30,6 +38,15 @@ typedef struct WalCutShared {
 	ClusterControlRootResult result;
 	ClusterWalCutMessageV1 request;
 	ClusterWalCutMessageV1 reply;
+	uint64 source_revision;
+	WalCutSourceState source_state;
+	int32 source_pid;
+	bool source_reply_pending;
+	ClusterWalCutMessageV1 source_request;
+	ClusterWalWriterSampleV1 source_sample;
+	ClusterWalCutMessageV1 source_reply;
+	int32 bgwriter_procno;
+	int32 bgwriter_pid;
 } WalCutShared;
 
 struct ClusterWalCutV1 {
@@ -185,8 +202,8 @@ cut_current(const ClusterWalCutMessageV1 *m, bool collector)
 	int32 source = m->source.claim.identity.origin_node_id;
 	uint64 boot
 		= collector ? m->collector_incarnation : m->source.claim.identity.origin_owner_incarnation;
-	return cluster_enabled && cluster_shared_config && cut_message_valid(m)
-		   && cluster_node_id == (collector ? (int32)m->collector : source)
+	return cluster_enabled && cluster_shared_config && !cluster_normal_stop_requested()
+		   && cut_message_valid(m) && cluster_node_id == (collector ? (int32)m->collector : source)
 		   && GetSystemIdentifier() == m->source.claim.identity.system_identifier
 		   && cluster_qvotec_get_self_incarnation() == boot && cluster_qvotec_in_quorum()
 		   && cluster_epoch_get_current() == m->epoch
@@ -249,6 +266,28 @@ static void
 cut_child_exit(int code pg_attribute_unused(), Datum arg pg_attribute_unused())
 {
 	cut_cancel(active_cut);
+	if (cut_shared != NULL) {
+		SpinLockAcquire(&cut_shared->lock);
+		if (cut_shared->source_pid == MyProcPid) {
+			cut_shared->source_state = WAL_CUT_SOURCE_EMPTY;
+			cut_shared->source_pid = 0;
+		}
+		if (cut_shared->bgwriter_pid == MyProcPid) {
+			cut_shared->bgwriter_pid = 0;
+			cut_shared->bgwriter_procno = -1;
+		}
+		SpinLockRelease(&cut_shared->lock);
+	}
+}
+
+static void
+cut_register_cleanup(void)
+{
+	if (!callbacks_registered) {
+		RegisterResourceReleaseCallback(cut_resource_release, NULL);
+		before_shmem_exit(cut_child_exit, (Datum)0);
+		callbacks_registered = true;
+	}
 }
 
 static bool
@@ -282,11 +321,7 @@ cluster_wal_cut_begin_v1(const ClusterWalSourceRef *source, ClusterWalCutV1 **ou
 	cut->pid = getpid();
 	cut->owner = CurrentResourceOwner;
 	cut->requested = request;
-	if (!callbacks_registered) {
-		RegisterResourceReleaseCallback(cut_resource_release, NULL);
-		before_shmem_exit(cut_child_exit, (Datum)0);
-		callbacks_registered = true;
-	}
+	cut_register_cleanup();
 	SpinLockAcquire(&cut_shared->lock);
 	if (cut_shared->owner_pid == 0 && cut_shared->revision != UINT64_MAX) {
 		cut->revision = ++cut_shared->revision;
@@ -368,6 +403,72 @@ cluster_wal_cut_release_v1(ClusterWalCutV1 **cut)
 	*cut = NULL;
 }
 
+static void
+cut_source_enqueue(const ClusterWalCutMessageV1 *request)
+{
+	ClusterWalWriterSampleV1 sample = { 0 };
+	WalCutSourceState state;
+	uint64 revision;
+	int32 procno = -1, pid = 0;
+	bool same;
+	if (cut_shared == NULL)
+		return;
+	SpinLockAcquire(&cut_shared->lock);
+	state = cut_shared->source_state;
+	revision = cut_shared->source_revision;
+	same = state != WAL_CUT_SOURCE_EMPTY && cut_same_request(&cut_shared->source_request, request);
+	if (same
+		&& (request->verb == CLUSTER_WAL_CUT_SAMPLE
+			|| (request->reserved_end == cut_shared->source_sample.reserved_end
+				&& request->native_config_generation
+					   == cut_shared->source_sample.writer.ref.claim.max_config_generation))) {
+		/* A duplicate reuses the original reservation, including while the
+		 * source is idle. It cannot make the required flush a moving target. */
+		if (request->verb == CLUSTER_WAL_CUT_CONFIRM)
+			cut_shared->source_request = *request;
+		if (state == WAL_CUT_SOURCE_REPLIED) {
+			cut_shared->source_reply.verb
+				= cut_shared->source_request.verb == CLUSTER_WAL_CUT_SAMPLE
+					  ? CLUSTER_WAL_CUT_SAMPLED
+					  : CLUSTER_WAL_CUT_CONFIRMED;
+			cut_shared->source_reply_pending = true;
+		}
+	}
+	SpinLockRelease(&cut_shared->lock);
+	if (same || state == WAL_CUT_SOURCE_QUEUED || state == WAL_CUT_SOURCE_RUNNING
+		|| revision == UINT64_MAX)
+		return;
+	if (request->verb == CLUSTER_WAL_CUT_SAMPLE) {
+		if (cluster_wal_writer_sample_v1(&sample) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			|| sample.writer.epoch != request->epoch || sample.writer.startup_first_lsn != 0
+			|| !cut_source_covered(&sample.writer.ref, &request->source))
+			return;
+	} else {
+		sample.writer.ref = request->source;
+		sample.writer.ref.claim.max_config_generation = request->native_config_generation;
+		sample.writer.epoch = request->epoch;
+		sample.reserved_end = request->reserved_end;
+	}
+	if (!cut_current(request, false))
+		return;
+	SpinLockAcquire(&cut_shared->lock);
+	if (cut_shared->source_revision == revision
+		&& (cut_shared->source_state == WAL_CUT_SOURCE_EMPTY
+			|| cut_shared->source_state == WAL_CUT_SOURCE_REPLIED)) {
+		cut_shared->source_revision++;
+		cut_shared->source_request = *request;
+		cut_shared->source_sample = sample;
+		cut_shared->source_state = WAL_CUT_SOURCE_QUEUED;
+		cut_shared->source_reply_pending = false;
+		procno = cut_shared->bgwriter_procno;
+		pid = cut_shared->bgwriter_pid;
+	}
+	SpinLockRelease(&cut_shared->lock);
+	if (ProcGlobal != NULL && procno >= 0 && (uint32)procno < ProcGlobal->allProcCount && pid > 0
+		&& ProcGlobal->allProcs[procno].pid == pid)
+		SetLatch(&ProcGlobal->allProcs[procno].procLatch);
+}
+
 void
 cluster_wal_cut_ingress_v1(const ClusterICEnvelope *env, const void *payload)
 {
@@ -379,35 +480,9 @@ cluster_wal_cut_ingress_v1(const ClusterICEnvelope *env, const void *payload)
 	/* The CONTROL router binds envelope source to the peer's HELLO. Every
 	 * semantic boot, source, epoch and job identity is checked independently. */
 	if (m.verb == CLUSTER_WAL_CUT_SAMPLE || m.verb == CLUSTER_WAL_CUT_CONFIRM) {
-		ClusterWalWriterSampleV1 sample = { 0 };
-		ClusterWalWriterFlushV1 flushed;
-		ClusterControlRootResult result;
-		uint8 wire[CLUSTER_WAL_CUT_BYTES];
-		bool first = m.verb == CLUSTER_WAL_CUT_SAMPLE;
 		if (env->source_node_id != m.collector || !cut_current(&m, false))
 			return;
-		if (first) {
-			result = cluster_wal_writer_sample_v1(&sample);
-			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || sample.writer.epoch != m.epoch
-				|| sample.writer.startup_first_lsn != 0
-				|| !cut_source_covered(&sample.writer.ref, &m.source))
-				return;
-			m.native_config_generation = sample.writer.ref.claim.max_config_generation;
-			m.reserved_end = sample.reserved_end;
-		} else {
-			sample.writer.ref = m.source;
-			sample.writer.ref.claim.max_config_generation = m.native_config_generation;
-			sample.writer.epoch = m.epoch;
-			sample.reserved_end = m.reserved_end;
-		}
-		result = cluster_wal_writer_confirm_v1(&sample, &flushed);
-		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			&& !(first && result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT))
-			return;
-		m.verb = first ? CLUSTER_WAL_CUT_SAMPLED : CLUSTER_WAL_CUT_CONFIRMED;
-		m.flushed_end = result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ? flushed.flushed_end : 0;
-		if (cut_current(&m, false) && cluster_wal_cut_encode_v1(&m, wire))
-			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_WAL_CUT, m.collector, wire, sizeof(wire));
+		cut_source_enqueue(&m);
 		return;
 	}
 	if (cut_shared == NULL || env->source_node_id != (uint32)m.source.claim.identity.origin_node_id
@@ -433,23 +508,121 @@ cluster_wal_cut_ingress_v1(const ClusterICEnvelope *env, const void *payload)
 	SpinLockRelease(&cut_shared->lock);
 }
 
+bool
+cluster_wal_cut_bgwriter_tick_v1(void)
+{
+	ClusterWalCutMessageV1 request, reply;
+	ClusterWalWriterSampleV1 sample;
+	ClusterWalWriterFlushV1 flushed;
+	volatile ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	uint64 revision;
+	bool queued;
+	if (MyBackendType != B_BG_WRITER || cut_shared == NULL || !cluster_enabled
+		|| !cluster_shared_config || CurrentResourceOwner == NULL || CritSectionCount != 0)
+		return false;
+	cut_register_cleanup();
+	SpinLockAcquire(&cut_shared->lock);
+	if (MyProc != NULL) {
+		cut_shared->bgwriter_procno = MyProc->pgprocno;
+		cut_shared->bgwriter_pid = MyProcPid;
+	}
+	queued = cut_shared->source_state == WAL_CUT_SOURCE_QUEUED;
+	request = cut_shared->source_request;
+	sample = cut_shared->source_sample;
+	revision = cut_shared->source_revision;
+	if (queued) {
+		cut_shared->source_state = WAL_CUT_SOURCE_RUNNING;
+		cut_shared->source_pid = MyProcPid;
+	}
+	SpinLockRelease(&cut_shared->lock);
+	if (!queued)
+		return false;
+	reply = request;
+	PG_TRY();
+	{
+		if (cut_current(&request, false))
+			result = cluster_wal_writer_flush_sample_v1(&sample, &flushed);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			reply.verb = request.verb == CLUSTER_WAL_CUT_SAMPLE ? CLUSTER_WAL_CUT_SAMPLED
+																: CLUSTER_WAL_CUT_CONFIRMED;
+			reply.native_config_generation = sample.writer.ref.claim.max_config_generation;
+			reply.reserved_end = sample.reserved_end;
+			reply.flushed_end = flushed.flushed_end;
+			if (!cut_current(&reply, false))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
+	}
+	PG_FINALLY();
+	{
+		SpinLockAcquire(&cut_shared->lock);
+		if (cut_shared->source_revision == revision && cut_shared->source_pid == MyProcPid) {
+			cut_shared->source_pid = 0;
+			cut_shared->source_reply_pending = result == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+				reply.verb = cut_shared->source_request.verb == CLUSTER_WAL_CUT_SAMPLE
+								 ? CLUSTER_WAL_CUT_SAMPLED
+								 : CLUSTER_WAL_CUT_CONFIRMED;
+				cut_shared->source_reply = reply;
+				cut_shared->source_state = WAL_CUT_SOURCE_REPLIED;
+			} else
+				cut_shared->source_state = result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+											   ? WAL_CUT_SOURCE_QUEUED
+											   : WAL_CUT_SOURCE_EMPTY;
+		}
+		SpinLockRelease(&cut_shared->lock);
+		cluster_lmon_wakeup();
+	}
+	PG_END_TRY();
+	return true;
+}
+
 void
 cluster_wal_cut_lmon_tick_v1(void)
 {
-	ClusterWalCutMessageV1 request;
+	ClusterWalCutMessageV1 request, reply;
 	ClusterControlRootResult result;
-	uint64 revision;
+	uint64 revision, source_revision;
 	int32 owner;
+	bool reply_pending;
+	bool stopping;
 	uint8 wire[CLUSTER_WAL_CUT_BYTES];
 	TimestampTz now;
 	if (MyBackendType != B_LMON || cut_shared == NULL)
 		return;
+	stopping = cluster_normal_stop_requested();
 	SpinLockAcquire(&cut_shared->lock);
+	if (stopping) {
+		cut_shared->owner_pid = 0;
+		cut_shared->result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (cut_shared->source_state != WAL_CUT_SOURCE_RUNNING) {
+			cut_shared->source_state = WAL_CUT_SOURCE_EMPTY;
+			cut_shared->source_reply_pending = false;
+		}
+		SpinLockRelease(&cut_shared->lock);
+		return;
+	}
 	owner = cut_shared->owner_pid;
 	revision = cut_shared->revision;
 	result = cut_shared->result;
 	request = cut_shared->request;
+	source_revision = cut_shared->source_revision;
+	reply_pending
+		= cut_shared->source_state == WAL_CUT_SOURCE_REPLIED && cut_shared->source_reply_pending;
+	reply = cut_shared->source_reply;
+	if (reply_pending)
+		cut_shared->source_reply_pending = false;
 	SpinLockRelease(&cut_shared->lock);
+	if (reply_pending && cut_current(&reply, false) && cluster_wal_cut_encode_v1(&reply, wire)) {
+		ClusterICSendResult sent
+			= cluster_ic_send_envelope(PGRAC_IC_MSG_WAL_CUT, reply.collector, wire, sizeof(wire));
+		if (sent != CLUSTER_IC_SEND_DONE && sent != CLUSTER_IC_SEND_WOULD_BLOCK) {
+			SpinLockAcquire(&cut_shared->lock);
+			if (cut_shared->source_revision == source_revision
+				&& cut_shared->source_state == WAL_CUT_SOURCE_REPLIED)
+				cut_shared->source_reply_pending = true;
+			SpinLockRelease(&cut_shared->lock);
+		}
+	}
 	if (owner == 0 || result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
 		return;
 	if (!cut_current(&request, true)) {
@@ -470,6 +643,28 @@ cluster_wal_cut_lmon_tick_v1(void)
 	sent_revision = revision;
 	sent_verb = request.verb;
 	last_send = now;
+}
+
+ClusterNormalStopPollResult
+cluster_wal_cut_normal_stop_poll_v1(const char **reason)
+{
+	bool active;
+	if (reason != NULL)
+		*reason = NULL;
+	if (!cluster_shared_config)
+		return CLUSTER_NORMAL_STOP_READY;
+	if (cut_shared == NULL) {
+		if (reason != NULL)
+			*reason = "WAL_CUT_OWNER_UNINITIALIZED";
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	SpinLockAcquire(&cut_shared->lock);
+	active = cut_shared->owner_pid != 0 || cut_shared->source_state == WAL_CUT_SOURCE_QUEUED
+			 || cut_shared->source_state == WAL_CUT_SOURCE_RUNNING;
+	SpinLockRelease(&cut_shared->lock);
+	if (active && reason != NULL)
+		*reason = "WAL_CUT_NATIVE_FLUSH_PENDING";
+	return active ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_READY;
 }
 
 void
@@ -498,6 +693,7 @@ cut_shmem_init(void)
 	if (!found) {
 		memset(cut_shared, 0, sizeof(*cut_shared));
 		SpinLockInit(&cut_shared->lock);
+		cut_shared->bgwriter_procno = -1;
 	}
 }
 
