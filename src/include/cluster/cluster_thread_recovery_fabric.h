@@ -16,6 +16,8 @@ typedef struct ClusterThreadRecoveryFabricPlanRequestV1 {
 	uint64 system_identifier;
 	uint8 storage_uuid[16];
 	const RfContributorStreamCutV1 *physical_cuts;
+	/* Optional for pure graphs; shared ROOT scanners supply every full claim. */
+	const ClusterWalSourceRef *sources;
 	uint32 participant_count;
 	uint64 retention_binding_cookie;
 	Size page_memory_budget;

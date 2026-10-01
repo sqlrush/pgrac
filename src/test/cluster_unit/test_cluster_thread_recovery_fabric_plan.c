@@ -51,6 +51,15 @@ rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request,
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
+bool
+rf_page_online_plan_bind_sources_v1(RfPageOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
+									uint32 count)
+{
+	UT_ASSERT(plan == (RfPageOnlinePlanV1 *)&page_plan_object);
+	UT_ASSERT_EQ(step, 0);
+	return sources != NULL && count == 1;
+}
+
 RfPageProofDetailV1
 rf_page_detached_preflight_v1(XLogReaderState *record, bool space_active,
 							  const RfDetachedOwnerOpsV1 *owner_ops, RfDetachedRecordPlanV1 *plan)

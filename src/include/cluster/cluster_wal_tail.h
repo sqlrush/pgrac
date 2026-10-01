@@ -37,6 +37,14 @@ extern ClusterControlRootResult cluster_control_root_recovery_visit(
 	const ClusterControlRootSnapshot *expected, const ClusterControlRootReadToken *token,
 	ClusterWalRecordVisitor visitor, void *arg, ClusterWalTailObservation *out);
 
+/* Select the full source named by this same exact ROOT token before feeding
+ * a closed plan. This reads no WAL and grants no retention/replay authority;
+ * recovery_visit must subsequently validate the claim, WAL and same token. */
+extern ClusterControlRootResult
+cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expected,
+										const ClusterControlRootReadToken *token,
+										ClusterWalSourceRef *out);
+
 /* Startup-only physical input, never a close/recovery/serving permission.
  * Zero maxima mean no PARAMETER_CHANGE record was observed; the caller must
  * also retain the predecessor/history/configuration requirements. */

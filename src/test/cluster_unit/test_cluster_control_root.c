@@ -11811,7 +11811,19 @@ UT_TEST(test_runtime_pending_checkpoint_promotes_without_claiming_recovery_done)
 		UT_ASSERT_EQ(test_actual_cf, NoLock);
 		{
 			ClusterWalTailObservation observed;
+			ClusterWalSourceRef source = { 0 };
+			uint8 claim_bytes[CLUSTER_WAL_CLAIM_V2_BYTES], claim_hash[32];
 			RecoveryVisitTest visit = { 0 };
+			UT_ASSERT_EQ(cluster_wal_claim_v2_encode(&op.claim, claim_bytes), 0);
+			sha256_bytes(claim_bytes, sizeof(claim_bytes), claim_hash);
+			UT_ASSERT_EQ(cluster_control_root_recovery_source_v1(&snapshot, &token, &source), 0);
+			UT_ASSERT(
+				cluster_control_root_identity_equal(&source.claim.identity, &op.claim.identity));
+			UT_ASSERT_EQ(source.claim.database_incarnation, op.claim.database_incarnation);
+			UT_ASSERT_EQ(source.claim.max_config_generation, op.claim.config_generation);
+			UT_ASSERT_EQ(memcmp(source.claim.claim_sha256, claim_hash, 32), 0);
+			UT_ASSERT_EQ(source.timeline, snapshot.checkpoint_tli);
+			UT_ASSERT_EQ(test_actual_cf, NoLock);
 			UT_ASSERT_EQ(cluster_control_root_recovery_visit(
 							 &snapshot, &token, recovery_visit_record, &visit, &observed),
 						 0);
@@ -11891,6 +11903,23 @@ UT_TEST(test_exact_recovery_source_discards_stale_or_cancelled_input)
 			token.file_txn_seq++;
 		if (fault == 4)
 			test_cf_release_confirmed = false;
+		{
+			ClusterWalSourceRef source, empty = { 0 };
+			ClusterControlRootResult result;
+			memset(&source, 0xa5, sizeof(source));
+			result = cluster_control_root_recovery_source_v1(&snapshot, &token, &source);
+			if (fault == 0 || fault == 4) {
+				UT_ASSERT(result != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+				UT_ASSERT_EQ(memcmp(&source, &empty, sizeof(source)), 0);
+			} else {
+				ClusterControlRootSnapshot unchanged = snapshot;
+				UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+				UT_ASSERT_EQ(cluster_control_root_recovery_source_v1(
+								 &snapshot, &token, (ClusterWalSourceRef *)&snapshot),
+							 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+				UT_ASSERT_EQ(memcmp(&snapshot, &unchanged, sizeof(snapshot)), 0);
+			}
+		}
 		memset(&out, 0xa5, sizeof(out));
 		PG_TRY();
 		{

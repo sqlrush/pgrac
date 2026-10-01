@@ -124,6 +124,10 @@ cluster_thread_recovery_fabric_plan_create_v1(
 	page_request.retention_binding_cookie = request->retention_binding_cookie;
 	page_request.memory_budget = request->page_memory_budget;
 	detail = rf_page_online_plan_create_v1(&page_request, &plan->page_plan);
+	if (detail == RF_PAGE_PROOF_DETAIL_OK && request->sources != NULL
+		&& !rf_page_online_plan_bind_sources_v1(plan->page_plan, request->sources,
+												request->participant_count))
+		detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 	if (detail != RF_PAGE_PROOF_DETAIL_OK) {
 		fabric_plan_free(plan);
 		return detail;

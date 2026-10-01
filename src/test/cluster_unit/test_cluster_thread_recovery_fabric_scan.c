@@ -61,6 +61,28 @@ static RfContributorStreamCutV1 requested_cuts[2];
 static uint16 fault_origin;
 static uint16 stale_origin;
 static bool expire_during_seal;
+static unsigned selected_source_count;
+
+ClusterControlRootResult
+cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
+										const ClusterControlRootReadToken *token,
+										ClusterWalSourceRef *out)
+{
+	bool inject = fault_origin == 0 || root->identity.origin_thread_id == fault_origin;
+	UT_ASSERT(token != NULL && plan_create_count == 0 && plan_feed_count == 0);
+	selected_source_count++;
+	memset(out, 0, sizeof(*out));
+	if (inject && exact_source_fault == 7)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	out->claim.identity = root->identity;
+	out->claim.database_incarnation = inject && exact_source_fault == 8 ? 43 : 42;
+	out->claim.max_config_generation = 9;
+	out->claim.claim_sha256[0] = root->identity.origin_thread_id;
+	out->timeline = root->checkpoint_tli;
+	if (inject && exact_source_fault == 9)
+		stale_origin = 2;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
 
 ClusterThreadRecoveryAuthorityResultV1
 cluster_thread_recovery_authority_revalidate_nowait_v1(
@@ -181,6 +203,16 @@ cluster_thread_recovery_fabric_plan_create_v1(
 			  && cut->timeline_id == 7 && cut->scan_begin_inclusive == 0x100
 			  && cut->scan_end_exclusive == 0x200);
 	memcpy(requested_cuts, cut, expected_participants * sizeof(*cut));
+	UT_ASSERT((request->sources != NULL) == cluster_shared_config);
+	if (cluster_shared_config) {
+		UT_ASSERT_EQ(selected_source_count, expected_participants);
+		for (uint32 i = 0; i < expected_participants; i++) {
+			UT_ASSERT_EQ(request->sources[i].claim.identity.origin_thread_id, cut[i].failed_thread);
+			UT_ASSERT_EQ(request->sources[i].claim.claim_sha256[0], cut[i].failed_thread);
+			UT_ASSERT_EQ(request->sources[i].claim.database_incarnation, 42);
+			UT_ASSERT_EQ(request->sources[i].timeline, cut[i].timeline_id);
+		}
+	}
 	if (expected_participants == 2) {
 		UT_ASSERT_EQ(cut[1].failed_thread, 4);
 		UT_ASSERT_EQ(cut[1].timeline_id, 8);
@@ -273,6 +305,7 @@ init_case(ClusterThreadRecoveryAuthorityV1 *authority)
 	expected_participants = 1;
 	fault_origin = stale_origin = 0;
 	expire_during_seal = false;
+	selected_source_count = 0;
 }
 
 static void
@@ -373,6 +406,29 @@ UT_TEST(test_multi_source_wrong_cut_namespace_or_pin_refuses_before_scan)
 		UT_ASSERT(plan == NULL && records == 0);
 		UT_ASSERT_EQ(exact_source_count, 0);
 		UT_ASSERT_EQ(plan_create_count, 0);
+	}
+}
+
+UT_TEST(test_full_source_selection_refuses_before_feeding)
+{
+	for (int fault = 7; fault <= 9; fault++) {
+		ClusterThreadRecoveryAuthorityV1 authorities[2];
+		ClusterRecoveryDutyKey duties[2];
+		ClusterControlRootSnapshot roots[2];
+		ClusterControlRootReadToken tokens[2];
+		ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
+		uint64 records = 99;
+		init_two(authorities, duties, roots, tokens);
+		fault_origin = 4;
+		exact_source_fault = fault;
+		UT_ASSERT(
+			cluster_thread_recovery_fabric_scan_roots_v1(authorities, 2, false, &plan, &records)
+			!= RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(plan == NULL && records == 0);
+		UT_ASSERT_EQ(plan_create_count, 0);
+		UT_ASSERT_EQ(plan_feed_count, 0);
+		UT_ASSERT_EQ(exact_source_count, 0);
+		UT_ASSERT_EQ(selected_source_count, 2);
 	}
 }
 
@@ -518,7 +574,7 @@ UT_TEST(test_non_root_window_is_rejected_before_reader_or_plan)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_shared_config_uses_exact_source_without_legacy_fallback);
 	UT_RUN(test_shared_source_failure_discards_every_provisional_record);
 	UT_RUN(test_scans_exact_root_cut_and_seals_only_at_upper_boundary);
@@ -528,6 +584,7 @@ main(void)
 	UT_RUN(test_multi_source_seals_one_plan_after_every_original_cut);
 	UT_RUN(test_multi_source_late_refusal_discards_earlier_source_too);
 	UT_RUN(test_multi_source_wrong_cut_namespace_or_pin_refuses_before_scan);
+	UT_RUN(test_full_source_selection_refuses_before_feeding);
 	UT_RUN(test_multi_source_rechecks_every_owner_after_seal);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

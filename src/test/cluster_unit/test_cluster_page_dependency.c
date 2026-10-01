@@ -154,6 +154,20 @@ cluster_thread_wal_reader_free(XLogReaderState *reader, void *private_state)
 }
 
 ClusterControlRootResult
+cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
+										const ClusterControlRootReadToken *token,
+										ClusterWalSourceRef *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->claim.identity = root->identity;
+	out->claim.database_incarnation = 42;
+	out->claim.max_config_generation = 5;
+	out->claim.claim_sha256[0] = root->identity.origin_thread_id;
+	out->timeline = root->checkpoint_tli;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
 cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *root,
 	const ClusterControlRootReadToken *token, ClusterWalRecordVisitor visitor, void *arg,
 	ClusterWalTailObservation *out)
@@ -236,6 +250,11 @@ scan_three_roots(ClusterThreadRecoveryFabricPlanV1 **out, uint64 *records)
 		duties[i].system_identifier = 99;
 		memset(duties[i].storage_uuid, 3, 16);
 		duties[i].origin_thread_id = i + 1;
+		duties[i].origin_node_id = i;
+		duties[i].authority_uuid[0] = 1;
+		duties[i].thread_claim_created_at = 10;
+		duties[i].origin_owner_incarnation = 11;
+		duties[i].root_lineage_seq = 12;
 		roots[i].identity = duties[i];
 		roots[i].checkpoint_tli = roots[i].tail_tli = i + 1;
 		roots[i].checkpoint_lower_lsn = 0x100;
@@ -263,6 +282,16 @@ UT_TEST(test_original_root_scanner_resolves_reverse_three_origin_native_page_cha
 	UT_ASSERT_EQ(scan_three_roots(&plan, &records), RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT_EQ(records, 3);
 	UT_ASSERT_EQ(source_visits, 3);
+	for (int i = 0; i < 3; i++) {
+		ClusterWalSourceRef source = { 0 };
+		UT_ASSERT(rf_page_online_plan_source_v1(cluster_thread_recovery_fabric_page_plan_v1(plan),
+												i, &source));
+		UT_ASSERT_EQ(source.claim.identity.origin_thread_id, i + 1);
+		UT_ASSERT_EQ(source.claim.claim_sha256[0], i + 1);
+		UT_ASSERT_EQ(source.claim.database_incarnation, 42);
+		UT_ASSERT_EQ(source.claim.max_config_generation, 5);
+		UT_ASSERT_EQ(source.timeline, i + 1);
+	}
 	UT_ASSERT(rf_page_online_plan_target_v1(cluster_thread_recovery_fabric_page_plan_v1(plan), 0, &view));
 	if (rf_page_online_plan_target_v1(cluster_thread_recovery_fabric_page_plan_v1(plan), 0, &view)) {
 		UT_ASSERT_EQ(view.expected_before.mutation_token, 10);
