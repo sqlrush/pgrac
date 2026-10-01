@@ -113,7 +113,9 @@ cluster_page_wal_prepare_install_v1(Buffer buffer, const ClusterPageWalBindingV1
 			|| !cluster_wal_thread_current_v2_ref(&current)
 			|| current.claim.identity.system_identifier != carrier->identity.system_identifier
 			|| memcmp(current.claim.identity.storage_uuid, carrier->identity.storage_uuid, 16) != 0
-			|| current.claim.database_incarnation != carrier->source.claim.database_incarnation)
+			|| current.claim.database_incarnation != carrier->source.claim.database_incarnation
+			|| ((carrier->flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+				&& !page_wal_same_source(&current, &carrier->source)))
 			return false;
 	}
 	*prepared = *carrier;
@@ -128,6 +130,13 @@ cluster_page_wal_publish_install_v1(Buffer buffer, const ClusterPageWalBindingV1
 		return false;
 	bindings[buffer - 1] = *prepared;
 	return true;
+}
+
+bool
+cluster_page_wal_forget_v1(Buffer buffer)
+{
+	static const ClusterPageWalBindingV1 zero = { 0 };
+	return cluster_page_wal_publish_install_v1(buffer, &zero);
 }
 
 Size

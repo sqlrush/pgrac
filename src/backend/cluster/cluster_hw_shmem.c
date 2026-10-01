@@ -222,10 +222,11 @@ cluster_hw_normal_stop_poll(const char **domain_out, uint64 *key_out, int *backe
 
 	for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
 		uint32 status = pg_atomic_read_u32(&hw_state->remaster_result[node]);
-		bool invalid = status > CLUSTER_HW_REMASTER_NOT_APPLICABLE
+		bool invalid = status > CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY
 					   || status == CLUSTER_HW_REMASTER_BLOCKED_STRUCTURAL;
 		bool pending = status == CLUSTER_HW_REMASTER_RUNNING
 					   || status == CLUSTER_HW_REMASTER_BLOCKED
+					   || status == CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY
 					   || pg_atomic_read_u64(&hw_state->remaster_next_attempt_at[node]) != 0;
 		if (invalid || (pending && result == CLUSTER_NORMAL_STOP_READY)) {
 			result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
@@ -600,6 +601,8 @@ cluster_hw_remaster_result_name(ClusterHwRemasterResult result)
 		return "blocked_structural";
 	case CLUSTER_HW_REMASTER_NOT_APPLICABLE:
 		return "not_applicable";
+	case CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY:
+		return "wait_typed_space_recovery";
 	}
 	return "unknown";
 }

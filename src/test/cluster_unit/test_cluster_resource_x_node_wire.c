@@ -906,6 +906,7 @@ make_wal_image(void)
 	wal->record_crc = 0x11223344;
 	wal->rmid = 10;
 	wal->info = 0x12;
+	wal->flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
 	return frame;
 }
 
@@ -944,7 +945,7 @@ UT_TEST(test_image_preserves_full_native_source_and_rejects_legacy)
 
 UT_TEST(test_image_source_conflicts_refuse_before_output)
 {
-	for (int i = 0; i < 12; i++) {
+	for (int i = 0; i < 13; i++) {
 		ResourceXDecodedFrame frame = make_wal_image();
 		ClusterPageWalBindingV1 *wal = &frame.body.image_envelope.page_wal;
 		ResourceXWireReject reject;
@@ -987,6 +988,9 @@ UT_TEST(test_image_source_conflicts_refuse_before_output)
 		case 11:
 			wal->record_start = wal->record_end;
 			break;
+		case 12:
+			wal->flags = 0;
+			break;
 		}
 		memset(bytes, 0x59, sizeof(bytes));
 		UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, bytes,
@@ -998,7 +1002,7 @@ UT_TEST(test_image_source_conflicts_refuse_before_output)
 
 UT_TEST(test_image_wal_corruption_rejected_with_valid_wire_crc)
 {
-	const int offsets[] = { 8520 + 132, 8520 + 180, 8520 + 208, 8520 + 40, 326 };
+	const int offsets[] = { 8520 + 132, 8520 + 180, 8520 + 208, 8520 + 40, 326, 8520 + 231 };
 	for (int i = 0; i < lengthof(offsets); i++) {
 		ResourceXDecodedFrame frame = make_wal_image(), decoded;
 		ResourceXWireReject reject;
@@ -1006,7 +1010,7 @@ UT_TEST(test_image_wal_corruption_rejected_with_valid_wire_crc)
 		uint16 len = 0;
 		UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, bytes,
 												 sizeof(bytes), &len, &reject));
-		bytes[offsets[i]] = 1;
+		bytes[offsets[i]] = offsets[i] == 8520 + 231 ? 0 : 1;
 		test_reseal(bytes, len);
 		memset(&decoded, 0x59, sizeof(decoded));
 		UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len,

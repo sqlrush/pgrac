@@ -130,7 +130,8 @@ static void FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject
 									IOContext io_context,
 									const struct ClusterSpaceRecoveryBatchV1 *recovery,
 									volatile bool *io_started,
-									const struct ClusterPageWalBindingV1 *data_wal);
+									const struct ClusterPageWalBindingV1 *data_wal,
+									volatile bool *write_attempted);
 
 #ifdef USE_PGRAC_CLUSTER
 static inline bool
@@ -9049,11 +9050,11 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * including certified foreign images, without a local-LSN comparison. */
 	if (cluster_enabled && cluster_shared_config && !RecoveryInProgress()
 		&& cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal)) {
-		FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, &wal);
+		FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, &wal, NULL);
 		return;
 	}
 #endif
-	FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, NULL);
+	FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, NULL, NULL);
 }
 
 /* Original write path with an optional retained SPACE recovery owner or
@@ -9061,7 +9062,8 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 static void
 FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 						IOContext io_context, const struct ClusterSpaceRecoveryBatchV1 *recovery,
-						volatile bool *io_started, const struct ClusterPageWalBindingV1 *data_wal)
+						volatile bool *io_started, const struct ClusterPageWalBindingV1 *data_wal,
+						volatile bool *write_attempted)
 {
 	XLogRecPtr	recptr;
 	ErrorContextCallback errcallback;
@@ -9290,6 +9292,8 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 						errmsg("DATA write changed its exact WAL source before I/O"),
 						errhint("Retry through the current page owner.")));
 #endif
+	if (write_attempted != NULL)
+		*write_attempted = true;
 	smgrwrite(reln,
 			  BufTagGetForkNum(&buf->tag),
 			  buf->tag.blockNum,
@@ -10437,7 +10441,8 @@ FlushOneBuffer(Buffer buffer)
  * exact installed bytes; this function still owns native BufferIO/checksum/
  * smgrwrite. The caller owns fsync and post-read while keeping current-X. */
 bool
-FlushOneBufferForSpaceRecovery(Buffer buffer, const ClusterSpaceRecoveryBatchV1 *batch)
+FlushOneBufferForSpaceRecovery(Buffer buffer, const ClusterSpaceRecoveryBatchV1 *batch,
+							   volatile bool *write_attempted)
 {
 	BufferDesc *buf;
 	ErrorContextCallback *saved_context = error_context_stack;
@@ -10445,6 +10450,9 @@ FlushOneBufferForSpaceRecovery(Buffer buffer, const ClusterSpaceRecoveryBatchV1 
 	uint32 state;
 	bool complete;
 
+	if (write_attempted == NULL)
+		return false;
+	*write_attempted = false;
 	if (buffer <= 0 || buffer > NBuffers || !BufferIsPinned(buffer) || batch == NULL)
 		return false;
 	buf = GetBufferDescriptor(buffer - 1);
@@ -10461,7 +10469,7 @@ FlushOneBufferForSpaceRecovery(Buffer buffer, const ClusterSpaceRecoveryBatchV1 
 	PG_TRY();
 	{
 		FlushBufferWithRecovery(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL, batch, &io_started,
-								NULL);
+								NULL, write_attempted);
 	}
 	PG_FINALLY();
 	{
@@ -10641,7 +10649,7 @@ cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *target,
 				break;
 			rel = smgropen(key.locator, InvalidBackendId);
 			FlushBufferWithRecovery(data, rel, IOOBJECT_RELATION, IOCONTEXT_NORMAL, NULL,
-									&io_started, &binding);
+									&io_started, &binding, NULL);
 			if (!cluster_page_data_holder_ready(data, &data_tag, true, &live)
 				|| !cluster_pcm_own_fence_equal_exact(&data_owner, &live)
 				|| (live.semantic_buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0)
@@ -13598,7 +13606,7 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 					cluster_pcm_x_finish_retain_flush_active = true;
 					if (has_wal)
 						FlushBufferWithRecovery(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
-												NULL, NULL, &wal);
+												NULL, NULL, &wal, NULL);
 					else
 						FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 					cluster_pcm_x_finish_retain_flush_active = false;

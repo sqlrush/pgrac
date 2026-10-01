@@ -428,7 +428,8 @@ static void FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject
 									IOContext context,
 									const struct ClusterSpaceRecoveryBatchV1 *recovery,
 									volatile bool *io_started,
-									const struct ClusterPageWalBindingV1 *data_wal);
+									const struct ClusterPageWalBindingV1 *data_wal,
+									volatile bool *write_attempted);
 static struct SMgrRelationData transition_smgr;
 static BufferUsage transition_usage;
 static void
@@ -518,7 +519,8 @@ transition_write_context(void *arg)
 #undef cluster_bufmgr_pcm_x_retained_image_locked
 #undef FlushBuffer
 #define FlushBuffer(buf, rel, object, context) transition_flush(buf)
-#define FlushBufferWithRecovery(buf, rel, object, context, recovery, io, wal) transition_flush(buf)
+#define FlushBufferWithRecovery(buf, rel, object, context, recovery, io, wal, wrote)               \
+	transition_flush(buf)
 #include "test_cluster_pcm_transition_owner.inc"
 #undef FlushBufferWithRecovery
 /* Actual S-source reservation/prepare/abort, with storage and allocation

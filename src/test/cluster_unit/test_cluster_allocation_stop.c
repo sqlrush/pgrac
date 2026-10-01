@@ -580,6 +580,15 @@ UT_TEST(hw_original_remaster_status_and_snapshot_owner)
 	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_READY, hw_poll(NULL, NULL, NULL));
 	cluster_hw_remaster_set_result(CLUSTER_MAX_NODES - 1, CLUSTER_HW_REMASTER_BLOCKED_STRUCTURAL);
 	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_INVALID, hw_poll(NULL, NULL, NULL));
+	cluster_hw_remaster_set_result(CLUSTER_MAX_NODES - 1,
+								   CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY);
+	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_PENDING, hw_poll(NULL, NULL, NULL));
+	cluster_hw_remaster_set_next_attempt_at(CLUSTER_MAX_NODES - 1, PG_UINT64_MAX);
+	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_PENDING, hw_poll(NULL, NULL, NULL));
+	cluster_hw_remaster_set_result(
+		CLUSTER_MAX_NODES - 1,
+		(ClusterHwRemasterResult)(CLUSTER_HW_REMASTER_WAIT_TYPED_SPACE_RECOVERY + 1));
+	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_INVALID, hw_poll(NULL, NULL, NULL));
 }
 UT_TEST(hw_invalid_late_entry_overrides_pending)
 {

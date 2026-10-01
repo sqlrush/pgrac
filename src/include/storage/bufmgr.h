@@ -225,9 +225,11 @@ extern BlockNumber RelationGetNumberOfBlocksInFork(Relation relation,
 extern void FlushOneBuffer(Buffer buffer);
 #ifdef USE_PGRAC_CLUSTER
 struct ClusterSpaceRecoveryBatchV1;
-/* PGRAC: exact retained-source owner, pinned current-X buffer only. */
+/* PGRAC: exact retained-source owner, pinned current-X buffer only. The
+ * mandatory output is set before smgrwrite, including an uncertain ERROR. */
 extern bool FlushOneBufferForSpaceRecovery(Buffer buffer,
-										   const struct ClusterSpaceRecoveryBatchV1 *batch);
+										   const struct ClusterSpaceRecoveryBatchV1 *batch,
+										   volatile bool *write_attempted);
 #endif
 extern void FlushRelationBuffers(Relation rel);
 extern void FlushRelationsAllBuffers(struct SMgrRelationData **smgrs, int nrels);

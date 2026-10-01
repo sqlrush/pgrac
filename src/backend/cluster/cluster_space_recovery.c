@@ -189,6 +189,8 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply)
 	SMgrRelation rel;
 	uint32 count;
 	bool ok = false;
+	volatile bool mutated = false, write_attempted = false;
+	volatile uint32 before_state = 0;
 
 	if (!space_sources_fresh(batch)
 		|| cluster_smgr_which_for(target->key.locator, InvalidBackendId) != 1)
@@ -249,10 +251,12 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply)
 		/* The strict MarkBufferDirty predicate was checked before entering
  * the critical section. Content-X prevents a revoke from changing it. */
 		START_CRIT_SECTION();
+		before_state = pg_atomic_read_u32(&GetBufferDescriptor(batch->buffers[1] - 1)->state);
 		memcpy(BufferGetPage(batch->buffers[1]), prepared.pages[1].data, BLCKSZ);
 		MarkBufferDirty(batch->buffers[1]);
+		mutated = true;
 		END_CRIT_SECTION();
-		if (!FlushOneBufferForSpaceRecovery(batch->buffers[1], batch))
+		if (!FlushOneBufferForSpaceRecovery(batch->buffers[1], batch, &write_attempted))
 			goto done;
 		smgrimmedsync(rel, SPACE_FORKNUM);
 		ok = space_sources_fresh(batch) && space_disk_matches(rel, 0, prepared.pages[0].data)
@@ -261,6 +265,23 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply)
 	}
 	PG_FINALLY();
 	{
+		if (mutated && !write_attempted) {
+			BufferDesc *buf = GetBufferDescriptor(batch->buffers[1] - 1);
+			const uint32 mask = BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR;
+			uint32 state;
+
+			/* Native I/O has already unwound. Until the first write attempt
+			 * it is safe to restore exactly what this content-X owner saw.
+			 * After a possible write, keep the conservative higher HWM;
+			 * the recovery/isolation owner still has no completion proof. */
+			Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE));
+			memcpy(BufferGetPage(batch->buffers[1]), target->before[1].data, BLCKSZ);
+			Assert(memcmp(BufferGetPage(batch->buffers[1]), target->before[1].data, BLCKSZ) == 0);
+			state = LockBufHdr(buf);
+			Assert((state & BM_IO_IN_PROGRESS) == 0);
+			state = (state & ~mask) | (before_state & mask);
+			UnlockBufHdr(buf, state);
+		}
 		space_target_release(batch);
 	}
 	PG_END_TRY();

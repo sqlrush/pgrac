@@ -73,7 +73,7 @@ int cluster_node_id;
 bool cluster_smart_fusion, cluster_past_image;
 ClusterPcmOwnEntry *ClusterPcmOwnArray;
 BufferUsage pgBufferUsage;
-static bool sf_blocked, stale_during_io;
+static bool sf_blocked, stale_during_io, stale_after_write;
 static unsigned wal_flushes, io_aborts;
 static bool cluster_pcm_x_finish_retain_flush_active;
 static bool cluster_pcm_x_finish_retain_flush_io_active;
@@ -345,6 +345,8 @@ smgrwrite(SMgrRelation r, ForkNumber f, BlockNumber b, const void *data, bool sk
 	fault(4);
 	writes++;
 	UT_ASSERT_EQ(pwrite(fileno(file), data, BLCKSZ, BLCKSZ), BLCKSZ);
+	if (stale_after_write)
+		stale = true;
 }
 uint32
 LockBufHdr(BufferDesc *buf)
@@ -778,17 +780,24 @@ UT_TEST(test_error_releases_original_resources)
 
 UT_TEST(test_native_flush_wait_and_stale_source_unwind)
 {
-	for (int variant = 0; variant < 2; variant++) {
+	for (int variant = 0; variant < 3; variant++) {
 		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		PGAlignedBlock before;
+		uint32 before_state;
 		volatile bool caught = false;
 		reset();
+		stale_after_write = false;
 		UT_ASSERT(cluster_space_recovery_preflight_v1(fabric, sources, 2, &batch));
 		if (!batch)
 			continue;
+		before = pages[1];
+		before_state = pg_atomic_read_u32(&descriptors[1].bufferdesc.state);
 		if (variant == 0)
 			cluster_smart_fusion = sf_blocked = true;
-		else
+		else if (variant == 1)
 			stale_during_io = true;
+		else
+			stale_after_write = true;
 		PG_TRY();
 		{
 			UT_ASSERT(!cluster_space_recovery_apply_v1(batch));
@@ -799,13 +808,26 @@ UT_TEST(test_native_flush_wait_and_stale_source_unwind)
 		}
 		PG_END_TRY();
 		UT_ASSERT_EQ(caught, variant == 1);
-		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(writes, variant == 2);
 		UT_ASSERT_EQ(syncs, 0);
 		UT_ASSERT_EQ(io_aborts, variant == 1);
 		UT_ASSERT_EQ(wal_flushes, 0);
+		if (variant < 2) {
+			UT_ASSERT(memcmp(pages[1].data, before.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(pg_atomic_read_u32(&descriptors[1].bufferdesc.state), before_state);
+		} else {
+			/* A completed/uncertain write must never roll the HWM back. */
+			ClusterSpaceReservation got;
+			uint64 token;
+			UT_ASSERT(cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1,
+															&key, &got, &token));
+			UT_ASSERT_EQ(got.next_block, 11);
+			UT_ASSERT_EQ(token, 19);
+		}
 		UT_ASSERT(!pins && !locks && !hw_held && error_context_stack == NULL);
 		UT_ASSERT(!(pg_atomic_read_u32(&descriptors[1].bufferdesc.state) & BM_IO_IN_PROGRESS));
 		cluster_space_recovery_destroy_v1(&batch);
+		stale_after_write = false;
 	}
 }
 
@@ -814,7 +836,7 @@ UT_TEST(test_ordinary_native_flush_keeps_local_wal)
 	reset();
 	pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_DIRTY);
 	FlushBufferWithRecovery(&descriptors[1].bufferdesc, &relation, IOOBJECT_RELATION,
-							IOCONTEXT_NORMAL, NULL, NULL, NULL);
+							IOCONTEXT_NORMAL, NULL, NULL, NULL, NULL);
 	UT_ASSERT_EQ(wal_flushes, 1);
 	UT_ASSERT_EQ(writes, 1);
 	UT_ASSERT_EQ(io_aborts, 0);

@@ -81,11 +81,17 @@ extern void cluster_page_wal_shmem_register(void);
 
 /* Sole native WAL insertion owner after successful insertion, while its
  * registered buffer is still pinned and content-X. No allocation, I/O or
- * lock upgrade. Caller must reject a failure before exposing the mutation.
+ * lock upgrade. On ordinary attribution failure the insertion owner must
+ * clear the previous binding under the same content-X; absence is not a
+ * durability receipt and does not discharge the original DATA obligation.
  * End/start/CRC belong to the actual inserted record, not its retry candidate. */
 extern bool cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
 											   uint64 result_token, XLogRecPtr start,
 											   XLogRecPtr end, uint32 crc, uint8 rmid, uint8 info);
+
+/* Clear attribution under the original pin/content-X, without allocation or
+ * I/O. False means the caller no longer has the required buffer invariant. */
+extern bool cluster_page_wal_forget_v1(Buffer buffer);
 
 /* Caller already pins and content-locks this descriptor and supplies the
  * lifecycle-qualified SPACE identity. Does not acquire any page or grant

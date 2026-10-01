@@ -169,7 +169,8 @@ resource_x_image_wal_valid(const ResourceXDecodedFrame *frame)
 	PGAlignedBlock page;
 	if (body->image_flags == 0)
 		return resource_x_bytes_zero((const uint8 *)&body->page_wal, sizeof(body->page_wal));
-	if (body->image_flags != RESOURCE_X_IMAGE_HAS_WAL)
+	if (body->image_flags != RESOURCE_X_IMAGE_HAS_WAL
+		|| body->page_wal.flags != CLUSTER_PAGE_WAL_NATIVE_FLUSHED)
 		return false;
 	memcpy(page.data, body->page_bytes, BLCKSZ);
 	return body->page_scn_lsn == body->page_wal.version.mutation_token

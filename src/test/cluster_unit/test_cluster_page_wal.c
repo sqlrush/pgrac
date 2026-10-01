@@ -41,6 +41,8 @@ static bool consistency_check;
 static unsigned flush_calls;
 static bool flush_changes_source;
 static XLogRecPtr insert_end;
+static sigjmp_buf native_error_target;
+static bool catch_native_errors, native_panicked;
 XLogRecPtr ProcLastRecPtr;
 ProcessingMode Mode = NormalProcessing;
 
@@ -210,8 +212,16 @@ XLogInsertRecord(XLogRecData *data, XLogRecPtr fpw, uint8 flags, int fpi, bool t
 	record.xl_crc = 0x9192;
 	return 0x200;
 }
+static void
+pg_attribute_noreturn() native_error(void)
+{
+	native_panicked = true;
+	if (catch_native_errors)
+		siglongjmp(native_error_target, 1);
+	abort();
+}
 #undef elog
-#define elog(level, ...) abort()
+#define elog(level, ...) native_error()
 #include "test_cluster_page_wal_insert.inc"
 
 static void
@@ -266,6 +276,7 @@ reset(void)
 	flush_calls = 0;
 	flush_changes_source = false;
 	insert_end = 0x500;
+	catch_native_errors = native_panicked = false;
 	XLogResetInsertion();
 	cluster_page_wal_shmem_init();
 	begininsert_called = true;
@@ -320,6 +331,39 @@ exact_generation_survives_new_writer(void)
 		return;
 	UT_ASSERT_EQ(out.source.claim.identity.origin_owner_incarnation, 7);
 	UT_ASSERT_EQ(out.source.claim.claim_sha256[15], 0);
+}
+static void
+native_capture_refusal_clears_old_binding(void)
+{
+	ClusterPageWalBindingV1 zero = { 0 };
+	reset();
+	UT_ASSERT(capture());
+	selected = false;
+	XLogRegisterBuffer(0, 1, REGBUF_STANDARD);
+	catch_native_errors = true;
+	if (sigsetjmp(native_error_target, 1) == 0)
+		UT_ASSERT_EQ(XLogInsert(RM_HEAP_ID, 0), 0x200);
+	catch_native_errors = false;
+	UT_ASSERT(!native_panicked);
+	UT_ASSERT_EQ(insert_calls, 1);
+	UT_ASSERT(!begininsert_called && !page_version_edge_registered);
+	UT_ASSERT(memcmp(&shared_binding, &zero, sizeof(zero)) == 0);
+}
+static void
+native_capture_requires_clear_owner(void)
+{
+	ClusterPageWalBindingV1 before;
+	reset();
+	UT_ASSERT(capture());
+	before = shared_binding;
+	exclusive = false;
+	XLogRegisterBuffer(0, 1, REGBUF_STANDARD);
+	catch_native_errors = true;
+	if (sigsetjmp(native_error_target, 1) == 0)
+		(void)XLogInsert(RM_HEAP_ID, 0);
+	catch_native_errors = false;
+	UT_ASSERT(native_panicked);
+	UT_ASSERT(memcmp(&shared_binding, &before, sizeof(before)) == 0);
 }
 static void
 stale_page_or_space_never_reads(void)
@@ -431,6 +475,8 @@ carrier_install_keeps_original_generation(void)
 	UT_ASSERT(cluster_page_wal_snapshot_v1(1, &carrier));
 	if (!cluster_page_wal_snapshot_v1(1, &carrier))
 		return;
+	UT_ASSERT(cluster_page_wal_flush_source_v1(&carrier, &carrier));
+	UT_ASSERT_EQ(flush_calls, 1);
 	block.kind = RESOURCE_X_WIRE_BLOCK_TO_N;
 	block.common.logical_assertion.resource = desc.bufferdesc.tag;
 	block.common.logical_assertion.requester_node = 1;
@@ -473,7 +519,7 @@ carrier_install_keeps_original_generation(void)
 static void
 carrier_preflight_refuses_without_mutation(void)
 {
-	for (int i = 0; i < 8; i++) {
+	for (int i = 0; i < 9; i++) {
 		ClusterPageWalBindingV1 carrier, prepared, before;
 		reset();
 		UT_ASSERT(capture());
@@ -499,6 +545,10 @@ carrier_preflight_refuses_without_mutation(void)
 			selected = false;
 		if (i == 7)
 			pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_ERROR);
+		if (i == 8) {
+			writer.claim.identity.origin_thread_id = 2;
+			writer.claim.identity.origin_node_id = 1;
+		}
 		UT_ASSERT(!cluster_page_wal_prepare_install_v1(1, &carrier, page.data, &prepared));
 		UT_ASSERT_EQ(((uint8 *)&prepared)[0], 0x59);
 		UT_ASSERT_EQ(memcmp(&shared_binding, &before, sizeof(before)), 0);
@@ -526,8 +576,7 @@ flush_certification_is_source_exact(void)
 	UT_ASSERT(capture());
 	PageSetLSNPreserveOrigin(page.data, 0x200);
 	UT_ASSERT(cluster_page_wal_flush_source_v1(&shared_binding, &certified));
-	if (!flush_calls)
-		return;
+	UT_ASSERT_EQ(flush_calls, 1);
 	UT_ASSERT_EQ(certified.flags, CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
 	UT_ASSERT_EQ(shared_binding.flags, 0);
 	UT_ASSERT_EQ(flush_calls, 1);
@@ -576,12 +625,14 @@ flush_refusal_never_certifies(void)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(13);
 	printf("# Native WAL binding: %zu bytes per buffer\n", sizeof(ClusterPageWalBindingV1));
 	cluster_page_wal_shmem_register();
 	UT_ASSERT(registered_region != NULL);
 	UT_RUN(native_insert_source);
 	UT_RUN(exact_generation_survives_new_writer);
+	UT_RUN(native_capture_refusal_clears_old_binding);
+	UT_RUN(native_capture_requires_clear_owner);
 	UT_RUN(stale_page_or_space_never_reads);
 	UT_RUN(capture_requires_original_owner);
 	UT_RUN(private_page_and_nonshared_skip);

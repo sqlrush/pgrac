@@ -790,8 +790,9 @@ XLogInsert(RmgrId rmid, uint8 info)
 			if (!cluster_page_wal_capture_native_v1(
 					rb->page_version_buffer, edge, registered_page_version_result_token,
 					ProcLastRecPtr, EndPos, ((XLogRecord *)hdr_scratch)->xl_crc,
-					((XLogRecord *)hdr_scratch)->xl_rmid, ((XLogRecord *)hdr_scratch)->xl_info))
-				elog(PANIC, "could not bind the exact WAL source of a versioned buffer");
+					((XLogRecord *)hdr_scratch)->xl_rmid, ((XLogRecord *)hdr_scratch)->xl_info)
+				&& !cluster_page_wal_forget_v1(rb->page_version_buffer))
+				elog(PANIC, "versioned WAL lost its buffer attribution owner");
 		}
 	}
 #endif
