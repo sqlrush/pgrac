@@ -11,8 +11,10 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_retention.h"
+#include "cluster/cluster_wal_writer.h"
 #include "common/cryptohash.h"
 #include "miscadmin.h"
+#include "postmaster/interrupt.h"
 #include "utils/resowner.h"
 
 #include "cluster_control_root_private.h"
@@ -30,6 +32,10 @@ struct ClusterWalInputsV1 {
 	uint16 threads[CLUSTER_WAL_RETENTION_MAX_THREADS];
 	uint32 count;
 	ClusterWalInputV1 items[CLUSTER_WAL_INPUTS_MAX];
+	/* Job-local minimum sampled after its directory cut, not a Flush promise. */
+	ClusterWalWriterToken local_writer;
+	XLogRecPtr local_minimum;
+	uint32 local_index;
 };
 
 typedef struct WalInputsWork {
@@ -325,6 +331,111 @@ cluster_wal_inputs_visit_retained_v1(ClusterWalInputsV1 *inputs, uint32 index,
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		*out = observed;
 	else
+		inputs->stale = true;
+	return result;
+}
+
+static ClusterControlRootResult
+inputs_live_sample(ClusterWalInputsV1 *inputs, uint32 index, ClusterWalWriterFlushV1 *out)
+{
+	const ClusterWalInputV1 *item = &inputs->items[index];
+	ClusterWalWriterToken current;
+	ClusterControlRootResult result;
+
+	result = cluster_wal_writer_begin(item->source.timeline, &current);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	/* ROOT's later configuration ceiling may cover this same immutable
+	 * native claim. The original writer token itself remains byte-exact. */
+	if (!cluster_control_root_identity_equal(&current.ref.claim.identity,
+											 &item->source.claim.identity)
+		|| current.ref.claim.database_incarnation != item->source.claim.database_incarnation
+		|| current.ref.claim.max_config_generation == 0
+		|| current.ref.claim.max_config_generation > item->source.claim.max_config_generation
+		|| memcmp(current.ref.claim.claim_sha256, item->source.claim.claim_sha256, 32) != 0
+		|| current.ref.timeline != item->source.timeline || current.startup_first_lsn != 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (inputs->local_minimum == InvalidXLogRecPtr) {
+		XLogRecPtr minimum = GetXLogInsertEndRecPtr();
+		result = cluster_wal_writer_check(&current);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		if (minimum <= item->checkpoint_start
+			|| minimum < item->checkpoint.validated_tail_lsn_exclusive)
+			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		inputs->local_writer = current;
+		inputs->local_minimum = minimum;
+		inputs->local_index = index;
+	} else if (inputs->local_index != index
+			   || memcmp(&current, &inputs->local_writer, sizeof(current)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = cluster_wal_writer_flushed_v1(out);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(&out->writer, &inputs->local_writer, sizeof(out->writer)) != 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (out->complete_end == InvalidXLogRecPtr || out->flushed_end < out->complete_end)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	/* The process-local sampler may have completed an earlier job's pending
+	 * reservation. Consuming that sample is safe, using it for this job is
+	 * not. The next poll samples anew without moving our fixed minimum. */
+	return out->complete_end < inputs->local_minimum ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+													 : CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_visit_live_local_v1(ClusterWalInputsV1 *inputs, uint32 index,
+									   ClusterWalRecordVisitor visitor, void *arg,
+									   ClusterWalTailObservation *out)
+{
+	ClusterWalTailObservation observed = { 0 };
+	ClusterWalWriterFlushV1 native;
+	WalInputsVisit visit = { inputs, visitor, arg };
+	const ClusterWalInputV1 *item;
+	ClusterControlRootResult result;
+	bool visited = false;
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (!inputs_current(inputs) || index >= inputs->count || CritSectionCount != 0
+		|| ShutdownRequestPending || RecoveryInProgress())
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	item = &inputs->items[index];
+	if (!item->current || item->kind != CLUSTER_WAL_INPUT_CHECKPOINT
+		|| item->checkpoint.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	PG_TRY();
+	{
+		result = cluster_wal_inputs_revalidate_v1(inputs);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			if (item->source.claim.identity.origin_node_id != cluster_node_id)
+				result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+			else
+				result = inputs_live_sample(inputs, index, &native);
+		}
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			visited = true;
+			result = cluster_wal_flushed_prefix_visit(
+				cluster_wal_threads_dir, &item->source, wal_segment_size,
+				item->checkpoint.checkpoint_lower_lsn, inputs->local_minimum, native.complete_end,
+				native.flushed_end, item->checkpoint_start,
+				item->checkpoint.checkpoint_record_crc32c, inputs_visit_record, &visit, &observed);
+		}
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_writer_check(&native.writer);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_inputs_revalidate_v1(inputs);
+	}
+	PG_CATCH();
+	{
+		inputs->stale = true;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = observed;
+	else if (visited || result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
 		inputs->stale = true;
 	return result;
 }

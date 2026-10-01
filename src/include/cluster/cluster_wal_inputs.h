@@ -53,6 +53,18 @@ extern ClusterControlRootResult
 cluster_wal_inputs_visit_retained_v1(ClusterWalInputsV1 *inputs, uint32 index,
 									 ClusterWalRecordVisitor visitor, void *arg,
 									 ClusterWalTailObservation *out);
+
+/* Original local OPEN writer only. Invoke first after capturing the exact
+ * directory cut for this job. Keeps a fixed native reserved-end minimum in
+ * this scope, waits for the writer's confirmed complete end to cover it, then
+ * decodes without CF. A pending sample from an earlier job cannot satisfy a
+ * later cut. RECONFIG_WAIT before visiting retains the minimum; any visited
+ * failure invalidates the scope. Remote sources require their own writer
+ * transport and return RECONFIG_WAIT here, never use the receiver's Flush. */
+extern ClusterControlRootResult
+cluster_wal_inputs_visit_live_local_v1(ClusterWalInputsV1 *inputs, uint32 index,
+									   ClusterWalRecordVisitor visitor, void *arg,
+									   ClusterWalTailObservation *out);
 extern void cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs);
 
 #endif
