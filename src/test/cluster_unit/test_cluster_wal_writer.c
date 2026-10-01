@@ -237,6 +237,26 @@ static struct {
 	char pages[2 * XLOG_BLCKSZ];
 } native_ctl;
 static ControlFileData native_control;
+static unsigned flush_probe_calls, flush_probe_drift;
+static bool flush_probe_recovery;
+XLogRecPtr
+GetFlushRecPtr(TimeLineID *timeline)
+{
+	UT_ASSERT(!flush_probe_recovery);
+	flush_probe_calls++;
+	if (flush_probe_calls == 2) {
+		if (flush_probe_drift == 1)
+			epoch++;
+		else if (flush_probe_drift == 2)
+			ref.claim.claim_sha256[0]++;
+		else if (flush_probe_drift == 3)
+			self_fenced = true;
+		else if (flush_probe_drift == 4)
+			native_ctl.InsertTimeLineID++;
+	}
+	*timeline = native_ctl.InsertTimeLineID;
+	return native_ctl.LogwrtResult.Flush;
+}
 #define ControlFile (&native_control)
 #define XLogRecPtrToBufIdx(p) (((p) / XLOG_BLCKSZ) % (native_ctl.XLogCacheBlck + 1))
 #define CLUSTER_INJECTION_POINT(name) ((void)0)
@@ -278,7 +298,7 @@ XLogInsertAllowed(void)
 bool
 RecoveryInProgress(void)
 {
-	return false;
+	return flush_probe_recovery;
 }
 static void
 UpdateMinRecoveryPoint(XLogRecPtr r pg_attribute_unused(), bool f pg_attribute_unused())
@@ -895,10 +915,66 @@ UT_TEST(test_startup_rejects_changed_selection_route_or_owner)
 	}
 }
 
+UT_TEST(test_background_flush_snapshot_preserves_native_byte_boundary)
+{
+	ClusterWalWriterFlushV1 snapshot;
+	fixture();
+	CritSectionCount = 0;
+	held = false;
+	MyBackendType = B_BG_WRITER;
+	flush_probe_calls = flush_probe_drift = 0;
+	native_ctl.InsertTimeLineID = 1;
+	native_ctl.LogwrtResult.Flush = wal_segment_size + 89;
+	UT_ASSERT_EQ(cluster_wal_writer_flushed_v1(&snapshot), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(snapshot.flushed_end, wal_segment_size + 89);
+	UT_ASSERT_EQ(snapshot.writer.epoch, epoch);
+	UT_ASSERT_EQ(memcmp(&snapshot.writer.ref, &ref, sizeof(ref)), 0);
+	UT_ASSERT_EQ(flush_probe_calls, 2);
+	UT_ASSERT_EQ(sync_calls, 0);
+	UT_ASSERT_EQ(rename_calls, 0);
+}
+
+UT_TEST(test_background_flush_snapshot_rejects_writer_change_and_startup)
+{
+	for (unsigned fault = 0; fault < 10; fault++) {
+		ClusterWalWriterFlushV1 snapshot;
+		static const ClusterWalWriterFlushV1 zero;
+		fixture();
+		CritSectionCount = 0;
+		held = false;
+		MyBackendType = B_BG_WRITER;
+		native_ctl.InsertTimeLineID = 1;
+		native_ctl.LogwrtResult.Flush = wal_segment_size + 89;
+		flush_probe_calls = 0;
+		flush_probe_recovery = fault == 9;
+		flush_probe_drift = fault < 4 ? fault + 1 : 0;
+		if (fault == 4)
+			native_ctl.LogwrtResult.Flush = 0;
+		else if (fault == 5)
+			MyBackendType = B_STARTUP;
+		else if (fault == 6)
+			active = false;
+		else if (fault == 7)
+			have_ref = false;
+		else if (fault == 8)
+			fence_lease_zero = true;
+		memset(&snapshot, 0x55, sizeof(snapshot));
+		UT_ASSERT(cluster_wal_writer_flushed_v1(&snapshot) != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(memcmp(&snapshot, &zero, sizeof(snapshot)), 0);
+		if (flush_probe_recovery)
+			UT_ASSERT_EQ(flush_probe_calls, 0);
+	}
+	UT_ASSERT_EQ(cluster_wal_writer_flushed_v1(NULL), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	flush_probe_drift = 0;
+	flush_probe_recovery = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(21);
+	UT_RUN(test_background_flush_snapshot_preserves_native_byte_boundary);
+	UT_RUN(test_background_flush_snapshot_rejects_writer_change_and_startup);
 	UT_RUN(test_native_flush_has_no_sidefile_io_or_record_rounddown);
 	UT_RUN(test_native_survivor_waits_for_epoch_token);
 	UT_RUN(test_native_survivor_waits_for_token_publication);

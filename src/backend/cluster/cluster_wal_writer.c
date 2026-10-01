@@ -99,6 +99,34 @@ cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *work)
 }
 
 ClusterControlRootResult
+cluster_wal_writer_flushed_v1(ClusterWalWriterFlushV1 *out)
+{
+	ClusterWalWriterFlushV1 work = { 0 };
+	ClusterControlRootResult result;
+	TimeLineID timeline;
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (MyBackendType == B_STARTUP || CritSectionCount != 0 || ShutdownRequestPending
+		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress())
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	/* First obtain the native timeline; only the read between begin/check
+	 * supplies the flush bound. Never read WAL, force flush or round here. */
+	(void)GetFlushRecPtr(&timeline);
+	result = cluster_wal_writer_begin(timeline, &work.writer);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	work.flushed_end = GetFlushRecPtr(&timeline);
+	if (work.flushed_end == InvalidXLogRecPtr || timeline != work.writer.ref.timeline)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	result = cluster_wal_writer_check(&work.writer);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = work;
+	return result;
+}
+
+ClusterControlRootResult
 cluster_wal_writer_ready(TimeLineID timeline)
 {
 	ClusterWalWriterToken work;

@@ -10,6 +10,15 @@ typedef struct ClusterWalWriterToken {
 	XLogRecPtr startup_first_lsn;
 } ClusterWalWriterToken;
 
+typedef struct ClusterWalWriterFlushV1 {
+	ClusterWalWriterToken writer;
+	XLogRecPtr flushed_end;
+} ClusterWalWriterFlushV1;
+
+/* Background physical input only, not ROOT/recovery/GC permission. Native
+ * Flush may bisect a later record; only the bounded reader may round it. */
+extern ClusterControlRootResult cluster_wal_writer_flushed_v1(ClusterWalWriterFlushV1 *out);
+
 /* Snapshot before I/O, revalidate after fsync before exposing native Flush.
  * Both calls are nonblocking and perform no file I/O or allocation. */
 extern ClusterControlRootResult cluster_wal_writer_begin(TimeLineID timeline,
