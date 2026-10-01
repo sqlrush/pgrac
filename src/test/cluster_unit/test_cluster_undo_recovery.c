@@ -69,9 +69,10 @@ rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *p, uint64 sysid,
 {
 	UT_ASSERT(p == plan);
 	return source_ok && sysid == 123 && memcmp(uuid, storage_uuid, 16) == 0
-		&& cut->failed_thread == 3 && cut->timeline_id == 7
-		&& cut->flags == RF_CONTRIBUTOR_CUT_COMPLETE
-		&& cut->scan_begin_inclusive == 100 && cut->scan_end_exclusive == 500;
+		   && cut->failed_thread == 3 && cut->timeline_id == 7
+		   && cut->origin_owner_incarnation == duty.origin_owner_incarnation
+		   && cut->flags == RF_CONTRIBUTOR_CUT_COMPLETE && cut->scan_begin_inclusive == 100
+		   && cut->scan_end_exclusive == 500;
 }
 
 int

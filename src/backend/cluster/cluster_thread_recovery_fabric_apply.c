@@ -199,6 +199,8 @@ cluster_thread_recovery_fabric_apply_sources_v1(const ClusterThreadRecoveryFabri
 		if (!cluster_thread_recovery_fabric_cut_v1(plan, i, &cut))
 			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 		if (cut.failed_thread == 0 || cut.failed_thread != source->duty->origin_thread_id
+			|| (cut.origin_owner_incarnation != 0
+				&& cut.origin_owner_incarnation != source->duty->origin_owner_incarnation)
 			|| cut.failed_thread != source->root_snapshot->identity.origin_thread_id
 			|| (i > 0 && source->duty->origin_thread_id <= authority[i - 1].duty->origin_thread_id)
 			|| cut.timeline_id == 0 || cut.timeline_id != source->root_snapshot->checkpoint_tli

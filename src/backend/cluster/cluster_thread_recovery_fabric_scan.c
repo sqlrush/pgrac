@@ -121,6 +121,7 @@ cluster_thread_recovery_fabric_scan_roots_v1(
 				root->validated_tail_lsn_exclusive))
 			return RF_PAGE_PROOF_DETAIL_RETENTION_STALE;
 		cuts[i].failed_thread = authority->duty->origin_thread_id;
+		cuts[i].origin_owner_incarnation = authority->duty->origin_owner_incarnation;
 		cuts[i].timeline_id = root->checkpoint_tli;
 		cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
 		cuts[i].scan_begin_inclusive = root->checkpoint_lower_lsn;

@@ -280,12 +280,10 @@ validate_request(const RfPageStableGraphRequestV1 *request)
 		bool empty = (cut->flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0;
 
 		if (cut->failed_thread == 0 || cut->timeline_id == 0
+			|| cut->origin_owner_incarnation == UINT64_MAX
 			|| (cut->flags & ~RF_CONTRIBUTOR_CUT_KNOWN_MASK) != 0
 			|| (cut->flags & RF_CONTRIBUTOR_CUT_COMPLETE) == 0
-			|| (i > 0
-				&& (vector->cuts[i - 1].failed_thread > cut->failed_thread
-					|| (vector->cuts[i - 1].failed_thread == cut->failed_thread
-						&& vector->cuts[i - 1].timeline_id >= cut->timeline_id)))) {
+			|| (i > 0 && !rf_contributor_cut_precedes_v1(&vector->cuts[i - 1], cut))) {
 			detail = RF_PAGE_PROOF_DETAIL_PARTICIPANT_MISSING;
 			goto done;
 		}
@@ -407,7 +405,8 @@ rf_page_stable_base_select_v1(const RfPageStableGraphRequestV1 *request, uint32 
 
 			if (edge_is_duplicate_of_prior(vector, j))
 				continue;
-			if (record_identity_equal(&left->record_identity, &right->record_identity)
+			if (left->participant_index == right->participant_index
+				&& record_identity_equal(&left->record_identity, &right->record_identity)
 				&& !edge_exact_equal(left, right)) {
 				detail = RF_PAGE_PROOF_DETAIL_ANCHOR_AMBIGUOUS;
 				goto fail;
@@ -553,6 +552,8 @@ stable_owners_revalidate(const RfPageStableBaseProofRequestV1 *request, bool bou
 		if (!bytes_nonzero(token->authority_uuid, sizeof(token->authority_uuid))
 			|| token->origin_thread_id != contributors->cuts[i].failed_thread
 			|| token->origin_thread_id != duty->origin_thread_id
+			|| (contributors->cuts[i].origin_owner_incarnation != 0
+				&& contributors->cuts[i].origin_owner_incarnation != duty->origin_owner_incarnation)
 			|| token->root_lineage_seq != duty->root_lineage_seq
 			|| memcmp(token->authority_uuid, duty->authority_uuid, 16) != 0
 			|| token->root_lineage_seq == 0 || token->reserved20 != 0 || token->reserved32 != 0)
@@ -607,6 +608,8 @@ source_owners_revalidate(const RfPageIdentityV1 *identity,
 		if (a->duty->system_identifier != identity->system_identifier
 			|| memcmp(a->duty->storage_uuid, identity->storage_uuid, 16) != 0
 			|| cut->failed_thread != a->duty->origin_thread_id
+			|| (cut->origin_owner_incarnation != 0
+				&& cut->origin_owner_incarnation != a->duty->origin_owner_incarnation)
 			|| (i > 0 && cut->failed_thread <= contributors->cuts[i - 1].failed_thread))
 			return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 		/* These are per-target projections of the physically closed cuts.

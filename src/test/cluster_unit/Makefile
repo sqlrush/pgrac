@@ -1199,6 +1199,7 @@ CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O = \
 
 $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_fabric_plan.c \
+		$(top_srcdir)/src/include/cluster/cluster_page_stable_base.h \
 		$(top_srcdir)/src/include/cluster/cluster_thread_recovery_fabric.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
@@ -1294,6 +1295,7 @@ test_cluster_page_dependency: test_cluster_page_dependency.c unit_test.h \
 
 $(CLUSTER_PAGE_REPLAY_BATCH_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_page_replay_batch.c \
+		$(top_srcdir)/src/include/cluster/cluster_page_stable_base.h \
 		$(top_srcdir)/src/include/cluster/cluster_page_replay_batch.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
@@ -2043,6 +2045,7 @@ test_cluster_space_cleanout_product.o: $(top_srcdir)/src/backend/cluster/cluster
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_space_recovery_product.o: $(top_srcdir)/src/backend/cluster/cluster_space_recovery.c \
+		$(top_srcdir)/src/include/cluster/cluster_page_stable_base.h \
 		$(top_srcdir)/src/include/cluster/cluster_space_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_thread_recovery_fabric.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@

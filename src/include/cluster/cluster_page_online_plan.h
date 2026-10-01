@@ -63,6 +63,7 @@ typedef struct RfPageContributionPrefixV1 {
 	uint16 reserved_zero;
 	TimeLineID timeline;
 	XLogRecPtr first_uncovered_lsn;
+	uint64 origin_owner_incarnation;
 } RfPageContributionPrefixV1;
 
 extern RfPageProofDetailV1 rf_page_online_plan_create_v1(const RfPageOnlinePlanRequestV1 *request,

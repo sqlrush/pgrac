@@ -384,7 +384,7 @@ make_plan(uint32 participants)
 }
 
 static RfPageProofDetailV1
-enqueue(RfPageOnlinePlanV1 *plan, RecordFixture *fixture, uint16 participant)
+enqueue_origin(RfPageOnlinePlanV1 *plan, RecordFixture *fixture, uint16 participant, uint16 origin)
 {
 	RfDetachedRecordPlanV1 detached;
 	RfPageOnlineRecordIdentityV1 id = {0};
@@ -397,7 +397,7 @@ enqueue(RfPageOnlinePlanV1 *plan, RecordFixture *fixture, uint16 participant)
 	id.participant_index = participant;
 	id.record.system_identifier = 99;
 	memset(id.record.storage_uuid, 3, 16);
-	id.record.origin_thread = participant + 1;
+	id.record.origin_thread = origin;
 	id.record.timeline_id = 1;
 	id.record.read_rec_ptr = record->lsn;
 	id.record.end_rec_ptr = record->next_lsn;
@@ -405,6 +405,102 @@ enqueue(RfPageOnlinePlanV1 *plan, RecordFixture *fixture, uint16 participant)
 	id.record.rmid = record->header.xl_rmid;
 	id.record.info = record->header.xl_info;
 	return rf_page_online_plan_queue_record_v1(plan, &detached, &id);
+}
+
+static RfPageProofDetailV1
+enqueue(RfPageOnlinePlanV1 *plan, RecordFixture *fixture, uint16 participant)
+{
+	return enqueue_origin(plan, fixture, participant, participant + 1);
+}
+
+UT_TEST(test_same_thread_generations_keep_separate_prefixes_and_full_claims)
+{
+	RfContributorStreamCutV1 cuts[2] = { { 0 } };
+	ClusterWalSourceRef sources[2], changed[2];
+	RfPageOnlinePlanRequestV1 request = { 0 };
+	RfPageOnlinePlanV1 *plan = NULL;
+	RfPageContributionPrefixV1 checkpoint[2], retained[2], sentinel[2];
+	RfPageOnlineTargetViewV1 target;
+	RecordFixture record;
+	memset(sources, 0, sizeof(sources));
+	for (uint32 i = 0; i < 2; i++) {
+		cuts[i].failed_thread = cuts[i].timeline_id = 1;
+		cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		cuts[i].scan_begin_inclusive = 0x100;
+		cuts[i].scan_end_exclusive = 0x200;
+		cuts[i].origin_owner_incarnation = 41 + i;
+		sources[i].claim.identity.system_identifier = 99;
+		memset(sources[i].claim.identity.storage_uuid, 3, 16);
+		memset(sources[i].claim.identity.authority_uuid, 4, 16);
+		sources[i].claim.identity.origin_thread_id = 1;
+		sources[i].claim.identity.origin_owner_incarnation = 41 + i;
+		sources[i].claim.identity.root_lineage_seq = 10 + i;
+		sources[i].claim.identity.thread_claim_created_at = 20 + i;
+		sources[i].claim.database_incarnation = 42;
+		sources[i].claim.max_config_generation = 5;
+		sources[i].claim.claim_sha256[0] = 41 + i;
+		sources[i].timeline = 1;
+	}
+	request.system_identifier = 99;
+	memset(request.storage_uuid, 3, 16);
+	request.physical_cuts = cuts;
+	request.participant_count = 2;
+	request.retention_binding_cookie = 41;
+	UT_ASSERT_EQ(rf_page_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+	if (plan == NULL)
+		return;
+	memcpy(changed, sources, sizeof(changed));
+	changed[1] = sources[0];
+	UT_ASSERT(!rf_page_online_plan_bind_sources_v1(plan, changed, 2));
+	UT_ASSERT(rf_page_online_plan_bind_sources_v1(plan, sources, 2));
+	/* Same thread, TLI and LSN, but different retained generation. */
+	record_init(&record, 90, 7, false, BLCKSZ - 1, 0xb2);
+	UT_ASSERT_EQ(enqueue_origin(plan, &record, 1, 1), RF_PAGE_PROOF_DETAIL_OK);
+	record_init(&record, 10, 90, true, 0, 0xa1);
+	UT_ASSERT_EQ(enqueue_origin(plan, &record, 0, 1), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_page_online_plan_target_v1(plan, 0, &target));
+	if (rf_page_online_plan_target_v1(plan, 0, &target)) {
+		RfPageStableGraphRequestV1 graph = *target.graph;
+		RfPageStableSelectionV1 selected;
+		RfPagePinnedSourceV1 base = *target.source;
+		uint32 chain[2];
+
+		UT_ASSERT_EQ(target.contributors->edge_count, 2);
+		UT_ASSERT_EQ((uint8)target.canonical_page[BLCKSZ - 1], 0xb2);
+		/* Exercise the lower graph validator as well as queue/prefix code.
+		 * These booleans are a pure graph fixture, never a durable proof. */
+		base.source_version = target.expected_before;
+		graph.source = &base;
+		graph.root_current = graph.duty_current = graph.fence_current = graph.retention_current
+			= true;
+		graph.retention_binding_cookie = graph.current_retention_binding_cookie = 41;
+		UT_ASSERT_EQ(rf_page_stable_base_select_v1(&graph, chain, 2, &selected),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(selected.chain_length, 2);
+	}
+	UT_ASSERT(rf_page_online_plan_page_prefix_v1(plan, NULL, 0, checkpoint, 2));
+	UT_ASSERT_EQ(checkpoint[0].origin_owner_incarnation, 41);
+	UT_ASSERT_EQ(checkpoint[1].origin_owner_incarnation, 42);
+	checkpoint[1].first_uncovered_lsn = 0x200;
+	UT_ASSERT(rf_page_online_plan_dependency_prefix_v1(plan, checkpoint, 2, retained));
+	UT_ASSERT_EQ(retained[1].first_uncovered_lsn, 0x100);
+	checkpoint[0].first_uncovered_lsn = 0x200;
+	UT_ASSERT(rf_page_online_plan_dependency_prefix_v1(plan, checkpoint, 2, retained));
+	UT_ASSERT_EQ(retained[0].first_uncovered_lsn, 0x200);
+	UT_ASSERT_EQ(retained[1].first_uncovered_lsn, 0x200);
+	memset(sentinel, 0xa5, sizeof(sentinel));
+	memcpy(retained, sentinel, sizeof(retained));
+	checkpoint[1].origin_owner_incarnation = 41;
+	UT_ASSERT(!rf_page_online_plan_dependency_prefix_v1(plan, checkpoint, 2, retained));
+	UT_ASSERT_EQ(memcmp(retained, sentinel, sizeof(retained)), 0);
+	rf_page_online_plan_destroy_v1(&plan);
+	/* Neither omitted nor repeated generation can distinguish these cuts. */
+	for (uint32 i = 0; i < 3; i++) {
+		cuts[1].origin_owner_incarnation = i == 0 ? 0 : i == 1 ? 41 : UINT64_MAX;
+		UT_ASSERT_NE(rf_page_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(plan == NULL);
+	}
 }
 
 UT_TEST(test_reverse_real_fpi_delta_chain_owns_reader_bytes)
@@ -772,7 +868,8 @@ UT_TEST(test_actual_fabric_refuses_routed_components_without_side_consumer)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
+	UT_RUN(test_same_thread_generations_keep_separate_prefixes_and_full_claims);
 	UT_RUN(test_reverse_real_fpi_delta_chain_owns_reader_bytes);
 	UT_RUN(test_cycle_and_branch_do_not_expose_canonical_pages);
 	UT_RUN(test_corrupt_owned_fpi_is_refused_by_real_decoder);

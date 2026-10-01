@@ -78,7 +78,8 @@ rf_side_online_plan_multixact_page_retired_v1(const RfSideOnlinePlanV1 *plan,
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed
 		|| page > UINT32_MAX / per_page || source_lsn == InvalidXLogRecPtr
-		|| source_end_lsn <= source_lsn)
+		|| source_end_lsn <= source_lsn || origin_thread > UINT16_MAX
+		|| rf_side_online_plan_origin_operation_count_v1(plan, (uint16)origin_thread) == UINT32_MAX)
 		return false;
 	for (uint32 i = 0; i < plan->operation_count; i++) {
 		const RfSideOnlineOperationV1 *entry = &plan->operations[i];
@@ -564,11 +565,17 @@ rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request,
 		bool empty = (cut->flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0;
 
 		if (cut->failed_thread == 0 || cut->timeline_id == 0
+			|| cut->origin_owner_incarnation == UINT64_MAX
 			|| (cut->flags & RF_CONTRIBUTOR_CUT_COMPLETE) == 0
 			|| (cut->flags & ~RF_CONTRIBUTOR_CUT_KNOWN_MASK) != 0
 			|| (empty && cut->scan_begin_inclusive != cut->scan_end_exclusive)
 			|| (!empty && cut->scan_begin_inclusive >= cut->scan_end_exclusive)
-			|| (i > 0 && request->physical_cuts[i - 1].failed_thread >= cut->failed_thread))
+			|| (i > 0
+				&& (!rf_contributor_cut_precedes_v1(&request->physical_cuts[i - 1], cut)
+					|| (request->physical_cuts[i - 1].failed_thread == cut->failed_thread
+						&& (cut->origin_owner_incarnation == 0
+							|| request->physical_cuts[i - 1].origin_owner_incarnation
+								   == cut->origin_owner_incarnation)))))
 			return RF_PAGE_PROOF_DETAIL_PARTICIPANT_MISSING;
 		if (request->redo_starts != NULL
 			&& (request->redo_starts[i] < cut->scan_begin_inclusive
@@ -785,7 +792,8 @@ rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan,
 		return false;
 	source = NULL;
 	for (uint32 i = 0; i < plan->participant_count; i++)
-		if (plan->physical_cuts[i].failed_thread == cut->failed_thread) {
+		if (plan->physical_cuts[i].failed_thread == cut->failed_thread
+			&& plan->physical_cuts[i].origin_owner_incarnation == cut->origin_owner_incarnation) {
 			source = &plan->physical_cuts[i];
 			break;
 		}
@@ -906,7 +914,9 @@ rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
 	const RfSideXactOperationV1 *operation)
 {
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed
-		|| operation == NULL || operation->kind != RF_SIDE_XACT_COMMIT)
+		|| operation == NULL || operation->kind != RF_SIDE_XACT_COMMIT
+		|| rf_side_online_plan_origin_operation_count_v1(plan, operation->origin_thread)
+			   == UINT32_MAX)
 		return false;
 	for (uint32 i = 0; i < plan->operation_count; i++)
 		if (!plan->operations[i].history_only
@@ -1392,8 +1402,12 @@ rf_side_online_plan_origin_operation_count_v1(const RfSideOnlinePlanV1 *plan, ui
 	if (source_thread == 0)
 		found = true;
 	for (uint32 i = 0; i < plan->participant_count; i++)
-		if (plan->physical_cuts[i].failed_thread == source_thread)
+		if (plan->physical_cuts[i].failed_thread == source_thread) {
+			/* This legacy selector cannot distinguish two generations. */
+			if (found)
+				return UINT32_MAX;
 			found = true;
+		}
 	if (!found)
 		return UINT32_MAX;
 	for (uint32 i = 0; i < plan->operation_count; i++)

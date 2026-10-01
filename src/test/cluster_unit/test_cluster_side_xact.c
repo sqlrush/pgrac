@@ -3573,10 +3573,74 @@ UT_TEST(test_side_plan_does_not_drop_unowned_page_components)
 	}
 }
 
+UT_TEST(test_retained_generations_refuse_ambiguous_thread_selectors)
+{
+	RfSideOnlinePlanRequestV1 request = { 0 };
+	RfContributorStreamCutV1 cuts[2] = { { 0 } }, changed;
+	XLogRecPtr redo[2] = { 200, 100 };
+	RfSideOnlinePlanV1 *plan = NULL;
+	RfSideOnlineApplyOpsV1 ops = { 0 };
+	ApplyCapture capture = { 0 };
+	FakeXactRecord fake;
+	int page = 17;
+	request.system_identifier = UINT64_C(0x11223344);
+	memset(request.storage_uuid, 0x45, 16);
+	request.participant_count = 2;
+	request.physical_cuts = cuts;
+	request.redo_starts = redo;
+	for (uint32 i = 0; i < 2; i++) {
+		cuts[i].failed_thread = 3;
+		cuts[i].timeline_id = 7;
+		cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		cuts[i].scan_begin_inclusive = 100;
+		cuts[i].scan_end_exclusive = 200;
+		cuts[i].origin_owner_incarnation = 41 + i;
+	}
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+	if (plan == NULL)
+		return;
+	for (uint32 i = 0; i < 2; i++) {
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		make_projection_record(&fake, RM_MULTIXACT_ID, XLOG_MULTIXACT_ZERO_OFF_PAGE, &page,
+							   sizeof(page));
+		identity = make_identity(&fake, request.storage_uuid);
+		identity.participant_index = i;
+		record = make_projection_record_plan(&fake);
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_OK);
+	}
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	for (uint32 i = 0; i < 2; i++)
+		UT_ASSERT(rf_side_online_plan_source_matches_v1(plan, request.system_identifier,
+														request.storage_uuid, &cuts[i]));
+	changed = cuts[1];
+	changed.origin_owner_incarnation = 0;
+	UT_ASSERT(!rf_side_online_plan_source_matches_v1(plan, request.system_identifier,
+													 request.storage_uuid, &changed));
+	changed.origin_owner_incarnation = 43;
+	UT_ASSERT(!rf_side_online_plan_source_matches_v1(plan, request.system_identifier,
+													 request.storage_uuid, &changed));
+	UT_ASSERT_EQ(rf_side_online_plan_origin_operation_count_v1(plan, 0), 1);
+	UT_ASSERT_EQ(rf_side_online_plan_origin_operation_count_v1(plan, 3), UINT32_MAX);
+	ops.arg = &capture;
+	ops.begin_protected_set = capture_begin;
+	ops.end_protected_set = capture_end;
+	ops.preflight_projection = accept_preflight;
+	ops.apply_projection = capture_apply_projection;
+	ops.source_thread = 3;
+	UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &ops), RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(capture.begin_count, 0);
+	UT_ASSERT_EQ(capture.projection_count, 0);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(51);
+	UT_PLAN(52);
+	UT_RUN(test_retained_generations_refuse_ambiguous_thread_selectors);
 	UT_RUN(test_side_plan_does_not_drop_unowned_page_components);
 	UT_RUN(test_retained_side_history_is_validated_but_never_dispatched);
 	UT_RUN(test_retained_commit_drop_does_not_create_space_mutation_target);

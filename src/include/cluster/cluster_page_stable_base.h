@@ -47,15 +47,32 @@ typedef struct RfContributorStreamCutV1 {
 	XLogRecPtr scan_end_exclusive;
 	uint32 contributor_count;
 	uint32 component_count;
+	/* Transient source projection; zero is the legacy single-generation
+	 * form. Full claims remain owned/bound separately, never inferred here. */
+	uint64 origin_owner_incarnation;
 } RfContributorStreamCutV1;
 
-StaticAssertDecl(sizeof(RfContributorStreamCutV1) == 32, "RfContributorStreamCutV1 ABI drift");
+StaticAssertDecl(sizeof(RfContributorStreamCutV1) == 40, "RfContributorStreamCutV1 ABI drift");
 StaticAssertDecl(offsetof(RfContributorStreamCutV1, timeline_id) == 4,
 				 "RfContributorStreamCutV1 timeline offset drift");
 StaticAssertDecl(offsetof(RfContributorStreamCutV1, scan_begin_inclusive) == 8,
 				 "RfContributorStreamCutV1 begin offset drift");
 StaticAssertDecl(offsetof(RfContributorStreamCutV1, contributor_count) == 24,
 				 "RfContributorStreamCutV1 count offset drift");
+
+/* Ordering is for one immutable input vector, never WAL ordering across
+ * sources. A repeated thread needs explicit, different generations. The
+ * stable graph also retains its legacy distinct-timeline input form. */
+static inline bool
+rf_contributor_cut_precedes_v1(const RfContributorStreamCutV1 *a, const RfContributorStreamCutV1 *b)
+{
+	if (a->failed_thread != b->failed_thread)
+		return a->failed_thread < b->failed_thread;
+	if (a->origin_owner_incarnation != b->origin_owner_incarnation)
+		return a->origin_owner_incarnation != 0 && b->origin_owner_incarnation != 0
+			   && a->origin_owner_incarnation < b->origin_owner_incarnation;
+	return a->timeline_id < b->timeline_id;
+}
 
 /* Exact immutable identity of one decoded foreign WAL record. */
 typedef struct RfPageReplayRecordIdentityV1 {

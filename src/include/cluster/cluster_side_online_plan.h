@@ -102,6 +102,7 @@ extern RfPageProofDetailV1 rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
 extern bool rf_side_online_plan_bind_database_v1(RfSideOnlinePlanV1 *plan,
 												uint64 database_incarnation);
 /* Match the sealed, physically observed source, including its exact cut. */
+/* A legacy zero-generation cut never selects an explicit generation. */
 extern bool rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan,
 	uint64 system_identifier, const uint8 storage_uuid[16],
 	const RfContributorStreamCutV1 *cut);

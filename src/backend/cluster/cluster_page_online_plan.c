@@ -349,6 +349,8 @@ rf_page_online_plan_bind_sources_v1(RfPageOnlinePlanV1 *plan, const ClusterWalSo
 		if (plan->participant_seen[i] || id->system_identifier != plan->system_identifier
 			|| memcmp(id->storage_uuid, plan->storage_uuid, 16) != 0
 			|| id->origin_thread_id != cut->failed_thread
+			|| (cut->origin_owner_incarnation != 0
+				&& cut->origin_owner_incarnation != id->origin_owner_incarnation)
 			|| id->origin_thread_id > PGRAC_PAGE_LSN_ORIGIN_MAX + 1
 			|| id->origin_node_id != (int32)id->origin_thread_id - 1 || id->reserved42 != 0
 			|| id->reserved60 != 0 || id->thread_claim_created_at <= 0
@@ -408,11 +410,17 @@ rf_page_online_plan_create_v1(const RfPageOnlinePlanRequestV1 *request,
 		bool empty = (cut->flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0;
 
 		if (cut->failed_thread == 0 || cut->timeline_id == 0
+			|| cut->origin_owner_incarnation == UINT64_MAX
 			|| (cut->flags & RF_CONTRIBUTOR_CUT_COMPLETE) == 0
 			|| (cut->flags & ~RF_CONTRIBUTOR_CUT_KNOWN_MASK) != 0
 			|| (empty && cut->scan_begin_inclusive != cut->scan_end_exclusive)
 			|| (!empty && cut->scan_begin_inclusive >= cut->scan_end_exclusive)
-			|| (i > 0 && request->physical_cuts[i - 1].failed_thread >= cut->failed_thread))
+			|| (i > 0
+				&& (!rf_contributor_cut_precedes_v1(&request->physical_cuts[i - 1], cut)
+					|| (request->physical_cuts[i - 1].failed_thread == cut->failed_thread
+						&& (cut->origin_owner_incarnation == 0
+							|| request->physical_cuts[i - 1].origin_owner_incarnation
+								   == cut->origin_owner_incarnation)))))
 			return RF_PAGE_PROOF_DETAIL_PARTICIPANT_MISSING;
 		if (request->redo_starts != NULL
 			&& (request->redo_starts[i] < cut->scan_begin_inclusive
@@ -1044,6 +1052,7 @@ rf_page_online_plan_page_prefix_v1(const RfPageOnlinePlanV1 *plan,
 		candidate[i].origin_thread = plan->physical_cuts[i].failed_thread;
 		candidate[i].timeline = plan->physical_cuts[i].timeline_id;
 		candidate[i].first_uncovered_lsn = plan->physical_cuts[i].scan_end_exclusive;
+		candidate[i].origin_owner_incarnation = plan->physical_cuts[i].origin_owner_incarnation;
 	}
 	for (uint32 i = 0; i < plan->target_count; i++) {
 		const RfPageOnlineTargetV1 *target = plan->targets[i];
@@ -1112,6 +1121,7 @@ rf_page_online_plan_dependency_prefix_v1(const RfPageOnlinePlanV1 *plan,
 		const RfPageContributionPrefixV1 *checkpoint = &checkpoints[i];
 
 		if (checkpoint->origin_thread != cut->failed_thread
+			|| checkpoint->origin_owner_incarnation != cut->origin_owner_incarnation
 			|| checkpoint->timeline != cut->timeline_id || checkpoint->reserved_zero != 0
 			|| checkpoint->first_uncovered_lsn < cut->scan_begin_inclusive
 			|| checkpoint->first_uncovered_lsn > cut->scan_end_exclusive)

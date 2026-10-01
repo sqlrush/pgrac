@@ -30,6 +30,7 @@ undo_scope_current(const ClusterUndoRecoveryScopeV1 *scope)
 		|| memcmp(&scope->duty, a->duty, sizeof(scope->duty)) != 0
 		|| memcmp(&scope->root_token, a->root_token, sizeof(scope->root_token)) != 0
 		|| a->root_snapshot->checkpoint_tli != scope->cut.timeline_id
+		|| a->duty->origin_owner_incarnation != scope->cut.origin_owner_incarnation
 		|| a->root_snapshot->tail_tli != scope->cut.timeline_id
 		|| a->root_snapshot->checkpoint_lower_lsn != scope->cut.scan_begin_inclusive
 		|| a->root_snapshot->validated_tail_lsn_exclusive != scope->cut.scan_end_exclusive
@@ -58,6 +59,7 @@ cluster_undo_recovery_scope_enter_v1(ClusterUndoRecoveryScopeV1 *scope,
 	candidate.duty = *authority->duty;
 	candidate.root_token = *authority->root_token;
 	candidate.cut.failed_thread = authority->duty->origin_thread_id;
+	candidate.cut.origin_owner_incarnation = authority->duty->origin_owner_incarnation;
 	candidate.cut.timeline_id = authority->root_snapshot->checkpoint_tli;
 	candidate.cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
 	candidate.cut.scan_begin_inclusive = authority->root_snapshot->checkpoint_lower_lsn;

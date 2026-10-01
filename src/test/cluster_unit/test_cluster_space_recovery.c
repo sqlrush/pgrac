@@ -682,7 +682,7 @@ UT_TEST(test_actual_reservation_install_and_repeat)
 
 UT_TEST(test_sources_and_structure_refuse_before_mutation)
 {
-	for (int variant = 0; variant < 8; variant++) {
+	for (int variant = 0; variant < 9; variant++) {
 		ClusterSpaceRecoveryBatchV1 *batch = NULL;
 		reset();
 		if (variant == 0)
@@ -706,6 +706,8 @@ UT_TEST(test_sources_and_structure_refuse_before_mutation)
 			cuts[1].failed_thread = invalid;
 			make_plan();
 		}
+		if (variant == 8)
+			cuts[1].origin_owner_incarnation = duties[1].origin_owner_incarnation + 1;
 		UT_ASSERT(
 			!cluster_space_recovery_preflight_v1(fabric, sources, variant == 6 ? 1 : 2, &batch));
 		UT_ASSERT(batch == NULL && writes == 0 && lock_calls == 0);
