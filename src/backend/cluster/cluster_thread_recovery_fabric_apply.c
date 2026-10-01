@@ -148,7 +148,7 @@ cluster_thread_recovery_fabric_apply_sources_v1(const ClusterThreadRecoveryFabri
 {
 	const RfPageOnlinePlanV1 *page_plan;
 	const RfSideOnlinePlanV1 *side_plan;
-	ClusterThreadRecoveryFabricApplyStateV1 state;
+	ClusterThreadRecoveryFabricApplyStateV1 *state;
 	ClusterThreadRecoveryFabricApplyResultV1 completed;
 	RfPageInstallAuthorityAdapterV1 page_adapter;
 	RfPageStorageInstallRequestV1 install_request;
@@ -209,138 +209,154 @@ cluster_thread_recovery_fabric_apply_sources_v1(const ClusterThreadRecoveryFabri
 	target_count = rf_page_online_plan_target_count_v1(page_plan);
 	if (target_count > RF_PAGE_STABLE_MAX_EDGES)
 		return RF_PAGE_PROOF_DETAIL_CAPACITY;
-	memset(&state, 0, sizeof(state));
+	state = fabric_apply_alloc0(sizeof(*state));
+	if (state == NULL)
+		return RF_PAGE_PROOF_DETAIL_OOM;
 	memset(&completed, 0, sizeof(completed));
 	completed.page_target_count = target_count;
 	completed.side_operation_count = rf_side_online_plan_operation_count_v1(side_plan);
 
-	if (target_count > 0) {
-		Size page_bytes = (Size)target_count * BLCKSZ;
+	/* Heap-owned state survives PG ERROR longjmp at any preparation/apply
+	 * stage. The caller's plan and original authorities are only borrowed. */
+	PG_TRY();
+	{
+		if (target_count > 0) {
+			Size page_bytes = (Size)target_count * BLCKSZ;
 
-		state.views = (RfPageOnlineTargetViewV1 *)fabric_apply_alloc0((Size)target_count
-																	  * sizeof(*state.views));
-		state.components = (RfPageStorageInstallComponentV1 *)fabric_apply_alloc0(
-			(Size)target_count * sizeof(*state.components));
-		state.authority_targets = (RfPageAuthorityTargetV1 *)fabric_apply_alloc0(
-			(Size)target_count * sizeof(*state.authority_targets));
-		state.proofs = (RfPageStableBaseProofV1 **)fabric_apply_alloc0((Size)target_count
-																	   * sizeof(*state.proofs));
-		state.prepared_pages = (char *)fabric_apply_alloc0(page_bytes);
-		state.io_pages = (char *)fabric_apply_alloc0(page_bytes);
-		if (state.views == NULL || state.components == NULL || state.authority_targets == NULL
-			|| state.proofs == NULL || state.prepared_pages == NULL || state.io_pages == NULL) {
-			detail = RF_PAGE_PROOF_DETAIL_OOM;
-			goto done;
-		}
-		for (i = 0; i < target_count; i++) {
-			if (!rf_page_online_plan_target_v1(page_plan, i, &state.views[i])
-				|| state.views[i].source == NULL || state.views[i].contributors == NULL
-				|| state.views[i].graph == NULL || state.views[i].canonical_page == NULL
-				|| state.views[i].contributors->edge_count == 0) {
-				detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+			state->views = (RfPageOnlineTargetViewV1 *)fabric_apply_alloc0((Size)target_count
+																		   * sizeof(*state->views));
+			state->components = (RfPageStorageInstallComponentV1 *)fabric_apply_alloc0(
+				(Size)target_count * sizeof(*state->components));
+			state->authority_targets = (RfPageAuthorityTargetV1 *)fabric_apply_alloc0(
+				(Size)target_count * sizeof(*state->authority_targets));
+			state->proofs = (RfPageStableBaseProofV1 **)fabric_apply_alloc0(
+				(Size)target_count * sizeof(*state->proofs));
+			state->prepared_pages = (char *)fabric_apply_alloc0(page_bytes);
+			state->io_pages = (char *)fabric_apply_alloc0(page_bytes);
+			if (state->views == NULL || state->components == NULL
+				|| state->authority_targets == NULL || state->proofs == NULL
+				|| state->prepared_pages == NULL || state->io_pages == NULL) {
+				detail = RF_PAGE_PROOF_DETAIL_OOM;
 				goto done;
 			}
-			max_chain_count = Max(max_chain_count, state.views[i].contributors->edge_count);
-		}
-		state.chain_indices
-			= (uint32 *)fabric_apply_alloc0((Size)max_chain_count * sizeof(*state.chain_indices));
-		if (state.chain_indices == NULL) {
-			detail = RF_PAGE_PROOF_DETAIL_OOM;
-			goto done;
-		}
-		for (i = 0; i < target_count; i++) {
-			detail = rf_page_stable_base_proof_build_sources_v1(
-				state.views[i].graph, authority, participant_count, state.chain_indices,
-				max_chain_count, &state.proofs[i]);
+			for (i = 0; i < target_count; i++) {
+				if (!rf_page_online_plan_target_v1(page_plan, i, &state->views[i])
+					|| state->views[i].source == NULL || state->views[i].contributors == NULL
+					|| state->views[i].graph == NULL || state->views[i].canonical_page == NULL
+					|| state->views[i].contributors->edge_count == 0) {
+					detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+					goto done;
+				}
+				max_chain_count = Max(max_chain_count, state->views[i].contributors->edge_count);
+			}
+			state->chain_indices = (uint32 *)fabric_apply_alloc0((Size)max_chain_count
+																 * sizeof(*state->chain_indices));
+			if (state->chain_indices == NULL) {
+				detail = RF_PAGE_PROOF_DETAIL_OOM;
+				goto done;
+			}
+			for (i = 0; i < target_count; i++) {
+				detail = rf_page_stable_base_proof_build_sources_v1(
+					state->views[i].graph, authority, participant_count, state->chain_indices,
+					max_chain_count, &state->proofs[i]);
+				if (detail != RF_PAGE_PROOF_DETAIL_OK)
+					goto done;
+				state->authority_targets[i].page_identity = state->views[i].page_identity;
+				state->authority_targets[i].expected_result = state->views[i].expected_result;
+				state->authority_targets[i].stable_base = state->proofs[i];
+				state->authority_targets[i].source = state->views[i].source;
+				state->authority_targets[i].contributors = state->views[i].contributors;
+				state->components[i].page_identity = state->views[i].page_identity;
+				state->components[i].before_kind = state->views[i].before_kind;
+				state->components[i].expected_before = state->views[i].expected_before;
+				state->components[i].expected_result = state->views[i].expected_result;
+				state->components[i].canonical_page = state->views[i].canonical_page;
+			}
+			memset(&authority_request, 0, sizeof(authority_request));
+			authority_request.targets = state->authority_targets;
+			authority_request.target_count = target_count;
+			authority_request.source_authorities = authority;
+			authority_request.participant_count = participant_count;
+			detail = fabric_apply_map_authority(rf_page_authority_batch_preflight_wait_v1(
+				&authority_request, 1000, &state->page_preflight));
 			if (detail != RF_PAGE_PROOF_DETAIL_OK)
 				goto done;
-			state.authority_targets[i].page_identity = state.views[i].page_identity;
-			state.authority_targets[i].expected_result = state.views[i].expected_result;
-			state.authority_targets[i].stable_base = state.proofs[i];
-			state.authority_targets[i].source = state.views[i].source;
-			state.authority_targets[i].contributors = state.views[i].contributors;
-			state.components[i].page_identity = state.views[i].page_identity;
-			state.components[i].before_kind = state.views[i].before_kind;
-			state.components[i].expected_before = state.views[i].expected_before;
-			state.components[i].expected_result = state.views[i].expected_result;
-			state.components[i].canonical_page = state.views[i].canonical_page;
+			if (!rf_page_install_authority_adapter_init_v1(
+					state->page_preflight, authority->serial_guard, &page_adapter)) {
+				detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
+				goto done;
+			}
+			memset(&install_request, 0, sizeof(install_request));
+			install_request.components = state->components;
+			install_request.component_count = target_count;
+			install_request.prepared_pages = state->prepared_pages;
+			install_request.prepared_capacity = page_bytes;
+			install_request.io_pages = state->io_pages;
+			install_request.io_capacity = page_bytes;
+			install_request.authority = &page_adapter.ops;
+			install_request.global_preflight_ok = true;
+			detail = rf_page_storage_smgr_preopen_v1(&install_request, &state->smgr_preopen);
+			if (detail != RF_PAGE_PROOF_DETAIL_OK)
+				goto done;
 		}
-		memset(&authority_request, 0, sizeof(authority_request));
-		authority_request.targets = state.authority_targets;
-		authority_request.target_count = target_count;
-		authority_request.source_authorities = authority;
-		authority_request.participant_count = participant_count;
-		detail = fabric_apply_map_authority(rf_page_authority_batch_preflight_wait_v1(
-			&authority_request, 1000, &state.page_preflight));
-		if (detail != RF_PAGE_PROOF_DETAIL_OK)
-			goto done;
-		if (!rf_page_install_authority_adapter_init_v1(state.page_preflight,
-													   authority->serial_guard, &page_adapter)) {
-			detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
-			goto done;
-		}
-		memset(&install_request, 0, sizeof(install_request));
-		install_request.components = state.components;
-		install_request.component_count = target_count;
-		install_request.prepared_pages = state.prepared_pages;
-		install_request.prepared_capacity = page_bytes;
-		install_request.io_pages = state.io_pages;
-		install_request.io_capacity = page_bytes;
-		install_request.authority = &page_adapter.ops;
-		install_request.global_preflight_ok = true;
-		detail = rf_page_storage_smgr_preopen_v1(&install_request, &state.smgr_preopen);
-		if (detail != RF_PAGE_PROOF_DETAIL_OK)
-			goto done;
-	}
 
-	for (i = 0; i < participant_count; i++) {
+		for (i = 0; i < participant_count; i++) {
+			if (!fabric_apply_sources_fresh(authority, count)) {
+				detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+				goto done;
+			}
+			detail
+				= fabric_apply_side_origin(side_plan, &authority[i], (uint32)current_epoch, true);
+			if (detail != RF_PAGE_PROOF_DETAIL_OK)
+				goto done;
+		}
 		if (!fabric_apply_sources_fresh(authority, count)) {
 			detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 			goto done;
 		}
-		detail = fabric_apply_side_origin(side_plan, &authority[i], (uint32)current_epoch, true);
-		if (detail != RF_PAGE_PROOF_DETAIL_OK)
-			goto done;
-	}
-	if (!fabric_apply_sources_fresh(authority, count)) {
-		detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
-		goto done;
-	}
-	if (target_count > 0) {
-		memset(&install_proof, 0, sizeof(install_proof));
-		detail = rf_page_storage_install_smgr_preopened_v1(&install_request, state.smgr_preopen,
-														   &install_proof);
-		if (detail != RF_PAGE_PROOF_DETAIL_OK)
-			goto done;
-		completed.page_write_count = install_proof.write_count;
-		completed.page_result_skip_count = install_proof.result_skip_count;
-		completed.page_durability_complete = install_proof.durability_complete;
-		completed.page_postread_complete = install_proof.postread_complete;
-		if (!install_proof.proof_published || !install_proof.authority_released
-			|| !completed.page_durability_complete || !completed.page_postread_complete) {
-			detail = RF_PAGE_PROOF_DETAIL_POSTREAD_FAILED;
-			goto done;
+		if (target_count > 0) {
+			memset(&install_proof, 0, sizeof(install_proof));
+			detail = rf_page_storage_install_smgr_preopened_v1(&install_request,
+															   state->smgr_preopen, &install_proof);
+			if (detail != RF_PAGE_PROOF_DETAIL_OK)
+				goto done;
+			completed.page_write_count = install_proof.write_count;
+			completed.page_result_skip_count = install_proof.result_skip_count;
+			completed.page_durability_complete = install_proof.durability_complete;
+			completed.page_postread_complete = install_proof.postread_complete;
+			if (!install_proof.proof_published || !install_proof.authority_released
+				|| !completed.page_durability_complete || !completed.page_postread_complete) {
+				detail = RF_PAGE_PROOF_DETAIL_POSTREAD_FAILED;
+				goto done;
+			}
 		}
-	}
-	for (i = 0; i < participant_count; i++) {
+		for (i = 0; i < participant_count; i++) {
+			if (!fabric_apply_sources_fresh(authority, count)) {
+				detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+				goto done;
+			}
+			detail
+				= fabric_apply_side_origin(side_plan, &authority[i], (uint32)current_epoch, false);
+			if (detail != RF_PAGE_PROOF_DETAIL_OK)
+				goto done;
+		}
+		completed.side_apply_complete = true;
 		if (!fabric_apply_sources_fresh(authority, count)) {
 			detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 			goto done;
 		}
-		detail = fabric_apply_side_origin(side_plan, &authority[i], (uint32)current_epoch, false);
-		if (detail != RF_PAGE_PROOF_DETAIL_OK)
-			goto done;
-	}
-	completed.side_apply_complete = true;
-	if (!fabric_apply_sources_fresh(authority, count)) {
-		detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
-		goto done;
-	}
-	*result = completed;
-	detail = RF_PAGE_PROOF_DETAIL_OK;
+		detail = RF_PAGE_PROOF_DETAIL_OK;
 
-done:
-	fabric_apply_state_free(&state, target_count);
+	done:;
+	}
+	PG_FINALLY();
+	{
+		fabric_apply_state_free(state, target_count);
+		fabric_apply_free(state);
+	}
+	PG_END_TRY();
+	if (detail == RF_PAGE_PROOF_DETAIL_OK)
+		*result = completed;
 	return detail;
 }
 

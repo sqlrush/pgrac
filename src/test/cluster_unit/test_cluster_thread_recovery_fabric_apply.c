@@ -15,6 +15,16 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack == NULL)
+		abort();
+	siglongjmp(*PG_exception_stack, 1);
+}
 
 void
 ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
@@ -48,6 +58,15 @@ static uint32 participant_count;
 static uint32 side_preflight_calls, side_apply_calls;
 static uint16 refuse_thread, stale_thread;
 static bool stale_after_page, stale_after_side;
+static int throw_at;
+static unsigned live_proofs, live_preflights, live_preopens;
+
+static void
+throw_if(int stage)
+{
+	if (throw_at == stage)
+		pg_re_throw();
+}
 
 const RfPageOnlinePlanV1 *
 cluster_thread_recovery_fabric_page_plan_v1(const ClusterThreadRecoveryFabricPlanV1 *plan)
@@ -159,13 +178,17 @@ rf_page_stable_base_proof_build_sources_v1(const RfPageStableGraphRequestV1 *gra
 	index = graph == &graphs[0] ? 0 : (graph == &graphs[1] ? 1 : -1);
 	UT_ASSERT(index >= 0);
 	*out_proof = (RfPageStableBaseProofV1 *)&proof_objects[index];
+	live_proofs++;
 	proof_step = ++step;
+	throw_if(1);
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
 void
 rf_page_stable_base_proof_destroy_v1(RfPageStableBaseProofV1 **proof)
 {
+	UT_ASSERT(*proof != NULL && live_proofs > 0);
+	live_proofs--;
 	*proof = NULL;
 }
 
@@ -185,12 +208,16 @@ rf_page_authority_batch_preflight_wait_v1(const RfPageAuthorityBatchRequestV1 *r
 	}
 	page_preflight_step = ++step;
 	*out_preflight = (RfPageAuthorityPreflightV1 *)&preflight_object;
+	live_preflights++;
+	throw_if(2);
 	return RF_PAGE_AUTHORITY_OK;
 }
 
 void
 rf_page_authority_preflight_destroy_v1(RfPageAuthorityPreflightV1 **preflight)
 {
+	UT_ASSERT(*preflight != NULL && live_preflights > 0);
+	live_preflights--;
 	*preflight = NULL;
 }
 
@@ -214,12 +241,16 @@ rf_page_storage_smgr_preopen_v1(const RfPageStorageInstallRequestV1 *request,
 			  && request->storage == NULL);
 	preopen_step = ++step;
 	*out_preopen = (RfPageSmgrPreopenV1 *)&preopen_object;
+	live_preopens++;
+	throw_if(3);
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
 void
 rf_page_storage_smgr_preopen_destroy_v1(RfPageSmgrPreopenV1 **preopen)
 {
+	UT_ASSERT(*preopen != NULL && live_preopens > 0);
+	live_preopens--;
 	*preopen = NULL;
 }
 
@@ -231,6 +262,7 @@ rf_page_storage_install_smgr_preopened_v1(const RfPageStorageInstallRequestV1 *r
 	UT_ASSERT(request != NULL && preopen == (RfPageSmgrPreopenV1 *)&preopen_object
 			  && side_preflight_step != 0 && side_preflight_step < step + 1);
 	page_install_step = ++step;
+	throw_if(5);
 	if (stale_after_page)
 		stale_thread = 2;
 	memset(proof, 0, sizeof(*proof));
@@ -273,6 +305,7 @@ rf_side_online_production_preflight_v1(const RfSideOnlinePlanV1 *plan,
 	UT_ASSERT(owner->undo_authority != NULL && owner->undo_authority == owner->authority_arg);
 	side_preflight_step = ++step;
 	side_preflight_calls++;
+	throw_if(4);
 	return side_preflight_ok && owner->undo_authority->duty->origin_thread_id != refuse_thread
 			   ? RF_PAGE_PROOF_DETAIL_OK
 			   : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
@@ -285,6 +318,7 @@ rf_side_online_production_apply_v1(const RfSideOnlinePlanV1 *plan,
 	UT_ASSERT(plan == (const RfSideOnlinePlanV1 *)&side_plan_object && owner != NULL);
 	side_apply_step = ++step;
 	side_apply_calls++;
+	throw_if(6);
 	if (stale_after_side)
 		stale_thread = 2;
 	return RF_PAGE_PROOF_DETAIL_OK;
@@ -350,6 +384,8 @@ init_case(ClusterThreadRecoveryAuthorityV1 *authority)
 	side_preflight_calls = side_apply_calls = 0;
 	refuse_thread = stale_thread = 0;
 	stale_after_page = stale_after_side = false;
+	throw_at = 0;
+	live_proofs = live_preflights = live_preopens = 0;
 }
 
 typedef struct FabricSources {
@@ -526,10 +562,39 @@ UT_TEST(test_retained_cut_mismatch_blocks_before_any_target_preflight)
 	UT_ASSERT_EQ(side_apply_step, 0);
 }
 
+UT_TEST(test_error_at_every_owned_stage_releases_all_fabric_state)
+{
+	for (int stage = 1; stage <= 6; stage++) {
+		ClusterThreadRecoveryAuthorityV1 authority;
+		ClusterThreadRecoveryFabricApplyResultV1 result, zero = { 0 };
+		volatile bool caught = false;
+
+		init_case(&authority);
+		throw_at = stage;
+		memset(&result, 0xa5, sizeof(result));
+		PG_TRY();
+		{
+			(void)cluster_thread_recovery_fabric_apply_v1(
+				(const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object, &authority, &result);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(live_proofs, 0);
+		UT_ASSERT_EQ(live_preflights, 0);
+		UT_ASSERT_EQ(live_preopens, 0);
+		UT_ASSERT(memcmp(&result, &zero, sizeof(result)) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
+	UT_RUN(test_error_at_every_owned_stage_releases_all_fabric_state);
 	UT_RUN(test_multi_source_fabric_preflights_every_origin_before_page_and_side);
 	UT_RUN(test_multi_source_fabric_late_preflight_refusal_leaves_all_targets_untouched);
 	UT_RUN(test_multi_source_fabric_rechecks_prior_sources_between_owners);

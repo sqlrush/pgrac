@@ -317,7 +317,8 @@ struct RfPageSmgrPreopenV1 {
 
 typedef struct RfPageSmgrAuthorityContextV1 {
 	const RfPageInstallAuthorityOpsV1 *delegate;
-	bool promoted;
+	/* Read after the PG_TRY longjmp when storage or post-read throws. */
+	volatile bool promoted;
 } RfPageSmgrAuthorityContextV1;
 
 static SMgrRelation

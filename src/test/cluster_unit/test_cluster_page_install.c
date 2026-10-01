@@ -93,11 +93,14 @@ typedef struct InstallCase {
 #include "test_cluster_page_install_smgr_types.inc"
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
+static int throw_at;
 
 void
 pg_re_throw(void)
 {
-	abort();
+	if (PG_exception_stack == NULL)
+		abort();
+	siglongjmp(*PG_exception_stack, 1);
 }
 
 bool
@@ -142,6 +145,9 @@ storage_read(void *arg, uint32 index, const RfPageIdentityV1 *identity, char pag
 
 	fixture->step++;
 	fixture->read_calls++;
+	if ((throw_at == 1 && fixture->read_calls <= (int)fixture->initial_read_count)
+		|| (throw_at == 4 && fixture->read_calls > (int)fixture->initial_read_count))
+		pg_re_throw();
 	if (fixture->read_calls <= (int)fixture->initial_read_count) {
 		if (fixture->first_initial_read_step == 0)
 			fixture->first_initial_read_step = fixture->step;
@@ -172,6 +178,8 @@ storage_write(void *arg, uint32 index, const RfPageIdentityV1 *identity, const c
 	if (fixture->first_write_step == 0)
 		fixture->first_write_step = fixture->step;
 	fixture->write_calls++;
+	if (throw_at == 2)
+		pg_re_throw();
 	fixture->last_extend = extend;
 	if (!fixture->write_ok[index])
 		return false;
@@ -187,6 +195,8 @@ storage_sync(void *arg, uint32 index, const RfPageIdentityV1 *identity)
 
 	fixture->step++;
 	fixture->sync_calls++;
+	if (throw_at == 3)
+		pg_re_throw();
 	return fixture->sync_ok[index];
 }
 
@@ -264,6 +274,8 @@ authority_publish(void *arg)
 
 	fixture->step++;
 	fixture->publish_calls++;
+	if (throw_at == 5)
+		pg_re_throw();
 	return fixture->publish_ok;
 }
 
@@ -455,6 +467,38 @@ UT_TEST(test_native_smgr_wrapper_preserves_optional_ancestor_proof)
 	}
 }
 
+UT_TEST(test_native_smgr_error_releases_promoted_authority)
+{
+	for (int stage = 1; stage <= 5; stage++) {
+		InstallCase *test_case = calloc(1, sizeof(*test_case));
+		RfPageStorageInstallProofV1 proof = { 0 }, zero = { 0 };
+		RfPageSmgrPreopenV1 preopen = { 0 };
+		volatile bool caught = false;
+
+		if (test_case == NULL)
+			abort();
+		init_case(test_case, 1);
+		test_case->request.storage = NULL;
+		preopen.request = &test_case->request;
+		throw_at = stage;
+		PG_TRY();
+		{
+			(void)rf_page_storage_install_smgr_preopened_v1(&test_case->request, &preopen, &proof);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		throw_at = 0;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(test_case->fixture.promote_calls, 1);
+		UT_ASSERT_EQ(test_case->fixture.release_calls, 1);
+		UT_ASSERT(memcmp(&proof, &zero, sizeof(proof)) == 0);
+		free(test_case);
+	}
+}
+
 UT_TEST(test_noncanonical_result_target_blocks_whole_batch_before_promote)
 {
 	InstallCase test_case;
@@ -620,12 +664,13 @@ UT_TEST(test_reserved_and_nonordinary_fork_are_rejected)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(test_expected_target_write_sync_postread_publish_release);
 	UT_RUN(test_result_target_skips_write_but_proves_durability);
 	UT_RUN(test_proven_intermediate_version_is_reconstructed);
 	UT_RUN(test_intermediate_requires_exact_proof_for_every_target);
 	UT_RUN(test_native_smgr_wrapper_preserves_optional_ancestor_proof);
+	UT_RUN(test_native_smgr_error_releases_promoted_authority);
 	UT_RUN(test_noncanonical_result_target_blocks_whole_batch_before_promote);
 	UT_RUN(test_absent_target_extends_only_for_absent_edge);
 	UT_RUN(test_absent_target_with_present_edge_is_zero_mutation);
