@@ -302,8 +302,9 @@ record_identity_validate(RfPageOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 
 		|| identity->participant_index >= plan->participant_count
 		|| record->system_identifier != plan->system_identifier
 		|| memcmp(record->storage_uuid, plan->storage_uuid, 16) != 0 || record->origin_thread == 0
-		|| record->timeline_id == 0 || record->read_rec_ptr == InvalidXLogRecPtr
-		|| record->end_rec_ptr == InvalidXLogRecPtr || record->read_rec_ptr >= record->end_rec_ptr
+		|| record->origin_thread > PGRAC_PAGE_LSN_ORIGIN_MAX + 1 || record->timeline_id == 0
+		|| record->read_rec_ptr == InvalidXLogRecPtr || record->end_rec_ptr == InvalidXLogRecPtr
+		|| record->read_rec_ptr >= record->end_rec_ptr
 		|| reader->system_identifier != record->system_identifier
 		|| reader->ReadRecPtr != record->read_rec_ptr || reader->EndRecPtr != record->end_rec_ptr
 		|| decoded->lsn != record->read_rec_ptr || decoded->next_lsn != record->end_rec_ptr
@@ -478,6 +479,26 @@ apply_ordered_record(RfPageOnlinePlanV1 *plan,
 			}
 			old_page = item->target->canonical.data;
 		}
+		/* A closed contribution chain can never revisit a version. An
+		 * image does not make such an alias safe for later DATA receipts. */
+		if (rf_page_version_equal_v1(&component->before, &component->result)
+			|| (!item->new_target
+				&& rf_page_version_equal_v1(&item->target->view.expected_before,
+											&component->result))) {
+			detail = RF_PAGE_PROOF_DETAIL_EDGE_CYCLE;
+			goto fail;
+		}
+		for (j = 0; j < item->target->edge_count; j++) {
+			const RfPageStableEdgeInputV1 *previous = &item->target->edges[j];
+
+			if (previous->result_token == component->result.mutation_token
+				&& memcmp(previous->edge.result_incarnation, component->result.segment_incarnation,
+						  16)
+					   == 0) {
+				detail = RF_PAGE_PROOF_DETAIL_EDGE_CYCLE;
+				goto fail;
+			}
+		}
 		detail = rf_page_detached_apply_v1(record_plan, i, old_page, item->canonical.data);
 		if (detail != RF_PAGE_PROOF_DETAIL_OK)
 			goto fail;
@@ -485,6 +506,13 @@ apply_ordered_record(RfPageOnlinePlanV1 *plan,
 			|| ((PageHeader)item->canonical.data)->pd_block_scn
 				   != component->result.mutation_token) {
 			detail = RF_PAGE_PROOF_DETAIL_IMAGE_INTEGRITY_FAILED;
+			goto fail;
+		}
+		/* Detached PG redo may run in a merged window and stamp the local
+		 * process's coordinate. Canonical bytes retain their exact source. */
+		PageSetLSNPreserveOrigin(item->canonical.data, identity->record.end_rec_ptr);
+		if (!PageSetLSNOrigin(item->canonical.data, identity->record.origin_thread - 1)) {
+			detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 			goto fail;
 		}
 		item->edge.page_identity = page_identity;
@@ -881,6 +909,81 @@ rf_page_online_plan_target_v1(const RfPageOnlinePlanV1 *plan, uint32 index,
 		|| index >= plan->target_count || out_target == NULL)
 		return false;
 	*out_target = plan->targets[index]->view;
+	return true;
+}
+
+bool
+rf_page_online_plan_page_prefix_v1(const RfPageOnlinePlanV1 *plan,
+								   const RfPageDataCoverageV1 *coverage, uint32 coverage_count,
+								   RfPageContributionPrefixV1 *prefixes, uint32 participant_count)
+{
+	RfPageContributionPrefixV1 candidate[RF_PAGE_STABLE_MAX_PARTICIPANTS] = { { 0 } };
+	uint32 next_coverage = 0;
+
+	if (plan == NULL || plan->magic != RF_PAGE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| prefixes == NULL || participant_count != plan->participant_count
+		|| participant_count == 0 || participant_count > RF_PAGE_STABLE_MAX_PARTICIPANTS
+		|| coverage_count > plan->target_count || (coverage_count != 0 && coverage == NULL))
+		return false;
+	for (uint32 i = 0; i < coverage_count; i++)
+		if (!rf_page_identity_valid_v1(&coverage[i].page_identity)
+			|| !rf_page_version_present_v1(&coverage[i].version)
+			|| (i > 0
+				&& identity_compare(&coverage[i - 1].page_identity, &coverage[i].page_identity)
+					   >= 0))
+			return false;
+	for (uint32 i = 0; i < participant_count; i++) {
+		candidate[i].origin_thread = plan->physical_cuts[i].failed_thread;
+		candidate[i].timeline = plan->physical_cuts[i].timeline_id;
+		candidate[i].first_uncovered_lsn = plan->physical_cuts[i].scan_end_exclusive;
+	}
+	for (uint32 i = 0; i < plan->target_count; i++) {
+		const RfPageOnlineTargetV1 *target = plan->targets[i];
+		uint32 covered_edges = 0;
+
+		if (next_coverage < coverage_count) {
+			const RfPageDataCoverageV1 *observed = &coverage[next_coverage];
+			int cmp = identity_compare(&observed->page_identity, &target->view.page_identity);
+
+			if (cmp < 0)
+				return false; /* Completion for an object outside this closed input. */
+			if (cmp == 0) {
+				bool found = target->view.before_kind == RF_PAGE_STATE_PRESENT
+							 && rf_page_version_equal_v1(&observed->version,
+														 &target->view.expected_before);
+
+				for (uint32 j = 0; j < target->edge_count; j++) {
+					const RfPageStableEdgeInputV1 *edge = &target->edges[j];
+
+					if (observed->version.mutation_token == edge->result_token
+						&& memcmp(observed->version.segment_incarnation,
+								  edge->edge.result_incarnation, 16)
+							   == 0) {
+						if (found)
+							return false;
+						found = true;
+						covered_edges = j + 1;
+					}
+				}
+				if (!found)
+					return false;
+				next_coverage++;
+			}
+		}
+		/* Keep the first unresolved record in each ORIGINAL stream. Taking
+		 * the max acknowledged LSN would jump over another page's hole or
+		 * an uncompleted component of the very same multi-page record. */
+		for (uint32 j = covered_edges; j < target->edge_count; j++) {
+			const RfPageStableEdgeInputV1 *edge = &target->edges[j];
+			RfPageContributionPrefixV1 *prefix = &candidate[edge->participant_index];
+
+			prefix->first_uncovered_lsn
+				= Min(prefix->first_uncovered_lsn, edge->record_identity.read_rec_ptr);
+		}
+	}
+	if (next_coverage != coverage_count)
+		return false;
+	memcpy(prefixes, candidate, participant_count * sizeof(*prefixes));
 	return true;
 }
 

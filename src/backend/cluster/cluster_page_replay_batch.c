@@ -269,7 +269,8 @@ validate_record_table(const RfPageReplayBatchRequestV1 *request)
 		cut = &request->participants[record->participant_index];
 		if (identity->system_identifier != request->system_identifier
 			|| memcmp(identity->storage_uuid, request->storage_uuid, 16) != 0
-			|| identity->origin_thread != cut->failed_thread
+			|| identity->origin_thread != cut->failed_thread || identity->origin_thread == 0
+			|| identity->origin_thread > PGRAC_PAGE_LSN_ORIGIN_MAX + 1
 			|| identity->timeline_id != cut->timeline_id || identity->reserved_zero != 0
 			|| identity->reserved_zero2 != 0 || XLogRecPtrIsInvalid(identity->read_rec_ptr)
 			|| XLogRecPtrIsInvalid(identity->end_rec_ptr)
@@ -379,13 +380,16 @@ rf_page_replay_batch_run(const RfPageReplayBatchRequestV1 *request, RfPageReplay
 
 		memcpy(canonical, target->base_page, BLCKSZ);
 		for (j = 0; j < target->step_count; j++) {
-			const RfDetachedRecordPlanV1 *plan
-				= request->records[target->steps[j].record_index].record_plan;
+			const RfPageReplayRecordV1 *source = &request->records[target->steps[j].record_index];
+			const RfDetachedRecordPlanV1 *plan = source->record_plan;
 
 			detail = rf_page_detached_apply_v1(plan, target->steps[j].component_index, canonical,
 											   canonical);
 			if (detail != RF_PAGE_PROOF_DETAIL_OK)
 				return detail;
+			PageSetLSNPreserveOrigin(canonical, source->identity.end_rec_ptr);
+			if (!PageSetLSNOrigin(canonical, source->identity.origin_thread - 1))
+				return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 		}
 		if (page_all_zero(canonical) || !page_layout_valid(canonical)
 			|| ((PageHeader)canonical)->pd_block_scn != target->expected_result.mutation_token)

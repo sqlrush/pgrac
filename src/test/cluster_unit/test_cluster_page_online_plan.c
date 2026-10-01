@@ -468,10 +468,213 @@ UT_TEST(test_ordered_side_only_feed_cannot_mix_with_queued_input)
 	rf_page_online_plan_destroy_v1(&plan);
 }
 
+static RfPageOnlinePlanV1 *
+prefix_plan(void)
+{
+	RfPageOnlinePlanV1 *plan = three_stream_plan();
+	FakeRecord record;
+
+	init_record(&record, 0x100, 0x200, 2);
+	set_component(&record, 0, 10, 1, 60, 7, false);
+	set_component(&record, 1, 10, 2, 500, 7, true);
+	UT_ASSERT_EQ(queue_record(plan, &record, 2), RF_PAGE_PROOF_DETAIL_OK);
+	init_record(&record, 0x100, 0x200, 1);
+	set_component(&record, 0, 10, 1, 900, 60, false);
+	UT_ASSERT_EQ(queue_record(plan, &record, 1), RF_PAGE_PROOF_DETAIL_OK);
+	init_record(&record, 0x100, 0x200, 1);
+	set_component(&record, 0, 10, 1, 10, 900, true);
+	UT_ASSERT_EQ(queue_record(plan, &record, 0), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+UT_TEST(test_page_prefix_exact_ancestry_and_multi_page_record)
+{
+	RfPageOnlinePlanV1 *plan = prefix_plan();
+	RfPageContributionPrefixV1 prefixes[3] = { { 0 } };
+	RfPageDataCoverageV1 coverage[2];
+	RfPageOnlineTargetViewV1 target;
+	uint64 tokens[] = { 900, 60, 7 };
+
+	UT_ASSERT(rf_page_online_plan_page_prefix_v1(plan, NULL, 0, prefixes, 3));
+	for (int i = 0; i < 3; i++) {
+		UT_ASSERT_EQ(prefixes[i].origin_thread, i + 1);
+		UT_ASSERT_EQ(prefixes[i].timeline, 1);
+		UT_ASSERT_EQ(prefixes[i].first_uncovered_lsn, 0x100);
+	}
+	for (int i = 0; i < 2; i++) {
+		UT_ASSERT(rf_page_online_plan_target_v1(plan, i, &target));
+		coverage[i].page_identity = target.page_identity;
+		coverage[i].version = target.expected_result;
+	}
+	for (int n = 0; n < 3; n++) {
+		coverage[0].version.mutation_token = tokens[n];
+		UT_ASSERT(rf_page_online_plan_page_prefix_v1(plan, coverage, 1, prefixes, 3));
+		UT_ASSERT_EQ(prefixes[0].first_uncovered_lsn, 0x200);
+		UT_ASSERT_EQ(prefixes[1].first_uncovered_lsn, n == 0 ? 0x100 : 0x200);
+		/* C's second component still has no DATA completion. */
+		UT_ASSERT_EQ(prefixes[2].first_uncovered_lsn, 0x100);
+	}
+	UT_ASSERT(rf_page_online_plan_page_prefix_v1(plan, coverage, 2, prefixes, 3));
+	for (int i = 0; i < 3; i++)
+		UT_ASSERT_EQ(prefixes[i].first_uncovered_lsn, 0x200);
+	/* A delayed old receipt cannot consume the later B/C obligations. */
+	coverage[0].version.mutation_token = 900;
+	UT_ASSERT(rf_page_online_plan_page_prefix_v1(plan, coverage, 2, prefixes, 3));
+	UT_ASSERT_EQ(prefixes[1].first_uncovered_lsn, 0x100);
+	UT_ASSERT_EQ(prefixes[2].first_uncovered_lsn, 0x100);
+	rf_page_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_page_prefix_rejects_unknown_without_publication)
+{
+	for (int variant = 0; variant < 8; variant++) {
+		RfPageOnlinePlanV1 *plan = prefix_plan();
+		RfPageContributionPrefixV1 prefixes[3], sentinel[3];
+		RfPageDataCoverageV1 coverage[2];
+		RfPageOnlineTargetViewV1 target;
+		for (int i = 0; i < 2; i++) {
+			UT_ASSERT(rf_page_online_plan_target_v1(plan, i, &target));
+			coverage[i].page_identity = target.page_identity;
+			coverage[i].version = target.expected_result;
+		}
+		memset(prefixes, 0xa5, sizeof(prefixes));
+		memcpy(sentinel, prefixes, sizeof(prefixes));
+		if (variant == 0)
+			coverage[0].version.mutation_token = UINT64_MAX;
+		if (variant == 1)
+			coverage[0].version.segment_incarnation[0]++;
+		if (variant == 2)
+			coverage[0].page_identity.storage_uuid[0]++;
+		if (variant == 3)
+			coverage[1] = coverage[0];
+		if (variant == 4) {
+			RfPageDataCoverageV1 swap = coverage[0];
+			coverage[0] = coverage[1];
+			coverage[1] = swap;
+		}
+		if (variant == 5)
+			coverage[1].page_identity.blockno++;
+		if (variant == 6)
+			coverage[0].page_identity.reserved_zero = 1;
+		UT_ASSERT(
+			!rf_page_online_plan_page_prefix_v1(plan, coverage, 2, prefixes, variant == 7 ? 2 : 3));
+		UT_ASSERT(memcmp(prefixes, sentinel, sizeof(prefixes)) == 0);
+		rf_page_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_page_prefix_hole_and_empty_source)
+{
+	RfPageOnlinePlanV1 *plan = create_plan(0x100, 0x500);
+	RfPageContributionPrefixV1 prefix = { 0 };
+	RfPageDataCoverageV1 coverage;
+	RfPageOnlineTargetViewV1 target;
+	FakeRecord record;
+	RfPageOnlineRecordIdentityV1 id;
+
+	init_record(&record, 0x100, 0x200, 0);
+	id = record_identity(&record);
+	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	init_record(&record, 0x200, 0x300, 1);
+	set_component(&record, 0, 10, 1, 10, 900, true);
+	id = record_identity(&record);
+	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	init_record(&record, 0x300, 0x400, 1);
+	set_component(&record, 0, 10, 2, 20, 7, true);
+	id = record_identity(&record);
+	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	init_record(&record, 0x400, 0x500, 0);
+	id = record_identity(&record);
+	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(!rf_page_online_plan_page_prefix_v1(plan, NULL, 0, &prefix, 1));
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_page_online_plan_target_v1(plan, 1, &target));
+	coverage.page_identity = target.page_identity;
+	coverage.version = target.expected_result;
+	UT_ASSERT(rf_page_online_plan_page_prefix_v1(plan, &coverage, 1, &prefix, 1));
+	UT_ASSERT_EQ(prefix.first_uncovered_lsn, 0x200);
+	UT_ASSERT(rf_page_online_plan_target_v1(plan, 0, &target));
+	coverage.page_identity = target.page_identity;
+	coverage.version = target.expected_result;
+	UT_ASSERT(rf_page_online_plan_page_prefix_v1(plan, &coverage, 1, &prefix, 1));
+	UT_ASSERT_EQ(prefix.first_uncovered_lsn, 0x300);
+	rf_page_online_plan_destroy_v1(&plan);
+	plan = create_plan(0x100, 0x200);
+	init_record(&record, 0x100, 0x200, 0);
+	id = record_identity(&record);
+	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_page_online_plan_page_prefix_v1(plan, NULL, 0, &prefix, 1));
+	UT_ASSERT_EQ(prefix.first_uncovered_lsn, 0x200);
+	rf_page_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_repeated_version_cannot_form_sealed_ancestry)
+{
+	RfPageOnlinePlanV1 *plan = create_plan(0x100, 0x400);
+	FakeRecord record;
+	RfPageOnlineRecordIdentityV1 id;
+	init_record(&record, 0x100, 0x200, 1);
+	set_component(&record, 0, 10, 1, 10, 900, true);
+	id = record_identity(&record);
+	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	init_record(&record, 0x200, 0x300, 1);
+	set_component(&record, 0, 10, 1, 900, 60, false);
+	id = record_identity(&record);
+	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	init_record(&record, 0x300, 0x400, 1);
+	set_component(&record, 0, 10, 1, 60, 900, false);
+	id = record_identity(&record);
+	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
+				 RF_PAGE_PROOF_DETAIL_EDGE_CYCLE);
+	set_component(&record, 0, 10, 1, 60, 10, false);
+	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
+				 RF_PAGE_PROOF_DETAIL_EDGE_CYCLE);
+	set_component(&record, 0, 10, 1, 60, 7, false);
+	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	rf_page_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_source_origin_must_fit_page_coordinate)
+{
+	RfContributorStreamCutV1 cut = { .failed_thread = PGRAC_PAGE_LSN_ORIGIN_MAX + 2,
+									 .timeline_id = 1,
+									 .flags = RF_CONTRIBUTOR_CUT_COMPLETE,
+									 .scan_begin_inclusive = 0x100,
+									 .scan_end_exclusive = 0x200 };
+	RfPageOnlinePlanRequestV1 request = { .system_identifier = 99,
+										  .physical_cuts = &cut,
+										  .participant_count = 1,
+										  .retention_binding_cookie = 41 };
+	RfPageOnlinePlanV1 *plan = NULL;
+	FakeRecord record;
+	RfPageOnlineRecordIdentityV1 id;
+	memset(request.storage_uuid, 3, 16);
+	UT_ASSERT_EQ(rf_page_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+	init_record(&record, 0x100, 0x200, 1);
+	set_component(&record, 0, 10, 1, 10, 900, true);
+	id = record_identity(&record);
+	id.record.origin_thread = cut.failed_thread;
+	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
+				 RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+	UT_ASSERT_EQ(rf_page_online_plan_target_count_v1(plan), 0);
+	rf_page_online_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(15);
 	UT_RUN(test_two_record_chain_builds_canonical_target);
 	UT_RUN(test_record_failure_is_atomic_and_retryable);
 	UT_RUN(test_first_delta_requires_full_anchor);
@@ -482,6 +685,11 @@ main(void)
 	UT_RUN(test_multi_page_record_waits_for_both_predecessors);
 	UT_RUN(test_closed_input_without_base_has_no_published_target);
 	UT_RUN(test_ordered_side_only_feed_cannot_mix_with_queued_input);
+	UT_RUN(test_page_prefix_exact_ancestry_and_multi_page_record);
+	UT_RUN(test_page_prefix_rejects_unknown_without_publication);
+	UT_RUN(test_page_prefix_hole_and_empty_source);
+	UT_RUN(test_repeated_version_cannot_form_sealed_ancestry);
+	UT_RUN(test_source_origin_must_fit_page_coordinate);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

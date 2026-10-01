@@ -43,6 +43,23 @@ typedef struct RfPageOnlineTargetViewV1 {
 	const RfPageStableGraphRequestV1 *graph;
 } RfPageOnlineTargetViewV1;
 
+/* An exact DATA version qualified by the original write/fsync owner. This
+ * projection alone is not a durability proof or a grant to retire WAL. */
+typedef struct RfPageDataCoverageV1 {
+	RfPageIdentityV1 page_identity;
+	RfPageVersionV1 version;
+} RfPageDataCoverageV1;
+
+/* PAGE-only retention constraint in one original physical cut. The caller
+ * retains that cut's full source identity/authority and combines this with
+ * every SIDE, ROOT and other retention obligation before publishing a floor. */
+typedef struct RfPageContributionPrefixV1 {
+	uint16 origin_thread;
+	uint16 reserved_zero;
+	TimeLineID timeline;
+	XLogRecPtr first_uncovered_lsn;
+} RfPageContributionPrefixV1;
+
 extern RfPageProofDetailV1 rf_page_online_plan_create_v1(const RfPageOnlinePlanRequestV1 *request,
 														 RfPageOnlinePlanV1 **out_plan);
 extern RfPageProofDetailV1
@@ -59,6 +76,15 @@ extern RfPageProofDetailV1 rf_page_online_plan_seal_v1(RfPageOnlinePlanV1 *plan)
 extern uint32 rf_page_online_plan_target_count_v1(const RfPageOnlinePlanV1 *plan);
 extern bool rf_page_online_plan_target_v1(const RfPageOnlinePlanV1 *plan, uint32 index,
 										  RfPageOnlineTargetViewV1 *out_target);
+/* Pure, sealed-input projection. Coverage must be sorted by page identity,
+ * unique and already qualified by the physical owner. Unknown versions never
+ * imply coverage; every failure leaves the output unchanged. No data I/O,
+ * authority acquisition, root publication or WAL retirement occurs here. */
+extern bool rf_page_online_plan_page_prefix_v1(const RfPageOnlinePlanV1 *plan,
+											   const RfPageDataCoverageV1 *coverage,
+											   uint32 coverage_count,
+											   RfPageContributionPrefixV1 *prefixes,
+											   uint32 participant_count);
 extern void rf_page_online_plan_destroy_v1(RfPageOnlinePlanV1 **plan);
 
 #endif /* CLUSTER_PAGE_ONLINE_PLAN_H */

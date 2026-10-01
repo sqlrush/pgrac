@@ -256,6 +256,10 @@ UT_TEST(test_original_root_scanner_resolves_reverse_three_origin_native_page_cha
 	uint64 records = 0;
 
 	source_failure = 0;
+	cluster_node_id = 4;
+	cluster_recmerge_window_active = cluster_recmerge_apply_foreign = true;
+	cluster_recmerge_window_scn = 12345;
+	cluster_recmerge_window_own_lsn = 0x77;
 	UT_ASSERT_EQ(scan_three_roots(&plan, &records), RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT_EQ(records, 3);
 	UT_ASSERT_EQ(source_visits, 3);
@@ -267,8 +271,17 @@ UT_TEST(test_original_root_scanner_resolves_reverse_three_origin_native_page_cha
 		UT_ASSERT_EQ((uint8)view.canonical_page[BLCKSZ - 3], 0xa1);
 		UT_ASSERT_EQ((uint8)view.canonical_page[BLCKSZ - 2], 0xb2);
 		UT_ASSERT_EQ((uint8)view.canonical_page[BLCKSZ - 1], 0xc3);
+		{
+			int origin = -1;
+			UT_ASSERT_EQ(PageGetLSN((Page)view.canonical_page), 0x200);
+			UT_ASSERT(PageGetLSNOrigin((Page)view.canonical_page, &origin));
+			UT_ASSERT_EQ(origin, 0); /* Final edge is from original thread 1. */
+		}
 	}
 	cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+	cluster_node_id = 0;
+	cluster_recmerge_window_active = cluster_recmerge_apply_foreign = false;
+	cluster_recmerge_window_scn = cluster_recmerge_window_own_lsn = 0;
 }
 
 UT_TEST(test_original_root_scanner_refuses_missing_source_or_version_dependency)
@@ -352,7 +365,8 @@ UT_TEST(test_reverse_real_fpi_delta_chain_owns_reader_bytes)
 	if (rf_page_online_plan_target_v1(plan, 0, &view)) {
 		expected.data[BLCKSZ - 2] = (char)0xb2;
 		expected.data[BLCKSZ - 1] = (char)0xc3;
-		PageSetLSN(expected.data, 0x200);
+		PageSetLSNPreserveOrigin(expected.data, 0x200);
+		UT_ASSERT(PageSetLSNOrigin(expected.data, 2));
 		((PageHeader)expected.data)->pd_block_scn = 7;
 		UT_ASSERT(memcmp(expected.data, view.canonical_page, BLCKSZ) == 0);
 		UT_ASSERT_EQ(view.contributors->edge_count, 3);
