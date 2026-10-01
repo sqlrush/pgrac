@@ -609,9 +609,11 @@ replay_one_block(XLogReaderState *reader, uint8 block_id, char *page, SCN window
 	/*
 	 * PGRAC: spec-6.12h D-h3c — Past Image recovery base (see the function
 	 * header).  Probe is cheap (BufTable lookup); every uncertain outcome
-	 * discards the PI and falls through to the storage path below.
+	 * discards the PI and falls through to the storage path below. Canonical
+	 * shared PI requires an exact master/DATA retirement, so this legacy
+	 * tag-only shortcut cannot consume or discard it across replay records.
 	 */
-	if (cluster_past_image) {
+	if (cluster_past_image && !cluster_shared_config) {
 		BufferTag tag;
 		SCN ship_scn;
 

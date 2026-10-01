@@ -533,7 +533,7 @@ test_invalid_uninitialized_residency_is_not_cached_authority(void)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 	UT_RUN(test_required_init_and_lock_boundary);
 	UT_RUN(test_original_reservation_activation_delivery_completion);
 	UT_RUN(test_original_pi_convert_preserve_discard);

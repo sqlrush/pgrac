@@ -128,6 +128,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_control_walr \
 		test_cluster_control_ir \
 		test_cluster_recovery_cold_cut \
+		test_cluster_thread_replay_pi \
 		test_cluster_shared_config \
 		test_cluster_config_delivery_driver \
 		test_cluster_config_delivery_route \
@@ -517,6 +518,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_control_cf_poll,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_walr,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_ir,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_recovery_cold_cut,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_thread_replay_pi,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_startup_exit,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_members,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_mount,$(SIMPLE_TESTS))
@@ -3484,6 +3486,16 @@ test_cluster_thread_apply: test_cluster_thread_apply.c unit_test.h $(CLUSTER_THR
 # the RMW replay engine makes before touching any page.  No cluster object is
 # needed (the gate is inline); only libpgcommon/libpgport for the unit harness.
 # The engine's byte-for-byte streaming behaviour lands as cluster_tap t/259.
+test_cluster_thread_replay_pi.inc: $(top_srcdir)/src/backend/cluster/cluster_thread_recovery_replay.c Makefile
+	awk '/^replay_one_block\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_thread_replay_pi: test_cluster_thread_replay_pi.c unit_test.h \
+		test_cluster_thread_replay_pi.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
 test_cluster_thread_replay: test_cluster_thread_replay.c unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
