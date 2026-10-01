@@ -44,6 +44,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_page_anchor_cache.h"
 #include "cluster/cluster_page_producer.h"
+#include "cluster/cluster_page_wal.h"
 #include "cluster/storage/cluster_smgr.h"
 #endif
 
@@ -227,6 +228,7 @@ typedef struct
 	bool		apply_image_emitted;
 	bool		page_anchor_key_registered;
 	RfPageAnchorCacheKeyV1 page_anchor_key;
+	Buffer page_version_buffer;
 #endif
 	RelFileLocator rlocator;	/* identifies the relation and block */
 	ForkNumber	forkno;
@@ -457,6 +459,7 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->rdata_len = 0;
 #ifdef USE_PGRAC_CLUSTER
 	regbuf->page_anchor_key_registered = false;
+	regbuf->page_version_buffer = buffer;
 #endif
 
 	/*
@@ -513,6 +516,7 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->rdata_len = 0;
 #ifdef USE_PGRAC_CLUSTER
 	regbuf->page_anchor_key_registered = false;
+	regbuf->page_version_buffer = InvalidBuffer;
 #endif
 
 	/*
@@ -762,6 +766,32 @@ XLogInsert(RmgrId rmid, uint8 info)
 			if (rb->in_use && rb->page_anchor_key_registered)
 				(void) rf_page_anchor_cache_record_v1(&rb->page_anchor_key,
 					true, rb->apply_image_emitted);
+		}
+	}
+	/* Keep the original generation, not just the page header's thread id.
+	 * Assembly retries publish nothing; only this actual successful record
+	 * may bind the registered resident result before ResetInsertion. */
+	if (cluster_shared_config && page_version_edge_registered) {
+		for (uint8 i = 0; i < registered_page_version_entry_count; i++) {
+			const RfPageVersionEdgeEntryV1 *edge = &registered_page_version_entries[i];
+			registered_buffer *rb;
+
+			if (edge->page_class != RF_PAGE_CLASS_ORDINARY)
+				continue;
+			if (edge->block_id >= max_registered_block_id)
+				elog(PANIC, "versioned WAL lost its registered buffer");
+			rb = &registered_buffers[edge->block_id];
+			/* Original private bulk/copy owners retain their own WAL+DATA
+			 * obligations; they are never fabricated as resident buffers. */
+			if (!rb->in_use)
+				elog(PANIC, "versioned WAL lost its registered page");
+			if (rb->page_version_buffer == InvalidBuffer || BufferIsLocal(rb->page_version_buffer))
+				continue;
+			if (!cluster_page_wal_capture_native_v1(
+					rb->page_version_buffer, edge, registered_page_version_result_token,
+					ProcLastRecPtr, EndPos, ((XLogRecord *)hdr_scratch)->xl_crc,
+					((XLogRecord *)hdr_scratch)->xl_rmid, ((XLogRecord *)hdr_scratch)->xl_info))
+				elog(PANIC, "could not bind the exact WAL source of a versioned buffer");
 		}
 	}
 #endif

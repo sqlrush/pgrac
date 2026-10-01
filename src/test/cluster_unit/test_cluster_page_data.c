@@ -9,6 +9,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_page_data.h"
+#include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_space_recovery.h"
@@ -24,6 +25,7 @@
 #include "storage/checksum.h"
 #include "storage/checksum_impl.h"
 #include "storage/smgr.h"
+#include "storage/shmem.h"
 #include "utils/resowner.h"
 #include "unit_test.h"
 
@@ -54,6 +56,8 @@ static FILE *file;
 static SMgrRelationData relation;
 static ClusterPageDataTargetV1 target;
 static ClusterWalSourceRef writer;
+static ClusterPageWalBindingV1 page_sources[2];
+static bool source_capture;
 static ClusterSpaceIdentity identity;
 static bool cluster_pcm_x_finish_retain_flush_active;
 static bool cluster_pcm_x_finish_retain_flush_io_active;
@@ -192,7 +196,7 @@ LWLockHeldByMe(LWLock *lock)
 bool
 LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
 {
-	return LWLockHeldByMe(lock);
+	return LWLockHeldByMe(lock) && (mode != LW_EXCLUSIVE || source_capture);
 }
 uint32
 LockBufHdr(BufferDesc *buf)
@@ -247,7 +251,20 @@ cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf, ClusterPcmOwnSnapshot *out)
 bool
 cluster_bufmgr_pcm_x_content_holder_write_permitted(BufferDesc *buf)
 {
-	return false;
+	return buf->buf_id == 1 && locks[1] && source_capture;
+}
+
+Size
+mul_size(Size a, Size b)
+{
+	return a * b;
+}
+void *
+ShmemInitStruct(const char *name, Size size, bool *found)
+{
+	UT_ASSERT_EQ(size, sizeof(page_sources));
+	*found = false;
+	return page_sources;
 }
 bool
 cluster_space_recovery_flush_permitted_v1(const ClusterSpaceRecoveryBatchV1 *b, Buffer buf)
@@ -386,6 +403,20 @@ shared_buffer_write_error_callback(void *arg)
 #include "test_cluster_page_data.inc"
 
 static void
+bind_native_source(void)
+{
+	RfPageVersionEdgeEntryV1 e = { 0 };
+	e.page_class = RF_PAGE_CLASS_ORDINARY;
+	e.result_kind = RF_PAGE_STATE_PRESENT;
+	memcpy(e.result_incarnation, identity.incarnation, 16);
+	source_capture = locks[1] = true;
+	HOLD_INTERRUPTS();
+	UT_ASSERT(cluster_page_wal_capture_native_v1(2, &e, 80, 0x100, 0x200, 0x9192, RM_HEAP_ID, 0));
+	RESUME_INTERRUPTS();
+	source_capture = locks[1] = false;
+}
+
+static void
 reset(void)
 {
 	PageHeader p = (PageHeader)pages[1].data;
@@ -455,6 +486,8 @@ reset(void)
 	writes = syncs = reads = wal_flushes = aborts = 0;
 	cluster_smart_fusion = cluster_past_image = false;
 	error_context_stack = NULL;
+	cluster_page_wal_shmem_init();
+	bind_native_source();
 }
 static void
 clean(void)
@@ -654,6 +687,7 @@ vm_and_clean_completion(void)
 		checksums = enabled;
 		target.identity.forknum = VISIBILITYMAP_FORKNUM;
 		descriptors[1].bufferdesc.tag.forkNum = VISIBILITYMAP_FORKNUM;
+		bind_native_source();
 		UT_ASSERT(cluster_bufmgr_write_page_data_v1(&target, &r));
 		if (!r)
 			continue;
@@ -669,10 +703,30 @@ vm_and_clean_completion(void)
 		clean();
 	}
 }
+static void
+new_claim_never_flushes_old_coordinate(void)
+{
+	for (int c = 0; c < 3; c++) {
+		ClusterPageDataReceiptV1 *r = NULL;
+		reset();
+		if (c == 0)
+			writer.claim.identity.origin_owner_incarnation++;
+		if (c == 1)
+			writer.claim.claim_sha256[15]++;
+		if (c == 2)
+			memset(page_sources, 0, sizeof(page_sources));
+		UT_ASSERT(!cluster_bufmgr_write_page_data_v1(&target, &r));
+		UT_ASSERT(r == NULL);
+		UT_ASSERT_EQ(writes + syncs + wal_flushes, 0);
+		cluster_page_data_receipt_free_v1(&r);
+		clean();
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(success_and_old_completion);
 	UT_RUN(identity_refusals);
 	UT_RUN(authority_refusals);
@@ -680,6 +734,7 @@ main(void)
 	UT_RUN(io_failure_cleanup);
 	UT_RUN(completion_refusals);
 	UT_RUN(vm_and_clean_completion);
+	UT_RUN(new_claim_never_flushes_old_coordinate);
 	if (file)
 		fclose(file);
 	UT_DONE();

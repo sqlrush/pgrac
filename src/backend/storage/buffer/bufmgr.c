@@ -79,6 +79,7 @@
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_page_data.h"
+#include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 
@@ -10514,6 +10515,7 @@ cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *target,
 								  ClusterPageDataReceiptV1 **out)
 {
 	ClusterWalSourceRef source, current;
+	ClusterPageWalBindingV1 binding;
 	ClusterSpaceIdentityKey key;
 	ClusterSpaceIdentity space_identity;
 	ClusterPcmOwnSnapshot space_owner, data_owner, live;
@@ -10565,7 +10567,10 @@ cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *target,
 				|| memcmp(space_identity.incarnation, target->version.segment_incarnation, 16) != 0)
 				break;
 			data = cluster_page_data_try_hold(data_tag, true, &data_owner);
-			if (data == NULL)
+			if (data == NULL
+				|| !cluster_page_wal_read_v1(BufferDescriptorGetBuffer(data), &space_identity,
+											 &binding)
+				|| !cluster_page_data_source_same(&source, &binding.source))
 				break;
 			memcpy(expected.data, BufHdrGetBlock(data), BLCKSZ);
 			header = (PageHeader)expected.data;

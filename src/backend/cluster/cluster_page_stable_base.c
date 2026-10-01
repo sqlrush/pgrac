@@ -9,6 +9,7 @@
 #include "postgres.h"
 
 #include "access/xlogreader.h"
+#include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_page_stable_base.h"
 #include "cluster/cluster_recovery_duty.h"
@@ -59,7 +60,10 @@ rf_page_identity_valid_v1(const RfPageIdentityV1 *identity)
 {
 	return identity != NULL && identity->system_identifier != 0
 		   && bytes_nonzero(identity->storage_uuid, sizeof(identity->storage_uuid))
-		   && identity->locator.spcOid != InvalidOid && identity->locator.dbOid != InvalidOid
+		   && identity->locator.spcOid != InvalidOid
+		   && (identity->locator.spcOid == GLOBALTABLESPACE_OID
+				   ? identity->locator.dbOid == InvalidOid
+				   : identity->locator.dbOid != InvalidOid)
 		   && identity->locator.relNumber != InvalidRelFileNumber
 		   && identity->blockno != InvalidBlockNumber && identity->reserved_zero == 0;
 }

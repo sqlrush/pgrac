@@ -23,7 +23,8 @@ typedef struct ClusterPageDataReceiptV1 ClusterPageDataReceiptV1;
  * resident, unfenced current-X; resident SPACE0 stays locked across write,
  * fsync and exact post-read. Busy/missing/stale returns false, never takes
  * ownership or creates storage. This initial endpoint requires the page's
- * explicit WAL origin to be the selected local writer. Foreign WAL requires
+ * exact native WAL binding to be the selected local writer generation (the
+ * header's thread id and LSN alone do not identify a generation). Foreign WAL requires
  * its original contribution owner, not a comparison with local LSNs.
  *
  * On success *out (NULL on entry) owns a receipt in CurrentMemoryContext.

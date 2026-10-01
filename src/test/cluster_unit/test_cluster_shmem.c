@@ -871,6 +871,18 @@ void
 cluster_pcm_own_shmem_register(void)
 {}
 
+/* The actual per-buffer source region is exercised by test_cluster_page_wal. */
+void cluster_page_wal_shmem_register(void);
+void
+cluster_page_wal_shmem_register(void)
+{}
+
+/* Existing control-request owner is outside this registry-only fixture. */
+void cluster_control_request_shmem_register(void);
+void
+cluster_control_request_shmem_register(void)
+{}
+
 /* spec-2.6 Sprint A Step 1 stub: cluster_qvotec shmem region. */
 void
 cluster_qvotec_shmem_register(void)
