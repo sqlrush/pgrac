@@ -847,6 +847,15 @@ cluster_wal_startup_observe(const char *wal_root, const ClusterWalSourceRef *ref
 							int segment_size, XLogRecPtr first_segment,
 							ClusterWalStartupObservation *out)
 {
+	return cluster_wal_startup_visit_v1(wal_root, ref, segment_size, first_segment, NULL, NULL,
+										out);
+}
+
+ClusterControlRootResult
+cluster_wal_startup_visit_v1(const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
+							 XLogRecPtr first_segment, ClusterWalRecordVisitor visitor, void *arg,
+							 ClusterWalStartupObservation *out)
+{
 	ClusterWalTailObservation tail;
 	XLogRecPtr lower;
 	if (out != NULL)
@@ -856,7 +865,7 @@ cluster_wal_startup_observe(const char *wal_root, const ClusterWalSourceRef *ref
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	lower = first_segment + SizeOfXLogLongPHD;
 	return wal_tail_observe_common(wal_root, ref, segment_size, lower, lower, 0, 0, &tail, out,
-								   false, false, NULL, NULL, NULL, InvalidXLogRecPtr);
+								   false, false, NULL, visitor, arg, InvalidXLogRecPtr);
 }
 
 ClusterControlRootResult
@@ -894,11 +903,11 @@ cluster_wal_tail_observe_checkpoint(const char *wal_root, const ClusterWalSource
 								   NULL, NULL, InvalidXLogRecPtr);
 }
 
-ClusterControlRootResult
-cluster_wal_tail_visit_sealed(const char *wal_root, const ClusterWalSourceRef *ref,
-							  int segment_size, const ClusterControlRootSnapshot *sealed,
-							  XLogRecPtr checkpoint_start, ClusterWalRecordVisitor visitor,
-							  void *arg, ClusterWalTailObservation *out)
+static ClusterControlRootResult
+wal_tail_visit_exact(const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
+					 const ClusterControlRootSnapshot *sealed, XLogRecPtr checkpoint_start,
+					 ClusterWalRecordVisitor visitor, void *arg, ClusterWalTailObservation *out,
+					 bool recovery_only)
 {
 	ClusterControlRootSnapshot expected;
 	const uint32 flags
@@ -910,7 +919,10 @@ cluster_wal_tail_visit_sealed(const char *wal_root, const ClusterWalSourceRef *r
 		expected = *sealed;
 	memset(out, 0, sizeof(*out));
 	if (sealed == NULL || ref == NULL || checkpoint_start == 0
-		|| expected.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		|| (expected.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+			&& (recovery_only
+				|| (expected.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+					&& expected.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)))
 		|| (expected.root_flags & flags) != flags
 		|| memcmp(&expected.identity, &ref->claim.identity, sizeof(expected.identity)) != 0
 		|| expected.checkpoint_tli != ref->timeline || expected.tail_tli != ref->timeline
@@ -922,6 +934,26 @@ cluster_wal_tail_visit_sealed(const char *wal_root, const ClusterWalSourceRef *r
 								   expected.validated_tail_lsn_exclusive, checkpoint_start,
 								   expected.checkpoint_record_crc32c, out, NULL, false, false,
 								   &expected, visitor, arg, InvalidXLogRecPtr);
+}
+
+ClusterControlRootResult
+cluster_wal_tail_visit_sealed(const char *wal_root, const ClusterWalSourceRef *ref,
+							  int segment_size, const ClusterControlRootSnapshot *sealed,
+							  XLogRecPtr checkpoint_start, ClusterWalRecordVisitor visitor,
+							  void *arg, ClusterWalTailObservation *out)
+{
+	return wal_tail_visit_exact(wal_root, ref, segment_size, sealed, checkpoint_start, visitor, arg,
+								out, true);
+}
+
+ClusterControlRootResult
+cluster_wal_retained_visit_v1(const char *wal_root, const ClusterWalSourceRef *ref,
+							  int segment_size, const ClusterControlRootSnapshot *retained,
+							  XLogRecPtr checkpoint_start, ClusterWalRecordVisitor visitor,
+							  void *arg, ClusterWalTailObservation *out)
+{
+	return wal_tail_visit_exact(wal_root, ref, segment_size, retained, checkpoint_start, visitor,
+								arg, out, false);
 }
 
 ClusterControlRootResult

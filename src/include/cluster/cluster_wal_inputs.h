@@ -41,6 +41,18 @@ extern ClusterControlRootResult cluster_wal_inputs_begin_v1(const uint8 storage_
 extern ClusterControlRootResult cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs);
 extern uint32 cluster_wal_inputs_count_v1(ClusterWalInputsV1 *inputs);
 extern const ClusterWalInputV1 *cluster_wal_inputs_at_v1(ClusterWalInputsV1 *inputs, uint32 index);
+
+/* Physically visit one selected retained source outside CF, under this exact
+ * ROOT/WALR scope. OPEN refuses: its original live writer must first confirm
+ * a complete end after the directory cut. Terminal input is fully reclassified
+ * and compared with the selected terminal. Callbacks are provisional; any
+ * failure invalidates the scope and clears output. The caller must release
+ * the scope on failure/ERROR and revalidate the complete scope before using
+ * the assembled proof. No callback may release or mutate this scope. */
+extern ClusterControlRootResult
+cluster_wal_inputs_visit_retained_v1(ClusterWalInputsV1 *inputs, uint32 index,
+									 ClusterWalRecordVisitor visitor, void *arg,
+									 ClusterWalTailObservation *out);
 extern void cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs);
 
 #endif

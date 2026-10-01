@@ -19191,6 +19191,153 @@ inputs_fixture(uint8 bytes[66048], ClusterRecoveryAnchorV2 anchors[2])
 	MyBackendType = B_BG_WORKER;
 }
 
+typedef struct InputsVisitTest {
+	unsigned calls;
+	int fault;
+} InputsVisitTest;
+
+static bool
+inputs_visit_record(XLogReaderState *reader, void *arg)
+{
+	InputsVisitTest *visit = arg;
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT(inputs_pin_held && inputs_pin_current);
+	UT_ASSERT(reader->ReadRecPtr < reader->EndRecPtr);
+	visit->calls++;
+	if (visit->fault == 1) {
+		char path[MAXPGPATH];
+		uint8 bytes[66048];
+		path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+		read_all_or_abort(path, bytes, sizeof(bytes));
+		put_u64_le(bytes + 112, get_u64_le(bytes + 112) + 1);
+		v2_checksums(bytes);
+		v2_write_roots(bytes);
+	}
+	if (visit->fault == 2)
+		inputs_pin_current = false;
+	if (visit->fault == 3)
+		return false;
+	if (visit->fault == 4)
+		pg_re_throw();
+	return true;
+}
+
+static void
+inputs_closed_wal_fixture(uint8 bytes[66048], ClusterRecoveryAnchorV2 anchors[2])
+{
+	ControlRootImage root;
+	XLogRecPtr ends[2];
+	uint32 crcs[2];
+	char path[MAXPGPATH];
+	inputs_fixture(bytes, anchors);
+	for (unsigned i = 0; i < 2; i++) {
+		ControlFileData native = { 0 };
+		ClusterRecoveryAnchorV2 *a = &anchors[i];
+		a->state = DB_SHUTDOWNED;
+		a->min_recovery_point = a->min_recovery_tli = 0;
+		a->checkpoint = (XLogRecPtr)(i + 2) * wal_segment_size + SizeOfXLogLongPHD;
+		a->checkpoint_copy.redo = a->checkpoint;
+		a->checkpoint_copy.nextXid = FullTransactionIdFromU64(100);
+		native.state = a->state;
+		native.checkPoint = a->checkpoint;
+		native.checkPointCopy = a->checkpoint_copy;
+		snprintf(test_checkpoint_prefix_path, sizeof(test_checkpoint_prefix_path),
+				 "%s/thread_%u/generation_" UINT64_FORMAT "/durable_prefix/current",
+				 cluster_wal_threads_dir, a->identity.origin_thread_id,
+				 a->identity.origin_owner_incarnation);
+		v2_checkpoint_wal_record(&a->identity, &native, 8);
+		ends[i] = test_checkpoint_end;
+		crcs[i] = test_checkpoint_crc;
+		v2_anchor_object(bytes, a, &a->identity, path);
+	}
+	UT_ASSERT_EQ(cluster_control_root_v3_decode(bytes, 66048, v2_storage, TEST_SYSID, &root), 0);
+	for (unsigned i = 0; i < 2; i++) {
+		unsigned node = i == 0 ? 0 : 127;
+		ClusterControlRootSnapshot *s = &root.records[node];
+		s->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+		s->checkpoint_lower_lsn = s->tail_last_record_lsn = anchors[i].checkpoint;
+		s->checkpoint_record_crc32c = s->tail_last_record_crc32c = crcs[i];
+		s->tail_tli = s->checkpoint_tli;
+		s->validated_tail_lsn_exclusive = ends[i];
+		s->tail_validation_kind = CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
+		s->root_flags |= CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+						 | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+	}
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	memcpy(bytes, root.bytes, 66048);
+	put_u64_le(bytes + 232, 0);
+	put_u64_le(bytes + 240, 0);
+	v2_checksums(bytes);
+	v2_write_roots(bytes);
+}
+
+UT_TEST(test_wal_inputs_physically_visit_exact_nonserving_closed_sources)
+{
+	uint8 bytes[66048];
+	ClusterRecoveryAnchorV2 anchors[2];
+	ClusterWalInputsV1 *inputs = NULL;
+	InputsVisitTest visit = { 0 };
+	inputs_closed_wal_fixture(bytes, anchors);
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+	for (uint32 i = 0; i < 2; i++) {
+		ClusterWalTailObservation out;
+		UT_ASSERT_EQ(
+			cluster_wal_inputs_visit_retained_v1(inputs, i, inputs_visit_record, &visit, &out), 0);
+		UT_ASSERT_EQ(out.records, 1);
+		UT_ASSERT_EQ(out.last_record_start, anchors[i].checkpoint);
+		UT_ASSERT_EQ(out.database_incarnation, anchors[i].database_incarnation);
+	}
+	UT_ASSERT_EQ(visit.calls, 2);
+	UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), 0);
+	cluster_wal_inputs_release_v1(&inputs);
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_wal_inputs_physical_failure_invalidates_provisional_scope)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		uint8 bytes[66048];
+		ClusterRecoveryAnchorV2 anchors[2];
+		ClusterWalInputsV1 *inputs = NULL;
+		ClusterWalTailObservation out, zero = { 0 };
+		InputsVisitTest visit = { 0 };
+		volatile bool caught = false;
+		inputs_closed_wal_fixture(bytes, anchors);
+		UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+		visit.fault = fault;
+		if (fault == 0) {
+			char path[MAXPGPATH];
+			v2_claim_path(&anchors[1].identity, path);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		if (fault == 5) {
+			/* A ROOT change before scanning must prevent even a first visit. */
+			put_u64_le(bytes + 112, get_u64_le(bytes + 112) + 1);
+			v2_checksums(bytes);
+			v2_write_roots(bytes);
+		}
+		memset(&out, 0xa5, sizeof(out));
+		PG_TRY();
+		{
+			UT_ASSERT_NE(
+				cluster_wal_inputs_visit_retained_v1(inputs, 1, inputs_visit_record, &visit, &out),
+				0);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 4);
+		UT_ASSERT_EQ(visit.calls, fault == 0 || fault == 5 ? 0 : 1);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 0);
+		UT_ASSERT(inputs_pin_held && test_actual_cf == NoLock);
+		cluster_wal_inputs_release_v1(&inputs);
+		MyBackendType = B_INVALID;
+	}
+}
+
 UT_TEST(test_wal_inputs_all_origins_exact_native_anchor)
 {
 	uint8 bytes[66048];
@@ -19358,6 +19505,7 @@ UT_TEST(test_wal_inputs_terminal_and_pending_are_not_checkpoint_sources)
 	ControlFileData control;
 	ClusterControlRootFileToken token;
 	unsigned terminals = 0;
+	uint32 terminal_index = UINT32_MAX;
 
 	if (ut_current_failed)
 		return;
@@ -19395,6 +19543,7 @@ UT_TEST(test_wal_inputs_terminal_and_pending_are_not_checkpoint_sources)
 		if (item->kind != CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL)
 			continue;
 		terminals++;
+		terminal_index = i;
 		UT_ASSERT(
 			cluster_control_root_identity_equal(&item->source.claim.identity, &op.claim.identity));
 		UT_ASSERT_EQ(item->first_segment, op.first_segment_lsn);
@@ -19402,8 +19551,44 @@ UT_TEST(test_wal_inputs_terminal_and_pending_are_not_checkpoint_sources)
 		UT_ASSERT_EQ(item->terminal.checkpoint_records, 0);
 		UT_ASSERT(item->checkpoint_start == 0 && item->native_redo == 0 && !item->current);
 		UT_ASSERT(v2_zero(&item->checkpoint, sizeof(item->checkpoint)));
+		{
+			InputsVisitTest visit = { 0 };
+			ClusterWalTailObservation out;
+			UT_ASSERT_EQ(
+				cluster_wal_inputs_visit_retained_v1(inputs, i, inputs_visit_record, &visit, &out),
+				0);
+			UT_ASSERT_EQ(visit.calls, item->terminal.tail.records);
+			UT_ASSERT_EQ(out.complete_end, item->terminal.tail.complete_end);
+		}
 	}
 	UT_ASSERT_EQ(terminals, 1);
+	if (terminal_index != UINT32_MAX) {
+		const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, terminal_index);
+		ControlFileData native = { 0 };
+		InputsVisitTest visit = { 0 };
+		ClusterWalTailObservation out, zero = { 0 };
+		/* A valid later checkpoint in the same actual source contradicts
+		 * the immutable checkpoint-less terminal; mere CRC validity is not
+		 * permission to omit this changed input. */
+		native.state = DB_SHUTDOWNED;
+		native.checkPoint = item->first_segment + SizeOfXLogLongPHD;
+		native.checkPointCopy.redo = native.checkPoint;
+		native.checkPointCopy.ThisTimeLineID = item->source.timeline;
+		native.checkPointCopy.PrevTimeLineID = item->source.timeline;
+		native.checkPointCopy.nextXid = FullTransactionIdFromU64(100);
+		snprintf(test_checkpoint_prefix_path, sizeof(test_checkpoint_prefix_path),
+				 "%s/thread_%u/generation_" UINT64_FORMAT "/durable_prefix/current",
+				 cluster_wal_threads_dir, item->source.claim.identity.origin_thread_id,
+				 item->source.claim.identity.origin_owner_incarnation);
+		v2_checkpoint_wal_record(&item->source.claim.identity, &native, 8);
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT_EQ(cluster_wal_inputs_visit_retained_v1(inputs, terminal_index,
+														  inputs_visit_record, &visit, &out),
+					 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+		UT_ASSERT_EQ(visit.calls, 1);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 0);
+	}
 	cluster_wal_inputs_release_v1(&inputs);
 	test_reserve_mode = false;
 	MyBackendType = B_INVALID;
@@ -19521,7 +19706,9 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_WAL_INPUTS") != NULL) {
-		UT_PLAN(8);
+		UT_PLAN(10);
+		UT_RUN(test_wal_inputs_physically_visit_exact_nonserving_closed_sources);
+		UT_RUN(test_wal_inputs_physical_failure_invalidates_provisional_scope);
 		UT_RUN(test_wal_inputs_all_origins_exact_native_anchor);
 		UT_RUN(test_wal_inputs_missing_peer_or_pending_never_partial);
 		UT_RUN(test_wal_inputs_retained_generations_remain_distinct);
@@ -19540,7 +19727,9 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(357);
+	UT_PLAN(359);
+	UT_RUN(test_wal_inputs_physically_visit_exact_nonserving_closed_sources);
+	UT_RUN(test_wal_inputs_physical_failure_invalidates_provisional_scope);
 	UT_RUN(test_wal_inputs_all_origins_exact_native_anchor);
 	UT_RUN(test_wal_inputs_missing_peer_or_pending_never_partial);
 	UT_RUN(test_wal_inputs_retained_generations_remain_distinct);

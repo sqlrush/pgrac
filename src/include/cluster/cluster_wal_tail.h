@@ -30,6 +30,16 @@ cluster_wal_tail_visit_sealed(const char *wal_root, const ClusterWalSourceRef *r
 							  XLogRecPtr checkpoint_start, ClusterWalRecordVisitor visitor,
 							  void *arg, ClusterWalTailObservation *out);
 
+/* Read-only retained input, not recovery authority. Accept exact CLOSED,
+ * RECOVERY_REQUIRED or RECOVERY_COMPLETE cuts without changing their lifecycle.
+ * All sealed physical checks remain mandatory; OPEN needs its writer's native
+ * complete-end owner instead. The caller holds/revalidates its ROOT/WALR scope. */
+extern ClusterControlRootResult
+cluster_wal_retained_visit_v1(const char *wal_root, const ClusterWalSourceRef *ref,
+							  int segment_size, const ClusterControlRootSnapshot *retained,
+							  XLogRecPtr checkpoint_start, ClusterWalRecordVisitor visitor,
+							  void *arg, ClusterWalTailObservation *out);
+
 /* Resolve the selected v3 claim/anchor under CF-S, scan without CF, then
  * reobserve the exact root token/record. Caller retains and revalidates its
  * separate IR/fencing/WALR owner bundle. This supplies input, not permission. */
@@ -83,6 +93,14 @@ extern ClusterControlRootResult cluster_wal_startup_observe(const char *wal_root
 															int segment_size,
 															XLogRecPtr first_segment,
 															ClusterWalStartupObservation *out);
+
+/* Same full startup classification, with provisional read-only callbacks.
+ * The selected terminal must be compared to the final observation by its
+ * owner. No checkpoint/recovery/retirement permission follows from a visit. */
+extern ClusterControlRootResult
+cluster_wal_startup_visit_v1(const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
+							 XLogRecPtr first_segment, ClusterWalRecordVisitor visitor, void *arg,
+							 ClusterWalStartupObservation *out);
 
 /* Recovery-owner-only physical sync of the observed stream, actual claim
  * and directory entries. This grants no writer or recovery permission.

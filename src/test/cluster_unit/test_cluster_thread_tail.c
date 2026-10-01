@@ -1500,6 +1500,60 @@ UT_TEST(sealed_reader_refuses_changed_cut_and_discards_provisional_output)
 	}
 }
 
+UT_TEST(retained_reader_keeps_lifecycle_and_strict_physical_checks)
+{
+	const uint16 states[]
+		= { CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED,
+			CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE };
+	for (unsigned i = 0; i < lengthof(states); i++) {
+		for (int bad = 0; bad < 4; bad++) {
+			ClusterControlRootSnapshot root = sealed_fixture(false), before;
+			ClusterWalTailObservation out = { 0 }, zero = { 0 };
+			SealedVisitTest visit = { 0 };
+			root.lifecycle = states[i];
+			if (bad == 1)
+				root.tail_last_record_crc32c ^= 1;
+			if (bad == 2)
+				(void)record_write(generation, root.validated_tail_lsn_exclusive,
+								   root.tail_last_record_lsn, 24);
+			if (bad == 3)
+				visit.fault = 3;
+			before = root;
+			UT_ASSERT_EQ(cluster_wal_retained_visit_v1(scratch, &ref, wal_segment_size, &root,
+													   root.checkpoint_lower_lsn, sealed_visit,
+													   &visit, &out)
+							 == 0,
+						 bad == 0);
+			UT_ASSERT_EQ(memcmp(&root, &before, sizeof(root)), 0);
+			if (bad == 0) {
+				UT_ASSERT_EQ(out.records, 1);
+				UT_ASSERT_EQ(out.complete_end, root.validated_tail_lsn_exclusive);
+			} else
+				UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		}
+	}
+}
+
+UT_TEST(retained_input_does_not_open_recovery_or_live_tail)
+{
+	ClusterControlRootSnapshot root = sealed_fixture(false);
+	ClusterWalTailObservation out = { 0 }, zero = { 0 };
+	SealedVisitTest visit = { 0 };
+	root.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	UT_ASSERT_NE(cluster_wal_tail_visit_sealed(scratch, &ref, wal_segment_size, &root,
+											   root.checkpoint_lower_lsn, sealed_visit, &visit,
+											   &out),
+				 0);
+	UT_ASSERT_EQ(visit.calls, 0);
+	root.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	UT_ASSERT_NE(cluster_wal_retained_visit_v1(scratch, &ref, wal_segment_size, &root,
+											   root.checkpoint_lower_lsn, sealed_visit, &visit,
+											   &out),
+				 0);
+	UT_ASSERT_EQ(visit.calls, 0);
+	UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+}
+
 UT_TEST(live_prefix_stops_at_original_flush_boundary)
 {
 	for (int cut = 0; cut < 6; cut++) {
@@ -1642,7 +1696,9 @@ UT_TEST(live_prefix_ignores_unflushed_suffix_but_preserves_cleanup)
 int
 main(void)
 {
-	UT_PLAN(55);
+	UT_PLAN(57);
+	UT_RUN(retained_reader_keeps_lifecycle_and_strict_physical_checks);
+	UT_RUN(retained_input_does_not_open_recovery_or_live_tail);
 	UT_RUN(live_prefix_rejects_oversized_record_inside_confirmed_complete_end);
 	UT_RUN(live_prefix_stops_at_original_flush_boundary);
 	UT_RUN(live_prefix_does_not_accept_corruption_inside_qualified_prefix);

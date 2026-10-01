@@ -235,6 +235,100 @@ inputs_collect(ClusterWalInputsV1 *inputs, WalInputsWork *work)
 								  : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 }
 
+typedef struct WalInputsVisit {
+	ClusterWalInputsV1 *inputs;
+	ClusterWalRecordVisitor visitor;
+	void *arg;
+} WalInputsVisit;
+
+static bool
+inputs_visit_record(struct XLogReaderState *reader, void *arg)
+{
+	WalInputsVisit *visit = arg;
+	if (!inputs_current(visit->inputs) || cluster_cf_held(ShareLock)
+		|| cluster_cf_held(ExclusiveLock))
+		return false;
+	if (visit->visitor != NULL && !visit->visitor(reader, visit->arg))
+		return false;
+	return inputs_current(visit->inputs) && !cluster_cf_held(ShareLock)
+		   && !cluster_cf_held(ExclusiveLock);
+}
+
+/* Terminal codec admits PARAMETER_CHANGE/FPW only. Compare logical fields,
+ * not native structure padding or just the final LSN. A later checkpoint or
+ * any newly observed side effect invalidates this selected terminal. */
+static bool
+inputs_terminal_same(const ClusterWalStartupObservation *a, const ClusterWalStartupObservation *b)
+{
+	return a->tail.complete_end == b->tail.complete_end
+		   && a->tail.last_record_start == b->tail.last_record_start
+		   && a->tail.last_record_crc == b->tail.last_record_crc
+		   && a->tail.records == b->tail.records
+		   && a->tail.database_incarnation == b->tail.database_incarnation
+		   && a->checkpoint_records == 0 && b->checkpoint_records == 0
+		   && a->unsupported_records == 0 && b->unsupported_records == 0
+		   && a->fpw_records == b->fpw_records && a->parameter_records == b->parameter_records
+		   && a->fpw_disabled == b->fpw_disabled && a->max_connections == b->max_connections
+		   && a->max_worker_processes == b->max_worker_processes
+		   && a->max_wal_senders == b->max_wal_senders
+		   && a->max_prepared_xacts == b->max_prepared_xacts
+		   && a->max_locks_per_xact == b->max_locks_per_xact;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_visit_retained_v1(ClusterWalInputsV1 *inputs, uint32 index,
+									 ClusterWalRecordVisitor visitor, void *arg,
+									 ClusterWalTailObservation *out)
+{
+	ClusterWalTailObservation observed = { 0 };
+	WalInputsVisit visit = { inputs, visitor, arg };
+	ClusterControlRootResult result;
+	const ClusterWalInputV1 *item;
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (!inputs_current(inputs) || index >= inputs->count)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	item = &inputs->items[index];
+	PG_TRY();
+	{
+		result = cluster_wal_inputs_revalidate_v1(inputs);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			if (item->kind == CLUSTER_WAL_INPUT_CHECKPOINT)
+				result = cluster_wal_retained_visit_v1(
+					cluster_wal_threads_dir, &item->source, wal_segment_size, &item->checkpoint,
+					item->checkpoint_start, inputs_visit_record, &visit, &observed);
+			else if (item->kind == CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL) {
+				ClusterWalStartupObservation startup;
+				result = cluster_wal_startup_visit_v1(cluster_wal_threads_dir, &item->source,
+													  wal_segment_size, item->first_segment,
+													  inputs_visit_record, &visit, &startup);
+				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+					if (!inputs_terminal_same(&startup, &item->terminal))
+						result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+					else
+						observed = startup.tail;
+				}
+			} else
+				result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		}
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_inputs_revalidate_v1(inputs);
+	}
+	PG_CATCH();
+	{
+		inputs->stale = true;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = observed;
+	else
+		inputs->stale = true;
+	return result;
+}
+
 ClusterControlRootResult
 cluster_wal_inputs_begin_v1(const uint8 storage_uuid[16], uint64 system_identifier,
 							ClusterWalInputsV1 **out)
