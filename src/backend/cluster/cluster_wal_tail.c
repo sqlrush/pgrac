@@ -42,6 +42,8 @@ typedef struct WalTailWork {
 	bool startup_mode;
 	bool sync_inputs;
 	bool checkpoint_prefix;
+	XLogRecPtr flush_end;
+	bool flush_boundary;
 	const ClusterControlRootSnapshot *sealed;
 	ClusterWalRecordVisitor visitor;
 	void *visitor_arg;
@@ -123,10 +125,18 @@ wal_tail_page(XLogReaderState *reader, XLogRecPtr pageptr, int required,
 	struct stat st;
 	XLogPageHeader header;
 	size_t used = 0;
+	size_t wanted = XLOG_BLCKSZ;
 	CHECK_FOR_INTERRUPTS();
 	if (required < 0 || required > XLOG_BLCKSZ || pageptr % XLOG_BLCKSZ != 0) {
 		work->result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 		return XLREAD_FAIL;
+	}
+	if (work->flush_end != InvalidXLogRecPtr) {
+		if (pageptr >= work->flush_end || (uint64)required > work->flush_end - pageptr) {
+			work->flush_boundary = true;
+			return XLREAD_FAIL;
+		}
+		wanted = Min((XLogRecPtr)XLOG_BLCKSZ, work->flush_end - pageptr);
 	}
 	work->last_page_requested = Max(work->last_page_requested, pageptr);
 	XLByteToSeg(pageptr, number, reader->segcxt.ws_segsize);
@@ -169,8 +179,8 @@ wal_tail_page(XLogReaderState *reader, XLogRecPtr pageptr, int required,
 		work->result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		return XLREAD_FAIL;
 	}
-	while (used < XLOG_BLCKSZ) {
-		ssize_t count = pread(work->segment_fd, page + used, XLOG_BLCKSZ - used,
+	while (used < wanted) {
+		ssize_t count = pread(work->segment_fd, page + used, wanted - used,
 							  XLogSegmentOffset(pageptr, reader->segcxt.ws_segsize) + used);
 		if (count < 0 && errno == EINTR) {
 			CHECK_FOR_INTERRUPTS();
@@ -587,6 +597,13 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 		if (record == NULL)
 			break;
 		CHECK_FOR_INTERRUPTS();
+		/* Native flush may stop at a page boundary within a record, or
+		 * before its alignment/switch padding. Only a complete end inside
+		 * the qualified cut may enter the provisional visitor. */
+		if (work->flush_end != InvalidXLogRecPtr && work->reader->EndRecPtr > work->flush_end) {
+			work->flush_boundary = true;
+			break;
+		}
 		result = wal_profile_supported(work->reader);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
@@ -619,12 +636,20 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 		work->observed.last_record_start = work->reader->ReadRecPtr;
 		work->observed.last_record_crc = record->xl_crc;
 		++work->observed.records;
+		if (work->flush_end != InvalidXLogRecPtr
+			&& work->observed.complete_end == work->flush_end) {
+			work->flush_boundary = true;
+			break;
+		}
 		if (work->checkpoint_prefix && work->observed.complete_end == minimum)
 			break;
 	}
 	if (work->result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return work->result;
-	if (!work->checkpoint_prefix && !wal_tail_normal_end(work))
+	if (work->flush_end != InvalidXLogRecPtr && !work->flush_boundary)
+		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
+	if (!work->checkpoint_prefix && work->flush_end == InvalidXLogRecPtr
+		&& !wal_tail_normal_end(work))
 		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
 	if (!checkpoint_seen
 		|| (!(work->startup_mode && work->observed.records == 0)
@@ -642,7 +667,7 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
 	if (!wal_tail_close_segment(work))
 		return work->result;
-	if (!work->checkpoint_prefix) {
+	if (!work->checkpoint_prefix && work->flush_end == InvalidXLogRecPtr) {
 		result = wal_tail_no_written_successor(work, lower);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
@@ -752,7 +777,7 @@ wal_tail_observe_common(const char *wal_root, const ClusterWalSourceRef *ref, in
 						pg_crc32c checkpoint_crc, ClusterWalTailObservation *out,
 						ClusterWalStartupObservation *startup, bool sync_inputs,
 						bool checkpoint_prefix, const ClusterControlRootSnapshot *sealed,
-						ClusterWalRecordVisitor visitor, void *arg)
+						ClusterWalRecordVisitor visitor, void *arg, XLogRecPtr flush_end)
 {
 	WalTailWork *work;
 	ClusterControlRootResult result;
@@ -762,6 +787,7 @@ wal_tail_observe_common(const char *wal_root, const ClusterWalSourceRef *ref, in
 	if (wal_root == NULL || wal_root[0] == '\0' || !IsValidWalSegSize(segment_size)
 		|| scan_lower == 0 || minimum_end < scan_lower
 		|| (startup == NULL && minimum_end == scan_lower)
+		|| (flush_end != InvalidXLogRecPtr && flush_end < minimum_end)
 		|| (checkpoint_start != 0
 			&& (checkpoint_start < scan_lower || checkpoint_start >= minimum_end))
 		|| ref == NULL || ref->timeline == 0 || !cluster_wal_claim_v2_ref_valid(&ref->claim))
@@ -772,6 +798,7 @@ wal_tail_observe_common(const char *wal_root, const ClusterWalSourceRef *ref, in
 	work->startup_mode = startup != NULL;
 	work->sync_inputs = sync_inputs;
 	work->checkpoint_prefix = checkpoint_prefix;
+	work->flush_end = flush_end;
 	work->sealed = sealed;
 	work->visitor = visitor;
 	work->visitor_arg = arg;
@@ -811,7 +838,7 @@ cluster_wal_tail_observe(const char *wal_root, const ClusterWalSourceRef *ref,
 						 ClusterWalTailObservation *out)
 {
 	return wal_tail_observe_common(wal_root, ref, segment_size, scan_lower, minimum_end, 0, 0, out,
-								   NULL, false, false, NULL, NULL, NULL);
+								   NULL, false, false, NULL, NULL, NULL, InvalidXLogRecPtr);
 }
 
 ClusterControlRootResult
@@ -828,7 +855,7 @@ cluster_wal_startup_observe(const char *wal_root, const ClusterWalSourceRef *ref
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	lower = first_segment + SizeOfXLogLongPHD;
 	return wal_tail_observe_common(wal_root, ref, segment_size, lower, lower, 0, 0, &tail, out,
-								   false, false, NULL, NULL, NULL);
+								   false, false, NULL, NULL, NULL, InvalidXLogRecPtr);
 }
 
 ClusterControlRootResult
@@ -845,7 +872,7 @@ cluster_wal_startup_sync(const char *wal_root, const ClusterWalSourceRef *ref,
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	lower = first_segment + SizeOfXLogLongPHD;
 	return wal_tail_observe_common(wal_root, ref, segment_size, lower, lower, 0, 0, &tail, out,
-								   true, false, NULL, NULL, NULL);
+								   true, false, NULL, NULL, NULL, InvalidXLogRecPtr);
 }
 
 /* PGRAC: bind the root-selected checkpoint and the actual native tail.
@@ -863,7 +890,7 @@ cluster_wal_tail_observe_checkpoint(const char *wal_root, const ClusterWalSource
 	}
 	return wal_tail_observe_common(wal_root, ref, segment_size, scan_lower, minimum_end,
 								   checkpoint_start, checkpoint_crc, out, NULL, false, false, NULL,
-								   NULL, NULL);
+								   NULL, NULL, InvalidXLogRecPtr);
 }
 
 ClusterControlRootResult
@@ -893,7 +920,7 @@ cluster_wal_tail_visit_sealed(const char *wal_root, const ClusterWalSourceRef *r
 	return wal_tail_observe_common(wal_root, ref, segment_size, expected.checkpoint_lower_lsn,
 								   expected.validated_tail_lsn_exclusive, checkpoint_start,
 								   expected.checkpoint_record_crc32c, out, NULL, false, false,
-								   &expected, visitor, arg);
+								   &expected, visitor, arg, InvalidXLogRecPtr);
 }
 
 ClusterControlRootResult
@@ -909,5 +936,23 @@ cluster_wal_checkpoint_prefix_observe(const char *wal_root, const ClusterWalSour
 	}
 	return wal_tail_observe_common(wal_root, ref, segment_size, physical_lower, checkpoint_end,
 								   checkpoint_start, checkpoint_crc, out, NULL, false, true, NULL,
-								   NULL, NULL);
+								   NULL, NULL, InvalidXLogRecPtr);
+}
+
+ClusterControlRootResult
+cluster_wal_flushed_prefix_visit(const char *wal_root, const ClusterWalSourceRef *ref,
+								 int segment_size, XLogRecPtr physical_lower,
+								 XLogRecPtr minimum_end, XLogRecPtr flushed_end,
+								 XLogRecPtr checkpoint_start, pg_crc32c checkpoint_crc,
+								 ClusterWalRecordVisitor visitor, void *arg,
+								 ClusterWalTailObservation *out)
+{
+	if (checkpoint_start == InvalidXLogRecPtr || flushed_end == InvalidXLogRecPtr) {
+		if (out != NULL)
+			memset(out, 0, sizeof(*out));
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	}
+	return wal_tail_observe_common(wal_root, ref, segment_size, physical_lower, minimum_end,
+								   checkpoint_start, checkpoint_crc, out, NULL, false, false, NULL,
+								   visitor, arg, flushed_end);
 }

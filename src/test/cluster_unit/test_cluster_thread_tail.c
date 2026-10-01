@@ -1500,10 +1500,124 @@ UT_TEST(sealed_reader_refuses_changed_cut_and_discards_provisional_output)
 	}
 }
 
+UT_TEST(live_prefix_stops_at_original_flush_boundary)
+{
+	for (int cut = 0; cut < 6; cut++) {
+		ClusterControlRootSnapshot root = sealed_fixture(false);
+		ClusterWalTailObservation out;
+		SealedVisitTest visit = { 0 };
+		WalTestRecord next
+			= record_write(generation, root.validated_tail_lsn_exclusive, root.tail_last_record_lsn,
+						   cut == 4 ? wal_segment_size * 2 : XLOG_BLCKSZ * 2);
+		XLogRecPtr bound = cut == 0	  ? root.validated_tail_lsn_exclusive
+						   : cut == 1 ? next.record_start + 8
+						   : cut == 2 ? next.record_start + SizeOfXLogRecord + 8
+						   : cut == 3 ? wal_segment_size + XLOG_BLCKSZ
+						   : cut == 4 ? wal_segment_size * 2
+									  : next.exclusive_end;
+		int before = fd_count();
+		UT_ASSERT_EQ(cluster_wal_flushed_prefix_visit(
+						 scratch, &ref, wal_segment_size, root.checkpoint_lower_lsn,
+						 root.validated_tail_lsn_exclusive, bound, root.checkpoint_lower_lsn,
+						 root.checkpoint_record_crc32c, sealed_visit, &visit, &out),
+					 0);
+		UT_ASSERT_EQ(out.records, cut == 5 ? 2 : 1);
+		UT_ASSERT_EQ(visit.calls, out.records);
+		UT_ASSERT_EQ(out.complete_end,
+					 cut == 5 ? next.exclusive_end : root.validated_tail_lsn_exclusive);
+		UT_ASSERT_EQ(out.last_record_crc,
+					 cut == 5 ? next.record_crc : root.tail_last_record_crc32c);
+		UT_ASSERT_EQ(out.database_incarnation, ref.claim.database_incarnation);
+		UT_ASSERT_EQ(fd_count(), before);
+	}
+}
+
+UT_TEST(live_prefix_does_not_accept_corruption_inside_qualified_prefix)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		ClusterControlRootSnapshot root = sealed_fixture(false);
+		ClusterWalTailObservation out, zero = { 0 };
+		SealedVisitTest visit = { 0 };
+		WalTestRecord next = record_write(generation, root.validated_tail_lsn_exclusive,
+										  root.tail_last_record_lsn, XLOG_BLCKSZ * 2);
+		XLogRecPtr bound = next.exclusive_end;
+		uint8 corrupt = 0xff;
+		int before = fd_count();
+		if (fault == 0)
+			overwrite(next.record_start + SizeOfXLogRecord + 10, &corrupt, 1);
+		else if (fault == 1)
+			root.checkpoint_record_crc32c ^= 1;
+		else if (fault == 2)
+			root.validated_tail_lsn_exclusive = bound + 1;
+		else if (fault == 3)
+			visit.fault = 3;
+		else {
+			bound = next.record_start + SizeOfXLogRecord + 8;
+			root.validated_tail_lsn_exclusive = bound;
+		}
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT_NE(cluster_wal_flushed_prefix_visit(
+						 scratch, &ref, wal_segment_size, root.checkpoint_lower_lsn,
+						 root.validated_tail_lsn_exclusive, bound, root.checkpoint_lower_lsn,
+						 root.checkpoint_record_crc32c, sealed_visit, &visit, &out),
+					 0);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		UT_ASSERT_EQ(fd_count(), before);
+	}
+}
+
+UT_TEST(live_prefix_ignores_unflushed_suffix_but_preserves_cleanup)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		ClusterControlRootSnapshot root = sealed_fixture(false);
+		ClusterWalTailObservation out, zero = { 0 };
+		SealedVisitTest visit = { 0 };
+		WalTestRecord next = record_write(generation, root.validated_tail_lsn_exclusive,
+										  root.tail_last_record_lsn, XLOG_BLCKSZ * 2);
+		uint8 corrupt = 0xff;
+		volatile bool caught = false;
+		int before = fd_count();
+		overwrite(next.record_start + SizeOfXLogRecord + 10, &corrupt, 1);
+		if (fault == 1)
+			visit.fault = 1;
+		if (fault == 2)
+			visit.fault = 2;
+		if (fault == 3)
+			close_action = 1;
+		memset(&out, 0xa5, sizeof(out));
+		PG_TRY();
+		{
+			ClusterControlRootResult result = cluster_wal_flushed_prefix_visit(
+				scratch, &ref, wal_segment_size, root.checkpoint_lower_lsn,
+				root.validated_tail_lsn_exclusive, next.record_start + SizeOfXLogRecord + 8,
+				root.checkpoint_lower_lsn, root.checkpoint_record_crc32c, sealed_visit, &visit,
+				&out);
+			if (fault == 0) {
+				UT_ASSERT_EQ(result, 0);
+				UT_ASSERT_EQ(out.complete_end, root.validated_tail_lsn_exclusive);
+				UT_ASSERT_EQ(visit.calls, 1);
+			} else
+				UT_ASSERT_NE(result, 0);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 2);
+		if (fault != 0)
+			UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		UT_ASSERT_EQ(fd_count(), before);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(51);
+	UT_PLAN(54);
+	UT_RUN(live_prefix_stops_at_original_flush_boundary);
+	UT_RUN(live_prefix_does_not_accept_corruption_inside_qualified_prefix);
+	UT_RUN(live_prefix_ignores_unflushed_suffix_but_preserves_cleanup);
 	UT_RUN(later_segment_must_match_exact_source_identity);
 	UT_RUN(later_segment_scan_preserves_failure_cleanup_and_namespace);
 	UT_RUN(missing_unpromised_middle_segment_is_not_a_tail);
