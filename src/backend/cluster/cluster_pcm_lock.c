@@ -6143,6 +6143,24 @@ cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecP
 	entry = entry_ref.entry;
 
 	pcm_entry_lock_exclusive(entry);
+	if (cluster_shared_config) {
+		int32 previous = entry->x_holder_node;
+		bool had_x = pg_atomic_read_u32(&entry->master_state) == PCM_STATE_X;
+
+		if (pg_atomic_read_u64(&entry->transition_count_local) >= UINT64_MAX - 1
+			|| (had_x && (previous < 0 || previous >= 32))) {
+			LWLockRelease(&entry->entry_lock.lock);
+			pcm_entry_ref_release(&entry_ref);
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("shared X grant lost its prior authority generation")));
+		}
+		/* The legacy self-ship path can still reach this owner. Remember
+		 * its departing writer atomically with the grant, even when no
+		 * physical PI was retained. A later keeper note is insufficient. */
+		if (had_x && previous != requester_node)
+			pg_atomic_fetch_or_u32(&entry->pi_holders_bitmap, (uint32)1u << previous);
+		pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
+	}
 	pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
 	entry->x_holder_node = requester_node;
 	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);

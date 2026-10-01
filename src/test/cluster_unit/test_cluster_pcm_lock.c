@@ -9425,6 +9425,36 @@ setup_pi_write_master(BufferTag tag)
 	UT_ASSERT(cluster_pcm_lock_pi_write_snapshot_v1(tag, &pi_receipt_cut));
 }
 
+UT_TEST(test_shared_legacy_grant_keeps_departed_writers_without_physical_pi)
+{
+	BufferTag tag = make_tag(6513);
+	struct StopPcmEntryLayout *entry;
+	uint64 before;
+
+	for (int shared = 0; shared < 2; shared++) {
+		reset_fake_pcm_runtime(4);
+		cluster_node_id = 0;
+		cluster_shared_config = shared;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_X, 0),
+					 PCM_GCS_TRANSITION_APPLIED);
+		entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+		UT_ASSERT_NOT_NULL(entry);
+		before = pg_atomic_read_u64(&entry->transition_count_local);
+		/* This is the actual self-ship grant owner, with no PI conversion
+		 * or keeper note. A -> B -> C still owes both former writers. */
+		cluster_pcm_lock_master_grant_x_to(tag, 1, 100, (SCN)10, 1, 17);
+		cluster_pcm_lock_master_grant_x_to(tag, 2, 101, (SCN)11, 2, 17);
+		UT_ASSERT_EQ(entry->x_holder_node, 2);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), shared ? 3 : 0);
+		if (shared)
+			UT_ASSERT(pg_atomic_read_u64(&entry->transition_count_local) > before);
+		cluster_pcm_lock_master_grant_x_to(tag, 2, 101, (SCN)11, 2, 17);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), shared ? 3 : 0);
+	}
+}
+
 UT_TEST(test_pi_write_master_exact_retirement)
 {
 	BufferTag tag = make_tag(6510);
@@ -19477,7 +19507,7 @@ UT_TEST(test_stop_seal_keeps_original_identity_validation_first)
 int
 main(void)
 {
-	UT_PLAN(283);
+	UT_PLAN(288);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -19617,6 +19647,7 @@ main(void)
 	UT_RUN(test_resource_x_adapter_head_rebinds_only_before_assert);
 	UT_RUN(test_resource_x_settled_retirement_tombstone_replays_and_frees_live_slot);
 	UT_RUN(test_pi_write_master_exact_retirement);
+	UT_RUN(test_shared_legacy_grant_keeps_departed_writers_without_physical_pi);
 	UT_RUN(test_pi_write_master_refuses_later_handoff_and_pending);
 	UT_RUN(test_resource_x_tombstone_lineage_drift_remains_terminal);
 	UT_RUN(test_pcm_protocol_debt_projection_rejects_settled_without_cached_or_pi);
