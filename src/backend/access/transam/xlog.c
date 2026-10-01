@@ -6161,7 +6161,9 @@ ClusterStartupWriterSelect(void)
 		|| selected.first_segment_lsn > UINT64_MAX - wal_segment_size
 		|| selected.sealed_input_end != selected.input_record_end
 		|| selected.timeline != selected.input_timeline
-		|| ControlFile->checkPoint != selected.predecessor.snapshot.checkpoint_lower_lsn
+		|| ControlFile->checkPoint != selected.predecessor.snapshot.tail_last_record_lsn
+		|| selected.predecessor.snapshot.checkpoint_lower_lsn == InvalidXLogRecPtr
+		|| selected.predecessor.snapshot.checkpoint_lower_lsn > ControlFile->checkPoint
 		|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("native startup contradicts its selected clean input")));
@@ -6196,7 +6198,9 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 		|| input->lastRec != selected.input_record_start
 		|| input->lastRecTLI != selected.input_timeline
 		|| input->endOfLogTLI != selected.input_timeline
-		|| ControlFile->checkPoint != selected.predecessor.snapshot.checkpoint_lower_lsn
+		|| ControlFile->checkPoint != selected.predecessor.snapshot.tail_last_record_lsn
+		|| selected.predecessor.snapshot.checkpoint_lower_lsn == InvalidXLogRecPtr
+		|| selected.predecessor.snapshot.checkpoint_lower_lsn > ControlFile->checkPoint
 		|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("native recovery result contradicts its selected clean input")));
@@ -8188,11 +8192,13 @@ ClusterStartupCheckpointPrepare(int flags, ControlFileData *selected)
 		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
 		|| cluster_cf_held(ExclusiveLock)
 		|| !cluster_wal_writer_startup_matches(&clusterStartupWriter.claim.identity,
-												clusterStartupWriter.operation_uuid,
-												clusterStartupWriter.first_segment_lsn)
+											   clusterStartupWriter.operation_uuid,
+											   clusterStartupWriter.first_segment_lsn)
 		|| ControlFile->state != DB_SHUTDOWNED
 		|| ControlFile->system_identifier != clusterStartupWriter.claim.identity.system_identifier
-		|| ControlFile->checkPoint != clusterStartupWriter.predecessor.snapshot.checkpoint_lower_lsn
+		|| ControlFile->checkPoint != clusterStartupWriter.predecessor.snapshot.tail_last_record_lsn
+		|| clusterStartupWriter.predecessor.snapshot.checkpoint_lower_lsn == InvalidXLogRecPtr
+		|| clusterStartupWriter.predecessor.snapshot.checkpoint_lower_lsn > ControlFile->checkPoint
 		|| ControlFile->checkPointCopy.ThisTimeLineID != clusterStartupWriter.timeline
 		|| ControlFile->minRecoveryPoint != 0 || ControlFile->minRecoveryPointTLI != 0
 		|| ControlFile->backupStartPoint != 0 || ControlFile->backupEndPoint != 0

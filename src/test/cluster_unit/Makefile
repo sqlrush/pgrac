@@ -127,6 +127,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_control_cf_poll \
 		test_cluster_control_walr \
 		test_cluster_control_ir \
+		test_cluster_recovery_cold_cut \
 		test_cluster_shared_config \
 		test_cluster_config_delivery_driver \
 		test_cluster_config_delivery_route \
@@ -515,6 +516,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_control_retire_master,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_cf_poll,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_walr,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_ir,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_recovery_cold_cut,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_startup_exit,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_members,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_mount,$(SIMPLE_TESTS))
@@ -6900,6 +6902,18 @@ test_cluster_wal_state_rmw: test_cluster_wal_state_rmw.c unit_test.h \
 # heap ordering scn->lsn->node, G/S/L/U class matrix, xl_scn layout).
 # Header-only; scn_recovery_cmp stubbed in-test (cluster_scn.o not
 # linked).  Header deps explicit per L229.
+test_cluster_recovery_cold_cut.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
+	awk '/^cluster_recovery_merge_project_readonly\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_recovery_cold_cut: test_cluster_recovery_cold_cut.c unit_test.h \
+		test_cluster_recovery_cold_cut.inc \
+		$(top_srcdir)/src/include/cluster/cluster_control_root.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_source.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
 test_cluster_recovery_merge: test_cluster_recovery_merge.c unit_test.h \
 		../../../src/include/cluster/cluster_recovery_merge.h \
 		../../../src/include/access/xlogrecord.h $(CLUSTER_VERSION_O)

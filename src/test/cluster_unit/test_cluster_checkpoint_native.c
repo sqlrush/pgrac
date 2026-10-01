@@ -742,6 +742,7 @@ startup_fixture(void)
 	clusterStartupWriter.timeline = 1;
 	clusterStartupWriter.first_segment_lsn = 128;
 	clusterStartupWriter.predecessor.snapshot.checkpoint_lower_lsn = 100;
+	clusterStartupWriter.predecessor.snapshot.tail_last_record_lsn = 100;
 }
 
 static bool
@@ -1071,6 +1072,36 @@ UT_TEST(legacy_startup_does_not_select_shared_initializer)
 	UT_ASSERT(!clusterStartupWriterSelected);
 }
 
+UT_TEST(clean_restart_uses_shutdown_checkpoint_above_retained_floor)
+{
+	writer_begin_fixture();
+	offered.predecessor.snapshot.checkpoint_lower_lsn = 80;
+	UT_ASSERT_EQ(writer_begin(), wal_segment_size);
+	UT_ASSERT(clusterStartupWriterSelected && clusterStartupWriterBound);
+	UT_ASSERT(startup_prepare(CHECKPOINT_END_OF_RECOVERY));
+	UT_ASSERT_EQ(candidate.checkPoint, 100);
+	UT_ASSERT_EQ(clusterStartupWriter.predecessor.snapshot.checkpoint_lower_lsn, 80);
+	UT_ASSERT_EQ(clusterStartupWriter.predecessor.snapshot.tail_last_record_lsn, 100);
+}
+
+UT_TEST(clean_restart_rejects_wrong_shutdown_tail_at_each_native_boundary)
+{
+	writer_begin_fixture();
+	offered.predecessor.snapshot.checkpoint_lower_lsn = 80;
+	offered.predecessor.snapshot.tail_last_record_lsn++;
+	UT_ASSERT(!startup_first_native_site());
+	UT_ASSERT_EQ(startup_directory_calls | route_calls | bind_calls, 0);
+	writer_begin_fixture();
+	UT_ASSERT(startup_first_native_site());
+	clusterStartupWriter.predecessor.snapshot.tail_last_record_lsn++;
+	UT_ASSERT_EQ(writer_bind(), InvalidXLogRecPtr);
+	UT_ASSERT_EQ(route_calls | bind_calls, 0);
+	startup_fixture();
+	clusterStartupWriter.predecessor.snapshot.tail_last_record_lsn++;
+	UT_ASSERT(!startup_prepare(CHECKPOINT_END_OF_RECOVERY));
+	UT_ASSERT_EQ(native_writes | local_updates, 0);
+}
+
 UT_TEST(writer_begin_routes_only_after_all_target_initializing)
 {
 	writer_begin_fixture();
@@ -1257,7 +1288,9 @@ UT_TEST(native_startup_insert_has_no_link_or_page_from_predecessor)
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(33);
+	UT_RUN(clean_restart_uses_shutdown_checkpoint_above_retained_floor);
+	UT_RUN(clean_restart_rejects_wrong_shutdown_tail_at_each_native_boundary);
 	UT_RUN(static_common_wait_precedes_initializer_and_native_directory);
 	UT_RUN(static_common_mismatch_or_cancel_never_writes);
 	UT_RUN(static_common_is_rechecked_before_new_wal_binding);

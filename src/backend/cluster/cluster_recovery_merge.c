@@ -55,6 +55,7 @@
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_tail.h"
 #include "postmaster/startup.h"				   /* spec-6.14 D9 amend: HandleStartupProcInterrupts */
 #include "cluster/storage/cluster_shared_fs.h" /* spec-4.5a D4: capability gate */
 #include "lib/stringinfo.h"
@@ -987,13 +988,10 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 							 "%sthread %u peer (node %d) is not a shared-root participant",
 							 blockers.len ? "; " : "", (unsigned)tid, (int)tid - 1);
 
-		/* Candidate start point + fpw history from the CANONICAL control root
-		 * (RF-ROOT P7 G1b-A): the root's checkpoint_lower_lsn is refreshed
-		 * every checkpoint (CHECKPOINT_ADVANCE) and its FPW_WAS_OFF sticky
-		 * by the checkpointer (FPW_STICKY); the wal-state registry is
-		 * telemetry only.  Startup-process context (cold recovery): the
-		 * STRONG root read's CF(S) is legal here and already exercised by
-		 * the fence-plan revalidation below (:1366). */
+		/* The canonical physical retention floor is not a redo start.
+		 * Until cold replay consumes the full typed ancestry plan, refuse
+		 * a peer with retained history before its same-token native redo.
+		 * The legacy profile keeps its original checkpoint semantics. */
 		{
 			ClusterControlRootIdentity root_identity;
 			ClusterControlRootSnapshot root_snapshot;
@@ -1010,13 +1008,34 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 				appendStringInfo(&blockers, "%sthread %u canonical root unreadable (result %d)",
 								 blockers.len ? "; " : "", (unsigned)tid, (int)root_result);
 			} else {
+				XLogRecPtr redo = root_snapshot.checkpoint_lower_lsn;
+
 				if (root_snapshot.checkpoint_lower_lsn == 0)
 					appendStringInfo(&blockers, "%sthread %u has no checkpoint redo start",
 									 blockers.len ? "; " : "", (unsigned)tid);
 				if ((root_snapshot.root_flags & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF) != 0)
 					appendStringInfo(&blockers, "%sthread %u ran with full_page_writes=off",
 									 blockers.len ? "; " : "", (unsigned)tid);
-				out_start[tid] = (XLogRecPtr)root_snapshot.checkpoint_lower_lsn;
+				if (cluster_shared_config) {
+					ClusterWalSourceRef source;
+
+					root_result = cluster_control_root_recovery_source_v1(
+						&root_snapshot, &root_token, &source, &redo);
+					if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || redo == 0) {
+						appendStringInfo(
+							&blockers,
+							"%sthread %u native checkpoint input is unproven (result %d)",
+							blockers.len ? "; " : "", (unsigned)tid, (int)root_result);
+						continue;
+					}
+					if (redo != root_snapshot.checkpoint_lower_lsn) {
+						appendStringInfo(
+							&blockers, "%sthread %u retained history requires typed cold recovery",
+							blockers.len ? "; " : "", (unsigned)tid);
+						continue;
+					}
+				}
+				out_start[tid] = redo;
 			}
 		}
 	}
