@@ -52,13 +52,13 @@ fabric_preflight_side_component(void *arg, const RfOpcodeRouteV1 *route,
 								const RfPageVersionEdgeEntryV1 *edge, const DecodedBkpBlock *block)
 {
 	(void)arg;
-	return route != NULL && route->record_owner == RF_ROUTE_OWNER_PAGE_CODEC && edge != NULL
-				   && block != NULL
-				   && (edge->page_class == RF_PAGE_CLASS_ROUTED_HEADER
-					   || edge->page_class == RF_PAGE_CLASS_ROUTED_SIDE
-					   || edge->page_class == RF_PAGE_CLASS_ROUTED_SPACE)
-			   ? RF_PAGE_PROOF_DETAIL_OK
-			   : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	(void)route;
+	(void)edge;
+	(void)block;
+	/* The SIDE plan owns independent typed records, not routed components
+	 * inside PAGE records. A class label alone cannot discharge that page's
+	 * obligation. Refuse before either lane can omit it from a sealed plan. */
+	return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 }
 
 static RfPageProofDetailV1

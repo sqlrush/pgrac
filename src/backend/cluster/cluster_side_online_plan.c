@@ -607,6 +607,27 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 	detail = side_record_identity_validate(plan, record_plan, identity);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		return detail;
+	/* A caller's preflight callback is not a component consumer. Keep every
+	 * unimplemented routed component out of the sealed plan rather than
+	 * treating it as a PAGE-only record and silently dropping its duty. */
+	if (record_plan->component_count > RF_PAGE_STABLE_MAX_COMPONENTS
+		|| (record_plan->component_count != 0
+			&& record_plan->route.record_owner != RF_ROUTE_OWNER_PAGE_CODEC))
+		return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+	for (uint32 i = 0; i < record_plan->component_count; i++) {
+		const RfDetachedComponentPlanV1 *component = &record_plan->components[i];
+
+		if (component->owner == RF_DETACHED_COMPONENT_SIDE_TYPED
+			|| component->page_class == RF_PAGE_CLASS_ROUTED_HEADER
+			|| component->page_class == RF_PAGE_CLASS_ROUTED_SIDE
+			|| component->page_class == RF_PAGE_CLASS_ROUTED_SPACE)
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		if (!((component->owner == RF_DETACHED_COMPONENT_PAGE_CODEC
+			   && component->page_class == RF_PAGE_CLASS_ORDINARY)
+			  || (component->owner == RF_DETACHED_COMPONENT_REBUILDABLE
+				  && component->page_class == RF_PAGE_CLASS_REBUILDABLE_FSM)))
+			return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+	}
 	memset(&candidate, 0, sizeof(candidate));
 	if (record_plan->route.record_owner == RF_ROUTE_OWNER_SIDE_TYPED) {
 		if (record_plan->route.rmid == RM_XACT_ID

@@ -16,6 +16,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/storage_xlog.h"
+#include "catalog/pg_control.h"
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_side_online_plan.h"
@@ -3415,10 +3416,59 @@ UT_TEST(test_multi_origin_side_selection_keeps_exact_source_and_original_plan)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+UT_TEST(test_side_plan_does_not_drop_unowned_page_components)
+{
+	const uint8 classes[]
+		= { RF_PAGE_CLASS_ROUTED_HEADER, RF_PAGE_CLASS_ROUTED_SIDE, RF_PAGE_CLASS_ROUTED_SPACE };
+	uint8 uuid[16];
+
+	memset(uuid, 0x44, sizeof(uuid));
+	for (unsigned i = 0; i < lengthof(classes); i++) {
+		RfSideOnlinePlanV1 *plan = space_online_plan(200);
+		FakeXactRecord fake = { 0 };
+		RfDetachedRecordPlanV1 record = { 0 };
+		RfPageOnlineRecordIdentityV1 identity;
+
+		fake.reader.record = &fake.u.decoded;
+		fake.u.decoded.header.xl_rmid = RM_XLOG_ID;
+		fake.u.decoded.header.xl_info = XLOG_FPI;
+		fake.u.decoded.max_block_id = 0;
+		fake.u.decoded.blocks[0].in_use = true;
+		fake.u.decoded.blocks[0].forknum = i == 2 ? SPACE_FORKNUM : MAIN_FORKNUM;
+		identity = make_identity(&fake, uuid);
+		record.source_record = &fake.reader;
+		record.route.record_owner = RF_ROUTE_OWNER_PAGE_CODEC;
+		record.route.rmid = RM_XLOG_ID;
+		record.route.codec_id = RF_ROUTE_CODEC_XLOG_FPI;
+		record.component_count = 1;
+		record.components[0].page_class = classes[i];
+		record.components[0].owner = RF_DETACHED_COMPONENT_SIDE_TYPED;
+		record.components[0].before_kind = record.components[0].result_kind = RF_PAGE_STATE_ROUTED;
+		record.preflight_complete = true;
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		/* A refusal did not consume the source position or add any operation.
+		 * The same cut can still contain a PAGE-owned ordinary component. */
+		record.components[0].page_class
+			= i == 1 ? RF_PAGE_CLASS_REBUILDABLE_FSM : RF_PAGE_CLASS_ORDINARY;
+		record.components[0].owner
+			= i == 1 ? RF_DETACHED_COMPONENT_REBUILDABLE : RF_DETACHED_COMPONENT_PAGE_CODEC;
+		record.components[0].before_kind = record.components[0].result_kind
+			= i == 1 ? RF_PAGE_STATE_REBUILDABLE : RF_PAGE_STATE_PRESENT;
+		fake.u.decoded.blocks[0].forknum = i == 1 ? FSM_FORKNUM : MAIN_FORKNUM;
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 0);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(49);
+	UT_RUN(test_side_plan_does_not_drop_unowned_page_components);
 	UT_RUN(test_multi_origin_side_selection_keeps_exact_source_and_original_plan);
 	UT_RUN(test_reuse_owner_covers_retired_commit_only_after_new_physical_and_tt);
 	UT_RUN(test_init_owner_repairs_short_segment_before_header_and_commit);

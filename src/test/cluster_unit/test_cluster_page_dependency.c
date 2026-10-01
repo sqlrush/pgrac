@@ -187,6 +187,22 @@ cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *root,
 		record_init(&fixture, source_failure == 2 ? 901 : 900, 60, false, BLCKSZ - 2, 0xb2);
 	else
 		record_init(&fixture, 10, 900, true, 0, 0xa1);
+	if (source_failure >= 3 && source_failure <= 5) {
+		RfPageVersionEdgeEntryV1 *edge;
+		uint8 encoded[XLR_PAGE_VERSION_EDGE_HEADER_SIZE + XLR_PAGE_VERSION_EDGE_ENTRY_SIZE];
+		Size length;
+
+		record_init(&fixture, 10, 900, true, 0, 0xa1);
+		edge = &fixture.decoded.record.page_version_edge.entries[0];
+		memset(edge, 0, sizeof(*edge));
+		edge->page_class = source_failure == 3	 ? RF_PAGE_CLASS_ROUTED_HEADER
+						   : source_failure == 4 ? RF_PAGE_CLASS_ROUTED_SIDE
+												 : RF_PAGE_CLASS_ROUTED_SPACE;
+		edge->before_kind = edge->result_kind = RF_PAGE_STATE_ROUTED;
+		UT_ASSERT(XLogEncodePageVersionEdgeV1(encoded, sizeof(encoded), 900, edge, 1, &length));
+		if (source_failure == 5)
+			fixture.decoded.record.blocks[0].forknum = SPACE_FORKNUM;
+	}
 	fixture.reader.seg.ws_tli = root->checkpoint_tli;
 	if (!visitor(&fixture.reader, arg))
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
@@ -265,7 +281,8 @@ scan_three_roots(ClusterThreadRecoveryFabricPlanV1 **out, uint64 *records)
 		authorities[i].root_token = &tokens[i];
 		authorities[i].retention_pin = (ClusterWalRetentionPin *)&source_pin;
 	}
-	return cluster_thread_recovery_fabric_scan_roots_v1(authorities, 3, false, out, records);
+	return cluster_thread_recovery_fabric_scan_roots_v1(authorities, 3, source_failure == 5, out,
+														records);
 }
 
 UT_TEST(test_original_root_scanner_resolves_reverse_three_origin_native_page_chain)
@@ -514,10 +531,25 @@ UT_TEST(test_native_delta_decode_ignores_absent_image_fields)
 	rf_page_online_plan_destroy_v1(&plan);
 }
 
+UT_TEST(test_actual_fabric_refuses_routed_components_without_side_consumer)
+{
+	for (source_failure = 3; source_failure <= 5; source_failure++) {
+		ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
+		uint64 records = UINT64_MAX;
+
+		UT_ASSERT_EQ(scan_three_roots(&plan, &records), RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		UT_ASSERT(plan == NULL);
+		UT_ASSERT_EQ(records, 0);
+		UT_ASSERT_EQ(source_visits, 1);
+		cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+	}
+	source_failure = 0;
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(test_reverse_real_fpi_delta_chain_owns_reader_bytes);
 	UT_RUN(test_cycle_and_branch_do_not_expose_canonical_pages);
 	UT_RUN(test_corrupt_owned_fpi_is_refused_by_real_decoder);
@@ -525,6 +557,7 @@ main(void)
 	UT_RUN(test_native_delta_decode_ignores_absent_image_fields);
 	UT_RUN(test_original_root_scanner_resolves_reverse_three_origin_native_page_chain);
 	UT_RUN(test_original_root_scanner_refuses_missing_source_or_version_dependency);
+	UT_RUN(test_actual_fabric_refuses_routed_components_without_side_consumer);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
