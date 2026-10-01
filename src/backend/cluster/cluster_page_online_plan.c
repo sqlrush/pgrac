@@ -60,6 +60,7 @@ struct RfPageOnlinePlanV1 {
 	Size memory_used;
 	uint64 retention_binding_cookie;
 	RfContributorStreamCutV1 *physical_cuts;
+	ClusterWalSourceRef *sources;
 	XLogRecPtr *last_record_end;
 	bool *participant_seen;
 	RfPageOnlineTargetV1 **targets;
@@ -321,6 +322,60 @@ record_identity_validate(RfPageOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 
 			&& record->read_rec_ptr < plan->last_record_end[identity->participant_index]))
 		return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+bool
+rf_page_online_plan_bind_sources_v1(RfPageOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
+									uint32 participant_count)
+{
+	Size bytes;
+	ClusterWalSourceRef *bound;
+
+	if (plan == NULL || plan->magic != RF_PAGE_ONLINE_PLAN_MAGIC || plan->sealed
+		|| plan->queue_failed || plan->sources != NULL || sources == NULL
+		|| participant_count != plan->participant_count || participant_count == 0
+		|| participant_count > RF_PAGE_STABLE_MAX_PARTICIPANTS || plan->queue_head != NULL
+		|| plan->queued_count != 0 || plan->ordered_feed_started || plan->target_count != 0)
+		return false;
+	for (uint32 i = 0; i < participant_count; i++) {
+		const ClusterWalThreadClaimRefV2 *claim = &sources[i].claim;
+		const ClusterControlRootIdentity *id = &claim->identity;
+		const RfContributorStreamCutV1 *cut = &plan->physical_cuts[i];
+
+		if (plan->participant_seen[i] || id->system_identifier != plan->system_identifier
+			|| memcmp(id->storage_uuid, plan->storage_uuid, 16) != 0
+			|| id->origin_thread_id != cut->failed_thread
+			|| id->origin_thread_id > PGRAC_PAGE_LSN_ORIGIN_MAX + 1
+			|| id->origin_node_id != (int32)id->origin_thread_id - 1 || id->reserved42 != 0
+			|| id->reserved60 != 0 || id->thread_claim_created_at <= 0
+			|| id->origin_owner_incarnation == 0 || id->root_lineage_seq == 0
+			|| !bytes_nonzero(id->authority_uuid, 16) || claim->database_incarnation == 0
+			|| claim->database_incarnation != sources[0].claim.database_incarnation
+			|| claim->max_config_generation == 0 || !bytes_nonzero(claim->claim_sha256, 32)
+			|| sources[i].timeline != cut->timeline_id)
+			return false;
+	}
+	bytes = (Size)participant_count * sizeof(*bound);
+	if (bytes > plan->memory_budget || plan->memory_used > plan->memory_budget - bytes)
+		return false;
+	bound = (ClusterWalSourceRef *)online_alloc0(bytes);
+	if (bound == NULL)
+		return false;
+	memcpy(bound, sources, bytes);
+	plan->sources = bound;
+	plan->memory_used += bytes;
+	return true;
+}
+
+bool
+rf_page_online_plan_source_v1(const RfPageOnlinePlanV1 *plan, uint32 participant_index,
+							  ClusterWalSourceRef *out)
+{
+	if (plan == NULL || plan->magic != RF_PAGE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| plan->sources == NULL || participant_index >= plan->participant_count || out == NULL)
+		return false;
+	*out = plan->sources[participant_index];
+	return true;
 }
 
 RfPageProofDetailV1
@@ -1015,6 +1070,8 @@ rf_page_online_plan_destroy_v1(RfPageOnlinePlanV1 **plan_pointer)
 		online_free(plan->last_record_end);
 	if (plan->physical_cuts != NULL)
 		online_free(plan->physical_cuts);
+	if (plan->sources != NULL)
+		online_free(plan->sources);
 	plan->magic = 0;
 	online_free(plan);
 	*plan_pointer = NULL;

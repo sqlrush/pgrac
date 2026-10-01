@@ -9041,11 +9041,23 @@ static void
 FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 			IOContext io_context)
 {
+#ifdef USE_PGRAC_CLUSTER
+	ClusterPageWalBindingV1 wal;
+
+	/* Native checkpoint, replacement and background writers keep their
+	 * original buffer authority. A known version uses its exact WAL source,
+	 * including certified foreign images, without a local-LSN comparison. */
+	if (cluster_enabled && cluster_shared_config && !RecoveryInProgress()
+		&& cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal)) {
+		FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, &wal);
+		return;
+	}
+#endif
 	FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, NULL);
 }
 
-/* PGRAC: the original write path, with a synchronous exact-source owner for
- * SPACE recovery. Ordinary flushes have no such owner. */
+/* Original write path with an optional retained SPACE recovery owner or
+ * exact PAGE WAL evidence. Neither argument grants ordinary buffer ownership. */
 static void
 FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 						IOContext io_context, const struct ClusterSpaceRecoveryBatchV1 *recovery,
@@ -10471,6 +10483,7 @@ FlushOneBufferForSpaceRecovery(Buffer buffer, const ClusterSpaceRecoveryBatchV1 
 struct ClusterPageDataReceiptV1 {
 	uint64 magic;
 	ClusterPageDataTargetV1 target;
+	ClusterPageWalBindingV1 wal;
 };
 
 /* Neither a tag nor a pin grants write authority. Check every live fence
@@ -10681,6 +10694,7 @@ cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *target,
 	receipt = palloc(sizeof(*receipt));
 	receipt->magic = UINT64_C(0x5047444154413031);
 	receipt->target = *target;
+	receipt->wal = binding;
 	*out = receipt;
 	return true;
 }
@@ -10703,6 +10717,94 @@ cluster_page_data_receipt_free_v1(ClusterPageDataReceiptV1 **receipt)
 		pfree(*receipt);
 		*receipt = NULL;
 	}
+}
+
+bool
+cluster_page_data_prefix_v1(const RfPageOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
+							uint32 participant_count,
+							const ClusterPageDataReceiptV1 *const *receipts, uint32 receipt_count,
+							RfPageContributionPrefixV1 *prefixes)
+{
+	RfPageContributionPrefixV1 candidate[RF_PAGE_STABLE_MAX_PARTICIPANTS];
+	RfPageDataCoverageV1 *coverage = NULL;
+	uint32 target_count = rf_page_online_plan_target_count_v1(plan);
+	uint32 next_receipt = 0;
+	bool valid = false;
+
+	if (sources == NULL || prefixes == NULL || participant_count == 0
+		|| participant_count > RF_PAGE_STABLE_MAX_PARTICIPANTS || receipt_count > target_count
+		|| (receipt_count != 0 && receipts == NULL)
+		|| !rf_page_online_plan_page_prefix_v1(plan, NULL, 0, candidate, participant_count))
+		return false;
+	for (uint32 i = 0; i < participant_count; i++) {
+		const ClusterWalSourceRef *source = &sources[i];
+		ClusterWalSourceRef bound;
+		if (!rf_page_online_plan_source_v1(plan, i, &bound)
+			|| !cluster_page_data_source_same(&bound, source)
+			|| source->claim.identity.origin_thread_id != candidate[i].origin_thread
+			|| source->timeline != candidate[i].timeline || source->claim.database_incarnation == 0
+			|| source->claim.database_incarnation != sources[0].claim.database_incarnation
+			|| source->claim.identity.system_identifier == 0
+			|| source->claim.identity.system_identifier
+				   != sources[0].claim.identity.system_identifier
+			|| memcmp(source->claim.identity.storage_uuid, sources[0].claim.identity.storage_uuid,
+					  16)
+				   != 0)
+			return false;
+	}
+	if (receipt_count != 0)
+		coverage = palloc((Size)receipt_count * sizeof(*coverage));
+	/* A linear merge in target order also rejects duplicate/unordered
+	 * receipts. No receipt can fabricate a contribution absent from this
+	 * sealed chain or substitute another claim at the same thread/LSN. */
+	for (uint32 i = 0; i < target_count && next_receipt < receipt_count; i++) {
+		RfPageOnlineTargetViewV1 view;
+		ClusterPageDataTargetV1 completed;
+		const ClusterPageDataReceiptV1 *receipt = receipts[next_receipt];
+		bool exact = false;
+		if (!rf_page_online_plan_target_v1(plan, i, &view)
+			|| !cluster_page_data_receipt_read_v1(receipt, &completed)
+			|| completed.database_incarnation != sources[0].claim.database_incarnation)
+			goto done;
+		if (!rf_page_identity_equal_v1(&view.page_identity, &completed.identity))
+			continue;
+		for (uint32 j = 0; j < view.contributors->edge_count; j++) {
+			const RfPageStableEdgeInputV1 *edge = &view.contributors->edges[j];
+			const RfPageReplayRecordIdentityV1 *record = &edge->record_identity;
+			const ClusterPageWalBindingV1 *wal = &receipt->wal;
+			if (edge->result_token != completed.version.mutation_token
+				|| memcmp(edge->edge.result_incarnation, completed.version.segment_incarnation, 16)
+					   != 0)
+				continue;
+			if (edge->participant_index >= participant_count
+				|| !cluster_page_data_source_same(&wal->source, &sources[edge->participant_index])
+				|| !rf_page_identity_equal_v1(&wal->identity, &completed.identity)
+				|| !rf_page_version_equal_v1(&wal->version, &completed.version)
+				|| record->origin_thread != wal->source.claim.identity.origin_thread_id
+				|| record->timeline_id != wal->source.timeline
+				|| record->read_rec_ptr != wal->record_start
+				|| record->end_rec_ptr != wal->record_end || record->record_crc != wal->record_crc
+				|| record->rmid != wal->rmid || record->info != wal->info)
+				goto done;
+			exact = true;
+			break;
+		}
+		if (!exact)
+			goto done;
+		coverage[next_receipt].page_identity = completed.identity;
+		coverage[next_receipt].version = completed.version;
+		next_receipt++;
+	}
+	if (next_receipt != receipt_count
+		|| !rf_page_online_plan_page_prefix_v1(plan, coverage, receipt_count, candidate,
+											   participant_count))
+		goto done;
+	memcpy(prefixes, candidate, (Size)participant_count * sizeof(*prefixes));
+	valid = true;
+done:
+	if (coverage != NULL)
+		pfree(coverage);
+	return valid;
 }
 #endif
 

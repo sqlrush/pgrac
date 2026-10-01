@@ -10,6 +10,8 @@
 #define CLUSTER_PAGE_DATA_H
 
 #include "cluster/cluster_page_stable_base.h"
+#include "cluster/cluster_page_online_plan.h"
+#include "cluster/cluster_wal_source.h"
 
 typedef struct ClusterPageDataTargetV1 {
 	uint64 database_incarnation;
@@ -35,5 +37,17 @@ extern bool cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *tar
 extern bool cluster_page_data_receipt_read_v1(const ClusterPageDataReceiptV1 *receipt,
 											  ClusterPageDataTargetV1 *out);
 extern void cluster_page_data_receipt_free_v1(ClusterPageDataReceiptV1 **receipt);
+
+/* Combine actual DATA completions with one sealed, retained PAGE input.
+ * Sources are the original full claims in the plan's participant order;
+ * receipts are unique and ordered by the plan's target identity. Each must
+ * name an exact result record in that source, never a larger numeric token.
+ * This is only a PAGE constraint: the caller still owns source retention,
+ * SIDE obligations and ROOT publication. Failure leaves prefixes unchanged. */
+extern bool cluster_page_data_prefix_v1(const RfPageOnlinePlanV1 *plan,
+										const ClusterWalSourceRef *sources,
+										uint32 participant_count,
+										const ClusterPageDataReceiptV1 *const *receipts,
+										uint32 receipt_count, RfPageContributionPrefixV1 *prefixes);
 
 #endif /* CLUSTER_PAGE_DATA_H */

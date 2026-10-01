@@ -2057,6 +2057,10 @@ test_cluster_page_data.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Ma
 	     emit && /^#endif/ { print; emit=0 } emit { print } \
 	     END { if (n != 1 || emit) exit 1 }' $< > $@
 
+test_cluster_page_flush.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^FlushBuffer\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@
+
 test_cluster_page_data_stable.o: $(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
 
@@ -2088,11 +2092,20 @@ test_cluster_page_wal: test_cluster_page_wal.c unit_test.h test_cluster_page_wal
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -o $@
 
 test_cluster_page_data: test_cluster_page_data.c unit_test.h test_cluster_page_data.inc \
+		test_cluster_page_flush.inc \
 		test_cluster_space_recovery_flush.inc test_cluster_page_data_stable.o test_cluster_page_wal_product.o \
-		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
+		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o xlogreader_fs.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_page_data_stable.o test_cluster_page_wal_product.o \
-		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
-		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -o $@
+		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
+		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o xlogreader_fs.o \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -llz4 -lzstd -o $@
 
 test_cluster_space_recovery: test_cluster_space_recovery.c unit_test.h test_cluster_space_recovery_flush.inc \
 		test_cluster_space_recovery_product.o $(CLUSTER_HW_O) $(CLUSTER_UNIT_CRYPTOHASH_O) \
@@ -3949,6 +3962,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_page_data.inc
 	rm -f test_cluster_page_wal_insert.inc
 	rm -f test_cluster_page_wal_image.inc
+	rm -f test_cluster_page_flush.inc
 	rm -f test_cluster_pcm_s_prepare.inc
 	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
 	rm -f test_cluster_space_extend.inc

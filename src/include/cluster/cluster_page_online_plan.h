@@ -9,6 +9,7 @@
 #define CLUSTER_PAGE_ONLINE_PLAN_H
 
 #include "cluster/cluster_page_detached.h"
+#include "cluster/cluster_wal_source.h"
 
 #define CLUSTER_PAGE_ONLINE_PLAN_INTERFACE_V1 1
 #define CLUSTER_PAGE_DEPENDENCY_QUEUE_V1 1
@@ -62,6 +63,14 @@ typedef struct RfPageContributionPrefixV1 {
 
 extern RfPageProofDetailV1 rf_page_online_plan_create_v1(const RfPageOnlinePlanRequestV1 *request,
 														 RfPageOnlinePlanV1 **out_plan);
+/* Retained source owner binds full claims once, before any record is fed.
+ * Required by DATA completion qualification; pure graph consumers may omit.
+ * These copies never acquire retention, fencing or replay permission. */
+extern bool rf_page_online_plan_bind_sources_v1(RfPageOnlinePlanV1 *plan,
+												const ClusterWalSourceRef *sources,
+												uint32 participant_count);
+extern bool rf_page_online_plan_source_v1(const RfPageOnlinePlanV1 *plan, uint32 participant_index,
+										  ClusterWalSourceRef *out);
 extern RfPageProofDetailV1
 rf_page_online_plan_feed_record_v1(RfPageOnlinePlanV1 *plan,
 								   const RfDetachedRecordPlanV1 *record_plan,

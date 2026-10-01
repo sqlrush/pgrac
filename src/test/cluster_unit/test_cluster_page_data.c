@@ -5,7 +5,10 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
+#include "catalog/pg_control.h"
 #include "catalog/pg_tablespace_d.h"
+#include "cluster/cluster_block_apply.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_page_data.h"
@@ -37,6 +40,7 @@ int cluster_node_id = 0, NBuffers = 2, NLocBuffer;
 bool cluster_enabled = true, cluster_shared_config = true, cluster_shared_catalog = true;
 bool cluster_smart_fusion, cluster_past_image;
 ResourceOwner CurrentResourceOwner = (void *)1;
+MemoryContext TopMemoryContext = (void *)1;
 BufferUsage pgBufferUsage;
 static BufferDescPadded descriptors[2];
 BufferDescPadded *BufferDescriptors = descriptors;
@@ -92,17 +96,13 @@ fault(int at)
 	}
 }
 void *
-palloc(Size size)
+MemoryContextAllocAligned(MemoryContext context, Size size, Size alignto, int flags)
 {
-	void *p = malloc(size);
-	if (!p)
+	void *memory = NULL;
+	UT_ASSERT(context == TopMemoryContext && flags == 0);
+	if (posix_memalign(&memory, alignto, size) != 0)
 		abort();
-	return p;
-}
-void
-pfree(void *p)
-{
-	free(p);
+	return memory;
 }
 bool
 RecoveryInProgress(void)
@@ -110,6 +110,14 @@ RecoveryInProgress(void)
 	return false;
 }
 bool cluster_recmerge_window_active;
+bool cluster_recmerge_apply_foreign;
+uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
+ClusterBlkApplyResult
+cluster_block_apply_heap(XLogReaderState *record, uint8 block_id, char *page)
+{
+	/* The contribution integration below exercises actual FPI codecs only. */
+	abort();
+}
 int cluster_pcm_grd_max_entries = 100;
 static ClusterConf conf = { .node_count = 2 };
 ClusterConf *ClusterConfShmem = &conf;
@@ -303,7 +311,7 @@ GetXLogInsertRecPtr(void)
 void
 XLogFlush(XLogRecPtr lsn)
 {
-	UT_ASSERT_EQ(lsn, 0x200);
+	UT_ASSERT_EQ(lsn, PageGetLSN(pages[1].data));
 	wal_flushes++;
 	fault(1);
 }
@@ -321,20 +329,6 @@ bool
 DataChecksumsEnabled(void)
 {
 	return checksums;
-}
-void
-PageSetChecksumInplace(Page page, BlockNumber block)
-{
-	if (checksums)
-		((PageHeader)page)->pd_checksum = pg_checksum_page(page, block);
-}
-char *
-PageSetChecksumCopy(Page page, BlockNumber block)
-{
-	static PGAlignedBlock copy;
-	memcpy(copy.data, page, BLCKSZ);
-	PageSetChecksumInplace(copy.data, block);
-	return copy.data;
 }
 SMgrRelation
 smgropen(RelFileLocator r, BackendId b)
@@ -401,10 +395,11 @@ shared_buffer_write_error_callback(void *arg)
 		pg_re_throw();                                                                             \
 	} while (0)
 #include "test_cluster_space_recovery_flush.inc"
+#include "test_cluster_page_flush.inc"
 #include "test_cluster_page_data.inc"
 
 static void
-bind_native_source(void)
+bind_native_record(uint8 rmid, uint8 info)
 {
 	RfPageVersionEdgeEntryV1 e = { 0 };
 	e.page_class = RF_PAGE_CLASS_ORDINARY;
@@ -412,9 +407,16 @@ bind_native_source(void)
 	memcpy(e.result_incarnation, identity.incarnation, 16);
 	source_capture = locks[1] = true;
 	HOLD_INTERRUPTS();
-	UT_ASSERT(cluster_page_wal_capture_native_v1(2, &e, 80, 0x100, 0x200, 0x9192, RM_HEAP_ID, 0));
+	UT_ASSERT(cluster_page_wal_capture_native_v1(2, &e, target.version.mutation_token, 0x100, 0x200,
+												 0x9192, rmid, info));
 	RESUME_INTERRUPTS();
 	source_capture = locks[1] = false;
+}
+
+static void
+bind_native_source(void)
+{
+	bind_native_record(RM_HEAP_ID, 0);
 }
 
 static void
@@ -759,10 +761,356 @@ foreign_certified_image_uses_original_wal(void)
 		clean();
 	}
 }
+static void
+ordinary_flush_uses_original_source(void)
+{
+	for (int scenario = 0; scenario < 4; scenario++) {
+		ClusterPageWalBindingV1 certified, prepared;
+		volatile bool threw = false;
+		reset();
+		if (scenario > 0) {
+			UT_ASSERT(cluster_page_wal_flush_source_v1(&page_sources[1], &certified));
+			writer.claim.identity.origin_thread_id = 2;
+			writer.claim.identity.origin_node_id = cluster_node_id = 1;
+			writer.claim.claim_sha256[0]++;
+			local_insert_end = scenario == 2 ? 0x100 : 0x900;
+			if (scenario != 3) {
+				source_capture = locks[1] = true;
+				HOLD_INTERRUPTS();
+				UT_ASSERT(
+					cluster_page_wal_prepare_install_v1(2, &certified, pages[1].data, &prepared));
+				UT_ASSERT(cluster_page_wal_publish_install_v1(2, &prepared));
+				RESUME_INTERRUPTS();
+				source_capture = locks[1] = false;
+			}
+		}
+		/* Native checkpointer/replacement caller pins and content-locks the
+		 * page. Its ordinary ResourceOwner error cleanup is a fixture here. */
+		pins[1] = 1;
+		locks[0] = locks[1] = true;
+		PG_TRY();
+		{
+			FlushBuffer(&descriptors[1].bufferdesc, &relation, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+		}
+		PG_CATCH();
+		{
+			threw = true;
+			AbortBufferIO(2);
+			error_context_stack = NULL;
+		}
+		PG_END_TRY();
+		locks[0] = locks[1] = false;
+		pins[1] = 0;
+		UT_ASSERT_EQ(threw, scenario == 3);
+		UT_ASSERT_EQ(wal_flushes, 1); /* Foreign cases only flushed at A. */
+		UT_ASSERT_EQ(writes, scenario == 3 ? 0 : 1);
+		clean();
+	}
+}
+
+/* Decoded WAL is an explicit input boundary; actual preflight, detached FPI
+ * apply, dependency sealing, DATA I/O and receipt qualification run together. */
+static RfPageOnlinePlanV1 *
+data_contribution_plan(const ClusterWalSourceRef sources[3])
+{
+	RfContributorStreamCutV1 cuts[3] = { { 0 } };
+	RfPageOnlinePlanRequestV1 request = { 0 };
+	RfPageOnlinePlanV1 *plan = NULL;
+	uint64 tokens[] = { 10, 80, 19, 7 };
+	for (int i = 0; i < 3; i++) {
+		cuts[i].failed_thread = i + 1;
+		cuts[i].timeline_id = 1;
+		cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		cuts[i].scan_begin_inclusive = 0x100;
+		cuts[i].scan_end_exclusive = 0x200;
+	}
+	request.system_identifier = target.identity.system_identifier;
+	memcpy(request.storage_uuid, target.identity.storage_uuid, 16);
+	request.physical_cuts = cuts;
+	request.participant_count = 3;
+	request.retention_binding_cookie = 41;
+	UT_ASSERT_EQ(rf_page_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_page_online_plan_bind_sources_v1(plan, sources, 3));
+	for (int i = 0; i < 3; i++) {
+		union {
+			DecodedXLogRecord record;
+			char bytes[sizeof(DecodedXLogRecord) + 2 * sizeof(DecodedBkpBlock)];
+		} decoded = { 0 };
+		XLogReaderState reader = { 0 };
+		RfDetachedRecordPlanV1 detached;
+		RfPageOnlineRecordIdentityV1 input = { 0 };
+		PGAlignedBlock image;
+		char error[1024];
+		DecodedXLogRecord *record = &decoded.record;
+		reader.record = record;
+		reader.ReadRecPtr = record->lsn = 0x100;
+		reader.EndRecPtr = record->next_lsn = 0x200;
+		reader.system_identifier = request.system_identifier;
+		reader.errormsg_buf = error;
+		record->header.xl_rmid = RM_XLOG_ID;
+		record->header.xl_info = XLOG_FPI;
+		record->header.xl_crc = 0x9192;
+		record->max_block_id = i == 2 ? 1 : 0;
+		record->has_page_version_edge = true;
+		record->page_version_edge.entry_count = record->max_block_id + 1;
+		record->page_version_edge.result_token = tokens[i + 1];
+		memcpy(image.data, pages[1].data, BLCKSZ);
+		((PageHeader)image.data)->pd_block_scn = tokens[i + 1];
+		for (int j = 0; j <= record->max_block_id; j++) {
+			DecodedBkpBlock *block = &record->blocks[j];
+			RfPageVersionEdgeEntryV1 *edge = &record->page_version_edge.entries[j];
+			block->in_use = block->has_image = block->apply_image = true;
+			block->rlocator = target.identity.locator;
+			block->forknum = j == 0 ? MAIN_FORKNUM : VISIBILITYMAP_FORKNUM;
+			block->blkno = 7;
+			block->bkp_image = image.data;
+			block->bimg_len = BLCKSZ;
+			block->bimg_info = BKPIMAGE_APPLY;
+			edge->block_id = j;
+			edge->page_class = RF_PAGE_CLASS_ORDINARY;
+			edge->before_kind = edge->result_kind = RF_PAGE_STATE_PRESENT;
+			memcpy(edge->before.segment_incarnation, target.version.segment_incarnation, 16);
+			memcpy(edge->result_incarnation, target.version.segment_incarnation, 16);
+			edge->before.mutation_token = j == 0 ? tokens[i] : 30;
+			edge->edge_flags = RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE;
+		}
+		UT_ASSERT_EQ(rf_page_detached_preflight_v1(&reader, true, NULL, &detached),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		input.record.system_identifier = request.system_identifier;
+		memcpy(input.record.storage_uuid, request.storage_uuid, 16);
+		input.record.origin_thread = i + 1;
+		input.record.timeline_id = 1;
+		input.record.read_rec_ptr = 0x100;
+		input.record.end_rec_ptr = 0x200;
+		input.record.record_crc = 0x9192;
+		input.record.rmid = RM_XLOG_ID;
+		input.record.info = XLOG_FPI;
+		input.participant_index = i;
+		UT_ASSERT_EQ(rf_page_online_plan_queue_record_v1(plan, &detached, &input),
+					 RF_PAGE_PROOF_DETAIL_OK);
+	}
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+static void
+plan_sources_are_immutable(void)
+{
+	RfContributorStreamCutV1 cut = { 0 };
+	RfPageOnlinePlanRequestV1 request = { 0 };
+	RfPageOnlinePlanV1 *plan = NULL;
+	ClusterWalSourceRef source, observed, sentinel;
+	RfPageContributionPrefixV1 prefix, untouched;
+
+	reset();
+	cut.failed_thread = cut.timeline_id = 1;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE | RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY;
+	cut.scan_begin_inclusive = cut.scan_end_exclusive = 0x100;
+	request.system_identifier = writer.claim.identity.system_identifier;
+	memcpy(request.storage_uuid, writer.claim.identity.storage_uuid, 16);
+	request.physical_cuts = &cut;
+	request.participant_count = request.retention_binding_cookie = 1;
+	UT_ASSERT_EQ(rf_page_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+	for (int i = 0; i < 14; i++) {
+		source = writer;
+		switch (i) {
+		case 0:
+			source.claim.identity.system_identifier++;
+			break;
+		case 1:
+			source.claim.identity.storage_uuid[0]++;
+			break;
+		case 2:
+			source.claim.identity.origin_thread_id++;
+			break;
+		case 3:
+			source.claim.identity.origin_node_id++;
+			break;
+		case 4:
+			source.claim.identity.reserved42++;
+			break;
+		case 5:
+			source.claim.identity.reserved60++;
+			break;
+		case 6:
+			source.claim.identity.thread_claim_created_at = 0;
+			break;
+		case 7:
+			source.claim.identity.origin_owner_incarnation = 0;
+			break;
+		case 8:
+			source.claim.identity.root_lineage_seq = 0;
+			break;
+		case 9:
+			memset(source.claim.identity.authority_uuid, 0, 16);
+			break;
+		case 10:
+			source.claim.database_incarnation = 0;
+			break;
+		case 11:
+			source.claim.max_config_generation = 0;
+			break;
+		case 12:
+			memset(source.claim.claim_sha256, 0, 32);
+			break;
+		case 13:
+			source.timeline++;
+			break;
+		}
+		UT_ASSERT(!rf_page_online_plan_bind_sources_v1(plan, &source, 1));
+	}
+	source = writer;
+	UT_ASSERT(!rf_page_online_plan_bind_sources_v1(plan, &source, 0));
+	UT_ASSERT(!rf_page_online_plan_bind_sources_v1(plan, NULL, 1));
+	UT_ASSERT(rf_page_online_plan_bind_sources_v1(plan, &source, 1));
+	UT_ASSERT(!rf_page_online_plan_bind_sources_v1(plan, &source, 1));
+	memset(&sentinel, 0xa5, sizeof(sentinel));
+	observed = sentinel;
+	UT_ASSERT(!rf_page_online_plan_source_v1(plan, 0, &observed));
+	UT_ASSERT_EQ(memcmp(&observed, &sentinel, sizeof(observed)), 0);
+	source.claim.identity.origin_owner_incarnation++;
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_page_online_plan_source_v1(plan, 0, &observed));
+	UT_ASSERT(cluster_page_data_source_same(&observed, &writer));
+	observed = sentinel;
+	UT_ASSERT(!rf_page_online_plan_source_v1(plan, 1, &observed));
+	UT_ASSERT_EQ(memcmp(&observed, &sentinel, sizeof(observed)), 0);
+	UT_ASSERT(cluster_page_data_prefix_v1(plan, &writer, 1, NULL, 0, &prefix));
+	UT_ASSERT_EQ(prefix.first_uncovered_lsn, 0x100);
+	rf_page_online_plan_destroy_v1(&plan);
+	UT_ASSERT_EQ(rf_page_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(!rf_page_online_plan_bind_sources_v1(plan, &writer, 1));
+	memset(&untouched, 0xa5, sizeof(untouched));
+	prefix = untouched;
+	UT_ASSERT(!cluster_page_data_prefix_v1(plan, &writer, 1, NULL, 0, &prefix));
+	UT_ASSERT_EQ(memcmp(&prefix, &untouched, sizeof(prefix)), 0);
+	rf_page_online_plan_destroy_v1(&plan);
+	clean();
+}
+
+static void
+physical_receipts_close_only_exact_contributions(void)
+{
+	ClusterPageDataReceiptV1 *old = NULL, *main = NULL, *vm = NULL;
+	const ClusterPageDataReceiptV1 *receipts[2];
+	ClusterWalSourceRef sources[3];
+	RfPageContributionPrefixV1 prefixes[3] = { { 0 } }, sentinel[3];
+	RfPageOnlinePlanV1 *plan;
+	FILE *main_file;
+	reset();
+	for (int i = 0; i < 3; i++) {
+		sources[i] = writer;
+		sources[i].claim.identity.origin_thread_id = i + 1;
+		sources[i].claim.identity.origin_node_id = i;
+		sources[i].claim.claim_sha256[1] = i;
+	}
+	plan = data_contribution_plan(sources);
+	bind_native_record(RM_XLOG_ID, XLOG_FPI);
+	UT_ASSERT(cluster_bufmgr_write_page_data_v1(&target, &old));
+	receipts[0] = old;
+	UT_ASSERT(cluster_page_data_prefix_v1(plan, sources, 3, receipts, 1, prefixes));
+	UT_ASSERT_EQ(prefixes[0].first_uncovered_lsn, 0x200);
+	UT_ASSERT_EQ(prefixes[1].first_uncovered_lsn, 0x100);
+	UT_ASSERT_EQ(prefixes[2].first_uncovered_lsn, 0x100);
+	writer = sources[2];
+	cluster_node_id = 2;
+	target.version.mutation_token = ((PageHeader)pages[1].data)->pd_block_scn = 7;
+	UT_ASSERT(PageSetLSNOrigin(pages[1].data, 2));
+	pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_DIRTY);
+	bind_native_record(RM_XLOG_ID, XLOG_FPI);
+	UT_ASSERT(cluster_bufmgr_write_page_data_v1(&target, &main));
+	receipts[0] = main;
+	UT_ASSERT(cluster_page_data_prefix_v1(plan, sources, 3, receipts, 1, prefixes));
+	UT_ASSERT_EQ(prefixes[0].first_uncovered_lsn, 0x200);
+	UT_ASSERT_EQ(prefixes[1].first_uncovered_lsn, 0x200);
+	UT_ASSERT_EQ(prefixes[2].first_uncovered_lsn, 0x100); /* C's VM is not written. */
+	main_file = file;
+	file = tmpfile(); /* Physical fork routing remains the explicit smgr fixture. */
+	UT_ASSERT(file != NULL);
+	target.identity.forknum = descriptors[1].bufferdesc.tag.forkNum = VISIBILITYMAP_FORKNUM;
+	pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_DIRTY);
+	bind_native_record(RM_XLOG_ID, XLOG_FPI);
+	UT_ASSERT(cluster_bufmgr_write_page_data_v1(&target, &vm));
+	receipts[1] = vm;
+	UT_ASSERT(cluster_page_data_prefix_v1(plan, sources, 3, receipts, 2, prefixes));
+	for (int i = 0; i < 3; i++)
+		UT_ASSERT_EQ(prefixes[i].first_uncovered_lsn, 0x200);
+	/* An old completion plus C's VM still cannot cover B/C's main page. */
+	receipts[0] = old;
+	UT_ASSERT(cluster_page_data_prefix_v1(plan, sources, 3, receipts, 2, prefixes));
+	UT_ASSERT_EQ(prefixes[1].first_uncovered_lsn, 0x100);
+	UT_ASSERT_EQ(prefixes[2].first_uncovered_lsn, 0x100);
+	memset(sentinel, 0xa5, sizeof(sentinel));
+	for (int i = 0; i < 7; i++) {
+		ClusterWalSourceRef changed[3];
+		memcpy(changed, sources, sizeof(changed));
+		memcpy(prefixes, sentinel, sizeof(prefixes));
+		receipts[0] = main;
+		receipts[1] = vm;
+		if (i == 0)
+			changed[2].claim.identity.origin_owner_incarnation++;
+		if (i == 1)
+			changed[2].claim.claim_sha256[0]++;
+		if (i == 2)
+			changed[2].claim.database_incarnation++;
+		if (i == 3)
+			receipts[0] = NULL;
+		if (i == 4)
+			receipts[1] = main;
+		if (i == 5) {
+			receipts[0] = vm;
+			receipts[1] = main;
+		}
+		if (i == 6)
+			changed[1].claim.identity.origin_owner_incarnation++;
+		UT_ASSERT(!cluster_page_data_prefix_v1(plan, changed, 3, receipts, 2, prefixes));
+		UT_ASSERT_EQ(memcmp(prefixes, sentinel, sizeof(prefixes)), 0);
+	}
+	/* Physical completion of another record/version is not evidence for
+	 * this sealed input, even at the same page address and writer. */
+	for (int i = 0; i < 4; i++) {
+		ClusterPageDataReceiptV1 *other = NULL;
+		RfPageVersionEdgeEntryV1 edge = { 0 };
+		uint64 token = i == 3 ? 999 : 7;
+		XLogRecPtr end = i == 3 ? 0x400 : 0x200;
+		target.version.mutation_token = ((PageHeader)pages[1].data)->pd_block_scn = token;
+		PageSetLSNPreserveOrigin(pages[1].data, end);
+		edge.page_class = RF_PAGE_CLASS_ORDINARY;
+		edge.result_kind = RF_PAGE_STATE_PRESENT;
+		memcpy(edge.result_incarnation, target.version.segment_incarnation, 16);
+		source_capture = locks[1] = true;
+		HOLD_INTERRUPTS();
+		UT_ASSERT(cluster_page_wal_capture_native_v1(2, &edge, token,
+													 i == 3	  ? 0x300
+													 : i == 2 ? 0x108
+															  : 0x100,
+													 end, i == 0 ? 0x9193 : 0x9192, RM_XLOG_ID,
+													 i == 1 ? XLOG_FPI_FOR_HINT : XLOG_FPI));
+		RESUME_INTERRUPTS();
+		source_capture = locks[1] = false;
+		pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_DIRTY);
+		UT_ASSERT(cluster_bufmgr_write_page_data_v1(&target, &other));
+		receipts[0] = main;
+		receipts[1] = other;
+		memcpy(prefixes, sentinel, sizeof(prefixes));
+		UT_ASSERT(!cluster_page_data_prefix_v1(plan, sources, 3, receipts, 2, prefixes));
+		UT_ASSERT_EQ(memcmp(prefixes, sentinel, sizeof(prefixes)), 0);
+		cluster_page_data_receipt_free_v1(&other);
+	}
+	cluster_page_data_receipt_free_v1(&old);
+	cluster_page_data_receipt_free_v1(&main);
+	cluster_page_data_receipt_free_v1(&vm);
+	rf_page_online_plan_destroy_v1(&plan);
+	fclose(file);
+	file = main_file;
+	clean();
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(12);
 	UT_RUN(success_and_old_completion);
 	UT_RUN(identity_refusals);
 	UT_RUN(authority_refusals);
@@ -772,6 +1120,9 @@ main(void)
 	UT_RUN(vm_and_clean_completion);
 	UT_RUN(new_claim_never_flushes_old_coordinate);
 	UT_RUN(foreign_certified_image_uses_original_wal);
+	UT_RUN(ordinary_flush_uses_original_source);
+	UT_RUN(plan_sources_are_immutable);
+	UT_RUN(physical_receipts_close_only_exact_contributions);
 	if (file)
 		fclose(file);
 	UT_DONE();

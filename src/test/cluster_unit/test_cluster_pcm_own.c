@@ -135,6 +135,7 @@ static bool transition_copy_active;
 static bool transition_wal_error;
 static int transition_wal_calls;
 static int transition_wal_changes;
+bool cluster_enabled = true;
 bool cluster_shared_config;
 bool cluster_past_image;
 static bool transition_drop_active, transition_prepin_dirty, transition_unpin_dirty;
