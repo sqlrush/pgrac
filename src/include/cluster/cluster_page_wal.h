@@ -1,5 +1,5 @@
 /* Exact last-mutation WAL source for a versioned resident page.
- * In-memory values only; neither WAL durability nor writer authority.
+ * In-memory values only; never DATA durability or writer authority.
  * Author: SqlRush <sqlrush@gmail.com> */
 #ifndef CLUSTER_PAGE_WAL_H
 #define CLUSTER_PAGE_WAL_H
@@ -19,19 +19,20 @@ typedef struct ClusterPageWalBindingV1 {
 	uint32 record_crc;
 	uint8 rmid;
 	uint8 info;
-	uint16 reserved_zero;
+	uint16 flags;
 } ClusterPageWalBindingV1;
 
-/* Pure carrier consistency, not authority or durability. The caller supplies
- * aligned page bytes and the independently selected physical address. */
+#define CLUSTER_PAGE_WAL_NATIVE_FLUSHED UINT16_C(1)
+
+/* Pure carrier consistency. Validation cannot certify a new flush or grant
+ * authority. The match helper also requires aligned page bytes and an
+ * independently selected physical address. */
 static inline bool
-cluster_page_wal_binding_matches_v1(const ClusterPageWalBindingV1 *b, RelFileLocator locator,
-									ForkNumber forknum, BlockNumber blockno, Page page)
+cluster_page_wal_binding_shape_v1(const ClusterPageWalBindingV1 *b)
 {
 	static const uint8 zero[32] = { 0 };
 	const ClusterControlRootIdentity *id;
-	int origin;
-	if (b == NULL || page == NULL)
+	if (b == NULL)
 		return false;
 	id = &b->source.claim.identity;
 	return id->system_identifier != 0 && id->reserved42 == 0 && id->reserved60 == 0
@@ -44,17 +45,35 @@ cluster_page_wal_binding_matches_v1(const ClusterPageWalBindingV1 *b, RelFileLoc
 		   && memcmp(b->source.claim.claim_sha256, zero, 32) != 0 && b->source.timeline != 0
 		   && b->identity.system_identifier == id->system_identifier
 		   && memcmp(b->identity.storage_uuid, id->storage_uuid, 16) == 0
-		   && RelFileLocatorEquals(b->identity.locator, locator) && b->identity.forknum == forknum
-		   && b->identity.blockno == blockno
-		   && (forknum == MAIN_FORKNUM || forknum == VISIBILITYMAP_FORKNUM)
-		   && b->identity.reserved_zero == 0 && b->reserved_zero == 0
+		   && (b->identity.forknum == MAIN_FORKNUM || b->identity.forknum == VISIBILITYMAP_FORKNUM)
+		   && b->identity.reserved_zero == 0 && (b->flags & ~CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
 		   && memcmp(b->version.segment_incarnation, zero, 16) != 0
 		   && b->version.mutation_token != 0 && b->record_start != InvalidXLogRecPtr
-		   && b->record_start < b->record_end && !PageIsNew(page)
+		   && b->record_start < b->record_end;
+}
+
+static inline bool
+cluster_page_wal_binding_matches_v1(const ClusterPageWalBindingV1 *b, RelFileLocator locator,
+									ForkNumber forknum, BlockNumber blockno, Page page)
+{
+	int origin;
+	return page != NULL && cluster_page_wal_binding_shape_v1(b)
+		   && RelFileLocatorEquals(b->identity.locator, locator) && b->identity.forknum == forknum
+		   && b->identity.blockno == blockno && !PageIsNew(page)
 		   && ((PageHeader)page)->pd_block_scn == b->version.mutation_token
 		   && PageGetLSN(page) == b->record_end && PageGetLSNOrigin(page, &origin)
-		   && origin == id->origin_thread_id - 1;
+		   && origin == b->source.claim.identity.origin_thread_id - 1;
 }
+
+/* Only the original selected native writer can certify a new flush. A
+ * carrier already certified by that owner may relay it in the same namespace.
+ * Caller keeps its original pin/ownership but need not hold a content lock;
+ * it must revalidate the exact page binding after the potentially blocking I/O.
+ * Failure/ERROR leaves output untouched and cannot certify DATA or ancestry. */
+extern bool cluster_page_wal_flush_source_v1(const ClusterPageWalBindingV1 *binding,
+											 ClusterPageWalBindingV1 *certified);
+extern bool cluster_page_wal_same_mutation_v1(const ClusterPageWalBindingV1 *a,
+											  const ClusterPageWalBindingV1 *b);
 
 extern Size cluster_page_wal_shmem_size(void);
 extern void cluster_page_wal_shmem_init(void);

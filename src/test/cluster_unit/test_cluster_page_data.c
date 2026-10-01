@@ -52,6 +52,7 @@ static bool stale_sync, redirty_sync, checksums = true;
 static bool zero_disk, late_fence;
 static int throw_at;
 static unsigned writes, syncs, reads, wal_flushes, aborts;
+static XLogRecPtr local_insert_end;
 static FILE *file;
 static SMgrRelationData relation;
 static ClusterPageDataTargetV1 target;
@@ -297,7 +298,7 @@ AbortBufferIO(Buffer buf)
 XLogRecPtr
 GetXLogInsertRecPtr(void)
 {
-	return 0x500;
+	return local_insert_end;
 }
 void
 XLogFlush(XLogRecPtr lsn)
@@ -420,6 +421,8 @@ static void
 reset(void)
 {
 	PageHeader p = (PageHeader)pages[1].data;
+	local_insert_end = 0x500;
+	cluster_node_id = 0;
 	if (file)
 		fclose(file);
 	file = tmpfile();
@@ -457,6 +460,7 @@ reset(void)
 	writer.claim.identity.storage_uuid[0] = 1;
 	writer.claim.identity.authority_uuid[0] = 8;
 	writer.claim.identity.origin_thread_id = 1;
+	writer.claim.identity.thread_claim_created_at = 100;
 	writer.claim.identity.origin_owner_incarnation = 9;
 	writer.claim.identity.root_lineage_seq = 1;
 	writer.claim.database_incarnation = 3;
@@ -723,10 +727,42 @@ new_claim_never_flushes_old_coordinate(void)
 	}
 }
 
+static void
+foreign_certified_image_uses_original_wal(void)
+{
+	for (int c = 0; c < 2; c++) {
+		ClusterPageDataReceiptV1 *r = NULL;
+		ClusterPageWalBindingV1 certified, prepared;
+		reset();
+		UT_ASSERT(cluster_page_wal_flush_source_v1(&page_sources[1], &certified));
+		UT_ASSERT_EQ(wal_flushes, 1);
+		writer.claim.identity.origin_thread_id = 2;
+		writer.claim.identity.origin_node_id = cluster_node_id = 1;
+		writer.claim.identity.origin_owner_incarnation++;
+		writer.claim.claim_sha256[0]++;
+		local_insert_end = c ? 0x100 : 0x900;
+		/* Same page, uncertified old source cannot use the receiver's WAL. */
+		UT_ASSERT(!cluster_bufmgr_write_page_data_v1(&target, &r));
+		UT_ASSERT_EQ(writes + syncs, 0);
+		source_capture = locks[1] = true;
+		HOLD_INTERRUPTS();
+		UT_ASSERT(cluster_page_wal_prepare_install_v1(2, &certified, pages[1].data, &prepared));
+		UT_ASSERT(cluster_page_wal_publish_install_v1(2, &prepared));
+		RESUME_INTERRUPTS();
+		source_capture = locks[1] = false;
+		UT_ASSERT(cluster_bufmgr_write_page_data_v1(&target, &r));
+		UT_ASSERT(r != NULL);
+		UT_ASSERT_EQ(wal_flushes, 1);
+		UT_ASSERT_EQ(writes, 1);
+		UT_ASSERT_EQ(syncs, 1);
+		cluster_page_data_receipt_free_v1(&r);
+		clean();
+	}
+}
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 	UT_RUN(success_and_old_completion);
 	UT_RUN(identity_refusals);
 	UT_RUN(authority_refusals);
@@ -735,6 +771,7 @@ main(void)
 	UT_RUN(completion_refusals);
 	UT_RUN(vm_and_clean_completion);
 	UT_RUN(new_claim_never_flushes_old_coordinate);
+	UT_RUN(foreign_certified_image_uses_original_wal);
 	if (file)
 		fclose(file);
 	UT_DONE();

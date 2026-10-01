@@ -925,6 +925,14 @@ UT_TEST(test_image_preserves_full_native_source_and_rejects_legacy)
 	UT_ASSERT_EQ(memcmp(&decoded.body.image_envelope.page_wal, &frame.body.image_envelope.page_wal,
 						sizeof(ClusterPageWalBindingV1)),
 				 0);
+	frame.body.image_envelope.page_wal.flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, bytes,
+											 sizeof(bytes), &len, &reject));
+	UT_ASSERT_EQ(bytes[8520 + 230], 0);
+	UT_ASSERT_EQ(bytes[8520 + 231], CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											 &reject));
+	UT_ASSERT_EQ(decoded.body.image_envelope.page_wal.flags, CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
 	memset(&decoded, 0x59, sizeof(decoded));
 	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, 8520, &decoded,
 											  &reject));
@@ -965,7 +973,7 @@ UT_TEST(test_image_source_conflicts_refuse_before_output)
 			memset(wal->source.claim.claim_sha256, 0, 32);
 			break;
 		case 7:
-			wal->reserved_zero = 1;
+			wal->flags = 2;
 			break;
 		case 8:
 			wal->source.claim.identity.reserved60 = 1;

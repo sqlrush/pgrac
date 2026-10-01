@@ -3949,6 +3949,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_page_data.inc
 	rm -f test_cluster_page_wal_insert.inc
 	rm -f test_cluster_page_wal_image.inc
+	rm -f test_cluster_pcm_s_prepare.inc
 	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
 	rm -f test_cluster_space_extend.inc
 	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc
@@ -4594,6 +4595,13 @@ test_cluster_pcm_source_finish_consumer.inc: $(top_srcdir)/src/backend/cluster/c
 
 # PGRAC: real bounded discard/PI owners, not copies of their decisions.
 # Author: SqlRush <sqlrush@gmail.com>
+test_cluster_pcm_s_prepare.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^typedef enum ClusterPcmOwnSSourceHardFailureReason/ { emit=1; types++ } \
+	     /^cluster_bufmgr_pcm_own_(begin_s_revoke|prepare_s_source_image|abort_s_revoke)\(/ \
+	       { print "ClusterPcmOwnResult"; emit=1; funcs++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 1 || funcs != 3 || emit) exit 1 }' $< > $@
+
 test_cluster_pcm_flush_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^FlushBuffer\(/ { print "static void"; emit=1; flush++ } \
 	     /^FlushBufferWithRecovery\(/ { print "static void"; emit=1; recovery++ } \
@@ -4709,6 +4717,7 @@ test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
 		test_cluster_pcm_barrier_proof.inc \
 		test_cluster_pcm_eviction_owner.inc test_cluster_pcm_clock_sweep.inc \
 		test_cluster_pcm_source_finish_consumer.inc \
+		test_cluster_pcm_s_prepare.inc \
 		test_cluster_pcm_source_finish_tick.inc \
 		test_cluster_pcm_preassert_owner.inc test_cluster_pcm_preassert_consumer.inc \
 		test_cluster_pcm_n_predecessor_consumer.inc \

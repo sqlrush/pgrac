@@ -125,10 +125,12 @@ extern bool ignore_checksum_failure;
 static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
 						IOObject io_object, IOContext io_context);
 struct ClusterSpaceRecoveryBatchV1;
+struct ClusterPageWalBindingV1;
 static void FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 									IOContext io_context,
 									const struct ClusterSpaceRecoveryBatchV1 *recovery,
-									volatile bool *io_started);
+									volatile bool *io_started,
+									const struct ClusterPageWalBindingV1 *data_wal);
 
 #ifdef USE_PGRAC_CLUSTER
 static inline bool
@@ -9039,7 +9041,7 @@ static void
 FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 			IOContext io_context)
 {
-	FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL);
+	FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, NULL);
 }
 
 /* PGRAC: the original write path, with a synchronous exact-source owner for
@@ -9047,7 +9049,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 static void
 FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 						IOContext io_context, const struct ClusterSpaceRecoveryBatchV1 *recovery,
-						volatile bool *io_started)
+						volatile bool *io_started, const struct ClusterPageWalBindingV1 *data_wal)
 {
 	XLogRecPtr	recptr;
 	ErrorContextCallback errcallback;
@@ -9059,6 +9061,15 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 #ifdef USE_PGRAC_CLUSTER
 	uint64		writer_activation_token;
 	uint64		resource_x_activation_generation;
+	ClusterPageWalBindingV1 observed_wal, certified_wal;
+
+	if (data_wal != NULL
+		&& (recovery != NULL || !cluster_shared_config
+			|| !cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &observed_wal)
+			|| !cluster_page_wal_same_mutation_v1(data_wal, &observed_wal)))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("DATA write lost its exact WAL source"),
+						errhint("Retry through the current page owner.")));
 
 	if (recovery != NULL
 		&& !cluster_space_recovery_flush_permitted_v1(recovery, BufferDescriptorGetBuffer(buf)))
@@ -9209,11 +9220,17 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * the only local additions on top of a shipped image are hint-class
 	 * changes (ITL lazy cleanout, index kill bits), which emit no WAL.
 	 */
-	if (recovery == NULL && cluster_storage_mode_enabled() && !RecoveryInProgress()
-		&& recptr > GetXLogInsertRecPtr())
+	if (data_wal != NULL && (buf_state & BM_PERMANENT)
+		&& !cluster_page_wal_flush_source_v1(data_wal, &certified_wal))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("DATA write requires its original WAL flush evidence"),
+				 errhint("Retry through the current page owner with its original WAL source.")));
+	if (data_wal == NULL && recovery == NULL && cluster_storage_mode_enabled()
+		&& !RecoveryInProgress() && recptr > GetXLogInsertRecPtr())
 		recptr = InvalidXLogRecPtr;
 #endif
-	if ((buf_state & BM_PERMANENT) && recovery == NULL)
+	if ((buf_state & BM_PERMANENT) && recovery == NULL && data_wal == NULL)
 		XLogFlush(recptr);
 
 	/*
@@ -9254,6 +9271,12 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	if (recovery != NULL
 		&& !cluster_space_recovery_flush_permitted_v1(recovery, BufferDescriptorGetBuffer(buf)))
 		ereport(ERROR, (errmsg("SPACE recovery flush lost its retained source authority")));
+	if (data_wal != NULL
+		&& (!cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &observed_wal)
+			|| !cluster_page_wal_same_mutation_v1(data_wal, &observed_wal)))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("DATA write changed its exact WAL source before I/O"),
+						errhint("Retry through the current page owner.")));
 #endif
 	smgrwrite(reln,
 			  BufTagGetForkNum(&buf->tag),
@@ -10425,7 +10448,8 @@ FlushOneBufferForSpaceRecovery(Buffer buffer, const ClusterSpaceRecoveryBatchV1 
 		return false;
 	PG_TRY();
 	{
-		FlushBufferWithRecovery(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL, batch, &io_started);
+		FlushBufferWithRecovery(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL, batch, &io_started,
+								NULL);
 	}
 	PG_FINALLY();
 	{
@@ -10583,7 +10607,8 @@ cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *target,
 			if (data == NULL
 				|| !cluster_page_wal_read_v1(BufferDescriptorGetBuffer(data), &space_identity,
 											 &binding)
-				|| !cluster_page_data_source_same(&source, &binding.source))
+				|| (!cluster_page_data_source_same(&source, &binding.source)
+					&& (binding.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0))
 				break;
 			memcpy(expected.data, BufHdrGetBlock(data), BLCKSZ);
 			header = (PageHeader)expected.data;
@@ -10596,13 +10621,14 @@ cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *target,
 				|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
 				|| header->pd_block_scn != target->version.mutation_token
 				|| !PageGetLSNOrigin(expected.data, &page_origin)
-				|| page_origin != source.claim.identity.origin_thread_id - 1
+				|| page_origin != binding.source.claim.identity.origin_thread_id - 1
 				|| XLogRecPtrIsInvalid(PageGetLSN(expected.data))
-				|| PageGetLSN(expected.data) > GetXLogInsertRecPtr())
+				|| ((binding.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+					&& PageGetLSN(expected.data) > GetXLogInsertRecPtr()))
 				break;
 			rel = smgropen(key.locator, InvalidBackendId);
 			FlushBufferWithRecovery(data, rel, IOOBJECT_RELATION, IOCONTEXT_NORMAL, NULL,
-									&io_started);
+									&io_started, &binding);
 			if (!cluster_page_data_holder_ready(data, &data_tag, true, &live)
 				|| !cluster_pcm_own_fence_equal_exact(&data_owner, &live)
 				|| (live.semantic_buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0)
@@ -13298,6 +13324,9 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	volatile bool caller_pinned = false;
 	volatile bool flush_owned = false;
 	ClusterPageWalBindingV1 wal = { 0 };
+	ClusterPageWalBindingV1 latest_wal;
+	bool has_wal;
+	bool latest_has_wal;
 
 	if (out_wal != NULL)
 		memset(out_wal, 0, sizeof(*out_wal));
@@ -13373,20 +13402,29 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 			}
 			content_locked = true;
 			first_lsn = PageGetLSN(page);
+			memset(&wal, 0, sizeof(wal));
+			has_wal = cluster_shared_config
+					  && cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal);
 			LWLockRelease(content_lock);
 			content_locked = false;
 
 			/*
-		 * HC82: flush WAL up to the page LSN before shipping the bytes. Use
-		 * XLogFlush(page_lsn) specifically — NOT XLogFlush(insert pointer)
-		 * which would be correct but over-flushes and doesn't express the
-		 * "flush this page before ship" safety contract.
+		 * Certify the exact original native source outside the content lock.
+		 * A received certification is already durable in that source's WAL;
+		 * its numeric LSN must never select a receiver's unrelated WAL thread.
+		 * Unattributed images retain their existing eager-flush behavior.
 		 */
 #ifdef USE_CLUSTER_UNIT
 			if (cluster_gcs_block_test_xlog_flush_hook != NULL)
 				cluster_gcs_block_test_xlog_flush_hook((uint64)first_lsn);
 #endif
-			if (!XLogRecPtrIsInvalid(first_lsn))
+			if (has_wal) {
+				if (!cluster_page_wal_flush_source_v1(&wal, &wal)) {
+					if (out_refusal != NULL)
+						*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID;
+					break;
+				}
+			} else if (!XLogRecPtrIsInvalid(first_lsn))
 				XLogFlush(cluster_gcs_clamp_ship_flush_lsn(first_lsn));
 
 			/*
@@ -13424,6 +13462,9 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 				}
 			}
 			second_lsn = PageGetLSN(page);
+			latest_has_wal
+				= cluster_shared_config
+				  && cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &latest_wal);
 
 #ifdef USE_CLUSTER_UNIT
 
@@ -13440,7 +13481,8 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 			}
 #endif
 
-			if (first_lsn == second_lsn) {
+			if (first_lsn == second_lsn && has_wal == latest_has_wal
+				&& (!has_wal || cluster_page_wal_same_mutation_v1(&wal, &latest_wal))) {
 				uint32 buf_state;
 
 				/* A queue handoff may retire this descriptor immediately after
@@ -13452,7 +13494,11 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 					Assert(!cluster_pcm_x_finish_retain_flush_error_context_pushed);
 					flush_owned = true;
 					cluster_pcm_x_finish_retain_flush_active = true;
-					FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+					if (has_wal)
+						FlushBufferWithRecovery(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+												NULL, NULL, &wal);
+					else
+						FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 					cluster_pcm_x_finish_retain_flush_active = false;
 					flush_owned = false;
 				}
@@ -13475,9 +13521,9 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 				}
 
 				memcpy(dst, page, BLCKSZ);
-				memset(&wal, 0, sizeof(wal));
-				if (cluster_shared_config && out_wal != NULL)
-					(void)cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal);
+				latest_has_wal
+					= cluster_shared_config
+					  && cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &latest_wal);
 
 				/* Hint-bit dirties may occur under a shared content lock.  Do not
 			 * certify a copy if one raced the memcpy after the first clean check. */
@@ -13490,7 +13536,8 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 										 | BM_IO_ERROR | BM_IO_IN_PROGRESS))
 										 == 0;
 				UnlockBufHdr(buf, buf_state);
-				if (!storage_current) {
+				if (!storage_current || has_wal != latest_has_wal
+					|| (has_wal && !cluster_page_wal_same_mutation_v1(&wal, &latest_wal))) {
 					if (out_refusal != NULL)
 						*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID;
 					LWLockRelease(content_lock);
@@ -13508,8 +13555,8 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 					*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
 				break;
 			}
-			/* The content lock was released for WAL flush.  A changed LSN
-			 * invalidates this attempt, not the holder's authority. */
+			/* The unlocked WAL interval can change source even at equal LSN.
+			 * Invalidate this attempt without changing holder authority. */
 			if (out_refusal != NULL)
 				*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_WAL_RECHECK_CHANGED;
 			LWLockRelease(content_lock);
@@ -16239,6 +16286,7 @@ cluster_bufmgr_pcm_own_prepare_s_source_image(
 	bool local_covers;
 	bool replace_resident = false;
 	bool storage_covers;
+	ClusterPageWalBindingV1 wal = { 0 };
 	volatile bool content_locked = false;
 	volatile bool private_pinned = false;
 	ClusterPcmOwnSSourceHardFailureReason hard_failure_reason =
@@ -16421,12 +16469,23 @@ cluster_bufmgr_pcm_own_prepare_s_source_image(
 					buf, &live, selected_page, replace_resident, out_revoking,
 					block_data, out_page_lsn, out_page_scn);
 			if (result == CLUSTER_PCM_OWN_OK && cluster_shared_config && out_wal != NULL)
-				(void)cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), out_wal);
+				(void)cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal);
 			LWLockRelease(content_lock);
 			content_locked = false;
 		} else if (result == CLUSTER_PCM_OWN_OK) {
 			*out_refusal = CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_CONTENT_LOCK;
 			result = CLUSTER_PCM_OWN_BUSY;
+		}
+		/* Keep potentially throwing WAL I/O inside this exact reservation
+		 * owner's cleanup scope, after releasing the content lock. REVOKING
+		 * protects the selected bytes until the existing handoff finishes. */
+		if (result == CLUSTER_PCM_OWN_OK && wal.record_start != InvalidXLogRecPtr) {
+			if (!cluster_page_wal_flush_source_v1(&wal, &wal))
+				result = CLUSTER_PCM_OWN_STALE;
+			buf_state = LockBufHdr(buf);
+			if (!cluster_pcm_own_fence_matches_locked(buf, &live))
+				result = CLUSTER_PCM_OWN_STALE;
+			UnlockBufHdr(buf, buf_state);
 		}
 	}
 	PG_CATCH();
@@ -16450,8 +16509,11 @@ cluster_bufmgr_pcm_own_prepare_s_source_image(
 	}
 	PG_END_TRY();
 
-	if (result == CLUSTER_PCM_OWN_OK)
+	if (result == CLUSTER_PCM_OWN_OK) {
+		if (out_wal != NULL)
+			*out_wal = wal;
 		return result;
+	}
 	abort_result = cluster_bufmgr_pcm_own_abort_s_revoke(buf, &live);
 	if (abort_result != CLUSTER_PCM_OWN_OK) {
 		cluster_bufmgr_pcm_own_observe_s_source_hard_failure(

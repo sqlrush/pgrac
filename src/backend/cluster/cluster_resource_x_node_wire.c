@@ -121,7 +121,7 @@ resource_x_page_wal_encode(uint8 *p, const ClusterPageWalBindingV1 *b)
 	resource_x_put_u32(p + 224, b->record_crc);
 	p[228] = b->rmid;
 	p[229] = b->info;
-	resource_x_put_u16(p + 230, b->reserved_zero);
+	resource_x_put_u16(p + 230, b->flags);
 }
 
 static void
@@ -158,7 +158,7 @@ resource_x_page_wal_decode(const uint8 *p, ClusterPageWalBindingV1 *b)
 	b->record_crc = resource_x_get_u32(p + 224);
 	b->rmid = p[228];
 	b->info = p[229];
-	b->reserved_zero = resource_x_get_u16(p + 230);
+	b->flags = resource_x_get_u16(p + 230);
 }
 
 static bool

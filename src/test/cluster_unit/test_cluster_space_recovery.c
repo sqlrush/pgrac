@@ -438,6 +438,10 @@ shared_buffer_write_error_callback(void *arg)
 		InterruptHoldoffCount = 0;                                                                 \
 		pg_re_throw();                                                                             \
 	} while (0)
+/* This suite supplies only the original SPACE owner, never PAGE evidence. */
+#define cluster_page_wal_snapshot_v1(buffer, out) ((void)(buffer), (void)(out), false)
+#define cluster_page_wal_same_mutation_v1(a, b) ((void)(a), (void)(b), false)
+#define cluster_page_wal_flush_source_v1(a, b) ((void)(a), (void)(b), false)
 #include "test_cluster_space_recovery_flush.inc"
 
 static void
@@ -810,7 +814,7 @@ UT_TEST(test_ordinary_native_flush_keeps_local_wal)
 	reset();
 	pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_DIRTY);
 	FlushBufferWithRecovery(&descriptors[1].bufferdesc, &relation, IOOBJECT_RELATION,
-							IOCONTEXT_NORMAL, NULL, NULL);
+							IOCONTEXT_NORMAL, NULL, NULL, NULL);
 	UT_ASSERT_EQ(wal_flushes, 1);
 	UT_ASSERT_EQ(writes, 1);
 	UT_ASSERT_EQ(io_aborts, 0);

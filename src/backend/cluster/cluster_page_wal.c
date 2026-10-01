@@ -15,6 +15,58 @@
 
 static ClusterPageWalBindingV1 *bindings;
 
+static bool
+page_wal_same_source(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b)
+{
+	return memcmp(&a->claim.identity, &b->claim.identity, sizeof(a->claim.identity)) == 0
+		   && a->claim.database_incarnation == b->claim.database_incarnation
+		   && a->claim.max_config_generation == b->claim.max_config_generation
+		   && memcmp(a->claim.claim_sha256, b->claim.claim_sha256, 32) == 0
+		   && a->timeline == b->timeline;
+}
+
+bool
+cluster_page_wal_flush_source_v1(const ClusterPageWalBindingV1 *binding,
+								 ClusterPageWalBindingV1 *certified)
+{
+	ClusterWalSourceRef current, after;
+	ClusterPageWalBindingV1 result;
+	if (certified == NULL || !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
+		|| !cluster_page_wal_binding_shape_v1(binding)
+		|| !rf_page_identity_valid_v1(&binding->identity)
+		|| !rf_page_version_present_v1(&binding->version)
+		|| !cluster_wal_thread_current_v2_ref(&current)
+		|| current.claim.identity.system_identifier != binding->identity.system_identifier
+		|| current.claim.database_incarnation != binding->source.claim.database_incarnation
+		|| memcmp(current.claim.identity.storage_uuid, binding->identity.storage_uuid, 16) != 0)
+		return false;
+	result = *binding;
+	if ((binding->flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0) {
+		if (!page_wal_same_source(&binding->source, &current)
+			|| binding->record_end > GetXLogInsertRecPtr())
+			return false;
+		XLogFlush(binding->record_end);
+		if (!cluster_wal_thread_current_v2_ref(&after) || !page_wal_same_source(&current, &after))
+			return false;
+		result.flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	}
+	*certified = result;
+	return true;
+}
+
+bool
+cluster_page_wal_same_mutation_v1(const ClusterPageWalBindingV1 *a,
+								  const ClusterPageWalBindingV1 *b)
+{
+	ClusterPageWalBindingV1 left, right;
+	if (a == NULL || b == NULL)
+		return false;
+	left = *a;
+	right = *b;
+	left.flags = right.flags = 0;
+	return memcmp(&left, &right, sizeof(left)) == 0;
+}
+
 bool
 cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
 {
@@ -184,7 +236,8 @@ cluster_page_wal_read_v1(Buffer buffer, const ClusterSpaceIdentity *identity,
 	value = &bindings[buffer - 1];
 	page = BufferGetPage(buffer);
 	if (value->record_start == InvalidXLogRecPtr || value->record_start >= value->record_end
-		|| value->reserved_zero != 0 || !rf_page_identity_valid_v1(&value->identity)
+		|| (value->flags & ~CLUSTER_PAGE_WAL_NATIVE_FLUSHED) != 0
+		|| !rf_page_identity_valid_v1(&value->identity)
 		|| !rf_page_version_present_v1(&value->version)
 		|| !RelFileLocatorEquals(value->identity.locator, BufTagGetRelFileLocator(&buf->tag))
 		|| value->identity.forknum != buf->tag.forkNum

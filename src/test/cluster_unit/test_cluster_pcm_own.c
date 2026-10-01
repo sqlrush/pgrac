@@ -67,7 +67,34 @@ static bool transition_flush_error;
 static bool transition_flush_leaves_dirty;
 static ClusterPageWalBindingV1 transition_page_wal;
 static bool transition_wal_prepare_ok = true;
+static bool transition_wal_certify_ok = true;
+static int transition_wal_source_changes;
+static bool transition_s_prepare;
 static unsigned transition_wal_publishes;
+static void transition_wal_flush(XLogRecPtr lsn);
+
+bool
+cluster_page_wal_flush_source_v1(const ClusterPageWalBindingV1 *binding,
+								 ClusterPageWalBindingV1 *certified)
+{
+	if (!transition_wal_certify_ok)
+		return false;
+	if ((binding->flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0) {
+		UT_ASSERT(!transition_content_held);
+		transition_wal_flush(PageGetLSN(transition_page.data));
+	}
+	*certified = *binding;
+	certified->flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	return true;
+}
+bool
+cluster_page_wal_same_mutation_v1(const ClusterPageWalBindingV1 *a,
+								  const ClusterPageWalBindingV1 *b)
+{
+	ClusterPageWalBindingV1 x = *a, y = *b;
+	x.flags = y.flags = 0;
+	return memcmp(&x, &y, sizeof(x)) == 0;
+}
 
 bool
 cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
@@ -228,7 +255,8 @@ transition_lock_acquire(LWLock *lock, LWLockMode mode)
 		transition_mapping_held = true;
 	} else {
 		UT_ASSERT(lock == BufferDescriptorGetContentLock(transition_buf));
-		UT_ASSERT_EQ(mode, transition_copy_active ? LW_SHARED : LW_EXCLUSIVE);
+		UT_ASSERT_EQ(mode,
+					 transition_copy_active && !transition_s_prepare ? LW_SHARED : LW_EXCLUSIVE);
 		if (transition_content_busy)
 			return false;
 		UT_ASSERT(!transition_content_held);
@@ -328,11 +356,17 @@ transition_wal_flush(XLogRecPtr lsn)
 
 	UT_ASSERT(transition_copy_active);
 	UT_ASSERT(!transition_content_held && !transition_mapping_held);
-	UT_ASSERT(transition_drop_active ? transition_pin_count <= 1 : transition_pin_count == 1);
+	UT_ASSERT(transition_s_prepare	   ? transition_pin_count == 0
+			  : transition_drop_active ? transition_pin_count <= 1
+									   : transition_pin_count == 1);
 	UT_ASSERT_EQ(lsn, PageGetLSN(page));
 	transition_wal_calls++;
 	if (transition_wal_error)
 		pg_re_throw();
+	if (transition_wal_source_changes > 0) {
+		transition_wal_source_changes--;
+		transition_page_wal.source.claim.identity.origin_owner_incarnation++;
+	}
 	if (transition_wal_changes > 0) {
 		transition_wal_changes--;
 		PageSetLSNPreserveOrigin(page, lsn + UINT64_C(8));
@@ -392,7 +426,8 @@ struct ClusterSpaceRecoveryBatchV1;
 static void FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject object,
 									IOContext context,
 									const struct ClusterSpaceRecoveryBatchV1 *recovery,
-									volatile bool *io_started);
+									volatile bool *io_started,
+									const struct ClusterPageWalBindingV1 *data_wal);
 static struct SMgrRelationData transition_smgr;
 static BufferUsage transition_usage;
 static void
@@ -482,7 +517,28 @@ transition_write_context(void *arg)
 #undef cluster_bufmgr_pcm_x_retained_image_locked
 #undef FlushBuffer
 #define FlushBuffer(buf, rel, object, context) transition_flush(buf)
+#define FlushBufferWithRecovery(buf, rel, object, context, recovery, io, wal) transition_flush(buf)
 #include "test_cluster_pcm_transition_owner.inc"
+#undef FlushBufferWithRecovery
+/* Actual S-source reservation/prepare/abort, with storage and allocation
+ * boundaries explicit. The WAL error occurs after the real content release. */
+#define ReservePrivateRefCountEntry() ((void)0)
+#define ResourceOwnerEnlargeBuffers(owner) ((void)0)
+#define PinBuffer_Locked(buf) abort()
+#define UnpinBuffer(buf) abort()
+#define smgropen(locator, backend) (&transition_smgr)
+#define smgrread(rel, fork, block, dst) memcpy(dst, transition_page.data, BLCKSZ)
+#define PageIsVerifiedForFork(page, fork, block, flags) true
+#define cluster_bufmgr_pcm_own_observe_s_source_hard_failure(...) ((void)0)
+#include "test_cluster_pcm_s_prepare.inc"
+#undef cluster_bufmgr_pcm_own_observe_s_source_hard_failure
+#undef PageIsVerifiedForFork
+#undef smgrread
+#undef smgropen
+#undef UnpinBuffer
+#undef PinBuffer_Locked
+#undef ResourceOwnerEnlargeBuffers
+#undef ReservePrivateRefCountEntry
 /* Only the terminal map removal and scheduling gaps are fixtures. Real
  * invalidation, copy/flush admission, PI flags and final drop guards execute. */
 static bool cluster_bufmgr_convert_to_pi_locked(BufferDesc *buf, uint32 state);
@@ -2201,6 +2257,9 @@ transition_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry, ClusterPcmOwnSnap
 	transition_flush_leaves_dirty = false;
 	memset(&transition_page_wal, 0, sizeof(transition_page_wal));
 	transition_wal_prepare_ok = true;
+	transition_wal_certify_ok = true;
+	transition_wal_source_changes = 0;
+	transition_s_prepare = false;
 	transition_wal_publishes = 0;
 	transition_real_flush = false;
 	transition_owned_io = transition_io_wakes = transition_io_aborts = 0;
@@ -2719,7 +2778,9 @@ UT_TEST(test_real_gcs_wal_recheck_yields_without_exporting_an_image)
 	transition_page_wal.record_start = 0x120;
 	UT_ASSERT(cluster_bufmgr_copy_block_for_gcs(buf.tag, &copied_lsn, output.data, &refusal,
 												&copied_wal));
-	UT_ASSERT_EQ(memcmp(&copied_wal, &transition_page_wal, sizeof(copied_wal)), 0);
+	UT_ASSERT(cluster_page_wal_same_mutation_v1(&copied_wal, &transition_page_wal));
+	UT_ASSERT_EQ(copied_wal.flags, CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
+	UT_ASSERT_EQ(transition_page_wal.flags, 0);
 	cluster_shared_config = false;
 	UT_ASSERT_EQ(memcmp(output.data, transition_page.data, BLCKSZ), 0);
 	UT_ASSERT_EQ(copied_lsn, UINT64_C(0x12370));
@@ -2735,6 +2796,106 @@ UT_TEST(test_real_gcs_wal_recheck_yields_without_exporting_an_image)
 	ClusterPcmOwnArray = saved;
 	for (attempt = 0; attempt < 3; attempt++)
 		UT_ASSERT_EQ(statuses[attempt], GCS_BLOCK_REPLY_DENIED_PENDING_X);
+}
+
+UT_TEST(test_real_gcs_exact_source_recheck_and_error_cleanup)
+{
+	for (int scenario = 0; scenario < 5; scenario++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		ClusterPcmOwnSnapshot ignored;
+		ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+		ClusterBufmgrGcsCopyRefusal refusal;
+		PGIOAlignedBlock output;
+		ClusterPageWalBindingV1 copied_wal;
+		XLogRecPtr copied_lsn = 0xdead;
+		volatile bool copied = false, threw = false;
+		transition_fixture(&buf, &entry, &ignored, true);
+		transition_copy_active = true;
+		cluster_shared_config = true;
+		buf.pcm_state = PCM_STATE_X;
+		buf.buffer_type = BUF_TYPE_XCUR;
+		pg_atomic_write_u32(&entry.flags, 0);
+		transition_page_wal.record_start = 0x120;
+		transition_wal_source_changes = scenario == 0 ? 2 : scenario == 1 ? 1 : 0;
+		transition_wal_certify_ok = scenario != 2;
+		transition_wal_error = scenario == 3;
+		transition_flush_error = scenario == 4;
+		memset(output.data, 0xa5, BLCKSZ);
+		memset(&copied_wal, 0xa5, sizeof(copied_wal));
+		PG_TRY();
+		{
+			copied = cluster_bufmgr_copy_block_for_gcs(buf.tag, &copied_lsn, output.data, &refusal,
+													   &copied_wal);
+		}
+		PG_CATCH();
+		{
+			threw = true;
+		}
+		PG_END_TRY();
+		cluster_shared_config = false;
+		ClusterPcmOwnArray = saved;
+		UT_ASSERT_EQ(copied, scenario == 1);
+		UT_ASSERT_EQ(threw, scenario >= 3);
+		UT_ASSERT_EQ(copied_wal.flags, scenario == 1 ? CLUSTER_PAGE_WAL_NATIVE_FLUSHED : 0);
+		UT_ASSERT_EQ(copied_wal.record_start, scenario == 1 ? 0x120 : 0);
+		UT_ASSERT_EQ(copied_lsn, scenario == 1 ? 0x12340 : 0xdead);
+		UT_ASSERT_EQ(PageGetLSN(transition_page.data), 0x12340);
+		UT_ASSERT_EQ(transition_page_wal.flags, 0);
+		UT_ASSERT_EQ(transition_pin_count, 0);
+		UT_ASSERT_EQ(transition_io_aborts, scenario == 4 ? 1 : 0);
+		UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf.state)), 0);
+		UT_ASSERT(!transition_content_held && !transition_mapping_held);
+		UT_ASSERT(!cluster_pcm_x_finish_retain_flush_active);
+		if (scenario == 0)
+			UT_ASSERT_EQ(refusal, CLUSTER_BUFMGR_GCS_COPY_REFUSAL_WAL_RECHECK_CHANGED);
+	}
+}
+
+UT_TEST(test_real_s_source_owns_wal_certification_cleanup)
+{
+	for (int scenario = 0; scenario < 3; scenario++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		ClusterPcmOwnSnapshot before, revoking;
+		ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+		ClusterPcmOwnSourcePrepareRefusal refusal;
+		PGIOAlignedBlock output;
+		ClusterPageWalBindingV1 copied_wal;
+		XLogRecPtr copied_lsn;
+		uint64 copied_token;
+		volatile ClusterPcmOwnResult result = CLUSTER_PCM_OWN_INVALID;
+		volatile bool threw = false;
+		transition_fixture(&buf, &entry, &before, false);
+		pg_atomic_write_u32(&entry.flags, 0);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(&buf, &before), CLUSTER_PCM_OWN_OK);
+		transition_s_prepare = transition_copy_active = cluster_shared_config = true;
+		transition_page_wal.record_start = 0x120;
+		transition_wal_certify_ok = scenario != 1;
+		transition_wal_error = scenario == 2;
+		PG_TRY();
+		{
+			result = cluster_bufmgr_pcm_own_prepare_s_source_image(
+				&buf, &before, 0, &revoking, output.data, &copied_lsn, &copied_token, &refusal,
+				&copied_wal);
+		}
+		PG_CATCH();
+		{
+			threw = true;
+		}
+		PG_END_TRY();
+		cluster_shared_config = false;
+		UT_ASSERT_EQ(threw, scenario == 2);
+		UT_ASSERT_EQ(result == CLUSTER_PCM_OWN_OK, scenario == 0);
+		UT_ASSERT_EQ(copied_wal.flags, scenario == 0 ? CLUSTER_PAGE_WAL_NATIVE_FLUSHED : 0);
+		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), scenario == 0 ? PCM_OWN_FLAG_REVOKING : 0);
+		if (scenario == 0)
+			UT_ASSERT_EQ(cluster_bufmgr_pcm_own_abort_s_revoke(&buf, &revoking),
+						 CLUSTER_PCM_OWN_OK);
+		UT_ASSERT_EQ(transition_pin_count, 0);
+		UT_ASSERT(!transition_content_held && !transition_mapping_held);
+		ClusterPcmOwnArray = saved;
+	}
 }
 
 UT_TEST(test_real_gcs_wal_recheck_preserves_invalid_image_and_io_refusals)
@@ -7819,7 +7980,7 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(137);
+	UT_PLAN(139);
 	UT_RUN(test_gcs_invalidate_flushes_data_before_retry_then_discards);
 	UT_RUN(test_gcs_invalidate_busy_or_skipped_flush_keeps_obligation);
 	UT_RUN(test_gcs_invalidate_flush_error_keeps_data_and_releases_pin);
@@ -7951,6 +8112,8 @@ main(void)
 	UT_RUN(test_resource_x_preuse_drift_reprobes_only_current_valid_tuple);
 	UT_RUN(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only);
 	UT_RUN(test_real_gcs_wal_recheck_yields_without_exporting_an_image);
+	UT_RUN(test_real_gcs_exact_source_recheck_and_error_cleanup);
+	UT_RUN(test_real_s_source_owns_wal_certification_cleanup);
 	UT_RUN(test_real_gcs_wal_recheck_preserves_invalid_image_and_io_refusals);
 	UT_RUN(test_real_eviction_pending_excludes_clock_sweep_and_keeps_one_owner);
 	UT_RUN(test_real_n_predecessor_does_not_fence_a_lost_physical_observation);
