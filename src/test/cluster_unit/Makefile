@@ -3131,19 +3131,21 @@ test_cluster_control_walr.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_ret
 
 # PGRAC: actual copyable IR callers use production ownership/registry objects.
 # Author: SqlRush <sqlrush@gmail.com>
-test_cluster_control_ir_plan.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c
+test_cluster_control_ir_plan.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_merge.c Makefile
 	awk '/^#define CLUSTER_RECOVERY_FENCE_PLAN_MAGIC/ { print; constants++ } \
 	     /^typedef struct ClusterRecoveryFenceOrigin \{/ || /^struct ClusterRecoveryFencePlan \{/ { emit=1; types++ } \
-	     /^(recovery_fence_plan_valid|recovery_fence_plan_release_members|cluster_recovery_merge_fence_plan_acquire_serial|cluster_recovery_merge_fence_plan_release_serial|cluster_recovery_merge_fence_plan_destroy)\(/ { print prev; emit=1; count++ } \
+	     /^(recovery_fence_plan_valid|recovery_fence_plan_release_members|recovery_fence_plan_find_origin|cluster_recovery_merge_fence_plan_acquire_serial|cluster_recovery_merge_fence_plan_revalidate_nowait|cluster_recovery_merge_fence_plan_authority|cluster_recovery_merge_fence_plan_release_serial|cluster_recovery_merge_fence_plan_destroy)\(/ { print prev; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
-	     END { if (constants != 1 || types != 2 || count != 5) exit 1 }' $< > $@.tmp
+	     END { if (constants != 1 || types != 2 || count != 8) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_control_ir: test_cluster_control_ir.c test_cluster_cf_enqueue.c unit_test.h \
 		test_cluster_control_ir_plan.inc \
+		cluster_thread_recovery_authority_test.o \
 		$(CLUSTER_IR_O) $(CLUSTER_IR_LOCK_O) $(CLUSTER_CF_ENQUEUE_O) \
 		$(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) $(CLUSTER_LMD_WAIT_STATE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		cluster_thread_recovery_authority_test.o \
 		$(CLUSTER_IR_O) $(CLUSTER_IR_LOCK_O) $(CLUSTER_CF_ENQUEUE_O) \
 		$(CLUSTER_LOCK_OWNER_O) $(CLUSTER_CONTROL_REQUEST_O) $(CLUSTER_LMD_WAIT_STATE_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@

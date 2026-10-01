@@ -53,6 +53,7 @@
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_recovery_worker.h"
+#include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_wal_thread.h"
 #include "postmaster/startup.h"				   /* spec-6.14 D9 amend: HandleStartupProcInterrupts */
 #include "cluster/storage/cluster_shared_fs.h" /* spec-4.5a D4: capability gate */
@@ -87,6 +88,7 @@ bool cluster_recmerge_apply_foreign = false;
 typedef struct ClusterRecoveryFenceOrigin {
 	uint16 origin_thread;
 	ClusterRecoveryDutyKey duty;
+	ClusterControlRootSnapshot root_snapshot;
 	ClusterControlRootReadToken root_token;
 	ClusterFormationWitnessV1 *formation;
 	PgracExternalFenceNeedSetV1 *needs;
@@ -108,6 +110,7 @@ struct ClusterRecoveryFencePlan {
 	XLogRecPtr start_lsn[CLUSTER_WAL_STATE_SLOT_COUNT + 1];
 	ClusterRecoveryFenceOrigin origins[CLUSTER_WAL_STATE_SLOT_COUNT];
 	ClusterRecoverySerialGuardSet serial_guards;
+	ClusterWalRetentionPin *retention_pin;
 };
 
 void
@@ -1167,6 +1170,7 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 		origin = &plan->origins[plan->origin_count];
 		origin->origin_thread = tid;
 		origin->duty = identity;
+		origin->root_snapshot = snapshot;
 		origin->root_token = token;
 		origin_threads[plan->origin_count] = tid;
 		plan->origin_count++;
@@ -1272,8 +1276,39 @@ cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFencePlan *plan)
 	uint16 i;
 
 	if (!recovery_fence_plan_valid(plan) || !plan->sealed || plan->serial_held || plan->committed
-		|| plan->origin_count == 0 || plan->serial_guards.count != 0)
+		|| plan->origin_count == 0 || plan->serial_guards.count != 0
+		|| plan->retention_pin != NULL)
 		return false;
+	/* PGRAC: retain the complete original input before acquiring IR. The pin
+	 * borrows the plan's fence owners until BOTH releases are confirmed.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config) {
+		ClusterWalRetentionPinThreadRequest *pin_requests;
+		ClusterWalRetentionInterval *intervals;
+		ClusterWalPinResult pin_result;
+		bool valid = true;
+
+		pin_requests = palloc0(sizeof(*pin_requests) * plan->origin_count);
+		intervals = palloc0(sizeof(*intervals) * plan->origin_count);
+		for (i = 0; i < plan->origin_count; i++) {
+			ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
+
+			if (!cluster_thread_recovery_pin_request_build_v1(
+					origin->origin_thread, &origin->duty, &origin->root_snapshot,
+					&origin->root_token, origin->formation, origin->needs, origin->admissions,
+					&intervals[i], &pin_requests[i])) {
+				valid = false;
+				break;
+			}
+		}
+		pin_result = valid ? cluster_wal_retention_pin_acquire(
+								  pin_requests, plan->origin_count, &plan->retention_pin)
+						   : CLUSTER_WAL_PIN_INVALID;
+		pfree(intervals);
+		pfree(pin_requests);
+		if (pin_result != CLUSTER_WAL_PIN_OK)
+			return false;
+	}
 	requests = palloc0(sizeof(*requests) * plan->origin_count);
 	for (i = 0; i < plan->origin_count; i++) {
 		ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
@@ -1292,6 +1327,13 @@ cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFencePlan *plan)
 												 &plan->serial_guards, &failed_index);
 	pfree(requests);
 	if (result != CLUSTER_RECOVERY_SERIAL_GRANTED)
+		return false;
+	if (cluster_shared_config
+		&& (plan->origin_count == 1
+				? cluster_wal_retention_pin_bind_one(plan->retention_pin,
+													 &plan->serial_guards.guards[0])
+				: cluster_wal_retention_pin_bind_set(plan->retention_pin, &plan->serial_guards))
+			   != CLUSTER_WAL_PIN_OK)
 		return false;
 	plan->serial_held = true;
 	return true;
@@ -1341,6 +1383,14 @@ cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan)
 				   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
 			|| memcmp(&token, &plan->origins[origin_index].root_token, sizeof(token)) != 0)
 			return false;
+		if (cluster_shared_config
+			&& (snapshot.checkpoint_tli != plan->origins[origin_index].root_snapshot.checkpoint_tli
+				|| snapshot.tail_tli != plan->origins[origin_index].root_snapshot.tail_tli
+				|| snapshot.checkpoint_lower_lsn
+					   != plan->origins[origin_index].root_snapshot.checkpoint_lower_lsn
+				|| snapshot.validated_tail_lsn_exclusive
+					   != plan->origins[origin_index].root_snapshot.validated_tail_lsn_exclusive))
+			return false;
 		current_origins[current_count++] = tid;
 	}
 	if (!cluster_recovery_fence_plan_shape_valid(plan->own_thread, current_replay, current_foreign,
@@ -1384,6 +1434,10 @@ cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *pl
 	if (!recovery_fence_plan_valid(plan) || !plan->sealed || !plan->serial_held
 		|| plan->origin_count == 0 || plan->serial_guards.count != plan->origin_count)
 		return false;
+	if (cluster_shared_config
+		&& (plan->retention_pin == NULL
+			|| cluster_wal_retention_pin_revalidate(plan->retention_pin) != CLUSTER_WAL_PIN_OK))
+		return false;
 	for (i = 0; i < plan->origin_count; i++) {
 		ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
 
@@ -1400,20 +1454,61 @@ cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *pl
 	return true;
 }
 
+/* Borrow only the exact original owners; an origin number or COLD_FORMED
+ * enum alone cannot authorize a canonical SIDE/PAGE mutation. */
+bool
+cluster_recovery_merge_fence_plan_authority(ClusterRecoveryFencePlan *plan,
+										 uint16 origin_thread,
+										 ClusterThreadRecoveryAuthorityV1 *out)
+{
+	ClusterThreadRecoveryAuthorityV1 authority;
+	ClusterRecoveryFenceOrigin *origin;
+	int index;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!recovery_fence_plan_valid(plan) || !plan->committed
+		|| !cluster_recovery_merge_fence_plan_revalidate_nowait(plan)
+		|| (index = recovery_fence_plan_find_origin(plan, origin_thread)) < 0)
+		return false;
+	origin = &plan->origins[index];
+	memset(&authority, 0, sizeof(authority));
+	authority.duty = &origin->duty;
+	authority.root_snapshot = &origin->root_snapshot;
+	authority.root_token = &origin->root_token;
+	authority.formation = origin->formation;
+	authority.fence_need_set = origin->needs;
+	authority.fence_admission_set = origin->admissions;
+	authority.retention_pin = plan->retention_pin;
+	authority.serial_guard = &plan->serial_guards.guards[index];
+	if (authority.serial_guard->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+		|| cluster_thread_recovery_authority_revalidate_nowait_v1(&authority)
+			   != CLUSTER_THREAD_AUTHORITY_OK)
+		return false;
+	*out = authority;
+	return true;
+}
+
 bool
 cluster_recovery_merge_fence_plan_release_serial(ClusterRecoveryFencePlan *plan)
 {
 	ClusterRecoverySerialReleaseResult result;
 
-	if (!recovery_fence_plan_valid(plan) || plan->serial_guards.count == 0)
+	if (!recovery_fence_plan_valid(plan))
 		return false;
 	/* A failed set acquisition can still own earlier guards. Conversely,
 	 * starting release surrenders full-set authority even while ACKs wait. */
 	plan->serial_held = false;
-	result = cluster_recovery_serial_release_set(&plan->serial_guards);
-	if (result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
+	if (plan->serial_guards.count != 0) {
+		result = cluster_recovery_serial_release_set(&plan->serial_guards);
+		if (result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
+			return false;
+	}
+	if (plan->retention_pin != NULL
+		&& cluster_wal_retention_pin_release(&plan->retention_pin)
+			   != CLUSTER_WALR_RELEASE_CONFIRMED)
 		return false;
-	plan->serial_held = false;
 	return true;
 }
 
@@ -1425,7 +1520,8 @@ cluster_recovery_merge_fence_plan_destroy(ClusterRecoveryFencePlan **plan)
 	if (plan == NULL || *plan == NULL)
 		return;
 	owned = *plan;
-	if (!recovery_fence_plan_valid(owned) || owned->serial_held || owned->serial_guards.count != 0)
+	if (!recovery_fence_plan_valid(owned) || owned->serial_held || owned->serial_guards.count != 0
+		|| owned->retention_pin != NULL)
 		return;
 	recovery_fence_plan_release_members(owned);
 	MemSet(owned, 0, sizeof(*owned));

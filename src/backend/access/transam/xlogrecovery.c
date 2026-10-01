@@ -2484,8 +2484,7 @@ PerformWalRecovery(void)
 		{
 			if (serial_acquired && !plan_committed)
 				cluster_write_fence_note_external_mutation_gate_blocked();
-			if (serial_acquired &&
-				!cluster_recovery_merge_fence_plan_release_serial(
+			if (!cluster_recovery_merge_fence_plan_release_serial(
 					cluster_fence_plan))
 				ereport(FATAL,
 						(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),

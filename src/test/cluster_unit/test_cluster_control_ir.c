@@ -13,11 +13,86 @@
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_thread_recovery_authority.h"
 
 static ClusterControlRootReadToken ir_token;
 static ClusterControlRootReadToken ir_tokens[CLUSTER_WAL_STATE_SLOT_COUNT + 1];
 static uint16 ir_unavailable_thread;
 static unsigned ir_members_released;
+static unsigned pin_acquire_calls, pin_bind_calls, pin_release_calls;
+static unsigned pin_requested_origins, pin_ir_locks_at_acquire;
+static bool pin_available = true, pin_bound, pin_current = true;
+static bool pin_bind_ok = true, pin_release_ok = true;
+static bool pin_acquire_uncertain;
+static int pin_fixture;
+
+ClusterWalPinResult
+cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *requests,
+								  uint16 count, ClusterWalRetentionPin **out)
+{
+	unsigned i;
+
+	pin_acquire_calls++;
+	pin_requested_origins = count;
+	pin_ir_locks_at_acquire = pg_atomic_read_u32(&MyProc->cluster_grd_registered_count);
+	for (i = 0; i < count; i++) {
+		UT_ASSERT_EQ(requests[i].nintervals, 1);
+		UT_ASSERT_EQ(requests[i].intervals[0].thread_id, requests[i].duty.origin_thread_id);
+		UT_ASSERT_EQ(requests[i].intervals[0].tli, 7);
+		UT_ASSERT_EQ(requests[i].intervals[0].start_lsn, 100);
+		UT_ASSERT_EQ(requests[i].intervals[0].end_lsn, 500);
+	}
+	if (pin_acquire_uncertain) {
+		*out = (ClusterWalRetentionPin *)&pin_fixture;
+		return CLUSTER_WAL_PIN_RELEASE_UNCERTAIN;
+	}
+	if (!pin_available)
+		return CLUSTER_WAL_PIN_UNAVAILABLE;
+	*out = (ClusterWalRetentionPin *)&pin_fixture;
+	return CLUSTER_WAL_PIN_OK;
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin,
+								   ClusterRecoverySerialGuard *serial)
+{
+	UT_ASSERT(pin == (ClusterWalRetentionPin *)&pin_fixture);
+	UT_ASSERT(serial->held);
+	pin_bind_calls++;
+	pin_bound = pin_bind_ok;
+	return pin_bind_ok ? CLUSTER_WAL_PIN_OK : CLUSTER_WAL_PIN_STALE;
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_bind_set(ClusterWalRetentionPin *pin,
+								   ClusterRecoverySerialGuardSet *set)
+{
+	unsigned i;
+
+	UT_ASSERT_EQ(set->count, pin_requested_origins);
+	for (i = 0; i < set->count; i++)
+		UT_ASSERT(set->guards[i].held);
+	return cluster_wal_retention_pin_bind_one(pin, &set->guards[0]);
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin)
+{
+	return pin == (ClusterWalRetentionPin *)&pin_fixture && pin_bound && pin_current
+			   ? CLUSTER_WAL_PIN_OK : CLUSTER_WAL_PIN_STALE;
+}
+
+ClusterWalrReleaseResult
+cluster_wal_retention_pin_release(ClusterWalRetentionPin **pin)
+{
+	UT_ASSERT(*pin == (ClusterWalRetentionPin *)&pin_fixture);
+	pin_release_calls++;
+	if (!pin_release_ok)
+		return CLUSTER_WALR_RELEASE_UNCONFIRMED;
+	*pin = NULL;
+	pin_bound = false;
+	return CLUSTER_WALR_RELEASE_CONFIRMED;
+}
 
 void *
 palloc0(Size size)
@@ -275,6 +350,12 @@ UT_TEST(cold_plan_partial_set_keeps_cleanup_without_minting_full_authority)
 		origin->origin_thread = i + 1;
 		origin->duty = request.duty;
 		origin->root_token = request.expected_root_token;
+		origin->root_snapshot.identity = origin->duty;
+		origin->root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+		origin->root_snapshot.root_flags = origin->root_token.root_flags;
+		origin->root_snapshot.checkpoint_tli = origin->root_snapshot.tail_tli = 7;
+		origin->root_snapshot.checkpoint_lower_lsn = 100;
+		origin->root_snapshot.validated_tail_lsn_exclusive = 500;
 		origin->formation = (ClusterFormationWitnessV1 *)request.formation;
 		origin->needs = (PgracExternalFenceNeedSetV1 *)request.fence_need_set;
 		origin->admissions = (PgracExternalFenceAdmissionSetV1 *)request.fence_admission_set;
@@ -309,6 +390,187 @@ UT_TEST(cold_plan_partial_set_keeps_cleanup_without_minting_full_authority)
 	ir_unavailable_thread = 0;
 }
 
+static ClusterRecoveryFencePlan *
+cold_pin_plan(uint16 count)
+{
+	ClusterRecoveryFencePlan *plan = palloc0(sizeof(*plan));
+	unsigned i;
+
+	pin_acquire_calls = pin_bind_calls = pin_release_calls = 0;
+	pin_requested_origins = pin_ir_locks_at_acquire = 0;
+	pin_available = pin_bind_ok = pin_current = pin_release_ok = true;
+	pin_bound = false;
+	pin_acquire_uncertain = false;
+	plan->magic = CLUSTER_RECOVERY_FENCE_PLAN_MAGIC;
+	plan->owner_pid = MyProcPid;
+	plan->own_thread = 3;
+	plan->origin_count = count;
+	plan->sealed = true;
+	plan->acquire_timeout_ms_snapshot = 100;
+	for (i = 0; i < count; i++) {
+		ClusterRecoverySerialRequest request = ir_request(i + 1);
+		ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
+
+		origin->origin_thread = i + 1;
+		origin->duty = request.duty;
+		origin->root_token = request.expected_root_token;
+		origin->root_snapshot.identity = origin->duty;
+		origin->root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+		origin->root_snapshot.root_flags = origin->root_token.root_flags;
+		origin->root_snapshot.checkpoint_tli = origin->root_snapshot.tail_tli = 7;
+		origin->root_snapshot.checkpoint_lower_lsn = 100;
+		origin->root_snapshot.validated_tail_lsn_exclusive = 500;
+		origin->formation = (ClusterFormationWitnessV1 *)request.formation;
+		origin->needs = (PgracExternalFenceNeedSetV1 *)request.fence_need_set;
+		origin->admissions = (PgracExternalFenceAdmissionSetV1 *)request.fence_admission_set;
+	}
+	return plan;
+}
+
+static void
+cold_pin_cleanup(ClusterRecoveryFencePlan **plan)
+{
+	if (*plan == NULL)
+		return;
+	pin_release_ok = true;
+	(void)cluster_recovery_merge_fence_plan_release_serial(*plan);
+	(void)acknowledge_retirements();
+	(void)cluster_recovery_merge_fence_plan_release_serial(*plan);
+	cluster_recovery_merge_fence_plan_destroy(plan);
+	UT_ASSERT(*plan == NULL);
+}
+
+UT_TEST(cold_plan_pins_exact_inputs_before_any_ir)
+{
+	ClusterRecoveryFencePlan *plan = cold_pin_plan(2);
+
+	UT_ASSERT(cluster_recovery_merge_fence_plan_acquire_serial(plan));
+	UT_ASSERT_EQ(pin_acquire_calls, 1);
+	UT_ASSERT_EQ(pin_requested_origins, 2);
+	UT_ASSERT_EQ(pin_ir_locks_at_acquire, 0);
+	UT_ASSERT_EQ(pin_bind_calls, 1);
+	UT_ASSERT(plan->retention_pin != NULL && pin_bound);
+	cold_pin_cleanup(&plan);
+	UT_ASSERT_EQ(pin_release_calls, 1);
+}
+
+UT_TEST(cold_plan_pin_refusal_takes_no_ir)
+{
+	ClusterRecoveryFencePlan *plan = cold_pin_plan(1);
+
+	pin_available = false;
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_acquire_serial(plan));
+	UT_ASSERT_EQ(plan->serial_guards.count, 0);
+	UT_ASSERT(!plan->serial_held);
+	UT_ASSERT_EQ(pin_bind_calls, 0);
+	cold_pin_cleanup(&plan);
+}
+
+UT_TEST(cold_plan_failed_pin_bind_does_not_publish_full_authority)
+{
+	ClusterRecoveryFencePlan *plan = cold_pin_plan(1);
+
+	pin_bind_ok = false;
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_acquire_serial(plan));
+	UT_ASSERT(!plan->serial_held);
+	UT_ASSERT_EQ(pin_bind_calls, 1);
+	UT_ASSERT(plan->retention_pin != NULL);
+	cold_pin_cleanup(&plan);
+}
+
+UT_TEST(cold_plan_pin_release_uncertain_retains_borrowed_fence_owners)
+{
+	ClusterRecoveryFencePlan *plan = cold_pin_plan(1);
+	unsigned released = ir_members_released;
+
+	UT_ASSERT(cluster_recovery_merge_fence_plan_acquire_serial(plan));
+	pin_release_ok = false;
+	(void)cluster_recovery_merge_fence_plan_release_serial(plan);
+	(void)acknowledge_retirements();
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_release_serial(plan));
+	UT_ASSERT(!plan->serial_held);
+	cluster_recovery_merge_fence_plan_destroy(&plan);
+	UT_ASSERT(plan != NULL);
+	UT_ASSERT_EQ(ir_members_released, released);
+	cold_pin_cleanup(&plan);
+}
+
+UT_TEST(cold_plan_bad_root_has_no_partial_pin_or_ir)
+{
+	ClusterRecoveryFencePlan *plan = cold_pin_plan(2);
+
+	plan->origins[1].root_snapshot.tail_tli++;
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_acquire_serial(plan));
+	UT_ASSERT_EQ(pin_acquire_calls, 0);
+	UT_ASSERT_EQ(plan->serial_guards.count, 0);
+	cold_pin_cleanup(&plan);
+}
+
+UT_TEST(cold_plan_uncertain_pin_acquire_keeps_cleanup_owner)
+{
+	ClusterRecoveryFencePlan *plan = cold_pin_plan(1);
+	unsigned released = ir_members_released;
+
+	pin_acquire_uncertain = true;
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_acquire_serial(plan));
+	UT_ASSERT_EQ(plan->serial_guards.count, 0);
+	UT_ASSERT(plan->retention_pin != NULL);
+	cluster_recovery_merge_fence_plan_destroy(&plan);
+	UT_ASSERT(plan != NULL);
+	UT_ASSERT_EQ(ir_members_released, released);
+	cold_pin_cleanup(&plan);
+	UT_ASSERT_EQ(pin_release_calls, 1);
+}
+
+UT_TEST(cold_plan_authority_borrows_exact_owners_only_after_commit)
+{
+	ClusterRecoveryFencePlan *plan = cold_pin_plan(2);
+	ClusterThreadRecoveryAuthorityV1 authority, zero = { 0 };
+
+	UT_ASSERT(cluster_recovery_merge_fence_plan_acquire_serial(plan));
+	memset(&authority, 0x7f, sizeof(authority));
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_authority(plan, 2, &authority));
+	UT_ASSERT(memcmp(&authority, &zero, sizeof(zero)) == 0);
+	plan->committed = true;
+	UT_ASSERT(cluster_recovery_merge_fence_plan_authority(plan, 2, &authority));
+	UT_ASSERT(authority.duty == &plan->origins[1].duty);
+	UT_ASSERT(authority.root_snapshot == &plan->origins[1].root_snapshot);
+	UT_ASSERT(authority.root_token == &plan->origins[1].root_token);
+	UT_ASSERT(authority.serial_guard == &plan->serial_guards.guards[1]);
+	UT_ASSERT(authority.retention_pin == plan->retention_pin);
+	UT_ASSERT_EQ(authority.root_snapshot->checkpoint_lower_lsn, 100);
+	UT_ASSERT_EQ(authority.root_snapshot->validated_tail_lsn_exclusive, 500);
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_authority(plan, 3, &authority));
+	UT_ASSERT(memcmp(&authority, &zero, sizeof(zero)) == 0);
+	(void)cluster_recovery_merge_fence_plan_release_serial(plan);
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_authority(plan, 2, &authority));
+	cold_pin_cleanup(&plan);
+}
+
+UT_TEST(cold_plan_stale_pin_or_mismatched_snapshot_never_exports_authority)
+{
+	ClusterRecoveryFencePlan *plan = cold_pin_plan(1);
+	ClusterThreadRecoveryAuthorityV1 authority, zero = { 0 };
+
+	UT_ASSERT(cluster_recovery_merge_fence_plan_acquire_serial(plan));
+	plan->committed = true;
+	UT_ASSERT(cluster_recovery_merge_fence_plan_revalidate_nowait(plan));
+	pin_current = false;
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_revalidate_nowait(plan));
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_authority(plan, 1, &authority));
+	UT_ASSERT(memcmp(&authority, &zero, sizeof(zero)) == 0);
+	pin_current = true;
+	plan->origins[0].root_snapshot.identity.origin_owner_incarnation++;
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_authority(plan, 1, &authority));
+	UT_ASSERT(memcmp(&authority, &zero, sizeof(zero)) == 0);
+	plan->origins[0].root_snapshot.identity = plan->origins[0].duty;
+	plan->serial_guards.guards[0].mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+	UT_ASSERT(!cluster_recovery_merge_fence_plan_authority(plan, 1, &authority));
+	plan->serial_guards.guards[0].mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+	UT_ASSERT(cluster_recovery_merge_fence_plan_authority(plan, 1, &authority));
+	cold_pin_cleanup(&plan);
+}
+
 int
 main(void)
 {
@@ -321,11 +583,19 @@ main(void)
 	retire_driver = cluster_control_request_driver_start();
 	cluster_shared_config = true;
 	MyBackendType = B_LMON; /* Nonblocking release; ACKs are explicit above. */
-	UT_PLAN(4);
+	UT_PLAN(12);
 	UT_RUN(ir_copied_set_compacts_without_losing_cleanup_owner);
 	UT_RUN(ir_failed_s5_outlives_stack_without_becoming_a_holder);
 	UT_RUN(ir_old_guard_is_unusable_during_rebind_but_still_releasable);
 	UT_RUN(cold_plan_partial_set_keeps_cleanup_without_minting_full_authority);
+	UT_RUN(cold_plan_pins_exact_inputs_before_any_ir);
+	UT_RUN(cold_plan_pin_refusal_takes_no_ir);
+	UT_RUN(cold_plan_failed_pin_bind_does_not_publish_full_authority);
+	UT_RUN(cold_plan_pin_release_uncertain_retains_borrowed_fence_owners);
+	UT_RUN(cold_plan_bad_root_has_no_partial_pin_or_ir);
+	UT_RUN(cold_plan_uncertain_pin_acquire_keeps_cleanup_owner);
+	UT_RUN(cold_plan_authority_borrows_exact_owners_only_after_commit);
+	UT_RUN(cold_plan_stale_pin_or_mismatched_snapshot_never_exports_authority);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
