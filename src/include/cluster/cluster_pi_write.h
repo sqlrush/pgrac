@@ -11,6 +11,7 @@
 
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_page_data.h"
+#include "cluster/cluster_page_wal.h"
 
 #ifdef USE_PGRAC_CLUSTER
 /* Process-local projection, never a grant or a persistent record. */
@@ -175,6 +176,21 @@ extern bool cluster_bufmgr_write_page_data_at_cut_v1(const ClusterPageDataTarget
 extern bool cluster_bufmgr_write_current_data_at_cut_v1(const ClusterPageDataTargetV1 *target,
 														const ClusterPcmPiWriteCutV1 *cut,
 														ClusterPageDataReceiptV1 **out);
+
+/* Master write requests know the namespace/tag and installed X generation,
+ * not the holder's current version. Sample incarnation from locked SPACE0
+ * and version from the actual current binding. Original background I/O only;
+ * this neither creates an identity nor acquires X. */
+extern bool cluster_bufmgr_write_tag_data_at_cut_v1(const ClusterSpaceIdentityKey *key,
+													const ClusterPcmPiWriteCutV1 *cut,
+													ClusterPageDataReceiptV1 **out);
+
+/* Copy actual DATA facts for the original background completion transport.
+ * This projection is not an import/receipt constructor or retirement grant.
+ * A raw decoded binding/cut cannot create an opaque DATA receipt. */
+extern bool cluster_page_data_pi_export_v1(const ClusterPageDataReceiptV1 *receipt,
+										   ClusterPageWalBindingV1 *binding,
+										   ClusterPcmPiWriteCutV1 *cut);
 
 /* Validate ancestry through the actual receipt in a sealed full-source PAGE
  * plan. Later page versions remain uncovered in its contribution prefix.

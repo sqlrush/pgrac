@@ -313,6 +313,7 @@ OBJS = \
 	cluster_wal_claim.o \
 	cluster_wal_inputs.o \
 	cluster_wal_cut.o \
+	cluster_pi_data.o \
 	cluster_wal_restart_read.o \
 	cluster_wal_writer.o \
 	cluster_wal_state.o \

@@ -80,6 +80,7 @@
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_page_data.h"
 #include "cluster/cluster_pi_write.h"
+#include "cluster/cluster_pi_data.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_writer.h"
@@ -10612,7 +10613,7 @@ cluster_page_data_source_covered_by(const ClusterWalSourceRef *original,
 static bool
 cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 										const ClusterPcmPiWriteCutV1 *cut, bool sample_current,
-										ClusterPageDataReceiptV1 **out)
+										bool sample_identity, ClusterPageDataReceiptV1 **out)
 {
 	ClusterPcmPiWriteCutV1 write_cut = { 0 };
 	ClusterPageDataTargetV1 written_target;
@@ -10634,7 +10635,8 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 	if (target == NULL || out == NULL || *out != NULL || CurrentResourceOwner == NULL
 		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
 		|| target->database_incarnation == 0 || !rf_page_identity_valid_v1(&target->identity)
-		|| !rf_page_version_present_v1(&target->version)
+		|| (!sample_identity && !rf_page_version_present_v1(&target->version))
+		|| (sample_identity && (!sample_current || cut == NULL))
 		|| (target->identity.forknum != MAIN_FORKNUM
 			&& target->identity.forknum != VISIBILITYMAP_FORKNUM)
 		|| cluster_smgr_which_for(target->identity.locator, InvalidBackendId) != 1
@@ -10675,7 +10677,9 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 				|| !cluster_space_identity_page_decode(BufHdrGetBlock(space), BLCKSZ, SPACE_FORKNUM,
 													   0, &key, &space_identity, &space_token)
 				|| space_identity.state != CLUSTER_SPACE_IDENTITY_LIVE
-				|| memcmp(space_identity.incarnation, target->version.segment_incarnation, 16) != 0)
+				|| (!sample_identity
+					&& memcmp(space_identity.incarnation, target->version.segment_incarnation, 16)
+						   != 0))
 				break;
 			data = cluster_page_data_try_hold(data_tag, true, &data_owner);
 			if (data == NULL
@@ -10703,6 +10707,11 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 				|| XLogRecPtrIsInvalid(PageGetLSN(expected.data))
 				|| ((binding.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
 					&& PageGetLSN(expected.data) > GetXLogInsertRecPtr()))
+				break;
+			/* A transportable completion includes the original WAL certificate,
+			 * including when the current buffer was already clean. Never certify
+			 * foreign WAL through the receiver's Flush pointer. */
+			if (sample_identity && !cluster_page_wal_flush_source_v1(&binding, &binding))
 				break;
 			rel = smgropen(key.locator, InvalidBackendId);
 			FlushBufferWithRecovery(data, rel, IOOBJECT_RELATION, IOCONTEXT_NORMAL, NULL,
@@ -10769,7 +10778,7 @@ bool
 cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *target,
 								  ClusterPageDataReceiptV1 **out)
 {
-	return cluster_bufmgr_write_page_data_internal(target, NULL, false, out);
+	return cluster_bufmgr_write_page_data_internal(target, NULL, false, false, out);
 }
 
 bool
@@ -10778,7 +10787,7 @@ cluster_bufmgr_write_page_data_at_cut_v1(const ClusterPageDataTargetV1 *target,
 										 ClusterPageDataReceiptV1 **out)
 {
 	return cluster_pcm_pi_write_cut_valid_v1(cut) && cut->pi_holders_bitmap != 0
-		   && cluster_bufmgr_write_page_data_internal(target, cut, false, out);
+		   && cluster_bufmgr_write_page_data_internal(target, cut, false, false, out);
 }
 
 bool
@@ -10787,7 +10796,81 @@ cluster_bufmgr_write_current_data_at_cut_v1(const ClusterPageDataTargetV1 *targe
 											ClusterPageDataReceiptV1 **out)
 {
 	return cluster_pcm_pi_write_cut_valid_v1(cut) && cut->pi_holders_bitmap != 0
-		   && cluster_bufmgr_write_page_data_internal(target, cut, true, out);
+		   && cluster_bufmgr_write_page_data_internal(target, cut, true, false, out);
+}
+
+bool
+cluster_bufmgr_write_tag_data_at_cut_v1(const ClusterSpaceIdentityKey *key,
+										const ClusterPcmPiWriteCutV1 *cut,
+										ClusterPageDataReceiptV1 **out)
+{
+	ClusterPageDataTargetV1 target = { 0 };
+	if (key == NULL || !cluster_pcm_pi_write_cut_valid_v1(cut) || cut->pi_holders_bitmap == 0
+		|| (MyBackendType != B_BG_WORKER && MyBackendType != B_BG_WRITER
+			&& MyBackendType != B_CHECKPOINTER)
+		|| CritSectionCount != 0
+		|| !RelFileLocatorEquals(key->locator,
+								 BufTagGetRelFileLocator(&cut->holder.assertion.resource)))
+		return false;
+	target.database_incarnation = key->database_incarnation;
+	target.identity.system_identifier = key->system_identifier;
+	memcpy(target.identity.storage_uuid, key->storage_uuid, 16);
+	target.identity.locator = key->locator;
+	target.identity.forknum = cut->holder.assertion.resource.forkNum;
+	target.identity.blockno = cut->holder.assertion.resource.blockNum;
+	return cluster_bufmgr_write_page_data_internal(&target, cut, true, true, out);
+}
+
+bool
+cluster_page_data_pi_export_v1(const ClusterPageDataReceiptV1 *receipt,
+							   ClusterPageWalBindingV1 *binding, ClusterPcmPiWriteCutV1 *cut)
+{
+	ClusterPageDataTargetV1 target;
+	BufferTag tag;
+	if (binding == NULL || cut == NULL || !cluster_page_data_receipt_read_v1(receipt, &target)
+		|| !cluster_pcm_pi_write_cut_valid_v1(&receipt->pi_cut)
+		|| receipt->pi_cut.pi_holders_bitmap == 0
+		|| !cluster_page_wal_binding_shape_v1(&receipt->wal)
+		|| receipt->wal.flags != CLUSTER_PAGE_WAL_NATIVE_FLUSHED
+		|| receipt->wal.source.claim.database_incarnation != target.database_incarnation
+		|| !rf_page_identity_equal_v1(&receipt->wal.identity, &target.identity)
+		|| !rf_page_version_equal_v1(&receipt->wal.version, &target.version))
+		return false;
+	InitBufferTag(&tag, &target.identity.locator, target.identity.forknum, target.identity.blockno);
+	if (!BufferTagsEqual(&tag, &receipt->pi_cut.holder.assertion.resource))
+		return false;
+	*binding = receipt->wal;
+	*cut = receipt->pi_cut;
+	return true;
+}
+
+bool
+cluster_page_data_from_remote_v1(const ClusterPiDataV1 *job, ClusterPageDataReceiptV1 **out)
+{
+	ClusterPageWalBindingV1 binding;
+	ClusterPcmPiWriteCutV1 cut;
+	ClusterPageDataReceiptV1 *receipt;
+	BufferTag tag;
+	if (out == NULL || *out != NULL || !cluster_pi_data_read_v1(job, &binding, &cut)
+		|| !cluster_page_wal_binding_shape_v1(&binding)
+		|| binding.flags != CLUSTER_PAGE_WAL_NATIVE_FLUSHED
+		|| !rf_page_identity_valid_v1(&binding.identity)
+		|| !rf_page_version_present_v1(&binding.version) || !cluster_pcm_pi_write_cut_valid_v1(&cut)
+		|| cut.pi_holders_bitmap == 0)
+		return false;
+	InitBufferTag(&tag, &binding.identity.locator, binding.identity.forknum,
+				  binding.identity.blockno);
+	if (!BufferTagsEqual(&tag, &cut.holder.assertion.resource))
+		return false;
+	receipt = palloc0(sizeof(*receipt));
+	receipt->magic = UINT64_C(0x5047444154413031);
+	receipt->target.database_incarnation = binding.source.claim.database_incarnation;
+	receipt->target.identity = binding.identity;
+	receipt->target.version = binding.version;
+	receipt->wal = binding;
+	receipt->pi_cut = cut;
+	*out = receipt;
+	return true;
 }
 
 bool

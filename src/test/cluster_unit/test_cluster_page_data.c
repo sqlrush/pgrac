@@ -13,6 +13,7 @@
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_page_data.h"
 #include "cluster/cluster_pi_write.h"
+#include "cluster/cluster_pi_data.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
@@ -61,6 +62,20 @@ static bool locks[2], resident[2], busy[2], selected, sf_blocked, bad_checksum, 
 static bool stale_sync, redirty_sync, checksums = true;
 static bool zero_disk, late_fence;
 static bool storage_read, storage_cut_current = true, storage_cut_changed, storage_space_changed;
+static bool remote_data_ready;
+static ClusterPageWalBindingV1 remote_data_binding;
+static ClusterPcmPiWriteCutV1 remote_data_cut;
+
+bool
+cluster_pi_data_read_v1(const ClusterPiDataV1 *job, ClusterPageWalBindingV1 *binding,
+						ClusterPcmPiWriteCutV1 *cut)
+{
+	if (!remote_data_ready || job != (const ClusterPiDataV1 *)1)
+		return false;
+	*binding = remote_data_binding;
+	*cut = remote_data_cut;
+	return true;
+}
 static unsigned pi_discards;
 static int pi_discard_race;
 static int throw_at;
@@ -1306,6 +1321,141 @@ pi_cut_must_match_current_holder_before_data(void)
 }
 
 static void
+tag_write_samples_real_identity_and_version(void)
+{
+	ClusterPcmPiWriteCutV1 cut, exported;
+	ClusterPageDataReceiptV1 *receipt = NULL;
+	ClusterPageDataTargetV1 observed;
+	ClusterPageWalBindingV1 binding;
+	reset();
+	cut = data_pi_cut();
+	UT_ASSERT(cluster_bufmgr_write_tag_data_at_cut_v1(&identity.key, &cut, &receipt));
+	UT_ASSERT(cluster_page_data_receipt_read_v1(receipt, &observed));
+	UT_ASSERT(rf_page_identity_equal_v1(&observed.identity, &target.identity));
+	UT_ASSERT(rf_page_version_equal_v1(&observed.version, &target.version));
+	UT_ASSERT(cluster_page_data_pi_export_v1(receipt, &binding, &exported));
+	UT_ASSERT_EQ(memcmp(&cut, &exported, sizeof(cut)), 0);
+	UT_ASSERT_EQ(binding.flags, CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
+	UT_ASSERT_EQ(binding.record_end, 0x200);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(syncs, 1);
+	UT_ASSERT_EQ(reads, 1);
+	UT_ASSERT_EQ(wal_flushes, 1);
+	cluster_page_data_receipt_free_v1(&receipt);
+	clean();
+}
+
+static void
+tag_write_rejects_wrong_namespace_or_holder(void)
+{
+	for (int wrong = 0; wrong < 11; wrong++) {
+		ClusterPcmPiWriteCutV1 cut;
+		ClusterSpaceIdentityKey key;
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		reset();
+		cut = data_pi_cut();
+		key = identity.key;
+		switch (wrong) {
+		case 0:
+			key.system_identifier++;
+			break;
+		case 1:
+			key.database_incarnation++;
+			break;
+		case 2:
+			key.storage_uuid[15]++;
+			break;
+		case 3:
+			key.locator.relNumber++;
+			break;
+		case 4:
+			cut.holder.requester_target_generation++;
+			break;
+		case 5:
+			cut.holder.assertion.requester_node++;
+			break;
+		case 6:
+			resident[0] = false;
+			break;
+		case 7:
+			resident[1] = false;
+			break;
+		case 8:
+			MyBackendType = B_LMON;
+			break;
+		case 9:
+			CurrentResourceOwner = NULL;
+			break;
+		case 10:
+			identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+			UT_ASSERT(cluster_space_identity_page_encode(&identity, 10, pages[0].data, BLCKSZ));
+			break;
+		}
+		UT_ASSERT(!cluster_bufmgr_write_tag_data_at_cut_v1(&key, &cut, &receipt));
+		UT_ASSERT(receipt == NULL);
+		UT_ASSERT_EQ(writes + syncs + reads + wal_flushes, 0);
+		clean();
+	}
+}
+
+static void
+remote_import_requires_original_job(void)
+{
+	ClusterPcmPiWriteCutV1 cut, exported;
+	ClusterPageDataReceiptV1 *written = NULL, *imported = NULL;
+	ClusterPageDataTargetV1 observed;
+	ClusterPageWalBindingV1 binding;
+	reset();
+	cut = data_pi_cut();
+	UT_ASSERT(cluster_bufmgr_write_tag_data_at_cut_v1(&identity.key, &cut, &written));
+	UT_ASSERT(cluster_page_data_pi_export_v1(written, &remote_data_binding, &remote_data_cut));
+	remote_data_ready = false;
+	UT_ASSERT(!cluster_page_data_from_remote_v1((const ClusterPiDataV1 *)1, &imported));
+	UT_ASSERT(imported == NULL);
+	remote_data_ready = true;
+	UT_ASSERT(!cluster_page_data_from_remote_v1(NULL, &imported));
+	UT_ASSERT(cluster_page_data_from_remote_v1((const ClusterPiDataV1 *)1, &imported));
+	UT_ASSERT(cluster_page_data_receipt_read_v1(imported, &observed));
+	UT_ASSERT(rf_page_version_equal_v1(&observed.version, &target.version));
+	UT_ASSERT(cluster_page_data_pi_export_v1(imported, &binding, &exported));
+	UT_ASSERT_EQ(memcmp(&binding, &remote_data_binding, sizeof(binding)), 0);
+	UT_ASSERT_EQ(memcmp(&exported, &cut, sizeof(cut)), 0);
+	cluster_page_data_receipt_free_v1(&imported);
+	remote_data_binding.flags = 0;
+	UT_ASSERT(!cluster_page_data_from_remote_v1((const ClusterPiDataV1 *)1, &imported));
+	UT_ASSERT(imported == NULL);
+	cluster_page_data_receipt_free_v1(&written);
+	remote_data_ready = false;
+	clean();
+}
+
+static void
+tag_write_io_failure_never_exports_completion(void)
+{
+	for (int at = 1; at <= 4; at++) {
+		ClusterPcmPiWriteCutV1 cut;
+		ClusterPageDataReceiptV1 *volatile receipt = NULL;
+		volatile bool caught = false;
+		reset();
+		cut = data_pi_cut();
+		throw_at = at;
+		PG_TRY();
+		{
+			(void)cluster_bufmgr_write_tag_data_at_cut_v1(&identity.key, &cut,
+														  (ClusterPageDataReceiptV1 **)&receipt);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT(receipt == NULL);
+		clean();
+	}
+}
+
+static void
 physical_receipts_close_only_exact_contributions(void)
 {
 	ClusterPageDataReceiptV1 *old = NULL, *old_at_cut = NULL, *main = NULL, *vm = NULL;
@@ -1764,7 +1914,11 @@ physical_pi_newer_than_actual_data_is_not_discarded(void)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(26);
+	UT_RUN(tag_write_io_failure_never_exports_completion);
+	UT_RUN(remote_import_requires_original_job);
+	UT_RUN(tag_write_samples_real_identity_and_version);
+	UT_RUN(tag_write_rejects_wrong_namespace_or_holder);
 	UT_RUN(physical_ack_requires_actual_consumption_and_original_boot);
 	UT_RUN(physical_ack_cannot_change_data_cut_or_owner);
 	UT_RUN(same_claim_data_under_later_root_ceiling);
