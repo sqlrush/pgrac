@@ -208,6 +208,34 @@ cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
 	return true;
 }
 bool
+cluster_page_wal_pi_snapshot_locked_v1(BufferDesc *buf, ClusterPageWalBindingV1 *out)
+{
+	ClusterPageWalBindingV1 value;
+	uint32 state;
+	if (bindings == NULL || buf == NULL || buf->buf_id < 0 || buf->buf_id >= NBuffers
+		|| out == NULL)
+		return false;
+	state = pg_atomic_read_u32(&buf->state);
+	if ((state & (BM_LOCKED | BM_TAG_VALID | BM_PERMANENT))
+			!= (BM_LOCKED | BM_TAG_VALID | BM_PERMANENT)
+		|| (state
+			& (BM_VALID | BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR
+			   | BM_IO_IN_PROGRESS))
+			   != 0
+		|| buf->buffer_type != BUF_TYPE_PI || buf->pcm_state != PCM_STATE_N
+		|| !page_wal_expand(buf, &value)
+		|| !cluster_page_wal_binding_matches_v1(&value, BufTagGetRelFileLocator(&buf->tag),
+												buf->tag.forkNum, buf->tag.blockNum,
+												BufferGetPage(BufferDescriptorGetBuffer(buf))))
+		return false;
+	/* PI conversion retains this descriptor's claim reference. With its
+	 * header locked and no input I/O, neither reuse nor reread can release
+	 * that reference or alter the frozen bytes during this projection. */
+	*out = value;
+	return true;
+}
+
+bool
 cluster_page_wal_prepare_install_v1(Buffer buffer, const ClusterPageWalBindingV1 *carrier,
 									Page image, ClusterPageWalInstallV1 *prepared)
 {

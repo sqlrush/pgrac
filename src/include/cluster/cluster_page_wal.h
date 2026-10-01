@@ -124,6 +124,12 @@ extern bool cluster_page_wal_read_v1(Buffer buffer, const ClusterSpaceIdentity *
  * establish current SPACE incarnation or qualify a DATA write. */
 extern bool cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out);
 
+/* Strict frozen PI projection under the descriptor header lock. No pin or
+ * content lock is borrowed; !BM_VALID/PI/N/no-I/O excludes byte mutation.
+ * The caller must revalidate descriptor generation before any discard. */
+extern bool cluster_page_wal_pi_snapshot_locked_v1(struct BufferDesc *buf,
+												   ClusterPageWalBindingV1 *out);
+
 /* Original T2 owner preflights under content-X before touching page/authority.
  * An all-zero carrier explicitly clears old attribution. A successful prepare
  * reserves its source before page/authority mutation. The process-local value

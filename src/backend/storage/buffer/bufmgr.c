@@ -11076,6 +11076,129 @@ cluster_page_data_pi_storage_proof_v1(const ClusterPageDataReceiptV1 *receipt,
 	*out = receipt->storage_cut;
 	return true;
 }
+
+static bool
+cluster_page_data_covers_pi(const ClusterPageDataReceiptV1 *receipt, const RfPageOnlinePlanV1 *plan,
+							const ClusterWalSourceRef *sources, uint32 source_count,
+							const ClusterPageWalBindingV1 *pi)
+{
+	if (!rf_page_identity_equal_v1(&receipt->target.identity, &pi->identity)
+		|| memcmp(receipt->target.version.segment_incarnation, pi->version.segment_incarnation, 16)
+			   != 0)
+		return false;
+	for (uint32 i = 0; i < rf_page_online_plan_target_count_v1(plan); i++) {
+		RfPageOnlineTargetViewV1 view;
+		bool found = false;
+		if (!rf_page_online_plan_target_v1(plan, i, &view))
+			return false;
+		if (!rf_page_identity_equal_v1(&receipt->target.identity, &view.page_identity))
+			continue;
+		/* Sealed contributors are in dependency order, not token or LSN
+		 * order. Stop at actual DATA: a successor PI remains owed. */
+		for (uint32 j = 0; j < view.contributors->edge_count; j++) {
+			const RfPageStableEdgeInputV1 *edge = &view.contributors->edges[j];
+			const RfPageReplayRecordIdentityV1 *record = &edge->record_identity;
+			if (edge->result_token == pi->version.mutation_token
+				&& memcmp(edge->edge.result_incarnation, pi->version.segment_incarnation, 16)
+					   == 0) {
+				if (edge->participant_index >= source_count
+					|| !cluster_page_data_source_same(&pi->source,
+													  &sources[edge->participant_index])
+					|| record->read_rec_ptr != pi->record_start
+					|| record->end_rec_ptr != pi->record_end || record->record_crc != pi->record_crc
+					|| record->rmid != pi->rmid || record->info != pi->info)
+					return false;
+				found = true;
+			}
+			if (edge->result_token == receipt->target.version.mutation_token
+				&& memcmp(edge->edge.result_incarnation,
+						  receipt->target.version.segment_incarnation, 16)
+					   == 0)
+				return found;
+		}
+		return false;
+	}
+	return false;
+}
+
+static bool
+cluster_pi_physical_unfenced_locked(BufferDesc *buf, uint32 state)
+{
+	uint64 generation = cluster_pcm_own_gen_get(buf->buf_id);
+	return (state & (BM_TAG_VALID | BM_PERMANENT)) == (BM_TAG_VALID | BM_PERMANENT)
+		   && (state & (BM_IO_IN_PROGRESS | BM_IO_ERROR | BM_PIN_COUNT_WAITER)) == 0
+		   && BUF_STATE_GET_REFCOUNT(state) == 0 && generation != 0 && generation != UINT64_MAX
+		   && cluster_pcm_own_flags_get(buf->buf_id) == 0
+		   && cluster_pcm_own_writer_activation_token_get(buf->buf_id) == 0
+		   && cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id) == 0
+		   && cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0;
+}
+
+ClusterPiPhysicalResultV1
+cluster_bufmgr_discard_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
+									 const RfPageOnlinePlanV1 *plan,
+									 const ClusterWalSourceRef *sources, uint32 source_count)
+{
+	ClusterPageDataTargetV1 target;
+	ClusterPcmPiWriteCutV1 x_cut;
+	ClusterPcmPiStorageCutV1 storage_cut;
+	ClusterPageWalBindingV1 pi, reobserved;
+	BufferTag tag;
+	BufferDesc *buf;
+	LWLock *partition;
+	uint64 generation;
+	uint32 hash, state;
+	int id;
+	bool valid;
+	ClusterPiPhysicalResultV1 result = CLUSTER_PI_PHYSICAL_RETRY;
+
+	if (!cluster_enabled || !cluster_shared_config || RecoveryInProgress()
+		|| !cluster_page_data_receipt_read_v1(receipt, &target)
+		|| (!cluster_page_data_pi_proof_v1(receipt, plan, sources, source_count, &x_cut)
+			&& !cluster_page_data_pi_storage_proof_v1(receipt, plan, sources, source_count,
+													  &storage_cut)))
+		return result;
+	InitBufferTag(&tag, &target.identity.locator, target.identity.forknum, target.identity.blockno);
+	hash = BufTableHashCode(&tag);
+	partition = BufMappingPartitionLock(hash);
+	LWLockAcquire(partition, LW_SHARED);
+	id = BufTableLookup(&tag, hash);
+	if (id < 0) {
+		LWLockRelease(partition);
+		return CLUSTER_PI_PHYSICAL_ABSENT;
+	}
+	buf = GetBufferDescriptor(id);
+	state = LockBufHdr(buf);
+	generation = cluster_pcm_own_gen_get(id);
+	valid = BufferTagsEqual(&buf->tag, &tag) && cluster_pi_physical_unfenced_locked(buf, state);
+	if (valid && cluster_bufmgr_pcm_current_image_locked(buf, state)) {
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		return CLUSTER_PI_PHYSICAL_REPLACED;
+	}
+	valid = valid && cluster_page_wal_pi_snapshot_locked_v1(buf, &pi);
+	UnlockBufHdr(buf, state);
+	LWLockRelease(partition);
+	if (!valid || !cluster_page_data_covers_pi(receipt, plan, sources, source_count, &pi))
+		return result;
+
+	/* The ordinary InvalidateBuffer wrapper drops the header while taking
+	 * mapping-X. Use its existing commit owner under the final exact locks
+	 * so a same-tag replacement cannot consume an old notification. */
+	LWLockAcquire(partition, LW_EXCLUSIVE);
+	state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag) || cluster_pcm_own_gen_get(id) != generation
+		|| !cluster_pi_physical_unfenced_locked(buf, state)
+		|| !cluster_page_wal_pi_snapshot_locked_v1(buf, &reobserved)
+		|| memcmp(&pi, &reobserved, sizeof(pi)) != 0) {
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		return result;
+	}
+	if (InvalidateBufferCommitLocked(buf, &tag, hash, partition, state))
+		result = CLUSTER_PI_PHYSICAL_DISCARDED;
+	return result;
+}
 #endif
 
 /*

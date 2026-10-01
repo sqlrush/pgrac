@@ -862,10 +862,49 @@ pregrant_owner_releases_preparation_on_all_outcomes(void)
 		UT_ASSERT_EQ(capture_many(256, 900), CLUSTER_PAGE_WAL_CAPTURED);
 	}
 }
+static void
+pi_snapshot_requires_frozen_header_owner(void)
+{
+	for (int c = 0; c < 9; c++) {
+		ClusterPageWalBindingV1 out, untouched;
+		reset();
+		UT_ASSERT(capture());
+		PageSetLSNPreserveOrigin(page.data, 0x200);
+		desc.bufferdesc.buffer_type = BUF_TYPE_PI;
+		desc.bufferdesc.pcm_state = PCM_STATE_N;
+		pg_atomic_write_u32(&desc.bufferdesc.state, BM_LOCKED | BM_TAG_VALID | BM_PERMANENT);
+		locked = exclusive = false;
+		memset(&untouched, 0xa5, sizeof(untouched));
+		out = untouched;
+		if (c == 1)
+			pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_LOCKED);
+		if (c == 2)
+			pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_VALID);
+		if (c == 3)
+			pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_IN_PROGRESS);
+		if (c == 4)
+			pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_DIRTY);
+		if (c == 5)
+			desc.bufferdesc.buffer_type = BUF_TYPE_SCUR;
+		if (c == 6)
+			desc.bufferdesc.pcm_state = PCM_STATE_X;
+		if (c == 7)
+			((PageHeader)page.data)->pd_block_scn++;
+		if (c == 8)
+			pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_PERMANENT);
+		UT_ASSERT_EQ(cluster_page_wal_pi_snapshot_locked_v1(&desc.bufferdesc, &out), c == 0);
+		if (c == 0) {
+			UT_ASSERT_EQ(out.version.mutation_token, 80);
+			UT_ASSERT_EQ(out.record_end, 0x200);
+		} else
+			UT_ASSERT_EQ(memcmp(&out, &untouched, sizeof(out)), 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(19);
 	UT_RUN(resident_binding_memory_budget);
 	printf("# Complete private/wire carrier: %zu bytes\n", sizeof(ClusterPageWalBindingV1));
 	cluster_page_wal_shmem_register();
@@ -887,6 +926,7 @@ main(void)
 	UT_RUN(shared_claim_and_descriptor_reuse_do_not_alias);
 	UT_RUN(bounded_claim_pool_and_t2_reservation_release);
 	UT_RUN(pregrant_owner_releases_preparation_on_all_outcomes);
+	UT_RUN(pi_snapshot_requires_frozen_header_owner);
 	free(shared_memory);
 	UT_DONE();
 	return ut_failed_count != 0;

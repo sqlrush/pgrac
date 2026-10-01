@@ -98,6 +98,23 @@ extern bool cluster_page_data_pi_storage_proof_v1(const ClusterPageDataReceiptV1
 												  uint32 source_count,
 												  ClusterPcmPiStorageCutV1 *out);
 
+typedef enum ClusterPiPhysicalResultV1 {
+	CLUSTER_PI_PHYSICAL_RETRY = 0,
+	CLUSTER_PI_PHYSICAL_ABSENT,
+	CLUSTER_PI_PHYSICAL_REPLACED,
+	CLUSTER_PI_PHYSICAL_DISCARDED
+} ClusterPiPhysicalResultV1;
+
+/* Local physical consumer only. Drops a strictly unpinned, unfenced PI
+ * iff its exact original WAL/version is an ancestor of actual DATA in the
+ * same sealed input. Current/S and later PI are never discarded. This result
+ * is neither a master-clear grant nor proof that another boot has retired;
+ * the background owner must qualify every node/session and recheck its cut. */
+extern ClusterPiPhysicalResultV1
+cluster_bufmgr_discard_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
+									 const RfPageOnlinePlanV1 *plan,
+									 const ClusterWalSourceRef *sources, uint32 source_count);
+
 static inline bool
 cluster_pcm_pi_write_cut_valid_v1(const ClusterPcmPiWriteCutV1 *cut)
 {

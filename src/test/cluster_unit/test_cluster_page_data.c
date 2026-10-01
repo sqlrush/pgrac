@@ -58,6 +58,8 @@ static bool locks[2], resident[2], busy[2], selected, sf_blocked, bad_checksum, 
 static bool stale_sync, redirty_sync, checksums = true;
 static bool zero_disk, late_fence;
 static bool storage_read, storage_cut_current = true, storage_cut_changed, storage_space_changed;
+static unsigned pi_discards;
+static int pi_discard_race;
 static int throw_at;
 static unsigned writes, syncs, reads, wal_flushes, aborts;
 static XLogRecPtr local_insert_end;
@@ -163,6 +165,15 @@ bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
 	UT_ASSERT(lock == &mapping);
+	if (mode == LW_EXCLUSIVE && pi_discard_race != 0) {
+		if (pi_discard_race == 1)
+			pg_atomic_fetch_add_u64(&own[1].generation, 1);
+		else if (pi_discard_race == 2)
+			pg_atomic_fetch_add_u32(&descriptors[1].bufferdesc.state, 1);
+		else
+			((PageHeader)pages[1].data)->pd_block_scn++;
+		pi_discard_race = 0;
+	}
 	HOLD_INTERRUPTS();
 	return true;
 }
@@ -398,6 +409,27 @@ cluster_pcm_lock_pi_storage_matches_v1(const ClusterPcmPiStorageCutV1 *cut)
 {
 	return storage_cut_current && cluster_pcm_pi_storage_cut_valid_v1(cut);
 }
+/* Exact native eviction boundary. The new consumer must already hold
+ * mapping-X and the original header, with no pin or current residency. */
+static bool
+InvalidateBufferCommitLocked(BufferDesc *buf, BufferTag *tag, uint32 hash, LWLock *partition,
+							 uint32 state)
+{
+	UT_ASSERT(state & BM_LOCKED);
+	UT_ASSERT(BufferTagsEqual(&buf->tag, tag));
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(state), 0);
+	UT_ASSERT_EQ(buf->pcm_state, PCM_STATE_N);
+	UT_ASSERT_EQ(buf->buffer_type, BUF_TYPE_PI);
+	cluster_page_wal_reset_reuse_locked(buf);
+	ClearBufferTag(&buf->tag);
+	resident[buf->buf_id] = false;
+	buf->buffer_type = BUF_TYPE_CURRENT;
+	pg_atomic_fetch_add_u64(&own[buf->buf_id].generation, 1);
+	UnlockBufHdr(buf, state & ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK));
+	LWLockRelease(partition);
+	pi_discards++;
+	return true;
+}
 static void
 shared_buffer_write_error_callback(void *arg)
 {
@@ -520,6 +552,8 @@ reset(void)
 	zero_disk = late_fence = false;
 	storage_read = storage_cut_changed = storage_space_changed = false;
 	storage_cut_current = true;
+	pi_discards = 0;
+	pi_discard_race = 0;
 	checksums = true;
 	throw_at = 0;
 	writes = syncs = reads = wal_flushes = aborts = 0;
@@ -1394,10 +1428,123 @@ physical_receipts_close_only_exact_contributions(void)
 	clean();
 }
 
+static void
+physical_pi_from_source(const ClusterWalSourceRef *source, uint64 token)
+{
+	uint64 requested = target.version.mutation_token;
+	writer = *source;
+	cluster_node_id = writer.claim.identity.origin_node_id;
+	resident[1] = true;
+	((PageHeader)pages[1].data)->pd_block_scn = token;
+	UT_ASSERT(PageSetLSNOrigin(pages[1].data, writer.claim.identity.origin_thread_id - 1));
+	pg_atomic_write_u32(&descriptors[1].bufferdesc.state, BM_VALID | BM_TAG_VALID | BM_PERMANENT);
+	target.version.mutation_token = token;
+	bind_native_record(RM_XLOG_ID, XLOG_FPI);
+	target.version.mutation_token = requested;
+	descriptors[1].bufferdesc.pcm_state = PCM_STATE_N;
+	descriptors[1].bufferdesc.buffer_type = BUF_TYPE_PI;
+	pg_atomic_fetch_and_u32(&descriptors[1].bufferdesc.state, ~BM_VALID);
+}
+
+static void
+physical_pi_discard_is_ancestry_and_generation_exact(void)
+{
+	for (int c = 0; c < 15; c++) {
+		ClusterWalSourceRef sources[3], pi_source;
+		ClusterPcmPiStorageCutV1 cut;
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &cut);
+		ClusterPiPhysicalResultV1 expected
+			= c == 0 ? CLUSTER_PI_PHYSICAL_DISCARDED : CLUSTER_PI_PHYSICAL_RETRY;
+		UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt));
+		pi_source = sources[0];
+		if (c == 5)
+			pi_source.claim.identity.origin_owner_incarnation++;
+		physical_pi_from_source(&pi_source, 80);
+		if (c == 1)
+			pg_atomic_fetch_add_u32(&descriptors[1].bufferdesc.state, 1);
+		if (c == 2)
+			pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_DIRTY);
+		if (c == 3)
+			pg_atomic_write_u32(&own[1].flags, PCM_OWN_FLAG_REVOKING);
+		if (c == 4)
+			((PageHeader)pages[1].data)->pd_block_scn++;
+		if (c == 6)
+			pi_discard_race = 1;
+		if (c == 7)
+			pi_discard_race = 2;
+		if (c == 8 || c == 9) {
+			descriptors[1].bufferdesc.pcm_state = c == 8 ? PCM_STATE_X : PCM_STATE_S;
+			descriptors[1].bufferdesc.buffer_type = c == 8 ? BUF_TYPE_XCUR : BUF_TYPE_SCUR;
+			pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_VALID);
+			expected = CLUSTER_PI_PHYSICAL_REPLACED;
+		}
+		if (c == 10) {
+			resident[1] = false;
+			expected = CLUSTER_PI_PHYSICAL_ABSENT;
+		}
+		if (c == 11) {
+			locks[1] = source_capture = true;
+			UT_ASSERT(cluster_page_wal_forget_v1(2));
+			locks[1] = source_capture = false;
+		}
+		if (c == 12)
+			receipt->target.version.segment_incarnation[0]++;
+		if (c == 13)
+			pi_discard_race = 3;
+		if (c == 14) {
+			identity.incarnation[0]++;
+			physical_pi_from_source(&pi_source, 80);
+		}
+		UT_ASSERT_EQ(cluster_bufmgr_discard_pi_at_data_v1(receipt, plan, sources, 3), expected);
+		UT_ASSERT_EQ(pi_discards, c == 0 ? 1 : 0);
+		if (c == 0) {
+			UT_ASSERT_EQ(cluster_bufmgr_discard_pi_at_data_v1(receipt, plan, sources, 3),
+						 CLUSTER_PI_PHYSICAL_ABSENT);
+			UT_ASSERT_EQ(pi_discards, 1);
+		}
+		UT_ASSERT_EQ(writes + wal_flushes, 0);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&plan);
+		clean();
+	}
+}
+
+static void
+physical_pi_newer_than_actual_data_is_not_discarded(void)
+{
+	ClusterWalSourceRef sources[3];
+	ClusterPcmPiStorageCutV1 storage_cut;
+	ClusterPcmPiWriteCutV1 cut;
+	ClusterPageDataReceiptV1 *receipt = NULL;
+	RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &storage_cut);
+	physical_pi_from_source(&sources[0], 80);
+	storage_read = false;
+	descriptors[1].bufferdesc.pcm_state = PCM_STATE_X;
+	descriptors[1].bufferdesc.buffer_type = BUF_TYPE_XCUR;
+	pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_VALID | BM_DIRTY);
+	target.version.mutation_token = 80;
+	cut = data_pi_cut();
+	UT_ASSERT(cluster_bufmgr_write_page_data_at_cut_v1(&target, &cut, &receipt));
+	physical_pi_from_source(&sources[1], 19);
+	UT_ASSERT_EQ(cluster_bufmgr_discard_pi_at_data_v1(receipt, plan, sources, 3),
+				 CLUSTER_PI_PHYSICAL_RETRY);
+	UT_ASSERT_EQ(pi_discards, 0);
+	/* Same old DATA can retire its own exact PI, independent of numeric
+	 * token ordering (80 is older than 19 in this sealed chain). */
+	physical_pi_from_source(&sources[0], 80);
+	UT_ASSERT_EQ(cluster_bufmgr_discard_pi_at_data_v1(receipt, plan, sources, 3),
+				 CLUSTER_PI_PHYSICAL_DISCARDED);
+	UT_ASSERT_EQ(pi_discards, 1);
+	cluster_page_data_receipt_free_v1(&receipt);
+	rf_page_online_plan_destroy_v1(&plan);
+	clean();
+}
+
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(18);
 	UT_RUN(success_and_old_completion);
 	UT_RUN(identity_refusals);
 	UT_RUN(authority_refusals);
@@ -1414,6 +1561,8 @@ main(void)
 	UT_RUN(n_s_storage_observation_qualifies_only_terminal_data);
 	UT_RUN(storage_observation_rejects_incomplete_or_changed_proof);
 	UT_RUN(storage_observation_releases_space_on_io_error);
+	UT_RUN(physical_pi_discard_is_ancestry_and_generation_exact);
+	UT_RUN(physical_pi_newer_than_actual_data_is_not_discarded);
 	if (file)
 		fclose(file);
 	UT_DONE();
