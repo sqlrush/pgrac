@@ -354,6 +354,11 @@ transition_drop_tail(BufferDesc *buf, uint32 state)
  * after the real StartBufferIO and callback registration have executed. */
 static bool StartBufferIO(BufferDesc *buf, bool forInput);
 static void TerminateBufferIO(BufferDesc *buf, bool clear, uint32 flags);
+struct ClusterSpaceRecoveryBatchV1;
+static void FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject object,
+									IOContext context,
+									const struct ClusterSpaceRecoveryBatchV1 *recovery,
+									volatile bool *io_started);
 static struct SMgrRelationData transition_smgr;
 static BufferUsage transition_usage;
 static void
@@ -390,6 +395,7 @@ transition_write_context(void *arg)
 	((void)(dirty), (void)(token), (void)(generation), true)
 #define cluster_smart_fusion false
 #define cluster_sf_dep_buffer_flush_blocked(buf) false
+#define cluster_space_recovery_flush_permitted_v1(batch, buffer) false
 #define ResourceOwnerEnlargeBufferIOs(owner) ((void)0)
 #define ResourceOwnerRememberBufferIO(owner, buffer) (transition_owned_io++)
 #define ResourceOwnerForgetBufferIO(owner, buffer) transition_io_forget(buffer)
@@ -411,6 +417,7 @@ transition_write_context(void *arg)
 #undef ereport
 #define ereport(...) pg_re_throw()
 #include "test_cluster_pcm_flush_owner.inc"
+#undef cluster_space_recovery_flush_permitted_v1
 #undef pfree
 #undef relpathperm
 #undef AbortBufferIO
@@ -6216,7 +6223,7 @@ UT_TEST(test_queue_n_source_refresh_is_exact_and_publishes_only_complete_image)
 			"cluster_pcm_own_reservation_begin_exact",
 			"PCM_OWN_FLAG_REVOKING",
 			"smgrread",
-			"PageIsVerifiedExtended",
+			"PageIsVerifiedForFork",
 			"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
 			"cluster_bufmgr_pcm_own_copy_source_image_exact(" };
 	static const char *const copy_contract[]
@@ -6792,7 +6799,7 @@ UT_TEST(test_retained_image_release_and_writeback_gates_are_exact)
 	 * later Sync/Flush/dirty paths see the immutable retained shape. */
 	victim = strstr(source, "\nInvalidateVictimBuffer(");
 	sync = strstr(source, "\nSyncOneBuffer(");
-	flush = strstr(source, "\nFlushBuffer(");
+	flush = strstr(source, "\nFlushBufferWithRecovery(");
 	dirty = strstr(source, "\nMarkBufferDirty(Buffer buffer)");
 	hint = strstr(source, "\nMarkBufferDirtyHint(Buffer buffer, bool buffer_std)");
 	lockbuffer = strstr(source, "\nLockBufferInternal(Buffer buffer, int mode");
@@ -6834,7 +6841,7 @@ UT_TEST(test_retained_image_release_and_writeback_gates_are_exact)
 		UT_ASSERT(strstr(flush, "cluster_bufmgr_pcm_x_retained_image_locked")
 				  < strstr(flush, "StartBufferIO(buf, false)"));
 	if (dirty != NULL)
-		UT_ASSERT(strstr(dirty, "cluster_bufmgr_pcm_x_retained_image_locked")
+		UT_ASSERT(strstr(dirty, "cluster_bufmgr_pcm_x_content_holder_write_permitted")
 				  < strstr(dirty, "buf_state |= BM_DIRTY"));
 	if (hint != NULL) {
 		const char *tracked = strstr(hint, "cluster_bufmgr_should_pcm_track(bufHdr)");
@@ -7166,8 +7173,17 @@ UT_TEST(test_conditional_lock_preserves_native_off_and_enforces_tracked_x)
 UT_TEST(test_resource_x_ordinary_mutation_gate_dominates_dirty_hint_and_flush)
 {
 	static const char *const dirty_contract[]
-		= { "LockBufHdr", "cluster_pcm_x_content_holder_mutation_allowed(", "UnlockBufHdr",
+		= { "cluster_bufmgr_pcm_x_content_holder_write_permitted(",
 			"pg_atomic_read_u32(&bufHdr->state)" };
+	static const char *const holder_contract[]
+		= { "LockBufHdr",
+			"cluster_pcm_x_content_holder_mutation_allowed(",
+			"cluster_bufmgr_pcm_x_retained_image_locked",
+			"cluster_pcm_own_flags_get",
+			"cluster_pcm_own_writer_activation_token_get",
+			"cluster_pcm_own_resource_x_activation_generation_get",
+			"UnlockBufHdr",
+			"return permitted" };
 	static const char *const hint_contract[]
 		= { "LockBufHdr", "cluster_pcm_x_content_holder_mutation_allowed(", "UnlockBufHdr",
 			"XLogHintBitIsNeeded()" };
@@ -7193,20 +7209,24 @@ UT_TEST(test_resource_x_ordinary_mutation_gate_dominates_dirty_hint_and_flush)
 	UT_ASSERT(cluster_pcm_x_flush_fence_consistent(true, 0, 0));
 
 	source = read_bufmgr_source();
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_x_content_holder_write_permitted(",
+							   "\nbool\ncluster_bufmgr_pcm_x_ordinary_content_write_permitted(",
+							   holder_contract, lengthof(holder_contract));
 	assert_ordered_in_function(source, "\nMarkBufferDirty(", "\n/*\n * ReleaseAndReadBuffer",
 							   dirty_contract, lengthof(dirty_contract));
 	assert_ordered_in_function(source, "\nMarkBufferDirtyHint(",
 							   "\n/*\n * Release buffer content locks", hint_contract,
 							   lengthof(hint_contract));
-	assert_ordered_in_function(source, "\nFlushBuffer(", "\n/*\n * RelationGetNumberOfBlocksInFork",
-							   flush_contract, lengthof(flush_contract));
+	assert_ordered_in_function(source, "\nFlushBufferWithRecovery(",
+							   "\n/*\n * RelationGetNumberOfBlocksInFork", flush_contract,
+							   lengthof(flush_contract));
 	free(source);
 }
 
 UT_TEST(test_preexisting_content_holder_can_finish_before_pre_retention_drain)
 {
 	static const char *const dirty_contract[]
-		= { "LockBufHdr", "cluster_pcm_x_content_holder_mutation_allowed(", "UnlockBufHdr",
+		= { "cluster_bufmgr_pcm_x_content_holder_write_permitted(",
 			"pg_atomic_read_u32(&bufHdr->state)" };
 	static const char *const hint_contract[]
 		= { "LockBufHdr", "cluster_pcm_x_content_holder_mutation_allowed(", "UnlockBufHdr",

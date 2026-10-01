@@ -77,6 +77,7 @@
 #include "cluster/cluster_pcm_x_bufmgr.h" /* spec-2.36a C1 opaque reservation API */
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_space_recovery.h"
 #include "cluster/storage/cluster_smgr.h"
 
 /*
@@ -120,6 +121,11 @@ extern bool ignore_checksum_failure;
 
 static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
 						IOObject io_object, IOContext io_context);
+struct ClusterSpaceRecoveryBatchV1;
+static void FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+									IOContext io_context,
+									const struct ClusterSpaceRecoveryBatchV1 *recovery,
+									volatile bool *io_started);
 
 #ifdef USE_PGRAC_CLUSTER
 static inline bool
@@ -9017,6 +9023,16 @@ static void
 FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 			IOContext io_context)
 {
+	FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL);
+}
+
+/* PGRAC: the original write path, with a synchronous exact-source owner for
+ * SPACE recovery. Ordinary flushes have no such owner. */
+static void
+FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+						IOContext io_context, const struct ClusterSpaceRecoveryBatchV1 *recovery,
+						volatile bool *io_started)
+{
 	XLogRecPtr	recptr;
 	ErrorContextCallback errcallback;
 	instr_time	io_start;
@@ -9027,6 +9043,10 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 #ifdef USE_PGRAC_CLUSTER
 	uint64		writer_activation_token;
 	uint64		resource_x_activation_generation;
+
+	if (recovery != NULL
+		&& !cluster_space_recovery_flush_permitted_v1(recovery, BufferDescriptorGetBuffer(buf)))
+		ereport(ERROR, (errmsg("SPACE recovery flush lost its retained source authority")));
 
 	/*
 	 * Caller holds content SHARE.  Retain/release require EXCLUSIVE, so this
@@ -9069,6 +9089,8 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 */
 	if (!StartBufferIO(buf, false))
 		return;
+	if (io_started != NULL)
+		*io_started = true;
 
 #ifdef USE_PGRAC_CLUSTER
 	/* The GCS copy/retain-finish caller catches this ERROR at the DATA
@@ -9093,6 +9115,8 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 */
 	if (cluster_smart_fusion && cluster_sf_dep_buffer_flush_blocked(buf)) {
 		TerminateBufferIO(buf, false, 0);
+		if (io_started != NULL)
+			*io_started = false;
 		if (cluster_pcm_x_finish_retain_flush_io_active)
 			cluster_pcm_x_finish_retain_flush_io_active = false;
 		return;
@@ -9169,11 +9193,11 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * the only local additions on top of a shipped image are hint-class
 	 * changes (ITL lazy cleanout, index kill bits), which emit no WAL.
 	 */
-	if (cluster_storage_mode_enabled() && !RecoveryInProgress()
+	if (recovery == NULL && cluster_storage_mode_enabled() && !RecoveryInProgress()
 		&& recptr > GetXLogInsertRecPtr())
 		recptr = InvalidXLogRecPtr;
 #endif
-	if (buf_state & BM_PERMANENT)
+	if ((buf_state & BM_PERMANENT) && recovery == NULL)
 		XLogFlush(recptr);
 
 	/*
@@ -9210,6 +9234,11 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	/*
 	 * bufToWrite is either the shared buffer or a copy, as appropriate.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	if (recovery != NULL
+		&& !cluster_space_recovery_flush_permitted_v1(recovery, BufferDescriptorGetBuffer(buf)))
+		ereport(ERROR, (errmsg("SPACE recovery flush lost its retained source authority")));
+#endif
 	smgrwrite(reln,
 			  BufTagGetForkNum(&buf->tag),
 			  buf->tag.blockNum,
@@ -9232,7 +9261,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * the master's watermark check and the holder's strict PI-only drop own
 	 * correctness).
 	 */
-	if (cluster_past_image && buf->pcm_state != (uint8) PCM_STATE_N)
+	if (recovery == NULL && cluster_past_image && buf->pcm_state != (uint8)PCM_STATE_N)
 		cluster_gcs_block_pi_write_note(buf->tag,
 										((PageHeader) bufToWrite)->pd_block_scn);
 #endif
@@ -9265,6 +9294,8 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * end the BM_IO_IN_PROGRESS state.
 	 */
 	TerminateBufferIO(buf, true, 0);
+	if (io_started != NULL)
+		*io_started = false;
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_pcm_x_finish_retain_flush_io_active)
 		cluster_pcm_x_finish_retain_flush_io_active = false;
@@ -10348,6 +10379,52 @@ FlushOneBuffer(Buffer buffer)
 
 	FlushBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: never substitute the recovering thread's WAL horizon for foreign
+ * redo. The opaque owner proves the complete original retained input and
+ * exact installed bytes; this function still owns native BufferIO/checksum/
+ * smgrwrite. The caller owns fsync and post-read while keeping current-X. */
+bool
+FlushOneBufferForSpaceRecovery(Buffer buffer, const ClusterSpaceRecoveryBatchV1 *batch)
+{
+	BufferDesc *buf;
+	ErrorContextCallback *saved_context = error_context_stack;
+	volatile bool io_started = false;
+	uint32 state;
+	bool complete;
+
+	if (buffer <= 0 || buffer > NBuffers || !BufferIsPinned(buffer) || batch == NULL)
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (!LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE)
+		|| !cluster_bufmgr_pcm_x_content_holder_write_permitted(buf)
+		|| !cluster_space_recovery_flush_permitted_v1(batch, buffer))
+		return false;
+	state = LockBufHdr(buf);
+	complete = (state & (BM_VALID | BM_TAG_VALID | BM_PERMANENT))
+			   == (BM_VALID | BM_TAG_VALID | BM_PERMANENT);
+	UnlockBufHdr(buf, state);
+	if (!complete)
+		return false;
+	PG_TRY();
+	{
+		FlushBufferWithRecovery(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL, batch, &io_started);
+	}
+	PG_FINALLY();
+	{
+		/* The recovery worker may catch ERROR without transaction abort. */
+		error_context_stack = saved_context;
+		if (io_started)
+			AbortBufferIO(buffer);
+	}
+	PG_END_TRY();
+	state = LockBufHdr(buf);
+	complete = (state & (BM_DIRTY | BM_JUST_DIRTIED | BM_IO_IN_PROGRESS | BM_IO_ERROR)) == 0;
+	UnlockBufHdr(buf, state);
+	return complete && cluster_space_recovery_flush_permitted_v1(batch, buffer);
+}
+#endif
 
 /*
  * ReleaseBuffer -- release the pin on a buffer

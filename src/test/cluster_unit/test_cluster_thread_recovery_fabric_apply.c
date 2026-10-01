@@ -10,6 +10,7 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_page_authority.h"
 #include "cluster/cluster_side_online_owner.h"
+#include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_thread_recovery_fabric.h"
 #include "unit_test.h"
@@ -60,6 +61,63 @@ static uint16 refuse_thread, stale_thread;
 static bool stale_after_page, stale_after_side;
 static int throw_at;
 static unsigned live_proofs, live_preflights, live_preopens;
+static char space_object;
+static bool space_present, space_preflight_ok, space_apply_ok;
+static unsigned live_space;
+static int space_preflight_step, space_apply_step;
+static void throw_if(int stage);
+
+uint32
+rf_side_online_plan_space_target_count_v1(const RfSideOnlinePlanV1 *plan)
+{
+	return space_present ? 1 : 0;
+}
+bool
+cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
+									const ClusterThreadRecoveryAuthorityV1 *authority, uint32 count,
+									ClusterSpaceRecoveryBatchV1 **out)
+{
+	UT_ASSERT(plan == (const void *)&fabric_object && count == participant_count);
+	*out = NULL;
+	space_preflight_step = ++step;
+	if (!space_preflight_ok)
+		return false;
+	*out = (void *)&space_object;
+	live_space++;
+	return true;
+}
+bool
+cluster_space_recovery_apply_v1(ClusterSpaceRecoveryBatchV1 *batch)
+{
+	UT_ASSERT(batch == (void *)&space_object);
+	space_apply_step = ++step;
+	throw_if(7);
+	return space_apply_ok;
+}
+void
+cluster_space_recovery_destroy_v1(ClusterSpaceRecoveryBatchV1 **batch)
+{
+	if (*batch) {
+		UT_ASSERT(*batch == (void *)&space_object);
+		live_space--;
+		*batch = NULL;
+	}
+}
+Size
+cluster_space_recovery_scratch_held_v1(const ClusterSpaceRecoveryBatchV1 *batch)
+{
+	return 8192;
+}
+bool
+cluster_space_recovery_preflight_operation_v1(void *arg, const RfSideOnlineOperationV1 *op)
+{
+	return true;
+}
+bool
+cluster_space_recovery_applied_operation_v1(void *arg, const RfSideOnlineOperationV1 *op)
+{
+	return true;
+}
 
 static void
 throw_if(int stage)
@@ -303,6 +361,11 @@ rf_side_online_production_preflight_v1(const RfSideOnlinePlanV1 *plan,
 {
 	UT_ASSERT(plan == (const RfSideOnlinePlanV1 *)&side_plan_object && owner != NULL);
 	UT_ASSERT(owner->undo_authority != NULL && owner->undo_authority == owner->authority_arg);
+	if (space_present) {
+		UT_ASSERT(owner->space_arg == (void *)&space_object && space_preflight_step > 0);
+		UT_ASSERT(owner->preflight_space == cluster_space_recovery_preflight_operation_v1);
+		UT_ASSERT_EQ(owner->borrowed_scratch_bytes, 8192);
+	}
 	side_preflight_step = ++step;
 	side_preflight_calls++;
 	throw_if(4);
@@ -317,6 +380,9 @@ rf_side_online_production_apply_v1(const RfSideOnlinePlanV1 *plan,
 {
 	UT_ASSERT(plan == (const RfSideOnlinePlanV1 *)&side_plan_object && owner != NULL);
 	side_apply_step = ++step;
+	if (space_present)
+		UT_ASSERT(space_apply_step > 0
+				  && owner->apply_space == cluster_space_recovery_applied_operation_v1);
 	side_apply_calls++;
 	throw_if(6);
 	if (stale_after_side)
@@ -386,6 +452,10 @@ init_case(ClusterThreadRecoveryAuthorityV1 *authority)
 	stale_after_page = stale_after_side = false;
 	throw_at = 0;
 	live_proofs = live_preflights = live_preopens = 0;
+	space_present = false;
+	space_preflight_ok = space_apply_ok = true;
+	live_space = 0;
+	space_preflight_step = space_apply_step = 0;
 }
 
 typedef struct FabricSources {
@@ -590,10 +660,50 @@ UT_TEST(test_error_at_every_owned_stage_releases_all_fabric_state)
 	}
 }
 
+UT_TEST(test_space_owner_precedes_page_install_and_unwinds)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		ClusterThreadRecoveryAuthorityV1 authority;
+		ClusterThreadRecoveryFabricApplyResultV1 result;
+		volatile bool caught = false;
+		RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
+		init_case(&authority);
+		space_present = true;
+		if (variant == 1)
+			space_preflight_ok = false;
+		if (variant == 2)
+			space_apply_ok = false;
+		if (variant == 3)
+			throw_at = 7;
+		PG_TRY();
+		{
+			detail = cluster_thread_recovery_fabric_apply_v1(
+				(const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object, &authority, &result);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, variant == 3);
+		UT_ASSERT_EQ(live_space, 0);
+		UT_ASSERT_EQ(live_proofs + live_preflights + live_preopens, 0);
+		if (variant == 0) {
+			UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT(space_preflight_step < side_preflight_step
+					  && side_preflight_step < space_apply_step);
+			UT_ASSERT(space_apply_step < page_install_step && page_install_step < side_apply_step);
+		} else
+			UT_ASSERT(page_install_step == 0 && side_apply_step == 0
+					  && !result.side_apply_complete);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
+	UT_RUN(test_space_owner_precedes_page_install_and_unwinds);
 	UT_RUN(test_error_at_every_owned_stage_releases_all_fabric_state);
 	UT_RUN(test_multi_source_fabric_preflights_every_origin_before_page_and_side);
 	UT_RUN(test_multi_source_fabric_late_preflight_refusal_leaves_all_targets_untouched);

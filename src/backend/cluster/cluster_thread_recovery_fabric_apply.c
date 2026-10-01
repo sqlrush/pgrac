@@ -10,6 +10,7 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_page_authority.h"
 #include "cluster/cluster_side_online_owner.h"
+#include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_thread_recovery_fabric.h"
 
@@ -31,6 +32,7 @@ typedef struct ClusterThreadRecoveryFabricApplyStateV1 {
 	char *io_pages;
 	RfPageAuthorityPreflightV1 *page_preflight;
 	RfPageSmgrPreopenV1 *smgr_preopen;
+	ClusterSpaceRecoveryBatchV1 *space;
 } ClusterThreadRecoveryFabricApplyStateV1;
 
 static bool
@@ -55,7 +57,7 @@ fabric_apply_sources_fresh(const ClusterThreadRecoveryAuthorityV1 *authorities, 
 static RfPageProofDetailV1
 fabric_apply_side_origin(const RfSideOnlinePlanV1 *plan,
 						 const ClusterThreadRecoveryAuthorityV1 *authority, uint32 epoch,
-						 bool preflight_only)
+						 ClusterSpaceRecoveryBatchV1 *space, bool preflight_only)
 {
 	RfSideOnlineProductionOwnerV1 owner;
 
@@ -63,6 +65,12 @@ fabric_apply_side_origin(const RfSideOnlinePlanV1 *plan,
 												 fabric_apply_authority_fresh, epoch, true)
 		|| !rf_side_online_production_bind_undo_v1(&owner, authority))
 		return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+	if (space != NULL) {
+		owner.space_arg = space;
+		owner.preflight_space = cluster_space_recovery_preflight_operation_v1;
+		owner.apply_space = cluster_space_recovery_applied_operation_v1;
+		owner.borrowed_scratch_bytes = cluster_space_recovery_scratch_held_v1(space);
+	}
 	return preflight_only ? rf_side_online_production_preflight_v1(plan, &owner)
 						  : rf_side_online_production_apply_v1(plan, &owner);
 }
@@ -116,6 +124,7 @@ fabric_apply_state_free(ClusterThreadRecoveryFabricApplyStateV1 *state, uint32 t
 {
 	uint32 i;
 
+	cluster_space_recovery_destroy_v1(&state->space);
 	if (state->smgr_preopen != NULL)
 		rf_page_storage_smgr_preopen_destroy_v1(&state->smgr_preopen);
 	if (state->page_preflight != NULL)
@@ -220,6 +229,11 @@ cluster_thread_recovery_fabric_apply_sources_v1(const ClusterThreadRecoveryFabri
 	 * stage. The caller's plan and original authorities are only borrowed. */
 	PG_TRY();
 	{
+		if (rf_side_online_plan_space_target_count_v1(side_plan) > 0
+			&& !cluster_space_recovery_preflight_v1(plan, authority, count, &state->space)) {
+			detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			goto done;
+		}
 		if (target_count > 0) {
 			Size page_bytes = (Size)target_count * BLCKSZ;
 
@@ -305,13 +319,17 @@ cluster_thread_recovery_fabric_apply_sources_v1(const ClusterThreadRecoveryFabri
 				detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 				goto done;
 			}
-			detail
-				= fabric_apply_side_origin(side_plan, &authority[i], (uint32)current_epoch, true);
+			detail = fabric_apply_side_origin(side_plan, &authority[i], (uint32)current_epoch,
+											  state->space, true);
 			if (detail != RF_PAGE_PROOF_DETAIL_OK)
 				goto done;
 		}
 		if (!fabric_apply_sources_fresh(authority, count)) {
 			detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+			goto done;
+		}
+		if (state->space != NULL && !cluster_space_recovery_apply_v1(state->space)) {
+			detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 			goto done;
 		}
 		if (target_count > 0) {
@@ -335,8 +353,8 @@ cluster_thread_recovery_fabric_apply_sources_v1(const ClusterThreadRecoveryFabri
 				detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 				goto done;
 			}
-			detail
-				= fabric_apply_side_origin(side_plan, &authority[i], (uint32)current_epoch, false);
+			detail = fabric_apply_side_origin(side_plan, &authority[i], (uint32)current_epoch,
+											  state->space, false);
 			if (detail != RF_PAGE_PROOF_DETAIL_OK)
 				goto done;
 		}

@@ -22,6 +22,11 @@ typedef struct RfSideOnlineProductionOwnerV1 {
 	ClusterUndoRecoveryScopeV1 undo_scope;
 	void *undo_headers;
 	Size undo_bytes_remaining;
+	/* Borrowed whole-source SPACE owner; released by the enclosing fabric. */
+	void *space_arg;
+	RfSideOnlineSpaceV1 preflight_space;
+	RfSideOnlineSpaceV1 apply_space;
+	Size borrowed_scratch_bytes;
 	bool protected_set_active;
 	bool protected_set_complete;
 	uint8 reserved2[6];

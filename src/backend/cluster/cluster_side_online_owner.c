@@ -172,10 +172,14 @@ side_owner_begin_protected_set(void *arg)
 	if (owner == NULL || owner->protected_set_active || !side_owner_authority_fresh(owner))
 		return false;
 	if (owner->undo_authority != NULL) {
+		Size available = rf_side_online_plan_scratch_available_v1(owner->protected_plan);
+
+		if (owner->borrowed_scratch_bytes > available)
+			return false;
 		if (!cluster_undo_recovery_scope_enter_v1(&owner->undo_scope,
 			owner->undo_authority, owner->protected_plan))
 			return false;
-		owner->undo_bytes_remaining = rf_side_online_plan_scratch_available_v1(owner->protected_plan);
+		owner->undo_bytes_remaining = available - owner->borrowed_scratch_bytes;
 	}
 	cluster_remote_xact_online_writer_push();
 	owner->protected_set_active = true;
@@ -348,6 +352,25 @@ side_owner_source_thread(const RfSideOnlineProductionOwnerV1 *owner)
 	return owner->undo_authority->duty->origin_thread_id;
 }
 
+static bool
+side_owner_preflight_space(void *arg, const RfSideOnlineOperationV1 *operation)
+{
+	RfSideOnlineProductionOwnerV1 *owner = arg;
+
+	return owner->protected_set_active && owner->preflight_space != NULL
+		   && side_owner_authority_fresh(owner)
+		   && owner->preflight_space(owner->space_arg, operation);
+}
+
+static bool
+side_owner_apply_space(void *arg, const RfSideOnlineOperationV1 *operation)
+{
+	RfSideOnlineProductionOwnerV1 *owner = arg;
+
+	return owner->protected_set_active && owner->apply_space != NULL
+		   && side_owner_authority_fresh(owner) && owner->apply_space(owner->space_arg, operation);
+}
+
 RfPageProofDetailV1
 rf_side_online_production_preflight_v1(const RfSideOnlinePlanV1 *plan,
 									   RfSideOnlineProductionOwnerV1 *owner)
@@ -370,6 +393,10 @@ rf_side_online_production_preflight_v1(const RfSideOnlinePlanV1 *plan,
 	ops.apply_xact = side_owner_apply_xact;
 	ops.apply_undo = side_owner_apply_undo;
 	ops.apply_projection = side_owner_apply_projection;
+	if (owner->preflight_space != NULL && owner->apply_space != NULL) {
+		ops.preflight_space = side_owner_preflight_space;
+		ops.apply_space = side_owner_apply_space;
+	}
 	detail = rf_side_online_plan_preflight_v1(plan, &ops);
 	owner->protected_plan = NULL;
 	return detail;
@@ -397,6 +424,10 @@ rf_side_online_production_apply_v1(const RfSideOnlinePlanV1 *plan,
 	ops.apply_xact = side_owner_apply_xact;
 	ops.apply_undo = side_owner_apply_undo;
 	ops.apply_projection = side_owner_apply_projection;
+	if (owner->preflight_space != NULL && owner->apply_space != NULL) {
+		ops.preflight_space = side_owner_preflight_space;
+		ops.apply_space = side_owner_apply_space;
+	}
 	detail = rf_side_online_plan_apply_v1(plan, &ops);
 	owner->protected_plan = NULL;
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
