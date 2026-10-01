@@ -234,6 +234,7 @@ typedef enum ClusterWalrReleaseResult {
 
 typedef struct ClusterWalRetentionPin ClusterWalRetentionPin;
 typedef struct ClusterWalRootPublishGuard ClusterWalRootPublishGuard;
+typedef struct ClusterWalReadPinV1 ClusterWalReadPinV1;
 
 typedef struct ClusterWalRetentionPinThreadRequest {
 	const ClusterWalRetentionInterval *intervals;
@@ -335,6 +336,13 @@ cluster_wal_retention_interval_intersects_file(const ClusterWalRetentionInterval
 											   const ClusterWalFileIdentity *identity,
 											   int wal_segsz_bytes);
 extern bool cluster_wal_retention_resid_encode(uint16 thread_id, ClusterResId *out_resid);
+/* Read-only protection against WAL reuse. Callers qualify ROOT, claims,
+ * anchors and native flush cuts separately after acquiring these grants.
+ * This scope conveys no recovery, DATA or publication authority. */
+extern ClusterWalPinResult cluster_wal_read_pin_acquire_v1(const uint16 *threads, uint16 nthreads,
+														   ClusterWalReadPinV1 **out);
+extern bool cluster_wal_read_pin_covers_v1(ClusterWalReadPinV1 *pin, uint16 thread);
+extern ClusterWalrReleaseResult cluster_wal_read_pin_release_v1(ClusterWalReadPinV1 **pin);
 extern ClusterWalPinResult
 cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *requests,
 								  uint16 nthreads, ClusterWalRetentionPin **out_pin);
