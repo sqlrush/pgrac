@@ -11,6 +11,7 @@
 #include "access/xlogreader.h"
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_external_fence.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_page_stable_base.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_thread_recovery_authority.h"
@@ -552,6 +553,7 @@ stable_owners_revalidate(const RfPageStableBaseProofRequestV1 *request, bool bou
 		if (!bytes_nonzero(token->authority_uuid, sizeof(token->authority_uuid))
 			|| token->origin_thread_id != contributors->cuts[i].failed_thread
 			|| token->origin_thread_id != duty->origin_thread_id
+			|| (cluster_shared_config && contributors->cuts[i].origin_owner_incarnation == 0)
 			|| (contributors->cuts[i].origin_owner_incarnation != 0
 				&& contributors->cuts[i].origin_owner_incarnation != duty->origin_owner_incarnation)
 			|| token->root_lineage_seq != duty->root_lineage_seq
@@ -608,6 +610,7 @@ source_owners_revalidate(const RfPageIdentityV1 *identity,
 		if (a->duty->system_identifier != identity->system_identifier
 			|| memcmp(a->duty->storage_uuid, identity->storage_uuid, 16) != 0
 			|| cut->failed_thread != a->duty->origin_thread_id
+			|| (cluster_shared_config && cut->origin_owner_incarnation == 0)
 			|| (cut->origin_owner_incarnation != 0
 				&& cut->origin_owner_incarnation != a->duty->origin_owner_incarnation)
 			|| (i > 0 && cut->failed_thread <= contributors->cuts[i - 1].failed_thread))

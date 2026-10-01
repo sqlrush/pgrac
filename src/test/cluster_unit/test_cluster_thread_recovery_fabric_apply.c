@@ -16,6 +16,8 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+bool cluster_shared_config = true;
+static uint64 cut_generation = 19;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 
@@ -177,6 +179,7 @@ cluster_thread_recovery_fabric_cut_v1(const ClusterThreadRecoveryFabricPlanV1 *p
 		return false;
 	memset(out_cut, 0, sizeof(*out_cut));
 	out_cut->failed_thread = index + 2;
+	out_cut->origin_owner_incarnation = cut_generation;
 	out_cut->flags = RF_CONTRIBUTOR_CUT_COMPLETE;
 	out_cut->timeline_id = 7;
 	out_cut->scan_begin_inclusive = 0x100;
@@ -416,6 +419,7 @@ init_case(ClusterThreadRecoveryAuthorityV1 *authority)
 	duty.system_identifier = 99;
 	memset(duty.storage_uuid, 3, 16);
 	duty.origin_thread_id = 2;
+	duty.origin_owner_incarnation = 19;
 	root.identity = duty;
 	root.checkpoint_tli = 7;
 	root.tail_tli = 7;
@@ -467,6 +471,8 @@ init_case(ClusterThreadRecoveryAuthorityV1 *authority)
 	space_preflight_ok = space_apply_ok = true;
 	live_space = 0;
 	space_preflight_step = space_apply_step = 0;
+	cut_generation = 19;
+	cluster_shared_config = true;
 }
 
 typedef struct FabricSources {
@@ -494,6 +500,27 @@ init_sources(FabricSources *f)
 		f->authorities[i].serial_guard = &f->serials[i];
 	}
 	participant_count = 3;
+}
+
+UT_TEST(test_shared_fabric_rejects_unspecified_writer_generation)
+{
+	for (int shared = 0; shared < 2; shared++) {
+		FabricSources f;
+		ClusterThreadRecoveryFabricApplyResultV1 result;
+		RfPageProofDetailV1 detail;
+		init_sources(&f);
+		cluster_shared_config = shared;
+		cut_generation = 0;
+		detail = cluster_thread_recovery_fabric_apply_sources_v1(
+			(const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object, f.authorities, 3, &result);
+		UT_ASSERT_EQ(detail == RF_PAGE_PROOF_DETAIL_OK, !shared);
+		if (shared) {
+			UT_ASSERT_EQ(proof_step, 0);
+			UT_ASSERT_EQ(side_preflight_calls, 0);
+			UT_ASSERT_EQ(page_install_step, 0);
+		}
+	}
+	cluster_shared_config = true;
 }
 
 UT_TEST(test_multi_source_fabric_preflights_every_origin_before_page_and_side)
@@ -750,7 +777,8 @@ UT_TEST(test_space_owner_precedes_page_install_and_unwinds)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
+	UT_RUN(test_shared_fabric_rejects_unspecified_writer_generation);
 	UT_RUN(test_space_owner_precedes_page_install_and_unwinds);
 	UT_RUN(test_error_at_every_owned_stage_releases_all_fabric_state);
 	UT_RUN(test_multi_source_fabric_preflights_every_origin_before_page_and_side);

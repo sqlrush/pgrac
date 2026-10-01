@@ -84,6 +84,7 @@ space_sources_fresh_current_owner(const ClusterSpaceRecoveryBatchV1 *batch)
 				a->root_snapshot->identity.storage_uuid)
 			|| !cluster_thread_recovery_fabric_cut_v1(batch->fabric, i, &cut)
 			|| cut.failed_thread == 0 || cut.failed_thread != a->duty->origin_thread_id
+			|| (cluster_shared_config && cut.origin_owner_incarnation == 0)
 			|| (cut.origin_owner_incarnation != 0
 				&& cut.origin_owner_incarnation != a->duty->origin_owner_incarnation)
 			|| cut.failed_thread > PGRAC_PAGE_LSN_ORIGIN_MAX + 1

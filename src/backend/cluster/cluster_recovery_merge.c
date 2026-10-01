@@ -1041,12 +1041,18 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 	}
 
 	if (blockers.len > 0)
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-						errmsg("merged k-way recovery refused"), errdetail("%s.", blockers.data),
-						errhint("Resolve the shared WAL storage / configuration, or set "
-								"cluster.merged_recovery=off to recover this node's own "
-								"stream only (a crashed peer's committed WAL will not be "
-								"recovered).")));
+		ereport(
+			FATAL,
+			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+			 errmsg("merged k-way recovery refused"), errdetail("%s.", blockers.data),
+			 errhint("%s", cluster_shared_config
+							   ? "Preserve all original thread WAL and shared configuration. "
+								 "Shared mode requires merged recovery; retained history needs "
+								 "a supported typed cold-recovery path before startup can proceed."
+							   : "Resolve the shared WAL storage / configuration, or set "
+								 "cluster.merged_recovery=off to recover this node's own "
+								 "stream only (a crashed peer's committed WAL will not be "
+								 "recovered).")));
 	pfree(blockers.data);
 	return CLUSTER_MERGE_ENGAGE;
 }

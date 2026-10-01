@@ -581,6 +581,7 @@ reset(void)
 		memcpy(operations[i].identity.record.storage_uuid, key.storage_uuid, 16);
 		duties[i].system_identifier = 17;
 		duties[i].origin_thread_id = i + 2;
+		duties[i].origin_owner_incarnation = 19;
 		memcpy(duties[i].storage_uuid, key.storage_uuid, 16);
 		roots[i].identity = duties[i];
 		roots[i].checkpoint_tli = roots[i].tail_tli = 7;
@@ -590,6 +591,7 @@ reset(void)
 		sources[i].root_snapshot = &roots[i];
 		sources[i].retention_pin = (void *)3;
 		cuts[i] = (RfContributorStreamCutV1){ .failed_thread = i + 2,
+											  .origin_owner_incarnation = 19,
 											  .timeline_id = 7,
 											  .flags = RF_CONTRIBUTOR_CUT_COMPLETE,
 											  .scan_begin_inclusive = 100,
@@ -682,7 +684,7 @@ UT_TEST(test_actual_reservation_install_and_repeat)
 
 UT_TEST(test_sources_and_structure_refuse_before_mutation)
 {
-	for (int variant = 0; variant < 9; variant++) {
+	for (int variant = 0; variant < 10; variant++) {
 		ClusterSpaceRecoveryBatchV1 *batch = NULL;
 		reset();
 		if (variant == 0)
@@ -708,6 +710,8 @@ UT_TEST(test_sources_and_structure_refuse_before_mutation)
 		}
 		if (variant == 8)
 			cuts[1].origin_owner_incarnation = duties[1].origin_owner_incarnation + 1;
+		if (variant == 9)
+			cuts[1].origin_owner_incarnation = 0;
 		UT_ASSERT(
 			!cluster_space_recovery_preflight_v1(fabric, sources, variant == 6 ? 1 : 2, &batch));
 		UT_ASSERT(batch == NULL && writes == 0 && lock_calls == 0);

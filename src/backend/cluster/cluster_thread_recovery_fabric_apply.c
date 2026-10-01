@@ -8,6 +8,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_page_authority.h"
 #include "cluster/cluster_side_online_owner.h"
 #include "cluster/cluster_space_recovery.h"
@@ -199,6 +200,7 @@ cluster_thread_recovery_fabric_apply_sources_v1(const ClusterThreadRecoveryFabri
 		if (!cluster_thread_recovery_fabric_cut_v1(plan, i, &cut))
 			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 		if (cut.failed_thread == 0 || cut.failed_thread != source->duty->origin_thread_id
+			|| (cluster_shared_config && cut.origin_owner_incarnation == 0)
 			|| (cut.origin_owner_incarnation != 0
 				&& cut.origin_owner_incarnation != source->duty->origin_owner_incarnation)
 			|| cut.failed_thread != source->root_snapshot->identity.origin_thread_id

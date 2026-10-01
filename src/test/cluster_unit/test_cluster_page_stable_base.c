@@ -292,6 +292,7 @@ graph_recount(GraphFixture *fixture, uint32 participant_count, uint32 edge_count
 	memset(fixture->cuts, 0, sizeof(fixture->cuts));
 	for (i = 0; i < participant_count; i++) {
 		fixture->cuts[i].failed_thread = (uint16)(i + 1);
+		fixture->cuts[i].origin_owner_incarnation = 19;
 		fixture->cuts[i].timeline_id = 1;
 		fixture->cuts[i].flags = RF_CONTRIBUTOR_CUT_KNOWN_MASK;
 		fixture->cuts[i].scan_begin_inclusive = 100;
@@ -353,6 +354,7 @@ graph_init(GraphFixture *fixture)
 	fixture->root_tokens[0].root_publish_seq = 11;
 	fixture->root_tokens[0].record_crc32c = 12;
 	fixture->duties[0].origin_thread_id = 1;
+	fixture->duties[0].origin_owner_incarnation = 19;
 	fixture->duties[0].root_lineage_seq = 9;
 	memset(fixture->duties[0].authority_uuid, 0x31, sizeof(fixture->duties[0].authority_uuid));
 }
@@ -682,6 +684,32 @@ cleanup:
 		rf_page_authority_guard_release_v1(&adapter.guard);
 	rf_page_authority_preflight_destroy_v1(&preflight);
 	rf_page_stable_base_proof_destroy_v1(&proof);
+}
+
+UT_TEST(test_shared_proofs_reject_unspecified_writer_generation)
+{
+	for (int shared = 0; shared < 2; shared++) {
+		SourceFixture f;
+		GraphFixture g;
+		RfPageStableBaseProofRequestV1 request;
+		RfPageStableBaseProofV1 *proof = NULL;
+		RfPageProofDetailV1 result;
+
+		sources_init(&f);
+		cluster_shared_config = shared;
+		f.graph.cuts[1].origin_owner_incarnation = 0;
+		result = sources_build(&f, &proof);
+		UT_ASSERT_EQ(result == RF_PAGE_PROOF_DETAIL_OK, !shared);
+		rf_page_stable_base_proof_destroy_v1(&proof);
+		graph_init(&g);
+		proof_request(&g, &request);
+		g.cuts[0].origin_owner_incarnation = 0;
+		result = rf_page_stable_base_proof_build_wait_v1(&request, g.chain, lengthof(g.chain), 1000,
+														 &proof);
+		UT_ASSERT_EQ(result == RF_PAGE_PROOF_DETAIL_OK, !shared);
+		rf_page_stable_base_proof_destroy_v1(&proof);
+	}
+	cluster_shared_config = true;
 }
 
 UT_TEST(test_stable_proof_binds_exact_borrowed_owners)
@@ -1526,7 +1554,8 @@ UT_TEST(test_complete_release_order)
 int
 main(void)
 {
-	UT_PLAN(57);
+	UT_PLAN(58);
+	UT_RUN(test_shared_proofs_reject_unspecified_writer_generation);
 	UT_RUN(test_sources_bind_each_original_owner);
 	UT_RUN(test_sources_do_not_borrow_first_fence_for_later_origin);
 	UT_RUN(test_sources_reject_stale_later_member_and_pin);
