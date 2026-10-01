@@ -13,10 +13,17 @@ typedef struct ClusterWalWriterToken {
 typedef struct ClusterWalWriterFlushV1 {
 	ClusterWalWriterToken writer;
 	XLogRecPtr flushed_end;
+	XLogRecPtr complete_end;
 } ClusterWalWriterFlushV1;
 
 /* Background physical input only, not ROOT/recovery/GC permission. Native
- * Flush may bisect a later record; only the bounded reader may round it. */
+ * Flush may bisect a later record. complete_end is sampled from the native
+ * reservation owner and then confirmed by native Flush >= complete_end.
+ * Until that is true this call returns RECONFIG_WAIT, with cleared output
+ * and the same process-local reservation retained for the next poll. A
+ * changed writer token discards that pending sample. New inserts cannot
+ * perpetually move the pending cut forward. On success it is consumed;
+ * it never forces flush or infers a complete cut by decoding stored bytes. */
 extern ClusterControlRootResult cluster_wal_writer_flushed_v1(ClusterWalWriterFlushV1 *out);
 
 /* Snapshot before I/O, revalidate after fsync before exposing native Flush.

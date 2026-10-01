@@ -7038,6 +7038,7 @@ test_cluster_wal_writer: test_cluster_wal_writer.c
 # PGRAC: writer runtime checks with native caller boundaries. Author: SqlRush <sqlrush@gmail.com>
 test_cluster_wal_writer: unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_writer.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_writer.h \
 		$(CLUSTER_WAL_CLAIM_O) xlogreader_fs.o \
 		test_cluster_wal_publish_tail.inc test_cluster_wal_publish_callers.inc test_cluster_wal_publish_entry.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c $(CLUSTER_WAL_CLAIM_O) \

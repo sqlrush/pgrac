@@ -33,6 +33,11 @@ static struct {
 	ClusterWalSourceRef ref;
 } writer_startup;
 
+/* A background poll keeps its original reservation while native flush
+ * catches up. New insertions must not turn this into a moving target.
+ * No locks, shared state, WAL retention or I/O are owned by this value. */
+static ClusterWalWriterFlushV1 writer_pending_prefix;
+
 static bool
 writer_select(ClusterWalWriterToken *work)
 {
@@ -109,18 +114,36 @@ cluster_wal_writer_flushed_v1(ClusterWalWriterFlushV1 *out)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	memset(out, 0, sizeof(*out));
 	if (MyBackendType == B_STARTUP || CritSectionCount != 0 || ShutdownRequestPending
-		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress())
+		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress()) {
+		memset(&writer_pending_prefix, 0, sizeof(writer_pending_prefix));
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	/* First obtain the native timeline; only the read between begin/check
-	 * supplies the flush bound. Never read WAL, force flush or round here. */
+	}
+	/* First obtain the native timeline. Sample the exact reserved end before
+	 * Flush: XLogWrite waits for all insertions below its flush bound. Once
+	 * that bound covers our sample, every byte through the sampled record
+	 * end (including a switch's padding) is complete. A page-aligned Flush
+	 * alone cannot prove this. No disk decoding, rounding or forced flush. */
 	(void)GetFlushRecPtr(&timeline);
 	result = cluster_wal_writer_begin(timeline, &work.writer);
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		memset(&writer_pending_prefix, 0, sizeof(writer_pending_prefix));
 		return result;
+	}
+	if (writer_pending_prefix.complete_end != InvalidXLogRecPtr
+		&& memcmp(&writer_pending_prefix.writer, &work.writer, sizeof(work.writer)) == 0)
+		work.complete_end = writer_pending_prefix.complete_end;
+	else
+		work.complete_end = GetXLogInsertEndRecPtr();
+	memset(&writer_pending_prefix, 0, sizeof(writer_pending_prefix));
 	work.flushed_end = GetFlushRecPtr(&timeline);
-	if (work.flushed_end == InvalidXLogRecPtr || timeline != work.writer.ref.timeline)
+	if (work.complete_end == InvalidXLogRecPtr || work.flushed_end == InvalidXLogRecPtr
+		|| timeline != work.writer.ref.timeline)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	result = cluster_wal_writer_check(&work.writer);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && work.flushed_end < work.complete_end) {
+		writer_pending_prefix = work;
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	}
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		*out = work;
 	return result;

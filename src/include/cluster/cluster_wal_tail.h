@@ -125,15 +125,17 @@ cluster_wal_checkpoint_prefix_observe(const char *wal_root, const ClusterWalSour
 									  XLogRecPtr checkpoint_end, XLogRecPtr checkpoint_start,
 									  pg_crc32c checkpoint_crc, ClusterWalTailObservation *out);
 
-/* Read complete records only up to the original live writer's native flush
- * boundary. That boundary may bisect a later record: never read/feed that
- * suffix. The selected checkpoint and required prefix must still validate.
+/* Read through the original live writer's independently confirmed complete
+ * record end, which must be <= its native flush boundary. Scan must reach
+ * that exact end: a damaged length cannot shorten a confirmed prefix. Bytes
+ * after complete_end are never read/fed, even if already flushed. The selected
+ * checkpoint and required prefix must still validate.
  * Caller owns exact source/flush qualification, retention and revalidation;
  * provisional visits and this observation grant no durability permission. */
 extern ClusterControlRootResult cluster_wal_flushed_prefix_visit(
 	const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
-	XLogRecPtr physical_lower, XLogRecPtr minimum_end, XLogRecPtr flushed_end,
-	XLogRecPtr checkpoint_start, pg_crc32c checkpoint_crc, ClusterWalRecordVisitor visitor,
-	void *arg, ClusterWalTailObservation *out);
+	XLogRecPtr physical_lower, XLogRecPtr minimum_end, XLogRecPtr complete_end,
+	XLogRecPtr flushed_end, XLogRecPtr checkpoint_start, pg_crc32c checkpoint_crc,
+	ClusterWalRecordVisitor visitor, void *arg, ClusterWalTailObservation *out);
 
 #endif /* CLUSTER_WAL_TAIL_H */

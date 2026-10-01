@@ -239,6 +239,12 @@ static struct {
 static ControlFileData native_control;
 static unsigned flush_probe_calls, flush_probe_drift;
 static bool flush_probe_recovery;
+static XLogRecPtr reserved_end;
+XLogRecPtr
+GetXLogInsertEndRecPtr(void)
+{
+	return reserved_end;
+}
 XLogRecPtr
 GetFlushRecPtr(TimeLineID *timeline)
 {
@@ -253,6 +259,8 @@ GetFlushRecPtr(TimeLineID *timeline)
 			self_fenced = true;
 		else if (flush_probe_drift == 4)
 			native_ctl.InsertTimeLineID++;
+		else if (flush_probe_drift == 5)
+			reserved_end += XLOG_BLCKSZ; /* a later concurrent reservation */
 	}
 	*timeline = native_ctl.InsertTimeLineID;
 	return native_ctl.LogwrtResult.Flush;
@@ -925,8 +933,10 @@ UT_TEST(test_background_flush_snapshot_preserves_native_byte_boundary)
 	flush_probe_calls = flush_probe_drift = 0;
 	native_ctl.InsertTimeLineID = 1;
 	native_ctl.LogwrtResult.Flush = wal_segment_size + 89;
+	reserved_end = wal_segment_size + 80;
 	UT_ASSERT_EQ(cluster_wal_writer_flushed_v1(&snapshot), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	UT_ASSERT_EQ(snapshot.flushed_end, wal_segment_size + 89);
+	UT_ASSERT_EQ(snapshot.complete_end, reserved_end);
 	UT_ASSERT_EQ(snapshot.writer.epoch, epoch);
 	UT_ASSERT_EQ(memcmp(&snapshot.writer.ref, &ref, sizeof(ref)), 0);
 	UT_ASSERT_EQ(flush_probe_calls, 2);
@@ -945,6 +955,7 @@ UT_TEST(test_background_flush_snapshot_rejects_writer_change_and_startup)
 		MyBackendType = B_BG_WRITER;
 		native_ctl.InsertTimeLineID = 1;
 		native_ctl.LogwrtResult.Flush = wal_segment_size + 89;
+		reserved_end = wal_segment_size + 80;
 		flush_probe_calls = 0;
 		flush_probe_recovery = fault == 9;
 		flush_probe_drift = fault < 4 ? fault + 1 : 0;
@@ -969,10 +980,77 @@ UT_TEST(test_background_flush_snapshot_rejects_writer_change_and_startup)
 	flush_probe_recovery = false;
 }
 
+UT_TEST(test_background_complete_prefix_waits_for_reserved_record_end)
+{
+	ClusterWalWriterFlushV1 snapshot;
+	static const ClusterWalWriterFlushV1 zero;
+	fixture();
+	CritSectionCount = 0;
+	held = false;
+	MyBackendType = B_BG_WRITER;
+	flush_probe_calls = flush_probe_drift = 0;
+	native_ctl.InsertTimeLineID = 1;
+	/* Native flush can finish one page while this reserved record still
+	 * extends into the next. The byte bound alone is not a complete cut. */
+	native_ctl.LogwrtResult.Flush = wal_segment_size + XLOG_BLCKSZ;
+	reserved_end = wal_segment_size + 2 * XLOG_BLCKSZ;
+	memset(&snapshot, 0x55, sizeof(snapshot));
+	UT_ASSERT_NE(cluster_wal_writer_flushed_v1(&snapshot), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(memcmp(&snapshot, &zero, sizeof(snapshot)), 0);
+	UT_ASSERT_EQ(sync_calls, 0);
+	UT_ASSERT_EQ(rename_calls, 0);
+	/* Retrying after native flush covers the captured reservation succeeds.
+	 * Later reservations must not move the already captured complete cut. */
+	flush_probe_calls = 0;
+	flush_probe_drift = 5;
+	native_ctl.LogwrtResult.Flush = reserved_end;
+	reserved_end += XLOG_BLCKSZ;
+	UT_ASSERT_EQ(cluster_wal_writer_flushed_v1(&snapshot), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(snapshot.complete_end, wal_segment_size + 2 * XLOG_BLCKSZ);
+	UT_ASSERT_EQ(snapshot.flushed_end, snapshot.complete_end);
+	UT_ASSERT_EQ(reserved_end, snapshot.complete_end + 2 * XLOG_BLCKSZ);
+	flush_probe_drift = 0;
+}
+
+UT_TEST(test_background_pending_cut_cannot_cross_writer_token)
+{
+	for (unsigned changed = 0; changed < 3; changed++) {
+		ClusterWalWriterFlushV1 snapshot;
+		static const ClusterWalWriterFlushV1 zero;
+		fixture();
+		CritSectionCount = 0;
+		held = false;
+		MyBackendType = B_BG_WRITER;
+		flush_probe_calls = flush_probe_drift = 0;
+		native_ctl.InsertTimeLineID = 1;
+		reserved_end = wal_segment_size + 2 * XLOG_BLCKSZ;
+		native_ctl.LogwrtResult.Flush = reserved_end - XLOG_BLCKSZ;
+		UT_ASSERT_EQ(cluster_wal_writer_flushed_v1(&snapshot), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		native_ctl.LogwrtResult.Flush = reserved_end;
+		reserved_end += XLOG_BLCKSZ;
+		if (changed == 0)
+			epoch++;
+		else if (changed == 1)
+			ref.claim.claim_sha256[0]++;
+		else {
+			incarnation++;
+			ref.claim.identity.origin_owner_incarnation = incarnation;
+		}
+		UT_ASSERT_EQ(cluster_wal_writer_flushed_v1(&snapshot), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		UT_ASSERT_EQ(memcmp(&snapshot, &zero, sizeof(snapshot)), 0);
+		native_ctl.LogwrtResult.Flush = reserved_end;
+		UT_ASSERT_EQ(cluster_wal_writer_flushed_v1(&snapshot), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(snapshot.complete_end, reserved_end);
+		UT_ASSERT_EQ(memcmp(&snapshot.writer.ref, &ref, sizeof(ref)), 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(23);
+	UT_RUN(test_background_pending_cut_cannot_cross_writer_token);
+	UT_RUN(test_background_complete_prefix_waits_for_reserved_record_end);
 	UT_RUN(test_background_flush_snapshot_preserves_native_byte_boundary);
 	UT_RUN(test_background_flush_snapshot_rejects_writer_change_and_startup);
 	UT_RUN(test_native_flush_has_no_sidefile_io_or_record_rounddown);

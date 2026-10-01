@@ -1518,8 +1518,10 @@ UT_TEST(live_prefix_stops_at_original_flush_boundary)
 		int before = fd_count();
 		UT_ASSERT_EQ(cluster_wal_flushed_prefix_visit(
 						 scratch, &ref, wal_segment_size, root.checkpoint_lower_lsn,
-						 root.validated_tail_lsn_exclusive, bound, root.checkpoint_lower_lsn,
-						 root.checkpoint_record_crc32c, sealed_visit, &visit, &out),
+						 root.validated_tail_lsn_exclusive,
+						 cut == 5 ? next.exclusive_end : root.validated_tail_lsn_exclusive, bound,
+						 root.checkpoint_lower_lsn, root.checkpoint_record_crc32c, sealed_visit,
+						 &visit, &out),
 					 0);
 		UT_ASSERT_EQ(out.records, cut == 5 ? 2 : 1);
 		UT_ASSERT_EQ(visit.calls, out.records);
@@ -1530,6 +1532,31 @@ UT_TEST(live_prefix_stops_at_original_flush_boundary)
 		UT_ASSERT_EQ(out.database_incarnation, ref.claim.database_incarnation);
 		UT_ASSERT_EQ(fd_count(), before);
 	}
+}
+
+UT_TEST(live_prefix_rejects_oversized_record_inside_confirmed_complete_end)
+{
+	ClusterControlRootSnapshot root = sealed_fixture(false);
+	ClusterWalTailObservation out, zero = { 0 };
+	SealedVisitTest visit = { 0 };
+	WalTestRecord next = record_write(generation, root.validated_tail_lsn_exclusive,
+									  root.tail_last_record_lsn, 24);
+	uint32 oversized = XLOG_BLCKSZ * 2;
+	int before = fd_count();
+
+	/* The writer confirmed next.exclusive_end before these stored bytes
+	 * were damaged. A legal-looking length must not turn that record into
+	 * an unconfirmed suffix and silently return only the checkpoint. */
+	overwrite(next.record_start + offsetof(XLogRecord, xl_tot_len), &oversized, sizeof(oversized));
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT_NE(
+		cluster_wal_flushed_prefix_visit(scratch, &ref, wal_segment_size, root.checkpoint_lower_lsn,
+										 root.validated_tail_lsn_exclusive, next.exclusive_end,
+										 next.exclusive_end, root.checkpoint_lower_lsn,
+										 root.checkpoint_record_crc32c, sealed_visit, &visit, &out),
+		0);
+	UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+	UT_ASSERT_EQ(fd_count(), before);
 }
 
 UT_TEST(live_prefix_does_not_accept_corruption_inside_qualified_prefix)
@@ -1558,8 +1585,9 @@ UT_TEST(live_prefix_does_not_accept_corruption_inside_qualified_prefix)
 		memset(&out, 0xa5, sizeof(out));
 		UT_ASSERT_NE(cluster_wal_flushed_prefix_visit(
 						 scratch, &ref, wal_segment_size, root.checkpoint_lower_lsn,
-						 root.validated_tail_lsn_exclusive, bound, root.checkpoint_lower_lsn,
-						 root.checkpoint_record_crc32c, sealed_visit, &visit, &out),
+						 root.validated_tail_lsn_exclusive, next.exclusive_end, bound,
+						 root.checkpoint_lower_lsn, root.checkpoint_record_crc32c, sealed_visit,
+						 &visit, &out),
 					 0);
 		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
 		UT_ASSERT_EQ(fd_count(), before);
@@ -1589,9 +1617,9 @@ UT_TEST(live_prefix_ignores_unflushed_suffix_but_preserves_cleanup)
 		{
 			ClusterControlRootResult result = cluster_wal_flushed_prefix_visit(
 				scratch, &ref, wal_segment_size, root.checkpoint_lower_lsn,
-				root.validated_tail_lsn_exclusive, next.record_start + SizeOfXLogRecord + 8,
-				root.checkpoint_lower_lsn, root.checkpoint_record_crc32c, sealed_visit, &visit,
-				&out);
+				root.validated_tail_lsn_exclusive, root.validated_tail_lsn_exclusive,
+				next.record_start + SizeOfXLogRecord + 8, root.checkpoint_lower_lsn,
+				root.checkpoint_record_crc32c, sealed_visit, &visit, &out);
 			if (fault == 0) {
 				UT_ASSERT_EQ(result, 0);
 				UT_ASSERT_EQ(out.complete_end, root.validated_tail_lsn_exclusive);
@@ -1614,7 +1642,8 @@ UT_TEST(live_prefix_ignores_unflushed_suffix_but_preserves_cleanup)
 int
 main(void)
 {
-	UT_PLAN(54);
+	UT_PLAN(55);
+	UT_RUN(live_prefix_rejects_oversized_record_inside_confirmed_complete_end);
 	UT_RUN(live_prefix_stops_at_original_flush_boundary);
 	UT_RUN(live_prefix_does_not_accept_corruption_inside_qualified_prefix);
 	UT_RUN(live_prefix_ignores_unflushed_suffix_but_preserves_cleanup);

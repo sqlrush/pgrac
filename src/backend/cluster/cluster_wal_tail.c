@@ -597,9 +597,9 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 		if (record == NULL)
 			break;
 		CHECK_FOR_INTERRUPTS();
-		/* Native flush may stop at a page boundary within a record, or
-		 * before its alignment/switch padding. Only a complete end inside
-		 * the qualified cut may enter the provisional visitor. */
+		/* The live owner supplied a confirmed complete record end, not a
+		 * byte-flush hint. No record may cross that exact cut. The final
+		 * equality check rejects any damaged length that stops us early. */
 		if (work->flush_end != InvalidXLogRecPtr && work->reader->EndRecPtr > work->flush_end) {
 			work->flush_boundary = true;
 			break;
@@ -646,7 +646,8 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 	}
 	if (work->result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return work->result;
-	if (work->flush_end != InvalidXLogRecPtr && !work->flush_boundary)
+	if (work->flush_end != InvalidXLogRecPtr
+		&& (!work->flush_boundary || work->observed.complete_end != work->flush_end))
 		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
 	if (!work->checkpoint_prefix && work->flush_end == InvalidXLogRecPtr
 		&& !wal_tail_normal_end(work))
@@ -942,17 +943,18 @@ cluster_wal_checkpoint_prefix_observe(const char *wal_root, const ClusterWalSour
 ClusterControlRootResult
 cluster_wal_flushed_prefix_visit(const char *wal_root, const ClusterWalSourceRef *ref,
 								 int segment_size, XLogRecPtr physical_lower,
-								 XLogRecPtr minimum_end, XLogRecPtr flushed_end,
-								 XLogRecPtr checkpoint_start, pg_crc32c checkpoint_crc,
-								 ClusterWalRecordVisitor visitor, void *arg,
-								 ClusterWalTailObservation *out)
+								 XLogRecPtr minimum_end, XLogRecPtr complete_end,
+								 XLogRecPtr flushed_end, XLogRecPtr checkpoint_start,
+								 pg_crc32c checkpoint_crc, ClusterWalRecordVisitor visitor,
+								 void *arg, ClusterWalTailObservation *out)
 {
-	if (checkpoint_start == InvalidXLogRecPtr || flushed_end == InvalidXLogRecPtr) {
+	if (checkpoint_start == InvalidXLogRecPtr || complete_end == InvalidXLogRecPtr
+		|| complete_end < minimum_end || flushed_end < complete_end) {
 		if (out != NULL)
 			memset(out, 0, sizeof(*out));
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	}
 	return wal_tail_observe_common(wal_root, ref, segment_size, physical_lower, minimum_end,
 								   checkpoint_start, checkpoint_crc, out, NULL, false, false, NULL,
-								   visitor, arg, flushed_end);
+								   visitor, arg, complete_end);
 }
