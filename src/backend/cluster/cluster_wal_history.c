@@ -433,9 +433,10 @@ cluster_wal_startup_route_locked(const ControlRootImage *root, uint32 node, cons
 	result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &restart->claim, &old_claim);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	result = cluster_wal_tail_observe_checkpoint(
-		cluster_wal_threads_dir, restart, op.segment_size, op.input_record_start,
-		op.sealed_input_end, op.input_record_start, op.input_record_crc, &old_tail);
+	result = cluster_wal_tail_observe_checkpoint(cluster_wal_threads_dir, restart, op.segment_size,
+												 op.predecessor.snapshot.checkpoint_lower_lsn,
+												 op.sealed_input_end, op.input_record_start,
+												 op.input_record_crc, &old_tail);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (old_tail.complete_end != op.sealed_input_end
@@ -536,8 +537,9 @@ done:
 		result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &restart->claim, &old_claim);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		result = cluster_wal_tail_observe_checkpoint(
-			cluster_wal_threads_dir, restart, op.segment_size, op.input_record_start,
-			op.sealed_input_end, op.input_record_start, op.input_record_crc, &fresh_tail);
+			cluster_wal_threads_dir, restart, op.segment_size,
+			op.predecessor.snapshot.checkpoint_lower_lsn, op.sealed_input_end,
+			op.input_record_start, op.input_record_crc, &fresh_tail);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& memcmp(&fresh_tail, &old_tail, sizeof(old_tail)) != 0)
 		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;

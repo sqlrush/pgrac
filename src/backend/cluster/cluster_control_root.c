@@ -1357,7 +1357,11 @@ startup_decode_fields(const uint8 *bytes, const ControlRootImage *root, uint32 n
 				: CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED))
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 	if ((input->snapshot.root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) == 0
-		|| out->input_record_start != input->snapshot.checkpoint_lower_lsn
+		|| out->input_record_start
+			   != (out->input_kind == CLUSTER_WAL_STARTUP_CLEAN
+					   ? input->snapshot.tail_last_record_lsn
+					   : input->snapshot.checkpoint_lower_lsn)
+		|| out->input_record_start < input->snapshot.checkpoint_lower_lsn
 		|| out->input_record_crc != input->snapshot.checkpoint_record_crc32c
 		|| out->input_timeline != input->snapshot.checkpoint_tli
 		|| out->timeline != out->input_timeline || input->snapshot.tail_tli != out->input_timeline
@@ -2656,7 +2660,9 @@ shutdown_v2_record_input(const ControlRootImage *root, const ClusterControlRootS
 	ClusterControlRootResult result;
 
 	if (raw->state != DB_SHUTDOWNED || raw->checkPointCopy.redo != raw->checkPoint
-		|| record->checkpoint_lower_lsn != raw->checkPoint
+		|| record->checkpoint_lower_lsn == InvalidXLogRecPtr
+		|| record->checkpoint_lower_lsn > raw->checkPoint
+		|| (root->header.format_version < 3 && record->checkpoint_lower_lsn != raw->checkPoint)
 		|| (record->root_flags
 			& (CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
 			   | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID))
@@ -4587,6 +4593,8 @@ typedef struct CheckpointV2Work {
 	ClusterControlRootResult wal_read_result;
 	ClusterWalSourceRef source_ref;
 	uint32 checkpoint_crc;
+	/* Original physical responsibility, independent of the selected native redo. */
+	XLogRecPtr retained_lower;
 } CheckpointV2Work;
 
 static bool
@@ -4814,12 +4822,21 @@ checkpoint_v2_input_observe(CheckpointV2Work *work, const ControlFileData *contr
 		ClusterWalTailObservation tail;
 		result = cluster_wal_tail_observe_checkpoint(
 			cluster_wal_threads_dir, &work->source_ref, wal_segment_size,
-			control->checkPoint, end, control->checkPoint, crc, &tail);
+			work->retained_lower != InvalidXLogRecPtr ? work->retained_lower : control->checkPoint,
+			end, control->checkPoint, crc, &tail);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 		return tail.complete_end == end && tail.last_record_start == control->checkPoint
 				   && tail.last_record_crc == crc
 				   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	if (work->retained_lower != InvalidXLogRecPtr) {
+		ClusterWalTailObservation prefix;
+		result = cluster_wal_checkpoint_prefix_observe(cluster_wal_threads_dir, &work->source_ref,
+													   wal_segment_size, work->retained_lower, end,
+													   control->checkPoint, crc, &prefix);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
 	}
 	result = checkpoint_v2_wal_verify(work, &work->source_ref.claim.identity, control, end);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -4998,10 +5015,10 @@ reserve_clean_input_locked(ReserveCleanWork *work, unsigned node)
 		return result;
 	if (memcmp(scan->base.bytes, work->base.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
-	if (scan->old_view.state != DB_SHUTDOWNED
-		|| scan->old_view.checkPoint != record->checkpoint_lower_lsn
-		|| scan->old_view.checkPointCopy.redo != record->checkpoint_lower_lsn
-		|| record->tail_last_record_lsn != record->checkpoint_lower_lsn
+	if (scan->old_view.state != DB_SHUTDOWNED || record->checkpoint_lower_lsn == InvalidXLogRecPtr
+		|| record->checkpoint_lower_lsn > scan->old_view.checkPoint
+		|| scan->old_view.checkPointCopy.redo != scan->old_view.checkPoint
+		|| record->tail_last_record_lsn != scan->old_view.checkPoint
 		|| record->tail_last_record_crc32c != record->checkpoint_record_crc32c
 		|| record->validated_tail_lsn_exclusive <= record->tail_last_record_lsn
 		|| (record->root_flags
@@ -5016,6 +5033,7 @@ reserve_clean_input_locked(ReserveCleanWork *work, unsigned node)
 	scan->source_ref.claim.max_config_generation = work->base.header.v2.config_generation;
 	memcpy(scan->source_ref.claim.claim_sha256, work->base.refs[node].claim_sha256, 32);
 	scan->source_ref.timeline = record->checkpoint_tli;
+	scan->retained_lower = record->checkpoint_lower_lsn;
 	result
 		= checkpoint_v2_input_observe(scan, &scan->old_view, record->validated_tail_lsn_exclusive,
 									   record->checkpoint_record_crc32c);
@@ -6594,7 +6612,7 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 		return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
 	if (cf->checkPointCopy.ThisTimeLineID != record->checkpoint_tli
 		|| cf->checkPointCopy.PrevTimeLineID != work->old_view.checkPointCopy.PrevTimeLineID
-		|| cf->checkPointCopy.redo <= record->checkpoint_lower_lsn
+		|| cf->checkPointCopy.redo <= work->old_view.checkPointCopy.redo
 		|| cf->checkPoint <= work->old_view.checkPoint || end < record->validated_tail_lsn_exclusive
 		|| cf->minRecoveryPoint != work->old_view.minRecoveryPoint
 		|| cf->minRecoveryPointTLI != work->old_view.minRecoveryPointTLI
@@ -6602,6 +6620,12 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 		|| cf->wal_log_hints != work->old_view.wal_log_hints
 		|| cf->track_commit_timestamp != work->old_view.track_commit_timestamp)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	/* A native checkpoint closes this writer's DATA/SIDE duty, not the
+	 * other sources' ancestry. Until their exact dependency owner supplies
+	 * a qualified advance, retain the old physical lower in v3. No scalar
+	 * supplied by the checkpoint caller authorizes GC. */
+	if (work->format_version >= 3)
+		work->retained_lower = record->checkpoint_lower_lsn;
 	result = checkpoint_terminal_collect(work, index);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -6698,7 +6722,9 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	record = &work->next.records[index];
 	record->checkpoint_tli = cf->checkPointCopy.ThisTimeLineID;
 	record->checkpoint_source_kind = CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1;
-	record->checkpoint_lower_lsn = cf->checkPointCopy.redo;
+	record->checkpoint_lower_lsn = work->retained_lower != InvalidXLogRecPtr
+									   ? work->retained_lower
+									   : cf->checkPointCopy.redo;
 	record->checkpoint_record_crc32c = crc;
 	record->root_flags
 		|= CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
@@ -8111,7 +8137,9 @@ shutdown_v2_observe_work(CheckpointV2Work *work, const ClusterWalSourceRef *expe
 	end = record->validated_tail_lsn_exclusive;
 	if (work->old_view.state != DB_SHUTDOWNED
 		|| work->old_view.checkPointCopy.redo != work->old_view.checkPoint
-		|| record->checkpoint_lower_lsn != work->old_view.checkPoint
+		|| record->checkpoint_lower_lsn == InvalidXLogRecPtr
+		|| record->checkpoint_lower_lsn > work->old_view.checkPoint
+		|| (work->format_version < 3 && record->checkpoint_lower_lsn != work->old_view.checkPoint)
 		|| (record->root_flags
 			& (CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
 			   | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID))
@@ -8122,6 +8150,8 @@ shutdown_v2_observe_work(CheckpointV2Work *work, const ClusterWalSourceRef *expe
 		|| record->tail_last_record_crc32c != record->checkpoint_record_crc32c
 		|| end <= record->tail_last_record_lsn)
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if (work->format_version >= 3)
+		work->retained_lower = record->checkpoint_lower_lsn;
 	if (!shutdown_v2_owner_current(expected, epoch, end))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (close_plan != NULL && record->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED) {

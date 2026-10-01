@@ -6984,6 +6984,161 @@ v2_checkpoint_append_noop(void)
 					   test_checkpoint_end);
 }
 
+/* Supply the earlier retained interval as one real NOOP spanning page
+ * continuations, then link the actual checkpoint to it. The test's original
+ * ROOT/anchor is a fixture; this interval and the new checkpoint are decoded
+ * by the production reader, without substituting its CRC or prev-link checks. */
+static void
+v2_checkpoint_retained_prefix(const ClusterControlRootIdentity *self,
+							  const ControlFileData *candidate, XLogRecPtr lower)
+{
+	XLogRecPtr position = lower;
+	size_t length = 0, used = 0;
+	char path[MAXPGPATH];
+	uint8 *bytes;
+	XLogRecord record = { 0 };
+	uint8 checkpoint[SizeOfXLogRecord + 2 + sizeof(CheckPoint)];
+	uint32 data_length;
+	int fd;
+
+	UT_ASSERT(lower < candidate->checkPoint);
+	UT_ASSERT_EQ(lower / wal_segment_size, candidate->checkPoint / wal_segment_size);
+	while (position < candidate->checkPoint) {
+		size_t n = Min(candidate->checkPoint - position, XLOG_BLCKSZ - position % XLOG_BLCKSZ);
+		length += n;
+		position += n;
+		if (position < candidate->checkPoint && position % XLOG_BLCKSZ == 0)
+			position += SizeOfXLogShortPHD;
+	}
+	UT_ASSERT(length >= SizeOfXLogRecord + 5);
+	bytes = palloc0(length);
+	record.xl_tot_len = length;
+	record.xl_rmid = RM_XLOG_ID;
+	record.xl_info = XLOG_NOOP;
+	bytes[SizeOfXLogRecord] = XLR_BLOCK_ID_DATA_LONG;
+	data_length = length - SizeOfXLogRecord - 5;
+	memcpy(bytes + SizeOfXLogRecord + 1, &data_length, sizeof(data_length));
+	INIT_CRC32C(record.xl_crc);
+	COMP_CRC32C(record.xl_crc, bytes + SizeOfXLogRecord, length - SizeOfXLogRecord);
+	COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(record.xl_crc);
+	memcpy(bytes, &record, SizeOfXLogRecord);
+	v2_checkpoint_wal_path(self, lower, candidate->checkPointCopy.ThisTimeLineID, path);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	position = lower;
+	while (used < length) {
+		uint8 page[XLOG_BLCKSZ];
+		XLogLongPageHeaderData header = { 0 };
+		XLogRecPtr page_start = position - position % XLOG_BLCKSZ;
+		size_t offset = position % XLOG_BLCKSZ;
+		size_t n = Min(length - used, XLOG_BLCKSZ - offset);
+
+		UT_ASSERT_EQ(pread(fd, page, sizeof(page), page_start % wal_segment_size), sizeof(page));
+		header.std.xlp_magic = XLOG_PAGE_MAGIC;
+		header.std.xlp_info = page_start % wal_segment_size == 0 ? XLP_LONG_HEADER : 0;
+		header.std.xlp_tli = candidate->checkPointCopy.ThisTimeLineID;
+		header.std.xlp_thread_id = self->origin_thread_id;
+		header.std.xlp_pageaddr = page_start;
+		header.xlp_sysid = self->system_identifier;
+		header.xlp_seg_size = wal_segment_size;
+		header.xlp_xlog_blcksz = XLOG_BLCKSZ;
+		if (used != 0) {
+			header.std.xlp_info |= XLP_FIRST_IS_CONTRECORD;
+			header.std.xlp_rem_len = length - used;
+		}
+		memcpy(page, &header, XLogPageHeaderSize(&header.std));
+		memcpy(page + offset, bytes + used, n);
+		UT_ASSERT_EQ(pwrite(fd, page, sizeof(page), page_start % wal_segment_size), sizeof(page));
+		used += n;
+		position += n;
+		if (used < length)
+			position += SizeOfXLogShortPHD;
+	}
+	UT_ASSERT_EQ(position, candidate->checkPoint);
+	UT_ASSERT(candidate->checkPoint % XLOG_BLCKSZ + sizeof(checkpoint) < XLOG_BLCKSZ);
+	UT_ASSERT_EQ(
+		pread(fd, checkpoint, sizeof(checkpoint), candidate->checkPoint % wal_segment_size),
+		sizeof(checkpoint));
+	memcpy(&record, checkpoint, SizeOfXLogRecord);
+	record.xl_prev = lower;
+	INIT_CRC32C(record.xl_crc);
+	COMP_CRC32C(record.xl_crc, checkpoint + SizeOfXLogRecord,
+				sizeof(checkpoint) - SizeOfXLogRecord);
+	COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(record.xl_crc);
+	memcpy(checkpoint, &record, SizeOfXLogRecord);
+	UT_ASSERT_EQ(
+		pwrite(fd, checkpoint, sizeof(checkpoint), candidate->checkPoint % wal_segment_size),
+		sizeof(checkpoint));
+	UT_ASSERT_EQ(close(fd), 0);
+	test_checkpoint_crc = test_checkpoint_prefix.record_crc = record.xl_crc;
+	pfree(bytes);
+}
+
+UT_TEST(test_live_checkpoint_prefix_does_not_require_a_sealed_suffix)
+{
+	for (unsigned suffix = 0; suffix < 3; suffix++) {
+		uint8 before[66048];
+		ClusterControlRootIdentity self;
+		ControlFileData candidate;
+		ClusterWalTailObservation out;
+
+		v2_checkpoint_fixture(before, &self, &candidate);
+		if (suffix == 1)
+			v2_checkpoint_append_noop();
+		else if (suffix == 2)
+			v2_incomplete_wal_tail(&self, test_flush_tli, wal_segment_size, test_checkpoint_end,
+								   candidate.checkPoint);
+		UT_ASSERT_EQ(cluster_wal_checkpoint_prefix_observe(
+						 cluster_wal_threads_dir, &test_checkpoint_prefix_ref, wal_segment_size,
+						 candidate.checkPoint, test_checkpoint_end, candidate.checkPoint,
+						 test_checkpoint_crc, &out),
+					 0);
+		UT_ASSERT_EQ(out.records, 1);
+		UT_ASSERT_EQ(out.complete_end, test_checkpoint_end);
+		UT_ASSERT_EQ(out.last_record_start, candidate.checkPoint);
+		UT_ASSERT_EQ(out.last_record_crc, test_checkpoint_crc);
+	}
+}
+
+UT_TEST(test_live_checkpoint_prefix_rejects_incomplete_or_changed_input)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		uint8 before[66048];
+		ClusterControlRootIdentity self;
+		ControlFileData candidate;
+		ClusterWalTailObservation out;
+		ClusterWalSourceRef ref;
+		XLogRecPtr lower, end;
+		pg_crc32c crc;
+
+		v2_checkpoint_fixture(before, &self, &candidate);
+		ref = test_checkpoint_prefix_ref;
+		lower = candidate.checkPoint;
+		end = test_checkpoint_end;
+		crc = test_checkpoint_crc;
+		if (fault == 0)
+			lower -= 8;
+		else if (fault == 1)
+			end -= 8;
+		else if (fault == 2)
+			end += 8;
+		else if (fault == 3)
+			crc ^= 1;
+		else if (fault == 4)
+			ref.claim.claim_sha256[0] ^= 1;
+		else
+			ref.timeline++;
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(cluster_wal_checkpoint_prefix_observe(cluster_wal_threads_dir, &ref,
+														wal_segment_size, lower, end,
+														candidate.checkPoint, crc, &out)
+				  != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+	}
+}
+
 static int test_native_input_race;
 
 static void
@@ -8181,6 +8336,7 @@ v2_close_add_peer(uint8 before[66048], int node, ClusterPhase1FullStopPlan *plan
 }
 
 static bool test_native_initializer;
+static bool test_retained_startup;
 
 /* Supply real native checkpoint/SLRU inputs before the reservation captures
  * W0. No anchor/root or embedded PGWG is changed after it becomes selected. */
@@ -8291,6 +8447,16 @@ v3_reserve_fixture(uint8 before[66048], ControlRootImage *root)
 	root->header.format_version = 3;
 	root->header.v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_CLOSED;
 	root->records[0].lifecycle = root->records[3].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	if (test_retained_startup) {
+		ControlFileData checkpoint = { 0 };
+		checkpoint.checkPoint = root->records[0].tail_last_record_lsn;
+		checkpoint.checkPointCopy.ThisTimeLineID = root->records[0].checkpoint_tli;
+		root->records[0].checkpoint_lower_lsn = checkpoint.checkPoint - 64;
+		v2_checkpoint_retained_prefix(&root->records[0].identity, &checkpoint,
+									  root->records[0].checkpoint_lower_lsn);
+		root->records[0].checkpoint_record_crc32c = test_checkpoint_crc;
+		root->records[0].tail_last_record_crc32c = test_checkpoint_crc;
+	}
 	UT_ASSERT_EQ(cluster_control_root_v3_encode(root), 0);
 	memcpy(before, root->bytes, 66048);
 	v2_write_roots(before);
@@ -9006,6 +9172,56 @@ UT_TEST(test_v3_startup_route_switches_only_exact_empty_generation)
 	test_restart_ref_valid = test_reserve_mode = false;
 }
 
+UT_TEST(test_v3_startup_route_consumes_complete_retained_predecessor)
+{
+	for (unsigned corrupt = 0; corrupt < 2; corrupt++) {
+		uint8 before[66048];
+		ControlRootImage root;
+		char pgdata[MAXPGPATH], pgwal[MAXPGPATH], path[MAXPGPATH];
+		ClusterWalStartupImage op, out;
+		struct stat original, observed;
+
+		test_retained_startup = true;
+		op = v3_route_fixture(before, &root, pgdata);
+		test_retained_startup = false;
+		UT_ASSERT(op.predecessor.snapshot.checkpoint_lower_lsn < op.input_record_start);
+		UT_ASSERT_EQ(op.input_record_start, op.predecessor.snapshot.tail_last_record_lsn);
+		snprintf(pgwal, sizeof(pgwal), "%s/pg_wal", pgdata);
+		UT_ASSERT_EQ(lstat(pgwal, &original), 0);
+		if (corrupt) {
+			uint8 byte = 0x71;
+			int fd;
+			v2_checkpoint_wal_path(&op.predecessor.snapshot.identity, op.input_record_start,
+								   op.input_timeline, path);
+			fd = open(path, O_WRONLY);
+			UT_ASSERT(fd >= 0);
+			UT_ASSERT_EQ(
+				pwrite(fd, &byte, 1,
+					   (op.predecessor.snapshot.checkpoint_lower_lsn + SizeOfXLogRecord + 5)
+						   % wal_segment_size),
+				1);
+			UT_ASSERT_EQ(close(fd), 0);
+		}
+		if (corrupt) {
+			UT_ASSERT(cluster_control_root_v3_startup_route_writer(&op.claim.identity,
+																   op.operation_uuid, &out)
+					  != 0);
+			UT_ASSERT(v2_zero(&out, sizeof(out)));
+		} else
+			UT_ASSERT_EQ(cluster_control_root_v3_startup_route_writer(&op.claim.identity,
+																	  op.operation_uuid, &out),
+						 0);
+		UT_ASSERT_EQ(lstat(pgwal, &observed), 0);
+		UT_ASSERT_EQ(original.st_ino == observed.st_ino, corrupt != 0);
+		v2_assert_primary_unchanged(before);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(unlink(pgwal), 0);
+		UT_ASSERT_EQ(rmdir(pgdata), 0);
+		DataDir = test_root;
+		test_restart_ref_valid = test_reserve_mode = false;
+	}
+}
+
 UT_TEST(test_v3_startup_route_requires_exact_owner_and_restart_input)
 {
 	for (unsigned fault = 0; fault < 14; ++fault) {
@@ -9539,6 +9755,35 @@ v3_install_fixture(uint8 before[66048], ControlRootImage *root)
 	memcpy(before, root->bytes, 66048);
 	test_actual_cf = test_cf_mode = NoLock;
 	return durable;
+}
+
+UT_TEST(test_v3_new_generation_archives_the_retained_range)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterWalStartupImage op;
+	ClusterWalSourceRef writer;
+	ClusterWalHistoryImage history;
+	ClusterControlRootFileToken token;
+	ControlFileData view;
+
+	test_retained_startup = true;
+	op = v3_install_fixture(before, &root);
+	test_retained_startup = false;
+	UT_ASSERT(op.predecessor.snapshot.checkpoint_lower_lsn < op.input_record_start);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&op, &writer), 0);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_read_thread_locked(&op.claim.identity, &root, &view, &token), 0);
+	UT_ASSERT_EQ(cluster_wal_history_read_locked(&root, 0, &history), 0);
+	UT_ASSERT_EQ(history.count, 1);
+	UT_ASSERT(memcmp(&history.records[0].snapshot, &op.predecessor.snapshot,
+					 sizeof(op.predecessor.snapshot))
+			  == 0);
+	UT_ASSERT(memcmp(&history.records[0].refs, &op.predecessor.refs, sizeof(op.predecessor.refs))
+			  == 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	test_reserve_mode = false;
 }
 
 UT_TEST(test_v3_startup_install_refuses_wrong_owner_and_intent)
@@ -11250,6 +11495,8 @@ UT_TEST(test_v3_checkpoint_transfers_terminal_obligations_atomically)
 		COMP_CRC32C(candidate.crc, &candidate, offsetof(ControlFileData, crc));
 		FIN_CRC32C(candidate.crc);
 		v2_checkpoint_wal_record(&op.claim.identity, &candidate, 0);
+		v2_checkpoint_retained_prefix(&op.claim.identity, &candidate,
+									  root.records[0].checkpoint_lower_lsn);
 		test_fail_primary_rename = scenario == 3;
 		if (scenario >= 2) {
 			UT_ASSERT(cluster_control_root_v3_checkpoint_publish(&op.claim.identity, &candidate,
@@ -17930,13 +18177,51 @@ UT_TEST(test_v3_checkpoint_publish_preserves_pending_and_real_wal_guards)
 		ClusterControlRootFileToken token;
 		ControlRootImage root;
 		ControlFileData candidate, view;
+		ClusterRecoveryAnchorV2 old_anchor;
+		XLogRecPtr lower;
+		char path[MAXPGPATH];
 		if (shutdown)
 			v2_shutdown_checkpoint_fixture(before, &self, &candidate);
 		else
 			v2_checkpoint_fixture(before, &self, &candidate);
+		/* Older byte-codec fixtures used a segment boundary as their redo.
+		 * The physical prefix starts at an actual record after the header. */
+		old_anchor = v2_stop_clean_anchor(before, &self);
+		old_anchor.checkpoint_copy.redo += SizeOfXLogLongPHD;
+		lower = old_anchor.checkpoint_copy.redo;
+		put_u64_le(before + 512 + 112, lower);
+		v2_anchor_object(before, &old_anchor, &self, path);
+		candidate.minRecoveryPoint = 0;
+		candidate.minRecoveryPointTLI = 0;
+		INIT_CRC32C(candidate.crc);
+		COMP_CRC32C(candidate.crc, &candidate, offsetof(ControlFileData, crc));
+		FIN_CRC32C(candidate.crc);
+		v2_checkpoint_retained_prefix(&self, &candidate, lower);
 		root_fixture_version3(before);
 		v3_mark_pending(before, 127);
 		v2_write_roots(before);
+		/* A good selected checkpoint cannot excuse damaged retained bytes. */
+		{
+			uint8 saved, damaged;
+			int fd;
+			off_t offset = (lower + SizeOfXLogRecord + 5) % wal_segment_size;
+			v2_checkpoint_wal_path(&self, lower, candidate.checkPointCopy.ThisTimeLineID, path);
+			fd = open(path, O_RDWR);
+			UT_ASSERT(fd >= 0);
+			UT_ASSERT_EQ(pread(fd, &saved, 1, offset), 1);
+			damaged = saved ^ 1;
+			UT_ASSERT_EQ(pwrite(fd, &damaged, 1, offset), 1);
+			UT_ASSERT_EQ(shutdown ? cluster_control_root_v3_shutdown_checkpoint_publish(
+										&self, &candidate, test_checkpoint_end, &out, &token, &view)
+								  : cluster_control_root_v3_checkpoint_publish(&self, &candidate,
+																			   test_checkpoint_end,
+																			   &out, &token, &view),
+						 CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
+			UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+			v2_assert_primary_unchanged(before);
+			UT_ASSERT_EQ(pwrite(fd, &saved, 1, offset), 1);
+			UT_ASSERT_EQ(close(fd), 0);
+		}
 		UT_ASSERT_EQ(shutdown ? cluster_control_root_v3_shutdown_checkpoint_publish(
 									&self, &candidate, test_checkpoint_end, &out, &token, &view)
 							  : cluster_control_root_v3_checkpoint_publish(
@@ -17949,6 +18234,8 @@ UT_TEST(test_v3_checkpoint_publish_preserves_pending_and_real_wal_guards)
 		UT_ASSERT_EQ(view.state, DB_IN_PRODUCTION);
 		UT_ASSERT_EQ(out.validated_tail_lsn_exclusive, test_checkpoint_end);
 		UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&self, &root, &view, &token), 0);
+		UT_ASSERT_EQ(out.checkpoint_lower_lsn, lower);
+		UT_ASSERT_EQ(view.checkPointCopy.redo, candidate.checkPointCopy.redo);
 		UT_ASSERT(memcmp(root.bytes + 1024, before + 1024, 66048 - 1024) == 0);
 		UT_ASSERT_EQ(root.startup[127].generation, 705);
 		UT_ASSERT_EQ(root.header.v2.database_state, CLUSTER_CONTROL_ROOT_DATABASE_OPEN);
@@ -17962,6 +18249,25 @@ UT_TEST(test_v3_checkpoint_publish_preserves_pending_and_real_wal_guards)
 				0);
 			UT_ASSERT_EQ(token.format_version, 3);
 			UT_ASSERT_EQ(out.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+		} else {
+			/* Retention must not let native redo regress or repeat. Both
+			 * candidate values remain above the old physical lower. */
+			for (unsigned repeat = 0; repeat < 2; repeat++) {
+				ControlFileData invalid = candidate;
+				uint8 published[66048];
+				memcpy(published, root.bytes, sizeof(published));
+				invalid.checkPoint += 512;
+				if (!repeat)
+					invalid.checkPointCopy.redo -= 8;
+				INIT_CRC32C(invalid.crc);
+				COMP_CRC32C(invalid.crc, &invalid, offsetof(ControlFileData, crc));
+				FIN_CRC32C(invalid.crc);
+				v2_checkpoint_wal_record(&self, &invalid, 0);
+				UT_ASSERT_EQ(cluster_control_root_v3_checkpoint_publish(
+								 &self, &invalid, test_checkpoint_end, &out, &token, &view),
+							 CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+				v2_assert_primary_unchanged(published);
+			}
 		}
 	}
 }
@@ -18834,7 +19140,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(345);
+	UT_PLAN(349);
 	UT_RUN(test_config_failed_acquire_retires_before_retry);
 	UT_RUN(test_config_poll_delivers_only_after_its_exact_release);
 	UT_RUN(test_config_poll_cut_or_prior_drift_discards_retained_observation);
@@ -18880,6 +19186,7 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_startup_checkpoint_retry_requires_selected_root_durability);
 	UT_RUN(test_v3_startup_install_retains_predecessor_without_serving);
 	UT_RUN(test_v3_startup_install_refuses_wrong_owner_and_intent);
+	UT_RUN(test_v3_new_generation_archives_the_retained_range);
 	UT_RUN(test_v3_startup_install_requires_actual_old_and_new_files);
 	UT_RUN(test_v3_startup_install_uncertain_rename_is_not_success);
 	UT_RUN(test_v3_startup_install_all_sync_and_late_cuts_retain_obligations);
@@ -18891,6 +19198,7 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_startup_checkpoint_persistence_and_late_races_keep_obligations);
 	UT_RUN(test_v3_begin_requires_all_declared_empty_targets_before_native_mutation);
 	UT_RUN(test_v3_startup_route_switches_only_exact_empty_generation);
+	UT_RUN(test_v3_startup_route_consumes_complete_retained_predecessor);
 	UT_RUN(test_v3_startup_route_requires_exact_owner_and_restart_input);
 	UT_RUN(test_v3_startup_route_refuses_unsafe_or_nonempty_namespaces);
 	UT_RUN(test_v3_startup_route_uncertain_rename_requires_directory_sync);
@@ -19060,6 +19368,8 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_thread_view_clears_root_after_missing_anchor);
 	UT_RUN(test_v2_thread_view_rejects_selected_foreign_or_inconsistent_anchor);
 	UT_RUN(test_v2_checkpoint_advances_one_thread_and_preserves_common);
+	UT_RUN(test_live_checkpoint_prefix_does_not_require_a_sealed_suffix);
+	UT_RUN(test_live_checkpoint_prefix_rejects_incomplete_or_changed_input);
 	UT_RUN(test_v2_shutdown_checkpoint_evidence_is_not_clean_close);
 	UT_RUN(test_v2_stop_observation_does_not_close_or_publish);
 	UT_RUN(test_v2_stop_observation_rejects_late_wal_and_changed_owner);

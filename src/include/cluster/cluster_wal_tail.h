@@ -115,4 +115,14 @@ cluster_wal_tail_observe_checkpoint(const char *wal_root, const ClusterWalSource
 									XLogRecPtr checkpoint_start, pg_crc32c checkpoint_crc,
 									ClusterWalTailObservation *out);
 
+/* A live checkpointer's exact physical prefix ending at its native checkpoint.
+ * Validate every retained record, but do not require the writer's later suffix
+ * to be sealed or empty. The original owner supplies WALR, native flush and
+ * CF/root revalidation; this read-only observation grants no GC permission. */
+extern ClusterControlRootResult
+cluster_wal_checkpoint_prefix_observe(const char *wal_root, const ClusterWalSourceRef *ref,
+									  int segment_size, XLogRecPtr physical_lower,
+									  XLogRecPtr checkpoint_end, XLogRecPtr checkpoint_start,
+									  pg_crc32c checkpoint_crc, ClusterWalTailObservation *out);
+
 #endif /* CLUSTER_WAL_TAIL_H */
