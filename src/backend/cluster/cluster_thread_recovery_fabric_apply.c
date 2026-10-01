@@ -168,6 +168,7 @@ cluster_thread_recovery_fabric_apply_sources_v1(const ClusterThreadRecoveryFabri
 	uint64 current_epoch;
 	uint32 participant_count;
 	uint32 target_count;
+	uint32 retained_target_count;
 	uint32 max_chain_count = 0;
 	uint32 i;
 
@@ -215,15 +216,23 @@ cluster_thread_recovery_fabric_apply_sources_v1(const ClusterThreadRecoveryFabri
 	current_epoch = cluster_epoch_get_current();
 	if (current_epoch == 0 || current_epoch > UINT32_MAX)
 		return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
-	target_count = rf_page_online_plan_target_count_v1(page_plan);
-	if (target_count > RF_PAGE_STABLE_MAX_EDGES)
+	retained_target_count = rf_page_online_plan_target_count_v1(page_plan);
+	if (retained_target_count > RF_PAGE_STABLE_MAX_EDGES)
 		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	target_count = 0;
+	for (i = 0; i < retained_target_count; i++) {
+		RfPageOnlineTargetViewV1 view;
+		if (!rf_page_online_plan_target_v1(page_plan, i, &view))
+			return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+		if (!view.history_only)
+			target_count++;
+	}
 	state = fabric_apply_alloc0(sizeof(*state));
 	if (state == NULL)
 		return RF_PAGE_PROOF_DETAIL_OOM;
 	memset(&completed, 0, sizeof(completed));
 	completed.page_target_count = target_count;
-	completed.side_operation_count = rf_side_online_plan_operation_count_v1(side_plan);
+	completed.side_operation_count = rf_side_online_plan_origin_operation_count_v1(side_plan, 0);
 
 	/* Heap-owned state survives PG ERROR longjmp at any preparation/apply
 	 * stage. The caller's plan and original authorities are only borrowed. */
@@ -236,6 +245,7 @@ cluster_thread_recovery_fabric_apply_sources_v1(const ClusterThreadRecoveryFabri
 		}
 		if (target_count > 0) {
 			Size page_bytes = (Size)target_count * BLCKSZ;
+			uint32 next = 0;
 
 			state->views = (RfPageOnlineTargetViewV1 *)fabric_apply_alloc0((Size)target_count
 																		   * sizeof(*state->views));
@@ -253,15 +263,22 @@ cluster_thread_recovery_fabric_apply_sources_v1(const ClusterThreadRecoveryFabri
 				detail = RF_PAGE_PROOF_DETAIL_OOM;
 				goto done;
 			}
-			for (i = 0; i < target_count; i++) {
-				if (!rf_page_online_plan_target_v1(page_plan, i, &state->views[i])
-					|| state->views[i].source == NULL || state->views[i].contributors == NULL
-					|| state->views[i].graph == NULL || state->views[i].canonical_page == NULL
-					|| state->views[i].contributors->edge_count == 0) {
+			for (i = 0; i < retained_target_count; i++) {
+				RfPageOnlineTargetViewV1 view;
+				if (!rf_page_online_plan_target_v1(page_plan, i, &view)) {
 					detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
 					goto done;
 				}
-				max_chain_count = Max(max_chain_count, state->views[i].contributors->edge_count);
+				if (view.history_only)
+					continue;
+				if (view.source == NULL || view.contributors == NULL || view.graph == NULL
+					|| view.canonical_page == NULL || view.contributors->edge_count == 0
+					|| next >= target_count) {
+					detail = RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+					goto done;
+				}
+				state->views[next++] = view;
+				max_chain_count = Max(max_chain_count, view.contributors->edge_count);
 			}
 			state->chain_indices = (uint32 *)fabric_apply_alloc0((Size)max_chain_count
 																 * sizeof(*state->chain_indices));

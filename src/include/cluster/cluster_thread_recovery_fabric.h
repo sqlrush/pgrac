@@ -18,6 +18,8 @@ typedef struct ClusterThreadRecoveryFabricPlanRequestV1 {
 	const RfContributorStreamCutV1 *physical_cuts;
 	/* Optional for pure graphs; shared ROOT scanners supply every full claim. */
 	const ClusterWalSourceRef *sources;
+	/* Native redo starts from the same exact ROOT-selected source/anchor. */
+	const XLogRecPtr *redo_starts;
 	uint32 participant_count;
 	uint64 retention_binding_cookie;
 	Size page_memory_budget;

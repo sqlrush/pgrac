@@ -24,6 +24,9 @@ typedef struct RfPageOnlinePlanRequestV1 {
 	uint32 participant_count;
 	uint64 retention_binding_cookie;
 	Size memory_budget;
+	/* Same original source's native checkpoint. NULL preserves a full-cut
+	 * redo plan. Earlier retained records remain dependency input only. */
+	const XLogRecPtr *redo_starts;
 } RfPageOnlinePlanRequestV1;
 
 typedef struct RfPageOnlineRecordIdentityV1 {
@@ -35,7 +38,8 @@ typedef struct RfPageOnlineRecordIdentityV1 {
 typedef struct RfPageOnlineTargetViewV1 {
 	RfPageIdentityV1 page_identity;
 	uint8 before_kind;
-	uint8 reserved_zero[7];
+	bool history_only;
+	uint8 reserved_zero[6];
 	RfPageVersionV1 expected_before;
 	RfPageVersionV1 expected_result;
 	const char *canonical_page;

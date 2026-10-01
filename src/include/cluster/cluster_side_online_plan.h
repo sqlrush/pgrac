@@ -31,6 +31,8 @@ typedef struct RfSideOnlinePlanRequestV1 {
 	const RfContributorStreamCutV1 *physical_cuts;
 	uint32 participant_count;
 	Size memory_budget;
+	/* Bound before feed by the original source owner; NULL means full cut. */
+	const XLogRecPtr *redo_starts;
 } RfSideOnlinePlanRequestV1;
 
 typedef struct RfSideOnlineOperationV1 {
@@ -44,6 +46,8 @@ typedef struct RfSideOnlineOperationV1 {
 	ClusterUndoDecoded undo;
 	ClusterSideProjectionOperationV1 projection;
 	ClusterSpaceIdentityKey space_key;
+	/* Kept for reconstruction/dependency checks; never dispatched as redo. */
+	bool history_only;
 } RfSideOnlineOperationV1;
 
 typedef bool (*RfSideOnlineApplyXactV1)(void *arg, const RfSideOnlineOperationV1 *operation);

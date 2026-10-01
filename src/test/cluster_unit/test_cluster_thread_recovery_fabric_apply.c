@@ -45,6 +45,16 @@ static RfPagePinnedSourceV1 sources[2];
 static RfPageStableGraphRequestV1 graphs[2];
 static RfPageOnlineTargetViewV1 targets[2];
 static int target_count;
+
+static uint32
+active_target_count(void)
+{
+	uint32 count = 0;
+	for (int i = 0; i < target_count; i++)
+		if (!targets[i].history_only)
+			count++;
+	return count;
+}
 static int step;
 static int proof_step;
 static int page_preflight_step;
@@ -191,8 +201,9 @@ rf_page_online_plan_target_v1(const RfPageOnlinePlanV1 *plan, uint32 index,
 }
 
 uint32
-rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan)
+rf_side_online_plan_origin_operation_count_v1(const RfSideOnlinePlanV1 *plan, uint16 origin)
 {
+	UT_ASSERT_EQ(origin, 0);
 	return plan == (const RfSideOnlinePlanV1 *)&side_plan_object ? 3 : 0;
 }
 
@@ -255,12 +266,12 @@ rf_page_authority_batch_preflight_wait_v1(const RfPageAuthorityBatchRequestV1 *r
 										  int timeout_ms,
 										  RfPageAuthorityPreflightV1 **out_preflight)
 {
-	UT_ASSERT(request != NULL && request->target_count == (uint32)target_count
+	UT_ASSERT(request != NULL && request->target_count == active_target_count()
 			  && timeout_ms == 1000);
 	UT_ASSERT(request->source_authorities != NULL && request->participant_count == participant_count
 			  && request->formation == NULL && request->duties == NULL
 			  && request->retention_pin == NULL);
-	if (target_count == 2) {
+	if (active_target_count() == 2) {
 		UT_ASSERT(request->targets[0].contributors == &contributors[0]);
 		UT_ASSERT(request->targets[1].contributors == &contributors[1]);
 	}
@@ -295,7 +306,7 @@ RfPageProofDetailV1
 rf_page_storage_smgr_preopen_v1(const RfPageStorageInstallRequestV1 *request,
 								RfPageSmgrPreopenV1 **out_preopen)
 {
-	UT_ASSERT(request != NULL && request->component_count == (uint32)target_count
+	UT_ASSERT(request != NULL && request->component_count == active_target_count()
 			  && request->storage == NULL);
 	preopen_step = ++step;
 	*out_preopen = (RfPageSmgrPreopenV1 *)&preopen_object;
@@ -614,6 +625,43 @@ UT_TEST(test_side_only_plan_skips_page_authority_and_install)
 	UT_ASSERT(result.side_apply_complete);
 }
 
+UT_TEST(test_history_only_pages_never_reach_storage_or_mutation_authority)
+{
+	ClusterThreadRecoveryAuthorityV1 authority;
+	ClusterThreadRecoveryFabricApplyResultV1 result;
+	init_case(&authority);
+	for (int i = 0; i < target_count; i++)
+		targets[i].history_only = true;
+	UT_ASSERT_EQ(
+		cluster_thread_recovery_fabric_apply_v1(
+			(const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object, &authority, &result),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(result.page_target_count, 0);
+	UT_ASSERT_EQ(proof_step, 0);
+	UT_ASSERT_EQ(page_preflight_step, 0);
+	UT_ASSERT_EQ(preopen_step, 0);
+	UT_ASSERT_EQ(page_install_step, 0);
+	UT_ASSERT(result.side_apply_complete);
+}
+
+UT_TEST(test_mixed_history_pages_install_only_active_targets)
+{
+	for (int historical = 0; historical < 2; historical++) {
+		ClusterThreadRecoveryAuthorityV1 authority;
+		ClusterThreadRecoveryFabricApplyResultV1 result;
+		init_case(&authority);
+		targets[historical].history_only = true;
+		UT_ASSERT_EQ(
+			cluster_thread_recovery_fabric_apply_v1(
+				(const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object, &authority, &result),
+			RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(result.page_target_count, 1);
+		UT_ASSERT_EQ(result.page_write_count, 1);
+		UT_ASSERT_EQ(live_proofs + live_preflights + live_preopens, 0);
+		UT_ASSERT(result.side_apply_complete);
+	}
+}
+
 UT_TEST(test_retained_cut_mismatch_blocks_before_any_target_preflight)
 {
 	ClusterThreadRecoveryAuthorityV1 authority;
@@ -702,7 +750,7 @@ UT_TEST(test_space_owner_precedes_page_install_and_unwinds)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(12);
 	UT_RUN(test_space_owner_precedes_page_install_and_unwinds);
 	UT_RUN(test_error_at_every_owned_stage_releases_all_fabric_state);
 	UT_RUN(test_multi_source_fabric_preflights_every_origin_before_page_and_side);
@@ -713,6 +761,8 @@ main(void)
 	UT_RUN(test_side_preflight_failure_leaves_page_unmodified);
 	UT_RUN(test_side_only_plan_skips_page_authority_and_install);
 	UT_RUN(test_retained_cut_mismatch_blocks_before_any_target_preflight);
+	UT_RUN(test_history_only_pages_never_reach_storage_or_mutation_authority);
+	UT_RUN(test_mixed_history_pages_install_only_active_targets);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

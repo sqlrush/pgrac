@@ -1063,7 +1063,13 @@ read_source_capacity(BootstrapReadWork *work, const char *shared_root, const cha
 	if (anchor.backup_start != InvalidXLogRecPtr || anchor.backup_end != InvalidXLogRecPtr
 		|| anchor.backup_end_required)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
-	if (anchor.checkpoint_copy.redo != source->checkpoint_lower_lsn
+	if (source->checkpoint_lower_lsn == InvalidXLogRecPtr
+		|| anchor.checkpoint_copy.redo < source->checkpoint_lower_lsn
+		|| ((source->root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) != 0
+			&& anchor.checkpoint_copy.redo > source->validated_tail_lsn_exclusive)
+		|| (anchor.checkpoint_copy.redo != source->checkpoint_lower_lsn
+			&& ((source->root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) == 0
+				|| source->tail_tli != source->checkpoint_tli))
 		|| anchor.checkpoint_copy.ThisTimeLineID != source->checkpoint_tli)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 #define RECOVERY_MAX(field) required->field = Max(required->field, anchor.field)

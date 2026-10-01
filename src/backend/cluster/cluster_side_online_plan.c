@@ -40,6 +40,7 @@ struct RfSideOnlinePlanV1 {
 	Size memory_used;
 	uint32 participant_count;
 	RfContributorStreamCutV1 *physical_cuts;
+	XLogRecPtr *redo_starts;
 	XLogRecPtr *last_record_end;
 	bool *participant_seen;
 	RfSideOnlineOperationV1 *operations;
@@ -175,6 +176,8 @@ side_record_identity_validate(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPl
 		|| (cut->flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0
 		|| record->read_rec_ptr < cut->scan_begin_inclusive
 		|| record->end_rec_ptr > cut->scan_end_exclusive
+		|| (record->read_rec_ptr < plan->redo_starts[identity->participant_index]
+			&& record->end_rec_ptr > plan->redo_starts[identity->participant_index])
 		|| (plan->participant_seen[identity->participant_index]
 			&& record->read_rec_ptr < plan->last_record_end[identity->participant_index]))
 		return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
@@ -299,6 +302,12 @@ side_operation_space_count(const RfSideOnlineOperationV1 *op)
 {
 	return op->kind == RF_SIDE_ONLINE_OPERATION_SPACE ? 1
 		: op->kind == RF_SIDE_ONLINE_OPERATION_XACT ? op->xact.space_drop_count : 0;
+}
+
+static uint32
+side_operation_replay_space_count(const RfSideOnlineOperationV1 *op)
+{
+	return op->history_only ? 0 : side_operation_space_count(op);
 }
 
 /* A COMMIT can own several different locators. Each still points to this
@@ -561,10 +570,15 @@ rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request,
 			|| (!empty && cut->scan_begin_inclusive >= cut->scan_end_exclusive)
 			|| (i > 0 && request->physical_cuts[i - 1].failed_thread >= cut->failed_thread))
 			return RF_PAGE_PROOF_DETAIL_PARTICIPANT_MISSING;
+		if (request->redo_starts != NULL
+			&& (request->redo_starts[i] < cut->scan_begin_inclusive
+				|| request->redo_starts[i] > cut->scan_end_exclusive))
+			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 	}
 	arrays_size = (Size)request->participant_count
 				  * (sizeof(*plan->physical_cuts) + sizeof(*plan->last_record_end)
 					 + sizeof(*plan->participant_seen));
+	arrays_size += (Size)request->participant_count * sizeof(*plan->redo_starts);
 	if (sizeof(*plan) > budget - Min(budget, arrays_size))
 		return RF_PAGE_PROOF_DETAIL_CAPACITY;
 	plan = (RfSideOnlinePlanV1 *)side_alloc0(sizeof(*plan));
@@ -576,15 +590,21 @@ rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request,
 																  * sizeof(*plan->physical_cuts));
 	plan->last_record_end = (XLogRecPtr *)side_alloc0((Size)request->participant_count
 													  * sizeof(*plan->last_record_end));
+	plan->redo_starts
+		= (XLogRecPtr *)side_alloc0((Size)request->participant_count * sizeof(*plan->redo_starts));
 	plan->participant_seen
 		= (bool *)side_alloc0((Size)request->participant_count * sizeof(*plan->participant_seen));
 	if (plan->physical_cuts == NULL || plan->last_record_end == NULL
-		|| plan->participant_seen == NULL) {
+		|| plan->participant_seen == NULL || plan->redo_starts == NULL) {
 		rf_side_online_plan_destroy_v1(&plan);
 		return RF_PAGE_PROOF_DETAIL_OOM;
 	}
 	memcpy(plan->physical_cuts, request->physical_cuts,
 		   (Size)request->participant_count * sizeof(*plan->physical_cuts));
+	for (i = 0; i < request->participant_count; i++)
+		plan->redo_starts[i] = request->redo_starts != NULL
+								   ? request->redo_starts[i]
+								   : request->physical_cuts[i].scan_begin_inclusive;
 	plan->magic = RF_SIDE_ONLINE_PLAN_MAGIC;
 	plan->system_identifier = request->system_identifier;
 	memcpy(plan->storage_uuid, request->storage_uuid, 16);
@@ -719,6 +739,8 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 			return RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED;
 		candidate.identity = *identity;
 		candidate.route = record_plan->route;
+		candidate.history_only
+			= identity->record.end_rec_ptr <= plan->redo_starts[identity->participant_index];
 		if (!side_ensure_operation_capacity(plan))
 			return RF_PAGE_PROOF_DETAIL_CAPACITY;
 		plan->operations[plan->operation_count++] = candidate;
@@ -797,7 +819,7 @@ rf_side_online_plan_prepare_space_v1(const RfSideOnlinePlanV1 *plan,
 		|| memcmp(expected->storage_uuid, plan->storage_uuid, 16) != 0)
 		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 	for (uint32 i = 0; i < plan->operation_count; i++)
-		for (uint32 j = 0; j < side_operation_space_count(&plan->operations[i]); j++) {
+		for (uint32 j = 0; j < side_operation_replay_space_count(&plan->operations[i]); j++) {
 			ClusterSpaceIdentityKey key;
 			ClusterSpaceRecoveryInput input;
 
@@ -826,7 +848,7 @@ rf_side_online_plan_prepare_space_v1(const RfSideOnlinePlanV1 *plan,
 	for (uint32 i = 0; i < plan->operation_count; i++) {
 		const RfSideOnlineOperationV1 *op = &plan->operations[i];
 
-		for (uint32 j = 0; j < side_operation_space_count(op); j++) {
+		for (uint32 j = 0; j < side_operation_replay_space_count(op); j++) {
 			ClusterSpaceIdentityKey key;
 			ClusterSpaceRecoveryInput input;
 
@@ -887,7 +909,8 @@ rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
 		|| operation == NULL || operation->kind != RF_SIDE_XACT_COMMIT)
 		return false;
 	for (uint32 i = 0; i < plan->operation_count; i++)
-		if (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_XACT
+		if (!plan->operations[i].history_only
+			&& plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_XACT
 			&& memcmp(&plan->operations[i].xact, operation, sizeof(*operation)) == 0)
 			return true;
 	return false;
@@ -1216,7 +1239,7 @@ side_space_sources_seal(RfSideOnlinePlanV1 *plan)
 	RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH;
 
 	for (uint32 i = 0; i < plan->operation_count; i++) {
-		uint32 n = side_operation_space_count(&plan->operations[i]);
+		uint32 n = side_operation_replay_space_count(&plan->operations[i]);
 
 		if (n > UINT32_MAX - count)
 			return RF_PAGE_PROOF_DETAIL_CAPACITY;
@@ -1246,7 +1269,7 @@ side_space_sources_seal(RfSideOnlinePlanV1 *plan)
 		goto done;
 	}
 	for (uint32 i = 0; i < plan->operation_count; i++)
-		for (uint32 j = 0; j < side_operation_space_count(&plan->operations[i]); j++) {
+		for (uint32 j = 0; j < side_operation_replay_space_count(&plan->operations[i]); j++) {
 			SideSpaceSourceInput *entry = &entries[next++];
 
 			if (!side_operation_space_input(plan, &plan->operations[i], j, &entry->key,
@@ -1367,14 +1390,16 @@ rf_side_online_plan_origin_operation_count_v1(const RfSideOnlinePlanV1 *plan, ui
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed)
 		return UINT32_MAX;
 	if (source_thread == 0)
-		return plan->operation_count;
+		found = true;
 	for (uint32 i = 0; i < plan->participant_count; i++)
 		if (plan->physical_cuts[i].failed_thread == source_thread)
 			found = true;
 	if (!found)
 		return UINT32_MAX;
 	for (uint32 i = 0; i < plan->operation_count; i++)
-		if (plan->operations[i].identity.record.origin_thread == source_thread)
+		if (!plan->operations[i].history_only
+			&& (source_thread == 0
+				|| plan->operations[i].identity.record.origin_thread == source_thread))
 			count++;
 	return count;
 }
@@ -1391,6 +1416,8 @@ side_plan_apply_ops_valid(const RfSideOnlinePlanV1 *plan, const RfSideOnlineAppl
 	if (rf_side_online_plan_origin_operation_count_v1(plan, ops->source_thread) == UINT32_MAX)
 		return false;
 	for (i = 0; i < plan->operation_count; i++) {
+		if (plan->operations[i].history_only)
+			continue;
 		if (ops->source_thread != 0
 			&& plan->operations[i].identity.record.origin_thread != ops->source_thread)
 			continue;
@@ -1422,6 +1449,8 @@ side_plan_preflight_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApp
 		RfSideOnlineOperationV1 operation = plan->operations[i];
 		bool accepted;
 
+		if (operation.history_only)
+			continue;
 		if (ops->source_thread != 0
 			&& operation.identity.record.origin_thread != ops->source_thread)
 			continue;
@@ -1486,6 +1515,8 @@ side_plan_apply_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOp
 		RfSideOnlineOperationV1 operation = plan->operations[i];
 		bool applied;
 
+		if (operation.history_only)
+			continue;
 		if (ops->source_thread != 0
 			&& operation.identity.record.origin_thread != ops->source_thread)
 			continue;
@@ -1541,6 +1572,8 @@ rf_side_online_plan_destroy_v1(RfSideOnlinePlanV1 **plan_address)
 		side_free(plan->physical_cuts);
 	if (plan->last_record_end != NULL)
 		side_free(plan->last_record_end);
+	if (plan->redo_starts != NULL)
+		side_free(plan->redo_starts);
 	if (plan->participant_seen != NULL)
 		side_free(plan->participant_seen);
 	if (plan->operations != NULL)

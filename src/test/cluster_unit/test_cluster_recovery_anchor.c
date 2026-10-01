@@ -1427,6 +1427,7 @@ UT_TEST(test_v2_current_thread_state_matrix_preserves_other_fields)
 	record.identity = ref.identity;
 	record.checkpoint_lower_lsn = input.checkPointCopy.redo;
 	record.checkpoint_tli = input.checkPointCopy.ThisTimeLineID;
+	record.validated_tail_lsn_exclusive = input.checkPointCopy.redo + 8192;
 	input.minRecoveryPoint = 0;
 	input.minRecoveryPointTLI = 0;
 	for (int life = 1; life <= 5; ++life) {
@@ -1468,6 +1469,7 @@ UT_TEST(test_v2_current_thread_state_rejects_wrong_identity_or_crc)
 		record.identity = ref.identity;
 		record.checkpoint_lower_lsn = view.checkPointCopy.redo;
 		record.checkpoint_tli = view.checkPointCopy.ThisTimeLineID;
+		record.validated_tail_lsn_exclusive = view.checkPointCopy.redo + 8192;
 		record.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
 		if (fault == 0)
 			record.identity.origin_owner_incarnation++;
@@ -1485,6 +1487,48 @@ UT_TEST(test_v2_current_thread_state_rejects_wrong_identity_or_crc)
 														  fault == 7 ? NULL : &record, &view)
 				  != 0);
 		UT_ASSERT(v2_zero(&view, sizeof(view)));
+	}
+}
+
+UT_TEST(test_v2_retained_lower_preserves_native_checkpoint_and_bounded_identity)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		uint8 bytes[512];
+		ClusterRecoveryAnchorRefV2 ref;
+		ClusterControlRootSnapshot record = { 0 };
+		ControlFileData common, input, view;
+		v2_fixture(bytes, &ref);
+		v2_common(&common);
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_project(bytes, 512, &ref, &common, &input), 0);
+		record.identity = ref.identity;
+		record.checkpoint_lower_lsn = input.checkPointCopy.redo - 8;
+		record.checkpoint_tli = input.checkPointCopy.ThisTimeLineID;
+		record.tail_tli = record.checkpoint_tli;
+		record.root_flags = CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID;
+		record.validated_tail_lsn_exclusive = input.checkPointCopy.redo + 8192;
+		record.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+		if (fault == 1)
+			record.checkpoint_lower_lsn = 0;
+		if (fault == 2)
+			record.checkpoint_lower_lsn = input.checkPointCopy.redo + 1;
+		if (fault == 3)
+			record.validated_tail_lsn_exclusive = input.checkPointCopy.redo - 1;
+		if (fault == 4)
+			record.checkpoint_tli++;
+		if (fault == 5)
+			record.root_flags = 0;
+		if (fault == 6)
+			record.tail_tli++;
+		view = input;
+		if (fault == 0) {
+			UT_ASSERT_EQ(cluster_recovery_anchor_v2_thread_state(&ref, &record, &view), 0);
+			UT_ASSERT_EQ(view.checkPointCopy.redo, input.checkPointCopy.redo);
+			UT_ASSERT_EQ(view.checkPoint, input.checkPoint);
+		} else {
+			UT_ASSERT_EQ(cluster_recovery_anchor_v2_thread_state(&ref, &record, &view),
+						 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+			UT_ASSERT(v2_zero(&view, sizeof(view)));
+		}
 	}
 }
 
@@ -2000,7 +2044,7 @@ main(void)
 {
 	setup_shared_root();
 
-	UT_PLAN(35);
+	UT_PLAN(36);
 	UT_RUN(test_layout);
 	UT_RUN(test_write_read_roundtrip);
 	UT_RUN(test_classify);
@@ -2022,6 +2066,7 @@ main(void)
 	UT_RUN(test_v2_projection_field_ownership);
 	UT_RUN(test_v2_current_thread_state_matrix_preserves_other_fields);
 	UT_RUN(test_v2_current_thread_state_rejects_wrong_identity_or_crc);
+	UT_RUN(test_v2_retained_lower_preserves_native_checkpoint_and_bounded_identity);
 	UT_RUN(test_v2_projection_backup_and_state_refuse);
 	UT_RUN(test_v2_read_selected_object_only);
 	UT_RUN(test_v2_object_type_size_and_permissions);

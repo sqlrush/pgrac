@@ -66,7 +66,7 @@ static unsigned selected_source_count;
 ClusterControlRootResult
 cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 										const ClusterControlRootReadToken *token,
-										ClusterWalSourceRef *out)
+										ClusterWalSourceRef *out, XLogRecPtr *native_redo)
 {
 	bool inject = fault_origin == 0 || root->identity.origin_thread_id == fault_origin;
 	UT_ASSERT(token != NULL && plan_create_count == 0 && plan_feed_count == 0);
@@ -79,6 +79,7 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 	out->claim.max_config_generation = 9;
 	out->claim.claim_sha256[0] = root->identity.origin_thread_id;
 	out->timeline = root->checkpoint_tli;
+	*native_redo = 0x180;
 	if (inject && exact_source_fault == 9)
 		stale_origin = 2;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -206,11 +207,13 @@ cluster_thread_recovery_fabric_plan_create_v1(
 	UT_ASSERT((request->sources != NULL) == cluster_shared_config);
 	if (cluster_shared_config) {
 		UT_ASSERT_EQ(selected_source_count, expected_participants);
+		UT_ASSERT(request->redo_starts != NULL);
 		for (uint32 i = 0; i < expected_participants; i++) {
 			UT_ASSERT_EQ(request->sources[i].claim.identity.origin_thread_id, cut[i].failed_thread);
 			UT_ASSERT_EQ(request->sources[i].claim.claim_sha256[0], cut[i].failed_thread);
 			UT_ASSERT_EQ(request->sources[i].claim.database_incarnation, 42);
 			UT_ASSERT_EQ(request->sources[i].timeline, cut[i].timeline_id);
+			UT_ASSERT_EQ(request->redo_starts[i], 0x180);
 		}
 	}
 	if (expected_participants == 2) {

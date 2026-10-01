@@ -87,6 +87,7 @@ cluster_thread_recovery_fabric_scan_roots_v1(
 	ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
 	RfContributorStreamCutV1 cuts[RF_PAGE_STABLE_MAX_PARTICIPANTS];
 	ClusterWalSourceRef sources[RF_PAGE_STABLE_MAX_PARTICIPANTS];
+	XLogRecPtr redo_starts[RF_PAGE_STABLE_MAX_PARTICIPANTS];
 	RfPageProofDetailV1 detail;
 	uint64 database_incarnation = 0;
 	uint64 record_count = 0;
@@ -124,7 +125,8 @@ cluster_thread_recovery_fabric_scan_roots_v1(
 		cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
 		cuts[i].scan_begin_inclusive = root->checkpoint_lower_lsn;
 		cuts[i].scan_end_exclusive = root->validated_tail_lsn_exclusive;
-		if (cluster_control_root_recovery_source_v1(root, authority->root_token, &sources[i])
+		if (cluster_control_root_recovery_source_v1(root, authority->root_token, &sources[i],
+													&redo_starts[i])
 			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 		if (sources[i].claim.database_incarnation == 0
@@ -139,6 +141,7 @@ cluster_thread_recovery_fabric_scan_roots_v1(
 	memcpy(request.storage_uuid, authorities[0].duty->storage_uuid, 16);
 	request.physical_cuts = cuts;
 	request.sources = sources;
+	request.redo_starts = redo_starts;
 	request.participant_count = count;
 	request.retention_binding_cookie = (uint64)(uintptr_t)authorities[0].retention_pin;
 	request.space_active = space_active;

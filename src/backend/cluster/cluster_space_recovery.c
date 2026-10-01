@@ -354,8 +354,11 @@ cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *pla
 		RfSideOnlineOperationV1 op;
 		ClusterSpaceReservationChange change;
 
-		if (!rf_side_online_plan_operation_v1(side, i, &op)
-			|| (op.kind == RF_SIDE_ONLINE_OPERATION_XACT && op.xact.space_drop_count != 0))
+		if (!rf_side_online_plan_operation_v1(side, i, &op))
+			return false;
+		if (op.history_only)
+			continue;
+		if (op.kind == RF_SIDE_ONLINE_OPERATION_XACT && op.xact.space_drop_count != 0)
 			return false;
 		if (op.kind == RF_SIDE_ONLINE_OPERATION_SPACE
 			&& (op.identity.record.rmid != RM_SMGR_ID
@@ -452,7 +455,7 @@ cluster_space_recovery_preflight_operation_v1(void *arg, const RfSideOnlineOpera
 {
 	const ClusterSpaceRecoveryBatchV1 *batch = arg;
 
-	if (batch == NULL || !batch->preflight_complete || operation == NULL
+	if (batch == NULL || !batch->preflight_complete || operation == NULL || operation->history_only
 		|| operation->kind != RF_SIDE_ONLINE_OPERATION_SPACE || !space_sources_fresh(batch))
 		return false;
 	for (uint32 i = 0; i < batch->operation_count; i++) {
@@ -461,7 +464,7 @@ cluster_space_recovery_preflight_operation_v1(void *arg, const RfSideOnlineOpera
 		if (!rf_side_online_plan_operation_v1(batch->side, i, &expected))
 			return false;
 		if (memcmp(&operation->identity, &expected.identity, sizeof(expected.identity)) == 0)
-			return expected.kind == RF_SIDE_ONLINE_OPERATION_SPACE
+			return !expected.history_only && expected.kind == RF_SIDE_ONLINE_OPERATION_SPACE
 				   && operation->owned_payload_length == expected.owned_payload_length
 				   && operation->owned_payload != NULL && expected.owned_payload != NULL
 				   && memcmp(operation->owned_payload, expected.owned_payload,

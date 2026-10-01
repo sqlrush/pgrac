@@ -7887,6 +7887,53 @@ v2_retention_fixture(uint8 bytes[66048], ClusterControlRootIdentity *self,
 
 /* PGRAC: existing recovery owners use these public canonical readers, not
  * the own-writer checkpoint accessor. Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_runtime_v3_source_selects_native_redo_separately_from_retained_lower)
+{
+	uint8 bytes[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate;
+	ControlRootImage root;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken token;
+	ClusterWalSourceRef source;
+	XLogRecPtr native_redo, original_redo;
+	v2_retention_fixture(bytes, &self, &candidate);
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
+	original_redo = root.records[0].checkpoint_lower_lsn;
+	root.records[0].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	root.records[0].checkpoint_lower_lsn = original_redo - 8;
+	root.records[0].root_flags
+		|= CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+	root.records[0].tail_tli = root.records[0].checkpoint_tli;
+	root.records[0].tail_validation_kind = CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
+	root.records[0].validated_tail_lsn_exclusive = original_redo + 4096;
+	root.records[0].tail_last_record_lsn = original_redo + 128;
+	root.records[0].tail_last_record_crc32c = root.records[0].checkpoint_record_crc32c;
+	UT_ASSERT_EQ(cluster_control_root_v2_encode(&root), 0);
+	if (ut_current_failed)
+		return;
+	memcpy(bytes, root.bytes, sizeof(bytes));
+	runtime_fixture_version3(bytes);
+	cluster_node_id = 1;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(1, &self, &snapshot, &token), 0);
+	UT_ASSERT_EQ(cluster_control_root_recovery_source_v1(&snapshot, &token, &source, &native_redo),
+				 0);
+	UT_ASSERT_EQ(native_redo, original_redo);
+	UT_ASSERT_EQ(snapshot.checkpoint_lower_lsn, original_redo - 8);
+	UT_ASSERT(cluster_control_root_identity_equal(&source.claim.identity, &self));
+	UT_ASSERT_EQ(source.timeline, snapshot.checkpoint_tli);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	/* Selecting these exact input objects is not a sealed-WAL proof. This
+	 * read-only fixture has no physical WAL at the extended lower boundary. */
+	{
+		ClusterWalTailObservation observed;
+		UT_ASSERT(cluster_control_root_recovery_visit(&snapshot, &token, NULL, NULL, &observed)
+				  != 0);
+	}
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_runtime_v3_canonical_strong_reads_recovery_required_peer)
 {
 	uint8 bytes[66048];
@@ -11812,11 +11859,15 @@ UT_TEST(test_runtime_pending_checkpoint_promotes_without_claiming_recovery_done)
 		{
 			ClusterWalTailObservation observed;
 			ClusterWalSourceRef source = { 0 };
+			XLogRecPtr native_redo = InvalidXLogRecPtr;
 			uint8 claim_bytes[CLUSTER_WAL_CLAIM_V2_BYTES], claim_hash[32];
 			RecoveryVisitTest visit = { 0 };
 			UT_ASSERT_EQ(cluster_wal_claim_v2_encode(&op.claim, claim_bytes), 0);
 			sha256_bytes(claim_bytes, sizeof(claim_bytes), claim_hash);
-			UT_ASSERT_EQ(cluster_control_root_recovery_source_v1(&snapshot, &token, &source), 0);
+			UT_ASSERT_EQ(
+				cluster_control_root_recovery_source_v1(&snapshot, &token, &source, &native_redo),
+				0);
+			UT_ASSERT_EQ(native_redo, snapshot.checkpoint_lower_lsn);
 			UT_ASSERT(
 				cluster_control_root_identity_equal(&source.claim.identity, &op.claim.identity));
 			UT_ASSERT_EQ(source.claim.database_incarnation, op.claim.database_incarnation);
@@ -11905,17 +11956,24 @@ UT_TEST(test_exact_recovery_source_discards_stale_or_cancelled_input)
 			test_cf_release_confirmed = false;
 		{
 			ClusterWalSourceRef source, empty = { 0 };
+			XLogRecPtr native_redo = UINT64_MAX;
 			ClusterControlRootResult result;
 			memset(&source, 0xa5, sizeof(source));
-			result = cluster_control_root_recovery_source_v1(&snapshot, &token, &source);
+			result
+				= cluster_control_root_recovery_source_v1(&snapshot, &token, &source, &native_redo);
 			if (fault == 0 || fault == 4) {
 				UT_ASSERT(result != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 				UT_ASSERT_EQ(memcmp(&source, &empty, sizeof(source)), 0);
+				UT_ASSERT_EQ(native_redo, InvalidXLogRecPtr);
 			} else {
 				ClusterControlRootSnapshot unchanged = snapshot;
 				UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 				UT_ASSERT_EQ(cluster_control_root_recovery_source_v1(
-								 &snapshot, &token, (ClusterWalSourceRef *)&snapshot),
+								 &snapshot, &token, (ClusterWalSourceRef *)&snapshot, &native_redo),
+							 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+				UT_ASSERT_EQ(memcmp(&snapshot, &unchanged, sizeof(snapshot)), 0);
+				UT_ASSERT_EQ(cluster_control_root_recovery_source_v1(
+								 &snapshot, &token, &source, &snapshot.checkpoint_lower_lsn),
 							 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
 				UT_ASSERT_EQ(memcmp(&snapshot, &unchanged, sizeof(snapshot)), 0);
 			}
@@ -18776,7 +18834,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(344);
+	UT_PLAN(345);
 	UT_RUN(test_config_failed_acquire_retires_before_retry);
 	UT_RUN(test_config_poll_delivers_only_after_its_exact_release);
 	UT_RUN(test_config_poll_cut_or_prior_drift_discards_retained_observation);
@@ -19038,6 +19096,7 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_retention_exception_releases_owned_cf);
 	UT_RUN(test_v2_retention_exception_unconfirmed_release_is_fatal);
 	UT_RUN(test_runtime_v3_canonical_strong_reads_recovery_required_peer);
+	UT_RUN(test_runtime_v3_source_selects_native_redo_separately_from_retained_lower);
 	UT_RUN(test_runtime_v3_canonical_discovery_lookup_and_revalidate);
 	UT_RUN(test_runtime_v3_canonical_no_missing_claim_or_lockfree_fallback);
 	UT_RUN(test_runtime_v3_canonical_unconfirmed_release_is_fatal);

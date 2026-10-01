@@ -1673,7 +1673,8 @@ UT_TEST(test_online_plan_denies_terminal_missing_required_tt_commit)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
-UT_TEST(test_online_plan_accepts_exact_preceding_tt_commit_dependency)
+static void
+check_preceding_tt_commit_dependency(bool historical)
 {
 	FakeXactRecord prepare_fake;
 	FakeXactRecord undo_fake;
@@ -1689,6 +1690,7 @@ UT_TEST(test_online_plan_accepts_exact_preceding_tt_commit_dependency)
 	ApplyCapture capture;
 	XLogReaderState *prepare_record;
 	uint8 storage_uuid[16];
+	XLogRecPtr redo = historical ? 200 : 100;
 
 	reset_prepare_apply();
 	prepare_record = make_prepare(&prepare_fake, 802, true, false);
@@ -1719,6 +1721,7 @@ UT_TEST(test_online_plan_accepts_exact_preceding_tt_commit_dependency)
 	memcpy(request.storage_uuid, storage_uuid, sizeof(storage_uuid));
 	request.physical_cuts = &cut;
 	request.participant_count = 1;
+	request.redo_starts = &redo;
 	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &undo_plan, &undo_identity),
 				 RF_PAGE_PROOF_DETAIL_OK);
@@ -1736,9 +1739,15 @@ UT_TEST(test_online_plan_accepts_exact_preceding_tt_commit_dependency)
 	apply_ops.apply_undo = capture_apply_undo;
 	UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &apply_ops), RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT_EQ(capture.count, 1);
-	UT_ASSERT_EQ(capture.undo_count, 1);
+	UT_ASSERT_EQ(capture.undo_count, historical ? 0 : 1);
 	UT_ASSERT(capture.end_complete);
 	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_online_plan_accepts_exact_preceding_tt_commit_dependency)
+{
+	check_preceding_tt_commit_dependency(false);
+	check_preceding_tt_commit_dependency(true);
 }
 
 UT_TEST(test_online_plan_denies_abort_terminal_missing_tt_abort)
@@ -2055,7 +2064,7 @@ space_advance_fixture(void)
 }
 
 static RfSideOnlinePlanV1 *
-space_online_plan(uint64 end)
+space_online_plan_redo(uint64 end, const XLogRecPtr *redo)
 {
 	RfSideOnlinePlanV1 *plan = NULL;
 	RfContributorStreamCutV1 cut = {0};
@@ -2070,8 +2079,15 @@ space_online_plan(uint64 end)
 	memset(request.storage_uuid, 0x44, 16);
 	request.physical_cuts = &cut;
 	request.participant_count = 1;
+	request.redo_starts = redo;
 	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
 	return plan;
+}
+
+static RfSideOnlinePlanV1 *
+space_online_plan(uint64 end)
+{
+	return space_online_plan_redo(end, NULL);
 }
 
 static ClusterSpaceStructureChange
@@ -3416,6 +3432,99 @@ UT_TEST(test_multi_origin_side_selection_keeps_exact_source_and_original_plan)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+UT_TEST(test_retained_commit_drop_does_not_create_space_mutation_target)
+{
+	ClusterSpaceStructureChange drop = space_drop_fixture(16384);
+	XLogRecPtr redo = 200;
+	RfSideOnlinePlanV1 *plan = space_online_plan_redo(200, &redo);
+	FakeXactRecord fake;
+	RfSideOnlineOperationV1 op;
+	RfSideOnlineApplyOpsV1 ops = { 0 };
+	ApplyCapture capture = { 0 };
+	make_space_commit(&fake, &drop, 1);
+	UT_ASSERT_EQ(space_commit_feed(plan, &fake, 100), RF_PAGE_PROOF_DETAIL_OK);
+	/* History still belongs to the exact database; skipping redo is not
+	 * permission to accept an unrelated namespace. */
+	UT_ASSERT(!rf_side_online_plan_bind_database_v1(plan, 43));
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_space_target_count_v1(plan), 0);
+	UT_ASSERT_EQ(rf_side_online_plan_origin_operation_count_v1(plan, 3), 0);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+	UT_ASSERT(op.history_only);
+	UT_ASSERT_EQ(op.xact.space_drop_count, 1);
+	ops.arg = &capture;
+	ops.begin_protected_set = capture_begin;
+	ops.end_protected_set = capture_end;
+	UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &ops), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(capture.begin_count, 0);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_retained_side_history_is_validated_but_never_dispatched)
+{
+	for (unsigned mode = 0; mode < 4; mode++) {
+		RfSideOnlinePlanRequestV1 request = { 0 };
+		RfContributorStreamCutV1 cut = { 0 };
+		RfSideOnlinePlanV1 *plan = NULL;
+		RfSideOnlineOperationV1 op;
+		RfSideOnlineApplyOpsV1 ops = { 0 };
+		ApplyCapture capture = { 0 };
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		XLogRecPtr redo = mode == 0 ? 100 : mode == 1 ? 200 : mode == 2 ? 300 : 150;
+		request.system_identifier = UINT64_C(0x11223344);
+		memset(request.storage_uuid, 0x42, 16);
+		cut.failed_thread = 3;
+		cut.timeline_id = 7;
+		cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		cut.scan_begin_inclusive = 100;
+		cut.scan_end_exclusive = 300;
+		request.physical_cuts = &cut;
+		request.participant_count = 1;
+		request.redo_starts = &redo;
+		UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+		redo = 0;
+		for (unsigned i = 0; i < 2; i++) {
+			(void)make_commit(&fake, 800 + i, 901 + i, 123456, false);
+			identity = make_identity(&fake, request.storage_uuid);
+			set_identity_range(&fake, &identity, 100 + i * 100, 200 + i * 100);
+			record = make_record_plan(&fake);
+			UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+						 mode == 3 && i == 0 ? RF_PAGE_PROOF_DETAIL_SOURCE_GAP
+											 : RF_PAGE_PROOF_DETAIL_OK);
+			if (mode == 3)
+				break;
+		}
+		if (mode == 3) {
+			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+			rf_side_online_plan_destroy_v1(&plan);
+			continue;
+		}
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 2);
+		UT_ASSERT_EQ(rf_side_online_plan_origin_operation_count_v1(plan, 0), 2 - mode);
+		UT_ASSERT_EQ(rf_side_online_plan_origin_operation_count_v1(plan, 3), 2 - mode);
+		for (unsigned i = 0; i < 2; i++) {
+			UT_ASSERT(rf_side_online_plan_operation_v1(plan, i, &op));
+			UT_ASSERT_EQ(op.history_only, i < mode);
+		}
+		ops.arg = &capture;
+		ops.begin_protected_set = capture_begin;
+		ops.end_protected_set = capture_end;
+		if (mode < 2) {
+			ops.preflight_xact = accept_preflight;
+			ops.apply_xact = capture_apply;
+		}
+		UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &ops), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(capture.count, 2 - mode);
+		UT_ASSERT_EQ(capture.begin_count, mode < 2 ? 1 : 0);
+		UT_ASSERT_EQ(capture.end_count, capture.begin_count);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
 UT_TEST(test_side_plan_does_not_drop_unowned_page_components)
 {
 	const uint8 classes[]
@@ -3467,8 +3576,10 @@ UT_TEST(test_side_plan_does_not_drop_unowned_page_components)
 int
 main(void)
 {
-	UT_PLAN(49);
+	UT_PLAN(51);
 	UT_RUN(test_side_plan_does_not_drop_unowned_page_components);
+	UT_RUN(test_retained_side_history_is_validated_but_never_dispatched);
+	UT_RUN(test_retained_commit_drop_does_not_create_space_mutation_target);
 	UT_RUN(test_multi_origin_side_selection_keeps_exact_source_and_original_plan);
 	UT_RUN(test_reuse_owner_covers_retired_commit_only_after_new_physical_and_tt);
 	UT_RUN(test_init_owner_repairs_short_segment_before_header_and_commit);

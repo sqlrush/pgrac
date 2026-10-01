@@ -123,6 +123,8 @@ record_init(RecordFixture *fixture, uint64 before, uint64 result, bool image,
 static char empty_side_plan, source_pin;
 static unsigned source_visits;
 static int source_failure;
+/* Independent original checkpoints; no cross-thread LSN ordering. */
+static unsigned source_completed;
 
 ClusterThreadRecoveryAuthorityResultV1
 cluster_thread_recovery_authority_revalidate_nowait_v1(
@@ -156,7 +158,7 @@ cluster_thread_wal_reader_free(XLogReaderState *reader, void *private_state)
 ClusterControlRootResult
 cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 										const ClusterControlRootReadToken *token,
-										ClusterWalSourceRef *out)
+										ClusterWalSourceRef *out, XLogRecPtr *native_redo)
 {
 	memset(out, 0, sizeof(*out));
 	out->claim.identity = root->identity;
@@ -164,6 +166,7 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 	out->claim.max_config_generation = 5;
 	out->claim.claim_sha256[0] = root->identity.origin_thread_id;
 	out->timeline = root->checkpoint_tli;
+	*native_redo = source_completed & (1U << (root->identity.origin_thread_id - 1)) ? 0x200 : 0x100;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -345,7 +348,7 @@ UT_TEST(test_original_root_scanner_refuses_missing_source_or_version_dependency)
 }
 
 static RfPageOnlinePlanV1 *
-make_plan_to(uint32 participants, XLogRecPtr end)
+make_plan_redo(uint32 participants, XLogRecPtr end, const XLogRecPtr *redo)
 {
 	RfContributorStreamCutV1 cuts[3] = {{0}};
 	RfPageOnlinePlanRequestV1 request = {0};
@@ -363,8 +366,15 @@ make_plan_to(uint32 participants, XLogRecPtr end)
 	request.physical_cuts = cuts;
 	request.participant_count = participants;
 	request.retention_binding_cookie = 41;
+	request.redo_starts = redo;
 	UT_ASSERT_EQ(rf_page_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
 	return plan;
+}
+
+static RfPageOnlinePlanV1 *
+make_plan_to(uint32 participants, XLogRecPtr end)
+{
+	return make_plan_redo(participants, end, NULL);
 }
 
 static RfPageOnlinePlanV1 *
@@ -639,6 +649,111 @@ UT_TEST(test_retained_history_does_not_reopen_completed_other_page)
 	rf_page_online_plan_destroy_v1(&plan);
 }
 
+UT_TEST(test_retained_checkpoint_history_keeps_ancestors_without_new_page_duty)
+{
+	for (unsigned completed = 0; completed < 8; completed++) {
+		XLogRecPtr redo[3];
+		RfPageOnlinePlanV1 *plan;
+		RfPageOnlineTargetViewV1 view;
+		RecordFixture fixture;
+		for (int i = 0; i < 3; i++)
+			redo[i] = completed & (1U << i) ? 0x200 : 0x100;
+		plan = make_plan_redo(3, 0x200, redo);
+		/* The plan owns the selected boundaries, not these caller bytes. */
+		memset(redo, 0, sizeof(redo));
+		record_init(&fixture, 60, 7, false, BLCKSZ - 1, 0xc3);
+		UT_ASSERT_EQ(enqueue(plan, &fixture, 2), RF_PAGE_PROOF_DETAIL_OK);
+		record_init(&fixture, 900, 60, false, BLCKSZ - 2, 0xb2);
+		UT_ASSERT_EQ(enqueue(plan, &fixture, 1), RF_PAGE_PROOF_DETAIL_OK);
+		record_init(&fixture, 10, 900, true, 0, 0xa1);
+		UT_ASSERT_EQ(enqueue(plan, &fixture, 0), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		if (completed == 7) {
+			UT_ASSERT_EQ(rf_page_online_plan_target_count_v1(plan), 0);
+			rf_page_online_plan_destroy_v1(&plan);
+			continue;
+		}
+		UT_ASSERT(rf_page_online_plan_target_v1(plan, 0, &view));
+		UT_ASSERT_EQ(view.history_only, completed == 7);
+		UT_ASSERT_EQ(view.contributors->edge_count, 3);
+		UT_ASSERT_EQ((uint8)view.canonical_page[BLCKSZ - 3], 0xa1);
+		UT_ASSERT_EQ((uint8)view.canonical_page[BLCKSZ - 2], 0xb2);
+		UT_ASSERT_EQ((uint8)view.canonical_page[BLCKSZ - 1], 0xc3);
+		rf_page_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_unneeded_history_delta_does_not_require_a_new_data_base)
+{
+	/* Completed generations at the same address are not ancestors of a
+	 * recreated page. Neither an old delta nor an old FPI may reopen them. */
+	for (unsigned scenario = 0; scenario < 3; scenario++) {
+		XLogRecPtr redo = 0x200;
+		RfPageOnlinePlanV1 *plan = make_plan_redo(1, 0x300, &redo);
+		RecordFixture fixture;
+		RfPageOnlineTargetViewV1 view;
+		BlockNumber blockno = scenario == 0 ? 5 : 4;
+		uint8 incarnation = scenario == 0 ? 7 : 8;
+
+		record_init(&fixture, 60, 7, scenario == 2, BLCKSZ - 1, 0xc3);
+		UT_ASSERT_EQ(enqueue(plan, &fixture, 0), RF_PAGE_PROOF_DETAIL_OK);
+		record_init(&fixture, 10, 900, true, 0, 0xa1);
+		fixture.decoded.record.blocks[0].blkno = blockno;
+		memset(fixture.decoded.record.page_version_edge.entries[0].before.segment_incarnation,
+			   incarnation, 16);
+		memset(fixture.decoded.record.page_version_edge.entries[0].result_incarnation, incarnation,
+			   16);
+		fixture.reader.ReadRecPtr = fixture.decoded.record.lsn = 0x200;
+		fixture.reader.EndRecPtr = fixture.decoded.record.next_lsn = 0x300;
+		UT_ASSERT_EQ(enqueue(plan, &fixture, 0), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_page_online_plan_target_count_v1(plan), 1);
+		UT_ASSERT(rf_page_online_plan_target_v1(plan, 0, &view));
+		if (rf_page_online_plan_target_v1(plan, 0, &view)) {
+			UT_ASSERT_EQ(view.page_identity.blockno, blockno);
+			UT_ASSERT(!view.history_only);
+			UT_ASSERT_EQ(view.contributors->edge_count, 1);
+			UT_ASSERT_EQ(view.expected_result.segment_incarnation[0], incarnation);
+			UT_ASSERT_EQ((uint8)view.canonical_page[BLCKSZ - 1], 0xa1);
+		}
+		rf_page_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_native_checkpoint_cannot_split_a_retained_record)
+{
+	XLogRecPtr redo = 0x180;
+	RfPageOnlinePlanV1 *plan = make_plan_redo(1, 0x200, &redo);
+	RecordFixture fixture;
+	record_init(&fixture, 10, 900, true, 0, 0xa1);
+	UT_ASSERT_EQ(enqueue(plan, &fixture, 0), RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+	rf_page_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_actual_root_scan_binds_native_redo_to_complete_ancestry_input)
+{
+	for (source_completed = 0; source_completed < 8; source_completed++) {
+		ClusterThreadRecoveryFabricPlanV1 *fabric = NULL;
+		const RfPageOnlinePlanV1 *plan;
+		uint64 records;
+		RfPageOnlineTargetViewV1 view;
+		UT_ASSERT_EQ(scan_three_roots(&fabric, &records), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(records, 3);
+		plan = cluster_thread_recovery_fabric_page_plan_v1(fabric);
+		UT_ASSERT_EQ(rf_page_online_plan_target_count_v1(plan), source_completed == 7 ? 0 : 1);
+		if (source_completed != 7 && rf_page_online_plan_target_v1(plan, 0, &view)) {
+			UT_ASSERT_EQ(view.contributors->edge_count, 3);
+			UT_ASSERT(!view.history_only);
+			UT_ASSERT_EQ((uint8)view.canonical_page[BLCKSZ - 3], 0xa1);
+			UT_ASSERT_EQ((uint8)view.canonical_page[BLCKSZ - 2], 0xb2);
+			UT_ASSERT_EQ((uint8)view.canonical_page[BLCKSZ - 1], 0xc3);
+		}
+		cluster_thread_recovery_fabric_plan_destroy_v1(&fabric);
+	}
+	source_completed = 0;
+}
+
 UT_TEST(test_actual_fabric_refuses_routed_components_without_side_consumer)
 {
 	for (source_failure = 3; source_failure <= 5; source_failure++) {
@@ -657,7 +772,7 @@ UT_TEST(test_actual_fabric_refuses_routed_components_without_side_consumer)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(14);
 	UT_RUN(test_reverse_real_fpi_delta_chain_owns_reader_bytes);
 	UT_RUN(test_cycle_and_branch_do_not_expose_canonical_pages);
 	UT_RUN(test_corrupt_owned_fpi_is_refused_by_real_decoder);
@@ -668,6 +783,10 @@ main(void)
 	UT_RUN(test_checkpoint_prefix_keeps_complete_three_origin_ancestry);
 	UT_RUN(test_retained_history_does_not_reopen_completed_other_page);
 	UT_RUN(test_actual_fabric_refuses_routed_components_without_side_consumer);
+	UT_RUN(test_retained_checkpoint_history_keeps_ancestors_without_new_page_duty);
+	UT_RUN(test_native_checkpoint_cannot_split_a_retained_record);
+	UT_RUN(test_unneeded_history_delta_does_not_require_a_new_data_base);
+	UT_RUN(test_actual_root_scan_binds_native_redo_to_complete_ancestry_input);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

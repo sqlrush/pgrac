@@ -123,6 +123,7 @@ cluster_thread_recovery_fabric_plan_create_v1(
 	page_request.participant_count = request->participant_count;
 	page_request.retention_binding_cookie = request->retention_binding_cookie;
 	page_request.memory_budget = request->page_memory_budget;
+	page_request.redo_starts = request->redo_starts;
 	detail = rf_page_online_plan_create_v1(&page_request, &plan->page_plan);
 	if (detail == RF_PAGE_PROOF_DETAIL_OK && request->sources != NULL
 		&& !rf_page_online_plan_bind_sources_v1(plan->page_plan, request->sources,
@@ -138,6 +139,7 @@ cluster_thread_recovery_fabric_plan_create_v1(
 	side_request.physical_cuts = plan->physical_cuts;
 	side_request.participant_count = request->participant_count;
 	side_request.memory_budget = request->side_memory_budget;
+	side_request.redo_starts = request->redo_starts;
 	detail = rf_side_online_plan_create_v1(&side_request, &plan->side_plan);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK) {
 		fabric_plan_free(plan);

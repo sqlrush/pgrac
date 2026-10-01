@@ -9593,17 +9593,23 @@ recovery_wal_visit_root(RecoveryWalVisitWork *work)
 ClusterControlRootResult
 cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expected,
 										const ClusterControlRootReadToken *token,
-										ClusterWalSourceRef *out)
+										ClusterWalSourceRef *out, XLogRecPtr *native_redo)
 {
 	RecoveryWalVisitWork *work;
 	ClusterControlRootResult result;
 
 	if (history_ranges_overlap(expected, sizeof(*expected), out, sizeof(*out))
-		|| history_ranges_overlap(token, sizeof(*token), out, sizeof(*out)))
+		|| history_ranges_overlap(token, sizeof(*token), out, sizeof(*out))
+		|| history_ranges_overlap(expected, sizeof(*expected), native_redo, sizeof(*native_redo))
+		|| history_ranges_overlap(token, sizeof(*token), native_redo, sizeof(*native_redo))
+		|| history_ranges_overlap(out, sizeof(*out), native_redo, sizeof(*native_redo)))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
-	if (expected == NULL || token == NULL || out == NULL || expected->identity.origin_node_id < 0
+	if (native_redo != NULL)
+		*native_redo = InvalidXLogRecPtr;
+	if (expected == NULL || token == NULL || out == NULL || native_redo == NULL
+		|| expected->identity.origin_node_id < 0
 		|| expected->identity.origin_node_id >= CLUSTER_MAX_NODES
 		|| expected->identity.origin_thread_id != expected->identity.origin_node_id + 1
 		|| expected->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED)
@@ -9631,8 +9637,10 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *expect
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		*out = work->ref;
+		*native_redo = work->control.checkPointCopy.redo;
+	}
 	pfree(work);
 	return result;
 }

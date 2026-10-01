@@ -60,6 +60,7 @@ struct RfPageOnlinePlanV1 {
 	Size memory_used;
 	uint64 retention_binding_cookie;
 	RfContributorStreamCutV1 *physical_cuts;
+	XLogRecPtr *redo_starts;
 	ClusterWalSourceRef *sources;
 	XLogRecPtr *last_record_end;
 	bool *participant_seen;
@@ -163,6 +164,7 @@ target_create(RfPageOnlinePlanV1 *plan, const RfPageIdentityV1 *identity)
 		return NULL;
 	}
 	target->view.page_identity = *identity;
+	target->view.history_only = true;
 	for (i = 0; i < plan->participant_count; i++) {
 		target->cuts[i] = plan->physical_cuts[i];
 		target->cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE | RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY;
@@ -318,6 +320,8 @@ record_identity_validate(RfPageOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 
 	if ((cut->flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0
 		|| record->read_rec_ptr < cut->scan_begin_inclusive
 		|| record->end_rec_ptr > cut->scan_end_exclusive
+		|| (record->read_rec_ptr < plan->redo_starts[identity->participant_index]
+			&& record->end_rec_ptr > plan->redo_starts[identity->participant_index])
 		|| (plan->participant_seen[identity->participant_index]
 			&& record->read_rec_ptr < plan->last_record_end[identity->participant_index]))
 		return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
@@ -410,10 +414,15 @@ rf_page_online_plan_create_v1(const RfPageOnlinePlanRequestV1 *request,
 			|| (!empty && cut->scan_begin_inclusive >= cut->scan_end_exclusive)
 			|| (i > 0 && request->physical_cuts[i - 1].failed_thread >= cut->failed_thread))
 			return RF_PAGE_PROOF_DETAIL_PARTICIPANT_MISSING;
+		if (request->redo_starts != NULL
+			&& (request->redo_starts[i] < cut->scan_begin_inclusive
+				|| request->redo_starts[i] > cut->scan_end_exclusive))
+			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 	}
 	arrays_size = (Size)request->participant_count
 				  * (sizeof(*plan->physical_cuts) + sizeof(*plan->last_record_end)
 					 + sizeof(*plan->participant_seen));
+	arrays_size += (Size)request->participant_count * sizeof(*plan->redo_starts);
 	if (sizeof(*plan) > budget - Min(budget, arrays_size))
 		return RF_PAGE_PROOF_DETAIL_CAPACITY;
 	plan = (RfPageOnlinePlanV1 *)online_alloc0(sizeof(*plan));
@@ -429,15 +438,21 @@ rf_page_online_plan_create_v1(const RfPageOnlinePlanRequestV1 *request,
 																	* sizeof(*plan->physical_cuts));
 	plan->last_record_end = (XLogRecPtr *)online_alloc0((Size)request->participant_count
 														* sizeof(*plan->last_record_end));
+	plan->redo_starts = (XLogRecPtr *)online_alloc0((Size)request->participant_count
+													* sizeof(*plan->redo_starts));
 	plan->participant_seen
 		= (bool *)online_alloc0((Size)request->participant_count * sizeof(*plan->participant_seen));
 	if (plan->physical_cuts == NULL || plan->last_record_end == NULL
-		|| plan->participant_seen == NULL) {
+		|| plan->participant_seen == NULL || plan->redo_starts == NULL) {
 		rf_page_online_plan_destroy_v1(&plan);
 		return RF_PAGE_PROOF_DETAIL_OOM;
 	}
 	memcpy(plan->physical_cuts, request->physical_cuts,
 		   (Size)request->participant_count * sizeof(*plan->physical_cuts));
+	for (i = 0; i < request->participant_count; i++)
+		plan->redo_starts[i] = request->redo_starts != NULL
+								   ? request->redo_starts[i]
+								   : request->physical_cuts[i].scan_begin_inclusive;
 	plan->magic = RF_PAGE_ONLINE_PLAN_MAGIC;
 	plan->system_identifier = request->system_identifier;
 	memcpy(plan->storage_uuid, request->storage_uuid, 16);
@@ -614,6 +629,8 @@ apply_ordered_record(RfPageOnlinePlanV1 *plan,
 			item->new_target = false;
 		}
 		target->edges[target->edge_count++] = item->edge;
+		if (identity->record.end_rec_ptr > plan->redo_starts[identity->participant_index])
+			target->view.history_only = false;
 		target->view.expected_result.segment_incarnation[0] = 0;
 		memcpy(target->view.expected_result.segment_incarnation, item->edge.edge.result_incarnation,
 			   16);
@@ -865,6 +882,42 @@ drain_queued_records(RfPageOnlinePlanV1 *plan)
 		if (empty != !plan->participant_seen[i]
 			|| (!empty && plan->last_record_end[i] != plan->physical_cuts[i].scan_end_exclusive))
 			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+	}
+	/* The closed input, not arrival order, decides which retained history
+	 * needs a DATA base. Keep every ancestor/successor of an active page
+	 * incarnation; a completed generation at a reused address is unrelated.
+	 * An unrelated completed page may have only a delta in this retained
+	 * interval; it must not become a new reconstruction or write duty. */
+	for (RfPageQueuedRecordV1 *record = plan->queue_head; record != NULL; record = record->next) {
+		uint32 kept = 0;
+		if (record->identity.record.end_rec_ptr
+			> plan->redo_starts[record->identity.participant_index])
+			continue;
+		for (uint32 c = 0; c < record->plan.component_count; c++) {
+			const RfDetachedComponentPlanV1 *component = &record->plan.components[c];
+			bool needed = component->owner != RF_DETACHED_COMPONENT_PAGE_CODEC;
+			for (const RfPageQueuedRecordV1 *active = plan->queue_head; !needed && active != NULL;
+				 active = active->next) {
+				if (active->identity.record.end_rec_ptr
+					<= plan->redo_starts[active->identity.participant_index])
+					continue;
+				for (uint32 a = 0; a < active->plan.component_count; a++) {
+					const RfDetachedComponentPlanV1 *other = &active->plan.components[a];
+					if (other->owner == RF_DETACHED_COMPONENT_PAGE_CODEC
+						&& memcmp(component->result.segment_incarnation,
+								  other->result.segment_incarnation, 16)
+							   == 0
+						&& same_block(&record->reader.record->blocks[component->block_id],
+									  &active->reader.record->blocks[other->block_id])) {
+						needed = true;
+						break;
+					}
+				}
+			}
+			if (needed)
+				record->plan.components[kept++] = *component;
+		}
+		record->plan.component_count = kept;
 	}
 	memset(plan->participant_seen, 0, plan->participant_count * sizeof(*plan->participant_seen));
 	memset(plan->last_record_end, 0, plan->participant_count * sizeof(*plan->last_record_end));
@@ -1126,6 +1179,8 @@ rf_page_online_plan_destroy_v1(RfPageOnlinePlanV1 **plan_pointer)
 		online_free(plan->participant_seen);
 	if (plan->last_record_end != NULL)
 		online_free(plan->last_record_end);
+	if (plan->redo_starts != NULL)
+		online_free(plan->redo_starts);
 	if (plan->physical_cuts != NULL)
 		online_free(plan->physical_cuts);
 	if (plan->sources != NULL)

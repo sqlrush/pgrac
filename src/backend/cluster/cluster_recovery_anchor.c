@@ -109,6 +109,8 @@ anchor_v2_put(uint8 *bytes, size_t offset, uint64 value, size_t width)
 static bool anchor_v2_ref_valid(const ClusterRecoveryAnchorRefV2 *ref);
 
 /* PGRAC: a reopened thread can still select its previous clean checkpoint.
+ * A retained lower may precede native redo only inside a validated same-TLI
+ * tail. Older checkpoint-only OPEN inputs retain their equal-bound meaning.
  * Only the exact root lifecycle says whether that thread is closed now.
  * Author: SqlRush <sqlrush@gmail.com>
  */
@@ -129,7 +131,13 @@ cluster_recovery_anchor_v2_thread_state(const ClusterRecoveryAnchorRefV2 *ref,
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (memcmp(&ref->identity, &record->identity, sizeof(ref->identity)) != 0
 		|| input.system_identifier != ref->identity.system_identifier
-		|| input.checkPointCopy.redo != record->checkpoint_lower_lsn
+		|| record->checkpoint_lower_lsn == InvalidXLogRecPtr
+		|| input.checkPointCopy.redo < record->checkpoint_lower_lsn
+		|| ((record->root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) != 0
+			&& input.checkPointCopy.redo > record->validated_tail_lsn_exclusive)
+		|| (input.checkPointCopy.redo != record->checkpoint_lower_lsn
+			&& ((record->root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) == 0
+				|| record->tail_tli != record->checkpoint_tli))
 		|| input.checkPointCopy.ThisTimeLineID != record->checkpoint_tli)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	INIT_CRC32C(crc);
