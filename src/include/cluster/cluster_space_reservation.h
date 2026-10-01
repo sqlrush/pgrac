@@ -123,5 +123,11 @@ extern bool cluster_space_recovery_prepare(const ClusterSpaceRecoveryInput *inpu
 /* Heap scratch used by preparation, or zero for an unrepresentable size. */
 extern size_t cluster_space_recovery_scratch_bytes(uint32 count);
 
+/* Validate and order only the complete retained source chain. No target is
+ * read or certified, no page image or mutation permission is returned. The
+ * same chain checks are also mandatory in prepare with the real target. */
+extern bool cluster_space_recovery_order(const ClusterSpaceRecoveryInput *inputs, uint32 count,
+										 const ClusterSpaceIdentityKey *expected, uint32 *order);
+
 #endif
 #endif

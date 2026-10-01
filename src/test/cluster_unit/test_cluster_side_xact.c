@@ -2450,6 +2450,81 @@ UT_TEST(test_space_plan_structural_pair_and_standalone_tombstone)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+UT_TEST(test_space_seal_rejects_incomplete_source_chains_before_target_io)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		ClusterSpaceReservationChange c = space_advance_fixture();
+		RfSideOnlinePlanV1 *plan = space_online_plan(300);
+		uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
+
+		UT_ASSERT(cluster_space_reservation_wal_encode(&c, wal, sizeof(wal)));
+		UT_ASSERT_EQ(
+			space_online_feed(plan, XLOG_SMGR_SPACE_RESERVATION, wal, sizeof(wal), 100, false),
+			RF_PAGE_PROOF_DETAIL_OK);
+		c.before = c.result;
+		c.before_token = c.result_token;
+		c.result_token = 60;
+		if (fault == 0)
+			c.before_token = 900;
+		if (fault == 1)
+			c.before_token = 100;
+		if (fault == 2)
+			c.before.next_block++;
+		if (fault == 3)
+			c.before.identity.incarnation[0]++;
+		c.result = c.before;
+		c.first_block = c.before.next_block;
+		c.result.next_block += c.granted;
+		UT_ASSERT(cluster_space_reservation_wal_encode(&c, wal, sizeof(wal)));
+		UT_ASSERT_EQ(
+			space_online_feed(plan, XLOG_SMGR_SPACE_RESERVATION, wal, sizeof(wal), 200, false),
+			RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH);
+		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 0);
+		UT_ASSERT_EQ(rf_side_online_plan_space_target_count_v1(plan), UINT32_MAX);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_space_seal_enumerates_every_unique_commit_and_smgr_target)
+{
+	ClusterSpaceReservationChange c = space_advance_fixture();
+	ClusterSpaceStructureChange drops[2] = { space_drop_fixture(16384), space_drop_fixture(16385) };
+	RfSideOnlinePlanV1 *plan = space_online_plan(400);
+	uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
+	FakeXactRecord fake;
+	ClusterSpaceIdentityKey key, saved;
+
+	UT_ASSERT_EQ(rf_side_online_plan_space_target_count_v1(plan), UINT32_MAX);
+	c.before.identity.key.locator.relNumber = c.result.identity.key.locator.relNumber = 16385;
+	UT_ASSERT(cluster_space_reservation_wal_encode(&c, wal, sizeof(wal)));
+	UT_ASSERT_EQ(space_online_feed(plan, XLOG_SMGR_SPACE_RESERVATION, wal, sizeof(wal), 100, false),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	make_space_commit(&fake, drops, 2);
+	UT_ASSERT_EQ(space_commit_feed(plan, &fake, 200), RF_PAGE_PROOF_DETAIL_OK);
+	c.before.identity.key.locator.relNumber = c.result.identity.key.locator.relNumber = 16383;
+	UT_ASSERT(cluster_space_reservation_wal_encode(&c, wal, sizeof(wal)));
+	UT_ASSERT_EQ(space_online_feed(plan, XLOG_SMGR_SPACE_RESERVATION, wal, sizeof(wal), 300, false),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_space_target_count_v1(plan), 3);
+	UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 3);
+	for (uint32 i = 0; i < 3; i++) {
+		memset(&key, 0, sizeof(key));
+		UT_ASSERT(rf_side_online_plan_space_target_v1(plan, i, &key));
+		UT_ASSERT_EQ(key.locator.relNumber, 16383 + i);
+		UT_ASSERT_EQ(key.system_identifier, c.result.identity.key.system_identifier);
+		UT_ASSERT_EQ(key.database_incarnation, 42);
+		UT_ASSERT(memcmp(key.storage_uuid, c.result.identity.key.storage_uuid, 16) == 0);
+	}
+	saved = key;
+	UT_ASSERT(!rf_side_online_plan_space_target_v1(plan, 3, &key));
+	UT_ASSERT(memcmp(&key, &saved, sizeof(key)) == 0);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
 UT_TEST(test_space_plan_rejects_unbound_native_shapes)
 {
 	for (int variant = 0; variant < 5; variant++) {
@@ -3343,7 +3418,7 @@ UT_TEST(test_multi_origin_side_selection_keeps_exact_source_and_original_plan)
 int
 main(void)
 {
-	UT_PLAN(46);
+	UT_PLAN(48);
 	UT_RUN(test_multi_origin_side_selection_keeps_exact_source_and_original_plan);
 	UT_RUN(test_reuse_owner_covers_retired_commit_only_after_new_physical_and_tt);
 	UT_RUN(test_init_owner_repairs_short_segment_before_header_and_commit);
@@ -3386,6 +3461,8 @@ main(void)
 	UT_RUN(test_space_plan_owns_exact_chain_and_requires_observed_namespace);
 	UT_RUN(test_space_plan_rejects_unbound_native_shapes);
 	UT_RUN(test_space_plan_structural_pair_and_standalone_tombstone);
+	UT_RUN(test_space_seal_rejects_incomplete_source_chains_before_target_io);
+	UT_RUN(test_space_seal_enumerates_every_unique_commit_and_smgr_target);
 	UT_RUN(test_space_commit_owned_multiple_targets_close_exact_source_chains);
 	UT_RUN(test_space_commit_rejects_unowned_duplicate_or_malformed_drop_inputs);
 	UT_RUN(test_space_commit_retains_all_native_side_effects_and_refuses_tt_only_owner);

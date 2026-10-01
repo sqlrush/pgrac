@@ -498,11 +498,11 @@ recovery_reservation_member(const ClusterSpaceReservation *target, uint64 target
 	return target_token == token && (token == 0 || reservation_equal(target, state));
 }
 
-bool
-cluster_space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs,
-							   uint32 count, const ClusterSpaceIdentityKey *expected,
-							   const void *identity_page, const void *reservation_page,
-							   uint32 *order, ClusterSpaceRecoveryImage *out)
+static bool
+space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
+					   const ClusterSpaceIdentityKey *expected, const void *identity_page,
+					   const void *reservation_page, uint32 *order, ClusterSpaceRecoveryImage *out,
+					   bool check_target)
 {
 	SpaceRecoveryNode *nodes = NULL;
 	SpaceRecoveryIndex *before = NULL, *result = NULL;
@@ -512,18 +512,20 @@ cluster_space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs,
 	ClusterSpaceReservation target_res = {0}, current_res;
 	uint64 target_id_token = 0, target_res_token = 0, id_token, res_token;
 	uint32 head = UINT32_MAX, cursor;
-	bool id_member, res_member, ok = false;
+	bool id_member, res_member, has_structural = false, ok = false;
 
-	if (inputs == NULL || count == 0 || expected == NULL || identity_page == NULL
-		|| reservation_page == NULL || order == NULL || out == NULL
+	if (inputs == NULL || count == 0 || expected == NULL || order == NULL
+		|| (check_target && (identity_page == NULL || reservation_page == NULL || out == NULL))
 		|| cluster_space_recovery_scratch_bytes(count) == 0)
 		return false;
-	if ((!all_zero(identity_page, BLCKSZ)
-		 && !cluster_space_identity_page_decode(identity_page, BLCKSZ, SPACE_FORKNUM, 0,
-			 expected, &target_id, &target_id_token))
-		|| (!all_zero(reservation_page, BLCKSZ)
-			&& !cluster_space_reservation_page_decode(reservation_page, BLCKSZ, SPACE_FORKNUM, 1,
-				expected, &target_res, &target_res_token)))
+	if (check_target
+		&& ((!all_zero(identity_page, BLCKSZ)
+			 && !cluster_space_identity_page_decode(identity_page, BLCKSZ, SPACE_FORKNUM, 0,
+													expected, &target_id, &target_id_token))
+			|| (!all_zero(reservation_page, BLCKSZ)
+				&& !cluster_space_reservation_page_decode(reservation_page, BLCKSZ, SPACE_FORKNUM,
+														  1, expected, &target_res,
+														  &target_res_token))))
 		return false;
 
 	/* Bounded by the caller's closed-input memory budget; malloc is shared by
@@ -544,6 +546,7 @@ cluster_space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs,
 				&nodes[i].change))
 				goto done;
 			nodes[i].structural = true;
+			has_structural = true;
 		} else if (inputs[i].length != CLUSTER_SPACE_RESERVATION_WAL_BYTES
 			|| !cluster_space_reservation_wal_decode(inputs[i].data, inputs[i].length, change)
 			|| change->action != CLUSTER_SPACE_RESERVATION_ADVANCE)
@@ -609,12 +612,20 @@ cluster_space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs,
 			id_token = id->result_token;
 			prepared.source_index[0] = ordered[i];
 		}
-		if (id_token == 0 || !recovery_identity_equal(&current_id, &change->result.identity))
+		if (((check_target || has_structural) && id_token == 0)
+			|| !recovery_identity_equal(&current_id, &change->result.identity))
 			goto done;
 		current_res = change->result;
 		res_token = change->result_token;
 		id_member |= recovery_identity_member(&target_id, target_id_token, &current_id, id_token);
 		res_member |= recovery_reservation_member(&target_res, target_res_token, &current_res, res_token);
+	}
+	/* Source-only ordering has no identity-page token in an ADVANCE-only
+	 * cut. Never invent one or export the private source state as DATA. */
+	if (!check_target) {
+		memcpy(order, ordered, (size_t)count * sizeof(*order));
+		ok = true;
+		goto done;
 	}
 	if (!id_member || !res_member)
 		goto done;
@@ -642,5 +653,22 @@ done:
 	free(before);
 	free(nodes);
 	return ok;
+}
+
+bool
+cluster_space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
+							   const ClusterSpaceIdentityKey *expected, const void *identity_page,
+							   const void *reservation_page, uint32 *order,
+							   ClusterSpaceRecoveryImage *out)
+{
+	return space_recovery_prepare(inputs, count, expected, identity_page, reservation_page, order,
+								  out, true);
+}
+
+bool
+cluster_space_recovery_order(const ClusterSpaceRecoveryInput *inputs, uint32 count,
+							 const ClusterSpaceIdentityKey *expected, uint32 *order)
+{
+	return space_recovery_prepare(inputs, count, expected, NULL, NULL, order, NULL, false);
 }
 #endif

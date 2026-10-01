@@ -608,10 +608,51 @@ UT_TEST(test_recovery_requires_both_typed_before_chains)
 		f.pages[1][0].data, f.pages[1][1].data, order, &out));
 }
 
+UT_TEST(test_source_order_never_needs_or_certifies_target_pages)
+{
+	RecoveryFixture f;
+	uint32 order[5] = { 99, 99, 99, 99, 99 };
+	const uint32 expected_order[5] = { 4, 2, 0, 3, 1 };
+
+	recovery_fixture(&f);
+	UT_ASSERT(cluster_space_recovery_order(f.input, 5, &f.changes[0].result.identity.key, order));
+	UT_ASSERT(memcmp(order, expected_order, sizeof(order)) == 0);
+	/* An ADVANCE-only cut never supplies an identity-page token. */
+	order[0] = 99;
+	UT_ASSERT(
+		cluster_space_recovery_order(&f.input[2], 1, &f.changes[0].result.identity.key, order));
+	UT_ASSERT_EQ(order[0], 0);
+}
+
+UT_TEST(test_source_order_refuses_missing_or_inconsistent_chain_atomically)
+{
+	RecoveryFixture f;
+	uint32 order[5] = { 99, 99, 99, 99, 99 }, saved[5];
+	ClusterSpaceStructureChange wrong;
+	ClusterSpaceRecoveryInput missing[4];
+
+	recovery_fixture(&f);
+	memcpy(saved, order, sizeof(order));
+	missing[0] = f.input[0];
+	missing[1] = f.input[1];
+	missing[2] = f.input[3];
+	missing[3] = f.input[4];
+	UT_ASSERT(!cluster_space_recovery_order(missing, 4, &f.changes[0].result.identity.key, order));
+	UT_ASSERT(memcmp(order, saved, sizeof(order)) == 0);
+	wrong.identity = f.identities[2];
+	wrong.reservation = f.changes[2];
+	wrong.identity.before_token = 777;
+	UT_ASSERT(cluster_space_structure_wal_encode(&wrong, f.wal[2], sizeof(f.wal[2])));
+	UT_ASSERT(!cluster_space_recovery_order(f.input, 5, &f.changes[0].result.identity.key, order));
+	UT_ASSERT(memcmp(order, saved, sizeof(order)) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(17);
+	UT_RUN(test_source_order_never_needs_or_certifies_target_pages);
+	UT_RUN(test_source_order_refuses_missing_or_inconsistent_chain_atomically);
 	UT_RUN(test_literal_unaligned_payload_and_wal);
 	UT_RUN(test_crc_reserved_namespace_and_refusal_atomicity);
 	UT_RUN(test_exact_page_class_and_header);

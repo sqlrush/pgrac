@@ -138,6 +138,13 @@ extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_header_v1(
 	const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 segment_id,
 	const char *base, RfSideUndoHeaderImageV1 *out);
 extern uint32 rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan);
+/* Complete sorted unique namespace/locator set for typed SPACE, including
+ * each original COMMIT-DROP participant. Sealing checks every source chain;
+ * enumeration grants no target, lifecycle or durability authority.
+ * UINT32_MAX denotes an invalid/unsealed plan. */
+extern uint32 rf_side_online_plan_space_target_count_v1(const RfSideOnlinePlanV1 *plan);
+extern bool rf_side_online_plan_space_target_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+												ClusterSpaceIdentityKey *out);
 /* UINT32_MAX denotes an invalid plan or absent source; zero is a proven
  * empty projection of a source that belongs to this sealed plan. */
 extern uint32 rf_side_online_plan_origin_operation_count_v1(const RfSideOnlinePlanV1 *plan,

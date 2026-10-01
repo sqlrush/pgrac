@@ -48,6 +48,8 @@ struct RfSideOnlinePlanV1 {
 	uint8 *owned_payload;
 	uint32 owned_payload_bytes;
 	uint32 owned_payload_capacity;
+	ClusterSpaceIdentityKey *space_targets;
+	uint32 space_target_count;
 };
 
 static bool
@@ -1162,22 +1164,115 @@ rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan,
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
+typedef struct SideSpaceSourceInput {
+	ClusterSpaceIdentityKey key;
+	ClusterSpaceRecoveryInput input;
+} SideSpaceSourceInput;
+
+static int
+side_space_input_compare(const void *a, const void *b)
+{
+	const RelFileLocator *left = &((const SideSpaceSourceInput *)a)->key.locator;
+	const RelFileLocator *right = &((const SideSpaceSourceInput *)b)->key.locator;
+
+	if (left->spcOid != right->spcOid)
+		return left->spcOid < right->spcOid ? -1 : 1;
+	if (left->dbOid != right->dbOid)
+		return left->dbOid < right->dbOid ? -1 : 1;
+	return left->relNumber < right->relNumber ? -1 : left->relNumber > right->relNumber ? 1 : 0;
+}
+
+static RfPageProofDetailV1
+side_space_sources_seal(RfSideOnlinePlanV1 *plan)
+{
+	SideSpaceSourceInput *entries = NULL;
+	ClusterSpaceRecoveryInput *inputs = NULL;
+	ClusterSpaceIdentityKey *targets = NULL;
+	uint32 *order = NULL;
+	uint32 count = 0, next = 0, target_count = 0;
+	Size bytes, retained;
+	size_t scratch;
+	RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH;
+
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		uint32 n = side_operation_space_count(&plan->operations[i]);
+
+		if (n > UINT32_MAX - count)
+			return RF_PAGE_PROOF_DETAIL_CAPACITY;
+		count += n;
+	}
+	if (count == 0)
+		return RF_PAGE_PROOF_DETAIL_OK;
+	if (plan->database_incarnation == 0)
+		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+	if (count > plan->memory_budget
+					/ (sizeof(*entries) + sizeof(*inputs) + sizeof(*targets) + sizeof(*order)))
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	bytes = (Size)count * (sizeof(*entries) + sizeof(*inputs) + sizeof(*targets) + sizeof(*order));
+	retained = (Size)count * sizeof(*targets);
+	scratch = cluster_space_recovery_scratch_bytes(count);
+	if (scratch == 0 || scratch > SIZE_MAX - bytes)
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	bytes += scratch;
+	if (bytes > plan->memory_budget || plan->memory_used > plan->memory_budget - bytes)
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	entries = side_alloc0((Size)count * sizeof(*entries));
+	inputs = side_alloc0((Size)count * sizeof(*inputs));
+	targets = side_alloc0(retained);
+	order = side_alloc0((Size)count * sizeof(*order));
+	if (entries == NULL || inputs == NULL || targets == NULL || order == NULL) {
+		detail = RF_PAGE_PROOF_DETAIL_OOM;
+		goto done;
+	}
+	for (uint32 i = 0; i < plan->operation_count; i++)
+		for (uint32 j = 0; j < side_operation_space_count(&plan->operations[i]); j++) {
+			SideSpaceSourceInput *entry = &entries[next++];
+
+			if (!side_operation_space_input(plan, &plan->operations[i], j, &entry->key,
+											&entry->input)
+				|| entry->key.database_incarnation != plan->database_incarnation) {
+				detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+				goto done;
+			}
+		}
+	qsort(entries, count, sizeof(*entries), side_space_input_compare);
+	for (uint32 first = 0; first < count;) {
+		uint32 end = first + 1;
+
+		while (end < count && side_space_input_compare(&entries[first], &entries[end]) == 0)
+			end++;
+		for (uint32 i = first; i < end; i++)
+			inputs[i - first] = entries[i].input;
+		if (!cluster_space_recovery_order(inputs, end - first, &entries[first].key, order))
+			goto done;
+		targets[target_count++] = entries[first].key;
+		first = end;
+	}
+	plan->space_targets = targets;
+	plan->space_target_count = target_count;
+	plan->memory_used += retained;
+	targets = NULL;
+	detail = RF_PAGE_PROOF_DETAIL_OK;
+done:
+	if (order != NULL)
+		side_free(order);
+	if (targets != NULL)
+		side_free(targets);
+	if (inputs != NULL)
+		side_free(inputs);
+	if (entries != NULL)
+		side_free(entries);
+	return detail;
+}
+
 RfPageProofDetailV1
 rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
 {
 	uint32 i;
+	RfPageProofDetailV1 detail;
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || plan->sealed)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
-	for (i = 0; i < plan->operation_count; i++)
-		for (uint32 j = 0; j < side_operation_space_count(&plan->operations[i]); j++) {
-			ClusterSpaceIdentityKey key;
-			ClusterSpaceRecoveryInput input;
-
-			if (plan->database_incarnation == 0
-				|| !side_operation_space_input(plan, &plan->operations[i], j, &key, &input))
-				return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
-		}
 	for (i = 0; i < plan->participant_count; i++) {
 		const RfContributorStreamCutV1 *cut = &plan->physical_cuts[i];
 		bool empty = (cut->flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0;
@@ -1188,6 +1283,9 @@ rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
 					|| plan->last_record_end[i] != cut->scan_end_exclusive)))
 			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 	}
+	detail = side_space_sources_seal(plan);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		return detail;
 	plan->sealed = true;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
@@ -1198,6 +1296,25 @@ rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan)
 	return plan != NULL && plan->magic == RF_SIDE_ONLINE_PLAN_MAGIC && plan->sealed
 			   ? plan->operation_count
 			   : 0;
+}
+
+uint32
+rf_side_online_plan_space_target_count_v1(const RfSideOnlinePlanV1 *plan)
+{
+	return plan != NULL && plan->magic == RF_SIDE_ONLINE_PLAN_MAGIC && plan->sealed
+			   ? plan->space_target_count
+			   : UINT32_MAX;
+}
+
+bool
+rf_side_online_plan_space_target_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+									ClusterSpaceIdentityKey *out)
+{
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || out == NULL
+		|| index >= plan->space_target_count)
+		return false;
+	*out = plan->space_targets[index];
+	return true;
 }
 
 Size
@@ -1409,6 +1526,8 @@ rf_side_online_plan_destroy_v1(RfSideOnlinePlanV1 **plan_address)
 		side_free(plan->operations);
 	if (plan->owned_payload != NULL)
 		side_free(plan->owned_payload);
+	if (plan->space_targets != NULL)
+		side_free(plan->space_targets);
 	memset(plan, 0, sizeof(*plan));
 	side_free(plan);
 	*plan_address = NULL;
