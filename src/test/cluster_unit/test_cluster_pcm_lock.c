@@ -5290,7 +5290,7 @@ check_resource_x_terminal_local_owner_recycle_and_revoke(int32 next_requester,
 	ResourceXIntentSlot old_status_intent;
 	ClusterPcmOwnSnapshot dropped;
 	ClusterPcmOwnSnapshot revoking;
-	uint8 old_image_payload[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 old_image_payload[RESOURCE_X_IMAGE_V2_BYTES];
 	uint8 old_status_payload[RESOURCE_X_PROOF_V1_BYTES];
 	uint64 old_source_generation = 0;
 
@@ -10719,8 +10719,8 @@ UT_TEST(test_resource_x_prepared_s_source_retains_one_exact_matching_pair)
 	ResourceXIntentSlot image_intent;
 	ResourceXIntentSlot status_intent;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint8 image_bytes[RESOURCE_X_IMAGE_V1_BYTES];
-	uint8 retained_image_bytes[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 image_bytes[RESOURCE_X_IMAGE_V2_BYTES];
+	uint8 retained_image_bytes[RESOURCE_X_IMAGE_V2_BYTES];
 	uint8 retained_status_bytes[RESOURCE_X_PROOF_V1_BYTES];
 	uint64 source_generation = 0;
 	uint16 image_bytes_len = 0;
@@ -11407,7 +11407,7 @@ make_resource_x_remote_join_pair(BufferTag tag, int32 requester_node, ResourceXD
 {
 	ResourceXDecodedFrame decoded_image;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint8 image_payload[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
 	uint16 image_payload_bytes = 0;
 	int i;
 
@@ -11459,7 +11459,7 @@ make_resource_x_remote_join_pair(BufferTag tag, int32 requester_node, ResourceXD
 		image->body.image_envelope.page_bytes[i] = (uint8)(i * 37);
 	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, image, image_payload,
 											 sizeof(image_payload), &image_payload_bytes, &reject));
-	UT_ASSERT_EQ(image_payload_bytes, RESOURCE_X_IMAGE_V1_BYTES);
+	UT_ASSERT_EQ(image_payload_bytes, RESOURCE_X_IMAGE_V2_BYTES);
 	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, image_payload,
 											 image_payload_bytes, &decoded_image, &reject));
 	*image = decoded_image;
@@ -11472,7 +11472,7 @@ make_resource_x_s_remote_join_pair(BufferTag tag, int32 requester_node,
 {
 	ResourceXDecodedFrame canonical_image;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint8 image_payload[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
 	uint16 image_payload_bytes = 0;
 
 	make_resource_x_remote_join_pair(tag, requester_node, grant, image);
@@ -11494,7 +11494,7 @@ retarget_resource_x_remote_join_pair(ResourceXDecodedFrame *grant, ResourceXDeco
 {
 	ResourceXDecodedFrame decoded_image;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint8 image_payload[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
 	uint16 image_payload_bytes = 0;
 
 	UT_ASSERT(final_authority_generation >= 3);
@@ -11521,12 +11521,12 @@ canonicalize_resource_x_test_image(ResourceXDecodedFrame *image)
 {
 	ResourceXDecodedFrame decoded;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint8 payload[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 payload[RESOURCE_X_IMAGE_V2_BYTES];
 	uint16 payload_bytes = 0;
 
 	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, image, payload,
 											 sizeof(payload), &payload_bytes, &reject));
-	UT_ASSERT_EQ(payload_bytes, RESOURCE_X_IMAGE_V1_BYTES);
+	UT_ASSERT_EQ(payload_bytes, RESOURCE_X_IMAGE_V2_BYTES);
 	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, payload, payload_bytes,
 											 &decoded, &reject));
 	*image = decoded;
@@ -11602,7 +11602,7 @@ retain_resource_x_test_settlement_pair_at_attempt(BufferTag tag, uint8 source_mo
 	ResourceXIntentSlot image_intent;
 	ResourceXIntentSlot status_intent;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint8 image_payload[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
 	uint8 status_payload[RESOURCE_X_PROOF_V1_BYTES];
 
 	block = make_resource_x_master_frame(RESOURCE_X_WIRE_BLOCK_TO_N, tag, 2, 1);
@@ -12515,7 +12515,7 @@ UT_TEST(test_resource_x_requester_join_accepts_either_order_and_never_overwrites
 	ResourceXRequesterJoinSnapshot snapshot;
 	ResourceXRequesterJoinSnapshot first;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint8 image_payload[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
 	uint16 image_payload_bytes = 0;
 
 	reset_fake_pcm_runtime(8);
@@ -12576,7 +12576,7 @@ UT_TEST(test_resource_x_requester_join_accepts_either_order_and_never_overwrites
 	changed.common.sender_connection_generation = 85;
 	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &changed, image_payload,
 											 sizeof(image_payload), &image_payload_bytes, &reject));
-	UT_ASSERT_EQ(image_payload_bytes, RESOURCE_X_IMAGE_V1_BYTES);
+	UT_ASSERT_EQ(image_payload_bytes, RESOURCE_X_IMAGE_V2_BYTES);
 	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, image_payload,
 											 image_payload_bytes, &resealed_image, &reject));
 	UT_ASSERT(resealed_image.common.semantic_crc32c != image.common.semantic_crc32c);
@@ -13209,7 +13209,7 @@ UT_TEST(test_resource_x_lost_image_replays_pair_after_physical_completion)
 	ResourceXSourceSettlementPlan plan;
 	ResourceXSourceSettlementCommitObservation observation;
 	uint8 status_payload[RESOURCE_X_PROOF_V1_BYTES];
-	uint8 image_payload[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
 	ResourceXAssertion assertion;
 	bool published = false;
 
@@ -14103,7 +14103,7 @@ UT_TEST(test_resource_x_requester_join_accepts_s_carrier_either_order_and_reject
 	ResourceXDecodedFrame image;
 	ResourceXRequesterJoinSnapshot join;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint8 image_payload[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
 	uint16 image_payload_bytes = 0;
 
 	reset_fake_pcm_runtime(8);
@@ -14526,9 +14526,9 @@ UT_TEST(test_resource_x_x_source_defers_self_master_grd_transition_to_ingress)
 	ResourceXReconfigBatch batch;
 	ResourceXAssertion requester_assertion;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint8 image_payload[RESOURCE_X_IMAGE_V1_BYTES];
-	uint8 newer_image_payload[RESOURCE_X_IMAGE_V1_BYTES];
-	uint8 probe_payload[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
+	uint8 newer_image_payload[RESOURCE_X_IMAGE_V2_BYTES];
+	uint8 probe_payload[RESOURCE_X_IMAGE_V2_BYTES];
 	uint8 status_payload[RESOURCE_X_PROOF_V1_BYTES];
 	uint32 examined = 0;
 	uint32 canonical_image_crc = 0;
@@ -14555,7 +14555,7 @@ UT_TEST(test_resource_x_x_source_defers_self_master_grd_transition_to_ingress)
 	image.common.sender_connection_generation = 84;
 	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &image, image_payload,
 											 sizeof(image_payload), &image_payload_bytes, &reject));
-	UT_ASSERT_EQ(image_payload_bytes, RESOURCE_X_IMAGE_V1_BYTES);
+	UT_ASSERT_EQ(image_payload_bytes, RESOURCE_X_IMAGE_V2_BYTES);
 	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, image_payload,
 											 image_payload_bytes, &decoded, &reject));
 	image = decoded;
@@ -14626,7 +14626,7 @@ UT_TEST(test_resource_x_x_source_defers_self_master_grd_transition_to_ingress)
 			&block.common.logical_assertion, &image_intent, image_payload, sizeof(image_payload)),
 		RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(image_intent.kind, RESOURCE_X_WIRE_IMAGE_ENVELOPE);
-	UT_ASSERT_EQ(image_intent.payload_bytes, RESOURCE_X_IMAGE_V1_BYTES);
+	UT_ASSERT_EQ(image_intent.payload_bytes, RESOURCE_X_IMAGE_V2_BYTES);
 	UT_ASSERT_EQ(image_intent.destination_node, 2);
 	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, image_payload,
 											 image_intent.payload_bytes, &decoded, &reject));
@@ -14746,7 +14746,7 @@ UT_TEST(test_resource_x_x_source_defers_self_master_grd_transition_to_ingress)
 	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &newer_image,
 											 newer_image_payload, sizeof(newer_image_payload),
 											 &newer_image_payload_bytes, &reject));
-	UT_ASSERT_EQ(newer_image_payload_bytes, RESOURCE_X_IMAGE_V1_BYTES);
+	UT_ASSERT_EQ(newer_image_payload_bytes, RESOURCE_X_IMAGE_V2_BYTES);
 	reject = RESOURCE_X_WIRE_REJECT_NONE;
 	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, newer_image_payload,
 											 newer_image_payload_bytes, &newer_image, &reject));
@@ -14778,7 +14778,7 @@ UT_TEST(test_resource_x_x_source_defers_self_master_grd_transition_to_ingress)
 	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &newer_image,
 											 newer_image_payload, sizeof(newer_image_payload),
 											 &newer_image_payload_bytes, &reject));
-	UT_ASSERT_EQ(newer_image_payload_bytes, RESOURCE_X_IMAGE_V1_BYTES);
+	UT_ASSERT_EQ(newer_image_payload_bytes, RESOURCE_X_IMAGE_V2_BYTES);
 	reject = RESOURCE_X_WIRE_REJECT_NONE;
 	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, newer_image_payload,
 											 newer_image_payload_bytes, &newer_image, &reject));
@@ -14887,7 +14887,7 @@ check_resource_x_source_settlement_drains_only_the_exact_retained_pair(bool dele
 	ResourceXIntentProbeResult probe_result = RESOURCE_X_INTENT_PROBE_IDLE;
 	ResourceXRequesterJoinSnapshot join;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint8 image_payload[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
 	uint8 requester_settlement_payload[RESOURCE_X_PROOF_V1_BYTES];
 	uint8 status_payload[RESOURCE_X_PROOF_V1_BYTES];
 	uint32 examined = 0;
@@ -15180,7 +15180,7 @@ UT_TEST(test_resource_x_holder_pair_drain_allows_master_requester_colocation)
 	ResourceXDecodedFrame status;
 	ResourceXIntentSlot image_intent;
 	ResourceXIntentSlot status_intent;
-	uint8 image_payload[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
 	uint8 status_payload[RESOURCE_X_PROOF_V1_BYTES];
 	uint64 source_generation = 0;
 
@@ -15249,7 +15249,7 @@ UT_TEST(test_resource_x_remote_master_uses_exact_installed_holder_lineage)
 	ResourceXExecutorSnapshot executor;
 	ResourceXIntentSlot image_intent;
 	ResourceXIntentSlot status_intent;
-	uint8 image_payload[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
 	uint8 status_payload[RESOURCE_X_PROOF_V1_BYTES];
 
 	reset_fake_pcm_runtime(4);
@@ -15343,7 +15343,7 @@ UT_TEST(test_resource_x_remote_master_retains_exact_current_x_without_local_auth
 	ResourceXDecodedFrame status;
 	ResourceXIntentSlot image_intent;
 	ResourceXIntentSlot status_intent;
-	uint8 image_payload[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
 	uint8 status_payload[RESOURCE_X_PROOF_V1_BYTES];
 	uint64 binding_generation;
 
@@ -15429,7 +15429,7 @@ check_resource_x_prepared_retain_episode_mode(uint64 old_generation, int old_req
 	if (old_generation != 0) {
 		ResourceXIntentSlot status_intent;
 		ResourceXIntentSlot image_intent;
-		uint8 payload[RESOURCE_X_IMAGE_V1_BYTES];
+		uint8 payload[RESOURCE_X_IMAGE_V2_BYTES];
 		uint64 source_generation;
 
 		/* A prior authenticated carrier is a frame input; retain, publish,
@@ -15711,7 +15711,7 @@ UT_TEST(test_resource_x_deferred_source_pin_claim_is_exact_and_single_owner)
 			for (int calls = 0; calls < 20; calls++) {
 				ResourceXAcquisitionRef work;
 				ResourceXIntentSlot slot;
-				uint8 payload[RESOURCE_X_IMAGE_V1_BYTES];
+				uint8 payload[RESOURCE_X_IMAGE_V2_BYTES];
 				uint32 examined;
 				ResourceXIntentProbeResult probe;
 
@@ -15804,7 +15804,7 @@ UT_TEST(test_resource_x_deferred_source_rejects_corruption_exhaustion_and_reconf
 	ClusterPcmResourceXLocalOwner changed;
 	ResourceXDecodedFrame retained;
 	ResourceXReconfigToken token;
-	uint8 encoded[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 encoded[RESOURCE_X_IMAGE_V2_BYTES];
 	ResourceXWireReject reject;
 	uint16 bytes;
 	char *owner_bytes = NULL;
@@ -15862,7 +15862,7 @@ UT_TEST(test_resource_x_deferred_source_rejects_corruption_exhaustion_and_reconf
 	UT_ASSERT_EQ(image_matches, 1);
 	if (image_matches != 1)
 		return;
-	image_bytes[offsetof(ResourceXImageEnvelopeV1, page_bytes) + 17] ^= 1;
+	image_bytes[offsetof(ResourceXImageEnvelopeV2, page_bytes) + 17] ^= 1;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_finish_claim_exact(&ref, 21, &claim),
 				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
 	UT_ASSERT_EQ(claim.buffer_id, -1);
@@ -15952,7 +15952,7 @@ check_resource_x_self_master_source_episode(bool with_history, ForkNumber fork,
 		ResourceXDecodedFrame previous_assert;
 		ResourceXDecodedFrame source_ack;
 		ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-		uint8 payload[RESOURCE_X_IMAGE_V1_BYTES];
+		uint8 payload[RESOURCE_X_IMAGE_V2_BYTES];
 		uint64 source_generation;
 
 		/* Real retained-pair APIs close a prior local-master source episode.

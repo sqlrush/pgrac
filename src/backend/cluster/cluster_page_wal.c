@@ -15,6 +15,69 @@
 
 static ClusterPageWalBindingV1 *bindings;
 
+bool
+cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
+{
+	BufferDesc *buf;
+	uint32 state;
+	if (bindings == NULL || buffer <= 0 || buffer > NBuffers || out == NULL)
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (!LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+		return false;
+	state = pg_atomic_read_u32(&buf->state);
+	if ((state & (BM_VALID | BM_TAG_VALID | BM_PERMANENT))
+			!= (BM_VALID | BM_TAG_VALID | BM_PERMANENT)
+		|| (state & BM_IO_ERROR) != 0
+		|| !cluster_page_wal_binding_matches_v1(
+			&bindings[buffer - 1], BufTagGetRelFileLocator(&buf->tag), buf->tag.forkNum,
+			buf->tag.blockNum, BufferGetPage(buffer)))
+		return false;
+	*out = bindings[buffer - 1];
+	return true;
+}
+bool
+cluster_page_wal_prepare_install_v1(Buffer buffer, const ClusterPageWalBindingV1 *carrier,
+									Page image, ClusterPageWalBindingV1 *prepared)
+{
+	static const ClusterPageWalBindingV1 zero = { 0 };
+	ClusterWalSourceRef current;
+	BufferDesc *buf;
+	uint32 state;
+	if (bindings == NULL || buffer <= 0 || buffer > NBuffers || carrier == NULL || image == NULL
+		|| prepared == NULL || !cluster_enabled || !cluster_shared_config)
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (!LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE))
+		return false;
+	state = pg_atomic_read_u32(&buf->state);
+	if ((state & (BM_VALID | BM_TAG_VALID)) != (BM_VALID | BM_TAG_VALID)
+		|| (state & (BM_IO_ERROR | BM_IO_IN_PROGRESS)) != 0)
+		return false;
+	if (memcmp(carrier, &zero, sizeof(zero)) != 0) {
+		if ((state & BM_PERMANENT) == 0
+			|| !cluster_page_wal_binding_matches_v1(carrier, BufTagGetRelFileLocator(&buf->tag),
+													buf->tag.forkNum, buf->tag.blockNum, image)
+			|| !cluster_wal_thread_current_v2_ref(&current)
+			|| current.claim.identity.system_identifier != carrier->identity.system_identifier
+			|| memcmp(current.claim.identity.storage_uuid, carrier->identity.storage_uuid, 16) != 0
+			|| current.claim.database_incarnation != carrier->source.claim.database_incarnation)
+			return false;
+	}
+	*prepared = *carrier;
+	return true;
+}
+bool
+cluster_page_wal_publish_install_v1(Buffer buffer, const ClusterPageWalBindingV1 *prepared)
+{
+	if (bindings == NULL || buffer <= 0 || buffer > NBuffers || prepared == NULL
+		|| !LWLockHeldByMeInMode(BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)),
+								 LW_EXCLUSIVE))
+		return false;
+	bindings[buffer - 1] = *prepared;
+	return true;
+}
+
 Size
 cluster_page_wal_shmem_size(void)
 {

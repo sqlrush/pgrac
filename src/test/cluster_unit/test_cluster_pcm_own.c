@@ -65,6 +65,40 @@ static int transition_base_pins;
 static int transition_flush_count;
 static bool transition_flush_error;
 static bool transition_flush_leaves_dirty;
+static ClusterPageWalBindingV1 transition_page_wal;
+static bool transition_wal_prepare_ok = true;
+static unsigned transition_wal_publishes;
+
+bool
+cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
+{
+	UT_ASSERT(transition_content_held);
+	if (transition_page_wal.record_start == 0)
+		return false;
+	*out = transition_page_wal;
+	return true;
+}
+bool
+cluster_page_wal_prepare_install_v1(Buffer buffer, const ClusterPageWalBindingV1 *carrier,
+									Page image, ClusterPageWalBindingV1 *prepared)
+{
+	UT_ASSERT(transition_content_held);
+	if (!transition_wal_prepare_ok)
+		return false;
+	*prepared = *carrier;
+	return true;
+}
+bool
+cluster_page_wal_publish_install_v1(Buffer buffer, const ClusterPageWalBindingV1 *prepared)
+{
+	UT_ASSERT(transition_content_held);
+	UT_ASSERT(pg_atomic_read_u64(
+				  &ClusterPcmOwnArray[transition_buf->buf_id].resource_x_activation_generation)
+			  != 0);
+	transition_page_wal = *prepared;
+	transition_wal_publishes++;
+	return true;
+}
 static bool transition_real_flush;
 static unsigned transition_owned_io, transition_io_wakes, transition_io_aborts;
 static void transition_production_flush(BufferDesc *buf, SMgrRelation reln, IOObject object,
@@ -2165,6 +2199,9 @@ transition_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry, ClusterPcmOwnSnap
 	transition_flush_count = 0;
 	transition_flush_error = false;
 	transition_flush_leaves_dirty = false;
+	memset(&transition_page_wal, 0, sizeof(transition_page_wal));
+	transition_wal_prepare_ok = true;
+	transition_wal_publishes = 0;
 	transition_real_flush = false;
 	transition_owned_io = transition_io_wakes = transition_io_aborts = 0;
 	transition_copy_active = false;
@@ -2650,6 +2687,7 @@ UT_TEST(test_real_gcs_wal_recheck_yields_without_exporting_an_image)
 	PGIOAlignedBlock sentinel;
 	GcsBlockReplyStatus statuses[3];
 	ClusterBufmgrGcsCopyRefusal refusal;
+	ClusterPageWalBindingV1 copied_wal;
 	XLogRecPtr copied_lsn;
 	uint64 generation;
 	int attempt;
@@ -2665,7 +2703,8 @@ UT_TEST(test_real_gcs_wal_recheck_yields_without_exporting_an_image)
 		memcpy(output.data, sentinel.data, BLCKSZ);
 		copied_lsn = UINT64_C(0xdead);
 		transition_wal_changes = 2;
-		UT_ASSERT(!cluster_bufmgr_copy_block_for_gcs(buf.tag, &copied_lsn, output.data, &refusal));
+		UT_ASSERT(
+			!cluster_bufmgr_copy_block_for_gcs(buf.tag, &copied_lsn, output.data, &refusal, NULL));
 		statuses[attempt] = GcsBlockMasterDirectCopyRefusalStatus(refusal);
 		UT_ASSERT_EQ(copied_lsn, UINT64_C(0xdead));
 		UT_ASSERT_EQ(memcmp(output.data, sentinel.data, BLCKSZ), 0);
@@ -2676,7 +2715,12 @@ UT_TEST(test_real_gcs_wal_recheck_yields_without_exporting_an_image)
 
 	/* The next actual attempt must earn an image, not merely report success
 	 * after the prior retry. The pending dirty image is physically flushed. */
-	UT_ASSERT(cluster_bufmgr_copy_block_for_gcs(buf.tag, &copied_lsn, output.data, &refusal));
+	cluster_shared_config = true;
+	transition_page_wal.record_start = 0x120;
+	UT_ASSERT(cluster_bufmgr_copy_block_for_gcs(buf.tag, &copied_lsn, output.data, &refusal,
+												&copied_wal));
+	UT_ASSERT_EQ(memcmp(&copied_wal, &transition_page_wal, sizeof(copied_wal)), 0);
+	cluster_shared_config = false;
 	UT_ASSERT_EQ(memcmp(output.data, transition_page.data, BLCKSZ), 0);
 	UT_ASSERT_EQ(copied_lsn, UINT64_C(0x12370));
 	UT_ASSERT_EQ(refusal, CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE);
@@ -2726,7 +2770,8 @@ UT_TEST(test_real_gcs_wal_recheck_preserves_invalid_image_and_io_refusals)
 		memset(output.data, 0xa5, BLCKSZ);
 		PG_TRY();
 		{
-			copied = cluster_bufmgr_copy_block_for_gcs(tag, &copied_lsn, output.data, &refusal);
+			copied
+				= cluster_bufmgr_copy_block_for_gcs(tag, &copied_lsn, output.data, &refusal, NULL);
 		}
 		PG_CATCH();
 		{
@@ -3309,11 +3354,12 @@ UT_TEST(test_real_remote_image_t2_t3_use_image_proof_not_page_is_new)
 	const ResourceXBufferActivationResult expected[]
 		= { RESOURCE_X_BUFFER_T2_INSTALLED, RESOURCE_X_BUFFER_CORRUPT, RESOURCE_X_BUFFER_CORRUPT,
 			RESOURCE_X_BUFFER_CORRUPT,		RESOURCE_X_BUFFER_ABSENT,  RESOURCE_X_BUFFER_STALE,
-			RESOURCE_X_BUFFER_STALE,		RESOURCE_X_BUFFER_CORRUPT };
+			RESOURCE_X_BUFFER_STALE,		RESOURCE_X_BUFFER_CORRUPT, RESOURCE_X_BUFFER_CORRUPT };
 
 	for (scenario = 0; scenario < lengthof(expected); scenario++) {
 		transition_fixture(&buf, &entry, &ignored, false);
 		buf.tag.forkNum = VISIBILITYMAP_FORKNUM;
+		cluster_shared_config = true;
 		buf.pcm_state = (uint8)PCM_STATE_X;
 		buf.buffer_type = (uint8)BUF_TYPE_XCUR;
 		pg_atomic_write_u64(&entry.generation, 1);
@@ -3333,6 +3379,8 @@ UT_TEST(test_real_remote_image_t2_t3_use_image_proof_not_page_is_new)
 		memset(&image, 0, sizeof(image));
 		image.page_bytes = carrier.data;
 		image.image_length = BLCKSZ;
+		image.page_wal.record_start = 0x120;
+		image.page_wal.record_end = 0x200;
 		image.page_lsn = PageGetLSN((Page)carrier.data);
 		image.page_scn = ((PageHeader)carrier.data)->pd_block_scn;
 		image.page_checksum = cluster_gcs_block_compute_checksum(carrier.data);
@@ -3350,27 +3398,40 @@ UT_TEST(test_real_remote_image_t2_t3_use_image_proof_not_page_is_new)
 			pg_atomic_write_u64(&entry.resource_x_activation_generation, 2);
 		else if (scenario == 7)
 			pg_atomic_fetch_or_u32(&buf.state, BM_IO_ERROR);
+		else if (scenario == 8)
+			transition_wal_prepare_ok = false;
 		UT_ASSERT(!PageIsNew((Page)transition_page.data));
 		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_activate_x_by_tag(&ref, &image, &installed),
 					 expected[scenario]);
 		UT_ASSERT_EQ(memcmp(before.data, transition_page.data, BLCKSZ), 0);
 		if (scenario == 0) {
+			UT_ASSERT_EQ(transition_wal_publishes, 1);
+			UT_ASSERT_EQ(transition_page_wal.record_start, 0x120);
 			UT_ASSERT_EQ(installed.ownership_generation, 1);
 			UT_ASSERT_EQ(installed.writer_activation_token, 1);
 			UT_ASSERT_EQ(installed.resource_x_activation_generation, 1);
 			UT_ASSERT_EQ(cluster_bufmgr_pcm_own_activate_x_by_tag(&ref, &image, &installed),
 						 RESOURCE_X_BUFFER_ALREADY_INSTALLED);
+			UT_ASSERT_EQ(transition_wal_publishes, 1);
+			image.page_wal.source.claim.claim_sha256[0]++;
+			UT_ASSERT_EQ(cluster_bufmgr_pcm_own_activate_x_by_tag(&ref, &image, &installed),
+						 RESOURCE_X_BUFFER_CORRUPT);
+			UT_ASSERT_EQ(transition_wal_publishes, 1);
+			UT_ASSERT_EQ(transition_page_wal.source.claim.claim_sha256[0], 0);
 			UT_ASSERT_EQ(
 				cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(&ref, &activated),
 				RESOURCE_X_BUFFER_T2_INSTALLED);
 			UT_ASSERT_EQ(activated.ownership_generation, 1);
 			UT_ASSERT_EQ(activated.writer_activation_token, 0);
 			UT_ASSERT_EQ(activated.resource_x_activation_generation, 0);
-		} else
+		} else {
 			UT_ASSERT_EQ(installed.ownership_generation, 0);
+			UT_ASSERT_EQ(transition_wal_publishes, 0);
+		}
 		UT_ASSERT_EQ(transition_pin_count, 0);
 		UT_ASSERT(!transition_mapping_held && !transition_content_held);
 	}
+	cluster_shared_config = false;
 	ClusterPcmOwnArray = saved;
 }
 
@@ -6161,7 +6222,7 @@ UT_TEST(test_queue_contract_exposes_opaque_retained_revoke_api)
 													uint64 *);
 	typedef ClusterPcmOwnResult (*PrepareSSourceFn)(
 		BufferDesc *, const ClusterPcmOwnSnapshot *, SCN, ClusterPcmOwnSnapshot *, char *,
-		XLogRecPtr *, uint64 *, ClusterPcmOwnSourcePrepareRefusal *);
+		XLogRecPtr *, uint64 *, ClusterPcmOwnSourcePrepareRefusal *, ClusterPageWalBindingV1 *);
 	typedef ClusterPcmOwnResult (*AbortRevokeFn)(BufferDesc *, const ClusterPcmOwnSnapshot *);
 	typedef ClusterPcmOwnResult (*FinishRetainFn)(BufferDesc *, const ClusterPcmOwnSnapshot *,
 												  XLogRecPtr, ClusterPcmOwnSnapshot *,
@@ -7347,7 +7408,7 @@ UT_TEST(test_resource_x_t2_t3_buffer_owner_is_generation_exact_and_ordered)
 	live.reservation_token = 12;
 	live.writer_activation_token = 12;
 	live.pcm_state = (uint8)PCM_STATE_X;
-	UT_ASSERT_EQ(sizeof(ResourceXCurrentImage), 32);
+	UT_ASSERT_EQ(sizeof(ResourceXCurrentImage), 264);
 	UT_ASSERT(cluster_pcm_x_resource_x_t2_snapshot_exact(&ref, &live));
 	live.resource_x_activation_generation = ref.acquisition_generation;
 	UT_ASSERT(cluster_pcm_x_resource_x_t2_snapshot_exact(&ref, &live));

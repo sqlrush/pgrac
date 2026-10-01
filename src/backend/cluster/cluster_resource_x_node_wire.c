@@ -85,6 +85,98 @@ resource_x_bytes_zero(const uint8 *bytes, Size len)
 }
 
 
+/* Fixed IMAGE extension; every integer is network order. The four bytes at
+ * 132 are reserved, not the native source structure's padding. */
+static void
+resource_x_page_wal_encode(uint8 *p, const ClusterPageWalBindingV1 *b)
+{
+	memset(p, 0, 232);
+	resource_x_put_u64(p + 0, b->source.claim.identity.system_identifier);
+	memcpy(p + 8, b->source.claim.identity.storage_uuid, 16);
+	memcpy(p + 24, b->source.claim.identity.authority_uuid, 16);
+	resource_x_put_u16(p + 40, b->source.claim.identity.origin_thread_id);
+	resource_x_put_u16(p + 42, b->source.claim.identity.reserved42);
+	resource_x_put_u32(p + 44, b->source.claim.identity.origin_node_id);
+	resource_x_put_u64(p + 48, b->source.claim.identity.thread_claim_created_at);
+	resource_x_put_u32(p + 56, b->source.claim.identity.thread_claim_crc32c);
+	resource_x_put_u32(p + 60, b->source.claim.identity.reserved60);
+	resource_x_put_u64(p + 64, b->source.claim.identity.origin_owner_incarnation);
+	resource_x_put_u64(p + 72, b->source.claim.identity.root_lineage_seq);
+	resource_x_put_u64(p + 80, b->source.claim.database_incarnation);
+	resource_x_put_u64(p + 88, b->source.claim.max_config_generation);
+	memcpy(p + 96, b->source.claim.claim_sha256, 32);
+	resource_x_put_u32(p + 128, b->source.timeline);
+	resource_x_put_u64(p + 136, b->identity.system_identifier);
+	memcpy(p + 144, b->identity.storage_uuid, 16);
+	resource_x_put_u32(p + 160, b->identity.locator.spcOid);
+	resource_x_put_u32(p + 164, b->identity.locator.dbOid);
+	resource_x_put_u32(p + 168, b->identity.locator.relNumber);
+	resource_x_put_u32(p + 172, b->identity.forknum);
+	resource_x_put_u32(p + 176, b->identity.blockno);
+	resource_x_put_u32(p + 180, b->identity.reserved_zero);
+	memcpy(p + 184, b->version.segment_incarnation, 16);
+	resource_x_put_u64(p + 200, b->version.mutation_token);
+	resource_x_put_u64(p + 208, b->record_start);
+	resource_x_put_u64(p + 216, b->record_end);
+	resource_x_put_u32(p + 224, b->record_crc);
+	p[228] = b->rmid;
+	p[229] = b->info;
+	resource_x_put_u16(p + 230, b->reserved_zero);
+}
+
+static void
+resource_x_page_wal_decode(const uint8 *p, ClusterPageWalBindingV1 *b)
+{
+	memset(b, 0, sizeof(*b));
+	b->source.claim.identity.system_identifier = resource_x_get_u64(p + 0);
+	memcpy(b->source.claim.identity.storage_uuid, p + 8, 16);
+	memcpy(b->source.claim.identity.authority_uuid, p + 24, 16);
+	b->source.claim.identity.origin_thread_id = resource_x_get_u16(p + 40);
+	b->source.claim.identity.reserved42 = resource_x_get_u16(p + 42);
+	b->source.claim.identity.origin_node_id = (int32)resource_x_get_u32(p + 44);
+	b->source.claim.identity.thread_claim_created_at = (int64)resource_x_get_u64(p + 48);
+	b->source.claim.identity.thread_claim_crc32c = resource_x_get_u32(p + 56);
+	b->source.claim.identity.reserved60 = resource_x_get_u32(p + 60);
+	b->source.claim.identity.origin_owner_incarnation = resource_x_get_u64(p + 64);
+	b->source.claim.identity.root_lineage_seq = resource_x_get_u64(p + 72);
+	b->source.claim.database_incarnation = resource_x_get_u64(p + 80);
+	b->source.claim.max_config_generation = resource_x_get_u64(p + 88);
+	memcpy(b->source.claim.claim_sha256, p + 96, 32);
+	b->source.timeline = resource_x_get_u32(p + 128);
+	b->identity.system_identifier = resource_x_get_u64(p + 136);
+	memcpy(b->identity.storage_uuid, p + 144, 16);
+	b->identity.locator.spcOid = resource_x_get_u32(p + 160);
+	b->identity.locator.dbOid = resource_x_get_u32(p + 164);
+	b->identity.locator.relNumber = resource_x_get_u32(p + 168);
+	b->identity.forknum = resource_x_get_u32(p + 172);
+	b->identity.blockno = resource_x_get_u32(p + 176);
+	b->identity.reserved_zero = resource_x_get_u32(p + 180);
+	memcpy(b->version.segment_incarnation, p + 184, 16);
+	b->version.mutation_token = resource_x_get_u64(p + 200);
+	b->record_start = resource_x_get_u64(p + 208);
+	b->record_end = resource_x_get_u64(p + 216);
+	b->record_crc = resource_x_get_u32(p + 224);
+	b->rmid = p[228];
+	b->info = p[229];
+	b->reserved_zero = resource_x_get_u16(p + 230);
+}
+
+static bool
+resource_x_image_wal_valid(const ResourceXDecodedFrame *frame)
+{
+	const ResourceXDecodedImageEnvelope *body = &frame->body.image_envelope;
+	const BufferTag *tag = &frame->common.logical_assertion.resource;
+	PGAlignedBlock page;
+	if (body->image_flags == 0)
+		return resource_x_bytes_zero((const uint8 *)&body->page_wal, sizeof(body->page_wal));
+	if (body->image_flags != RESOURCE_X_IMAGE_HAS_WAL)
+		return false;
+	memcpy(page.data, body->page_bytes, BLCKSZ);
+	return body->page_scn_lsn == body->page_wal.version.mutation_token
+		   && cluster_page_wal_binding_matches_v1(&body->page_wal, BufTagGetRelFileLocator(tag),
+												  tag->forkNum, tag->blockNum, page.data);
+}
+
 static uint32
 resource_x_wire_crc(const uint8 *bytes, uint16 len)
 {
@@ -142,7 +234,7 @@ resource_x_pair_length(uint8 msg_type, ResourceXWireKind kind, uint16 len)
 		return msg_type == RESOURCE_X_MSG_BLOCKED_TO_N
 			   && (len == RESOURCE_X_CONTROL_V1_BYTES || len == RESOURCE_X_PROOF_V1_BYTES);
 	if (kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE)
-		return msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT && len == RESOURCE_X_IMAGE_V1_BYTES;
+		return msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT && len == RESOURCE_X_IMAGE_V2_BYTES;
 	if (kind == RESOURCE_X_WIRE_AUTHORITY_GRANT)
 		return msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT && len == RESOURCE_X_PROOF_V1_BYTES;
 	if (kind == RESOURCE_X_WIRE_RELEASE_X)
@@ -182,7 +274,7 @@ resource_x_frame_length(const ResourceXDecodedFrame *frame, uint16 *len)
 		*len = RESOURCE_X_PROOF_V1_BYTES;
 		return true;
 	case RESOURCE_X_WIRE_IMAGE_ENVELOPE:
-		*len = RESOURCE_X_IMAGE_V1_BYTES;
+		*len = RESOURCE_X_IMAGE_V2_BYTES;
 		return true;
 	default:
 		return false;
@@ -413,7 +505,8 @@ static void
 resource_x_common_encode(uint8 *bytes, ResourceXWireKind kind, const ResourceXDecodedCommon *common,
 						 uint16 len)
 {
-	bytes[0] = RESOURCE_X_WIRE_VERSION;
+	bytes[0] = kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE ? RESOURCE_X_IMAGE_WIRE_VERSION
+													  : RESOURCE_X_WIRE_VERSION;
 	bytes[1] = (uint8)kind;
 	resource_x_put_u16(bytes + 2, len);
 	resource_x_assertion_encode(bytes + 8, &common->logical_assertion);
@@ -557,7 +650,8 @@ resource_x_body_valid(const ResourceXDecodedFrame *frame, ResourceXWireReject *r
 				&& body->requester_target_generation == frame->common.assertion_sequence
 				&& body->image_length == RESOURCE_X_PAGE_BYTES
 				&& body->source_disposition == RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE
-				&& body->proof_kind == RESOURCE_X_PROOF_REMOTE_CARRIER && body->image_flags == 0
+				&& body->proof_kind == RESOURCE_X_PROOF_REMOTE_CARRIER
+				&& resource_x_image_wal_valid(frame)
 				&& resource_x_dependencies_valid(body->dependencies, body->dependency_count);
 	} break;
 	case RESOURCE_X_WIRE_INSTALL_SETTLEMENT: {
@@ -676,6 +770,7 @@ resource_x_body_encode(uint8 *bytes, const ResourceXDecodedFrame *frame)
 		bytes[325] = body->proof_kind;
 		resource_x_put_u16(bytes + 326, body->image_flags);
 		memcpy(bytes + 328, body->page_bytes, RESOURCE_X_PAGE_BYTES);
+		resource_x_page_wal_encode(bytes + 8520, &body->page_wal);
 	} break;
 	case RESOURCE_X_WIRE_INSTALL_SETTLEMENT: {
 		const ResourceXDecodedInstallSettlement *body = &frame->body.install_settlement;
@@ -775,6 +870,11 @@ resource_x_body_decode(const uint8 *bytes, ResourceXDecodedFrame *frame,
 		body->proof_kind = bytes[325];
 		body->image_flags = resource_x_get_u16(bytes + 326);
 		memcpy(body->page_bytes, bytes + 328, RESOURCE_X_PAGE_BYTES);
+		if (!resource_x_bytes_zero(bytes + 8520 + 132, 4)) {
+			resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_RESERVED);
+			return false;
+		}
+		resource_x_page_wal_decode(bytes + 8520, &body->page_wal);
 	} break;
 	case RESOURCE_X_WIRE_INSTALL_SETTLEMENT: {
 		ResourceXDecodedInstallSettlement *body = &frame->body.install_settlement;
@@ -804,7 +904,7 @@ cluster_resource_x_wire_encode(uint8 msg_type, const ResourceXDecodedFrame *fram
 							   uint16 payload_capacity, uint16 *payload_len_out,
 							   ResourceXWireReject *reject)
 {
-	uint8 encoded[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 encoded[RESOURCE_X_IMAGE_V2_BYTES];
 	uint32 crc;
 	uint16 len;
 
@@ -849,7 +949,7 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 	if (bytes == NULL || out == NULL)
 		return false;
 	if (payload_len != RESOURCE_X_CONTROL_V1_BYTES && payload_len != RESOURCE_X_SHORT_V1_BYTES
-		&& payload_len != RESOURCE_X_PROOF_V1_BYTES && payload_len != RESOURCE_X_IMAGE_V1_BYTES) {
+		&& payload_len != RESOURCE_X_PROOF_V1_BYTES && payload_len != RESOURCE_X_IMAGE_V2_BYTES) {
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_LEGACY_LENGTH);
 		return false;
 	}
@@ -858,7 +958,9 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_TYPE_KIND);
 		return false;
 	}
-	if (bytes[0] != RESOURCE_X_WIRE_VERSION) {
+	if (bytes[0]
+		!= (kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE ? RESOURCE_X_IMAGE_WIRE_VERSION
+												   : RESOURCE_X_WIRE_VERSION)) {
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_VERSION);
 		return false;
 	}

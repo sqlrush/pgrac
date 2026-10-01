@@ -15,13 +15,16 @@
 #include "cluster/cluster_buffer_desc.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_resource_x_identity.h"
+#include "cluster/cluster_page_wal.h"
 
 #define RESOURCE_X_WIRE_VERSION 1
 
 #define RESOURCE_X_CONTROL_V1_BYTES 96
 #define RESOURCE_X_SHORT_V1_BYTES 152
 #define RESOURCE_X_PROOF_V1_BYTES 312
-#define RESOURCE_X_IMAGE_V1_BYTES 8520
+#define RESOURCE_X_IMAGE_V2_BYTES 8752
+#define RESOURCE_X_IMAGE_WIRE_VERSION 2
+#define RESOURCE_X_IMAGE_HAS_WAL UINT16_C(1)
 #define RESOURCE_X_PAGE_BYTES 8192
 #define RESOURCE_X_DEPENDENCY_MAX 16
 #define RESOURCE_X_DEPENDENCY_VECTOR_BYTES 128
@@ -188,7 +191,7 @@ typedef struct ResourceXAuthorityGrantV1 {
 	uint8 requester_connection_generation[8];
 } ResourceXAuthorityGrantV1;
 
-typedef struct ResourceXImageEnvelopeV1 {
+typedef struct ResourceXImageEnvelopeV2 {
 	ResourceXWireCommonV1 common;
 	uint8 request_tail[RESOURCE_X_REQUEST_TAIL_BYTES];
 	uint8 conversion_base_generation[8];
@@ -205,7 +208,8 @@ typedef struct ResourceXImageEnvelopeV1 {
 	uint8 proof_kind;
 	uint8 image_flags[2];
 	uint8 page_bytes[RESOURCE_X_PAGE_BYTES];
-} ResourceXImageEnvelopeV1;
+	uint8 page_wal[232];
+} ResourceXImageEnvelopeV2;
 
 typedef struct ResourceXInstallSettlementV1 {
 	ResourceXWireCommonV1 common;
@@ -305,6 +309,7 @@ typedef struct ResourceXDecodedImageEnvelope {
 	uint8 proof_kind;
 	uint16 image_flags;
 	uint8 page_bytes[RESOURCE_X_PAGE_BYTES];
+	ClusterPageWalBindingV1 page_wal;
 } ResourceXDecodedImageEnvelope;
 
 typedef struct ResourceXDecodedInstallSettlement {
@@ -358,10 +363,10 @@ StaticAssertDecl(sizeof(ResourceXAuthorityGrantV1) == RESOURCE_X_PROOF_V1_BYTES,
 StaticAssertDecl(offsetof(ResourceXAuthorityGrantV1, source_fence) == 96
 					 && offsetof(ResourceXAuthorityGrantV1, requester_connection_generation) == 304,
 				 "Resource-X authority-grant V1 offsets changed");
-StaticAssertDecl(sizeof(ResourceXImageEnvelopeV1) == RESOURCE_X_IMAGE_V1_BYTES,
+StaticAssertDecl(sizeof(ResourceXImageEnvelopeV2) == RESOURCE_X_IMAGE_V2_BYTES,
 				 "Resource-X image-envelope V1 wire size changed");
-StaticAssertDecl(offsetof(ResourceXImageEnvelopeV1, request_tail) == 96
-					 && offsetof(ResourceXImageEnvelopeV1, page_bytes) == 328,
+StaticAssertDecl(offsetof(ResourceXImageEnvelopeV2, request_tail) == 96
+					 && offsetof(ResourceXImageEnvelopeV2, page_bytes) == 328,
 				 "Resource-X image-envelope V1 offsets changed");
 StaticAssertDecl(sizeof(ResourceXInstallSettlementV1) == RESOURCE_X_SHORT_V1_BYTES,
 				 "Resource-X install-settlement V1 wire size changed");

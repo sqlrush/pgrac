@@ -822,7 +822,7 @@ UT_TEST(test_resource_x_reused_types_route_only_after_strict_domain_decode)
 		{ RESOURCE_X_MSG_IMAGE_OR_GRANT, RESOURCE_X_WIRE_AUTHORITY_GRANT,
 		  RESOURCE_X_PROOF_V1_BYTES },
 		{ RESOURCE_X_MSG_IMAGE_OR_GRANT, RESOURCE_X_WIRE_IMAGE_ENVELOPE,
-		  RESOURCE_X_IMAGE_V1_BYTES },
+		  RESOURCE_X_IMAGE_V2_BYTES },
 		{ RESOURCE_X_MSG_IMAGE_OR_GRANT, RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP,
 		  RESOURCE_X_CONTROL_V1_BYTES },
 		{ RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, RESOURCE_X_WIRE_RELEASE_X,
@@ -833,7 +833,7 @@ UT_TEST(test_resource_x_reused_types_route_only_after_strict_domain_decode)
 	BufferTag tag = make_tag(1663, 5, 37001, FSM_FORKNUM, 771);
 	union {
 		uint64 align;
-		uint8 bytes[RESOURCE_X_IMAGE_V1_BYTES];
+		uint8 bytes[RESOURCE_X_IMAGE_V2_BYTES];
 	} payload;
 	int expected = cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS);
 	Size i;

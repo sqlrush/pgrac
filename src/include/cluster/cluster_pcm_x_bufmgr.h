@@ -25,6 +25,7 @@
 #include "access/xlogdefs.h"
 #include "cluster/cluster_pcm_own.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_page_wal.h"
 #include "storage/buf_internals.h"
 
 /* Compiler-visible identities consumed by the Stage-8 closed-world AST gate.
@@ -244,6 +245,7 @@ typedef struct ResourceXCurrentImage {
 	SCN page_scn;
 	uint32 page_checksum;
 	uint32 image_length;
+	ClusterPageWalBindingV1 page_wal;
 } ResourceXCurrentImage;
 
 typedef enum ResourceXBufferActivationResult {
@@ -264,8 +266,8 @@ typedef enum ResourceXSidecarNeutralizeResult {
 	RESOURCE_X_SIDECAR_CORRUPT
 } ResourceXSidecarNeutralizeResult;
 
-StaticAssertDecl(sizeof(ResourceXCurrentImage) == 32,
-				 "ResourceXCurrentImage process-local layout must remain 32 bytes");
+StaticAssertDecl(sizeof(ResourceXCurrentImage) == 264,
+				 "ResourceXCurrentImage process-local layout must remain 264 bytes");
 
 static inline bool
 cluster_pcm_x_resource_x_t2_snapshot_exact(const ResourceXAcquisitionRef *ref,
@@ -942,7 +944,8 @@ cluster_bufmgr_pcm_own_begin_s_revoke(BufferDesc *buf, const ClusterPcmOwnSnapsh
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_prepare_s_source_image(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s, SCN required_page_scn,
 	ClusterPcmOwnSnapshot *out_revoking, char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
-	uint64 *out_page_scn, ClusterPcmOwnSourcePrepareRefusal *out_refusal);
+	uint64 *out_page_scn, ClusterPcmOwnSourcePrepareRefusal *out_refusal,
+	ClusterPageWalBindingV1 *out_wal);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abort_s_revoke(BufferDesc *buf,
 									  const ClusterPcmOwnSnapshot *expected_revoking);

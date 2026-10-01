@@ -1148,6 +1148,8 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 {
 	PGAlignedBlock verified;
 	PGAlignedBlock previous;
+	ClusterPageWalBindingV1 prepared_wal;
+	ClusterPageWalBindingV1 installed_wal = { 0 };
 	BufferDesc *buf;
 	BufferTag lookup_tag;
 	ClusterPcmOwnSnapshot expected;
@@ -1220,7 +1222,10 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 	}
 
 	image_checksum = cluster_gcs_block_compute_checksum(image->page_bytes);
-	if (image_checksum != image->page_checksum)
+	if (image_checksum != image->page_checksum
+		|| (cluster_shared_config
+			&& !cluster_page_wal_prepare_install_v1(
+				BufferDescriptorGetBuffer(buf), &image->page_wal, verified.data, &prepared_wal)))
 		result = RESOURCE_X_BUFFER_CORRUPT;
 	else
 	{
@@ -1243,9 +1248,14 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 			page = (Page) BufHdrGetBlock(buf);
 			if (live.resource_x_activation_generation == ref->acquisition_generation)
 			{
-				if (cluster_gcs_block_compute_checksum((const char *) page) != image_checksum
+				if (cluster_shared_config)
+					(void)cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf),
+													   &installed_wal);
+				if (cluster_gcs_block_compute_checksum((const char *)page) != image_checksum
 					|| PageGetLSN(page) != image->page_lsn
-					|| ((PageHeader) page)->pd_block_scn != image->page_scn)
+					|| ((PageHeader)page)->pd_block_scn != image->page_scn
+					|| (cluster_shared_config
+						&& memcmp(&installed_wal, &prepared_wal, sizeof(prepared_wal)) != 0))
 					result = RESOURCE_X_BUFFER_CORRUPT;
 				else
 					result = RESOURCE_X_BUFFER_ALREADY_INSTALLED;
@@ -1266,7 +1276,10 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 						: own_result == CLUSTER_PCM_OWN_NOT_READY ? RESOURCE_X_BUFFER_ABSENT
 						: own_result == CLUSTER_PCM_OWN_CORRUPT ? RESOURCE_X_BUFFER_CORRUPT
 						: RESOURCE_X_BUFFER_STALE;
-				}
+				} else if (cluster_shared_config
+						   && !cluster_page_wal_publish_install_v1(BufferDescriptorGetBuffer(buf),
+																   &prepared_wal))
+					result = RESOURCE_X_BUFFER_CORRUPT;
 				else
 					result = RESOURCE_X_BUFFER_T2_INSTALLED;
 			}
@@ -13266,7 +13279,8 @@ cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag, SCN expected_page_scn,
  */
 bool
 cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
-								  ClusterBufmgrGcsCopyRefusal *out_refusal)
+								  ClusterBufmgrGcsCopyRefusal *out_refusal,
+								  ClusterPageWalBindingV1 *out_wal)
 {
 	uint32 hashcode;
 	LWLock *partition_lock;
@@ -13283,6 +13297,10 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	volatile bool content_locked = false;
 	volatile bool caller_pinned = false;
 	volatile bool flush_owned = false;
+	ClusterPageWalBindingV1 wal = { 0 };
+
+	if (out_wal != NULL)
+		memset(out_wal, 0, sizeof(*out_wal));
 
 	if (out_refusal != NULL)
 		*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
@@ -13457,6 +13475,9 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 				}
 
 				memcpy(dst, page, BLCKSZ);
+				memset(&wal, 0, sizeof(wal));
+				if (cluster_shared_config && out_wal != NULL)
+					(void)cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal);
 
 				/* Hint-bit dirties may occur under a shared content lock.  Do not
 			 * certify a copy if one raced the memcpy after the first clean check. */
@@ -13478,6 +13499,8 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 				}
 
 				*out_page_lsn = second_lsn;
+				if (out_wal != NULL)
+					*out_wal = wal;
 				LWLockRelease(content_lock);
 				content_locked = false;
 				stable = true;
@@ -15092,7 +15115,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
-		(void)cluster_bufmgr_copy_block_for_gcs(tag, &written_lsn, scratch.data, NULL);
+		(void)cluster_bufmgr_copy_block_for_gcs(tag, &written_lsn, scratch.data, NULL, NULL);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
 
@@ -15605,7 +15628,7 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
-		(void)cluster_bufmgr_copy_block_for_gcs(tag, &written_lsn, scratch.data, NULL);
+		(void)cluster_bufmgr_copy_block_for_gcs(tag, &written_lsn, scratch.data, NULL, NULL);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
 
@@ -16195,9 +16218,9 @@ cluster_bufmgr_pcm_own_observe_s_source_hard_failure(
 ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_prepare_s_source_image(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s, SCN required_page_scn,
-	ClusterPcmOwnSnapshot *out_revoking, char block_data[BLCKSZ],
-	XLogRecPtr *out_page_lsn, uint64 *out_page_scn,
-	ClusterPcmOwnSourcePrepareRefusal *out_refusal)
+	ClusterPcmOwnSnapshot *out_revoking, char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
+	uint64 *out_page_scn, ClusterPcmOwnSourcePrepareRefusal *out_refusal,
+	ClusterPageWalBindingV1 *out_wal)
 {
 	PGIOAlignedBlock scratch;
 	ClusterPcmOwnResult abort_result;
@@ -16220,6 +16243,9 @@ cluster_bufmgr_pcm_own_prepare_s_source_image(
 	volatile bool private_pinned = false;
 	ClusterPcmOwnSSourceHardFailureReason hard_failure_reason =
 		CLUSTER_PCM_S_SOURCE_HARD_NONE;
+
+	if (out_wal != NULL)
+		memset(out_wal, 0, sizeof(*out_wal));
 
 	if (out_revoking != NULL)
 		memset(out_revoking, 0, sizeof(*out_revoking));
@@ -16394,6 +16420,8 @@ cluster_bufmgr_pcm_own_prepare_s_source_image(
 				result = cluster_bufmgr_pcm_own_copy_source_image_exact(
 					buf, &live, selected_page, replace_resident, out_revoking,
 					block_data, out_page_lsn, out_page_scn);
+			if (result == CLUSTER_PCM_OWN_OK && cluster_shared_config && out_wal != NULL)
+				(void)cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), out_wal);
 			LWLockRelease(content_lock);
 			content_locked = false;
 		} else if (result == CLUSTER_PCM_OWN_OK) {

@@ -7,6 +7,7 @@
 #include "access/xloginsert.h"
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_page_anchor_cache.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -15,6 +16,7 @@
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
+#include "port/pg_crc32c.h"
 #include "storage/bufmgr.h"
 #include "storage/shmem.h"
 #include "unit_test.h"
@@ -38,6 +40,30 @@ static bool retry_insert;
 static bool consistency_check;
 XLogRecPtr ProcLastRecPtr;
 ProcessingMode Mode = NormalProcessing;
+
+#include "test_cluster_pcm_checksum_owner.inc"
+#include "test_cluster_page_wal_image.inc"
+
+bool
+errstart(int level, const char *domain)
+{
+	return level >= ERROR;
+}
+bool
+errstart_cold(int level, const char *domain)
+{
+	return errstart(level, domain);
+}
+int
+errmsg_internal(const char *fmt, ...)
+{
+	return 0;
+}
+void
+errfinish(const char *file, int line, const char *func)
+{
+	abort();
+}
 
 /* Only fields used by the extracted native functions. Assembly is the
  * explicit boundary; native product compilation retains its complete type. */
@@ -194,6 +220,7 @@ reset(void)
 	writer.claim.identity.storage_uuid[0] = 4;
 	writer.claim.identity.authority_uuid[0] = 10;
 	writer.claim.identity.origin_thread_id = 1;
+	writer.claim.identity.thread_claim_created_at = 99;
 	writer.claim.identity.origin_owner_incarnation = 7;
 	writer.claim.identity.root_lineage_seq = 1;
 	writer.claim.database_incarnation = 3;
@@ -373,10 +400,109 @@ global_catalog_identity(void)
 	out.identity.locator.spcOid = DEFAULTTABLESPACE_OID;
 	UT_ASSERT(!rf_page_identity_valid_v1(&out.identity));
 }
+static void
+carrier_install_keeps_original_generation(void)
+{
+	ClusterPageWalBindingV1 carrier, prepared, out;
+	ResourceXDecodedFrame block = { 0 }, status, image;
+	ClusterPcmOwnSnapshot revoking = { 0 };
+	reset();
+	UT_ASSERT(capture());
+	PageSetLSNPreserveOrigin(page.data, 0x200);
+	UT_ASSERT(cluster_page_wal_snapshot_v1(1, &carrier));
+	if (!cluster_page_wal_snapshot_v1(1, &carrier))
+		return;
+	block.kind = RESOURCE_X_WIRE_BLOCK_TO_N;
+	block.common.logical_assertion.resource = desc.bufferdesc.tag;
+	block.common.logical_assertion.requester_node = 1;
+	block.common.base_authority_generation = 1;
+	block.common.resource_formation = 2;
+	block.common.master_session_incarnation = 3;
+	block.common.assertion_sequence = 4;
+	block.common.sender_connection_generation = 5;
+	revoking.generation = 7;
+	revoking.reservation_token = 8;
+	revoking.flags = PCM_OWN_FLAG_REVOKING;
+	revoking.pcm_state = PCM_STATE_X;
+	UT_ASSERT(gcs_block_pcm_x_resource_x_build_source_frames(
+		&block, &revoking, page.data, 0x200, 80, &carrier, 11, 12, PCM_STATE_X, &status, &image));
+	UT_ASSERT_EQ(image.body.image_envelope.image_flags, RESOURCE_X_IMAGE_HAS_WAL);
+	if (image.body.image_envelope.image_flags != RESOURCE_X_IMAGE_HAS_WAL)
+		return;
+	UT_ASSERT_EQ(status.body.blocked_to_n.source_proof_crc32c, image.common.semantic_crc32c);
+	UT_ASSERT_EQ(memcmp(&carrier, &image.body.image_envelope.page_wal, sizeof(carrier)), 0);
+	carrier = image.body.image_envelope.page_wal;
+	writer.claim.identity.origin_thread_id = 2;
+	writer.claim.identity.origin_node_id = 1;
+	writer.claim.identity.origin_owner_incarnation = 12;
+	writer.claim.claim_sha256[0] = 99;
+	memset(&shared_binding, 0, sizeof(shared_binding));
+	UT_ASSERT(cluster_page_wal_prepare_install_v1(1, &carrier, page.data, &prepared));
+	if (!cluster_page_wal_prepare_install_v1(1, &carrier, page.data, &prepared))
+		return;
+	UT_ASSERT_EQ(shared_binding.record_end, 0);
+	cluster_page_wal_publish_install_v1(1, &prepared);
+	UT_ASSERT(cluster_page_wal_read_v1(1, &space, &out));
+	UT_ASSERT_EQ(out.source.claim.identity.origin_thread_id, 1);
+	UT_ASSERT_EQ(out.source.claim.claim_sha256[0], 13);
+	/* Same transfer without a new mutation preserves the original source. */
+	UT_ASSERT(cluster_page_wal_snapshot_v1(1, &out));
+	UT_ASSERT_EQ(memcmp(&out, &carrier, sizeof(out)), 0);
+	space.incarnation[1]++;
+	UT_ASSERT(!cluster_page_wal_read_v1(1, &space, &out));
+}
+static void
+carrier_preflight_refuses_without_mutation(void)
+{
+	for (int i = 0; i < 8; i++) {
+		ClusterPageWalBindingV1 carrier, prepared, before;
+		reset();
+		UT_ASSERT(capture());
+		PageSetLSNPreserveOrigin(page.data, 0x200);
+		UT_ASSERT(cluster_page_wal_snapshot_v1(1, &carrier));
+		if (!cluster_page_wal_snapshot_v1(1, &carrier))
+			return;
+		before = shared_binding;
+		memset(&prepared, 0x59, sizeof(prepared));
+		if (i == 0)
+			writer.claim.database_incarnation++;
+		if (i == 1)
+			writer.claim.identity.storage_uuid[1]++;
+		if (i == 2)
+			writer.claim.identity.system_identifier++;
+		if (i == 3)
+			carrier.identity.blockno++;
+		if (i == 4)
+			carrier.record_end++;
+		if (i == 5)
+			exclusive = false;
+		if (i == 6)
+			selected = false;
+		if (i == 7)
+			pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_ERROR);
+		UT_ASSERT(!cluster_page_wal_prepare_install_v1(1, &carrier, page.data, &prepared));
+		UT_ASSERT_EQ(((uint8 *)&prepared)[0], 0x59);
+		UT_ASSERT_EQ(memcmp(&shared_binding, &before, sizeof(before)), 0);
+	}
+}
+static void
+unattributed_carrier_clears_old_source(void)
+{
+	ClusterPageWalBindingV1 zero = { 0 }, prepared, out;
+	reset();
+	UT_ASSERT(capture());
+	PageSetLSNPreserveOrigin(page.data, 0x200);
+	UT_ASSERT(cluster_page_wal_prepare_install_v1(1, &zero, page.data, &prepared));
+	if (!cluster_page_wal_prepare_install_v1(1, &zero, page.data, &prepared))
+		return;
+	cluster_page_wal_publish_install_v1(1, &prepared);
+	UT_ASSERT(!cluster_page_wal_read_v1(1, &space, &out));
+	UT_ASSERT(!cluster_page_wal_snapshot_v1(1, &out));
+}
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(9);
 	printf("# Native WAL binding: %zu bytes per buffer\n", sizeof(ClusterPageWalBindingV1));
 	cluster_page_wal_shmem_register();
 	UT_ASSERT(registered_region != NULL);
@@ -386,6 +512,9 @@ main(void)
 	UT_RUN(capture_requires_original_owner);
 	UT_RUN(private_page_and_nonshared_skip);
 	UT_RUN(global_catalog_identity);
+	UT_RUN(carrier_install_keeps_original_generation);
+	UT_RUN(carrier_preflight_refuses_without_mutation);
+	UT_RUN(unattributed_carrier_clears_old_source);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

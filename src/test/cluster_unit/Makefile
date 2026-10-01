@@ -2070,10 +2070,20 @@ test_cluster_page_wal_insert.inc: $(top_srcdir)/src/backend/access/transam/xlogi
 	       { print "void"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 4) exit 1 }' $< > $@
 
+test_cluster_page_wal_image.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_put_u32\(/ || /^gcs_block_resource_x_put_u64\(/ \
+	       { print "static void"; emit=1; n++ } \
+	     /^gcs_block_pcm_x_resource_x_dependency_crc\(/ { print "static uint32"; emit=1; n++ } \
+	     /^gcs_block_pcm_x_resource_x_build_source_frames\(/ { print "static bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 4) exit 1 }' $< > $@
+
 test_cluster_page_wal: test_cluster_page_wal.c unit_test.h test_cluster_page_wal_insert.inc \
+		test_cluster_page_wal_image.inc test_cluster_pcm_checksum_owner.inc \
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(CLUSTER_RESOURCE_X_IDENTITY_O) $(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -o $@
 
@@ -3938,6 +3948,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_space_recovery_flush.inc
 	rm -f test_cluster_page_data.inc
 	rm -f test_cluster_page_wal_insert.inc
+	rm -f test_cluster_page_wal_image.inc
 	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
 	rm -f test_cluster_space_extend.inc
 	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc

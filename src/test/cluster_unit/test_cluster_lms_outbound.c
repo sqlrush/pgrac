@@ -121,7 +121,7 @@ int cluster_gcs_reply_timeout_ms = 5000;
 static uint32 ut_peer_capabilities[CLUSTER_MAX_NODES];
 static uint32 ut_peer_cap_generation[CLUSTER_MAX_NODES];
 static ResourceXIntentSlot ut_resource_x_owner_slot;
-static uint8 ut_resource_x_owner_payload[RESOURCE_X_IMAGE_V1_BYTES];
+static uint8 ut_resource_x_owner_payload[RESOURCE_X_IMAGE_V2_BYTES];
 static int ut_resource_x_stage_count = 0;
 static int ut_resource_x_rearm_count = 0;
 static int ut_resource_x_complete_count = 0;
@@ -151,7 +151,7 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload, uint16 paylo
 							   ResourceXDecodedFrame *out, ResourceXWireReject *reject)
 {
 	if (msg_type != RESOURCE_X_MSG_IMAGE_OR_GRANT || payload == NULL
-		|| payload_len != RESOURCE_X_IMAGE_V1_BYTES || out == NULL
+		|| payload_len != RESOURCE_X_IMAGE_V2_BYTES || out == NULL
 		|| ut_resource_x_decode_sender_generation == 0)
 		return false;
 	memset(out, 0, sizeof(*out));
@@ -767,7 +767,7 @@ ut_resource_x_image_intent(int32 destination_node)
 {
 	ResourceXIntentSlot intent = ut_resource_x_grant_intent(destination_node);
 
-	intent.payload_bytes = RESOURCE_X_IMAGE_V1_BYTES;
+	intent.payload_bytes = RESOURCE_X_IMAGE_V2_BYTES;
 	intent.kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
 	intent.body.owner_generation = intent.logical_generation;
 	intent.body.owner_kind = RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE;
@@ -1507,7 +1507,7 @@ UT_TEST(test_resource_x_image_intent_rebinds_transport_generation)
 	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
 	UT_ASSERT_EQ(ut_sent_n, 1);
 	UT_ASSERT_EQ(ut_sent_log[0].msg_type, RESOURCE_X_MSG_IMAGE_OR_GRANT);
-	UT_ASSERT_EQ(ut_sent_log[0].payload_len, RESOURCE_X_IMAGE_V1_BYTES);
+	UT_ASSERT_EQ(ut_sent_log[0].payload_len, RESOURCE_X_IMAGE_V2_BYTES);
 	UT_ASSERT_EQ(ut_sent_log[0].marker, 0xAA);
 	UT_ASSERT_EQ(ut_resource_x_decode_count, 0);
 	UT_ASSERT_EQ(ut_resource_x_rebind_count, 1);

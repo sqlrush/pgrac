@@ -1656,7 +1656,7 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
 					tag, out_page_lsn, (char *)scratch, out_sf_dep_vec);
 			else
 				copied = cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, (char *)scratch,
-														   out_copy_refusal);
+														   out_copy_refusal, NULL);
 			if (!copied) {
 				if (smart_fusion_reply && out_copy_refusal != NULL)
 					*out_copy_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_SMART_FUSION_UNCLASSIFIED;
@@ -1690,7 +1690,8 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
 		if (out_sf_dep_valid != NULL)
 			*out_sf_dep_valid = true;
 		gcs_block_note_scratch_copy();
-	} else if (!cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, copy_buf, out_copy_refusal))
+	} else if (!cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, copy_buf, out_copy_refusal,
+												  NULL))
 		return false;
 	else
 		gcs_block_note_scratch_copy();
@@ -9184,7 +9185,7 @@ gcs_block_resource_x_payload_candidate(uint8 msg_type, uint32 payload_length)
 	if (msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_PROOF_V1_BYTES
-			   || payload_length == RESOURCE_X_IMAGE_V1_BYTES;
+			   || payload_length == RESOURCE_X_IMAGE_V2_BYTES;
 	if (msg_type == RESOURCE_X_MSG_BLOCK_TO_N)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_PROOF_V1_BYTES;
@@ -9778,14 +9779,15 @@ static bool
 gcs_block_pcm_x_resource_x_build_source_frames(
 	const ResourceXDecodedFrame *block, const ClusterPcmOwnSnapshot *revoking,
 	const char page_bytes[BLCKSZ], XLogRecPtr page_lsn, uint64 page_scn,
-	uint32 requester_connection_generation, uint64 source_boot_incarnation, uint8 source_mode,
-	ResourceXDecodedFrame *status, ResourceXDecodedFrame *image)
+	const ClusterPageWalBindingV1 *page_wal, uint32 requester_connection_generation,
+	uint64 source_boot_incarnation, uint8 source_mode, ResourceXDecodedFrame *status,
+	ResourceXDecodedFrame *image)
 {
 	ResourceXDecodedFrame canonical_image;
 	ResourceXDecodedBlockedToN *blocked_body;
 	ResourceXDecodedImageEnvelope *image_body;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint8 encoded_image[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 encoded_image[RESOURCE_X_IMAGE_V2_BYTES];
 	uint16 encoded_bytes = 0;
 	uint64 source_carrier_generation;
 
@@ -9801,7 +9803,7 @@ gcs_block_pcm_x_resource_x_build_source_frames(
 	memset(image, 0, sizeof(*image));
 
 	image->kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
-	image->payload_bytes = RESOURCE_X_IMAGE_V1_BYTES;
+	image->payload_bytes = RESOURCE_X_IMAGE_V2_BYTES;
 	image->common = block->common;
 	image->common.action_node = block->common.logical_assertion.requester_node;
 	image->common.observed_mode = source_mode;
@@ -9836,10 +9838,14 @@ gcs_block_pcm_x_resource_x_build_source_frames(
 	image_body->image_length = BLCKSZ;
 	image_body->source_disposition = RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
 	image_body->proof_kind = RESOURCE_X_PROOF_REMOTE_CARRIER;
+	if (page_wal != NULL && page_wal->record_start != InvalidXLogRecPtr) {
+		image_body->image_flags = RESOURCE_X_IMAGE_HAS_WAL;
+		image_body->page_wal = *page_wal;
+	}
 	memcpy(image_body->page_bytes, page_bytes, BLCKSZ);
 	if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, image, encoded_image,
 										sizeof(encoded_image), &encoded_bytes, &reject)
-		|| encoded_bytes != RESOURCE_X_IMAGE_V1_BYTES
+		|| encoded_bytes != RESOURCE_X_IMAGE_V2_BYTES
 		|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, encoded_image,
 										   encoded_bytes, &canonical_image, &reject)
 		|| canonical_image.kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
@@ -10128,6 +10134,7 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 											 uint64 r4_record_generation)
 {
 	PGAlignedBlock aligned_page;
+	ClusterPageWalBindingV1 page_wal = { 0 };
 	BufferDesc *buf;
 	ClusterPcmOwnHeldXRevoke held_x_revoke;
 	ClusterPcmOwnResult own_result;
@@ -10398,7 +10405,7 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 		if (shared_s_source)
 			own_result = cluster_bufmgr_pcm_own_prepare_s_source_image(
 				buf, &current, (SCN)0, &revoking, aligned_page.data, &page_lsn, &page_scn,
-				&source_prepare_refusal);
+				&source_prepare_refusal, &page_wal);
 		else if (tagless_target_x) {
 			ResourceXApplyResult owner_result;
 
@@ -10561,7 +10568,7 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 		failure_stage = "source-copy";
 		if (!shared_s_source
 			&& !cluster_bufmgr_copy_block_for_gcs(block->common.logical_assertion.resource,
-												  &page_lsn, aligned_page.data, NULL)) {
+												  &page_lsn, aligned_page.data, NULL, &page_wal)) {
 			failure_result = RESOURCE_X_APPLY_BAD_STATE;
 			goto pre_retained_failure;
 		}
@@ -10569,7 +10576,7 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 			page_scn = (uint64)((PageHeader)aligned_page.data)->pd_block_scn;
 		failure_stage = "source-frame-build";
 		if (!gcs_block_pcm_x_resource_x_build_source_frames(
-				block, &revoking, aligned_page.data, page_lsn, page_scn,
+				block, &revoking, aligned_page.data, page_lsn, page_scn, &page_wal,
 				requester_connection_generation, source_boot_incarnation, source_mode, &status,
 				&image)) {
 			failure_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
@@ -10690,6 +10697,7 @@ PGRAC_PCM_X_FENCE_DOMINATED(gcs_block_pcm_x_reserved_image_write_exact)
 		const ResourceXCurrentImage *image)
 {
 	PGAlignedBlock verified;
+	ClusterPageWalBindingV1 prepared_wal;
 	ClusterPcmOwnSnapshot live;
 	ClusterPcmOwnResult own_result;
 	Page page;
@@ -10701,7 +10709,10 @@ PGRAC_PCM_X_FENCE_DOMINATED(gcs_block_pcm_x_reserved_image_write_exact)
 	memcpy(verified.data, image->page_bytes, BLCKSZ);
 	if (PageGetLSN((Page)verified.data) != image->page_lsn
 		|| ((PageHeader)verified.data)->pd_block_scn != image->page_scn
-		|| cluster_gcs_block_compute_checksum(verified.data) != image->page_checksum)
+		|| cluster_gcs_block_compute_checksum(verified.data) != image->page_checksum
+		|| (cluster_shared_config
+			&& !cluster_page_wal_prepare_install_v1(
+				BufferDescriptorGetBuffer(buf), &image->page_wal, verified.data, &prepared_wal)))
 		return CLUSTER_PCM_OWN_CORRUPT;
 	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
 	if (own_result != CLUSTER_PCM_OWN_OK)
@@ -11031,6 +11042,9 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 				image_out->page_scn = ((PageHeader)aligned_page->data)->pd_block_scn;
 				image_out->page_checksum = cluster_gcs_block_compute_checksum(aligned_page->data);
 				image_out->image_length = BLCKSZ;
+				if (cluster_shared_config)
+					(void)cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf),
+													   &image_out->page_wal);
 			}
 			*committed_generation_out = committed_generation;
 			result = RESOURCE_X_BUFFER_T2_INSTALLED;
@@ -11320,6 +11334,7 @@ gcs_block_pcm_x_resource_x_join_terminal_try(const ResourceXAssertion *assertion
 				joined_image.page_scn = ((PageHeader)aligned_image.data)->pd_block_scn;
 				joined_image.page_checksum = image_frame.body.image_envelope.page_checksum;
 				joined_image.image_length = BLCKSZ;
+				joined_image.page_wal = image_frame.body.image_envelope.page_wal;
 				if (image_frame.body.image_envelope.page_scn_lsn != (uint64)joined_image.page_scn) {
 					result = RESOURCE_X_APPLY_INVALID;
 					break;

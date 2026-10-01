@@ -3772,7 +3772,8 @@ GcsBlockMasterDirectCopyRefusalStatus(ClusterBufmgrGcsCopyRefusal refusal)
 
 extern const char *cluster_bufmgr_gcs_copy_refusal_name(ClusterBufmgrGcsCopyRefusal refusal);
 extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
-											  ClusterBufmgrGcsCopyRefusal *out_refusal);
+											  ClusterBufmgrGcsCopyRefusal *out_refusal,
+											  ClusterPageWalBindingV1 *out_wal);
 extern bool cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag, SCN expected_page_scn,
 												XLogRecPtr *page_lsn_out, SCN *page_scn_out,
 												char *dst,
