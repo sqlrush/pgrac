@@ -134,6 +134,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_control_root \
 		test_cluster_checkpoint_native \
 		test_cluster_checkpoint_buffers \
+		test_cluster_page_data \
 		test_cluster_wal_retention \
 		test_cluster_recovery_duty \
 		test_cluster_formation_witness \
@@ -506,7 +507,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
 SIMPLE_TESTS := $(filter-out test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_thread_tail,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers test_cluster_page_data,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_request,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire_master,$(SIMPLE_TESTS))
@@ -2049,6 +2050,21 @@ test_cluster_space_recovery_flush.inc: $(top_srcdir)/src/backend/storage/buffer/
 	awk '/^FlushBufferWithRecovery\(/ { print "static void"; emit=1; n++ } \
 	     /^FlushOneBufferForSpaceRecovery\(/ { print "bool"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@
+
+test_cluster_page_data.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^\/\* PGRAC DATA receipt implementation/ { emit=1; n++ } \
+	     emit && /^#endif/ { print; emit=0 } emit { print } \
+	     END { if (n != 1 || emit) exit 1 }' $< > $@
+
+test_cluster_page_data_stable.o: $(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_page_data: test_cluster_page_data.c unit_test.h test_cluster_page_data.inc \
+		test_cluster_space_recovery_flush.inc test_cluster_page_data_stable.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_page_data_stable.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -o $@
 
 test_cluster_space_recovery: test_cluster_space_recovery.c unit_test.h test_cluster_space_recovery_flush.inc \
 		test_cluster_space_recovery_product.o $(CLUSTER_HW_O) $(CLUSTER_UNIT_CRYPTOHASH_O) \
@@ -3902,6 +3918,7 @@ check_r11_source_removal_census:
 # ----------
 clean distclean maintainer-clean:
 	rm -f test_cluster_space_recovery_flush.inc
+	rm -f test_cluster_page_data.inc
 	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
 	rm -f test_cluster_space_extend.inc
 	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc

@@ -78,6 +78,8 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_space_recovery.h"
+#include "cluster/cluster_page_data.h"
+#include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 
 /*
@@ -10423,6 +10425,240 @@ FlushOneBufferForSpaceRecovery(Buffer buffer, const ClusterSpaceRecoveryBatchV1 
 	complete = (state & (BM_DIRTY | BM_JUST_DIRTIED | BM_IO_IN_PROGRESS | BM_IO_ERROR)) == 0;
 	UnlockBufHdr(buf, state);
 	return complete && cluster_space_recovery_flush_permitted_v1(batch, buffer);
+}
+#endif
+
+/* PGRAC DATA receipt implementation. */
+#ifdef USE_PGRAC_CLUSTER
+struct ClusterPageDataReceiptV1 {
+	uint64 magic;
+	ClusterPageDataTargetV1 target;
+};
+
+/* Neither a tag nor a pin grants write authority. Check every live fence
+ * while the original descriptor remains content-locked. SPACE may be S;
+ * DATA must be the current X holder. Do not borrow an in-flight transfer. */
+static bool
+cluster_page_data_holder_ready(BufferDesc *buf, const BufferTag *tag, bool data,
+							   ClusterPcmOwnSnapshot *snapshot)
+{
+	uint32 state;
+	bool valid;
+
+	if (!cluster_pcm_is_active() || !cluster_bufmgr_should_pcm_track(buf)
+		|| cluster_bufmgr_pcm_own_snapshot(buf, snapshot) != CLUSTER_PCM_OWN_OK)
+		return false;
+	state = LockBufHdr(buf);
+	valid = BufferTagsEqual(&buf->tag, tag)
+			&& (state & (BM_VALID | BM_TAG_VALID | BM_PERMANENT))
+				   == (BM_VALID | BM_TAG_VALID | BM_PERMANENT)
+			&& (state & (BM_IO_ERROR | BM_IO_IN_PROGRESS)) == 0
+			&& cluster_bufmgr_pcm_current_image_locked(buf, state);
+	UnlockBufHdr(buf, state);
+	return valid && BufferTagsEqual(&snapshot->tag, tag) && snapshot->generation != 0
+		   && snapshot->generation != UINT64_MAX && snapshot->reservation_token != UINT64_MAX
+		   && snapshot->flags == 0 && snapshot->writer_activation_token == 0
+		   && snapshot->resource_x_activation_generation == 0
+		   && (!data || snapshot->pcm_state == PCM_STATE_X);
+}
+
+static BufferDesc *
+cluster_page_data_try_hold(BufferTag tag, bool data, ClusterPcmOwnSnapshot *snapshot)
+{
+	uint32 hash = BufTableHashCode(&tag);
+	LWLock *partition = BufMappingPartitionLock(hash);
+	BufferDesc *buf;
+	uint32 state;
+	int id;
+
+	LWLockAcquire(partition, LW_SHARED);
+	id = BufTableLookup(&tag, hash);
+	if (id < 0) {
+		LWLockRelease(partition);
+		return NULL;
+	}
+	buf = GetBufferDescriptor(id);
+	state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag) || !cluster_bufmgr_pcm_current_image_locked(buf, state)
+		|| cluster_pcm_own_flags_get(buf->buf_id) != 0) {
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		return NULL;
+	}
+	cluster_bufmgr_pin_for_gcs_locked(buf, state);
+	LWLockRelease(partition);
+	if (!LWLockConditionalAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED)) {
+		cluster_bufmgr_unpin_for_gcs(buf);
+		return NULL;
+	}
+	if (!cluster_page_data_holder_ready(buf, &tag, data, snapshot)) {
+		LWLockRelease(BufferDescriptorGetContentLock(buf));
+		cluster_bufmgr_unpin_for_gcs(buf);
+		return NULL;
+	}
+	return buf;
+}
+
+static bool
+cluster_page_data_source_same(const ClusterWalSourceRef *before, const ClusterWalSourceRef *after)
+{
+	return cluster_control_root_identity_equal(&before->claim.identity, &after->claim.identity)
+		   && before->claim.database_incarnation == after->claim.database_incarnation
+		   && before->claim.max_config_generation == after->claim.max_config_generation
+		   && memcmp(before->claim.claim_sha256, after->claim.claim_sha256, 32) == 0
+		   && before->timeline == after->timeline;
+}
+
+bool
+cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *target,
+								  ClusterPageDataReceiptV1 **out)
+{
+	ClusterWalSourceRef source, current;
+	ClusterSpaceIdentityKey key;
+	ClusterSpaceIdentity space_identity;
+	ClusterPcmOwnSnapshot space_owner, data_owner, live;
+	BufferTag space_tag, data_tag;
+	BufferDesc *volatile space = NULL;
+	BufferDesc *volatile data = NULL;
+	ErrorContextCallback *saved_context = error_context_stack;
+	volatile bool io_started = false;
+	volatile bool complete = false;
+	PGAlignedBlock expected, disk;
+	uint64 space_token;
+	ClusterPageDataReceiptV1 *receipt;
+
+	if (target == NULL || out == NULL || *out != NULL || CurrentResourceOwner == NULL
+		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
+		|| target->database_incarnation == 0 || !rf_page_identity_valid_v1(&target->identity)
+		|| !rf_page_version_present_v1(&target->version)
+		|| (target->identity.forknum != MAIN_FORKNUM
+			&& target->identity.forknum != VISIBILITYMAP_FORKNUM)
+		|| cluster_smgr_which_for(target->identity.locator, InvalidBackendId) != 1
+		|| !cluster_wal_thread_current_v2_ref(&source)
+		|| source.claim.identity.origin_thread_id == 0
+		|| source.claim.identity.origin_thread_id > PGRAC_PAGE_LSN_ORIGIN_MAX + 1
+		|| source.timeline == 0
+		|| source.claim.identity.system_identifier != target->identity.system_identifier
+		|| source.claim.database_incarnation != target->database_incarnation
+		|| memcmp(source.claim.identity.storage_uuid, target->identity.storage_uuid, 16) != 0)
+		return false;
+	memset(&key, 0, sizeof(key));
+	key.system_identifier = target->identity.system_identifier;
+	key.database_incarnation = target->database_incarnation;
+	memcpy(key.storage_uuid, target->identity.storage_uuid, 16);
+	key.locator = target->identity.locator;
+	InitBufferTag(&space_tag, &key.locator, SPACE_FORKNUM, 0);
+	InitBufferTag(&data_tag, &key.locator, target->identity.forknum, target->identity.blockno);
+	PG_TRY();
+	{
+		do {
+			PageHeader header;
+			SMgrRelation rel;
+			uint16 stored_checksum;
+			int page_origin;
+
+			space = cluster_page_data_try_hold(space_tag, false, &space_owner);
+			if (space == NULL
+				|| !cluster_space_identity_page_decode(BufHdrGetBlock(space), BLCKSZ, SPACE_FORKNUM,
+													   0, &key, &space_identity, &space_token)
+				|| space_identity.state != CLUSTER_SPACE_IDENTITY_LIVE
+				|| memcmp(space_identity.incarnation, target->version.segment_incarnation, 16) != 0)
+				break;
+			data = cluster_page_data_try_hold(data_tag, true, &data_owner);
+			if (data == NULL)
+				break;
+			memcpy(expected.data, BufHdrGetBlock(data), BLCKSZ);
+			header = (PageHeader)expected.data;
+			if (PageIsNew(expected.data) || PageGetPageSize(expected.data) != BLCKSZ
+				|| PageGetPageLayoutVersion(expected.data) != PG_PAGE_LAYOUT_VERSION
+				|| (header->pd_flags
+					& (~PD_VALID_FLAG_BITS | PD_SPACE_METADATA | PD_UNDO_SEG_HEADER))
+					   != 0
+				|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
+				|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
+				|| header->pd_block_scn != target->version.mutation_token
+				|| !PageGetLSNOrigin(expected.data, &page_origin)
+				|| page_origin != source.claim.identity.origin_thread_id - 1
+				|| XLogRecPtrIsInvalid(PageGetLSN(expected.data))
+				|| PageGetLSN(expected.data) > GetXLogInsertRecPtr())
+				break;
+			rel = smgropen(key.locator, InvalidBackendId);
+			FlushBufferWithRecovery(data, rel, IOOBJECT_RELATION, IOCONTEXT_NORMAL, NULL,
+									&io_started);
+			if (!cluster_page_data_holder_ready(data, &data_tag, true, &live)
+				|| !cluster_pcm_own_fence_equal_exact(&data_owner, &live)
+				|| (live.semantic_buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0)
+				break;
+			smgrimmedsync(rel, target->identity.forknum);
+			smgrread(rel, target->identity.forknum, target->identity.blockno, disk.data);
+			/* Never let ignore_checksum_failure qualify physical DATA. Check
+			 * PageIsNew before computing checksums (native checksum asserts). */
+			if (PageIsNew(disk.data))
+				break;
+			stored_checksum = ((PageHeader)disk.data)->pd_checksum;
+			PageSetChecksumInplace(disk.data, target->identity.blockno);
+			if (DataChecksumsEnabled() && stored_checksum != ((PageHeader)disk.data)->pd_checksum)
+				break;
+			header->pd_checksum = ((PageHeader)disk.data)->pd_checksum = 0;
+			if (memcmp(expected.data, disk.data, BLCKSZ) != 0
+				|| !cluster_page_data_holder_ready(data, &data_tag, true, &live)
+				|| !cluster_pcm_own_fence_equal_exact(&data_owner, &live)
+				|| (live.semantic_buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0
+				|| !cluster_page_data_holder_ready(space, &space_tag, false, &live)
+				|| !cluster_pcm_own_fence_equal_exact(&space_owner, &live)
+				|| !cluster_wal_thread_current_v2_ref(&current)
+				|| !cluster_page_data_source_same(&source, &current))
+				break;
+			complete = true;
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		error_context_stack = saved_context;
+		if (io_started)
+			AbortBufferIO(BufferDescriptorGetBuffer(data));
+		if (data != NULL) {
+			/* elog(ERROR) reset holdoffs, but these exact locks remain ours. */
+			if (InterruptHoldoffCount == 0)
+				HOLD_INTERRUPTS();
+			LWLockRelease(BufferDescriptorGetContentLock(data));
+			cluster_bufmgr_unpin_for_gcs(data);
+		}
+		if (space != NULL) {
+			if (InterruptHoldoffCount == 0)
+				HOLD_INTERRUPTS();
+			LWLockRelease(BufferDescriptorGetContentLock(space));
+			cluster_bufmgr_unpin_for_gcs(space);
+		}
+	}
+	PG_END_TRY();
+	if (!complete)
+		return false;
+	receipt = palloc(sizeof(*receipt));
+	receipt->magic = UINT64_C(0x5047444154413031);
+	receipt->target = *target;
+	*out = receipt;
+	return true;
+}
+
+bool
+cluster_page_data_receipt_read_v1(const ClusterPageDataReceiptV1 *receipt,
+								  ClusterPageDataTargetV1 *out)
+{
+	if (receipt == NULL || receipt->magic != UINT64_C(0x5047444154413031) || out == NULL)
+		return false;
+	*out = receipt->target;
+	return true;
+}
+
+void
+cluster_page_data_receipt_free_v1(ClusterPageDataReceiptV1 **receipt)
+{
+	if (receipt != NULL && *receipt != NULL) {
+		(*receipt)->magic = 0;
+		pfree(*receipt);
+		*receipt = NULL;
+	}
 }
 #endif
 
