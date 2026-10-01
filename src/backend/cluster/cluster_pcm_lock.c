@@ -39,6 +39,7 @@
 
 #include "access/xlogdefs.h"
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_grd.h" /* PGRAC: spec-2.30 D1 — ClusterGrdHolderId 24B */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-2.30 D3 — cluster_node_id */
 #include "cluster/cluster_gcs.h" /* PGRAC: spec-2.32 D5 — master lookup + send_transition_and_wait */
@@ -6067,7 +6068,8 @@ cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, const PcmAuthorityS
 	}
 	if (current.state != PCM_STATE_X || current.x_holder_node != holder_node
 		|| current.s_holders_bitmap != 0 || current.pending_x_requester_node != -1
-		|| current.master_holder.node_id != (uint32)holder_node) {
+		|| current.master_holder.node_id != (uint32)holder_node
+		|| (cluster_shared_config && current.transition_count >= UINT64_MAX - 1)) {
 		LWLockRelease(&entry->entry_lock.lock);
 		LWLockRelease(&ClusterPcm->htab_lock.lock);
 		return PCM_X_TRANSFER_COMMIT_BAD_STATE;
@@ -6729,6 +6731,10 @@ pcm_transition_apply_internal(struct GrdEntry *entry, PcmLockTransition trans, i
 	Assert(entry != NULL);
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 	Assert(holder_node_id >= 0 && holder_node_id < 32);
+	if (cluster_shared_config
+		&& pg_atomic_read_u64(&entry->transition_count_local) >= UINT64_MAX - 1)
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("shared PCM transition generation exhausted")));
 	/* All ordinary owners should have refused earlier. Keep this shared
 	 * mutation boundary fail-closed BEFORE changing directory/PI bytes; the
 	 * terminal release bracket must never rely on a later clear guard. */
@@ -9846,6 +9852,111 @@ pcm_resource_x_terminal_tombstone_snapshot(const BufferTag *tag,
 	pcm_resource_x_master_snapshot(tag, tombstone->requester_node, state, &tombstone->request, out);
 	if (out != NULL)
 		out->is_head = 0;
+}
+
+static bool
+pcm_pi_write_snapshot_locked(struct GrdEntry *entry, ClusterPcmPiWriteCutV1 *out)
+{
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmResourceXMasterRequest *request;
+	ClusterPcmPiWriteCutV1 cut = { 0 };
+	int32 holder = entry->x_holder_node;
+
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
+		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	if (pg_atomic_read_u32(&entry->lifecycle) != PCM_ENTRY_LIVE
+		|| pg_atomic_read_u32(&entry->master_state) != PCM_STATE_X || holder < 0
+		|| holder >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| entry->master_holder.node_id != (uint32)holder
+		|| pg_atomic_read_u32(&entry->s_holders_bitmap) != 0
+		|| entry->pending_x_requester_node != -1 || entry->pending_x_since_lsn != 0)
+		return false;
+	state = pcm_resource_x_master_state_for_entry(entry);
+	if (state == NULL)
+		return false;
+	request = &state->requests[holder];
+	if (request->phase == RESOURCE_X_MASTER_NONE
+		&& pcm_resource_x_terminal_tombstone_valid(&state->terminal_tombstone)
+		&& state->terminal_tombstone.requester_node == holder)
+		request = &state->terminal_tombstone.request;
+	pcm_resource_x_master_snapshot(&entry->tag, holder, state, request, &cut.holder);
+	cut.binding_generation = entry->binding_generation;
+	cut.transition_count = pg_atomic_read_u64(&entry->transition_count_local);
+	cut.master_generation = cluster_lms_get_shard_master_generation();
+	cut.master_node = cluster_node_id;
+	cut.pi_holders_bitmap = pg_atomic_read_u32(&entry->pi_holders_bitmap);
+	if (!cluster_pcm_pi_write_cut_valid_v1(&cut)
+		|| state->authority_generation != cut.holder.final_authority_generation
+		|| !cluster_pcm_lock_resource_x_gate_open_exact(cut.holder.resource_formation))
+		return false;
+	*out = cut;
+	return true;
+}
+
+bool
+cluster_pcm_lock_pi_write_snapshot_v1(BufferTag tag, ClusterPcmPiWriteCutV1 *out)
+{
+	ClusterPcmPiWriteCutV1 cut;
+	struct GrdEntry *entry;
+	bool found, valid = false;
+	if (out == NULL || !cluster_shared_config || ClusterPcm == NULL || cluster_pcm_htab == NULL
+		|| cluster_gcs_lookup_master(tag) != cluster_node_id)
+		return false;
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+		valid = pcm_pi_write_snapshot_locked(entry, &cut) && cut.pi_holders_bitmap != 0;
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	if (valid)
+		*out = cut;
+	return valid;
+}
+
+bool
+cluster_pcm_lock_pi_write_complete_v1(const ClusterPageDataReceiptV1 *receipt,
+									  const RfPageOnlinePlanV1 *plan,
+									  const ClusterWalSourceRef *sources, uint32 source_count,
+									  uint32 *holders_out)
+{
+	ClusterPcmPiWriteCutV1 cut, current;
+	struct GrdEntry *entry;
+	bool found, complete = false;
+	if (holders_out != NULL)
+		*holders_out = 0;
+	/* Retained-input qualification may allocate. Finish it before any
+	 * directory lock, then reobserve the exact master cut under entry X. */
+	if (holders_out == NULL || !cluster_shared_config || ClusterPcm == NULL
+		|| cluster_pcm_htab == NULL
+		|| !cluster_page_data_pi_proof_v1(receipt, plan, sources, source_count, &cut)
+		|| !cluster_pcm_pi_write_cut_valid_v1(&cut) || cut.pi_holders_bitmap == 0
+		|| cut.master_node != cluster_node_id
+		|| cluster_gcs_lookup_master(cut.holder.assertion.resource) != cluster_node_id)
+		return false;
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = hash_search(cluster_pcm_htab, &cut.holder.assertion.resource, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		if (pcm_pi_write_snapshot_locked(entry, &current)) {
+			/* A retry may resend the same qualified notification. New PI
+			 * from another handoff changes the holder/transition cut. */
+			if (current.pi_holders_bitmap == 0 && entry->pi_watermark_lsn == InvalidXLogRecPtr
+				&& entry->pi_watermark_scn == InvalidScn)
+				current.pi_holders_bitmap = cut.pi_holders_bitmap;
+			if (memcmp(&cut, &current, sizeof(cut)) == 0) {
+				*holders_out = cut.pi_holders_bitmap;
+				pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
+				entry->pi_watermark_lsn = InvalidXLogRecPtr;
+				entry->pi_watermark_scn = InvalidScn;
+				complete = true;
+			}
+		}
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	return complete;
 }
 
 static bool

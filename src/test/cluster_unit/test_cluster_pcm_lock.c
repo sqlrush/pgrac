@@ -52,6 +52,7 @@
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D1 — ClusterGcsBlockPhase + phase_for_tag proto */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_pi_write.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_resource_x_identity.h"
@@ -113,6 +114,23 @@ static uint32 ut_wait_event_info_storage = 0;
 static bool stop_new_work_allowed = true;
 static int stop_new_work_calls;
 static bool stop_pi_cut_allowed;
+/* DATA I/O and retained input qualification are the explicit external
+ * boundary in this directory fixture; test_cluster_page_data runs those
+ * actual owners. No caller boolean is accepted by the production API. */
+static ClusterPcmPiWriteCutV1 pi_receipt_cut;
+static bool pi_receipt_valid;
+static char pi_receipt_fixture;
+
+bool
+cluster_page_data_pi_proof_v1(const ClusterPageDataReceiptV1 *receipt,
+							  const RfPageOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
+							  uint32 source_count, ClusterPcmPiWriteCutV1 *out)
+{
+	if (!pi_receipt_valid || (const void *)receipt != &pi_receipt_fixture || out == NULL)
+		return false;
+	*out = pi_receipt_cut;
+	return true;
+}
 
 bool
 cluster_normal_stop_service_new_work(bool modifies_data)
@@ -9356,6 +9374,163 @@ UT_TEST(test_resource_x_adapter_head_rebinds_only_before_assert)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_adapter_head_rebind_exact(
 					 &successor.common.logical_assertion, 42, 78, 17, 4, &authority),
 				 RESOURCE_X_APPLY_STALE);
+}
+
+static void
+setup_pi_write_master(BufferTag tag)
+{
+	ResourceXDecodedFrame assertion, settlement;
+	ResourceXDurableProof durable = { 0 };
+	ResourceXMasterSnapshot snapshot;
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	cluster_shared_config = true;
+	pi_receipt_valid = false;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 2, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 2, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	durable.assertion = assertion.common.logical_assertion;
+	durable.base_authority_generation = 1;
+	durable.resource_formation = 17;
+	durable.master_session_incarnation = 31;
+	durable.assertion_sequence = 41;
+	durable.requester_target_generation = 41;
+	durable.page_scn_lsn = 82;
+	durable.page_checksum = UINT32_C(0x12345678);
+	durable.source_proof_crc32c = UINT32_C(0x87654321);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(&durable, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	settlement = make_resource_x_master_frame(RESOURCE_X_WIRE_INSTALL_SETTLEMENT, tag, 2, 2);
+	settlement.common.outcome = RESOURCE_X_OUTCOME_OK;
+	settlement.common.authority_generation = 2;
+	settlement.body.install_settlement.conversion_base_generation = 1;
+	settlement.body.install_settlement.final_authority_generation = 2;
+	settlement.body.install_settlement.requester_connection_generation = 91;
+	settlement.body.install_settlement.requester_target_generation = 41;
+	settlement.body.install_settlement.page_scn_lsn = 82;
+	settlement.body.install_settlement.page_checksum = UINT32_C(0x12345678);
+	settlement.body.install_settlement.source_proof_crc32c = UINT32_C(0x87654321);
+	settlement.body.install_settlement.installed_mode = PCM_STATE_X;
+	settlement.body.install_settlement.requester_role = RESOURCE_X_REQUESTER_ROLE_ACQUIRER;
+	settlement.body.install_settlement.terminal_outcome = RESOURCE_X_OUTCOME_OK;
+	settlement.body.install_settlement.terminal_state = RESOURCE_X_SETTLEMENT_TERMINAL_INSTALLED;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_install_settlement_exact(&settlement, 2, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_SETTLED);
+	/* The two keeper notes are external inputs to the real bitmap owner. */
+	cluster_pcm_lock_pi_holder_note(tag, 0);
+	cluster_pcm_lock_pi_holder_note(tag, 1);
+	UT_ASSERT(cluster_pcm_lock_pi_write_snapshot_v1(tag, &pi_receipt_cut));
+}
+
+UT_TEST(test_pi_write_master_exact_retirement)
+{
+	BufferTag tag = make_tag(6510);
+	struct StopPcmEntryLayout *entry, expected;
+	ClusterPcmPiWriteCutV1 original;
+	uint32 holders;
+	setup_pi_write_master(tag);
+	original = pi_receipt_cut;
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	expected = *entry;
+	UT_ASSERT(!cluster_pcm_lock_pi_write_complete_v1((void *)&pi_receipt_fixture, NULL, NULL, 0,
+													 &holders));
+	UT_ASSERT_EQ(holders, 0);
+	UT_ASSERT_EQ(memcmp(entry, &expected, sizeof(expected)), 0);
+	pi_receipt_valid = true;
+	for (int wrong = 0; wrong < 6; wrong++) {
+		pi_receipt_cut = original;
+		switch (wrong) {
+		case 0:
+			pi_receipt_cut.binding_generation++;
+			break;
+		case 1:
+			pi_receipt_cut.transition_count++;
+			break;
+		case 2:
+			pi_receipt_cut.master_generation++;
+			break;
+		case 3:
+			pi_receipt_cut.holder.master_session_incarnation++;
+			break;
+		case 4:
+			pi_receipt_cut.holder.requester_target_generation++;
+			break;
+		case 5:
+			pi_receipt_cut.pi_holders_bitmap = 1;
+			break;
+		}
+		UT_ASSERT(!cluster_pcm_lock_pi_write_complete_v1((void *)&pi_receipt_fixture, NULL, NULL, 0,
+														 &holders));
+		UT_ASSERT_EQ(holders, 0);
+		UT_ASSERT_EQ(memcmp(entry, &expected, sizeof(expected)), 0);
+	}
+	pi_receipt_cut = original;
+	UT_ASSERT(cluster_pcm_lock_pi_write_complete_v1((void *)&pi_receipt_fixture, NULL, NULL, 0,
+													&holders));
+	UT_ASSERT_EQ(holders, 3);
+	pg_atomic_write_u32(&expected.pi_holders_bitmap, 0);
+	UT_ASSERT_EQ(memcmp(entry, &expected, sizeof(expected)), 0);
+	/* A lost completion/notification is retried against the same current
+	 * holder. Replay may repeat the old notification, never retire new PI. */
+	UT_ASSERT(cluster_pcm_lock_pi_write_complete_v1((void *)&pi_receipt_fixture, NULL, NULL, 0,
+													&holders));
+	UT_ASSERT_EQ(holders, 3);
+	UT_ASSERT_EQ(memcmp(entry, &expected, sizeof(expected)), 0);
+	/* Normal settlement compaction preserves the exact current holder. */
+	setup_pi_write_master(tag);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_settled_retire_exact(
+					 &pi_receipt_cut.holder.assertion, pi_receipt_cut.holder.assertion_sequence,
+					 &pi_receipt_cut.holder),
+				 RESOURCE_X_APPLY_APPLIED);
+	pi_receipt_valid = true;
+	UT_ASSERT(cluster_pcm_lock_pi_write_complete_v1((void *)&pi_receipt_fixture, NULL, NULL, 0,
+													&holders));
+	UT_ASSERT_EQ(holders, 3);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pi_write_master_refuses_later_handoff_and_pending)
+{
+	for (int race = 0; race < 5; race++) {
+		BufferTag tag = make_tag(6511);
+		ClusterPcmPiWriteCutV1 current, sentinel;
+		struct StopPcmEntryLayout *entry, before;
+		uint32 holders;
+		setup_pi_write_master(tag);
+		pi_receipt_valid = true;
+		entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+		if (race == 0) {
+			UT_ASSERT_EQ(
+				cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_X_TO_N_DOWNGRADE, 2),
+				PCM_GCS_TRANSITION_APPLIED);
+			UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_X, 2),
+						 PCM_GCS_TRANSITION_APPLIED);
+		} else if (race == 1)
+			UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 3, 78),
+						 PCM_PENDING_X_RESERVE_OK);
+		else if (race == 2)
+			fake_gcs_master_node = 1;
+		else if (race == 3)
+			cluster_pcm_lock_pi_holder_note(tag, 3);
+		else
+			pg_atomic_write_u64(&entry->transition_count_local, UINT64_MAX);
+		before = *entry;
+		UT_ASSERT(!cluster_pcm_lock_pi_write_complete_v1((void *)&pi_receipt_fixture, NULL, NULL, 0,
+														 &holders));
+		UT_ASSERT_EQ(holders, 0);
+		UT_ASSERT_EQ(memcmp(entry, &before, sizeof(before)), 0);
+		if (race == 1 || race == 2 || race == 4) {
+			memset(&sentinel, 0xa5, sizeof(sentinel));
+			current = sentinel;
+			UT_ASSERT(!cluster_pcm_lock_pi_write_snapshot_v1(tag, &current));
+			UT_ASSERT_EQ(memcmp(&current, &sentinel, sizeof(current)), 0);
+		}
+		cluster_shared_config = false;
+	}
 }
 
 UT_TEST(test_resource_x_settled_retirement_tombstone_replays_and_frees_live_slot)
@@ -19441,6 +19616,8 @@ main(void)
 	UT_RUN(test_resource_x_adapter_adopts_only_exact_pristine_legacy_base);
 	UT_RUN(test_resource_x_adapter_head_rebinds_only_before_assert);
 	UT_RUN(test_resource_x_settled_retirement_tombstone_replays_and_frees_live_slot);
+	UT_RUN(test_pi_write_master_exact_retirement);
+	UT_RUN(test_pi_write_master_refuses_later_handoff_and_pending);
 	UT_RUN(test_resource_x_tombstone_lineage_drift_remains_terminal);
 	UT_RUN(test_pcm_protocol_debt_projection_rejects_settled_without_cached_or_pi);
 	UT_RUN(test_pcm_stop_durable_cut_replaces_exact_terminal_pi_cover);

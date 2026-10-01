@@ -79,6 +79,7 @@
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_page_data.h"
+#include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -10501,6 +10502,7 @@ struct ClusterPageDataReceiptV1 {
 	uint64 magic;
 	ClusterPageDataTargetV1 target;
 	ClusterPageWalBindingV1 wal;
+	ClusterPcmPiWriteCutV1 pi_cut;
 };
 
 /* Neither a tag nor a pin grants write authority. Check every live fence
@@ -10577,10 +10579,13 @@ cluster_page_data_source_same(const ClusterWalSourceRef *before, const ClusterWa
 		   && before->timeline == after->timeline;
 }
 
-bool
-cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *target,
-								  ClusterPageDataReceiptV1 **out)
+static bool
+cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
+										const ClusterPcmPiWriteCutV1 *cut, bool sample_current,
+										ClusterPageDataReceiptV1 **out)
 {
+	ClusterPcmPiWriteCutV1 write_cut = { 0 };
+	ClusterPageDataTargetV1 written_target;
 	ClusterWalSourceRef source, current;
 	ClusterPageWalBindingV1 binding;
 	ClusterSpaceIdentityKey key;
@@ -10611,6 +10616,7 @@ cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *target,
 		|| source.claim.database_incarnation != target->database_incarnation
 		|| memcmp(source.claim.identity.storage_uuid, target->identity.storage_uuid, 16) != 0)
 		return false;
+	written_target = *target;
 	memset(&key, 0, sizeof(key));
 	key.system_identifier = target->identity.system_identifier;
 	key.database_incarnation = target->database_incarnation;
@@ -10618,6 +10624,14 @@ cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *target,
 	key.locator = target->identity.locator;
 	InitBufferTag(&space_tag, &key.locator, SPACE_FORKNUM, 0);
 	InitBufferTag(&data_tag, &key.locator, target->identity.forknum, target->identity.blockno);
+	if (cut != NULL) {
+		write_cut = *cut;
+		if (!cluster_pcm_pi_write_cut_valid_v1(&write_cut) || write_cut.pi_holders_bitmap == 0
+			|| write_cut.holder.assertion.requester_node != cluster_node_id
+			|| source.claim.identity.origin_node_id != cluster_node_id
+			|| !BufferTagsEqual(&write_cut.holder.assertion.resource, &data_tag))
+			return false;
+	}
 	PG_TRY();
 	{
 		do {
@@ -10635,11 +10649,15 @@ cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *target,
 				break;
 			data = cluster_page_data_try_hold(data_tag, true, &data_owner);
 			if (data == NULL
+				|| (cut != NULL
+					&& data_owner.generation != write_cut.holder.requester_target_generation)
 				|| !cluster_page_wal_read_v1(BufferDescriptorGetBuffer(data), &space_identity,
 											 &binding)
 				|| (!cluster_page_data_source_same(&source, &binding.source)
 					&& (binding.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0))
 				break;
+			if (sample_current)
+				written_target.version = binding.version;
 			memcpy(expected.data, BufHdrGetBlock(data), BLCKSZ);
 			header = (PageHeader)expected.data;
 			if (PageIsNew(expected.data) || PageGetPageSize(expected.data) != BLCKSZ
@@ -10649,7 +10667,7 @@ cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *target,
 					   != 0
 				|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
 				|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
-				|| header->pd_block_scn != target->version.mutation_token
+				|| header->pd_block_scn != written_target.version.mutation_token
 				|| !PageGetLSNOrigin(expected.data, &page_origin)
 				|| page_origin != binding.source.claim.identity.origin_thread_id - 1
 				|| XLogRecPtrIsInvalid(PageGetLSN(expected.data))
@@ -10710,10 +10728,36 @@ cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *target,
 		return false;
 	receipt = palloc(sizeof(*receipt));
 	receipt->magic = UINT64_C(0x5047444154413031);
-	receipt->target = *target;
+	receipt->target = written_target;
 	receipt->wal = binding;
+	receipt->pi_cut = write_cut;
 	*out = receipt;
 	return true;
+}
+
+bool
+cluster_bufmgr_write_page_data_v1(const ClusterPageDataTargetV1 *target,
+								  ClusterPageDataReceiptV1 **out)
+{
+	return cluster_bufmgr_write_page_data_internal(target, NULL, false, out);
+}
+
+bool
+cluster_bufmgr_write_page_data_at_cut_v1(const ClusterPageDataTargetV1 *target,
+										 const ClusterPcmPiWriteCutV1 *cut,
+										 ClusterPageDataReceiptV1 **out)
+{
+	return cluster_pcm_pi_write_cut_valid_v1(cut) && cut->pi_holders_bitmap != 0
+		   && cluster_bufmgr_write_page_data_internal(target, cut, false, out);
+}
+
+bool
+cluster_bufmgr_write_current_data_at_cut_v1(const ClusterPageDataTargetV1 *target,
+											const ClusterPcmPiWriteCutV1 *cut,
+											ClusterPageDataReceiptV1 **out)
+{
+	return cluster_pcm_pi_write_cut_valid_v1(cut) && cut->pi_holders_bitmap != 0
+		   && cluster_bufmgr_write_page_data_internal(target, cut, true, out);
 }
 
 bool
@@ -10822,6 +10866,30 @@ done:
 	if (coverage != NULL)
 		pfree(coverage);
 	return valid;
+}
+
+bool
+cluster_page_data_pi_proof_v1(const ClusterPageDataReceiptV1 *receipt,
+							  const RfPageOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
+							  uint32 source_count, ClusterPcmPiWriteCutV1 *out)
+{
+	ClusterPageDataTargetV1 target;
+	RfPageContributionPrefixV1 prefixes[RF_PAGE_STABLE_MAX_PARTICIPANTS];
+	BufferTag tag;
+
+	if (out == NULL || !cluster_page_data_receipt_read_v1(receipt, &target)
+		|| !cluster_pcm_pi_write_cut_valid_v1(&receipt->pi_cut)
+		|| receipt->pi_cut.pi_holders_bitmap == 0
+		|| !cluster_page_data_prefix_v1(plan, sources, source_count, &receipt, 1, prefixes))
+		return false;
+	InitBufferTag(&tag, &target.identity.locator, target.identity.forknum, target.identity.blockno);
+	if (!BufferTagsEqual(&tag, &receipt->pi_cut.holder.assertion.resource))
+		return false;
+	/* The master independently rechecks the original holder cut. A later
+	 * local redirty can appear in the plan without invalidating this DATA;
+	 * the PAGE prefix leaves those later contributions uncovered. */
+	*out = receipt->pi_cut;
+	return true;
 }
 #endif
 

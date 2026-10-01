@@ -12,6 +12,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_page_data.h"
+#include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
@@ -1018,10 +1019,77 @@ plan_sources_are_immutable(void)
 	clean();
 }
 
+static ClusterPcmPiWriteCutV1
+data_pi_cut(void)
+{
+	ClusterPcmPiWriteCutV1 cut = { 0 };
+	InitBufferTag(&cut.holder.assertion.resource, &target.identity.locator, target.identity.forknum,
+				  target.identity.blockno);
+	cut.holder.assertion.requester_node = cluster_node_id;
+	cut.holder.base_authority_generation = 1;
+	cut.holder.final_authority_generation = 2;
+	cut.holder.resource_formation = 17;
+	cut.holder.master_session_incarnation = 31;
+	cut.holder.assertion_sequence = 41;
+	cut.holder.requester_target_generation = cluster_pcm_own_gen_get(1);
+	cut.holder.phase = RESOURCE_X_MASTER_SETTLED;
+	cut.binding_generation = 51;
+	cut.transition_count = 4;
+	cut.master_generation = 71;
+	cut.master_node = 1;
+	cut.pi_holders_bitmap = 3;
+	return cut;
+}
+
+static void
+pi_cut_must_match_current_holder_before_data(void)
+{
+	for (int wrong = 0; wrong < 9; wrong++) {
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		ClusterPcmPiWriteCutV1 cut;
+		reset();
+		cut = data_pi_cut();
+		switch (wrong) {
+		case 0:
+			cut.holder.assertion.requester_node++;
+			break;
+		case 1:
+			cut.holder.requester_target_generation++;
+			break;
+		case 2:
+			cut.holder.assertion.resource.blockNum++;
+			break;
+		case 3:
+			cut.holder.phase = RESOURCE_X_MASTER_GRANT_COMMITTED;
+			break;
+		case 4:
+			cut.holder.resource_formation = 0;
+			break;
+		case 5:
+			cut.master_generation = 0;
+			break;
+		case 6:
+			cut.transition_count = UINT64_MAX;
+			break;
+		case 7:
+			cut.pi_holders_bitmap = 0;
+			break;
+		case 8:
+			break; /* NULL is not the ordinary endpoint. */
+		}
+		UT_ASSERT(
+			!cluster_bufmgr_write_page_data_at_cut_v1(&target, wrong == 8 ? NULL : &cut, &receipt));
+		UT_ASSERT(receipt == NULL);
+		UT_ASSERT_EQ(writes + syncs + reads, 0);
+		clean();
+	}
+}
+
 static void
 physical_receipts_close_only_exact_contributions(void)
 {
-	ClusterPageDataReceiptV1 *old = NULL, *main = NULL, *vm = NULL;
+	ClusterPageDataReceiptV1 *old = NULL, *old_at_cut = NULL, *main = NULL, *vm = NULL;
+	ClusterPcmPiWriteCutV1 cut, proven, pi_sentinel;
 	const ClusterPageDataReceiptV1 *receipts[2];
 	ClusterWalSourceRef sources[3];
 	RfPageContributionPrefixV1 prefixes[3] = { { 0 } }, retained[3] = { { 0 } }, sentinel[3];
@@ -1037,6 +1105,16 @@ physical_receipts_close_only_exact_contributions(void)
 	plan = data_contribution_plan(sources);
 	bind_native_record(RM_XLOG_ID, XLOG_FPI);
 	UT_ASSERT(cluster_bufmgr_write_page_data_v1(&target, &old));
+	memset(&pi_sentinel, 0xa5, sizeof(pi_sentinel));
+	proven = pi_sentinel;
+	UT_ASSERT(!cluster_page_data_pi_proof_v1(old, plan, sources, 3, &proven));
+	UT_ASSERT_EQ(memcmp(&proven, &pi_sentinel, sizeof(proven)), 0);
+	cut = data_pi_cut();
+	UT_ASSERT(cluster_bufmgr_write_page_data_at_cut_v1(&target, &cut, &old_at_cut));
+	/* Its own older cut may qualify this earlier DATA. The master must
+	 * reject it after A -> B -> C; the PAGE prefix below leaves B/C owed. */
+	UT_ASSERT(cluster_page_data_pi_proof_v1(old_at_cut, plan, sources, 3, &proven));
+	UT_ASSERT_EQ(memcmp(&proven, &cut, sizeof(proven)), 0);
 	receipts[0] = old;
 	UT_ASSERT(cluster_page_data_prefix_v1(plan, sources, 3, receipts, 1, prefixes));
 	UT_ASSERT_EQ(prefixes[0].first_uncovered_lsn, 0x200);
@@ -1051,7 +1129,19 @@ physical_receipts_close_only_exact_contributions(void)
 	UT_ASSERT(PageSetLSNOrigin(pages[1].data, 2));
 	pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_DIRTY);
 	bind_native_record(RM_XLOG_ID, XLOG_FPI);
-	UT_ASSERT(cluster_bufmgr_write_page_data_v1(&target, &main));
+	cut = data_pi_cut();
+	/* The request still knows A's token. C already changed the page before
+	 * the background request arrived; write the actual current version. */
+	target.version.mutation_token = 80;
+	UT_ASSERT(!cluster_bufmgr_write_page_data_at_cut_v1(&target, &cut, &main));
+	UT_ASSERT(main == NULL);
+	UT_ASSERT(cluster_bufmgr_write_current_data_at_cut_v1(&target, &cut, &main));
+	target.version.mutation_token = 7;
+	UT_ASSERT(cluster_page_data_pi_proof_v1(main, plan, sources, 3, &proven));
+	UT_ASSERT_EQ(memcmp(&proven, &cut, sizeof(proven)), 0);
+	cut.binding_generation++;
+	UT_ASSERT(cluster_page_data_pi_proof_v1(main, plan, sources, 3, &proven));
+	UT_ASSERT(proven.binding_generation != cut.binding_generation);
 	receipts[0] = main;
 	UT_ASSERT(cluster_page_data_prefix_v1(plan, sources, 3, receipts, 1, prefixes));
 	UT_ASSERT_EQ(prefixes[0].first_uncovered_lsn, 0x200);
@@ -1144,6 +1234,7 @@ physical_receipts_close_only_exact_contributions(void)
 		cluster_page_data_receipt_free_v1(&other);
 	}
 	cluster_page_data_receipt_free_v1(&old);
+	cluster_page_data_receipt_free_v1(&old_at_cut);
 	cluster_page_data_receipt_free_v1(&main);
 	cluster_page_data_receipt_free_v1(&vm);
 	rf_page_online_plan_destroy_v1(&plan);
@@ -1167,6 +1258,7 @@ main(void)
 	UT_RUN(foreign_certified_image_uses_original_wal);
 	UT_RUN(ordinary_flush_uses_original_source);
 	UT_RUN(plan_sources_are_immutable);
+	UT_RUN(pi_cut_must_match_current_holder_before_data);
 	UT_RUN(physical_receipts_close_only_exact_contributions);
 	if (file)
 		fclose(file);
