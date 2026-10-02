@@ -1465,6 +1465,93 @@ rf_side_online_plan_space_contribution_count_v1(const RfSideOnlinePlanV1 *plan, 
 }
 
 bool
+rf_side_online_plan_contribution_owners_v1(const RfSideOnlinePlanV1 *plan, uint32 operation,
+										   RfSideContributionOwnersV1 *out)
+{
+	const RfSideOnlineOperationV1 *op;
+	RfSideContributionOwnersV1 result = { 0 };
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| operation >= plan->operation_count || out == NULL)
+		return false;
+	op = &plan->operations[operation];
+	/* Feed decoded every component under the original route and forbade
+	 * routed PAGE references without an owner. Do not turn a new typed kind
+	 * into an empty PCM census by default. */
+	switch (op->kind) {
+	case RF_SIDE_ONLINE_OPERATION_SPACE:
+		result.owners = RF_SIDE_CONTRIBUTION_SPACE;
+		break;
+	case RF_SIDE_ONLINE_OPERATION_XACT:
+		switch (op->xact.kind) {
+		case RF_SIDE_XACT_COMMIT:
+			result.owners = RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL;
+			break;
+		case RF_SIDE_XACT_ABORT:
+			/* Its TT transition is a separate original UNDO record. */
+			result.owners = RF_SIDE_CONTRIBUTION_TERMINAL;
+			break;
+		case RF_SIDE_XACT_PREPARE:
+		case RF_SIDE_XACT_COMMIT_PREPARED:
+		case RF_SIDE_XACT_ABORT_PREPARED:
+			result.owners = RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL
+							| RF_SIDE_CONTRIBUTION_PREPARED;
+			break;
+		default:
+			return false;
+		}
+		break;
+	case RF_SIDE_ONLINE_OPERATION_UNDO:
+		switch (op->undo.kind) {
+		case CLUSTER_UNDO_KIND_SEGMENT_INIT:
+		case CLUSTER_UNDO_KIND_SEGMENT_REUSE:
+			result.owners = RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_UNDO_BLOCK;
+			break;
+		case CLUSTER_UNDO_KIND_TT_BIND:
+		case CLUSTER_UNDO_KIND_TT_COMMIT:
+		case CLUSTER_UNDO_KIND_TT_ABORT:
+		case CLUSTER_UNDO_KIND_TT_SET_HEAD:
+		case CLUSTER_UNDO_KIND_TT_CTRC_RELEASE:
+		case CLUSTER_UNDO_KIND_SEGMENT_RECYCLE:
+			result.owners = RF_SIDE_CONTRIBUTION_UNDO_HEADER;
+			break;
+		case CLUSTER_UNDO_KIND_BLOCK_WRITE:
+		case CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI:
+			result.owners = RF_SIDE_CONTRIBUTION_UNDO_BLOCK;
+			break;
+		default:
+			return false;
+		}
+		break;
+	case RF_SIDE_ONLINE_OPERATION_PROJECTION:
+		switch (op->projection.kind) {
+		case CLUSTER_SIDE_PROJECTION_CLOG:
+			result.owners = RF_SIDE_CONTRIBUTION_CLOG;
+			break;
+		case CLUSTER_SIDE_PROJECTION_MULTIXACT:
+			result.owners = RF_SIDE_CONTRIBUTION_MULTIXACT;
+			break;
+		case CLUSTER_SIDE_PROJECTION_COMMIT_TS:
+			result.owners = RF_SIDE_CONTRIBUTION_COMMIT_TS;
+			break;
+		default:
+			return false;
+		}
+		break;
+	case RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL:
+		result.owners = RF_SIDE_CONTRIBUTION_NATIVE_CONTROL;
+		break;
+	default:
+		return false;
+	}
+	result.space_locator_count = side_operation_space_count(op);
+	if (result.space_locator_count != 0)
+		result.owners |= RF_SIDE_CONTRIBUTION_SPACE;
+	*out = result;
+	return true;
+}
+
+bool
 rf_side_online_plan_space_contribution_v1(const RfSideOnlinePlanV1 *plan, uint32 operation,
 										  uint32 locator_index, RfSideSpaceContributionV1 *out)
 {

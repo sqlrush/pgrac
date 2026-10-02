@@ -152,6 +152,32 @@ typedef struct RfSideSpaceContributionV1 {
 	uint8 page_mask;
 } RfSideSpaceContributionV1;
 
+typedef enum RfSideContributionOwnerV1 {
+	RF_SIDE_CONTRIBUTION_SPACE = 1u << 0,
+	RF_SIDE_CONTRIBUTION_UNDO_HEADER = 1u << 1,
+	RF_SIDE_CONTRIBUTION_UNDO_BLOCK = 1u << 2,
+	RF_SIDE_CONTRIBUTION_TERMINAL = 1u << 3,
+	RF_SIDE_CONTRIBUTION_PREPARED = 1u << 4,
+	RF_SIDE_CONTRIBUTION_CLOG = 1u << 5,
+	RF_SIDE_CONTRIBUTION_MULTIXACT = 1u << 6,
+	RF_SIDE_CONTRIBUTION_COMMIT_TS = 1u << 7,
+	RF_SIDE_CONTRIBUTION_NATIVE_CONTROL = 1u << 8
+} RfSideContributionOwnerV1;
+
+typedef struct RfSideContributionOwnersV1 {
+	uint32 owners;
+	uint32 space_locator_count;
+} RfSideContributionOwnersV1;
+
+/* Classify every original typed owner of a sealed operation, including
+ * retained history. Only SPACE contributes PCM BufferTags; UNDO headers and
+ * blocks, terminal/prepared state, per-origin projections and native control
+ * retain their independent owners. This is a census, never a durability,
+ * replay-completion or WAL-retirement proof. Failure preserves output. */
+extern bool rf_side_online_plan_contribution_owners_v1(const RfSideOnlinePlanV1 *plan,
+													   uint32 operation,
+													   RfSideContributionOwnersV1 *out);
+
 /* All physical SPACE contributions of this original operation, including
  * retained history and every locator in a native COMMIT. Bit zero/one selects
  * SPACE block zero/one. Only the sealed plan's bound namespace is accepted.

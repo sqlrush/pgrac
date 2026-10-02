@@ -20,6 +20,7 @@ typedef struct PiRebuildJob {
 	ClusterThreadRecoveryFabricPlanV1 *plan;
 	uint32 cursor;
 	uint32 side_cursor;
+	uint32 side_locator;
 	uint8 side_block;
 	bool side_blocked;
 	bool side_checked;
@@ -114,20 +115,15 @@ pi_rebuild_side_covered(const ClusterThreadRecoveryFabricPlanV1 *plan, uint32 *b
 	if (side == NULL || count == UINT32_MAX)
 		return false;
 	for (uint32 i = 0; i < count; i++) {
-		RfSideOnlineOperationV1 operation;
-		RfSideSpaceContributionV1 space;
+		RfSideContributionOwnersV1 owners;
 		*blocked = i;
-		if (!rf_side_online_plan_operation_v1(side, i, &operation))
+		if (!rf_side_online_plan_contribution_owners_v1(side, i, &owners))
 			return false;
-		if (operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL)
-			continue;
-		if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE
-			&& rf_side_online_plan_space_contribution_count_v1(side, i) == 1
-			&& rf_side_online_plan_space_contribution_v1(side, i, 0, &space))
-			continue;
-		/* Other owners, including a COMMIT's TT and structural components,
-		 * must all be mapped before the directory can complete its census. */
-		return false;
+		for (uint32 j = 0; j < owners.space_locator_count; j++) {
+			RfSideSpaceContributionV1 space;
+			if (!rf_side_online_plan_space_contribution_v1(side, i, j, &space))
+				return false;
+		}
 	}
 	return true;
 }
@@ -136,23 +132,17 @@ static bool
 pi_rebuild_space(PiRebuildJob *job, const RfPageOnlinePlanV1 *page, const RfSideOnlinePlanV1 *side)
 {
 	RfSideOnlineOperationV1 operation;
+	RfSideContributionOwnersV1 owners;
 	RfSideSpaceContributionV1 contribution;
 	ClusterWalSourceRef source;
 	RfContributorStreamCutV1 physical;
 	BufferTag tag;
 	int node, home;
 	uint32 index = job->side_cursor;
-	uint8 block = job->side_block++;
+	uint8 block = job->side_block;
 
-	if (!rf_side_online_plan_operation_v1(side, index, &operation))
-		return false;
-	if (operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL) {
-		job->side_cursor++;
-		job->side_block = 0;
-		return true;
-	}
-	if (operation.kind != RF_SIDE_ONLINE_OPERATION_SPACE || block > 1
-		|| !rf_side_online_plan_space_contribution_v1(side, index, 0, &contribution)
+	if (!rf_side_online_plan_operation_v1(side, index, &operation)
+		|| !rf_side_online_plan_contribution_owners_v1(side, index, &owners)
 		|| !rf_page_online_plan_source_v1(page, operation.identity.participant_index, &source)
 		|| !cluster_thread_recovery_fabric_cut_v1(job->plan, operation.identity.participant_index,
 												  &physical)
@@ -171,15 +161,27 @@ pi_rebuild_space(PiRebuildJob *job, const RfPageOnlinePlanV1 *page, const RfSide
 		|| operation.identity.record.timeline_id != physical.timeline_id
 		|| operation.identity.record.read_rec_ptr < physical.scan_begin_inclusive
 		|| operation.identity.record.end_rec_ptr > physical.scan_end_exclusive
-		|| operation.identity.record.end_rec_ptr <= operation.identity.record.read_rec_ptr
+		|| operation.identity.record.end_rec_ptr <= operation.identity.record.read_rec_ptr)
+		return false;
+	if (owners.space_locator_count == 0) {
+		/* These exact typed records have no PCM pages. Their own durability
+		 * and recovery gates remain intact; this census does not retire WAL. */
+		job->side_cursor++;
+		return true;
+	}
+	if (block > 1 || job->side_locator >= owners.space_locator_count
+		|| !rf_side_online_plan_space_contribution_v1(side, index, job->side_locator, &contribution)
 		|| contribution.result.key.system_identifier != source.claim.identity.system_identifier
 		|| contribution.result.key.database_incarnation != source.claim.database_incarnation
 		|| memcmp(contribution.result.key.storage_uuid, source.claim.identity.storage_uuid, 16)
 			   != 0)
 		return false;
-	if (block == 1) {
-		job->side_cursor++;
+	if (++job->side_block == 2) {
 		job->side_block = 0;
+		if (++job->side_locator == owners.space_locator_count) {
+			job->side_locator = 0;
+			job->side_cursor++;
+		}
 	}
 	if (!(contribution.page_mask & (1u << block)))
 		return true;

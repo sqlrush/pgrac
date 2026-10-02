@@ -1224,6 +1224,16 @@ UT_TEST(test_abort_prepared_nonempty_undo_retains_native_owner)
 	UT_ASSERT_EQ(prepare_apply.pending_resolves, 0);
 }
 
+static void
+assert_contribution_owners(const RfSideOnlinePlanV1 *plan, uint32 index, uint32 owners,
+						   uint32 space_count)
+{
+	RfSideContributionOwnersV1 result = { 0 };
+	UT_ASSERT(rf_side_online_plan_contribution_owners_v1(plan, index, &result));
+	UT_ASSERT_EQ(result.owners, owners);
+	UT_ASSERT_EQ(result.space_locator_count, space_count);
+}
+
 UT_TEST(test_online_plan_owns_decoded_operation_not_raw_record)
 {
 	FakeXactRecord fake;
@@ -1261,6 +1271,8 @@ UT_TEST(test_online_plan_owns_decoded_operation_not_raw_record)
 	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
 	UT_ASSERT_EQ(operation.xact.xid, 800);
 	UT_ASSERT_EQ(operation.xact.terminal_scn, UINT64_C(901));
+	assert_contribution_owners(plan, 0,
+							   RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL, 0);
 	memset(&capture, 0, sizeof(capture));
 	memset(&apply_ops, 0, sizeof(apply_ops));
 	apply_ops.arg = &capture;
@@ -1370,6 +1382,9 @@ UT_TEST(test_online_plan_owns_typed_projection_records)
 	UT_ASSERT_EQ(operation.projection.action, CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE);
 	UT_ASSERT_EQ(operation.projection.page_number, 19);
 	UT_ASSERT_EQ(operation.projection.oldest_xid, 800);
+	assert_contribution_owners(plan, 0, RF_SIDE_CONTRIBUTION_CLOG, 0);
+	assert_contribution_owners(plan, 1, RF_SIDE_CONTRIBUTION_MULTIXACT, 0);
+	assert_contribution_owners(plan, 2, RF_SIDE_CONTRIBUTION_COMMIT_TS, 0);
 
 	memset(&capture, 0, sizeof(capture));
 	memset(&apply_ops, 0, sizeof(apply_ops));
@@ -1487,6 +1502,7 @@ UT_TEST(test_online_plan_owns_undo_payload_not_raw_record)
 	UT_ASSERT_EQ(operation.owned_payload_length,
 				 UNDO_BLOCK_HDR_PREFIX_LEN + 24 + sizeof(UndoSlotDirEntry));
 	UT_ASSERT_EQ(operation.owned_payload[0], 0x6b);
+	assert_contribution_owners(plan, 0, RF_SIDE_CONTRIBUTION_UNDO_BLOCK, 0);
 	memset(&capture, 0, sizeof(capture));
 	memset(&apply_ops, 0, sizeof(apply_ops));
 	apply_ops.arg = &capture;
@@ -1544,6 +1560,10 @@ UT_TEST(test_online_plan_owns_prepare_state_not_raw_record)
 	if (operation.owned_payload != NULL)
 		memcpy(&magic, operation.owned_payload, sizeof(magic));
 	UT_ASSERT_EQ(magic, UINT32_C(0x57F94534));
+	assert_contribution_owners(plan, 0,
+							   RF_SIDE_CONTRIBUTION_PREPARED | RF_SIDE_CONTRIBUTION_UNDO_HEADER
+								   | RF_SIDE_CONTRIBUTION_TERMINAL,
+							   0);
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
@@ -2638,6 +2658,12 @@ UT_TEST(test_online_undo_header_evolves_init_bind_and_folded_commit)
 	undo_header_commit(&fake, 0, 802);
 	undo_header_feed(plan, &fake, 400);
 	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	assert_contribution_owners(
+		plan, 0, RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_UNDO_BLOCK, 0);
+	assert_contribution_owners(plan, 1, RF_SIDE_CONTRIBUTION_UNDO_HEADER, 0);
+	assert_contribution_owners(plan, 2, RF_SIDE_CONTRIBUTION_UNDO_BLOCK, 0);
+	assert_contribution_owners(plan, 3,
+							   RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL, 0);
 	memset(&image, 0x7a, sizeof(image));
 	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, NULL, &image),
 		RF_PAGE_PROOF_DETAIL_OK);
@@ -3445,6 +3471,7 @@ UT_TEST(test_space_contribution_census_includes_history_and_every_drop_page)
 	XLogRecPtr redo = 300;
 	RfSideOnlinePlanV1 *plan = space_online_plan_redo(300, &redo);
 	RfSideSpaceContributionV1 contribution, saved;
+	RfSideContributionOwnersV1 owners = { UINT32_MAX, UINT32_MAX }, saved_owners = owners;
 	RfSideOnlineOperationV1 op;
 	FakeXactRecord fake;
 	uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
@@ -3453,6 +3480,8 @@ UT_TEST(test_space_contribution_census_includes_history_and_every_drop_page)
 	saved = contribution;
 	UT_ASSERT_EQ(rf_side_online_plan_space_contribution_count_v1(plan, 0), UINT32_MAX);
 	UT_ASSERT(!rf_side_online_plan_space_contribution_v1(plan, 0, 0, &contribution));
+	UT_ASSERT(!rf_side_online_plan_contribution_owners_v1(plan, 0, &owners));
+	UT_ASSERT(memcmp(&owners, &saved_owners, sizeof(owners)) == 0);
 	UT_ASSERT(memcmp(&contribution, &saved, sizeof(saved)) == 0);
 	UT_ASSERT(cluster_space_reservation_wal_encode(&advance, wal, sizeof(wal)));
 	UT_ASSERT_EQ(space_online_feed(plan, XLOG_SMGR_SPACE_RESERVATION, wal, sizeof(wal), 100, false),
@@ -3467,6 +3496,11 @@ UT_TEST(test_space_contribution_census_includes_history_and_every_drop_page)
 	UT_ASSERT(op.history_only);
 	UT_ASSERT_EQ(rf_side_online_plan_space_contribution_count_v1(plan, 0), 1);
 	UT_ASSERT_EQ(rf_side_online_plan_space_contribution_count_v1(plan, 1), 2);
+	assert_contribution_owners(plan, 0, RF_SIDE_CONTRIBUTION_SPACE, 1);
+	assert_contribution_owners(plan, 1,
+							   RF_SIDE_CONTRIBUTION_SPACE | RF_SIDE_CONTRIBUTION_UNDO_HEADER
+								   | RF_SIDE_CONTRIBUTION_TERMINAL,
+							   2);
 	if (rf_side_online_plan_space_contribution_v1(plan, 0, 0, &contribution)) {
 		UT_ASSERT_EQ(contribution.page_mask, 2);
 		UT_ASSERT_EQ(contribution.result_token[0], 0);
@@ -3493,6 +3527,10 @@ UT_TEST(test_space_contribution_census_includes_history_and_every_drop_page)
 	UT_ASSERT(!rf_side_online_plan_space_contribution_v1(plan, 1, 2, &contribution));
 	UT_ASSERT(!rf_side_online_plan_space_contribution_v1(plan, 2, 0, &contribution));
 	UT_ASSERT_EQ(rf_side_online_plan_space_contribution_count_v1(plan, 2), UINT32_MAX);
+	UT_ASSERT(!rf_side_online_plan_contribution_owners_v1(plan, 2, &owners));
+	UT_ASSERT(!rf_side_online_plan_contribution_owners_v1(NULL, 0, &owners));
+	UT_ASSERT(!rf_side_online_plan_contribution_owners_v1(plan, 0, NULL));
+	UT_ASSERT(memcmp(&owners, &saved_owners, sizeof(owners)) == 0);
 	UT_ASSERT(memcmp(&contribution, &saved, sizeof(saved)) == 0);
 	rf_side_online_plan_destroy_v1(&plan);
 }
@@ -3785,6 +3823,7 @@ UT_TEST(test_native_control_is_owned_input_and_not_replay_permission)
 		memset(fake.data, 0xa5, length);
 		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 1);
+		assert_contribution_owners(plan, 0, RF_SIDE_CONTRIBUTION_NATIVE_CONTROL, 0);
 		if (rf_side_online_plan_operation_v1(plan, 0, &operation)) {
 			UT_ASSERT_EQ(operation.kind, RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL);
 			UT_ASSERT_EQ(operation.owned_payload_length, length);

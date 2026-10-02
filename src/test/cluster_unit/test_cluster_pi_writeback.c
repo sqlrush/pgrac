@@ -36,6 +36,8 @@ static RfPageOnlinePlanV1 *wb_page_plan;
 static unsigned wb_plan_builds, wb_input_releases, wb_sends;
 static RfSideOnlineOperationKindV1 wb_side_kind;
 static bool wb_space_valid;
+static bool wb_side_mapped;
+static uint32 wb_space_count;
 static RfSideSpaceContributionV1 wb_space_contribution;
 const RfSideOnlinePlanV1 *
 cluster_thread_recovery_fabric_side_plan_v1(const ClusterThreadRecoveryFabricPlanV1 *plan)
@@ -56,7 +58,8 @@ rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 	memset(out, 0, sizeof(*out));
 	out->kind = wb_side_kind;
 	out->history_only = true; /* Retained predecessors also carry PI duties. */
-	if (wb_space_valid) {
+	if (wb_space_valid || wb_side_mapped
+		|| wb_side_kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL) {
 		RfPageOnlineTargetViewV1 view;
 		UT_ASSERT(rf_page_online_plan_target_v1(wb_page_plan, 0, &view));
 		for (uint32 i = 0; i < view.contributors->edge_count; i++)
@@ -68,20 +71,35 @@ rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 	}
 	return true;
 }
+bool
+rf_side_online_plan_contribution_owners_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+										   RfSideContributionOwnersV1 *out)
+{
+	if (index != 0
+		|| (!wb_side_mapped && !wb_space_valid
+			&& wb_side_kind != RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL))
+		return false;
+	out->space_locator_count = wb_space_valid ? wb_space_count : 0;
+	out->owners = wb_space_valid ? RF_SIDE_CONTRIBUTION_SPACE : RF_SIDE_CONTRIBUTION_NATIVE_CONTROL;
+	if (wb_side_kind == RF_SIDE_ONLINE_OPERATION_XACT)
+		out->owners |= RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL;
+	return true;
+}
 /* The SIDE planner is an explicit boundary in this endpoint fixture. Its
  * typed payload/history enumeration executes separately in side_xact. */
 uint32
 rf_side_online_plan_space_contribution_count_v1(const RfSideOnlinePlanV1 *plan, uint32 index)
 {
-	return wb_space_valid && index == 0 ? 1 : UINT32_MAX;
+	return wb_space_valid && index == 0 ? wb_space_count : UINT32_MAX;
 }
 bool
 rf_side_online_plan_space_contribution_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 										  uint32 locator, RfSideSpaceContributionV1 *out)
 {
-	if (!wb_space_valid || index != 0 || locator != 0)
+	if (!wb_space_valid || index != 0 || locator >= wb_space_count)
 		return false;
 	*out = wb_space_contribution;
+	out->result.key.locator.relNumber += locator;
 	return true;
 }
 bool
@@ -163,6 +181,11 @@ cluster_pcm_rebuild_pi_contributors_v1(const ClusterGrdPiRebuildCutV1 *cut, Buff
 	UT_ASSERT(wb_inputs_pinned[cluster_node_id]);
 	InitBufferTag(&expected, &target.identity.locator, tag.forkNum,
 				  tag.forkNum == SPACE_FORKNUM ? tag.blockNum : target.identity.blockno);
+	if (tag.forkNum == SPACE_FORKNUM) {
+		UT_ASSERT(tag.relNumber >= expected.relNumber
+				  && tag.relNumber - expected.relNumber < wb_space_count);
+		expected.relNumber = tag.relNumber;
+	}
 	UT_ASSERT(BufferTagsEqual(&tag, &expected));
 	UT_ASSERT_NE(lsn, 0);
 	if (tag.forkNum == SPACE_FORKNUM) {
@@ -873,6 +896,8 @@ rebuild_setup(void)
 	ClusterPageDataReceiptV1 *data = wb_setup();
 	wb_side_kind = RF_SIDE_ONLINE_OPERATION_INVALID;
 	wb_space_valid = false;
+	wb_side_mapped = false;
+	wb_space_count = 1;
 	memset(&wb_space_contribution, 0, sizeof(wb_space_contribution));
 	wb_select(0, B_BG_WRITER);
 	memset(&rebuild_cut, 0, sizeof(rebuild_cut));
@@ -944,6 +969,38 @@ UT_TEST(retained_rebuild_maps_both_space_pages_under_original_source)
 		UT_ASSERT_EQ(rebuild_completions, invalid ? 0 : 1);
 		UT_ASSERT(!wb_inputs_pinned[0]);
 		UT_ASSERT(pi_rebuild_job == NULL);
+		pi_rebuild_release();
+		cluster_page_data_receipt_free_v1(&data);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(retained_rebuild_maps_commit_drop_and_separate_non_pcm_owners)
+{
+	for (unsigned drop_count = 0; drop_count <= 40; drop_count += 20) {
+		ClusterPageDataReceiptV1 *data = rebuild_setup();
+		bool pending;
+		wb_side_kind = RF_SIDE_ONLINE_OPERATION_XACT;
+		wb_side_mapped = true;
+		wb_space_valid = drop_count != 0;
+		wb_space_count = drop_count;
+		wb_space_contribution.result = identity;
+		wb_space_contribution.page_mask = 3;
+		wb_space_contribution.result_token[0] = 53;
+		wb_space_contribution.result_token[1] = 41;
+		pending = cluster_pi_rebuild_bgwriter_tick_v1();
+		UT_ASSERT_EQ(pending, drop_count == 40);
+		if (drop_count == 40) {
+			UT_ASSERT_EQ(rebuild_applies, 64);
+			UT_ASSERT_EQ(rebuild_completions, 0);
+			UT_ASSERT(!wb_inputs_pinned[0]);
+			UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+		}
+		UT_ASSERT_EQ(rebuild_applies, 2 + 2 * drop_count);
+		UT_ASSERT_EQ(rebuild_completions, 1);
+		UT_ASSERT_EQ(rebuild_side_blocked, 0);
+		UT_ASSERT_EQ(rebuild_logs, 0);
 		pi_rebuild_release();
 		cluster_page_data_receipt_free_v1(&data);
 		rf_page_online_plan_destroy_v1(&wb_page_plan);
@@ -1023,7 +1080,7 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(remote_physical_ack_runs_actual_ancestry_and_disposal);
 	UT_RUN(writeback_codec_has_exact_bounded_authenticated_facts);
 	UT_RUN(writeback_rejects_foreign_sender_boot_and_changed_master_cut);
@@ -1036,6 +1093,7 @@ main(void)
 	UT_RUN(retained_rebuild_never_completes_with_unmapped_side_contributions);
 	UT_RUN(retained_rebuild_restores_all_original_writers_before_complete);
 	UT_RUN(retained_rebuild_maps_both_space_pages_under_original_source);
+	UT_RUN(retained_rebuild_maps_commit_drop_and_separate_non_pcm_owners);
 	UT_RUN(retained_rebuild_waits_unpinned_and_rejects_incomplete_or_changed_cut);
 	UT_RUN(retained_rebuild_root_change_or_apply_failure_never_completes);
 	UT_RUN(retained_rebuild_error_cleanup_and_postapply_root_check);
