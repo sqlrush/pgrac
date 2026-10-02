@@ -656,12 +656,14 @@ page_chain_link(ClusterColdPlanV1 *plan, const uint32 *group, uint32 count, uint
 static bool
 data_shape_valid(const ClusterColdDataV1 *data)
 {
-	static const uint8 zero[7] = { 0 };
+	static const uint8 zero[6] = { 0 };
 
-	if (memcmp(data->reserved_zero, zero, sizeof(zero)) != 0)
+	if (memcmp(data->reserved_zero, zero, sizeof(zero)) != 0
+		|| (data->flags & ~CLUSTER_COLD_DATA_KNOWN_FLAGS) != 0)
 		return false;
 	switch (data->kind) {
 	case CLUSTER_COLD_DATA_INVALID:
+		return data->flags == 0;
 	case CLUSTER_COLD_DATA_ABSENT:
 		return true;
 	case CLUSTER_COLD_DATA_PRESENT:
@@ -750,6 +752,27 @@ page_data_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 			return CLUSTER_COLD_ANCHOR_MISSING;
 		}
 		*exact = false;
+		*covered = anchor - 1;
+		return CLUSTER_COLD_OK;
+	}
+	/*
+	 * Unless its content was verified, only the header placed DATA.  Any
+	 * replayable change may have been in flight when the instances failed,
+	 * and a torn write can leave that header over another version's body,
+	 * so that content is never a redo base: as with full_page_writes, the
+	 * earliest anchor after the last history change rebuilds the page and
+	 * everything before it is skipped.  A single stream always has that
+	 * anchor (its first change after the redo start logs a full image);
+	 * across generations it can be missing (a change after another
+	 * generation's history need not log one), and the page is refused.
+	 */
+	if ((data->flags & CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED) == 0) {
+		anchor = page_earliest_replayable_anchor(plan, chain, count, (int64)count);
+		if (anchor < 0) {
+			diag_component(plan, diag, chain[0]);
+			diag->version = data->version;
+			return CLUSTER_COLD_CONTENT_UNPROVEN;
+		}
 		*covered = anchor - 1;
 		return CLUSTER_COLD_OK;
 	}

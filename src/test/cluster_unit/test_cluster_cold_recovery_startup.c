@@ -227,6 +227,7 @@ cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterCol
 	observer->pages_observed++;
 	memset(out, 0, sizeof(*out));
 	out->kind = CLUSTER_COLD_DATA_PRESENT;
+	out->flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED; /* data checksums on */
 	memset(out->version.segment_incarnation, 7, 16);
 	out->version.mutation_token = data_token;
 	return true;

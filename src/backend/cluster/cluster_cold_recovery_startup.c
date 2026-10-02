@@ -82,6 +82,7 @@ cold_detail_name(ClusterColdDetailV1 detail)
 		"lifecycle record unsupported",
 		"opcode unsupported",
 		"side owner missing",
+		"page content unproven",
 	};
 
 	return (int)detail >= 0 && (Size)detail < lengthof(names) ? names[detail] : "unknown";

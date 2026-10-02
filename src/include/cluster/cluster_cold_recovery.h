@@ -77,7 +77,8 @@ typedef enum ClusterColdDetailV1 {
 	CLUSTER_COLD_STATE = 16,				  /* wrong phase or already failed */
 	CLUSTER_COLD_STRUCTURAL_UNSUPPORTED = 17, /* lifecycle record needs its owner */
 	CLUSTER_COLD_OPCODE_UNSUPPORTED = 18,	  /* outside the closed route registry */
-	CLUSTER_COLD_SIDE_OWNER_MISSING = 19	  /* side effect without a cold owner */
+	CLUSTER_COLD_SIDE_OWNER_MISSING = 19,	  /* side effect without a cold owner */
+	CLUSTER_COLD_CONTENT_UNPROVEN = 20		  /* unverified DATA and no anchor rebuilds it */
 } ClusterColdDetailV1;
 
 /* Exact physical cut of one writer generation, all from one ROOT token. */
@@ -145,12 +146,19 @@ typedef enum ClusterColdDataKindV1 {
 } ClusterColdDataKindV1;
 
 /* Observed shared DATA state of one page.  PRESENT carries the exact
- * version; UNFORMATTED carries only the segment incarnation. */
+ * version; UNFORMATTED carries only the segment incarnation.  CONTENT_VERIFIED
+ * means the whole page was proven (page checksum, all-zero page or no
+ * block); without it only the header is known, and a torn write can leave
+ * that header over another version's body. */
 typedef struct ClusterColdDataV1 {
 	uint8 kind;
-	uint8 reserved_zero[7];
+	uint8 flags; /* CLUSTER_COLD_DATA_FLAG_* */
+	uint8 reserved_zero[6];
 	RfPageVersionV1 version;
 } ClusterColdDataV1;
+
+#define CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED UINT8_C(0x01)
+#define CLUSTER_COLD_DATA_KNOWN_FLAGS UINT8_C(0x01)
 
 /* Read-only DATA observation.  False means the observation itself failed
  * (I/O, identity); the plan then refuses instead of guessing. */
