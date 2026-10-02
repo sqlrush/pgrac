@@ -159,18 +159,44 @@ fixture(void)
 	cluster_shared_config = true;
 }
 
-UT_TEST(all_crashed_retained_history_cannot_enter_native_redo)
+/* Retained history before the native redo is ancestry for the typed cold
+ * plan: the projection engages from the same-token native redo and never
+ * hands the physical lower to replay as a redo start. */
+UT_TEST(all_crashed_retained_history_engages_from_native_redo)
 {
 	uint64 bitmap[2];
 	XLogRecPtr starts[CLUSTER_WAL_STATE_SLOT_COUNT + 1] = { 0 };
 	fixture();
 	roots[3].checkpoint_lower_lsn = 0x100; /* old peer FPI precedes real redo */
+	if (setjmp(fatal_jump) != 0) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT_EQ(cluster_recovery_merge_project_readonly(1, 0x900, bitmap, starts),
+				 CLUSTER_MERGE_ENGAGE);
+	UT_ASSERT_EQ(starts[3], 0x800);
+	UT_ASSERT_EQ(source_calls, 3);
+}
+
+UT_TEST(native_redo_outside_retained_cut_refused)
+{
+	uint64 bitmap[2];
+	XLogRecPtr starts[CLUSTER_WAL_STATE_SLOT_COUNT + 1] = { 0 };
+	fixture();
+	roots[2].checkpoint_lower_lsn = 0x900; /* lower beyond the native redo */
 	if (setjmp(fatal_jump) == 0) {
 		(void)cluster_recovery_merge_project_readonly(1, 0x900, bitmap, starts);
 		UT_ASSERT(false);
 	}
-	UT_ASSERT(strstr(details, "retained history") != NULL);
-	UT_ASSERT(starts[3] != 0x100);
+	UT_ASSERT(strstr(details, "native checkpoint") != NULL);
+	UT_ASSERT_EQ(starts[2], 0);
+	fixture();
+	redo[4] = 0x1800; /* native redo beyond the validated tail */
+	if (setjmp(fatal_jump) == 0) {
+		(void)cluster_recovery_merge_project_readonly(1, 0x900, bitmap, starts);
+		UT_ASSERT(false);
+	}
+	UT_ASSERT(strstr(details, "native checkpoint") != NULL);
 }
 
 UT_TEST(all_crashed_equal_native_cuts_preserve_original_gate)
@@ -227,8 +253,9 @@ UT_TEST(warm_and_legacy_paths_do_not_borrow_canonical_authority)
 int
 main(void)
 {
-	UT_PLAN(4);
-	UT_RUN(all_crashed_retained_history_cannot_enter_native_redo);
+	UT_PLAN(5);
+	UT_RUN(all_crashed_retained_history_engages_from_native_redo);
+	UT_RUN(native_redo_outside_retained_cut_refused);
 	UT_RUN(all_crashed_equal_native_cuts_preserve_original_gate);
 	UT_RUN(unproven_native_anchor_cannot_fall_back_to_lower);
 	UT_RUN(warm_and_legacy_paths_do_not_borrow_canonical_authority);

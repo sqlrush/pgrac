@@ -988,9 +988,10 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 							 "%sthread %u peer (node %d) is not a shared-root participant",
 							 blockers.len ? "; " : "", (unsigned)tid, (int)tid - 1);
 
-		/* The canonical physical retention floor is not a redo start.
-		 * Until cold replay consumes the full typed ancestry plan, refuse
-		 * a peer with retained history before its same-token native redo.
+		/* The canonical physical retention floor is not a redo start.  The
+		 * shared profile replays from the same-token native redo and hands
+		 * the retained prefix to the typed cold plan as ancestry only
+		 * (cluster_cold_recovery_plan.c); an unproven anchor still refuses.
 		 * The legacy profile keeps its original checkpoint semantics. */
 		{
 			ClusterControlRootIdentity root_identity;
@@ -1021,17 +1022,13 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 
 					root_result = cluster_control_root_recovery_source_v1(
 						&root_snapshot, &root_token, &source, &redo);
-					if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || redo == 0) {
+					if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || redo == 0
+						|| redo < root_snapshot.checkpoint_lower_lsn
+						|| redo > root_snapshot.validated_tail_lsn_exclusive) {
 						appendStringInfo(
 							&blockers,
 							"%sthread %u native checkpoint input is unproven (result %d)",
 							blockers.len ? "; " : "", (unsigned)tid, (int)root_result);
-						continue;
-					}
-					if (redo != root_snapshot.checkpoint_lower_lsn) {
-						appendStringInfo(
-							&blockers, "%sthread %u retained history requires typed cold recovery",
-							blockers.len ? "; " : "", (unsigned)tid);
 						continue;
 					}
 				}
@@ -1041,18 +1038,16 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 	}
 
 	if (blockers.len > 0)
-		ereport(
-			FATAL,
-			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-			 errmsg("merged k-way recovery refused"), errdetail("%s.", blockers.data),
-			 errhint("%s", cluster_shared_config
-							   ? "Preserve all original thread WAL and shared configuration. "
-								 "Shared mode requires merged recovery; retained history needs "
-								 "a supported typed cold-recovery path before startup can proceed."
-							   : "Resolve the shared WAL storage / configuration, or set "
-								 "cluster.merged_recovery=off to recover this node's own "
-								 "stream only (a crashed peer's committed WAL will not be "
-								 "recovered).")));
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+				 errmsg("merged k-way recovery refused"), errdetail("%s.", blockers.data),
+				 errhint("%s", cluster_shared_config
+								   ? "Preserve all original thread WAL and shared configuration. "
+									 "Shared mode requires merged recovery; do not disable it."
+								   : "Resolve the shared WAL storage / configuration, or set "
+									 "cluster.merged_recovery=off to recover this node's own "
+									 "stream only (a crashed peer's committed WAL will not be "
+									 "recovered).")));
 	pfree(blockers.data);
 	return CLUSTER_MERGE_ENGAGE;
 }
@@ -1301,8 +1296,7 @@ cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFencePlan *plan)
 	uint16 i;
 
 	if (!recovery_fence_plan_valid(plan) || !plan->sealed || plan->serial_held || plan->committed
-		|| plan->origin_count == 0 || plan->serial_guards.count != 0
-		|| plan->retention_pin != NULL)
+		|| plan->origin_count == 0 || plan->serial_guards.count != 0 || plan->retention_pin != NULL)
 		return false;
 	/* PGRAC: retain the complete original input before acquiring IR. The pin
 	 * borrows the plan's fence owners until BOTH releases are confirmed.
@@ -1326,8 +1320,8 @@ cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFencePlan *plan)
 				break;
 			}
 		}
-		pin_result = valid ? cluster_wal_retention_pin_acquire(
-								  pin_requests, plan->origin_count, &plan->retention_pin)
+		pin_result = valid ? cluster_wal_retention_pin_acquire(pin_requests, plan->origin_count,
+															   &plan->retention_pin)
 						   : CLUSTER_WAL_PIN_INVALID;
 		pfree(intervals);
 		pfree(pin_requests);
@@ -1450,6 +1444,27 @@ cluster_recovery_merge_fence_plan_copy_replay(const ClusterRecoveryFencePlan *pl
 	return true;
 }
 
+/* Copy one fenced origin's exact ROOT input.  Read-only; grants nothing. */
+bool
+cluster_recovery_merge_fence_plan_origin(const ClusterRecoveryFencePlan *plan, uint16 index,
+										 uint16 *origin_thread, ClusterControlRootSnapshot *root,
+										 ClusterControlRootReadToken *token)
+{
+	if (!recovery_fence_plan_valid(plan) || !plan->sealed || index >= plan->origin_count
+		|| origin_thread == NULL || root == NULL || token == NULL)
+		return false;
+	*origin_thread = plan->origins[index].origin_thread;
+	*root = plan->origins[index].root_snapshot;
+	*token = plan->origins[index].root_token;
+	return true;
+}
+
+uint16
+cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *plan)
+{
+	return recovery_fence_plan_valid(plan) && plan->sealed ? plan->origin_count : 0;
+}
+
 bool
 cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan)
 {
@@ -1482,9 +1497,8 @@ cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *pl
 /* Borrow only the exact original owners; an origin number or COLD_FORMED
  * enum alone cannot authorize a canonical SIDE/PAGE mutation. */
 bool
-cluster_recovery_merge_fence_plan_authority(ClusterRecoveryFencePlan *plan,
-										 uint16 origin_thread,
-										 ClusterThreadRecoveryAuthorityV1 *out)
+cluster_recovery_merge_fence_plan_authority(ClusterRecoveryFencePlan *plan, uint16 origin_thread,
+											ClusterThreadRecoveryAuthorityV1 *out)
 {
 	ClusterThreadRecoveryAuthorityV1 authority;
 	ClusterRecoveryFenceOrigin *origin;

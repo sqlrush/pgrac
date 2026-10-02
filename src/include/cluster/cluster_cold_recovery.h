@@ -305,6 +305,60 @@ extern ClusterColdDetailV1 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, ui
 													 bool space_active,
 													 ClusterColdScanResultV1 *result);
 
+/*
+ * Typed cold replay driver state (startup process).  prepare() runs pass 1
+ * with external admissions held and before the serial set is taken; refusal
+ * is returned in `refusal`/`refusal_detail` so the caller can release what
+ * it holds before failing startup.
+ */
+struct ClusterRecoveryFencePlan;
+
+typedef struct ClusterColdTypedV1 {
+	MemoryContext context;
+	ClusterColdPlanV1 *plan;
+	ClusterColdDetailV1 refusal; /* CLUSTER_COLD_OK when sealed */
+	char refusal_detail[512];
+	uint32 participant_count;
+	uint32 own_participant;
+	uint64 system_identifier;
+	uint64 scanned_records;
+	ClusterColdObserverV1 observer;
+	ClusterColdParticipantV1 participants[CLUSTER_COLD_MAX_PARTICIPANTS];
+	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
+} ClusterColdTypedV1;
+
+extern ClusterColdTypedV1 *cluster_cold_typed_prepare_v1(struct ClusterRecoveryFencePlan *fence,
+														 uint16 own_thread, XLogRecPtr own_redo);
+extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
+
+/*
+ * Per-block decision consumed by the typed cold redo consultation in
+ * XLogReadBufferForRedoExtended (whose owner also stamps the result
+ * version).  NATIVE outside a published step and for blocks without a
+ * PageVersion component; SKIP never reads the block; APPLY restores the
+ * image or redoes without LSN/SCN freshness checks after verifying
+ * expected_before.  False means the request does not match the published
+ * record and replay must stop.
+ */
+typedef enum ClusterColdRedoBlockActionV1 {
+	CLUSTER_COLD_REDO_NATIVE = 0,
+	CLUSTER_COLD_REDO_SKIP = 1,
+	CLUSTER_COLD_REDO_APPLY = 2
+} ClusterColdRedoBlockActionV1;
+
+typedef struct ClusterColdRedoBlockV1 {
+	ClusterColdRedoBlockActionV1 action;
+	uint8 expected_kind; /* ClusterColdDataKindV1; INVALID = any content */
+	uint8 reserved_zero[3];
+	RfPageVersionV1 expected_before;
+	RfPageVersionV1 result;
+} ClusterColdRedoBlockV1;
+
+extern void cluster_cold_redo_step_enter_v1(const ClusterColdStepV1 *step);
+extern void cluster_cold_redo_step_leave_v1(void);
+extern bool cluster_cold_redo_block_decision_v1(struct XLogReaderState *record, uint8 block_id,
+												ClusterColdRedoBlockV1 *out);
+
 #endif /* !FRONTEND */
 
 #endif /* CLUSTER_COLD_RECOVERY_H */
