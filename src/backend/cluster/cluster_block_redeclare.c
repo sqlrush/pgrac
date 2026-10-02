@@ -121,9 +121,26 @@ cluster_block_redeclare_decode_v1(const void *data, Size length, ClusterBlockRed
 }
 
 static bool
-rd_current(const ClusterBlockRedeclareV1 *m)
+rd_namespace(const ClusterBlockRedeclareV1 *m, uint64 boot)
 {
 	ClusterWalSourceRef local;
+	/* A fresh master receives its census before StartupXLOG installs the
+	 * ordinary writer. The validated restart mirror supplies namespace only;
+	 * current membership below still authenticates both live process boots. */
+	if (cluster_wal_thread_current_v2_ref(&local)) {
+		if (local.claim.identity.origin_owner_incarnation != boot)
+			return false;
+	} else if (cluster_node_id != m->master_node || cluster_node_id == m->source_node
+			   || !cluster_wal_thread_restart_v2_ref(&local))
+		return false;
+	return local.claim.identity.origin_node_id == cluster_node_id
+		   && local.claim.identity.system_identifier == m->system_identifier
+		   && memcmp(local.claim.identity.storage_uuid, m->storage_uuid, 16) == 0;
+}
+
+static bool
+rd_current(const ClusterBlockRedeclareV1 *m)
+{
 	uint64 census_hash;
 	uint64 boot = cluster_qvotec_get_self_incarnation();
 	return MyBackendType == B_LMON && cluster_enabled && cluster_shared_config && rd_valid(m)
@@ -139,11 +156,7 @@ rd_current(const ClusterBlockRedeclareV1 *m)
 		   && cluster_gcs_lookup_master(m->tag) == m->master_node
 		   && cluster_grd_block_redeclare_state_v1(m->tag, m->epoch, &census_hash) == 1
 		   && census_hash == m->census_hash && GetSystemIdentifier() == m->system_identifier
-		   && cluster_wal_thread_current_v2_ref(&local)
-		   && local.claim.identity.origin_node_id == cluster_node_id
-		   && local.claim.identity.origin_owner_incarnation == boot
-		   && local.claim.identity.system_identifier == m->system_identifier
-		   && memcmp(local.claim.identity.storage_uuid, m->storage_uuid, 16) == 0;
+		   && rd_namespace(m, boot);
 }
 
 static bool

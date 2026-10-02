@@ -70,6 +70,29 @@
 #include "lib/ilist.h"
 #include "port/atomics.h"
 #include "storage/lock.h" /* LOCKTAG */
+#include "storage/spin.h"
+
+/* Local frozen directory identity, never a DATA or retirement proof. */
+typedef struct ClusterGrdPiRebuildCutV1 {
+	uint64 epoch;
+	uint64 event_id;
+	uint64 redeclare_generation;
+	uint64 master_map_refresh;
+	uint64 routing_generation;
+	uint64 self_boot;
+	uint32 direction;
+	uint32 reserved_zero;
+	uint8 affected[CLUSTER_MAX_NODES / 8];
+	uint8 members[CLUSTER_MAX_NODES / 8];
+	uint64 member_boots[CLUSTER_MAX_NODES];
+} ClusterGrdPiRebuildCutV1;
+
+/* 0: no local takeover, -1: not yet a complete protocol cut, 1: frozen cut.
+ * The common protocol barrier remains distinct from PI/DATA completion. */
+extern int cluster_grd_pi_rebuild_snapshot_v1(ClusterGrdPiRebuildCutV1 *out);
+extern bool cluster_grd_pi_rebuild_current_v1(const ClusterGrdPiRebuildCutV1 *cut);
+extern bool cluster_grd_pi_rebuild_complete_v1(const ClusterGrdPiRebuildCutV1 *cut);
+extern bool cluster_grd_pi_rebuild_gate_v1(void);
 
 typedef struct ClusterFormationSnapshotV1 ClusterFormationSnapshotV1;
 
@@ -419,6 +442,8 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 join_pcm_fence_epoch;
 	pg_atomic_uint64 join_pcm_fence_member_epoch[CLUSTER_MAX_NODES];
 	pg_atomic_uint32 recovery_direction;
+	slock_t pi_rebuild_lock;
+	ClusterGrdPiRebuildCutV1 pi_rebuilt;
 
 	/*
 	 * TT lane / crash-rejoin re-declare barrier (Shape A) — off-path boot

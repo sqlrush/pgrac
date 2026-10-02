@@ -41,6 +41,7 @@
 #include "cluster/cluster_ges.h"	  /* GesRequestPayload / RELEASE cleanup payload */
 #include "cluster/cluster_ges_mode.h" /* spec-5.1b D1: ges_modes_compatible (frozen matrix) */
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_pi_rebuild.h"
 #include "cluster/cluster_grd_outbound.h" /* cluster_grd_outbound_enqueue_cleanup_release (D10) */
 #include "cluster/cluster_hw_remaster.h" /* spec-5.7 D3 S5d — HW authority rebuild launch + gate */
 #include "cluster/cluster_lmd.h"		 /* spec-2.24 D10 cleanup_*_count_inc */
@@ -939,6 +940,8 @@ cluster_grd_shmem_init(void)
 		for (i = 0; i < CLUSTER_MAX_NODES; i++)
 			pg_atomic_init_u64(&cluster_grd_state->join_pcm_fence_member_epoch[i], 0);
 		pg_atomic_init_u32(&cluster_grd_state->recovery_direction, (uint32)GRD_REMASTER_DIR_NONE);
+		SpinLockInit(&cluster_grd_state->pi_rebuild_lock);
+		memset(&cluster_grd_state->pi_rebuilt, 0, sizeof(cluster_grd_state->pi_rebuilt));
 		/* Shape A: off-path boot barrier starts UNDECIDED (fail-closed). */
 		pg_atomic_init_u32(&cluster_grd_state->offpath_boot_decided, 0);
 		pg_atomic_init_u64(&cluster_grd_state->join_remaster_started_count, 0);
@@ -2054,8 +2057,12 @@ cluster_grd_join_view_rebuilt(void)
 bool
 cluster_grd_block_view_rebuilt(BufferTag tag)
 {
-	(void)tag;
-	return cluster_grd_join_view_rebuilt();
+	if (!cluster_grd_join_view_rebuilt())
+		return false;
+	/* Remote requesters may retry after the protocol barrier. The actual
+	 * master additionally waits for its own complete retained contributions. */
+	return !cluster_shared_config || cluster_gcs_lookup_master(tag) != cluster_node_id
+		   || !cluster_grd_pi_rebuild_gate_v1();
 }
 
 /*
@@ -2489,6 +2496,148 @@ grd_control_authority_pending(void)
 		   > pg_atomic_read_u64(&cluster_grd_state->recovery_authority_terminal_generation);
 }
 
+static int
+grd_pi_rebuild_cut(ClusterGrdPiRebuildCutV1 *out)
+{
+	ClusterGrdRecoveryControlSnapshotV1 failure;
+	uint32 state, direction;
+	int origin = -1;
+
+	memset(out, 0, sizeof(*out));
+	if (!cluster_enabled || !cluster_shared_config)
+		return 0;
+	if (!grd_control_map_current() || cluster_node_id < 0 || cluster_node_id >= 32)
+		return -1;
+	state = pg_atomic_read_u32(&cluster_grd_state->recovery_state);
+	direction = pg_atomic_read_u32(&cluster_grd_state->recovery_direction);
+	out->epoch = cluster_epoch_get_current();
+	if (state != GRD_RECOVERY_IDLE && direction == GRD_REMASTER_DIR_FAIL) {
+		if (state != GRD_RECOVERY_WAIT_CLUSTER)
+			return -1;
+		for (int i = 0; i < CLUSTER_MAX_NODES; i++)
+			if (pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[i / 64])
+				& (UINT64CONST(1) << (i % 64))) {
+				origin = i;
+				break;
+			}
+		if (origin < 0 || !cluster_grd_recovery_control_snapshot(origin + 1, &failure))
+			return -1;
+		out->direction = GRD_REMASTER_DIR_FAIL;
+		out->event_id = failure.event_id;
+		out->redeclare_generation = failure.redeclare_generation;
+		memcpy(out->affected, failure.dead_bitmap, sizeof(out->affected));
+		memcpy(out->members, failure.survivor_bitmap, sizeof(out->members));
+	} else if (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch) == out->epoch
+			   && join_fence_is_recipient_for(cluster_node_id, out->epoch)) {
+		if (!cluster_grd_join_view_rebuilt())
+			return -1;
+		out->direction = GRD_REMASTER_DIR_JOIN;
+		out->redeclare_generation = cluster_grd_redeclare_generation();
+		for (int i = 0; i < CLUSTER_MAX_NODES; i++) {
+			if (join_fence_is_recipient_for(i, out->epoch))
+				out->affected[i / 8] |= (uint8)(1u << (i % 8));
+			if (cluster_conf_lookup_node(i) != NULL && cluster_membership_is_member(i))
+				out->members[i / 8] |= (uint8)(1u << (i % 8));
+		}
+	} else
+		return 0; /* JOIN survivors keep their original directory authority. */
+	out->master_map_refresh = pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count);
+	out->routing_generation = cluster_lms_get_shard_master_generation();
+	out->self_boot = cluster_qvotec_get_self_incarnation();
+	if (out->master_map_refresh == 0 || out->routing_generation == 0 || out->self_boot == 0
+		|| !(out->members[cluster_node_id / 8] & (1u << (cluster_node_id % 8))))
+		return -1;
+	for (int i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (!(out->members[i / 8] & (1u << (i % 8))))
+			continue;
+		if (i >= 32 || !cluster_membership_is_member(i)
+			|| (out->member_boots[i] = cluster_membership_get_last_admitted_incarnation(i)) == 0)
+			return -1;
+	}
+	return out->member_boots[cluster_node_id] == out->self_boot ? 1 : -1;
+}
+
+int
+cluster_grd_pi_rebuild_snapshot_v1(ClusterGrdPiRebuildCutV1 *out)
+{
+	ClusterGrdPiRebuildCutV1 before, after;
+	int state;
+	if (out == NULL)
+		return -1;
+	memset(out, 0, sizeof(*out));
+	state = grd_pi_rebuild_cut(&before);
+	pg_read_barrier();
+	if (state != grd_pi_rebuild_cut(&after)
+		|| (state == 1 && memcmp(&before, &after, sizeof(before)) != 0))
+		return -1;
+	if (state == 1)
+		*out = before;
+	return state;
+}
+
+bool
+cluster_grd_pi_rebuild_current_v1(const ClusterGrdPiRebuildCutV1 *cut)
+{
+	ClusterGrdPiRebuildCutV1 now;
+	return cut != NULL && cluster_grd_pi_rebuild_snapshot_v1(&now) == 1
+		   && memcmp(cut, &now, sizeof(now)) == 0;
+}
+
+bool
+cluster_grd_pi_rebuild_complete_v1(const ClusterGrdPiRebuildCutV1 *cut)
+{
+	if (MyBackendType != B_BG_WRITER || !cluster_grd_pi_rebuild_current_v1(cut))
+		return false;
+	SpinLockAcquire(&cluster_grd_state->pi_rebuild_lock);
+	cluster_grd_state->pi_rebuilt = *cut;
+	SpinLockRelease(&cluster_grd_state->pi_rebuild_lock);
+	return cluster_grd_pi_rebuild_current_v1(cut);
+}
+
+bool
+cluster_grd_pi_rebuild_gate_v1(void)
+{
+	ClusterGrdPiRebuildCutV1 now, completed;
+	int state = cluster_grd_pi_rebuild_snapshot_v1(&now);
+	if (state != 1)
+		return state != 0;
+	SpinLockAcquire(&cluster_grd_state->pi_rebuild_lock);
+	completed = cluster_grd_state->pi_rebuilt;
+	SpinLockRelease(&cluster_grd_state->pi_rebuild_lock);
+	return memcmp(&completed, &now, sizeof(now)) != 0 || !cluster_grd_pi_rebuild_current_v1(&now);
+}
+
+bool
+cluster_grd_pi_rebuild_blocked_v1(BufferTag tag)
+{
+	uint64 epoch;
+	uint32 state, direction;
+	int home, master;
+
+	if (!cluster_enabled || !cluster_shared_config)
+		return false;
+	if (!grd_control_map_current())
+		return true;
+	master = cluster_gcs_lookup_master(tag);
+	if (master < 0 || master >= 32)
+		return true;
+	if (master != cluster_node_id)
+		return false;
+	home = cluster_gcs_lookup_master_static(tag);
+	if (home < 0 || home >= 32)
+		return true;
+	state = pg_atomic_read_u32(&cluster_grd_state->recovery_state);
+	direction = pg_atomic_read_u32(&cluster_grd_state->recovery_direction);
+	if (state != GRD_RECOVERY_IDLE && direction == GRD_REMASTER_DIR_FAIL
+		&& (pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[home / 64])
+			& (UINT64CONST(1) << (home % 64))))
+		return cluster_grd_pi_rebuild_gate_v1();
+	epoch = cluster_epoch_get_current();
+	return pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch) == epoch
+		   && join_fence_is_recipient_for(home, epoch)
+		   && (!cluster_grd_join_view_rebuilt() || cluster_grd_pi_rebuild_gate_v1());
+}
+
 bool
 cluster_grd_control_recovery_ready(const ClusterResId *resid, LOCKMODE mode)
 {
@@ -2503,9 +2652,10 @@ cluster_grd_control_recovery_ready(const ClusterResId *resid, LOCKMODE mode)
 		return false;
 	allowed = (resid->type == CLUSTER_CF_RESID_TYPE && mode == ShareLock && resid->field1 == 0
 			   && resid->field2 == 0 && resid->field3 == 0)
-			  || (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE && mode == ExclusiveLock
-				  && resid->field1 > 0 && resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS
-				  && resid->field2 == 0 && resid->field3 == 0)
+			  || (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE
+				  && (mode == ExclusiveLock || mode == ShareLock) && resid->field1 > 0
+				  && resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS && resid->field2 == 0
+				  && resid->field3 == 0)
 			  || (resid->type == CLUSTER_IR_RESID_TYPE && mode == ExclusiveLock && resid->field1 > 0
 				  && resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS
 				  && (resid->field2 != 0 || resid->field3 != 0));
@@ -4496,6 +4646,8 @@ cluster_grd_recovery_lmon_tick(void)
 						episode_epoch)));
 				return;
 			}
+			if (cluster_shared_config && cluster_grd_pi_rebuild_gate_v1())
+				return;
 
 			/* P6 post-barrier global sweep (P0#3 + P0-1:  legal HERE and
 			 * coherent against the LOCKED episode epoch — holders rebound

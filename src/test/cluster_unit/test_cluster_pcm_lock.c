@@ -91,6 +91,7 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_prepared_s_so
 #undef printf
 
 #include "unit_test.h"
+#include "cluster/cluster_pi_rebuild.h"
 #include "test_cluster_pcm_source_owner_layout.inc"
 #include "test_cluster_pcm_stop_fields.inc"
 
@@ -118,6 +119,12 @@ cluster_qvotec_get_self_incarnation(void)
 	return ut_master_session;
 }
 static uint32 ut_wait_event_info_storage = 0;
+static bool pi_service_blocked;
+bool
+cluster_grd_pi_rebuild_blocked_v1(BufferTag tag)
+{
+	return pi_service_blocked;
+}
 static bool stop_new_work_allowed = true;
 static int stop_new_work_calls;
 static bool stop_pi_cut_allowed;
@@ -437,6 +444,7 @@ s_lock(volatile slock_t *lock, const char *file pg_attribute_unused(),
 static void
 reset_fake_pcm_runtime(int max_entries)
 {
+	pi_service_blocked = false;
 	stop_new_work_allowed = true;
 	stop_pi_cut_allowed = false;
 	MyAuxProcType = NotAnAuxProcess;
@@ -16876,6 +16884,29 @@ UT_TEST(test_resource_x_self_master_reuse_orders_by_proven_current_authority)
 															requester);
 }
 
+UT_TEST(test_resource_x_target_waits_for_retained_pi_rebuild)
+{
+	BufferTag tag = make_tag(291);
+	ResourceXDecodedFrame request, ack, assertion;
+	ResourceXMasterSnapshot snapshot;
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	request = make_resource_x_bootstrap_request_values(tag, 2, 17, 31, 41, 51);
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 2, 2);
+	pi_service_blocked = true;
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_bootstrap_request_exact(&request, 2, 61, 77, 31, 71, &ack),
+		RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 2, &snapshot),
+				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(fake_pcm_entry_count, 0);
+	pi_service_blocked = false;
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_bootstrap_request_exact(&request, 2, 61, 77, 31, 71, &ack),
+		RESOURCE_X_APPLY_APPLIED);
+}
+
 UT_TEST(test_resource_x_master_local_and_durable_proofs_are_exact_and_closed)
 {
 	BufferTag local_tag = make_tag(144);
@@ -16936,6 +16967,10 @@ UT_TEST(test_resource_x_master_local_and_durable_proofs_are_exact_and_closed)
 	durable_proof.page_scn_lsn = 82;
 	durable_proof.page_checksum = UINT32_C(0x12345678);
 	durable_proof.source_proof_crc32c = UINT32_C(0x87654321);
+	pi_service_blocked = true;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(&durable_proof, &snapshot),
+				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	pi_service_blocked = false;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(&durable_proof, &snapshot),
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_GRANT_COMMITTED);
@@ -16947,6 +16982,18 @@ UT_TEST(test_resource_x_master_local_and_durable_proofs_are_exact_and_closed)
 		cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
 			&assertion.common.logical_assertion, &grant_intent, grant_bytes, sizeof(grant_bytes)),
 		RESOURCE_X_APPLY_APPLIED);
+	pi_service_blocked = true;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_authority_grant_exact(
+					 &assertion.common.logical_assertion, &decoded_grant),
+				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	{
+		ResourceXIntentSlot blocked_intent;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
+						 &grant_intent, &blocked_intent, grant_bytes, sizeof(grant_bytes)),
+					 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(blocked_intent.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	}
+	pi_service_blocked = false;
 	UT_ASSERT_EQ(grant_intent.state, RESOURCE_X_INTENT_SLOT_ARMED);
 	UT_ASSERT_EQ(grant_intent.logical_generation, 41);
 	UT_ASSERT_EQ(grant_intent.authority_generation, 2);
@@ -17136,7 +17183,8 @@ UT_TEST(test_resource_x_local_settlement_reconciles_exact_requester_prestate)
 	}
 }
 
-UT_TEST(test_resource_x_master_settlement_release_starts_fifo_successor)
+static void
+run_resource_x_settlement_release(bool frozen)
 {
 	BufferTag tag = make_tag(147);
 	bool preserve_current_x = false;
@@ -17202,6 +17250,7 @@ UT_TEST(test_resource_x_master_settlement_release_starts_fifo_successor)
 	settlement.body.install_settlement.requester_role = RESOURCE_X_REQUESTER_ROLE_ACQUIRER;
 	settlement.body.install_settlement.terminal_outcome = RESOURCE_X_OUTCOME_OK;
 	settlement.body.install_settlement.terminal_state = RESOURCE_X_SETTLEMENT_TERMINAL_INSTALLED;
+	pi_service_blocked = frozen;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_install_settlement_exact(&settlement, 1, &snapshot),
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_SETTLED);
@@ -17209,6 +17258,20 @@ UT_TEST(test_resource_x_master_settlement_release_starts_fifo_successor)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
 					 &second_assert.common.logical_assertion, &snapshot),
 				 RESOURCE_X_APPLY_APPLIED);
+	if (frozen) {
+		UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_QUEUED);
+		release = make_resource_x_master_frame(RESOURCE_X_WIRE_RELEASE_X, tag, 1, 1);
+		release.common.observed_mode = PCM_STATE_X;
+		release.common.target_mode = PCM_STATE_N;
+		release.common.outcome = RESOURCE_X_OUTCOME_OK;
+		release.common.authority_generation = 2;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_release_x_exact(&release, 1, &snapshot),
+					 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		UT_ASSERT_EQ(cluster_pcm_lock_query(tag), PCM_LOCK_MODE_X);
+		pi_service_blocked = false;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&second_assert, 2, &snapshot),
+					 RESOURCE_X_APPLY_DUPLICATE);
+	}
 	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
 	UT_ASSERT_EQ(snapshot.incompatible_holders_bitmap, UINT32_C(1) << 1);
 	UT_ASSERT_EQ(
@@ -17266,6 +17329,15 @@ UT_TEST(test_resource_x_master_settlement_release_starts_fifo_successor)
 				 RESOURCE_X_APPLY_BAD_STATE);
 	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
 	UT_ASSERT_EQ(snapshot.proof_kind, 0);
+}
+
+UT_TEST(test_resource_x_master_settlement_release_starts_fifo_successor)
+{
+	run_resource_x_settlement_release(false);
+}
+UT_TEST(test_resource_x_pi_freeze_preserves_queued_successor_and_resumes)
+{
+	run_resource_x_settlement_release(true);
 }
 
 UT_TEST(test_resource_x_release_without_successor_advances_canonical_base)
@@ -18218,6 +18290,17 @@ UT_TEST(test_pcm_d1_recovering_gate_fail_closed)
  * reconstruction (D3 adds the not-double-X conflict invariant).
  */
 static int pi_redeclare_frozen = 1;
+static bool pi_rebuild_current = true;
+int
+cluster_gcs_lookup_master_static(BufferTag tag)
+{
+	return 1;
+}
+bool
+cluster_grd_pi_rebuild_current_v1(const ClusterGrdPiRebuildCutV1 *cut)
+{
+	return pi_rebuild_current && cut != NULL && cut->epoch == 7;
+}
 int
 cluster_grd_block_redeclare_state_v1(BufferTag tag, uint64 epoch, uint64 *hash)
 {
@@ -18246,6 +18329,43 @@ UT_TEST(test_shared_redeclare_preserves_physical_pi_without_current_holder)
 		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 3);
 	}
 	pi_redeclare_frozen = 1;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_retained_contributors_rebuild_pi_without_changing_current_authority)
+{
+	ClusterGrdPiRebuildCutV1 cut = { .epoch = 7, .affected = { 2 } };
+	BufferTag tag = make_tag(901);
+	struct StopPcmEntryLayout *entry;
+	reset_fake_pcm_runtime(4);
+	cluster_shared_config = true;
+	UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(tag, PCM_STATE_X, 7, 8, 2, 7));
+	MyBackendType = B_BG_WRITER;
+	UT_ASSERT(cluster_pcm_rebuild_pi_contributors_v1(&cut, tag, 3, 80, 90));
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	if (entry != NULL) {
+		uint64 transition = pg_atomic_read_u64(&entry->transition_count_local);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 3);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->master_state), PCM_STATE_X);
+		UT_ASSERT_EQ(entry->x_holder_node, 2);
+		UT_ASSERT_EQ(cluster_pcm_lock_pi_watermark_lsn_query(tag), 80);
+		pi_rebuild_current = false;
+		UT_ASSERT(!cluster_pcm_rebuild_pi_contributors_v1(&cut, tag, 4, 90, 100));
+		pi_rebuild_current = true;
+		fake_gcs_master_node = 1;
+		UT_ASSERT(!cluster_pcm_rebuild_pi_contributors_v1(&cut, tag, 4, 90, 100));
+		fake_gcs_master_node = 0;
+		cut.affected[0] = 1;
+		UT_ASSERT(!cluster_pcm_rebuild_pi_contributors_v1(&cut, tag, 4, 90, 100));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 3);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&entry->transition_count_local), transition);
+		cut.affected[0] = 2;
+		UT_ASSERT(cluster_pcm_rebuild_pi_contributors_v1(&cut, tag, 5, 19, 20));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 7);
+		UT_ASSERT_EQ(cluster_pcm_lock_pi_watermark_lsn_query(tag), 80);
+	}
+	MyBackendType = B_BACKEND;
 	cluster_shared_config = false;
 }
 
@@ -19804,7 +19924,7 @@ UT_TEST(test_stop_seal_keeps_original_identity_validation_first)
 int
 main(void)
 {
-	UT_PLAN(295);
+	UT_PLAN(298);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -20036,12 +20156,14 @@ main(void)
 	UT_RUN(test_resource_x_remote_retain_reuse_requires_old_drain);
 	UT_RUN(test_resource_x_self_master_drop_keeps_local_grd_authority_domain);
 	UT_RUN(test_resource_x_self_master_reuse_orders_by_proven_current_authority);
+	UT_RUN(test_resource_x_target_waits_for_retained_pi_rebuild);
 	UT_RUN(test_resource_x_master_local_and_durable_proofs_are_exact_and_closed);
 	UT_RUN(test_resource_x_master_multi_s_blockers_advance_exact_frontier);
 	UT_RUN(test_resource_x_head_accepts_exact_blockers_after_prior_pcm_s_churn);
 	UT_RUN(test_resource_x_head_rejects_uncovered_pcm_transition_drift);
 	UT_RUN(test_resource_x_local_settlement_reconciles_exact_requester_prestate);
 	UT_RUN(test_resource_x_master_settlement_release_starts_fifo_successor);
+	UT_RUN(test_resource_x_pi_freeze_preserves_queued_successor_and_resumes);
 	UT_RUN(test_resource_x_release_without_successor_advances_canonical_base);
 	UT_RUN(test_resource_x_reclaim_nonhead_preserves_survivor_fifo);
 	UT_RUN(test_resource_x_reclaim_safe_head_starts_exact_successor);
@@ -20066,6 +20188,7 @@ main(void)
 	UT_RUN(test_pcm_d1_recovering_gate_fail_closed);
 	UT_RUN(test_pcm_d2_rebuild_from_redeclare);
 	UT_RUN(test_shared_redeclare_preserves_physical_pi_without_current_holder);
+	UT_RUN(test_retained_contributors_rebuild_pi_without_changing_current_authority);
 	UT_RUN(test_pcm_d3_not_double_x);
 	UT_RUN(test_pcm_wm_prov_table_keeps_last_advance);
 	UT_RUN(test_pcm_acquire_buffer_local_s_nonholder_registers_s_then_upgrades);

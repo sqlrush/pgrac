@@ -58,6 +58,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_pi_data.h"
 #include "cluster/cluster_pi_writeback.h"
+#include "cluster/cluster_pi_rebuild.h"
 #include "cluster/cluster_wal_cut.h"
 #endif
 
@@ -252,6 +253,8 @@ BackgroundWriterMain(void)
 		if (cluster_pi_data_bgwriter_tick_v1())
 			can_hibernate = false;
 		if (cluster_pi_writeback_bgwriter_tick_v1())
+			can_hibernate = false;
+		if (cluster_pi_rebuild_bgwriter_tick_v1())
 			can_hibernate = false;
 #endif
 

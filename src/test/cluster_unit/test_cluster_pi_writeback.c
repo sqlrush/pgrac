@@ -19,6 +19,7 @@ extern void *ShmemInitStruct(const char *name, Size size, bool *found);
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/cluster_pi_rebuild.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
 #include "utils/timestamp.h"
@@ -33,6 +34,28 @@ static ClusterWalSourceRef wb_sources[3];
 static ClusterPcmPiStorageCutV1 wb_storage_cut;
 static RfPageOnlinePlanV1 *wb_page_plan;
 static unsigned wb_plan_builds, wb_input_releases, wb_sends;
+static RfSideOnlineOperationKindV1 wb_side_kind;
+const RfSideOnlinePlanV1 *
+cluster_thread_recovery_fabric_side_plan_v1(const ClusterThreadRecoveryFabricPlanV1 *plan)
+{
+	return (const RfSideOnlinePlanV1 *)plan;
+}
+uint32
+rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan)
+{
+	return wb_side_kind == RF_SIDE_ONLINE_OPERATION_INVALID ? 0 : 1;
+}
+bool
+rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+								 RfSideOnlineOperationV1 *out)
+{
+	if (index != 0 || wb_side_kind == RF_SIDE_ONLINE_OPERATION_INVALID)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->kind = wb_side_kind;
+	out->history_only = true; /* Retained predecessors also carry PI duties. */
+	return true;
+}
 static const ClusterShmemRegion *wb_region;
 static uint8 wb_memory[3][65536] pg_attribute_aligned(MAXIMUM_ALIGNOF);
 static uint8 wb_wire[CLUSTER_PI_WRITEBACK_MAX_BYTES];
@@ -47,6 +70,67 @@ static ClusterWalInputV1 wb_inputs[3];
 static bool wb_inputs_pinned[3], wb_resume_wait;
 static unsigned wb_resumes;
 static unsigned wb_absorbs;
+volatile sig_atomic_t ShutdownRequestPending;
+static ClusterGrdPiRebuildCutV1 rebuild_cut;
+static bool rebuild_needed, rebuild_apply_ok = true, rebuild_drift, rebuild_root_drift;
+static uint32 rebuild_holders, rebuild_applies, rebuild_completions;
+
+int
+cluster_gcs_lookup_master_static(BufferTag tag)
+{
+	return 1;
+}
+int
+cluster_grd_pi_rebuild_snapshot_v1(ClusterGrdPiRebuildCutV1 *out)
+{
+	*out = rebuild_cut;
+	return rebuild_needed ? 1 : 0;
+}
+bool
+cluster_grd_pi_rebuild_current_v1(const ClusterGrdPiRebuildCutV1 *cut)
+{
+	return rebuild_needed && memcmp(cut, &rebuild_cut, sizeof(*cut)) == 0;
+}
+bool
+cluster_grd_pi_rebuild_gate_v1(void)
+{
+	return rebuild_needed;
+}
+bool
+cluster_grd_pi_rebuild_complete_v1(const ClusterGrdPiRebuildCutV1 *cut)
+{
+	UT_ASSERT(wb_inputs_pinned[cluster_node_id]);
+	if (!cluster_grd_pi_rebuild_current_v1(cut))
+		return false;
+	rebuild_completions++;
+	rebuild_needed = false;
+	return true;
+}
+bool
+cluster_pcm_rebuild_pi_contributors_v1(const ClusterGrdPiRebuildCutV1 *cut, BufferTag tag,
+									   uint32 holders, XLogRecPtr lsn, SCN scn)
+{
+	BufferTag expected;
+	if (!cluster_grd_pi_rebuild_current_v1(cut))
+		return false;
+	UT_ASSERT_EQ(MyBackendType, B_BG_WRITER);
+	UT_ASSERT(wb_inputs_pinned[cluster_node_id]);
+	InitBufferTag(&expected, &target.identity.locator, tag.forkNum, target.identity.blockno);
+	UT_ASSERT(BufferTagsEqual(&tag, &expected));
+	UT_ASSERT_NE(lsn, 0);
+	UT_ASSERT(tag.forkNum == MAIN_FORKNUM || tag.forkNum == VISIBILITYMAP_FORKNUM);
+	UT_ASSERT_EQ(scn, tag.forkNum == MAIN_FORKNUM ? 80 : 7);
+	UT_ASSERT_EQ(holders, tag.forkNum == MAIN_FORKNUM ? 7 : 4);
+	rebuild_applies++;
+	if (rebuild_drift)
+		rebuild_cut.routing_generation++;
+	if (rebuild_root_drift)
+		wb_input_current = false;
+	if (!rebuild_apply_ok)
+		return false;
+	rebuild_holders |= holders;
+	return true;
+}
 
 void
 AbsorbSyncRequests(void)
@@ -329,6 +413,7 @@ wb_palloc0(Size size)
 }
 #define palloc0 wb_palloc0
 #include "../../backend/cluster/cluster_pi_writeback.c"
+#include "../../backend/cluster/cluster_pi_rebuild.c"
 #undef palloc0
 
 static void
@@ -720,10 +805,129 @@ UT_TEST(writeback_initial_allocation_error_cannot_orphan_running_owner)
 	clean();
 }
 
+static ClusterPageDataReceiptV1 *
+rebuild_setup(void)
+{
+	ClusterPageDataReceiptV1 *data = wb_setup();
+	wb_side_kind = RF_SIDE_ONLINE_OPERATION_INVALID;
+	wb_select(0, B_BG_WRITER);
+	memset(&rebuild_cut, 0, sizeof(rebuild_cut));
+	rebuild_cut.epoch = 1;
+	rebuild_cut.self_boot = 9;
+	rebuild_cut.affected[0] = 2;
+	rebuild_needed = rebuild_apply_ok = true;
+	rebuild_drift = rebuild_root_drift = false;
+	rebuild_holders = rebuild_applies = rebuild_completions = 0;
+	return data;
+}
+
+UT_TEST(retained_rebuild_never_completes_with_unmapped_side_contributions)
+{
+	ClusterPageDataReceiptV1 *data = rebuild_setup();
+	for (unsigned kind = RF_SIDE_ONLINE_OPERATION_XACT; kind <= RF_SIDE_ONLINE_OPERATION_SPACE;
+		 kind++) {
+		wb_side_kind = kind;
+		UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+		UT_ASSERT_EQ(rebuild_completions, 0);
+		UT_ASSERT_EQ(rebuild_applies, 0);
+		UT_ASSERT(!wb_inputs_pinned[0]);
+	}
+	wb_side_kind = RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;
+	UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+	UT_ASSERT_EQ(rebuild_completions, 1);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(retained_rebuild_restores_all_original_writers_before_complete)
+{
+	ClusterPageDataReceiptV1 *data = rebuild_setup();
+	UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+	UT_ASSERT_EQ(rebuild_holders, 7); /* A -> B -> C, including nonterminal writers. */
+	UT_ASSERT_EQ(rebuild_applies, 2);
+	UT_ASSERT_EQ(rebuild_completions, 1);
+	UT_ASSERT_EQ(wb_input_releases, 1);
+	UT_ASSERT(!wb_inputs_pinned[0]);
+	UT_ASSERT(pi_rebuild_job == NULL);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(retained_rebuild_waits_unpinned_and_rejects_incomplete_or_changed_cut)
+{
+	ClusterPageDataReceiptV1 *data = rebuild_setup();
+	wb_input_wait = true;
+	UT_ASSERT(cluster_pi_rebuild_bgwriter_tick_v1());
+	UT_ASSERT(!wb_inputs_pinned[0]);
+	UT_ASSERT_EQ(rebuild_applies, 0);
+	UT_ASSERT_EQ(rebuild_completions, 0);
+	wb_input_wait = false;
+	rebuild_drift = true;
+	UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+	UT_ASSERT_EQ(rebuild_holders, 7); /* Additions survive, but never open service. */
+	UT_ASSERT_EQ(rebuild_completions, 0);
+	rebuild_drift = false;
+	UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+	UT_ASSERT_EQ(rebuild_completions, 1);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(retained_rebuild_root_change_or_apply_failure_never_completes)
+{
+	ClusterPageDataReceiptV1 *data = rebuild_setup();
+	rebuild_apply_ok = false;
+	UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+	UT_ASSERT_EQ(rebuild_completions, 0);
+	UT_ASSERT_EQ(rebuild_holders, 0);
+	rebuild_apply_ok = true;
+	wb_input_current = false;
+	UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+	UT_ASSERT_EQ(rebuild_applies, 1);
+	UT_ASSERT_EQ(rebuild_completions, 0);
+	UT_ASSERT(!wb_inputs_pinned[0]);
+	UT_ASSERT(pi_rebuild_job == NULL);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
+{
+	ClusterPageDataReceiptV1 *data = rebuild_setup();
+	volatile bool caught = false;
+	wb_allocation_error = true;
+	PG_TRY();
+	{
+		(void)cluster_pi_rebuild_bgwriter_tick_v1();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		pi_rebuild_owner_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT(pi_rebuild_job == NULL);
+	UT_ASSERT(!wb_inputs_pinned[0]);
+	rebuild_root_drift = true;
+	UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+	UT_ASSERT_EQ(rebuild_holders, 7);
+	UT_ASSERT_EQ(rebuild_completions, 0);
+	UT_ASSERT_EQ(wb_input_releases, 1);
+	UT_ASSERT(!wb_inputs_pinned[0]);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(14);
 	UT_RUN(remote_physical_ack_runs_actual_ancestry_and_disposal);
 	UT_RUN(writeback_codec_has_exact_bounded_authenticated_facts);
 	UT_RUN(writeback_rejects_foreign_sender_boot_and_changed_master_cut);
@@ -733,6 +937,11 @@ main(void)
 	UT_RUN(checkpointer_batch_reaches_actual_local_and_remote_physical_owners);
 	UT_RUN(checkpointer_releases_pending_batch_before_native_checkpoint);
 	UT_RUN(writeback_initial_allocation_error_cannot_orphan_running_owner);
+	UT_RUN(retained_rebuild_never_completes_with_unmapped_side_contributions);
+	UT_RUN(retained_rebuild_restores_all_original_writers_before_complete);
+	UT_RUN(retained_rebuild_waits_unpinned_and_rejects_incomplete_or_changed_cut);
+	UT_RUN(retained_rebuild_root_change_or_apply_failure_never_completes);
+	UT_RUN(retained_rebuild_error_cleanup_and_postapply_root_check);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

@@ -49,6 +49,9 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "miscadmin.h"
+
+BackendType MyBackendType = B_LMON;
 
 #include <signal.h>
 #include <stdlib.h>

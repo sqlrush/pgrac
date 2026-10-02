@@ -49,6 +49,7 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_pi_rebuild.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_scn.h"
@@ -5924,6 +5925,43 @@ cluster_pcm_lock_clean_leave_verify_no_leftover(int32 leaving_node)
  *	fail-closed) and full reconciliation of a reused entry.
  */
 bool
+cluster_pcm_rebuild_pi_contributors_v1(const ClusterGrdPiRebuildCutV1 *cut, BufferTag tag,
+									   uint32 holders, XLogRecPtr watermark_lsn, SCN watermark_scn)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	struct GrdEntry *entry;
+	int home;
+
+	if (!cluster_shared_config || MyBackendType != B_BG_WRITER || holders == 0
+		|| XLogRecPtrIsInvalid(watermark_lsn) || !SCN_VALID(watermark_scn)
+		|| !cluster_grd_pi_rebuild_current_v1(cut))
+		return false;
+	home = cluster_gcs_lookup_master_static(tag);
+	if (home < 0 || home >= 32 || !(cut->affected[home / 8] & (1u << (home % 8)))
+		|| cluster_gcs_lookup_master(tag) != cluster_node_id)
+		return false;
+	if (!pcm_entry_ref_acquire(&tag, true, &ref, &acquired))
+		return false;
+	entry = ref.entry;
+	pcm_entry_lock_exclusive(entry);
+	if (!cluster_grd_pi_rebuild_current_v1(cut) || cluster_gcs_lookup_master(tag) != cluster_node_id
+		|| pg_atomic_read_u64(&entry->transition_count_local) >= UINT64_MAX - 1) {
+		LWLockRelease(&entry->entry_lock.lock);
+		pcm_entry_ref_release(&ref);
+		return false;
+	}
+	pg_atomic_fetch_or_u32(&entry->pi_holders_bitmap, holders);
+	pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
+	entry->pi_watermark_lsn = Max(entry->pi_watermark_lsn, watermark_lsn);
+	if (scn_local(watermark_scn) > scn_local(entry->pi_watermark_scn))
+		entry->pi_watermark_scn = watermark_scn;
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return true;
+}
+
+bool
 cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn,
 												SCN page_scn, int32 source_node,
 												uint64 cluster_epoch)
@@ -9810,6 +9848,10 @@ pcm_resource_x_start_head_locked(struct GrdEntry *entry, ClusterPcmResourceXMast
 	request = pcm_resource_x_master_head(state, &requester_node);
 	if (request == NULL)
 		return NULL;
+	/* Pausing advancement does not prove an empty queue: RELEASE_X must
+	 * preserve the current carrier for this exact successor. */
+	if (cluster_grd_pi_rebuild_blocked_v1(entry->tag))
+		goto done;
 	if (request->phase == RESOURCE_X_MASTER_QUEUED) {
 		request->head_transition_generation = pg_atomic_read_u64(&entry->transition_count_local);
 		if (request->head_transition_generation == UINT64_MAX) {
@@ -16908,7 +16950,8 @@ cluster_pcm_lock_resource_x_bootstrap_request_exact(
 		return RESOURCE_X_APPLY_INVALID;
 	gate_phase = pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
 	gate_formation = pg_atomic_read_u64(&ClusterPcm->resource_x_gate_formation);
-	if (gate_phase != RESOURCE_X_GATE_OPEN || gate_formation != request->common.resource_formation)
+	if (gate_phase != RESOURCE_X_GATE_OPEN || gate_formation != request->common.resource_formation
+		|| cluster_grd_pi_rebuild_blocked_v1(request->common.logical_assertion.resource))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 
 	if (!pcm_entry_ref_acquire(&request->common.logical_assertion.resource, true, &entry_ref,
@@ -16918,8 +16961,9 @@ cluster_pcm_lock_resource_x_bootstrap_request_exact(
 	requester_node = request->common.logical_assertion.requester_node;
 	pcm_entry_lock_exclusive(entry);
 	state = pcm_resource_x_master_state_for_entry(entry);
-	if (state == NULL || state->authority_generation == 0
-		|| state->authority_generation == UINT64_MAX || state->next_enqueue_order == 0) {
+	if (state == NULL || cluster_grd_pi_rebuild_blocked_v1(entry->tag)
+		|| state->authority_generation == 0 || state->authority_generation == UINT64_MAX
+		|| state->next_enqueue_order == 0) {
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
@@ -17177,8 +17221,8 @@ pcm_resource_x_assert_exact_internal(const ResourceXDecodedFrame *assertion,
 		return RESOURCE_X_APPLY_INVALID;
 	gate_phase = pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
 	gate_formation = pg_atomic_read_u64(&ClusterPcm->resource_x_gate_formation);
-	if (gate_phase != RESOURCE_X_GATE_OPEN
-		|| gate_formation != assertion->common.resource_formation)
+	if (gate_phase != RESOURCE_X_GATE_OPEN || gate_formation != assertion->common.resource_formation
+		|| cluster_grd_pi_rebuild_blocked_v1(assertion->common.logical_assertion.resource))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 
 	if (!pcm_entry_ref_acquire(&assertion->common.logical_assertion.resource, true, &entry_ref,
@@ -17213,7 +17257,8 @@ pcm_resource_x_assert_locked(struct GrdEntry *entry, const ResourceXDecodedFrame
 
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 	state = pcm_resource_x_master_state_for_entry(entry);
-	if (state == NULL || state->authority_generation == 0 || state->next_enqueue_order == 0) {
+	if (state == NULL || cluster_grd_pi_rebuild_blocked_v1(entry->tag)
+		|| state->authority_generation == 0 || state->next_enqueue_order == 0) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		goto unlock;
 	}
@@ -17240,6 +17285,10 @@ pcm_resource_x_assert_locked(struct GrdEntry *entry, const ResourceXDecodedFrame
 			= pcm_resource_x_assert_common_matches_request(&assertion->common, request);
 
 		if (same_attempt || request->phase != RESOURCE_X_MASTER_RELEASED) {
+			/* A control settlement can leave the FIFO head queued while the
+			 * retained-PI gate is closed. Its original ASSERT resumes it. */
+			if (same_attempt && request->phase == RESOURCE_X_MASTER_QUEUED)
+				(void)pcm_resource_x_start_head_locked(entry, state, NULL);
 			if (same_attempt && request->phase == RESOURCE_X_MASTER_WAIT_BLOCKERS
 				&& !pcm_resource_x_arm_block_intents_locked(entry, state, request, requester_node))
 				request->phase = RESOURCE_X_MASTER_RECOVERY_BLOCKED;
@@ -17590,7 +17639,7 @@ cluster_pcm_lock_resource_x_block_intent_snapshot_exact(const ResourceXAssertion
 	holder_bit = UINT32_C(1) << (uint32)holder_node;
 	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
 	state = pcm_resource_x_master_state_for_entry(entry);
-	if (state == NULL) {
+	if (state == NULL || cluster_grd_pi_rebuild_blocked_v1(entry->tag)) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		goto block_intent_snapshot_done;
 	}
@@ -21483,6 +21532,8 @@ pcm_resource_x_build_authority_grant_locked(struct GrdEntry *entry,
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
 		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 	memset(out, 0, sizeof(*out));
+	if (cluster_grd_pi_rebuild_blocked_v1(entry->tag))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	requester_connection_generation = request->requester_connection_generation != 0
 										  ? request->requester_connection_generation
 										  : (uint64)request->sender_connection_generation;
@@ -21554,6 +21605,8 @@ pcm_resource_x_redrive_grant_intent_locked(struct GrdEntry *entry,
 	Assert(state != NULL);
 	Assert(request != NULL);
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	if (cluster_grd_pi_rebuild_blocked_v1(entry->tag))
+		return false;
 	intent = &state->grant_intent;
 	if (request->delegated_authority_generation != 0) {
 		ClusterPcmResourceXBlockIntent *block_intent;
@@ -21694,6 +21747,8 @@ pcm_resource_x_commit_grant_locked(struct GrdEntry *entry, ClusterPcmResourceXMa
 	Assert(state != NULL);
 	Assert(request != NULL);
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	if (cluster_grd_pi_rebuild_blocked_v1(entry->tag))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	current_state = (PcmState)pg_atomic_read_u32(&entry->master_state);
 	s_holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
 	current_transition_generation = pg_atomic_read_u64(&entry->transition_count_local);
@@ -21931,7 +21986,7 @@ cluster_pcm_lock_resource_x_blocked_to_n_exact(const ResourceXDecodedFrame *bloc
 	requester_node = blocked->common.logical_assertion.requester_node;
 	pcm_entry_lock_exclusive(entry);
 	state = pcm_resource_x_master_state_for_entry(entry);
-	if (state == NULL) {
+	if (state == NULL || cluster_grd_pi_rebuild_blocked_v1(entry->tag)) {
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
@@ -22147,7 +22202,7 @@ cluster_pcm_lock_resource_x_local_proof_exact(const ResourceXDecodedFrame *local
 	requester_node = local_proof->common.logical_assertion.requester_node;
 	pcm_entry_lock_exclusive(entry);
 	state = pcm_resource_x_master_state_for_entry(entry);
-	if (state == NULL) {
+	if (state == NULL || cluster_grd_pi_rebuild_blocked_v1(entry->tag)) {
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
@@ -22247,7 +22302,7 @@ cluster_pcm_lock_resource_x_durable_proof_exact(const ResourceXDurableProof *dur
 	requester_node = durable_proof->assertion.requester_node;
 	pcm_entry_lock_exclusive(entry);
 	state = pcm_resource_x_master_state_for_entry(entry);
-	if (state == NULL) {
+	if (state == NULL || cluster_grd_pi_rebuild_blocked_v1(entry->tag)) {
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
@@ -22722,7 +22777,7 @@ cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(const ResourceXAssertion
 	requester_node = assertion->requester_node;
 	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
 	state = pcm_resource_x_master_state_for_entry(entry);
-	if (state == NULL) {
+	if (state == NULL || cluster_grd_pi_rebuild_blocked_v1(entry->tag)) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		goto grant_intent_snapshot_done;
 	}
@@ -22989,6 +23044,13 @@ cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(const ResourceXIntent
 	if (slot == NULL)
 		return RESOURCE_X_APPLY_STALE;
 	entry = entry_ref.entry;
+	if ((expected->body.owner_kind == RESOURCE_X_INTENT_OWNER_MASTER_BLOCK
+		 || expected->body.owner_kind == RESOURCE_X_INTENT_OWNER_MASTER_GRANT)
+		&& cluster_grd_pi_rebuild_blocked_v1(entry->tag)) {
+		LWLockRelease(&entry->entry_lock.lock);
+		pcm_entry_ref_release(&entry_ref);
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
 	if (slot->state == RESOURCE_X_INTENT_SLOT_EMPTY) {
 		LWLockRelease(&entry->entry_lock.lock);
 		pcm_entry_ref_release(&entry_ref);
@@ -23050,6 +23112,13 @@ cluster_pcm_lock_resource_x_outbound_intent_stage_exact(const ResourceXIntentSlo
 	slot = pcm_resource_x_outbound_intent_lock_exact(expected, &entry_ref, &payload);
 	if (slot == NULL)
 		return RESOURCE_X_INTENT_STALE;
+	if ((expected->body.owner_kind == RESOURCE_X_INTENT_OWNER_MASTER_BLOCK
+		 || expected->body.owner_kind == RESOURCE_X_INTENT_OWNER_MASTER_GRANT)
+		&& cluster_grd_pi_rebuild_blocked_v1(entry_ref.entry->tag)) {
+		LWLockRelease(&entry_ref.entry->entry_lock.lock);
+		pcm_entry_ref_release(&entry_ref);
+		return RESOURCE_X_INTENT_STALE;
+	}
 	/* Physical queue ownership is not the idempotent semantic stage API.
 	 * An ingress worker and the scan worker can observe the same ARMED
 	 * handle: only one may acquire a ring copy under this entry lock. */
@@ -24159,6 +24228,14 @@ cluster_pcm_lock_resource_x_release_x_exact(const ResourceXDecodedFrame *release
 	 * response owns the later X->N+PI transition and grant.  Dropping to N
 	 * here would erase the current source and leave only historical PI bits,
 	 * which are not Resource-X authority. */
+	if (pcm_resource_x_master_head(state, NULL) != NULL
+		&& cluster_grd_pi_rebuild_blocked_v1(entry->tag)) {
+		pcm_resource_x_release_snapshot(&entry->tag, state, request, tombstone, tombstone_request,
+										requester_node, out);
+		LWLockRelease(&entry->entry_lock.lock);
+		pcm_entry_ref_release(&entry_ref);
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
 	successor = pcm_resource_x_start_head_locked(entry, state, NULL);
 	if (successor == NULL) {
 		/* No FIFO successor consumes the current X carrier, so RELEASE_X owns

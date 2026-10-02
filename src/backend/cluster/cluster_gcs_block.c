@@ -77,6 +77,7 @@
 #include "cluster/cluster_xnode_lever.h" /* spec-6.12a — downgrade counters */
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_pi_rebuild.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_itl.h" /* spec-5.2 D11 — active-ITL writer-transfer guard */
 #include "cluster/cluster_ic_envelope.h"
@@ -9295,7 +9296,8 @@ gcs_block_resource_x_gate_session_snapshot_result(const BufferTag *tag,
 		|| gate.phase != RESOURCE_X_GATE_OPEN)
 		return PCM_X_SESSION_AUTH_INVALID;
 	master_node = cluster_gcs_lookup_master(*tag);
-	if (master_node < 0 || master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
+	if (master_node < 0 || master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| cluster_grd_pi_rebuild_blocked_v1(*tag))
 		return PCM_X_SESSION_AUTH_INVALID;
 	if (gate_out != NULL)
 		*gate_out = gate;

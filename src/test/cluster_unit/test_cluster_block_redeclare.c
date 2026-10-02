@@ -22,7 +22,7 @@ BackendType MyBackendType = B_LMON;
 int cluster_node_id;
 bool cluster_enabled = true, cluster_shared_config = true;
 static uint64 epoch = 10, boots[2] = { 31, 41 }, serial, census_hash = 133;
-static bool quorum = true, prebump, apply_ok = true;
+static bool quorum = true, prebump, apply_ok = true, writer_ready = true, restart_ready = true;
 static int frozen = 1, master = 1;
 static uint32 sends, applies;
 static TimestampTz now = 1000000;
@@ -105,7 +105,14 @@ cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 	out->claim.identity.origin_node_id = cluster_node_id;
 	out->claim.identity.origin_owner_incarnation = boots[cluster_node_id];
 	memset(out->claim.identity.storage_uuid, 0x37, 16);
-	return true;
+	return writer_ready;
+}
+bool
+cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
+{
+	(void)cluster_wal_thread_current_v2_ref(out);
+	out->claim.identity.origin_owner_incarnation--;
+	return restart_ready;
 }
 bool
 cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 mode, XLogRecPtr lsn, SCN scn,
@@ -136,6 +143,7 @@ reset(void)
 	epoch++;
 	cluster_node_id = 0;
 	quorum = apply_ok = true;
+	writer_ready = restart_ready = true;
 	prebump = false;
 	frozen = master = 1;
 	sends = applies = 0;
@@ -207,6 +215,28 @@ UT_TEST(scan_waits_for_actual_master_application_ack)
 	UT_ASSERT_EQ(applies, 2);
 }
 
+UT_TEST(fresh_master_accepts_namespace_before_writer_install)
+{
+	uint8 request[sizeof(sent)], ack[sizeof(sent)];
+	reset();
+	UT_ASSERT(!cluster_block_redeclare_poll_v1(tag, PCM_STATE_N, 80, 90, epoch, master));
+	memcpy(request, sent, sizeof(sent));
+	writer_ready = false;
+	restart_ready = false;
+	deliver(0, 1, request);
+	UT_ASSERT_EQ(applies, 0);
+	restart_ready = true;
+	deliver(0, 1, request);
+	UT_ASSERT_EQ(applies, 1);
+	UT_ASSERT_EQ(sends, 2);
+	memcpy(ack, sent, sizeof(sent));
+	deliver(1, 0, ack);
+	UT_ASSERT(!cluster_block_redeclare_poll_v1(tag, PCM_STATE_N, 80, 90, epoch, master));
+	writer_ready = true;
+	deliver(1, 0, ack);
+	UT_ASSERT(cluster_block_redeclare_poll_v1(tag, PCM_STATE_N, 80, 90, epoch, master));
+}
+
 UT_TEST(late_ack_cannot_cover_changed_buffer_or_incarnation)
 {
 	uint8 request[sizeof(sent)], ack[sizeof(sent)];
@@ -263,9 +293,10 @@ UT_TEST(self_master_is_applied_and_unknown_cut_never_finishes)
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(6);
 	UT_RUN(codec_checks_full_length_and_reserved_bytes);
 	UT_RUN(scan_waits_for_actual_master_application_ack);
+	UT_RUN(fresh_master_accepts_namespace_before_writer_install);
 	UT_RUN(late_ack_cannot_cover_changed_buffer_or_incarnation);
 	UT_RUN(foreign_or_unfrozen_request_does_not_mutate_master);
 	UT_RUN(self_master_is_applied_and_unknown_cut_never_finishes);

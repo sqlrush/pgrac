@@ -316,6 +316,7 @@ OBJS = \
 	cluster_pi_data.o \
 	cluster_pi_writeback.o \
 	cluster_block_redeclare.o \
+	cluster_pi_rebuild.o \
 	cluster_wal_restart_read.o \
 	cluster_wal_writer.o \
 	cluster_wal_state.o \

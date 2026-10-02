@@ -57,6 +57,7 @@
 #include "cluster/cluster_ges_mode.h"	 /* spec-5.1b — frozen matrix + convert classification */
 #include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_pi_rebuild.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_hw.h"			/* spec-4.6a HW remaster watchdog stubs */
@@ -404,11 +405,14 @@ cluster_epoch_adopt_admitted(uint64 admitted_epoch)
  * unchanged (no buffers scanned → the callback is never invoked → send/lookup
  * are never reached in this test).
  */
+static int ut_mock_routed_master = 0;
 int
 cluster_gcs_lookup_master(BufferTag tag pg_attribute_unused())
 {
-	return 0;
+	return ut_mock_routed_master;
 }
+
+BackendType MyBackendType = B_LMON;
 /* spec-5.16 L104 — cluster_grd.c now references these (join fence predicates).
  * Settable so the join-fence suite can drive a specific static home + member
  * set.  Defaults (static master 0, all members) keep pre-5.16 tests unchanged. */
@@ -5606,6 +5610,8 @@ UT_TEST(test_redeclare_fresh_join_recipient_accepts_only_its_fence)
 
 UT_TEST(test_canonical_space_dead_node_returns_grd_to_normal_after_data_recovery)
 {
+	ClusterGrdPiRebuildCutV1 cut, changed;
+	BufferTag tag = { 0 };
 	setup_recovery_control_fixture(true);
 	cluster_shared_data_dir = "/fixture/shared";
 	cluster_shared_config = true;
@@ -5615,6 +5621,28 @@ UT_TEST(test_canonical_space_dead_node_returns_grd_to_normal_after_data_recovery
 	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_CLUSTER);
 	ut_thread_recovery_blocked = false;
 	cluster_grd_recovery_lmon_tick();
+	/* DATA recovery alone cannot reconstruct departed-writer obligations. */
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_CLUSTER);
+	UT_ASSERT_EQ(cluster_grd_pi_rebuild_snapshot_v1(&cut), 1);
+	UT_ASSERT_EQ(cut.affected[0], 2);
+	UT_ASSERT(cluster_grd_pi_rebuild_gate_v1());
+	ut_mock_static_master = 1;
+	ut_mock_routed_master = cluster_node_id;
+	UT_ASSERT(cluster_grd_pi_rebuild_blocked_v1(tag));
+	ut_mock_static_master = 0;
+	UT_ASSERT(!cluster_grd_pi_rebuild_blocked_v1(tag));
+	ut_mock_static_master = 1;
+	UT_ASSERT(!cluster_grd_pi_rebuild_complete_v1(&cut));
+	MyBackendType = B_BG_WRITER;
+	changed = cut;
+	changed.member_boots[2]++;
+	UT_ASSERT(!cluster_grd_pi_rebuild_complete_v1(&changed));
+	UT_ASSERT(cluster_grd_pi_rebuild_complete_v1(&cut));
+	UT_ASSERT(!cluster_grd_pi_rebuild_gate_v1());
+	UT_ASSERT(!cluster_grd_pi_rebuild_blocked_v1(tag));
+	ut_mock_static_master = 0;
+	MyBackendType = B_LMON;
+	cluster_grd_recovery_lmon_tick();
 	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_IDLE);
 	for (uint32 shard = 0; shard < PGRAC_GRD_SHARD_COUNT; shard++) {
 		UT_ASSERT_EQ(cluster_grd_shard_phase(shard), GRD_SHARD_NORMAL);
@@ -5622,6 +5650,54 @@ UT_TEST(test_canonical_space_dead_node_returns_grd_to_normal_after_data_recovery
 	}
 	cluster_shared_config = false;
 	cluster_shared_data_dir = NULL;
+	finish_recovery_control_fixture();
+}
+
+UT_TEST(test_join_protocol_completes_before_local_pi_service_and_new_cut_invalidates)
+{
+	ClusterGrdPiRebuildCutV1 cut;
+	BufferTag tag = { 0 };
+	uint8 joined[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 2 };
+	ut_jr_setup_3node();
+	cluster_enabled = cluster_shared_config = true;
+	cluster_node_id = 1;
+	ut_mock_routed_master = ut_mock_static_master = 1;
+	ut_mock_epoch = 10;
+	ut_qvotec_quorum = true;
+	ut_admitted_incarnation = 11;
+	mock_lms_shard_master_generation = (UINT64_C(10) << 32) | 7;
+	cluster_grd_arm_join_pcm_fence(joined);
+	UT_ASSERT_EQ(cluster_grd_pi_rebuild_snapshot_v1(&cut), -1);
+	cluster_grd_recovery_mark_peer_done(0, 10, 0);
+	cluster_grd_recovery_mark_peer_done(2, 10, 0);
+	UT_ASSERT(cluster_grd_join_view_rebuilt());
+	UT_ASSERT(!cluster_grd_block_view_rebuilt(tag));
+	UT_ASSERT(cluster_grd_pi_rebuild_blocked_v1(tag));
+	UT_ASSERT_EQ(cluster_grd_pi_rebuild_snapshot_v1(&cut), 1);
+	MyBackendType = B_BG_WRITER;
+	UT_ASSERT(cluster_grd_pi_rebuild_complete_v1(&cut));
+	UT_ASSERT(cluster_grd_block_view_rebuilt(tag));
+	UT_ASSERT(!cluster_grd_pi_rebuild_blocked_v1(tag));
+	/* Same-epoch recipient union and routing/boot changes are different cuts. */
+	joined[0] = 6;
+	cluster_grd_arm_join_pcm_fence(joined);
+	UT_ASSERT(cluster_grd_pi_rebuild_gate_v1());
+	UT_ASSERT(!cluster_grd_pi_rebuild_complete_v1(&cut));
+	UT_ASSERT_EQ(cluster_grd_pi_rebuild_snapshot_v1(&cut), 1);
+	UT_ASSERT(cluster_grd_pi_rebuild_complete_v1(&cut));
+	mock_lms_shard_master_generation++;
+	UT_ASSERT(cluster_grd_pi_rebuild_gate_v1());
+	UT_ASSERT_EQ(cluster_grd_pi_rebuild_snapshot_v1(&cut), 1);
+	UT_ASSERT(cluster_grd_pi_rebuild_complete_v1(&cut));
+	ut_admitted_incarnation++;
+	UT_ASSERT(cluster_grd_pi_rebuild_gate_v1());
+	/* A survivor may finish its control census independently of receiver PI. */
+	cluster_node_id = 0;
+	UT_ASSERT_EQ(cluster_grd_pi_rebuild_snapshot_v1(&cut), 0);
+	MyBackendType = B_LMON;
+	ut_mock_routed_master = 0;
+	ut_admitted_incarnation = 11;
+	cluster_shared_config = false;
 	finish_recovery_control_fixture();
 }
 
@@ -5686,7 +5762,7 @@ UT_TEST(test_control_acquire_waits_for_common_barrier_even_on_normal_shard)
 	UT_ASSERT(cluster_grd_control_acquire_allowed(&cf, ShareLock));
 	UT_ASSERT(cluster_grd_control_acquire_allowed(&walr, ExclusiveLock));
 	UT_ASSERT(!cluster_grd_control_acquire_allowed(&cf, ExclusiveLock));
-	UT_ASSERT(!cluster_grd_control_acquire_allowed(&walr, ShareLock));
+	UT_ASSERT(cluster_grd_control_acquire_allowed(&walr, ShareLock));
 	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_CLUSTER);
 	UT_ASSERT(cluster_grd_recovery_in_progress());
 	cluster_shared_config = false;
@@ -6735,7 +6811,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(143);
+	UT_PLAN(144);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
@@ -6874,6 +6950,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_redeclare_census_requires_exact_fenced_episode);
 	UT_RUN(test_redeclare_fresh_join_recipient_accepts_only_its_fence);
 	UT_RUN(test_canonical_space_dead_node_returns_grd_to_normal_after_data_recovery);
+	UT_RUN(test_join_protocol_completes_before_local_pi_service_and_new_cut_invalidates);
 	UT_RUN(test_control_acquire_waits_for_common_barrier_even_on_normal_shard);
 	UT_RUN(test_control_gate_unknown_cut_never_proves_frozen_or_ready);
 	UT_RUN(test_recovery_control_uses_accepted_epoch_after_observer_bump);
