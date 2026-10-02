@@ -58,6 +58,25 @@ cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own)
 	return own ? CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID : CLUSTER_COLD_PAGE_SKIP;
 }
 
+ClusterColdUnscheduledV1
+cluster_cold_unscheduled_v1(const ClusterColdRecordV1 *record)
+{
+	uint32 i;
+
+	if (record == NULL || record->component_count != 0
+		|| (record->record_flags
+			& (CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_UNSUPPORTED
+			   | CLUSTER_COLD_RECORD_SIDE_UNOWNED))
+			   != 0)
+		return CLUSTER_COLD_UNSCHEDULED_REFUSE;
+	if (record->space_count == 0)
+		return CLUSTER_COLD_UNSCHEDULED_NATIVE;
+	for (i = 0; i < record->space_count; i++)
+		if (record->space_ops[i].kind == CLUSTER_COLD_SPACE_DROP)
+			return CLUSTER_COLD_UNSCHEDULED_REFUSE;
+	return CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP;
+}
+
 static ClusterColdReplayDetailV1
 replay_stop(ColdReplayRun *run, ClusterColdReplayDetailV1 detail, uint32 participant,
 			XLogRecPtr rec_ptr)
