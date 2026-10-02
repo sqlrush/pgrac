@@ -499,10 +499,17 @@ extern bool cluster_recovery_merge_fence_plan_copy_replay(const ClusterRecoveryF
 														  uint64 out_bitmap[2],
 														  XLogRecPtr *out_start);
 extern bool cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan);
+extern uint16 cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *plan);
+struct ClusterControlRootSnapshot;
+struct ClusterControlRootReadToken;
+extern bool cluster_recovery_merge_fence_plan_origin(const ClusterRecoveryFencePlan *plan,
+													 uint16 index, uint16 *origin_thread,
+													 struct ClusterControlRootSnapshot *root,
+													 struct ClusterControlRootReadToken *token);
 struct ClusterThreadRecoveryAuthorityV1;
-extern bool cluster_recovery_merge_fence_plan_authority(
-	ClusterRecoveryFencePlan *plan, uint16 origin_thread,
-	struct ClusterThreadRecoveryAuthorityV1 *out);
+extern bool
+cluster_recovery_merge_fence_plan_authority(ClusterRecoveryFencePlan *plan, uint16 origin_thread,
+											struct ClusterThreadRecoveryAuthorityV1 *out);
 extern bool cluster_recovery_merge_fence_plan_release_serial(ClusterRecoveryFencePlan *plan);
 extern void cluster_recovery_merge_fence_plan_destroy(ClusterRecoveryFencePlan **plan);
 

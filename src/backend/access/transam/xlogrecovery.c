@@ -132,6 +132,20 @@
  *	What changed: XLogFileRead opens the authenticated restart generation
  *	              independently of the writable pg_wal route.
  *	Why:          A successor writer must not substitute its WAL for restart input.
+ *
+ * PGRAC MODIFICATIONS (S9P2-05 typed cold replay)
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-s9p2-05-instance-and-cluster-recovery.md
+ *	What changed: With cluster.shared_config, an engaged cold merge runs the
+ *	              typed cold plan: pass 1 (cluster_recovery_typed_begin)
+ *	              scans every retained writer generation before the serial
+ *	              set is taken; pass 2
+ *	              (cluster_recovery_typed_replay) replays the sealed
+ *	              schedule, matching every page record to its pass-1
+ *	              identity.  The legacy profile keeps the SCN merge.
+ *	Why:          Retained history before a native redo start is ancestry
+ *	              only; SCN order with unconditional full-page images can
+ *	              overwrite a newer durable page another thread wrote.
  */
 
 #include "postgres.h"
@@ -167,6 +181,7 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_space_identity.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -619,6 +634,10 @@ static XLogRecPtr cluster_recovery_merged_replay(const uint64 *bitmap, const XLo
 												 TimeLineID tli, uint16 own_thread,
 												 TimeLineID *replayTLI, bool restore_mode,
 												 ClusterRecoveryFencePlan **fence_plan);
+static ClusterColdTypedV1 *cluster_recovery_typed_begin(ClusterRecoveryFencePlan **fence_plan);
+static XLogRecPtr cluster_recovery_typed_replay(ClusterColdTypedV1 **typed,
+												TimeLineID *replayTLI,
+												ClusterRecoveryFencePlan **fence_plan);
 static bool cluster_backup_recovery_have_manifest = false;
 static ClusterBackupManifest cluster_backup_recovery_manifest;
 static bool cluster_backup_recovery_target_active = false;
@@ -2409,6 +2428,7 @@ PerformWalRecovery(void)
 	uint64		cluster_merge_bitmap[2] = {0, 0};
 	XLogRecPtr	cluster_merge_start[CLUSTER_WAL_STATE_SLOT_COUNT + 1];
 	ClusterRecoveryFencePlan *cluster_fence_plan = NULL;
+	ClusterColdTypedV1 *cluster_typed = NULL;
 #endif
 
 	/*
@@ -2467,7 +2487,15 @@ PerformWalRecovery(void)
 			cluster_wal_thread_id(), RedoStartLSN, &cluster_fence_plan);
 		cluster_recovery_merge_claim_acquire_blocking();
 	}
-	if (cluster_engage == CLUSTER_MERGE_ENGAGE)
+	/*
+	 * PGRAC: the shared profile replays every retained writer generation
+	 * through the typed cold plan (pass 1 here, pass 2 below); it never
+	 * falls back to the SCN-ordered legacy merge, which ignores page
+	 * ancestry and cannot read PRE2 generation directories.
+	 */
+	if (cluster_engage == CLUSTER_MERGE_ENGAGE && cluster_shared_config)
+		cluster_typed = cluster_recovery_typed_begin(&cluster_fence_plan);
+	else if (cluster_engage == CLUSTER_MERGE_ENGAGE)
 	{
 		bool serial_acquired;
 		bool plan_committed = false;
@@ -2670,11 +2698,15 @@ PerformWalRecovery(void)
 		{
 			XLogRecPtr	merged_end;
 
-			merged_end = cluster_recovery_merged_replay(cluster_merge_bitmap, cluster_merge_start,
-													NULL, NULL, replayTLI,
-													cluster_wal_thread_id(),
-													&replayTLI, false,
-													&cluster_fence_plan);
+			if (cluster_typed != NULL)
+				merged_end = cluster_recovery_typed_replay(&cluster_typed, &replayTLI,
+														   &cluster_fence_plan);
+			else
+				merged_end = cluster_recovery_merged_replay(cluster_merge_bitmap,
+															cluster_merge_start, NULL, NULL,
+															replayTLI, cluster_wal_thread_id(),
+															&replayTLI, false,
+															&cluster_fence_plan);
 			RmgrCleanup();
 			ereport(LOG, (errmsg("redo done (merged) at %X/%X system usage: %s",
 								 LSN_FORMAT_ARGS(merged_end), pg_rusage_show(&ru0))));
@@ -3027,6 +3059,405 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 	ereport(LOG, (errmsg("cluster %srecovery: replay complete (own thread %u)",
 						 restore_mode ? "backup restore " : "merged ",
 						 (unsigned)own_thread)));
+	return own_end;
+}
+
+/*
+ * cluster_recovery_typed_fail -- release cold serialization, then fail.
+ *
+ *	Releasing the serial set also releases the retention pin; neither may
+ *	outlive a refused startup.  The detail is copied out of the typed plan's
+ *	memory context before that context is deleted.
+ */
+static void
+pg_attribute_noreturn()
+cluster_recovery_typed_fail(ClusterRecoveryFencePlan **fence_plan, ClusterColdTypedV1 **typed,
+							const char *message, const char *detail)
+{
+	char	   *detail_copy = detail != NULL ? pstrdup(detail) : NULL;
+	bool		released = true;
+
+	if (fence_plan != NULL && *fence_plan != NULL)
+	{
+		released = cluster_recovery_merge_fence_plan_release_serial(*fence_plan);
+		if (released)
+			cluster_recovery_merge_fence_plan_destroy(fence_plan);
+	}
+	cluster_cold_typed_destroy_v1(typed);
+	ereport(FATAL,
+			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+			 errmsg("%s", message),
+			 detail_copy != NULL ? errdetail("%s", detail_copy) : 0,
+			 !released ? errdetail_log("Cold recovery serialization release was not confirmed.") : 0,
+			 errhint("Preserve all original thread WAL and shared configuration. Shared mode "
+					 "recovers every retained writer generation through the typed cold plan "
+					 "and never falls back to single-stream replay.")));
+	pg_unreachable();
+}
+
+/*
+ * cluster_recovery_typed_begin -- typed cold replay pass 1.
+ *
+ *	With every foreign origin's external admission held and before the
+ *	serial set (retention pin, then IR) is taken, run pass 1: scan every
+ *	retained cut, observe DATA and seal the plan.  These reads are
+ *	provisional.  The serial set then retains the same input and the
+ *	unchanged ROOT tokens are recommitted; pass 2 re-reads that retained
+ *	input and matches every record identity and count against pass 1.
+ *	Nothing is mutated before this returns; every refusal releases what
+ *	was taken.
+ */
+static ClusterColdTypedV1 *
+cluster_recovery_typed_begin(ClusterRecoveryFencePlan **fence_plan)
+{
+	ClusterColdTypedV1 *typed = NULL;
+	bool		serial_acquired;
+	bool		plan_committed = false;
+
+	typed = cluster_cold_typed_prepare_v1(*fence_plan, cluster_wal_thread_id(), RedoStartLSN);
+	if (typed->refusal != CLUSTER_COLD_OK)
+		cluster_recovery_typed_fail(fence_plan, &typed, "typed cold recovery refused",
+									typed->refusal_detail);
+	serial_acquired = cluster_recovery_merge_fence_plan_acquire_serial(*fence_plan);
+	if (serial_acquired)
+		plan_committed = cluster_recovery_merge_commit_plan_nowait(*fence_plan);
+	if (!serial_acquired || !plan_committed)
+	{
+		if (serial_acquired)
+			cluster_write_fence_note_external_mutation_gate_blocked();
+		cluster_recovery_typed_fail(fence_plan, &typed,
+									"cold recovery fence plan changed before replay", NULL);
+	}
+	ereport(LOG,
+			(errmsg("cluster typed cold recovery: plan sealed for %u writer generations",
+					typed->participant_count),
+			 errdetail_log(UINT64_FORMAT " records scanned, %u replay steps, " UINT64_FORMAT
+						   " pages observed, " UINT64_FORMAT " unreadable.",
+						   typed->scanned_records, cluster_cold_plan_step_count_v1(typed->plan),
+						   typed->observer.pages_observed, typed->observer.pages_invalid)));
+	return typed;
+}
+
+/* Pass-2 cursor over every participant of one sealed typed plan. */
+typedef struct ClusterColdTypedReplay
+{
+	ClusterColdTypedV1 *typed;
+	ClusterRecoveryFencePlan **fence_plan;
+	TimeLineID *replayTLI;
+	ClusterColdReaderV1 *readers[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint64		consumed[CLUSTER_COLD_MAX_PARTICIPANTS];
+	XLogRecPtr	last_end[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint64		max_recovered[CLUSTER_WAL_STATE_SLOT_COUNT + 1];
+	XLogRecPtr	own_read;
+	XLogRecPtr	own_end;
+	bool		foreign_mutation_started;
+	uint64		pages_skipped;
+	uint64		pages_applied;
+	ClusterColdDecodedV1 decoded;	/* scratch for unscheduled records */
+} ClusterColdTypedReplay;
+
+static void
+pg_attribute_noreturn()
+cluster_typed_replay_mismatch(ClusterColdTypedReplay *rep, uint32 participant,
+							  XLogRecPtr read_rec_ptr, const char *what)
+{
+	ereport(FATAL,
+			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+			 errmsg("typed cold recovery input changed between passes"),
+			 errdetail("Thread %u record %X/%X: %s.",
+					   (unsigned) rep->typed->participants[participant].thread_id,
+					   LSN_FORMAT_ARGS(read_rec_ptr), what),
+			 errhint("Preserve all original thread WAL; the retained input must not change "
+					 "while cold recovery holds it.")));
+	pg_unreachable();
+}
+
+/* The first foreign mutation revalidates the complete fence plan. */
+static void
+cluster_typed_replay_foreign_gate(ClusterColdTypedReplay *rep)
+{
+	if (rep->foreign_mutation_started)
+		return;
+	if (rep->fence_plan == NULL || *rep->fence_plan == NULL ||
+		!cluster_recovery_merge_fence_plan_revalidate_nowait(*rep->fence_plan))
+	{
+		cluster_write_fence_note_external_mutation_gate_blocked();
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_EXTERNAL_FENCE_UNAVAILABLE),
+				 errmsg("external write exclusion became stale before cold replay"),
+				 errhint("Retry startup so every foreign origin is fenced again; do not force "
+						 "partial recovery.")));
+	}
+	rep->foreign_mutation_started = true;
+}
+
+static void
+cluster_typed_replay_consumed(ClusterColdTypedReplay *rep, uint32 participant,
+							  XLogReaderState *r, bool is_own)
+{
+	uint16		thread = rep->typed->participants[participant].thread_id;
+
+	rep->consumed[participant]++;
+	rep->last_end[participant] = r->EndRecPtr;
+	if (is_own)
+	{
+		rep->own_read = r->ReadRecPtr;
+		rep->own_end = r->EndRecPtr;
+	}
+	else if (thread <= CLUSTER_WAL_STATE_SLOT_COUNT && r->EndRecPtr > rep->max_recovered[thread])
+		rep->max_recovered[thread] = r->EndRecPtr;
+}
+
+/*
+ * A record without ordinary page components.  Its class decides the route,
+ * as in the legacy merge; a page record here means pass 1 saw other input.
+ */
+static void
+cluster_typed_replay_nonpage(ClusterColdTypedReplay *rep, uint32 participant,
+							 XLogReaderState *r)
+{
+	ClusterColdTypedV1 *typed = rep->typed;
+	const ClusterWalSourceRef *source = &typed->sources[participant];
+	bool		is_own = participant == typed->own_participant;
+	XLogRecord *rec = &r->record->header;
+
+	if (cluster_cold_recovery_decode_v1(r, typed->system_identifier,
+										source->claim.identity.storage_uuid, false,
+										&rep->decoded) != CLUSTER_COLD_OK ||
+		rep->decoded.record.component_count != 0)
+		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
+									  "an unscheduled record carries page versions");
+	cluster_typed_replay_consumed(rep, participant, r, is_own);
+	if (!is_own)
+	{
+		ClusterRecoveryRecordClass cls = cluster_record_apply_class(r);
+
+		if (cls == CLUSTER_RECMERGE_LOCAL)
+		{
+			cluster_vis_bump_merged_skipped_local();
+			return;
+		}
+		if (cls == CLUSTER_RECMERGE_UNCLASSIFIABLE)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("typed cold recovery hit an unclassifiable record on thread %u "
+							"(rmgr %u)",
+							(unsigned) typed->participants[participant].thread_id,
+							(unsigned) rec->xl_rmid),
+					 errhint("This foreign record has no supported cold owner.")));
+		cluster_typed_replay_foreign_gate(rep);
+		if (rec->xl_rmid == RM_XACT_ID || rec->xl_rmid == RM_CLOG_ID ||
+			rec->xl_rmid == RM_MULTIXACT_ID || rec->xl_rmid == RM_COMMIT_TS_ID)
+		{
+			cluster_recovery_merge_set_scn(rec->xl_scn);
+			cluster_remote_xact_apply((int) typed->participants[participant].thread_id - 1, r,
+									  false);
+			cluster_vis_bump_merged_records_applied();
+			return;
+		}
+	}
+	cluster_recovery_merge_set_scn(rec->xl_scn);
+	cluster_recovery_merge_set_apply_foreign(!is_own);
+	ApplyWalRecord(r, rec, rep->replayTLI);
+	cluster_recovery_merge_set_apply_foreign(false);
+	if (!is_own)
+		cluster_vis_bump_merged_records_applied();
+}
+
+/* One scheduled page record, matched exactly against its pass-1 identity. */
+static void
+cluster_typed_replay_page(ClusterColdTypedReplay *rep, uint32 participant, XLogReaderState *r,
+						  const ClusterColdStepV1 *step)
+{
+	bool		is_own = participant == rep->typed->own_participant;
+
+	if (r->EndRecPtr != step->end_rec_ptr ||
+		(uint32) r->record->header.xl_crc != step->record_crc ||
+		r->record->header.xl_rmid != step->rmid || r->record->header.xl_info != step->info)
+		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
+									  "the scheduled record identity differs");
+	cluster_typed_replay_consumed(rep, participant, r, is_own);
+	if (step->all_skip)
+	{
+		rep->pages_skipped++;
+		return;
+	}
+#ifdef CLUSTER_COLD_REDO_HOOK_CONSUMER_V1
+	if (!is_own)
+		cluster_typed_replay_foreign_gate(rep);
+	cluster_cold_redo_step_enter_v1(step);
+	cluster_recovery_merge_set_scn(r->record->header.xl_scn);
+	cluster_recovery_merge_set_apply_foreign(!is_own);
+	ApplyWalRecord(r, &r->record->header, rep->replayTLI);
+	cluster_recovery_merge_set_apply_foreign(false);
+	cluster_cold_redo_step_leave_v1();
+	rep->pages_applied++;
+#else
+	ereport(FATAL,
+			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+			 errmsg("typed cold recovery cannot apply page record %X/%X of thread %u",
+					LSN_FORMAT_ARGS(r->ReadRecPtr),
+					(unsigned) rep->typed->participants[participant].thread_id),
+			 errdetail("This build has no per-block typed redo consultation; applying the "
+					   "record through the freshness checks could skip or overwrite a newer "
+					   "page version."),
+			 errhint("Preserve all original thread WAL and start with a build that supports "
+					 "typed cold replay.")));
+#endif
+}
+
+/* Read the participant up to the scheduled record, replaying what precedes it. */
+static XLogReaderState *
+cluster_typed_replay_until(ClusterColdTypedReplay *rep, uint32 participant, XLogRecPtr target)
+{
+	for (;;)
+	{
+		char	   *errormsg = NULL;
+		XLogReaderState *r;
+
+		HandleStartupProcInterrupts();
+		r = cluster_cold_reader_next_v1(rep->readers[participant], &errormsg);
+		if (r == NULL)
+			cluster_typed_replay_mismatch(rep, participant, target,
+										  errormsg != NULL ? errormsg
+										  : "the scheduled record is missing");
+		if (r->ReadRecPtr == target)
+			return r;
+		if (r->ReadRecPtr > target)
+			cluster_typed_replay_mismatch(rep, participant, target,
+										  "the scheduled record start was passed");
+		cluster_typed_replay_nonpage(rep, participant, r);
+	}
+}
+
+/* Replay the rest of one participant and prove its cut was consumed. */
+static void
+cluster_typed_replay_drain(ClusterColdTypedReplay *rep, uint32 participant)
+{
+	const ClusterColdParticipantV1 *cut = &rep->typed->participants[participant];
+	char	   *errormsg = NULL;
+	XLogReaderState *r;
+
+	while ((r = cluster_cold_reader_next_v1(rep->readers[participant], &errormsg)) != NULL)
+	{
+		HandleStartupProcInterrupts();
+		if (r->EndRecPtr > cut->tail_end)
+			cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
+										  "a record lies past the validated tail");
+		cluster_typed_replay_nonpage(rep, participant, r);
+	}
+	if (rep->last_end[participant] != cut->tail_end ||
+		rep->consumed[participant] !=
+		cluster_cold_plan_replay_record_count_v1(rep->typed->plan, participant))
+		cluster_typed_replay_mismatch(rep, participant, rep->last_end[participant],
+									  errormsg != NULL ? errormsg
+									  : "the replayed cut differs from pass 1");
+}
+
+/* Pin progress to the own stream, persist outcomes, publish and release. */
+static void
+cluster_typed_replay_finish(ClusterColdTypedReplay *rep)
+{
+	uint32		p;
+
+	if (rep->own_read != InvalidXLogRecPtr)
+	{
+		SpinLockAcquire(&XLogRecoveryCtl->info_lck);
+		XLogRecoveryCtl->lastReplayedReadRecPtr = rep->own_read;
+		XLogRecoveryCtl->lastReplayedEndRecPtr = rep->own_end;
+		XLogRecoveryCtl->lastReplayedTLI = *rep->replayTLI;
+		SpinLockRelease(&XLogRecoveryCtl->info_lck);
+	}
+	cluster_remote_xact_flush();
+	if (*rep->fence_plan != NULL &&
+		!cluster_recovery_merge_fence_plan_revalidate_nowait(*rep->fence_plan))
+	{
+		cluster_write_fence_note_external_publish_gate_blocked();
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_EXTERNAL_FENCE_UNAVAILABLE),
+				 errmsg("external write exclusion became stale before recovery authority publish"),
+				 errhint("Retry startup; replayed foreign state remains unpublished until the "
+						 "complete fence plan is current.")));
+	}
+	for (p = 0; p < rep->typed->participant_count; p++)
+	{
+		uint16		thread = rep->typed->participants[p].thread_id;
+
+		if (p != rep->typed->own_participant && thread <= CLUSTER_WAL_STATE_SLOT_COUNT &&
+			rep->max_recovered[thread] > 0)
+			cluster_merged_authority_publish((int) thread - 1, rep->max_recovered[thread]);
+	}
+	if (*rep->fence_plan != NULL)
+	{
+		if (!cluster_recovery_merge_fence_plan_release_serial(*rep->fence_plan))
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("cold recovery serialization release was not confirmed")));
+		cluster_recovery_merge_fence_plan_destroy(rep->fence_plan);
+	}
+}
+
+/*
+ * cluster_recovery_typed_replay -- typed cold replay pass 2.
+ *
+ *	Steps follow the sealed schedule.  Before each scheduled page record its
+ *	participant's preceding records (no page versions) are replayed in
+ *	order; afterwards every participant is drained to its validated tail.
+ *	Each page record must match its pass-1 identity, and each participant
+ *	must replay exactly the records pass 1 saw after its native redo.
+ */
+static XLogRecPtr
+cluster_recovery_typed_replay(ClusterColdTypedV1 **typed_address, TimeLineID *replayTLI,
+							  ClusterRecoveryFencePlan **fence_plan)
+{
+	ClusterColdTypedV1 *typed = *typed_address;
+	ClusterColdTypedReplay *rep = palloc0(sizeof(*rep));
+	uint32		steps = cluster_cold_plan_step_count_v1(typed->plan);
+	uint32		i;
+	XLogRecPtr	own_end;
+
+	rep->typed = typed;
+	rep->fence_plan = fence_plan;
+	rep->replayTLI = replayTLI;
+	for (i = 0; i < typed->participant_count; i++)
+	{
+		rep->readers[i] = cluster_cold_reader_open_v1(&typed->sources[i],
+													  typed->system_identifier,
+													  typed->participants[i].native_redo);
+		if (rep->readers[i] == NULL)
+			cluster_typed_replay_mismatch(rep, i, typed->participants[i].native_redo,
+										  "the selected source cannot be opened");
+		rep->last_end[i] = typed->participants[i].native_redo;
+	}
+	cluster_recovery_merge_window_enter();
+	cluster_recovery_merge_set_own_lsn((uint64) typed->participants[typed->own_participant].native_redo);
+	for (i = 0; i < steps; i++)
+	{
+		ClusterColdStepV1 step;
+		XLogReaderState *r;
+
+		if (!cluster_cold_plan_step_v1(typed->plan, i, &step) ||
+			step.participant >= typed->participant_count)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("typed cold recovery plan step %u is unusable", i)));
+		r = cluster_typed_replay_until(rep, step.participant, step.read_rec_ptr);
+		cluster_typed_replay_page(rep, step.participant, r, &step);
+	}
+	for (i = 0; i < typed->participant_count; i++)
+		cluster_typed_replay_drain(rep, i);
+	cluster_recovery_merge_window_leave();
+	for (i = 0; i < typed->participant_count; i++)
+		cluster_cold_reader_close_v1(&rep->readers[i]);
+	cluster_typed_replay_finish(rep);
+	ereport(LOG,
+			(errmsg("cluster typed cold recovery: replay complete (own thread %u)",
+					(unsigned) typed->participants[typed->own_participant].thread_id),
+			 errdetail_log(UINT64_FORMAT " page records skipped, " UINT64_FORMAT " applied.",
+						   rep->pages_skipped, rep->pages_applied)));
+	own_end = rep->own_end;
+	pfree(rep);
+	cluster_cold_typed_destroy_v1(typed_address);
 	return own_end;
 }
 
