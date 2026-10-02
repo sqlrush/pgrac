@@ -497,7 +497,16 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	smgrtruncate2(RelationGetSmgr(rel), forks, nforks, old_blocks, blocks);
 #ifdef USE_PGRAC_CLUSTER
 	if (space_truncate != NULL)
+	{
+		/* The new SPACE identity may reach disk immediately after release.
+		 * Its physical shrink must already be durable, including auxiliary
+		 * forks, before any successor can allocate or write under that identity.
+		 * A sync error remains fatal inside the original truncation critical
+		 * section; do not expose an identity whose physical action is uncertain. */
+		for (int i = 0; i < nforks; i++)
+			smgrimmedsync(RelationGetSmgr(rel), forks[i]);
 		cluster_space_truncate_publish(space_truncate);
+	}
 #endif
 
 	END_CRIT_SECTION();
