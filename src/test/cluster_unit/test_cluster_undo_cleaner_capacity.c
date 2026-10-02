@@ -58,6 +58,11 @@ static ClusterCtrcCapacityProbeResult test_proof;
 static TransactionId test_xid = 100;
 static bool test_maintenance_cut, test_ctrc_progress;
 static unsigned test_ctrc_passes, test_gc_passes, test_modifier_entries, test_modifier_leaves;
+static bool test_gc_complete;
+static uint32 test_inventory_max;
+static unsigned test_inventory_scans;
+static uint64 test_gc_reclaimed;
+static ClusterUndoSegTryRecycle test_recycle_result;
 bool cluster_undo_record_segment_commit_on_rollover;
 int cluster_undo_cleaner_batch_segments = 8;
 
@@ -114,8 +119,9 @@ cluster_tt_slot_gc_current_pass(SCN horizon, uint64 epoch, ClusterUndoCleanerPas
 	if (horizon != 1000 || epoch != 13 || stats == NULL || test_lock_depth != 0)
 		abort();
 	test_gc_passes++;
+	stats->shmem_tt_slots_gcd += test_gc_reclaimed;
 	/* A finite existing GC refusal exercises the real pass's token release. */
-	return false;
+	return test_gc_complete;
 }
 
 void
@@ -138,25 +144,30 @@ cluster_undo_horizon_stall_reason_name(ClusterUndoHorizonStallReason reason pg_a
 uint32
 cluster_undo_segment_scan_max_existing(uint8 owner pg_attribute_unused())
 {
-	abort();
+	return test_inventory_max;
 }
 uint32
 cluster_undo_record_active_segment_id(void)
 {
-	abort();
+	return 1;
 }
 uint32
 cluster_tt_slot_current_segment(int node pg_attribute_unused())
 {
-	abort();
+	return 1;
 }
 bool
-cluster_undo_segment_tt_header_scan_pass(uint32 segment pg_attribute_unused(),
-										 uint8 owner pg_attribute_unused(),
-										 SCN horizon pg_attribute_unused(),
-										 ClusterUndoCleanerPassStats *stats pg_attribute_unused())
+cluster_undo_segment_tt_header_scan_pass(uint32 segment, uint8 owner, SCN horizon,
+										 ClusterUndoCleanerPassStats *stats)
 {
-	abort();
+	if (segment < 2 || segment > test_inventory_max || owner != 1 || horizon != 1000)
+		abort();
+	/* A durable COMMITTED slot remains in an ALREADY/RETAINED segment.
+	 * This observation is deliberately unchanged by subsequent scans. */
+	stats->header_tt_slots_below_horizon++;
+	stats->segments_scanned++;
+	test_inventory_scans++;
+	return true;
 }
 void
 cluster_undo_segment_advance_committed(uint32 segment pg_attribute_unused())
@@ -164,11 +175,11 @@ cluster_undo_segment_advance_committed(uint32 segment pg_attribute_unused())
 	abort();
 }
 ClusterUndoSegTryRecycle
-cluster_undo_segment_advance_recyclable(uint32 segment pg_attribute_unused(),
-										SCN horizon pg_attribute_unused(),
-										uint64 epoch pg_attribute_unused())
+cluster_undo_segment_advance_recyclable(uint32 segment, SCN horizon, uint64 epoch)
 {
-	abort();
+	if (segment < 2 || segment > test_inventory_max || horizon != 1000 || epoch != 13)
+		abort();
+	return test_recycle_result;
 }
 bool
 errstart(int level pg_attribute_unused(), const char *domain pg_attribute_unused())
@@ -427,6 +438,11 @@ reset_wait_fixture(void)
 	subscribed = early_signal = test_cancel = test_pin_after_probe = false;
 	prepared = cancelled = slept = signalled = broadcasts = 0;
 	test_proof = CLUSTER_CTRC_CAPACITY_WAIT;
+	test_gc_complete = false;
+	test_inventory_max = 1;
+	test_inventory_scans = 0;
+	test_gc_reclaimed = 0;
+	test_recycle_result = CLUSTER_SEG_RECYCLE_ALREADY;
 	for (unsigned i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++) {
 		undo_cleaner_state->workers[i].status = UNDO_CLEANER_READY;
 		undo_cleaner_state->workers[i].latch = &test_proc.procLatch;
@@ -648,16 +664,69 @@ UT_TEST(test_outer_pass_keeps_terminal_supply_but_cuts_new_optional_maintenance)
 	}
 }
 
+UT_TEST(test_full_history_batch_without_reclaim_yields)
+{
+	for (int retained = 0; retained < 2; retained++) {
+		/* Reinitializing shmem does not erase the same durable inventory. */
+		for (int boot = 0; boot < 2; boot++) {
+			bool remaining = true;
+
+			reset_wait_fixture();
+			undo_cleaner_worker = 0;
+			test_gc_complete = true;
+			test_inventory_max = 9;
+			test_recycle_result = retained ? CLUSTER_SEG_RECYCLE_RETAINED
+									  : CLUSTER_SEG_RECYCLE_ALREADY;
+			test_ctrc_progress = test_maintenance_cut = false;
+			for (int pass = 0; pass < 3; pass++) {
+				UT_ASSERT(!undo_cleaner_run_pass(&remaining));
+				UT_ASSERT(!remaining);
+			}
+			UT_ASSERT_EQ(test_inventory_scans, 24);
+			UT_ASSERT_EQ(undo_cleaner_state->header_tt_slots_below_horizon, 24);
+			UT_ASSERT_EQ(undo_cleaner_state->segments_marked_recyclable, 0);
+			UT_ASSERT_EQ(undo_cleaner_state->shmem_tt_slots_gcd, 0);
+			UT_ASSERT_EQ(test_lock_depth, 0);
+		}
+	}
+}
+
+UT_TEST(test_real_recycle_progress_continues_then_yields)
+{
+	for (int gc = 0; gc < 2; gc++) {
+		bool remaining = false;
+
+		reset_wait_fixture();
+		undo_cleaner_worker = 0;
+		test_gc_complete = true;
+		test_inventory_max = 9;
+		test_ctrc_progress = test_maintenance_cut = false;
+		test_recycle_result = gc ? CLUSTER_SEG_RECYCLE_ALREADY : CLUSTER_SEG_RECYCLE_ADVANCED;
+		test_gc_reclaimed = gc ? 1 : 0;
+		UT_ASSERT(!undo_cleaner_run_pass(&remaining));
+		UT_ASSERT(remaining);
+		UT_ASSERT_EQ(undo_cleaner_state->segments_marked_recyclable, gc ? 0 : 8);
+		UT_ASSERT_EQ(undo_cleaner_state->shmem_tt_slots_gcd, gc ? 1 : 0);
+		test_recycle_result = CLUSTER_SEG_RECYCLE_ALREADY;
+		test_gc_reclaimed = 0;
+		UT_ASSERT(!undo_cleaner_run_pass(&remaining));
+		UT_ASSERT(!remaining);
+		UT_ASSERT_EQ(test_lock_depth, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(8);
 	UT_RUN(test_capacity_wait_retries_signals_and_cadence_without_authorizing_free);
 	UT_RUN(test_capacity_every_blocking_hold_refuses_without_sleep);
 	UT_RUN(test_heavyweight_lock_identity_and_mode_are_exact);
 	UT_RUN(test_capacity_cancellation_and_missing_supply_keep_original_outcome);
 	UT_RUN(test_worker_lifecycle_rows_and_pid_inventory_are_independent);
 	UT_RUN(test_outer_pass_keeps_terminal_supply_but_cuts_new_optional_maintenance);
+	UT_RUN(test_full_history_batch_without_reclaim_yields);
+	UT_RUN(test_real_recycle_progress_continues_then_yields);
 	free(undo_cleaner_state);
 	UT_DONE();
 	return ut_failed_count != 0;
