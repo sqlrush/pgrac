@@ -880,7 +880,9 @@ UT_TEST(test_new_page_starts_from_unformatted_or_absent)
 	UT_ASSERT_EQ(step.blocks[0].verdict, CLUSTER_COLD_BLOCK_APPLY_INIT);
 	UT_ASSERT_EQ(step.blocks[0].expected_kind, CLUSTER_COLD_DATA_UNFORMATTED);
 	UT_ASSERT_EQ(step.blocks[1].verdict, CLUSTER_COLD_BLOCK_APPLY_INIT);
-	UT_ASSERT_EQ(step.blocks[1].expected_kind, CLUSTER_COLD_DATA_ABSENT);
+	/* Replay of a later block may extend the relation over this one as a
+	 * zero page first; the init replaces whatever is there. */
+	UT_ASSERT_EQ(step.blocks[1].expected_kind, CLUSTER_COLD_DATA_INVALID);
 	destroy_plan(&plan);
 
 	plan = make_plan(parts, 1);

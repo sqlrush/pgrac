@@ -507,6 +507,16 @@ component_expected(const ClusterColdPlanV1 *plan, const ColdComponent *component
 		return;
 	}
 	kind = (component->state >> COLD_STATE_DATA_KIND_SHIFT) & COLD_STATE_DATA_KIND_MASK;
+	/*
+	 * A block DATA did not have yet can exist as a zero page by the time its
+	 * anchor applies: redo of a later block extends the relation over it.
+	 * The anchor replaces the whole page, so any content is expected.
+	 */
+	if (kind == CLUSTER_COLD_DATA_ABSENT) {
+		Assert(component->verdict != CLUSTER_COLD_BLOCK_APPLY_DELTA);
+		block->expected_kind = CLUSTER_COLD_DATA_INVALID;
+		return;
+	}
 	source = cold_component(plan, component->link);
 	block->expected_kind = kind;
 	if (kind == CLUSTER_COLD_DATA_PRESENT || kind == CLUSTER_COLD_DATA_UNFORMATTED)

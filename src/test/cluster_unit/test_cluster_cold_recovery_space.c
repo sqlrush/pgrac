@@ -429,7 +429,7 @@ UT_TEST(test_space_create_orders_new_relation_pages)
 	UT_ASSERT(step_at(plan, 1, 1, 0x1000, &step));
 	UT_ASSERT_EQ(step.step_kind, CLUSTER_COLD_STEP_PAGE);
 	UT_ASSERT_EQ(step.blocks[0].verdict, CLUSTER_COLD_BLOCK_APPLY_INIT);
-	UT_ASSERT_EQ(step.blocks[0].expected_kind, CLUSTER_COLD_DATA_ABSENT);
+	UT_ASSERT_EQ(step.blocks[0].expected_kind, CLUSTER_COLD_DATA_INVALID);
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
@@ -498,11 +498,12 @@ UT_TEST(test_space_truncate_boundary_rebase_and_retire)
 		cluster_cold_plan_destroy_v1(&plan);
 	}
 
-	/* A shrink that reached disk leaves the retired block absent. */
+	/* A shrink that reached disk leaves the retired block absent: the init
+	 * replaces it (or the zero page a later block's extension leaves). */
 	plan = truncate_fixture(&table, ver(INC_NEW, 2), CLUSTER_COLD_DATA_ABSENT, ver(0, 0));
 	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
 	UT_ASSERT(step_at(plan, 4, 1, 0x1100, &step));
-	UT_ASSERT_EQ(step.blocks[0].expected_kind, CLUSTER_COLD_DATA_ABSENT);
+	UT_ASSERT_EQ(step.blocks[0].expected_kind, CLUSTER_COLD_DATA_INVALID);
 	cluster_cold_plan_destroy_v1(&plan);
 
 	/* Old content under the new identity, or a zeroed block under the old
@@ -749,7 +750,7 @@ UT_TEST(test_space_drop_makes_changes_irrelevant)
 	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 4);
 	UT_ASSERT(step_at(plan, 3, 1, 0x1200, &step));
 	UT_ASSERT_EQ(step.blocks[0].verdict, CLUSTER_COLD_BLOCK_APPLY_INIT);
-	UT_ASSERT_EQ(step.blocks[0].expected_kind, CLUSTER_COLD_DATA_ABSENT);
+	UT_ASSERT_EQ(step.blocks[0].expected_kind, CLUSTER_COLD_DATA_INVALID);
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
