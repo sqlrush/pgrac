@@ -45,6 +45,7 @@
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_wal_tail.h"
 #include "storage/bufpage.h"
+#include "storage/checksum.h"
 #include "utils/memutils.h"
 
 /* cluster.cold_recovery_plan_memory, kB; registered with the cluster GUCs. */
@@ -378,12 +379,6 @@ cluster_cold_typed_ready_v1(const ClusterColdTypedV1 *typed,
 	return reason[0] == '\0';
 }
 
-bool
-cluster_cold_checksum_proves_content_v1(bool checksums_enabled, bool ignore_checksum_failure)
-{
-	return checksums_enabled && !ignore_checksum_failure;
-}
-
 static bool cold_replay_window = false;
 
 void
@@ -474,9 +469,20 @@ cold_page_all_zero(const char *page)
 	return true;
 }
 
+/* The stored data checksum matches the content (pg_checksum_page scratches
+ * pd_checksum, so it runs on a copy). */
+static bool
+cold_page_checksum_matches(const char *page, BlockNumber blkno)
+{
+	PGAlignedBlock copy;
+
+	memcpy(copy.data, page, BLCKSZ);
+	return pg_checksum_page(copy.data, blkno) == ((const PageHeaderData *)page)->pd_checksum;
+}
+
 bool
-cluster_cold_classify_page_v1(const char *page, bool verified, bool content_proven,
-							  ClusterColdDataV1 *out)
+cluster_cold_classify_page_v1(const char *page, BlockNumber blkno, bool header_valid,
+							  bool checksums, ClusterColdDataV1 *out)
 {
 	memset(out, 0, sizeof(*out));
 	if (PageIsNew((Page)page)) {
@@ -489,7 +495,7 @@ cluster_cold_classify_page_v1(const char *page, bool verified, bool content_prov
 		out->flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED;
 		return true;
 	}
-	if (!verified) {
+	if (!header_valid || (checksums && !cold_page_checksum_matches(page, blkno))) {
 		out->kind = CLUSTER_COLD_DATA_INVALID;
 		return true;
 	}
@@ -499,7 +505,7 @@ cluster_cold_classify_page_v1(const char *page, bool verified, bool content_prov
 		return false;
 	out->kind = CLUSTER_COLD_DATA_PRESENT;
 	out->version.mutation_token = (uint64)((const PageHeaderData *)page)->pd_block_scn;
-	if (content_proven)
+	if (checksums)
 		out->flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED;
 	return true;
 }
@@ -509,9 +515,10 @@ cluster_cold_refusal_hint_v1(ClusterColdDetailV1 detail)
 {
 	switch (detail) {
 	case CLUSTER_COLD_CONTENT_UNPROVEN:
-		return "Without data checksums the named page's content cannot be proven, and no "
-			   "full-page image after its last checkpointed change can rebuild it. Preserve "
-			   "all original thread WAL and DATA; do not force recovery.";
+		return "Shared mode requires data checksums (initdb -k, or pgrac-init); without them "
+			   "the named page's content cannot be proven, and no full-page image after its "
+			   "last checkpointed change can rebuild it. Preserve all original thread WAL and "
+			   "DATA; do not force recovery.";
 	case CLUSTER_COLD_ANCHOR_MISSING:
 		return "The named page is unreadable or failed verification, and no full-page image "
 			   "after its last checkpointed change can rebuild it. Preserve all original "

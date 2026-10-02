@@ -390,12 +390,14 @@ extern bool cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page
 
 /*
  * Classify one block read from storage (the caller handles a missing block
- * and fills the segment incarnation).  verified is PageIsVerifiedExtended's
- * answer; content_proven says whether it covered the whole page (an
- * enforced checksum).  False: a formatted page without a version token.
+ * and fills the segment incarnation).  header_valid is the native page
+ * verification.  With data checksums the stored checksum is compared to the
+ * content here, whatever ignore_checksum_failure says: a mismatch is a torn
+ * or corrupt page (INVALID), a match proves the content.  False: a
+ * formatted page without a version token.
  */
-extern bool cluster_cold_classify_page_v1(const char *page, bool verified, bool content_proven,
-										  ClusterColdDataV1 *out);
+extern bool cluster_cold_classify_page_v1(const char *page, BlockNumber blkno, bool header_valid,
+										  bool checksums, ClusterColdDataV1 *out);
 
 /* Operator hint for a pass-1 refusal. */
 extern const char *cluster_cold_refusal_hint_v1(ClusterColdDetailV1 detail);
@@ -490,10 +492,6 @@ extern void cluster_cold_replay_window_enter_v1(void);
 extern void cluster_cold_replay_window_leave_v1(void);
 extern bool cluster_cold_replay_window_active_v1(void);
 
-/* True when a page that passed verification has proven content: data
- * checksums are on and a checksum failure is not being ignored. */
-extern bool cluster_cold_checksum_proves_content_v1(bool checksums_enabled,
-													bool ignore_checksum_failure);
 
 /*
  * Per-block decision consumed by the typed cold redo consultation in

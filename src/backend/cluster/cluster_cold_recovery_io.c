@@ -48,9 +48,6 @@
 #include "storage/bufpage.h"
 #include "storage/smgr.h"
 
-/* bufpage.c; declared here as guc_tables.c and bufmgr.c do. */
-extern bool ignore_checksum_failure;
-
 struct ClusterColdReaderV1 {
 	ClusterWalSourceRef source;
 	XLogReaderState *reader;
@@ -179,8 +176,7 @@ cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterCol
 	PGAlignedBlock block;
 	SMgrRelation relation;
 	ForkNumber fork;
-	bool verified;
-	bool proven;
+	bool header_valid;
 
 	if (observer == NULL || page == NULL || out == NULL || page->forknum > MAX_FORKNUM)
 		return false;
@@ -194,12 +190,11 @@ cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterCol
 		return true;
 	}
 	smgrread(relation, fork, page->blockno, block.data);
-	verified = PageIsVerifiedExtended((Page)block.data, page->blockno, 0);
-	/* Only an enforced page checksum proves the content of a verified page;
-	 * otherwise just its header is known. */
-	proven
-		= cluster_cold_checksum_proves_content_v1(DataChecksumsEnabled(), ignore_checksum_failure);
-	if (!cluster_cold_classify_page_v1(block.data, verified, proven, out))
+	/* The classifier compares the data checksum itself, so a page the native
+	 * check passes under ignore_checksum_failure is still judged torn. */
+	header_valid = PageIsVerifiedExtended((Page)block.data, page->blockno, 0);
+	if (!cluster_cold_classify_page_v1(block.data, page->blockno, header_valid,
+									   DataChecksumsEnabled(), out))
 		return false;
 	if (out->kind == CLUSTER_COLD_DATA_INVALID) {
 		observer->pages_invalid++;
