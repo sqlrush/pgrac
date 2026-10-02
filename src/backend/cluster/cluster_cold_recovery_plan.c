@@ -67,6 +67,7 @@ typedef struct ColdParticipant {
 	ClusterColdParticipantV1 cut;
 	uint32 input_index;
 	bool seen;
+	XLogRecPtr last_read;
 	XLogRecPtr last_end;
 } ColdParticipant;
 
@@ -415,8 +416,11 @@ record_cursor_check(const ColdParticipant *participant, const ClusterColdRecordV
 	if (record->read_rec_ptr >= record->end_rec_ptr || record->read_rec_ptr < cut->physical_lower
 		|| record->end_rec_ptr > cut->tail_end)
 		return CLUSTER_COLD_SOURCE_GAP;
+	/* Contiguity: each record names its predecessor (xl_prev), so a record
+	 * skipped by the feeder cannot hide behind a monotonic LSN. */
 	if (!participant->seen ? record->read_rec_ptr != cut->physical_lower
-						   : record->read_rec_ptr < participant->last_end)
+						   : record->read_rec_ptr < participant->last_end
+								 || record->prev_rec_ptr != participant->last_read)
 		return CLUSTER_COLD_SOURCE_GAP;
 	/* History ends at the native redo start; nothing may span it. */
 	if (record->read_rec_ptr < cut->native_redo && record->end_rec_ptr > cut->native_redo)
@@ -507,6 +511,7 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 			detail = record_store(plan, plan->canonical[participant], record);
 		if (detail == CLUSTER_COLD_OK) {
 			owner->seen = true;
+			owner->last_read = record->read_rec_ptr;
 			owner->last_end = record->end_rec_ptr;
 		}
 	}
@@ -661,63 +666,81 @@ data_shape_valid(const ClusterColdDataV1 *data)
 	}
 }
 
+/* Last anchor (full image or full-coverage init) whose whole chain suffix
+ * is replayable; -1 when none.  History is never replayed. */
+static int64
+page_last_replayable_anchor(const ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count)
+{
+	uint32 i;
+
+	for (i = count; i > 0; i--) {
+		const ColdComponent *component = &plan->components[chain[i - 1]];
+
+		if (plan->records[component->record].history)
+			return -1;
+		if (component->edge_flags != 0)
+			return (int64)i - 1;
+	}
+	return -1;
+}
+
 /*
  * Place DATA on the chain.  *covered is the last chain index DATA already
- * contains (-1: none).  *repair means DATA is replaced from the anchor at
- * *covered + 1.
+ * contains (-1: none).  *exact means the page holds the DATA state exactly
+ * before the first applied component; otherwise that component is an
+ * anchor that replaces unreadable or unrelated content.
+ *
+ * The shared profile does not require checksums, so a torn write can pair
+ * a newer header with an older body.  As with full_page_writes, the last
+ * replayable anchor is always restored once DATA is at or past its
+ * predecessor, never skipped on a header token alone.
  */
 static ClusterColdDetailV1
 page_data_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
-				   const ClusterColdDataV1 *data, int64 *covered, bool *repair,
+				   const ClusterColdDataV1 *data, int64 *covered, bool *exact,
 				   ClusterColdDiagV1 *diag)
 {
 	const ColdComponent *first = &plan->components[chain[0]];
 	bool new_start = first->before_kind != RF_PAGE_STATE_PRESENT;
+	int64 anchor = page_last_replayable_anchor(plan, chain, count);
+	int64 position = -2;
 	uint32 i;
 
-	*repair = false;
+	*exact = true;
 	if (data->kind == CLUSTER_COLD_DATA_PRESENT) {
-		for (i = 0; i < count; i++)
-			if (version_equal(&plan->components[chain[i]].result, &data->version)) {
-				*covered = (int64)i;
-				return CLUSTER_COLD_OK;
-			}
-		if (!new_start && version_equal(&first->before, &data->version)) {
-			*covered = -1;
-			return CLUSTER_COLD_OK;
+		for (i = 0; i < count && position == -2; i++)
+			if (version_equal(&plan->components[chain[i]].result, &data->version))
+				position = (int64)i;
+		if (position == -2 && !new_start && version_equal(&first->before, &data->version))
+			position = -1;
+		if (position == -2) {
+			diag_component(plan, diag, chain[0]);
+			diag->version = data->version;
+			return incarnation_equal(&first->result, &data->version)
+					   ? CLUSTER_COLD_ANCESTOR_MISSING
+					   : CLUSTER_COLD_INCARNATION_MISMATCH;
 		}
-		diag_component(plan, diag, chain[0]);
-		diag->version = data->version;
-		return incarnation_equal(&first->result, &data->version)
-				   ? CLUSTER_COLD_ANCESTOR_MISSING
-				   : CLUSTER_COLD_INCARNATION_MISMATCH;
-	}
-	if (data->kind != CLUSTER_COLD_DATA_INVALID && new_start) {
+	} else if (data->kind != CLUSTER_COLD_DATA_INVALID && new_start) {
 		if (data->kind == CLUSTER_COLD_DATA_UNFORMATTED
 			&& !incarnation_equal(&first->result, &data->version)) {
 			diag_component(plan, diag, chain[0]);
 			diag->version = data->version;
 			return CLUSTER_COLD_INCARNATION_MISMATCH;
 		}
-		*covered = -1;
+		position = -1;
+	} else {
+		/* Unreadable, or a new page where a formatted one was expected. */
+		if (anchor < 0) {
+			diag_component(plan, diag, chain[count - 1]);
+			diag->version = data->version;
+			return CLUSTER_COLD_ANCHOR_MISSING;
+		}
+		*exact = false;
+		*covered = anchor - 1;
 		return CLUSTER_COLD_OK;
 	}
-	/* Unreadable or unexpected new-page DATA: restart from the last anchor
-	 * whose whole suffix is replayable; history is never replayed. */
-	for (i = count; i > 0; i--) {
-		const ColdComponent *component = &plan->components[chain[i - 1]];
-
-		if (plan->records[component->record].history)
-			break;
-		if (component->edge_flags != 0) {
-			*covered = (int64)i - 2;
-			*repair = true;
-			return CLUSTER_COLD_OK;
-		}
-	}
-	diag_component(plan, diag, chain[count - 1]);
-	diag->version = data->version;
-	return CLUSTER_COLD_ANCHOR_MISSING;
+	*covered = anchor >= 0 && position >= anchor - 1 ? anchor - 1 : position;
+	return CLUSTER_COLD_OK;
 }
 
 static uint8
@@ -732,7 +755,7 @@ apply_verdict(uint16 edge_flags)
 
 static ClusterColdDetailV1
 page_assign_verdicts(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
-					 const ClusterColdDataV1 *data, int64 covered, bool repair,
+					 const ClusterColdDataV1 *data, int64 covered, bool exact,
 					 ClusterColdDiagV1 *diag)
 {
 	uint32 i;
@@ -751,8 +774,8 @@ page_assign_verdicts(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 		}
 		component->verdict = apply_verdict(component->edge_flags);
 		if ((int64)i == covered + 1) {
-			component->expected_kind = repair ? CLUSTER_COLD_DATA_INVALID : data->kind;
-			if (!repair)
+			component->expected_kind = exact ? data->kind : CLUSTER_COLD_DATA_INVALID;
+			if (exact)
 				component->expected_before = data->version;
 		} else {
 			const ColdComponent *previous = &plan->components[chain[i - 1]];
@@ -772,7 +795,7 @@ page_group_resolve(ClusterColdPlanV1 *plan, const uint32 *group, uint32 count, C
 	ClusterColdDataV1 data;
 	ClusterColdDetailV1 detail;
 	bool replayable = false;
-	bool repair;
+	bool exact;
 	int64 covered;
 	uint32 i;
 
@@ -788,10 +811,10 @@ page_group_resolve(ClusterColdPlanV1 *plan, const uint32 *group, uint32 count, C
 		diag_component(plan, diag, work->chain[0]);
 		return CLUSTER_COLD_OBSERVATION_FAILED;
 	}
-	detail = page_data_position(plan, work->chain, count, &data, &covered, &repair, diag);
+	detail = page_data_position(plan, work->chain, count, &data, &covered, &exact, diag);
 	if (detail != CLUSTER_COLD_OK)
 		return detail;
-	return page_assign_verdicts(plan, work->chain, count, &data, covered, repair, diag);
+	return page_assign_verdicts(plan, work->chain, count, &data, covered, exact, diag);
 }
 
 static ClusterColdDetailV1
@@ -1071,7 +1094,12 @@ cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 index, ClusterCo
 		const ColdComponent *component = &plan->components[record->first_component + i];
 		ClusterColdBlockStepV1 *block = &out->blocks[component->block_id];
 
-		Assert(component->verdict != CLUSTER_COLD_BLOCK_NONE);
+		/* Every component of a scheduled record has a verdict; anything else
+		 * is a planner bug and must not reach replay as "no action". */
+		if (component->verdict == CLUSTER_COLD_BLOCK_NONE) {
+			memset(out, 0, sizeof(*out));
+			return false;
+		}
 		block->verdict = component->verdict;
 		block->expected_kind = component->expected_kind;
 		block->expected_before = component->expected_before;

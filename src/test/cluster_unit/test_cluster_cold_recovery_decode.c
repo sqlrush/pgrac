@@ -112,6 +112,7 @@ fake_record(FakeRecord *record, uint8 rmid, uint8 info, int blocks)
 	record->storage.decoded.header.xl_info = info;
 	record->storage.decoded.header.xl_crc = 0xabcd;
 	record->storage.decoded.header.xl_scn = 77;
+	record->storage.decoded.header.xl_prev = 0xf80;
 	record->storage.decoded.main_data = record->data;
 	record->storage.decoded.main_data_len = sizeof(record->data);
 	record->storage.decoded.max_block_id = blocks - 1;
@@ -172,6 +173,7 @@ UT_TEST(test_page_record_maps_ordinary_components)
 	UT_ASSERT_EQ(out.record.read_rec_ptr, 0x1000);
 	UT_ASSERT_EQ(out.record.end_rec_ptr, 0x1080);
 	UT_ASSERT_EQ(out.record.scn, 77);
+	UT_ASSERT_EQ(out.record.prev_rec_ptr, 0xf80);
 	UT_ASSERT_EQ(out.record.record_crc, 0xabcd);
 	UT_ASSERT_EQ(out.record.rmid, RM_HEAP_ID);
 	UT_ASSERT_EQ(out.record.info, 0x20);
@@ -286,7 +288,7 @@ UT_TEST(test_storage_lifecycle_classification)
 		uint8 info;
 		uint8 flags;
 	} cases[] = { { RM_SMGR_ID, XLOG_SMGR_CREATE, 0 },
-				  { RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION, 0 },
+				  { RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_SMGR_ID, XLOG_SMGR_TRUNCATE, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_SMGR_ID, XLOG_SMGR_SPACE_IDENTITY, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_DBASE_ID, 0x00, CLUSTER_COLD_RECORD_STRUCTURAL },

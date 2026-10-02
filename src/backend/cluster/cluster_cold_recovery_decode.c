@@ -125,7 +125,9 @@ cold_record_flags(XLogReaderState *reader, uint8 *flags)
 	case RM_XACT_ID:
 		return cold_xact_flags(reader, flags);
 	case RM_SMGR_ID:
-		if (info == XLOG_SMGR_TRUNCATE || info == XLOG_SMGR_SPACE_IDENTITY)
+		/* SPACE reservations carry order-sensitive SPACE versions too. */
+		if (info == XLOG_SMGR_TRUNCATE || info == XLOG_SMGR_SPACE_IDENTITY
+			|| info == XLOG_SMGR_SPACE_RESERVATION)
 			*flags = CLUSTER_COLD_RECORD_STRUCTURAL;
 		return CLUSTER_COLD_OK;
 	case RM_HEAP2_ID:
@@ -208,6 +210,7 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 	decoded = reader->record;
 	out->record.read_rec_ptr = reader->ReadRecPtr;
 	out->record.end_rec_ptr = reader->EndRecPtr;
+	out->record.prev_rec_ptr = decoded->header.xl_prev;
 	out->record.scn = decoded->header.xl_scn;
 	out->record.record_crc = (uint32)decoded->header.xl_crc;
 	out->record.rmid = decoded->header.xl_rmid;

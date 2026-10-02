@@ -104,8 +104,8 @@ typedef struct ClusterColdComponentV1 {
 
 /*
  * Record flags set by the decoder.  STRUCTURAL marks a relation lifecycle
- * change (truncate, drop, identity tombstone, database/tablespace, relation
- * map) whose ordering against other generations' page records needs its own
+ * change (truncate, drop, SPACE identity or reservation, database/tablespace,
+ * relation map) whose ordering against other generations' page records needs its own
  * typed owner; it is refused after the native redo start and accepted as
  * already-durable history before it.  UNSUPPORTED marks input outside the
  * supported profile (prepared transactions) and is refused anywhere.
@@ -119,7 +119,8 @@ typedef struct ClusterColdComponentV1 {
 typedef struct ClusterColdRecordV1 {
 	XLogRecPtr read_rec_ptr;
 	XLogRecPtr end_rec_ptr;
-	uint64 scn; /* xl_scn; deterministic tie-break only */
+	XLogRecPtr prev_rec_ptr; /* xl_prev: must equal the previous fed read_rec_ptr */
+	uint64 scn;				 /* xl_scn; deterministic tie-break only */
 	uint32 record_crc;
 	uint8 rmid;
 	uint8 info;
@@ -221,6 +222,7 @@ extern ClusterColdDetailV1 cluster_cold_plan_seal_v1(ClusterColdPlanV1 *plan,
 extern uint32 cluster_cold_plan_step_count_v1(const ClusterColdPlanV1 *plan);
 extern bool cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 index,
 									  ClusterColdStepV1 *out);
+
 
 extern void cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan);
 
