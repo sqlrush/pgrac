@@ -2741,6 +2741,7 @@ test_cluster_control_root_worker.inc: $(top_srcdir)/src/backend/cluster/cluster_
 		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_orchestrator.c \
 		$(top_srcdir)/src/backend/cluster/cluster_reconfig.c $(srcdir)/Makefile
 	awk '/^root_owner_exact\(/ { print "static bool"; emit=1; count++ } \
+	     /^cluster_thread_recovery_root_complete_patch_build_v1\(/ { print "bool"; emit=1; count++ } \
 	     /^thread_recovery_root_projection\(/ { print "static bool"; emit=1; count++ } \
 	     /^typedef struct ClusterThreadRecOwnedWorker \{/ { emit=1; types++ } \
 	     /^static ClusterThreadRecOwnedWorker thread_recovery_owned\[/ { print; arrays++ } \
@@ -2748,7 +2749,7 @@ test_cluster_control_root_worker.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     /^thread_recovery_worker_run\(/ { print "static ClusterThreadRecResult"; emit=1; count++ } \
 	     /^thread_recovery_launch_one\(/ { print "static void"; emit=1; count++ } \
 	     /^cluster_thread_recovery_worker_main\(/ { print "void"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 7 || types != 1 || arrays != 1) exit 1 }' \
+	     emit { print } /^}/ { emit=0 } END { if (count != 8 || types != 1 || arrays != 1) exit 1 }' \
 		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_authority.c \
 		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_orchestrator.c \
 		$(top_srcdir)/src/backend/cluster/cluster_reconfig.c \
@@ -2779,6 +2780,7 @@ test_cluster_wal_inputs_product.o: $(top_srcdir)/src/backend/cluster/cluster_wal
 		-Dcluster_wal_claim_v2_read=test_wal_inputs_claim_read -c $< -o $@
 
 test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc \
+		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		test_cluster_control_native_xid.inc \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
@@ -2791,6 +2793,7 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixt
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
+		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		test_cluster_wal_inputs_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
