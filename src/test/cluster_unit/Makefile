@@ -4831,6 +4831,16 @@ test_cluster_pcm_eviction_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bu
 	     END { if (begin != 1 || finish != 1 || cancel != 1 || driver != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# The real clean-leave producer and shared release helper, with the original
+# auxiliary-pin admission predicate. Author: SqlRush <sqlrush@gmail.com>
+test_cluster_pcm_leave_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_pcm_aux_pin_admission_locked\(/ { print "static inline bool"; emit=1; admission++ } \
+	     /^cluster_bufmgr_shared_leave_release_x\(/ { print "static bool"; emit=1; shared++ } \
+	     /^cluster_bufmgr_flush_and_release_x_for_leave\(/ { print "uint32"; emit=1; owner++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (admission != 1 || shared != 1 || owner != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # The real clock-sweep loop, excluding the freelist and unrelated strategy setup.
 test_cluster_pcm_clock_sweep.inc: $(top_srcdir)/src/backend/storage/buffer/freelist.c Makefile
 	awk '/Nothing on the freelist, so run the "clock sweep" algorithm/ { emit=1; begin++ } \
@@ -4911,6 +4921,7 @@ test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
 		test_cluster_pcm_gcs_drop.inc test_cluster_pcm_downgrade.inc test_cluster_pcm_eviction_gate.inc \
 		test_cluster_pcm_barrier_proof.inc \
 		test_cluster_pcm_eviction_owner.inc test_cluster_pcm_clock_sweep.inc \
+		test_cluster_pcm_leave_owner.inc \
 		test_cluster_pcm_source_finish_consumer.inc \
 		test_cluster_pcm_s_prepare.inc \
 		test_cluster_pcm_source_finish_tick.inc \
