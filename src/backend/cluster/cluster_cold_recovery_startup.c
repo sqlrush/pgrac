@@ -374,6 +374,12 @@ cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own)
 	return own ? CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID : CLUSTER_COLD_PAGE_SKIP;
 }
 
+bool
+cluster_cold_checksum_proves_content_v1(bool checksums_enabled, bool ignore_checksum_failure)
+{
+	return checksums_enabled && !ignore_checksum_failure;
+}
+
 /* Pass-2 verdicts of the one record being applied, startup process only. */
 static struct {
 	bool active;

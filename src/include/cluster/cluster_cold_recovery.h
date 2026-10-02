@@ -391,6 +391,11 @@ typedef enum ClusterColdPageActionV1 {
 
 extern ClusterColdPageActionV1 cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own);
 
+/* True when a page that passed verification has proven content: data
+ * checksums are on and a checksum failure is not being ignored. */
+extern bool cluster_cold_checksum_proves_content_v1(bool checksums_enabled,
+													bool ignore_checksum_failure);
+
 /*
  * Per-block decision consumed by the typed cold redo consultation in
  * XLogReadBufferForRedoExtended (whose owner also stamps the result

@@ -509,6 +509,19 @@ UT_TEST(test_unshared_multi_thread_cold_merge_refused)
 	UT_ASSERT_EQ(cluster_cold_route_v1(false, false), CLUSTER_COLD_ROUTE_NATIVE);
 }
 
+/*
+ * PageIsVerifiedExtended accepts a sane header with a failed checksum when
+ * ignore_checksum_failure is on; such a page must not count as proven
+ * content, or a torn body would become a redo base.
+ */
+UT_TEST(test_ignored_checksum_failure_does_not_prove_content)
+{
+	UT_ASSERT(cluster_cold_checksum_proves_content_v1(true, false));
+	UT_ASSERT(!cluster_cold_checksum_proves_content_v1(true, true));
+	UT_ASSERT(!cluster_cold_checksum_proves_content_v1(false, false));
+	UT_ASSERT(!cluster_cold_checksum_proves_content_v1(false, true));
+}
+
 int
 main(void)
 {
@@ -523,6 +536,7 @@ main(void)
 	UT_RUN(test_ready_requires_every_consumer_before_ir);
 	UT_RUN(test_skipped_own_record_advances_next_xid);
 	UT_RUN(test_unshared_multi_thread_cold_merge_refused);
+	UT_RUN(test_ignored_checksum_failure_does_not_prove_content);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
