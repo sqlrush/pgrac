@@ -24,6 +24,26 @@ typedef struct ClusterPageWalBindingV1 {
 
 #define CLUSTER_PAGE_WAL_NATIVE_FLUSHED UINT16_C(1)
 
+/* One owned reference to the existing immutable claim pool, independent of
+ * a BufferDesc. The keyed owner supplies its unchanged physical address.
+ * Zero initialize; never copy a live reference, and release exactly once.
+ * Retaining attribution is not a flush, ancestry or DATA certificate. */
+typedef struct ClusterPageWalRefV1 {
+	uint8 incarnation[16];
+	uint64 token;
+	XLogRecPtr start, end;
+	uint32 crc;
+	uint16 source_flags;
+	uint8 rmid, info;
+} ClusterPageWalRefV1;
+
+extern bool cluster_page_wal_ref_retain_v1(const ClusterPageWalBindingV1 *binding,
+										   ClusterPageWalRefV1 *out);
+extern bool cluster_page_wal_ref_read_v1(const ClusterPageWalRefV1 *ref, RelFileLocator locator,
+										 ForkNumber forknum, BlockNumber blockno,
+										 ClusterPageWalBindingV1 *out);
+extern bool cluster_page_wal_ref_release_v1(ClusterPageWalRefV1 *ref);
+
 typedef enum ClusterPageWalCaptureResultV1 {
 	CLUSTER_PAGE_WAL_CAPTURED,
 	CLUSTER_PAGE_WAL_UNATTRIBUTED,

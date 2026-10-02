@@ -901,10 +901,74 @@ pi_snapshot_requires_frozen_header_owner(void)
 	}
 }
 
+static void
+detached_reference_survives_descriptor_reuse(void)
+{
+	ClusterPageWalRefV1 ref = { 0 }, zero = { 0 };
+	ClusterPageWalBindingV1 binding, out;
+	BufferTag original;
+	reset();
+	UT_ASSERT(capture());
+	PageSetLSNPreserveOrigin(page.data, 0x200);
+	binding = current_binding();
+	original = desc.bufferdesc.tag;
+	UT_ASSERT_EQ(sizeof(ref), 48);
+	UT_ASSERT(cluster_page_wal_ref_retain_v1(&binding, &ref));
+	UT_ASSERT(!cluster_page_wal_ref_retain_v1(&binding, &ref));
+	pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_LOCKED);
+	cluster_page_wal_reset_reuse_locked(&desc.bufferdesc);
+	pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_LOCKED);
+	desc.bufferdesc.tag.blockNum++;
+	writer.claim.identity.origin_owner_incarnation++;
+	writer.claim.claim_sha256[15]++;
+	UT_ASSERT(capture());
+	UT_ASSERT(cluster_page_wal_ref_read_v1(&ref, BufTagGetRelFileLocator(&original),
+										   original.forkNum, original.blockNum, &out));
+	UT_ASSERT(cluster_page_wal_same_mutation_v1(&binding, &out));
+	UT_ASSERT_EQ(out.flags, 0); /* retaining never certifies a native flush */
+	UT_ASSERT(cluster_page_wal_ref_release_v1(&ref));
+	UT_ASSERT_EQ(memcmp(&ref, &zero, sizeof(ref)), 0);
+	UT_ASSERT(cluster_page_wal_ref_release_v1(&ref));
+	UT_ASSERT(!cluster_page_wal_ref_read_v1(
+		&ref, binding.identity.locator, binding.identity.forknum, binding.identity.blockno, &out));
+	UT_ASSERT_EQ(current_binding().source.claim.identity.origin_owner_incarnation, 8);
+}
+
+static void
+detached_reference_rejects_invalid_and_full_pool_without_changes(void)
+{
+	ClusterPageWalRefV1 ref = { 0 }, zero = { 0 };
+	ClusterPageWalBindingV1 original, bad, out, untouched;
+	reset_many();
+	for (int i = 0; i < 256; i++)
+		UT_ASSERT_EQ(capture_many(i, i + 1), CLUSTER_PAGE_WAL_CAPTURED);
+	UT_ASSERT(cluster_page_wal_snapshot_v1(1, &original));
+	bad = original;
+	bad.source.claim.identity.origin_owner_incarnation = 999;
+	UT_ASSERT(!cluster_page_wal_ref_retain_v1(&bad, &ref));
+	UT_ASSERT_EQ(memcmp(&ref, &zero, sizeof(ref)), 0);
+	bad = original;
+	bad.record_end = bad.record_start;
+	UT_ASSERT(!cluster_page_wal_ref_retain_v1(&bad, &ref));
+	UT_ASSERT_EQ(memcmp(&ref, &zero, sizeof(ref)), 0);
+	UT_ASSERT(cluster_page_wal_ref_retain_v1(&original, &ref));
+	pg_atomic_fetch_or_u32(&many_descriptors[0].bufferdesc.state, BM_LOCKED);
+	cluster_page_wal_reset_reuse_locked(&many_descriptors[0].bufferdesc);
+	pg_atomic_fetch_and_u32(&many_descriptors[0].bufferdesc.state, ~BM_LOCKED);
+	UT_ASSERT_EQ(capture_many(257, 999), CLUSTER_PAGE_WAL_UNATTRIBUTED);
+	memset(&untouched, 0xa5, sizeof(untouched));
+	out = untouched;
+	UT_ASSERT(!cluster_page_wal_ref_read_v1(&ref, original.identity.locator, FSM_FORKNUM,
+											original.identity.blockno, &out));
+	UT_ASSERT_EQ(memcmp(&out, &untouched, sizeof(out)), 0);
+	UT_ASSERT(cluster_page_wal_ref_release_v1(&ref));
+	UT_ASSERT_EQ(capture_many(257, 999), CLUSTER_PAGE_WAL_CAPTURED);
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(21);
 	UT_RUN(resident_binding_memory_budget);
 	printf("# Complete private/wire carrier: %zu bytes\n", sizeof(ClusterPageWalBindingV1));
 	cluster_page_wal_shmem_register();
@@ -927,6 +991,8 @@ main(void)
 	UT_RUN(bounded_claim_pool_and_t2_reservation_release);
 	UT_RUN(pregrant_owner_releases_preparation_on_all_outcomes);
 	UT_RUN(pi_snapshot_requires_frozen_header_owner);
+	UT_RUN(detached_reference_survives_descriptor_reuse);
+	UT_RUN(detached_reference_rejects_invalid_and_full_pool_without_changes);
 	free(shared_memory);
 	UT_DONE();
 	return ut_failed_count != 0;

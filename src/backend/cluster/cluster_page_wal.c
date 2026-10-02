@@ -18,14 +18,7 @@
 #define PAGE_WAL_SOURCE_MASK UINT16_C(0x7fff)
 #define PAGE_WAL_SLOT_FLUSHED UINT16_C(0x8000)
 
-typedef struct PageWalSlot {
-	uint8 incarnation[16];
-	uint64 token;
-	XLogRecPtr start, end;
-	uint32 crc;
-	uint16 source_flags; /* 1-based source slot; high bit is native flush */
-	uint8 rmid, info;
-} PageWalSlot;
+typedef ClusterPageWalRefV1 PageWalSlot;
 StaticAssertDecl(sizeof(PageWalSlot) == 48, "page WAL resident slot budget");
 
 typedef struct PageWalSource {
@@ -116,21 +109,21 @@ page_wal_slot_encode(PageWalSlot *slot, const ClusterPageWalBindingV1 *value, ui
 }
 
 static bool
-page_wal_expand(BufferDesc *buf, ClusterPageWalBindingV1 *value)
+page_wal_expand_ref(const PageWalSlot *slot, RelFileLocator locator, ForkNumber forknum,
+					BlockNumber blockno, ClusterPageWalBindingV1 *value)
 {
-	const PageWalSlot *slot = &bindings[buf->buf_id];
 	uint16 source = slot->source_flags & PAGE_WAL_SOURCE_MASK;
 	if (source == 0 || source > PAGE_WAL_SOURCE_SLOTS)
 		return false;
 	memset(value, 0, sizeof(*value));
-	/* The caller's original pin/content lock protects the resident reference;
-	 * another buffer may alter its refcount but cannot replace these bytes. */
+	/* The caller protects its owned reference; another owner may change the
+	 * pool refcount but cannot replace this source while we retain it. */
 	value->source = page_wal_shared->sources[source - 1].source;
 	value->identity.system_identifier = value->source.claim.identity.system_identifier;
 	memcpy(value->identity.storage_uuid, value->source.claim.identity.storage_uuid, 16);
-	value->identity.locator = BufTagGetRelFileLocator(&buf->tag);
-	value->identity.forknum = buf->tag.forkNum;
-	value->identity.blockno = buf->tag.blockNum;
+	value->identity.locator = locator;
+	value->identity.forknum = forknum;
+	value->identity.blockno = blockno;
 	memcpy(value->version.segment_incarnation, slot->incarnation, 16);
 	value->version.mutation_token = slot->token;
 	value->record_start = slot->start;
@@ -140,6 +133,52 @@ page_wal_expand(BufferDesc *buf, ClusterPageWalBindingV1 *value)
 	value->info = slot->info;
 	value->flags
 		= (slot->source_flags & PAGE_WAL_SLOT_FLUSHED) ? CLUSTER_PAGE_WAL_NATIVE_FLUSHED : 0;
+	return true;
+}
+
+static bool
+page_wal_expand(BufferDesc *buf, ClusterPageWalBindingV1 *value)
+{
+	return page_wal_expand_ref(&bindings[buf->buf_id], BufTagGetRelFileLocator(&buf->tag),
+							   buf->tag.forkNum, buf->tag.blockNum, value);
+}
+
+bool
+cluster_page_wal_ref_retain_v1(const ClusterPageWalBindingV1 *binding, ClusterPageWalRefV1 *out)
+{
+	static const ClusterPageWalRefV1 zero = { 0 };
+	uint16 source;
+	if (out == NULL || page_wal_shared == NULL || memcmp(out, &zero, sizeof(*out)) != 0
+		|| !cluster_page_wal_binding_shape_v1(binding)
+		|| !rf_page_identity_valid_v1(&binding->identity))
+		return false;
+	source = page_wal_source_acquire(&binding->source);
+	if (source == 0)
+		return false;
+	page_wal_slot_encode(out, binding, source);
+	return true;
+}
+
+bool
+cluster_page_wal_ref_read_v1(const ClusterPageWalRefV1 *ref, RelFileLocator locator,
+							 ForkNumber forknum, BlockNumber blockno, ClusterPageWalBindingV1 *out)
+{
+	ClusterPageWalBindingV1 value;
+	if (out == NULL || ref == NULL || page_wal_shared == NULL
+		|| !page_wal_expand_ref(ref, locator, forknum, blockno, &value)
+		|| !cluster_page_wal_binding_shape_v1(&value)
+		|| !rf_page_identity_valid_v1(&value.identity))
+		return false;
+	*out = value;
+	return true;
+}
+
+bool
+cluster_page_wal_ref_release_v1(ClusterPageWalRefV1 *ref)
+{
+	if (ref == NULL || !page_wal_source_release(ref->source_flags & PAGE_WAL_SOURCE_MASK))
+		return false;
+	memset(ref, 0, sizeof(*ref));
 	return true;
 }
 
