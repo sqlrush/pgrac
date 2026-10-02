@@ -150,7 +150,8 @@ typedef struct ColdSpaceOp {
 	uint32 record;
 	RelFileLocator locator;
 	BlockNumber nblocks;
-	uint8 kind; /* ClusterColdSpaceKindV1 */
+	uint8 kind;	  /* ClusterColdSpaceKindV1 */
+	bool covered; /* sealed: its incarnation's end is durable; not an input */
 	uint8 before[16];
 	uint8 result[16];
 	uint32 relation;	/* sealed: index of its relation among SPACE inputs, or NO_INDEX */

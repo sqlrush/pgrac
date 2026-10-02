@@ -184,6 +184,31 @@ space_structural(ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag)
 	return CLUSTER_COLD_OK;
 }
 
+/*
+ * An input after a native redo start whose resulting incarnation a
+ * structural change in history already ended is covered by the SPACE pages
+ * on disk: every change to an incarnation precedes its end.  It is neither
+ * handed to the SPACE owner nor a step.
+ */
+static void
+space_covered(ClusterColdPlanV1 *plan)
+{
+	uint32 i;
+
+	for (i = 0; i < plan->space_count; i++) {
+		ColdSpaceOp *op = cold_space_op(plan, i);
+		const ColdSpaceOp *ender;
+
+		if (op->payload == NULL || op->kind == CLUSTER_COLD_SPACE_DROP)
+			continue;
+		ender = space_find(plan, &op->locator, op->result, false);
+		if (ender == NULL || !record_history(plan, ender->record))
+			continue;
+		op->covered = true;
+		cold_record(plan, op->record)->flags &= ~COLD_RECORD_SPACE_STEP;
+	}
+}
+
 /* Per segment: the record that must replay first, and how it ended. */
 static ClusterColdDetailV1
 space_segments(ClusterColdPlanV1 *plan)
@@ -203,9 +228,11 @@ space_segments(ClusterColdPlanV1 *plan)
 		const ColdSpaceOp *ender
 			= space_find(plan, &relation->locator, segment->incarnation, false);
 
-		facts->creator_record = creator != NULL && !record_history(plan, creator->record)
-									? creator->record
-									: CLUSTER_COLD_NO_INDEX;
+		facts->creator_record
+			= creator != NULL
+					  && (cold_record(plan, creator->record)->flags & COLD_RECORD_SPACE_STEP) != 0
+				  ? creator->record
+				  : CLUSTER_COLD_NO_INDEX;
 		facts->retired_from = InvalidBlockNumber;
 		if (ender == NULL)
 			continue;
@@ -308,7 +335,7 @@ space_inputs(ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag)
 	uint32 i;
 
 	for (i = 0; i < plan->space_count; i++)
-		if (cold_space_op(plan, i)->payload != NULL)
+		if (cold_space_op(plan, i)->payload != NULL && !cold_space_op(plan, i)->covered)
 			plan->space_input_count++;
 	if (plan->space_input_count != 0 && plan->space_check == NULL)
 		return CLUSTER_COLD_SIDE_OWNER_MISSING;
@@ -323,7 +350,7 @@ space_inputs(ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag)
 	if (detail == CLUSTER_COLD_OK) {
 		plan->space_input_count = 0;
 		for (i = 0; i < plan->space_count; i++)
-			if (cold_space_op(plan, i)->payload != NULL)
+			if (cold_space_op(plan, i)->payload != NULL && !cold_space_op(plan, i)->covered)
 				plan->space_inputs[plan->space_input_count++] = i;
 		qsort_arg(plan->space_inputs, plan->space_input_count, sizeof(uint32), input_compare, plan);
 	}
@@ -357,8 +384,10 @@ cold_plan_space_seal(ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag)
 {
 	ClusterColdDetailV1 detail = space_structural(plan, diag);
 
-	if (detail == CLUSTER_COLD_OK)
+	if (detail == CLUSTER_COLD_OK) {
+		space_covered(plan);
 		detail = space_segments(plan);
+	}
 	if (detail == CLUSTER_COLD_OK)
 		detail = space_inputs(plan, diag);
 	return detail;

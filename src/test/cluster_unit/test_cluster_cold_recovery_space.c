@@ -824,6 +824,58 @@ UT_TEST(test_space_created_relation_without_identity)
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
+/*
+ * An input whose incarnation a structural change in another generation's
+ * history already ended is covered by the SPACE pages on disk: it is not
+ * handed to the SPACE owner and is not a step.  The owner then sees one
+ * chain from the durable state.
+ */
+UT_TEST(test_space_inputs_covered_by_durable_end)
+{
+	ClusterColdParticipantV1 parts[2]
+		= { part(1, 11, 0x1000, 0x1300, 0x2000), part(2, 12, 0x1000, 0x1000, 0x2000) };
+	ClusterColdPlanV1 *plan = make_plan(parts, 2);
+	ObserveTable table = { 0 };
+	ClusterColdDiagV1 diag;
+	ClusterColdSpaceInputV1 input;
+	RelFileLocator locator;
+	uint32 count = 0;
+
+	/* thread 1 history: truncate R, drop S; thread 2 replays around them */
+	UT_ASSERT_EQ(feed_space(plan, 0, 0x1000, 0x1100, 3,
+							space_op(CLUSTER_COLD_SPACE_TRUNCATE, REL_R, INC_OLD, INC_NEW, 4)),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_space(plan, 0, 0x1100, 0x1300, 4,
+							space_op(CLUSTER_COLD_SPACE_DROP, REL_S, INC_C, 0, 0)),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_plain(plan, 0, 0x1300, 0x2000), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_space(plan, 1, 0x1000, 0x1100, 1,
+							space_op(CLUSTER_COLD_SPACE_ADVANCE, REL_R, 0, INC_OLD, 0)),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_space(plan, 1, 0x1100, 0x1200, 2,
+							space_op(CLUSTER_COLD_SPACE_CREATE, REL_S, 0, INC_C, 0)),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_page(plan, 1, 0x1200, 0x1300, 2, init_new(INC_C, REL_S, 0, 5)),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_space(plan, 1, 0x1300, 0x2000, 5,
+							space_op(CLUSTER_COLD_SPACE_ADVANCE, REL_R, 0, INC_NEW, 0)),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	/* R: only the advance on the new incarnation; S: nothing left */
+	UT_ASSERT_EQ(cluster_cold_plan_space_relation_count_v1(plan), 1);
+	UT_ASSERT(cluster_cold_plan_space_relation_v1(plan, 0, &locator, &count));
+	UT_ASSERT_EQ(locator.relNumber, REL_R);
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT(cluster_cold_plan_space_input_v1(plan, 0, 0, &input));
+	UT_ASSERT_EQ(input.read_rec_ptr, 0x1300);
+	UT_ASSERT_EQ(check_log.calls, 1);
+	UT_ASSERT_EQ(check_log.last_count, 1);
+	/* the dropped relation's create and init are not replayed */
+	UT_ASSERT_EQ(table.calls, 0);
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 1);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
 /* One commit drops several relations: one step, each effect located. */
 UT_TEST(test_space_commit_drops_several_relations)
 {
@@ -1034,6 +1086,7 @@ main(void)
 	UT_RUN(test_space_token_repeated_across_incarnations);
 	UT_RUN(test_space_drop_makes_changes_irrelevant);
 	UT_RUN(test_space_commit_drops_several_relations);
+	UT_RUN(test_space_inputs_covered_by_durable_end);
 	UT_RUN(test_space_owner_order_orders_steps);
 	UT_RUN(test_space_owner_check_required);
 	UT_RUN(test_space_created_relation_without_identity);
