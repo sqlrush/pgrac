@@ -6359,7 +6359,7 @@ test_cluster_normal_cold_postjobs.inc: $(top_srcdir)/src/backend/access/transam/
 # fixture values are external inputs, never a hand-copied liveness decision.
 test_cluster_stop_membership_observation.inc: $(top_srcdir)/src/backend/cluster/cluster_reconfig.c Makefile
 	@awk '/^cluster_reconfig_r4_membership_observations_current\(/ { emit=1; starts++; print "static bool" } \
-		emit && /^\/\* Formation-LMON-only/ { done=1; exit } emit { print } \
+		emit { print } emit && /^}/ { done=1; exit } \
 		END { if (!done || starts != 1) exit 1 }' $< > $@
 
 test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h test_cluster_normal_cold_scn.inc \

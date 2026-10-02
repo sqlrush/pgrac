@@ -5324,11 +5324,11 @@ UT_TEST(test_100a_modifier_bootstrap_source_requires_ordinary_write_gate)
 	test_gate_reset();
 	test_gate_publish(2, 0, 0, test_current_epoch, true);
 	UT_ASSERT_EQ(cluster_semantic_activation_modifier_enter(true, &token),
-				 CLUSTER_SEMANTIC_ADMISSION_OK);
-	UT_ASSERT(token.entered);
-	UT_ASSERT(cluster_semantic_activation_modifier_recheck(&token, true));
-	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 1);
-	cluster_semantic_activation_leave(&token);
+				 CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+	UT_ASSERT(!token.entered);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 0);
+	if (token.entered)
+		cluster_semantic_activation_leave(&token);
 }
 
 UT_TEST(test_100b_modifier_bootstrap_source_refuses_replacement_closed_member)
@@ -5567,6 +5567,10 @@ UT_TEST(test_109a_lmon_publishes_source_open_only_after_majority_legacy_zero)
 	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 0);
 	UT_ASSERT_EQ(test_membership_snapshot_calls, 1);
 	UT_ASSERT_EQ(cluster_semantic_activation_modifier_enter(true, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+	UT_ASSERT(!token.entered);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_SOURCE_SIDE, &token),
 				 CLUSTER_SEMANTIC_ADMISSION_OK);
 	cluster_semantic_activation_leave(&token);
 }
@@ -9032,10 +9036,8 @@ UT_TEST(test_normal_start_bootstrap_requires_strict_source_at_entry_and_recheck)
 		ut_normal_start_setup();
 		pg_atomic_write_u32(&NormalStartCompletion->state, state);
 		UT_ASSERT_EQ(cluster_semantic_activation_modifier_enter(true, &token),
-					 state == 2 ? CLUSTER_SEMANTIC_ADMISSION_OK
-								: CLUSTER_SEMANTIC_ADMISSION_CLOSED);
-		UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)),
-					 state == 2 ? 1 : 0);
+					 CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+		UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 0);
 		if (token.entered)
 			cluster_semantic_activation_leave(&token);
 	}
@@ -9044,27 +9046,37 @@ UT_TEST(test_normal_start_bootstrap_requires_strict_source_at_entry_and_recheck)
 	memset(test_r4fsm_bootstrap_bytes, 0, 512);
 	UT_ASSERT(cluster_semantic_normal_start_prepare(true, 0, &failure));
 	UT_ASSERT_EQ(cluster_semantic_activation_modifier_enter(true, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+	if (token.entered)
+		cluster_semantic_activation_leave(&token);
+	/* A real SOURCE read may still enter, but it is never a modifier token. */
+	test_gate_publish(2, 0, 0, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_SOURCE_SIDE, &token),
 				 CLUSTER_SEMANTIC_ADMISSION_OK);
-	UT_ASSERT(cluster_semantic_activation_modifier_recheck(&token, true));
+	UT_ASSERT(!cluster_semantic_activation_modifier_recheck(&token, true));
 	pg_atomic_write_u32(&NormalStartCompletion->state, 5);
 	UT_ASSERT(!cluster_semantic_activation_modifier_recheck(&token, true));
 	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 1);
 	cluster_semantic_activation_leave(&token);
 }
 
-UT_TEST(test_normal_start_bootstrap_after_debt_change_releases_only_its_debt)
+UT_TEST(test_normal_start_zero_modifier_refusal_preserves_read_debt)
 {
-	ClusterSemanticAdmissionToken token;
+	ClusterSemanticAdmissionToken token, reader;
 	ut_normal_start_setup();
 	pg_atomic_write_u32(&NormalStartCompletion->state, 2);
-	test_read_barrier_count = 0;
-	test_fail_normal_on_read_barrier = 3; /* Real helper's second snapshot, after ++debt. */
-	UT_ASSERT_EQ(semantic_activation_modifier_enter_bootstrap(true, &token),
-				 CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED);
+	test_gate_publish(2, 0, 0, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_SOURCE_SIDE, &reader),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(cluster_semantic_activation_modifier_enter(true, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_CLOSED);
 	UT_ASSERT(!token.entered);
-	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 1);
 	if (token.entered)
 		cluster_semantic_activation_leave(&token);
+	cluster_semantic_activation_leave(&reader);
 }
 
 UT_TEST(test_normal_start_closed_modes_block_regular_and_terminal_census)
@@ -10884,7 +10896,7 @@ main(void)
 	UT_RUN(test_normal_start_capture_drift_and_wrong_writer_refuse);
 	UT_RUN(test_normal_start_identity_rechecked_after_real_root_read);
 	UT_RUN(test_normal_start_bootstrap_requires_strict_source_at_entry_and_recheck);
-	UT_RUN(test_normal_start_bootstrap_after_debt_change_releases_only_its_debt);
+	UT_RUN(test_normal_start_zero_modifier_refusal_preserves_read_debt);
 	UT_RUN(test_normal_start_closed_modes_block_regular_and_terminal_census);
 	UT_RUN(test_normal_start_publish_and_legacy_sync_cannot_bypass_mode);
 	UT_RUN(test_a142_clean_start_observation_is_not_rearmable);

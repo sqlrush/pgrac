@@ -88,6 +88,7 @@ scn_time_cmp(SCN a, SCN b)
 UT_DEFINE_GLOBALS();
 
 static void (*g_epoch_hook)(void) = NULL;
+static void (*g_modifier_recheck_hook)(void) = NULL;
 
 uint64
 GetSystemIdentifier(void)
@@ -131,6 +132,8 @@ bool
 cluster_semantic_activation_modifier_recheck(const ClusterSemanticAdmissionToken *token,
 											 bool writable_admission)
 {
+	if (g_modifier_recheck_hook != NULL)
+		g_modifier_recheck_hook();
 	return token != NULL && token->entered && writable_admission;
 }
 
@@ -843,6 +846,7 @@ reset_current_write_mock(void)
 {
 	reset_header_read_mock();
 	g_epoch_hook = NULL;
+	g_modifier_recheck_hook = NULL;
 	g_before_current_acquire_hook = NULL;
 	g_after_bind_emit_hook = NULL;
 	g_ctrc_overlap_hook = NULL;
