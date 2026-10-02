@@ -633,7 +633,7 @@ UT_TEST(test_source_order_refuses_missing_or_inconsistent_chain_atomically)
 
 	recovery_fixture(&f);
 	memcpy(saved, order, sizeof(order));
-	missing[0] = f.input[0];
+	missing[0] = f.input[2]; /* Missing RESET, never an omitted ADVANCE. */
 	missing[1] = f.input[1];
 	missing[2] = f.input[3];
 	missing[3] = f.input[4];
@@ -896,10 +896,137 @@ UT_TEST(test_recovery_through_before_first_structure_does_not_borrow_its_identit
 	UT_ASSERT(memcmp(out.pages, f.pages[2], sizeof(out.pages)) == 0);
 }
 
+UT_TEST(test_structural_history_advances_require_a_target_after_every_gap)
+{
+	for (int omitted = 1; omitted <= 3; omitted++) {
+		RecoveryFixture f;
+		ClusterSpaceRecoveryInput inputs[5];
+		ClusterSpaceRecoveryImage out, saved;
+		uint32 count = 0, order[5];
+		int last_gap = omitted & 2 ? 4 : 2;
+
+		recovery_fixture(&f);
+		for (uint32 i = 0; i < 5; i++) {
+			if (((omitted & 1) && i == 2) || ((omitted & 2) && i == 3))
+				continue;
+			inputs[count++] = f.input[i];
+		}
+		/* Source ordering is not target permission: retain every structure
+		 * and postpone qualification of missing ADVANCEs to DATA preflight. */
+		UT_ASSERT(
+			cluster_space_recovery_order(inputs, count, &f.changes[0].result.identity.key, order));
+		memset(&saved, 0xa5, sizeof(saved));
+		for (int id = 0; id < 6; id++)
+			for (int reservation = 0; reservation < 6; reservation++) {
+				out = saved;
+				memset(order, 0x77, sizeof(order));
+				UT_ASSERT_EQ(cluster_space_recovery_prepare(
+								 inputs, count, &f.changes[0].result.identity.key,
+								 f.pages[id][0].data, f.pages[reservation][1].data, order, &out),
+							 reservation >= last_gap);
+				if (reservation < last_gap) {
+					UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+					UT_ASSERT_EQ(order[0], UINT32_C(0x77777777));
+				} else {
+					UT_ASSERT_EQ(out.covered_by_successor_mask, 2);
+					UT_ASSERT(memcmp(out.pages, f.pages[5], sizeof(out.pages)) == 0);
+				}
+			}
+	}
+}
+
+UT_TEST(test_structural_history_gap_prefix_preserves_the_later_before_image)
+{
+	RecoveryFixture f;
+	ClusterSpaceRecoveryInput inputs[2];
+	ClusterSpaceStructureChange truncate;
+	ClusterSpaceRecoveryImage out, saved;
+	ClusterSpaceReservation target;
+	PGAlignedBlock page;
+	uint32 order[2];
+
+	recovery_fixture(&f);
+	truncate.identity = f.identities[2];
+	truncate.reservation = f.changes[2];
+	/* A's 0->9, B's omitted 9->18, then B's retained TRUNCATE. */
+	truncate.reservation.before.next_block = 18;
+	truncate.reservation.before_token = 14;
+	UT_ASSERT(cluster_space_structure_wal_encode(&truncate, f.wal[2], sizeof(f.wal[2])));
+	inputs[0] = f.input[0];
+	inputs[1] = f.input[2];
+	memset(&saved, 0xa5, sizeof(saved));
+	for (int variant = 0; variant < 5; variant++) {
+		uint64 token = 14;
+
+		target = truncate.reservation.before;
+		if (variant == 1) {
+			target.next_block = 9;
+			token = 80;
+		}
+		if (variant == 2)
+			target.next_block = 19; /* Cannot jump over TRUNCATE's predecessor. */
+		if (variant == 3)
+			token = 80; /* Known token, different bytes. */
+		if (variant == 4)
+			target.identity.incarnation[0]++;
+		UT_ASSERT(cluster_space_reservation_page_encode(&target, token, page.data, BLCKSZ));
+		PageXLogRecPtrSet(((PageHeader)page.data)->pd_lsn, UINT64_C(0x8899));
+		out = saved;
+		order[0] = order[1] = 77;
+		UT_ASSERT_EQ(
+			cluster_space_recovery_prepare_through(inputs, 2, 0, &f.changes[0].result.identity.key,
+												   f.pages[1][0].data, page.data, order, &out),
+			variant == 0);
+		if (variant != 0) {
+			UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+			UT_ASSERT_EQ(order[0], 77);
+			UT_ASSERT_EQ(order[1], 77);
+			continue;
+		}
+		UT_ASSERT_EQ(order[0], 1);
+		UT_ASSERT_EQ(order[1], 0);
+		UT_ASSERT_EQ(out.apply_mask, 0);
+		UT_ASSERT_EQ(out.covered_by_successor_mask, 2);
+		UT_ASSERT_EQ(out.source_index[1], UINT32_MAX);
+		UT_ASSERT(memcmp(out.pages[1].data, page.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_structural_history_later_live_target_is_not_rewound)
+{
+	RecoveryFixture f;
+	ClusterSpaceRecoveryInput inputs[3];
+	ClusterSpaceRecoveryImage out = { 0 };
+	ClusterSpaceReservation target;
+	PGAlignedBlock page;
+	uint32 order[3];
+
+	recovery_fixture(&f);
+	/* CREATE, omitted ADVANCE, TRUNCATE, ADVANCE; no DROP in this cut. */
+	inputs[0] = f.input[0];
+	inputs[1] = f.input[3];
+	inputs[2] = f.input[4];
+	target = f.changes[3].result;
+	target.next_block += 9;
+	UT_ASSERT(cluster_space_reservation_page_encode(&target, 6, page.data, BLCKSZ));
+	PageXLogRecPtrSet(((PageHeader)page.data)->pd_lsn, UINT64_C(0x9988));
+	for (uint32 through = 0; through < 3; through++) {
+		UT_ASSERT(cluster_space_recovery_prepare_through(
+			inputs, 3, through, &target.identity.key, f.pages[3][0].data, page.data, order, &out));
+		UT_ASSERT_EQ(out.apply_mask, 0);
+		UT_ASSERT(out.covered_by_successor_mask & 2);
+		UT_ASSERT_EQ(out.source_index[1], UINT32_MAX);
+		UT_ASSERT(memcmp(out.pages[1].data, page.data, BLCKSZ) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(26);
+	UT_RUN(test_structural_history_advances_require_a_target_after_every_gap);
+	UT_RUN(test_structural_history_gap_prefix_preserves_the_later_before_image);
+	UT_RUN(test_structural_history_later_live_target_is_not_rewound);
 	UT_RUN(test_recovery_through_advances_preserves_survivor_bytes_and_gap_proof);
 	UT_RUN(test_recovery_through_before_first_structure_does_not_borrow_its_identity_source);
 	UT_RUN(test_recovery_through_never_installs_a_later_structure_or_rewinds_a_component);
