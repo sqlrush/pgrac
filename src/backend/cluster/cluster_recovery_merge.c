@@ -1052,6 +1052,21 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 	return CLUSTER_MERGE_ENGAGE;
 }
 
+/*
+ * A cold crash that needs another thread merged: the same conditions under
+ * which cluster_recovery_merge_project_readonly goes on to its gates.
+ */
+static bool
+recovery_merge_cold_merge_needed(uint16 own_thread)
+{
+	ClusterRecoveryPlan plan;
+
+	return cluster_merged_recovery && cluster_wal_threads_dir != NULL
+		   && cluster_wal_threads_dir[0] != '\0' && own_thread != XLP_THREAD_ID_LEGACY
+		   && cluster_recovery_plan_snapshot(&plan) && !plan.failed
+		   && plan.n_crashed_candidate > 0 && plan.n_alive == 0;
+}
+
 static bool
 recovery_fence_plan_valid(const ClusterRecoveryFencePlan *plan)
 {
@@ -1129,10 +1144,15 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 	plan->owner_pid = MyProcPid;
 	plan->own_thread = own_thread;
 	plan->acquire_timeout_ms_snapshot = cluster_external_fence_acquire_timeout_ms;
-	engage = cluster_recovery_merge_project_readonly(own_thread, own_redo,
-													 plan->replay_thread_bitmap, plan->start_lsn);
 	/* PGRAC: refuse the unshared multi-generation merge before any fence
-	 * admission.  Author: SqlRush <sqlrush@gmail.com> */
+	 * admission, and before the merge blockers, which only the shared
+	 * profile's typed cold plan could satisfy.  Author: SqlRush
+	 * <sqlrush@gmail.com> */
+	if (!cluster_shared_config && recovery_merge_cold_merge_needed(own_thread))
+		engage = CLUSTER_MERGE_REFUSE_UNSHARED;
+	else
+		engage = cluster_recovery_merge_project_readonly(
+			own_thread, own_redo, plan->replay_thread_bitmap, plan->start_lsn);
 	engage = cluster_recovery_merge_profile_gate(engage, cluster_shared_config);
 	if (engage != CLUSTER_MERGE_ENGAGE) {
 		MemSet(plan, 0, sizeof(*plan));
