@@ -42,6 +42,7 @@
 typedef struct SpaceRecoveryTarget {
 	ClusterSpaceIdentityKey key;
 	bool has_create;
+	uint32 operation_count;
 	PGAlignedBlock before[2];
 	ClusterSpaceRecoveryImage final;
 } SpaceRecoveryTarget;
@@ -215,7 +216,7 @@ space_disk_matches(SMgrRelation rel, BlockNumber block, const char *expected)
 }
 
 static bool
-space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply)
+space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, uint32 through)
 {
 	static const PGAlignedBlock zero;
 	SpaceRecoveryTarget *target = &batch->targets[index];
@@ -269,16 +270,23 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply)
 				goto done;
 			memcpy(target->before[i].data, BufferGetPage(batch->buffers[i]), BLCKSZ);
 		}
-		if (!space_sources_fresh(batch)
-			|| rf_side_online_plan_prepare_space_v1(
-				   batch->side, &target->key, target->before[0].data, target->before[1].data,
-				   batch->order, batch->operation_count, &count, &prepared)
-				   != RF_PAGE_PROOF_DETAIL_OK
-			|| (!target->has_create && prepared.source_index[0] != UINT32_MAX)
-			|| (target->has_create && prepared.source_index[0] == UINT32_MAX))
+		if (!space_sources_fresh(batch))
 			goto done;
+		if ((through == UINT32_MAX
+				 ? rf_side_online_plan_prepare_space_v1(
+					   batch->side, &target->key, target->before[0].data, target->before[1].data,
+					   batch->order, batch->operation_count, &count, &prepared)
+				 : rf_side_online_plan_prepare_space_through_v1(
+					   batch->side, &target->key, target->before[0].data, target->before[1].data,
+					   through, batch->order, batch->operation_count, &count, &prepared))
+				!= RF_PAGE_PROOF_DETAIL_OK
+			|| (!target->has_create && prepared.source_index[0] != UINT32_MAX)
+			|| (target->has_create && prepared.source_index[0] == UINT32_MAX
+				&& !(prepared.covered_by_successor_mask & 1)))
+			goto done;
+		target->operation_count = count;
 		if (prepared.source_index[1] == UINT32_MAX) {
-			if (prepared.covered_by_successor_mask != 2 || prepared.apply_mask != 0)
+			if (!(prepared.covered_by_successor_mask & 2) || (prepared.apply_mask & 2))
 				goto done;
 		}
 		for (int i = 0; i < 2; i++) {
@@ -292,9 +300,10 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply)
 		}
 		/* A successor's bytes cannot borrow a failed origin's WAL owner.
 		 * Require its canonical physical image before qualifying coverage. */
-		if (prepared.covered_by_successor_mask != 0
-			&& (blocks != 2 || !space_disk_matches(rel, 1, target->before[1].data)))
-			goto done;
+		for (int i = 0; i < 2; i++)
+			if ((prepared.covered_by_successor_mask & (1 << i))
+				&& (blocks <= i || !space_disk_matches(rel, i, target->before[i].data)))
+				goto done;
 		/* ADVANCE cannot supply missing identity-page bytes or their WAL. */
 		if (!target->has_create && !space_disk_matches(rel, 0, prepared.pages[0].data))
 			goto done;
@@ -309,10 +318,14 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply)
 		}
 		if (prepared.covered_by_successor_mask != 0) {
 			smgrimmedsync(rel, SPACE_FORKNUM);
-			if (!space_sources_fresh(batch) || !space_disk_matches(rel, 0, target->before[0].data)
-				|| !space_disk_matches(rel, 1, target->before[1].data))
+			if (!space_sources_fresh(batch))
 				goto done;
-			if (prepared.source_index[1] == UINT32_MAX) {
+			for (int i = 0; i < 2; i++)
+				if (((prepared.covered_by_successor_mask & (1 << i))
+					 || prepared.source_index[i] == UINT32_MAX)
+					&& !space_disk_matches(rel, i, target->before[i].data))
+					goto done;
+			if (prepared.source_index[0] == UINT32_MAX && prepared.source_index[1] == UINT32_MAX) {
 				ok = true;
 				goto done;
 			}
@@ -521,7 +534,7 @@ space_recovery_preflight(const ClusterThreadRecoveryFabricPlanV1 *plan,
 					&& RelFileLocatorEquals(op.space_key.locator, target->key.locator))
 					target->has_create = true;
 			}
-			if (!space_target_run(batch, i, false))
+			if (!space_target_run(batch, i, false, UINT32_MAX))
 				goto done;
 		}
 		ok = batch->preflight_complete = space_sources_fresh(batch);
@@ -559,13 +572,24 @@ cluster_space_recovery_cold_preflight_v1(const RfSideOnlinePlanV1 *side,
 }
 
 bool
+cluster_space_recovery_apply_through_v1(ClusterSpaceRecoveryBatchV1 *batch, uint32 target,
+										uint32 through)
+{
+	if (batch == NULL || !batch->preflight_complete || batch->installed
+		|| target >= batch->target_count || through >= batch->targets[target].operation_count
+		|| !space_sources_fresh(batch))
+		return false;
+	return space_target_run(batch, target, true, through);
+}
+
+bool
 cluster_space_recovery_apply_v1(ClusterSpaceRecoveryBatchV1 *batch)
 {
 	if (batch == NULL || !batch->preflight_complete || batch->installed
 		|| !space_sources_fresh(batch))
 		return false;
 	for (uint32 i = 0; i < batch->target_count; i++)
-		if (!space_target_run(batch, i, true))
+		if (!space_target_run(batch, i, true, UINT32_MAX))
 			return false;
 	batch->installed = space_sources_fresh(batch);
 	return batch->installed;

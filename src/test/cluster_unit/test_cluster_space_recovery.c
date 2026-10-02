@@ -84,6 +84,7 @@ static bool creating;
 static BlockNumber existing_blocks;
 static unsigned creates, extensions, x_locks;
 static int fail_write_block;
+static int corrupt_after_sync_block;
 static bool corrupt_checksum, checksums, ignore_checksum_failure;
 static int throw_at;
 int cluster_node_id;
@@ -440,6 +441,8 @@ smgrread(SMgrRelation r, ForkNumber f, BlockNumber b, void *out)
 		((char *)out)[200] ^= 1;
 	if (corrupt_checksum && writes && b == 1)
 		((PageHeader)out)->pd_checksum ^= 1;
+	if (syncs != 0 && (int)b == corrupt_after_sync_block)
+		((PageHeader)out)->pd_checksum ^= 1;
 }
 void
 smgrimmedsync(SMgrRelation r, ForkNumber f)
@@ -680,6 +683,7 @@ reset(void)
 	existing_blocks = 2;
 	creates = extensions = x_locks = 0;
 	fail_write_block = -1;
+	corrupt_after_sync_block = -1;
 	exists = permitted = true;
 	throw_at = 0;
 	memset(changes, 0, sizeof(changes));
@@ -1510,10 +1514,140 @@ UT_TEST(test_create_never_replaces_another_incarnation_or_uses_stale_fence)
 	}
 }
 
+UT_TEST(test_native_create_step_does_not_advance_or_complete_the_batch)
+{
+	for (int cold = 0; cold < 2; cold++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		ClusterSpaceReservation reservation;
+		uint64 token;
+		int origin;
+
+		create_input(0);
+		UT_ASSERT(create_preflight(cold, &batch));
+		UT_ASSERT(cluster_space_recovery_apply_through_v1(batch, 0, 0));
+		UT_ASSERT(cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1,
+														&key, &reservation, &token));
+		UT_ASSERT_EQ(reservation.next_block, 0);
+		UT_ASSERT_EQ(token, 100);
+		UT_ASSERT_EQ(writes, 2);
+		UT_ASSERT_EQ(syncs, 1);
+		UT_ASSERT(PageGetLSNOrigin(pages[1].data, &origin));
+		UT_ASSERT_EQ(origin, duties[0].origin_thread_id - 1);
+		UT_ASSERT_EQ(PageGetLSN(pages[1].data), operations[0].identity.record.end_rec_ptr);
+		UT_ASSERT(!cluster_space_recovery_applied_operation_v1(batch, &operations[1]));
+		UT_ASSERT(cluster_space_recovery_apply_through_v1(batch, 0, 1));
+		UT_ASSERT(cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1,
+														&key, &reservation, &token));
+		UT_ASSERT_EQ(reservation.next_block, 4);
+		UT_ASSERT_EQ(token, 80);
+		UT_ASSERT(PageGetLSNOrigin(pages[1].data, &origin));
+		UT_ASSERT_EQ(origin, duties[1].origin_thread_id - 1);
+		UT_ASSERT(!cluster_space_recovery_applied_operation_v1(batch, &operations[1]));
+		UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+		UT_ASSERT(cluster_space_recovery_applied_operation_v1(batch, &operations[1]));
+		cluster_space_recovery_destroy_v1(&batch);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_native_prefix_preserves_later_reservation_but_installs_missing_identity)
+{
+	ClusterSpaceRecoveryBatchV1 *batch = NULL;
+	PGAlignedBlock successor;
+	int origin;
+
+	create_input(6);
+	memset(pages[0].data, 0, BLCKSZ);
+	PageSetLSNPreserveOrigin(pages[1].data, operations[1].identity.record.end_rec_ptr);
+	UT_ASSERT(PageSetLSNOrigin(pages[1].data, duties[1].origin_thread_id - 1));
+	successor = pages[1];
+	UT_ASSERT_EQ(pwrite(fileno(file), pages[0].data, BLCKSZ, 0), BLCKSZ);
+	UT_ASSERT_EQ(pwrite(fileno(file), PageSetChecksumCopy(pages[1].data, 1), BLCKSZ, BLCKSZ),
+				 BLCKSZ);
+	UT_ASSERT(create_preflight(true, &batch));
+	UT_ASSERT(cluster_space_recovery_apply_through_v1(batch, 0, 0));
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(syncs, 2);
+	UT_ASSERT(memcmp(successor.data, pages[1].data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 100);
+	UT_ASSERT(PageGetLSNOrigin(pages[0].data, &origin));
+	UT_ASSERT_EQ(origin, duties[0].origin_thread_id - 1);
+	UT_ASSERT(!cluster_space_recovery_applied_operation_v1(batch, &operations[1]));
+	cluster_space_recovery_destroy_v1(&batch);
+	UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+}
+
+UT_TEST(test_native_prefix_invalid_target_or_position_has_no_io)
+{
+	ClusterSpaceRecoveryBatchV1 *batch = NULL;
+	unsigned previous_reads;
+	create_input(0);
+	UT_ASSERT(create_preflight(true, &batch));
+	previous_reads = reads;
+	UT_ASSERT(!cluster_space_recovery_apply_through_v1(batch, 1, 0));
+	UT_ASSERT(!cluster_space_recovery_apply_through_v1(batch, 0, UINT32_MAX));
+	UT_ASSERT(!cluster_space_recovery_apply_through_v1(batch, 0, 2));
+	UT_ASSERT_EQ(reads, previous_reads);
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT_EQ(syncs, 0);
+	UT_ASSERT_EQ(creates, 0);
+	UT_ASSERT_EQ(extensions, 0);
+	cluster_space_recovery_destroy_v1(&batch);
+}
+
+UT_TEST(test_native_prefix_partial_write_retries_without_installing_the_suffix)
+{
+	ClusterSpaceRecoveryBatchV1 *batch = NULL;
+	volatile bool caught = false;
+	create_input(0);
+	UT_ASSERT(create_preflight(true, &batch));
+	fail_write_block = 1;
+	PG_TRY();
+	{
+		(void)cluster_space_recovery_apply_through_v1(batch, 0, 0);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 100);
+	UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 100);
+	UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	fail_write_block = -1;
+	UT_ASSERT(cluster_space_recovery_apply_through_v1(batch, 0, 0));
+	UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 100);
+	UT_ASSERT(!cluster_space_recovery_applied_operation_v1(batch, &operations[1]));
+	UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+	UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 80);
+	cluster_space_recovery_destroy_v1(&batch);
+}
+
+UT_TEST(test_successor_sync_still_rechecks_unchanged_identity)
+{
+	ClusterSpaceRecoveryBatchV1 *batch = NULL;
+	reset();
+	survivor_advance(15, 9, true);
+	UT_ASSERT(create_preflight(true, &batch));
+	corrupt_after_sync_block = 0;
+	UT_ASSERT(!cluster_space_recovery_apply_through_v1(batch, 0, 0));
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT_EQ(syncs, 1);
+	UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	cluster_space_recovery_destroy_v1(&batch);
+}
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(27);
+	UT_RUN(test_successor_sync_still_rechecks_unchanged_identity);
+	UT_RUN(test_native_create_step_does_not_advance_or_complete_the_batch);
+	UT_RUN(test_native_prefix_preserves_later_reservation_but_installs_missing_identity);
+	UT_RUN(test_native_prefix_invalid_target_or_position_has_no_io);
+	UT_RUN(test_native_prefix_partial_write_retries_without_installing_the_suffix);
 	UT_RUN(test_create_missing_partial_and_complete_space_then_cross_source_advance);
 	UT_RUN(test_create_flush_failure_keeps_restartable_components);
 	UT_RUN(test_create_never_replaces_another_incarnation_or_uses_stale_fence);

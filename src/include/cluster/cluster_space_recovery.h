@@ -27,6 +27,11 @@ extern bool cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabri
 												const ClusterThreadRecoveryAuthorityV1 *sources,
 												uint32 count, ClusterSpaceRecoveryBatchV1 **out);
 extern bool cluster_space_recovery_apply_v1(ClusterSpaceRecoveryBatchV1 *batch);
+/* Install one target through a position in its complete canonical input
+ * order. Uses the same preflighted batch and original source authority;
+ * success does not certify completion of the whole batch. */
+extern bool cluster_space_recovery_apply_through_v1(ClusterSpaceRecoveryBatchV1 *batch,
+													uint32 target, uint32 through);
 /* Startup only, after the original cold fence plan is committed; requires
  * its complete foreign-origin set (not a founder or historical authority).
  * Borrows that plan and the sealed SIDE inputs until batch destruction;
