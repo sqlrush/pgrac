@@ -508,6 +508,14 @@ UT_TEST(test_space_identity_changes_are_typed)
 	space_record(&record, XLOG_SMGR_SPACE_IDENTITY, &change);
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 98, UUID, true, false, &out),
 				 CLUSTER_COLD_SPACE_INVALID);
+	{
+		uint8 other[16];
+
+		memcpy(other, UUID, 16);
+		other[15] ^= 1;
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, other, true, false, &out),
+					 CLUSTER_COLD_SPACE_INVALID);
+	}
 	record.storage.decoded.main_data_len--;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_SPACE_INVALID);
