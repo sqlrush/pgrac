@@ -1077,10 +1077,24 @@ UT_TEST(test_earliest_replayable_anchor_precedes_torn_deltas)
 	destroy_plan(&plan);
 }
 
+/* A side effect without a cold owner is refused after the native redo
+ * start; in retained history it is already durable. */
+UT_TEST(test_unowned_side_records_refused_after_native_redo)
+{
+	ClusterColdParticipantV1 parts[1] = { part(2, 12, 0x100, 0x1000, 0x2000) };
+	ClusterColdPlanV1 *plan = make_plan(parts, 1);
+
+	UT_ASSERT_EQ(feed_flagged(plan, 0, 0x100, 0x1000, CLUSTER_COLD_RECORD_SIDE_UNOWNED),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_flagged(plan, 0, 0x1000, 0x1100, CLUSTER_COLD_RECORD_SIDE_UNOWNED),
+				 CLUSTER_COLD_SIDE_OWNER_MISSING);
+	destroy_plan(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(30);
 	UT_RUN(test_lower_lag_old_fpi_cannot_overwrite_newer_durable);
 	UT_RUN(test_data_behind_history_is_refused);
 	UT_RUN(test_a_b_c_exact_order_ignores_scn_and_lsn);
@@ -1110,6 +1124,7 @@ main(void)
 	UT_RUN(test_torn_header_restores_last_replayable_anchor);
 	UT_RUN(test_record_gap_refused);
 	UT_RUN(test_earliest_replayable_anchor_precedes_torn_deltas);
+	UT_RUN(test_unowned_side_records_refused_after_native_redo);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

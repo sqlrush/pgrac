@@ -1131,6 +1131,9 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 	plan->acquire_timeout_ms_snapshot = cluster_external_fence_acquire_timeout_ms;
 	engage = cluster_recovery_merge_project_readonly(own_thread, own_redo,
 													 plan->replay_thread_bitmap, plan->start_lsn);
+	/* PGRAC: refuse the unshared multi-generation merge before any fence
+	 * admission.  Author: SqlRush <sqlrush@gmail.com> */
+	engage = cluster_recovery_merge_profile_gate(engage, cluster_shared_config);
 	if (engage != CLUSTER_MERGE_ENGAGE) {
 		MemSet(plan, 0, sizeof(*plan));
 		pfree(plan);
@@ -1426,21 +1429,6 @@ cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan)
 	if (!cluster_recovery_merge_fence_plan_revalidate_nowait(plan))
 		return false;
 	plan->committed = true;
-	return true;
-}
-
-bool
-cluster_recovery_merge_fence_plan_copy_replay(const ClusterRecoveryFencePlan *plan,
-											  uint64 out_bitmap[2], XLogRecPtr *out_start)
-{
-	uint16 tid;
-
-	if (!recovery_fence_plan_valid(plan) || !plan->committed || out_bitmap == NULL
-		|| out_start == NULL)
-		return false;
-	memcpy(out_bitmap, plan->replay_thread_bitmap, sizeof(plan->replay_thread_bitmap));
-	for (tid = 0; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++)
-		out_start[tid] = plan->start_lsn[tid];
 	return true;
 }
 

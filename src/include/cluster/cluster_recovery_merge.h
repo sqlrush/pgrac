@@ -483,7 +483,22 @@ typedef enum ClusterMergeEngage {
 	CLUSTER_MERGE_NO_NO_CANDIDATES,	 /* nothing crashed to merge in         */
 	CLUSTER_MERGE_NO_NOT_COLD,		 /* a foreign node is ALIVE (warm = 4.6) */
 	CLUSTER_MERGE_ENGAGE,			 /* gate passed below; do merged replay */
+	CLUSTER_MERGE_REFUSE_UNSHARED,	 /* multi-generation cold crash, unshared */
 } ClusterMergeEngage;
+
+/*
+ * PRE2 recovers a cold crash that needs several WAL threads merged only
+ * through the shared profile's typed plan.  The unshared profile refuses it
+ * before any fence, claim or replay action; the SCN-ordered legacy merge can
+ * restore one thread's older full-page image over a newer page another
+ * thread already made durable.  Single-stream recovery is unaffected.
+ */
+static inline ClusterMergeEngage
+cluster_recovery_merge_profile_gate(ClusterMergeEngage engage, bool shared_config)
+{
+	return engage == CLUSTER_MERGE_ENGAGE && !shared_config ? CLUSTER_MERGE_REFUSE_UNSHARED
+															: engage;
+}
 
 /* RF-ROOT P4 cold caller contract.  The sole readonly producer freezes the
  * canonical replay/proof-origin sets and owns every formation/NeedSet/
@@ -495,9 +510,6 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 										  ClusterRecoveryFencePlan **out_plan);
 extern bool cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFencePlan *plan);
 extern bool cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan);
-extern bool cluster_recovery_merge_fence_plan_copy_replay(const ClusterRecoveryFencePlan *plan,
-														  uint64 out_bitmap[2],
-														  XLogRecPtr *out_start);
 extern bool cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan);
 extern uint16 cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *plan);
 struct ClusterControlRootSnapshot;
