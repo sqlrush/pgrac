@@ -108,6 +108,7 @@ AuxProcType MyAuxProcType = NotAnAuxProcess;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 static bool test_checkpoint_mode;
+static bool test_inputs_startup_cf;
 static bool test_random_leading_zero;
 static uint64 test_self_incarnation;
 static uint64 test_epoch;
@@ -526,7 +527,7 @@ cluster_cf_held(LOCKMODE mode)
 	(void)mode;
 	if (MyBackendType == B_LMON || MyBackendType == B_LMS)
 		return test_actual_cf == mode;
-	if (MyBackendType == B_BG_WORKER || MyBackendType == B_STARTUP)
+	if (MyBackendType == B_BG_WORKER || (MyBackendType == B_STARTUP && test_inputs_startup_cf))
 		return test_actual_cf == mode;
 	if (MyBackendType == B_BACKEND && test_reserve_mode)
 		return test_actual_cf == mode || (test_checkpoint_mode && test_checkpoint_outer_cf);
@@ -19680,7 +19681,6 @@ inputs_fixture(uint8 bytes[66048], ClusterRecoveryAnchorV2 anchors[2])
 	inputs_peer_begins = inputs_peer_releases = 0;
 	memset(&inputs_peer_flush, 0, sizeof(inputs_peer_flush));
 	cluster_shared_config = true;
-	cluster_node_id = 0;
 	MyBackendType = B_BG_WORKER;
 }
 
@@ -19810,7 +19810,11 @@ UT_TEST(test_wal_inputs_physically_visit_exact_nonserving_closed_sources)
 
 UT_TEST(test_wal_inputs_cold_physically_visit_exact_nonserving_closed_sources)
 {
+	int saved_node = cluster_node_id;
+	test_inputs_startup_cf = true;
 	inputs_check_physically_visit_exact_nonserving_closed_sources(true);
+	test_inputs_startup_cf = false;
+	cluster_node_id = saved_node;
 }
 
 UT_TEST(test_wal_inputs_physical_failure_invalidates_provisional_scope)
@@ -20378,7 +20382,11 @@ UT_TEST(test_wal_inputs_all_origins_exact_native_anchor)
 
 UT_TEST(test_wal_inputs_cold_all_origins_exact_native_anchor)
 {
+	int saved_node = cluster_node_id;
+	test_inputs_startup_cf = true;
 	inputs_check_all_origins_exact_native_anchor(true);
+	test_inputs_startup_cf = false;
+	cluster_node_id = saved_node;
 }
 
 UT_TEST(test_wal_inputs_claim_io_releases_cf_and_keeps_all_native_pins)
@@ -20686,7 +20694,11 @@ UT_TEST(test_wal_inputs_retained_generations_remain_distinct)
 
 UT_TEST(test_wal_inputs_cold_retained_generations_remain_distinct)
 {
+	int saved_node = cluster_node_id;
+	test_inputs_startup_cf = true;
 	inputs_check_retained_generations_remain_distinct(true);
+	test_inputs_startup_cf = false;
+	cluster_node_id = saved_node;
 }
 
 UT_TEST(test_wal_inputs_roster_race_busy_and_stale_scope)
@@ -20821,7 +20833,11 @@ UT_TEST(test_wal_inputs_terminal_and_pending_are_not_checkpoint_sources)
 
 UT_TEST(test_wal_inputs_cold_terminal_and_pending_are_not_checkpoint_sources)
 {
+	int saved_node = cluster_node_id;
+	test_inputs_startup_cf = true;
 	inputs_check_terminal_and_pending_are_not_checkpoint_sources(true);
+	test_inputs_startup_cf = false;
+	cluster_node_id = saved_node;
 }
 
 UT_TEST(test_wal_inputs_capacity_never_truncates_history)
@@ -20925,6 +20941,7 @@ UT_TEST(test_wal_inputs_rejects_dispatch_and_retires_failed_native_acquire)
 
 UT_TEST(test_wal_inputs_cold_role_cannot_borrow_online_writer_authority)
 {
+	int saved_node = cluster_node_id;
 	uint8 bytes[66048];
 	ClusterRecoveryAnchorV2 anchors[2];
 	ClusterWalInputsV1 *inputs = NULL;
@@ -20939,6 +20956,8 @@ UT_TEST(test_wal_inputs_cold_role_cannot_borrow_online_writer_authority)
 		= { B_LMON, B_LMS, B_BACKEND, B_BG_WORKER, B_BG_WRITER, B_CHECKPOINTER, B_INVALID };
 
 	inputs_fixture(bytes, anchors);
+	cluster_node_id = 0;
+	test_inputs_startup_cf = true;
 	calls = test_cf_lock_calls;
 	inputs_native_recovery = true;
 	for (unsigned i = 0; i < lengthof(refused); i++) {
@@ -20959,6 +20978,8 @@ UT_TEST(test_wal_inputs_cold_role_cannot_borrow_online_writer_authority)
 	if (inputs == NULL) {
 		inputs_native_recovery = false;
 		MyBackendType = B_INVALID;
+		test_inputs_startup_cf = false;
+		cluster_node_id = saved_node;
 		return;
 	}
 	for (uint32 i = 0; i < 2; i++) {
@@ -20999,10 +21020,14 @@ UT_TEST(test_wal_inputs_cold_role_cannot_borrow_online_writer_authority)
 	UT_ASSERT(inputs == NULL && !inputs_pin_held && test_actual_cf == NoLock);
 	inputs_native_recovery = false;
 	MyBackendType = B_INVALID;
+	test_inputs_startup_cf = false;
+	cluster_node_id = saved_node;
 }
 
 UT_TEST(test_wal_inputs_cold_selection_and_pin_lifetime_are_exact)
 {
+	int saved_node = cluster_node_id;
+	test_inputs_startup_cf = true;
 	for (unsigned fault = 0; fault < 5; fault++) {
 		uint8 bytes[66048];
 		ClusterRecoveryAnchorV2 anchors[2];
@@ -21056,6 +21081,8 @@ UT_TEST(test_wal_inputs_cold_selection_and_pin_lifetime_are_exact)
 	}
 	inputs_native_recovery = false;
 	MyBackendType = B_INVALID;
+	test_inputs_startup_cf = false;
+	cluster_node_id = saved_node;
 }
 
 int
