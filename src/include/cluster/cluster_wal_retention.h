@@ -355,6 +355,15 @@ cluster_wal_retention_pin_bind_set(ClusterWalRetentionPin *pin,
 extern ClusterWalPinResult
 cluster_wal_retention_pin_preflight_revalidate_wait_v1(ClusterWalRetentionPin *pin);
 extern ClusterWalPinResult cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin);
+/* Borrow the current ResourceOwner's complete bound COLD_FORMED set. This
+ * neither acquires nor transfers ownership and cannot qualify DATA by itself.
+ * The consumer still checks its startup phase, exact ROOT/native source and
+ * namespace. A missing thread (including the founder) is never invented.
+ * On refusal all outputs stay unchanged; *out_pin must initially be NULL. */
+extern ClusterWalPinResult
+cluster_wal_retention_pin_borrow_cold_v1(ClusterWalRetentionPin **out_pin,
+										 ClusterRecoverySerialGuard **guards, uint16 capacity,
+										 uint16 *out_count);
 extern ClusterWalPinResult
 cluster_wal_retention_pin_seal_for_root_publish(ClusterWalRetentionPin *pin);
 extern ClusterWalPinResult cluster_wal_retention_pin_adopt_root_readback_v1(

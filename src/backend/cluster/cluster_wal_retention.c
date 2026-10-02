@@ -906,6 +906,43 @@ cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin)
 }
 
 ClusterWalPinResult
+cluster_wal_retention_pin_borrow_cold_v1(ClusterWalRetentionPin **out_pin,
+										 ClusterRecoverySerialGuard **guards, uint16 capacity,
+										 uint16 *out_count)
+{
+	ClusterWalRetentionPin *pin = active_pin;
+	ClusterWalPinResult result;
+
+	if (!cluster_shared_config || out_pin == NULL || *out_pin != NULL || guards == NULL
+		|| out_count == NULL || !pin_valid(pin)
+		|| (pin->state != CLUSTER_WAL_PIN_STATE_BOUND_ONE
+			&& pin->state != CLUSTER_WAL_PIN_STATE_BOUND_SET))
+		return CLUSTER_WAL_PIN_INVALID;
+	if (capacity < pin->nthreads)
+		return CLUSTER_WAL_PIN_CAPACITY;
+	if (pin->state == CLUSTER_WAL_PIN_STATE_BOUND_SET
+		&& (pin->serial_set == NULL || pin->serial_set->count != pin->nthreads))
+		return CLUSTER_WAL_PIN_STALE;
+	for (uint16 i = 0; i < pin->nthreads; i++) {
+		const ClusterWalPinThread *thread = &pin->threads[i];
+
+		if (thread->nintervals != 1 || thread->pending.generation != 0 || thread->serial == NULL
+			|| thread->serial->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED)
+			return CLUSTER_WAL_PIN_INVALID;
+	}
+	result = cluster_wal_retention_pin_revalidate(pin);
+	if (result != CLUSTER_WAL_PIN_OK)
+		return result;
+	/* Publish nothing until the entire original set has passed. These are
+	 * borrowed objects, not a new pin, IR holder or startup authority. */
+	for (uint16 i = 0; i < pin->nthreads; i++)
+		guards[i] = pin->threads[i].serial;
+	*out_count = pin->nthreads;
+	*out_pin = pin;
+	return CLUSTER_WAL_PIN_OK;
+}
+
+ClusterWalPinResult
 cluster_wal_retention_pin_seal_for_root_publish(ClusterWalRetentionPin *pin)
 {
 	ClusterWalPinResult result;
