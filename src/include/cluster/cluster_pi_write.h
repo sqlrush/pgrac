@@ -120,6 +120,31 @@ cluster_bufmgr_discard_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 
 typedef struct ClusterPiPhysicalAckV1 ClusterPiPhysicalAckV1;
 
+/* Local departed-writer responsibility. Binding identity and revision fence
+ * an exact snapshot across DATA/physical I/O; neither counter orders pages.
+ * Empty is a qualified directory observation, not proof of a retired boot. */
+typedef struct ClusterPcmLocalPiSnapshotV1 {
+	BufferTag resource;
+	uint64 binding_generation, revision;
+	ClusterPageWalBindingV1 first, last;
+} ClusterPcmLocalPiSnapshotV1;
+
+/* Original handoff owner only, before publishing its source completion.
+ * This can add responsibility, never grant or retire it. Failed retain
+ * leaves the previous responsibility intact and the handoff must retry. */
+extern bool cluster_pcm_local_pi_record_v1(BufferTag tag, const ClusterPageWalBindingV1 *binding);
+extern bool cluster_pcm_local_pi_snapshot_v1(BufferTag tag, ClusterPcmLocalPiSnapshotV1 *out);
+extern bool cluster_page_data_covers_local_pi_v1(const ClusterPageDataReceiptV1 *receipt,
+												 const RfPageOnlinePlanV1 *plan,
+												 const ClusterWalSourceRef *sources,
+												 uint32 source_count,
+												 const ClusterPcmLocalPiSnapshotV1 *local);
+extern bool cluster_pcm_local_pi_retire_v1(const ClusterPcmLocalPiSnapshotV1 *local,
+										   const ClusterPageDataReceiptV1 *receipt,
+										   const RfPageOnlinePlanV1 *plan,
+										   const ClusterWalSourceRef *sources, uint32 source_count,
+										   const ClusterPiPhysicalAckV1 *ack);
+
 /* Actual local physical completion, qualified for the original writer/boot.
  * It covers this instance, including older boots only when the original
  * retirement owner qualifies them in the supplied complete input scope.

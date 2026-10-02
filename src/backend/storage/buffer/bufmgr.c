@@ -11331,6 +11331,42 @@ cluster_pi_physical_unfenced_locked(BufferDesc *buf, uint32 state)
 		   && cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0;
 }
 
+bool
+cluster_page_data_covers_local_pi_v1(const ClusterPageDataReceiptV1 *receipt,
+									 const RfPageOnlinePlanV1 *plan,
+									 const ClusterWalSourceRef *sources, uint32 source_count,
+									 const ClusterPcmLocalPiSnapshotV1 *local)
+{
+	static const ClusterPageWalBindingV1 empty = { 0 };
+	ClusterPageDataTargetV1 target;
+	ClusterPcmPiWriteCutV1 x_cut;
+	ClusterPcmPiStorageCutV1 storage_cut;
+	BufferTag tag;
+	bool first_empty, last_empty;
+
+	if (local == NULL || !cluster_page_data_receipt_read_v1(receipt, &target)
+		|| (!cluster_page_data_pi_proof_v1(receipt, plan, sources, source_count, &x_cut)
+			&& !cluster_page_data_pi_storage_proof_v1(receipt, plan, sources, source_count,
+													  &storage_cut)))
+		return false;
+	InitBufferTag(&tag, &target.identity.locator, target.identity.forknum, target.identity.blockno);
+	if (!BufferTagsEqual(&tag, &local->resource) || local->binding_generation == UINT64_MAX
+		|| local->revision == UINT64_MAX)
+		return false;
+	first_empty = memcmp(&local->first, &empty, sizeof(empty)) == 0;
+	last_empty = memcmp(&local->last, &empty, sizeof(empty)) == 0;
+	if (first_empty || last_empty)
+		return first_empty && last_empty;
+	/* These references survive BufferDesc eviction. Both ends must belong
+	 * to the same sealed ancestry as actual DATA, not merely share a tag.
+	 * A later handoff is fenced again under the original entry lock. */
+	return local->binding_generation != 0 && local->revision != 0
+		   && cluster_page_wal_binding_shape_v1(&local->first)
+		   && cluster_page_wal_binding_shape_v1(&local->last)
+		   && cluster_page_data_covers_pi(receipt, plan, sources, source_count, &local->first)
+		   && cluster_page_data_covers_pi(receipt, plan, sources, source_count, &local->last);
+}
+
 static bool
 cluster_page_data_covers_missing_pi(const ClusterPageDataReceiptV1 *receipt,
 									const RfPageOnlinePlanV1 *plan,
@@ -11449,6 +11485,8 @@ cluster_bufmgr_ack_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 	ClusterWalWriterToken writer, after;
 	ClusterPcmPiWriteCutV1 x_cut;
 	ClusterPcmPiStorageCutV1 storage_cut;
+	ClusterPcmLocalPiSnapshotV1 local;
+	BufferTag tag;
 	ClusterPiPhysicalAckV1 *ack;
 	ClusterPiPhysicalResultV1 result;
 	uint32 expected;
@@ -11482,6 +11520,11 @@ cluster_bufmgr_ack_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 	}
 	if (!found)
 		return false;
+	InitBufferTag(&tag, &receipt->target.identity.locator, receipt->target.identity.forknum,
+				  receipt->target.identity.blockno);
+	if (!cluster_pcm_local_pi_snapshot_v1(tag, &local)
+		|| !cluster_page_data_covers_local_pi_v1(receipt, plan, sources, source_count, &local))
+		return false;
 	result = cluster_bufmgr_discard_pi_at_data_v1(receipt, plan, sources, source_count);
 	if ((result != CLUSTER_PI_PHYSICAL_ABSENT && result != CLUSTER_PI_PHYSICAL_REPLACED
 		 && result != CLUSTER_PI_PHYSICAL_DISCARDED)
@@ -11494,6 +11537,10 @@ cluster_bufmgr_ack_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 	ack->owner = CurrentResourceOwner;
 	ack->pid = getpid();
 	ack->node = cluster_node_id;
+	if (!cluster_pcm_local_pi_retire_v1(&local, receipt, plan, sources, source_count, ack)) {
+		cluster_page_data_pi_ack_free_v1(&ack);
+		return false;
+	}
 	*out = ack;
 	return true;
 }

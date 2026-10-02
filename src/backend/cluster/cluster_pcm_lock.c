@@ -40,6 +40,7 @@
 #include "access/xlogdefs.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_pi_write.h"
+#include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_grd.h" /* PGRAC: spec-2.30 D1 — ClusterGrdHolderId 24B */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-2.30 D3 — cluster_node_id */
 #include "cluster/cluster_gcs.h" /* PGRAC: spec-2.32 D5 — master lookup + send_transition_and_wait */
@@ -402,6 +403,10 @@ struct GrdEntry {
 	uint64 binding_generation;
 	uint32 registry_slot;
 	uint32 lifecycle_pad;
+	/* Independent of buffer residency and of this node's current master role.
+	 * Both anchors keep the original claim alive until qualified retirement. */
+	uint64 local_pi_revision;
+	ClusterPageWalRefV1 local_pi_first, local_pi_last;
 	ConditionVariable wait_cv; /* spec-2.31 D1 v0.4 incompatible state wait */
 	LWLockPadded entry_lock;   /*128B PG_CACHE_LINE_SIZE — must stay last */
 };
@@ -423,7 +428,7 @@ struct GrdEntry {
  *	expected constant on this build platform, so silent layout drift
  *	(e.g. a future struct change in a dependency) cannot slip past CI.
  */
-StaticAssertDecl(sizeof(struct GrdEntry) == 1128,
+StaticAssertDecl(sizeof(struct GrdEntry) == 1232,
 				 "Stage 8 D2 GrdEntry size must include pinned binding identity");
 
 
@@ -922,6 +927,7 @@ static bool pcm_resource_x_source_finish_pending_locked(struct GrdEntry *entry);
 static bool pcm_resource_x_local_handoff_valid(const ClusterPcmResourceXLocalHandoff *handoff);
 static bool pcm_resource_x_local_owner_priority_clear_locked(struct GrdEntry *entry);
 static bool pcm_resource_x_local_owner_expire_locked(struct GrdEntry *entry, uint64 now_us);
+static void pcm_local_pi_release_locked(struct GrdEntry *entry);
 static uint64 pcm_resource_x_monotonic_us(void);
 static bool pcm_resource_x_head_changed_locked(struct GrdEntry *entry, bool semantic_progress,
 											   uint64 now_us);
@@ -1887,7 +1893,8 @@ pcm_entry_retire_eligible_locked(struct GrdEntry *entry, uint64 expected_generat
 		*why = PCM_RETIRE_REFUSAL_HOLDER_PRESENT;
 		return false;
 	}
-	if (pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0) {
+	if (pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0
+		|| entry->local_pi_first.source_flags != 0 || entry->local_pi_last.source_flags != 0) {
 		*why = PCM_RETIRE_REFUSAL_PI_PRESENT;
 		return false;
 	}
@@ -5892,7 +5899,10 @@ cluster_pcm_lock_clean_leave_verify_no_leftover(int32 leaving_node)
 		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
 		if (entry->x_holder_node == leaving_node
 			|| (pg_atomic_read_u32(&entry->s_holders_bitmap) & leaving_bit) != 0
-			|| (pg_atomic_read_u32(&entry->pi_holders_bitmap) & leaving_bit) != 0)
+			|| (pg_atomic_read_u32(&entry->pi_holders_bitmap) & leaving_bit) != 0
+			|| (leaving_node == cluster_node_id
+				&& (entry->local_pi_first.source_flags != 0
+					|| entry->local_pi_last.source_flags != 0)))
 			clean = false;
 		LWLockRelease(&entry->entry_lock.lock);
 
@@ -8679,7 +8689,9 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 			current_reason = "PCM_PENDING_CONVERT";
 		} else if (current == CLUSTER_NORMAL_STOP_READY && require_pi_retired
 				   && (pi_holders != 0 || entry->pi_watermark_lsn != InvalidXLogRecPtr
-					   || entry->pi_watermark_scn != InvalidScn)) {
+					   || entry->pi_watermark_scn != InvalidScn
+					   || entry->local_pi_first.source_flags != 0
+					   || entry->local_pi_last.source_flags != 0)) {
 			current = CLUSTER_NORMAL_STOP_PENDING;
 			current_reason = "PCM_PI_DURABILITY";
 		}
@@ -8690,6 +8702,7 @@ pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out
 			pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
 			entry->pi_watermark_lsn = InvalidXLogRecPtr;
 			entry->pi_watermark_scn = InvalidScn;
+			pcm_local_pi_release_locked(entry);
 		}
 		if ((current == CLUSTER_NORMAL_STOP_INVALID && result != CLUSTER_NORMAL_STOP_INVALID)
 			|| (current == CLUSTER_NORMAL_STOP_PENDING && result == CLUSTER_NORMAL_STOP_READY)) {
@@ -9931,6 +9944,167 @@ pcm_resource_x_terminal_tombstone_snapshot(const BufferTag *tag,
 	pcm_resource_x_master_snapshot(tag, tombstone->requester_node, state, &tombstone->request, out);
 	if (out != NULL)
 		out->is_head = 0;
+}
+
+static bool
+pcm_local_pi_snapshot_locked(struct GrdEntry *entry, ClusterPcmLocalPiSnapshotV1 *out)
+{
+	ClusterPcmLocalPiSnapshotV1 value = { 0 };
+	bool first = entry->local_pi_first.source_flags != 0;
+	bool last = entry->local_pi_last.source_flags != 0;
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
+		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	if (first != last || entry->local_pi_revision == UINT64_MAX
+		|| (first && entry->local_pi_revision == 0))
+		return false;
+	value.resource = entry->tag;
+	value.binding_generation = entry->binding_generation;
+	value.revision = entry->local_pi_revision;
+	if (first
+		&& (!cluster_page_wal_ref_read_v1(&entry->local_pi_first,
+										  BufTagGetRelFileLocator(&entry->tag), entry->tag.forkNum,
+										  entry->tag.blockNum, &value.first)
+			|| !cluster_page_wal_ref_read_v1(&entry->local_pi_last,
+											 BufTagGetRelFileLocator(&entry->tag),
+											 entry->tag.forkNum, entry->tag.blockNum, &value.last)))
+		return false;
+	*out = value;
+	return true;
+}
+
+static bool
+pcm_local_pi_remember_locked(struct GrdEntry *entry, const ClusterPageWalBindingV1 *binding)
+{
+	ClusterPcmLocalPiSnapshotV1 previous;
+	ClusterPageWalRefV1 first = { 0 }, last = { 0 };
+	ClusterWalSourceRef writer;
+	BufferTag tag;
+	bool empty;
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	if (!cluster_enabled || !cluster_shared_config || !cluster_page_wal_binding_shape_v1(binding)
+		|| (binding->flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+		|| !cluster_wal_thread_current_v2_ref(&writer)
+		|| writer.claim.identity.origin_node_id != cluster_node_id
+		|| writer.claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation()
+		|| writer.claim.identity.system_identifier != binding->identity.system_identifier
+		|| writer.claim.database_incarnation != binding->source.claim.database_incarnation
+		|| memcmp(writer.claim.identity.storage_uuid, binding->identity.storage_uuid, 16) != 0
+		|| !pcm_local_pi_snapshot_locked(entry, &previous))
+		return false;
+	InitBufferTag(&tag, &binding->identity.locator, binding->identity.forknum,
+				  binding->identity.blockno);
+	if (!BufferTagsEqual(&tag, &entry->tag))
+		return false;
+	empty = previous.first.record_start == InvalidXLogRecPtr;
+	if (!empty) {
+		if (memcmp(previous.first.version.segment_incarnation, binding->version.segment_incarnation,
+				   16)
+			!= 0)
+			return false;
+		if (cluster_page_wal_same_mutation_v1(&previous.last, binding))
+			return true;
+	}
+	if (entry->local_pi_revision >= UINT64_MAX - 1)
+		return false;
+	/* Reserve every replacement reference before changing the original owner.
+	 * The unchanged keyed entry, not a buffer slot, owns these references. */
+	if (empty && !cluster_page_wal_ref_retain_v1(binding, &first))
+		return false;
+	if (!cluster_page_wal_ref_retain_v1(binding, &last)) {
+		(void)cluster_page_wal_ref_release_v1(&first);
+		return false;
+	}
+	if (empty)
+		entry->local_pi_first = first; /* move, never duplicate a live reference */
+	else if (!cluster_page_wal_ref_release_v1(&entry->local_pi_last))
+		elog(PANIC, "local PI responsibility lost its owned WAL reference");
+	entry->local_pi_last = last;
+	entry->local_pi_revision++;
+	return true;
+}
+
+static void
+pcm_local_pi_release_locked(struct GrdEntry *entry)
+{
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	if (entry->local_pi_first.source_flags == 0 && entry->local_pi_last.source_flags == 0)
+		return;
+	if (entry->local_pi_revision >= UINT64_MAX - 1
+		|| !cluster_page_wal_ref_release_v1(&entry->local_pi_first)
+		|| !cluster_page_wal_ref_release_v1(&entry->local_pi_last))
+		elog(PANIC, "local PI responsibility lost its retirement invariant");
+	entry->local_pi_revision++;
+}
+
+bool
+cluster_pcm_local_pi_record_v1(BufferTag tag, const ClusterPageWalBindingV1 *binding)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	bool result;
+	if (!cluster_enabled || !cluster_shared_config
+		|| !pcm_entry_ref_acquire(&tag, true, &ref, &acquired))
+		return false;
+	pcm_entry_lock_exclusive(ref.entry);
+	result = pcm_local_pi_remember_locked(ref.entry, binding);
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
+bool
+cluster_pcm_local_pi_snapshot_v1(BufferTag tag, ClusterPcmLocalPiSnapshotV1 *out)
+{
+	ClusterPcmLocalPiSnapshotV1 value = { 0 };
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	bool result;
+	if (out == NULL || !cluster_shared_config || cluster_pcm_htab == NULL)
+		return false;
+	if (!pcm_entry_ref_acquire(&tag, false, &ref, &acquired)) {
+		if (acquired != PCM_ENTRY_ACQUIRE_NOT_FOUND)
+			return false;
+		value.resource = tag;
+		*out = value;
+		return true;
+	}
+	LWLockAcquire(&ref.entry->entry_lock.lock, LW_SHARED);
+	result = pcm_local_pi_snapshot_locked(ref.entry, &value);
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	if (result)
+		*out = value;
+	return result;
+}
+
+bool
+cluster_pcm_local_pi_retire_v1(const ClusterPcmLocalPiSnapshotV1 *local,
+							   const ClusterPageDataReceiptV1 *receipt,
+							   const RfPageOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
+							   uint32 source_count, const ClusterPiPhysicalAckV1 *ack)
+{
+	ClusterPcmLocalPiSnapshotV1 current;
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	int32 ack_node;
+	bool result;
+	if (local == NULL || !cluster_shared_config || cluster_pcm_htab == NULL
+		|| !cluster_page_data_pi_ack_read_v1(ack, receipt, &ack_node) || ack_node != cluster_node_id
+		|| !cluster_page_data_covers_local_pi_v1(receipt, plan, sources, source_count, local))
+		return false;
+	if (!pcm_entry_ref_acquire(&local->resource, false, &ref, &acquired))
+		return acquired == PCM_ENTRY_ACQUIRE_NOT_FOUND && local->binding_generation == 0
+			   && local->revision == 0 && local->first.record_start == 0
+			   && local->last.record_start == 0;
+	pcm_entry_lock_exclusive(ref.entry);
+	result = pcm_local_pi_snapshot_locked(ref.entry, &current)
+			 && memcmp(&current, local, sizeof(current)) == 0
+			 && ref.entry->local_pi_revision < UINT64_MAX - 1;
+	if (result)
+		pcm_local_pi_release_locked(ref.entry);
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
 }
 
 static bool
@@ -18935,6 +19109,16 @@ pcm_resource_x_holder_pair_publish_internal(const ResourceXAssertion *assertion,
 		goto pair_publish_done;
 	}
 	if (state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PENDING || status_ready) {
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		goto pair_publish_done;
+	}
+	/* The source has completed its exact physical revoke. Preserve logical
+	 * responsibility before either completion/image can leave this process;
+	 * reclaiming the physical PI or replacing master state cannot erase it.
+	 * Other page classes retain the existing guard and full-WAL reconstruction. */
+	if (cluster_shared_config && image.common.observed_mode == PCM_STATE_X
+		&& image.body.image_envelope.page_wal.record_start != 0
+		&& !pcm_local_pi_remember_locked(entry, &image.body.image_envelope.page_wal)) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		goto pair_publish_done;
 	}

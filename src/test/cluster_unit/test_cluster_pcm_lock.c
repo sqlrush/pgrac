@@ -53,6 +53,7 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pi_write.h"
+#include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -140,6 +141,30 @@ static char pi_receipt_fixture;
 static char pi_ack_fixtures[3];
 static uint32 pi_ack_available;
 static uint32 pi_ack_imported;
+static bool local_pi_writer_ready, local_pi_covered;
+static ClusterWalSourceRef local_pi_writer;
+static union {
+	uint64 align;
+	char bytes[65536];
+} local_pi_wal_memory;
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
+{
+	if (!local_pi_writer_ready)
+		return false;
+	*out = local_pi_writer;
+	return true;
+}
+bool
+cluster_page_data_covers_local_pi_v1(const ClusterPageDataReceiptV1 *receipt,
+									 const RfPageOnlinePlanV1 *plan,
+									 const ClusterWalSourceRef *sources, uint32 source_count,
+									 const ClusterPcmLocalPiSnapshotV1 *local)
+{
+	/* The actual sealed-plan/physical receipt owner is exercised separately
+	 * in test_cluster_page_data. This fixture never constructs DATA proof. */
+	return local_pi_covered && (const void *)receipt == &pi_receipt_fixture;
+}
 static const ClusterPiPhysicalAckV1 *pi_acks[3]
 	= { (const void *)&pi_ack_fixtures[0], (const void *)&pi_ack_fixtures[1],
 		(const void *)&pi_ack_fixtures[2] };
@@ -223,7 +248,7 @@ cluster_lms_wakeup(int worker_id pg_attribute_unused())
 {}
 
 #define FAKE_PCM_MAX_ENTRIES 24
-#define FAKE_PCM_ENTRY_BYTES 1128
+#define FAKE_PCM_ENTRY_BYTES 1232
 StaticAssertDecl(sizeof(struct StopPcmEntryLayout) == FAKE_PCM_ENTRY_BYTES,
 				 "negative fixture field offsets must match the generated original entry");
 
@@ -599,6 +624,11 @@ cluster_grd_inc_block_path_failclosed(void)
 void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPtr)
 {
+	if (strcmp(name, "pgrac page WAL binding") == 0) {
+		Assert(size <= sizeof(local_pi_wal_memory));
+		*foundPtr = false;
+		return local_pi_wal_memory.bytes;
+	}
 	Assert(size <= sizeof(fake_pcm_header.data));
 	fake_pcm_header_requested_size = size;
 	fake_init_wait_event_seen = ut_wait_event_info_storage;
@@ -1437,7 +1467,7 @@ UT_TEST(test_pcm_real_summary_counts_live_entries)
 UT_TEST(test_pcm_grd_entry_abi_includes_resource_x_executor_state)
 {
 	reset_fake_pcm_runtime(4);
-	UT_ASSERT_EQ(fake_pcm_entrysize, 1128);
+	UT_ASSERT_EQ(fake_pcm_entrysize, 1232);
 	UT_ASSERT_EQ(cluster_pcm_grd_shmem_size(), add_size(fake_pcm_header_requested_size,
 														hash_estimate_size(4, fake_pcm_entrysize)));
 }
@@ -19921,10 +19951,324 @@ UT_TEST(test_stop_seal_keeps_original_identity_validation_first)
 	UT_ASSERT_EQ(fake_pcm_entry_count, 0);
 }
 
+static ClusterPageWalBindingV1
+local_pi_setup(BufferTag tag)
+{
+	ClusterPageWalBindingV1 b = { 0 };
+	reset_fake_pcm_runtime(4);
+	cluster_enabled = cluster_shared_config = true;
+	cluster_page_wal_shmem_init();
+	b.source.claim.identity.system_identifier = 123;
+	b.source.claim.identity.origin_node_id = 0;
+	b.source.claim.identity.origin_thread_id = 1;
+	b.source.claim.identity.origin_owner_incarnation = ut_master_session;
+	b.source.claim.identity.thread_claim_created_at = 8;
+	b.source.claim.identity.root_lineage_seq = 9;
+	b.source.claim.identity.storage_uuid[0] = 10;
+	b.source.claim.identity.authority_uuid[0] = 11;
+	b.source.claim.database_incarnation = 12;
+	b.source.claim.max_config_generation = 13;
+	b.source.claim.claim_sha256[0] = 14;
+	b.source.timeline = 1;
+	b.identity.system_identifier = 123;
+	memcpy(b.identity.storage_uuid, b.source.claim.identity.storage_uuid, 16);
+	b.identity.locator = BufTagGetRelFileLocator(&tag);
+	b.identity.forknum = tag.forkNum;
+	b.identity.blockno = tag.blockNum;
+	b.version.segment_incarnation[0] = 15;
+	b.version.mutation_token = 80;
+	b.record_start = 100;
+	b.record_end = 200;
+	b.record_crc = 30;
+	b.rmid = RM_HEAP_ID;
+	b.flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	local_pi_writer = b.source;
+	local_pi_writer_ready = true;
+	local_pi_covered = false;
+	return b;
+}
+
+UT_TEST(test_local_pi_keeps_first_and_latest_across_master_changes)
+{
+	BufferTag tag = make_tag(912);
+	ClusterPageWalBindingV1 b = local_pi_setup(tag), first = b;
+	ClusterPcmLocalPiSnapshotV1 a = { 0 }, again;
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &b));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &a));
+	UT_ASSERT_EQ(a.first.version.mutation_token, 80);
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &b));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &again));
+	UT_ASSERT_EQ(memcmp(&a, &again, sizeof(a)), 0);
+	b.source.claim.identity.origin_node_id = 1;
+	b.source.claim.identity.origin_thread_id = 2;
+	b.source.claim.identity.origin_owner_incarnation = 71;
+	b.version.mutation_token = 19; /* tokens/foreign LSNs are not a clock */
+	b.record_start = 5;
+	b.record_end = 9;
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &b));
+	UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(tag, PCM_STATE_X, 5, 19, 2, 7));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &again));
+	UT_ASSERT(again.revision > a.revision);
+	UT_ASSERT(cluster_page_wal_same_mutation_v1(&again.first, &first));
+	UT_ASSERT(cluster_page_wal_same_mutation_v1(&again.last, &b));
+	UT_ASSERT(!cluster_pcm_lock_clean_leave_verify_no_leftover(cluster_node_id));
+	local_pi_writer_ready = false;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_local_pi_rejects_unqualified_replacement_without_losing_anchors)
+{
+	for (unsigned variant = 0; variant < 6; variant++) {
+		BufferTag tag = make_tag(913);
+		ClusterPageWalBindingV1 b = local_pi_setup(tag);
+		ClusterPcmLocalPiSnapshotV1 before = { 0 }, after;
+		UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &b));
+		UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &before));
+		if (variant == 0)
+			b.version.segment_incarnation[1]++;
+		if (variant == 1)
+			b.identity.storage_uuid[1]++;
+		if (variant == 2)
+			b.source.claim.database_incarnation++;
+		if (variant == 3)
+			b.flags = 0;
+		if (variant == 4)
+			b.identity.blockno++;
+		if (variant == 5)
+			local_pi_writer_ready = false;
+		UT_ASSERT(!cluster_pcm_local_pi_record_v1(tag, &b));
+		local_pi_writer_ready = true;
+		UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &after));
+		UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	}
+	local_pi_writer_ready = false;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_local_pi_retirement_requires_exact_responsibility_and_physical_ack)
+{
+	BufferTag tag = make_tag(914);
+	ClusterPageWalBindingV1 b = local_pi_setup(tag);
+	ClusterPcmLocalPiSnapshotV1 before = { 0 }, current = { 0 }, empty = { 0 };
+	const ClusterPageDataReceiptV1 *receipt = (const void *)&pi_receipt_fixture;
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &b));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &before));
+	pi_receipt_valid = true;
+	pi_storage_receipt_valid = false;
+	memset(&pi_receipt_cut, 0, sizeof(pi_receipt_cut));
+	pi_ack_cut = pi_receipt_cut;
+	pi_ack_available = 1;
+	pi_ack_imported = 0;
+	UT_ASSERT(!cluster_pcm_local_pi_retire_v1(&before, receipt, NULL, NULL, 0, pi_acks[0]));
+	local_pi_covered = true;
+	UT_ASSERT(!cluster_pcm_local_pi_retire_v1(&before, receipt, NULL, NULL, 0, NULL));
+	b.version.mutation_token++;
+	b.record_start = 300;
+	b.record_end = 400;
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &b));
+	UT_ASSERT(!cluster_pcm_local_pi_retire_v1(&before, receipt, NULL, NULL, 0, pi_acks[0]));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &current));
+	UT_ASSERT(cluster_pcm_local_pi_retire_v1(&current, receipt, NULL, NULL, 0, pi_acks[0]));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &empty));
+	UT_ASSERT_EQ(empty.first.record_start, 0);
+	UT_ASSERT_EQ(empty.last.record_start, 0);
+	UT_ASSERT(empty.revision > current.revision);
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &b));
+	UT_ASSERT(!cluster_pcm_local_pi_retire_v1(&current, receipt, NULL, NULL, 0, pi_acks[0]));
+	local_pi_writer_ready = false;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_local_pi_alone_prevents_directory_reclamation)
+{
+	BufferTag tag = make_tag(915);
+	ClusterPageWalBindingV1 b = local_pi_setup(tag);
+	ClusterPcmLocalPiSnapshotV1 current = { 0 };
+	PcmRetireRefusal why;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &b));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &current));
+	UT_ASSERT(!pcm_entry_retire_classify_exact(&tag, current.binding_generation, &why));
+	UT_ASSERT_EQ(why, PCM_RETIRE_REFUSAL_PI_PRESENT);
+	UT_ASSERT(!pcm_entry_try_retire_exact(&tag, current.binding_generation,
+										  PCM_RETIRE_REASON_PI_DISCARDED));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &current));
+	UT_ASSERT_EQ(current.first.record_start, 100);
+	local_pi_writer_ready = false;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_local_pi_is_owned_before_source_pair_becomes_sendable)
+{
+	BufferTag tag = make_tag(916);
+	ClusterPageWalBindingV1 binding = local_pi_setup(tag);
+	ClusterPcmLocalPiSnapshotV1 before, after;
+	ResourceXDecodedFrame block, grant, image, status;
+	ResourceXIntentSlot status_intent, image_intent;
+	uint8 status_payload[RESOURCE_X_PROOF_V1_BYTES];
+	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
+	uint64 source_generation;
+	PGAlignedBlock page;
+
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+	fake_gcs_master_node = 1;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	block = make_resource_x_master_frame(RESOURCE_X_WIRE_BLOCK_TO_N, tag, 1, 0);
+	block.common.observed_mode = PCM_STATE_X;
+	block.common.target_mode = PCM_STATE_N;
+	block.common.source_candidate = block.common.retain_pi_if_dirty = 1;
+	make_resource_x_remote_join_pair(tag, 1, &grant, &image);
+	binding.version.mutation_token = image.body.image_envelope.page_scn_lsn;
+	memset(page.data, 0, BLCKSZ);
+	((PageHeader)page.data)->pd_upper = BLCKSZ;
+	((PageHeader)page.data)->pd_block_scn = binding.version.mutation_token;
+	PageSetLSNPreserveOrigin(page.data, binding.record_end);
+	UT_ASSERT(PageSetLSNOrigin(page.data, 0));
+	memcpy(image.body.image_envelope.page_bytes, page.data, BLCKSZ);
+	image.body.image_envelope.page_wal = binding;
+	image.body.image_envelope.image_flags = RESOURCE_X_IMAGE_HAS_WAL;
+	canonicalize_resource_x_test_image(&image);
+	status = make_resource_x_remote_blocked_frame(tag, 1, 0);
+	status.body.blocked_to_n.source_proof_crc32c = image.common.semantic_crc32c;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_source_exact(&block, 1, &status, &image),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &before));
+	UT_ASSERT_EQ(before.first.record_start, 0);
+	local_pi_writer_ready = false;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_publish_exact(
+					 &block.common.logical_assertion, block.common.assertion_sequence, 1,
+					 block.common.master_session_incarnation),
+				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &after));
+	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	UT_ASSERT(
+		cluster_pcm_lock_resource_x_holder_status_intent_snapshot_exact(
+			&block.common.logical_assertion, &status_intent, status_payload, sizeof(status_payload))
+		!= RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(
+		cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(
+			&block.common.logical_assertion, &image_intent, image_payload, sizeof(image_payload))
+		!= RESOURCE_X_APPLY_APPLIED);
+	local_pi_writer_ready = true;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_publish_exact(
+					 &block.common.logical_assertion, block.common.assertion_sequence, 1,
+					 block.common.master_session_incarnation),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &before));
+	UT_ASSERT(cluster_page_wal_same_mutation_v1(&before.first, &binding));
+	UT_ASSERT(cluster_page_wal_same_mutation_v1(&before.last, &binding));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_publish_exact(
+					 &block.common.logical_assertion, block.common.assertion_sequence, 1,
+					 block.common.master_session_incarnation),
+				 RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_status_intent_snapshot_exact(
+					 &block.common.logical_assertion, &status_intent, status_payload,
+					 sizeof(status_payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(
+			&block.common.logical_assertion, &image_intent, image_payload, sizeof(image_payload)),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&status_intent, 105),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&status_intent));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&image_intent, 106),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&image_intent));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_drain_prepare_exact(
+					 &block.common.logical_assertion, block.common.assertion_sequence, 1,
+					 block.common.master_session_incarnation, &source_generation),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_drain_commit_exact(
+					 &block.common.logical_assertion, block.common.assertion_sequence, 1,
+					 block.common.master_session_incarnation, source_generation),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &after));
+	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	local_pi_writer_ready = cluster_shared_config = false;
+}
+
+UT_TEST(test_local_pi_requires_original_all_member_stop_cut)
+{
+	BufferTag tag = make_tag(917);
+	ClusterPageWalBindingV1 binding = local_pi_setup(tag);
+	ClusterPcmLocalPiSnapshotV1 before, after;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &binding));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &before));
+	UT_ASSERT_EQ(stop_pcm_poll(true, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(stop_pcm_retire(), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &after));
+	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	stop_pi_cut_allowed = true;
+	UT_ASSERT_EQ(stop_pcm_retire(), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &after));
+	UT_ASSERT_EQ(after.first.record_start, 0);
+	UT_ASSERT_EQ(after.last.record_start, 0);
+	UT_ASSERT_EQ(after.revision, before.revision + 1);
+	UT_ASSERT_EQ(stop_pcm_poll(true, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	local_pi_writer_ready = cluster_shared_config = false;
+}
+
+UT_TEST(test_local_pi_read_only_carrier_does_not_create_writer_responsibility)
+{
+	BufferTag tag = make_tag(918);
+	ClusterPageWalBindingV1 binding = local_pi_setup(tag);
+	ClusterPcmLocalPiSnapshotV1 local;
+	ResourceXDecodedFrame block, grant, image, status;
+	ClusterPcmOwnSnapshot prepared = { 0 };
+	PGAlignedBlock page;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	fake_gcs_master_node = 1;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	block = make_resource_x_master_frame(RESOURCE_X_WIRE_BLOCK_TO_N, tag, 1, 0);
+	block.common.observed_mode = PCM_STATE_S;
+	block.common.target_mode = PCM_STATE_N;
+	block.common.source_candidate = block.common.retain_pi_if_dirty = 1;
+	make_resource_x_s_remote_join_pair(tag, 1, &grant, &image);
+	binding.version.mutation_token = image.body.image_envelope.page_scn_lsn;
+	memset(page.data, 0, BLCKSZ);
+	((PageHeader)page.data)->pd_upper = BLCKSZ;
+	((PageHeader)page.data)->pd_block_scn = binding.version.mutation_token;
+	PageSetLSNPreserveOrigin(page.data, binding.record_end);
+	UT_ASSERT(PageSetLSNOrigin(page.data, 0));
+	memcpy(image.body.image_envelope.page_bytes, page.data, BLCKSZ);
+	image.body.image_envelope.page_wal = binding;
+	image.body.image_envelope.image_flags = RESOURCE_X_IMAGE_HAS_WAL;
+	canonicalize_resource_x_test_image(&image);
+	status = make_resource_x_remote_blocked_frame(tag, 1, 0);
+	status.common.observed_mode = PCM_STATE_S;
+	memcpy(status.body.blocked_to_n.source_fence, image.body.image_envelope.source_fence,
+		   sizeof(status.body.blocked_to_n.source_fence));
+	status.body.blocked_to_n.source_proof_crc32c = image.common.semantic_crc32c;
+	prepared.tag = tag;
+	prepared.generation = 60;
+	prepared.reservation_token = 77;
+	prepared.flags = PCM_OWN_FLAG_REVOKING;
+	prepared.pcm_state = PCM_STATE_S;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(
+					 &block, 1, &status, &image, &prepared, binding.record_end,
+					 binding.version.mutation_token, image.body.image_envelope.page_checksum),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_publish_exact(
+					 &block.common.logical_assertion, block.common.assertion_sequence, 1,
+					 block.common.master_session_incarnation),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &local));
+	UT_ASSERT_EQ(local.first.record_start, 0);
+	UT_ASSERT_EQ(local.last.record_start, 0);
+	local_pi_writer_ready = cluster_shared_config = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(298);
+	UT_PLAN(305);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -20223,6 +20567,13 @@ main(void)
 	UT_RUN(test_stop_seal_unreceipted_assert_is_new_but_replay_is_not);
 	UT_RUN(test_stop_seal_keeps_original_identity_validation_first);
 	UT_RUN(test_stop_seal_service_new_round_but_not_existing_round_or_backend);
+	UT_RUN(test_local_pi_keeps_first_and_latest_across_master_changes);
+	UT_RUN(test_local_pi_rejects_unqualified_replacement_without_losing_anchors);
+	UT_RUN(test_local_pi_retirement_requires_exact_responsibility_and_physical_ack);
+	UT_RUN(test_local_pi_alone_prevents_directory_reclamation);
+	UT_RUN(test_local_pi_is_owned_before_source_pair_becomes_sendable);
+	UT_RUN(test_local_pi_requires_original_all_member_stop_cut);
+	UT_RUN(test_local_pi_read_only_carrier_does_not_create_writer_responsibility);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

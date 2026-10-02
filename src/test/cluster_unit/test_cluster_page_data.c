@@ -65,6 +65,31 @@ static bool locks[2], resident[2], busy[2], selected, sf_blocked, bad_checksum, 
 static bool redeclare_scan_test;
 static int redeclare_scope = 1;
 static unsigned redeclare_content_attempts;
+static ClusterPcmLocalPiSnapshotV1 logical_pi;
+static bool logical_pi_raced;
+static unsigned logical_pi_retire_calls;
+
+bool
+cluster_pcm_local_pi_snapshot_v1(BufferTag tag, ClusterPcmLocalPiSnapshotV1 *out)
+{
+	*out = logical_pi;
+	if (logical_pi.binding_generation == 0)
+		out->resource = tag;
+	return true;
+}
+
+bool
+cluster_pcm_local_pi_retire_v1(const ClusterPcmLocalPiSnapshotV1 *local,
+							   const ClusterPageDataReceiptV1 *receipt,
+							   const RfPageOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
+							   uint32 source_count, const ClusterPiPhysicalAckV1 *ack)
+{
+	int32 node;
+	logical_pi_retire_calls++;
+	return !logical_pi_raced && cluster_page_data_pi_ack_read_v1(ack, receipt, &node)
+		   && node == cluster_node_id
+		   && cluster_page_data_covers_local_pi_v1(receipt, plan, sources, source_count, local);
+}
 
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
 uint64
@@ -2286,10 +2311,92 @@ redeclare_scan_filters_scope_before_content_or_io_wait(void)
 	}
 }
 
+static ClusterPcmLocalPiSnapshotV1
+logical_anchors(const ClusterWalSourceRef sources[3], BufferTag tag)
+{
+	ClusterPcmLocalPiSnapshotV1 local = { 0 };
+	local.resource = tag;
+	local.binding_generation = 11;
+	local.revision = 12;
+	local.first.source = sources[0];
+	local.first.identity = target.identity;
+	local.first.version = target.version;
+	local.first.version.mutation_token = 80;
+	local.first.record_start = 0x100;
+	local.first.record_end = 0x200;
+	local.first.record_crc = 0x9192;
+	local.first.rmid = RM_XLOG_ID;
+	local.first.info = XLOG_FPI;
+	local.first.flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	local.last = local.first;
+	local.last.source = sources[1];
+	local.last.version.mutation_token = 19;
+	return local;
+}
+
+static void
+data_requires_both_detached_logical_anchors_in_its_ancestry(void)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		ClusterWalSourceRef sources[3];
+		ClusterPcmPiStorageCutV1 cut;
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &cut);
+		ClusterPcmLocalPiSnapshotV1 local = logical_anchors(sources, cut.resource);
+		UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt));
+		if (fault == 1)
+			local.first.record_crc++;
+		if (fault == 2)
+			local.last.source.claim.identity.origin_owner_incarnation++;
+		if (fault == 3)
+			local.last.version.mutation_token = 6;
+		if (fault == 4)
+			local.first.version.segment_incarnation[1]++;
+		if (fault == 5)
+			local.resource.blockNum++;
+		if (fault == 6)
+			memset(&local.first, 0, sizeof(local.first));
+		UT_ASSERT_EQ(cluster_page_data_covers_local_pi_v1(receipt, plan, sources, 3, &local),
+					 fault == 0);
+		UT_ASSERT_EQ(pi_discards + writes, 0);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&plan);
+		clean();
+	}
+}
+
+static void
+physical_ack_rechecks_detached_responsibility_after_consumption(void)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterWalSourceRef sources[3];
+		ClusterPcmPiStorageCutV1 cut;
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		ClusterPiPhysicalAckV1 *ack = NULL;
+		RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &cut);
+		UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt));
+		logical_pi = logical_anchors(sources, cut.resource);
+		logical_pi_raced = fault == 1;
+		logical_pi_retire_calls = 0;
+		if (fault == 2)
+			logical_pi.first.record_crc++;
+		UT_ASSERT_EQ(cluster_bufmgr_ack_pi_at_data_v1(receipt, plan, sources, 3, NULL, &ack),
+					 fault == 0);
+		UT_ASSERT_EQ(logical_pi_retire_calls, fault == 2 ? 0 : 1);
+		UT_ASSERT_EQ(pi_discards + writes, 0); /* actual ABSENT physical result */
+		cluster_page_data_pi_ack_free_v1(&ack);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&plan);
+		memset(&logical_pi, 0, sizeof(logical_pi));
+		logical_pi_raced = false;
+		clean();
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(35);
+	UT_PLAN(37);
 	UT_RUN(missing_pi_terminal_receipt_accepts_original_claim_ceiling);
 	UT_RUN(data_sync_releases_content_and_rechecks_clean_replacement);
 	UT_RUN(redeclare_scan_includes_physical_pi_and_preserves_unacknowledged_cursor);
@@ -2325,6 +2432,8 @@ main(void)
 	UT_RUN(physical_pi_discard_is_ancestry_and_generation_exact);
 	UT_RUN(physical_pi_newer_than_actual_data_is_not_discarded);
 	UT_RUN(missing_pi_cannot_confirm_nonterminal_data);
+	UT_RUN(data_requires_both_detached_logical_anchors_in_its_ancestry);
+	UT_RUN(physical_ack_rechecks_detached_responsibility_after_consumption);
 	if (file)
 		fclose(file);
 	UT_DONE();
