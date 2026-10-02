@@ -108,6 +108,12 @@ extern ClusterControlRootResult
 cluster_wal_inputs_contributions_v1(ClusterWalInputsV1 *inputs, bool space_active,
 									ClusterThreadRecoveryFabricPlanV1 **out_plan,
 									uint64 *out_record_count, RfPageProofDetailV1 *out_detail);
+/* Local prior-executor retirement only. Consume original prior-exit evidence
+ * and the ROOT-selected native INSTALL predecessor chain under this scope.
+ * This does not prove DATA coverage, remove PI, or permit WAL reclamation. */
+extern bool cluster_wal_inputs_local_predecessor_retired_v1(ClusterWalInputsV1 *inputs,
+															const ClusterWalSourceRef *predecessor,
+															const ClusterWalSourceRef *writer);
 extern void cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs);
 
 #endif

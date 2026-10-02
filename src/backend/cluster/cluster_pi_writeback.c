@@ -814,7 +814,8 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 		ClusterPiPhysicalAckV1 *ack = NULL;
 		ClusterWalWriterToken native;
 		bool valid = cluster_page_data_from_notice_v1(wb_notice, i, &receipt)
-					 && cluster_bufmgr_ack_pi_at_data_v1(receipt, page, sources, count, &ack)
+					 && cluster_bufmgr_ack_pi_at_data_v1(receipt, page, sources, count,
+														 wb_notice->inputs, &ack)
 					 && cluster_page_data_pi_ack_export_v1(ack, receipt, &native)
 					 && native.epoch == request.epoch && native.startup_first_lsn == 0
 					 && wb_source_covered(&native.ref, &request.peer)
@@ -1083,7 +1084,7 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 					if (n >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 						|| !cluster_bufmgr_ack_pi_at_data_v1(
 							wb_batch->receipts[i], page, wb_batch->sources, wb_batch->source_count,
-							&wb_batch->acks[i][n]))
+							wb_batch->inputs, &wb_batch->acks[i][n]))
 						goto done;
 					wb_batch->ack_count[i]++;
 				}

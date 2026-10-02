@@ -13,6 +13,8 @@
 #include "cluster/cluster_page_data.h"
 #include "cluster/cluster_page_wal.h"
 
+typedef struct ClusterWalInputsV1 ClusterWalInputsV1;
+
 #ifdef USE_PGRAC_CLUSTER
 /* Process-local projection, never a grant or a persistent record. */
 typedef struct ClusterPcmPiWriteCutV1 {
@@ -119,8 +121,10 @@ cluster_bufmgr_discard_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 typedef struct ClusterPiPhysicalAckV1 ClusterPiPhysicalAckV1;
 
 /* Actual local physical completion, qualified for the original writer/boot.
- * It covers this instance only, and refuses retained sources from its older
- * boots until their separate retirement owner is connected. Remote node ids,
+ * It covers this instance, including older boots only when the original
+ * retirement owner qualifies them in the supplied complete input scope.
+ * NULL inputs is sufficient only when every local source has this boot.
+ * Remote node ids,
  * caller bitmaps and physical-result enums cannot construct an acknowledgement.
  * The caller retains the complete input scope throughout this background job.
  * Output must start NULL; failure leaves it unchanged. The acknowledgement is
@@ -128,7 +132,8 @@ typedef struct ClusterPiPhysicalAckV1 ClusterPiPhysicalAckV1;
 extern bool cluster_bufmgr_ack_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 											 const RfPageOnlinePlanV1 *plan,
 											 const ClusterWalSourceRef *sources,
-											 uint32 source_count, ClusterPiPhysicalAckV1 **out);
+											 uint32 source_count, ClusterWalInputsV1 *inputs,
+											 ClusterPiPhysicalAckV1 **out);
 extern bool cluster_page_data_pi_ack_read_v1(const ClusterPiPhysicalAckV1 *ack,
 											 const ClusterPageDataReceiptV1 *receipt,
 											 int32 *out_node);

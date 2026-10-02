@@ -466,6 +466,17 @@ cluster_stats_spawned_at(void)
 {
 	abort();
 }
+static bool inputs_exit_valid;
+static uint64 inputs_prior_boot, inputs_observer_boot;
+bool
+cluster_qvotec_prior_exit_observe(uint32 node, uint64 prior, uint64 observer,
+								  ClusterQvotecPriorExitObservation *out)
+{
+	memset(out, 0, sizeof(*out));
+	return inputs_exit_valid && node == cluster_node_id && prior == inputs_prior_boot
+		   && observer == inputs_observer_boot;
+}
+
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
@@ -20108,6 +20119,57 @@ UT_TEST(test_wal_inputs_missing_peer_or_pending_never_partial)
 	MyBackendType = B_INVALID;
 }
 
+UT_TEST(test_wal_inputs_installed_predecessor_needs_exact_original_exit)
+{
+	ClusterWalInputsV1 *inputs = NULL;
+	ClusterWalSourceRef current = { 0 }, prior = { 0 }, bad;
+	/* Actual original checkpoint and INSTALL for both sparse members. */
+	test_v3_startup_install_sparse_pair_has_no_four_member_assumption();
+	UT_ASSERT(!ut_current_failed);
+	cluster_node_id = 0;
+	MyBackendType = B_BG_WRITER;
+	inputs_pin_held = inputs_pin_refuse = inputs_pin_race = inputs_pin_throw = false;
+	inputs_pin_current = true;
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+	UT_ASSERT(inputs != NULL);
+	for (uint32 i = 0; i < cluster_wal_inputs_count_v1(inputs); i++) {
+		const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, i);
+		if (item->source.claim.identity.origin_node_id == 0) {
+			if (item->current)
+				current = item->source;
+			else
+				prior = item->source;
+		}
+	}
+	UT_ASSERT_NE(current.claim.identity.origin_owner_incarnation, 0);
+	UT_ASSERT_NE(prior.claim.identity.origin_owner_incarnation, 0);
+	inputs_exit_valid = true;
+	inputs_prior_boot = prior.claim.identity.origin_owner_incarnation;
+	inputs_observer_boot = current.claim.identity.origin_owner_incarnation;
+	test_self_incarnation = inputs_observer_boot;
+	UT_ASSERT(cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	inputs_exit_valid = false;
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	inputs_exit_valid = true;
+	inputs_prior_boot++;
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	inputs_prior_boot--;
+	bad = prior;
+	bad.claim.claim_sha256[0] ^= 1;
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &bad, &current));
+	bad = current;
+	bad.claim.identity.origin_owner_incarnation++;
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &bad));
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &current, &current));
+	UT_ASSERT_EQ(cluster_wal_inputs_suspend_v1(inputs), 0);
+	UT_ASSERT(!cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	UT_ASSERT_EQ(cluster_wal_inputs_resume_v1(inputs), 0);
+	UT_ASSERT(cluster_wal_inputs_local_predecessor_retired_v1(inputs, &prior, &current));
+	cluster_wal_inputs_release_v1(&inputs);
+	inputs_exit_valid = false;
+	MyBackendType = B_INVALID;
+}
+
 UT_TEST(test_wal_inputs_retained_generations_remain_distinct)
 {
 	uint8 bytes[66048];
@@ -20381,7 +20443,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_WAL_INPUTS") != NULL) {
-		UT_PLAN(22);
+		UT_PLAN(23);
 		UT_RUN(test_wal_inputs_pause_releases_all_pins_and_resume_checks_original_root);
 		UT_RUN(test_wal_inputs_resume_error_releases_reacquired_native_owner);
 		UT_RUN(test_wal_inputs_claim_io_releases_cf_and_keeps_all_native_pins);
@@ -20398,6 +20460,7 @@ main(int argc, char **argv)
 		UT_RUN(test_wal_inputs_physical_failure_invalidates_provisional_scope);
 		UT_RUN(test_wal_inputs_all_origins_exact_native_anchor);
 		UT_RUN(test_wal_inputs_missing_peer_or_pending_never_partial);
+		UT_RUN(test_wal_inputs_installed_predecessor_needs_exact_original_exit);
 		UT_RUN(test_wal_inputs_retained_generations_remain_distinct);
 		UT_RUN(test_wal_inputs_roster_race_busy_and_stale_scope);
 		UT_RUN(test_wal_inputs_terminal_and_pending_are_not_checkpoint_sources);
@@ -20414,7 +20477,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(371);
+	UT_PLAN(372);
 	UT_RUN(test_wal_inputs_pause_releases_all_pins_and_resume_checks_original_root);
 	UT_RUN(test_wal_inputs_resume_error_releases_reacquired_native_owner);
 	UT_RUN(test_wal_inputs_claim_io_releases_cf_and_keeps_all_native_pins);
@@ -20431,6 +20494,7 @@ main(int argc, char **argv)
 	UT_RUN(test_wal_inputs_physical_failure_invalidates_provisional_scope);
 	UT_RUN(test_wal_inputs_all_origins_exact_native_anchor);
 	UT_RUN(test_wal_inputs_missing_peer_or_pending_never_partial);
+	UT_RUN(test_wal_inputs_installed_predecessor_needs_exact_original_exit);
 	UT_RUN(test_wal_inputs_retained_generations_remain_distinct);
 	UT_RUN(test_wal_inputs_roster_race_busy_and_stale_scope);
 	UT_RUN(test_wal_inputs_terminal_and_pending_are_not_checkpoint_sources);

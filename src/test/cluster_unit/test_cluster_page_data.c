@@ -22,6 +22,7 @@
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -123,6 +124,20 @@ static ClusterPageDataTargetV1 target;
 static ClusterWalSourceRef writer;
 static uint64 ack_writer_epoch = 1, ack_boot = 9;
 static bool ack_writer_ready = true, ack_epoch_race;
+static bool ack_retired_allowed;
+static unsigned ack_retired_calls;
+static ClusterWalSourceRef ack_retired_source, ack_retired_writer;
+bool
+cluster_wal_inputs_local_predecessor_retired_v1(ClusterWalInputsV1 *inputs,
+												const ClusterWalSourceRef *predecessor,
+												const ClusterWalSourceRef *current)
+{
+	ack_retired_calls++;
+	return inputs == (void *)1 && ack_retired_allowed
+		   && memcmp(predecessor, &ack_retired_source, sizeof(*predecessor)) == 0
+		   && memcmp(current, &ack_retired_writer, sizeof(*current)) == 0;
+}
+
 static void *page_sources_memory;
 static bool source_capture;
 static ClusterSpaceIdentity identity;
@@ -994,14 +1009,14 @@ ordinary_flush_uses_original_source(void)
 /* Decoded WAL is an explicit input boundary; actual preflight, detached FPI
  * apply, dependency sealing, DATA I/O and receipt qualification run together. */
 static RfPageOnlinePlanV1 *
-data_contribution_plan(const ClusterWalSourceRef sources[3])
+data_contribution_plan_count(const ClusterWalSourceRef *sources, unsigned count)
 {
-	RfContributorStreamCutV1 cuts[3] = { { 0 } };
+	RfContributorStreamCutV1 cuts[4] = { { 0 } };
 	RfPageOnlinePlanRequestV1 request = { 0 };
 	RfPageOnlinePlanV1 *plan = NULL;
-	uint64 tokens[] = { 10, 80, 19, 7 };
-	for (int i = 0; i < 3; i++) {
-		cuts[i].failed_thread = i + 1;
+	uint64 tokens[] = { 10, 80, 19, 7, 6 };
+	for (unsigned i = 0; i < count; i++) {
+		cuts[i].failed_thread = sources[i].claim.identity.origin_thread_id;
 		cuts[i].origin_owner_incarnation = sources[i].claim.identity.origin_owner_incarnation;
 		cuts[i].timeline_id = 1;
 		cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
@@ -1011,11 +1026,11 @@ data_contribution_plan(const ClusterWalSourceRef sources[3])
 	request.system_identifier = target.identity.system_identifier;
 	memcpy(request.storage_uuid, target.identity.storage_uuid, 16);
 	request.physical_cuts = cuts;
-	request.participant_count = 3;
+	request.participant_count = count;
 	request.retention_binding_cookie = 41;
 	UT_ASSERT_EQ(rf_page_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
-	UT_ASSERT(rf_page_online_plan_bind_sources_v1(plan, sources, 3));
-	for (int i = 0; i < 3; i++) {
+	UT_ASSERT(rf_page_online_plan_bind_sources_v1(plan, sources, count));
+	for (unsigned i = 0; i < count; i++) {
 		union {
 			DecodedXLogRecord record;
 			char bytes[sizeof(DecodedXLogRecord) + 2 * sizeof(DecodedBkpBlock)];
@@ -1046,7 +1061,7 @@ data_contribution_plan(const ClusterWalSourceRef sources[3])
 			block->in_use = block->has_image = block->apply_image = true;
 			block->rlocator = target.identity.locator;
 			block->forknum = j == 0 ? MAIN_FORKNUM : VISIBILITYMAP_FORKNUM;
-			block->blkno = 7;
+			block->blkno = i == 3 ? 8 : 7;
 			block->bkp_image = image.data;
 			block->bimg_len = BLCKSZ;
 			block->bimg_info = BKPIMAGE_APPLY;
@@ -1055,26 +1070,32 @@ data_contribution_plan(const ClusterWalSourceRef sources[3])
 			edge->before_kind = edge->result_kind = RF_PAGE_STATE_PRESENT;
 			memcpy(edge->before.segment_incarnation, target.version.segment_incarnation, 16);
 			memcpy(edge->result_incarnation, target.version.segment_incarnation, 16);
-			edge->before.mutation_token = j == 0 ? tokens[i] : 30;
+			edge->before.mutation_token = i == 3 ? 10 : (j == 0 ? tokens[i] : 30);
 			edge->edge_flags = RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE;
 		}
 		UT_ASSERT_EQ(rf_page_detached_preflight_v1(&reader, true, NULL, &detached),
 					 RF_PAGE_PROOF_DETAIL_OK);
 		input.record.system_identifier = request.system_identifier;
 		memcpy(input.record.storage_uuid, request.storage_uuid, 16);
-		input.record.origin_thread = i + 1;
+		input.record.origin_thread = i == 3 ? 1 : i + 1;
 		input.record.timeline_id = 1;
 		input.record.read_rec_ptr = 0x100;
 		input.record.end_rec_ptr = 0x200;
 		input.record.record_crc = 0x9192;
 		input.record.rmid = RM_XLOG_ID;
 		input.record.info = XLOG_FPI;
-		input.participant_index = i;
+		input.participant_index = count == 4 ? (i == 0 ? 0 : (i == 3 ? 1 : i + 1)) : i;
 		UT_ASSERT_EQ(rf_page_online_plan_queue_record_v1(plan, &detached, &input),
 					 RF_PAGE_PROOF_DETAIL_OK);
 	}
 	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 	return plan;
+}
+
+static RfPageOnlinePlanV1 *
+data_contribution_plan(const ClusterWalSourceRef sources[3])
+{
+	return data_contribution_plan_count(sources, 3);
 }
 
 static RfPageOnlinePlanV1 *
@@ -1755,6 +1776,41 @@ physical_pi_discard_is_ancestry_and_generation_exact(void)
 }
 
 static void
+physical_ack_consumes_original_prior_exit_and_full_retained_scope(void)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterWalSourceRef sources[4], current;
+		ClusterPcmPiStorageCutV1 cut;
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		ClusterPiPhysicalAckV1 *ack = NULL;
+		RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &cut);
+		current = writer;
+		rf_page_online_plan_destroy_v1(&plan);
+		sources[3] = sources[2];
+		sources[2] = sources[1];
+		sources[1] = sources[0]; /* Live A writes another block in the same cut. */
+		sources[0].claim.identity.origin_owner_incarnation--;
+		plan = data_contribution_plan_count(sources, 4);
+		UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 4, &receipt));
+		writer = current;
+		ack_retired_source = sources[0];
+		ack_retired_writer = current;
+		ack_retired_allowed = fault != 1;
+		ack_retired_calls = 0;
+		UT_ASSERT_EQ(cluster_bufmgr_ack_pi_at_data_v1(receipt, plan, sources, 4,
+													  fault == 2 ? NULL : (void *)1, &ack),
+					 fault == 0);
+		UT_ASSERT_EQ(ack_retired_calls, 1);
+		UT_ASSERT_EQ(pi_discards, 0); /* Exited boot cannot have a local PI. */
+		cluster_page_data_pi_ack_free_v1(&ack);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&plan);
+		ack_retired_allowed = false;
+		clean();
+	}
+}
+
+static void
 physical_ack_requires_actual_consumption_and_original_boot(void)
 {
 	for (int c = 0; c < 11; c++) {
@@ -1794,7 +1850,8 @@ physical_ack_requires_actual_consumption_and_original_boot(void)
 			MyBackendType = B_LMON;
 		if (c == 10)
 			ack_epoch_race = true;
-		UT_ASSERT_EQ(cluster_bufmgr_ack_pi_at_data_v1(receipt, plan, sources, 3, &ack), c < 3);
+		UT_ASSERT_EQ(cluster_bufmgr_ack_pi_at_data_v1(receipt, plan, sources, 3, NULL, &ack),
+					 c < 3);
 		UT_ASSERT_EQ(pi_discards, c == 0 || c == 10 ? 1 : 0);
 		if (c < 3) {
 			UT_ASSERT(cluster_page_data_pi_ack_read_v1(ack, receipt, &node));
@@ -1804,7 +1861,7 @@ physical_ack_requires_actual_consumption_and_original_boot(void)
 		if (c == 10) {
 			/* Failure after discard keeps master responsibility; a retry
 			 * observes actual absence under the new token. */
-			UT_ASSERT(cluster_bufmgr_ack_pi_at_data_v1(receipt, plan, sources, 3, &ack));
+			UT_ASSERT(cluster_bufmgr_ack_pi_at_data_v1(receipt, plan, sources, 3, NULL, &ack));
 			UT_ASSERT(cluster_page_data_pi_ack_read_v1(ack, receipt, &node));
 			UT_ASSERT_EQ(pi_discards, 1);
 		}
@@ -1831,7 +1888,7 @@ physical_ack_cannot_change_data_cut_or_owner(void)
 	int32 node;
 	UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt));
 	physical_pi_from_source(&sources[0], 80);
-	UT_ASSERT(cluster_bufmgr_ack_pi_at_data_v1(receipt, plan, sources, 3, &ack));
+	UT_ASSERT(cluster_bufmgr_ack_pi_at_data_v1(receipt, plan, sources, 3, NULL, &ack));
 	original = *receipt;
 	for (int c = 0; c < 8; c++) {
 		if (c == 0)
@@ -2183,7 +2240,7 @@ redeclare_scan_retries_content_busy_and_zero_lsn_current(void)
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(34);
 	UT_RUN(missing_pi_terminal_receipt_accepts_original_claim_ceiling);
 	UT_RUN(data_sync_releases_content_and_rechecks_clean_replacement);
 	UT_RUN(redeclare_scan_includes_physical_pi_and_preserves_unacknowledged_cursor);
@@ -2194,6 +2251,7 @@ main(void)
 	UT_RUN(remote_import_requires_original_job);
 	UT_RUN(tag_write_samples_real_identity_and_version);
 	UT_RUN(tag_write_rejects_wrong_namespace_or_holder);
+	UT_RUN(physical_ack_consumes_original_prior_exit_and_full_retained_scope);
 	UT_RUN(physical_ack_requires_actual_consumption_and_original_boot);
 	UT_RUN(physical_ack_cannot_change_data_cut_or_owner);
 	UT_RUN(same_claim_data_under_later_root_ceiling);

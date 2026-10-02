@@ -9,6 +9,7 @@
 #include "access/xlog.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_wal_writer.h"
@@ -76,6 +77,89 @@ inputs_current(ClusterWalInputsV1 *inputs)
 		   && cluster_wal_read_pin_covers_v1(inputs->pin, inputs->threads[0]);
 }
 
+static bool
+inputs_source_selected(const ClusterWalSourceRef *source, const ClusterWalSourceRef *selected)
+{
+	return cluster_wal_claim_v2_ref_valid(&source->claim)
+		   && cluster_control_root_identity_equal(&source->claim.identity,
+												  &selected->claim.identity)
+		   && source->claim.database_incarnation == selected->claim.database_incarnation
+		   && source->claim.max_config_generation <= selected->claim.max_config_generation
+		   && memcmp(source->claim.claim_sha256, selected->claim.claim_sha256, 32) == 0
+		   && source->timeline == selected->timeline;
+}
+
+bool
+cluster_wal_inputs_local_predecessor_retired_v1(ClusterWalInputsV1 *inputs,
+												const ClusterWalSourceRef *predecessor,
+												const ClusterWalSourceRef *writer)
+{
+	const ClusterWalInputV1 *current = NULL, *old = NULL;
+	ClusterQvotecPriorExitObservation exit;
+	uint64 lineage, lower;
+	bool exit_observed = false;
+
+	if (!inputs_current(inputs) || predecessor == NULL || writer == NULL
+		|| writer->claim.identity.origin_node_id != cluster_node_id
+		|| writer->claim.identity.origin_owner_incarnation == 0
+		|| writer->claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation()
+		|| predecessor->claim.identity.origin_node_id != cluster_node_id
+		|| predecessor->claim.identity.origin_owner_incarnation == 0
+		|| predecessor->claim.identity.origin_owner_incarnation
+			   == writer->claim.identity.origin_owner_incarnation
+		|| cluster_wal_inputs_revalidate_v1(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return false;
+	for (uint32 i = 0; i < inputs->count; i++) {
+		const ClusterWalInputV1 *item = &inputs->items[i];
+		if (item->current && inputs_source_selected(writer, &item->source))
+			current = item;
+		if (!item->current && inputs_source_selected(predecessor, &item->source))
+			old = item;
+	}
+	if (current == NULL || old == NULL || current->kind != CLUSTER_WAL_INPUT_CHECKPOINT
+		|| current->checkpoint.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
+		return false;
+	/* This alternative was constructed only by the original selected
+	 * initializer-terminal consumer, which validates durable isolation and
+	 * closure. A terminal is never inferred from an absent checkpoint. */
+	if (old->kind == CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL)
+		return old->terminal.checkpoint_records == 0 && old->terminal.unsupported_records == 0;
+	lineage = current->source.claim.identity.root_lineage_seq;
+	lower = old->source.claim.identity.root_lineage_seq;
+	if (lower == 0 || lower >= lineage || lineage - lower > inputs->count)
+		return false;
+	/* Native INSTALL atomically selects the successor and retains the full
+	 * CLOSED predecessor union after consuming the original clean exit.
+	 * Anchor that chain at the actual prior-exit witness for this boot; no
+	 * numeric boot comparison or unselected archival file is a proof. */
+	while (lineage > lower) {
+		const ClusterWalInputV1 *parent = NULL;
+		lineage--;
+		for (uint32 i = 0; i < inputs->count; i++) {
+			const ClusterWalInputV1 *item = &inputs->items[i];
+			if (item->current || item->kind != CLUSTER_WAL_INPUT_CHECKPOINT
+				|| item->source.claim.identity.origin_node_id != cluster_node_id
+				|| item->source.claim.identity.root_lineage_seq != lineage)
+				continue;
+			if (parent != NULL)
+				return false;
+			parent = item;
+		}
+		if (parent == NULL || parent->checkpoint.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+			|| parent->checkpoint.checkpoint_source_kind
+				   != CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1
+			|| (lineage == lower && parent != old))
+			return false;
+		if (!exit_observed) {
+			if (!cluster_qvotec_prior_exit_observe(
+					cluster_node_id, parent->source.claim.identity.origin_owner_incarnation,
+					writer->claim.identity.origin_owner_incarnation, &exit))
+				return false;
+			exit_observed = true;
+		}
+	}
+	return exit_observed && inputs_current(inputs);
+}
 static void
 inputs_unlock(WalInputsWork *work)
 {

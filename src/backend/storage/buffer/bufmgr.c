@@ -86,6 +86,7 @@
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_wal_inputs.h"
 #include "cluster/storage/cluster_smgr.h"
 
 /*
@@ -11442,7 +11443,8 @@ cluster_pi_ack_local_writer(ClusterWalWriterToken *out)
 bool
 cluster_bufmgr_ack_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 								 const RfPageOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
-								 uint32 source_count, ClusterPiPhysicalAckV1 **out)
+								 uint32 source_count, ClusterWalInputsV1 *inputs,
+								 ClusterPiPhysicalAckV1 **out)
 {
 	ClusterWalWriterToken writer, after;
 	ClusterPcmPiWriteCutV1 x_cut;
@@ -11468,10 +11470,12 @@ cluster_bufmgr_ack_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 		const ClusterWalSourceRef *source = &sources[i];
 		if (source->claim.identity.origin_node_id != cluster_node_id)
 			continue;
-		/* Current memory cannot answer for a prior incarnation. Even an
-		 * absent buffer or a CLOSED root is not old-process retirement. */
+		/* Current memory cannot answer for a prior incarnation. Require
+		 * the original retirement owner and exact retained predecessor set;
+		 * absence or a CLOSED record alone is insufficient. */
 		if (source->claim.identity.origin_owner_incarnation
-			!= writer.ref.claim.identity.origin_owner_incarnation)
+				!= writer.ref.claim.identity.origin_owner_incarnation
+			&& !cluster_wal_inputs_local_predecessor_retired_v1(inputs, source, &writer.ref))
 			return false;
 		if (cluster_page_data_source_covered_by(&writer.ref, source))
 			found = true;
