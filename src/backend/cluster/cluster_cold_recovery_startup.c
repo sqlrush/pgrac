@@ -40,6 +40,7 @@
 #include "access/xlogreader.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_control_root.h"
+#include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_wal_tail.h"
@@ -369,14 +370,6 @@ cluster_cold_typed_ready_v1(const ClusterColdTypedV1 *typed,
 	return reason[0] == '\0';
 }
 
-ClusterColdPageActionV1
-cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own)
-{
-	if (step == NULL || !step->all_skip)
-		return CLUSTER_COLD_PAGE_APPLY;
-	return own ? CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID : CLUSTER_COLD_PAGE_SKIP;
-}
-
 bool
 cluster_cold_checksum_proves_content_v1(bool checksums_enabled, bool ignore_checksum_failure)
 {
@@ -460,6 +453,22 @@ cluster_cold_redo_block_decision_v1(XLogReaderState *record, uint8 block_id,
 	out->expected_before = block->expected_before;
 	out->result = block->result;
 	return true;
+}
+
+/*
+ * The native consumer reads this record's verdicts when it begins and
+ * ends, so the step is published first and withdrawn last.  Any refusal
+ * inside ends the startup process; nothing here needs unwinding.
+ */
+void
+cluster_cold_apply_step_v1(const ClusterColdStepV1 *step, XLogReaderState *record,
+						   ClusterColdApplyRecordV1 apply, void *arg)
+{
+	cluster_cold_redo_step_enter_v1(step);
+	cluster_page_cold_redo_begin_v1(record);
+	apply(record, arg);
+	cluster_page_cold_redo_end_v1(record);
+	cluster_cold_redo_step_leave_v1();
 }
 
 #endif /* USE_PGRAC_CLUSTER */

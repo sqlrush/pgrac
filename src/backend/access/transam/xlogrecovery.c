@@ -3160,20 +3160,17 @@ cluster_recovery_typed_begin(ClusterRecoveryFencePlan **fence_plan)
 	return typed;
 }
 
-/* Pass-2 cursor over every participant of one sealed typed plan. */
+/* Pass-2 adapter: native readers and redo for the pure sequencer. */
 typedef struct ClusterColdTypedReplay
 {
 	ClusterColdTypedV1 *typed;
 	ClusterRecoveryFencePlan **fence_plan;
 	TimeLineID *replayTLI;
 	ClusterColdReaderV1 *readers[CLUSTER_COLD_MAX_PARTICIPANTS];
-	uint64		consumed[CLUSTER_COLD_MAX_PARTICIPANTS];
-	XLogRecPtr	last_end[CLUSTER_COLD_MAX_PARTICIPANTS];
-	XLogRecPtr	own_read;
-	XLogRecPtr	own_end;
+	XLogReaderState *current[CLUSTER_COLD_MAX_PARTICIPANTS];
+	char	   *errormsg[CLUSTER_COLD_MAX_PARTICIPANTS];
 	bool		foreign_mutation_started;
-	uint64		pages_skipped;
-	uint64		pages_applied;
+	bool		apply_foreign;	/* the record being applied is another generation's */
 	ClusterColdDecodedV1 decoded;	/* scratch for unscheduled records */
 } ClusterColdTypedReplay;
 
@@ -3212,17 +3209,36 @@ cluster_typed_replay_foreign_gate(ClusterColdTypedReplay *rep)
 	rep->foreign_mutation_started = true;
 }
 
+/* Native redo of the current record; the caller sets apply_foreign. */
 static void
-cluster_typed_replay_consumed(ClusterColdTypedReplay *rep, uint32 participant,
-							  XLogReaderState *r, bool is_own)
+cluster_typed_replay_apply(XLogReaderState *r, void *arg)
 {
-	rep->consumed[participant]++;
-	rep->last_end[participant] = r->EndRecPtr;
-	if (is_own)
-	{
-		rep->own_read = r->ReadRecPtr;
-		rep->own_end = r->EndRecPtr;
-	}
+	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *) arg;
+
+	cluster_recovery_merge_set_scn(r->record->header.xl_scn);
+	cluster_recovery_merge_set_apply_foreign(rep->apply_foreign);
+	ApplyWalRecord(r, &r->record->header, rep->replayTLI);
+	cluster_recovery_merge_set_apply_foreign(false);
+}
+
+static bool
+cluster_typed_replay_next(void *arg, uint32 participant, ClusterColdReplayRecordV1 *out)
+{
+	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *) arg;
+	XLogReaderState *r;
+
+	HandleStartupProcInterrupts();
+	rep->current[participant] = NULL;
+	r = cluster_cold_reader_next_v1(rep->readers[participant], &rep->errormsg[participant]);
+	if (r == NULL)
+		return false;
+	rep->current[participant] = r;
+	out->read_rec_ptr = r->ReadRecPtr;
+	out->end_rec_ptr = r->EndRecPtr;
+	out->record_crc = (uint32) r->record->header.xl_crc;
+	out->rmid = r->record->header.xl_rmid;
+	out->info = r->record->header.xl_info;
+	return true;
 }
 
 /*
@@ -3232,14 +3248,14 @@ cluster_typed_replay_consumed(ClusterColdTypedReplay *rep, uint32 participant,
  * generation's rebuildable FSM-only page record; anything else means pass 1
  * saw other input.
  */
-static void
-cluster_typed_replay_nonpage(ClusterColdTypedReplay *rep, uint32 participant,
-							 XLogReaderState *r)
+static bool
+cluster_typed_replay_unscheduled(void *arg, uint32 participant)
 {
+	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *) arg;
 	ClusterColdTypedV1 *typed = rep->typed;
 	const ClusterWalSourceRef *source = &typed->sources[participant];
 	bool		is_own = participant == typed->own_participant;
-	XLogRecord *rec = &r->record->header;
+	XLogReaderState *r = rep->current[participant];
 
 	if (cluster_cold_recovery_decode_v1(r, typed->system_identifier,
 										source->claim.identity.storage_uuid, false, !is_own,
@@ -3252,31 +3268,24 @@ cluster_typed_replay_nonpage(ClusterColdTypedReplay *rep, uint32 participant,
 		  CLUSTER_COLD_RECORD_SIDE_UNOWNED)) != 0)
 		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
 									  "a record pass 1 would have refused reached replay");
-	cluster_typed_replay_consumed(rep, participant, r, is_own);
 	if (!is_own)
 		cluster_typed_replay_foreign_gate(rep);
-	cluster_recovery_merge_set_scn(rec->xl_scn);
-	cluster_recovery_merge_set_apply_foreign(!is_own);
-	ApplyWalRecord(r, rec, rep->replayTLI);
-	cluster_recovery_merge_set_apply_foreign(false);
+	rep->apply_foreign = !is_own;
+	cluster_typed_replay_apply(r, rep);
 	if (!is_own)
 		cluster_vis_bump_merged_records_applied();
+	return true;
 }
 
-/* One scheduled page record, matched exactly against its pass-1 identity. */
-static void
-cluster_typed_replay_page(ClusterColdTypedReplay *rep, uint32 participant, XLogReaderState *r,
-						  const ClusterColdStepV1 *step)
+/* One scheduled page record, already matched to its pass-1 identity. */
+static bool
+cluster_typed_replay_scheduled(void *arg, uint32 participant, const ClusterColdStepV1 *step,
+							   ClusterColdPageActionV1 action)
 {
-	bool		is_own = participant == rep->typed->own_participant;
+	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *) arg;
+	XLogReaderState *r = rep->current[participant];
 
-	if (r->EndRecPtr != step->end_rec_ptr ||
-		(uint32) r->record->header.xl_crc != step->record_crc ||
-		r->record->header.xl_rmid != step->rmid || r->record->header.xl_info != step->info)
-		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
-									  "the scheduled record identity differs");
-	cluster_typed_replay_consumed(rep, participant, r, is_own);
-	switch (cluster_cold_page_action_v1(step, is_own))
+	switch (action)
 	{
 		case CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID:
 
@@ -3285,84 +3294,74 @@ cluster_typed_replay_page(ClusterColdTypedReplay *rep, uint32 participant, XLogR
 			 * be behind nextXid, exactly as replaying it would have left it.
 			 */
 			AdvanceNextFullTransactionIdPastXid(r->record->header.xl_xid);
-			rep->pages_skipped++;
-			return;
+			return true;
 		case CLUSTER_COLD_PAGE_SKIP:
-			rep->pages_skipped++;
-			return;
+			return true;
 		case CLUSTER_COLD_PAGE_APPLY:
 			break;
 	}
 #ifdef CLUSTER_COLD_REDO_HOOK_CONSUMER_V1
-	if (!is_own)
+	rep->apply_foreign = participant != rep->typed->own_participant;
+	if (rep->apply_foreign)
 		cluster_typed_replay_foreign_gate(rep);
-	cluster_cold_redo_step_enter_v1(step);
-	cluster_recovery_merge_set_scn(r->record->header.xl_scn);
-	cluster_recovery_merge_set_apply_foreign(!is_own);
-	ApplyWalRecord(r, &r->record->header, rep->replayTLI);
-	cluster_recovery_merge_set_apply_foreign(false);
-	cluster_cold_redo_step_leave_v1();
-	rep->pages_applied++;
+	cluster_cold_apply_step_v1(step, r, cluster_typed_replay_apply, rep);
+	return true;
 #else
 	ereport(FATAL,
 			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
 			 errmsg("typed cold recovery cannot apply page record %X/%X of thread %u",
-					LSN_FORMAT_ARGS(r->ReadRecPtr),
+					LSN_FORMAT_ARGS(step->read_rec_ptr),
 					(unsigned) rep->typed->participants[participant].thread_id),
 			 errdetail("This build has no per-block typed redo consultation; applying the "
 					   "record through the freshness checks could skip or overwrite a newer "
 					   "page version."),
 			 errhint("Preserve all original thread WAL and start with a build that supports "
 					 "typed cold replay.")));
+	pg_unreachable();
 #endif
 }
 
-/* Read the participant up to the scheduled record, replaying what precedes it. */
-static XLogReaderState *
-cluster_typed_replay_until(ClusterColdTypedReplay *rep, uint32 participant, XLogRecPtr target)
-{
-	for (;;)
-	{
-		char	   *errormsg = NULL;
-		XLogReaderState *r;
+static const ClusterColdReplayOpsV1 cluster_typed_replay_ops = {
+	cluster_typed_replay_next,
+	cluster_typed_replay_unscheduled,
+	cluster_typed_replay_scheduled,
+};
 
-		HandleStartupProcInterrupts();
-		r = cluster_cold_reader_next_v1(rep->readers[participant], &errormsg);
-		if (r == NULL)
-			cluster_typed_replay_mismatch(rep, participant, target,
-										  errormsg != NULL ? errormsg
-										  : "the scheduled record is missing");
-		if (r->ReadRecPtr == target)
-			return r;
-		if (r->ReadRecPtr > target)
-			cluster_typed_replay_mismatch(rep, participant, target,
-										  "the scheduled record start was passed");
-		cluster_typed_replay_nonpage(rep, participant, r);
-	}
-}
-
-/* Replay the rest of one participant and prove its cut was consumed. */
+/* A sequencer stop is fatal: report it in pass-1 terms. */
 static void
-cluster_typed_replay_drain(ClusterColdTypedReplay *rep, uint32 participant)
+pg_attribute_noreturn()
+cluster_typed_replay_stopped(ClusterColdTypedReplay *rep, const ClusterColdReplayResultV1 *result)
 {
-	const ClusterColdParticipantV1 *cut = &rep->typed->participants[participant];
-	char	   *errormsg = NULL;
-	XLogReaderState *r;
+	const char *reader_error = result->participant < rep->typed->participant_count
+		? rep->errormsg[result->participant] : NULL;
 
-	while ((r = cluster_cold_reader_next_v1(rep->readers[participant], &errormsg)) != NULL)
+	switch ((ClusterColdReplayDetailV1) result->detail)
 	{
-		HandleStartupProcInterrupts();
-		if (r->EndRecPtr > cut->tail_end)
-			cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
+		case CLUSTER_COLD_REPLAY_SOURCE_ENDED:
+			cluster_typed_replay_mismatch(rep, result->participant, result->rec_ptr,
+										  reader_error != NULL ? reader_error
+										  : "the scheduled record is missing");
+		case CLUSTER_COLD_REPLAY_TARGET_PASSED:
+			cluster_typed_replay_mismatch(rep, result->participant, result->rec_ptr,
+										  "the scheduled record start was passed");
+		case CLUSTER_COLD_REPLAY_IDENTITY:
+			cluster_typed_replay_mismatch(rep, result->participant, result->rec_ptr,
+										  "the scheduled record identity differs");
+		case CLUSTER_COLD_REPLAY_PAST_TAIL:
+			cluster_typed_replay_mismatch(rep, result->participant, result->rec_ptr,
 										  "a record lies past the validated tail");
-		cluster_typed_replay_nonpage(rep, participant, r);
+		case CLUSTER_COLD_REPLAY_CUT_DIFFERS:
+			cluster_typed_replay_mismatch(rep, result->participant, result->rec_ptr,
+										  reader_error != NULL ? reader_error
+										  : "the replayed cut differs from pass 1");
+		default:
+			break;
 	}
-	if (rep->last_end[participant] != cut->tail_end ||
-		rep->consumed[participant] !=
-		cluster_cold_plan_replay_record_count_v1(rep->typed->plan, participant))
-		cluster_typed_replay_mismatch(rep, participant, rep->last_end[participant],
-									  errormsg != NULL ? errormsg
-									  : "the replayed cut differs from pass 1");
+	ereport(FATAL,
+			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+			 errmsg("typed cold recovery pass 2 stopped at step %u (detail %u)",
+					result->steps_done, (unsigned) result->detail)));
+	pg_unreachable();
 }
 
 /*
@@ -3384,13 +3383,13 @@ cluster_typed_replay_publish(ClusterColdTypedReplay *rep)
 
 /* Pin progress to the own stream, publish completion and release. */
 static void
-cluster_typed_replay_finish(ClusterColdTypedReplay *rep)
+cluster_typed_replay_finish(ClusterColdTypedReplay *rep, const ClusterColdReplayResultV1 *result)
 {
-	if (rep->own_read != InvalidXLogRecPtr)
+	if (result->own_read != InvalidXLogRecPtr)
 	{
 		SpinLockAcquire(&XLogRecoveryCtl->info_lck);
-		XLogRecoveryCtl->lastReplayedReadRecPtr = rep->own_read;
-		XLogRecoveryCtl->lastReplayedEndRecPtr = rep->own_end;
+		XLogRecoveryCtl->lastReplayedReadRecPtr = result->own_read;
+		XLogRecoveryCtl->lastReplayedEndRecPtr = result->own_end;
 		XLogRecoveryCtl->lastReplayedTLI = *rep->replayTLI;
 		SpinLockRelease(&XLogRecoveryCtl->info_lck);
 	}
@@ -3418,11 +3417,12 @@ cluster_typed_replay_finish(ClusterColdTypedReplay *rep)
 /*
  * cluster_recovery_typed_replay -- typed cold replay pass 2.
  *
- *	Steps follow the sealed schedule.  Before each scheduled page record its
- *	participant's preceding records (no page versions) are replayed in
- *	order; afterwards every participant is drained to its validated tail.
- *	Each page record must match its pass-1 identity, and each participant
- *	must replay exactly the records pass 1 saw after its native redo.
+ *	cluster_cold_replay_run_v1 sequences the sealed schedule over one native
+ *	reader per participant: records before each scheduled page record
+ *	replay in stream order, each scheduled record must match its pass-1
+ *	identity, and every participant must end at its validated tail with
+ *	exactly the records pass 1 counted.  Applied page records run inside
+ *	their published step and the native block consumer's bracket.
  */
 static XLogRecPtr
 cluster_recovery_typed_replay(ClusterColdTypedV1 **typed_address, TimeLineID *replayTLI,
@@ -3430,7 +3430,7 @@ cluster_recovery_typed_replay(ClusterColdTypedV1 **typed_address, TimeLineID *re
 {
 	ClusterColdTypedV1 *typed = *typed_address;
 	ClusterColdTypedReplay *rep = palloc0(sizeof(*rep));
-	uint32		steps = cluster_cold_plan_step_count_v1(typed->plan);
+	ClusterColdReplayResultV1 result;
 	uint32		i;
 	XLogRecPtr	own_end;
 
@@ -3445,37 +3445,25 @@ cluster_recovery_typed_replay(ClusterColdTypedV1 **typed_address, TimeLineID *re
 		if (rep->readers[i] == NULL)
 			cluster_typed_replay_mismatch(rep, i, typed->participants[i].native_redo,
 										  "the selected source cannot be opened");
-		rep->last_end[i] = typed->participants[i].native_redo;
 	}
 	cluster_cold_replay_window_enter_v1();
 	cluster_recovery_merge_window_enter();
 	cluster_recovery_merge_set_own_lsn((uint64) typed->participants[typed->own_participant].native_redo);
-	for (i = 0; i < steps; i++)
-	{
-		ClusterColdStepV1 step;
-		XLogReaderState *r;
-
-		if (!cluster_cold_plan_step_v1(typed->plan, i, &step) ||
-			step.participant >= typed->participant_count)
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-					 errmsg("typed cold recovery plan step %u is unusable", i)));
-		r = cluster_typed_replay_until(rep, step.participant, step.read_rec_ptr);
-		cluster_typed_replay_page(rep, step.participant, r, &step);
-	}
-	for (i = 0; i < typed->participant_count; i++)
-		cluster_typed_replay_drain(rep, i);
+	if (cluster_cold_replay_run_v1(typed->plan, typed->participants, typed->participant_count,
+								   typed->own_participant, &cluster_typed_replay_ops, rep,
+								   &result) != CLUSTER_COLD_REPLAY_OK)
+		cluster_typed_replay_stopped(rep, &result);
 	cluster_recovery_merge_window_leave();
 	for (i = 0; i < typed->participant_count; i++)
 		cluster_cold_reader_close_v1(&rep->readers[i]);
-	cluster_typed_replay_finish(rep);
+	cluster_typed_replay_finish(rep, &result);
 	cluster_cold_replay_window_leave_v1();
 	ereport(LOG,
 			(errmsg("cluster typed cold recovery: replay complete (own thread %u)",
 					(unsigned) typed->participants[typed->own_participant].thread_id),
 			 errdetail_log(UINT64_FORMAT " page records skipped, " UINT64_FORMAT " applied.",
-						   rep->pages_skipped, rep->pages_applied)));
-	own_end = rep->own_end;
+						   result.pages_skipped, result.pages_applied)));
+	own_end = result.own_end;
 	pfree(rep);
 	cluster_cold_typed_destroy_v1(typed_address);
 	return own_end;

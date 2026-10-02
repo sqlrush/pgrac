@@ -1152,6 +1152,12 @@ cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 index, ClusterCo
 	return true;
 }
 
+uint32
+cluster_cold_plan_participant_count_v1(const ClusterColdPlanV1 *plan)
+{
+	return plan_valid(plan) && plan->phase == COLD_PHASE_SEALED ? plan->participant_count : 0;
+}
+
 uint64
 cluster_cold_plan_replay_record_count_v1(const ClusterColdPlanV1 *plan, uint32 participant)
 {
