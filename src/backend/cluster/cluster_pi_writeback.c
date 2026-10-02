@@ -17,6 +17,7 @@
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_thread.h"
 #include "miscadmin.h"
+#include "postmaster/bgwriter.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
 #include "storage/shmem.h"
@@ -789,13 +790,16 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			goto invalid;
 	}
-	if (cluster_wal_inputs_revalidate_v1(wb_notice->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	result = cluster_wal_inputs_resume_v1(wb_notice->inputs);
+	if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
+		goto wait;
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto invalid;
 	if (wb_notice->plan == NULL) {
 		result = cluster_wal_inputs_contributions_v1(wb_notice->inputs, true, &wb_notice->plan,
 													 &records, &detail);
 		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
-			return true;
+			goto wait;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			goto invalid;
 	}
@@ -827,6 +831,9 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 		goto invalid;
 	wb_server_finish(&reply);
 	return true;
+wait:
+	if (cluster_wal_inputs_suspend_v1(wb_notice->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return true;
 invalid:
 	wb_server_finish(NULL);
 	return true;
@@ -933,6 +940,7 @@ wb_batch_data(void)
 			}
 		}
 		wb_batch->data_index++;
+		AbsorbSyncRequests();
 	}
 	return true;
 }
@@ -999,6 +1007,15 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 		goto done;
 	if (!wb_batch_data())
 		return true;
+	/* Poll a peer's in-memory reply before resuming any WAL input. A silent
+	 * or busy peer must leave the GC writer a real lock-free interval. */
+	if (wb_batch->physical_job != NULL) {
+		result = cluster_pi_writeback_poll_v1(wb_batch->physical_job);
+		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
+			goto wait;
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			goto done;
+	}
 	if (wb_batch->inputs == NULL) {
 		result = cluster_wal_inputs_begin_v1(wb_batch->local.claim.identity.storage_uuid,
 											 wb_batch->local.claim.identity.system_identifier,
@@ -1008,7 +1025,10 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			goto done;
 	}
-	if (cluster_wal_inputs_revalidate_v1(wb_batch->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	result = cluster_wal_inputs_resume_v1(wb_batch->inputs);
+	if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
+		goto wait;
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	if (wb_batch->plan == NULL) {
 		uint64 records;
@@ -1016,7 +1036,7 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 		result = cluster_wal_inputs_contributions_v1(wb_batch->inputs, true, &wb_batch->plan,
 													 &records, &detail);
 		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
-			return true;
+			goto wait;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			|| !wb_plan_sources(wb_batch->plan, wb_batch->sources, &wb_batch->source_count))
 			goto done;
@@ -1026,6 +1046,7 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 			ClusterPcmPiStorageCutV1 s;
 			if (wb_batch->storage_cuts[i].binding_generation != 0)
 				(void)wb_batch_storage(i, page);
+			AbsorbSyncRequests();
 			wb_batch->qualified[i]
 				= wb_batch->receipts[i] != NULL
 				  && (cluster_page_data_pi_proof_v1(wb_batch->receipts[i], page, wb_batch->sources,
@@ -1073,13 +1094,13 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 			result = cluster_pi_writeback_begin_v1(receipts, wb_batch->group_count, &peer,
 												   &wb_batch->physical_job);
 			if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
-				return true;
+				goto wait;
 			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 				goto done;
 		}
 		result = cluster_pi_writeback_poll_v1(wb_batch->physical_job);
 		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
-			return true;
+			goto wait;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			goto done;
 		for (uint32 j = 0; j < wb_batch->group_count; j++) {
@@ -1110,6 +1131,11 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 				(const ClusterPiPhysicalAckV1 *const *)wb_batch->acks[i], wb_batch->ack_count[i],
 				&holders);
 	}
+	goto done;
+wait:
+	if (wb_batch->inputs == NULL
+		|| cluster_wal_inputs_suspend_v1(wb_batch->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return true;
 done:
 	cluster_pi_writeback_checkpointer_release_v1();
 	return true;

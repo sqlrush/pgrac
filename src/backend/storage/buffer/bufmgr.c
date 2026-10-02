@@ -10621,7 +10621,7 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 	ClusterPcmPiWriteCutV1 write_cut = { 0 };
 	ClusterPageDataTargetV1 written_target;
 	ClusterWalSourceRef source, current;
-	ClusterPageWalBindingV1 binding;
+	ClusterPageWalBindingV1 binding, reobserved;
 	ClusterSpaceIdentityKey key;
 	ClusterSpaceIdentity space_identity;
 	ClusterPcmOwnSnapshot space_owner, data_owner, live;
@@ -10630,6 +10630,7 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 	BufferDesc *volatile data = NULL;
 	ErrorContextCallback *saved_context = error_context_stack;
 	volatile bool io_started = false;
+	volatile bool data_locked = false;
 	volatile bool complete = false;
 	PGAlignedBlock expected, disk;
 	uint64 space_token;
@@ -10685,6 +10686,7 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 						   != 0))
 				break;
 			data = cluster_page_data_try_hold(data_tag, true, &data_owner);
+			data_locked = data != NULL;
 			if (data == NULL
 				|| (cut != NULL
 					&& data_owner.generation != write_cut.holder.requester_target_generation)
@@ -10723,6 +10725,11 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 				|| !cluster_pcm_own_fence_equal_exact(&data_owner, &live)
 				|| (live.semantic_buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0)
 				break;
+			/* The native write consumed a stable snapshot. Keep the raw pin
+			 * and SPACE identity owner, but let foreground current writers run
+			 * during fork fsync/readback. Reacquire without waiting below. */
+			LWLockRelease(BufferDescriptorGetContentLock(data));
+			data_locked = false;
 			smgrimmedsync(rel, target->identity.forknum);
 			smgrread(rel, target->identity.forknum, target->identity.blockno, disk.data);
 			/* Never let ignore_checksum_failure qualify physical DATA. Check
@@ -10735,9 +10742,15 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 				break;
 			header->pd_checksum = ((PageHeader)disk.data)->pd_checksum = 0;
 			if (memcmp(expected.data, disk.data, BLCKSZ) != 0
-				|| !cluster_page_data_holder_ready(data, &data_tag, true, &live)
+				|| !LWLockConditionalAcquire(BufferDescriptorGetContentLock(data), LW_SHARED))
+				break;
+			data_locked = true;
+			if (!cluster_page_data_holder_ready(data, &data_tag, true, &live)
 				|| !cluster_pcm_own_fence_equal_exact(&data_owner, &live)
 				|| (live.semantic_buf_state & (BM_DIRTY | BM_JUST_DIRTIED)) != 0
+				|| !cluster_page_wal_read_v1(BufferDescriptorGetBuffer(data), &space_identity,
+											 &reobserved)
+				|| !cluster_page_wal_same_mutation_v1(&binding, &reobserved)
 				|| !cluster_page_data_holder_ready(space, &space_tag, false, &live)
 				|| !cluster_pcm_own_fence_equal_exact(&space_owner, &live)
 				|| !cluster_wal_thread_current_v2_ref(&current)
@@ -10753,9 +10766,11 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 			AbortBufferIO(BufferDescriptorGetBuffer(data));
 		if (data != NULL) {
 			/* elog(ERROR) reset holdoffs, but these exact locks remain ours. */
-			if (InterruptHoldoffCount == 0)
-				HOLD_INTERRUPTS();
-			LWLockRelease(BufferDescriptorGetContentLock(data));
+			if (data_locked) {
+				if (InterruptHoldoffCount == 0)
+					HOLD_INTERRUPTS();
+				LWLockRelease(BufferDescriptorGetContentLock(data));
+			}
 			cluster_bufmgr_unpin_for_gcs(data);
 		}
 		if (space != NULL) {
@@ -11315,6 +11330,27 @@ cluster_pi_physical_unfenced_locked(BufferDesc *buf, uint32 state)
 		   && cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0;
 }
 
+static bool
+cluster_page_data_covers_missing_pi(const ClusterPageDataReceiptV1 *receipt,
+									const RfPageOnlinePlanV1 *plan,
+									const ClusterWalSourceRef *sources, uint32 source_count)
+{
+	ClusterPageWalBindingV1 terminal, original = receipt->wal;
+
+	/* Without the old physical binding there is no exact PI to look up.
+	 * Require DATA to cover every possible ancestor in the complete sealed
+	 * chain. A newer contribution makes ABSENT/REPLACED retry too; absence
+	 * cannot certify a successor that was never written by this receipt. */
+	if (!cluster_page_data_terminal_binding(&receipt->target, plan, sources, source_count,
+											&terminal)
+		|| !cluster_page_data_source_covered_by(&original.source, &terminal.source))
+		return false;
+	/* Only this qualified contribution join can use a later decoder ceiling.
+	 * The sealed source and the original native writer remain immutable. */
+	original.source = terminal.source;
+	return cluster_page_wal_same_mutation_v1(&terminal, &original);
+}
+
 ClusterPiPhysicalResultV1
 cluster_bufmgr_discard_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 									 const RfPageOnlinePlanV1 *plan,
@@ -11346,7 +11382,9 @@ cluster_bufmgr_discard_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 	id = BufTableLookup(&tag, hash);
 	if (id < 0) {
 		LWLockRelease(partition);
-		return CLUSTER_PI_PHYSICAL_ABSENT;
+		return cluster_page_data_covers_missing_pi(receipt, plan, sources, source_count)
+				   ? CLUSTER_PI_PHYSICAL_ABSENT
+				   : result;
 	}
 	buf = GetBufferDescriptor(id);
 	state = LockBufHdr(buf);
@@ -11355,7 +11393,9 @@ cluster_bufmgr_discard_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 	if (valid && cluster_bufmgr_pcm_current_image_locked(buf, state)) {
 		UnlockBufHdr(buf, state);
 		LWLockRelease(partition);
-		return CLUSTER_PI_PHYSICAL_REPLACED;
+		return cluster_page_data_covers_missing_pi(receipt, plan, sources, source_count)
+				   ? CLUSTER_PI_PHYSICAL_REPLACED
+				   : result;
 	}
 	valid = valid && cluster_page_wal_pi_snapshot_locked_v1(buf, &pi);
 	UnlockBufHdr(buf, state);

@@ -23,7 +23,9 @@ typedef struct ClusterPageDataReceiptV1 ClusterPageDataReceiptV1;
 
 /* Background write endpoint, with no caller buffer locks. Borrows only a
  * resident, unfenced current-X; resident SPACE0 stays locked across write,
- * fsync and exact post-read. Busy/missing/stale returns false, never takes
+ * fsync and exact post-read; DATA content is unlocked after the native write
+ * and reacquired conditionally to verify the same WAL/version after readback.
+ * Busy/missing/stale returns false, never takes
  * ownership or creates storage. The exact native WAL binding must name the
  * selected local writer generation or carry its original writer's native
  * flush certification. A receiver's thread id/LSN cannot certify foreign WAL.

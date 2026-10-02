@@ -44,6 +44,17 @@ static ClusterICSendResult wb_send_result = CLUSTER_IC_SEND_DONE;
 static bool wb_candidates;
 static unsigned wb_master_completions;
 static ClusterWalInputV1 wb_inputs[3];
+static bool wb_inputs_pinned[3], wb_resume_wait;
+static unsigned wb_resumes;
+static unsigned wb_absorbs;
+
+void
+AbsorbSyncRequests(void)
+{
+	UT_ASSERT_EQ(MyBackendType, B_CHECKPOINTER);
+	UT_ASSERT(!locks[0] && !locks[1]);
+	wb_absorbs++;
+}
 
 uint32
 cluster_pcm_lock_pi_candidates_v1(uint32 *cursor, uint32 budget, BufferTag *tags, uint32 capacity)
@@ -229,6 +240,7 @@ ClusterControlRootResult
 cluster_wal_inputs_begin_v1(const uint8 uuid[16], uint64 sysid, ClusterWalInputsV1 **out)
 {
 	UT_ASSERT(MyBackendType == B_BG_WRITER || MyBackendType == B_CHECKPOINTER);
+	wb_inputs_pinned[cluster_node_id] = true;
 	*out = (void *)1;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
@@ -245,13 +257,30 @@ cluster_wal_inputs_at_v1(ClusterWalInputsV1 *inputs, uint32 index)
 ClusterControlRootResult
 cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
 {
-	return wb_input_current ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	return wb_input_current && wb_inputs_pinned[cluster_node_id] ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+																 : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+ClusterControlRootResult
+cluster_wal_inputs_suspend_v1(ClusterWalInputsV1 *inputs)
+{
+	wb_inputs_pinned[cluster_node_id] = false;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+ClusterControlRootResult
+cluster_wal_inputs_resume_v1(ClusterWalInputsV1 *inputs)
+{
+	wb_resumes++;
+	if (wb_resume_wait)
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	wb_inputs_pinned[cluster_node_id] = true;
+	return cluster_wal_inputs_revalidate_v1(inputs);
 }
 ClusterControlRootResult
 cluster_wal_inputs_contributions_v1(ClusterWalInputsV1 *inputs, bool space_active,
 									ClusterThreadRecoveryFabricPlanV1 **out, uint64 *records,
 									RfPageProofDetailV1 *detail)
 {
+	UT_ASSERT(wb_inputs_pinned[cluster_node_id]);
 	*out = NULL;
 	*records = 0;
 	*detail = RF_PAGE_PROOF_DETAIL_OK;
@@ -265,6 +294,7 @@ cluster_wal_inputs_contributions_v1(ClusterWalInputsV1 *inputs, bool space_activ
 void
 cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 {
+	wb_inputs_pinned[cluster_node_id] = false;
 	if (*inputs != NULL)
 		wb_input_releases++;
 	*inputs = NULL;
@@ -322,6 +352,10 @@ wb_setup(void)
 	wb_stop = wb_input_wait = false;
 	wb_send_result = CLUSTER_IC_SEND_DONE;
 	wb_plan_builds = wb_input_releases = wb_sends = 0;
+	memset(wb_inputs_pinned, 0, sizeof(wb_inputs_pinned));
+	wb_resumes = 0;
+	wb_absorbs = 0;
+	wb_resume_wait = false;
 	wb_master_completions = 0;
 	wb_candidates = false;
 	wb_page_plan = prepare_storage_observation(wb_sources, &wb_storage_cut);
@@ -589,9 +623,21 @@ UT_TEST(checkpointer_batch_reaches_actual_local_and_remote_physical_owners)
 	UT_ASSERT_EQ(wb_plan_builds, 1);
 	UT_ASSERT_EQ(wb_master_completions, 0);
 	UT_ASSERT_EQ(wb_input_releases, 0);
+	UT_ASSERT(wb_absorbs > 0);
 	wb_select(0, B_LMON);
 	cluster_pi_writeback_lmon_tick_v1();
 	UT_ASSERT_EQ(wb_destination, 1);
+	wb_select(0, B_CHECKPOINTER);
+	UT_ASSERT(!wb_inputs_pinned[0]);
+	{
+		unsigned before = wb_resumes;
+		for (int i = 0; i < 100; i++) {
+			UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+			UT_ASSERT(!wb_inputs_pinned[0]);
+		}
+		UT_ASSERT_EQ(wb_resumes, before);
+		UT_ASSERT_EQ(wb_plan_builds, 1);
+	}
 	/* Switch the physical fixture from A's discarded descriptor to B's
 	 * independently resident PI; A's real invalidation cleared its tag. */
 	InitBufferTag(&descriptors[1].bufferdesc.tag, &target.identity.locator, target.identity.forknum,
@@ -605,6 +651,11 @@ UT_TEST(checkpointer_batch_reaches_actual_local_and_remote_physical_owners)
 	cluster_pi_writeback_lmon_tick_v1();
 	wb_deliver(1, 0, wb_wire, wb_length);
 	wb_select(0, B_CHECKPOINTER);
+	wb_resume_wait = true;
+	UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+	UT_ASSERT_EQ(wb_master_completions, 0);
+	UT_ASSERT(!wb_inputs_pinned[0]);
+	wb_resume_wait = false;
 	UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
 	UT_ASSERT_EQ(wb_plan_builds, 2);
 	UT_ASSERT_EQ(wb_input_releases, 2);

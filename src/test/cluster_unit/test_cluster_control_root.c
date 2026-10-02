@@ -19131,6 +19131,15 @@ UT_TEST(test_config_poll_requires_background_role_and_preserves_aliased_input)
  * anchor, history and physical WAL use actual files and production readers.
  * test_cluster_wal_writer separately executes the actual native owner. */
 static bool inputs_pin_held, inputs_pin_current;
+static unsigned inputs_absorbs;
+void AbsorbSyncRequests(void);
+void
+AbsorbSyncRequests(void)
+{
+	UT_ASSERT_EQ(MyBackendType, B_CHECKPOINTER);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	inputs_absorbs++;
+}
 static bool inputs_pin_refuse, inputs_pin_race, inputs_pin_throw;
 static uint16 inputs_pin_threads[128], inputs_pin_count;
 static ClusterWalWriterToken inputs_native_writer;
@@ -19345,6 +19354,7 @@ inputs_fixture(uint8 bytes[66048], ClusterRecoveryAnchorV2 anchors[2])
 	test_cf_grant = test_cf_release_confirmed = true;
 	inputs_pin_held = inputs_pin_refuse = inputs_pin_race = inputs_pin_throw = false;
 	inputs_native_begin_calls = inputs_native_flush_calls = 0;
+	inputs_absorbs = 0;
 	inputs_native_wait = inputs_native_recovery = inputs_native_reconfigured = false;
 	inputs_peer_result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 	inputs_peer_begins = inputs_peer_releases = 0;
@@ -19582,6 +19592,9 @@ UT_TEST(test_wal_inputs_live_accepted_cut_never_expands_during_plan_build)
 	test_insert += XLOG_BLCKSZ;
 	inputs_native_flush.complete_end += XLOG_BLCKSZ;
 	inputs_native_flush.flushed_end = inputs_native_flush.complete_end;
+	UT_ASSERT_EQ(cluster_wal_inputs_suspend_v1(inputs), 0);
+	UT_ASSERT(!inputs_pin_held);
+	UT_ASSERT_EQ(cluster_wal_inputs_resume_v1(inputs), 0);
 	UT_ASSERT_EQ(
 		cluster_wal_inputs_visit_live_local_v1(inputs, 0, inputs_visit_record, &visit, &out), 0);
 	UT_ASSERT_EQ(out.complete_end, accepted);
@@ -19619,6 +19632,9 @@ UT_TEST(test_wal_inputs_live_cut_uses_its_own_fixed_native_flush_job)
 		if (pending != 0)
 			UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
 		UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 2);
+		UT_ASSERT_EQ(cluster_wal_inputs_suspend_v1(inputs), 0);
+		UT_ASSERT(!inputs_pin_held);
+		UT_ASSERT_EQ(cluster_wal_inputs_resume_v1(inputs), 0);
 		inputs_native_wait = false;
 		inputs_native_flush.complete_end = required;
 		test_insert += XLOG_BLCKSZ; /* Later inserts cannot move this job's minimum. */
@@ -19776,8 +19792,10 @@ UT_TEST(test_wal_inputs_contributions_all_closed_or_local_live)
 		ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
 		RfPageProofDetailV1 detail;
 		uint64 records = 0;
+		MyBackendType = B_CHECKPOINTER;
 		UT_ASSERT_EQ(cluster_wal_inputs_contributions_v1(inputs, true, &plan, &records, &detail),
 					 0);
+		UT_ASSERT(inputs_absorbs > 0);
 		UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
 		UT_ASSERT(plan != NULL);
 		UT_ASSERT_EQ(records, 2);
@@ -19958,6 +19976,65 @@ UT_TEST(test_wal_inputs_claim_io_releases_cf_and_keeps_all_native_pins)
 	UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 2);
 	cluster_wal_inputs_release_v1(&inputs);
 	UT_ASSERT(inputs == NULL && !inputs_pin_held && test_actual_cf == NoLock);
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_wal_inputs_pause_releases_all_pins_and_resume_checks_original_root)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		uint8 bytes[66048];
+		ClusterRecoveryAnchorV2 anchors[2];
+		ClusterWalInputsV1 *inputs = NULL;
+		inputs_fixture(bytes, anchors);
+		UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+		UT_ASSERT_EQ(cluster_wal_inputs_suspend_v1(inputs), 0);
+		UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
+		UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 0);
+		UT_ASSERT(cluster_wal_inputs_at_v1(inputs, 0) == NULL);
+		UT_ASSERT_NE(cluster_wal_inputs_revalidate_v1(inputs), 0);
+		if (fault == 1)
+			v2_checkpoint_root_race();
+		if (fault == 2) {
+			inputs_pin_refuse = true; /* a GC-X owner now gets its turn */
+			UT_ASSERT_EQ(cluster_wal_inputs_resume_v1(inputs),
+						 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+			UT_ASSERT(!inputs_pin_held);
+			inputs_pin_refuse = false;
+		}
+		UT_ASSERT_EQ(cluster_wal_inputs_resume_v1(inputs), fault == 1
+															   ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+															   : CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(inputs_pin_held, fault != 1);
+		UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), fault == 1 ? 0 : 2);
+		cluster_wal_inputs_release_v1(&inputs);
+		UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
+		MyBackendType = B_INVALID;
+	}
+}
+
+UT_TEST(test_wal_inputs_resume_error_releases_reacquired_native_owner)
+{
+	uint8 bytes[66048];
+	ClusterRecoveryAnchorV2 anchors[2];
+	ClusterWalInputsV1 *inputs = NULL;
+	volatile bool caught = false;
+	inputs_fixture(bytes, anchors);
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+	UT_ASSERT_EQ(cluster_wal_inputs_suspend_v1(inputs), 0);
+	inputs_pin_throw = true;
+	PG_TRY();
+	{
+		(void)cluster_wal_inputs_resume_v1(inputs);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	inputs_pin_throw = false;
+	UT_ASSERT(caught && !inputs_pin_held && test_actual_cf == NoLock);
+	UT_ASSERT_NE(cluster_wal_inputs_resume_v1(inputs), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	cluster_wal_inputs_release_v1(&inputs);
 	MyBackendType = B_INVALID;
 }
 
@@ -20304,7 +20381,9 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_WAL_INPUTS") != NULL) {
-		UT_PLAN(20);
+		UT_PLAN(22);
+		UT_RUN(test_wal_inputs_pause_releases_all_pins_and_resume_checks_original_root);
+		UT_RUN(test_wal_inputs_resume_error_releases_reacquired_native_owner);
 		UT_RUN(test_wal_inputs_claim_io_releases_cf_and_keeps_all_native_pins);
 		UT_RUN(test_wal_inputs_claim_io_race_and_error_never_publish_partial_scope);
 		UT_RUN(test_wal_inputs_remote_confirmation_feeds_complete_contribution_plan);
@@ -20335,7 +20414,9 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(369);
+	UT_PLAN(371);
+	UT_RUN(test_wal_inputs_pause_releases_all_pins_and_resume_checks_original_root);
+	UT_RUN(test_wal_inputs_resume_error_releases_reacquired_native_owner);
 	UT_RUN(test_wal_inputs_claim_io_releases_cf_and_keeps_all_native_pins);
 	UT_RUN(test_wal_inputs_claim_io_race_and_error_never_publish_partial_scope);
 	UT_RUN(test_wal_inputs_remote_confirmation_feeds_complete_contribution_plan);

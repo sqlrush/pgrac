@@ -114,6 +114,7 @@ cluster_pi_data_read_v1(const ClusterPiDataV1 *job, ClusterPageWalBindingV1 *bin
 static unsigned pi_discards;
 static int pi_discard_race;
 static int throw_at;
+static int concurrent_sync;
 static unsigned writes, syncs, reads, wal_flushes, aborts;
 static XLogRecPtr local_insert_end;
 static FILE *file;
@@ -446,10 +447,29 @@ smgrwrite(SMgrRelation r, ForkNumber f, BlockNumber b, const void *data, bool sk
 void
 smgrimmedsync(SMgrRelation r, ForkNumber f)
 {
-	UT_ASSERT(locks[0] && (storage_read ? !locks[1] : locks[1]));
+	UT_ASSERT(locks[0] && !locks[1]);
 	fault(3);
 	UT_ASSERT_EQ(fsync(fileno(file)), 0);
 	syncs++;
+	if (concurrent_sync == 1) {
+		RfPageVersionEdgeEntryV1 edge = { 0 };
+		edge.page_class = RF_PAGE_CLASS_ORDINARY;
+		edge.result_kind = RF_PAGE_STATE_PRESENT;
+		memcpy(edge.result_incarnation, identity.incarnation, 16);
+		((PageHeader)pages[1].data)->pd_block_scn++;
+		source_capture = locks[1] = true;
+		HOLD_INTERRUPTS();
+		UT_ASSERT_EQ(cluster_page_wal_capture_native_v1(2, &edge,
+														((PageHeader)pages[1].data)->pd_block_scn,
+														0x300, 0x400, 0x9193, RM_HEAP_ID, 0),
+					 CLUSTER_PAGE_WAL_CAPTURED);
+		RESUME_INTERRUPTS();
+		source_capture = locks[1] = false;
+		/* A concurrent write plus its own flush can leave the buffer clean.
+		 * Checking BM_DIRTY alone must not qualify our older DATA receipt. */
+	}
+	if (concurrent_sync == 2)
+		busy[1] = true;
 	if (stale_sync)
 		writer.claim.identity.origin_owner_incarnation++;
 	if (redirty_sync)
@@ -464,7 +484,7 @@ smgrimmedsync(SMgrRelation r, ForkNumber f)
 void
 smgrread(SMgrRelation r, ForkNumber f, BlockNumber b, void *out)
 {
-	UT_ASSERT(locks[0] && (storage_read ? !locks[1] : (locks[1] && syncs)));
+	UT_ASSERT(locks[0] && !locks[1] && (storage_read || syncs));
 	fault(storage_read && reads > 0 ? 5 : 4);
 	reads++;
 	UT_ASSERT_EQ(pread(fileno(file), out, BLCKSZ, 0), BLCKSZ);
@@ -642,6 +662,7 @@ reset(void)
 	pi_discard_race = 0;
 	checksums = true;
 	throw_at = 0;
+	concurrent_sync = 0;
 	writes = syncs = reads = wal_flushes = aborts = 0;
 	cluster_smart_fusion = cluster_past_image = false;
 	error_context_stack = NULL;
@@ -1919,6 +1940,46 @@ same_claim_pi_under_later_root_ceiling(void)
 }
 
 static void
+missing_pi_terminal_receipt_accepts_original_claim_ceiling(void)
+{
+	for (int replacement = 0; replacement < 3; replacement++) {
+		ClusterWalSourceRef sources[3];
+		ClusterPcmPiStorageCutV1 storage_cut;
+		ClusterPcmPiWriteCutV1 cut, verified;
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &storage_cut);
+		rf_page_online_plan_destroy_v1(&plan);
+		for (unsigned i = 0; i < 3; i++)
+			sources[i].claim.max_config_generation = 3;
+		writer = sources[2];
+		cluster_node_id = 2;
+		resident[1] = true;
+		storage_read = false;
+		bind_native_record(RM_XLOG_ID, XLOG_FPI);
+		cut = data_pi_cut();
+		UT_ASSERT(cluster_bufmgr_write_page_data_at_cut_v1(&target, &cut, &receipt));
+		for (unsigned i = 0; i < 3; i++)
+			sources[i].claim.max_config_generation = 4;
+		plan = data_contribution_plan(sources);
+		UT_ASSERT(cluster_page_data_pi_proof_v1(receipt, plan, sources, 3, &verified));
+		if (replacement == 0) {
+			physical_pi_from_source(&sources[0], 80);
+			UT_ASSERT_EQ(cluster_bufmgr_discard_pi_at_data_v1(receipt, plan, sources, 3),
+						 CLUSTER_PI_PHYSICAL_DISCARDED);
+		} else if (replacement == 2) {
+			descriptors[1].bufferdesc.pcm_state = PCM_STATE_S;
+			descriptors[1].bufferdesc.buffer_type = BUF_TYPE_SCUR;
+		}
+		/* Lost-ACK retry after actual deletion, or a stable current replacement. */
+		UT_ASSERT_EQ(cluster_bufmgr_discard_pi_at_data_v1(receipt, plan, sources, 3),
+					 replacement == 0 ? CLUSTER_PI_PHYSICAL_ABSENT : CLUSTER_PI_PHYSICAL_REPLACED);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&plan);
+		clean();
+	}
+}
+
+static void
 physical_pi_newer_than_actual_data_is_not_discarded(void)
 {
 	ClusterWalSourceRef sources[3];
@@ -1947,6 +2008,57 @@ physical_pi_newer_than_actual_data_is_not_discarded(void)
 	cluster_page_data_receipt_free_v1(&receipt);
 	rf_page_online_plan_destroy_v1(&plan);
 	clean();
+}
+
+static void
+missing_pi_cannot_confirm_nonterminal_data(void)
+{
+	for (int current = 0; current < 3; current++) {
+		ClusterWalSourceRef sources[3];
+		ClusterPcmPiStorageCutV1 storage_cut;
+		ClusterPcmPiWriteCutV1 cut, verified;
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &storage_cut);
+		physical_pi_from_source(&sources[0], 80);
+		storage_read = false;
+		descriptors[1].bufferdesc.pcm_state = PCM_STATE_X;
+		descriptors[1].bufferdesc.buffer_type = BUF_TYPE_XCUR;
+		pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_VALID | BM_DIRTY);
+		target.version.mutation_token = 80;
+		cut = data_pi_cut();
+		UT_ASSERT(cluster_bufmgr_write_page_data_at_cut_v1(&target, &cut, &receipt));
+		UT_ASSERT(cluster_page_data_pi_proof_v1(receipt, plan, sources, 3, &verified));
+		/* The sealed chain has B(19), C(7) after this actual A(80) DATA.
+		 * Absence or a replacement current buffer cannot erase those PIs. */
+		if (current == 0)
+			resident[1] = false;
+		else if (current == 2) {
+			descriptors[1].bufferdesc.pcm_state = PCM_STATE_S;
+			descriptors[1].bufferdesc.buffer_type = BUF_TYPE_SCUR;
+		}
+		UT_ASSERT_EQ(cluster_bufmgr_discard_pi_at_data_v1(receipt, plan, sources, 3),
+					 CLUSTER_PI_PHYSICAL_RETRY);
+		UT_ASSERT_EQ(pi_discards, 0);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&plan);
+		clean();
+	}
+}
+
+static void
+data_sync_releases_content_and_rechecks_clean_replacement(void)
+{
+	for (int changed = 1; changed <= 2; changed++) {
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		reset();
+		concurrent_sync = changed;
+		UT_ASSERT(!cluster_bufmgr_write_page_data_v1(&target, &receipt));
+		UT_ASSERT(receipt == NULL);
+		UT_ASSERT_EQ(syncs, 1);
+		UT_ASSERT_EQ(reads, 1);
+		UT_ASSERT_EQ(writes, 1);
+		clean();
+	}
 }
 
 static void
@@ -2071,7 +2183,9 @@ redeclare_scan_retries_content_busy_and_zero_lsn_current(void)
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(33);
+	UT_RUN(missing_pi_terminal_receipt_accepts_original_claim_ceiling);
+	UT_RUN(data_sync_releases_content_and_rechecks_clean_replacement);
 	UT_RUN(redeclare_scan_includes_physical_pi_and_preserves_unacknowledged_cursor);
 	UT_RUN(redeclare_scan_retries_content_busy_and_zero_lsn_current);
 	UT_RUN(notice_import_requires_actual_fact_and_qualified_master_job);
@@ -2102,6 +2216,7 @@ main(void)
 	UT_RUN(storage_observation_releases_space_on_io_error);
 	UT_RUN(physical_pi_discard_is_ancestry_and_generation_exact);
 	UT_RUN(physical_pi_newer_than_actual_data_is_not_discarded);
+	UT_RUN(missing_pi_cannot_confirm_nonterminal_data);
 	if (file)
 		fclose(file);
 	UT_DONE();

@@ -15,6 +15,7 @@
 #include "cluster/cluster_wal_cut.h"
 #include "common/cryptohash.h"
 #include "miscadmin.h"
+#include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
 #include "utils/resowner.h"
 
@@ -29,6 +30,7 @@ struct ClusterWalInputsV1 {
 	ResourceOwner owner;
 	pid_t pid;
 	bool stale;
+	bool suspended;
 	uint16 thread_count;
 	uint16 threads[CLUSTER_WAL_RETENTION_MAX_THREADS];
 	uint32 count;
@@ -69,7 +71,7 @@ static bool
 inputs_current(ClusterWalInputsV1 *inputs)
 {
 	return cluster_enabled && cluster_shared_config && inputs_io_role() && inputs_owned(inputs)
-		   && !inputs->stale && inputs->thread_count > 0
+		   && !inputs->stale && inputs->thread_count > 0 && !inputs->suspended
 		   && inputs->thread_count <= CLUSTER_WAL_RETENTION_MAX_THREADS
 		   && cluster_wal_read_pin_covers_v1(inputs->pin, inputs->threads[0]);
 }
@@ -264,6 +266,7 @@ typedef struct WalInputsVisit {
 	ClusterWalInputsV1 *inputs;
 	ClusterWalRecordVisitor visitor;
 	void *arg;
+	uint64 records;
 } WalInputsVisit;
 
 static bool
@@ -273,6 +276,8 @@ inputs_visit_record(struct XLogReaderState *reader, void *arg)
 	if (!inputs_current(visit->inputs) || cluster_cf_held(ShareLock)
 		|| cluster_cf_held(ExclusiveLock))
 		return false;
+	if (MyBackendType == B_CHECKPOINTER && (visit->records++ % 64) == 0)
+		AbsorbSyncRequests();
 	if (visit->visitor != NULL && !visit->visitor(reader, visit->arg))
 		return false;
 	return inputs_current(visit->inputs) && !cluster_cf_held(ShareLock)
@@ -917,6 +922,68 @@ cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
 		inputs->stale = true;
+	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_suspend_v1(ClusterWalInputsV1 *inputs)
+{
+	if (!inputs_owned(inputs) || !inputs_io_role() || inputs->stale)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (inputs->suspended)
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	if (!inputs_current(inputs))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (cluster_wal_read_pin_release_v1(&inputs->pin) != CLUSTER_WALR_RELEASE_CONFIRMED)
+		elog(FATAL, "could not suspend WAL input retention owner");
+	inputs->suspended = true;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_resume_v1(ClusterWalInputsV1 *inputs)
+{
+	ClusterWalPinResult pinned;
+	ClusterControlRootResult result;
+	if (!inputs_owned(inputs) || !inputs_io_role() || inputs->stale)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (!inputs->suspended)
+		return cluster_wal_inputs_revalidate_v1(inputs);
+	if (!cluster_enabled || !cluster_shared_config || cluster_cf_held(ShareLock)
+		|| cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	PG_TRY();
+	{
+		pinned
+			= cluster_wal_read_pin_acquire_v1(inputs->threads, inputs->thread_count, &inputs->pin);
+		if (pinned != CLUSTER_WAL_PIN_OK)
+			result = pinned == CLUSTER_WAL_PIN_RELEASE_UNCERTAIN
+						 ? CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN
+						 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		else {
+			inputs->suspended = false;
+			result = cluster_wal_inputs_revalidate_v1(inputs);
+		}
+	}
+	PG_CATCH();
+	{
+		inputs->stale = true;
+		if (inputs->pin != NULL
+			&& cluster_wal_read_pin_release_v1(&inputs->pin) != CLUSTER_WALR_RELEASE_CONFIRMED)
+			elog(FATAL, "could not release resumed WAL input retention owner");
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	/* A refused resume must not turn waiting for CF or a changed ROOT into
+	 * another long-lived WALR-S grant. No result can consume the old plan. */
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		if (inputs->pin != NULL
+			&& cluster_wal_read_pin_release_v1(&inputs->pin) != CLUSTER_WALR_RELEASE_CONFIRMED)
+			elog(FATAL, "could not release refused WAL input retention owner");
+		inputs->suspended = true;
+	}
 	return result;
 }
 

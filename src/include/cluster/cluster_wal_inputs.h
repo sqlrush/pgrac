@@ -27,6 +27,14 @@ typedef struct ClusterWalInputV1 {
 
 typedef struct ClusterWalInputsV1 ClusterWalInputsV1;
 
+/* Release every read pin while a background job waits for a peer. Suspended
+ * scopes cannot expose inputs, read WAL or qualify use of an existing plan.
+ * Resume reacquires the same sorted pin set and compares the complete original
+ * ROOT token. A changed token is terminal for this scope; lock contention is
+ * retryable. Neither operation resamples an already fixed live endpoint. */
+extern ClusterControlRootResult cluster_wal_inputs_suspend_v1(ClusterWalInputsV1 *inputs);
+extern ClusterControlRootResult cluster_wal_inputs_resume_v1(ClusterWalInputsV1 *inputs);
+
 /* Native background worker, bgwriter or checkpointer I/O context only;
  * never LMON/LMS dispatch. CF and WALR use their existing native owners.
  * Read all present origins, including non-serving/current/history/terminal

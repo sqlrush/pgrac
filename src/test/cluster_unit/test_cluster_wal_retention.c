@@ -3025,6 +3025,34 @@ UT_TEST(test_read_pin_covers_sorted_threads_without_recovery_authority)
 	reset_pin_fakes();
 }
 
+UT_TEST(test_released_read_census_allows_real_e1_gc_owner_to_progress)
+{
+	V2ReuseFixture f;
+	uint16 threads[] = { 1, 3 };
+	v2_reuse_fixture(&f);
+	for (int retry = 0; retry < 10; retry++) {
+		ClusterWalReadPinV1 *pin = NULL;
+		ClusterWalRetentionE1Context context = { 0 };
+		ClusterWalRootFoldResult fold;
+		ClusterWalReuseDenyReason reason;
+		XLogSegNo floor;
+		UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_begin(&context, 1, &fold, &floor, &reason),
+					 CLUSTER_WAL_GUARD_INVALID);
+		UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_GUARD_STATE);
+		UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+		UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_begin(&context, 1, &fold, &floor, &reason),
+					 CLUSTER_WAL_GUARD_OK);
+		UT_ASSERT(context.coarse_walr.held && context.coarse_walr.mode == ExclusiveLock);
+		UT_ASSERT_EQ(fold, CLUSTER_WAL_FOLD_BOUNDED);
+		UT_ASSERT_EQ(floor, 4);
+		UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_release(&context, &reason),
+					 CLUSTER_WALR_RELEASE_CONFIRMED);
+		cluster_wal_retention_e1_finish(&context);
+	}
+	v2_reuse_fixture_cleanup(&f);
+}
+
 UT_TEST(test_read_pin_rejects_bad_shape_and_rolls_back_partial_grants)
 {
 	uint16 threads[] = { 1, 3 };
@@ -3235,7 +3263,8 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(65);
+	UT_PLAN(66);
+	UT_RUN(test_released_read_census_allows_real_e1_gc_owner_to_progress);
 	UT_RUN(test_read_pin_covers_sorted_threads_without_recovery_authority);
 	UT_RUN(test_read_pin_rejects_bad_shape_and_rolls_back_partial_grants);
 	UT_RUN(test_read_pin_uncertain_release_is_cleanup_only);
