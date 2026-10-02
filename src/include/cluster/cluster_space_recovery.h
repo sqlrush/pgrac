@@ -31,7 +31,8 @@ extern bool cluster_space_recovery_apply_v1(ClusterSpaceRecoveryBatchV1 *batch);
  * its complete foreign-origin set (not a founder or historical authority).
  * Borrows that plan and the sealed SIDE inputs until batch destruction;
  * neither an origin number nor a caller-provided mode grants mutation.
- * Currently accepts ADVANCE only with an already durable identity page. */
+ * Accepts CREATE plus ADVANCE; ADVANCE alone needs a durable identity page.
+ * TRUNCATE and DROP need their separate structural retirement owner. */
 extern bool cluster_space_recovery_cold_preflight_v1(const RfSideOnlinePlanV1 *side,
 													 struct ClusterRecoveryFencePlan *fence,
 													 ClusterSpaceRecoveryBatchV1 **out);

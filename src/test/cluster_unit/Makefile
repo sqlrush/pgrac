@@ -2269,7 +2269,15 @@ test_cluster_space_extend.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c
 	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_space_extend: test_cluster_space_extend.c test_cluster_space_extend.inc unit_test.h $(CLUSTER_HW_O) $(CLUSTER_UNIT_PORT_LIBS)
+test_cluster_space_extend_finish.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^ExtendBufferedRelShared\(/ { inside=1 } \
+	     inside && /^\t\/\* Set BM_VALID, terminate IO, and wake up any waiters \*\// { emit=1; found++ } \
+	     emit && /^\tpgBufferUsage.shared_blks_written/ { emit=0; done++ } \
+	     emit { print } /^}/ { inside=0 } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_extend: test_cluster_space_extend.c test_cluster_space_extend.inc test_cluster_space_extend_finish.inc unit_test.h $(CLUSTER_HW_O) $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_HW_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
@@ -4103,7 +4111,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_page_flush.inc
 	rm -f test_cluster_pcm_s_prepare.inc
 	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
-	rm -f test_cluster_space_extend.inc
+	rm -f test_cluster_space_extend.inc test_cluster_space_extend_finish.inc
 	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc
 	rm -f test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc
 	rm -f test_cluster_undo_bind_native.inc test_cluster_undo_tt_transition.inc

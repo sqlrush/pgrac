@@ -7571,43 +7571,68 @@ retry_extend_collision:
 							io_start, extend_by);
 
 	/* Set BM_VALID, terminate IO, and wake up any waiters */
-	for (int i = 0; i < extend_by; i++)
+#ifdef USE_PGRAC_CLUSTER
+	PG_TRY();
 	{
-		Buffer		buf = buffers[i];
-		BufferDesc *buf_hdr = GetBufferDescriptor(buf - 1);
-		bool		lock = false;
+#endif
+		for (int i = 0; i < extend_by; i++) {
+			Buffer buf = buffers[i];
+			BufferDesc *buf_hdr = GetBufferDescriptor(buf - 1);
+			bool lock = false;
 
-		if (flags & EB_LOCK_FIRST && i == 0)
-			lock = true;
-		else if (flags & EB_LOCK_TARGET)
-		{
-			Assert(extend_upto != InvalidBlockNumber);
-			if (first_block + i + 1 == extend_upto)
+			if (flags & EB_LOCK_FIRST && i == 0)
 				lock = true;
-		}
+			else if (flags & EB_LOCK_TARGET) {
+				Assert(extend_upto != InvalidBlockNumber);
+				if (first_block + i + 1 == extend_upto)
+					lock = true;
+			}
 
-		if (lock)
-		{
+			if (lock) {
 #ifdef USE_PGRAC_CLUSTER
-			ClusterPcmDirectInitProof direct_init_proof;
+				ClusterPcmDirectInitProof direct_init_proof;
 
-			/* This exact buffer is in the range successfully zeroextended above
-			 * and still owns BM_IO_IN_PROGRESS + !BM_VALID. */
-			(void) cluster_bufmgr_pcm_arm_direct_init(
-				buf_hdr, CLUSTER_PCM_DIRECT_INIT_EXTEND,
-				&direct_init_proof, NULL);
-			(void) cluster_bufmgr_pcm_gate_direct_init(
-				buf_hdr, CLUSTER_PCM_DIRECT_INIT_EXTEND, &direct_init_proof,
-				NULL);
+				/* This exact buffer is in the range successfully zeroextended above
+				 * and still owns BM_IO_IN_PROGRESS + !BM_VALID. */
+				(void) cluster_bufmgr_pcm_arm_direct_init(
+					buf_hdr, CLUSTER_PCM_DIRECT_INIT_EXTEND,
+					&direct_init_proof, NULL);
+				(void) cluster_bufmgr_pcm_gate_direct_init(
+					buf_hdr, CLUSTER_PCM_DIRECT_INIT_EXTEND, &direct_init_proof,
+					NULL);
 #endif
-			LWLockAcquire(BufferDescriptorGetContentLock(buf_hdr), LW_EXCLUSIVE);
+				LWLockAcquire(BufferDescriptorGetContentLock(buf_hdr), LW_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
-			cluster_bufmgr_pcm_x_writer_activate_target_direct_init(buf_hdr);
+				cluster_bufmgr_pcm_x_writer_activate_target_direct_init(buf_hdr);
 #endif
-		}
+			}
 
-		TerminateBufferIO(buf_hdr, false, BM_VALID);
+			TerminateBufferIO(buf_hdr, false, BM_VALID);
+		}
+#ifdef USE_PGRAC_CLUSTER
 	}
+	PG_CATCH();
+	{
+		/* No Buffer has returned to the caller yet. A later direct-init
+		 * can fail with the first buffer already locked and activated.
+		 * Clear only this extension's local use ledgers/content locks;
+		 * the original ResourceOwner still owns every pin and BufferIO. */
+		for (uint32 i = extend_by; i > 0; i--) {
+			BufferDesc *buf_hdr = GetBufferDescriptor(buffers[i - 1] - 1);
+			LWLock *content = BufferDescriptorGetContentLock(buf_hdr);
+
+			if (LWLockHeldByMe(content)) {
+				/* PostgreSQL ERROR reset the interrupt holdoff count. */
+				if (InterruptHoldoffCount == 0)
+					HOLD_INTERRUPTS();
+				LWLockRelease(content);
+			}
+			cluster_bufmgr_pcm_x_writer_clear(cluster_bufmgr_pcm_x_writer_find(buf_hdr));
+		}
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+#endif
 
 	pgBufferUsage.shared_blks_written += extend_by;
 

@@ -41,6 +41,7 @@
 
 typedef struct SpaceRecoveryTarget {
 	ClusterSpaceIdentityKey key;
+	bool has_create;
 	PGAlignedBlock before[2];
 	ClusterSpaceRecoveryImage final;
 } SpaceRecoveryTarget;
@@ -216,15 +217,18 @@ space_disk_matches(SMgrRelation rel, BlockNumber block, const char *expected)
 static bool
 space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply)
 {
+	static const PGAlignedBlock zero;
 	SpaceRecoveryTarget *target = &batch->targets[index];
 	ClusterSpaceRecoveryImage prepared;
 	RfSideOnlineOperationV1 source;
 	ClusterResId resid;
 	SMgrRelation rel;
+	BlockNumber blocks;
 	uint32 count;
-	bool ok = false;
-	volatile bool mutated = false, write_attempted = false;
-	volatile uint32 before_state = 0;
+	bool exists, ok = false;
+	volatile uint8 mutated_mask = 0;
+	volatile bool write_attempted[2] = { false, false };
+	volatile uint32 before_state[2] = { 0, 0 };
 
 	if (!space_sources_fresh(batch)
 		|| cluster_smgr_which_for(target->key.locator, InvalidBackendId) != 1)
@@ -243,51 +247,61 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply)
 		CurrentResourceOwner = batch->io_owner;
 		batch->active = target;
 		rel = smgropen(target->key.locator, InvalidBackendId);
-		if (!smgrexists(rel, SPACE_FORKNUM) || smgrnblocks(rel, SPACE_FORKNUM) != 2)
+		exists = smgrexists(rel, SPACE_FORKNUM);
+		blocks = exists ? smgrnblocks(rel, SPACE_FORKNUM) : 0;
+		if (blocks > 2 || (!target->has_create && (!exists || blocks != 2)))
 			goto done;
-		for (BlockNumber i = 0; i < 2; i++) {
+		/* Missing CREATE components remain private zero predecessors until
+		 * the whole retained chain has passed, without creating the fork. */
+		memset(target->before, 0, sizeof(target->before));
+		for (BlockNumber i = 0; i < blocks; i++) {
 			batch->buffers[i] = ReadBufferWithoutRelcache(target->key.locator, SPACE_FORKNUM, i,
 														  RBM_NORMAL, NULL, true);
 			if (!BufferIsValid(batch->buffers[i]) || BufferIsLocal(batch->buffers[i]))
 				goto done;
-			LockBuffer(batch->buffers[i], i == 0 ? BUFFER_LOCK_SHARE : BUFFER_LOCK_EXCLUSIVE);
+			LockBuffer(batch->buffers[i],
+					   i == 0 && !target->has_create ? BUFFER_LOCK_SHARE : BUFFER_LOCK_EXCLUSIVE);
 			if (BufferGetBlockNumber(batch->buffers[i]) != i)
 				goto done;
+			if ((i == 1 || target->has_create)
+				&& !cluster_bufmgr_pcm_x_content_holder_write_permitted(
+					GetBufferDescriptor(batch->buffers[i] - 1)))
+				goto done;
+			memcpy(target->before[i].data, BufferGetPage(batch->buffers[i]), BLCKSZ);
 		}
 		if (!space_sources_fresh(batch)
-			|| !cluster_bufmgr_pcm_x_content_holder_write_permitted(
-				GetBufferDescriptor(batch->buffers[1] - 1))
-			|| rf_side_online_plan_prepare_space_v1(batch->side, &target->key,
-													BufferGetPage(batch->buffers[0]),
-													BufferGetPage(batch->buffers[1]), batch->order,
-													batch->operation_count, &count, &prepared)
+			|| rf_side_online_plan_prepare_space_v1(
+				   batch->side, &target->key, target->before[0].data, target->before[1].data,
+				   batch->order, batch->operation_count, &count, &prepared)
 				   != RF_PAGE_PROOF_DETAIL_OK
-			|| prepared.source_index[0] != UINT32_MAX)
+			|| (!target->has_create && prepared.source_index[0] != UINT32_MAX)
+			|| (target->has_create && prepared.source_index[0] == UINT32_MAX))
 			goto done;
 		if (prepared.source_index[1] == UINT32_MAX) {
 			if (prepared.covered_by_successor_mask != 2 || prepared.apply_mask != 0)
 				goto done;
-		} else {
-			if (!rf_side_online_plan_operation_v1(batch->side, prepared.source_index[1], &source))
+		}
+		for (int i = 0; i < 2; i++) {
+			if (prepared.source_index[i] == UINT32_MAX)
+				continue;
+			if (!rf_side_online_plan_operation_v1(batch->side, prepared.source_index[i], &source))
 				goto done;
-			PageSetLSNPreserveOrigin(prepared.pages[1].data, source.identity.record.end_rec_ptr);
-			if (!PageSetLSNOrigin(prepared.pages[1].data, source.identity.record.origin_thread - 1))
+			PageSetLSNPreserveOrigin(prepared.pages[i].data, source.identity.record.end_rec_ptr);
+			if (!PageSetLSNOrigin(prepared.pages[i].data, source.identity.record.origin_thread - 1))
 				goto done;
 		}
 		/* A successor's bytes cannot borrow a failed origin's WAL owner.
 		 * Require its canonical physical image before qualifying coverage. */
 		if (prepared.covered_by_successor_mask != 0
-			&& !space_disk_matches(rel, 1, BufferGetPage(batch->buffers[1])))
+			&& (blocks != 2 || !space_disk_matches(rel, 1, target->before[1].data)))
 			goto done;
 		/* ADVANCE cannot supply missing identity-page bytes or their WAL. */
-		if (!space_disk_matches(rel, 0, prepared.pages[0].data))
+		if (!target->has_create && !space_disk_matches(rel, 0, prepared.pages[0].data))
 			goto done;
 		/* Re-prepare under this HW/current-X hold. A legitimate survivor
 		 * extension since preflight may cover the old cut; never overwrite
 		 * it with the previously prepared lower HWM. Rollback uses this
 		 * apply's own original bytes, not the earlier preflight snapshot. */
-		for (int i = 0; i < 2; i++)
-			memcpy(target->before[i].data, BufferGetPage(batch->buffers[i]), BLCKSZ);
 		target->final = prepared;
 		if (!apply) {
 			ok = true;
@@ -305,16 +319,40 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply)
 		}
 		if (!space_sources_fresh(batch))
 			goto done;
+		if (!exists)
+			smgrcreate(rel, SPACE_FORKNUM, true);
+		for (BlockNumber i = blocks; i < 2; i++) {
+			batch->buffers[i] = ReadBufferWithoutRelcache(target->key.locator, SPACE_FORKNUM, P_NEW,
+														  RBM_ZERO_AND_LOCK, NULL, true);
+			if (!BufferIsValid(batch->buffers[i]) || BufferIsLocal(batch->buffers[i])
+				|| BufferGetBlockNumber(batch->buffers[i]) != i
+				|| memcmp(BufferGetPage(batch->buffers[i]), zero.data, BLCKSZ) != 0)
+				goto done;
+		}
+		if (!space_sources_fresh(batch))
+			goto done;
+		for (int i = 0; i < 2; i++)
+			if (prepared.source_index[i] != UINT32_MAX
+				&& !cluster_bufmgr_pcm_x_content_holder_write_permitted(
+					GetBufferDescriptor(batch->buffers[i] - 1)))
+				goto done;
 		/* The strict MarkBufferDirty predicate was checked before entering
  * the critical section. Content-X prevents a revoke from changing it. */
 		START_CRIT_SECTION();
-		before_state = pg_atomic_read_u32(&GetBufferDescriptor(batch->buffers[1] - 1)->state);
-		memcpy(BufferGetPage(batch->buffers[1]), prepared.pages[1].data, BLCKSZ);
-		MarkBufferDirty(batch->buffers[1]);
-		mutated = true;
+		for (int i = 0; i < 2; i++) {
+			if (prepared.source_index[i] == UINT32_MAX)
+				continue;
+			before_state[i]
+				= pg_atomic_read_u32(&GetBufferDescriptor(batch->buffers[i] - 1)->state);
+			memcpy(BufferGetPage(batch->buffers[i]), prepared.pages[i].data, BLCKSZ);
+			MarkBufferDirty(batch->buffers[i]);
+			mutated_mask |= 1 << i;
+		}
 		END_CRIT_SECTION();
-		if (!FlushOneBufferForSpaceRecovery(batch->buffers[1], batch, &write_attempted))
-			goto done;
+		for (int i = 0; i < 2; i++)
+			if (prepared.source_index[i] != UINT32_MAX
+				&& !FlushOneBufferForSpaceRecovery(batch->buffers[i], batch, &write_attempted[i]))
+				goto done;
 		smgrimmedsync(rel, SPACE_FORKNUM);
 		ok = space_sources_fresh(batch) && space_disk_matches(rel, 0, prepared.pages[0].data)
 			 && space_disk_matches(rel, 1, prepared.pages[1].data);
@@ -322,27 +360,30 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply)
 	}
 	PG_FINALLY();
 	{
-		if (mutated && !write_attempted) {
-			BufferDesc *buf = GetBufferDescriptor(batch->buffers[1] - 1);
-			const uint32 mask = BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR;
-			uint32 state;
+		if (!write_attempted[0] && !write_attempted[1]) {
+			/* Native I/O has already unwound. Once either component may have
+			 * reached storage, keep both repeatable result components. */
+			for (int i = 0; i < 2; i++) {
+				BufferDesc *buf;
+				const uint32 mask = BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR;
+				uint32 state;
 
-			/* Native I/O has already unwound. Until the first write attempt
-			 * it is safe to restore exactly what this content-X owner saw.
-			 * After a possible write, keep the conservative higher HWM;
-			 * the recovery/isolation owner still has no completion proof. */
-			Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE));
-			memcpy(BufferGetPage(batch->buffers[1]), target->before[1].data, BLCKSZ);
-			Assert(memcmp(BufferGetPage(batch->buffers[1]), target->before[1].data, BLCKSZ) == 0);
-			state = LockBufHdr(buf);
-			Assert((state & BM_IO_IN_PROGRESS) == 0);
-			/* Checkpointer can select a previously dirty page while we hold
-			 * content-X. Restoring its old bytes must retain that new duty;
-			 * otherwise its redo cut could pass the original SPACE WAL. */
-			if (before_state & BM_DIRTY)
-				before_state |= state & BM_CHECKPOINT_NEEDED;
-			state = (state & ~mask) | (before_state & mask);
-			UnlockBufHdr(buf, state);
+				if (!(mutated_mask & (1 << i)))
+					continue;
+				buf = GetBufferDescriptor(batch->buffers[i] - 1);
+				Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE));
+				memcpy(BufferGetPage(batch->buffers[i]), target->before[i].data, BLCKSZ);
+				Assert(memcmp(BufferGetPage(batch->buffers[i]), target->before[i].data, BLCKSZ)
+					   == 0);
+				state = LockBufHdr(buf);
+				Assert((state & BM_IO_IN_PROGRESS) == 0);
+				/* A concurrent checkpoint can select an already dirty page
+				 * despite content-X; restoring bytes must retain that duty. */
+				if (before_state[i] & BM_DIRTY)
+					before_state[i] |= state & BM_CHECKPOINT_NEEDED;
+				state = (state & ~mask) | (before_state[i] & mask);
+				UnlockBufHdr(buf, state);
+			}
 		}
 		space_target_release(batch);
 	}
@@ -397,6 +438,7 @@ space_recovery_preflight(const ClusterThreadRecoveryFabricPlanV1 *plan,
 	for (uint32 i = 0; i < operations; i++) {
 		RfSideOnlineOperationV1 op;
 		ClusterSpaceReservationChange change;
+		ClusterSpaceStructureChange structure;
 
 		if (!rf_side_online_plan_operation_v1(side, i, &op))
 			return false;
@@ -404,13 +446,20 @@ space_recovery_preflight(const ClusterThreadRecoveryFabricPlanV1 *plan,
 			continue;
 		if (op.kind == RF_SIDE_ONLINE_OPERATION_XACT && op.xact.space_drop_count != 0)
 			return false;
-		if (op.kind == RF_SIDE_ONLINE_OPERATION_SPACE
-			&& (op.identity.record.rmid != RM_SMGR_ID
-				|| (op.identity.record.info & ~XLR_INFO_MASK) != XLOG_SMGR_SPACE_RESERVATION
-				|| !cluster_space_reservation_wal_decode(op.owned_payload, op.owned_payload_length,
-														 &change)
-				|| change.action != CLUSTER_SPACE_RESERVATION_ADVANCE))
-			return false;
+		if (op.kind == RF_SIDE_ONLINE_OPERATION_SPACE) {
+			if (op.identity.record.rmid != RM_SMGR_ID)
+				return false;
+			if ((op.identity.record.info & ~XLR_INFO_MASK) == XLOG_SMGR_SPACE_RESERVATION) {
+				if (!cluster_space_reservation_wal_decode(op.owned_payload, op.owned_payload_length,
+														  &change)
+					|| change.action != CLUSTER_SPACE_RESERVATION_ADVANCE)
+					return false;
+			} else if ((op.identity.record.info & ~XLR_INFO_MASK) != XLOG_SMGR_SPACE_IDENTITY
+					   || !cluster_space_structure_wal_decode(op.owned_payload,
+															  op.owned_payload_length, &structure)
+					   || structure.identity.action != CLUSTER_SPACE_WAL_CREATE)
+				return false;
+		}
 	}
 	batch = space_alloc(bytes - 4 * BLCKSZ);
 	if (batch == NULL)
@@ -459,10 +508,22 @@ space_recovery_preflight(const ClusterThreadRecoveryFabricPlanV1 *plan,
 		}
 		if (!space_sources_fresh(batch))
 			goto done;
-		for (uint32 i = 0; i < targets; i++)
-			if (!rf_side_online_plan_space_target_v1(side, i, &batch->targets[i].key)
-				|| !space_target_run(batch, i, false))
+		for (uint32 i = 0; i < targets; i++) {
+			SpaceRecoveryTarget *target = &batch->targets[i];
+			if (!rf_side_online_plan_space_target_v1(side, i, &target->key))
 				goto done;
+			for (uint32 j = 0; j < operations; j++) {
+				RfSideOnlineOperationV1 op;
+				if (!rf_side_online_plan_operation_v1(side, j, &op))
+					goto done;
+				if (!op.history_only && op.kind == RF_SIDE_ONLINE_OPERATION_SPACE
+					&& (op.identity.record.info & ~XLR_INFO_MASK) == XLOG_SMGR_SPACE_IDENTITY
+					&& RelFileLocatorEquals(op.space_key.locator, target->key.locator))
+					target->has_create = true;
+			}
+			if (!space_target_run(batch, i, false))
+				goto done;
+		}
 		ok = batch->preflight_complete = space_sources_fresh(batch);
 	done:;
 	}
@@ -531,13 +592,14 @@ cluster_space_recovery_flush_permitted_v1(const ClusterSpaceRecoveryBatchV1 *bat
 		|| (batch->cold_fence == NULL
 			&& (!batch->hw.held || !batch->hw.coordinated
 				|| batch->hw.req.lockmode != ExclusiveLock))
-		|| !BufferIsValid(buffer) || buffer != batch->buffers[1] || BufferIsLocal(buffer)
-		|| !space_sources_fresh(batch))
+		|| !BufferIsValid(buffer) || BufferIsLocal(buffer) || !space_sources_fresh(batch))
 		return false;
 	BufferGetTag(buffer, &locator, &fork, &block);
 	return RelFileLocatorEquals(locator, batch->active->key.locator) && fork == SPACE_FORKNUM
-		   && block == CLUSTER_SPACE_RESERVATION_BLOCK
-		   && memcmp(BufferGetPage(buffer), batch->active->final.pages[1].data, BLCKSZ) == 0;
+		   && block < 2 && buffer == batch->buffers[block]
+		   && batch->active->final.source_index[block] != UINT32_MAX
+		   && (block == CLUSTER_SPACE_RESERVATION_BLOCK || batch->active->has_create)
+		   && memcmp(BufferGetPage(buffer), batch->active->final.pages[block].data, BLCKSZ) == 0;
 }
 
 Size

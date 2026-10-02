@@ -80,6 +80,10 @@ static uint64 source_database[2];
 static bool source_unavailable;
 static unsigned pins, locks, writes, syncs, reads, lock_calls;
 static bool hw_held, permitted, stale, exists, corrupt_disk, structural, wrong_cut;
+static bool creating;
+static BlockNumber existing_blocks;
+static unsigned creates, extensions, x_locks;
+static int fail_write_block;
 static bool corrupt_checksum, checksums, ignore_checksum_failure;
 static int throw_at;
 int cluster_node_id;
@@ -316,14 +320,34 @@ smgrexists(SMgrRelation r, ForkNumber f)
 BlockNumber
 smgrnblocks(SMgrRelation r, ForkNumber f)
 {
-	return 2;
+	return existing_blocks;
+}
+void
+smgrcreate(SMgrRelation r, ForkNumber fork, bool is_redo)
+{
+	UT_ASSERT((hw_held || cold_protected()) && CurrentResourceOwner == child_owner);
+	UT_ASSERT_EQ(fork, SPACE_FORKNUM);
+	UT_ASSERT(is_redo && !exists && existing_blocks == 0);
+	exists = true;
+	creates++;
 }
 Buffer
 ReadBufferWithoutRelcache(RelFileLocator r, ForkNumber f, BlockNumber b, ReadBufferMode m,
 						  BufferAccessStrategy s, bool perm)
 {
 	UT_ASSERT(CurrentResourceOwner == child_owner);
-	UT_ASSERT((hw_held || cold_protected()) && f == SPACE_FORKNUM && b < 2);
+	UT_ASSERT((hw_held || cold_protected()) && f == SPACE_FORKNUM);
+	if (b == P_NEW) {
+		UT_ASSERT(creating && exists && existing_blocks < 2 && m == RBM_ZERO_AND_LOCK);
+		b = existing_blocks++;
+		extensions++;
+		memset(pages[b].data, 0, BLCKSZ);
+		UT_ASSERT_EQ(pwrite(fileno(file), pages[b].data, BLCKSZ, (off_t)b * BLCKSZ), BLCKSZ);
+		pins |= 1 << b;
+		LockBuffer(b + 1, BUFFER_LOCK_EXCLUSIVE);
+		return b + 1;
+	}
+	UT_ASSERT(b < existing_blocks && b < 2 && m == RBM_NORMAL);
 	pins |= 1 << b;
 	fault(1);
 	return b + 1;
@@ -333,10 +357,13 @@ LockBuffer(Buffer b, int mode)
 {
 	if (mode == BUFFER_LOCK_UNLOCK) {
 		locks &= ~(1 << (b - 1));
+		x_locks &= ~(1 << (b - 1));
 		InterruptHoldoffCount--;
 	} else {
 		UT_ASSERT(pins & (1 << (b - 1)));
 		locks |= 1 << (b - 1);
+		if (mode == BUFFER_LOCK_EXCLUSIVE)
+			x_locks |= 1 << (b - 1);
 		InterruptHoldoffCount++;
 		fault(2);
 	}
@@ -359,12 +386,15 @@ LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
 {
 	return LWLockHeldByMe(lock)
 		   && (mode != LW_EXCLUSIVE
-			   || lock == BufferDescriptorGetContentLock(&descriptors[1].bufferdesc));
+			   || (lock == BufferDescriptorGetContentLock(&descriptors[0].bufferdesc)
+					   ? (x_locks & 1) != 0
+					   : (x_locks & 2) != 0));
 }
 bool
 cluster_bufmgr_pcm_x_content_holder_write_permitted(BufferDesc *b)
 {
-	UT_ASSERT(locks == 3 && pins == 3 && (hw_held || cold_protected()));
+	UT_ASSERT((locks & (1 << b->buf_id)) && (pins & (1 << b->buf_id))
+			  && (x_locks & (1 << b->buf_id)) && (hw_held || cold_protected()));
 	return permitted;
 }
 BlockNumber
@@ -382,9 +412,10 @@ BufferGetTag(Buffer b, RelFileLocator *r, ForkNumber *f, BlockNumber *n)
 void
 MarkBufferDirty(Buffer b)
 {
-	UT_ASSERT_EQ(b, 2);
+	UT_ASSERT(b == 2 || (creating && b == 1));
+	UT_ASSERT(x_locks & (1 << (b - 1)));
 	UT_ASSERT(CritSectionCount > 0);
-	pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_DIRTY | BM_JUST_DIRTIED);
+	pg_atomic_fetch_or_u32(&descriptors[b - 1].bufferdesc.state, BM_DIRTY | BM_JUST_DIRTIED);
 }
 bool
 PageIsVerifiedForFork(Page p, ForkNumber f, BlockNumber b, int flags)
@@ -422,11 +453,15 @@ smgrimmedsync(SMgrRelation r, ForkNumber f)
 void
 smgrwrite(SMgrRelation r, ForkNumber f, BlockNumber b, const void *data, bool skip)
 {
-	UT_ASSERT_EQ(b, 1);
+	UT_ASSERT(b == 1 || (creating && b == 0));
 	UT_ASSERT_EQ(f, SPACE_FORKNUM);
 	fault(4);
+	if ((int)b == fail_write_block) {
+		InterruptHoldoffCount = 0;
+		pg_re_throw();
+	}
 	writes++;
-	UT_ASSERT_EQ(pwrite(fileno(file), data, BLCKSZ, BLCKSZ), BLCKSZ);
+	UT_ASSERT_EQ(pwrite(fileno(file), data, BLCKSZ, (off_t)b * BLCKSZ), BLCKSZ);
 	if (stale_after_write)
 		stale = true;
 }
@@ -556,6 +591,21 @@ make_plan(void)
 
 		decoded.main_data = (char *)payload[i];
 		decoded.main_data_len = sizeof(payload[i]);
+		if (creating && i == 0) {
+			ClusterSpaceStructureChange change = { 0 };
+			change.identity.action = CLUSTER_SPACE_WAL_CREATE;
+			change.identity.nblocks = InvalidBlockNumber;
+			change.identity.result = changes[0].before.identity;
+			change.identity.result_token = changes[0].before_token;
+			change.reservation.action = CLUSTER_SPACE_RESERVATION_INIT;
+			change.reservation.result = changes[0].before;
+			change.reservation.result_token = changes[0].before_token;
+			UT_ASSERT(cluster_space_structure_wal_encode(&change, structural_bytes,
+														 sizeof(structural_bytes)));
+			decoded.main_data = (char *)structural_bytes;
+			decoded.main_data_len = sizeof(structural_bytes);
+			identity.record.info = XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE;
+		}
 		if (structural && i == 1) {
 			ClusterSpaceStructureChange change = { 0 };
 			change.identity.action = CLUSTER_SPACE_WAL_TRUNCATE;
@@ -626,6 +676,10 @@ reset(void)
 	InterruptHoldoffCount = 0;
 	cluster_smart_fusion = false;
 	hw_held = stale = corrupt_disk = structural = wrong_cut = false;
+	creating = false;
+	existing_blocks = 2;
+	creates = extensions = x_locks = 0;
+	fail_write_block = -1;
 	exists = permitted = true;
 	throw_at = 0;
 	memset(changes, 0, sizeof(changes));
@@ -1295,10 +1349,174 @@ UT_TEST(test_cold_history_does_not_replay_and_structural_owner_is_required)
 	}
 }
 
+static void
+create_input(int shape)
+{
+	reset();
+	creating = true;
+	changes[0].before.next_block = changes[0].first_block = 0;
+	changes[0].result.next_block = 4;
+	changes[1] = changes[0];
+	UT_ASSERT(cluster_space_reservation_wal_encode(&changes[1], payload[1], sizeof(payload[1])));
+	make_plan();
+	exists = shape != 0;
+	existing_blocks = shape < 2 ? 0 : (shape == 2 ? 1 : 2);
+	memset(pages, 0, sizeof(pages));
+	if (shape == 2 || shape == 4 || shape == 6)
+		UT_ASSERT(cluster_space_identity_page_encode(&changes[0].before.identity, 100,
+													 pages[0].data, BLCKSZ));
+	if (shape == 5 || shape == 6)
+		UT_ASSERT(cluster_space_reservation_page_encode(
+			shape == 6 ? &changes[0].result : &changes[0].before, shape == 6 ? 80 : 100,
+			pages[1].data, BLCKSZ));
+	UT_ASSERT_EQ(ftruncate(fileno(file), 0), 0);
+	for (BlockNumber i = 0; i < existing_blocks; i++)
+		UT_ASSERT_EQ(
+			pwrite(fileno(file),
+				   PageIsNew(pages[i].data) ? pages[i].data : PageSetChecksumCopy(pages[i].data, i),
+				   BLCKSZ, (off_t)i * BLCKSZ),
+			BLCKSZ);
+}
+
+static bool
+create_preflight(bool cold, ClusterSpaceRecoveryBatchV1 **batch)
+{
+	if (cold) {
+		MyAuxProcType = StartupProcess;
+		return cluster_space_recovery_cold_preflight_v1(side, cold_fence, batch);
+	}
+	return cluster_space_recovery_preflight_v1(fabric, sources, 2, batch);
+}
+
+UT_TEST(test_create_missing_partial_and_complete_space_then_cross_source_advance)
+{
+	for (int cold = 0; cold < 2; cold++)
+		for (int shape = 0; shape < 7; shape++) {
+			ClusterSpaceRecoveryBatchV1 *batch = NULL;
+			ClusterSpaceIdentity identity;
+			ClusterSpaceReservation reservation;
+			PGAlignedBlock before[2];
+			BlockNumber before_blocks;
+			uint64 token;
+			int origin;
+			create_input(shape);
+			memcpy(before, pages, sizeof(before));
+			before_blocks = existing_blocks;
+			UT_ASSERT(create_preflight(cold, &batch));
+			UT_ASSERT_NOT_NULL(batch);
+			UT_ASSERT_EQ(creates, 0);
+			UT_ASSERT_EQ(extensions, 0);
+			UT_ASSERT_EQ(writes, 0);
+			UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+			if (!batch)
+				continue;
+			UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+			UT_ASSERT_EQ(creates, shape == 0);
+			UT_ASSERT_EQ(extensions, 2 - before_blocks);
+			UT_ASSERT_EQ(writes, 2);
+			UT_ASSERT_EQ(syncs, 1);
+			UT_ASSERT_EQ(wal_flushes, 0);
+			UT_ASSERT(cluster_space_identity_page_decode(pages[0].data, BLCKSZ, SPACE_FORKNUM, 0,
+														 &key, &identity, &token));
+			UT_ASSERT_EQ(token, 100);
+			UT_ASSERT(PageGetLSNOrigin(pages[0].data, &origin));
+			UT_ASSERT_EQ(origin, duties[0].origin_thread_id - 1);
+			UT_ASSERT_EQ(PageGetLSN(pages[0].data), 200);
+			UT_ASSERT(cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1,
+															&key, &reservation, &token));
+			UT_ASSERT_EQ(token, 80);
+			UT_ASSERT_EQ(reservation.next_block, 4);
+			UT_ASSERT(PageGetLSNOrigin(pages[1].data, &origin));
+			UT_ASSERT_EQ(origin, duties[1].origin_thread_id - 1);
+			cluster_space_recovery_destroy_v1(&batch);
+			UT_ASSERT(create_preflight(cold, &batch));
+			UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+			UT_ASSERT_EQ(creates, shape == 0);
+			UT_ASSERT_EQ(extensions, 2 - before_blocks);
+			cluster_space_recovery_destroy_v1(&batch);
+			UT_ASSERT(!pins && !locks && !x_locks && !hw_held);
+			UT_ASSERT(CurrentResourceOwner == source_owner);
+		}
+}
+
+UT_TEST(test_create_flush_failure_keeps_restartable_components)
+{
+	for (int fail = -1; fail < 2; fail++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		PGAlignedBlock before[2];
+		volatile bool caught = false;
+		create_input(0);
+		memcpy(before, pages, sizeof(before));
+		UT_ASSERT(create_preflight(true, &batch));
+		if (!batch)
+			continue;
+		fail_write_block = fail;
+		if (fail < 0)
+			cluster_smart_fusion = sf_blocked = true;
+		PG_TRY();
+		{
+			UT_ASSERT(!cluster_space_recovery_apply_v1(batch));
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fail >= 0);
+		UT_ASSERT_EQ(writes, fail == 1);
+		UT_ASSERT_EQ(syncs, 0);
+		UT_ASSERT_EQ(wal_flushes, 0);
+		if (fail < 0)
+			UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+		else {
+			UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 100);
+			UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 80);
+		}
+		UT_ASSERT(!pins && !locks && !x_locks && !hw_held && error_context_stack == NULL);
+		UT_ASSERT(CurrentResourceOwner == source_owner);
+		cluster_space_recovery_destroy_v1(&batch);
+		fail_write_block = -1;
+		cluster_smart_fusion = sf_blocked = false;
+		UT_ASSERT(create_preflight(true, &batch));
+		UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+		cluster_space_recovery_destroy_v1(&batch);
+	}
+}
+
+UT_TEST(test_create_never_replaces_another_incarnation_or_uses_stale_fence)
+{
+	for (int variant = 0; variant < 2; variant++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		PGAlignedBlock before[2];
+		create_input(variant == 0 ? 4 : 0);
+		if (variant == 0) {
+			ClusterSpaceIdentity wrong = changes[0].before.identity;
+			memset(wrong.incarnation, 0x45, sizeof(wrong.incarnation));
+			UT_ASSERT(cluster_space_identity_page_encode(&wrong, 100, pages[0].data, BLCKSZ));
+		}
+		memcpy(before, pages, sizeof(before));
+		if (variant == 0)
+			UT_ASSERT(!create_preflight(true, &batch));
+		else {
+			UT_ASSERT(create_preflight(true, &batch));
+			cold_current = false;
+			UT_ASSERT(!cluster_space_recovery_apply_v1(batch));
+		}
+		UT_ASSERT_EQ(creates, 0);
+		UT_ASSERT_EQ(extensions, 0);
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+		cluster_space_recovery_destroy_v1(&batch);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(22);
+	UT_RUN(test_create_missing_partial_and_complete_space_then_cross_source_advance);
+	UT_RUN(test_create_flush_failure_keeps_restartable_components);
+	UT_RUN(test_create_never_replaces_another_incarnation_or_uses_stale_fence);
 	UT_RUN(test_cold_complete_fence_installs_interleaved_reservations_and_retries);
 	UT_RUN(test_cold_owner_and_complete_source_set_required_before_io);
 	UT_RUN(test_cold_late_fence_change_never_writes);
