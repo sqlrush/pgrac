@@ -319,6 +319,20 @@ cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
 
 #ifndef FRONTEND
 
+#include "utils/guc.h"
+
+/*
+ * cluster.cold_recovery_plan_memory (kB, PGC_POSTMASTER): everything one
+ * typed cold plan may own during pass 1 (records, page versions, seal
+ * scratch; never WAL payload).  Exhausting it refuses startup before any
+ * page is modified.
+ */
+#define CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB Min(4 * 1024 * 1024, MAX_KILOBYTES)
+#define CLUSTER_COLD_PLAN_MEMORY_MIN_KB 1024
+#define CLUSTER_COLD_PLAN_MEMORY_MAX_KB MAX_KILOBYTES
+
+extern PGDLLIMPORT int cluster_cold_recovery_plan_memory;
+
 struct XLogReaderState;
 
 /*
@@ -373,6 +387,20 @@ typedef struct ClusterColdObserverV1 {
 
 extern bool cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page,
 										 ClusterColdDataV1 *out);
+
+/*
+ * Classify one block read from storage (the caller handles a missing block
+ * and fills the segment incarnation).  header_valid is the native page
+ * verification.  With data checksums the stored checksum is compared to the
+ * content here, whatever ignore_checksum_failure says: a mismatch is a torn
+ * or corrupt page (INVALID), a match proves the content.  False: a
+ * formatted page without a version token.
+ */
+extern bool cluster_cold_classify_page_v1(const char *page, BlockNumber blkno, bool header_valid,
+										  bool checksums, ClusterColdDataV1 *out);
+
+/* Operator hint for a pass-1 refusal. */
+extern const char *cluster_cold_refusal_hint_v1(ClusterColdDetailV1 detail);
 
 /* Pass-1 scan of one RECOVERY_REQUIRED root through the sealed recovery
  * visitor, feeding the plan participant at caller index `participant`.
@@ -464,10 +492,6 @@ extern void cluster_cold_replay_window_enter_v1(void);
 extern void cluster_cold_replay_window_leave_v1(void);
 extern bool cluster_cold_replay_window_active_v1(void);
 
-/* True when a page that passed verification has proven content: data
- * checksums are on and a checksum failure is not being ignored. */
-extern bool cluster_cold_checksum_proves_content_v1(bool checksums_enabled,
-													bool ignore_checksum_failure);
 
 /*
  * Per-block decision consumed by the typed cold redo consultation in

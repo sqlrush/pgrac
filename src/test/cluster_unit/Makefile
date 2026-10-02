@@ -7534,9 +7534,11 @@ test_cluster_control_root test_cluster_cf_authority: \
 
 # Typed cold recovery tests use the real plan and explicit owner boundaries.
 # Author: SqlRush <sqlrush@gmail.com>
-CLUSTER_COLD_PLAN_O = test_cluster_cold_recovery_plan_core.o
+CLUSTER_COLD_PLAN_SPLIT_O = test_cluster_cold_recovery_plan_store_core.o test_cluster_cold_recovery_plan_seal_core.o
+CLUSTER_COLD_PLAN_O = test_cluster_cold_recovery_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
 
-$(CLUSTER_COLD_PLAN_O): $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_plan.c \
+test_cluster_cold_recovery_plan_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_plan.c \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
@@ -7544,6 +7546,16 @@ test_cluster_cold_recovery_plan: test_cluster_cold_recovery_plan.c unit_test.h $
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_PLAN_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+test_cluster_cold_recovery_plan_store_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_plan_store.c \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
+
+test_cluster_cold_recovery_plan_seal_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_plan_seal.c \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
 CLUSTER_COLD_DECODE_O = test_cluster_cold_recovery_decode_core.o
 
@@ -7556,13 +7568,14 @@ test_cluster_cold_recovery_decode: test_cluster_cold_recovery_decode.c unit_test
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_DECODE_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
-CLUSTER_COLD_STARTUP_O = test_cluster_cold_recovery_startup_core.o test_cluster_cold_recovery_startup_plan_core.o
+CLUSTER_COLD_STARTUP_O = test_cluster_cold_recovery_startup_core.o test_cluster_cold_recovery_startup_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
 
 test_cluster_cold_recovery_startup_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_startup.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
 test_cluster_cold_recovery_startup_plan_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_plan.c \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
@@ -7571,9 +7584,10 @@ test_cluster_cold_recovery_startup: test_cluster_cold_recovery_startup.c unit_te
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_STARTUP_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
-D_COLD_REFAIL_O = test_cluster_cold_recovery_refail_plan_core.o
+D_COLD_REFAIL_O = test_cluster_cold_recovery_refail_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
 
-$(D_COLD_REFAIL_O): $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_plan.c \
+test_cluster_cold_recovery_refail_plan_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_plan.c \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
@@ -7582,13 +7596,14 @@ test_cluster_cold_recovery_refail: test_cluster_cold_recovery_refail.c unit_test
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(D_COLD_REFAIL_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
-D_COLD_REPLAY_O = test_cluster_cold_recovery_replay_core.o test_cluster_cold_recovery_replay_plan_core.o
+D_COLD_REPLAY_O = test_cluster_cold_recovery_replay_core.o test_cluster_cold_recovery_replay_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)
 
 test_cluster_cold_recovery_replay_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_replay.c \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
 test_cluster_cold_recovery_replay_plan_core.o: $(top_srcdir)/src/backend/cluster/cluster_cold_recovery_plan.c \
+		$(top_srcdir)/src/include/cluster/cluster_cold_recovery_plan_internal.h \
 		$(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 

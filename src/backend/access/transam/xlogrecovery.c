@@ -3089,6 +3089,8 @@ cluster_recovery_typed_fail(ClusterRecoveryFencePlan **fence_plan, ClusterColdTy
 							const char *message, const char *detail)
 {
 	char	   *detail_copy = detail != NULL ? pstrdup(detail) : NULL;
+	const char *hint = cluster_cold_refusal_hint_v1(*typed != NULL ? (*typed)->refusal
+													: CLUSTER_COLD_OK);
 	bool		released = true;
 
 	if (fence_plan != NULL && *fence_plan != NULL)
@@ -3103,9 +3105,7 @@ cluster_recovery_typed_fail(ClusterRecoveryFencePlan **fence_plan, ClusterColdTy
 			 errmsg("%s", message),
 			 detail_copy != NULL ? errdetail("%s", detail_copy) : 0,
 			 !released ? errdetail_log("Cold recovery serialization release was not confirmed.") : 0,
-			 errhint("Preserve all original thread WAL and shared configuration. Shared mode "
-					 "recovers every retained writer generation through the typed cold plan "
-					 "and never falls back to single-stream replay.")));
+			 errhint("%s", hint)));
 	pg_unreachable();
 }
 

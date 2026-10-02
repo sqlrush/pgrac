@@ -253,6 +253,7 @@ UT_TEST(test_d4_scan_cursor_roundrobin)
 int
 main(void)
 {
+	UT_PLAN(12);
 	UT_RUN(test_r1_same_gen_committed_applies);
 	UT_RUN(test_r2_same_gen_recyclable_idempotent);
 	UT_RUN(test_r3_disk_gen_higher_skips_stale);

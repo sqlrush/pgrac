@@ -3597,7 +3597,7 @@ UT_TEST(test_a148_undo_stop_does_not_confuse_extent_and_cursor_cache_with_writer
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(71);
+	UT_PLAN(74);
 	UT_RUN(test_a148_undo_stop_original_active_writer_requires_original_commit_release);
 	UT_RUN(test_a148_undo_stop_all_slots_and_late_invalid_do_not_clear_debt);
 	UT_RUN(test_a148_undo_stop_does_not_confuse_extent_and_cursor_cache_with_writer);
