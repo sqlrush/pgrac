@@ -179,10 +179,12 @@ static int test_runtime_materialize_nmembers;
 static MultiXactMember test_runtime_materialize_member;
 static uint8 test_runtime_describe_payload[sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE];
 
+static TimestampTz test_runtime_now = UINT64_C(1000000);
+
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return UINT64_C(1000000);
+	return test_runtime_now;
 }
 
 static void test_member(ClusterCurrentMxMemberDesc *member, TransactionId xid, uint8 status);
@@ -491,8 +493,13 @@ cluster_runtime_visibility_current_owner_lookup_exact_ctrc(TransactionId xid,
 
 bool
 cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid, ClusterTTStatusKey *key,
-													   ClusterTTStatusResult *result)
+													   ClusterTTStatusResult *result,
+													   bool *precommit_retry_out)
 {
+	if (precommit_retry_out != NULL)
+		*precommit_retry_out = TransactionIdIsNormal(test_runtime_local_terminal_xid)
+			&& TransactionIdEquals(xid, test_runtime_local_terminal_xid)
+			&& test_runtime_local_terminal_status == CLUSTER_TT_STATUS_IN_PROGRESS;
 	test_runtime_local_terminal_calls++;
 	UT_ASSERT_NOT_NULL(key);
 	UT_ASSERT_NOT_NULL(result);
@@ -545,7 +552,7 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 	*cross_segment_out = false;
 	if (!uba_decode(locator->uba, &data_segment, &block_no, &tt_slot_offset, &row_offset))
 		return false;
-	if (cluster_runtime_visibility_local_terminal_lookup_exact(locator->xid, key, result)) {
+	if (cluster_runtime_visibility_local_terminal_lookup_exact(locator->xid, key, result, NULL)) {
 		*cross_segment_out = key->undo_segment_id != data_segment;
 		return true;
 	}
@@ -1641,6 +1648,101 @@ UT_TEST(test_current_multixact_local_member_uses_target_canonical_not_source)
  * A retired current-segment owner and a rolled terminal slot carry no grant
  * and no participant capability generation, while an exact ACTIVE/SELF peer
  * in the same descriptor retains its own grant-bound identity. */
+UT_TEST(test_current_multixact_local_precommit_scrubs_batch_and_keeps_deadline)
+{
+	ClusterCurrentMxKey key = test_mxkey();
+	ClusterCurrentMxMemberDesc members[2];
+	ClusterCurrentMemberProof proofs[2];
+	ClusterCurrentUpdaterProof updater_proof;
+	uint32 capabilities[2];
+	TimestampTz deadline = 0;
+	uint64 hash;
+	ClusterMxResolveResult observed;
+	int pass;
+
+	cluster_node_id = 4;
+	test_runtime_epoch = 9;
+	key.cluster_epoch = (uint32)test_runtime_epoch;
+	test_member(&members[0], 102, MultiXactStatusForShare);
+	test_member(&members[1], 105, MultiXactStatusForKeyShare);
+	hash = cluster_multixact_current_descriptor_hash(&key, members, lengthof(members));
+	test_runtime_target_owner_enabled = true;
+	test_runtime_target_owner_active_xid = members[0].xid;
+	test_runtime_local_terminal_xid = members[1].xid;
+	test_runtime_local_terminal_status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	observed = cluster_multixact_current_members_resolve_until(
+		&key, members, lengthof(members), hash, NULL, proofs, &updater_proof, capabilities,
+		&deadline);
+	/* Restore fixture inputs before asserting the intentional RED. */
+	test_runtime_target_owner_enabled = false;
+	test_runtime_target_owner_active_xid = InvalidTransactionId;
+	test_runtime_local_terminal_xid = InvalidTransactionId;
+	test_runtime_local_terminal_status = CLUSTER_TT_STATUS_UNKNOWN;
+	cluster_node_id = -1;
+	UT_ASSERT_EQ(observed, CMX_RESOLVE_RETRY);
+	UT_ASSERT_EQ(deadline, (TimestampTz)UINT64_C(2000000));
+	for (pass = 0; pass < 2; pass++) {
+		UT_ASSERT_EQ(proofs[pass].state, CCM_UNKNOWN);
+		UT_ASSERT_EQ(ClusterCurrentMemberProofGetCtrcGrant(&proofs[pass]), 0);
+		UT_ASSERT_EQ(capabilities[pass], 0);
+	}
+	UT_ASSERT_EQ(updater_proof.verdict, CUCP_UNKNOWN);
+}
+
+UT_TEST(test_current_multixact_precommit_retry_respects_original_deadline)
+{
+	ClusterCurrentMxKey key = test_mxkey();
+	ClusterCurrentMxMemberDesc members[2];
+	ClusterCurrentMemberProof proofs[2];
+	ClusterCurrentUpdaterProof updater;
+	uint32 capabilities[2];
+	TimestampTz deadline;
+	uint64 hash;
+	int pass;
+
+	cluster_node_id = 4;
+	test_runtime_epoch = 9;
+	key.cluster_epoch = 9;
+	test_member(&members[0], 102, MultiXactStatusForShare);
+	test_member(&members[1], 105, MultiXactStatusForKeyShare);
+	hash = cluster_multixact_current_descriptor_hash(&key, members, lengthof(members));
+	test_runtime_target_owner_enabled = true;
+	test_runtime_target_owner_active_xid = members[0].xid;
+	test_runtime_local_terminal_xid = members[1].xid;
+	for (pass = 0; pass < 3; pass++) {
+		deadline = 0;
+		test_runtime_now = UINT64_C(1000000);
+		test_runtime_local_terminal_status = CLUSTER_TT_STATUS_IN_PROGRESS;
+		UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(&key, members, 2, hash,
+			NULL, proofs, &updater, capabilities, &deadline), CMX_RESOLVE_RETRY);
+		UT_ASSERT_EQ(deadline, (TimestampTz)UINT64_C(2000000));
+		test_runtime_now += UINT64_C(500000);
+		UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(&key, members, 2, hash,
+			NULL, proofs, &updater, capabilities, &deadline), CMX_RESOLVE_RETRY);
+		UT_ASSERT_EQ(deadline, (TimestampTz)UINT64_C(2000000));
+		if (pass < 2) {
+			test_runtime_local_terminal_status = pass == 0 ? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_ABORTED;
+			UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(&key, members, 2, hash,
+				NULL, proofs, &updater, capabilities, &deadline), CMX_RESOLVE_OK);
+			UT_ASSERT_EQ(proofs[1].state, pass == 0 ? CCM_COMMITTED : CCM_ABORTED);
+			UT_ASSERT_EQ(ClusterCurrentMemberProofGetCtrcGrant(&proofs[1]), 0);
+		} else {
+			test_runtime_now = deadline;
+			UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(&key, members, 2, hash,
+				NULL, proofs, &updater, capabilities, &deadline), CMX_RESOLVE_TIMEOUT);
+			UT_ASSERT_EQ(proofs[0].state, CCM_UNKNOWN);
+			UT_ASSERT_EQ(proofs[1].state, CCM_UNKNOWN);
+		}
+		UT_ASSERT_EQ(deadline, (TimestampTz)UINT64_C(2000000));
+	}
+	test_runtime_now = UINT64_C(1000000);
+	test_runtime_target_owner_enabled = false;
+	test_runtime_target_owner_active_xid = InvalidTransactionId;
+	test_runtime_local_terminal_xid = InvalidTransactionId;
+	test_runtime_local_terminal_status = CLUSTER_TT_STATUS_UNKNOWN;
+	cluster_node_id = -1;
+}
+
 UT_TEST(test_current_multixact_local_terminal_uses_physical_current_or_rolled)
 {
 	ClusterCurrentMxKey key = test_mxkey();
@@ -3330,7 +3432,9 @@ UT_TEST(test_current_multixact_origin_serves_member_proof_on_capability_bound_re
 int
 main(void)
 {
-	UT_PLAN(51);
+	UT_PLAN(53);
+	UT_RUN(test_current_multixact_precommit_retry_respects_original_deadline);
+	UT_RUN(test_current_multixact_local_precommit_scrubs_batch_and_keeps_deadline);
 	UT_RUN(test_current_multixact_public_symbols_link);
 	UT_RUN(test_current_multixact_router_domain_binding);
 	UT_RUN(test_current_multixact_descriptor_validation);

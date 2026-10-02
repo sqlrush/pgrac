@@ -622,7 +622,8 @@ bool
 cluster_runtime_visibility_physical_locator_sample_held(
 	const ClusterTTSlotPhysicalLocator *locator, const ClusterSemanticAdmissionToken *admission,
 	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
-	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out, bool *ctrc_physical_active_out)
+	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out, bool *ctrc_physical_active_out,
+	bool *precommit_retry_out)
 {
 	ClusterUndoBlock0Generation generation = { false, 0 };
 	ClusterUndoBlock0Generation final_generation = { false, 0 };
@@ -654,6 +655,8 @@ cluster_runtime_visibility_physical_locator_sample_held(
 	}
 	if (ctrc_physical_active_out != NULL)
 		*ctrc_physical_active_out = false;
+	if (precommit_retry_out != NULL)
+		*precommit_retry_out = false;
 	memset(&final_root, 0, sizeof(final_root));
 	memset(&current_owner, 0, sizeof(current_owner));
 	memset(&final_owner, 0, sizeof(final_owner));
@@ -753,6 +756,9 @@ cluster_runtime_visibility_physical_locator_sample_held(
 		*ctrc_physical_active_out
 			= exact_slot.xid == locator->xid && exact_slot.wrap == locator->wrap
 			  && exact_slot.status == TT_SLOT_ACTIVE && exact_slot.commit_scn == InvalidScn;
+	if (precommit_retry_out != NULL)
+		*precommit_retry_out = outcome == CLUSTER_TX_IN_PROGRESS
+			&& exact_slot.status == TT_SLOT_COMMITTED && SCN_VALID(exact_slot.commit_scn);
 	return true;
 }
 
@@ -1163,7 +1169,8 @@ cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(
 bool
 cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid,
 													   ClusterTTStatusKey *key_out,
-													   ClusterTTStatusResult *result_out)
+													   ClusterTTStatusResult *result_out,
+													   bool *precommit_retry_out)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterUndoBlock0LogicalKey logical;
@@ -1178,8 +1185,11 @@ cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid,
 	uint16 slot_wrap = TT_WRAP_INVALID;
 	uint64 epoch;
 	bool sampled = false;
+	bool precommit_retry = false;
 	bool physical_active = false;
 
+	if (precommit_retry_out != NULL)
+		*precommit_retry_out = false;
 	if (key_out != NULL)
 		MemSet(key_out, 0, sizeof(*key_out));
 	if (result_out != NULL) {
@@ -1232,7 +1242,8 @@ cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid,
 														 &current_result)
 			== CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
 			sampled = cluster_runtime_visibility_physical_locator_sample_held(
-				&locator, &admission, &guard, &root, key_out, result_out, &physical_active);
+				&locator, &admission, &guard, &root, key_out, result_out, &physical_active,
+				&precommit_retry);
 		if (sampled
 			&& (physical_active
 				|| (result_out->status != CLUSTER_TT_STATUS_COMMITTED
@@ -1243,17 +1254,20 @@ cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid,
 				!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
 				cluster_undo_block0_current_cancel(&guard);
 				sampled = false;
+				precommit_retry = false;
 			}
 			cleanup.active = false;
 		}
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
 								PointerGetDatum(&cleanup));
-	if (sampled
+	if ((sampled || precommit_retry)
 		&& (cluster_epoch_get_current() != epoch
 			|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY,
-															 &admission)))
+															 &admission))) {
 		sampled = false;
+		precommit_retry = false;
+	}
 
 done:
 	if (admission.entered)
@@ -1264,6 +1278,8 @@ done:
 		result_out->status = CLUSTER_TT_STATUS_UNKNOWN;
 		result_out->commit_scn = InvalidScn;
 	}
+	if (precommit_retry_out != NULL)
+		*precommit_retry_out = precommit_retry;
 	return sampled;
 }
 
@@ -2205,7 +2221,7 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 
 		if (!cluster_runtime_visibility_physical_locator_sample_held(
 				&physical, &admission, &guard, &phase_root, &sampled_key, &sampled_result,
-				&physical_active))
+				&physical_active, NULL))
 			goto protected_done;
 		if (sampled_result.status == CLUSTER_TT_STATUS_IN_PROGRESS) {
 			owner.segment_id = physical.segment_id;

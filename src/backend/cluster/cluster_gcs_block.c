@@ -7890,6 +7890,7 @@ gcs_block_current_mx_origin_sample_held(GcsBlockR4TxOriginContext *context)
 		ClusterCtrcTxnKeyV1 ctrc_key;
 		ClusterCtrcTouchResult touch_result;
 		bool ctrc_physical_active = false;
+		bool precommit_retry = false;
 		uint32 ctrc_grant = 0;
 
 		memset(&final_root, 0, sizeof(final_root));
@@ -7911,7 +7912,7 @@ gcs_block_current_mx_origin_sample_held(GcsBlockR4TxOriginContext *context)
 		memset(&result, 0, sizeof(result));
 		if (!cluster_runtime_visibility_physical_locator_sample_held(
 				&context->current_mx_locators[i], &context->admission, &context->guard,
-				&context->tt_root, &key, &result, &ctrc_physical_active))
+				&context->tt_root, &key, &result, &ctrc_physical_active, &precommit_retry))
 			return false;
 		context->current_mx_sampled_keys[i] = key;
 		if (!cluster_multixact_current_resolve_origin_member_proof(
@@ -7921,8 +7922,17 @@ gcs_block_current_mx_origin_sample_held(GcsBlockR4TxOriginContext *context)
 			return false;
 		if (context->current_mx_proofs[i].state == CCM_ACTIVE
 			|| context->current_mx_proofs[i].state == CCM_SELF) {
-			if (!ctrc_physical_active)
+			if (!ctrc_physical_active) {
+				if (!precommit_retry)
+					return false;
+				/* Canonical precommit is retryable, never an ACTIVE grant.
+				 * The owner must finish the existing release before replying. */
+				context->current_mx_result = CMX_RESOLVE_RETRY;
+				context->current_mx_proof_count = 0;
+				memset(context->current_mx_proofs, 0, sizeof(context->current_mx_proofs));
+				memset(context->current_mx_ctrc_keys, 0, sizeof(context->current_mx_ctrc_keys));
 				return false;
+			}
 			if (cluster_undo_block0_current_sample_generation(&context->guard, &context->tt_root,
 															  &generation)
 					!= CLUSTER_UNDO_BLOCK0_OK
@@ -8381,8 +8391,10 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 			context->guard_active = false;
 			context->outcome = CLUSTER_TX_UNKNOWN;
 			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
-			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+				context->current_mx_result = CMX_RESOLVE_UNKNOWN;
 				context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_RELEASE;
+			}
 			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
 		}
 		break;
@@ -8411,8 +8423,10 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 			context->guard_active = false;
 			context->outcome = CLUSTER_TX_UNKNOWN;
 			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
-			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+				context->current_mx_result = CMX_RESOLVE_UNKNOWN;
 				context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_RELEASE;
+			}
 			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
 		}
 		break;
@@ -8487,6 +8501,10 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 			context->guard_active = false;
 			context->outcome = CLUSTER_TX_UNKNOWN;
 			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+				context->current_mx_result = CMX_RESOLVE_UNKNOWN;
+				context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_RELEASE;
+			}
 			memset(&context->resolution, 0, sizeof(context->resolution));
 			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
 		}
@@ -8506,6 +8524,10 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 			context->guard_active = false;
 			context->outcome = CLUSTER_TX_UNKNOWN;
 			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+				context->current_mx_result = CMX_RESOLVE_UNKNOWN;
+				context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_RELEASE;
+			}
 			memset(&context->resolution, 0, sizeof(context->resolution));
 			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
 		}

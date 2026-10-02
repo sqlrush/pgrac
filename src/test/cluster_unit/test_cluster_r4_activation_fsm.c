@@ -135,6 +135,10 @@ static uint32 test_peer_capability_word;
 static uint32 test_peer_capability_generation;
 static int test_peer_capability_sample_calls[CLUSTER_MAX_NODES];
 static int test_capability_missing_peer = -1;
+static uint64 test_capability_missing_bitmap;
+static bool test_capture_activation_log;
+static unsigned test_activation_diag_logs;
+static char test_activation_last_diag[512];
 static bool test_terminal_peer_record_enabled;
 static bool test_terminal_peer_eligible;
 static ClusterSfPeerCap test_terminal_peer_record;
@@ -602,7 +606,8 @@ cluster_sf_peer_capability_record_snapshot(int32 peer_id, ClusterSfPeerCap *out)
 		return true;
 	}
 	test_peer_capability_sample_calls[peer_id]++;
-	out->valid = test_peer_capability_word_sample_ok && peer_id != test_capability_missing_peer;
+	out->valid = test_peer_capability_word_sample_ok && peer_id != test_capability_missing_peer
+		&& (test_capability_missing_bitmap & (UINT64_C(1) << peer_id)) == 0;
 	out->bits = test_peer_capability_word;
 	out->generation = test_peer_capability_generation;
 	return true;
@@ -957,9 +962,9 @@ test_read_barrier(void)
 #define pg_read_barrier() test_read_barrier()
 
 bool
-errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart(int elevel, const char *domain pg_attribute_unused())
 {
-	return false;
+	return test_capture_activation_log && elevel == LOG;
 }
 
 bool
@@ -980,7 +985,20 @@ errcode(int sqlerrcode pg_attribute_unused())
 }
 
 int
-errmsg(const char *fmt pg_attribute_unused(), ...)
+errmsg(const char *fmt, ...)
+{
+	va_list args;
+	if (test_capture_activation_log && strstr(fmt, "semantic activation round") != NULL) {
+		test_activation_diag_logs++;
+		va_start(args, fmt);
+		vsnprintf(test_activation_last_diag, sizeof(test_activation_last_diag), fmt, args);
+		va_end(args);
+	}
+	return 0;
+}
+
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
@@ -1046,6 +1064,10 @@ test_gate_inflight(ClusterSemanticAdmissionSide side, int feature_index)
 static void
 test_gate_reset(void)
 {
+	test_capture_activation_log = false;
+	test_activation_diag_logs = 0;
+	test_activation_last_diag[0] = '\0';
+	test_capability_missing_bitmap = 0;
 	memset(&test_normal_start_completion, 0, sizeof(test_normal_start_completion));
 	test_normal_start_found = false;
 	test_normal_start_requested_size = 0;
@@ -9439,6 +9461,154 @@ UT_TEST(test_clean_restart_missing_request_peer_retains_same_round)
 	test_gate_reset();
 }
 
+/* Same real restart owner/ACK machinery as the clean-boot acceptance above. */
+static void
+ut_s17_waiting_ack(void)
+{
+	ut_a142_setup(3);
+	MyAuxProcType = LmonProcess;
+	ut_a148_ready_input();
+	cluster_semantic_activation_lmon_tick();
+	(void)ut_a142_complete_open_read(0);
+	ut_a142_frame(0, false, 23, 0);
+	test_capability_missing_bitmap = 6;
+	test_capture_activation_log = true;
+	ut_a142_local_root(false);
+}
+
+UT_TEST(test_restart_wait_diagnostic_tracks_current_peer_and_logs_once)
+{
+	const char *domain, *reason;
+	uint64 key, pending;
+	ut_s17_waiting_ack();
+	pending = semantic_activation_ack_local_pending_send.pending_members_lo;
+	for (int tick = 0; tick < 12; tick++) {
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_STR_EQ(domain, "R4_ACK_SEND");
+		UT_ASSERT_STR_EQ(reason, "SEMANTIC_ACK_PEER_CAPABILITY_PENDING");
+		UT_ASSERT_EQ(key, 1);
+		UT_ASSERT_EQ(SemanticActivationAckTable->round_nonce, 23);
+		UT_ASSERT_EQ(semantic_activation_ack_local_pending_send.pending_members_lo, pending);
+		UT_ASSERT(!semantic_activation_restart.opened);
+	}
+	UT_ASSERT_EQ(test_activation_diag_logs, 1);
+	UT_ASSERT(strstr(test_activation_last_diag, "nonce=23") != NULL);
+	UT_ASSERT(strstr(test_activation_last_diag, "epoch=0") != NULL);
+	UT_ASSERT(strstr(test_activation_last_diag, "phase=5") != NULL);
+	test_capability_missing_bitmap = 4;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_STR_EQ(reason, "SEMANTIC_ACK_PEER_CAPABILITY_PENDING");
+	UT_ASSERT_EQ(key, 2);
+	UT_ASSERT_EQ(test_activation_diag_logs, 1);
+	test_capability_missing_bitmap = 0;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(semantic_activation_ack_local_pending_send.pending_members_lo, 0);
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(reason, "SEMANTIC_ACK_PEER_CAPABILITY_PENDING") != 0);
+	UT_ASSERT(!semantic_activation_restart.opened); /* clearing text proves nothing */
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "SEMANTIC_STOP_OWNER_OR_SHARED_STATE_INVALID");
+	test_gate_reset();
+}
+
+UT_TEST(test_restart_epoch_change_retires_the_old_missing_peer_diagnostic)
+{
+	const char *domain, *reason;
+	uint64 key;
+	ut_s17_waiting_ack();
+	test_capability_missing_bitmap = 0;
+	test_current_epoch++;
+	for (int tick = 0; tick < 3; tick++) {
+		cluster_semantic_activation_lmon_tick();
+		/* The original restart owner waits here. Diagnostics do not turn its
+		 * verdict into either INVALID or READY. */
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_STR_EQ(reason, "SEMANTIC_RESTART_EPOCH_CHANGED");
+		UT_ASSERT_EQ(key, 3);
+		UT_ASSERT(!semantic_activation_restart.opened);
+	}
+	UT_ASSERT_EQ(test_activation_diag_logs, 2);
+	test_gate_reset();
+}
+
+UT_TEST(test_restart_final_record_contradiction_retains_first_diagnostic)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		const char *reason;
+		ClusterSemanticActivationRecord open;
+		uint8 root[512];
+		ut_s17_waiting_ack();
+		test_capability_missing_bitmap = 0;
+		cluster_semantic_activation_lmon_tick();
+		if (fault == 0) {
+			SemanticActivationAckTable->record_generation++;
+			cluster_semantic_activation_lmon_tick();
+		} else {
+			for (int peer = 0; peer < 3; peer++)
+				ut_a142_frame(peer, true, 23, UINT64_C(0x100) + peer);
+			cluster_semantic_activation_lmon_tick();
+			(void)ut_a142_complete_open_read(1); /* valid, different PGSA */
+		}
+		UT_ASSERT(semantic_activation_restart.failed);
+		for (int tick = 0; tick < 3; tick++) {
+			cluster_semantic_activation_lmon_tick();
+			UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(NULL, NULL, &reason),
+						 CLUSTER_NORMAL_STOP_INVALID);
+			UT_ASSERT_STR_EQ(reason, "SEMANTIC_RESTART_RECORD_CHANGED");
+			UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&open, root, NULL, &reason),
+						 CLUSTER_NORMAL_STOP_INVALID);
+			UT_ASSERT_STR_EQ(reason, "SEMANTIC_RESTART_RECORD_CHANGED");
+		}
+		UT_ASSERT_EQ(test_activation_diag_logs, 2);
+		UT_ASSERT(!semantic_activation_restart.opened);
+		test_gate_reset();
+	}
+}
+
+UT_TEST(test_restart_invalidation_keeps_first_reason_through_normal_stop)
+{
+	const char *expected[] = { "SEMANTIC_ACK_CAPABILITY_INVALID",
+		"SEMANTIC_RESTART_READY_IDENTITY_INVALID", "SEMANTIC_RESTART_READY_IDENTITY_INVALID",
+		"SEMANTIC_ACK_SEND_FAILED", "SEMANTIC_ACK_PEER_IDENTITY_INVALID" };
+	for (int fault = 0; fault < 5; fault++) {
+		const char *domain, *reason;
+		uint64 key;
+		ClusterSemanticActivationRecord open;
+		uint8 root[512];
+		ut_s17_waiting_ack();
+		test_capability_missing_bitmap = 0;
+		switch (fault) {
+		case 0: test_peer_capability_word &= ~PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1; break;
+		case 1: NormalStartCompletion->boot_incarnation++; break;
+		case 2: NormalStartCompletion->pgrd[511] ^= 1; break;
+		case 3: test_send_results[1] = CLUSTER_IC_SEND_HARD_ERROR; break;
+		case 4: ut_a142_frame(0, true, 23, UINT64_C(0x999)); break;
+		}
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT(semantic_activation_restart.failed);
+		for (int tick = 0; tick < 3; tick++) {
+			cluster_semantic_activation_lmon_tick();
+			UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+						 CLUSTER_NORMAL_STOP_INVALID);
+			UT_ASSERT_STR_EQ(reason, expected[fault]);
+			UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&open, root, NULL, &reason),
+						 CLUSTER_NORMAL_STOP_INVALID);
+			UT_ASSERT_STR_EQ(reason, expected[fault]);
+			UT_ASSERT(!semantic_activation_restart.opened);
+		}
+		UT_ASSERT_EQ(test_activation_diag_logs, 2); /* first wait, first invalid */
+		test_gate_reset();
+	}
+}
+
 UT_TEST(test_clean_restart_proven_capability_contradiction_still_invalidates)
 {
 	for (int fault = 0; fault < 2; fault++) {
@@ -10782,7 +10952,7 @@ UT_TEST(test_a148_stop_poll_includes_original_phase3_handoff)
 int
 main(void)
 {
-	UT_PLAN(314);
+	UT_PLAN(318);
 	UT_RUN(test_normal_actual_finish_preserves_unconfigured_native_startup);
 	UT_RUN(test_normal_start_pending_ack_does_not_reuse_root_after_valid_mirror_drift);
 	UT_RUN(test_normal_start_confirmed_new_root_permanently_rejects_old_completion);
@@ -11053,6 +11223,10 @@ main(void)
 	UT_RUN(test_normal_start_pending_self_ack_rechecks_completion_at_actual_send);
 	UT_RUN(test_clean_restart_missing_fanout_peer_retries_before_open);
 	UT_RUN(test_clean_restart_missing_request_peer_retains_same_round);
+	UT_RUN(test_restart_wait_diagnostic_tracks_current_peer_and_logs_once);
+	UT_RUN(test_restart_epoch_change_retires_the_old_missing_peer_diagnostic);
+	UT_RUN(test_restart_final_record_contradiction_retains_first_diagnostic);
+	UT_RUN(test_restart_invalidation_keeps_first_reason_through_normal_stop);
 	UT_RUN(test_clean_restart_proven_capability_contradiction_still_invalidates);
 	UT_RUN(test_clean_restart_delayed_peer_cannot_restore_old_identity);
 	UT_RUN(test_normal_start_only_strict_zero_is_source);

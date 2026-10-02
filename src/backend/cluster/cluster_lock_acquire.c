@@ -274,6 +274,8 @@ cluster_lock_acquire_is_cf_request(const ClusterLockAcquireRequest *req)
 		   && (req->lockmode == ShareLock || req->lockmode == ExclusiveLock);
 }
 
+static bool cluster_lock_acquire_is_hw_request(const ClusterLockAcquireRequest *req);
+
 /*
  * S3 partition + reservation — spec-2.17 §1.4 Q6 F3 race window 防御。
  *
@@ -323,8 +325,11 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 	pg_atomic_fetch_add_u64(&stub_s3_reservation_count, 1);
 	/* Compatible siblings may mutate the entry while acquisition runs.  Use
 	 * the existing local/remote master in S4, not an optimistic entry revision
-	 * as a second grant authority.  CF does not take a PG-native lock. */
-	if (cluster_lock_acquire_is_relation_request(req) || cluster_lock_acquire_is_cf_request(req))
+	 * as a second grant authority. CF has no PG-native lock; HW acquires its
+	 * native relation-extension lock only after this global handoff, so local
+	 * HW reservations can overlap here too. */
+	if (cluster_lock_acquire_is_relation_request(req) || cluster_lock_acquire_is_cf_request(req)
+		|| cluster_lock_acquire_is_hw_request(req))
 		return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 
 	if (cluster_local_fast_path_enabled && fast_path) {
@@ -662,7 +667,9 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 		ClusterGesHwGrant *grant = &((ClusterLockAcquireRequest *)req)->hw_grant;
 		volatile bool promoted = false;
 		bool mode_aware = cluster_lock_acquire_is_relation_request(req)
-						  || cluster_lock_acquire_is_cf_request(req);
+						  || cluster_lock_acquire_is_cf_request(req)
+						  || (cluster_lock_acquire_is_hw_request(req)
+							  && grant->master == cluster_node_id);
 
 		if (grant->consumed) {
 			mut->registration_failure_reason = "GRANT_ALREADY_CONSUMED";

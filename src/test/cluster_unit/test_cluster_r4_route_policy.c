@@ -370,6 +370,22 @@ cluster_multixact_current_member_proof_bind_ctrc(ClusterCurrentMemberProof *proo
 	return true;
 }
 
+static bool mx_origin_sample_enabled;
+static ClusterTTStatus mx_origin_sample_status;
+static bool mx_origin_physical_active;
+static bool mx_origin_precommit_sample;
+static int mx_origin_guard_held;
+static int mx_origin_reply_calls;
+static ClusterMxResolveResult mx_origin_reply_result;
+static uint16 mx_origin_reply_count;
+static bool mx_origin_release_pending;
+static bool mx_origin_release_failed;
+static int mx_origin_release_poll_calls;
+
+#define cluster_cr_server_current_mx_build_proof_page test_actual_current_mx_build_proof_page
+#include "test_cluster_current_mx_reply_builder.inc"
+#undef cluster_cr_server_current_mx_build_proof_page
+
 ClusterMxResolveResult
 cluster_cr_server_current_mx_build_proof_page(
 	uint16 source_node_id pg_attribute_unused(),
@@ -380,7 +396,23 @@ cluster_cr_server_current_mx_build_proof_page(
 	const ClusterCurrentUpdaterProof *updater_proof pg_attribute_unused(),
 	ClusterCurrentMxProofReplyPage *page pg_attribute_unused())
 {
-	return result;
+	static const ClusterCurrentMxProofReplyPage empty_page;
+	ClusterMxResolveResult built = test_actual_current_mx_build_proof_page(
+		source_node_id, request, result, requester_capability_generation, proofs,
+		proof_count, updater_proof, page);
+
+	if (mx_origin_sample_enabled) {
+		UT_ASSERT_EQ(mx_origin_guard_held, 0);
+		mx_origin_reply_calls++;
+		mx_origin_reply_result = built;
+		mx_origin_reply_count = page->header.entry_count;
+		if (built != CMX_RESOLVE_OK) {
+			UT_ASSERT_EQ(page->header.entry_count, 0);
+			UT_ASSERT_EQ(page->header.requester_capability_generation, 0);
+			UT_ASSERT_EQ(memcmp(&page->body, &empty_page.body, sizeof(page->body)), 0);
+		}
+	}
+	return built;
 }
 
 bool
@@ -492,7 +524,13 @@ cluster_multixact_current_resolve_origin_member_proof(
 	void *exact_lookup_arg pg_attribute_unused(),
 	ClusterCurrentMemberProof *proof pg_attribute_unused())
 {
-	return false;
+	if (!mx_origin_sample_enabled || !initial_result->authoritative
+		|| initial_result->status == CLUSTER_TT_STATUS_UNKNOWN)
+		return false;
+	memset(proof, 0, sizeof(*proof));
+	proof->state = initial_result->status == CLUSTER_TT_STATUS_IN_PROGRESS ? CCM_ACTIVE
+		: initial_result->status == CLUSTER_TT_STATUS_COMMITTED ? CCM_COMMITTED : CCM_ABORTED;
+	return true;
 }
 
 void
@@ -548,6 +586,19 @@ cluster_runtime_visibility_origin_plan_canonical_physical(
 	ClusterTTSlotPhysicalLocator *locator_out pg_attribute_unused(),
 	bool *same_segment_out pg_attribute_unused())
 {
+	if (mx_origin_sample_enabled && plan != NULL && plan->opaque[0] == 1
+		&& locator_out != NULL && same_segment_out != NULL) {
+		ClusterTxLocator data;
+
+		memcpy(&data, plan->opaque + 8, sizeof(data));
+		memset(locator_out, 0, sizeof(*locator_out));
+		locator_out->segment_id = 5;
+		locator_out->xid = data.xid;
+		locator_out->slot_offset = 3;
+		locator_out->wrap = 7;
+		*same_segment_out = true;
+		return true;
+	}
 	return false;
 }
 
@@ -559,9 +610,27 @@ cluster_runtime_visibility_physical_locator_sample_held(
 	const ClusterUndoBlock0ResolvedRoot *root pg_attribute_unused(),
 	ClusterTTStatusKey *key_out pg_attribute_unused(),
 	ClusterTTStatusResult *result_out pg_attribute_unused(),
-	bool *ctrc_physical_active_out pg_attribute_unused())
+	bool *ctrc_physical_active_out pg_attribute_unused(),
+	bool *precommit_retry_out)
 {
-	return false;
+	if (!mx_origin_sample_enabled)
+		return false;
+	UT_ASSERT_EQ(mx_origin_guard_held, 1);
+	memset(key_out, 0, sizeof(*key_out));
+	key_out->origin_node_id = (uint16)cluster_node_id;
+	key_out->undo_segment_id = locator->segment_id;
+	key_out->tt_slot_id = locator->slot_offset + 1;
+	key_out->local_xid = locator->xid;
+	key_out->cluster_epoch = (uint32)admission->formation_epoch;
+	memset(result_out, 0, sizeof(*result_out));
+	result_out->status = mx_origin_sample_status;
+	result_out->status_epoch = key_out->cluster_epoch;
+	result_out->authoritative = mx_origin_sample_status != CLUSTER_TT_STATUS_UNKNOWN;
+	result_out->commit_scn = mx_origin_sample_status == CLUSTER_TT_STATUS_COMMITTED ? 101 : InvalidScn;
+	*ctrc_physical_active_out = mx_origin_physical_active;
+	*precommit_retry_out = mx_origin_precommit_sample
+		&& mx_origin_sample_status == CLUSTER_TT_STATUS_IN_PROGRESS;
+	return result_out->authoritative;
 }
 
 bool
@@ -588,6 +657,12 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node pg_attribute_un
 												 uint16 *out_wrap pg_attribute_unused(),
 												 uint8 *out_status pg_attribute_unused())
 {
+	if (mx_origin_sample_enabled) {
+		*out_seg = 5;
+		*out_slot = 3;
+		*out_wrap = 7;
+		return CLUSTER_TT_DURABLE_LOCATE_FOUND;
+	}
 	return CLUSTER_TT_DURABLE_LOCATE_MISSING;
 }
 
@@ -1154,6 +1229,17 @@ route_seam_reset(void)
 {
 	stop_new_read_allowed = true;
 	stop_new_read_calls = 0;
+	mx_origin_sample_enabled = false;
+	mx_origin_sample_status = CLUSTER_TT_STATUS_UNKNOWN;
+	mx_origin_physical_active = false;
+	mx_origin_precommit_sample = true;
+	mx_origin_guard_held = 0;
+	mx_origin_reply_calls = 0;
+	mx_origin_reply_result = CMX_RESOLVE_UNKNOWN;
+	mx_origin_reply_count = 0;
+	mx_origin_release_pending = false;
+	mx_origin_release_failed = false;
+	mx_origin_release_poll_calls = 0;
 	memset(&route_seam, 0, sizeof(route_seam));
 	origin_generation_sample_enabled = false;
 	origin_generation_sample_value = 9;
@@ -1996,6 +2082,8 @@ cluster_undo_block0_current_acquire_begin_admitted(const ClusterUndoBlock0Logica
 		|| (key->segment_id != 5 && key->segment_id != 6) || mode != CLUSTER_UNDO_BLOCK0_SCUR
 		|| admission == NULL || !admission->entered || guard == NULL)
 		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	if (mx_origin_sample_enabled)
+		mx_origin_guard_held++;
 	return CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 }
 
@@ -2010,6 +2098,8 @@ void
 cluster_undo_block0_current_cancel(ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused())
 {
 	route_seam.candidate_cancel_calls++;
+	if (mx_origin_sample_enabled)
+		mx_origin_guard_held = 0;
 }
 
 ClusterUndoBlock0CurrentStep
@@ -2019,6 +2109,16 @@ cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard,
 	route_seam.candidate_release_begin_calls++;
 	if (failure != NULL)
 		*failure = CLUSTER_UNDO_BLOCK0_OK;
+	if (mx_origin_sample_enabled) {
+		UT_ASSERT_EQ(mx_origin_guard_held, 1);
+		if (mx_origin_release_pending)
+			return CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
+		mx_origin_guard_held--;
+		if (mx_origin_release_failed) {
+			*failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+			return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+		}
+	}
 	return guard != NULL ? CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED
 						 : CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 }
@@ -2027,6 +2127,14 @@ ClusterUndoBlock0CurrentStep
 cluster_undo_block0_current_release_poll(ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
 										 ClusterUndoBlock0Result *failure pg_attribute_unused())
 {
+	if (mx_origin_sample_enabled) {
+		mx_origin_release_poll_calls++;
+		if (mx_origin_release_pending)
+			return CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
+		mx_origin_guard_held--;
+		return mx_origin_release_failed ? CLUSTER_UNDO_BLOCK0_CURRENT_FAILED
+			: CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
+	}
 	return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 }
 
@@ -2063,6 +2171,15 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 	ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
 {
 	route_seam.candidate_resolve_calls++;
+	if (mx_origin_sample_enabled && expected_generation == NULL
+		&& mode == CLUSTER_TX_RESOLVE_VISIBILITY && locator != NULL
+		&& admission != NULL && admission->entered && guard != NULL && root != NULL
+		&& root->root_id == UINT64_C(0x8000) && plan != NULL) {
+		memset(plan, 0, sizeof(*plan));
+		plan->opaque[0] = 1;
+		memcpy(plan->opaque + 8, locator, sizeof(*locator));
+		return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE;
+	}
 	if (locator == NULL
 		|| (mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS && mode != CLUSTER_TX_RESOLVE_VISIBILITY)
 		|| admission == NULL || !admission->entered || expected_generation == NULL
@@ -3611,6 +3728,158 @@ UT_TEST(test_current_mx_member_proof_forward128_routes_to_cooperative_origin)
 	cluster_gcs_block_test_r4_tx_origin_drain(); /* RED-only original cleanup. */
 	stop_new_read_allowed = true;
 
+	cluster_node_id = saved_node_id;
+}
+
+static void
+init_current_mx_origin_request(ClusterCurrentMxProofForwardV2 *request, ClusterICEnvelope *env)
+{
+	memset(request, 0, sizeof(*request));
+	request->prefix.request_id = UT_REQUEST_ID;
+	request->prefix.epoch = UT_FORMATION_EPOCH;
+	request->prefix.mxkey.origin_node_id = UT_MASTER_NODE;
+	request->prefix.mxkey.multixact_id = (MultiXactId)46;
+	request->prefix.mxkey.cluster_epoch = (uint32)UT_FORMATION_EPOCH;
+	request->prefix.original_requester_node = UT_REQUESTER_NODE;
+	request->prefix.requester_backend_id = UT_REQUESTER_BACKEND;
+	request->prefix.total_count = 1;
+	request->prefix.entry_count = 1;
+	request->prefix.body_kind = CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS;
+	request->prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	request->trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	request->trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	request->trailer.body.asks[0].xid = (TransactionId)503;
+	request->trailer.body.asks[0].member_status = MultiXactStatusForShare;
+	*env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE, UT_MASTER_NODE,
+							  sizeof(*request));
+}
+
+UT_TEST(test_current_mx_precommit_origin_releases_before_retry)
+{
+	ClusterCurrentMxProofForwardV2 request;
+	ClusterICEnvelope env;
+	int saved_node_id = cluster_node_id;
+	ClusterMxResolveResult observed;
+
+	cluster_node_id = UT_MASTER_NODE;
+	route_seam_reset();
+	mx_origin_sample_enabled = true;
+	mx_origin_sample_status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	mx_origin_release_pending = true;
+	init_current_mx_origin_request(&request, &env);
+	UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
+	cluster_gcs_block_test_r4_tx_origin_drain();
+	UT_ASSERT_EQ(mx_origin_reply_calls, 0);
+	UT_ASSERT_EQ(mx_origin_guard_held, 1);
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 1);
+	mx_origin_release_pending = false;
+	cluster_gcs_block_test_r4_tx_origin_drain();
+	observed = mx_origin_reply_result;
+	mx_origin_sample_enabled = false;
+	cluster_node_id = saved_node_id;
+	UT_ASSERT_EQ(mx_origin_guard_held, 0);
+	UT_ASSERT_EQ(mx_origin_reply_calls, 1);
+	UT_ASSERT_EQ(mx_origin_reply_count, 0);
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+	UT_ASSERT_EQ(observed, CMX_RESOLVE_RETRY);
+}
+
+UT_TEST(test_current_mx_updater_precommit_final_release_failure_is_unknown)
+{
+	ClusterCurrentMxProofForwardV2 request;
+	ClusterICEnvelope env;
+	ClusterCurrentMxUpdaterChallengeWire *challenge;
+	int saved_node_id = cluster_node_id;
+	int variant;
+
+	for (variant = 0; variant < 3; variant++) {
+		cluster_node_id = UT_MASTER_NODE;
+		route_seam_reset();
+		mx_origin_sample_enabled = true;
+		mx_origin_sample_status = CLUSTER_TT_STATUS_IN_PROGRESS;
+		mx_origin_release_failed = variant != 0;
+		mx_origin_release_pending = variant == 2;
+		init_current_mx_origin_request(&request, &env);
+		request.prefix.body_kind = CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE;
+		memset(&request.trailer.body, 0, sizeof(request.trailer.body));
+		challenge = &request.trailer.body.updater.challenge;
+		challenge->updater_xid = 503;
+		challenge->member_status = MultiXactStatusNoKeyUpdate;
+		challenge->candidate_next_xmin_alias.local_xid = 503;
+		challenge->candidate_next_xmin_alias.origin_node_id = UT_MASTER_NODE;
+		challenge->candidate_next_xmin_alias.cluster_epoch = UT_FORMATION_EPOCH;
+		challenge->candidate_next_xmin_alias.undo_record_segment_id = 5;
+		challenge->candidate_next_xmin_alias.tt_slot_id = 4;
+		challenge->candidate_next_xmin_locator.uba = uba_encode(5, 408, 3, 1);
+		challenge->candidate_next_xmin_locator.xid = 503;
+		challenge->candidate_next_xmin_locator.tt_wrap = TT_WRAP_INVALID;
+		challenge->candidate_next_xmin_locator.itl_kind = ITL_FLAG_ACTIVE;
+		UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
+		cluster_gcs_block_test_r4_tx_origin_drain();
+		if (mx_origin_release_pending) {
+			UT_ASSERT_EQ(mx_origin_reply_calls, 0);
+			UT_ASSERT_EQ(mx_origin_guard_held, 1);
+			mx_origin_release_pending = false;
+			cluster_gcs_block_test_r4_tx_origin_drain();
+		}
+		UT_ASSERT_EQ(route_seam.candidate_resolve_calls, 1);
+		UT_ASSERT_EQ(mx_origin_guard_held, 0);
+		UT_ASSERT_EQ(mx_origin_reply_calls, 1);
+		UT_ASSERT_EQ(mx_origin_reply_count, 0);
+		UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+		UT_ASSERT_EQ(mx_origin_reply_result, variant == 0 ? CMX_RESOLVE_RETRY : CMX_RESOLVE_UNKNOWN);
+	}
+	mx_origin_sample_enabled = false;
+	cluster_node_id = saved_node_id;
+}
+
+UT_TEST(test_current_mx_origin_retry_keeps_unknown_release_and_deadline_fences)
+{
+	ClusterCurrentMxProofForwardV2 request;
+	ClusterICEnvelope env;
+	int saved_node_id = cluster_node_id;
+	int variant;
+
+	for (variant = 0; variant < 9; variant++) {
+		cluster_node_id = UT_MASTER_NODE;
+		route_seam_reset();
+		mx_origin_sample_enabled = true;
+		mx_origin_sample_status = CLUSTER_TT_STATUS_IN_PROGRESS;
+		switch (variant) {
+		case 0: mx_origin_precommit_sample = false; break; /* malformed ACTIVE */
+		case 1: mx_origin_sample_status = CLUSTER_TT_STATUS_UNKNOWN; break;
+		case 2: mx_origin_release_failed = true; break;
+		case 3: case 4: case 5: mx_origin_release_pending = true; break;
+		case 6: mx_origin_physical_active = true; mx_origin_precommit_sample = false; break;
+		case 7: mx_origin_sample_status = CLUSTER_TT_STATUS_COMMITTED; break;
+		case 8: mx_origin_sample_status = CLUSTER_TT_STATUS_ABORTED; break;
+		}
+		init_current_mx_origin_request(&request, &env);
+		UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
+		cluster_gcs_block_test_r4_tx_origin_drain();
+		if (mx_origin_release_pending) {
+			UT_ASSERT_EQ(mx_origin_reply_calls, 0);
+			UT_ASSERT_EQ(mx_origin_guard_held, 1);
+			mx_origin_release_pending = false;
+			if (variant == 3)
+				mx_origin_release_failed = true;
+			else if (variant == 4)
+				route_test_epoch++;
+			else
+				route_test_now = TimestampTzPlusMilliseconds(0, cluster_gcs_reply_timeout_ms) + 1;
+			cluster_gcs_block_test_r4_tx_origin_drain();
+		}
+		UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+		UT_ASSERT_EQ(mx_origin_guard_held, 0);
+		if (variant == 4)
+			UT_ASSERT_EQ(mx_origin_reply_calls, 0);
+		else {
+			UT_ASSERT(mx_origin_reply_calls > 0);
+			UT_ASSERT_EQ(mx_origin_reply_result, variant >= 7 ? CMX_RESOLVE_OK : CMX_RESOLVE_UNKNOWN);
+			UT_ASSERT_EQ(mx_origin_reply_count, variant >= 7 ? 1 : 0);
+		}
+	}
+	mx_origin_sample_enabled = false;
 	cluster_node_id = saved_node_id;
 }
 
@@ -6754,7 +7023,10 @@ UT_TEST(test_internal_origin_refusals_do_not_enter_backend_reply_table)
 int
 main(void)
 {
-	UT_PLAN(118);
+	UT_PLAN(136);
+	UT_RUN(test_current_mx_updater_precommit_final_release_failure_is_unknown);
+	UT_RUN(test_current_mx_origin_retry_keeps_unknown_release_and_deadline_fences);
+	UT_RUN(test_current_mx_precommit_origin_releases_before_retry);
 	UT_RUN(test_refusal_queue_nonadmission_is_counted_at_each_producer);
 	UT_RUN(test_seal_two_blocks_new_tx_and_undo_contexts_but_not_original_drain);
 	UT_RUN(test_kind2_requester_asks_origin_to_select_and_lands_exact_status22);

@@ -162,6 +162,11 @@ static bool guard_armed;
 static int guard_reads;
 static int cancel_sent;
 static PGPROC requester_proc;
+static PROC_HDR hw_local_proc_header;
+static PGPROC hw_local_procs[23];
+static const ClusterLockAcquireRequest *hw_release_on_wait;
+static bool hw_error_after_wait_release;
+static bool hw_local_case;
 static GesReplyPayload actual_reply;
 static ClusterICEnvelope actual_envelope;
 
@@ -342,6 +347,17 @@ ConditionVariableTimedSleep(ConditionVariable *cv, long ms, uint32 event)
 	(void)cv;
 	(void)event;
 	cooperative_sleeps++;
+	if (hw_release_on_wait != NULL) {
+		const ClusterLockAcquireRequest *owner = hw_release_on_wait;
+		int procno = MyProc->pgprocno;
+		hw_release_on_wait = NULL;
+		MyProc->pgprocno = owner->holder.procno;
+		HW_CHECK(cluster_lock_acquire_s6_release(owner) == CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+		MyProc->pgprocno = procno;
+		if (hw_error_after_wait_release)
+			ereport(ERROR, (errmsg("injected cancellation after local HW grant")));
+		return false;
+	}
 	ut_mock_now += ms * 1000;
 	return true;
 }
@@ -443,7 +459,7 @@ cluster_recovery_authority_request_allowed(const ClusterResId *r, LOCKMODE m, bo
 bool
 cluster_ges_dedup_remove_completed(const ClusterGesDedupKey *key)
 {
-	HW_CHECK(key->request_id == 201);
+	HW_CHECK(key->request_id == 201 || (hw_local_case && key->request_id == 202));
 	return true; /* Dedup storage is a fixture, not the grant authority. */
 }
 void
@@ -618,10 +634,11 @@ void
 cluster_grd_outbound_enqueue_cleanup_release(uint32 destination, const void *payload, uint16 length)
 {
 	char command = 'R';
-	if ((relation_case || cf_case) && master_child < 0 && destination == (uint32)cluster_node_id) {
+	if ((relation_case || cf_case || hw_local_case) && master_child < 0 && destination == (uint32)cluster_node_id) {
 		HW_CHECK(length == sizeof(local_cleanup_release));
 		HW_CHECK(((const GesRequestPayload *)payload)->opcode == GES_REQ_OPCODE_RELEASE);
-		HW_CHECK(((const GesRequestPayload *)payload)->holder_request_id_lo == 201);
+		HW_CHECK(((const GesRequestPayload *)payload)->holder_request_id_lo == 201
+			|| (hw_local_case && ((const GesRequestPayload *)payload)->holder_request_id_lo == 202));
 		local_cleanup_release = *(const GesRequestPayload *)payload;
 		cleanup_sent++;
 		return; /* Keep it owned until the test drives the real local drain. */
@@ -889,6 +906,9 @@ setup_case(ClusterLockAcquireRequest *req, bool sibling)
 	bool fast = false;
 	guard_armed = false;
 	guard_reads = 0;
+	hw_local_case = false;
+	hw_error_after_wait_release = false;
+	hw_release_on_wait = NULL;
 	grd_lifecycle_reset(4);
 	set_mock_declared(4, nodes);
 	cluster_grd_master_map_init();
@@ -1628,6 +1648,151 @@ UT_TEST(local_optimistic_generation_fence)
 	MyProc = NULL;
 }
 
+static void
+hw_local_competitors(ClusterLockAcquireRequest *a, ClusterLockAcquireRequest *b)
+{
+	fault = HW_NORMAL;
+	setup_case(a, false);
+	UT_ASSERT_EQ(cluster_grd_cancel_reservation_by_id(&a->resid, &a->holder),
+				 CLUSTER_GRD_ENTRY_OK);
+	cluster_node_id = 3;
+	MyProc->pgprocno = 21;
+	a->holder.node_id = 3;
+	memset(&hw_local_proc_header, 0, sizeof(hw_local_proc_header));
+	memset(hw_local_procs, 0, sizeof(hw_local_procs));
+	hw_local_proc_header.allProcCount = lengthof(hw_local_procs);
+	hw_local_proc_header.allProcs = hw_local_procs;
+	hw_local_procs[21].pid = getpid();
+	hw_local_procs[21].backendId = 1;
+	ProcGlobal = &hw_local_proc_header;
+	hw_local_case = true;
+	hw_release_on_wait = NULL;
+	cooperative_sleeps = 0;
+	*b = *a;
+	b->holder = grd_lifecycle_holder(3, 22, 202);
+	b->holder.cluster_epoch = 1;
+	b->request_id = 202;
+}
+
+static void
+hw_dispatch_reserved(ClusterLockAcquireRequest *req, ClusterLockAcquireResult s3)
+{
+	MyProc->pgprocno = req->holder.procno;
+	/* Execute exactly the wrapper's branch; do not force S4 in the test. */
+	if (s3 == CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
+		UT_ASSERT_EQ(cluster_lock_acquire_s4_remote_request_wait(req),
+					 CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK);
+	else
+		UT_ASSERT_EQ(s3, CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK);
+}
+
+UT_TEST(hw_local_two_reservations_survive_exact_grants)
+{
+	ClusterLockAcquireRequest a, b;
+	ClusterLockAcquireResult a3, b3;
+	LOCKMODE mode = NoLock;
+	hw_local_competitors(&a, &b);
+	a3 = cluster_lock_acquire_s3_partition_reservation(&a);
+	MyProc->pgprocno = 22;
+	b3 = cluster_lock_acquire_s3_partition_reservation(&b);
+	hw_dispatch_reserved(&a, a3);
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&a), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	hw_release_on_wait = &a;
+	hw_dispatch_reserved(&b, b3);
+	UT_ASSERT_EQ(cooperative_sleeps, 1);
+	if (hw_release_on_wait != NULL) { /* Original RED's cleanup, not a grant. */
+		hw_release_on_wait = NULL;
+		UT_ASSERT_EQ(cluster_lock_acquire_s6_release(&a), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	}
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT(cluster_grd_holder_mode_by_id(&b.resid, &b.holder, &mode));
+	UT_ASSERT_EQ(mode, ExclusiveLock);
+	UT_ASSERT_EQ(cluster_lock_acquire_s6_release(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	UT_ASSERT_EQ(request_sent, 0);
+	UT_ASSERT_EQ(ut_mock_epoch, 1);
+	MyProc = NULL;
+}
+
+UT_TEST(hw_local_release_does_not_invalidate_another_reserved_request)
+{
+	ClusterLockAcquireRequest a, b;
+	ClusterLockAcquireResult a3, b3;
+	hw_local_competitors(&a, &b);
+	a3 = cluster_lock_acquire_s3_partition_reservation(&a);
+	hw_dispatch_reserved(&a, a3);
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&a), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	MyProc->pgprocno = 22;
+	b3 = cluster_lock_acquire_s3_partition_reservation(&b);
+	/* A can finish native extension and release while B has only reserved
+	 * HW, before its authoritative grant and promotion. */
+	MyProc->pgprocno = 21;
+	UT_ASSERT_EQ(cluster_lock_acquire_s6_release(&a), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	MyProc->pgprocno = 22;
+	hw_dispatch_reserved(&b, b3);
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(cluster_lock_acquire_s6_release(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	UT_ASSERT_EQ(request_sent, 0);
+	MyProc = NULL;
+}
+
+UT_TEST(hw_local_cancel_after_grant_keeps_exact_cleanup_owner)
+{
+	static ClusterLockAcquireRequest a, b; /* survive the ERROR longjmp */
+	volatile bool caught = false;
+	LOCKMODE mode = NoLock;
+	hw_local_competitors(&a, &b);
+	hw_dispatch_reserved(&a, cluster_lock_acquire_s3_partition_reservation(&a));
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&a), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	MyProc->pgprocno = 22;
+	UT_ASSERT_EQ(cluster_lock_acquire_s3_partition_reservation(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	hw_release_on_wait = &a;
+	hw_error_after_wait_release = true;
+	PG_TRY();
+	{
+		(void)cluster_lock_acquire_s4_remote_request_wait(&b);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	hw_error_after_wait_release = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 0);
+	UT_ASSERT_EQ(cleanup_sent, 1);
+	if (cleanup_sent == 1) {
+		UT_ASSERT_EQ(local_cleanup_release.holder_request_id_lo, b.request_id);
+		UT_ASSERT_EQ(local_cleanup_release.holder_procno, b.holder.procno);
+		UT_ASSERT_EQ(memcmp(local_cleanup_release.resid, &b.resid, sizeof(b.resid)), 0);
+		master_request = local_cleanup_release;
+		stage_master_work();
+		UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+	}
+	UT_ASSERT(!cluster_grd_holder_mode_by_id(&b.resid, &b.holder, &mode));
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	MyProc = NULL;
+}
+
+UT_TEST(hw_local_grant_rejects_epoch_change_before_promotion)
+{
+	ClusterLockAcquireRequest a, b;
+	hw_local_competitors(&a, &b);
+	hw_dispatch_reserved(&a, cluster_lock_acquire_s3_partition_reservation(&a));
+	ut_mock_epoch++;
+	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&a), CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT_EQ(cleanup_sent, 1);
+	UT_ASSERT(!a.hw_grant.consumed);
+	/* The exact original cleanup is owned, never a release of a new epoch. */
+	if (cleanup_sent == 1) {
+		UT_ASSERT_EQ(local_cleanup_release.holder_cluster_epoch_lo, 1);
+		UT_ASSERT_EQ(local_cleanup_release.holder_request_id_lo, a.request_id);
+	}
+	MyProc = NULL;
+}
+
 UT_TEST(local_master_uses_existing_holder)
 {
 	ClusterLockAcquireRequest req;
@@ -1644,7 +1809,8 @@ UT_TEST(local_master_uses_existing_holder)
 	req.master_gen_snapshot = snapshot;
 	UT_ASSERT_EQ(cluster_lock_acquire_s4_remote_request_wait(&req),
 				 CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK);
-	UT_ASSERT_EQ(req.hw_grant.key.request_id, 0);
+	UT_ASSERT_EQ(req.hw_grant.key.request_id, req.request_id);
+	UT_ASSERT(req.hw_grant.grant_observed);
 	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
 	UT_ASSERT_EQ(request_sent, 0);
 	UT_ASSERT_EQ(cleanup_sent, 0);
@@ -2100,7 +2266,7 @@ main(void)
 	MyBackendType = B_BACKEND; /* Definition belongs to the embedded GRD fixture. */
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Standalone fixture owner, not a database deadline. */
-	UT_PLAN(43);
+	UT_PLAN(47);
 	UT_RUN(no_sibling_control);
 	UT_RUN(real_grant_sibling_promotes);
 	UT_RUN(relation_share_grant_survives_compatible_sibling);
@@ -2136,6 +2302,10 @@ main(void)
 	UT_RUN(identity_mismatch_does_not_release_sibling);
 	UT_RUN(local_optimistic_generation_fence);
 	UT_RUN(local_master_uses_existing_holder);
+	UT_RUN(hw_local_cancel_after_grant_keeps_exact_cleanup_owner);
+	UT_RUN(hw_local_grant_rejects_epoch_change_before_promotion);
+	UT_RUN(hw_local_two_reservations_survive_exact_grants);
+	UT_RUN(hw_local_release_does_not_invalidate_another_reserved_request);
 	UT_RUN(relation_native_error_has_full_interval_cleanup_owner);
 	UT_RUN(cooperative_redeclare_yields_then_consumes_real_grant);
 	UT_RUN(cooperative_redeclare_late_cut_cannot_publish_ack);

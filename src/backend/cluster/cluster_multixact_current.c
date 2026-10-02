@@ -254,7 +254,7 @@ cluster_multixact_current_updater_candidate_verdict(const ClusterTTStatusKey *ca
 	if (!(cluster_runtime_visibility_current_owner_lookup_exact(updater_xid, &sampled_binding,
 																&sampled_result)
 		  || cluster_runtime_visibility_local_terminal_lookup_exact(updater_xid, &sampled_binding,
-																	&sampled_result))
+																	&sampled_result, NULL))
 		|| !sampled_result.authoritative || sampled_result.status_epoch != current_epoch
 		|| !tt_key_valid(&sampled_binding, updater_xid, current_epoch, updater_origin_node))
 		return CUCP_UNKNOWN;
@@ -307,7 +307,7 @@ cluster_multixact_current_successor_provenance_well_formed(
  * must record the exact CTRC touch and return its participant capability
  * generation; terminal state is sampled from the exact current-or-rolled
  * physical slot and deliberately carries neither grant nor participant. */
-static bool
+static ClusterMxResolveResult
 current_mx_local_member_sample_exact(TransactionId xid, ClusterTTStatusKey *key,
 									 ClusterTTStatusResult *result, uint32 *ctrc_grant,
 									 uint32 *participant_capability_generation,
@@ -315,10 +315,11 @@ current_mx_local_member_sample_exact(TransactionId xid, ClusterTTStatusKey *key,
 {
 	ClusterCtrcTxnKeyV1 ctrc_key;
 	ClusterCtrcParticipantIdentity participant;
+	bool precommit_retry = false;
 
 	if (key == NULL || result == NULL || ctrc_grant == NULL
 		|| participant_capability_generation == NULL || ctrc_key_out == NULL)
-		return false;
+		return CMX_RESOLVE_UNKNOWN;
 	MemSet(key, 0, sizeof(*key));
 	MemSet(result, 0, sizeof(*result));
 	result->status = CLUSTER_TT_STATUS_UNKNOWN;
@@ -332,10 +333,10 @@ current_mx_local_member_sample_exact(TransactionId xid, ClusterTTStatusKey *key,
 			xid, key, result, ctrc_grant, &ctrc_key, &participant)) {
 		if (result->status != CLUSTER_TT_STATUS_IN_PROGRESS || *ctrc_grant == 0
 			|| participant.capability_record_generation == 0)
-			return false;
+			return CMX_RESOLVE_UNKNOWN;
 		*participant_capability_generation = participant.capability_record_generation;
 		*ctrc_key_out = ctrc_key;
-		return true;
+		return CMX_RESOLVE_OK;
 	}
 
 	MemSet(key, 0, sizeof(*key));
@@ -343,9 +344,12 @@ current_mx_local_member_sample_exact(TransactionId xid, ClusterTTStatusKey *key,
 	result->status = CLUSTER_TT_STATUS_UNKNOWN;
 	result->commit_scn = InvalidScn;
 	*ctrc_grant = 0;
-	return cluster_runtime_visibility_local_terminal_lookup_exact(xid, key, result)
-		   && (result->status == CLUSTER_TT_STATUS_COMMITTED
-			   || result->status == CLUSTER_TT_STATUS_ABORTED);
+	if (cluster_runtime_visibility_local_terminal_lookup_exact(xid, key, result,
+															 &precommit_retry)
+		&& (result->status == CLUSTER_TT_STATUS_COMMITTED
+			|| result->status == CLUSTER_TT_STATUS_ABORTED))
+		return CMX_RESOLVE_OK;
+	return precommit_retry ? CMX_RESOLVE_RETRY : CMX_RESOLVE_UNKNOWN;
 }
 
 
@@ -1309,10 +1313,12 @@ cluster_multixact_current_members_resolve_internal(
 					uint32 ctrc_grant = 0;
 					uint32 participant_capability_generation = 0;
 
-					if (!current_mx_local_member_sample_exact(
-							ask->xid, &initial_key, &initial_result, &ctrc_grant,
-							&participant_capability_generation, &ctrc_key)
-						|| !cluster_multixact_current_resolve_origin_member_proof(
+					result = current_mx_local_member_sample_exact(
+						ask->xid, &initial_key, &initial_result, &ctrc_grant,
+						&participant_capability_generation, &ctrc_key);
+					if (result != CMX_RESOLVE_OK)
+						goto non_ok;
+					if (!cluster_multixact_current_resolve_origin_member_proof(
 							ask->xid, ask->member_status, ask->member_ordinal,
 							(uint16)cluster_node_id, (uint32)current_epoch,
 							TransactionIdIsCurrentTransactionId(ask->xid), &initial_key,
