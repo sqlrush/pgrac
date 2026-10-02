@@ -47,9 +47,11 @@
 #include "postmaster/bgworker.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "utils/resowner.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 #include "../../backend/cluster/cluster_control_root_private.h"
 #include "../../backend/cluster/cluster_control_bootstrap_private.h"
@@ -618,6 +620,9 @@ static bool test_worker_pin_sealed;
 static bool test_worker_finalize;
 static unsigned test_worker_finalize_fault;
 static unsigned test_worker_complete_publishes;
+static unsigned test_worker_reader_refusals, test_worker_completion_attempts;
+static unsigned test_worker_completion_waits, test_worker_completion_wait_ms;
+static bool test_worker_completion_cancel, test_worker_completion_stale;
 static ClusterRecoverySerialGuard *test_worker_bound_serial;
 static bool test_worker_pin_release = true;
 static ClusterWalRetentionPinThreadRequest test_worker_pin_request;
@@ -627,6 +632,35 @@ static bool test_launch_fixture;
 static unsigned test_launch_stamps, test_launch_registered, test_launch_legacy_pins;
 static bool test_worker_window_consumer;
 static unsigned test_legacy_projection_reads;
+static Latch test_root_latch;
+Latch *MyLatch = &test_root_latch;
+
+void
+ResetLatch(Latch *latch)
+{
+	UT_ASSERT(latch == MyLatch);
+}
+
+int
+WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event_info)
+{
+	UT_ASSERT(latch == MyLatch);
+	UT_ASSERT_EQ(events, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH);
+	UT_ASSERT_EQ(wait_event_info, WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+	UT_ASSERT(timeout > 0 && timeout <= 32);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	if (test_worker_finalize) {
+		UT_ASSERT(test_worker_pin_held && test_worker_pin_sealed);
+		UT_ASSERT(test_worker_bound_serial != NULL && !test_worker_bound_serial->held
+				  && !test_worker_bound_serial->release_uncertain);
+		UT_ASSERT_EQ(test_worker_replays, 1);
+		test_worker_completion_waits++;
+		test_worker_completion_wait_ms += timeout;
+		if (test_worker_completion_cancel)
+			InterruptPending = true;
+	}
+	return WL_TIMEOUT;
+}
 static bool thread_recovery_root_projection(uint16 thread, uint64 epoch,
 											const ClusterThreadRecoveryAuthorityV1 *authority,
 											ClusterControlRootReadToken *token, uint64 *tail,
@@ -1139,6 +1173,19 @@ cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken
 	test_walr_sealed_required = require_sealed_pin;
 	test_walr_thread = expected_root->origin_thread_id;
 	test_walr_begin_order = ++test_order_seq;
+	if (require_sealed_pin && test_worker_finalize) {
+		UT_ASSERT(test_worker_pin_held && test_worker_pin_sealed);
+		UT_ASSERT(test_worker_bound_serial != NULL && !test_worker_bound_serial->held
+				  && !test_worker_bound_serial->release_uncertain);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		test_worker_completion_attempts++;
+		if (test_worker_reader_refusals != 0) {
+			test_worker_reader_refusals--;
+			return CLUSTER_WAL_PIN_UNAVAILABLE;
+		}
+		if (test_worker_completion_stale)
+			return CLUSTER_WAL_PIN_STALE;
+	}
 	if (test_walr_begin_result != CLUSTER_WAL_PIN_OK)
 		return test_walr_begin_result;
 	*out_guard = (ClusterWalRootPublishGuard *)(uintptr_t)0x1;
@@ -1754,6 +1801,9 @@ wipe_root_files(void)
 	test_worker_replays = test_worker_pins = test_worker_normal_ir = 0;
 	test_worker_finalize = false;
 	test_worker_finalize_fault = test_worker_complete_publishes = 0;
+	test_worker_reader_refusals = test_worker_completion_attempts = 0;
+	test_worker_completion_waits = test_worker_completion_wait_ms = 0;
+	test_worker_completion_cancel = test_worker_completion_stale = false;
 	test_failure_need_count = 1;
 	test_worker_initializer_ir = test_worker_formations = 0;
 	test_worker_pin_held = false;
@@ -12608,6 +12658,97 @@ UT_TEST(test_runtime_v3_worker_finalization_error_releases_post_ir_pin)
 	test_self_incarnation = saved_incarnation;
 }
 
+/* Real worker/finalizer and durable ROOT bytes; the WALR fixture models a
+ * concurrent reader refusing X, never a fabricated converted grant. The GRD
+ * suite separately exercises the real cross-node master conflict decision. */
+UT_TEST(test_runtime_v3_worker_retries_completion_without_replaying)
+{
+	const int saved_node = cluster_node_id;
+	const uint64 saved_incarnation = test_self_incarnation;
+	for (unsigned scenario = 0; scenario < 3; scenario++) {
+		uint8 before[66048];
+		ClusterRecoverySerialRequest request;
+		ClusterThreadRecLaunchEligibility eligibility = { 0 };
+		ClusterControlRootSnapshot out;
+		ClusterControlRootReadToken token;
+		ClusterThreadRecResult result;
+
+		v2_failure_fixture(before, &request, true);
+		runtime_fixture_version3(before);
+		eligibility.origin_thread = 1;
+		eligibility.attempt_stamp = 123;
+		eligibility.duty = request.duty;
+		test_worker_finalize = true;
+		test_reserve_mode = true;
+		test_worker_reader_refusals = scenario == 0 ? 3 : scenario == 1 ? 100 : 1;
+		test_worker_completion_stale = scenario == 2;
+		result = thread_recovery_worker_run(&eligibility);
+		UT_ASSERT_EQ(result, scenario == 0 ? CLUSTER_THREADREC_DONE : CLUSTER_THREADREC_DEFERRED);
+		UT_ASSERT_EQ(test_worker_replays, 1);
+		UT_ASSERT_EQ(test_worker_pins, 1);
+		UT_ASSERT_EQ(test_worker_normal_ir, 1);
+		UT_ASSERT_EQ(test_worker_complete_publishes, 1);
+		UT_ASSERT_EQ(test_worker_completion_attempts, scenario == 0 ? 4 : scenario == 1 ? 8 : 2);
+		UT_ASSERT_EQ(test_worker_completion_waits, scenario == 0 ? 3 : scenario == 1 ? 7 : 1);
+		UT_ASSERT(test_worker_completion_wait_ms > 0 && test_worker_completion_wait_ms <= 95);
+		UT_ASSERT(!test_worker_pin_held && test_worker_bound_serial == NULL);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(cluster_control_root_read_canonical(
+						 1, &request.duty, CLUSTER_CONTROL_ROOT_READ_STRONG, &out, &token),
+					 0);
+		UT_ASSERT_EQ(out.lifecycle, scenario == 0
+										? CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+										: CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED);
+		cluster_shared_config = false;
+	}
+	cluster_node_id = saved_node;
+	test_self_incarnation = saved_incarnation;
+}
+
+UT_TEST(test_runtime_v3_worker_cancel_during_completion_backoff_releases_pin)
+{
+	const int saved_node = cluster_node_id;
+	const uint64 saved_incarnation = test_self_incarnation;
+	uint8 before[66048];
+	ClusterRecoverySerialRequest request;
+	ClusterThreadRecLaunchEligibility eligibility = { 0 };
+	ClusterControlRootSnapshot out;
+	ClusterControlRootReadToken token;
+	volatile bool caught = false;
+
+	v2_failure_fixture(before, &request, true);
+	runtime_fixture_version3(before);
+	eligibility.origin_thread = 1;
+	eligibility.attempt_stamp = 123;
+	eligibility.duty = request.duty;
+	test_worker_finalize = true;
+	test_reserve_mode = true;
+	test_worker_reader_refusals = 100;
+	test_worker_completion_cancel = true;
+	PG_TRY();
+	{
+		(void)thread_recovery_worker_run(&eligibility);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(test_worker_completion_attempts, 1);
+	UT_ASSERT_EQ(test_worker_completion_waits, 1);
+	UT_ASSERT_EQ(test_worker_replays, 1);
+	UT_ASSERT(!test_worker_pin_held && test_worker_bound_serial == NULL);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(cluster_control_root_read_canonical(
+					 1, &request.duty, CLUSTER_CONTROL_ROOT_READ_STRONG, &out, &token),
+				 0);
+	UT_ASSERT_EQ(out.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED);
+	cluster_shared_config = false;
+	cluster_node_id = saved_node;
+	test_self_incarnation = saved_incarnation;
+}
+
 UT_TEST(test_runtime_v3_worker_window_consumes_its_sealed_authority_not_legacy_projection)
 {
 	uint8 before[66048];
@@ -20655,9 +20796,11 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_WORKER_FINALIZE") != NULL) {
-		UT_PLAN(2);
+		UT_PLAN(4);
 		UT_RUN(test_runtime_v3_worker_done_requires_durable_canonical_completion);
 		UT_RUN(test_runtime_v3_worker_finalization_error_releases_post_ir_pin);
+		UT_RUN(test_runtime_v3_worker_retries_completion_without_replaying);
+		UT_RUN(test_runtime_v3_worker_cancel_during_completion_backoff_releases_pin);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
@@ -20697,9 +20840,11 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(375);
+	UT_PLAN(377);
 	UT_RUN(test_runtime_v3_worker_done_requires_durable_canonical_completion);
 	UT_RUN(test_runtime_v3_worker_finalization_error_releases_post_ir_pin);
+	UT_RUN(test_runtime_v3_worker_retries_completion_without_replaying);
+	UT_RUN(test_runtime_v3_worker_cancel_during_completion_backoff_releases_pin);
 	UT_RUN(test_wal_inputs_pause_releases_all_pins_and_resume_checks_original_root);
 	UT_RUN(test_wal_inputs_failed_wait_observes_root_without_restoring_proof_or_pins);
 	UT_RUN(test_wal_inputs_resume_error_releases_reacquired_native_owner);
