@@ -325,6 +325,9 @@ UT_TEST(test_lower_lag_old_fpi_cannot_overwrite_newer_durable)
 	UT_ASSERT(step.all_skip);
 	UT_ASSERT(!step.mixed);
 	UT_ASSERT(!find_step(plan, 1, 0x200, NULL, NULL));
+	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 0), 3);
+	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 1), 1);
+	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 2), 0);
 	destroy_plan(&plan);
 }
 
