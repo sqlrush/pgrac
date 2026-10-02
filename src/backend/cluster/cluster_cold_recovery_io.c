@@ -7,8 +7,9 @@
  *	  Pass 1 visits every retained record of a RECOVERY_REQUIRED root through
  *	  the sealed recovery visitor and feeds the plan; nothing visited is
  *	  trusted until the visitor and the observed cut both match the ROOT.
- *	  DATA observation reads storage directly, before replay touches shared
- *	  buffers.  Pass 2 re-reads the same generation through the selected
+ *	  DATA observation and the SPACE owner's pass-1 check read storage
+ *	  directly, before replay touches shared buffers.  Pass 2 re-reads the
+ *	  same generation through the selected
  *	  restart-input segment opener; the caller compares each record with its
  *	  pass-1 identity.  No function here writes, locks pages or grants
  *	  replay authority.
@@ -41,7 +42,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_guc.h"
-#include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_wal_restart_read.h"
 #include "cluster/cluster_wal_tail.h"
 #include "pgstat.h"
@@ -149,24 +150,101 @@ cluster_cold_reader_close_v1(ClusterColdReaderV1 **cold_address)
 	*cold_address = NULL;
 }
 
-static bool
-cold_observe_incarnation(ClusterColdObserverV1 *observer, RelFileLocator locator,
-						 uint8 incarnation[16])
+/* Both SPACE pages as storage holds them; zero where a block is absent. */
+static void
+cold_read_space_pages(RelFileLocator locator, PGAlignedBlock pages[2])
 {
-	ClusterSpaceIdentity identity;
+	SMgrRelation relation = smgropen(locator, InvalidBackendId);
+	BlockNumber nblocks = 0;
+	BlockNumber block;
 
-	if (observer->cached_valid && RelFileLocatorEquals(observer->cached_locator, locator)) {
-		memcpy(incarnation, observer->cached_incarnation, 16);
-		return true;
+	memset(pages, 0, 2 * sizeof(PGAlignedBlock));
+	if (smgrexists(relation, SPACE_FORKNUM))
+		nblocks = smgrnblocks(relation, SPACE_FORKNUM);
+	for (block = 0; block < 2 && block < nblocks; block++)
+		smgrread(relation, SPACE_FORKNUM, block, pages[block].data);
+}
+
+static void
+cold_space_key(const ClusterColdObserverV1 *observer, RelFileLocator locator,
+			   ClusterSpaceIdentityKey *key)
+{
+	memset(key, 0, sizeof(*key));
+	key->system_identifier = observer->system_identifier;
+	key->database_incarnation = observer->database_incarnation;
+	memcpy(key->storage_uuid, observer->storage_uuid, 16);
+	key->locator = locator;
+}
+
+/*
+ * The relation's live SPACE identity names the incarnation a page header
+ * belongs to.  Without one (not yet written for a relation created in the
+ * replayed WAL, dropped, or unreadable) the page is reported NO_IDENTITY
+ * and the planner decides.
+ */
+static void
+cold_observe_incarnation(ClusterColdObserverV1 *observer, RelFileLocator locator,
+						 ClusterColdDataV1 *out)
+{
+	if (!observer->cached_valid || !RelFileLocatorEquals(observer->cached_locator, locator)) {
+		ClusterSpaceIdentityKey key;
+		ClusterSpaceIdentity identity;
+		PGAlignedBlock pages[2];
+		uint64 token;
+
+		cold_space_key(observer, locator, &key);
+		cold_read_space_pages(locator, pages);
+		observer->cached_no_identity
+			= !cluster_space_identity_page_decode(pages[0].data, BLCKSZ, SPACE_FORKNUM, 0, &key,
+												  &identity, &token)
+			  || identity.state != CLUSTER_SPACE_IDENTITY_LIVE;
+		memset(observer->cached_incarnation, 0, 16);
+		if (!observer->cached_no_identity)
+			memcpy(observer->cached_incarnation, identity.incarnation, 16);
+		observer->cached_locator = locator;
+		observer->cached_valid = true;
 	}
-	if (!cluster_space_relation_read_redo_identity(locator, &identity)
-		|| identity.state != CLUSTER_SPACE_IDENTITY_LIVE)
+	if (observer->cached_no_identity)
+		out->flags |= CLUSTER_COLD_DATA_FLAG_NO_IDENTITY;
+	memcpy(out->version.segment_incarnation, observer->cached_incarnation, 16);
+}
+
+bool
+cluster_cold_space_check_v1(void *arg, const RelFileLocator *locator,
+							const ClusterColdSpaceInputV1 *inputs, uint32 count, uint32 *order)
+{
+	ClusterColdObserverV1 *observer = (ClusterColdObserverV1 *)arg;
+	ClusterSpaceIdentityKey key;
+	ClusterSpaceRecoveryInput *owned;
+	ClusterSpaceRecoveryImage *image;
+	PGAlignedBlock pages[2];
+	bool proven;
+	uint32 i;
+
+	if (observer == NULL || locator == NULL || inputs == NULL || order == NULL || count == 0)
 		return false;
-	observer->cached_locator = locator;
-	memcpy(observer->cached_incarnation, identity.incarnation, 16);
-	observer->cached_valid = true;
-	memcpy(incarnation, identity.incarnation, 16);
-	return true;
+	owned = (ClusterSpaceRecoveryInput *)palloc_extended((Size)count * sizeof(*owned),
+														 MCXT_ALLOC_HUGE | MCXT_ALLOC_NO_OOM);
+	image = (ClusterSpaceRecoveryImage *)palloc_extended(sizeof(*image), MCXT_ALLOC_NO_OOM);
+	if (owned == NULL || image == NULL) {
+		if (owned != NULL)
+			pfree(owned);
+		if (image != NULL)
+			pfree(image);
+		return false;
+	}
+	for (i = 0; i < count; i++) {
+		owned[i].data = inputs[i].payload;
+		owned[i].length = inputs[i].payload_length;
+	}
+	cold_space_key(observer, *locator, &key);
+	cold_read_space_pages(*locator, pages);
+	proven = cluster_space_recovery_prepare(owned, count, &key, pages[0].data, pages[1].data, order,
+											image);
+	observer->space_relations_checked++;
+	pfree(image);
+	pfree(owned);
+	return proven;
 }
 
 bool
@@ -200,7 +278,8 @@ cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterCol
 		observer->pages_invalid++;
 		return true;
 	}
-	return cold_observe_incarnation(observer, page->locator, out->version.segment_incarnation);
+	cold_observe_incarnation(observer, page->locator, out);
+	return true;
 }
 
 typedef struct ColdScanWork {
@@ -262,6 +341,7 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	work->detail = CLUSTER_COLD_OK;
 	work->result = result;
 	visit = cluster_control_root_recovery_visit(root, token, cold_scan_visit, work, &observed);
+	cluster_cold_decoded_release_v1(&work->decoded);
 	result->root_result = (int)visit;
 	detail = work->detail;
 	if (detail == CLUSTER_COLD_OK

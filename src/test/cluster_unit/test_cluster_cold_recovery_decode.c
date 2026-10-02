@@ -5,7 +5,8 @@
  *
  *	  The closed route registry preflight and transaction record parsing are
  *	  fixtures here; this binary checks the cold owner policy, component
- *	  mapping and lifecycle classification only.
+ *	  mapping, lifecycle classification and the typed SPACE effects decoded
+ *	  with the SPACE owner's real WAL codec.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -30,8 +31,10 @@
 #include "access/xlogreader.h"
 #include "catalog/storage_xlog.h"
 #include "access/heapam_xlog.h"
+#include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_page_detached.h"
+#include "cluster/cluster_space_reservation.h"
 
 #include "unit_test.h"
 
@@ -50,6 +53,8 @@ static RfDetachedOwnerOpsV1 seen_ops;
 static int commit_nrels;
 static bool commit_parse_ok = true;
 static int abort_nrels;
+static uint32 commit_nspace_drops;
+static const char *commit_space_drops;
 
 RfPageProofDetailV1
 rf_page_detached_preflight_v1(XLogReaderState *record, bool space_active,
@@ -74,6 +79,8 @@ ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, Size len, xl_xact_parsed_co
 		return false;
 	memset(parsed, 0, sizeof(*parsed));
 	parsed->nrels = commit_nrels;
+	parsed->nspace_drops = commit_nspace_drops;
+	parsed->space_drops = commit_space_drops;
 	return true;
 }
 
@@ -88,7 +95,7 @@ ParseAbortRecord(uint8 info, xl_xact_abort *xlrec, xl_xact_parsed_abort *parsed)
 
 typedef struct FakeRecord {
 	XLogReaderState reader;
-	char data[64];
+	char data[2 * CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	union {
 		DecodedXLogRecord decoded;
 		/* Reserves the trailing block array addressed through decoded. */
@@ -135,6 +142,8 @@ fake_record(FakeRecord *record, uint8 rmid, uint8 info, int blocks)
 	commit_nrels = 0;
 	abort_nrels = 0;
 	commit_parse_ok = true;
+	commit_nspace_drops = 0;
+	commit_space_drops = NULL;
 }
 
 static void
@@ -161,7 +170,7 @@ plan_component(uint32 index, uint8 owner, uint8 page_class, uint64 before, uint6
 UT_TEST(test_page_record_maps_ordinary_components)
 {
 	FakeRecord record;
-	ClusterColdDecodedV1 out;
+	ClusterColdDecodedV1 out = { 0 };
 
 	fake_record(&record, RM_HEAP_ID, 0x20, 3);
 	plan_component(0, RF_DETACHED_COMPONENT_PAGE_CODEC, RF_PAGE_CLASS_ORDINARY, 4, 9,
@@ -198,7 +207,7 @@ UT_TEST(test_page_record_maps_ordinary_components)
 UT_TEST(test_registry_refusal_is_opcode_unsupported)
 {
 	FakeRecord record;
-	ClusterColdDecodedV1 out;
+	ClusterColdDecodedV1 out = { 0 };
 
 	fake_record(&record, RM_HEAP_ID, 0x20, 1);
 	preflight_result = RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED;
@@ -215,7 +224,7 @@ UT_TEST(test_registry_refusal_is_opcode_unsupported)
 UT_TEST(test_cold_owner_policy)
 {
 	FakeRecord record;
-	ClusterColdDecodedV1 out;
+	ClusterColdDecodedV1 out = { 0 };
 	RfOpcodeRouteV1 side = { 0 };
 	RfOpcodeRouteV1 noop = { 0 };
 	RfOpcodeRouteV1 page = { 0 };
@@ -248,7 +257,7 @@ UT_TEST(test_cold_owner_policy)
 UT_TEST(test_transaction_lifecycle_classification)
 {
 	FakeRecord record;
-	ClusterColdDecodedV1 out;
+	ClusterColdDecodedV1 out = { 0 };
 	static const uint8 prepared[3]
 		= { XLOG_XACT_PREPARE, XLOG_XACT_COMMIT_PREPARED, XLOG_XACT_ABORT_PREPARED };
 	int i;
@@ -257,10 +266,11 @@ UT_TEST(test_transaction_lifecycle_classification)
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, 0);
+	/* the native commit redo deletes the files; SPACE drops are decoded below */
 	commit_nrels = 1;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_STRUCTURAL);
+	UT_ASSERT_EQ(out.record.record_flags, 0);
 	commit_parse_ok = false;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_COMPONENT_INVALID);
@@ -282,15 +292,13 @@ UT_TEST(test_transaction_lifecycle_classification)
 UT_TEST(test_storage_lifecycle_classification)
 {
 	FakeRecord record;
-	ClusterColdDecodedV1 out;
+	ClusterColdDecodedV1 out = { 0 };
 	static const struct {
 		uint8 rmid;
 		uint8 info;
 		uint8 flags;
 	} cases[] = { { RM_SMGR_ID, XLOG_SMGR_CREATE, 0 },
-				  { RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_SMGR_ID, XLOG_SMGR_TRUNCATE, CLUSTER_COLD_RECORD_STRUCTURAL },
-				  { RM_SMGR_ID, XLOG_SMGR_SPACE_IDENTITY, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_DBASE_ID, 0x00, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_TBLSPC_ID, 0x00, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_RELMAP_ID, 0x00, CLUSTER_COLD_RECORD_STRUCTURAL },
@@ -316,7 +324,7 @@ UT_TEST(test_storage_lifecycle_classification)
 UT_TEST(test_malformed_plan_refused)
 {
 	FakeRecord record;
-	ClusterColdDecodedV1 out;
+	ClusterColdDecodedV1 out = { 0 };
 
 	fake_record(&record, RM_HEAP_ID, 0x20, 1);
 	plan_component(0, RF_DETACHED_COMPONENT_PAGE_CODEC, RF_PAGE_CLASS_ORDINARY, 4, 9, 0);
@@ -339,7 +347,7 @@ UT_TEST(test_malformed_plan_refused)
 UT_TEST(test_foreign_side_records_have_no_cold_owner)
 {
 	FakeRecord record;
-	ClusterColdDecodedV1 out;
+	ClusterColdDecodedV1 out = { 0 };
 
 	fake_record(&record, RM_XLOG_ID, 0x10, 0); /* CHECKPOINT_ONLINE */
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
@@ -359,8 +367,13 @@ UT_TEST(test_foreign_side_records_have_no_cold_owner)
 	commit_nrels = 1;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
 				 CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(out.record.record_flags,
-				 CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+
+	/* Creating a relation file is idempotent: its native redo is the owner. */
+	fake_record(&record, RM_SMGR_ID, XLOG_SMGR_CREATE, 0);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, 0);
 
 	fake_record(&record, RM_HEAP_ID, 0x20, 1);
 	plan_component(0, RF_DETACHED_COMPONENT_PAGE_CODEC, RF_PAGE_CLASS_ORDINARY, 4, 9, 0);
@@ -370,10 +383,232 @@ UT_TEST(test_foreign_side_records_have_no_cold_owner)
 	UT_ASSERT_EQ(out.record.component_count, 1);
 }
 
+/* SPACE payloads built with the SPACE owner's own WAL codec. */
+static ClusterSpaceReservation
+space_state(uint8 incarnation)
+{
+	ClusterSpaceReservation state;
+
+	memset(&state, 0, sizeof(state));
+	state.identity.key.system_identifier = 99;
+	state.identity.key.database_incarnation = 4;
+	memcpy(state.identity.key.storage_uuid, UUID, 16);
+	state.identity.key.locator.spcOid = DEFAULTTABLESPACE_OID;
+	state.identity.key.locator.dbOid = 5;
+	state.identity.key.locator.relNumber = 16384;
+	memset(state.identity.incarnation, incarnation, 16);
+	state.identity.sequence = 1;
+	state.identity.operation = 7;
+	state.identity.state = CLUSTER_SPACE_IDENTITY_LIVE;
+	return state;
+}
+
+static ClusterSpaceStructureChange
+structure_change(ClusterSpaceWalAction action)
+{
+	ClusterSpaceStructureChange c;
+
+	memset(&c, 0, sizeof(c));
+	c.identity.action = action;
+	c.identity.result = space_state(0x31).identity;
+	c.identity.result_token = 211;
+	c.reservation.result_token = 211;
+	c.reservation.result.identity = c.identity.result;
+	if (action == CLUSTER_SPACE_WAL_CREATE) {
+		c.identity.nblocks = InvalidBlockNumber;
+		c.reservation.action = CLUSTER_SPACE_RESERVATION_INIT;
+		return c;
+	}
+	c.identity.expected = c.identity.result;
+	c.identity.before_token = 17;
+	c.reservation.before.identity = c.identity.expected;
+	c.reservation.before.next_block = 10;
+	c.reservation.before_token = 99;
+	c.identity.result.sequence++;
+	c.identity.result.operation++;
+	if (action == CLUSTER_SPACE_WAL_TRUNCATE) {
+		c.identity.nblocks = 4;
+		c.identity.result.incarnation[0]++;
+		c.reservation.action = CLUSTER_SPACE_RESERVATION_RESET;
+		c.reservation.first_block = c.reservation.result.next_block = 4;
+	} else {
+		c.identity.nblocks = InvalidBlockNumber;
+		c.identity.result.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+		c.reservation.action = CLUSTER_SPACE_RESERVATION_TOMBSTONE;
+		c.reservation.result.next_block = 10;
+	}
+	c.reservation.result.identity = c.identity.result;
+	return c;
+}
+
+static void
+space_record(FakeRecord *record, uint8 info, const ClusterSpaceStructureChange *change)
+{
+	fake_record(record, RM_SMGR_ID, info, 0);
+	if (info == XLOG_SMGR_SPACE_IDENTITY) {
+		UT_ASSERT(cluster_space_structure_wal_encode(change, record->data,
+													 CLUSTER_SPACE_STRUCTURE_WAL_BYTES));
+		record->storage.decoded.main_data_len = CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
+	} else {
+		UT_ASSERT(cluster_space_reservation_wal_encode(&change->reservation, record->data,
+													   CLUSTER_SPACE_RESERVATION_WAL_BYTES));
+		record->storage.decoded.main_data_len = CLUSTER_SPACE_RESERVATION_WAL_BYTES;
+	}
+}
+
+static bool
+incarnation_is(const uint8 *incarnation, uint8 first, uint8 rest)
+{
+	int i;
+
+	if (incarnation[0] != first)
+		return false;
+	for (i = 1; i < 16; i++)
+		if (incarnation[i] != rest)
+			return false;
+	return true;
+}
+
+UT_TEST(test_space_identity_changes_are_typed)
+{
+	FakeRecord record;
+	ClusterColdDecodedV1 out = { 0 };
+	ClusterSpaceStructureChange change = structure_change(CLUSTER_SPACE_WAL_CREATE);
+
+	space_record(&record, XLOG_SMGR_SPACE_IDENTITY, &change);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, 0);
+	UT_ASSERT_EQ(out.record.space_count, 1);
+	UT_ASSERT(out.record.space_ops == out.space_ops);
+	UT_ASSERT_EQ(out.space_ops[0].kind, CLUSTER_COLD_SPACE_CREATE);
+	UT_ASSERT_EQ(out.space_ops[0].locator.relNumber, 16384);
+	UT_ASSERT(incarnation_is(out.space_ops[0].result_incarnation, 0x31, 0x31));
+	UT_ASSERT(incarnation_is(out.space_ops[0].before_incarnation, 0, 0));
+	UT_ASSERT(out.space_ops[0].payload == record.data);
+	UT_ASSERT_EQ(out.space_ops[0].payload_length, CLUSTER_SPACE_STRUCTURE_WAL_BYTES);
+
+	change = structure_change(CLUSTER_SPACE_WAL_TRUNCATE);
+	space_record(&record, XLOG_SMGR_SPACE_IDENTITY, &change);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	/* another generation's SPACE change has the SPACE owner */
+	UT_ASSERT_EQ(out.record.record_flags, 0);
+	UT_ASSERT_EQ(out.space_ops[0].kind, CLUSTER_COLD_SPACE_TRUNCATE);
+	UT_ASSERT_EQ(out.space_ops[0].nblocks, 4);
+	UT_ASSERT(incarnation_is(out.space_ops[0].before_incarnation, 0x31, 0x31));
+	UT_ASSERT(incarnation_is(out.space_ops[0].result_incarnation, 0x32, 0x31));
+
+	/* A standalone tombstone, another namespace, or a damaged payload. */
+	change = structure_change(CLUSTER_SPACE_WAL_TOMBSTONE);
+	space_record(&record, XLOG_SMGR_SPACE_IDENTITY, &change);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
+				 CLUSTER_COLD_SPACE_INVALID);
+	change = structure_change(CLUSTER_SPACE_WAL_CREATE);
+	space_record(&record, XLOG_SMGR_SPACE_IDENTITY, &change);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 98, UUID, true, false, &out),
+				 CLUSTER_COLD_SPACE_INVALID);
+	record.storage.decoded.main_data_len--;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
+				 CLUSTER_COLD_SPACE_INVALID);
+	cluster_cold_decoded_release_v1(&out);
+	UT_ASSERT(out.space_ops == NULL);
+}
+
+UT_TEST(test_space_reservation_advance_is_typed)
+{
+	FakeRecord record;
+	ClusterColdDecodedV1 out = { 0 };
+	ClusterSpaceStructureChange change = structure_change(CLUSTER_SPACE_WAL_CREATE);
+
+	change.reservation.action = CLUSTER_SPACE_RESERVATION_ADVANCE;
+	change.reservation.before = space_state(0x31);
+	change.reservation.before.next_block = 3;
+	change.reservation.before_token = 5;
+	change.reservation.result = change.reservation.before;
+	change.reservation.result.next_block = 9;
+	change.reservation.first_block = 3;
+	change.reservation.granted = 6;
+	change.reservation.result_token = 6;
+	space_record(&record, XLOG_SMGR_SPACE_RESERVATION, &change);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, 0);
+	UT_ASSERT_EQ(out.record.space_count, 1);
+	UT_ASSERT_EQ(out.space_ops[0].kind, CLUSTER_COLD_SPACE_ADVANCE);
+	UT_ASSERT(incarnation_is(out.space_ops[0].result_incarnation, 0x31, 0x31));
+	UT_ASSERT_EQ(out.space_ops[0].payload_length, CLUSTER_SPACE_RESERVATION_WAL_BYTES);
+
+	/* Only an advance stands alone. */
+	change = structure_change(CLUSTER_SPACE_WAL_CREATE);
+	space_record(&record, XLOG_SMGR_SPACE_RESERVATION, &change);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
+				 CLUSTER_COLD_SPACE_INVALID);
+	cluster_cold_decoded_release_v1(&out);
+}
+
+/* A commit's drops: one SPACE tombstone each; the commit stays native. */
+UT_TEST(test_commit_space_drops_are_typed)
+{
+	FakeRecord record;
+	ClusterColdDecodedV1 out = { 0 };
+	ClusterSpaceStructureChange drop = structure_change(CLUSTER_SPACE_WAL_TOMBSTONE);
+	char *items;
+
+	fake_record(&record, RM_XACT_ID, XLOG_XACT_COMMIT, 0);
+	items = record.data;
+	UT_ASSERT(cluster_space_structure_wal_encode(&drop, items, CLUSTER_SPACE_STRUCTURE_WAL_BYTES));
+	drop.identity.expected.key.locator.relNumber = 16385;
+	drop.identity.result.key.locator.relNumber = 16385;
+	drop.reservation.before.identity.key.locator.relNumber = 16385;
+	drop.reservation.result.identity.key.locator.relNumber = 16385;
+	UT_ASSERT(cluster_space_structure_wal_encode(&drop, items + CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+												 CLUSTER_SPACE_STRUCTURE_WAL_BYTES));
+	commit_nrels = 3;
+	commit_nspace_drops = 2;
+	commit_space_drops = items;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, 0);
+	UT_ASSERT_EQ(out.record.space_count, 2);
+	UT_ASSERT_EQ(out.space_ops[0].kind, CLUSTER_COLD_SPACE_DROP);
+	UT_ASSERT_EQ(out.space_ops[0].locator.relNumber, 16384);
+	UT_ASSERT_EQ(out.space_ops[1].locator.relNumber, 16385);
+	UT_ASSERT(incarnation_is(out.space_ops[1].before_incarnation, 0x31, 0x31));
+	UT_ASSERT(incarnation_is(out.space_ops[1].result_incarnation, 0, 0));
+	UT_ASSERT(out.space_ops[1].payload == items + CLUSTER_SPACE_STRUCTURE_WAL_BYTES);
+
+	/* Another generation's commit still has no cold owner. */
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+
+	/* More drops than relations, or a drop that is not a tombstone. */
+	commit_nrels = 1;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
+				 CLUSTER_COLD_SPACE_INVALID);
+	commit_nrels = 3;
+	drop = structure_change(CLUSTER_SPACE_WAL_TRUNCATE);
+	UT_ASSERT(cluster_space_structure_wal_encode(&drop, items, CLUSTER_SPACE_STRUCTURE_WAL_BYTES));
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
+				 CLUSTER_COLD_SPACE_INVALID);
+
+	/* A plain record afterwards keeps the buffer but carries no effects. */
+	fake_record(&record, RM_HEAP_ID, 0x20, 1);
+	plan_component(0, RF_DETACHED_COMPONENT_PAGE_CODEC, RF_PAGE_CLASS_ORDINARY, 4, 9, 0);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.space_count, 0);
+	UT_ASSERT(out.record.space_ops == NULL);
+	UT_ASSERT(out.space_capacity >= 2);
+	cluster_cold_decoded_release_v1(&out);
+	UT_ASSERT_EQ(out.space_capacity, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(10);
 	UT_RUN(test_page_record_maps_ordinary_components);
 	UT_RUN(test_registry_refusal_is_opcode_unsupported);
 	UT_RUN(test_cold_owner_policy);
@@ -381,6 +616,9 @@ main(void)
 	UT_RUN(test_storage_lifecycle_classification);
 	UT_RUN(test_malformed_plan_refused);
 	UT_RUN(test_foreign_side_records_have_no_cold_owner);
+	UT_RUN(test_space_identity_changes_are_typed);
+	UT_RUN(test_space_reservation_advance_is_typed);
+	UT_RUN(test_commit_space_drops_are_typed);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -106,6 +106,8 @@ static ClusterControlRootResult source_result[NROOTS + 1];
 static uint16 fence_count;
 static ClusterColdDetailV1 scan_result[NROOTS + 1];
 static uint64 data_token;
+static uint64 database_incarnation[NROOTS + 1];
+static bool scan_space; /* thread 2 extends relation 300 before its page record */
 
 ClusterRecoveryDutyCompare
 cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *a, const ClusterRecoveryDutyKey *b)
@@ -137,6 +139,7 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 	UT_ASSERT_EQ(memcmp(token, &tokens[thread], sizeof(*token)), 0);
 	memset(source, 0, sizeof(*source));
 	source->claim.identity = root->identity;
+	source->claim.database_incarnation = database_incarnation[thread];
 	source->timeline = root->checkpoint_tli;
 	*redo = native_redo[thread];
 	return source_result[thread];
@@ -196,6 +199,30 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	detail = cluster_cold_plan_feed_v1(plan, participant, &record);
 	if (detail != CLUSTER_COLD_OK)
 		return detail;
+	if (scan_space && thread == 2) {
+		static const char payload[4] = { 'A', 'D', 'V', '1' };
+		ClusterColdSpaceOpV1 advance;
+
+		memset(&advance, 0, sizeof(advance));
+		advance.kind = CLUSTER_COLD_SPACE_ADVANCE;
+		advance.locator.spcOid = 1663;
+		advance.locator.dbOid = 5;
+		advance.locator.relNumber = 300;
+		memset(advance.result_incarnation, 7, 16);
+		advance.payload = payload;
+		advance.payload_length = sizeof(payload);
+		memset(&record, 0, sizeof(record));
+		record.read_rec_ptr = native_redo[thread];
+		record.end_rec_ptr = native_redo[thread] + 0x100;
+		record.prev_rec_ptr = root->checkpoint_lower_lsn;
+		record.space_count = 1;
+		record.space_ops = &advance;
+		detail = cluster_cold_plan_feed_v1(plan, participant, &record);
+		if (detail != CLUSTER_COLD_OK)
+			return detail;
+		record.space_count = 0;
+		record.space_ops = NULL;
+	}
 	memset(&component, 0, sizeof(component));
 	component.page.system_identifier = 9;
 	memset(component.page.storage_uuid, 1, 16);
@@ -211,9 +238,10 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	component.before.mutation_token = 5;
 	memset(component.result.segment_incarnation, 7, 16);
 	component.result.mutation_token = 6;
-	record.read_rec_ptr = native_redo[thread];
+	record.read_rec_ptr = native_redo[thread] + (scan_space && thread == 2 ? 0x100 : 0);
 	record.end_rec_ptr = root->validated_tail_lsn_exclusive;
-	record.prev_rec_ptr = root->checkpoint_lower_lsn;
+	record.prev_rec_ptr
+		= scan_space && thread == 2 ? native_redo[thread] : root->checkpoint_lower_lsn;
 	record.component_count = 1;
 	record.components = &component;
 	detail = cluster_cold_plan_feed_v1(plan, participant, &record);
@@ -266,6 +294,27 @@ cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterCol
 	return true;
 }
 
+/* The SPACE owner's pass-1 check: what it was given, and its answer. */
+static int space_checks;
+static ClusterColdObserverV1 space_check_namespace;
+static uint32 space_check_count;
+
+bool
+cluster_cold_space_check_v1(void *arg, const RelFileLocator *locator,
+							const ClusterColdSpaceInputV1 *inputs, uint32 count, uint32 *order)
+{
+	uint32 i;
+
+	(void)locator;
+	(void)inputs;
+	space_checks++;
+	space_check_namespace = *(ClusterColdObserverV1 *)arg;
+	space_check_count = count;
+	for (i = 0; i < count; i++)
+		order[i] = i;
+	return true;
+}
+
 static void
 fixture(void)
 {
@@ -298,6 +347,7 @@ fixture(void)
 		native_redo[thread] = 0x800;
 		source_result[thread] = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 		scan_result[thread] = CLUSTER_COLD_OK;
+		database_incarnation[thread] = 5;
 		tokens[thread].origin_thread_id = thread;
 		tokens[thread].file_txn_seq = 77;
 	}
@@ -520,6 +570,52 @@ UT_TEST(test_ready_requires_every_consumer_before_ir)
 	cluster_cold_typed_destroy_v1(&typed);
 }
 
+/*
+ * Relations with SPACE effects are checked by the SPACE owner in pass 1, in
+ * the namespace every participant shares, and pass 2 then needs the cold
+ * SPACE install too.
+ */
+UT_TEST(test_space_effects_checked_and_need_the_space_owner)
+{
+	ClusterColdHandshakeV1 all = { .redo_block_hook = true,
+								   .participant_census = true,
+								   .side_owners = true,
+								   .completion_publish = true,
+								   .restartpoint_hold = true };
+	ClusterColdHandshakeV1 with_space = all;
+	ClusterColdTypedV1 *typed;
+	char reason[256];
+
+	with_space.space_owner = true;
+	fixture();
+	data_token = 5;
+	scan_space = true;
+	space_checks = 0;
+	typed = prepare(0x800);
+	if (typed->refusal != CLUSTER_COLD_OK)
+		printf("# refusal: %s\n", typed->refusal_detail);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(space_checks, 1);
+	UT_ASSERT_EQ(space_check_count, 1);
+	UT_ASSERT_EQ(space_check_namespace.system_identifier, 9);
+	UT_ASSERT_EQ(space_check_namespace.database_incarnation, 5);
+	UT_ASSERT_EQ(space_check_namespace.storage_uuid[0], 1);
+	UT_ASSERT(!cluster_cold_typed_ready_v1(typed, &all, reason, sizeof(reason)));
+	UT_ASSERT(strstr(reason, "1 SPACE relations need the cold SPACE owner") != NULL);
+	UT_ASSERT(cluster_cold_typed_ready_v1(typed, &with_space, reason, sizeof(reason)));
+	cluster_cold_typed_destroy_v1(&typed);
+
+	/* Generations of different database incarnations share no namespace. */
+	fixture();
+	data_token = 5;
+	database_incarnation[2] = 6;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
+	UT_ASSERT(strstr(typed->refusal_detail, "database incarnation") != NULL);
+	cluster_cold_typed_destroy_v1(&typed);
+	scan_space = false;
+}
+
 /* PRE2: a cold crash that needs several threads merged is refused outside
  * the shared profile, before any fence, claim or replay; single-stream and
  * warm decisions pass through unchanged. */
@@ -714,12 +810,18 @@ UT_TEST(test_refusal_hints)
 	UT_ASSERT(strstr(cluster_cold_refusal_hint_v1(CLUSTER_COLD_HISTORY_GAP), "typed cold plan")
 			  != NULL);
 	UT_ASSERT(strstr(cluster_cold_refusal_hint_v1(CLUSTER_COLD_OK), "typed cold plan") != NULL);
+	UT_ASSERT(strstr(cluster_cold_refusal_hint_v1(CLUSTER_COLD_SPACE_INVALID), "SPACE changes")
+			  != NULL);
+	UT_ASSERT(strstr(cluster_cold_refusal_hint_v1(CLUSTER_COLD_SPACE_REFUSED), "SPACE pages")
+			  != NULL);
+	UT_ASSERT(strstr(cluster_cold_refusal_hint_v1(CLUSTER_COLD_IDENTITY_MISSING), "SPACE identity")
+			  != NULL);
 }
 
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(16);
 	UT_RUN(test_prepare_seals_own_and_fenced_generations);
 	UT_RUN(test_prepare_refuses_unsealed_own_generation);
 	UT_RUN(test_prepare_refuses_restart_redo_mismatch);
@@ -728,6 +830,7 @@ main(void)
 	UT_RUN(test_redo_block_decisions);
 	UT_RUN(test_route_shared_cold_merge_only_typed);
 	UT_RUN(test_ready_requires_every_consumer_before_ir);
+	UT_RUN(test_space_effects_checked_and_need_the_space_owner);
 	UT_RUN(test_unshared_multi_thread_cold_merge_refused);
 	UT_RUN(test_checksum_decides_torn_pages);
 	UT_RUN(test_cold_replay_window_tracks_pass_two);

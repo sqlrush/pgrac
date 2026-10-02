@@ -3,13 +3,14 @@
  * cluster_cold_recovery_replay.c
  *	  Pure pass-2 sequencer of typed cold-crash replay.
  *
- *	  Pass 2 replays exactly what pass 1 sealed.  For each scheduled page
- *	  record, in schedule order, its participant's stream is read up to the
- *	  record; every record before it has no scheduled step and replays in
- *	  stream order.  The scheduled record must carry its pass-1 identity
- *	  (start, end, CRC, rmgr, info).  Afterwards every participant is
- *	  drained to its validated tail and must have consumed exactly the
- *	  records pass 1 counted after its native redo start.
+ *	  Pass 2 replays exactly what pass 1 sealed.  For each scheduled record
+ *	  (a page record or a SPACE step), in schedule order, its participant's
+ *	  stream is read up to the record; every record before it has no
+ *	  scheduled step and replays in stream order.  The scheduled record must
+ *	  carry its pass-1 identity (start, end, CRC, rmgr, info).  Afterwards
+ *	  every participant is drained to its validated tail and must have
+ *	  consumed exactly the records pass 1 counted after its native redo
+ *	  start, and every SPACE relation is installed in full.
  *
  *	  The caller's callbacks read and apply; nothing here touches WAL,
  *	  buffers, locks or authority.  Any difference from pass 1 stops replay
@@ -50,6 +51,8 @@ typedef struct ColdReplayRun {
 ClusterColdPageActionV1
 cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own)
 {
+	if (step != NULL && step->step_kind == CLUSTER_COLD_STEP_SPACE)
+		return CLUSTER_COLD_SPACE_STEP;
 	if (step == NULL || !step->all_skip)
 		return CLUSTER_COLD_PAGE_APPLY;
 	return own ? CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID : CLUSTER_COLD_PAGE_SKIP;
@@ -124,7 +127,9 @@ replay_step(ColdReplayRun *run, uint32 index)
 		return replay_stop(run, CLUSTER_COLD_REPLAY_IDENTITY, step.participant, step.read_rec_ptr);
 	replay_consumed(run, step.participant, &record);
 	action = cluster_cold_page_action_v1(&step, step.participant == run->own);
-	if (action == CLUSTER_COLD_PAGE_APPLY)
+	if (action == CLUSTER_COLD_SPACE_STEP)
+		run->result->space_steps++;
+	else if (action == CLUSTER_COLD_PAGE_APPLY)
 		run->result->pages_applied++;
 	else
 		run->result->pages_skipped++;
@@ -168,6 +173,7 @@ cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
 	ColdReplayRun run;
 	ClusterColdReplayDetailV1 detail = CLUSTER_COLD_REPLAY_OK;
 	uint32 steps;
+	uint32 relations;
 	uint32 i;
 
 	if (result == NULL)
@@ -182,6 +188,9 @@ cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
 		|| own >= participant_count || ops == NULL || ops->next == NULL || ops->unscheduled == NULL
 		|| ops->scheduled == NULL)
 		return replay_stop(&run, CLUSTER_COLD_REPLAY_INVALID_ARGUMENT, 0, InvalidXLogRecPtr);
+	relations = cluster_cold_plan_space_relation_count_v1(plan);
+	if (relations != 0 && ops->space_final == NULL)
+		return replay_stop(&run, CLUSTER_COLD_REPLAY_INVALID_ARGUMENT, 0, InvalidXLogRecPtr);
 	run.plan = plan;
 	run.participants = participants;
 	run.own = own;
@@ -194,6 +203,11 @@ cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
 		detail = replay_step(&run, i);
 	for (i = 0; i < participant_count && detail == CLUSTER_COLD_REPLAY_OK; i++)
 		detail = replay_drain(&run, i);
+	for (i = 0; i < relations && detail == CLUSTER_COLD_REPLAY_OK; i++) {
+		if (!ops->space_final(arg, i))
+			return replay_stop(&run, CLUSTER_COLD_REPLAY_CALLBACK, own, run.last_end[own]);
+		result->space_relations_finished++;
+	}
 	return detail;
 }
 

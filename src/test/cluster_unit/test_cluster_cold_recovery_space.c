@@ -249,14 +249,84 @@ observe(void *arg, const RfPageIdentityV1 *page, ClusterColdDataV1 *out)
 	return true;
 }
 
+/*
+ * Stand-in for the SPACE owner's check: feed order, CREATEs first (as a
+ * chain would order them), a refusal, or a malformed order.
+ */
+typedef enum CheckMode {
+	CHECK_FEED_ORDER,
+	CHECK_CREATE_FIRST,
+	CHECK_REFUSE,
+	CHECK_BAD_ORDER
+} CheckMode;
+
+typedef struct CheckLog {
+	CheckMode mode;
+	int calls;
+	uint32 last_count;
+	RelFileLocator last_locator;
+	ClusterColdSpaceInputV1 last_inputs[8];
+} CheckLog;
+
+static CheckLog check_log;
+
+static bool
+space_check(void *arg, const RelFileLocator *locator, const ClusterColdSpaceInputV1 *inputs,
+			uint32 count, uint32 *order)
+{
+	CheckLog *log = (CheckLog *)arg;
+	uint32 next = 0;
+	uint32 i;
+
+	log->calls++;
+	log->last_count = count;
+	log->last_locator = *locator;
+	for (i = 0; i < count && i < lengthof(log->last_inputs); i++)
+		log->last_inputs[i] = inputs[i];
+	switch (log->mode) {
+	case CHECK_REFUSE:
+		/* a well-formed order does not make a refusal an answer */
+		for (i = 0; i < count; i++)
+			order[i] = i;
+		return false;
+	case CHECK_BAD_ORDER:
+		for (i = 0; i < count; i++)
+			order[i] = 0;
+		return true;
+	case CHECK_CREATE_FIRST:
+		for (i = 0; i < count; i++)
+			if (inputs[i].kind == CLUSTER_COLD_SPACE_CREATE)
+				order[next++] = i;
+		for (i = 0; i < count; i++)
+			if (inputs[i].kind != CLUSTER_COLD_SPACE_CREATE)
+				order[next++] = i;
+		return true;
+	case CHECK_FEED_ORDER:
+		for (i = 0; i < count; i++)
+			order[i] = i;
+		return true;
+	}
+	return false;
+}
+
 static ClusterColdPlanV1 *
-make_plan(const ClusterColdParticipantV1 *participants, uint32 count)
+make_plan_checked(const ClusterColdParticipantV1 *participants, uint32 count, CheckMode mode)
 {
 	ClusterColdPlanV1 *plan = NULL;
 
 	chains_reset();
+	memset(&check_log, 0, sizeof(check_log));
+	check_log.mode = mode;
 	UT_ASSERT_EQ(cluster_cold_plan_create_v1(participants, count, BUDGET, &plan), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_set_space_check_v1(plan, space_check, &check_log),
+				 CLUSTER_COLD_OK);
 	return plan;
+}
+
+static ClusterColdPlanV1 *
+make_plan(const ClusterColdParticipantV1 *participants, uint32 count)
+{
+	return make_plan_checked(participants, count, CHECK_FEED_ORDER);
 }
 
 static bool
@@ -318,6 +388,12 @@ UT_TEST(test_space_advance_collected_not_scheduled)
 	UT_ASSERT(cluster_cold_plan_space_input_v1(plan, 0, 1, &input));
 	UT_ASSERT_EQ(input.participant, 1);
 	UT_ASSERT(!cluster_cold_plan_space_input_v1(plan, 0, 2, &input));
+	/* the SPACE owner checked the relation once, with the same inputs */
+	UT_ASSERT_EQ(check_log.calls, 1);
+	UT_ASSERT_EQ(check_log.last_count, 2);
+	UT_ASSERT_EQ(check_log.last_locator.relNumber, REL_R);
+	UT_ASSERT_EQ(check_log.last_inputs[0].read_rec_ptr, 0x1200);
+	UT_ASSERT_EQ(check_log.last_inputs[1].participant, 1);
 	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 0), 2);
 	cluster_cold_plan_destroy_v1(&plan);
 }
@@ -642,9 +718,14 @@ UT_TEST(test_space_drop_makes_changes_irrelevant)
 
 	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(table.calls, 0);
-	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 1);
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 2);
 	UT_ASSERT(step_at(plan, 0, 0, 0x1000, &step));
 	UT_ASSERT(step.all_skip);
+	/* the drop is a step: the SPACE owner installs it before its commit */
+	UT_ASSERT(step_at(plan, 1, 1, 0x1000, &step));
+	UT_ASSERT_EQ(step.step_kind, CLUSTER_COLD_STEP_SPACE);
+	UT_ASSERT_EQ(step.space_kind, CLUSTER_COLD_SPACE_DROP);
+	UT_ASSERT_EQ(step.space_count, 1);
 	UT_ASSERT_EQ(cluster_cold_plan_space_relation_count_v1(plan), 1);
 	UT_ASSERT(cluster_cold_plan_space_input_v1(plan, 0, 0, &input));
 	UT_ASSERT_EQ(input.kind, CLUSTER_COLD_SPACE_DROP);
@@ -665,8 +746,8 @@ UT_TEST(test_space_drop_makes_changes_irrelevant)
 				 CLUSTER_COLD_OK);
 	observe_set(&table, REL_R, 0, CLUSTER_COLD_DATA_ABSENT, ver(0, 0), VERIFIED);
 	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
-	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 3);
-	UT_ASSERT(step_at(plan, 2, 1, 0x1200, &step));
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 4);
+	UT_ASSERT(step_at(plan, 3, 1, 0x1200, &step));
 	UT_ASSERT_EQ(step.blocks[0].verdict, CLUSTER_COLD_BLOCK_APPLY_INIT);
 	UT_ASSERT_EQ(step.blocks[0].expected_kind, CLUSTER_COLD_DATA_ABSENT);
 	cluster_cold_plan_destroy_v1(&plan);
@@ -741,6 +822,124 @@ UT_TEST(test_space_created_relation_without_identity)
 	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag),
 				 CLUSTER_COLD_IDENTITY_MISSING);
 	cluster_cold_plan_destroy_v1(&plan);
+}
+
+/* One commit drops several relations: one step, each effect located. */
+UT_TEST(test_space_commit_drops_several_relations)
+{
+	ClusterColdParticipantV1 parts[2]
+		= { part(1, 11, 0x1000, 0x1000, 0x2000), part(2, 12, 0x1000, 0x1000, 0x2000) };
+	ClusterColdPlanV1 *plan = make_plan(parts, 2);
+	ObserveTable table = { 0 };
+	ClusterColdDiagV1 diag;
+	ClusterColdStepV1 step;
+	ClusterColdSpaceInputV1 input;
+	RelFileLocator locator;
+	uint32 relation = 99;
+	uint32 position = 99;
+	uint32 count = 0;
+	ClusterColdSpaceOpV1 drops[2] = { space_op(CLUSTER_COLD_SPACE_DROP, REL_R, INC_OLD, 0, 0),
+									  space_op(CLUSTER_COLD_SPACE_DROP, REL_S, INC_C, 0, 0) };
+
+	UT_ASSERT_EQ(feed_space(plan, 0, 0x1000, 0x2000, 1,
+							space_op(CLUSTER_COLD_SPACE_ADVANCE, REL_S, 0, INC_C, 0)),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_any(plan, 1, 0x1000, 0x2000, 2, 0, NULL, 2, drops), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 1);
+	UT_ASSERT(step_at(plan, 0, 1, 0x1000, &step));
+	UT_ASSERT_EQ(step.space_kind, CLUSTER_COLD_SPACE_DROP);
+	UT_ASSERT_EQ(step.space_count, 2);
+	UT_ASSERT(cluster_cold_plan_step_space_v1(plan, 0, 1, &relation, &position));
+	UT_ASSERT(cluster_cold_plan_space_relation_v1(plan, relation, &locator, &count));
+	UT_ASSERT_EQ(locator.relNumber, REL_S);
+	UT_ASSERT_EQ(count, 2);
+	UT_ASSERT_EQ(position, 1);
+	UT_ASSERT(cluster_cold_plan_space_input_v1(plan, relation, position, &input));
+	UT_ASSERT_EQ(input.kind, CLUSTER_COLD_SPACE_DROP);
+	UT_ASSERT(cluster_cold_plan_step_space_v1(plan, 0, 0, &relation, &position));
+	UT_ASSERT(cluster_cold_plan_space_relation_v1(plan, relation, &locator, &count));
+	UT_ASSERT_EQ(locator.relNumber, REL_R);
+	UT_ASSERT(!cluster_cold_plan_step_space_v1(plan, 0, 2, &relation, &position));
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+/*
+ * The SPACE owner's order, not SCN, orders a relation's SPACE steps: the
+ * CREATE is installed before the TRUNCATE of the incarnation it made.
+ */
+UT_TEST(test_space_owner_order_orders_steps)
+{
+	ClusterColdParticipantV1 parts[2]
+		= { part(1, 11, 0x1000, 0x1000, 0x2000), part(2, 12, 0x1000, 0x1000, 0x2000) };
+	ClusterColdPlanV1 *plan = make_plan_checked(parts, 2, CHECK_CREATE_FIRST);
+	ObserveTable table = { 0 };
+	ClusterColdDiagV1 diag;
+	ClusterColdStepV1 step;
+	ClusterColdSpaceInputV1 input;
+
+	UT_ASSERT_EQ(feed_space(plan, 0, 0x1000, 0x2000, 1,
+							space_op(CLUSTER_COLD_SPACE_TRUNCATE, REL_S, INC_C, INC_D, 0)),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_space(plan, 1, 0x1000, 0x2000, 9,
+							space_op(CLUSTER_COLD_SPACE_CREATE, REL_S, 0, INC_C, 0)),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(check_log.last_inputs[0].kind, CLUSTER_COLD_SPACE_TRUNCATE);
+	UT_ASSERT(cluster_cold_plan_space_input_v1(plan, 0, 0, &input));
+	UT_ASSERT_EQ(input.kind, CLUSTER_COLD_SPACE_CREATE);
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 2);
+	UT_ASSERT(step_at(plan, 0, 1, 0x1000, &step));
+	UT_ASSERT_EQ(step.space_kind, CLUSTER_COLD_SPACE_CREATE);
+	UT_ASSERT_EQ(step.space_input, 0);
+	UT_ASSERT(step_at(plan, 1, 0, 0x1000, &step));
+	UT_ASSERT_EQ(step.space_kind, CLUSTER_COLD_SPACE_TRUNCATE);
+	UT_ASSERT_EQ(step.space_input, 1);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+/* Without the SPACE owner's agreement nothing is planned. */
+UT_TEST(test_space_owner_check_required)
+{
+	ClusterColdParticipantV1 parts[2]
+		= { part(1, 11, 0x1000, 0x1000, 0x2000), part(2, 12, 0x1000, 0x1000, 0x2000) };
+	ClusterColdPlanV1 *plan;
+	ObserveTable table = { 0 };
+	ClusterColdDiagV1 diag;
+	ClusterColdSpaceOpV1 adv = space_op(CLUSTER_COLD_SPACE_ADVANCE, REL_R, 0, INC_OLD, 0);
+	CheckMode modes[2] = { CHECK_REFUSE, CHECK_BAD_ORDER };
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		plan = make_plan_checked(parts, 2, modes[i]);
+		UT_ASSERT_EQ(feed_space(plan, 0, 0x1000, 0x2000, 1, adv), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(feed_space(plan, 1, 0x1000, 0x2000, 2, adv), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag),
+					 CLUSTER_COLD_SPACE_REFUSED);
+		UT_ASSERT(diag.has_record);
+		UT_ASSERT_EQ(diag.read_rec_ptr, 0x1000);
+		UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 0);
+		cluster_cold_plan_destroy_v1(&plan);
+	}
+
+	/* No owner at all: refused; a plan without SPACE inputs needs none. */
+	chains_reset();
+	UT_ASSERT_EQ(cluster_cold_plan_create_v1(parts, 2, BUDGET, &plan), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_space(plan, 0, 0x1000, 0x2000, 1, adv), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_plain(plan, 1, 0x1000, 0x2000), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag),
+				 CLUSTER_COLD_SIDE_OWNER_MISSING);
+	UT_ASSERT_EQ(cluster_cold_plan_set_space_check_v1(plan, space_check, &check_log),
+				 CLUSTER_COLD_STATE);
+	cluster_cold_plan_destroy_v1(&plan);
+	chains_reset();
+	UT_ASSERT_EQ(cluster_cold_plan_create_v1(parts, 2, BUDGET, &plan), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_plain(plan, 0, 0x1000, 0x2000), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_plain(plan, 1, 0x1000, 0x2000), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	cluster_cold_plan_destroy_v1(&plan);
+	UT_ASSERT_EQ(cluster_cold_plan_set_space_check_v1(NULL, space_check, NULL),
+				 CLUSTER_COLD_INVALID_ARGUMENT);
 }
 
 UT_TEST(test_space_effect_validation)
@@ -834,6 +1033,9 @@ main(void)
 	UT_RUN(test_space_truncate_visibility_map_fork);
 	UT_RUN(test_space_token_repeated_across_incarnations);
 	UT_RUN(test_space_drop_makes_changes_irrelevant);
+	UT_RUN(test_space_commit_drops_several_relations);
+	UT_RUN(test_space_owner_order_orders_steps);
+	UT_RUN(test_space_owner_check_required);
 	UT_RUN(test_space_created_relation_without_identity);
 	UT_RUN(test_space_effect_validation);
 	UT_DONE();

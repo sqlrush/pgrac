@@ -395,9 +395,8 @@ space_record_store(ClusterColdPlanV1 *plan, uint32 canonical, const ClusterColdR
 	stored->rmid = record->rmid;
 	stored->info = record->info;
 	stored->flags = COLD_RECORD_SPACE | (history ? COLD_RECORD_HISTORY : 0);
-	if (!history
-		&& (record->space_ops[0].kind == CLUSTER_COLD_SPACE_CREATE
-			|| record->space_ops[0].kind == CLUSTER_COLD_SPACE_TRUNCATE))
+	/* Only an ADVANCE waits for the end of replay. */
+	if (!history && record->space_ops[0].kind != CLUSTER_COLD_SPACE_ADVANCE)
 		stored->flags |= COLD_RECORD_SPACE_STEP;
 	for (i = 0; i < record->space_count; i++) {
 		const ClusterColdSpaceOpV1 *source = &record->space_ops[i];
@@ -539,6 +538,7 @@ cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 index, ClusterCo
 		return false;
 	record = cold_record(plan, plan->schedule[index]);
 	memset(out, 0, sizeof(*out));
+	out->step_index = index;
 	out->participant = plan->participants[record->participant].input_index;
 	out->read_rec_ptr = record->read_rec_ptr;
 	out->end_rec_ptr = record->end_rec_ptr;
@@ -550,6 +550,7 @@ cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 index, ClusterCo
 
 		out->step_kind = CLUSTER_COLD_STEP_SPACE;
 		out->space_kind = op->kind;
+		out->space_count = cold_record_space_count(plan, plan->schedule[index]);
 		out->space_relation = op->relation;
 		out->space_input = op->input;
 		return true;
@@ -576,6 +577,39 @@ cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 index, ClusterCo
 	out->all_skip = any_skip && !any_apply;
 	out->mixed = any_skip && any_apply;
 	return true;
+}
+
+bool
+cluster_cold_plan_step_space_v1(const ClusterColdPlanV1 *plan, uint32 index, uint32 effect,
+								uint32 *relation, uint32 *input)
+{
+	const ColdRecord *record;
+	const ColdSpaceOp *op;
+
+	if (!plan_valid(plan) || plan->phase != COLD_PHASE_SEALED || relation == NULL || input == NULL
+		|| index >= plan->schedule_count)
+		return false;
+	record = cold_record(plan, plan->schedule[index]);
+	if ((record->flags & COLD_RECORD_SPACE) == 0
+		|| effect >= cold_record_space_count(plan, plan->schedule[index]))
+		return false;
+	op = cold_space_op(plan, record->first_component + effect);
+	*relation = op->relation;
+	*input = op->input;
+	return true;
+}
+
+ClusterColdDetailV1
+cluster_cold_plan_set_space_check_v1(ClusterColdPlanV1 *plan, ClusterColdSpaceCheckV1 check,
+									 void *arg)
+{
+	if (!plan_valid(plan) || check == NULL)
+		return CLUSTER_COLD_INVALID_ARGUMENT;
+	if (plan->phase != COLD_PHASE_FEEDING)
+		return CLUSTER_COLD_STATE;
+	plan->space_check = check;
+	plan->space_check_arg = arg;
+	return CLUSTER_COLD_OK;
 }
 
 uint32
