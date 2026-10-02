@@ -19140,6 +19140,35 @@ static bool inputs_native_wait, inputs_native_recovery, inputs_native_reconfigur
 static ClusterControlRootResult inputs_peer_result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 static ClusterWalWriterFlushV1 inputs_peer_flush;
 static unsigned inputs_peer_begins, inputs_peer_releases;
+static bool inputs_claim_observe;
+static unsigned inputs_claim_calls, inputs_claim_under_cf, inputs_claim_unpinned;
+static unsigned inputs_claim_fault;
+
+/* Observe the call site without replacing physical claim validation. */
+extern ClusterControlRootResult test_wal_inputs_claim_read(const char *path,
+														   const ClusterWalThreadClaimRefV2 *ref,
+														   ClusterWalThreadClaimV2 *out);
+ClusterControlRootResult
+test_wal_inputs_claim_read(const char *path, const ClusterWalThreadClaimRefV2 *ref,
+						   ClusterWalThreadClaimV2 *out)
+{
+	ClusterControlRootResult result;
+	if (inputs_claim_observe) {
+		inputs_claim_calls++;
+		inputs_claim_under_cf += test_actual_cf != NoLock;
+		inputs_claim_unpinned += !inputs_pin_held || !inputs_pin_current;
+	}
+	result = cluster_wal_claim_v2_read(path, ref, out);
+	if (inputs_claim_observe && inputs_claim_calls == 2) {
+		if (inputs_claim_fault == 1)
+			v2_checkpoint_root_race();
+		else if (inputs_claim_fault == 2)
+			inputs_pin_current = false;
+		else if (inputs_claim_fault == 3)
+			pg_re_throw();
+	}
+	return result;
+}
 
 /* The actual CONTROL owner is exercised by test_cluster_wal_cut. This
  * explicit boundary lets the real ROOT/WAL readers observe pending, stale
@@ -19912,6 +19941,62 @@ UT_TEST(test_wal_inputs_all_origins_exact_native_anchor)
 	MyBackendType = B_INVALID;
 }
 
+UT_TEST(test_wal_inputs_claim_io_releases_cf_and_keeps_all_native_pins)
+{
+	uint8 bytes[66048];
+	ClusterRecoveryAnchorV2 anchors[2];
+	ClusterWalInputsV1 *inputs = NULL;
+	inputs_fixture(bytes, anchors);
+	inputs_claim_observe = true;
+	inputs_claim_calls = inputs_claim_under_cf = inputs_claim_unpinned = inputs_claim_fault = 0;
+	UT_ASSERT_EQ(cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs), 0);
+	inputs_claim_observe = false;
+	UT_ASSERT_EQ(inputs_claim_calls, 2);
+	UT_ASSERT_EQ(inputs_claim_under_cf, 0);
+	UT_ASSERT_EQ(inputs_claim_unpinned, 0);
+	UT_ASSERT(inputs != NULL && inputs_pin_held);
+	UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 2);
+	cluster_wal_inputs_release_v1(&inputs);
+	UT_ASSERT(inputs == NULL && !inputs_pin_held && test_actual_cf == NoLock);
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_wal_inputs_claim_io_race_and_error_never_publish_partial_scope)
+{
+	for (unsigned fault = 1; fault <= 3; fault++) {
+		uint8 bytes[66048];
+		ClusterRecoveryAnchorV2 anchors[2];
+		ClusterWalInputsV1 *inputs = NULL;
+		volatile bool caught = false;
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		inputs_fixture(bytes, anchors);
+		inputs_claim_observe = true;
+		inputs_claim_calls = inputs_claim_under_cf = inputs_claim_unpinned = 0;
+		inputs_claim_fault = fault;
+		PG_TRY();
+		{
+			result = cluster_wal_inputs_begin_v1(v2_storage, TEST_SYSID, &inputs);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		inputs_claim_observe = false;
+		UT_ASSERT_EQ(inputs_claim_calls, 2);
+		UT_ASSERT_EQ(inputs_claim_under_cf, 0);
+		UT_ASSERT_EQ(inputs_claim_unpinned, 0);
+		UT_ASSERT_EQ(caught, fault == 3);
+		if (!caught)
+			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+		UT_ASSERT(inputs == NULL && !inputs_pin_held && test_actual_cf == NoLock);
+		/* Keep the failing test's scope cleanup independent of the verdict. */
+		if (inputs != NULL)
+			cluster_wal_inputs_release_v1(&inputs);
+	}
+	MyBackendType = B_INVALID;
+}
+
 UT_TEST(test_wal_inputs_missing_peer_or_pending_never_partial)
 {
 	for (unsigned fault = 0; fault < 4; fault++) {
@@ -20219,7 +20304,9 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_WAL_INPUTS") != NULL) {
-		UT_PLAN(18);
+		UT_PLAN(20);
+		UT_RUN(test_wal_inputs_claim_io_releases_cf_and_keeps_all_native_pins);
+		UT_RUN(test_wal_inputs_claim_io_race_and_error_never_publish_partial_scope);
 		UT_RUN(test_wal_inputs_remote_confirmation_feeds_complete_contribution_plan);
 		UT_RUN(test_wal_inputs_remote_requires_exact_identity_end_and_postread_scope);
 		UT_RUN(test_wal_inputs_contributions_all_closed_or_local_live);
@@ -20248,7 +20335,9 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(367);
+	UT_PLAN(369);
+	UT_RUN(test_wal_inputs_claim_io_releases_cf_and_keeps_all_native_pins);
+	UT_RUN(test_wal_inputs_claim_io_race_and_error_never_publish_partial_scope);
 	UT_RUN(test_wal_inputs_remote_confirmation_feeds_complete_contribution_plan);
 	UT_RUN(test_wal_inputs_remote_requires_exact_identity_end_and_postread_scope);
 	UT_RUN(test_wal_inputs_contributions_all_closed_or_local_live);

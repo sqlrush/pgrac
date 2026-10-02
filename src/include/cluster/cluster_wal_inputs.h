@@ -32,7 +32,9 @@ typedef struct ClusterWalInputsV1 ClusterWalInputsV1;
  * Read all present origins, including non-serving/current/history/terminal
  * generations. No ALIVE filter or partial result. Pending initialization
  * returns RECONFIG_WAIT. Acquire distinct sorted WALR-S outside CF, then
- * select all immutable claims/anchors under the unchanged CF-S ROOT token.
+ * select all immutable claim references/anchors under the unchanged CF-S
+ * ROOT token. Read the claims outside CF while retaining the entire WALR-S
+ * set, then recheck the exact ROOT token before returning any inputs.
  * Outputs are metadata only: live complete ends, physical WAL validation,
  * directory cuts, DATA and retirement still need their original owners.
  * The caller's ResourceOwner must remain current through release. */

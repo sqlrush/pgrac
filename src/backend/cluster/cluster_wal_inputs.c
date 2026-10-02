@@ -133,7 +133,6 @@ inputs_checkpoint(ClusterWalInputsV1 *inputs, const WalInputsWork *work,
 				  const ClusterWalHistoryRecord *record, bool current)
 {
 	ClusterWalInputV1 *item;
-	ClusterWalThreadClaimV2 claim;
 	ClusterRecoveryAnchorRefV2 anchor = { 0 };
 	ControlFileData native;
 	ClusterControlRootResult result;
@@ -149,9 +148,6 @@ inputs_checkpoint(ClusterWalInputsV1 *inputs, const WalInputsWork *work,
 	item->source.claim.max_config_generation = work->root.header.v2.config_generation;
 	memcpy(item->source.claim.claim_sha256, record->refs.claim_sha256, 32);
 	item->source.timeline = record->snapshot.checkpoint_tli;
-	result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &item->source.claim, &claim);
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		return result;
 	anchor.identity = record->snapshot.identity;
 	anchor.database_incarnation = item->source.claim.database_incarnation;
 	anchor.max_config_generation = item->source.claim.max_config_generation;
@@ -173,7 +169,6 @@ static ClusterControlRootResult
 inputs_terminal(ClusterWalInputsV1 *inputs, WalInputsWork *work, uint32 node, uint32 index)
 {
 	ClusterWalInputV1 *item;
-	ClusterWalThreadClaimV2 claim;
 	uint8 bytes[CLUSTER_WAL_CLAIM_V2_BYTES];
 	pg_cryptohash_ctx *hash;
 	ClusterControlRootResult result;
@@ -201,9 +196,6 @@ inputs_terminal(ClusterWalInputsV1 *inputs, WalInputsWork *work, uint32 node, ui
 	pg_cryptohash_free(hash);
 	if (!hashed)
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &item->source.claim, &claim);
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		return result;
 	item->first_segment = work->terminal.initialization.first_segment_lsn;
 	item->terminal = work->terminal.observation;
 	inputs->count++;
@@ -239,6 +231,28 @@ inputs_collect(ClusterWalInputsV1 *inputs, WalInputsWork *work)
 				return result;
 		}
 		result = inputs_checkpoint(inputs, work, &work->origin.current, true);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	}
+	return inputs_current(inputs) ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+								  : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+/* Claim paths are immutable within the held WALR set. Their physical I/O
+ * must not extend the cluster-wide CF interval; the caller rechecks the
+ * complete ROOT after this scan before publishing any assembled input. */
+static ClusterControlRootResult
+inputs_claims(ClusterWalInputsV1 *inputs)
+{
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	for (uint32 i = 0; i < inputs->count; i++) {
+		ClusterWalThreadClaimV2 claim;
+		ClusterControlRootResult result;
+		if (!inputs_current(inputs))
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &inputs->items[i].source.claim,
+										   &claim);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 	}
@@ -848,6 +862,11 @@ cluster_wal_inputs_begin_v1(const uint8 storage_uuid[16], uint64 system_identifi
 			result = inputs_root(inputs, work, false);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = inputs_collect(inputs, work);
+		inputs_unlock(work);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = inputs_claims(inputs);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = inputs_root(inputs, work, false);
 		inputs_unlock(work);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && !inputs_current(inputs))
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;

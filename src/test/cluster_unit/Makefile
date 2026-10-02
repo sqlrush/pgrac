@@ -2764,11 +2764,18 @@ WAL_INPUT_CONTRIBUTION_TEST_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O)
 
+# Observe only the claim-call boundary; the input owner and claim reader both
+# execute their production implementations.
+test_cluster_wal_inputs_product.o: $(top_srcdir)/src/backend/cluster/cluster_wal_inputs.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-Dcluster_wal_claim_v2_read=test_wal_inputs_claim_read -c $< -o $@
+
 test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc \
 		test_cluster_control_native_xid.inc \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
 		$(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
-		$(top_builddir)/src/backend/cluster/cluster_wal_inputs.o \
+		test_cluster_wal_inputs_product.o \
 		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
@@ -2778,7 +2785,7 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixt
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
-		$(top_builddir)/src/backend/cluster/cluster_wal_inputs.o \
+		test_cluster_wal_inputs_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
 		cluster_control_bootstrap_read_test.o \
