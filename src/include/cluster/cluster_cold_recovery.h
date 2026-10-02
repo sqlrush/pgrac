@@ -50,6 +50,7 @@
 
 #include "access/xlogrecord.h"
 #include "cluster/cluster_page_stable_base.h"
+#include "cluster/cluster_wal_source.h"
 
 #define CLUSTER_COLD_RECOVERY_INTERFACE_V1 1
 #define CLUSTER_COLD_MAX_PARTICIPANTS RF_PAGE_STABLE_MAX_PARTICIPANTS
@@ -224,6 +225,11 @@ extern bool cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 inde
 									  ClusterColdStepV1 *out);
 
 
+/* Records at or after the participant's native redo start (pass-2 input),
+ * page or not, as fed; pass 2 must consume exactly this many. */
+extern uint64 cluster_cold_plan_replay_record_count_v1(const ClusterColdPlanV1 *plan,
+													   uint32 participant);
+
 extern void cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan);
 
 #ifndef FRONTEND
@@ -250,6 +256,54 @@ extern ClusterColdDetailV1 cluster_cold_recovery_decode_v1(struct XLogReaderStat
 														   const uint8 storage_uuid[16],
 														   bool space_active,
 														   ClusterColdDecodedV1 *out);
+
+/*
+ * Pass-2 reader over one ROOT-selected writer generation.  Segments are
+ * opened through the selected restart-input opener (claim, namespace and
+ * file identity); the native reader validates pages, records and xl_prev.
+ * Read-only and never authority: the caller compares every returned record
+ * with its pass-1 identity before applying it.
+ */
+typedef struct ClusterColdReaderV1 ClusterColdReaderV1;
+
+extern ClusterColdReaderV1 *cluster_cold_reader_open_v1(const ClusterWalSourceRef *source,
+														uint64 system_identifier, XLogRecPtr start);
+extern struct XLogReaderState *cluster_cold_reader_next_v1(ClusterColdReaderV1 *reader,
+														   char **errormsg);
+extern void cluster_cold_reader_close_v1(ClusterColdReaderV1 **reader);
+
+/*
+ * Read-only DATA observation for seal().  Reads storage directly, before any
+ * replay touches shared buffers, and resolves the segment incarnation from
+ * the relation's persisted SPACE identity.  arg is a ClusterColdObserverV1.
+ */
+typedef struct ClusterColdObserverV1 {
+	RelFileLocator cached_locator;
+	bool cached_valid;
+	uint8 cached_incarnation[16];
+	uint64 pages_observed;
+	uint64 pages_invalid;
+} ClusterColdObserverV1;
+
+extern bool cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page,
+										 ClusterColdDataV1 *out);
+
+/* Pass-1 scan of one RECOVERY_REQUIRED root through the sealed recovery
+ * visitor, feeding the plan participant at caller index `participant`.
+ * Every visited record is provisional until the visit and the observed cut
+ * (complete end, record count) match the ROOT. */
+typedef struct ClusterColdScanResultV1 {
+	uint64 records;
+	int root_result; /* ClusterControlRootResult of the visit */
+	XLogRecPtr failed_read_rec_ptr;
+	uint8 route_detail;
+} ClusterColdScanResultV1;
+
+extern ClusterColdDetailV1 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
+													 const ClusterControlRootSnapshot *root,
+													 const ClusterControlRootReadToken *token,
+													 bool space_active,
+													 ClusterColdScanResultV1 *result);
 
 #endif /* !FRONTEND */
 

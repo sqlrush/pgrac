@@ -69,6 +69,7 @@ typedef struct ColdParticipant {
 	bool seen;
 	XLogRecPtr last_read;
 	XLogRecPtr last_end;
+	uint64 replay_records; /* fed records ending after native redo */
 } ColdParticipant;
 
 typedef struct ColdRecord {
@@ -513,6 +514,8 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 			owner->seen = true;
 			owner->last_read = record->read_rec_ptr;
 			owner->last_end = record->end_rec_ptr;
+			if (record->end_rec_ptr > owner->cut.native_redo)
+				owner->replay_records++;
 		}
 	}
 	if (detail != CLUSTER_COLD_OK)
@@ -1112,6 +1115,14 @@ cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 index, ClusterCo
 	out->all_skip = any_skip && !any_apply;
 	out->mixed = any_skip && any_apply;
 	return true;
+}
+
+uint64
+cluster_cold_plan_replay_record_count_v1(const ClusterColdPlanV1 *plan, uint32 participant)
+{
+	if (!plan_valid(plan) || participant >= plan->participant_count)
+		return 0;
+	return plan->participants[plan->canonical[participant]].replay_records;
 }
 
 void
