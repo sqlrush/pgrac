@@ -46,6 +46,29 @@ cold_plan_release(ClusterColdPlanV1 *plan, Size bytes)
 	plan->memory_used -= bytes;
 }
 
+/*
+ * Zeroed scratch of `bytes` (at least one word), accounted first and added
+ * to *accounted for the caller's release; NULL when over budget or out of
+ * memory.
+ */
+void *
+cold_plan_scratch(ClusterColdPlanV1 *plan, Size bytes, Size *accounted)
+{
+	void *array;
+
+	bytes = Max(bytes, sizeof(uint32));
+	if (!cold_plan_reserve(plan, bytes))
+		return NULL;
+	array = cold_alloc0(bytes);
+	if (array == NULL) {
+		cold_plan_release(plan, bytes);
+		return NULL;
+	}
+	if (accounted != NULL)
+		*accounted += bytes;
+	return array;
+}
+
 /* Grow one owned array by doubling, accounting the delta first. */
 static ClusterColdDetailV1
 plan_grow(ClusterColdPlanV1 *plan, void **array, uint32 *capacity, uint32 required, Size element)
@@ -191,6 +214,27 @@ cold_plan_intern(ClusterColdPlanV1 *plan, ColdIntern *intern, const void *key, S
 	intern->slots[at] = intern->count + 1;
 	*out = intern->count++;
 	return CLUSTER_COLD_OK;
+}
+
+/* Index of `key` if it was interned; never adds it. */
+bool
+cold_plan_intern_find(const ColdIntern *intern, const void *key, Size key_size, uint32 *out)
+{
+	uint32 at;
+
+	if (intern->slot_count == 0)
+		return false;
+	at = intern_hash(key, key_size) & (intern->slot_count - 1);
+	while (intern->slots[at] != 0) {
+		uint32 index = intern->slots[at] - 1;
+
+		if (memcmp(intern->entries + (Size)index * key_size, key, key_size) == 0) {
+			*out = index;
+			return true;
+		}
+		at = (at + 1) & (intern->slot_count - 1);
+	}
+	return false;
 }
 
 void

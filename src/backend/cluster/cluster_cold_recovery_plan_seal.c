@@ -3,12 +3,14 @@
  * cluster_cold_recovery_plan_seal.c
  *	  Seal of the typed cold-crash replay plan.
  *
- *	  seal() checks that every participant cut was fed completely, links
- *	  each page's components into one chain by exact version equality,
- *	  places the observed DATA state on it, assigns SKIP or APPLY with the
- *	  expected state, and orders the replayable records by dependency with
- *	  a deterministic (xl_scn, thread, owner incarnation, LSN) tie-break.
- *	  Every refusal happens here, before the caller modifies anything.
+ *	  seal() checks that every participant cut was fed completely, applies
+ *	  the SPACE effects (cluster_cold_recovery_plan_space.c), links each
+ *	  page's components into one chain by exact version equality (across
+ *	  the incarnations a TRUNCATE carried the block through), places the
+ *	  observed DATA state on it, assigns SKIP or APPLY with the expected
+ *	  state, and has the replayable records ordered
+ *	  (cluster_cold_recovery_plan_schedule.c).  Every refusal happens here,
+ *	  before the caller modifies anything.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -38,9 +40,7 @@ typedef struct ColdSealWork {
 	uint32 *by_result;
 	uint32 *chain;
 	uint32 *successor; /* per component, during chain linking */
-	uint32 *lists;
-	uint32 *list_start;
-	uint32 *list_next;
+	uint32 *relevant;  /* one page's components not retired or dropped */
 	Size bytes;
 } ColdSealWork;
 
@@ -69,37 +69,6 @@ page_compare(const ClusterColdPlanV1 *plan, const ColdComponent *left, const Col
 	if (left->blockno != right->blockno)
 		return left->blockno < right->blockno ? -1 : 1;
 	return 0;
-}
-
-/* Record whose result an applied component's before-state is. */
-static uint32
-component_dependency(const ClusterColdPlanV1 *plan, const ColdComponent *component)
-{
-	if (component->verdict < CLUSTER_COLD_BLOCK_APPLY_DELTA
-		|| (component->state & COLD_STATE_FIRST_APPLY) != 0
-		|| component->link == CLUSTER_COLD_NO_INDEX)
-		return CLUSTER_COLD_NO_INDEX;
-	return cold_component(plan, component->link)->record;
-}
-
-static void
-diag_record(const ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag, uint32 record)
-{
-	const ColdRecord *stored = cold_record(plan, record);
-
-	diag->has_record = true;
-	diag->participant = plan->participants[stored->participant].input_index;
-	diag->read_rec_ptr = stored->read_rec_ptr;
-}
-
-static void
-diag_component(const ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag, uint32 component)
-{
-	const ColdComponent *stored = cold_component(plan, component);
-
-	diag_record(plan, diag, stored->record);
-	diag->has_page = true;
-	diag->page = cold_plan_component_page(plan, stored);
 }
 
 static int
@@ -176,7 +145,7 @@ page_chain_link(ClusterColdPlanV1 *plan, const uint32 *group, uint32 count, Cold
 	qsort_arg(by_result, count, sizeof(uint32), by_result_compare, plan);
 	for (i = 1; i < count; i++)
 		if (by_result_compare(&by_result[i - 1], &by_result[i], plan) == 0) {
-			diag_component(plan, diag, by_result[i]);
+			cold_diag_component(plan, diag, by_result[i]);
 			return CLUSTER_COLD_EDGE_CYCLE;
 		}
 	for (i = 0; i < count; i++)
@@ -185,9 +154,18 @@ page_chain_link(ClusterColdPlanV1 *plan, const uint32 *group, uint32 count, Cold
 		ColdComponent *component = cold_component(plan, group[i]);
 		uint32 predecessor = CLUSTER_COLD_NO_INDEX;
 
-		if (component->before_kind == RF_PAGE_STATE_PRESENT)
-			predecessor
-				= find_result(plan, by_result, count, component->segment, component->before_token);
+		if (component->before_kind == RF_PAGE_STATE_PRESENT) {
+			uint32 segment = component->segment;
+			uint32 hops = 0;
+
+			/* A TRUNCATE keeps the version of a block it carries. */
+			while (segment != CLUSTER_COLD_NO_INDEX && hops++ <= plan->space_creator_count) {
+				predecessor = find_result(plan, by_result, count, segment, component->before_token);
+				if (predecessor != CLUSTER_COLD_NO_INDEX)
+					break;
+				segment = cold_plan_space_carried_from(plan, segment, component->blockno);
+			}
+		}
 		component->link = predecessor;
 		if (predecessor == CLUSTER_COLD_NO_INDEX) {
 			if (start != CLUSTER_COLD_NO_INDEX) {
@@ -199,14 +177,14 @@ page_chain_link(ClusterColdPlanV1 *plan, const uint32 *group, uint32 count, Cold
 
 				/* Two starts from one version is a fork; otherwise an edge
 				 * is missing or a second incarnation needs its SPACE owner. */
-				diag_component(plan, diag, group[i]);
+				cold_diag_component(plan, diag, group[i]);
 				return same_start ? CLUSTER_COLD_EDGE_BRANCH : CLUSTER_COLD_CHAIN_AMBIGUOUS;
 			}
 			start = group[i];
 			continue;
 		}
 		if (successor[predecessor] != CLUSTER_COLD_NO_INDEX) {
-			diag_component(plan, diag, group[i]);
+			cold_diag_component(plan, diag, group[i]);
 			return CLUSTER_COLD_EDGE_BRANCH;
 		}
 		successor[predecessor] = group[i];
@@ -215,7 +193,7 @@ page_chain_link(ClusterColdPlanV1 *plan, const uint32 *group, uint32 count, Cold
 		chain[walked++] = i;
 	if (start == CLUSTER_COLD_NO_INDEX || walked != count
 		|| successor[chain[count - 1]] != CLUSTER_COLD_NO_INDEX) {
-		diag_component(plan, diag, group[0]);
+		cold_diag_component(plan, diag, group[0]);
 		return CLUSTER_COLD_EDGE_CYCLE;
 	}
 	return CLUSTER_COLD_OK;
@@ -229,6 +207,12 @@ data_shape_valid(const ClusterColdDataV1 *data)
 	if (memcmp(data->reserved_zero, zero, sizeof(zero)) != 0
 		|| (data->flags & ~CLUSTER_COLD_DATA_KNOWN_FLAGS) != 0)
 		return false;
+	/* Without a SPACE identity a page header names no incarnation. */
+	if ((data->flags & CLUSTER_COLD_DATA_FLAG_NO_IDENTITY) != 0)
+		return (data->kind == CLUSTER_COLD_DATA_PRESENT
+				|| data->kind == CLUSTER_COLD_DATA_UNFORMATTED)
+			   && !bytes_nonzero(data->version.segment_incarnation, 16)
+			   && (data->version.mutation_token != 0) == (data->kind == CLUSTER_COLD_DATA_PRESENT);
 	switch (data->kind) {
 	case CLUSTER_COLD_DATA_INVALID:
 		return data->flags == 0;
@@ -246,8 +230,9 @@ data_shape_valid(const ClusterColdDataV1 *data)
 
 /*
  * Earliest anchor (full image or full-coverage init) at chain index <= limit
- * whose whole chain suffix is replayable; -1 when none.  History is never
- * replayed, so only anchors after the last history edge qualify.
+ * whose whole chain suffix is replayable; -1 when none.  History and changes
+ * written before a TRUNCATE are never replayed, so only anchors after the
+ * last such edge qualify.
  */
 static int64
 page_earliest_replayable_anchor(const ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
@@ -257,7 +242,7 @@ page_earliest_replayable_anchor(const ClusterColdPlanV1 *plan, const uint32 *cha
 	uint32 i;
 
 	for (i = count; i > 0; i--)
-		if (record_history(plan, cold_component(plan, chain[i - 1])->record)) {
+		if (component_settled(plan, cold_component(plan, chain[i - 1]))) {
 			start = i;
 			break;
 		}
@@ -267,51 +252,75 @@ page_earliest_replayable_anchor(const ClusterColdPlanV1 *plan, const uint32 *cha
 	return -1;
 }
 
+/* Whether DATA names a version of this component's block in incarnation. */
+static bool
+data_incarnation_fits(const ClusterColdPlanV1 *plan, const ColdComponent *component,
+					  const ClusterColdDataV1 *data)
+{
+	return (data->flags & CLUSTER_COLD_DATA_FLAG_NO_IDENTITY) != 0
+		   || cold_plan_space_lineage(plan, component, data->version.segment_incarnation);
+}
+
 /*
  * Position of a readable DATA state on the chain: the index of the
  * component whose result DATA holds, or -1 when DATA is the chain start
  * (the first expected-before, or the unformatted/absent start of a new
- * page).  Anything else is refused.
+ * page).  The token places DATA; the incarnation, read from the relation's
+ * SPACE identity, only has to be one the block was carried through.
+ * *stale reports retired content at a block a TRUNCATE did not carry,
+ * which is never a redo base.  Anything else is refused.
  */
 static ClusterColdDetailV1
 page_header_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
-					 const ClusterColdDataV1 *data, int64 *position, ClusterColdDiagV1 *diag)
+					 const ClusterColdDataV1 *data, int64 *position, bool *stale,
+					 ClusterColdDiagV1 *diag)
 {
 	const ColdComponent *first = cold_component(plan, chain[0]);
 	bool new_start = first->before_kind != RF_PAGE_STATE_PRESENT;
-	RfPageVersionV1 before;
+	bool fits = data_incarnation_fits(plan, first, data);
+	uint32 matches = 0;
 	uint32 i;
 
+	*stale = false;
+	*position = -1;
+	/* Only a relation created after a native redo start may lack one. */
+	if ((data->flags & CLUSTER_COLD_DATA_FLAG_NO_IDENTITY) != 0
+		&& !cold_plan_space_created_here(plan, first)) {
+		cold_diag_component(plan, diag, chain[0]);
+		return CLUSTER_COLD_IDENTITY_MISSING;
+	}
 	if (data->kind != CLUSTER_COLD_DATA_PRESENT) {
 		Assert(new_start);
-		*position = -1;
-		if (data->kind == CLUSTER_COLD_DATA_UNFORMATTED
-			&& !cold_plan_incarnation_is(plan, first, &data->version)) {
-			diag_component(plan, diag, chain[0]);
-			diag->version = data->version;
-			return CLUSTER_COLD_INCARNATION_MISMATCH;
-		}
-		return CLUSTER_COLD_OK;
-	}
-	for (i = 0; i < count; i++) {
-		const ColdComponent *component = cold_component(plan, chain[i]);
-
-		if (component->result_token == data->version.mutation_token
-			&& cold_plan_incarnation_is(plan, component, &data->version)) {
-			*position = (int64)i;
+		if (data->kind != CLUSTER_COLD_DATA_UNFORMATTED || fits)
 			return CLUSTER_COLD_OK;
+	} else {
+		for (i = 0; i < count; i++) {
+			const ColdComponent *component = cold_component(plan, chain[i]);
+
+			if (component->result_token == data->version.mutation_token
+				&& data_incarnation_fits(plan, component, data)) {
+				*position = (int64)i;
+				matches++;
+			}
 		}
+		if (matches > 1) {
+			cold_diag_component(plan, diag, chain[0]);
+			diag->version = data->version;
+			return CLUSTER_COLD_CHAIN_AMBIGUOUS;
+		}
+		if (matches == 1)
+			return CLUSTER_COLD_OK;
+		if (!new_start && first->before_token == data->version.mutation_token && fits)
+			return CLUSTER_COLD_OK;
 	}
-	before = cold_plan_component_before(plan, first);
-	if (!new_start && version_equal(&before, &data->version)) {
-		*position = -1;
+	if (new_start && cold_plan_space_retired_start(plan, first)) {
+		*stale = true;
 		return CLUSTER_COLD_OK;
 	}
-	diag_component(plan, diag, chain[0]);
+	cold_diag_component(plan, diag, chain[0]);
 	diag->version = data->version;
-	return cold_plan_incarnation_is(plan, first, &data->version)
-			   ? CLUSTER_COLD_ANCESTOR_MISSING
-			   : CLUSTER_COLD_INCARNATION_MISMATCH;
+	return fits && data->kind == CLUSTER_COLD_DATA_PRESENT ? CLUSTER_COLD_ANCESTOR_MISSING
+														   : CLUSTER_COLD_INCARNATION_MISMATCH;
 }
 
 /* DATA cannot be a redo base: rebuild from the earliest replayable anchor. */
@@ -323,7 +332,7 @@ page_rebuild_from_anchor(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 co
 	int64 anchor = page_earliest_replayable_anchor(plan, chain, count, (int64)count);
 
 	if (anchor < 0) {
-		diag_component(plan, diag, chain[diag_index]);
+		cold_diag_component(plan, diag, chain[diag_index]);
 		diag->version = data->version;
 		return missing;
 	}
@@ -337,10 +346,9 @@ page_rebuild_from_anchor(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 co
  * before the first applied component; otherwise that component is an
  * anchor that replaces unreadable or unrelated content.
  *
- * The shared profile does not require checksums, so a torn write can pair
- * a newer header with an older body.  As with full_page_writes, the earliest
- * replayable anchor whose predecessor DATA has reached is always restored,
- * so no delta is applied to a body whose header alone placed it.
+ * As with full_page_writes, the earliest replayable anchor whose predecessor
+ * DATA has reached is always restored, so no delta is applied to a body
+ * whose header alone placed it.
  */
 static ClusterColdDetailV1
 page_data_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
@@ -349,6 +357,7 @@ page_data_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 {
 	bool new_start = cold_component(plan, chain[0])->before_kind != RF_PAGE_STATE_PRESENT;
 	ClusterColdDetailV1 detail;
+	bool stale;
 	int64 anchor;
 
 	*exact = true;
@@ -360,9 +369,14 @@ page_data_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 		return page_rebuild_from_anchor(plan, chain, count, data, CLUSTER_COLD_ANCHOR_MISSING,
 										count - 1, covered, diag);
 	}
-	detail = page_header_position(plan, chain, count, data, position, diag);
+	detail = page_header_position(plan, chain, count, data, position, &stale, diag);
 	if (detail != CLUSTER_COLD_OK)
 		return detail;
+	if (stale) {
+		*exact = false;
+		return page_rebuild_from_anchor(plan, chain, count, data, CLUSTER_COLD_ANCHOR_MISSING, 0,
+										covered, diag);
+	}
 
 	/*
 	 * Unless its content was verified, only the header placed DATA.  Any
@@ -407,8 +421,9 @@ page_assign_verdicts(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 			component->verdict = CLUSTER_COLD_BLOCK_SKIP;
 			continue;
 		}
-		if (record_history(plan, component->record)) {
-			diag_component(plan, diag, chain[i]);
+		/* DATA behind history or behind a TRUNCATE's object write. */
+		if (component_settled(plan, component)) {
+			cold_diag_component(plan, diag, chain[i]);
 			diag->version = cold_plan_component_before(plan, component);
 			return CLUSTER_COLD_HISTORY_GAP;
 		}
@@ -416,6 +431,7 @@ page_assign_verdicts(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 		/* Later components keep link = chain predecessor (chain[i - 1]). */
 		if ((int64)i != covered + 1)
 			continue;
+		Assert((component->state & (COLD_STATE_DURABLE | COLD_STATE_IRRELEVANT)) == 0);
 		component->state = COLD_STATE_FIRST_APPLY;
 		component->link = CLUSTER_COLD_NO_INDEX;
 		if (exact) {
@@ -443,19 +459,36 @@ page_group_resolve(ClusterColdPlanV1 *plan, const uint32 *group, uint32 count, C
 	bool exact;
 	int64 covered;
 	int64 position;
+	uint32 relevant = 0;
 	uint32 i;
 
-	for (i = 0; i < count && !replayable; i++)
-		replayable = !record_history(plan, cold_component(plan, group[i])->record);
-	if (!replayable)
-		return CLUSTER_COLD_OK; /* completed history: no DATA duty */
+	/* Changes to retired or dropped blocks take no part in the chain. */
+	cold_plan_space_retire_inferred(plan, group, count);
+	for (i = 0; i < count; i++) {
+		ColdComponent *component = cold_component(plan, group[i]);
+
+		if ((component->state & COLD_STATE_IRRELEVANT) != 0) {
+			component->verdict = CLUSTER_COLD_BLOCK_SKIP;
+			continue;
+		}
+		work->relevant[relevant++] = group[i];
+		replayable |= !component_settled(plan, component);
+	}
+	if (!replayable) {
+		/* Completed history or durable before a TRUNCATE: no DATA duty. */
+		for (i = 0; i < relevant; i++)
+			cold_component(plan, work->relevant[i])->verdict = CLUSTER_COLD_BLOCK_SKIP;
+		return CLUSTER_COLD_OK;
+	}
+	group = work->relevant;
+	count = relevant;
 	detail = page_chain_link(plan, group, count, work, diag);
 	if (detail != CLUSTER_COLD_OK)
 		return detail;
 	memset(&data, 0, sizeof(data));
 	page = cold_plan_component_page(plan, cold_component(plan, group[0]));
 	if (!observe(arg, &page, &data) || !data_shape_valid(&data)) {
-		diag_component(plan, diag, work->chain[0]);
+		cold_diag_component(plan, diag, work->chain[0]);
 		return CLUSTER_COLD_OBSERVATION_FAILED;
 	}
 	detail = page_data_position(plan, work->chain, count, &data, &covered, &exact, &position, diag);
@@ -487,25 +520,14 @@ seal_inputs_complete(const ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag)
 static uint32 *
 work_alloc(ClusterColdPlanV1 *plan, ColdSealWork *work, uint32 count)
 {
-	Size bytes = (Size)Max(count, 1) * sizeof(uint32);
-	uint32 *array;
-
-	if (!cold_plan_reserve(plan, bytes))
-		return NULL;
-	array = (uint32 *)cold_alloc0(bytes);
-	if (array == NULL) {
-		cold_plan_release(plan, bytes);
-		return NULL;
-	}
-	work->bytes += bytes;
-	return array;
+	return (uint32 *)cold_plan_scratch(plan, (Size)count * sizeof(uint32), &work->bytes);
 }
 
 static void
 work_free(ClusterColdPlanV1 *plan, ColdSealWork *work)
 {
-	uint32 **arrays[] = { &work->by_page, &work->by_result,	 &work->chain,	  &work->successor,
-						  &work->lists,	  &work->list_start, &work->list_next };
+	uint32 **arrays[]
+		= { &work->by_page, &work->by_result, &work->chain, &work->successor, &work->relevant };
 	Size i;
 
 	for (i = 0; i < lengthof(arrays); i++)
@@ -529,8 +551,9 @@ seal_pages(ClusterColdPlanV1 *plan, ColdSealWork *work, ClusterColdObserveV1 obs
 	work->by_result = work_alloc(plan, work, n);
 	work->chain = work_alloc(plan, work, n);
 	work->successor = work_alloc(plan, work, n);
+	work->relevant = work_alloc(plan, work, n);
 	if (work->by_page == NULL || work->by_result == NULL || work->chain == NULL
-		|| work->successor == NULL)
+		|| work->successor == NULL || work->relevant == NULL)
 		return CLUSTER_COLD_CAPACITY;
 	for (i = 0; i < n; i++)
 		work->by_page[i] = i;
@@ -548,137 +571,6 @@ seal_pages(ClusterColdPlanV1 *plan, ColdSealWork *work, ClusterColdObserveV1 obs
 		if (detail != CLUSTER_COLD_OK)
 			return detail;
 		start = i;
-	}
-	return CLUSTER_COLD_OK;
-}
-
-static bool
-record_ready(const ClusterColdPlanV1 *plan, const ColdRecord *record, uint32 *blocking)
-{
-	uint16 i;
-
-	for (i = 0; i < record->component_count; i++) {
-		uint32 dependency
-			= component_dependency(plan, cold_component(plan, record->first_component + i));
-
-		if (dependency != CLUSTER_COLD_NO_INDEX
-			&& (cold_record(plan, dependency)->flags & COLD_RECORD_SCHEDULED) == 0) {
-			if (blocking != NULL)
-				*blocking = dependency;
-			return false;
-		}
-	}
-	return true;
-}
-
-/* Deterministic candidate key: (xl_scn, thread, owner incarnation, LSN). */
-static bool
-record_key_less(const ColdRecord *left, const ColdRecord *right)
-{
-	if (left->scn != right->scn)
-		return left->scn < right->scn;
-	if (left->participant != right->participant)
-		return left->participant < right->participant;
-	return left->read_rec_ptr < right->read_rec_ptr;
-}
-
-/* Bucket replayable records by canonical participant, keeping feed order. */
-static ClusterColdDetailV1
-schedule_lists(ClusterColdPlanV1 *plan, ColdSealWork *work, uint32 *total)
-{
-	uint32 p = plan->participant_count;
-	uint32 i;
-
-	work->lists = work_alloc(plan, work, plan->record_count);
-	work->list_start = work_alloc(plan, work, p + 1);
-	work->list_next = work_alloc(plan, work, p);
-	if (work->lists == NULL || work->list_start == NULL || work->list_next == NULL)
-		return CLUSTER_COLD_CAPACITY;
-	for (i = 0; i < plan->record_count; i++)
-		if (!record_history(plan, i))
-			work->list_start[cold_record(plan, i)->participant + 1]++;
-	for (i = 0; i < p; i++)
-		work->list_start[i + 1] += work->list_start[i];
-	*total = work->list_start[p];
-	for (i = 0; i < p; i++)
-		work->list_next[i] = work->list_start[i];
-	for (i = 0; i < plan->record_count; i++)
-		if (!record_history(plan, i))
-			work->lists[work->list_next[cold_record(plan, i)->participant]++] = i;
-	for (i = 0; i < p; i++)
-		work->list_next[i] = work->list_start[i];
-	return CLUSTER_COLD_OK;
-}
-
-static void
-schedule_deadlock(const ClusterColdPlanV1 *plan, const ColdSealWork *work, ClusterColdDiagV1 *diag)
-{
-	uint32 best = CLUSTER_COLD_NO_INDEX;
-	uint32 blocking = CLUSTER_COLD_NO_INDEX;
-	uint32 p;
-
-	for (p = 0; p < plan->participant_count; p++) {
-		uint32 head;
-
-		if (work->list_next[p] == work->list_start[p + 1])
-			continue;
-		head = work->lists[work->list_next[p]];
-		if (best == CLUSTER_COLD_NO_INDEX
-			|| record_key_less(cold_record(plan, head), cold_record(plan, best)))
-			best = head;
-	}
-	if (best == CLUSTER_COLD_NO_INDEX)
-		return;
-	diag_record(plan, diag, best);
-	(void)record_ready(plan, cold_record(plan, best), &blocking);
-	if (blocking != CLUSTER_COLD_NO_INDEX) {
-		diag->has_dependency = true;
-		diag->dependency_participant
-			= plan->participants[cold_record(plan, blocking)->participant].input_index;
-		diag->dependency_read_rec_ptr = cold_record(plan, blocking)->read_rec_ptr;
-	}
-}
-
-static ClusterColdDetailV1
-seal_schedule(ClusterColdPlanV1 *plan, ColdSealWork *work, ClusterColdDiagV1 *diag)
-{
-	ClusterColdDetailV1 detail;
-	uint32 total = 0;
-	Size bytes;
-
-	detail = schedule_lists(plan, work, &total);
-	if (detail != CLUSTER_COLD_OK)
-		return detail;
-	bytes = (Size)Max(total, 1) * sizeof(uint32);
-	if (!cold_plan_reserve(plan, bytes))
-		return CLUSTER_COLD_CAPACITY;
-	plan->schedule = (uint32 *)cold_alloc0(bytes);
-	if (plan->schedule == NULL) {
-		cold_plan_release(plan, bytes);
-		return CLUSTER_COLD_OOM;
-	}
-	while (plan->schedule_count < total) {
-		uint32 best = CLUSTER_COLD_NO_INDEX;
-		uint32 p;
-
-		for (p = 0; p < plan->participant_count; p++) {
-			uint32 head;
-
-			if (work->list_next[p] == work->list_start[p + 1])
-				continue;
-			head = work->lists[work->list_next[p]];
-			if (record_ready(plan, cold_record(plan, head), NULL)
-				&& (best == CLUSTER_COLD_NO_INDEX
-					|| record_key_less(cold_record(plan, head), cold_record(plan, best))))
-				best = head;
-		}
-		if (best == CLUSTER_COLD_NO_INDEX) {
-			schedule_deadlock(plan, work, diag);
-			return CLUSTER_COLD_DEADLOCK;
-		}
-		cold_record(plan, best)->flags |= COLD_RECORD_SCHEDULED;
-		work->list_next[cold_record(plan, best)->participant]++;
-		plan->schedule[plan->schedule_count++] = best;
 	}
 	return CLUSTER_COLD_OK;
 }
@@ -701,10 +593,13 @@ cluster_cold_plan_seal_v1(ClusterColdPlanV1 *plan, ClusterColdObserveV1 observe,
 	memset(&work, 0, sizeof(work));
 	detail = seal_inputs_complete(plan, diag);
 	if (detail == CLUSTER_COLD_OK)
-		detail = seal_pages(plan, &work, observe, arg, diag);
+		detail = cold_plan_space_seal(plan, diag);
 	if (detail == CLUSTER_COLD_OK)
-		detail = seal_schedule(plan, &work, diag);
+		detail = seal_pages(plan, &work, observe, arg, diag);
 	work_free(plan, &work);
+	if (detail == CLUSTER_COLD_OK)
+		detail = cold_plan_schedule(plan, diag);
+	cold_plan_space_release(plan);
 	if (detail != CLUSTER_COLD_OK) {
 		plan->phase = COLD_PHASE_FAILED;
 		plan->schedule_count = 0;

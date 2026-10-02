@@ -78,7 +78,9 @@ typedef enum ClusterColdDetailV1 {
 	CLUSTER_COLD_STRUCTURAL_UNSUPPORTED = 17, /* lifecycle record needs its owner */
 	CLUSTER_COLD_OPCODE_UNSUPPORTED = 18,	  /* outside the closed route registry */
 	CLUSTER_COLD_SIDE_OWNER_MISSING = 19,	  /* side effect without a cold owner */
-	CLUSTER_COLD_CONTENT_UNPROVEN = 20		  /* unverified DATA and no anchor rebuilds it */
+	CLUSTER_COLD_CONTENT_UNPROVEN = 20,		  /* unverified DATA and no anchor rebuilds it */
+	CLUSTER_COLD_SPACE_INVALID = 21,		  /* malformed or inconsistent SPACE effects */
+	CLUSTER_COLD_IDENTITY_MISSING = 22 /* no SPACE identity for a relation not created here */
 } ClusterColdDetailV1;
 
 /* Exact physical cut of one writer generation, all from one ROOT token. */
@@ -104,6 +106,33 @@ typedef struct ClusterColdComponentV1 {
 	RfPageVersionV1 before;
 	RfPageVersionV1 result;
 } ClusterColdComponentV1;
+
+/*
+ * SPACE (relation storage identity) effect of a record.  CREATE and TRUNCATE
+ * give the relation a new incarnation, which the pages' versions carry.
+ * TRUNCATE also retires the blocks at or past nblocks and, as an object
+ * checkpoint, makes every earlier change of the relation durable.  DROP (a
+ * commit or abort that drops the relation) makes the dropped incarnation's
+ * changes irrelevant.  ADVANCE only moves the reservation.  payload is the
+ * exact input of the SPACE owner; feed copies it.
+ */
+typedef enum ClusterColdSpaceKindV1 {
+	CLUSTER_COLD_SPACE_CREATE = 1,
+	CLUSTER_COLD_SPACE_TRUNCATE = 2,
+	CLUSTER_COLD_SPACE_ADVANCE = 3,
+	CLUSTER_COLD_SPACE_DROP = 4
+} ClusterColdSpaceKindV1;
+
+typedef struct ClusterColdSpaceOpV1 {
+	uint8 kind; /* ClusterColdSpaceKindV1 */
+	uint8 reserved_zero[3];
+	BlockNumber nblocks; /* TRUNCATE: first retired block */
+	RelFileLocator locator;
+	uint8 before_incarnation[16]; /* TRUNCATE, DROP: the replaced or dropped one */
+	uint8 result_incarnation[16]; /* CREATE, TRUNCATE: the new one; ADVANCE: the live one */
+	const void *payload;
+	uint32 payload_length;
+} ClusterColdSpaceOpV1;
 
 /*
  * Record flags set by the decoder.  STRUCTURAL marks a relation lifecycle
@@ -136,6 +165,8 @@ typedef struct ClusterColdRecordV1 {
 	uint8 reserved_zero;
 	uint16 component_count;
 	const ClusterColdComponentV1 *components;
+	uint32 space_count; /* a record has SPACE effects or page components, not both */
+	const ClusterColdSpaceOpV1 *space_ops;
 } ClusterColdRecordV1;
 
 typedef enum ClusterColdDataKindV1 {
@@ -149,7 +180,10 @@ typedef enum ClusterColdDataKindV1 {
  * version; UNFORMATTED carries only the segment incarnation.  CONTENT_VERIFIED
  * means the whole page was proven (page checksum, all-zero page or no
  * block); without it only the header is known, and a torn write can leave
- * that header over another version's body. */
+ * that header over another version's body.  NO_IDENTITY marks a PRESENT page
+ * whose relation has no readable SPACE identity yet (zero incarnation); it is
+ * placed by its token only, and only when the relation was created after a
+ * native redo start. */
 typedef struct ClusterColdDataV1 {
 	uint8 kind;
 	uint8 flags; /* CLUSTER_COLD_DATA_FLAG_* */
@@ -158,7 +192,8 @@ typedef struct ClusterColdDataV1 {
 } ClusterColdDataV1;
 
 #define CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED UINT8_C(0x01)
-#define CLUSTER_COLD_DATA_KNOWN_FLAGS UINT8_C(0x01)
+#define CLUSTER_COLD_DATA_FLAG_NO_IDENTITY UINT8_C(0x02)
+#define CLUSTER_COLD_DATA_KNOWN_FLAGS UINT8_C(0x03)
 
 /* Read-only DATA observation.  False means the observation itself failed
  * (I/O, identity); the plan then refuses instead of guessing. */
@@ -184,9 +219,20 @@ typedef struct ClusterColdBlockStepV1 {
 	RfPageVersionV1 result;
 } ClusterColdBlockStepV1;
 
+/* A scheduled step replays a page record, or hands a CREATE/TRUNCATE to the
+ * SPACE owner before the pages of the new incarnation. */
+typedef enum ClusterColdStepKindV1 {
+	CLUSTER_COLD_STEP_PAGE = 0,
+	CLUSTER_COLD_STEP_SPACE = 1
+} ClusterColdStepKindV1;
+
 typedef struct ClusterColdStepV1 {
 	uint32 participant; /* caller's participant index */
-	uint32 reserved_zero;
+	uint8 step_kind;	/* ClusterColdStepKindV1 */
+	uint8 space_kind;	/* SPACE step: CREATE or TRUNCATE */
+	uint16 reserved_zero;
+	uint32 space_relation; /* SPACE step: index in cluster_cold_plan_space_relation_v1 */
+	uint32 space_input;	   /* SPACE step: this record's input within that relation */
 	XLogRecPtr read_rec_ptr;
 	XLogRecPtr end_rec_ptr;
 	uint32 record_crc;
@@ -245,6 +291,27 @@ extern uint64 cluster_cold_plan_replay_record_count_v1(const ClusterColdPlanV1 *
 													   uint32 participant);
 
 extern void cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan);
+
+/*
+ * SPACE inputs for the SPACE owner: relations with SPACE effects after their
+ * participant's native redo start (as the owner receives them online), in
+ * canonical locator order; each relation's inputs in canonical participant
+ * and LSN order.  Payloads are owned by the plan.
+ */
+typedef struct ClusterColdSpaceInputV1 {
+	uint8 kind;			/* ClusterColdSpaceKindV1 */
+	uint32 participant; /* caller index */
+	XLogRecPtr read_rec_ptr;
+	XLogRecPtr end_rec_ptr;
+	const void *payload;
+	uint32 payload_length;
+} ClusterColdSpaceInputV1;
+
+extern uint32 cluster_cold_plan_space_relation_count_v1(const ClusterColdPlanV1 *plan);
+extern bool cluster_cold_plan_space_relation_v1(const ClusterColdPlanV1 *plan, uint32 index,
+												RelFileLocator *locator, uint32 *input_count);
+extern bool cluster_cold_plan_space_input_v1(const ClusterColdPlanV1 *plan, uint32 relation,
+											 uint32 input, ClusterColdSpaceInputV1 *out);
 
 /* Participants of a sealed plan; 0 unless seal() succeeded. */
 extern uint32 cluster_cold_plan_participant_count_v1(const ClusterColdPlanV1 *plan);
