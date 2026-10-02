@@ -29,6 +29,7 @@ static int installs;
 static int publishes;
 static int leaves;
 int cluster_node_id;
+bool cluster_shared_config;
 static int kind9_requests;
 static int ack_sends;
 static int assert_sends;
@@ -1813,6 +1814,58 @@ static int evict_claims, evict_aborts, evict_commits, evict_enqueues;
 static bool evict_after_prepare_gap, evict_after_enqueue_gap, evict_queue_full;
 static ResourceXApplyResult evict_abort_result, evict_commit_result;
 
+static int evict_refs, evict_retains, evict_pi_records, evict_wal_case;
+static bool evict_requires_pi;
+
+bool
+cluster_page_wal_flush_source_v1(const ClusterPageWalBindingV1 *wal, ClusterPageWalBindingV1 *out)
+{
+	UT_ASSERT_EQ(evict_claims, 0);
+	UT_ASSERT_EQ(wal->record_end, 200);
+	if (evict_wal_case == 1)
+		return false;
+	*out = *wal;
+	out->flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	return true;
+}
+
+bool
+cluster_page_wal_ref_retain_v1(const ClusterPageWalBindingV1 *wal, ClusterPageWalRefV1 *out)
+{
+	UT_ASSERT_EQ(wal->flags, CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
+	UT_ASSERT_EQ(out->source_flags, 0);
+	evict_retains++;
+	if (evict_wal_case == 2 && evict_retains == 2)
+		return false;
+	out->source_flags = 1;
+	evict_refs++;
+	return true;
+}
+
+bool
+cluster_page_wal_ref_release_v1(ClusterPageWalRefV1 *ref)
+{
+	if (ref->source_flags) {
+		UT_ASSERT(evict_refs > 0);
+		evict_refs--;
+		memset(ref, 0, sizeof(*ref));
+	}
+	return true;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_target_evict_record_pi_exact(ResourceXTargetEvictionPlan *plan)
+{
+	UT_ASSERT(plan->local_n_committed && plan->prepared && !plan->release_admitted);
+	UT_ASSERT_EQ(evict_enqueues, 0);
+	UT_ASSERT_EQ(evict_refs, 2);
+	UT_ASSERT(cluster_page_wal_ref_release_v1(&plan->pi_refs[0]));
+	UT_ASSERT(cluster_page_wal_ref_release_v1(&plan->pi_refs[1]));
+	plan->pi_recorded = true;
+	evict_pi_records++;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
 ResourceXApplyResult
 cluster_pcm_lock_resource_x_target_evict_prepare_exact(const BufferTag *tag, int32 node,
 													   uint64 formation, uint64 session, uint64 r4,
@@ -1871,6 +1924,8 @@ evict_encode(uint8 kind, const ResourceXDecodedFrame *frame, void *payload, uint
 	UT_ASSERT_EQ(kind, RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE);
 	UT_ASSERT_EQ(frame->kind, RESOURCE_X_WIRE_RELEASE_X);
 	UT_ASSERT_EQ(capacity, RESOURCE_X_CONTROL_V1_BYTES);
+	if (evict_wal_case == 3)
+		pg_re_throw();
 	*bytes = capacity;
 	*reject = RESOURCE_X_WIRE_REJECT_NONE;
 	memset(payload, 0xa5, capacity);
@@ -1884,6 +1939,8 @@ evict_enqueue(uint8 kind, uint32 destination, const void *payload, uint16 bytes)
 	UT_ASSERT_EQ(destination, 1);
 	UT_ASSERT_EQ(bytes, RESOURCE_X_CONTROL_V1_BYTES);
 	UT_ASSERT_EQ(((const uint8 *)payload)[0], 0xa5);
+	if (evict_requires_pi)
+		UT_ASSERT_EQ(evict_pi_records, 1);
 	if (evict_queue_full)
 		return false;
 	evict_enqueues++;
@@ -1928,6 +1985,8 @@ evict_fixture(ResourceXTargetEvictionPlan *plan)
 	terminal_identity_conflict = terminal_pending_remaining = 0;
 	eviction_admission_closed = false;
 	evict_claims = evict_aborts = evict_commits = evict_enqueues = 0;
+	evict_refs = evict_retains = evict_pi_records = evict_wal_case = 0;
+	evict_requires_pi = cluster_shared_config = false;
 	evict_after_prepare_gap = evict_after_enqueue_gap = evict_queue_full = false;
 	evict_abort_result = evict_commit_result = RESOURCE_X_APPLY_APPLIED;
 	memset(plan, 0, sizeof(*plan));
@@ -2034,14 +2093,80 @@ UT_TEST(test_actual_eviction_prepare_pending_proves_exact_reversible_cleanup)
 		evict_after_prepare_gap = leg != 0;
 		if (leg == 2)
 			evict_abort_result = RESOURCE_X_APPLY_STALE;
-		UT_ASSERT_EQ(
-			cluster_gcs_resource_x_target_evict_prepare_exact(&exact.tag, &exact, 77, 9, &plan),
-			leg == 2 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED : RESOURCE_X_APPLY_BAD_STATE);
+		UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_prepare_exact(&exact.tag, &exact, 77, 9,
+																	   NULL, &plan),
+					 leg == 2 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED : RESOURCE_X_APPLY_BAD_STATE);
 		UT_ASSERT(!plan.prepared);
 		UT_ASSERT_EQ(evict_aborts, leg == 0 ? 0 : 1);
 		UT_ASSERT_EQ(evict_claims, leg == 0 ? 0 : 1);
 	}
 	session_gap = false;
+}
+
+UT_TEST(test_eviction_reserves_before_n_and_registers_before_release)
+{
+	for (int leg = 0; leg < 6; leg++) {
+		volatile ResourceXTargetEvictionPlan storage;
+		ResourceXTargetEvictionPlan *const plan = (ResourceXTargetEvictionPlan *)&storage;
+		ClusterPcmOwnSnapshot exact = { 0 };
+		ClusterPageWalBindingV1 wal = { 0 };
+		volatile ResourceXApplyResult prepared = RESOURCE_X_APPLY_INVALID;
+		volatile bool caught = false;
+		bool retry = false;
+		evict_fixture(plan);
+		cluster_shared_config = evict_requires_pi = true;
+		exact.tag = plan->tag;
+		exact.generation = 7;
+		exact.reservation_token = 9;
+		exact.flags = PCM_OWN_FLAG_REVOKING;
+		exact.pcm_state = PCM_STATE_X;
+		wal.identity.locator = BufTagGetRelFileLocator(&exact.tag);
+		wal.identity.forknum = exact.tag.forkNum;
+		wal.identity.blockno = exact.tag.blockNum;
+		wal.record_end = 200;
+		evict_wal_case = leg;
+		evict_after_prepare_gap = leg == 4;
+		PG_TRY();
+		{
+			prepared = cluster_gcs_resource_x_target_evict_prepare_exact(&exact.tag, &exact, 77, 9,
+																		 &wal, plan);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, leg == 3);
+		UT_ASSERT_EQ(evict_pi_records, 0);
+		UT_ASSERT_EQ(evict_enqueues, 0);
+		if (leg == 0 || leg == 5) {
+			UT_ASSERT_EQ(prepared, RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(evict_refs, 2);
+			UT_ASSERT(!plan->local_n_committed);
+			if (leg == 5) {
+				UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_abort_exact(plan),
+							 RESOURCE_X_APPLY_APPLIED);
+			} else {
+				plan->local_n_committed = true;
+				evict_queue_full = true;
+				UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_publish_exact(plan, &retry),
+							 RESOURCE_X_APPLY_BAD_STATE);
+				UT_ASSERT(retry && plan->pi_recorded && !plan->release_admitted);
+				evict_queue_full = false;
+				UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_publish_exact(plan, &retry),
+							 RESOURCE_X_APPLY_APPLIED);
+				UT_ASSERT_EQ(evict_pi_records, 1);
+				UT_ASSERT_EQ(evict_enqueues, 1);
+			}
+		} else {
+			if (leg != 3)
+				UT_ASSERT_EQ(prepared, RESOURCE_X_APPLY_BAD_STATE);
+			UT_ASSERT(!plan->prepared);
+			UT_ASSERT_EQ(evict_aborts, leg == 3 || leg == 4 ? 1 : 0);
+		}
+		UT_ASSERT_EQ(evict_refs, 0);
+	}
+	cluster_shared_config = evict_requires_pi = false;
 }
 
 static ClusterPcmOwnSnapshot failed_round_live;
@@ -2203,6 +2328,7 @@ main(void)
 	UT_RUN(test_actual_eviction_publication_pending_preserves_one_frozen_release);
 	UT_RUN(test_actual_eviction_hard_refusal_and_capacity_have_distinct_retry_cause);
 	UT_RUN(test_actual_eviction_prepare_pending_proves_exact_reversible_cleanup);
+	UT_RUN(test_eviction_reserves_before_n_and_registers_before_release);
 	UT_RUN(test_actual_failed_round_observation_retries_only_exact_predecessor_shape);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

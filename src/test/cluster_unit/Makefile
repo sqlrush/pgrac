@@ -5631,8 +5631,9 @@ test_cluster_resource_x_terminal_gate_consumer.inc: $(top_srcdir)/src/backend/cl
 test_cluster_resource_x_eviction_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_block_resource_x_target_eviction_recheck_result\(/ { print "static ResourceXApplyResult"; emit=1 } \
 	     /^cluster_gcs_resource_x_target_evict_(prepare|publish|abort)_exact\(/ { print "ResourceXApplyResult"; emit=1; owner++ } \
+	     /^cluster_gcs_resource_x_target_evict_release_refs\(/ { print "void"; emit=1; refs++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (owner != 3 || emit) exit 1 }' $< > $@.tmp
+	     END { if (owner != 3 || refs != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_resource_x_failed_round_observation.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile

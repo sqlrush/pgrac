@@ -2522,6 +2522,8 @@ UT_TEST(test_gcs_legacy_drop_profile_unchanged)
 static int eviction_publishes, eviction_sleeps, eviction_frees, eviction_fuses;
 static int eviction_reuse_observed, eviction_private_pins, eviction_scenario;
 static bool eviction_mapping_deleted, eviction_pin_reserved;
+static unsigned eviction_wal_captures, eviction_reserved_refs, eviction_entry_refs;
+static unsigned eviction_plan_allocations, eviction_plan_frees;
 static sigjmp_buf eviction_clock_error;
 
 #define LockBufHdr transition_lock_header
@@ -2597,10 +2599,53 @@ eviction_reserve_pin(void)
 	eviction_pin_reserved = true;
 }
 
+static ClusterPageWalCaptureResultV1
+eviction_capture(BufferDesc *buf, const ClusterPcmOwnSnapshot *fence, uint32 pins,
+				 ClusterPageWalBindingV1 *out)
+{
+	UT_ASSERT(transition_mapping_held && !transition_content_held);
+	UT_ASSERT(pg_atomic_read_u32(&buf->state) & BM_LOCKED);
+	UT_ASSERT_EQ(BUF_STATE_GET_REFCOUNT(pg_atomic_read_u32(&buf->state)), pins);
+	UT_ASSERT_EQ(fence->flags, PCM_OWN_FLAG_REVOKING);
+	memset(out, 0, sizeof(*out));
+	out->record_start = 0x120;
+	if (eviction_scenario == 4 && eviction_wal_captures == 1)
+		out->record_start++;
+	eviction_wal_captures++;
+	return CLUSTER_PAGE_WAL_CAPTURED;
+}
+
+static void *
+eviction_plan_alloc(Size bytes)
+{
+	UT_ASSERT(!transition_mapping_held && !transition_content_held);
+	UT_ASSERT((pg_atomic_read_u32(&transition_buf->state) & BM_LOCKED) == 0);
+	UT_ASSERT_EQ(bytes, sizeof(ResourceXTargetEvictionPlan));
+	if (eviction_scenario == 6)
+		pg_re_throw();
+	eviction_plan_allocations++;
+	return calloc(1, bytes);
+}
+
+static void
+eviction_plan_free(void *plan)
+{
+	UT_ASSERT(!transition_mapping_held && !transition_content_held);
+	UT_ASSERT((pg_atomic_read_u32(&transition_buf->state) & BM_LOCKED) == 0);
+	UT_ASSERT(plan != NULL);
+	UT_ASSERT(eviction_plan_frees < eviction_plan_allocations);
+	eviction_plan_frees++;
+	free(plan);
+}
+
 static ResourceXApplyResult
 eviction_prepare(const BufferTag *tag, const ClusterPcmOwnSnapshot *revoking, uint64 r4_generation,
-				 uint64 token, ResourceXTargetEvictionPlan *plan)
+				 uint64 token, const ClusterPageWalBindingV1 *wal,
+				 ResourceXTargetEvictionPlan *plan)
 {
+	UT_ASSERT_EQ(eviction_wal_captures, 1);
+	UT_ASSERT(wal != NULL);
+	UT_ASSERT_EQ(wal->record_start, 0x120);
 	UT_ASSERT(!transition_mapping_held && !transition_content_held);
 	UT_ASSERT_EQ(revoking->flags, PCM_OWN_FLAG_REVOKING);
 	plan->tag = *tag;
@@ -2609,6 +2654,30 @@ eviction_prepare(const BufferTag *tag, const ClusterPcmOwnSnapshot *revoking, ui
 	plan->owner.buffer_ownership_generation = revoking->generation;
 	plan->owner.reservation_token = token;
 	plan->prepared = true;
+	plan->pi_refs[0].source_flags = 1;
+	plan->pi_refs[1].source_flags = 2;
+	eviction_reserved_refs = 2;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
+static void
+eviction_release_refs(ResourceXTargetEvictionPlan *plan)
+{
+	UT_ASSERT(!transition_mapping_held && !transition_content_held);
+	for (int i = 0; i < 2; i++) {
+		if (plan->pi_refs[i].source_flags != 0) {
+			UT_ASSERT(eviction_reserved_refs > 0);
+			eviction_reserved_refs--;
+			memset(&plan->pi_refs[i], 0, sizeof(plan->pi_refs[i]));
+		}
+	}
+}
+
+static ResourceXApplyResult
+eviction_abort(ResourceXTargetEvictionPlan *plan)
+{
+	UT_ASSERT(!plan->local_n_committed);
+	eviction_release_refs(plan);
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
@@ -2618,6 +2687,7 @@ eviction_publish(ResourceXTargetEvictionPlan *plan, bool *retry_pending_out)
 	*retry_pending_out = false;
 	UT_ASSERT(!transition_mapping_held && !transition_content_held);
 	UT_ASSERT(plan->local_n_committed && plan->prepared);
+	UT_ASSERT_EQ(eviction_wal_captures, 2);
 	UT_ASSERT(eviction_mapping_deleted);
 	UT_ASSERT_EQ(transition_buf->pcm_state, PCM_STATE_N);
 	UT_ASSERT_EQ(cluster_pcm_own_gen_get(transition_buf->buf_id),
@@ -2629,6 +2699,16 @@ eviction_publish(ResourceXTargetEvictionPlan *plan, bool *retry_pending_out)
 		return RESOURCE_X_APPLY_BAD_STATE; /* Not a known pending cause. */
 	if (eviction_scenario == 3)
 		return RESOURCE_X_APPLY_STALE;
+	if (eviction_scenario == 5) {
+		/* Real publish moves references to entry before a later send can
+		 * throw. The outer owner must observe the cleared plan after ERROR. */
+		UT_ASSERT_EQ(eviction_reserved_refs, 2);
+		eviction_entry_refs = 2;
+		eviction_reserved_refs = 0;
+		memset(plan->pi_refs, 0, sizeof(plan->pi_refs));
+		plan->pi_recorded = true;
+		pg_re_throw();
+	}
 	if (eviction_publishes <= 3) {
 		*retry_pending_out = true;
 		return RESOURCE_X_APPLY_BAD_STATE;
@@ -2660,6 +2740,8 @@ eviction_free(BufferDesc *buf)
 	eviction_frees++;
 }
 
+#define palloc0 eviction_plan_alloc
+#define pfree eviction_plan_free
 #define LockBufHdr transition_lock_header
 #define LWLockAcquire eviction_mapping_acquire
 #define LWLockRelease transition_lock_release
@@ -2669,9 +2751,11 @@ eviction_free(BufferDesc *buf)
 #define UnpinBuffer eviction_unpin
 #define ReservePrivateRefCountEntry eviction_reserve_pin
 #define ResourceOwnerEnlargeBuffers(owner) eviction_reserve_pin()
+#define cluster_page_wal_eviction_snapshot_locked_v1 eviction_capture
+#define cluster_gcs_resource_x_target_evict_release_refs eviction_release_refs
 #define cluster_gcs_resource_x_target_evict_prepare_exact eviction_prepare
 #define cluster_gcs_resource_x_target_evict_publish_exact eviction_publish
-#define cluster_gcs_resource_x_target_evict_abort_exact(plan) RESOURCE_X_APPLY_APPLIED
+#define cluster_gcs_resource_x_target_evict_abort_exact eviction_abort
 #define cluster_bufmgr_resource_x_fail_closed_current() (eviction_fuses++)
 #define cluster_bufmgr_resource_x_writer_report_failure(...) pg_re_throw()
 #define cluster_pcm_own_report_bump_failure(...) pg_re_throw()
@@ -2686,6 +2770,10 @@ eviction_free(BufferDesc *buf)
 #undef cluster_gcs_resource_x_target_evict_abort_exact
 #undef cluster_gcs_resource_x_target_evict_publish_exact
 #undef cluster_gcs_resource_x_target_evict_prepare_exact
+#undef cluster_gcs_resource_x_target_evict_release_refs
+#undef cluster_page_wal_eviction_snapshot_locked_v1
+#undef palloc0
+#undef pfree
 #undef ResourceOwnerEnlargeBuffers
 #undef ReservePrivateRefCountEntry
 #undef UnpinBuffer
@@ -2703,7 +2791,7 @@ UT_TEST(test_real_eviction_pending_excludes_clock_sweep_and_keeps_one_owner)
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
 
 	for (initial_pins = 0; initial_pins <= 1; initial_pins++) {
-		for (leg = 0; leg < 4; leg++) {
+		for (leg = 0; leg < 7; leg++) {
 			BufferDesc buf;
 			ClusterPcmOwnEntry entry;
 			ClusterPcmOwnSnapshot base;
@@ -2720,6 +2808,9 @@ UT_TEST(test_real_eviction_pending_excludes_clock_sweep_and_keeps_one_owner)
 			eviction_private_pins = initial_pins;
 			eviction_publishes = eviction_sleeps = eviction_frees = eviction_fuses = 0;
 			eviction_reuse_observed = 0;
+			eviction_wal_captures = eviction_reserved_refs = eviction_entry_refs = 0;
+			eviction_plan_allocations = eviction_plan_frees = 0;
+			cluster_shared_config = true;
 			eviction_scenario = leg;
 			eviction_mapping_deleted = eviction_pin_reserved = false;
 			tag = buf.tag;
@@ -2739,15 +2830,26 @@ UT_TEST(test_real_eviction_pending_excludes_clock_sweep_and_keeps_one_owner)
 			PG_END_TRY();
 			UT_ASSERT(completed == (leg == 0));
 			UT_ASSERT_EQ(eviction_reuse_observed, 0);
-			UT_ASSERT_EQ(eviction_publishes, leg == 0 ? 4 : 1);
+			UT_ASSERT_EQ(eviction_publishes, leg == 0 ? 4 : (leg == 4 || leg == 6) ? 0 : 1);
 			UT_ASSERT_EQ(eviction_sleeps, leg == 0 ? 3 : leg == 2 ? 1 : 0);
-			UT_ASSERT_EQ(eviction_fuses, leg == 0 ? 0 : 1);
+			UT_ASSERT_EQ(eviction_fuses, leg == 0 || (leg == 4 || leg == 6) ? 0 : 1);
 			UT_ASSERT_EQ(eviction_frees, initial_pins == 0 && leg == 0 ? 1 : 0);
 			UT_ASSERT_EQ(eviction_private_pins, initial_pins);
+			UT_ASSERT_EQ(eviction_reserved_refs, 0);
+			UT_ASSERT_EQ(eviction_entry_refs, leg == 5 ? 2 : 0);
+			UT_ASSERT_EQ(eviction_plan_allocations, leg == 6 ? 0 : 1);
+			UT_ASSERT_EQ(eviction_plan_frees, eviction_plan_allocations);
+			if (leg == 4 || leg == 6) {
+				UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_X);
+				UT_ASSERT(BufferTagsEqual(&buf.tag, &tag));
+				UT_ASSERT_EQ(pg_atomic_read_u32(&entry.flags), 0);
+				UT_ASSERT(!eviction_mapping_deleted);
+			}
 			UT_ASSERT(!transition_mapping_held && !transition_content_held);
 		}
 	}
 	ClusterPcmOwnArray = saved;
+	cluster_shared_config = false;
 }
 
 UT_TEST(test_real_gcs_wal_recheck_yields_without_exporting_an_image)
@@ -6263,11 +6365,11 @@ UT_TEST(test_resource_x_target_cached_x_eviction_uses_native_exact_release)
 			"UnlockBufHdr(buf, buf_state)",
 			"BufTableDelete(tag, hash)",
 			"LWLockRelease(partition_lock)",
-			"plan.local_n_committed = true",
+			"plan->local_n_committed = true",
 			"cluster_gcs_resource_x_target_evict_publish_exact(",
 			"StrategyFreeBuffer" };
 	static const char *const abort_contract[]
-		= { "cluster_gcs_resource_x_target_evict_abort_exact(&plan)",
+		= { "cluster_gcs_resource_x_target_evict_abort_exact(plan)",
 			"cluster_pcm_own_eviction_abort_locked(",
 			"cluster_bufmgr_resource_x_fail_closed_current()" };
 	static const char *const commit_entry_contract[]

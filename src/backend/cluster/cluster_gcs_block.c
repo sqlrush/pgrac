@@ -15728,6 +15728,15 @@ gcs_block_resource_x_target_eviction_recheck_result(const BufferTag *tag,
 	return connection_sampled ? session_result : RESOURCE_X_APPLY_BAD_STATE;
 }
 
+void
+cluster_gcs_resource_x_target_evict_release_refs(ResourceXTargetEvictionPlan *plan)
+{
+	if (plan != NULL
+		&& (!cluster_page_wal_ref_release_v1(&plan->pi_refs[0])
+			|| !cluster_page_wal_ref_release_v1(&plan->pi_refs[1])))
+		elog(PANIC, "cached-X eviction lost its reserved WAL reference");
+}
+
 /* Freeze the existing kind-4 RELEASE_X while the descriptor is still the
  * exact X+REVOKING residency.  Entry-local EVICTING is lifecycle ownership,
  * never authority; every failure before local commit drops it exactly. */
@@ -15736,6 +15745,7 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 												  const ClusterPcmOwnSnapshot *exact_x,
 												  uint64 r4_record_generation,
 												  uint64 reservation_token,
+												  const ClusterPageWalBindingV1 *wal,
 												  ResourceXTargetEvictionPlan *plan_out)
 {
 	ClusterSemanticAdmissionToken admission;
@@ -15796,13 +15806,27 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 		else
 			result = gcs_block_resource_x_target_peer_result_exact(&admission, master_node,
 																   sender_connection_generation);
+		if (result == RESOURCE_X_APPLY_APPLIED && wal != NULL) {
+			ClusterPageWalBindingV1 flushed;
+			BufferTag wal_tag;
+
+			InitBufferTag(&wal_tag, &wal->identity.locator, wal->identity.forknum,
+						  wal->identity.blockno);
+			/* Native WAL confirmation may wait. No buffer or entry lock is held,
+			 * and the original descriptor remains X+REVOKING throughout. */
+			if (!cluster_shared_config || !BufferTagsEqual(tag, &wal_tag)
+				|| !cluster_page_wal_flush_source_v1(wal, &flushed)
+				|| !cluster_page_wal_ref_retain_v1(&flushed, &plan_out->pi_refs[0])
+				|| !cluster_page_wal_ref_retain_v1(&flushed, &plan_out->pi_refs[1]))
+				result = RESOURCE_X_APPLY_BAD_STATE;
+		}
 		if (result == RESOURCE_X_APPLY_APPLIED)
 			result = cluster_pcm_lock_resource_x_target_evict_prepare_exact(
 				tag, master_node, gate.formation, master_session, r4_record_generation,
 				exact_x->generation, reservation_token, sender_connection_generation,
 				(int32)MyProc->pgprocno, &release, &owner);
 		if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE) {
-			memcpy((void *)&cleanup_owner, &owner, sizeof(owner));
+			cleanup_owner = owner;
 			owner_claimed = true;
 		}
 		if (owner_claimed
@@ -15837,10 +15861,11 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 	}
 	PG_CATCH();
 	{
+		cluster_gcs_resource_x_target_evict_release_refs(plan_out);
 		if (owner_claimed) {
 			ResourceXLocalOwnerHandle catch_owner;
 
-			memcpy(&catch_owner, (const void *)&cleanup_owner, sizeof(catch_owner));
+			catch_owner = cleanup_owner;
 			abort_result = cluster_pcm_lock_resource_x_target_evict_abort_exact(&catch_owner);
 			if (abort_result != RESOURCE_X_APPLY_APPLIED)
 				gcs_block_resource_x_fail_closed_current();
@@ -15850,6 +15875,8 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 	}
 	PG_END_TRY();
 	cluster_semantic_activation_leave(&admission);
+	if (!plan_out->prepared)
+		cluster_gcs_resource_x_target_evict_release_refs(plan_out);
 	return result;
 }
 
@@ -15899,6 +15926,14 @@ cluster_gcs_resource_x_target_evict_publish_exact(ResourceXTargetEvictionPlan *p
 			plan->sender_connection_generation, &admission);
 		if (result == RESOURCE_X_APPLY_BAD_STATE)
 			*retry_pending_out = true;
+		if (result == RESOURCE_X_APPLY_APPLIED && !plan->pi_recorded) {
+			if (plan->pi_refs[0].source_flags != 0 || plan->pi_refs[1].source_flags != 0)
+				result = cluster_pcm_lock_resource_x_target_evict_record_pi_exact(plan);
+			else
+				plan->pi_recorded = true; /* No attributed source; no invented PI proof. */
+			if (result == RESOURCE_X_APPLY_APPLIED)
+				cluster_gcs_resource_x_target_evict_release_refs(plan);
+		}
 		if (result == RESOURCE_X_APPLY_APPLIED && !plan->release_admitted) {
 			if (plan->master_node == cluster_node_id)
 				result = cluster_pcm_lock_resource_x_release_x_exact(
@@ -15961,6 +15996,7 @@ cluster_gcs_resource_x_target_evict_abort_exact(ResourceXTargetEvictionPlan *pla
 		plan->prepared = false;
 		memset(&plan->owner, 0, sizeof(plan->owner));
 	}
+	cluster_gcs_resource_x_target_evict_release_refs(plan);
 	return result;
 }
 

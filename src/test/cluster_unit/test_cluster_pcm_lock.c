@@ -8692,7 +8692,10 @@ UT_TEST(test_resource_x_bootstrap_direct_init_cached_x_consumes_same_round_t3_ha
 	UT_ASSERT(memcmp(&terminal_ref, &expected_ref, sizeof(terminal_ref)) == 0);
 }
 
-UT_TEST(test_resource_x_cached_x_eviction_prepares_and_commits_release)
+static ClusterPageWalBindingV1 local_pi_setup(BufferTag tag);
+
+static void
+cached_x_eviction_case(bool record_pi)
 {
 	BufferTag tag = make_tag(161);
 	PcmEntryAcquireResult acquire_result;
@@ -8715,10 +8718,18 @@ UT_TEST(test_resource_x_cached_x_eviction_prepares_and_commits_release)
 	ClusterPcmOwnSnapshot lost;
 	uint64 binding_generation;
 	bool residual_entry;
+	ClusterPageWalBindingV1 binding = { 0 };
+	ClusterPcmLocalPiSnapshotV1 pi = { 0 };
+	ResourceXTargetEvictionPlan plan = { 0 };
 
-	reset_fake_pcm_runtime(4);
+	if (record_pi)
+		binding = local_pi_setup(tag);
+	else
+		reset_fake_pcm_runtime(4);
 	fake_pcm_clock_us = 200;
 	cluster_node_id = 1;
+	if (record_pi)
+		local_pi_writer.claim.identity.origin_node_id = 1;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT(resource_x_assertion_init(&tag, 1, &assertion));
@@ -8830,6 +8841,35 @@ UT_TEST(test_resource_x_cached_x_eviction_prepares_and_commits_release)
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_target_evict_commit_exact(&release, 0, 77, 8, &stale_eviction),
 		RESOURCE_X_APPLY_STALE);
+	if (record_pi) {
+		plan.tag = tag;
+		plan.release = release;
+		plan.owner = eviction;
+		plan.master_node = 0;
+		plan.r4_record_generation = 77;
+		plan.cached_ownership_generation = 8;
+		plan.prepared = true;
+		UT_ASSERT(cluster_page_wal_ref_retain_v1(&binding, &plan.pi_refs[0]));
+		UT_ASSERT(cluster_page_wal_ref_retain_v1(&binding, &plan.pi_refs[1]));
+		UT_ASSERT_EQ(
+			cluster_pcm_lock_resource_x_target_evict_record_pi_exact(&plan),
+			RESOURCE_X_APPLY_INVALID); /* local X still reversible: no responsibility yet */
+		plan.local_n_committed = true;
+		plan.owner.reservation_token++;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_target_evict_record_pi_exact(&plan),
+					 RESOURCE_X_APPLY_STALE);
+		UT_ASSERT(plan.pi_refs[0].source_flags != 0 && plan.pi_refs[1].source_flags != 0);
+		UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &pi));
+		UT_ASSERT_EQ(pi.first.record_start, 0);
+		plan.owner = eviction;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_target_evict_record_pi_exact(&plan),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(plan.pi_recorded);
+		UT_ASSERT_EQ(plan.pi_refs[0].source_flags, 0);
+		UT_ASSERT_EQ(plan.pi_refs[1].source_flags, 0);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_target_evict_record_pi_exact(&plan),
+					 RESOURCE_X_APPLY_INVALID); /* original plan never consumes moved refs twice */
+	}
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_target_evict_commit_exact(&release, 0, 77, 8, &eviction),
 		RESOURCE_X_APPLY_APPLIED);
@@ -8839,11 +8879,31 @@ UT_TEST(test_resource_x_cached_x_eviction_prepares_and_commits_release)
 	residual_entry = pcm_entry_ref_acquire(&tag, false, &entry_ref, &acquire_result);
 	if (residual_entry)
 		pcm_entry_ref_release(&entry_ref);
-	UT_ASSERT(!residual_entry);
-	UT_ASSERT_EQ(acquire_result, PCM_ENTRY_ACQUIRE_NOT_FOUND);
-	UT_ASSERT_EQ(
-		cluster_pcm_lock_resource_x_target_evict_commit_exact(&release, 0, 77, 8, &eviction),
-		RESOURCE_X_APPLY_NOT_FOUND);
+	UT_ASSERT_EQ(residual_entry, record_pi);
+	if (record_pi) {
+		UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &pi));
+		UT_ASSERT(cluster_page_wal_same_mutation_v1(&pi.first, &binding));
+		UT_ASSERT(cluster_page_wal_same_mutation_v1(&pi.last, &binding));
+		UT_ASSERT(!pcm_entry_retire_classify_exact(&tag, pi.binding_generation, &why));
+		UT_ASSERT_EQ(why, PCM_RETIRE_REFUSAL_PI_PRESENT);
+		UT_ASSERT(!cluster_pcm_lock_clean_leave_verify_no_leftover(cluster_node_id));
+	} else {
+		UT_ASSERT_EQ(acquire_result, PCM_ENTRY_ACQUIRE_NOT_FOUND);
+		UT_ASSERT_EQ(
+			cluster_pcm_lock_resource_x_target_evict_commit_exact(&release, 0, 77, 8, &eviction),
+			RESOURCE_X_APPLY_NOT_FOUND);
+	}
+	cluster_shared_config = local_pi_writer_ready = false;
+}
+
+UT_TEST(test_resource_x_cached_x_eviction_prepares_and_commits_release)
+{
+	cached_x_eviction_case(false);
+}
+
+UT_TEST(test_cached_x_eviction_keeps_logical_pi_after_release)
+{
+	cached_x_eviction_case(true);
 }
 
 UT_TEST(test_resource_x_local_master_release_keeps_cached_cover_until_commit)
@@ -20531,6 +20591,7 @@ main(void)
 	UT_RUN(test_resource_x_cached_x_to_s_commit_clears_only_exact_terminal_cover);
 	UT_RUN(test_resource_x_bootstrap_direct_init_cached_x_consumes_same_round_t3_handoff);
 	UT_RUN(test_resource_x_cached_x_eviction_prepares_and_commits_release);
+	UT_RUN(test_cached_x_eviction_keeps_logical_pi_after_release);
 	UT_RUN(test_resource_x_local_master_release_keeps_cached_cover_until_commit);
 	UT_RUN(test_resource_x_local_n_without_evicting_owner_is_post_mutation_ambiguity);
 	UT_RUN(test_resource_x_terminal_remote_holder_binds_exact_final_authority);

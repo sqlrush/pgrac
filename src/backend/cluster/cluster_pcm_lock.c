@@ -9973,7 +9973,8 @@ pcm_local_pi_snapshot_locked(struct GrdEntry *entry, ClusterPcmLocalPiSnapshotV1
 }
 
 static bool
-pcm_local_pi_remember_locked(struct GrdEntry *entry, const ClusterPageWalBindingV1 *binding)
+pcm_local_pi_remember_locked(struct GrdEntry *entry, const ClusterPageWalBindingV1 *binding,
+							 ClusterPageWalRefV1 *reserved)
 {
 	ClusterPcmLocalPiSnapshotV1 previous;
 	ClusterPageWalRefV1 first = { 0 }, last = { 0 };
@@ -10007,12 +10008,31 @@ pcm_local_pi_remember_locked(struct GrdEntry *entry, const ClusterPageWalBinding
 	if (entry->local_pi_revision >= UINT64_MAX - 1)
 		return false;
 	/* Reserve every replacement reference before changing the original owner.
-	 * The unchanged keyed entry, not a buffer slot, owns these references. */
-	if (empty && !cluster_page_wal_ref_retain_v1(binding, &first))
-		return false;
-	if (!cluster_page_wal_ref_retain_v1(binding, &last)) {
-		(void)cluster_page_wal_ref_release_v1(&first);
-		return false;
+	 * Eviction already reserved both references before its irreversible N;
+	 * consume those without a capacity allocation under the entry lock. */
+	if (reserved != NULL) {
+		ClusterPageWalBindingV1 observed;
+		for (int i = 0; i < 2; i++) {
+			if (!cluster_page_wal_ref_read_v1(&reserved[i], binding->identity.locator,
+											  binding->identity.forknum, binding->identity.blockno,
+											  &observed)
+				|| (observed.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+				|| !cluster_page_wal_same_mutation_v1(&observed, binding))
+				return false;
+		}
+		if (empty) {
+			first = reserved[0];
+			memset(&reserved[0], 0, sizeof(reserved[0]));
+		}
+		last = reserved[1];
+		memset(&reserved[1], 0, sizeof(reserved[1]));
+	} else {
+		if (empty && !cluster_page_wal_ref_retain_v1(binding, &first))
+			return false;
+		if (!cluster_page_wal_ref_retain_v1(binding, &last)) {
+			(void)cluster_page_wal_ref_release_v1(&first);
+			return false;
+		}
 	}
 	if (empty)
 		entry->local_pi_first = first; /* move, never duplicate a live reference */
@@ -10046,7 +10066,7 @@ cluster_pcm_local_pi_record_v1(BufferTag tag, const ClusterPageWalBindingV1 *bin
 		|| !pcm_entry_ref_acquire(&tag, true, &ref, &acquired))
 		return false;
 	pcm_entry_lock_exclusive(ref.entry);
-	result = pcm_local_pi_remember_locked(ref.entry, binding);
+	result = pcm_local_pi_remember_locked(ref.entry, binding, NULL);
 	LWLockRelease(&ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&ref);
 	return result;
@@ -16336,6 +16356,37 @@ pcm_resource_x_target_evict_release_matches_locked(
 }
 
 ResourceXApplyResult
+cluster_pcm_lock_resource_x_target_evict_record_pi_exact(ResourceXTargetEvictionPlan *plan)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ClusterPageWalBindingV1 binding;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_STALE;
+
+	if (plan == NULL || !plan->prepared || !plan->local_n_committed || plan->release_admitted
+		|| plan->pi_recorded || !cluster_shared_config
+		|| !BufferTagsEqual(&plan->tag, &plan->release.common.logical_assertion.resource)
+		|| !cluster_page_wal_ref_read_v1(&plan->pi_refs[0], BufTagGetRelFileLocator(&plan->tag),
+										 plan->tag.forkNum, plan->tag.blockNum, &binding))
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&plan->tag, false, &ref, &acquired))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	pcm_entry_lock_exclusive(ref.entry);
+	if (pcm_resource_x_target_evict_release_matches_locked(
+			ref.entry, &ref.entry->resource_x_bootstrap_round, &plan->release, plan->master_node,
+			plan->r4_record_generation, plan->cached_ownership_generation, &plan->owner)) {
+		result = pcm_local_pi_remember_locked(ref.entry, &binding, plan->pi_refs)
+					 ? RESOURCE_X_APPLY_APPLIED
+					 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		if (result == RESOURCE_X_APPLY_APPLIED)
+			plan->pi_recorded = true;
+	}
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
+ResourceXApplyResult
 cluster_pcm_lock_resource_x_target_evict_commit_exact(const ResourceXDecodedFrame *release,
 													  int32 current_master_node,
 													  uint64 r4_record_generation,
@@ -19180,7 +19231,7 @@ pcm_resource_x_holder_pair_publish_internal(const ResourceXAssertion *assertion,
 	 * Other page classes retain the existing guard and full-WAL reconstruction. */
 	if (cluster_shared_config && image.common.observed_mode == PCM_STATE_X
 		&& image.body.image_envelope.page_wal.record_start != 0
-		&& !pcm_local_pi_remember_locked(entry, &image.body.image_envelope.page_wal)) {
+		&& !pcm_local_pi_remember_locked(entry, &image.body.image_envelope.page_wal, NULL)) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		goto pair_publish_done;
 	}

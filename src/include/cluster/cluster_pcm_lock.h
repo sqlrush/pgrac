@@ -1697,6 +1697,11 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_target_evict_prepare_exa
 	ResourceXLocalOwnerHandle *handle_out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_target_evict_abort_exact(const ResourceXLocalOwnerHandle *handle);
+/* Consume only pre-reserved source references after local N and before the
+ * original RELEASE_X can be sent. The exact EVICTING owner remains live. */
+struct ResourceXTargetEvictionPlan;
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_target_evict_record_pi_exact(struct ResourceXTargetEvictionPlan *plan);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_target_evict_commit_exact(
 	const ResourceXDecodedFrame *release, int32 current_master_node, uint64 r4_record_generation,
 	uint64 cached_ownership_generation, const ResourceXLocalOwnerHandle *handle);
