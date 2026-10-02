@@ -1021,10 +1021,66 @@ UT_TEST(test_record_gap_refused)
 	destroy_plan(&plan);
 }
 
+/* Two replayable anchors: a page whose header names an early version may
+ * still be torn, so restoration starts at the earliest replayable anchor at
+ * or before DATA's successor, never by applying deltas onto that body. */
+UT_TEST(test_earliest_replayable_anchor_precedes_torn_deltas)
+{
+	ClusterColdParticipantV1 parts[2]
+		= { part(1, 11, 0x1000, 0x1000, 0x2000), part(2, 12, 0x1000, 0x1000, 0x2000) };
+	ClusterColdComponentV1 fpi0 = fpi(0, 100, 0, 1, 2);
+	ClusterColdComponentV1 d1 = delta(0, 100, 0, 2, 3);
+	ClusterColdComponentV1 d2 = delta(0, 100, 0, 3, 4);
+	ClusterColdComponentV1 fpi3 = fpi(0, 100, 0, 4, 5);
+	ClusterColdComponentV1 d4 = delta(0, 100, 0, 5, 6);
+	ObserveTable table = { 0 };
+	ClusterColdDiagV1 diag;
+	ClusterColdPlanV1 *plan = make_plan(parts, 2);
+	ClusterColdStepV1 step;
+
+	UT_ASSERT_EQ(feed(plan, 0, 0x1000, 0x1100, 1, 1, &fpi0), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed(plan, 1, 0x1000, 0x1100, 2, 1, &d1), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed(plan, 0, 0x1100, 0x1200, 3, 1, &d2), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed(plan, 1, 0x1100, 0x1200, 4, 1, &fpi3), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed(plan, 0, 0x1200, 0x2000, 5, 1, &d4), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_plain(plan, 1, 0x1200, 0x2000), CLUSTER_COLD_OK);
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 3)); /* d1's result */
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT(find_step(plan, 0, 0x1000, &step, NULL));
+	UT_ASSERT_EQ(step.blocks[0].verdict, CLUSTER_COLD_BLOCK_APPLY_IMAGE);
+	UT_ASSERT_EQ(step.blocks[0].expected_kind, CLUSTER_COLD_DATA_PRESENT);
+	UT_ASSERT(version_is(&step.blocks[0].expected_before, INC_I, 3));
+	UT_ASSERT(find_step(plan, 1, 0x1000, &step, NULL));
+	UT_ASSERT_EQ(step.blocks[0].verdict, CLUSTER_COLD_BLOCK_APPLY_DELTA);
+	UT_ASSERT(version_is(&step.blocks[0].expected_before, INC_I, 2));
+	UT_ASSERT(find_step(plan, 0, 0x1100, &step, NULL));
+	UT_ASSERT_EQ(step.blocks[0].verdict, CLUSTER_COLD_BLOCK_APPLY_DELTA);
+	UT_ASSERT(find_step(plan, 1, 0x1100, &step, NULL));
+	UT_ASSERT_EQ(step.blocks[0].verdict, CLUSTER_COLD_BLOCK_APPLY_IMAGE);
+	destroy_plan(&plan);
+
+	/* DATA past the later anchor's predecessor: the earliest anchor still
+	 * qualifies and is restored first. */
+	plan = make_plan(parts, 2);
+	memset(&table, 0, sizeof(table));
+	UT_ASSERT_EQ(feed(plan, 0, 0x1000, 0x1100, 1, 1, &fpi0), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed(plan, 1, 0x1000, 0x1100, 2, 1, &d1), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed(plan, 0, 0x1100, 0x1200, 3, 1, &d2), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed(plan, 1, 0x1100, 0x1200, 4, 1, &fpi3), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed(plan, 0, 0x1200, 0x2000, 5, 1, &d4), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_plain(plan, 1, 0x1200, 0x2000), CLUSTER_COLD_OK);
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 6));
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+	UT_ASSERT(find_step(plan, 0, 0x1000, &step, NULL));
+	UT_ASSERT_EQ(step.blocks[0].verdict, CLUSTER_COLD_BLOCK_APPLY_IMAGE);
+	UT_ASSERT(version_is(&step.blocks[0].expected_before, INC_I, 6));
+	destroy_plan(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(29);
 	UT_RUN(test_lower_lag_old_fpi_cannot_overwrite_newer_durable);
 	UT_RUN(test_data_behind_history_is_refused);
 	UT_RUN(test_a_b_c_exact_order_ignores_scn_and_lsn);
@@ -1053,6 +1109,7 @@ main(void)
 	UT_RUN(test_structural_records_refused_after_native_redo);
 	UT_RUN(test_torn_header_restores_last_replayable_anchor);
 	UT_RUN(test_record_gap_refused);
+	UT_RUN(test_earliest_replayable_anchor_precedes_torn_deltas);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
