@@ -200,6 +200,21 @@ extern bool cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out);
 /* Immutable restart input, independent of the ordinary writer reference.
  * Reading this mirror never authorizes WAL insertion or serving. */
 extern bool cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out);
+
+/* Last successful native checkpoint observation, never retention authority.
+ * Byte intervals derived from these LSNs exclude other writer generations,
+ * preallocation and filesystem allocation. Unknown until first publication. */
+typedef struct ClusterWalThreadCheckpointSampleV1 {
+	uint64 root_publish_seq;
+	XLogRecPtr retained_lower;
+	XLogRecPtr native_redo;
+	XLogRecPtr validated_tail;
+	int64 published_at_usec;
+} ClusterWalThreadCheckpointSampleV1;
+
+extern void cluster_wal_thread_checkpoint_observed_v1(const ClusterControlRootSnapshot *record,
+													  XLogRecPtr native_redo);
+extern bool cluster_wal_thread_checkpoint_sample_v1(ClusterWalThreadCheckpointSampleV1 *out);
 struct ClusterWalStartupImage;
 /* StartupProcess-only INSTALL plus exact route check, then once-only shared
  * writer-reference publication. This never overwrites the restart input and

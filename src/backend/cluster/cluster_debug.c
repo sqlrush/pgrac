@@ -55,6 +55,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/xlog.h"
 
 #include "fmgr.h"
 #include "funcapi.h"
@@ -3710,6 +3711,44 @@ dump_wal_thread(ReturnSetInfo *rsinfo)
 				 (ready && v == CLUSTER_WAL_SLOT_OK) ? fmt_uint64_hex(slot.highest_lsn) : "-");
 		emit_row(rsinfo, "wal_thread", "registry_highest_scn",
 				 (ready && v == CLUSTER_WAL_SLOT_OK) ? fmt_int64((int64)slot.highest_scn) : "-");
+	}
+	/* Local immutable writer + last successfully published native checkpoint.
+	 * No CF/claim I/O, WAL scan, or recovery/retention permission is involved.
+	 * Logical byte spans are not allocated files or other generations' WAL. */
+	{
+		ClusterWalSourceRef ref;
+		ClusterWalThreadCheckpointSampleV1 sample;
+		bool writer = cluster_wal_thread_current_v2_ref(&ref);
+		bool observed = writer && cluster_wal_thread_checkpoint_sample_v1(&sample);
+		TimeLineID timeline = 0;
+		XLogRecPtr flushed = writer ? GetFlushRecPtr(&timeline) : InvalidXLogRecPtr;
+		bool current_flush = writer && timeline == ref.timeline && flushed != InvalidXLogRecPtr;
+		bool span = observed && current_flush && flushed >= sample.validated_tail;
+
+		emit_row(rsinfo, "wal_thread", "writer_node_id",
+				 writer ? fmt_int32(ref.claim.identity.origin_node_id) : "-");
+		emit_row(rsinfo, "wal_thread", "writer_boot_incarnation",
+				 writer ? fmt_uint64(ref.claim.identity.origin_owner_incarnation) : "-");
+		emit_row(rsinfo, "wal_thread", "writer_root_lineage",
+				 writer ? fmt_uint64(ref.claim.identity.root_lineage_seq) : "-");
+		emit_row(rsinfo, "wal_thread", "writer_config_ceiling",
+				 writer ? fmt_uint64(ref.claim.max_config_generation) : "-");
+		emit_row(rsinfo, "wal_thread", "observed_root_publish_seq",
+				 observed ? fmt_uint64(sample.root_publish_seq) : "-");
+		emit_row(rsinfo, "wal_thread", "observed_checkpoint_at_usec",
+				 observed ? fmt_int64(sample.published_at_usec) : "-");
+		emit_row(rsinfo, "wal_thread", "observed_retained_lower_lsn",
+				 observed ? fmt_uint64_hex(sample.retained_lower) : "-");
+		emit_row(rsinfo, "wal_thread", "observed_native_redo_lsn",
+				 observed ? fmt_uint64_hex(sample.native_redo) : "-");
+		emit_row(rsinfo, "wal_thread", "observed_validated_tail_lsn",
+				 observed ? fmt_uint64_hex(sample.validated_tail) : "-");
+		emit_row(rsinfo, "wal_thread", "native_flush_lsn",
+				 current_flush ? fmt_uint64_hex(flushed) : "-");
+		emit_row(rsinfo, "wal_thread", "observed_retained_history_bytes",
+				 observed ? fmt_uint64(sample.native_redo - sample.retained_lower) : "-");
+		emit_row(rsinfo, "wal_thread", "observed_to_flush_retained_bytes",
+				 span ? fmt_uint64(flushed - sample.retained_lower) : "-");
 	}
 }
 

@@ -86,7 +86,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_r4_itl_capacity \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
-        test_cluster_wal_thread test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_wal_cut test_cluster_pi_data test_cluster_thread_tail test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
+        test_cluster_wal_thread test_cluster_wal_checkpoint_sample test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_wal_cut test_cluster_pi_data test_cluster_thread_tail test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
         test_cluster_backup test_cluster_retained_remote \
         test_cluster_recovery_worker test_cluster_recovery_merge test_cluster_remote_xact test_cluster_remote_xact_writer \
         test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay \
@@ -427,6 +427,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_replay_batch,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_install,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_producer test_cluster_space_fork test_cluster_space_identity test_cluster_space_page_verify test_cluster_space_table_size test_cluster_space_wal test_cluster_space_storage test_cluster_space_recovery test_cluster_space_cache test_cluster_space_recovery_route test_cluster_space_copy test_cluster_space_copy_version test_cluster_heap_insert_version test_cluster_vm_version test_cluster_vm_redo,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_generic_version test_cluster_generic_redo,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_wal_checkpoint_sample,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_inplace_version test_cluster_heap_maintenance_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_vm_visible_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_btree_build_version,$(SIMPLE_TESTS))
@@ -2554,6 +2555,23 @@ test_cluster_side_xact_undo_product.o: $(top_srcdir)/src/backend/cluster/cluster
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -include test_cluster_undo_tt_transition.inc \
 		-ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_wal_checkpoint_sample.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_thread.c Makefile
+	awk '/^typedef struct ClusterWalThreadShmemData/ { emit=1; count++ } \
+	     /^cluster_wal_thread_current_v2_ref\(/ || /^cluster_wal_thread_checkpoint_observed_v1\(/ || /^cluster_wal_thread_checkpoint_sample_v1\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 4) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_checkpoint_dump.inc: $(top_srcdir)/src/backend/cluster/cluster_debug.c Makefile
+	awk '/^dump_wal_thread\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_checkpoint_sample: test_cluster_wal_checkpoint_sample.c unit_test.h \
+		test_cluster_wal_checkpoint_sample.inc test_cluster_wal_checkpoint_dump.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_side_xact: test_cluster_side_xact.c unit_test.h test_cluster_undo_header_identity.inc \
 		test_cluster_side_online_owner_product.o \

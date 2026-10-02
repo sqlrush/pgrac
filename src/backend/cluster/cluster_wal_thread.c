@@ -59,6 +59,7 @@
 #include "port/atomics.h"
 #include "storage/fd.h" /* BasicOpenFile, pg_fsync */
 #include "storage/shmem.h"
+#include "storage/spin.h"
 #include "utils/timestamp.h" /* GetCurrentTimestamp */
 #include "utils/wait_event.h"
 
@@ -88,6 +89,8 @@ typedef struct ClusterWalThreadShmemData {
 	 * cluster_stats on best-effort refresh failures, read by the dump
 	 * SRF in any backend). */
 	pg_atomic_uint64 wal_state_refresh_fail_count;
+	slock_t checkpoint_sample_lock;
+	ClusterWalThreadCheckpointSampleV1 checkpoint_sample;
 	char _reserved[8]; /* remaining headroom */
 } ClusterWalThreadShmemData;
 
@@ -119,6 +122,9 @@ cluster_wal_thread_shmem_init(void)
 			   sizeof(cluster_wal_thread_shmem->restart_ref));
 		cluster_wal_thread_shmem->restart_ref_valid = false;
 		pg_atomic_init_u64(&cluster_wal_thread_shmem->wal_state_refresh_fail_count, 0);
+		SpinLockInit(&cluster_wal_thread_shmem->checkpoint_sample_lock);
+		memset(&cluster_wal_thread_shmem->checkpoint_sample, 0,
+			   sizeof(cluster_wal_thread_shmem->checkpoint_sample));
 		memset(cluster_wal_thread_shmem->_reserved, 0, sizeof(cluster_wal_thread_shmem->_reserved));
 	}
 }
@@ -231,6 +237,50 @@ cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
 		return false;
 	*out = cluster_wal_thread_shmem->restart_ref;
 	return true;
+}
+
+void
+cluster_wal_thread_checkpoint_observed_v1(const ClusterControlRootSnapshot *record,
+										  XLogRecPtr native_redo)
+{
+	ClusterWalSourceRef ref;
+	ClusterWalThreadCheckpointSampleV1 sample;
+
+	/* Best-effort observation only. Never change the publisher's result or
+	 * infer a floor from an unbound writer, another boot, or scalar LSNs. */
+	if (MyBackendType != B_CHECKPOINTER || record == NULL
+		|| !cluster_wal_thread_current_v2_ref(&ref)
+		|| memcmp(&record->identity, &ref.claim.identity, sizeof(record->identity)) != 0
+		|| record->root_publish_seq == 0 || record->checkpoint_tli != ref.timeline
+		|| record->tail_tli != ref.timeline || record->checkpoint_lower_lsn == InvalidXLogRecPtr
+		|| record->checkpoint_lower_lsn > native_redo || native_redo > record->tail_last_record_lsn
+		|| record->tail_last_record_lsn >= record->validated_tail_lsn_exclusive)
+		return;
+	memset(&sample, 0, sizeof(sample));
+	sample.root_publish_seq = record->root_publish_seq;
+	sample.retained_lower = record->checkpoint_lower_lsn;
+	sample.native_redo = native_redo;
+	sample.validated_tail = record->validated_tail_lsn_exclusive;
+	sample.published_at_usec = record->published_at_usec;
+	SpinLockAcquire(&cluster_wal_thread_shmem->checkpoint_sample_lock);
+	if (sample.root_publish_seq > cluster_wal_thread_shmem->checkpoint_sample.root_publish_seq)
+		cluster_wal_thread_shmem->checkpoint_sample = sample;
+	SpinLockRelease(&cluster_wal_thread_shmem->checkpoint_sample_lock);
+}
+
+bool
+cluster_wal_thread_checkpoint_sample_v1(ClusterWalThreadCheckpointSampleV1 *out)
+{
+	ClusterWalSourceRef ref;
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_wal_thread_current_v2_ref(&ref))
+		return false;
+	SpinLockAcquire(&cluster_wal_thread_shmem->checkpoint_sample_lock);
+	*out = cluster_wal_thread_shmem->checkpoint_sample;
+	SpinLockRelease(&cluster_wal_thread_shmem->checkpoint_sample_lock);
+	return out->root_publish_seq != 0;
 }
 
 ClusterControlRootResult

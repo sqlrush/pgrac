@@ -6866,6 +6866,8 @@ checkpoint_v2_publish(CheckpointV2Purpose purpose, const ClusterControlRootIdent
 		*out = work->base.records[self->origin_thread_id - 1];
 		*out_token = work->after;
 		*out_control = work->new_view;
+		if (version >= 3)
+			cluster_wal_thread_checkpoint_observed_v1(out, out_control->checkPointCopy.redo);
 	}
 	pfree(work);
 	return result;

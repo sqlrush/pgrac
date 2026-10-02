@@ -6252,6 +6252,21 @@ static WalTestRecord test_checkpoint_prefix;
 static char test_checkpoint_prefix_path[MAXPGPATH];
 static ClusterWalSourceRef test_restart_ref;
 static bool test_restart_ref_valid;
+static unsigned checkpoint_observations;
+static ClusterControlRootSnapshot checkpoint_observed;
+static XLogRecPtr checkpoint_observed_redo;
+
+void
+cluster_wal_thread_checkpoint_observed_v1(const ClusterControlRootSnapshot *record,
+										  XLogRecPtr native_redo)
+{
+	UT_ASSERT_EQ(test_cf_mode, NoLock);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	checkpoint_observations++;
+	checkpoint_observed = *record;
+	checkpoint_observed_redo = native_redo;
+}
 
 bool
 cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
@@ -18336,6 +18351,7 @@ UT_TEST(test_v3_checkpoint_publish_preserves_pending_and_real_wal_guards)
 		ClusterRecoveryAnchorV2 old_anchor;
 		XLogRecPtr lower;
 		char path[MAXPGPATH];
+		unsigned observations_before = checkpoint_observations;
 		if (shutdown)
 			v2_shutdown_checkpoint_fixture(before, &self, &candidate);
 		else
@@ -18386,6 +18402,9 @@ UT_TEST(test_v3_checkpoint_publish_preserves_pending_and_real_wal_guards)
 		if (ut_current_failed)
 			return;
 		UT_ASSERT_EQ(token.format_version, 3);
+		UT_ASSERT_EQ(checkpoint_observations, observations_before + 1);
+		UT_ASSERT_EQ(memcmp(&checkpoint_observed, &out, sizeof(out)), 0);
+		UT_ASSERT_EQ(checkpoint_observed_redo, candidate.checkPointCopy.redo);
 		UT_ASSERT_EQ(out.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
 		UT_ASSERT_EQ(view.state, DB_IN_PRODUCTION);
 		UT_ASSERT_EQ(out.validated_tail_lsn_exclusive, test_checkpoint_end);

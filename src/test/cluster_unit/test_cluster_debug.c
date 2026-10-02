@@ -2712,6 +2712,26 @@ cluster_cr_r4_event_count(uint32 event pg_attribute_unused())
  * accessors (cluster_wal_thread.c / cluster_wal_state.c) are not linked
  * here; stub everything dump_wal_thread reads (L104). */
 #include "cluster/cluster_wal_state.h"
+#include "cluster/cluster_wal_thread.h"
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
+{
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+bool
+cluster_wal_thread_checkpoint_sample_v1(ClusterWalThreadCheckpointSampleV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+XLogRecPtr
+GetFlushRecPtr(TimeLineID *timeline)
+{
+	if (timeline != NULL)
+		*timeline = 0;
+	return InvalidXLogRecPtr;
+}
 bool
 cluster_wal_state_registry_ready(void)
 {
