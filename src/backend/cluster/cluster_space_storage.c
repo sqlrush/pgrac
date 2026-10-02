@@ -847,6 +847,33 @@ void
 cluster_space_truncate_finish(ClusterSpaceTruncateState *state, Relation rel)
 {
 	Assert(state != NULL && CritSectionCount == 0);
+	/* The caller still holds the relation lifecycle lock and both SPACE
+	 * content locks. Persist the new incarnation before another writer can
+	 * make its pages durable: an old on-disk identity cannot distinguish
+	 * those pages from the retired incarnation after a crash. */
+	PG_TRY();
+	{
+		SMgrRelation smgr;
+
+		for (int i = 0; i < 2; i++)
+			FlushOneBuffer(state->buffers[i]);
+		smgr = smgropen(rel->rd_locator, InvalidBackendId);
+		smgrimmedsync(smgr, SPACE_FORKNUM);
+	}
+	PG_CATCH();
+	{
+		/* The published shared pages cannot be rolled back. An ordinary
+		 * transaction abort would release the locks and expose that cached
+		 * incarnation to other writers without its durable SPACE anchor. */
+		ereport(PANIC, (errcode(ERRCODE_IO_ERROR),
+						errmsg("could not durably publish the truncated relation identity"),
+						errdetail("Relation %u/%u/%u has an unconfirmed SPACE incarnation.",
+								  rel->rd_locator.spcOid, rel->rd_locator.dbOid,
+								  rel->rd_locator.relNumber),
+						errhint("Restore storage availability and restart the instance to recover "
+								"the truncation.")));
+	}
+	PG_END_TRY();
 	space_truncate_release(state);
 	if (space_identity_cache != NULL)
 		space_identity_invalidate((Datum)0, RelationGetRelid(rel));

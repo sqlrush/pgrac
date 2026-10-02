@@ -95,9 +95,13 @@ ErrorContextCallback *error_context_stack;
 static BufferDescPadded descriptors[2];
 BufferDescPadded *BufferDescriptors = descriptors;
 static bool truncate_owner, drop_owner, deleted_all, expecting_error;
+static int reported_level;
 static unsigned relation_flushes, fork_syncs, invalidations, random_calls;
 static unsigned shrink_syncs;
 static int fail_shrink_sync = -1;
+static unsigned space_flushes, space_syncs;
+static int fail_space_flush, fail_space_sync;
+static PGAlignedBlock written_space[2];
 static bool cold_truncate_fixture, cold_truncate_permitted, cold_vm_clear, cold_vm_stale;
 static bool cold_main_missing;
 static const ClusterSpaceRecoveryBatchV1 *cold_batch = (const ClusterSpaceRecoveryBatchV1 *)42;
@@ -741,11 +745,30 @@ int
 errmsg(const char *fmt, ...)
 {
 	(void)fmt;
+	if (expecting_error)
+		return 0;
 	abort();
 }
-bool errstart(int level, const char *domain) { return level >= ERROR; }
+bool
+errstart(int level, const char *domain)
+{
+	reported_level = level;
+	return level >= ERROR;
+}
 bool errstart_cold(int level, const char *domain) { return errstart(level, domain); }
 int errmsg_internal(const char *fmt, ...) { return 0; }
+int
+errdetail(const char *fmt, ...)
+{
+	UT_ASSERT(expecting_error);
+	return 0;
+}
+int
+errhint(const char *fmt, ...)
+{
+	UT_ASSERT(expecting_error);
+	return 0;
+}
 void
 errfinish(const char *file, int line, const char *function)
 {
@@ -761,9 +784,37 @@ FlushRelationBuffers(Relation rel)
 	relation_flushes++;
 }
 void
+FlushOneBuffer(Buffer buffer)
+{
+	UT_ASSERT(truncate_owner && buffer >= 1 && buffer <= 2);
+	UT_ASSERT_EQ(locked, 3);
+	UT_ASSERT_EQ(pinned, 3);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(invalidations, 0);
+	UT_ASSERT_EQ(shrink_syncs, auxiliary_forks ? 3 : 1);
+	space_flushes++;
+	if (buffer == fail_space_flush)
+		pg_re_throw();
+	memcpy(written_space[buffer - 1].data, pages[buffer - 1].data, BLCKSZ);
+}
+
+void
 smgrimmedsync(SMgrRelation rel, ForkNumber fork)
 {
 	UT_ASSERT((truncate_owner || recovering) && rel == &storage);
+	if (truncate_owner && fork == SPACE_FORKNUM && truncate_calls != 0) {
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(locked, 3);
+		UT_ASSERT_EQ(pinned, 3);
+		UT_ASSERT_EQ(invalidations, 0);
+		UT_ASSERT_EQ(space_flushes, 2);
+		UT_ASSERT_EQ(memcmp(written_space, pages, sizeof(pages)), 0);
+		space_syncs++;
+		if (fail_space_sync)
+			pg_re_throw();
+		fork_syncs++;
+		return;
+	}
 	if (recovering && !truncate_owner) {
 		UT_ASSERT_EQ(CritSectionCount, 1);
 		UT_ASSERT_EQ(locked, 3);
@@ -809,6 +860,8 @@ int
 errcode(int code)
 {
 	(void)code;
+	if (expecting_error)
+		return 0;
 	abort();
 }
 
@@ -819,9 +872,13 @@ reset(void)
 		abort();
 	fake_allocations = fake_frees = 0;
 	truncate_owner = drop_owner = deleted_all = expecting_error = false;
+	reported_level = 0;
 	relation_flushes = fork_syncs = invalidations = random_calls = 0;
 	shrink_syncs = 0;
 	fail_shrink_sync = -1;
+	space_flushes = space_syncs = 0;
+	fail_space_flush = fail_space_sync = 0;
+	memset(written_space, 0, sizeof(written_space));
 	cold_truncate_fixture = cold_vm_stale = cold_main_missing = false;
 	cold_commit_window = cold_drop_proven = false;
 	cold_drop_checks = 0;
@@ -1633,7 +1690,7 @@ UT_TEST(test_native_truncate_logs_pair_after_durable_base_before_publish)
 	UT_ASSERT_EQ(main_blocks, 4);
 	UT_ASSERT_EQ(truncate_calls, 1);
 	UT_ASSERT_EQ(relation_flushes, 1);
-	UT_ASSERT_EQ(fork_syncs, 3);
+	UT_ASSERT_EQ(fork_syncs, 4);
 	UT_ASSERT_EQ(shrink_syncs, 1);
 	UT_ASSERT_EQ(invalidations, 1);
 	UT_ASSERT_EQ(MyProc->delayChkptFlags, 0);
@@ -1680,7 +1737,7 @@ UT_TEST(test_native_truncate_syncs_all_shrunken_forks_before_identity)
 	auxiliary_forks = true;
 	RelationTruncate(rel, 4);
 	UT_ASSERT_EQ(shrink_syncs, 3);
-	UT_ASSERT_EQ(fork_syncs, 7);
+	UT_ASSERT_EQ(fork_syncs, 8);
 	UT_ASSERT_EQ(truncate_calls, 1);
 	UT_ASSERT_EQ(invalidations, 1);
 	UT_ASSERT_EQ(fsm_vacuums, 1);
@@ -1719,6 +1776,65 @@ UT_TEST(test_native_truncate_failed_sync_does_not_publish_identity)
 		UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
 		/* The original critical I/O error terminates the process; no success
 		 * or post-publication cleanup is manufactured by this fixture. */
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_native_truncate_persists_new_space_before_exposing_incarnation)
+{
+	Relation rel = native_truncate_relation();
+	ClusterSpaceStructureChange change;
+	ClusterSpaceIdentity identity = { 0 };
+	ClusterSpaceReservation reservation = { 0 };
+	uint64 token = 0;
+
+	RelationTruncate(rel, 4);
+	UT_ASSERT_EQ(space_flushes, 2);
+	UT_ASSERT_EQ(space_syncs, 1);
+	UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, registered_len, &change));
+	UT_ASSERT(cluster_space_identity_page_decode(written_space[0].data, BLCKSZ, SPACE_FORKNUM, 0,
+												 &change.identity.result.key, &identity, &token));
+	UT_ASSERT_EQ(token, change.identity.result_token);
+	UT_ASSERT_EQ(identity.sequence, change.identity.result.sequence);
+	UT_ASSERT(cluster_space_reservation_page_decode(written_space[1].data, BLCKSZ, SPACE_FORKNUM, 1,
+													&change.identity.result.key, &reservation,
+													&token));
+	UT_ASSERT_EQ(reservation.next_block, 4);
+	UT_ASSERT_EQ(token, change.reservation.result_token);
+	UT_ASSERT_EQ(invalidations, 1);
+	UT_ASSERT_EQ(pinned | locked, 0);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_native_truncate_space_write_or_sync_error_does_not_complete)
+{
+	for (int failure = 1; failure <= 3; failure++) {
+		Relation rel = native_truncate_relation();
+		volatile bool caught = false;
+
+		fail_space_flush = failure <= 2 ? failure : 0;
+		fail_space_sync = failure == 3;
+		expecting_error = true;
+		PG_TRY();
+		{
+			RelationTruncate(rel, 4);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(reported_level, PANIC);
+		UT_ASSERT_EQ(space_flushes, failure <= 2 ? failure : 2);
+		UT_ASSERT_EQ(space_syncs, failure == 3 ? 1 : 0);
+		UT_ASSERT_EQ(invalidations, 0);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(pinned, 3);
+		UT_ASSERT_EQ(locked, 3);
+		/* The fixture intercepts PANIC. Production must terminate before
+		 * transaction cleanup exposes this not-yet-durable cached identity
+		 * to another backend; ordinary ERROR would fail this assertion. */
 		FreeFakeRelcacheEntry(rel);
 	}
 }
@@ -2301,7 +2417,9 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(47);
+	UT_PLAN(49);
+	UT_RUN(test_native_truncate_persists_new_space_before_exposing_incarnation);
+	UT_RUN(test_native_truncate_space_write_or_sync_error_does_not_complete);
 	UT_RUN(test_cold_physical_preflight_checks_vm_without_truncation_or_fsm_writes);
 	UT_RUN(test_native_cold_commit_later_refusal_keeps_all_targets_unmodified);
 	UT_RUN(test_native_cold_commit_uses_already_proof_without_local_flush_or_rewrite);
