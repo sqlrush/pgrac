@@ -9333,6 +9333,168 @@ UT_TEST(test_normal_start_pending_self_ack_rechecks_completion_at_actual_send)
 	test_gate_reset();
 }
 
+UT_TEST(test_clean_restart_missing_fanout_peer_retries_before_open)
+{
+	for (int shared = 0; shared <= 1; shared++) {
+		ClusterSemanticActivationRecord open;
+		ClusterSemanticActivationReadRequest read;
+		uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+		uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+		uint64 incarnations[4], generation;
+		const char *reason;
+
+		ut_a142_setup(3);
+		cluster_shared_config = shared;
+		ut_a148_ready_input();
+		cluster_semantic_activation_lmon_tick();
+		(void)ut_a142_complete_open_read(0);
+		ut_a142_frame(0, false, 23, 0);
+		test_capability_missing_peer = 1;
+		ut_a142_local_root(false);
+		UT_ASSERT(semantic_activation_restart.local_ready);
+		UT_ASSERT(!semantic_activation_restart.failed);
+		UT_ASSERT(!semantic_activation_ack_local_pending_send.invalidated);
+		UT_ASSERT((semantic_activation_ack_local_pending_send.pending_members_lo & 2) != 0);
+		if (semantic_activation_restart.failed) {
+			test_gate_reset();
+			continue;
+		}
+		for (int tick = 0; tick < 3; tick++) {
+			cluster_semantic_activation_lmon_tick();
+			UT_ASSERT_EQ(test_send_calls[1], 0);
+			UT_ASSERT(!semantic_activation_restart.failed);
+			UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 1);
+		}
+		/* Missing evidence cannot manufacture the identity needed to stop. */
+		MyAuxProcType = LmonProcess;
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&open, root, incarnations, &reason),
+					 CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT_STR_EQ(reason, "SEMANTIC_STOP_READ_INVALID");
+
+		test_capability_missing_peer = -1;
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT_EQ(test_send_calls[0], 1); /* no duplicate delivery to the ready peer */
+		UT_ASSERT_EQ(test_send_calls[1], 1);
+		UT_ASSERT_EQ(test_send_calls[2], 1);
+		UT_ASSERT_EQ(semantic_activation_ack_local_pending_send.pending_members_lo, 0);
+		for (int peer = 0; peer < 3; peer++)
+			ut_a142_frame(peer, true, 23, UINT64_C(0x100) + peer);
+		UT_ASSERT_EQ(SemanticActivationAckTable->observed_members_lo, 15);
+		cluster_semantic_activation_lmon_tick();
+		(void)ut_a142_complete_open_read(0);
+		UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation), RESOURCE_X_WRITER_CLOSED);
+		test_resource_x_cutover_digest_valid = true;
+		test_resource_x_cutover_digest = 99;
+		test_resource_x_cutover_token.old_formation = 1;
+		test_resource_x_cutover_token.new_formation = 2;
+		test_resource_x_cutover_token.freeze_generation = 1;
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation), RESOURCE_X_WRITER_CLOSED);
+		test_resource_x_cutover_thawed = true;
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation), RESOURCE_X_WRITER_TARGET);
+		UT_ASSERT_EQ(generation, 6);
+		UT_ASSERT(semantic_activation_restart.opened);
+
+		/* The unchanged stop reader can now prove OPEN through its own read. */
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&open, root, incarnations, &reason),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT(cluster_semantic_activation_qvotec_poll_record_read(&read));
+		ut_a142_open_bytes(bytes, 0);
+		UT_ASSERT(cluster_semantic_activation_qvotec_complete_record_read(
+			read.request_seq, CLUSTER_SEMANTIC_ACTIVATION_OK, false, bytes));
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&open, root, incarnations, &reason),
+					 CLUSTER_NORMAL_STOP_READY);
+		test_gate_reset();
+	}
+}
+
+UT_TEST(test_clean_restart_missing_request_peer_retains_same_round)
+{
+	uint64 nonce;
+	ut_a142_setup(0);
+	ut_a148_ready_input();
+	test_send_results[1] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	cluster_semantic_activation_lmon_tick();
+	nonce = ut_a142_complete_open_read(0);
+	UT_ASSERT(semantic_activation_restart.requested);
+	UT_ASSERT_EQ(test_send_calls[1], 1);
+	test_capability_missing_peer = 1;
+	for (int tick = 0; tick < 3; tick++) {
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT(!semantic_activation_restart.failed);
+		UT_ASSERT(semantic_activation_ack_local_request_origin.active);
+		UT_ASSERT_EQ(test_send_calls[1], 1);
+		UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 1);
+	}
+	test_capability_missing_peer = -1;
+	test_send_results[1] = CLUSTER_IC_SEND_DONE;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(test_send_calls[1], 2);
+	UT_ASSERT_EQ(test_send_calls[2], 1);
+	UT_ASSERT_EQ(test_send_calls[3], 1);
+	UT_ASSERT_EQ(semantic_activation_ack_local_request_origin.unsent_members_lo, 0);
+	UT_ASSERT_EQ(SemanticActivationAckTable->round_nonce, nonce);
+	UT_ASSERT(!semantic_activation_restart.failed);
+	test_gate_reset();
+}
+
+UT_TEST(test_clean_restart_proven_capability_contradiction_still_invalidates)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		ut_a142_setup(3);
+		ut_a148_ready_input();
+		cluster_semantic_activation_lmon_tick();
+		(void)ut_a142_complete_open_read(0);
+		ut_a142_frame(0, false, 23, 0);
+		test_send_results[1] = CLUSTER_IC_SEND_NOT_ADMITTED;
+		ut_a142_local_root(false);
+		UT_ASSERT(!semantic_activation_restart.failed);
+		if (fault == 0)
+			test_peer_capability_word &= ~PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+		else
+			test_peer_capability_generation = 0;
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT(semantic_activation_restart.failed);
+		UT_ASSERT(semantic_activation_ack_local_pending_send.invalidated);
+		UT_ASSERT_EQ(test_send_calls[1], 1);
+		UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 1);
+		test_gate_reset();
+	}
+}
+
+UT_TEST(test_clean_restart_delayed_peer_cannot_restore_old_identity)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		ut_a142_setup(3);
+		ut_a148_ready_input();
+		cluster_semantic_activation_lmon_tick();
+		(void)ut_a142_complete_open_read(0);
+		ut_a142_frame(0, false, 23, 0);
+		test_capability_missing_peer = 1;
+		ut_a142_local_root(false);
+		test_capability_missing_peer = -1;
+		if (fault == 0)
+			test_current_epoch++;
+		else if (fault == 1)
+			NormalStartCompletion->pgrd[511] ^= 1;
+		else {
+			test_peer_capability_generation++;
+			test_peer_capability_matches = false; /* old ingress connection no longer current */
+		}
+		cluster_semantic_activation_lmon_tick();
+		for (int peer = 0; peer < 3; peer++)
+			ut_a142_frame(peer, true, 23, UINT64_C(0x100) + peer);
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT(!semantic_activation_restart.opened);
+		UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 1);
+		UT_ASSERT_EQ(SemanticActivationAckTable->observed_members_lo & 7, 0);
+		if (fault < 2)
+			UT_ASSERT_EQ(test_send_calls[1], 0);
+		test_gate_reset();
+	}
+}
+
 UT_TEST(test_normal_start_local_ack_binds_full_payload_and_current_identity)
 {
 	int fault;
@@ -10620,7 +10782,7 @@ UT_TEST(test_a148_stop_poll_includes_original_phase3_handoff)
 int
 main(void)
 {
-	UT_PLAN(310);
+	UT_PLAN(314);
 	UT_RUN(test_normal_actual_finish_preserves_unconfigured_native_startup);
 	UT_RUN(test_normal_start_pending_ack_does_not_reuse_root_after_valid_mirror_drift);
 	UT_RUN(test_normal_start_confirmed_new_root_permanently_rejects_old_completion);
@@ -10889,6 +11051,10 @@ main(void)
 	UT_RUN(test_normal_start_local_ack_binds_full_payload_and_current_identity);
 	UT_RUN(test_normal_start_final_open_rechecks_full_ready_bytes);
 	UT_RUN(test_normal_start_pending_self_ack_rechecks_completion_at_actual_send);
+	UT_RUN(test_clean_restart_missing_fanout_peer_retries_before_open);
+	UT_RUN(test_clean_restart_missing_request_peer_retains_same_round);
+	UT_RUN(test_clean_restart_proven_capability_contradiction_still_invalidates);
+	UT_RUN(test_clean_restart_delayed_peer_cannot_restore_old_identity);
 	UT_RUN(test_normal_start_only_strict_zero_is_source);
 	UT_RUN(test_normal_start_bad_identity_and_debt_never_load);
 	UT_RUN(test_normal_start_incomplete_or_changed_root_is_sticky);
