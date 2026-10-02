@@ -40,6 +40,9 @@
 #include "access/xlog_internal.h"
 #include "access/xlogprefetcher.h"
 #include "access/xlogutils.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_page_cold_redo.h"
+#endif
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/fd.h"
@@ -399,6 +402,15 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		elog(PANIC, "block with WILL_INIT flag in WAL record must be zeroed by redo routine");
 	if (!willinit && zeromode)
 		elog(PANIC, "block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record");
+
+#ifdef USE_PGRAC_CLUSTER
+	{
+		XLogRedoAction cold_action;
+		if (cluster_page_cold_redo_read_v1(record, block_id, mode, get_cleanup_lock,
+										 buf, &cold_action))
+			return cold_action;
+	}
+#endif
 
 	/* If it has a full-page image and it should be restored, do it. */
 	if (XLogRecBlockImageApply(record, block_id))

@@ -63,6 +63,7 @@ OBJS = \
 	cluster_control_bootstrap_native.o \
 	cluster_formation_marker.o \
 	cluster_page_version.o \
+	cluster_page_cold_redo.o \
 	cluster_page_rmgr.o \
 	cluster_page_producer.o \
 	cluster_page_wal.o \

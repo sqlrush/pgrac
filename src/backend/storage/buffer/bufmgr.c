@@ -39,6 +39,9 @@
 #endif
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_page_cold_redo.h"
+#endif
 #include "catalog/catalog.h"
 #ifdef USE_ASSERT_CHECKING
 #include "catalog/pg_tablespace_d.h"
@@ -7661,6 +7664,10 @@ MarkBufferDirty(Buffer buffer)
 								  "buffer=%d",
 								  cluster_node_id, bufHdr->buf_id)));
 	}
+	/* The native redo owner still holds the original pin/content-X here. */
+	if (cluster_page_cold_redo_active_v1)
+		cluster_page_cold_redo_dirty_v1(buffer);
+
 #endif
 
 	old_buf_state = pg_atomic_read_u32(&bufHdr->state);
