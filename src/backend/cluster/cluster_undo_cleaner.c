@@ -779,14 +779,16 @@ undo_cleaner_run_pass(bool *out_work_remaining)
 				floor_retry_needed = true;
 				cluster_undo_horizon_note_pass_abort();
 			} else if (batch == 0
-					   && (stats.segments_marked_recyclable > 0 || stats.shmem_tt_slots_gcd > 0
-						   || stats.header_tt_slots_below_horizon > 0)) {
+					   && (stats.segments_marked_recyclable > 0 || stats.shmem_tt_slots_gcd > 0)) {
 				/*
 				 * H2 continuous mode: the batch budget ran out while
 				 * recycle progress was still being made -- more eligible
 				 * inventory is waiting than one batch covers.  Ask the
 				 * caller to re-run now rather than let a write storm
 				 * outrun the interval cadence.
+				 * Header inventory is scan-only: the same retained or already
+				 * recyclable TT slots may be observed on every pass. It cannot
+				 * prove progress or keep an otherwise idle cleaner running.
 				 */
 				*out_work_remaining = true;
 			}
