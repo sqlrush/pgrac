@@ -30,6 +30,14 @@ extern bool cluster_space_recovery_cold_relation_install_v1(const ClusterSpaceId
 															const ClusterSpaceColdSourceV1 *sources,
 															uint32 count, uint32 through);
 
+/* Read-only qualification for the original cold COMMIT deletion owner.
+ * Both SPACE components must already be this exact, durable tombstone.
+ * Borrows the original whole cold owner set; does not grant foreign SIDE
+ * replay or recovery-window closure, and never writes target bytes. */
+extern bool cluster_space_recovery_cold_drop_already_v1(const ClusterSpaceIdentityKey *key,
+														const ClusterSpaceRecoveryInput *input,
+														const ClusterSpaceColdSourceV1 *source);
+
 extern bool cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
 												const ClusterThreadRecoveryAuthorityV1 *sources,
 												uint32 count, ClusterSpaceRecoveryBatchV1 **out);

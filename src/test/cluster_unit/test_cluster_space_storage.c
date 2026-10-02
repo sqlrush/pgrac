@@ -23,6 +23,7 @@
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_hw.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -99,6 +100,31 @@ static unsigned shrink_syncs;
 static int fail_shrink_sync = -1;
 static bool cold_truncate_fixture, cold_truncate_permitted, cold_vm_clear, cold_vm_stale;
 static const ClusterSpaceRecoveryBatchV1 *cold_batch = (const ClusterSpaceRecoveryBatchV1 *)42;
+static bool cold_commit_window, cold_drop_proven;
+static unsigned cold_drop_checks;
+static bool cold_drop_second_refused;
+bool
+cluster_cold_replay_window_active_v1(void)
+{
+	return cold_commit_window;
+}
+bool
+cluster_space_recovery_cold_drop_already_v1(const ClusterSpaceIdentityKey *key,
+											const ClusterSpaceRecoveryInput *input,
+											const ClusterSpaceColdSourceV1 *source)
+{
+	ClusterSpaceStructureChange drop;
+	UT_ASSERT(key->locator.spcOid == locator.spcOid && key->locator.dbOid == locator.dbOid
+			  && key->locator.relNumber == locator.relNumber + cold_drop_checks);
+	UT_ASSERT_EQ(key->database_incarnation, 2);
+	UT_ASSERT_EQ(source->origin_thread, 1);
+	UT_ASSERT_EQ(source->end_rec_ptr, UINT64_C(0x10000300));
+	UT_ASSERT(cluster_space_structure_wal_decode(input->data, input->length, &drop));
+	UT_ASSERT_EQ(drop.identity.action, CLUSTER_SPACE_WAL_TOMBSTONE);
+	UT_ASSERT_EQ(pinned | locked, 0);
+	cold_drop_checks++;
+	return cold_drop_proven && !(cold_drop_second_refused && cold_drop_checks == 2);
+}
 static PGPROC proc;
 PGPROC *MyProc = &proc;
 XLogRecPtr XactLastRecEnd;
@@ -231,7 +257,9 @@ RecoveryInProgress(void)
 int
 cluster_smgr_which_for(RelFileLocator tag, BackendId backend)
 {
-	if (!RelFileLocatorEquals(tag, locator) || backend != InvalidBackendId)
+	if (backend != InvalidBackendId || tag.spcOid != locator.spcOid || tag.dbOid != locator.dbOid
+		|| (tag.relNumber != locator.relNumber
+			&& !(cold_drop_second_refused && tag.relNumber == locator.relNumber + 1)))
 		abort();
 	return shared ? 1 : 0;
 }
@@ -787,6 +815,9 @@ reset(void)
 	shrink_syncs = 0;
 	fail_shrink_sync = -1;
 	cold_truncate_fixture = cold_vm_stale = false;
+	cold_commit_window = cold_drop_proven = false;
+	cold_drop_checks = 0;
+	cold_drop_second_refused = false;
 	cold_truncate_permitted = cold_vm_clear = true;
 	native_commits = commit_decisions = 0;
 	plain_commit_emitter = false;
@@ -1944,6 +1975,85 @@ native_commit_redo_prefix(XLogReaderState *record, xl_xact_parsed_commit *parsed
 #include "test_cluster_space_commit_redo.inc"
 }
 
+UT_TEST(test_native_cold_commit_uses_already_proof_without_local_flush_or_rewrite)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	Relation rel = drop_replay_record(&reader, &decoded);
+	xl_xact_parsed_commit parsed;
+	PGAlignedBlock before[2];
+
+	cold_commit_window = cold_drop_proven = true;
+	writer_allowed = false; /* The ordinary serving-X write path is not a cold owner. */
+	memcpy(before, pages, sizeof(before));
+	UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+	UT_ASSERT(cluster_space_drop_replay_commit(&reader, 501));
+	UT_ASSERT_EQ(cold_drop_checks, 1);
+	UT_ASSERT_EQ(dirty_calls + flush_calls + truncate_calls + unlink_calls, 0);
+	UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+	UT_ASSERT(!pinned && !locked);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_native_cold_commit_later_refusal_keeps_all_targets_unmodified)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	Relation rel = drop_replay_record(&reader, &decoded);
+	xl_xact_parsed_commit parsed;
+	ClusterSpaceStructureChange drop;
+	PGAlignedBlock before[2];
+	RelFileLocator second = locator;
+	char *after_locators;
+	int count = 2;
+	uint32 drops = 2;
+
+	UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+	after_locators = (char *)(parsed.xlocators + 1);
+	memmove(after_locators + sizeof(second), after_locators,
+			commit_len - (after_locators - (char *)commit_bytes));
+	second.relNumber++;
+	memcpy(after_locators, &second, sizeof(second));
+	memcpy((char *)parsed.xlocators - sizeof(int), &count, sizeof(count));
+	commit_len += sizeof(second);
+	UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+	UT_ASSERT(cluster_space_structure_wal_decode(parsed.space_drops,
+												 CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &drop));
+	drop.identity.expected.key.locator = drop.identity.result.key.locator = second;
+	drop.reservation.before.identity.key.locator = drop.reservation.result.identity.key.locator
+		= second;
+	UT_ASSERT(cluster_space_structure_wal_encode(&drop, commit_bytes + commit_len,
+												 CLUSTER_SPACE_STRUCTURE_WAL_BYTES));
+	memcpy((char *)parsed.space_drops - sizeof(drops), &drops, sizeof(drops));
+	commit_len += CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
+	decoded.main_data_len = commit_len;
+	cold_commit_window = cold_drop_proven = cold_drop_second_refused = true;
+	memcpy(before, pages, sizeof(before));
+	UT_ASSERT(!cluster_space_drop_replay_commit(&reader, 501));
+	UT_ASSERT_EQ(cold_drop_checks, 2);
+	UT_ASSERT_EQ(dirty_calls + flush_calls + truncate_calls + unlink_calls, 0);
+	UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+	UT_ASSERT(!pinned && !locked);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_native_cold_commit_refuses_unproved_tombstone_before_local_mutation)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	Relation rel = drop_replay_record(&reader, &decoded);
+	PGAlignedBlock before[2];
+
+	cold_commit_window = true;
+	memcpy(before, pages, sizeof(before));
+	UT_ASSERT(!cluster_space_drop_replay_commit(&reader, 501));
+	UT_ASSERT_EQ(cold_drop_checks, 1);
+	UT_ASSERT_EQ(dirty_calls + flush_calls + truncate_calls + unlink_calls, 0);
+	UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+	UT_ASSERT(!pinned && !locked);
+	FreeFakeRelcacheEntry(rel);
+}
+
 UT_TEST(test_atomic_drop_commit_replays_all_partial_tombstones)
 {
 	for (unsigned mask = 0; mask < 4; mask++) {
@@ -2161,7 +2271,10 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(43);
+	UT_PLAN(46);
+	UT_RUN(test_native_cold_commit_later_refusal_keeps_all_targets_unmodified);
+	UT_RUN(test_native_cold_commit_uses_already_proof_without_local_flush_or_rewrite);
+	UT_RUN(test_native_cold_commit_refuses_unproved_tombstone_before_local_mutation);
 	UT_RUN(test_cold_physical_truncate_never_grows_a_short_or_retained_main);
 	UT_RUN(test_cold_physical_truncate_uses_original_forks_without_local_wal_flush);
 	UT_RUN(test_cold_physical_truncate_refuses_owner_and_vm_before_shrink);

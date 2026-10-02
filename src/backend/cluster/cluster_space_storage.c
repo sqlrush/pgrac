@@ -19,6 +19,7 @@
 #include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_hw.h"
 #include "cluster/cluster_page_producer.h"
@@ -996,6 +997,7 @@ cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid)
 	xl_xact_parsed_commit parsed;
 	int count;
 	uint32 consumed = 0;
+	bool cold = cluster_shared_config && cluster_cold_replay_window_active_v1();
 
 	if (record == NULL || record->record == NULL || !RecoveryInProgress()
 		|| !TransactionIdIsNormal(xid) || XLogRecGetRmid(record) != RM_XACT_ID
@@ -1037,6 +1039,16 @@ cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid)
 			|| !space_identity_key_matches(&expected, &change.identity.result.key))
 			goto refused;
 		consumed++;
+		if (cold) {
+			ClusterSpaceRecoveryInput input
+				= { parsed.space_drops + (Size)(consumed - 1) * CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+					CLUSTER_SPACE_STRUCTURE_WAL_BYTES };
+			ClusterSpaceColdSourceV1 source = { local_thread, record->EndRecPtr };
+
+			if (!cluster_space_recovery_cold_drop_already_v1(&expected, &input, &source))
+				goto refused;
+			continue;
+		}
 		smgr = smgropen(expected.locator, InvalidBackendId);
 		if (!smgrexists(smgr, SPACE_FORKNUM)) {
 			/* Native unlink removes SPACE last. A missing identity alone
@@ -1056,6 +1068,13 @@ cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid)
 	if (consumed != parsed.nspace_drops)
 		goto refused;
 	pfree(sorted);
+	if (cold) {
+		/* The original COMMIT owner deletes only after every target has
+		 * qualified. Its source is already pinned; no local WAL flush or
+		 * SPACE rewrite is allowed for a cold ALREADY result. */
+		cluster_space_drop_finish(state);
+		return true;
+	}
 	/* All targets were checked privately. Bind minRecoveryPoint to this
 	 * same local stream's COMMIT before any tombstone becomes dirty. */
 	XLogFlush(record->EndRecPtr);

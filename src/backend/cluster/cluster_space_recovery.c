@@ -70,6 +70,7 @@ struct ClusterSpaceRecoveryBatchV1 {
 	ResourceOwner source_owner;
 	ResourceOwner io_owner;
 	ResourceOwner previous_owner;
+	bool cold_drop_already;
 	bool preflight_complete;
 	bool installed;
 };
@@ -389,6 +390,26 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 		 * it with the previously prepared lower HWM. Rollback uses this
 		 * apply's own original bytes, not the earlier preflight snapshot. */
 		target->final = prepared;
+		if (batch->cold_drop_already) {
+			/* COMMIT may delete only its exact installed result, never a
+			 * LIVE predecessor or a reused locator. This is a read-only
+			 * proof: a cached result cannot be made durable on this path. */
+			if (apply || prepared.apply_mask != 0 || prepared.covered_by_successor_mask != 0
+				|| prepared.source_index[0] != 0 || prepared.source_index[1] != 0)
+				goto done;
+			for (int i = 0; i < 2; i++)
+				if (memcmp(target->before[i].data, prepared.pages[i].data, BLCKSZ) != 0
+					|| !space_disk_matches(rel, i, target->before[i].data))
+					goto done;
+			smgrimmedsync(rel, SPACE_FORKNUM);
+			if (!space_sources_fresh(batch))
+				goto done;
+			for (int i = 0; i < 2; i++)
+				if (!space_disk_matches(rel, i, target->before[i].data))
+					goto done;
+			ok = space_sources_fresh(batch);
+			goto done;
+		}
 		if (!apply) {
 			ok = true;
 			goto done;
@@ -684,11 +705,10 @@ cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *pla
 		sources, count, out);
 }
 
-bool
-cluster_space_recovery_cold_relation_install_v1(const ClusterSpaceIdentityKey *key,
-												const ClusterSpaceRecoveryInput *inputs,
-												const ClusterSpaceColdSourceV1 *origins,
-												uint32 count, uint32 through)
+static bool
+space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRecoveryInput *inputs,
+						const ClusterSpaceColdSourceV1 *origins, uint32 count, uint32 through,
+						bool drop_already)
 {
 	ClusterRecoverySerialGuard *guards[CLUSTER_WAL_RETENTION_MAX_THREADS];
 	ClusterWalRetentionPin *pin = NULL;
@@ -699,6 +719,13 @@ cluster_space_recovery_cold_relation_install_v1(const ClusterSpaceIdentityKey *k
 	Size bytes, scratch;
 	bool ok = false;
 
+	if (drop_already) {
+		ClusterSpaceStructureChange drop;
+		if (inputs == NULL || count != 1 || through != 0
+			|| !cluster_space_structure_wal_decode(inputs[0].data, inputs[0].length, &drop)
+			|| drop.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE)
+			return false;
+	}
 	if (!space_cold_phase() || key == NULL || inputs == NULL || origins == NULL || count == 0
 		|| through >= count || (scratch = cluster_space_recovery_scratch_bytes(count)) == 0
 		|| cluster_wal_retention_pin_borrow_cold_v1(&pin, guards, lengthof(guards), &source_count)
@@ -720,6 +747,7 @@ cluster_space_recovery_cold_relation_install_v1(const ClusterSpaceIdentityKey *k
 	batch->order = (uint32 *)(batch->targets + 1);
 	batch->sources = authorities;
 	batch->cold_inputs = inputs;
+	batch->cold_drop_already = drop_already;
 	batch->cold_origins = origins;
 	batch->source_owner = CurrentResourceOwner;
 	batch->source_count = source_count;
@@ -791,6 +819,10 @@ cluster_space_recovery_cold_relation_install_v1(const ClusterSpaceIdentityKey *k
 		}
 		if (!space_target_run(batch, 0, false, UINT32_MAX) || !space_sources_fresh(batch))
 			goto done;
+		if (drop_already) {
+			ok = true;
+			goto done;
+		}
 		batch->preflight_complete = true;
 		/* Each structural result follows its own physical action; a caller
 		 * asking for a later prefix may not skip intermediate structures. */
@@ -807,6 +839,23 @@ cluster_space_recovery_cold_relation_install_v1(const ClusterSpaceIdentityKey *k
 	}
 	PG_END_TRY();
 	return ok;
+}
+
+bool
+cluster_space_recovery_cold_relation_install_v1(const ClusterSpaceIdentityKey *key,
+												const ClusterSpaceRecoveryInput *inputs,
+												const ClusterSpaceColdSourceV1 *origins,
+												uint32 count, uint32 through)
+{
+	return space_cold_relation_run(key, inputs, origins, count, through, false);
+}
+
+bool
+cluster_space_recovery_cold_drop_already_v1(const ClusterSpaceIdentityKey *key,
+											const ClusterSpaceRecoveryInput *input,
+											const ClusterSpaceColdSourceV1 *source)
+{
+	return space_cold_relation_run(key, input, source, 1, 0, true);
 }
 
 bool

@@ -2127,10 +2127,110 @@ UT_TEST(test_compact_cold_partial_space_write_retries_without_losing_regrowth)
 	}
 }
 
+UT_TEST(test_cold_commit_already_qualifies_both_durable_components_without_mutation)
+{
+	ClusterSpaceRecoveryInput inputs[4];
+	ClusterSpaceColdSourceV1 origins[4];
+	uint8 bytes[4][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	PGAlignedBlock before[2];
+	unsigned prior_writes, prior_syncs;
+
+	compact_lifecycle(inputs, origins, bytes);
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 4, 3));
+	memcpy(before, pages, sizeof(before));
+	prior_writes = writes;
+	prior_syncs = syncs;
+	UT_ASSERT(cluster_space_recovery_cold_drop_already_v1(&key, &inputs[3], &origins[3]));
+	UT_ASSERT_EQ(writes, prior_writes);
+	UT_ASSERT_EQ(syncs, prior_syncs + 1);
+	UT_ASSERT_EQ(wal_flushes, 0);
+	UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+	UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+}
+
+UT_TEST(test_cold_commit_already_refuses_unwritten_result_wrong_origin_and_stale_owner)
+{
+	for (int bad = 0; bad < 10; bad++) {
+		ClusterSpaceRecoveryInput inputs[4];
+		ClusterSpaceColdSourceV1 origins[4];
+		uint8 bytes[4][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		PGAlignedBlock before[2], old[2];
+		unsigned prior_writes;
+
+		compact_lifecycle(inputs, origins, bytes);
+		memcpy(old, pages, sizeof(old));
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 4, 3));
+		if (bad == 0)
+			pages[0] = old[0];
+		if (bad == 1)
+			pages[1] = old[1];
+		if (bad == 2)
+			UT_ASSERT_EQ(pwrite(fileno(file), old, sizeof(old), 0), sizeof(old));
+		if (bad == 3)
+			origins[3].origin_thread = 2;
+		if (bad == 4)
+			origins[3].end_rec_ptr++;
+		if (bad == 5)
+			cold_window = false;
+		if (bad == 6)
+			stale = true;
+		if (bad == 7)
+			corrupt_after_sync_block = 1;
+		if (bad == 8)
+			existing_blocks = 1;
+		if (bad == 9)
+			permitted = false;
+		memcpy(before, pages, sizeof(before));
+		prior_writes = writes;
+		UT_ASSERT(!cluster_space_recovery_cold_drop_already_v1(&key, &inputs[3], &origins[3]));
+		UT_ASSERT_EQ(writes, prior_writes);
+		UT_ASSERT_EQ(wal_flushes, 0);
+		UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_cold_commit_io_error_keeps_original_authority_for_retry)
+{
+	const int faults[] = { 1, 2, 3, 5, 6 };
+	for (unsigned i = 0; i < lengthof(faults); i++) {
+		ClusterSpaceRecoveryInput inputs[4];
+		ClusterSpaceColdSourceV1 origins[4];
+		uint8 bytes[4][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		PGAlignedBlock before[2];
+		unsigned prior_writes;
+		volatile bool caught = false;
+
+		compact_lifecycle(inputs, origins, bytes);
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 4, 3));
+		memcpy(before, pages, sizeof(before));
+		prior_writes = writes;
+		throw_at = faults[i];
+		PG_TRY();
+		{
+			(void)cluster_space_recovery_cold_drop_already_v1(&key, &inputs[3], &origins[3]);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+		UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+		UT_ASSERT_EQ(writes, prior_writes);
+		throw_at = 0;
+		UT_ASSERT(cluster_space_recovery_cold_drop_already_v1(&key, &inputs[3], &origins[3]));
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(39);
+	UT_PLAN(42);
+	UT_RUN(test_cold_commit_io_error_keeps_original_authority_for_retry);
+	UT_RUN(test_cold_commit_already_qualifies_both_durable_components_without_mutation);
+	UT_RUN(test_cold_commit_already_refuses_unwritten_result_wrong_origin_and_stale_owner);
 	UT_RUN(test_compact_cold_truncate_qualifies_history_advance_gap);
 	UT_RUN(test_compact_cold_regrowth_and_commit_tombstone_preserve_later_data);
 	UT_RUN(test_compact_cold_final_install_performs_intermediate_truncate);
