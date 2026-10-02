@@ -590,8 +590,10 @@ semantic_activation_restart_diagnostic_note(uint32 kind, int32 peer, const char 
 {
 	SemanticActivationRestartDiagnostic *d = &semantic_activation_restart.diagnostic;
 
-	if (!semantic_activation_restart.requested || semantic_activation_restart.opened
-		|| d->nonce == 0 || d->invalid || (!invalid && d->reason != NULL))
+	if (semantic_activation_restart.opened || d->nonce == 0 || d->invalid
+		|| (!invalid && d->reason != NULL)
+		|| (!semantic_activation_restart.requested
+			&& !(invalid && kind == 0 && semantic_activation_restart.read_nonce == d->nonce)))
 		return;
 	d->kind = kind;
 	d->peer = peer;
@@ -12866,8 +12868,8 @@ normal_start_ready_matches(const uint8 pgsa[512], const uint8 pgrd[512])
 		|| completion.epoch != cluster_epoch_get_current()
 		|| memcmp(completion.pgsa, pgsa, sizeof(completion.pgsa)) != 0
 		|| memcmp(completion.pgrd, pgrd, sizeof(completion.pgrd)) != 0) {
-		semantic_activation_restart_diagnostic_note(CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK,
-				cluster_node_id, "SEMANTIC_RESTART_READY_IDENTITY_INVALID", true);
+		semantic_activation_restart_diagnostic_note(
+			0, cluster_node_id, "SEMANTIC_RESTART_READY_IDENTITY_INVALID", true);
 		semantic_activation_restart.failed = true;
 		return false;
 	}
@@ -12967,7 +12969,16 @@ semantic_activation_restart_tick(void)
 				}
 				return false;
 			}
-			(void)semantic_activation_record_read_mailbox_submit(&restart->read_seq);
+			if (semantic_activation_record_read_mailbox_submit(&restart->read_seq)
+				&& !restart->requested) {
+				/* The initial read has an owner before any REQUEST exists.
+				 * Preserve its actual sequence for diagnostics, without
+				 * fabricating an accepted round or a record-derived epoch. */
+				memset(&restart->diagnostic, 0, sizeof(restart->diagnostic));
+				restart->diagnostic.nonce = restart->read_seq;
+				restart->diagnostic.epoch = cluster_epoch_get_current();
+				restart->diagnostic.peer = cluster_node_id;
+			}
 			return true;
 		}
 		if (!semantic_activation_record_read_mailbox_poll_completion(restart->read_seq,
@@ -13017,6 +13028,8 @@ semantic_activation_restart_tick(void)
 		table.expected_members_lo = restart->open.admitted_members_lo;
 		table.expected_members_hi = restart->open.admitted_members_hi;
 		if (!semantic_activation_restart_record_matches(&restart->open, &table)) {
+			semantic_activation_restart_diagnostic_note(
+				0, cluster_node_id, "SEMANTIC_RESTART_RECORD_IDENTITY_INVALID", true);
 			restart->failed = true;
 			return true;
 		}
@@ -13087,8 +13100,8 @@ semantic_activation_restart_tick(void)
 					 &semantic_activation_ack_local_pending_send, &request, cluster_node_id, &self))
 			semantic_activation_ack_lmon_send_pending();
 		else {
-			semantic_activation_restart_diagnostic_note(CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK,
-				cluster_node_id, "SEMANTIC_RESTART_ACK_STAGE_INVALID", true);
+			semantic_activation_restart_diagnostic_note(0, cluster_node_id,
+														"SEMANTIC_RESTART_ACK_STAGE_INVALID", true);
 			restart->failed = true;
 		}
 		return true;
@@ -13593,8 +13606,14 @@ cluster_semantic_normal_stop_read_identity(
 		|| gate.formation_epoch == UINT64_MAX || gate.formation_epoch != cluster_epoch_get_current()
 		|| gate.active_bits
 			   != (CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
-				   | CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1))
+				   | CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1)) {
+		/* Only this closed admission observation belongs to the failed
+		 * restart. Bad reader arguments and unrelated mailbox failures do
+		 * not inherit its diagnostic. */
+		if (!semantic_activation_restart.opened && semantic_activation_restart.diagnostic.invalid)
+			reason = semantic_activation_restart.diagnostic.reason;
 		goto done;
+	}
 	request_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
 	completion_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_completion_seq);
 	if (semantic_activation_lmon_stop_read_seq == 0) {
@@ -13641,11 +13660,6 @@ cluster_semantic_normal_stop_read_identity(
 			memcpy(member_incarnations_out, incarnations, sizeof(incarnations));
 	}
 done:
-	if (IsUnderPostmaster && AmLmonProcess()
-		&& result == CLUSTER_NORMAL_STOP_INVALID
-		&& strcmp(reason, "SEMANTIC_STOP_READ_INVALID") == 0
-		&& semantic_activation_restart.diagnostic.invalid)
-		reason = semantic_activation_restart.diagnostic.reason;
 	if (reason_out != NULL)
 		*reason_out = reason;
 	return result;
@@ -13806,13 +13820,17 @@ cluster_semantic_normal_stop_poll(const char **domain_out, uint64 *key_out, cons
 		|| admission_seq != pg_atomic_read_u64(&SemanticActivationShmem->admission_seq))
 		semantic_activation_stop_note(&out, CLUSTER_NORMAL_STOP_PENDING, "R4_ADMISSION", 0,
 									  "SEMANTIC_STOP_ADMISSION_PUBLICATION_PENDING");
-	/* Project the original LMON's first failure or current send wait. Never
-	 * promote or demote the result, and never read another process's copy. */
-	if (restart->requested && !restart->opened && restart->diagnostic.reason != NULL
+	/* Enrich only an observation of this restart/ACK owner. Another
+	 * outstanding obligation retains its original priority and reason. */
+	if (!restart->opened && restart->diagnostic.nonce != 0 && restart->diagnostic.reason != NULL
+		&& (strcmp(out.domain, "R4_RESTART") == 0 || strcmp(out.domain, "R4_ACK_SEND") == 0
+			|| strcmp(out.domain, "R4_ACK_ORIGIN") == 0)
 		&& ((restart->diagnostic.invalid && out.result == CLUSTER_NORMAL_STOP_INVALID)
 			|| out.result == CLUSTER_NORMAL_STOP_PENDING)) {
-		out.domain = restart->diagnostic.kind == CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST
-					 ? "R4_ACK_ORIGIN" : "R4_ACK_SEND";
+		out.domain = restart->diagnostic.kind == 0 ? "R4_RESTART"
+					 : restart->diagnostic.kind == CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST
+						 ? "R4_ACK_ORIGIN"
+						 : "R4_ACK_SEND";
 		out.key = (uint64)restart->diagnostic.peer;
 		out.reason = restart->diagnostic.reason;
 	}

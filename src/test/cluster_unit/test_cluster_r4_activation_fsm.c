@@ -9518,6 +9518,102 @@ UT_TEST(test_restart_wait_diagnostic_tracks_current_peer_and_logs_once)
 	test_gate_reset();
 }
 
+UT_TEST(test_restart_initial_record_failure_has_original_read_diagnostic)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		ClusterSemanticActivationReadRequest read;
+		ClusterSemanticActivationRecord open;
+		uint8 bytes[512], root[512];
+		const char *domain, *reason;
+		uint64 key;
+		const char *expected = fault == 0 ? "SEMANTIC_RESTART_RECORD_INVALID"
+										  : "SEMANTIC_RESTART_RECORD_IDENTITY_INVALID";
+
+		ut_a142_setup(0);
+		MyAuxProcType = LmonProcess;
+		ut_a148_ready_input();
+		test_capture_activation_log = true;
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT(cluster_semantic_activation_qvotec_poll_record_read(&read));
+		ut_a142_open_bytes(bytes, fault);
+		UT_ASSERT(cluster_semantic_activation_qvotec_complete_record_read(
+			read.request_seq, CLUSTER_SEMANTIC_ACTIVATION_OK, false, bytes));
+		if (fault == 0)
+			SemanticActivationShmem->record_cas_desired_bytes[511] ^= 1;
+		for (int tick = 0; tick < 3; tick++) {
+			cluster_semantic_activation_lmon_tick();
+			UT_ASSERT(semantic_activation_restart.failed);
+			UT_ASSERT(!semantic_activation_restart.requested);
+			UT_ASSERT(!semantic_activation_restart.opened);
+			UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+						 CLUSTER_NORMAL_STOP_INVALID);
+			UT_ASSERT_STR_EQ(domain, "R4_RESTART");
+			UT_ASSERT_STR_EQ(reason, expected);
+			UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&open, root, NULL, &reason),
+						 CLUSTER_NORMAL_STOP_INVALID);
+			UT_ASSERT_STR_EQ(reason, expected);
+		}
+		UT_ASSERT_EQ(semantic_activation_restart.diagnostic.nonce, read.request_seq);
+		UT_ASSERT_EQ(test_activation_diag_logs, 1);
+		UT_ASSERT_EQ(test_send_calls[1] + test_send_calls[2] + test_send_calls[3], 0);
+		test_gate_reset();
+	}
+}
+
+UT_TEST(test_restart_diagnostic_preserves_unrelated_stop_obligation)
+{
+	for (int invalid = 0; invalid < 2; invalid++) {
+		const char *domain, *reason;
+		uint64 key;
+		ut_s17_waiting_ack();
+		if (invalid) {
+			test_capability_missing_bitmap = 0;
+			test_send_results[1] = CLUSTER_IC_SEND_HARD_ERROR;
+			cluster_semantic_activation_lmon_tick();
+			UT_ASSERT(semantic_activation_restart.failed);
+			semantic_activation_local_inflight[1][5] = 2;
+		}
+		pg_atomic_write_u32(&SemanticActivationShmem->inflight[1][5], 1);
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+					 invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_STR_EQ(domain, "R4_ADMISSION");
+		UT_ASSERT_STR_EQ(reason, invalid ? "SEMANTIC_STOP_LOCAL_DEBT_EXCEEDS_SHARED"
+										 : "SEMANTIC_STOP_ADMISSION_PENDING");
+		UT_ASSERT_EQ(key, 69);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&SemanticActivationShmem->inflight[1][5]), 1);
+		test_gate_reset();
+	}
+}
+
+UT_TEST(test_restart_authority_diagnostic_uses_restart_domain)
+{
+	const char *domain, *reason;
+	uint64 key;
+	ut_s17_waiting_ack();
+	test_initial_clean_snapshot_valid = false;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_STR_EQ(domain, "R4_RESTART");
+	UT_ASSERT_STR_EQ(reason, "SEMANTIC_RESTART_AUTHORITY_PENDING");
+	UT_ASSERT(!semantic_activation_restart.opened);
+	test_gate_reset();
+}
+
+UT_TEST(test_restart_diagnostic_does_not_hide_invalid_stop_reader)
+{
+	const char *reason;
+	uint8 root[512];
+	ut_s17_waiting_ack();
+	test_current_epoch++;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT(semantic_activation_restart.diagnostic.invalid);
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(NULL, root, NULL, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "SEMANTIC_STOP_READ_INVALID");
+	test_gate_reset();
+}
+
 UT_TEST(test_restart_epoch_change_retires_the_old_missing_peer_diagnostic)
 {
 	const char *domain, *reason;
@@ -9532,6 +9628,7 @@ UT_TEST(test_restart_epoch_change_retires_the_old_missing_peer_diagnostic)
 		UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
 					 CLUSTER_NORMAL_STOP_PENDING);
 		UT_ASSERT_STR_EQ(reason, "SEMANTIC_RESTART_EPOCH_CHANGED");
+		UT_ASSERT_STR_EQ(domain, "R4_RESTART");
 		UT_ASSERT_EQ(key, 3);
 		UT_ASSERT(!semantic_activation_restart.opened);
 	}
@@ -10952,7 +11049,7 @@ UT_TEST(test_a148_stop_poll_includes_original_phase3_handoff)
 int
 main(void)
 {
-	UT_PLAN(318);
+	UT_PLAN(322);
 	UT_RUN(test_normal_actual_finish_preserves_unconfigured_native_startup);
 	UT_RUN(test_normal_start_pending_ack_does_not_reuse_root_after_valid_mirror_drift);
 	UT_RUN(test_normal_start_confirmed_new_root_permanently_rejects_old_completion);
@@ -11224,6 +11321,10 @@ main(void)
 	UT_RUN(test_clean_restart_missing_fanout_peer_retries_before_open);
 	UT_RUN(test_clean_restart_missing_request_peer_retains_same_round);
 	UT_RUN(test_restart_wait_diagnostic_tracks_current_peer_and_logs_once);
+	UT_RUN(test_restart_initial_record_failure_has_original_read_diagnostic);
+	UT_RUN(test_restart_diagnostic_preserves_unrelated_stop_obligation);
+	UT_RUN(test_restart_authority_diagnostic_uses_restart_domain);
+	UT_RUN(test_restart_diagnostic_does_not_hide_invalid_stop_reader);
 	UT_RUN(test_restart_epoch_change_retires_the_old_missing_peer_diagnostic);
 	UT_RUN(test_restart_final_record_contradiction_retains_first_diagnostic);
 	UT_RUN(test_restart_invalidation_keeps_first_reason_through_normal_stop);
