@@ -250,6 +250,9 @@ class SendC1GateTests(unittest.TestCase):
                 empty_object = unit_build / "cluster_unit_port_stubs.o"
                 subprocess.run(shlex.split(compiler) + ["-c", str(empty_source),
                                "-o", str(empty_object)], check=True, capture_output=True)
+                for dependency in ("test_cluster_page_wal_product.o",
+                                   "test_cluster_page_data_stable.o"):
+                    (unit_build / dependency).write_bytes(empty_object.read_bytes())
                 for library in ("common/libpgcommon_srv.a", "port/libpgport_srv.a"):
                     archive = build_root / "src" / library
                     archive.parent.mkdir(parents=True, exist_ok=True)

@@ -552,6 +552,9 @@ def _compile_mutation_binary(
                 str(unit_source / "test_cluster_pcm_lock.c"),
                 str(backend_build / "cluster_version.o"),
                 str(mutated_object),
+                str(unit_directory / "test_cluster_page_wal_product.o"),
+                str(unit_directory / "test_cluster_page_data_stable.o"),
+                "-Wl,-dead_strip" if sys.platform == "darwin" else "-Wl,--gc-sections",
                 str(backend_build / "cluster_resource_x_identity.o"),
                 str(backend_build / "cluster_resource_x_node_wire.o"),
             ]
