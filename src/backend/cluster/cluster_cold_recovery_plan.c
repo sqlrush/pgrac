@@ -72,35 +72,86 @@ typedef struct ColdParticipant {
 	uint64 replay_records; /* fed records ending after native redo */
 } ColdParticipant;
 
+/*
+ * Storage is compact: the page namespace (system identifier, storage UUID)
+ * is plan-wide; a component names its page by an interned relation fork
+ * and its block; both of its versions share one interned segment
+ * incarnation (an ABSENT before-state has none); and expected state and
+ * dependency are derived from chain links when a step is read.  Records
+ * and components live in fixed-size chunks, so growth never doubles the
+ * footprint.
+ */
+#define COLD_CHUNK_SHIFT 10
+#define COLD_CHUNK_ENTRIES (UINT32_C(1) << COLD_CHUNK_SHIFT)
+#define COLD_CHUNK_MASK (COLD_CHUNK_ENTRIES - 1)
+
 typedef struct ColdRecord {
 	XLogRecPtr read_rec_ptr;
 	XLogRecPtr end_rec_ptr;
 	uint64 scn;
 	uint32 record_crc;
-	uint32 participant; /* canonical index */
 	uint32 first_component;
-	uint16 component_count;
+	uint8 participant; /* canonical index */
+	uint8 component_count;
 	uint8 rmid;
 	uint8 info;
-	bool history;
-	bool scheduled;
+	uint8 flags; /* COLD_RECORD_* */
 } ColdRecord;
 
+#define COLD_RECORD_HISTORY 0x01
+#define COLD_RECORD_SCHEDULED 0x02
+
+StaticAssertDecl(CLUSTER_COLD_MAX_PARTICIPANTS <= UINT8_MAX + 1,
+				 "canonical participant index must fit ColdRecord");
+StaticAssertDecl(CLUSTER_COLD_MAX_COMPONENTS <= UINT8_MAX, "component count must fit ColdRecord");
+
+/* Interned relation fork; the plan-wide namespace completes the page. */
+typedef struct ColdRelation {
+	RelFileLocator locator;
+	uint32 forknum;
+} ColdRelation;
+
+/* Interned segment incarnation of one relation fork. */
+typedef struct ColdSegment {
+	uint32 relation;
+	uint8 incarnation[16];
+} ColdSegment;
+
 typedef struct ColdComponent {
-	RfPageIdentityV1 page;
-	RfPageVersionV1 before;
-	RfPageVersionV1 result;
-	RfPageVersionV1 expected_before;
+	uint64 before_token; /* 0 unless the before-state is PRESENT */
+	uint64 result_token;
+	uint32 segment; /* (relation, result incarnation) */
+	BlockNumber blockno;
 	uint32 record;
-	uint32 dependency; /* record index or CLUSTER_COLD_NO_INDEX */
-	uint32 predecessor;
-	uint32 successor;
+	uint32 link; /* seal: chain predecessor; sealed APPLY: expected source */
 	uint16 edge_flags;
 	uint8 block_id;
 	uint8 before_kind;
 	uint8 verdict;
-	uint8 expected_kind;
+	uint8 state; /* COLD_STATE_* */
 } ColdComponent;
+
+/*
+ * A sealed APPLY component expects the result of its link (the chain
+ * predecessor, whose record it depends on) unless it is the first applied
+ * component of its page.  That one expects DATA: with EXACT, the observed
+ * state of kind DATA_KIND, whose version is link's result, or link's
+ * before-state with DATA_BEFORE; without EXACT, any content (an anchor).
+ */
+#define COLD_STATE_FIRST_APPLY 0x01
+#define COLD_STATE_EXACT 0x02
+#define COLD_STATE_DATA_BEFORE 0x04
+#define COLD_STATE_DATA_KIND_SHIFT 4
+#define COLD_STATE_DATA_KIND_MASK 0x03
+
+/* Open-addressing intern table; slots hold entry index + 1. */
+typedef struct ColdIntern {
+	char *entries;
+	uint32 count;
+	uint32 capacity;
+	uint32 *slots;
+	uint32 slot_count; /* power of two */
+} ColdIntern;
 
 struct ClusterColdPlanV1 {
 	uint32 magic;
@@ -113,12 +164,16 @@ struct ClusterColdPlanV1 {
 	Size memory_used;
 	ColdParticipant *participants; /* canonical order */
 	uint32 *canonical;			   /* caller index -> canonical index */
-	ColdRecord *records;
+	ColdRecord **record_chunks;
 	uint32 record_count;
-	uint32 record_capacity;
-	ColdComponent *components;
+	uint32 record_chunk_count;
+	uint32 record_chunk_capacity;
+	ColdComponent **component_chunks;
 	uint32 component_count;
-	uint32 component_capacity;
+	uint32 component_chunk_count;
+	uint32 component_chunk_capacity;
+	ColdIntern relations; /* ColdRelation */
+	ColdIntern segments;  /* ColdSegment */
 	uint32 *schedule;
 	uint32 schedule_count;
 };
@@ -128,11 +183,42 @@ typedef struct ColdSealWork {
 	uint32 *by_page;
 	uint32 *by_result;
 	uint32 *chain;
+	uint32 *successor; /* per component, during chain linking */
 	uint32 *lists;
 	uint32 *list_start;
 	uint32 *list_next;
 	Size bytes;
 } ColdSealWork;
+
+static inline ColdRecord *
+cold_record(const ClusterColdPlanV1 *plan, uint32 index)
+{
+	return &plan->record_chunks[index >> COLD_CHUNK_SHIFT][index & COLD_CHUNK_MASK];
+}
+
+static inline ColdComponent *
+cold_component(const ClusterColdPlanV1 *plan, uint32 index)
+{
+	return &plan->component_chunks[index >> COLD_CHUNK_SHIFT][index & COLD_CHUNK_MASK];
+}
+
+static inline const ColdSegment *
+cold_segment(const ClusterColdPlanV1 *plan, uint32 index)
+{
+	return &((const ColdSegment *)plan->segments.entries)[index];
+}
+
+static inline const ColdRelation *
+cold_relation(const ClusterColdPlanV1 *plan, uint32 index)
+{
+	return &((const ColdRelation *)plan->relations.entries)[index];
+}
+
+static inline bool
+record_history(const ClusterColdPlanV1 *plan, uint32 record)
+{
+	return (cold_record(plan, record)->flags & COLD_RECORD_HISTORY) != 0;
+}
 
 static bool
 bytes_nonzero(const uint8 *bytes, Size size)
@@ -167,19 +253,6 @@ incarnation_equal(const RfPageVersionV1 *left, const RfPageVersionV1 *right)
 	return memcmp(left->segment_incarnation, right->segment_incarnation,
 				  sizeof(left->segment_incarnation))
 		   == 0;
-}
-
-static int
-version_compare(const RfPageVersionV1 *left, const RfPageVersionV1 *right)
-{
-	int cmp = memcmp(left->segment_incarnation, right->segment_incarnation,
-					 sizeof(left->segment_incarnation));
-
-	if (cmp != 0)
-		return cmp;
-	if (left->mutation_token != right->mutation_token)
-		return left->mutation_token < right->mutation_token ? -1 : 1;
-	return 0;
 }
 
 static int
@@ -253,6 +326,252 @@ plan_grow(ClusterColdPlanV1 *plan, void **array, uint32 *capacity, uint32 requir
 	*array = grown;
 	*capacity = wanted;
 	return CLUSTER_COLD_OK;
+}
+
+/* Make room for `required` entries of a chunked array, accounting first. */
+static ClusterColdDetailV1
+chunk_reserve(ClusterColdPlanV1 *plan, void ***chunks, uint32 *chunk_count, uint32 *chunk_capacity,
+			  uint64 required, Size element)
+{
+	uint64 needed = (required + COLD_CHUNK_MASK) >> COLD_CHUNK_SHIFT;
+
+	if (required > UINT32_MAX)
+		return CLUSTER_COLD_CAPACITY;
+	while (*chunk_count < needed) {
+		void *chunk;
+
+		if (*chunk_count == *chunk_capacity) {
+			uint32 wanted = *chunk_capacity == 0 ? 16 : *chunk_capacity * 2;
+			Size delta = (Size)(wanted - *chunk_capacity) * sizeof(void *);
+			void **grown;
+
+			if (!plan_reserve(plan, delta))
+				return CLUSTER_COLD_CAPACITY;
+			grown = (void **)cold_realloc(*chunks, (Size)wanted * sizeof(void *));
+			if (grown == NULL) {
+				plan_release(plan, delta);
+				return CLUSTER_COLD_OOM;
+			}
+			*chunks = grown;
+			*chunk_capacity = wanted;
+		}
+		if (!plan_reserve(plan, (Size)COLD_CHUNK_ENTRIES * element))
+			return CLUSTER_COLD_CAPACITY;
+		chunk = cold_alloc0((Size)COLD_CHUNK_ENTRIES * element);
+		if (chunk == NULL) {
+			plan_release(plan, (Size)COLD_CHUNK_ENTRIES * element);
+			return CLUSTER_COLD_OOM;
+		}
+		(*chunks)[(*chunk_count)++] = chunk;
+	}
+	return CLUSTER_COLD_OK;
+}
+
+static uint32
+intern_hash(const void *key, Size size)
+{
+	const uint8 *bytes = (const uint8 *)key;
+	uint32 hash = UINT32_C(2166136261);
+	Size i;
+
+	for (i = 0; i < size; i++) {
+		hash ^= bytes[i];
+		hash *= UINT32_C(16777619);
+	}
+	return hash;
+}
+
+static ClusterColdDetailV1
+intern_rehash(ClusterColdPlanV1 *plan, ColdIntern *intern, Size key_size, uint32 slot_count)
+{
+	Size bytes = (Size)slot_count * sizeof(uint32);
+	uint32 *slots;
+	uint32 i;
+
+	if (!plan_reserve(plan, bytes))
+		return CLUSTER_COLD_CAPACITY;
+	slots = (uint32 *)cold_alloc0(bytes);
+	if (slots == NULL) {
+		plan_release(plan, bytes);
+		return CLUSTER_COLD_OOM;
+	}
+	for (i = 0; i < intern->count; i++) {
+		uint32 at = intern_hash(intern->entries + (Size)i * key_size, key_size) & (slot_count - 1);
+
+		while (slots[at] != 0)
+			at = (at + 1) & (slot_count - 1);
+		slots[at] = i + 1;
+	}
+	if (intern->slots != NULL) {
+		cold_free(intern->slots);
+		plan_release(plan, (Size)intern->slot_count * sizeof(uint32));
+	}
+	intern->slots = slots;
+	intern->slot_count = slot_count;
+	return CLUSTER_COLD_OK;
+}
+
+/* Index of `key` in the table, adding it when new. */
+static ClusterColdDetailV1
+intern_lookup(ClusterColdPlanV1 *plan, ColdIntern *intern, const void *key, Size key_size,
+			  uint32 *out)
+{
+	ClusterColdDetailV1 detail;
+	uint32 at;
+
+	if (intern->count >= UINT32_MAX / 4)
+		return CLUSTER_COLD_CAPACITY;
+	if ((uint64)(intern->count + 1) * 2 > intern->slot_count) {
+		detail = intern_rehash(plan, intern, key_size,
+							   intern->slot_count == 0 ? 64 : intern->slot_count * 2);
+		if (detail != CLUSTER_COLD_OK)
+			return detail;
+	}
+	at = intern_hash(key, key_size) & (intern->slot_count - 1);
+	while (intern->slots[at] != 0) {
+		uint32 index = intern->slots[at] - 1;
+
+		if (memcmp(intern->entries + (Size)index * key_size, key, key_size) == 0) {
+			*out = index;
+			return CLUSTER_COLD_OK;
+		}
+		at = (at + 1) & (intern->slot_count - 1);
+	}
+	detail = plan_grow(plan, (void **)&intern->entries, &intern->capacity, intern->count + 1,
+					   key_size);
+	if (detail != CLUSTER_COLD_OK)
+		return detail;
+	memcpy(intern->entries + (Size)intern->count * key_size, key, key_size);
+	intern->slots[at] = intern->count + 1;
+	*out = intern->count++;
+	return CLUSTER_COLD_OK;
+}
+
+static void
+intern_free(ColdIntern *intern)
+{
+	if (intern->entries != NULL)
+		cold_free(intern->entries);
+	if (intern->slots != NULL)
+		cold_free(intern->slots);
+	memset(intern, 0, sizeof(*intern));
+}
+
+static RfPageVersionV1
+component_result(const ClusterColdPlanV1 *plan, const ColdComponent *component)
+{
+	RfPageVersionV1 version;
+
+	memcpy(version.segment_incarnation, cold_segment(plan, component->segment)->incarnation,
+		   sizeof(version.segment_incarnation));
+	version.mutation_token = component->result_token;
+	return version;
+}
+
+static RfPageVersionV1
+component_before(const ClusterColdPlanV1 *plan, const ColdComponent *component)
+{
+	RfPageVersionV1 version;
+
+	memset(&version, 0, sizeof(version));
+	if (component->before_kind != RF_PAGE_STATE_ABSENT)
+		memcpy(version.segment_incarnation, cold_segment(plan, component->segment)->incarnation,
+			   sizeof(version.segment_incarnation));
+	version.mutation_token = component->before_token;
+	return version;
+}
+
+static bool
+segment_incarnation_is(const ClusterColdPlanV1 *plan, const ColdComponent *component,
+					   const RfPageVersionV1 *version)
+{
+	return memcmp(cold_segment(plan, component->segment)->incarnation, version->segment_incarnation,
+				  sizeof(version->segment_incarnation))
+		   == 0;
+}
+
+static RfPageIdentityV1
+component_page(const ClusterColdPlanV1 *plan, const ColdComponent *component)
+{
+	const ColdRelation *relation
+		= cold_relation(plan, cold_segment(plan, component->segment)->relation);
+	RfPageIdentityV1 page;
+
+	memset(&page, 0, sizeof(page));
+	page.system_identifier = plan->system_identifier;
+	memcpy(page.storage_uuid, plan->storage_uuid, sizeof(page.storage_uuid));
+	page.locator = relation->locator;
+	page.forknum = relation->forknum;
+	page.blockno = component->blockno;
+	return page;
+}
+
+/* Canonical page order: relation fork fields, then block. */
+static int
+page_compare(const ClusterColdPlanV1 *plan, const ColdComponent *left, const ColdComponent *right)
+{
+	uint32 lrel = cold_segment(plan, left->segment)->relation;
+	uint32 rrel = cold_segment(plan, right->segment)->relation;
+
+	if (lrel != rrel) {
+		const ColdRelation *a = cold_relation(plan, lrel);
+		const ColdRelation *b = cold_relation(plan, rrel);
+
+#define COLD_CMP_FIELD(field_)                                                                     \
+	do {                                                                                           \
+		if (a->field_ != b->field_)                                                                \
+			return a->field_ < b->field_ ? -1 : 1;                                                 \
+	} while (0)
+		COLD_CMP_FIELD(locator.spcOid);
+		COLD_CMP_FIELD(locator.dbOid);
+		COLD_CMP_FIELD(locator.relNumber);
+		COLD_CMP_FIELD(forknum);
+#undef COLD_CMP_FIELD
+	}
+	if (left->blockno != right->blockno)
+		return left->blockno < right->blockno ? -1 : 1;
+	return 0;
+}
+
+/* Expected state of an applied component (see COLD_STATE_*). */
+static void
+component_expected(const ClusterColdPlanV1 *plan, const ColdComponent *component,
+				   ClusterColdBlockStepV1 *block)
+{
+	const ColdComponent *source;
+	uint8 kind;
+
+	if ((component->state & COLD_STATE_FIRST_APPLY) == 0) {
+		block->expected_kind = CLUSTER_COLD_DATA_PRESENT;
+		block->expected_before = component_result(plan, cold_component(plan, component->link));
+		return;
+	}
+	if ((component->state & COLD_STATE_EXACT) == 0) {
+		block->expected_kind = CLUSTER_COLD_DATA_INVALID;
+		return;
+	}
+	kind = (component->state >> COLD_STATE_DATA_KIND_SHIFT) & COLD_STATE_DATA_KIND_MASK;
+	source = cold_component(plan, component->link);
+	block->expected_kind = kind;
+	if (kind == CLUSTER_COLD_DATA_PRESENT)
+		block->expected_before = (component->state & COLD_STATE_DATA_BEFORE) != 0
+									 ? component_before(plan, source)
+									 : component_result(plan, source);
+	else if (kind == CLUSTER_COLD_DATA_UNFORMATTED)
+		memcpy(block->expected_before.segment_incarnation,
+			   cold_segment(plan, source->segment)->incarnation,
+			   sizeof(block->expected_before.segment_incarnation));
+}
+
+/* Record whose result an applied component's before-state is. */
+static uint32
+component_dependency(const ClusterColdPlanV1 *plan, const ColdComponent *component)
+{
+	if (component->verdict < CLUSTER_COLD_BLOCK_APPLY_DELTA
+		|| (component->state & COLD_STATE_FIRST_APPLY) != 0
+		|| component->link == CLUSTER_COLD_NO_INDEX)
+		return CLUSTER_COLD_NO_INDEX;
+	return cold_component(plan, component->link)->record;
 }
 
 static bool
@@ -432,6 +751,7 @@ record_cursor_check(const ColdParticipant *participant, const ClusterColdRecordV
 static ClusterColdDetailV1
 record_store(ClusterColdPlanV1 *plan, uint32 canonical, const ClusterColdRecordV1 *record)
 {
+	uint32 segments[CLUSTER_COLD_MAX_COMPONENTS];
 	ColdRecord *stored;
 	ClusterColdDetailV1 detail;
 	uint16 i;
@@ -439,37 +759,57 @@ record_store(ClusterColdPlanV1 *plan, uint32 canonical, const ClusterColdRecordV
 	if (plan->record_count == UINT32_MAX
 		|| (uint64)plan->component_count + record->component_count > UINT32_MAX)
 		return CLUSTER_COLD_CAPACITY;
-	detail = plan_grow(plan, (void **)&plan->records, &plan->record_capacity,
-					   plan->record_count + 1, sizeof(ColdRecord));
+	detail = chunk_reserve(plan, (void ***)&plan->record_chunks, &plan->record_chunk_count,
+						   &plan->record_chunk_capacity, (uint64)plan->record_count + 1,
+						   sizeof(ColdRecord));
 	if (detail == CLUSTER_COLD_OK)
-		detail = plan_grow(plan, (void **)&plan->components, &plan->component_capacity,
-						   plan->component_count + record->component_count, sizeof(ColdComponent));
+		detail = chunk_reserve(plan, (void ***)&plan->component_chunks,
+							   &plan->component_chunk_count, &plan->component_chunk_capacity,
+							   (uint64)plan->component_count + record->component_count,
+							   sizeof(ColdComponent));
+	/* Intern every page before storing anything; the incarnation of the
+	 * before-state equals the result's unless it is ABSENT (validated). */
+	for (i = 0; i < record->component_count && detail == CLUSTER_COLD_OK; i++) {
+		const ClusterColdComponentV1 *source = &record->components[i];
+		ColdRelation relation;
+		ColdSegment segment;
+
+		memset(&relation, 0, sizeof(relation));
+		relation.locator = source->page.locator;
+		relation.forknum = source->page.forknum;
+		memset(&segment, 0, sizeof(segment));
+		detail
+			= intern_lookup(plan, &plan->relations, &relation, sizeof(relation), &segment.relation);
+		memcpy(segment.incarnation, source->result.segment_incarnation, 16);
+		if (detail == CLUSTER_COLD_OK)
+			detail = intern_lookup(plan, &plan->segments, &segment, sizeof(segment), &segments[i]);
+	}
 	if (detail != CLUSTER_COLD_OK)
 		return detail;
-	stored = &plan->records[plan->record_count];
+	stored = cold_record(plan, plan->record_count);
 	memset(stored, 0, sizeof(*stored));
 	stored->read_rec_ptr = record->read_rec_ptr;
 	stored->end_rec_ptr = record->end_rec_ptr;
 	stored->scn = record->scn;
 	stored->record_crc = record->record_crc;
-	stored->participant = canonical;
+	stored->participant = (uint8)canonical;
 	stored->first_component = plan->component_count;
-	stored->component_count = record->component_count;
+	stored->component_count = (uint8)record->component_count;
 	stored->rmid = record->rmid;
 	stored->info = record->info;
-	stored->history = record->end_rec_ptr <= plan->participants[canonical].cut.native_redo;
+	if (record->end_rec_ptr <= plan->participants[canonical].cut.native_redo)
+		stored->flags |= COLD_RECORD_HISTORY;
 	for (i = 0; i < record->component_count; i++) {
 		const ClusterColdComponentV1 *source = &record->components[i];
-		ColdComponent *component = &plan->components[plan->component_count + i];
+		ColdComponent *component = cold_component(plan, plan->component_count + i);
 
 		memset(component, 0, sizeof(*component));
-		component->page = source->page;
-		component->before = source->before;
-		component->result = source->result;
+		component->before_token = source->before.mutation_token;
+		component->result_token = source->result.mutation_token;
+		component->segment = segments[i];
+		component->blockno = source->page.blockno;
 		component->record = plan->record_count;
-		component->dependency = CLUSTER_COLD_NO_INDEX;
-		component->predecessor = CLUSTER_COLD_NO_INDEX;
-		component->successor = CLUSTER_COLD_NO_INDEX;
+		component->link = CLUSTER_COLD_NO_INDEX;
 		component->edge_flags = source->edge_flags;
 		component->block_id = source->block_id;
 		component->before_kind = source->before_kind;
@@ -531,7 +871,7 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 static void
 diag_record(const ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag, uint32 record)
 {
-	const ColdRecord *stored = &plan->records[record];
+	const ColdRecord *stored = cold_record(plan, record);
 
 	diag->has_record = true;
 	diag->participant = plan->participants[stored->participant].input_index;
@@ -541,20 +881,22 @@ diag_record(const ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag, uint32 recor
 static void
 diag_component(const ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag, uint32 component)
 {
-	diag_record(plan, diag, plan->components[component].record);
+	const ColdComponent *stored = cold_component(plan, component);
+
+	diag_record(plan, diag, stored->record);
 	diag->has_page = true;
-	diag->page = plan->components[component].page;
+	diag->page = component_page(plan, stored);
 }
 
 static int
 by_page_compare(const void *left, const void *right, void *arg)
 {
 	const ClusterColdPlanV1 *plan = (const ClusterColdPlanV1 *)arg;
-	const ColdComponent *a = &plan->components[*(const uint32 *)left];
-	const ColdComponent *b = &plan->components[*(const uint32 *)right];
-	const ColdRecord *ra = &plan->records[a->record];
-	const ColdRecord *rb = &plan->records[b->record];
-	int cmp = identity_compare(&a->page, &b->page);
+	const ColdComponent *a = cold_component(plan, *(const uint32 *)left);
+	const ColdComponent *b = cold_component(plan, *(const uint32 *)right);
+	const ColdRecord *ra = cold_record(plan, a->record);
+	const ColdRecord *rb = cold_record(plan, b->record);
+	int cmp = page_compare(plan, a, b);
 
 	if (cmp != 0)
 		return cmp;
@@ -565,29 +907,35 @@ by_page_compare(const void *left, const void *right, void *arg)
 	return 0;
 }
 
+/* Within one page: by (segment incarnation, result token). */
 static int
 by_result_compare(const void *left, const void *right, void *arg)
 {
 	const ClusterColdPlanV1 *plan = (const ClusterColdPlanV1 *)arg;
+	const ColdComponent *a = cold_component(plan, *(const uint32 *)left);
+	const ColdComponent *b = cold_component(plan, *(const uint32 *)right);
 
-	return version_compare(&plan->components[*(const uint32 *)left].result,
-						   &plan->components[*(const uint32 *)right].result);
+	if (a->segment != b->segment)
+		return a->segment < b->segment ? -1 : 1;
+	if (a->result_token != b->result_token)
+		return a->result_token < b->result_token ? -1 : 1;
+	return 0;
 }
 
 static uint32
-find_result(const ClusterColdPlanV1 *plan, const uint32 *by_result, uint32 count,
-			const RfPageVersionV1 *version)
+find_result(const ClusterColdPlanV1 *plan, const uint32 *by_result, uint32 count, uint32 segment,
+			uint64 token)
 {
 	uint32 low = 0;
 	uint32 high = count;
 
 	while (low < high) {
 		uint32 middle = low + (high - low) / 2;
-		int cmp = version_compare(&plan->components[by_result[middle]].result, version);
+		const ColdComponent *probe = cold_component(plan, by_result[middle]);
 
-		if (cmp == 0)
+		if (probe->segment == segment && probe->result_token == token)
 			return by_result[middle];
-		if (cmp < 0)
+		if (probe->segment < segment || (probe->segment == segment && probe->result_token < token))
 			low = middle + 1;
 		else
 			high = middle;
@@ -600,9 +948,12 @@ find_result(const ClusterColdPlanV1 *plan, const uint32 *by_result, uint32 count
  * chain receives the components from the chain start to its terminal.
  */
 static ClusterColdDetailV1
-page_chain_link(ClusterColdPlanV1 *plan, const uint32 *group, uint32 count, uint32 *by_result,
-				uint32 *chain, ClusterColdDiagV1 *diag)
+page_chain_link(ClusterColdPlanV1 *plan, const uint32 *group, uint32 count, ColdSealWork *work,
+				ClusterColdDiagV1 *diag)
 {
+	uint32 *by_result = work->by_result;
+	uint32 *chain = work->chain;
+	uint32 *successor = work->successor;
 	uint32 start = CLUSTER_COLD_NO_INDEX;
 	uint32 walked = 0;
 	uint32 i;
@@ -610,43 +961,46 @@ page_chain_link(ClusterColdPlanV1 *plan, const uint32 *group, uint32 count, uint
 	memcpy(by_result, group, (Size)count * sizeof(uint32));
 	qsort_arg(by_result, count, sizeof(uint32), by_result_compare, plan);
 	for (i = 1; i < count; i++)
-		if (version_equal(&plan->components[by_result[i - 1]].result,
-						  &plan->components[by_result[i]].result)) {
+		if (by_result_compare(&by_result[i - 1], &by_result[i], plan) == 0) {
 			diag_component(plan, diag, by_result[i]);
 			return CLUSTER_COLD_EDGE_CYCLE;
 		}
+	for (i = 0; i < count; i++)
+		successor[group[i]] = CLUSTER_COLD_NO_INDEX;
 	for (i = 0; i < count; i++) {
-		ColdComponent *component = &plan->components[group[i]];
+		ColdComponent *component = cold_component(plan, group[i]);
 		uint32 predecessor = CLUSTER_COLD_NO_INDEX;
 
 		if (component->before_kind == RF_PAGE_STATE_PRESENT)
-			predecessor = find_result(plan, by_result, count, &component->before);
-		component->predecessor = predecessor;
+			predecessor
+				= find_result(plan, by_result, count, component->segment, component->before_token);
+		component->link = predecessor;
 		if (predecessor == CLUSTER_COLD_NO_INDEX) {
 			if (start != CLUSTER_COLD_NO_INDEX) {
-				const ColdComponent *first = &plan->components[start];
+				const ColdComponent *first = cold_component(plan, start);
+				bool same_start = first->before_kind == component->before_kind
+								  && (component->before_kind == RF_PAGE_STATE_ABSENT
+									  || (first->segment == component->segment
+										  && first->before_token == component->before_token));
 
 				/* Two starts from one version is a fork; otherwise an edge
 				 * is missing or a second incarnation needs its SPACE owner. */
 				diag_component(plan, diag, group[i]);
-				return first->before_kind == component->before_kind
-							   && version_equal(&first->before, &component->before)
-						   ? CLUSTER_COLD_EDGE_BRANCH
-						   : CLUSTER_COLD_CHAIN_AMBIGUOUS;
+				return same_start ? CLUSTER_COLD_EDGE_BRANCH : CLUSTER_COLD_CHAIN_AMBIGUOUS;
 			}
 			start = group[i];
 			continue;
 		}
-		if (plan->components[predecessor].successor != CLUSTER_COLD_NO_INDEX) {
+		if (successor[predecessor] != CLUSTER_COLD_NO_INDEX) {
 			diag_component(plan, diag, group[i]);
 			return CLUSTER_COLD_EDGE_BRANCH;
 		}
-		plan->components[predecessor].successor = group[i];
+		successor[predecessor] = group[i];
 	}
-	for (i = start; i != CLUSTER_COLD_NO_INDEX && walked < count; i = plan->components[i].successor)
+	for (i = start; i != CLUSTER_COLD_NO_INDEX && walked < count; i = successor[i])
 		chain[walked++] = i;
 	if (start == CLUSTER_COLD_NO_INDEX || walked != count
-		|| plan->components[chain[count - 1]].successor != CLUSTER_COLD_NO_INDEX) {
+		|| successor[chain[count - 1]] != CLUSTER_COLD_NO_INDEX) {
 		diag_component(plan, diag, group[0]);
 		return CLUSTER_COLD_EDGE_CYCLE;
 	}
@@ -689,12 +1043,12 @@ page_earliest_replayable_anchor(const ClusterColdPlanV1 *plan, const uint32 *cha
 	uint32 i;
 
 	for (i = count; i > 0; i--)
-		if (plan->records[plan->components[chain[i - 1]].record].history) {
+		if (record_history(plan, cold_component(plan, chain[i - 1])->record)) {
 			start = i;
 			break;
 		}
 	for (i = start; i < count && (int64)i <= limit; i++)
-		if (plan->components[chain[i]].edge_flags != 0)
+		if (cold_component(plan, chain[i])->edge_flags != 0)
 			return (int64)i;
 	return -1;
 }
@@ -709,34 +1063,40 @@ static ClusterColdDetailV1
 page_header_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 					 const ClusterColdDataV1 *data, int64 *position, ClusterColdDiagV1 *diag)
 {
-	const ColdComponent *first = &plan->components[chain[0]];
+	const ColdComponent *first = cold_component(plan, chain[0]);
 	bool new_start = first->before_kind != RF_PAGE_STATE_PRESENT;
+	RfPageVersionV1 before;
 	uint32 i;
 
 	if (data->kind != CLUSTER_COLD_DATA_PRESENT) {
 		Assert(new_start);
 		*position = -1;
 		if (data->kind == CLUSTER_COLD_DATA_UNFORMATTED
-			&& !incarnation_equal(&first->result, &data->version)) {
+			&& !segment_incarnation_is(plan, first, &data->version)) {
 			diag_component(plan, diag, chain[0]);
 			diag->version = data->version;
 			return CLUSTER_COLD_INCARNATION_MISMATCH;
 		}
 		return CLUSTER_COLD_OK;
 	}
-	for (i = 0; i < count; i++)
-		if (version_equal(&plan->components[chain[i]].result, &data->version)) {
+	for (i = 0; i < count; i++) {
+		const ColdComponent *component = cold_component(plan, chain[i]);
+
+		if (component->result_token == data->version.mutation_token
+			&& segment_incarnation_is(plan, component, &data->version)) {
 			*position = (int64)i;
 			return CLUSTER_COLD_OK;
 		}
-	if (!new_start && version_equal(&first->before, &data->version)) {
+	}
+	before = component_before(plan, first);
+	if (!new_start && version_equal(&before, &data->version)) {
 		*position = -1;
 		return CLUSTER_COLD_OK;
 	}
 	diag_component(plan, diag, chain[0]);
 	diag->version = data->version;
-	return incarnation_equal(&first->result, &data->version) ? CLUSTER_COLD_ANCESTOR_MISSING
-															 : CLUSTER_COLD_INCARNATION_MISMATCH;
+	return segment_incarnation_is(plan, first, &data->version) ? CLUSTER_COLD_ANCESTOR_MISSING
+															   : CLUSTER_COLD_INCARNATION_MISMATCH;
 }
 
 /* DATA cannot be a redo base: rebuild from the earliest replayable anchor. */
@@ -769,15 +1129,15 @@ page_rebuild_from_anchor(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 co
  */
 static ClusterColdDetailV1
 page_data_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
-				   const ClusterColdDataV1 *data, int64 *covered, bool *exact,
+				   const ClusterColdDataV1 *data, int64 *covered, bool *exact, int64 *position,
 				   ClusterColdDiagV1 *diag)
 {
-	bool new_start = plan->components[chain[0]].before_kind != RF_PAGE_STATE_PRESENT;
+	bool new_start = cold_component(plan, chain[0])->before_kind != RF_PAGE_STATE_PRESENT;
 	ClusterColdDetailV1 detail;
 	int64 anchor;
-	int64 position;
 
 	*exact = true;
+	*position = -1;
 	/* Unreadable, or a new page where a formatted one was expected. */
 	if (data->kind == CLUSTER_COLD_DATA_INVALID
 		|| (data->kind != CLUSTER_COLD_DATA_PRESENT && !new_start)) {
@@ -785,7 +1145,7 @@ page_data_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 		return page_rebuild_from_anchor(plan, chain, count, data, CLUSTER_COLD_ANCHOR_MISSING,
 										count - 1, covered, diag);
 	}
-	detail = page_header_position(plan, chain, count, data, &position, diag);
+	detail = page_header_position(plan, chain, count, data, position, diag);
 	if (detail != CLUSTER_COLD_OK)
 		return detail;
 
@@ -803,8 +1163,8 @@ page_data_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 	if ((data->flags & CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED) == 0)
 		return page_rebuild_from_anchor(plan, chain, count, data, CLUSTER_COLD_CONTENT_UNPROVEN, 0,
 										covered, diag);
-	anchor = page_earliest_replayable_anchor(plan, chain, count, position + 1);
-	*covered = anchor >= 0 ? anchor - 1 : position;
+	anchor = page_earliest_replayable_anchor(plan, chain, count, *position + 1);
+	*covered = anchor >= 0 ? anchor - 1 : *position;
 	return CLUSTER_COLD_OK;
 }
 
@@ -820,34 +1180,38 @@ apply_verdict(uint16 edge_flags)
 
 static ClusterColdDetailV1
 page_assign_verdicts(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
-					 const ClusterColdDataV1 *data, int64 covered, bool exact,
+					 const ClusterColdDataV1 *data, int64 covered, bool exact, int64 position,
 					 ClusterColdDiagV1 *diag)
 {
 	uint32 i;
 
 	for (i = 0; i < count; i++) {
-		ColdComponent *component = &plan->components[chain[i]];
+		ColdComponent *component = cold_component(plan, chain[i]);
 
 		if ((int64)i <= covered) {
 			component->verdict = CLUSTER_COLD_BLOCK_SKIP;
 			continue;
 		}
-		if (plan->records[component->record].history) {
+		if (record_history(plan, component->record)) {
 			diag_component(plan, diag, chain[i]);
-			diag->version = component->before;
+			diag->version = component_before(plan, component);
 			return CLUSTER_COLD_HISTORY_GAP;
 		}
 		component->verdict = apply_verdict(component->edge_flags);
-		if ((int64)i == covered + 1) {
-			component->expected_kind = exact ? data->kind : CLUSTER_COLD_DATA_INVALID;
-			if (exact)
-				component->expected_before = data->version;
-		} else {
-			const ColdComponent *previous = &plan->components[chain[i - 1]];
-
-			component->expected_kind = CLUSTER_COLD_DATA_PRESENT;
-			component->expected_before = previous->result;
-			component->dependency = previous->record;
+		/* Later components keep link = chain predecessor (chain[i - 1]). */
+		if ((int64)i != covered + 1)
+			continue;
+		component->state = COLD_STATE_FIRST_APPLY;
+		component->link = CLUSTER_COLD_NO_INDEX;
+		if (exact) {
+			component->state
+				|= COLD_STATE_EXACT | (uint8)(data->kind << COLD_STATE_DATA_KIND_SHIFT);
+			if (position >= 0)
+				component->link = chain[position];
+			else {
+				component->link = chain[0];
+				component->state |= COLD_STATE_DATA_BEFORE;
+			}
 		}
 	}
 	return CLUSTER_COLD_OK;
@@ -859,27 +1223,30 @@ page_group_resolve(ClusterColdPlanV1 *plan, const uint32 *group, uint32 count, C
 {
 	ClusterColdDataV1 data;
 	ClusterColdDetailV1 detail;
+	RfPageIdentityV1 page;
 	bool replayable = false;
 	bool exact;
 	int64 covered;
+	int64 position;
 	uint32 i;
 
 	for (i = 0; i < count && !replayable; i++)
-		replayable = !plan->records[plan->components[group[i]].record].history;
+		replayable = !record_history(plan, cold_component(plan, group[i])->record);
 	if (!replayable)
 		return CLUSTER_COLD_OK; /* completed history: no DATA duty */
-	detail = page_chain_link(plan, group, count, work->by_result, work->chain, diag);
+	detail = page_chain_link(plan, group, count, work, diag);
 	if (detail != CLUSTER_COLD_OK)
 		return detail;
 	memset(&data, 0, sizeof(data));
-	if (!observe(arg, &plan->components[group[0]].page, &data) || !data_shape_valid(&data)) {
+	page = component_page(plan, cold_component(plan, group[0]));
+	if (!observe(arg, &page, &data) || !data_shape_valid(&data)) {
 		diag_component(plan, diag, work->chain[0]);
 		return CLUSTER_COLD_OBSERVATION_FAILED;
 	}
-	detail = page_data_position(plan, work->chain, count, &data, &covered, &exact, diag);
+	detail = page_data_position(plan, work->chain, count, &data, &covered, &exact, &position, diag);
 	if (detail != CLUSTER_COLD_OK)
 		return detail;
-	return page_assign_verdicts(plan, work->chain, count, &data, covered, exact, diag);
+	return page_assign_verdicts(plan, work->chain, count, &data, covered, exact, position, diag);
 }
 
 static ClusterColdDetailV1
@@ -922,7 +1289,7 @@ work_alloc(ClusterColdPlanV1 *plan, ColdSealWork *work, uint32 count)
 static void
 work_free(ClusterColdPlanV1 *plan, ColdSealWork *work)
 {
-	uint32 **arrays[] = { &work->by_page, &work->by_result,	 &work->chain,
+	uint32 **arrays[] = { &work->by_page, &work->by_result,	 &work->chain,	  &work->successor,
 						  &work->lists,	  &work->list_start, &work->list_next };
 	Size i;
 
@@ -946,7 +1313,9 @@ seal_pages(ClusterColdPlanV1 *plan, ColdSealWork *work, ClusterColdObserveV1 obs
 	work->by_page = work_alloc(plan, work, n);
 	work->by_result = work_alloc(plan, work, n);
 	work->chain = work_alloc(plan, work, n);
-	if (work->by_page == NULL || work->by_result == NULL || work->chain == NULL)
+	work->successor = work_alloc(plan, work, n);
+	if (work->by_page == NULL || work->by_result == NULL || work->chain == NULL
+		|| work->successor == NULL)
 		return CLUSTER_COLD_CAPACITY;
 	for (i = 0; i < n; i++)
 		work->by_page[i] = i;
@@ -955,8 +1324,8 @@ seal_pages(ClusterColdPlanV1 *plan, ColdSealWork *work, ClusterColdObserveV1 obs
 		ClusterColdDetailV1 detail;
 
 		if (i < n
-			&& identity_compare(&plan->components[work->by_page[start]].page,
-								&plan->components[work->by_page[i]].page)
+			&& page_compare(plan, cold_component(plan, work->by_page[start]),
+							cold_component(plan, work->by_page[i]))
 				   == 0)
 			continue;
 		detail
@@ -974,12 +1343,13 @@ record_ready(const ClusterColdPlanV1 *plan, const ColdRecord *record, uint32 *bl
 	uint16 i;
 
 	for (i = 0; i < record->component_count; i++) {
-		const ColdComponent *component = &plan->components[record->first_component + i];
+		uint32 dependency
+			= component_dependency(plan, cold_component(plan, record->first_component + i));
 
-		if (component->dependency != CLUSTER_COLD_NO_INDEX
-			&& !plan->records[component->dependency].scheduled) {
+		if (dependency != CLUSTER_COLD_NO_INDEX
+			&& (cold_record(plan, dependency)->flags & COLD_RECORD_SCHEDULED) == 0) {
 			if (blocking != NULL)
-				*blocking = component->dependency;
+				*blocking = dependency;
 			return false;
 		}
 	}
@@ -1010,16 +1380,16 @@ schedule_lists(ClusterColdPlanV1 *plan, ColdSealWork *work, uint32 *total)
 	if (work->lists == NULL || work->list_start == NULL || work->list_next == NULL)
 		return CLUSTER_COLD_CAPACITY;
 	for (i = 0; i < plan->record_count; i++)
-		if (!plan->records[i].history)
-			work->list_start[plan->records[i].participant + 1]++;
+		if (!record_history(plan, i))
+			work->list_start[cold_record(plan, i)->participant + 1]++;
 	for (i = 0; i < p; i++)
 		work->list_start[i + 1] += work->list_start[i];
 	*total = work->list_start[p];
 	for (i = 0; i < p; i++)
 		work->list_next[i] = work->list_start[i];
 	for (i = 0; i < plan->record_count; i++)
-		if (!plan->records[i].history)
-			work->lists[work->list_next[plan->records[i].participant]++] = i;
+		if (!record_history(plan, i))
+			work->lists[work->list_next[cold_record(plan, i)->participant]++] = i;
 	for (i = 0; i < p; i++)
 		work->list_next[i] = work->list_start[i];
 	return CLUSTER_COLD_OK;
@@ -1039,18 +1409,18 @@ schedule_deadlock(const ClusterColdPlanV1 *plan, const ColdSealWork *work, Clust
 			continue;
 		head = work->lists[work->list_next[p]];
 		if (best == CLUSTER_COLD_NO_INDEX
-			|| record_key_less(&plan->records[head], &plan->records[best]))
+			|| record_key_less(cold_record(plan, head), cold_record(plan, best)))
 			best = head;
 	}
 	if (best == CLUSTER_COLD_NO_INDEX)
 		return;
 	diag_record(plan, diag, best);
-	(void)record_ready(plan, &plan->records[best], &blocking);
+	(void)record_ready(plan, cold_record(plan, best), &blocking);
 	if (blocking != CLUSTER_COLD_NO_INDEX) {
 		diag->has_dependency = true;
 		diag->dependency_participant
-			= plan->participants[plan->records[blocking].participant].input_index;
-		diag->dependency_read_rec_ptr = plan->records[blocking].read_rec_ptr;
+			= plan->participants[cold_record(plan, blocking)->participant].input_index;
+		diag->dependency_read_rec_ptr = cold_record(plan, blocking)->read_rec_ptr;
 	}
 }
 
@@ -1082,17 +1452,17 @@ seal_schedule(ClusterColdPlanV1 *plan, ColdSealWork *work, ClusterColdDiagV1 *di
 			if (work->list_next[p] == work->list_start[p + 1])
 				continue;
 			head = work->lists[work->list_next[p]];
-			if (record_ready(plan, &plan->records[head], NULL)
+			if (record_ready(plan, cold_record(plan, head), NULL)
 				&& (best == CLUSTER_COLD_NO_INDEX
-					|| record_key_less(&plan->records[head], &plan->records[best])))
+					|| record_key_less(cold_record(plan, head), cold_record(plan, best))))
 				best = head;
 		}
 		if (best == CLUSTER_COLD_NO_INDEX) {
 			schedule_deadlock(plan, work, diag);
 			return CLUSTER_COLD_DEADLOCK;
 		}
-		plan->records[best].scheduled = true;
-		work->list_next[plan->records[best].participant]++;
+		cold_record(plan, best)->flags |= COLD_RECORD_SCHEDULED;
+		work->list_next[cold_record(plan, best)->participant]++;
 		plan->schedule[plan->schedule_count++] = best;
 	}
 	return CLUSTER_COLD_OK;
@@ -1147,7 +1517,7 @@ cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 index, ClusterCo
 	if (out == NULL || !plan_valid(plan) || plan->phase != COLD_PHASE_SEALED
 		|| index >= plan->schedule_count)
 		return false;
-	record = &plan->records[plan->schedule[index]];
+	record = cold_record(plan, plan->schedule[index]);
 	memset(out, 0, sizeof(*out));
 	out->participant = plan->participants[record->participant].input_index;
 	out->read_rec_ptr = record->read_rec_ptr;
@@ -1156,7 +1526,7 @@ cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 index, ClusterCo
 	out->rmid = record->rmid;
 	out->info = record->info;
 	for (i = 0; i < record->component_count; i++) {
-		const ColdComponent *component = &plan->components[record->first_component + i];
+		const ColdComponent *component = cold_component(plan, record->first_component + i);
 		ClusterColdBlockStepV1 *block = &out->blocks[component->block_id];
 
 		/* Every component of a scheduled record has a verdict; anything else
@@ -1166,13 +1536,13 @@ cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 index, ClusterCo
 			return false;
 		}
 		block->verdict = component->verdict;
-		block->expected_kind = component->expected_kind;
-		block->expected_before = component->expected_before;
-		block->result = component->result;
+		block->result = component_result(plan, component);
 		if (component->verdict == CLUSTER_COLD_BLOCK_SKIP)
 			any_skip = true;
-		else
+		else {
+			component_expected(plan, component, block);
 			any_apply = true;
+		}
 	}
 	out->all_skip = any_skip && !any_apply;
 	out->mixed = any_skip && any_apply;
@@ -1197,6 +1567,7 @@ void
 cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan_address)
 {
 	ClusterColdPlanV1 *plan;
+	uint32 i;
 
 	if (plan_address == NULL || *plan_address == NULL)
 		return;
@@ -1206,10 +1577,16 @@ cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan_address)
 	plan->magic = 0;
 	if (plan->schedule != NULL)
 		cold_free(plan->schedule);
-	if (plan->components != NULL)
-		cold_free(plan->components);
-	if (plan->records != NULL)
-		cold_free(plan->records);
+	for (i = 0; i < plan->component_chunk_count; i++)
+		cold_free(plan->component_chunks[i]);
+	if (plan->component_chunks != NULL)
+		cold_free(plan->component_chunks);
+	for (i = 0; i < plan->record_chunk_count; i++)
+		cold_free(plan->record_chunks[i]);
+	if (plan->record_chunks != NULL)
+		cold_free(plan->record_chunks);
+	intern_free(&plan->relations);
+	intern_free(&plan->segments);
 	cold_free(plan->canonical);
 	cold_free(plan->participants);
 	cold_free(plan);

@@ -1173,6 +1173,54 @@ UT_TEST(test_unverified_content_needs_an_anchor)
 	destroy_plan(&plan);
 }
 
+/* Every page's chain starts at token block * 100 + 1 (see capacity test). */
+static bool
+observe_chain_start(void *arg, const RfPageIdentityV1 *page, ClusterColdDataV1 *out)
+{
+	(void)arg;
+	memset(out, 0, sizeof(*out));
+	out->kind = CLUSTER_COLD_DATA_PRESENT;
+	out->flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED;
+	out->version = ver(INC_I, (uint64)page->blockno * 100 + 1);
+	return true;
+}
+
+/*
+ * Storage is compact enough for production windows: 25,000 single-block
+ * records over 2,500 pages fit a 4 MiB budget through seal (about 100
+ * bytes a record including seal scratch), where per-record page identity,
+ * versions and expected state took about 256.
+ */
+UT_TEST(test_compact_plan_capacity)
+{
+	ClusterColdParticipantV1 parts[1] = { part(1, 11, 0x1000, 0x1000, 0x1000 + 25000 * 0x10) };
+	ClusterColdPlanV1 *plan = NULL;
+	ClusterColdDiagV1 diag;
+	ClusterColdDetailV1 detail = CLUSTER_COLD_OK;
+	ClusterColdStepV1 step;
+	XLogRecPtr at = 0x1000;
+	uint32 i;
+
+	UT_ASSERT_EQ(cluster_cold_plan_create_v1(parts, 1, BUDGET, &plan), CLUSTER_COLD_OK);
+	for (i = 0; i < 25000 && detail == CLUSTER_COLD_OK; i++) {
+		BlockNumber block = i % 2500;
+		uint64 base = (uint64)block * 100 + 1 + i / 2500;
+		ClusterColdComponentV1 change = delta(0, 100, block, base, base + 1);
+
+		detail = feed(plan, 0, at, at + 0x10, i + 1, 1, &change);
+		at += 0x10;
+	}
+	UT_ASSERT_EQ(detail, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe_chain_start, NULL, &diag),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 25000);
+	UT_ASSERT(cluster_cold_plan_step_v1(plan, 24999, &step));
+	UT_ASSERT_EQ(step.blocks[0].verdict, CLUSTER_COLD_BLOCK_APPLY_DELTA);
+	UT_ASSERT(version_is(&step.blocks[0].expected_before, INC_I, 2499 * 100 + 10));
+	UT_ASSERT(version_is(&step.blocks[0].result, INC_I, 2499 * 100 + 11));
+	destroy_plan(&plan);
+}
+
 int
 main(void)
 {
@@ -1208,6 +1256,7 @@ main(void)
 	UT_RUN(test_earliest_replayable_anchor_precedes_torn_deltas);
 	UT_RUN(test_unowned_side_records_refused_after_native_redo);
 	UT_RUN(test_unverified_content_needs_an_anchor);
+	UT_RUN(test_compact_plan_capacity);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

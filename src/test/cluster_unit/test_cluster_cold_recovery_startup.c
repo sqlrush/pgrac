@@ -643,6 +643,32 @@ UT_TEST(test_observed_page_classification)
 	UT_ASSERT(!cluster_cold_classify_page_v1(block.data, true, true, &out));
 }
 
+/*
+ * The pass-1 budget is cluster.cold_recovery_plan_memory (kB, default
+ * 4 GiB).  Exhausting it refuses before anything is modified, names the
+ * budget and points at the parameter.
+ */
+UT_TEST(test_plan_memory_budget_parameter)
+{
+	ClusterColdTypedV1 *typed;
+	int saved = cluster_cold_recovery_plan_memory;
+
+	UT_ASSERT_EQ(CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB, Min(4 * 1024 * 1024, MAX_KILOBYTES));
+	UT_ASSERT_EQ(cluster_cold_recovery_plan_memory, CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB);
+	UT_ASSERT_EQ(CLUSTER_COLD_PLAN_MEMORY_MIN_KB, 1024);
+	UT_ASSERT(strstr(cluster_cold_refusal_hint_v1(CLUSTER_COLD_CAPACITY),
+					 "cluster.cold_recovery_plan_memory")
+			  != NULL);
+
+	fixture();
+	cluster_cold_recovery_plan_memory = 1;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_CAPACITY);
+	UT_ASSERT(strstr(typed->refusal_detail, "1 kB") != NULL);
+	cluster_cold_typed_destroy_v1(&typed);
+	cluster_cold_recovery_plan_memory = saved;
+}
+
 /* Pages nothing can rebuild get a hint naming why; others the generic one. */
 UT_TEST(test_refusal_hints)
 {
@@ -673,6 +699,7 @@ main(void)
 	UT_RUN(test_apply_step_brackets_native_redo);
 	UT_RUN(test_observed_page_classification);
 	UT_RUN(test_refusal_hints);
+	UT_RUN(test_plan_memory_budget_parameter);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

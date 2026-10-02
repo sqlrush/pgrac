@@ -47,9 +47,8 @@
 #include "storage/bufpage.h"
 #include "utils/memutils.h"
 
-/* Upper bound on everything one cold plan may own (records and versions,
- * never WAL payload).  Exceeding it refuses startup with CAPACITY. */
-#define CLUSTER_COLD_PLAN_MEMORY_BUDGET ((Size)1024 * 1024 * 1024)
+/* cluster.cold_recovery_plan_memory, kB; registered with the cluster GUCs. */
+int cluster_cold_recovery_plan_memory = CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB;
 
 #define COLD_REQUIRED_ROOT_FLAGS                                                                   \
 	(CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID            \
@@ -102,6 +101,13 @@ cold_refuse(ClusterColdTypedV1 *typed, ClusterColdDetailV1 detail, const char *f
 	va_start(args, format);
 	(void)pg_vsnprintf(typed->refusal_detail, sizeof(typed->refusal_detail), format, args);
 	va_end(args);
+	if (detail == CLUSTER_COLD_CAPACITY) {
+		Size used = strlen(typed->refusal_detail);
+
+		(void)snprintf(typed->refusal_detail + used, sizeof(typed->refusal_detail) - used,
+					   " (cluster.cold_recovery_plan_memory is %d kB)",
+					   cluster_cold_recovery_plan_memory);
+	}
 }
 
 /* The founder's previous generation must be sealed like every peer. */
@@ -277,8 +283,9 @@ cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread
 		goto done;
 	}
 	typed->system_identifier = roots[0].root.identity.system_identifier;
-	detail = cluster_cold_plan_create_v1(typed->participants, typed->participant_count,
-										 CLUSTER_COLD_PLAN_MEMORY_BUDGET, &typed->plan);
+	detail
+		= cluster_cold_plan_create_v1(typed->participants, typed->participant_count,
+									  (Size)cluster_cold_recovery_plan_memory * 1024, &typed->plan);
 	if (detail != CLUSTER_COLD_OK) {
 		cold_refuse(typed, detail, "plan creation refused: %s", cold_detail_name(detail));
 		goto done;
@@ -509,6 +516,12 @@ cluster_cold_refusal_hint_v1(ClusterColdDetailV1 detail)
 		return "The named page is unreadable or failed verification, and no full-page image "
 			   "after its last checkpointed change can rebuild it. Preserve all original "
 			   "thread WAL and DATA; do not force recovery.";
+	case CLUSTER_COLD_CAPACITY:
+		return "The typed cold plan did not fit cluster.cold_recovery_plan_memory. Nothing was "
+			   "modified; raise the parameter and restart.";
+	case CLUSTER_COLD_OOM:
+		return "The server could not allocate the typed cold plan. Nothing was modified; free "
+			   "memory on this host and restart.";
 	default:
 		return "Preserve all original thread WAL and shared configuration. Shared mode "
 			   "recovers every retained writer generation through the typed cold plan and "

@@ -319,6 +319,20 @@ cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
 
 #ifndef FRONTEND
 
+#include "utils/guc.h"
+
+/*
+ * cluster.cold_recovery_plan_memory (kB, PGC_POSTMASTER): everything one
+ * typed cold plan may own during pass 1 (records, page versions, seal
+ * scratch; never WAL payload).  Exhausting it refuses startup before any
+ * page is modified.
+ */
+#define CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB Min(4 * 1024 * 1024, MAX_KILOBYTES)
+#define CLUSTER_COLD_PLAN_MEMORY_MIN_KB 1024
+#define CLUSTER_COLD_PLAN_MEMORY_MAX_KB MAX_KILOBYTES
+
+extern PGDLLIMPORT int cluster_cold_recovery_plan_memory;
+
 struct XLogReaderState;
 
 /*
