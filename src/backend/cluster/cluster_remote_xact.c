@@ -1272,10 +1272,10 @@ cluster_remote_xact_commit_wrap_proof(int origin_node, TransactionId xid,
  *	FlushBuffer foreign-LSN skip).  The equivalent guarantee holds
  *	structurally: the terminal record mandating this drop was READ from the
  *	origin's durable WAL thread on shared storage, and a crash before the
- *	unlink completes re-merges the same window and re-drops it
- *	(DropRelationFiles isRedo tolerates ENOENT, so an origin that already
- *	unlinked before dying -- or a second node replaying the same window --
- *	degrades to a no-op: the drop takes effect exactly once).
+ *	storage action completes re-merges the same window and replays the DROP.
+ *	DropRelationFiles owns missing-file handling and shared locator retention;
+ *	this caller cannot infer success from ENOENT or authorize reuse. Returning
+ *	from this action does not prove the recovery window is durably closed.
  *
  *	Stats drops: same as vanilla redo; per-node runtime stats entries for the
  *	dropped objects on nodes that never replay this record are reconciled by

@@ -3530,8 +3530,23 @@ test_cluster_thread_replay_pi.inc: $(top_srcdir)/src/backend/cluster/cluster_thr
 	mv $@.tmp $@
 
 test_cluster_thread_replay_pi: test_cluster_thread_replay_pi.c unit_test.h \
-		test_cluster_thread_replay_pi.inc
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		test_cluster_thread_replay_pi.inc test_cluster_thread_replay_missing.inc \
+		test_cluster_thread_replay_stream.inc $(SIDE_XACT_XACTDESC_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(SIDE_XACT_XACTDESC_O) \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+test_cluster_thread_replay_missing.inc: $(top_srcdir)/src/backend/cluster/cluster_thread_recovery_replay.c Makefile
+	awk '/^typedef struct ClusterThreadMissingRels/ { emit=1; count++ } \
+	     /^missing_add\(/ || /^missing_forget_dropped\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_thread_replay_stream.inc: $(top_srcdir)/src/backend/cluster/cluster_thread_recovery_replay.c Makefile
+	awk '/^cluster_thread_recovery_replay_stream_ex\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 test_cluster_thread_replay: test_cluster_thread_replay.c unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
