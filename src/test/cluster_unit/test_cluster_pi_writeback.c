@@ -132,11 +132,18 @@ static ClusterGrdPiRebuildCutV1 rebuild_cut;
 static bool rebuild_needed, rebuild_apply_ok = true, rebuild_drift, rebuild_root_drift;
 static uint32 rebuild_holders, rebuild_applies, rebuild_completions;
 static unsigned rebuild_side_blocked, rebuild_logs;
+static unsigned rebuild_apply_blocked, rebuild_fail_after = UINT32_MAX;
 
 void
 cluster_grd_inc_pi_rebuild_side_blocked(void)
 {
 	rebuild_side_blocked++;
+}
+
+void
+cluster_grd_inc_pi_rebuild_apply_blocked(void)
+{
+	rebuild_apply_blocked++;
 }
 
 int
@@ -202,7 +209,7 @@ cluster_pcm_rebuild_pi_contributors_v1(const ClusterGrdPiRebuildCutV1 *cut, Buff
 		rebuild_cut.routing_generation++;
 	if (rebuild_root_drift)
 		wb_input_current = false;
-	if (!rebuild_apply_ok)
+	if (!rebuild_apply_ok || rebuild_applies > rebuild_fail_after)
 		return false;
 	rebuild_holders |= holders;
 	return true;
@@ -908,6 +915,8 @@ rebuild_setup(void)
 	rebuild_drift = rebuild_root_drift = false;
 	rebuild_holders = rebuild_applies = rebuild_completions = 0;
 	rebuild_side_blocked = rebuild_logs = 0;
+	rebuild_apply_blocked = 0;
+	rebuild_fail_after = UINT32_MAX;
 	pi_rebuild_logged = false;
 	return data;
 }
@@ -964,11 +973,11 @@ UT_TEST(retained_rebuild_maps_both_space_pages_under_original_source)
 		wb_space_contribution.page_mask = 3;
 		wb_space_contribution.result_token[0] = 53;
 		wb_space_contribution.result_token[1] = 41;
-		UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+		UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(), invalid != 0);
 		UT_ASSERT_EQ(rebuild_applies, invalid ? 2 : 4);
 		UT_ASSERT_EQ(rebuild_completions, invalid ? 0 : 1);
 		UT_ASSERT(!wb_inputs_pinned[0]);
-		UT_ASSERT(pi_rebuild_job == NULL);
+		UT_ASSERT_EQ(pi_rebuild_job == NULL, invalid == 0);
 		pi_rebuild_release();
 		cluster_page_data_receipt_free_v1(&data);
 		rf_page_online_plan_destroy_v1(&wb_page_plan);
@@ -1033,7 +1042,7 @@ UT_TEST(retained_rebuild_root_change_or_apply_failure_never_completes)
 {
 	ClusterPageDataReceiptV1 *data = rebuild_setup();
 	rebuild_apply_ok = false;
-	UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+	UT_ASSERT(cluster_pi_rebuild_bgwriter_tick_v1());
 	UT_ASSERT_EQ(rebuild_completions, 0);
 	UT_ASSERT_EQ(rebuild_holders, 0);
 	rebuild_apply_ok = true;
@@ -1046,6 +1055,41 @@ UT_TEST(retained_rebuild_root_change_or_apply_failure_never_completes)
 	cluster_page_data_receipt_free_v1(&data);
 	rf_page_online_plan_destroy_v1(&wb_page_plan);
 	clean();
+}
+
+UT_TEST(retained_rebuild_apply_failure_retries_original_target_without_rescan)
+{
+	for (unsigned space = 0; space < 2; space++) {
+		ClusterPageDataReceiptV1 *data = rebuild_setup();
+		rebuild_cut.epoch = 80 + space;
+		if (space) {
+			wb_side_kind = RF_SIDE_ONLINE_OPERATION_SPACE;
+			wb_space_valid = true;
+			wb_space_contribution.result = identity;
+			wb_space_contribution.page_mask = 3;
+			wb_space_contribution.result_token[0] = 53;
+			wb_space_contribution.result_token[1] = 41;
+		}
+		rebuild_fail_after = 2 * space;
+		for (unsigned tick = 0; tick < 5; tick++) {
+			UT_ASSERT(cluster_pi_rebuild_bgwriter_tick_v1());
+			UT_ASSERT(!wb_inputs_pinned[0]);
+			UT_ASSERT_EQ(rebuild_completions, 0);
+			UT_ASSERT_EQ(wb_plan_builds, 1);
+			UT_ASSERT_EQ(rebuild_apply_blocked, 1);
+			UT_ASSERT_EQ(rebuild_logs, 1);
+		}
+		rebuild_fail_after = UINT32_MAX;
+		UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+		UT_ASSERT_EQ(rebuild_completions, 1);
+		UT_ASSERT_EQ(rebuild_applies, 7 + 2 * space);
+		UT_ASSERT_EQ(wb_plan_builds, 1);
+		UT_ASSERT(!wb_inputs_pinned[0]);
+		pi_rebuild_release();
+		cluster_page_data_receipt_free_v1(&data);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
 }
 
 UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
@@ -1080,7 +1124,7 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(remote_physical_ack_runs_actual_ancestry_and_disposal);
 	UT_RUN(writeback_codec_has_exact_bounded_authenticated_facts);
 	UT_RUN(writeback_rejects_foreign_sender_boot_and_changed_master_cut);
@@ -1096,6 +1140,7 @@ main(void)
 	UT_RUN(retained_rebuild_maps_commit_drop_and_separate_non_pcm_owners);
 	UT_RUN(retained_rebuild_waits_unpinned_and_rejects_incomplete_or_changed_cut);
 	UT_RUN(retained_rebuild_root_change_or_apply_failure_never_completes);
+	UT_RUN(retained_rebuild_apply_failure_retries_original_target_without_rescan);
 	UT_RUN(retained_rebuild_error_cleanup_and_postapply_root_check);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

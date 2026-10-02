@@ -237,7 +237,7 @@ UT_TEST(fresh_master_accepts_namespace_before_writer_install)
 	UT_ASSERT(cluster_block_redeclare_poll_v1(tag, PCM_STATE_N, 80, 90, epoch, master));
 }
 
-UT_TEST(late_ack_cannot_cover_changed_buffer_or_incarnation)
+UT_TEST(late_ack_cannot_cover_changed_mode_or_incarnation)
 {
 	uint8 request[sizeof(sent)], ack[sizeof(sent)];
 	reset();
@@ -246,16 +246,49 @@ UT_TEST(late_ack_cannot_cover_changed_buffer_or_incarnation)
 	deliver(0, 1, request);
 	memcpy(ack, sent, sizeof(sent));
 	cluster_node_id = 0;
-	UT_ASSERT(!cluster_block_redeclare_poll_v1(tag, PCM_STATE_X, 81, 91, epoch, master));
+	UT_ASSERT(!cluster_block_redeclare_poll_v1(tag, PCM_STATE_S, 81, 91, epoch, master));
 	deliver(1, 0, ack);
-	UT_ASSERT(!cluster_block_redeclare_poll_v1(tag, PCM_STATE_X, 81, 91, epoch, master));
+	UT_ASSERT(!cluster_block_redeclare_poll_v1(tag, PCM_STATE_S, 81, 91, epoch, master));
 	boots[1]++;
 	deliver(1, 0, ack);
-	UT_ASSERT(!cluster_block_redeclare_poll_v1(tag, PCM_STATE_X, 81, 91, epoch, master));
+	UT_ASSERT(!cluster_block_redeclare_poll_v1(tag, PCM_STATE_S, 81, 91, epoch, master));
 	census_hash++;
 	deliver(1, 0, ack);
-	UT_ASSERT(!cluster_block_redeclare_poll_v1(tag, PCM_STATE_X, 81, 91, epoch, master));
+	UT_ASSERT(!cluster_block_redeclare_poll_v1(tag, PCM_STATE_S, 81, 91, epoch, master));
 	UT_ASSERT_EQ(applies, 1);
+}
+
+UT_TEST(growing_page_keeps_request_identity_until_acknowledged)
+{
+	uint8 request[sizeof(sent)], ack[sizeof(sent)];
+	reset();
+	UT_ASSERT(!cluster_block_redeclare_poll_v1(tag, PCM_STATE_X, 80, 90, epoch, master));
+	memcpy(request, sent, sizeof(sent));
+	deliver(0, 1, request);
+	memcpy(ack, sent, sizeof(sent));
+	cluster_node_id = 0;
+	for (unsigned tick = 0; tick < 10; tick++)
+		UT_ASSERT(!cluster_block_redeclare_poll_v1(tag, PCM_STATE_X, 81 + tick, 91 + tick, epoch,
+												   master));
+	deliver(1, 0, ack);
+	UT_ASSERT(cluster_block_redeclare_poll_v1(tag, PCM_STATE_X, 100, 110, epoch, master));
+	UT_ASSERT_EQ(sends, 2);
+	UT_ASSERT_EQ(applies, 1);
+}
+
+UT_TEST(regressed_page_does_not_consume_prior_ack)
+{
+	for (unsigned scn = 0; scn < 2; scn++) {
+		uint8 request[sizeof(sent)], ack[sizeof(sent)];
+		reset();
+		UT_ASSERT(!cluster_block_redeclare_poll_v1(tag, PCM_STATE_X, 80, 90, epoch, master));
+		memcpy(request, sent, sizeof(sent));
+		deliver(0, 1, request);
+		memcpy(ack, sent, sizeof(sent));
+		deliver(1, 0, ack);
+		UT_ASSERT(!cluster_block_redeclare_poll_v1(tag, PCM_STATE_X, scn ? 80 : 79, scn ? 89 : 90,
+												   epoch, master));
+	}
 }
 
 UT_TEST(foreign_or_unfrozen_request_does_not_mutate_master)
@@ -293,11 +326,13 @@ UT_TEST(self_master_is_applied_and_unknown_cut_never_finishes)
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(8);
 	UT_RUN(codec_checks_full_length_and_reserved_bytes);
 	UT_RUN(scan_waits_for_actual_master_application_ack);
 	UT_RUN(fresh_master_accepts_namespace_before_writer_install);
-	UT_RUN(late_ack_cannot_cover_changed_buffer_or_incarnation);
+	UT_RUN(late_ack_cannot_cover_changed_mode_or_incarnation);
+	UT_RUN(growing_page_keeps_request_identity_until_acknowledged);
+	UT_RUN(regressed_page_does_not_consume_prior_ack);
 	UT_RUN(foreign_or_unfrozen_request_does_not_mutate_master);
 	UT_RUN(self_master_is_applied_and_unknown_cut_never_finishes);
 	UT_DONE();

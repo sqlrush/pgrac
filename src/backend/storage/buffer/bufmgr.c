@@ -15896,6 +15896,7 @@ cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 {
 	int			i;
 	int			end;
+	uint64 scan_epoch = cluster_shared_config ? cluster_epoch_get_current() : 0;
 
 	if (start_buf < 0)
 		start_buf = 0;
@@ -15926,13 +15927,26 @@ cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 			UnlockBufHdr(buf, buf_state);
 			continue;
 		}
-		if ((buf_state & (BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0) {
-			UnlockBufHdr(buf, buf_state);
-			return -1 - i;
-		}
 		tag = buf->tag;
 		/* pin + unlock header (raw pin, mirrors copy_block_for_gcs). */
 		cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
+		/* Keep the tag pinned while consulting the original census scope,
+		 * outside the header spinlock and before any content-lock/I/O wait.
+		 * The callback still validates its exact episode before declaring. */
+		if (cluster_shared_config) {
+			uint64 census_hash;
+			int state = cluster_grd_block_redeclare_state_v1(tag, scan_epoch, &census_hash);
+			if (state != 1) {
+				cluster_bufmgr_unpin_for_gcs(buf);
+				if (state < 0)
+					return -1 - i;
+				continue;
+			}
+		}
+		if ((buf_state & (BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0) {
+			cluster_bufmgr_unpin_for_gcs(buf);
+			return -1 - i;
+		}
 
 		content_lock = BufferDescriptorGetContentLock(buf);
 		if (!LWLockConditionalAcquire(content_lock, LW_SHARED)) {

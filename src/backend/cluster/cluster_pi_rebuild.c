@@ -30,6 +30,8 @@ static PiRebuildJob *pi_rebuild_job;
 static bool pi_rebuild_callback_registered;
 static bool pi_rebuild_logged;
 static ClusterGrdPiRebuildCutV1 pi_rebuild_logged_cut;
+static bool pi_rebuild_apply_logged;
+static ClusterGrdPiRebuildCutV1 pi_rebuild_apply_logged_cut;
 
 static void
 pi_rebuild_release(void)
@@ -176,6 +178,20 @@ pi_rebuild_space(PiRebuildJob *job, const RfPageOnlinePlanV1 *page, const RfSide
 		|| memcmp(contribution.result.key.storage_uuid, source.claim.identity.storage_uuid, 16)
 			   != 0)
 		return false;
+	if (!(contribution.page_mask & (1u << block)))
+		goto advance;
+	InitBufferTag(&tag, &contribution.result.key.locator, SPACE_FORKNUM, block);
+	home = cluster_gcs_lookup_master_static(tag);
+	if (home < 0 || home >= 32)
+		return false;
+	if (!(job->cut.affected[home / 8] & (1u << (home % 8)))
+		|| cluster_gcs_lookup_master(tag) != cluster_node_id)
+		goto advance;
+	if (!cluster_pcm_rebuild_pi_contributors_v1(&job->cut, tag, (uint32)1u << node,
+												operation.identity.record.read_rec_ptr,
+												contribution.result_token[block]))
+		return false;
+advance:
 	if (++job->side_block == 2) {
 		job->side_block = 0;
 		if (++job->side_locator == owners.space_locator_count) {
@@ -183,18 +199,25 @@ pi_rebuild_space(PiRebuildJob *job, const RfPageOnlinePlanV1 *page, const RfSide
 			job->side_cursor++;
 		}
 	}
-	if (!(contribution.page_mask & (1u << block)))
-		return true;
-	InitBufferTag(&tag, &contribution.result.key.locator, SPACE_FORKNUM, block);
-	home = cluster_gcs_lookup_master_static(tag);
-	if (home < 0 || home >= 32)
-		return false;
-	if (!(job->cut.affected[home / 8] & (1u << (home % 8)))
-		|| cluster_gcs_lookup_master(tag) != cluster_node_id)
-		return true;
-	return cluster_pcm_rebuild_pi_contributors_v1(&job->cut, tag, (uint32)1u << node,
-												  operation.identity.record.read_rec_ptr,
-												  contribution.result_token[block]);
+	return true;
+}
+
+static void
+pi_rebuild_report_apply_blocked(PiRebuildJob *job, bool side)
+{
+	if (pi_rebuild_apply_logged
+		&& memcmp(&pi_rebuild_apply_logged_cut, &job->cut, sizeof(job->cut)) == 0)
+		return;
+	pi_rebuild_apply_logged = true;
+	pi_rebuild_apply_logged_cut = job->cut;
+	cluster_grd_inc_pi_rebuild_apply_blocked();
+	ereport(
+		LOG,
+		(errmsg("cluster PI rebuild could not register a retained contribution"),
+		 errdetail("Epoch " UINT64_FORMAT ", direction %u, %s index %u, locator %u, block %u. "
+				   "Service remains fenced; retrying the same target with WAL read pins released.",
+				   job->cut.epoch, job->cut.direction, side ? "SIDE" : "PAGE",
+				   side ? job->side_cursor : job->cursor, job->side_locator, job->side_block)));
 }
 
 static void
@@ -297,16 +320,21 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 	 * grants until the complete graph and original ROOT have been checked. */
 	for (; budget > 0 && pi_rebuild_job->cursor < rf_page_online_plan_target_count_v1(page);
 		 budget--) {
-		if (!pi_rebuild_target(pi_rebuild_job, page, pi_rebuild_job->cursor++))
-			goto done;
+		if (!pi_rebuild_target(pi_rebuild_job, page, pi_rebuild_job->cursor)) {
+			pi_rebuild_report_apply_blocked(pi_rebuild_job, false);
+			goto blocked;
+		}
+		pi_rebuild_job->cursor++;
 	}
 	if (pi_rebuild_job->cursor != rf_page_online_plan_target_count_v1(page))
 		goto wait;
 	side = cluster_thread_recovery_fabric_side_plan_v1(pi_rebuild_job->plan);
 	for (; budget > 0 && pi_rebuild_job->side_cursor < rf_side_online_plan_operation_count_v1(side);
 		 budget--)
-		if (!pi_rebuild_space(pi_rebuild_job, page, side))
-			goto done;
+		if (!pi_rebuild_space(pi_rebuild_job, page, side)) {
+			pi_rebuild_report_apply_blocked(pi_rebuild_job, true);
+			goto blocked;
+		}
 	if (pi_rebuild_job->side_cursor != rf_side_online_plan_operation_count_v1(side))
 		goto wait;
 	if (cluster_wal_inputs_revalidate_v1(pi_rebuild_job->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -315,6 +343,11 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 done:
 	pi_rebuild_release();
 	return false;
+blocked:
+	if (!cluster_grd_pi_rebuild_current_v1(&cut)
+		|| cluster_wal_inputs_revalidate_v1(pi_rebuild_job->inputs)
+			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
 wait:
 	if (cluster_wal_inputs_suspend_v1(pi_rebuild_job->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;

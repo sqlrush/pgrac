@@ -173,6 +173,7 @@ cluster_block_redeclare_poll_v1(BufferTag tag, uint8 mode, XLogRecPtr page_lsn, 
 								uint64 epoch, int master)
 {
 	ClusterBlockRedeclareV1 m = { 0 };
+	ClusterBlockRedeclareV1 identity;
 	ClusterWalSourceRef local;
 	uint8 bytes[CLUSTER_BLOCK_REDECLARE_BYTES];
 	TimestampTz now;
@@ -205,7 +206,14 @@ cluster_block_redeclare_poll_v1(BufferTag tag, uint8 mode, XLogRecPtr page_lsn, 
 		return false;
 	if (master == cluster_node_id)
 		return rd_apply(&m);
-	if (pending.nonce == 0 || memcmp(&pending, &m, sizeof(m)) != 0) {
+	/* A declaration records residency and an observed lower watermark,
+	 * not a DATA receipt. Newer bytes do not cancel the master's ACK of
+	 * this same resident. Keep the original wire sample until it is ACKed. */
+	identity = m;
+	identity.page_lsn = pending.page_lsn;
+	identity.page_scn = pending.page_scn;
+	if (pending.nonce == 0 || memcmp(&pending, &identity, sizeof(identity)) != 0
+		|| m.page_lsn < pending.page_lsn || scn_local(m.page_scn) < scn_local(pending.page_scn)) {
 		if (!pg_strong_random(&m.nonce, sizeof(m.nonce)) || m.nonce == 0)
 			return false;
 		pending = m;

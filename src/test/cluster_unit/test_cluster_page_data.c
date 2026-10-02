@@ -9,6 +9,7 @@
 #include "catalog/pg_control.h"
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_block_apply.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_page_data.h"
@@ -62,6 +63,24 @@ static LWLock mapping;
 static unsigned pins[2];
 static bool locks[2], resident[2], busy[2], selected, sf_blocked, bad_checksum, bad_bytes;
 static bool redeclare_scan_test;
+static int redeclare_scope = 1;
+static unsigned redeclare_content_attempts;
+
+#ifndef PGRAC_TEST_REAL_PI_WRITEBACK
+uint64
+cluster_epoch_get_current(void)
+{
+	return 1;
+}
+#endif
+
+int
+cluster_grd_block_redeclare_state_v1(BufferTag tag, uint64 epoch, uint64 *hash)
+{
+	UT_ASSERT_EQ(epoch, cluster_epoch_get_current());
+	*hash = 17;
+	return redeclare_scope;
+}
 static bool stale_sync, redirty_sync, checksums = true;
 static bool zero_disk, late_fence;
 static bool storage_read, storage_cut_current = true, storage_cut_changed, storage_space_changed;
@@ -273,6 +292,8 @@ LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 {
 	for (int i = 0; i < 2; i++)
 		if (lock == BufferDescriptorGetContentLock(&descriptors[i].bufferdesc)) {
+			if (redeclare_scan_test)
+				redeclare_content_attempts++;
 			if (busy[i])
 				return false;
 			UT_ASSERT(pins[i] && !locks[i]);
@@ -601,6 +622,8 @@ static void
 reset(void)
 {
 	PageHeader p = (PageHeader)pages[1].data;
+	redeclare_scope = 1;
+	redeclare_content_attempts = 0;
 	local_insert_end = 0x500;
 	ack_writer_epoch = 1;
 	ack_boot = 9;
@@ -2237,14 +2260,41 @@ redeclare_scan_retries_content_busy_and_zero_lsn_current(void)
 	clean();
 }
 
+static void
+redeclare_scan_filters_scope_before_content_or_io_wait(void)
+{
+	for (int scope = -1; scope <= 1; scope++) {
+		reset();
+		redeclare_scan_test = true;
+		redeclare_scope = scope;
+		redeclare_count = 0;
+		busy[1] = true;
+		UT_ASSERT_EQ(cluster_bufmgr_redeclare_scan_chunk(1, 1, redeclare_observe, NULL),
+					 scope == 0 ? 2 : -2);
+		UT_ASSERT_EQ(redeclare_content_attempts, scope == 1 ? 1 : 0);
+		UT_ASSERT_EQ(redeclare_count, 0);
+		UT_ASSERT_EQ(pins[1], 0);
+		pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_IO_IN_PROGRESS);
+		UT_ASSERT_EQ(cluster_bufmgr_redeclare_scan_chunk(1, 1, redeclare_observe, NULL),
+					 scope == 0 ? 2 : -2);
+		UT_ASSERT_EQ(redeclare_count, 0);
+		UT_ASSERT_EQ(pins[1], 0);
+		UT_ASSERT(pg_atomic_read_u32(&descriptors[1].bufferdesc.state) & BM_IO_IN_PROGRESS);
+		pg_atomic_fetch_and_u32(&descriptors[1].bufferdesc.state, ~BM_IO_IN_PROGRESS);
+		redeclare_scan_test = false;
+		clean();
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(35);
 	UT_RUN(missing_pi_terminal_receipt_accepts_original_claim_ceiling);
 	UT_RUN(data_sync_releases_content_and_rechecks_clean_replacement);
 	UT_RUN(redeclare_scan_includes_physical_pi_and_preserves_unacknowledged_cursor);
 	UT_RUN(redeclare_scan_retries_content_busy_and_zero_lsn_current);
+	UT_RUN(redeclare_scan_filters_scope_before_content_or_io_wait);
 	UT_RUN(notice_import_requires_actual_fact_and_qualified_master_job);
 	UT_RUN(remote_ack_import_preserves_peer_and_resource_owner);
 	UT_RUN(tag_write_io_failure_never_exports_completion);
