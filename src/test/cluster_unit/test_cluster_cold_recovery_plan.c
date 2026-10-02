@@ -224,6 +224,9 @@ observe_set(ObserveTable *table, Oid rel, BlockNumber block, uint8 kind, RfPageV
 	memset(&table->data[i], 0, sizeof(table->data[i]));
 	table->data[i].kind = kind;
 	table->data[i].version = version;
+	/* Fixtures model checksum-verified content unless a test says otherwise. */
+	if (kind != CLUSTER_COLD_DATA_INVALID)
+		table->data[i].flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED;
 }
 
 static bool
@@ -1091,6 +1094,85 @@ UT_TEST(test_unowned_side_records_refused_after_native_redo)
 	destroy_plan(&plan);
 }
 
+/*
+ * Without verified content only the page header placed DATA, and a torn
+ * write may have left that header over another version's body.  With no
+ * anchor after the last history change nothing can rebuild the page, so
+ * the plan refuses.  With a later anchor the unverified content is never a
+ * delta base (the changes before the anchor are skipped); verified content
+ * is used as the base as before.
+ */
+UT_TEST(test_unverified_content_needs_an_anchor)
+{
+	ClusterColdParticipantV1 parts[2]
+		= { part(1, 11, 0x1000, 0x1100, 0x2000), part(2, 12, 0x1000, 0x1000, 0x2000) };
+	ClusterColdComponentV1 h = fpi(0, 100, 0, 1, 2);
+	ClusterColdComponentV1 d1 = delta(0, 100, 0, 2, 3);
+	ClusterColdComponentV1 d2 = delta(0, 100, 0, 3, 4);
+	ClusterColdComponentV1 f2 = fpi(0, 100, 0, 3, 4);
+	ObserveTable table = { 0 };
+	ClusterColdDiagV1 diag;
+	ClusterColdPlanV1 *plan;
+	ClusterColdStepV1 step;
+	int pass;
+
+	for (pass = 0; pass < 3; pass++) {
+		plan = make_plan(parts, 2);
+		memset(&table, 0, sizeof(table));
+		UT_ASSERT_EQ(feed(plan, 0, 0x1000, 0x1100, 1, 1, &h), CLUSTER_COLD_OK); /* history */
+		UT_ASSERT_EQ(feed_plain(plan, 0, 0x1100, 0x2000), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(feed(plan, 1, 0x1000, 0x1100, 2, 1, &d1), CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(feed(plan, 1, 0x1100, 0x2000, 3, 1, pass == 2 ? &f2 : &d2), CLUSTER_COLD_OK);
+		observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 2));
+		if (pass != 1)
+			table.data[0].flags = 0;
+		if (pass == 0) {
+			UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag),
+						 CLUSTER_COLD_CONTENT_UNPROVEN);
+			UT_ASSERT_EQ(diag.detail, CLUSTER_COLD_CONTENT_UNPROVEN);
+			UT_ASSERT(diag.has_page);
+			UT_ASSERT(version_is(&diag.version, INC_I, 2));
+			UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(plan), 0);
+		} else {
+			UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag), CLUSTER_COLD_OK);
+			/* Unverified content is never a delta base: skip to the anchor. */
+			UT_ASSERT(find_step(plan, 1, 0x1000, &step, NULL));
+			UT_ASSERT_EQ(step.blocks[0].verdict,
+						 pass == 2 ? CLUSTER_COLD_BLOCK_SKIP : CLUSTER_COLD_BLOCK_APPLY_DELTA);
+			UT_ASSERT(find_step(plan, 1, 0x1100, &step, NULL));
+			UT_ASSERT_EQ(step.blocks[0].verdict, pass == 2 ? CLUSTER_COLD_BLOCK_APPLY_IMAGE
+														   : CLUSTER_COLD_BLOCK_APPLY_DELTA);
+			if (pass == 2) {
+				UT_ASSERT_EQ(step.blocks[0].expected_kind, CLUSTER_COLD_DATA_PRESENT);
+				UT_ASSERT(version_is(&step.blocks[0].expected_before, INC_I, 2));
+			}
+		}
+		destroy_plan(&plan);
+	}
+
+	/* The flag is part of the observation contract. */
+	plan = make_plan(parts, 2);
+	memset(&table, 0, sizeof(table));
+	UT_ASSERT_EQ(feed_plain(plan, 0, 0x1000, 0x1100), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_plain(plan, 0, 0x1100, 0x2000), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed(plan, 1, 0x1000, 0x2000, 2, 1, &d1), CLUSTER_COLD_OK);
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_INVALID, ver(0, 0));
+	table.data[0].flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED;
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag),
+				 CLUSTER_COLD_OBSERVATION_FAILED);
+	destroy_plan(&plan);
+	plan = make_plan(parts, 2);
+	memset(&table, 0, sizeof(table));
+	UT_ASSERT_EQ(feed_plain(plan, 0, 0x1000, 0x1100), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_plain(plan, 0, 0x1100, 0x2000), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed(plan, 1, 0x1000, 0x2000, 2, 1, &d1), CLUSTER_COLD_OK);
+	observe_set(&table, 100, 0, CLUSTER_COLD_DATA_PRESENT, ver(INC_I, 2));
+	table.data[0].flags |= 0x02;
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe, &table, &diag),
+				 CLUSTER_COLD_OBSERVATION_FAILED);
+	destroy_plan(&plan);
+}
+
 int
 main(void)
 {
@@ -1125,6 +1207,7 @@ main(void)
 	UT_RUN(test_record_gap_refused);
 	UT_RUN(test_earliest_replayable_anchor_precedes_torn_deltas);
 	UT_RUN(test_unowned_side_records_refused_after_native_redo);
+	UT_RUN(test_unverified_content_needs_an_anchor);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

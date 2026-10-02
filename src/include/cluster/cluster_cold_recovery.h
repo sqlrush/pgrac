@@ -77,7 +77,8 @@ typedef enum ClusterColdDetailV1 {
 	CLUSTER_COLD_STATE = 16,				  /* wrong phase or already failed */
 	CLUSTER_COLD_STRUCTURAL_UNSUPPORTED = 17, /* lifecycle record needs its owner */
 	CLUSTER_COLD_OPCODE_UNSUPPORTED = 18,	  /* outside the closed route registry */
-	CLUSTER_COLD_SIDE_OWNER_MISSING = 19	  /* side effect without a cold owner */
+	CLUSTER_COLD_SIDE_OWNER_MISSING = 19,	  /* side effect without a cold owner */
+	CLUSTER_COLD_CONTENT_UNPROVEN = 20		  /* unverified DATA and no anchor rebuilds it */
 } ClusterColdDetailV1;
 
 /* Exact physical cut of one writer generation, all from one ROOT token. */
@@ -145,12 +146,19 @@ typedef enum ClusterColdDataKindV1 {
 } ClusterColdDataKindV1;
 
 /* Observed shared DATA state of one page.  PRESENT carries the exact
- * version; UNFORMATTED carries only the segment incarnation. */
+ * version; UNFORMATTED carries only the segment incarnation.  CONTENT_VERIFIED
+ * means the whole page was proven (page checksum, all-zero page or no
+ * block); without it only the header is known, and a torn write can leave
+ * that header over another version's body. */
 typedef struct ClusterColdDataV1 {
 	uint8 kind;
-	uint8 reserved_zero[7];
+	uint8 flags; /* CLUSTER_COLD_DATA_FLAG_* */
+	uint8 reserved_zero[6];
 	RfPageVersionV1 version;
 } ClusterColdDataV1;
+
+#define CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED UINT8_C(0x01)
+#define CLUSTER_COLD_DATA_KNOWN_FLAGS UINT8_C(0x01)
 
 /* Read-only DATA observation.  False means the observation itself failed
  * (I/O, identity); the plan then refuses instead of guessing. */
@@ -237,6 +245,77 @@ extern uint64 cluster_cold_plan_replay_record_count_v1(const ClusterColdPlanV1 *
 													   uint32 participant);
 
 extern void cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan);
+
+/* Participants of a sealed plan; 0 unless seal() succeeded. */
+extern uint32 cluster_cold_plan_participant_count_v1(const ClusterColdPlanV1 *plan);
+
+/* Pass-2 action for one scheduled page record.  A fully skipped record of
+ * the founder's own thread still advances nextXid past its xid. */
+typedef enum ClusterColdPageActionV1 {
+	CLUSTER_COLD_PAGE_APPLY = 0,
+	CLUSTER_COLD_PAGE_SKIP = 1,
+	CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID = 2
+} ClusterColdPageActionV1;
+
+extern ClusterColdPageActionV1 cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own);
+
+/*
+ * Pass-2 sequencer.  Drives every participant's reader through the sealed
+ * schedule: records before a scheduled page record replay as unscheduled
+ * records in stream order; the scheduled record must carry its pass-1
+ * identity; afterwards each participant is drained to its validated tail
+ * and must have consumed exactly its pass-1 record count.  The callbacks
+ * read and apply; the sequencer only decides order and proves the cut.
+ */
+typedef struct ClusterColdReplayRecordV1 {
+	XLogRecPtr read_rec_ptr;
+	XLogRecPtr end_rec_ptr;
+	uint32 record_crc;
+	uint8 rmid;
+	uint8 info;
+	uint8 reserved_zero[2];
+} ClusterColdReplayRecordV1;
+
+typedef enum ClusterColdReplayDetailV1 {
+	CLUSTER_COLD_REPLAY_OK = 0,
+	CLUSTER_COLD_REPLAY_INVALID_ARGUMENT = 1,
+	CLUSTER_COLD_REPLAY_STEP_UNUSABLE = 2, /* unreadable step or unknown participant */
+	CLUSTER_COLD_REPLAY_SOURCE_ENDED = 3,  /* stream ended or failed before the step */
+	CLUSTER_COLD_REPLAY_TARGET_PASSED = 4, /* the scheduled record start was passed */
+	CLUSTER_COLD_REPLAY_IDENTITY = 5,	   /* the scheduled record identity differs */
+	CLUSTER_COLD_REPLAY_PAST_TAIL = 6,	   /* a record lies past the validated tail */
+	CLUSTER_COLD_REPLAY_CUT_DIFFERS = 7,   /* end or record count differs from pass 1 */
+	CLUSTER_COLD_REPLAY_CALLBACK = 8	   /* a callback refused the record */
+} ClusterColdReplayDetailV1;
+
+typedef struct ClusterColdReplayOpsV1 {
+	/* Next record of a participant; false at end of stream or on failure. */
+	bool (*next)(void *arg, uint32 participant, ClusterColdReplayRecordV1 *out);
+	/* Replay the record just returned, which has no scheduled step. */
+	bool (*unscheduled)(void *arg, uint32 participant);
+	/* Consume the scheduled record just returned with its page action. */
+	bool (*scheduled)(void *arg, uint32 participant, const ClusterColdStepV1 *step,
+					  ClusterColdPageActionV1 action);
+} ClusterColdReplayOpsV1;
+
+typedef struct ClusterColdReplayResultV1 {
+	uint8 detail;		/* ClusterColdReplayDetailV1 */
+	uint32 participant; /* where replay stopped */
+	XLogRecPtr rec_ptr; /* the target, offending record or reached end */
+	uint32 steps_done;
+	uint64 pages_skipped;
+	uint64 pages_applied;
+	XLogRecPtr own_read; /* last consumed record of the own participant */
+	XLogRecPtr own_end;
+} ClusterColdReplayResultV1;
+
+/* participants/participant_count must be the plan's caller-order cuts; own
+ * is the founder's caller index. */
+extern ClusterColdReplayDetailV1
+cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
+						   const ClusterColdParticipantV1 *participants, uint32 participant_count,
+						   uint32 own, const ClusterColdReplayOpsV1 *ops, void *arg,
+						   ClusterColdReplayResultV1 *result);
 
 #ifndef FRONTEND
 
@@ -355,15 +434,17 @@ extern ClusterColdRouteV1 cluster_cold_route_v1(bool shared_config, bool merge_e
 /*
  * Consumers pass 2 needs from their owners: the per-block redo consultation
  * (R-A2), the complete participant census (R-A4), typed owners for other
- * generations' non-page effects and the XID/OID/MX/SCN bounds (R-A5), and
- * recovery completion publication (R-A7).  Each flag is set only once the
- * cold driver calls that consumer.
+ * generations' non-page effects and the XID/OID/MX/SCN bounds (R-A5),
+ * recovery completion publication (R-A7), and a restartpoint owner that
+ * holds own-thread checkpoints inside the cold replay window (R-A9).  Each
+ * flag is set only once that consumer exists.
  */
 typedef struct ClusterColdHandshakeV1 {
 	bool redo_block_hook;
 	bool participant_census;
 	bool side_owners;
 	bool completion_publish;
+	bool restartpoint_hold;
 } ClusterColdHandshakeV1;
 
 /* True only when every consumer exists; with no redo consultation, any page
@@ -373,15 +454,20 @@ extern bool cluster_cold_typed_ready_v1(const ClusterColdTypedV1 *typed,
 										const ClusterColdHandshakeV1 *handshake, char *reason,
 										Size reason_size);
 
-/* Pass-2 action for one scheduled page record.  A fully skipped record of
- * the founder's own thread still advances nextXid past its xid. */
-typedef enum ClusterColdPageActionV1 {
-	CLUSTER_COLD_PAGE_APPLY = 0,
-	CLUSTER_COLD_PAGE_SKIP = 1,
-	CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID = 2
-} ClusterColdPageActionV1;
+/*
+ * Typed cold replay window of the startup process (pass 2, from the first
+ * replayed record to completion).  The cold cut must not move while it is
+ * open, so the restartpoint owner does not adopt own-thread checkpoint
+ * records replayed inside it (handshake restartpoint_hold).
+ */
+extern void cluster_cold_replay_window_enter_v1(void);
+extern void cluster_cold_replay_window_leave_v1(void);
+extern bool cluster_cold_replay_window_active_v1(void);
 
-extern ClusterColdPageActionV1 cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own);
+/* True when a page that passed verification has proven content: data
+ * checksums are on and a checksum failure is not being ignored. */
+extern bool cluster_cold_checksum_proves_content_v1(bool checksums_enabled,
+													bool ignore_checksum_failure);
 
 /*
  * Per-block decision consumed by the typed cold redo consultation in
@@ -410,6 +496,18 @@ extern void cluster_cold_redo_step_enter_v1(const ClusterColdStepV1 *step);
 extern void cluster_cold_redo_step_leave_v1(void);
 extern bool cluster_cold_redo_block_decision_v1(struct XLogReaderState *record, uint8 block_id,
 												ClusterColdRedoBlockV1 *out);
+
+/*
+ * Apply one scheduled page record inside its published step, bracketed by
+ * the native block consumer (cluster_page_cold_redo_begin_v1/end_v1), so
+ * every block the redo routine reads is decided by this record's verdicts
+ * and every applied block is proven dirty with its result version.
+ */
+typedef void (*ClusterColdApplyRecordV1)(struct XLogReaderState *record, void *arg);
+
+extern void cluster_cold_apply_step_v1(const ClusterColdStepV1 *step,
+									   struct XLogReaderState *record,
+									   ClusterColdApplyRecordV1 apply, void *arg);
 
 #endif /* !FRONTEND */
 

@@ -97,6 +97,7 @@ OBJS = \
 	cluster_cold_recovery_decode.o \
 	cluster_cold_recovery_io.o \
 	cluster_cold_recovery_startup.o \
+	cluster_cold_recovery_replay.o \
 	cluster_recovery_duty.o \
 	cluster_cf_enqueue.o \
 	cluster_lock_owner.o \

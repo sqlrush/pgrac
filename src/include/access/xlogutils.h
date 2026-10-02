@@ -14,6 +14,11 @@
 #include "access/xlogreader.h"
 #include "storage/bufmgr.h"
 
+#ifdef USE_PGRAC_CLUSTER
+/* Exact PAGE consumers and the cold driver brackets are both installed. */
+#define CLUSTER_COLD_REDO_HOOK_CONSUMER_V1 1
+#endif
+
 /*
  * Prior to 8.4, all activity during recovery was carried out by the startup
  * process. This local variable continues to be used in many parts of the

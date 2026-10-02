@@ -48,6 +48,9 @@
 #include "storage/bufpage.h"
 #include "storage/smgr.h"
 
+/* bufpage.c; declared here as guc_tables.c and bufmgr.c do. */
+extern bool ignore_checksum_failure;
+
 struct ClusterColdReaderV1 {
 	ClusterWalSourceRef source;
 	XLogReaderState *reader;
@@ -196,6 +199,7 @@ cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterCol
 	relation = smgropen(page->locator, InvalidBackendId);
 	if (!smgrexists(relation, fork) || page->blockno >= smgrnblocks(relation, fork)) {
 		out->kind = CLUSTER_COLD_DATA_ABSENT;
+		out->flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED;
 		return true;
 	}
 	smgrread(relation, fork, page->blockno, block.data);
@@ -206,6 +210,7 @@ cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterCol
 			return true;
 		}
 		out->kind = CLUSTER_COLD_DATA_UNFORMATTED;
+		out->flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED;
 		return cold_observe_incarnation(observer, page->locator, out->version.segment_incarnation);
 	}
 	if (!PageIsVerifiedExtended((Page)block.data, page->blockno, 0)) {
@@ -218,6 +223,10 @@ cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterCol
 	if (((PageHeader)block.data)->pd_block_scn == 0)
 		return false;
 	out->kind = CLUSTER_COLD_DATA_PRESENT;
+	/* Only an enforced page checksum proves the content verified above;
+	 * otherwise just its header is known. */
+	if (cluster_cold_checksum_proves_content_v1(DataChecksumsEnabled(), ignore_checksum_failure))
+		out->flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED;
 	out->version.mutation_token = (uint64)((PageHeader)block.data)->pd_block_scn;
 	return cold_observe_incarnation(observer, page->locator, out->version.segment_incarnation);
 }

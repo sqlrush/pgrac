@@ -28,6 +28,7 @@
 
 #include "access/xlogreader.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_wal_tail.h"
@@ -218,6 +219,36 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	return detail;
 }
 
+/* A's native block consumer: record the bracket and what it can see. */
+static char bracket_order[8];
+static int bracket_calls;
+static bool bracket_saw_step[3];
+
+/* slot: 0 begin, 1 apply, 2 end. */
+static void
+bracket_note(char kind, int slot, XLogReaderState *record)
+{
+	ClusterColdRedoBlockV1 decision;
+
+	if (bracket_calls < (int)sizeof(bracket_order) - 1)
+		bracket_order[bracket_calls] = kind;
+	bracket_saw_step[slot] = cluster_cold_redo_block_decision_v1(record, 1, &decision)
+							 && decision.action == CLUSTER_COLD_REDO_APPLY;
+	bracket_calls++;
+}
+
+void
+cluster_page_cold_redo_begin_v1(XLogReaderState *record)
+{
+	bracket_note('b', 0, record);
+}
+
+void
+cluster_page_cold_redo_end_v1(XLogReaderState *record)
+{
+	bracket_note('e', 2, record);
+}
+
 bool
 cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterColdDataV1 *out)
 {
@@ -227,6 +258,7 @@ cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterCol
 	observer->pages_observed++;
 	memset(out, 0, sizeof(*out));
 	out->kind = CLUSTER_COLD_DATA_PRESENT;
+	out->flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED; /* data checksums on */
 	memset(out->version.segment_incarnation, 7, 16);
 	out->version.mutation_token = data_token;
 	return true;
@@ -446,13 +478,21 @@ sealed_with_steps(bool all_skip)
  * record without the per-block redo consultation. */
 UT_TEST(test_ready_requires_every_consumer_before_ir)
 {
-	ClusterColdHandshakeV1 none = { false, false, false, false };
-	ClusterColdHandshakeV1 all = { true, true, true, true };
-	ClusterColdHandshakeV1 no_hook = { false, true, true, true };
-	ClusterColdHandshakeV1 no_side = { true, true, false, true };
+	ClusterColdHandshakeV1 none = { 0 };
+	ClusterColdHandshakeV1 all = { .redo_block_hook = true,
+								   .participant_census = true,
+								   .side_owners = true,
+								   .completion_publish = true,
+								   .restartpoint_hold = true };
+	ClusterColdHandshakeV1 no_hook = all;
+	ClusterColdHandshakeV1 no_side = all;
+	ClusterColdHandshakeV1 no_hold = all;
 	ClusterColdTypedV1 *typed = sealed_with_steps(false);
 	char reason[256];
 
+	no_hook.redo_block_hook = false;
+	no_side.side_owners = false;
+	no_hold.restartpoint_hold = false;
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
 	UT_ASSERT(!cluster_cold_typed_ready_v1(typed, &none, reason, sizeof(reason)));
 	UT_ASSERT(strstr(reason, "redo-block consultation") != NULL);
@@ -462,6 +502,9 @@ UT_TEST(test_ready_requires_every_consumer_before_ir)
 	UT_ASSERT(!cluster_cold_typed_ready_v1(typed, &no_hook, reason, sizeof(reason)));
 	UT_ASSERT(strstr(reason, "3 page records need") != NULL);
 	UT_ASSERT(!cluster_cold_typed_ready_v1(typed, &no_side, reason, sizeof(reason)));
+	/* The cut must stay fixed: no restartpoint may move a participant. */
+	UT_ASSERT(!cluster_cold_typed_ready_v1(typed, &no_hold, reason, sizeof(reason)));
+	UT_ASSERT(strstr(reason, "restartpoint") != NULL);
 	UT_ASSERT(cluster_cold_typed_ready_v1(typed, &all, reason, sizeof(reason)));
 	cluster_cold_typed_destroy_v1(&typed);
 
@@ -473,21 +516,6 @@ UT_TEST(test_ready_requires_every_consumer_before_ir)
 	UT_ASSERT(cluster_cold_typed_ready_v1(typed, &all, reason, sizeof(reason)));
 	UT_ASSERT(!cluster_cold_typed_ready_v1(NULL, &all, reason, sizeof(reason)));
 	cluster_cold_typed_destroy_v1(&typed);
-}
-
-/* A skipped record of the founder's own thread still moves nextXid past its
- * xid, as replaying it would have; another generation's xid is not ours. */
-UT_TEST(test_skipped_own_record_advances_next_xid)
-{
-	ClusterColdStepV1 step;
-
-	memset(&step, 0, sizeof(step));
-	step.all_skip = true;
-	UT_ASSERT_EQ(cluster_cold_page_action_v1(&step, true), CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID);
-	UT_ASSERT_EQ(cluster_cold_page_action_v1(&step, false), CLUSTER_COLD_PAGE_SKIP);
-	step.all_skip = false;
-	UT_ASSERT_EQ(cluster_cold_page_action_v1(&step, true), CLUSTER_COLD_PAGE_APPLY);
-	UT_ASSERT_EQ(cluster_cold_page_action_v1(&step, false), CLUSTER_COLD_PAGE_APPLY);
 }
 
 /* PRE2: a cold crash that needs several threads merged is refused outside
@@ -508,6 +536,68 @@ UT_TEST(test_unshared_multi_thread_cold_merge_refused)
 	UT_ASSERT_EQ(cluster_cold_route_v1(false, false), CLUSTER_COLD_ROUTE_NATIVE);
 }
 
+/*
+ * The restartpoint owner holds own-thread checkpoints while typed cold
+ * replay runs; the window is visible only between enter and leave.
+ */
+UT_TEST(test_cold_replay_window_tracks_pass_two)
+{
+	UT_ASSERT(!cluster_cold_replay_window_active_v1());
+	cluster_cold_replay_window_enter_v1();
+	UT_ASSERT(cluster_cold_replay_window_active_v1());
+	cluster_cold_replay_window_leave_v1();
+	UT_ASSERT(!cluster_cold_replay_window_active_v1());
+}
+
+/*
+ * PageIsVerifiedExtended accepts a sane header with a failed checksum when
+ * ignore_checksum_failure is on; such a page must not count as proven
+ * content, or a torn body would become a redo base.
+ */
+UT_TEST(test_ignored_checksum_failure_does_not_prove_content)
+{
+	UT_ASSERT(cluster_cold_checksum_proves_content_v1(true, false));
+	UT_ASSERT(!cluster_cold_checksum_proves_content_v1(true, true));
+	UT_ASSERT(!cluster_cold_checksum_proves_content_v1(false, false));
+	UT_ASSERT(!cluster_cold_checksum_proves_content_v1(false, true));
+}
+
+static void
+bracket_apply(XLogReaderState *record, void *arg)
+{
+	(void)arg;
+	bracket_note('a', 1, record);
+}
+
+/*
+ * The native block consumer requires every applied record to be bracketed
+ * by its begin/end inside the published step: begin and end re-read this
+ * record's verdicts, and redo in between must see them too.
+ */
+UT_TEST(test_apply_step_brackets_native_redo)
+{
+	ClusterColdStepV1 step;
+	ClusterColdRedoBlockV1 out;
+	XLogReaderState reader;
+
+	memset(&reader, 0, sizeof(reader));
+	reader.ReadRecPtr = 0x700;
+	memset(&step, 0, sizeof(step));
+	step.read_rec_ptr = 0x700;
+	step.blocks[1].verdict = CLUSTER_COLD_BLOCK_APPLY_DELTA;
+	step.blocks[1].expected_kind = CLUSTER_COLD_DATA_PRESENT;
+	memset(bracket_order, 0, sizeof(bracket_order));
+	bracket_calls = 0;
+	cluster_cold_apply_step_v1(&step, &reader, bracket_apply, NULL);
+	UT_ASSERT_STR_EQ(bracket_order, "bae");
+	UT_ASSERT(bracket_saw_step[0]);
+	UT_ASSERT(bracket_saw_step[1]);
+	UT_ASSERT(bracket_saw_step[2]);
+	/* The step is no longer published afterwards. */
+	UT_ASSERT(cluster_cold_redo_block_decision_v1(&reader, 1, &out));
+	UT_ASSERT_EQ(out.action, CLUSTER_COLD_REDO_NATIVE);
+}
+
 int
 main(void)
 {
@@ -520,8 +610,10 @@ main(void)
 	UT_RUN(test_redo_block_decisions);
 	UT_RUN(test_route_shared_cold_merge_only_typed);
 	UT_RUN(test_ready_requires_every_consumer_before_ir);
-	UT_RUN(test_skipped_own_record_advances_next_xid);
 	UT_RUN(test_unshared_multi_thread_cold_merge_refused);
+	UT_RUN(test_ignored_checksum_failure_does_not_prove_content);
+	UT_RUN(test_cold_replay_window_tracks_pass_two);
+	UT_RUN(test_apply_step_brackets_native_redo);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
