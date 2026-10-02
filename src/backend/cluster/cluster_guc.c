@@ -36,12 +36,15 @@
  */
 #include "postgres.h"
 
+#include <limits.h>
+
 #include "common/relpath.h"
 #include "storage/block.h"
 #include "utils/guc.h"
 #include "libpq/pqcomm.h"
 
 #include "cluster/cluster_block_recovery.h"		 /* spec-4.10 D1 online block recovery GUCs */
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_external_fence.h"		 /* STOP-04 external fence GUC defaults */
 #include "cluster/cluster_thread_recovery.h"	 /* spec-4.11 D1 online thread recovery GUCs */
 #include "cluster/cluster_write_fence.h"		 /* spec-4.12 D7 write-fence enforcement GUCs */
@@ -1641,6 +1644,16 @@ cluster_init_guc(void)
 		"cluster.merged_recovery", gettext_noop("Enable cold-crash k-way SCN merged recovery."),
 		gettext_noop("Off keeps single-stream recovery (this node's own thread only)."),
 		&cluster_merged_recovery, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.cold_recovery_plan_memory",
+		gettext_noop("Memory budget of the typed cold-recovery plan."),
+		gettext_noop("Everything pass 1 of an all-instance crash recovery keeps "
+					 "(page versions, records, seal scratch). Exhausting it "
+					 "refuses startup before any page is modified."),
+		&cluster_cold_recovery_plan_memory, CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB,
+		CLUSTER_COLD_PLAN_MEMORY_MIN_KB, CLUSTER_COLD_PLAN_MEMORY_MAX_KB, PGC_POSTMASTER,
+		GUC_UNIT_KB, NULL, NULL, NULL);
 
 	/*
 	 * cluster.xnode_profile -- cross-node per-bucket profiling (spec-5.59).

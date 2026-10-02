@@ -91,13 +91,36 @@ $node->psql('postgres',
 like($stderr, qr/cannot be changed without restarting the server/i,
 	'SET cluster.node_id at runtime is rejected (PGC_POSTMASTER)');
 
+# The planner owns storage for this registered, bounded startup budget.
+my $cold_default_kb = $node->safe_psql('postgres',
+	q{SELECT least(4194304, max_val::bigint) FROM pg_settings
+	    WHERE name = 'cluster.cold_recovery_plan_memory'});
+ok($cold_default_kb >= 1024, 'cold plan memory has a supported platform bound');
+is($node->safe_psql('postgres',
+	q{SELECT setting || '|' || vartype || '|' || unit || '|' || min_val || '|' || context
+	    FROM pg_settings WHERE name = 'cluster.cold_recovery_plan_memory'}),
+	"$cold_default_kb|integer|kB|1024|postmaster", 'cold plan budget default and metadata');
+if ($cold_default_kb == 4194304)
+{
+	$node->assert_cluster_guc('cluster.cold_recovery_plan_memory', '4GB',
+		'cold plan memory displays 4GB by default');
+}
+$node->psql('postgres', q{SET "cluster.cold_recovery_plan_memory" = '32MB'},
+	stdout => \$stdout, stderr => \$stderr);
+like($stderr, qr/cannot be changed without restarting the server/i,
+	'cold plan memory cannot change at runtime');
+
 
 # ----------
 # postgresql.conf override + restart -> SHOW returns the new value.
 # ----------
 $node->stop;
 $node->append_conf('postgresql.conf', "cluster.node_id = 7\n");
+$node->append_conf('postgresql.conf', "cluster.cold_recovery_plan_memory = '32MB'\n");
 $node->start;
+
+$node->assert_cluster_guc('cluster.cold_recovery_plan_memory', '32MB',
+	'cold plan memory configuration applies after restart');
 
 $node->assert_cluster_guc('cluster.node_id', '7',
 	'postgresql.conf override applied across restart (cluster.node_id = 7)');
@@ -303,5 +326,17 @@ is($node->safe_psql('postgres',
 	    FROM pg_settings WHERE name = 'cluster.xnode_profile'}),
 	'off|bool|superuser',
 	'cluster.xnode_profile default off, bool, superuser context');
+
+# Custom GUC startup validation rejects an invalid value and retains the
+# boot default, matching the existing node_id range check above.
+$node->stop;
+$node->append_conf('postgresql.conf', "cluster.cold_recovery_plan_memory = '1023kB'\n");
+$node->start;
+is($node->safe_psql('postgres',
+	q{SELECT setting FROM pg_settings WHERE name = 'cluster.cold_recovery_plan_memory'}),
+	$cold_default_kb, 'cold plan memory below 1MB is rejected');
+like(slurp_file($node->logfile),
+	qr/1023 kB is outside the valid range for parameter "cluster.cold_recovery_plan_memory"/,
+	'cold plan invalid range is reported in startup log');
 
 done_testing();
