@@ -700,6 +700,63 @@ page_earliest_replayable_anchor(const ClusterColdPlanV1 *plan, const uint32 *cha
 }
 
 /*
+ * Position of a readable DATA state on the chain: the index of the
+ * component whose result DATA holds, or -1 when DATA is the chain start
+ * (the first expected-before, or the unformatted/absent start of a new
+ * page).  Anything else is refused.
+ */
+static ClusterColdDetailV1
+page_header_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
+					 const ClusterColdDataV1 *data, int64 *position, ClusterColdDiagV1 *diag)
+{
+	const ColdComponent *first = &plan->components[chain[0]];
+	bool new_start = first->before_kind != RF_PAGE_STATE_PRESENT;
+	uint32 i;
+
+	if (data->kind != CLUSTER_COLD_DATA_PRESENT) {
+		Assert(new_start);
+		*position = -1;
+		if (data->kind == CLUSTER_COLD_DATA_UNFORMATTED
+			&& !incarnation_equal(&first->result, &data->version)) {
+			diag_component(plan, diag, chain[0]);
+			diag->version = data->version;
+			return CLUSTER_COLD_INCARNATION_MISMATCH;
+		}
+		return CLUSTER_COLD_OK;
+	}
+	for (i = 0; i < count; i++)
+		if (version_equal(&plan->components[chain[i]].result, &data->version)) {
+			*position = (int64)i;
+			return CLUSTER_COLD_OK;
+		}
+	if (!new_start && version_equal(&first->before, &data->version)) {
+		*position = -1;
+		return CLUSTER_COLD_OK;
+	}
+	diag_component(plan, diag, chain[0]);
+	diag->version = data->version;
+	return incarnation_equal(&first->result, &data->version) ? CLUSTER_COLD_ANCESTOR_MISSING
+															 : CLUSTER_COLD_INCARNATION_MISMATCH;
+}
+
+/* DATA cannot be a redo base: rebuild from the earliest replayable anchor. */
+static ClusterColdDetailV1
+page_rebuild_from_anchor(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
+						 const ClusterColdDataV1 *data, ClusterColdDetailV1 missing,
+						 uint32 diag_index, int64 *covered, ClusterColdDiagV1 *diag)
+{
+	int64 anchor = page_earliest_replayable_anchor(plan, chain, count, (int64)count);
+
+	if (anchor < 0) {
+		diag_component(plan, diag, chain[diag_index]);
+		diag->version = data->version;
+		return missing;
+	}
+	*covered = anchor - 1;
+	return CLUSTER_COLD_OK;
+}
+
+/*
  * Place DATA on the chain.  *covered is the last chain index DATA already
  * contains (-1: none).  *exact means the page holds the DATA state exactly
  * before the first applied component; otherwise that component is an
@@ -715,46 +772,23 @@ page_data_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 				   const ClusterColdDataV1 *data, int64 *covered, bool *exact,
 				   ClusterColdDiagV1 *diag)
 {
-	const ColdComponent *first = &plan->components[chain[0]];
-	bool new_start = first->before_kind != RF_PAGE_STATE_PRESENT;
+	bool new_start = plan->components[chain[0]].before_kind != RF_PAGE_STATE_PRESENT;
+	ClusterColdDetailV1 detail;
 	int64 anchor;
-	int64 position = -2;
-	uint32 i;
+	int64 position;
 
 	*exact = true;
-	if (data->kind == CLUSTER_COLD_DATA_PRESENT) {
-		for (i = 0; i < count && position == -2; i++)
-			if (version_equal(&plan->components[chain[i]].result, &data->version))
-				position = (int64)i;
-		if (position == -2 && !new_start && version_equal(&first->before, &data->version))
-			position = -1;
-		if (position == -2) {
-			diag_component(plan, diag, chain[0]);
-			diag->version = data->version;
-			return incarnation_equal(&first->result, &data->version)
-					   ? CLUSTER_COLD_ANCESTOR_MISSING
-					   : CLUSTER_COLD_INCARNATION_MISMATCH;
-		}
-	} else if (data->kind != CLUSTER_COLD_DATA_INVALID && new_start) {
-		if (data->kind == CLUSTER_COLD_DATA_UNFORMATTED
-			&& !incarnation_equal(&first->result, &data->version)) {
-			diag_component(plan, diag, chain[0]);
-			diag->version = data->version;
-			return CLUSTER_COLD_INCARNATION_MISMATCH;
-		}
-		position = -1;
-	} else {
-		/* Unreadable, or a new page where a formatted one was expected. */
-		anchor = page_earliest_replayable_anchor(plan, chain, count, (int64)count);
-		if (anchor < 0) {
-			diag_component(plan, diag, chain[count - 1]);
-			diag->version = data->version;
-			return CLUSTER_COLD_ANCHOR_MISSING;
-		}
+	/* Unreadable, or a new page where a formatted one was expected. */
+	if (data->kind == CLUSTER_COLD_DATA_INVALID
+		|| (data->kind != CLUSTER_COLD_DATA_PRESENT && !new_start)) {
 		*exact = false;
-		*covered = anchor - 1;
-		return CLUSTER_COLD_OK;
+		return page_rebuild_from_anchor(plan, chain, count, data, CLUSTER_COLD_ANCHOR_MISSING,
+										count - 1, covered, diag);
 	}
+	detail = page_header_position(plan, chain, count, data, &position, diag);
+	if (detail != CLUSTER_COLD_OK)
+		return detail;
+
 	/*
 	 * Unless its content was verified, only the header placed DATA.  Any
 	 * replayable change may have been in flight when the instances failed,
@@ -766,16 +800,9 @@ page_data_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 	 * across generations it can be missing (a change after another
 	 * generation's history need not log one), and the page is refused.
 	 */
-	if ((data->flags & CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED) == 0) {
-		anchor = page_earliest_replayable_anchor(plan, chain, count, (int64)count);
-		if (anchor < 0) {
-			diag_component(plan, diag, chain[0]);
-			diag->version = data->version;
-			return CLUSTER_COLD_CONTENT_UNPROVEN;
-		}
-		*covered = anchor - 1;
-		return CLUSTER_COLD_OK;
-	}
+	if ((data->flags & CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED) == 0)
+		return page_rebuild_from_anchor(plan, chain, count, data, CLUSTER_COLD_CONTENT_UNPROVEN, 0,
+										covered, diag);
 	anchor = page_earliest_replayable_anchor(plan, chain, count, position + 1);
 	*covered = anchor >= 0 ? anchor - 1 : position;
 	return CLUSTER_COLD_OK;
