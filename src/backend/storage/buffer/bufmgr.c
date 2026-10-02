@@ -6026,7 +6026,11 @@ cluster_bufmgr_resource_x_target_evict_locked(
 	ClusterPcmOwnSnapshot restored_x;
 	ClusterPcmOwnResult own_result;
 	ClusterPcmOwnResult abort_own_result;
-	ResourceXTargetEvictionPlan plan;
+	/* The object is allocated off-lock in B. A volatile pointer preserves its
+	 * identity across ERROR; the allocated ref moves survive longjmp. */
+	ResourceXTargetEvictionPlan *volatile plan = NULL;
+	ClusterPageWalBindingV1 wal = { 0 };
+	ClusterPageWalCaptureResultV1 wal_result = CLUSTER_PAGE_WAL_UNATTRIBUTED;
 	ResourceXApplyResult prepare_result;
 	ResourceXApplyResult publish_result;
 	ResourceXApplyResult abort_result = RESOURCE_X_APPLY_APPLIED;
@@ -6039,7 +6043,6 @@ cluster_bufmgr_resource_x_target_evict_locked(
 	MemSet(&revoking, 0, sizeof(revoking));
 	MemSet(&committed_n, 0, sizeof(committed_n));
 	MemSet(&restored_x, 0, sizeof(restored_x));
-	MemSet(&plan, 0, sizeof(plan));
 	if (buf == NULL || tag == NULL || partition_lock == NULL || base == NULL
 		|| !BufferTagsEqual(&buf->tag, tag)
 		|| !BufferTagsEqual(&base->tag, tag)
@@ -6073,6 +6076,18 @@ cluster_bufmgr_resource_x_target_evict_locked(
 			buf, own_result, base->generation, base->flags,
 			"TARGET cached-X eviction begin");
 	}
+	if (cluster_shared_config) {
+		wal_result
+			= cluster_page_wal_eviction_snapshot_locked_v1(buf, &revoking, expected_refcount, &wal);
+		if (wal_result == CLUSTER_PAGE_WAL_INVARIANT_BROKEN) {
+			abort_own_result = cluster_pcm_own_eviction_abort_locked(buf, &revoking, &restored_x);
+			UnlockBufHdr(buf, buf_state);
+			LWLockRelease(partition_lock);
+			cluster_bufmgr_resource_x_fail_closed_current();
+			cluster_bufmgr_resource_x_writer_report_failure(RESOURCE_X_APPLY_RECOVERY_BLOCKED, buf,
+															"TARGET cached-X WAL capture");
+		}
+	}
 	UnlockBufHdr(buf, buf_state);
 	LWLockRelease(partition_lock);
 
@@ -6086,13 +6101,17 @@ cluster_bufmgr_resource_x_target_evict_locked(
 			ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
 			ReservePrivateRefCountEntry();
 		}
+		plan = palloc0(sizeof(*plan));
 		prepare_result = cluster_gcs_resource_x_target_evict_prepare_exact(
 			tag, &revoking, r4_record_generation, reservation_token,
-			&plan);
+			wal_result == CLUSTER_PAGE_WAL_CAPTURED ? &wal : NULL, plan);
 	}
 	PG_CATCH();
 	{
-		/* PREPARE owns entry cleanup; restore only the exact BufferDesc half. */
+		/* PREPARE owns entry/ref cleanup; restore the exact BufferDesc half. */
+		if (plan != NULL)
+			pfree(plan);
+		plan = NULL;
 		LWLockAcquire(partition_lock, LW_EXCLUSIVE);
 		buf_state = LockBufHdr(buf);
 		abort_own_result = cluster_pcm_own_eviction_abort_locked(
@@ -6108,6 +6127,8 @@ cluster_bufmgr_resource_x_target_evict_locked(
 	if (prepare_result != RESOURCE_X_APPLY_APPLIED
 		&& prepare_result != RESOURCE_X_APPLY_DUPLICATE)
 	{
+		pfree(plan);
+		plan = NULL;
 		LWLockAcquire(partition_lock, LW_EXCLUSIVE);
 		buf_state = LockBufHdr(buf);
 		abort_own_result = cluster_pcm_own_eviction_abort_locked(
@@ -6141,20 +6162,30 @@ cluster_bufmgr_resource_x_target_evict_locked(
 	 * off-lock before the BufferDesc token is cleared. */
 	LWLockAcquire(partition_lock, LW_EXCLUSIVE);
 	buf_state = LockBufHdr(buf);
-	precommit_exact = (buf_state & BM_TAG_VALID) != 0
-		&& BufferTagsEqual(&buf->tag, tag)
-		&& BUF_STATE_GET_REFCOUNT(buf_state) == expected_refcount
-		&& (buf_state & (BM_DIRTY | BM_IO_IN_PROGRESS)) == 0
-		&& cluster_pcm_own_fence_matches_locked(buf, &revoking)
-		&& plan.cached_ownership_generation == base->generation
-		&& plan.r4_record_generation == r4_record_generation
-		&& plan.owner.buffer_ownership_generation == base->generation
-		&& plan.owner.reservation_token == reservation_token;
+	precommit_exact = (buf_state & BM_TAG_VALID) != 0 && BufferTagsEqual(&buf->tag, tag)
+					  && BUF_STATE_GET_REFCOUNT(buf_state) == expected_refcount
+					  && (buf_state & (BM_DIRTY | BM_IO_IN_PROGRESS)) == 0
+					  && cluster_pcm_own_fence_matches_locked(buf, &revoking)
+					  && plan->cached_ownership_generation == base->generation
+					  && plan->r4_record_generation == r4_record_generation
+					  && plan->owner.buffer_ownership_generation == base->generation
+					  && plan->owner.reservation_token == reservation_token;
+	if (precommit_exact && cluster_shared_config) {
+		ClusterPageWalBindingV1 observed;
+		ClusterPageWalCaptureResultV1 observed_result
+			= cluster_page_wal_eviction_snapshot_locked_v1(buf, &revoking, expected_refcount,
+														   &observed);
+		precommit_exact = observed_result == wal_result
+						  && (wal_result == CLUSTER_PAGE_WAL_UNATTRIBUTED
+							  || cluster_page_wal_same_mutation_v1(&wal, &observed));
+	}
 	if (!precommit_exact)
 	{
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
-		abort_result = cluster_gcs_resource_x_target_evict_abort_exact(&plan);
+		abort_result = cluster_gcs_resource_x_target_evict_abort_exact(plan);
+		pfree(plan);
+		plan = NULL;
 		LWLockAcquire(partition_lock, LW_EXCLUSIVE);
 		buf_state = LockBufHdr(buf);
 		abort_own_result = cluster_pcm_own_eviction_abort_locked(
@@ -6176,7 +6207,9 @@ cluster_bufmgr_resource_x_target_evict_locked(
 	{
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
-		abort_result = cluster_gcs_resource_x_target_evict_abort_exact(&plan);
+		abort_result = cluster_gcs_resource_x_target_evict_abort_exact(plan);
+		pfree(plan);
+		plan = NULL;
 		LWLockAcquire(partition_lock, LW_EXCLUSIVE);
 		buf_state = LockBufHdr(buf);
 		abort_own_result = cluster_pcm_own_eviction_abort_locked(
@@ -6211,7 +6244,7 @@ cluster_bufmgr_resource_x_target_evict_locked(
 	if (old_flags & BM_TAG_VALID)
 		BufTableDelete(tag, hash);
 	LWLockRelease(partition_lock);
-	plan.local_n_committed = true;
+	plan->local_n_committed = true;
 
 	/* Phase D: keep the same plan and pin for recognized pending publication.
 	 * A hard failure or cancellation closes the gate before local pin cleanup;
@@ -6221,7 +6254,7 @@ cluster_bufmgr_resource_x_target_evict_locked(
 		for (;;) {
 			retry_pending = false;
 			publish_result
-				= cluster_gcs_resource_x_target_evict_publish_exact(&plan, &retry_pending);
+				= cluster_gcs_resource_x_target_evict_publish_exact(plan, &retry_pending);
 			if (publish_result != RESOURCE_X_APPLY_BAD_STATE || !retry_pending)
 				break;
 			(void)cluster_bufmgr_resource_x_wait_retry(BufferDescriptorGetContentLock(buf),
@@ -6231,6 +6264,9 @@ cluster_bufmgr_resource_x_target_evict_locked(
 	PG_CATCH();
 	{
 		cluster_bufmgr_resource_x_fail_closed_current();
+		cluster_gcs_resource_x_target_evict_release_refs(plan);
+		pfree(plan);
+		plan = NULL;
 		if (temporary_pin)
 			UnpinBuffer(buf);
 		elog(LOG,
@@ -6244,6 +6280,9 @@ cluster_bufmgr_resource_x_target_evict_locked(
 		&& publish_result != RESOURCE_X_APPLY_DUPLICATE)
 	{
 		cluster_bufmgr_resource_x_fail_closed_current();
+		cluster_gcs_resource_x_target_evict_release_refs(plan);
+		pfree(plan);
+		plan = NULL;
 		if (temporary_pin)
 			UnpinBuffer(buf);
 		elog(LOG,
@@ -6254,6 +6293,8 @@ cluster_bufmgr_resource_x_target_evict_locked(
 			RESOURCE_X_APPLY_RECOVERY_BLOCKED, buf,
 			"TARGET cached-X eviction publish after local commit");
 	}
+	cluster_gcs_resource_x_target_evict_release_refs(plan);
+	pfree(plan);
 	if (temporary_pin)
 		UnpinBuffer(buf);
 	if (return_to_freelist)
@@ -14776,6 +14817,13 @@ cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
 		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
 	}
 
+	/* Keep X and let the caller serve its existing read-only image. */
+	if (cluster_shared_config) {
+		if (out_refusal != NULL)
+			*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_OWNERSHIP_REVOKE_BUSY;
+		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
+	}
+
 	hashcode = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hashcode);
 
@@ -15514,6 +15562,13 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
 		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
 	}
 
+	/* Keep X and let the caller serve its existing read-only image. */
+	if (cluster_shared_config) {
+		if (out_refusal != NULL)
+			*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_OWNERSHIP_REVOKE_BUSY;
+		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
+	}
+
 	hashcode = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hashcode);
 
@@ -16088,6 +16143,12 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	buf = GetBufferDescriptor(buf_id);
 
 	buf_state = LockBufHdr(buf);
+	/* Validate the actual owner, even if an old sender labels it S. */
+	if (cluster_shared_config && buf->pcm_state == PCM_STATE_X) {
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		return CLUSTER_BUFMGR_GCS_DROP_STALE;
+	}
 	/* Re-verify tag under the header lock to defend against a tag-rewrite race
 	 * between the partition-lock lookup and the raw pin (copy_block_for_gcs
 	 * convention). */
@@ -16199,6 +16260,12 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	{
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
+	}
+
+	/* The unpinned interval may have installed a new Resource-X X owner. */
+	if (cluster_shared_config && buf->pcm_state == PCM_STATE_X) {
+		UnlockBufHdr(buf, buf_state);
+		return CLUSTER_BUFMGR_GCS_DROP_STALE;
 	}
 
 	saved_pcm_state = buf->pcm_state;
@@ -16591,6 +16658,10 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 
 	if (out_page_lsn != NULL)
 		*out_page_lsn = InvalidXLogRecPtr;
+
+	/* Absence is not a legacy X-transfer grant in shared mode. */
+	if (cluster_shared_config)
+		return CLUSTER_BUFMGR_GCS_DROP_STALE;
 
 	hashcode = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hashcode);

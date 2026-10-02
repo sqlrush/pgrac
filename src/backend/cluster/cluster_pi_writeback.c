@@ -45,6 +45,9 @@ typedef struct WritebackShared {
 	int32 bgwriter_procno;
 	int32 bgwriter_pid;
 	int32 checkpointer_pid;
+	ClusterPiWritebackRejectionsV1 rejections;
+	uint64 logged_epoch[CLUSTER_PI_WRITEBACK_REJECTION_COUNT];
+	uint64 logged_boot[CLUSTER_PI_WRITEBACK_REJECTION_COUNT];
 } WritebackShared;
 
 struct ClusterPiWritebackJobV1 {
@@ -96,6 +99,55 @@ static bool wb_callbacks;
 static TimestampTz wb_last_send;
 static uint64 wb_sent_revision, wb_sent_inbound;
 static bool wb_sent_reply;
+
+bool
+cluster_pi_writeback_rejections_v1(ClusterPiWritebackRejectionsV1 *out)
+{
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (wb_shared == NULL)
+		return false;
+	SpinLockAcquire(&wb_shared->lock);
+	*out = wb_shared->rejections;
+	SpinLockRelease(&wb_shared->lock);
+	return true;
+}
+
+/* Count every rejected page attempt, but do not flood the log when a hot or
+ * unavailable page is selected again. The throttle belongs to this node's
+ * boot/membership cut, not a batch nonce or a checkpoint. No diagnostic
+ * observation authorizes retirement or removes the page from later scans. */
+static void
+wb_rejected(ClusterPiWritebackRejectionV1 reason, const BufferTag *tag, int32 peer, uint64 epoch,
+			uint64 boot)
+{
+	static const char *const names[]
+		= { "DATA_PROOF", "LOCAL_ACK", "REMOTE_ACK", "MASTER_CUT", "PEER_PHYSICAL" };
+	bool log;
+	if (wb_shared == NULL || tag == NULL || (uint32)reason >= CLUSTER_PI_WRITEBACK_REJECTION_COUNT)
+		return;
+	SpinLockAcquire(&wb_shared->lock);
+	if (wb_shared->rejections.attempts[reason] != UINT64_MAX)
+		wb_shared->rejections.attempts[reason]++;
+	wb_shared->rejections.last_resource = *tag;
+	wb_shared->rejections.last_reason = reason;
+	wb_shared->rejections.last_peer = peer;
+	log = wb_shared->logged_epoch[reason] != epoch || wb_shared->logged_boot[reason] != boot;
+	if (log) {
+		wb_shared->logged_epoch[reason] = epoch;
+		wb_shared->logged_boot[reason] = boot;
+		if (wb_shared->rejections.log_events != UINT64_MAX)
+			wb_shared->rejections.log_events++;
+	}
+	SpinLockRelease(&wb_shared->lock);
+	if (log)
+		elog(LOG,
+			 "PGRAC_FAMILY=PI_WRITEBACK action=PAGE_DEFERRED stage=%s "
+			 "resource=%u/%u/%u/%u/%u peer=%d epoch=" UINT64_FORMAT " boot=" UINT64_FORMAT,
+			 names[reason], tag->spcOid, tag->dbOid, tag->relNumber, tag->forkNum, tag->blockNum,
+			 peer, epoch, boot);
+}
 
 static void
 wb_forget_batch(void)
@@ -849,7 +901,10 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 		if (valid) {
 			reply.peer = native.ref;
 			reply.facts[reply.count++] = request.facts[i];
-		}
+		} else
+			wb_rejected(CLUSTER_PI_WRITEBACK_PEER_PHYSICAL, wb_tag(&request.facts[i]),
+						wb_master(&request.facts[i]), request.epoch,
+						request.peer.claim.identity.origin_owner_incarnation);
 		cluster_page_data_pi_ack_free_v1(&ack);
 		cluster_page_data_receipt_free_v1(&receipt);
 	}
@@ -1081,6 +1136,10 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 					  || cluster_page_data_pi_storage_proof_v1(wb_batch->receipts[i], page,
 															   wb_batch->sources,
 															   wb_batch->source_count, &s));
+			if (!wb_batch->qualified[i])
+				wb_rejected(CLUSTER_PI_WRITEBACK_DATA_PROOF, &wb_batch->tags[i], cluster_node_id,
+							wb_batch->epoch,
+							wb_batch->local.claim.identity.origin_owner_incarnation);
 		}
 	}
 	page = cluster_thread_recovery_fabric_page_plan_v1(wb_batch->plan);
@@ -1112,6 +1171,9 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 							wb_batch->receipts[i], page, wb_batch->sources, wb_batch->source_count,
 							wb_batch->inputs, &wb_batch->acks[i][n])) {
 						wb_batch->qualified[i] = false;
+						wb_rejected(CLUSTER_PI_WRITEBACK_LOCAL_ACK, &wb_batch->tags[i], node,
+									wb_batch->epoch,
+									wb_batch->local.claim.identity.origin_owner_incarnation);
 						continue;
 					}
 					wb_batch->ack_count[i]++;
@@ -1138,6 +1200,9 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 				|| !cluster_page_data_pi_ack_import_v1(
 					wb_batch->physical_job, j, wb_batch->receipts[i], &wb_batch->acks[i][n])) {
 				wb_batch->qualified[i] = false;
+				wb_rejected(CLUSTER_PI_WRITEBACK_REMOTE_ACK, &wb_batch->tags[i], node,
+							wb_batch->epoch,
+							wb_batch->local.claim.identity.origin_owner_incarnation);
 				continue;
 			}
 			wb_batch->ack_count[i]++;
@@ -1149,18 +1214,22 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 		goto done;
 	for (uint32 i = 0; i < wb_batch->count; i++) {
 		uint32 holders;
+		bool completed;
 		if (!wb_batch->qualified[i])
 			continue;
 		if (wb_batch->write_cuts[i].binding_generation != 0)
-			(void)cluster_pcm_lock_pi_write_complete_v1(
+			completed = cluster_pcm_lock_pi_write_complete_v1(
 				wb_batch->receipts[i], page, wb_batch->sources, wb_batch->source_count,
 				(const ClusterPiPhysicalAckV1 *const *)wb_batch->acks[i], wb_batch->ack_count[i],
 				&holders);
 		else
-			(void)cluster_pcm_lock_pi_storage_complete_v1(
+			completed = cluster_pcm_lock_pi_storage_complete_v1(
 				wb_batch->receipts[i], page, wb_batch->sources, wb_batch->source_count,
 				(const ClusterPiPhysicalAckV1 *const *)wb_batch->acks[i], wb_batch->ack_count[i],
 				&holders);
+		if (!completed)
+			wb_rejected(CLUSTER_PI_WRITEBACK_MASTER_CUT, &wb_batch->tags[i], cluster_node_id,
+						wb_batch->epoch, wb_batch->local.claim.identity.origin_owner_incarnation);
 	}
 	goto done;
 wait:

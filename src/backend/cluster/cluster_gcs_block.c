@@ -3171,6 +3171,9 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 								  cluster_node_id)));
 	*out_retry_denied = false;
+	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config, transition_id))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("cluster_gcs_send_block_request_and_wait: NULL BufferDesc"),
@@ -6448,6 +6451,9 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, const PcmAuthority
 								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 								  cluster_node_id)));
 	*out_retry_denied = false;
+	if (cluster_shared_config)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
 	holder_node = expected->x_holder_node;
 	if (expected->state != PCM_STATE_X || holder_node < 0 || holder_node >= 32
 		|| holder_node == cluster_node_id || expected->s_holders_bitmap != 0
@@ -15728,6 +15734,15 @@ gcs_block_resource_x_target_eviction_recheck_result(const BufferTag *tag,
 	return connection_sampled ? session_result : RESOURCE_X_APPLY_BAD_STATE;
 }
 
+void
+cluster_gcs_resource_x_target_evict_release_refs(ResourceXTargetEvictionPlan *plan)
+{
+	if (plan != NULL
+		&& (!cluster_page_wal_ref_release_v1(&plan->pi_refs[0])
+			|| !cluster_page_wal_ref_release_v1(&plan->pi_refs[1])))
+		elog(PANIC, "cached-X eviction lost its reserved WAL reference");
+}
+
 /* Freeze the existing kind-4 RELEASE_X while the descriptor is still the
  * exact X+REVOKING residency.  Entry-local EVICTING is lifecycle ownership,
  * never authority; every failure before local commit drops it exactly. */
@@ -15736,6 +15751,7 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 												  const ClusterPcmOwnSnapshot *exact_x,
 												  uint64 r4_record_generation,
 												  uint64 reservation_token,
+												  const ClusterPageWalBindingV1 *wal,
 												  ResourceXTargetEvictionPlan *plan_out)
 {
 	ClusterSemanticAdmissionToken admission;
@@ -15796,13 +15812,27 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 		else
 			result = gcs_block_resource_x_target_peer_result_exact(&admission, master_node,
 																   sender_connection_generation);
+		if (result == RESOURCE_X_APPLY_APPLIED && wal != NULL) {
+			ClusterPageWalBindingV1 flushed;
+			BufferTag wal_tag;
+
+			InitBufferTag(&wal_tag, &wal->identity.locator, wal->identity.forknum,
+						  wal->identity.blockno);
+			/* Native WAL confirmation may wait. No buffer or entry lock is held,
+			 * and the original descriptor remains X+REVOKING throughout. */
+			if (!cluster_shared_config || !BufferTagsEqual(tag, &wal_tag)
+				|| !cluster_page_wal_flush_source_v1(wal, &flushed)
+				|| !cluster_page_wal_ref_retain_v1(&flushed, &plan_out->pi_refs[0])
+				|| !cluster_page_wal_ref_retain_v1(&flushed, &plan_out->pi_refs[1]))
+				result = RESOURCE_X_APPLY_BAD_STATE;
+		}
 		if (result == RESOURCE_X_APPLY_APPLIED)
 			result = cluster_pcm_lock_resource_x_target_evict_prepare_exact(
 				tag, master_node, gate.formation, master_session, r4_record_generation,
 				exact_x->generation, reservation_token, sender_connection_generation,
 				(int32)MyProc->pgprocno, &release, &owner);
 		if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE) {
-			memcpy((void *)&cleanup_owner, &owner, sizeof(owner));
+			cleanup_owner = owner;
 			owner_claimed = true;
 		}
 		if (owner_claimed
@@ -15837,10 +15867,11 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 	}
 	PG_CATCH();
 	{
+		cluster_gcs_resource_x_target_evict_release_refs(plan_out);
 		if (owner_claimed) {
 			ResourceXLocalOwnerHandle catch_owner;
 
-			memcpy(&catch_owner, (const void *)&cleanup_owner, sizeof(catch_owner));
+			catch_owner = cleanup_owner;
 			abort_result = cluster_pcm_lock_resource_x_target_evict_abort_exact(&catch_owner);
 			if (abort_result != RESOURCE_X_APPLY_APPLIED)
 				gcs_block_resource_x_fail_closed_current();
@@ -15850,6 +15881,8 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 	}
 	PG_END_TRY();
 	cluster_semantic_activation_leave(&admission);
+	if (!plan_out->prepared)
+		cluster_gcs_resource_x_target_evict_release_refs(plan_out);
 	return result;
 }
 
@@ -15899,6 +15932,14 @@ cluster_gcs_resource_x_target_evict_publish_exact(ResourceXTargetEvictionPlan *p
 			plan->sender_connection_generation, &admission);
 		if (result == RESOURCE_X_APPLY_BAD_STATE)
 			*retry_pending_out = true;
+		if (result == RESOURCE_X_APPLY_APPLIED && !plan->pi_recorded) {
+			if (plan->pi_refs[0].source_flags != 0 || plan->pi_refs[1].source_flags != 0)
+				result = cluster_pcm_lock_resource_x_target_evict_record_pi_exact(plan);
+			else
+				plan->pi_recorded = true; /* No attributed source; no invented PI proof. */
+			if (result == RESOURCE_X_APPLY_APPLIED)
+				cluster_gcs_resource_x_target_evict_release_refs(plan);
+		}
 		if (result == RESOURCE_X_APPLY_APPLIED && !plan->release_admitted) {
 			if (plan->master_node == cluster_node_id)
 				result = cluster_pcm_lock_resource_x_release_x_exact(
@@ -15961,6 +16002,7 @@ cluster_gcs_resource_x_target_evict_abort_exact(ResourceXTargetEvictionPlan *pla
 		plan->prepared = false;
 		memset(&plan->owner, 0, sizeof(plan->owner));
 	}
+	cluster_gcs_resource_x_target_evict_release_refs(plan);
 	return result;
 }
 
@@ -16274,6 +16316,13 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		return;
 
 	req = (const GcsBlockRequestPayload *)payload;
+	/* Reject before dedup, image copy or pending-X authority changes. */
+	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config,
+											 (PcmLockTransition)req->transition_id)) {
+		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
+							 InvalidXLogRecPtr, NULL);
+		return;
+	}
 
 	/*
 	 * spec-5.16 D3b (r3 P1 + sr1-②, INV-R8/R14) — master-side hard gate, BEFORE
@@ -18192,6 +18241,11 @@ cluster_gcs_block_lmon_handle_direct_land_completion(int32 peer_node, uint64 wr_
 							  || status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
 							  || status == GCS_BLOCK_REPLY_DENIED_LOST_WRITE);
 	}
+	if (cluster_shared_config
+		&& (!cluster_pcm_legacy_transition_allowed(true, (PcmLockTransition)hdr->transition_id)
+			|| status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+			|| status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE))
+		identity_ok = false;
 	if (!identity_ok) {
 		gcs_block_direct_fail_slot(blk, slot, GCS_BLOCK_DIRECT_ABORT_BAD_IDENTITY, false, NULL);
 		return;
@@ -19093,6 +19147,12 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 		return;
 	}
 
+	if (cluster_shared_config && !GcsBlockReplyStatusIsR4((GcsBlockReplyStatus)hdr->status)
+		&& (!cluster_pcm_legacy_transition_allowed(true, (PcmLockTransition)hdr->transition_id)
+			|| hdr->status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+			|| hdr->status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE))
+		return;
+
 	/* HC80: direct index by requester_backend_id (1..MaxBackends → 0..MaxBackends-1). */
 	backend_idx = hdr->requester_backend_id - 1;
 	if (backend_idx < 0 || backend_idx >= MaxBackends)
@@ -19604,6 +19664,13 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	 * (e1 release-side) path untouched (§3.4b: never force the holder).
 	 * MUST branch before the ship-image copy below: a nudge ships nothing.
 	 */
+	if (cluster_shared_config
+		&& (GcsBlockForwardPayloadIsXTransfer(fwd)
+			|| !cluster_pcm_legacy_transition_allowed(true, (PcmLockTransition)fwd->transition_id))) {
+		gcs_block_forward_reply_immediate_deny(fwd);
+		return;
+	}
+
 	if (GcsBlockForwardPayloadIsBastNudge(fwd)) {
 		bool yielded = false;
 

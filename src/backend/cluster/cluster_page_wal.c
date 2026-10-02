@@ -274,6 +274,41 @@ cluster_page_wal_pi_snapshot_locked_v1(BufferDesc *buf, ClusterPageWalBindingV1 
 	return true;
 }
 
+ClusterPageWalCaptureResultV1
+cluster_page_wal_eviction_snapshot_locked_v1(BufferDesc *buf, const ClusterPcmOwnSnapshot *fence,
+											 uint32 caller_pins, ClusterPageWalBindingV1 *out)
+{
+	ClusterPageWalBindingV1 value;
+	uint32 state;
+	if (buf == NULL || fence == NULL || out == NULL || buf->buf_id < 0 || buf->buf_id >= NBuffers
+		|| caller_pins > 1)
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	state = pg_atomic_read_u32(&buf->state);
+	if ((state & (BM_LOCKED | BM_VALID | BM_TAG_VALID)) != (BM_LOCKED | BM_VALID | BM_TAG_VALID)
+		|| (state & (BM_DIRTY | BM_IO_ERROR | BM_IO_IN_PROGRESS)) != 0
+		|| BUF_STATE_GET_REFCOUNT(state) != caller_pins || !BufferTagsEqual(&buf->tag, &fence->tag)
+		|| buf->pcm_state != PCM_STATE_X || fence->pcm_state != PCM_STATE_X
+		|| buf->buffer_type != fence->buffer_type || fence->flags != PCM_OWN_FLAG_REVOKING
+		|| fence->reservation_token == 0 || fence->reservation_token == UINT64_MAX
+		|| fence->writer_activation_token != 0 || fence->resource_x_activation_generation != 0
+		|| fence->generation == 0 || fence->generation == UINT64_MAX
+		|| cluster_pcm_own_gen_get(buf->buf_id) != fence->generation
+		|| cluster_pcm_own_flags_get(buf->buf_id) != fence->flags
+		|| cluster_pcm_own_reservation_token_get(buf->buf_id) != fence->reservation_token
+		|| cluster_pcm_own_writer_activation_token_get(buf->buf_id) != 0
+		|| cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id) != 0)
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	if (bindings == NULL || bindings[buf->buf_id].source_flags == 0)
+		return CLUSTER_PAGE_WAL_UNATTRIBUTED;
+	if ((state & BM_PERMANENT) == 0 || !page_wal_expand(buf, &value)
+		|| !cluster_page_wal_binding_matches_v1(&value, BufTagGetRelFileLocator(&buf->tag),
+												buf->tag.forkNum, buf->tag.blockNum,
+												BufferGetPage(BufferDescriptorGetBuffer(buf))))
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	*out = value;
+	return CLUSTER_PAGE_WAL_CAPTURED;
+}
+
 bool
 cluster_page_wal_prepare_install_v1(Buffer buffer, const ClusterPageWalBindingV1 *carrier,
 									Page image, ClusterPageWalInstallV1 *prepared)

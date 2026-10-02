@@ -53,8 +53,10 @@
 #include "port/pg_crc32c.h"
 #include "postmaster/interrupt.h"
 #include "storage/fd.h"
+#include "storage/latch.h"
 #include "utils/timestamp.h"
 #include "utils/memutils.h"
+#include "utils/wait_event.h"
 
 #define CONTROL_ROOT_HEADER_MAGIC "PGCH"
 #define CONTROL_ROOT_RECORD_MAGIC "PGRT"
@@ -9286,7 +9288,20 @@ recovery_complete_v3_work(RecoveryCompleteV3Work *work, const ClusterControlRoot
 	uint8 storage_uuid[16];
 	uint32 node = expected->origin_thread_id - 1;
 
-	pinned = cluster_wal_retention_root_publish_begin_exact(expected, true, &work->walr);
+	/* Keep this recovery's sealed S through short reader conflicts. Each
+	 * attempt rechecks the original owner and confirmed IR release; no CF
+	 * lock, DATA work or converted guard may span the backoff. Exhaustion
+	 * leaves the original worker responsible for deferral and cleanup. */
+	for (int attempt = 0; attempt < 8; attempt++) {
+		pinned = cluster_wal_retention_root_publish_begin_exact(expected, true, &work->walr);
+		if (pinned != CLUSTER_WAL_PIN_UNAVAILABLE || work->walr != NULL || attempt == 7)
+			break;
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						1L << Min(attempt, 5), WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
+		CHECK_FOR_INTERRUPTS();
+	}
 	if (pinned != CLUSTER_WAL_PIN_OK)
 		return pinned == CLUSTER_WAL_PIN_INVALID ? CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT
 			   : pinned == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
