@@ -85,7 +85,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_undo_block0 test_cluster_undo_block0_current test_cluster_undo_smgr_publication test_cluster_terminal_ref_census test_cluster_cr test_cluster_cr_cache test_cluster_cr_key test_cluster_cr_pool test_cluster_cr_lifecycle test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_resolver_cache test_cluster_cr_coordinator test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_tx_enqueue test_cluster_r4_wire_codec test_cluster_r4_route_policy test_cluster_r4_slot_machine test_cluster_r4_lms_controls test_cluster_r4_slot_reservation test_cluster_r4_observe test_cluster_r4_cr_walk test_cluster_r4_multi_subx_2pc test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order test_cluster_r4_scratch_resolver test_cluster_tt_durable test_cluster_terminal_authority test_cluster_sf_dep \
         test_cluster_r4_itl_capacity \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
-        test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
+        test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent test_cluster_undo_extent_claim \
         test_cluster_wal_thread test_cluster_wal_checkpoint_sample test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_wal_cut test_cluster_pi_data test_cluster_thread_tail test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
         test_cluster_backup test_cluster_retained_remote \
         test_cluster_recovery_worker test_cluster_recovery_merge test_cluster_remote_xact test_cluster_remote_xact_writer \
@@ -418,6 +418,7 @@ SIMPLE_TESTS := $(filter-out test_pgrac_fenced_target_client,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_hw_handoff,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge_reader,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_epq_wait,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_undo_extent_claim,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_rf_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_detached,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_guard,$(SIMPLE_TESTS))
@@ -4195,6 +4196,7 @@ clean distclean maintainer-clean:
 		test_cluster_ctrc_dispatch.inc \
 		test_cluster_ctrc_run_pass.inc \
 		test_cluster_undo_cleaner_holds.inc \
+		test_cluster_undo_extent_types.inc test_cluster_undo_extent_claim.inc \
 		$(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
 		$(CLUSTER_QVOTEC_PGSA_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_TEST_O) \
 		$(CLUSTER_XLOG_INSERT_END_TEST_O) \
@@ -6892,6 +6894,27 @@ test_cluster_undo_cleaner_holds.inc: $(top_srcdir)/src/backend/storage/buffer/bu
 	     { print "bool"; emit=1; count++ } emit { print } /^}/ { emit=0 } \
 	     END { if (count != 4) exit 1 }' $(filter %.c,$^) > $@.tmp
 	mv $@.tmp $@
+
+test_cluster_undo_extent_types.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_record.c Makefile
+	awk '/^typedef struct ClusterUndoRecordShared / { emit=1; count++ } \
+	     /^typedef enum UndoExtentClaimResult / { emit=1; count++ } \
+	     emit { print } /^} (ClusterUndoRecordShared|UndoExtentClaimResult);/ { emit=0 } \
+	     END { if (count != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_undo_extent_claim.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_record.c Makefile
+	awk '/^claim_undo_extent\(/ { print "static UndoExtentClaimResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_undo_extent_claim: test_cluster_undo_extent_claim.c unit_test.h \
+		test_cluster_undo_extent_types.inc test_cluster_undo_extent_claim.inc \
+		$(top_srcdir)/src/include/cluster/cluster_undo_extent.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
 test_cluster_undo_cleaner_capacity: test_cluster_undo_cleaner_capacity.c test_cluster_undo_cleaner_holds.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_cleaner.c \
