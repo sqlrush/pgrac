@@ -597,10 +597,85 @@ recovery_advances_prepare(SpaceRecoveryNode *nodes, uint32 count,
 }
 
 static bool
+recovery_prefix_prepare(const SpaceRecoveryNode *nodes, const uint32 *ordered, uint32 count,
+						uint32 through, bool has_structural, const ClusterSpaceIdentity *target_id,
+						uint64 target_id_token, const ClusterSpaceReservation *target_res,
+						uint64 target_res_token, const void *identity_page,
+						const void *reservation_page, ClusterSpaceRecoveryImage *prepared)
+{
+	const ClusterSpaceReservationChange *reservation = &nodes[ordered[through]].change.reservation;
+	const ClusterSpaceIdentity *identity = target_id;
+	uint64 id_token = target_id_token;
+	uint32 id_source = UINT32_MAX;
+	bool id_later = false, res_later = false;
+
+	/* The complete chain and both targets have already passed validation.
+	 * Reuse those decoded nodes; a prefix must never hide a bad suffix. */
+	for (uint32 i = 0; i < count; i++) {
+		const SpaceRecoveryNode *node = &nodes[ordered[i]];
+
+		if (node->structural) {
+			identity = &node->change.identity.expected;
+			id_token = node->change.identity.before_token;
+			break;
+		}
+	}
+	for (uint32 i = 0; i <= through; i++) {
+		const SpaceRecoveryNode *node = &nodes[ordered[i]];
+
+		if (node->structural) {
+			identity = &node->change.identity.result;
+			id_token = node->change.identity.result_token;
+			id_source = ordered[i];
+		}
+	}
+	for (uint32 i = through + 1; i < count; i++) {
+		const SpaceRecoveryNode *node = &nodes[ordered[i]];
+
+		if (node->structural)
+			id_later |= recovery_identity_member(target_id, target_id_token,
+												 &node->change.identity.result,
+												 node->change.identity.result_token);
+		res_later |= recovery_reservation_member(target_res, target_res_token,
+												 &node->change.reservation.result,
+												 node->change.reservation.result_token);
+	}
+	/* Only an ADVANCE-only cut permits an omitted survivor interval. The
+	 * full validator has checked the exact LIVE identity and all token
+	 * collisions before this monotone HWM comparison. */
+	if (!has_structural)
+		res_later = target_res->next_block > reservation->result.next_block;
+
+	prepared->apply_mask = 0;
+	prepared->source_index[0] = id_later ? UINT32_MAX : id_source;
+	prepared->source_index[1] = res_later ? UINT32_MAX : ordered[through];
+	if (id_later || recovery_identity_member(target_id, target_id_token, identity, id_token))
+		memcpy(prepared->pages[0].data, identity_page, BLCKSZ);
+	else {
+		if (!cluster_space_identity_page_encode(identity, id_token, prepared->pages[0].data,
+												BLCKSZ))
+			return false;
+		prepared->apply_mask |= 1;
+	}
+	if (res_later
+		|| recovery_reservation_member(target_res, target_res_token, &reservation->result,
+									   reservation->result_token))
+		memcpy(prepared->pages[1].data, reservation_page, BLCKSZ);
+	else {
+		if (!cluster_space_reservation_page_encode(&reservation->result, reservation->result_token,
+												   prepared->pages[1].data, BLCKSZ))
+			return false;
+		prepared->apply_mask |= 2;
+	}
+	prepared->covered_by_successor_mask |= (id_later ? 1 : 0) | (res_later ? 2 : 0);
+	return true;
+}
+
+static bool
 space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 					   const ClusterSpaceIdentityKey *expected, const void *identity_page,
 					   const void *reservation_page, uint32 *order, ClusterSpaceRecoveryImage *out,
-					   bool check_target)
+					   bool check_target, uint32 through)
 {
 	SpaceRecoveryNode *nodes = NULL;
 	SpaceRecoveryIndex *before = NULL, *result = NULL;
@@ -612,7 +687,7 @@ space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 	uint32 head = UINT32_MAX, cursor;
 	bool id_member, res_member, has_structural = false, ok = false;
 
-	if (inputs == NULL || count == 0 || expected == NULL || order == NULL
+	if (inputs == NULL || count == 0 || through >= count || expected == NULL || order == NULL
 		|| (check_target && (identity_page == NULL || reservation_page == NULL || out == NULL))
 		|| cluster_space_recovery_scratch_bytes(count) == 0)
 		return false;
@@ -659,6 +734,11 @@ space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 		if (!recovery_advances_prepare(nodes, count, &target_id, target_id_token, &target_res,
 									   target_res_token, identity_page, reservation_page, before,
 									   result, ordered, &prepared, check_target))
+			goto done;
+		if (check_target && through < count - 1
+			&& !recovery_prefix_prepare(nodes, ordered, count, through, false, &target_id,
+										target_id_token, &target_res, target_res_token,
+										identity_page, reservation_page, &prepared))
 			goto done;
 		memcpy(order, ordered, (size_t)count * sizeof(*order));
 		if (check_target)
@@ -753,6 +833,11 @@ space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 			goto done;
 		prepared.apply_mask |= 2;
 	}
+	if (through < count - 1
+		&& !recovery_prefix_prepare(nodes, ordered, count, through, true, &target_id,
+									target_id_token, &target_res, target_res_token, identity_page,
+									reservation_page, &prepared))
+		goto done;
 	memcpy(order, ordered, (size_t) count * sizeof(*order));
 	*out = prepared;
 	ok = true;
@@ -771,13 +856,24 @@ cluster_space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 c
 							   ClusterSpaceRecoveryImage *out)
 {
 	return space_recovery_prepare(inputs, count, expected, identity_page, reservation_page, order,
-								  out, true);
+								  out, true, count - 1);
 }
 
 bool
 cluster_space_recovery_order(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 							 const ClusterSpaceIdentityKey *expected, uint32 *order)
 {
-	return space_recovery_prepare(inputs, count, expected, NULL, NULL, order, NULL, false);
+	return space_recovery_prepare(inputs, count, expected, NULL, NULL, order, NULL, false,
+								  count - 1);
+}
+
+bool
+cluster_space_recovery_prepare_through(const ClusterSpaceRecoveryInput *inputs, uint32 count,
+									   uint32 through, const ClusterSpaceIdentityKey *expected,
+									   const void *identity_page, const void *reservation_page,
+									   uint32 *order, ClusterSpaceRecoveryImage *out)
+{
+	return space_recovery_prepare(inputs, count, expected, identity_page, reservation_page, order,
+								  out, true, through);
 }
 #endif

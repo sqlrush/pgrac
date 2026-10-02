@@ -128,6 +128,16 @@ extern bool cluster_space_recovery_prepare(const ClusterSpaceRecoveryInput *inpu
 										  uint32 count, const ClusterSpaceIdentityKey *expected,
 										  const void *identity_page, const void *reservation_page,
 										  uint32 *order, ClusterSpaceRecoveryImage *out);
+/* Validate the same complete input, but prepare through one position in its
+ * canonical order. A component already beyond that position is preserved
+ * with explicit successor coverage and no borrowed WAL source. This does
+ * not authorize structural I/O or replace its durability qualification. */
+extern bool cluster_space_recovery_prepare_through(const ClusterSpaceRecoveryInput *inputs,
+												   uint32 count, uint32 through,
+												   const ClusterSpaceIdentityKey *expected,
+												   const void *identity_page,
+												   const void *reservation_page, uint32 *order,
+												   ClusterSpaceRecoveryImage *out);
 /* Heap scratch used by preparation, or zero for an unrepresentable size. */
 extern size_t cluster_space_recovery_scratch_bytes(uint32 count);
 
