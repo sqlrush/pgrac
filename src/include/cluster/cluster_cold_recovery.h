@@ -363,15 +363,17 @@ extern ClusterColdRouteV1 cluster_cold_route_v1(bool shared_config, bool merge_e
 /*
  * Consumers pass 2 needs from their owners: the per-block redo consultation
  * (R-A2), the complete participant census (R-A4), typed owners for other
- * generations' non-page effects and the XID/OID/MX/SCN bounds (R-A5), and
- * recovery completion publication (R-A7).  Each flag is set only once the
- * cold driver calls that consumer.
+ * generations' non-page effects and the XID/OID/MX/SCN bounds (R-A5),
+ * recovery completion publication (R-A7), and a restartpoint owner that
+ * holds own-thread checkpoints inside the cold replay window (R-A9).  Each
+ * flag is set only once that consumer exists.
  */
 typedef struct ClusterColdHandshakeV1 {
 	bool redo_block_hook;
 	bool participant_census;
 	bool side_owners;
 	bool completion_publish;
+	bool restartpoint_hold;
 } ClusterColdHandshakeV1;
 
 /* True only when every consumer exists; with no redo consultation, any page
@@ -390,6 +392,16 @@ typedef enum ClusterColdPageActionV1 {
 } ClusterColdPageActionV1;
 
 extern ClusterColdPageActionV1 cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own);
+
+/*
+ * Typed cold replay window of the startup process (pass 2, from the first
+ * replayed record to completion).  The cold cut must not move while it is
+ * open, so the restartpoint owner does not adopt own-thread checkpoint
+ * records replayed inside it (handshake restartpoint_hold).
+ */
+extern void cluster_cold_replay_window_enter_v1(void);
+extern void cluster_cold_replay_window_leave_v1(void);
+extern bool cluster_cold_replay_window_active_v1(void);
 
 /* True when a page that passed verification has proven content: data
  * checksums are on and a checksum failure is not being ignored. */

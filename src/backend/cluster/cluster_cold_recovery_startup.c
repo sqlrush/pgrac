@@ -345,6 +345,9 @@ cluster_cold_typed_ready_v1(const ClusterColdTypedV1 *typed,
 						   "no typed side owners or XID/OID/MX/SCN bound merge (R-A5)");
 	if (!handshake->completion_publish)
 		cold_reason_append(reason, reason_size, "no recovery completion publication (R-A7)");
+	if (!handshake->restartpoint_hold)
+		cold_reason_append(reason, reason_size,
+						   "no restartpoint hold while the cold cut is replayed (R-A9)");
 	steps = cluster_cold_plan_step_count_v1(typed->plan);
 	for (i = 0; i < steps; i++) {
 		ClusterColdStepV1 step;
@@ -378,6 +381,26 @@ bool
 cluster_cold_checksum_proves_content_v1(bool checksums_enabled, bool ignore_checksum_failure)
 {
 	return checksums_enabled && !ignore_checksum_failure;
+}
+
+static bool cold_replay_window = false;
+
+void
+cluster_cold_replay_window_enter_v1(void)
+{
+	cold_replay_window = true;
+}
+
+void
+cluster_cold_replay_window_leave_v1(void)
+{
+	cold_replay_window = false;
+}
+
+bool
+cluster_cold_replay_window_active_v1(void)
+{
+	return cold_replay_window;
 }
 
 /* Pass-2 verdicts of the one record being applied, startup process only. */

@@ -142,7 +142,11 @@
  *	              set is taken; pass 2
  *	              (cluster_recovery_typed_replay) replays the sealed
  *	              schedule, matching every page record to its pass-1
- *	              identity.  The legacy profile keeps the SCN merge.
+ *	              identity.  Pass 2 starts only once every consumer it
+ *	              needs exists (cluster_cold_typed_ready_v1), including a
+ *	              restartpoint owner that does not adopt own checkpoints
+ *	              replayed inside it.  Without shared_config a cold merge
+ *	              of several threads is refused before any fence or claim.
  *	Why:          Retained history before a native redo start is ancestry
  *	              only; SCN order with unconditional full-page images can
  *	              overwrite a newer durable page another thread wrote.
@@ -3050,10 +3054,11 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 
 /*
  * Consumers this cold driver calls (cluster_cold_typed_ready_v1).  The
- * per-block redo consultation exists once its owner publishes the
- * handshake macro; the participant census, other generations' typed side
- * owners with the XID/OID/MX/SCN bound merge, and completion publication
- * are not wired yet, so every typed plan currently refuses before IR.
+ * per-block redo consultation and the restartpoint hold exist once their
+ * owners publish the handshake macros; the participant census, other
+ * generations' typed side owners with the XID/OID/MX/SCN bound merge, and
+ * completion publication are not wired yet, so every typed plan currently
+ * refuses before IR.
  */
 static const ClusterColdHandshakeV1 cluster_cold_handshake = {
 #ifdef CLUSTER_COLD_REDO_HOOK_CONSUMER_V1
@@ -3064,6 +3069,11 @@ static const ClusterColdHandshakeV1 cluster_cold_handshake = {
 	.participant_census = false,
 	.side_owners = false,
 	.completion_publish = false,
+#ifdef CLUSTER_COLD_RESTARTPOINT_HOLD_CONSUMER_V1
+	.restartpoint_hold = true,
+#else
+	.restartpoint_hold = false,
+#endif
 };
 
 /*
@@ -3437,6 +3447,7 @@ cluster_recovery_typed_replay(ClusterColdTypedV1 **typed_address, TimeLineID *re
 										  "the selected source cannot be opened");
 		rep->last_end[i] = typed->participants[i].native_redo;
 	}
+	cluster_cold_replay_window_enter_v1();
 	cluster_recovery_merge_window_enter();
 	cluster_recovery_merge_set_own_lsn((uint64) typed->participants[typed->own_participant].native_redo);
 	for (i = 0; i < steps; i++)
@@ -3458,6 +3469,7 @@ cluster_recovery_typed_replay(ClusterColdTypedV1 **typed_address, TimeLineID *re
 	for (i = 0; i < typed->participant_count; i++)
 		cluster_cold_reader_close_v1(&rep->readers[i]);
 	cluster_typed_replay_finish(rep);
+	cluster_cold_replay_window_leave_v1();
 	ereport(LOG,
 			(errmsg("cluster typed cold recovery: replay complete (own thread %u)",
 					(unsigned) typed->participants[typed->own_participant].thread_id),

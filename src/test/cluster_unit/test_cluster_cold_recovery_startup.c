@@ -447,13 +447,21 @@ sealed_with_steps(bool all_skip)
  * record without the per-block redo consultation. */
 UT_TEST(test_ready_requires_every_consumer_before_ir)
 {
-	ClusterColdHandshakeV1 none = { false, false, false, false };
-	ClusterColdHandshakeV1 all = { true, true, true, true };
-	ClusterColdHandshakeV1 no_hook = { false, true, true, true };
-	ClusterColdHandshakeV1 no_side = { true, true, false, true };
+	ClusterColdHandshakeV1 none = { 0 };
+	ClusterColdHandshakeV1 all = { .redo_block_hook = true,
+								   .participant_census = true,
+								   .side_owners = true,
+								   .completion_publish = true,
+								   .restartpoint_hold = true };
+	ClusterColdHandshakeV1 no_hook = all;
+	ClusterColdHandshakeV1 no_side = all;
+	ClusterColdHandshakeV1 no_hold = all;
 	ClusterColdTypedV1 *typed = sealed_with_steps(false);
 	char reason[256];
 
+	no_hook.redo_block_hook = false;
+	no_side.side_owners = false;
+	no_hold.restartpoint_hold = false;
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
 	UT_ASSERT(!cluster_cold_typed_ready_v1(typed, &none, reason, sizeof(reason)));
 	UT_ASSERT(strstr(reason, "redo-block consultation") != NULL);
@@ -463,6 +471,9 @@ UT_TEST(test_ready_requires_every_consumer_before_ir)
 	UT_ASSERT(!cluster_cold_typed_ready_v1(typed, &no_hook, reason, sizeof(reason)));
 	UT_ASSERT(strstr(reason, "3 page records need") != NULL);
 	UT_ASSERT(!cluster_cold_typed_ready_v1(typed, &no_side, reason, sizeof(reason)));
+	/* The cut must stay fixed: no restartpoint may move a participant. */
+	UT_ASSERT(!cluster_cold_typed_ready_v1(typed, &no_hold, reason, sizeof(reason)));
+	UT_ASSERT(strstr(reason, "restartpoint") != NULL);
 	UT_ASSERT(cluster_cold_typed_ready_v1(typed, &all, reason, sizeof(reason)));
 	cluster_cold_typed_destroy_v1(&typed);
 
@@ -510,6 +521,19 @@ UT_TEST(test_unshared_multi_thread_cold_merge_refused)
 }
 
 /*
+ * The restartpoint owner holds own-thread checkpoints while typed cold
+ * replay runs; the window is visible only between enter and leave.
+ */
+UT_TEST(test_cold_replay_window_tracks_pass_two)
+{
+	UT_ASSERT(!cluster_cold_replay_window_active_v1());
+	cluster_cold_replay_window_enter_v1();
+	UT_ASSERT(cluster_cold_replay_window_active_v1());
+	cluster_cold_replay_window_leave_v1();
+	UT_ASSERT(!cluster_cold_replay_window_active_v1());
+}
+
+/*
  * PageIsVerifiedExtended accepts a sane header with a failed checksum when
  * ignore_checksum_failure is on; such a page must not count as proven
  * content, or a torn body would become a redo base.
@@ -537,6 +561,7 @@ main(void)
 	UT_RUN(test_skipped_own_record_advances_next_xid);
 	UT_RUN(test_unshared_multi_thread_cold_merge_refused);
 	UT_RUN(test_ignored_checksum_failure_does_not_prove_content);
+	UT_RUN(test_cold_replay_window_tracks_pass_two);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
