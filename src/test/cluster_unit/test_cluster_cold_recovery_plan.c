@@ -156,6 +156,22 @@ feed_plain(ClusterColdPlanV1 *plan, uint32 participant, XLogRecPtr read, XLogRec
 	return feed(plan, participant, read, end, 1, 0, NULL);
 }
 
+static ClusterColdDetailV1
+feed_flagged(ClusterColdPlanV1 *plan, uint32 participant, XLogRecPtr read, XLogRecPtr end,
+			 uint8 flags)
+{
+	ClusterColdRecordV1 record;
+
+	memset(&record, 0, sizeof(record));
+	record.read_rec_ptr = read;
+	record.end_rec_ptr = end;
+	record.scn = 1;
+	record.record_crc = (uint32)(read ^ end);
+	record.rmid = RM_SMGR_ID;
+	record.record_flags = flags;
+	return cluster_cold_plan_feed_v1(plan, participant, &record);
+}
+
 static void
 observe_set(ObserveTable *table, Oid rel, BlockNumber block, uint8 kind, RfPageVersionV1 version)
 {
@@ -860,10 +876,41 @@ UT_TEST(test_memory_budget_enforced)
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
+/* A destructive lifecycle record after the native redo start cannot be
+ * ordered against other generations' page records without its typed owner;
+ * the same record in retained history is already durable. */
+UT_TEST(test_structural_records_refused_after_native_redo)
+{
+	ClusterColdParticipantV1 parts[1] = { part(1, 11, 0x100, 0x1000, 0x2000) };
+	ClusterColdPlanV1 *plan = make_plan(parts, 1);
+	ClusterColdRecordV1 bad;
+
+	UT_ASSERT_EQ(feed_flagged(plan, 0, 0x100, 0x200, CLUSTER_COLD_RECORD_STRUCTURAL),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_plain(plan, 0, 0x200, 0x1000), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(feed_flagged(plan, 0, 0x1000, 0x1100, CLUSTER_COLD_RECORD_STRUCTURAL),
+				 CLUSTER_COLD_STRUCTURAL_UNSUPPORTED);
+	UT_ASSERT_EQ(feed_plain(plan, 0, 0x1100, 0x2000), CLUSTER_COLD_STATE);
+	cluster_cold_plan_destroy_v1(&plan);
+
+	plan = make_plan(parts, 1);
+	UT_ASSERT_EQ(feed_flagged(plan, 0, 0x100, 0x200, CLUSTER_COLD_RECORD_UNSUPPORTED),
+				 CLUSTER_COLD_STRUCTURAL_UNSUPPORTED);
+	cluster_cold_plan_destroy_v1(&plan);
+
+	plan = make_plan(parts, 1);
+	memset(&bad, 0, sizeof(bad));
+	bad.read_rec_ptr = 0x100;
+	bad.end_rec_ptr = 0x200;
+	bad.record_flags = 0x80;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &bad), CLUSTER_COLD_INVALID_ARGUMENT);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(26);
 	UT_RUN(test_lower_lag_old_fpi_cannot_overwrite_newer_durable);
 	UT_RUN(test_data_behind_history_is_refused);
 	UT_RUN(test_a_b_c_exact_order_ignores_scn_and_lsn);
@@ -889,6 +936,7 @@ main(void)
 	UT_RUN(test_new_page_starts_from_unformatted_or_absent);
 	UT_RUN(test_zero_page_with_redo_anchor_is_repaired);
 	UT_RUN(test_memory_budget_enforced);
+	UT_RUN(test_structural_records_refused_after_native_redo);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -73,7 +73,9 @@ typedef enum ClusterColdDetailV1 {
 	CLUSTER_COLD_DEADLOCK = 13,
 	CLUSTER_COLD_CAPACITY = 14,
 	CLUSTER_COLD_OOM = 15,
-	CLUSTER_COLD_STATE = 16 /* wrong phase or already failed */
+	CLUSTER_COLD_STATE = 16,				  /* wrong phase or already failed */
+	CLUSTER_COLD_STRUCTURAL_UNSUPPORTED = 17, /* lifecycle record needs its owner */
+	CLUSTER_COLD_OPCODE_UNSUPPORTED = 18	  /* outside the closed route registry */
 } ClusterColdDetailV1;
 
 /* Exact physical cut of one writer generation, all from one ROOT token. */
@@ -100,6 +102,18 @@ typedef struct ClusterColdComponentV1 {
 	RfPageVersionV1 result;
 } ClusterColdComponentV1;
 
+/*
+ * Record flags set by the decoder.  STRUCTURAL marks a relation lifecycle
+ * change (truncate, drop, identity tombstone, database/tablespace, relation
+ * map) whose ordering against other generations' page records needs its own
+ * typed owner; it is refused after the native redo start and accepted as
+ * already-durable history before it.  UNSUPPORTED marks input outside the
+ * supported profile (prepared transactions) and is refused anywhere.
+ */
+#define CLUSTER_COLD_RECORD_STRUCTURAL UINT8_C(0x01)
+#define CLUSTER_COLD_RECORD_UNSUPPORTED UINT8_C(0x02)
+#define CLUSTER_COLD_RECORD_KNOWN_FLAGS UINT8_C(0x03)
+
 /* Every decoded record of a participant is fed, in its LSN order.  Records
  * without ordinary page components only advance the participant cursor. */
 typedef struct ClusterColdRecordV1 {
@@ -109,6 +123,8 @@ typedef struct ClusterColdRecordV1 {
 	uint32 record_crc;
 	uint8 rmid;
 	uint8 info;
+	uint8 record_flags; /* CLUSTER_COLD_RECORD_* */
+	uint8 reserved_zero;
 	uint16 component_count;
 	const ClusterColdComponentV1 *components;
 } ClusterColdRecordV1;
@@ -207,5 +223,32 @@ extern bool cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 inde
 									  ClusterColdStepV1 *out);
 
 extern void cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan);
+
+#ifndef FRONTEND
+
+struct XLogReaderState;
+
+/*
+ * One native record mapped to plan input by the shared closed route
+ * registry.  record.components points into components[]; never copy a
+ * filled value, pass it by pointer.
+ */
+typedef struct ClusterColdDecodedV1 {
+	ClusterColdRecordV1 record;
+	ClusterColdComponentV1 components[CLUSTER_COLD_MAX_COMPONENTS];
+	uint8 route_owner;	/* RfRecordRouteOwnerV1 */
+	uint8 route_detail; /* RfPageProofDetailV1 of a refused record */
+} ClusterColdDecodedV1;
+
+/* Classify one decoded record of the exact source namespace.  Unsupported
+ * opcodes and routed side components fail with OPCODE_UNSUPPORTED; lifecycle
+ * and prepared-transaction records are flagged for the plan to judge. */
+extern ClusterColdDetailV1 cluster_cold_recovery_decode_v1(struct XLogReaderState *reader,
+														   uint64 system_identifier,
+														   const uint8 storage_uuid[16],
+														   bool space_active,
+														   ClusterColdDecodedV1 *out);
+
+#endif /* !FRONTEND */
 
 #endif /* CLUSTER_COLD_RECOVERY_H */

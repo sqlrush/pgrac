@@ -37,6 +37,8 @@
  */
 #include "postgres.h"
 
+#ifdef USE_PGRAC_CLUSTER
+
 #include "cluster/cluster_cold_recovery.h"
 
 #ifdef USE_CLUSTER_UNIT
@@ -485,11 +487,20 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 		return CLUSTER_COLD_STATE;
 	if (record == NULL || participant >= plan->participant_count
 		|| record->component_count > CLUSTER_COLD_MAX_COMPONENTS
-		|| (record->component_count != 0 && record->components == NULL))
+		|| (record->component_count != 0 && record->components == NULL)
+		|| (record->record_flags & ~CLUSTER_COLD_RECORD_KNOWN_FLAGS) != 0
+		|| record->reserved_zero != 0)
 		detail = CLUSTER_COLD_INVALID_ARGUMENT;
 	else {
 		owner = &plan->participants[plan->canonical[participant]];
 		detail = record_cursor_check(owner, record);
+		/* A durable lifecycle change before native redo is history; after
+		 * it, its order against other generations needs its own owner. */
+		if (detail == CLUSTER_COLD_OK
+			&& ((record->record_flags & CLUSTER_COLD_RECORD_UNSUPPORTED) != 0
+				|| ((record->record_flags & CLUSTER_COLD_RECORD_STRUCTURAL) != 0
+					&& record->end_rec_ptr > owner->cut.native_redo)))
+			detail = CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
 		if (detail == CLUSTER_COLD_OK)
 			detail = components_validate(plan, record);
 		if (detail == CLUSTER_COLD_OK && record->component_count != 0)
@@ -1097,3 +1108,5 @@ cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan_address)
 	cold_free(plan);
 	*plan_address = NULL;
 }
+
+#endif /* USE_PGRAC_CLUSTER */
