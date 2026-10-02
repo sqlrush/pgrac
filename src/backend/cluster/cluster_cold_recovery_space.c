@@ -9,7 +9,9 @@
  *	  at each SPACE step, the step's own input, so pages of an incarnation
  *	  are never replayed under a later one; after every stream is drained,
  *	  all of them.  Each input is stamped with the record end of the
- *	  generation that logged it.
+ *	  generation that logged it.  A TRUNCATE's shrink is repeated only at
+ *	  its own step and only for the forks pass 1 found no later proof of
+ *	  (shrink_forks).
  *
  *	  The install itself (physical action, stamping, write, fsync,
  *	  post-read) belongs to the SPACE owner.  Until it provides its cold
@@ -73,19 +75,21 @@ cold_space_inputs(const ClusterColdTypedV1 *typed, uint32 relation, uint32 count
 
 bool
 cluster_cold_typed_space_install_v1(const ClusterColdTypedV1 *typed, uint32 relation,
-									uint32 through)
+									uint32 through, bool step)
 {
 #ifdef CLUSTER_COLD_SPACE_OWNER_CONSUMER_V1
 	ClusterSpaceIdentityKey key;
 	ClusterSpaceRecoveryInput *inputs;
 	ClusterSpaceColdSourceV1 *sources;
+	ClusterColdSpaceInputV1 at;
 	uint32 count = 0;
 	bool installed;
 
 	memset(&key, 0, sizeof(key));
 	if (typed == NULL
 		|| !cluster_cold_plan_space_relation_v1(typed->plan, relation, &key.locator, &count)
-		|| through >= count)
+		|| through >= count
+		|| !cluster_cold_plan_space_input_v1(typed->plan, relation, through, &at))
 		return false;
 	key.system_identifier = typed->observer.system_identifier;
 	key.database_incarnation = typed->observer.database_incarnation;
@@ -94,8 +98,11 @@ cluster_cold_typed_space_install_v1(const ClusterColdTypedV1 *typed, uint32 rela
 														  MCXT_ALLOC_HUGE);
 	sources = (ClusterSpaceColdSourceV1 *)palloc_extended((Size)count * sizeof(*sources),
 														  MCXT_ALLOC_HUGE);
+	/* Only at its own step: once later pages are replayed, a shrink would
+	 * remove them. */
 	installed = cold_space_inputs(typed, relation, count, inputs, sources)
-				&& cluster_space_cold_install_v1(&key, inputs, sources, count, through);
+				&& cluster_space_cold_install_v1(&key, inputs, sources, count, through,
+												 step ? at.shrink_forks : 0);
 	pfree(sources);
 	pfree(inputs);
 	return installed;
@@ -103,6 +110,7 @@ cluster_cold_typed_space_install_v1(const ClusterColdTypedV1 *typed, uint32 rela
 	(void)typed;
 	(void)relation;
 	(void)through;
+	(void)step;
 	return false;
 #endif
 }

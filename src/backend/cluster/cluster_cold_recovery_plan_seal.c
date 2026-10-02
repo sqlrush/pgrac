@@ -267,8 +267,9 @@ data_incarnation_fits(const ClusterColdPlanV1 *plan, const ColdComponent *compon
  * (the first expected-before, or the unformatted/absent start of a new
  * page).  The token places DATA; the incarnation, read from the relation's
  * SPACE identity, only has to be one the block was carried through.
- * *stale reports retired content at a block a TRUNCATE did not carry,
- * which is never a redo base.  Anything else is refused.
+ * *stale reports retired content at a block a TRUNCATE did not carry, or
+ * any content past the size of a TRUNCATE pass 2 shrinks again, which is
+ * never a redo base.  Anything else is refused.
  */
 static ClusterColdDetailV1
 page_header_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
@@ -283,6 +284,11 @@ page_header_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 
 	*stale = false;
 	*position = -1;
+	/* Pass 2 shrinks the fork again before the page's first change. */
+	if (new_start && cold_plan_space_shrink_pending(plan, first)) {
+		*stale = true;
+		return CLUSTER_COLD_OK;
+	}
 	/* Only a relation created after a native redo start may lack one. */
 	if ((data->flags & CLUSTER_COLD_DATA_FLAG_NO_IDENTITY) != 0
 		&& !cold_plan_space_created_here(plan, first)) {

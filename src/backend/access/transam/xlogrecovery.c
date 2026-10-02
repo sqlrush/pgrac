@@ -143,8 +143,9 @@
  *	              (cluster_recovery_typed_replay) replays the sealed
  *	              schedule, matching every page record to its pass-1
  *	              identity; SPACE changes are installed by the SPACE owner
- *	              at their steps and in full at the end, never replayed
- *	              natively.  Pass 2 starts only once every consumer it
+ *	              at their steps (repeating a TRUNCATE's shrink only where
+ *	              nothing proves it durable) and in full at the end, never
+ *	              replayed natively.  Pass 2 starts only once every consumer it
  *	              needs exists (cluster_cold_typed_ready_v1), including a
  *	              restartpoint owner that does not adopt own checkpoints
  *	              replayed inside it.  Without shared_config a cold merge
@@ -3305,16 +3306,22 @@ cluster_typed_replay_space_refused(const RelFileLocator *locator, uint32 through
 	pg_unreachable();
 }
 
-/* Bring one SPACE relation through `through`, or stop recovery. */
+/*
+ * Bring one SPACE relation through `through`, or stop recovery.  `step`: at
+ * that input's own SPACE step, where a TRUNCATE's unproven shrink is
+ * repeated.
+ */
 static void
-cluster_typed_replay_space_install(ClusterColdTypedReplay *rep, uint32 relation, uint32 through)
+cluster_typed_replay_space_install(ClusterColdTypedReplay *rep, uint32 relation, uint32 through,
+								   bool step)
 {
 	RelFileLocator locator;
 	uint32		count = 0;
 
 	memset(&locator, 0, sizeof(locator));
 	if (!cluster_cold_plan_space_relation_v1(rep->typed->plan, relation, &locator, &count) ||
-		through >= count || !cluster_cold_typed_space_install_v1(rep->typed, relation, through))
+		through >= count ||
+		!cluster_cold_typed_space_install_v1(rep->typed, relation, through, step))
 		cluster_typed_replay_space_refused(&locator, through);
 }
 
@@ -3347,7 +3354,7 @@ cluster_typed_replay_space_step(ClusterColdTypedReplay *rep, uint32 participant,
 											 &input))
 			cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
 										  "a SPACE step lost its effects");
-		cluster_typed_replay_space_install(rep, relation, input);
+		cluster_typed_replay_space_install(rep, relation, input, true);
 	}
 	if (step->space_kind == CLUSTER_COLD_SPACE_DROP)
 	{
@@ -3369,7 +3376,7 @@ cluster_typed_replay_space_final(void *arg, uint32 relation)
 	if (!cluster_cold_plan_space_relation_v1(rep->typed->plan, relation, &locator, &count) ||
 		count == 0)
 		return false;
-	cluster_typed_replay_space_install(rep, relation, count - 1);
+	cluster_typed_replay_space_install(rep, relation, count - 1, false);
 	return true;
 }
 

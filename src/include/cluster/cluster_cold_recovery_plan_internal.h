@@ -150,8 +150,9 @@ typedef struct ColdSpaceOp {
 	uint32 record;
 	RelFileLocator locator;
 	BlockNumber nblocks;
-	uint8 kind;	  /* ClusterColdSpaceKindV1 */
-	bool covered; /* sealed: its incarnation's end is durable; not an input */
+	uint8 kind;			/* ClusterColdSpaceKindV1 */
+	bool covered;		/* sealed: its incarnation's end is durable; not an input */
+	uint8 shrink_forks; /* sealed TRUNCATE input: forks pass 2 shrinks again */
 	uint8 before[16];
 	uint8 result[16];
 	uint32 relation;	/* sealed: index of its relation among SPACE inputs, or NO_INDEX */
@@ -162,7 +163,8 @@ typedef struct ColdSpaceOp {
 /*
  * SPACE facts of one interned segment (relation fork, incarnation), valid
  * during seal.  A TRUNCATE or DROP ends a segment: its blocks at or past
- * retired_from are gone, the rest were written before the change was logged.
+ * retired_from (this or any later end) are gone, the rest were written
+ * before the change was logged.
  */
 typedef struct ColdSegmentSpace {
 	uint32 creator_record;	  /* replay-range CREATE/TRUNCATE that made it, or NO_INDEX */
@@ -365,6 +367,8 @@ extern bool cold_plan_space_lineage(const ClusterColdPlanV1 *plan, const ColdCom
 									const uint8 *incarnation);
 extern bool cold_plan_space_retired_start(const ClusterColdPlanV1 *plan,
 										  const ColdComponent *component);
+extern bool cold_plan_space_shrink_pending(const ClusterColdPlanV1 *plan,
+										   const ColdComponent *component);
 extern bool cold_plan_space_created_here(const ClusterColdPlanV1 *plan,
 										 const ColdComponent *component);
 extern void cold_plan_space_retire_inferred(ClusterColdPlanV1 *plan, const uint32 *group,
