@@ -975,8 +975,7 @@ run_holder_registration(uint8 final_status, PcmLockTransition transition_id, boo
 		ClusterICEnvelope env = { 0 };
 		GcsRequestPayload req = { 0 };
 		const PcmLockTransition denied[] = { PCM_TRANS_N_TO_X, PCM_TRANS_S_TO_X_UPGRADE,
-			PCM_TRANS_X_TO_S_DOWNGRADE, PCM_TRANS_X_TO_N_DOWNGRADE,
-			PCM_TRANS_X_TO_N_RELEASE, PCM_TRANS_S_TO_X_CLEANOUT };
+			PCM_TRANS_S_TO_X_CLEANOUT };
 
 		reset_control_fixture();
 		cluster_shared_config = true;
@@ -999,6 +998,8 @@ run_holder_registration(uint8 final_status, PcmLockTransition transition_id, boo
 		UT_ASSERT_EQ(fake_master_apply_calls, 1);
 		UT_ASSERT(cluster_gcs_try_send_transition_and_wait(req.tag, PCM_TRANS_S_TO_N_RELEASE, 1));
 		UT_ASSERT_EQ(fake_master_apply_calls, 2);
+		UT_ASSERT(cluster_gcs_try_send_transition_and_wait(req.tag, PCM_TRANS_X_TO_S_DOWNGRADE, 1));
+		UT_ASSERT_EQ(fake_master_apply_calls, 3);
 		cluster_shared_config = false;
 	}
 

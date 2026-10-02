@@ -4150,7 +4150,7 @@ clean distclean maintainer-clean:
 		test_cluster_heap_vm_delete.inc test_cluster_heap_vm_pretoast.inc \
 		test_cluster_pcm_snapshot_owner.inc \
 		test_cluster_pcm_transition_owner.inc \
-		test_cluster_pcm_gcs_drop.inc \
+		test_cluster_pcm_gcs_drop.inc test_cluster_pcm_downgrade.inc test_cluster_pcm_eviction_gate.inc \
 		test_cluster_pcm_flush_owner.inc \
 		test_cluster_pcm_barrier_proof.inc \
 		test_cluster_pcm_preassert_owner.inc test_cluster_pcm_preassert_consumer.inc \
@@ -4758,6 +4758,22 @@ test_cluster_pcm_flush_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmg
 	     END { if (flush != 1 || recovery != 1 || start != 1 || finish != 1 || abort_io != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Real local/remote S-cache prepare and ownership transitions.
+test_cluster_pcm_downgrade.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_downgrade_x_to_s_(remote_)?for_gcs_prepare_image\(/ { print "ClusterBufmgrGcsDowngradeOutcome"; emit=1; prepare++ } \
+	     /^cluster_bufmgr_pcm_own_(begin_x_revoke|abort_x_revoke)\(/ { print "ClusterPcmOwnResult"; emit=1; revoke++ } \
+	     /^cluster_bufmgr_pcm_own_finish_x_to_s_downgrade\(/ { print "static ClusterPcmOwnResult"; emit=1; finish++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (prepare != 2 || revoke != 2 || finish != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_eviction_gate.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_pcm_own_eviction_capture_locked\(/ { print "static inline void"; emit=1; capture++ } \
+	     /^(InvalidateBufferCommitLocked|InvalidateVictimBuffer)\(/ { print "static bool"; emit=1; gate++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (gate != 2 || capture != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_gcs_drop.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^InvalidateBufferTry\(/ { print "static bool"; emit=1; bounded++ } \
 	     /^cluster_bufmgr_convert_to_pi_locked\(/ { print "static bool"; emit=1; pi++ } \
@@ -4859,7 +4875,7 @@ test_cluster_bufmgr_stop: test_cluster_bufmgr_stop.c unit_test.h \
 test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_pcm_transition_owner.inc \
 		test_cluster_pcm_flush_owner.inc \
-		test_cluster_pcm_gcs_drop.inc \
+		test_cluster_pcm_gcs_drop.inc test_cluster_pcm_downgrade.inc test_cluster_pcm_eviction_gate.inc \
 		test_cluster_pcm_barrier_proof.inc \
 		test_cluster_pcm_eviction_owner.inc test_cluster_pcm_clock_sweep.inc \
 		test_cluster_pcm_source_finish_consumer.inc \

@@ -9674,8 +9674,8 @@ UT_TEST(test_shared_legacy_x_apis_refuse_without_changing_authority)
 	PcmAuthoritySnapshot before, after;
 	BufferDesc buf;
 	bool retry = true;
-	const PcmLockTransition departures[] = { PCM_TRANS_X_TO_S_DOWNGRADE,
-		PCM_TRANS_X_TO_N_DOWNGRADE, PCM_TRANS_X_TO_N_RELEASE };
+	const PcmLockTransition grants[] = { PCM_TRANS_N_TO_X,
+		PCM_TRANS_S_TO_X_UPGRADE, PCM_TRANS_S_TO_X_CLEANOUT };
 
 	reset_fake_pcm_runtime(4);
 	cluster_node_id = 0;
@@ -9684,8 +9684,8 @@ UT_TEST(test_shared_legacy_x_apis_refuse_without_changing_authority)
 	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
 	cluster_shared_config = true;
 	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &before));
-	for (int i = 0; i < lengthof(departures); i++)
-		UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, departures[i], 0),
+	for (int i = 0; i < lengthof(grants); i++)
+		UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, grants[i], 0),
 					 PCM_GCS_TRANSITION_INCOMPATIBLE);
 	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(missing, PCM_TRANS_N_TO_X, 1),
 				 PCM_GCS_TRANSITION_INCOMPATIBLE);
@@ -9704,11 +9704,14 @@ UT_TEST(test_shared_legacy_x_apis_refuse_without_changing_authority)
 	cluster_pcm_clean_page_xfer_arm(true);
 	UT_EXPECT_EREPORT(cluster_pcm_lock_acquire_buffer(&buf, PCM_LOCK_MODE_X, &retry));
 	UT_ASSERT(!cluster_pcm_clean_page_xfer_is_armed());
-	UT_EXPECT_EREPORT(cluster_pcm_lock_downgrade(tag, PCM_LOCK_MODE_S, true));
-	UT_EXPECT_EREPORT(cluster_pcm_lock_release_saved_tag_for_eviction(tag, PCM_LOCK_MODE_X));
-	UT_EXPECT_EREPORT(cluster_pcm_lock_release(tag));
 	UT_ASSERT_EQ(cluster_pcm_lock_query(tag), PCM_LOCK_MODE_X);
 	UT_ASSERT_EQ(cluster_pcm_master_holder_node_by_tag(tag), 0);
+	/* A read downgrade is not an X grant.  Preserve the existing S cache. */
+	cluster_pcm_lock_downgrade(tag, PCM_LOCK_MODE_S, true);
+	UT_ASSERT_EQ(cluster_pcm_lock_query(tag), PCM_LOCK_MODE_S);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &after));
+	UT_ASSERT_EQ(after.x_holder_node, -1);
+	UT_ASSERT_EQ(after.s_holders_bitmap, 1);
 
 	/* Shared reads still register/release, but cannot upgrade on this API. */
 	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(missing, PCM_TRANS_N_TO_S, 0),
@@ -9719,6 +9722,29 @@ UT_TEST(test_shared_legacy_x_apis_refuse_without_changing_authority)
 	UT_ASSERT_EQ(cluster_pcm_lock_query(missing), PCM_LOCK_MODE_S);
 	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(missing, PCM_TRANS_S_TO_N_RELEASE, 0),
 				 PCM_GCS_TRANSITION_APPLIED);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_shared_remote_holder_downgrade_registers_cached_reader)
+{
+	BufferTag tag = make_tag(6523);
+	PcmAuthoritySnapshot after;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_X, 1),
+				 PCM_GCS_TRANSITION_APPLIED);
+	cluster_shared_config = true;
+	/* Master consumes the remote holder's X->S notification, then the
+	 * installed reader's N->S ACK.  Both execute the real authority owner. */
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_X_TO_S_DOWNGRADE, 1),
+				 PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_S, 2),
+				 PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &after));
+	UT_ASSERT_EQ(after.state, PCM_STATE_S);
+	UT_ASSERT_EQ(after.x_holder_node, -1);
+	UT_ASSERT_EQ(after.s_holders_bitmap, (1u << 1) | (1u << 2));
 	cluster_shared_config = false;
 }
 
@@ -20592,7 +20618,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(310);
+	UT_PLAN(311);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -20738,6 +20764,7 @@ main(void)
 	UT_RUN(test_pi_completion_requires_entire_unique_confirmation_set);
 	UT_RUN(test_pi_storage_completion_is_exact_and_idempotent);
 	UT_RUN(test_shared_legacy_x_apis_refuse_without_changing_authority);
+	UT_RUN(test_shared_remote_holder_downgrade_registers_cached_reader);
 	UT_RUN(test_nonshared_legacy_grant_keeps_original_behavior);
 	UT_RUN(test_pi_storage_cut_tracks_n_s_and_rejects_changed_authority);
 	UT_RUN(test_pi_storage_cut_allows_waiting_storage_x_without_grant);

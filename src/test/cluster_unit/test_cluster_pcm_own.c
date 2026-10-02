@@ -143,6 +143,10 @@ static void transition_production_flush(BufferDesc *buf, SMgrRelation reln, IOOb
 										IOContext context);
 static void transition_production_abort(Buffer buffer);
 static bool transition_copy_active;
+static bool transition_downgrade_active;
+static int downgrade_applies, downgrade_notifies, downgrade_fuses;
+static ResourceXApplyResult downgrade_preflight;
+int cluster_node_id = 0;
 static bool transition_wal_error;
 static int transition_wal_calls;
 static int transition_wal_changes;
@@ -269,7 +273,8 @@ transition_lock_acquire(LWLock *lock, LWLockMode mode)
 	} else {
 		UT_ASSERT(lock == BufferDescriptorGetContentLock(transition_buf));
 		UT_ASSERT_EQ(mode,
-					 transition_copy_active && !transition_s_prepare ? LW_SHARED : LW_EXCLUSIVE);
+					 transition_copy_active && !transition_s_prepare && !transition_downgrade_active
+						 ? LW_SHARED : LW_EXCLUSIVE);
 		if (transition_content_busy)
 			return false;
 		UT_ASSERT(!transition_content_held);
@@ -541,6 +546,45 @@ transition_write_context(void *arg)
 #define FlushBufferWithRecovery(buf, rel, object, context, recovery, io, wal, wrote)               \
 	transition_flush(buf)
 #include "test_cluster_pcm_transition_owner.inc"
+static ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_x_to_s_downgrade(
+	BufferDesc *, const ClusterPcmOwnSnapshot *, ClusterPcmOwnSnapshot *);
+static bool
+downgrade_master_notify(BufferTag tag, PcmLockTransition trans, int node, bool remote)
+{
+	UT_ASSERT(transition_content_held);
+	UT_ASSERT_EQ(transition_buf->pcm_state, PCM_STATE_X);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&transition_buf->state) & BM_DIRTY, 0);
+	UT_ASSERT(BufferTagsEqual(&tag, &transition_buf->tag));
+	UT_ASSERT_EQ(trans, PCM_TRANS_X_TO_S_DOWNGRADE);
+	UT_ASSERT_EQ(node, remote ? 2 : cluster_node_id);
+	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config, trans))
+		return false;
+	if (remote)
+		downgrade_notifies++;
+	else
+		downgrade_applies++;
+	return true;
+}
+#define cluster_pcm_lock_apply_gcs_transition(tag, trans, node) downgrade_master_notify(tag, trans, node, false)
+#define cluster_gcs_send_transition_nowait(tag, trans, node) downgrade_master_notify(tag, trans, node, true)
+#define cluster_bufmgr_pcm_x_content_write_permitted(buf) (cluster_pcm_own_flags_get((buf)->buf_id) == 0)
+#define cluster_itl_page_has_active_slot(page) false
+#define cluster_pcm_lock_resource_x_bootstrap_round_x_to_s_preflight_exact(snapshot) downgrade_preflight
+#define cluster_pcm_lock_resource_x_bootstrap_round_note_x_to_s_exact(before, after) RESOURCE_X_APPLY_NOT_FOUND
+#define cluster_bufmgr_resource_x_fail_closed_current() (downgrade_fuses++)
+#define cluster_injection_should_skip(name) false
+#define CLUSTER_INJECTION_POINT(name) ((void)0)
+#include "test_cluster_pcm_downgrade.inc"
+#undef CLUSTER_INJECTION_POINT
+#undef cluster_injection_should_skip
+#undef cluster_bufmgr_resource_x_fail_closed_current
+#undef cluster_pcm_lock_resource_x_bootstrap_round_note_x_to_s_exact
+#undef cluster_pcm_lock_resource_x_bootstrap_round_x_to_s_preflight_exact
+#undef cluster_itl_page_has_active_slot
+#undef cluster_bufmgr_pcm_x_content_write_permitted
+#undef cluster_gcs_send_transition_nowait
+#undef cluster_pcm_lock_apply_gcs_transition
+
 #undef FlushBufferWithRecovery
 /* Actual S-source reservation/prepare/abort, with storage and allocation
  * boundaries explicit. The WAL error occurs after the real content release. */
@@ -2324,7 +2368,50 @@ drop_fixture_done(ClusterPcmOwnEntry *saved)
 	cluster_shared_config = cluster_past_image = transition_drop_active = false;
 }
 
-UT_TEST(test_shared_legacy_ship_cannot_drop_x_even_when_tag_is_missing_or_mode_is_s)
+UT_TEST(test_shared_scache_local_master_and_remote_holder_prepare)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int remote = 0; remote < 2; remote++) {
+		for (int dirty = 0; dirty < 2; dirty++) {
+			BufferDesc buf;
+			ClusterPcmOwnEntry entry;
+			PGAlignedBlock image;
+			XLogRecPtr lsn;
+			ClusterBufmgrGcsCopyRefusal refusal;
+			ClusterBufmgrGcsDowngradeOutcome result;
+			uint64 generation;
+
+			drop_fixture(&buf, &entry, dirty);
+			buf.pcm_state = PCM_STATE_X;
+			buf.buffer_type = BUF_TYPE_XCUR;
+			transition_downgrade_active = true;
+			downgrade_applies = downgrade_notifies = downgrade_fuses = 0;
+			downgrade_preflight = RESOURCE_X_APPLY_NOT_FOUND;
+			generation = cluster_pcm_own_gen_get(buf.buf_id);
+			result = remote
+				? cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
+					buf.tag, 2, &lsn, image.data, &refusal)
+				: cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
+					buf.tag, &lsn, image.data, &refusal);
+			UT_ASSERT_EQ(result, CLUSTER_BUFMGR_GCS_DOWNGRADE_COMMITTED);
+			UT_ASSERT_EQ(refusal, CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE);
+			UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_S);
+			UT_ASSERT_EQ(buf.buffer_type, BUF_TYPE_SCUR);
+			UT_ASSERT_EQ(cluster_pcm_own_gen_get(buf.buf_id), generation + 1);
+			UT_ASSERT_EQ(cluster_pcm_own_flags_get(buf.buf_id), 0);
+			UT_ASSERT_EQ(downgrade_applies, !remote);
+			UT_ASSERT_EQ(downgrade_notifies, remote);
+			UT_ASSERT_EQ(downgrade_fuses, 0);
+			UT_ASSERT_EQ(transition_flush_count, dirty);
+			UT_ASSERT_EQ(lsn, PageGetLSN((Page)transition_page.data));
+			UT_ASSERT_EQ(memcmp(image.data, transition_page.data, BLCKSZ), 0);
+			transition_downgrade_active = false;
+			drop_fixture_done(saved);
+		}
+	}
+}
+
+UT_TEST(test_shared_invalidate_rejects_mismatched_x_mode)
 {
 	BufferDesc buf;
 	ClusterPcmOwnEntry entry;
@@ -2333,8 +2420,6 @@ UT_TEST(test_shared_legacy_ship_cannot_drop_x_even_when_tag_is_missing_or_mode_i
 		drop_fixture(&buf, &entry, dirty);
 		buf.pcm_state = PCM_STATE_X;
 		buf.buffer_type = BUF_TYPE_XCUR;
-		UT_ASSERT_EQ(cluster_bufmgr_drop_block_for_gcs_no_wire(buf.tag, UINT64_C(0x12340), NULL),
-					 CLUSTER_BUFMGR_GCS_DROP_STALE);
 		UT_ASSERT_EQ(cluster_bufmgr_invalidate_block_for_gcs(buf.tag, PCM_LOCK_MODE_S, NULL, NULL),
 					 CLUSTER_BUFMGR_GCS_DROP_STALE);
 		UT_ASSERT_EQ(transition_flush_count + transition_discards + transition_pi_stamps, 0);
@@ -2344,7 +2429,7 @@ UT_TEST(test_shared_legacy_ship_cannot_drop_x_even_when_tag_is_missing_or_mode_i
 			BufferTag missing = buf.tag;
 			missing.blockNum++;
 			UT_ASSERT_EQ(cluster_bufmgr_drop_block_for_gcs_no_wire(missing, UINT64_C(0x12340), NULL),
-						 CLUSTER_BUFMGR_GCS_DROP_STALE);
+						 CLUSTER_BUFMGR_GCS_DROP_NOT_RESIDENT);
 		}
 		drop_fixture_done(saved);
 	}
@@ -2379,13 +2464,6 @@ UT_TEST(test_gcs_invalidate_flushes_data_before_retry_then_discards)
 		drop_fixture(&buf, &entry, true);
 		buf.pcm_state = mode == 0 ? PCM_STATE_S : PCM_STATE_X;
 		buf.buffer_type = mode == 0 ? BUF_TYPE_SCUR : BUF_TYPE_XCUR;
-		if (mode == 1) {
-			UT_ASSERT_EQ(cluster_bufmgr_invalidate_block_for_gcs(buf.tag, PCM_LOCK_MODE_X, NULL, NULL),
-						 CLUSTER_BUFMGR_GCS_DROP_STALE);
-			UT_ASSERT_EQ(transition_flush_count + transition_discards, 0);
-			drop_fixture_done(saved);
-			continue;
-		}
 		UT_ASSERT_EQ(cluster_bufmgr_invalidate_block_for_gcs(buf.tag, (PcmLockMode)buf.pcm_state,
 															 NULL, NULL),
 					 CLUSTER_BUFMGR_GCS_DROP_PINNED);
@@ -2454,13 +2532,6 @@ UT_TEST(test_gcs_drop_data_error_aborts_only_own_io_before_unpin)
 	for (int no_wire = 0; no_wire < 2; ++no_wire) {
 		volatile bool caught = false;
 		drop_fixture(&buf, &entry, true);
-		if (no_wire) {
-			UT_ASSERT_EQ(cluster_bufmgr_drop_block_for_gcs_no_wire(buf.tag, UINT64_C(0x12340), NULL),
-						 CLUSTER_BUFMGR_GCS_DROP_STALE);
-			UT_ASSERT_EQ(transition_owned_io + transition_io_aborts + transition_flush_count, 0);
-			drop_fixture_done(saved);
-			continue;
-		}
 		transition_real_flush = transition_flush_error = true;
 		PG_TRY();
 		{
@@ -2556,8 +2627,6 @@ UT_TEST(test_gcs_drop_mapping_gap_and_no_wire_keep_dirty)
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
 	for (int scenario = 0; scenario < 3; ++scenario) {
 		drop_fixture(&buf, &entry, false);
-		/* Refusal precedes even the mapping/pin stage. */
-		pg_atomic_fetch_or_u32(&buf.state, BM_DIRTY);
 		transition_prepin_dirty = scenario == 0;
 		if (scenario != 0) {
 			pg_atomic_fetch_or_u32(&buf.state, BM_DIRTY | BM_CHECKPOINT_NEEDED);
@@ -2565,7 +2634,7 @@ UT_TEST(test_gcs_drop_mapping_gap_and_no_wire_keep_dirty)
 		}
 		cluster_past_image = scenario == 2;
 		UT_ASSERT_EQ(cluster_bufmgr_drop_block_for_gcs_no_wire(buf.tag, UINT64_C(0x12340), NULL),
-					 CLUSTER_BUFMGR_GCS_DROP_STALE);
+					 CLUSTER_BUFMGR_GCS_DROP_PINNED);
 		UT_ASSERT_EQ(transition_discards + transition_pi_stamps, 0);
 		UT_ASSERT((pg_atomic_read_u32(&buf.state) & BM_DIRTY) != 0);
 		UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_S);
@@ -2833,6 +2902,44 @@ eviction_free(BufferDesc *buf)
 #define cluster_bufmgr_resource_x_wait_retry eviction_wait
 #define elog(...) ((void)0)
 #include "test_cluster_pcm_eviction_owner.inc"
+static ResourceXWriterPath eviction_path;
+static int eviction_legacy_releases;
+static void
+eviction_legacy_release(BufferTag tag, PcmLockMode mode)
+{
+	eviction_legacy_releases++;
+	if (cluster_shared_config && mode == PCM_LOCK_MODE_X)
+		pg_re_throw();
+}
+static void
+eviction_legacy_tail(BufferDesc *buf, BufferTag *tag, uint32 state, PcmLockMode mode)
+{
+	ClearBufferTag(&buf->tag);
+	UnlockBufHdr(buf, state & ~(BUF_FLAG_MASK | BUF_USAGECOUNT_MASK));
+	eviction_mapping_deleted = true;
+	transition_lock_release(&transition_mapping_lock);
+	eviction_legacy_release(*tag, mode);
+}
+#define BufTableHashCode(tag) 0U
+#define BufMappingPartitionLock(hash) ((void)(hash), &transition_mapping_lock)
+#define GetPrivateRefCount(buffer) eviction_private_pins
+#define cluster_bufmgr_pcm_x_retained_image_reuse_blocked_locked(buf, state) false
+#define cluster_resource_x_writer_path_snapshot(generation) (*(generation) = 91, eviction_path)
+#define cluster_pcm_is_active() true
+#define cluster_pcm_x_buffer_tag_tracked(tag, catalog) true
+#define cluster_pcm_lock_release_saved_tag_for_eviction eviction_legacy_release
+#define InvalidateBufferCommitTailLocked(buf, tag, hash, lock, state, mode, release) eviction_legacy_tail(buf, tag, state, mode)
+#include "test_cluster_pcm_eviction_gate.inc"
+#undef InvalidateBufferCommitTailLocked
+#undef cluster_pcm_lock_release_saved_tag_for_eviction
+#undef cluster_pcm_x_buffer_tag_tracked
+#undef cluster_pcm_is_active
+#undef cluster_resource_x_writer_path_snapshot
+#undef cluster_bufmgr_pcm_x_retained_image_reuse_blocked_locked
+#undef GetPrivateRefCount
+#undef BufMappingPartitionLock
+#undef BufTableHashCode
+
 #undef elog
 #undef cluster_bufmgr_resource_x_wait_retry
 #undef cluster_pcm_own_report_bump_failure
@@ -2854,6 +2961,58 @@ eviction_free(BufferDesc *buf)
 #undef LWLockRelease
 #undef LWLockAcquire
 #undef LockBufHdr
+
+UT_TEST(test_shared_non_target_x_eviction_keeps_mapping_and_ownership)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int victim = 0; victim < 2; victim++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		BufferTag tag;
+		uint64 generation;
+		uint32 state;
+		volatile bool caught = false, done = true;
+
+		drop_fixture(&buf, &entry, false);
+		buf.pcm_state = PCM_STATE_X;
+		buf.buffer_type = BUF_TYPE_XCUR;
+		tag = buf.tag;
+		state = BM_VALID | BM_TAG_VALID | (victim ? BUF_REFCOUNT_ONE : 0);
+		pg_atomic_write_u32(&buf.state, state);
+		generation = cluster_pcm_own_gen_get(buf.buf_id);
+		eviction_private_pins = victim;
+		eviction_path = RESOURCE_X_WRITER_SOURCE;
+		eviction_mapping_deleted = false;
+		eviction_legacy_releases = 0;
+		PG_TRY();
+		{
+			if (victim)
+				done = InvalidateVictimBuffer(&buf);
+			else {
+				eviction_mapping_acquire(&transition_mapping_lock, LW_EXCLUSIVE);
+				done = InvalidateBufferCommitLocked(&buf, &tag, 0,
+					&transition_mapping_lock, transition_lock_header(&buf));
+			}
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(!caught && !done);
+		UT_ASSERT(!eviction_mapping_deleted);
+		UT_ASSERT_EQ(eviction_legacy_releases, 0);
+		UT_ASSERT(BufferTagsEqual(&buf.tag, &tag));
+		UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_X);
+		UT_ASSERT_EQ(buf.buffer_type, BUF_TYPE_XCUR);
+		UT_ASSERT_EQ(cluster_pcm_own_gen_get(buf.buf_id), generation);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), state);
+		UT_ASSERT(!transition_mapping_held);
+		/* The clock-sweep caller still owns its original pin on RETRY. */
+		pg_atomic_write_u32(&buf.state, state & ~BUF_REFCOUNT_MASK);
+		drop_fixture_done(saved);
+	}
+}
 
 UT_TEST(test_real_eviction_pending_excludes_clock_sweep_and_keeps_one_owner)
 {
@@ -8167,8 +8326,10 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(141);
-	UT_RUN(test_shared_legacy_ship_cannot_drop_x_even_when_tag_is_missing_or_mode_is_s);
+	UT_PLAN(143);
+	UT_RUN(test_shared_scache_local_master_and_remote_holder_prepare);
+	UT_RUN(test_shared_non_target_x_eviction_keeps_mapping_and_ownership);
+	UT_RUN(test_shared_invalidate_rejects_mismatched_x_mode);
 	UT_RUN(test_shared_old_invalidate_preserves_x_installed_after_its_pin);
 	UT_RUN(test_gcs_invalidate_flushes_data_before_retry_then_discards);
 	UT_RUN(test_gcs_invalidate_busy_or_skipped_flush_keeps_obligation);

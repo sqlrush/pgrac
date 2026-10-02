@@ -6336,6 +6336,15 @@ InvalidateBufferCommitLocked(BufferDesc *buf, BufferTag *oldTag, uint32 oldHash,
 	cluster_pcm_own_eviction_capture_locked(buf, &eviction_capture);
 	current_writer_path = cluster_resource_x_writer_path_snapshot(
 		&r4_record_generation);
+	/* Reconfiguration can close TARGET while a cached X remains resident.
+	 * Keep its mapping and exact ownership tuple until the native release
+	 * owner is available; never fall through to legacy release after reuse. */
+	if (cluster_shared_config && eviction_capture.pcm_state == (uint8)PCM_STATE_X
+		&& current_writer_path != RESOURCE_X_WRITER_TARGET) {
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(oldPartitionLock);
+		return false;
+	}
 	if (current_writer_path == RESOURCE_X_WRITER_TARGET
 		&& eviction_capture.pcm_state == (uint8)PCM_STATE_X
 		&& (r4_record_generation == 0
@@ -6632,6 +6641,15 @@ InvalidateVictimBuffer(BufferDesc *buf_hdr)
 	cluster_pcm_own_eviction_capture_locked(buf_hdr, &eviction_capture);
 	current_writer_path = cluster_resource_x_writer_path_snapshot(
 		&r4_record_generation);
+	/* Reconfiguration can close TARGET while a cached X remains resident.
+	 * Keep its mapping and exact ownership tuple until the native release
+	 * owner is available; never fall through to legacy release after reuse. */
+	if (cluster_shared_config && eviction_capture.pcm_state == (uint8)PCM_STATE_X
+		&& current_writer_path != RESOURCE_X_WRITER_TARGET) {
+		UnlockBufHdr(buf_hdr, buf_state);
+		LWLockRelease(partition_lock);
+		return false;
+	}
 	if (current_writer_path == RESOURCE_X_WRITER_TARGET
 		&& eviction_capture.pcm_state == (uint8)PCM_STATE_X
 		&& (r4_record_generation == 0
@@ -14817,13 +14835,6 @@ cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
 		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
 	}
 
-	/* Keep X and let the caller serve its existing read-only image. */
-	if (cluster_shared_config) {
-		if (out_refusal != NULL)
-			*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_OWNERSHIP_REVOKE_BUSY;
-		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
-	}
-
 	hashcode = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hashcode);
 
@@ -15562,13 +15573,6 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
 		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
 	}
 
-	/* Keep X and let the caller serve its existing read-only image. */
-	if (cluster_shared_config) {
-		if (out_refusal != NULL)
-			*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_OWNERSHIP_REVOKE_BUSY;
-		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
-	}
-
 	hashcode = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hashcode);
 
@@ -16105,7 +16109,8 @@ cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
  *        pin re-fails with PINNED (round-5;  see
  *        ClusterBufmgrGcsDropResult in cluster_gcs_block.h).
  *
- *   `expected_mode` is advisory.
+ *   In shared mode an S directive cannot revoke X, and the ownership
+ *   generation must remain unchanged across the unpinned interval.
  * ======================================================================== */
 ClusterBufmgrGcsDropResult
 cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,
@@ -16120,10 +16125,10 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	SCN			page_scn = InvalidScn;	/* PGRAC: spec-2.41 D3 — page version for the ACK SCN carrier */
 	bool		was_dirty = false;
 	uint8		saved_pcm_state;
+	uint64		captured_gen;
 	uint64		staged_gen;		/* PGRAC W2: ownership gen captured at stage-N */
 	bool		invalidate_succeeded;
 
-	(void) expected_mode;
 
 	if (out_page_lsn != NULL)
 		*out_page_lsn = InvalidXLogRecPtr;
@@ -16144,7 +16149,8 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 
 	buf_state = LockBufHdr(buf);
 	/* Validate the actual owner, even if an old sender labels it S. */
-	if (cluster_shared_config && buf->pcm_state == PCM_STATE_X) {
+	if (cluster_shared_config && buf->pcm_state == PCM_STATE_X
+		&& expected_mode != PCM_LOCK_MODE_X) {
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
 		return CLUSTER_BUFMGR_GCS_DROP_STALE;
@@ -16172,6 +16178,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 		LWLockRelease(partition_lock);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
+	captured_gen = cluster_pcm_own_gen_get(buf->buf_id);
 	was_dirty = (buf_state & BM_DIRTY) != 0;
 
 	/* PGRAC: the existing source-copy owner pins, conditionally locks, flushes
@@ -16263,7 +16270,9 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	}
 
 	/* The unpinned interval may have installed a new Resource-X X owner. */
-	if (cluster_shared_config && buf->pcm_state == PCM_STATE_X) {
+	if (cluster_shared_config
+		&& (cluster_pcm_own_gen_get(buf->buf_id) != captured_gen
+			|| (buf->pcm_state == PCM_STATE_X && expected_mode != PCM_LOCK_MODE_X))) {
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_STALE;
 	}
@@ -16658,10 +16667,6 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 
 	if (out_page_lsn != NULL)
 		*out_page_lsn = InvalidXLogRecPtr;
-
-	/* Absence is not a legacy X-transfer grant in shared mode. */
-	if (cluster_shared_config)
-		return CLUSTER_BUFMGR_GCS_DROP_STALE;
 
 	hashcode = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hashcode);

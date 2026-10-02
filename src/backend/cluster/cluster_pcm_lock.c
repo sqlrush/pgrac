@@ -8044,12 +8044,6 @@ cluster_pcm_lock_release(BufferTag tag)
 	 *	                wakes); same-node refcount-only paths skip broadcast.
 	 */
 	if (cur == PCM_STATE_X) {
-		if (cluster_shared_config) {
-			LWLockRelease(&entry->entry_lock.lock);
-			pcm_entry_ref_release(&entry_ref);
-			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("shared X ownership requires Resource-X")));
-		}
 		if (entry->x_holder_node != holder_node) {
 			LWLockRelease(&entry->entry_lock.lock);
 			pcm_entry_ref_release(&entry_ref);
@@ -8143,10 +8137,6 @@ cluster_pcm_lock_release_saved_tag_for_eviction(BufferTag tag, PcmLockMode mode)
 	uint64 local_projection_generation = 0;
 	int master_node;
 	PcmLockTransition trans;
-
-	if (cluster_shared_config && mode == PCM_LOCK_MODE_X)
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("shared X ownership requires Resource-X")));
 
 	if (cluster_pcm_htab == NULL)
 		PCM_STUB_DISABLED_PATH;
@@ -8388,10 +8378,6 @@ cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, bool keep_pi)
 	PcmState cur;
 	PcmLockTransition trans;
 	int holder_node;
-
-	if (cluster_shared_config)
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("shared X ownership requires Resource-X")));
 
 	CLUSTER_INJECTION_POINT("cluster-pcm-downgrade-pre");
 
