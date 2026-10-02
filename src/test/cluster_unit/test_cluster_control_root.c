@@ -20073,6 +20073,72 @@ UT_TEST(test_wal_inputs_remote_confirmation_feeds_complete_contribution_plan)
 	UT_ASSERT_EQ(inputs_peer_releases, 1);
 }
 
+static bool inputs_census_refuse;
+static RfPageProofDetailV1
+inputs_census_record(XLogReaderState *reader, const ClusterWalSourceRef *source,
+					 const RfContributorStreamCutV1 *cut, void *arg)
+{
+	uint64 *calls = arg;
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(source->claim.identity.origin_thread_id, cut->failed_thread);
+	UT_ASSERT_EQ(source->claim.identity.origin_owner_incarnation, cut->origin_owner_incarnation);
+	UT_ASSERT(reader->ReadRecPtr >= cut->scan_begin_inclusive);
+	UT_ASSERT(reader->EndRecPtr <= cut->scan_end_exclusive);
+	(*calls)++;
+	return inputs_census_refuse ? RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE : RF_PAGE_PROOF_DETAIL_OK;
+}
+
+UT_TEST(test_wal_inputs_stream_census_waits_complete_set_and_reuses_exact_live_end)
+{
+	ClusterWalInputsV1 *inputs = inputs_contribution_fixture(1);
+	const ClusterWalInputV1 *peer = cluster_wal_inputs_at_v1(inputs, 1);
+	RfPageProofDetailV1 detail;
+	uint64 records = 99, calls = 0;
+	inputs_census_refuse = false;
+	UT_ASSERT_EQ(
+		cluster_wal_inputs_census_v1(inputs, inputs_census_record, &calls, &records, &detail),
+		CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT_EQ(calls, 0);
+	UT_ASSERT_EQ(records, 0);
+	inputs_peer_confirm(peer);
+	UT_ASSERT_EQ(
+		cluster_wal_inputs_census_v1(inputs, inputs_census_record, &calls, &records, &detail),
+		CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(calls, 2);
+	UT_ASSERT_EQ(records, 2);
+	inputs_peer_flush.complete_end += 100;
+	inputs_peer_flush.flushed_end += 100;
+	UT_ASSERT_EQ(
+		cluster_wal_inputs_census_v1(inputs, inputs_census_record, &calls, &records, &detail),
+		CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(calls, 4);
+	UT_ASSERT_EQ(records, 2);
+	UT_ASSERT_EQ(inputs_native_begin_calls + inputs_native_flush_calls, 0);
+	inputs_live_done(&inputs);
+}
+
+UT_TEST(test_wal_inputs_failed_census_never_restores_partial_proof)
+{
+	ClusterWalInputsV1 *inputs = inputs_contribution_fixture(1);
+	RfPageProofDetailV1 detail;
+	uint64 records = 99, calls = 0;
+	inputs_peer_confirm(cluster_wal_inputs_at_v1(inputs, 1));
+	inputs_census_refuse = true;
+	UT_ASSERT_NE(
+		cluster_wal_inputs_census_v1(inputs, inputs_census_record, &calls, &records, &detail),
+		CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+	UT_ASSERT_EQ(records, 0);
+	UT_ASSERT_EQ(calls, 1);
+	UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 0);
+	inputs_census_refuse = false;
+	UT_ASSERT_NE(
+		cluster_wal_inputs_census_v1(inputs, inputs_census_record, &calls, &records, &detail),
+		CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(calls, 1);
+	inputs_live_done(&inputs);
+}
+
 UT_TEST(test_wal_inputs_remote_requires_exact_identity_end_and_postread_scope)
 {
 	for (int fault = 0; fault < 6; fault++) {
@@ -20805,7 +20871,9 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_WAL_INPUTS") != NULL) {
-		UT_PLAN(24);
+		UT_PLAN(26);
+		UT_RUN(test_wal_inputs_stream_census_waits_complete_set_and_reuses_exact_live_end);
+		UT_RUN(test_wal_inputs_failed_census_never_restores_partial_proof);
 		UT_RUN(test_wal_inputs_pause_releases_all_pins_and_resume_checks_original_root);
 		UT_RUN(test_wal_inputs_failed_wait_observes_root_without_restoring_proof_or_pins);
 		UT_RUN(test_wal_inputs_resume_error_releases_reacquired_native_owner);
@@ -20840,7 +20908,9 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(377);
+	UT_PLAN(379);
+	UT_RUN(test_wal_inputs_stream_census_waits_complete_set_and_reuses_exact_live_end);
+	UT_RUN(test_wal_inputs_failed_census_never_restores_partial_proof);
 	UT_RUN(test_runtime_v3_worker_done_requires_durable_canonical_completion);
 	UT_RUN(test_runtime_v3_worker_finalization_error_releases_post_ir_pin);
 	UT_RUN(test_runtime_v3_worker_retries_completion_without_replaying);

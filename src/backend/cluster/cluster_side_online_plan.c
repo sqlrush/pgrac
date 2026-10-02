@@ -769,30 +769,26 @@ side_native_control_valid(XLogReaderState *reader, const RfPageOnlineRecordIdent
 	}
 }
 
-RfPageProofDetailV1
-rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
-								   const RfDetachedRecordPlanV1 *record_plan,
-								   const RfPageOnlineRecordIdentityV1 *identity)
+/* Decode one record without allocating or retaining its payload. Both the
+ * immutable replay plan and the streaming census use this same validator. */
+static RfPageProofDetailV1
+side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *record_plan,
+				   const RfPageOnlineRecordIdentityV1 *identity, RfSideOnlineOperationV1 *candidate,
+				   const uint8 **payload)
 {
-	RfSideOnlineOperationV1 candidate;
 	RfPageProofDetailV1 detail;
-	uint16 participant;
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || plan->sealed)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	detail = side_record_identity_validate(plan, record_plan, identity);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		return detail;
-	/* A caller's preflight callback is not a component consumer. Keep every
-	 * unimplemented routed component out of the sealed plan rather than
-	 * treating it as a PAGE-only record and silently dropping its duty. */
 	if (record_plan->component_count > RF_PAGE_STABLE_MAX_COMPONENTS
 		|| (record_plan->component_count != 0
 			&& record_plan->route.record_owner != RF_ROUTE_OWNER_PAGE_CODEC))
 		return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
 	for (uint32 i = 0; i < record_plan->component_count; i++) {
 		const RfDetachedComponentPlanV1 *component = &record_plan->components[i];
-
 		if (component->owner == RF_DETACHED_COMPONENT_SIDE_TYPED
 			|| component->page_class == RF_PAGE_CLASS_ROUTED_HEADER
 			|| component->page_class == RF_PAGE_CLASS_ROUTED_SIDE
@@ -804,123 +800,109 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 				  && component->page_class == RF_PAGE_CLASS_REBUILDABLE_FSM)))
 			return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
 	}
-	memset(&candidate, 0, sizeof(candidate));
+	memset(candidate, 0, sizeof(*candidate));
+	*payload = NULL;
 	if (record_plan->route.record_owner == RF_ROUTE_OWNER_SIDE_TYPED) {
 		if ((record_plan->route.rmid == RM_XLOG_ID || record_plan->route.rmid == RM_STANDBY_ID)
 			&& record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD) {
-			uint32 length = XLogRecGetDataLen(record_plan->source_record);
 			if (!side_native_control_valid(record_plan->source_record, identity))
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-			candidate.kind = RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;
-			if (length > 0) {
-				if (!side_ensure_payload_capacity(plan, length))
-					return RF_PAGE_PROOF_DETAIL_CAPACITY;
-				candidate.owned_payload_offset = plan->owned_payload_bytes;
-				candidate.owned_payload_length = length;
-				memcpy(plan->owned_payload + plan->owned_payload_bytes,
-					   XLogRecGetData(record_plan->source_record), length);
-				plan->owned_payload_bytes += length;
-			}
+			candidate->kind = RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;
+			candidate->owned_payload_length = XLogRecGetDataLen(record_plan->source_record);
+			*payload = (const uint8 *)XLogRecGetData(record_plan->source_record);
 		} else if (record_plan->route.rmid == RM_XACT_ID
 				   && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD) {
 			if (!rf_side_xact_decode_v1(record_plan->source_record, plan->system_identifier,
-										identity->record.origin_thread, &candidate.xact))
+										identity->record.origin_thread, &candidate->xact))
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-			candidate.kind = RF_SIDE_ONLINE_OPERATION_XACT;
-			if (candidate.xact.kind == RF_SIDE_XACT_PREPARE || candidate.xact.space_drop_count != 0) {
-				uint32 record_length = XLogRecGetDataLen(record_plan->source_record);
-				uint32 expected_length = candidate.xact.kind == RF_SIDE_XACT_PREPARE
-					? candidate.xact.prepare_payload_length : candidate.xact.completion_payload_length;
-
-				for (uint32 i = 0; i < candidate.xact.space_drop_count; i++) {
+			candidate->kind = RF_SIDE_ONLINE_OPERATION_XACT;
+			if (candidate->xact.kind == RF_SIDE_XACT_PREPARE
+				|| candidate->xact.space_drop_count != 0) {
+				uint32 length = XLogRecGetDataLen(record_plan->source_record);
+				uint32 expected = candidate->xact.kind == RF_SIDE_XACT_PREPARE
+									  ? candidate->xact.prepare_payload_length
+									  : candidate->xact.completion_payload_length;
+				for (uint32 i = 0; i < candidate->xact.space_drop_count; i++) {
 					ClusterSpaceStructureChange drop;
-
-					if (!cluster_space_structure_wal_decode(XLogRecGetData(record_plan->source_record)
-						+ candidate.xact.space_drop_offset + (Size)i * CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
-						CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &drop)
+					if (!cluster_space_structure_wal_decode(
+							XLogRecGetData(record_plan->source_record)
+								+ candidate->xact.space_drop_offset
+								+ (Size)i * CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+							CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &drop)
 						|| !side_space_key_matches_plan(plan, &drop.identity.result.key))
 						return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 				}
-				if (record_length == 0 || record_length != expected_length
-					|| !side_ensure_operation_capacity(plan)
-					|| !side_ensure_payload_capacity(plan, record_length))
-					return RF_PAGE_PROOF_DETAIL_CAPACITY;
-				candidate.owned_payload_offset = plan->owned_payload_bytes;
-				candidate.owned_payload_length = record_length;
-				memcpy(plan->owned_payload + plan->owned_payload_bytes,
-					   XLogRecGetData(record_plan->source_record), record_length);
-				plan->owned_payload_bytes += record_length;
+				if (length == 0 || length != expected)
+					return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+				candidate->owned_payload_length = length;
+				*payload = (const uint8 *)XLogRecGetData(record_plan->source_record);
 			}
 		} else if (record_plan->route.rmid == RM_CLUSTER_UNDO_ID
 				   && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_CLUSTER_UNDO) {
-			const char *record_data = XLogRecGetData(record_plan->source_record);
-			uint32 record_length = XLogRecGetDataLen(record_plan->source_record);
-
-			if (!cluster_undo_decode(record_plan->source_record, &candidate.undo)
-				|| !cluster_undo_preflight(&candidate.undo)
-				|| candidate.undo.instance != identity->record.origin_thread
-				|| candidate.undo.payload_offset > record_length
-				|| candidate.undo.payload_length > record_length - candidate.undo.payload_offset)
+			uint32 length = XLogRecGetDataLen(record_plan->source_record);
+			if (!cluster_undo_decode(record_plan->source_record, &candidate->undo)
+				|| !cluster_undo_preflight(&candidate->undo)
+				|| candidate->undo.instance != identity->record.origin_thread
+				|| candidate->undo.payload_offset > length
+				|| candidate->undo.payload_length > length - candidate->undo.payload_offset)
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-			candidate.kind = RF_SIDE_ONLINE_OPERATION_UNDO;
-			candidate.owned_payload_length = candidate.undo.payload_length;
-			if (!side_ensure_operation_capacity(plan))
-				return RF_PAGE_PROOF_DETAIL_CAPACITY;
-			if (candidate.owned_payload_length > 0) {
-				if (!side_ensure_payload_capacity(plan, candidate.owned_payload_length))
-					return RF_PAGE_PROOF_DETAIL_CAPACITY;
-				candidate.owned_payload_offset = plan->owned_payload_bytes;
-				memcpy(plan->owned_payload + plan->owned_payload_bytes,
-					   record_data + candidate.undo.payload_offset, candidate.owned_payload_length);
-				plan->owned_payload_bytes += candidate.owned_payload_length;
-			}
+			candidate->kind = RF_SIDE_ONLINE_OPERATION_UNDO;
+			candidate->owned_payload_length = candidate->undo.payload_length;
+			*payload = (const uint8 *)XLogRecGetData(record_plan->source_record)
+					   + candidate->undo.payload_offset;
 		} else if (record_plan->route.rmid == RM_SMGR_ID
 				   && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD) {
-			if (!side_space_decode(plan, record_plan, &candidate))
+			if (!side_space_decode(plan, record_plan, candidate))
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-			if (!side_ensure_operation_capacity(plan)
-				|| !side_ensure_payload_capacity(plan, candidate.owned_payload_length))
-				return RF_PAGE_PROOF_DETAIL_CAPACITY;
-			candidate.owned_payload_offset = plan->owned_payload_bytes;
-			memcpy(plan->owned_payload + plan->owned_payload_bytes,
-				XLogRecGetData(record_plan->source_record), candidate.owned_payload_length);
-			plan->owned_payload_bytes += candidate.owned_payload_length;
+			*payload = (const uint8 *)XLogRecGetData(record_plan->source_record);
 		} else if ((record_plan->route.rmid == RM_CLOG_ID
 					|| record_plan->route.rmid == RM_MULTIXACT_ID
 					|| record_plan->route.rmid == RM_COMMIT_TS_ID)
 				   && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD) {
-			uint32 payload_offset;
-			uint32 payload_length;
-
-			if (!side_projection_decode(record_plan, &candidate, &payload_offset, &payload_length))
+			uint32 offset, length;
+			if (!side_projection_decode(record_plan, candidate, &offset, &length))
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-			if (!side_ensure_operation_capacity(plan))
-				return RF_PAGE_PROOF_DETAIL_CAPACITY;
-			candidate.kind = RF_SIDE_ONLINE_OPERATION_PROJECTION;
-			candidate.owned_payload_length = payload_length;
-			if (payload_length > 0) {
-				if (!side_ensure_payload_capacity(plan, payload_length))
-					return RF_PAGE_PROOF_DETAIL_CAPACITY;
-				candidate.owned_payload_offset = plan->owned_payload_bytes;
-				memcpy(plan->owned_payload + plan->owned_payload_bytes,
-					   XLogRecGetData(record_plan->source_record) + payload_offset, payload_length);
-				plan->owned_payload_bytes += payload_length;
-			}
+			candidate->kind = RF_SIDE_ONLINE_OPERATION_PROJECTION;
+			candidate->owned_payload_length = length;
+			*payload = (const uint8 *)XLogRecGetData(record_plan->source_record) + offset;
 		} else
 			return RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED;
-		candidate.identity = *identity;
-		candidate.route = record_plan->route;
-		candidate.history_only
+		candidate->identity = *identity;
+		candidate->route = record_plan->route;
+		candidate->history_only
 			= identity->record.end_rec_ptr <= plan->redo_starts[identity->participant_index];
-		if (!side_ensure_operation_capacity(plan))
-			return RF_PAGE_PROOF_DETAIL_CAPACITY;
-		plan->operations[plan->operation_count++] = candidate;
 	} else if (record_plan->route.record_owner != RF_ROUTE_OWNER_PAGE_CODEC
 			   && record_plan->route.record_owner != RF_ROUTE_OWNER_LOGICAL_NOOP)
 		return RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED;
-	participant = identity->participant_index;
-	plan->participant_seen[participant] = true;
-	plan->last_record_end[participant] = identity->record.end_rec_ptr;
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
+								   const RfDetachedRecordPlanV1 *record_plan,
+								   const RfPageOnlineRecordIdentityV1 *identity)
+{
+	RfSideOnlineOperationV1 candidate;
+	const uint8 *payload;
+	RfPageProofDetailV1 detail;
+
+	detail = side_decode_record(plan, record_plan, identity, &candidate, &payload);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		return detail;
+	if (candidate.kind != RF_SIDE_ONLINE_OPERATION_INVALID) {
+		if (!side_ensure_operation_capacity(plan)
+			|| !side_ensure_payload_capacity(plan, candidate.owned_payload_length))
+			return RF_PAGE_PROOF_DETAIL_CAPACITY;
+		candidate.owned_payload_offset = plan->owned_payload_bytes;
+		if (candidate.owned_payload_length > 0) {
+			memcpy(plan->owned_payload + candidate.owned_payload_offset, payload,
+				   candidate.owned_payload_length);
+			plan->owned_payload_bytes += candidate.owned_payload_length;
+		}
+		plan->operations[plan->operation_count++] = candidate;
+	}
+	plan->participant_seen[identity->participant_index] = true;
+	plan->last_record_end[identity->participant_index] = identity->record.end_rec_ptr;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
@@ -1667,6 +1649,67 @@ rf_side_online_plan_space_target_v1(const RfSideOnlinePlanV1 *plan, uint32 index
 		return false;
 	*out = plan->space_targets[index];
 	return true;
+}
+
+RfPageProofDetailV1
+rf_side_record_census_v1(const RfDetachedRecordPlanV1 *record_plan,
+						 const RfPageOnlineRecordIdentityV1 *identity,
+						 const RfContributorStreamCutV1 *cut, uint64 database_incarnation,
+						 RfSideCensusSpaceVisitorV1 visit_space, void *arg,
+						 RfSideContributionOwnersV1 *out)
+{
+	RfSideOnlinePlanV1 scratch = { 0 };
+	RfSideOnlineOperationV1 operation;
+	RfSideContributionOwnersV1 owners = { 0 };
+	RfContributorStreamCutV1 physical;
+	XLogRecPtr redo, last = InvalidXLogRecPtr;
+	bool seen = false;
+	const uint8 *payload;
+	RfPageProofDetailV1 detail;
+
+	if (identity == NULL || cut == NULL || out == NULL || visit_space == NULL
+		|| identity->participant_index != 0 || database_incarnation == 0
+		|| identity->record.system_identifier == 0
+		|| !side_bytes_nonzero(identity->record.storage_uuid, 16)
+		|| cut->origin_owner_incarnation == 0 || cut->origin_owner_incarnation == UINT64_MAX
+		|| cut->flags != RF_CONTRIBUTOR_CUT_COMPLETE
+		|| cut->scan_begin_inclusive == InvalidXLogRecPtr
+		|| cut->scan_end_exclusive <= cut->scan_begin_inclusive)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	physical = *cut;
+	redo = cut->scan_begin_inclusive;
+	scratch.magic = RF_SIDE_ONLINE_PLAN_MAGIC;
+	scratch.system_identifier = identity->record.system_identifier;
+	scratch.database_incarnation = database_incarnation;
+	memcpy(scratch.storage_uuid, identity->record.storage_uuid, 16);
+	scratch.participant_count = 1;
+	scratch.physical_cuts = &physical;
+	scratch.redo_starts = &redo;
+	scratch.last_record_end = &last;
+	scratch.participant_seen = &seen;
+	detail = side_decode_record(&scratch, record_plan, identity, &operation, &payload);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		return detail;
+	if (operation.kind != RF_SIDE_ONLINE_OPERATION_INVALID) {
+		/* A private one-record view only. It never escapes as a sealed replay
+		 * plan, and owns no memory. All consumers below only enumerate duties. */
+		scratch.sealed = true;
+		scratch.operations = &operation;
+		scratch.operation_count = 1;
+		scratch.owned_payload = (uint8 *)payload;
+		scratch.owned_payload_bytes = operation.owned_payload_length;
+		if (!rf_side_online_plan_contribution_owners_v1(&scratch, 0, &owners))
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		for (uint32 i = 0; i < owners.space_locator_count; i++) {
+			RfSideSpaceContributionV1 space;
+			if (!rf_side_online_plan_space_contribution_v1(&scratch, 0, i, &space))
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			if (!visit_space(arg, &space))
+				return RF_PAGE_PROOF_DETAIL_WOULD_BLOCK;
+		}
+	}
+	*out = owners;
+	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
 Size

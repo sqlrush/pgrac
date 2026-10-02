@@ -719,6 +719,8 @@ cluster_wal_inputs_visit_live_v1(ClusterWalInputsV1 *inputs, uint32 index,
 
 typedef struct WalContributionWork {
 	ClusterThreadRecoveryFabricPlanV1 *plan;
+	ClusterWalCensusVisitorV1 census;
+	void *census_arg;
 	RfContributorStreamCutV1 cuts[CLUSTER_WAL_INPUTS_MAX];
 	ClusterWalSourceRef sources[CLUSTER_WAL_INPUTS_MAX];
 	uint32 indices[CLUSTER_WAL_INPUTS_MAX];
@@ -781,12 +783,22 @@ static bool
 inputs_contribution_record(XLogReaderState *reader, void *arg)
 {
 	WalContributionWork *work = arg;
+	if ((work->records % 64) == 0) {
+		CHECK_FOR_INTERRUPTS();
+		if (ShutdownRequestPending) {
+			work->detail = RF_PAGE_PROOF_DETAIL_CANCELLED;
+			return false;
+		}
+	}
 	if (work->records == UINT64_MAX) {
 		work->detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
 		return false;
 	}
-	work->detail
-		= cluster_thread_recovery_fabric_plan_feed_record_v1(work->plan, reader, work->participant);
+	work->detail = work->census != NULL
+					   ? work->census(reader, &work->sources[work->participant],
+									  &work->cuts[work->participant], work->census_arg)
+					   : cluster_thread_recovery_fabric_plan_feed_record_v1(work->plan, reader,
+																			work->participant);
 	if (work->detail != RF_PAGE_PROOF_DETAIL_OK)
 		return false;
 	work->records++;
@@ -800,6 +812,17 @@ inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalCont
 	ClusterControlRootResult result = inputs_contribution_cuts(inputs, work);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
+	for (uint32 i = 0; i < work->count; i++) {
+		const ClusterWalSourceRef *source = &work->sources[i];
+		if (!cluster_wal_claim_v2_ref_valid(&source->claim)
+			|| source->claim.identity.system_identifier != inputs->system_identifier
+			|| memcmp(source->claim.identity.storage_uuid, inputs->storage_uuid, 16) != 0
+			|| source->claim.database_incarnation == 0
+			|| source->claim.database_incarnation != work->sources[0].claim.database_incarnation) {
+			work->detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		}
+	}
 	request.system_identifier = inputs->system_identifier;
 	memcpy(request.storage_uuid, inputs->storage_uuid, 16);
 	request.physical_cuts = work->cuts;
@@ -810,13 +833,15 @@ inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalCont
 	/* NULL redo_starts deliberately keeps every retained contribution.
 	 * This graph cannot authorize replay; native recovery has a different
 	 * owner and must select its same-anchor actual redo start. */
-	work->detail = cluster_thread_recovery_fabric_plan_create_v1(&request, &work->plan);
-	if (work->detail != RF_PAGE_PROOF_DETAIL_OK)
-		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
-	if (!cluster_thread_recovery_fabric_bind_database_v1(
-			work->plan, work->sources[0].claim.database_incarnation)) {
-		work->detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
-		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (work->census == NULL) {
+		work->detail = cluster_thread_recovery_fabric_plan_create_v1(&request, &work->plan);
+		if (work->detail != RF_PAGE_PROOF_DETAIL_OK)
+			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		if (!cluster_thread_recovery_fabric_bind_database_v1(
+				work->plan, work->sources[0].claim.database_incarnation)) {
+			work->detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		}
 	}
 	for (uint32 i = 0; i < work->count; i++) {
 		uint32 index = work->indices[i];
@@ -847,9 +872,11 @@ inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalCont
 	result = cluster_wal_inputs_revalidate_v1(inputs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	work->detail = cluster_thread_recovery_fabric_plan_seal_v1(work->plan);
-	if (work->detail != RF_PAGE_PROOF_DETAIL_OK)
-		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (work->census == NULL) {
+		work->detail = cluster_thread_recovery_fabric_plan_seal_v1(work->plan);
+		if (work->detail != RF_PAGE_PROOF_DETAIL_OK)
+			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	}
 	result = cluster_wal_inputs_revalidate_v1(inputs);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& inputs->local_cut.complete_end != InvalidXLogRecPtr)
@@ -863,10 +890,11 @@ inputs_contribution_build(ClusterWalInputsV1 *inputs, bool space_active, WalCont
 	return result;
 }
 
-ClusterControlRootResult
-cluster_wal_inputs_contributions_v1(ClusterWalInputsV1 *inputs, bool space_active,
-									ClusterThreadRecoveryFabricPlanV1 **out_plan,
-									uint64 *out_record_count, RfPageProofDetailV1 *out_detail)
+static ClusterControlRootResult
+inputs_scan_contributions(ClusterWalInputsV1 *inputs, bool space_active,
+						  ClusterWalCensusVisitorV1 census, void *census_arg,
+						  ClusterThreadRecoveryFabricPlanV1 **out_plan, uint64 *out_record_count,
+						  RfPageProofDetailV1 *out_detail)
 {
 	WalContributionWork *work;
 	ClusterControlRootResult result;
@@ -878,6 +906,8 @@ cluster_wal_inputs_contributions_v1(ClusterWalInputsV1 *inputs, bool space_activ
 	if (!inputs_current(inputs) || CritSectionCount != 0 || ShutdownRequestPending)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	work = palloc0(sizeof(*work));
+	work->census = census;
+	work->census_arg = census_arg;
 	PG_TRY();
 	{
 		result = inputs_contribution_build(inputs, space_active, work);
@@ -901,6 +931,26 @@ cluster_wal_inputs_contributions_v1(ClusterWalInputsV1 *inputs, bool space_activ
 	}
 	pfree(work);
 	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_contributions_v1(ClusterWalInputsV1 *inputs, bool space_active,
+									ClusterThreadRecoveryFabricPlanV1 **out_plan,
+									uint64 *out_record_count, RfPageProofDetailV1 *out_detail)
+{
+	return inputs_scan_contributions(inputs, space_active, NULL, NULL, out_plan, out_record_count,
+									 out_detail);
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_census_v1(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visitor,
+							 void *arg, uint64 *out_record_count, RfPageProofDetailV1 *out_detail)
+{
+	ClusterThreadRecoveryFabricPlanV1 *unused = NULL;
+	if (visitor == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return inputs_scan_contributions(inputs, true, visitor, arg, &unused, out_record_count,
+									 out_detail);
 }
 
 ClusterControlRootResult

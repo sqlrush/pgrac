@@ -20,6 +20,7 @@ extern void *ShmemInitStruct(const char *name, Size size, bool *found);
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_pi_rebuild.h"
+#include "storage/buffile.h"
 #include "storage/ipc.h"
 #include "storage/proc.h"
 #include "utils/timestamp.h"
@@ -36,6 +37,8 @@ static ClusterPcmPiStorageCutV1 wb_vm_cut;
 static bool wb_multiple;
 static RfPageOnlinePlanV1 *wb_page_plan;
 static unsigned wb_plan_builds, wb_input_releases, wb_sends;
+static unsigned wb_census_builds;
+static bool wb_census_tail_bad;
 static unsigned wb_log_calls[3];
 static RfSideOnlineOperationKindV1 wb_side_kind;
 static bool wb_space_valid;
@@ -489,6 +492,146 @@ cluster_wal_inputs_contributions_v1(ClusterWalInputsV1 *inputs, bool space_activ
 	*records = 3;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
+/* The physical scanner and typed decoder are separate boundaries here;
+ * their real bytes/identity paths run in control_root and side_xact tests. */
+static struct {
+	RelFileLocator locator;
+	ForkNumber forknum;
+	BlockNumber blockno;
+	uint64 token;
+} census_component;
+
+RfPageProofDetailV1
+cluster_thread_recovery_record_census_v1(XLogReaderState *record, const ClusterWalSourceRef *source,
+										 const RfContributorStreamCutV1 *cut,
+										 ClusterRecoveryContributionVisitorV1 visitor, void *arg)
+{
+	if (source->claim.identity.origin_owner_incarnation == 0
+		|| source->claim.identity.origin_owner_incarnation != cut->origin_owner_incarnation
+		|| source->claim.identity.origin_thread_id != cut->failed_thread
+		|| source->timeline != cut->timeline_id)
+		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+	return visitor(arg, &census_component.locator, census_component.forknum,
+				   census_component.blockno, census_component.token)
+			   ? RF_PAGE_PROOF_DETAIL_OK
+			   : RF_PAGE_PROOF_DETAIL_WOULD_BLOCK;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_census_v1(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitorV1 visitor,
+							 void *arg, uint64 *records, RfPageProofDetailV1 *detail)
+{
+	XLogReaderState reader = { 0 };
+	UT_ASSERT(wb_inputs_pinned[cluster_node_id]);
+	*records = 0;
+	*detail = RF_PAGE_PROOF_DETAIL_OK;
+	if (wb_input_wait)
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	wb_plan_builds++;
+	wb_census_builds++;
+	*detail = rebuild_plan_failure;
+	if (*detail != RF_PAGE_PROOF_DETAIL_OK)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	for (uint32 target_index = 0; target_index < rf_page_online_plan_target_count_v1(wb_page_plan);
+		 target_index++) {
+		RfPageOnlineTargetViewV1 view;
+		UT_ASSERT(rf_page_online_plan_target_v1(wb_page_plan, target_index, &view));
+		census_component.locator = view.page_identity.locator;
+		census_component.forknum = view.page_identity.forknum;
+		census_component.blockno = view.page_identity.blockno;
+		for (uint32 i = 0; i < view.contributors->edge_count; i++) {
+			const RfPageStableEdgeInputV1 *edge = &view.contributors->edges[i];
+			ClusterWalSourceRef source;
+			UT_ASSERT(
+				rf_page_online_plan_source_v1(wb_page_plan, edge->participant_index, &source));
+			reader.ReadRecPtr = edge->record_identity.read_rec_ptr;
+			census_component.token = edge->result_token;
+			*detail
+				= visitor(&reader, &source, &view.contributors->cuts[edge->participant_index], arg);
+			if (*detail != RF_PAGE_PROOF_DETAIL_OK)
+				return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+			(*records)++;
+		}
+	}
+	if (wb_side_kind != RF_SIDE_ONLINE_OPERATION_INVALID) {
+		RfSideContributionOwnersV1 owners;
+		ClusterWalSourceRef source;
+		RfContributorStreamCutV1 cut;
+		if (!rf_side_online_plan_contribution_owners_v1((void *)wb_page_plan, 0, &owners)) {
+			*detail = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		}
+		UT_ASSERT(rf_page_online_plan_source_v1(wb_page_plan, 2, &source));
+		UT_ASSERT(cluster_thread_recovery_fabric_cut_v1((void *)wb_page_plan, 2, &cut));
+		for (uint32 i = 0; i < owners.space_locator_count; i++) {
+			RfSideSpaceContributionV1 space = { 0 };
+			UT_ASSERT(
+				rf_side_online_plan_space_contribution_v1((void *)wb_page_plan, 0, i, &space));
+			if (space.result.key.database_incarnation != source.claim.database_incarnation) {
+				*detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+				return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+			}
+			census_component.locator = space.result.key.locator;
+			census_component.forknum = SPACE_FORKNUM;
+			for (uint8 block = 0; block < 2; block++) {
+				if (!(space.page_mask & (1u << block)))
+					continue;
+				census_component.blockno = block;
+				census_component.token = space.result_token[block];
+				*detail = visitor(&reader, &source, &cut, arg);
+				if (*detail != RF_PAGE_PROOF_DETAIL_OK)
+					return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+				(*records)++;
+			}
+		}
+	}
+	if (wb_census_tail_bad) {
+		*detail = RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+/* Native temporary file owner is replaced with a real FILE in this fixture. */
+struct BufFile {
+	FILE *file;
+};
+static unsigned census_file_open, census_file_reads;
+BufFile *
+BufFileCreateTemp(bool interXact)
+{
+	BufFile *file = malloc(sizeof(*file));
+	UT_ASSERT(!interXact && file != NULL);
+	file->file = tmpfile();
+	UT_ASSERT(file->file != NULL);
+	census_file_open++;
+	return file;
+}
+void
+BufFileClose(BufFile *file)
+{
+	UT_ASSERT_EQ(fclose(file->file), 0);
+	census_file_open--;
+	free(file);
+}
+void
+BufFileWrite(BufFile *file, const void *ptr, size_t size)
+{
+	UT_ASSERT_EQ(fwrite(ptr, 1, size, file->file), size);
+}
+void
+BufFileReadExact(BufFile *file, void *ptr, size_t size)
+{
+	UT_ASSERT_EQ(fread(ptr, 1, size, file->file), size);
+	census_file_reads++;
+}
+int
+BufFileSeek(BufFile *file, int fileno, off_t offset, int whence)
+{
+	UT_ASSERT_EQ(fileno, 0);
+	return fseeko(file->file, offset, whence);
+}
+
 void
 cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
 {
@@ -1191,6 +1334,28 @@ UT_TEST(retained_rebuild_never_completes_with_unmapped_side_contributions)
 	clean();
 }
 
+UT_TEST(retained_census_does_not_materialize_history_and_checks_tail_first)
+{
+	ClusterPageDataReceiptV1 *data = rebuild_setup();
+	wb_census_builds = 0;
+	wb_census_tail_bad = true;
+	UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(), CLUSTER_PI_REBUILD_WAIT);
+	UT_ASSERT_EQ(wb_census_builds, 1);
+	UT_ASSERT_EQ(rebuild_applies, 0);
+	UT_ASSERT_EQ(rebuild_completions, 0);
+	UT_ASSERT(!wb_inputs_pinned[0]);
+	pi_rebuild_release();
+	wb_census_tail_bad = false;
+	UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(), CLUSTER_PI_REBUILD_IDLE);
+	UT_ASSERT_EQ(wb_census_builds, 2);
+	UT_ASSERT_EQ(rebuild_completions, 1);
+	UT_ASSERT_EQ(rebuild_holders, 7);
+	UT_ASSERT(sizeof(PiRebuildJob) < 16384);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
 UT_TEST(retained_rebuild_restores_all_original_writers_before_complete)
 {
 	ClusterPageDataReceiptV1 *data = rebuild_setup();
@@ -1218,7 +1383,8 @@ UT_TEST(retained_rebuild_maps_both_space_pages_under_original_source)
 		wb_space_contribution.result_token[0] = 53;
 		wb_space_contribution.result_token[1] = 41;
 		UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(), invalid != 0);
-		UT_ASSERT_EQ(rebuild_applies, invalid ? 2 : 4);
+		UT_ASSERT_EQ(rebuild_applies,
+					 invalid ? 0 : 4); /* All input checks precede GRD additions. */
 		UT_ASSERT_EQ(rebuild_completions, invalid ? 0 : 1);
 		UT_ASSERT(!wb_inputs_pinned[0]);
 		UT_ASSERT_EQ(pi_rebuild_job == NULL, invalid == 0);
@@ -1388,6 +1554,38 @@ UT_TEST(retained_rebuild_progress_continues_without_bgwriter_delay)
 	clean();
 }
 
+UT_TEST(retained_census_spill_retries_exact_pending_without_reading_or_rescanning)
+{
+	ClusterPageDataReceiptV1 *data = rebuild_setup();
+	wb_side_kind = RF_SIDE_ONLINE_OPERATION_XACT;
+	wb_side_mapped = wb_space_valid = true;
+	wb_space_count = 80;
+	wb_space_contribution.result = identity;
+	wb_space_contribution.page_mask = 3;
+	wb_space_contribution.result_token[0] = 53;
+	wb_space_contribution.result_token[1] = 41;
+	census_file_reads = 0;
+	rebuild_fail_after = 64;
+	UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(), CLUSTER_PI_REBUILD_MORE);
+	UT_ASSERT_EQ(census_file_open, 1);
+	for (int i = 0; i < 4; i++) {
+		UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(), CLUSTER_PI_REBUILD_WAIT);
+		UT_ASSERT_EQ(census_file_reads, 65);
+		UT_ASSERT_EQ(wb_plan_builds, 1);
+		UT_ASSERT_EQ(pi_rebuild_job->cursor, 64);
+		UT_ASSERT(!wb_inputs_pinned[0]);
+	}
+	rebuild_fail_after = UINT32_MAX;
+	UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(), CLUSTER_PI_REBUILD_MORE);
+	UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(), CLUSTER_PI_REBUILD_IDLE);
+	UT_ASSERT_EQ(census_file_reads, 162);
+	UT_ASSERT_EQ(census_file_open, 0);
+	UT_ASSERT_EQ(rebuild_completions, 1);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
 UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 {
 	ClusterPageDataReceiptV1 *data = rebuild_setup();
@@ -1420,7 +1618,7 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(24);
 	UT_RUN(remote_physical_ack_runs_actual_ancestry_and_disposal);
 	UT_RUN(writeback_codec_has_exact_bounded_authenticated_facts);
 	UT_RUN(writeback_rejects_foreign_sender_boot_and_changed_master_cut);
@@ -1434,6 +1632,7 @@ main(void)
 	UT_RUN(writeback_rejections_survive_batches_and_throttle_per_boot_epoch);
 	UT_RUN(writeback_initial_allocation_error_cannot_orphan_running_owner);
 	UT_RUN(retained_rebuild_never_completes_with_unmapped_side_contributions);
+	UT_RUN(retained_census_does_not_materialize_history_and_checks_tail_first);
 	UT_RUN(retained_rebuild_restores_all_original_writers_before_complete);
 	UT_RUN(retained_rebuild_maps_both_space_pages_under_original_source);
 	UT_RUN(retained_rebuild_maps_commit_drop_and_separate_non_pcm_owners);
@@ -1442,6 +1641,7 @@ main(void)
 	UT_RUN(retained_rebuild_apply_failure_retries_original_target_without_rescan);
 	UT_RUN(retained_rebuild_plan_failure_waits_for_changed_root_without_rescan);
 	UT_RUN(retained_rebuild_progress_continues_without_bgwriter_delay);
+	UT_RUN(retained_census_spill_retries_exact_pending_without_reading_or_rescanning);
 	UT_RUN(retained_rebuild_error_cleanup_and_postapply_root_check);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

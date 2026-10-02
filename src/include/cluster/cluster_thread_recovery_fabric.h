@@ -41,6 +41,17 @@ typedef struct ClusterThreadRecoveryFabricApplyResultV1 {
 
 struct ClusterThreadRecoveryAuthorityV1;
 
+/* One-record contribution census, never an ancestry/replay/retirement proof.
+ * The physical input owner must qualify the entire stream and ROOT afterward.
+ * Callbacks may only retain provisional additions. */
+typedef bool (*ClusterRecoveryContributionVisitorV1)(void *arg, const RelFileLocator *locator,
+													 ForkNumber forknum, BlockNumber blockno,
+													 uint64 token);
+extern RfPageProofDetailV1
+cluster_thread_recovery_record_census_v1(XLogReaderState *record, const ClusterWalSourceRef *source,
+										 const RfContributorStreamCutV1 *cut,
+										 ClusterRecoveryContributionVisitorV1 visitor, void *arg);
+
 /* Collect all exact original cuts before resolving PAGE dependencies. Every
  * authority must borrow the same held retention set; observed generation
  * claims must name one database. This creates no mutation authority. */

@@ -1213,11 +1213,12 @@ $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O): \
 
 test_cluster_thread_recovery_fabric_plan: \
 		test_cluster_thread_recovery_fabric_plan.c unit_test.h \
-		$(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O)
+		$(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) test_cluster_page_data_stable.o $(CLUSTER_WAL_CLAIM_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< \
 		$(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
-		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		test_cluster_page_data_stable.o $(CLUSTER_WAL_CLAIM_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lcrypto -o $@
 
 CLUSTER_THREAD_RECOVERY_FABRIC_APPLY_O = \
 		cluster_thread_recovery_fabric_apply_test.o

@@ -10,20 +10,34 @@
 #include "cluster/cluster_wal_thread.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
+#include "storage/buffile.h"
 #include "utils/resowner.h"
+
+#define PI_REBUILD_BATCH 64
+
+typedef struct PiRebuildContribution {
+	BufferTag tag;
+	uint32 holders;
+	XLogRecPtr lsn;
+	SCN scn;
+} PiRebuildContribution;
 
 typedef struct PiRebuildJob {
 	ResourceOwner owner;
 	ClusterGrdPiRebuildCutV1 cut;
 	ClusterWalSourceRef local;
 	ClusterWalInputsV1 *inputs;
-	ClusterThreadRecoveryFabricPlanV1 *plan;
-	uint32 cursor;
-	uint32 side_cursor;
-	uint32 side_locator;
-	uint8 side_block;
-	bool side_blocked;
-	bool side_checked;
+	BufFile *spool;
+	PiRebuildContribution batch[PI_REBUILD_BATCH];
+	PiRebuildContribution pending;
+	uint32 batch_count;
+	uint64 total;
+	uint64 cursor;
+	uint64 records;
+	int source_node;
+	XLogRecPtr source_lsn;
+	bool pending_valid;
+	bool scanned;
 	bool plan_blocked;
 } PiRebuildJob;
 
@@ -41,7 +55,8 @@ pi_rebuild_release(void)
 {
 	if (pi_rebuild_job == NULL)
 		return;
-	cluster_thread_recovery_fabric_plan_destroy_v1(&pi_rebuild_job->plan);
+	if (pi_rebuild_job->spool != NULL)
+		BufFileClose(pi_rebuild_job->spool);
 	cluster_wal_inputs_release_v1(&pi_rebuild_job->inputs);
 	pfree(pi_rebuild_job);
 	pi_rebuild_job = NULL;
@@ -51,162 +66,83 @@ static void
 pi_rebuild_owner_release(ResourceReleasePhase phase, bool is_commit pg_attribute_unused(),
 						 bool is_top_level pg_attribute_unused(), void *arg pg_attribute_unused())
 {
-	/* The native input/pin owners perform error cleanup. Their memory context
-	 * is about to be reset, so no retry may retain these process pointers. */
+	/* Native file/input owners release resources before this memory context
+	 * is reset. No retry may retain any pointer from a failed owner. */
 	if (phase == RESOURCE_RELEASE_BEFORE_LOCKS && pi_rebuild_job != NULL
 		&& pi_rebuild_job->owner == CurrentResourceOwner)
 		pi_rebuild_job = NULL;
 }
 
-static bool
-pi_rebuild_target(PiRebuildJob *job, const RfPageOnlinePlanV1 *plan, uint32 index)
+static void
+pi_rebuild_spill(PiRebuildJob *job)
 {
-	RfPageOnlineTargetViewV1 target;
-	const RfContributorVectorV1 *contributors;
+	if (job->batch_count == 0)
+		return;
+	if (job->spool == NULL)
+		job->spool = BufFileCreateTemp(false);
+	BufFileWrite(job->spool, job->batch, sizeof(job->batch[0]) * job->batch_count);
+	job->total += job->batch_count;
+	job->batch_count = 0;
+}
+
+static bool
+pi_rebuild_add(void *arg, const RelFileLocator *locator, ForkNumber forknum, BlockNumber blockno,
+			   uint64 token)
+{
+	PiRebuildJob *job = arg;
 	BufferTag tag;
-	uint32 holders = 0;
-	XLogRecPtr watermark_lsn = InvalidXLogRecPtr;
-	SCN watermark_scn = 0;
+	PiRebuildContribution *item;
 	int home;
 
-	if (!rf_page_online_plan_target_v1(plan, index, &target)
-		|| (contributors = target.contributors) == NULL || contributors->edge_count == 0)
+	if (token == 0 || job->source_node < 0 || job->source_node >= 32
+		|| XLogRecPtrIsInvalid(job->source_lsn))
 		return false;
-	InitBufferTag(&tag, &target.page_identity.locator, target.page_identity.forknum,
-				  target.page_identity.blockno);
+	InitBufferTag(&tag, locator, forknum, blockno);
 	home = cluster_gcs_lookup_master_static(tag);
 	if (home < 0 || home >= 32)
 		return false;
 	if (!(job->cut.affected[home / 8] & (1u << (home % 8)))
 		|| cluster_gcs_lookup_master(tag) != cluster_node_id)
 		return true;
-	for (uint32 i = 0; i < contributors->edge_count; i++) {
-		const RfPageStableEdgeInputV1 *edge = &contributors->edges[i];
-		ClusterWalSourceRef source;
-		int node;
-		if (edge->participant_index >= contributors->participant_count
-			|| !rf_page_online_plan_source_v1(plan, edge->participant_index, &source)
-			|| !cluster_wal_claim_v2_ref_valid(&source.claim)
-			|| source.claim.identity.origin_owner_incarnation == 0
-			|| source.claim.identity.system_identifier
-				   != job->local.claim.identity.system_identifier
-			|| source.claim.database_incarnation != job->local.claim.database_incarnation
-			|| memcmp(source.claim.identity.storage_uuid, job->local.claim.identity.storage_uuid,
-					  16)
-				   != 0
-			|| (node = source.claim.identity.origin_node_id) < 0 || node >= 32
-			|| source.claim.identity.origin_thread_id != node + 1
-			|| source.timeline != edge->record_identity.timeline_id
-			|| source.claim.identity.origin_thread_id != edge->record_identity.origin_thread
-			|| source.claim.identity.origin_owner_incarnation
-				   != contributors->cuts[edge->participant_index].origin_owner_incarnation
-			|| edge->edge.page_class != RF_PAGE_CLASS_ORDINARY || edge->result_token == 0
-			|| XLogRecPtrIsInvalid(edge->record_identity.read_rec_ptr))
-			return false;
-		holders |= (uint32)1u << node;
-		watermark_lsn = Max(watermark_lsn, edge->record_identity.read_rec_ptr);
-		if (scn_local(edge->result_token) > scn_local(watermark_scn))
-			watermark_scn = edge->result_token;
-	}
-	return cluster_pcm_rebuild_pi_contributors_v1(&job->cut, tag, holders, watermark_lsn,
-												  watermark_scn);
-}
-
-static bool
-pi_rebuild_side_covered(const ClusterThreadRecoveryFabricPlanV1 *plan, uint32 *blocked)
-{
-	const RfSideOnlinePlanV1 *side = cluster_thread_recovery_fabric_side_plan_v1(plan);
-	uint32 count = rf_side_online_plan_operation_count_v1(side);
-	if (side == NULL || count == UINT32_MAX)
-		return false;
-	for (uint32 i = 0; i < count; i++) {
-		RfSideContributionOwnersV1 owners;
-		*blocked = i;
-		if (!rf_side_online_plan_contribution_owners_v1(side, i, &owners))
-			return false;
-		for (uint32 j = 0; j < owners.space_locator_count; j++) {
-			RfSideSpaceContributionV1 space;
-			if (!rf_side_online_plan_space_contribution_v1(side, i, j, &space))
-				return false;
+	for (uint32 i = 0; i < job->batch_count; i++)
+		if (BufferTagsEqual(&job->batch[i].tag, &tag)) {
+			item = &job->batch[i];
+			goto merge;
 		}
-	}
+	if (job->total > UINT64_MAX - PI_REBUILD_BATCH)
+		return false;
+	if (job->batch_count == PI_REBUILD_BATCH)
+		pi_rebuild_spill(job);
+	item = &job->batch[job->batch_count++];
+	memset(item, 0, sizeof(*item));
+	item->tag = tag;
+merge:
+	item->holders |= (uint32)1u << job->source_node;
+	item->lsn = Max(item->lsn, job->source_lsn);
+	if (scn_local(token) > scn_local(item->scn))
+		item->scn = token;
 	return true;
 }
 
-static bool
-pi_rebuild_space(PiRebuildJob *job, const RfPageOnlinePlanV1 *page, const RfSideOnlinePlanV1 *side)
+static RfPageProofDetailV1
+pi_rebuild_record(XLogReaderState *record, const ClusterWalSourceRef *source,
+				  const RfContributorStreamCutV1 *cut, void *arg)
 {
-	RfSideOnlineOperationV1 operation;
-	RfSideContributionOwnersV1 owners;
-	RfSideSpaceContributionV1 contribution;
-	ClusterWalSourceRef source;
-	RfContributorStreamCutV1 physical;
-	BufferTag tag;
-	int node, home;
-	uint32 index = job->side_cursor;
-	uint8 block = job->side_block;
+	PiRebuildJob *job = arg;
 
-	if (!rf_side_online_plan_operation_v1(side, index, &operation)
-		|| !rf_side_online_plan_contribution_owners_v1(side, index, &owners)
-		|| !rf_page_online_plan_source_v1(page, operation.identity.participant_index, &source)
-		|| !cluster_thread_recovery_fabric_cut_v1(job->plan, operation.identity.participant_index,
-												  &physical)
-		|| !cluster_wal_claim_v2_ref_valid(&source.claim)
-		|| (node = source.claim.identity.origin_node_id) < 0 || node >= 32
-		|| source.claim.identity.origin_thread_id != node + 1
-		|| source.claim.identity.origin_owner_incarnation == 0
-		|| physical.origin_owner_incarnation != source.claim.identity.origin_owner_incarnation
-		|| source.claim.identity.system_identifier != job->local.claim.identity.system_identifier
-		|| source.claim.database_incarnation != job->local.claim.database_incarnation
-		|| memcmp(source.claim.identity.storage_uuid, job->local.claim.identity.storage_uuid, 16)
-			   != 0
-		|| physical.failed_thread != source.claim.identity.origin_thread_id
-		|| physical.timeline_id != source.timeline
-		|| operation.identity.record.origin_thread != physical.failed_thread
-		|| operation.identity.record.timeline_id != physical.timeline_id
-		|| operation.identity.record.read_rec_ptr < physical.scan_begin_inclusive
-		|| operation.identity.record.end_rec_ptr > physical.scan_end_exclusive
-		|| operation.identity.record.end_rec_ptr <= operation.identity.record.read_rec_ptr)
-		return false;
-	if (owners.space_locator_count == 0) {
-		/* These exact typed records have no PCM pages. Their own durability
-		 * and recovery gates remain intact; this census does not retire WAL. */
-		job->side_cursor++;
-		return true;
-	}
-	if (block > 1 || job->side_locator >= owners.space_locator_count
-		|| !rf_side_online_plan_space_contribution_v1(side, index, job->side_locator, &contribution)
-		|| contribution.result.key.system_identifier != source.claim.identity.system_identifier
-		|| contribution.result.key.database_incarnation != source.claim.database_incarnation
-		|| memcmp(contribution.result.key.storage_uuid, source.claim.identity.storage_uuid, 16)
-			   != 0)
-		return false;
-	if (!(contribution.page_mask & (1u << block)))
-		goto advance;
-	InitBufferTag(&tag, &contribution.result.key.locator, SPACE_FORKNUM, block);
-	home = cluster_gcs_lookup_master_static(tag);
-	if (home < 0 || home >= 32)
-		return false;
-	if (!(job->cut.affected[home / 8] & (1u << (home % 8)))
-		|| cluster_gcs_lookup_master(tag) != cluster_node_id)
-		goto advance;
-	if (!cluster_pcm_rebuild_pi_contributors_v1(&job->cut, tag, (uint32)1u << node,
-												operation.identity.record.read_rec_ptr,
-												contribution.result_token[block]))
-		return false;
-advance:
-	if (++job->side_block == 2) {
-		job->side_block = 0;
-		if (++job->side_locator == owners.space_locator_count) {
-			job->side_locator = 0;
-			job->side_cursor++;
-		}
-	}
-	return true;
+	if ((job->records++ % PI_REBUILD_BATCH) == 0 && !cluster_grd_pi_rebuild_current_v1(&job->cut))
+		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+	if (source->claim.identity.system_identifier != job->local.claim.identity.system_identifier
+		|| source->claim.database_incarnation != job->local.claim.database_incarnation
+		|| memcmp(source->claim.identity.storage_uuid, job->local.claim.identity.storage_uuid, 16))
+		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+	job->source_node = source->claim.identity.origin_node_id;
+	job->source_lsn = record->ReadRecPtr;
+	return cluster_thread_recovery_record_census_v1(record, source, cut, pi_rebuild_add, job);
 }
 
 static void
-pi_rebuild_report_apply_blocked(PiRebuildJob *job, bool side)
+pi_rebuild_report_apply_blocked(PiRebuildJob *job)
 {
 	if (pi_rebuild_apply_logged
 		&& memcmp(&pi_rebuild_apply_logged_cut, &job->cut, sizeof(job->cut)) == 0)
@@ -217,47 +153,33 @@ pi_rebuild_report_apply_blocked(PiRebuildJob *job, bool side)
 	ereport(
 		LOG,
 		(errmsg("cluster PI rebuild could not register a retained contribution"),
-		 errdetail("Epoch " UINT64_FORMAT ", direction %u, %s index %u, locator %u, block %u. "
+		 errdetail("Epoch " UINT64_FORMAT ", direction %u, contribution " UINT64_FORMAT ". "
 				   "Service remains fenced; retrying the same target with WAL read pins released.",
-				   job->cut.epoch, job->cut.direction, side ? "SIDE" : "PAGE",
-				   side ? job->side_cursor : job->cursor, job->side_locator, job->side_block)));
-}
-
-static void
-pi_rebuild_report_side_blocked(PiRebuildJob *job, uint32 index)
-{
-	RfSideOnlineOperationV1 operation = { 0 };
-
-	job->side_blocked = true;
-	if (pi_rebuild_logged && memcmp(&pi_rebuild_logged_cut, &job->cut, sizeof(job->cut)) == 0)
-		return;
-	pi_rebuild_logged = true;
-	pi_rebuild_logged_cut = job->cut;
-	cluster_grd_inc_pi_rebuild_side_blocked();
-	(void)rf_side_online_plan_operation_v1(cluster_thread_recovery_fabric_side_plan_v1(job->plan),
-										   index, &operation);
-	ereport(LOG, (errmsg("cluster PI rebuild is waiting for a typed SIDE contribution owner"),
-				  errdetail("Epoch " UINT64_FORMAT
-							", direction %u, operation %u, kind %u, WAL thread %u, record %X/%X. "
-							"The retained plan remains blocked with WAL read pins released.",
-							job->cut.epoch, job->cut.direction, index, operation.kind,
-							operation.identity.record.origin_thread,
-							LSN_FORMAT_ARGS(operation.identity.record.read_rec_ptr))));
+				   job->cut.epoch, job->cut.direction, job->cursor)));
 }
 
 static void
 pi_rebuild_report_plan_blocked(PiRebuildJob *job, ClusterControlRootResult result,
 							   RfPageProofDetailV1 detail)
 {
-	if (result == CLUSTER_CONTROL_ROOT_STALE_TOKEN
-		|| (pi_rebuild_plan_logged
-			&& memcmp(&pi_rebuild_plan_logged_cut, &job->cut, sizeof(job->cut)) == 0))
+	if (result == CLUSTER_CONTROL_ROOT_STALE_TOKEN)
 		return;
-	pi_rebuild_plan_logged = true;
-	pi_rebuild_plan_logged_cut = job->cut;
-	cluster_grd_inc_pi_rebuild_plan_blocked();
+	if (detail == RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE) {
+		if (pi_rebuild_logged && memcmp(&pi_rebuild_logged_cut, &job->cut, sizeof(job->cut)) == 0)
+			return;
+		pi_rebuild_logged = true;
+		pi_rebuild_logged_cut = job->cut;
+		cluster_grd_inc_pi_rebuild_side_blocked();
+	} else {
+		if (pi_rebuild_plan_logged
+			&& memcmp(&pi_rebuild_plan_logged_cut, &job->cut, sizeof(job->cut)) == 0)
+			return;
+		pi_rebuild_plan_logged = true;
+		pi_rebuild_plan_logged_cut = job->cut;
+		cluster_grd_inc_pi_rebuild_plan_blocked();
+	}
 	ereport(LOG,
-			(errmsg("cluster PI rebuild could not build its retained contribution plan"),
+			(errmsg("cluster PI rebuild could not complete its retained contribution census"),
 			 errdetail("Epoch " UINT64_FORMAT ", direction %u, input result %u, proof detail %u. "
 					   "Service remains fenced; failed proofs are never used to complete the cut.",
 					   job->cut.epoch, job->cut.direction, result, detail)));
@@ -268,19 +190,16 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 {
 	ClusterGrdPiRebuildCutV1 cut;
 	ClusterWalSourceRef local;
-	const RfPageOnlinePlanV1 *page;
-	const RfSideOnlinePlanV1 *side;
 	ClusterControlRootResult result;
 	uint64 records;
 	RfPageProofDetailV1 detail;
-	uint32 blocked = UINT32_MAX;
-	uint32 budget = 64;
+	uint32 budget = PI_REBUILD_BATCH;
 	ClusterPiRebuildProgressV1 progress = CLUSTER_PI_REBUILD_WAIT;
 	int state;
 
 	if (MyBackendType != B_BG_WRITER || !cluster_enabled || !cluster_shared_config
 		|| CurrentResourceOwner == NULL || CritSectionCount != 0)
-		return false;
+		return CLUSTER_PI_REBUILD_IDLE;
 	if (!pi_rebuild_callback_registered) {
 		RegisterResourceReleaseCallback(pi_rebuild_owner_release, NULL);
 		pi_rebuild_callback_registered = true;
@@ -311,7 +230,7 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 											 &pi_rebuild_job->inputs);
 		if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
 			|| result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
-			return true;
+			return CLUSTER_PI_REBUILD_WAIT;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 			pi_rebuild_report_plan_blocked(pi_rebuild_job, result, RF_PAGE_PROOF_DETAIL_OK);
 			goto done;
@@ -324,55 +243,50 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 		pi_rebuild_report_plan_blocked(pi_rebuild_job, result, RF_PAGE_PROOF_DETAIL_OK);
 		goto done;
 	}
-	if (pi_rebuild_job->plan == NULL) {
-		result = cluster_wal_inputs_contributions_v1(pi_rebuild_job->inputs, true,
-													 &pi_rebuild_job->plan, &records, &detail);
+	if (!pi_rebuild_job->scanned) {
+		result = cluster_wal_inputs_census_v1(pi_rebuild_job->inputs, pi_rebuild_record,
+											  pi_rebuild_job, &records, &detail);
 		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
 			goto wait;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 			pi_rebuild_report_plan_blocked(pi_rebuild_job, result, detail);
-			/* Capacity/typed-proof refusals are stable for this fixed input.
-			 * Transient input I/O and stale authority still retry fresh. */
 			if (detail == RF_PAGE_PROOF_DETAIL_OK)
 				goto done;
 			pi_rebuild_job->plan_blocked = true;
 			goto failed;
 		}
+		/* A failed physical suffix has made no directory additions. Spill
+		 * only contributions, never full replay operations or payloads. */
+		if (pi_rebuild_job->spool != NULL) {
+			pi_rebuild_spill(pi_rebuild_job);
+			if (BufFileSeek(pi_rebuild_job->spool, 0, 0, SEEK_SET) != 0)
+				ereport(ERROR, (errmsg("could not rewind cluster PI census")));
+		} else
+			pi_rebuild_job->total = pi_rebuild_job->batch_count;
+		pi_rebuild_job->scanned = true;
 	}
-	page = cluster_thread_recovery_fabric_page_plan_v1(pi_rebuild_job->plan);
-	if (page == NULL || !cluster_grd_pi_rebuild_current_v1(&cut)
+	if (!cluster_grd_pi_rebuild_current_v1(&cut)
 		|| cluster_wal_inputs_revalidate_v1(pi_rebuild_job->inputs)
 			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
-	if (pi_rebuild_job->side_blocked)
-		goto wait;
-	if (!pi_rebuild_job->side_checked && !pi_rebuild_side_covered(pi_rebuild_job->plan, &blocked)) {
-		pi_rebuild_report_side_blocked(pi_rebuild_job, blocked);
-		goto wait;
-	}
-	pi_rebuild_job->side_checked = true;
-	/* Directory additions are bounded per tick and remain invisible to
-	 * grants until the complete graph and original ROOT have been checked. */
-	for (; budget > 0 && pi_rebuild_job->cursor < rf_page_online_plan_target_count_v1(page);
-		 budget--) {
-		if (!pi_rebuild_target(pi_rebuild_job, page, pi_rebuild_job->cursor)) {
-			pi_rebuild_report_apply_blocked(pi_rebuild_job, false);
+	for (; budget > 0 && pi_rebuild_job->cursor < pi_rebuild_job->total; budget--) {
+		PiRebuildJob *job = pi_rebuild_job;
+		if (!job->pending_valid) {
+			if (job->spool != NULL)
+				BufFileReadExact(job->spool, &job->pending, sizeof(job->pending));
+			else
+				job->pending = job->batch[job->cursor];
+			job->pending_valid = true;
+		}
+		if (!cluster_pcm_rebuild_pi_contributors_v1(&cut, job->pending.tag, job->pending.holders,
+													job->pending.lsn, job->pending.scn)) {
+			pi_rebuild_report_apply_blocked(job);
 			goto blocked;
 		}
-		pi_rebuild_job->cursor++;
+		job->pending_valid = false;
+		job->cursor++;
 	}
-	if (pi_rebuild_job->cursor != rf_page_online_plan_target_count_v1(page)) {
-		progress = CLUSTER_PI_REBUILD_MORE;
-		goto wait;
-	}
-	side = cluster_thread_recovery_fabric_side_plan_v1(pi_rebuild_job->plan);
-	for (; budget > 0 && pi_rebuild_job->side_cursor < rf_side_online_plan_operation_count_v1(side);
-		 budget--)
-		if (!pi_rebuild_space(pi_rebuild_job, page, side)) {
-			pi_rebuild_report_apply_blocked(pi_rebuild_job, true);
-			goto blocked;
-		}
-	if (pi_rebuild_job->side_cursor != rf_side_online_plan_operation_count_v1(side)) {
+	if (pi_rebuild_job->cursor != pi_rebuild_job->total) {
 		progress = CLUSTER_PI_REBUILD_MORE;
 		goto wait;
 	}

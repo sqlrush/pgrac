@@ -190,6 +190,19 @@ extern bool rf_side_online_plan_space_contribution_v1(const RfSideOnlinePlanV1 *
 													  uint32 operation, uint32 locator_index,
 													  RfSideSpaceContributionV1 *out);
 
+/* One decoded record, no retained operation array or payload allocation.
+ * Reuses the replay decoder but returns only provisional contribution owners.
+ * The caller must finish physical WAL/source validation before completing its
+ * census; these callbacks never prove an ancestor, DATA, replay or retirement.
+ * identity uses participant zero in the supplied original source cut. */
+typedef bool (*RfSideCensusSpaceVisitorV1)(void *arg, const RfSideSpaceContributionV1 *space);
+extern RfPageProofDetailV1 rf_side_record_census_v1(const RfDetachedRecordPlanV1 *record_plan,
+													const RfPageOnlineRecordIdentityV1 *identity,
+													const RfContributorStreamCutV1 *cut,
+													uint64 database_incarnation,
+													RfSideCensusSpaceVisitorV1 visit_space,
+													void *arg, RfSideContributionOwnersV1 *out);
+
 /* Complete sorted unique namespace/locator set for typed SPACE, including
  * each original COMMIT-DROP participant. Sealing checks every source chain;
  * enumeration grants no target, lifecycle or durability authority.
