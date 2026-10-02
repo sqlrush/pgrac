@@ -72,6 +72,19 @@ $HOME/linkdb-install/bin/pgrac-init --version
 If both commands report a version line, the install is ready.
 Continue with the [Bootstrap](bootstrap.md) guide to start a node.
 
+## Data checksums for shared mode
+
+`cluster.shared_config=on` requires data checksums. `pgrac-init` enables them
+for new data directories, including directories with relocated WAL. A joining
+node inherits the setting from its seed backup. If using `initdb` directly,
+pass `-k` (`--data-checksums`). Check the setting with `SHOW data_checksums`.
+
+Shared startup rejects a directory without checksums with SQLSTATE `55000`,
+before recovery writes. Disabling checksums with `pg_checksums --disable`
+also prevents its next shared startup. Preserve the original directory and
+initialize a new directory with checksums enabled when preparing a shared
+database.
+
 ## Run the test suites (optional)
 
 ```bash

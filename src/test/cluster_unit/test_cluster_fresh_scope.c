@@ -252,6 +252,7 @@ UT_TEST(test_pre1_startup_refuses_before_root_and_without_writes)
 	UT_ASSERT_EQ(mkdir(global, 0700), 0);
 	image.pg_control_version = PG_CONTROL_VERSION;
 	image.catalog_version_no = 202609120;
+	image.data_checksum_version = PG_DATA_CHECKSUM_VERSION;
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, &image, offsetof(ControlFileData, crc));
 	FIN_CRC32C(crc);
@@ -296,6 +297,7 @@ UT_TEST(test_selected_pre1_image_and_corruption_are_distinct)
 	int caught;
 	image.pg_control_version = PG_CONTROL_VERSION;
 	image.catalog_version_no = 202609120;
+	image.data_checksum_version = PG_DATA_CHECKSUM_VERSION;
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, &image, offsetof(ControlFileData, crc));
 	FIN_CRC32C(crc);
@@ -336,6 +338,7 @@ UT_TEST(test_catalog_only_profile_refuses_pre1)
 
 	image.pg_control_version = PG_CONTROL_VERSION;
 	image.catalog_version_no = 202609120;
+	image.data_checksum_version = PG_DATA_CHECKSUM_VERSION;
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, &image, offsetof(ControlFileData, crc));
 	FIN_CRC32C(crc);
@@ -369,6 +372,117 @@ UT_TEST(test_bound_startup_does_not_consult_compatibility_projection)
 	UT_ASSERT_EQ(write_opens, 0);
 	DataDir = NULL;
 	binding_result = PGRAC_CONTROL_BINDING_MISSING;
+}
+
+static ControlFileData
+checksum_control(uint32 version, DBState state)
+{
+	ControlFileData image = { 0 };
+	pg_crc32c crc;
+	image.pg_control_version = PG_CONTROL_VERSION;
+	image.catalog_version_no = CATALOG_VERSION_NO;
+	image.maxAlign = MAXIMUM_ALIGNOF;
+	image.floatFormat = FLOATFORMAT_VALUE;
+	image.blcksz = BLCKSZ;
+	image.relseg_size = RELSEG_SIZE;
+	image.xlog_blcksz = XLOG_BLCKSZ;
+	image.nameDataLen = NAMEDATALEN;
+	image.indexMaxKeys = INDEX_MAX_KEYS;
+	image.toast_max_chunk_size = TOAST_MAX_CHUNK_SIZE;
+	image.loblksize = LOBLKSIZE;
+#ifdef USE_FLOAT8_BYVAL
+	image.float8ByVal = true;
+#endif
+	image.xlog_seg_size = 16 * 1024 * 1024;
+	image.state = state;
+	image.data_checksum_version = version;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, &image, offsetof(ControlFileData, crc));
+	FIN_CRC32C(crc);
+	image.crc = crc;
+	return image;
+}
+
+UT_TEST(test_shared_selected_control_requires_supported_checksums)
+{
+	const DBState states[] = { DB_SHUTDOWNED, DB_IN_PRODUCTION, DB_IN_CRASH_RECOVERY };
+	cluster_shared_config = true;
+	for (unsigned i = 0; i < lengthof(states); i++)
+		for (uint32 version = 0; version <= PG_DATA_CHECKSUM_VERSION + 1; version++) {
+			ControlFileData image = checksum_control(version, states[i]);
+			ControlFileData before = image;
+			int caught;
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				XLogValidateControlFile(&image);
+			/* Atomic format activation is still a separate owner.  A valid
+			 * checksum must preserve the current PRE1 refusal until then. */
+			UT_ASSERT_EQ(caught,
+						 version != PG_DATA_CHECKSUM_VERSION || CATALOG_VERSION_NO == 202609120);
+			if (version != PG_DATA_CHECKSUM_VERSION) {
+				UT_ASSERT_EQ(error_code, ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE);
+				UT_ASSERT(strstr(error_message, "requires data checksums") != NULL);
+				UT_ASSERT(strstr(error_hint, "initdb -k") != NULL);
+			} else if (CATALOG_VERSION_NO == 202609120) {
+				UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+				UT_ASSERT(strstr(error_message, "PRE1") != NULL);
+			}
+			UT_ASSERT(memcmp(&image, &before, sizeof(image)) == 0);
+		}
+}
+UT_TEST(test_shared_unbound_checksum_refusal_precedes_root_and_writes)
+{
+	char tmp[] = "/tmp/pgrac-checksum-scope-XXXXXX";
+	char global[MAXPGPATH], path[MAXPGPATH];
+	ControlFileData image = checksum_control(0, DB_SHUTDOWNED), after;
+	int fd, caught;
+
+	UT_ASSERT(mkdtemp(tmp) != NULL);
+	snprintf(global, sizeof(global), "%s/global", tmp);
+	snprintf(path, sizeof(path), "%s/pg_control", global);
+	UT_ASSERT_EQ(mkdir(global, 0700), 0);
+	fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(write(fd, &image, sizeof(image)), sizeof(image));
+	UT_ASSERT_EQ(close(fd), 0);
+	DataDir = tmp;
+	cluster_shared_config = true;
+	binding_result = PGRAC_CONTROL_BINDING_MISSING;
+	prepare_calls = legacy_calls = open_calls = write_opens = 0;
+	reset_error();
+	caught = sigsetjmp(boundary, 1);
+	if (!caught)
+		LocalProcessControlFile(false);
+	UT_ASSERT_EQ(caught, 1);
+	UT_ASSERT_EQ(error_code, ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE);
+	UT_ASSERT_EQ(prepare_calls, 0);
+	UT_ASSERT_EQ(legacy_calls, 0);
+	UT_ASSERT_EQ(open_calls, 1);
+	UT_ASSERT_EQ(write_opens, 0);
+	fd = open(path, O_RDONLY);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(read(fd, &after, sizeof(after)), sizeof(after));
+	UT_ASSERT_EQ(close(fd), 0);
+	UT_ASSERT(memcmp(&image, &after, sizeof(image)) == 0);
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_EQ(rmdir(global), 0);
+	UT_ASSERT_EQ(rmdir(tmp), 0);
+	DataDir = NULL;
+}
+UT_TEST(test_nonshared_control_keeps_native_checksum_choice)
+{
+	cluster_shared_config = false;
+	cluster_shared_catalog = false;
+	for (uint32 version = 0; version <= PG_DATA_CHECKSUM_VERSION; version++) {
+		ControlFileData image = checksum_control(version, DB_SHUTDOWNED);
+		int caught;
+		reset_error();
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			XLogValidateControlFile(&image);
+		UT_ASSERT_EQ(caught, 0);
+	}
 }
 
 UT_TEST(test_create_concurrently_refuses_before_native_mutation)
@@ -732,7 +846,7 @@ UT_TEST(test_schema_prechecks_removed_children_but_retains_supported_commands)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(18);
 	UT_RUN(test_pre1_startup_refuses_before_root_and_without_writes);
 	UT_RUN(test_selected_pre1_image_and_corruption_are_distinct);
 	UT_RUN(test_nonshared_startup_remains_native);
@@ -748,6 +862,9 @@ main(void)
 	UT_RUN(test_shared_removed_commands_refuse_at_native_utility_entry);
 	UT_RUN(test_unlogged_and_matview_create_and_alter_refuse_before_work);
 	UT_RUN(test_schema_prechecks_removed_children_but_retains_supported_commands);
+	UT_RUN(test_shared_selected_control_requires_supported_checksums);
+	UT_RUN(test_shared_unbound_checksum_refusal_precedes_root_and_writes);
+	UT_RUN(test_nonshared_control_keeps_native_checksum_choice);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

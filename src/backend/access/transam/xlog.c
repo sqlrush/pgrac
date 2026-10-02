@@ -4848,6 +4848,20 @@ XLogValidateControlFile(const ControlFileData *control)
 				(errmsg("incorrect checksum in control file")));
 
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: shared recovery needs a checksum-qualified DATA base.  Check
+	 * the selected image before any bootstrap/recovery writes; a compatibility
+	 * projection must not supply this prerequisite for a different ROOT.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	if (cluster_shared_config && control->data_checksum_version != PG_DATA_CHECKSUM_VERSION)
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cluster.shared_config requires data checksums"),
+				 errdetail("The selected control file has data checksum version %u; this server requires version %u.",
+						   control->data_checksum_version, PG_DATA_CHECKSUM_VERSION),
+				 errhint("Initialize a new data directory with initdb -k (--data-checksums), or with "
+						 "pgrac-init, which enables them by default. Preserve the original data directory.")));
+
 	/* PGRAC: no PRE1 physical import into the shared PRE2 format. Test only
 	 * after native version/CRC validation; a corrupt image is not an old one.
 	 * Author: SqlRush <sqlrush@gmail.com>
