@@ -3522,6 +3522,9 @@ cluster_reconfig_publish_prepared_join_commit(void)
 			   == 0) {
 		/* fall through to publish */
 		cluster_write_fence_authority_cache_invalidate();
+		if (cluster_shared_config)
+			cluster_grd_arm_join_pcm_fence_scope_v1(join_commit_stage.event.join_bitmap,
+													expected_fenced);
 		cluster_membership_set_state(join_commit_stage.node_id, CLUSTER_MEMBER_MEMBER);
 		cluster_membership_record_admitted(join_commit_stage.node_id,
 										   join_commit_stage.admitted_incarnation);
@@ -4939,13 +4942,19 @@ cluster_reconfig_open_replacement_admission(const ClusterReplacementEpisode *exp
 }
 
 void
-cluster_reconfig_note_self_admitted(uint64 admitted_epoch)
+cluster_reconfig_note_self_admitted(uint64 admitted_epoch, const ClusterFenceMarker *marker)
 {
 	bool replacement_admitted;
 
 	if (ReconfigShmem == NULL)
 		return;
 	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		return;
+
+	if (cluster_shared_config
+		&& (admitted_epoch == 0 || !cluster_fence_marker_valid_v1(marker)
+			|| marker->fence_epoch != admitted_epoch
+			|| cluster_fence_marker_node_is_fenced(marker->fenced_dead_bitmap, cluster_node_id)))
 		return;
 
 	/* The ordinary v2 callback never opens a replacement episode, including a
@@ -5023,7 +5032,10 @@ cluster_reconfig_note_self_admitted(uint64 admitted_epoch)
 		uint8 self_set[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
 
 		self_set[cluster_node_id >> 3] = (uint8)(1u << (cluster_node_id & 7));
-		cluster_grd_arm_join_pcm_fence(self_set);
+		if (cluster_shared_config)
+			cluster_grd_arm_join_pcm_fence_scope_v1(self_set, marker->fenced_dead_bitmap);
+		else
+			cluster_grd_arm_join_pcm_fence(self_set);
 	}
 
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
@@ -6757,7 +6769,19 @@ cluster_reconfig_lmon_tick(void)
 
 				if (cluster_reconfig_get_observed_committed_join(i, &obs_inc, &obs_epoch)
 					&& obs_inc == root_gated_join_incarnation
-					&& obs_inc > cluster_membership_get_last_admitted_incarnation(i)) {
+					&& obs_inc > cluster_membership_get_last_admitted_incarnation(i)
+					&& (!cluster_shared_config
+						|| (obs_epoch != 0 && obs_epoch == cluster_epoch_get_current()))) {
+					if (cluster_shared_config) {
+						uint8 recipient[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+						uint8 excluded[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+						recipient[i / 8] = (uint8)(1u << (i % 8));
+						for (int b = 0; b < sizeof(excluded); b++)
+							excluded[b] = ReconfigShmem->last_applied.dead_bitmap[b]
+										  | ReconfigShmem->removed_bitmap[b];
+						excluded[i / 8] &= (uint8) ~(1u << (i % 8));
+						cluster_grd_arm_join_pcm_fence_scope_v1(recipient, excluded);
+					}
 					cluster_membership_set_state(i, CLUSTER_MEMBER_MEMBER);
 					cluster_membership_record_admitted(i, obs_inc);
 					ReconfigShmem->fast_rejoin_incarnation[i] = obs_inc;
@@ -10159,7 +10183,8 @@ cluster_reconfig_self_join_gate_verdict(void)
 }
 
 void
-cluster_reconfig_note_self_admitted(uint64 admitted_epoch pg_attribute_unused())
+cluster_reconfig_note_self_admitted(uint64 admitted_epoch pg_attribute_unused(),
+									const ClusterFenceMarker *marker pg_attribute_unused())
 {}
 
 bool

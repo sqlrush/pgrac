@@ -1019,6 +1019,24 @@ void
 cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set pg_attribute_unused())
 {}
 
+/* Observe the real admission caller before MEMBER is published. */
+static int ut_join_scope_calls;
+static bool ut_join_scope_before_member;
+static uint8 ut_join_scope_recipients[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+static uint8 ut_join_scope_excluded[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+void cluster_grd_arm_join_pcm_fence_scope_v1(const uint8 *recipients, const uint8 *excluded);
+void
+cluster_grd_arm_join_pcm_fence_scope_v1(const uint8 *recipients, const uint8 *excluded)
+{
+	ut_join_scope_calls++;
+	ut_join_scope_before_member = true;
+	for (int i = 0; i < CLUSTER_MAX_NODES; i++)
+		if ((recipients[i / 8] & (1u << (i % 8))) && cluster_membership_is_member(i))
+			ut_join_scope_before_member = false;
+	memcpy(ut_join_scope_recipients, recipients, sizeof(ut_join_scope_recipients));
+	memcpy(ut_join_scope_excluded, excluded, sizeof(ut_join_scope_excluded));
+}
+
 /* Shape A (crash-rejoin re-declare barrier) stubs — the off-path rejoin tick
  * references these; the reconfig unit legs do not exercise the crash-rejoin
  * arm, so inert stubs suffice. */
@@ -4138,12 +4156,12 @@ UT_TEST(test_epoch0_managed_pivot_drives_ordinary_join_owner)
 		/* Exact JCMK may arrive before PGXS/JOIN WAL.  The existing admission
 		 * callback must keep the tuple write-closed until the unified stripe
 		 * gate is terminal-current. */
-		cluster_reconfig_note_self_admitted(UINT64_C(7));
+		cluster_reconfig_note_self_admitted(UINT64_C(7), NULL);
 		UT_ASSERT_EQ(state->self_join_admitted, 0);
 		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
 					 (int)CLUSTER_MEMBER_JOINING);
 		ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
-		cluster_reconfig_note_self_admitted(UINT64_C(7));
+		cluster_reconfig_note_self_admitted(UINT64_C(7), NULL);
 		UT_ASSERT_EQ(state->self_join_admitted, 1);
 		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
 					 (int)CLUSTER_MEMBER_MEMBER);
@@ -4257,6 +4275,53 @@ UT_TEST(test_late_joiner_stripe_refuse_is_terminal_fail_closed)
 /* A durable ordinary JOIN_COMMITTED proof cannot open service while the
  * existing xid-stripe gate is still staging the current node's own PGXS
  * claim.  The callback is retried by QVOTEC and must never seed PGXA. */
+UT_TEST(test_shared_join_admission_requires_exact_selected_routing_scope)
+{
+	ClusterReconfigState *state;
+	ClusterFenceMarker marker = { 0 };
+	cluster_online_join = true;
+	ut_join_setup();
+	cluster_shared_config = true;
+	cluster_node_id = 1;
+	ut_declared_set[1] = true;
+	ut_set_self_incarnation_sequence(UINT64_C(81), UINT64_C(81), UINT64_C(81));
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
+	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
+	ut_join_scope_calls = 0;
+	marker.magic = CLUSTER_FENCE_MARKER_MAGIC;
+	marker.version = CLUSTER_FENCE_MARKER_VERSION;
+	marker.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+	marker.fence_epoch = 7;
+	marker.fence_event_id = 70;
+	marker.issuer_node_id = 0;
+	marker.fenced_dead_bitmap[0] = 4;
+	cluster_reconfig_note_self_admitted(7, NULL);
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
+	marker._pad[0] = 1;
+	cluster_reconfig_note_self_admitted(7, &marker);
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
+	marker._pad[0] = 0;
+	marker.fence_epoch = 6;
+	cluster_reconfig_note_self_admitted(7, &marker);
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
+	marker.fence_epoch = 7;
+	marker.fenced_dead_bitmap[0] |= 2;
+	cluster_reconfig_note_self_admitted(7, &marker);
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
+	UT_ASSERT_EQ(ut_join_scope_calls, 0);
+	marker.fenced_dead_bitmap[0] = 4;
+	cluster_reconfig_note_self_admitted(7, &marker);
+	UT_ASSERT_EQ(state->self_join_admitted, 1);
+	UT_ASSERT_EQ(ut_join_scope_calls, 1);
+	UT_ASSERT(ut_join_scope_before_member);
+	UT_ASSERT_EQ(ut_join_scope_recipients[0], 2);
+	UT_ASSERT_EQ(ut_join_scope_excluded[0], 4);
+	UT_ASSERT(cluster_membership_is_member(cluster_node_id));
+	cluster_shared_config = false;
+	cluster_online_join = false;
+}
+
 UT_TEST(test_online_join_waits_for_own_stripe_claim)
 {
 	ClusterReconfigState *state;
@@ -4270,7 +4335,7 @@ UT_TEST(test_online_join_waits_for_own_stripe_claim)
 	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
 	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_HOLD;
 
-	cluster_reconfig_note_self_admitted(UINT64_C(7));
+	cluster_reconfig_note_self_admitted(UINT64_C(7), NULL);
 	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 1);
 	UT_ASSERT(!ut_xid_stripe_last_may_seed);
 	UT_ASSERT_EQ(state->self_join_admitted, 0);
@@ -4278,7 +4343,7 @@ UT_TEST(test_online_join_waits_for_own_stripe_claim)
 	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(0));
 
 	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
-	cluster_reconfig_note_self_admitted(UINT64_C(7));
+	cluster_reconfig_note_self_admitted(UINT64_C(7), NULL);
 	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 2);
 	UT_ASSERT(!ut_xid_stripe_last_may_seed);
 	UT_ASSERT_EQ(state->self_join_admitted, 1);
@@ -4303,14 +4368,14 @@ UT_TEST(test_online_join_waits_for_join_wal)
 	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
 	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_HOLD;
 
-	cluster_reconfig_note_self_admitted(UINT64_C(9));
+	cluster_reconfig_note_self_admitted(UINT64_C(9), NULL);
 	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 1);
 	UT_ASSERT(!ut_xid_stripe_last_may_seed);
 	UT_ASSERT_EQ(state->self_join_admitted, 0);
 	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_JOINING);
 
 	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
-	cluster_reconfig_note_self_admitted(UINT64_C(9));
+	cluster_reconfig_note_self_admitted(UINT64_C(9), NULL);
 	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 2);
 	UT_ASSERT(!ut_xid_stripe_last_may_seed);
 	UT_ASSERT_EQ(state->self_join_admitted, 1);
@@ -4482,7 +4547,7 @@ UT_TEST(test_self_join_gate_lifecycle)
 				 (int)CLUSTER_JOIN_GATE_BLOCK_53R60);
 
 	/* admission (note_self_admitted) reopens the gate. */
-	cluster_reconfig_note_self_admitted(7);
+	cluster_reconfig_note_self_admitted(7, NULL);
 	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(), (int)CLUSTER_JOIN_GATE_ALLOW);
 
 	cluster_online_join = false; /* leave global off for other tests */
@@ -4527,7 +4592,7 @@ UT_TEST(test_replacement_member_publish_is_exact_and_write_closed)
 	UT_ASSERT_EQ(memcmp(&state->replacement_episode, &episode, sizeof(episode)), 0);
 
 	/* The ordinary v2 callback remains unable to open a replacement episode. */
-	cluster_reconfig_note_self_admitted(episode.reserved_or_committed_epoch);
+	cluster_reconfig_note_self_admitted(episode.reserved_or_committed_epoch, NULL);
 	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
 				 (int)CLUSTER_JOIN_GATE_BLOCK_53R60);
 	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
@@ -4596,7 +4661,7 @@ UT_TEST(test_nonempty_invalid_replacement_episode_blocks_ordinary_openers)
 	cluster_reconfig_lmon_tick();
 	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
 				 (int)CLUSTER_JOIN_GATE_BLOCK_53R60);
-	cluster_reconfig_note_self_admitted(UINT64_C(41));
+	cluster_reconfig_note_self_admitted(UINT64_C(41), NULL);
 	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
 				 (int)CLUSTER_JOIN_GATE_BLOCK_53R60);
 	cluster_online_join = false;
@@ -5146,6 +5211,52 @@ UT_TEST(test_survivor_join_observation_clears_only_gated_origin)
 	UT_ASSERT_EQ((int)applied.reconfig_kind, (int)RECONFIG_KIND_JOIN_COMMITTED);
 	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x04)) == 0);
 	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x08)) != 0);
+	cluster_online_join = false;
+}
+
+UT_TEST(test_shared_coordinator_fences_full_scope_before_publishing_member)
+{
+	ClusterReconfigState *state;
+	ut_stage_join_commit_with_prior_excluded(true);
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+	state->removed_bitmap[0] = 8;
+	cluster_shared_config = true;
+	ut_join_scope_calls = 0;
+	cluster_reconfig_lmon_tick();
+	UT_ASSERT_EQ(ut_join_scope_calls, 0);
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_ACKED;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_ACK;
+	cluster_reconfig_lmon_tick();
+	UT_ASSERT(cluster_membership_is_member(1));
+	UT_ASSERT_EQ(ut_join_scope_calls, 1);
+	UT_ASSERT(ut_join_scope_before_member);
+	UT_ASSERT_EQ(ut_join_scope_recipients[0], 2);
+	UT_ASSERT_EQ(ut_join_scope_excluded[0], 12);
+	cluster_shared_config = false;
+	cluster_online_join = false;
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_shared_observer_waits_for_exact_epoch_then_fences_remaining_homes)
+{
+	ClusterReconfigState *state;
+	ut_stage_survivor_join_observation(true);
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+	state->removed_bitmap[0] = 16;
+	cluster_shared_config = true;
+	ut_join_scope_calls = 0;
+	cluster_reconfig_lmon_tick();
+	UT_ASSERT(!cluster_membership_is_member(2));
+	UT_ASSERT_EQ(ut_join_scope_calls, 0);
+	cluster_epoch_adopt_admitted(1);
+	cluster_reconfig_lmon_tick();
+	UT_ASSERT(cluster_membership_is_member(2));
+	UT_ASSERT_EQ(ut_join_scope_calls, 1);
+	UT_ASSERT(ut_join_scope_before_member);
+	UT_ASSERT_EQ(ut_join_scope_recipients[0], 4);
+	UT_ASSERT_EQ(ut_join_scope_excluded[0], 24);
+	cluster_shared_config = false;
 	cluster_online_join = false;
 }
 
@@ -7202,7 +7313,7 @@ UT_TEST(test_stop_reconfig_actual_formation_owner)
 int
 main(void)
 {
-	UT_PLAN(130);
+	UT_PLAN(133);
 	UT_RUN(test_stop_membership_terminal_peer_is_not_online_admission);
 	UT_RUN(test_stop_membership_preserves_all_nonliveness_requirements);
 	UT_RUN(test_stop_reconfig_shared_owners);
@@ -7324,6 +7435,7 @@ main(void)
 
 	/* spec-5.15 D5 — joiner write-gate lifecycle (INV-J9). */
 	UT_RUN(test_self_join_gate_lifecycle);
+	UT_RUN(test_shared_join_admission_requires_exact_selected_routing_scope);
 	UT_RUN(test_online_join_waits_for_own_stripe_claim);
 	UT_RUN(test_online_join_waits_for_join_wal);
 	UT_RUN(test_replacement_member_publish_is_exact_and_write_closed);
@@ -7344,6 +7456,8 @@ main(void)
 	UT_RUN(test_join_pending_preserves_full_prior_excluded_set);
 	UT_RUN(test_survivor_join_observation_requires_root_rejoin_gate);
 	UT_RUN(test_survivor_join_observation_clears_only_gated_origin);
+	UT_RUN(test_shared_coordinator_fences_full_scope_before_publishing_member);
+	UT_RUN(test_shared_observer_waits_for_exact_epoch_then_fences_remaining_homes);
 	UT_RUN(test_survivor_join_observation_waits_for_serving_ready);
 	UT_RUN(test_reconfig_region3_mailbox_request_word_is_exact_duplex);
 	UT_RUN(test_reconfig_qvotec_lifecycle_double_invalidates_mailboxes);

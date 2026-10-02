@@ -871,7 +871,9 @@ extern bool cluster_reconfig_join_in_progress(void);
  * adopt the admitted epoch (may jump >16) AND set self MEMBER, THEN open the
  * write gate (gate-open guard = adopt && state==MEMBER — P1-r5 half-publish).
  */
-extern void cluster_reconfig_note_self_admitted(uint64 admitted_epoch);
+struct ClusterFenceMarker;
+extern void cluster_reconfig_note_self_admitted(uint64 admitted_epoch,
+												const struct ClusterFenceMarker *marker);
 extern bool cluster_reconfig_self_join_admitted(void); /* RF-ROOT P6 */
 /* Approved epoch-0 late-founder bridge.  This is a read-only conjunction of
  * current QVOTEC peer identity, exact admitted membership, and the already-

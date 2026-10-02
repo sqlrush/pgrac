@@ -442,6 +442,10 @@ typedef struct ClusterGrdShared {
 	 */
 	pg_atomic_uint64 join_pcm_fence_epoch;
 	pg_atomic_uint64 join_pcm_fence_member_epoch[CLUSTER_MAX_NODES];
+	/* PGRAC: a remaining dead/removed home may change survivor master on
+	 * JOIN. These homes are not recipients and never waive survivor DONE. */
+	pg_atomic_uint64 join_pcm_fence_excluded_epoch[CLUSTER_MAX_NODES];
+	pg_atomic_uint64 join_pcm_fence_scope_epoch;
 	pg_atomic_uint32 recovery_direction;
 	slock_t pi_rebuild_lock;
 	ClusterGrdPiRebuildCutV1 pi_rebuilt;
@@ -671,6 +675,10 @@ extern uint32 cluster_grd_master_map_recompute_for_membership(const uint8 *activ
  *	in cluster_gcs_block.h (BufferTag is in scope there).
  */
 extern void cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set /* [16] */);
+/* Same accepted epoch, before MEMBER. Excluded homes are routing scope,
+ * never recipient/barrier exemptions or dead-writer retirement authority. */
+extern void cluster_grd_arm_join_pcm_fence_scope_v1(const uint8 *rejoining_set,
+													const uint8 *excluded_set);
 extern bool cluster_grd_join_remaster_in_progress(void);
 
 /*

@@ -44,6 +44,7 @@
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_gcs_reqid.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_membership.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
@@ -294,6 +295,8 @@ cluster_gcs_lookup_master(BufferTag tag)
 			declared[declared_count++] = i;
 
 	if (declared_count <= 1) {
+		if (cluster_shared_config && !cluster_membership_is_member(cluster_node_id))
+			return -1;
 		if (ClusterGcs != NULL)
 			pg_atomic_fetch_add_u64(&ClusterGcs->lookup_master_self_count, 1);
 		return cluster_node_id; /* single-node fallback (HC72) */
@@ -321,19 +324,26 @@ cluster_gcs_lookup_master(BufferTag tag)
 	 * separately gated by cluster_gcs_block_phase_for_tag (RECOVERING until the
 	 * dead origin's merged WAL recovery materializes — redo-before-unfreeze).
 	 */
-	if (master_node != cluster_node_id
-		&& cluster_cssd_get_peer_state(master_node) == CLUSTER_CSSD_PEER_DEAD) {
+	/* PGRAC: heartbeat ALIVE precedes admission. A shared routing set may
+	 * grow only after the admission owner has synchronously fenced every
+	 * affected home. In particular it must not rehash a still-dead home
+	 * between two survivors merely because a JOINING peer sent a heartbeat.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if ((master_node != cluster_node_id
+		 && cluster_cssd_get_peer_state(master_node) == CLUSTER_CSSD_PEER_DEAD)
+		|| (cluster_shared_config && !cluster_membership_is_member(master_node))) {
 		int live[CLUSTER_MAX_NODES];
 		int live_count = 0;
 
 		for (i = 0; i < declared_count; i++)
-			if (declared[i] == cluster_node_id
-				|| cluster_cssd_get_peer_state(declared[i]) != CLUSTER_CSSD_PEER_DEAD)
+			if ((!cluster_shared_config || cluster_membership_is_member(declared[i]))
+				&& (declared[i] == cluster_node_id
+					|| cluster_cssd_get_peer_state(declared[i]) != CLUSTER_CSSD_PEER_DEAD))
 				live[live_count++] = declared[i];
 		if (live_count >= 1)
 			master_node = live[h % (uint32)live_count];
-		/* else (all declared dead but self excluded — impossible since self is
-		 * live): keep static master; downstream dead-master guard fail-closes. */
+		else if (cluster_shared_config)
+			return -1; /* No admitted route; never invent self authority. */
 	}
 
 	if (ClusterGcs != NULL) {

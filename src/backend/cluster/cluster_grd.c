@@ -102,6 +102,7 @@ static HTAB *cluster_grd_entry_htab = NULL;
 
 static int cluster_grd_snapshot_entry_resids(ClusterResId **out_resids);
 static bool join_fence_is_recipient_for(int32 node_id, uint64 ref_epoch);
+static bool join_fence_is_affected_for(int32 node_id, uint64 ref_epoch);
 static void grd_recovery_authority_clear_seal(void);
 static bool grd_recovery_authority_request_current(uint64 request_generation);
 
@@ -937,8 +938,11 @@ cluster_grd_shmem_init(void)
 
 		/* spec-5.16 D2/D3b/D5 — online-join remaster fence + counters. */
 		pg_atomic_init_u64(&cluster_grd_state->join_pcm_fence_epoch, 0);
-		for (i = 0; i < CLUSTER_MAX_NODES; i++)
+		pg_atomic_init_u64(&cluster_grd_state->join_pcm_fence_scope_epoch, 0);
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 			pg_atomic_init_u64(&cluster_grd_state->join_pcm_fence_member_epoch[i], 0);
+			pg_atomic_init_u64(&cluster_grd_state->join_pcm_fence_excluded_epoch[i], 0);
+		}
 		pg_atomic_init_u32(&cluster_grd_state->recovery_direction, (uint32)GRD_REMASTER_DIR_NONE);
 		SpinLockInit(&cluster_grd_state->pi_rebuild_lock);
 		pg_atomic_init_u64(&cluster_grd_state->pi_rebuild_side_blocked_count, 0);
@@ -1935,6 +1939,36 @@ cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set)
 	pg_atomic_write_u32(&cluster_grd_state->recovery_direction, (uint32)GRD_REMASTER_DIR_JOIN);
 }
 
+void
+cluster_grd_arm_join_pcm_fence_scope_v1(const uint8 *rejoining_set, const uint8 *excluded_set)
+{
+	uint64 epoch, prior;
+	if (cluster_grd_state == NULL || rejoining_set == NULL || excluded_set == NULL)
+		return;
+	epoch = cluster_epoch_get_current();
+	if (epoch == 0)
+		return;
+	/* Same-epoch arms union without removing a home already fenced. A
+	 * newer epoch naturally ignores old stamps. Publish scope before the
+	 * original recipient fence, which is armed before MEMBER is visible. */
+	for (int i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (!(excluded_set[i / 8] & (1u << (i % 8))))
+			continue;
+		prior = pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_excluded_epoch[i]);
+		while (epoch > prior
+			   && !pg_atomic_compare_exchange_u64(
+				   &cluster_grd_state->join_pcm_fence_excluded_epoch[i], &prior, epoch))
+			;
+	}
+	pg_write_barrier();
+	prior = pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_scope_epoch);
+	while (epoch > prior
+		   && !pg_atomic_compare_exchange_u64(&cluster_grd_state->join_pcm_fence_scope_epoch,
+											  &prior, epoch))
+		;
+	cluster_grd_arm_join_pcm_fence(rejoining_set);
+}
+
 /*
  * cluster_grd_join_remaster_in_progress -- spec-5.16 D2.  recovery_direction
  * == JOIN (observability + recompute selection; does not change the FSM).
@@ -1951,9 +1985,9 @@ cluster_grd_join_remaster_in_progress(void)
 /*
  * cluster_grd_join_remaster_active_for_shard -- spec-5.16 D3 (INV-R8).
  *
- *	True iff the block's STATIC PCM home (cluster_gcs_lookup_master_static) is a
- *	rejoining RECIPIENT of the CURRENT fence episode (member_epoch[home] ==
- *	join_pcm_fence_epoch).  Bound to online_join (the fence epoch is armed by
+ *	True iff the block's STATIC PCM home belongs to the CURRENT JOIN scope:
+ *	recipients plus remaining excluded homes whose live-set hash may change.
+ *	Bound to online_join (the fence epoch is armed by
  *	note_self_admitted / LMON P0-accept), INDEPENDENT of any GRD master[]
  *	movement — so join_remaster_enabled=off still fences (r2 P1-①, P1-A
  *	closure).  false when the fence is not armed or the home is a steady member
@@ -1975,7 +2009,7 @@ cluster_grd_join_remaster_active_for_shard(BufferTag tag)
 	home = cluster_gcs_lookup_master_static(tag);
 	if (home < 0 || home >= CLUSTER_MAX_NODES)
 		return false;
-	return pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_member_epoch[home]) == fence_epoch;
+	return join_fence_is_affected_for(home, fence_epoch);
 }
 
 /*
@@ -1988,9 +2022,9 @@ cluster_grd_join_remaster_active_for_shard(BufferTag tag)
  *	BEFORE the survivors finish re-declaring their held joiner-home blocks to
  *	it, so gating on recovery_done_epoch[joiner] alone would lift the fence
  *	early → the joiner cold-serves a block a survivor still holds X on → 8.A
- *	double-grant (Hardening v1.1, user-approved 2026-06-28).  The tag is
- *	vestigial (the barrier is per-fence-epoch, not per-block) but kept so
- *	call sites read uniformly with active_for_shard.
+ *	double-grant (Hardening v1.1, user-approved 2026-06-28). The protocol
+ *	barrier is per-fence-epoch; shared service additionally checks the tag's
+ *	new master's retained-contributor cut.
  *
  *	The barrier set is the CURRENT members (cluster_membership_is_member), NOT
  *	all declared nodes:  a node dead from a prior failure never re-declares, so
@@ -2019,6 +2053,21 @@ join_fence_is_recipient_for(int32 node_id, uint64 ref_epoch)
 		   == ref_epoch;
 }
 
+/* A routing exclusion is an affected home, never a recipient. Unknown
+ * scope on a shared join keeps service closed until the selected cut lands. */
+static bool
+join_fence_is_affected_for(int32 node_id, uint64 ref_epoch)
+{
+	if (cluster_grd_state == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES || ref_epoch == 0)
+		return false;
+	if (cluster_shared_config
+		&& pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_scope_epoch) != ref_epoch)
+		return true;
+	return join_fence_is_recipient_for(node_id, ref_epoch)
+		   || pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_excluded_epoch[node_id])
+				  == ref_epoch;
+}
+
 bool
 cluster_grd_join_view_rebuilt(void)
 {
@@ -2030,6 +2079,9 @@ cluster_grd_join_view_rebuilt(void)
 	fence_epoch = pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch);
 	if (fence_epoch == 0)
 		return true; /* nothing fenced */
+	if (cluster_shared_config
+		&& pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_scope_epoch) != fence_epoch)
+		return false;
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (cluster_conf_lookup_node(i) == NULL)
@@ -2062,8 +2114,7 @@ cluster_grd_block_view_rebuilt(BufferTag tag)
 		return false;
 	/* Remote requesters may retry after the protocol barrier. The actual
 	 * master additionally waits for its own complete retained contributions. */
-	return !cluster_shared_config || cluster_gcs_lookup_master(tag) != cluster_node_id
-		   || !cluster_grd_pi_rebuild_gate_v1();
+	return !cluster_grd_pi_rebuild_blocked_v1(tag);
 }
 
 /*
@@ -2318,13 +2369,14 @@ cluster_grd_block_redeclare_state_v1(BufferTag tag, uint64 epoch, uint64 *census
 		/* Fresh recipients have no local JOIN event. Their synchronous fence
 		 * admits declarations, but not service, before the survivor barrier. */
 		if (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch) != epoch
+			|| pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_scope_epoch) != epoch
 			|| (!active
 				&& !(state == GRD_RECOVERY_IDLE
 					 && join_fence_is_recipient_for(cluster_node_id, epoch)))
 			|| cluster_grd_join_view_rebuilt())
 			return -1;
 		for (int i = 0; i < CLUSTER_MAX_NODES; i++)
-			if (join_fence_is_recipient_for(i, epoch))
+			if (join_fence_is_affected_for(i, epoch))
 				bitmap[i / 8] |= (uint8)(1u << (i % 8));
 	} else
 		return -1;
@@ -2343,7 +2395,7 @@ cluster_grd_block_redeclare_state_v1(BufferTag tag, uint64 epoch, uint64 *census
 		if (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch) != epoch)
 			return -1;
 		for (int i = 0; i < CLUSTER_MAX_NODES; i++)
-			if (join_fence_is_recipient_for(i, epoch) != !!(bitmap[i / 8] & (1u << (i % 8))))
+			if (join_fence_is_affected_for(i, epoch) != !!(bitmap[i / 8] & (1u << (i % 8))))
 				return -1;
 	}
 	*census_hash = hash;
@@ -2528,20 +2580,29 @@ grd_pi_rebuild_cut(ClusterGrdPiRebuildCutV1 *out)
 		out->redeclare_generation = failure.redeclare_generation;
 		memcpy(out->affected, failure.dead_bitmap, sizeof(out->affected));
 		memcpy(out->members, failure.survivor_bitmap, sizeof(out->members));
-	} else if (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch) == out->epoch
-			   && join_fence_is_recipient_for(cluster_node_id, out->epoch)) {
-		if (!cluster_grd_join_view_rebuilt())
+	} else if (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch) == out->epoch) {
+		bool needs_rebuild = join_fence_is_recipient_for(cluster_node_id, out->epoch);
+		if (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_scope_epoch) != out->epoch)
 			return -1;
-		out->direction = GRD_REMASTER_DIR_JOIN;
-		out->redeclare_generation = cluster_grd_redeclare_generation();
 		for (int i = 0; i < CLUSTER_MAX_NODES; i++) {
-			if (join_fence_is_recipient_for(i, out->epoch))
+			if (join_fence_is_affected_for(i, out->epoch))
 				out->affected[i / 8] |= (uint8)(1u << (i % 8));
+			if (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_excluded_epoch[i])
+				== out->epoch)
+				needs_rebuild = true; /* Rehash can choose any survivor. */
 			if (cluster_conf_lookup_node(i) != NULL && cluster_membership_is_member(i))
 				out->members[i / 8] |= (uint8)(1u << (i % 8));
 		}
+		if (!needs_rebuild)
+			return 0;
+		/* Finish the JOIN control protocol first: ROOT/native INSTALL may
+		 * need its normal CF owner before the retained WAL census can run. */
+		if (state != GRD_RECOVERY_IDLE || !cluster_grd_join_view_rebuilt())
+			return -1;
+		out->direction = GRD_REMASTER_DIR_JOIN;
+		out->redeclare_generation = cluster_grd_redeclare_generation();
 	} else
-		return 0; /* JOIN survivors keep their original directory authority. */
+		return 0;
 	out->master_map_refresh = pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count);
 	out->routing_generation = cluster_lms_get_shard_master_generation();
 	out->self_boot = cluster_qvotec_get_self_incarnation();
@@ -2642,7 +2703,7 @@ cluster_grd_pi_rebuild_blocked_v1(BufferTag tag)
 		return cluster_grd_pi_rebuild_gate_v1();
 	epoch = cluster_epoch_get_current();
 	return pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch) == epoch
-		   && join_fence_is_recipient_for(home, epoch)
+		   && join_fence_is_affected_for(home, epoch)
 		   && (!cluster_grd_join_view_rebuilt() || cluster_grd_pi_rebuild_gate_v1());
 }
 
@@ -4155,15 +4216,20 @@ cluster_grd_recovery_lmon_tick(void)
 		 * joiner-home PCM block fence on THIS node.  The joiner already armed it
 		 * synchronously before opening its write gate (note_self_admitted,
 		 * INV-R13);  this covers survivors and is an idempotent monotonic-max
-		 * re-arm on the joiner.  JOIN events carry the rejoiner set in
-		 * join_bitmap (dead_bitmap is empty), so the failure-path freeze/remaster
-		 * below is a structural no-op — only the block re-declare barrier runs,
-		 * which rebuilds the joiner's PCM block view.
+		 * re-arm on the joiner. JOIN events carry recipients in join_bitmap;
+		 * remaining dead and removed homes also participate because live-set
+		 * rehash can move their blocks between two survivors. These homes do
+		 * not exempt any survivor from the original re-declare barrier.
 		 */
 		if (evt.reconfig_kind == (uint8)RECONFIG_KIND_JOIN_COMMITTED) {
+			uint8 excluded[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+
 			pg_atomic_write_u32(&cluster_grd_state->recovery_direction,
 								(uint32)GRD_REMASTER_DIR_JOIN);
-			cluster_grd_arm_join_pcm_fence(evt.join_bitmap);
+			cluster_reconfig_snapshot_removed_bitmap(excluded);
+			for (int b = 0; b < sizeof(excluded); b++)
+				excluded[b] |= evt.dead_bitmap[b];
+			cluster_grd_arm_join_pcm_fence_scope_v1(evt.join_bitmap, excluded);
 			pg_atomic_fetch_add_u64(&cluster_grd_state->join_remaster_started_count, 1);
 		} else {
 			pg_atomic_write_u32(&cluster_grd_state->recovery_direction,
@@ -4656,7 +4722,10 @@ cluster_grd_recovery_lmon_tick(void)
 						episode_epoch)));
 				return;
 			}
-			if (cluster_shared_config && cluster_grd_pi_rebuild_gate_v1())
+			if (cluster_shared_config
+				&& pg_atomic_read_u32(&cluster_grd_state->recovery_direction)
+					   != GRD_REMASTER_DIR_JOIN
+				&& cluster_grd_pi_rebuild_gate_v1())
 				return;
 
 			/* P6 post-barrier global sweep (P0#3 + P0-1:  legal HERE and

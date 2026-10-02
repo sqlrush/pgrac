@@ -4384,7 +4384,16 @@ test_cluster_grd_stop_types.inc: $(top_srcdir)/src/backend/cluster/cluster_grd.c
 	     emit { print } /^}/ { emit=0 } END { if (count != 3 || constants != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_grd_routing.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs.c $(srcdir)/Makefile
+	awk '/^typedef struct ClusterGcsShared \{/ { emit=1; types++ } \
+	     /^cluster_gcs_lookup_master(_static)?\(/ { print "static int"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     /^static ClusterGcsShared \*ClusterGcs =/ { print; pointers++ } \
+	     END { if (types != 1 || functions != 2 || pointers != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_grd: test_cluster_grd.c unit_test.h test_cluster_grd_stop_types.inc \
+		test_cluster_grd_routing.inc \
 		test_cluster_hw_authority_gate.inc \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GRD_O) $(CLUSTER_GES_MODE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \

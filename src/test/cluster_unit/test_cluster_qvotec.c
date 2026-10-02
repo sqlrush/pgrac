@@ -1194,9 +1194,10 @@ cluster_xid_stripe_herding_tick(const int *fds pg_attribute_unused(),
 								int n_disks pg_attribute_unused())
 {}
 #include "cluster/cluster_membership.h" /* ClusterJoinCommitMarker (D5 self-admit) */
-void cluster_reconfig_note_self_admitted(uint64 admitted_epoch);
+void cluster_reconfig_note_self_admitted(uint64 admitted_epoch, const ClusterFenceMarker *marker);
 void
-cluster_reconfig_note_self_admitted(uint64 admitted_epoch pg_attribute_unused())
+cluster_reconfig_note_self_admitted(uint64 admitted_epoch pg_attribute_unused(),
+									const ClusterFenceMarker *marker pg_attribute_unused())
 {}
 bool cluster_reconfig_qvotec_observe_replacement_admitted(const int *fds, int n_disks,
 														  uint64 live_incarnation);

@@ -49,6 +49,7 @@
 #include "cluster/cluster_cssd.h" /* PGRAC_IC_MSG_CSSD_HEARTBEAT */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs.h"
+#include "cluster/cluster_membership.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_gcs_reqid.h"
 #include "cluster/cluster_grd_outbound.h"
@@ -551,6 +552,14 @@ UT_TEST(test_gcs_reply_status_enum_count_is_4)
  * L6: cluster_gcs_lookup_master symbol linkable.
  * ----------
  */
+/* Admission is a boundary here; test_cluster_grd exercises the real
+ * routing bodies with changing JOIN membership. */
+bool
+cluster_membership_is_member(int32 node_id)
+{
+	return cluster_conf_lookup_node(node_id) != NULL;
+}
+
 UT_TEST(test_gcs_lookup_master_symbol_linkable)
 {
 	UT_ASSERT_NOT_NULL((void *)cluster_gcs_lookup_master);

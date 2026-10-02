@@ -3169,6 +3169,37 @@ qvotec_poll_once(void)
 	}
 
 	/*
+	 * spec-4.12 D2: scan the matrix we just read for the durable fence marker
+	 * and refresh the local write-fence token.  A tuple is authoritative only
+	 * when an identical marker appears on >= quorum-majority disks (P0a); order
+	 * by fence_epoch (monotonic) not event_id (P0b).  A minority / partial
+	 * marker is ignored (counter) and the token is left to age out (fail-closed).
+	 * This is independent of the node-quorum decision below.
+	 */
+	{
+		ClusterFenceMarker disk_markers[CLUSTER_MAX_VOTING_DISKS];
+		bool disk_has_marker[CLUSTER_MAX_VOTING_DISKS];
+		ClusterFenceAuthority authority;
+
+		qvotec_diagnostic_phase_enter(QVOTEC_DIAG_FENCE_DECISION);
+		for (i = 0; i < qvotec_n_disks; i++)
+			disk_has_marker[i] = qvotec_best_marker_on_disk(i, &disk_markers[i]);
+
+		authority = cluster_fence_authority_decide(disk_markers, disk_has_marker, qvotec_n_disks);
+		if (authority.has_authority) {
+			uint64 fence_lease_expire = now_us + (uint64)cluster_write_fence_lease_ms * 1000ULL;
+
+			cluster_write_fence_refresh_from_marker(&authority.marker, fence_lease_expire);
+			/* spec-4.12b D5/P1-1: retain the exact durable tuple so the
+			 * baseline author below cannot regress order/dead membership or
+			 * publish a competing identity at the same order. */
+			durable_authority_marker = authority.marker;
+			durable_has_authority = true;
+		} else if (authority.minority_seen)
+			cluster_write_fence_note_minority_marker();
+	}
+
+	/*
 	 * spec-5.15 D5: detect THIS node's own admission — a §2.6 COMMITTED join
 	 * marker in region-3 slot self, with admitted_incarnation == our incarnation,
 	 * on a quorum-majority of disks (one extra slot read per disk; qvotec already
@@ -3217,8 +3248,13 @@ qvotec_poll_once(void)
 		win = cluster_join_marker_select_majority(self_markers, n_self, majority, NULL);
 
 		/* HF-1: gate-open requires the publish-proof too, not the marker alone. */
-		if (win >= 0 && cluster_reconfig_join_publish_proven(self_markers[win].admitted_epoch)) {
-			cluster_reconfig_note_self_admitted(self_markers[win].admitted_epoch);
+		if (win >= 0 && cluster_reconfig_join_publish_proven(self_markers[win].admitted_epoch)
+			&& (!cluster_shared_config
+				|| (durable_has_authority
+					&& durable_authority_marker.fence_epoch == self_markers[win].admitted_epoch))) {
+			cluster_reconfig_note_self_admitted(self_markers[win].admitted_epoch,
+												durable_has_authority ? &durable_authority_marker
+																	  : NULL);
 			/*
 			 * spec-5.16 (3-node rejoin) — the same durable COMMITTED join marker
 			 * that admits self also supersedes any fail-stop write-fence still
@@ -3228,37 +3264,6 @@ qvotec_poll_once(void)
 			 */
 			cluster_write_fence_supersede_by_admit(self_markers[win].admitted_epoch);
 		}
-	}
-
-	/*
-	 * spec-4.12 D2: scan the matrix we just read for the durable fence marker
-	 * and refresh the local write-fence token.  A tuple is authoritative only
-	 * when an identical marker appears on >= quorum-majority disks (P0a); order
-	 * by fence_epoch (monotonic) not event_id (P0b).  A minority / partial
-	 * marker is ignored (counter) and the token is left to age out (fail-closed).
-	 * This is independent of the node-quorum decision below.
-	 */
-	{
-		ClusterFenceMarker disk_markers[CLUSTER_MAX_VOTING_DISKS];
-		bool disk_has_marker[CLUSTER_MAX_VOTING_DISKS];
-		ClusterFenceAuthority authority;
-
-		qvotec_diagnostic_phase_enter(QVOTEC_DIAG_FENCE_DECISION);
-		for (i = 0; i < qvotec_n_disks; i++)
-			disk_has_marker[i] = qvotec_best_marker_on_disk(i, &disk_markers[i]);
-
-		authority = cluster_fence_authority_decide(disk_markers, disk_has_marker, qvotec_n_disks);
-		if (authority.has_authority) {
-			uint64 fence_lease_expire = now_us + (uint64)cluster_write_fence_lease_ms * 1000ULL;
-
-			cluster_write_fence_refresh_from_marker(&authority.marker, fence_lease_expire);
-			/* spec-4.12b D5/P1-1: retain the exact durable tuple so the
-			 * baseline author below cannot regress order/dead membership or
-			 * publish a competing identity at the same order. */
-			durable_authority_marker = authority.marker;
-			durable_has_authority = true;
-		} else if (authority.minority_seen)
-			cluster_write_fence_note_minority_marker();
 	}
 
 	/* ---- 2. decide BEFORE writing self slot ---- */

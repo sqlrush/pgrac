@@ -67,6 +67,7 @@
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_reconfig.h" /* spec-4.6 D1 — ReconfigEvent stub type */
 #include "cluster/cluster_recovery_duty.h"
+#include "common/hashfn.h"
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 (L238) — gate_unfreeze proto */
 #include "port/atomics.h"
 #include "storage/lock.h"
@@ -295,10 +296,22 @@ cluster_cssd_get_dead_generation(void)
 }
 
 typedef enum { CSSD_PEER_ALIVE = 0, CSSD_PEER_SUSPECTED = 1, CSSD_PEER_DEAD = 2 } _stub_peer_state;
+static bool ut_real_gcs_routing;
+static uint32 ut_routing_dead_mask;
 int /* ClusterCssdPeerState */
-cluster_cssd_get_peer_state(int32 peer_id pg_attribute_unused())
+cluster_cssd_get_peer_state(int32 peer_id)
 {
-	return 0; /* CLUSTER_CSSD_PEER_ALIVE */
+	return ut_real_gcs_routing && peer_id >= 0 && peer_id < 32
+				   && (ut_routing_dead_mask & (1u << peer_id))
+			   ? CSSD_PEER_DEAD
+			   : CSSD_PEER_ALIVE;
+}
+
+static uint8 ut_removed_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+void
+cluster_reconfig_snapshot_removed_bitmap(uint8 *out)
+{
+	memcpy(out, ut_removed_bitmap, sizeof(ut_removed_bitmap));
 }
 
 int /* ClusterCssdStatus */
@@ -406,10 +419,22 @@ cluster_epoch_adopt_admitted(uint64 admitted_epoch)
  * are never reached in this test).
  */
 static int ut_mock_routed_master = 0;
+/* Execute the original static/live-set routing bodies for the mixed JOIN
+ * case; unrelated older tests retain their explicit routing boundary. */
+#define cluster_gcs_lookup_master_static ut_actual_gcs_lookup_master_static
+#define cluster_gcs_lookup_master ut_actual_gcs_lookup_master
+#define CLUSTER_CSSD_PEER_DEAD CSSD_PEER_DEAD
+#ifdef USE_CLUSTER_UNIT
+static int cluster_gcs_test_force_remote_master_node = -1;
+#endif
+#include "test_cluster_grd_routing.inc"
+#undef CLUSTER_CSSD_PEER_DEAD
+#undef cluster_gcs_lookup_master
+#undef cluster_gcs_lookup_master_static
 int
-cluster_gcs_lookup_master(BufferTag tag pg_attribute_unused())
+cluster_gcs_lookup_master(BufferTag tag)
 {
-	return ut_mock_routed_master;
+	return ut_real_gcs_routing ? ut_actual_gcs_lookup_master(tag) : ut_mock_routed_master;
 }
 
 BackendType MyBackendType = B_LMON;
@@ -418,9 +443,9 @@ BackendType MyBackendType = B_LMON;
  * set.  Defaults (static master 0, all members) keep pre-5.16 tests unchanged. */
 static int ut_mock_static_master = 0;
 int
-cluster_gcs_lookup_master_static(BufferTag tag pg_attribute_unused())
+cluster_gcs_lookup_master_static(BufferTag tag)
 {
-	return ut_mock_static_master;
+	return ut_real_gcs_routing ? ut_actual_gcs_lookup_master_static(tag) : ut_mock_static_master;
 }
 /* ut_member_mask < 0 (default) means "all declared nodes are members";
  * otherwise a node is a member iff (ut_member_mask >> node) & 1. */
@@ -5593,11 +5618,13 @@ UT_TEST(test_redeclare_fresh_join_recipient_accepts_only_its_fence)
 	cluster_node_id = 1;
 	ut_mock_epoch = 10;
 	ut_qvotec_quorum = true;
-	cluster_grd_arm_join_pcm_fence(joined);
+	cluster_grd_arm_join_pcm_fence_scope_v1(joined,
+											(const uint8[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES]){ 0 });
 	ut_mock_static_master = 1;
 	UT_ASSERT_EQ(cluster_grd_block_redeclare_state_v1(tag, 10, &hash), 1);
 	joined[0] = 6;
-	cluster_grd_arm_join_pcm_fence(joined);
+	cluster_grd_arm_join_pcm_fence_scope_v1(joined,
+											(const uint8[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES]){ 0 });
 	UT_ASSERT_EQ(cluster_grd_block_redeclare_state_v1(tag, 10, &expanded), 1);
 	UT_ASSERT_NE(hash, expanded);
 	ut_mock_static_master = 0;
@@ -5605,6 +5632,122 @@ UT_TEST(test_redeclare_fresh_join_recipient_accepts_only_its_fence)
 	cluster_node_id = 0; /* an idle survivor has not started its census */
 	UT_ASSERT_EQ(cluster_grd_block_redeclare_state_v1(tag, 10, &hash), -1);
 	cluster_shared_config = false;
+	finish_recovery_control_fixture();
+}
+
+UT_TEST(test_join_routing_excludes_unadmitted_alive_peers)
+{
+	int32 nodes[] = { 0, 1, 2, 3 };
+	BufferTag tag = { 0 };
+	bool found = false;
+	set_mock_declared(4, nodes);
+	cluster_node_id = 2;
+	cluster_shared_config = true;
+	ut_member_mask = 6;
+	ut_real_gcs_routing = true;
+	for (tag.blockNum = 0; tag.blockNum < 10000; tag.blockNum++) {
+		ut_routing_dead_mask = 9;
+		if (cluster_gcs_lookup_master_static(tag) != 0 || cluster_gcs_lookup_master(tag) != 1)
+			continue;
+		ut_routing_dead_mask = 1;
+		ut_member_mask = 14;
+		found = cluster_gcs_lookup_master(tag) == 2;
+		ut_member_mask = 6;
+		if (found)
+			break;
+	}
+	UT_ASSERT(found);
+	UT_ASSERT_EQ(cluster_gcs_lookup_master(tag), 1);
+	/* The static fast path cannot send to an ALIVE nonmember either. */
+	for (tag.blockNum = 0; tag.blockNum < 10000; tag.blockNum++)
+		if (cluster_gcs_lookup_master_static(tag) == 3)
+			break;
+	UT_ASSERT(tag.blockNum < 10000);
+	UT_ASSERT_NE(cluster_gcs_lookup_master(tag), 3);
+	ut_member_mask = 0;
+	UT_ASSERT_EQ(cluster_gcs_lookup_master(tag), -1);
+	ut_real_gcs_routing = false;
+	ut_routing_dead_mask = 0;
+	ut_member_mask = -1;
+	cluster_shared_config = false;
+	cluster_node_id = 0;
+}
+
+UT_TEST(test_join_census_covers_dead_home_rerouted_between_survivors)
+{
+	int32 nodes[] = { 0, 1, 2, 3 };
+	uint8 joined[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 8 };
+	uint8 excluded[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 1 };
+	BufferTag tag = { 0 };
+	ClusterGrdPiRebuildCutV1 cut;
+	uint64 hash;
+	bool found = false;
+
+	reset_fake_grd_htab();
+	cluster_grd_max_entries = 16;
+	ut_jr_setup_3node();
+	ut_reset_grd_shmem();
+	cluster_grd_shmem_init();
+	set_mock_declared(4, nodes);
+	cluster_grd_master_map_init();
+	cluster_enabled = cluster_shared_config = true;
+	cluster_node_id = 2;
+	ut_member_mask = 14;
+	ut_qvotec_quorum = true;
+	ut_admitted_incarnation = 11;
+	ut_real_gcs_routing = true;
+	ut_mock_epoch = 9;
+	ut_mock_now = 0;
+	fake_scan_nbuffers = 0;
+	mock_lms_shard_master_generation = (UINT64_C(10) << 32) | 7;
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+	cluster_grd_recovery_lmon_tick();
+	/* The original routing code must move this dead-home block from one
+	 * survivor to another; neither endpoint is the JOIN recipient. */
+	for (tag.blockNum = 0; tag.blockNum < 10000; tag.blockNum++) {
+		ut_routing_dead_mask = 9;
+		if (cluster_gcs_lookup_master_static(tag) != 0 || cluster_gcs_lookup_master(tag) != 1)
+			continue;
+		ut_routing_dead_mask = 1;
+		if (cluster_gcs_lookup_master(tag) == 2) {
+			found = true;
+			break;
+		}
+	}
+	UT_ASSERT(found);
+	ut_mock_epoch = 10;
+	cluster_grd_arm_join_pcm_fence_scope_v1(joined, excluded);
+	UT_ASSERT(cluster_grd_join_remaster_active_for_shard(tag));
+	UT_ASSERT(cluster_grd_pi_rebuild_blocked_v1(tag));
+	ut_mock_last_event.event_id = 701;
+	ut_mock_last_event.old_epoch = 9;
+	ut_mock_last_event.new_epoch = 10;
+	ut_mock_last_event.reconfig_kind = RECONFIG_KIND_JOIN_COMMITTED;
+	ut_mock_last_event.coordinator_node_id = 1;
+	ut_mock_last_event.dead_bitmap[0] = 1;
+	ut_mock_last_event.join_bitmap[0] = 8;
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_block_redeclare_state_v1(tag, 10, &hash), 1);
+	UT_ASSERT_NE(hash, 0);
+	cluster_grd_recovery_mark_peer_done(1, 10, cluster_grd_dead_bitmap_hash(excluded));
+	cluster_grd_recovery_lmon_tick();
+	cluster_grd_recovery_lmon_tick();
+	/* The original protocol can finish; actual new master still waits for
+	 * its retained contributions before serving this previously dead home. */
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_IDLE);
+	UT_ASSERT(cluster_grd_join_view_rebuilt());
+	UT_ASSERT_EQ(cluster_grd_pi_rebuild_snapshot_v1(&cut), 1);
+	UT_ASSERT_EQ(cut.affected[0], 9);
+	UT_ASSERT_EQ(cut.members[0], 14);
+	UT_ASSERT(cluster_grd_pi_rebuild_blocked_v1(tag));
+	MyBackendType = B_BG_WRITER;
+	UT_ASSERT(cluster_grd_pi_rebuild_complete_v1(&cut));
+	UT_ASSERT(!cluster_grd_pi_rebuild_blocked_v1(tag));
+	MyBackendType = B_LMON;
+	ut_real_gcs_routing = false;
+	ut_routing_dead_mask = 0;
+	cluster_shared_config = false;
+	cluster_node_id = 0;
 	finish_recovery_control_fixture();
 }
 
@@ -5666,7 +5809,8 @@ UT_TEST(test_join_protocol_completes_before_local_pi_service_and_new_cut_invalid
 	ut_qvotec_quorum = true;
 	ut_admitted_incarnation = 11;
 	mock_lms_shard_master_generation = (UINT64_C(10) << 32) | 7;
-	cluster_grd_arm_join_pcm_fence(joined);
+	cluster_grd_arm_join_pcm_fence_scope_v1(joined,
+											(const uint8[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES]){ 0 });
 	UT_ASSERT_EQ(cluster_grd_pi_rebuild_snapshot_v1(&cut), -1);
 	cluster_grd_recovery_mark_peer_done(0, 10, 0);
 	cluster_grd_recovery_mark_peer_done(2, 10, 0);
@@ -5680,7 +5824,8 @@ UT_TEST(test_join_protocol_completes_before_local_pi_service_and_new_cut_invalid
 	UT_ASSERT(!cluster_grd_pi_rebuild_blocked_v1(tag));
 	/* Same-epoch recipient union and routing/boot changes are different cuts. */
 	joined[0] = 6;
-	cluster_grd_arm_join_pcm_fence(joined);
+	cluster_grd_arm_join_pcm_fence_scope_v1(joined,
+											(const uint8[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES]){ 0 });
 	UT_ASSERT(cluster_grd_pi_rebuild_gate_v1());
 	UT_ASSERT(!cluster_grd_pi_rebuild_complete_v1(&cut));
 	UT_ASSERT_EQ(cluster_grd_pi_rebuild_snapshot_v1(&cut), 1);
@@ -6811,7 +6956,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(144);
+	UT_PLAN(146);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
@@ -6985,6 +7130,8 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_retire_request_local_shadow_never_grants);
 	UT_RUN(test_startup_cf_handoff_real_queue);
 	UT_RUN(test_startup_cf_handoff_rejects_noncanonical_queue);
+	UT_RUN(test_join_routing_excludes_unadmitted_alive_peers);
+	UT_RUN(test_join_census_covers_dead_home_rerouted_between_survivors);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
