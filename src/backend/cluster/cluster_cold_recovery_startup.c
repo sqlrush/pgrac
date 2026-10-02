@@ -44,6 +44,7 @@
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_wal_tail.h"
+#include "storage/bufpage.h"
 #include "utils/memutils.h"
 
 /* Upper bound on everything one cold plan may own (records and versions,
@@ -453,6 +454,66 @@ cluster_cold_redo_block_decision_v1(XLogReaderState *record, uint8 block_id,
 	out->expected_before = block->expected_before;
 	out->result = block->result;
 	return true;
+}
+
+static bool
+cold_page_all_zero(const char *page)
+{
+	Size i;
+
+	for (i = 0; i < BLCKSZ; i++)
+		if (page[i] != 0)
+			return false;
+	return true;
+}
+
+bool
+cluster_cold_classify_page_v1(const char *page, bool verified, bool content_proven,
+							  ClusterColdDataV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (PageIsNew((Page)page)) {
+		/* Only an entirely zero page is unformatted; anything else is torn. */
+		if (!cold_page_all_zero(page)) {
+			out->kind = CLUSTER_COLD_DATA_INVALID;
+			return true;
+		}
+		out->kind = CLUSTER_COLD_DATA_UNFORMATTED;
+		out->flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED;
+		return true;
+	}
+	if (!verified) {
+		out->kind = CLUSTER_COLD_DATA_INVALID;
+		return true;
+	}
+	/* A formatted page without a version token cannot be placed on a chain;
+	 * refuse rather than treat it as replaceable. */
+	if (((const PageHeaderData *)page)->pd_block_scn == 0)
+		return false;
+	out->kind = CLUSTER_COLD_DATA_PRESENT;
+	out->version.mutation_token = (uint64)((const PageHeaderData *)page)->pd_block_scn;
+	if (content_proven)
+		out->flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED;
+	return true;
+}
+
+const char *
+cluster_cold_refusal_hint_v1(ClusterColdDetailV1 detail)
+{
+	switch (detail) {
+	case CLUSTER_COLD_CONTENT_UNPROVEN:
+		return "Without data checksums the named page's content cannot be proven, and no "
+			   "full-page image after its last checkpointed change can rebuild it. Preserve "
+			   "all original thread WAL and DATA; do not force recovery.";
+	case CLUSTER_COLD_ANCHOR_MISSING:
+		return "The named page is unreadable or failed verification, and no full-page image "
+			   "after its last checkpointed change can rebuild it. Preserve all original "
+			   "thread WAL and DATA; do not force recovery.";
+	default:
+		return "Preserve all original thread WAL and shared configuration. Shared mode "
+			   "recovers every retained writer generation through the typed cold plan and "
+			   "never falls back to single-stream replay.";
+	}
 }
 
 /*

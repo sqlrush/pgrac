@@ -172,17 +172,6 @@ cold_observe_incarnation(ClusterColdObserverV1 *observer, RelFileLocator locator
 	return true;
 }
 
-static bool
-cold_page_all_zero(const char *page)
-{
-	Size i;
-
-	for (i = 0; i < BLCKSZ; i++)
-		if (page[i] != 0)
-			return false;
-	return true;
-}
-
 bool
 cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterColdDataV1 *out)
 {
@@ -190,6 +179,8 @@ cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterCol
 	PGAlignedBlock block;
 	SMgrRelation relation;
 	ForkNumber fork;
+	bool verified;
+	bool proven;
 
 	if (observer == NULL || page == NULL || out == NULL || page->forknum > MAX_FORKNUM)
 		return false;
@@ -203,31 +194,17 @@ cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page, ClusterCol
 		return true;
 	}
 	smgrread(relation, fork, page->blockno, block.data);
-	if (PageIsNew((Page)block.data)) {
-		if (!cold_page_all_zero(block.data)) {
-			observer->pages_invalid++;
-			out->kind = CLUSTER_COLD_DATA_INVALID;
-			return true;
-		}
-		out->kind = CLUSTER_COLD_DATA_UNFORMATTED;
-		out->flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED;
-		return cold_observe_incarnation(observer, page->locator, out->version.segment_incarnation);
-	}
-	if (!PageIsVerifiedExtended((Page)block.data, page->blockno, 0)) {
+	verified = PageIsVerifiedExtended((Page)block.data, page->blockno, 0);
+	/* Only an enforced page checksum proves the content of a verified page;
+	 * otherwise just its header is known. */
+	proven
+		= cluster_cold_checksum_proves_content_v1(DataChecksumsEnabled(), ignore_checksum_failure);
+	if (!cluster_cold_classify_page_v1(block.data, verified, proven, out))
+		return false;
+	if (out->kind == CLUSTER_COLD_DATA_INVALID) {
 		observer->pages_invalid++;
-		out->kind = CLUSTER_COLD_DATA_INVALID;
 		return true;
 	}
-	/* A formatted page without a version token cannot be placed on a chain;
-	 * refuse rather than treat it as replaceable. */
-	if (((PageHeader)block.data)->pd_block_scn == 0)
-		return false;
-	out->kind = CLUSTER_COLD_DATA_PRESENT;
-	/* Only an enforced page checksum proves the content verified above;
-	 * otherwise just its header is known. */
-	if (cluster_cold_checksum_proves_content_v1(DataChecksumsEnabled(), ignore_checksum_failure))
-		out->flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED;
-	out->version.mutation_token = (uint64)((PageHeader)block.data)->pd_block_scn;
 	return cold_observe_incarnation(observer, page->locator, out->version.segment_incarnation);
 }
 

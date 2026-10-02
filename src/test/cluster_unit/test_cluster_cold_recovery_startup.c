@@ -598,6 +598,63 @@ UT_TEST(test_apply_step_brackets_native_redo)
 	UT_ASSERT_EQ(out.action, CLUSTER_COLD_REDO_NATIVE);
 }
 
+/*
+ * Pass-1 DATA observation of one page read from storage: an all-zero page
+ * is a proven unformatted page; any other new or unverifiable page is
+ * INVALID; a formatted page carries its version token, and its content is
+ * proven only when an enforced checksum covered it.
+ */
+UT_TEST(test_observed_page_classification)
+{
+	PGAlignedBlock block;
+	PageHeader header = (PageHeader)block.data;
+	ClusterColdDataV1 out;
+
+	memset(block.data, 0, BLCKSZ);
+	UT_ASSERT(cluster_cold_classify_page_v1(block.data, true, true, &out));
+	UT_ASSERT_EQ(out.kind, CLUSTER_COLD_DATA_UNFORMATTED);
+	UT_ASSERT_EQ(out.flags, CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED);
+	UT_ASSERT_EQ(out.version.mutation_token, 0);
+
+	block.data[BLCKSZ - 1] = 1; /* new header, non-zero body: torn */
+	UT_ASSERT(cluster_cold_classify_page_v1(block.data, true, true, &out));
+	UT_ASSERT_EQ(out.kind, CLUSTER_COLD_DATA_INVALID);
+	UT_ASSERT_EQ(out.flags, 0);
+
+	memset(block.data, 0, BLCKSZ);
+	header->pd_lower = SizeOfPageHeaderData;
+	header->pd_upper = BLCKSZ;
+	header->pd_special = BLCKSZ;
+	header->pd_block_scn = 77;
+	UT_ASSERT(cluster_cold_classify_page_v1(block.data, false, true, &out));
+	UT_ASSERT_EQ(out.kind, CLUSTER_COLD_DATA_INVALID);
+	UT_ASSERT_EQ(out.flags, 0);
+
+	UT_ASSERT(cluster_cold_classify_page_v1(block.data, true, true, &out));
+	UT_ASSERT_EQ(out.kind, CLUSTER_COLD_DATA_PRESENT);
+	UT_ASSERT_EQ(out.version.mutation_token, 77);
+	UT_ASSERT_EQ(out.flags, CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED);
+	UT_ASSERT(cluster_cold_classify_page_v1(block.data, true, false, &out));
+	UT_ASSERT_EQ(out.kind, CLUSTER_COLD_DATA_PRESENT);
+	UT_ASSERT_EQ(out.flags, 0);
+
+	/* A formatted page without a version token cannot be placed. */
+	header->pd_block_scn = 0;
+	UT_ASSERT(!cluster_cold_classify_page_v1(block.data, true, true, &out));
+}
+
+/* Pages nothing can rebuild get a hint naming why; others the generic one. */
+UT_TEST(test_refusal_hints)
+{
+	UT_ASSERT(strstr(cluster_cold_refusal_hint_v1(CLUSTER_COLD_CONTENT_UNPROVEN), "checksums")
+			  != NULL);
+	UT_ASSERT(strstr(cluster_cold_refusal_hint_v1(CLUSTER_COLD_ANCHOR_MISSING), "full-page image")
+			  != NULL);
+	UT_ASSERT(strstr(cluster_cold_refusal_hint_v1(CLUSTER_COLD_HISTORY_GAP), "typed cold plan")
+			  != NULL);
+	UT_ASSERT(strstr(cluster_cold_refusal_hint_v1(CLUSTER_COLD_OK), "typed cold plan") != NULL);
+}
+
 int
 main(void)
 {
@@ -614,6 +671,8 @@ main(void)
 	UT_RUN(test_ignored_checksum_failure_does_not_prove_content);
 	UT_RUN(test_cold_replay_window_tracks_pass_two);
 	UT_RUN(test_apply_step_brackets_native_redo);
+	UT_RUN(test_observed_page_classification);
+	UT_RUN(test_refusal_hints);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -374,6 +374,18 @@ typedef struct ClusterColdObserverV1 {
 extern bool cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page,
 										 ClusterColdDataV1 *out);
 
+/*
+ * Classify one block read from storage (the caller handles a missing block
+ * and fills the segment incarnation).  verified is PageIsVerifiedExtended's
+ * answer; content_proven says whether it covered the whole page (an
+ * enforced checksum).  False: a formatted page without a version token.
+ */
+extern bool cluster_cold_classify_page_v1(const char *page, bool verified, bool content_proven,
+										  ClusterColdDataV1 *out);
+
+/* Operator hint for a pass-1 refusal. */
+extern const char *cluster_cold_refusal_hint_v1(ClusterColdDetailV1 detail);
+
 /* Pass-1 scan of one RECOVERY_REQUIRED root through the sealed recovery
  * visitor, feeding the plan participant at caller index `participant`.
  * Every visited record is provisional until the visit and the observed cut
