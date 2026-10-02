@@ -68,6 +68,11 @@ static bool transition_flush_leaves_dirty;
 static ClusterPageWalBindingV1 transition_page_wal;
 static bool transition_wal_prepare_ok = true;
 static bool transition_wal_certify_ok = true;
+static bool transition_pi_record_ok = true;
+static bool transition_pi_record_error;
+static bool transition_pi_record_busy;
+static unsigned transition_pi_records;
+static ClusterPageWalBindingV1 transition_pi_binding;
 static int transition_wal_source_changes;
 static bool transition_s_prepare;
 static unsigned transition_wal_publishes;
@@ -103,6 +108,24 @@ cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
 	if (transition_page_wal.record_start == 0)
 		return false;
 	*out = transition_page_wal;
+	return true;
+}
+bool
+cluster_pcm_local_pi_record_v1(BufferTag tag, const ClusterPageWalBindingV1 *binding)
+{
+	UT_ASSERT(!transition_content_held && !transition_mapping_held);
+	UT_ASSERT(BufferTagsEqual(&tag, &transition_buf->tag));
+	UT_ASSERT_EQ(transition_buf->pcm_state, PCM_STATE_X);
+	UT_ASSERT_EQ(cluster_pcm_own_flags_get(transition_buf->buf_id), PCM_OWN_FLAG_REVOKING);
+	UT_ASSERT_EQ(binding->flags, CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
+	if (transition_pi_record_error)
+		pg_re_throw();
+	if (!transition_pi_record_ok)
+		return false;
+	transition_pi_binding = *binding;
+	transition_pi_records++;
+	if (transition_pi_record_busy)
+		transition_content_busy = true;
 	return true;
 }
 bool
@@ -144,6 +167,7 @@ static void transition_production_flush(BufferDesc *buf, SMgrRelation reln, IOOb
 static void transition_production_abort(Buffer buffer);
 static bool transition_copy_active;
 static bool transition_downgrade_active;
+static bool downgrade_notify_ok = true;
 static int downgrade_applies, downgrade_notifies, downgrade_fuses;
 static ResourceXApplyResult downgrade_preflight;
 int cluster_node_id = 0;
@@ -557,13 +581,15 @@ downgrade_master_notify(BufferTag tag, PcmLockTransition trans, int node, bool r
 	UT_ASSERT(BufferTagsEqual(&tag, &transition_buf->tag));
 	UT_ASSERT_EQ(trans, PCM_TRANS_X_TO_S_DOWNGRADE);
 	UT_ASSERT_EQ(node, remote ? 2 : cluster_node_id);
+	if (cluster_shared_config && transition_page_wal.record_start != 0)
+		UT_ASSERT_EQ(transition_pi_records, 1);
 	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config, trans))
 		return false;
 	if (remote)
 		downgrade_notifies++;
 	else
 		downgrade_applies++;
-	return true;
+	return downgrade_notify_ok;
 }
 #define cluster_pcm_lock_apply_gcs_transition(tag, trans, node) downgrade_master_notify(tag, trans, node, false)
 #define cluster_gcs_send_transition_nowait(tag, trans, node) downgrade_master_notify(tag, trans, node, true)
@@ -2324,6 +2350,10 @@ transition_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry, ClusterPcmOwnSnap
 	memset(&transition_page_wal, 0, sizeof(transition_page_wal));
 	transition_wal_prepare_ok = true;
 	transition_wal_certify_ok = true;
+	transition_pi_record_ok = downgrade_notify_ok = true;
+	transition_pi_record_error = transition_pi_record_busy = false;
+	transition_pi_records = 0;
+	memset(&transition_pi_binding, 0, sizeof(transition_pi_binding));
 	transition_wal_source_changes = 0;
 	transition_s_prepare = false;
 	transition_wal_publishes = 0;
@@ -2405,6 +2435,105 @@ UT_TEST(test_shared_scache_local_master_and_remote_holder_prepare)
 			UT_ASSERT_EQ(transition_flush_count, dirty);
 			UT_ASSERT_EQ(lsn, PageGetLSN((Page)transition_page.data));
 			UT_ASSERT_EQ(memcmp(image.data, transition_page.data, BLCKSZ), 0);
+			transition_downgrade_active = false;
+			drop_fixture_done(saved);
+		}
+	}
+}
+
+UT_TEST(test_shared_downgrade_records_original_wal_before_notification)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int remote = 0; remote < 2; remote++) {
+		for (int foreign = 0; foreign < 2; foreign++) {
+			BufferDesc buf;
+			ClusterPcmOwnEntry entry;
+			PGAlignedBlock image;
+			XLogRecPtr lsn;
+			ClusterBufmgrGcsCopyRefusal refusal;
+			ClusterBufmgrGcsDowngradeOutcome result;
+			drop_fixture(&buf, &entry, true);
+			buf.pcm_state = PCM_STATE_X;
+			buf.buffer_type = BUF_TYPE_XCUR;
+			transition_downgrade_active = true;
+			downgrade_applies = downgrade_notifies = downgrade_fuses = 0;
+			downgrade_preflight = RESOURCE_X_APPLY_NOT_FOUND;
+			transition_page_wal.record_start = UINT64_C(0x12300);
+			transition_page_wal.record_end = UINT64_C(0x12400);
+			transition_page_wal.source.claim.identity.origin_node_id = foreign ? 3 : 0;
+			transition_page_wal.flags = foreign ? CLUSTER_PAGE_WAL_NATIVE_FLUSHED : 0;
+			result = remote
+				? cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
+					buf.tag, 2, &lsn, image.data, &refusal)
+				: cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
+					buf.tag, &lsn, image.data, &refusal);
+			UT_ASSERT_EQ(result, CLUSTER_BUFMGR_GCS_DOWNGRADE_COMMITTED);
+			UT_ASSERT_EQ(transition_pi_records, 1);
+			UT_ASSERT_EQ(transition_wal_calls, !foreign);
+			UT_ASSERT(cluster_page_wal_same_mutation_v1(&transition_pi_binding,
+													  &transition_page_wal));
+			UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_S);
+			UT_ASSERT_EQ(downgrade_applies + downgrade_notifies, 1);
+			UT_ASSERT_EQ(downgrade_fuses, 0);
+			UT_ASSERT_EQ(transition_flush_count, 1);
+			transition_downgrade_active = false;
+			drop_fixture_done(saved);
+		}
+	}
+}
+
+UT_TEST(test_shared_downgrade_pi_failure_keeps_x_and_releases_original_revoke)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int remote = 0; remote < 2; remote++) {
+		for (int fault = 0; fault < 8; fault++) {
+			BufferDesc buf;
+			ClusterPcmOwnEntry entry;
+			PGAlignedBlock image;
+			XLogRecPtr lsn;
+			ClusterBufmgrGcsCopyRefusal refusal;
+			volatile bool caught = false;
+			volatile ClusterBufmgrGcsDowngradeOutcome result = CLUSTER_BUFMGR_GCS_DOWNGRADE_COMMITTED;
+			uint64 generation;
+			drop_fixture(&buf, &entry, true);
+			buf.pcm_state = PCM_STATE_X;
+			buf.buffer_type = BUF_TYPE_XCUR;
+			generation = cluster_pcm_own_gen_get(buf.buf_id);
+			transition_downgrade_active = true;
+			downgrade_applies = downgrade_notifies = downgrade_fuses = 0;
+			downgrade_preflight = RESOURCE_X_APPLY_NOT_FOUND;
+			transition_page_wal.record_start = UINT64_C(0x12300);
+			transition_page_wal.record_end = UINT64_C(0x12400);
+			transition_wal_certify_ok = fault != 0;
+			transition_wal_error = fault == 1;
+			transition_pi_record_ok = fault != 2;
+			transition_pi_record_error = fault == 3;
+			transition_pi_record_busy = fault == 4;
+			downgrade_notify_ok = fault != 5;
+			transition_wal_source_changes = fault == 6;
+			transition_flush_error = fault == 7;
+			PG_TRY();
+			{
+				result = remote
+					? cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
+						buf.tag, 2, &lsn, image.data, &refusal)
+					: cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
+						buf.tag, &lsn, image.data, &refusal);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			UT_ASSERT_EQ(caught, fault == 1 || fault == 3 || fault == 7);
+			if (!caught)
+				UT_ASSERT_EQ(result, CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY);
+			UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_X);
+			UT_ASSERT_EQ(cluster_pcm_own_gen_get(buf.buf_id), generation);
+			UT_ASSERT_EQ(cluster_pcm_own_flags_get(buf.buf_id), 0);
+			UT_ASSERT_EQ(downgrade_applies + downgrade_notifies, fault == 5);
+			UT_ASSERT_EQ(downgrade_fuses, 0);
+			UT_ASSERT_EQ(lsn, InvalidXLogRecPtr);
 			transition_downgrade_active = false;
 			drop_fixture_done(saved);
 		}
@@ -8326,8 +8455,10 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(143);
+	UT_PLAN(145);
 	UT_RUN(test_shared_scache_local_master_and_remote_holder_prepare);
+	UT_RUN(test_shared_downgrade_records_original_wal_before_notification);
+	UT_RUN(test_shared_downgrade_pi_failure_keeps_x_and_releases_original_revoke);
 	UT_RUN(test_shared_non_target_x_eviction_keeps_mapping_and_ownership);
 	UT_RUN(test_shared_invalidate_rejects_mismatched_x_mode);
 	UT_RUN(test_shared_old_invalidate_preserves_x_installed_after_its_pin);

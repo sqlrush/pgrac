@@ -4760,11 +4760,12 @@ test_cluster_pcm_flush_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmg
 
 # Real local/remote S-cache prepare and ownership transitions.
 test_cluster_pcm_downgrade.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^cluster_bufmgr_downgrade_x_to_s_(remote_)?for_gcs_prepare_image\(/ { print "ClusterBufmgrGcsDowngradeOutcome"; emit=1; prepare++ } \
+	awk '/^cluster_bufmgr_downgrade_record_pi\(/ { print "static bool"; emit=1; record_pi++ } \
+	     /^cluster_bufmgr_downgrade_x_to_s_(remote_)?for_gcs_prepare_image\(/ { print "ClusterBufmgrGcsDowngradeOutcome"; emit=1; prepare++ } \
 	     /^cluster_bufmgr_pcm_own_(begin_x_revoke|abort_x_revoke)\(/ { print "ClusterPcmOwnResult"; emit=1; revoke++ } \
 	     /^cluster_bufmgr_pcm_own_finish_x_to_s_downgrade\(/ { print "static ClusterPcmOwnResult"; emit=1; finish++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (prepare != 2 || revoke != 2 || finish != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (record_pi != 1 || prepare != 2 || revoke != 2 || finish != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_eviction_gate.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile

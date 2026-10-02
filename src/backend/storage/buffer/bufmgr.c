@@ -14804,6 +14804,31 @@ cluster_bufmgr_finish_direct_land_target_for_gcs(BufferDesc *buf, bool valid,
  *   harmless).  Runs in the LMON IC-dispatch context; the FlushBuffer
  *   call mirrors the checkpointer contract (pin + content lock held).
  * ======================================================================== */
+/* The original REVOKING owner keeps writers out while WAL certification and
+ * the source responsibility registry run outside BufferContent.  A refused
+ * notify may leave a conservative source anchor: only a qualified DATA/PI
+ * retirement (or the existing terminal close owner) can erase that anchor.
+ * Unattributed pages still require the eager DATA guard; absence is no proof. */
+static bool
+cluster_bufmgr_downgrade_record_pi(BufferDesc *buf, volatile bool *content_locked)
+{
+	ClusterPageWalBindingV1 wal, latest;
+	LWLock *content_lock = BufferDescriptorGetContentLock(buf);
+
+	if (!cluster_shared_config
+		|| !cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal))
+		return true;
+	LWLockRelease(content_lock);
+	*content_locked = false;
+	if (!cluster_page_wal_flush_source_v1(&wal, &wal)
+		|| !cluster_pcm_local_pi_record_v1(buf->tag, &wal)
+		|| !LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE))
+		return false;
+	*content_locked = true;
+	return cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &latest)
+		   && cluster_page_wal_same_mutation_v1(&wal, &latest);
+}
+
 ClusterBufmgrGcsDowngradeOutcome
 cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
 	BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
@@ -14824,6 +14849,8 @@ cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
 	XLogRecPtr second_lsn;
 	uint32		buf_state;
 	bool		dirty;
+	volatile bool content_locked = true;
+	bool pi_ready;
 
 	if (out_page_lsn != NULL)
 		*out_page_lsn = InvalidXLogRecPtr;
@@ -14950,17 +14977,30 @@ cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
 	{
 		if (dirty)
 			FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+		pi_ready = cluster_bufmgr_downgrade_record_pi(buf, &content_locked);
 	}
 	PG_CATCH();
 	{
 		own_result = cluster_bufmgr_pcm_own_abort_x_revoke(buf, &revoking);
 		if (own_result != CLUSTER_PCM_OWN_OK)
 			cluster_bufmgr_resource_x_fail_closed_current();
-		LWLockRelease(content_lock);
+		if (content_locked)
+			LWLockRelease(content_lock);
 		cluster_bufmgr_unpin_for_gcs(buf);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	if (!pi_ready) {
+		own_result = cluster_bufmgr_pcm_own_abort_x_revoke(buf, &revoking);
+		if (own_result != CLUSTER_PCM_OWN_OK)
+			cluster_bufmgr_resource_x_fail_closed_current();
+		if (content_locked)
+			LWLockRelease(content_lock);
+		cluster_bufmgr_unpin_for_gcs(buf);
+		if (out_refusal != NULL)
+			*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID;
+		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
+	}
 
 	buf_state = LockBufHdr(buf);
 	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0
@@ -15561,6 +15601,8 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
 	uint32		buf_state;
 	bool		dirty;
 	bool notify_handed_off = false;
+	volatile bool content_locked = true;
+	bool pi_ready;
 
 	if (out_page_lsn != NULL)
 		*out_page_lsn = InvalidXLogRecPtr;
@@ -15684,17 +15726,30 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
 	{
 		if (dirty)
 			FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+		pi_ready = cluster_bufmgr_downgrade_record_pi(buf, &content_locked);
 	}
 	PG_CATCH();
 	{
 		own_result = cluster_bufmgr_pcm_own_abort_x_revoke(buf, &revoking);
 		if (own_result != CLUSTER_PCM_OWN_OK)
 			cluster_bufmgr_resource_x_fail_closed_current();
-		LWLockRelease(content_lock);
+		if (content_locked)
+			LWLockRelease(content_lock);
 		cluster_bufmgr_unpin_for_gcs(buf);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	if (!pi_ready) {
+		own_result = cluster_bufmgr_pcm_own_abort_x_revoke(buf, &revoking);
+		if (own_result != CLUSTER_PCM_OWN_OK)
+			cluster_bufmgr_resource_x_fail_closed_current();
+		if (content_locked)
+			LWLockRelease(content_lock);
+		cluster_bufmgr_unpin_for_gcs(buf);
+		if (out_refusal != NULL)
+			*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID;
+		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
+	}
 
 	/* Content EXCLUSIVE keeps the page bytes stable.  Prove the exact
 	 * REVOKING ownership and clean current-image shape both before and after
