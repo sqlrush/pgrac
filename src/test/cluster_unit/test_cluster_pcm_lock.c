@@ -18362,6 +18362,42 @@ UT_TEST(test_shared_redeclare_preserves_physical_pi_without_current_holder)
 	cluster_shared_config = false;
 }
 
+UT_TEST(test_redeclare_watermark_is_cleared_only_by_data_and_later_handoff_survives)
+{
+	BufferTag tag = make_tag(898);
+	uint32 holders;
+	setup_pi_write_master(tag);
+	/* This is the first sample whose wire ACK remains valid while X grows.
+	 * Re-declaration restores ownership and a lower bound, not durable DATA. */
+	UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(tag, PCM_STATE_X, 80, 90, 2, 7));
+	UT_ASSERT_EQ(cluster_pcm_lock_pi_watermark_lsn_query(tag), 80);
+	UT_ASSERT_EQ(cluster_pcm_lock_pi_watermark_scn_query(tag), 90);
+	UT_ASSERT(cluster_pcm_lock_pi_write_snapshot_v1(tag, &pi_receipt_cut));
+	pi_ack_cut = pi_receipt_cut;
+	/* The DATA/ancestry boundary is explicit in this directory fixture. The
+	 * real file/ancestry tests reject a PI newer than the actual DATA version. */
+	UT_ASSERT(!cluster_pcm_lock_pi_write_complete_v1((void *)&pi_receipt_fixture, NULL, NULL, 0,
+													 pi_acks, 2, &holders));
+	UT_ASSERT_EQ(cluster_pcm_lock_pi_watermark_lsn_query(tag), 80);
+	UT_ASSERT_EQ(cluster_pcm_lock_pi_watermark_scn_query(tag), 90);
+	pi_receipt_valid = true;
+	UT_ASSERT(cluster_pcm_lock_pi_write_complete_v1((void *)&pi_receipt_fixture, NULL, NULL, 0,
+													pi_acks, 2, &holders));
+	UT_ASSERT_EQ(holders, 3);
+	UT_ASSERT_EQ(cluster_pcm_lock_pi_watermark_lsn_query(tag), InvalidXLogRecPtr);
+	UT_ASSERT_EQ(cluster_pcm_lock_pi_watermark_scn_query(tag), InvalidScn);
+	/* New dirty bytes remain the current holder's obligation. Their actual
+	 * handoff reports a fresh bound; the old DATA completion cannot erase it. */
+	cluster_pcm_lock_master_grant_x_to(tag, 3, 180, 190, 101, 17);
+	UT_ASSERT_EQ(cluster_pcm_lock_pi_watermark_lsn_query(tag), 180);
+	UT_ASSERT_EQ(cluster_pcm_lock_pi_watermark_scn_query(tag), 190);
+	UT_ASSERT(!cluster_pcm_lock_pi_write_complete_v1((void *)&pi_receipt_fixture, NULL, NULL, 0,
+													 pi_acks, 2, &holders));
+	UT_ASSERT_EQ(cluster_pcm_lock_pi_watermark_lsn_query(tag), 180);
+	UT_ASSERT_EQ(cluster_pcm_lock_pi_watermark_scn_query(tag), 190);
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_retained_contributors_rebuild_pi_without_changing_current_authority)
 {
 	ClusterGrdPiRebuildCutV1 cut = { .epoch = 7, .affected = { 2 } };
@@ -20268,7 +20304,7 @@ UT_TEST(test_local_pi_read_only_carrier_does_not_create_writer_responsibility)
 int
 main(void)
 {
-	UT_PLAN(305);
+	UT_PLAN(306);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -20532,6 +20568,7 @@ main(void)
 	UT_RUN(test_pcm_d1_recovering_gate_fail_closed);
 	UT_RUN(test_pcm_d2_rebuild_from_redeclare);
 	UT_RUN(test_shared_redeclare_preserves_physical_pi_without_current_holder);
+	UT_RUN(test_redeclare_watermark_is_cleared_only_by_data_and_later_handoff_survives);
 	UT_RUN(test_retained_contributors_rebuild_pi_without_changing_current_authority);
 	UT_RUN(test_pcm_d3_not_double_x);
 	UT_RUN(test_pcm_wm_prov_table_keeps_last_advance);
