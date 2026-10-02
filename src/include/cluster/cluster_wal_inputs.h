@@ -114,6 +114,20 @@ extern ClusterControlRootResult
 cluster_wal_inputs_contributions_v1(ClusterWalInputsV1 *inputs, bool space_active,
 									ClusterThreadRecoveryFabricPlanV1 **out_plan,
 									uint64 *out_record_count, RfPageProofDetailV1 *out_detail);
+
+/* Fixed-memory census over the same complete input set and immutable live
+ * ends. All callbacks are provisional additions, never DATA/retirement or
+ * service-completion proofs. A callback refusal invalidates the scope. No
+ * full PAGE/SIDE graph is materialized; final physical/source/ROOT checks are
+ * identical to contributions_v1. The original caller retains every source. */
+typedef RfPageProofDetailV1 (*ClusterWalCensusVisitorV1)(XLogReaderState *record,
+														 const ClusterWalSourceRef *source,
+														 const RfContributorStreamCutV1 *cut,
+														 void *arg);
+extern ClusterControlRootResult cluster_wal_inputs_census_v1(ClusterWalInputsV1 *inputs,
+															 ClusterWalCensusVisitorV1 visitor,
+															 void *arg, uint64 *out_record_count,
+															 RfPageProofDetailV1 *out_detail);
 /* Local prior-executor retirement only. Consume original prior-exit evidence
  * and the ROOT-selected native INSTALL predecessor chain under this scope.
  * This does not prove DATA coverage, remove PI, or permit WAL reclamation. */

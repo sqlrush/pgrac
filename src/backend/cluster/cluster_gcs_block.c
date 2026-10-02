@@ -18243,8 +18243,7 @@ cluster_gcs_block_lmon_handle_direct_land_completion(int32 peer_node, uint64 wr_
 	}
 	if (cluster_shared_config
 		&& (!cluster_pcm_legacy_transition_allowed(true, (PcmLockTransition)hdr->transition_id)
-			|| status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
-			|| status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE))
+			|| status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER))
 		identity_ok = false;
 	if (!identity_ok) {
 		gcs_block_direct_fail_slot(blk, slot, GCS_BLOCK_DIRECT_ABORT_BAD_IDENTITY, false, NULL);
@@ -19149,8 +19148,7 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 
 	if (cluster_shared_config && !GcsBlockReplyStatusIsR4((GcsBlockReplyStatus)hdr->status)
 		&& (!cluster_pcm_legacy_transition_allowed(true, (PcmLockTransition)hdr->transition_id)
-			|| hdr->status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
-			|| hdr->status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE))
+			|| hdr->status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER))
 		return;
 
 	/* HC80: direct index by requester_backend_id (1..MaxBackends → 0..MaxBackends-1). */

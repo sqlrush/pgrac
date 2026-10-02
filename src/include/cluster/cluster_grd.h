@@ -323,6 +323,13 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 recovery_event_old_epoch;
 	pg_atomic_uint64 recovery_redeclare_generation;
 	pg_atomic_uint64 recovery_barrier_deadline;
+	/* Observational mirrors published by LMON. Never used as service proof. */
+	pg_atomic_uint32 block_redeclare_cursor;
+	pg_atomic_uint32 local_pi_redeclare_cursor;
+	pg_atomic_uint64 block_redeclare_epoch;
+	pg_atomic_uint32 block_redeclare_done;
+	pg_atomic_uint64 block_redeclare_retries;
+	pg_atomic_uint64 local_pi_redeclare_retries;
 	pg_atomic_uint32 recovery_event_coordinator;
 	pg_atomic_uint64 recovery_done_epoch_at_accept;
 
@@ -803,6 +810,9 @@ extern uint64 cluster_grd_offpath_crash_rejoin_fenced_count(void);
 /* spec-4.6 D5 — bulk snapshot of the 13 grd_recovery counters for the
  * pg_cluster_state dump (category 'grd_recovery';  one t/249 leg each). */
 typedef struct ClusterGrdRecoveryCounters {
+	uint32 local_pi_redeclare_cursor;
+	uint64 block_redeclare_retries;
+	uint64 local_pi_redeclare_retries;
 	uint64 remaster_started;
 	uint64 remaster_done;
 	uint64 remaster_failed;

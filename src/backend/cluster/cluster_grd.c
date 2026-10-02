@@ -911,6 +911,12 @@ cluster_grd_shmem_init(void)
 		pg_atomic_init_u64(&cluster_grd_state->recovery_event_old_epoch, 0);
 		pg_atomic_init_u64(&cluster_grd_state->recovery_redeclare_generation, 0);
 		pg_atomic_init_u64(&cluster_grd_state->recovery_barrier_deadline, 0);
+		pg_atomic_init_u32(&cluster_grd_state->block_redeclare_cursor, 0);
+		pg_atomic_init_u32(&cluster_grd_state->local_pi_redeclare_cursor, 0);
+		pg_atomic_init_u64(&cluster_grd_state->block_redeclare_epoch, 0);
+		pg_atomic_init_u32(&cluster_grd_state->block_redeclare_done, 0);
+		pg_atomic_init_u64(&cluster_grd_state->block_redeclare_retries, 0);
+		pg_atomic_init_u64(&cluster_grd_state->local_pi_redeclare_retries, 0);
 		pg_atomic_init_u32(&cluster_grd_state->recovery_event_coordinator, 0);
 		pg_atomic_init_u64(&cluster_grd_state->recovery_done_epoch_at_accept, 0);
 		/* spec-4.6 P0#3 cluster gate — per-node barrier-done epochs. */
@@ -2915,6 +2921,12 @@ cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out)
 	memset(out, 0, sizeof(*out));
 	if (cluster_grd_state == NULL)
 		return;
+	out->local_pi_redeclare_cursor
+		= pg_atomic_read_u32(&cluster_grd_state->local_pi_redeclare_cursor);
+	out->block_redeclare_retries
+		= pg_atomic_read_u64(&cluster_grd_state->block_redeclare_retries);
+	out->local_pi_redeclare_retries
+		= pg_atomic_read_u64(&cluster_grd_state->local_pi_redeclare_retries);
 	out->remaster_started = pg_atomic_read_u64(&cluster_grd_state->remaster_started_count);
 	out->remaster_done = pg_atomic_read_u64(&cluster_grd_state->remaster_done_count);
 	out->remaster_failed = pg_atomic_read_u64(&cluster_grd_state->remaster_failed_count);
@@ -4073,7 +4085,7 @@ grd_block_redeclare_step(uint64 episode_epoch)
 	}
 
 	if (grd_block_redeclare_done)
-		return;
+		goto publish_progress;
 
 	if (!grd_block_redeclare_buffers_done) {
 		/* A busy buffer or unacknowledged declaration retains its position. */
@@ -4082,11 +4094,13 @@ grd_block_redeclare_step(uint64 episode_epoch)
 												   grd_block_redeclare_cb, &episode_epoch);
 		if (next < 0) {
 			grd_block_redeclare_cursor = -1 - next;
-			return;
+			if (cluster_grd_state != NULL)
+				pg_atomic_fetch_add_u64(&cluster_grd_state->block_redeclare_retries, 1);
+			goto publish_progress;
 		}
 		if (next != grd_block_redeclare_cursor) {
 			grd_block_redeclare_cursor = next;
-			return;
+			goto publish_progress;
 		}
 		grd_block_redeclare_buffers_done = true;
 	}
@@ -4098,14 +4112,27 @@ grd_block_redeclare_step(uint64 episode_epoch)
 														 grd_block_redeclare_cb, &episode_epoch);
 		if (next < 0) {
 			grd_local_pi_redeclare_cursor = -1 - next;
-			return;
+			if (cluster_grd_state != NULL)
+				pg_atomic_fetch_add_u64(&cluster_grd_state->local_pi_redeclare_retries, 1);
+			goto publish_progress;
 		}
 		if (next != grd_local_pi_redeclare_cursor) {
 			grd_local_pi_redeclare_cursor = next;
-			return;
+			goto publish_progress;
 		}
 	}
 	grd_block_redeclare_done = true;
+
+publish_progress:
+	/* LMON owns the scan, but dump runs in another backend. These independent
+	 * observations are diagnostic only; the service gate above still uses
+	 * the exact private episode/generation and completion state. */
+	if (cluster_grd_state != NULL) {
+		pg_atomic_write_u32(&cluster_grd_state->block_redeclare_cursor, grd_block_redeclare_cursor);
+		pg_atomic_write_u32(&cluster_grd_state->local_pi_redeclare_cursor, grd_local_pi_redeclare_cursor);
+		pg_atomic_write_u64(&cluster_grd_state->block_redeclare_epoch, grd_block_redeclare_epoch);
+		pg_atomic_write_u32(&cluster_grd_state->block_redeclare_done, grd_block_redeclare_done);
+	}
 }
 
 /*
@@ -4129,19 +4156,19 @@ grd_block_redeclare_scan_complete(uint64 episode_epoch)
 int
 cluster_grd_recovery_block_redeclare_cursor(void)
 {
-	return grd_block_redeclare_cursor;
+	return cluster_grd_state != NULL ? (int)pg_atomic_read_u32(&cluster_grd_state->block_redeclare_cursor) : 0;
 }
 
 uint64
 cluster_grd_recovery_block_redeclare_epoch(void)
 {
-	return grd_block_redeclare_epoch;
+	return cluster_grd_state != NULL ? pg_atomic_read_u64(&cluster_grd_state->block_redeclare_epoch) : 0;
 }
 
 bool
 cluster_grd_recovery_block_redeclare_done(void)
 {
-	return grd_block_redeclare_done;
+	return cluster_grd_state != NULL ? pg_atomic_read_u32(&cluster_grd_state->block_redeclare_done) != 0 : 0;
 }
 
 void

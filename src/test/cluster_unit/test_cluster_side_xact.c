@@ -4034,10 +4034,114 @@ UT_TEST(test_standby_invalid_counts_shapes_and_sources_never_seal)
 		}
 }
 
+static bool
+census_space(void *arg, const RfSideSpaceContributionV1 *space)
+{
+	unsigned *calls = arg;
+	(*calls)++;
+	UT_ASSERT_EQ(space->page_mask, 2);
+	UT_ASSERT_EQ(space->result.key.database_incarnation, 42);
+	UT_ASSERT_EQ(space->result_token[1], 80);
+	return true;
+}
+
+UT_TEST(test_stream_census_does_not_accumulate_a_million_side_operations)
+{
+	FakeXactRecord fake;
+	RfPageOnlineRecordIdentityV1 identity;
+	RfDetachedRecordPlanV1 record;
+	RfContributorStreamCutV1 cut = { 0 };
+	RfSideContributionOwnersV1 owners;
+	uint8 uuid[16];
+	unsigned calls = 0;
+	memset(uuid, 0x44, sizeof(uuid));
+	make_commit(&fake, 802, 999, 12345, false);
+	identity = make_identity(&fake, uuid);
+	record = make_record_plan(&fake);
+	cut.failed_thread = 3;
+	cut.timeline_id = 7;
+	cut.origin_owner_incarnation = 9;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	cut.scan_begin_inclusive = 100;
+	cut.scan_end_exclusive = 100000100;
+	for (uint32 i = 0; i < 1000000; i++) {
+		set_identity_range(&fake, &identity, 100 + (uint64)i * 100, 200 + (uint64)i * 100);
+		UT_ASSERT_EQ(
+			rf_side_record_census_v1(&record, &identity, &cut, 42, census_space, &calls, &owners),
+			RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(owners.owners,
+					 RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL);
+		UT_ASSERT_EQ(owners.space_locator_count, 0);
+	}
+	UT_ASSERT_EQ(calls, 0);
+	/* The census cannot make a malformed final record disappear. */
+	fake.u.decoded.main_data_len--;
+	UT_ASSERT_NE(
+		rf_side_record_census_v1(&record, &identity, &cut, 42, census_space, &calls, &owners),
+		RF_PAGE_PROOF_DETAIL_OK);
+}
+
+UT_TEST(test_stream_census_checks_native_and_space_payloads_without_replay)
+{
+	FakeXactRecord fake;
+	RfPageOnlineRecordIdentityV1 identity;
+	RfDetachedRecordPlanV1 record;
+	RfContributorStreamCutV1 cut = { 0 };
+	RfSideContributionOwnersV1 owners;
+	ClusterSpaceReservationChange change = space_advance_fixture();
+	PGAlignedBlock payload = { 0 };
+	uint8 uuid[16];
+	unsigned calls = 0;
+	memset(uuid, 0x44, sizeof(uuid));
+	cut.failed_thread = 3;
+	cut.timeline_id = 7;
+	cut.origin_owner_incarnation = 9;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	cut.scan_begin_inclusive = 100;
+	cut.scan_end_exclusive = 200;
+	for (uint8 info = 0; info <= XLOG_INVALIDATIONS; info += 0x10) {
+		uint32 length = standby_payload(info, payload.data);
+		make_projection_record(&fake, RM_STANDBY_ID, info, payload.data, length);
+		identity = make_identity(&fake, uuid);
+		record = make_projection_record_plan(&fake);
+		fake.u.decoded.max_block_id = -1;
+		UT_ASSERT_EQ(
+			rf_side_record_census_v1(&record, &identity, &cut, 42, census_space, &calls, &owners),
+			RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(owners.owners, RF_SIDE_CONTRIBUTION_NATIVE_CONTROL);
+		fake.u.decoded.main_data_len--;
+		UT_ASSERT_NE(
+			rf_side_record_census_v1(&record, &identity, &cut, 42, census_space, &calls, &owners),
+			RF_PAGE_PROOF_DETAIL_OK);
+	}
+	UT_ASSERT(cluster_space_reservation_wal_encode(&change, payload.data,
+												   CLUSTER_SPACE_RESERVATION_WAL_BYTES));
+	make_projection_record(&fake, RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION, payload.data,
+						   CLUSTER_SPACE_RESERVATION_WAL_BYTES);
+	identity = make_identity(&fake, uuid);
+	record = make_projection_record_plan(&fake);
+	fake.u.decoded.max_block_id = -1;
+	UT_ASSERT_EQ(
+		rf_side_record_census_v1(&record, &identity, &cut, 42, census_space, &calls, &owners),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(calls, 1);
+	UT_ASSERT_EQ(owners.space_locator_count, 1);
+	UT_ASSERT_NE(
+		rf_side_record_census_v1(&record, &identity, &cut, 43, census_space, &calls, &owners),
+		RF_PAGE_PROOF_DETAIL_OK);
+	cut.origin_owner_incarnation = 0;
+	UT_ASSERT_NE(
+		rf_side_record_census_v1(&record, &identity, &cut, 42, census_space, &calls, &owners),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(calls, 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(58);
+	UT_PLAN(60);
+	UT_RUN(test_stream_census_does_not_accumulate_a_million_side_operations);
+	UT_RUN(test_stream_census_checks_native_and_space_payloads_without_replay);
 	UT_RUN(test_standby_retains_exact_payload_and_independent_control_obligation);
 	UT_RUN(test_standby_empty_snapshot_and_initial_completed_xid_are_valid);
 	UT_RUN(test_standby_invalid_counts_shapes_and_sources_never_seal);

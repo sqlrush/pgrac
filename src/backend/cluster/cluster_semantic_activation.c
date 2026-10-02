@@ -5978,61 +5978,6 @@ semantic_activation_modifier_policy(uint64 active_bits, uint64 record_generation
 	return true;
 }
 
-static ClusterSemanticAdmissionResult
-semantic_activation_modifier_enter_bootstrap(bool writable_admission,
-											 ClusterSemanticAdmissionToken *token)
-{
-	SemanticActivationAdmissionSnapshot before;
-	SemanticActivationAdmissionSnapshot after;
-	uint64 epoch_before;
-	uint64 epoch_after;
-	bool incremented = false;
-
-	if (token != NULL)
-		memset(token, 0, sizeof(*token));
-	if (!writable_admission || !normal_start_bootstrap_allowed() || token == NULL
-		|| SemanticActivationShmem == NULL || !semantic_activation_ensure_exit_hook())
-		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
-
-	epoch_before = cluster_epoch_get_current();
-	if (!semantic_activation_snapshot(&before) || before.formation_epoch != epoch_before
-		|| before.record_generation != 0 || before.active_bits != 0)
-		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
-
-	HOLD_INTERRUPTS();
-	if (semantic_activation_local_inflight[CLUSTER_SEMANTIC_SOURCE_SIDE][0] != UINT32_MAX
-		&& semantic_activation_counter_increment(
-			&SemanticActivationShmem->inflight[CLUSTER_SEMANTIC_SOURCE_SIDE][0])) {
-		semantic_activation_local_inflight[CLUSTER_SEMANTIC_SOURCE_SIDE][0]++;
-		incremented = true;
-	}
-	pg_write_barrier();
-	RESUME_INTERRUPTS();
-	if (!incremented)
-		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
-
-	if (!semantic_activation_snapshot(&after))
-		goto fail;
-	epoch_after = cluster_epoch_get_current();
-	if (before.seq != after.seq || after.record_generation != 0 || after.active_bits != 0
-		|| before.formation_epoch != after.formation_epoch || epoch_before != epoch_after
-		|| after.formation_epoch != epoch_after || !normal_start_bootstrap_allowed())
-		goto fail;
-
-	token->feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
-	token->record_generation = 0;
-	token->formation_epoch = before.formation_epoch;
-	token->side = CLUSTER_SEMANTIC_SOURCE_SIDE;
-	token->entered = true;
-	return CLUSTER_SEMANTIC_ADMISSION_OK;
-
-fail:
-	HOLD_INTERRUPTS();
-	semantic_activation_release_debt(CLUSTER_SEMANTIC_SOURCE_SIDE, 0);
-	RESUME_INTERRUPTS();
-	return CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED;
-}
-
 static ClusterSemanticActivationResult
 semantic_activation_preflight(ClusterSemanticActivationAction action, uint64 expected_generation,
 							  ClusterSemanticActivationRefusal *refusal, uint32 *effects)
@@ -8942,7 +8887,7 @@ cluster_semantic_activation_enter_r4_terminal_census(ClusterSemanticAdmissionTok
 }
 
 ClusterSemanticAdmissionResult
-cluster_semantic_activation_modifier_enter(bool writable_admission,
+cluster_semantic_activation_modifier_enter(bool writable_admission pg_attribute_unused(),
 										   ClusterSemanticAdmissionToken *token)
 {
 	SemanticActivationAdmissionSnapshot snapshot;
@@ -8953,31 +8898,22 @@ cluster_semantic_activation_modifier_enter(bool writable_admission,
 	if (token == NULL || !semantic_activation_snapshot(&snapshot))
 		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 
-	/*
-	 * Before the first PGSA record, the ordinary-join write gate is the
-	 * durable discriminator between a steady SOURCE member and a replacement
-	 * MEMBER that is deliberately still closed.  We still take D10 debt so a
-	 * later close can drain already-running ordinary modifiers.
-	 */
-	if (snapshot.record_generation == 0) {
-		if (snapshot.active_bits != 0 || !writable_admission)
-			return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
-		return semantic_activation_modifier_enter_bootstrap(writable_admission, token);
-	} else {
-		if (!semantic_activation_modifier_policy(snapshot.active_bits, snapshot.record_generation,
-												 snapshot.transition_closed))
-			return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
-		side = (snapshot.active_bits & CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1) != 0
-				   ? CLUSTER_SEMANTIC_TARGET_SIDE
-				   : CLUSTER_SEMANTIC_SOURCE_SIDE;
-	}
+	/* SOURCE_ZERO permits formation/read work, not canonical mutation. A
+	 * writable token must carry the durable generation required by TT/CTRC,
+	 * even when the ordinary member write gate is already open. */
+	if (!semantic_activation_modifier_policy(snapshot.active_bits, snapshot.record_generation,
+										 snapshot.transition_closed))
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+	side = (snapshot.active_bits & CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1) != 0
+			   ? CLUSTER_SEMANTIC_TARGET_SIDE
+			   : CLUSTER_SEMANTIC_SOURCE_SIDE;
 
 	return cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, side, token);
 }
 
 bool
 cluster_semantic_activation_modifier_recheck(const ClusterSemanticAdmissionToken *token,
-											 bool writable_admission)
+											 bool writable_admission pg_attribute_unused())
 {
 	SemanticActivationAdmissionSnapshot snapshot;
 	uint64 current_epoch;
@@ -8990,9 +8926,7 @@ cluster_semantic_activation_modifier_recheck(const ClusterSemanticAdmissionToken
 		|| snapshot.formation_epoch != token->formation_epoch
 		|| current_epoch != token->formation_epoch)
 		return false;
-	if (snapshot.record_generation == 0)
-		return normal_start_bootstrap_allowed() && token->side == CLUSTER_SEMANTIC_SOURCE_SIDE
-			   && snapshot.active_bits == 0 && writable_admission;
+
 	return semantic_activation_modifier_policy(snapshot.active_bits, snapshot.record_generation,
 											   snapshot.transition_closed);
 }
