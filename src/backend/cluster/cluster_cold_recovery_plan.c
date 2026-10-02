@@ -669,21 +669,26 @@ data_shape_valid(const ClusterColdDataV1 *data)
 	}
 }
 
-/* Last anchor (full image or full-coverage init) whose whole chain suffix
- * is replayable; -1 when none.  History is never replayed. */
+/*
+ * Earliest anchor (full image or full-coverage init) at chain index <= limit
+ * whose whole chain suffix is replayable; -1 when none.  History is never
+ * replayed, so only anchors after the last history edge qualify.
+ */
 static int64
-page_last_replayable_anchor(const ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count)
+page_earliest_replayable_anchor(const ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
+								int64 limit)
 {
+	uint32 start = 0;
 	uint32 i;
 
-	for (i = count; i > 0; i--) {
-		const ColdComponent *component = &plan->components[chain[i - 1]];
-
-		if (plan->records[component->record].history)
-			return -1;
-		if (component->edge_flags != 0)
-			return (int64)i - 1;
-	}
+	for (i = count; i > 0; i--)
+		if (plan->records[plan->components[chain[i - 1]].record].history) {
+			start = i;
+			break;
+		}
+	for (i = start; i < count && (int64)i <= limit; i++)
+		if (plan->components[chain[i]].edge_flags != 0)
+			return (int64)i;
 	return -1;
 }
 
@@ -694,9 +699,9 @@ page_last_replayable_anchor(const ClusterColdPlanV1 *plan, const uint32 *chain, 
  * anchor that replaces unreadable or unrelated content.
  *
  * The shared profile does not require checksums, so a torn write can pair
- * a newer header with an older body.  As with full_page_writes, the last
- * replayable anchor is always restored once DATA is at or past its
- * predecessor, never skipped on a header token alone.
+ * a newer header with an older body.  As with full_page_writes, the earliest
+ * replayable anchor whose predecessor DATA has reached is always restored,
+ * so no delta is applied to a body whose header alone placed it.
  */
 static ClusterColdDetailV1
 page_data_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
@@ -705,7 +710,7 @@ page_data_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 {
 	const ColdComponent *first = &plan->components[chain[0]];
 	bool new_start = first->before_kind != RF_PAGE_STATE_PRESENT;
-	int64 anchor = page_last_replayable_anchor(plan, chain, count);
+	int64 anchor;
 	int64 position = -2;
 	uint32 i;
 
@@ -733,6 +738,7 @@ page_data_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 		position = -1;
 	} else {
 		/* Unreadable, or a new page where a formatted one was expected. */
+		anchor = page_earliest_replayable_anchor(plan, chain, count, (int64)count);
 		if (anchor < 0) {
 			diag_component(plan, diag, chain[count - 1]);
 			diag->version = data->version;
@@ -742,7 +748,8 @@ page_data_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 		*covered = anchor - 1;
 		return CLUSTER_COLD_OK;
 	}
-	*covered = anchor >= 0 && position >= anchor - 1 ? anchor - 1 : position;
+	anchor = page_earliest_replayable_anchor(plan, chain, count, position + 1);
+	*covered = anchor >= 0 ? anchor - 1 : position;
 	return CLUSTER_COLD_OK;
 }
 
