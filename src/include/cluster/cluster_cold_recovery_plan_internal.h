@@ -5,8 +5,10 @@
  *
  *	  Shared only by the planner: cluster_cold_recovery_plan.c (input,
  *	  steps, lifetime), cluster_cold_recovery_plan_store.c (compact storage
- *	  and accounting) and cluster_cold_recovery_plan_seal.c (chains, DATA
- *	  placement, verdicts, schedule).  Callers use cluster_cold_recovery.h.
+ *	  and accounting), cluster_cold_recovery_plan_space.c (SPACE effects),
+ *	  cluster_cold_recovery_plan_seal.c (chains, DATA placement, verdicts)
+ *	  and cluster_cold_recovery_plan_schedule.c (replay order).  Callers
+ *	  use cluster_cold_recovery.h.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -88,6 +90,8 @@ typedef struct ColdRecord {
 
 #define COLD_RECORD_HISTORY 0x01
 #define COLD_RECORD_SCHEDULED 0x02
+#define COLD_RECORD_SPACE 0x04		/* first_component is its first SPACE effect */
+#define COLD_RECORD_SPACE_STEP 0x08 /* CREATE/TRUNCATE after a native redo start: a step */
 
 StaticAssertDecl(CLUSTER_COLD_MAX_PARTICIPANTS <= UINT8_MAX + 1,
 				 "canonical participant index must fit ColdRecord");
@@ -131,6 +135,38 @@ typedef struct ColdComponent {
 #define COLD_STATE_DATA_BEFORE 0x04
 #define COLD_STATE_DATA_KIND_SHIFT 4
 #define COLD_STATE_DATA_KIND_MASK 0x03
+/* Set at seal from SPACE effects; never cleared by verdict assignment. */
+#define COLD_STATE_DURABLE 0x40	   /* before a TRUNCATE of its relation (object checkpoint) */
+#define COLD_STATE_IRRELEVANT 0x80 /* dropped, or retired by a TRUNCATE */
+
+/*
+ * One stored SPACE effect.  Effects in history are kept only when structural
+ * (CREATE, TRUNCATE, DROP) and carry no payload; effects after a native redo
+ * start are the SPACE owner's inputs and keep a copy of their payload.
+ */
+typedef struct ColdSpaceOp {
+	void *payload;
+	uint32 payload_length;
+	uint32 record;
+	RelFileLocator locator;
+	BlockNumber nblocks;
+	uint8 kind; /* ClusterColdSpaceKindV1 */
+	uint8 before[16];
+	uint8 result[16];
+	uint32 relation; /* sealed: index of its relation among SPACE inputs, or NO_INDEX */
+	uint32 input;	 /* sealed: position within that relation's inputs */
+} ColdSpaceOp;
+
+/*
+ * SPACE facts of one interned segment (relation fork, incarnation), valid
+ * during seal.  A TRUNCATE or DROP ends a segment: its blocks at or past
+ * retired_from are gone, the rest were written before the change was logged.
+ */
+typedef struct ColdSegmentSpace {
+	uint32 creator_record;	  /* replay-range CREATE/TRUNCATE that made it, or NO_INDEX */
+	BlockNumber retired_from; /* InvalidBlockNumber: none known to be retired */
+	bool ended;
+} ColdSegmentSpace;
 
 /* Open-addressing intern table; slots hold entry index + 1. */
 typedef struct ColdIntern {
@@ -162,6 +198,22 @@ struct ClusterColdPlanV1 {
 	uint32 component_chunk_capacity;
 	ColdIntern relations; /* ColdRelation */
 	ColdIntern segments;  /* ColdSegment */
+	ColdSpaceOp **space_chunks;
+	uint32 space_count;
+	uint32 space_chunk_count;
+	uint32 space_chunk_capacity;
+	/* SPACE views kept after seal: the SPACE owner's inputs per relation. */
+	uint32 *space_inputs; /* replay-range effects, by relation then feed order */
+	uint32 space_input_count;
+	uint32 *space_relation_start; /* space_relation_count + 1 boundaries */
+	uint32 space_relation_count;
+	/* SPACE views used only during seal (cold_plan_space_release). */
+	ColdSegmentSpace *segment_space; /* per interned segment */
+	uint32 *space_creators;			 /* CREATE/TRUNCATE by (locator, result) */
+	uint32 space_creator_count;
+	uint32 *space_enders; /* TRUNCATE/DROP by (locator, before) */
+	uint32 space_ender_count;
+	Size space_scratch_bytes;
 	uint32 *schedule;
 	uint32 schedule_count;
 };
@@ -188,6 +240,12 @@ static inline const ColdRelation *
 cold_relation(const ClusterColdPlanV1 *plan, uint32 index)
 {
 	return &((const ColdRelation *)plan->relations.entries)[index];
+}
+
+static inline ColdSpaceOp *
+cold_space_op(const ClusterColdPlanV1 *plan, uint32 index)
+{
+	return &plan->space_chunks[index >> COLD_CHUNK_SHIFT][index & COLD_CHUNK_MASK];
 }
 
 static inline bool
@@ -240,11 +298,14 @@ plan_valid(const ClusterColdPlanV1 *plan)
 /* cluster_cold_recovery_plan_store.c */
 extern bool cold_plan_reserve(ClusterColdPlanV1 *plan, Size bytes);
 extern void cold_plan_release(ClusterColdPlanV1 *plan, Size bytes);
+extern void *cold_plan_scratch(ClusterColdPlanV1 *plan, Size bytes, Size *accounted);
 extern ClusterColdDetailV1 cold_plan_chunk_reserve(ClusterColdPlanV1 *plan, void ***chunks,
 												   uint32 *chunk_count, uint32 *chunk_capacity,
 												   uint64 required, Size element);
 extern ClusterColdDetailV1 cold_plan_intern(ClusterColdPlanV1 *plan, ColdIntern *intern,
 											const void *key, Size key_size, uint32 *out);
+extern bool cold_plan_intern_find(const ColdIntern *intern, const void *key, Size key_size,
+								  uint32 *out);
 extern void cold_plan_intern_free(ColdIntern *intern);
 extern RfPageVersionV1 cold_plan_component_result(const ClusterColdPlanV1 *plan,
 												  const ColdComponent *component);
@@ -254,5 +315,49 @@ extern bool cold_plan_incarnation_is(const ClusterColdPlanV1 *plan, const ColdCo
 									 const RfPageVersionV1 *version);
 extern RfPageIdentityV1 cold_plan_component_page(const ClusterColdPlanV1 *plan,
 												 const ColdComponent *component);
+
+/* cluster_cold_recovery_plan_schedule.c */
+extern ClusterColdDetailV1 cold_plan_schedule(ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag);
+
+static inline void
+cold_diag_record(const ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag, uint32 record)
+{
+	const ColdRecord *stored = cold_record(plan, record);
+
+	diag->has_record = true;
+	diag->participant = plan->participants[stored->participant].input_index;
+	diag->read_rec_ptr = stored->read_rec_ptr;
+}
+
+static inline void
+cold_diag_component(const ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag, uint32 component)
+{
+	const ColdComponent *stored = cold_component(plan, component);
+
+	cold_diag_record(plan, diag, stored->record);
+	diag->has_page = true;
+	diag->page = cold_plan_component_page(plan, stored);
+}
+
+/* cluster_cold_recovery_plan_space.c */
+extern ClusterColdDetailV1 cold_plan_space_seal(ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag);
+extern void cold_plan_space_release(ClusterColdPlanV1 *plan);
+extern uint32 cold_plan_space_carried_from(const ClusterColdPlanV1 *plan, uint32 segment,
+										   BlockNumber blockno);
+extern bool cold_plan_space_lineage(const ClusterColdPlanV1 *plan, const ColdComponent *component,
+									const uint8 *incarnation);
+extern bool cold_plan_space_retired_start(const ClusterColdPlanV1 *plan,
+										  const ColdComponent *component);
+extern bool cold_plan_space_created_here(const ClusterColdPlanV1 *plan,
+										 const ColdComponent *component);
+extern void cold_plan_space_retire_inferred(ClusterColdPlanV1 *plan, const uint32 *group,
+											uint32 count);
+
+/* History, or written before a TRUNCATE of its relation: never replayed. */
+static inline bool
+component_settled(const ClusterColdPlanV1 *plan, const ColdComponent *component)
+{
+	return record_history(plan, component->record) || (component->state & COLD_STATE_DURABLE) != 0;
+}
 
 #endif /* CLUSTER_COLD_RECOVERY_PLAN_INTERNAL_H */

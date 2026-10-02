@@ -313,6 +313,125 @@ record_store(ClusterColdPlanV1 *plan, uint32 canonical, const ClusterColdRecordV
 	return CLUSTER_COLD_OK;
 }
 
+/* Shape of one SPACE effect; the SPACE owner validates the payload itself. */
+static bool
+space_op_valid(const ClusterColdSpaceOpV1 *op)
+{
+	static const uint8 zero[3] = { 0 };
+	bool before = bytes_nonzero(op->before_incarnation, 16);
+	bool result = bytes_nonzero(op->result_incarnation, 16);
+
+	if (memcmp(op->reserved_zero, zero, sizeof(zero)) != 0 || op->payload == NULL
+		|| op->payload_length == 0 || op->locator.relNumber == InvalidRelFileNumber)
+		return false;
+	switch (op->kind) {
+	case CLUSTER_COLD_SPACE_CREATE:
+	case CLUSTER_COLD_SPACE_ADVANCE:
+		return !before && result;
+	case CLUSTER_COLD_SPACE_TRUNCATE:
+		return before && result && memcmp(op->before_incarnation, op->result_incarnation, 16) != 0;
+	case CLUSTER_COLD_SPACE_DROP:
+		return before && !result;
+	default:
+		return false;
+	}
+}
+
+/* A CREATE, TRUNCATE or ADVANCE stands alone; only a commit or abort drops
+ * several relations at once. */
+static bool
+space_ops_valid(const ClusterColdRecordV1 *record)
+{
+	uint32 i;
+
+	for (i = 0; i < record->space_count; i++) {
+		const ClusterColdSpaceOpV1 *op = &record->space_ops[i];
+
+		if (!space_op_valid(op) || (record->space_count > 1 && op->kind != CLUSTER_COLD_SPACE_DROP))
+			return false;
+	}
+	return true;
+}
+
+/* History keeps the structural effects, without payload. */
+static bool
+space_op_kept(const ClusterColdSpaceOpV1 *op, bool history)
+{
+	return !history || op->kind != CLUSTER_COLD_SPACE_ADVANCE;
+}
+
+static ClusterColdDetailV1
+space_record_store(ClusterColdPlanV1 *plan, uint32 canonical, const ClusterColdRecordV1 *record)
+{
+	bool history = record->end_rec_ptr <= plan->participants[canonical].cut.native_redo;
+	uint32 kept = 0;
+	ColdRecord *stored;
+	ClusterColdDetailV1 detail;
+	uint32 i;
+
+	for (i = 0; i < record->space_count; i++)
+		kept += space_op_kept(&record->space_ops[i], history) ? 1 : 0;
+	if (kept == 0)
+		return CLUSTER_COLD_OK;
+	if (plan->record_count == UINT32_MAX || (uint64)plan->space_count + kept > UINT32_MAX)
+		return CLUSTER_COLD_CAPACITY;
+	detail = cold_plan_chunk_reserve(plan, (void ***)&plan->record_chunks,
+									 &plan->record_chunk_count, &plan->record_chunk_capacity,
+									 (uint64)plan->record_count + 1, sizeof(ColdRecord));
+	if (detail == CLUSTER_COLD_OK)
+		detail = cold_plan_chunk_reserve(plan, (void ***)&plan->space_chunks,
+										 &plan->space_chunk_count, &plan->space_chunk_capacity,
+										 (uint64)plan->space_count + kept, sizeof(ColdSpaceOp));
+	if (detail != CLUSTER_COLD_OK)
+		return detail;
+	stored = cold_record(plan, plan->record_count);
+	memset(stored, 0, sizeof(*stored));
+	stored->read_rec_ptr = record->read_rec_ptr;
+	stored->end_rec_ptr = record->end_rec_ptr;
+	stored->scn = record->scn;
+	stored->record_crc = record->record_crc;
+	stored->participant = (uint8)canonical;
+	stored->first_component = plan->space_count;
+	stored->rmid = record->rmid;
+	stored->info = record->info;
+	stored->flags = COLD_RECORD_SPACE | (history ? COLD_RECORD_HISTORY : 0);
+	if (!history
+		&& (record->space_ops[0].kind == CLUSTER_COLD_SPACE_CREATE
+			|| record->space_ops[0].kind == CLUSTER_COLD_SPACE_TRUNCATE))
+		stored->flags |= COLD_RECORD_SPACE_STEP;
+	for (i = 0; i < record->space_count; i++) {
+		const ClusterColdSpaceOpV1 *source = &record->space_ops[i];
+		ColdSpaceOp *op;
+
+		if (!space_op_kept(source, history))
+			continue;
+		op = cold_space_op(plan, plan->space_count);
+		memset(op, 0, sizeof(*op));
+		if (!history) {
+			if (!cold_plan_reserve(plan, source->payload_length))
+				return CLUSTER_COLD_CAPACITY;
+			op->payload = cold_alloc0(source->payload_length);
+			if (op->payload == NULL) {
+				cold_plan_release(plan, source->payload_length);
+				return CLUSTER_COLD_OOM;
+			}
+			memcpy(op->payload, source->payload, source->payload_length);
+			op->payload_length = source->payload_length;
+		}
+		op->record = plan->record_count;
+		op->locator = source->locator;
+		op->nblocks = source->nblocks;
+		op->kind = source->kind;
+		memcpy(op->before, source->before_incarnation, 16);
+		memcpy(op->result, source->result_incarnation, 16);
+		op->relation = CLUSTER_COLD_NO_INDEX;
+		op->input = CLUSTER_COLD_NO_INDEX;
+		plan->space_count++;
+	}
+	plan->record_count++;
+	return CLUSTER_COLD_OK;
+}
+
 ClusterColdDetailV1
 cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 						  const ClusterColdRecordV1 *record)
@@ -327,9 +446,12 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	if (record == NULL || participant >= plan->participant_count
 		|| record->component_count > CLUSTER_COLD_MAX_COMPONENTS
 		|| (record->component_count != 0 && record->components == NULL)
+		|| (record->space_count != 0 && record->space_ops == NULL)
 		|| (record->record_flags & ~CLUSTER_COLD_RECORD_KNOWN_FLAGS) != 0
 		|| record->reserved_zero != 0)
 		detail = CLUSTER_COLD_INVALID_ARGUMENT;
+	else if (record->space_count != 0 && record->component_count != 0)
+		detail = CLUSTER_COLD_COMPONENT_INVALID;
 	else {
 		owner = &plan->participants[plan->canonical[participant]];
 		detail = record_cursor_check(owner, record);
@@ -347,6 +469,10 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 			detail = CLUSTER_COLD_SIDE_OWNER_MISSING;
 		if (detail == CLUSTER_COLD_OK)
 			detail = components_validate(plan, record);
+		if (detail == CLUSTER_COLD_OK && !space_ops_valid(record))
+			detail = CLUSTER_COLD_SPACE_INVALID;
+		if (detail == CLUSTER_COLD_OK && record->space_count != 0)
+			detail = space_record_store(plan, plan->canonical[participant], record);
 		if (detail == CLUSTER_COLD_OK && record->component_count != 0)
 			detail = record_store(plan, plan->canonical[participant], record);
 		if (detail == CLUSTER_COLD_OK) {
@@ -370,10 +496,11 @@ component_expected(const ClusterColdPlanV1 *plan, const ColdComponent *component
 	const ColdComponent *source;
 	uint8 kind;
 
+	/* The block is applied while the SPACE identity carries this component's
+	 * incarnation (a TRUNCATE rebases the predecessor's token into it). */
 	if ((component->state & COLD_STATE_FIRST_APPLY) == 0) {
 		block->expected_kind = CLUSTER_COLD_DATA_PRESENT;
-		block->expected_before
-			= cold_plan_component_result(plan, cold_component(plan, component->link));
+		block->expected_before = cold_plan_component_before(plan, component);
 		return;
 	}
 	if ((component->state & COLD_STATE_EXACT) == 0) {
@@ -383,14 +510,14 @@ component_expected(const ClusterColdPlanV1 *plan, const ColdComponent *component
 	kind = (component->state >> COLD_STATE_DATA_KIND_SHIFT) & COLD_STATE_DATA_KIND_MASK;
 	source = cold_component(plan, component->link);
 	block->expected_kind = kind;
-	if (kind == CLUSTER_COLD_DATA_PRESENT)
-		block->expected_before = (component->state & COLD_STATE_DATA_BEFORE) != 0
-									 ? cold_plan_component_before(plan, source)
-									 : cold_plan_component_result(plan, source);
-	else if (kind == CLUSTER_COLD_DATA_UNFORMATTED)
+	if (kind == CLUSTER_COLD_DATA_PRESENT || kind == CLUSTER_COLD_DATA_UNFORMATTED)
 		memcpy(block->expected_before.segment_incarnation,
-			   cold_segment(plan, source->segment)->incarnation,
+			   cold_segment(plan, component->segment)->incarnation,
 			   sizeof(block->expected_before.segment_incarnation));
+	if (kind == CLUSTER_COLD_DATA_PRESENT)
+		block->expected_before.mutation_token = (component->state & COLD_STATE_DATA_BEFORE) != 0
+													? source->before_token
+													: source->result_token;
 }
 
 uint32
@@ -418,6 +545,15 @@ cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 index, ClusterCo
 	out->record_crc = record->record_crc;
 	out->rmid = record->rmid;
 	out->info = record->info;
+	if ((record->flags & COLD_RECORD_SPACE) != 0) {
+		const ColdSpaceOp *op = cold_space_op(plan, record->first_component);
+
+		out->step_kind = CLUSTER_COLD_STEP_SPACE;
+		out->space_kind = op->kind;
+		out->space_relation = op->relation;
+		out->space_input = op->input;
+		return true;
+	}
 	for (i = 0; i < record->component_count; i++) {
 		const ColdComponent *component = cold_component(plan, record->first_component + i);
 		ClusterColdBlockStepV1 *block = &out->blocks[component->block_id];
@@ -439,6 +575,53 @@ cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 index, ClusterCo
 	}
 	out->all_skip = any_skip && !any_apply;
 	out->mixed = any_skip && any_apply;
+	return true;
+}
+
+uint32
+cluster_cold_plan_space_relation_count_v1(const ClusterColdPlanV1 *plan)
+{
+	return plan_valid(plan) && plan->phase == COLD_PHASE_SEALED ? plan->space_relation_count : 0;
+}
+
+bool
+cluster_cold_plan_space_relation_v1(const ClusterColdPlanV1 *plan, uint32 index,
+									RelFileLocator *locator, uint32 *input_count)
+{
+	uint32 first;
+
+	if (!plan_valid(plan) || plan->phase != COLD_PHASE_SEALED || locator == NULL
+		|| input_count == NULL || index >= plan->space_relation_count)
+		return false;
+	first = plan->space_relation_start[index];
+	*locator = cold_space_op(plan, plan->space_inputs[first])->locator;
+	*input_count = plan->space_relation_start[index + 1] - first;
+	return true;
+}
+
+bool
+cluster_cold_plan_space_input_v1(const ClusterColdPlanV1 *plan, uint32 relation, uint32 input,
+								 ClusterColdSpaceInputV1 *out)
+{
+	const ColdSpaceOp *op;
+	const ColdRecord *record;
+	uint32 at;
+
+	if (!plan_valid(plan) || plan->phase != COLD_PHASE_SEALED || out == NULL
+		|| relation >= plan->space_relation_count)
+		return false;
+	at = plan->space_relation_start[relation] + input;
+	if (input >= plan->space_relation_start[relation + 1] - plan->space_relation_start[relation])
+		return false;
+	op = cold_space_op(plan, plan->space_inputs[at]);
+	record = cold_record(plan, op->record);
+	memset(out, 0, sizeof(*out));
+	out->kind = op->kind;
+	out->participant = plan->participants[record->participant].input_index;
+	out->read_rec_ptr = record->read_rec_ptr;
+	out->end_rec_ptr = record->end_rec_ptr;
+	out->payload = op->payload;
+	out->payload_length = op->payload_length;
 	return true;
 }
 
@@ -474,6 +657,18 @@ cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan_address)
 		cold_free(plan->component_chunks[i]);
 	if (plan->component_chunks != NULL)
 		cold_free(plan->component_chunks);
+	for (i = 0; i < plan->space_count; i++)
+		if (cold_space_op(plan, i)->payload != NULL)
+			cold_free(cold_space_op(plan, i)->payload);
+	for (i = 0; i < plan->space_chunk_count; i++)
+		cold_free(plan->space_chunks[i]);
+	if (plan->space_chunks != NULL)
+		cold_free(plan->space_chunks);
+	cold_plan_space_release(plan);
+	if (plan->space_inputs != NULL)
+		cold_free(plan->space_inputs);
+	if (plan->space_relation_start != NULL)
+		cold_free(plan->space_relation_start);
 	for (i = 0; i < plan->record_chunk_count; i++)
 		cold_free(plan->record_chunks[i]);
 	if (plan->record_chunks != NULL)
