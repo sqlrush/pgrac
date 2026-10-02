@@ -3250,8 +3250,9 @@ cluster_typed_replay_next(void *arg, uint32 participant, ClusterColdReplayRecord
  * prepared-transaction and unowned side record after native redo, so what
  * reaches here is the founder's own record (native owner), another
  * generation's rebuildable FSM-only page record or relation file creation,
- * or a SPACE reservation advance, which the SPACE owner installs later
- * (never replayed natively); anything else means pass 1 saw other input.
+ * or a SPACE change the SPACE owner installs later or the SPACE pages on disk
+ * already cover (never replayed natively); anything else means pass 1 saw
+ * other input (cluster_cold_unscheduled_v1).
  */
 static bool
 cluster_typed_replay_unscheduled(void *arg, uint32 participant)
@@ -3264,24 +3265,22 @@ cluster_typed_replay_unscheduled(void *arg, uint32 participant)
 
 	if (cluster_cold_recovery_decode_v1(r, typed->system_identifier,
 										source->claim.identity.storage_uuid, false, !is_own,
-										&rep->decoded) != CLUSTER_COLD_OK ||
-		rep->decoded.record.component_count != 0)
+										&rep->decoded) != CLUSTER_COLD_OK)
 		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
-									  "an unscheduled record carries page versions");
-	if ((rep->decoded.record.record_flags &
-		 (CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_UNSUPPORTED |
-		  CLUSTER_COLD_RECORD_SIDE_UNOWNED)) != 0)
-		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
-									  "a record pass 1 would have refused reached replay");
-	if (rep->decoded.record.space_count > 0)
+									  "an unscheduled record no longer decodes");
+	switch (cluster_cold_unscheduled_v1(&rep->decoded.record))
 	{
-		if (rep->decoded.record.space_count != 1 ||
-			rep->decoded.space_ops[0].kind != CLUSTER_COLD_SPACE_ADVANCE)
+		case CLUSTER_COLD_UNSCHEDULED_REFUSE:
 			cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
-										  "a SPACE step reached replay unscheduled");
-		if (is_own)
-			AdvanceNextFullTransactionIdPastXid(r->record->header.xl_xid);
-		return true;
+										  "a record pass 1 would have refused or scheduled "
+										  "reached replay unscheduled");
+			break;
+		case CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP:
+			if (is_own)
+				AdvanceNextFullTransactionIdPastXid(r->record->header.xl_xid);
+			return true;
+		case CLUSTER_COLD_UNSCHEDULED_NATIVE:
+			break;
 	}
 	if (!is_own)
 		cluster_typed_replay_foreign_gate(rep);

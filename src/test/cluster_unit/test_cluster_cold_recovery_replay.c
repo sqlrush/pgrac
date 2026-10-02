@@ -608,6 +608,50 @@ UT_TEST(test_skipped_own_record_advances_next_xid)
 	UT_ASSERT_EQ(cluster_cold_page_action_v1(&step, true), CLUSTER_COLD_SPACE_STEP);
 }
 
+/*
+ * A record without a scheduled step: native redo, unless it carries SPACE
+ * effects (installed by the SPACE owner, or covered by the SPACE pages on
+ * disk, so never replayed natively); page versions, refused flags and a
+ * commit's drops (always a step) mean pass 1 saw other input.
+ */
+UT_TEST(test_unscheduled_record_handling)
+{
+	ClusterColdRecordV1 record;
+	ClusterColdComponentV1 c = component(0, 1, 2, false);
+	ClusterColdSpaceOpV1 ops[2];
+	uint8 kinds[3]
+		= { CLUSTER_COLD_SPACE_CREATE, CLUSTER_COLD_SPACE_TRUNCATE, CLUSTER_COLD_SPACE_ADVANCE };
+	int i;
+
+	memset(&record, 0, sizeof(record));
+	memset(ops, 0, sizeof(ops));
+	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_NATIVE);
+	record.space_count = 1;
+	record.space_ops = ops;
+	for (i = 0; i < 3; i++) {
+		ops[0].kind = kinds[i];
+		UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP);
+	}
+	ops[0].kind = CLUSTER_COLD_SPACE_ADVANCE;
+	ops[1].kind = CLUSTER_COLD_SPACE_DROP;
+	record.space_count = 2;
+	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
+	record.space_count = 0;
+	record.space_ops = NULL;
+	record.component_count = 1;
+	record.components = &c;
+	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
+	record.component_count = 0;
+	record.components = NULL;
+	record.record_flags = CLUSTER_COLD_RECORD_SIDE_UNOWNED;
+	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
+	record.record_flags = CLUSTER_COLD_RECORD_STRUCTURAL;
+	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
+	record.record_flags = CLUSTER_COLD_RECORD_UNSUPPORTED;
+	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
+	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(NULL), CLUSTER_COLD_UNSCHEDULED_REFUSE);
+}
+
 int
 main(void)
 {
@@ -617,6 +661,7 @@ main(void)
 	UT_RUN(test_replay_drain_proves_the_cut);
 	UT_RUN(test_replay_callback_refusal_stops);
 	UT_RUN(test_replay_space_steps_and_final_installs);
+	UT_RUN(test_unscheduled_record_handling);
 	UT_RUN(test_replay_argument_checks);
 	UT_RUN(test_skipped_own_record_advances_next_xid);
 	UT_DONE();

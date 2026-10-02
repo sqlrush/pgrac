@@ -352,6 +352,20 @@ typedef enum ClusterColdPageActionV1 {
 extern ClusterColdPageActionV1 cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own);
 
 /*
+ * Pass-2 handling of a decoded record without a scheduled step.  SPACE
+ * effects are never replayed natively: the SPACE owner installs them, or the
+ * SPACE pages on disk already cover them.  Page versions, refused flags or a
+ * commit's drops (always a step) mean pass 1 saw other input.
+ */
+typedef enum ClusterColdUnscheduledV1 {
+	CLUSTER_COLD_UNSCHEDULED_NATIVE = 0,
+	CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP = 1,
+	CLUSTER_COLD_UNSCHEDULED_REFUSE = 2
+} ClusterColdUnscheduledV1;
+
+extern ClusterColdUnscheduledV1 cluster_cold_unscheduled_v1(const ClusterColdRecordV1 *record);
+
+/*
  * Pass-2 sequencer.  Drives every participant's reader through the sealed
  * schedule: records before a scheduled page record replay as unscheduled
  * records in stream order; the scheduled record must carry its pass-1
