@@ -506,6 +506,11 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 				|| ((record->record_flags & CLUSTER_COLD_RECORD_STRUCTURAL) != 0
 					&& record->end_rec_ptr > owner->cut.native_redo)))
 			detail = CLUSTER_COLD_STRUCTURAL_UNSUPPORTED;
+		/* A side effect without a cold owner is never replayed as a no-op. */
+		if (detail == CLUSTER_COLD_OK
+			&& (record->record_flags & CLUSTER_COLD_RECORD_SIDE_UNOWNED) != 0
+			&& record->end_rec_ptr > owner->cut.native_redo)
+			detail = CLUSTER_COLD_SIDE_OWNER_MISSING;
 		if (detail == CLUSTER_COLD_OK)
 			detail = components_validate(plan, record);
 		if (detail == CLUSTER_COLD_OK && record->component_count != 0)

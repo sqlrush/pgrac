@@ -165,10 +165,12 @@ cluster_recovery_merge_fence_plan_origin(const ClusterRecoveryFencePlan *plan, u
 
 /* Each participant contributes its native-redo checkpoint record and one
  * page record on page (100, thread). */
+static bool scan_foreign[NROOTS + 1];
+
 ClusterColdDetailV1
 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 						  const ClusterControlRootSnapshot *root,
-						  const ClusterControlRootReadToken *token, bool space_active,
+						  const ClusterControlRootReadToken *token, bool space_active, bool foreign,
 						  ClusterColdScanResultV1 *result)
 {
 	uint16 thread = root->identity.origin_thread_id;
@@ -178,6 +180,7 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 
 	(void)token;
 	(void)space_active;
+	scan_foreign[thread] = foreign;
 	memset(result, 0, sizeof(*result));
 	if (scan_result[thread] != CLUSTER_COLD_OK) {
 		result->failed_read_rec_ptr = 0x1234;
@@ -295,6 +298,8 @@ UT_TEST(test_prepare_seals_own_and_fenced_generations)
 	UT_ASSERT_EQ(typed->scanned_records, 6);
 	UT_ASSERT_EQ(typed->observer.pages_observed, 3);
 	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(typed->plan), 3);
+	UT_ASSERT(!scan_foreign[1]);
+	UT_ASSERT(scan_foreign[2] && scan_foreign[3]);
 	cluster_cold_typed_destroy_v1(&typed);
 	UT_ASSERT_NULL(typed);
 	UT_ASSERT_EQ(contexts_alive, 0);
@@ -418,16 +423,105 @@ UT_TEST(test_redo_block_decisions)
 	UT_ASSERT_EQ(out.action, CLUSTER_COLD_REDO_NATIVE);
 }
 
+/* Shared mode takes only the typed path; everything else keeps native
+ * single-stream recovery (the unshared multi-generation case is refused
+ * earlier, by the merge preflight). */
+UT_TEST(test_route_shared_cold_merge_only_typed)
+{
+	UT_ASSERT_EQ(cluster_cold_route_v1(true, true), CLUSTER_COLD_ROUTE_TYPED);
+	UT_ASSERT_EQ(cluster_cold_route_v1(true, false), CLUSTER_COLD_ROUTE_NATIVE);
+	UT_ASSERT_EQ(cluster_cold_route_v1(false, false), CLUSTER_COLD_ROUTE_NATIVE);
+	UT_ASSERT_EQ(cluster_cold_route_v1(false, true), CLUSTER_COLD_ROUTE_REFUSE);
+}
+
+static ClusterColdTypedV1 *
+sealed_with_steps(bool all_skip)
+{
+	fixture();
+	data_token = all_skip ? 6 : 5;
+	return prepare(0x800);
+}
+
+/* Pass 2 may start only with every consumer wired, and never applies a page
+ * record without the per-block redo consultation. */
+UT_TEST(test_ready_requires_every_consumer_before_ir)
+{
+	ClusterColdHandshakeV1 none = { false, false, false, false };
+	ClusterColdHandshakeV1 all = { true, true, true, true };
+	ClusterColdHandshakeV1 no_hook = { false, true, true, true };
+	ClusterColdHandshakeV1 no_side = { true, true, false, true };
+	ClusterColdTypedV1 *typed = sealed_with_steps(false);
+	char reason[256];
+
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT(!cluster_cold_typed_ready_v1(typed, &none, reason, sizeof(reason)));
+	UT_ASSERT(strstr(reason, "redo-block consultation") != NULL);
+	UT_ASSERT(strstr(reason, "participant census") != NULL);
+	UT_ASSERT(strstr(reason, "side owners") != NULL);
+	UT_ASSERT(strstr(reason, "completion publication") != NULL);
+	UT_ASSERT(!cluster_cold_typed_ready_v1(typed, &no_hook, reason, sizeof(reason)));
+	UT_ASSERT(strstr(reason, "3 page records need") != NULL);
+	UT_ASSERT(!cluster_cold_typed_ready_v1(typed, &no_side, reason, sizeof(reason)));
+	UT_ASSERT(cluster_cold_typed_ready_v1(typed, &all, reason, sizeof(reason)));
+	cluster_cold_typed_destroy_v1(&typed);
+
+	/* Fully skipped records need no hook, yet the other consumers remain. */
+	typed = sealed_with_steps(true);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT(!cluster_cold_typed_ready_v1(typed, &no_hook, reason, sizeof(reason)));
+	UT_ASSERT(strstr(reason, "page records need") == NULL);
+	UT_ASSERT(cluster_cold_typed_ready_v1(typed, &all, reason, sizeof(reason)));
+	UT_ASSERT(!cluster_cold_typed_ready_v1(NULL, &all, reason, sizeof(reason)));
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
+/* A skipped record of the founder's own thread still moves nextXid past its
+ * xid, as replaying it would have; another generation's xid is not ours. */
+UT_TEST(test_skipped_own_record_advances_next_xid)
+{
+	ClusterColdStepV1 step;
+
+	memset(&step, 0, sizeof(step));
+	step.all_skip = true;
+	UT_ASSERT_EQ(cluster_cold_page_action_v1(&step, true), CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID);
+	UT_ASSERT_EQ(cluster_cold_page_action_v1(&step, false), CLUSTER_COLD_PAGE_SKIP);
+	step.all_skip = false;
+	UT_ASSERT_EQ(cluster_cold_page_action_v1(&step, true), CLUSTER_COLD_PAGE_APPLY);
+	UT_ASSERT_EQ(cluster_cold_page_action_v1(&step, false), CLUSTER_COLD_PAGE_APPLY);
+}
+
+/* PRE2: a cold crash that needs several threads merged is refused outside
+ * the shared profile, before any fence, claim or replay; single-stream and
+ * warm decisions pass through unchanged. */
+UT_TEST(test_unshared_multi_thread_cold_merge_refused)
+{
+	UT_ASSERT_EQ(cluster_recovery_merge_profile_gate(CLUSTER_MERGE_ENGAGE, false),
+				 CLUSTER_MERGE_REFUSE_UNSHARED);
+	UT_ASSERT_EQ(cluster_recovery_merge_profile_gate(CLUSTER_MERGE_ENGAGE, true),
+				 CLUSTER_MERGE_ENGAGE);
+	UT_ASSERT_EQ(cluster_recovery_merge_profile_gate(CLUSTER_MERGE_NO_NO_CANDIDATES, false),
+				 CLUSTER_MERGE_NO_NO_CANDIDATES);
+	UT_ASSERT_EQ(cluster_recovery_merge_profile_gate(CLUSTER_MERGE_NO_DISABLED, false),
+				 CLUSTER_MERGE_NO_DISABLED);
+	UT_ASSERT_EQ(cluster_recovery_merge_profile_gate(CLUSTER_MERGE_NO_NOT_COLD, false),
+				 CLUSTER_MERGE_NO_NOT_COLD);
+	UT_ASSERT_EQ(cluster_cold_route_v1(false, false), CLUSTER_COLD_ROUTE_NATIVE);
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(10);
 	UT_RUN(test_prepare_seals_own_and_fenced_generations);
 	UT_RUN(test_prepare_refuses_unsealed_own_generation);
 	UT_RUN(test_prepare_refuses_restart_redo_mismatch);
 	UT_RUN(test_prepare_refuses_unproven_origin_source);
 	UT_RUN(test_prepare_reports_scan_and_seal_refusals);
 	UT_RUN(test_redo_block_decisions);
+	UT_RUN(test_route_shared_cold_merge_only_typed);
+	UT_RUN(test_ready_requires_every_consumer_before_ir);
+	UT_RUN(test_skipped_own_record_advances_next_xid);
+	UT_RUN(test_unshared_multi_thread_cold_merge_refused);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -81,6 +81,7 @@ cold_detail_name(ClusterColdDetailV1 detail)
 		"state",
 		"lifecycle record unsupported",
 		"opcode unsupported",
+		"side owner missing",
 	};
 
 	return (int)detail >= 0 && (Size)detail < lengthof(names) ? names[detail] : "unknown";
@@ -222,7 +223,7 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots)
 		ClusterColdScanResultV1 scan;
 
 		detail = cluster_cold_scan_root_v1(typed->plan, i, &roots[i].root, &roots[i].token, false,
-										   &scan);
+										   i != typed->own_participant, &scan);
 		typed->scanned_records += scan.records;
 		if (detail != CLUSTER_COLD_OK) {
 			cold_refuse(typed, detail,
@@ -300,6 +301,76 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
 	if (typed->plan != NULL)
 		cluster_cold_plan_destroy_v1(&typed->plan);
 	MemoryContextDelete(typed->context);
+}
+
+ClusterColdRouteV1
+cluster_cold_route_v1(bool shared_config, bool merge_engaged)
+{
+	if (!merge_engaged)
+		return CLUSTER_COLD_ROUTE_NATIVE;
+	return shared_config ? CLUSTER_COLD_ROUTE_TYPED : CLUSTER_COLD_ROUTE_REFUSE;
+}
+
+static void
+cold_reason_append(char *reason, Size reason_size, const char *text)
+{
+	Size used = strlen(reason);
+
+	(void)snprintf(reason + used, reason_size - used, "%s%s", used > 0 ? "; " : "", text);
+}
+
+bool
+cluster_cold_typed_ready_v1(const ClusterColdTypedV1 *typed,
+							const ClusterColdHandshakeV1 *handshake, char *reason, Size reason_size)
+{
+	uint32 steps;
+	uint32 applied = 0;
+	uint32 i;
+
+	if (reason == NULL || reason_size == 0)
+		return false;
+	reason[0] = '\0';
+	if (typed == NULL || handshake == NULL || typed->refusal != CLUSTER_COLD_OK
+		|| typed->plan == NULL) {
+		cold_reason_append(reason, reason_size, "no sealed typed cold plan");
+		return false;
+	}
+	if (!handshake->redo_block_hook)
+		cold_reason_append(reason, reason_size, "no typed redo-block consultation (R-A2)");
+	if (!handshake->participant_census)
+		cold_reason_append(reason, reason_size, "no complete participant census (R-A4)");
+	if (!handshake->side_owners)
+		cold_reason_append(reason, reason_size,
+						   "no typed side owners or XID/OID/MX/SCN bound merge (R-A5)");
+	if (!handshake->completion_publish)
+		cold_reason_append(reason, reason_size, "no recovery completion publication (R-A7)");
+	steps = cluster_cold_plan_step_count_v1(typed->plan);
+	for (i = 0; i < steps; i++) {
+		ClusterColdStepV1 step;
+
+		if (!cluster_cold_plan_step_v1(typed->plan, i, &step)) {
+			cold_reason_append(reason, reason_size, "unusable plan step");
+			return false;
+		}
+		if (!step.all_skip)
+			applied++;
+	}
+	if (applied > 0 && !handshake->redo_block_hook) {
+		char text[96];
+
+		(void)snprintf(text, sizeof(text), "%u page records need the redo-block consultation",
+					   applied);
+		cold_reason_append(reason, reason_size, text);
+	}
+	return reason[0] == '\0';
+}
+
+ClusterColdPageActionV1
+cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own)
+{
+	if (step == NULL || !step->all_skip)
+		return CLUSTER_COLD_PAGE_APPLY;
+	return own ? CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID : CLUSTER_COLD_PAGE_SKIP;
 }
 
 /* Pass-2 verdicts of the one record being applied, startup process only. */

@@ -4,12 +4,14 @@
  *	  Map decoded native WAL records to typed cold replay plan input.
  *
  *	  Classification uses the same closed route registry and detached page
- *	  preflight as online thread recovery, so cold and online replay consume
- *	  one opcode table.  The cold owner policy accepts typed side records and
- *	  rebuildable FSM components, and refuses routed side components inside
- *	  page records until their typed cold owner exists.  Relation lifecycle
- *	  and prepared-transaction records are flagged for the plan, which judges
- *	  them against each generation's native redo start.
+ *	  preflight as online thread recovery: one opcode table and one page
+ *	  component codec.  The cold owner policy is narrower than online
+ *	  recovery's typed side consumers: page records route to the plan, the
+ *	  founder's own non-page records keep their native redo owner, and
+ *	  another generation's non-page records, relation lifecycle and prepared-
+ *	  transaction records are flagged so the plan refuses them after the
+ *	  native redo start.  Routed side components inside page records are
+ *	  refused until their typed cold owner exists.
  *
  *	  Read-only: no buffers, storage, locks or authority.
  *
@@ -138,6 +140,9 @@ cold_record_flags(XLogReaderState *reader, uint8 *flags)
 	case RM_TBLSPC_ID:
 	case RM_RELMAP_ID:
 	case RM_REPLORIGIN_ID:
+	case RM_CLUSTER_XID_STRIPE_ID:
+		/* Stripe JOIN/RETIRE are cluster-wide facts whose order across
+		 * generations a per-participant drain cannot keep. */
 		*flags = CLUSTER_COLD_RECORD_STRUCTURAL;
 		return CLUSTER_COLD_OK;
 	default:
@@ -193,7 +198,7 @@ cold_map_components(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 
 ClusterColdDetailV1
 cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_identifier,
-								const uint8 storage_uuid[16], bool space_active,
+								const uint8 storage_uuid[16], bool space_active, bool foreign,
 								ClusterColdDecodedV1 *out)
 {
 	RfDetachedOwnerOpsV1 owner_ops;
@@ -230,6 +235,10 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 	detail = cold_record_flags(reader, &out->record.record_flags);
 	if (detail != CLUSTER_COLD_OK)
 		return detail;
+	/* Another generation's non-page effects (outcomes, checkpoints, counters,
+	 * undo, SLRU) have no typed cold owner yet; never a silent no-op. */
+	if (foreign && plan.route.record_owner != RF_ROUTE_OWNER_PAGE_CODEC)
+		out->record.record_flags |= CLUSTER_COLD_RECORD_SIDE_UNOWNED;
 	return cold_map_components(reader, &plan, system_identifier, storage_uuid, out);
 }
 

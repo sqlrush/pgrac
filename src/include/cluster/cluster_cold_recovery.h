@@ -76,7 +76,8 @@ typedef enum ClusterColdDetailV1 {
 	CLUSTER_COLD_OOM = 15,
 	CLUSTER_COLD_STATE = 16,				  /* wrong phase or already failed */
 	CLUSTER_COLD_STRUCTURAL_UNSUPPORTED = 17, /* lifecycle record needs its owner */
-	CLUSTER_COLD_OPCODE_UNSUPPORTED = 18	  /* outside the closed route registry */
+	CLUSTER_COLD_OPCODE_UNSUPPORTED = 18,	  /* outside the closed route registry */
+	CLUSTER_COLD_SIDE_OWNER_MISSING = 19	  /* side effect without a cold owner */
 } ClusterColdDetailV1;
 
 /* Exact physical cut of one writer generation, all from one ROOT token. */
@@ -110,10 +111,15 @@ typedef struct ClusterColdComponentV1 {
  * typed owner; it is refused after the native redo start and accepted as
  * already-durable history before it.  UNSUPPORTED marks input outside the
  * supported profile (prepared transactions) and is refused anywhere.
+ * SIDE_UNOWNED marks a non-page effect of another generation for which no
+ * typed cold owner exists yet (transaction outcomes, checkpoints, XID/OID/MX
+ * counters, undo, SLRU); like STRUCTURAL it is refused after native redo and
+ * is never replayed as a no-op.
  */
 #define CLUSTER_COLD_RECORD_STRUCTURAL UINT8_C(0x01)
 #define CLUSTER_COLD_RECORD_UNSUPPORTED UINT8_C(0x02)
-#define CLUSTER_COLD_RECORD_KNOWN_FLAGS UINT8_C(0x03)
+#define CLUSTER_COLD_RECORD_SIDE_UNOWNED UINT8_C(0x04)
+#define CLUSTER_COLD_RECORD_KNOWN_FLAGS UINT8_C(0x07)
 
 /* Every decoded record of a participant is fed, in its LSN order.  Records
  * without ordinary page components only advance the participant cursor. */
@@ -249,12 +255,13 @@ typedef struct ClusterColdDecodedV1 {
 } ClusterColdDecodedV1;
 
 /* Classify one decoded record of the exact source namespace.  Unsupported
- * opcodes and routed side components fail with OPCODE_UNSUPPORTED; lifecycle
- * and prepared-transaction records are flagged for the plan to judge. */
+ * opcodes and routed side components fail with OPCODE_UNSUPPORTED; lifecycle,
+ * prepared-transaction and (for another generation, `foreign`) unowned side
+ * records are flagged for the plan to judge. */
 extern ClusterColdDetailV1 cluster_cold_recovery_decode_v1(struct XLogReaderState *reader,
 														   uint64 system_identifier,
 														   const uint8 storage_uuid[16],
-														   bool space_active,
+														   bool space_active, bool foreign,
 														   ClusterColdDecodedV1 *out);
 
 /*
@@ -302,7 +309,7 @@ typedef struct ClusterColdScanResultV1 {
 extern ClusterColdDetailV1 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 													 const ClusterControlRootSnapshot *root,
 													 const ClusterControlRootReadToken *token,
-													 bool space_active,
+													 bool space_active, bool foreign,
 													 ClusterColdScanResultV1 *result);
 
 /*
@@ -330,6 +337,51 @@ typedef struct ClusterColdTypedV1 {
 extern ClusterColdTypedV1 *cluster_cold_typed_prepare_v1(struct ClusterRecoveryFencePlan *fence,
 														 uint16 own_thread, XLogRecPtr own_redo);
 extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
+
+/*
+ * Cold crash route.  The shared profile recovers an engaged multi-generation
+ * cold crash only through the typed plan; the unshared profile refuses it
+ * (the merge preflight already does so before any fence or claim action);
+ * everything else keeps native single-stream recovery.
+ */
+typedef enum ClusterColdRouteV1 {
+	CLUSTER_COLD_ROUTE_NATIVE = 0,
+	CLUSTER_COLD_ROUTE_TYPED = 1,
+	CLUSTER_COLD_ROUTE_REFUSE = 2
+} ClusterColdRouteV1;
+
+extern ClusterColdRouteV1 cluster_cold_route_v1(bool shared_config, bool merge_engaged);
+
+/*
+ * Consumers pass 2 needs from their owners: the per-block redo consultation
+ * (R-A2), the complete participant census (R-A4), typed owners for other
+ * generations' non-page effects and the XID/OID/MX/SCN bounds (R-A5), and
+ * recovery completion publication (R-A7).  Each flag is set only once the
+ * cold driver calls that consumer.
+ */
+typedef struct ClusterColdHandshakeV1 {
+	bool redo_block_hook;
+	bool participant_census;
+	bool side_owners;
+	bool completion_publish;
+} ClusterColdHandshakeV1;
+
+/* True only when every consumer exists; with no redo consultation, any page
+ * record that must be applied also refuses.  Decided after pass 1, before
+ * the serial set is taken, so a refusal mutates nothing. */
+extern bool cluster_cold_typed_ready_v1(const ClusterColdTypedV1 *typed,
+										const ClusterColdHandshakeV1 *handshake, char *reason,
+										Size reason_size);
+
+/* Pass-2 action for one scheduled page record.  A fully skipped record of
+ * the founder's own thread still advances nextXid past its xid. */
+typedef enum ClusterColdPageActionV1 {
+	CLUSTER_COLD_PAGE_APPLY = 0,
+	CLUSTER_COLD_PAGE_SKIP = 1,
+	CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID = 2
+} ClusterColdPageActionV1;
+
+extern ClusterColdPageActionV1 cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own);
 
 /*
  * Per-block decision consumed by the typed cold redo consultation in

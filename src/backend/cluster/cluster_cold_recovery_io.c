@@ -228,6 +228,7 @@ typedef struct ColdScanWork {
 	uint64 system_identifier;
 	uint8 storage_uuid[16];
 	bool space_active;
+	bool foreign;
 	ClusterColdDetailV1 detail;
 	ClusterColdScanResultV1 *result;
 	ClusterColdDecodedV1 decoded;
@@ -239,8 +240,9 @@ cold_scan_visit(XLogReaderState *reader, void *arg)
 	ColdScanWork *work = (ColdScanWork *)arg;
 
 	CHECK_FOR_INTERRUPTS();
-	work->detail = cluster_cold_recovery_decode_v1(
-		reader, work->system_identifier, work->storage_uuid, work->space_active, &work->decoded);
+	work->detail
+		= cluster_cold_recovery_decode_v1(reader, work->system_identifier, work->storage_uuid,
+										  work->space_active, work->foreign, &work->decoded);
 	if (work->detail == CLUSTER_COLD_OK)
 		work->detail
 			= cluster_cold_plan_feed_v1(work->plan, work->participant, &work->decoded.record);
@@ -256,7 +258,7 @@ cold_scan_visit(XLogReaderState *reader, void *arg)
 ClusterColdDetailV1
 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 						  const ClusterControlRootSnapshot *root,
-						  const ClusterControlRootReadToken *token, bool space_active,
+						  const ClusterControlRootReadToken *token, bool space_active, bool foreign,
 						  ClusterColdScanResultV1 *result)
 {
 	ColdScanWork *work;
@@ -275,6 +277,7 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	work->system_identifier = root->identity.system_identifier;
 	memcpy(work->storage_uuid, root->identity.storage_uuid, 16);
 	work->space_active = space_active;
+	work->foreign = foreign;
 	work->detail = CLUSTER_COLD_OK;
 	work->result = result;
 	visit = cluster_control_root_recovery_visit(root, token, cold_scan_visit, work, &observed);

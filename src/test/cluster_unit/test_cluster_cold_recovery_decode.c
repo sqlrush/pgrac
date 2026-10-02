@@ -168,7 +168,7 @@ UT_TEST(test_page_record_maps_ordinary_components)
 				   RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE);
 	plan_component(1, RF_DETACHED_COMPONENT_PAGE_CODEC, RF_PAGE_CLASS_ORDINARY, 5, 9, 0);
 	plan_component(2, RF_DETACHED_COMPONENT_REBUILDABLE, RF_PAGE_CLASS_REBUILDABLE_FSM, 0, 9, 0);
-	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, &out),
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.read_rec_ptr, 0x1000);
 	UT_ASSERT_EQ(out.record.end_rec_ptr, 0x1080);
@@ -202,11 +202,11 @@ UT_TEST(test_registry_refusal_is_opcode_unsupported)
 
 	fake_record(&record, RM_HEAP_ID, 0x20, 1);
 	preflight_result = RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED;
-	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, &out),
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_OPCODE_UNSUPPORTED);
 	UT_ASSERT_EQ(out.route_detail, RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED);
 	preflight_result = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, &out),
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_OPCODE_UNSUPPORTED);
 	UT_ASSERT_EQ(out.route_detail, RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
 }
@@ -223,7 +223,7 @@ UT_TEST(test_cold_owner_policy)
 	DecodedBkpBlock block = { 0 };
 
 	fake_record(&record, RM_XACT_ID, XLOG_XACT_COMMIT, 0);
-	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, &out),
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_OK);
 	side.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
 	noop.record_owner = RF_ROUTE_OWNER_LOGICAL_NOOP;
@@ -254,26 +254,26 @@ UT_TEST(test_transaction_lifecycle_classification)
 	int i;
 
 	fake_record(&record, RM_XACT_ID, XLOG_XACT_COMMIT, 0);
-	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, &out),
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, 0);
 	commit_nrels = 1;
-	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, &out),
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_STRUCTURAL);
 	commit_parse_ok = false;
-	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, &out),
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_COMPONENT_INVALID);
 
 	fake_record(&record, RM_XACT_ID, XLOG_XACT_ABORT, 0);
 	abort_nrels = 2;
-	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, &out),
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_STRUCTURAL);
 
 	for (i = 0; i < 3; i++) {
 		fake_record(&record, RM_XACT_ID, prepared[i], 0);
-		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, &out),
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 					 CLUSTER_COLD_OK);
 		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_UNSUPPORTED);
 	}
@@ -296,13 +296,15 @@ UT_TEST(test_storage_lifecycle_classification)
 				  { RM_RELMAP_ID, 0x00, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_REPLORIGIN_ID, 0x00, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_HEAP2_ID, XLOG_HEAP2_REWRITE, CLUSTER_COLD_RECORD_STRUCTURAL },
+				  { RM_CLUSTER_XID_STRIPE_ID, 0x00, CLUSTER_COLD_RECORD_STRUCTURAL },
+				  { RM_CLUSTER_XID_STRIPE_ID, 0x10, CLUSTER_COLD_RECORD_STRUCTURAL },
 				  { RM_XLOG_ID, 0x30, 0 },
 				  { RM_STANDBY_ID, 0x10, 0 } };
 	Size i;
 
 	for (i = 0; i < lengthof(cases); i++) {
 		fake_record(&record, cases[i].rmid, cases[i].info, 0);
-		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, &out),
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 					 CLUSTER_COLD_OK);
 		if (out.record.record_flags != cases[i].flags)
 			printf("# case %zu rmid %u info 0x%02x flags %u\n", i, cases[i].rmid, cases[i].info,
@@ -319,28 +321,66 @@ UT_TEST(test_malformed_plan_refused)
 	fake_record(&record, RM_HEAP_ID, 0x20, 1);
 	plan_component(0, RF_DETACHED_COMPONENT_PAGE_CODEC, RF_PAGE_CLASS_ORDINARY, 4, 9, 0);
 	preflight_plan.components[0].block_id = 3;
-	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, &out),
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_COMPONENT_INVALID);
 	fake_record(&record, RM_HEAP_ID, 0x20, 1);
 	plan_component(0, RF_DETACHED_COMPONENT_SIDE_TYPED, RF_PAGE_CLASS_ROUTED_SIDE, 0, 9, 0);
-	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, &out),
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_OPCODE_UNSUPPORTED);
-	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(NULL, 99, UUID, true, &out),
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(NULL, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_INVALID_ARGUMENT);
-	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, NULL),
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, NULL),
 				 CLUSTER_COLD_INVALID_ARGUMENT);
+}
+
+/* A foreign record that is not a page record has no cold owner yet; it is
+ * flagged so the plan refuses it after the native redo start.  The founder's
+ * own records keep their native owner. */
+UT_TEST(test_foreign_side_records_have_no_cold_owner)
+{
+	FakeRecord record;
+	ClusterColdDecodedV1 out;
+
+	fake_record(&record, RM_XLOG_ID, 0x10, 0); /* CHECKPOINT_ONLINE */
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, 0);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+
+	fake_record(&record, RM_LOGICALMSG_ID, 0x00, 0);
+	preflight_plan.route.record_owner = RF_ROUTE_OWNER_LOGICAL_NOOP;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+
+	fake_record(&record, RM_XACT_ID, XLOG_XACT_COMMIT, 0);
+	commit_nrels = 1;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags,
+				 CLUSTER_COLD_RECORD_STRUCTURAL | CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+
+	fake_record(&record, RM_HEAP_ID, 0x20, 1);
+	plan_component(0, RF_DETACHED_COMPONENT_PAGE_CODEC, RF_PAGE_CLASS_ORDINARY, 4, 9, 0);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, 0);
+	UT_ASSERT_EQ(out.record.component_count, 1);
 }
 
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_page_record_maps_ordinary_components);
 	UT_RUN(test_registry_refusal_is_opcode_unsupported);
 	UT_RUN(test_cold_owner_policy);
 	UT_RUN(test_transaction_lifecycle_classification);
 	UT_RUN(test_storage_lifecycle_classification);
 	UT_RUN(test_malformed_plan_refused);
+	UT_RUN(test_foreign_side_records_have_no_cold_owner);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
