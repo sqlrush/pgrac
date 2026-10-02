@@ -35,6 +35,12 @@ typedef struct ClusterWalInputsV1 ClusterWalInputsV1;
 extern ClusterControlRootResult cluster_wal_inputs_suspend_v1(ClusterWalInputsV1 *inputs);
 extern ClusterControlRootResult cluster_wal_inputs_resume_v1(ClusterWalInputsV1 *inputs);
 
+/* Abandon a failed proof permanently and release all WAL pins/remote requests.
+ * Only compare its original ROOT to schedule a retry: OK means keep waiting;
+ * STALE_TOKEN means discard this object and begin a fresh scope. This works
+ * on a stale scope, but never restores it or grants access to its sources. */
+extern ClusterControlRootResult cluster_wal_inputs_wait_failed_v1(ClusterWalInputsV1 *inputs);
+
 /* Native background worker, bgwriter or checkpointer I/O context only;
  * never LMON/LMS dispatch. CF and WALR use their existing native owners.
  * Read all present origins, including non-serving/current/history/terminal

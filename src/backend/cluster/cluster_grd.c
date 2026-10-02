@@ -947,6 +947,7 @@ cluster_grd_shmem_init(void)
 		SpinLockInit(&cluster_grd_state->pi_rebuild_lock);
 		pg_atomic_init_u64(&cluster_grd_state->pi_rebuild_side_blocked_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->pi_rebuild_apply_blocked_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->pi_rebuild_plan_blocked_count, 0);
 		memset(&cluster_grd_state->pi_rebuilt, 0, sizeof(cluster_grd_state->pi_rebuilt));
 		/* Shape A: off-path boot barrier starts UNDECIDED (fail-closed). */
 		pg_atomic_init_u32(&cluster_grd_state->offpath_boot_decided, 0);
@@ -2684,6 +2685,13 @@ cluster_grd_inc_pi_rebuild_apply_blocked(void)
 		pg_atomic_fetch_add_u64(&cluster_grd_state->pi_rebuild_apply_blocked_count, 1);
 }
 
+void
+cluster_grd_inc_pi_rebuild_plan_blocked(void)
+{
+	if (cluster_grd_state != NULL)
+		pg_atomic_fetch_add_u64(&cluster_grd_state->pi_rebuild_plan_blocked_count, 1);
+}
+
 bool
 cluster_grd_pi_rebuild_blocked_v1(BufferTag tag)
 {
@@ -2940,6 +2948,8 @@ cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out)
 		= pg_atomic_read_u64(&cluster_grd_state->pi_rebuild_side_blocked_count);
 	out->pi_rebuild_apply_blocked
 		= pg_atomic_read_u64(&cluster_grd_state->pi_rebuild_apply_blocked_count);
+	out->pi_rebuild_plan_blocked
+		= pg_atomic_read_u64(&cluster_grd_state->pi_rebuild_plan_blocked_count);
 }
 
 /*

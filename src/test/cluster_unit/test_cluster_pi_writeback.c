@@ -135,6 +135,8 @@ static bool rebuild_needed, rebuild_apply_ok = true, rebuild_drift, rebuild_root
 static uint32 rebuild_holders, rebuild_applies, rebuild_completions;
 static unsigned rebuild_side_blocked, rebuild_logs;
 static unsigned rebuild_apply_blocked, rebuild_fail_after = UINT32_MAX;
+static unsigned rebuild_plan_blocked;
+static RfPageProofDetailV1 rebuild_plan_failure;
 
 void
 cluster_grd_inc_pi_rebuild_side_blocked(void)
@@ -146,6 +148,12 @@ void
 cluster_grd_inc_pi_rebuild_apply_blocked(void)
 {
 	rebuild_apply_blocked++;
+}
+
+void
+cluster_grd_inc_pi_rebuild_plan_blocked(void)
+{
+	rebuild_plan_blocked++;
 }
 
 int
@@ -455,6 +463,12 @@ cluster_wal_inputs_resume_v1(ClusterWalInputsV1 *inputs)
 	return cluster_wal_inputs_revalidate_v1(inputs);
 }
 ClusterControlRootResult
+cluster_wal_inputs_wait_failed_v1(ClusterWalInputsV1 *inputs)
+{
+	wb_inputs_pinned[cluster_node_id] = false;
+	return wb_input_current ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+ClusterControlRootResult
 cluster_wal_inputs_contributions_v1(ClusterWalInputsV1 *inputs, bool space_active,
 									ClusterThreadRecoveryFabricPlanV1 **out, uint64 *records,
 									RfPageProofDetailV1 *detail)
@@ -466,6 +480,10 @@ cluster_wal_inputs_contributions_v1(ClusterWalInputsV1 *inputs, bool space_activ
 	if (wb_input_wait)
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
 	wb_plan_builds++;
+	if (rebuild_plan_failure != RF_PAGE_PROOF_DETAIL_OK) {
+		*detail = rebuild_plan_failure;
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	}
 	*out = (void *)wb_page_plan;
 	*records = 3;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -1069,6 +1087,8 @@ rebuild_setup(void)
 	rebuild_holders = rebuild_applies = rebuild_completions = 0;
 	rebuild_side_blocked = rebuild_logs = 0;
 	rebuild_apply_blocked = 0;
+	rebuild_plan_blocked = 0;
+	rebuild_plan_failure = RF_PAGE_PROOF_DETAIL_OK;
 	rebuild_fail_after = UINT32_MAX;
 	pi_rebuild_logged = false;
 	return data;
@@ -1245,6 +1265,58 @@ UT_TEST(retained_rebuild_apply_failure_retries_original_target_without_rescan)
 	}
 }
 
+UT_TEST(retained_rebuild_plan_failure_waits_for_changed_root_without_rescan)
+{
+	ClusterPageDataReceiptV1 *data = rebuild_setup();
+	rebuild_cut.epoch = 93;
+	rebuild_plan_failure = RF_PAGE_PROOF_DETAIL_CAPACITY;
+	for (unsigned tick = 0; tick < 4; tick++) {
+		UT_ASSERT(cluster_pi_rebuild_bgwriter_tick_v1());
+		UT_ASSERT_EQ(wb_plan_builds, 1);
+		UT_ASSERT_EQ(rebuild_plan_blocked, 1);
+		UT_ASSERT_EQ(rebuild_logs, 1);
+		UT_ASSERT_EQ(rebuild_completions, 0);
+		UT_ASSERT(!wb_inputs_pinned[0]);
+	}
+	/* A changed ROOT can shorten the retained window. Discard the failed
+	 * scope; a fresh scope, never the failed object, must rebuild it. */
+	wb_input_current = false;
+	UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+	UT_ASSERT(pi_rebuild_job == NULL);
+	wb_input_current = true;
+	rebuild_plan_failure = RF_PAGE_PROOF_DETAIL_OK;
+	UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+	UT_ASSERT_EQ(wb_plan_builds, 2);
+	UT_ASSERT_EQ(rebuild_completions, 1);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(retained_rebuild_progress_continues_without_bgwriter_delay)
+{
+	ClusterPageDataReceiptV1 *data = rebuild_setup();
+	wb_side_kind = RF_SIDE_ONLINE_OPERATION_XACT;
+	wb_side_mapped = wb_space_valid = true;
+	wb_space_count = 80;
+	wb_space_contribution.result = identity;
+	wb_space_contribution.page_mask = 3;
+	wb_space_contribution.result_token[0] = 53;
+	wb_space_contribution.result_token[1] = 41;
+	/* 2 is runnable work, distinct from a peer/capacity wait (1). */
+	UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(), CLUSTER_PI_REBUILD_MORE);
+	UT_ASSERT_EQ(rebuild_applies, 64);
+	UT_ASSERT(!wb_inputs_pinned[0]);
+	UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(), CLUSTER_PI_REBUILD_MORE);
+	UT_ASSERT_EQ(rebuild_applies, 128);
+	UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+	UT_ASSERT_EQ(rebuild_applies, 162);
+	UT_ASSERT_EQ(rebuild_completions, 1);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
 UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 {
 	ClusterPageDataReceiptV1 *data = rebuild_setup();
@@ -1277,7 +1349,7 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(21);
 	UT_RUN(remote_physical_ack_runs_actual_ancestry_and_disposal);
 	UT_RUN(writeback_codec_has_exact_bounded_authenticated_facts);
 	UT_RUN(writeback_rejects_foreign_sender_boot_and_changed_master_cut);
@@ -1296,6 +1368,8 @@ main(void)
 	UT_RUN(retained_rebuild_waits_unpinned_and_rejects_incomplete_or_changed_cut);
 	UT_RUN(retained_rebuild_root_change_or_apply_failure_never_completes);
 	UT_RUN(retained_rebuild_apply_failure_retries_original_target_without_rescan);
+	UT_RUN(retained_rebuild_plan_failure_waits_for_changed_root_without_rescan);
+	UT_RUN(retained_rebuild_progress_continues_without_bgwriter_delay);
 	UT_RUN(retained_rebuild_error_cleanup_and_postapply_root_check);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

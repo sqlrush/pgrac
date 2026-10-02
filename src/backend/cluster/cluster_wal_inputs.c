@@ -1027,6 +1027,42 @@ cluster_wal_inputs_suspend_v1(ClusterWalInputsV1 *inputs)
 }
 
 ClusterControlRootResult
+cluster_wal_inputs_wait_failed_v1(ClusterWalInputsV1 *inputs)
+{
+	WalInputsWork *work;
+	ClusterControlRootResult result;
+	if (!inputs_owned(inputs) || !inputs_io_role() || CritSectionCount != 0 || !cluster_enabled
+		|| !cluster_shared_config)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	/* Failure remains terminal even when the ROOT still matches. No WAL
+	 * or plan consumer can use the scope after this call. */
+	inputs->stale = true;
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	for (uint32 i = 0; i < CLUSTER_WAL_INPUTS_MAX; i++)
+		cluster_wal_cut_release_v1(&inputs->remote[i]);
+	if (inputs->pin != NULL
+		&& cluster_wal_read_pin_release_v1(&inputs->pin) != CLUSTER_WALR_RELEASE_CONFIRMED)
+		elog(FATAL, "could not release failed WAL input retention owner");
+	inputs->suspended = true;
+	work = palloc0(sizeof(*work));
+	PG_TRY();
+	{
+		result = inputs_root(inputs, work, false);
+		inputs_unlock(work);
+	}
+	PG_CATCH();
+	{
+		inputs_unlock(work);
+		pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	pfree(work);
+	return result;
+}
+
+ClusterControlRootResult
 cluster_wal_inputs_resume_v1(ClusterWalInputsV1 *inputs)
 {
 	ClusterWalPinResult pinned;

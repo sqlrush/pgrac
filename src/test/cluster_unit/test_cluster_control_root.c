@@ -20162,6 +20162,50 @@ UT_TEST(test_wal_inputs_pause_releases_all_pins_and_resume_checks_original_root)
 	}
 }
 
+UT_TEST(test_wal_inputs_failed_wait_observes_root_without_restoring_proof_or_pins)
+{
+	ClusterWalInputsV1 *inputs = inputs_contribution_fixture(0);
+	ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
+	const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, 1);
+	RfPageProofDetailV1 detail;
+	char path[MAXPGPATH];
+	uint64 records;
+	unsigned begins, flushes;
+	volatile bool caught = false;
+	v2_claim_path(&item->source.claim.identity, path);
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_NE(cluster_wal_inputs_contributions_v1(inputs, true, &plan, &records, &detail),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT(plan == NULL && inputs_pin_held && test_actual_cf == NoLock);
+	UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 0);
+	begins = inputs_native_begin_calls;
+	flushes = inputs_native_flush_calls;
+	for (unsigned tick = 0; tick < 3; tick++) {
+		UT_ASSERT_EQ(cluster_wal_inputs_wait_failed_v1(inputs), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(!inputs_pin_held && test_actual_cf == NoLock);
+		UT_ASSERT_EQ(cluster_wal_inputs_count_v1(inputs), 0);
+		UT_ASSERT_EQ(cluster_wal_inputs_resume_v1(inputs), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	}
+	UT_ASSERT_EQ(inputs_native_begin_calls, begins);
+	UT_ASSERT_EQ(inputs_native_flush_calls, flushes);
+	test_throw_root_read = true;
+	PG_TRY();
+	{
+		(void)cluster_wal_inputs_wait_failed_v1(inputs);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	test_throw_root_read = false;
+	UT_ASSERT(caught && !inputs_pin_held && test_actual_cf == NoLock);
+	v2_checkpoint_root_race();
+	UT_ASSERT_EQ(cluster_wal_inputs_wait_failed_v1(inputs), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT_EQ(cluster_wal_inputs_resume_v1(inputs), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	inputs_live_done(&inputs);
+}
+
 UT_TEST(test_wal_inputs_resume_error_releases_reacquired_native_owner)
 {
 	uint8 bytes[66048];
@@ -20589,8 +20633,9 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_WAL_INPUTS") != NULL) {
-		UT_PLAN(23);
+		UT_PLAN(24);
 		UT_RUN(test_wal_inputs_pause_releases_all_pins_and_resume_checks_original_root);
+		UT_RUN(test_wal_inputs_failed_wait_observes_root_without_restoring_proof_or_pins);
 		UT_RUN(test_wal_inputs_resume_error_releases_reacquired_native_owner);
 		UT_RUN(test_wal_inputs_claim_io_releases_cf_and_keeps_all_native_pins);
 		UT_RUN(test_wal_inputs_claim_io_race_and_error_never_publish_partial_scope);
@@ -20623,10 +20668,11 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(374);
+	UT_PLAN(375);
 	UT_RUN(test_runtime_v3_worker_done_requires_durable_canonical_completion);
 	UT_RUN(test_runtime_v3_worker_finalization_error_releases_post_ir_pin);
 	UT_RUN(test_wal_inputs_pause_releases_all_pins_and_resume_checks_original_root);
+	UT_RUN(test_wal_inputs_failed_wait_observes_root_without_restoring_proof_or_pins);
 	UT_RUN(test_wal_inputs_resume_error_releases_reacquired_native_owner);
 	UT_RUN(test_wal_inputs_claim_io_releases_cf_and_keeps_all_native_pins);
 	UT_RUN(test_wal_inputs_claim_io_race_and_error_never_publish_partial_scope);

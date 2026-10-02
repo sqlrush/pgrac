@@ -247,15 +247,25 @@ BackgroundWriterMain(void)
 		can_hibernate = BgBufferSync(&wb_context);
 #ifdef USE_PGRAC_CLUSTER
 		/* GCS write requests execute here, outside CONTROL dispatch and with
-		 * the native auxiliary ResourceOwner/error cleanup. */
-		if (cluster_wal_cut_bgwriter_tick_v1())
-			can_hibernate = false;
-		if (cluster_pi_data_bgwriter_tick_v1())
-			can_hibernate = false;
-		if (cluster_pi_writeback_bgwriter_tick_v1())
-			can_hibernate = false;
-		if (cluster_pi_rebuild_bgwriter_tick_v1())
-			can_hibernate = false;
+		 * the native auxiliary ResourceOwner/error cleanup. Runnable census
+		 * batches do not pay BgWriterDelay; a refused peer/lock/proof does.
+		 * Keep servicing other I/O requests and interrupts between batches,
+		 * without accelerating the native dirty-buffer feedback loop. */
+		{
+			ClusterPiRebuildProgressV1 rebuild;
+			do {
+				HandleMainLoopInterrupts();
+				if (cluster_wal_cut_bgwriter_tick_v1())
+					can_hibernate = false;
+				if (cluster_pi_data_bgwriter_tick_v1())
+					can_hibernate = false;
+				if (cluster_pi_writeback_bgwriter_tick_v1())
+					can_hibernate = false;
+				rebuild = cluster_pi_rebuild_bgwriter_tick_v1();
+				if (rebuild != CLUSTER_PI_REBUILD_IDLE)
+					can_hibernate = false;
+			} while (rebuild == CLUSTER_PI_REBUILD_MORE);
+		}
 #endif
 
 		/* Report pending statistics to the cumulative stats system */

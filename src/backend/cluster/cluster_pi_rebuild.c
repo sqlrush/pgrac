@@ -24,6 +24,7 @@ typedef struct PiRebuildJob {
 	uint8 side_block;
 	bool side_blocked;
 	bool side_checked;
+	bool plan_blocked;
 } PiRebuildJob;
 
 static PiRebuildJob *pi_rebuild_job;
@@ -32,6 +33,8 @@ static bool pi_rebuild_logged;
 static ClusterGrdPiRebuildCutV1 pi_rebuild_logged_cut;
 static bool pi_rebuild_apply_logged;
 static ClusterGrdPiRebuildCutV1 pi_rebuild_apply_logged_cut;
+static bool pi_rebuild_plan_logged;
+static ClusterGrdPiRebuildCutV1 pi_rebuild_plan_logged_cut;
 
 static void
 pi_rebuild_release(void)
@@ -242,7 +245,25 @@ pi_rebuild_report_side_blocked(PiRebuildJob *job, uint32 index)
 							LSN_FORMAT_ARGS(operation.identity.record.read_rec_ptr))));
 }
 
-bool
+static void
+pi_rebuild_report_plan_blocked(PiRebuildJob *job, ClusterControlRootResult result,
+							   RfPageProofDetailV1 detail)
+{
+	if (result == CLUSTER_CONTROL_ROOT_STALE_TOKEN
+		|| (pi_rebuild_plan_logged
+			&& memcmp(&pi_rebuild_plan_logged_cut, &job->cut, sizeof(job->cut)) == 0))
+		return;
+	pi_rebuild_plan_logged = true;
+	pi_rebuild_plan_logged_cut = job->cut;
+	cluster_grd_inc_pi_rebuild_plan_blocked();
+	ereport(LOG,
+			(errmsg("cluster PI rebuild could not build its retained contribution plan"),
+			 errdetail("Epoch " UINT64_FORMAT ", direction %u, input result %u, proof detail %u. "
+					   "Service remains fenced; failed proofs are never used to complete the cut.",
+					   job->cut.epoch, job->cut.direction, result, detail)));
+}
+
+ClusterPiRebuildProgressV1
 cluster_pi_rebuild_bgwriter_tick_v1(void)
 {
 	ClusterGrdPiRebuildCutV1 cut;
@@ -254,6 +275,7 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 	RfPageProofDetailV1 detail;
 	uint32 blocked = UINT32_MAX;
 	uint32 budget = 64;
+	ClusterPiRebuildProgressV1 progress = CLUSTER_PI_REBUILD_WAIT;
 	int state;
 
 	if (MyBackendType != B_BG_WRITER || !cluster_enabled || !cluster_shared_config
@@ -281,6 +303,8 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 		job->local = local;
 		pi_rebuild_job = job;
 	}
+	if (pi_rebuild_job->plan_blocked)
+		goto failed;
 	if (pi_rebuild_job->inputs == NULL) {
 		result = cluster_wal_inputs_begin_v1(local.claim.identity.storage_uuid,
 											 local.claim.identity.system_identifier,
@@ -288,21 +312,32 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 		if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
 			|| result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
 			return true;
-		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			pi_rebuild_report_plan_blocked(pi_rebuild_job, result, RF_PAGE_PROOF_DETAIL_OK);
 			goto done;
+		}
 	}
 	result = cluster_wal_inputs_resume_v1(pi_rebuild_job->inputs);
 	if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
 		goto wait;
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		pi_rebuild_report_plan_blocked(pi_rebuild_job, result, RF_PAGE_PROOF_DETAIL_OK);
 		goto done;
+	}
 	if (pi_rebuild_job->plan == NULL) {
 		result = cluster_wal_inputs_contributions_v1(pi_rebuild_job->inputs, true,
 													 &pi_rebuild_job->plan, &records, &detail);
 		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
 			goto wait;
-		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			goto done;
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			pi_rebuild_report_plan_blocked(pi_rebuild_job, result, detail);
+			/* Capacity/typed-proof refusals are stable for this fixed input.
+			 * Transient input I/O and stale authority still retry fresh. */
+			if (detail == RF_PAGE_PROOF_DETAIL_OK)
+				goto done;
+			pi_rebuild_job->plan_blocked = true;
+			goto failed;
+		}
 	}
 	page = cluster_thread_recovery_fabric_page_plan_v1(pi_rebuild_job->plan);
 	if (page == NULL || !cluster_grd_pi_rebuild_current_v1(&cut)
@@ -326,8 +361,10 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 		}
 		pi_rebuild_job->cursor++;
 	}
-	if (pi_rebuild_job->cursor != rf_page_online_plan_target_count_v1(page))
+	if (pi_rebuild_job->cursor != rf_page_online_plan_target_count_v1(page)) {
+		progress = CLUSTER_PI_REBUILD_MORE;
 		goto wait;
+	}
 	side = cluster_thread_recovery_fabric_side_plan_v1(pi_rebuild_job->plan);
 	for (; budget > 0 && pi_rebuild_job->side_cursor < rf_side_online_plan_operation_count_v1(side);
 		 budget--)
@@ -335,14 +372,22 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 			pi_rebuild_report_apply_blocked(pi_rebuild_job, true);
 			goto blocked;
 		}
-	if (pi_rebuild_job->side_cursor != rf_side_online_plan_operation_count_v1(side))
+	if (pi_rebuild_job->side_cursor != rf_side_online_plan_operation_count_v1(side)) {
+		progress = CLUSTER_PI_REBUILD_MORE;
 		goto wait;
+	}
 	if (cluster_wal_inputs_revalidate_v1(pi_rebuild_job->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& cluster_grd_pi_rebuild_complete_v1(&cut))
 		cluster_lmon_wakeup();
 done:
 	pi_rebuild_release();
-	return false;
+	return CLUSTER_PI_REBUILD_IDLE;
+failed:
+	result = cluster_wal_inputs_wait_failed_v1(pi_rebuild_job->inputs);
+	if (result == CLUSTER_CONTROL_ROOT_STALE_TOKEN
+		|| result == CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT)
+		goto done;
+	return CLUSTER_PI_REBUILD_WAIT;
 blocked:
 	if (!cluster_grd_pi_rebuild_current_v1(&cut)
 		|| cluster_wal_inputs_revalidate_v1(pi_rebuild_job->inputs)
@@ -351,5 +396,5 @@ blocked:
 wait:
 	if (cluster_wal_inputs_suspend_v1(pi_rebuild_job->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
-	return true;
+	return progress;
 }

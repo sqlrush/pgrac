@@ -95,6 +95,7 @@ extern bool cluster_grd_pi_rebuild_complete_v1(const ClusterGrdPiRebuildCutV1 *c
 extern bool cluster_grd_pi_rebuild_gate_v1(void);
 extern void cluster_grd_inc_pi_rebuild_side_blocked(void);
 extern void cluster_grd_inc_pi_rebuild_apply_blocked(void);
+extern void cluster_grd_inc_pi_rebuild_plan_blocked(void);
 
 typedef struct ClusterFormationSnapshotV1 ClusterFormationSnapshotV1;
 
@@ -452,6 +453,7 @@ typedef struct ClusterGrdShared {
 	ClusterGrdPiRebuildCutV1 pi_rebuilt;
 	pg_atomic_uint64 pi_rebuild_side_blocked_count;
 	pg_atomic_uint64 pi_rebuild_apply_blocked_count;
+	pg_atomic_uint64 pi_rebuild_plan_blocked_count;
 
 	/*
 	 * TT lane / crash-rejoin re-declare barrier (Shape A) — off-path boot
@@ -826,6 +828,7 @@ typedef struct ClusterGrdRecoveryCounters {
 	uint64 join_block_recovering_failclosed;
 	uint64 pi_rebuild_side_blocked;
 	uint64 pi_rebuild_apply_blocked;
+	uint64 pi_rebuild_plan_blocked;
 } ClusterGrdRecoveryCounters;
 
 extern void cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out);

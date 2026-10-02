@@ -7,7 +7,14 @@
 #include "cluster/cluster_scn.h"
 #include "storage/buf_internals.h"
 
-extern bool cluster_pi_rebuild_bgwriter_tick_v1(void);
+typedef enum ClusterPiRebuildProgressV1 {
+	CLUSTER_PI_REBUILD_IDLE = 0,
+	CLUSTER_PI_REBUILD_WAIT = 1,
+	/* Bounded work made progress. Run the next batch without a timer sleep. */
+	CLUSTER_PI_REBUILD_MORE = 2
+} ClusterPiRebuildProgressV1;
+
+extern ClusterPiRebuildProgressV1 cluster_pi_rebuild_bgwriter_tick_v1(void);
 /* Local target-master admission/progression only. Control cleanup and remote
  * survivor declarations remain independent of this DATA authority gate. */
 extern bool cluster_grd_pi_rebuild_blocked_v1(BufferTag tag);
