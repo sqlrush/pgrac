@@ -64,6 +64,10 @@ extern bool cluster_space_recovery_flush_permitted_v1(const ClusterSpaceRecovery
 struct xl_smgr_truncate;
 /* Original native truncation only, while the batch holds both SPACE pages
  * and the exact current structural input. A naked LSN never grants this. */
+/* Read-only precursor may inspect MAIN/VM before this chain creates SPACE. */
+extern bool
+cluster_space_recovery_truncate_preflight_permitted_v1(const ClusterSpaceRecoveryBatchV1 *batch,
+													   const struct xl_smgr_truncate *truncate);
 extern bool cluster_space_recovery_truncate_permitted_v1(const ClusterSpaceRecoveryBatchV1 *batch,
 														 const struct xl_smgr_truncate *truncate);
 extern Size cluster_space_recovery_scratch_held_v1(const ClusterSpaceRecoveryBatchV1 *batch);

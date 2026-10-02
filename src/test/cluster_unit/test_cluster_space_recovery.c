@@ -528,6 +528,17 @@ smgrwrite(SMgrRelation r, ForkNumber f, BlockNumber b, const void *data, bool sk
 		stale = true;
 }
 bool
+smgr_cold_truncate_preflight(const xl_smgr_truncate *truncate,
+							 const ClusterSpaceRecoveryBatchV1 *batch)
+{
+	UT_ASSERT(CurrentResourceOwner == child_owner);
+	UT_ASSERT(cluster_space_recovery_truncate_preflight_permitted_v1(batch, truncate));
+	if (pins != 3)
+		UT_ASSERT(!cluster_space_recovery_truncate_permitted_v1(batch, truncate));
+	return !fail_cold_truncate;
+}
+
+bool
 smgr_redo_cold_truncate(const xl_smgr_truncate *truncate, const ClusterSpaceRecoveryBatchV1 *batch)
 {
 	xl_smgr_truncate wrong = *truncate;
@@ -2224,10 +2235,55 @@ UT_TEST(test_cold_commit_io_error_keeps_original_authority_for_retry)
 	}
 }
 
+UT_TEST(test_compact_cold_physical_refusal_precedes_all_prefix_mutations)
+{
+	ClusterSpaceRecoveryInput inputs[3];
+	ClusterSpaceColdSourceV1 origins[3];
+	uint8 bytes[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	ClusterSpaceStructureChange truncate = { 0 };
+	PGAlignedBlock before[2];
+
+	create_input(0);
+	MyAuxProcType = StartupProcess;
+	structural = true;
+	compact_inputs(inputs, origins);
+	origins[0].end_rec_ptr = 120;
+	origins[1].end_rec_ptr = 140;
+	truncate.identity.action = CLUSTER_SPACE_WAL_TRUNCATE;
+	truncate.identity.expected = changes[1].result.identity;
+	truncate.identity.result = truncate.identity.expected;
+	truncate.identity.result.incarnation[0] ^= 1;
+	truncate.identity.result.sequence++;
+	truncate.identity.result.operation = 19;
+	truncate.identity.nblocks = 2;
+	truncate.identity.before_token = 100;
+	truncate.identity.result_token = 19;
+	truncate.reservation.action = CLUSTER_SPACE_RESERVATION_RESET;
+	truncate.reservation.before = changes[1].result;
+	truncate.reservation.result.identity = truncate.identity.result;
+	truncate.reservation.result.next_block = truncate.reservation.first_block = 2;
+	truncate.reservation.before_token = 80;
+	truncate.reservation.result_token = 19;
+	UT_ASSERT(cluster_space_structure_wal_encode(&truncate, bytes, sizeof(bytes)));
+	inputs[2] = (ClusterSpaceRecoveryInput){ bytes, sizeof(bytes) };
+	origins[2] = (ClusterSpaceColdSourceV1){ 2, 160 };
+	memcpy(before, pages, sizeof(before));
+	fail_cold_truncate = true;
+	UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origins, 3, 2));
+	UT_ASSERT_EQ(writes + creates + extensions + cold_truncates, 0);
+	UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+	UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	fail_cold_truncate = false;
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 3, 2));
+	fail_cold_truncate = true; /* A completed shrink may not recheck a regrown VM. */
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 3, 2));
+}
+
 int
 main(void)
 {
-	UT_PLAN(42);
+	UT_PLAN(43);
+	UT_RUN(test_compact_cold_physical_refusal_precedes_all_prefix_mutations);
 	UT_RUN(test_cold_commit_io_error_keeps_original_authority_for_retry);
 	UT_RUN(test_cold_commit_already_qualifies_both_durable_components_without_mutation);
 	UT_RUN(test_cold_commit_already_refuses_unwritten_result_wrong_origin_and_stale_owner);

@@ -99,6 +99,7 @@ static unsigned relation_flushes, fork_syncs, invalidations, random_calls;
 static unsigned shrink_syncs;
 static int fail_shrink_sync = -1;
 static bool cold_truncate_fixture, cold_truncate_permitted, cold_vm_clear, cold_vm_stale;
+static bool cold_main_missing;
 static const ClusterSpaceRecoveryBatchV1 *cold_batch = (const ClusterSpaceRecoveryBatchV1 *)42;
 static bool cold_commit_window, cold_drop_proven;
 static unsigned cold_drop_checks;
@@ -283,7 +284,7 @@ smgrexists(SMgrRelation rel, ForkNumber forknum)
 	if ((recovering || truncate_owner) && (forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM))
 		return auxiliary_forks;
 	if ((truncate_owner || recovering) && forknum == MAIN_FORKNUM)
-		return true;
+		return !cold_main_missing;
 	if (forknum != SPACE_FORKNUM)
 		abort();
 	return exists;
@@ -789,6 +790,13 @@ smgrimmedsync(SMgrRelation rel, ForkNumber fork)
 		UT_ASSERT_EQ(locked, 0);
 	fork_syncs++;
 }
+bool
+cluster_space_recovery_truncate_preflight_permitted_v1(const ClusterSpaceRecoveryBatchV1 *batch,
+													   const xl_smgr_truncate *truncate)
+{
+	return cluster_space_recovery_truncate_permitted_v1(batch, truncate);
+}
+
 void
 CacheInvalidateRelcache(Relation rel)
 {
@@ -814,7 +822,7 @@ reset(void)
 	relation_flushes = fork_syncs = invalidations = random_calls = 0;
 	shrink_syncs = 0;
 	fail_shrink_sync = -1;
-	cold_truncate_fixture = cold_vm_stale = false;
+	cold_truncate_fixture = cold_vm_stale = cold_main_missing = false;
 	cold_commit_window = cold_drop_proven = false;
 	cold_drop_checks = 0;
 	cold_drop_second_refused = false;
@@ -1760,6 +1768,28 @@ UT_TEST(test_cold_physical_truncate_uses_original_forks_without_local_wal_flush)
 	}
 }
 
+UT_TEST(test_cold_physical_preflight_checks_vm_without_truncation_or_fsm_writes)
+{
+	for (int bad = 0; bad < 4; bad++) {
+		xl_smgr_truncate truncate = { 4, locator, SMGR_TRUNCATE_ALL };
+		reset();
+		recovering = cold_truncate_fixture = auxiliary_forks = true;
+		pinned = locked = 3;
+		if (bad == 1)
+			cold_truncate_permitted = false;
+		if (bad == 2)
+			cold_vm_clear = false;
+		if (bad == 3)
+			cold_main_missing = true;
+		UT_ASSERT_EQ(smgr_cold_truncate_preflight(&truncate, cold_batch), bad == 0);
+		UT_ASSERT_EQ(truncate_calls + shrink_syncs + flush_calls + main_create_calls + dirty_calls
+						 + fsm_vacuums,
+					 0);
+		UT_ASSERT_EQ(main_blocks, 10);
+		UT_ASSERT_EQ(fake_allocations, fake_frees);
+	}
+}
+
 UT_TEST(test_cold_physical_truncate_refuses_owner_and_vm_before_shrink)
 {
 	for (int variant = 0; variant < 4; variant++) {
@@ -2271,7 +2301,8 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(46);
+	UT_PLAN(47);
+	UT_RUN(test_cold_physical_preflight_checks_vm_without_truncation_or_fsm_writes);
 	UT_RUN(test_native_cold_commit_later_refusal_keeps_all_targets_unmodified);
 	UT_RUN(test_native_cold_commit_uses_already_proof_without_local_flush_or_rewrite);
 	UT_RUN(test_native_cold_commit_refuses_unproved_tombstone_before_local_mutation);

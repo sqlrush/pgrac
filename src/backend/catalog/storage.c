@@ -1138,7 +1138,7 @@ AtSubAbort_smgr(void)
  * does not authorize a foreign-thread replay or prove its WAL durability. */
 static bool
 smgr_redo_truncate_internal(XLogRecPtr lsn, const xl_smgr_truncate *xlrec,
-						   const struct ClusterSpaceRecoveryBatchV1 *batch)
+						   const struct ClusterSpaceRecoveryBatchV1 *batch, bool apply)
 {
 	SMgrRelation reln;
 	Relation	rel;
@@ -1154,7 +1154,9 @@ smgr_redo_truncate_internal(XLogRecPtr lsn, const xl_smgr_truncate *xlrec,
 #endif
 
 #ifdef USE_PGRAC_CLUSTER
-	if (batch != NULL && !cluster_space_recovery_truncate_permitted_v1(batch, xlrec))
+	if (batch != NULL
+		&& !(apply ? cluster_space_recovery_truncate_permitted_v1(batch, xlrec)
+			 : cluster_space_recovery_truncate_preflight_permitted_v1(batch, xlrec)))
 		return false;
 	shared_relation = cluster_shared_config
 		&& cluster_smgr_which_for(xlrec->rlocator, InvalidBackendId) == 1;
@@ -1198,8 +1200,14 @@ smgr_redo_truncate_internal(XLogRecPtr lsn, const xl_smgr_truncate *xlrec,
 #ifdef USE_PGRAC_CLUSTER
 	if (batch != NULL
 		&& (!visibilitymap_prepare_cold_truncate(rel, xlrec->blkno, &cold_vm_blocks)
-			|| !cluster_space_recovery_truncate_permitted_v1(batch, xlrec)))
+			|| !(apply ? cluster_space_recovery_truncate_permitted_v1(batch, xlrec)
+				 : cluster_space_recovery_truncate_preflight_permitted_v1(batch, xlrec))))
 		goto done;
+	if (!apply)
+	{
+		success = true;
+		goto done;
+	}
 #endif
 
 	/* Prepare for truncation of MAIN fork */
@@ -1283,17 +1291,26 @@ done:
 void
 smgr_redo_truncate(XLogRecPtr lsn, const xl_smgr_truncate *xlrec)
 {
-	(void)smgr_redo_truncate_internal(lsn, xlrec, NULL);
+	(void)smgr_redo_truncate_internal(lsn, xlrec, NULL, true);
 }
 
 #ifdef USE_PGRAC_CLUSTER
+bool
+smgr_cold_truncate_preflight(const xl_smgr_truncate *xlrec,
+							 const ClusterSpaceRecoveryBatchV1 *batch)
+{
+	if (batch == NULL || xlrec == NULL)
+		return false;
+	return smgr_redo_truncate_internal(InvalidXLogRecPtr, xlrec, batch, false);
+}
+
 bool
 smgr_redo_cold_truncate(const xl_smgr_truncate *xlrec,
 					   const ClusterSpaceRecoveryBatchV1 *batch)
 {
 	if (batch == NULL || xlrec == NULL)
 		return false;
-	return smgr_redo_truncate_internal(InvalidXLogRecPtr, xlrec, batch);
+	return smgr_redo_truncate_internal(InvalidXLogRecPtr, xlrec, batch, true);
 }
 #endif
 

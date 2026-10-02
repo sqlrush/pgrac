@@ -410,11 +410,7 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 			ok = space_sources_fresh(batch);
 			goto done;
 		}
-		if (!apply) {
-			ok = true;
-			goto done;
-		}
-		if (prepared.covered_by_successor_mask != 0) {
+		if (apply && prepared.covered_by_successor_mask != 0) {
 			smgrimmedsync(rel, SPACE_FORKNUM);
 			if (!space_sources_fresh(batch))
 				goto done;
@@ -452,7 +448,7 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 						&& space_disk_matches(rel, i, target->before[i].data))
 						completed |= 1 << i;
 				}
-				if (completed != 0) {
+				if (completed != 0 && apply) {
 					smgrimmedsync(rel, SPACE_FORKNUM);
 					if (!space_sources_fresh(batch))
 						goto done;
@@ -460,7 +456,7 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 						if ((completed & (1 << i))
 							&& !space_disk_matches(rel, i, target->before[i].data))
 							goto done;
-				} else {
+				} else if (completed == 0) {
 					xl_smgr_truncate truncate
 						= { change.identity.nblocks, target->key.locator, SMGR_TRUNCATE_ALL };
 
@@ -470,11 +466,17 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 					if (later)
 						goto done;
 					batch->active_step = through;
-					if (!smgr_redo_cold_truncate(&truncate, batch) || !space_sources_fresh(batch))
+					if (!(apply ? smgr_redo_cold_truncate(&truncate, batch)
+								: smgr_cold_truncate_preflight(&truncate, batch))
+						|| !space_sources_fresh(batch))
 						goto done;
 					batch->active_step = UINT32_MAX;
 				}
 			}
+		}
+		if (!apply) {
+			ok = true;
+			goto done;
 		}
 		if (!exists)
 			smgrcreate(rel, SPACE_FORKNUM, true);
@@ -824,6 +826,17 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 			goto done;
 		}
 		batch->preflight_complete = true;
+		/* Qualify every physical prerequisite through the requested cut
+		 * before even an earlier CREATE publishes a SPACE component. */
+		for (uint32 i = 0; i <= through; i++) {
+			ClusterSpaceStructureChange change;
+
+			if (inputs[i].length == CLUSTER_SPACE_STRUCTURE_WAL_BYTES
+				&& (!cluster_space_structure_wal_decode(inputs[i].data, inputs[i].length, &change)
+					|| (change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE
+						&& !space_target_run(batch, 0, false, i))))
+				goto done;
+		}
 		/* Each structural result follows its own physical action; a caller
 		 * asking for a later prefix may not skip intermediate structures. */
 		for (uint32 i = 0; i < through; i++)
@@ -923,10 +936,11 @@ cluster_space_recovery_flush_permitted_v1(const ClusterSpaceRecoveryBatchV1 *bat
 		   && memcmp(BufferGetPage(buffer), batch->active->final.pages[block].data, BLCKSZ) == 0;
 }
 
-bool
-cluster_space_recovery_truncate_permitted_v1(const ClusterSpaceRecoveryBatchV1 *batch,
-											 const xl_smgr_truncate *truncate)
+static bool
+space_truncate_permitted(const ClusterSpaceRecoveryBatchV1 *batch, const xl_smgr_truncate *truncate,
+						 bool readonly)
 {
+	static const PGAlignedBlock zero;
 	ClusterSpaceStructureChange change;
 
 	if (batch == NULL || truncate == NULL || batch->cold_inputs == NULL
@@ -945,6 +959,9 @@ cluster_space_recovery_truncate_permitted_v1(const ClusterSpaceRecoveryBatchV1 *
 		ForkNumber fork;
 		BlockNumber block;
 
+		if (readonly && !BufferIsValid(buffer) && batch->active->has_create
+			&& memcmp(batch->active->before[i].data, zero.data, BLCKSZ) == 0)
+			continue;
 		if (!BufferIsValid(buffer) || BufferIsLocal(buffer)
 			|| !LWLockHeldByMeInMode(
 				BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)), LW_EXCLUSIVE)
@@ -956,6 +973,20 @@ cluster_space_recovery_truncate_permitted_v1(const ClusterSpaceRecoveryBatchV1 *
 			return false;
 	}
 	return true;
+}
+
+bool
+cluster_space_recovery_truncate_preflight_permitted_v1(const ClusterSpaceRecoveryBatchV1 *batch,
+													   const xl_smgr_truncate *truncate)
+{
+	return space_truncate_permitted(batch, truncate, true);
+}
+
+bool
+cluster_space_recovery_truncate_permitted_v1(const ClusterSpaceRecoveryBatchV1 *batch,
+											 const xl_smgr_truncate *truncate)
+{
+	return space_truncate_permitted(batch, truncate, false);
 }
 
 Size
