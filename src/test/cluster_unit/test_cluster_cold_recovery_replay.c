@@ -52,6 +52,8 @@ typedef struct FixRecord {
 	uint64 scn;
 	bool page;
 	ClusterColdComponentV1 component;
+	bool space;
+	ClusterColdSpaceOpV1 op;
 } FixRecord;
 
 typedef struct Stream {
@@ -60,7 +62,7 @@ typedef struct Stream {
 	ClusterColdReplayRecordV1 record[MAX_STREAM];
 } Stream;
 
-typedef enum TraceKind { T_UNSCHEDULED, T_SCHEDULED } TraceKind;
+typedef enum TraceKind { T_UNSCHEDULED, T_SCHEDULED, T_SPACE_FINAL } TraceKind;
 
 typedef struct TraceEvent {
 	TraceKind kind;
@@ -75,6 +77,7 @@ typedef struct Harness {
 	int events;
 	TraceEvent trace[MAX_TRACE];
 	bool refuse_unscheduled;
+	bool refuse_space_final;
 } Harness;
 
 static RfPageVersionV1
@@ -132,6 +135,38 @@ paged(XLogRecPtr read, XLogRecPtr end, uint64 scn, ClusterColdComponentV1 c)
 	r.page = true;
 	r.component = c;
 	return r;
+}
+
+static const char space_payload[4] = { 'S', 'P', 'C', '1' };
+
+static FixRecord
+spaced(XLogRecPtr read, XLogRecPtr end, uint8 kind, Oid rel)
+{
+	FixRecord r = plain(read, end);
+
+	r.space = true;
+	r.op.kind = kind;
+	r.op.locator.spcOid = 1663;
+	r.op.locator.dbOid = 5;
+	r.op.locator.relNumber = rel;
+	memset(r.op.result_incarnation, INC + 1, sizeof(r.op.result_incarnation));
+	r.op.payload = space_payload;
+	r.op.payload_length = sizeof(space_payload);
+	return r;
+}
+
+static bool
+check_feed_order(void *arg, const RelFileLocator *locator, const ClusterColdSpaceInputV1 *inputs,
+				 uint32 count, uint32 *order)
+{
+	uint32 i;
+
+	(void)arg;
+	(void)locator;
+	(void)inputs;
+	for (i = 0; i < count; i++)
+		order[i] = i;
+	return true;
 }
 
 static ClusterColdReplayRecordV1
@@ -206,6 +241,8 @@ seal(void)
 	uint32 p;
 
 	UT_ASSERT_EQ(cluster_cold_plan_create_v1(cuts, 2, BUDGET, &plan), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_set_space_check_v1(plan, check_feed_order, NULL),
+				 CLUSTER_COLD_OK);
 	for (p = 0; p < 2; p++) {
 		XLogRecPtr prev = cuts[p].physical_lower - 0x40;
 		int i;
@@ -223,6 +260,8 @@ seal(void)
 			record.rmid = id.rmid;
 			record.component_count = fix[p][i].page ? 1 : 0;
 			record.components = fix[p][i].page ? &fix[p][i].component : NULL;
+			record.space_count = fix[p][i].space ? 1 : 0;
+			record.space_ops = fix[p][i].space ? &fix[p][i].op : NULL;
 			UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, p, &record), CLUSTER_COLD_OK);
 			prev = id.read_rec_ptr;
 		}
@@ -284,7 +323,18 @@ op_scheduled(void *arg, uint32 participant, const ClusterColdStepV1 *step,
 	return h->current[participant] == step->read_rec_ptr;
 }
 
-static const ClusterColdReplayOpsV1 ops = { op_next, op_unscheduled, op_scheduled };
+static bool
+op_space_final(void *arg, uint32 relation)
+{
+	Harness *h = (Harness *)arg;
+	TraceEvent *e = &h->trace[h->events++];
+
+	e->kind = T_SPACE_FINAL;
+	e->participant = relation;
+	return !h->refuse_space_final;
+}
+
+static const ClusterColdReplayOpsV1 ops = { op_next, op_unscheduled, op_scheduled, op_space_final };
 
 static bool
 event_is(const Harness *h, int i, TraceKind kind, uint32 participant, XLogRecPtr read)
@@ -448,6 +498,73 @@ UT_TEST(test_replay_callback_refusal_stops)
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
+/*
+ * A CREATE is a SPACE step in schedule order; a reservation advance replays
+ * as an unscheduled record; after every stream is drained each SPACE
+ * relation is installed in full, in relation order.
+ */
+static void
+space_fixture(void)
+{
+	fixture(false);
+	fix[0][0] = plain(0x1000, 0x1100);
+	fix[0][1] = spaced(0x1100, 0x1200, CLUSTER_COLD_SPACE_ADVANCE, 100);
+	fix[0][2] = plain(0x1200, 0x1500);
+	fix[1][0] = spaced(0x1000, 0x1100, CLUSTER_COLD_SPACE_CREATE, 200);
+	fix[1][1] = plain(0x1100, 0x1300);
+	fix_count[0] = 3;
+	fix_count[1] = 2;
+}
+
+UT_TEST(test_replay_space_steps_and_final_installs)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	ClusterColdReplayOpsV1 partial = ops;
+	Harness h;
+
+	space_fixture();
+	plan = seal();
+	harness_init(&h);
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_OK);
+	UT_ASSERT_EQ(h.events, 7);
+	UT_ASSERT(event_is(&h, 0, T_SCHEDULED, 1, 0x1000));
+	UT_ASSERT_EQ(h.trace[0].action, CLUSTER_COLD_SPACE_STEP);
+	UT_ASSERT(event_is(&h, 1, T_UNSCHEDULED, 0, 0x1000));
+	UT_ASSERT(event_is(&h, 2, T_UNSCHEDULED, 0, 0x1100));
+	UT_ASSERT(event_is(&h, 3, T_UNSCHEDULED, 0, 0x1200));
+	UT_ASSERT(event_is(&h, 4, T_UNSCHEDULED, 1, 0x1100));
+	UT_ASSERT_EQ(h.trace[5].kind, T_SPACE_FINAL);
+	UT_ASSERT_EQ(h.trace[5].participant, 0);
+	UT_ASSERT_EQ(h.trace[6].kind, T_SPACE_FINAL);
+	UT_ASSERT_EQ(h.trace[6].participant, 1);
+	UT_ASSERT_EQ(result.steps_done, 1);
+	UT_ASSERT_EQ(result.space_steps, 1);
+	UT_ASSERT_EQ(result.pages_applied, 0);
+	UT_ASSERT_EQ(result.space_relations_finished, 2);
+
+	/* A refused final install stops replay; no owner for it is refused. */
+	harness_init(&h);
+	h.refuse_space_final = true;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CALLBACK);
+	UT_ASSERT_EQ(result.space_relations_finished, 0);
+	UT_ASSERT_EQ(h.events, 6);
+	harness_init(&h);
+	partial.space_final = NULL;
+	UT_ASSERT_EQ(cluster_cold_replay_run_v1(plan, cuts, 2, 0, &partial, &h, &result),
+				 CLUSTER_COLD_REPLAY_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(h.events, 0);
+	cluster_cold_plan_destroy_v1(&plan);
+
+	/* Without SPACE relations no final install is needed. */
+	fixture(false);
+	plan = seal();
+	harness_init(&h);
+	UT_ASSERT_EQ(cluster_cold_replay_run_v1(plan, cuts, 2, 0, &partial, &h, &result),
+				 CLUSTER_COLD_REPLAY_OK);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
 UT_TEST(test_replay_argument_checks)
 {
 	ClusterColdPlanV1 *plan;
@@ -487,6 +604,8 @@ UT_TEST(test_skipped_own_record_advances_next_xid)
 	step.all_skip = false;
 	UT_ASSERT_EQ(cluster_cold_page_action_v1(&step, true), CLUSTER_COLD_PAGE_APPLY);
 	UT_ASSERT_EQ(cluster_cold_page_action_v1(&step, false), CLUSTER_COLD_PAGE_APPLY);
+	step.step_kind = CLUSTER_COLD_STEP_SPACE;
+	UT_ASSERT_EQ(cluster_cold_page_action_v1(&step, true), CLUSTER_COLD_SPACE_STEP);
 }
 
 int
@@ -497,6 +616,7 @@ main(void)
 	UT_RUN(test_replay_scheduled_record_must_match);
 	UT_RUN(test_replay_drain_proves_the_cut);
 	UT_RUN(test_replay_callback_refusal_stops);
+	UT_RUN(test_replay_space_steps_and_final_installs);
 	UT_RUN(test_replay_argument_checks);
 	UT_RUN(test_skipped_own_record_advances_next_xid);
 	UT_DONE();

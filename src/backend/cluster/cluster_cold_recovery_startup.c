@@ -85,6 +85,9 @@ cold_detail_name(ClusterColdDetailV1 detail)
 		"opcode unsupported",
 		"side owner missing",
 		"page content unproven",
+		"SPACE effects invalid",
+		"SPACE identity missing",
+		"SPACE effects refused",
 	};
 
 	return (int)detail >= 0 && (Size)detail < lengthof(names) ? names[detail] : "unknown";
@@ -222,12 +225,55 @@ cold_refuse_diag(ClusterColdTypedV1 *typed, ClusterColdDetailV1 detail, const ch
 		LSN_FORMAT_ARGS(diag->has_dependency ? diag->dependency_read_rec_ptr : InvalidXLogRecPtr));
 }
 
+/*
+ * SPACE effects are keyed by the namespace every participant must share:
+ * the cluster's identity and the database incarnation of their claims.
+ */
+static bool
+cold_space_namespace(ClusterColdTypedV1 *typed)
+{
+	const ClusterWalSourceRef *own = &typed->sources[typed->own_participant];
+	ClusterColdObserverV1 *observer = &typed->observer;
+	uint32 i;
+
+	for (i = 0; i < typed->participant_count; i++) {
+		const ClusterWalSourceRef *source = &typed->sources[i];
+
+		if (source->claim.database_incarnation != own->claim.database_incarnation
+			|| source->claim.identity.system_identifier != own->claim.identity.system_identifier
+			|| memcmp(source->claim.identity.storage_uuid, own->claim.identity.storage_uuid, 16)
+				   != 0) {
+			cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+						"thread %u claims database incarnation " UINT64_FORMAT
+						", thread %u " UINT64_FORMAT "; generations share no namespace",
+						(unsigned)typed->participants[i].thread_id,
+						source->claim.database_incarnation,
+						(unsigned)typed->participants[typed->own_participant].thread_id,
+						own->claim.database_incarnation);
+			return false;
+		}
+	}
+	observer->system_identifier = own->claim.identity.system_identifier;
+	observer->database_incarnation = own->claim.database_incarnation;
+	memcpy(observer->storage_uuid, own->claim.identity.storage_uuid, 16);
+	return true;
+}
+
 static bool
 cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots)
 {
 	ClusterColdDiagV1 diag;
 	ClusterColdDetailV1 detail;
 	uint32 i;
+
+	if (!cold_space_namespace(typed))
+		return false;
+	detail = cluster_cold_plan_set_space_check_v1(typed->plan, cluster_cold_space_check_v1,
+												  &typed->observer);
+	if (detail != CLUSTER_COLD_OK) {
+		cold_refuse(typed, detail, "SPACE check refused: %s", cold_detail_name(detail));
+		return false;
+	}
 
 	for (i = 0; i < typed->participant_count; i++) {
 		ClusterColdScanResultV1 scan;
@@ -358,6 +404,13 @@ cluster_cold_typed_ready_v1(const ClusterColdTypedV1 *typed,
 	if (!handshake->restartpoint_hold)
 		cold_reason_append(reason, reason_size,
 						   "no restartpoint hold while the cold cut is replayed (R-A9)");
+	if (cluster_cold_plan_space_relation_count_v1(typed->plan) > 0 && !handshake->space_owner) {
+		char text[96];
+
+		(void)snprintf(text, sizeof(text), "%u SPACE relations need the cold SPACE owner (R-A11)",
+					   cluster_cold_plan_space_relation_count_v1(typed->plan));
+		cold_reason_append(reason, reason_size, text);
+	}
 	steps = cluster_cold_plan_step_count_v1(typed->plan);
 	for (i = 0; i < steps; i++) {
 		ClusterColdStepV1 step;
@@ -529,6 +582,17 @@ cluster_cold_refusal_hint_v1(ClusterColdDetailV1 detail)
 	case CLUSTER_COLD_OOM:
 		return "The server could not allocate the typed cold plan. Nothing was modified; free "
 			   "memory on this host and restart.";
+	case CLUSTER_COLD_SPACE_INVALID:
+		return "The retained WAL holds malformed or contradictory SPACE changes at the named "
+			   "record. Nothing was modified; preserve all original thread WAL and DATA.";
+	case CLUSTER_COLD_SPACE_REFUSED:
+		return "The SPACE owner could not order the named record's relation changes from its "
+			   "current SPACE pages (a change is missing or branches, or the pages are "
+			   "unreadable). Nothing was modified; preserve all original thread WAL and DATA.";
+	case CLUSTER_COLD_IDENTITY_MISSING:
+		return "The named page's relation has no readable SPACE identity and was not created "
+			   "inside the replayed WAL. Nothing was modified; preserve all original thread WAL "
+			   "and DATA; do not force recovery.";
 	default:
 		return "Preserve all original thread WAL and shared configuration. Shared mode "
 			   "recovers every retained writer generation through the typed cold plan and "

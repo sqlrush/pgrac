@@ -142,7 +142,9 @@
  *	              set is taken; pass 2
  *	              (cluster_recovery_typed_replay) replays the sealed
  *	              schedule, matching every page record to its pass-1
- *	              identity.  Pass 2 starts only once every consumer it
+ *	              identity; SPACE changes are installed by the SPACE owner
+ *	              at their steps and in full at the end, never replayed
+ *	              natively.  Pass 2 starts only once every consumer it
  *	              needs exists (cluster_cold_typed_ready_v1), including a
  *	              restartpoint owner that does not adopt own checkpoints
  *	              replayed inside it.  Without shared_config a cold merge
@@ -3128,6 +3130,7 @@ static ClusterColdTypedV1 *
 cluster_recovery_typed_begin(ClusterRecoveryFencePlan **fence_plan)
 {
 	ClusterColdTypedV1 *typed = NULL;
+	ClusterColdHandshakeV1 handshake = cluster_cold_handshake;
 	bool		serial_acquired;
 	bool		plan_committed = false;
 	char		readiness[512];
@@ -3136,8 +3139,9 @@ cluster_recovery_typed_begin(ClusterRecoveryFencePlan **fence_plan)
 	if (typed->refusal != CLUSTER_COLD_OK)
 		cluster_recovery_typed_fail(fence_plan, &typed, "typed cold recovery refused",
 									typed->refusal_detail);
-	if (!cluster_cold_typed_ready_v1(typed, &cluster_cold_handshake, readiness,
-									 sizeof(readiness)))
+	/* The cold SPACE install exists once its owner publishes it. */
+	handshake.space_owner = cluster_cold_space_owner_v1();
+	if (!cluster_cold_typed_ready_v1(typed, &handshake, readiness, sizeof(readiness)))
 		cluster_recovery_typed_fail(fence_plan, &typed,
 									"typed cold recovery cannot replay this plan yet", readiness);
 	serial_acquired = cluster_recovery_merge_fence_plan_acquire_serial(*fence_plan);
@@ -3242,11 +3246,12 @@ cluster_typed_replay_next(void *arg, uint32 participant, ClusterColdReplayRecord
 }
 
 /*
- * A record without ordinary page components.  Pass 1 refused every lifecycle,
+ * A record without a scheduled step.  Pass 1 refused every lifecycle,
  * prepared-transaction and unowned side record after native redo, so what
- * reaches here is the founder's own record (native owner) or another
- * generation's rebuildable FSM-only page record; anything else means pass 1
- * saw other input.
+ * reaches here is the founder's own record (native owner), another
+ * generation's rebuildable FSM-only page record or relation file creation,
+ * or a SPACE reservation advance, which the SPACE owner installs later
+ * (never replayed natively); anything else means pass 1 saw other input.
  */
 static bool
 cluster_typed_replay_unscheduled(void *arg, uint32 participant)
@@ -3268,6 +3273,16 @@ cluster_typed_replay_unscheduled(void *arg, uint32 participant)
 		  CLUSTER_COLD_RECORD_SIDE_UNOWNED)) != 0)
 		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
 									  "a record pass 1 would have refused reached replay");
+	if (rep->decoded.record.space_count > 0)
+	{
+		if (rep->decoded.record.space_count != 1 ||
+			rep->decoded.space_ops[0].kind != CLUSTER_COLD_SPACE_ADVANCE)
+			cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
+										  "a SPACE step reached replay unscheduled");
+		if (is_own)
+			AdvanceNextFullTransactionIdPastXid(r->record->header.xl_xid);
+		return true;
+	}
 	if (!is_own)
 		cluster_typed_replay_foreign_gate(rep);
 	rep->apply_foreign = !is_own;
@@ -3277,7 +3292,89 @@ cluster_typed_replay_unscheduled(void *arg, uint32 participant)
 	return true;
 }
 
-/* One scheduled page record, already matched to its pass-1 identity. */
+static void
+pg_attribute_noreturn()
+cluster_typed_replay_space_refused(const RelFileLocator *locator, uint32 through)
+{
+	ereport(FATAL,
+			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+			 errmsg("typed cold recovery could not install SPACE changes of relation %u/%u/%u",
+					locator->spcOid, locator->dbOid, locator->relNumber),
+			 errdetail("The SPACE owner refused input %u in its pass-1 order, or this build has "
+					   "no cold SPACE install.", through),
+			 errhint("Preserve all original thread WAL and DATA; do not force recovery.")));
+	pg_unreachable();
+}
+
+/* Bring one SPACE relation through `through`, or stop recovery. */
+static void
+cluster_typed_replay_space_install(ClusterColdTypedReplay *rep, uint32 relation, uint32 through)
+{
+	RelFileLocator locator;
+	uint32		count = 0;
+
+	memset(&locator, 0, sizeof(locator));
+	if (!cluster_cold_plan_space_relation_v1(rep->typed->plan, relation, &locator, &count) ||
+		through >= count || !cluster_cold_typed_space_install_v1(rep->typed, relation, through))
+		cluster_typed_replay_space_refused(&locator, through);
+}
+
+/*
+ * A CREATE, TRUNCATE or a commit's relation drops.  The SPACE owner brings
+ * each relation through this step's input first (never further, so pages
+ * of an incarnation never see a later one); a drop's commit then replays
+ * natively, its files and outcome still owned by the commit redo.  Without
+ * a cold SPACE install the readiness gate refused such a plan before IR.
+ */
+static void
+cluster_typed_replay_space_step(ClusterColdTypedReplay *rep, uint32 participant,
+								const ClusterColdStepV1 *step, XLogReaderState *r)
+{
+	bool		is_own = participant == rep->typed->own_participant;
+	uint32		i;
+
+	/* Pass 1 refuses another generation's commit (R-A5). */
+	if (step->space_kind == CLUSTER_COLD_SPACE_DROP && !is_own)
+		cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
+									  "another generation's relation drops reached replay");
+	if (!is_own)
+		cluster_typed_replay_foreign_gate(rep);
+	for (i = 0; i < step->space_count; i++)
+	{
+		uint32		relation;
+		uint32		input;
+
+		if (!cluster_cold_plan_step_space_v1(rep->typed->plan, step->step_index, i, &relation,
+											 &input))
+			cluster_typed_replay_mismatch(rep, participant, r->ReadRecPtr,
+										  "a SPACE step lost its effects");
+		cluster_typed_replay_space_install(rep, relation, input);
+	}
+	if (step->space_kind == CLUSTER_COLD_SPACE_DROP)
+	{
+		rep->apply_foreign = false;
+		cluster_typed_replay_apply(r, rep);
+	}
+	else if (is_own)
+		AdvanceNextFullTransactionIdPastXid(r->record->header.xl_xid);
+}
+
+/* Every SPACE relation's remaining inputs, after all streams are drained. */
+static bool
+cluster_typed_replay_space_final(void *arg, uint32 relation)
+{
+	ClusterColdTypedReplay *rep = (ClusterColdTypedReplay *) arg;
+	RelFileLocator locator;
+	uint32		count = 0;
+
+	if (!cluster_cold_plan_space_relation_v1(rep->typed->plan, relation, &locator, &count) ||
+		count == 0)
+		return false;
+	cluster_typed_replay_space_install(rep, relation, count - 1);
+	return true;
+}
+
+/* One scheduled record, already matched to its pass-1 identity. */
 static bool
 cluster_typed_replay_scheduled(void *arg, uint32 participant, const ClusterColdStepV1 *step,
 							   ClusterColdPageActionV1 action)
@@ -3287,6 +3384,9 @@ cluster_typed_replay_scheduled(void *arg, uint32 participant, const ClusterColdS
 
 	switch (action)
 	{
+		case CLUSTER_COLD_SPACE_STEP:
+			cluster_typed_replay_space_step(rep, participant, step, r);
+			return true;
 		case CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID:
 
 			/*
@@ -3325,6 +3425,7 @@ static const ClusterColdReplayOpsV1 cluster_typed_replay_ops = {
 	cluster_typed_replay_next,
 	cluster_typed_replay_unscheduled,
 	cluster_typed_replay_scheduled,
+	cluster_typed_replay_space_final,
 };
 
 /* A sequencer stop is fatal: report it in pass-1 terms. */
@@ -3456,13 +3557,16 @@ cluster_recovery_typed_replay(ClusterColdTypedV1 **typed_address, TimeLineID *re
 	cluster_recovery_merge_window_leave();
 	for (i = 0; i < typed->participant_count; i++)
 		cluster_cold_reader_close_v1(&rep->readers[i]);
+	cluster_cold_decoded_release_v1(&rep->decoded);
 	cluster_typed_replay_finish(rep, &result);
 	cluster_cold_replay_window_leave_v1();
 	ereport(LOG,
 			(errmsg("cluster typed cold recovery: replay complete (own thread %u)",
 					(unsigned) typed->participants[typed->own_participant].thread_id),
-			 errdetail_log(UINT64_FORMAT " page records skipped, " UINT64_FORMAT " applied.",
-						   result.pages_skipped, result.pages_applied)));
+			 errdetail_log(UINT64_FORMAT " page records skipped, " UINT64_FORMAT " applied; "
+						   "%u SPACE steps, %u SPACE relations installed.",
+						   result.pages_skipped, result.pages_applied, result.space_steps,
+						   result.space_relations_finished)));
 	own_end = result.own_end;
 	pfree(rep);
 	cluster_cold_typed_destroy_v1(typed_address);

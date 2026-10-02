@@ -184,6 +184,31 @@ space_structural(ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag)
 	return CLUSTER_COLD_OK;
 }
 
+/*
+ * An input after a native redo start whose resulting incarnation a
+ * structural change in history already ended is covered by the SPACE pages
+ * on disk: every change to an incarnation precedes its end.  It is neither
+ * handed to the SPACE owner nor a step.
+ */
+static void
+space_covered(ClusterColdPlanV1 *plan)
+{
+	uint32 i;
+
+	for (i = 0; i < plan->space_count; i++) {
+		ColdSpaceOp *op = cold_space_op(plan, i);
+		const ColdSpaceOp *ender;
+
+		if (op->payload == NULL || op->kind == CLUSTER_COLD_SPACE_DROP)
+			continue;
+		ender = space_find(plan, &op->locator, op->result, false);
+		if (ender == NULL || !record_history(plan, ender->record))
+			continue;
+		op->covered = true;
+		cold_record(plan, op->record)->flags &= ~COLD_RECORD_SPACE_STEP;
+	}
+}
+
 /* Per segment: the record that must replay first, and how it ended. */
 static ClusterColdDetailV1
 space_segments(ClusterColdPlanV1 *plan)
@@ -203,9 +228,11 @@ space_segments(ClusterColdPlanV1 *plan)
 		const ColdSpaceOp *ender
 			= space_find(plan, &relation->locator, segment->incarnation, false);
 
-		facts->creator_record = creator != NULL && !record_history(plan, creator->record)
-									? creator->record
-									: CLUSTER_COLD_NO_INDEX;
+		facts->creator_record
+			= creator != NULL
+					  && (cold_record(plan, creator->record)->flags & COLD_RECORD_SPACE_STEP) != 0
+				  ? creator->record
+				  : CLUSTER_COLD_NO_INDEX;
 		facts->retired_from = InvalidBlockNumber;
 		if (ender == NULL)
 			continue;
@@ -227,38 +254,129 @@ space_segments(ClusterColdPlanV1 *plan)
 	return CLUSTER_COLD_OK;
 }
 
+/* The SPACE owner's view of one stored effect. */
+static void
+space_input_of(const ClusterColdPlanV1 *plan, const ColdSpaceOp *op, ClusterColdSpaceInputV1 *out)
+{
+	const ColdRecord *record = cold_record(plan, op->record);
+
+	memset(out, 0, sizeof(*out));
+	out->kind = op->kind;
+	out->participant = plan->participants[record->participant].input_index;
+	out->read_rec_ptr = record->read_rec_ptr;
+	out->end_rec_ptr = record->end_rec_ptr;
+	out->payload = op->payload;
+	out->payload_length = op->payload_length;
+}
+
+/*
+ * Have the SPACE owner check one relation's inputs (slice, in canonical
+ * participant and LSN order) against its current SPACE pages, then keep
+ * them in the owner's order.  scratch holds 3 * count words.
+ */
+static ClusterColdDetailV1
+space_relation_check(ClusterColdPlanV1 *plan, uint32 *slice, uint32 count, uint32 *scratch,
+					 ClusterColdSpaceInputV1 *inputs, ClusterColdDiagV1 *diag)
+{
+	uint32 *order = scratch;
+	uint32 *seen = scratch + count;
+	uint32 *ordered = scratch + 2 * (Size)count;
+	const ColdSpaceOp *first = cold_space_op(plan, slice[0]);
+	uint32 i;
+
+	for (i = 0; i < count; i++) {
+		space_input_of(plan, cold_space_op(plan, slice[i]), &inputs[i]);
+		seen[i] = 0;
+	}
+	if (!plan->space_check(plan->space_check_arg, &first->locator, inputs, count, order)) {
+		cold_diag_record(plan, diag, first->record);
+		return CLUSTER_COLD_SPACE_REFUSED;
+	}
+	for (i = 0; i < count; i++) {
+		if (order[i] >= count || seen[order[i]]++ != 0) {
+			cold_diag_record(plan, diag, first->record);
+			return CLUSTER_COLD_SPACE_REFUSED;
+		}
+		ordered[i] = slice[order[i]];
+	}
+	memcpy(slice, ordered, (Size)count * sizeof(uint32));
+	return CLUSTER_COLD_OK;
+}
+
+/*
+ * Number the relation's inputs in the owner's order, and chain its SPACE
+ * steps so they are scheduled in that order.
+ */
+static void
+space_relation_number(ClusterColdPlanV1 *plan, uint32 relation, const uint32 *slice, uint32 count)
+{
+	uint32 previous_step = CLUSTER_COLD_NO_INDEX;
+	uint32 i;
+
+	for (i = 0; i < count; i++) {
+		ColdSpaceOp *op = cold_space_op(plan, slice[i]);
+
+		op->relation = relation;
+		op->input = i;
+		op->wait_record = previous_step != op->record ? previous_step : CLUSTER_COLD_NO_INDEX;
+		if ((cold_record(plan, op->record)->flags & COLD_RECORD_SPACE_STEP) != 0)
+			previous_step = op->record;
+	}
+}
+
 /* The SPACE owner's inputs: every effect after a native redo start. */
 static ClusterColdDetailV1
-space_inputs(ClusterColdPlanV1 *plan)
+space_inputs(ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag)
 {
+	ClusterColdSpaceInputV1 *inputs;
+	ClusterColdDetailV1 detail = CLUSTER_COLD_OK;
+	uint32 *scratch;
+	uint32 start = 0;
 	uint32 i;
 
 	for (i = 0; i < plan->space_count; i++)
-		if (cold_space_op(plan, i)->payload != NULL)
+		if (cold_space_op(plan, i)->payload != NULL && !cold_space_op(plan, i)->covered)
 			plan->space_input_count++;
+	if (plan->space_input_count != 0 && plan->space_check == NULL)
+		return CLUSTER_COLD_SIDE_OWNER_MISSING;
 	plan->space_inputs = scratch_alloc(plan, (Size)plan->space_input_count * sizeof(uint32), true);
 	plan->space_relation_start
 		= scratch_alloc(plan, ((Size)plan->space_input_count + 1) * sizeof(uint32), true);
-	if (plan->space_inputs == NULL || plan->space_relation_start == NULL)
-		return CLUSTER_COLD_CAPACITY;
-	plan->space_input_count = 0;
-	for (i = 0; i < plan->space_count; i++)
-		if (cold_space_op(plan, i)->payload != NULL)
-			plan->space_inputs[plan->space_input_count++] = i;
-	qsort_arg(plan->space_inputs, plan->space_input_count, sizeof(uint32), input_compare, plan);
-	for (i = 0; i < plan->space_input_count; i++) {
-		ColdSpaceOp *op = cold_space_op(plan, plan->space_inputs[i]);
-
-		if (i == 0
-			|| locator_compare(&cold_space_op(plan, plan->space_inputs[i - 1])->locator,
-							   &op->locator)
-				   != 0)
-			plan->space_relation_start[plan->space_relation_count++] = i;
-		op->relation = plan->space_relation_count - 1;
-		op->input = i - plan->space_relation_start[op->relation];
+	scratch = scratch_alloc(plan, (Size)plan->space_input_count * 3 * sizeof(uint32), false);
+	inputs = scratch_alloc(plan, (Size)plan->space_input_count * sizeof(*inputs), false);
+	if (plan->space_inputs == NULL || plan->space_relation_start == NULL || scratch == NULL
+		|| inputs == NULL)
+		detail = CLUSTER_COLD_CAPACITY;
+	if (detail == CLUSTER_COLD_OK) {
+		plan->space_input_count = 0;
+		for (i = 0; i < plan->space_count; i++)
+			if (cold_space_op(plan, i)->payload != NULL && !cold_space_op(plan, i)->covered)
+				plan->space_inputs[plan->space_input_count++] = i;
+		qsort_arg(plan->space_inputs, plan->space_input_count, sizeof(uint32), input_compare, plan);
 	}
-	plan->space_relation_start[plan->space_relation_count] = plan->space_input_count;
-	return CLUSTER_COLD_OK;
+	for (i = 1; detail == CLUSTER_COLD_OK && i <= plan->space_input_count; i++) {
+		if (i < plan->space_input_count
+			&& locator_compare(&cold_space_op(plan, plan->space_inputs[start])->locator,
+							   &cold_space_op(plan, plan->space_inputs[i])->locator)
+				   == 0)
+			continue;
+		detail = space_relation_check(plan, plan->space_inputs + start, i - start, scratch, inputs,
+									  diag);
+		if (detail != CLUSTER_COLD_OK)
+			break;
+		plan->space_relation_start[plan->space_relation_count] = start;
+		space_relation_number(plan, plan->space_relation_count++, plan->space_inputs + start,
+							  i - start);
+		start = i;
+	}
+	if (detail == CLUSTER_COLD_OK)
+		plan->space_relation_start[plan->space_relation_count] = plan->space_input_count;
+	/* Released with the rest of the seal scratch. */
+	if (scratch != NULL)
+		cold_free(scratch);
+	if (inputs != NULL)
+		cold_free(inputs);
+	return detail;
 }
 
 ClusterColdDetailV1
@@ -266,10 +384,12 @@ cold_plan_space_seal(ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag)
 {
 	ClusterColdDetailV1 detail = space_structural(plan, diag);
 
-	if (detail == CLUSTER_COLD_OK)
+	if (detail == CLUSTER_COLD_OK) {
+		space_covered(plan);
 		detail = space_segments(plan);
+	}
 	if (detail == CLUSTER_COLD_OK)
-		detail = space_inputs(plan);
+		detail = space_inputs(plan, diag);
 	return detail;
 }
 

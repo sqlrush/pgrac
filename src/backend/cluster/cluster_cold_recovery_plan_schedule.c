@@ -71,13 +71,23 @@ dependency_pending(const ClusterColdPlanV1 *plan, uint32 dependency, uint32 *blo
 /*
  * An applied component waits for its chain predecessor's record and for
  * the CREATE or TRUNCATE that made its incarnation the relation's SPACE
- * identity.
+ * identity; a SPACE step waits for its relations' previous SPACE steps.
  */
 static bool
-record_ready(const ClusterColdPlanV1 *plan, const ColdRecord *record, uint32 *blocking)
+record_ready(const ClusterColdPlanV1 *plan, uint32 index, uint32 *blocking)
 {
-	uint16 i;
+	const ColdRecord *record = cold_record(plan, index);
+	uint32 i;
 
+	if ((record->flags & COLD_RECORD_SPACE) != 0) {
+		uint32 count = cold_record_space_count(plan, index);
+
+		for (i = 0; i < count; i++)
+			if (dependency_pending(
+					plan, cold_space_op(plan, record->first_component + i)->wait_record, blocking))
+				return false;
+		return true;
+	}
 	for (i = 0; i < record->component_count; i++) {
 		const ColdComponent *component = cold_component(plan, record->first_component + i);
 
@@ -90,7 +100,7 @@ record_ready(const ClusterColdPlanV1 *plan, const ColdRecord *record, uint32 *bl
 	return true;
 }
 
-/* Scheduled: page records and replay-range CREATE/TRUNCATE. */
+/* Scheduled: page records and SPACE steps (CREATE, TRUNCATE, drops). */
 static bool
 record_scheduled_kind(const ClusterColdPlanV1 *plan, uint32 record)
 {
@@ -161,7 +171,7 @@ schedule_deadlock(const ClusterColdPlanV1 *plan, const ColdScheduleWork *work,
 	if (best == CLUSTER_COLD_NO_INDEX)
 		return;
 	cold_diag_record(plan, diag, best);
-	(void)record_ready(plan, cold_record(plan, best), &blocking);
+	(void)record_ready(plan, best, &blocking);
 	if (blocking != CLUSTER_COLD_NO_INDEX) {
 		diag->has_dependency = true;
 		diag->dependency_participant
@@ -198,7 +208,7 @@ schedule_run(ClusterColdPlanV1 *plan, ColdScheduleWork *work, ClusterColdDiagV1 
 			if (work->list_next[p] == work->list_start[p + 1])
 				continue;
 			head = work->lists[work->list_next[p]];
-			if (record_ready(plan, cold_record(plan, head), NULL)
+			if (record_ready(plan, head, NULL)
 				&& (best == CLUSTER_COLD_NO_INDEX
 					|| record_key_less(cold_record(plan, head), cold_record(plan, best))))
 				best = head;

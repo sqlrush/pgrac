@@ -7589,8 +7589,10 @@ $(CLUSTER_COLD_DECODE_O): $(top_srcdir)/src/backend/cluster/cluster_cold_recover
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
 
 test_cluster_cold_recovery_decode: test_cluster_cold_recovery_decode.c unit_test.h $(CLUSTER_COLD_DECODE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
 		cluster_unit_port_stubs.o $(top_srcdir)/src/include/cluster/cluster_cold_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_COLD_DECODE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 CLUSTER_COLD_STARTUP_O = test_cluster_cold_recovery_startup_core.o test_cluster_cold_recovery_startup_plan_core.o $(CLUSTER_COLD_PLAN_SPLIT_O)

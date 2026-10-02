@@ -6,12 +6,14 @@
  *	  Classification uses the same closed route registry and detached page
  *	  preflight as online thread recovery: one opcode table and one page
  *	  component codec.  The cold owner policy is narrower than online
- *	  recovery's typed side consumers: page records route to the plan, the
- *	  founder's own non-page records keep their native redo owner, and
- *	  another generation's non-page records, relation lifecycle and prepared-
- *	  transaction records are flagged so the plan refuses them after the
- *	  native redo start.  Routed side components inside page records are
- *	  refused until their typed cold owner exists.
+ *	  recovery's typed side consumers: page records route to the plan; SPACE
+ *	  identity and reservation changes and a commit's relation drops become
+ *	  typed SPACE effects for the SPACE owner; the founder's own non-page
+ *	  records keep their native redo owner, as does relation file creation;
+ *	  another generation's other non-page records, the remaining relation
+ *	  lifecycle and prepared-transaction records are flagged so the plan
+ *	  refuses them after the native redo start.  Routed side components
+ *	  inside page records are refused until their typed cold owner exists.
  *
  *	  Read-only: no buffers, storage, locks or authority.
  *
@@ -41,6 +43,19 @@
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_page_detached.h"
+#include "cluster/cluster_space_reservation.h"
+#include "utils/memutils.h"
+
+#ifdef USE_CLUSTER_UNIT
+#define cold_ops_alloc(pointer_, size_) realloc((pointer_), (size_))
+#define cold_ops_free(pointer_) free(pointer_)
+#else
+#define cold_ops_alloc(pointer_, size_)                                                            \
+	((pointer_) == NULL                                                                            \
+		 ? palloc_extended((size_), MCXT_ALLOC_HUGE | MCXT_ALLOC_NO_OOM)                           \
+		 : repalloc_extended((pointer_), (size_), MCXT_ALLOC_HUGE | MCXT_ALLOC_NO_OOM))
+#define cold_ops_free(pointer_) pfree(pointer_)
+#endif
 
 static RfPageProofDetailV1
 cold_preflight_side_record(void *arg, const RfOpcodeRouteV1 *route,
@@ -80,10 +95,76 @@ cold_preflight_rebuildable_component(void *arg, const RfOpcodeRouteV1 *route,
 			   : RF_PAGE_PROOF_DETAIL_CLASS_UNKNOWN;
 }
 
-/* Commit/abort that drops relations is a lifecycle change; prepared
- * transactions are outside the supported profile. */
+/* Room for count SPACE effects, zeroed and attached to the record. */
+static ClusterColdSpaceOpV1 *
+cold_space_reserve(ClusterColdDecodedV1 *out, uint32 count)
+{
+	if (count > out->space_capacity) {
+		void *grown;
+
+		if ((Size)count > MaxAllocHugeSize / sizeof(ClusterColdSpaceOpV1))
+			return NULL;
+		grown = cold_ops_alloc(out->space_ops, (Size)count * sizeof(ClusterColdSpaceOpV1));
+		if (grown == NULL)
+			return NULL;
+		out->space_ops = (ClusterColdSpaceOpV1 *)grown;
+		out->space_capacity = count;
+	}
+	memset(out->space_ops, 0, (Size)count * sizeof(ClusterColdSpaceOpV1));
+	out->record.space_count = count;
+	out->record.space_ops = out->space_ops;
+	return out->space_ops;
+}
+
+static bool
+cold_space_key_matches(const ClusterSpaceIdentityKey *key, uint64 system_identifier,
+					   const uint8 storage_uuid[16])
+{
+	return key->system_identifier == system_identifier
+		   && memcmp(key->storage_uuid, storage_uuid, 16) == 0
+		   && key->locator.relNumber != InvalidRelFileNumber;
+}
+
+/* A commit's relation drops: one SPACE tombstone per cluster relation. */
 static ClusterColdDetailV1
-cold_xact_flags(XLogReaderState *reader, uint8 *flags)
+cold_space_drops(const xl_xact_parsed_commit *parsed, uint64 system_identifier,
+				 const uint8 storage_uuid[16], ClusterColdDecodedV1 *out)
+{
+	ClusterColdSpaceOpV1 *ops;
+	uint32 i;
+
+	if (parsed->nspace_drops > (uint32)Max(parsed->nrels, 0) || parsed->space_drops == NULL)
+		return CLUSTER_COLD_SPACE_INVALID;
+	ops = cold_space_reserve(out, parsed->nspace_drops);
+	if (ops == NULL)
+		return CLUSTER_COLD_OOM;
+	for (i = 0; i < parsed->nspace_drops; i++) {
+		const char *bytes = parsed->space_drops + (Size)i * CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
+		ClusterSpaceStructureChange change;
+
+		if (!cluster_space_structure_wal_decode(bytes, CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &change)
+			|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
+			|| !cold_space_key_matches(&change.identity.result.key, system_identifier,
+									   storage_uuid))
+			return CLUSTER_COLD_SPACE_INVALID;
+		ops[i].kind = CLUSTER_COLD_SPACE_DROP;
+		ops[i].locator = change.identity.result.key.locator;
+		memcpy(ops[i].before_incarnation, change.identity.expected.incarnation, 16);
+		ops[i].payload = bytes;
+		ops[i].payload_length = CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
+	}
+	return CLUSTER_COLD_OK;
+}
+
+/*
+ * A commit's relation drops become SPACE effects; the native commit redo
+ * still owns the files.  Relations dropped by an abort have no SPACE
+ * tombstone and remain a lifecycle change; prepared transactions are
+ * outside the supported profile.
+ */
+static ClusterColdDetailV1
+cold_xact_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 storage_uuid[16],
+				ClusterColdDecodedV1 *out, uint8 *flags)
 {
 	uint8 info = XLogRecGetInfo(reader);
 
@@ -94,8 +175,10 @@ cold_xact_flags(XLogReaderState *reader, uint8 *flags)
 		if (!ParseCommitRecord(info, (xl_xact_commit *)XLogRecGetData(reader),
 							   XLogRecGetDataLen(reader), &parsed))
 			return CLUSTER_COLD_COMPONENT_INVALID;
-		*flags = parsed.nrels > 0 ? CLUSTER_COLD_RECORD_STRUCTURAL : 0;
-		return CLUSTER_COLD_OK;
+		*flags = 0;
+		return parsed.nspace_drops > 0
+				   ? cold_space_drops(&parsed, system_identifier, storage_uuid, out)
+				   : CLUSTER_COLD_OK;
 	}
 	case XLOG_XACT_ABORT: {
 		xl_xact_parsed_abort parsed;
@@ -117,19 +200,79 @@ cold_xact_flags(XLogReaderState *reader, uint8 *flags)
 	}
 }
 
+/* SMGR SPACE_IDENTITY: a CREATE or TRUNCATE.  A tombstone travels only in
+ * its commit. */
 static ClusterColdDetailV1
-cold_record_flags(XLogReaderState *reader, uint8 *flags)
+cold_space_identity(XLogReaderState *reader, uint64 system_identifier, const uint8 storage_uuid[16],
+					ClusterColdDecodedV1 *out)
+{
+	ClusterSpaceStructureChange change;
+	ClusterColdSpaceOpV1 *op;
+
+	if (!cluster_space_structure_wal_decode(XLogRecGetData(reader), XLogRecGetDataLen(reader),
+											&change)
+		|| (change.identity.action != CLUSTER_SPACE_WAL_CREATE
+			&& change.identity.action != CLUSTER_SPACE_WAL_TRUNCATE)
+		|| !cold_space_key_matches(&change.identity.result.key, system_identifier, storage_uuid))
+		return CLUSTER_COLD_SPACE_INVALID;
+	op = cold_space_reserve(out, 1);
+	if (op == NULL)
+		return CLUSTER_COLD_OOM;
+	op->locator = change.identity.result.key.locator;
+	op->nblocks = change.identity.nblocks;
+	memcpy(op->result_incarnation, change.identity.result.incarnation, 16);
+	if (change.identity.action == CLUSTER_SPACE_WAL_CREATE)
+		op->kind = CLUSTER_COLD_SPACE_CREATE;
+	else {
+		op->kind = CLUSTER_COLD_SPACE_TRUNCATE;
+		memcpy(op->before_incarnation, change.identity.expected.incarnation, 16);
+	}
+	op->payload = XLogRecGetData(reader);
+	op->payload_length = XLogRecGetDataLen(reader);
+	return CLUSTER_COLD_OK;
+}
+
+/* SMGR SPACE_RESERVATION: only an ADVANCE stands alone. */
+static ClusterColdDetailV1
+cold_space_reservation(XLogReaderState *reader, uint64 system_identifier,
+					   const uint8 storage_uuid[16], ClusterColdDecodedV1 *out)
+{
+	ClusterSpaceReservationChange change;
+	ClusterColdSpaceOpV1 *op;
+
+	if (!cluster_space_reservation_wal_decode(XLogRecGetData(reader), XLogRecGetDataLen(reader),
+											  &change)
+		|| change.action != CLUSTER_SPACE_RESERVATION_ADVANCE
+		|| !cold_space_key_matches(&change.result.identity.key, system_identifier, storage_uuid))
+		return CLUSTER_COLD_SPACE_INVALID;
+	op = cold_space_reserve(out, 1);
+	if (op == NULL)
+		return CLUSTER_COLD_OOM;
+	op->kind = CLUSTER_COLD_SPACE_ADVANCE;
+	op->locator = change.result.identity.key.locator;
+	memcpy(op->result_incarnation, change.result.identity.incarnation, 16);
+	op->payload = XLogRecGetData(reader);
+	op->payload_length = XLogRecGetDataLen(reader);
+	return CLUSTER_COLD_OK;
+}
+
+static ClusterColdDetailV1
+cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 storage_uuid[16],
+				  ClusterColdDecodedV1 *out, uint8 *flags)
 {
 	uint8 info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
 
 	*flags = 0;
 	switch (XLogRecGetRmid(reader)) {
 	case RM_XACT_ID:
-		return cold_xact_flags(reader, flags);
+		return cold_xact_flags(reader, system_identifier, storage_uuid, out, flags);
 	case RM_SMGR_ID:
-		/* SPACE reservations carry order-sensitive SPACE versions too. */
-		if (info == XLOG_SMGR_TRUNCATE || info == XLOG_SMGR_SPACE_IDENTITY
-			|| info == XLOG_SMGR_SPACE_RESERVATION)
+		if (info == XLOG_SMGR_SPACE_IDENTITY)
+			return cold_space_identity(reader, system_identifier, storage_uuid, out);
+		if (info == XLOG_SMGR_SPACE_RESERVATION)
+			return cold_space_reservation(reader, system_identifier, storage_uuid, out);
+		/* A truncation without a SPACE identity change has no cold owner. */
+		if (info == XLOG_SMGR_TRUNCATE)
 			*flags = CLUSTER_COLD_RECORD_STRUCTURAL;
 		return CLUSTER_COLD_OK;
 	case RM_HEAP2_ID:
@@ -206,10 +349,17 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 	RfPageProofDetailV1 preflight;
 	const DecodedXLogRecord *decoded;
 	ClusterColdDetailV1 detail;
+	ClusterColdSpaceOpV1 *space_ops;
+	uint32 space_capacity;
+	bool has_owner;
 
 	if (out == NULL)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
+	space_ops = out->space_ops;
+	space_capacity = out->space_capacity;
 	memset(out, 0, sizeof(*out));
+	out->space_ops = space_ops;
+	out->space_capacity = space_capacity;
 	if (reader == NULL || reader->record == NULL || storage_uuid == NULL || system_identifier == 0)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
 	decoded = reader->record;
@@ -232,14 +382,36 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 		return CLUSTER_COLD_OPCODE_UNSUPPORTED;
 	}
 	out->route_owner = plan.route.record_owner;
-	detail = cold_record_flags(reader, &out->record.record_flags);
+	detail = cold_record_flags(reader, system_identifier, storage_uuid, out,
+							   &out->record.record_flags);
 	if (detail != CLUSTER_COLD_OK)
 		return detail;
-	/* Another generation's non-page effects (outcomes, checkpoints, counters,
-	 * undo, SLRU) have no typed cold owner yet; never a silent no-op. */
-	if (foreign && plan.route.record_owner != RF_ROUTE_OWNER_PAGE_CODEC)
+
+	/*
+	 * Another generation's non-page effects (outcomes, checkpoints, counters,
+	 * undo, SLRU) have no typed cold owner yet; never a silent no-op.  Its
+	 * SPACE changes have the SPACE owner, and creating a relation file is
+	 * idempotent, so their native redo is the owner's.
+	 */
+	has_owner = XLogRecGetRmid(reader) == RM_SMGR_ID
+				&& ((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_SMGR_CREATE
+					|| out->record.space_count > 0);
+	if (foreign && plan.route.record_owner != RF_ROUTE_OWNER_PAGE_CODEC && !has_owner)
 		out->record.record_flags |= CLUSTER_COLD_RECORD_SIDE_UNOWNED;
 	return cold_map_components(reader, &plan, system_identifier, storage_uuid, out);
+}
+
+void
+cluster_cold_decoded_release_v1(ClusterColdDecodedV1 *decoded)
+{
+	if (decoded == NULL)
+		return;
+	if (decoded->space_ops != NULL)
+		cold_ops_free(decoded->space_ops);
+	decoded->space_ops = NULL;
+	decoded->space_capacity = 0;
+	decoded->record.space_ops = NULL;
+	decoded->record.space_count = 0;
 }
 
 #endif /* USE_PGRAC_CLUSTER */

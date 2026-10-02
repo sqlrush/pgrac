@@ -100,6 +100,7 @@ OBJS = \
 	cluster_cold_recovery_plan_schedule.o \
 	cluster_cold_recovery_decode.o \
 	cluster_cold_recovery_io.o \
+	cluster_cold_recovery_space.o \
 	cluster_cold_recovery_startup.o \
 	cluster_cold_recovery_replay.o \
 	cluster_recovery_duty.o \

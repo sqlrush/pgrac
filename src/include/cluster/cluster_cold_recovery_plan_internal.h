@@ -91,7 +91,7 @@ typedef struct ColdRecord {
 #define COLD_RECORD_HISTORY 0x01
 #define COLD_RECORD_SCHEDULED 0x02
 #define COLD_RECORD_SPACE 0x04		/* first_component is its first SPACE effect */
-#define COLD_RECORD_SPACE_STEP 0x08 /* CREATE/TRUNCATE after a native redo start: a step */
+#define COLD_RECORD_SPACE_STEP 0x08 /* CREATE, TRUNCATE or drop after a native redo start */
 
 StaticAssertDecl(CLUSTER_COLD_MAX_PARTICIPANTS <= UINT8_MAX + 1,
 				 "canonical participant index must fit ColdRecord");
@@ -150,11 +150,13 @@ typedef struct ColdSpaceOp {
 	uint32 record;
 	RelFileLocator locator;
 	BlockNumber nblocks;
-	uint8 kind; /* ClusterColdSpaceKindV1 */
+	uint8 kind;	  /* ClusterColdSpaceKindV1 */
+	bool covered; /* sealed: its incarnation's end is durable; not an input */
 	uint8 before[16];
 	uint8 result[16];
-	uint32 relation; /* sealed: index of its relation among SPACE inputs, or NO_INDEX */
-	uint32 input;	 /* sealed: position within that relation's inputs */
+	uint32 relation;	/* sealed: index of its relation among SPACE inputs, or NO_INDEX */
+	uint32 input;		/* sealed: position in the SPACE owner's order of those inputs */
+	uint32 wait_record; /* sealed: the relation's previous SPACE step, or NO_INDEX */
 } ColdSpaceOp;
 
 /*
@@ -196,6 +198,8 @@ struct ClusterColdPlanV1 {
 	uint32 component_count;
 	uint32 component_chunk_count;
 	uint32 component_chunk_capacity;
+	ClusterColdSpaceCheckV1 space_check;
+	void *space_check_arg;
 	ColdIntern relations; /* ColdRelation */
 	ColdIntern segments;  /* ColdSegment */
 	ColdSpaceOp **space_chunks;
@@ -246,6 +250,19 @@ static inline ColdSpaceOp *
 cold_space_op(const ClusterColdPlanV1 *plan, uint32 index)
 {
 	return &plan->space_chunks[index >> COLD_CHUNK_SHIFT][index & COLD_CHUNK_MASK];
+}
+
+/* A SPACE record's effects are stored contiguously from first_component. */
+static inline uint32
+cold_record_space_count(const ClusterColdPlanV1 *plan, uint32 record)
+{
+	uint32 first = cold_record(plan, record)->first_component;
+	uint32 count = 0;
+
+	while (first + count < plan->space_count
+		   && cold_space_op(plan, first + count)->record == record)
+		count++;
+	return count;
 }
 
 static inline bool
