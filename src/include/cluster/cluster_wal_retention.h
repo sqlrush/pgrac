@@ -363,13 +363,17 @@ extern ClusterWalPinResult cluster_wal_retention_pin_adopt_root_readback_v1(
 	const ClusterControlRootSnapshot *observed_snapshot,
 	const ClusterControlRootReadToken *observed_token);
 extern ClusterWalrReleaseResult cluster_wal_retention_pin_release(ClusterWalRetentionPin **pin);
+/* A required sealed pin is converted, after confirmed IR release, from S to
+ * X on its original holder with dontwait. This excludes every old DATA
+ * executor until CF/CAS/durable readback completes. End restores the original
+ * S ownership; unconfirmed conversion/release is cleanup-only. */
 extern ClusterWalPinResult
 cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken *expected_root,
 											   bool require_sealed_pin,
 											   ClusterWalRootPublishGuard **out_guard);
 extern ClusterWalrReleaseResult
 cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard);
-/* PGRAC: post-IR sealed-pin observation; no CF acquisition or new authority.
+/* PGRAC: post-IR sealed-pin exclusive observation; no CF acquisition or new authority.
  * Author: SqlRush <sqlrush@gmail.com> */
 extern bool
 cluster_wal_retention_root_publish_sealed_current(const ClusterWalRootPublishGuard *guard,

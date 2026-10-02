@@ -4021,6 +4021,15 @@ typedef bool (*ClusterGcsRedeclareCallback)(BufferTag tag, uint8 held_mode, XLog
 extern int cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 											   ClusterGcsRedeclareCallback cb, void *arg);
 
+/* LMON's second census cursor, over the original PCM registry. Logical PI
+ * responsibility survives buffer eviction. Declare only affected, nonempty
+ * entries as N with zero numeric watermarks; their retained typed sources are
+ * ancestry evidence, not comparable LSN/SCN floors. Same -1-position retry
+ * convention; callbacks run without directory locks or retained entry refs.
+ * This adds obligations, never replaces the retained-WAL recovery census. */
+extern int cluster_pcm_local_pi_redeclare_scan_chunk(int start, int max_scan, uint64 epoch,
+													 ClusterGcsRedeclareCallback cb, void *arg);
+
 
 /* ============================================================
  * Public API.
@@ -4506,7 +4515,9 @@ typedef struct ResourceXTargetEvictionPlan {
 	bool prepared;
 	bool local_n_committed;
 	bool release_admitted;
-	uint8 reserved[3];
+	bool pi_recorded;
+	uint8 reserved[2];
+	ClusterPageWalRefV1 pi_refs[2];
 	uint8 release_payload[RESOURCE_X_CONTROL_V1_BYTES];
 } ResourceXTargetEvictionPlan;
 
@@ -4549,7 +4560,9 @@ extern ResourceXApplyResult cluster_gcs_resource_x_target_acquire_reobserve_exac
 	ResourceXAuxiliaryAcquireContext *context, ResourceXAcquisitionRef *ref_out);
 extern ResourceXApplyResult cluster_gcs_resource_x_target_evict_prepare_exact(
 	const BufferTag *tag, const ClusterPcmOwnSnapshot *exact_x, uint64 r4_record_generation,
-	uint64 reservation_token, ResourceXTargetEvictionPlan *plan_out);
+	uint64 reservation_token, const ClusterPageWalBindingV1 *wal,
+	ResourceXTargetEvictionPlan *plan_out);
+extern void cluster_gcs_resource_x_target_evict_release_refs(ResourceXTargetEvictionPlan *plan);
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_evict_publish_exact(ResourceXTargetEvictionPlan *plan,
 												  bool *retry_pending_out);

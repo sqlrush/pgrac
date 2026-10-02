@@ -37,6 +37,26 @@ typedef struct ClusterPiWritebackMessageV1 {
 typedef struct ClusterPiWritebackNoticeV1 ClusterPiWritebackNoticeV1;
 typedef struct ClusterPiWritebackJobV1 ClusterPiWritebackJobV1;
 
+typedef enum ClusterPiWritebackRejectionV1 {
+	CLUSTER_PI_WRITEBACK_DATA_PROOF = 0,
+	CLUSTER_PI_WRITEBACK_LOCAL_ACK,
+	CLUSTER_PI_WRITEBACK_REMOTE_ACK,
+	CLUSTER_PI_WRITEBACK_MASTER_CUT,
+	CLUSTER_PI_WRITEBACK_PEER_PHYSICAL,
+	CLUSTER_PI_WRITEBACK_REJECTION_COUNT
+} ClusterPiWritebackRejectionV1;
+
+/* Attempt counters, not a count of distinct pages or a retirement proof.
+ * Shared across background owners; the last sample is diagnostic only. */
+typedef struct ClusterPiWritebackRejectionsV1 {
+	uint64 attempts[CLUSTER_PI_WRITEBACK_REJECTION_COUNT];
+	uint64 log_events;
+	BufferTag last_resource;
+	uint32 last_reason;
+	int32 last_peer;
+} ClusterPiWritebackRejectionsV1;
+extern bool cluster_pi_writeback_rejections_v1(ClusterPiWritebackRejectionsV1 *out);
+
 extern bool cluster_pi_writeback_encode_v1(const ClusterPiWritebackMessageV1 *message, uint8 *bytes,
 										   Size capacity, Size *length);
 extern bool cluster_pi_writeback_decode_v1(const void *bytes, Size length,

@@ -4034,8 +4034,10 @@ grd_recovery_wait_cluster_watchdog(const uint64 *dead, uint64 episode_epoch)
  */
 #define GRD_BLOCK_REDECLARE_CHUNK 256
 static int grd_block_redeclare_cursor = 0;
+static int grd_local_pi_redeclare_cursor = 0;
 static uint64 grd_block_redeclare_epoch = 0;
 static uint64 grd_block_redeclare_generation = 0;
+static bool grd_block_redeclare_buffers_done = false;
 static bool grd_block_redeclare_done = false;
 
 static bool
@@ -4065,24 +4067,45 @@ grd_block_redeclare_step(uint64 episode_epoch)
 		grd_block_redeclare_epoch = episode_epoch;
 		grd_block_redeclare_generation = generation;
 		grd_block_redeclare_cursor = 0;
+		grd_local_pi_redeclare_cursor = 0;
+		grd_block_redeclare_buffers_done = false;
 		grd_block_redeclare_done = false;
 	}
 
 	if (grd_block_redeclare_done)
 		return;
 
-	/* Bounded chunk;  scan_chunk caps the cursor at NBuffers and returns the
-	 * cursor unchanged once the whole pool has been scanned this episode. */
-	next
-		= cluster_bufmgr_redeclare_scan_chunk(grd_block_redeclare_cursor, GRD_BLOCK_REDECLARE_CHUNK,
-											  grd_block_redeclare_cb, &episode_epoch);
-	if (next < 0) {
-		grd_block_redeclare_cursor = -1 - next;
-		return; /* busy buffer or master application not yet acknowledged */
+	if (!grd_block_redeclare_buffers_done) {
+		/* A busy buffer or unacknowledged declaration retains its position. */
+		next = cluster_bufmgr_redeclare_scan_chunk(grd_block_redeclare_cursor,
+												   GRD_BLOCK_REDECLARE_CHUNK,
+												   grd_block_redeclare_cb, &episode_epoch);
+		if (next < 0) {
+			grd_block_redeclare_cursor = -1 - next;
+			return;
+		}
+		if (next != grd_block_redeclare_cursor) {
+			grd_block_redeclare_cursor = next;
+			return;
+		}
+		grd_block_redeclare_buffers_done = true;
 	}
-	if (next == grd_block_redeclare_cursor)
-		grd_block_redeclare_done = true; /* reached NBuffers — whole pool scanned */
-	grd_block_redeclare_cursor = next;
+	/* The last resident buffer may have disappeared while the source still
+	 * owes a PI. REDECLARE_DONE must include that detached responsibility. */
+	if (cluster_shared_config) {
+		next = cluster_pcm_local_pi_redeclare_scan_chunk(grd_local_pi_redeclare_cursor,
+														 GRD_BLOCK_REDECLARE_CHUNK, episode_epoch,
+														 grd_block_redeclare_cb, &episode_epoch);
+		if (next < 0) {
+			grd_local_pi_redeclare_cursor = -1 - next;
+			return;
+		}
+		if (next != grd_local_pi_redeclare_cursor) {
+			grd_local_pi_redeclare_cursor = next;
+			return;
+		}
+	}
+	grd_block_redeclare_done = true;
 }
 
 /*

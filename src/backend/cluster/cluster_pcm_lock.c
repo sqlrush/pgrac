@@ -6109,6 +6109,9 @@ cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, const PcmAuthorityS
 	ClusterGrdHolderId requester;
 	bool found;
 
+	if (cluster_shared_config)
+		return PCM_X_TRANSFER_COMMIT_BAD_STATE;
+
 	if (expected == NULL || holder_node < 0 || holder_node >= 32 || request_id == 0)
 		return PCM_X_TRANSFER_COMMIT_BAD_STATE;
 	if (ClusterPcm == NULL || cluster_pcm_htab == NULL)
@@ -6189,6 +6192,10 @@ cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecP
 	PcmEntryAcquireResult acquire_result;
 	struct GrdEntry *entry;
 
+	if (cluster_shared_config)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
+
 	if (cluster_pcm_htab == NULL)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("PCM lock manager disabled (cluster.pcm_grd_max_entries=0)")));
@@ -6221,9 +6228,9 @@ cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecP
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("shared X grant lost its prior authority generation")));
 		}
-		/* The legacy self-ship path can still reach this owner. Remember
-		 * its departing writer atomically with the grant, even when no
-		 * physical PI was retained. A later keeper note is insufficient. */
+		/* Retain the old safety condition behind the shared entry refusal:
+		 * reopening this owner must never lose the departing writer, even
+		 * when no physical PI was retained. */
 		if (had_x && previous != requester_node)
 			pg_atomic_fetch_or_u32(&entry->pi_holders_bitmap, (uint32)1u << previous);
 		pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
@@ -7009,6 +7016,9 @@ cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition tr
 	bool broadcast_needed = false;
 	bool create;
 
+	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config, trans))
+		return PCM_GCS_TRANSITION_INCOMPATIBLE;
+
 	if (cluster_pcm_htab == NULL)
 		return PCM_GCS_TRANSITION_INCOMPATIBLE;
 	if (holder_node_id < 0 || holder_node_id >= 32)
@@ -7606,6 +7616,10 @@ pcm_lock_acquire_local(BufferTag tag, PcmLockMode mode, PcmAuthoritySnapshot *re
 void
 cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 {
+	if (cluster_shared_config && mode == PCM_LOCK_MODE_X)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
+
 	/* A tag-only caller has no BufferDesc and therefore retains the
 	 * historical fail-closed behavior for a remote-X conflict. */
 	(void)pcm_lock_acquire_local(tag, mode, NULL);
@@ -7688,6 +7702,10 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 	 * guarantee no leak).
 	 */
 	clean_eligible = cluster_pcm_clean_page_xfer_consume();
+
+	if (cluster_shared_config && mode == PCM_LOCK_MODE_X)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
 
 	if (cluster_pcm_htab == NULL)
 		PCM_STUB_DISABLED_PATH;
@@ -8026,6 +8044,12 @@ cluster_pcm_lock_release(BufferTag tag)
 	 *	                wakes); same-node refcount-only paths skip broadcast.
 	 */
 	if (cur == PCM_STATE_X) {
+		if (cluster_shared_config) {
+			LWLockRelease(&entry->entry_lock.lock);
+			pcm_entry_ref_release(&entry_ref);
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared X ownership requires Resource-X")));
+		}
 		if (entry->x_holder_node != holder_node) {
 			LWLockRelease(&entry->entry_lock.lock);
 			pcm_entry_ref_release(&entry_ref);
@@ -8119,6 +8143,10 @@ cluster_pcm_lock_release_saved_tag_for_eviction(BufferTag tag, PcmLockMode mode)
 	uint64 local_projection_generation = 0;
 	int master_node;
 	PcmLockTransition trans;
+
+	if (cluster_shared_config && mode == PCM_LOCK_MODE_X)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
 
 	if (cluster_pcm_htab == NULL)
 		PCM_STUB_DISABLED_PATH;
@@ -8275,6 +8303,10 @@ cluster_pcm_lock_upgrade(BufferTag tag)
 	PcmState cur;
 	int holder_node;
 
+	if (cluster_shared_config)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
+
 	CLUSTER_INJECTION_POINT("cluster-pcm-convert-pre");
 
 	if (cluster_pcm_htab == NULL)
@@ -8356,6 +8388,10 @@ cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, bool keep_pi)
 	PcmState cur;
 	PcmLockTransition trans;
 	int holder_node;
+
+	if (cluster_shared_config)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
 
 	CLUSTER_INJECTION_POINT("cluster-pcm-downgrade-pre");
 
@@ -9973,7 +10009,8 @@ pcm_local_pi_snapshot_locked(struct GrdEntry *entry, ClusterPcmLocalPiSnapshotV1
 }
 
 static bool
-pcm_local_pi_remember_locked(struct GrdEntry *entry, const ClusterPageWalBindingV1 *binding)
+pcm_local_pi_remember_locked(struct GrdEntry *entry, const ClusterPageWalBindingV1 *binding,
+							 ClusterPageWalRefV1 *reserved)
 {
 	ClusterPcmLocalPiSnapshotV1 previous;
 	ClusterPageWalRefV1 first = { 0 }, last = { 0 };
@@ -10007,12 +10044,31 @@ pcm_local_pi_remember_locked(struct GrdEntry *entry, const ClusterPageWalBinding
 	if (entry->local_pi_revision >= UINT64_MAX - 1)
 		return false;
 	/* Reserve every replacement reference before changing the original owner.
-	 * The unchanged keyed entry, not a buffer slot, owns these references. */
-	if (empty && !cluster_page_wal_ref_retain_v1(binding, &first))
-		return false;
-	if (!cluster_page_wal_ref_retain_v1(binding, &last)) {
-		(void)cluster_page_wal_ref_release_v1(&first);
-		return false;
+	 * Eviction already reserved both references before its irreversible N;
+	 * consume those without a capacity allocation under the entry lock. */
+	if (reserved != NULL) {
+		ClusterPageWalBindingV1 observed;
+		for (int i = 0; i < 2; i++) {
+			if (!cluster_page_wal_ref_read_v1(&reserved[i], binding->identity.locator,
+											  binding->identity.forknum, binding->identity.blockno,
+											  &observed)
+				|| (observed.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+				|| !cluster_page_wal_same_mutation_v1(&observed, binding))
+				return false;
+		}
+		if (empty) {
+			first = reserved[0];
+			memset(&reserved[0], 0, sizeof(reserved[0]));
+		}
+		last = reserved[1];
+		memset(&reserved[1], 0, sizeof(reserved[1]));
+	} else {
+		if (empty && !cluster_page_wal_ref_retain_v1(binding, &first))
+			return false;
+		if (!cluster_page_wal_ref_retain_v1(binding, &last)) {
+			(void)cluster_page_wal_ref_release_v1(&first);
+			return false;
+		}
 	}
 	if (empty)
 		entry->local_pi_first = first; /* move, never duplicate a live reference */
@@ -10046,7 +10102,7 @@ cluster_pcm_local_pi_record_v1(BufferTag tag, const ClusterPageWalBindingV1 *bin
 		|| !pcm_entry_ref_acquire(&tag, true, &ref, &acquired))
 		return false;
 	pcm_entry_lock_exclusive(ref.entry);
-	result = pcm_local_pi_remember_locked(ref.entry, binding);
+	result = pcm_local_pi_remember_locked(ref.entry, binding, NULL);
 	LWLockRelease(&ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&ref);
 	return result;
@@ -10105,6 +10161,68 @@ cluster_pcm_local_pi_retire_v1(const ClusterPcmLocalPiSnapshotV1 *local,
 	LWLockRelease(&ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&ref);
 	return result;
+}
+
+int
+cluster_pcm_local_pi_redeclare_scan_chunk(int start, int max_scan, uint64 epoch,
+										  ClusterGcsRedeclareCallback cb, void *arg)
+{
+	int end;
+	if (start < 0)
+		start = 0;
+	if (!cluster_shared_config)
+		return start;
+	if (MyBackendType != B_LMON || !cluster_enabled || ClusterPcm == NULL
+		|| cluster_pcm_htab == NULL || cluster_pcm_resource_x_slots == NULL
+		|| pcm_grd_effective <= 0 || cb == NULL || max_scan <= 0 || epoch == 0)
+		return -1 - start;
+	start = Min(start, pcm_grd_effective);
+	end = start + Min(max_scan, pcm_grd_effective - start);
+	for (int i = start; i < end; i++) {
+		ClusterPcmResourceXSlot slot;
+		ClusterPcmLocalPiSnapshotV1 local;
+		PcmEntryRef ref;
+		PcmEntryAcquireResult acquired;
+		uint64 census_hash;
+		bool valid;
+		int state;
+
+		/* Copy the index under its original owner; never keep a raw entry
+		 * pointer or a table/entry lock while sending or waiting for ACK. */
+		LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+		slot = cluster_pcm_resource_x_slots[i];
+		LWLockRelease(&ClusterPcm->htab_lock.lock);
+		if (slot.state == PCM_REGISTRY_EMPTY || slot.state == PCM_REGISTRY_TOMBSTONE)
+			continue;
+		if (slot.state != PCM_REGISTRY_LIVE || slot.reserved != 0
+			|| slot.retired_authority_generation != 0 || slot.binding_generation == 0
+			|| slot.binding_generation == UINT64_MAX)
+			return -1 - i;
+		state = cluster_grd_block_redeclare_state_v1(slot.tag, epoch, &census_hash);
+		if (state < 0)
+			return -1 - i;
+		if (state == 0)
+			continue;
+		if (!pcm_entry_ref_acquire(&slot.tag, false, &ref, &acquired))
+			return -1 - i;
+		if (!LWLockConditionalAcquire(&ref.entry->entry_lock.lock, LW_SHARED)) {
+			pcm_entry_ref_release(&ref);
+			return -1 - i;
+		}
+		valid = ref.binding_generation == slot.binding_generation && ref.registry_slot == (uint32)i
+				&& pcm_local_pi_snapshot_locked(ref.entry, &local);
+		LWLockRelease(&ref.entry->entry_lock.lock);
+		pcm_entry_ref_release(&ref);
+		if (!valid)
+			return -1 - i;
+		/* This source still owes an old version, even with no physical PI.
+		 * N adds only its responsibility bit. A foreign retained LSN/token
+		 * cannot become the new master's numeric service watermark. */
+		if (local.first.record_start != InvalidXLogRecPtr
+			&& !cb(local.resource, PCM_STATE_N, InvalidXLogRecPtr, InvalidScn, arg))
+			return -1 - i;
+	}
+	return end;
 }
 
 static bool
@@ -16274,6 +16392,37 @@ pcm_resource_x_target_evict_release_matches_locked(
 }
 
 ResourceXApplyResult
+cluster_pcm_lock_resource_x_target_evict_record_pi_exact(ResourceXTargetEvictionPlan *plan)
+{
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	ClusterPageWalBindingV1 binding;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_STALE;
+
+	if (plan == NULL || !plan->prepared || !plan->local_n_committed || plan->release_admitted
+		|| plan->pi_recorded || !cluster_shared_config
+		|| !BufferTagsEqual(&plan->tag, &plan->release.common.logical_assertion.resource)
+		|| !cluster_page_wal_ref_read_v1(&plan->pi_refs[0], BufTagGetRelFileLocator(&plan->tag),
+										 plan->tag.forkNum, plan->tag.blockNum, &binding))
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&plan->tag, false, &ref, &acquired))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	pcm_entry_lock_exclusive(ref.entry);
+	if (pcm_resource_x_target_evict_release_matches_locked(
+			ref.entry, &ref.entry->resource_x_bootstrap_round, &plan->release, plan->master_node,
+			plan->r4_record_generation, plan->cached_ownership_generation, &plan->owner)) {
+		result = pcm_local_pi_remember_locked(ref.entry, &binding, plan->pi_refs)
+					 ? RESOURCE_X_APPLY_APPLIED
+					 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		if (result == RESOURCE_X_APPLY_APPLIED)
+			plan->pi_recorded = true;
+	}
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
+ResourceXApplyResult
 cluster_pcm_lock_resource_x_target_evict_commit_exact(const ResourceXDecodedFrame *release,
 													  int32 current_master_node,
 													  uint64 r4_record_generation,
@@ -19118,7 +19267,7 @@ pcm_resource_x_holder_pair_publish_internal(const ResourceXAssertion *assertion,
 	 * Other page classes retain the existing guard and full-WAL reconstruction. */
 	if (cluster_shared_config && image.common.observed_mode == PCM_STATE_X
 		&& image.body.image_envelope.page_wal.record_start != 0
-		&& !pcm_local_pi_remember_locked(entry, &image.body.image_envelope.page_wal)) {
+		&& !pcm_local_pi_remember_locked(entry, &image.body.image_envelope.page_wal, NULL)) {
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		goto pair_publish_done;
 	}

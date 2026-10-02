@@ -150,6 +150,15 @@ extern bool cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 
 extern bool cluster_page_wal_pi_snapshot_locked_v1(struct BufferDesc *buf,
 												   ClusterPageWalBindingV1 *out);
 
+/* Original cached-X eviction owner: header locked, exact X+REVOKING fence,
+ * clean bytes and only the caller's optional pin. An absent attribution is
+ * explicit and cannot certify DATA or retire any responsibility. */
+struct ClusterPcmOwnSnapshot;
+extern ClusterPageWalCaptureResultV1
+cluster_page_wal_eviction_snapshot_locked_v1(struct BufferDesc *buf,
+											 const struct ClusterPcmOwnSnapshot *fence,
+											 uint32 caller_pins, ClusterPageWalBindingV1 *out);
+
 /* Original T2 owner preflights under content-X before touching page/authority.
  * An all-zero carrier explicitly clears old attribution. A successful prepare
  * reserves its source before page/authority mutation. The process-local value

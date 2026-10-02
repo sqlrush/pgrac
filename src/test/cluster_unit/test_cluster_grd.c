@@ -492,6 +492,23 @@ cluster_gcs_block_send_redeclare(BufferTag tag pg_attribute_unused(),
  * stays false until the cursor reaches it. */
 static int fake_scan_nbuffers = 0;
 static bool fake_scan_pending;
+static int fake_pi_scan_count;
+static int fake_pi_scan_calls;
+static int fake_pi_scan_start;
+static bool fake_pi_scan_pending;
+int
+cluster_pcm_local_pi_redeclare_scan_chunk(int start, int max_scan, uint64 epoch,
+										  ClusterGcsRedeclareCallback cb, void *arg)
+{
+	(void)epoch;
+	(void)cb;
+	(void)arg;
+	fake_pi_scan_calls++;
+	fake_pi_scan_start = start;
+	if (fake_pi_scan_pending)
+		return -1 - start;
+	return Min(start + max_scan, fake_pi_scan_count);
+}
 int
 cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 									ClusterGcsRedeclareCallback cb pg_attribute_unused(),
@@ -2617,6 +2634,39 @@ UT_TEST(test_grd_d2_redeclare_scan_completion_gate)
 	fake_scan_nbuffers = 0; /* restore no-op for any later test */
 }
 
+UT_TEST(test_grd_redeclare_waits_for_detached_logical_pi_ack)
+{
+	/* No buffer remains, but its old source still owns a logical PI. */
+	cluster_shared_config = true;
+	fake_scan_nbuffers = 0;
+	fake_pi_scan_count = 257;
+	fake_pi_scan_calls = 0;
+	fake_pi_scan_pending = true;
+	grd_block_redeclare_step(12345);
+	UT_ASSERT(!grd_block_redeclare_scan_complete(12345));
+	UT_ASSERT_EQ(fake_pi_scan_calls, 1);
+	UT_ASSERT_EQ(fake_pi_scan_start, 0);
+	grd_block_redeclare_step(12345);
+	UT_ASSERT(!grd_block_redeclare_scan_complete(12345));
+	UT_ASSERT_EQ(fake_pi_scan_start, 0);
+	fake_pi_scan_pending = false;
+	grd_block_redeclare_step(12345);
+	UT_ASSERT(!grd_block_redeclare_scan_complete(12345));
+	grd_block_redeclare_step(12345);
+	UT_ASSERT_EQ(fake_pi_scan_start, 256);
+	UT_ASSERT(!grd_block_redeclare_scan_complete(12345));
+	grd_block_redeclare_step(12345);
+	UT_ASSERT(grd_block_redeclare_scan_complete(12345));
+	/* A new episode must acknowledge the detached obligations again. */
+	fake_pi_scan_pending = true;
+	grd_block_redeclare_step(12346);
+	UT_ASSERT(!grd_block_redeclare_scan_complete(12346));
+	UT_ASSERT_EQ(fake_pi_scan_start, 0);
+	fake_pi_scan_count = 0;
+	fake_pi_scan_pending = false;
+	cluster_shared_config = false;
+}
+
 
 /* ============================================================
  * spec-5.1b — GES grant/convert state machine (D11 unit suite U1-U11).
@@ -3646,6 +3696,66 @@ UT_TEST(test_walr_convert_nowait_requires_exact_old_holder_id)
 	UT_ASSERT_EQ(
 		(int)cluster_grd_convert_nowait(&resid, 1, 100, 0, ShareLock, ExclusiveLock, 42, 41, 1, 0),
 		(int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	convert_teardown();
+}
+
+/* Exercise the production master conversion/holder table, not the caller's
+ * S5 result fixture. A remote recovery/read pin must exclude completion X. */
+UT_TEST(test_walr_completion_master_excludes_remote_readers)
+{
+	ClusterResId resid = { 0 };
+	ClusterGrdHolderId completing = bast_holder(1, 100, 41);
+	ClusterGrdHolderId reader = bast_holder(2, 200, 51);
+	ClusterGrdHolderId late_reader = bast_holder(2, 201, 61);
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nconflict = -1;
+	LOCKMODE mode = NoLock;
+
+	convert_reset();
+	resid.type = CLUSTER_WAL_RETENTION_RESID_TYPE;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	resid.field1 = 3;
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant_meta(
+					 &resid, &completing, 1, 41, (ClusterGrdWaiterMeta){ 0, 0 }, 0,
+					 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nconflict),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant_meta(
+					 &resid, &reader, 2, 51, (ClusterGrdWaiterMeta){ 0, 0 }, 0,
+					 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nconflict),
+				 CLUSTER_GRD_GRANT_NOW);
+	for (unsigned attempt = 0; attempt < 3; attempt++) {
+		UT_ASSERT_EQ(cluster_grd_convert_nowait(&resid, 1, 100, 0, ShareLock, ExclusiveLock,
+												42 + attempt, 41, 1, 0),
+					 CLUSTER_GRD_CONVERT_CONFLICT_NOWAIT);
+		UT_ASSERT(cluster_grd_holder_mode_by_id(&resid, &completing, &mode));
+		UT_ASSERT_EQ(mode, ShareLock);
+		UT_ASSERT(cluster_grd_holder_mode_by_id(&resid, &reader, &mode));
+		UT_ASSERT_EQ(mode, ShareLock);
+		UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, false, &entry),
+					 CLUSTER_GRD_ENTRY_OK);
+		UT_ASSERT_EQ(cluster_grd_entry_nconverts(entry), 0);
+		cluster_grd_entry_release(entry);
+	}
+	UT_ASSERT_EQ(cluster_grd_release_holder_by_id(&resid, &reader), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(
+		cluster_grd_convert_nowait(&resid, 1, 100, 0, ShareLock, ExclusiveLock, 45, 41, 1, 0),
+		CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	UT_ASSERT(!cluster_grd_holder_mode_by_id(&resid, &completing, NULL));
+	completing.request_id = 45;
+	UT_ASSERT(cluster_grd_holder_mode_by_id(&resid, &completing, &mode));
+	UT_ASSERT_EQ(mode, ExclusiveLock);
+	UT_ASSERT_EQ(cluster_grd_entry_grant_conditional(&resid, &late_reader, 2, 61, 0,
+													 GES_REQ_OPCODE_REQUEST_NOWAIT, ShareLock,
+													 conflicts, &nconflict),
+				 CLUSTER_GRD_CONFLICT_NOWAIT);
+	UT_ASSERT(!cluster_grd_holder_mode_by_id(&resid, &late_reader, NULL));
+	UT_ASSERT_EQ(cluster_grd_release_holder_by_id(&resid, &completing), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_grant_conditional(&resid, &late_reader, 2, 61, 0,
+													 GES_REQ_OPCODE_REQUEST_NOWAIT, ShareLock,
+													 conflicts, &nconflict),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_release_holder_by_id(&resid, &late_reader), CLUSTER_GRD_ENTRY_OK);
 	convert_teardown();
 }
 
@@ -6956,7 +7066,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(146);
+	UT_PLAN(148);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
@@ -7002,6 +7112,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_grd_lookup_master_rejects_undo_resid);
 	UT_RUN(test_grd_shard_phase_accessors);
 	UT_RUN(test_grd_d2_redeclare_scan_completion_gate);
+	UT_RUN(test_grd_redeclare_waits_for_detached_logical_pi_ack);
 	UT_RUN(test_grd_redeclare_unacknowledged_buffer_does_not_advance_cursor);
 
 	/* spec-5.1b — GES grant/convert state machine (U1-U11). */
@@ -7035,6 +7146,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_5_1c_u9c_different_backend_normal);
 	UT_RUN(test_ul_grant_conditional_no_waiter_enqueued);
 	UT_RUN(test_walr_convert_nowait_requires_exact_old_holder_id);
+	UT_RUN(test_walr_completion_master_excludes_remote_readers);
 	UT_RUN(test_ul_advisory_resid_encoding);
 	UT_RUN(test_ul_advisory_mode_matrix_conditional);
 	UT_RUN(test_5_1c_u5_bast_consume_drains);

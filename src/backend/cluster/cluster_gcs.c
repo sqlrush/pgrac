@@ -594,6 +594,9 @@ gcs_transition_and_wait_internal(BufferTag tag, PcmLockTransition transition_id,
 							   (int)transition_id)));
 	}
 
+	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config, transition_id))
+		return GCS_REPLY_DENIED_VALIDATOR_REJECT;
+
 	slot = gcs_reserve_slot(tag, (uint8)transition_id, master_node, &request_id);
 
 	/* Build payload.  spec-2.32 wire ABI = 48B (HC73). */
@@ -795,6 +798,8 @@ cluster_gcs_send_transition_nowait(BufferTag tag, PcmLockTransition transition_i
 
 	if (transition_id < PCM_TRANS_N_TO_S || transition_id > PCM_TRANS_S_TO_X_CLEANOUT)
 		return false;
+	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config, transition_id))
+		return false;
 	if (master_node < 0 || master_node == cluster_node_id)
 		return false;
 
@@ -870,6 +875,13 @@ cluster_gcs_handle_request_envelope(const ClusterICEnvelope *env, const void *pa
 		return;
 	}
 
+	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config,
+											 (PcmLockTransition)req->transition_id)) {
+		gcs_send_reply(req->sender_node, req->request_id, req->transition_id,
+					   GCS_REPLY_DENIED_VALIDATOR_REJECT);
+		return;
+	}
+
 	/* HC73:  epoch freshness check. */
 	current_epoch = cluster_epoch_get_current();
 	if (req->epoch < current_epoch) {
@@ -907,7 +919,9 @@ cluster_gcs_handle_reply_envelope(const ClusterICEnvelope *env, const void *payl
 	pg_atomic_fetch_add_u64(&ClusterGcs->handle_reply_count, 1);
 	pg_atomic_fetch_add_u64(&ClusterGcs->decode_payload_bytes, sizeof(*reply));
 
-	if (!gcs_mark_slot_reply(env, reply)) {
+	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config,
+											 (PcmLockTransition)reply->transition_id)
+		|| !gcs_mark_slot_reply(env, reply)) {
 		/* HC74: unknown request_id = stale/late reply; local drop. */
 		pg_atomic_fetch_add_u64(&ClusterGcs->reply_late_drop_count, 1);
 		return;

@@ -26,6 +26,8 @@ static uint32 wait_event;
 uint32 *my_wait_event_info = &wait_event;
 static BufferDescPadded desc, many_descriptors[258];
 BufferDescPadded *BufferDescriptors = &desc;
+static ClusterPcmOwnEntry own_entry;
+ClusterPcmOwnEntry *ClusterPcmOwnArray = &own_entry;
 static PGAlignedBlock page, private_page, many_pages[258];
 char *BufferBlocks = page.data;
 Block *LocalBufferBlockPointers;
@@ -902,6 +904,65 @@ pi_snapshot_requires_frozen_header_owner(void)
 }
 
 static void
+eviction_snapshot_requires_exact_clean_revoke(void)
+{
+	for (int pins = 0; pins <= 1; pins++) {
+		for (int variant = 0; variant < 10; variant++) {
+			ClusterPcmOwnSnapshot fence = { 0 };
+			ClusterPageWalBindingV1 out, untouched;
+			reset();
+			UT_ASSERT(capture());
+			PageSetLSNPreserveOrigin(page.data, 0x200);
+			memset(&own_entry, 0, sizeof(own_entry));
+			pg_atomic_init_u64(&own_entry.generation, 7);
+			pg_atomic_init_u64(&own_entry.reservation_token, 9);
+			pg_atomic_init_u32(&own_entry.flags, PCM_OWN_FLAG_REVOKING);
+			desc.bufferdesc.pcm_state = PCM_STATE_X;
+			desc.bufferdesc.buffer_type = BUF_TYPE_XCUR;
+			pg_atomic_write_u32(&desc.bufferdesc.state, BM_LOCKED | BM_VALID | BM_TAG_VALID
+															| BM_PERMANENT
+															| pins * BUF_REFCOUNT_ONE);
+			fence.tag = desc.bufferdesc.tag;
+			fence.generation = 7;
+			fence.reservation_token = 9;
+			fence.flags = PCM_OWN_FLAG_REVOKING;
+			fence.pcm_state = PCM_STATE_X;
+			fence.buffer_type = BUF_TYPE_XCUR;
+			if (variant == 1)
+				pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_DIRTY);
+			if (variant == 2)
+				pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_IN_PROGRESS);
+			if (variant == 3)
+				pg_atomic_fetch_add_u32(&desc.bufferdesc.state, BUF_REFCOUNT_ONE);
+			if (variant == 4)
+				pg_atomic_write_u64(&own_entry.generation, 8);
+			if (variant == 5)
+				pg_atomic_write_u64(&own_entry.writer_activation_token, 1);
+			if (variant == 6)
+				fence.tag.blockNum++;
+			if (variant == 7)
+				((PageHeader)page.data)->pd_block_scn++;
+			if (variant == 8)
+				pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_LOCKED);
+			if (variant == 9)
+				cluster_page_wal_reset_reuse_locked(&desc.bufferdesc);
+			memset(&untouched, 0xa5, sizeof(untouched));
+			out = untouched;
+			UT_ASSERT_EQ(
+				cluster_page_wal_eviction_snapshot_locked_v1(&desc.bufferdesc, &fence, pins, &out),
+				variant == 0   ? CLUSTER_PAGE_WAL_CAPTURED
+				: variant == 9 ? CLUSTER_PAGE_WAL_UNATTRIBUTED
+							   : CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
+			if (variant == 0) {
+				UT_ASSERT_EQ(out.record_end, 0x200);
+				UT_ASSERT_EQ(out.version.mutation_token, 80);
+			} else
+				UT_ASSERT_EQ(memcmp(&out, &untouched, sizeof(out)), 0);
+		}
+	}
+}
+
+static void
 detached_reference_survives_descriptor_reuse(void)
 {
 	ClusterPageWalRefV1 ref = { 0 }, zero = { 0 };
@@ -991,6 +1052,7 @@ main(void)
 	UT_RUN(bounded_claim_pool_and_t2_reservation_release);
 	UT_RUN(pregrant_owner_releases_preparation_on_all_outcomes);
 	UT_RUN(pi_snapshot_requires_frozen_header_owner);
+	UT_RUN(eviction_snapshot_requires_exact_clean_revoke);
 	UT_RUN(detached_reference_survives_descriptor_reuse);
 	UT_RUN(detached_reference_rejects_invalid_and_full_pool_without_changes);
 	free(shared_memory);
