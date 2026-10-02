@@ -110,6 +110,13 @@ extern bool rf_side_online_plan_bind_database_v1(RfSideOnlinePlanV1 *plan,
 extern bool rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan,
 	uint64 system_identifier, const uint8 storage_uuid[16],
 	const RfContributorStreamCutV1 *cut);
+/* UINT32_MAX for an invalid or unsealed plan. */
+extern uint32 rf_side_online_plan_participant_count_v1(const RfSideOnlinePlanV1 *plan);
+/* The physical lower alone must not authorize replay of retained history. */
+extern bool rf_side_online_plan_replay_start_matches_v1(const RfSideOnlinePlanV1 *plan,
+														uint32 thread, uint64 incarnation,
+														uint64 database_incarnation,
+														XLogRecPtr native_redo);
 extern bool rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
 	const RfSideXactOperationV1 *operation);
 /* Only later native TRUNCATE in this exact sealed source can justify an

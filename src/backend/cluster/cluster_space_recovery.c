@@ -20,7 +20,9 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_space_recovery.h"
+#include "cluster/cluster_wal_tail.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -45,6 +47,7 @@ typedef struct SpaceRecoveryTarget {
 
 struct ClusterSpaceRecoveryBatchV1 {
 	const ClusterThreadRecoveryFabricPlanV1 *fabric;
+	ClusterRecoveryFencePlan *cold_fence;
 	const RfSideOnlinePlanV1 *side;
 	const ClusterThreadRecoveryAuthorityV1 *sources;
 	uint32 source_count;
@@ -66,8 +69,16 @@ struct ClusterSpaceRecoveryBatchV1 {
 static bool
 space_sources_fresh_current_owner(const ClusterSpaceRecoveryBatchV1 *batch)
 {
-	if (batch == NULL || batch->source_count == 0
-		|| batch->source_count
+	if (batch == NULL || batch->source_count == 0)
+		return false;
+	if (batch->cold_fence != NULL) {
+		if (!AmStartupProcess() || !RecoveryInProgress() || batch->fabric != NULL
+			|| !cluster_recovery_merge_fence_plan_revalidate_nowait(batch->cold_fence)
+			|| batch->source_count
+				   != cluster_recovery_merge_fence_plan_origin_count(batch->cold_fence)
+			|| batch->source_count != rf_side_online_plan_participant_count_v1(batch->side))
+			return false;
+	} else if (batch->source_count
 			   != cluster_thread_recovery_fabric_participant_count_v1(batch->fabric))
 		return false;
 	for (uint32 i = 0; i < batch->source_count; i++) {
@@ -76,14 +87,34 @@ space_sources_fresh_current_owner(const ClusterSpaceRecoveryBatchV1 *batch)
 
 		if (cluster_thread_recovery_authority_revalidate_nowait_v1(a) != CLUSTER_THREAD_AUTHORITY_OK
 			|| a->duty == NULL || a->root_snapshot == NULL || a->retention_pin == NULL
-			|| a->retention_pin != batch->sources[0].retention_pin
-			|| !cluster_thread_recovery_fabric_identity_matches_v1(
-				batch->fabric, a->duty->system_identifier, a->duty->storage_uuid)
-			|| !cluster_thread_recovery_fabric_identity_matches_v1(
-				batch->fabric, a->root_snapshot->identity.system_identifier,
-				a->root_snapshot->identity.storage_uuid)
-			|| !cluster_thread_recovery_fabric_cut_v1(batch->fabric, i, &cut)
-			|| cut.failed_thread == 0 || cut.failed_thread != a->duty->origin_thread_id
+			|| a->retention_pin != batch->sources[0].retention_pin)
+			return false;
+		if (batch->cold_fence != NULL) {
+			if (a->serial_guard == NULL || !a->serial_guard->held
+				|| a->serial_guard->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED)
+				return false;
+			cut = (RfContributorStreamCutV1){
+				.failed_thread = a->duty->origin_thread_id,
+				.origin_owner_incarnation = a->duty->origin_owner_incarnation,
+				.timeline_id = a->root_snapshot->checkpoint_tli,
+				.flags = RF_CONTRIBUTOR_CUT_COMPLETE,
+				.scan_begin_inclusive = a->root_snapshot->checkpoint_lower_lsn,
+				.scan_end_exclusive = a->root_snapshot->validated_tail_lsn_exclusive
+			};
+			if (!rf_side_online_plan_source_matches_v1(batch->side, a->duty->system_identifier,
+													   a->duty->storage_uuid, &cut)
+				|| !rf_side_online_plan_source_matches_v1(
+					batch->side, a->root_snapshot->identity.system_identifier,
+					a->root_snapshot->identity.storage_uuid, &cut))
+				return false;
+		} else if (!cluster_thread_recovery_fabric_identity_matches_v1(
+					   batch->fabric, a->duty->system_identifier, a->duty->storage_uuid)
+				   || !cluster_thread_recovery_fabric_identity_matches_v1(
+					   batch->fabric, a->root_snapshot->identity.system_identifier,
+					   a->root_snapshot->identity.storage_uuid)
+				   || !cluster_thread_recovery_fabric_cut_v1(batch->fabric, i, &cut))
+			return false;
+		if (cut.failed_thread == 0 || cut.failed_thread != a->duty->origin_thread_id
 			|| (cluster_shared_config && cut.origin_owner_incarnation == 0)
 			|| (cut.origin_owner_incarnation != 0
 				&& cut.origin_owner_incarnation != a->duty->origin_owner_incarnation)
@@ -201,7 +232,11 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply)
 	cluster_hw_resid_encode(target->key.locator, MAIN_FORKNUM, &resid);
 	PG_TRY();
 	{
-		if (!cluster_hw_lock(&resid, &batch->hw) || !space_sources_fresh(batch))
+		/* A committed cold plan holds the complete formed recovery isolation.
+		 * Serving HW cannot be acquired during that startup phase. Online
+		 * callers still acquire HW before taking any target buffer locks. */
+		if ((batch->cold_fence == NULL && !cluster_hw_lock(&resid, &batch->hw))
+			|| !space_sources_fresh(batch))
 			goto done;
 		batch->previous_owner = CurrentResourceOwner;
 		batch->io_owner = ResourceOwnerCreate(CurrentResourceOwner, "SPACE recovery I/O");
@@ -315,13 +350,14 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply)
 	return ok;
 }
 
-bool
-cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
-									const ClusterThreadRecoveryAuthorityV1 *sources, uint32 count,
-									ClusterSpaceRecoveryBatchV1 **out)
+static bool
+space_recovery_preflight(const ClusterThreadRecoveryFabricPlanV1 *plan,
+						 const RfSideOnlinePlanV1 *side, ClusterRecoveryFencePlan *cold_fence,
+						 const ClusterThreadRecoveryAuthorityV1 *sources, uint32 count,
+						 ClusterSpaceRecoveryBatchV1 **out)
 {
 	ClusterSpaceRecoveryBatchV1 *batch;
-	const RfSideOnlinePlanV1 *side;
+	ClusterThreadRecoveryAuthorityV1 *cold_sources;
 	uint32 targets, operations;
 	Size bytes;
 	size_t scratch;
@@ -330,10 +366,14 @@ cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *pla
 	if (out == NULL)
 		return false;
 	*out = NULL;
-	if (!cluster_enabled || !cluster_shared_config || plan == NULL || sources == NULL || count == 0
-		|| count > RF_PAGE_STABLE_MAX_PARTICIPANTS)
+	if (!cluster_enabled || !cluster_shared_config || count == 0
+		|| count > RF_PAGE_STABLE_MAX_PARTICIPANTS
+		|| (cold_fence == NULL
+				? (plan == NULL || sources == NULL)
+				: (plan != NULL || sources != NULL || !AmStartupProcess() || !RecoveryInProgress()
+				   || !cluster_recovery_merge_fence_plan_revalidate_nowait(cold_fence)
+				   || count != rf_side_online_plan_participant_count_v1(side))))
 		return false;
-	side = cluster_thread_recovery_fabric_side_plan_v1(plan);
 	if (side == NULL)
 		return false;
 	targets = rf_side_online_plan_space_target_count_v1(side);
@@ -343,7 +383,8 @@ cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *pla
 		|| operations > RF_SIDE_ONLINE_PLAN_MAX_BYTES / sizeof(uint32))
 		return false;
 	bytes = sizeof(*batch) + (Size)targets * sizeof(SpaceRecoveryTarget)
-			+ (Size)operations * sizeof(uint32) + 4 * BLCKSZ;
+			+ (Size)operations * sizeof(uint32) + 4 * BLCKSZ
+			+ (cold_fence != NULL ? (Size)count * sizeof(*cold_sources) : 0);
 	scratch = targets == 0 ? 0 : cluster_space_recovery_scratch_bytes(operations);
 	/* Preparation temporarily owns input pointers, two index arrays and
  * the common codec's scratch while our complete batch remains alive. */
@@ -375,6 +416,7 @@ cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *pla
 	if (batch == NULL)
 		return false;
 	batch->fabric = plan;
+	batch->cold_fence = cold_fence;
 	batch->side = side;
 	batch->sources = sources;
 	batch->source_owner = CurrentResourceOwner;
@@ -382,10 +424,39 @@ cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *pla
 	batch->target_count = targets;
 	batch->operation_count = operations;
 	batch->allocated_bytes = bytes - 4 * BLCKSZ;
-	batch->targets = (SpaceRecoveryTarget *)(batch + 1);
+	cold_sources = (ClusterThreadRecoveryAuthorityV1 *)(batch + 1);
+	batch->targets = (SpaceRecoveryTarget *)(cold_fence != NULL
+												 ? cold_sources + count
+												 : (ClusterThreadRecoveryAuthorityV1 *)(batch + 1));
 	batch->order = (uint32 *)(batch->targets + targets);
 	PG_TRY();
 	{
+		if (cold_fence != NULL) {
+			batch->sources = cold_sources;
+			for (uint32 i = 0; i < count; i++) {
+				ClusterControlRootSnapshot root;
+				ClusterControlRootReadToken token;
+				ClusterWalSourceRef source;
+				XLogRecPtr native_redo;
+				uint16 thread;
+
+				if (!cluster_recovery_merge_fence_plan_origin(cold_fence, i, &thread, &root, &token)
+					|| !cluster_recovery_merge_fence_plan_authority(cold_fence, thread,
+																	&cold_sources[i]))
+					goto done;
+				/* Read the same token's native anchor before any target lock.
+				 * Later I/O revalidates that original authority; a sealed plan
+				 * may not substitute its physical lower for this redo start. */
+				if (cluster_control_root_recovery_source_v1(cold_sources[i].root_snapshot,
+															cold_sources[i].root_token, &source,
+															&native_redo)
+						!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					|| !rf_side_online_plan_replay_start_matches_v1(
+						side, thread, cold_sources[i].duty->origin_owner_incarnation,
+						source.claim.database_incarnation, native_redo))
+					goto done;
+			}
+		}
 		if (!space_sources_fresh(batch))
 			goto done;
 		for (uint32 i = 0; i < targets; i++)
@@ -404,6 +475,26 @@ cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *pla
 	if (ok)
 		*out = batch;
 	return ok;
+}
+
+bool
+cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
+									const ClusterThreadRecoveryAuthorityV1 *sources, uint32 count,
+									ClusterSpaceRecoveryBatchV1 **out)
+{
+	return space_recovery_preflight(
+		plan, plan != NULL ? cluster_thread_recovery_fabric_side_plan_v1(plan) : NULL, NULL,
+		sources, count, out);
+}
+
+bool
+cluster_space_recovery_cold_preflight_v1(const RfSideOnlinePlanV1 *side,
+										 ClusterRecoveryFencePlan *fence,
+										 ClusterSpaceRecoveryBatchV1 **out)
+{
+	return space_recovery_preflight(
+		NULL, side, fence, NULL,
+		fence != NULL ? cluster_recovery_merge_fence_plan_origin_count(fence) : 0, out);
 }
 
 bool
@@ -436,8 +527,10 @@ cluster_space_recovery_flush_permitted_v1(const ClusterSpaceRecoveryBatchV1 *bat
 	ForkNumber fork;
 	BlockNumber block;
 
-	if (batch == NULL || batch->active == NULL || !batch->preflight_complete || !batch->hw.held
-		|| !batch->hw.coordinated || batch->hw.req.lockmode != ExclusiveLock
+	if (batch == NULL || batch->active == NULL || !batch->preflight_complete
+		|| (batch->cold_fence == NULL
+			&& (!batch->hw.held || !batch->hw.coordinated
+				|| batch->hw.req.lockmode != ExclusiveLock))
 		|| !BufferIsValid(buffer) || buffer != batch->buffers[1] || BufferIsLocal(buffer)
 		|| !space_sources_fresh(batch))
 		return false;

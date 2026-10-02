@@ -25,9 +25,11 @@
 #include "cluster/cluster_hw.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_mode.h"
+#include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_space_recovery.h"
+#include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -63,9 +65,19 @@ static uint8 payload[2][CLUSTER_SPACE_RESERVATION_WAL_BYTES];
 static RfSideOnlineOperationV1 operations[2];
 static ClusterRecoveryDutyKey duties[2];
 static ClusterControlRootSnapshot roots[2];
+static ClusterControlRootReadToken root_tokens[2];
 static ClusterThreadRecoveryAuthorityV1 sources[2];
+static ClusterRecoverySerialGuard serials[2];
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+static bool recovery = true, cold_current = true;
+static uint16 cold_origins = 2;
+static ClusterRecoveryFencePlan *cold_fence = (void *)7;
 static ClusterSpaceIdentityKey key;
 static RfContributorStreamCutV1 cuts[2];
+static XLogRecPtr native_redo[2];
+static XLogRecPtr source_redo[2];
+static uint64 source_database[2];
+static bool source_unavailable;
 static unsigned pins, locks, writes, syncs, reads, lock_calls;
 static bool hw_held, permitted, stale, exists, corrupt_disk, structural, wrong_cut;
 static bool corrupt_checksum, checksums, ignore_checksum_failure;
@@ -88,6 +100,72 @@ static bool cluster_pcm_x_finish_retain_flush_fault_active;
 #endif
 static const ClusterThreadRecoveryFabricPlanV1 *fabric = (void *)1;
 static RfSideOnlinePlanV1 *side;
+static ResourceOwner source_owner = (void *)6;
+
+static bool
+cold_protected(void)
+{
+	return MyAuxProcType == StartupProcess && recovery && cold_current && cold_origins == 2
+		   && serials[0].held && serials[1].held
+		   && serials[0].mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+		   && serials[1].mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+}
+
+uint16
+cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *plan)
+{
+	return plan == cold_fence ? cold_origins : 0;
+}
+
+bool
+cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan)
+{
+	return plan == cold_fence && cold_current;
+}
+
+bool
+cluster_recovery_merge_fence_plan_origin(const ClusterRecoveryFencePlan *plan, uint16 index,
+										 uint16 *thread, ClusterControlRootSnapshot *root,
+										 ClusterControlRootReadToken *token)
+{
+	if (plan != cold_fence || index >= cold_origins || index >= 2)
+		return false;
+	*thread = duties[index].origin_thread_id;
+	*root = roots[index];
+	memset(token, 0, sizeof(*token));
+	return true;
+}
+
+bool
+cluster_recovery_merge_fence_plan_authority(ClusterRecoveryFencePlan *plan, uint16 thread,
+											ClusterThreadRecoveryAuthorityV1 *out)
+{
+	if (plan != cold_fence || !cold_current)
+		return false;
+	for (uint16 i = 0; i < cold_origins && i < 2; i++)
+		if (thread == duties[i].origin_thread_id) {
+			*out = sources[i];
+			return true;
+		}
+	return false;
+}
+
+ClusterControlRootResult
+cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
+										const ClusterControlRootReadToken *token,
+										ClusterWalSourceRef *out, XLogRecPtr *redo)
+{
+	UT_ASSERT(CurrentResourceOwner == source_owner);
+	UT_ASSERT(!pins && !locks && !hw_held);
+	for (int i = 0; i < 2; i++)
+		if (!source_unavailable && root == &roots[i] && token == &root_tokens[i]) {
+			memset(out, 0, sizeof(*out));
+			out->claim.database_incarnation = source_database[i];
+			*redo = source_redo[i];
+			return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		}
+	return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
 /* A SPACE-only source must never query transaction/2PC state. */
 uint64
 GetSystemIdentifier(void)
@@ -112,7 +190,6 @@ TwoPhaseRecoveryPendingReadExact(TransactionId xid, Oid database, const char *gi
 	abort();
 }
 ResourceOwner CurrentResourceOwner;
-static ResourceOwner source_owner = (void *)6;
 static ResourceOwner child_owner = (void *)5;
 ResourceOwner
 ResourceOwnerCreate(ResourceOwner parent, const char *name)
@@ -188,7 +265,10 @@ cluster_thread_recovery_authority_revalidate_nowait_v1(const ClusterThreadRecove
 {
 	if (locks == 3)
 		fault(6);
-	return CurrentResourceOwner == source_owner && !stale && (a == &sources[0] || a == &sources[1])
+	return CurrentResourceOwner == source_owner && !stale
+				   && memcmp(&a->root_snapshot->identity, a->duty, sizeof(*a->duty)) == 0
+				   && (memcmp(a, &sources[0], sizeof(*a)) == 0
+					   || memcmp(a, &sources[1], sizeof(*a)) == 0)
 			   ? CLUSTER_THREAD_AUTHORITY_OK
 			   : CLUSTER_THREAD_AUTHORITY_ROOT_STALE;
 }
@@ -243,7 +323,7 @@ ReadBufferWithoutRelcache(RelFileLocator r, ForkNumber f, BlockNumber b, ReadBuf
 						  BufferAccessStrategy s, bool perm)
 {
 	UT_ASSERT(CurrentResourceOwner == child_owner);
-	UT_ASSERT(hw_held && f == SPACE_FORKNUM && b < 2);
+	UT_ASSERT((hw_held || cold_protected()) && f == SPACE_FORKNUM && b < 2);
 	pins |= 1 << b;
 	fault(1);
 	return b + 1;
@@ -284,7 +364,7 @@ LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
 bool
 cluster_bufmgr_pcm_x_content_holder_write_permitted(BufferDesc *b)
 {
-	UT_ASSERT(locks == 3 && pins == 3 && hw_held);
+	UT_ASSERT(locks == 3 && pins == 3 && (hw_held || cold_protected()));
 	return permitted;
 }
 BlockNumber
@@ -334,7 +414,7 @@ void
 smgrimmedsync(SMgrRelation r, ForkNumber f)
 {
 	UT_ASSERT(CurrentResourceOwner == child_owner);
-	UT_ASSERT(locks == 3 && hw_held);
+	UT_ASSERT(locks == 3 && (hw_held || cold_protected()));
 	fault(5);
 	UT_ASSERT_EQ(fsync(fileno(file)), 0);
 	syncs++;
@@ -384,7 +464,7 @@ AbortBufferIO(Buffer b)
 bool
 RecoveryInProgress(void)
 {
-	return true;
+	return recovery;
 }
 static bool cold_write_allowed = true;
 bool
@@ -459,8 +539,10 @@ shared_buffer_write_error_callback(void *arg)
 static void
 make_plan(void)
 {
-	RfSideOnlinePlanRequestV1 request
-		= { .system_identifier = 17, .physical_cuts = cuts, .participant_count = 2 };
+	RfSideOnlinePlanRequestV1 request = { .system_identifier = 17,
+										  .physical_cuts = cuts,
+										  .participant_count = 2,
+										  .redo_starts = native_redo };
 
 	rf_side_online_plan_destroy_v1(&side);
 	memcpy(request.storage_uuid, key.storage_uuid, 16);
@@ -524,6 +606,11 @@ make_plan(void)
 static void
 reset(void)
 {
+	MyAuxProcType = NotAnAuxProcess;
+	recovery = cold_current = true;
+	cold_origins = 2;
+	source_unavailable = false;
+	memset(serials, 0, sizeof(serials));
 	cold_write_allowed = true;
 	CurrentResourceOwner = source_owner;
 	checksums = true;
@@ -569,6 +656,9 @@ reset(void)
 	changes[1].result_token = 19;
 	key = changes[0].before.identity.key;
 	for (int i = 0; i < 2; i++) {
+		native_redo[i] = 100;
+		source_redo[i] = 100;
+		source_database[i] = 42;
 		UT_ASSERT(
 			cluster_space_reservation_wal_encode(&changes[i], payload[i], sizeof(payload[i])));
 		operations[i].kind = RF_SIDE_ONLINE_OPERATION_SPACE;
@@ -597,7 +687,11 @@ reset(void)
 		roots[i].validated_tail_lsn_exclusive = 200;
 		sources[i].duty = &duties[i];
 		sources[i].root_snapshot = &roots[i];
+		sources[i].root_token = &root_tokens[i];
 		sources[i].retention_pin = (void *)3;
+		serials[i].held = true;
+		serials[i].mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		sources[i].serial_guard = &serials[i];
 		cuts[i] = (RfContributorStreamCutV1){ .failed_thread = i + 2,
 											  .origin_owner_incarnation = 19,
 											  .timeline_id = 7,
@@ -767,12 +861,18 @@ UT_TEST(test_disk_failure_never_completes)
 
 UT_TEST(test_error_releases_original_resources)
 {
-	for (int at = 1; at <= 6; at++) {
+	for (int variant = 0; variant < 12; variant++) {
+		int at = variant % 6 + 1;
 		ClusterSpaceRecoveryBatchV1 *volatile batch = NULL;
 		volatile bool caught = false;
 		reset();
-		UT_ASSERT(cluster_space_recovery_preflight_v1(fabric, sources, 2,
-													  (ClusterSpaceRecoveryBatchV1 **)&batch));
+		if (variant >= 6) {
+			MyAuxProcType = StartupProcess;
+			UT_ASSERT(cluster_space_recovery_cold_preflight_v1(
+				side, cold_fence, (ClusterSpaceRecoveryBatchV1 **)&batch));
+		} else
+			UT_ASSERT(cluster_space_recovery_preflight_v1(fabric, sources, 2,
+														  (ClusterSpaceRecoveryBatchV1 **)&batch));
 		if (!batch)
 			continue;
 		throw_at = at;
@@ -797,21 +897,26 @@ UT_TEST(test_error_releases_original_resources)
 
 UT_TEST(test_native_flush_wait_and_stale_source_unwind)
 {
-	for (int variant = 0; variant < 3; variant++) {
+	for (int variant = 0; variant < 6; variant++) {
+		int failure = variant % 3;
 		ClusterSpaceRecoveryBatchV1 *batch = NULL;
 		PGAlignedBlock before;
 		uint32 before_state;
 		volatile bool caught = false;
 		reset();
 		stale_after_write = false;
-		UT_ASSERT(cluster_space_recovery_preflight_v1(fabric, sources, 2, &batch));
+		if (variant >= 3) {
+			MyAuxProcType = StartupProcess;
+			UT_ASSERT(cluster_space_recovery_cold_preflight_v1(side, cold_fence, &batch));
+		} else
+			UT_ASSERT(cluster_space_recovery_preflight_v1(fabric, sources, 2, &batch));
 		if (!batch)
 			continue;
 		before = pages[1];
 		before_state = pg_atomic_read_u32(&descriptors[1].bufferdesc.state);
-		if (variant == 0)
+		if (failure == 0)
 			cluster_smart_fusion = sf_blocked = true;
-		else if (variant == 1)
+		else if (failure == 1)
 			stale_during_io = true;
 		else
 			stale_after_write = true;
@@ -824,12 +929,12 @@ UT_TEST(test_native_flush_wait_and_stale_source_unwind)
 			caught = true;
 		}
 		PG_END_TRY();
-		UT_ASSERT_EQ(caught, variant == 1);
-		UT_ASSERT_EQ(writes, variant == 2);
+		UT_ASSERT_EQ(caught, failure == 1);
+		UT_ASSERT_EQ(writes, failure == 2);
 		UT_ASSERT_EQ(syncs, 0);
-		UT_ASSERT_EQ(io_aborts, variant == 1);
+		UT_ASSERT_EQ(io_aborts, failure == 1);
 		UT_ASSERT_EQ(wal_flushes, 0);
-		if (variant < 2) {
+		if (failure < 2) {
 			UT_ASSERT(memcmp(pages[1].data, before.data, BLCKSZ) == 0);
 			UT_ASSERT_EQ(pg_atomic_read_u32(&descriptors[1].bufferdesc.state), before_state);
 		} else {
@@ -1064,10 +1169,140 @@ UT_TEST(test_successor_cache_without_physical_proof_refuses)
 	}
 }
 
+UT_TEST(test_cold_complete_fence_installs_interleaved_reservations_and_retries)
+{
+	ClusterSpaceRecoveryBatchV1 *batch = NULL;
+	ClusterSpaceReservation got;
+	uint64 token;
+	reset();
+	MyAuxProcType = StartupProcess;
+	UT_ASSERT(cluster_space_recovery_cold_preflight_v1(side, cold_fence, &batch));
+	UT_ASSERT_NOT_NULL(batch);
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(lock_calls, 0);  /* cold isolation never opens serving HW */
+	UT_ASSERT_EQ(wal_flushes, 0); /* no foreign numeric LSN flush */
+	UT_ASSERT_EQ(syncs, 1);
+	UT_ASSERT(cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1, &key,
+													&got, &token));
+	UT_ASSERT_EQ(got.next_block, 11);
+	UT_ASSERT_EQ(token, 19);
+	cluster_space_recovery_destroy_v1(&batch);
+	UT_ASSERT(cluster_space_recovery_cold_preflight_v1(side, cold_fence, &batch));
+	UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+	UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 19);
+	cluster_space_recovery_destroy_v1(&batch);
+	UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+}
+
+UT_TEST(test_cold_owner_and_complete_source_set_required_before_io)
+{
+	for (int variant = 0; variant < 12; variant++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		reset();
+		MyAuxProcType = StartupProcess;
+		switch (variant) {
+		case 0:
+			MyAuxProcType = BgWriterProcess;
+			break;
+		case 1:
+			recovery = false;
+			break;
+		case 2:
+			cold_current = false;
+			break;
+		case 3:
+			cold_origins = 1;
+			break;
+		case 4:
+			serials[1].mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+			break;
+		case 5:
+			serials[1].held = false;
+			break;
+		case 6:
+			roots[1].identity.origin_owner_incarnation++;
+			break;
+		case 7:
+			roots[1].validated_tail_lsn_exclusive++;
+			break;
+		case 8:
+			sources[1].retention_pin = (void *)4;
+			break;
+		case 9:
+			source_redo[1] = 150;
+			break;
+		case 10:
+			source_database[1]++;
+			break;
+		case 11:
+			source_unavailable = true;
+			break;
+		}
+		UT_ASSERT(!cluster_space_recovery_cold_preflight_v1(side, cold_fence, &batch));
+		UT_ASSERT(batch == NULL && !pins && !locks && !hw_held);
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(reads, 0);
+		UT_ASSERT_EQ(lock_calls, 0);
+	}
+}
+
+UT_TEST(test_cold_late_fence_change_never_writes)
+{
+	ClusterSpaceRecoveryBatchV1 *batch = NULL;
+	PGAlignedBlock before;
+	reset();
+	MyAuxProcType = StartupProcess;
+	before = pages[1];
+	UT_ASSERT(cluster_space_recovery_cold_preflight_v1(side, cold_fence, &batch));
+	UT_ASSERT_NOT_NULL(batch);
+	cold_current = false;
+	UT_ASSERT(!cluster_space_recovery_apply_v1(batch));
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT(memcmp(&before, &pages[1], sizeof(before)) == 0);
+	cluster_space_recovery_destroy_v1(&batch);
+	UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+}
+
+UT_TEST(test_cold_history_does_not_replay_and_structural_owner_is_required)
+{
+	for (int history = 0; history < 2; history++) {
+		ClusterSpaceRecoveryBatchV1 *batch = NULL;
+		PGAlignedBlock before[2];
+		reset();
+		MyAuxProcType = StartupProcess;
+		structural = true;
+		if (history) {
+			native_redo[0] = native_redo[1] = 200;
+			source_redo[0] = source_redo[1] = 200;
+		}
+		make_plan();
+		memcpy(before, pages, sizeof(before));
+		UT_ASSERT_EQ(cluster_space_recovery_cold_preflight_v1(side, cold_fence, &batch), history);
+		if (history) {
+			UT_ASSERT_NOT_NULL(batch);
+			UT_ASSERT(cluster_space_recovery_apply_v1(batch));
+		} else
+			UT_ASSERT_NULL(batch);
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(reads, 0);
+		UT_ASSERT_EQ(syncs, 0);
+		UT_ASSERT_EQ(lock_calls, 0);
+		UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+		cluster_space_recovery_destroy_v1(&batch);
+		UT_ASSERT(!pins && !locks && !hw_held && CurrentResourceOwner == source_owner);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(19);
+	UT_RUN(test_cold_complete_fence_installs_interleaved_reservations_and_retries);
+	UT_RUN(test_cold_owner_and_complete_source_set_required_before_io);
+	UT_RUN(test_cold_late_fence_change_never_writes);
+	UT_RUN(test_cold_history_does_not_replay_and_structural_owner_is_required);
 	UT_RUN(test_cold_violation_blocks_native_write_even_for_already_dirty_page);
 	UT_RUN(test_failed_install_preserves_checkpoint_of_original_dirty_page);
 	UT_RUN(test_interleaved_writers_use_durable_successor_before_suffix);
