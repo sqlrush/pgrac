@@ -136,7 +136,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_control_root \
 		test_cluster_checkpoint_native \
 		test_cluster_checkpoint_buffers \
-		test_cluster_page_data test_cluster_pi_writeback \
+		test_cluster_page_data test_cluster_pi_writeback test_cluster_block_redeclare \
 		test_cluster_page_wal \
 		test_cluster_wal_retention \
 		test_cluster_recovery_duty \
@@ -510,7 +510,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
 SIMPLE_TESTS := $(filter-out test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_wal_cut test_cluster_pi_data test_cluster_thread_tail,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers test_cluster_page_data test_cluster_pi_writeback test_cluster_page_wal,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers test_cluster_page_data test_cluster_pi_writeback test_cluster_block_redeclare test_cluster_page_wal,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_request,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire_master,$(SIMPLE_TESTS))
@@ -2068,6 +2068,10 @@ test_cluster_page_flush.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c M
 	awk '/^FlushBuffer\(/ { print "static void"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@
 
+test_cluster_block_redeclare_scan.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_redeclare_scan_chunk\(/ { print "int"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@
+
 test_cluster_page_data_stable.o: $(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
 
@@ -2110,6 +2114,7 @@ test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c 
 		$(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_data_wire.h
 test_cluster_page_data test_cluster_pi_writeback: unit_test.h test_cluster_page_data.inc \
+		test_cluster_block_redeclare_scan.inc \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h $(CLUSTER_WAL_CLAIM_O) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
@@ -4028,6 +4033,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_block_redeclare_scan.inc
 	rm -f test_cluster_space_recovery_flush.inc
 	rm -f test_cluster_page_data.inc
 	rm -f test_cluster_page_wal_insert.inc
@@ -7063,6 +7069,13 @@ test_cluster_wal_publish_entry.inc: $(top_srcdir)/src/backend/access/transam/xlo
 	mv $@.tmp $@
 
 test_cluster_wal_writer: test_cluster_wal_writer.c
+
+test_cluster_block_redeclare: test_cluster_block_redeclare.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_block_redeclare.h \
+		$(top_builddir)/src/backend/cluster/cluster_block_redeclare.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_builddir)/src/backend/cluster/cluster_block_redeclare.o \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_pi_data: test_cluster_pi_data.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_data.c \

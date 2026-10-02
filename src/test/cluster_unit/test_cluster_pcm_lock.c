@@ -18217,6 +18217,38 @@ UT_TEST(test_pcm_d1_recovering_gate_fail_closed)
  * note v0.1);  this is the L239 unit-proof of the 8.A-relevant master-view
  * reconstruction (D3 adds the not-double-X conflict invariant).
  */
+static int pi_redeclare_frozen = 1;
+int
+cluster_grd_block_redeclare_state_v1(BufferTag tag, uint64 epoch, uint64 *hash)
+{
+	*hash = 133;
+	return pi_redeclare_frozen;
+}
+
+UT_TEST(test_shared_redeclare_preserves_physical_pi_without_current_holder)
+{
+	BufferTag tag = make_tag(899);
+	struct StopPcmEntryLayout *entry;
+	reset_fake_pcm_runtime(4);
+	cluster_shared_config = true;
+	UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(tag, PCM_STATE_N, 80, 90, 0, 7));
+	UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(tag, PCM_STATE_N, 19, 20, 1, 7));
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	if (entry != NULL) {
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->master_state), PCM_STATE_N);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 3);
+		UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(tag, PCM_STATE_X, 7, 8, 2, 7));
+		UT_ASSERT_EQ(entry->x_holder_node, 2);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 3);
+		pi_redeclare_frozen = 0;
+		UT_ASSERT(!cluster_gcs_block_master_rebuild_from_redeclare(tag, PCM_STATE_N, 80, 90, 3, 7));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 3);
+	}
+	pi_redeclare_frozen = 1;
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_pcm_d2_rebuild_from_redeclare)
 {
 	BufferTag tagx = make_tag(88);
@@ -19772,7 +19804,7 @@ UT_TEST(test_stop_seal_keeps_original_identity_validation_first)
 int
 main(void)
 {
-	UT_PLAN(294);
+	UT_PLAN(295);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -20033,6 +20065,7 @@ main(void)
 	UT_RUN(test_pcm_b_local_master_remote_x_holder_fail_closed);
 	UT_RUN(test_pcm_d1_recovering_gate_fail_closed);
 	UT_RUN(test_pcm_d2_rebuild_from_redeclare);
+	UT_RUN(test_shared_redeclare_preserves_physical_pi_without_current_holder);
 	UT_RUN(test_pcm_d3_not_double_x);
 	UT_RUN(test_pcm_wm_prov_table_keeps_last_advance);
 	UT_RUN(test_pcm_acquire_buffer_local_s_nonholder_registers_s_then_upgrades);

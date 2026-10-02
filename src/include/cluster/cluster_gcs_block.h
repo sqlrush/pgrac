@@ -4009,12 +4009,14 @@ extern bool cluster_bufmgr_block_write_permitted(Buffer buffer);
 extern uint32 cluster_bufmgr_flush_and_release_x_for_leave(void);
 
 /* PGRAC: spec-4.7 D2 (Q6-A' worker-centric) — bounded chunked scan of the
- * shared buffer pool that re-declares each locally-held S/X buffer.  The
- * callback receives (tag, held_mode, page_lsn, arg) per qualifying buffer;
+ * shared buffer pool that re-declares each locally-held S/X buffer and,
+ * in shared mode, every N-state physical PI. Callback false retains that
+ * position until actual acknowledgement. A busy/pending position i returns
+ * -1-i; nonnegative results retain the original end-of-scan convention.
  * cluster_bufmgr_redeclare_scan_chunk returns the next cursor (== NBuffers
  * once the whole pool has been scanned) so the LMON reconfig tick can drive
  * it in bounded chunks without blocking the heartbeat. */
-typedef void (*ClusterGcsRedeclareCallback)(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn,
+typedef bool (*ClusterGcsRedeclareCallback)(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn,
 											SCN page_scn, void *arg); /* spec-2.41 D3 +page_scn */
 extern int cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 											   ClusterGcsRedeclareCallback cb, void *arg);
@@ -4149,6 +4151,9 @@ extern ClusterGcsBlockPhase cluster_gcs_block_phase_for_tag(BufferTag tag);
  */
 extern bool cluster_grd_join_remaster_active_for_shard(BufferTag tag);
 extern bool cluster_grd_block_view_rebuilt(BufferTag tag);
+/* Frozen census observation only: -1 unknown/stale, 0 preserved master,
+ * 1 a resource requiring survivor reconstruction. Never grants access. */
+extern int cluster_grd_block_redeclare_state_v1(BufferTag tag, uint64 epoch, uint64 *census_hash);
 
 /*
  * spec-4.7 D5 — redo-before-unfreeze gate (Q5):  true iff the dead origin's
@@ -4167,7 +4172,7 @@ extern bool cluster_gcs_block_redo_lsn_covered(int dead_origin, XLogRecPtr requi
  *		minimal block-resource view via
  *		cluster_gcs_block_master_rebuild_from_redeclare (cluster_pcm_lock.c).
  */
-extern void cluster_gcs_block_send_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn,
+extern bool cluster_gcs_block_send_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn,
 											 SCN page_scn, uint64 cluster_epoch, int master_node);
 extern void cluster_gcs_handle_block_redeclare_envelope(const struct ClusterICEnvelope *env,
 														const void *payload);

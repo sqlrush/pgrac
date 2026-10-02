@@ -2263,6 +2263,85 @@ cluster_grd_dead_bitmap_hash(const uint8 *dead_bitmap)
 	return hash_bytes_extended(dead_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES, 0);
 }
 
+/* A block census can only add obligations while its home is fenced.  The
+ * cross-node identity includes the accepted set: an epoch alone does not
+ * distinguish a growing dead set. Local generations are rechecked but must
+ * not be compared between instances.  This is no DATA/retirement authority. */
+int
+cluster_grd_block_redeclare_state_v1(BufferTag tag, uint64 epoch, uint64 *census_hash)
+{
+	uint8 bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint32 state, direction;
+	uint64 generation, refresh, event_id, hash;
+	bool active;
+	int home;
+
+	if (census_hash != NULL)
+		*census_hash = 0;
+	if (census_hash == NULL || !cluster_enabled || !cluster_shared_config
+		|| cluster_grd_state == NULL || epoch == 0 || cluster_epoch_get_current() != epoch
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| !cluster_membership_is_member(cluster_node_id) || !cluster_qvotec_in_quorum()
+		|| cluster_reconfig_has_pending_prebump_stage()
+		|| pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) == 0)
+		return -1;
+	state = pg_atomic_read_u32(&cluster_grd_state->recovery_state);
+	direction = pg_atomic_read_u32(&cluster_grd_state->recovery_direction);
+	generation = cluster_grd_redeclare_generation();
+	refresh = pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count);
+	event_id = pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id);
+	active = (state == GRD_RECOVERY_WAIT_BARRIER || state == GRD_RECOVERY_WAIT_CLUSTER)
+			 && cluster_grd_redeclare_episode_epoch() == epoch && generation != 0;
+	home = cluster_gcs_lookup_master_static(tag);
+	if (home < 0 || home >= CLUSTER_MAX_NODES)
+		return -1;
+	if (direction == GRD_REMASTER_DIR_FAIL) {
+		if (!active || event_id == 0)
+			return -1;
+		for (int i = 0; i < lengthof(cluster_grd_state->recovery_dead_bitmap); i++) {
+			uint64 word = pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[i]);
+			for (int j = 0; j < 8 && i * 8 + j < sizeof(bitmap); j++)
+				bitmap[i * 8 + j] = (uint8)(word >> (j * 8));
+		}
+		if (cluster_grd_dead_bitmap_hash(bitmap)
+			!= pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash))
+			return -1;
+	} else if (direction == GRD_REMASTER_DIR_JOIN) {
+		/* Fresh recipients have no local JOIN event. Their synchronous fence
+		 * admits declarations, but not service, before the survivor barrier. */
+		if (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch) != epoch
+			|| (!active
+				&& !(state == GRD_RECOVERY_IDLE
+					 && join_fence_is_recipient_for(cluster_node_id, epoch)))
+			|| cluster_grd_join_view_rebuilt())
+			return -1;
+		for (int i = 0; i < CLUSTER_MAX_NODES; i++)
+			if (join_fence_is_recipient_for(i, epoch))
+				bitmap[i / 8] |= (uint8)(1u << (i % 8));
+	} else
+		return -1;
+	hash = hash_bytes_extended(bitmap, sizeof(bitmap), direction);
+	if (hash == 0 || cluster_epoch_get_current() != epoch || !cluster_qvotec_in_quorum()
+		|| cluster_reconfig_has_pending_prebump_stage()
+		|| pg_atomic_read_u32(&cluster_grd_state->recovery_state) != state
+		|| pg_atomic_read_u32(&cluster_grd_state->recovery_direction) != direction
+		|| cluster_grd_redeclare_generation() != generation
+		|| pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count) != refresh
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id) != event_id)
+		return -1;
+	/* Bitmap writers publish only at an episode transition, except JOIN's
+	 * per-recipient monotone union, which needs its own exact second read. */
+	if (direction == GRD_REMASTER_DIR_JOIN) {
+		if (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch) != epoch)
+			return -1;
+		for (int i = 0; i < CLUSTER_MAX_NODES; i++)
+			if (join_fence_is_recipient_for(i, epoch) != !!(bitmap[i / 8] & (1u << (i % 8))))
+				return -1;
+	}
+	*census_hash = hash;
+	return (bitmap[home / 8] & (1u << (home % 8))) != 0 ? 1 : 0;
+}
+
 /*
  * PGRAC: observe the completed failure PROTOCOL barrier without passing P7's
  * DATA-recovery gate. This does not acquire a control lock, retire any holder,
@@ -3715,15 +3794,17 @@ grd_recovery_wait_cluster_watchdog(const uint64 *dead, uint64 episode_epoch)
 #define GRD_BLOCK_REDECLARE_CHUNK 256
 static int grd_block_redeclare_cursor = 0;
 static uint64 grd_block_redeclare_epoch = 0;
+static uint64 grd_block_redeclare_generation = 0;
 static bool grd_block_redeclare_done = false;
 
-static void
+static bool
 grd_block_redeclare_cb(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn, SCN page_scn, void *arg)
 {
 	uint64 episode_epoch = *(const uint64 *)arg;
 	int master = cluster_gcs_lookup_master(tag);
 
-	cluster_gcs_block_send_redeclare(tag, held_mode, page_lsn, page_scn, episode_epoch, master);
+	return cluster_gcs_block_send_redeclare(tag, held_mode, page_lsn, page_scn, episode_epoch,
+											master);
 }
 
 /* Non-static (exposed via cluster_grd.h) so the unit test can drive the scan
@@ -3733,12 +3814,15 @@ void
 grd_block_redeclare_step(uint64 episode_epoch)
 {
 	int next;
+	uint64 generation = cluster_grd_redeclare_generation();
 
 	/* Re-arm to the start of the pool whenever a fresh episode locks a new
 	 * epoch (the previous episode's partial scan is abandoned — the new epoch
 	 * re-stamps every re-declare). */
-	if (grd_block_redeclare_epoch != episode_epoch) {
+	if (grd_block_redeclare_epoch != episode_epoch
+		|| grd_block_redeclare_generation != generation) {
 		grd_block_redeclare_epoch = episode_epoch;
+		grd_block_redeclare_generation = generation;
 		grd_block_redeclare_cursor = 0;
 		grd_block_redeclare_done = false;
 	}
@@ -3751,6 +3835,10 @@ grd_block_redeclare_step(uint64 episode_epoch)
 	next
 		= cluster_bufmgr_redeclare_scan_chunk(grd_block_redeclare_cursor, GRD_BLOCK_REDECLARE_CHUNK,
 											  grd_block_redeclare_cb, &episode_epoch);
+	if (next < 0) {
+		grd_block_redeclare_cursor = -1 - next;
+		return; /* busy buffer or master application not yet acknowledged */
+	}
 	if (next == grd_block_redeclare_cursor)
 		grd_block_redeclare_done = true; /* reached NBuffers — whole pool scanned */
 	grd_block_redeclare_cursor = next;
@@ -3770,7 +3858,8 @@ grd_block_redeclare_step(uint64 episode_epoch)
 bool
 grd_block_redeclare_scan_complete(uint64 episode_epoch)
 {
-	return grd_block_redeclare_epoch == episode_epoch && grd_block_redeclare_done;
+	return grd_block_redeclare_epoch == episode_epoch && grd_block_redeclare_done
+		   && grd_block_redeclare_generation == cluster_grd_redeclare_generation();
 }
 
 int

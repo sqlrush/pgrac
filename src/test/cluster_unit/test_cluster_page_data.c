@@ -60,6 +60,7 @@ ClusterPcmOwnEntry *ClusterPcmOwnArray = own;
 static LWLock mapping;
 static unsigned pins[2];
 static bool locks[2], resident[2], busy[2], selected, sf_blocked, bad_checksum, bad_bytes;
+static bool redeclare_scan_test;
 static bool stale_sync, redirty_sync, checksums = true;
 static bool zero_disk, late_fence;
 static bool storage_read, storage_cut_current = true, storage_cut_changed, storage_space_changed;
@@ -259,7 +260,7 @@ LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 			if (busy[i])
 				return false;
 			UT_ASSERT(pins[i] && !locks[i]);
-			if (i == 1)
+			if (i == 1 && !redeclare_scan_test)
 				UT_ASSERT(locks[0]);
 			locks[i] = true;
 			HOLD_INTERRUPTS();
@@ -527,6 +528,7 @@ shared_buffer_write_error_callback(void *arg)
 #include "test_cluster_space_recovery_flush.inc"
 #include "test_cluster_page_flush.inc"
 #include "test_cluster_page_data.inc"
+#include "test_cluster_block_redeclare_scan.inc"
 
 static void
 bind_native_record(uint8 rmid, uint8 info)
@@ -2009,10 +2011,69 @@ remote_ack_import_preserves_peer_and_resource_owner(void)
 	clean();
 }
 
+static unsigned redeclare_count;
+static bool redeclare_ack;
+static uint8 redeclare_mode;
+static bool
+redeclare_observe(BufferTag tag, uint8 mode, XLogRecPtr lsn, SCN scn, void *arg)
+{
+	UT_ASSERT(BufferTagsEqual(&tag, &descriptors[1].bufferdesc.tag));
+	redeclare_count++;
+	redeclare_mode = mode;
+	return redeclare_ack;
+}
+
+static void
+redeclare_scan_includes_physical_pi_and_preserves_unacknowledged_cursor(void)
+{
+	BufferDesc *buf;
+	reset();
+	redeclare_scan_test = true;
+	buf = &descriptors[1].bufferdesc;
+	buf->buffer_type = BUF_TYPE_PI;
+	buf->pcm_state = PCM_STATE_N;
+	pg_atomic_write_u32(&buf->state, BM_TAG_VALID | BM_PERMANENT);
+	redeclare_count = 0;
+	redeclare_ack = false;
+	UT_ASSERT_EQ(cluster_bufmgr_redeclare_scan_chunk(1, 1, redeclare_observe, NULL), -2);
+	UT_ASSERT_EQ(redeclare_count, 1);
+	UT_ASSERT_EQ(redeclare_mode, PCM_STATE_N);
+	redeclare_ack = true;
+	UT_ASSERT_EQ(cluster_bufmgr_redeclare_scan_chunk(1, 1, redeclare_observe, NULL), 2);
+	UT_ASSERT_EQ(redeclare_count, 2);
+	UT_ASSERT_EQ(buf->buffer_type, BUF_TYPE_PI);
+	UT_ASSERT_EQ(writes + wal_flushes, 0);
+	UT_ASSERT_EQ(pins[1], 0);
+	redeclare_scan_test = false;
+	clean();
+}
+
+static void
+redeclare_scan_retries_content_busy_and_zero_lsn_current(void)
+{
+	reset();
+	redeclare_scan_test = true;
+	redeclare_ack = true;
+	redeclare_count = 0;
+	busy[1] = true;
+	UT_ASSERT_EQ(cluster_bufmgr_redeclare_scan_chunk(1, 1, redeclare_observe, NULL), -2);
+	UT_ASSERT_EQ(redeclare_count, 0);
+	busy[1] = false;
+	PageSetLSNPreserveOrigin(pages[1].data, 0);
+	UT_ASSERT_EQ(cluster_bufmgr_redeclare_scan_chunk(1, 1, redeclare_observe, NULL), 2);
+	UT_ASSERT_EQ(redeclare_count, 1);
+	UT_ASSERT_EQ(redeclare_mode, PCM_STATE_X);
+	UT_ASSERT_EQ(pins[1], 0);
+	redeclare_scan_test = false;
+	clean();
+}
+
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(30);
+	UT_RUN(redeclare_scan_includes_physical_pi_and_preserves_unacknowledged_cursor);
+	UT_RUN(redeclare_scan_retries_content_busy_and_zero_lsn_current);
 	UT_RUN(notice_import_requires_actual_fact_and_qualified_master_job);
 	UT_RUN(remote_ack_import_preserves_peer_and_resource_owner);
 	UT_RUN(tag_write_io_failure_never_exports_completion);

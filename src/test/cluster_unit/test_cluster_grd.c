@@ -447,19 +447,22 @@ cluster_qvotec_get_self_incarnation(void)
 {
 	return ut_admitted_incarnation;
 }
-void
+bool
 cluster_gcs_block_send_redeclare(BufferTag tag pg_attribute_unused(),
 								 uint8 held_mode pg_attribute_unused(),
 								 XLogRecPtr page_lsn pg_attribute_unused(),
 								 SCN page_scn pg_attribute_unused(),
 								 uint64 cluster_epoch pg_attribute_unused(),
 								 int master_node pg_attribute_unused())
-{}
+{
+	return true;
+}
 /* spec-4.7 D2/D7 (P0 fix) — controllable scan: fake_scan_nbuffers == 0 (default)
  * means "no buffers → instant done" (the no-op other tests expect);  a test
  * raises it to model a multi-tick scan so grd_block_redeclare_scan_complete
  * stays false until the cursor reaches it. */
 static int fake_scan_nbuffers = 0;
+static bool fake_scan_pending;
 int
 cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 									ClusterGcsRedeclareCallback cb pg_attribute_unused(),
@@ -467,6 +470,8 @@ cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 {
 	int end;
 
+	if (fake_scan_pending)
+		return -1 - start_buf;
 	if (start_buf >= fake_scan_nbuffers)
 		return start_buf; /* whole (fake) pool scanned — cursor unchanged = done */
 	end = start_buf + max_scan;
@@ -2544,6 +2549,22 @@ UT_TEST(test_grd_shard_phase_accessors)
  * a held block un-re-declared → the new master serves it as cold → 8.A
  * double-grant.)
  */
+UT_TEST(test_grd_redeclare_unacknowledged_buffer_does_not_advance_cursor)
+{
+	fake_scan_nbuffers = 1;
+	fake_scan_pending = true;
+	grd_block_redeclare_step(1234);
+	UT_ASSERT_EQ(cluster_grd_recovery_block_redeclare_cursor(), 0);
+	grd_block_redeclare_step(1234);
+	UT_ASSERT_EQ(cluster_grd_recovery_block_redeclare_cursor(), 0);
+	UT_ASSERT(!grd_block_redeclare_scan_complete(1234));
+	fake_scan_pending = false;
+	grd_block_redeclare_step(1234);
+	grd_block_redeclare_step(1234);
+	UT_ASSERT(grd_block_redeclare_scan_complete(1234));
+	fake_scan_nbuffers = 0;
+}
+
 UT_TEST(test_grd_d2_redeclare_scan_completion_gate)
 {
 	fake_scan_nbuffers = 600; /* > CHUNK (256) → needs several steps */
@@ -5196,6 +5217,8 @@ UT_TEST(test_recovery_same_epoch_dead_set_growth_restamps)
 	uint8 grown[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 	uint64 h_small;
 	uint64 h_grown;
+	uint64 census_small, census_grown;
+	BufferTag census_tag = { 0 };
 	int i;
 
 	ut_jr_setup_3node();
@@ -5221,6 +5244,11 @@ UT_TEST(test_recovery_same_epoch_dead_set_growth_restamps)
 	cluster_grd_recovery_lmon_tick(); /* P1-P5 -> WAIT_BARRIER, episode epoch 11 */
 	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), (uint32)GRD_RECOVERY_WAIT_BARRIER);
 	UT_ASSERT_EQ(cluster_grd_recovery_event_bitmap_hash_value(), h_small);
+	cluster_shared_config = true;
+	ut_mock_static_master = 1;
+	UT_ASSERT_EQ(cluster_grd_block_redeclare_state_v1(census_tag, 11, &census_small), 1);
+	grd_block_redeclare_step(11);
+	UT_ASSERT(grd_block_redeclare_scan_complete(11));
 
 	/* The wedge shape: a full-set DONE from the coordinator withholds the
 	 * composite hash half while this node's stamp is behind (the epoch axis
@@ -5249,6 +5277,9 @@ UT_TEST(test_recovery_same_epoch_dead_set_growth_restamps)
 	cluster_grd_recovery_lmon_tick();
 	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), (uint32)GRD_RECOVERY_WAIT_BARRIER);
 	UT_ASSERT_EQ(cluster_grd_recovery_event_bitmap_hash_value(), h_grown);
+	UT_ASSERT(!grd_block_redeclare_scan_complete(11));
+	UT_ASSERT_EQ(cluster_grd_block_redeclare_state_v1(census_tag, 11, &census_grown), 1);
+	UT_ASSERT_NE(census_small, census_grown);
 	for (i = 0; i < PGRAC_GRD_SHARD_COUNT; i++)
 		UT_ASSERT_EQ(cluster_grd_shard_master(i), (int32)0);
 
@@ -5257,6 +5288,8 @@ UT_TEST(test_recovery_same_epoch_dead_set_growth_restamps)
 	UT_ASSERT_EQ(cluster_grd_recovery_done_epoch_for(0), 11);
 	UT_ASSERT_EQ(cluster_grd_recovery_done_bitmap_hash_for(0), h_grown);
 
+	cluster_shared_config = false;
+	ut_mock_static_master = 0;
 	cluster_enabled = false;
 	ut_mock_now = 0;
 	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
@@ -5525,6 +5558,50 @@ finish_recovery_control_fixture(void)
 	mock_lms_shard_master_generation = 0;
 	cluster_enabled = false;
 	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+}
+
+UT_TEST(test_redeclare_census_requires_exact_fenced_episode)
+{
+	BufferTag tag = { 0 };
+	uint64 hash;
+	setup_recovery_control_fixture(false);
+	cluster_shared_config = true;
+	ut_mock_static_master = 1;
+	UT_ASSERT_EQ(cluster_grd_block_redeclare_state_v1(tag, 9, &hash), 1);
+	UT_ASSERT_NE(hash, 0);
+	ut_mock_static_master = 0;
+	UT_ASSERT_EQ(cluster_grd_block_redeclare_state_v1(tag, 9, &hash), 0);
+	UT_ASSERT_EQ(cluster_grd_block_redeclare_state_v1(tag, 8, &hash), -1);
+	UT_ASSERT_EQ(hash, 0);
+	ut_qvotec_quorum = false;
+	UT_ASSERT_EQ(cluster_grd_block_redeclare_state_v1(tag, 9, &hash), -1);
+	cluster_shared_config = false;
+	finish_recovery_control_fixture();
+}
+
+UT_TEST(test_redeclare_fresh_join_recipient_accepts_only_its_fence)
+{
+	BufferTag tag = { 0 };
+	uint8 joined[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 2 };
+	uint64 hash, expanded;
+	ut_jr_setup_3node();
+	cluster_enabled = cluster_shared_config = true;
+	cluster_node_id = 1;
+	ut_mock_epoch = 10;
+	ut_qvotec_quorum = true;
+	cluster_grd_arm_join_pcm_fence(joined);
+	ut_mock_static_master = 1;
+	UT_ASSERT_EQ(cluster_grd_block_redeclare_state_v1(tag, 10, &hash), 1);
+	joined[0] = 6;
+	cluster_grd_arm_join_pcm_fence(joined);
+	UT_ASSERT_EQ(cluster_grd_block_redeclare_state_v1(tag, 10, &expanded), 1);
+	UT_ASSERT_NE(hash, expanded);
+	ut_mock_static_master = 0;
+	UT_ASSERT_EQ(cluster_grd_block_redeclare_state_v1(tag, 10, &hash), 0);
+	cluster_node_id = 0; /* an idle survivor has not started its census */
+	UT_ASSERT_EQ(cluster_grd_block_redeclare_state_v1(tag, 10, &hash), -1);
+	cluster_shared_config = false;
+	finish_recovery_control_fixture();
 }
 
 UT_TEST(test_canonical_space_dead_node_returns_grd_to_normal_after_data_recovery)
@@ -6658,7 +6735,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(140);
+	UT_PLAN(143);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
@@ -6704,6 +6781,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_grd_lookup_master_rejects_undo_resid);
 	UT_RUN(test_grd_shard_phase_accessors);
 	UT_RUN(test_grd_d2_redeclare_scan_completion_gate);
+	UT_RUN(test_grd_redeclare_unacknowledged_buffer_does_not_advance_cursor);
 
 	/* spec-5.1b — GES grant/convert state machine (U1-U11). */
 	UT_RUN(test_convert_u1_grant_path_matrix_switch_all_pairs);
@@ -6793,6 +6871,8 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_recovery_idle_joiner_accounts_done_epoch_for_fence);
 	UT_RUN(test_rejoin_clear_snapshot_requires_exact_all_survivor_done_cut);
 	UT_RUN(test_recovery_control_observes_protocol_cut_without_data_thaw);
+	UT_RUN(test_redeclare_census_requires_exact_fenced_episode);
+	UT_RUN(test_redeclare_fresh_join_recipient_accepts_only_its_fence);
 	UT_RUN(test_canonical_space_dead_node_returns_grd_to_normal_after_data_recovery);
 	UT_RUN(test_control_acquire_waits_for_common_barrier_even_on_normal_shard);
 	UT_RUN(test_control_gate_unknown_cut_never_proves_frozen_or_ready);

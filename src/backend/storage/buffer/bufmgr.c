@@ -15832,9 +15832,9 @@ cluster_bufmgr_copy_block_for_gcs_smart_fusion(BufferTag tag, XLogRecPtr *out_pa
  * cluster_bufmgr_redeclare_scan_chunk -- spec-4.7 D2 (Q6-A' worker-centric).
  *
  *	Scan a bounded chunk [start_buf, start_buf + max_scan) of the shared
- *	buffer pool;  for every locally-resident buffer that holds a covering PCM
- *	mode (BM_VALID ∧ !BM_IO_IN_PROGRESS ∧ pcm_state ∈ {S,X} ∧ PCM-tracked ∧
- *	valid page_lsn) invoke cb(tag, mode, page_lsn, arg).  Returns the next
+ *	buffer pool; declare each PCM S/X holder and, in shared mode, each physical
+ *	N-state PI. A busy buffer or unacknowledged declaration returns -1-index
+ *	so the LMON retries that exact position. Otherwise returns the next
  *	cursor (== NBuffers once the whole pool has been scanned), so the LMON
  *	reconfig tick can drive it in bounded chunks across ticks without
  *	blocking the heartbeat (§6 risk mitigation).
@@ -15853,13 +15853,13 @@ cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 	int			i;
 	int			end;
 
-	Assert(cb != NULL);
-
 	if (start_buf < 0)
 		start_buf = 0;
-	end = start_buf + max_scan;
-	if (end > NBuffers)
-		end = NBuffers;
+	if (start_buf > NBuffers)
+		start_buf = NBuffers;
+	if (cb == NULL || max_scan <= 0)
+		return -1 - start_buf;
+	end = start_buf + Min(max_scan, NBuffers - start_buf);
 
 	for (i = start_buf; i < end; i++)
 	{
@@ -15870,23 +15870,41 @@ cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 		LWLock	   *content_lock;
 		XLogRecPtr	page_lsn;
 		SCN			page_scn;	/* spec-2.41 D3 — re-declare SCN carrier */
+		bool is_pi;
 
 		buf_state = LockBufHdr(buf);
 		mode = buf->pcm_state;
-		if ((buf_state & BM_VALID) == 0
-			|| (buf_state & BM_IO_IN_PROGRESS) != 0
-			|| (mode != (uint8) PCM_STATE_S && mode != (uint8) PCM_STATE_X)
-			|| !cluster_bufmgr_should_pcm_track(buf))
-		{
+		is_pi = cluster_shared_config && mode == PCM_STATE_N && buf->buffer_type == BUF_TYPE_PI
+				&& (buf_state & (BM_TAG_VALID | BM_PERMANENT)) == (BM_TAG_VALID | BM_PERMANENT);
+		if (!is_pi
+			&& ((buf_state & BM_VALID) == 0 || (mode != PCM_STATE_S && mode != PCM_STATE_X)
+				|| !cluster_bufmgr_should_pcm_track(buf))) {
 			UnlockBufHdr(buf, buf_state);
 			continue;
+		}
+		if ((buf_state & (BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0) {
+			UnlockBufHdr(buf, buf_state);
+			return -1 - i;
 		}
 		tag = buf->tag;
 		/* pin + unlock header (raw pin, mirrors copy_block_for_gcs). */
 		cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
 
 		content_lock = BufferDescriptorGetContentLock(buf);
-		LWLockAcquire(content_lock, LW_SHARED);
+		if (!LWLockConditionalAcquire(content_lock, LW_SHARED)) {
+			cluster_bufmgr_unpin_for_gcs(buf);
+			return -1 - i;
+		}
+		buf_state = LockBufHdr(buf);
+		if (!BufferTagsEqual(&tag, &buf->tag) || mode != buf->pcm_state
+			|| (is_pi && buf->buffer_type != BUF_TYPE_PI) || (!is_pi && (buf_state & BM_VALID) == 0)
+			|| (buf_state & (BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0) {
+			UnlockBufHdr(buf, buf_state);
+			LWLockRelease(content_lock);
+			cluster_bufmgr_unpin_for_gcs(buf);
+			return -1 - i;
+		}
+		UnlockBufHdr(buf, buf_state);
 		page_lsn = PageGetLSN((Page) BufHdrGetBlock(buf));
 		/* PGRAC: spec-2.41 D3 — also read pd_block_scn so the re-declare carries
 		 * the cross-node version for the detector's SCN watermark (alongside
@@ -15896,9 +15914,11 @@ cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 
 		cluster_bufmgr_unpin_for_gcs(buf);
 
-		/* P1#2: only re-declare a buffer with a valid pd_lsn. */
-		if (!XLogRecPtrIsInvalid(page_lsn))
-			cb(tag, mode, page_lsn, page_scn, arg);
+		/* A zero LSN does not prove that an observed current holder is absent.
+		 * Shared reconstruction records residency even before its first WAL. */
+		if ((cluster_shared_config || !XLogRecPtrIsInvalid(page_lsn))
+			&& !cb(tag, mode, page_lsn, page_scn, arg))
+			return -1 - i;
 	}
 
 	return end;

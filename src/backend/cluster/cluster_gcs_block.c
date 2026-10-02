@@ -51,6 +51,7 @@
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server park/fetch */
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_block_redeclare.h"
 #include "cluster/cluster_lms_shard.h" /* PGRAC: spec-7.3 D4 — tag->worker shard */
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_gcs_reqid.h"		 /* PGRAC: spec-6.14a D1 — id domains */
@@ -22137,18 +22138,24 @@ static const ClusterICMsgTypeInfo gcs_block_invalidate_ack_info = {
 /*
  * cluster_gcs_block_send_redeclare -- spec-4.7 D2 survivor → master re-declare.
  *
- *	One fire-and-forget announce of a locally-held S/X buffer to the block's
- *	current (remastered) master.  Self-mastered blocks need no wire (their
- *	master state rebuilds locally — D3 lazy rebuild), so skip master == self.
+ * Shared mode waits for actual application by the frozen master, including
+ * self-master and physical PI declarations. Legacy mode retains its admitted
+ * transport semantics. False keeps the LMON census at this buffer.
  */
-void
+bool
 cluster_gcs_block_send_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn, SCN page_scn,
 								 uint64 cluster_epoch, int master_node)
 {
 	GcsBlockRedeclarePayload p;
+	ClusterICSendResult sent;
 
-	if (master_node < 0 || master_node == cluster_node_id)
-		return;
+	if (cluster_shared_config)
+		return cluster_block_redeclare_poll_v1(tag, held_mode, page_lsn, page_scn, cluster_epoch,
+											   master_node);
+	if (master_node < 0 || master_node >= 32)
+		return false;
+	if (master_node == cluster_node_id)
+		return true;
 
 	memset(&p, 0, sizeof(p));
 	p.cluster_epoch = cluster_epoch;
@@ -22159,11 +22166,11 @@ cluster_gcs_block_send_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page
 	p.held_mode = held_mode;
 	p.checksum = gcs_block_compute_redeclare_checksum(&p);
 
-	cluster_gcs_block_note_send_outcome(
-		GCS_BLOCK_SEND_FAMILY_INVALIDATE,
-		cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REDECLARE, master_node, &p, sizeof(p)));
+	sent = cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REDECLARE, master_node, &p, sizeof(p));
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_INVALIDATE, sent);
 	if (ClusterGcsBlock != NULL)
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->recovery_buffers_redeclared, 1);
+	return sent == CLUSTER_IC_SEND_DONE || sent == CLUSTER_IC_SEND_WOULD_BLOCK;
 }
 
 
@@ -22182,7 +22189,13 @@ cluster_gcs_handle_block_redeclare_envelope(const ClusterICEnvelope *env, const 
 	const GcsBlockRedeclarePayload *p = (const GcsBlockRedeclarePayload *)payload;
 	uint64 episode_epoch;
 
+	if (cluster_shared_config) {
+		cluster_block_redeclare_ingress_v1(env, payload);
+		return;
+	}
 	if (ClusterGcsBlock == NULL)
+		return;
+	if (env == NULL || payload == NULL || env->payload_length != sizeof(*p))
 		return;
 
 	if (p->checksum != gcs_block_compute_redeclare_checksum(p)) {

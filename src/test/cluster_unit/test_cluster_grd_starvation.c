@@ -336,14 +336,16 @@ cluster_membership_is_member(int32 node_id pg_attribute_unused())
 {
 	return true;
 }
-void
+bool
 cluster_gcs_block_send_redeclare(BufferTag tag pg_attribute_unused(),
 								 uint8 held_mode pg_attribute_unused(),
 								 XLogRecPtr page_lsn pg_attribute_unused(),
 								 SCN page_scn pg_attribute_unused(),
 								 uint64 cluster_epoch pg_attribute_unused(),
 								 int master_node pg_attribute_unused())
-{}
+{
+	return true;
+}
 /* spec-4.7 D2/D7 (P0 fix) — controllable scan: fake_scan_nbuffers == 0 (default)
  * means "no buffers → instant done" (the no-op other tests expect);  a test
  * raises it to model a multi-tick scan so grd_block_redeclare_scan_complete
@@ -910,6 +912,22 @@ set_mock_declared(int count, const int32 *nodes)
 
 
 /* spec-5.10 D7 GUC stubs (defined in cluster_guc.c in the backend build). */
+/* From B's audited fixture update: recovery is outside this fairness test.
+ * Unexpected use stays closed instead of fabricating an empty census. */
+bool cluster_control_request_census(uint64 epoch, uint64 *version);
+bool cluster_control_request_census_unchanged(uint64 epoch, uint64 version);
+bool
+cluster_control_request_census(uint64 epoch pg_attribute_unused(), uint64 *version)
+{
+	*version = 0;
+	return false;
+}
+bool
+cluster_control_request_census_unchanged(uint64 epoch pg_attribute_unused(),
+										 uint64 version pg_attribute_unused())
+{
+	return false;
+}
 int cluster_ges_starvation_max_skips = 8;
 
 /* spec-6.12e1 — handoff-verifier stubs (cluster_grd.o's release_and_drain

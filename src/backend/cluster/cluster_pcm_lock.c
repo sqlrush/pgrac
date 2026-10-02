@@ -5932,6 +5932,7 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 	PcmEntryAcquireResult acquire_result;
 	struct GrdEntry *entry;
 	uint32 holder_bit;
+	uint64 census_hash;
 
 	/* epoch already gated by the handler (L235/L236); recorded below as the
 	 * re-declare feed's provenance epoch (S3 forensics step 1a). */
@@ -5940,7 +5941,11 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 		return false;
 	if (source_node < 0 || source_node >= 32)
 		return false;
-	if (held_mode != (uint8)PCM_STATE_S && held_mode != (uint8)PCM_STATE_X)
+	if (held_mode != (uint8)PCM_STATE_S && held_mode != (uint8)PCM_STATE_X
+		&& !(cluster_shared_config && held_mode == PCM_STATE_N))
+		return false;
+	if (cluster_shared_config
+		&& cluster_grd_block_redeclare_state_v1(tag, cluster_epoch, &census_hash) != 1)
 		return false;
 
 	if (!pcm_entry_ref_acquire(&tag, true, &entry_ref, &acquire_result))
@@ -5951,7 +5956,18 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 
 	pcm_entry_lock_exclusive(entry);
 
-	if (held_mode == (uint8)PCM_STATE_X) {
+	if (cluster_shared_config
+		&& (cluster_grd_block_redeclare_state_v1(tag, cluster_epoch, &census_hash) != 1
+			|| pg_atomic_read_u64(&entry->transition_count_local) >= UINT64_MAX - 1)) {
+		LWLockRelease(&entry->entry_lock.lock);
+		pcm_entry_ref_release(&entry_ref);
+		return false;
+	}
+	if (held_mode == PCM_STATE_N) {
+		/* A physical PI has no current residency. Reconstruct its obligation
+		 * without creating X/S authority or clearing another departed writer. */
+		pg_atomic_fetch_or_u32(&entry->pi_holders_bitmap, holder_bit);
+	} else if (held_mode == (uint8)PCM_STATE_X) {
 		int32 cur_x = entry->x_holder_node;
 		uint32 other_s = pg_atomic_read_u32(&entry->s_holders_bitmap) & ~holder_bit;
 
@@ -5997,6 +6013,8 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_S);
 	}
 
+	if (cluster_shared_config)
+		pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
 	/* spec-2.41 D3 — advance BOTH watermarks from the survivor re-declare,
 	 * monotone max.  page_lsn feeds the spec-4.7 D5 redo-coverage serve-gate's
 	 * required_lsn (per-stream replay position);  page_scn feeds the lost-write
