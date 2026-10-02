@@ -2952,6 +2952,7 @@ semantic_activation_ack_lmon_send_pending(void)
 		bool is_pending = node < 64
 							  ? (pending->pending_members_lo & (UINT64_C(1) << node)) != 0
 							  : (pending->pending_members_hi & (UINT64_C(1) << (node - 64))) != 0;
+		bool capability_ready;
 
 		if (!is_pending)
 			continue;
@@ -2961,9 +2962,22 @@ semantic_activation_ack_lmon_send_pending(void)
 			&& pending->message.stage == CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED
 			&& !semantic_activation_restart_ready_current())
 			return;
-		if (!cluster_sf_peer_capability_word_sample(node, required_caps, &capability_word,
-													&capability_generation)
-			|| capability_generation == 0
+		if (!refused && semantic_activation_restart_collecting(&image)) {
+			ClusterSfPeerCap capability;
+
+			/* A coordinator REQUEST does not prove that every member-to-member
+			 * HELLO has arrived. Retain this destination for the next LMON tick;
+			 * no wait loop or admission is added. A valid but incompatible
+			 * record still disproves this round and follows invalidation below. */
+			if (!cluster_sf_peer_capability_record_snapshot(node, &capability) || !capability.valid)
+				return;
+			capability_word = capability.bits;
+			capability_generation = capability.generation;
+			capability_ready = (capability_word & required_caps) == required_caps;
+		} else
+			capability_ready = cluster_sf_peer_capability_word_sample(
+				node, required_caps, &capability_word, &capability_generation);
+		if (!capability_ready || capability_generation == 0
 			|| (refused && capability_generation != pending->refusal_connection_generation)) {
 			pending->pending_members_lo = 0;
 			pending->pending_members_hi = 0;
@@ -3102,6 +3116,7 @@ semantic_activation_ack_lmon_send_origin_requests(void)
 		uint32 capability_generation;
 		uint64 member_bit;
 		int32 node;
+		bool capability_ready;
 
 		if (pending->pending_members_lo == 0 && pending->pending_members_hi == 0) {
 			for (node = 1; node < 4; node++) {
@@ -3150,10 +3165,25 @@ semantic_activation_ack_lmon_send_origin_requests(void)
 			|| pending->message.admitted_members_lo != image.expected_members_lo
 			|| pending->message.admitted_members_hi != image.expected_members_hi
 			|| pending->message.capability_sample_digest != image.capability_sample_digest
-			|| !cluster_semantic_activation_ack_wire_encode(&pending->message, payload)
-			|| !cluster_sf_peer_capability_word_sample(node, required_caps, &capability_word,
-													   &capability_generation)
-			|| capability_generation == 0) {
+			|| !cluster_semantic_activation_ack_wire_encode(&pending->message, payload)) {
+			semantic_activation_ack_lmon_invalidate_active();
+			return false;
+		}
+		if (semantic_activation_restart_collecting(&image)) {
+			ClusterSfPeerCap capability;
+
+			/* Keep the exact REQUEST/nonce owned here across a temporarily
+			 * absent HELLO, just as for a transport queue not yet admitting it.
+			 * One bounded attempt per tick; all round checks run again. */
+			if (!cluster_sf_peer_capability_record_snapshot(node, &capability) || !capability.valid)
+				return true;
+			capability_word = capability.bits;
+			capability_generation = capability.generation;
+			capability_ready = (capability_word & required_caps) == required_caps;
+		} else
+			capability_ready = cluster_sf_peer_capability_word_sample(
+				node, required_caps, &capability_word, &capability_generation);
+		if (!capability_ready || capability_generation == 0) {
 			semantic_activation_ack_lmon_invalidate_active();
 			return false;
 		}
