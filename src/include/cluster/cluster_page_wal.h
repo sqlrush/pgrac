@@ -112,6 +112,12 @@ extern Size cluster_page_wal_shmem_size(void);
 extern void cluster_page_wal_shmem_init(void);
 extern void cluster_page_wal_shmem_register(void);
 
+/* Cold redo failure latches before releasing the suspect page's content-X.
+ * Allocation/error-free, shared across processes, reset only with new shared
+ * memory. A local redo abort must never reopen DATA writes. */
+extern bool cluster_page_wal_cold_redo_write_allowed_v1(void);
+extern void cluster_page_wal_cold_redo_fail_v1(void);
+
 /* Sole native WAL insertion owner after successful insertion, while its
  * registered buffer is still pinned and content-X. No allocation, I/O or
  * lock upgrade. On ordinary attribution failure the insertion owner must

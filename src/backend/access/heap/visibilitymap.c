@@ -123,6 +123,7 @@
 #include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_page_cold_redo.h"
 #include "cluster/storage/cluster_smgr.h"
 #endif
 
@@ -224,6 +225,8 @@ vm_image_versioned_redo(XLogReaderState *record, RelFileLocator locator,
 {
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	ClusterSpaceIdentity identity;
+	ClusterColdRedoBlockV1 decision;
+	bool cold = false;
 	const RfPageVersionEdgeV1 *edge;
 	const RfPageVersionEdgeEntryV1 *entry = NULL;
 	PGAlignedBlock image;
@@ -251,9 +254,22 @@ vm_image_versioned_redo(XLogReaderState *record, RelFileLocator locator,
 	 * have a new recorded version even when its bits were already clear. */
 	if (block_id < 0 && flags == 0)
 		return;
-	if (!RecoveryInProgress() || !XLogRecHasPageVersionEdge(record) ||
-		XLogRecPtrIsInvalid(record->EndRecPtr) ||
-		!cluster_space_relation_read_redo_identity(locator, &identity))
+	if (block_id >= 0) {
+		if (!cluster_cold_redo_block_decision_v1(record, block_id, &decision)
+			|| (decision.action != CLUSTER_COLD_REDO_NATIVE && !cluster_page_cold_redo_active_v1))
+			elog(FATAL, "shared VM redo has no matching cold consumer");
+		if (decision.action == CLUSTER_COLD_REDO_SKIP) {
+			if (XLogReadBufferForRedoExtended(record, block_id, RBM_NORMAL, false, &buffer)
+					!= BLK_NOTFOUND
+				|| BufferIsValid(buffer))
+				elog(FATAL, "shared VM cold skip returned a buffer");
+			return;
+		}
+		cold = decision.action == CLUSTER_COLD_REDO_APPLY;
+	}
+	if (!RecoveryInProgress() || !XLogRecHasPageVersionEdge(record)
+		|| XLogRecPtrIsInvalid(record->EndRecPtr)
+		|| (!cold && !cluster_space_relation_read_redo_identity(locator, &identity)))
 		elog(ERROR, "shared VM redo requires restart SPACE identity and version edge");
 	edge = XLogRecGetPageVersionEdge(record);
 	for (i = 0; i < edge->entry_count; i++)
@@ -264,23 +280,40 @@ vm_image_versioned_redo(XLogReaderState *record, RelFileLocator locator,
 			elog(ERROR, "shared VM redo has duplicate version edges");
 		entry = &edge->entries[i];
 	}
-	if (block_id < 0 || entry == NULL ||
-		entry->page_class != RF_PAGE_CLASS_ORDINARY ||
-		entry->before_kind != RF_PAGE_STATE_PRESENT ||
-		entry->result_kind != RF_PAGE_STATE_PRESENT ||
-		entry->edge_flags != (RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE) ||
-		entry->component_ordinal != XLogRecGetBlock(record, block_id)->component_ordinal ||
-		entry->before.mutation_token == 0 || edge->result_token == 0 ||
-		entry->before.mutation_token == edge->result_token ||
-		memcmp(entry->before.segment_incarnation, identity.incarnation, 16) != 0 ||
-		memcmp(entry->result_incarnation, identity.incarnation, 16) != 0 ||
-		!XLogRecHasBlockImage(record, block_id) || !XLogRecBlockImageApply(record, block_id) ||
-		(XLogRecGetBlock(record, block_id)->flags & BKPBLOCK_WILL_INIT) != 0 ||
-		!RestoreBlockImage(record, block_id, image.data) || !vm_redo_page_valid(image.data) ||
-		((PageHeader) image.data)->pd_block_scn != edge->result_token ||
-		(PageGetContents(image.data)[HEAPBLK_TO_MAPBYTE(heapBlk)] & mask) !=
-			(setting ? mask : 0))
+	if (block_id < 0 || entry == NULL || entry->page_class != RF_PAGE_CLASS_ORDINARY
+		|| entry->before_kind != RF_PAGE_STATE_PRESENT
+		|| entry->result_kind != RF_PAGE_STATE_PRESENT
+		|| entry->edge_flags != (RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE)
+		|| entry->component_ordinal != XLogRecGetBlock(record, block_id)->component_ordinal
+		|| entry->before.mutation_token == 0 || edge->result_token == 0
+		|| entry->before.mutation_token == edge->result_token
+		|| memcmp(entry->before.segment_incarnation,
+				  cold ? decision.result.segment_incarnation : identity.incarnation, 16)
+			   != 0
+		|| memcmp(entry->result_incarnation,
+				  cold ? decision.result.segment_incarnation : identity.incarnation, 16)
+			   != 0
+		|| (cold && edge->result_token != decision.result.mutation_token)
+		|| !XLogRecHasBlockImage(record, block_id) || !XLogRecBlockImageApply(record, block_id)
+		|| (XLogRecGetBlock(record, block_id)->flags & BKPBLOCK_WILL_INIT) != 0
+		|| !RestoreBlockImage(record, block_id, image.data) || !vm_redo_page_valid(image.data)
+		|| ((PageHeader)image.data)->pd_block_scn != edge->result_token
+		|| (PageGetContents(image.data)[HEAPBLK_TO_MAPBYTE(heapBlk)] & mask)
+			   != (setting ? mask : 0))
 		elog(ERROR, "shared VM redo has no exact recorded result image");
+
+	if (cold) {
+		/* The first visit replaces the whole VM image. A second heap target
+		 * may name the same image; its bits were validated above as well. */
+		if (!cluster_page_cold_redo_vm_image_applied_v1(record, block_id)) {
+			if (XLogReadBufferForRedoExtended(record, block_id, RBM_NORMAL, false, &buffer)
+					!= BLK_RESTORED
+				|| !BufferIsValid(buffer))
+				elog(FATAL, "shared VM cold redo did not restore its selected image");
+			UnlockReleaseBuffer(buffer);
+		}
+		return;
+	}
 
 	/* Unlike XLogReadBufferForRedo, this cannot restore the FPI before checking
 	 * its predecessor. Missing/zero/torn bases require the separate recovery

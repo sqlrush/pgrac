@@ -21,11 +21,21 @@
 #include "storage/buf.h"
 
 typedef struct ClusterSpaceRecoveryBatchV1 ClusterSpaceRecoveryBatchV1;
+struct ClusterRecoveryFencePlan;
 
 extern bool cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
 												const ClusterThreadRecoveryAuthorityV1 *sources,
 												uint32 count, ClusterSpaceRecoveryBatchV1 **out);
 extern bool cluster_space_recovery_apply_v1(ClusterSpaceRecoveryBatchV1 *batch);
+/* Startup only, after the original cold fence plan is committed; requires
+ * its complete foreign-origin set (not a founder or historical authority).
+ * Borrows that plan and the sealed SIDE inputs until batch destruction;
+ * neither an origin number nor a caller-provided mode grants mutation.
+ * Accepts CREATE plus ADVANCE; ADVANCE alone needs a durable identity page.
+ * TRUNCATE and DROP need their separate structural retirement owner. */
+extern bool cluster_space_recovery_cold_preflight_v1(const RfSideOnlinePlanV1 *side,
+													 struct ClusterRecoveryFencePlan *fence,
+													 ClusterSpaceRecoveryBatchV1 **out);
 extern void cluster_space_recovery_destroy_v1(ClusterSpaceRecoveryBatchV1 **batch);
 /* The buffer manager calls this only inside its synchronous recovery flush.
  * It proves exact bytes and all retained sources, not a caller-supplied LSN. */

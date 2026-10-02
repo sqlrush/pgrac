@@ -7,6 +7,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw.h"
 #include "cluster/cluster_hw_lease.h"
+#include "cluster/cluster_pcm_direct_init.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "pgstat.h"
@@ -31,6 +32,7 @@ BufferDescPadded *BufferDescriptors = descriptors;
 static bool hw_held, retired, missing_identity, refuse_hw, refuse_grant, throw_grant;
 static unsigned victims, unpins, identity_reads, reservations, legacy_allocations, size_reads;
 static bool local_lock;
+volatile uint32 InterruptHoldoffCount;
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -221,14 +223,153 @@ UT_TEST(test_reservation_error_releases_hw)
 	UT_ASSERT(!hw_held);
 	UT_ASSERT_EQ(reservations + size_reads + legacy_allocations, 0);
 }
+
+/* Execute the native post-extension loop too. Transport and kernel I/O
+ * remain boundaries; the ERROR lands after native content-X acquisition. */
+typedef struct ClusterPcmXWriterLedgerEntry {
+	bool present;
+} ClusterPcmXWriterLedgerEntry;
+static ClusterPcmXWriterLedgerEntry init_ledgers[2];
+static unsigned init_locks, init_completed;
+static int init_fail_buffer, init_fail_stage;
+
+static void
+init_fault(BufferDesc *buf, int stage)
+{
+	if (buf->buf_id == init_fail_buffer && stage == init_fail_stage) {
+		InterruptHoldoffCount = 0; /* PostgreSQL ERROR unwinding */
+		pg_re_throw();
+	}
+}
+static bool
+cluster_bufmgr_pcm_arm_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind kind,
+								   ClusterPcmDirectInitProof *proof, void *context)
+{
+	UT_ASSERT_EQ(kind, CLUSTER_PCM_DIRECT_INIT_EXTEND);
+	return true;
+}
+static bool
+cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind kind,
+									const ClusterPcmDirectInitProof *proof, void *context)
+{
+	init_ledgers[buf->buf_id].present = true;
+	init_fault(buf, 1);
+	return true;
+}
+bool
+LWLockAcquire(LWLock *lock, LWLockMode mode)
+{
+	for (int i = 0; i < 2; i++)
+		if (lock == BufferDescriptorGetContentLock(&descriptors[i].bufferdesc)) {
+			UT_ASSERT(!(init_locks & (1 << i)));
+			UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+			init_locks |= 1 << i;
+			InterruptHoldoffCount++;
+			return true;
+		}
+	UT_ASSERT(false);
+	return false;
+}
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	for (int i = 0; i < 2; i++)
+		if (lock == BufferDescriptorGetContentLock(&descriptors[i].bufferdesc))
+			return (init_locks & (1 << i)) != 0;
+	return false;
+}
+void
+LWLockRelease(LWLock *lock)
+{
+	for (int i = 0; i < 2; i++)
+		if (lock == BufferDescriptorGetContentLock(&descriptors[i].bufferdesc)) {
+			UT_ASSERT(init_locks & (1 << i));
+			UT_ASSERT(InterruptHoldoffCount > 0);
+			init_locks &= ~(1 << i);
+			InterruptHoldoffCount--;
+			return;
+		}
+	UT_ASSERT(false);
+}
+static void
+cluster_bufmgr_pcm_x_writer_activate_target_direct_init(BufferDesc *buf)
+{
+	UT_ASSERT(init_locks & (1 << buf->buf_id));
+	init_fault(buf, 2);
+}
+static ClusterPcmXWriterLedgerEntry *
+pg_attribute_unused() cluster_bufmgr_pcm_x_writer_find(BufferDesc *buf)
+{
+	return init_ledgers[buf->buf_id].present ? &init_ledgers[buf->buf_id] : NULL;
+}
+static void
+pg_attribute_unused() cluster_bufmgr_pcm_x_writer_clear(ClusterPcmXWriterLedgerEntry *entry)
+{
+	if (entry != NULL)
+		entry->present = false;
+}
+static void
+TerminateBufferIO(BufferDesc *buf, bool dirty, uint32 flags)
+{
+	UT_ASSERT(!dirty && flags == BM_VALID);
+	init_completed++;
+}
+static void
+finish_extension(uint32 flags, uint32 extend_by)
+{
+	Buffer buffers[2] = { 1, 2 };
+	BlockNumber first_block = 0, extend_upto = extend_by;
+#include "test_cluster_space_extend_finish.inc"
+}
+UT_TEST(test_extension_returns_initialized_content_locks)
+{
+	reset();
+	init_locks = init_completed = InterruptHoldoffCount = 0;
+	memset(init_ledgers, 0, sizeof(init_ledgers));
+	init_fail_buffer = -1;
+	finish_extension(EB_LOCK_FIRST | EB_LOCK_TARGET, 2);
+	UT_ASSERT_EQ(init_completed, 2);
+	UT_ASSERT_EQ(init_locks, 3);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 2);
+	UT_ASSERT(init_ledgers[0].present && init_ledgers[1].present);
+}
+UT_TEST(test_extension_error_releases_current_and_earlier_content_locks)
+{
+	for (int buffer = 0; buffer < 2; buffer++)
+		for (int stage = 1; stage <= 2; stage++) {
+			volatile bool returned = false, caught = false;
+			reset();
+			init_locks = init_completed = InterruptHoldoffCount = 0;
+			memset(init_ledgers, 0, sizeof(init_ledgers));
+			init_fail_buffer = buffer;
+			init_fail_stage = stage;
+			PG_TRY();
+			{
+				finish_extension(EB_LOCK_FIRST | EB_LOCK_TARGET, 2);
+				returned = true;
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			UT_ASSERT(caught && !returned);
+			UT_ASSERT_EQ(init_completed, buffer);
+			UT_ASSERT_EQ(init_locks, 0);
+			UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+			UT_ASSERT(!init_ledgers[0].present && !init_ledgers[1].present);
+		}
+}
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(6);
 	UT_RUN(test_single_live_and_private_callers_use_canonical_reservations);
 	UT_RUN(test_nonshared_and_auxiliary_keep_native_extension);
 	UT_RUN(test_refusals_do_not_fall_back_to_file_size);
 	UT_RUN(test_reservation_error_releases_hw);
+	UT_RUN(test_extension_returns_initialized_content_locks);
+	UT_RUN(test_extension_error_releases_current_and_earlier_content_locks);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

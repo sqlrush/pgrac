@@ -48,6 +48,7 @@ static DecodedXLogRecord *decoded;
 static unsigned dirties, releases, vm_calls;
 static bool locked;
 static bool checksums;
+static unsigned skip_mask, restored_mask, data_reads[2];
 static bool buffer_locked[2];
 static const BlockNumber block_number = 17;
 static char inplace_data[8] = "newvalue";
@@ -63,10 +64,15 @@ XLogRedoAction
 XLogReadBufferForRedo(XLogReaderState *record, uint8 id, Buffer *buffer)
 {
 	UT_ASSERT(record == &reader && id < 2 && !buffer_locked[id]);
+	if (skip_mask & (1U << id)) {
+		*buffer = InvalidBuffer;
+		return BLK_NOTFOUND;
+	}
+	data_reads[id]++;
 	buffer_locked[id] = true;
 	locked = true;
 	*buffer = id + 1;
-	return BLK_NEEDS_REDO;
+	return (restored_mask & (1U << id)) ? BLK_RESTORED : BLK_NEEDS_REDO;
 }
 Buffer
 XLogInitBufferForRedo(XLogReaderState *record, uint8 id)
@@ -86,7 +92,7 @@ XLogReadBufferForRedoExtended(XLogReaderState *record, uint8 id, ReadBufferMode 
 		*buffer = InvalidBuffer;
 		return BLK_DONE;
 	}
-	UT_ASSERT(mode == RBM_NORMAL);
+	UT_ASSERT(mode == RBM_NORMAL || mode == RBM_ZERO_AND_LOCK);
 	UT_ASSERT_EQ(cleanup, (XLogRecGetInfo(record) & XLOG_HEAP_OPMASK) == XLOG_HEAP2_PRUNE);
 	return XLogReadBufferForRedo(record, id, buffer);
 }
@@ -338,7 +344,8 @@ reset(uint8 rmid, uint8 opcode, int itl_format)
 	}
 	native_page = detached_page = original;
 	BufferBlocks = native_page.data;
-	dirties = releases = vm_calls = 0;
+	dirties = releases = vm_calls = skip_mask = restored_mask = 0;
+	memset(data_reads, 0, sizeof(data_reads));
 	locked = false;
 	memset(buffer_locked, 0, sizeof(buffer_locked));
 }
@@ -850,6 +857,53 @@ UT_TEST(test_update_variants_match_native)
 					}
 }
 
+
+UT_TEST(test_init_cold_skip_and_restored_never_reinitialize)
+{
+	for (int multi = 0; multi < 2; multi++) {
+		PGAlignedBlock result, saved;
+		void (*redo)(XLogReaderState *) = multi ? heap_xlog_multi_insert : heap_xlog_insert;
+		reset_insert(multi, true, 3, 0);
+		redo(&reader);
+		result = native_page;
+		for (int restored = 0; restored < 2; restored++) {
+			reset_insert(multi, true, 3, 0);
+			if (restored) {
+				restored_mask = 1;
+				native_page = result;
+			} else {
+				skip_mask = 1;
+				memset(&native_page, 0xA5, sizeof(native_page));
+			}
+			saved = native_page;
+			redo(&reader);
+			UT_ASSERT(memcmp(saved.data, native_page.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(data_reads[0], restored);
+			UT_ASSERT_EQ(dirties, 0);
+			UT_ASSERT_EQ(releases, restored);
+		}
+	}
+	for (unsigned skip = 1; skip < 4; skip++) {
+		PGAlignedBlock result[2], before[2];
+		reset_update(true, true, false, 3, 0, true);
+		heap_xlog_update(&reader, false);
+		memcpy(result, native_pages, sizeof(result));
+		reset_update(true, true, false, 3, 0, true);
+		skip_mask = skip;
+		for (int i = 0; i < 2; i++)
+			if (skip & (1U << i))
+				memset(&native_pages[i], 0xA5, BLCKSZ);
+		memcpy(before, native_pages, sizeof(before));
+		heap_xlog_update(&reader, false);
+		for (int i = 0; i < 2; i++) {
+			UT_ASSERT(memcmp(native_pages[i].data,
+							 (skip & (1U << i)) ? before[i].data : result[i].data, BLCKSZ)
+					  == 0);
+			UT_ASSERT_EQ(data_reads[i], (skip & (1U << i)) ? 0 : 1);
+		}
+		UT_ASSERT(!locked);
+	}
+}
 UT_TEST(test_update_bad_shapes_do_not_modify_output)
 {
 	for (int bad = 0; bad < 24; bad++) {
@@ -1250,7 +1304,7 @@ UT_TEST(test_bad_maintenance_does_not_modify_output)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(test_confirm_and_inplace_match_native);
 	UT_RUN(test_lock_and_updated_lock_match_native);
 	UT_RUN(test_zero_length_inplace_payload_matches_native);
@@ -1264,6 +1318,7 @@ main(void)
 	UT_RUN(test_insert_reuses_unused_pointer_and_delete_logical_trailer);
 	UT_RUN(test_insert_delete_bad_shapes_do_not_modify_output);
 	UT_RUN(test_update_variants_match_native);
+	UT_RUN(test_init_cold_skip_and_restored_never_reinitialize);
 	UT_RUN(test_update_bad_shapes_do_not_modify_output);
 	UT_RUN(test_visible_heap_matches_native_and_producer_lsn);
 	UT_RUN(test_bad_visible_heap_leaves_output_unchanged);

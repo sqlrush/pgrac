@@ -52,6 +52,29 @@ SELECT name, setting, unit, context, source, pending_restart FROM pg_settings WH
 SELECT name, setting, unit, context, source, pending_restart FROM pg_settings WHERE name = 'cluster.recovery_workers_max';
 ```
 
+## `cluster.cold_recovery_plan_memory`
+
+| 属性 | 值 |
+|---|---|
+| 类型 | `integer` |
+| 默认值 | `4GB`（32 位平台受平台上限约束） |
+| 范围 | `1MB` 至平台 `MAX_KILOBYTES` 上限 |
+| Context | `postmaster` |
+| 生效方式 | 修改后重启实例 |
+| 单位 | `kB` |
+| 内置短说明 | Memory budget of the typed cold-recovery plan. |
+
+限制所有实例异常退出后，类型化冷恢复第一遍规划保留的内存，包括记录、页版本和封存临时空间。
+这不是预先分配量。规划超出预算时，在修改任何页之前拒绝启动；可增加此参数后重新启动恢复。
+应同时给 PostgreSQL 的其他内存使用和操作系统预留空间。
+
+观察当前值及重启状态：
+
+```sql
+SELECT name, setting, unit, min_val, max_val, context, source, pending_restart
+FROM pg_settings WHERE name = 'cluster.cold_recovery_plan_memory';
+```
+
 ## `cluster.merged_recovery`
 
 | 属性 | 值 |

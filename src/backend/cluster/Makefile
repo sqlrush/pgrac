@@ -94,9 +94,15 @@ OBJS = \
 	cluster_side_space.o \
 	cluster_side_stats.o \
 	cluster_cold_recovery_plan.o \
+	cluster_cold_recovery_plan_store.o \
+	cluster_cold_recovery_plan_seal.o \
+	cluster_cold_recovery_plan_space.o \
+	cluster_cold_recovery_plan_schedule.o \
 	cluster_cold_recovery_decode.o \
 	cluster_cold_recovery_io.o \
+	cluster_cold_recovery_space.o \
 	cluster_cold_recovery_startup.o \
+	cluster_cold_recovery_replay.o \
 	cluster_recovery_duty.o \
 	cluster_cf_enqueue.o \
 	cluster_lock_owner.o \

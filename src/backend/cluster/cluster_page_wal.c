@@ -28,6 +28,7 @@ typedef struct PageWalSource {
 
 typedef struct PageWalShared {
 	slock_t source_lock;
+	pg_atomic_uint32 cold_redo_failed;
 	PageWalSource sources[PAGE_WAL_SOURCE_SLOTS];
 	PageWalSlot slots[FLEXIBLE_ARRAY_MEMBER];
 } PageWalShared;
@@ -411,7 +412,21 @@ cluster_page_wal_shmem_init(void)
 	if (!found) {
 		memset(page_wal_shared, 0, cluster_page_wal_shmem_size());
 		SpinLockInit(&page_wal_shared->source_lock);
+		pg_atomic_init_u32(&page_wal_shared->cold_redo_failed, 0);
 	}
+}
+
+bool
+cluster_page_wal_cold_redo_write_allowed_v1(void)
+{
+	return page_wal_shared != NULL && pg_atomic_read_u32(&page_wal_shared->cold_redo_failed) == 0;
+}
+
+void
+cluster_page_wal_cold_redo_fail_v1(void)
+{
+	if (page_wal_shared != NULL)
+		pg_atomic_write_u32(&page_wal_shared->cold_redo_failed, 1);
 }
 
 static const ClusterShmemRegion page_wal_region = {

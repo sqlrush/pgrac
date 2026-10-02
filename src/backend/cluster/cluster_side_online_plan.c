@@ -926,6 +926,30 @@ rf_side_online_plan_bind_database_v1(RfSideOnlinePlanV1 *plan, uint64 database_i
 	return true;
 }
 
+uint32
+rf_side_online_plan_participant_count_v1(const RfSideOnlinePlanV1 *plan)
+{
+	return plan != NULL && plan->magic == RF_SIDE_ONLINE_PLAN_MAGIC && plan->sealed
+			   ? plan->participant_count
+			   : UINT32_MAX;
+}
+
+bool
+rf_side_online_plan_replay_start_matches_v1(const RfSideOnlinePlanV1 *plan, uint32 thread,
+											uint64 incarnation, uint64 database_incarnation,
+											XLogRecPtr native_redo)
+{
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| database_incarnation == 0 || plan->database_incarnation != database_incarnation
+		|| XLogRecPtrIsInvalid(native_redo))
+		return false;
+	for (uint32 i = 0; i < plan->participant_count; i++)
+		if (plan->physical_cuts[i].failed_thread == thread
+			&& plan->physical_cuts[i].origin_owner_incarnation == incarnation)
+			return plan->redo_starts[i] == native_redo;
+	return false;
+}
+
 bool
 rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan,
 	uint64 system_identifier, const uint8 storage_uuid[16], const RfContributorStreamCutV1 *cut)

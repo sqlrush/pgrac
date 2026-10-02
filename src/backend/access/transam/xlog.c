@@ -196,6 +196,7 @@
 #include "cluster/cluster_cf_authority.h" /* PGRAC: spec-5.6 shared pg_control authority write */
 #include "cluster/cluster_cf_stats.h" /* PGRAC: RF-B OWNER -> EOR phase */
 #include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-6.14 D9 amend recovery-claim release */
+#include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_relmap_arb.h" /* PGRAC: spec-6.14 D5 relmap pending arbitration */
 #include "cluster/cluster_cf_enqueue.h" /* PGRAC: spec-5.6 CF X write-permission gate */
 #include "cluster/cluster_cf_phase2.h" /* PGRAC: spec-5.6 T6 cross-node verify */
@@ -10702,6 +10703,7 @@ xlog_redo(XLogReaderState *record)
 		for (uint8 block_id = 0; block_id <= XLogRecMaxBlockId(record); block_id++)
 		{
 			Buffer		buffer;
+			XLogRedoAction action;
 
 			if (!XLogRecHasBlockImage(record, block_id))
 			{
@@ -10710,8 +10712,19 @@ xlog_redo(XLogReaderState *record)
 				continue;
 			}
 
-			if (XLogReadBufferForRedo(record, block_id, &buffer) != BLK_RESTORED)
-				elog(ERROR, "unexpected XLogReadBufferForRedo result when restoring backup block");
+			action = XLogReadBufferForRedo(record, block_id, &buffer);
+#ifdef USE_PGRAC_CLUSTER
+			/* Exact cold SKIP returns no pin and must not open DATA. */
+			if (cluster_page_cold_redo_active_v1 && action == BLK_NOTFOUND
+				&& !BufferIsValid(buffer))
+				continue;
+#endif
+			if (action != BLK_RESTORED || !BufferIsValid(buffer))
+				ereport(
+					ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg(
+						 "unexpected XLogReadBufferForRedo result when restoring backup block")));
 			UnlockReleaseBuffer(buffer);
 		}
 	}

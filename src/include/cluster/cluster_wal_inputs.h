@@ -55,6 +55,25 @@ extern ClusterControlRootResult cluster_wal_inputs_wait_failed_v1(ClusterWalInpu
 extern ClusterControlRootResult cluster_wal_inputs_begin_v1(const uint8 storage_uuid[16],
 															uint64 system_identifier,
 															ClusterWalInputsV1 **out);
+/* Startup in recovery only, before IR. Same complete ROOT/anchor/claim and
+ * WALR-S selection as begin_v1, but this scope cannot sample/flush OPEN
+ * writers, request peer cuts, build live contribution plans or prove local
+ * predecessor retirement. OPEN metadata remains visible; retained visitation
+ * returns WAIT for OPEN without invalidating the scope. No membership filter,
+ * no lower-versus-native-redo filter and no discovery of unselected archives.
+ *
+ * This read scope is not an execution pin or a recovery permission. Copy
+ * metadata only while held. Release before acquiring an execution pin, then
+ * revalidate the entire selected ROOT using that original execution owner
+ * before IR; copied tokens alone confer no DATA/ROOT/PI/GC authority. */
+extern ClusterControlRootResult cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16],
+																 uint64 system_identifier,
+																 ClusterWalInputsV1 **out);
+/* Metadata token of the whole selected ROOT, not a publication capability.
+ * Like at_v1, this requires the same live scope/owner; call revalidate_v1
+ * before consuming provisional results. Invalid scopes produce no token. */
+extern ClusterControlRootResult cluster_wal_inputs_root_token_v1(ClusterWalInputsV1 *inputs,
+																 ClusterControlRootFileToken *out);
 extern ClusterControlRootResult cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs);
 extern uint32 cluster_wal_inputs_count_v1(ClusterWalInputsV1 *inputs);
 extern const ClusterWalInputV1 *cluster_wal_inputs_at_v1(ClusterWalInputsV1 *inputs, uint32 index);
