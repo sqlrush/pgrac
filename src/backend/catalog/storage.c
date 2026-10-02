@@ -1148,6 +1148,7 @@ smgr_redo_truncate_internal(XLogRecPtr lsn, const xl_smgr_truncate *xlrec,
 	int			nforks = 0;
 	bool		need_fsm_vacuum = false;
 	BlockNumber cold_vm_blocks = InvalidBlockNumber;
+	uint8		cold_sync_forks = 0;
 	bool success = false;
 #ifdef USE_PGRAC_CLUSTER
 	bool shared_relation;
@@ -1199,7 +1200,8 @@ smgr_redo_truncate_internal(XLogRecPtr lsn, const xl_smgr_truncate *xlrec,
 	rel = CreateFakeRelcacheEntry(xlrec->rlocator);
 #ifdef USE_PGRAC_CLUSTER
 	if (batch != NULL
-		&& (!visibilitymap_prepare_cold_truncate(rel, xlrec->blkno, &cold_vm_blocks)
+		&& ((((xlrec->flags & SMGR_TRUNCATE_VM) != 0)
+			 && !visibilitymap_prepare_cold_truncate(rel, xlrec->blkno, &cold_vm_blocks))
 			|| !(apply ? cluster_space_recovery_truncate_permitted_v1(batch, xlrec)
 				 : cluster_space_recovery_truncate_preflight_permitted_v1(batch, xlrec))))
 		goto done;
@@ -1213,10 +1215,17 @@ smgr_redo_truncate_internal(XLogRecPtr lsn, const xl_smgr_truncate *xlrec,
 	/* Prepare for truncation of MAIN fork */
 	if ((xlrec->flags & SMGR_TRUNCATE_HEAP) != 0)
 	{
-		forks[nforks] = MAIN_FORKNUM;
-		old_blocks[nforks] = smgrnblocks(reln, MAIN_FORKNUM);
-		blocks[nforks] = xlrec->blkno;
-		nforks++;
+		BlockNumber old = smgrnblocks(reln, MAIN_FORKNUM);
+
+		if (batch != NULL)
+			cold_sync_forks |= 1 << MAIN_FORKNUM;
+		if (batch == NULL || old > xlrec->blkno)
+		{
+			forks[nforks] = MAIN_FORKNUM;
+			old_blocks[nforks] = old;
+			blocks[nforks] = xlrec->blkno;
+			nforks++;
+		}
 
 		/* Also tell xlogutils.c about it */
 		XLogTruncateRelation(xlrec->rlocator, MAIN_FORKNUM, xlrec->blkno);
@@ -1226,6 +1235,8 @@ smgr_redo_truncate_internal(XLogRecPtr lsn, const xl_smgr_truncate *xlrec,
 	if ((xlrec->flags & SMGR_TRUNCATE_FSM) != 0 &&
 		smgrexists(reln, FSM_FORKNUM))
 	{
+		if (batch != NULL)
+			cold_sync_forks |= 1 << FSM_FORKNUM;
 		blocks[nforks] = FreeSpaceMapPrepareTruncateRel(rel, xlrec->blkno);
 		if (BlockNumberIsValid(blocks[nforks]))
 		{
@@ -1238,6 +1249,8 @@ smgr_redo_truncate_internal(XLogRecPtr lsn, const xl_smgr_truncate *xlrec,
 	if ((xlrec->flags & SMGR_TRUNCATE_VM) != 0 &&
 		smgrexists(reln, VISIBILITYMAP_FORKNUM))
 	{
+		if (batch != NULL)
+			cold_sync_forks |= 1 << VISIBILITYMAP_FORKNUM;
 		blocks[nforks] = batch != NULL ? cold_vm_blocks
 			: visibilitymap_prepare_truncate(rel, xlrec->blkno);
 		if (BlockNumberIsValid(blocks[nforks]))
@@ -1258,15 +1271,41 @@ smgr_redo_truncate_internal(XLogRecPtr lsn, const xl_smgr_truncate *xlrec,
 	if (shared_relation)
 		for (int i = 0; i < nforks; i++)
 			blocks[i] = Min(blocks[i], old_blocks[i]);
+	if (batch != NULL)
+	{
+		int shrinking = 0;
+
+		for (int i = 0; i < nforks; i++)
+			if (blocks[i] < old_blocks[i])
+			{
+				forks[shrinking] = forks[i];
+				blocks[shrinking] = blocks[i];
+				old_blocks[shrinking++] = old_blocks[i];
+			}
+		nforks = shrinking;
+	}
 #endif
-	if (nforks > 0)
+	if (nforks > 0 || cold_sync_forks != 0)
 	{
 		START_CRIT_SECTION();
-		smgrtruncate2(reln, forks, nforks, old_blocks, blocks);
+		if (nforks > 0)
+			smgrtruncate2(reln, forks, nforks, old_blocks, blocks);
 #ifdef USE_PGRAC_CLUSTER
 		if (shared_relation)
-			for (int i = 0; i < nforks; i++)
-				smgrimmedsync(reln, forks[i]);
+		{
+			/* A previous recoverer may have changed EOF without completing
+			 * its sync. Leave a short fork's size alone, but establish the
+			 * durability requested by this exact cold step before returning. */
+			if (batch != NULL)
+			{
+				for (ForkNumber fork = MAIN_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++)
+					if (cold_sync_forks & (1 << fork))
+						smgrimmedsync(reln, fork);
+			}
+			else
+				for (int i = 0; i < nforks; i++)
+					smgrimmedsync(reln, forks[i]);
+		}
 #endif
 		END_CRIT_SECTION();
 	}

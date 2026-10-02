@@ -104,6 +104,9 @@ static int fail_space_flush, fail_space_sync;
 static PGAlignedBlock written_space[2];
 static bool cold_truncate_fixture, cold_truncate_permitted, cold_vm_clear, cold_vm_stale;
 static bool cold_main_missing;
+static int cold_fork_flags;
+static unsigned cold_vm_reads, cold_truncated_forks, cold_synced_forks;
+static BlockNumber cold_fsm_size, cold_vm_size;
 static const ClusterSpaceRecoveryBatchV1 *cold_batch = (const ClusterSpaceRecoveryBatchV1 *)42;
 static bool cold_commit_window, cold_drop_proven;
 static unsigned cold_drop_checks;
@@ -317,9 +320,9 @@ smgrnblocks(SMgrRelation rel, ForkNumber forknum)
 	if ((recovering || truncate_owner) && forknum == MAIN_FORKNUM)
 		return main_blocks;
 	if ((recovering || truncate_owner) && auxiliary_forks && forknum == FSM_FORKNUM)
-		return 8;
+		return cold_fsm_size;
 	if ((recovering || truncate_owner) && auxiliary_forks && forknum == VISIBILITYMAP_FORKNUM)
-		return 3;
+		return cold_vm_size;
 	if (forknum != SPACE_FORKNUM)
 		abort();
 	return blocks;
@@ -392,6 +395,8 @@ FreeSpaceMapPrepareTruncateRel(Relation rel, BlockNumber count)
 		|| !RelFileLocatorEquals(rel->rd_locator, locator)
 		|| rel->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT)
 		abort();
+	if (cold_truncate_fixture && cold_fsm_size <= 1)
+		return InvalidBlockNumber;
 	return 1;
 }
 BlockNumber
@@ -406,6 +411,7 @@ visibilitymap_prepare_cold_truncate(Relation rel, BlockNumber count, BlockNumber
 {
 	UT_ASSERT(cold_truncate_fixture && rel == fake_relation && count == 4);
 	UT_ASSERT_EQ(truncate_calls, 0);
+	cold_vm_reads++;
 	if (cold_vm_stale)
 		cold_truncate_permitted = false;
 	if (!cold_vm_clear)
@@ -420,7 +426,7 @@ cluster_space_recovery_truncate_permitted_v1(const ClusterSpaceRecoveryBatchV1 *
 	return cold_truncate_fixture && cold_truncate_permitted && batch == cold_batch && recovering
 		   && locked == 3 && pinned == 3 && truncate != NULL
 		   && RelFileLocatorEquals(truncate->rlocator, locator)
-		   && truncate->flags == SMGR_TRUNCATE_ALL && truncate->blkno == 4;
+		   && truncate->flags == cold_fork_flags && truncate->blkno == 4;
 }
 void
 FreeSpaceMapVacuumRange(Relation rel, BlockNumber start, BlockNumber end)
@@ -435,6 +441,35 @@ void
 smgrtruncate2(SMgrRelation rel, ForkNumber *forks, int nforks, BlockNumber *oldblocks,
 			  BlockNumber *newblocks)
 {
+	if (cold_truncate_fixture) {
+		unsigned expected = 0;
+
+		UT_ASSERT(rel == &storage && locked == 3 && pinned == 3);
+		UT_ASSERT_EQ(CritSectionCount, 1);
+		UT_ASSERT_EQ(flush_calls, 0);
+		if ((cold_fork_flags & SMGR_TRUNCATE_HEAP) && main_blocks > 4)
+			expected |= 1 << MAIN_FORKNUM;
+		if (auxiliary_forks && (cold_fork_flags & SMGR_TRUNCATE_FSM) && cold_fsm_size > 1)
+			expected |= 1 << FSM_FORKNUM;
+		if (auxiliary_forks && (cold_fork_flags & SMGR_TRUNCATE_VM) && cold_vm_size > 1)
+			expected |= 1 << VISIBILITYMAP_FORKNUM;
+		for (int i = 0; i < nforks; i++) {
+			BlockNumber *size = forks[i] == MAIN_FORKNUM  ? &main_blocks
+								: forks[i] == FSM_FORKNUM ? &cold_fsm_size
+														  : &cold_vm_size;
+
+			UT_ASSERT(forks[i] >= MAIN_FORKNUM && forks[i] <= VISIBILITYMAP_FORKNUM);
+			UT_ASSERT((cold_truncated_forks & (1 << forks[i])) == 0);
+			UT_ASSERT_EQ(oldblocks[i], *size);
+			UT_ASSERT_EQ(newblocks[i], forks[i] == MAIN_FORKNUM ? 4 : 1);
+			UT_ASSERT(newblocks[i] < oldblocks[i]);
+			cold_truncated_forks |= 1 << forks[i];
+			*size = newblocks[i];
+		}
+		UT_ASSERT_EQ(cold_truncated_forks, expected);
+		truncate_calls++;
+		return;
+	}
 	if (rel != &storage || nforks != (auxiliary_forks ? 3 : 1) || forks[0] != MAIN_FORKNUM
 		|| (!truncate_owner && (locked != 3 || pinned != 3)) || CritSectionCount == 0
 		|| flush_calls != (cold_truncate_fixture ? 0 : truncate_calls + 1)
@@ -818,7 +853,16 @@ smgrimmedsync(SMgrRelation rel, ForkNumber fork)
 	if (recovering && !truncate_owner) {
 		UT_ASSERT_EQ(CritSectionCount, 1);
 		UT_ASSERT_EQ(locked, 3);
-		UT_ASSERT_EQ(fork, (ForkNumber)(shrink_syncs % (auxiliary_forks ? 3 : 1)));
+		if (cold_truncate_fixture) {
+			UT_ASSERT(fork == MAIN_FORKNUM || auxiliary_forks);
+			UT_ASSERT(cold_fork_flags
+					  & (fork == MAIN_FORKNUM  ? SMGR_TRUNCATE_HEAP
+						 : fork == FSM_FORKNUM ? SMGR_TRUNCATE_FSM
+											   : SMGR_TRUNCATE_VM));
+			UT_ASSERT((cold_synced_forks & (1 << fork)) == 0);
+			cold_synced_forks |= 1 << fork;
+		} else
+			UT_ASSERT_EQ(fork, (ForkNumber)(shrink_syncs % (auxiliary_forks ? 3 : 1)));
 		UT_ASSERT_EQ(flush_calls, cold_truncate_fixture ? 0 : truncate_calls);
 		shrink_syncs++;
 		fork_syncs++;
@@ -880,6 +924,10 @@ reset(void)
 	fail_space_flush = fail_space_sync = 0;
 	memset(written_space, 0, sizeof(written_space));
 	cold_truncate_fixture = cold_vm_stale = cold_main_missing = false;
+	cold_fork_flags = SMGR_TRUNCATE_ALL;
+	cold_vm_reads = cold_truncated_forks = cold_synced_forks = 0;
+	cold_fsm_size = 8;
+	cold_vm_size = 3;
 	cold_commit_window = cold_drop_proven = false;
 	cold_drop_checks = 0;
 	cold_drop_second_refused = false;
@@ -1942,11 +1990,51 @@ UT_TEST(test_cold_physical_truncate_never_grows_a_short_or_retained_main)
 		main_blocks = prior;
 		UT_ASSERT(smgr_redo_cold_truncate(&truncate, cold_batch));
 		UT_ASSERT_EQ(main_blocks, prior);
-		UT_ASSERT_EQ(truncate_calls, 1);
+		UT_ASSERT_EQ(truncate_calls, 0);
 		UT_ASSERT_EQ(shrink_syncs, 1);
 		UT_ASSERT_EQ(flush_calls + main_create_calls, 0);
 		UT_ASSERT_EQ(fake_allocations, fake_frees);
 	}
+}
+
+UT_TEST(test_cold_physical_truncate_touches_only_named_forks)
+{
+	for (int flags = 1; flags <= SMGR_TRUNCATE_ALL; flags++) {
+		xl_smgr_truncate truncate = { 4, locator, flags };
+
+		reset();
+		recovering = cold_truncate_fixture = auxiliary_forks = true;
+		cold_fork_flags = flags;
+		pinned = locked = 3;
+		cold_vm_clear = (flags & SMGR_TRUNCATE_VM) != 0;
+		UT_ASSERT(smgr_redo_cold_truncate(&truncate, cold_batch));
+		UT_ASSERT_EQ(main_blocks, (flags & SMGR_TRUNCATE_HEAP) ? 4 : 10);
+		UT_ASSERT_EQ(cold_fsm_size, (flags & SMGR_TRUNCATE_FSM) ? 1 : 8);
+		UT_ASSERT_EQ(cold_vm_size, (flags & SMGR_TRUNCATE_VM) ? 1 : 3);
+		UT_ASSERT_EQ(cold_vm_reads, (flags & SMGR_TRUNCATE_VM) ? 1 : 0);
+		UT_ASSERT_EQ(cold_synced_forks, cold_truncated_forks);
+		UT_ASSERT_EQ(fsm_vacuums, (flags & SMGR_TRUNCATE_FSM) ? 1 : 0);
+		UT_ASSERT_EQ(flush_calls + main_create_calls, 0);
+		UT_ASSERT_EQ(fake_allocations, fake_frees);
+	}
+}
+
+UT_TEST(test_cold_physical_truncate_leaves_already_short_forks_alone)
+{
+	xl_smgr_truncate truncate = { 4, locator, SMGR_TRUNCATE_ALL };
+
+	reset();
+	recovering = cold_truncate_fixture = auxiliary_forks = true;
+	pinned = locked = 3;
+	main_blocks = 3;
+	cold_fsm_size = cold_vm_size = 1;
+	UT_ASSERT(smgr_redo_cold_truncate(&truncate, cold_batch));
+	UT_ASSERT_EQ(truncate_calls + fsm_vacuums, 0);
+	UT_ASSERT_EQ(shrink_syncs, 3);
+	UT_ASSERT_EQ(main_blocks, 3);
+	UT_ASSERT_EQ(cold_fsm_size, 1);
+	UT_ASSERT_EQ(cold_vm_size, 1);
+	UT_ASSERT_EQ(fake_allocations, fake_frees);
 }
 
 static void
@@ -2417,7 +2505,9 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(49);
+	UT_PLAN(51);
+	UT_RUN(test_cold_physical_truncate_touches_only_named_forks);
+	UT_RUN(test_cold_physical_truncate_leaves_already_short_forks_alone);
 	UT_RUN(test_native_truncate_persists_new_space_before_exposing_incarnation);
 	UT_RUN(test_native_truncate_space_write_or_sync_error_does_not_complete);
 	UT_RUN(test_cold_physical_preflight_checks_vm_without_truncation_or_fsm_writes);

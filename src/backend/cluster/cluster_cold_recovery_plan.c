@@ -661,6 +661,7 @@ cluster_cold_plan_space_input_v1(const ClusterColdPlanV1 *plan, uint32 relation,
 	record = cold_record(plan, op->record);
 	memset(out, 0, sizeof(*out));
 	out->kind = op->kind;
+	out->shrink_forks = op->shrink_forks;
 	out->participant = plan->participants[record->participant].input_index;
 	out->read_rec_ptr = record->read_rec_ptr;
 	out->end_rec_ptr = record->end_rec_ptr;

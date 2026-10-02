@@ -28,7 +28,8 @@ struct ClusterRecoveryFencePlan;
 extern bool cluster_space_recovery_cold_relation_install_v1(const ClusterSpaceIdentityKey *key,
 															const ClusterSpaceRecoveryInput *inputs,
 															const ClusterSpaceColdSourceV1 *sources,
-															uint32 count, uint32 through);
+															uint32 count, uint32 through,
+															uint8 shrink_forks);
 
 /* Read-only qualification for the original cold COMMIT deletion owner.
  * Both SPACE components must already be this exact, durable tombstone.

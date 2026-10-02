@@ -95,6 +95,7 @@ ClusterPcmOwnEntry *ClusterPcmOwnArray;
 BufferUsage pgBufferUsage;
 static bool sf_blocked, stale_during_io, stale_after_write;
 static unsigned cold_truncates;
+static int cold_last_truncate_flags;
 static bool fail_cold_truncate, stale_after_truncate;
 static BlockNumber cold_main_blocks;
 static bool checkpoint_during_flush;
@@ -547,7 +548,7 @@ smgr_redo_cold_truncate(const xl_smgr_truncate *truncate, const ClusterSpaceReco
 	wrong.blkno++;
 	UT_ASSERT(!cluster_space_recovery_truncate_permitted_v1(batch, &wrong));
 	wrong = *truncate;
-	wrong.flags = SMGR_TRUNCATE_HEAP;
+	wrong.flags ^= SMGR_TRUNCATE_HEAP;
 	UT_ASSERT(!cluster_space_recovery_truncate_permitted_v1(batch, &wrong));
 	wrong = *truncate;
 	wrong.rlocator.relNumber++;
@@ -556,8 +557,11 @@ smgr_redo_cold_truncate(const xl_smgr_truncate *truncate, const ClusterSpaceReco
 	UT_ASSERT_EQ(wal_flushes, 0);
 	if (fail_cold_truncate)
 		return false;
-	cold_main_blocks = Min(cold_main_blocks, truncate->blkno);
-	cold_truncates++;
+	cold_last_truncate_flags = truncate->flags;
+	if ((truncate->flags & SMGR_TRUNCATE_HEAP) != 0 && cold_main_blocks > truncate->blkno) {
+		cold_main_blocks = truncate->blkno;
+		cold_truncates++;
+	}
 	if (stale_after_truncate)
 		stale = true;
 	return true;
@@ -757,6 +761,7 @@ reset(void)
 	recovery = cold_current = true;
 	cold_window = merge_claim = true;
 	cold_truncates = 0;
+	cold_last_truncate_flags = 0;
 	cold_main_blocks = 7;
 	fail_cold_truncate = stale_after_truncate = false;
 	cold_origins = 2;
@@ -1772,7 +1777,7 @@ UT_TEST(test_compact_cold_create_and_advance_use_original_sources)
 			roots[0].identity = serials[0].duty = duties[0];
 		}
 		compact_inputs(inputs, origin);
-		installed = cluster_space_cold_install_v1(&key, inputs, origin, 2, 0);
+		installed = cluster_space_cold_install_v1(&key, inputs, origin, 2, 0, 0);
 		UT_ASSERT(installed);
 		if (!installed)
 			continue;
@@ -1785,7 +1790,7 @@ UT_TEST(test_compact_cold_create_and_advance_use_original_sources)
 		UT_ASSERT(cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1,
 														&key, &observed, &token));
 		UT_ASSERT_EQ(observed.next_block, 0);
-		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 1));
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 1, 0));
 		UT_ASSERT(cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1,
 														&key, &observed, &token));
 		UT_ASSERT_EQ(observed.next_block, 4);
@@ -1824,7 +1829,7 @@ UT_TEST(test_compact_cold_rejects_missing_owner_and_source_drift_before_io)
 			merge_claim = false;
 		if (variant == 7)
 			serials[1].root_read_token.record_crc32c++;
-		UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0));
+		UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0, 0));
 		UT_ASSERT_EQ(writes + creates + extensions + syncs + reads, 0);
 		UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
 		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
@@ -1843,11 +1848,11 @@ UT_TEST(test_compact_cold_preflights_suffix_and_preserves_canonical_order)
 	swap = inputs[0];
 	inputs[0] = inputs[1];
 	inputs[1] = swap;
-	UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0));
+	UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0, 0));
 	UT_ASSERT_EQ(writes + creates + extensions + syncs, 0);
 	compact_inputs(inputs, origin);
 	inputs[1].length--;
-	UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0));
+	UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0, 0));
 	UT_ASSERT_EQ(writes + creates + extensions + syncs, 0);
 }
 
@@ -1869,7 +1874,7 @@ UT_TEST(test_compact_cold_history_successor_requires_physical_proof)
 		survivor_advance(9, 7, durable);
 		before = pages[1];
 		compact_inputs(inputs, origin);
-		UT_ASSERT_EQ(cluster_space_cold_install_v1(&key, inputs, origin, 2, 0), durable);
+		UT_ASSERT_EQ(cluster_space_cold_install_v1(&key, inputs, origin, 2, 0, 0), durable);
 		UT_ASSERT(memcmp(before.data, pages[1].data, BLCKSZ) == 0);
 		if (!durable)
 			UT_ASSERT_EQ(writes + syncs + creates + extensions, 0);
@@ -1897,7 +1902,7 @@ UT_TEST(test_compact_cold_failed_io_keeps_original_owner_and_retryable_prefix)
 			throw_at = 3;
 		PG_TRY();
 		{
-			UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0));
+			UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0, 0));
 		}
 		PG_CATCH();
 		{
@@ -1911,7 +1916,7 @@ UT_TEST(test_compact_cold_failed_io_keeps_original_owner_and_retryable_prefix)
 		fail_write_block = -1;
 		stale_after_write = stale = false;
 		throw_at = 0;
-		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 0));
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 0, 0));
 		UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 100);
 		UT_ASSERT_EQ(wal_flushes, 0);
 	}
@@ -1930,7 +1935,7 @@ UT_TEST(test_compact_cold_structure_requires_exact_two_component_chain)
 	compact_inputs(inputs, origin);
 	inputs[1].length--;
 	memcpy(before, pages, sizeof(before));
-	UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0));
+	UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0, 0));
 	UT_ASSERT_EQ(writes + creates + extensions + syncs + reads, 0);
 	UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
 }
@@ -1947,17 +1952,17 @@ UT_TEST(test_compact_cold_truncate_runs_original_owner_at_its_step_only)
 	make_plan();
 	MyAuxProcType = StartupProcess;
 	compact_inputs(inputs, origin);
-	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 0));
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 0, 0));
 	UT_ASSERT_EQ(cold_truncates, 0);
 	UT_ASSERT_EQ(cold_main_blocks, 7);
-	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 1));
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 1, SMGR_TRUNCATE_ALL));
 	UT_ASSERT_EQ(cold_truncates, 1);
 	UT_ASSERT_EQ(cold_main_blocks, 5);
 	UT_ASSERT(cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1, &key,
 													&got, &token));
 	UT_ASSERT_EQ(got.next_block, 5);
 	UT_ASSERT_EQ(token, 19);
-	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 1));
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 1, SMGR_TRUNCATE_ALL));
 	UT_ASSERT_EQ(cold_truncates, 1);
 	UT_ASSERT_EQ(wal_flushes, 0);
 	UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
@@ -1978,13 +1983,13 @@ UT_TEST(test_compact_cold_truncate_failure_cannot_publish_new_identity)
 		memcpy(before, pages, sizeof(before));
 		fail_cold_truncate = !late;
 		stale_after_truncate = late;
-		UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 1));
+		UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 1, SMGR_TRUNCATE_ALL));
 		UT_ASSERT_EQ(cold_truncates, late);
 		UT_ASSERT_EQ(writes, 0);
 		UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
 		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
 		stale = stale_after_truncate = fail_cold_truncate = false;
-		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 1));
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 1, SMGR_TRUNCATE_ALL));
 		UT_ASSERT_EQ(cold_main_blocks, 5);
 	}
 }
@@ -2051,7 +2056,8 @@ UT_TEST(test_compact_cold_regrowth_and_commit_tombstone_preserve_later_data)
 
 	compact_lifecycle(inputs, origin, bytes);
 	for (uint32 through = 0; through < 4; through++) {
-		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, through));
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, through,
+												through == 1 ? SMGR_TRUNCATE_ALL : 0));
 		if (through == 2)
 			cold_main_blocks = 9; /* Later native PAGE installs after their reservation. */
 	}
@@ -2062,25 +2068,97 @@ UT_TEST(test_compact_cold_regrowth_and_commit_tombstone_preserve_later_data)
 	UT_ASSERT_EQ(identity.state, CLUSTER_SPACE_IDENTITY_TOMBSTONED);
 	UT_ASSERT_EQ(token, 88);
 	memcpy(before, pages, sizeof(before));
-	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, 1));
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, 1, 0));
 	UT_ASSERT_EQ(cold_truncates, 1);
 	UT_ASSERT_EQ(cold_main_blocks, 9);
 	UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
 	UT_ASSERT_EQ(wal_flushes, 0);
 }
 
-UT_TEST(test_compact_cold_final_install_performs_intermediate_truncate)
+UT_TEST(test_compact_cold_final_install_never_repeats_intermediate_shrink)
 {
 	ClusterSpaceRecoveryInput inputs[4];
 	ClusterSpaceColdSourceV1 origin[4];
 	uint8 bytes[4][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 
 	compact_lifecycle(inputs, origin, bytes);
-	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, 3));
-	UT_ASSERT_EQ(cold_truncates, 1);
-	UT_ASSERT_EQ(cold_main_blocks, 5);
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, 3, 0));
+	UT_ASSERT_EQ(cold_truncates, 0);
+	UT_ASSERT_EQ(cold_main_blocks, 7);
 	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 88);
 	UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 88);
+}
+
+UT_TEST(test_compact_cold_named_shrink_runs_even_when_space_is_already_durable)
+{
+	ClusterSpaceRecoveryInput inputs[2];
+	ClusterSpaceColdSourceV1 origins[2];
+
+	reset();
+	structural = true;
+	make_plan();
+	MyAuxProcType = StartupProcess;
+	compact_inputs(inputs, origins);
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 2, 1, SMGR_TRUNCATE_ALL));
+	cold_main_blocks = 9; /* The SPACE result alone is not a fork durability proof. */
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 2, 1, SMGR_TRUNCATE_HEAP));
+	UT_ASSERT_EQ(cold_main_blocks, 5);
+	UT_ASSERT_EQ(cold_truncates, 2);
+}
+
+UT_TEST(test_compact_cold_unrequested_shrink_does_not_inspect_or_modify_data)
+{
+	ClusterSpaceRecoveryInput inputs[2];
+	ClusterSpaceColdSourceV1 origins[2];
+
+	reset();
+	structural = true;
+	make_plan();
+	MyAuxProcType = StartupProcess;
+	compact_inputs(inputs, origins);
+	fail_cold_truncate = true;
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 2, 1, 0));
+	UT_ASSERT_EQ(cold_main_blocks, 7);
+	UT_ASSERT_EQ(cold_truncates, 0);
+	UT_ASSERT_EQ(cold_last_truncate_flags, 0);
+	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 19);
+}
+
+UT_TEST(test_compact_cold_invalid_shrink_request_refuses_before_first_mutation)
+{
+	for (int variant = 0; variant < 2; variant++) {
+		ClusterSpaceRecoveryInput inputs[2];
+		ClusterSpaceColdSourceV1 origins[2];
+
+		reset();
+		structural = true;
+		make_plan();
+		MyAuxProcType = StartupProcess;
+		compact_inputs(inputs, origins);
+		UT_ASSERT(
+			!cluster_space_cold_install_v1(&key, inputs, origins, 2, variant,
+										   variant ? (1 << SPACE_FORKNUM) : SMGR_TRUNCATE_HEAP));
+		UT_ASSERT_EQ(writes + creates + extensions + syncs + cold_truncates, 0);
+		UT_ASSERT_EQ(cold_main_blocks, 7);
+	}
+}
+
+UT_TEST(test_compact_cold_vm_shrink_does_not_shrink_main)
+{
+	ClusterSpaceRecoveryInput inputs[2];
+	ClusterSpaceColdSourceV1 origins[2];
+
+	reset();
+	structural = true;
+	make_plan();
+	MyAuxProcType = StartupProcess;
+	compact_inputs(inputs, origins);
+	UT_ASSERT(
+		cluster_space_cold_install_v1(&key, inputs, origins, 2, 1, 1 << VISIBILITYMAP_FORKNUM));
+	UT_ASSERT_EQ(cold_main_blocks, 7);
+	UT_ASSERT_EQ(cold_truncates, 0);
+	UT_ASSERT_EQ(cold_last_truncate_flags, SMGR_TRUNCATE_VM);
+	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 19);
 }
 
 UT_TEST(test_compact_cold_truncate_qualifies_history_advance_gap)
@@ -2098,7 +2176,8 @@ UT_TEST(test_compact_cold_truncate_qualifies_history_advance_gap)
 		UT_ASSERT(cluster_space_structure_wal_encode(&truncate, bytes[1], sizeof(bytes[1])));
 		survivor_advance(9, 7, durable);
 		cold_main_blocks = 9;
-		UT_ASSERT_EQ(cluster_space_cold_install_v1(&key, inputs, origin, 4, 1), durable);
+		UT_ASSERT_EQ(cluster_space_cold_install_v1(&key, inputs, origin, 4, 1, SMGR_TRUNCATE_ALL),
+					 durable);
 		UT_ASSERT_EQ(cold_truncates, durable);
 		UT_ASSERT_EQ(cold_main_blocks, durable ? 5 : 9);
 		if (!durable)
@@ -2119,7 +2198,7 @@ UT_TEST(test_compact_cold_partial_space_write_retries_without_losing_regrowth)
 		fail_write_block = block;
 		PG_TRY();
 		{
-			(void)cluster_space_cold_install_v1(&key, inputs, origin, 4, 1);
+			(void)cluster_space_cold_install_v1(&key, inputs, origin, 4, 1, SMGR_TRUNCATE_ALL);
 		}
 		PG_CATCH();
 		{
@@ -2130,10 +2209,10 @@ UT_TEST(test_compact_cold_partial_space_write_retries_without_losing_regrowth)
 		UT_ASSERT_EQ(cold_truncates, 1);
 		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
 		fail_write_block = -1;
-		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, 1));
-		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, 2));
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, 1, SMGR_TRUNCATE_ALL));
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, 2, 0));
 		cold_main_blocks = 9;
-		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, 1));
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, 1, 0));
 		UT_ASSERT_EQ(cold_main_blocks, 9);
 	}
 }
@@ -2147,7 +2226,7 @@ UT_TEST(test_cold_commit_already_qualifies_both_durable_components_without_mutat
 	unsigned prior_writes, prior_syncs;
 
 	compact_lifecycle(inputs, origins, bytes);
-	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 4, 3));
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 4, 3, 0));
 	memcpy(before, pages, sizeof(before));
 	prior_writes = writes;
 	prior_syncs = syncs;
@@ -2170,7 +2249,7 @@ UT_TEST(test_cold_commit_already_refuses_unwritten_result_wrong_origin_and_stale
 
 		compact_lifecycle(inputs, origins, bytes);
 		memcpy(old, pages, sizeof(old));
-		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 4, 3));
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 4, 3, 0));
 		if (bad == 0)
 			pages[0] = old[0];
 		if (bad == 1)
@@ -2213,7 +2292,7 @@ UT_TEST(test_cold_commit_io_error_keeps_original_authority_for_retry)
 		volatile bool caught = false;
 
 		compact_lifecycle(inputs, origins, bytes);
-		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 4, 3));
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 4, 3, 0));
 		memcpy(before, pages, sizeof(before));
 		prior_writes = writes;
 		throw_at = faults[i];
@@ -2269,27 +2348,31 @@ UT_TEST(test_compact_cold_physical_refusal_precedes_all_prefix_mutations)
 	origins[2] = (ClusterSpaceColdSourceV1){ 2, 160 };
 	memcpy(before, pages, sizeof(before));
 	fail_cold_truncate = true;
-	UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origins, 3, 2));
+	UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origins, 3, 2, SMGR_TRUNCATE_ALL));
 	UT_ASSERT_EQ(writes + creates + extensions + cold_truncates, 0);
 	UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
 	UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
 	fail_cold_truncate = false;
-	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 3, 2));
-	fail_cold_truncate = true; /* A completed shrink may not recheck a regrown VM. */
-	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 3, 2));
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 3, 2, SMGR_TRUNCATE_ALL));
+	fail_cold_truncate = true; /* No requested shrink: do not inspect the regrown VM. */
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origins, 3, 2, 0));
 }
 
 int
 main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(47);
+	UT_RUN(test_compact_cold_vm_shrink_does_not_shrink_main);
+	UT_RUN(test_compact_cold_named_shrink_runs_even_when_space_is_already_durable);
+	UT_RUN(test_compact_cold_unrequested_shrink_does_not_inspect_or_modify_data);
+	UT_RUN(test_compact_cold_invalid_shrink_request_refuses_before_first_mutation);
 	UT_RUN(test_compact_cold_physical_refusal_precedes_all_prefix_mutations);
 	UT_RUN(test_cold_commit_io_error_keeps_original_authority_for_retry);
 	UT_RUN(test_cold_commit_already_qualifies_both_durable_components_without_mutation);
 	UT_RUN(test_cold_commit_already_refuses_unwritten_result_wrong_origin_and_stale_owner);
 	UT_RUN(test_compact_cold_truncate_qualifies_history_advance_gap);
 	UT_RUN(test_compact_cold_regrowth_and_commit_tombstone_preserve_later_data);
-	UT_RUN(test_compact_cold_final_install_performs_intermediate_truncate);
+	UT_RUN(test_compact_cold_final_install_never_repeats_intermediate_shrink);
 	UT_RUN(test_compact_cold_partial_space_write_retries_without_losing_regrowth);
 	UT_RUN(test_compact_cold_truncate_runs_original_owner_at_its_step_only);
 	UT_RUN(test_compact_cold_truncate_failure_cannot_publish_new_identity);

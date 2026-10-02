@@ -65,6 +65,8 @@ struct ClusterSpaceRecoveryBatchV1 {
 	uint32 *order;
 	SpaceRecoveryTarget *active;
 	uint32 active_step;
+	uint32 cold_shrink_step;
+	uint8 cold_shrink_forks;
 	Buffer buffers[2];
 	HwLock hw;
 	ResourceOwner source_owner;
@@ -288,6 +290,41 @@ space_prepare_target(ClusterSpaceRecoveryBatchV1 *batch, SpaceRecoveryTarget *ta
 		   == RF_PAGE_PROOF_DETAIL_OK;
 }
 
+/* ForkNumber bits are the cold planner ABI. Native SMGR flag values use a
+ * different order for FSM and VM; never copy this mask into xlrec->flags. */
+static int
+space_cold_shrink_flags(uint8 forks)
+{
+	return ((forks & (1 << MAIN_FORKNUM)) ? SMGR_TRUNCATE_HEAP : 0)
+		   | ((forks & (1 << FSM_FORKNUM)) ? SMGR_TRUNCATE_FSM : 0)
+		   | ((forks & (1 << VISIBILITYMAP_FORKNUM)) ? SMGR_TRUNCATE_VM : 0);
+}
+
+static bool
+space_cold_shrink(ClusterSpaceRecoveryBatchV1 *batch, uint32 through, bool apply)
+{
+	ClusterSpaceStructureChange change;
+	xl_smgr_truncate truncate;
+	bool ok;
+
+	if (batch->cold_inputs == NULL || batch->cold_shrink_forks == 0
+		|| through != batch->cold_shrink_step)
+		return true;
+	if (through >= batch->operation_count
+		|| !cluster_space_structure_wal_decode(batch->cold_inputs[through].data,
+											   batch->cold_inputs[through].length, &change)
+		|| change.identity.action != CLUSTER_SPACE_WAL_TRUNCATE)
+		return false;
+	truncate = (xl_smgr_truncate){ change.identity.nblocks, batch->active->key.locator,
+								   space_cold_shrink_flags(batch->cold_shrink_forks) };
+	batch->active_step = through;
+	ok = (apply ? smgr_redo_cold_truncate(&truncate, batch)
+				: smgr_cold_truncate_preflight(&truncate, batch))
+		 && space_sources_fresh(batch);
+	batch->active_step = UINT32_MAX;
+	return ok;
+}
+
 static bool
 space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, uint32 through)
 {
@@ -410,6 +447,11 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 			ok = space_sources_fresh(batch);
 			goto done;
 		}
+		/* A SPACE successor does not certify physical shrink. The committed
+		 * planner names exactly the forks still needing it at this step;
+		 * catch-up prefixes and unrequested forks never repeat ftruncate. */
+		if (!space_cold_shrink(batch, through, apply))
+			goto done;
 		if (apply && prepared.covered_by_successor_mask != 0) {
 			smgrimmedsync(rel, SPACE_FORKNUM);
 			if (!space_sources_fresh(batch))
@@ -426,54 +468,6 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 		}
 		if (!space_sources_fresh(batch))
 			goto done;
-		if (batch->cold_inputs != NULL && through < batch->operation_count
-			&& batch->cold_inputs[through].length == CLUSTER_SPACE_STRUCTURE_WAL_BYTES) {
-			ClusterSpaceStructureChange change;
-
-			if (!cluster_space_structure_wal_decode(batch->cold_inputs[through].data,
-													batch->cold_inputs[through].length, &change))
-				goto done;
-			if (change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE) {
-				uint8 completed = 0;
-				bool later = false;
-
-				/* A durable result component proves the shrink preceded it.
-				 * A history-gap before-image alone does not prove this action.
-				 * Never repeat a covered shrink against later regrown DATA. */
-				for (int i = 0; i < 2; i++) {
-					later |= prepared.source_index[i] == UINT32_MAX;
-					if (!(prepared.apply_mask & (1 << i))
-						&& (prepared.source_index[i] == UINT32_MAX
-							|| prepared.source_index[i] == through)
-						&& space_disk_matches(rel, i, target->before[i].data))
-						completed |= 1 << i;
-				}
-				if (completed != 0 && apply) {
-					smgrimmedsync(rel, SPACE_FORKNUM);
-					if (!space_sources_fresh(batch))
-						goto done;
-					for (int i = 0; i < 2; i++)
-						if ((completed & (1 << i))
-							&& !space_disk_matches(rel, i, target->before[i].data))
-							goto done;
-				} else if (completed == 0) {
-					xl_smgr_truncate truncate
-						= { change.identity.nblocks, target->key.locator, SMGR_TRUNCATE_ALL };
-
-					/* A failed first SPACE write can leave exact result bytes
-					 * only in cache. Repeating that same shrink is safe, but a
-					 * later allocation always requires physical coverage. */
-					if (later)
-						goto done;
-					batch->active_step = through;
-					if (!(apply ? smgr_redo_cold_truncate(&truncate, batch)
-								: smgr_cold_truncate_preflight(&truncate, batch))
-						|| !space_sources_fresh(batch))
-						goto done;
-					batch->active_step = UINT32_MAX;
-				}
-			}
-		}
 		if (!apply) {
 			ok = true;
 			goto done;
@@ -710,7 +704,7 @@ cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *pla
 static bool
 space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRecoveryInput *inputs,
 						const ClusterSpaceColdSourceV1 *origins, uint32 count, uint32 through,
-						bool drop_already)
+						uint8 shrink_forks, bool drop_already)
 {
 	ClusterRecoverySerialGuard *guards[CLUSTER_WAL_RETENTION_MAX_THREADS];
 	ClusterWalRetentionPin *pin = NULL;
@@ -721,6 +715,17 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 	Size bytes, scratch;
 	bool ok = false;
 
+	if (shrink_forks != 0) {
+		ClusterSpaceStructureChange change;
+		if (inputs == NULL || through >= count || drop_already
+			|| (shrink_forks
+				& ~((1 << MAIN_FORKNUM) | (1 << FSM_FORKNUM) | (1 << VISIBILITYMAP_FORKNUM)))
+				   != 0
+			|| !cluster_space_structure_wal_decode(inputs[through].data, inputs[through].length,
+												   &change)
+			|| change.identity.action != CLUSTER_SPACE_WAL_TRUNCATE)
+			return false;
+	}
 	if (drop_already) {
 		ClusterSpaceStructureChange drop;
 		if (inputs == NULL || count != 1 || through != 0
@@ -750,6 +755,8 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 	batch->sources = authorities;
 	batch->cold_inputs = inputs;
 	batch->cold_drop_already = drop_already;
+	batch->cold_shrink_step = through;
+	batch->cold_shrink_forks = shrink_forks;
 	batch->cold_origins = origins;
 	batch->source_owner = CurrentResourceOwner;
 	batch->source_count = source_count;
@@ -826,19 +833,12 @@ space_cold_relation_run(const ClusterSpaceIdentityKey *key, const ClusterSpaceRe
 			goto done;
 		}
 		batch->preflight_complete = true;
-		/* Qualify every physical prerequisite through the requested cut
-		 * before even an earlier CREATE publishes a SPACE component. */
-		for (uint32 i = 0; i <= through; i++) {
-			ClusterSpaceStructureChange change;
-
-			if (inputs[i].length == CLUSTER_SPACE_STRUCTURE_WAL_BYTES
-				&& (!cluster_space_structure_wal_decode(inputs[i].data, inputs[i].length, &change)
-					|| (change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE
-						&& !space_target_run(batch, 0, false, i))))
-				goto done;
-		}
-		/* Each structural result follows its own physical action; a caller
-		 * asking for a later prefix may not skip intermediate structures. */
+		/* Qualify the requested shrink before even an earlier CREATE can
+		 * publish a component. Other steps/forks have no physical action. */
+		if (shrink_forks != 0 && !space_target_run(batch, 0, false, through))
+			goto done;
+		/* Install structural SPACE results in order without replaying an
+		 * intermediate shrink against DATA already covered by history. */
 		for (uint32 i = 0; i < through; i++)
 			if (inputs[i].length == CLUSTER_SPACE_STRUCTURE_WAL_BYTES
 				&& !space_target_run(batch, 0, true, i))
@@ -858,9 +858,9 @@ bool
 cluster_space_recovery_cold_relation_install_v1(const ClusterSpaceIdentityKey *key,
 												const ClusterSpaceRecoveryInput *inputs,
 												const ClusterSpaceColdSourceV1 *origins,
-												uint32 count, uint32 through)
+												uint32 count, uint32 through, uint8 shrink_forks)
 {
-	return space_cold_relation_run(key, inputs, origins, count, through, false);
+	return space_cold_relation_run(key, inputs, origins, count, through, shrink_forks, false);
 }
 
 bool
@@ -868,7 +868,7 @@ cluster_space_recovery_cold_drop_already_v1(const ClusterSpaceIdentityKey *key,
 											const ClusterSpaceRecoveryInput *input,
 											const ClusterSpaceColdSourceV1 *source)
 {
-	return space_cold_relation_run(key, input, source, 1, 0, true);
+	return space_cold_relation_run(key, input, source, 1, 0, 0, true);
 }
 
 bool
@@ -946,12 +946,14 @@ space_truncate_permitted(const ClusterSpaceRecoveryBatchV1 *batch, const xl_smgr
 	if (batch == NULL || truncate == NULL || batch->cold_inputs == NULL
 		|| !batch->preflight_complete || batch->active == NULL
 		|| batch->active_step >= batch->operation_count || !space_sources_fresh(batch)
+		|| batch->cold_shrink_forks == 0 || batch->active_step != batch->cold_shrink_step
 		|| !cluster_space_structure_wal_decode(batch->cold_inputs[batch->active_step].data,
 											   batch->cold_inputs[batch->active_step].length,
 											   &change)
 		|| change.identity.action != CLUSTER_SPACE_WAL_TRUNCATE
 		|| !RelFileLocatorEquals(truncate->rlocator, batch->active->key.locator)
-		|| truncate->flags != SMGR_TRUNCATE_ALL || truncate->blkno != change.identity.nblocks)
+		|| truncate->flags != space_cold_shrink_flags(batch->cold_shrink_forks)
+		|| truncate->blkno != change.identity.nblocks)
 		return false;
 	for (int i = 0; i < 2; i++) {
 		Buffer buffer = batch->buffers[i];

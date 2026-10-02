@@ -53,9 +53,11 @@ static uint64 space_identity_invalidations;
 bool
 cluster_space_cold_install_v1(const ClusterSpaceIdentityKey *key,
 							  const ClusterSpaceRecoveryInput *inputs,
-							  const ClusterSpaceColdSourceV1 *sources, uint32 count, uint32 through)
+							  const ClusterSpaceColdSourceV1 *sources, uint32 count, uint32 through,
+							  uint8 shrink_forks)
 {
-	return cluster_space_recovery_cold_relation_install_v1(key, inputs, sources, count, through);
+	return cluster_space_recovery_cold_relation_install_v1(key, inputs, sources, count, through,
+														   shrink_forks);
 }
 
 static void

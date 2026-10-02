@@ -306,9 +306,22 @@ extern void cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan);
  * owner's check returned.  Payloads are owned by the plan.  Pass 2 installs
  * a relation's inputs through a SPACE step's position, never past a later
  * CREATE, TRUNCATE or drop, and all of them at the end.
+ *
+ * A TRUNCATE shrank its relation's files before the instances failed, but a
+ * shrink is durable only once the file is synced.  shrink_forks names the
+ * forks for which nothing later proves it (no later TRUNCATE or DROP, whose
+ * preparation syncs every fork, and no change of the new incarnation in
+ * history, whose checkpoint synced the file): pass 2 shrinks them again at
+ * the TRUNCATE's step, whether or not the SPACE pages already hold it, and
+ * trusts no page of them past the size.  Every other fork keeps its files:
+ * shrinking again would remove pages whose changes are never replayed.
  */
+#define CLUSTER_COLD_SHRINK_FORKS                                                                  \
+	((uint8)((1 << MAIN_FORKNUM) | (1 << FSM_FORKNUM) | (1 << VISIBILITYMAP_FORKNUM)))
+
 typedef struct ClusterColdSpaceInputV1 {
 	uint8 kind;			/* ClusterColdSpaceKindV1 */
+	uint8 shrink_forks; /* TRUNCATE: forks (1 << ForkNumber) to shrink at its step */
 	uint32 participant; /* caller index */
 	XLogRecPtr read_rec_ptr;
 	XLogRecPtr end_rec_ptr;
@@ -584,13 +597,15 @@ extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
 
 /*
  * Pass-2 SPACE install through the SPACE owner: bring one relation of the
- * sealed plan through its input at position `through` (never further).
- * False refuses; so does every call while this build has no cold SPACE
- * install (cluster_cold_space_owner_v1, the handshake's space_owner).
+ * sealed plan through its input at position `through` (never further).  At
+ * that input's own SPACE step (`step`), a TRUNCATE's shrink_forks are also
+ * shrunk again.  False refuses; so does every call while this build has no
+ * cold SPACE install (cluster_cold_space_owner_v1, the handshake's
+ * space_owner).
  */
 extern bool cluster_cold_space_owner_v1(void);
 extern bool cluster_cold_typed_space_install_v1(const ClusterColdTypedV1 *typed, uint32 relation,
-												uint32 through);
+												uint32 through, bool step);
 
 /*
  * Cold crash route.  The shared profile recovers an engaged multi-generation

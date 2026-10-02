@@ -209,6 +209,37 @@ space_covered(ClusterColdPlanV1 *plan)
 	}
 }
 
+/* Walks stop after as many steps as there are structural effects. */
+static uint32
+walk_limit(const ClusterColdPlanV1 *plan)
+{
+	return plan->space_creator_count + 1;
+}
+
+/*
+ * First block of the relation no longer carried once this incarnation has
+ * ended: a later TRUNCATE that does not carry a block retires it however
+ * many earlier ones did, and a later DROP retires every block.  Outside the
+ * main fork a TRUNCATE's size is not known here
+ * (cold_plan_space_retire_inferred).
+ */
+static BlockNumber
+space_retired_from(const ClusterColdPlanV1 *plan, const ColdRelation *relation,
+				   const ColdSpaceOp *ender)
+{
+	BlockNumber from = InvalidBlockNumber;
+	uint32 steps;
+
+	for (steps = 0; ender != NULL && steps < walk_limit(plan); steps++) {
+		if (ender->kind == CLUSTER_COLD_SPACE_DROP)
+			return 0;
+		if (relation->forknum == MAIN_FORKNUM)
+			from = Min(from, ender->nblocks);
+		ender = space_find(plan, &relation->locator, ender->result, false);
+	}
+	return from;
+}
+
 /* Per segment: the record that must replay first, and how it ended. */
 static ClusterColdDetailV1
 space_segments(ClusterColdPlanV1 *plan)
@@ -237,10 +268,7 @@ space_segments(ClusterColdPlanV1 *plan)
 		if (ender == NULL)
 			continue;
 		facts->ended = true;
-		if (ender->kind == CLUSTER_COLD_SPACE_DROP)
-			facts->retired_from = 0;
-		else if (relation->forknum == MAIN_FORKNUM)
-			facts->retired_from = ender->nblocks;
+		facts->retired_from = space_retired_from(plan, relation, ender);
 	}
 	for (i = 0; i < plan->component_count; i++) {
 		ColdComponent *component = cold_component(plan, i);
@@ -254,6 +282,38 @@ space_segments(ClusterColdPlanV1 *plan)
 	return CLUSTER_COLD_OK;
 }
 
+/*
+ * Forks whose TRUNCATE shrink nothing later proves durable (see
+ * ClusterColdSpaceInputV1): a later end of the incarnation, or a change of
+ * it in history, proves the fork's file was synced after the shrink.
+ */
+static void
+space_shrink_pending(ClusterColdPlanV1 *plan)
+{
+	uint32 i;
+
+	for (i = 0; i < plan->space_count; i++) {
+		ColdSpaceOp *op = cold_space_op(plan, i);
+
+		op->shrink_forks = 0;
+		if (op->payload != NULL && !op->covered && op->kind == CLUSTER_COLD_SPACE_TRUNCATE
+			&& space_find(plan, &op->locator, op->result, false) == NULL)
+			op->shrink_forks = CLUSTER_COLD_SHRINK_FORKS;
+	}
+	for (i = 0; i < plan->component_count; i++) {
+		const ColdComponent *component = cold_component(plan, i);
+		const ColdSegment *segment = cold_segment(plan, component->segment);
+		const ColdRelation *relation = cold_relation(plan, segment->relation);
+		ColdSpaceOp *op;
+
+		if (!record_history(plan, component->record) || relation->forknum > VISIBILITYMAP_FORKNUM)
+			continue;
+		op = (ColdSpaceOp *)space_find(plan, &relation->locator, segment->incarnation, true);
+		if (op != NULL)
+			op->shrink_forks &= (uint8) ~(1 << relation->forknum);
+	}
+}
+
 /* The SPACE owner's view of one stored effect. */
 static void
 space_input_of(const ClusterColdPlanV1 *plan, const ColdSpaceOp *op, ClusterColdSpaceInputV1 *out)
@@ -262,6 +322,7 @@ space_input_of(const ClusterColdPlanV1 *plan, const ColdSpaceOp *op, ClusterCold
 
 	memset(out, 0, sizeof(*out));
 	out->kind = op->kind;
+	out->shrink_forks = op->shrink_forks;
 	out->participant = plan->participants[record->participant].input_index;
 	out->read_rec_ptr = record->read_rec_ptr;
 	out->end_rec_ptr = record->end_rec_ptr;
@@ -389,6 +450,8 @@ cold_plan_space_seal(ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag)
 		detail = space_segments(plan);
 	}
 	if (detail == CLUSTER_COLD_OK)
+		space_shrink_pending(plan);
+	if (detail == CLUSTER_COLD_OK)
 		detail = space_inputs(plan, diag);
 	return detail;
 }
@@ -409,13 +472,6 @@ cold_plan_space_release(ClusterColdPlanV1 *plan)
 	plan->space_ender_count = 0;
 	cold_plan_release(plan, plan->space_scratch_bytes);
 	plan->space_scratch_bytes = 0;
-}
-
-/* Walks stop after as many steps as there are structural effects. */
-static uint32
-walk_limit(const ClusterColdPlanV1 *plan)
-{
-	return plan->space_creator_count + 1;
 }
 
 /*
@@ -504,6 +560,22 @@ cold_plan_space_retired_start(const ClusterColdPlanV1 *plan, const ColdComponent
 	op = space_find(plan, &relation->locator, segment->incarnation, true);
 	return op != NULL && op->kind == CLUSTER_COLD_SPACE_TRUNCATE
 		   && (relation->forknum != MAIN_FORKNUM || component->blockno >= op->nblocks);
+}
+
+/*
+ * A new page past the size of a TRUNCATE that pass 2 shrinks again: what
+ * DATA shows there is removed before the page is replayed.
+ */
+bool
+cold_plan_space_shrink_pending(const ClusterColdPlanV1 *plan, const ColdComponent *component)
+{
+	const ColdSegment *segment = cold_segment(plan, component->segment);
+	const ColdRelation *relation = cold_relation(plan, segment->relation);
+	const ColdSpaceOp *op = space_find(plan, &relation->locator, segment->incarnation, true);
+
+	return relation->forknum <= VISIBILITYMAP_FORKNUM
+		   && cold_plan_space_retired_start(plan, component) && op != NULL
+		   && (op->shrink_forks & (1 << relation->forknum)) != 0;
 }
 
 /*
