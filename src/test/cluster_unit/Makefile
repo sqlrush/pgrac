@@ -4979,6 +4979,7 @@ test_cluster_heap_vm_pretoast.inc: $(top_srcdir)/src/backend/access/heap/heapam.
 
 test_cluster_pcm_aux_mutation: test_cluster_pcm_aux_mutation.c unit_test.h \
 		test_cluster_heap_hio_vm.h test_cluster_heap_hio_vm.inc \
+		test_cluster_heap_lock_vm_needed.inc \
 		test_cluster_heap_hio_allocate.inc \
 		test_cluster_heap_vm_insert.inc test_cluster_heap_vm_tuple_lock.inc \
 		test_cluster_heap_vm_update.inc test_cluster_heap_vm_unwind_helpers.inc \

@@ -141,8 +141,9 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_tt_durable.c",
             "src/backend/cluster/cluster_tt_slot.c",
             "src/backend/cluster/storage/cluster_undo_xlog.c",
+            "src/backend/cluster/cluster_side_undo.c",
         ),
-        r"(?:\b(?:slot|successor|fresh|entry|s)->status|\b(?:slot|successor|fresh|entry)\.status)\s*=\s*(?:\(uint8\)\s*)?TT_SLOT_(?:ACTIVE|COMMITTED|ABORTED|RECYCLABLE|UNUSED)",
+        r"(?:\b(?:slot|successor|fresh|entry|s)->status|\b(?:slot|successor|fresh|entry)\.status)\s*=\s*(?:(?:\(uint8\)\s*)?TT_SLOT_(?:ACTIVE|COMMITTED|ABORTED|RECYCLABLE|UNUSED)|decoded->kind\s*==\s*CLUSTER_UNDO_KIND_TT_COMMIT\s*\?\s*TT_SLOT_COMMITTED\s*:\s*TT_SLOT_ABORTED)",
     ),
     ScanRule(
         "TT_RELEASE_FLAG_WRITER",
@@ -151,6 +152,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_tt_slot.c",
             "src/backend/cluster/cluster_terminal_ref_census.c",
             "src/backend/cluster/storage/cluster_undo_xlog.c",
+            "src/backend/cluster/cluster_side_undo.c",
         ),
         r"\bTT_SLOT_FLAG_CTRC_RELEASE_PROVEN\b",
     ),
@@ -1032,12 +1034,12 @@ _classify_owners(
 _classify_owners(
     "KO_PHYSICAL_REMOVAL",
     "src/backend/catalog/storage.c",
-    ("smgr_redo",),
-    "PROVEN_LOCAL_NONCLUSTER",
+    ("smgr_redo_truncate",),
+    "SUCCESSOR_BEFORE_PREDECESSOR",
     "WAL_REPLAY_OF_PRECLASSIFIED_MUTATION",
     "RECOVERY_STORAGE_TARGET",
-    "ORIGINATING_WAL_RECORD",
-    "ORIGINATING_PRIMARY_KO_GATE",
+    "ORIGINATING_WAL_RECORD_AND_TYPED_SPACE_PREDECESSOR",
+    "ORIGINATING_PRIMARY_KO_GATE_AND_LOCAL_REPLAY",
     "MXA-T35",
 )
 _classify_owners(
@@ -1282,19 +1284,41 @@ _classify_owners(
 )
 _classify_owners(
     "TT_STATUS_WRITER",
-    "src/backend/cluster/storage/cluster_undo_xlog.c",
-    ("cluster_tt_durable_redo_bind_slot",),
-    "REGISTERED_REFERENCE",
+    "src/backend/cluster/cluster_side_undo.c",
+    ("undo_prepare_tt_slot",),
+    "SUCCESSOR_BEFORE_PREDECESSOR",
     "ALL_CTRC_REFERENCE_KINDS",
     "CANONICAL_TT_SLOT",
-    "cluster_ctrc_origin_open_shared",
-    "cluster_ctrc_terminal_release_sample_exact",
+    "PRIVATE_HEADER_NATIVE_TT_TRANSITION_DECISION",
+    "ORIGINAL_DURABLE_REDO_OR_TYPED_SIDE_APPLY",
     "MXA-T20",
 )
 _classify_owners(
     "TT_STATUS_WRITER",
+    "src/backend/cluster/cluster_side_undo.c",
+    ("cluster_undo_prepare_commit_v1",),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "CANONICAL_TT_SLOT",
+    "PRIVATE_TERMINAL_STATUS_WITH_RELEASE_BIT_CLEARED",
+    "ORIGINAL_DURABLE_REDO_OR_TYPED_SIDE_APPLY",
+    "MXA-T33",
+)
+_classify_owners(
+    "TT_RELEASE_FLAG_WRITER",
+    "src/backend/cluster/cluster_side_undo.c",
+    ("undo_prepare_tt_slot",),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "CANONICAL_TT_SLOT",
+    "EXACT_WAL_RELEASE_ON_PRIVATE_HEADER",
+    "cluster_undo_tt_ctrc_release_redo_decide",
+    "MXA-T33",
+)
+_classify_owners(
+    "TT_STATUS_WRITER",
     "src/backend/cluster/storage/cluster_undo_xlog.c",
-    ("cluster_tt_durable_redo_stamp_slot", "cluster_tt_durable_redo_stamp_slot_exact"),
+    ("cluster_tt_durable_redo_stamp_slot",),
     "TERMINAL_PROJECTION_DISCHARGE",
     "ALL_CTRC_REFERENCE_KINDS",
     "CANONICAL_TT_SLOT",

@@ -687,6 +687,21 @@ cluster_undo_path_uses_shared_root(ClusterUndoPathIntent intent pg_attribute_unu
 	return false;
 }
 
+/* This local encode/decode fixture never enters a qualified recovery scope. */
+ClusterUndoPathIntent
+cluster_undo_recovery_intent_for_owner(uint8 owner)
+{
+	return cluster_undo_intent_for_owner(owner);
+}
+int
+cluster_undo_recovery_path_resolve_v1(uint8 owner pg_attribute_unused(),
+									  uint32 segment pg_attribute_unused(), char *path, size_t size)
+{
+	if (path != NULL && size > 0)
+		path[0] = '\0';
+	return -1;
+}
+
 int
 cluster_shared_fs_undo_path_resolve(uint8 owner_instance pg_attribute_unused(),
 									uint32 segment_id pg_attribute_unused(),

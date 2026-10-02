@@ -8,6 +8,7 @@
 #include "cluster/cluster_recovery_duty.h"
 #include "../../backend/cluster/cluster_control_root_private.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_pi_writeback.h"
 #include "postmaster/interrupt.h"
 #include "storage/procsignal.h"
 #include "storage/ipc.h"
@@ -28,6 +29,8 @@ static jmp_buf exit_boundary;
 static int exit_code, checkpoint_calls, stopped_calls, complete_calls, prepare_calls;
 static int old_prepare_calls, old_close_calls, old_drain_calls, thread_close_calls;
 static int report_calls, config_calls;
+static bool pi_scope_retained;
+static unsigned pi_scope_releases;
 static bool retry_apply, retry_applied, shared_config_saw_retry;
 static bool requested, prepare_ok, stopped_ok, complete_ok, fail_checkpoint, fail_at_finish;
 static bool native_mode, native_stopped_ok;
@@ -59,6 +62,13 @@ record(char c)
 {
 	trace[trace_pos++] = c;
 	trace[trace_pos] = 0;
+}
+void
+cluster_pi_writeback_checkpointer_release_v1(void)
+{
+	pi_scope_retained = false;
+	pi_scope_releases++;
+	record('R');
 }
 static void
 UpdateSharedMemoryConfig(void)
@@ -169,6 +179,7 @@ ShutdownXLOG(int code, Datum arg)
 	(void)code;
 	(void)arg;
 	UT_ASSERT(ExitOnAnyError);
+	UT_ASSERT(!pi_scope_retained);
 	checkpoint_calls++;
 	record('W');
 	if (fail_checkpoint) {
@@ -303,6 +314,8 @@ reset_fixture(void)
 	checkpoint_calls = stopped_calls = complete_calls = prepare_calls = 0;
 	old_prepare_calls = old_close_calls = old_drain_calls = thread_close_calls = 0;
 	report_calls = config_calls = trace_pos = 0;
+	pi_scope_retained = true;
+	pi_scope_releases = 0;
 	trace[0] = 0;
 	exit_code = -1;
 }
@@ -328,6 +341,8 @@ UT_TEST(no_shutdown_is_not_a_stop_request)
 	run_handler();
 	UT_ASSERT_EQ(exit_code, -1);
 	UT_ASSERT_EQ(checkpoint_calls, 0);
+	UT_ASSERT(pi_scope_retained);
+	UT_ASSERT_EQ(pi_scope_releases, 0);
 	assert_no_fallback();
 }
 UT_TEST(idle_retry_updates_native_shared_configuration)
@@ -349,7 +364,7 @@ UT_TEST(original_noncurrent_path_is_unchanged)
 	requested = false;
 	run_handler();
 	UT_ASSERT_EQ(exit_code, 0);
-	UT_ASSERT(strcmp(trace, "pWSdtE") == 0);
+	UT_ASSERT(strcmp(trace, "RpWSdtE") == 0);
 	UT_ASSERT_EQ(prepare_calls, 0);
 	UT_ASSERT_EQ(complete_calls, 0);
 	reset_fixture();
@@ -357,7 +372,7 @@ UT_TEST(original_noncurrent_path_is_unchanged)
 	old_prepare_result = CLUSTER_PHASE1_FULL_STOP_READY;
 	run_handler();
 	UT_ASSERT_EQ(exit_code, 0);
-	UT_ASSERT(strcmp(trace, "pWScE") == 0);
+	UT_ASSERT(strcmp(trace, "RpWScE") == 0);
 }
 UT_TEST(current_calls_real_shutdown_between_two_current_barriers)
 {
@@ -365,7 +380,8 @@ UT_TEST(current_calls_real_shutdown_between_two_current_barriers)
 	run_handler();
 	assert_no_fallback();
 	UT_ASSERT_EQ(exit_code, 0);
-	UT_ASSERT(strcmp(trace, "PWSCE") == 0);
+	UT_ASSERT(strcmp(trace, "RPWSCE") == 0);
+	UT_ASSERT_EQ(pi_scope_releases, 1);
 	UT_ASSERT_EQ(PendingCheckpointerStats.requested_checkpoints, 1);
 	UT_ASSERT_EQ(report_calls, 2);
 }
@@ -437,7 +453,7 @@ UT_TEST(native_calls_real_shutdown_before_own_durable_observer)
 	stopped_ok = false; /* registry is not configured */
 	run_handler();
 	UT_ASSERT_EQ(exit_code, 0);
-	UT_ASSERT(strcmp(trace, "PWNCE") == 0);
+	UT_ASSERT(strcmp(trace, "RPWNCE") == 0);
 	UT_ASSERT_EQ(stopped_calls, 0);
 	UT_ASSERT_EQ(native_stopped_calls, 1);
 	assert_no_fallback();
@@ -465,7 +481,7 @@ UT_TEST(v2_uses_root_stop_evidence_not_flat_registry)
 	stopped_ok = false;
 	run_handler();
 	UT_ASSERT_EQ(exit_code, 0);
-	UT_ASSERT(strcmp(trace, "PWVCE") == 0);
+	UT_ASSERT(strcmp(trace, "RPWVCE") == 0);
 	UT_ASSERT_EQ(stopped_calls, 0);
 	UT_ASSERT_EQ(native_stopped_calls, 0);
 	UT_ASSERT_EQ(v2_observe_calls, 1);

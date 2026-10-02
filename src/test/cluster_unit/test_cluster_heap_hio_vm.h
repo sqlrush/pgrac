@@ -364,14 +364,15 @@ hio_init(Page page, Size size, Size special)
 }
 
 static bool
-hio_identity_read(RelFileLocator locator, ClusterSpaceIdentity *out)
+hio_identity_read(Relation relation, ClusterSpaceIdentity *out)
 {
 	hio_assert_no_vm_wait();
+	UT_ASSERT(relation == &relation_data);
 	hio_identity_reads++;
 	if (hio_identity_missing)
 		return false;
 	memset(out, 0, sizeof(*out));
-	out->key.locator = locator;
+	out->key.locator = relation->rd_locator;
 	return true;
 }
 
@@ -413,7 +414,7 @@ hio_unlock_release(Buffer buffer)
 #define RelationGetNumberOfBlocks(relation) 2
 #define RelationAddBlocks hio_extend
 #define cluster_smgr_which_for(locator, backend) 1
-#define cluster_space_relation_read_identity hio_identity_read
+#define cluster_space_relation_get_identity hio_identity_read
 #define cluster_space_init_heap_buffer_wal hio_versioned_init
 #undef RelationNeedsWAL
 #define RelationNeedsWAL(relation) true

@@ -11,7 +11,6 @@
 #include "test_cluster_hw_handoff.c"
 #include "storage/ipc.h"
 
-BackendType MyBackendType = B_LMON;
 bool cluster_lms_enabled = true;
 bool
 cluster_lms_is_ready(void)
@@ -236,6 +235,7 @@ UT_TEST(cf_request_common_barrier_blocks_every_entry_then_admits_control_only)
 int
 main(void)
 {
+	MyBackendType = B_LMON;
 	UT_PLAN(4);
 	UT_RUN(cf_poll_yields_until_remote_exact_grant);
 	UT_RUN(cf_poll_local_conflict_does_not_wait_for_its_own_drain);

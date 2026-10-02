@@ -10,7 +10,6 @@
 #include "test_cluster_hw_handoff.c"
 #include "cluster/cluster_control_retire.h"
 
-BackendType MyBackendType = B_LMON;
 static bool receipt_table_ready = true;
 
 bool
@@ -101,6 +100,7 @@ UT_TEST(retire_wrong_cut_and_missing_tables_are_not_certificates)
 int
 main(void)
 {
+	MyBackendType = B_LMON;
 	UT_PLAN(2);
 	UT_RUN(retire_closes_queued_acquisition_not_just_holder);
 	UT_RUN(retire_wrong_cut_and_missing_tables_are_not_certificates);

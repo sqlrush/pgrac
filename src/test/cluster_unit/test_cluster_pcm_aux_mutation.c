@@ -12,6 +12,7 @@
 #include "catalog/pg_class.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "portability/instr_time.h"
@@ -31,6 +32,41 @@ uint64 cluster_recmerge_window_scn = 0;
 uint64 cluster_recmerge_window_own_lsn = 0;
 int cluster_node_id = 0;
 bool cluster_shared_config = false;
+
+/* This fixture exercises the native VM/FSM mutation and auxiliary-X retry
+ * consumers. Shared version publication is covered by the page producer tests. */
+int
+cluster_smgr_which_for(RelFileLocator locator pg_attribute_unused(),
+					   BackendId backend pg_attribute_unused())
+{
+	UT_ASSERT(!cluster_shared_config);
+	return 0;
+}
+
+bool
+cluster_space_prepare_buffer_versions(const ClusterSpaceIdentity *identity pg_attribute_unused(),
+									  const Buffer *buffers pg_attribute_unused(),
+									  const uint8 *ids pg_attribute_unused(),
+									  uint8 count pg_attribute_unused(),
+									  RfPageProducerBatchV1 *versions pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
+rf_page_producer_stamp_v1(RfPageProducerBatchV1 *versions pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
+ClusterLockBufferShareBarrierAware(Buffer buffer pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
 
 #include "test_cluster_pcm_aux_page_space.inc"
 
@@ -209,8 +245,10 @@ fixture_recent(RelFileLocator locator, ForkNumber fork, BlockNumber block, Buffe
 }
 
 static XLogRecPtr
-fixture_log_visible(Relation rel, Buffer heap, Buffer vm, TransactionId cutoff, uint8 flags)
+fixture_log_visible(Relation rel, Buffer heap, Buffer vm, TransactionId cutoff, uint8 flags,
+					const RfPageProducerBatchV1 *versions)
 {
+	UT_ASSERT(versions == NULL);
 	UT_ASSERT(rel == &relation_data && heap == 3 && vm == current_aux + 1);
 	UT_ASSERT(locks[2] && locks[vm - 1]);
 	UT_ASSERT_EQ(cutoff, InvalidTransactionId);
@@ -264,9 +302,10 @@ fixture_interrupt(void)
 
 static void visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 									 XLogRecPtr recptr, Buffer vmBuf, TransactionId cutoff_xid,
-									 uint8 flags);
+									 uint8 flags, const ClusterSpaceIdentity *identity);
 #include "test_cluster_pcm_aux_vm_mutation.inc"
 #include "test_cluster_pcm_aux_heap_repin.inc"
+#include "test_cluster_heap_lock_vm_needed.inc"
 
 typedef struct FSMAddress {
 	int level;
@@ -614,6 +653,7 @@ run_tuple_vm_bracket(void)
 	int cluster_current_mx_lock_plan = 1, cluster_current_mx_operation = 1;
 	bool cluster_did_lock_stamp = true, cluster_lock_needs_itl_slot = true;
 	bool cluster_lock_undo_ready = true, vm_locked = false;
+	bool cluster_page_versioned = false;
 	int cluster_lock_slot_idx = 2;
 
 	ItemPointerSet(tid, 0, FirstOffsetNumber);

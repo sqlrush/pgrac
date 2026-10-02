@@ -45,10 +45,13 @@
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_buffer_desc.h"
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D1 — ClusterGcsBlockPhase + phase_for_tag proto */
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_pi_rebuild.h"
+#include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_shmem.h"
 #include "storage/backendid.h" /* spec-6.14 D9 amend — MyBackendId stub */
 #include "storage/buf_internals.h"
@@ -80,6 +83,63 @@ bool cluster_enabled = true; /* PGRAC: spec-2.31 D2 helper depends on this */
 bool IsUnderPostmaster = false;
 BackendType MyBackendType = B_BACKEND;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
+
+/* No shared reconfiguration or DATA receipt is supplied by this lock-order
+ * fixture. Actual receipt/physical owners run in test_cluster_page_data. */
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	return 31;
+}
+int
+cluster_gcs_lookup_master_static(BufferTag tag pg_attribute_unused())
+{
+	return cluster_node_id;
+}
+bool
+cluster_grd_pi_rebuild_blocked_v1(BufferTag tag pg_attribute_unused())
+{
+	return cluster_shared_config;
+}
+bool
+cluster_grd_pi_rebuild_current_v1(const ClusterGrdPiRebuildCutV1 *cut pg_attribute_unused())
+{
+	return false;
+}
+int
+cluster_grd_block_redeclare_state_v1(BufferTag tag pg_attribute_unused(),
+									 uint64 epoch pg_attribute_unused(), uint64 *hash)
+{
+	*hash = 0;
+	return -1;
+}
+bool
+cluster_page_data_pi_proof_v1(const ClusterPageDataReceiptV1 *receipt pg_attribute_unused(),
+							  const RfPageOnlinePlanV1 *plan pg_attribute_unused(),
+							  const ClusterWalSourceRef *sources pg_attribute_unused(),
+							  uint32 count pg_attribute_unused(), ClusterPcmPiWriteCutV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+bool
+cluster_page_data_pi_storage_proof_v1(const ClusterPageDataReceiptV1 *receipt pg_attribute_unused(),
+									  const RfPageOnlinePlanV1 *plan pg_attribute_unused(),
+									  const ClusterWalSourceRef *sources pg_attribute_unused(),
+									  uint32 count pg_attribute_unused(),
+									  ClusterPcmPiStorageCutV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+bool
+cluster_page_data_pi_ack_read_v1(const ClusterPiPhysicalAckV1 *ack pg_attribute_unused(),
+								 const ClusterPageDataReceiptV1 *receipt pg_attribute_unused(),
+								 int32 *out_node)
+{
+	*out_node = -1;
+	return false;
+}
 
 bool
 cluster_normal_stop_service_new_work(bool modifies_data pg_attribute_unused())

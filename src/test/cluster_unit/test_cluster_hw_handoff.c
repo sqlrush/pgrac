@@ -64,7 +64,6 @@
 
 #ifndef PGRAC_HW_HANDOFF_EMBEDDED
 /* The dedicated control service suites execute these boundaries. */
-BackendType MyBackendType = B_BACKEND;
 Latch *MyLatch;
 void
 ResetLatch(Latch *latch pg_attribute_unused())
@@ -2098,6 +2097,7 @@ UT_TEST(queued_origin_generation_is_not_receiver_cut)
 int
 main(void)
 {
+	MyBackendType = B_BACKEND; /* Definition belongs to the embedded GRD fixture. */
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Standalone fixture owner, not a database deadline. */
 	UT_PLAN(43);
