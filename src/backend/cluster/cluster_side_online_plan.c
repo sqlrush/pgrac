@@ -1455,6 +1455,53 @@ rf_side_online_plan_space_target_count_v1(const RfSideOnlinePlanV1 *plan)
 			   : UINT32_MAX;
 }
 
+uint32
+rf_side_online_plan_space_contribution_count_v1(const RfSideOnlinePlanV1 *plan, uint32 operation)
+{
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| operation >= plan->operation_count)
+		return UINT32_MAX;
+	return side_operation_space_count(&plan->operations[operation]);
+}
+
+bool
+rf_side_online_plan_space_contribution_v1(const RfSideOnlinePlanV1 *plan, uint32 operation,
+										  uint32 locator_index, RfSideSpaceContributionV1 *out)
+{
+	RfSideSpaceContributionV1 contribution = { 0 };
+	ClusterSpaceIdentityKey key;
+	ClusterSpaceRecoveryInput input;
+	uint32 count = rf_side_online_plan_space_contribution_count_v1(plan, operation);
+
+	if (out == NULL || count == UINT32_MAX || locator_index >= count
+		|| plan->database_incarnation == 0
+		|| !side_operation_space_input(plan, &plan->operations[operation], locator_index, &key,
+									   &input)
+		|| key.database_incarnation != plan->database_incarnation)
+		return false;
+	if (input.length == CLUSTER_SPACE_RESERVATION_WAL_BYTES) {
+		ClusterSpaceReservationChange change;
+
+		if (!cluster_space_reservation_wal_decode(input.data, input.length, &change)
+			|| change.action != CLUSTER_SPACE_RESERVATION_ADVANCE)
+			return false;
+		contribution.result = change.result.identity;
+		contribution.result_token[1] = change.result_token;
+		contribution.page_mask = 2;
+	} else {
+		ClusterSpaceStructureChange change;
+
+		if (!cluster_space_structure_wal_decode(input.data, input.length, &change))
+			return false;
+		contribution.result = change.identity.result;
+		contribution.result_token[0] = change.identity.result_token;
+		contribution.result_token[1] = change.reservation.result_token;
+		contribution.page_mask = 3;
+	}
+	*out = contribution;
+	return true;
+}
+
 bool
 rf_side_online_plan_space_target_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 									ClusterSpaceIdentityKey *out)

@@ -146,6 +146,23 @@ extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_header_v1(
 	const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 segment_id,
 	const char *base, RfSideUndoHeaderImageV1 *out);
 extern uint32 rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan);
+typedef struct RfSideSpaceContributionV1 {
+	ClusterSpaceIdentity result;
+	uint64 result_token[2];
+	uint8 page_mask;
+} RfSideSpaceContributionV1;
+
+/* All physical SPACE contributions of this original operation, including
+ * retained history and every locator in a native COMMIT. Bit zero/one selects
+ * SPACE block zero/one. Only the sealed plan's bound namespace is accepted.
+ * Enumeration records obligations; it grants no DATA, redo or retirement
+ * authority. UINT32_MAX means invalid/unsealed; failure preserves output. */
+extern uint32 rf_side_online_plan_space_contribution_count_v1(const RfSideOnlinePlanV1 *plan,
+															  uint32 operation);
+extern bool rf_side_online_plan_space_contribution_v1(const RfSideOnlinePlanV1 *plan,
+													  uint32 operation, uint32 locator_index,
+													  RfSideSpaceContributionV1 *out);
+
 /* Complete sorted unique namespace/locator set for typed SPACE, including
  * each original COMMIT-DROP participant. Sealing checks every source chain;
  * enumeration grants no target, lifecycle or durability authority.

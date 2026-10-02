@@ -19,10 +19,16 @@ typedef struct PiRebuildJob {
 	ClusterWalInputsV1 *inputs;
 	ClusterThreadRecoveryFabricPlanV1 *plan;
 	uint32 cursor;
+	uint32 side_cursor;
+	uint8 side_block;
+	bool side_blocked;
+	bool side_checked;
 } PiRebuildJob;
 
 static PiRebuildJob *pi_rebuild_job;
 static bool pi_rebuild_callback_registered;
+static bool pi_rebuild_logged;
+static ClusterGrdPiRebuildCutV1 pi_rebuild_logged_cut;
 
 static void
 pi_rebuild_release(void)
@@ -101,7 +107,7 @@ pi_rebuild_target(PiRebuildJob *job, const RfPageOnlinePlanV1 *plan, uint32 inde
 }
 
 static bool
-pi_rebuild_side_covered(const ClusterThreadRecoveryFabricPlanV1 *plan)
+pi_rebuild_side_covered(const ClusterThreadRecoveryFabricPlanV1 *plan, uint32 *blocked)
 {
 	const RfSideOnlinePlanV1 *side = cluster_thread_recovery_fabric_side_plan_v1(plan);
 	uint32 count = rf_side_online_plan_operation_count_v1(side);
@@ -109,14 +115,106 @@ pi_rebuild_side_covered(const ClusterThreadRecoveryFabricPlanV1 *plan)
 		return false;
 	for (uint32 i = 0; i < count; i++) {
 		RfSideOnlineOperationV1 operation;
-		/* Native control has no GCS page. All other SIDE owners still need
-		 * their own physical contributor mapping, including history_only
-		 * ancestors. An empty PAGE graph never discharges those duties. */
-		if (!rf_side_online_plan_operation_v1(side, i, &operation)
-			|| operation.kind != RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL)
+		RfSideSpaceContributionV1 space;
+		*blocked = i;
+		if (!rf_side_online_plan_operation_v1(side, i, &operation))
 			return false;
+		if (operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL)
+			continue;
+		if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE
+			&& rf_side_online_plan_space_contribution_count_v1(side, i) == 1
+			&& rf_side_online_plan_space_contribution_v1(side, i, 0, &space))
+			continue;
+		/* Other owners, including a COMMIT's TT and structural components,
+		 * must all be mapped before the directory can complete its census. */
+		return false;
 	}
 	return true;
+}
+
+static bool
+pi_rebuild_space(PiRebuildJob *job, const RfPageOnlinePlanV1 *page, const RfSideOnlinePlanV1 *side)
+{
+	RfSideOnlineOperationV1 operation;
+	RfSideSpaceContributionV1 contribution;
+	ClusterWalSourceRef source;
+	RfContributorStreamCutV1 physical;
+	BufferTag tag;
+	int node, home;
+	uint32 index = job->side_cursor;
+	uint8 block = job->side_block++;
+
+	if (!rf_side_online_plan_operation_v1(side, index, &operation))
+		return false;
+	if (operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL) {
+		job->side_cursor++;
+		job->side_block = 0;
+		return true;
+	}
+	if (operation.kind != RF_SIDE_ONLINE_OPERATION_SPACE || block > 1
+		|| !rf_side_online_plan_space_contribution_v1(side, index, 0, &contribution)
+		|| !rf_page_online_plan_source_v1(page, operation.identity.participant_index, &source)
+		|| !cluster_thread_recovery_fabric_cut_v1(job->plan, operation.identity.participant_index,
+												  &physical)
+		|| !cluster_wal_claim_v2_ref_valid(&source.claim)
+		|| (node = source.claim.identity.origin_node_id) < 0 || node >= 32
+		|| source.claim.identity.origin_thread_id != node + 1
+		|| source.claim.identity.origin_owner_incarnation == 0
+		|| physical.origin_owner_incarnation != source.claim.identity.origin_owner_incarnation
+		|| source.claim.identity.system_identifier != job->local.claim.identity.system_identifier
+		|| source.claim.database_incarnation != job->local.claim.database_incarnation
+		|| memcmp(source.claim.identity.storage_uuid, job->local.claim.identity.storage_uuid, 16)
+			   != 0
+		|| physical.failed_thread != source.claim.identity.origin_thread_id
+		|| physical.timeline_id != source.timeline
+		|| operation.identity.record.origin_thread != physical.failed_thread
+		|| operation.identity.record.timeline_id != physical.timeline_id
+		|| operation.identity.record.read_rec_ptr < physical.scan_begin_inclusive
+		|| operation.identity.record.end_rec_ptr > physical.scan_end_exclusive
+		|| operation.identity.record.end_rec_ptr <= operation.identity.record.read_rec_ptr
+		|| contribution.result.key.system_identifier != source.claim.identity.system_identifier
+		|| contribution.result.key.database_incarnation != source.claim.database_incarnation
+		|| memcmp(contribution.result.key.storage_uuid, source.claim.identity.storage_uuid, 16)
+			   != 0)
+		return false;
+	if (block == 1) {
+		job->side_cursor++;
+		job->side_block = 0;
+	}
+	if (!(contribution.page_mask & (1u << block)))
+		return true;
+	InitBufferTag(&tag, &contribution.result.key.locator, SPACE_FORKNUM, block);
+	home = cluster_gcs_lookup_master_static(tag);
+	if (home < 0 || home >= 32)
+		return false;
+	if (!(job->cut.affected[home / 8] & (1u << (home % 8)))
+		|| cluster_gcs_lookup_master(tag) != cluster_node_id)
+		return true;
+	return cluster_pcm_rebuild_pi_contributors_v1(&job->cut, tag, (uint32)1u << node,
+												  operation.identity.record.read_rec_ptr,
+												  contribution.result_token[block]);
+}
+
+static void
+pi_rebuild_report_side_blocked(PiRebuildJob *job, uint32 index)
+{
+	RfSideOnlineOperationV1 operation = { 0 };
+
+	job->side_blocked = true;
+	if (pi_rebuild_logged && memcmp(&pi_rebuild_logged_cut, &job->cut, sizeof(job->cut)) == 0)
+		return;
+	pi_rebuild_logged = true;
+	pi_rebuild_logged_cut = job->cut;
+	cluster_grd_inc_pi_rebuild_side_blocked();
+	(void)rf_side_online_plan_operation_v1(cluster_thread_recovery_fabric_side_plan_v1(job->plan),
+										   index, &operation);
+	ereport(LOG, (errmsg("cluster PI rebuild is waiting for a typed SIDE contribution owner"),
+				  errdetail("Epoch " UINT64_FORMAT
+							", direction %u, operation %u, kind %u, WAL thread %u, record %X/%X. "
+							"The retained plan remains blocked with WAL read pins released.",
+							job->cut.epoch, job->cut.direction, index, operation.kind,
+							operation.identity.record.origin_thread,
+							LSN_FORMAT_ARGS(operation.identity.record.read_rec_ptr))));
 }
 
 bool
@@ -125,9 +223,12 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 	ClusterGrdPiRebuildCutV1 cut;
 	ClusterWalSourceRef local;
 	const RfPageOnlinePlanV1 *page;
+	const RfSideOnlinePlanV1 *side;
 	ClusterControlRootResult result;
 	uint64 records;
 	RfPageProofDetailV1 detail;
+	uint32 blocked = UINT32_MAX;
+	uint32 budget = 64;
 	int state;
 
 	if (MyBackendType != B_BG_WRITER || !cluster_enabled || !cluster_shared_config
@@ -179,20 +280,32 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 			goto done;
 	}
 	page = cluster_thread_recovery_fabric_page_plan_v1(pi_rebuild_job->plan);
-	if (page == NULL || !pi_rebuild_side_covered(pi_rebuild_job->plan)
-		|| !cluster_grd_pi_rebuild_current_v1(&cut)
+	if (page == NULL || !cluster_grd_pi_rebuild_current_v1(&cut)
 		|| cluster_wal_inputs_revalidate_v1(pi_rebuild_job->inputs)
 			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
+	if (pi_rebuild_job->side_blocked)
+		goto wait;
+	if (!pi_rebuild_job->side_checked && !pi_rebuild_side_covered(pi_rebuild_job->plan, &blocked)) {
+		pi_rebuild_report_side_blocked(pi_rebuild_job, blocked);
+		goto wait;
+	}
+	pi_rebuild_job->side_checked = true;
 	/* Directory additions are bounded per tick and remain invisible to
 	 * grants until the complete graph and original ROOT have been checked. */
-	for (uint32 budget = 0;
-		 budget < 64 && pi_rebuild_job->cursor < rf_page_online_plan_target_count_v1(page);
-		 budget++) {
+	for (; budget > 0 && pi_rebuild_job->cursor < rf_page_online_plan_target_count_v1(page);
+		 budget--) {
 		if (!pi_rebuild_target(pi_rebuild_job, page, pi_rebuild_job->cursor++))
 			goto done;
 	}
 	if (pi_rebuild_job->cursor != rf_page_online_plan_target_count_v1(page))
+		goto wait;
+	side = cluster_thread_recovery_fabric_side_plan_v1(pi_rebuild_job->plan);
+	for (; budget > 0 && pi_rebuild_job->side_cursor < rf_side_online_plan_operation_count_v1(side);
+		 budget--)
+		if (!pi_rebuild_space(pi_rebuild_job, page, side))
+			goto done;
+	if (pi_rebuild_job->side_cursor != rf_side_online_plan_operation_count_v1(side))
 		goto wait;
 	if (cluster_wal_inputs_revalidate_v1(pi_rebuild_job->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& cluster_grd_pi_rebuild_complete_v1(&cut))

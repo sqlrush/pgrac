@@ -2427,6 +2427,7 @@ UT_TEST(test_space_plan_structural_pair_and_standalone_tombstone)
 	PGAlignedBlock zero = {0};
 	ClusterSpaceRecoveryImage out;
 	uint32 order, count = 0;
+	RfSideSpaceContributionV1 contribution;
 
 	change.identity.action = CLUSTER_SPACE_WAL_CREATE;
 	change.identity.result = advance.result.identity;
@@ -2446,6 +2447,11 @@ UT_TEST(test_space_plan_structural_pair_and_standalone_tombstone)
 		zero.data, zero.data, &order, 1, &count, &out), RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT_EQ(count, 1);
 	UT_ASSERT_EQ(out.apply_mask, 3);
+	UT_ASSERT_EQ(rf_side_online_plan_space_contribution_count_v1(plan, 0), 1);
+	UT_ASSERT(rf_side_online_plan_space_contribution_v1(plan, 0, 0, &contribution));
+	UT_ASSERT_EQ(contribution.page_mask, 3);
+	UT_ASSERT_EQ(contribution.result_token[0], change.identity.result_token);
+	UT_ASSERT_EQ(contribution.result_token[1], change.reservation.result_token);
 	UT_ASSERT(!rf_side_online_plan_bind_database_v1(plan, 42));
 	rf_side_online_plan_destroy_v1(&plan);
 	change.identity.action = CLUSTER_SPACE_WAL_TOMBSTONE;
@@ -3432,6 +3438,65 @@ UT_TEST(test_multi_origin_side_selection_keeps_exact_source_and_original_plan)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+UT_TEST(test_space_contribution_census_includes_history_and_every_drop_page)
+{
+	ClusterSpaceReservationChange advance = space_advance_fixture();
+	ClusterSpaceStructureChange drops[2] = { space_drop_fixture(16384), space_drop_fixture(16385) };
+	XLogRecPtr redo = 300;
+	RfSideOnlinePlanV1 *plan = space_online_plan_redo(300, &redo);
+	RfSideSpaceContributionV1 contribution, saved;
+	RfSideOnlineOperationV1 op;
+	FakeXactRecord fake;
+	uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
+
+	memset(&contribution, 0x5a, sizeof(contribution));
+	saved = contribution;
+	UT_ASSERT_EQ(rf_side_online_plan_space_contribution_count_v1(plan, 0), UINT32_MAX);
+	UT_ASSERT(!rf_side_online_plan_space_contribution_v1(plan, 0, 0, &contribution));
+	UT_ASSERT(memcmp(&contribution, &saved, sizeof(saved)) == 0);
+	UT_ASSERT(cluster_space_reservation_wal_encode(&advance, wal, sizeof(wal)));
+	UT_ASSERT_EQ(space_online_feed(plan, XLOG_SMGR_SPACE_RESERVATION, wal, sizeof(wal), 100, false),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	make_space_commit(&fake, drops, 2);
+	UT_ASSERT_EQ(space_commit_feed(plan, &fake, 200), RF_PAGE_PROOF_DETAIL_OK);
+	memset(fake.data, 0xee, sizeof(fake.data));
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_space_target_count_v1(plan), 0);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &op));
+	UT_ASSERT(op.history_only);
+	UT_ASSERT_EQ(rf_side_online_plan_space_contribution_count_v1(plan, 0), 1);
+	UT_ASSERT_EQ(rf_side_online_plan_space_contribution_count_v1(plan, 1), 2);
+	if (rf_side_online_plan_space_contribution_v1(plan, 0, 0, &contribution)) {
+		UT_ASSERT_EQ(contribution.page_mask, 2);
+		UT_ASSERT_EQ(contribution.result_token[0], 0);
+		UT_ASSERT_EQ(contribution.result_token[1], advance.result_token);
+		UT_ASSERT_EQ(contribution.result.key.database_incarnation, 42);
+		UT_ASSERT(RelFileLocatorEquals(contribution.result.key.locator,
+									   advance.result.identity.key.locator));
+	} else
+		UT_ASSERT(false);
+	for (uint32 i = 0; i < 2; i++) {
+		UT_ASSERT(rf_side_online_plan_operation_v1(plan, 1, &op));
+		UT_ASSERT(op.history_only);
+		if (rf_side_online_plan_space_contribution_v1(plan, 1, i, &contribution)) {
+			UT_ASSERT_EQ(contribution.page_mask, 3);
+			UT_ASSERT_EQ(contribution.result_token[0], drops[i].identity.result_token);
+			UT_ASSERT_EQ(contribution.result_token[1], drops[i].reservation.result_token);
+			UT_ASSERT_EQ(contribution.result.state, CLUSTER_SPACE_IDENTITY_TOMBSTONED);
+			UT_ASSERT(RelFileLocatorEquals(contribution.result.key.locator,
+										   drops[i].identity.result.key.locator));
+		} else
+			UT_ASSERT(false);
+	}
+	saved = contribution;
+	UT_ASSERT(!rf_side_online_plan_space_contribution_v1(plan, 1, 2, &contribution));
+	UT_ASSERT(!rf_side_online_plan_space_contribution_v1(plan, 2, 0, &contribution));
+	UT_ASSERT_EQ(rf_side_online_plan_space_contribution_count_v1(plan, 2), UINT32_MAX);
+	UT_ASSERT(memcmp(&contribution, &saved, sizeof(saved)) == 0);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
 UT_TEST(test_retained_commit_drop_does_not_create_space_mutation_target)
 {
 	ClusterSpaceStructureChange drop = space_drop_fixture(16384);
@@ -3785,7 +3850,8 @@ UT_TEST(test_native_control_rejects_bad_shape_and_identity)
 int
 main(void)
 {
-	UT_PLAN(54);
+	UT_PLAN(55);
+	UT_RUN(test_space_contribution_census_includes_history_and_every_drop_page);
 	UT_RUN(test_native_control_is_owned_input_and_not_replay_permission);
 	UT_RUN(test_native_control_rejects_bad_shape_and_identity);
 	UT_RUN(test_retained_generations_refuse_ambiguous_thread_selectors);

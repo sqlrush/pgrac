@@ -35,6 +35,8 @@ static ClusterPcmPiStorageCutV1 wb_storage_cut;
 static RfPageOnlinePlanV1 *wb_page_plan;
 static unsigned wb_plan_builds, wb_input_releases, wb_sends;
 static RfSideOnlineOperationKindV1 wb_side_kind;
+static bool wb_space_valid;
+static RfSideSpaceContributionV1 wb_space_contribution;
 const RfSideOnlinePlanV1 *
 cluster_thread_recovery_fabric_side_plan_v1(const ClusterThreadRecoveryFabricPlanV1 *plan)
 {
@@ -54,6 +56,43 @@ rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 	memset(out, 0, sizeof(*out));
 	out->kind = wb_side_kind;
 	out->history_only = true; /* Retained predecessors also carry PI duties. */
+	if (wb_space_valid) {
+		RfPageOnlineTargetViewV1 view;
+		UT_ASSERT(rf_page_online_plan_target_v1(wb_page_plan, 0, &view));
+		for (uint32 i = 0; i < view.contributors->edge_count; i++)
+			if (view.contributors->edges[i].participant_index == 2) {
+				out->identity.participant_index = 2;
+				out->identity.record = view.contributors->edges[i].record_identity;
+				break;
+			}
+	}
+	return true;
+}
+/* The SIDE planner is an explicit boundary in this endpoint fixture. Its
+ * typed payload/history enumeration executes separately in side_xact. */
+uint32
+rf_side_online_plan_space_contribution_count_v1(const RfSideOnlinePlanV1 *plan, uint32 index)
+{
+	return wb_space_valid && index == 0 ? 1 : UINT32_MAX;
+}
+bool
+rf_side_online_plan_space_contribution_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
+										  uint32 locator, RfSideSpaceContributionV1 *out)
+{
+	if (!wb_space_valid || index != 0 || locator != 0)
+		return false;
+	*out = wb_space_contribution;
+	return true;
+}
+bool
+cluster_thread_recovery_fabric_cut_v1(const ClusterThreadRecoveryFabricPlanV1 *plan, uint32 index,
+									  RfContributorStreamCutV1 *out)
+{
+	RfPageOnlineTargetViewV1 view;
+	if (!rf_page_online_plan_target_v1(wb_page_plan, 0, &view)
+		|| index >= view.contributors->participant_count)
+		return false;
+	*out = view.contributors->cuts[index];
 	return true;
 }
 static const ClusterShmemRegion *wb_region;
@@ -74,6 +113,13 @@ volatile sig_atomic_t ShutdownRequestPending;
 static ClusterGrdPiRebuildCutV1 rebuild_cut;
 static bool rebuild_needed, rebuild_apply_ok = true, rebuild_drift, rebuild_root_drift;
 static uint32 rebuild_holders, rebuild_applies, rebuild_completions;
+static unsigned rebuild_side_blocked, rebuild_logs;
+
+void
+cluster_grd_inc_pi_rebuild_side_blocked(void)
+{
+	rebuild_side_blocked++;
+}
 
 int
 cluster_gcs_lookup_master_static(BufferTag tag)
@@ -115,12 +161,19 @@ cluster_pcm_rebuild_pi_contributors_v1(const ClusterGrdPiRebuildCutV1 *cut, Buff
 		return false;
 	UT_ASSERT_EQ(MyBackendType, B_BG_WRITER);
 	UT_ASSERT(wb_inputs_pinned[cluster_node_id]);
-	InitBufferTag(&expected, &target.identity.locator, tag.forkNum, target.identity.blockno);
+	InitBufferTag(&expected, &target.identity.locator, tag.forkNum,
+				  tag.forkNum == SPACE_FORKNUM ? tag.blockNum : target.identity.blockno);
 	UT_ASSERT(BufferTagsEqual(&tag, &expected));
 	UT_ASSERT_NE(lsn, 0);
-	UT_ASSERT(tag.forkNum == MAIN_FORKNUM || tag.forkNum == VISIBILITYMAP_FORKNUM);
-	UT_ASSERT_EQ(scn, tag.forkNum == MAIN_FORKNUM ? 80 : 7);
-	UT_ASSERT_EQ(holders, tag.forkNum == MAIN_FORKNUM ? 7 : 4);
+	if (tag.forkNum == SPACE_FORKNUM) {
+		UT_ASSERT(tag.blockNum <= 1);
+		UT_ASSERT_EQ(scn, wb_space_contribution.result_token[tag.blockNum]);
+		UT_ASSERT_EQ(holders, 4);
+	} else {
+		UT_ASSERT(tag.forkNum == MAIN_FORKNUM || tag.forkNum == VISIBILITYMAP_FORKNUM);
+		UT_ASSERT_EQ(scn, tag.forkNum == MAIN_FORKNUM ? 80 : 7);
+		UT_ASSERT_EQ(holders, tag.forkNum == MAIN_FORKNUM ? 7 : 4);
+	}
 	rebuild_applies++;
 	if (rebuild_drift)
 		rebuild_cut.routing_generation++;
@@ -412,6 +465,15 @@ wb_palloc0(Size size)
 	return palloc0(size);
 }
 #define palloc0 wb_palloc0
+#undef ereport
+#define ereport(level, rest)                                                                       \
+	do {                                                                                           \
+		if ((level) >= ERROR) {                                                                    \
+			InterruptHoldoffCount = 0;                                                             \
+			pg_re_throw();                                                                         \
+		} else if ((level) == LOG)                                                                 \
+			rebuild_logs++;                                                                        \
+	} while (0)
 #include "../../backend/cluster/cluster_pi_writeback.c"
 #include "../../backend/cluster/cluster_pi_rebuild.c"
 #undef palloc0
@@ -810,6 +872,8 @@ rebuild_setup(void)
 {
 	ClusterPageDataReceiptV1 *data = wb_setup();
 	wb_side_kind = RF_SIDE_ONLINE_OPERATION_INVALID;
+	wb_space_valid = false;
+	memset(&wb_space_contribution, 0, sizeof(wb_space_contribution));
 	wb_select(0, B_BG_WRITER);
 	memset(&rebuild_cut, 0, sizeof(rebuild_cut));
 	rebuild_cut.epoch = 1;
@@ -818,6 +882,8 @@ rebuild_setup(void)
 	rebuild_needed = rebuild_apply_ok = true;
 	rebuild_drift = rebuild_root_drift = false;
 	rebuild_holders = rebuild_applies = rebuild_completions = 0;
+	rebuild_side_blocked = rebuild_logs = 0;
+	pi_rebuild_logged = false;
 	return data;
 }
 
@@ -826,11 +892,18 @@ UT_TEST(retained_rebuild_never_completes_with_unmapped_side_contributions)
 	ClusterPageDataReceiptV1 *data = rebuild_setup();
 	for (unsigned kind = RF_SIDE_ONLINE_OPERATION_XACT; kind <= RF_SIDE_ONLINE_OPERATION_SPACE;
 		 kind++) {
+		unsigned builds = wb_plan_builds;
 		wb_side_kind = kind;
-		UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+		UT_ASSERT(cluster_pi_rebuild_bgwriter_tick_v1());
+		for (int i = 0; i < 4; i++)
+			UT_ASSERT(cluster_pi_rebuild_bgwriter_tick_v1());
+		UT_ASSERT_EQ(wb_plan_builds, builds + 1);
+		UT_ASSERT_EQ(rebuild_side_blocked, 1);
+		UT_ASSERT_EQ(rebuild_logs, 1);
 		UT_ASSERT_EQ(rebuild_completions, 0);
 		UT_ASSERT_EQ(rebuild_applies, 0);
 		UT_ASSERT(!wb_inputs_pinned[0]);
+		pi_rebuild_release();
 	}
 	wb_side_kind = RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;
 	UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
@@ -853,6 +926,29 @@ UT_TEST(retained_rebuild_restores_all_original_writers_before_complete)
 	cluster_page_data_receipt_free_v1(&data);
 	rf_page_online_plan_destroy_v1(&wb_page_plan);
 	clean();
+}
+
+UT_TEST(retained_rebuild_maps_both_space_pages_under_original_source)
+{
+	for (unsigned invalid = 0; invalid < 2; invalid++) {
+		ClusterPageDataReceiptV1 *data = rebuild_setup();
+		wb_side_kind = RF_SIDE_ONLINE_OPERATION_SPACE;
+		wb_space_valid = true;
+		wb_space_contribution.result = identity;
+		wb_space_contribution.result.key.database_incarnation += invalid;
+		wb_space_contribution.page_mask = 3;
+		wb_space_contribution.result_token[0] = 53;
+		wb_space_contribution.result_token[1] = 41;
+		UT_ASSERT(!cluster_pi_rebuild_bgwriter_tick_v1());
+		UT_ASSERT_EQ(rebuild_applies, invalid ? 2 : 4);
+		UT_ASSERT_EQ(rebuild_completions, invalid ? 0 : 1);
+		UT_ASSERT(!wb_inputs_pinned[0]);
+		UT_ASSERT(pi_rebuild_job == NULL);
+		pi_rebuild_release();
+		cluster_page_data_receipt_free_v1(&data);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
 }
 
 UT_TEST(retained_rebuild_waits_unpinned_and_rejects_incomplete_or_changed_cut)
@@ -927,7 +1023,7 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
 	UT_RUN(remote_physical_ack_runs_actual_ancestry_and_disposal);
 	UT_RUN(writeback_codec_has_exact_bounded_authenticated_facts);
 	UT_RUN(writeback_rejects_foreign_sender_boot_and_changed_master_cut);
@@ -939,6 +1035,7 @@ main(void)
 	UT_RUN(writeback_initial_allocation_error_cannot_orphan_running_owner);
 	UT_RUN(retained_rebuild_never_completes_with_unmapped_side_contributions);
 	UT_RUN(retained_rebuild_restores_all_original_writers_before_complete);
+	UT_RUN(retained_rebuild_maps_both_space_pages_under_original_source);
 	UT_RUN(retained_rebuild_waits_unpinned_and_rejects_incomplete_or_changed_cut);
 	UT_RUN(retained_rebuild_root_change_or_apply_failure_never_completes);
 	UT_RUN(retained_rebuild_error_cleanup_and_postapply_root_check);
