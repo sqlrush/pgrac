@@ -14817,6 +14817,13 @@ cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
 		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
 	}
 
+	/* Keep X and let the caller serve its existing read-only image. */
+	if (cluster_shared_config) {
+		if (out_refusal != NULL)
+			*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_OWNERSHIP_REVOKE_BUSY;
+		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
+	}
+
 	hashcode = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hashcode);
 
@@ -15555,6 +15562,13 @@ cluster_bufmgr_downgrade_x_to_s_remote_for_gcs_prepare_image(
 		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
 	}
 
+	/* Keep X and let the caller serve its existing read-only image. */
+	if (cluster_shared_config) {
+		if (out_refusal != NULL)
+			*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_OWNERSHIP_REVOKE_BUSY;
+		return CLUSTER_BUFMGR_GCS_DOWNGRADE_REFUSED_PRE_NOTIFY;
+	}
+
 	hashcode = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hashcode);
 
@@ -16129,6 +16143,12 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	buf = GetBufferDescriptor(buf_id);
 
 	buf_state = LockBufHdr(buf);
+	/* Validate the actual owner, even if an old sender labels it S. */
+	if (cluster_shared_config && buf->pcm_state == PCM_STATE_X) {
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		return CLUSTER_BUFMGR_GCS_DROP_STALE;
+	}
 	/* Re-verify tag under the header lock to defend against a tag-rewrite race
 	 * between the partition-lock lookup and the raw pin (copy_block_for_gcs
 	 * convention). */
@@ -16240,6 +16260,12 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	{
 		UnlockBufHdr(buf, buf_state);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
+	}
+
+	/* The unpinned interval may have installed a new Resource-X X owner. */
+	if (cluster_shared_config && buf->pcm_state == PCM_STATE_X) {
+		UnlockBufHdr(buf, buf_state);
+		return CLUSTER_BUFMGR_GCS_DROP_STALE;
 	}
 
 	saved_pcm_state = buf->pcm_state;
@@ -16632,6 +16658,10 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 
 	if (out_page_lsn != NULL)
 		*out_page_lsn = InvalidXLogRecPtr;
+
+	/* Absence is not a legacy X-transfer grant in shared mode. */
+	if (cluster_shared_config)
+		return CLUSTER_BUFMGR_GCS_DROP_STALE;
 
 	hashcode = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hashcode);

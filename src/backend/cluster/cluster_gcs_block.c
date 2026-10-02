@@ -3171,6 +3171,9 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 								  cluster_node_id)));
 	*out_retry_denied = false;
+	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config, transition_id))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("cluster_gcs_send_block_request_and_wait: NULL BufferDesc"),
@@ -6448,6 +6451,9 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, const PcmAuthority
 								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 								  cluster_node_id)));
 	*out_retry_denied = false;
+	if (cluster_shared_config)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
 	holder_node = expected->x_holder_node;
 	if (expected->state != PCM_STATE_X || holder_node < 0 || holder_node >= 32
 		|| holder_node == cluster_node_id || expected->s_holders_bitmap != 0
@@ -16310,6 +16316,13 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		return;
 
 	req = (const GcsBlockRequestPayload *)payload;
+	/* Reject before dedup, image copy or pending-X authority changes. */
+	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config,
+											 (PcmLockTransition)req->transition_id)) {
+		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
+							 InvalidXLogRecPtr, NULL);
+		return;
+	}
 
 	/*
 	 * spec-5.16 D3b (r3 P1 + sr1-②, INV-R8/R14) — master-side hard gate, BEFORE
@@ -18228,6 +18241,11 @@ cluster_gcs_block_lmon_handle_direct_land_completion(int32 peer_node, uint64 wr_
 							  || status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
 							  || status == GCS_BLOCK_REPLY_DENIED_LOST_WRITE);
 	}
+	if (cluster_shared_config
+		&& (!cluster_pcm_legacy_transition_allowed(true, (PcmLockTransition)hdr->transition_id)
+			|| status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+			|| status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE))
+		identity_ok = false;
 	if (!identity_ok) {
 		gcs_block_direct_fail_slot(blk, slot, GCS_BLOCK_DIRECT_ABORT_BAD_IDENTITY, false, NULL);
 		return;
@@ -19129,6 +19147,12 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 		return;
 	}
 
+	if (cluster_shared_config && !GcsBlockReplyStatusIsR4((GcsBlockReplyStatus)hdr->status)
+		&& (!cluster_pcm_legacy_transition_allowed(true, (PcmLockTransition)hdr->transition_id)
+			|| hdr->status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+			|| hdr->status == GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE))
+		return;
+
 	/* HC80: direct index by requester_backend_id (1..MaxBackends → 0..MaxBackends-1). */
 	backend_idx = hdr->requester_backend_id - 1;
 	if (backend_idx < 0 || backend_idx >= MaxBackends)
@@ -19640,6 +19664,13 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	 * (e1 release-side) path untouched (§3.4b: never force the holder).
 	 * MUST branch before the ship-image copy below: a nudge ships nothing.
 	 */
+	if (cluster_shared_config
+		&& (GcsBlockForwardPayloadIsXTransfer(fwd)
+			|| !cluster_pcm_legacy_transition_allowed(true, (PcmLockTransition)fwd->transition_id))) {
+		gcs_block_forward_reply_immediate_deny(fwd);
+		return;
+	}
+
 	if (GcsBlockForwardPayloadIsBastNudge(fwd)) {
 		bool yielded = false;
 

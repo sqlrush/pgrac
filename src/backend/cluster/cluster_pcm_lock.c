@@ -6109,6 +6109,9 @@ cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, const PcmAuthorityS
 	ClusterGrdHolderId requester;
 	bool found;
 
+	if (cluster_shared_config)
+		return PCM_X_TRANSFER_COMMIT_BAD_STATE;
+
 	if (expected == NULL || holder_node < 0 || holder_node >= 32 || request_id == 0)
 		return PCM_X_TRANSFER_COMMIT_BAD_STATE;
 	if (ClusterPcm == NULL || cluster_pcm_htab == NULL)
@@ -6189,6 +6192,10 @@ cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecP
 	PcmEntryAcquireResult acquire_result;
 	struct GrdEntry *entry;
 
+	if (cluster_shared_config)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
+
 	if (cluster_pcm_htab == NULL)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("PCM lock manager disabled (cluster.pcm_grd_max_entries=0)")));
@@ -6221,9 +6228,9 @@ cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecP
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 							errmsg("shared X grant lost its prior authority generation")));
 		}
-		/* The legacy self-ship path can still reach this owner. Remember
-		 * its departing writer atomically with the grant, even when no
-		 * physical PI was retained. A later keeper note is insufficient. */
+		/* Retain the old safety condition behind the shared entry refusal:
+		 * reopening this owner must never lose the departing writer, even
+		 * when no physical PI was retained. */
 		if (had_x && previous != requester_node)
 			pg_atomic_fetch_or_u32(&entry->pi_holders_bitmap, (uint32)1u << previous);
 		pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
@@ -7009,6 +7016,9 @@ cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition tr
 	bool broadcast_needed = false;
 	bool create;
 
+	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config, trans))
+		return PCM_GCS_TRANSITION_INCOMPATIBLE;
+
 	if (cluster_pcm_htab == NULL)
 		return PCM_GCS_TRANSITION_INCOMPATIBLE;
 	if (holder_node_id < 0 || holder_node_id >= 32)
@@ -7606,6 +7616,10 @@ pcm_lock_acquire_local(BufferTag tag, PcmLockMode mode, PcmAuthoritySnapshot *re
 void
 cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode)
 {
+	if (cluster_shared_config && mode == PCM_LOCK_MODE_X)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
+
 	/* A tag-only caller has no BufferDesc and therefore retains the
 	 * historical fail-closed behavior for a remote-X conflict. */
 	(void)pcm_lock_acquire_local(tag, mode, NULL);
@@ -7688,6 +7702,10 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 	 * guarantee no leak).
 	 */
 	clean_eligible = cluster_pcm_clean_page_xfer_consume();
+
+	if (cluster_shared_config && mode == PCM_LOCK_MODE_X)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
 
 	if (cluster_pcm_htab == NULL)
 		PCM_STUB_DISABLED_PATH;
@@ -8026,6 +8044,12 @@ cluster_pcm_lock_release(BufferTag tag)
 	 *	                wakes); same-node refcount-only paths skip broadcast.
 	 */
 	if (cur == PCM_STATE_X) {
+		if (cluster_shared_config) {
+			LWLockRelease(&entry->entry_lock.lock);
+			pcm_entry_ref_release(&entry_ref);
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("shared X ownership requires Resource-X")));
+		}
 		if (entry->x_holder_node != holder_node) {
 			LWLockRelease(&entry->entry_lock.lock);
 			pcm_entry_ref_release(&entry_ref);
@@ -8119,6 +8143,10 @@ cluster_pcm_lock_release_saved_tag_for_eviction(BufferTag tag, PcmLockMode mode)
 	uint64 local_projection_generation = 0;
 	int master_node;
 	PcmLockTransition trans;
+
+	if (cluster_shared_config && mode == PCM_LOCK_MODE_X)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
 
 	if (cluster_pcm_htab == NULL)
 		PCM_STUB_DISABLED_PATH;
@@ -8275,6 +8303,10 @@ cluster_pcm_lock_upgrade(BufferTag tag)
 	PcmState cur;
 	int holder_node;
 
+	if (cluster_shared_config)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
+
 	CLUSTER_INJECTION_POINT("cluster-pcm-convert-pre");
 
 	if (cluster_pcm_htab == NULL)
@@ -8356,6 +8388,10 @@ cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, bool keep_pi)
 	PcmState cur;
 	PcmLockTransition trans;
 	int holder_node;
+
+	if (cluster_shared_config)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
 
 	CLUSTER_INJECTION_POINT("cluster-pcm-downgrade-pre");
 

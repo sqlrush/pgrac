@@ -150,6 +150,7 @@ bool cluster_enabled = true;
 bool cluster_shared_config;
 bool cluster_past_image;
 static bool transition_drop_active, transition_prepin_dirty, transition_unpin_dirty;
+static bool transition_unpin_installs_x;
 static bool cluster_bufmgr_in_gcs_drop;
 static unsigned transition_discards, transition_pi_stamps;
 #ifdef USE_CLUSTER_UNIT
@@ -316,6 +317,13 @@ transition_unpin(BufferDesc *buf)
 	if (transition_drop_active && transition_unpin_dirty) {
 		transition_unpin_dirty = false;
 		pg_atomic_fetch_or_u32(&buf->state, BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED);
+	}
+	if (transition_drop_active && transition_unpin_installs_x) {
+		/* Concurrent Resource-X install boundary after the old pin is gone. */
+		transition_unpin_installs_x = false;
+		buf->pcm_state = PCM_STATE_X;
+		buf->buffer_type = BUF_TYPE_XCUR;
+		pg_atomic_fetch_add_u64(&ClusterPcmOwnArray[buf->buf_id].generation, 1);
 	}
 }
 
@@ -2302,6 +2310,7 @@ drop_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry, bool dirty)
 	transition_drop_active = true;
 	transition_copy_active = true;
 	transition_prepin_dirty = transition_unpin_dirty = false;
+	transition_unpin_installs_x = false;
 	transition_discards = transition_pi_stamps = 0;
 }
 
@@ -2315,6 +2324,52 @@ drop_fixture_done(ClusterPcmOwnEntry *saved)
 	cluster_shared_config = cluster_past_image = transition_drop_active = false;
 }
 
+UT_TEST(test_shared_legacy_ship_cannot_drop_x_even_when_tag_is_missing_or_mode_is_s)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int dirty = 0; dirty < 2; dirty++) {
+		drop_fixture(&buf, &entry, dirty);
+		buf.pcm_state = PCM_STATE_X;
+		buf.buffer_type = BUF_TYPE_XCUR;
+		UT_ASSERT_EQ(cluster_bufmgr_drop_block_for_gcs_no_wire(buf.tag, UINT64_C(0x12340), NULL),
+					 CLUSTER_BUFMGR_GCS_DROP_STALE);
+		UT_ASSERT_EQ(cluster_bufmgr_invalidate_block_for_gcs(buf.tag, PCM_LOCK_MODE_S, NULL, NULL),
+					 CLUSTER_BUFMGR_GCS_DROP_STALE);
+		UT_ASSERT_EQ(transition_flush_count + transition_discards + transition_pi_stamps, 0);
+		UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_X);
+		UT_ASSERT((pg_atomic_read_u32(&buf.state) & BM_VALID) != 0);
+		{
+			BufferTag missing = buf.tag;
+			missing.blockNum++;
+			UT_ASSERT_EQ(cluster_bufmgr_drop_block_for_gcs_no_wire(missing, UINT64_C(0x12340), NULL),
+						 CLUSTER_BUFMGR_GCS_DROP_STALE);
+		}
+		drop_fixture_done(saved);
+	}
+}
+
+UT_TEST(test_shared_old_invalidate_preserves_x_installed_after_its_pin)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	uint64 generation;
+
+	drop_fixture(&buf, &entry, false);
+	generation = cluster_pcm_own_gen_get(buf.buf_id);
+	transition_unpin_installs_x = true;
+	UT_ASSERT_EQ(cluster_bufmgr_invalidate_block_for_gcs(buf.tag, PCM_LOCK_MODE_S, NULL, NULL),
+				 CLUSTER_BUFMGR_GCS_DROP_STALE);
+	UT_ASSERT_EQ(transition_discards + transition_pi_stamps + transition_flush_count, 0);
+	UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_X);
+	UT_ASSERT_EQ(buf.buffer_type, BUF_TYPE_XCUR);
+	UT_ASSERT_EQ(cluster_pcm_own_gen_get(buf.buf_id), generation + 1);
+	UT_ASSERT((pg_atomic_read_u32(&buf.state) & BM_VALID) != 0);
+	drop_fixture_done(saved);
+}
+
 UT_TEST(test_gcs_invalidate_flushes_data_before_retry_then_discards)
 {
 	BufferDesc buf;
@@ -2324,6 +2379,13 @@ UT_TEST(test_gcs_invalidate_flushes_data_before_retry_then_discards)
 		drop_fixture(&buf, &entry, true);
 		buf.pcm_state = mode == 0 ? PCM_STATE_S : PCM_STATE_X;
 		buf.buffer_type = mode == 0 ? BUF_TYPE_SCUR : BUF_TYPE_XCUR;
+		if (mode == 1) {
+			UT_ASSERT_EQ(cluster_bufmgr_invalidate_block_for_gcs(buf.tag, PCM_LOCK_MODE_X, NULL, NULL),
+						 CLUSTER_BUFMGR_GCS_DROP_STALE);
+			UT_ASSERT_EQ(transition_flush_count + transition_discards, 0);
+			drop_fixture_done(saved);
+			continue;
+		}
 		UT_ASSERT_EQ(cluster_bufmgr_invalidate_block_for_gcs(buf.tag, (PcmLockMode)buf.pcm_state,
 															 NULL, NULL),
 					 CLUSTER_BUFMGR_GCS_DROP_PINNED);
@@ -2392,6 +2454,13 @@ UT_TEST(test_gcs_drop_data_error_aborts_only_own_io_before_unpin)
 	for (int no_wire = 0; no_wire < 2; ++no_wire) {
 		volatile bool caught = false;
 		drop_fixture(&buf, &entry, true);
+		if (no_wire) {
+			UT_ASSERT_EQ(cluster_bufmgr_drop_block_for_gcs_no_wire(buf.tag, UINT64_C(0x12340), NULL),
+						 CLUSTER_BUFMGR_GCS_DROP_STALE);
+			UT_ASSERT_EQ(transition_owned_io + transition_io_aborts + transition_flush_count, 0);
+			drop_fixture_done(saved);
+			continue;
+		}
 		transition_real_flush = transition_flush_error = true;
 		PG_TRY();
 		{
@@ -2487,6 +2556,8 @@ UT_TEST(test_gcs_drop_mapping_gap_and_no_wire_keep_dirty)
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
 	for (int scenario = 0; scenario < 3; ++scenario) {
 		drop_fixture(&buf, &entry, false);
+		/* Refusal precedes even the mapping/pin stage. */
+		pg_atomic_fetch_or_u32(&buf.state, BM_DIRTY);
 		transition_prepin_dirty = scenario == 0;
 		if (scenario != 0) {
 			pg_atomic_fetch_or_u32(&buf.state, BM_DIRTY | BM_CHECKPOINT_NEEDED);
@@ -2494,7 +2565,7 @@ UT_TEST(test_gcs_drop_mapping_gap_and_no_wire_keep_dirty)
 		}
 		cluster_past_image = scenario == 2;
 		UT_ASSERT_EQ(cluster_bufmgr_drop_block_for_gcs_no_wire(buf.tag, UINT64_C(0x12340), NULL),
-					 CLUSTER_BUFMGR_GCS_DROP_PINNED);
+					 CLUSTER_BUFMGR_GCS_DROP_STALE);
 		UT_ASSERT_EQ(transition_discards + transition_pi_stamps, 0);
 		UT_ASSERT((pg_atomic_read_u32(&buf.state) & BM_DIRTY) != 0);
 		UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_S);
@@ -8096,7 +8167,9 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(139);
+	UT_PLAN(141);
+	UT_RUN(test_shared_legacy_ship_cannot_drop_x_even_when_tag_is_missing_or_mode_is_s);
+	UT_RUN(test_shared_old_invalidate_preserves_x_installed_after_its_pin);
 	UT_RUN(test_gcs_invalidate_flushes_data_before_retry_then_discards);
 	UT_RUN(test_gcs_invalidate_busy_or_skipped_flush_keeps_obligation);
 	UT_RUN(test_gcs_invalidate_flush_error_keeps_data_and_releases_pin);

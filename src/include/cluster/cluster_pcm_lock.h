@@ -104,6 +104,15 @@ typedef enum PcmLockTransition {
 	PCM_TRANS_S_TO_N_RELEASE = 8,	 /* local release */
 	PCM_TRANS_S_TO_X_CLEANOUT = 9	 /* AD-006 ITL cleanout */
 } PcmLockTransition;
+
+/* Legacy carriers may register/release shared readers. Shared X authority
+ * belongs exclusively to Resource-X, including departure from X. */
+static inline bool
+cluster_pcm_legacy_transition_allowed(bool shared, PcmLockTransition transition)
+{
+	return !shared || transition == PCM_TRANS_N_TO_S
+		|| transition == PCM_TRANS_S_TO_N_INVALIDATE || transition == PCM_TRANS_S_TO_N_RELEASE;
+}
 #define PCM_TRANSITION_COUNT 9
 
 /* Exact master-side apply verdict.  PENDING_X is distinct from a structural

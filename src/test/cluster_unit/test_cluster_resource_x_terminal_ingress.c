@@ -2106,8 +2106,8 @@ UT_TEST(test_actual_eviction_prepare_pending_proves_exact_reversible_cleanup)
 UT_TEST(test_eviction_reserves_before_n_and_registers_before_release)
 {
 	for (int leg = 0; leg < 6; leg++) {
-		volatile ResourceXTargetEvictionPlan storage;
-		ResourceXTargetEvictionPlan *const plan = (ResourceXTargetEvictionPlan *)&storage;
+		static ResourceXTargetEvictionPlan storage;
+		ResourceXTargetEvictionPlan *const plan = &storage;
 		ClusterPcmOwnSnapshot exact = { 0 };
 		ClusterPageWalBindingV1 wal = { 0 };
 		volatile ResourceXApplyResult prepared = RESOURCE_X_APPLY_INVALID;
@@ -2304,7 +2304,7 @@ UT_TEST(test_actual_failed_round_observation_retries_only_exact_predecessor_shap
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(25);
 	UT_RUN(test_actual_terminal_ingress_keeps_master_and_physical_source_distinct);
 	UT_RUN(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission);
 	UT_RUN(test_actual_fused_admission_notifies_ready_resource_without_registry_tick);

@@ -469,6 +469,7 @@ s_lock(volatile slock_t *lock, const char *file pg_attribute_unused(),
 static void
 reset_fake_pcm_runtime(int max_entries)
 {
+	cluster_shared_config = false;
 	pi_service_blocked = false;
 	stop_new_work_allowed = true;
 	stop_pi_cut_allowed = false;
@@ -9556,6 +9557,16 @@ setup_pi_write_master(BufferTag tag)
 	durable.source_proof_crc32c = UINT32_C(0x87654321);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(&durable, &snapshot),
 				 RESOURCE_X_APPLY_APPLIED);
+	{
+		ResourceXIntentSlot intent;
+		uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
+						 &assertion.common.logical_assertion, &intent, payload, sizeof(payload)),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_stage_exact(&intent, intent.first_armed_us + 1),
+					 RESOURCE_X_INTENT_STAGED);
+		UT_ASSERT(cluster_pcm_lock_resource_x_grant_intent_complete_exact(&intent));
+	}
 	settlement = make_resource_x_master_frame(RESOURCE_X_WIRE_INSTALL_SETTLEMENT, tag, 2, 2);
 	settlement.common.outcome = RESOURCE_X_OUTCOME_OK;
 	settlement.common.authority_generation = 2;
@@ -9580,34 +9591,161 @@ setup_pi_write_master(BufferTag tag)
 	pi_ack_cut = pi_receipt_cut;
 }
 
-UT_TEST(test_shared_legacy_grant_keeps_departed_writers_without_physical_pi)
+/* Network/proof bytes are fixture inputs; both ownership changes execute
+ * the production Resource-X master, never a legacy shared-mode grant. */
+static void
+release_pi_write_master(BufferTag tag, bool add_reader)
+{
+	ResourceXDecodedFrame release
+		= make_resource_x_master_frame(RESOURCE_X_WIRE_RELEASE_X, tag, 2, 2);
+	ResourceXMasterSnapshot snapshot;
+
+	/* The third PI is an explicit keeper report, not inferred from a clean
+	 * RELEASE_X (which need not leave a physical PI). */
+	cluster_pcm_lock_pi_holder_note(tag, 2);
+	release.common.observed_mode = PCM_STATE_X;
+	release.common.target_mode = PCM_STATE_N;
+	release.common.outcome = RESOURCE_X_OUTCOME_OK;
+	release.common.base_authority_generation = 1;
+	release.common.authority_generation = 2;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_release_x_exact(&release, 2, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	if (add_reader)
+		UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_S, 2),
+					 PCM_GCS_TRANSITION_APPLIED);
+}
+
+static ResourceXDecodedFrame resource_x_admitted_test_assert(
+	BufferTag tag, int32 requester, ResourceXMasterSnapshot *snapshot);
+
+static void
+handoff_pi_write_master(BufferTag tag)
+{
+	ResourceXDecodedFrame assertion, blocked, settlement;
+	ResourceXMasterSnapshot snapshot;
+	ResourceXIntentSlot intent;
+	uint8 payload[RESOURCE_X_CONTROL_V1_BYTES];
+
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_settled_retire_exact(
+					 &pi_receipt_cut.holder.assertion, pi_receipt_cut.holder.assertion_sequence,
+					 &pi_receipt_cut.holder),
+				 RESOURCE_X_APPLY_APPLIED);
+	assertion = resource_x_admitted_test_assert(tag, 3, &snapshot);
+	UT_ASSERT_EQ(assertion.common.base_authority_generation, 2);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_intent_snapshot_exact(
+					 &assertion.common.logical_assertion, 2, &intent, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
+					 &intent, intent.first_armed_us + 1),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&intent));
+	blocked = make_resource_x_remote_blocked_frame(tag, 3, 2);
+	blocked.common.base_authority_generation = blocked.common.authority_generation = 2;
+	blocked.common.ordered_lane = assertion.common.ordered_lane;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_blocked_to_n_exact(&blocked, 2, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_GRANT_COMMITTED);
+	settlement = assertion;
+	settlement.kind = RESOURCE_X_WIRE_INSTALL_SETTLEMENT;
+	settlement.common.outcome = RESOURCE_X_OUTCOME_OK;
+	settlement.common.base_authority_generation = 2;
+	settlement.common.authority_generation = snapshot.final_authority_generation;
+	settlement.body.install_settlement.conversion_base_generation = 2;
+	settlement.body.install_settlement.final_authority_generation = snapshot.final_authority_generation;
+	settlement.body.install_settlement.requester_connection_generation = 61;
+	settlement.body.install_settlement.requester_target_generation = 41;
+	settlement.body.install_settlement.page_scn_lsn = blocked.body.blocked_to_n.page_scn_lsn;
+	settlement.body.install_settlement.page_checksum = blocked.body.blocked_to_n.page_checksum;
+	settlement.body.install_settlement.source_proof_crc32c = blocked.body.blocked_to_n.source_proof_crc32c;
+	settlement.body.install_settlement.installed_mode = PCM_STATE_X;
+	settlement.body.install_settlement.requester_role = RESOURCE_X_REQUESTER_ROLE_ACQUIRER;
+	settlement.body.install_settlement.terminal_outcome = RESOURCE_X_OUTCOME_OK;
+	settlement.body.install_settlement.terminal_state = RESOURCE_X_SETTLEMENT_TERMINAL_INSTALLED;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_install_settlement_exact(&settlement, 3, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_SETTLED);
+	UT_ASSERT_EQ(cluster_pcm_master_holder_node_by_tag(tag), 3);
+}
+
+UT_TEST(test_shared_legacy_x_apis_refuse_without_changing_authority)
+{
+	BufferTag tag = make_tag(6520), missing = make_tag(6521);
+	PcmAuthoritySnapshot before, after;
+	BufferDesc buf;
+	bool retry = true;
+	const PcmLockTransition departures[] = { PCM_TRANS_X_TO_S_DOWNGRADE,
+		PCM_TRANS_X_TO_N_DOWNGRADE, PCM_TRANS_X_TO_N_RELEASE };
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	/* Seed an earlier authority; the shared caller must not convert it. */
+	cluster_shared_config = false;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+	cluster_shared_config = true;
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &before));
+	for (int i = 0; i < lengthof(departures); i++)
+		UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, departures[i], 0),
+					 PCM_GCS_TRANSITION_INCOMPATIBLE);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(missing, PCM_TRANS_N_TO_X, 1),
+				 PCM_GCS_TRANSITION_INCOMPATIBLE);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(missing, PCM_TRANS_S_TO_X_CLEANOUT, 1),
+				 PCM_GCS_TRANSITION_INCOMPATIBLE);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &after));
+	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	UT_ASSERT_EQ(cluster_pcm_grd_count(), 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_master_take_x_after_transfer(tag, &before, 100, (SCN)10,
+															  0, 1, 1, 17),
+				 PCM_X_TRANSFER_COMMIT_BAD_STATE);
+	UT_EXPECT_EREPORT(cluster_pcm_lock_master_grant_x_to(tag, 1, 100, (SCN)10, 1, 17));
+	UT_EXPECT_EREPORT(cluster_pcm_lock_acquire(make_tag(6522), PCM_LOCK_MODE_X));
+	memset(&buf, 0, sizeof(buf));
+	buf.tag = missing;
+	cluster_pcm_clean_page_xfer_arm(true);
+	UT_EXPECT_EREPORT(cluster_pcm_lock_acquire_buffer(&buf, PCM_LOCK_MODE_X, &retry));
+	UT_ASSERT(!cluster_pcm_clean_page_xfer_is_armed());
+	UT_EXPECT_EREPORT(cluster_pcm_lock_downgrade(tag, PCM_LOCK_MODE_S, true));
+	UT_EXPECT_EREPORT(cluster_pcm_lock_release_saved_tag_for_eviction(tag, PCM_LOCK_MODE_X));
+	UT_EXPECT_EREPORT(cluster_pcm_lock_release(tag));
+	UT_ASSERT_EQ(cluster_pcm_lock_query(tag), PCM_LOCK_MODE_X);
+	UT_ASSERT_EQ(cluster_pcm_master_holder_node_by_tag(tag), 0);
+
+	/* Shared reads still register/release, but cannot upgrade on this API. */
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(missing, PCM_TRANS_N_TO_S, 0),
+				 PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(missing, PCM_TRANS_S_TO_X_UPGRADE, 0),
+				 PCM_GCS_TRANSITION_INCOMPATIBLE);
+	UT_EXPECT_EREPORT(cluster_pcm_lock_upgrade(missing));
+	UT_ASSERT_EQ(cluster_pcm_lock_query(missing), PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(missing, PCM_TRANS_S_TO_N_RELEASE, 0),
+				 PCM_GCS_TRANSITION_APPLIED);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_nonshared_legacy_grant_keeps_original_behavior)
 {
 	BufferTag tag = make_tag(6513);
 	struct StopPcmEntryLayout *entry;
 	uint64 before;
 
-	for (int shared = 0; shared < 2; shared++) {
-		reset_fake_pcm_runtime(4);
-		cluster_node_id = 0;
-		cluster_shared_config = shared;
-		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
-					 RESOURCE_X_APPLY_APPLIED);
-		UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_X, 0),
-					 PCM_GCS_TRANSITION_APPLIED);
-		entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
-		UT_ASSERT_NOT_NULL(entry);
-		before = pg_atomic_read_u64(&entry->transition_count_local);
-		/* This is the actual self-ship grant owner, with no PI conversion
-		 * or keeper note. A -> B -> C still owes both former writers. */
-		cluster_pcm_lock_master_grant_x_to(tag, 1, 100, (SCN)10, 1, 17);
-		cluster_pcm_lock_master_grant_x_to(tag, 2, 101, (SCN)11, 2, 17);
-		UT_ASSERT_EQ(entry->x_holder_node, 2);
-		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), shared ? 3 : 0);
-		if (shared)
-			UT_ASSERT(pg_atomic_read_u64(&entry->transition_count_local) > before);
-		cluster_pcm_lock_master_grant_x_to(tag, 2, 101, (SCN)11, 2, 17);
-		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), shared ? 3 : 0);
-	}
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_X, 0),
+				 PCM_GCS_TRANSITION_APPLIED);
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	before = pg_atomic_read_u64(&entry->transition_count_local);
+	/* Nonshared legacy grants retain their original behavior. Shared callers
+	 * are rejected before this owner, as the preceding test verifies. */
+	cluster_pcm_lock_master_grant_x_to(tag, 1, 100, (SCN)10, 1, 17);
+	cluster_pcm_lock_master_grant_x_to(tag, 2, 101, (SCN)11, 2, 17);
+	UT_ASSERT_EQ(entry->x_holder_node, 2);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&entry->transition_count_local), before);
+	cluster_pcm_lock_master_grant_x_to(tag, 2, 101, (SCN)11, 2, 17);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 0);
 }
 
 UT_TEST(test_pi_storage_cut_tracks_n_s_and_rejects_changed_authority)
@@ -9621,9 +9759,7 @@ UT_TEST(test_pi_storage_cut_tracks_n_s_and_rejects_changed_authority)
 		current = sentinel;
 		UT_ASSERT(!cluster_pcm_lock_pi_storage_snapshot_v1(tag, &current));
 		UT_ASSERT_EQ(memcmp(&current, &sentinel, sizeof(current)), 0);
-		UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(
-						 tag, mode ? PCM_TRANS_X_TO_S_DOWNGRADE : PCM_TRANS_X_TO_N_DOWNGRADE, 2),
-					 PCM_GCS_TRANSITION_APPLIED);
+		release_pi_write_master(tag, mode != 0);
 		entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
 		UT_ASSERT_NOT_NULL(entry);
 		before = *entry;
@@ -9670,10 +9806,8 @@ UT_TEST(test_pi_storage_cut_allows_waiting_storage_x_without_grant)
 	cluster_shared_config = true;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
 				 RESOURCE_X_APPLY_APPLIED);
-	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_X, 0),
-				 PCM_GCS_TRANSITION_APPLIED);
-	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_X_TO_N_DOWNGRADE, 0),
-				 PCM_GCS_TRANSITION_APPLIED);
+	/* Re-declared PI with no current holder is the actual shared input. */
+	UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(tag, PCM_STATE_N, 80, 90, 0, 7));
 	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 2, 2);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 2, &snapshot),
 				 RESOURCE_X_APPLY_APPLIED);
@@ -9737,10 +9871,7 @@ UT_TEST(test_pi_storage_completion_is_exact_and_idempotent)
 			struct StopPcmEntryLayout *entry, expected;
 			uint32 holders;
 			setup_pi_write_master(tag);
-			UT_ASSERT_EQ(
-				cluster_pcm_lock_apply_gcs_transition_result(
-					tag, mode ? PCM_TRANS_X_TO_S_DOWNGRADE : PCM_TRANS_X_TO_N_DOWNGRADE, 2),
-				PCM_GCS_TRANSITION_APPLIED);
+			release_pi_write_master(tag, mode != 0);
 			UT_ASSERT(cluster_pcm_lock_pi_storage_snapshot_v1(tag, &pi_storage_receipt_cut));
 			pi_storage_ack_cut = pi_storage_receipt_cut;
 			pi_storage_receipt_valid = true;
@@ -9897,11 +10028,7 @@ UT_TEST(test_pi_write_master_refuses_later_handoff_and_pending)
 		pi_receipt_valid = true;
 		entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
 		if (race == 0) {
-			UT_ASSERT_EQ(
-				cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_X_TO_N_DOWNGRADE, 2),
-				PCM_GCS_TRANSITION_APPLIED);
-			UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_X, 2),
-						 PCM_GCS_TRANSITION_APPLIED);
+			handoff_pi_write_master(tag);
 		} else if (race == 1)
 			UT_ASSERT_EQ(cluster_pcm_lock_try_reserve_pending_x(tag, 3, 78),
 						 PCM_PENDING_X_RESERVE_OK);
@@ -18448,7 +18575,10 @@ UT_TEST(test_redeclare_watermark_is_cleared_only_by_data_and_later_handoff_survi
 	UT_ASSERT_EQ(cluster_pcm_lock_pi_watermark_scn_query(tag), InvalidScn);
 	/* New dirty bytes remain the current holder's obligation. Their actual
 	 * handoff reports a fresh bound; the old DATA completion cannot erase it. */
-	cluster_pcm_lock_master_grant_x_to(tag, 3, 180, 190, 101, 17);
+	handoff_pi_write_master(tag);
+	/* The new holder's sampled page supplies the watermarks; Resource-X
+	 * source proof alone must not synthesize foreign page LSN/SCN. */
+	UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(tag, PCM_STATE_X, 180, 190, 3, 7));
 	UT_ASSERT_EQ(cluster_pcm_lock_pi_watermark_lsn_query(tag), 180);
 	UT_ASSERT_EQ(cluster_pcm_lock_pi_watermark_scn_query(tag), 190);
 	UT_ASSERT(!cluster_pcm_lock_pi_write_complete_v1((void *)&pi_receipt_fixture, NULL, NULL, 0,
@@ -20207,7 +20337,10 @@ UT_TEST(test_local_pi_is_owned_before_source_pair_becomes_sendable)
 	uint64 source_generation;
 	PGAlignedBlock page;
 
-	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+	/* The source starts with an existing X from the re-declaration boundary,
+	 * not a second, legacy shared-mode grant. */
+	UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(
+		tag, PCM_STATE_X, binding.record_end, binding.version.mutation_token, 0, 7));
 	fake_gcs_master_node = 1;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
 				 RESOURCE_X_APPLY_APPLIED);
@@ -20458,7 +20591,8 @@ UT_TEST(test_local_pi_redeclare_busy_or_unknown_scope_keeps_original_cursor)
 int
 main(void)
 {
-	UT_PLAN(308);
+	setvbuf(stdout, NULL, _IOLBF, 0);
+	UT_PLAN(310);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -20603,7 +20737,8 @@ main(void)
 	UT_RUN(test_pi_master_rejects_unqualified_foreign_ack_and_scans_bounded);
 	UT_RUN(test_pi_completion_requires_entire_unique_confirmation_set);
 	UT_RUN(test_pi_storage_completion_is_exact_and_idempotent);
-	UT_RUN(test_shared_legacy_grant_keeps_departed_writers_without_physical_pi);
+	UT_RUN(test_shared_legacy_x_apis_refuse_without_changing_authority);
+	UT_RUN(test_nonshared_legacy_grant_keeps_original_behavior);
 	UT_RUN(test_pi_storage_cut_tracks_n_s_and_rejects_changed_authority);
 	UT_RUN(test_pi_storage_cut_allows_waiting_storage_x_without_grant);
 	UT_RUN(test_pi_write_master_refuses_later_handoff_and_pending);
