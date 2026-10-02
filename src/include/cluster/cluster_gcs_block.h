@@ -4021,6 +4021,15 @@ typedef bool (*ClusterGcsRedeclareCallback)(BufferTag tag, uint8 held_mode, XLog
 extern int cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 											   ClusterGcsRedeclareCallback cb, void *arg);
 
+/* LMON's second census cursor, over the original PCM registry. Logical PI
+ * responsibility survives buffer eviction. Declare only affected, nonempty
+ * entries as N with zero numeric watermarks; their retained typed sources are
+ * ancestry evidence, not comparable LSN/SCN floors. Same -1-position retry
+ * convention; callbacks run without directory locks or retained entry refs.
+ * This adds obligations, never replaces the retained-WAL recovery census. */
+extern int cluster_pcm_local_pi_redeclare_scan_chunk(int start, int max_scan, uint64 epoch,
+													 ClusterGcsRedeclareCallback cb, void *arg);
+
 
 /* ============================================================
  * Public API.

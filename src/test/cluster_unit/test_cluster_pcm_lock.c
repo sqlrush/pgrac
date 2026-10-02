@@ -20301,10 +20301,104 @@ UT_TEST(test_local_pi_read_only_carrier_does_not_create_writer_responsibility)
 	local_pi_writer_ready = cluster_shared_config = false;
 }
 
+static int local_pi_redeclare_calls;
+static bool local_pi_redeclare_acked;
+static BufferTag local_pi_redeclared_tag;
+
+static bool
+local_pi_redeclare_callback(BufferTag tag, uint8 mode, XLogRecPtr lsn, SCN scn, void *arg)
+{
+	ClusterPcmLocalPiSnapshotV1 observed;
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	UT_ASSERT_EQ(mode, PCM_STATE_N);
+	UT_ASSERT_EQ(lsn, InvalidXLogRecPtr);
+	UT_ASSERT_EQ(scn, InvalidScn);
+	UT_ASSERT_EQ(*(int *)arg, 53);
+	/* Transport is outside directory locks and may observe the same entry. */
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &observed));
+	UT_ASSERT(observed.first.record_start != InvalidXLogRecPtr);
+	local_pi_redeclare_calls++;
+	local_pi_redeclared_tag = tag;
+	return local_pi_redeclare_acked;
+}
+
+UT_TEST(test_local_pi_redeclare_does_not_need_resident_buffer_or_current_authority)
+{
+	BufferTag tag = make_tag(919);
+	ClusterPageWalBindingV1 b = local_pi_setup(tag);
+	ClusterPcmLocalPiSnapshotV1 before, after;
+	int marker = 53;
+	int slot;
+	/* The logical WAL source is foreign; its LSN/token are not local floors. */
+	b.source.claim.identity.origin_node_id = 1;
+	b.source.claim.identity.origin_thread_id = 2;
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &b));
+	slot = ((struct StopPcmEntryLayout *)hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND,
+													 NULL))
+			   ->registry_slot;
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &before));
+	MyBackendType = B_LMON;
+	local_pi_redeclare_calls = 0;
+	local_pi_redeclare_acked = false;
+	UT_ASSERT_EQ(
+		cluster_pcm_local_pi_redeclare_scan_chunk(slot, 1, 7, local_pi_redeclare_callback, &marker),
+		-1 - slot);
+	UT_ASSERT_EQ(local_pi_redeclare_calls, 1);
+	UT_ASSERT(BufferTagsEqual(&local_pi_redeclared_tag, &tag));
+	local_pi_redeclare_acked = true;
+	UT_ASSERT_EQ(
+		cluster_pcm_local_pi_redeclare_scan_chunk(slot, 1, 7, local_pi_redeclare_callback, &marker),
+		slot + 1);
+	UT_ASSERT_EQ(cluster_pcm_local_pi_redeclare_scan_chunk((slot + 1) % 4, 1, 7,
+														   local_pi_redeclare_callback, &marker),
+				 (slot + 1) % 4 + 1);
+	UT_ASSERT_EQ(local_pi_redeclare_calls, 2);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &after));
+	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	local_pi_writer_ready = cluster_shared_config = false;
+}
+
+UT_TEST(test_local_pi_redeclare_busy_or_unknown_scope_keeps_original_cursor)
+{
+	BufferTag tag = make_tag(920);
+	ClusterPageWalBindingV1 b = local_pi_setup(tag);
+	int marker = 53;
+	int slot;
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &b));
+	slot = ((struct StopPcmEntryLayout *)hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND,
+													 NULL))
+			   ->registry_slot;
+	MyBackendType = B_LMON;
+	local_pi_redeclare_calls = 0;
+	local_pi_redeclare_acked = true;
+	fake_lwlock_conditional_fail_once = true;
+	UT_ASSERT_EQ(
+		cluster_pcm_local_pi_redeclare_scan_chunk(slot, 1, 7, local_pi_redeclare_callback, &marker),
+		-1 - slot);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	pi_redeclare_frozen = -1;
+	UT_ASSERT_EQ(
+		cluster_pcm_local_pi_redeclare_scan_chunk(slot, 1, 7, local_pi_redeclare_callback, &marker),
+		-1 - slot);
+	pi_redeclare_frozen = 0;
+	UT_ASSERT_EQ(
+		cluster_pcm_local_pi_redeclare_scan_chunk(slot, 1, 7, local_pi_redeclare_callback, &marker),
+		slot + 1);
+	UT_ASSERT_EQ(local_pi_redeclare_calls, 0);
+	pi_redeclare_frozen = 1;
+	UT_ASSERT_EQ(
+		cluster_pcm_local_pi_redeclare_scan_chunk(slot, 1, 7, local_pi_redeclare_callback, &marker),
+		slot + 1);
+	UT_ASSERT_EQ(local_pi_redeclare_calls, 1);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	local_pi_writer_ready = cluster_shared_config = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(306);
+	UT_PLAN(308);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -20611,6 +20705,8 @@ main(void)
 	UT_RUN(test_local_pi_is_owned_before_source_pair_becomes_sendable);
 	UT_RUN(test_local_pi_requires_original_all_member_stop_cut);
 	UT_RUN(test_local_pi_read_only_carrier_does_not_create_writer_responsibility);
+	UT_RUN(test_local_pi_redeclare_does_not_need_resident_buffer_or_current_authority);
+	UT_RUN(test_local_pi_redeclare_busy_or_unknown_scope_keeps_original_cursor);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -10107,6 +10107,68 @@ cluster_pcm_local_pi_retire_v1(const ClusterPcmLocalPiSnapshotV1 *local,
 	return result;
 }
 
+int
+cluster_pcm_local_pi_redeclare_scan_chunk(int start, int max_scan, uint64 epoch,
+										  ClusterGcsRedeclareCallback cb, void *arg)
+{
+	int end;
+	if (start < 0)
+		start = 0;
+	if (!cluster_shared_config)
+		return start;
+	if (MyBackendType != B_LMON || !cluster_enabled || ClusterPcm == NULL
+		|| cluster_pcm_htab == NULL || cluster_pcm_resource_x_slots == NULL
+		|| pcm_grd_effective <= 0 || cb == NULL || max_scan <= 0 || epoch == 0)
+		return -1 - start;
+	start = Min(start, pcm_grd_effective);
+	end = start + Min(max_scan, pcm_grd_effective - start);
+	for (int i = start; i < end; i++) {
+		ClusterPcmResourceXSlot slot;
+		ClusterPcmLocalPiSnapshotV1 local;
+		PcmEntryRef ref;
+		PcmEntryAcquireResult acquired;
+		uint64 census_hash;
+		bool valid;
+		int state;
+
+		/* Copy the index under its original owner; never keep a raw entry
+		 * pointer or a table/entry lock while sending or waiting for ACK. */
+		LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+		slot = cluster_pcm_resource_x_slots[i];
+		LWLockRelease(&ClusterPcm->htab_lock.lock);
+		if (slot.state == PCM_REGISTRY_EMPTY || slot.state == PCM_REGISTRY_TOMBSTONE)
+			continue;
+		if (slot.state != PCM_REGISTRY_LIVE || slot.reserved != 0
+			|| slot.retired_authority_generation != 0 || slot.binding_generation == 0
+			|| slot.binding_generation == UINT64_MAX)
+			return -1 - i;
+		state = cluster_grd_block_redeclare_state_v1(slot.tag, epoch, &census_hash);
+		if (state < 0)
+			return -1 - i;
+		if (state == 0)
+			continue;
+		if (!pcm_entry_ref_acquire(&slot.tag, false, &ref, &acquired))
+			return -1 - i;
+		if (!LWLockConditionalAcquire(&ref.entry->entry_lock.lock, LW_SHARED)) {
+			pcm_entry_ref_release(&ref);
+			return -1 - i;
+		}
+		valid = ref.binding_generation == slot.binding_generation && ref.registry_slot == (uint32)i
+				&& pcm_local_pi_snapshot_locked(ref.entry, &local);
+		LWLockRelease(&ref.entry->entry_lock.lock);
+		pcm_entry_ref_release(&ref);
+		if (!valid)
+			return -1 - i;
+		/* This source still owes an old version, even with no physical PI.
+		 * N adds only its responsibility bit. A foreign retained LSN/token
+		 * cannot become the new master's numeric service watermark. */
+		if (local.first.record_start != InvalidXLogRecPtr
+			&& !cb(local.resource, PCM_STATE_N, InvalidXLogRecPtr, InvalidScn, arg))
+			return -1 - i;
+	}
+	return end;
+}
+
 static bool
 pcm_pi_storage_snapshot_locked(struct GrdEntry *entry, ClusterPcmPiStorageCutV1 *out)
 {

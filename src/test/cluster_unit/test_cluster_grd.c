@@ -492,6 +492,23 @@ cluster_gcs_block_send_redeclare(BufferTag tag pg_attribute_unused(),
  * stays false until the cursor reaches it. */
 static int fake_scan_nbuffers = 0;
 static bool fake_scan_pending;
+static int fake_pi_scan_count;
+static int fake_pi_scan_calls;
+static int fake_pi_scan_start;
+static bool fake_pi_scan_pending;
+int
+cluster_pcm_local_pi_redeclare_scan_chunk(int start, int max_scan, uint64 epoch,
+										  ClusterGcsRedeclareCallback cb, void *arg)
+{
+	(void)epoch;
+	(void)cb;
+	(void)arg;
+	fake_pi_scan_calls++;
+	fake_pi_scan_start = start;
+	if (fake_pi_scan_pending)
+		return -1 - start;
+	return Min(start + max_scan, fake_pi_scan_count);
+}
 int
 cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 									ClusterGcsRedeclareCallback cb pg_attribute_unused(),
@@ -2615,6 +2632,39 @@ UT_TEST(test_grd_d2_redeclare_scan_completion_gate)
 	UT_ASSERT(!grd_block_redeclare_scan_complete(11));
 
 	fake_scan_nbuffers = 0; /* restore no-op for any later test */
+}
+
+UT_TEST(test_grd_redeclare_waits_for_detached_logical_pi_ack)
+{
+	/* No buffer remains, but its old source still owns a logical PI. */
+	cluster_shared_config = true;
+	fake_scan_nbuffers = 0;
+	fake_pi_scan_count = 257;
+	fake_pi_scan_calls = 0;
+	fake_pi_scan_pending = true;
+	grd_block_redeclare_step(12345);
+	UT_ASSERT(!grd_block_redeclare_scan_complete(12345));
+	UT_ASSERT_EQ(fake_pi_scan_calls, 1);
+	UT_ASSERT_EQ(fake_pi_scan_start, 0);
+	grd_block_redeclare_step(12345);
+	UT_ASSERT(!grd_block_redeclare_scan_complete(12345));
+	UT_ASSERT_EQ(fake_pi_scan_start, 0);
+	fake_pi_scan_pending = false;
+	grd_block_redeclare_step(12345);
+	UT_ASSERT(!grd_block_redeclare_scan_complete(12345));
+	grd_block_redeclare_step(12345);
+	UT_ASSERT_EQ(fake_pi_scan_start, 256);
+	UT_ASSERT(!grd_block_redeclare_scan_complete(12345));
+	grd_block_redeclare_step(12345);
+	UT_ASSERT(grd_block_redeclare_scan_complete(12345));
+	/* A new episode must acknowledge the detached obligations again. */
+	fake_pi_scan_pending = true;
+	grd_block_redeclare_step(12346);
+	UT_ASSERT(!grd_block_redeclare_scan_complete(12346));
+	UT_ASSERT_EQ(fake_pi_scan_start, 0);
+	fake_pi_scan_count = 0;
+	fake_pi_scan_pending = false;
+	cluster_shared_config = false;
 }
 
 
@@ -6956,7 +7006,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(146);
+	UT_PLAN(147);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
@@ -7002,6 +7052,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_grd_lookup_master_rejects_undo_resid);
 	UT_RUN(test_grd_shard_phase_accessors);
 	UT_RUN(test_grd_d2_redeclare_scan_completion_gate);
+	UT_RUN(test_grd_redeclare_waits_for_detached_logical_pi_ack);
 	UT_RUN(test_grd_redeclare_unacknowledged_buffer_does_not_advance_cursor);
 
 	/* spec-5.1b — GES grant/convert state machine (U1-U11). */
