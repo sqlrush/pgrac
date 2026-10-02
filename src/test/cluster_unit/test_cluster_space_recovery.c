@@ -94,6 +94,9 @@ bool cluster_smart_fusion, cluster_past_image;
 ClusterPcmOwnEntry *ClusterPcmOwnArray;
 BufferUsage pgBufferUsage;
 static bool sf_blocked, stale_during_io, stale_after_write;
+static unsigned cold_truncates;
+static bool fail_cold_truncate, stale_after_truncate;
+static BlockNumber cold_main_blocks;
 static bool checkpoint_during_flush;
 static unsigned wal_flushes, io_aborts;
 static bool cluster_pcm_x_finish_retain_flush_active;
@@ -469,7 +472,7 @@ BufferGetTag(Buffer b, RelFileLocator *r, ForkNumber *f, BlockNumber *n)
 void
 MarkBufferDirty(Buffer b)
 {
-	UT_ASSERT(b == 2 || (creating && b == 1));
+	UT_ASSERT(b == 2 || ((creating || structural) && b == 1));
 	UT_ASSERT(x_locks & (1 << (b - 1)));
 	UT_ASSERT(CritSectionCount > 0);
 	pg_atomic_fetch_or_u32(&descriptors[b - 1].bufferdesc.state, BM_DIRTY | BM_JUST_DIRTIED);
@@ -512,7 +515,7 @@ smgrimmedsync(SMgrRelation r, ForkNumber f)
 void
 smgrwrite(SMgrRelation r, ForkNumber f, BlockNumber b, const void *data, bool skip)
 {
-	UT_ASSERT(b == 1 || (creating && b == 0));
+	UT_ASSERT(b == 1 || ((creating || structural) && b == 0));
 	UT_ASSERT_EQ(f, SPACE_FORKNUM);
 	fault(4);
 	if ((int)b == fail_write_block) {
@@ -523,6 +526,30 @@ smgrwrite(SMgrRelation r, ForkNumber f, BlockNumber b, const void *data, bool sk
 	UT_ASSERT_EQ(pwrite(fileno(file), data, BLCKSZ, (off_t)b * BLCKSZ), BLCKSZ);
 	if (stale_after_write)
 		stale = true;
+}
+bool
+smgr_redo_cold_truncate(const xl_smgr_truncate *truncate, const ClusterSpaceRecoveryBatchV1 *batch)
+{
+	xl_smgr_truncate wrong = *truncate;
+
+	UT_ASSERT(cluster_space_recovery_truncate_permitted_v1(batch, truncate));
+	wrong.blkno++;
+	UT_ASSERT(!cluster_space_recovery_truncate_permitted_v1(batch, &wrong));
+	wrong = *truncate;
+	wrong.flags = SMGR_TRUNCATE_HEAP;
+	UT_ASSERT(!cluster_space_recovery_truncate_permitted_v1(batch, &wrong));
+	wrong = *truncate;
+	wrong.rlocator.relNumber++;
+	UT_ASSERT(!cluster_space_recovery_truncate_permitted_v1(batch, &wrong));
+	UT_ASSERT(CurrentResourceOwner == child_owner && locks == 3 && x_locks == 3 && pins == 3);
+	UT_ASSERT_EQ(wal_flushes, 0);
+	if (fail_cold_truncate)
+		return false;
+	cold_main_blocks = Min(cold_main_blocks, truncate->blkno);
+	cold_truncates++;
+	if (stale_after_truncate)
+		stale = true;
+	return true;
 }
 uint32
 LockBufHdr(BufferDesc *buf)
@@ -718,6 +745,9 @@ reset(void)
 	MyAuxProcType = NotAnAuxProcess;
 	recovery = cold_current = true;
 	cold_window = merge_claim = true;
+	cold_truncates = 0;
+	cold_main_blocks = 7;
+	fail_cold_truncate = stale_after_truncate = false;
 	cold_origins = 2;
 	source_unavailable = false;
 	memset(serials, 0, sizeof(serials));
@@ -1876,7 +1906,7 @@ UT_TEST(test_compact_cold_failed_io_keeps_original_owner_and_retryable_prefix)
 	}
 }
 
-UT_TEST(test_compact_cold_structure_stays_closed_until_physical_owner_is_wired)
+UT_TEST(test_compact_cold_structure_requires_exact_two_component_chain)
 {
 	ClusterSpaceRecoveryInput inputs[2];
 	ClusterSpaceColdSourceV1 origin[2];
@@ -1887,19 +1917,229 @@ UT_TEST(test_compact_cold_structure_stays_closed_until_physical_owner_is_wired)
 	structural = true;
 	make_plan();
 	compact_inputs(inputs, origin);
+	inputs[1].length--;
 	memcpy(before, pages, sizeof(before));
 	UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0));
 	UT_ASSERT_EQ(writes + creates + extensions + syncs + reads, 0);
 	UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
 }
 
+UT_TEST(test_compact_cold_truncate_runs_original_owner_at_its_step_only)
+{
+	ClusterSpaceRecoveryInput inputs[2];
+	ClusterSpaceColdSourceV1 origin[2];
+	ClusterSpaceReservation got;
+	uint64 token;
+
+	reset();
+	structural = true;
+	make_plan();
+	MyAuxProcType = StartupProcess;
+	compact_inputs(inputs, origin);
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 0));
+	UT_ASSERT_EQ(cold_truncates, 0);
+	UT_ASSERT_EQ(cold_main_blocks, 7);
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 1));
+	UT_ASSERT_EQ(cold_truncates, 1);
+	UT_ASSERT_EQ(cold_main_blocks, 5);
+	UT_ASSERT(cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1, &key,
+													&got, &token));
+	UT_ASSERT_EQ(got.next_block, 5);
+	UT_ASSERT_EQ(token, 19);
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 1));
+	UT_ASSERT_EQ(cold_truncates, 1);
+	UT_ASSERT_EQ(wal_flushes, 0);
+	UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+}
+
+UT_TEST(test_compact_cold_truncate_failure_cannot_publish_new_identity)
+{
+	for (int late = 0; late < 2; late++) {
+		ClusterSpaceRecoveryInput inputs[2];
+		ClusterSpaceColdSourceV1 origin[2];
+		PGAlignedBlock before[2];
+
+		reset();
+		structural = true;
+		make_plan();
+		MyAuxProcType = StartupProcess;
+		compact_inputs(inputs, origin);
+		memcpy(before, pages, sizeof(before));
+		fail_cold_truncate = !late;
+		stale_after_truncate = late;
+		UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 1));
+		UT_ASSERT_EQ(cold_truncates, late);
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+		stale = stale_after_truncate = fail_cold_truncate = false;
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 1));
+		UT_ASSERT_EQ(cold_main_blocks, 5);
+	}
+}
+
+static void
+compact_lifecycle(ClusterSpaceRecoveryInput inputs[4], ClusterSpaceColdSourceV1 origin[4],
+				  uint8 bytes[4][CLUSTER_SPACE_STRUCTURE_WAL_BYTES])
+{
+	ClusterSpaceStructureChange truncate, drop;
+	ClusterSpaceReservationChange advance;
+
+	reset();
+	structural = true;
+	make_plan();
+	MyAuxProcType = StartupProcess;
+	compact_inputs(inputs, origin);
+	UT_ASSERT(cluster_space_structure_wal_decode(inputs[1].data, inputs[1].length, &truncate));
+	memcpy(bytes[0], inputs[0].data, inputs[0].length);
+	memcpy(bytes[1], inputs[1].data, inputs[1].length);
+	advance = (ClusterSpaceReservationChange){ 0 };
+	advance.action = CLUSTER_SPACE_RESERVATION_ADVANCE;
+	advance.before = truncate.reservation.result;
+	advance.result = advance.before;
+	advance.first_block = 5;
+	advance.granted = 4;
+	advance.result.next_block = 9;
+	advance.before_token = 19;
+	advance.result_token = 77;
+	UT_ASSERT(cluster_space_reservation_wal_encode(&advance, bytes[2],
+												   CLUSTER_SPACE_RESERVATION_WAL_BYTES));
+	drop = (ClusterSpaceStructureChange){ 0 };
+	drop.identity.action = CLUSTER_SPACE_WAL_TOMBSTONE;
+	drop.identity.nblocks = InvalidBlockNumber;
+	drop.identity.expected = truncate.identity.result;
+	drop.identity.result = drop.identity.expected;
+	drop.identity.result.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+	drop.identity.result.sequence++;
+	drop.identity.result.operation = 88;
+	drop.identity.before_token = 19;
+	drop.identity.result_token = 88;
+	drop.reservation.action = CLUSTER_SPACE_RESERVATION_TOMBSTONE;
+	drop.reservation.before = advance.result;
+	drop.reservation.result = drop.reservation.before;
+	drop.reservation.result.identity = drop.identity.result;
+	drop.reservation.before_token = 77;
+	drop.reservation.result_token = 88;
+	UT_ASSERT(cluster_space_structure_wal_encode(&drop, bytes[3], sizeof(bytes[3])));
+	for (int i = 0; i < 4; i++) {
+		inputs[i]
+			= (ClusterSpaceRecoveryInput){ bytes[i], i % 2 ? CLUSTER_SPACE_STRUCTURE_WAL_BYTES
+														   : CLUSTER_SPACE_RESERVATION_WAL_BYTES };
+		origin[i] = (ClusterSpaceColdSourceV1){ 2 + i % 2, 120 + 20 * i };
+	}
+}
+
+UT_TEST(test_compact_cold_regrowth_and_commit_tombstone_preserve_later_data)
+{
+	ClusterSpaceRecoveryInput inputs[4];
+	ClusterSpaceColdSourceV1 origin[4];
+	uint8 bytes[4][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	PGAlignedBlock before[2];
+	ClusterSpaceIdentity identity;
+	uint64 token;
+
+	compact_lifecycle(inputs, origin, bytes);
+	for (uint32 through = 0; through < 4; through++) {
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, through));
+		if (through == 2)
+			cold_main_blocks = 9; /* Later native PAGE installs after their reservation. */
+	}
+	UT_ASSERT_EQ(cold_truncates, 1);
+	UT_ASSERT_EQ(cold_main_blocks, 9); /* Physical deletion belongs to COMMIT. */
+	UT_ASSERT(cluster_space_identity_page_decode(pages[0].data, BLCKSZ, SPACE_FORKNUM, 0, &key,
+												 &identity, &token));
+	UT_ASSERT_EQ(identity.state, CLUSTER_SPACE_IDENTITY_TOMBSTONED);
+	UT_ASSERT_EQ(token, 88);
+	memcpy(before, pages, sizeof(before));
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, 1));
+	UT_ASSERT_EQ(cold_truncates, 1);
+	UT_ASSERT_EQ(cold_main_blocks, 9);
+	UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+	UT_ASSERT_EQ(wal_flushes, 0);
+}
+
+UT_TEST(test_compact_cold_final_install_performs_intermediate_truncate)
+{
+	ClusterSpaceRecoveryInput inputs[4];
+	ClusterSpaceColdSourceV1 origin[4];
+	uint8 bytes[4][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+
+	compact_lifecycle(inputs, origin, bytes);
+	UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, 3));
+	UT_ASSERT_EQ(cold_truncates, 1);
+	UT_ASSERT_EQ(cold_main_blocks, 5);
+	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 88);
+	UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 88);
+}
+
+UT_TEST(test_compact_cold_truncate_qualifies_history_advance_gap)
+{
+	for (int durable = 0; durable < 2; durable++) {
+		ClusterSpaceRecoveryInput inputs[4];
+		ClusterSpaceColdSourceV1 origin[4];
+		uint8 bytes[4][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		ClusterSpaceStructureChange truncate;
+
+		compact_lifecycle(inputs, origin, bytes);
+		UT_ASSERT(cluster_space_structure_wal_decode(bytes[1], sizeof(bytes[1]), &truncate));
+		truncate.reservation.before.next_block = 9;
+		truncate.reservation.before_token = 7;
+		UT_ASSERT(cluster_space_structure_wal_encode(&truncate, bytes[1], sizeof(bytes[1])));
+		survivor_advance(9, 7, durable);
+		cold_main_blocks = 9;
+		UT_ASSERT_EQ(cluster_space_cold_install_v1(&key, inputs, origin, 4, 1), durable);
+		UT_ASSERT_EQ(cold_truncates, durable);
+		UT_ASSERT_EQ(cold_main_blocks, durable ? 5 : 9);
+		if (!durable)
+			UT_ASSERT_EQ(writes + creates + extensions + syncs, 0);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_compact_cold_partial_space_write_retries_without_losing_regrowth)
+{
+	for (int block = 0; block < 2; block++) {
+		ClusterSpaceRecoveryInput inputs[4];
+		ClusterSpaceColdSourceV1 origin[4];
+		uint8 bytes[4][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		volatile bool caught = false;
+
+		compact_lifecycle(inputs, origin, bytes);
+		fail_write_block = block;
+		PG_TRY();
+		{
+			(void)cluster_space_cold_install_v1(&key, inputs, origin, 4, 1);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(cold_truncates, 1);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+		fail_write_block = -1;
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, 1));
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, 2));
+		cold_main_blocks = 9;
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 4, 1));
+		UT_ASSERT_EQ(cold_main_blocks, 9);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(39);
+	UT_RUN(test_compact_cold_truncate_qualifies_history_advance_gap);
+	UT_RUN(test_compact_cold_regrowth_and_commit_tombstone_preserve_later_data);
+	UT_RUN(test_compact_cold_final_install_performs_intermediate_truncate);
+	UT_RUN(test_compact_cold_partial_space_write_retries_without_losing_regrowth);
+	UT_RUN(test_compact_cold_truncate_runs_original_owner_at_its_step_only);
+	UT_RUN(test_compact_cold_truncate_failure_cannot_publish_new_identity);
 	UT_RUN(test_compact_cold_history_successor_requires_physical_proof);
 	UT_RUN(test_compact_cold_failed_io_keeps_original_owner_and_retryable_prefix);
-	UT_RUN(test_compact_cold_structure_stays_closed_until_physical_owner_is_wired);
+	UT_RUN(test_compact_cold_structure_requires_exact_two_component_chain);
 	UT_RUN(test_compact_cold_create_and_advance_use_original_sources);
 	UT_RUN(test_compact_cold_rejects_missing_owner_and_source_drift_before_io);
 	UT_RUN(test_compact_cold_preflights_suffix_and_preserves_canonical_order);

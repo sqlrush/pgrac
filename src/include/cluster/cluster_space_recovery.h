@@ -53,6 +53,11 @@ extern void cluster_space_recovery_destroy_v1(ClusterSpaceRecoveryBatchV1 **batc
  * It proves exact bytes and all retained sources, not a caller-supplied LSN. */
 extern bool cluster_space_recovery_flush_permitted_v1(const ClusterSpaceRecoveryBatchV1 *batch,
 													  Buffer buffer);
+struct xl_smgr_truncate;
+/* Original native truncation only, while the batch holds both SPACE pages
+ * and the exact current structural input. A naked LSN never grants this. */
+extern bool cluster_space_recovery_truncate_permitted_v1(const ClusterSpaceRecoveryBatchV1 *batch,
+														 const struct xl_smgr_truncate *truncate);
 extern Size cluster_space_recovery_scratch_held_v1(const ClusterSpaceRecoveryBatchV1 *batch);
 extern bool cluster_space_recovery_preflight_operation_v1(void *arg,
 														  const RfSideOnlineOperationV1 *operation);

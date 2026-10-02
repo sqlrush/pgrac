@@ -1888,10 +1888,11 @@ test_cluster_vm_version.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap
 	     /^visibilitymap_pin_ok\(/ { print "bool"; emit=1; pinok++ } \
 	     /^visibilitymap_pin_recent\(/ { print "bool"; emit=1; recent++ } \
 	     /^visibilitymap_prepare_truncate\(/ { print "BlockNumber"; emit=1; truncs++ } \
+	     /^visibilitymap_prepare_cold_truncate\(/ { print "bool"; emit=1; coldtruncs++ } \
 	     /^vm_readbuf\(/ { print "static Buffer"; emit=1; reads++ } \
 	     /^vm_extend\(/ { print "static Buffer"; emit=1; extends++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (pins != 1 || pinok != 1 || recent != 1 || truncs != 1 || reads != 1 || extends != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (pins != 1 || pinok != 1 || recent != 1 || truncs != 1 || coldtruncs != 1 || reads != 1 || extends != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_vm_version: test_cluster_vm_version.c test_cluster_vm_version.inc unit_test.h \

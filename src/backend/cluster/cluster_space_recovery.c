@@ -44,6 +44,7 @@
 typedef struct SpaceRecoveryTarget {
 	ClusterSpaceIdentityKey key;
 	bool has_create;
+	bool has_structure;
 	uint32 operation_count;
 	PGAlignedBlock before[2];
 	ClusterSpaceRecoveryImage final;
@@ -63,6 +64,7 @@ struct ClusterSpaceRecoveryBatchV1 {
 	SpaceRecoveryTarget *targets;
 	uint32 *order;
 	SpaceRecoveryTarget *active;
+	uint32 active_step;
 	Buffer buffers[2];
 	HwLock hw;
 	ResourceOwner source_owner;
@@ -235,6 +237,7 @@ space_target_release(ClusterSpaceRecoveryBatchV1 *batch)
 	if (batch->hw.held)
 		cluster_hw_unlock(&batch->hw);
 	batch->active = NULL;
+	batch->active_step = UINT32_MAX;
 }
 
 static bool
@@ -328,11 +331,11 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 														  RBM_NORMAL, NULL, true);
 			if (!BufferIsValid(batch->buffers[i]) || BufferIsLocal(batch->buffers[i]))
 				goto done;
-			LockBuffer(batch->buffers[i],
-					   i == 0 && !target->has_create ? BUFFER_LOCK_SHARE : BUFFER_LOCK_EXCLUSIVE);
+			LockBuffer(batch->buffers[i], i == 0 && !target->has_structure ? BUFFER_LOCK_SHARE
+																		   : BUFFER_LOCK_EXCLUSIVE);
 			if (BufferGetBlockNumber(batch->buffers[i]) != i)
 				goto done;
-			if ((i == 1 || target->has_create)
+			if ((i == 1 || target->has_structure)
 				&& !cluster_bufmgr_pcm_x_content_holder_write_permitted(
 					GetBufferDescriptor(batch->buffers[i] - 1)))
 				goto done;
@@ -341,9 +344,8 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 		if (!space_sources_fresh(batch))
 			goto done;
 		if (!space_prepare_target(batch, target, through, &count, &prepared)
-			|| (!target->has_create && prepared.source_index[0] != UINT32_MAX)
-			|| (target->has_create && prepared.source_index[0] == UINT32_MAX
-				&& !(prepared.covered_by_successor_mask & 1)))
+			|| (!target->has_structure && prepared.source_index[0] != UINT32_MAX)
+			|| (prepared.source_index[0] == UINT32_MAX && (prepared.apply_mask & 1)))
 			goto done;
 		target->operation_count = count;
 		if (prepared.source_index[1] == UINT32_MAX) {
@@ -379,7 +381,8 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 				&& (blocks <= i || !space_disk_matches(rel, i, target->before[i].data)))
 				goto done;
 		/* ADVANCE cannot supply missing identity-page bytes or their WAL. */
-		if (!target->has_create && !space_disk_matches(rel, 0, prepared.pages[0].data))
+		if (prepared.source_index[0] == UINT32_MAX
+			&& !space_disk_matches(rel, 0, prepared.pages[0].data))
 			goto done;
 		/* Re-prepare under this HW/current-X hold. A legitimate survivor
 		 * extension since preflight may cover the old cut; never overwrite
@@ -406,6 +409,52 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 		}
 		if (!space_sources_fresh(batch))
 			goto done;
+		if (batch->cold_inputs != NULL && through < batch->operation_count
+			&& batch->cold_inputs[through].length == CLUSTER_SPACE_STRUCTURE_WAL_BYTES) {
+			ClusterSpaceStructureChange change;
+
+			if (!cluster_space_structure_wal_decode(batch->cold_inputs[through].data,
+													batch->cold_inputs[through].length, &change))
+				goto done;
+			if (change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE) {
+				uint8 completed = 0;
+				bool later = false;
+
+				/* A durable result component proves the shrink preceded it.
+				 * A history-gap before-image alone does not prove this action.
+				 * Never repeat a covered shrink against later regrown DATA. */
+				for (int i = 0; i < 2; i++) {
+					later |= prepared.source_index[i] == UINT32_MAX;
+					if (!(prepared.apply_mask & (1 << i))
+						&& (prepared.source_index[i] == UINT32_MAX
+							|| prepared.source_index[i] == through)
+						&& space_disk_matches(rel, i, target->before[i].data))
+						completed |= 1 << i;
+				}
+				if (completed != 0) {
+					smgrimmedsync(rel, SPACE_FORKNUM);
+					if (!space_sources_fresh(batch))
+						goto done;
+					for (int i = 0; i < 2; i++)
+						if ((completed & (1 << i))
+							&& !space_disk_matches(rel, i, target->before[i].data))
+							goto done;
+				} else {
+					xl_smgr_truncate truncate
+						= { change.identity.nblocks, target->key.locator, SMGR_TRUNCATE_ALL };
+
+					/* A failed first SPACE write can leave exact result bytes
+					 * only in cache. Repeating that same shrink is safe, but a
+					 * later allocation always requires physical coverage. */
+					if (later)
+						goto done;
+					batch->active_step = through;
+					if (!smgr_redo_cold_truncate(&truncate, batch) || !space_sources_fresh(batch))
+						goto done;
+					batch->active_step = UINT32_MAX;
+				}
+			}
+		}
 		if (!exists)
 			smgrcreate(rel, SPACE_FORKNUM, true);
 		for (BlockNumber i = blocks; i < 2; i++) {
@@ -606,7 +655,7 @@ space_recovery_preflight(const ClusterThreadRecoveryFabricPlanV1 *plan,
 				if (!op.history_only && op.kind == RF_SIDE_ONLINE_OPERATION_SPACE
 					&& (op.identity.record.info & ~XLR_INFO_MASK) == XLOG_SMGR_SPACE_IDENTITY
 					&& RelFileLocatorEquals(op.space_key.locator, target->key.locator))
-					target->has_create = true;
+					target->has_create = target->has_structure = true;
 			}
 			if (!space_target_run(batch, i, false, UINT32_MAX))
 				goto done;
@@ -732,18 +781,23 @@ cluster_space_recovery_cold_relation_install_v1(const ClusterSpaceIdentityKey *k
 			if (inputs[i].length == CLUSTER_SPACE_STRUCTURE_WAL_BYTES) {
 				ClusterSpaceStructureChange structure;
 
-				/* Structural shrink/drop still require their original physical
-				 * owner. Do not open the readiness handshake for this subset. */
 				if (!cluster_space_structure_wal_decode(inputs[i].data, inputs[i].length,
-														&structure)
-					|| structure.identity.action != CLUSTER_SPACE_WAL_CREATE)
+														&structure))
 					goto done;
-				batch->targets[0].has_create = true;
+				batch->targets[0].has_structure = true;
+				batch->targets[0].has_create
+					|= structure.identity.action == CLUSTER_SPACE_WAL_CREATE;
 			}
 		}
 		if (!space_target_run(batch, 0, false, UINT32_MAX) || !space_sources_fresh(batch))
 			goto done;
 		batch->preflight_complete = true;
+		/* Each structural result follows its own physical action; a caller
+		 * asking for a later prefix may not skip intermediate structures. */
+		for (uint32 i = 0; i < through; i++)
+			if (inputs[i].length == CLUSTER_SPACE_STRUCTURE_WAL_BYTES
+				&& !space_target_run(batch, 0, true, i))
+				goto done;
 		ok = space_target_run(batch, 0, true, through);
 	done:;
 	}
@@ -816,8 +870,43 @@ cluster_space_recovery_flush_permitted_v1(const ClusterSpaceRecoveryBatchV1 *bat
 	return RelFileLocatorEquals(locator, batch->active->key.locator) && fork == SPACE_FORKNUM
 		   && block < 2 && buffer == batch->buffers[block]
 		   && batch->active->final.source_index[block] != UINT32_MAX
-		   && (block == CLUSTER_SPACE_RESERVATION_BLOCK || batch->active->has_create)
+		   && (block == CLUSTER_SPACE_RESERVATION_BLOCK || batch->active->has_structure)
 		   && memcmp(BufferGetPage(buffer), batch->active->final.pages[block].data, BLCKSZ) == 0;
+}
+
+bool
+cluster_space_recovery_truncate_permitted_v1(const ClusterSpaceRecoveryBatchV1 *batch,
+											 const xl_smgr_truncate *truncate)
+{
+	ClusterSpaceStructureChange change;
+
+	if (batch == NULL || truncate == NULL || batch->cold_inputs == NULL
+		|| !batch->preflight_complete || batch->active == NULL
+		|| batch->active_step >= batch->operation_count || !space_sources_fresh(batch)
+		|| !cluster_space_structure_wal_decode(batch->cold_inputs[batch->active_step].data,
+											   batch->cold_inputs[batch->active_step].length,
+											   &change)
+		|| change.identity.action != CLUSTER_SPACE_WAL_TRUNCATE
+		|| !RelFileLocatorEquals(truncate->rlocator, batch->active->key.locator)
+		|| truncate->flags != SMGR_TRUNCATE_ALL || truncate->blkno != change.identity.nblocks)
+		return false;
+	for (int i = 0; i < 2; i++) {
+		Buffer buffer = batch->buffers[i];
+		RelFileLocator locator;
+		ForkNumber fork;
+		BlockNumber block;
+
+		if (!BufferIsValid(buffer) || BufferIsLocal(buffer)
+			|| !LWLockHeldByMeInMode(
+				BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)), LW_EXCLUSIVE)
+			|| memcmp(BufferGetPage(buffer), batch->active->before[i].data, BLCKSZ) != 0)
+			return false;
+		BufferGetTag(buffer, &locator, &fork, &block);
+		if (!RelFileLocatorEquals(locator, truncate->rlocator) || fork != SPACE_FORKNUM
+			|| block != i)
+			return false;
+	}
+	return true;
 }
 
 Size

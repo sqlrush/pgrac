@@ -28,6 +28,7 @@
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_xnode_profile.h"
@@ -96,6 +97,8 @@ static bool truncate_owner, drop_owner, deleted_all, expecting_error;
 static unsigned relation_flushes, fork_syncs, invalidations, random_calls;
 static unsigned shrink_syncs;
 static int fail_shrink_sync = -1;
+static bool cold_truncate_fixture, cold_truncate_permitted, cold_vm_clear, cold_vm_stale;
+static const ClusterSpaceRecoveryBatchV1 *cold_batch = (const ClusterSpaceRecoveryBatchV1 *)42;
 static PGPROC proc;
 PGPROC *MyProc = &proc;
 XLogRecPtr XactLastRecEnd;
@@ -251,7 +254,7 @@ smgrexists(SMgrRelation rel, ForkNumber forknum)
 		return false;
 	if ((recovering || truncate_owner) && (forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM))
 		return auxiliary_forks;
-	if (truncate_owner && forknum == MAIN_FORKNUM)
+	if ((truncate_owner || recovering) && forknum == MAIN_FORKNUM)
 		return true;
 	if (forknum != SPACE_FORKNUM)
 		abort();
@@ -365,6 +368,27 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber count)
 		abort();
 	return 1;
 }
+bool
+visibilitymap_prepare_cold_truncate(Relation rel, BlockNumber count, BlockNumber *out)
+{
+	UT_ASSERT(cold_truncate_fixture && rel == fake_relation && count == 4);
+	UT_ASSERT_EQ(truncate_calls, 0);
+	if (cold_vm_stale)
+		cold_truncate_permitted = false;
+	if (!cold_vm_clear)
+		return false;
+	*out = auxiliary_forks ? 1 : InvalidBlockNumber;
+	return true;
+}
+bool
+cluster_space_recovery_truncate_permitted_v1(const ClusterSpaceRecoveryBatchV1 *batch,
+											 const xl_smgr_truncate *truncate)
+{
+	return cold_truncate_fixture && cold_truncate_permitted && batch == cold_batch && recovering
+		   && locked == 3 && pinned == 3 && truncate != NULL
+		   && RelFileLocatorEquals(truncate->rlocator, locator)
+		   && truncate->flags == SMGR_TRUNCATE_ALL && truncate->blkno == 4;
+}
 void
 FreeSpaceMapVacuumRange(Relation rel, BlockNumber start, BlockNumber end)
 {
@@ -379,9 +403,11 @@ smgrtruncate2(SMgrRelation rel, ForkNumber *forks, int nforks, BlockNumber *oldb
 			  BlockNumber *newblocks)
 {
 	if (rel != &storage || nforks != (auxiliary_forks ? 3 : 1) || forks[0] != MAIN_FORKNUM
-		|| (!truncate_owner && (locked != 3 || pinned != 3))
-		|| CritSectionCount == 0 || flush_calls != truncate_calls + 1
-		|| oldblocks[0] != main_blocks || newblocks[0] != 4)
+		|| (!truncate_owner && (locked != 3 || pinned != 3)) || CritSectionCount == 0
+		|| flush_calls != (cold_truncate_fixture ? 0 : truncate_calls + 1)
+		|| oldblocks[0] != main_blocks
+		|| newblocks[0]
+			   != (recovering && cluster_shared_config && shared ? Min(main_blocks, 4) : 4))
 		abort();
 	if (auxiliary_forks
 		&& (forks[1] != FSM_FORKNUM || forks[2] != VISIBILITYMAP_FORKNUM || oldblocks[1] != 8
@@ -708,7 +734,16 @@ FlushRelationBuffers(Relation rel)
 void
 smgrimmedsync(SMgrRelation rel, ForkNumber fork)
 {
-	UT_ASSERT(truncate_owner && rel == &storage);
+	UT_ASSERT((truncate_owner || recovering) && rel == &storage);
+	if (recovering && !truncate_owner) {
+		UT_ASSERT_EQ(CritSectionCount, 1);
+		UT_ASSERT_EQ(locked, 3);
+		UT_ASSERT_EQ(fork, (ForkNumber)(shrink_syncs % (auxiliary_forks ? 3 : 1)));
+		UT_ASSERT_EQ(flush_calls, cold_truncate_fixture ? 0 : truncate_calls);
+		shrink_syncs++;
+		fork_syncs++;
+		return;
+	}
 	UT_ASSERT_EQ(relation_flushes, 1);
 	if (truncate_calls != 0) {
 		UT_ASSERT_EQ(locked, 3);
@@ -751,6 +786,8 @@ reset(void)
 	relation_flushes = fork_syncs = invalidations = random_calls = 0;
 	shrink_syncs = 0;
 	fail_shrink_sync = -1;
+	cold_truncate_fixture = cold_vm_stale = false;
+	cold_truncate_permitted = cold_vm_clear = true;
 	native_commits = commit_decisions = 0;
 	plain_commit_emitter = false;
 	commit_len = 0;
@@ -1672,6 +1709,69 @@ UT_TEST(test_native_truncate_without_shared_space_keeps_original_sync_policy)
 	}
 }
 
+UT_TEST(test_cold_physical_truncate_uses_original_forks_without_local_wal_flush)
+{
+	for (int aux = 0; aux < 2; aux++) {
+		xl_smgr_truncate truncate = { 4, locator, SMGR_TRUNCATE_ALL };
+
+		reset();
+		recovering = cold_truncate_fixture = true;
+		auxiliary_forks = aux;
+		pinned = locked = 3;
+		UT_ASSERT(smgr_redo_cold_truncate(&truncate, cold_batch));
+		UT_ASSERT_EQ(truncate_calls, 1);
+		UT_ASSERT_EQ(main_blocks, 4);
+		UT_ASSERT_EQ(shrink_syncs, aux ? 3 : 1);
+		UT_ASSERT_EQ(flush_calls + main_create_calls + dirty_calls, 0);
+		UT_ASSERT_EQ(fake_allocations, fake_frees);
+		UT_ASSERT(fake_relation == NULL);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+	}
+}
+
+UT_TEST(test_cold_physical_truncate_refuses_owner_and_vm_before_shrink)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		xl_smgr_truncate truncate = { 4, locator, SMGR_TRUNCATE_ALL };
+
+		reset();
+		recovering = cold_truncate_fixture = auxiliary_forks = true;
+		pinned = locked = 3;
+		if (variant == 0)
+			cold_truncate_permitted = false;
+		if (variant == 1)
+			cold_vm_clear = false;
+		if (variant == 2)
+			cold_vm_stale = true;
+		if (variant == 3)
+			truncate.flags = SMGR_TRUNCATE_HEAP;
+		UT_ASSERT(!smgr_redo_cold_truncate(&truncate, cold_batch));
+		UT_ASSERT_EQ(truncate_calls + shrink_syncs + flush_calls + main_create_calls + dirty_calls,
+					 0);
+		UT_ASSERT_EQ(main_blocks, 10);
+		UT_ASSERT_EQ(fake_allocations, fake_frees);
+		UT_ASSERT(fake_relation == NULL);
+	}
+}
+
+UT_TEST(test_cold_physical_truncate_never_grows_a_short_or_retained_main)
+{
+	for (BlockNumber prior = 0; prior <= 2; prior++) {
+		xl_smgr_truncate truncate = { 4, locator, SMGR_TRUNCATE_ALL };
+
+		reset();
+		recovering = cold_truncate_fixture = true;
+		pinned = locked = 3;
+		main_blocks = prior;
+		UT_ASSERT(smgr_redo_cold_truncate(&truncate, cold_batch));
+		UT_ASSERT_EQ(main_blocks, prior);
+		UT_ASSERT_EQ(truncate_calls, 1);
+		UT_ASSERT_EQ(shrink_syncs, 1);
+		UT_ASSERT_EQ(flush_calls + main_create_calls, 0);
+		UT_ASSERT_EQ(fake_allocations, fake_frees);
+	}
+}
+
 static void
 emit_drop_commit(ClusterSpaceDropState *state, const RelFileLocator *deletes, int count)
 {
@@ -2061,7 +2161,10 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(40);
+	UT_PLAN(43);
+	UT_RUN(test_cold_physical_truncate_never_grows_a_short_or_retained_main);
+	UT_RUN(test_cold_physical_truncate_uses_original_forks_without_local_wal_flush);
+	UT_RUN(test_cold_physical_truncate_refuses_owner_and_vm_before_shrink);
 	UT_RUN(test_real_create_binds_selected_namespace_and_wal);
 	UT_RUN(test_no_create_on_legacy_or_unproved_namespace);
 	UT_RUN(test_existing_identity_is_never_recreated);

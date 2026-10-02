@@ -62,6 +62,7 @@ static bool begun;
 static RfPageVersionEdgeEntryV1 wal_edge;
 static PGAlignedBlock wal_image;
 static ReadBufferMode read_mode;
+static int last_lock_mode;
 static jmp_buf error_jump;
 
 /* The original native VM routine calls these through its normal interfaces. */
@@ -244,9 +245,10 @@ LockBuffer(Buffer buffer, int mode)
 {
 	if (buffer != 1 || pins != 1)
 		abort();
-	if (mode == BUFFER_LOCK_EXCLUSIVE)
+	if (mode == BUFFER_LOCK_EXCLUSIVE || mode == BUFFER_LOCK_SHARE) {
+		last_lock_mode = mode;
 		locks++;
-	else if (mode == BUFFER_LOCK_UNLOCK)
+	} else if (mode == BUFFER_LOCK_UNLOCK)
 		unlocks++;
 	else
 		abort();
@@ -400,6 +402,7 @@ reset(bool shared)
 	identity_ok = true;
 	expecting_error = release_on_lock = installed_remote = InRecovery = false;
 	corrupt_extension_fallback = false;
+	last_lock_mode = BUFFER_LOCK_UNLOCK;
 }
 
 UT_TEST(test_shared_read_observes_zero_without_initialization)
@@ -678,10 +681,89 @@ UT_TEST(test_legacy_extension_keeps_native_zero_on_error)
 	ReleaseBuffer(buffer);
 }
 
+UT_TEST(test_cold_truncate_reads_clear_tail_without_mutation)
+{
+	const BlockNumber limits[] = { 1, 4, 10, HEAPBLOCKS_PER_PAGE - 1 };
+	for (int zero = 0; zero < 2; zero++)
+		for (int i = 0; i < lengthof(limits); i++) {
+			BlockNumber size = 99, n = limits[i];
+			PGAlignedBlock before;
+
+			reset(true);
+			InRecovery = true;
+			if (!zero) {
+				PageInit(vm.data, BLCKSZ, 0);
+				memset(PageGetContents(vm.data), 0xff, HEAPBLK_TO_MAPBYTE(n));
+				PageGetContents(vm.data)[HEAPBLK_TO_MAPBYTE(n)] = (1 << HEAPBLK_TO_OFFSET(n)) - 1;
+				((PageHeader)vm.data)->pd_block_scn = 55;
+			}
+			before = vm;
+			UT_ASSERT(visibilitymap_prepare_cold_truncate(&relation, n, &size));
+			UT_ASSERT_EQ(size, 1);
+			UT_ASSERT_EQ(reads, 1);
+			UT_ASSERT_EQ(read_mode, RBM_NORMAL);
+			UT_ASSERT_EQ(last_lock_mode, BUFFER_LOCK_SHARE);
+			UT_ASSERT_EQ(pins, 0);
+			UT_ASSERT_EQ(locks, unlocks);
+			UT_ASSERT_EQ(init_calls + dirty + prepared + wal_records + identities, 0);
+			UT_ASSERT(memcmp(before.data, vm.data, BLCKSZ) == 0);
+		}
+}
+
+UT_TEST(test_cold_truncate_rejects_nonclear_tail_and_wrong_mode)
+{
+	for (int variant = 0; variant < 6; variant++) {
+		BlockNumber size = 99;
+		PGAlignedBlock before;
+
+		reset(true);
+		InRecovery = true;
+		PageInit(vm.data, BLCKSZ, 0);
+		if (variant == 0)
+			PageGetContents(vm.data)[2] = 0x10;
+		if (variant == 1)
+			PageGetContents(vm.data)[MAPSIZE - 1] = 1;
+		if (variant == 2)
+			cluster_shared_config = false;
+		if (variant == 3)
+			InRecovery = false;
+		if (variant == 4)
+			relform.relpersistence = RELPERSISTENCE_TEMP;
+		if (variant == 5) {
+			memset(vm.data, 0, BLCKSZ);
+			vm.data[BLCKSZ - 1] = 1; /* A new header is not proof of all-zero bytes. */
+		}
+		before = vm;
+		UT_ASSERT(!visibilitymap_prepare_cold_truncate(&relation, 10, &size));
+		UT_ASSERT_EQ(size, 99);
+		UT_ASSERT_EQ(init_calls + dirty + prepared + wal_records + identities, 0);
+		UT_ASSERT_EQ(pins, 0);
+		UT_ASSERT_EQ(locks, unlocks);
+		UT_ASSERT(memcmp(before.data, vm.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_cold_truncate_page_boundary_and_short_fork_need_no_read)
+{
+	const BlockNumber limits[] = { 0, HEAPBLOCKS_PER_PAGE, 2 * HEAPBLOCKS_PER_PAGE + 10 };
+	for (int i = 0; i < lengthof(limits); i++) {
+		BlockNumber size = 99;
+
+		reset(true);
+		InRecovery = true;
+		UT_ASSERT(visibilitymap_prepare_cold_truncate(&relation, limits[i], &size));
+		UT_ASSERT_EQ(size, i == 2 ? InvalidBlockNumber : (BlockNumber)i);
+		UT_ASSERT_EQ(reads + pins + locks + init_calls + dirty, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(17);
+	UT_RUN(test_cold_truncate_reads_clear_tail_without_mutation);
+	UT_RUN(test_cold_truncate_rejects_nonclear_tail_and_wrong_mode);
+	UT_RUN(test_cold_truncate_page_boundary_and_short_fork_need_no_read);
 	UT_RUN(test_shared_read_observes_zero_without_initialization);
 	UT_RUN(test_write_pin_reinitializes_read_only_zero_with_version);
 	UT_RUN(test_recent_pin_refuses_unformatted_without_leaking_pin);
