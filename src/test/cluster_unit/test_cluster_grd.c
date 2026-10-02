@@ -2597,6 +2597,8 @@ UT_TEST(test_grd_shard_phase_accessors)
  */
 UT_TEST(test_grd_redeclare_unacknowledged_buffer_does_not_advance_cursor)
 {
+	ClusterGrdRecoveryCounters before, after;
+	cluster_grd_recovery_counters_snapshot(&before);
 	fake_scan_nbuffers = 1;
 	fake_scan_pending = true;
 	grd_block_redeclare_step(1234);
@@ -2604,6 +2606,8 @@ UT_TEST(test_grd_redeclare_unacknowledged_buffer_does_not_advance_cursor)
 	grd_block_redeclare_step(1234);
 	UT_ASSERT_EQ(cluster_grd_recovery_block_redeclare_cursor(), 0);
 	UT_ASSERT(!grd_block_redeclare_scan_complete(1234));
+	cluster_grd_recovery_counters_snapshot(&after);
+	UT_ASSERT_EQ(after.block_redeclare_retries, before.block_redeclare_retries + 2);
 	fake_scan_pending = false;
 	grd_block_redeclare_step(1234);
 	grd_block_redeclare_step(1234);
@@ -2636,6 +2640,11 @@ UT_TEST(test_grd_d2_redeclare_scan_completion_gate)
 
 UT_TEST(test_grd_redeclare_waits_for_detached_logical_pi_ack)
 {
+	ClusterGrdRecoveryCounters before, after;
+	bool found;
+	ClusterGrdShared *shared;
+
+	cluster_grd_recovery_counters_snapshot(&before);
 	/* No buffer remains, but its old source still owns a logical PI. */
 	cluster_shared_config = true;
 	fake_scan_nbuffers = 0;
@@ -2649,6 +2658,8 @@ UT_TEST(test_grd_redeclare_waits_for_detached_logical_pi_ack)
 	grd_block_redeclare_step(12345);
 	UT_ASSERT(!grd_block_redeclare_scan_complete(12345));
 	UT_ASSERT_EQ(fake_pi_scan_start, 0);
+	cluster_grd_recovery_counters_snapshot(&after);
+	UT_ASSERT_EQ(after.local_pi_redeclare_retries, before.local_pi_redeclare_retries + 2);
 	fake_pi_scan_pending = false;
 	grd_block_redeclare_step(12345);
 	UT_ASSERT(!grd_block_redeclare_scan_complete(12345));
@@ -2656,6 +2667,20 @@ UT_TEST(test_grd_redeclare_waits_for_detached_logical_pi_ack)
 	UT_ASSERT_EQ(fake_pi_scan_start, 256);
 	UT_ASSERT(!grd_block_redeclare_scan_complete(12345));
 	grd_block_redeclare_step(12345);
+	UT_ASSERT(grd_block_redeclare_scan_complete(12345));
+	cluster_grd_recovery_counters_snapshot(&after);
+	UT_ASSERT_EQ(after.local_pi_redeclare_cursor, 257);
+	UT_ASSERT_EQ(after.local_pi_redeclare_retries, before.local_pi_redeclare_retries + 2);
+	/* A SQL backend reads shared observations, not its own unused LMON
+	 * process-local cursors. The authority completion check stays private. */
+	shared = ShmemInitStruct("pgrac cluster grd", sizeof(*shared), &found);
+	UT_ASSERT(found);
+	pg_atomic_write_u32(&shared->block_redeclare_cursor, 19);
+	pg_atomic_write_u64(&shared->block_redeclare_epoch, 12);
+	pg_atomic_write_u32(&shared->block_redeclare_done, 0);
+	UT_ASSERT_EQ(cluster_grd_recovery_block_redeclare_cursor(), 19);
+	UT_ASSERT_EQ(cluster_grd_recovery_block_redeclare_epoch(), 12);
+	UT_ASSERT(!cluster_grd_recovery_block_redeclare_done());
 	UT_ASSERT(grd_block_redeclare_scan_complete(12345));
 	/* A new episode must acknowledge the detached obligations again. */
 	fake_pi_scan_pending = true;

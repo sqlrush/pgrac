@@ -1398,6 +1398,12 @@ dump_grd_recovery(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_grd_recovery_done_bitmap_hash_for(cluster_node_id)));
 	emit_row(rsinfo, "grd_recovery", "block_redeclare_cursor",
 			 fmt_int32((int32)cluster_grd_recovery_block_redeclare_cursor()));
+	emit_row(rsinfo, "grd_recovery", "local_pi_redeclare_cursor",
+			 fmt_int32((int32)c.local_pi_redeclare_cursor));
+	emit_row(rsinfo, "grd_recovery", "block_redeclare_retries",
+			 fmt_int64((int64)c.block_redeclare_retries));
+	emit_row(rsinfo, "grd_recovery", "local_pi_redeclare_retries",
+			 fmt_int64((int64)c.local_pi_redeclare_retries));
 	emit_row(rsinfo, "grd_recovery", "block_redeclare_epoch",
 			 fmt_int64((int64)cluster_grd_recovery_block_redeclare_epoch()));
 	emit_row(rsinfo, "grd_recovery", "block_redeclare_done",
