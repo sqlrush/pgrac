@@ -18,10 +18,17 @@
 
 #include "cluster/cluster_thread_recovery_fabric.h"
 #include "cluster/cluster_thread_recovery_authority.h"
+#include "cluster/cluster_space_storage.h"
 #include "storage/buf.h"
 
 typedef struct ClusterSpaceRecoveryBatchV1 ClusterSpaceRecoveryBatchV1;
 struct ClusterRecoveryFencePlan;
+
+/* Native implementation of the storage owner's fixed cold entry. */
+extern bool cluster_space_recovery_cold_relation_install_v1(const ClusterSpaceIdentityKey *key,
+															const ClusterSpaceRecoveryInput *inputs,
+															const ClusterSpaceColdSourceV1 *sources,
+															uint32 count, uint32 through);
 
 extern bool cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
 												const ClusterThreadRecoveryAuthorityV1 *sources,

@@ -22,6 +22,7 @@
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_hw.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_mode.h"
@@ -70,6 +71,7 @@ static ClusterThreadRecoveryAuthorityV1 sources[2];
 static ClusterRecoverySerialGuard serials[2];
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 static bool recovery = true, cold_current = true;
+static bool cold_window = true, merge_claim = true;
 static uint16 cold_origins = 2;
 static ClusterRecoveryFencePlan *cold_fence = (void *)7;
 static ClusterSpaceIdentityKey key;
@@ -163,10 +165,58 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 	UT_ASSERT(CurrentResourceOwner == source_owner);
 	UT_ASSERT(!pins && !locks && !hw_held);
 	for (int i = 0; i < 2; i++)
-		if (!source_unavailable && root == &roots[i] && token == &root_tokens[i]) {
+		if (!source_unavailable && memcmp(root, &roots[i], sizeof(*root)) == 0
+			&& memcmp(token, &root_tokens[i], sizeof(*token)) == 0) {
 			memset(out, 0, sizeof(*out));
+			out->claim.identity = duties[i];
 			out->claim.database_incarnation = source_database[i];
 			*redo = source_redo[i];
+			return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		}
+	return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+bool
+cluster_cold_replay_window_active_v1(void)
+{
+	return cold_window;
+}
+
+bool
+cluster_recovery_merge_claim_is_held(void)
+{
+	return merge_claim;
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_borrow_cold_v1(ClusterWalRetentionPin **pin,
+										 ClusterRecoverySerialGuard **guards, uint16 capacity,
+										 uint16 *count)
+{
+	if (CurrentResourceOwner != source_owner || !cold_current || stale || capacity < cold_origins)
+		return CLUSTER_WAL_PIN_STALE;
+	for (uint16 i = 0; i < cold_origins; i++)
+		if (!serials[i].held || serials[i].mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED)
+			return CLUSTER_WAL_PIN_STALE;
+	for (uint16 i = 0; i < cold_origins; i++)
+		guards[i] = &serials[i];
+	*pin = (void *)3;
+	*count = cold_origins;
+	return CLUSTER_WAL_PIN_OK;
+}
+
+ClusterControlRootResult
+cluster_control_root_read_canonical(uint16 tid, const ClusterRecoveryDutyKey *duty,
+									ClusterControlRootReadMode mode,
+									ClusterControlRootSnapshot *root,
+									ClusterControlRootReadToken *token)
+{
+	UT_ASSERT(CurrentResourceOwner == source_owner && !pins && !locks && !hw_held);
+	UT_ASSERT_EQ(mode, CLUSTER_CONTROL_ROOT_READ_STRONG);
+	for (uint16 i = 0; i < 2; i++)
+		if (tid == duties[i].origin_thread_id && memcmp(duty, &duties[i], sizeof(*duty)) == 0) {
+			*root = roots[i];
+			*token = root_tokens[i];
 			return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 		}
 	return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
@@ -270,12 +320,18 @@ cluster_thread_recovery_authority_revalidate_nowait_v1(const ClusterThreadRecove
 {
 	if (locks == 3)
 		fault(6);
-	return CurrentResourceOwner == source_owner && !stale
-				   && memcmp(&a->root_snapshot->identity, a->duty, sizeof(*a->duty)) == 0
-				   && (memcmp(a, &sources[0], sizeof(*a)) == 0
-					   || memcmp(a, &sources[1], sizeof(*a)) == 0)
-			   ? CLUSTER_THREAD_AUTHORITY_OK
-			   : CLUSTER_THREAD_AUTHORITY_ROOT_STALE;
+	for (uint16 i = 0; i < 2; i++)
+		if (CurrentResourceOwner == source_owner && !stale
+			&& memcmp(&a->root_snapshot->identity, a->duty, sizeof(*a->duty)) == 0
+			&& a->serial_guard == sources[i].serial_guard
+			&& a->retention_pin == sources[i].retention_pin && a->formation == sources[i].formation
+			&& a->fence_need_set == sources[i].fence_need_set
+			&& a->fence_admission_set == sources[i].fence_admission_set
+			&& memcmp(a->duty, &duties[i], sizeof(*a->duty)) == 0
+			&& memcmp(a->root_snapshot, &roots[i], sizeof(*a->root_snapshot)) == 0
+			&& memcmp(a->root_token, &root_tokens[i], sizeof(*a->root_token)) == 0)
+			return CLUSTER_THREAD_AUTHORITY_OK;
+	return CLUSTER_THREAD_AUTHORITY_ROOT_STALE;
 }
 bool
 cluster_thread_recovery_authority_covers_window_v1(const ClusterThreadRecoveryAuthorityV1 *a,
@@ -661,6 +717,7 @@ reset(void)
 {
 	MyAuxProcType = NotAnAuxProcess;
 	recovery = cold_current = true;
+	cold_window = merge_claim = true;
 	cold_origins = 2;
 	source_unavailable = false;
 	memset(serials, 0, sizeof(serials));
@@ -675,7 +732,7 @@ reset(void)
 		abort();
 	pins = locks = writes = syncs = reads = lock_calls = 0;
 	wal_flushes = io_aborts = 0;
-	sf_blocked = stale_during_io = false;
+	sf_blocked = stale_during_io = stale_after_write = false;
 	InterruptHoldoffCount = 0;
 	cluster_smart_fusion = false;
 	hw_held = stale = corrupt_disk = structural = wrong_cut = false;
@@ -690,6 +747,7 @@ reset(void)
 	memset(operations, 0, sizeof(operations));
 	memset(duties, 0, sizeof(duties));
 	memset(roots, 0, sizeof(roots));
+	memset(root_tokens, 0, sizeof(root_tokens));
 	memset(sources, 0, sizeof(sources));
 	memset(cuts, 0, sizeof(cuts));
 	changes[0].action = CLUSTER_SPACE_RESERVATION_ADVANCE;
@@ -749,6 +807,8 @@ reset(void)
 		sources[i].retention_pin = (void *)3;
 		serials[i].held = true;
 		serials[i].mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		serials[i].duty = duties[i];
+		serials[i].root_read_token = root_tokens[i];
 		sources[i].serial_guard = &serials[i];
 		cuts[i] = (RfContributorStreamCutV1){ .failed_thread = i + 2,
 											  .origin_owner_incarnation = 19,
@@ -1639,10 +1699,210 @@ UT_TEST(test_successor_sync_still_rechecks_unchanged_identity)
 	cluster_space_recovery_destroy_v1(&batch);
 }
 
+static void
+compact_inputs(ClusterSpaceRecoveryInput inputs[2], ClusterSpaceColdSourceV1 origin[2])
+{
+	for (uint32 i = 0; i < 2; i++) {
+		RfSideOnlineOperationV1 operation;
+		UT_ASSERT(rf_side_online_plan_operation_v1(side, i, &operation));
+		inputs[i] = (ClusterSpaceRecoveryInput){ operation.owned_payload,
+												 operation.owned_payload_length };
+		origin[i] = (ClusterSpaceColdSourceV1){ duties[i].origin_thread_id,
+												operation.identity.record.end_rec_ptr };
+	}
+}
+
+UT_TEST(test_compact_cold_create_and_advance_use_original_sources)
+{
+	for (int founder = 0; founder < 2; founder++) {
+		ClusterSpaceRecoveryInput inputs[2];
+		ClusterSpaceColdSourceV1 origin[2];
+		ClusterSpaceReservation observed = { 0 };
+		uint64 token;
+		int page_origin = -1;
+		bool installed;
+
+		create_input(0);
+		MyAuxProcType = StartupProcess;
+		/* This owner fixture explicitly includes the founder. A bare node
+		 * number or restart ref may not fabricate it in production. */
+		if (founder) {
+			duties[0].origin_thread_id = 1;
+			roots[0].identity = serials[0].duty = duties[0];
+		}
+		compact_inputs(inputs, origin);
+		installed = cluster_space_cold_install_v1(&key, inputs, origin, 2, 0);
+		UT_ASSERT(installed);
+		if (!installed)
+			continue;
+		UT_ASSERT_EQ(creates, 1);
+		UT_ASSERT_EQ(extensions, 2);
+		UT_ASSERT(PageGetLSNOrigin(pages[0].data, &page_origin));
+		UT_ASSERT_EQ(page_origin, origin[0].origin_thread - 1);
+		UT_ASSERT(PageGetLSNOrigin(pages[1].data, &page_origin));
+		UT_ASSERT_EQ(page_origin, origin[0].origin_thread - 1);
+		UT_ASSERT(cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1,
+														&key, &observed, &token));
+		UT_ASSERT_EQ(observed.next_block, 0);
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 1));
+		UT_ASSERT(cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1,
+														&key, &observed, &token));
+		UT_ASSERT_EQ(observed.next_block, 4);
+		UT_ASSERT(PageGetLSNOrigin(pages[1].data, &page_origin));
+		UT_ASSERT_EQ(page_origin, origin[1].origin_thread - 1);
+		UT_ASSERT_EQ(lock_calls, 0);
+		UT_ASSERT_EQ(wal_flushes, 0);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_compact_cold_rejects_missing_owner_and_source_drift_before_io)
+{
+	for (int variant = 0; variant < 8; variant++) {
+		ClusterSpaceRecoveryInput inputs[2];
+		ClusterSpaceColdSourceV1 origin[2];
+		PGAlignedBlock saved[2];
+
+		create_input(0);
+		MyAuxProcType = StartupProcess;
+		compact_inputs(inputs, origin);
+		memcpy(saved, pages, sizeof(saved));
+		if (variant == 0)
+			origin[0].origin_thread = 1; /* Missing founder. */
+		if (variant == 1)
+			origin[1].end_rec_ptr = native_redo[1]; /* history only */
+		if (variant == 2)
+			origin[1].end_rec_ptr++;
+		if (variant == 3)
+			source_database[1]++;
+		if (variant == 4)
+			source_unavailable = true;
+		if (variant == 5)
+			cold_window = false;
+		if (variant == 6)
+			merge_claim = false;
+		if (variant == 7)
+			serials[1].root_read_token.record_crc32c++;
+		UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0));
+		UT_ASSERT_EQ(writes + creates + extensions + syncs + reads, 0);
+		UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_compact_cold_preflights_suffix_and_preserves_canonical_order)
+{
+	ClusterSpaceRecoveryInput inputs[2];
+	ClusterSpaceColdSourceV1 origin[2];
+	ClusterSpaceRecoveryInput swap;
+
+	create_input(0);
+	MyAuxProcType = StartupProcess;
+	compact_inputs(inputs, origin);
+	swap = inputs[0];
+	inputs[0] = inputs[1];
+	inputs[1] = swap;
+	UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0));
+	UT_ASSERT_EQ(writes + creates + extensions + syncs, 0);
+	compact_inputs(inputs, origin);
+	inputs[1].length--;
+	UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0));
+	UT_ASSERT_EQ(writes + creates + extensions + syncs, 0);
+}
+
+UT_TEST(test_compact_cold_history_successor_requires_physical_proof)
+{
+	for (int durable = 0; durable < 2; durable++) {
+		ClusterSpaceRecoveryInput inputs[2];
+		ClusterSpaceColdSourceV1 origin[2];
+		PGAlignedBlock before;
+
+		create_input(4);
+		MyAuxProcType = StartupProcess;
+		changes[1].before.next_block = changes[1].first_block = 9;
+		changes[1].result.next_block = 13;
+		changes[1].before_token = 7;
+		UT_ASSERT(
+			cluster_space_reservation_wal_encode(&changes[1], payload[1], sizeof(payload[1])));
+		make_plan();
+		survivor_advance(9, 7, durable);
+		before = pages[1];
+		compact_inputs(inputs, origin);
+		UT_ASSERT_EQ(cluster_space_cold_install_v1(&key, inputs, origin, 2, 0), durable);
+		UT_ASSERT(memcmp(before.data, pages[1].data, BLCKSZ) == 0);
+		if (!durable)
+			UT_ASSERT_EQ(writes + syncs + creates + extensions, 0);
+		else
+			UT_ASSERT(syncs >= 2);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+	}
+}
+
+UT_TEST(test_compact_cold_failed_io_keeps_original_owner_and_retryable_prefix)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		ClusterSpaceRecoveryInput inputs[2];
+		ClusterSpaceColdSourceV1 origin[2];
+		volatile bool caught = false;
+
+		create_input(0);
+		MyAuxProcType = StartupProcess;
+		compact_inputs(inputs, origin);
+		if (variant == 0)
+			fail_write_block = 1;
+		if (variant == 1)
+			stale_after_write = true;
+		if (variant == 2)
+			throw_at = 3;
+		PG_TRY();
+		{
+			UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0));
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		/* Native read/write errors throw; a stale source refuses without ERROR. */
+		UT_ASSERT_EQ(caught, variant != 1);
+		UT_ASSERT(!pins && !locks && CurrentResourceOwner == source_owner);
+		UT_ASSERT(serials[0].held && serials[1].held);
+		fail_write_block = -1;
+		stale_after_write = stale = false;
+		throw_at = 0;
+		UT_ASSERT(cluster_space_cold_install_v1(&key, inputs, origin, 2, 0));
+		UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 100);
+		UT_ASSERT_EQ(wal_flushes, 0);
+	}
+}
+
+UT_TEST(test_compact_cold_structure_stays_closed_until_physical_owner_is_wired)
+{
+	ClusterSpaceRecoveryInput inputs[2];
+	ClusterSpaceColdSourceV1 origin[2];
+	PGAlignedBlock before[2];
+
+	reset();
+	MyAuxProcType = StartupProcess;
+	structural = true;
+	make_plan();
+	compact_inputs(inputs, origin);
+	memcpy(before, pages, sizeof(before));
+	UT_ASSERT(!cluster_space_cold_install_v1(&key, inputs, origin, 2, 0));
+	UT_ASSERT_EQ(writes + creates + extensions + syncs + reads, 0);
+	UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(33);
+	UT_RUN(test_compact_cold_history_successor_requires_physical_proof);
+	UT_RUN(test_compact_cold_failed_io_keeps_original_owner_and_retryable_prefix);
+	UT_RUN(test_compact_cold_structure_stays_closed_until_physical_owner_is_wired);
+	UT_RUN(test_compact_cold_create_and_advance_use_original_sources);
+	UT_RUN(test_compact_cold_rejects_missing_owner_and_source_drift_before_io);
+	UT_RUN(test_compact_cold_preflights_suffix_and_preserves_canonical_order);
 	UT_RUN(test_successor_sync_still_rechecks_unchanged_identity);
 	UT_RUN(test_native_create_step_does_not_advance_or_complete_the_batch);
 	UT_RUN(test_native_prefix_preserves_later_reservation_but_installs_missing_identity);

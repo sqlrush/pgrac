@@ -17,6 +17,7 @@
 
 #include "access/xlog.h"
 #include "catalog/storage_xlog.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -30,6 +31,7 @@
 #include "storage/smgr.h"
 #include "storage/checksum.h"
 #include "utils/resowner.h"
+#include "utils/memutils.h"
 
 #ifdef USE_CLUSTER_UNIT
 #define space_alloc(size_) calloc(1, (size_))
@@ -51,6 +53,8 @@ struct ClusterSpaceRecoveryBatchV1 {
 	const ClusterThreadRecoveryFabricPlanV1 *fabric;
 	ClusterRecoveryFencePlan *cold_fence;
 	const RfSideOnlinePlanV1 *side;
+	const ClusterSpaceRecoveryInput *cold_inputs;
+	const ClusterSpaceColdSourceV1 *cold_origins;
 	const ClusterThreadRecoveryAuthorityV1 *sources;
 	uint32 source_count;
 	uint32 target_count;
@@ -68,12 +72,45 @@ struct ClusterSpaceRecoveryBatchV1 {
 	bool installed;
 };
 
+typedef struct SpaceColdAuthority {
+	ClusterControlRootSnapshot root;
+	ClusterControlRootReadToken token;
+	XLogRecPtr native_redo;
+} SpaceColdAuthority;
+
+static bool
+space_cold_phase(void)
+{
+	return cluster_enabled && cluster_shared_config && AmStartupProcess() && RecoveryInProgress()
+		   && cluster_cold_replay_window_active_v1() && cluster_recovery_merge_claim_is_held();
+}
+
+static bool
+space_batch_cold(const ClusterSpaceRecoveryBatchV1 *batch)
+{
+	return batch->cold_fence != NULL || batch->cold_inputs != NULL;
+}
+
 static bool
 space_sources_fresh_current_owner(const ClusterSpaceRecoveryBatchV1 *batch)
 {
 	if (batch == NULL || batch->source_count == 0)
 		return false;
-	if (batch->cold_fence != NULL) {
+	if (batch->cold_inputs != NULL) {
+		ClusterRecoverySerialGuard *guards[CLUSTER_WAL_RETENTION_MAX_THREADS];
+		ClusterWalRetentionPin *pin = NULL;
+		uint16 count = 0;
+
+		if (!space_cold_phase() || batch->fabric != NULL || batch->side != NULL
+			|| batch->cold_fence != NULL || batch->cold_origins == NULL
+			|| cluster_wal_retention_pin_borrow_cold_v1(&pin, guards, lengthof(guards), &count)
+				   != CLUSTER_WAL_PIN_OK
+			|| count != batch->source_count || pin != batch->sources[0].retention_pin)
+			return false;
+		for (uint16 i = 0; i < count; i++)
+			if (guards[i] != batch->sources[i].serial_guard)
+				return false;
+	} else if (batch->cold_fence != NULL) {
 		if (!AmStartupProcess() || !RecoveryInProgress() || batch->fabric != NULL
 			|| !cluster_recovery_merge_fence_plan_revalidate_nowait(batch->cold_fence)
 			|| batch->source_count
@@ -91,7 +128,7 @@ space_sources_fresh_current_owner(const ClusterSpaceRecoveryBatchV1 *batch)
 			|| a->duty == NULL || a->root_snapshot == NULL || a->retention_pin == NULL
 			|| a->retention_pin != batch->sources[0].retention_pin)
 			return false;
-		if (batch->cold_fence != NULL) {
+		if (space_batch_cold(batch)) {
 			if (a->serial_guard == NULL || !a->serial_guard->held
 				|| a->serial_guard->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED)
 				return false;
@@ -103,11 +140,12 @@ space_sources_fresh_current_owner(const ClusterSpaceRecoveryBatchV1 *batch)
 				.scan_begin_inclusive = a->root_snapshot->checkpoint_lower_lsn,
 				.scan_end_exclusive = a->root_snapshot->validated_tail_lsn_exclusive
 			};
-			if (!rf_side_online_plan_source_matches_v1(batch->side, a->duty->system_identifier,
-													   a->duty->storage_uuid, &cut)
-				|| !rf_side_online_plan_source_matches_v1(
-					batch->side, a->root_snapshot->identity.system_identifier,
-					a->root_snapshot->identity.storage_uuid, &cut))
+			if (batch->cold_inputs == NULL
+				&& (!rf_side_online_plan_source_matches_v1(batch->side, a->duty->system_identifier,
+														   a->duty->storage_uuid, &cut)
+					|| !rf_side_online_plan_source_matches_v1(
+						batch->side, a->root_snapshot->identity.system_identifier,
+						a->root_snapshot->identity.storage_uuid, &cut)))
 				return false;
 		} else if (!cluster_thread_recovery_fabric_identity_matches_v1(
 					   batch->fabric, a->duty->system_identifier, a->duty->storage_uuid)
@@ -216,12 +254,42 @@ space_disk_matches(SMgrRelation rel, BlockNumber block, const char *expected)
 }
 
 static bool
+space_prepare_target(ClusterSpaceRecoveryBatchV1 *batch, SpaceRecoveryTarget *target,
+					 uint32 through, uint32 *count, ClusterSpaceRecoveryImage *prepared)
+{
+	if (batch->cold_inputs != NULL) {
+		bool ok = through == UINT32_MAX
+					  ? cluster_space_recovery_prepare(
+							batch->cold_inputs, batch->operation_count, &target->key,
+							target->before[0].data, target->before[1].data, batch->order, prepared)
+					  : cluster_space_recovery_prepare_through(
+							batch->cold_inputs, batch->operation_count, through, &target->key,
+							target->before[0].data, target->before[1].data, batch->order, prepared);
+
+		if (!ok)
+			return false;
+		for (uint32 i = 0; i < batch->operation_count; i++)
+			if (batch->order[i] != i)
+				return false;
+		*count = batch->operation_count;
+		return true;
+	}
+	return (through == UINT32_MAX
+				? rf_side_online_plan_prepare_space_v1(
+					  batch->side, &target->key, target->before[0].data, target->before[1].data,
+					  batch->order, batch->operation_count, count, prepared)
+				: rf_side_online_plan_prepare_space_through_v1(
+					  batch->side, &target->key, target->before[0].data, target->before[1].data,
+					  through, batch->order, batch->operation_count, count, prepared))
+		   == RF_PAGE_PROOF_DETAIL_OK;
+}
+
+static bool
 space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, uint32 through)
 {
 	static const PGAlignedBlock zero;
 	SpaceRecoveryTarget *target = &batch->targets[index];
 	ClusterSpaceRecoveryImage prepared;
-	RfSideOnlineOperationV1 source;
 	ClusterResId resid;
 	SMgrRelation rel;
 	BlockNumber blocks;
@@ -240,7 +308,7 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 		/* A committed cold plan holds the complete formed recovery isolation.
 		 * Serving HW cannot be acquired during that startup phase. Online
 		 * callers still acquire HW before taking any target buffer locks. */
-		if ((batch->cold_fence == NULL && !cluster_hw_lock(&resid, &batch->hw))
+		if ((!space_batch_cold(batch) && !cluster_hw_lock(&resid, &batch->hw))
 			|| !space_sources_fresh(batch))
 			goto done;
 		batch->previous_owner = CurrentResourceOwner;
@@ -272,14 +340,7 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 		}
 		if (!space_sources_fresh(batch))
 			goto done;
-		if ((through == UINT32_MAX
-				 ? rf_side_online_plan_prepare_space_v1(
-					   batch->side, &target->key, target->before[0].data, target->before[1].data,
-					   batch->order, batch->operation_count, &count, &prepared)
-				 : rf_side_online_plan_prepare_space_through_v1(
-					   batch->side, &target->key, target->before[0].data, target->before[1].data,
-					   through, batch->order, batch->operation_count, &count, &prepared))
-				!= RF_PAGE_PROOF_DETAIL_OK
+		if (!space_prepare_target(batch, target, through, &count, &prepared)
 			|| (!target->has_create && prepared.source_index[0] != UINT32_MAX)
 			|| (target->has_create && prepared.source_index[0] == UINT32_MAX
 				&& !(prepared.covered_by_successor_mask & 1)))
@@ -290,12 +351,25 @@ space_target_run(ClusterSpaceRecoveryBatchV1 *batch, uint32 index, bool apply, u
 				goto done;
 		}
 		for (int i = 0; i < 2; i++) {
+			ClusterSpaceColdSourceV1 stamp;
+
 			if (prepared.source_index[i] == UINT32_MAX)
 				continue;
-			if (!rf_side_online_plan_operation_v1(batch->side, prepared.source_index[i], &source))
-				goto done;
-			PageSetLSNPreserveOrigin(prepared.pages[i].data, source.identity.record.end_rec_ptr);
-			if (!PageSetLSNOrigin(prepared.pages[i].data, source.identity.record.origin_thread - 1))
+			if (batch->cold_inputs != NULL) {
+				if (prepared.source_index[i] >= batch->operation_count)
+					goto done;
+				stamp = batch->cold_origins[prepared.source_index[i]];
+			} else {
+				RfSideOnlineOperationV1 source;
+
+				if (!rf_side_online_plan_operation_v1(batch->side, prepared.source_index[i],
+													  &source))
+					goto done;
+				stamp = (ClusterSpaceColdSourceV1){ source.identity.record.origin_thread,
+													source.identity.record.end_rec_ptr };
+			}
+			PageSetLSNPreserveOrigin(prepared.pages[i].data, stamp.end_rec_ptr);
+			if (!PageSetLSNOrigin(prepared.pages[i].data, stamp.origin_thread - 1))
 				goto done;
 		}
 		/* A successor's bytes cannot borrow a failed origin's WAL owner.
@@ -562,6 +636,126 @@ cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *pla
 }
 
 bool
+cluster_space_recovery_cold_relation_install_v1(const ClusterSpaceIdentityKey *key,
+												const ClusterSpaceRecoveryInput *inputs,
+												const ClusterSpaceColdSourceV1 *origins,
+												uint32 count, uint32 through)
+{
+	ClusterRecoverySerialGuard *guards[CLUSTER_WAL_RETENTION_MAX_THREADS];
+	ClusterWalRetentionPin *pin = NULL;
+	ClusterSpaceRecoveryBatchV1 *batch = NULL;
+	ClusterThreadRecoveryAuthorityV1 *authorities;
+	SpaceColdAuthority *owners;
+	uint16 source_count = 0;
+	Size bytes, scratch;
+	bool ok = false;
+
+	if (!space_cold_phase() || key == NULL || inputs == NULL || origins == NULL || count == 0
+		|| through >= count || (scratch = cluster_space_recovery_scratch_bytes(count)) == 0
+		|| cluster_wal_retention_pin_borrow_cold_v1(&pin, guards, lengthof(guards), &source_count)
+			   != CLUSTER_WAL_PIN_OK
+		|| source_count == 0)
+		return false;
+	bytes = sizeof(*batch) + sizeof(SpaceRecoveryTarget)
+			+ (Size)source_count * (sizeof(*authorities) + sizeof(*owners));
+	if (scratch > MaxAllocSize - bytes - 4 * BLCKSZ
+		|| count > (MaxAllocSize - bytes - scratch - 4 * BLCKSZ) / sizeof(uint32))
+		return false;
+	bytes += (Size)count * sizeof(uint32);
+	batch = space_alloc(bytes);
+	if (batch == NULL)
+		return false;
+	authorities = (ClusterThreadRecoveryAuthorityV1 *)(batch + 1);
+	owners = (SpaceColdAuthority *)(authorities + source_count);
+	batch->targets = (SpaceRecoveryTarget *)(owners + source_count);
+	batch->order = (uint32 *)(batch->targets + 1);
+	batch->sources = authorities;
+	batch->cold_inputs = inputs;
+	batch->cold_origins = origins;
+	batch->source_owner = CurrentResourceOwner;
+	batch->source_count = source_count;
+	batch->target_count = 1;
+	batch->operation_count = count;
+	batch->allocated_bytes = bytes;
+	batch->targets[0].key = *key;
+	PG_TRY();
+	{
+		/* Read every exact original ROOT/native anchor before any target I/O.
+		 * No current-writer lookup and no local flush of a foreign coordinate. */
+		for (uint16 i = 0; i < source_count; i++) {
+			ClusterRecoverySerialGuard *guard = guards[i];
+			ClusterWalSourceRef source;
+			ClusterControlRootResult result;
+
+			result = cluster_control_root_read_canonical(guard->duty.origin_thread_id, &guard->duty,
+														 CLUSTER_CONTROL_ROOT_READ_STRONG,
+														 &owners[i].root, &owners[i].token);
+			if ((result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				 && result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+				|| memcmp(&owners[i].token, &guard->root_read_token, sizeof(owners[i].token)) != 0
+				|| memcmp(&owners[i].root.identity, &guard->duty, sizeof(guard->duty)) != 0
+				|| cluster_control_root_recovery_source_v1(&owners[i].root, &owners[i].token,
+														   &source, &owners[i].native_redo)
+					   != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				|| memcmp(&source.claim.identity, &guard->duty, sizeof(guard->duty)) != 0
+				|| source.claim.identity.system_identifier != key->system_identifier
+				|| memcmp(source.claim.identity.storage_uuid, key->storage_uuid, 16) != 0
+				|| source.claim.database_incarnation != key->database_incarnation
+				|| owners[i].native_redo < owners[i].root.checkpoint_lower_lsn
+				|| owners[i].native_redo > owners[i].root.validated_tail_lsn_exclusive)
+				goto done;
+			authorities[i]
+				= (ClusterThreadRecoveryAuthorityV1){ .duty = &guard->duty,
+													  .root_snapshot = &owners[i].root,
+													  .root_token = &owners[i].token,
+													  .formation = guard->formation,
+													  .fence_need_set = guard->fence_need_set,
+													  .fence_admission_set
+													  = guard->fence_admission_set,
+													  .retention_pin = pin,
+													  .serial_guard = guard };
+		}
+		if (!space_sources_fresh(batch)
+			|| !cluster_space_recovery_order(inputs, count, key, batch->order))
+			goto done;
+		for (uint32 i = 0; i < count; i++) {
+			uint16 source;
+
+			if (batch->order[i] != i)
+				goto done;
+			for (source = 0; source < source_count; source++)
+				if (origins[i].origin_thread == authorities[source].duty->origin_thread_id)
+					break;
+			if (source == source_count || origins[i].end_rec_ptr <= owners[source].native_redo
+				|| origins[i].end_rec_ptr > owners[source].root.validated_tail_lsn_exclusive)
+				goto done;
+			if (inputs[i].length == CLUSTER_SPACE_STRUCTURE_WAL_BYTES) {
+				ClusterSpaceStructureChange structure;
+
+				/* Structural shrink/drop still require their original physical
+				 * owner. Do not open the readiness handshake for this subset. */
+				if (!cluster_space_structure_wal_decode(inputs[i].data, inputs[i].length,
+														&structure)
+					|| structure.identity.action != CLUSTER_SPACE_WAL_CREATE)
+					goto done;
+				batch->targets[0].has_create = true;
+			}
+		}
+		if (!space_target_run(batch, 0, false, UINT32_MAX) || !space_sources_fresh(batch))
+			goto done;
+		batch->preflight_complete = true;
+		ok = space_target_run(batch, 0, true, through);
+	done:;
+	}
+	PG_FINALLY();
+	{
+		cluster_space_recovery_destroy_v1(&batch);
+	}
+	PG_END_TRY();
+	return ok;
+}
+
+bool
 cluster_space_recovery_cold_preflight_v1(const RfSideOnlinePlanV1 *side,
 										 ClusterRecoveryFencePlan *fence,
 										 ClusterSpaceRecoveryBatchV1 **out)
@@ -613,7 +807,7 @@ cluster_space_recovery_flush_permitted_v1(const ClusterSpaceRecoveryBatchV1 *bat
 	BlockNumber block;
 
 	if (batch == NULL || batch->active == NULL || !batch->preflight_complete
-		|| (batch->cold_fence == NULL
+		|| (!space_batch_cold(batch)
 			&& (!batch->hw.held || !batch->hw.coordinated
 				|| batch->hw.req.lockmode != ExclusiveLock))
 		|| !BufferIsValid(buffer) || BufferIsLocal(buffer) || !space_sources_fresh(batch))

@@ -24,6 +24,7 @@
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -47,6 +48,14 @@ typedef struct SpaceIdentityCacheEntry {
 
 static HTAB *space_identity_cache;
 static uint64 space_identity_invalidations;
+
+bool
+cluster_space_cold_install_v1(const ClusterSpaceIdentityKey *key,
+							  const ClusterSpaceRecoveryInput *inputs,
+							  const ClusterSpaceColdSourceV1 *sources, uint32 count, uint32 through)
+{
+	return cluster_space_recovery_cold_relation_install_v1(key, inputs, sources, count, through);
+}
 
 static void
 space_identity_invalidate(Datum arg, Oid relid)
