@@ -120,6 +120,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_pending.h"
 #include "cluster/cluster_grd_work_queue.h"
+#include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_cssd.h"  /* cluster_cssd_status (spec-2.5 D12) */
 #include "cluster/cluster_stats.h" /* cluster_stats_status (spec-1.14 D12) */
 #include "cluster/cluster_undo_cleaner.h"
@@ -1376,6 +1377,7 @@ static void
 dump_grd_recovery(ReturnSetInfo *rsinfo)
 {
 	ClusterGrdRecoveryCounters c;
+	ClusterPiWritebackRejectionsV1 wb;
 	uint32 state;
 
 	cluster_grd_recovery_counters_snapshot(&c);
@@ -1437,6 +1439,16 @@ dump_grd_recovery(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)c.pi_rebuild_apply_blocked));
 	emit_row(rsinfo, "grd_recovery", "pi_rebuild_plan_blocked",
 			 fmt_int64((int64)c.pi_rebuild_plan_blocked));
+	if (cluster_pi_writeback_rejections_v1(&wb)) {
+		static const char *const keys[]
+			= { "pi_writeback_data_proof_rejected", "pi_writeback_local_ack_rejected",
+				"pi_writeback_remote_ack_rejected", "pi_writeback_master_cut_rejected",
+				"pi_writeback_peer_physical_rejected" };
+		for (unsigned i = 0; i < lengthof(keys); i++)
+			emit_row(rsinfo, "grd_recovery", keys[i], psprintf(UINT64_FORMAT, wb.attempts[i]));
+		emit_row(rsinfo, "grd_recovery", "pi_writeback_rejection_logs",
+				 psprintf(UINT64_FORMAT, wb.log_events));
+	}
 	/* Shape A (crash-rejoin re-declare barrier): off-path crash-rejoin fence-arm
 	 * events (standalone counter, not part of the snapshot struct). */
 	emit_row(rsinfo, "grd_recovery", "offpath_crash_rejoin_fenced",

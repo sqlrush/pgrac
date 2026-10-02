@@ -50,6 +50,7 @@
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_grd.h"		  /* ClusterGrdRecoveryCounters */
+#include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
 #include "cluster/cluster_lmd.h"
@@ -4862,6 +4863,16 @@ cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out)
 	memset(out, 0, sizeof(*out));
 }
 
+bool
+cluster_pi_writeback_rejections_v1(ClusterPiWritebackRejectionsV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	for (unsigned i = 0; i < CLUSTER_PI_WRITEBACK_REJECTION_COUNT; i++)
+		out->attempts[i] = i + 11;
+	out->log_events = 2;
+	return true;
+}
+
 /* Shape A stub: dump_grd_recovery emits the crash-rejoin fence counter. */
 uint64
 cluster_grd_offpath_crash_rejoin_fenced_count(void)
@@ -5132,6 +5143,13 @@ UT_TEST(test_debug_dump_exposes_exact_resource_x_owner_state)
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_gate_formation"), "17");
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_writer_path"), "target");
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_writer_r4_generation"), "19");
+	UT_ASSERT_STR_EQ(captured_dump_value("grd_recovery", "pi_writeback_data_proof_rejected"), "11");
+	UT_ASSERT_STR_EQ(captured_dump_value("grd_recovery", "pi_writeback_local_ack_rejected"), "12");
+	UT_ASSERT_STR_EQ(captured_dump_value("grd_recovery", "pi_writeback_remote_ack_rejected"), "13");
+	UT_ASSERT_STR_EQ(captured_dump_value("grd_recovery", "pi_writeback_master_cut_rejected"), "14");
+	UT_ASSERT_STR_EQ(captured_dump_value("grd_recovery", "pi_writeback_peer_physical_rejected"),
+					 "15");
+	UT_ASSERT_STR_EQ(captured_dump_value("grd_recovery", "pi_writeback_rejection_logs"), "2");
 }
 
 UT_TEST(test_debug_dump_normal_completion_never_fabricates_unready_proof)
