@@ -185,7 +185,8 @@ wb_message_valid(const ClusterPiWritebackMessageV1 *m)
 {
 	int32 peer;
 	if (m == NULL || (m->verb != CLUSTER_PI_WRITEBACK_NOTIFY && m->verb != CLUSTER_PI_WRITEBACK_ACK)
-		|| m->nonce == 0 || m->epoch == 0 || m->epoch == UINT64_MAX || m->count == 0
+		|| m->nonce == 0 || m->epoch == 0 || m->epoch == UINT64_MAX
+		|| (m->count == 0 && m->verb != CLUSTER_PI_WRITEBACK_ACK)
 		|| m->count > CLUSTER_PI_WRITEBACK_MAX || !cluster_wal_claim_v2_ref_valid(&m->peer.claim)
 		|| m->peer.timeline == 0)
 		return false;
@@ -336,7 +337,7 @@ cluster_pi_writeback_decode_v1(const void *data, Size length, ClusterPiWriteback
 	m.count = pi_data_get(bytes + 12, 4);
 	m.nonce = pi_data_get(bytes + 16, 8);
 	m.epoch = pi_data_get(bytes + 24, 8);
-	if (m.count == 0 || m.count > CLUSTER_PI_WRITEBACK_MAX
+	if ((m.count == 0 && m.verb != CLUSTER_PI_WRITEBACK_ACK) || m.count > CLUSTER_PI_WRITEBACK_MAX
 		|| length
 			   != CLUSTER_PI_WRITEBACK_HEADER_BYTES
 					  + (Size)m.count * CLUSTER_PI_WRITEBACK_FACT_BYTES)
@@ -367,6 +368,29 @@ wb_same_request(const ClusterPiWritebackMessageV1 *request,
 		   && request->epoch == reply->epoch && wb_source_covered(&reply->peer, &request->peer)
 		   && memcmp(request->facts, reply->facts, (Size)request->count * sizeof(request->facts[0]))
 				  == 0;
+}
+
+/* An ACK is an ordered exact subset of one immutable request. Missing
+ * items carry no evidence; an empty response only finishes this attempt. */
+static bool
+wb_reply_matches(const ClusterPiWritebackMessageV1 *request,
+				 const ClusterPiWritebackMessageV1 *reply)
+{
+	uint32 at = 0;
+	if (!wb_message_valid(request) || !wb_message_valid(reply)
+		|| request->verb != CLUSTER_PI_WRITEBACK_NOTIFY || reply->verb != CLUSTER_PI_WRITEBACK_ACK
+		|| reply->count > request->count || request->nonce != reply->nonce
+		|| request->epoch != reply->epoch || !wb_source_covered(&reply->peer, &request->peer))
+		return false;
+	for (uint32 i = 0; i < reply->count; i++) {
+		while (at < request->count
+			   && memcmp(&request->facts[at], &reply->facts[i], sizeof(reply->facts[i])) != 0)
+			at++;
+		if (at == request->count)
+			return false;
+		at++;
+	}
+	return true;
 }
 
 static bool
@@ -416,25 +440,17 @@ wb_current(const ClusterPiWritebackMessageV1 *m, bool master)
 }
 
 static bool
-wb_master_cuts(const ClusterPiWritebackMessageV1 *m)
+wb_master_fact_cut(const ClusterPiDataFactV1 *f)
 {
-	if (!wb_current(m, true))
-		return false;
-	for (uint32 i = 0; i < m->count; i++) {
-		const ClusterPiDataFactV1 *f = &m->facts[i];
-		if (f->write_cut.binding_generation != 0) {
-			ClusterPcmPiWriteCutV1 cut;
-			if (!cluster_pcm_lock_pi_write_snapshot_v1(*wb_tag(f), &cut)
-				|| memcmp(&cut, &f->write_cut, sizeof(cut)) != 0)
-				return false;
-		} else {
-			ClusterPcmPiStorageCutV1 cut;
-			if (!cluster_pcm_lock_pi_storage_snapshot_v1(*wb_tag(f), &cut)
-				|| memcmp(&cut, &f->storage_cut, sizeof(cut)) != 0)
-				return false;
-		}
+	if (f->write_cut.binding_generation != 0) {
+		ClusterPcmPiWriteCutV1 cut;
+		return cluster_pcm_lock_pi_write_snapshot_v1(*wb_tag(f), &cut)
+			   && memcmp(&cut, &f->write_cut, sizeof(cut)) == 0;
+	} else {
+		ClusterPcmPiStorageCutV1 cut;
+		return cluster_pcm_lock_pi_storage_snapshot_v1(*wb_tag(f), &cut)
+			   && memcmp(&cut, &f->storage_cut, sizeof(cut)) == 0;
 	}
-	return true;
 }
 
 bool
@@ -538,7 +554,7 @@ cluster_pi_writeback_begin_v1(const ClusterPageDataReceiptV1 *const *receipts, u
 	for (uint32 i = 0; i < count; i++)
 		if (!cluster_page_data_pi_fact_v1(receipts[i], &m.facts[i]))
 			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	if (!pg_strong_random(&m.nonce, sizeof(m.nonce)) || !wb_master_cuts(&m))
+	if (!pg_strong_random(&m.nonce, sizeof(m.nonce)) || !wb_current(&m, true))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	job = palloc0(sizeof(*job));
 	job->owner = CurrentResourceOwner;
@@ -572,7 +588,7 @@ cluster_pi_writeback_poll_v1(ClusterPiWritebackJobV1 *job)
 	if (job == NULL || job->pid != getpid() || job->owner != CurrentResourceOwner
 		|| !wb_background() || wb_shared == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	if (job->stale || !wb_master_cuts(&job->requested)) {
+	if (job->stale || !wb_current(&job->requested, true)) {
 		wb_cancel(job);
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	}
@@ -590,8 +606,7 @@ cluster_pi_writeback_poll_v1(ClusterPiWritebackJobV1 *job)
 	}
 	if (!completed)
 		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
-	if (reply.verb != CLUSTER_PI_WRITEBACK_ACK || !wb_same_request(&job->requested, &reply)
-		|| !wb_master_cuts(&reply)) {
+	if (!wb_reply_matches(&job->requested, &reply) || !wb_current(&job->requested, true)) {
 		wb_cancel(job);
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	}
@@ -609,11 +624,20 @@ cluster_pi_writeback_ack_read_v1(const ClusterPiWritebackJobV1 *job, uint32 inde
 {
 	ClusterPiDataFactV1 fact;
 	ClusterWalWriterToken peer = { 0 };
+	bool found = false;
 	if (job == NULL || out == NULL || job->pid != getpid() || job->owner != CurrentResourceOwner
-		|| !wb_background() || !job->complete || job->stale || index >= job->accepted.count
-		|| !wb_same_request(&job->requested, &job->accepted)
+		|| !wb_background() || !job->complete || job->stale || index >= job->requested.count
+		|| !wb_reply_matches(&job->requested, &job->accepted)
 		|| !cluster_page_data_pi_fact_v1(receipt, &fact)
-		|| memcmp(&fact, &job->accepted.facts[index], sizeof(fact)) != 0)
+		|| memcmp(&fact, &job->requested.facts[index], sizeof(fact)) != 0
+		|| !wb_master_fact_cut(&fact))
+		return false;
+	for (uint32 i = 0; i < job->accepted.count; i++)
+		if (memcmp(&fact, &job->accepted.facts[i], sizeof(fact)) == 0) {
+			found = true;
+			break;
+		}
+	if (!found)
 		return false;
 	peer.ref = job->accepted.peer;
 	peer.epoch = job->accepted.epoch;
@@ -685,7 +709,7 @@ cluster_pi_writeback_ingress_v1(const ClusterICEnvelope *env, const void *payloa
 		return;
 	SpinLockAcquire(&wb_shared->lock);
 	if (wb_shared->outbound_pid != 0 && !wb_shared->outbound_complete
-		&& wb_same_request(&wb_shared->outbound, &m)) {
+		&& wb_reply_matches(&wb_shared->outbound, &m)) {
 		wb_shared->completed = m;
 		wb_shared->outbound_complete = true;
 	}
@@ -809,25 +833,27 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 	page = cluster_thread_recovery_fabric_page_plan_v1(wb_notice->plan);
 	reply = request;
 	reply.verb = CLUSTER_PI_WRITEBACK_ACK;
+	reply.count = 0;
 	for (uint32 i = 0; i < request.count; i++) {
 		ClusterPageDataReceiptV1 *receipt = NULL;
 		ClusterPiPhysicalAckV1 *ack = NULL;
 		ClusterWalWriterToken native;
-		bool valid = cluster_page_data_from_notice_v1(wb_notice, i, &receipt)
-					 && cluster_bufmgr_ack_pi_at_data_v1(receipt, page, sources, count,
-														 wb_notice->inputs, &ack)
-					 && cluster_page_data_pi_ack_export_v1(ack, receipt, &native)
-					 && native.epoch == request.epoch && native.startup_first_lsn == 0
-					 && wb_source_covered(&native.ref, &request.peer)
-					 && (i == 0 || memcmp(&native.ref, &reply.peer, sizeof(reply.peer)) == 0);
-		if (valid)
+		bool valid
+			= cluster_page_data_from_notice_v1(wb_notice, i, &receipt)
+			  && cluster_bufmgr_ack_pi_at_data_v1(receipt, page, sources, count, wb_notice->inputs,
+												  &ack)
+			  && cluster_page_data_pi_ack_export_v1(ack, receipt, &native)
+			  && native.epoch == request.epoch && native.startup_first_lsn == 0
+			  && wb_source_covered(&native.ref, &request.peer)
+			  && (reply.count == 0 || memcmp(&native.ref, &reply.peer, sizeof(reply.peer)) == 0);
+		if (valid) {
 			reply.peer = native.ref;
+			reply.facts[reply.count++] = request.facts[i];
+		}
 		cluster_page_data_pi_ack_free_v1(&ack);
 		cluster_page_data_receipt_free_v1(&receipt);
-		if (!valid)
-			goto invalid;
 	}
-	if (!wb_current(&reply, false)
+	if (!wb_current(&request, false) || !wb_current(&reply, false)
 		|| cluster_wal_inputs_revalidate_v1(wb_notice->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto invalid;
 	wb_server_finish(&reply);
@@ -1084,8 +1110,10 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 					if (n >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 						|| !cluster_bufmgr_ack_pi_at_data_v1(
 							wb_batch->receipts[i], page, wb_batch->sources, wb_batch->source_count,
-							wb_batch->inputs, &wb_batch->acks[i][n]))
-						goto done;
+							wb_batch->inputs, &wb_batch->acks[i][n])) {
+						wb_batch->qualified[i] = false;
+						continue;
+					}
 					wb_batch->ack_count[i]++;
 				}
 				continue;
@@ -1108,8 +1136,10 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 			uint32 i = wb_batch->group_indices[j], n = wb_batch->ack_count[i];
 			if (n >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 				|| !cluster_page_data_pi_ack_import_v1(
-					wb_batch->physical_job, j, wb_batch->receipts[i], &wb_batch->acks[i][n]))
-				goto done;
+					wb_batch->physical_job, j, wb_batch->receipts[i], &wb_batch->acks[i][n])) {
+				wb_batch->qualified[i] = false;
+				continue;
+			}
 			wb_batch->ack_count[i]++;
 		}
 		cluster_pi_writeback_release_v1(&wb_batch->physical_job);
@@ -1145,7 +1175,7 @@ done:
 void
 cluster_pi_writeback_lmon_tick_v1(void)
 {
-	ClusterPiWritebackMessageV1 request, reply;
+	ClusterPiWritebackMessageV1 request, reply, inbound;
 	uint64 revision, inbound_revision;
 	bool pending, replied;
 	uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES];
@@ -1170,6 +1200,7 @@ cluster_pi_writeback_lmon_tick_v1(void)
 	inbound_revision = wb_shared->inbound_revision;
 	replied = wb_shared->inbound_state == WB_REPLIED && wb_shared->reply_pending;
 	reply = wb_shared->reply;
+	inbound = wb_shared->inbound;
 	SpinLockRelease(&wb_shared->lock);
 	now = GetCurrentTimestamp();
 	if (wb_sent_revision == revision && wb_sent_inbound == inbound_revision
@@ -1179,7 +1210,8 @@ cluster_pi_writeback_lmon_tick_v1(void)
 		&& cluster_pi_writeback_encode_v1(&request, bytes, sizeof(bytes), &length))
 		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_PI_WRITEBACK,
 									   request.peer.claim.identity.origin_node_id, bytes, length);
-	if (replied && wb_current(&reply, false)
+	if (replied && wb_current(&inbound, false) && wb_reply_matches(&inbound, &reply)
+		&& wb_current(&reply, false)
 		&& cluster_pi_writeback_encode_v1(&reply, bytes, sizeof(bytes), &length)) {
 		bool send = false;
 		ClusterICSendResult sent;
@@ -1191,7 +1223,7 @@ cluster_pi_writeback_lmon_tick_v1(void)
 		}
 		SpinLockRelease(&wb_shared->lock);
 		if (send) {
-			sent = cluster_ic_send_envelope(PGRAC_IC_MSG_PI_WRITEBACK, wb_master(&reply.facts[0]),
+			sent = cluster_ic_send_envelope(PGRAC_IC_MSG_PI_WRITEBACK, wb_master(&inbound.facts[0]),
 											bytes, length);
 			if (sent != CLUSTER_IC_SEND_DONE && sent != CLUSTER_IC_SEND_WOULD_BLOCK) {
 				SpinLockAcquire(&wb_shared->lock);

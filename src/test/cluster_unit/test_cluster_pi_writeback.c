@@ -32,6 +32,8 @@ static uint64 wb_boots[3] = { 9, 9, 9 };
 static bool wb_quorum = true, wb_stop, wb_input_current = true, wb_input_wait;
 static ClusterWalSourceRef wb_sources[3];
 static ClusterPcmPiStorageCutV1 wb_storage_cut;
+static ClusterPcmPiStorageCutV1 wb_vm_cut;
+static bool wb_multiple;
 static RfPageOnlinePlanV1 *wb_page_plan;
 static unsigned wb_plan_builds, wb_input_releases, wb_sends;
 static RfSideOnlineOperationKindV1 wb_side_kind;
@@ -232,7 +234,9 @@ cluster_pcm_lock_pi_candidates_v1(uint32 *cursor, uint32 budget, BufferTag *tags
 		return 0;
 	wb_candidates = false;
 	tags[0] = wb_storage_cut.resource;
-	return 1;
+	if (wb_multiple)
+		tags[1] = wb_vm_cut.resource;
+	return wb_multiple ? 2 : 1;
 }
 ClusterControlRootResult
 cluster_pi_data_begin_v1(const ClusterSpaceIdentityKey *key, const ClusterPcmPiWriteCutV1 *cut,
@@ -271,11 +275,15 @@ cluster_pcm_lock_pi_storage_complete_v1(const ClusterPageDataReceiptV1 *receipt,
 										uint32 *holders)
 {
 	ClusterPcmPiStorageCutV1 cut;
+	ClusterPcmPiStorageCutV1 *current;
 	uint32 bitmap = 0;
 	UT_ASSERT_EQ(MyBackendType, B_CHECKPOINTER);
 	*holders = 0;
-	if (!cluster_page_data_pi_storage_proof_v1(receipt, plan, sources, count, &cut)
-		|| memcmp(&cut, &wb_storage_cut, sizeof(cut)) != 0)
+	if (!cluster_page_data_pi_storage_proof_v1(receipt, plan, sources, count, &cut))
+		return false;
+	current = wb_multiple && cut.resource.forkNum == VISIBILITYMAP_FORKNUM ? &wb_vm_cut
+																		   : &wb_storage_cut;
+	if (memcmp(&cut, current, sizeof(cut)) != 0)
 		return false;
 	for (uint32 i = 0; i < ack_count; i++) {
 		int32 node;
@@ -288,7 +296,7 @@ cluster_pcm_lock_pi_storage_complete_v1(const ClusterPageDataReceiptV1 *receipt,
 		return false;
 	wb_master_completions++;
 	*holders = bitmap;
-	wb_storage_cut.pi_holders_bitmap = 0;
+	current->pi_holders_bitmap = 0;
 	return true;
 }
 
@@ -345,6 +353,10 @@ cluster_pcm_lock_pi_write_snapshot_v1(BufferTag tag, ClusterPcmPiWriteCutV1 *out
 bool
 cluster_pcm_lock_pi_storage_snapshot_v1(BufferTag tag, ClusterPcmPiStorageCutV1 *out)
 {
+	if (wb_multiple && BufferTagsEqual(&tag, &wb_vm_cut.resource)) {
+		*out = wb_vm_cut;
+		return true;
+	}
 	if (!BufferTagsEqual(&tag, &wb_storage_cut.resource))
 		return false;
 	*out = wb_storage_cut;
@@ -524,6 +536,7 @@ static ClusterPageDataReceiptV1 *
 wb_setup(void)
 {
 	ClusterPageDataReceiptV1 *data = NULL;
+	wb_multiple = false;
 	wb_epoch = ack_writer_epoch = 1;
 	wb_quorum = wb_input_current = true;
 	wb_stop = wb_input_wait = false;
@@ -552,6 +565,21 @@ wb_setup(void)
 	}
 	wb_select(0, B_CHECKPOINTER);
 	wb_now += 1000000;
+	return data;
+}
+
+static ClusterPageDataReceiptV1 *
+wb_second_page(void)
+{
+	ClusterPageDataTargetV1 vm_target = target;
+	ClusterPageDataReceiptV1 *data = NULL;
+	wb_multiple = true;
+	wb_vm_cut = wb_storage_cut;
+	wb_vm_cut.resource.forkNum = vm_target.identity.forknum = VISIBILITYMAP_FORKNUM;
+	/* The existing sealed decoded record changes both MAIN and VM to token
+	 * 7; the file-backed fixture contains those same header bytes. */
+	UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&vm_target, &wb_vm_cut, wb_page_plan, wb_sources,
+												   3, &data));
 	return data;
 }
 
@@ -675,6 +703,7 @@ UT_TEST(writeback_rejects_foreign_sender_boot_and_changed_master_cut)
 {
 	ClusterPageDataReceiptV1 *data = wb_setup();
 	ClusterPiWritebackJobV1 *job = wb_start(data);
+	ClusterWalWriterToken rejected;
 	uint8 request[CLUSTER_PI_WRITEBACK_MAX_BYTES];
 	uint32 length = wb_length;
 	memcpy(request, wb_wire, length);
@@ -699,7 +728,8 @@ UT_TEST(writeback_rejects_foreign_sender_boot_and_changed_master_cut)
 	wb_deliver(1, 0, wb_wire, wb_length);
 	wb_storage_cut.authority.transition_count++;
 	wb_select(0, B_CHECKPOINTER);
-	UT_ASSERT_EQ(cluster_pi_writeback_poll_v1(job), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT_EQ(cluster_pi_writeback_poll_v1(job), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT(!cluster_pi_writeback_ack_read_v1(job, 0, data, &rejected));
 	UT_ASSERT_EQ(pi_discards, 1); /* Physical success cannot clear a later cut. */
 	cluster_pi_writeback_release_v1(&job);
 	cluster_page_data_receipt_free_v1(&data);
@@ -742,6 +772,7 @@ UT_TEST(writeback_never_acknowledges_missing_ancestry_or_busy_physical_pi)
 	for (unsigned fault_case = 0; fault_case < 3; fault_case++) {
 		ClusterPageDataReceiptV1 *data = wb_setup();
 		ClusterPiWritebackJobV1 *job = wb_start(data);
+		ClusterWalWriterToken rejected;
 		physical_pi_from_source(&wb_sources[1], fault_case == 0 ? 81 : 19);
 		if (fault_case == 1)
 			pg_atomic_fetch_add_u32(&descriptors[1].bufferdesc.state, 1);
@@ -751,9 +782,18 @@ UT_TEST(writeback_never_acknowledges_missing_ancestry_or_busy_physical_pi)
 		wb_select(1, B_BG_WRITER);
 		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
 		UT_ASSERT_EQ(pi_discards, 0);
-		UT_ASSERT_EQ(wb_shared->inbound_state, WB_EMPTY);
+		UT_ASSERT_EQ(wb_shared->inbound_state, fault_case == 2 ? WB_EMPTY : WB_REPLIED);
+		if (fault_case != 2) {
+			UT_ASSERT_EQ(wb_shared->reply.count, 0);
+			wb_select(1, B_LMON);
+			cluster_pi_writeback_lmon_tick_v1();
+			wb_deliver(1, 0, wb_wire, wb_length);
+		}
 		wb_select(0, B_CHECKPOINTER);
-		UT_ASSERT_EQ(cluster_pi_writeback_poll_v1(job), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		UT_ASSERT_EQ(cluster_pi_writeback_poll_v1(job), fault_case == 2
+															? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+															: CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(!cluster_pi_writeback_ack_read_v1(job, 0, data, &rejected));
 		cluster_pi_writeback_release_v1(&job);
 		cluster_page_data_receipt_free_v1(&data);
 		rf_page_online_plan_destroy_v1(&wb_page_plan);
@@ -861,6 +901,119 @@ UT_TEST(checkpointer_releases_pending_batch_before_native_checkpoint)
 	cluster_page_data_receipt_free_v1(&previous);
 	rf_page_online_plan_destroy_v1(&wb_page_plan);
 	clean();
+}
+
+UT_TEST(remote_batch_preserves_other_page_when_one_pi_retries)
+{
+	for (unsigned count = 1; count <= 2; count++) {
+		ClusterPageDataReceiptV1 *data[2];
+		ClusterPiWritebackJobV1 *job = NULL;
+		ClusterPiPhysicalAckV1 *ack = NULL;
+		data[0] = wb_setup();
+		data[1] = wb_second_page();
+		UT_ASSERT_EQ(cluster_pi_writeback_begin_v1((const ClusterPageDataReceiptV1 **)data, count,
+												   &wb_sources[1], &job),
+					 0);
+		wb_select(0, B_LMON);
+		cluster_pi_writeback_lmon_tick_v1();
+		physical_pi_from_source(&wb_sources[1], 19);
+		pg_atomic_fetch_add_u32(&descriptors[1].bufferdesc.state, 1);
+		wb_deliver(0, 1, wb_wire, wb_length);
+		wb_select(1, B_BG_WRITER);
+		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+		UT_ASSERT_EQ(wb_shared->inbound_state, WB_REPLIED);
+		UT_ASSERT_EQ(wb_shared->reply.count, count - 1);
+		UT_ASSERT_EQ(pi_discards, 0);
+		UT_ASSERT_EQ(wb_plan_builds, 1);
+		wb_select(1, B_LMON);
+		cluster_pi_writeback_lmon_tick_v1();
+		if (count == 2) {
+			uint8 valid[CLUSTER_PI_WRITEBACK_MAX_BYTES];
+			Size valid_length = wb_length, wrong_length;
+			ClusterPiWritebackMessageV1 reply, wrong;
+			memcpy(valid, wb_wire, valid_length);
+			UT_ASSERT(cluster_pi_writeback_decode_v1(valid, valid_length, &reply));
+			for (unsigned fault = 0; fault < 3; fault++) {
+				wrong = reply;
+				if (fault == 0)
+					wrong.nonce++;
+				else if (fault == 1)
+					wrong.facts[0].binding.record_crc++;
+				else {
+					wrong.count = 2;
+					wrong.facts[1] = job->requested.facts[0];
+				}
+				UT_ASSERT(cluster_pi_writeback_encode_v1(&wrong, wb_wire, sizeof(wb_wire),
+														 &wrong_length));
+				wb_deliver(1, 0, wb_wire, wrong_length);
+				wb_select(0, B_CHECKPOINTER);
+				UT_ASSERT_EQ(cluster_pi_writeback_poll_v1(job), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+			}
+			memcpy(wb_wire, valid, valid_length);
+			wb_length = valid_length;
+		}
+		wb_deliver(1, 0, wb_wire, wb_length);
+		wb_select(0, B_CHECKPOINTER);
+		/* A concurrent hot MAIN cut must not erase the VM's exact reply. */
+		wb_storage_cut.authority.transition_count++;
+		UT_ASSERT_EQ(cluster_pi_writeback_poll_v1(job), 0);
+		UT_ASSERT(!cluster_page_data_pi_ack_import_v1(job, 0, data[0], &ack));
+		if (count == 2) {
+			UT_ASSERT(cluster_page_data_pi_ack_import_v1(job, 1, data[1], &ack));
+			cluster_page_data_pi_ack_free_v1(&ack);
+		}
+		cluster_pi_writeback_release_v1(&job);
+		pg_atomic_fetch_sub_u32(&descriptors[1].bufferdesc.state, 1);
+		cluster_page_data_receipt_free_v1(&data[0]);
+		cluster_page_data_receipt_free_v1(&data[1]);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(checkpointer_batch_skips_local_retry_and_retires_other_page)
+{
+	for (unsigned remote = 0; remote < 2; remote++) {
+		ClusterPageDataReceiptV1 *data = wb_setup(), *vm = wb_second_page();
+		wb_storage_cut.pi_holders_bitmap = wb_vm_cut.pi_holders_bitmap = 3;
+		wb_candidates = true;
+		physical_pi_from_source(&wb_sources[0], 80);
+		if (!remote)
+			pg_atomic_fetch_add_u32(&descriptors[1].bufferdesc.state, 1);
+		wb_select(0, B_CHECKPOINTER);
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT(wb_batch != NULL);
+		UT_ASSERT(!wb_inputs_pinned[0]);
+		wb_select(0, B_LMON);
+		cluster_pi_writeback_lmon_tick_v1();
+		if (!remote)
+			pg_atomic_fetch_sub_u32(&descriptors[1].bufferdesc.state, 1);
+		/* Switch from A's actual discarded descriptor to B's resident PI. */
+		InitBufferTag(&descriptors[1].bufferdesc.tag, &target.identity.locator,
+					  target.identity.forknum, target.identity.blockno);
+		physical_pi_from_source(&wb_sources[1], 19);
+		if (remote)
+			pg_atomic_fetch_add_u32(&descriptors[1].bufferdesc.state, 1);
+		wb_deliver(0, 1, wb_wire, wb_length);
+		wb_select(1, B_BG_WRITER);
+		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+		wb_select(1, B_LMON);
+		cluster_pi_writeback_lmon_tick_v1();
+		wb_deliver(1, 0, wb_wire, wb_length);
+		wb_select(0, B_CHECKPOINTER);
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT_EQ(wb_master_completions, 1);
+		UT_ASSERT_EQ(wb_vm_cut.pi_holders_bitmap, 0);
+		UT_ASSERT_EQ(wb_storage_cut.pi_holders_bitmap, 3);
+		UT_ASSERT(!wb_inputs_pinned[0]);
+		if (remote)
+			pg_atomic_fetch_sub_u32(&descriptors[1].bufferdesc.state, 1);
+		cluster_pi_writeback_checkpointer_release_v1();
+		cluster_page_data_receipt_free_v1(&data);
+		cluster_page_data_receipt_free_v1(&vm);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
 }
 
 UT_TEST(writeback_initial_allocation_error_cannot_orphan_running_owner)
@@ -1124,7 +1277,7 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(19);
 	UT_RUN(remote_physical_ack_runs_actual_ancestry_and_disposal);
 	UT_RUN(writeback_codec_has_exact_bounded_authenticated_facts);
 	UT_RUN(writeback_rejects_foreign_sender_boot_and_changed_master_cut);
@@ -1133,6 +1286,8 @@ main(void)
 	UT_RUN(writeback_reply_is_retired_and_retries_only_transport_refusal);
 	UT_RUN(checkpointer_batch_reaches_actual_local_and_remote_physical_owners);
 	UT_RUN(checkpointer_releases_pending_batch_before_native_checkpoint);
+	UT_RUN(remote_batch_preserves_other_page_when_one_pi_retries);
+	UT_RUN(checkpointer_batch_skips_local_retry_and_retires_other_page);
 	UT_RUN(writeback_initial_allocation_error_cannot_orphan_running_owner);
 	UT_RUN(retained_rebuild_never_completes_with_unmapped_side_contributions);
 	UT_RUN(retained_rebuild_restores_all_original_writers_before_complete);

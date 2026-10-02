@@ -25,6 +25,8 @@ typedef struct ClusterPiDataFactV1 {
 
 typedef struct ClusterPiWritebackMessageV1 {
 	uint32 verb;
+	/* NOTIFY has 1..MAX facts. ACK carries its ordered exact success subset;
+	 * zero facts acknowledge no page and only finish that request attempt. */
 	uint32 count;
 	uint64 nonce;
 	uint64 epoch;
