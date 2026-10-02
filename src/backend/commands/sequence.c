@@ -2548,7 +2548,12 @@ seq_redo(XLogReaderState *record)
 	if (info != XLOG_SEQ_LOG)
 		elog(PANIC, "seq_redo: unknown op code %u", info);
 
-	buffer = XLogInitBufferForRedo(record, 0);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &buffer)
+		!= BLK_NEEDS_REDO) {
+		if (BufferIsValid(buffer))
+			UnlockReleaseBuffer(buffer);
+		return;
+	}
 	page = (Page) BufferGetPage(buffer);
 
 	/*

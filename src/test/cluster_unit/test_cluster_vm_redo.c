@@ -12,6 +12,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_page_wal.h"
 
 #include <setjmp.h>
 
@@ -20,6 +21,7 @@
 #include "access/xlog.h"
 #include "access/xlogutils.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
@@ -51,6 +53,29 @@ static bool pins[2], locks[2], identity_ok;
 static unsigned runtime_reads, restart_reads, dirty, fake_count;
 static jmp_buf error_jump;
 static bool error_ready;
+BackendType MyBackendType = B_STARTUP;
+static bool cold_published;
+static unsigned cold_skip_mask, data_reads;
+
+bool
+cluster_cold_redo_block_decision_v1(XLogReaderState *record, uint8 id, ClusterColdRedoBlockV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!cold_published)
+		return true;
+	UT_ASSERT(record == &reader && XLogRecHasBlockRef(record, id));
+	out->action = XLogRecGetBlock(record, id)->forknum != VISIBILITYMAP_FORKNUM
+						  || (cold_skip_mask & (1U << id))
+					  ? CLUSTER_COLD_REDO_SKIP
+					  : CLUSTER_COLD_REDO_APPLY;
+	out->expected_kind = CLUSTER_COLD_DATA_PRESENT;
+	memcpy(out->expected_before.segment_incarnation, identity.incarnation, 16);
+	out->expected_before.mutation_token = 100;
+	out->result = out->expected_before;
+	out->result.mutation_token = 200;
+	return true;
+}
+
 
 void
 ExceptionalCondition(const char *c, const char *f, int l)
@@ -169,8 +194,9 @@ Buffer
 XLogReadBufferExtended(RelFileLocator loc, ForkNumber forknum, BlockNumber block,
 					   ReadBufferMode mode, Buffer recent)
 {
-	if (mode != RBM_NORMAL || recent != InvalidBuffer)
+	if ((mode != RBM_NORMAL && mode != RBM_NORMAL_NO_LOG) || recent != InvalidBuffer)
 		abort();
+	data_reads++;
 	return read_vm(loc, forknum, block);
 }
 Buffer
@@ -234,6 +260,7 @@ MarkBufferDirty(Buffer buf)
 {
 	if (buf < 1 || buf > 2 || !pins[buf - 1] || !locks[buf - 1])
 		abort();
+	cluster_page_cold_redo_dirty_v1(buf);
 	dirty++;
 }
 bool
@@ -250,6 +277,34 @@ errmsg_internal(const char *fmt, ...)
 	(void)fmt;
 	return 0;
 }
+int
+errcode(int code)
+{
+	UT_ASSERT(error_ready);
+	return 0;
+}
+int
+errmsg(const char *fmt, ...)
+{
+	UT_ASSERT(error_ready);
+	return 0;
+}
+int
+errdetail(const char *fmt, ...)
+{
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	return 0;
+}
+bool
+cluster_page_wal_cold_redo_write_allowed_v1(void)
+{
+	return true;
+}
+void
+cluster_page_wal_cold_redo_fail_v1(void)
+{
+	abort();
+}
 void
 errfinish(const char *f, int l, const char *func)
 {
@@ -259,6 +314,25 @@ errfinish(const char *f, int l, const char *func)
 	longjmp(error_jump, 1);
 }
 
+void
+BufferGetTag(Buffer buf, RelFileLocator *loc, ForkNumber *forknum, BlockNumber *block)
+{
+	UT_ASSERT(buf >= 1 && buf <= 2 && pins[buf - 1]);
+	*loc = locator;
+	*forknum = VISIBILITYMAP_FORKNUM;
+	*block = buf - 1;
+}
+void
+LockBufferForCleanup(Buffer buf)
+{
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+}
+void
+FlushOneBuffer(Buffer buf)
+{
+	abort();
+}
+#include "test_cluster_typed_redo_reader.inc"
 #include "test_cluster_vm_redo_consumers.inc"
 
 static void (*consumers[])(XLogReaderState *)
@@ -340,6 +414,10 @@ static void
 reset(int which)
 {
 	int i;
+	cluster_page_cold_redo_abort_v1();
+	cold_published = false;
+	cold_skip_mask = data_reads = 0;
+	InRecovery = true;
 	free(decoded);
 	decoded = calloc(1, offsetof(DecodedXLogRecord, blocks) + 4 * sizeof(DecodedBkpBlock));
 	memset(&reader, 0, sizeof(reader));
@@ -688,10 +766,74 @@ UT_TEST(test_visible_refuses_wrong_result_and_predecessor)
 	}
 }
 
+
+UT_TEST(test_cold_skip_has_no_data_or_space_reads)
+{
+	PGAlignedBlock saved;
+	reset(0);
+	cold_published = true;
+	cold_skip_mask = 1U << 2;
+	identity_ok = false;
+	memset(&pages[0], 0xA5, BLCKSZ);
+	saved = pages[0];
+	cluster_page_cold_redo_begin_v1(&reader);
+	UT_ASSERT(run(0));
+	UT_ASSERT_EQ(data_reads, 0);
+	UT_ASSERT_EQ(restart_reads, 0);
+	UT_ASSERT_EQ(dirty, 0);
+	UT_ASSERT(memcmp(saved.data, pages[0].data, BLCKSZ) == 0);
+	cluster_page_cold_redo_abort_v1();
+}
+UT_TEST(test_cold_exact_vm_image_and_same_record_repeat)
+{
+	reset(3);
+	cold_published = true;
+	set_flags(3, XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED | XLH_UPDATE_NEW_ALL_VISIBLE_CLEARED);
+	cluster_page_cold_redo_begin_v1(&reader);
+	if (run(3) && run(4)) {
+		UT_ASSERT_EQ(data_reads, 1);
+		UT_ASSERT_EQ(restart_reads, 1);
+		UT_ASSERT_EQ(dirty, 1);
+		UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 200);
+		cluster_page_cold_redo_end_v1(&reader);
+	} else {
+		UT_ASSERT(false);
+		cluster_page_cold_redo_abort_v1();
+	}
+}
+UT_TEST(test_cold_mixed_vm_verdicts_and_missing_bracket)
+{
+	PGAlignedBlock saved;
+	reset(3);
+	decoded->blocks[1] = decoded->blocks[0];
+	decoded->blocks[0].blkno = VM_HEAP_BLOCKS;
+	add_image(3, 1, VISIBILITYMAP_VALID_BITS);
+	set_flags(3, XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED | XLH_UPDATE_NEW_ALL_VISIBLE_CLEARED);
+	cold_published = true;
+	cold_skip_mask = 1U << 2;
+	memset(&pages[0], 0xA5, BLCKSZ);
+	saved = pages[0];
+	cluster_page_cold_redo_begin_v1(&reader);
+	if (run(3) && run(4)) {
+		UT_ASSERT_EQ(data_reads, 1);
+		UT_ASSERT_EQ(dirty, 1);
+		UT_ASSERT(memcmp(saved.data, pages[0].data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 200);
+		cluster_page_cold_redo_end_v1(&reader);
+	} else {
+		UT_ASSERT(false);
+		cluster_page_cold_redo_abort_v1();
+	}
+	reset(0);
+	cold_published = true;
+	UT_ASSERT(!run(0));
+	UT_ASSERT_EQ(data_reads, 0);
+	UT_ASSERT_EQ(dirty, 0);
+}
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(22);
 	UT_RUN(test_delete);
 	UT_RUN(test_insert);
 	UT_RUN(test_multi_insert);
@@ -711,6 +853,9 @@ main(void)
 	UT_RUN(test_already_clear_but_versioned_vm_still_replays);
 	UT_RUN(test_visible_exact_image_and_repeat);
 	UT_RUN(test_visible_refuses_wrong_result_and_predecessor);
+	UT_RUN(test_cold_skip_has_no_data_or_space_reads);
+	UT_RUN(test_cold_exact_vm_image_and_same_record_repeat);
+	UT_RUN(test_cold_mixed_vm_verdicts_and_missing_bracket);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

@@ -440,7 +440,7 @@ TESTS += test_cluster_btree_structure_version
 TESTS += test_cluster_sequence_version
 TESTS += test_cluster_relation_wal_policy
 TESTS += test_cluster_heap_small_redo
-TESTS += test_cluster_btree_redo
+TESTS += test_cluster_btree_redo test_cluster_cold_init_redo
 TESTS += test_cluster_page_dependency
 TESTS += test_cluster_undo_producer
 TESTS += test_cluster_undo_native_lifecycle
@@ -1917,17 +1917,24 @@ test_cluster_vm_redo_consumers.inc: $(top_srcdir)/src/backend/access/heap/heapam
 test_cluster_vm_redo_product.o: $(top_srcdir)/src/backend/access/heap/visibilitymap.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_vm_redo_xlogutils.o: $(top_srcdir)/src/backend/access/transam/xlogutils.c
+test_cluster_vm_redo_xlogutils.o: $(top_srcdir)/src/backend/access/transam/xlogutils.c Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DXLogReadBufferExtended=vm_redo_unused_read \
+		-DXLogReadBufferForRedoExtended=vm_redo_unused_for_redo \
 		-ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_vm_redo_reader.o: $(top_srcdir)/src/backend/access/transam/xlogreader.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
+test_cluster_page_cold_redo_product.o: $(top_srcdir)/src/backend/cluster/cluster_page_cold_redo.c \
+		$(top_srcdir)/src/include/cluster/cluster_page_cold_redo.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_vm_redo: test_cluster_vm_redo.c test_cluster_vm_redo_consumers.inc unit_test.h \
+		test_cluster_typed_redo_reader.inc test_cluster_page_cold_redo_product.o \
 		test_cluster_vm_redo_product.o test_cluster_space_bufpage_product.o test_cluster_vm_redo_xlogutils.o \
 		test_cluster_vm_redo_reader.o $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_vm_redo_product.o test_cluster_space_bufpage_product.o \
+		test_cluster_page_cold_redo_product.o \
 		test_cluster_vm_redo_xlogutils.o test_cluster_vm_redo_reader.o $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
@@ -2163,9 +2170,11 @@ test_cluster_generic_product.o: $(top_srcdir)/src/backend/access/transam/generic
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_generic_redo: test_cluster_generic_redo.c unit_test.h \
+		test_cluster_typed_redo_reader.inc test_cluster_page_cold_redo_product.o \
 		test_cluster_generic_product.o test_cluster_vm_redo_reader.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_generic_product.o test_cluster_vm_redo_reader.o \
+		test_cluster_page_cold_redo_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
@@ -4075,7 +4084,8 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
-	rm -f test_cluster_typed_redo_reader.inc
+	rm -f test_cluster_typed_redo_reader.inc test_cluster_typed_redo_fpi.inc test_cluster_cold_init_native.inc
+	rm -f test_cluster_page_cold_redo_product.o
 	rm -f $(CLUSTER_COLD_PLAN_O) $(CLUSTER_COLD_DECODE_O) $(CLUSTER_COLD_STARTUP_O)
 	rm -f test_cluster_block_redeclare_scan.inc
 	rm -f test_cluster_space_recovery_flush.inc
@@ -7541,7 +7551,39 @@ test_cluster_typed_redo_reader.inc: $(top_srcdir)/src/backend/access/transam/xlo
 	awk '/^XLogReadBufferForRedoExtended\(/ { print "XLogRedoAction"; emit=1; count++ } emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_typed_redo_fpi.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk 'BEGIN { print "static void test_native_fpi_redo(XLogReaderState *record) { uint8 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;" } \
+	     /for \(uint8 block_id = 0; block_id <= XLogRecMaxBlockId\(record\); block_id\+\+\)/ { emit=1; count++ } \
+	     emit { print; line=$$0; opens=gsub(/\{/, "", line); line=$$0; closes=gsub(/\}/, "", line); depth+=opens-closes; if (opens) started=1; if (started && depth==0) emit=0 } \
+	     END { print "}"; if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_typed_redo: test_cluster_typed_redo.c unit_test.h test_cluster_typed_redo_reader.inc \
+		test_cluster_typed_redo_fpi.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_page_cold_redo.c \
 		$(top_srcdir)/src/include/cluster/cluster_page_cold_redo.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+# Original constructor bodies and page helpers; buffer I/O is the fixture.
+test_cluster_cold_init_native.inc: $(top_srcdir)/src/backend/access/hash/hashutil.c \
+		$(top_srcdir)/src/backend/access/hash/hashpage.c \
+		$(top_srcdir)/src/backend/access/hash/hashovfl.c \
+		$(top_srcdir)/src/backend/access/hash/hash_xlog.c \
+		$(top_srcdir)/src/backend/access/brin/brin_pageops.c \
+		$(top_srcdir)/src/backend/access/brin/brin_revmap.c \
+		$(top_srcdir)/src/backend/access/brin/brin_xlog.c \
+		$(top_srcdir)/src/backend/access/gin/ginutil.c \
+		$(top_srcdir)/src/backend/access/gin/ginxlog.c \
+		$(top_srcdir)/src/backend/access/gist/gistutil.c \
+		$(top_srcdir)/src/backend/access/gist/gistxlog.c \
+		$(top_srcdir)/src/backend/access/spgist/spgutils.c \
+		$(top_srcdir)/src/backend/access/spgist/spgdoinsert.c \
+		$(top_srcdir)/src/backend/access/spgist/spgxlog.c \
+		$(top_srcdir)/src/backend/commands/sequence.c Makefile
+	awk '/^(_hash_spareindex|_hash_get_totalbuckets|_hash_pageinit|_hash_initbuf|_hash_init_metabuffer|_hash_initbitmapbuffer|hash_xlog_init_meta_page|hash_xlog_init_bitmap_page|hash_xlog_add_ovfl_page|hash_xlog_split_allocate_page|brin_page_init|brin_metapage_init|brinSetHeapBlockItemptr|brin_xlog_createidx|brin_xlog_insert_update|brin_xlog_revmap_extend|GinInitPage|GinInitBuffer|GinInitMetabuffer|ginRedoCreatePTree|ginRedoUpdateMetapage|ginRedoInsertListPage|ginRedoDeleteListPages|gistinitpage|GISTInitBuffer|gistfillbuffer|gistRedoClearFollowRight|decodePageSplitRecord|gistRedoPageSplitRecord|SpGistInitPage|SpGistInitBuffer|spgFormDeadTuple|spgUpdateNodeLink|cmpOffsetNumbers|spgPageIndexMultiDelete|fillFakeState|addOrReplaceTuple|spgRedoAddLeaf|spgRedoMoveLeafs|spgRedoAddNode|spgRedoSplitTuple|spgRedoPickSplit|seq_redo)\(/ { print previous; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } { previous=$$0 } END { if (found != 43) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+test_cluster_cold_init_redo: test_cluster_cold_init_redo.c test_cluster_cold_init_native.inc unit_test.h \
+		test_cluster_space_bufpage_product.o $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -o $@

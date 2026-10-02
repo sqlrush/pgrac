@@ -281,53 +281,49 @@ gistRedoPageSplitRecord(XLogReaderState *record)
 			isrootsplit = true;
 		}
 
-		buffer = XLogInitBufferForRedo(record, i + 1);
-		page = (Page) BufferGetPage(buffer);
-		data = XLogRecGetBlockData(record, i + 1, &datalen);
+		if (XLogReadBufferForRedoExtended(record, i + 1, RBM_ZERO_AND_LOCK, false, &buffer)
+			== BLK_NEEDS_REDO) {
+			page = (Page)BufferGetPage(buffer);
+			data = XLogRecGetBlockData(record, i + 1, &datalen);
 
-		tuples = decodePageSplitRecord(data, datalen, &num);
+			tuples = decodePageSplitRecord(data, datalen, &num);
 
-		/* ok, clear buffer */
-		if (xldata->origleaf && blkno != GIST_ROOT_BLKNO)
-			flags = F_LEAF;
-		else
-			flags = 0;
-		GISTInitBuffer(buffer, flags);
-
-		/* and fill it */
-		gistfillbuffer(page, tuples, num, FirstOffsetNumber);
-
-		if (blkno == GIST_ROOT_BLKNO)
-		{
-			GistPageGetOpaque(page)->rightlink = InvalidBlockNumber;
-			GistPageSetNSN(page, xldata->orignsn);
-			GistClearFollowRight(page);
-		}
-		else
-		{
-			if (i < xldata->npage - 1)
-			{
-				BlockNumber nextblkno;
-
-				XLogRecGetBlockTag(record, i + 2, NULL, NULL, &nextblkno);
-				GistPageGetOpaque(page)->rightlink = nextblkno;
-			}
+			/* ok, clear buffer */
+			if (xldata->origleaf && blkno != GIST_ROOT_BLKNO)
+				flags = F_LEAF;
 			else
-				GistPageGetOpaque(page)->rightlink = xldata->origrlink;
-			GistPageSetNSN(page, xldata->orignsn);
-			if (i < xldata->npage - 1 && !isrootsplit &&
-				xldata->markfollowright)
-				GistMarkFollowRight(page);
-			else
+				flags = 0;
+			GISTInitBuffer(buffer, flags);
+
+			/* and fill it */
+			gistfillbuffer(page, tuples, num, FirstOffsetNumber);
+
+			if (blkno == GIST_ROOT_BLKNO) {
+				GistPageGetOpaque(page)->rightlink = InvalidBlockNumber;
+				GistPageSetNSN(page, xldata->orignsn);
 				GistClearFollowRight(page);
-		}
+			} else {
+				if (i < xldata->npage - 1) {
+					BlockNumber nextblkno;
 
-		PageSetLSN(page, lsn);
-		MarkBufferDirty(buffer);
+					XLogRecGetBlockTag(record, i + 2, NULL, NULL, &nextblkno);
+					GistPageGetOpaque(page)->rightlink = nextblkno;
+				} else
+					GistPageGetOpaque(page)->rightlink = xldata->origrlink;
+				GistPageSetNSN(page, xldata->orignsn);
+				if (i < xldata->npage - 1 && !isrootsplit && xldata->markfollowright)
+					GistMarkFollowRight(page);
+				else
+					GistClearFollowRight(page);
+			}
+
+			PageSetLSN(page, lsn);
+			MarkBufferDirty(buffer);
+		}
 
 		if (i == 0)
 			firstbuffer = buffer;
-		else
+		else if (BufferIsValid(buffer))
 			UnlockReleaseBuffer(buffer);
 	}
 
@@ -336,7 +332,8 @@ gistRedoPageSplitRecord(XLogReaderState *record)
 		gistRedoClearFollowRight(record, 0);
 
 	/* Finally, release lock on the first page */
-	UnlockReleaseBuffer(firstbuffer);
+	if (BufferIsValid(firstbuffer))
+		UnlockReleaseBuffer(firstbuffer);
 }
 
 /* redo page deletion */

@@ -96,10 +96,10 @@ spgRedoAddLeaf(XLogReaderState *record)
 	 */
 	if (xldata->newPage)
 	{
-		buffer = XLogInitBufferForRedo(record, 0);
-		SpGistInitBuffer(buffer,
-						 SPGIST_LEAF | (xldata->storesNulls ? SPGIST_NULLS : 0));
-		action = BLK_NEEDS_REDO;
+		action = XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &buffer);
+		if (action == BLK_NEEDS_REDO) {
+			SpGistInitBuffer(buffer, SPGIST_LEAF | (xldata->storesNulls ? SPGIST_NULLS : 0));
+		}
 	}
 	else
 		action = XLogReadBufferForRedo(record, 0, &buffer);
@@ -207,10 +207,10 @@ spgRedoMoveLeafs(XLogReaderState *record)
 	/* Insert tuples on the dest page (do first, so redirect is valid) */
 	if (xldata->newPage)
 	{
-		buffer = XLogInitBufferForRedo(record, 1);
-		SpGistInitBuffer(buffer,
-						 SPGIST_LEAF | (xldata->storesNulls ? SPGIST_NULLS : 0));
-		action = BLK_NEEDS_REDO;
+		action = XLogReadBufferForRedoExtended(record, 1, RBM_ZERO_AND_LOCK, false, &buffer);
+		if (action == BLK_NEEDS_REDO) {
+			SpGistInitBuffer(buffer, SPGIST_LEAF | (xldata->storesNulls ? SPGIST_NULLS : 0));
+		}
 	}
 	else
 		action = XLogReadBufferForRedo(record, 1, &buffer);
@@ -343,9 +343,10 @@ spgRedoAddNode(XLogReaderState *record)
 		if (xldata->newPage)
 		{
 			/* AddNode is not used for nulls pages */
-			buffer = XLogInitBufferForRedo(record, 1);
-			SpGistInitBuffer(buffer, 0);
-			action = BLK_NEEDS_REDO;
+			action = XLogReadBufferForRedoExtended(record, 1, RBM_ZERO_AND_LOCK, false, &buffer);
+			if (action == BLK_NEEDS_REDO) {
+				SpGistInitBuffer(buffer, 0);
+			}
 		}
 		else
 			action = XLogReadBufferForRedo(record, 1, &buffer);
@@ -483,10 +484,11 @@ spgRedoSplitTuple(XLogReaderState *record)
 	{
 		if (xldata->newPage)
 		{
-			buffer = XLogInitBufferForRedo(record, 1);
-			/* SplitTuple is not used for nulls pages */
-			SpGistInitBuffer(buffer, 0);
-			action = BLK_NEEDS_REDO;
+			action = XLogReadBufferForRedoExtended(record, 1, RBM_ZERO_AND_LOCK, false, &buffer);
+			if (action == BLK_NEEDS_REDO) {
+				/* SplitTuple is not used for nulls pages */
+				SpGistInitBuffer(buffer, 0);
+			}
 		}
 		else
 			action = XLogReadBufferForRedo(record, 1, &buffer);
@@ -577,11 +579,13 @@ spgRedoPickSplit(XLogReaderState *record)
 	else if (xldata->initSrc)
 	{
 		/* just re-init the source page */
-		srcBuffer = XLogInitBufferForRedo(record, 0);
-		srcPage = (Page) BufferGetPage(srcBuffer);
+		srcPage = NULL;
+		if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &srcBuffer)
+			== BLK_NEEDS_REDO) {
+			srcPage = (Page)BufferGetPage(srcBuffer);
 
-		SpGistInitBuffer(srcBuffer,
-						 SPGIST_LEAF | (xldata->storesNulls ? SPGIST_NULLS : 0));
+			SpGistInitBuffer(srcBuffer, SPGIST_LEAF | (xldata->storesNulls ? SPGIST_NULLS : 0));
+		}
 		/* don't update LSN etc till we're done with it */
 	}
 	else
@@ -630,11 +634,13 @@ spgRedoPickSplit(XLogReaderState *record)
 	else if (xldata->initDest)
 	{
 		/* just re-init the dest page */
-		destBuffer = XLogInitBufferForRedo(record, 1);
-		destPage = (Page) BufferGetPage(destBuffer);
+		destPage = NULL;
+		if (XLogReadBufferForRedoExtended(record, 1, RBM_ZERO_AND_LOCK, false, &destBuffer)
+			== BLK_NEEDS_REDO) {
+			destPage = (Page)BufferGetPage(destBuffer);
 
-		SpGistInitBuffer(destBuffer,
-						 SPGIST_LEAF | (xldata->storesNulls ? SPGIST_NULLS : 0));
+			SpGistInitBuffer(destBuffer, SPGIST_LEAF | (xldata->storesNulls ? SPGIST_NULLS : 0));
+		}
 		/* don't update LSN etc till we're done with it */
 	}
 	else
@@ -683,9 +689,10 @@ spgRedoPickSplit(XLogReaderState *record)
 	/* restore new inner tuple */
 	if (xldata->initInner)
 	{
-		innerBuffer = XLogInitBufferForRedo(record, 2);
-		SpGistInitBuffer(innerBuffer, (xldata->storesNulls ? SPGIST_NULLS : 0));
-		action = BLK_NEEDS_REDO;
+		action = XLogReadBufferForRedoExtended(record, 2, RBM_ZERO_AND_LOCK, false, &innerBuffer);
+		if (action == BLK_NEEDS_REDO) {
+			SpGistInitBuffer(innerBuffer, (xldata->storesNulls ? SPGIST_NULLS : 0));
+		}
 	}
 	else
 		action = XLogReadBufferForRedo(record, 2, &innerBuffer);

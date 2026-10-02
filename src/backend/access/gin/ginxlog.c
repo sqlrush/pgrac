@@ -49,7 +49,12 @@ ginRedoCreatePTree(XLogReaderState *record)
 	Buffer		buffer;
 	Page		page;
 
-	buffer = XLogInitBufferForRedo(record, 0);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &buffer)
+		!= BLK_NEEDS_REDO) {
+		if (BufferIsValid(buffer))
+			UnlockReleaseBuffer(buffer);
+		return;
+	}
 	page = (Page) BufferGetPage(buffer);
 
 	GinInitBuffer(buffer, GIN_DATA | GIN_LEAF | GIN_COMPRESSED);
@@ -538,14 +543,16 @@ ginRedoUpdateMetapage(XLogReaderState *record)
 	 * image, so restore the metapage unconditionally without looking at the
 	 * LSN, to avoid torn page hazards.
 	 */
-	metabuffer = XLogInitBufferForRedo(record, 0);
-	Assert(BufferGetBlockNumber(metabuffer) == GIN_METAPAGE_BLKNO);
-	metapage = BufferGetPage(metabuffer);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &metabuffer)
+		== BLK_NEEDS_REDO) {
+		Assert(BufferGetBlockNumber(metabuffer) == GIN_METAPAGE_BLKNO);
+		metapage = BufferGetPage(metabuffer);
 
-	GinInitMetabuffer(metabuffer);
-	memcpy(GinPageGetMeta(metapage), &data->metadata, sizeof(GinMetaPageData));
-	PageSetLSN(metapage, lsn);
-	MarkBufferDirty(metabuffer);
+		GinInitMetabuffer(metabuffer);
+		memcpy(GinPageGetMeta(metapage), &data->metadata, sizeof(GinMetaPageData));
+		PageSetLSN(metapage, lsn);
+		MarkBufferDirty(metabuffer);
+	}
 
 	if (data->ntuples > 0)
 	{
@@ -593,7 +600,8 @@ ginRedoUpdateMetapage(XLogReaderState *record)
 			MarkBufferDirty(buffer);
 		}
 		if (BufferIsValid(buffer))
-			UnlockReleaseBuffer(buffer);
+			if (BufferIsValid(buffer))
+				UnlockReleaseBuffer(buffer);
 	}
 	else if (data->prevTail != InvalidBlockNumber)
 	{
@@ -610,10 +618,12 @@ ginRedoUpdateMetapage(XLogReaderState *record)
 			MarkBufferDirty(buffer);
 		}
 		if (BufferIsValid(buffer))
-			UnlockReleaseBuffer(buffer);
+			if (BufferIsValid(buffer))
+				UnlockReleaseBuffer(buffer);
 	}
 
-	UnlockReleaseBuffer(metabuffer);
+	if (BufferIsValid(metabuffer))
+		UnlockReleaseBuffer(metabuffer);
 }
 
 static void
@@ -632,7 +642,12 @@ ginRedoInsertListPage(XLogReaderState *record)
 	Size		totaltupsize;
 
 	/* We always re-initialize the page. */
-	buffer = XLogInitBufferForRedo(record, 0);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &buffer)
+		!= BLK_NEEDS_REDO) {
+		if (BufferIsValid(buffer))
+			UnlockReleaseBuffer(buffer);
+		return;
+	}
 	page = BufferGetPage(buffer);
 
 	GinInitBuffer(buffer, GIN_LIST);
@@ -680,15 +695,17 @@ ginRedoDeleteListPages(XLogReaderState *record)
 	Page		metapage;
 	int			i;
 
-	metabuffer = XLogInitBufferForRedo(record, 0);
-	Assert(BufferGetBlockNumber(metabuffer) == GIN_METAPAGE_BLKNO);
-	metapage = BufferGetPage(metabuffer);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &metabuffer)
+		== BLK_NEEDS_REDO) {
+		Assert(BufferGetBlockNumber(metabuffer) == GIN_METAPAGE_BLKNO);
+		metapage = BufferGetPage(metabuffer);
 
-	GinInitMetabuffer(metabuffer);
+		GinInitMetabuffer(metabuffer);
 
-	memcpy(GinPageGetMeta(metapage), &data->metadata, sizeof(GinMetaPageData));
-	PageSetLSN(metapage, lsn);
-	MarkBufferDirty(metabuffer);
+		memcpy(GinPageGetMeta(metapage), &data->metadata, sizeof(GinMetaPageData));
+		PageSetLSN(metapage, lsn);
+		MarkBufferDirty(metabuffer);
+	}
 
 	/*
 	 * In normal operation, shiftList() takes exclusive lock on all the
@@ -710,16 +727,20 @@ ginRedoDeleteListPages(XLogReaderState *record)
 		Buffer		buffer;
 		Page		page;
 
-		buffer = XLogInitBufferForRedo(record, i + 1);
-		page = BufferGetPage(buffer);
-		GinInitBuffer(buffer, GIN_DELETED);
+		if (XLogReadBufferForRedoExtended(record, i + 1, RBM_ZERO_AND_LOCK, false, &buffer)
+			== BLK_NEEDS_REDO) {
+			page = BufferGetPage(buffer);
+			GinInitBuffer(buffer, GIN_DELETED);
 
-		PageSetLSN(page, lsn);
-		MarkBufferDirty(buffer);
+			PageSetLSN(page, lsn);
+			MarkBufferDirty(buffer);
+		}
 
-		UnlockReleaseBuffer(buffer);
+		if (BufferIsValid(buffer))
+			UnlockReleaseBuffer(buffer);
 	}
-	UnlockReleaseBuffer(metabuffer);
+	if (BufferIsValid(metabuffer))
+		UnlockReleaseBuffer(metabuffer);
 }
 
 void

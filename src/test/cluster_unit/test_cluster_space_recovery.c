@@ -14,6 +14,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_page_wal.h"
 #include <unistd.h>
 
 #include "access/xlog.h"
@@ -385,6 +386,12 @@ RecoveryInProgress(void)
 {
 	return true;
 }
+static bool cold_write_allowed = true;
+bool
+cluster_page_wal_cold_redo_write_allowed_v1(void)
+{
+	return cold_write_allowed;
+}
 XLogRecPtr
 GetXLogInsertRecPtr(void)
 {
@@ -517,6 +524,7 @@ make_plan(void)
 static void
 reset(void)
 {
+	cold_write_allowed = true;
 	CurrentResourceOwner = source_owner;
 	checksums = true;
 	ignore_checksum_failure = corrupt_checksum = false;
@@ -851,6 +859,39 @@ UT_TEST(test_ordinary_native_flush_keeps_local_wal)
 	UT_ASSERT_EQ(io_aborts, 0);
 }
 
+UT_TEST(test_cold_violation_blocks_native_write_even_for_already_dirty_page)
+{
+	for (int prior_dirty = 0; prior_dirty < 2; prior_dirty++) {
+		uint32 state;
+		volatile bool caught = false;
+		reset();
+		if (prior_dirty)
+			pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state,
+								   BM_DIRTY | BM_CHECKPOINT_NEEDED);
+		/* The cold dirty hook trips the shared latch while content-X is held.
+		 * MarkBufferDirty may still publish dirty before the rmgr releases X. */
+		cold_write_allowed = false;
+		pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_DIRTY | BM_JUST_DIRTIED);
+		state = pg_atomic_read_u32(&descriptors[1].bufferdesc.state);
+		PG_TRY();
+		{
+			FlushBufferWithRecovery(&descriptors[1].bufferdesc, &relation, IOOBJECT_RELATION,
+									IOCONTEXT_NORMAL, NULL, NULL, NULL, NULL);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(wal_flushes, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&descriptors[1].bufferdesc.state), state);
+		UT_ASSERT_EQ(io_aborts, 0);
+	}
+	cold_write_allowed = true;
+}
+
 UT_TEST(test_failed_install_preserves_checkpoint_of_original_dirty_page)
 {
 	for (int was_dirty = 0; was_dirty < 2; was_dirty++) {
@@ -1026,7 +1067,8 @@ UT_TEST(test_successor_cache_without_physical_proof_refuses)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
+	UT_RUN(test_cold_violation_blocks_native_write_even_for_already_dirty_page);
 	UT_RUN(test_failed_install_preserves_checkpoint_of_original_dirty_page);
 	UT_RUN(test_interleaved_writers_use_durable_successor_before_suffix);
 	UT_RUN(test_survivor_extension_after_preflight_is_not_overwritten);

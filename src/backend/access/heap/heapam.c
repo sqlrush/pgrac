@@ -22992,15 +22992,16 @@ heap_xlog_insert(XLogReaderState *record)
 	 */
 	if (XLogRecGetInfo(record) & XLOG_HEAP_INIT_PAGE)
 	{
-		buffer = XLogInitBufferForRedo(record, 0);
-		page = BufferGetPage(buffer);
-		/* PGRAC: heap WAL redo must restore ITL slot array (stage 1.5). */
+		action = XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &buffer);
+		if (action == BLK_NEEDS_REDO) {
+			page = BufferGetPage(buffer);
+			/* PGRAC: heap WAL redo must restore ITL slot array (stage 1.5). */
 #ifdef USE_PGRAC_CLUSTER
-		PageInitHeapPage(page, BufferGetPageSize(buffer), 0);
+			PageInitHeapPage(page, BufferGetPageSize(buffer), 0);
 #else
-		PageInit(page, BufferGetPageSize(buffer), 0);
+			PageInit(page, BufferGetPageSize(buffer), 0);
 #endif
-		action = BLK_NEEDS_REDO;
+		}
 	}
 	else
 		action = XLogReadBufferForRedo(record, 0, &buffer);
@@ -23149,15 +23150,16 @@ heap_xlog_multi_insert(XLogReaderState *record)
 
 	if (isinit)
 	{
-		buffer = XLogInitBufferForRedo(record, 0);
-		page = BufferGetPage(buffer);
-		/* PGRAC: heap WAL redo must restore ITL slot array (stage 1.5). */
+		action = XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &buffer);
+		if (action == BLK_NEEDS_REDO) {
+			page = BufferGetPage(buffer);
+			/* PGRAC: heap WAL redo must restore ITL slot array (stage 1.5). */
 #ifdef USE_PGRAC_CLUSTER
-		PageInitHeapPage(page, BufferGetPageSize(buffer), 0);
+			PageInitHeapPage(page, BufferGetPageSize(buffer), 0);
 #else
-		PageInit(page, BufferGetPageSize(buffer), 0);
+			PageInit(page, BufferGetPageSize(buffer), 0);
 #endif
-		action = BLK_NEEDS_REDO;
+		}
 	}
 	else
 		action = XLogReadBufferForRedo(record, 0, &buffer);
@@ -23436,15 +23438,16 @@ heap_xlog_update(XLogReaderState *record, bool hot_update)
 	}
 	else if (XLogRecGetInfo(record) & XLOG_HEAP_INIT_PAGE)
 	{
-		nbuffer = XLogInitBufferForRedo(record, 0);
-		page = (Page) BufferGetPage(nbuffer);
-		/* PGRAC: heap WAL redo must restore ITL slot array (stage 1.5). */
+		newaction = XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &nbuffer);
+		if (newaction == BLK_NEEDS_REDO) {
+			page = (Page)BufferGetPage(nbuffer);
+			/* PGRAC: heap WAL redo must restore ITL slot array (stage 1.5). */
 #ifdef USE_PGRAC_CLUSTER
-		PageInitHeapPage(page, BufferGetPageSize(nbuffer), 0);
+			PageInitHeapPage(page, BufferGetPageSize(nbuffer), 0);
 #else
-		PageInit(page, BufferGetPageSize(nbuffer), 0);
+			PageInit(page, BufferGetPageSize(nbuffer), 0);
 #endif
-		newaction = BLK_NEEDS_REDO;
+		}
 	}
 	else
 		newaction = XLogReadBufferForRedo(record, 0, &nbuffer);

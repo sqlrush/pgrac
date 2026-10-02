@@ -35,6 +35,7 @@ uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
 static PGAlignedBlock pages[TEST_BLOCKS], original[TEST_BLOCKS], output, main_data,
 	payload[TEST_BLOCKS];
 static bool locks[TEST_BLOCKS];
+static unsigned skip_mask, restored_mask, data_reads[TEST_BLOCKS];
 static unsigned dirties, releases, page_comparisons, rejection_checks;
 static XLogReaderState reader;
 static DecodedXLogRecord *decoded;
@@ -102,15 +103,20 @@ XLogRedoAction
 XLogReadBufferForRedo(XLogReaderState *record, uint8 id, Buffer *buffer)
 {
 	UT_ASSERT(record == &reader && id < TEST_BLOCKS && decoded->blocks[id].in_use && !locks[id]);
+	if (skip_mask & (1U << id)) {
+		*buffer = InvalidBuffer;
+		return BLK_NOTFOUND;
+	}
+	data_reads[id]++;
 	*buffer = id + 1;
 	locks[id] = true;
-	return BLK_NEEDS_REDO;
+	return (restored_mask & (1U << id)) ? BLK_RESTORED : BLK_NEEDS_REDO;
 }
 XLogRedoAction
 XLogReadBufferForRedoExtended(XLogReaderState *record, uint8 id, ReadBufferMode mode, bool cleanup,
 							  Buffer *buffer)
 {
-	UT_ASSERT(mode == RBM_NORMAL && cleanup);
+	UT_ASSERT((mode == RBM_NORMAL && cleanup) || (mode == RBM_ZERO_AND_LOCK && !cleanup));
 	return XLogReadBufferForRedo(record, id, buffer);
 }
 void
@@ -198,7 +204,8 @@ reset(uint8 opcode)
 	decoded->main_data = main_data.data;
 	decoded->max_block_id = TEST_BLOCKS - 1;
 	BufferBlocks = pages[0].data;
-	dirties = releases = 0;
+	dirties = releases = skip_mask = restored_mask = 0;
+	memset(data_reads, 0, sizeof(data_reads));
 	for (int i = 0; i < TEST_BLOCKS; i++) {
 		DecodedBkpBlock *b = &decoded->blocks[i];
 		b->rlocator = (RelFileLocator){ 1663, 5, 900 };
@@ -242,6 +249,81 @@ tuple(char *destination, uint64 key)
 	return sizeof(itup) + sizeof(key);
 }
 
+
+/* Replay the same physical record with independently selected block verdicts. */
+static void
+redo_current(void)
+{
+	uint8 info = XLogRecGetInfo(&reader) & ~XLR_INFO_MASK;
+	switch (info) {
+	case XLOG_BTREE_INSERT_LEAF:
+	case XLOG_BTREE_INSERT_UPPER:
+	case XLOG_BTREE_INSERT_META:
+	case XLOG_BTREE_INSERT_POST:
+		btree_xlog_insert(info == XLOG_BTREE_INSERT_LEAF || info == XLOG_BTREE_INSERT_POST,
+						  info == XLOG_BTREE_INSERT_META, info == XLOG_BTREE_INSERT_POST, &reader);
+		break;
+	case XLOG_BTREE_SPLIT_L:
+	case XLOG_BTREE_SPLIT_R:
+		btree_xlog_split(info == XLOG_BTREE_SPLIT_L, &reader);
+		break;
+	case XLOG_BTREE_MARK_PAGE_HALFDEAD:
+		btree_xlog_mark_page_halfdead(info, &reader);
+		break;
+	case XLOG_BTREE_UNLINK_PAGE:
+	case XLOG_BTREE_UNLINK_PAGE_META:
+		btree_xlog_unlink_page(info, &reader);
+		break;
+	case XLOG_BTREE_NEWROOT:
+		btree_xlog_newroot(&reader);
+		break;
+	case XLOG_BTREE_META_CLEANUP:
+		_bt_restore_meta(&reader, 0);
+		break;
+	case XLOG_BTREE_DEDUP:
+		btree_xlog_dedup(&reader);
+		break;
+	case XLOG_BTREE_VACUUM:
+		btree_xlog_vacuum(&reader);
+		break;
+	case XLOG_BTREE_DELETE:
+		btree_xlog_delete(&reader);
+		break;
+	default:
+		abort();
+	}
+}
+static void
+compare_mixed_verdicts(void)
+{
+	PGAlignedBlock expected[TEST_BLOCKS], skipped;
+	memcpy(expected, pages, sizeof(expected));
+	memset(&skipped, 0xA5, BLCKSZ);
+	for (unsigned selected = 0; selected < TEST_BLOCKS; selected++) {
+		if (!decoded->blocks[selected].in_use)
+			continue;
+		for (unsigned restored = 0; restored < 2; restored++) {
+			memcpy(pages, original, sizeof(pages));
+			skip_mask = restored ? 0 : 1U << selected;
+			restored_mask = restored ? 1U << selected : 0;
+			pages[selected] = restored ? expected[selected] : skipped;
+			memset(data_reads, 0, sizeof(data_reads));
+			dirties = releases = 0;
+			redo_current();
+			for (unsigned i = 0; i < TEST_BLOCKS; i++) {
+				UT_ASSERT(!locks[i]);
+				if (!decoded->blocks[i].in_use)
+					continue;
+				UT_ASSERT(memcmp(pages[i].data,
+								 i == selected && !restored ? skipped.data : expected[i].data,
+								 BLCKSZ)
+						  == 0);
+				UT_ASSERT_EQ(data_reads[i], i == selected && !restored ? 0 : 1);
+			}
+		}
+	}
+	skip_mask = restored_mask = 0;
+}
 static void
 compare_all(void)
 {
@@ -259,6 +341,7 @@ compare_all(void)
 		}
 	}
 	UT_ASSERT_EQ(dirties, releases);
+	compare_mixed_verdicts();
 }
 
 UT_TEST(test_native_retail_insert_and_child_meta)

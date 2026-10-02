@@ -22,6 +22,7 @@
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: exact versions for the three internal cleanup owners. */
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_space_storage.h"
 #endif
 
@@ -678,6 +679,8 @@ genericVersionedRedo(XLogReaderState *record)
 	PGAlignedBlock images[MAX_GENERIC_XLOG_PAGES];
 	Buffer buffers[MAX_GENERIC_XLOG_PAGES] = {0};
 	bool apply[MAX_GENERIC_XLOG_PAGES] = {false};
+	bool skip[MAX_GENERIC_XLOG_PAGES] = { false };
+	bool cold = cluster_page_cold_redo_active_v1;
 	const char *failure = "record shape";
 	int count = XLogRecMaxBlockId(record) + 1;
 	int i, j;
@@ -697,6 +700,7 @@ genericVersionedRedo(XLogReaderState *record)
 		DecodedBkpBlock *block;
 		const RfPageVersionEdgeEntryV1 *entry = &edge->entries[i];
 		ClusterSpaceIdentity identity;
+		ClusterColdRedoBlockV1 decision;
 		bool has_image;
 		Size length;
 		char *delta;
@@ -705,16 +709,15 @@ genericVersionedRedo(XLogReaderState *record)
 			goto refused;
 		block = XLogRecGetBlock(record, i);
 		has_image = XLogRecBlockImageApply(record, i);
-		if (block->forknum != MAIN_FORKNUM || block->blkno == InvalidBlockNumber ||
-			(block->flags & BKPBLOCK_WILL_INIT) != 0 ||
-			entry->block_id != i || entry->component_ordinal != block->component_ordinal ||
-			entry->page_class != RF_PAGE_CLASS_ORDINARY ||
-			entry->before_kind != RF_PAGE_STATE_PRESENT || entry->result_kind != RF_PAGE_STATE_PRESENT ||
-			entry->before.mutation_token == 0 || entry->before.mutation_token == edge->result_token ||
-			entry->edge_flags != (has_image ? RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE : 0) ||
-			!cluster_space_relation_read_redo_identity(block->rlocator, &identity) ||
-			memcmp(entry->before.segment_incarnation, identity.incarnation, 16) != 0 ||
-			memcmp(entry->result_incarnation, identity.incarnation, 16) != 0)
+		if (block->forknum != MAIN_FORKNUM || block->blkno == InvalidBlockNumber
+			|| (block->flags & BKPBLOCK_WILL_INIT) != 0 || entry->block_id != i
+			|| entry->component_ordinal != block->component_ordinal
+			|| entry->page_class != RF_PAGE_CLASS_ORDINARY
+			|| entry->before_kind != RF_PAGE_STATE_PRESENT
+			|| entry->result_kind != RF_PAGE_STATE_PRESENT || entry->before.mutation_token == 0
+			|| entry->before.mutation_token == edge->result_token
+			|| entry->edge_flags
+				   != (has_image ? RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE : 0))
 			goto refused;
 		for (j = 0; j < i; j++)
 		{
@@ -722,6 +725,27 @@ genericVersionedRedo(XLogReaderState *record)
 			if (RelFileLocatorEquals(prior->rlocator, block->rlocator) && prior->blkno == block->blkno)
 				goto refused;
 		}
+		/* Cold begin already checked SPACE before taking any DATA lock. The
+		 * published decision must precede every direct read, including SKIP. */
+		if (!cluster_cold_redo_block_decision_v1(record, i, &decision))
+			goto refused;
+		if (cold) {
+			if (decision.action == CLUSTER_COLD_REDO_SKIP) {
+				skip[i] = true;
+				continue;
+			}
+			if (decision.action != CLUSTER_COLD_REDO_APPLY
+				|| decision.result.mutation_token != edge->result_token
+				|| memcmp(entry->before.segment_incarnation, decision.result.segment_incarnation,
+						  16)
+					   != 0
+				|| memcmp(entry->result_incarnation, decision.result.segment_incarnation, 16) != 0)
+				goto refused;
+		} else if (decision.action != CLUSTER_COLD_REDO_NATIVE
+				   || !cluster_space_relation_read_redo_identity(block->rlocator, &identity)
+				   || memcmp(entry->before.segment_incarnation, identity.incarnation, 16) != 0
+				   || memcmp(entry->result_incarnation, identity.incarnation, 16) != 0)
+			goto refused;
 		if (has_image)
 		{
 			if (!XLogRecHasBlockImage(record, i) || !RestoreBlockImage(record, i, images[i].data) ||
@@ -743,11 +767,26 @@ genericVersionedRedo(XLogReaderState *record)
 		DecodedBkpBlock *block = XLogRecGetBlock(record, i);
 		Page page;
 
-		buffers[i] = XLogReadBufferExtended(block->rlocator, MAIN_FORKNUM, block->blkno,
-										   RBM_NORMAL, InvalidBuffer);
-		if (!BufferIsValid(buffers[i]))
-			goto refused;
-		LockBuffer(buffers[i], BUFFER_LOCK_EXCLUSIVE);
+		if (cold) {
+			XLogRedoAction action = XLogReadBufferForRedo(record, i, &buffers[i]);
+			if (skip[i]) {
+				if (action != BLK_NOTFOUND || BufferIsValid(buffers[i]))
+					goto refused;
+				continue;
+			}
+			if (!BufferIsValid(buffers[i]))
+				goto refused;
+			if (action == BLK_RESTORED)
+				continue;
+			if (action != BLK_NEEDS_REDO)
+				goto refused;
+		} else {
+			buffers[i] = XLogReadBufferExtended(block->rlocator, MAIN_FORKNUM, block->blkno,
+												RBM_NORMAL, InvalidBuffer);
+			if (!BufferIsValid(buffers[i]))
+				goto refused;
+			LockBuffer(buffers[i], BUFFER_LOCK_EXCLUSIVE);
+		}
 		page = BufferGetPage(buffers[i]);
 		if (!genericVersionPageValid(page) ||
 			(((PageHeader) page)->pd_block_scn != edge->entries[i].before.mutation_token &&
@@ -763,12 +802,14 @@ genericVersionedRedo(XLogReaderState *record)
 		if (!genericVersionPageValid(images[i].data) ||
 			((PageHeader) images[i].data)->pd_block_scn != edge->result_token)
 			goto refused;
-		apply[i] = ((PageHeader) page)->pd_block_scn != edge->result_token;
+		apply[i] = cold || ((PageHeader)page)->pd_block_scn != edge->result_token;
 		if (!apply[i] && !genericResultMatches(page, images[i].data))
 			goto refused;
 	}
 
-	/* No page changes until all exact predecessors and complete results pass. */
+	/* Native shared replay validates all predecessors before changing pages.
+	 * Cold FPI blocks were restored by the exact reader; all WAL payloads were
+	 * checked before I/O, and any remaining deltas are now ready to publish. */
 	START_CRIT_SECTION();
 	for (i = 0; i < count; i++)
 	{
@@ -786,7 +827,8 @@ genericVersionedRedo(XLogReaderState *record)
 	}
 	END_CRIT_SECTION();
 	for (i = 0; i < count; i++)
-		UnlockReleaseBuffer(buffers[i]);
+		if (BufferIsValid(buffers[i]))
+			UnlockReleaseBuffer(buffers[i]);
 	return;
 
 refused:

@@ -9158,6 +9158,14 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	uint64		resource_x_activation_generation;
 	ClusterPageWalBindingV1 observed_wal, certified_wal;
 
+	/* Cold redo reports dirty-hook violations outside critical sections.
+	 * Observe its shared failure latch under content SHARE, before any I/O;
+	 * the startup owner set it while holding X on the suspect image. */
+	if (cluster_enabled && cluster_shared_config && RecoveryInProgress()
+		&& !cluster_page_wal_cold_redo_write_allowed_v1())
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cannot flush a buffer after typed cold redo proof failure")));
+
 	if (data_wal != NULL
 		&& (recovery != NULL || !cluster_shared_config
 			|| !cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &observed_wal)

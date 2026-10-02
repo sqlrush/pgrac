@@ -29,13 +29,19 @@ brin_xlog_createidx(XLogReaderState *record)
 	Page		page;
 
 	/* create the index' metapage */
-	buf = XLogInitBufferForRedo(record, 0);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &buf)
+		!= BLK_NEEDS_REDO) {
+		if (BufferIsValid(buf))
+			UnlockReleaseBuffer(buf);
+		return;
+	}
 	Assert(BufferIsValid(buf));
 	page = (Page) BufferGetPage(buf);
 	brin_metapage_init(page, xlrec->pagesPerRange, xlrec->version);
 	PageSetLSN(page, lsn);
 	MarkBufferDirty(buf);
-	UnlockReleaseBuffer(buf);
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
 }
 
 /*
@@ -58,10 +64,11 @@ brin_xlog_insert_update(XLogReaderState *record,
 	 */
 	if (XLogRecGetInfo(record) & XLOG_BRIN_INIT_PAGE)
 	{
-		buffer = XLogInitBufferForRedo(record, 0);
-		page = BufferGetPage(buffer);
-		brin_page_init(page, BRIN_PAGETYPE_REGULAR);
-		action = BLK_NEEDS_REDO;
+		action = XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &buffer);
+		if (action == BLK_NEEDS_REDO) {
+			page = BufferGetPage(buffer);
+			brin_page_init(page, BRIN_PAGETYPE_REGULAR);
+		}
 	}
 	else
 	{
@@ -69,7 +76,7 @@ brin_xlog_insert_update(XLogReaderState *record,
 	}
 
 	/* need this page's blkno to store in revmap */
-	regpgno = BufferGetBlockNumber(buffer);
+	XLogRecGetBlockTag(record, 0, NULL, NULL, &regpgno);
 
 	/* insert the index item into the page */
 	if (action == BLK_NEEDS_REDO)
@@ -253,14 +260,17 @@ brin_xlog_revmap_extend(XLogReaderState *record)
 	 * image here.
 	 */
 
-	buf = XLogInitBufferForRedo(record, 1);
-	page = (Page) BufferGetPage(buf);
-	brin_page_init(page, BRIN_PAGETYPE_REVMAP);
+	if (XLogReadBufferForRedoExtended(record, 1, RBM_ZERO_AND_LOCK, false, &buf)
+		== BLK_NEEDS_REDO) {
+		page = (Page)BufferGetPage(buf);
+		brin_page_init(page, BRIN_PAGETYPE_REVMAP);
 
-	PageSetLSN(page, lsn);
-	MarkBufferDirty(buf);
+		PageSetLSN(page, lsn);
+		MarkBufferDirty(buf);
+	}
 
-	UnlockReleaseBuffer(buf);
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
 	if (BufferIsValid(metabuf))
 		UnlockReleaseBuffer(metabuf);
 }

@@ -2,6 +2,9 @@
  * WAL allocation, shared-memory allocation, PCM and content locks are fixtures.
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "postgres.h"
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
 
 #include "access/xlog.h"
 #include "access/xloginsert.h"
@@ -38,6 +41,7 @@ static ClusterSpaceIdentity space;
 static ClusterWalSourceRef writer;
 static void *shared_memory;
 static Size shared_bytes;
+static bool attach_existing;
 static const ClusterShmemRegion *registered_region;
 static RfPageVersionEdgeEntryV1 edge;
 static unsigned allocations, insert_calls, assemble_calls;
@@ -149,6 +153,11 @@ add_size(Size a, Size b)
 void *
 ShmemInitStruct(const char *name, Size size, bool *found)
 {
+	if (attach_existing) {
+		UT_ASSERT_EQ(size, shared_bytes);
+		*found = true;
+		return shared_memory;
+	}
 	free(shared_memory);
 	shared_memory = calloc(1, size);
 	UT_ASSERT(shared_memory != NULL);
@@ -1026,10 +1035,48 @@ detached_reference_rejects_invalid_and_full_pool_without_changes(void)
 	UT_ASSERT_EQ(capture_many(257, 999), CLUSTER_PAGE_WAL_CAPTURED);
 }
 
+static void
+cold_failure_latch_survives_process_attach_and_local_cleanup(void)
+{
+	void *old;
+	pid_t child;
+	int status;
+	reset();
+	UT_ASSERT(cluster_page_wal_cold_redo_write_allowed_v1());
+	old = shared_memory;
+	shared_memory = mmap(NULL, shared_bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, -1, 0);
+	UT_ASSERT(shared_memory != MAP_FAILED);
+	if (shared_memory == MAP_FAILED)
+		abort();
+	memcpy(shared_memory, old, shared_bytes);
+	free(old);
+	attach_existing = true;
+	cluster_page_wal_shmem_init();
+	child = fork();
+	UT_ASSERT(child >= 0);
+	if (child == 0) {
+		cluster_page_wal_shmem_init();
+		cluster_page_wal_cold_redo_fail_v1();
+		_exit(cluster_page_wal_cold_redo_write_allowed_v1() ? 1 : 0);
+	}
+	if (child < 0)
+		abort();
+	UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+	UT_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	UT_ASSERT(!cluster_page_wal_cold_redo_write_allowed_v1());
+	cluster_page_wal_shmem_init(); /* A new attach must not clear the failure. */
+	UT_ASSERT(!cluster_page_wal_cold_redo_write_allowed_v1());
+	munmap(shared_memory, shared_bytes);
+	shared_memory = NULL;
+	attach_existing = false;
+	reset(); /* Only a newly created shared-memory region can clear it. */
+	UT_ASSERT(cluster_page_wal_cold_redo_write_allowed_v1());
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(23);
 	UT_RUN(resident_binding_memory_budget);
 	printf("# Complete private/wire carrier: %zu bytes\n", sizeof(ClusterPageWalBindingV1));
 	cluster_page_wal_shmem_register();
@@ -1055,6 +1102,7 @@ main(void)
 	UT_RUN(eviction_snapshot_requires_exact_clean_revoke);
 	UT_RUN(detached_reference_survives_descriptor_reuse);
 	UT_RUN(detached_reference_rejects_invalid_and_full_pool_without_changes);
+	UT_RUN(cold_failure_latch_survives_process_attach_and_local_cleanup);
 	free(shared_memory);
 	UT_DONE();
 	return ut_failed_count != 0;
