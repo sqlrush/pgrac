@@ -28,6 +28,7 @@
 #include "cluster/cluster_tt_2pc.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_undo_xlog.h"
+#include "storage/standbydefs.h"
 
 #include "unit_test.h"
 
@@ -3886,10 +3887,160 @@ UT_TEST(test_native_control_rejects_bad_shape_and_identity)
 	}
 }
 
+static uint32
+standby_payload(uint8 info, char *payload)
+{
+	if (info == XLOG_STANDBY_LOCK) {
+		xl_standby_locks *locks = (xl_standby_locks *)payload;
+		locks->nlocks = 1;
+		locks->locks[0] = (xl_standby_lock){ 42, 0, 1259 };
+		return offsetof(xl_standby_locks, locks) + sizeof(xl_standby_lock);
+	}
+	if (info == XLOG_RUNNING_XACTS) {
+		xl_running_xacts *running = (xl_running_xacts *)payload;
+		running->xcnt = running->subxcnt = 1;
+		running->nextXid = 5;
+		running->oldestRunningXid = MaxTransactionId;
+		running->latestCompletedXid = 3;
+		running->xids[0] = MaxTransactionId;
+		running->xids[1] = 4;
+		return offsetof(xl_running_xacts, xids) + 2 * sizeof(TransactionId);
+	}
+	{
+		xl_invalidations *invals = (xl_invalidations *)payload;
+		invals->dbId = 1;
+		invals->tsId = 1663;
+		invals->relcacheInitFileInval = true;
+		invals->nmsgs = 1;
+		invals->msgs[0].rc.id = SHAREDINVALRELCACHE_ID;
+		invals->msgs[0].rc.dbId = 0;
+		invals->msgs[0].rc.relId = 0;
+		return MinSizeOfInvalidations + sizeof(SharedInvalidationMessage);
+	}
+}
+
+UT_TEST(test_standby_retains_exact_payload_and_independent_control_obligation)
+{
+	const uint8 infos[] = { XLOG_STANDBY_LOCK, XLOG_RUNNING_XACTS, XLOG_INVALIDATIONS };
+	for (unsigned i = 0; i < lengthof(infos); i++) {
+		RfSideOnlinePlanV1 *plan = space_online_plan(200);
+		FakeXactRecord fake;
+		PGAlignedBlock payload = { 0 };
+		uint8 uuid[16];
+		uint32 length = standby_payload(infos[i], payload.data);
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		RfSideOnlineOperationV1 operation;
+		RfSideOnlineApplyOpsV1 ops = { 0 };
+		ApplyCapture capture = { 0 };
+
+		memset(uuid, 0x44, sizeof(uuid));
+		make_projection_record(&fake, RM_STANDBY_ID, infos[i], payload.data, length);
+		identity = make_identity(&fake, uuid);
+		fake.u.decoded.max_block_id = -1;
+		record = make_projection_record_plan(&fake);
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		memset(fake.data, 0xa5, length);
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 1);
+		assert_contribution_owners(plan, 0, RF_SIDE_CONTRIBUTION_NATIVE_CONTROL, 0);
+		if (rf_side_online_plan_operation_v1(plan, 0, &operation)) {
+			UT_ASSERT_EQ(operation.kind, RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL);
+			UT_ASSERT_EQ(operation.identity.record.rmid, RM_STANDBY_ID);
+			UT_ASSERT_EQ(operation.owned_payload_length, length);
+			UT_ASSERT_EQ(memcmp(operation.owned_payload, payload.data, length), 0);
+		} else
+			UT_ASSERT(false);
+		ops.arg = &capture;
+		ops.begin_protected_set = capture_begin;
+		ops.end_protected_set = capture_end;
+		ops.preflight_projection = accept_preflight;
+		ops.apply_projection = capture_apply_projection;
+		UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &ops),
+					 RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT);
+		UT_ASSERT_EQ(capture.begin_count + capture.projection_count, 0);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_standby_empty_snapshot_and_initial_completed_xid_are_valid)
+{
+	RfSideOnlinePlanV1 *plan = space_online_plan(200);
+	FakeXactRecord fake;
+	xl_running_xacts running = { 0 };
+	uint8 uuid[16];
+	RfPageOnlineRecordIdentityV1 identity;
+	RfDetachedRecordPlanV1 record;
+
+	running.nextXid = running.oldestRunningXid = FirstNormalTransactionId;
+	running.latestCompletedXid = FrozenTransactionId;
+	memset(uuid, 0x44, sizeof(uuid));
+	make_projection_record(&fake, RM_STANDBY_ID, XLOG_RUNNING_XACTS, &running,
+						   offsetof(xl_running_xacts, xids));
+	identity = make_identity(&fake, uuid);
+	fake.u.decoded.max_block_id = -1;
+	record = make_projection_record_plan(&fake);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_standby_invalid_counts_shapes_and_sources_never_seal)
+{
+	const uint8 infos[] = { XLOG_STANDBY_LOCK, XLOG_RUNNING_XACTS, XLOG_INVALIDATIONS };
+	for (unsigned i = 0; i < lengthof(infos); i++)
+		for (unsigned fault = 0; fault < 8; fault++) {
+			RfSideOnlinePlanV1 *plan = space_online_plan(200);
+			FakeXactRecord fake;
+			PGAlignedBlock payload = { 0 };
+			uint8 uuid[16];
+			uint8 info = infos[i];
+			uint32 length = standby_payload(info, payload.data);
+			RfPageOnlineRecordIdentityV1 identity;
+			RfDetachedRecordPlanV1 record;
+			int count = fault == 2 ? -1 : INT_MAX;
+			Size offset = i == 0   ? offsetof(xl_standby_locks, nlocks)
+						  : i == 1 ? offsetof(xl_running_xacts, subxcnt)
+								   : offsetof(xl_invalidations, nmsgs);
+
+			if (fault == 0)
+				length--;
+			if (fault == 1)
+				length++;
+			if (fault == 2 || fault == 3)
+				memcpy(payload.data + offset, &count, sizeof(count));
+			if (fault == 4) {
+				if (i == 0)
+					((xl_standby_locks *)payload.data)->locks[0].xid = InvalidTransactionId;
+				else
+					payload.data[i == 1 ? offsetof(xl_running_xacts, subxid_overflow)
+										: offsetof(xl_invalidations, relcacheInitFileInval)] = 2;
+			}
+			if (fault == 5)
+				info |= XLR_SPECIAL_REL_UPDATE;
+			if (fault == 7)
+				info = 0xf0;
+			memset(uuid, 0x44, sizeof(uuid));
+			make_projection_record(&fake, RM_STANDBY_ID, info, payload.data, length);
+			identity = make_identity(&fake, uuid);
+			fake.u.decoded.max_block_id = fault == 6 ? 0 : -1;
+			record = make_projection_record_plan(&fake);
+			UT_ASSERT_NE(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+						 RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+			rf_side_online_plan_destroy_v1(&plan);
+		}
+}
+
 int
 main(void)
 {
-	UT_PLAN(55);
+	UT_PLAN(58);
+	UT_RUN(test_standby_retains_exact_payload_and_independent_control_obligation);
+	UT_RUN(test_standby_empty_snapshot_and_initial_completed_xid_are_valid);
+	UT_RUN(test_standby_invalid_counts_shapes_and_sources_never_seal);
 	UT_RUN(test_space_contribution_census_includes_history_and_every_drop_page);
 	UT_RUN(test_native_control_is_owned_input_and_not_replay_permission);
 	UT_RUN(test_native_control_rejects_bad_shape_and_identity);

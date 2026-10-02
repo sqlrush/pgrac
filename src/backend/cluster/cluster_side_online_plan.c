@@ -15,6 +15,7 @@
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
+#include "storage/standbydefs.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_native_startup.h"
 #include "cluster/storage/cluster_undo_alloc.h"
@@ -623,18 +624,86 @@ rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request,
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
+/* Standby records have no PCM target, but retain their source obligation.
+ * LOCK/RUNNING can be a no-op only in the original owner's proved primary
+ * context. INVALIDATIONS still need delivery/reset coverage. Validate the
+ * bounded native shape here; never infer either completion from the rmgr. */
+static bool
+side_native_standby_valid(const uint8 *data, uint32 length, uint8 info)
+{
+	switch (info) {
+	case XLOG_STANDBY_LOCK: {
+		int count;
+		Size base = offsetof(xl_standby_locks, locks);
+		if (length < base)
+			return false;
+		memcpy(&count, data + offsetof(xl_standby_locks, nlocks), sizeof(count));
+		if (count < 0 || (uint64)count * sizeof(xl_standby_lock) != length - base)
+			return false;
+		for (int i = 0; i < count; i++) {
+			xl_standby_lock lock;
+			memcpy(&lock, data + base + (Size)i * sizeof(lock), sizeof(lock));
+			/* Shared relations legitimately have database OID zero. */
+			if (!TransactionIdIsNormal(lock.xid) || !OidIsValid(lock.relOid))
+				return false;
+		}
+		return true;
+	}
+	case XLOG_RUNNING_XACTS: {
+		xl_running_xacts running;
+		Size base = offsetof(xl_running_xacts, xids);
+		uint64 count;
+		if (length < base || data[offsetof(xl_running_xacts, subxid_overflow)] > 1)
+			return false;
+		memcpy(&running, data, base);
+		if (running.xcnt < 0 || running.subxcnt < 0 || (running.xcnt == 0 && running.subxcnt != 0)
+			|| !TransactionIdIsNormal(running.nextXid)
+			|| !TransactionIdIsNormal(running.oldestRunningXid)
+			|| !TransactionIdIsValid(running.latestCompletedXid))
+			return false;
+		count = (uint64)running.xcnt + (uint64)running.subxcnt;
+		if (count * sizeof(TransactionId) != length - base)
+			return false;
+		for (uint64 i = 0; i < count; i++) {
+			TransactionId xid;
+			memcpy(&xid, data + base + (Size)i * sizeof(xid), sizeof(xid));
+			if (!TransactionIdIsNormal(xid))
+				return false;
+		}
+		/* XID wrap is native; numeric ordering of the snapshot is not a
+		 * source-completeness or cross-thread visibility proof. */
+		return true;
+	}
+	case XLOG_INVALIDATIONS: {
+		int count;
+		if (length < MinSizeOfInvalidations
+			|| data[offsetof(xl_invalidations, relcacheInitFileInval)] > 1)
+			return false;
+		memcpy(&count, data + offsetof(xl_invalidations, nmsgs), sizeof(count));
+		return count >= 0
+			   && (uint64)count * sizeof(SharedInvalidationMessage)
+					  == length - MinSizeOfInvalidations;
+	}
+	default:
+		return false;
+	}
+}
+
 /* Native control records retain their exact payload and source identity.
  * They are not PAGE work, but dropping them would lose checkpoint/capacity/
- * OID/recovery obligations. The native control consumer must close them. */
+ * OID/recovery/cache obligations. The native control consumer must close them. */
 static bool
 side_native_control_valid(XLogReaderState *reader, const RfPageOnlineRecordIdentityV1 *identity)
 {
 	uint32 length = XLogRecGetDataLen(reader);
 	const uint8 *data = (const uint8 *)XLogRecGetData(reader);
 	uint8 info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
-	if (XLogRecGetRmid(reader) != RM_XLOG_ID || XLogRecMaxBlockId(reader) >= 0
-		|| reader->record->has_page_version_edge || (length > 0 && data == NULL)
-		|| (XLogRecGetInfo(reader) & XLR_INFO_MASK) != 0)
+	if (XLogRecMaxBlockId(reader) >= 0 || reader->record->has_page_version_edge
+		|| (length > 0 && data == NULL) || (XLogRecGetInfo(reader) & XLR_INFO_MASK) != 0)
+		return false;
+	if (XLogRecGetRmid(reader) == RM_STANDBY_ID)
+		return side_native_standby_valid(data, length, info);
+	if (XLogRecGetRmid(reader) != RM_XLOG_ID)
 		return false;
 	switch (info) {
 	case XLOG_CHECKPOINT_SHUTDOWN:
@@ -737,7 +806,7 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 	}
 	memset(&candidate, 0, sizeof(candidate));
 	if (record_plan->route.record_owner == RF_ROUTE_OWNER_SIDE_TYPED) {
-		if (record_plan->route.rmid == RM_XLOG_ID
+		if ((record_plan->route.rmid == RM_XLOG_ID || record_plan->route.rmid == RM_STANDBY_ID)
 			&& record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD) {
 			uint32 length = XLogRecGetDataLen(record_plan->source_record);
 			if (!side_native_control_valid(record_plan->source_record, identity))
