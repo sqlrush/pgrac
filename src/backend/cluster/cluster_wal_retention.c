@@ -86,6 +86,9 @@ struct ClusterWalRootPublishGuard {
 	uint16 thread_id;
 	bool borrowed_from_pin;
 	bool borrowed_from_read_pin;
+	bool converted_from_pin;
+	ClusterWalRetentionPin *pin;
+	ClusterControlRootReadToken root_read;
 	ClusterWalPinLock walr;
 };
 
@@ -641,6 +644,7 @@ static bool
 pin_thread_walr_current(const ClusterWalRetentionPin *pin, const ClusterWalPinThread *thread)
 {
 	const ClusterWalReuseActionGuard *guard = active_reuse_guard;
+	const ClusterWalRootPublishGuard *publisher = active_root_publish_guard;
 
 	if (!thread->walr.held || thread->walr.release_uncertain)
 		return false;
@@ -648,6 +652,18 @@ pin_thread_walr_current(const ClusterWalRetentionPin *pin, const ClusterWalPinTh
 		return true;
 	if (thread->pending.generation != 0)
 		return false;
+	if (publisher != NULL && publisher->pin == pin && publisher->borrowed_from_pin
+		&& publisher->converted_from_pin && publisher->thread_id == thread->duty.origin_thread_id
+		&& publisher->walr.held && !publisher->walr.release_uncertain
+		&& publisher->walr.request.lockmode == ExclusiveLock
+		&& publisher->walr.request.control_owner_id != 0
+		&& publisher->walr.request.control_owner_id == thread->walr.request.control_owner_id
+		&& memcmp(&publisher->root_read, &thread->root_read, sizeof(thread->root_read)) == 0
+		&& memcmp(&publisher->walr.request.resid, &thread->walr.request.resid,
+				  sizeof(thread->walr.request.resid))
+			   == 0
+		&& walr_request_current(&publisher->walr.request))
+		return true;
 	return guard != NULL && guard->pin_or_null == pin && guard->serial_or_null == thread->serial
 		   && guard->walr.converted_from_pin && guard->walr.held && guard->walr.coordinated
 		   && !guard->walr.release_uncertain && guard->walr.mode == ExclusiveLock
@@ -985,7 +1001,8 @@ cluster_wal_retention_pin_release(ClusterWalRetentionPin **pin)
 		return CLUSTER_WALR_RELEASE_INVALID;
 	if (*pin == NULL)
 		return CLUSTER_WALR_RELEASE_NOT_HELD;
-	if (!pin_valid(*pin))
+	if (!pin_valid(*pin)
+		|| (active_root_publish_guard != NULL && active_root_publish_guard->borrowed_from_pin))
 		return CLUSTER_WALR_RELEASE_INVALID;
 	result = pin_release_locks(*pin);
 	if (result != CLUSTER_WALR_RELEASE_CONFIRMED) {
@@ -1186,6 +1203,56 @@ cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken
 			return CLUSTER_WAL_PIN_STALE;
 		}
 		guard->borrowed_from_pin = true;
+		if (require_sealed_pin) {
+			ClusterWalPinThread *thread = &active_pin->threads[i];
+			ClusterLockAcquireResult converted;
+			bool cleanup_required = false;
+
+			/* CF publication must exclude every retained old executor, not
+			 * merely follow our own IR release. Never wait for X while any IR
+			 * from the composite recovery scope is still held or uncertain. */
+			for (uint16 j = 0; j < active_pin->nthreads; j++) {
+				ClusterRecoverySerialGuard *serial = active_pin->threads[j].serial;
+				if (serial == NULL || serial->held || serial->release_uncertain) {
+					pfree(guard);
+					return CLUSTER_WAL_PIN_STALE;
+				}
+			}
+			if (thread->walr.request.lockmode != ShareLock
+				|| thread->walr.request.holder.request_id != thread->walr.request.request_id
+				|| !walr_request_has_native_lock(&thread->walr.request)) {
+				pfree(guard);
+				return CLUSTER_WAL_PIN_STALE;
+			}
+			guard->pin = active_pin;
+			guard->root_read = *expected_root;
+			guard->walr.request = thread->walr.request;
+			guard->walr.request.lockmode = ExclusiveLock;
+			guard->walr.request.op = CLUSTER_LOCK_OP_CONVERT;
+			guard->walr.request.current_mode = ShareLock;
+			guard->walr.request.convert_old_request_id = thread->walr.request.request_id;
+			guard->walr.request.dontwait = true;
+			guard->walr.request.timeout_ms = 1;
+			/* Register before any throwing conversion. Until it returns, the
+			 * original pin/stable owner retains all remote cleanup duties. */
+			active_root_publish_guard = guard;
+			converted = walr_request_convert_actual(&guard->walr.request, 0, &cleanup_required);
+			if (converted != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
+				if (cleanup_required) {
+					guard->converted_from_pin = guard->walr.held = true;
+					guard->walr.release_uncertain = true;
+					active_pin->poisoned = true;
+					*out_guard = guard;
+					return CLUSTER_WAL_PIN_RELEASE_UNCERTAIN;
+				}
+				if (converted != CLUSTER_LOCK_ACQUIRE_NOT_AVAIL)
+					active_pin->poisoned = true;
+				active_root_publish_guard = NULL;
+				pfree(guard);
+				return CLUSTER_WAL_PIN_UNAVAILABLE;
+			}
+			guard->converted_from_pin = guard->walr.held = true;
+		}
 	} else {
 		ClusterLockAcquireResult result;
 
@@ -1221,7 +1288,33 @@ cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard)
 	if (*guard != active_root_publish_guard || (*guard)->magic != CLUSTER_WAL_ROOT_PUBLISH_MAGIC
 		|| (*guard)->owner_pid != MyProcPid || (*guard)->owner != CurrentResourceOwner)
 		return CLUSTER_WALR_RELEASE_INVALID;
-	if (!(*guard)->borrowed_from_pin && !(*guard)->borrowed_from_read_pin) {
+	if ((*guard)->converted_from_pin) {
+		ClusterWalPinThread *thread = pin_find_thread((*guard)->pin, (*guard)->thread_id);
+		ClusterLockAcquireRequest down = (*guard)->walr.request;
+		bool cleanup_required = false;
+		if ((*guard)->pin != active_pin || thread == NULL || !thread->walr.held
+			|| !(*guard)->walr.held || down.lockmode != ExclusiveLock)
+			return CLUSTER_WALR_RELEASE_INVALID;
+		if ((*guard)->walr.release_uncertain)
+			return CLUSTER_WALR_RELEASE_UNCONFIRMED;
+		down.lockmode = ShareLock;
+		down.op = CLUSTER_LOCK_OP_CONVERT;
+		down.current_mode = ExclusiveLock;
+		down.convert_old_request_id = 0;
+		down.dontwait = true;
+		if (walr_request_convert_actual(&down, (*guard)->walr.request.request_id, &cleanup_required)
+			!= CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
+			(*guard)->walr.release_uncertain = true;
+			(*guard)->pin->poisoned = true;
+			return CLUSTER_WALR_RELEASE_UNCONFIRMED;
+		}
+		/* Same native accounting as the existing reuse-guard consumer:
+		 * retain the original S ref, remove temporary X and extra S refs. */
+		walr_native_lock_release_or_fatal(&(*guard)->walr.request);
+		walr_native_lock_release_or_fatal(&down);
+		thread->walr.request = down;
+		(*guard)->walr.held = false;
+	} else if (!(*guard)->borrowed_from_pin && !(*guard)->borrowed_from_read_pin) {
 		ClusterLockAcquireResult lock_result;
 
 		lock_result = walr_request_release_actual(&(*guard)->walr.request);
@@ -1324,6 +1417,9 @@ cluster_wal_retention_root_publish_sealed_current(const ClusterWalRootPublishGua
 	if (guard == NULL || guard != active_root_publish_guard || expected_root == NULL
 		|| guard->magic != CLUSTER_WAL_ROOT_PUBLISH_MAGIC || guard->owner_pid != MyProcPid
 		|| guard->owner != CurrentResourceOwner || !guard->borrowed_from_pin
+		|| !guard->converted_from_pin || guard->pin != active_pin || !guard->walr.held
+		|| guard->walr.release_uncertain || guard->walr.request.lockmode != ExclusiveLock
+		|| !walr_request_current(&guard->walr.request)
 		|| guard->thread_id != expected_root->origin_thread_id || !pin_valid(active_pin)
 		|| active_pin->poisoned || active_pin->state != CLUSTER_WAL_PIN_STATE_SEALED)
 		return false;
@@ -1399,6 +1495,22 @@ walr_resource_release_callback(ResourceReleasePhase phase, bool isCommit, bool i
 		&& active_root_publish_guard->owner == CurrentResourceOwner) {
 		ClusterWalRootPublishGuard *guard = active_root_publish_guard;
 
+		if (guard->converted_from_pin) {
+			ClusterWalPinThread *thread = pin_find_thread(guard->pin, guard->thread_id);
+			/* ERROR surrenders the one converted coordinated holder rather
+			 * than trying to reconstruct S after an uncertain downgrade. */
+			if (guard->pin != active_pin || thread == NULL || !thread->walr.held
+				|| !guard->walr.held
+				|| walr_request_release_actual(&guard->walr.request)
+					   != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
+				elog(FATAL, "could not confirm WALR exclusive root-publisher cleanup");
+			walr_native_lock_release_or_fatal(&thread->walr.request);
+			thread->walr.held = false;
+			thread->walr.release_uncertain = false;
+			guard->walr.held = false;
+			guard->converted_from_pin = false;
+			guard->pin->poisoned = true;
+		}
 		if (cluster_wal_retention_root_publish_end(&guard) != CLUSTER_WALR_RELEASE_CONFIRMED)
 			elog(FATAL, "could not confirm WALR root-publisher cleanup");
 	}

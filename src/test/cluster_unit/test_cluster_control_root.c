@@ -18125,12 +18125,14 @@ UT_TEST(test_v3_recovery_complete_preserves_exact_selected_inputs)
 
 UT_TEST(test_v3_recovery_complete_never_accepts_partial_or_unowned_terminal)
 {
-	for (int fault = 0; fault < 10; ++fault) {
+	for (int fault = 0; fault < 11; ++fault) {
 		uint8 before[66048];
 		ClusterControlRootSnapshot input, out;
 		ClusterControlRootReadToken token, published;
 		ClusterControlRootPatch patch;
+		int walr_end_before;
 		v3_complete_fixture(before, &input, &token, &patch);
+		walr_end_before = test_walr_end_calls;
 		if (fault == 0)
 			patch.desired.recovered_through_lsn_exclusive--;
 		else if (fault == 1)
@@ -18156,8 +18158,9 @@ UT_TEST(test_v3_recovery_complete_never_accepts_partial_or_unowned_terminal)
 														input.identity.system_identifier, &decoded),
 						 0);
 			token.record_crc32c = decoded.record_crc32c[0];
-		} else
-			{
+		} else if (fault == 10)
+			test_walr_begin_result = CLUSTER_WAL_PIN_UNAVAILABLE;
+		else {
 			char path[MAXPGPATH];
 			v2_claim_path(&test_checkpoint_prefix_ref.claim.identity, path);
 			UT_ASSERT_EQ(unlink(path), 0);
@@ -18168,6 +18171,13 @@ UT_TEST(test_v3_recovery_complete_never_accepts_partial_or_unowned_terminal)
 		UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&published, sizeof(published)));
 		v2_assert_primary_unchanged(before);
 		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		if (fault == 10) {
+			/* Another recoverer's S excludes completion before CF or DATA. */
+			UT_ASSERT_EQ(test_walr_end_calls, walr_end_before);
+			test_walr_begin_result = CLUSTER_WAL_PIN_OK;
+			UT_ASSERT_EQ(v3_complete_publish(&token, &patch, &out, &published), 0);
+			UT_ASSERT_EQ(out.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
+		}
 	}
 }
 
