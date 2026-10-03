@@ -178,6 +178,19 @@ typedef struct ClusterWalStartupImage {
 	ClusterWalThreadClaimV2 claim;
 } ClusterWalStartupImage;
 
+/* Original creator's memory-only composition of a complete first-input set.
+ * sources contains the actual original records/common object references and
+ * no startup references. Each configured origin supplies a distinct nonzero
+ * operation UUID; nonmembers supply zero. No I/O, randomness, creation proof,
+ * serving or writer permission. The creator must independently validate and
+ * persist every referenced object before publishing the returned ROOT last.
+ * Distinct outputs clear on refusal; overlapping arguments are not touched. */
+extern ClusterControlRootResult cluster_control_root_v3_initialized_inputs(
+	const ControlRootImage *sources,
+	const uint8 operation_ids[CLUSTER_CONTROL_ROOT_RECORD_COUNT][16], uint32 segment_size,
+	ControlRootImage *root,
+	uint8 inputs[CLUSTER_CONTROL_ROOT_RECORD_COUNT][CLUSTER_WAL_STARTUP_BYTES]);
+
 /* Checkpoint-less initialization terminal. Logical carrier only: the embedded
  * original and physical census grant neither recovery nor serving permission.
  * Author: SqlRush <sqlrush@gmail.com> */

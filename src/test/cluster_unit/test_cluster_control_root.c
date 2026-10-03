@@ -21354,7 +21354,11 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(395);
+	UT_PLAN(399);
+	UT_RUN(test_initialized_complete_cohort_constructs_all_selected_inputs);
+	UT_RUN(test_initialized_cohort_refuses_incomplete_or_existing_sources);
+	UT_RUN(test_initialized_cohort_refuses_wrong_identity_or_geometry);
+	UT_RUN(test_initialized_cohort_overlap_never_changes_input);
 	UT_RUN(test_initialized_seed_literal_roundtrip_has_no_writer);
 	UT_RUN(test_initialized_bound_phases_keep_real_successor_rules);
 	UT_RUN(test_initialized_seed_refuses_unearned_target_and_prior_root);

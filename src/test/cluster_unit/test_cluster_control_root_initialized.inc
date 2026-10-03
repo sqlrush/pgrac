@@ -238,3 +238,115 @@ UT_TEST(test_initialized_does_not_make_clean_or_import_legal)
 		UT_ASSERT(startup_refused(bytes, sizeof(bytes), &root, 0) != 0);
 	}
 }
+
+static void
+initialized_cohort_fixture(ControlRootImage *sources, uint8 ids[128][16])
+{
+	uint8 bytes[1536];
+	initialized_fixture(bytes, sources, true, 1);
+	memset(ids, 0, 128 * 16);
+	memset(sources->startup, 0, sizeof(sources->startup));
+	sources->header.v2.configured[0] = 15;
+	for (unsigned node = 0; node < 4; ++node) {
+		sources->present[node] = true;
+		sources->records[node] = sources->records[0];
+		sources->records[node].identity.origin_node_id = node;
+		sources->records[node].identity.origin_thread_id = node + 1;
+		sources->records[node].identity.origin_owner_incarnation += node;
+		sources->refs[node] = sources->refs[0];
+		sources->publisher_node[node] = node;
+		sources->publisher_incarnation[node] = sources->records[node].identity.origin_owner_incarnation;
+		ids[node][0] = node + 1;
+	}
+}
+
+UT_TEST(test_initialized_complete_cohort_constructs_all_selected_inputs)
+{
+	ControlRootImage sources, before, root, decoded_root;
+	uint8 ids[128][16], inputs[128][1536];
+	initialized_cohort_fixture(&sources, ids);
+	before = sources;
+	UT_ASSERT_EQ(cluster_control_root_v3_initialized_inputs(&sources, ids, 16 * 1024 * 1024,
+		&root, inputs), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(memcmp(&before, &sources, sizeof(sources)), 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_decode(root.bytes, sizeof(root.bytes),
+		root.header.storage_uuid, root.header.system_identifier, &decoded_root), 0);
+	for (unsigned node = 0; node < 128; ++node) {
+		ClusterWalStartupImage op;
+		if (node >= 4) {
+			UT_ASSERT(v2_zero(inputs[node], sizeof(inputs[node])));
+			UT_ASSERT(!root.present[node] && root.startup[node].generation == 0);
+			continue;
+		}
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_decode(inputs[node], 1536,
+			&decoded_root, node, &op), 0);
+		UT_ASSERT_EQ(op.input_kind, 4);
+		UT_ASSERT_EQ(op.formation_epoch, 0);
+		UT_ASSERT_EQ(op.phase, 1);
+		UT_ASSERT(v2_zero(&op.claim, sizeof(op.claim)));
+		UT_ASSERT_EQ(memcmp(op.operation_uuid, ids[node], 16), 0);
+		UT_ASSERT_EQ(memcmp(&op.predecessor.snapshot, &sources.records[node],
+			sizeof(op.predecessor.snapshot)), 0);
+		UT_ASSERT_EQ(op.input_record_end, sources.records[node].validated_tail_lsn_exclusive);
+		UT_ASSERT_EQ(root.startup[node].generation, 1);
+	}
+}
+
+UT_TEST(test_initialized_cohort_refuses_incomplete_or_existing_sources)
+{
+	ControlRootImage sources, before, root;
+	uint8 ids[128][16], inputs[128][1536];
+	for (unsigned fault = 0; fault < 9; ++fault) {
+		initialized_cohort_fixture(&sources, ids);
+		switch (fault) {
+		case 0: sources.present[3] = false; break;
+		case 1: sources.header.v2.configured[0] = 7; break;
+		case 2: sources.startup[0].generation = 1; sources.startup[0].sha256[0] = 1; break;
+		case 3: sources.records[3].identity.root_lineage_seq = 2; break;
+		case 4: sources.header.file_txn_seq = 2; break;
+		case 5: sources.header.v2.config_generation = 2; break;
+		case 6: sources.header.v2.serving[0] = 1; break;
+		case 7: sources.header.v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_CLOSED; break;
+		case 8: sources.refs[3].history_generation = 1; sources.refs[3].history_sha256[0] = 1; break;
+		}
+		before = sources;
+		memset(&root, 0x33, sizeof(root)); memset(inputs, 0x44, sizeof(inputs));
+		UT_ASSERT(cluster_control_root_v3_initialized_inputs(&sources, ids, 16 * 1024 * 1024,
+			&root, inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(v2_zero(&root, sizeof(root)) && v2_zero(inputs, sizeof(inputs)));
+		UT_ASSERT_EQ(memcmp(&before, &sources, sizeof(sources)), 0);
+	}
+}
+
+UT_TEST(test_initialized_cohort_refuses_wrong_identity_or_geometry)
+{
+	ControlRootImage sources, root;
+	uint8 ids[128][16], inputs[128][1536];
+	for (unsigned fault = 0; fault < 6; ++fault) {
+		uint32 size = 16 * 1024 * 1024;
+		initialized_cohort_fixture(&sources, ids);
+		switch (fault) {
+		case 0: memset(ids[3], 0, 16); break;
+		case 1: memcpy(ids[3], ids[0], 16); break;
+		case 2: ids[4][0] = 1; break;
+		case 3: sources.records[3].identity.system_identifier++; break;
+		case 4: size = 3 * 1024 * 1024; break;
+		case 5: sources.header.format_version = 2; break;
+		}
+		UT_ASSERT(cluster_control_root_v3_initialized_inputs(&sources, ids, size,
+			&root, inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(v2_zero(&root, sizeof(root)) && v2_zero(inputs, sizeof(inputs)));
+	}
+}
+
+UT_TEST(test_initialized_cohort_overlap_never_changes_input)
+{
+	ControlRootImage sources, before;
+	uint8 ids[128][16], inputs[128][1536];
+	initialized_cohort_fixture(&sources, ids); before = sources;
+	memset(inputs, 0x33, sizeof(inputs));
+	UT_ASSERT_EQ(cluster_control_root_v3_initialized_inputs(&sources, ids, 16 * 1024 * 1024,
+		&sources, inputs), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(memcmp(&sources, &before, sizeof(sources)), 0);
+	UT_ASSERT_EQ(inputs[0][0], 0x33);
+}

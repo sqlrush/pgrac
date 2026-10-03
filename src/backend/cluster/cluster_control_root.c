@@ -1784,6 +1784,47 @@ refused:
 	return result;
 }
 
+/* Shared field encoding only. Each caller validates the complete object set
+ * through the existing decoder before returning any selected output. */
+static void
+startup_encode_fields(const ClusterWalStartupImage *startup,
+	uint8 bytes[CLUSTER_WAL_STARTUP_BYTES])
+{
+	memcpy(bytes, "PGWG", 4);
+	write_u16_le(bytes + 4, 1);
+	write_u16_le(bytes + 6, CLUSTER_WAL_STARTUP_BYTES);
+	write_u32_le(bytes + 8, startup->phase);
+	write_u32_le(bytes + 12, startup->input_kind);
+	memcpy(bytes + 16, startup->operation_uuid, 16);
+	write_u64_le(bytes + 32, startup->database_incarnation);
+	write_u64_le(bytes + 40, startup->config_generation);
+	write_u64_le(bytes + 48, startup->formation_epoch);
+	write_u64_le(bytes + 56, startup->predecessor_file_sequence);
+	memcpy(bytes + 64, startup->predecessor_file_sha256, 32);
+	write_u64_le(bytes + 96, startup->generation);
+	write_u64_le(bytes + 104, startup->first_segment_lsn);
+	write_u32_le(bytes + 112, startup->timeline);
+	write_u32_le(bytes + 116, startup->segment_size);
+	memcpy(bytes + 120, startup->predecessor_evidence_sha256, 32);
+	write_u64_le(bytes + 152, startup->input_record_start);
+	write_u64_le(bytes + 160, startup->input_record_end);
+	write_u32_le(bytes + 168, startup->input_record_crc);
+	write_u32_le(bytes + 172, startup->input_timeline);
+	write_u64_le(bytes + 176, startup->sealed_input_end);
+	encode_record_version(
+		bytes + 256, &startup->predecessor.snapshot, startup->predecessor.publisher_incarnation,
+		startup->predecessor.publisher_node,
+		(ClusterControlRootPublishReason)startup->predecessor.snapshot.lifecycle_reason,
+		CONTROL_ROOT_RECORD_VERSION_V2, &startup->predecessor.refs, NULL);
+	if (startup->phase == CLUSTER_WAL_STARTUP_DURABLE) {
+		encode_record_version(
+			bytes + 768, &startup->successor.snapshot, startup->successor.publisher_incarnation,
+			startup->successor.publisher_node,
+			(ClusterControlRootPublishReason)startup->successor.snapshot.lifecycle_reason,
+			CONTROL_ROOT_RECORD_VERSION_V2, &startup->successor.refs, NULL);
+	}
+}
+
 ClusterControlRootResult
 cluster_control_root_v3_startup_encode(const ControlRootImage *root, uint32 origin_node,
 									   const ClusterWalStartupImage *startup,
@@ -1841,39 +1882,7 @@ cluster_control_root_v3_startup_encode(const ControlRootImage *root, uint32 orig
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			goto refused;
 	}
-	memcpy(bytes, "PGWG", 4);
-	write_u16_le(bytes + 4, 1);
-	write_u16_le(bytes + 6, CLUSTER_WAL_STARTUP_BYTES);
-	write_u32_le(bytes + 8, startup->phase);
-	write_u32_le(bytes + 12, startup->input_kind);
-	memcpy(bytes + 16, startup->operation_uuid, 16);
-	write_u64_le(bytes + 32, startup->database_incarnation);
-	write_u64_le(bytes + 40, startup->config_generation);
-	write_u64_le(bytes + 48, startup->formation_epoch);
-	write_u64_le(bytes + 56, startup->predecessor_file_sequence);
-	memcpy(bytes + 64, startup->predecessor_file_sha256, 32);
-	write_u64_le(bytes + 96, startup->generation);
-	write_u64_le(bytes + 104, startup->first_segment_lsn);
-	write_u32_le(bytes + 112, startup->timeline);
-	write_u32_le(bytes + 116, startup->segment_size);
-	memcpy(bytes + 120, startup->predecessor_evidence_sha256, 32);
-	write_u64_le(bytes + 152, startup->input_record_start);
-	write_u64_le(bytes + 160, startup->input_record_end);
-	write_u32_le(bytes + 168, startup->input_record_crc);
-	write_u32_le(bytes + 172, startup->input_timeline);
-	write_u64_le(bytes + 176, startup->sealed_input_end);
-	encode_record_version(
-		bytes + 256, &startup->predecessor.snapshot, startup->predecessor.publisher_incarnation,
-		startup->predecessor.publisher_node,
-		(ClusterControlRootPublishReason)startup->predecessor.snapshot.lifecycle_reason,
-		CONTROL_ROOT_RECORD_VERSION_V2, &startup->predecessor.refs, NULL);
-	if (startup->phase == CLUSTER_WAL_STARTUP_DURABLE) {
-		encode_record_version(
-			bytes + 768, &startup->successor.snapshot, startup->successor.publisher_incarnation,
-			startup->successor.publisher_node,
-			(ClusterControlRootPublishReason)startup->successor.snapshot.lifecycle_reason,
-			CONTROL_ROOT_RECORD_VERSION_V2, &startup->successor.refs, NULL);
-	}
+	startup_encode_fields(startup, bytes);
 	write_u32_le(bytes + 1532, control_root_crc(bytes, 1532));
 	memset(&ref, 0, sizeof(ref));
 	ref.generation = startup->generation;
@@ -1895,6 +1904,116 @@ cluster_control_root_v3_startup_encode(const ControlRootImage *root, uint32 orig
 	}
 refused:
 	memset(bytes, 0, CLUSTER_WAL_STARTUP_BYTES);
+	return result;
+}
+
+/* The original creator constructs all references in memory before qualifying
+ * the set. No sentinel reference is ever emitted or used as publication proof.
+ * Ordinary startup consumes persisted inputs; it cannot call this to repair
+ * an incomplete creation. Author: SqlRush <sqlrush@gmail.com> */
+ClusterControlRootResult
+cluster_control_root_v3_initialized_inputs(const ControlRootImage *sources,
+	const uint8 operation_ids[CLUSTER_CONTROL_ROOT_RECORD_COUNT][16], uint32 segment_size,
+	ControlRootImage *root,
+	uint8 inputs[CLUSTER_CONTROL_ROOT_RECORD_COUNT][CLUSTER_WAL_STARTUP_BYTES])
+{
+	const Size inputs_size = CLUSTER_CONTROL_ROOT_RECORD_COUNT * CLUSTER_WAL_STARTUP_BYTES;
+	const Size ids_size = CLUSTER_CONTROL_ROOT_RECORD_COUNT * 16;
+	ControlRootImage *work;
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	bool alias = history_ranges_overlap(sources, sizeof(*sources), root, sizeof(*root))
+		|| history_ranges_overlap(sources, sizeof(*sources), inputs, inputs_size)
+		|| history_ranges_overlap(operation_ids, ids_size, root, sizeof(*root))
+		|| history_ranges_overlap(operation_ids, ids_size, inputs, inputs_size)
+		|| history_ranges_overlap(root, sizeof(*root), inputs, inputs_size);
+
+	/* In contrast to ordinary distinct outputs, an overlapping destination
+	 * must not destroy the caller's source before it can report refusal. */
+	if (alias)
+		return result;
+	if (root != NULL) memset(root, 0, sizeof(*root));
+	if (inputs != NULL) memset(inputs, 0, inputs_size);
+	if (sources == NULL || operation_ids == NULL || root == NULL || inputs == NULL)
+		return result;
+	if (!IsValidWalSegSize(segment_size))
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (!bytes_are_zero(sources->startup, sizeof(sources->startup)))
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	work = palloc(sizeof(*work));
+	*work = *sources;
+	/* Validates the original wide carriers, namespace and references before
+	 * any narrow encoding. It does not grant ownership of referenced files. */
+	result = cluster_control_root_v3_encode(work);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto refused;
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; ++node) {
+		const ClusterControlRootSnapshot *record = &work->records[node];
+		ClusterWalStartupImage op = {0};
+		uint8 *bytes = inputs[node];
+		bool required = (work->header.v2.configured[node / 64]
+			& (UINT64_C(1) << (node % 64))) != 0;
+
+		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		if (required != work->present[node]
+			|| required == bytes_are_zero(operation_ids[node], 16))
+			goto refused;
+		if (!required)
+			continue;
+		if (!startup_initialized_record(record, &work->refs[node])) {
+			result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+			goto refused;
+		}
+		for (unsigned earlier = 0; earlier < node; ++earlier)
+			if (memcmp(operation_ids[node], operation_ids[earlier], 16) == 0)
+				goto refused;
+		op.phase = CLUSTER_WAL_STARTUP_RESERVED;
+		op.input_kind = CLUSTER_WAL_STARTUP_INITIALIZED;
+		memcpy(op.operation_uuid, operation_ids[node], 16);
+		op.database_incarnation = work->header.v2.database_incarnation;
+		op.config_generation = 1;
+		op.generation = 1;
+		op.segment_size = segment_size;
+		op.timeline = op.input_timeline = record->checkpoint_tli;
+		op.input_record_start = record->tail_last_record_lsn;
+		op.input_record_end = op.sealed_input_end = record->validated_tail_lsn_exclusive;
+		op.input_record_crc = record->tail_last_record_crc32c;
+		op.predecessor.snapshot = *record;
+		op.predecessor.refs = work->refs[node];
+		op.predecessor.publisher_incarnation = work->publisher_incarnation[node];
+		op.predecessor.publisher_node = work->publisher_node[node];
+		startup_encode_fields(&op, bytes);
+		if (!startup_initialized_digest(work, bytes, bytes + 120)) {
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			goto refused;
+		}
+		write_u32_le(bytes + 1532, control_root_crc(bytes, 1532));
+		work->startup[node].generation = 1;
+		if (!control_root_sha256(bytes, CLUSTER_WAL_STARTUP_BYTES, work->startup[node].sha256)) {
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			goto refused;
+		}
+	}
+	if (!startup_initialized_root(work)) {
+		result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+		goto refused;
+	}
+	result = cluster_control_root_v3_encode(work);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto refused;
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; ++node) {
+		ClusterWalStartupImage decoded;
+		if (!work->present[node]) continue;
+		result = cluster_control_root_v3_startup_decode(inputs[node], CLUSTER_WAL_STARTUP_BYTES,
+			work, node, &decoded);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			goto refused;
+	}
+	*root = *work;
+	pfree(work);
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+refused:
+	pfree(work);
+	memset(inputs, 0, inputs_size);
 	return result;
 }
 
