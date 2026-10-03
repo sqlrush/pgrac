@@ -12,6 +12,7 @@
 #include "access/xlog_internal.h"
 #include "cluster/cluster_initdb_cohort.h"
 #include "cluster/cluster_initdb_config.h"
+#include "cluster/cluster_wal_thread.h"
 #include "common/file_perm.h"
 #include "common/pgrac_initdb_cohort.h"
 #include "miscadmin.h"
@@ -19,6 +20,7 @@
 #include "utils/guc.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
+#include "cluster_initdb_origin_private.h"
 #include "../../bin/initdb/pgrac_wal.h"
 
 typedef struct InitdbDirectory
@@ -38,6 +40,7 @@ typedef struct InitdbOrigin
 	InitdbDirectory wal;
 	ControlFileData control;
 	PgracInitdbWalObservation checkpoint;
+	ClusterWalHistoryRecord input;
 } InitdbOrigin;
 
 static volatile sig_atomic_t creation_cancelled;
@@ -393,6 +396,63 @@ run_origin(const char *initdb, const PgracInitdbCohortContext *request,
 	control_read(origin, node + 1, config->identity.system_identifier, true);
 }
 
+static void
+create_origin_objects(const InitdbDirectory *shared, InitdbOrigin *origins,
+					  const ClusterSharedConfigRef *config, uint64 incarnation)
+{
+	InitdbDirectory global = {0}, images;
+	char name[64];
+	struct stat st;
+
+	/* A preexisting claim cannot be promoted into this creation operation. */
+	for (int node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++)
+	{
+		if (!(config->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64)))) continue;
+		control_read(&origins[node], node + 1, config->identity.system_identifier, false);
+		if (fstatat(origins[node].wal.fd, CLUSTER_WAL_THREAD_CLAIM_FILENAME,
+					&st, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
+			refuse("an original writer claim already exists");
+	}
+	/* global was made by the actual founder child inside our held new DATA. */
+	directory_current(shared);
+	global.parent = shared->fd;
+	global.parent_identity = shared->identity;
+	strlcpy(global.name, "global", sizeof(global.name));
+	if (snprintf(global.path, sizeof(global.path), "%s/global", shared->path) >= sizeof(global.path))
+		refuse("original global path is too long");
+	global.fd = openat(shared->fd, global.name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (global.fd < 0 || fstat(global.fd, &global.identity) != 0
+		|| !owned_directory(&global.identity))
+		refuse("original global directory is invalid");
+	directory_current(&global);
+	create_child(&global, "anchor_images", &images);
+	for (int node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++)
+	{
+		InitdbDirectory thread, generation, staging;
+		InitdbOrigin *origin = &origins[node];
+		if (!(config->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64)))) continue;
+		snprintf(name, sizeof(name), "thread_%d", node + 1);
+		create_child(&images, name, &thread);
+		snprintf(name, sizeof(name), "generation_" UINT64_FORMAT, incarnation);
+		create_child(&thread, name, &generation);
+		create_child(&generation, ".staging", &staging);
+		if (!cluster_initdb_origin_create(config, node, incarnation, origin->wal.fd,
+										generation.fd, &origin->control, &origin->input))
+			refuse("cannot persist original writer claim and native anchor");
+		control_read(origin, node + 1, config->identity.system_identifier, false);
+		directory_current(&staging);
+		directory_current(&generation);
+		directory_current(&thread);
+		if (fsync(staging.fd) != 0 || fsync(generation.fd) != 0 || fsync(thread.fd) != 0
+			|| close(staging.fd) != 0 || close(generation.fd) != 0 || close(thread.fd) != 0)
+			refuse("cannot persist original anchor directories");
+	}
+	directory_current(&images);
+	directory_current(&global);
+	if (fsync(images.fd) != 0 || fsync(global.fd) != 0 || close(images.fd) != 0 || close(global.fd) != 0)
+		refuse("cannot complete original anchor namespace");
+}
+
 void
 ClusterInitdbCohortMain(int argc, char **argv)
 {
@@ -455,6 +515,7 @@ ClusterInitdbCohortMain(int argc, char **argv)
 		for (int i = 0; i < 4; i++) directory_current(&roots[i]);
 	}
 	request_current(&request, ref);
+	create_origin_objects(&roots[1], origins, ref, incarnation);
 	for (int node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++)
 	{
 		InitdbOrigin *origin = &origins[node];

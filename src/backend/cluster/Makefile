@@ -42,6 +42,7 @@ OBJS = \
 	cluster_initdb_base.o \
 	cluster_initdb_config.o \
 	cluster_initdb_cohort.o \
+	cluster_initdb_origin.o \
 	cluster_initdb_wal.o \
 	cluster_adg.o \
 	cluster_adg_xlog.o \

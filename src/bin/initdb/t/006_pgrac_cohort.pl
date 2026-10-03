@@ -91,6 +91,26 @@ for my $node (0 .. 3)
 	}
 	ok($pages > 0 && !$wrong, "all origin $node WAL pages were generated with its thread");
 	ok(!-e "$data/global/pgrac_control_binding", 'no PGCB before complete ROOT publication');
+	my ($generation) = $wal =~ /generation_([0-9]+)$/;
+	my $claim_path = "$wal/pgrac_thread.claim";
+	ok(-f $claim_path, 'original writer has its immutable claim');
+	my @anchors = glob("$temp/valid-data/global/anchor_images/thread_$thread/generation_$generation/anchor_1-*.bin");
+	is(scalar @anchors, 1, 'original checkpoint has one immutable native anchor');
+	if (-f $claim_path && @anchors == 1)
+	{
+		my $claim = slurp_file($claim_path);
+		my $anchor = slurp_file($anchors[0]);
+		is(length $claim, 112, 'claim uses the original v2 encoding');
+		is(length $anchor, 512, 'anchor uses the original v2 encoding');
+		is(unpack('v', substr($claim, 4, 2)), 2, 'claim version is v2');
+		is(unpack('v', substr($anchor, 208, 2)), $thread, 'anchor names its generated native thread');
+		is(unpack('Q<', substr($anchor, 144, 8)), $generation, 'anchor binds original creation generation');
+		is(unpack('H*', substr($anchor, 216, 32)), sha256_hex($claim), 'anchor selects exact original claim');
+		like($anchors[0], qr/anchor_1-\Q@{[sha256_hex($anchor)]}\E\.bin$/, 'immutable name selects complete anchor bytes');
+		my ($high, $low) = split '/', $checkpoint;
+		is(unpack('Q<', substr($anchor, 24, 8)), hex($high) * 4294967296 + hex($low),
+			'anchor retains this native checkpoint, not a peer checkpoint');
+	}
 }
 is(scalar keys %generations, 4, 'four independent writer directories');
 my $source = sha256_hex(slurp_file("$temp/valid-caches/node_0/global/pg_control"));
