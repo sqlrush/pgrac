@@ -772,6 +772,28 @@ hw_normal_snapshot_load(XLogRecPtr own_redo, const char **failure_out)
 	return success;
 }
 
+/*
+ * D S09 R-A15: crash recovery of a root-backed node whose multi-node
+ * authority is not active loads its own checkpoint snapshot like a normal
+ * boot, before redo replays the HW_RESERVE tail on top.  The rebuilt table
+ * lets this lifetime's checkpoints keep the snapshot bound to their redo, so
+ * the next clean boot finds it.  Without an exact snapshot the original
+ * recovery contract stands: recovery proceeds, nothing is rewritten in this
+ * lifetime, and the next normal boot still refuses a stale snapshot.
+ */
+static bool
+hw_recovery_snapshot_load(XLogRecPtr own_redo)
+{
+	const char *failure = NULL;
+
+	if (XLogRecPtrIsInvalid(own_redo) || hw_normal_snapshot_load(own_redo, &failure))
+		return true;
+	ereport(LOG, (errmsg("cluster HW snapshot not rebuilt for crash recovery; it is not rewritten "
+						 "until a normal boot"),
+				  errdetail("reason=%s", failure != NULL ? failure : "UNCLASSIFIED")));
+	return true;
+}
+
 bool
 cluster_hw_startup_prepare(bool in_recovery, bool own_clean_shutdown, XLogRecPtr own_redo,
 						   const char **failure_out)
@@ -810,6 +832,8 @@ cluster_hw_startup_prepare(bool in_recovery, bool own_clean_shutdown, XLogRecPtr
 		return false;
 	}
 	*failure_out = NULL;
+	if (mode == CLUSTER_HW_BOOT_EXISTING_RECOVERY && !cluster_hw_authority_active())
+		return hw_recovery_snapshot_load(own_redo);
 	if (mode != CLUSTER_HW_BOOT_NORMAL_SELF)
 		return true;
 	if (!own_clean_shutdown || XLogRecPtrIsInvalid(own_redo)) {
@@ -924,7 +948,9 @@ cluster_hw_snapshot_checkpoint_write(XLogRecPtr redo_lsn)
 		return;
 	mode = cluster_hw_cold_boot_mode();
 	state = cluster_hw_cold_boot_state();
-	if (mode == CLUSTER_HW_BOOT_EXISTING_RECOVERY && !cluster_hw_authority_active())
+	/* D S09 R-A15: a recovery that rebuilt snapshot+tail keeps it current. */
+	if (mode == CLUSTER_HW_BOOT_EXISTING_RECOVERY && !cluster_hw_authority_active()
+		&& state != CLUSTER_HW_REBUILT && state != CLUSTER_HW_READY)
 		return;
 	if (!cluster_hw_metadata_configured() || hw_state == NULL || hw_htab == NULL
 		|| (mode != CLUSTER_HW_BOOT_EXISTING_RECOVERY
