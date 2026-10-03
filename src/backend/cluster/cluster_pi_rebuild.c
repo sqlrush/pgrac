@@ -12,6 +12,7 @@
 #include "postmaster/interrupt.h"
 #include "storage/buffile.h"
 #include "utils/resowner.h"
+#include "utils/timestamp.h"
 
 #define PI_REBUILD_BATCH 64
 
@@ -42,6 +43,8 @@ typedef struct PiRebuildJob {
 	bool pending_valid;
 	bool scanned;
 	bool plan_blocked;
+	/* PGRAC: when this cut's census began, for its completion reading. */
+	TimestampTz started;
 } PiRebuildJob;
 
 static PiRebuildJob *pi_rebuild_job;
@@ -234,6 +237,7 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 	if (pi_rebuild_job == NULL) {
 		PiRebuildJob *job = palloc0(sizeof(*job));
 		job->owner = CurrentResourceOwner;
+		job->started = GetCurrentTimestamp();
 		job->cut = cut;
 		job->local = local;
 		pi_rebuild_job = job;
@@ -307,8 +311,21 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 		goto wait;
 	}
 	if (cluster_wal_inputs_revalidate_v1(pi_rebuild_job->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		&& cluster_grd_pi_rebuild_complete_v1(&cut))
+		&& cluster_grd_pi_rebuild_complete_v1(&cut)) {
+		/* The fault-cut reading: census and registration of this cut. */
+		ereport(DEBUG1,
+				(errmsg("cluster PI rebuild completed for epoch " UINT64_FORMAT,
+						pi_rebuild_job->cut.epoch),
+				 errdetail("%llu records, %llu contributions, spool %llu bytes, %lld ms.",
+						   (unsigned long long)pi_rebuild_job->records,
+						   (unsigned long long)pi_rebuild_job->total,
+						   (unsigned long long)(pi_rebuild_job->spool != NULL
+													? pi_rebuild_job->total
+														  * sizeof(PiRebuildContribution)
+													: 0),
+						   (long long)((GetCurrentTimestamp() - pi_rebuild_job->started) / 1000))));
 		cluster_lmon_wakeup();
+	}
 done:
 	pi_rebuild_release();
 	return CLUSTER_PI_REBUILD_IDLE;

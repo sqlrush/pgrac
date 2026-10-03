@@ -34,6 +34,14 @@ volatile sig_atomic_t ShutdownRequestPending = false;
 volatile sig_atomic_t InterruptPending = false;
 volatile uint32 CritSectionCount = 0;
 AuxProcType MyAuxProcType = CheckpointerProcess;
+bool log_checkpoints = false;
+static TimestampTz fixture_now;
+
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return fixture_now += 1000;
+}
 
 void
 ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)

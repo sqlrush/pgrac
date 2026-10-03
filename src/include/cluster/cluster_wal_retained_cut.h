@@ -55,6 +55,8 @@ typedef struct ClusterWalRetainedCutV1 {
 	uint64 records;
 	uint64 history_edges;
 	uint64 retained_edges;
+	/* Bytes of history edges written to the temporary spool. */
+	uint64 spool_bytes;
 	/* SIDE contribution owner bits whose obligations pinned history. */
 	uint32 side_classes;
 	ClusterWalRetainedPinV1 pin;

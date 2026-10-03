@@ -65,6 +65,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "access/xlogreader.h"
 #include "catalog/storage_xlog.h"
 #include "cluster_control_root_private.h"
@@ -80,6 +81,7 @@
 #include "postmaster/interrupt.h"
 #include "storage/buf_internals.h"
 #include "storage/buffile.h"
+#include "utils/timestamp.h"
 
 /* 2^18 buckets of 40 bytes: 10 MiB, independent of the database size. */
 #define RETAINED_SKETCH_BITS 18
@@ -684,6 +686,7 @@ retained_census(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluster
 	out->records = work->records;
 	out->history_edges = work->history_edges;
 	out->retained_edges = work->retained_edges;
+	out->spool_bytes = work->spooled * sizeof(RetainedEdge);
 	out->side_classes = work->obligation_side;
 	out->pin = source->pin;
 	if (out->pin == CLUSTER_WAL_RETAINED_PIN_STRUCTURE)
@@ -779,6 +782,27 @@ retained_report(ClusterControlRootResult result, RfPageProofDetailV1 detail,
 								(unsigned long long)cut->history_edges)));
 }
 
+/* One line per checkpoint with the readings of S07: like the checkpoint
+ * report itself, at LOG only when log_checkpoints is on. */
+static void
+retained_report_readings(const ClusterWalRetainedCutV1 *cut, ClusterControlRootResult result,
+						 int64 census_us, int64 publication_us)
+{
+	ereport(
+		log_checkpoints ? LOG : DEBUG1,
+		(errmsg("cluster WAL retention census: lower %X/%X -> %X/%X (native redo %X/%X)",
+				LSN_FORMAT_ARGS(cut->old_lower),
+				LSN_FORMAT_ARGS(result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ? cut->lower
+																		  : cut->old_lower),
+				LSN_FORMAT_ARGS(cut->native_redo)),
+		 errdetail("result %d, %llu records, %llu history edges, %llu needed, spool %llu "
+				   "bytes, census %lld ms, publication %lld ms.",
+				   (int)result, (unsigned long long)cut->records,
+				   (unsigned long long)cut->history_edges, (unsigned long long)cut->retained_edges,
+				   (unsigned long long)cut->spool_bytes, (long long)(census_us / 1000),
+				   (long long)(publication_us / 1000))));
+}
+
 void
 cluster_wal_retained_cut_after_checkpoint_v1(void)
 {
@@ -787,18 +811,19 @@ cluster_wal_retained_cut_after_checkpoint_v1(void)
 	ClusterControlRootSnapshot published;
 	RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_OK;
 	ClusterControlRootResult result;
+	TimestampTz started, censused;
 
 	if (!AmCheckpointerProcess() || !cluster_enabled || !cluster_shared_config
 		|| ShutdownRequestPending || CritSectionCount != 0
 		|| !cluster_wal_thread_current_v2_ref(&self))
 		return;
+	started = GetCurrentTimestamp();
 	result = cluster_wal_retained_cut_compute_v1(&self, &cut, &detail);
+	censused = GetCurrentTimestamp();
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && cut.lower > cut.old_lower)
 		result = cluster_control_root_v3_retained_lower_publish(
 			&self.claim.identity, &cut.root_token, cut.native_redo, cut.lower, &published);
-	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && cut.lower > cut.old_lower)
-		ereport(DEBUG1, (errmsg("cluster WAL retention lower advanced from %X/%X to %X/%X",
-								LSN_FORMAT_ARGS(cut.old_lower), LSN_FORMAT_ARGS(cut.lower))));
+	retained_report_readings(&cut, result, censused - started, GetCurrentTimestamp() - censused);
 	retained_report(result, detail, result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ? cut.pin : 0, &cut);
 }
 

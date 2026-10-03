@@ -463,6 +463,11 @@ UT_TEST(test_retained_cut_driver_publishes_only_an_advance)
 	ShutdownRequestPending = false;
 	UT_ASSERT_EQ(publish_calls, 3);
 	UT_ASSERT_EQ(scopes_open, 0);
+	/* With log_checkpoints, every census also reports its readings. */
+	log_checkpoints = true;
+	cluster_wal_retained_cut_after_checkpoint_v1();
+	log_checkpoints = false;
+	UT_ASSERT_EQ(log_count, 4);
 }
 
 #endif /* TEST_CLUSTER_WAL_RETAINED_CUT_CASES_H */

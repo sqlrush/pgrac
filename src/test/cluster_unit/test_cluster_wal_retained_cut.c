@@ -61,6 +61,14 @@ volatile sig_atomic_t ShutdownRequestPending = false;
 volatile sig_atomic_t InterruptPending = false;
 volatile uint32 CritSectionCount = 0;
 AuxProcType MyAuxProcType = CheckpointerProcess;
+bool log_checkpoints = false;
+static TimestampTz fixture_now;
+
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return fixture_now += 1000;
+}
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
 
