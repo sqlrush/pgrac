@@ -50,6 +50,18 @@ typedef struct WalTailWork {
 	ClusterWalStartupObservation startup;
 } WalTailWork;
 
+/* PGRAC: inode identities of one validated checkpoint prefix.  A later
+ * recheck stats the same namespace again instead of re-reading its bytes.
+ * Author: SqlRush <sqlrush@gmail.com> */
+struct ClusterWalPrefixIdentity {
+	ClusterWalSourceRef ref;
+	int segment_size;
+	struct stat dirs[3];
+	uint32 count;
+	XLogSegNo *numbers;
+	struct stat *segments;
+};
+
 /* Use the same pinned namespace and exact file identities as the scan. A
  * physical fsync is not an isolation certificate or a new durable promise.
  * Descriptor ownership stays in work across ERROR/cancellation.
@@ -772,16 +784,45 @@ wal_tail_release(WalTailWork *work, ClusterControlRootResult result)
 	return result;
 }
 
+/* Copy the pinned directory and segment identities of a successful scan.
+ * Runs before release, while every directory descriptor is still open. */
+static ClusterWalPrefixIdentity *
+wal_tail_capture_identity(WalTailWork *work, int segment_size)
+{
+	ClusterWalPrefixIdentity *identity = palloc0(sizeof(*identity));
+	uint32 count = 0;
+
+	identity->ref = work->ref;
+	identity->segment_size = segment_size;
+	for (size_t i = 0; i < lengthof(work->dirs); ++i)
+		if (work->dirs[i] < 0 || fstat(work->dirs[i], &identity->dirs[i]) != 0) {
+			pfree(identity);
+			return NULL;
+		}
+	for (WalTailSegment *s = work->segments; s != NULL; s = s->next)
+		count++;
+	identity->numbers = palloc0(Max(count, 1) * sizeof(*identity->numbers));
+	identity->segments = palloc0(Max(count, 1) * sizeof(*identity->segments));
+	for (WalTailSegment *s = work->segments; s != NULL; s = s->next) {
+		identity->numbers[identity->count] = s->number;
+		identity->segments[identity->count++] = s->identity;
+	}
+	return identity;
+}
+
 static ClusterControlRootResult
-wal_tail_observe_common(const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
-						XLogRecPtr scan_lower, XLogRecPtr minimum_end, XLogRecPtr checkpoint_start,
-						pg_crc32c checkpoint_crc, ClusterWalTailObservation *out,
-						ClusterWalStartupObservation *startup, bool sync_inputs,
-						bool checkpoint_prefix, const ClusterControlRootSnapshot *sealed,
-						ClusterWalRecordVisitor visitor, void *arg, XLogRecPtr flush_end)
+wal_tail_observe_identity(const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
+						  XLogRecPtr scan_lower, XLogRecPtr minimum_end,
+						  XLogRecPtr checkpoint_start, pg_crc32c checkpoint_crc,
+						  ClusterWalTailObservation *out, ClusterWalStartupObservation *startup,
+						  bool sync_inputs, bool checkpoint_prefix,
+						  const ClusterControlRootSnapshot *sealed, ClusterWalRecordVisitor visitor,
+						  void *arg, XLogRecPtr flush_end, ClusterWalPrefixIdentity **identity)
 {
 	WalTailWork *work;
 	ClusterControlRootResult result;
+	if (identity != NULL)
+		*identity = NULL;
 	if (out == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	memset(out, 0, sizeof(*out));
@@ -812,10 +853,15 @@ wal_tail_observe_common(const char *wal_root, const ClusterWalSourceRef *ref, in
 	PG_TRY();
 	{
 		result = wal_tail_scan(work, segment_size, scan_lower, minimum_end);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && identity != NULL
+			&& (*identity = wal_tail_capture_identity(work, segment_size)) == NULL)
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 	}
 	PG_CATCH();
 	{
 		(void)wal_tail_release(work, CLUSTER_CONTROL_ROOT_IO_ERROR);
+		if (identity != NULL)
+			cluster_wal_prefix_identity_free(identity);
 		pfree(work);
 		PG_RE_THROW();
 	}
@@ -828,9 +874,23 @@ wal_tail_observe_common(const char *wal_root, const ClusterWalSourceRef *ref, in
 			*startup = work->startup;
 			startup->tail = work->observed;
 		}
-	}
+	} else if (identity != NULL)
+		cluster_wal_prefix_identity_free(identity);
 	pfree(work);
 	return result;
+}
+
+static ClusterControlRootResult
+wal_tail_observe_common(const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
+						XLogRecPtr scan_lower, XLogRecPtr minimum_end, XLogRecPtr checkpoint_start,
+						pg_crc32c checkpoint_crc, ClusterWalTailObservation *out,
+						ClusterWalStartupObservation *startup, bool sync_inputs,
+						bool checkpoint_prefix, const ClusterControlRootSnapshot *sealed,
+						ClusterWalRecordVisitor visitor, void *arg, XLogRecPtr flush_end)
+{
+	return wal_tail_observe_identity(wal_root, ref, segment_size, scan_lower, minimum_end,
+									 checkpoint_start, checkpoint_crc, out, startup, sync_inputs,
+									 checkpoint_prefix, sealed, visitor, arg, flush_end, NULL);
 }
 
 ClusterControlRootResult
@@ -970,6 +1030,110 @@ cluster_wal_checkpoint_prefix_observe(const char *wal_root, const ClusterWalSour
 	return wal_tail_observe_common(wal_root, ref, segment_size, physical_lower, checkpoint_end,
 								   checkpoint_start, checkpoint_crc, out, NULL, false, true, NULL,
 								   NULL, NULL, InvalidXLogRecPtr);
+}
+
+/* PGRAC: the same checkpoint scans, also returning their file identities.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterControlRootResult
+cluster_wal_checkpoint_prefix_observe_identity(
+	const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
+	XLogRecPtr physical_lower, XLogRecPtr checkpoint_end, XLogRecPtr checkpoint_start,
+	pg_crc32c checkpoint_crc, ClusterWalTailObservation *out, ClusterWalPrefixIdentity **identity)
+{
+	if (identity == NULL || checkpoint_start == InvalidXLogRecPtr) {
+		if (out != NULL)
+			memset(out, 0, sizeof(*out));
+		if (identity != NULL)
+			*identity = NULL;
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	}
+	return wal_tail_observe_identity(wal_root, ref, segment_size, physical_lower, checkpoint_end,
+									 checkpoint_start, checkpoint_crc, out, NULL, false, true, NULL,
+									 NULL, NULL, InvalidXLogRecPtr, identity);
+}
+
+ClusterControlRootResult
+cluster_wal_tail_observe_checkpoint_identity(const char *wal_root, const ClusterWalSourceRef *ref,
+											 int segment_size, XLogRecPtr scan_lower,
+											 XLogRecPtr minimum_end, XLogRecPtr checkpoint_start,
+											 pg_crc32c checkpoint_crc,
+											 ClusterWalTailObservation *out,
+											 ClusterWalPrefixIdentity **identity)
+{
+	if (identity == NULL || checkpoint_start == 0) {
+		if (out != NULL)
+			memset(out, 0, sizeof(*out));
+		if (identity != NULL)
+			*identity = NULL;
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	}
+	return wal_tail_observe_identity(wal_root, ref, segment_size, scan_lower, minimum_end,
+									 checkpoint_start, checkpoint_crc, out, NULL, false, false,
+									 NULL, NULL, NULL, InvalidXLogRecPtr, identity);
+}
+
+/* Stat the captured namespace again: the same root/thread/generation
+ * directories and, for every scanned segment, the same inode and size.  A
+ * missing or replaced file is STALE; no WAL byte is read here.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterControlRootResult
+cluster_wal_prefix_identity_recheck(const char *wal_root, const ClusterWalSourceRef *ref,
+									const ClusterWalPrefixIdentity *identity)
+{
+	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+	char thread[32], generation[48];
+	const char *parts[] = { thread, generation };
+	int dirs[3] = { -1, -1, -1 };
+	struct stat st;
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+
+	if (wal_root == NULL || wal_root[0] == '\0' || ref == NULL || identity == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (memcmp(&identity->ref, ref, sizeof(*ref)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	snprintf(thread, sizeof(thread), "thread_%u", ref->claim.identity.origin_thread_id);
+	snprintf(generation, sizeof(generation), "generation_" UINT64_FORMAT,
+			 ref->claim.identity.origin_owner_incarnation);
+	dirs[0] = open(wal_root, flags);
+	for (size_t i = 0; result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && i < lengthof(dirs); ++i) {
+		if (i > 0)
+			dirs[i] = openat(dirs[i - 1], parts[i - 1], flags);
+		if (dirs[i] < 0)
+			result = errno == ENOENT ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+									 : CLUSTER_CONTROL_ROOT_IO_ERROR;
+		else if (fstat(dirs[i], &st) != 0)
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		else if (!wal_tail_same(&identity->dirs[i], &st, true))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	for (uint32 i = 0; result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && i < identity->count; i++) {
+		char filename[MAXFNAMELEN];
+
+		CHECK_FOR_INTERRUPTS();
+		XLogFileName(filename, ref->timeline, identity->numbers[i], identity->segment_size);
+		if (fstatat(dirs[2], filename, &st, AT_SYMLINK_NOFOLLOW) != 0)
+			result = errno == ENOENT ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+									 : CLUSTER_CONTROL_ROOT_IO_ERROR;
+		else if (!wal_tail_same(&identity->segments[i], &st, false))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	for (size_t i = 0; i < lengthof(dirs); ++i)
+		if (dirs[i] >= 0 && close(dirs[i]) != 0)
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	return result;
+}
+
+void
+cluster_wal_prefix_identity_free(ClusterWalPrefixIdentity **identity)
+{
+	if (identity == NULL || *identity == NULL)
+		return;
+	if ((*identity)->numbers != NULL)
+		pfree((*identity)->numbers);
+	if ((*identity)->segments != NULL)
+		pfree((*identity)->segments);
+	pfree(*identity);
+	*identity = NULL;
 }
 
 ClusterControlRootResult
