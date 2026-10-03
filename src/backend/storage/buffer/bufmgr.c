@@ -19083,18 +19083,79 @@ cluster_bufmgr_flush_seq_page_to_storage(Buffer buffer)
 	FlushOneBuffer(buffer);
 }
 
+/*
+ * PGRAC: the shared LEAVE drain uses the ordinary cached-X release owner.
+ * Flush/sync is not a PI retirement proof: its WAL references survive the
+ * exact release until the qualified DATA/ancestor consumer retires them.
+ * The caller is the original, quiesced LEAVE backend/checkpointer.  No pin,
+ * content or mapping lock is held during contention waits.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+cluster_bufmgr_shared_leave_release_x(BufferDesc *buf)
+{
+	for (;;)
+	{
+		uint32		buf_state;
+		SMgrRelation reln;
+		bool		released;
+
+		ReservePrivateRefCountEntry();
+		buf_state = LockBufHdr(buf);
+		if ((PcmState) buf->pcm_state != PCM_STATE_X)
+		{
+			UnlockBufHdr(buf, buf_state);
+			return false;
+		}
+		if (!cluster_bufmgr_pcm_aux_pin_admission_locked(buf)
+			|| cluster_pcm_own_flags_get(buf->buf_id) != 0
+			|| BUF_STATE_GET_REFCOUNT(buf_state) != 0
+			|| (buf_state & BM_IO_IN_PROGRESS) != 0)
+		{
+			UnlockBufHdr(buf, buf_state);
+			(void) cluster_bufmgr_resource_x_wait_retry(
+				BufferDescriptorGetContentLock(buf), buf->buf_id, 0, NULL);
+			continue;
+		}
+		if ((buf_state & (BM_TAG_VALID | BM_VALID)) != (BM_TAG_VALID | BM_VALID))
+		{
+			UnlockBufHdr(buf, buf_state);
+			cluster_bufmgr_resource_x_writer_report_failure(
+				RESOURCE_X_APPLY_RECOVERY_BLOCKED, buf, "shared clean-leave X residency");
+		}
+
+		PinBuffer_Locked(buf);
+		LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
+		FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+		reln = smgropen(BufTagGetRelFileLocator(&buf->tag), InvalidBackendId);
+		smgrimmedsync(reln, BufTagGetForkNum(&buf->tag));
+		LWLockRelease(BufferDescriptorGetContentLock(buf));
+
+		/* This owner rechecks dirt, competing pins, activation and the exact
+		 * WAL binding before changing X or removing the mapping.  Our pin
+		 * prevents reuse throughout its off-lock PREPARE/PUBLISH interval. */
+		released = InvalidateVictimBuffer(buf);
+		UnpinBuffer(buf);
+		if (released)
+		{
+			StrategyFreeBuffer(buf);
+			return true;
+		}
+		(void) cluster_bufmgr_resource_x_wait_retry(
+			BufferDescriptorGetContentLock(buf), buf->buf_id, 0, NULL);
+	}
+}
+
 /* ========================================================================
  * PGRAC MODIFICATIONS by SqlRush — spec-5.13 D5b (clean-leave GCS flush seam).
  *
  *   cluster_bufmgr_flush_and_release_x_for_leave(void) -> uint32
- *   — a leaving node, while still alive, force-persists every dirty block it
- *   holds X on to shared storage and then releases that X (cache-residency
- *   pcm_state X -> N).  After this returns the leaving node holds NO in-memory
- *   current for any block: shared storage is the sole authority, so a survivor
- *   can read the current image from storage once it has invalidated its stale
- *   cache (CL-I5 / §0.3 命门 — the only sound way to bypass the Stage-6 cross-
- *   instance cache-coherence wall, because no in-memory current remains
- *   anywhere).
+ *   — the quiesced leaving backend/checkpointer drains its current images.
+ *   Shared mode includes clean X buffers and uses the exact cached-X eviction
+ *   owner after FlushBuffer + fork sync.  The original ResourceOwner unwinds
+ *   pin/content/I/O state if persistence throws; no local X release has then
+ *   occurred.  Publication retains logical PI until qualified retirement.
+ *   The legacy profile below retains its existing dirty-X release behavior.
  *
  *   FlushBuffer is a bufmgr private static (cluster code cannot call it), so
  *   this seam MUST live in bufmgr.c.  It is the persist-and-confirm sibling of
@@ -19123,10 +19184,10 @@ cluster_bufmgr_flush_seq_page_to_storage(Buffer buffer)
  *   pcm_state stays X — the block keeps its X grant and is NEVER falsely
  *   advertised as flushed.  The S5 driver wraps this in PG_TRY/CATCH and goes
  *   ABORTED_ESCALATE rather than assume a half-completed drain succeeded.
- *   Clean (non-dirty) X blocks are intentionally left here: their storage image
- *   is already current; the PCM directory holder record is cleared separately
- *   by cluster_pcm_lock_clean_leave_release_all_self.  Over-flush is harmless.
- *   Returns the count of blocks flushed + X-released.
+ *   The legacy loop leaves clean X to its directory release. Shared mode must
+ *   never use that shortcut, including while TARGET is closed. Returns the
+ *   count of current images flushed/synced and released in shared mode, or
+ *   dirty X blocks flushed/released by the legacy loop.
  * ======================================================================== */
 uint32
 cluster_bufmgr_flush_and_release_x_for_leave(void)
@@ -19147,6 +19208,13 @@ cluster_bufmgr_flush_and_release_x_for_leave(void)
 	{
 		BufferDesc *bufHdr = GetBufferDescriptor(i);
 		uint32		buf_state;
+
+		if (cluster_shared_config)
+		{
+			if (cluster_bufmgr_shared_leave_release_x(bufHdr))
+				flushed++;
+			continue;
+		}
 
 		ReservePrivateRefCountEntry();
 

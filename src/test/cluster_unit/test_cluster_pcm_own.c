@@ -3091,6 +3091,240 @@ eviction_legacy_tail(BufferDesc *buf, BufferTag *tag, uint32 state, PcmLockMode 
 #undef LWLockAcquire
 #undef LockBufHdr
 
+/* Exercise the real LEAVE producer through the real cached-X eviction owner
+ * above. Only scheduling and physical I/O are fixtures. No DATA receipt or
+ * PI retirement is manufactured by the flush/sync dependency. */
+static unsigned leave_syncs, leave_waits;
+static int leave_failure;
+
+static void
+leave_pin(BufferDesc *buf)
+{
+	uint32 state = pg_atomic_read_u32(&buf->state);
+
+	UT_ASSERT(state & BM_LOCKED);
+	UT_ASSERT_EQ(eviction_private_pins, 0);
+	eviction_private_pins++;
+	UnlockBufHdr(buf, state + BUF_REFCOUNT_ONE);
+}
+
+static void
+leave_unpin(BufferDesc *buf)
+{
+	UT_ASSERT(!transition_content_held && !transition_mapping_held);
+	UT_ASSERT_EQ(eviction_private_pins, 1);
+	eviction_private_pins--;
+	pg_atomic_fetch_sub_u32(&buf->state, BUF_REFCOUNT_ONE);
+}
+
+static void
+leave_flush(BufferDesc *buf)
+{
+	UT_ASSERT(transition_content_held && !transition_mapping_held);
+	UT_ASSERT_EQ(buf->pcm_state, PCM_STATE_X);
+	UT_ASSERT_EQ(eviction_publishes, 0);
+	transition_flush_count++;
+	if (leave_failure == 1)
+		pg_re_throw();
+	pg_atomic_fetch_and_u32(&buf->state, ~(BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED));
+}
+
+static void
+leave_sync(SMgrRelation reln, ForkNumber forknum)
+{
+	UT_ASSERT(transition_content_held && !transition_mapping_held);
+	UT_ASSERT_EQ(forknum, transition_buf->tag.forkNum);
+	UT_ASSERT_EQ(transition_buf->pcm_state, PCM_STATE_X);
+	UT_ASSERT_EQ(eviction_private_pins, 1);
+	UT_ASSERT_EQ(eviction_publishes, 0);
+	leave_syncs++;
+	if (leave_failure == 2)
+		pg_re_throw();
+}
+
+static bool
+leave_wait(LWLock *content, int32 id, uint32 index, bool *barrier)
+{
+	UT_ASSERT(!transition_mapping_held && !transition_content_held);
+	UT_ASSERT_EQ(eviction_private_pins, 0);
+	UT_ASSERT_EQ(eviction_frees, 0);
+	UT_ASSERT(!eviction_mapping_deleted);
+	leave_waits++;
+	if (leave_waits > 1 || leave_failure == 3)
+		pg_re_throw(); /* Only fixture cancellation ends a closed-gate wait. */
+	pg_atomic_fetch_and_u32(&transition_buf->state, ~BUF_REFCOUNT_MASK);
+	pg_atomic_write_u32(&ClusterPcmOwnArray[transition_buf->buf_id].flags, 0);
+	return true;
+}
+
+#define GetBufferDescriptor(id) ((void)(id), transition_buf)
+#define NBuffers 1
+#define CurrentResourceOwner ((void *)1)
+#define LockBufHdr transition_lock_header
+#define LWLockAcquire transition_lock_acquire
+#define LWLockRelease transition_lock_release
+#define PinBuffer_Locked leave_pin
+#define UnpinBuffer leave_unpin
+#define ReservePrivateRefCountEntry eviction_reserve_pin
+#define ResourceOwnerEnlargeBuffers(owner) eviction_reserve_pin()
+#define FlushBuffer(buf, rel, object, context) leave_flush(buf)
+#define smgropen(locator, backend) (&transition_smgr)
+#define smgrimmedsync leave_sync
+#define StrategyFreeBuffer eviction_free
+#define cluster_pcm_is_active() true
+#define cluster_bufmgr_should_pcm_track(buf) true
+#define cluster_pcm_own_report_bump_failure(...) pg_re_throw()
+#define cluster_bufmgr_resource_x_wait_retry leave_wait
+#define cluster_bufmgr_resource_x_writer_report_failure(...) pg_re_throw()
+#include "test_cluster_pcm_leave_owner.inc"
+#undef cluster_bufmgr_resource_x_writer_report_failure
+#undef cluster_bufmgr_resource_x_wait_retry
+#undef cluster_pcm_own_report_bump_failure
+#undef cluster_bufmgr_should_pcm_track
+#undef cluster_pcm_is_active
+#undef StrategyFreeBuffer
+#undef smgrimmedsync
+#undef smgropen
+#undef FlushBuffer
+#undef ResourceOwnerEnlargeBuffers
+#undef ReservePrivateRefCountEntry
+#undef UnpinBuffer
+#undef PinBuffer_Locked
+#undef LWLockRelease
+#undef LWLockAcquire
+#undef LockBufHdr
+#undef CurrentResourceOwner
+#undef NBuffers
+#undef GetBufferDescriptor
+
+static void
+leave_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry, bool dirty)
+{
+	drop_fixture(buf, entry, dirty);
+	buf->pcm_state = PCM_STATE_X;
+	buf->buffer_type = BUF_TYPE_XCUR;
+	transition_copy_active = true;
+	eviction_path = RESOURCE_X_WRITER_TARGET;
+	eviction_private_pins = 0;
+	eviction_publishes = eviction_sleeps = eviction_frees = eviction_fuses = 0;
+	eviction_reuse_observed = eviction_legacy_releases = eviction_scenario = 0;
+	eviction_wal_captures = eviction_reserved_refs = eviction_entry_refs = 0;
+	eviction_plan_allocations = eviction_plan_frees = 0;
+	eviction_mapping_deleted = eviction_pin_reserved = false;
+	leave_syncs = leave_waits = 0;
+	leave_failure = 0;
+}
+
+UT_TEST(test_shared_leave_releases_dirty_and_clean_x_through_exact_owner)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int dirty = 0; dirty <= 1; dirty++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+
+		leave_fixture(&buf, &entry, dirty);
+		UT_ASSERT_EQ(cluster_bufmgr_flush_and_release_x_for_leave(), 1);
+		UT_ASSERT_EQ(leave_syncs, 1);
+		UT_ASSERT_EQ(eviction_publishes, 4);
+		UT_ASSERT_EQ(eviction_wal_captures, 2);
+		UT_ASSERT_EQ(eviction_frees, 1);
+		UT_ASSERT_EQ(eviction_private_pins, 0);
+		UT_ASSERT_EQ(eviction_reuse_observed + eviction_legacy_releases, 0);
+		UT_ASSERT(eviction_mapping_deleted);
+		UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_N);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state) & (BM_VALID | BM_TAG_VALID), 0);
+		drop_fixture_done(saved);
+	}
+}
+
+UT_TEST(test_shared_leave_write_and_sync_error_keep_x_and_mapping)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int failure = 1; failure <= 2; failure++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		BufferTag tag;
+		volatile bool caught = false;
+
+		leave_fixture(&buf, &entry, true);
+		tag = buf.tag;
+		leave_failure = failure;
+		PG_TRY();
+		{
+			(void)cluster_bufmgr_flush_and_release_x_for_leave();
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT(BufferTagsEqual(&buf.tag, &tag));
+		UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_X);
+		UT_ASSERT_EQ(eviction_publishes + eviction_frees, 0);
+		UT_ASSERT(!eviction_mapping_deleted);
+		/* Production propagates to the original LEAVE driver's transaction
+		 * cleanup. Model that ResourceOwner unwind, not a successful flush. */
+		if (transition_content_held)
+			transition_lock_release(BufferDescriptorGetContentLock(&buf));
+		if (eviction_private_pins != 0)
+			leave_unpin(&buf);
+		drop_fixture_done(saved);
+	}
+}
+
+UT_TEST(test_shared_leave_waits_for_pin_and_revoke_without_skipping_x)
+{
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	for (int revoke = 0; revoke < 2; revoke++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+
+		leave_fixture(&buf, &entry, false);
+		if (revoke)
+			pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_REVOKING);
+		else
+			pg_atomic_fetch_add_u32(&buf.state, BUF_REFCOUNT_ONE);
+		UT_ASSERT_EQ(cluster_bufmgr_flush_and_release_x_for_leave(), 1);
+		UT_ASSERT_EQ(leave_waits, 1);
+		UT_ASSERT_EQ(leave_syncs, 1);
+		UT_ASSERT_EQ(eviction_publishes, 4);
+		UT_ASSERT_EQ(eviction_private_pins, 0);
+		pg_atomic_fetch_and_u32(&buf.state, ~BUF_REFCOUNT_MASK);
+		drop_fixture_done(saved);
+	}
+}
+
+UT_TEST(test_shared_leave_closed_target_keeps_x_before_mapping_removal)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	BufferTag tag;
+	volatile bool caught = false;
+
+	leave_fixture(&buf, &entry, false);
+	tag = buf.tag;
+	eviction_path = RESOURCE_X_WRITER_SOURCE;
+	leave_failure = 3;
+	PG_TRY();
+	{
+		(void)cluster_bufmgr_flush_and_release_x_for_leave();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_X);
+	UT_ASSERT(BufferTagsEqual(&buf.tag, &tag));
+	UT_ASSERT_EQ(eviction_publishes + eviction_legacy_releases + eviction_frees, 0);
+	UT_ASSERT_EQ(eviction_private_pins, 0);
+	UT_ASSERT(!eviction_mapping_deleted);
+	drop_fixture_done(saved);
+}
+
 UT_TEST(test_shared_non_target_x_eviction_keeps_mapping_and_ownership)
 {
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
@@ -8455,7 +8689,11 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(145);
+	UT_PLAN(149);
+	UT_RUN(test_shared_leave_releases_dirty_and_clean_x_through_exact_owner);
+	UT_RUN(test_shared_leave_write_and_sync_error_keep_x_and_mapping);
+	UT_RUN(test_shared_leave_waits_for_pin_and_revoke_without_skipping_x);
+	UT_RUN(test_shared_leave_closed_target_keeps_x_before_mapping_removal);
 	UT_RUN(test_shared_scache_local_master_and_remote_holder_prepare);
 	UT_RUN(test_shared_downgrade_records_original_wal_before_notification);
 	UT_RUN(test_shared_downgrade_pi_failure_keeps_x_and_releases_original_revoke);

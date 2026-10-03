@@ -63,6 +63,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sinval.h"
 #include "cluster/cluster_terminal_ref_census.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/backendid.h"
@@ -98,6 +99,7 @@ typedef struct ClusterKoInboundSlot {
 	uint32 spc_oid;
 	int32 source_node;
 	uint64 batch_id;
+	uint64 epoch;
 } ClusterKoInboundSlot;
 
 typedef struct ClusterKoShared {
@@ -142,8 +144,9 @@ cluster_ko_normal_stop_poll(uint32 *slot_out, const char **reason_out)
 	reason = "EMPTY";
 	for (uint32 i = head; i != tail; i = (i + 1) % CLUSTER_KO_INBOUND_CAPACITY) {
 		const ClusterKoInboundSlot *item = &ko_state->inbound[i];
-		if (item->batch_id == 0 || item->source_node < 0 || item->source_node >= CLUSTER_MAX_NODES
-			|| item->spc_oid == InvalidOid || item->rel_number == InvalidRelFileNumber) {
+		if (item->batch_id == 0 || item->epoch == 0 || item->source_node < 0
+			|| item->source_node >= CLUSTER_MAX_NODES || item->spc_oid == InvalidOid
+			|| item->rel_number == InvalidRelFileNumber) {
 			result = CLUSTER_NORMAL_STOP_INVALID;
 			reason = "INVALID_REQUEST";
 			slot = i;
@@ -376,7 +379,7 @@ ko_run_barrier(RelFileLocator rloc, uint32 alive_mask)
 	hdr.source_node = cluster_node_id;
 
 	KO_BUMP(flush_count);
-	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+	for (peer = 0; peer < CLUSTER_MAX_NODES && peer < sizeof(alive_mask) * CHAR_BIT; peer++) {
 		if ((alive_mask & (1u << peer)) == 0)
 			continue;
 		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_KO_FLUSH, (uint32)peer, &hdr,
@@ -394,8 +397,11 @@ ko_run_barrier(RelFileLocator rloc, uint32 alive_mask)
 		long timeout_ms;
 		int rc;
 
+		if (hdr.epoch == 0 || hdr.epoch != cluster_epoch_get_current())
+			break;
 		if (cluster_sinval_ack_wait_is_complete(batch_id)) {
-			ok = true;
+			/* The ACK lookup can overlap a reconfiguration. */
+			ok = hdr.epoch == cluster_epoch_get_current();
 			break;
 		}
 		now_us = GetCurrentTimestamp();
@@ -558,8 +564,8 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 		return;
 	if (env->payload_length != (uint32)sizeof(KoFlushHeader))
 		return;
-	if (hdr->epoch < cluster_epoch_get_current())
-		return; /* stale (a reconfig has bumped the epoch) */
+	if (hdr->epoch == 0 || hdr->epoch != cluster_epoch_get_current())
+		return; /* No request from another configuration can drain here. */
 	if (hdr->source_node < 0 || hdr->source_node >= CLUSTER_MAX_NODES
 		|| env->source_node_id != (uint32)hdr->source_node
 		|| cluster_conf_lookup_node(hdr->source_node) == NULL)
@@ -583,6 +589,7 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 	ko_state->inbound[tail].spc_oid = hdr->spc_oid;
 	ko_state->inbound[tail].source_node = hdr->source_node;
 	ko_state->inbound[tail].batch_id = hdr->batch_id;
+	ko_state->inbound[tail].epoch = hdr->epoch;
 	pg_write_barrier(); /* publish the slot before advancing the tail */
 	pg_atomic_write_u32(&ko_state->inbound_tail, next);
 
@@ -611,8 +618,8 @@ cluster_ko_flush_ack_handler(const ClusterICEnvelope *env, const void *payload)
 		|| env->source_node_id != (uint32)hdr->acker_node
 		|| cluster_conf_lookup_node(hdr->acker_node) == NULL)
 		return;
-	if (hdr->epoch < cluster_epoch_get_current())
-		return; /* stale */
+	if (hdr->epoch == 0 || hdr->epoch != cluster_epoch_get_current())
+		return;
 	if (hdr->status != (uint16)KO_FLUSH_ACK_DONE)
 		return; /* KO-M6: only an apply-after-drop DONE fulfils the barrier */
 
@@ -655,16 +662,18 @@ cluster_ko_drain_inbound_and_apply(void)
 		rloc.spcOid = (Oid)slot.spc_oid;
 		rloc.dbOid = (Oid)slot.db_oid;
 		rloc.relNumber = (RelFileNumber)slot.rel_number;
+		if (slot.epoch == 0 || slot.epoch != cluster_epoch_get_current())
+			goto next;
 		/* A peer may publish DONE only after its own bounded CTRC journal is
 		 * drained.  No ACK makes the enqueuer fail closed without extending
 		 * the existing KO wire. */
 		if (!cluster_ctrc_relation_removal_ready_shared((uint32)rloc.spcOid, (uint32)rloc.dbOid,
 														(uint32)rloc.relNumber)) {
-			head = pg_atomic_read_u32(&ko_state->inbound_head);
-			tail = pg_atomic_read_u32(&ko_state->inbound_tail);
-			continue;
+			goto next;
 		}
 		smgr = smgropen(rloc, InvalidBackendId);
+		if (slot.epoch != cluster_epoch_get_current())
+			goto next;
 
 		/*
 		 * Flush THEN invalidate (the abort-safe order): write any dirty buffers to
@@ -673,6 +682,18 @@ cluster_ko_drain_inbound_and_apply(void)
 		 * a reused relfilenode.
 		 */
 		FlushRelationsAllBuffers(&smgr, 1);
+		if (slot.epoch != cluster_epoch_get_current())
+			goto next;
+		if (cluster_shared_config && cluster_smgr_which_for(rloc, InvalidBackendId) == 1) {
+			/* Buffer writeout alone does not make shared DATA durable.  An
+			 * I/O error must retain the buffers and leave the origin unacked. */
+			for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++) {
+				if (smgrexists(smgr, fork))
+					smgrimmedsync(smgr, fork);
+				if (slot.epoch != cluster_epoch_get_current())
+					goto next;
+			}
+		}
 		DropRelationsAllBuffers(&smgr, 1);
 		cluster_hw_lease_discard(rloc, MAIN_FORKNUM);
 		KO_BUMP(peer_apply_count);
@@ -684,16 +705,14 @@ cluster_ko_drain_inbound_and_apply(void)
 		 * deterministically without having to kill a node.
 		 */
 		CLUSTER_INJECTION_POINT("cluster-ko-peer-skip-ack");
-		if (cluster_injection_should_skip("cluster-ko-peer-skip-ack")) {
-			head = pg_atomic_read_u32(&ko_state->inbound_head);
-			tail = pg_atomic_read_u32(&ko_state->inbound_tail);
-			continue;
-		}
+		if (cluster_injection_should_skip("cluster-ko-peer-skip-ack")
+			|| slot.epoch != cluster_epoch_get_current())
+			goto next;
 
 		/* apply-after-drop: ACK only now that the buffers are really gone. */
 		memset(&ack, 0, sizeof(ack));
 		ack.batch_id = slot.batch_id;
-		ack.epoch = cluster_epoch_get_current();
+		ack.epoch = slot.epoch;
 		ack.acker_node = cluster_node_id;
 		ack.status = (uint16)KO_FLUSH_ACK_DONE;
 		ack.flags = 0;
@@ -701,6 +720,7 @@ cluster_ko_drain_inbound_and_apply(void)
 			PGRAC_IC_MSG_KO_FLUSH_ACK, (uint32)slot.source_node, &ack, (uint16)sizeof(ack));
 		cluster_lmon_wakeup(); /* wake LMON to send the ACK */
 
+	next:
 		head = pg_atomic_read_u32(&ko_state->inbound_head);
 		tail = pg_atomic_read_u32(&ko_state->inbound_tail);
 	}

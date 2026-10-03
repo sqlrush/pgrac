@@ -19,11 +19,13 @@
 #include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_hw.h"
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -47,6 +49,16 @@ typedef struct SpaceIdentityCacheEntry {
 
 static HTAB *space_identity_cache;
 static uint64 space_identity_invalidations;
+
+bool
+cluster_space_cold_install_v1(const ClusterSpaceIdentityKey *key,
+							  const ClusterSpaceRecoveryInput *inputs,
+							  const ClusterSpaceColdSourceV1 *sources, uint32 count, uint32 through,
+							  uint8 shrink_forks)
+{
+	return cluster_space_recovery_cold_relation_install_v1(key, inputs, sources, count, through,
+														   shrink_forks);
+}
 
 static void
 space_identity_invalidate(Datum arg, Oid relid)
@@ -837,6 +849,33 @@ void
 cluster_space_truncate_finish(ClusterSpaceTruncateState *state, Relation rel)
 {
 	Assert(state != NULL && CritSectionCount == 0);
+	/* The caller still holds the relation lifecycle lock and both SPACE
+	 * content locks. Persist the new incarnation before another writer can
+	 * make its pages durable: an old on-disk identity cannot distinguish
+	 * those pages from the retired incarnation after a crash. */
+	PG_TRY();
+	{
+		SMgrRelation smgr;
+
+		for (int i = 0; i < 2; i++)
+			FlushOneBuffer(state->buffers[i]);
+		smgr = smgropen(rel->rd_locator, InvalidBackendId);
+		smgrimmedsync(smgr, SPACE_FORKNUM);
+	}
+	PG_CATCH();
+	{
+		/* The published shared pages cannot be rolled back. An ordinary
+		 * transaction abort would release the locks and expose that cached
+		 * incarnation to other writers without its durable SPACE anchor. */
+		ereport(PANIC, (errcode(ERRCODE_IO_ERROR),
+						errmsg("could not durably publish the truncated relation identity"),
+						errdetail("Relation %u/%u/%u has an unconfirmed SPACE incarnation.",
+								  rel->rd_locator.spcOid, rel->rd_locator.dbOid,
+								  rel->rd_locator.relNumber),
+						errhint("Restore storage availability and restart the instance to recover "
+								"the truncation.")));
+	}
+	PG_END_TRY();
 	space_truncate_release(state);
 	if (space_identity_cache != NULL)
 		space_identity_invalidate((Datum)0, RelationGetRelid(rel));
@@ -987,6 +1026,7 @@ cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid)
 	xl_xact_parsed_commit parsed;
 	int count;
 	uint32 consumed = 0;
+	bool cold = cluster_shared_config && cluster_cold_replay_window_active_v1();
 
 	if (record == NULL || record->record == NULL || !RecoveryInProgress()
 		|| !TransactionIdIsNormal(xid) || XLogRecGetRmid(record) != RM_XACT_ID
@@ -1028,6 +1068,16 @@ cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid)
 			|| !space_identity_key_matches(&expected, &change.identity.result.key))
 			goto refused;
 		consumed++;
+		if (cold) {
+			ClusterSpaceRecoveryInput input
+				= { parsed.space_drops + (Size)(consumed - 1) * CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+					CLUSTER_SPACE_STRUCTURE_WAL_BYTES };
+			ClusterSpaceColdSourceV1 source = { local_thread, record->EndRecPtr };
+
+			if (!cluster_space_recovery_cold_drop_already_v1(&expected, &input, &source))
+				goto refused;
+			continue;
+		}
 		smgr = smgropen(expected.locator, InvalidBackendId);
 		if (!smgrexists(smgr, SPACE_FORKNUM)) {
 			/* Native unlink removes SPACE last. A missing identity alone
@@ -1047,6 +1097,13 @@ cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid)
 	if (consumed != parsed.nspace_drops)
 		goto refused;
 	pfree(sorted);
+	if (cold) {
+		/* The original COMMIT owner deletes only after every target has
+		 * qualified. Its source is already pinned; no local WAL flush or
+		 * SPACE rewrite is allowed for a cold ALREADY result. */
+		cluster_space_drop_finish(state);
+		return true;
+	}
 	/* All targets were checked privately. Bind minRecoveryPoint to this
 	 * same local stream's COMMIT before any tombstone becomes dirty. */
 	XLogFlush(record->EndRecPtr);
@@ -1199,16 +1256,16 @@ cluster_space_relation_redo(XLogReaderState *record)
 			|| memcmp(BufferGetPage(buffers[i]), zero.data, BLCKSZ) != 0)
 			goto done;
 	}
-	if (identity->action == CLUSTER_SPACE_WAL_TRUNCATE) {
+	if (identity->action == CLUSTER_SPACE_WAL_TRUNCATE && (apply_mask & 1)) {
 		xl_smgr_truncate truncate;
 
 		truncate.rlocator = expected.locator;
 		truncate.blkno = identity->nblocks;
 		truncate.flags = SMGR_TRUNCATE_ALL;
 		/* Native preparation allocates memory; only its physical shrink is
-		 * critical. Keep SPACE locked, finish the structural action first,
-		 * then publish identity. A restart can repeat a completed shrink even
-		 * when SPACE already has result, or still has expected identity. */
+		 * critical. Keep SPACE locked and finish the shrink before publishing
+		 * identity. Result identity proves this shrink was already durable;
+		 * repeating it could remove a peer's later checkpointed extension. */
 		smgr_redo_truncate(record->EndRecPtr, &truncate);
 	}
 	if (apply_mask != 0) {

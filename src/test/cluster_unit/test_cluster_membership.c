@@ -40,6 +40,7 @@
  */
 #include "postgres.h"
 
+#include <setjmp.h>
 #include <stddef.h>
 #include <string.h>
 
@@ -86,10 +87,25 @@ cluster_qvotec_in_quorum(void)
 	return test_in_quorum;
 }
 
-/* cluster_membership.c invalidates this backend-local cache after a commit. */
+static pg_atomic_uint64 cut_generation;
+static ClusterMembershipTable cut_table;
+static bool inspect_write;
+static bool interrupt_write;
+static int inspected_writes;
+static jmp_buf interrupted;
+
+void cluster_write_fence_authority_cache_invalidate(void);
 void
 cluster_write_fence_authority_cache_invalidate(void)
-{}
+{
+	if (inspect_write) {
+		UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+		inspected_writes++;
+	}
+	if (interrupt_write)
+		longjmp(interrupted, 1);
+}
+
 
 /*
  * A file-static backing table for the marker-seed tests (U10/U13/U15).  They
@@ -756,10 +772,142 @@ UT_TEST(test_replacement_marker_v3_phase_bases_and_floors)
 	UT_ASSERT_EQ((int)ready, (int)UINT32_C(0xA5A5A5A5));
 }
 
+static void
+cut_reset(void)
+{
+	memset(&cut_table, 0, sizeof(cut_table));
+	pg_atomic_init_u64(&cut_generation, 2);
+	cluster_membership_attach(&cut_table);
+	cluster_membership_attach_cut_generation(&cut_generation);
+	inspect_write = false;
+	interrupt_write = false;
+	inspected_writes = 0;
+}
+
+UT_TEST(cut_missing_owner_never_qualifies)
+{
+	cluster_membership_attach(NULL);
+	cluster_membership_attach_cut_generation(NULL);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+	UT_ASSERT(!cluster_membership_cut_generation_current(0));
+	UT_ASSERT(!cluster_membership_cut_generation_current(2));
+	cluster_membership_record_admitted(3, 91);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(3), 91);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+}
+
+UT_TEST(cut_boot_and_member_changes_invalidate_same_epoch)
+{
+	uint64 before;
+	cut_reset();
+	inspect_write = true;
+	before = cluster_membership_cut_generation();
+	cluster_membership_record_admitted(3, 10);
+	UT_ASSERT(!cluster_membership_cut_generation_current(before));
+	UT_ASSERT(cluster_membership_cut_generation() > before);
+	before = cluster_membership_cut_generation();
+	cluster_membership_set_state(3, CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT(!cluster_membership_cut_generation_current(before));
+	before = cluster_membership_cut_generation();
+	cluster_membership_record_admitted(3, 11);
+	UT_ASSERT(!cluster_membership_cut_generation_current(before));
+	before = cluster_membership_cut_generation();
+	cluster_membership_set_state(3, CLUSTER_MEMBER_DEAD);
+	UT_ASSERT(!cluster_membership_cut_generation_current(before));
+	UT_ASSERT_EQ(inspected_writes, 4);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(3), 11);
+	UT_ASSERT_EQ(cluster_membership_get_state(3), CLUSTER_MEMBER_DEAD);
+}
+
+UT_TEST(cut_noops_do_not_retire_stable_cut)
+{
+	uint64 before;
+	cut_reset();
+	cluster_membership_record_admitted(3, 11);
+	cluster_membership_set_state(3, CLUSTER_MEMBER_MEMBER);
+	before = cluster_membership_cut_generation();
+	cluster_membership_record_admitted(3, 10);
+	cluster_membership_record_admitted(3, 11);
+	cluster_membership_set_state(3, CLUSTER_MEMBER_MEMBER);
+	cluster_membership_set_state(-1, CLUSTER_MEMBER_DEAD);
+	cluster_membership_record_admitted(CLUSTER_MAX_NODES, 12);
+	UT_ASSERT(cluster_membership_cut_generation_current(before));
+	/* O(1) generation API only; this does not claim A's ready-cache test. */
+	for (int i = 0; i < 1000000; i++)
+		UT_ASSERT(cluster_membership_cut_generation_current(before));
+}
+
+UT_TEST(cut_removed_and_durable_seed_cover_both_fields)
+{
+	uint64 before;
+	ClusterJoinCommitMarker marker = { 0 };
+	cut_reset();
+	inspect_write = true;
+	cluster_membership_record_admitted(3, 10);
+	cluster_membership_set_state(3, CLUSTER_MEMBER_MEMBER);
+	before = cluster_membership_cut_generation();
+	cluster_membership_shrink_to_removed(3, 12);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), before + 2);
+	UT_ASSERT(!cluster_membership_cut_generation_current(before));
+	UT_ASSERT_EQ(cluster_membership_get_state(3), CLUSTER_MEMBER_REMOVED);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(3), 12);
+	before = cluster_membership_cut_generation();
+	cluster_membership_shrink_to_removed(3, 11);
+	UT_ASSERT(cluster_membership_cut_generation_current(before));
+	marker.magic = CLUSTER_JCMK_MAGIC;
+	marker.version = CLUSTER_JCMK_VERSION;
+	marker.node_id = 4;
+	marker.phase = CLUSTER_JCMK_PHASE_COMMITTED;
+	marker.admitted_incarnation = 19;
+	cluster_join_marker_compute_crc(&marker);
+	UT_ASSERT(cluster_membership_seed_apply_marker(&marker));
+	UT_ASSERT(!cluster_membership_cut_generation_current(before));
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(4), 19);
+	UT_ASSERT_EQ(inspected_writes, 4);
+}
+
+UT_TEST(cut_interrupted_writer_never_reopens_old_cache)
+{
+	uint64 before;
+	cut_reset();
+	before = cluster_membership_cut_generation();
+	inspect_write = true;
+	interrupt_write = true;
+	if (setjmp(interrupted) == 0)
+		cluster_membership_record_admitted(3, 10);
+	interrupt_write = false;
+	UT_ASSERT_EQ(inspected_writes, 1);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(3), 0);
+	UT_ASSERT(!cluster_membership_cut_generation_current(before));
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+	/* A new mutator must not convert an interrupted odd sequence to ready. */
+	cluster_membership_record_admitted(3, 11);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(3), 11);
+}
+
+UT_TEST(cut_wrap_and_reattach_fail_closed)
+{
+	cut_reset();
+	pg_atomic_write_u64(&cut_generation, UINT64_MAX - 1);
+	cluster_membership_record_admitted(3, 10);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+	cluster_membership_set_state(3, CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+	cluster_membership_attach(&cut_table);
+	cluster_membership_attach_cut_generation(&cut_generation);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&cut_generation), UINT64_MAX);
+	/* An uninitialized owner cannot supply a stable cache token either. */
+	pg_atomic_write_u64(&cut_generation, 0);
+	cluster_membership_set_state(3, CLUSTER_MEMBER_DEAD);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(28);
 	UT_RUN(test_vet_fresh_above_accept);
 	UT_RUN(test_vet_equal_reject_stale);
 	UT_RUN(test_vet_below_reject_stale);
@@ -782,6 +930,12 @@ main(void)
 	UT_RUN(test_replacement_marker_v3_phase_and_integrity_gates);
 	UT_RUN(test_replacement_marker_v3_same_image_majority);
 	UT_RUN(test_replacement_marker_v3_phase_bases_and_floors);
+	UT_RUN(cut_missing_owner_never_qualifies);
+	UT_RUN(cut_boot_and_member_changes_invalidate_same_epoch);
+	UT_RUN(cut_noops_do_not_retire_stable_cut);
+	UT_RUN(cut_removed_and_durable_seed_cover_both_fields);
+	UT_RUN(cut_interrupted_writer_never_reopens_old_cache);
+	UT_RUN(cut_wrap_and_reattach_fail_closed);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

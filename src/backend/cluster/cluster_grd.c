@@ -89,6 +89,29 @@
 
 static ClusterGrdShared *cluster_grd_state = NULL;
 
+/* Process-local memo of an exactly checked completed JOIN cut. Every field
+ * is owned by an existing shared publisher; this is not a serving authority. */
+typedef struct GrdPiReadyKey {
+	uint64 publication;
+	uint64 membership;
+	uint64 epoch;
+	uint64 fence_epoch;
+	uint64 scope_epoch;
+	uint64 master_map_refresh;
+	uint64 redeclare_generation;
+	uint64 routing_generation;
+	uint64 self_boot;
+	uint64 event_id;
+	uint64 episode_epoch;
+	uint32 direction;
+	int32 node;
+} GrdPiReadyKey;
+
+static GrdPiReadyKey grd_pi_ready_key;
+static bool grd_pi_ready_valid;
+static bool grd_pi_ready_cached(void);
+
+
 /* spec-2.15 v0.3 P1.3:  Per-shard LWLock array (named tranche).  4096
  * LWLock managed by PG lwlock.c — cluster_grd_shmem_init only obtains
  * the array pointer; PG auto-initializes the lock objects. */
@@ -804,6 +827,7 @@ cluster_grd_shmem_init(void)
 	bool found;
 	Size entry_alloc = grd_entries_estimate_bytes();
 
+	grd_pi_ready_valid = false; /* Never inherit a memo across shmem attach. */
 	cluster_grd_state = ShmemInitStruct("pgrac cluster grd", sizeof(ClusterGrdShared), &found);
 	if (!found) {
 		int i;
@@ -951,6 +975,7 @@ cluster_grd_shmem_init(void)
 		}
 		pg_atomic_init_u32(&cluster_grd_state->recovery_direction, (uint32)GRD_REMASTER_DIR_NONE);
 		SpinLockInit(&cluster_grd_state->pi_rebuild_lock);
+		pg_atomic_init_u64(&cluster_grd_state->pi_rebuild_publication, 2);
 		pg_atomic_init_u64(&cluster_grd_state->pi_rebuild_side_blocked_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->pi_rebuild_apply_blocked_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->pi_rebuild_plan_blocked_count, 0);
@@ -1883,6 +1908,26 @@ cluster_grd_master_map_recompute_for_membership(const uint8 *active_member, uint
 	return moved;
 }
 
+/* Caller holds pi_rebuild_lock across scope/complete publication. Zero is
+ * sticky on exhaustion or an interrupted write, so a sequence cannot ABA. */
+static uint64
+grd_pi_publish_begin(void)
+{
+	uint64 prior = pg_atomic_read_u64(&cluster_grd_state->pi_rebuild_publication);
+	if (prior == 0 || (prior & 1) != 0 || prior > UINT64_MAX - 2)
+		prior = 0;
+	pg_atomic_write_u64(&cluster_grd_state->pi_rebuild_publication, prior ? prior + 1 : 0);
+	pg_write_barrier();
+	return prior;
+}
+
+static void
+grd_pi_publish_end(uint64 prior)
+{
+	pg_write_barrier();
+	pg_atomic_write_u64(&cluster_grd_state->pi_rebuild_publication, prior ? prior + 2 : 0);
+}
+
 /*
  * cluster_grd_arm_join_pcm_fence -- spec-5.16 D3b (INV-R13).
  *
@@ -1910,17 +1955,11 @@ cluster_grd_master_map_recompute_for_membership(const uint8 *active_member, uint
  *	keying fixes both the union (no under-fence) and the staleness (no cross-
  *	episode under-wait) with no reset race.
  */
-void
-cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set)
+static void
+grd_arm_join_pcm_fence_locked(const uint8 *rejoining_set, uint64 epoch)
 {
-	uint64 epoch;
 	uint64 prev;
 	int node;
-
-	if (cluster_grd_state == NULL || rejoining_set == NULL)
-		return;
-
-	epoch = cluster_epoch_get_current();
 
 	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
 		uint64 cur;
@@ -1948,14 +1987,29 @@ cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set)
 }
 
 void
+cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set)
+{
+	uint64 publication;
+	if (cluster_grd_state == NULL || rejoining_set == NULL)
+		return;
+	SpinLockAcquire(&cluster_grd_state->pi_rebuild_lock);
+	publication = grd_pi_publish_begin();
+	grd_arm_join_pcm_fence_locked(rejoining_set, cluster_epoch_get_current());
+	grd_pi_publish_end(publication);
+	SpinLockRelease(&cluster_grd_state->pi_rebuild_lock);
+}
+
+void
 cluster_grd_arm_join_pcm_fence_scope_v1(const uint8 *rejoining_set, const uint8 *excluded_set)
 {
-	uint64 epoch, prior;
+	uint64 epoch, prior, publication;
 	if (cluster_grd_state == NULL || rejoining_set == NULL || excluded_set == NULL)
 		return;
 	epoch = cluster_epoch_get_current();
 	if (epoch == 0)
 		return;
+	SpinLockAcquire(&cluster_grd_state->pi_rebuild_lock);
+	publication = grd_pi_publish_begin();
 	/* Same-epoch arms union without removing a home already fenced. A
 	 * newer epoch naturally ignores old stamps. Publish scope before the
 	 * original recipient fence, which is armed before MEMBER is visible. */
@@ -1974,7 +2028,9 @@ cluster_grd_arm_join_pcm_fence_scope_v1(const uint8 *rejoining_set, const uint8 
 		   && !pg_atomic_compare_exchange_u64(&cluster_grd_state->join_pcm_fence_scope_epoch,
 											  &prior, epoch))
 		;
-	cluster_grd_arm_join_pcm_fence(rejoining_set);
+	grd_arm_join_pcm_fence_locked(rejoining_set, epoch);
+	grd_pi_publish_end(publication);
+	SpinLockRelease(&cluster_grd_state->pi_rebuild_lock);
 }
 
 /*
@@ -2118,6 +2174,8 @@ cluster_grd_join_view_rebuilt(void)
 bool
 cluster_grd_block_view_rebuilt(BufferTag tag)
 {
+	if (grd_pi_ready_cached())
+		return true;
 	if (!cluster_grd_join_view_rebuilt())
 		return false;
 	/* Remote requesters may retry after the protocol barrier. The actual
@@ -2557,6 +2615,79 @@ grd_control_authority_pending(void)
 		   > pg_atomic_read_u64(&cluster_grd_state->recovery_authority_terminal_generation);
 }
 
+/* Fixed-cost cache key. No membership scan or global lock on a hit.
+ * The generation brackets JOIN scope/complete publication, including a
+ * same-epoch scope union; membership has its own original owner sequence. */
+static bool
+grd_pi_ready_key_read(GrdPiReadyKey *key)
+{
+	memset(key, 0, sizeof(*key));
+	if (!cluster_shared_config || !grd_control_map_current() || cluster_node_id < 0
+		|| cluster_node_id >= 32)
+		return false;
+	key->publication = pg_atomic_read_u64(&cluster_grd_state->pi_rebuild_publication);
+	key->membership = cluster_membership_cut_generation();
+	if (key->publication == 0 || (key->publication & 1) || key->membership == 0)
+		return false;
+	pg_read_barrier();
+	if (pg_atomic_read_u32(&cluster_grd_state->recovery_state) != GRD_RECOVERY_IDLE)
+		return false;
+	key->epoch = cluster_epoch_get_current();
+	key->fence_epoch = pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch);
+	key->scope_epoch = pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_scope_epoch);
+	key->master_map_refresh = pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count);
+	key->redeclare_generation = cluster_grd_redeclare_generation();
+	key->routing_generation = cluster_lms_get_shard_master_generation();
+	key->self_boot = cluster_qvotec_get_self_incarnation();
+	key->event_id = pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id);
+	key->episode_epoch = pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch);
+	key->direction = pg_atomic_read_u32(&cluster_grd_state->recovery_direction);
+	key->node = cluster_node_id;
+	pg_read_barrier();
+	return key->fence_epoch == key->epoch && key->scope_epoch == key->epoch
+		   && key->master_map_refresh != 0 && key->routing_generation != 0 && key->self_boot != 0
+		   && (key->direction == GRD_REMASTER_DIR_JOIN || key->direction == GRD_REMASTER_DIR_NONE)
+		   && pg_atomic_read_u32(&cluster_grd_state->recovery_state) == GRD_RECOVERY_IDLE
+		   && key->epoch == cluster_epoch_get_current()
+		   && key->publication == pg_atomic_read_u64(&cluster_grd_state->pi_rebuild_publication)
+		   && cluster_membership_cut_generation_current(key->membership);
+}
+
+static bool
+grd_pi_ready_cached(void)
+{
+	GrdPiReadyKey now;
+	return grd_pi_ready_valid && grd_pi_ready_key_read(&now)
+		   && memcmp(&now, &grd_pi_ready_key, sizeof(now)) == 0;
+}
+
+/* Only a successful exact slow-path check may prime the memo. The member
+ * set/boots must also match a single locked Reconfig snapshot; two unlocked
+ * scans alone could observe a stable intermediate table between mutators. */
+static void
+grd_pi_ready_remember(const GrdPiReadyKey *before, const ClusterGrdPiRebuildCutV1 *cut)
+{
+	ClusterFormationSnapshotV1 formation;
+	GrdPiReadyKey after;
+	if (cut->direction != GRD_REMASTER_DIR_JOIN
+		|| !cluster_membership_cut_generation_current(before->membership)
+		|| !cluster_reconfig_capture_formation_snapshot_v1(cluster_node_id + 1, &formation)
+		|| formation.local_epoch != cut->epoch)
+		return;
+	for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
+		bool member = cluster_conf_lookup_node(node) != NULL
+					  && formation.membership.membership_state[node] == CLUSTER_MEMBER_MEMBER;
+		if (member != ((cut->members[node / 8] & (1u << (node % 8))) != 0)
+			|| (member
+				&& formation.membership.last_admitted_incarnation[node] != cut->member_boots[node]))
+			return;
+	}
+	if (!grd_pi_ready_key_read(&after) || memcmp(before, &after, sizeof(after)) != 0)
+		return;
+	grd_pi_ready_key = after;
+	grd_pi_ready_valid = true;
+}
+
 static int
 grd_pi_rebuild_cut(ClusterGrdPiRebuildCutV1 *out)
 {
@@ -2656,10 +2787,13 @@ cluster_grd_pi_rebuild_current_v1(const ClusterGrdPiRebuildCutV1 *cut)
 bool
 cluster_grd_pi_rebuild_complete_v1(const ClusterGrdPiRebuildCutV1 *cut)
 {
+	uint64 publication;
 	if (MyBackendType != B_BG_WRITER || !cluster_grd_pi_rebuild_current_v1(cut))
 		return false;
 	SpinLockAcquire(&cluster_grd_state->pi_rebuild_lock);
+	publication = grd_pi_publish_begin();
 	cluster_grd_state->pi_rebuilt = *cut;
+	grd_pi_publish_end(publication);
 	SpinLockRelease(&cluster_grd_state->pi_rebuild_lock);
 	return cluster_grd_pi_rebuild_current_v1(cut);
 }
@@ -2668,13 +2802,25 @@ bool
 cluster_grd_pi_rebuild_gate_v1(void)
 {
 	ClusterGrdPiRebuildCutV1 now, completed;
-	int state = cluster_grd_pi_rebuild_snapshot_v1(&now);
+	GrdPiReadyKey key;
+	bool cacheable;
+	int state;
+
+	if (grd_pi_ready_cached())
+		return false;
+	grd_pi_ready_valid = false;
+	cacheable = grd_pi_ready_key_read(&key);
+	state = cluster_grd_pi_rebuild_snapshot_v1(&now);
 	if (state != 1)
 		return state != 0;
 	SpinLockAcquire(&cluster_grd_state->pi_rebuild_lock);
 	completed = cluster_grd_state->pi_rebuilt;
 	SpinLockRelease(&cluster_grd_state->pi_rebuild_lock);
-	return memcmp(&completed, &now, sizeof(now)) != 0 || !cluster_grd_pi_rebuild_current_v1(&now);
+	if (memcmp(&completed, &now, sizeof(now)) != 0 || !cluster_grd_pi_rebuild_current_v1(&now))
+		return true;
+	if (cacheable)
+		grd_pi_ready_remember(&key, &now);
+	return false;
 }
 
 void
@@ -2705,6 +2851,8 @@ cluster_grd_pi_rebuild_blocked_v1(BufferTag tag)
 	uint32 state, direction;
 	int home, master;
 
+	if (grd_pi_ready_cached())
+		return false;
 	if (!cluster_enabled || !cluster_shared_config)
 		return false;
 	if (!grd_control_map_current())

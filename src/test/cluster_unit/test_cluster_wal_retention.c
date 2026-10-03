@@ -1727,6 +1727,135 @@ UT_TEST(test_unbound_pin_has_pre_ir_slow_revalidation_only)
 	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 }
 
+UT_TEST(test_cold_borrow_returns_original_complete_set_without_acquiring)
+{
+	for (uint16 n = 1; n <= 2; n++) {
+		ClusterWalRetentionInterval intervals[2]
+			= { { 1, 0, 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2 },
+				{ 2, 0, 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2 } };
+		ClusterWalRetentionPinThreadRequest requests[2]
+			= { make_pin_request(1, &intervals[0], 1), make_pin_request(2, &intervals[1], 1) };
+		ClusterRecoverySerialGuardSet set = { 0 };
+		ClusterRecoverySerialGuard *borrowed[2] = { NULL, NULL };
+		ClusterWalRetentionPin *pin = NULL, *borrowed_pin = NULL;
+		uint16 count = 77;
+
+		reset_pin_fakes();
+		cluster_shared_config = true;
+		set.count = n;
+		for (uint16 i = 0; i < n; i++) {
+			set.guards[i] = make_serial_guard(&requests[i]);
+			set.guards[i].mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		}
+		UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(requests, n, &pin), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(n == 1 ? cluster_wal_retention_pin_bind_one(pin, &set.guards[0])
+							: cluster_wal_retention_pin_bind_set(pin, &set),
+					 CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_borrow_cold_v1(&borrowed_pin, borrowed, 2, &count),
+					 CLUSTER_WAL_PIN_OK);
+		UT_ASSERT(borrowed_pin == pin);
+		UT_ASSERT_EQ(count, n);
+		for (uint16 i = 0; i < n; i++)
+			UT_ASSERT(borrowed[i] == &set.guards[i]);
+		UT_ASSERT_EQ(fake_acquire_call_count, n);
+		UT_ASSERT_EQ(fake_release_call_count, 0);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+		UT_ASSERT_EQ(fake_release_call_count, n);
+		/* Borrowing never owns or releases the original IR guards. */
+		UT_ASSERT(set.guards[0].held);
+	}
+}
+
+UT_TEST(test_cold_borrow_never_exports_a_partial_or_stale_set)
+{
+	for (int variant = 0; variant < 6; variant++) {
+		ClusterWalRetentionInterval intervals[2]
+			= { { 1, 0, 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2 },
+				{ 2, 0, 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2 } };
+		ClusterWalRetentionPinThreadRequest requests[2]
+			= { make_pin_request(1, &intervals[0], 1), make_pin_request(2, &intervals[1], 1) };
+		ClusterRecoverySerialGuardSet set = { 0 };
+		ClusterRecoverySerialGuard *borrowed[2] = { NULL, NULL };
+		ClusterWalRetentionPin *pin = NULL, *borrowed_pin = NULL;
+		uint16 count = 77;
+
+		reset_pin_fakes();
+		cluster_shared_config = true;
+		set.count = 2;
+		for (uint16 i = 0; i < 2; i++) {
+			set.guards[i] = make_serial_guard(&requests[i]);
+			set.guards[i].mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		}
+		UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(requests, 2, &pin), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_bind_set(pin, &set), CLUSTER_WAL_PIN_OK);
+		if (variant == 0)
+			set.guards[1].held = false;
+		if (variant == 1)
+			set.guards[1].mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+		if (variant == 2)
+			set.guards[1].root_read_token.record_crc32c++;
+		if (variant == 3)
+			fake_serial_result = CLUSTER_RECOVERY_SERIAL_FENCE_STALE;
+		if (variant == 4)
+			fake_control_owner_stale_thread = 2;
+		if (variant == 5)
+			set.count = 1;
+		UT_ASSERT(cluster_wal_retention_pin_borrow_cold_v1(&borrowed_pin, borrowed, 2, &count)
+				  != CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_NULL(borrowed_pin);
+		UT_ASSERT_NULL(borrowed[0]);
+		UT_ASSERT_NULL(borrowed[1]);
+		UT_ASSERT_EQ(count, 77);
+		UT_ASSERT_EQ(fake_acquire_call_count, 2);
+		UT_ASSERT_EQ(fake_release_call_count, 0);
+		fake_serial_result = CLUSTER_RECOVERY_SERIAL_CURRENT;
+		fake_control_owner_stale_thread = 0;
+		UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	}
+}
+
+UT_TEST(test_cold_borrow_preserves_the_original_owner_and_closed_phase)
+{
+	for (int variant = 0; variant < 7; variant++) {
+		ClusterWalRetentionInterval interval
+			= { 1, 0, 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2 };
+		ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+		ClusterRecoverySerialGuard guard = make_serial_guard(&request), *borrowed = NULL;
+		ClusterWalRetentionPin *pin = NULL, *borrowed_pin = NULL;
+		ResourceOwner owner;
+		uint16 count = 77;
+
+		reset_pin_fakes();
+		cluster_shared_config = true;
+		owner = CurrentResourceOwner;
+		guard.mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+		if (variant != 0)
+			UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &guard), CLUSTER_WAL_PIN_OK);
+		if (variant == 1)
+			UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+		if (variant == 2)
+			CurrentResourceOwner = (ResourceOwner)(uintptr_t)0x2222;
+		if (variant == 3)
+			MyProcPid++;
+		if (variant == 4)
+			UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+		if (variant == 6)
+			cluster_shared_config = false;
+		UT_ASSERT(cluster_wal_retention_pin_borrow_cold_v1(&borrowed_pin, &borrowed,
+														   variant == 5 ? 0 : 1, &count)
+				  != CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_NULL(borrowed_pin);
+		UT_ASSERT_NULL(borrowed);
+		UT_ASSERT_EQ(count, 77);
+		CurrentResourceOwner = owner;
+		if (variant == 3)
+			MyProcPid--;
+		if (pin != NULL)
+			UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	}
+}
+
 UT_TEST(test_pin_revalidation_drift_poisoned_until_release)
 {
 	ClusterWalRetentionInterval interval = { .thread_id = 1,
@@ -3425,7 +3554,10 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(70);
+	UT_PLAN(73);
+	UT_RUN(test_cold_borrow_returns_original_complete_set_without_acquiring);
+	UT_RUN(test_cold_borrow_never_exports_a_partial_or_stale_set);
+	UT_RUN(test_cold_borrow_preserves_the_original_owner_and_closed_phase);
 	UT_RUN(test_released_read_census_allows_real_e1_gc_owner_to_progress);
 	UT_RUN(test_read_pin_covers_sorted_threads_without_recovery_authority);
 	UT_RUN(test_read_pin_rejects_bad_shape_and_rolls_back_partial_grants);

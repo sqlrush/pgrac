@@ -198,10 +198,13 @@ extern bool cluster_runtime_visibility_current_owner_sample_held(
 	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterTTStatusKey *key_out,
 	ClusterTTStatusResult *result_out, bool *ctrc_physical_active_out);
+/* Optional precommit flag requires exact COMMITTED TT/valid SCN with native
+ * IN_PROGRESS.  It is a negative observation, never a CTRC or terminal proof. */
 extern bool cluster_runtime_visibility_physical_locator_sample_held(
 	const ClusterTTSlotPhysicalLocator *locator, const ClusterSemanticAdmissionToken *admission,
 	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
-	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out, bool *ctrc_physical_active_out);
+	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out, bool *ctrc_physical_active_out,
+	bool *precommit_retry_out);
 extern bool cluster_runtime_visibility_current_owner_lookup_exact(
 	TransactionId xid, ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out);
 extern bool cluster_runtime_visibility_current_owner_lookup_exact_ctrc(
@@ -212,17 +215,23 @@ extern bool cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(
 	uint32 *ctrc_grant_out, ClusterCtrcTxnKeyV1 *ctrc_key_out,
 	ClusterCtrcParticipantIdentity *participant_out);
 /* Local current-MX terminal proof path.  It samples the exact current or
- * rolled physical slot and never creates a CTRC touch/grant/participant. */
+ * rolled physical slot and never creates a CTRC touch/grant/participant.
+ * On false, precommit_retry_out may report an exact precommit observation
+ * after successful guard release; key/result remain empty, not a proof. */
 extern bool cluster_runtime_visibility_local_terminal_lookup_exact(
-	TransactionId xid, ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out);
+	TransactionId xid, ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out,
+	bool *precommit_retry_out);
 /* Resolve an updater from its exact page-derived DATA locator.  The function
  * executes the same DATA -> canonical TT -> DATA proof used by the remote
- * origin adapter and never substitutes a by-xid locator. */
+ * origin adapter and never substitutes a by-xid locator.  On false, the optional
+ * precommit flag is a negative observation after guard release and admission
+ * recheck; all proof outputs remain empty. */
 extern bool cluster_runtime_visibility_current_mx_updater_provenance_exact(
 	const ClusterTxLocator *locator, TimestampTz deadline, ClusterTTStatusKey *key_out,
 	ClusterTTStatusResult *result_out, uint32 *ctrc_grant_out,
 	uint32 *participant_capability_generation_out, ClusterCtrcTxnKeyV1 *ctrc_key_out,
-	ClusterTxLocator *canonical_locator_out, bool *cross_segment_out);
+	ClusterTxLocator *canonical_locator_out, bool *cross_segment_out,
+	bool *precommit_retry_out);
 extern bool cluster_runtime_visibility_active_proof_ctrc_identity_exact(
 	const ClusterCurrentMemberProofKey *proof_key, uint32 ctrc_grant,
 	uint32 requester_capability_generation, ClusterCtrcTxnKeyV1 *ctrc_key_out,

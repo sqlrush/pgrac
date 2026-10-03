@@ -131,6 +131,12 @@ extern RfPageProofDetailV1 rf_side_online_plan_prepare_space_v1(
 	const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKey *expected,
 	const void *identity_page, const void *reservation_page, uint32 *order,
 	uint32 capacity, uint32 *out_count, ClusterSpaceRecoveryImage *out);
+/* through is a position in the complete returned order, not a SIDE operation
+ * index. Later proven target components retain their bytes and no WAL source. */
+extern RfPageProofDetailV1 rf_side_online_plan_prepare_space_through_v1(
+	const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKey *expected,
+	const void *identity_page, const void *reservation_page, uint32 through, uint32 *order,
+	uint32 capacity, uint32 *out_count, ClusterSpaceRecoveryImage *out);
 
 typedef struct RfSideUndoHeaderImageV1 {
 	PGAlignedBlock page;

@@ -5804,7 +5804,9 @@ cluster_pcm_lock_cleanup_on_node_dead(int32 dead_node)
  *   cluster_pcm_lock_clean_leave_release_all_self(leave_epoch) -> uint64
  *   — a leaving node clears its OWN holder records from the local PCM directory
  *   (entries this node masters): drop its X holdership, its S residency bit,
- *   and its PI residency bit on every entry.  Called AFTER the GCS flush +
+ *   and its PI residency bit on every entry in the legacy profile. Shared
+ *   X and PI remain owned by exact RELEASE and qualified retirement; this
+ *   scan cannot certify either operation. Called AFTER the GCS flush +
  *   release-X seam has persisted every dirty X block to shared storage (CL-I5),
  *   so dropping the directory X record can never strand an unflushed current
  *   image.  The survivor side drops node_id == leaving from entries it masters
@@ -5839,7 +5841,7 @@ cluster_pcm_lock_clean_leave_release_all_self(uint64 leave_epoch)
 
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
 
-		if (entry->x_holder_node == cluster_node_id) {
+		if (!cluster_shared_config && entry->x_holder_node == cluster_node_id) {
 			entry->x_holder_node = -1;
 			changed = true;
 		}

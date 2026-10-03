@@ -975,10 +975,11 @@ rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan,
 		&& cut->scan_end_exclusive == source->scan_end_exclusive;
 }
 
-RfPageProofDetailV1
-rf_side_online_plan_prepare_space_v1(const RfSideOnlinePlanV1 *plan,
-	const ClusterSpaceIdentityKey *expected, const void *identity_page, const void *reservation_page,
-	uint32 *order, uint32 capacity, uint32 *out_count, ClusterSpaceRecoveryImage *out)
+static RfPageProofDetailV1
+side_plan_prepare_space(const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKey *expected,
+						const void *identity_page, const void *reservation_page, uint32 *order,
+						uint32 capacity, uint32 *out_count, ClusterSpaceRecoveryImage *out,
+						bool prefix, uint32 through)
 {
 	ClusterSpaceRecoveryInput *inputs = NULL;
 	uint32 *indices = NULL, *sorted = NULL;
@@ -1008,6 +1009,8 @@ rf_side_online_plan_prepare_space_v1(const RfSideOnlinePlanV1 *plan,
 		}
 	if (count == 0)
 		return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+	if (prefix && through >= count)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	bytes = (Size)count * (sizeof(*inputs) + sizeof(*indices) + sizeof(*sorted));
 	scratch = cluster_space_recovery_scratch_bytes(count);
 	if (scratch == 0 || scratch > SIZE_MAX - bytes)
@@ -1038,8 +1041,9 @@ rf_side_online_plan_prepare_space_v1(const RfSideOnlinePlanV1 *plan,
 			indices[next++] = i;
 		}
 	}
-	if (!cluster_space_recovery_prepare(inputs, count, expected, identity_page,
-		reservation_page, sorted, &prepared))
+	if (!cluster_space_recovery_prepare_through(inputs, count, prefix ? through : count - 1,
+												expected, identity_page, reservation_page, sorted,
+												&prepared))
 		goto done;
 	for (uint32 i = 0; i < count; i++)
 		order[i] = indices[sorted[i]];
@@ -1054,6 +1058,29 @@ done:
 	if (indices != NULL) side_free(indices);
 	if (inputs != NULL) side_free(inputs);
 	return detail;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_space_v1(const RfSideOnlinePlanV1 *plan,
+									 const ClusterSpaceIdentityKey *expected,
+									 const void *identity_page, const void *reservation_page,
+									 uint32 *order, uint32 capacity, uint32 *out_count,
+									 ClusterSpaceRecoveryImage *out)
+{
+	return side_plan_prepare_space(plan, expected, identity_page, reservation_page, order, capacity,
+								   out_count, out, false, 0);
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_space_through_v1(const RfSideOnlinePlanV1 *plan,
+											 const ClusterSpaceIdentityKey *expected,
+											 const void *identity_page,
+											 const void *reservation_page, uint32 through,
+											 uint32 *order, uint32 capacity, uint32 *out_count,
+											 ClusterSpaceRecoveryImage *out)
+{
+	return side_plan_prepare_space(plan, expected, identity_page, reservation_page, order, capacity,
+								   out_count, out, true, through);
 }
 
 /* Return only TT slot operations on this exact segment. */

@@ -334,6 +334,43 @@ cluster_gcs_lookup_master_static(BufferTag tag pg_attribute_unused())
 {
 	return 0;
 }
+/* This grant-queue fixture has no shared membership owner or formation.
+ * It must never qualify the completed JOIN memo. */
+uint64
+cluster_membership_cut_generation(void)
+{
+	return 0;
+}
+
+bool
+cluster_membership_cut_generation_current(uint64 expected pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread pg_attribute_unused(),
+											   ClusterFormationSnapshotV1 *out
+												   pg_attribute_unused())
+{
+	return false;
+}
+
+void
+cluster_reconfig_snapshot_removed_bitmap(uint8 *out)
+{
+	memset(out, 0, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+}
+
+int
+cluster_pcm_local_pi_redeclare_scan_chunk(int start, int max_scan pg_attribute_unused(),
+										  uint64 epoch pg_attribute_unused(),
+										  ClusterGcsRedeclareCallback cb pg_attribute_unused(),
+										  void *arg pg_attribute_unused())
+{
+	return start; /* The queue fixture owns no local PI entries. */
+}
+
 bool
 cluster_membership_is_member(int32 node_id pg_attribute_unused())
 {

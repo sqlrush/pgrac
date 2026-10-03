@@ -3165,6 +3165,26 @@ UT_TEST(test_shared_pi_normal_stop_cut_remains_the_retirement_owner)
 	cluster_shared_config = false;
 }
 
+UT_TEST(test_shared_leave_legacy_clear_keeps_unreleased_x_authority)
+{
+	BufferTag tag = make_tag(230);
+	struct StopPcmEntryLayout *entry, before;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	before = *entry;
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_pcm_lock_clean_leave_release_all_self(17), 0);
+	UT_ASSERT_EQ(memcmp(entry, &before, sizeof(before)), 0);
+	UT_ASSERT(!cluster_pcm_lock_clean_leave_verify_no_leftover(0));
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_pcm_d5_resource_x_terminal_release_fast_retires_exact_binding)
 {
 	BufferTag tag = make_tag(226);
@@ -20618,7 +20638,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(311);
+	UT_PLAN(312);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -20668,6 +20688,7 @@ main(void)
 	UT_RUN(test_pcm_d5_durable_pi_discard_fast_retires_exact_binding);
 	UT_RUN(test_shared_pi_responsibilities_survive_legacy_retirement);
 	UT_RUN(test_shared_pi_normal_stop_cut_remains_the_retirement_owner);
+	UT_RUN(test_shared_leave_legacy_clear_keeps_unreleased_x_authority);
 	UT_RUN(test_pcm_d5_resource_x_terminal_release_fast_retires_exact_binding);
 	UT_RUN(test_pcm_d5_lifecycle_stats_are_exact_not_legacy_aliases);
 	UT_RUN(test_pcm_d1_bootstrap_no_capacity_is_pre_mutation_backpressure);

@@ -57,6 +57,7 @@ die() {
 usage() {
     cat <<EOF
 $PROGNAME initialises a new pgrac cluster data directory.
+New data directories have data checksums enabled.
 
 Usage:
   $PROGNAME [OPTION]... [DATADIR]
@@ -749,12 +750,12 @@ else
     fi
     if [ -n "$WAL_THREADS_DIR" ]; then
         # shellcheck disable=SC2086 # INITDB_OPTS intentionally word-split
-        "$INITDB" $INITDB_OPTS -D "$TARGET_PGDATA" -X "$THREAD_DIR" \
+        "$INITDB" $INITDB_OPTS --data-checksums -D "$TARGET_PGDATA" -X "$THREAD_DIR" \
             "--pgrac-wal-state-root=$WAL_THREADS_DIR" \
             ${HW_INITDB_ARGS[@]+"${HW_INITDB_ARGS[@]}"}
     else
         # shellcheck disable=SC2086 # INITDB_OPTS intentionally word-split
-        "$INITDB" $INITDB_OPTS -D "$TARGET_PGDATA" \
+        "$INITDB" $INITDB_OPTS --data-checksums -D "$TARGET_PGDATA" \
             ${HW_INITDB_ARGS[@]+"${HW_INITDB_ARGS[@]}"}
     fi
 fi

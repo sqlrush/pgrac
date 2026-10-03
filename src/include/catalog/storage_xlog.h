@@ -61,6 +61,15 @@ extern void log_smgrcreate(const RelFileLocator *rlocator, ForkNumber forkNum);
 extern void smgr_redo(XLogReaderState *record);
 /* PGRAC: native physical sequence; lsn is a local recovery coordinate. */
 extern void smgr_redo_truncate(XLogRecPtr lsn, const xl_smgr_truncate *xlrec);
+struct ClusterSpaceRecoveryBatchV1;
+#ifdef USE_PGRAC_CLUSTER
+/* Original cold SPACE batch supplies exact source and target authority.
+ * Refusal before shrink leaves the original structural owner in charge. */
+extern bool smgr_cold_truncate_preflight(const xl_smgr_truncate *xlrec,
+										 const struct ClusterSpaceRecoveryBatchV1 *batch);
+extern bool smgr_redo_cold_truncate(const xl_smgr_truncate *xlrec,
+								   const struct ClusterSpaceRecoveryBatchV1 *batch);
+#endif
 extern void smgr_desc(StringInfo buf, XLogReaderState *record);
 extern const char *smgr_identify(uint8 info);
 

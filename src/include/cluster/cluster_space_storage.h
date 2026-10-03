@@ -17,6 +17,7 @@
 #include "access/xlogreader.h"
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_space_identity.h"
+#include "cluster/cluster_space_reservation.h"
 #include "storage/buf.h"
 #include "utils/relcache.h"
 
@@ -36,6 +37,26 @@ extern bool cluster_space_relation_read_identity(RelFileLocator locator, Cluster
  * Same output/locking contract as the runtime raw reader; not admission. */
 extern bool cluster_space_relation_read_redo_identity(RelFileLocator locator,
 													  ClusterSpaceIdentity *out);
+
+typedef struct ClusterSpaceColdSourceV1 {
+	uint16 origin_thread;
+	XLogRecPtr end_rec_ptr;
+} ClusterSpaceColdSourceV1;
+
+/* Startup typed cold replay only. Inputs contain the complete retained
+ * relation chain in its pass-1 canonical order. Install no further than
+ * through; preserve components already covered by a qualified successor.
+ * shrink_forks names ForkNumber bits (MAIN/FSM/VM), only at a TRUNCATE's own
+ * step. Shrink only those forks even if SPACE already covers the result.
+ * Zero means no shrink, including final catch-up and intermediate inputs.
+ * Sources are record coordinates, never authority: the implementation must
+ * borrow every actual source owner before its first modification. The cold
+ * consumer handshake stays undefined until all structural/own-source paths
+ * and their physical obligations have been delivered. */
+extern bool cluster_space_cold_install_v1(const ClusterSpaceIdentityKey *key,
+										  const ClusterSpaceRecoveryInput *inputs,
+										  const ClusterSpaceColdSourceV1 *sources, uint32 count,
+										  uint32 through, uint8 shrink_forks);
 
 /* DML owner holds the original relation lifecycle lock and has consumed native
  * relcache invalidations at its lock/statement boundary. Backend-private

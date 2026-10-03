@@ -41,6 +41,7 @@
 #include "cluster/cluster_ko.h" /* PGRAC: spec-5.7 D6 object-reuse flush barrier */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_space_recovery.h"
 #include "cluster/storage/cluster_smgr.h"
 #endif
 #include "miscadmin.h"
@@ -497,7 +498,16 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	smgrtruncate2(RelationGetSmgr(rel), forks, nforks, old_blocks, blocks);
 #ifdef USE_PGRAC_CLUSTER
 	if (space_truncate != NULL)
+	{
+		/* The new SPACE identity may reach disk immediately after release.
+		 * Its physical shrink must already be durable, including auxiliary
+		 * forks, before any successor can allocate or write under that identity.
+		 * A sync error remains fatal inside the original truncation critical
+		 * section; do not expose an identity whose physical action is uncertain. */
+		for (int i = 0; i < nforks; i++)
+			smgrimmedsync(RelationGetSmgr(rel), forks[i]);
 		cluster_space_truncate_publish(space_truncate);
+	}
 #endif
 
 	END_CRIT_SECTION();
@@ -1126,8 +1136,9 @@ AtSubAbort_smgr(void)
 /* PGRAC: share the original physical truncation sequence with the typed
  * SPACE owner. lsn remains a local recovery coordinate; this helper alone
  * does not authorize a foreign-thread replay or prove its WAL durability. */
-void
-smgr_redo_truncate(XLogRecPtr lsn, const xl_smgr_truncate *xlrec)
+static bool
+smgr_redo_truncate_internal(XLogRecPtr lsn, const xl_smgr_truncate *xlrec,
+						   const struct ClusterSpaceRecoveryBatchV1 *batch, bool apply)
 {
 	SMgrRelation reln;
 	Relation	rel;
@@ -1136,6 +1147,21 @@ smgr_redo_truncate(XLogRecPtr lsn, const xl_smgr_truncate *xlrec)
 	BlockNumber old_blocks[MAX_FORKNUM];
 	int			nforks = 0;
 	bool		need_fsm_vacuum = false;
+	BlockNumber cold_vm_blocks = InvalidBlockNumber;
+	uint8		cold_sync_forks = 0;
+	bool success = false;
+#ifdef USE_PGRAC_CLUSTER
+	bool shared_relation;
+#endif
+
+#ifdef USE_PGRAC_CLUSTER
+	if (batch != NULL
+		&& !(apply ? cluster_space_recovery_truncate_permitted_v1(batch, xlrec)
+			 : cluster_space_recovery_truncate_preflight_permitted_v1(batch, xlrec)))
+		return false;
+	shared_relation = cluster_shared_config
+		&& cluster_smgr_which_for(xlrec->rlocator, InvalidBackendId) == 1;
+#endif
 
 	reln = smgropen(xlrec->rlocator, InvalidBackendId);
 
@@ -1145,7 +1171,10 @@ smgr_redo_truncate(XLogRecPtr lsn, const xl_smgr_truncate *xlrec)
 	 * XLogReadBufferForRedo, we prefer to recreate the rel and replay the
 	 * log as best we can until the drop is seen.
 	 */
-	smgrcreate(reln, MAIN_FORKNUM, true);
+	if (batch == NULL)
+		smgrcreate(reln, MAIN_FORKNUM, true);
+	else if (!smgrexists(reln, MAIN_FORKNUM))
+		return false;
 
 	/*
 	 * Before we perform the truncation, update minimum recovery point to
@@ -1162,26 +1191,52 @@ smgr_redo_truncate(XLogRecPtr lsn, const xl_smgr_truncate *xlrec)
 	 * after truncation, but that would leave a small window where the
 	 * WAL-first rule could be violated.
 	 */
-	XLogFlush(lsn);
+	if (batch == NULL)
+		XLogFlush(lsn);
+
+	/* Cold replay inherits a versioned VM base that the producer made
+	 * durable before logging TRUNCATE. Validate it without re-clearing bits,
+	 * before even the rebuildable FSM preparation can modify a page. */
+	rel = CreateFakeRelcacheEntry(xlrec->rlocator);
+#ifdef USE_PGRAC_CLUSTER
+	if (batch != NULL
+		&& ((((xlrec->flags & SMGR_TRUNCATE_VM) != 0)
+			 && !visibilitymap_prepare_cold_truncate(rel, xlrec->blkno, &cold_vm_blocks))
+			|| !(apply ? cluster_space_recovery_truncate_permitted_v1(batch, xlrec)
+				 : cluster_space_recovery_truncate_preflight_permitted_v1(batch, xlrec))))
+		goto done;
+	if (!apply)
+	{
+		success = true;
+		goto done;
+	}
+#endif
 
 	/* Prepare for truncation of MAIN fork */
 	if ((xlrec->flags & SMGR_TRUNCATE_HEAP) != 0)
 	{
-		forks[nforks] = MAIN_FORKNUM;
-		old_blocks[nforks] = smgrnblocks(reln, MAIN_FORKNUM);
-		blocks[nforks] = xlrec->blkno;
-		nforks++;
+		BlockNumber old = smgrnblocks(reln, MAIN_FORKNUM);
+
+		if (batch != NULL)
+			cold_sync_forks |= 1 << MAIN_FORKNUM;
+		if (batch == NULL || old > xlrec->blkno)
+		{
+			forks[nforks] = MAIN_FORKNUM;
+			old_blocks[nforks] = old;
+			blocks[nforks] = xlrec->blkno;
+			nforks++;
+		}
 
 		/* Also tell xlogutils.c about it */
 		XLogTruncateRelation(xlrec->rlocator, MAIN_FORKNUM, xlrec->blkno);
 	}
 
 	/* Prepare for truncation of FSM and VM too */
-	rel = CreateFakeRelcacheEntry(xlrec->rlocator);
-
 	if ((xlrec->flags & SMGR_TRUNCATE_FSM) != 0 &&
 		smgrexists(reln, FSM_FORKNUM))
 	{
+		if (batch != NULL)
+			cold_sync_forks |= 1 << FSM_FORKNUM;
 		blocks[nforks] = FreeSpaceMapPrepareTruncateRel(rel, xlrec->blkno);
 		if (BlockNumberIsValid(blocks[nforks]))
 		{
@@ -1194,7 +1249,10 @@ smgr_redo_truncate(XLogRecPtr lsn, const xl_smgr_truncate *xlrec)
 	if ((xlrec->flags & SMGR_TRUNCATE_VM) != 0 &&
 		smgrexists(reln, VISIBILITYMAP_FORKNUM))
 	{
-		blocks[nforks] = visibilitymap_prepare_truncate(rel, xlrec->blkno);
+		if (batch != NULL)
+			cold_sync_forks |= 1 << VISIBILITYMAP_FORKNUM;
+		blocks[nforks] = batch != NULL ? cold_vm_blocks
+			: visibilitymap_prepare_truncate(rel, xlrec->blkno);
 		if (BlockNumberIsValid(blocks[nforks]))
 		{
 			forks[nforks] = VISIBILITYMAP_FORKNUM;
@@ -1204,10 +1262,51 @@ smgr_redo_truncate(XLogRecPtr lsn, const xl_smgr_truncate *xlrec)
 	}
 
 	/* Do the real work to truncate relation forks */
-	if (nforks > 0)
+#ifdef USE_PGRAC_CLUSTER
+	if (batch != NULL && !cluster_space_recovery_truncate_permitted_v1(batch, xlrec))
+		goto done;
+	/* Shared truncate uses FileTruncate, which can extend. Preserve native
+	 * redo's shrink-only behavior when an earlier replay already shortened
+	 * a fork, including a retained zero-block MAIN placeholder. */
+	if (shared_relation)
+		for (int i = 0; i < nforks; i++)
+			blocks[i] = Min(blocks[i], old_blocks[i]);
+	if (batch != NULL)
+	{
+		int shrinking = 0;
+
+		for (int i = 0; i < nforks; i++)
+			if (blocks[i] < old_blocks[i])
+			{
+				forks[shrinking] = forks[i];
+				blocks[shrinking] = blocks[i];
+				old_blocks[shrinking++] = old_blocks[i];
+			}
+		nforks = shrinking;
+	}
+#endif
+	if (nforks > 0 || cold_sync_forks != 0)
 	{
 		START_CRIT_SECTION();
-		smgrtruncate2(reln, forks, nforks, old_blocks, blocks);
+		if (nforks > 0)
+			smgrtruncate2(reln, forks, nforks, old_blocks, blocks);
+#ifdef USE_PGRAC_CLUSTER
+		if (shared_relation)
+		{
+			/* A previous recoverer may have changed EOF without completing
+			 * its sync. Leave a short fork's size alone, but establish the
+			 * durability requested by this exact cold step before returning. */
+			if (batch != NULL)
+			{
+				for (ForkNumber fork = MAIN_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++)
+					if (cold_sync_forks & (1 << fork))
+						smgrimmedsync(reln, fork);
+			}
+			else
+				for (int i = 0; i < nforks; i++)
+					smgrimmedsync(reln, forks[i]);
+		}
+#endif
 		END_CRIT_SECTION();
 	}
 
@@ -1220,8 +1319,39 @@ smgr_redo_truncate(XLogRecPtr lsn, const xl_smgr_truncate *xlrec)
 		FreeSpaceMapVacuumRange(rel, xlrec->blkno,
 								InvalidBlockNumber);
 
+	success = true;
+#ifdef USE_PGRAC_CLUSTER
+done:
+#endif
 	FreeFakeRelcacheEntry(rel);
+	return success;
 }
+
+void
+smgr_redo_truncate(XLogRecPtr lsn, const xl_smgr_truncate *xlrec)
+{
+	(void)smgr_redo_truncate_internal(lsn, xlrec, NULL, true);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+bool
+smgr_cold_truncate_preflight(const xl_smgr_truncate *xlrec,
+							 const ClusterSpaceRecoveryBatchV1 *batch)
+{
+	if (batch == NULL || xlrec == NULL)
+		return false;
+	return smgr_redo_truncate_internal(InvalidXLogRecPtr, xlrec, batch, false);
+}
+
+bool
+smgr_redo_cold_truncate(const xl_smgr_truncate *xlrec,
+					   const ClusterSpaceRecoveryBatchV1 *batch)
+{
+	if (batch == NULL || xlrec == NULL)
+		return false;
+	return smgr_redo_truncate_internal(InvalidXLogRecPtr, xlrec, batch, true);
+}
+#endif
 
 void
 smgr_redo(XLogReaderState *record)

@@ -1028,6 +1028,62 @@ check_vm_size:
 	return newnblocks;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+bool
+visibilitymap_prepare_cold_truncate(Relation rel, BlockNumber nheapblocks,
+								   BlockNumber *newnblocks)
+{
+	static const PGAlignedBlock zero;
+	BlockNumber truncBlock, current, result;
+	uint32 truncByte;
+	uint8 truncOffset;
+	SMgrRelation smgr;
+
+	if (rel == NULL || newnblocks == NULL || nheapblocks == InvalidBlockNumber
+		|| !cluster_shared_config || !RecoveryInProgress() || !RelationIsPermanent(rel)
+		|| cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) != 1)
+		return false;
+	smgr = RelationGetSmgr(rel);
+	if (!smgrexists(smgr, VISIBILITYMAP_FORKNUM)) {
+		*newnblocks = InvalidBlockNumber;
+		return true;
+	}
+	current = smgrnblocks(smgr, VISIBILITYMAP_FORKNUM);
+	truncBlock = HEAPBLK_TO_MAPBLOCK(nheapblocks);
+	truncByte = HEAPBLK_TO_MAPBYTE(nheapblocks);
+	truncOffset = HEAPBLK_TO_OFFSET(nheapblocks);
+	result = truncBlock;
+	if (truncByte != 0 || truncOffset != 0) {
+		result++;
+		if (truncBlock < current) {
+			Buffer buffer;
+			Page page;
+			bool clear;
+
+			/* No runtime pin initializer and no ZERO_ON_ERROR: this check
+			 * qualifies existing bytes for the structural owner only. */
+			buffer = ReadBufferExtended(rel, VISIBILITYMAP_FORKNUM, truncBlock, RBM_NORMAL, NULL);
+			LockBuffer(buffer, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buffer);
+			if (PageIsNew(page))
+				clear = memcmp(page, zero.data, BLCKSZ) == 0;
+			else {
+				const unsigned char *map = (unsigned char *)PageGetContents(page);
+
+				clear = (map[truncByte] & ~((1 << truncOffset) - 1)) == 0;
+				for (uint32 i = truncByte + 1; clear && i < MAPSIZE; i++)
+					clear = map[i] == 0;
+			}
+			UnlockReleaseBuffer(buffer);
+			if (!clear)
+				return false;
+		}
+	}
+	*newnblocks = current <= result ? InvalidBlockNumber : result;
+	return true;
+}
+#endif
+
 /*
  * Read a visibility map page.
  *

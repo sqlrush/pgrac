@@ -437,6 +437,7 @@ typedef struct SpaceRecoveryNode {
 typedef struct SpaceRecoveryIndex {
 	uint64 token;
 	uint32 index;
+	BlockNumber next_block;
 } SpaceRecoveryIndex;
 
 size_t
@@ -453,6 +454,20 @@ recovery_index_compare(const void *a, const void *b)
 	const SpaceRecoveryIndex *left = a, *right = b;
 
 	return left->token < right->token ? -1 : left->token > right->token ? 1 : 0;
+}
+
+/* Reuse the index's token slot for the checked identity sequence. Sequence
+ * orders candidates only: full identity/token edges are still checked below.
+ * next_block occupies the original index padding; scratch stays bounded. */
+static int
+recovery_state_compare(const void *a, const void *b)
+{
+	const SpaceRecoveryIndex *left = a, *right = b;
+	int sequence = recovery_index_compare(a, b);
+
+	if (sequence != 0)
+		return sequence;
+	return left->next_block < right->next_block ? -1 : left->next_block > right->next_block ? 1 : 0;
 }
 
 static uint32
@@ -597,10 +612,97 @@ recovery_advances_prepare(SpaceRecoveryNode *nodes, uint32 count,
 }
 
 static bool
+recovery_prefix_prepare(const SpaceRecoveryNode *nodes, const uint32 *ordered, uint32 count,
+						uint32 through, bool has_structural, const ClusterSpaceIdentity *target_id,
+						uint64 target_id_token, const ClusterSpaceReservation *target_res,
+						uint64 target_res_token, const void *identity_page,
+						const void *reservation_page, ClusterSpaceRecoveryImage *prepared)
+{
+	const ClusterSpaceReservationChange *reservation = &nodes[ordered[through]].change.reservation;
+	const ClusterSpaceIdentity *identity = target_id;
+	uint64 id_token = target_id_token;
+	uint32 id_source = UINT32_MAX;
+	bool id_later = false, res_later = false;
+
+	/* The complete chain and both targets have already passed validation.
+	 * Reuse those decoded nodes; a prefix must never hide a bad suffix. */
+	for (uint32 i = 0; i < count; i++) {
+		const SpaceRecoveryNode *node = &nodes[ordered[i]];
+
+		if (node->structural) {
+			identity = &node->change.identity.expected;
+			id_token = node->change.identity.before_token;
+			break;
+		}
+	}
+	for (uint32 i = 0; i <= through; i++) {
+		const SpaceRecoveryNode *node = &nodes[ordered[i]];
+
+		if (node->structural) {
+			identity = &node->change.identity.result;
+			id_token = node->change.identity.result_token;
+			id_source = ordered[i];
+		}
+	}
+	for (uint32 i = through + 1; i < count; i++) {
+		const SpaceRecoveryNode *node = &nodes[ordered[i]];
+
+		if (node->structural)
+			id_later |= recovery_identity_member(target_id, target_id_token,
+												 &node->change.identity.result,
+												 node->change.identity.result_token);
+		res_later |= !recovery_reservation_member(&reservation->result, reservation->result_token,
+												  &node->change.reservation.before,
+												  node->change.reservation.before_token)
+					 && recovery_reservation_member(target_res, target_res_token,
+													&node->change.reservation.before,
+													node->change.reservation.before_token);
+		res_later |= recovery_reservation_member(target_res, target_res_token,
+												 &node->change.reservation.result,
+												 node->change.reservation.result_token);
+	}
+	/* The complete validator already proved that a monotone successor is
+	 * after the final LIVE state. Do not rewind it at an earlier structure. */
+	if (!has_structural)
+		res_later = target_res->next_block > reservation->result.next_block;
+	else {
+		const ClusterSpaceReservation *last = &nodes[ordered[count - 1]].change.reservation.result;
+
+		res_later |= last->identity.state == CLUSTER_SPACE_IDENTITY_LIVE
+					 && recovery_identity_equal(&target_res->identity, &last->identity)
+					 && target_res->next_block > last->next_block;
+	}
+
+	prepared->apply_mask = 0;
+	prepared->source_index[0] = id_later ? UINT32_MAX : id_source;
+	prepared->source_index[1] = res_later ? UINT32_MAX : ordered[through];
+	if (id_later || recovery_identity_member(target_id, target_id_token, identity, id_token))
+		memcpy(prepared->pages[0].data, identity_page, BLCKSZ);
+	else {
+		if (!cluster_space_identity_page_encode(identity, id_token, prepared->pages[0].data,
+												BLCKSZ))
+			return false;
+		prepared->apply_mask |= 1;
+	}
+	if (res_later
+		|| recovery_reservation_member(target_res, target_res_token, &reservation->result,
+									   reservation->result_token))
+		memcpy(prepared->pages[1].data, reservation_page, BLCKSZ);
+	else {
+		if (!cluster_space_reservation_page_encode(&reservation->result, reservation->result_token,
+												   prepared->pages[1].data, BLCKSZ))
+			return false;
+		prepared->apply_mask |= 2;
+	}
+	prepared->covered_by_successor_mask |= (id_later ? 1 : 0) | (res_later ? 2 : 0);
+	return true;
+}
+
+static bool
 space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 					   const ClusterSpaceIdentityKey *expected, const void *identity_page,
 					   const void *reservation_page, uint32 *order, ClusterSpaceRecoveryImage *out,
-					   bool check_target)
+					   bool check_target, uint32 through)
 {
 	SpaceRecoveryNode *nodes = NULL;
 	SpaceRecoveryIndex *before = NULL, *result = NULL;
@@ -609,10 +711,11 @@ space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 	ClusterSpaceIdentity target_id = {0}, current_id;
 	ClusterSpaceReservation target_res = {0}, current_res;
 	uint64 target_id_token = 0, target_res_token = 0, id_token, res_token;
-	uint32 head = UINT32_MAX, cursor;
+	uint32 head;
 	bool id_member, res_member, has_structural = false, ok = false;
+	bool gap = false, uncovered_gap = false, later_target = false;
 
-	if (inputs == NULL || count == 0 || expected == NULL || order == NULL
+	if (inputs == NULL || count == 0 || through >= count || expected == NULL || order == NULL
 		|| (check_target && (identity_page == NULL || reservation_page == NULL || out == NULL))
 		|| cluster_space_recovery_scratch_bytes(count) == 0)
 		return false;
@@ -660,6 +763,11 @@ space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 									   target_res_token, identity_page, reservation_page, before,
 									   result, ordered, &prepared, check_target))
 			goto done;
+		if (check_target && through < count - 1
+			&& !recovery_prefix_prepare(nodes, ordered, count, through, false, &target_id,
+										target_id_token, &target_res, target_res_token,
+										identity_page, reservation_page, &prepared))
+			goto done;
 		memcpy(order, ordered, (size_t)count * sizeof(*order));
 		if (check_target)
 			*out = prepared;
@@ -669,28 +777,39 @@ space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 	qsort(before, count, sizeof(*before), recovery_index_compare);
 	qsort(result, count, sizeof(*result), recovery_index_compare);
 	for (uint32 i = 0; i < count; i++) {
+		const ClusterSpaceReservationChange *change = &nodes[i].change.reservation;
+		uint32 previous;
+
 		/* A repeated edge is also refused: the source owner must not silently
 		 * consume the same physical WAL record twice. */
 		if (i > 0 && (before[i - 1].token == before[i].token
 			|| result[i - 1].token == result[i].token))
 			goto done;
-		if (recovery_index_find(result, count, before[i].token) == UINT32_MAX) {
-			if (head != UINT32_MAX)
-				goto done;
-			head = before[i].index;
-		}
-	}
-	if (head == UINT32_MAX)
-		goto done;
-	cursor = head;
-	for (uint32 i = 0; i < count; i++) {
-		if (cursor == UINT32_MAX)
+		previous = recovery_index_find(result, count, change->before_token);
+		if (previous != UINT32_MAX
+			&& !reservation_equal(&nodes[previous].change.reservation.result, &change->before))
 			goto done;
-		ordered[i] = cursor;
-		cursor = recovery_index_find(before, count, nodes[cursor].change.reservation.result_token);
+		/* A familiar token with different bytes is corruption, not a gap
+		 * covered by a numerically higher HWM or a later structural state. */
+		if (check_target
+			&& ((target_res_token == change->before_token
+				 && !recovery_reservation_member(&target_res, target_res_token, &change->before,
+												 change->before_token))
+				|| (target_res_token == change->result_token
+					&& !reservation_equal(&target_res, &change->result))))
+			goto done;
 	}
-	if (cursor != UINT32_MAX)
-		goto done;
+	/* Missing history ADVANCEs may separate exact same-incarnation ranges.
+	 * No structural edge is inferred from a UUID, sequence or WAL position. */
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterSpaceReservation *state = &nodes[i].change.reservation.before;
+
+		before[i] = (SpaceRecoveryIndex){ state->identity.sequence, i, state->next_block };
+	}
+	qsort(before, count, sizeof(*before), recovery_state_compare);
+	for (uint32 i = 0; i < count; i++)
+		ordered[i] = before[i].index;
+	head = ordered[0];
 
 	current_res = nodes[head].change.reservation.before;
 	current_id = current_res.identity;
@@ -711,9 +830,22 @@ space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 		ClusterSpaceReservationChange *change = &node->change.reservation;
 		ClusterSpaceWalChange *id = &node->change.identity;
 
-		if (!recovery_reservation_member(&change->before, change->before_token,
-			&current_res, res_token))
-			goto done;
+		if (!recovery_reservation_member(&change->before, change->before_token, &current_res,
+										 res_token)) {
+			if (current_res.identity.state != CLUSTER_SPACE_IDENTITY_LIVE
+				|| !recovery_identity_equal(&current_res.identity, &change->before.identity)
+				|| current_res.next_block >= change->before.next_block)
+				goto done;
+			gap = uncovered_gap = true;
+		}
+		/* Matching the far side of this gap (or a subsequent exact result)
+		 * qualifies its coverage only when the original owner proves DATA
+		 * durable. A target before any remaining gap cannot replay across it. */
+		if (recovery_reservation_member(&target_res, target_res_token, &change->before,
+										change->before_token)) {
+			res_member = true;
+			uncovered_gap = false;
+		}
 		if (node->structural) {
 			if (!recovery_identity_member(&id->expected, id->before_token, &current_id, id_token))
 				goto done;
@@ -727,7 +859,10 @@ space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 		current_res = change->result;
 		res_token = change->result_token;
 		id_member |= recovery_identity_member(&target_id, target_id_token, &current_id, id_token);
-		res_member |= recovery_reservation_member(&target_res, target_res_token, &current_res, res_token);
+		if (recovery_reservation_member(&target_res, target_res_token, &current_res, res_token)) {
+			res_member = true;
+			uncovered_gap = false;
+		}
 	}
 	/* Source-only ordering has no identity-page token in an ADVANCE-only
 	 * cut. Never invent one or export the private source state as DATA. */
@@ -736,9 +871,14 @@ space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 		ok = true;
 		goto done;
 	}
-	if (!id_member || !res_member)
+	later_target = current_res.identity.state == CLUSTER_SPACE_IDENTITY_LIVE
+				   && recovery_identity_equal(&target_res.identity, &current_res.identity)
+				   && target_res.next_block > current_res.next_block;
+	if (!id_member || (!later_target && (!res_member || uncovered_gap)))
 		goto done;
-	prepared.source_index[1] = ordered[count - 1];
+	prepared.source_index[1] = later_target ? UINT32_MAX : ordered[count - 1];
+	if (gap || later_target)
+		prepared.covered_by_successor_mask = 2;
 	if (recovery_identity_member(&target_id, target_id_token, &current_id, id_token))
 		memcpy(prepared.pages[0].data, identity_page, BLCKSZ);
 	else {
@@ -746,13 +886,19 @@ space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 			goto done;
 		prepared.apply_mask |= 1;
 	}
-	if (recovery_reservation_member(&target_res, target_res_token, &current_res, res_token))
+	if (later_target
+		|| recovery_reservation_member(&target_res, target_res_token, &current_res, res_token))
 		memcpy(prepared.pages[1].data, reservation_page, BLCKSZ);
 	else {
 		if (!cluster_space_reservation_page_encode(&current_res, res_token, prepared.pages[1].data, BLCKSZ))
 			goto done;
 		prepared.apply_mask |= 2;
 	}
+	if (through < count - 1
+		&& !recovery_prefix_prepare(nodes, ordered, count, through, true, &target_id,
+									target_id_token, &target_res, target_res_token, identity_page,
+									reservation_page, &prepared))
+		goto done;
 	memcpy(order, ordered, (size_t) count * sizeof(*order));
 	*out = prepared;
 	ok = true;
@@ -771,13 +917,24 @@ cluster_space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs, uint32 c
 							   ClusterSpaceRecoveryImage *out)
 {
 	return space_recovery_prepare(inputs, count, expected, identity_page, reservation_page, order,
-								  out, true);
+								  out, true, count - 1);
 }
 
 bool
 cluster_space_recovery_order(const ClusterSpaceRecoveryInput *inputs, uint32 count,
 							 const ClusterSpaceIdentityKey *expected, uint32 *order)
 {
-	return space_recovery_prepare(inputs, count, expected, NULL, NULL, order, NULL, false);
+	return space_recovery_prepare(inputs, count, expected, NULL, NULL, order, NULL, false,
+								  count - 1);
+}
+
+bool
+cluster_space_recovery_prepare_through(const ClusterSpaceRecoveryInput *inputs, uint32 count,
+									   uint32 through, const ClusterSpaceIdentityKey *expected,
+									   const void *identity_page, const void *reservation_page,
+									   uint32 *order, ClusterSpaceRecoveryImage *out)
+{
+	return space_recovery_prepare(inputs, count, expected, identity_page, reservation_page, order,
+								  out, true, through);
 }
 #endif

@@ -1322,9 +1322,8 @@ UT_TEST(test_reconfig_shmem_init_idempotent)
 	UT_ASSERT_EQ(evt.observer_role, CLUSTER_RECONFIG_OBSERVER_NONE);
 	UT_ASSERT_EQ((long long)evt.applied_at, 0LL);
 
-	/* Second init — found = true branch.  Should NOT re-zero state
-	 * (postmaster restart preserves shmem on the same shmem segment
-	 * for the same process — the found-flag prevents double init). */
+	/* Second attach to the same shmem — found = true branch. This does
+	 * not simulate a postmaster crash or a fresh shared-memory lifetime. */
 	cluster_reconfig_shmem_init();
 	cluster_reconfig_get_last_event(&evt);
 	UT_ASSERT_EQ((unsigned long long)evt.event_id, 0ULL);
@@ -1420,7 +1419,7 @@ UT_TEST(test_self_join_admitted_no_pgproc_never_blocks_on_reconfig_lock)
 /* spec-5.15A: the node-local replacement episode is part of the existing
  * reconfig region and starts as the exact canonical empty image.  Together
  * with the v3 mailbox widening plus P04's volatile fast-rejoin evidence this
- * is the frozen 10,968-byte state shape. */
+ * is the 13,760-byte shared state shape. */
 UT_TEST(test_reconfig_replacement_episode_is_embedded_and_zero_initialized)
 {
 	ClusterReconfigState *state;
@@ -1431,7 +1430,7 @@ UT_TEST(test_reconfig_replacement_episode_is_embedded_and_zero_initialized)
 	state = (ClusterReconfigState *)reconfig_shmem_storage;
 	memset(&empty_episode, 0, sizeof(empty_episode));
 
-	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 13752);
+	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 13760);
 	UT_ASSERT_EQ(memcmp(&state->replacement_episode, &empty_episode, sizeof(empty_episode)), 0);
 }
 
@@ -5384,7 +5383,7 @@ UT_TEST(test_reconfig_region3_mailbox_request_word_is_exact_duplex)
 
 	ut_join_setup();
 	state = (ClusterReconfigState *)reconfig_shmem_storage;
-	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 13752);
+	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 13760);
 	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_TARGET_MASK, UINT32_C(0x0000007f));
 	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_RESERVED_MASK, UINT32_C(0x7fffff80));
 	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_VERIFY_COMMITTED_CLOSED, UINT32_C(0x80000000));
@@ -7310,10 +7309,40 @@ UT_TEST(test_stop_reconfig_actual_formation_owner)
 	stop_reconfig_isolated(stop_reconfig_actual_formation_owner_body);
 }
 
+
+UT_TEST(test_membership_cut_generation_uses_original_shmem_owner)
+{
+	ClusterReconfigState *state;
+	uint64 stable;
+
+	reconfig_init_done = false;
+	cluster_reconfig_shmem_init();
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 2);
+	cluster_membership_record_admitted(5, 19);
+	stable = cluster_membership_cut_generation();
+	UT_ASSERT(stable > 2);
+	cluster_reconfig_shmem_init();
+	UT_ASSERT(cluster_membership_cut_generation_current(stable));
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(5), 19);
+
+	pg_atomic_write_u64(&state->membership_cut_generation, stable + 1);
+	cluster_reconfig_shmem_init();
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state->membership_cut_generation), stable + 1);
+	/* Simulated fresh shmem has a new cache lifetime. This is not a real
+	 * QVOTEC/postmaster crash test and does not claim volatile survival. */
+	reconfig_init_done = false;
+	cluster_reconfig_shmem_init();
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 2);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(5), 0);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(133);
+	UT_PLAN(134);
 	UT_RUN(test_stop_membership_terminal_peer_is_not_online_admission);
 	UT_RUN(test_stop_membership_preserves_all_nonliveness_requirements);
 	UT_RUN(test_stop_reconfig_shared_owners);
@@ -7336,6 +7365,7 @@ main(void)
 	UT_RUN(test_reconfig_event_sizeof_bounds);
 	UT_RUN(test_reconfig_shmem_size_positive);
 	UT_RUN(test_reconfig_shmem_init_idempotent);
+	UT_RUN(test_membership_cut_generation_uses_original_shmem_owner);
 	UT_RUN(test_formation_snapshot_no_pgproc_never_blocks_on_reconfig_lock);
 	UT_RUN(test_self_join_admitted_no_pgproc_never_blocks_on_reconfig_lock);
 	UT_RUN(test_r4_membership_snapshot_captures_exact_current_four_node_view);

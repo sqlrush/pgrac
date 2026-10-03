@@ -24,7 +24,8 @@
  *	  DDL path (RelationDropStorage / RelationTruncate), while the dropping node
  *	  already holds the cross-node AccessExclusiveLock (spec-5.3 TM) on the
  *	  relation -- so no peer can re-dirty the relfilenode after the flush.  The
- *	  peer FLUSHES dirty buffers to shared storage and THEN invalidates them
+ *	  peer FLUSHES dirty buffers to shared storage, synchronizes existing shared
+ *	  forks, and THEN invalidates them
  *	  (flush-then-invalidate, not pure discard): if the dropping transaction
  *	  rolls back the relation survives intact and peers re-read from storage with
  *	  no data loss, while ereport(ERROR 53RAA) is still able to abort the
@@ -91,7 +92,7 @@ extern void cluster_ko_resid_encode(RelFileLocator rloc, ClusterResId *dst);
  * KO_FLUSH_ACK only AFTER the drop completes (apply-after-drop, KO-M6).
  *
  *   batch_id     -- ack_wait correlation id (shared 2.39 allocator, KO-B2)
- *   epoch        -- HC100 stale-reply guard (reconfig fences old barriers)
+ *   epoch        -- exact request configuration, retained through peer I/O
  *   db/rel/spc   -- the relfilenode triple to drop
  *   source_node  -- the dropping node (where to send KO_FLUSH_ACK)
  */
@@ -120,7 +121,9 @@ typedef enum KoFlushAckStatus {
 
 /*
  * KoFlushAckHeader -- PGRAC_IC_MSG_KO_FLUSH_ACK payload (peer -> dropping node).
- * Sent ONLY after the peer has really dropped the relfilenode's buffers.
+ * Sent ONLY after the peer has really dropped the relfilenode's buffers;
+ * shared forks must first be synchronized.  The epoch echoes the request,
+ * and a reconfiguration during the work prevents a successful ACK.
  */
 typedef struct KoFlushAckHeader {
 	uint64 batch_id;  /*  8B [ 0,  8) echo of the KO_FLUSH batch_id */

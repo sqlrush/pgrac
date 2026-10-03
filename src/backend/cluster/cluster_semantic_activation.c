@@ -530,6 +530,19 @@ static SemanticActivationAckRequestOrigin semantic_activation_ack_local_request_
 static SemanticActivationAckStageAhead semantic_activation_ack_local_stage_ahead;
 static SemanticActivationAckRequestAhead semantic_activation_ack_local_request_ahead;
 
+/* Observation owned by the existing LMON restart round, never admission proof.
+ * A repeated tick may change the current wait but cannot replace a failure. */
+typedef struct SemanticActivationRestartDiagnostic {
+	uint64 nonce;
+	uint64 epoch;
+	uint32 stage;
+	uint32 kind;
+	int32 peer;
+	const char *reason;
+	bool invalid;
+	bool wait_logged;
+} SemanticActivationRestartDiagnostic;
+
 typedef struct SemanticActivationRestart {
 	bool disabled;
 	bool failed;
@@ -545,6 +558,7 @@ typedef struct SemanticActivationRestart {
 	ClusterSemanticActivationRecord open;
 	uint8 open_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
 	SemanticActivationAckStageAhead early;
+	SemanticActivationRestartDiagnostic diagnostic;
 } SemanticActivationRestart;
 
 static SemanticActivationRestart semantic_activation_restart;
@@ -556,6 +570,51 @@ static bool semantic_activation_restart_ready_current(void);
 static bool semantic_activation_restart_cutover(ClusterSemanticR11CutoverSnapshot *out);
 static bool semantic_activation_restart_pgrd_binding(ClusterSemanticFormationBinding *out);
 static bool semantic_activation_restart_current(void);
+
+static void
+semantic_activation_restart_diagnostic_begin(const ClusterSemanticActivationAckTableV1 *table)
+{
+	SemanticActivationRestartDiagnostic *d = &semantic_activation_restart.diagnostic;
+
+	/* Only the owner calls this after installing a new exact REQUEST. */
+	memset(d, 0, sizeof(*d));
+	d->nonce = table->round_nonce;
+	d->epoch = table->transition_epoch;
+	d->stage = table->stage;
+	d->peer = cluster_node_id;
+}
+
+static void
+semantic_activation_restart_diagnostic_note(uint32 kind, int32 peer, const char *reason,
+										   bool invalid)
+{
+	SemanticActivationRestartDiagnostic *d = &semantic_activation_restart.diagnostic;
+
+	if (semantic_activation_restart.opened || d->nonce == 0 || d->invalid
+		|| (!invalid && d->reason != NULL)
+		|| (!semantic_activation_restart.requested
+			&& !(invalid && kind == 0 && semantic_activation_restart.read_nonce == d->nonce)))
+		return;
+	d->kind = kind;
+	d->peer = peer;
+	d->reason = reason;
+	d->invalid = invalid;
+	if (invalid || !d->wait_logged) {
+		ereport(LOG, (errmsg("semantic activation round %s: phase=%u kind=%u peer=%d nonce=%llu epoch=%llu reason=%s",
+							invalid ? "invalid" : "waiting", d->stage, kind, peer,
+							(unsigned long long)d->nonce, (unsigned long long)d->epoch, reason)));
+		if (!invalid)
+			d->wait_logged = true;
+	}
+}
+
+static void
+semantic_activation_restart_diagnostic_retry(void)
+{
+	if (!semantic_activation_restart.diagnostic.invalid)
+		semantic_activation_restart.diagnostic.reason = NULL;
+}
+
 
 /* RF-ROOT P9 verification (cold-formation): the bit22 cutover round's
  * PREPARE-record CAS (majority legacy-zero -> generation 1), driven from
@@ -1666,8 +1725,11 @@ semantic_activation_ack_image_structural(const ClusterSemanticActivationAckTable
 static bool
 semantic_activation_ack_image_invalidate(ClusterSemanticActivationAckTableV1 *image)
 {
-	if (semantic_activation_restart.requested && !semantic_activation_restart.opened)
+	if (semantic_activation_restart.requested && !semantic_activation_restart.opened) {
+		semantic_activation_restart_diagnostic_note(0, cluster_node_id,
+												  "SEMANTIC_ACK_ROUND_IDENTITY_INVALID", true);
 		semantic_activation_restart.failed = true;
+	}
 	if (image == NULL)
 		return false;
 	memset(&semantic_activation_ack_local_stage_ahead, 0,
@@ -1867,6 +1929,8 @@ semantic_activation_ack_lmon_apply_item(const SemanticActivationAckIngressItem *
 	if (message->result != CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK
 		|| !semantic_activation_ack_remote_tuple(item, current_members_lo, current_members_hi,
 												 current_epoch, current_coordinator_node, &tuple)) {
+		semantic_activation_restart_diagnostic_note(CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK,
+				item->authenticated_source_node_id, "SEMANTIC_ACK_PEER_IDENTITY_INVALID", true);
 		return semantic_activation_ack_image_invalidate(&image)
 				   ? SEMANTIC_ACTIVATION_ACK_CONSUME_INVALIDATED
 				   : SEMANTIC_ACTIVATION_ACK_CONSUME_REJECTED;
@@ -2944,6 +3008,7 @@ semantic_activation_ack_lmon_send_pending(void)
 		return;
 	}
 
+	semantic_activation_restart_diagnostic_retry();
 	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
 		SemanticActivationAckSendResult disposition;
 		ClusterICSendResult send_result;
@@ -2969,8 +3034,11 @@ semantic_activation_ack_lmon_send_pending(void)
 			 * HELLO has arrived. Retain this destination for the next LMON tick;
 			 * no wait loop or admission is added. A valid but incompatible
 			 * record still disproves this round and follows invalidation below. */
-			if (!cluster_sf_peer_capability_record_snapshot(node, &capability) || !capability.valid)
+			if (!cluster_sf_peer_capability_record_snapshot(node, &capability) || !capability.valid) {
+				semantic_activation_restart_diagnostic_note(pending->message.kind, node,
+														  "SEMANTIC_ACK_PEER_CAPABILITY_PENDING", false);
 				return;
+			}
 			capability_word = capability.bits;
 			capability_generation = capability.generation;
 			capability_ready = (capability_word & required_caps) == required_caps;
@@ -2979,6 +3047,8 @@ semantic_activation_ack_lmon_send_pending(void)
 				node, required_caps, &capability_word, &capability_generation);
 		if (!capability_ready || capability_generation == 0
 			|| (refused && capability_generation != pending->refusal_connection_generation)) {
+			semantic_activation_restart_diagnostic_note(pending->message.kind, node,
+													  "SEMANTIC_ACK_CAPABILITY_INVALID", true);
 			pending->pending_members_lo = 0;
 			pending->pending_members_hi = 0;
 			pending->invalidated = true;
@@ -2988,7 +3058,12 @@ semantic_activation_ack_lmon_send_pending(void)
 		send_result = cluster_ic_send_envelope(PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1, node,
 											   payload, sizeof(payload));
 		disposition = semantic_activation_ack_pending_send_note_result(pending, node, send_result);
+		if (disposition == SEMANTIC_ACTIVATION_ACK_SEND_RETAINED)
+			semantic_activation_restart_diagnostic_note(pending->message.kind, node,
+													  "SEMANTIC_ACK_TRANSPORT_PENDING", false);
 		if (disposition == SEMANTIC_ACTIVATION_ACK_SEND_INVALIDATED) {
+			semantic_activation_restart_diagnostic_note(pending->message.kind, node,
+													  "SEMANTIC_ACK_SEND_FAILED", true);
 			cluster_ic_tier1_close_peer(node, "semantic activation ACK send failed");
 			semantic_activation_ack_lmon_invalidate_active();
 			return;
@@ -3108,6 +3183,7 @@ semantic_activation_ack_lmon_send_origin_requests(void)
 		return false;
 	}
 
+	semantic_activation_restart_diagnostic_retry();
 	for (;;) {
 		SemanticActivationAckPendingSend *pending = &origin->current;
 		SemanticActivationAckSendResult disposition;
@@ -3175,8 +3251,11 @@ semantic_activation_ack_lmon_send_origin_requests(void)
 			/* Keep the exact REQUEST/nonce owned here across a temporarily
 			 * absent HELLO, just as for a transport queue not yet admitting it.
 			 * One bounded attempt per tick; all round checks run again. */
-			if (!cluster_sf_peer_capability_record_snapshot(node, &capability) || !capability.valid)
+			if (!cluster_sf_peer_capability_record_snapshot(node, &capability) || !capability.valid) {
+				semantic_activation_restart_diagnostic_note(pending->message.kind, node,
+														  "SEMANTIC_ACK_PEER_CAPABILITY_PENDING", false);
 				return true;
+			}
 			capability_word = capability.bits;
 			capability_generation = capability.generation;
 			capability_ready = (capability_word & required_caps) == required_caps;
@@ -3184,6 +3263,8 @@ semantic_activation_ack_lmon_send_origin_requests(void)
 			capability_ready = cluster_sf_peer_capability_word_sample(
 				node, required_caps, &capability_word, &capability_generation);
 		if (!capability_ready || capability_generation == 0) {
+			semantic_activation_restart_diagnostic_note(pending->message.kind, node,
+													  "SEMANTIC_ACK_CAPABILITY_INVALID", true);
 			semantic_activation_ack_lmon_invalidate_active();
 			return false;
 		}
@@ -3191,9 +3272,14 @@ semantic_activation_ack_lmon_send_origin_requests(void)
 		send_result = cluster_ic_send_envelope(PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1, node,
 											   payload, sizeof(payload));
 		disposition = semantic_activation_ack_pending_send_note_result(pending, node, send_result);
-		if (disposition == SEMANTIC_ACTIVATION_ACK_SEND_RETAINED)
+		if (disposition == SEMANTIC_ACTIVATION_ACK_SEND_RETAINED) {
+			semantic_activation_restart_diagnostic_note(pending->message.kind, node,
+													  "SEMANTIC_ACK_TRANSPORT_PENDING", false);
 			return true;
+		}
 		if (disposition == SEMANTIC_ACTIVATION_ACK_SEND_INVALIDATED) {
+			semantic_activation_restart_diagnostic_note(pending->message.kind, node,
+													  "SEMANTIC_ACK_SEND_FAILED", true);
 			cluster_ic_tier1_close_peer(node, "semantic activation SAMPLE request send failed");
 			semantic_activation_ack_lmon_invalidate_active();
 			return false;
@@ -3445,8 +3531,17 @@ semantic_activation_ack_lmon_drain(void)
 	 * against a startup header with no predecessor/expected rows. */
 	if ((semantic_activation_restart.requested || semantic_activation_restart.have_open)
 		&& !semantic_activation_restart.opened) {
-		if (semantic_activation_restart.failed || !semantic_activation_restart_current())
+		if (semantic_activation_restart.failed)
 			return;
+		if (!semantic_activation_restart_current()) {
+			bool epoch_changed = cluster_epoch_get_current()
+				!= semantic_activation_restart.diagnostic.epoch;
+			semantic_activation_restart_diagnostic_retry();
+			semantic_activation_restart_diagnostic_note(0, cluster_node_id,
+				epoch_changed ? "SEMANTIC_RESTART_EPOCH_CHANGED"
+							  : "SEMANTIC_RESTART_AUTHORITY_PENDING", epoch_changed);
+			return;
+		}
 		while (
 			consumed++ < CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY
 			&& semantic_activation_ack_ingress_poll(&semantic_activation_ack_local_ingress, &item))
@@ -12689,6 +12784,7 @@ semantic_activation_restart_ingress(const SemanticActivationAckIngressItem *item
 		if (!semantic_activation_ack_table_publish(&next))
 			return true;
 		restart->requested = true;
+		semantic_activation_restart_diagnostic_begin(&next);
 		for (index = 0; index < (int)restart->early.count; index++)
 			(void)semantic_activation_ack_lmon_apply_item(&restart->early.items[index], 15, 0, 0,
 														  0);
@@ -12772,6 +12868,8 @@ normal_start_ready_matches(const uint8 pgsa[512], const uint8 pgrd[512])
 		|| completion.epoch != cluster_epoch_get_current()
 		|| memcmp(completion.pgsa, pgsa, sizeof(completion.pgsa)) != 0
 		|| memcmp(completion.pgrd, pgrd, sizeof(completion.pgrd)) != 0) {
+		semantic_activation_restart_diagnostic_note(
+			0, cluster_node_id, "SEMANTIC_RESTART_READY_IDENTITY_INVALID", true);
 		semantic_activation_restart.failed = true;
 		return false;
 	}
@@ -12871,7 +12969,16 @@ semantic_activation_restart_tick(void)
 				}
 				return false;
 			}
-			(void)semantic_activation_record_read_mailbox_submit(&restart->read_seq);
+			if (semantic_activation_record_read_mailbox_submit(&restart->read_seq)
+				&& !restart->requested) {
+				/* The initial read has an owner before any REQUEST exists.
+				 * Preserve its actual sequence for diagnostics, without
+				 * fabricating an accepted round or a record-derived epoch. */
+				memset(&restart->diagnostic, 0, sizeof(restart->diagnostic));
+				restart->diagnostic.nonce = restart->read_seq;
+				restart->diagnostic.epoch = cluster_epoch_get_current();
+				restart->diagnostic.peer = cluster_node_id;
+			}
 			return true;
 		}
 		if (!semantic_activation_record_read_mailbox_poll_completion(restart->read_seq,
@@ -12887,6 +12994,8 @@ semantic_activation_restart_tick(void)
 		}
 		if (!cluster_semantic_activation_record_decode(completion.selected_bytes, &restart->open,
 													   NULL)) {
+			semantic_activation_restart_diagnostic_note(0, cluster_node_id,
+													  "SEMANTIC_RESTART_RECORD_INVALID", true);
 			restart->failed = true;
 			return true;
 		}
@@ -12919,12 +13028,15 @@ semantic_activation_restart_tick(void)
 		table.expected_members_lo = restart->open.admitted_members_lo;
 		table.expected_members_hi = restart->open.admitted_members_hi;
 		if (!semantic_activation_restart_record_matches(&restart->open, &table)) {
+			semantic_activation_restart_diagnostic_note(
+				0, cluster_node_id, "SEMANTIC_RESTART_RECORD_IDENTITY_INVALID", true);
 			restart->failed = true;
 			return true;
 		}
 		if (!semantic_activation_ack_table_publish(&table))
 			return true;
 		restart->requested = true;
+		semantic_activation_restart_diagnostic_begin(&table);
 		memset(&semantic_activation_ack_local_request_origin, 0,
 			   sizeof(semantic_activation_ack_local_request_origin));
 		semantic_activation_ack_local_request_origin.active = true;
@@ -12935,6 +13047,8 @@ semantic_activation_restart_tick(void)
 	if (!restart->requested)
 		return true;
 	if (!semantic_activation_restart_record_matches(&restart->open, &table)) {
+		semantic_activation_restart_diagnostic_note(0, cluster_node_id,
+												  "SEMANTIC_RESTART_RECORD_CHANGED", true);
 		restart->failed = true;
 		return true;
 	}
@@ -12985,8 +13099,11 @@ semantic_activation_restart_tick(void)
 		else if (semantic_activation_ack_pending_send_begin_positive(
 					 &semantic_activation_ack_local_pending_send, &request, cluster_node_id, &self))
 			semantic_activation_ack_lmon_send_pending();
-		else
+		else {
+			semantic_activation_restart_diagnostic_note(0, cluster_node_id,
+														"SEMANTIC_RESTART_ACK_STAGE_INVALID", true);
 			restart->failed = true;
+		}
 		return true;
 	}
 	if (table.flags
@@ -13014,6 +13131,8 @@ semantic_activation_restart_tick(void)
 														  NULL)
 			|| !semantic_activation_restart_record_matches(&selected, &table)
 			|| selected.coordinator_incarnation != restart->open.coordinator_incarnation) {
+			semantic_activation_restart_diagnostic_note(0, cluster_node_id,
+													  "SEMANTIC_RESTART_RECORD_CHANGED", true);
 			restart->failed = true;
 			return true;
 		}
@@ -13487,8 +13606,14 @@ cluster_semantic_normal_stop_read_identity(
 		|| gate.formation_epoch == UINT64_MAX || gate.formation_epoch != cluster_epoch_get_current()
 		|| gate.active_bits
 			   != (CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
-				   | CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1))
+				   | CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1)) {
+		/* Only this closed admission observation belongs to the failed
+		 * restart. Bad reader arguments and unrelated mailbox failures do
+		 * not inherit its diagnostic. */
+		if (!semantic_activation_restart.opened && semantic_activation_restart.diagnostic.invalid)
+			reason = semantic_activation_restart.diagnostic.reason;
 		goto done;
+	}
 	request_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
 	completion_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_completion_seq);
 	if (semantic_activation_lmon_stop_read_seq == 0) {
@@ -13695,6 +13820,20 @@ cluster_semantic_normal_stop_poll(const char **domain_out, uint64 *key_out, cons
 		|| admission_seq != pg_atomic_read_u64(&SemanticActivationShmem->admission_seq))
 		semantic_activation_stop_note(&out, CLUSTER_NORMAL_STOP_PENDING, "R4_ADMISSION", 0,
 									  "SEMANTIC_STOP_ADMISSION_PUBLICATION_PENDING");
+	/* Enrich only an observation of this restart/ACK owner. Another
+	 * outstanding obligation retains its original priority and reason. */
+	if (!restart->opened && restart->diagnostic.nonce != 0 && restart->diagnostic.reason != NULL
+		&& (strcmp(out.domain, "R4_RESTART") == 0 || strcmp(out.domain, "R4_ACK_SEND") == 0
+			|| strcmp(out.domain, "R4_ACK_ORIGIN") == 0)
+		&& ((restart->diagnostic.invalid && out.result == CLUSTER_NORMAL_STOP_INVALID)
+			|| out.result == CLUSTER_NORMAL_STOP_PENDING)) {
+		out.domain = restart->diagnostic.kind == 0 ? "R4_RESTART"
+					 : restart->diagnostic.kind == CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST
+						 ? "R4_ACK_ORIGIN"
+						 : "R4_ACK_SEND";
+		out.key = (uint64)restart->diagnostic.peer;
+		out.reason = restart->diagnostic.reason;
+	}
 done:
 	if (domain_out != NULL)
 		*domain_out = out.domain;

@@ -75,5 +75,11 @@ extern uint8 visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer 
 extern void visibilitymap_count(Relation rel, BlockNumber *all_visible, BlockNumber *all_frozen);
 extern BlockNumber visibilitymap_prepare_truncate(Relation rel,
 												  BlockNumber nheapblocks);
+#ifdef USE_PGRAC_CLUSTER
+/* Read-only cold structural preparation. A surviving tail must already be
+ * clear; never initialize or mutate it. Output is unchanged on refusal. */
+extern bool visibilitymap_prepare_cold_truncate(Relation rel, BlockNumber nheapblocks,
+											  BlockNumber *newnblocks);
+#endif
 
 #endif							/* VISIBILITYMAP_H */

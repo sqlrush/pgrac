@@ -2314,7 +2314,7 @@ cluster_ges_hw_grant_is_current(const ClusterGesHwGrant *grant, const ClusterRes
 {
 	return resid != NULL && resid->type == CLUSTER_HW_RESID_TYPE
 		   && ges_request_grant_is_current(grant, resid, holder, request_id, ExclusiveLock,
-										   GES_REQ_OPCODE_REQUEST, false);
+										   GES_REQ_OPCODE_REQUEST, true);
 }
 
 bool
@@ -2458,7 +2458,9 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	bool debug1_starvation_fired;
 	bool retained_local_grant
 		= hw_grant != NULL && resid != NULL
-		  && (resid->type == LOCKTAG_RELATION || ges_cf_request_is_canonical(resid, lockmode));
+		  && (resid->type == LOCKTAG_RELATION || ges_cf_request_is_canonical(resid, lockmode)
+			  || (resid->type == CLUSTER_HW_RESID_TYPE && lockmode == ExclusiveLock
+				  && current_mode == NoLock && send_opcode == GES_REQ_OPCODE_REQUEST));
 	/* spec-5.6 Dc4b: caller-supplied wait-event label (0 = GES default). */
 	uint32 wait_ev = (wait_event != 0) ? wait_event : WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
 	ClusterXpScope xp_enqueue; /* PGRAC: spec-5.59 D2 profiling */

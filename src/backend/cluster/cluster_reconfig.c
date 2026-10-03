@@ -646,6 +646,7 @@ cluster_reconfig_shmem_init(void)
 		memset(ReconfigShmem, 0, sizeof(ClusterReconfigState));
 		LWLockInitialize(&ReconfigShmem->lock, LWTRANCHE_CLUSTER_RECONFIG);
 		pg_atomic_init_u64(&ReconfigShmem->apply_counter, 0);
+		pg_atomic_init_u64(&ReconfigShmem->membership_cut_generation, 2);
 		pg_atomic_init_u64(&ReconfigShmem->dedup_skip_counter, 0);
 		pg_atomic_init_u64(&ReconfigShmem->procsig_broadcast_count, 0);
 		pg_atomic_init_u32(&ReconfigShmem->prebump_sync_active, 0); /* spec-2.29a r2 t/274 */
@@ -746,6 +747,7 @@ cluster_reconfig_shmem_init(void)
 	 * re-attach their process-local pointer to the inherited shmem).
 	 */
 	cluster_membership_attach(&ReconfigShmem->membership);
+	cluster_membership_attach_cut_generation(&ReconfigShmem->membership_cut_generation);
 }
 
 

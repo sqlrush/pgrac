@@ -116,8 +116,9 @@ typedef struct ClusterSpaceRecoveryImage {
 
 /* Validate a complete, nonbranching structural chain, then prepare both pages.
  * order has count entries and preserves every structural action, even when
- * both pages already match the final result. ADVANCE-only input permits
- * disjoint monotone ranges inside one exact LIVE identity. The observed
+ * both pages already match the final result. Missing history ADVANCEs permit
+ * disjoint monotone ranges inside one exact LIVE identity, including between
+ * structural inputs whose full identity chain must remain present. The observed
  * target may cover earlier ranges; the remaining suffix must begin at its
  * exact token/state. Such successor coverage is explicit in the output and
  * still requires the original owner's physical durability qualification.
@@ -128,11 +129,21 @@ extern bool cluster_space_recovery_prepare(const ClusterSpaceRecoveryInput *inpu
 										  uint32 count, const ClusterSpaceIdentityKey *expected,
 										  const void *identity_page, const void *reservation_page,
 										  uint32 *order, ClusterSpaceRecoveryImage *out);
+/* Validate the same complete input, but prepare through one position in its
+ * canonical order. A component already beyond that position is preserved
+ * with explicit successor coverage and no borrowed WAL source. This does
+ * not authorize structural I/O or replace its durability qualification. */
+extern bool cluster_space_recovery_prepare_through(const ClusterSpaceRecoveryInput *inputs,
+												   uint32 count, uint32 through,
+												   const ClusterSpaceIdentityKey *expected,
+												   const void *identity_page,
+												   const void *reservation_page, uint32 *order,
+												   ClusterSpaceRecoveryImage *out);
 /* Heap scratch used by preparation, or zero for an unrepresentable size. */
 extern size_t cluster_space_recovery_scratch_bytes(uint32 count);
 
-/* Validate and order retained inputs (a full structural chain, or disjoint
- * ADVANCE-only ranges in one LIVE identity). No target is
+/* Validate and order retained inputs (a full structural chain, permitting
+ * disjoint ADVANCE ranges only inside each exact LIVE identity). No target is
  * read or certified, no page image or mutation permission is returned. The
  * same input checks are also mandatory in prepare with the real target. */
 extern bool cluster_space_recovery_order(const ClusterSpaceRecoveryInput *inputs, uint32 count,
