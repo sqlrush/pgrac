@@ -2313,11 +2313,13 @@ test_cluster_space_commit_emit.inc: $(top_srcdir)/src/backend/access/transam/xac
 	mv $@.tmp $@
 
 test_cluster_space_storage: test_cluster_space_storage.c test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc unit_test.h test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o test_cluster_side_xact_xactdesc.o \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
 		test_cluster_space_xlogutils_product.o \
 		test_cluster_space_storage_product.o $(CLUSTER_HW_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		test_cluster_space_storage_product.o test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
 		test_cluster_space_xlogutils_product.o test_cluster_side_xact_xactdesc.o $(CLUSTER_HW_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@

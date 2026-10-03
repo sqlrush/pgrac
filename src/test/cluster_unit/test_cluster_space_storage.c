@@ -39,6 +39,7 @@
 #include "replication/origin.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
+#include "storage/checksum.h"
 #include "storage/freespace.h"
 #include "storage/smgr.h"
 #include "storage/proc.h"
@@ -105,6 +106,10 @@ static int fail_shrink_sync = -1;
 static unsigned space_flushes, space_syncs;
 static int fail_space_flush, fail_space_sync;
 static PGAlignedBlock written_space[2];
+static unsigned space_readbacks;
+static bool readback_checksums;
+static int readback_fail_block, readback_corrupt_block, readback_corruption;
+static PGAlignedBlock before_space_readback[2];
 static bool cold_truncate_fixture, cold_truncate_permitted, cold_vm_clear, cold_vm_stale;
 static bool cold_main_missing;
 static int cold_fork_flags;
@@ -856,6 +861,40 @@ FlushOneBuffer(Buffer buffer)
 	if (buffer == fail_space_flush)
 		pg_re_throw();
 	memcpy(written_space[buffer - 1].data, pages[buffer - 1].data, BLCKSZ);
+	if (readback_checksums)
+		((PageHeader)written_space[buffer - 1].data)->pd_checksum
+			= pg_checksum_page(written_space[buffer - 1].data, buffer - 1);
+}
+
+bool DataChecksumsEnabled(void) { return readback_checksums; }
+
+void
+smgrread(SMgrRelation rel, ForkNumber fork, BlockNumber block, void *buffer)
+{
+	char *out = buffer;
+	UT_ASSERT(truncate_owner && rel == &storage && fork == SPACE_FORKNUM && block < 2);
+	UT_ASSERT_EQ(space_syncs, 1);
+	UT_ASSERT_EQ(space_flushes, 2);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(pinned, 3);
+	UT_ASSERT_EQ(locked, 3);
+	UT_ASSERT_EQ(invalidations, 0);
+	space_readbacks++;
+	if ((int)block == readback_fail_block)
+		pg_re_throw();
+	memcpy(out, written_space[block].data, BLCKSZ);
+	if ((int)block != readback_corrupt_block)
+		return;
+	switch (readback_corruption) {
+	case 0: out[BLCKSZ - 1] ^= 1; break;
+	case 1: memcpy(out, before_space_readback[block].data, BLCKSZ); break;
+	case 2: PageSetLSN(out, PageGetLSN(out) + 8); break;
+	case 3: ((PageHeader)out)->pd_checksum ^= 1; return;
+	case 4: memset(out, 0, BLCKSZ); return;
+	default: abort();
+	}
+	/* A valid checksum cannot rescue stale or different content. */
+	((PageHeader)out)->pd_checksum = pg_checksum_page(out, block);
 }
 
 void
@@ -868,7 +907,12 @@ smgrimmedsync(SMgrRelation rel, ForkNumber fork)
 		UT_ASSERT_EQ(pinned, 3);
 		UT_ASSERT_EQ(invalidations, 0);
 		UT_ASSERT_EQ(space_flushes, 2);
-		UT_ASSERT_EQ(memcmp(written_space, pages, sizeof(pages)), 0);
+		for (int i = 0; i < 2; i++) {
+			PGAlignedBlock expected = pages[i];
+			if (readback_checksums)
+				((PageHeader)expected.data)->pd_checksum = pg_checksum_page(expected.data, i);
+			UT_ASSERT_EQ(memcmp(written_space[i].data, expected.data, BLCKSZ), 0);
+		}
 		space_syncs++;
 		if (fail_space_sync)
 			pg_re_throw();
@@ -937,6 +981,10 @@ errcode(int code)
 static void
 reset(void)
 {
+	space_readbacks = 0;
+	readback_checksums = false;
+	readback_fail_block = readback_corrupt_block = -1;
+	readback_corruption = 0;
 	if (fake_relation != NULL)
 		abort();
 	fake_allocations = fake_frees = 0;
@@ -1917,6 +1965,7 @@ UT_TEST(test_native_truncate_persists_new_space_before_exposing_incarnation)
 	RelationTruncate(rel, 4);
 	UT_ASSERT_EQ(space_flushes, 2);
 	UT_ASSERT_EQ(space_syncs, 1);
+	UT_ASSERT_EQ(space_readbacks, 2);
 	UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, registered_len, &change));
 	UT_ASSERT(cluster_space_identity_page_decode(written_space[0].data, BLCKSZ, SPACE_FORKNUM, 0,
 												 &change.identity.result.key, &identity, &token));
@@ -1961,6 +2010,60 @@ UT_TEST(test_native_truncate_space_write_or_sync_error_does_not_complete)
 		/* The fixture intercepts PANIC. Production must terminate before
 		 * transaction cleanup exposes this not-yet-durable cached identity
 		 * to another backend; ordinary ERROR would fail this assertion. */
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_native_truncate_readback_requires_every_exact_page)
+{
+	for (int block = 0; block < 2; block++) {
+		for (int fault = -1; fault < 5; fault++) {
+			Relation rel = native_truncate_relation();
+			volatile bool caught = false;
+			readback_checksums = true;
+			memcpy(before_space_readback, pages, sizeof(pages));
+			readback_corrupt_block = fault < 0 ? -1 : block;
+			readback_corruption = fault;
+			expecting_error = fault >= 0;
+			PG_TRY(); { RelationTruncate(rel, 4); }
+			PG_CATCH(); { caught = true; } PG_END_TRY();
+			expecting_error = false;
+			UT_ASSERT_EQ(caught, fault >= 0);
+			UT_ASSERT_EQ(space_readbacks, fault < 0 ? 2 : block + 1);
+			UT_ASSERT_EQ(space_flushes, 2);
+			UT_ASSERT_EQ(space_syncs, 1);
+			UT_ASSERT_EQ(main_blocks, 4);
+			if (fault < 0) {
+				UT_ASSERT_EQ(pinned | locked, 0);
+				UT_ASSERT_EQ(invalidations, 1);
+			} else {
+				UT_ASSERT_EQ(reported_level, PANIC);
+				UT_ASSERT_EQ(pinned, 3);
+				UT_ASSERT_EQ(locked, 3);
+				UT_ASSERT_EQ(invalidations, 0);
+			}
+			FreeFakeRelcacheEntry(rel);
+		}
+	}
+}
+
+UT_TEST(test_native_truncate_readback_io_error_keeps_original_owner)
+{
+	for (int block = 0; block < 2; block++) {
+		Relation rel = native_truncate_relation();
+		volatile bool caught = false;
+		readback_fail_block = block;
+		expecting_error = true;
+		PG_TRY(); { RelationTruncate(rel, 4); }
+		PG_CATCH(); { caught = true; } PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(reported_level, PANIC);
+		UT_ASSERT_EQ(space_readbacks, block + 1);
+		UT_ASSERT_EQ(invalidations, 0);
+		UT_ASSERT_EQ(pinned, 3);
+		UT_ASSERT_EQ(locked, 3);
+		UT_ASSERT_EQ(CritSectionCount, 0);
 		FreeFakeRelcacheEntry(rel);
 	}
 }
@@ -2584,11 +2687,13 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(53);
+	UT_PLAN(55);
 	UT_RUN(test_cold_physical_truncate_touches_only_named_forks);
 	UT_RUN(test_cold_physical_truncate_leaves_already_short_forks_alone);
 	UT_RUN(test_native_truncate_persists_new_space_before_exposing_incarnation);
 	UT_RUN(test_native_truncate_space_write_or_sync_error_does_not_complete);
+	UT_RUN(test_native_truncate_readback_requires_every_exact_page);
+	UT_RUN(test_native_truncate_readback_io_error_keeps_original_owner);
 	UT_RUN(test_cold_physical_preflight_checks_vm_without_truncation_or_fsm_writes);
 	UT_RUN(test_native_cold_commit_later_refusal_keeps_all_targets_unmodified);
 	UT_RUN(test_native_cold_commit_uses_already_proof_without_local_flush_or_rewrite);

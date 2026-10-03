@@ -33,6 +33,7 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
+#include "storage/checksum.h"
 #include "storage/smgr.h"
 #include "storage/proc.h"
 #include "utils/catcache.h"
@@ -871,6 +872,25 @@ cluster_space_truncate_publish(ClusterSpaceTruncateState *state)
 	space_structure_publish(state, state->lsn);
 }
 
+/* The caller retains both content-X locks and relation lifecycle authority.
+ * A successful sync alone is not an exact structural completion observation.
+ * Check the raw storage copy, independently of ignore_checksum_failure, before
+ * normalizing only the checksum that the native writer sets in its copy. */
+static bool
+space_structure_readback(SMgrRelation rel, Buffer buffer, BlockNumber block)
+{
+	PGIOAlignedBlock disk;
+	const PageHeaderData *expected = (const PageHeaderData *)BufferGetPage(buffer);
+
+	smgrread(rel, SPACE_FORKNUM, block, disk.data);
+	if (PageIsNew(disk.data)
+		|| (DataChecksumsEnabled()
+			&& ((PageHeader)disk.data)->pd_checksum != pg_checksum_page(disk.data, block)))
+		return false;
+	((PageHeader)disk.data)->pd_checksum = expected->pd_checksum;
+	return memcmp(disk.data, expected, BLCKSZ) == 0;
+}
+
 void
 cluster_space_truncate_finish(ClusterSpaceTruncateState *state, Relation rel)
 {
@@ -887,6 +907,13 @@ cluster_space_truncate_finish(ClusterSpaceTruncateState *state, Relation rel)
 			FlushOneBuffer(state->buffers[i]);
 		smgr = smgropen(rel->rd_locator, InvalidBackendId);
 		smgrimmedsync(smgr, SPACE_FORKNUM);
+		for (int i = 0; i < 2; i++)
+			if (!space_structure_readback(smgr, state->buffers[i], i))
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("truncated SPACE page does not match its durable write"),
+								errdetail("Relation %u/%u/%u, SPACE block %d.", rel->rd_locator.spcOid,
+										  rel->rd_locator.dbOid, rel->rd_locator.relNumber, i),
+								errhint("Check the storage device before restarting the instance.")));
 	}
 	PG_CATCH();
 	{
