@@ -214,13 +214,13 @@ UT_TEST(test_retained_cut_space_obligation_keeps_space_history)
 }
 
 /* Until structural PI retirement is durable (CR20), a history record that
- * changes a relation's SPACE structure (block 0: CREATE, TRUNCATE, a DROP
- * tombstone, a COMMIT's drops) holds the lower at itself with no obligation
- * at all; a reservation alone does not, nor a structure change that is
- * still an obligation.  The earliest reason wins; a tie reports STRUCTURE. */
+ * ends a relation incarnation (SPACE block 0: TRUNCATE, a DROP tombstone, a
+ * COMMIT's drops) holds the lower at itself with no obligation at all; a
+ * CREATE or a reservation does not, nor a structure change that is still
+ * an obligation.  The earliest reason wins; a tie reports STRUCTURE. */
 UT_TEST(test_retained_cut_structure_change_pins_history)
 {
-	for (int variant = 0; variant < 6; variant++) {
+	for (int variant = 0; variant < 7; variant++) {
 		uint32 self, peer;
 		ClusterWalRetainedCutV1 cut;
 		RfPageProofDetailV1 detail;
@@ -254,6 +254,10 @@ UT_TEST(test_retained_cut_structure_change_pins_history)
 			add_record(peer, 0x6000, 0x6100, 100, 4, 5);
 			expected = 0x1000;
 			pin = CLUSTER_WAL_RETAINED_PIN_PAGE;
+		} else if (variant == 6) { /* a CREATE starts an incarnation */
+			r->space_create = true;
+			expected = SELF_REDO;
+			pin = CLUSTER_WAL_RETAINED_PIN_NONE;
 		} else if (variant == 5) /* same record also pinned by its page */
 			add_record(peer, 0x6000, 0x6100, InvalidOid, 0, 5)->space_rel = 900;
 		UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);

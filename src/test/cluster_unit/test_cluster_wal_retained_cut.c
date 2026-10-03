@@ -188,9 +188,10 @@ typedef struct FixtureRecord {
 	uint64 before[2];
 	uint32 owners;
 	Oid space_rel;
-	uint8 space_mask; /* 0: reservation (block 1); 3: structure change */
-	uint8 inc;		  /* result segment incarnation id, 0 means 1 */
-	uint8 before_inc; /* before incarnation id, 0 means inc */
+	uint8 space_mask;  /* 0: reservation (block 1); 3: structure change */
+	bool space_create; /* the structure change is a CREATE */
+	uint8 inc;		   /* result segment incarnation id, 0 means 1 */
+	uint8 before_inc;  /* before incarnation id, 0 means inc */
 } FixtureRecord;
 
 static ClusterWalInputV1 items[MAX_ITEMS];
@@ -343,6 +344,9 @@ rf_side_record_census_v1(const RfDetachedRecordPlanV1 *record_plan pg_attribute_
 		space.result.key.locator.dbOid = 5;
 		space.result.key.locator.relNumber = current->space_rel;
 		space.result.incarnation[0] = current->inc != 0 ? current->inc : 1;
+		space.result.state = current->space_create ? CLUSTER_SPACE_IDENTITY_LIVE
+												   : CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+		space.result.sequence = current->space_create ? 1 : 2;
 		space.page_mask = current->space_mask != 0 ? current->space_mask : 2;
 		if (space.page_mask & 1)
 			space.result_token[0] = current->result_token;

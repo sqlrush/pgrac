@@ -24,10 +24,18 @@
  *	  must strictly advance its page (result after before), otherwise the
  *	  census refuses.  A history record is also needed when it carries a
  *	  SIDE owner class that has an obligation and no per-key ancestry yet.  A
- *	  history record that changes a relation's SPACE structure (CREATE,
- *	  TRUNCATE, or a DROP tombstone, including the drops of a COMMIT) is
- *	  always needed: its structural PI responsibility has no durable
- *	  retirement receipt yet (CR20), so its WAL is never released.  The
+ *	  history record that ends a relation incarnation (TRUNCATE, a DROP
+ *	  tombstone, the dropped relations of a COMMIT or an ABORT) is always
+ *	  needed: its structural PI responsibility has no durable retirement
+ *	  receipt yet (CR20), so its WAL is never released.  A CREATE starts an
+ *	  incarnation and has no such responsibility.
+ *
+ *	  Native records the typed SIDE decoder does not own yet are classified
+ *	  from their own format instead of abandoning the census: a native
+ *	  SMGR CREATE needs nothing older, a native SMGR TRUNCATE ends an
+ *	  incarnation, standalone invalidations and XID assignments need
+ *	  nothing, and a transaction end carries its SIDE owner classes plus,
+ *	  with relations to drop, the structure pin.  The
  *	  obligations go into a fixed-size sketch keeping, per bucket, the
  *	  earliest before-version and the range of incarnations; collisions
  *	  only make the answer more conservative.  History edges are spooled to
@@ -56,7 +64,9 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/xact.h"
 #include "access/xlogreader.h"
+#include "catalog/storage_xlog.h"
 #include "cluster_control_root_private.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_scn.h"
@@ -277,17 +287,29 @@ retained_key_seen(RetainedCutWork *work, uint64 key, SCN before, const uint8 bef
 		retained_sketch_add(work->sketch, key, before, before_incarnation, result_incarnation);
 }
 
+/* A history record that ends a relation incarnation holds its source. */
+static void
+retained_structure(RetainedCutWork *work)
+{
+	RetainedSource *source = &work->sources[work->current_source];
+
+	if (work->current_history
+		&& (source->structure_first == InvalidXLogRecPtr
+			|| work->current_read < source->structure_first))
+		source->structure_first = work->current_read;
+}
+
 static bool
 retained_space(void *arg, const RfSideSpaceContributionV1 *space)
 {
 	RetainedCutWork *work = arg;
-	RetainedSource *source = &work->sources[work->current_source];
 
-	/* SPACE block 0 changes only with the relation's structure. */
-	if (work->current_history && (space->page_mask & 1) != 0
-		&& (source->structure_first == InvalidXLogRecPtr
-			|| work->current_read < source->structure_first))
-		source->structure_first = work->current_read;
+	/* SPACE block 0 changes only with the relation's structure.  A CREATE
+	 * (the first live identity of its key) starts an incarnation; TRUNCATE
+	 * and a DROP tombstone end one. */
+	if ((space->page_mask & 1) != 0
+		&& !(space->result.state == CLUSTER_SPACE_IDENTITY_LIVE && space->result.sequence == 1))
+		retained_structure(work);
 	for (uint8 block = 0; block < 2; block++)
 		if ((space->page_mask & (1u << block)) != 0) {
 			/* A SPACE contribution carries no before-version: as an
@@ -399,6 +421,71 @@ retained_classify(RetainedCutWork *work, XLogReaderState *record, const ClusterW
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
+/*
+ * A record the page route accepted but the typed SIDE decoder refused,
+ * classified from its native format (see the file header).  Records with
+ * block references, and every other refusal, stay refused.
+ */
+static RfPageProofDetailV1
+retained_native_record(RetainedCutWork *work, XLogReaderState *record, RfPageProofDetailV1 refused)
+{
+	uint8 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+	uint32 owners = 0;
+	bool drops = false;
+
+	if ((refused != RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE
+		 && refused != RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED)
+		|| XLogRecHasAnyBlockRefs(record))
+		return refused;
+	if (XLogRecGetRmid(record) == RM_SMGR_ID) {
+		if (info == XLOG_SMGR_CREATE)
+			return RF_PAGE_PROOF_DETAIL_OK;
+		if (info != XLOG_SMGR_TRUNCATE)
+			return refused;
+		retained_structure(work);
+		return RF_PAGE_PROOF_DETAIL_OK;
+	}
+	if (XLogRecGetRmid(record) != RM_XACT_ID)
+		return refused;
+	switch (info & XLOG_XACT_OPMASK) {
+	case XLOG_XACT_INVALIDATIONS:
+	case XLOG_XACT_ASSIGNMENT:
+		return RF_PAGE_PROOF_DETAIL_OK;
+	case XLOG_XACT_COMMIT:
+	case XLOG_XACT_COMMIT_PREPARED: {
+		xl_xact_parsed_commit parsed;
+
+		if (!ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
+							   XLogRecGetDataLen(record), &parsed))
+			return refused;
+		owners = RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL;
+		if ((info & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT_PREPARED)
+			owners |= RF_SIDE_CONTRIBUTION_PREPARED;
+		drops = parsed.nrels > 0 || parsed.nspace_drops > 0;
+		break;
+	}
+	case XLOG_XACT_ABORT:
+	case XLOG_XACT_ABORT_PREPARED: {
+		xl_xact_parsed_abort parsed;
+
+		if (XLogRecGetDataLen(record) < MinSizeOfXactAbort)
+			return refused;
+		ParseAbortRecord(XLogRecGetInfo(record), (xl_xact_abort *)XLogRecGetData(record), &parsed);
+		owners = RF_SIDE_CONTRIBUTION_TERMINAL;
+		if ((info & XLOG_XACT_OPMASK) == XLOG_XACT_ABORT_PREPARED)
+			owners |= RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_PREPARED;
+		drops = parsed.nrels > 0;
+		break;
+	}
+	default:
+		return refused;
+	}
+	retained_side(work, owners);
+	if (drops)
+		retained_structure(work);
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
 static RfPageProofDetailV1
 retained_record(XLogReaderState *record, const ClusterWalSourceRef *source,
 				const RfContributorStreamCutV1 *cut, void *arg)
@@ -435,7 +522,7 @@ retained_record(XLogReaderState *record, const ClusterWalSourceRef *source,
 	detail = rf_side_record_census_v1(&plan, &identity, cut, source->claim.database_incarnation,
 									  retained_space, work, &owners);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
-		return work->detail = detail;
+		return work->detail = retained_native_record(work, record, detail);
 	retained_side(work, owners.owners);
 	for (uint32 i = 0; i < plan.component_count; i++) {
 		const RfDetachedComponentPlanV1 *component = &plan.components[i];
