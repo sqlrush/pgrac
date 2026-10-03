@@ -15,6 +15,7 @@ static ControlFileData control;
 static ClusterCatalogInitialInput input;
 static uint8 clog[BLCKSZ];
 static uint8 output[BLCKSZ + sizeof(ClusterXidPrehistoryHeader)];
+static const char *native_directory;
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -104,6 +105,17 @@ UT_TEST(original_marker)
 	COMP_CRC32C(crc, &h, offsetof(ClusterCatalogAuthorityMarker, crc));
 	FIN_CRC32C(crc);
 	UT_ASSERT_EQ(h.crc, crc);
+}
+UT_TEST(native_bootstrap_oid_floor)
+{
+	ClusterOidAuthorityHeader h;
+	reset();
+	control.checkPointCopy.nextOid = FirstUnpinnedObjectId + 1253;
+	crc_control();
+	UT_ASSERT(
+		cluster_catalog_initial_image(CLUSTER_CATALOG_INITIAL_OID, &input, output, sizeof(h)));
+	memcpy(&h, output, sizeof(h));
+	UT_ASSERT_EQ(h.next_oid, FirstNormalObjectId);
 }
 UT_TEST(original_xid_consumer)
 {
@@ -196,7 +208,7 @@ UT_TEST(noninitial_control_is_refused)
 UT_TEST(native_allocator_bounds)
 {
 	reset();
-	control.checkPointCopy.nextOid = FirstNormalObjectId - 1;
+	control.checkPointCopy.nextOid = FirstGenbkiObjectId - 1;
 	crc_control();
 	reject();
 	reset();
@@ -277,11 +289,60 @@ UT_TEST(invalid_kind_length_and_null)
 	input.native_control = NULL;
 	reject();
 }
-int
-main(void)
+UT_TEST(real_native_files)
 {
-	UT_PLAN(10);
+	char path[MAXPGPATH];
+	FILE *file;
+
+	reset();
+	snprintf(path, sizeof(path), "%s/global/pg_control", native_directory);
+	file = fopen(path, "rb");
+	UT_ASSERT(file != NULL);
+	if (file == NULL)
+		return;
+	UT_ASSERT(fread(&control, 1, sizeof(control), file) == sizeof(control));
+	UT_ASSERT(fclose(file) == 0);
+	input.identity.system_identifier = control.system_identifier;
+	snprintf(path, sizeof(path), "%s/pg_xact/0000", native_directory);
+	file = fopen(path, "rb");
+	UT_ASSERT(file != NULL);
+	if (file == NULL)
+		return;
+	UT_ASSERT(fread(clog, 1, sizeof(clog), file) == sizeof(clog));
+	UT_ASSERT(fclose(file) == 0);
+	for (int kind = CLUSTER_CATALOG_INITIAL_OID; kind <= CLUSTER_CATALOG_INITIAL_PREHISTORY;
+		 ++kind) {
+		size_t length = cluster_catalog_initial_image_size(kind, &input);
+		UT_ASSERT(length > 0 && length <= sizeof(output));
+		memset(output, 0, sizeof(output));
+		UT_ASSERT(cluster_catalog_initial_image(kind, &input, output, length));
+		if (kind == CLUSTER_CATALOG_INITIAL_OID)
+			UT_ASSERT_EQ(cluster_oid_authority_classify((char *)output, length),
+						 CLUSTER_OID_AUTHORITY_VALID);
+		if (kind == CLUSTER_CATALOG_INITIAL_XID)
+			UT_ASSERT_EQ(cluster_xid_authority_classify((char *)output, length),
+						 CLUSTER_XID_AUTHORITY_VALID);
+		if (kind == CLUSTER_CATALOG_INITIAL_PREHISTORY)
+			UT_ASSERT_EQ(cluster_xid_prehistory_classify((char *)output, length),
+						 CLUSTER_XID_AUTHORITY_VALID);
+	}
+}
+
+int
+main(int argc, char **argv)
+{
+	if (argc == 3 && strcmp(argv[1], "--native") == 0) {
+		native_directory = argv[2];
+		UT_PLAN(1);
+		UT_RUN(real_native_files);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	if (argc != 1)
+		return 2;
+	UT_PLAN(11);
 	UT_RUN(original_oid_consumer);
+	UT_RUN(native_bootstrap_oid_floor);
 	UT_RUN(original_marker);
 	UT_RUN(original_xid_consumer);
 	UT_RUN(original_prehistory_consumer);
