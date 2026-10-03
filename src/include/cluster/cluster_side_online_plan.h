@@ -213,6 +213,17 @@ extern bool rf_side_online_plan_space_covers_v1(const RfSideOnlinePlanV1 *plan,
 	const ClusterSpaceIdentityKey *key, BlockNumber block, uint32 ancestor_operation,
 	uint32 completed_operation, bool *terminal);
 
+typedef struct RfSideSpaceTerminalV1 {
+	uint32 operation;
+	RfSideSpaceContributionV1 contribution;
+} RfSideSpaceTerminalV1;
+
+/* Select this block's terminal contribution using the same complete, strict
+ * retained ancestry proof. No source/durability authority; refusal preserves
+ * output, including when no retained operation contributes to this block. */
+extern bool rf_side_online_plan_space_terminal_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterSpaceIdentityKey *key, BlockNumber block, RfSideSpaceTerminalV1 *out);
+
 /* One decoded record, no retained operation array or payload allocation.
  * Reuses the replay decoder but returns only provisional contribution owners.
  * The caller must finish physical WAL/source validation before completing its

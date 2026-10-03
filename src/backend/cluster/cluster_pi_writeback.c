@@ -1032,6 +1032,16 @@ static bool
 wb_batch_storage(uint32 index, const RfPageOnlinePlanV1 *page)
 {
 	uint32 count = rf_page_online_plan_target_count_v1(page);
+	if (wb_batch->tags[index].forkNum == SPACE_FORKNUM) {
+		ClusterSpaceIdentityKey key = { 0 };
+		key.system_identifier = wb_batch->local.claim.identity.system_identifier;
+		key.database_incarnation = wb_batch->local.claim.database_incarnation;
+		memcpy(key.storage_uuid, wb_batch->local.claim.identity.storage_uuid, 16);
+		key.locator = BufTagGetRelFileLocator(&wb_batch->tags[index]);
+		return cluster_bufmgr_observe_pi_space_storage_v1(
+			&key, &wb_batch->storage_cuts[index], wb_batch->plan, wb_batch->sources,
+			wb_batch->source_count, &wb_batch->receipts[index]);
+	}
 	for (uint32 i = 0; i < count; i++) {
 		RfPageOnlineTargetViewV1 view;
 		BufferTag tag;

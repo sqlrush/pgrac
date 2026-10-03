@@ -566,7 +566,7 @@ smgrwrite(SMgrRelation r, ForkNumber f, BlockNumber b, const void *data, bool sk
 void
 smgrimmedsync(SMgrRelation r, ForkNumber f)
 {
-	UT_ASSERT(locks[0] && !locks[1]);
+	UT_ASSERT(!locks[1] && (locks[0] || (storage_read && data_slot == 0)));
 	fault(3);
 	UT_ASSERT_EQ(fsync(fileno(file)), 0);
 	syncs++;
@@ -603,7 +603,8 @@ smgrimmedsync(SMgrRelation r, ForkNumber f)
 void
 smgrread(SMgrRelation r, ForkNumber f, BlockNumber b, void *out)
 {
-	UT_ASSERT(locks[0] && !locks[1] && (storage_read || syncs));
+	UT_ASSERT(!locks[1] && (locks[0] || (storage_read && data_slot == 0))
+			  && (storage_read || syncs));
 	fault(storage_read && reads > 0 ? 5 : 4);
 	reads++;
 	UT_ASSERT_EQ(pread(fileno(file), out, BLCKSZ, 0), BLCKSZ);
@@ -3186,13 +3187,178 @@ remote_space_receipt_rebinds_receiver_plan_before_physical_ack(void)
 	cluster_thread_recovery_fabric_plan_destroy_v1(&sender);
 	clean();
 }
+
+static ClusterThreadRecoveryFabricPlanV1 *
+space_storage_fixture(int block, bool later, bool gap, ClusterWalSourceRef sources[2],
+					  ClusterPageWalBindingV1 *ancestor, ClusterPcmPiStorageCutV1 *cut)
+{
+	ClusterThreadRecoveryFabricPlanV1 *plan;
+	space_receipt_setup(block, sources, ancestor);
+	plan = space_contribution_plan(sources, later, gap, true);
+	memset(cut, 0, sizeof(*cut));
+	cut->resource = descriptors[block].bufferdesc.tag;
+	cut->authority.state = PCM_STATE_N;
+	cut->authority.master_holder.node_id = UINT32_MAX;
+	cut->authority.x_holder_node = cut->authority.pending_x_requester_node = -1;
+	cut->authority.transition_count = 6;
+	cut->pi_holders_bitmap = 3;
+	cut->binding_generation = 1;
+	cut->resource_formation = 17;
+	cut->authority_generation = 3;
+	cut->master_generation = 4;
+	cut->master_session_incarnation = 31;
+	cut->master_node = cluster_node_id;
+	PageSetChecksumInplace(pages[block].data, block);
+	UT_ASSERT_EQ(pwrite(fileno(file), pages[block].data, BLCKSZ, 0), BLCKSZ);
+	resident[block] = false;
+	storage_read = true;
+	writes = syncs = reads = wal_flushes = 0;
+	return plan;
+}
+
+static void
+space_n_s_storage_retires_pi_without_current_x(void)
+{
+	for (int block = 0; block < 2; block++)
+		for (int mode = 0; mode < 2; mode++) {
+			ClusterWalSourceRef sources[2];
+			ClusterPageWalBindingV1 ancestor;
+			ClusterPcmPiStorageCutV1 cut, proven;
+			ClusterPageDataReceiptV1 *receipt = NULL;
+			ClusterPiPhysicalAckV1 *ack = NULL;
+			ClusterThreadRecoveryFabricPlanV1 *fabric
+				= space_storage_fixture(block, false, false, sources, &ancestor, &cut);
+			const RfPageOnlinePlanV1 *page = cluster_thread_recovery_fabric_page_plan_v1(fabric);
+			int32 node = -1;
+			if (mode) {
+				cut.authority.state = PCM_STATE_S;
+				cut.authority.master_holder.node_id = 1;
+				cut.authority.s_holders_bitmap = 2;
+			}
+			UT_ASSERT(cluster_bufmgr_observe_pi_space_storage_v1(&identity.key, &cut, fabric,
+																 sources, 2, &receipt));
+			UT_ASSERT_EQ(reads, 2);
+			UT_ASSERT_EQ(syncs, 1);
+			UT_ASSERT_EQ(writes + wal_flushes, 0);
+			UT_ASSERT(cluster_page_data_pi_storage_proof_v1(receipt, page, sources, 2, &proven));
+			UT_ASSERT_EQ(memcmp(&cut, &proven, sizeof(cut)), 0);
+			/* A remote storage fact carries no borrowed plan or native-flush
+			 * certificate; the receiver proves its own complete typed input. */
+			UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &notice_fact));
+			cluster_page_data_receipt_free_v1(&receipt);
+			notice_ready = true;
+			UT_ASSERT(cluster_page_data_from_notice_v1((void *)1, 0, &receipt));
+			UT_ASSERT(!cluster_page_data_pi_storage_proof_v1(receipt, page, sources, 2, &proven));
+			UT_ASSERT(cluster_page_data_bind_plan_v1(receipt, fabric));
+			writer = sources[0];
+			cluster_node_id = 0;
+			space_physical_pi(&ancestor, 0);
+			UT_ASSERT(cluster_bufmgr_ack_pi_at_data_v1(receipt, page, sources, 2, NULL, &ack));
+			UT_ASSERT(cluster_page_data_pi_ack_read_v1(ack, receipt, &node));
+			UT_ASSERT_EQ(node, 0);
+			UT_ASSERT_EQ(pi_discards, 1);
+			cluster_page_data_pi_ack_free_v1(&ack);
+			cluster_page_data_receipt_free_v1(&receipt);
+			cluster_thread_recovery_fabric_plan_destroy_v1(&fabric);
+			clean();
+		}
+}
+
+static void
+space_storage_requires_exact_terminal_and_unchanged_master_cut(void)
+{
+	for (int block = 0; block < 2; block++)
+		for (int fault = 0; fault < 12; fault++) {
+			ClusterWalSourceRef sources[2];
+			ClusterPageWalBindingV1 ancestor;
+			ClusterPcmPiStorageCutV1 cut;
+			ClusterPageDataReceiptV1 *receipt = NULL;
+			bool valid = block == 0 && fault == 10;
+			ClusterThreadRecoveryFabricPlanV1 *fabric
+				= space_storage_fixture(block, fault == 10, fault == 11, sources, &ancestor, &cut);
+			if (fault == 0)
+				bad_checksum = true;
+			if (fault == 1)
+				bad_bytes = true;
+			if (fault == 2)
+				storage_cut_current = false;
+			if (fault == 3)
+				storage_cut_changed = true;
+			if (fault == 4)
+				stale_sync = true;
+			if (fault == 5)
+				zero_disk = true;
+			if (fault == 6) {
+				if (block == 1)
+					storage_space_changed = true;
+				else
+					cut.authority.x_holder_node = 0;
+			}
+			if (fault == 7)
+				sources[0].claim.claim_sha256[15]++;
+			if (fault == 8)
+				cut.resource.relNumber++;
+			if (fault == 9) {
+				if (block == 1)
+					resident[0] = false;
+				else
+					identity.key.database_incarnation++;
+			}
+			/* A later ADVANCE changes SPACE1's terminal, not SPACE0's. */
+			UT_ASSERT_EQ(cluster_bufmgr_observe_pi_space_storage_v1(&identity.key, &cut, fabric,
+																	sources, 2, &receipt),
+						 valid);
+			UT_ASSERT_EQ(receipt != NULL, valid);
+			UT_ASSERT_EQ(writes + wal_flushes + pi_discards + logical_pi_retire_calls, 0);
+			if (fault == 2 || fault == 7 || fault == 8 || fault == 9 || fault == 11)
+				UT_ASSERT_EQ(reads + syncs, 0);
+			cluster_page_data_receipt_free_v1(&receipt);
+			cluster_thread_recovery_fabric_plan_destroy_v1(&fabric);
+			clean();
+		}
+}
+
+static void
+space_storage_io_errors_never_export_or_leak_identity(void)
+{
+	for (int block = 0; block < 2; block++)
+		for (int at = 3; at <= 5; at++) {
+			ClusterWalSourceRef sources[2];
+			ClusterPageWalBindingV1 ancestor;
+			ClusterPcmPiStorageCutV1 cut;
+			ClusterPageDataReceiptV1 *receipt = NULL;
+			ClusterThreadRecoveryFabricPlanV1 *fabric
+				= space_storage_fixture(block, false, false, sources, &ancestor, &cut);
+			volatile bool caught = false;
+			throw_at = at;
+			PG_TRY();
+			{
+				(void)cluster_bufmgr_observe_pi_space_storage_v1(&identity.key, &cut, fabric,
+																 sources, 2, &receipt);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			UT_ASSERT(caught);
+			UT_ASSERT(receipt == NULL);
+			UT_ASSERT_EQ(writes + wal_flushes + pi_discards, 0);
+			cluster_thread_recovery_fabric_plan_destroy_v1(&fabric);
+			clean();
+		}
+}
+
 #endif
 
 int
 main(void)
 {
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
-	UT_PLAN(50);
+	UT_PLAN(53);
+	UT_RUN(space_n_s_storage_retires_pi_without_current_x);
+	UT_RUN(space_storage_requires_exact_terminal_and_unchanged_master_cut);
+	UT_RUN(space_storage_io_errors_never_export_or_leak_identity);
 	UT_RUN(space_data_qualifies_original_physical_and_logical_pi);
 	UT_RUN(space_data_rejects_missing_or_substituted_original_contribution);
 	UT_RUN(space_absent_replaced_and_successor_pi_require_per_block_terminal);

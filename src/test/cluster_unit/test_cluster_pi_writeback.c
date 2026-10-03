@@ -108,6 +108,13 @@ rf_side_online_plan_space_covers_v1(const RfSideOnlinePlanV1 *plan,
 	return false;
 }
 
+bool
+rf_side_online_plan_space_terminal_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterSpaceIdentityKey *key, BlockNumber block, RfSideSpaceTerminalV1 *out)
+{
+	return false;
+}
+
 uint32
 rf_side_online_plan_space_contribution_count_v1(const RfSideOnlinePlanV1 *plan, uint32 index)
 {

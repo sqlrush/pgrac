@@ -64,7 +64,8 @@ cluster_pcm_pi_storage_cut_valid_v1(const ClusterPcmPiStorageCutV1 *cut)
 		   && cut->master_session_incarnation != UINT64_MAX && cut->master_node >= 0
 		   && cut->master_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
 		   && (cut->resource.forkNum == MAIN_FORKNUM
-			   || cut->resource.forkNum == VISIBILITYMAP_FORKNUM)
+			   || cut->resource.forkNum == VISIBILITYMAP_FORKNUM
+			   || (cut->resource.forkNum == SPACE_FORKNUM && cut->resource.blockNum <= 1))
 		   && a->reserved[0] == 0 && a->reserved[1] == 0 && a->transition_count != 0
 		   && a->transition_count != UINT64_MAX && a->x_holder_node == -1
 		   && ((a->state == PCM_STATE_N && a->s_holders_bitmap == 0
@@ -95,6 +96,13 @@ extern bool cluster_bufmgr_observe_pi_storage_v1(const ClusterPageDataTargetV1 *
 												 const ClusterWalSourceRef *sources,
 												 uint32 source_count,
 												 ClusterPageDataReceiptV1 **out);
+/* Typed SPACE terminal selected from the complete retained input. SPACE0
+ * is its own identity: exact master N/S cut plus typed read/fsync/read needs
+ * no resident current image. SPACE1 retains the original SPACE0 identity-S.
+ * Neither path writes DATA or acquires X. Plan lifetime follows bind_plan. */
+extern bool cluster_bufmgr_observe_pi_space_storage_v1(const ClusterSpaceIdentityKey *key,
+	const ClusterPcmPiStorageCutV1 *cut, const struct ClusterThreadRecoveryFabricPlanV1 *plan,
+	const ClusterWalSourceRef *sources, uint32 source_count, ClusterPageDataReceiptV1 **out);
 extern bool cluster_page_data_pi_storage_proof_v1(const ClusterPageDataReceiptV1 *receipt,
 												  const RfPageOnlinePlanV1 *plan,
 												  const ClusterWalSourceRef *sources,

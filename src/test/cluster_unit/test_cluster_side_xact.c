@@ -4198,6 +4198,9 @@ UT_TEST(test_space_retained_ancestry_rejects_broken_history_before_live_suffix)
 		RfSideOnlinePlanV1 *plan = space_online_plan_redo(300, &redo);
 		uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
 		bool terminal = true;
+		RfSideSpaceTerminalV1 selected, untouched;
+		memset(&untouched, 0xa5, sizeof(untouched));
+		selected = untouched;
 		UT_ASSERT(cluster_space_reservation_wal_encode(&advance, wal, sizeof(wal)));
 		UT_ASSERT_EQ(
 			space_online_feed(plan, XLOG_SMGR_SPACE_RESERVATION, wal, sizeof(wal), 100, false),
@@ -4229,6 +4232,8 @@ UT_TEST(test_space_retained_ancestry_rejects_broken_history_before_live_suffix)
 		UT_ASSERT(!rf_side_online_plan_space_covers_v1(plan, &key, 1, 0, 1, &terminal));
 		UT_ASSERT(!rf_side_online_plan_space_covers_v1(plan, &key, 1, 1, 1, &terminal));
 		UT_ASSERT(terminal);
+		UT_ASSERT(!rf_side_online_plan_space_terminal_v1(plan, &key, 1, &selected));
+		UT_ASSERT_EQ(memcmp(&selected, &untouched, sizeof(selected)), 0);
 		rf_side_online_plan_destroy_v1(&plan);
 	}
 }
@@ -4242,6 +4247,7 @@ UT_TEST(test_space_retained_ancestry_orders_interleaved_writers_not_feed_or_toke
 	uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
 	const int feed_order[] = { 1, 2, 0 };
 	bool terminal = false;
+	RfSideSpaceTerminalV1 selected = { 0 };
 	chain[0] = space_advance_fixture();
 	for (int i = 0; i < 3; i++) {
 		cuts[i].failed_thread = i + 1;
@@ -4286,6 +4292,10 @@ UT_TEST(test_space_retained_ancestry_orders_interleaved_writers_not_feed_or_toke
 	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
 	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 	/* Operation order is B,C,A; dependency order is A,B,C (tokens 80,60,40). */
+	UT_ASSERT(rf_side_online_plan_space_terminal_v1(plan, &chain[0].before.identity.key, 1, &selected));
+	UT_ASSERT_EQ(selected.operation, 1);
+	UT_ASSERT_EQ(selected.contribution.result_token[1], 40);
+	UT_ASSERT(!rf_side_online_plan_space_terminal_v1(plan, &chain[0].before.identity.key, 0, &selected));
 	UT_ASSERT(rf_side_online_plan_space_covers_v1(plan, &chain[0].before.identity.key, 1, 2, 1,
 												  &terminal));
 	UT_ASSERT(terminal);
@@ -4351,6 +4361,7 @@ UT_TEST(test_space_retained_ancestry_create_and_independent_page_terminal)
 	RfSideOnlinePlanV1 *plan = space_online_plan_redo(300, &redo);
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	bool terminal = false;
+	RfSideSpaceTerminalV1 selected = { 0 };
 	create.identity.action = CLUSTER_SPACE_WAL_CREATE;
 	create.identity.nblocks = InvalidBlockNumber;
 	create.identity.result = advance.result.identity;
@@ -4373,6 +4384,12 @@ UT_TEST(test_space_retained_ancestry_create_and_independent_page_terminal)
 				 RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
 	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_side_online_plan_space_terminal_v1(plan, &create.identity.result.key, 0, &selected));
+	UT_ASSERT_EQ(selected.operation, 0);
+	UT_ASSERT_EQ(selected.contribution.result_token[0], 50);
+	UT_ASSERT(rf_side_online_plan_space_terminal_v1(plan, &create.identity.result.key, 1, &selected));
+	UT_ASSERT_EQ(selected.operation, 1);
+	UT_ASSERT_EQ(selected.contribution.result_token[1], 80);
 	UT_ASSERT(
 		rf_side_online_plan_space_covers_v1(plan, &create.identity.result.key, 0, 0, 0, &terminal));
 	UT_ASSERT(terminal); /* ADVANCE changes only block one. */
