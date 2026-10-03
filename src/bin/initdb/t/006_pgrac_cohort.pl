@@ -3,7 +3,7 @@
 use strict;
 use warnings;
 use Cwd qw(realpath);
-use Digest::SHA qw(sha256_hex);
+use Digest::SHA qw(sha256 sha256_hex);
 use File::Copy qw(copy);
 use JSON::PP qw(decode_json);
 use PostgreSQL::Test::Utils;
@@ -59,9 +59,9 @@ my ($out, $err);
 ok(IPC::Run::run([options('valid')], '>', \$out, '2>', \$err),
 	'one original creator prepares all four native origins') or diag $err;
 BAIL_OUT('cohort not created') unless -f "$temp/valid-caches/node_3/global/pg_control";
-like($out, qr/shared startup authority is not published/,
-	'preparation does not claim shared startup or OPEN');
-ok(!-e "$temp/valid-data/global/pgrac_control_root", 'no premature ROOT');
+like($out, qr/shared startup remains closed/,
+	'creation publication does not claim shared OPEN');
+ok(-f "$temp/valid-data/global/pgrac_control_root", 'complete creator publishes ROOT last');
 my %generations;
 my $founder_scn;
 for my $node (0 .. 3)
@@ -106,7 +106,7 @@ for my $node (0 .. 3)
 		close $fh or die "close WAL: $!";
 	}
 	ok($pages > 0 && !$wrong, "all origin $node WAL pages were generated with its thread");
-	ok(!-e "$data/global/pgrac_control_binding", 'no PGCB before complete ROOT publication');
+	ok(-f "$data/global/pgrac_control_binding", 'original local binding follows complete ROOT publication');
 	for my $family ('pg_xact', 'pg_subtrans', 'pg_multixact/offsets', 'pg_multixact/members', 'pg_commit_ts')
 	{
 		my $target = "$temp/valid-data/native_side/origin_$node/$family";
@@ -232,4 +232,74 @@ for my $bad ('missing-member', 'missing-setting', 'occupied', 'overlap', 'alias'
 is(slurp_file("$temp/occupied-undo/keep"), 'unchanged', 'occupied bytes preserved');
 command_fails_like(['postgres', '--pgrac-initdb-cohort'], qr/INITDB_COHORT_/,
 	'ordinary direct invocation lacks the original frontend context');
+# Independently derive both creation digests from actual persisted bytes.
+sub tree_material
+{
+	my ($base, $relative, $entries, $derived) = @_;
+	for my $name (@{entries(length($relative) ? "$base/$relative" : $base)})
+	{
+		my $path = length($relative) ? "$relative/$name" : $name;
+		next if $derived && ($path eq 'global/wal_startup'
+			|| $path eq 'global/pgrac_control_root' || $path eq 'global/pgrac_control_root.bak');
+		die "tree alias $path" if -l "$base/$path";
+		my $directory = -d "$base/$path";
+		my $bytes = $directory ? '' : slurp_file("$base/$path");
+		$entries->{$path} = pack('C V', $directory ? 1 : 2, length($path)) . $path
+			. pack('Q<', length($bytes)) . ($directory ? "\0" x 32 : sha256($bytes));
+		tree_material($base, $path, $entries, $derived) if $directory;
+	}
+}
+sub tree_digest
+{
+	my ($base, $derived) = @_;
+	my %entries;
+	tree_material($base, '', \%entries, $derived);
+	return sha256("PGRAC-CREATION-TREE-V1\0" . join('', map { $entries{$_} } sort keys %entries));
+}
+if (-f "$temp/valid-data/global/pgrac_control_root")
+{
+	my $root = slurp_file("$temp/valid-data/global/pgrac_control_root");
+	is(length($root), 66048, 'complete fixed-size ROOT is durable');
+	is($root, slurp_file("$temp/valid-data/global/pgrac_control_root.bak"),
+		'original primary and backup have identical bytes');
+	is(unpack('v', substr($root, 4, 2)), 3, 'ROOT uses v3');
+	is(unpack('Q<', substr($root, 64, 8)), 0x15, 'creation uses the separate flags domain');
+	is(unpack('Q<', substr($root, 164, 8)), 1, 'creation lineage is generation one');
+	is(unpack('Q<', substr($root, 172, 8)), 0, 'creation never invents an OPEN epoch');
+	is(unpack('V', substr($root, 196, 4)), 1, 'new ROOT is mounted, not serving');
+	is(substr($root, 232, 16), "\0" x 16, 'creation has no serving members');
+	my $origins = "PGRAC-CREATION-ORIGINS-V1\0" . substr($root, 216, 16);
+	for my $node (0 .. 3)
+	{
+		my $wal = readlink "$temp/valid-caches/node_$node/pg_wal";
+		my $thread = $node + 1;
+		my ($generation) = $wal =~ /generation_([0-9]+)$/;
+		my ($anchor) = glob("$temp/valid-data/global/anchor_images/thread_$thread/generation_$generation/anchor_1-*.bin");
+		$origins .= pack('V', $node) . sha256(slurp_file("$temp/valid-caches/node_$node/global/pg_control"))
+			. tree_digest($wal, 0) . sha256(slurp_file("$wal/pgrac_thread.claim")) . sha256(slurp_file($anchor));
+		my $binding = slurp_file("$temp/valid-caches/node_$node/global/pgrac_control_binding");
+		is(length($binding), 256, 'local binding has exact length');
+		is(unpack('v', substr($binding, 4, 2)), 3, 'PGCB uses v3');
+		is(unpack('V', substr($binding, 12, 4)), 1, 'PGCB selects creation domain');
+		is(unpack('V', substr($binding, 64, 4)), $node, 'PGCB binds its actual local node');
+		is(substr($binding, 152, 64), substr($root, 100, 64), 'PGCB selects both original ROOT digests');
+		is(substr($binding, 216, 16), pack('Q< Q<', 1, 0), 'PGCB cannot assert online OPEN');
+		my ($startup) = glob("$temp/valid-data/global/wal_startup/thread_$thread/startup_1-*.bin");
+		ok(defined($startup), 'each configured origin has an initialized input');
+		my $input = slurp_file($startup);
+		is(length($input), 1536, 'initialized input has exact length');
+		is(unpack('V', substr($input, 12, 4)), 4, 'kind4 is initialized, never CLEAN');
+		is(unpack('Q<', substr($input, 48, 8)), 0, 'kind4 awaits the actual formation');
+		is(substr($root, 512 + $node * 512 + 336, 32), sha256($input), 'ROOT selects exact kind4 bytes');
+	}
+	my $native_hash = sha256($origins);
+	is(substr($root, 132, 32), $native_hash, 'ROOT binds all actual native control/WAL/claim/anchor bytes');
+	my $cohort = "PGRAC-CREATION-COHORT-V1\0" . substr($root, 24, 8) . substr($root, 32, 32)
+		. substr($root, 200, 8) . substr($root, 216, 16) . substr($root, 4, 2)
+		. substr($root, 64, 8) . substr($root, 188, 8) . substr($root, 248, 40)
+		. substr($root, 288, 40) . substr($root, 328, 8) . substr($root, 344, 32)
+		. substr($root, 336, 8) . $native_hash . tree_digest("$temp/valid-data", 1)
+		. tree_digest("$temp/valid-undo", 0);
+	is(substr($root, 100, 32), sha256($cohort), 'ROOT cohort digest independently matches complete original objects');
+}
 done_testing();

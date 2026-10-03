@@ -15,6 +15,7 @@
 #include "cluster/cluster_initdb_config.h"
 #include "cluster/cluster_wal_thread.h"
 #include "common/file_perm.h"
+#include "common/cryptohash.h"
 #include "common/pgrac_initdb_cohort.h"
 #include "miscadmin.h"
 #include "libpq/pqsignal.h"
@@ -23,6 +24,7 @@
 #include "utils/timestamp.h"
 #include "cluster_initdb_origin_private.h"
 #include "cluster_initdb_common_private.h"
+#include "cluster_initdb_tree_private.h"
 #include "../../bin/initdb/pgrac_wal.h"
 #include "../../bin/initdb/pgrac_side.h"
 
@@ -44,6 +46,9 @@ typedef struct InitdbOrigin
 	ControlFileData control;
 	PgracInitdbWalObservation checkpoint;
 	ClusterWalHistoryRecord input;
+	uint8 control_sha256[32];
+	struct stat control_identity;
+	ClusterInitdbTree wal_observed;
 } InitdbOrigin;
 
 static volatile sig_atomic_t creation_cancelled;
@@ -73,6 +78,37 @@ pg_attribute_noreturn() refuse(const char *reason)
 	ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					errmsg("INITDB_COHORT_CREATE: %s", reason)));
 	pg_unreachable();
+}
+
+static pg_cryptohash_ctx *
+creation_hash_begin(const char *domain, Size length)
+{
+	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
+	if (ctx == NULL || pg_cryptohash_init(ctx) < 0
+		|| (length && pg_cryptohash_update(ctx, (const uint8 *)domain, length) < 0))
+		refuse("cannot start original creation digest");
+	return ctx;
+}
+
+static void
+creation_hash_feed(pg_cryptohash_ctx *ctx, const void *bytes, Size length)
+{
+	if (pg_cryptohash_update(ctx, bytes, length) < 0) refuse("cannot hash original creation bytes");
+}
+
+static void
+creation_hash_number(pg_cryptohash_ctx *ctx, uint64 value, unsigned width)
+{
+	uint8 bytes[8];
+	for (unsigned i = 0; i < width; i++) bytes[i] = value >> (8 * i);
+	creation_hash_feed(ctx, bytes, width);
+}
+
+static void
+creation_hash_finish(pg_cryptohash_ctx *ctx, uint8 hash[32])
+{
+	if (pg_cryptohash_final(ctx, hash, 32) < 0) refuse("cannot finish original creation digest");
+	pg_cryptohash_free(ctx);
 }
 
 static bool
@@ -306,6 +342,8 @@ control_read(InitdbOrigin *origin, uint16 thread, uint64 system_identifier, bool
 {
 	ControlFileData control;
 	PgracInitdbWalObservation observed;
+	uint8 control_hash[32];
+	pg_cryptohash_ctx *hash;
 	struct stat file, held, named;
 	char bytes[PG_CONTROL_FILE_SIZE + 1];
 	char *wal;
@@ -335,15 +373,25 @@ control_read(InitdbOrigin *origin, uint16 thread, uint64 system_identifier, bool
 		|| close(fd) != 0 || fstatat(origin->data.fd, "global", &named, AT_SYMLINK_NOFOLLOW) != 0
 		|| !same_directory(&held, &named) || close(global) != 0)
 		refuse("native control changed during readback");
+	hash = creation_hash_begin(NULL, 0);
+	creation_hash_feed(hash, bytes, PG_CONTROL_FILE_SIZE);
+	creation_hash_finish(hash, control_hash);
 	memcpy(&control, bytes, sizeof(control));
 	if (control.system_identifier != system_identifier
 		|| !pgrac_initdb_wal_observe(origin->wal.fd, &control, thread, &observed)
-		|| (!first && (memcmp(&control, &origin->control, sizeof(control)) != 0
+		|| (!first && (file.st_dev != origin->control_identity.st_dev
+			|| file.st_ino != origin->control_identity.st_ino
+			|| file.st_mode != origin->control_identity.st_mode
+			|| file.st_uid != origin->control_identity.st_uid
+			|| memcmp(control_hash, origin->control_sha256, 32) != 0
+			|| memcmp(&control, &origin->control, sizeof(control)) != 0
 			|| observed.checkpoint_start != origin->checkpoint.checkpoint_start
 			|| observed.checkpoint_end != origin->checkpoint.checkpoint_end
 			|| observed.checkpoint_scn != origin->checkpoint.checkpoint_scn
 			|| observed.checkpoint_crc != origin->checkpoint.checkpoint_crc)))
 		refuse("native shutdown checkpoint differs from its original completed child");
+	origin->control_identity = file;
+	memcpy(origin->control_sha256, control_hash, 32);
 	origin->control = control;
 	origin->checkpoint = observed;
 	directory_current(&origin->data);
@@ -536,7 +584,7 @@ create_peer_side(const InitdbDirectory *shared, InitdbOrigin *origins,
 
 static void
 create_common_objects(const InitdbDirectory *shared, InitdbOrigin *origins,
-					  const ClusterSharedConfigRef *config)
+					  const ClusterSharedConfigRef *config, ClusterInitdbCommon *published)
 {
 	const ControlFileData *sources[CLUSTER_CONTROL_ROOT_RECORD_COUNT] = {0};
 	ClusterInitdbCommon common;
@@ -583,6 +631,225 @@ create_common_objects(const InitdbDirectory *shared, InitdbOrigin *origins,
 	directory_current(&global);
 	if (fsync(global.fd) != 0 || close(global.fd) != 0)
 		refuse("cannot complete original common objects");
+	*published = common;
+}
+
+static void
+open_original_child(const InitdbDirectory *parent, const char *name, InitdbDirectory *child)
+{
+	directory_current(parent);
+	memset(child, 0, sizeof(*child));
+	child->parent = parent->fd;
+	child->parent_identity = parent->identity;
+	strlcpy(child->name, name, sizeof(child->name));
+	if (snprintf(child->path, sizeof(child->path), "%s/%s", parent->path, name) >= sizeof(child->path))
+		refuse("original child path is too long");
+	child->fd = openat(parent->fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (child->fd < 0 || fstat(child->fd, &child->identity) != 0 || !owned_directory(&child->identity))
+		refuse("cannot reopen original child directory");
+	directory_current(child);
+}
+
+static void
+creation_tree_recheck(int fd, bool derived, const ClusterInitdbTree *expected)
+{
+	ClusterInitdbTree observed;
+	if (!cluster_initdb_tree_read(fd, derived, &observed)
+		|| memcmp(&observed, expected, sizeof(observed)) != 0)
+		refuse("original file tree changed before publication");
+}
+
+static void
+creation_sources_current(const PgracInitdbCohortContext *request,
+	const ClusterSharedConfigRef *config, InitdbDirectory roots[4], InitdbOrigin *origins,
+	const ClusterInitdbTree *data, const ClusterInitdbTree *undo, bool derived)
+{
+	request_current(request, config);
+	for (unsigned i = 0; i < 4; i++) directory_current(&roots[i]);
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
+		if (!(config->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64)))) continue;
+		control_read(&origins[node], node + 1, config->identity.system_identifier, false);
+		creation_tree_recheck(origins[node].wal.fd, false, &origins[node].wal_observed);
+	}
+	creation_tree_recheck(roots[1].fd, derived, data);
+	creation_tree_recheck(roots[3].fd, false, undo);
+	request_current(request, config);
+}
+
+typedef struct InitdbStartupObject
+{
+	InitdbDirectory directory;
+	struct stat identity;
+	char name[112];
+} InitdbStartupObject;
+
+static void
+creation_derived_current(const InitdbDirectory *global, const InitdbDirectory *startups,
+	const InitdbStartupObject objects[128], const ControlRootImage *root,
+	const uint8 inputs[128][CLUSTER_WAL_STARTUP_BYTES], const struct stat *backup)
+{
+	directory_current(global);
+	directory_current(startups);
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
+		if (!root->present[node]) continue;
+		directory_current(&objects[node].directory);
+		if (!cluster_initdb_object_recheck(objects[node].directory.fd, objects[node].name,
+			inputs[node], CLUSTER_WAL_STARTUP_BYTES, &objects[node].identity))
+			refuse("original selected startup input changed before ROOT publication");
+	}
+	if (backup != NULL && !cluster_initdb_object_recheck(global->fd, "pgrac_control_root.bak",
+		root->bytes, sizeof(root->bytes), backup))
+		refuse("original backup ROOT changed before primary publication");
+}
+
+static void
+create_root_objects(const PgracInitdbCohortContext *request, InitdbDirectory roots[4],
+	InitdbOrigin *origins, const ClusterSharedConfigRef *config, const ClusterInitdbCommon *common,
+	uint64 incarnation)
+{
+	static const char origins_domain[] = "PGRAC-CREATION-ORIGINS-V1";
+	static const char cohort_domain[] = "PGRAC-CREATION-COHORT-V1";
+	ControlRootImage *sources = palloc0(sizeof(*sources)), *root = palloc0(sizeof(*root));
+	uint8 (*inputs)[CLUSTER_WAL_STARTUP_BYTES] = palloc0(128 * CLUSTER_WAL_STARTUP_BYTES);
+	uint8 (*bindings)[PGRAC_CONTROL_BINDING_BYTES] = palloc0(128 * PGRAC_CONTROL_BINDING_BYTES);
+	uint8 ids[128][16] = {{0}};
+	ClusterInitdbTree data, undo;
+	ControlRootHeader *header = &sources->header;
+	ControlRootCommonV2 *shared = &header->v2;
+	InitdbDirectory global, startups;
+	InitdbStartupObject *objects = palloc0(128 * sizeof(*objects));
+	struct stat backup;
+	pg_cryptohash_ctx *hash;
+	char name[112], hex[65];
+
+	header->file_txn_seq = 1;
+	header->format_version = 3;
+	header->system_identifier = config->identity.system_identifier;
+	memcpy(header->storage_uuid, config->identity.storage_uuid, 16);
+	memcpy(header->authority_uuid, config->identity.authority_uuid, 16);
+	header->activation_state = CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE;
+	header->lineage_kind = PGRAC_CONTROL_LINEAGE_CREATION_V1;
+	header->migration_prepare_generation = 1;
+	header->created_at_usec = header->published_at_usec = incarnation;
+	/* Describes compiled persistent formats, not online activation/admission. */
+	header->target_feature_bitmap = PGRAC_CONTROL_ROOT_FEATURE_KNOWN_MASK_V1
+		& ~PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1;
+	shared->database_state = CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED;
+	shared->database_incarnation = config->identity.database_incarnation;
+	shared->formation_seq = 1;
+	memcpy(shared->configured, config->identity.configured, sizeof(shared->configured));
+	shared->config_generation = shared->control_image_generation = shared->catalog_manifest_generation = 1;
+	memcpy(shared->config_sha256, config->sha256, 32);
+	memcpy(shared->control_image_sha256, common->control_sha256, 32);
+	memcpy(shared->catalog_manifest_sha256, common->catalog_sha256, 32);
+	hash = creation_hash_begin(origins_domain, sizeof(origins_domain));
+	creation_hash_number(hash, shared->configured[0], 8);
+	creation_hash_number(hash, shared->configured[1], 8);
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
+		InitdbOrigin *origin = &origins[node];
+		if (!(shared->configured[node / 64] & (UINT64CONST(1) << (node % 64)))) continue;
+		control_read(origin, node + 1, config->identity.system_identifier, false);
+		if (!cluster_initdb_tree_read(origin->wal.fd, false, &origin->wal_observed)
+			|| !pg_strong_random(ids[node], 16)) refuse("cannot observe original native source");
+		ids[node][6] = (ids[node][6] & 0x0f) | 0x40;
+		ids[node][8] = (ids[node][8] & 0x3f) | 0x80;
+		sources->present[node] = true;
+		sources->records[node] = origin->input.snapshot;
+		sources->refs[node] = origin->input.refs;
+		sources->publisher_node[node] = node;
+		sources->publisher_incarnation[node] = origin->input.publisher_incarnation;
+		shared->global_scn_high_water = Max(shared->global_scn_high_water, origin->checkpoint.checkpoint_scn);
+		creation_hash_number(hash, node, 4);
+		creation_hash_feed(hash, origin->control_sha256, 32);
+		creation_hash_feed(hash, origin->wal_observed.content, 32);
+		creation_hash_feed(hash, origin->input.refs.claim_sha256, 32);
+		creation_hash_feed(hash, origin->input.refs.anchor_sha256, 32);
+	}
+	creation_hash_finish(hash, header->source_wal_state_sha256);
+	if (!cluster_initdb_tree_read(roots[1].fd, false, &data)
+		|| !cluster_initdb_tree_read(roots[3].fd, false, &undo)) refuse("cannot observe original common trees");
+	hash = creation_hash_begin(cohort_domain, sizeof(cohort_domain));
+	creation_hash_number(hash, header->system_identifier, 8);
+	creation_hash_feed(hash, header->storage_uuid, 16);
+	creation_hash_feed(hash, header->authority_uuid, 16);
+	creation_hash_number(hash, shared->database_incarnation, 8);
+	creation_hash_number(hash, shared->configured[0], 8);
+	creation_hash_number(hash, shared->configured[1], 8);
+	creation_hash_number(hash, header->format_version, 2);
+	creation_hash_number(hash, CLUSTER_CONTROL_ROOT_FORMAT_CREATION_FLAGS_V1, 8);
+	creation_hash_number(hash, header->target_feature_bitmap, 8);
+	creation_hash_number(hash, shared->config_generation, 8);
+	creation_hash_feed(hash, shared->config_sha256, 32);
+	creation_hash_number(hash, shared->control_image_generation, 8);
+	creation_hash_feed(hash, shared->control_image_sha256, 32);
+	creation_hash_number(hash, shared->catalog_manifest_generation, 8);
+	creation_hash_feed(hash, shared->catalog_manifest_sha256, 32);
+	creation_hash_number(hash, shared->global_scn_high_water, 8);
+	creation_hash_feed(hash, header->source_wal_state_sha256, 32);
+	creation_hash_feed(hash, data.content, 32);
+	creation_hash_feed(hash, undo.content, 32);
+	creation_hash_finish(hash, header->migration_round_sha256);
+	if (cluster_control_root_v3_initialized_inputs(sources, ids, request->segment_size, root, inputs) != 0)
+		refuse("original cohort cannot encode complete initialized inputs");
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
+		PgracControlBinding binding = {0};
+		if (!root->present[node]) continue;
+		binding.system_identifier = header->system_identifier;
+		binding.database_incarnation = shared->database_incarnation;
+		memcpy(binding.storage_uuid, header->storage_uuid, 16);
+		memcpy(binding.authority_uuid, header->authority_uuid, 16);
+		binding.node_id = node;
+		binding.lineage_kind = PGRAC_CONTROL_LINEAGE_CREATION_V1;
+		binding.migration_prepare_generation = 1;
+		memcpy(binding.migration_round_sha256, header->migration_round_sha256, 32);
+		memcpy(binding.source_wal_state_sha256, header->source_wal_state_sha256, 32);
+		if (!pgrac_control_binding_encode(&binding, bindings[node], PGRAC_CONTROL_BINDING_BYTES))
+			refuse("cannot encode original local binding");
+	}
+	creation_sources_current(request, config, roots, origins, &data, &undo, false);
+	open_original_child(&roots[1], "global", &global);
+	create_child(&global, "wal_startup", &startups);
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
+		InitdbDirectory staging;
+		InitdbStartupObject *object = &objects[node];
+		if (!root->present[node]) continue;
+		snprintf(name, sizeof(name), "thread_%u", node + 1);
+		create_child(&startups, name, &object->directory);
+		create_child(&object->directory, ".staging", &staging);
+		for (unsigned j = 0; j < 32; j++) snprintf(hex + j * 2, 3, "%02x", root->startup[node].sha256[j]);
+		snprintf(object->name, sizeof(object->name), "startup_1-%s.bin", hex);
+		if (!cluster_initdb_object_write_observed(object->directory.fd, object->name, inputs[node],
+			CLUSTER_WAL_STARTUP_BYTES, &object->identity) || fsync(staging.fd) != 0
+			|| fsync(object->directory.fd) != 0 || close(staging.fd) != 0)
+			refuse("cannot persist original startup input");
+	}
+	if (fsync(startups.fd) != 0 || fsync(global.fd) != 0)
+		refuse("cannot persist original startup namespace");
+	creation_sources_current(request, config, roots, origins, &data, &undo, true);
+	creation_derived_current(&global, &startups, objects, root, inputs, NULL);
+	if (!cluster_initdb_object_write_observed(global.fd, "pgrac_control_root.bak", root->bytes,
+		sizeof(root->bytes), &backup))
+		refuse("cannot persist original backup ROOT");
+	creation_sources_current(request, config, roots, origins, &data, &undo, true);
+	creation_derived_current(&global, &startups, objects, root, inputs, &backup);
+	if (!cluster_initdb_object_write_new(global.fd, "pgrac_control_root", root->bytes, sizeof(root->bytes)))
+		refuse("cannot persist original primary ROOT");
+	directory_current(&global);
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++)
+		if (root->present[node] && close(objects[node].directory.fd) != 0)
+			refuse("cannot close original startup directory");
+	if (close(startups.fd) != 0 || close(global.fd) != 0) refuse("cannot close original ROOT directory");
+	request_current(request, config);
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
+		InitdbDirectory local_global;
+		if (!root->present[node]) continue;
+		control_read(&origins[node], node + 1, config->identity.system_identifier, false);
+		open_original_child(&origins[node].data, "global", &local_global);
+		if (!cluster_initdb_object_write_new(local_global.fd, PGRAC_CONTROL_BINDING_NAME,
+			bindings[node], PGRAC_CONTROL_BINDING_BYTES) || close(local_global.fd) != 0)
+			refuse("cannot persist original local binding");
+	}
+	pfree(objects); pfree(bindings); pfree(inputs); pfree(root); pfree(sources);
 }
 
 void
@@ -593,6 +860,7 @@ ClusterInitdbCohortMain(int argc, char **argv)
 	const ClusterSharedConfigRef *ref;
 	InitdbDirectory roots[4];
 	InitdbOrigin *origins;
+	ClusterInitdbCommon common;
 	char initdb[MAXPGPATH], generation[64], name[32];
 	uint64 incarnation;
 	const char *paths[4];
@@ -649,7 +917,7 @@ ClusterInitdbCohortMain(int argc, char **argv)
 	request_current(&request, ref);
 	create_peer_side(&roots[1], origins, ref);
 	create_origin_objects(&roots[1], origins, ref, incarnation);
-	create_common_objects(&roots[1], origins, ref);
+	create_common_objects(&roots[1], origins, ref, &common);
 	create_undo_directories(&roots[1], ref);
 	for (int node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++)
 	{
@@ -666,8 +934,7 @@ ClusterInitdbCohortMain(int argc, char **argv)
 			refuse("cannot persist original cohort directory entries");
 	}
 	request_current(&request, ref);
-	/* No re-entry may adopt these prepared directories. ROOT publication is
-	 * reserved for this still-live owner after the remaining objects exist. */
-	printf("Shared cohort prepared; shared startup authority is not published.\n");
+	create_root_objects(&request, roots, origins, ref, &common, incarnation);
+	printf("Shared cohort created; shared startup remains closed.\n");
 	exit(0);
 }

@@ -28,72 +28,111 @@ origin_hash(const uint8 *bytes, Size length, uint8 hash[32])
 }
 
 static bool
-origin_same(const struct stat *left, const struct stat *right)
+origin_same(const struct stat *a, const struct stat *b)
 {
-	return left->st_dev == right->st_dev && left->st_ino == right->st_ino
-		&& left->st_mode == right->st_mode && left->st_uid == right->st_uid
-		&& left->st_nlink == right->st_nlink && left->st_size == right->st_size;
+	if (a->st_dev != b->st_dev || a->st_ino != b->st_ino || a->st_mode != b->st_mode
+		|| a->st_uid != b->st_uid || a->st_nlink != b->st_nlink || a->st_size != b->st_size)
+		return false;
+#ifdef __APPLE__
+	return a->st_mtimespec.tv_sec == b->st_mtimespec.tv_sec
+		&& a->st_mtimespec.tv_nsec == b->st_mtimespec.tv_nsec
+		&& a->st_ctimespec.tv_sec == b->st_ctimespec.tv_sec
+		&& a->st_ctimespec.tv_nsec == b->st_ctimespec.tv_nsec;
+#else
+	return a->st_mtim.tv_sec == b->st_mtim.tv_sec && a->st_mtim.tv_nsec == b->st_mtim.tv_nsec
+		&& a->st_ctim.tv_sec == b->st_ctim.tv_sec && a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
+#endif
 }
 
-/* No overwrite, rename or cleanup of an unselected partial result. Reopen
- * the name after fsync, compare actual bytes and persist its directory entry. */
-bool
-cluster_initdb_object_write_new(int directory, const char *name, const uint8 *bytes, Size length)
+static bool
+origin_object_arguments(int directory, const char *name, const uint8 *bytes,
+	Size length, struct stat *parent)
 {
-	struct stat parent, current, file, named;
+	return bytes != NULL && name != NULL && name[0] != '\0' && strchr(name, '/') == NULL
+		&& strcmp(name, ".") != 0 && strcmp(name, "..") != 0
+		&& length > 0 && length <= CLUSTER_CONTROL_ROOT_FILE_BYTES
+		&& fstat(directory, parent) == 0 && S_ISDIR(parent->st_mode)
+		&& parent->st_uid == geteuid() && (parent->st_mode & 0022) == 0;
+}
+
+bool
+cluster_initdb_object_recheck(int directory, const char *name, const uint8 *bytes,
+	Size length, const struct stat *expected)
+{
+	struct stat parent, current, named;
 	uint8 readback[PG_CONTROL_FILE_SIZE + 1];
 	Size used = 0;
-	ssize_t n;
 	int fd = -1;
 	bool ok = false;
+	if (expected == NULL || !origin_object_arguments(directory, name, bytes, length, &parent)
+		|| !S_ISREG(expected->st_mode) || expected->st_size != length || expected->st_nlink != 1
+		|| expected->st_uid != geteuid() || (expected->st_mode & 0022) != 0) return false;
+	fd = openat(directory, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0 || fstat(fd, &current) != 0 || !origin_same(expected, &current)) goto done;
+	while (used < length + 1) {
+		ssize_t n = pread(fd, readback, Min(sizeof(readback), length + 1 - used), used);
+		if (n < 0 && errno == EINTR) continue;
+		if (n < 0 || n > length - used) goto done;
+		if (n == 0) break;
+		if (memcmp(readback, bytes + used, n) != 0) goto done;
+		used += n;
+	}
+	if (used != length || fstat(fd, &current) != 0 || !origin_same(expected, &current)
+		|| fstatat(directory, name, &named, AT_SYMLINK_NOFOLLOW) != 0
+		|| !origin_same(expected, &named)) goto done;
+	ok = true;
+done:
+	if (fd >= 0 && close(fd) != 0) ok = false;
+	return ok;
+}
 
-	if (bytes == NULL || name == NULL || name[0] == '\0' || strchr(name, '/') != NULL
-		|| strcmp(name, ".") == 0 || strcmp(name, "..") == 0
-		|| length == 0 || length >= sizeof(readback) || fstat(directory, &parent) != 0
-		|| !S_ISDIR(parent.st_mode) || parent.st_uid != geteuid()
-		|| (parent.st_mode & 0022) != 0)
-		return false;
+/* No overwrite, rename or cleanup of an unselected partial result. */
+static bool
+origin_object_write(int directory, const char *name, const uint8 *bytes, Size length,
+	struct stat *out)
+{
+	struct stat parent, current, file;
+	Size used = 0;
+	int fd = -1;
+	bool ok = false;
+	if (out != NULL) memset(out, 0, sizeof(*out));
+	if (!origin_object_arguments(directory, name, bytes, length, &parent)) return false;
 	fd = openat(directory, name, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
-				pg_file_create_mode);
+		pg_file_create_mode);
 	if (fd < 0) return false;
-	while (used < length)
-	{
-		n = pwrite(fd, bytes + used, length - used, used);
+	while (used < length) {
+		ssize_t n = pwrite(fd, bytes + used, length - used, used);
 		if (n < 0 && errno == EINTR) continue;
 		if (n <= 0) goto done;
 		used += n;
 	}
 	if (fsync(fd) != 0 || fstat(fd, &file) != 0 || !S_ISREG(file.st_mode)
 		|| file.st_uid != geteuid() || file.st_nlink != 1 || (file.st_mode & 0022) != 0
-		|| file.st_size != length)
-		goto done;
-	if (close(fd) != 0) { fd = -1; goto done; }
-	fd = openat(directory, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
-	if (fd < 0 || fstat(fd, &named) != 0 || !origin_same(&file, &named)) goto done;
-	used = 0;
-	while (used < length + 1)
-	{
-		n = pread(fd, readback + used, length + 1 - used, used);
-		if (n < 0 && errno == EINTR) continue;
-		if (n < 0) goto done;
-		if (n == 0) break;
-		used += n;
-	}
-	if (used != length || memcmp(readback, bytes, length) != 0
-		|| fstat(fd, &current) != 0 || !origin_same(&file, &current)
-		|| fstatat(directory, name, &named, AT_SYMLINK_NOFOLLOW) != 0
-		|| !origin_same(&file, &named))
-		goto done;
+		|| file.st_size != length) goto done;
 	if (close(fd) != 0) { fd = -1; goto done; }
 	fd = -1;
-	if (fsync(directory) != 0 || fstat(directory, &current) != 0
+	if (!cluster_initdb_object_recheck(directory, name, bytes, length, &file)
+		|| fsync(directory) != 0 || fstat(directory, &current) != 0
 		|| parent.st_dev != current.st_dev || parent.st_ino != current.st_ino
-		|| parent.st_uid != current.st_uid || parent.st_mode != current.st_mode)
-		goto done;
+		|| parent.st_uid != current.st_uid || parent.st_mode != current.st_mode) goto done;
+	if (out != NULL) *out = file;
 	ok = true;
 done:
 	if (fd >= 0 && close(fd) != 0) ok = false;
 	return ok;
+}
+
+bool
+cluster_initdb_object_write_new(int directory, const char *name, const uint8 *bytes, Size length)
+{
+	return origin_object_write(directory, name, bytes, length, NULL);
+}
+
+bool
+cluster_initdb_object_write_observed(int directory, const char *name, const uint8 *bytes,
+	Size length, struct stat *out)
+{
+	return out != NULL && origin_object_write(directory, name, bytes, length, out);
 }
 
 bool

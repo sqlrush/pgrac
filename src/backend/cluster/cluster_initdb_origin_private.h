@@ -3,6 +3,7 @@
 #ifndef CLUSTER_INITDB_ORIGIN_PRIVATE_H
 #define CLUSTER_INITDB_ORIGIN_PRIVATE_H
 
+#include <sys/stat.h>
 #include "cluster/cluster_shared_config.h"
 #include "cluster_control_root_private.h"
 
@@ -18,5 +19,12 @@ extern bool cluster_initdb_origin_create(const ClusterSharedConfigRef *config,
 /* Bounded original-object I/O, not creation ownership or selection proof. */
 extern bool cluster_initdb_object_write_new(int directory, const char *name,
 	const uint8 *bytes, Size length);
+
+/* Original owner retains this volatile file identity for a final, read-only
+ * check of its own published objects. It is never admission or adoption. */
+extern bool cluster_initdb_object_write_observed(int directory, const char *name,
+	const uint8 *bytes, Size length, struct stat *out);
+extern bool cluster_initdb_object_recheck(int directory, const char *name,
+	const uint8 *bytes, Size length, const struct stat *expected);
 
 #endif

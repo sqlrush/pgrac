@@ -71,6 +71,75 @@ cancel_owns_and_reaps_the_native_group(void)
 	UT_ASSERT(close(pipefd[0]) == 0);
 }
 
+static void derived_inputs_must_survive_until_primary_publication(void)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		char temp[] = "/tmp/pgrac-derived-XXXXXX", path[MAXPGPATH];
+		char *canonical;
+		InitdbDirectory base, global, startups;
+		InitdbStartupObject *objects = calloc(128, sizeof(*objects));
+		ControlRootImage *root = calloc(1, sizeof(*root));
+		uint8 (*inputs)[CLUSTER_WAL_STARTUP_BYTES] = calloc(128, CLUSTER_WAL_STARTUP_BYTES);
+		struct stat backup;
+		int fd;
+		UT_ASSERT(mkdtemp(temp) != NULL);
+		canonical = realpath(temp, NULL);
+		UT_ASSERT(canonical != NULL && objects != NULL && root != NULL && inputs != NULL);
+		snprintf(path, sizeof(path), "%s/new", canonical);
+		preflight_directory(path, &base); create_directory(&base);
+		create_child(&base, "global", &global); create_child(&global, "wal_startup", &startups);
+		create_child(&startups, "thread_1", &objects[0].directory);
+		root->present[0] = true;
+		memset(inputs[0], 0x6a, CLUSTER_WAL_STARTUP_BYTES);
+		strlcpy(objects[0].name, "input", sizeof(objects[0].name));
+		fd = openat(objects[0].directory.fd, "input", O_WRONLY | O_CREAT | O_EXCL, 0600);
+		UT_ASSERT(fd >= 0 && write(fd, inputs[0], CLUSTER_WAL_STARTUP_BYTES) == CLUSTER_WAL_STARTUP_BYTES);
+		UT_ASSERT(fsync(fd) == 0 && fstat(fd, &objects[0].identity) == 0 && close(fd) == 0);
+		fd = openat(global.fd, "pgrac_control_root.bak", O_WRONLY | O_CREAT | O_EXCL, 0600);
+		UT_ASSERT(fd >= 0 && write(fd, root->bytes, sizeof(root->bytes)) == sizeof(root->bytes));
+		UT_ASSERT(fsync(fd) == 0 && fstat(fd, &backup) == 0 && close(fd) == 0);
+		creation_derived_current(&global, &startups, objects, root, inputs, &backup);
+		if (fault == 0 || fault == 1 || fault == 4) {
+			fd = openat(fault == 4 ? global.fd : objects[0].directory.fd,
+				fault == 4 ? "pgrac_control_root.bak" : "input", O_WRONLY);
+			UT_ASSERT(fd >= 0);
+			if (fault == 1) UT_ASSERT(ftruncate(fd, 31) == 0);
+			else UT_ASSERT(pwrite(fd, "X", 1, 17) == 1);
+			UT_ASSERT(close(fd) == 0);
+		} else if (fault == 3) {
+			UT_ASSERT(renameat(startups.fd, "thread_1", startups.fd, "old") == 0);
+			UT_ASSERT(mkdirat(startups.fd, "thread_1", 0700) == 0);
+		} else {
+			int dir = fault == 2 ? objects[0].directory.fd : global.fd;
+			const char *name = fault == 2 ? "input" : "pgrac_control_root.bak";
+			const uint8 *bytes = fault == 2 ? inputs[0] : root->bytes;
+			Size length = fault == 2 ? CLUSTER_WAL_STARTUP_BYTES : sizeof(root->bytes);
+			UT_ASSERT(renameat(dir, name, dir, "old") == 0);
+			fd = openat(dir, name, O_WRONLY | O_CREAT | O_EXCL, 0600);
+			UT_ASSERT(fd >= 0 && write(fd, bytes, length) == length && close(fd) == 0);
+		}
+		expecting = true;
+		if (setjmp(refused) == 0) {
+			creation_derived_current(&global, &startups, objects, root, inputs, &backup);
+			UT_ASSERT(false);
+		}
+		expecting = false;
+		UT_ASSERT(faccessat(global.fd, "pgrac_control_root", F_OK, 0) < 0 && errno == ENOENT);
+		UT_ASSERT(unlinkat(objects[0].directory.fd, "input", 0) == 0);
+		if (fault == 2) UT_ASSERT(unlinkat(objects[0].directory.fd, "old", 0) == 0);
+		UT_ASSERT(close(objects[0].directory.fd) == 0);
+		UT_ASSERT(unlinkat(startups.fd, "thread_1", AT_REMOVEDIR) == 0);
+		if (fault == 3) UT_ASSERT(unlinkat(startups.fd, "old", AT_REMOVEDIR) == 0);
+		UT_ASSERT(close(startups.fd) == 0 && unlinkat(global.fd, "wal_startup", AT_REMOVEDIR) == 0);
+		UT_ASSERT(unlinkat(global.fd, "pgrac_control_root.bak", 0) == 0);
+		if (fault == 5) UT_ASSERT(unlinkat(global.fd, "old", 0) == 0);
+		UT_ASSERT(close(global.fd) == 0 && unlinkat(base.fd, "global", AT_REMOVEDIR) == 0);
+		UT_ASSERT(close(base.fd) == 0 && unlinkat(base.parent, base.name, AT_REMOVEDIR) == 0);
+		UT_ASSERT(close(base.parent) == 0 && rmdir(canonical) == 0);
+		free(canonical); free(inputs); free(root); free(objects);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -108,7 +177,8 @@ main(int argc, char **argv)
 		for (;;) pause();
 	}
 	strlcpy(executable, argv[0], sizeof(executable));
-	UT_PLAN(3);
+	UT_PLAN(4);
+	UT_RUN(derived_inputs_must_survive_until_primary_publication);
 	UT_RUN(completed);
 	UT_RUN(unsuccessful);
 	UT_RUN(cancel_owns_and_reaps_the_native_group);
