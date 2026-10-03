@@ -101,7 +101,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_shared_catalog \
         test_cluster_oid_lease \
         test_cluster_xid_authority \
-        test_cluster_relmap_authority \
+        test_cluster_relmap_authority test_cluster_relmap_init \
         test_cluster_hw \
         test_cluster_hw_remaster_retry \
         test_cluster_dl \
@@ -470,6 +470,15 @@ SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_service_observe,$(SIMPLE_TESTS))
 # PGRAC: shared frontend/backend binding codec uses its real common library.
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_init,$(SIMPLE_TESTS))
+
+# Fresh image constructor must link as a frontend, without backend services.
+test_cluster_relmap_init: test_cluster_relmap_init.c unit_test.h \
+		$(top_srcdir)/src/include/common/relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a -o $@
 
 # PGRAC: execute original entry-point prologues before any native mutation.
 TESTS += test_cluster_fresh_scope
@@ -3315,10 +3324,16 @@ test_cluster_xid_authority: test_cluster_xid_authority.c unit_test.h \
 # stubbed locally; CRC32C from libpgport.  The write-path activation (relmapper
 # hook, publish-then-invalidate, crash arbitration) is exercised by TAP.
 CLUSTER_RELMAP_AUTHORITY_O = $(top_builddir)/src/backend/cluster/cluster_relmap_authority.o
+test_cluster_relmap_consumer.inc: $(top_srcdir)/src/backend/utils/cache/relmapper.c Makefile
+	awk '/^cluster_read_relmap_from_authority\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_relmap_authority: test_cluster_relmap_authority.c unit_test.h \
-		$(CLUSTER_RELMAP_AUTHORITY_O)
+		test_cluster_relmap_consumer.inc $(CLUSTER_RELMAP_AUTHORITY_O) \
+		$(top_srcdir)/src/include/common/relmap.h $(top_builddir)/src/common/libpgcommon_srv.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_RELMAP_AUTHORITY_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # spec-5.6 Da2: test_cluster_cf_storage links cluster_cf_storage.o (migration

@@ -96,6 +96,47 @@ typedef struct ClusterRelmapAuthorityHeader {
 	pg_crc32c crc; /* CRC of the header (not the images)   */
 } ClusterRelmapAuthorityHeader;
 
+/* Fixed slot widths are independent of the inner image_size. */
+#define CLUSTER_RELMAP_AUTHORITY_FILE_SIZE \
+	((int)(sizeof(ClusterRelmapAuthorityHeader) + 2 * CLUSTER_RELMAP_IMAGE_MAX))
+#define CLUSTER_RELMAP_COMMITTED_OFFSET ((int)sizeof(ClusterRelmapAuthorityHeader))
+#define CLUSTER_RELMAP_PENDING_OFFSET \
+	(CLUSTER_RELMAP_COMMITTED_OFFSET + CLUSTER_RELMAP_IMAGE_MAX)
+
+typedef enum ClusterRelmapInitResult
+{
+	CLUSTER_RELMAP_INIT_OK = 0,
+	CLUSTER_RELMAP_INIT_INVALID_ARGUMENT,
+	CLUSTER_RELMAP_INIT_INVALID_LENGTH,
+	CLUSTER_RELMAP_INIT_INVALID_MAGIC,
+	CLUSTER_RELMAP_INIT_INVALID_CRC,
+	CLUSTER_RELMAP_INIT_INVALID_COUNT,
+	CLUSTER_RELMAP_INIT_INVALID_ENTRY,
+	CLUSTER_RELMAP_INIT_DUPLICATE,
+	CLUSTER_RELMAP_INIT_NAMESPACE_MISMATCH,
+	CLUSTER_RELMAP_INIT_OUTPUT_NOT_EMPTY
+} ClusterRelmapInitResult;
+
+/*
+ * Pure frontend/backend fresh-init helper; no I/O or allocation.  Validates
+ * exactly one native initdb map and builds the existing authority layout at
+ * committed generation 1 with no pending owner.  Accepts only the original
+ * bootstrap catalog set and original file numbers, not rewritten maps.
+ *
+ * shared_map requires dbid == InvalidOid; a local map requires a valid dbid.
+ * Native maps do not encode dbid or freshness: the original creating process
+ * must bind the input to its fresh directory and create the output file with
+ * O_EXCL, fsync/read it back, and publish startup authority last.  This helper
+ * cannot authenticate a directory or adopt an existing database.
+ *
+ * output_len must equal CLUSTER_RELMAP_AUTHORITY_FILE_SIZE and every output
+ * byte must initially be zero.  Failure leaves output entirely unchanged.
+ * Input and output may be unaligned.  No fallback, repair or partial image.
+ */
+extern ClusterRelmapInitResult cluster_relmap_authority_init_image(bool shared_map, Oid dbid,
+																 const void *native_map, size_t native_len,
+																 void *output, size_t output_len);
+
 /*
  * ClusterRelmapOwner -- the pending owner identity a writer stamps.
  */
