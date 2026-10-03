@@ -1515,9 +1515,10 @@ cluster_formation_classification_revalidate_nowait(uint16 origin_thread,
 	if (now_us == 0)
 		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
 	cache_result = cluster_write_fence_revalidate_cached_nowait(&authority->marker, now_us);
+	if (cache_result == CLUSTER_FENCE_CACHE_EXPIRED)
+		return CLUSTER_FORMATION_WITNESS_CACHE_EXPIRED;
 	return cache_result == CLUSTER_FENCE_CACHE_MATCH ? CLUSTER_FORMATION_WITNESS_READY
-		   : (cache_result == CLUSTER_FENCE_CACHE_STALE
-			  || cache_result == CLUSTER_FENCE_CACHE_EXPIRED)
+		   : cache_result == CLUSTER_FENCE_CACHE_STALE
 			   ? CLUSTER_FORMATION_WITNESS_UNSTABLE
 			   : CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
 }

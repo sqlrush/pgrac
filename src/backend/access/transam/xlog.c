@@ -6130,12 +6130,27 @@ CheckRequiredParameterValues(void)
 static void
 ClusterStartupConfigurationRequire(void)
 {
+	ClusterFormationWitnessResult last_proof = CLUSTER_FORMATION_WITNESS_READY;
+
 	for (;;) {
 		ClusterConfigMountResult result;
+		ClusterFormationWitnessResult proof;
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		ResetLatch(MyLatch);
-		result = cluster_config_members_mount_status();
+		/* The finite phase-3 witness may expire before configuration or native
+		 * writer installation finishes. Renew it here under the actual startup
+		 * owner, outside CF/WAL critical sections; LMON performs no disk read. */
+		proof = cluster_authority_startup_refresh_recovery(100);
+		if (proof != last_proof) {
+			ereport(LOG, (errmsg("native startup control proof changed"),
+						 errdetail("PGRAC_FAMILY=STARTUP_CONTROL operation=config_mount "
+								   "witness_result=%d readiness=%d", (int)proof,
+								   (int)cluster_authority_readiness_get())));
+			last_proof = proof;
+		}
+		result = proof == CLUSTER_FORMATION_WITNESS_READY
+					 ? cluster_config_members_mount_status() : CLUSTER_CONFIG_MOUNT_UNPROVEN;
 		if (result == CLUSTER_CONFIG_MOUNT_MATCH)
 			return;
 		if (result == CLUSTER_CONFIG_MOUNT_MISMATCH)

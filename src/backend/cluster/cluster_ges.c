@@ -193,7 +193,9 @@ ges_readiness_allows_early_opcode(uint32 opcode)
 		return allowed;
 	}
 	return opcode == GES_REQ_OPCODE_REQUEST || opcode == GES_REQ_OPCODE_RELEASE
-		   || opcode == GES_REQ_OPCODE_REDECLARE;
+		   || opcode == GES_REQ_OPCODE_REDECLARE
+		   /* Decode only; the exact sealed WALR-S gate below owns admission. */
+		   || (cluster_shared_config && opcode == GES_REQ_OPCODE_REQUEST_NOWAIT);
 }
 
 /* PGRAC: a current PRE2 failure survivor reconstructs all existing registered
@@ -235,7 +237,9 @@ ges_readiness_allows_protocol_request(uint32 opcode, const ClusterResId *resid, 
 		return cluster_recovery_transport_is_current();
 	if (!cluster_recovery_authority_is_current())
 		return false;
-	if (opcode == GES_REQ_OPCODE_REQUEST)
+	if (opcode == GES_REQ_OPCODE_REQUEST
+		|| (cluster_shared_config && opcode == GES_REQ_OPCODE_REQUEST_NOWAIT
+			&& resid != NULL && resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE && mode == ShareLock))
 		return cluster_recovery_authority_resid_mode_allowed(resid, mode);
 	if (opcode == GES_REQ_OPCODE_RELEASE)
 		return ges_recovery_release_resid_allowed(resid);
@@ -283,7 +287,9 @@ ges_readiness_allows_grant(const ClusterGrdGrantIdentity *grant, const ClusterRe
 	if (grant->request_opcode == GES_REQ_OPCODE_REQUEST
 		&& cluster_grd_control_recovery_ready(resid, grant->mode))
 		return cluster_recovery_transport_is_current();
-	return grant->request_opcode == GES_REQ_OPCODE_REQUEST
+	return (grant->request_opcode == GES_REQ_OPCODE_REQUEST
+			|| (cluster_shared_config && grant->request_opcode == GES_REQ_OPCODE_REQUEST_NOWAIT
+				&& resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE && grant->mode == ShareLock))
 		   && cluster_recovery_authority_is_current()
 		   && cluster_recovery_authority_resid_mode_allowed(resid, grant->mode);
 }
@@ -302,7 +308,9 @@ ges_readiness_allows_local_origin(uint32 opcode, const ClusterResId *resid, LOCK
 		return false;
 	if (opcode == GES_REQ_OPCODE_REDECLARE)
 		return ges_readiness_allows_redeclare(resid, mode);
-	if (opcode != GES_REQ_OPCODE_REQUEST)
+	if (opcode != GES_REQ_OPCODE_REQUEST
+		&& !(cluster_shared_config && opcode == GES_REQ_OPCODE_REQUEST_NOWAIT && resid != NULL
+			 && resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE && mode == ShareLock))
 		return false;
 	return cluster_recovery_authority_request_allowed(resid, mode, AmStartupProcess());
 }

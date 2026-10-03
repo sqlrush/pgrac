@@ -232,13 +232,19 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 	abort();
 }
 
+static bool classification_available;
+static ClusterFormationSnapshotV1 classification_snapshot;
+static ClusterFenceAuthorityCacheResult classification_cache = CLUSTER_FENCE_CACHE_INVALID;
+
 bool
 cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
 											   ClusterFormationSnapshotV1 *out)
 {
 	(void)origin_thread;
-	(void)out;
-	return false;
+	if (!classification_available)
+		return false;
+	*out = classification_snapshot;
+	return true;
 }
 
 ClusterFenceAuthorityReadResult
@@ -270,7 +276,7 @@ cluster_write_fence_revalidate_cached_nowait(const ClusterFenceMarker *expected,
 {
 	(void)expected;
 	(void)now_us;
-	return CLUSTER_FENCE_CACHE_INVALID;
+	return classification_cache;
 }
 
 /* RF-ROOT P6 (L4 admission / phase-3 gate diag refs): cluster_recovery_duty.o
@@ -1329,10 +1335,36 @@ UT_TEST(test_formation_pending_owner_and_full_outage_fail_closed)
 				 CLUSTER_FORMATION_WITNESS_FULL_OUTAGE_UNRECOVERED);
 }
 
+UT_TEST(test_classification_expiry_is_distinct_from_identity_drift)
+{
+	ClusterFormationSnapshotV1 expected;
+	ClusterFenceAuthorityProof proof;
+
+	build_valid_formation(&expected, &proof, 4);
+	classification_snapshot = expected;
+	classification_available = true;
+	classification_cache = CLUSTER_FENCE_CACHE_EXPIRED;
+	UT_ASSERT_EQ(cluster_formation_classification_revalidate_nowait(4, &proof, &expected),
+				 CLUSTER_FORMATION_WITNESS_CACHE_EXPIRED);
+	classification_snapshot.local_epoch++;
+	UT_ASSERT_EQ(cluster_formation_classification_revalidate_nowait(4, &proof, &expected),
+				 CLUSTER_FORMATION_WITNESS_UNSTABLE);
+	classification_snapshot = expected;
+	classification_cache = CLUSTER_FENCE_CACHE_STALE;
+	UT_ASSERT_EQ(cluster_formation_classification_revalidate_nowait(4, &proof, &expected),
+				 CLUSTER_FORMATION_WITNESS_UNSTABLE);
+	classification_cache = CLUSTER_FENCE_CACHE_MATCH;
+	UT_ASSERT_EQ(cluster_formation_classification_revalidate_nowait(4, &proof, &expected),
+				 CLUSTER_FORMATION_WITNESS_READY);
+	classification_available = false;
+	classification_cache = CLUSTER_FENCE_CACHE_INVALID;
+}
+
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(28);
+	UT_RUN(test_classification_expiry_is_distinct_from_identity_drift);
 	UT_RUN(test_exact_74_byte_encoding);
 	UT_RUN(test_domain_separated_digest);
 	UT_RUN(test_v2_claim_key_keeps_encoding_and_legacy_refusal);

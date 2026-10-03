@@ -57,7 +57,9 @@ typedef enum ClusterFormationWitnessResult {
 	CLUSTER_FORMATION_WITNESS_FULL_OUTAGE_UNRECOVERED = 6,
 	CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE = 7,
 	CLUSTER_FORMATION_WITNESS_IO_FAILED = 8,
-	CLUSTER_FORMATION_WITNESS_CORRUPT = 9
+	CLUSTER_FORMATION_WITNESS_CORRUPT = 9,
+	/* No permission. The immutable identity may be retained for a fresh read. */
+	CLUSTER_FORMATION_WITNESS_CACHE_EXPIRED = 10
 } ClusterFormationWitnessResult;
 
 /* Process-local last builder sample only. It grants no formation, membership,

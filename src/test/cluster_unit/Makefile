@@ -4068,11 +4068,22 @@ test_cluster_config_s1_native.inc: $(top_srcdir)/src/backend/cluster/cluster_loc
 	mv $@.tmp $@
 
 test_cluster_config_ges_native.inc: $(top_srcdir)/src/backend/cluster/cluster_ges.c Makefile
-	awk '/^ges_(recovery_release_resid_allowed|readiness_allows_(redeclare|protocol_request|grant|local_origin|local_release_origin))\(/ { print "static bool"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 6) exit 1 }' $< > $@.tmp
+	awk '/^ges_(recovery_release_resid_allowed|readiness_allows_(early_opcode|redeclare|protocol_request|grant|local_origin|local_release_origin))\(/ { print "static bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 7) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_startup_phase: test_cluster_startup_phase.c unit_test.h test_cluster_config_s1_native.inc test_cluster_config_ges_native.inc \
+test_cluster_startup_walr_native.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_retention.c Makefile
+	awk '/^cluster_wal_retention_resid_encode\(/ { print "bool"; emit=1; count++ } \
+	     /^walr_share_request_init\(/ { print "static bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_startup_snapshot_native.inc: $(top_srcdir)/src/backend/cluster/cluster_recovery_duty.c Makefile
+	awk '/^cluster_formation_snapshot_matches_v1\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_startup_phase: test_cluster_startup_phase.c unit_test.h test_cluster_config_s1_native.inc test_cluster_config_ges_native.inc test_cluster_startup_walr_native.inc test_cluster_startup_snapshot_native.inc \
 		$(CLUSTER_VERSION_O) $(CLUSTER_STARTUP_PHASE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		-DSTARTUP_PHASE_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_startup_phase.c"' \

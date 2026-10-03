@@ -2690,8 +2690,13 @@ read_token_equal(const ClusterControlRootReadToken *left, const ClusterControlRo
 static bool
 acquire_clusterwide_cf(LOCKMODE mode)
 {
-	if (!cluster_cf_lock(mode))
+	if (!cluster_cf_lock(mode)) {
+		if (MyBackendType == B_STARTUP)
+			ereport(LOG, (errmsg("native startup could not acquire the control-file lock"),
+						 errdetail("PGRAC_FAMILY=STARTUP_CONTROL operation=root_cf_acquire mode=%d",
+								   (int)mode)));
 		return false;
+	}
 	if (!cluster_cf_held_is_clusterwide(mode)) {
 		(void)cluster_cf_unlock_confirmed(mode);
 		return false;
@@ -5694,13 +5699,19 @@ startup_initialized_publish(ReserveCleanWork *work)
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
 	for (unsigned node = 0; node < CLUSTER_MAX_NODES; node++) {
 		ClusterWalStartupImage *op = &work->operations[node];
+		ClusterWalPinResult pin_result;
 		uint8 claim[CLUSTER_WAL_CLAIM_V2_BYTES];
 		uint64 mask = wal_segment_size - 1;
 		if (!work->base.present[node]) continue;
 		make_read_token(&work->base, node + 1, CONTROL_ROOT_SOURCE_PRIMARY, &scan->thread_token);
-		if (cluster_wal_retention_root_publish_begin_exact(&scan->thread_token, false, &scan->walr)
-			!= CLUSTER_WAL_PIN_OK)
+		pin_result = cluster_wal_retention_root_publish_begin_exact(&scan->thread_token, false,
+																		 &scan->walr);
+		if (pin_result != CLUSTER_WAL_PIN_OK) {
+			ereport(LOG, (errmsg("native initialization could not protect its original WAL input"),
+						 errdetail("PGRAC_FAMILY=STARTUP_CONTROL operation=initialized_input_walr "
+								   "thread=%u pin_result=%d", node + 1, (int)pin_result)));
 			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		}
 		if (!acquire_clusterwide_cf(ShareLock))
 			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 		scan->cf_mode = ShareLock;

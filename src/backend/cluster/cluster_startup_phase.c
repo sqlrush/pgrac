@@ -406,8 +406,10 @@ cluster_serving_generation_current(const ClusterAuthorityBindingLocal *binding)
 static bool
 cluster_authority_binding_components_current_internal(const ClusterAuthorityBindingLocal *binding,
 													  bool serving, bool require_seal,
-													  bool require_member)
+													  bool require_member, bool refresh_identity_only)
 {
+	ClusterFormationWitnessResult formation_result;
+
 	if (binding == NULL || binding->boot_incarnation == 0 || binding->lms_generation == 0
 		|| cluster_cssd_get_status() != CLUSTER_CSSD_READY
 		|| cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY || !cluster_qvotec_in_quorum()
@@ -416,22 +418,23 @@ cluster_authority_binding_components_current_internal(const ClusterAuthorityBind
 			   != binding->boot_incarnation
 		|| cluster_lms_get_lms_restart_generation() != binding->lms_generation
 		|| (require_member && !cluster_membership_is_member(cluster_node_id))
-		|| (serving ? !cluster_serving_formation_current(binding)
-					: cluster_formation_classification_revalidate_nowait(
-						  binding->origin_thread, &binding->authority, &binding->formation)
-						  != CLUSTER_FORMATION_WITNESS_READY)
 		|| (require_seal
 			&& !cluster_grd_recovery_authority_is_current(binding->boot_incarnation,
 														  binding->lms_generation)))
 		return false;
-	return true;
+	if (serving)
+		return cluster_serving_formation_current(binding);
+	formation_result = cluster_formation_classification_revalidate_nowait(
+		binding->origin_thread, &binding->authority, &binding->formation);
+	return formation_result == CLUSTER_FORMATION_WITNESS_READY
+		   || (refresh_identity_only && formation_result == CLUSTER_FORMATION_WITNESS_CACHE_EXPIRED);
 }
 
 static bool
 cluster_authority_binding_components_current(const ClusterAuthorityBindingLocal *binding,
 											 bool serving)
 {
-	return cluster_authority_binding_components_current_internal(binding, serving, true, true);
+	return cluster_authority_binding_components_current_internal(binding, serving, true, true, false);
 }
 
 static bool
@@ -772,10 +775,60 @@ cluster_recovery_authority_is_current(void)
 		 * stranded phase 4 with an OFF binding that nothing re-binds
 		 * (begin() is phase-3 gated), guaranteeing the phase4
 		 * serving-publication timeout. */
-		if (!cluster_authority_binding_components_current(&binding, false))
+		/* Expiry grants nothing, but is not loss of the immutable generation.
+		 * Preserve only that identity so the original startup owner can obtain
+		 * a new exact witness. Real component/formation drift still clears it. */
+		if (!cluster_authority_binding_components_current_internal(&binding, false, true, true, true))
 			cluster_authority_clear_matching(&binding, "recovery_authority_stale");
 	}
 	return current;
+}
+
+ClusterFormationWitnessResult
+cluster_authority_startup_refresh_recovery(int timeout_ms)
+{
+	ClusterAuthorityBindingLocal binding;
+	ClusterFormationWitnessV1 *witness = NULL;
+	ClusterFenceAuthorityProof authority;
+	ClusterFormationSnapshotV1 formation;
+	ClusterFormationWitnessResult result;
+	uint16 origin = 0;
+
+	if (!cluster_shared_config || !IsUnderPostmaster || MyBackendType != B_STARTUP
+		|| !AmStartupProcess() || MyProc == NULL || CritSectionCount != 0
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| cluster_current_phase() != CLUSTER_PHASE_3_RECOVERY || timeout_ms < 1
+		|| !cluster_authority_binding_copy(&binding)
+		|| binding.state != CLUSTER_AUTHORITY_RECOVERY_READY)
+		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+	if (cluster_recovery_authority_is_current())
+		return CLUSTER_FORMATION_WITNESS_READY;
+	if (!cluster_authority_binding_components_current_internal(&binding, false, true, true, true)
+		|| !cluster_lms_is_recovery_ready())
+		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+
+	/* No phase/CF lock spans this real majority read. It renews evidence for
+	 * this same boot, never creates formation or swaps a stale binding. */
+	result = cluster_formation_witness_build_recovery_control_wait(binding.origin_thread,
+																	 timeout_ms, &witness);
+	if (result == CLUSTER_FORMATION_WITNESS_READY) {
+		if (!cluster_formation_witness_copy_classification_v1(witness, &origin, &authority, &formation))
+			result = CLUSTER_FORMATION_WITNESS_CORRUPT;
+		else if (origin != binding.origin_thread
+				 || authority.agree_disk_count != binding.authority.agree_disk_count
+				 || authority.total_disk_count != binding.authority.total_disk_count
+				 || !cluster_fence_marker_semantic_equal(&authority.marker, &binding.authority.marker)
+				 /* Both operands are copied RECOVERY_CONTROL classifications.
+				  * The live-snapshot matcher deliberately rejects that shape. */
+				 || memcmp(&binding.formation, &formation, sizeof(formation)) != 0)
+			result = CLUSTER_FORMATION_WITNESS_UNSTABLE;
+		if (result != CLUSTER_FORMATION_WITNESS_READY)
+			cluster_authority_clear_matching(&binding, "startup_refresh_changed");
+	}
+	cluster_formation_witness_destroy(&witness);
+	if (result == CLUSTER_FORMATION_WITNESS_READY && !cluster_recovery_authority_is_current())
+		result = CLUSTER_FORMATION_WITNESS_UNSTABLE;
+	return result;
 }
 
 /* PGRAC: static configuration comparison is an input to SERVING. The exact
@@ -1012,7 +1065,8 @@ cluster_recovery_authority_resid_mode_allowed(const ClusterResId *resid, LOCKMOD
 			   && resid->field1 == 0 && resid->field2 == 0 && resid->field3 == 0
 			   && resid->field4 == 0 && resid->lockmethodid == DEFAULT_LOCKMETHOD;
 	if (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE)
-		return mode == ExclusiveLock && resid->field1 > 0
+		return (mode == ExclusiveLock || (cluster_shared_config && mode == ShareLock))
+			   && resid->field1 > 0
 			   && resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS && resid->field2 == 0
 			   && resid->field3 == 0 && resid->field4 == 0
 			   && resid->lockmethodid == DEFAULT_LOCKMETHOD;
@@ -1028,6 +1082,16 @@ cluster_recovery_authority_request_allowed(const ClusterResId *resid, LOCKMODE m
 	 * failure barrier, only CF-S/WALR-X/IR-X gain recovery transport access. */
 	if (!cluster_grd_control_acquire_allowed(resid, mode))
 		return false;
+	/* The original initializer reads its selected input under WALR-S. Unlike
+	 * the old WALR-X recovery surface, this new acquisition requires the real
+	 * startup backend and the completed control seal, not just components. */
+	if (resid != NULL && resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE && mode == ShareLock)
+		return cluster_shared_config && startup_process && IsUnderPostmaster
+			   && MyBackendType == B_STARTUP && MyProc != NULL
+			   && !cluster_hw_remaster_worker_active()
+			   && cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
+			   && cluster_recovery_authority_resid_mode_allowed(resid, mode)
+			   && cluster_recovery_authority_is_current();
 	/* PGRAC: the successor initializer publishes under real CF-X before
 	 * ordinary service. Components-only transport is insufficient for a new
 	 * exclusive holder, and the HW worker must retain its CF-S-only surface.
@@ -1567,7 +1631,8 @@ cluster_phase3_report_formation(ClusterFormationWitnessResult result)
 								   "FULL_OUTAGE_UNRECOVERED",
 								   "CAPABILITY_UNAVAILABLE",
 								   "IO_FAILED",
-								   "CORRUPT" };
+								   "CORRUPT",
+								   "CACHE_EXPIRED" };
 
 	if (!cluster_formation_witness_last_diagnostic_v1(&sample))
 		sample.predicate = "not_sampled";
