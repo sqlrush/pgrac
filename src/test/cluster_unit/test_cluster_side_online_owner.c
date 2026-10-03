@@ -5,6 +5,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_side_online_owner.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_smgr.h"
@@ -61,6 +62,19 @@ static const ClusterRecoveryDutyKey canonical_duty = { .origin_thread_id = 3 };
 static ClusterThreadRecoveryAuthorityV1 canonical_authority = { .duty = &canonical_duty };
 static ClusterUndoRecoveryScopeV1 *active_scope;
 static PGAlignedBlock canonical_header;
+
+bool
+cluster_undo_recovery_origin_authorized_v1(int origin_node pg_attribute_unused())
+{
+	UT_ASSERT(false); /* Native-control integration is in test_cluster_side_xact. */
+	return false;
+}
+
+void
+cluster_scn_recovery_replay_observe(SCN scn pg_attribute_unused())
+{
+	UT_ASSERT(false);
+}
 
 RfPageProofDetailV1
 rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan,

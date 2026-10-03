@@ -808,6 +808,7 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 			if (!side_native_control_valid(record_plan->source_record, identity))
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 			candidate->kind = RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;
+			candidate->control_scn = XLogRecGetScn(record_plan->source_record);
 			candidate->owned_payload_length = XLogRecGetDataLen(record_plan->source_record);
 			*payload = (const uint8 *)XLogRecGetData(record_plan->source_record);
 		} else if (record_plan->route.rmid == RM_XACT_ID
@@ -1653,11 +1654,37 @@ rf_side_online_plan_contribution_owners_v1(const RfSideOnlinePlanV1 *plan, uint3
 	return true;
 }
 
+static bool
+side_space_input_contribution(const ClusterSpaceRecoveryInput *input, RfSideSpaceContributionV1 *out)
+{
+	RfSideSpaceContributionV1 contribution = { 0 };
+	if (input->length == CLUSTER_SPACE_RESERVATION_WAL_BYTES) {
+		ClusterSpaceReservationChange change;
+
+		if (!cluster_space_reservation_wal_decode(input->data, input->length, &change)
+			|| change.action != CLUSTER_SPACE_RESERVATION_ADVANCE)
+			return false;
+		contribution.result = change.result.identity;
+		contribution.result_token[1] = change.result_token;
+		contribution.page_mask = 2;
+	} else {
+		ClusterSpaceStructureChange change;
+
+		if (!cluster_space_structure_wal_decode(input->data, input->length, &change))
+			return false;
+		contribution.result = change.identity.result;
+		contribution.result_token[0] = change.identity.result_token;
+		contribution.result_token[1] = change.reservation.result_token;
+		contribution.page_mask = 3;
+	}
+	*out = contribution;
+	return true;
+}
+
 bool
 rf_side_online_plan_space_contribution_v1(const RfSideOnlinePlanV1 *plan, uint32 operation,
 										  uint32 locator_index, RfSideSpaceContributionV1 *out)
 {
-	RfSideSpaceContributionV1 contribution = { 0 };
 	ClusterSpaceIdentityKey key;
 	ClusterSpaceRecoveryInput input;
 	uint32 count = rf_side_online_plan_space_contribution_count_v1(plan, operation);
@@ -1668,27 +1695,176 @@ rf_side_online_plan_space_contribution_v1(const RfSideOnlinePlanV1 *plan, uint32
 									   &input)
 		|| key.database_incarnation != plan->database_incarnation)
 		return false;
-	if (input.length == CLUSTER_SPACE_RESERVATION_WAL_BYTES) {
+	return side_space_input_contribution(&input, out);
+}
+
+static bool
+side_space_ancestry(const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKey *key,
+					BlockNumber block, uint32 ancestor_operation, uint32 completed_operation,
+					bool *terminal, RfSideSpaceTerminalV1 *selected)
+{
+	ClusterSpaceRecoveryInput *inputs = NULL;
+	uint32 *operations = NULL, *order = NULL;
+	RfSideSpaceContributionV1 ancestor = { 0 }, completed = { 0 };
+	uint32 count = 0, next = 0;
+	uint32 ancestor_position = UINT32_MAX, completed_position = UINT32_MAX;
+	uint32 last_position = UINT32_MAX;
+	bool ancestor_found = false, completed_found = false, covered = false;
+	uint8 previous_result[CLUSTER_SPACE_RESERVATION_BYTES];
+	uint64 previous_token = 0;
+	Size bytes;
+	size_t scratch;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || key == NULL
+		|| block > 1 || plan->database_incarnation == 0
+		|| (selected == NULL
+			&& (terminal == NULL || ancestor_operation >= plan->operation_count
+				|| completed_operation >= plan->operation_count))
+		|| key->database_incarnation != plan->database_incarnation
+		|| !side_space_key_matches_plan(plan, key))
+		return false;
+	/* Replay deliberately omits history. Ancestry cannot: validate every
+	 * retained typed input for this locator before considering either end. */
+	for (uint32 i = 0; i < plan->operation_count; i++)
+		for (uint32 j = 0; j < side_operation_space_count(&plan->operations[i]); j++) {
+			ClusterSpaceIdentityKey observed;
+			ClusterSpaceRecoveryInput input;
+			RfSideSpaceContributionV1 contribution;
+
+			if (!side_operation_space_input(plan, &plan->operations[i], j, &observed, &input))
+				return false;
+			if (!RelFileLocatorEquals(observed.locator, key->locator))
+				continue;
+			if (observed.database_incarnation != key->database_incarnation || count == UINT32_MAX)
+				return false;
+			count++;
+			if (i != ancestor_operation && i != completed_operation)
+				continue;
+			if (!rf_side_online_plan_space_contribution_v1(plan, i, j, &contribution)
+				|| (contribution.page_mask & (1u << block)) == 0)
+				return false;
+			if (i == ancestor_operation) {
+				if (ancestor_found)
+					return false;
+				ancestor = contribution;
+				ancestor_found = true;
+			}
+			if (i == completed_operation) {
+				if (completed_found)
+					return false;
+				completed = contribution;
+				completed_found = true;
+			}
+		}
+	if ((selected == NULL
+		 && (!ancestor_found || !completed_found
+			 || memcmp(ancestor.result.incarnation, completed.result.incarnation, 16) != 0))
+		|| count == 0
+		|| count > plan->memory_budget / (sizeof(*inputs) + sizeof(*operations) + sizeof(*order)))
+		return false;
+	bytes = (Size)count * (sizeof(*inputs) + sizeof(*operations) + sizeof(*order));
+	scratch = cluster_space_recovery_scratch_bytes(count);
+	if (scratch == 0 || scratch > SIZE_MAX - bytes)
+		return false;
+	bytes += scratch;
+	if (bytes > plan->memory_budget || plan->memory_used > plan->memory_budget - bytes)
+		return false;
+	inputs = side_alloc0((Size)count * sizeof(*inputs));
+	operations = side_alloc0((Size)count * sizeof(*operations));
+	order = side_alloc0((Size)count * sizeof(*order));
+	if (inputs == NULL || operations == NULL || order == NULL)
+		goto done;
+	for (uint32 i = 0; i < plan->operation_count; i++)
+		for (uint32 j = 0; j < side_operation_space_count(&plan->operations[i]); j++) {
+			ClusterSpaceIdentityKey observed;
+			ClusterSpaceRecoveryInput input;
+			if (!side_operation_space_input(plan, &plan->operations[i], j, &observed, &input))
+				goto done;
+			if (!RelFileLocatorEquals(observed.locator, key->locator))
+				continue;
+			if (next >= count)
+				goto done;
+			inputs[next] = input;
+			operations[next++] = i;
+		}
+	if (next != count || !cluster_space_recovery_order(inputs, count, key, order))
+		goto done;
+	for (uint32 i = 0; i < count; i++) {
+		uint32 index = order[i];
 		ClusterSpaceReservationChange change;
+		uint8 before[CLUSTER_SPACE_RESERVATION_BYTES];
 
-		if (!cluster_space_reservation_wal_decode(input.data, input.length, &change)
-			|| change.action != CLUSTER_SPACE_RESERVATION_ADVANCE)
-			return false;
-		contribution.result = change.result.identity;
-		contribution.result_token[1] = change.result_token;
-		contribution.page_mask = 2;
-	} else {
-		ClusterSpaceStructureChange change;
-
-		if (!cluster_space_structure_wal_decode(input.data, input.length, &change))
-			return false;
-		contribution.result = change.identity.result;
-		contribution.result_token[0] = change.identity.result_token;
-		contribution.result_token[1] = change.reservation.result_token;
-		contribution.page_mask = 3;
+		if (inputs[index].length == CLUSTER_SPACE_RESERVATION_WAL_BYTES) {
+			if (!cluster_space_reservation_wal_decode(inputs[index].data, inputs[index].length,
+													  &change))
+				goto done;
+		} else {
+			ClusterSpaceStructureChange structure;
+			if (!cluster_space_structure_wal_decode(inputs[index].data, inputs[index].length,
+													&structure))
+				goto done;
+			change = structure.reservation;
+		}
+		/* Recovery ordering permits survivor-owned gaps, but this query has
+		 * no durable target proof for them. Require every retained edge,
+		 * including structural ones, to continue the exact reservation. */
+		if (i > 0
+			&& (previous_token != change.before_token
+				|| !cluster_space_reservation_encode(&change.before, before, sizeof(before))
+				|| memcmp(previous_result, before, sizeof(before)) != 0))
+			goto done;
+		if (!cluster_space_reservation_encode(&change.result, previous_result,
+											  sizeof(previous_result)))
+			goto done;
+		previous_token = change.result_token;
+		if (block == 0 && inputs[index].length == CLUSTER_SPACE_RESERVATION_WAL_BYTES)
+			continue;
+		if (operations[index] == ancestor_operation)
+			ancestor_position = i;
+		if (operations[index] == completed_operation)
+			completed_position = i;
+		last_position = i;
 	}
-	*out = contribution;
-	return true;
+	if (selected != NULL) {
+		RfSideSpaceTerminalV1 result = { 0 };
+		if (last_position == UINT32_MAX
+			|| !side_space_input_contribution(&inputs[order[last_position]], &result.contribution))
+			goto done;
+		result.operation = operations[order[last_position]];
+		*selected = result;
+	} else {
+		if (ancestor_position == UINT32_MAX || completed_position == UINT32_MAX
+			|| ancestor_position > completed_position)
+			goto done;
+		*terminal = completed_position == last_position;
+	}
+	covered = true;
+done:
+	if (order != NULL)
+		side_free(order);
+	if (operations != NULL)
+		side_free(operations);
+	if (inputs != NULL)
+		side_free(inputs);
+	return covered;
+}
+
+bool
+rf_side_online_plan_space_covers_v1(const RfSideOnlinePlanV1 *plan,
+									const ClusterSpaceIdentityKey *key, BlockNumber block,
+									uint32 ancestor_operation, uint32 completed_operation,
+									bool *terminal)
+{
+	return side_space_ancestry(plan, key, block, ancestor_operation, completed_operation, terminal,
+							   NULL);
+}
+
+bool
+rf_side_online_plan_space_terminal_v1(const RfSideOnlinePlanV1 *plan,
+									  const ClusterSpaceIdentityKey *key, BlockNumber block,
+									  RfSideSpaceTerminalV1 *out)
+{
+	return out != NULL && side_space_ancestry(plan, key, block, UINT32_MAX, UINT32_MAX, NULL, out);
 }
 
 bool
@@ -1836,7 +2012,8 @@ side_plan_apply_ops_valid(const RfSideOnlinePlanV1 *plan, const RfSideOnlineAppl
 			|| (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_SPACE
 				&& (ops->preflight_space == NULL || ops->apply_space == NULL))
 			/* No projection/TT callback may stand in for native control. */
-			|| plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
+			|| (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
+				&& (ops->preflight_control == NULL || ops->apply_control == NULL))
 			|| plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_INVALID)
 			return false;
 	}
@@ -1878,6 +2055,8 @@ side_plan_preflight_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApp
 			accepted = ops->preflight_undo(ops->arg, &operation);
 		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE)
 			accepted = ops->preflight_space(ops->arg, &operation);
+		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL)
+			accepted = ops->preflight_control(ops->arg, &operation);
 		else
 			accepted = ops->preflight_projection(ops->arg, &operation);
 		if (!accepted)
@@ -1936,6 +2115,8 @@ side_plan_apply_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOp
 			applied = ops->apply_undo(ops->arg, &operation);
 		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE)
 			applied = ops->apply_space(ops->arg, &operation);
+		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL)
+			applied = ops->apply_control(ops->arg, &operation);
 		else
 			applied = ops->apply_projection(ops->arg, &operation);
 		if (!applied)

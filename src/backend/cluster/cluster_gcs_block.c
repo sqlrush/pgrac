@@ -9514,31 +9514,12 @@ static ResourceXApplyResult
 gcs_block_resource_x_assert_stage_exact(int32 master_node, const ResourceXDecodedFrame *assertion,
 										const ResourceXDecodedFrame *local_proof)
 {
-	uint8 assertion_payload[RESOURCE_X_CONTROL_V1_BYTES];
-	uint8 proof_payload[RESOURCE_X_SHORT_V1_BYTES];
-	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint16 assertion_bytes = 0;
-	uint16 proof_bytes = 0;
-
-	if (master_node < 0 || master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || assertion == NULL
-		|| !cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, assertion, assertion_payload,
-										   sizeof(assertion_payload), &assertion_bytes, &reject)
-		|| assertion_bytes != RESOURCE_X_CONTROL_V1_BYTES)
-		return RESOURCE_X_APPLY_INVALID;
-	if (local_proof != NULL
-		&& (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, local_proof, proof_payload,
-											sizeof(proof_payload), &proof_bytes, &reject)
-			|| proof_bytes != RESOURCE_X_SHORT_V1_BYTES))
-		return RESOURCE_X_APPLY_INVALID;
-	if (!cluster_grd_outbound_enqueue_backend_msg(RESOURCE_X_MSG_ASSERT_X, master_node,
-												  assertion_payload, assertion_bytes))
-		return RESOURCE_X_APPLY_BAD_STATE;
-	if (local_proof == NULL)
-		return RESOURCE_X_APPLY_APPLIED;
-	return cluster_grd_outbound_enqueue_backend_msg(RESOURCE_X_MSG_ASSERT_X, master_node,
-													proof_payload, proof_bytes)
+	ClusterLmsEnqueueResult result
+		= cluster_lms_outbound_enqueue_resource_x_requester(master_node, assertion, local_proof);
+	return result == CLUSTER_LMS_ENQUEUE_ADMITTED || result == CLUSTER_LMS_ENQUEUE_NOT_DUE
 			   ? RESOURCE_X_APPLY_APPLIED
-			   : RESOURCE_X_APPLY_BAD_STATE;
+		   : result == CLUSTER_LMS_ENQUEUE_INVALID ? RESOURCE_X_APPLY_INVALID
+												   : RESOURCE_X_APPLY_BAD_STATE;
 }
 
 /* The kind-9 ASSERT keeps its wire-neutral observed mode, but an exact local
@@ -9769,18 +9750,13 @@ static bool
 gcs_block_resource_x_bootstrap_request_stage_exact(int32 master_node,
 												   const ResourceXDecodedFrame *request)
 {
-	uint8 payload[RESOURCE_X_CONTROL_V1_BYTES];
-	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint16 payload_bytes = 0;
-
+	ClusterLmsEnqueueResult result;
 	if (master_node < 0 || master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || request == NULL
-		|| gcs_block_resource_x_delivery_arm_exact(master_node, request) != RESOURCE_X_APPLY_APPLIED
-		|| !cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, request, payload,
-										   sizeof(payload), &payload_bytes, &reject)
-		|| payload_bytes != RESOURCE_X_CONTROL_V1_BYTES)
+		|| gcs_block_resource_x_delivery_arm_exact(master_node, request)
+			   != RESOURCE_X_APPLY_APPLIED)
 		return false;
-	return cluster_grd_outbound_enqueue_backend_msg(RESOURCE_X_MSG_ASSERT_X, (uint32)master_node,
-													payload, payload_bytes);
+	result = cluster_lms_outbound_enqueue_resource_x_requester(master_node, request, NULL);
+	return result == CLUSTER_LMS_ENQUEUE_ADMITTED || result == CLUSTER_LMS_ENQUEUE_NOT_DUE;
 }
 
 /* PGRAC adaptation: the master receipt API has already copied the exact ACK
@@ -13532,12 +13508,13 @@ gcs_block_resource_x_requester_terminal_try(const ClusterICEnvelope *env,
 /* PGRAC adaptation: SourceSettlementV2 consumes only the exact retained
  * type-18/type-15 pair selected by the authenticated master.  Entry-lock
  * prepare/commit bracket, but never overlap, the BufferDesc release.  The
- * response is an ordinary unretained typed ACK; a full outbound queue is
- * healed by the master's still-retained kind-10 debt replay. */
+ * received request stays owned across BUSY, and the typed ACK uses the
+ * drained holder status send slot until transport completion. */
 static ResourceXApplyResult
-gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
-											   const ResourceXDecodedFrame *settlement,
-											   uint32 sender_connection_generation)
+gcs_block_resource_x_source_settlement_run(const ClusterICEnvelope *env,
+										   const ResourceXDecodedFrame *settlement,
+										   uint32 sender_connection_generation,
+										   volatile uint64 *claim)
 {
 	ResourceXDecodedFrame ack;
 	ResourceXSourceSettlementPlan plan;
@@ -13552,6 +13529,7 @@ gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
 	bool carrier_release_complete = false;
 	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
 	uint16 payload_bytes = 0;
+	uint64 acquired_claim = 0;
 
 	if (env == NULL || settlement == NULL
 		|| settlement->kind != RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
@@ -13561,8 +13539,12 @@ gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
 	memset(&plan, 0, sizeof(plan));
 	memset(&commit_observation, 0, sizeof(commit_observation));
 	memset(&prepare_observation, 0, sizeof(prepare_observation));
-	result = cluster_pcm_lock_resource_x_source_settlement_prepare_observed_exact(
-		settlement, (int32)env->source_node_id, &plan, &prepare_observation);
+	result = cluster_pcm_lock_resource_x_source_settlement_receive_begin_exact(
+		settlement, (int32)env->source_node_id, sender_connection_generation, &plan,
+		&prepare_observation, &acquired_claim);
+	*claim = acquired_claim;
+	if (result == RESOURCE_X_APPLY_DUPLICATE && acquired_claim == 0)
+		return result; /* The existing exact ACK still owns its send episode. */
 	if (result == RESOURCE_X_APPLY_APPLIED && !plan.valid) {
 		gcs_block_resource_x_source_settlement_failure_record(
 			settlement, &prepare_observation, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_PREPARE,
@@ -13653,8 +13635,12 @@ gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
 		gcs_block_resource_x_fail_closed_current();
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
-	ack_enqueued = cluster_grd_outbound_enqueue_backend_msg(
-		RESOURCE_X_MSG_BLOCKED_TO_N, env->source_node_id, payload, payload_bytes);
+	ack_enqueued = cluster_pcm_lock_resource_x_source_settlement_receive_end_exact(
+		&settlement->common.logical_assertion, *claim, &ack);
+	if (!ack_enqueued) {
+		gcs_block_resource_x_fail_closed_current();
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
 	if ((result == RESOURCE_X_APPLY_APPLIED || !ack_enqueued)
 		&& ((result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
 			|| !ack_enqueued
@@ -13669,6 +13655,78 @@ gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
 						   (unsigned long long)plan.source_generation, ack_enqueued ? 1U : 0U,
 						   sender_connection_generation)));
 	return result;
+}
+
+/* Only one ingress/tick owns physical release. Every unwind returns that
+ * local claim; it never drops the received request or the retained pair. */
+static ResourceXApplyResult
+gcs_block_resource_x_source_settlement_ingress_owned(const ClusterICEnvelope *env,
+													 const ResourceXDecodedFrame *settlement,
+													 uint32 sender_connection_generation,
+													 bool notify_busy)
+{
+	volatile uint64 claim = 0;
+	ResourceXApplyResult result;
+	PG_TRY();
+	{
+		result = gcs_block_resource_x_source_settlement_run(env, settlement,
+															sender_connection_generation, &claim);
+		if (notify_busy && result == RESOURCE_X_APPLY_BAD_STATE && claim != 0) {
+			ResourceXDecodedFrame busy = { 0 };
+			uint8 payload[RESOURCE_X_CONTROL_V1_BYTES];
+			uint16 length;
+			ResourceXWireReject reject;
+			busy.kind = RESOURCE_X_WIRE_BLOCKED_TO_N;
+			busy.common = settlement->common;
+			busy.common.outcome = RESOURCE_X_OUTCOME_RETRY;
+			busy.common.source_candidate = busy.common.retain_pi_if_dirty = 0;
+			busy.common.sender_connection_generation = sender_connection_generation;
+			if (cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &busy, payload,
+											   sizeof(payload), &length, &reject))
+				(void)cluster_grd_outbound_enqueue_backend_msg(
+					RESOURCE_X_MSG_BLOCKED_TO_N, env->source_node_id, payload, length);
+		}
+	}
+	PG_FINALLY();
+	{
+		if (claim != 0)
+			(void)cluster_pcm_lock_resource_x_source_settlement_receive_end_exact(
+				&settlement->common.logical_assertion, claim, NULL);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static ResourceXApplyResult
+gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
+											   const ResourceXDecodedFrame *settlement,
+											   uint32 sender_connection_generation)
+{
+	return gcs_block_resource_x_source_settlement_ingress_owned(env, settlement,
+																sender_connection_generation, true);
+}
+
+ResourceXApplyResult
+cluster_gcs_block_resource_x_source_settlement_tick(const ResourceXAcquisitionRef *ref)
+{
+	ResourceXDecodedFrame request;
+	ClusterICEnvelope env = { 0 };
+	int32 master;
+	uint32 received_generation, current_generation;
+	ResourceXApplyResult result;
+	if (MyBackendType != B_LMS)
+		return RESOURCE_X_APPLY_INVALID;
+	result = cluster_pcm_lock_resource_x_source_settlement_receive_snapshot_exact(
+		ref, &request, &master, &received_generation);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	if (!gcs_block_pcm_x_resource_x_peer_ready_exact(master, &current_generation)
+		|| current_generation != received_generation)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	env.source_node_id = master;
+	env.dest_node_id = cluster_node_id;
+	return gcs_block_resource_x_source_settlement_ingress_owned(&env, &request, current_generation,
+																false);
 }
 
 /* Consume the exact Resource-X subdomain before any reused legacy parser.
@@ -13759,6 +13817,15 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env, const void *payload
 			env, &frame, authenticated_capability_generation);
 		break;
 	case RESOURCE_X_WIRE_BLOCKED_TO_N:
+		if (frame.common.outcome == RESOURCE_X_OUTCOME_RETRY
+			&& frame.common.observed_mode == PCM_STATE_N
+			&& frame.common.target_mode == PCM_STATE_N) {
+			int channel = cluster_ic_tier1_my_data_channel();
+			result = cluster_pcm_lock_resource_x_source_settlement_busy_exact(
+				&frame, (int32)env->source_node_id, channel,
+				cluster_ic_tier1_resource_x_stream_generation(env->source_node_id, channel));
+			break;
+		}
 		result = cluster_pcm_lock_resource_x_blocked_to_n_exact(&frame, (int32)env->source_node_id,
 																&snapshot);
 		break;

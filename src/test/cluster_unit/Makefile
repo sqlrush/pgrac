@@ -46,7 +46,7 @@ endif
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
-        test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side \
+        test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_config \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
         test_pgrac_fenced_target_command test_pgrac_fenced_target_reply test_pgrac_fenced_target_client \
@@ -2076,6 +2076,7 @@ test_cluster_space_recovery_product.o: $(top_srcdir)/src/backend/cluster/cluster
 		$(top_srcdir)/src/include/cluster/cluster_hw.h \
 		$(top_srcdir)/src/include/cluster/cluster_lock_acquire.h \
 		$(top_srcdir)/src/include/cluster/cluster_page_stable_base.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_space_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_thread_recovery_fabric.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@
@@ -2155,6 +2156,7 @@ test_cluster_page_data test_cluster_pi_writeback: unit_test.h test_cluster_page_
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c test_cluster_page_data_stable.o test_cluster_page_wal_product.o $(CLUSTER_WAL_CLAIM_O) \
+		$(PAGE_DATA_SPACE_OBJS) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o xlogreader_fs.o \
@@ -2631,6 +2633,16 @@ test_cluster_side_xact: test_cluster_side_xact.c unit_test.h test_cluster_undo_h
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
 
 CLUSTER_SIDE_ONLINE_OWNER_O = test_cluster_side_online_owner_product.o
+# The DATA integration uses the actual immutable fabric and typed SIDE
+# planner. The writeback scheduling fixture keeps its explicit input boundary.
+test_cluster_page_data: PAGE_DATA_SPACE_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
+		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
+		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
+test_cluster_page_data: $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
+		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
+		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
 test_cluster_space_recovery: $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_XACTDESC_O) $(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
@@ -3644,7 +3656,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-$(filter-out test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_config test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # The wire behavior is inline; an updated decoder must rebuild this binary.
@@ -4694,10 +4706,11 @@ test_cluster_pcm_source_owner_layout.inc: $(top_srcdir)/src/backend/cluster/clus
 
 test_cluster_pcm_stop_fields.inc: $(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c Makefile
 	awk '/^typedef struct PcmConvertQueue PcmConvertQueue;/ { print; forward++ } \
+	     /^typedef struct ClusterPcmResourceXRequesterSend / { emit=1; send++ } \
 	     /^typedef struct ClusterPcmResourceXBootstrapRound / { emit=1; round++ } \
 	     /^struct GrdEntry \{/ { print "struct StopPcmEntryLayout {"; emit=1; entry++; next } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (forward != 1 || round != 1 || entry != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (forward != 1 || send != 1 || round != 1 || entry != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Use the actual bounded pump and its limits with the real PCM fixture.
@@ -4717,7 +4730,15 @@ test_cluster_pcm_lms_intent_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_source_settlement_(run|ingress|ingress_owned)\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
+	     /^cluster_gcs_block_resource_x_source_settlement_tick\(/ { print "ResourceXApplyResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+		test_cluster_pcm_settlement_ingress.inc \
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
 		test_cluster_pcm_stop_fields.inc \
@@ -5502,6 +5523,14 @@ test_cluster_initdb_side: test_cluster_initdb_side.c unit_test.h \
 
 # Original creation I/O boundaries: real files and SHA256; only failing syscalls
 # are injected. The whole successful creator is exercised by initdb TAP 004.
+test_cluster_initdb_config: test_cluster_initdb_config.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_config.c \
+		$(top_srcdir)/src/common/file_perm.c cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/file_perm.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
+		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
 test_cluster_initdb_base: test_cluster_initdb_base.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_base.c cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \

@@ -51,6 +51,7 @@
 
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic.h"
+#include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope prototype */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_clean_leave.h"
@@ -125,6 +126,14 @@ static int ut_resource_x_stage_count = 0;
 static bool ut_resource_x_stage_not_due;
 static int ut_resource_x_rearm_count = 0;
 static int ut_resource_x_complete_count = 0;
+static unsigned ut_rx_resends;
+void
+cluster_pcm_rx_metric_note(PcmRxMetric metric)
+{
+	UT_ASSERT_EQ(metric, PCM_RX_RESEND);
+	ut_rx_resends++;
+}
+
 static ResourceXIntentProbeResult ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_IDLE;
 static int ut_resource_x_probe_call_count = 0;
 static int ut_resource_x_probe_more_prefix = 0;
@@ -145,6 +154,64 @@ cluster_pcm_lock_resource_x_trace_wire(uint8 type, int32 peer, const void *paylo
 	(void)payload;
 	(void)length;
 	(void)result;
+}
+
+static unsigned ut_requester_begins, ut_requester_completed;
+static uint32 ut_requester_pending;
+static bool ut_requester_not_due;
+static ResourceXIntentSlot ut_requester_ticket;
+
+bool
+cluster_resource_x_wire_encode(uint8 type, const ResourceXDecodedFrame *frame, void *out,
+							   uint16 capacity, uint16 *length, ResourceXWireReject *reject)
+{
+	UT_ASSERT_EQ(type, RESOURCE_X_MSG_ASSERT_X);
+	*length = frame->kind == RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION ? RESOURCE_X_SHORT_V1_BYTES
+																	 : RESOURCE_X_CONTROL_V1_BYTES;
+	UT_ASSERT(capacity >= *length);
+	memset(out, frame->kind, *length);
+	*reject = RESOURCE_X_WIRE_REJECT_NONE;
+	return true; /* Codec has its own real-object suite; preserve FIFO markers. */
+}
+
+ResourceXIntentResult
+cluster_pcm_lock_resource_x_requester_send_begin_exact(const ResourceXDecodedFrame *frame,
+													   int32 master, uint32 count, uint64 now,
+													   ResourceXIntentSlot *out)
+{
+	ut_requester_begins++;
+	if (ut_requester_not_due || ut_requester_pending != 0)
+		return RESOURCE_X_INTENT_NOT_DUE;
+	memset(out, 0, sizeof(*out));
+	out->body.assertion = frame->common.logical_assertion;
+	out->body.owner_kind = RESOURCE_X_INTENT_OWNER_REQUESTER_SEND;
+	out->destination_node = master;
+	out->kind = frame->kind;
+	out->state = RESOURCE_X_INTENT_SLOT_STAGED;
+	out->send_episode = 1;
+	out->last_attempt_us = now;
+	out->payload_bytes = RESOURCE_X_CONTROL_V1_BYTES;
+	ut_requester_ticket = *out;
+	ut_requester_pending = (1U << count) - 1;
+	return RESOURCE_X_INTENT_STAGED;
+}
+
+bool
+cluster_pcm_lock_resource_x_requester_send_current_exact(const ResourceXIntentSlot *ticket)
+{
+	return (ut_requester_pending & (1U << ticket->body.owner_index)) != 0;
+}
+
+bool
+cluster_pcm_lock_resource_x_requester_send_complete_exact(const ResourceXIntentSlot *ticket,
+														  bool sent, uint64 now)
+{
+	UT_ASSERT(now >= ticket->last_attempt_us);
+	UT_ASSERT(ut_requester_pending & (1U << ticket->body.owner_index));
+	ut_requester_pending &= ~(1U << ticket->body.owner_index);
+	if (sent)
+		ut_requester_completed++;
+	return true;
 }
 
 bool
@@ -217,6 +284,7 @@ cluster_pcm_lock_resource_x_grant_intent_stage_exact(const ResourceXIntentSlot *
 		return RESOURCE_X_INTENT_STALE;
 	ut_resource_x_owner_slot.state = RESOURCE_X_INTENT_SLOT_STAGED;
 	ut_resource_x_owner_slot.last_attempt_us = now_us;
+	ut_resource_x_owner_slot.send_episode++;
 	ut_resource_x_stage_count++;
 	return RESOURCE_X_INTENT_STAGED;
 }
@@ -315,6 +383,14 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 }
 
 ResourceXApplyResult
+cluster_gcs_block_resource_x_source_settlement_tick(const ResourceXAcquisitionRef *ref)
+{
+	(void)ref;
+	UT_ASSERT(false);
+	return RESOURCE_X_APPLY_BAD_STATE;
+}
+
+ResourceXApplyResult
 cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *ref)
 {
 	UT_ASSERT_EQ(ref->formation, UINT64_C(17));
@@ -343,6 +419,40 @@ cluster_pcm_lock_resource_x_outbound_intent_stage_exact(const ResourceXIntentSlo
 	if (ut_resource_x_stage_not_due)
 		return RESOURCE_X_INTENT_NOT_DUE;
 	return cluster_pcm_lock_resource_x_grant_intent_stage_exact(expected, now_us);
+}
+
+ResourceXIntentResult
+cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(const ResourceXIntentSlot *expected,
+																uint64 now_us,
+																ResourceXIntentSlot *staged_out)
+{
+	ResourceXIntentResult result
+		= cluster_pcm_lock_resource_x_outbound_intent_stage_exact(expected, now_us);
+	if (result == RESOURCE_X_INTENT_STAGED && staged_out != NULL)
+		*staged_out = ut_resource_x_owner_slot;
+	return result;
+}
+
+bool
+cluster_pcm_lock_resource_x_outbound_transport_complete_exact(const ResourceXIntentSlot *expected,
+															  bool sent, uint64 now_us)
+{
+	if (expected->send_episode != ut_resource_x_owner_slot.send_episode
+		|| expected->last_attempt_us != ut_resource_x_owner_slot.last_attempt_us)
+		return false;
+	if (!sent || expected->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE)
+		return cluster_pcm_lock_resource_x_grant_intent_hard_rearm_exact(expected, now_us)
+			   == RESOURCE_X_INTENT_HARD_REARMED;
+	return cluster_pcm_lock_resource_x_grant_intent_complete_exact(expected);
+}
+
+ClusterICSendResult
+cluster_ic_tier1_send_resource_x_intent(uint8 msg_type, int32 dest_node_id, const void *payload,
+										uint32 payload_len, const ResourceXIntentSlot *intent)
+{
+	UT_ASSERT_EQ(intent->state, RESOURCE_X_INTENT_SLOT_STAGED);
+	UT_ASSERT(intent->send_episode != 0);
+	return cluster_ic_send_envelope(msg_type, dest_node_id, payload, payload_len);
 }
 
 ResourceXIntentResult
@@ -674,6 +784,9 @@ static void
 ut_reset_log(void)
 {
 	ut_sent_n = 0;
+	ut_requester_begins = ut_requester_completed = ut_requester_pending = 0;
+	ut_requester_not_due = false;
+	ut_rx_resends = 0;
 	ut_local_dispatch_count = 0;
 	ut_local_dispatch_marker = 0;
 	ut_direct_zero_reply_count = 0;
@@ -1461,19 +1574,21 @@ UT_TEST(test_resource_x_settlement_intent_uses_type38_and_short_payload)
 	UT_ASSERT_EQ(ut_resource_x_complete_count, 1);
 }
 
-UT_TEST(test_resource_x_holder_release_transport_rearms_until_typed_ack)
+UT_TEST(test_resource_x_holder_release_transport_waits_for_actual_send)
 {
 	ResourceXIntentSlot intent;
 	int partial;
 
-	for (partial = 0; partial <= 1; partial++) {
+	for (partial = 0; partial <= 3; partial++) {
 		ut_reset_log();
 		intent = ut_resource_x_holder_release_intent(UT_PEER_X);
+		if (partial >= 2)
+			intent.last_send_us = 100;
 		ut_resource_x_owner_slot = intent;
 		ut_resource_x_owner_payload[0] = 0xAC;
 		ut_peer_capabilities[UT_PEER_X] = PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
 		ut_peer_cap_generation[UT_PEER_X] = 87;
-		ut_peer_rc[UT_PEER_X] = partial ? CLUSTER_IC_SEND_WOULD_BLOCK : CLUSTER_IC_SEND_DONE;
+		ut_peer_rc[UT_PEER_X] = (partial & 1) ? CLUSTER_IC_SEND_WOULD_BLOCK : CLUSTER_IC_SEND_DONE;
 
 		UT_ASSERT_EQ(cluster_lms_outbound_enqueue_resource_x_intent(0, &intent, 87, UINT64_MAX),
 					 CLUSTER_LMS_ENQUEUE_ADMITTED);
@@ -1482,9 +1597,16 @@ UT_TEST(test_resource_x_holder_release_transport_rearms_until_typed_ack)
 		UT_ASSERT_EQ(ut_sent_log[0].msg_type, RESOURCE_X_MSG_BLOCK_TO_N);
 		UT_ASSERT_EQ(ut_sent_log[0].payload_len, RESOURCE_X_PROOF_V1_BYTES);
 		UT_ASSERT_EQ(ut_sent_log[0].marker, 0xAC);
-		UT_ASSERT_EQ(ut_resource_x_rearm_count, 1);
+		UT_ASSERT_EQ(ut_resource_x_rearm_count, (partial & 1) ? 0 : 1);
 		UT_ASSERT_EQ(ut_resource_x_complete_count, 0);
-		UT_ASSERT_EQ(ut_resource_x_owner_slot.state, RESOURCE_X_INTENT_SLOT_ARMED);
+		UT_ASSERT_EQ(ut_resource_x_owner_slot.state,
+					 (partial & 1) ? RESOURCE_X_INTENT_SLOT_STAGED : RESOURCE_X_INTENT_SLOT_ARMED);
+		UT_ASSERT_EQ(ut_rx_resends, partial == 2 ? 1 : 0);
+		if (partial & 1) {
+			ResourceXIntentSlot owned = ut_resource_x_owner_slot;
+			cluster_lms_outbound_resource_x_send_complete(&owned, false);
+			UT_ASSERT_EQ(ut_rx_resends, 0);
+		}
 	}
 }
 
@@ -2055,10 +2177,102 @@ UT_TEST(test_normal_stop_full_and_bad_frames_remain_debt)
 	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 1); /* poll never discards */
 }
 
+UT_TEST(test_requester_pair_atomic_admission_and_transport_handoff)
+{
+	ResourceXDecodedFrame command = { 0 }, proof;
+	int worker;
+	command.kind = RESOURCE_X_WIRE_ASSERT_X;
+	command.common.logical_assertion.resource.relNumber = 12;
+	command.common.logical_assertion.requester_node = cluster_node_id;
+	command.common.sender_connection_generation = 77;
+	proof = command;
+	proof.kind = RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION;
+	proof.common.outcome = RESOURCE_X_OUTCOME_OK;
+	worker = cluster_lms_shard_for_tag(&command.common.logical_assertion.resource,
+									   cluster_lms_workers);
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	for (int i = 0; i < 255; i++)
+		UT_ASSERT(ut_enqueue_marker(worker, UT_PEER_X, 0x90));
+	UT_ASSERT_EQ(cluster_lms_outbound_enqueue_resource_x_requester(UT_PEER_X, &command, &proof),
+				 CLUSTER_LMS_ENQUEUE_FULL);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker), 255);
+	UT_ASSERT_EQ(ut_requester_begins, 0); /* FULL never claims a transport owner. */
+	ut_captured_region->init_fn();
+	ut_peer_capabilities[UT_PEER_X] = PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+	ut_peer_cap_generation[UT_PEER_X] = 77;
+	UT_ASSERT_EQ(cluster_lms_outbound_enqueue_resource_x_requester(UT_PEER_X, &command, &proof),
+				 CLUSTER_LMS_ENQUEUE_ADMITTED);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker), 2);
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_staged_count(), 2);
+	UT_ASSERT_EQ(cluster_lms_outbound_enqueue_resource_x_requester(UT_PEER_X, &command, &proof),
+				 CLUSTER_LMS_ENQUEUE_NOT_DUE);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker), 2);
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_WOULD_BLOCK;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(worker), 2);
+	UT_ASSERT_EQ(ut_sent_log[0].marker, RESOURCE_X_WIRE_ASSERT_X);
+	UT_ASSERT_EQ(ut_sent_log[1].marker, RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION);
+	UT_ASSERT_EQ(ut_requester_pending, 3);
+	UT_ASSERT_EQ(ut_requester_completed, 0);
+	cluster_lms_outbound_resource_x_send_complete(&ut_requester_ticket, true);
+	UT_ASSERT_EQ(ut_requester_pending, 2);
+	ut_requester_ticket.body.owner_index = 1;
+	ut_requester_ticket.payload_bytes = RESOURCE_X_SHORT_V1_BYTES;
+	cluster_lms_outbound_resource_x_send_complete(&ut_requester_ticket, true);
+	UT_ASSERT_EQ(ut_requester_completed, 2);
+	UT_ASSERT_EQ(ut_requester_pending, 0);
+	ut_requester_not_due = true;
+	UT_ASSERT_EQ(cluster_lms_outbound_enqueue_resource_x_requester(UT_PEER_X, &command, &proof),
+				 CLUSTER_LMS_ENQUEUE_NOT_DUE);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker), 0);
+	UT_ASSERT_EQ(ut_rx_resends, 0); /* First send/WB are not retransmission. */
+}
+
+UT_TEST(test_requester_transport_refusal_and_capability_drift_return_owner)
+{
+	ResourceXDecodedFrame command = { 0 }, proof;
+	int worker;
+	command.kind = RESOURCE_X_WIRE_ASSERT_X;
+	command.common.logical_assertion.resource.relNumber = 12;
+	command.common.logical_assertion.requester_node = cluster_node_id;
+	command.common.sender_connection_generation = 77;
+	proof = command;
+	proof.kind = RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION;
+	proof.common.outcome = RESOURCE_X_OUTCOME_OK;
+	worker = cluster_lms_shard_for_tag(&command.common.logical_assertion.resource,
+									   cluster_lms_workers);
+	for (int scenario = 0; scenario < 3; scenario++) {
+		ut_captured_region->init_fn();
+		ut_reset_log();
+		ut_peer_capabilities[UT_PEER_X] = PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+		ut_peer_cap_generation[UT_PEER_X] = 77;
+		UT_ASSERT_EQ(cluster_lms_outbound_enqueue_resource_x_requester(UT_PEER_X, &command, &proof),
+					 CLUSTER_LMS_ENQUEUE_ADMITTED);
+		if (scenario == 0)
+			ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+		else if (scenario == 1)
+			ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_HARD_ERROR;
+		else
+			ut_peer_cap_generation[UT_PEER_X] = 78;
+		(void)cluster_lms_outbound_drain_send(worker);
+		UT_ASSERT_EQ(ut_requester_pending, 0);
+		UT_ASSERT_EQ(ut_requester_completed, 0); /* No physical send completed. */
+		UT_ASSERT_EQ(cluster_lms_outbound_depth(worker), 0);
+		UT_ASSERT_EQ(ut_rx_resends, 0);
+	}
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	proof.common.logical_assertion.resource.relNumber++;
+	UT_ASSERT_EQ(cluster_lms_outbound_enqueue_resource_x_requester(UT_PEER_X, &command, &proof),
+				 CLUSTER_LMS_ENQUEUE_INVALID);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker), 0);
+	UT_ASSERT_EQ(ut_requester_begins, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(46);
 
 	UT_RUN(test_normal_stop_missing_outbound_is_not_empty);
 	UT_RUN(test_ring_shmem_init);
@@ -2084,7 +2298,7 @@ main(void)
 	UT_RUN(test_resource_x_intent_admission_stages_and_completion_clears_owner);
 	UT_RUN(test_resource_x_block_intent_uses_type17_and_control_payload);
 	UT_RUN(test_resource_x_settlement_intent_uses_type38_and_short_payload);
-	UT_RUN(test_resource_x_holder_release_transport_rearms_until_typed_ack);
+	UT_RUN(test_resource_x_holder_release_transport_waits_for_actual_send);
 	UT_RUN(test_resource_x_source_settlement_ack_fits_ordinary_data_ring);
 	UT_RUN(test_resource_x_image_intent_rebinds_transport_generation);
 	UT_RUN(test_resource_x_intent_transport_refusal_rearms_without_ring_copy);
@@ -2104,6 +2318,8 @@ main(void)
 	UT_RUN(test_normal_stop_queue_observation_follows_real_handoff);
 	UT_RUN(test_normal_stop_inactive_and_malformed_ring_are_not_hidden);
 	UT_RUN(test_normal_stop_full_and_bad_frames_remain_debt);
+	UT_RUN(test_requester_pair_atomic_admission_and_transport_handoff);
+	UT_RUN(test_requester_transport_refusal_and_capability_drift_return_owner);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

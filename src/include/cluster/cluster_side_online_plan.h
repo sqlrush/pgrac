@@ -52,6 +52,8 @@ typedef struct RfSideOnlineOperationV1 {
 	ClusterSpaceIdentityKey space_key;
 	/* Kept for reconstruction/dependency checks; never dispatched as redo. */
 	bool history_only;
+	/* Original header SCN, not a page version or control-file authority. */
+	SCN control_scn;
 } RfSideOnlineOperationV1;
 
 typedef bool (*RfSideOnlineApplyXactV1)(void *arg, const RfSideOnlineOperationV1 *operation);
@@ -62,6 +64,7 @@ typedef bool (*RfSideOnlinePreflightUndoV1)(void *arg, const RfSideOnlineOperati
 typedef bool (*RfSideOnlinePreflightProjectionV1)(void *arg,
 												  const RfSideOnlineOperationV1 *operation);
 typedef bool (*RfSideOnlineSpaceV1)(void *arg, const RfSideOnlineOperationV1 *operation);
+typedef bool (*RfSideOnlineControlV1)(void *arg, const RfSideOnlineOperationV1 *operation);
 typedef bool (*RfSideOnlineBeginProtectedSetV1)(void *arg);
 typedef void (*RfSideOnlineEndProtectedSetV1)(void *arg, bool complete);
 
@@ -78,6 +81,8 @@ typedef struct RfSideOnlineApplyOpsV1 {
 	RfSideOnlineApplyProjectionV1 apply_projection;
 	RfSideOnlineSpaceV1 preflight_space;
 	RfSideOnlineSpaceV1 apply_space;
+	RfSideOnlineControlV1 preflight_control;
+	RfSideOnlineControlV1 apply_control;
 	/* Zero selects the whole plan. A nonzero original thread selects only
 	 * its operations; this is a selector, never recovery authority. */
 	uint16 source_thread;
@@ -202,6 +207,27 @@ extern uint32 rf_side_online_plan_space_contribution_count_v1(const RfSideOnline
 extern bool rf_side_online_plan_space_contribution_v1(const RfSideOnlinePlanV1 *plan,
 													  uint32 operation, uint32 locator_index,
 													  RfSideSpaceContributionV1 *out);
+
+/* Pure typed ancestry within the complete retained input, including history.
+ * Both operation indices must contribute to this exact key/block and retain
+ * the same incarnation. terminal describes this block, not other effects of
+ * a structural/COMMIT record. Refusal preserves terminal. The DATA owner must
+ * separately bind both indices to full original claims and record identities;
+ * this query alone grants no durability, physical disposal or WAL retirement. */
+extern bool rf_side_online_plan_space_covers_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterSpaceIdentityKey *key, BlockNumber block, uint32 ancestor_operation,
+	uint32 completed_operation, bool *terminal);
+
+typedef struct RfSideSpaceTerminalV1 {
+	uint32 operation;
+	RfSideSpaceContributionV1 contribution;
+} RfSideSpaceTerminalV1;
+
+/* Select this block's terminal contribution using the same complete, strict
+ * retained ancestry proof. No source/durability authority; refusal preserves
+ * output, including when no retained operation contributes to this block. */
+extern bool rf_side_online_plan_space_terminal_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterSpaceIdentityKey *key, BlockNumber block, RfSideSpaceTerminalV1 *out);
 
 /* One decoded record, no retained operation array or payload allocation.
  * Reuses the replay decoder but returns only provisional contribution owners.

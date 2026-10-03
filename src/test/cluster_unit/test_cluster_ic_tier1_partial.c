@@ -92,6 +92,35 @@ UT_DEFINE_GLOBALS();
 
 static int ut_backpressure_fd = -1;
 static unsigned int ut_backpressure_calls = 0;
+static ResourceXIntentSlot ut_rx_completed[8];
+static bool ut_rx_sent[8];
+static unsigned ut_rx_completed_count;
+static bool ut_rx_route_send;
+static bool ut_rx_rdma_busy;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	abort();
+}
+
+bool
+cluster_ic_rdma_pending_outbound(int32 peer)
+{
+	(void)peer;
+	return ut_rx_rdma_busy;
+}
+
+void
+cluster_lms_outbound_resource_x_send_complete(const ResourceXIntentSlot *intent, bool sent)
+{
+	if (ut_rx_completed_count >= lengthof(ut_rx_completed))
+		abort();
+	ut_rx_completed[ut_rx_completed_count] = *intent;
+	ut_rx_sent[ut_rx_completed_count++] = sent;
+}
 
 static ssize_t
 ut_backpressured_send(int fd, const void *buf, size_t len, int flags)
@@ -367,6 +396,8 @@ ClusterICSendResult
 cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload,
 						 uint32 payload_len)
 {
+	if (ut_rx_route_send)
+		return ClusterICOps_Tier1.send_bytes(dest_node_id, payload, payload_len);
 #ifdef PGRAC_CONTROL_TRANSPORT_EMBEDDED
 	if (ut_send_envelope_hook != NULL)
 		return ut_send_envelope_hook(msg_type, dest_node_id, payload, payload_len);
@@ -1160,6 +1191,94 @@ UT_TEST(test_fifo_full_refuses_honestly)
  * close_peer frees them all (counted, never silent) so a reconnect can
  * never replay stale frames onto the new stream.
  */
+UT_TEST(test_resource_x_tail_and_fifo_complete_exact_episodes)
+{
+	ResourceXIntentSlot first = { 0 }, second;
+	ClusterICPlane saved_plane = tier1_my_plane;
+	uint64 saved_epoch = Tier1Shmem->peers[UT_PEER_ID].conn_epoch;
+	char bytes[128] = { 'R' };
+
+	tier1_my_plane = CLUSTER_IC_PLANE_DATA;
+	Tier1Shmem->peers[UT_PEER_ID].conn_epoch = cluster_epoch_get_current();
+	ut_rx_route_send = true;
+	ut_rx_completed_count = 0;
+	first.destination_node = UT_PEER_ID;
+	first.state = RESOURCE_X_INTENT_SLOT_STAGED;
+	first.send_episode = 71;
+	/* Existing RDMA queue ownership is checked BEFORE passing a new frame.
+	 * It is not a receipt or completion proof for an already queued send. */
+	ut_rx_rdma_busy = true;
+	UT_ASSERT_EQ(cluster_ic_tier1_send_resource_x_intent(RESOURCE_X_MSG_BLOCK_TO_N, UT_PEER_ID,
+														 bytes, sizeof(bytes), &first),
+				 CLUSTER_IC_SEND_NOT_ADMITTED);
+	UT_ASSERT_EQ(ut_rx_completed_count, 0);
+	ut_rx_rdma_busy = false;
+	second = first;
+	second.send_episode = 72;
+	(void)ut_fill_until_eagain(ut_tx_fd);
+	UT_ASSERT_EQ(cluster_ic_tier1_send_resource_x_intent(RESOURCE_X_MSG_BLOCK_TO_N, UT_PEER_ID,
+														 bytes, sizeof(bytes), &first),
+				 CLUSTER_IC_SEND_WOULD_BLOCK);
+	UT_ASSERT_EQ(cluster_ic_tier1_send_resource_x_intent(RESOURCE_X_MSG_BLOCK_TO_N, UT_PEER_ID,
+														 bytes, sizeof(bytes), &second),
+				 CLUSTER_IC_SEND_WOULD_BLOCK);
+	UT_ASSERT_EQ(ut_rx_completed_count, 0);
+	UT_ASSERT_EQ(cluster_ic_tier1_drain_outbound(UT_PEER_ID), CLUSTER_IC_SEND_WOULD_BLOCK);
+	UT_ASSERT_EQ(ut_rx_completed_count, 0);
+	(void)ut_drain_all_and_sweep(UT_PEER_ID, ut_rx_fd, ut_acc, sizeof(ut_acc));
+	UT_ASSERT_EQ(ut_rx_completed_count, 2);
+	UT_ASSERT(ut_rx_sent[0] && ut_rx_sent[1]);
+	UT_ASSERT_EQ(ut_rx_completed[0].send_episode, 71);
+	UT_ASSERT_EQ(ut_rx_completed[1].send_episode, 72);
+	UT_ASSERT_EQ(cluster_ic_tier1_drain_outbound(UT_PEER_ID), CLUSTER_IC_SEND_DONE);
+	UT_ASSERT_EQ(ut_rx_completed_count, 2);
+	ut_rx_route_send = false;
+	tier1_my_plane = saved_plane;
+	Tier1Shmem->peers[UT_PEER_ID].conn_epoch = saved_epoch;
+}
+
+UT_TEST(test_resource_x_close_returns_each_unsent_owner_once)
+{
+	ResourceXIntentSlot intent = { 0 };
+	ClusterICPlane saved_plane = tier1_my_plane;
+	char bytes[128] = { 'C' };
+
+	tier1_my_plane = CLUSTER_IC_PLANE_DATA;
+	Tier1Shmem->peers[UT_PEER_ID].conn_epoch = cluster_epoch_get_current();
+	ut_rx_route_send = true;
+	ut_rx_completed_count = 0;
+	intent.destination_node = UT_PEER_ID;
+	intent.state = RESOURCE_X_INTENT_SLOT_STAGED;
+	intent.send_episode = 81;
+	(void)ut_fill_until_eagain(ut_tx_fd);
+	UT_ASSERT_EQ(cluster_ic_tier1_send_resource_x_intent(RESOURCE_X_MSG_BLOCK_TO_N, UT_PEER_ID,
+														 bytes, sizeof(bytes), &intent),
+				 CLUSTER_IC_SEND_WOULD_BLOCK);
+	intent.send_episode++;
+	UT_ASSERT_EQ(cluster_ic_tier1_send_resource_x_intent(RESOURCE_X_MSG_BLOCK_TO_N, UT_PEER_ID,
+														 bytes, sizeof(bytes), &intent),
+				 CLUSTER_IC_SEND_WOULD_BLOCK);
+	UT_ASSERT_EQ(ut_rx_completed_count, 0);
+	ut_release_backpressure(ut_tx_fd);
+	cluster_ic_tier1_close_peer(UT_PEER_ID, "unit close queued episodes");
+	UT_ASSERT_EQ(ut_rx_completed_count, 2);
+	UT_ASSERT(!ut_rx_sent[0] && !ut_rx_sent[1]);
+	UT_ASSERT_EQ(ut_rx_completed[0].send_episode, 81);
+	UT_ASSERT_EQ(ut_rx_completed[1].send_episode, 82);
+	cluster_ic_tier1_close_peer(UT_PEER_ID, "unit duplicate close");
+	UT_ASSERT_EQ(ut_rx_completed_count, 2);
+	close(ut_rx_fd);
+	ut_rx_fd = -1;
+	tier1_my_plane = saved_plane;
+	ut_reconnect_peer();
+	UT_ASSERT_EQ(cluster_ic_tier1_send_resource_x_intent(RESOURCE_X_MSG_BLOCK_TO_N, UT_PEER_ID,
+														 bytes, sizeof(bytes), &intent),
+				 CLUSTER_IC_SEND_DONE);
+	(void)ut_drain_all_and_sweep(UT_PEER_ID, ut_rx_fd, ut_acc, sizeof(ut_acc));
+	UT_ASSERT_EQ(ut_rx_completed_count, 2); /* Immediate DONE belongs to the caller. */
+	ut_rx_route_send = false;
+}
+
 UT_TEST(test_close_peer_clears_fifo)
 {
 	static char frame_u[512];
@@ -1343,16 +1462,22 @@ UT_TEST(test_stream_data_epoch_role_and_native_fork)
 	ClusterICTier1Stream stream;
 	pid_t child;
 	int status;
+	uint64 generation;
 	MyAuxProcType = LmsProcess;
 	cluster_ic_tier1_set_my_data_channel(0, 1);
 	ut_reconnect_peer();
 	UT_ASSERT(cluster_ic_tier1_stream_capture(UT_PEER_ID, &stream));
 	UT_ASSERT_EQ(stream.plane, CLUSTER_IC_PLANE_DATA);
 	UT_ASSERT_EQ(stream.channel, 0);
+	generation = cluster_ic_tier1_resource_x_stream_generation(UT_PEER_ID, 0);
+	UT_ASSERT(generation != 0);
+	UT_ASSERT_EQ(cluster_ic_tier1_resource_x_stream_generation(cluster_node_id, 0), 1);
+
 	MyAuxProcType = LmsWorker1Process;
 	UT_ASSERT(!cluster_ic_tier1_stream_current(&stream));
 	MyAuxProcType = LmsProcess;
 	++ut_epoch;
+	UT_ASSERT_EQ(cluster_ic_tier1_resource_x_stream_generation(UT_PEER_ID, 0), 0);
 	UT_ASSERT(!cluster_ic_tier1_stream_current(&stream));
 	UT_ASSERT(!cluster_ic_tier1_stream_capture(UT_PEER_ID, &ut_first_stream));
 	--ut_epoch;
@@ -1372,7 +1497,14 @@ UT_TEST(test_stream_data_epoch_role_and_native_fork)
 	cluster_ic_tier1_set_my_plane(CLUSTER_IC_PLANE_CONTROL);
 	cluster_ic_tier1_set_my_data_channel(0, 1);
 	UT_ASSERT(!cluster_ic_tier1_stream_current(&stream));
+	UT_ASSERT_EQ(cluster_ic_tier1_resource_x_stream_generation(UT_PEER_ID, 0), generation);
+	tier1_stream_bind(UT_PEER_ID);
+	UT_ASSERT_EQ(cluster_ic_tier1_resource_x_stream_generation(UT_PEER_ID, 0), generation + 1);
+	pg_atomic_write_u64(&Tier1Shmem->peers[UT_PEER_ID].resource_x_stream_generation, UINT64_MAX);
+	tier1_stream_bind(UT_PEER_ID);
+	UT_ASSERT_EQ(cluster_ic_tier1_resource_x_stream_generation(UT_PEER_ID, 0), 0);
 	cluster_ic_tier1_close_peer(UT_PEER_ID, NULL);
+	UT_ASSERT_EQ(cluster_ic_tier1_resource_x_stream_generation(UT_PEER_ID, 0), 0);
 	close(ut_rx_fd);
 	ut_rx_fd = -1;
 	MyAuxProcType = LmonProcess;
@@ -1412,7 +1544,7 @@ int
 main(void)
 {
 	MyProcPid = getpid();
-	UT_PLAN(25);
+	UT_PLAN(27);
 
 	UT_RUN(test_stop_poll_requires_initialized_actual_plane_owner);
 	UT_RUN(test_connect_registers_peer_fd);
@@ -1434,6 +1566,8 @@ main(void)
 	UT_RUN(test_fifo_preserves_multi_frame_order);
 	UT_RUN(test_backpressured_peer_does_not_block_other_peer);
 	UT_RUN(test_fifo_full_refuses_honestly);
+	UT_RUN(test_resource_x_tail_and_fifo_complete_exact_episodes);
+	UT_RUN(test_resource_x_close_returns_each_unsent_owner_once);
 	UT_RUN(test_close_peer_clears_fifo);
 	UT_RUN(test_stop_poll_owner_channel_and_idle_capacity);
 	UT_RUN(test_stream_accept_bindings_do_not_reuse_fd_identity);

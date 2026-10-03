@@ -7,9 +7,13 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/xlog_internal.h"
+#include "catalog/pg_control.h"
 #include "cluster/cluster_remote_xact.h"
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_side_online_owner.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "storage/standbydefs.h"
 
 #ifdef RF_SIDE_OWNER_TESTING
 #define owner_alloc(bytes_) calloc(1, (bytes_))
@@ -371,6 +375,75 @@ side_owner_apply_space(void *arg, const RfSideOnlineOperationV1 *operation)
 		   && side_owner_authority_fresh(owner) && owner->apply_space(owner->space_arg, operation);
 }
 
+/*
+ * These records describe the failed writer's native control/standby state.
+ * The survivor retains its own ControlFile and striped/leased allocators.
+ * This is an explicit original-source consumer, not permission to discard
+ * unknown SIDE work. In particular cache invalidations need the RESET owner.
+ */
+static bool
+side_owner_preflight_control(void *arg, const RfSideOnlineOperationV1 *operation)
+{
+	RfSideOnlineProductionOwnerV1 *owner = arg;
+	const ClusterUndoRecoveryScopeV1 *scope;
+	const RfPageReplayRecordIdentityV1 *record;
+	uint8 info;
+
+	if (owner == NULL || !owner->protected_set_active || owner->undo_authority == NULL
+		|| operation == NULL || operation->kind != RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
+		|| operation->history_only || !side_owner_authority_fresh(owner))
+		return false;
+	scope = &owner->undo_scope;
+	record = &operation->identity.record;
+	if (scope->authority != owner->undo_authority || scope->plan != owner->protected_plan
+		|| scope->authority->serial_guard == NULL
+		|| scope->authority->serial_guard->mode != CLUSTER_RECOVERY_SERIAL_ONLINE
+		|| record->system_identifier != scope->duty.system_identifier
+		|| memcmp(record->storage_uuid, scope->duty.storage_uuid, 16) != 0
+		|| record->origin_thread == 0 || record->origin_thread != scope->cut.failed_thread
+		|| record->origin_thread != scope->duty.origin_thread_id
+		|| scope->cut.origin_owner_incarnation == 0
+		|| scope->cut.origin_owner_incarnation != scope->duty.origin_owner_incarnation
+		|| scope->cut.flags != RF_CONTRIBUTOR_CUT_COMPLETE
+		|| record->timeline_id != scope->cut.timeline_id
+		|| record->read_rec_ptr == InvalidXLogRecPtr
+		|| record->read_rec_ptr < scope->cut.scan_begin_inclusive
+		|| record->end_rec_ptr <= record->read_rec_ptr
+		|| record->end_rec_ptr > scope->cut.scan_end_exclusive
+		|| !cluster_undo_recovery_origin_authorized_v1(record->origin_thread - 1))
+		return false;
+	info = record->info & ~XLR_INFO_MASK;
+	if (record->rmid == RM_STANDBY_ID)
+		return info == XLOG_STANDBY_LOCK || info == XLOG_RUNNING_XACTS;
+	if (record->rmid != RM_XLOG_ID)
+		return false;
+	switch (info) {
+	case XLOG_CHECKPOINT_SHUTDOWN:
+	case XLOG_CHECKPOINT_ONLINE:
+	case XLOG_NEXTOID:
+	case XLOG_PARAMETER_CHANGE:
+	case XLOG_FPW_CHANGE:
+	case XLOG_SWITCH:
+	case XLOG_NOOP:
+	case XLOG_BACKUP_END:
+	case XLOG_RESTORE_POINT:
+	case XLOG_END_OF_RECOVERY:
+	case XLOG_OVERWRITE_CONTRECORD:
+		return true;
+	default:
+		return false;
+	}
+}
+
+static bool
+side_owner_apply_control(void *arg, const RfSideOnlineOperationV1 *operation)
+{
+	if (!side_owner_preflight_control(arg, operation))
+		return false;
+	cluster_scn_recovery_replay_observe(operation->control_scn);
+	return true;
+}
+
 RfPageProofDetailV1
 rf_side_online_production_preflight_v1(const RfSideOnlinePlanV1 *plan,
 									   RfSideOnlineProductionOwnerV1 *owner)
@@ -393,6 +466,8 @@ rf_side_online_production_preflight_v1(const RfSideOnlinePlanV1 *plan,
 	ops.apply_xact = side_owner_apply_xact;
 	ops.apply_undo = side_owner_apply_undo;
 	ops.apply_projection = side_owner_apply_projection;
+	ops.preflight_control = side_owner_preflight_control;
+	ops.apply_control = side_owner_apply_control;
 	if (owner->preflight_space != NULL && owner->apply_space != NULL) {
 		ops.preflight_space = side_owner_preflight_space;
 		ops.apply_space = side_owner_apply_space;
@@ -424,6 +499,8 @@ rf_side_online_production_apply_v1(const RfSideOnlinePlanV1 *plan,
 	ops.apply_xact = side_owner_apply_xact;
 	ops.apply_undo = side_owner_apply_undo;
 	ops.apply_projection = side_owner_apply_projection;
+	ops.preflight_control = side_owner_preflight_control;
+	ops.apply_control = side_owner_apply_control;
 	if (owner->preflight_space != NULL && owner->apply_space != NULL) {
 		ops.preflight_space = side_owner_preflight_space;
 		ops.apply_space = side_owner_apply_space;

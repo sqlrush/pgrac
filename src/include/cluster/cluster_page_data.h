@@ -43,6 +43,16 @@ extern bool cluster_page_data_receipt_read_v1(const ClusterPageDataReceiptV1 *re
 											  ClusterPageDataTargetV1 *out);
 extern void cluster_page_data_receipt_free_v1(ClusterPageDataReceiptV1 **receipt);
 
+struct ClusterThreadRecoveryFabricPlanV1;
+/* Bind typed SPACE DATA to its exact original contribution and complete
+ * retained ancestry. Ordinary PAGE receipts keep their existing proof path.
+ * The caller must retain this immutable plan until all receipts/ACKs using
+ * it are freed. Remote notices bind to the receiver's own retained plan;
+ * no pointer or ancestry claim is accepted from the wire. Refusal leaves
+ * the receipt unchanged. This grants no checkpoint or WAL retirement. */
+extern bool cluster_page_data_bind_plan_v1(ClusterPageDataReceiptV1 *receipt,
+	const struct ClusterThreadRecoveryFabricPlanV1 *plan);
+
 /* Combine actual DATA completions with one sealed, retained PAGE input.
  * Sources are the original full claims in the plan's participant order;
  * receipts are unique and ordered by the plan's target identity. Each must

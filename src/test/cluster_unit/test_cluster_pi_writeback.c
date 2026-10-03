@@ -97,7 +97,24 @@ rf_side_online_plan_contribution_owners_v1(const RfSideOnlinePlanV1 *plan, uint3
 	return true;
 }
 /* The SIDE planner is an explicit boundary in this endpoint fixture. Its
- * typed payload/history enumeration executes separately in side_xact. */
+ * typed payload/history enumeration executes separately in side_xact;
+ * actual SPACE DATA/ancestry/ACK integration executes in page_data. This
+ * scheduling fixture must never fabricate typed SPACE disposal authority. */
+bool
+rf_side_online_plan_space_covers_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterSpaceIdentityKey *key, BlockNumber block, uint32 ancestor_operation,
+	uint32 completed_operation, bool *terminal)
+{
+	return false;
+}
+
+bool
+rf_side_online_plan_space_terminal_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterSpaceIdentityKey *key, BlockNumber block, RfSideSpaceTerminalV1 *out)
+{
+	return false;
+}
+
 uint32
 rf_side_online_plan_space_contribution_count_v1(const RfSideOnlinePlanV1 *plan, uint32 index)
 {

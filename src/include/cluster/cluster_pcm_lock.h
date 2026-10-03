@@ -317,6 +317,8 @@ extern bool cluster_pcm_rx_requester_wait_snapshot(const BufferTag *tag,
 	X(PCM_RX_RESERVATION_WAIT, "active_reservation_same_claim_wait_count")                         \
 	X(PCM_RX_RESERVATION_CONFLICT, "active_reservation_conflict_count")                            \
 	X(PCM_RX_RESERVATION_MALFORMED, "active_reservation_malformed_count")                          \
+	X(PCM_RX_POTENTIAL_LOSS, "request_potential_loss_count")                                       \
+	X(PCM_RX_RESEND, "request_resend_count")                                                       \
 	X(PCM_RX_DISPATCH, "head_transport_dispatch_count")                                            \
 	X(PCM_RX_FOLLOWER_DUPLICATE_ENQUEUE, "follower_duplicate_transport_enqueue_count")             \
 	X(PCM_RX_SEMANTIC_PROGRESS, "semantic_progress_count")                                         \
@@ -781,7 +783,8 @@ typedef enum ResourceXIntentProbeResult {
 	RESOURCE_X_INTENT_PROBE_CORRUPT = 4,
 	/* Local work only: never encoded as a wire intent. */
 	RESOURCE_X_INTENT_PROBE_DELIVERY = 5,
-	RESOURCE_X_INTENT_PROBE_SOURCE_FINISH = 6
+	RESOURCE_X_INTENT_PROBE_SOURCE_FINISH = 6,
+	RESOURCE_X_INTENT_PROBE_SOURCE_SETTLEMENT = 7
 } ResourceXIntentProbeResult;
 
 typedef enum ResourceXIntentState {
@@ -797,7 +800,8 @@ typedef enum ResourceXIntentOwnerKind {
 	RESOURCE_X_INTENT_OWNER_HOLDER_STATUS = 3,
 	RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE = 4,
 	RESOURCE_X_INTENT_OWNER_REQUESTER_SETTLEMENT = 5,
-	RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE = 6
+	RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE = 6,
+	RESOURCE_X_INTENT_OWNER_REQUESTER_SEND = 7 /* Transport only; no authority. */
 } ResourceXIntentOwnerKind;
 
 /* This handle is meaningful only together with its resource-scoped owner
@@ -817,6 +821,8 @@ typedef struct ResourceXIntentSlot {
 	uint64 authority_generation;
 	uint64 first_armed_us;
 	uint64 last_attempt_us;
+	uint64 send_episode;
+	uint64 last_send_us;
 	uint32 destination_node;
 	uint16 payload_bytes;
 	uint8 kind;
@@ -826,8 +832,8 @@ typedef struct ResourceXIntentSlot {
 
 StaticAssertDecl(sizeof(ResourceXIntentBodyHandle) == 40,
 				 "ResourceXIntentBodyHandle layout must remain 40 bytes");
-StaticAssertDecl(sizeof(ResourceXIntentSlot) == 80,
-				 "ResourceXIntentSlot layout must remain 80 bytes");
+StaticAssertDecl(sizeof(ResourceXIntentSlot) == 96,
+				 "ResourceXIntentSlot local descriptor layout must remain 96 bytes");
 
 typedef enum ResourceXReclaimResult {
 	RESOURCE_X_RECLAIM_NONE = 1,
@@ -1987,6 +1993,19 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_settlement_prepar
 	const ResourceXDecodedFrame *settlement, int32 authenticated_master_node,
 	ResourceXSourceSettlementPlan *plan_out,
 	ResourceXSourceSettlementCommitObservation *observation_out);
+/* Bounded receiver continuation; this is scheduling ownership, never authority. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_settlement_receive_begin_exact(
+	const ResourceXDecodedFrame *settlement, int32 master, uint32 peer_generation,
+	ResourceXSourceSettlementPlan *plan, ResourceXSourceSettlementCommitObservation *observation,
+	uint64 *claim);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_settlement_busy_exact(
+	const ResourceXDecodedFrame *busy, int32 source, int channel, uint64 stream_generation);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_settlement_receive_snapshot_exact(
+	const ResourceXAcquisitionRef *ref, ResourceXDecodedFrame *settlement, int32 *master,
+	uint32 *peer_generation);
+extern bool cluster_pcm_lock_resource_x_source_settlement_receive_end_exact(
+	const ResourceXAssertion *assertion, uint64 claim, const ResourceXDecodedFrame *ack);
+
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_settlement_commit_exact(
 	const ResourceXDecodedFrame *settlement, int32 authenticated_master_node,
 	const ResourceXSourceSettlementPlan *plan,
@@ -2054,11 +2073,26 @@ cluster_pcm_lock_resource_x_outbound_intent_not_admitted_exact(const ResourceXIn
 extern ResourceXIntentResult
 cluster_pcm_lock_resource_x_outbound_intent_stage_exact(const ResourceXIntentSlot *expected,
 														uint64 now_us);
+extern ResourceXIntentResult cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(
+	const ResourceXIntentSlot *expected, uint64 now_us, ResourceXIntentSlot *staged_out);
 extern ResourceXIntentResult
 cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(const ResourceXIntentSlot *expected,
 															 uint64 now_us);
 extern bool
 cluster_pcm_lock_resource_x_outbound_intent_complete_exact(const ResourceXIntentSlot *expected);
+extern ResourceXIntentResult
+cluster_pcm_lock_resource_x_requester_send_begin_exact(const ResourceXDecodedFrame *frame,
+													   int32 master, uint32 frame_count,
+													   uint64 now_us, ResourceXIntentSlot *out);
+extern bool
+cluster_pcm_lock_resource_x_requester_send_current_exact(const ResourceXIntentSlot *ticket);
+extern bool
+cluster_pcm_lock_resource_x_requester_send_complete_exact(const ResourceXIntentSlot *ticket,
+														  bool sent, uint64 now_us);
+
+extern bool
+cluster_pcm_lock_resource_x_outbound_transport_complete_exact(const ResourceXIntentSlot *expected,
+															  bool sent, uint64 now_us);
 extern ResourceXIntentProbeResult
 cluster_pcm_lock_resource_x_ready_intent_probe_exact(const BufferTag *tag, uint32 *owner_cursor,
 													 ResourceXIntentSlot *slot_out);

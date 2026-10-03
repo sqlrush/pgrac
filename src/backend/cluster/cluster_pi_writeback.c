@@ -892,6 +892,7 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 		ClusterWalWriterToken native;
 		bool valid
 			= cluster_page_data_from_notice_v1(wb_notice, i, &receipt)
+			  && cluster_page_data_bind_plan_v1(receipt, wb_notice->plan)
 			  && cluster_bufmgr_ack_pi_at_data_v1(receipt, page, sources, count, wb_notice->inputs,
 												  &ack)
 			  && cluster_page_data_pi_ack_export_v1(ack, receipt, &native)
@@ -1031,6 +1032,16 @@ static bool
 wb_batch_storage(uint32 index, const RfPageOnlinePlanV1 *page)
 {
 	uint32 count = rf_page_online_plan_target_count_v1(page);
+	if (wb_batch->tags[index].forkNum == SPACE_FORKNUM) {
+		ClusterSpaceIdentityKey key = { 0 };
+		key.system_identifier = wb_batch->local.claim.identity.system_identifier;
+		key.database_incarnation = wb_batch->local.claim.database_incarnation;
+		memcpy(key.storage_uuid, wb_batch->local.claim.identity.storage_uuid, 16);
+		key.locator = BufTagGetRelFileLocator(&wb_batch->tags[index]);
+		return cluster_bufmgr_observe_pi_space_storage_v1(
+			&key, &wb_batch->storage_cuts[index], wb_batch->plan, wb_batch->sources,
+			wb_batch->source_count, &wb_batch->receipts[index]);
+	}
 	for (uint32 i = 0; i < count; i++) {
 		RfPageOnlineTargetViewV1 view;
 		BufferTag tag;
@@ -1131,6 +1142,7 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 			AbsorbSyncRequests();
 			wb_batch->qualified[i]
 				= wb_batch->receipts[i] != NULL
+				  && cluster_page_data_bind_plan_v1(wb_batch->receipts[i], wb_batch->plan)
 				  && (cluster_page_data_pi_proof_v1(wb_batch->receipts[i], page, wb_batch->sources,
 													wb_batch->source_count, &x)
 					  || cluster_page_data_pi_storage_proof_v1(wb_batch->receipts[i], page,
