@@ -5557,6 +5557,8 @@ UT_TEST(test_startup_rejects_import_and_preserves_recovery)
 	UT_ASSERT_EQ(out.input_kind, CLUSTER_WAL_STARTUP_RECOVERED);
 }
 
+#include "test_cluster_control_root_initialized.inc"
+
 UT_TEST(test_startup_invalid_arguments_and_aliases_cannot_leave_partial_input)
 {
 	uint8 bytes[1536];
@@ -21352,7 +21354,14 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(388);
+	UT_PLAN(395);
+	UT_RUN(test_initialized_seed_literal_roundtrip_has_no_writer);
+	UT_RUN(test_initialized_bound_phases_keep_real_successor_rules);
+	UT_RUN(test_initialized_seed_refuses_unearned_target_and_prior_root);
+	UT_RUN(test_initialized_seed_requires_complete_initial_root);
+	UT_RUN(test_initialized_bound_source_cannot_be_a_served_generation);
+	UT_RUN(test_initialized_digest_binds_original_common_objects_and_cut);
+	UT_RUN(test_initialized_does_not_make_clean_or_import_legal);
 	UT_RUN(test_wal_inputs_cold_all_origins_exact_native_anchor);
 	UT_RUN(test_wal_inputs_cold_retained_generations_remain_distinct);
 	UT_RUN(test_wal_inputs_cold_terminal_and_pending_are_not_checkpoint_sources);

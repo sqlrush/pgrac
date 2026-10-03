@@ -149,8 +149,9 @@ typedef enum ClusterWalStartupPhase {
 
 typedef enum ClusterWalStartupInputKind {
 	CLUSTER_WAL_STARTUP_CLEAN = 1,
-	CLUSTER_WAL_STARTUP_RECOVERED = 2
+	CLUSTER_WAL_STARTUP_RECOVERED = 2,
 	/* Value 3 was cold import; deliberately not supported or reused. */
+	CLUSTER_WAL_STARTUP_INITIALIZED = 4
 } ClusterWalStartupInputKind;
 
 typedef struct ClusterWalStartupImage {
