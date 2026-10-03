@@ -235,14 +235,44 @@ tier1_stream_bind(int32 peer)
 	if (tier1_stream_next == PG_UINT64_MAX)
 		tier1_stream_exhausted = true;
 	tier1_stream_serial[peer] = tier1_stream_exhausted ? 0 : ++tier1_stream_next;
-	if (Tier1Shmem != NULL && tier1_my_plane == CLUSTER_IC_PLANE_DATA) {
+	if (Tier1Shmem != NULL) {
 		uint64 generation
 			= pg_atomic_read_u64(&Tier1Shmem->peers[peer].resource_x_stream_generation);
-		/* One process owns each DATA channel. Exhaustion removes the observation. */
+		/* One original owner per plane/channel. CONTROL terminal inquiries
+		 * also need a non-reusable lifetime, independent of diagnostics. */
 		if (generation != UINT64_MAX)
 			pg_atomic_write_u64(&Tier1Shmem->peers[peer].resource_x_stream_generation,
 								generation + 1);
+		pg_write_barrier(); /* publish the new lifetime before CONNECTED */
 	}
+}
+
+/* HELLO and close must name the same nonzero CONTROL lifetime. Diagnostic
+ * reconnect_count starts at zero and may wrap; it is not an identity.
+ * The existing capability ABI is uint32, so exhaustion removes its proof. */
+static uint32
+tier1_control_capability_generation(int32 peer)
+{
+	uint64 generation;
+
+	if (tier1_my_plane != CLUSTER_IC_PLANE_CONTROL || Tier1Shmem == NULL)
+		return 0;
+	generation = pg_atomic_read_u64(&Tier1Shmem->peers[peer].resource_x_stream_generation);
+	return generation > 0 && generation <= UINT32_MAX ? (uint32)generation : 0;
+}
+
+static void
+tier1_note_peer_capabilities(int32 peer, uint32 capabilities)
+{
+	uint32 generation;
+
+	if (tier1_my_plane != CLUSTER_IC_PLANE_CONTROL)
+		return;
+	generation = tier1_control_capability_generation(peer);
+	if (generation != 0)
+		cluster_sf_note_peer_hello_capabilities_gen(peer, capabilities, generation);
+	else
+		cluster_sf_note_peer_disconnected(peer);
 }
 
 /*
@@ -2368,8 +2398,7 @@ tier1_peer_caps_reply_handler(const ClusterICEnvelope *env, const void *payload)
 		return;
 	}
 
-	cluster_sf_note_peer_hello_capabilities_gen(sender, cluster_ic_hello_capabilities(&msg),
-												Tier1Shmem->peers[sender].reconnect_count);
+	tier1_note_peer_capabilities(sender, cluster_ic_hello_capabilities(&msg));
 	elog(DEBUG1, "cluster_ic tier1 learned peer %d capabilities 0x%X via PEER_CAPS_REPLY", sender,
 		 cluster_ic_hello_capabilities(&msg));
 }
@@ -2528,8 +2557,7 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 	 * cross-node write (t/360 L5.5).  CONTROL owns caps; DATA only reads them.
 	 */
 	if (tier1_my_plane == CLUSTER_IC_PLANE_CONTROL) {
-		cluster_sf_note_peer_hello_capabilities_gen(peer_id, cluster_ic_hello_capabilities(&msg),
-													Tier1Shmem->peers[peer_id].reconnect_count);
+		tier1_note_peer_capabilities(peer_id, cluster_ic_hello_capabilities(&msg));
 		tier1_maybe_send_caps_reply(peer_id, cluster_ic_hello_capabilities(&msg));
 	}
 
@@ -2739,9 +2767,7 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 		/* CONTROL owns caps lifecycle (see the named-peer path above); a
 		 * DATA-plane worker only reads the shared store. */
 		if (tier1_my_plane == CLUSTER_IC_PLANE_CONTROL) {
-			cluster_sf_note_peer_hello_capabilities_gen(learned,
-														cluster_ic_hello_capabilities(&msg),
-														Tier1Shmem->peers[learned].reconnect_count);
+			tier1_note_peer_capabilities(learned, cluster_ic_hello_capabilities(&msg));
 			tier1_maybe_send_caps_reply(learned, cluster_ic_hello_capabilities(&msg));
 		}
 	}
@@ -3090,10 +3116,8 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 		 * and duplicate-connection tie-breaks where no established link
 		 * existed -- wiping the surviving connection's capabilities there
 		 * would zero them with no new HELLO to renote.  The generation of
-		 * the closing connection is the peer's reconnect_count BEFORE the
-		 * increment below (the same value the learn sites stamped while
-		 * this connection was established), so only the matching record is
-		 * invalidated.
+		 * the closing connection is the original owner's stream generation
+		 * (the same value stamped by HELLO), so only that record is invalidated.
 		 */
 		/*
 		 * spec-5.22e Hardening (RC#1 integration review): ONLY a CONTROL-plane
@@ -3107,9 +3131,9 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 		 * clears here as before (fail-closed preserved).
 		 */
 		if (tier1_my_plane == CLUSTER_IC_PLANE_CONTROL) {
-			if (Tier1Shmem != NULL)
-				cluster_sf_note_peer_disconnected_gen(peer_id,
-													  Tier1Shmem->peers[peer_id].reconnect_count);
+			uint32 generation = tier1_control_capability_generation(peer_id);
+			if (generation != 0)
+				cluster_sf_note_peer_disconnected_gen(peer_id, generation);
 			else
 				cluster_sf_note_peer_disconnected(peer_id);
 		}
@@ -3216,6 +3240,72 @@ cluster_ic_tier1_resource_x_stream_generation(int32 peer, int channel)
 	return pg_atomic_read_u64(&shared->peers[peer].resource_x_stream_generation) == generation
 			   ? generation
 			   : 0;
+}
+
+/* Read-only backend observation of the actual plane owners. HELLO capability
+ * identity is checked separately by semantic activation; the CONTROL counter
+ * here must correspond to that same producer record. No diagnostics renew it.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static uint64
+tier1_terminal_stream_sample(int32 peer, ClusterICPlane plane, int channel,
+							uint64 epoch, uint32 control_capability_generation)
+{
+	ClusterICTier1Shmem *shared = Tier1ShmemSlots[tier1_slot_of(plane, channel)];
+	const ClusterICPeerStateShmem *state;
+	uint64 serial;
+
+	if (shared == NULL || shared->magic != PGRAC_IC_TIER1_SHMEM_MAGIC)
+		return 0;
+	state = &shared->peers[peer];
+	serial = pg_atomic_read_u64(&state->resource_x_stream_generation);
+	pg_read_barrier();
+	if (serial == 0 || serial == UINT64_MAX || state->state != CLUSTER_IC_PEER_CONNECTED
+		|| pg_atomic_read_u32(&state->close_requested) != 0
+		|| (plane == CLUSTER_IC_PLANE_DATA && state->conn_epoch != epoch)
+		|| (plane == CLUSTER_IC_PLANE_CONTROL
+			&& (serial > UINT32_MAX || serial != control_capability_generation)))
+		return 0;
+	pg_read_barrier();
+	return pg_atomic_read_u64(&state->resource_x_stream_generation) == serial ? serial : 0;
+}
+
+bool
+cluster_ic_tier1_terminal_peer_sessions(int32 peer, uint64 epoch,
+									  uint32 control_capability_generation, int data_channels,
+									  ClusterICTerminalPeerSessions *out)
+{
+	ClusterICTerminalPeerSessions candidate;
+	int channel;
+
+	memset(&candidate, 0, sizeof(candidate));
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || cluster_interconnect_tier != CLUSTER_IC_TIER_1
+		|| peer < 0 || peer >= CLUSTER_MAX_NODES || peer == cluster_node_id
+		|| control_capability_generation == 0 || data_channels < 1
+		|| data_channels > CLUSTER_IC_TIER1_DATA_CHANNELS || cluster_epoch_get_current() != epoch)
+		return false;
+	candidate.control_stream_generation = tier1_terminal_stream_sample(
+		peer, CLUSTER_IC_PLANE_CONTROL, 0, epoch, control_capability_generation);
+	if (candidate.control_stream_generation == 0)
+		return false;
+	candidate.data_channels = (uint32)data_channels;
+	for (channel = 0; channel < data_channels; channel++) {
+		candidate.data_stream_generation[channel] = tier1_terminal_stream_sample(
+			peer, CLUSTER_IC_PLANE_DATA, channel, epoch, 0);
+		if (candidate.data_stream_generation[channel] == 0)
+			return false;
+	}
+	for (channel = 0; channel < data_channels; channel++)
+		if (candidate.data_stream_generation[channel] != tier1_terminal_stream_sample(
+				peer, CLUSTER_IC_PLANE_DATA, channel, epoch, 0))
+			return false;
+	if (candidate.control_stream_generation != tier1_terminal_stream_sample(
+			peer, CLUSTER_IC_PLANE_CONTROL, 0, epoch, control_capability_generation)
+		|| cluster_epoch_get_current() != epoch)
+		return false;
+	*out = candidate;
+	return true;
 }
 
 const ClusterICPeerStateShmem *

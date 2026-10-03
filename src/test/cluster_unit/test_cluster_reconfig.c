@@ -2716,6 +2716,56 @@ UT_TEST(test_stop_membership_preserves_all_nonliveness_requirements)
 	ut_prepare_exact_r4_membership();
 }
 
+/* SD98 asks about retained terminal proof, never owner liveness. */
+UT_TEST(test_terminal_membership_allows_only_target_freshness_gap)
+{
+	ClusterR4MembershipSnapshot got, empty = { 0 };
+
+	ut_prepare_exact_r4_membership();
+	cluster_reconfig_record_observed_fresh_alive(3, false);
+	UT_ASSERT(cluster_reconfig_terminal_peer_membership(3, &got));
+	UT_ASSERT_EQ(got.admitted_members_lo, 15);
+	UT_ASSERT_EQ(got.admitted_incarnation[3], 103);
+	UT_ASSERT_EQ(got.observed_generation[3], 23);
+	UT_ASSERT(!cluster_reconfig_get_observed_fresh_alive(3));
+	UT_ASSERT(!cluster_reconfig_lmon_snapshot_r4_membership(&got));
+	UT_ASSERT(memcmp(&got, &empty, sizeof(got)) == 0);
+	cluster_reconfig_record_observed_fresh_alive(2, false);
+	UT_ASSERT(!cluster_reconfig_terminal_peer_membership(3, &got));
+	UT_ASSERT(memcmp(&got, &empty, sizeof(got)) == 0);
+	ut_prepare_exact_r4_membership();
+}
+
+UT_TEST(test_terminal_membership_preserves_identity_and_quorum)
+{
+	ClusterR4MembershipSnapshot got, empty = { 0 };
+
+	for (unsigned fault = 0; fault < 10; fault++) {
+		ut_prepare_exact_r4_membership();
+		cluster_reconfig_record_observed_fresh_alive(3, false);
+		switch (fault) {
+		case 0: cluster_reconfig_record_observed_slot(3, 999, 23, 0); break;
+		case 1: cluster_reconfig_record_observed_slot(3, 103, 0, 0); break;
+		case 2: cluster_reconfig_record_observed_slot(3, 103, 23, 1); break;
+		case 3: cluster_membership_set_state(3, CLUSTER_MEMBER_DEAD); break;
+		case 4: ut_in_quorum_value = false; break;
+		case 5: ut_qvotec_status = CLUSTER_QVOTEC_STARTING; break;
+		case 6: ut_storage_members[0] = 7; break;
+		case 7: ut_declared_set[3] = false; break;
+		case 8: cluster_reconfig_record_observed_fresh_alive(0, false); break;
+		case 9: ut_set_self_incarnation_sequence(999, 999, 999); break;
+		}
+		memset(&got, 0xa5, sizeof(got));
+		UT_ASSERT(!cluster_reconfig_terminal_peer_membership(3, &got));
+		UT_ASSERT(memcmp(&got, &empty, sizeof(got)) == 0);
+	}
+	ut_prepare_exact_r4_membership();
+	UT_ASSERT(!cluster_reconfig_terminal_peer_membership(cluster_node_id, &got));
+	UT_ASSERT(!cluster_reconfig_terminal_peer_membership(-1, &got));
+	UT_ASSERT(!cluster_reconfig_terminal_peer_membership(CLUSTER_MAX_NODES, &got));
+	UT_ASSERT(!cluster_reconfig_terminal_peer_membership(3, NULL));
+}
+
 UT_TEST(test_r4_membership_snapshot_captures_exact_current_four_node_view)
 {
 	ClusterR4MembershipSnapshot snapshot;
@@ -7382,7 +7432,7 @@ UT_TEST(test_membership_cut_generation_uses_original_shmem_owner)
 int
 main(void)
 {
-	UT_PLAN(135);
+	UT_PLAN(137);
 	UT_RUN(test_stop_membership_terminal_peer_is_not_online_admission);
 	UT_RUN(test_stop_membership_preserves_all_nonliveness_requirements);
 	UT_RUN(test_stop_reconfig_shared_owners);
@@ -7408,6 +7458,8 @@ main(void)
 	UT_RUN(test_membership_cut_generation_uses_original_shmem_owner);
 	UT_RUN(test_formation_snapshot_no_pgproc_never_blocks_on_reconfig_lock);
 	UT_RUN(test_self_join_admitted_no_pgproc_never_blocks_on_reconfig_lock);
+	UT_RUN(test_terminal_membership_allows_only_target_freshness_gap);
+	UT_RUN(test_terminal_membership_preserves_identity_and_quorum);
 	UT_RUN(test_r4_membership_snapshot_captures_exact_current_four_node_view);
 	UT_RUN(test_r4_membership_snapshot_fails_closed_on_inexact_member_evidence);
 	UT_RUN(test_r4_membership_cannot_admit_a_different_storage_component);
