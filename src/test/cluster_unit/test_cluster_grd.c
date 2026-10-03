@@ -5741,8 +5741,8 @@ setup_recovery_control_fixture_observation(bool peer_done, bool before_bump)
 	cluster_grd_recovery_lmon_tick();
 	if (peer_done) {
 		cluster_grd_recovery_lmon_tick();
-		cluster_grd_recovery_mark_peer_done(2, 9,
-							cluster_grd_dead_bitmap_hash(ut_mock_last_event.dead_bitmap));
+		cluster_grd_recovery_mark_peer_done(
+			2, 9, cluster_grd_dead_bitmap_hash(ut_mock_last_event.dead_bitmap));
 	}
 }
 
@@ -6237,8 +6237,8 @@ UT_TEST(test_recovery_control_observes_protocol_cut_without_data_thaw)
 	cluster_grd_recovery_lmon_tick();
 	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_CLUSTER);
 	UT_ASSERT(!cluster_grd_recovery_control_snapshot(2, &snapshot));
-	cluster_grd_recovery_mark_peer_done(2, 9,
-							cluster_grd_dead_bitmap_hash(ut_mock_last_event.dead_bitmap));
+	cluster_grd_recovery_mark_peer_done(
+		2, 9, cluster_grd_dead_bitmap_hash(ut_mock_last_event.dead_bitmap));
 	UT_ASSERT(cluster_grd_recovery_control_snapshot(2, &snapshot));
 	UT_ASSERT_EQ(snapshot.event_id, 701);
 	UT_ASSERT_EQ(snapshot.episode_epoch, 9);
@@ -7317,6 +7317,243 @@ UT_TEST(test_retire_request_local_shadow_never_grants)
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
 }
 
+
+/* The leader can acquire before PG creates its parallel group. A worker must
+ * recognize that original holder without borrowing its release identity. */
+UT_TEST(test_parallel_group_grants_without_aliasing_release)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId leader = bast_holder(1, 100, 1);
+	ClusterGrdHolderId worker = bast_holder(1, 101, 2);
+	ClusterGrdHolderId stranger = bast_holder(1, 102, 3);
+	ClusterGrdHolderId remote = bast_holder(2, 101, 4);
+	ClusterGrdWaiterMeta group = { 0, 0, 101 };
+	ClusterGrdEntry *entry = NULL;
+
+	convert_reset();
+	bast_resid(5901, &resid);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &leader, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+													AccessExclusiveLock, NULL, NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_grant_conditional_meta(&resid, &worker, 1, 2, group, 0,
+														  UT_GES_OPCODE_REQUEST, AccessShareLock,
+														  NULL, NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_grant_conditional(&resid, &stranger, 1, 3, 0,
+													 UT_GES_OPCODE_REQUEST, AccessShareLock, NULL,
+													 NULL),
+				 CLUSTER_GRD_CONFLICT_NOWAIT);
+	UT_ASSERT_EQ(cluster_grd_entry_grant_conditional_meta(&resid, &remote, 2, 4, group, 0,
+														  UT_GES_OPCODE_REQUEST, AccessShareLock,
+														  NULL, NULL),
+				 CLUSTER_GRD_CONFLICT_NOWAIT);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, false, &entry), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_release_holder(entry, &worker), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_ngranted(entry), 1);
+	UT_ASSERT_EQ(cluster_grd_entry_release_holder(entry, &leader), CLUSTER_GRD_ENTRY_OK);
+	cluster_grd_entry_release(entry);
+	convert_teardown();
+}
+
+UT_TEST(test_parallel_group_waiter_drain_and_wfg)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId leader = bast_holder(1, 100, 1);
+	ClusterGrdHolderId worker = bast_holder(1, 101, 2);
+	ClusterGrdHolderId remote = bast_holder(2, 200, 3);
+	ClusterGrdWaiterMeta group = { 0, 77, 101 };
+	ClusterGrdGrantIdentity granted[2];
+
+	convert_reset();
+	ut_wfg_reset();
+	bast_resid(5902, &resid);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &leader, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+													AccessShareLock, NULL, NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &remote, 2, 3, 0, UT_GES_OPCODE_REQUEST,
+													RowExclusiveLock, NULL, NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant_meta(&resid, &worker, 1, 2, group, 0,
+														 UT_GES_OPCODE_REQUEST, AccessExclusiveLock,
+														 NULL, NULL),
+				 CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 101, 0, 2), 1);
+	UT_ASSERT_EQ(ut_wfg[0].waiter.lock_group_procno_plus_one, 101);
+	UT_ASSERT_EQ(ut_wfg[0].waiter.wait_seq, 77);
+	UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &remote, granted, 2), 1);
+	UT_ASSERT_EQ(granted[0].holder.procno, 101);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 101, 0, 2), 0);
+	UT_ASSERT_EQ(cluster_grd_entry_grant_conditional(
+					 &resid, &remote, 2, 3, 0, UT_GES_OPCODE_REQUEST, AccessShareLock, NULL, NULL),
+				 CLUSTER_GRD_CONFLICT_NOWAIT);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &remote, 2, 3, 0, UT_GES_OPCODE_REQUEST,
+													AccessShareLock, NULL, NULL),
+				 CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 3), 1);
+	UT_ASSERT_EQ(ut_wfg[0].blocker.procno, 101);
+	UT_ASSERT_EQ(ut_wfg[0].blocker.lock_group_procno_plus_one, 101);
+	UT_ASSERT_EQ(cluster_grd_cancel_waiter_by_id(&resid, &remote), CLUSTER_GRD_ENTRY_OK);
+	convert_teardown();
+}
+
+UT_TEST(test_parallel_group_convert_uses_original_holder_group)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId leader = bast_holder(1, 100, 1);
+	ClusterGrdHolderId worker = bast_holder(1, 101, 2);
+	ClusterGrdWaiterMeta group = { 0, 0, 101 };
+
+	convert_reset();
+	bast_resid(5903, &resid);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &leader, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+													AccessShareLock, NULL, NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant_meta(&resid, &worker, 1, 2, group, 0,
+														 UT_GES_OPCODE_REQUEST, AccessShareLock,
+														 NULL, NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	/* The caller supplies no group override: conversion derives it from holder. */
+	UT_ASSERT_EQ(cluster_grd_convert_or_enqueue(&resid, 1, 101, 0, AccessShareLock,
+												AccessExclusiveLock, 4, 1, 0, NULL, NULL),
+				 CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	convert_teardown();
+}
+
+UT_TEST(test_parallel_group_worker_cannot_wait_behind_blocked_ddl)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId leader = bast_holder(1, 100, 1);
+	ClusterGrdHolderId worker = bast_holder(1, 101, 2);
+	ClusterGrdHolderId ddl = bast_holder(2, 200, 3);
+	ClusterGrdWaiterMeta group = { 0, 0, 101 };
+	int saved_skips = cluster_ges_starvation_max_skips;
+	bool saved_enabled = cluster_grd_starvation_protection_enabled();
+
+	convert_reset();
+	cluster_grd_set_starvation_protection(true);
+	cluster_ges_starvation_max_skips = 1;
+	bast_resid(5904, &resid);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &leader, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+													AccessExclusiveLock, NULL, NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &ddl, 2, 3, 0, UT_GES_OPCODE_REQUEST,
+													AccessExclusiveLock, NULL, NULL),
+				 CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant_meta(&resid, &worker, 1, 2, group, 0,
+														 UT_GES_OPCODE_REQUEST, AccessShareLock,
+														 NULL, NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	cluster_grd_set_starvation_protection(saved_enabled);
+	cluster_ges_starvation_max_skips = saved_skips;
+	convert_teardown();
+}
+
+UT_TEST(test_parallel_group_redeclare_both_orders_and_exit)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId leader = bast_holder(1, 100, 1);
+	ClusterGrdHolderId worker = bast_holder(1, 101, 2);
+	ClusterGrdHolderId remote = bast_holder(2, 200, 3);
+	ClusterGrdGrantIdentity granted[2];
+	int saved_node = cluster_node_id;
+
+	cluster_node_id = 1;
+	for (int order = 0; order < 2; order++) {
+		convert_reset();
+		bast_resid(5905 + order, &resid);
+		if (order == 0)
+			UT_ASSERT_EQ(cluster_grd_entry_rebind_or_insert_holder_group(&resid, &worker, 1,
+																		 AccessShareLock, 101),
+						 CLUSTER_GRD_ENTRY_OK);
+		UT_ASSERT_EQ(cluster_grd_entry_rebind_or_insert_holder_group(&resid, &leader, 1,
+																	 AccessExclusiveLock, 0),
+					 CLUSTER_GRD_ENTRY_OK);
+		UT_ASSERT_EQ(cluster_grd_entry_rebind_or_insert_holder_group(&resid, &worker, 1,
+																	 AccessShareLock, 101),
+					 CLUSTER_GRD_ENTRY_OK);
+		UT_ASSERT_EQ(cluster_grd_entry_rebind_or_insert_holder_group(&resid, &remote, 2,
+																	 AccessShareLock, 101),
+					 CLUSTER_GRD_ENTRY_ERROR);
+		UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &remote, 2, 3, 0,
+														UT_GES_OPCODE_REQUEST, AccessExclusiveLock,
+														NULL, NULL),
+					 CLUSTER_GRD_ENQUEUED_WAITER);
+		cluster_grd_cleanup_on_backend_exit(101);
+		UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &leader, granted, 2), 1);
+		UT_ASSERT_EQ(granted[0].holder.node_id, 2);
+		convert_teardown();
+	}
+	cluster_node_id = saved_node;
+}
+
+UT_TEST(test_parallel_group_conversion_drain_retains_worker_group)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId leader = bast_holder(1, 100, 1);
+	ClusterGrdHolderId worker = bast_holder(1, 101, 2);
+	ClusterGrdHolderId remote = bast_holder(2, 200, 3);
+	ClusterGrdWaiterMeta group = { 0, 0, 101 };
+	ClusterGrdGrantIdentity granted[3];
+
+	convert_reset();
+	ut_wfg_reset();
+	bast_resid(5907, &resid);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &leader, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+													AccessShareLock, NULL, NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant_meta(&resid, &worker, 1, 2, group, 0,
+														 UT_GES_OPCODE_REQUEST, AccessShareLock,
+														 NULL, NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &remote, 2, 3, 0, UT_GES_OPCODE_REQUEST,
+													RowExclusiveLock, NULL, NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_convert_or_enqueue(&resid, 1, 101, 0, AccessShareLock,
+												AccessExclusiveLock, 4, 1, 0, NULL, NULL),
+				 CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 101, 0, 4), 1);
+	UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &remote, granted, 3), 1);
+	UT_ASSERT_EQ(granted[0].holder.procno, 101);
+	UT_ASSERT_EQ(granted[0].holder.request_id, 4);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 101, 0, 4), 0);
+	convert_teardown();
+}
+
+UT_TEST(test_parallel_group_unprotected_request_respects_fairness)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId leader = bast_holder(1, 100, 1);
+	ClusterGrdHolderId worker = bast_holder(1, 101, 2);
+	ClusterGrdHolderId remote = bast_holder(2, 200, 3);
+	ClusterGrdHolderId ddl = bast_holder(3, 300, 4);
+	ClusterGrdWaiterMeta group = { 0, 55, 101 };
+	int saved_skips = cluster_ges_starvation_max_skips;
+	bool saved_enabled = cluster_grd_starvation_protection_enabled();
+
+	convert_reset();
+	ut_wfg_reset();
+	cluster_grd_set_starvation_protection(true);
+	cluster_ges_starvation_max_skips = 1;
+	bast_resid(5908, &resid);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &leader, 1, 1, 0, UT_GES_OPCODE_REQUEST,
+													AccessShareLock, NULL, NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &remote, 2, 3, 0, UT_GES_OPCODE_REQUEST,
+													RowExclusiveLock, NULL, NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &ddl, 3, 4, 0, UT_GES_OPCODE_REQUEST,
+													ExclusiveLock, NULL, NULL),
+				 CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant_meta(&resid, &worker, 1, 2, group, 0,
+														 UT_GES_OPCODE_REQUEST, RowExclusiveLock,
+														 NULL, NULL),
+				 CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 101, 0, 2), 1);
+	cluster_grd_set_starvation_protection(saved_enabled);
+	cluster_ges_starvation_max_skips = saved_skips;
+	convert_teardown();
+}
+
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature used by the
@@ -7332,8 +7569,15 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(154);
+	UT_PLAN(161);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
+	UT_RUN(test_parallel_group_worker_cannot_wait_behind_blocked_ddl);
+	UT_RUN(test_parallel_group_convert_uses_original_holder_group);
+	UT_RUN(test_parallel_group_waiter_drain_and_wfg);
+	UT_RUN(test_parallel_group_grants_without_aliasing_release);
+	UT_RUN(test_parallel_group_redeclare_both_orders_and_exit);
+	UT_RUN(test_parallel_group_conversion_drain_retains_worker_group);
+	UT_RUN(test_parallel_group_unprotected_request_respects_fairness);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);

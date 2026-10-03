@@ -124,21 +124,30 @@ vertex_youngest_first_cmp(const ClusterLmdVertex *a, const ClusterLmdVertex *b)
 /*
  * Find a cycle-graph vertex index, returning -1 if not found.
  *
- *	spec-5.8 D8 — a WFG cycle vertex is a BACKEND, identified by
- *	(node_id, procno, cluster_epoch).  request_id / wait_seq are deliberately
+ *	spec-5.8 D8 — a WFG cycle vertex is a lock group, identified by
+ *	(node_id, effective leader procno, cluster_epoch). A nonparallel backend
+ *	is its own group. The original procno remains the exact cancel target.
+ *	request_id / wait_seq are deliberately
  *	NOT part of the cycle identity: a backend that HOLDS one resource (granted
  *	under request_id rA) and WAITS for another (request_id rB) must be the SAME
  *	graph vertex, or a real hold-and-wait deadlock splits into disjoint edges
  *	(rA-holder vs rB-waiter) that Tarjan can never close.  request_id / wait_seq
  *	/ xid ride on the vertex as victim-targeting metadata (the WAIT identity,
- *	via waiter-identity-wins in the dedup pass) — the D5 resolver still cancels
+ *	selected from an internal edge of the SCC) — the D5 resolver still cancels
  *	the exact (request_id, cluster_epoch, wait_seq) the victim is waiting on.
  */
+static uint32
+vertex_group_procno(const ClusterLmdVertex *v)
+{
+	return v->lock_group_procno_plus_one ? v->lock_group_procno_plus_one - 1 : v->procno;
+}
+
 static int
 find_vertex_index(const ClusterLmdVertex *list, int nvertices, const ClusterLmdVertex *target)
 {
 	for (int i = 0; i < nvertices; i++) {
-		if (list[i].node_id == target->node_id && list[i].procno == target->procno
+		if (list[i].node_id == target->node_id
+			&& vertex_group_procno(&list[i]) == vertex_group_procno(target)
 			&& list[i].cluster_epoch == target->cluster_epoch)
 			return i;
 	}
@@ -164,9 +173,8 @@ cluster_lmd_tarjan_scan_snapshot(const ClusterLmdWaitEdge *edges, int nedges,
 	ClusterLmdVertex *vertices;
 	int *adj_head, *adj_next, *adj_to;
 	int nvertices = 0;
-	int adj_used = 0;
 	int *index_arr, *lowlink_arr;
-	bool *on_stack;
+	bool *on_stack, *in_component;
 	int *scc_stack, scc_stack_top = 0;
 	int *call_stack_v, *call_stack_iter; /* iterative Tarjan frames */
 	int call_top = 0;
@@ -207,17 +215,13 @@ cluster_lmd_tarjan_scan_snapshot(const ClusterLmdWaitEdge *edges, int nedges,
 		adj_head[i] = -1;
 
 	/*
-	 * Pass 1: dedup waiters + blockers into vertices[] (by backend identity —
-	 * node/procno/epoch) + build adjacency.
+	 * Pass 1: dedup waiters + blockers by node/effective group/epoch and
+	 * build adjacency. Preserve the original edge index for victim selection.
 	 *
-	 *	spec-5.8 D8 waiter-identity-wins:  the waiter half of an edge carries
-	 *	the victim-targeting metadata that matters (the WAIT's request_id +
-	 *	wait_seq + xid), so a waiter occurrence OVERWRITES the stored vertex's
-	 *	metadata, while a blocker occurrence only fills a not-yet-seen backend
-	 *	(its hold metadata is a placeholder until that backend shows up as a
-	 *	waiter).  Every vertex in a real cycle has an out-edge — i.e. it is a
-	 *	waiter — so the chosen victim always ends up carrying its WAIT identity,
-	 *	and the D5 resolver cancels the exact request it is waiting on (8.A).
+	 * The vertex array carries graph identity only. SCC output selects a real
+	 * waiting member from its internal edges, preserving the exact request
+	 * and wait sequence for victim-side revalidation. This is also required
+	 * for a nonparallel backend whose holder and waiter request IDs differ.
 	 */
 	for (int e = 0; e < nedges; e++) {
 		int wi = find_vertex_index(vertices, nvertices, &edges[e].waiter);
@@ -227,28 +231,32 @@ cluster_lmd_tarjan_scan_snapshot(const ClusterLmdWaitEdge *edges, int nedges,
 			vertices[nvertices] = edges[e].waiter;
 			wi = nvertices++;
 		} else {
-			/* Waiter-identity-wins: overwrite holder-origin metadata with the
-			 * WAIT identity (same node/procno/epoch, but the request the victim
-			 * is actually blocked on). */
+			/* The effective group is unchanged; keep current waiter metadata. */
 			vertices[wi] = edges[e].waiter;
 		}
 		bi = find_vertex_index(vertices, nvertices, &edges[e].blocker);
 		if (bi < 0) {
-			/* First sighting of this backend is as a holder — keep its hold
-			 * metadata only until/unless it also appears as a waiter above. */
+			/* This group was first seen as a holder. */
 			vertices[nvertices] = edges[e].blocker;
 			bi = nvertices++;
 		}
-		adj_to[adj_used] = bi;
-		adj_next[adj_used] = adj_head[wi];
-		adj_head[wi] = adj_used;
-		adj_used++;
+		/* Group members cannot block each other. Do not turn a stale or
+		 * malformed intra-group edge into a self-cycle during contraction. */
+		if (wi == bi
+			&& (edges[e].waiter.lock_group_procno_plus_one
+				|| edges[e].blocker.lock_group_procno_plus_one))
+			continue;
+		/* The adjacency index also identifies the exact originating waiter. */
+		adj_to[e] = bi;
+		adj_next[e] = adj_head[wi];
+		adj_head[wi] = e;
 	}
 
 	/* Tarjan state. */
 	index_arr = (int *)palloc(sizeof(int) * nvertices);
 	lowlink_arr = (int *)palloc(sizeof(int) * nvertices);
 	on_stack = (bool *)palloc0(sizeof(bool) * nvertices);
+	in_component = (bool *)palloc0(sizeof(bool) * nvertices);
 	scc_stack = (int *)palloc(sizeof(int) * nvertices);
 	call_stack_v = (int *)palloc(sizeof(int) * nvertices * 2);
 	call_stack_iter = (int *)palloc(sizeof(int) * nvertices * 2);
@@ -310,6 +318,7 @@ cluster_lmd_tarjan_scan_snapshot(const ClusterLmdWaitEdge *edges, int nedges,
 					do {
 						w = scc_stack[--scc_stack_top];
 						on_stack[w] = false;
+						in_component[w] = true;
 						scc_members[scc_size++] = w;
 					} while (w != v_popped);
 
@@ -331,10 +340,28 @@ cluster_lmd_tarjan_scan_snapshot(const ClusterLmdWaitEdge *edges, int nedges,
 					if (is_cycle) {
 						ncycles++;
 						for (int i = 0; i < scc_size; i++) {
+							const ClusterLmdVertex *representative = NULL;
+
+							/* Keep an exact, cancellable WAIT identity from an
+							 * edge inside this SCC. A leader may not be waiting,
+							 * and another worker may only wait on an unrelated
+							 * sink. Neither is a valid substitute for this edge. */
+							for (int a = adj_head[scc_members[i]]; a != -1; a = adj_next[a]) {
+								const ClusterLmdVertex *candidate = &edges[a].waiter;
+
+								if (in_component[adj_to[a]]
+									&& (representative == NULL
+										|| vertex_youngest_first_cmp(candidate, representative)
+											   < 0))
+									representative = candidate;
+							}
+							Assert(representative != NULL);
 							if (written < max_cycle_vertices)
-								out_cycle_vertices[written++] = vertices[scc_members[i]];
+								out_cycle_vertices[written++] = *representative;
 						}
 					}
+					for (int i = 0; i < scc_size; i++)
+						in_component[scc_members[i]] = false;
 					pfree(scc_members);
 				}
 
@@ -693,9 +720,10 @@ typedef struct LmdCoordRound {
 
 /*
  * Order-independent FNV-1a hash of a wait-for vertex over its backend-level
- * IDENTITY (node_id, procno, cluster_epoch) — it MUST match find_vertex_index.
+ * IDENTITY (node_id, effective group, cluster_epoch) — it MUST match
+ * find_vertex_index. Different waiting members of one group have one hash.
  *
- *	spec-5.8: a backend is exactly one WFG cycle vertex; request_id and
+ *	A lock group is exactly one WFG cycle vertex; request_id and
  *	wait_seq are victim-targeting metadata (consumed by the D5 per-proc
  *	revalidate at the victim's home node), NOT cycle identity, so they are
  *	excluded here just as they are in find_vertex_index.  Including request_id
@@ -710,7 +738,7 @@ lmd_vertex_identity_hash(const ClusterLmdVertex *v)
 	uint64 h = UINT64CONST(1469598103934665603);
 
 	h = (h ^ (uint64)(uint32)v->node_id) * UINT64CONST(1099511628211);
-	h = (h ^ (uint64)v->procno) * UINT64CONST(1099511628211);
+	h = (h ^ (uint64)vertex_group_procno(v)) * UINT64CONST(1099511628211);
 	h = (h ^ v->cluster_epoch) * UINT64CONST(1099511628211);
 	return h;
 }

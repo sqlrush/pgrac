@@ -156,6 +156,7 @@ static Size cluster_grd_entries_alloc_bytes = 0;
 
 typedef struct ClusterGrdHolder {
 	int32 node_id;
+	uint32 lock_group_procno_plus_one;
 	uint32 procno;
 	uint64 cluster_epoch;
 	uint64 request_id;
@@ -170,8 +171,9 @@ typedef struct ClusterGrdWaiter {
 	 * (node_id, mode, wait_start);  the procno/request_id/request_opcode
 	 * + source_node_id additions are NEW for spec-2.23.
 	 */
-	int32 node_id;					/* legacy: equal to source_node_id; kept for binary compat */
-	int32 source_node_id;			/* node hosting the waiting backend */
+	int32 node_id;		  /* legacy: equal to source_node_id; kept for binary compat */
+	int32 source_node_id; /* node hosting the waiting backend */
+	uint32 lock_group_procno_plus_one;
 	uint32 procno;					/* PG ProcNumber of the waiting backend */
 	uint64 cluster_epoch;			/* epoch at waiter enqueue time */
 	uint64 request_id;				/* per-backend monotonic id (for 5-tuple reply key) */
@@ -270,6 +272,7 @@ struct ClusterGrdEntry {
 
 typedef struct GrdWfgHolderSnap {
 	int32 node_id;
+	uint32 lock_group_procno_plus_one;
 	uint32 procno;
 	uint64 cluster_epoch;
 	uint64 request_id;
@@ -278,6 +281,7 @@ typedef struct GrdWfgHolderSnap {
 
 typedef struct GrdWfgWaiterSnap {
 	int32 node_id;
+	uint32 lock_group_procno_plus_one;
 	uint32 procno;
 	uint64 cluster_epoch;
 	uint64 request_id;		  /* REQUEST waiter id, or convert_request_id for a convert */
@@ -299,6 +303,33 @@ typedef struct GrdWfgSnapshot {
 	GrdWfgWaiterSnap waiters[PGRAC_GRD_MAX_WAITERS + PGRAC_GRD_MAX_CONVERTS];
 } GrdWfgSnapshot;
 
+/* PG retains a leader's PROC slot until its last group member exits. An
+ * ungrouped original holder is its own leader, including a lock acquired
+ * before BecomeLockGroupLeader(). Node identity still separates instances. */
+static bool
+grd_same_lock_group(int32 anode, uint32 aproc, uint32 agroup, int32 bnode, uint32 bproc,
+					uint32 bgroup)
+{
+	return anode == bnode
+		   && (aproc == bproc
+			   || (uint64)(agroup ? agroup : (uint64)aproc + 1)
+					  == (uint64)(bgroup ? bgroup : (uint64)bproc + 1));
+}
+
+/* A queued request already blocked by this group's holder cannot in turn
+ * block a group member: the leader may be waiting for that worker to finish. */
+static bool
+grd_group_blocks_mode(const ClusterGrdEntry *entry, int32 node, uint32 proc, uint32 group,
+					  LOCKMODE queued_mode)
+{
+	for (int i = 0; i < entry->ngranted; i++)
+		if (grd_same_lock_group(entry->holders[i].node_id, entry->holders[i].procno,
+								entry->holders[i].lock_group_procno_plus_one, node, proc, group)
+			&& !ges_modes_compatible(entry->holders[i].mode, queued_mode))
+			return true;
+	return false;
+}
+
 /* spec-5.10 D4 — wrap-safe fair_queue_seq order (defined with the other
  * starvation helpers below; forward-declared here because the spec-5.8 WFG
  * refresh re-emits the FAIRNESS_BARRIER edge and needs the "earlier-than"
@@ -311,7 +342,7 @@ static inline bool grd_fair_seq_precedes(uint64 a, uint64 b);
  * metadata, threaded from the GES request / convert at enqueue time). */
 static void
 grd_wfg_make_vertex(int32 node_id, uint32 procno, uint64 cluster_epoch, uint64 request_id,
-					TransactionId xid, uint64 wait_seq, ClusterLmdVertex *out)
+					TransactionId xid, uint64 wait_seq, uint32 group, ClusterLmdVertex *out)
 {
 	memset(out, 0, sizeof(*out));
 	out->node_id = node_id;
@@ -321,6 +352,7 @@ grd_wfg_make_vertex(int32 node_id, uint32 procno, uint64 cluster_epoch, uint64 r
 	out->xid = xid;
 	out->local_start_ts_ms = 0;
 	out->wait_seq = wait_seq;
+	out->lock_group_procno_plus_one = group;
 }
 
 static bool
@@ -371,6 +403,7 @@ grd_wfg_snapshot_locked(const ClusterGrdEntry *entry, GrdWfgSnapshot *snap)
 		GrdWfgHolderSnap *h = &snap->holders[snap->n_holders++];
 
 		h->node_id = entry->holders[i].node_id;
+		h->lock_group_procno_plus_one = entry->holders[i].lock_group_procno_plus_one;
 		h->procno = entry->holders[i].procno;
 		h->cluster_epoch = entry->holders[i].cluster_epoch;
 		h->request_id = entry->holders[i].request_id;
@@ -384,6 +417,7 @@ grd_wfg_snapshot_locked(const ClusterGrdEntry *entry, GrdWfgSnapshot *snap)
 		GrdWfgWaiterSnap *w = &snap->waiters[snap->n_waiters++];
 
 		w->node_id = entry->waiters[i].node_id;
+		w->lock_group_procno_plus_one = entry->waiters[i].lock_group_procno_plus_one;
 		w->procno = entry->waiters[i].procno;
 		w->cluster_epoch = entry->waiters[i].cluster_epoch;
 		w->request_id = entry->waiters[i].request_id;
@@ -401,6 +435,7 @@ grd_wfg_snapshot_locked(const ClusterGrdEntry *entry, GrdWfgSnapshot *snap)
 		/* A pending convert blocks on its requested (target) mode; its vertex
 		 * id uses the convert's own reply key (convert_request_id). */
 		w->node_id = entry->converts[i].node_id;
+		w->lock_group_procno_plus_one = entry->converts[i].lock_group_procno_plus_one;
 		w->procno = entry->converts[i].procno;
 		w->cluster_epoch = entry->converts[i].cluster_epoch;
 		w->request_id = entry->converts[i].convert_request_id;
@@ -426,7 +461,7 @@ grd_wfg_cancel_snapshot_waiters(const GrdWfgSnapshot *snap)
 		ClusterLmdVertex waiter_v;
 
 		grd_wfg_make_vertex(w->node_id, w->procno, w->cluster_epoch, w->request_id, w->waiter_xid,
-							w->wait_seq, &waiter_v);
+							w->wait_seq, w->lock_group_procno_plus_one, &waiter_v);
 		cluster_lmd_cancel_wait_edge_real(&waiter_v);
 	}
 }
@@ -442,21 +477,24 @@ grd_wfg_refresh_waiter_edges(const GrdWfgSnapshot *snap, const GrdWfgWaiterSnap 
 	int i;
 
 	grd_wfg_make_vertex(w->node_id, w->procno, w->cluster_epoch, w->request_id, w->waiter_xid,
-						w->wait_seq, &waiter_v);
+						w->wait_seq, w->lock_group_procno_plus_one, &waiter_v);
 	cluster_lmd_cancel_wait_edge_real(&waiter_v); /* clear stale edges first */
 
 	for (i = 0; i < snap->n_holders; i++) {
 		ClusterLmdVertex blocker_v;
 
 		/* spec-5.1c D5 self-exclusion: a backend never blocks on its own hold. */
-		if (snap->holders[i].node_id == w->node_id && snap->holders[i].procno == w->procno)
+		if (grd_same_lock_group(snap->holders[i].node_id, snap->holders[i].procno,
+								snap->holders[i].lock_group_procno_plus_one, w->node_id, w->procno,
+								w->lock_group_procno_plus_one))
 			continue;
 		/* Only conflicting holders block the waiter (frozen 8x8 matrix). */
 		if (ges_modes_compatible(snap->holders[i].mode, w->mode))
 			continue;
 		grd_wfg_make_vertex(snap->holders[i].node_id, snap->holders[i].procno,
 							snap->holders[i].cluster_epoch, snap->holders[i].request_id,
-							InvalidTransactionId, 0, &blocker_v);
+							InvalidTransactionId, 0, snap->holders[i].lock_group_procno_plus_one,
+							&blocker_v);
 		(void)cluster_lmd_submit_wait_edge_real(&waiter_v, &blocker_v, w->request_id);
 	}
 
@@ -474,11 +512,21 @@ grd_wfg_refresh_waiter_edges(const GrdWfgSnapshot *snap, const GrdWfgWaiterSnap 
 
 		for (i = 0; i < snap->n_waiters; i++) {
 			const GrdWfgWaiterSnap *cand = &snap->waiters[i];
+			bool group_blocks = false;
+
+			for (int h = 0; h < snap->n_holders; h++)
+				if (grd_same_lock_group(snap->holders[h].node_id, snap->holders[h].procno,
+										snap->holders[h].lock_group_procno_plus_one, w->node_id,
+										w->procno, w->lock_group_procno_plus_one)
+					&& !ges_modes_compatible(snap->holders[h].mode, cand->mode))
+					group_blocks = true;
+			if (group_blocks)
+				continue;
 
 			if (!cand->boosted)
 				continue;
-			if (cand->node_id == w->node_id && cand->procno == w->procno
-				&& cand->cluster_epoch == w->cluster_epoch && cand->request_id == w->request_id)
+			if (grd_same_lock_group(cand->node_id, cand->procno, cand->lock_group_procno_plus_one,
+									w->node_id, w->procno, w->lock_group_procno_plus_one))
 				continue; /* a waiter never barriers itself */
 			if (ges_modes_compatible(cand->mode, w->mode))
 				continue; /* no conflict -> does not block R */
@@ -494,7 +542,7 @@ grd_wfg_refresh_waiter_edges(const GrdWfgSnapshot *snap, const GrdWfgWaiterSnap 
 			grd_wfg_make_vertex(snap->waiters[best].node_id, snap->waiters[best].procno,
 								snap->waiters[best].cluster_epoch, snap->waiters[best].request_id,
 								snap->waiters[best].waiter_xid, snap->waiters[best].wait_seq,
-								&blocker_v);
+								snap->waiters[best].lock_group_procno_plus_one, &blocker_v);
 			(void)cluster_lmd_submit_wait_edge_real(&waiter_v, &blocker_v, w->request_id);
 		}
 	}
@@ -523,7 +571,7 @@ grd_wfg_resync_entry(const ClusterResId *resid, const ClusterGrdHolderId *depart
 
 		grd_wfg_make_vertex((int32)departed[i].node_id, departed[i].procno,
 							departed[i].cluster_epoch, departed[i].request_id, InvalidTransactionId,
-							0, &v);
+							0, 0, &v);
 		cluster_lmd_cancel_wait_edge_real(&v);
 	}
 
@@ -2489,9 +2537,9 @@ cluster_grd_recovery_control_snapshot(uint16 origin_thread,
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
-	if (out == NULL || origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES
-		|| !cluster_enabled || cluster_grd_state == NULL || cluster_grd_entry_htab == NULL
-		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+	if (out == NULL || origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES || !cluster_enabled
+		|| cluster_grd_state == NULL || cluster_grd_entry_htab == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES
 		|| pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) == 0
 		|| !cluster_qvotec_in_quorum() || cluster_reconfig_has_pending_prebump_stage())
 		return false;
@@ -2502,10 +2550,9 @@ cluster_grd_recovery_control_snapshot(uint16 origin_thread,
 	 * The GRD owner, not that historical observation, fixes this cut's epoch. */
 	observed.episode_epoch = pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch);
 	observed.dead_bitmap_hash = cluster_grd_dead_bitmap_hash(event.dead_bitmap);
-	observed.redeclare_generation =
-		pg_atomic_read_u64(&cluster_grd_state->recovery_redeclare_generation);
-	observed.master_map_refresh =
-		pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count);
+	observed.redeclare_generation
+		= pg_atomic_read_u64(&cluster_grd_state->recovery_redeclare_generation);
+	observed.master_map_refresh = pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count);
 	observed.routing_generation = cluster_lms_get_shard_master_generation();
 	memcpy(observed.dead_bitmap, event.dead_bitmap, sizeof(observed.dead_bitmap));
 	if (event.reconfig_kind != RECONFIG_KIND_FAIL_STOP || observed.event_id == 0
@@ -5004,6 +5051,15 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 										  const ClusterGrdHolderId *new_holder,
 										  int32 source_node_id, int lockmode)
 {
+	return cluster_grd_entry_rebind_or_insert_holder_group(resid, new_holder, source_node_id,
+														   lockmode, 0);
+}
+
+ClusterGrdEntryResult
+cluster_grd_entry_rebind_or_insert_holder_group(const ClusterResId *resid,
+												const ClusterGrdHolderId *new_holder,
+												int32 source_node_id, int lockmode, uint32 group)
+{
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult er;
 	int i;
@@ -5025,6 +5081,7 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 
 			entry->holders[i].cluster_epoch = new_holder->cluster_epoch;
 			entry->holders[i].request_id = new_holder->request_id;
+			entry->holders[i].lock_group_procno_plus_one = group;
 			entry->generation++;
 			SpinLockRelease(&entry->lock);
 			pg_atomic_fetch_add_u64(&cluster_grd_state->holders_rebound_count, 1);
@@ -5040,8 +5097,9 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 
 	/* Defensive double-grant refusal (see header comment). */
 	for (i = 0; i < entry->ngranted; i++) {
-		if (((uint32)entry->holders[i].node_id != new_holder->node_id
-			 || entry->holders[i].procno != new_holder->procno)
+		if (!grd_same_lock_group(entry->holders[i].node_id, entry->holders[i].procno,
+								 entry->holders[i].lock_group_procno_plus_one, new_holder->node_id,
+								 new_holder->procno, group)
 			&& !ges_modes_compatible(entry->holders[i].mode,
 									 (LOCKMODE)lockmode)) { /* spec-5.1b D1: frozen matrix */
 			SpinLockRelease(&entry->lock);
@@ -5059,6 +5117,7 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 
 	entry->holders[entry->ngranted].node_id = (int32)new_holder->node_id;
 	entry->holders[entry->ngranted].procno = new_holder->procno;
+	entry->holders[entry->ngranted].lock_group_procno_plus_one = group;
 	entry->holders[entry->ngranted].cluster_epoch = new_holder->cluster_epoch;
 	entry->holders[entry->ngranted].request_id = new_holder->request_id;
 	entry->holders[entry->ngranted].mode = (LOCKMODE)lockmode;
@@ -5678,6 +5737,7 @@ cluster_grd_entry_grant_holder(ClusterGrdEntry *entry, const ClusterGrdHolderId 
 	slot = entry->ngranted++;
 	entry->holders[slot].node_id = (int32)holder->node_id;
 	entry->holders[slot].procno = holder->procno;
+	entry->holders[slot].lock_group_procno_plus_one = 0;
 	entry->holders[slot].cluster_epoch = holder->cluster_epoch;
 	entry->holders[slot].request_id = holder->request_id;
 	entry->holders[slot].mode = (LOCKMODE)mode;
@@ -5732,6 +5792,7 @@ cluster_grd_entry_add_waiter(ClusterGrdEntry *entry, const ClusterGrdHolderId *h
 	 */
 	entry->waiters[slot].source_node_id = (int32)holder->node_id;
 	entry->waiters[slot].procno = holder->procno;
+	entry->waiters[slot].lock_group_procno_plus_one = 0;
 	entry->waiters[slot].cluster_epoch = holder->cluster_epoch;
 	entry->waiters[slot].request_id = holder->request_id;
 	entry->waiters[slot].request_opcode = 1; /* GES_REQ_OPCODE_REQUEST default */
@@ -6085,14 +6146,17 @@ grd_starvation_account_skip_on_grant(ClusterGrdEntry *entry, LOCKMODE granted_mo
  * conflicts with a holder — Rule 8.A).  Caller holds entry->lock.
  */
 static bool
-grd_scan_holder_conflict(const ClusterGrdEntry *entry, uint32 node_id, uint32 procno, LOCKMODE mode)
+grd_scan_holder_conflict(const ClusterGrdEntry *entry, uint32 node_id, uint32 procno, uint32 group,
+						 LOCKMODE mode)
 {
 	int i;
 
 	for (i = 0; i < entry->ngranted; i++) {
 		if (ges_modes_compatible(entry->holders[i].mode, mode))
 			continue;
-		if ((uint32)entry->holders[i].node_id == node_id && entry->holders[i].procno == procno)
+		if (grd_same_lock_group(entry->holders[i].node_id, entry->holders[i].procno,
+								entry->holders[i].lock_group_procno_plus_one, node_id, procno,
+								group))
 			continue; /* spec-5.1c self-exclusion */
 		return true;
 	}
@@ -6111,11 +6175,16 @@ grd_scan_holder_conflict(const ClusterGrdEntry *entry, uint32 node_id, uint32 pr
  */
 static int
 grd_find_earliest_boosted_conflicting_waiter(const ClusterGrdEntry *entry, LOCKMODE mode,
-											 uint64 exclude_seq)
+											 uint64 exclude_seq, int32 node, uint32 proc,
+											 uint32 group)
 {
 	int i, best = -1;
 
 	for (i = 0; i < entry->nwaiters; i++) {
+		if (grd_same_lock_group(entry->waiters[i].node_id, entry->waiters[i].procno,
+								entry->waiters[i].lock_group_procno_plus_one, node, proc, group)
+			|| grd_group_blocks_mode(entry, node, proc, group, entry->waiters[i].mode))
+			continue;
 		if (!entry->waiters[i].boosted)
 			continue;
 		if (ges_modes_compatible(entry->waiters[i].mode, mode))
@@ -6143,7 +6212,8 @@ grd_capture_waiter_vertex(const ClusterGrdEntry *entry, int idx, ClusterLmdVerte
 {
 	grd_wfg_make_vertex(entry->waiters[idx].node_id, entry->waiters[idx].procno,
 						entry->waiters[idx].cluster_epoch, entry->waiters[idx].request_id,
-						entry->waiters[idx].waiter_xid, entry->waiters[idx].wait_seq, out);
+						entry->waiters[idx].waiter_xid, entry->waiters[idx].wait_seq,
+						entry->waiters[idx].lock_group_procno_plus_one, out);
 }
 
 /*
@@ -6157,8 +6227,10 @@ grd_waiter_is_barriered(const ClusterGrdEntry *entry, int widx)
 {
 	if (!cluster_grd_starvation_protection_enabled())
 		return false;
-	return grd_find_earliest_boosted_conflicting_waiter(entry, entry->waiters[widx].mode,
-														entry->waiters[widx].fair_queue_seq)
+	return grd_find_earliest_boosted_conflicting_waiter(
+			   entry, entry->waiters[widx].mode, entry->waiters[widx].fair_queue_seq,
+			   entry->waiters[widx].node_id, entry->waiters[widx].procno,
+			   entry->waiters[widx].lock_group_procno_plus_one)
 		   >= 0;
 }
 
@@ -6183,6 +6255,7 @@ grd_enqueue_waiter_locked(ClusterGrdEntry *entry, const ClusterGrdHolderId *hold
 	entry->waiters[slot].node_id = (int32)holder->node_id;
 	entry->waiters[slot].source_node_id = source_node_id;
 	entry->waiters[slot].procno = holder->procno;
+	entry->waiters[slot].lock_group_procno_plus_one = meta.lock_group_procno_plus_one;
 	entry->waiters[slot].cluster_epoch = holder->cluster_epoch;
 	entry->waiters[slot].request_id = request_id;
 	entry->waiters[slot].waiter_xid = meta.xid;	   /* spec-5.8 D1c */
@@ -6302,8 +6375,9 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 		 * change of the SAME hold -- is the spec-5.2 path and self-excludes
 		 * in cluster_grd_entry_request_convert.)
 		 */
-		if ((uint32)entry->holders[i].node_id == holder->node_id
-			&& entry->holders[i].procno == holder->procno)
+		if (grd_same_lock_group(entry->holders[i].node_id, entry->holders[i].procno,
+								entry->holders[i].lock_group_procno_plus_one, holder->node_id,
+								holder->procno, meta.lock_group_procno_plus_one))
 			continue;
 		if (conflict_holders_out != NULL && n_conflict < PGRAC_GRD_MAX_HOLDERS) {
 			conflict_holders_out[n_conflict].holder.node_id = entry->holders[i].node_id;
@@ -6348,7 +6422,9 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 			 * request that conflicts with a HOLDER never reaches here, so the
 			 * conflict matrix is never bypassed (Rule 8.A — no false grant).
 			 */
-			wi = grd_find_earliest_boosted_conflicting_waiter(entry, (LOCKMODE)lockmode, 0);
+			wi = grd_find_earliest_boosted_conflicting_waiter(entry, (LOCKMODE)lockmode, 0,
+															  holder->node_id, holder->procno,
+															  meta.lock_group_procno_plus_one);
 			if (wi >= 0) {
 				ClusterLmdVertex w_vertex, r_vertex;
 				bool published;
@@ -6373,7 +6449,8 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 				 */
 				grd_capture_waiter_vertex(entry, wi, &w_vertex);
 				grd_wfg_make_vertex((int32)holder->node_id, holder->procno, holder->cluster_epoch,
-									request_id, meta.xid, meta.wait_seq, &r_vertex);
+									request_id, meta.xid, meta.wait_seq,
+									meta.lock_group_procno_plus_one, &r_vertex);
 				SpinLockRelease(&entry->lock);
 
 				published
@@ -6389,8 +6466,11 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 				 */
 				if (published
 					&& !grd_scan_holder_conflict(entry, holder->node_id, holder->procno,
+												 meta.lock_group_procno_plus_one,
 												 (LOCKMODE)lockmode)
-					&& grd_find_earliest_boosted_conflicting_waiter(entry, (LOCKMODE)lockmode, 0)
+					&& grd_find_earliest_boosted_conflicting_waiter(entry, (LOCKMODE)lockmode, 0,
+																	holder->node_id, holder->procno,
+																	meta.lock_group_procno_plus_one)
 						   >= 0) {
 					if (grd_enqueue_waiter_locked(entry, holder, source_node_id, request_id,
 												  shard_master_generation, request_opcode,
@@ -6420,7 +6500,7 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 						&cluster_grd_state->starvation_barrier_publish_fail_count, 1);
 				SpinLockAcquire(&entry->lock);
 				if (grd_scan_holder_conflict(entry, holder->node_id, holder->procno,
-											 (LOCKMODE)lockmode)) {
+											 meta.lock_group_procno_plus_one, (LOCKMODE)lockmode)) {
 					if (conditional) {
 						SpinLockRelease(&entry->lock);
 						cluster_grd_entry_release(entry);
@@ -6453,6 +6533,7 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 		slot = entry->ngranted++;
 		entry->holders[slot].node_id = (int32)holder->node_id;
 		entry->holders[slot].procno = holder->procno;
+		entry->holders[slot].lock_group_procno_plus_one = meta.lock_group_procno_plus_one;
 		entry->holders[slot].cluster_epoch = holder->cluster_epoch;
 		entry->holders[slot].request_id = holder->request_id;
 		entry->holders[slot].mode = (LOCKMODE)lockmode;
@@ -6646,7 +6727,11 @@ cluster_grd_entry_release_and_pop_compatible_waiter(const ClusterResId *resid,
 
 			for (int h = 0; h < entry->ngranted; h++) {
 				/* spec-5.1b D1: frozen-matrix conflict check. */
-				if (!ges_modes_compatible(entry->holders[h].mode, entry->waiters[w].mode)) {
+				if (!grd_same_lock_group(entry->holders[h].node_id, entry->holders[h].procno,
+										 entry->holders[h].lock_group_procno_plus_one,
+										 entry->waiters[w].node_id, entry->waiters[w].procno,
+										 entry->waiters[w].lock_group_procno_plus_one)
+					&& !ges_modes_compatible(entry->holders[h].mode, entry->waiters[w].mode)) {
 					compatible = false;
 					break;
 				}
@@ -6676,6 +6761,8 @@ cluster_grd_entry_release_and_pop_compatible_waiter(const ClusterResId *resid,
 			int hslot = entry->ngranted++;
 
 			entry->holders[hslot].node_id = entry->waiters[chosen].node_id;
+			entry->holders[hslot].lock_group_procno_plus_one
+				= entry->waiters[chosen].lock_group_procno_plus_one;
 			entry->holders[hslot].procno = entry->waiters[chosen].procno;
 			entry->holders[hslot].cluster_epoch = entry->waiters[chosen].cluster_epoch;
 			entry->holders[hslot].request_id = entry->waiters[chosen].request_id;
@@ -6768,6 +6855,7 @@ cluster_grd_entry_request_convert_internal(ClusterGrdEntry *entry, const Cluster
 										   bool *out_drain_hint, bool dontwait)
 {
 	int hslot;
+	ClusterGrdConvert grouped;
 	ClusterGesConvertClass klass;
 
 	Assert(entry != NULL && req != NULL);
@@ -6786,6 +6874,10 @@ cluster_grd_entry_request_convert_internal(ClusterGrdEntry *entry, const Cluster
 		pg_atomic_fetch_add_u64(&cluster_grd_state->convert_illegal_count, 1);
 		return CLUSTER_GRD_CONVERT_ILLEGAL;
 	}
+
+	grouped = *req;
+	grouped.lock_group_procno_plus_one = entry->holders[hslot].lock_group_procno_plus_one;
+	req = &grouped;
 
 	klass = ges_mode_convert_class(entry->holders[hslot].mode, req->requested_mode);
 	switch (klass) {
@@ -6813,8 +6905,9 @@ cluster_grd_entry_request_convert_internal(ClusterGrdEntry *entry, const Cluster
 		 */
 		for (int i = 0; i < entry->ngranted; i++) {
 			if (i == hslot
-				|| (entry->holders[i].node_id == req->node_id
-					&& entry->holders[i].procno == req->procno))
+				|| grd_same_lock_group(entry->holders[i].node_id, entry->holders[i].procno,
+									   entry->holders[i].lock_group_procno_plus_one, req->node_id,
+									   req->procno, req->lock_group_procno_plus_one))
 				continue;
 			if (!ges_modes_compatible(entry->holders[i].mode, req->requested_mode)) {
 				if (dontwait)
@@ -6916,7 +7009,11 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 			if (!entry->waiters[w].boosted)
 				continue;
 			for (int h = 0; h < entry->ngranted; h++) {
-				if (!ges_modes_compatible(entry->holders[h].mode, entry->waiters[w].mode)) {
+				if (!grd_same_lock_group(entry->holders[h].node_id, entry->holders[h].procno,
+										 entry->holders[h].lock_group_procno_plus_one,
+										 entry->waiters[w].node_id, entry->waiters[w].procno,
+										 entry->waiters[w].lock_group_procno_plus_one)
+					&& !ges_modes_compatible(entry->holders[h].mode, entry->waiters[w].mode)) {
 					holder_ok = false;
 					break;
 				}
@@ -6926,8 +7023,16 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 			if (grd_waiter_is_barriered(entry, w))
 				continue; /* held behind an earlier boosted waiter */
 			for (int cc = 0; cc < entry->nconverts; cc++) {
-				if (!ges_modes_compatible(entry->converts[cc].requested_mode,
-										  entry->waiters[w].mode)) {
+				if (!grd_same_lock_group(entry->converts[cc].node_id, entry->converts[cc].procno,
+										 entry->converts[cc].lock_group_procno_plus_one,
+										 entry->waiters[w].node_id, entry->waiters[w].procno,
+										 entry->waiters[w].lock_group_procno_plus_one)
+					&& !grd_group_blocks_mode(entry, entry->waiters[w].node_id,
+											  entry->waiters[w].procno,
+											  entry->waiters[w].lock_group_procno_plus_one,
+											  entry->converts[cc].requested_mode)
+					&& !ges_modes_compatible(entry->converts[cc].requested_mode,
+											 entry->waiters[w].mode)) {
 					convert_blocked = true;
 					break;
 				}
@@ -6958,6 +7063,8 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 				int hs = entry->ngranted++;
 
 				entry->holders[hs].node_id = entry->waiters[w].node_id;
+				entry->holders[hs].lock_group_procno_plus_one
+					= entry->waiters[w].lock_group_procno_plus_one;
 				entry->holders[hs].procno = entry->waiters[w].procno;
 				entry->holders[hs].cluster_epoch = entry->waiters[w].cluster_epoch;
 				entry->holders[hs].request_id = entry->waiters[w].request_id;
@@ -6991,8 +7098,10 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 		}
 		for (int i = 0; i < entry->ngranted; i++) {
 			if (i == hslot
-				|| (entry->holders[i].node_id == cv->node_id
-					&& entry->holders[i].procno == cv->procno))
+				|| grd_same_lock_group(entry->holders[i].node_id, entry->holders[i].procno,
+									   entry->holders[i].lock_group_procno_plus_one, cv->node_id,
+									   cv->procno,
+									   entry->holders[hslot].lock_group_procno_plus_one))
 				continue;
 			if (!ges_modes_compatible(entry->holders[i].mode, cv->requested_mode)) {
 				compatible = false;
@@ -7047,14 +7156,26 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 			bool ok = true;
 
 			for (int h = 0; h < entry->ngranted; h++) {
-				if (!ges_modes_compatible(entry->holders[h].mode, entry->waiters[w].mode)) {
+				if (!grd_same_lock_group(entry->holders[h].node_id, entry->holders[h].procno,
+										 entry->holders[h].lock_group_procno_plus_one,
+										 entry->waiters[w].node_id, entry->waiters[w].procno,
+										 entry->waiters[w].lock_group_procno_plus_one)
+					&& !ges_modes_compatible(entry->holders[h].mode, entry->waiters[w].mode)) {
 					ok = false;
 					break;
 				}
 			}
 			for (int cc = 0; ok && cc < entry->nconverts; cc++) {
-				if (!ges_modes_compatible(entry->converts[cc].requested_mode,
-										  entry->waiters[w].mode)) {
+				if (!grd_same_lock_group(entry->converts[cc].node_id, entry->converts[cc].procno,
+										 entry->converts[cc].lock_group_procno_plus_one,
+										 entry->waiters[w].node_id, entry->waiters[w].procno,
+										 entry->waiters[w].lock_group_procno_plus_one)
+					&& !grd_group_blocks_mode(entry, entry->waiters[w].node_id,
+											  entry->waiters[w].procno,
+											  entry->waiters[w].lock_group_procno_plus_one,
+											  entry->converts[cc].requested_mode)
+					&& !ges_modes_compatible(entry->converts[cc].requested_mode,
+											 entry->waiters[w].mode)) {
 					ok = false;
 					break;
 				}
@@ -7086,6 +7207,8 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 				int hs = entry->ngranted++;
 
 				entry->holders[hs].node_id = entry->waiters[w].node_id;
+				entry->holders[hs].lock_group_procno_plus_one
+					= entry->waiters[w].lock_group_procno_plus_one;
 				entry->holders[hs].procno = entry->waiters[w].procno;
 				entry->holders[hs].cluster_epoch = entry->waiters[w].cluster_epoch;
 				entry->holders[hs].request_id = entry->waiters[w].request_id;
@@ -7289,10 +7412,13 @@ cluster_grd_convert_or_enqueue_meta(const ClusterResId *resid, int32 node_id, ui
 	 */
 	if (result == CLUSTER_GRD_CONVERT_ENQUEUED && conflict_holders_out != NULL) {
 		int nc = 0;
+		int hs = grd_find_holder_slot(entry, node_id, procno, current_mode);
+		uint32 group = hs < 0 ? 0 : entry->holders[hs].lock_group_procno_plus_one;
 
 		for (int i = 0; i < entry->ngranted && nc < PGRAC_GRD_MAX_HOLDERS; i++) {
-			if ((uint32)entry->holders[i].node_id == (uint32)node_id
-				&& entry->holders[i].procno == procno)
+			if (grd_same_lock_group(entry->holders[i].node_id, entry->holders[i].procno,
+									entry->holders[i].lock_group_procno_plus_one, node_id, procno,
+									group))
 				continue; /* spec-5.1c D5 self-exclude */
 			if (ges_modes_compatible(entry->holders[i].mode, requested_mode))
 				continue;

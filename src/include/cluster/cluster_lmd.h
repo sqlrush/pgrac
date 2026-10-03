@@ -331,6 +331,8 @@ typedef struct ClusterLmdVertex {
 
 	/* Sort metadata (A4 victim selection only;not part of identity). */
 	TransactionId xid; /* may be InvalidTransactionId — advisory lock OK */
+	/* Graph compatibility only; never replaces the exact procno above. */
+	uint32 lock_group_procno_plus_one;
 	int64 local_start_ts_ms;
 	/* spec-5.8 D1e — the waiter's D1d wait-state publish sequence, stamped
 	 * here at edge submit time and carried with the WFG edge to the
@@ -341,8 +343,10 @@ typedef struct ClusterLmdVertex {
 } ClusterLmdVertex;
 
 StaticAssertDecl(sizeof(ClusterLmdVertex) == 48,
-				 "ClusterLmdVertex ABI 48-byte lock (4+4+8+8 identity + 4+8 metadata + 4 pad + "
-				 "8 wait_seq, spec-5.8 D1e)");
+				 "ClusterLmdVertex ABI 48-byte lock (24 identity + 4 xid + 4 group + "
+				 "8 timestamp + 8 wait_seq)");
+StaticAssertDecl(offsetof(ClusterLmdVertex, lock_group_procno_plus_one) == 28,
+				 "parallel group occupies the former vertex alignment gap");
 
 typedef struct ClusterLmdWaitEdge {
 	ClusterLmdVertex waiter;  /* this backend stuck waiting on S4 */
@@ -504,9 +508,8 @@ extern void cluster_lmd_victim_ack_tick(void);
  * ============================================================ */
 
 #define CLUSTER_LMD_CANCEL_QUEUE_DEPTH 256
-/* spec-5.8 D1e — holds a full GesRequestPayload image, which grew 64 -> 72
- * when waiter_xid (D1c) + wait_seq (D1e) were added. */
-#define CLUSTER_LMD_CANCEL_PAYLOAD_BYTES 72
+/* Includes the PRE2 parallel-group tail of GesRequestPayload. */
+#define CLUSTER_LMD_CANCEL_PAYLOAD_BYTES 80
 
 typedef struct ClusterLmdCancelItem {
 	uint32 source_node_id; /* sender of GES_REQ_OPCODE_CANCEL_PENDING */
@@ -515,8 +518,8 @@ typedef struct ClusterLmdCancelItem {
 	uint8 payload[CLUSTER_LMD_CANCEL_PAYLOAD_BYTES];
 } ClusterLmdCancelItem;
 
-StaticAssertDecl(sizeof(ClusterLmdCancelItem) == 80,
-				 "ClusterLmdCancelItem 80-byte lock (72B GesRequestPayload image, spec-5.8 D1e)");
+StaticAssertDecl(sizeof(ClusterLmdCancelItem) == 88,
+				 "ClusterLmdCancelItem: 8 metadata + 80 payload");
 
 extern Size cluster_lmd_cancel_queue_shmem_size(void);
 extern void cluster_lmd_cancel_queue_shmem_init(void);

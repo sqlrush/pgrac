@@ -490,6 +490,21 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid pg_attribute
 	return CLUSTER_GRD_ENTRY_OK;
 }
 
+uint32
+cluster_ges_current_lock_group(const ClusterGrdHolderId *holder pg_attribute_unused())
+{
+	return 0; /* This fixture has no parallel group; GRD/GES tests cover it. */
+}
+
+ClusterGrdEntryResult
+cluster_grd_entry_rebind_or_insert_holder_group(const ClusterResId *resid,
+												const ClusterGrdHolderId *holder, int32 source,
+												int mode, uint32 group pg_attribute_unused())
+{
+	return cluster_grd_entry_rebind_or_insert_holder(resid, holder, source, mode);
+}
+
+
 HTAB *
 GetLockMethodLocalHash(void)
 {

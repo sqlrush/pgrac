@@ -46,6 +46,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "storage/proc.h"
 
 #include <signal.h>
 #include <stdlib.h> /* spec-5.8 D8 — malloc/free for the palloc/pfree stubs */
@@ -530,6 +531,8 @@ cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 event_id)
 static int stub_rebind_calls;
 static ClusterGrdHolderId stub_rebind_holder;
 static int stub_rebind_mode;
+static uint32 stub_rebind_group;
+static uint32 stub_grant_group;
 static ClusterGrdEntryResult stub_rebind_result = CLUSTER_GRD_ENTRY_OK;
 
 ClusterGrdEntryResult
@@ -541,6 +544,15 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid pg_attribute
 	stub_rebind_holder = *nh;
 	stub_rebind_mode = lockmode;
 	return stub_rebind_result;
+}
+
+ClusterGrdEntryResult
+cluster_grd_entry_rebind_or_insert_holder_group(const ClusterResId *resid,
+												const struct ClusterGrdHolderId *nh, int32 src,
+												int lockmode, uint32 group)
+{
+	stub_rebind_group = group;
+	return cluster_grd_entry_rebind_or_insert_holder(resid, nh, src, lockmode);
 }
 
 static int32 stub_remote_master = -1;
@@ -645,7 +657,7 @@ cluster_lms_wake_drain(void)
  * link-only: ProcGlobal is never dereferenced, and SendProcSignal /
  * cluster_grd_bast_local_deliver_ok are never invoked.
  */
-void *ProcGlobal = NULL;
+PROC_HDR *ProcGlobal = NULL;
 
 int SendProcSignal(int pid, int reason, int backendid);
 int
@@ -1141,6 +1153,7 @@ cluster_grd_entry_enqueue_or_grant_meta(
 	int mode pg_attribute_unused(), struct ClusterGrdConflictHolder *out pg_attribute_unused(),
 	int *nout pg_attribute_unused())
 {
+	stub_grant_group = meta.lock_group_procno_plus_one;
 	stub_master_grant_mutation_count++;
 	if (nout != NULL)
 		*nout = 0;
@@ -1155,6 +1168,7 @@ cluster_grd_entry_grant_conditional_meta(
 	int mode pg_attribute_unused(), struct ClusterGrdConflictHolder *out pg_attribute_unused(),
 	int *nout pg_attribute_unused())
 {
+	stub_grant_group = meta.lock_group_procno_plus_one;
 	if (nout != NULL)
 		*nout = 0;
 	return CLUSTER_GRD_GRANT_NOW;
@@ -1300,7 +1314,7 @@ GetCurrentTimestamp(void)
 	return stub_now;
 }
 
-void *MyProc;
+PGPROC *MyProc;
 
 #include "storage/condition_variable.h"
 void
@@ -2843,11 +2857,17 @@ cooperative_reply(uint32 opcode, uint32 reason)
 UT_TEST(test_redeclare_poll_pending_keeps_one_identity_without_sleep)
 {
 	ClusterGesRedeclareAttempt attempt = { 0 };
+	PGPROC worker = { 0 }, leader = { 0 };
+	PGPROC *saved_proc = MyProc;
 	ClusterResId resid;
 	ClusterGrdHolderId holder;
 	GesRequestPayload first;
 
 	cooperative_fixture(&resid, &holder);
+	worker.pgprocno = holder.procno;
+	leader.pgprocno = 40;
+	worker.lockGroupLeader = &leader;
+	MyProc = &worker;
 	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
 				 CLUSTER_GES_REDECLARE_PENDING);
 	UT_ASSERT(attempt.initialized && attempt.wait_registered && attempt.sent);
@@ -2856,6 +2876,7 @@ UT_TEST(test_redeclare_poll_pending_keeps_one_identity_without_sleep)
 	UT_ASSERT_EQ(stub_reply_wait_entry.deadline, 0);
 	first = stub_backend_request_last;
 	UT_ASSERT_EQ(first.opcode, GES_REQ_OPCODE_REDECLARE);
+	UT_ASSERT_EQ(first.lock_group_procno_plus_one, 41);
 	UT_ASSERT_EQ(first.holder_request_id_lo, 5522);
 	UT_ASSERT_EQ(first.holder_cluster_epoch_lo, 81);
 	UT_ASSERT_EQ(first.shard_master_generation_lo, 71);
@@ -2869,6 +2890,7 @@ UT_TEST(test_redeclare_poll_pending_keeps_one_identity_without_sleep)
 	UT_ASSERT_EQ(memcmp(&first, &stub_backend_request_last, sizeof(first)), 0);
 	UT_ASSERT_EQ(stub_cooperative_inserts, 1);
 	UT_ASSERT_EQ(stub_cooperative_cv_calls, 0);
+	MyProc = saved_proc;
 }
 
 UT_TEST(test_redeclare_poll_late_grant_confirms_only_exact_attempt)
@@ -2993,11 +3015,17 @@ UT_TEST(test_redeclare_poll_readiness_loss_preserves_late_ack)
 UT_TEST(test_redeclare_poll_local_rebind_is_not_fresh_acquisition)
 {
 	ClusterGesRedeclareAttempt attempt = { 0 };
+	PGPROC worker = { 0 }, leader = { 0 };
+	PGPROC *saved_proc = MyProc;
 	ClusterResId resid;
 	ClusterGrdHolderId holder;
 	uint64 mutations;
 
 	cooperative_fixture(&resid, &holder);
+	worker.pgprocno = holder.procno;
+	leader.pgprocno = 40;
+	worker.lockGroupLeader = &leader;
+	MyProc = &worker;
 	stub_remote_master = 0;
 	mutations = stub_master_grant_mutation_count;
 	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
@@ -3005,6 +3033,7 @@ UT_TEST(test_redeclare_poll_local_rebind_is_not_fresh_acquisition)
 	UT_ASSERT_EQ(stub_rebind_calls, 1);
 	UT_ASSERT_EQ(stub_rebind_holder.request_id, 5522);
 	UT_ASSERT_EQ(stub_rebind_mode, ShareLock);
+	UT_ASSERT_EQ(stub_rebind_group, 41);
 	UT_ASSERT_EQ(stub_master_grant_mutation_count, mutations);
 	UT_ASSERT_EQ(stub_backend_request_enqueue_count, 0);
 	UT_ASSERT_EQ(stub_cooperative_inserts, 0);
@@ -3018,6 +3047,7 @@ UT_TEST(test_redeclare_poll_local_rebind_is_not_fresh_acquisition)
 	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
 				 CLUSTER_GES_REDECLARE_CUT_CHANGED);
 	UT_ASSERT_EQ(stub_rebind_calls, 1);
+	MyProc = saved_proc;
 }
 
 UT_TEST(test_redeclare_poll_invalid_or_unknown_route_never_grants)
@@ -3071,15 +3101,67 @@ UT_TEST(test_redeclare_poll_reject_and_post_reply_cut_are_not_ack)
 	UT_ASSERT(!attempt.wait_registered);
 }
 
+UT_TEST(test_ges_parallel_group_wire_and_origin)
+{
+	ClusterICEnvelope env;
+	GesRequestPayload req;
+	ClusterResId resid = { 0 };
+	PGPROC worker = { 0 }, leader = { 0 };
+	PGPROC *saved_proc = MyProc;
+	ClusterGrdHolderId holder = { 0 };
+	uint64 before = stub_work_queue_enqueue_count;
+
+	resid.type = LOCKTAG_ADVISORY;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	init_valid_ges_request(&env, &req, GES_REQ_OPCODE_REQUEST, &resid, AccessShareLock);
+	req.lock_group_procno_plus_one = 101;
+	req.holder_request_id_lo = 71;
+	UT_ASSERT_EQ(sizeof(req), 80);
+	UT_ASSERT_EQ(sizeof(ClusterGrdHolderId), 24);
+	env.payload_length = 72;
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, before);
+	env.payload_length = sizeof(req);
+	req._group_pad0 = 1;
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, before);
+	req._group_pad0 = 0;
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, before + 1);
+	memset(&stub_work_queue_dequeue_item, 0, sizeof(stub_work_queue_dequeue_item));
+	stub_work_queue_dequeue_item.routing_generation = stub_master_generation;
+	stub_work_queue_dequeue_item.source_node_id = env.source_node_id;
+	stub_work_queue_dequeue_item.payload_len = sizeof(req);
+	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));
+	stub_work_queue_dequeue_pending = true;
+	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+	UT_ASSERT_EQ(stub_grant_group, 101);
+
+	leader.pgprocno = 100;
+	worker.pgprocno = 101;
+	worker.lockGroupLeader = &leader;
+	holder.node_id = cluster_node_id;
+	holder.procno = 101;
+	MyProc = &worker;
+	UT_ASSERT_EQ(cluster_ges_current_lock_group(&holder), 101);
+	holder.procno = 102;
+	UT_ASSERT_EQ(cluster_ges_current_lock_group(&holder), 0);
+	holder.procno = 101;
+	holder.node_id = cluster_node_id + 1;
+	UT_ASSERT_EQ(cluster_ges_current_lock_group(&holder), 0);
+	MyProc = saved_proc;
+}
+
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(49);
+	UT_PLAN(50);
 	UT_RUN(test_block0_protected_failure_detail_is_not_elapsed_timeout);
 
 	UT_RUN(test_ges_request_handler_linkable);
 	UT_RUN(test_ges_reply_handler_linkable);
 	UT_RUN(test_ges_accessors_linkable_and_initial_zero);
+	UT_RUN(test_ges_parallel_group_wire_and_origin);
 	UT_RUN(test_ges_request_handler_real_behavior);
 	UT_RUN(test_ges_reply_handler_real_behavior);
 	UT_RUN(test_ges_handler_counter_monotonic_n_invocations);

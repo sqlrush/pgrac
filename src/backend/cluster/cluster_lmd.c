@@ -111,6 +111,9 @@
 #include "utils/wait_event.h"
 
 
+StaticAssertDecl(CLUSTER_LMD_CANCEL_PAYLOAD_BYTES >= sizeof(GesRequestPayload),
+				 "LMD cancel queue must hold the full GES request");
+
 /*
  * Idle sleep timeout for the skeleton loop.  Producer-side
  * ConditionVariableBroadcast() is retained as the forward-compatible API,

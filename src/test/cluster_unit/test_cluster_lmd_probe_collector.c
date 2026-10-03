@@ -484,10 +484,33 @@ UT_TEST(test_stop_probe_malformed_state_is_not_retired)
 	}
 }
 
+UT_TEST(test_probe_preserves_group_but_rejects_invalid_group)
+{
+	char buf[sizeof(GesDeadlockReportHeader) + sizeof(ClusterLmdWaitEdge)];
+	ClusterLmdWaitEdge *edge = (ClusterLmdWaitEdge *)(buf + sizeof(GesDeadlockReportHeader));
+	ClusterLmdWaitEdge out[1];
+	ClusterLmdProbeDrain drain;
+	Size len;
+
+	reset_region();
+	cluster_lmd_probe_arm(91, exp_bit(1), 0);
+	len = build_report(buf, 91, 1, 1);
+	edge->waiter.lock_group_procno_plus_one = 500;
+	edge->blocker.lock_group_procno_plus_one = PG_UINT32_MAX;
+	UT_ASSERT(!cluster_lmd_probe_collect_receive((GesDeadlockReportHeader *)buf, len));
+	UT_ASSERT_EQ(cluster_lmd_probe_n_received(), 0);
+	edge->blocker.lock_group_procno_plus_one = 600;
+	UT_ASSERT(cluster_lmd_probe_collect_receive((GesDeadlockReportHeader *)buf, len));
+	UT_ASSERT_EQ(cluster_lmd_probe_drain(out, 1, &drain), 1);
+	UT_ASSERT_EQ(out[0].waiter.procno, 1000);
+	UT_ASSERT_EQ(out[0].waiter.lock_group_procno_plus_one, 500);
+	UT_ASSERT_EQ(out[0].blocker.lock_group_procno_plus_one, 600);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_stop_probe_uninitialized_is_not_empty);
 	UT_RUN(test_probe_complete_report_accepted);
 	UT_RUN(test_probe_duplicate_dropped);
@@ -500,6 +523,7 @@ main(void)
 	UT_RUN(test_stop_overflow_is_owned_until_original_reset);
 	UT_RUN(test_stop_probe_rejects_recursive_module_lock);
 	UT_RUN(test_stop_probe_malformed_state_is_not_retired);
+	UT_RUN(test_probe_preserves_group_but_rejects_invalid_group);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

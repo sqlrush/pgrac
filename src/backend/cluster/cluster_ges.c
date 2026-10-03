@@ -101,6 +101,17 @@ ges_payload_is_replacement_episode(const void *payload, uint32 payload_length)
 		   && bytes[2] == 0 && bytes[3] == 0;
 }
 
+/* Only a request's real originating backend can supply its PG group. The
+ * worker keeps its own holder identity for release, cancellation and exit. */
+uint32
+cluster_ges_current_lock_group(const ClusterGrdHolderId *holder)
+{
+	if (holder == NULL || MyProc == NULL || holder->node_id != (uint32)cluster_node_id
+		|| holder->procno != (uint32)MyProc->pgprocno || MyProc->lockGroupLeader == NULL)
+		return 0;
+	return (uint32)MyProc->lockGroupLeader->pgprocno + 1;
+}
+
 static inline uint64
 ges_request_holder_epoch(const GesRequestPayload *req)
 {
@@ -827,6 +838,10 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 		return;
 	}
 	req = (const GesRequestPayload *)payload;
+	if (req->_group_pad0 != 0 || req->lock_group_procno_plus_one > (uint32)INT_MAX) {
+		cluster_grd_inc_ges_inbound_validation_fail();
+		return;
+	}
 
 	holder_epoch
 		= ((uint64)req->holder_cluster_epoch_lo) | (((uint64)req->holder_cluster_epoch_hi) << 32);
@@ -1475,7 +1490,7 @@ cluster_ges_lmon_drain_work_queue(void)
 			cluster_control_retire_drain(&item);
 			continue;
 		}
-		if (item.payload_len < sizeof(GesRequestPayload)) {
+		if (item.payload_len != sizeof(GesRequestPayload)) {
 			cluster_grd_inc_ges_inbound_validation_fail();
 			continue;
 		}
@@ -1617,12 +1632,14 @@ cluster_ges_lmon_drain_work_queue(void)
 			action = conditional
 						 ? cluster_grd_entry_grant_conditional_meta(
 							   &resid, &holder, (int32)item.source_node_id, holder_request_id,
-							   (ClusterGrdWaiterMeta){ req->waiter_xid, req->wait_seq },
+							   (ClusterGrdWaiterMeta){ req->waiter_xid, req->wait_seq,
+													   req->lock_group_procno_plus_one },
 							   ges_request_shard_master_generation(req), req->opcode,
 							   (int)req->lockmode, conflict_holders, &n_conflict)
 						 : cluster_grd_entry_enqueue_or_grant_meta(
 							   &resid, &holder, (int32)item.source_node_id, holder_request_id,
-							   (ClusterGrdWaiterMeta){ req->waiter_xid, req->wait_seq },
+							   (ClusterGrdWaiterMeta){ req->waiter_xid, req->wait_seq,
+													   req->lock_group_procno_plus_one },
 							   ges_request_shard_master_generation(req), req->opcode,
 							   (int)req->lockmode, conflict_holders, &n_conflict);
 
@@ -1768,7 +1785,9 @@ cluster_ges_lmon_drain_work_queue(void)
 				cr = cluster_grd_convert_or_enqueue_meta(
 					&resid, (int32)holder.node_id, holder.procno, holder.cluster_epoch,
 					convert_old_mode, requested_mode, holder.request_id, (int32)item.source_node_id,
-					generation, (ClusterGrdWaiterMeta){ req->waiter_xid, req->wait_seq },
+					generation,
+					(ClusterGrdWaiterMeta){ req->waiter_xid, req->wait_seq,
+											req->lock_group_procno_plus_one },
 					conflict_holders, &n_conflict);
 
 				switch (cr) {
@@ -1924,8 +1943,9 @@ cluster_ges_lmon_drain_work_queue(void)
 				 */
 			ClusterGrdEntryResult rr;
 
-			rr = cluster_grd_entry_rebind_or_insert_holder(
-				&resid, &holder, (int32)item.source_node_id, (int)req->lockmode);
+			rr = cluster_grd_entry_rebind_or_insert_holder_group(
+				&resid, &holder, (int32)item.source_node_id, (int)req->lockmode,
+				req->lock_group_procno_plus_one);
 			if (rr == CLUSTER_GRD_ENTRY_OK) {
 				GesReplyPayload reply;
 
@@ -2423,6 +2443,7 @@ ges_arm_local_request_grant(ClusterGesHwGrant *grant, const ClusterResId *resid,
 	request->lockmode = mode;
 	request->holder_node_id = holder->node_id;
 	request->holder_procno = holder->procno;
+	request->lock_group_procno_plus_one = cluster_ges_current_lock_group(holder);
 	request->holder_cluster_epoch_lo = (uint32)holder->cluster_epoch;
 	request->holder_cluster_epoch_hi = (uint32)(holder->cluster_epoch >> 32);
 	request->holder_request_id_lo = (uint32)holder->request_id;
@@ -2576,16 +2597,17 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			ges_arm_local_request_grant(hw_grant, resid, holder, lockmode, send_opcode, master_gen);
 		}
 		/* spec-5.5 D5 — local-master try-lock: conditional grant, never enqueue. */
-		action
-			= conditional
-				  ? cluster_grd_entry_grant_conditional_meta(
-						resid, holder, cluster_node_id, request_id,
-						(ClusterGrdWaiterMeta){ GetTopTransactionIdIfAny(), ges_local_wait_seq() },
-						master_gen, send_opcode, (int)lockmode, conflict_holders, &n_conflict)
-				  : cluster_grd_entry_enqueue_or_grant_meta(
-						resid, holder, cluster_node_id, request_id,
-						(ClusterGrdWaiterMeta){ GetTopTransactionIdIfAny(), ges_local_wait_seq() },
-						master_gen, send_opcode, (int)lockmode, conflict_holders, &n_conflict);
+		action = conditional
+					 ? cluster_grd_entry_grant_conditional_meta(
+						   resid, holder, cluster_node_id, request_id,
+						   (ClusterGrdWaiterMeta){ GetTopTransactionIdIfAny(), ges_local_wait_seq(),
+												   cluster_ges_current_lock_group(holder) },
+						   master_gen, send_opcode, (int)lockmode, conflict_holders, &n_conflict)
+					 : cluster_grd_entry_enqueue_or_grant_meta(
+						   resid, holder, cluster_node_id, request_id,
+						   (ClusterGrdWaiterMeta){ GetTopTransactionIdIfAny(), ges_local_wait_seq(),
+												   cluster_ges_current_lock_group(holder) },
+						   master_gen, send_opcode, (int)lockmode, conflict_holders, &n_conflict);
 
 		if (action == CLUSTER_GRD_GRANT_NOW) {
 			if (retained_local_grant)
@@ -2842,6 +2864,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	req.current_mode = (uint8)current_mode;
 	req.holder_node_id = (uint32)holder->node_id;
 	req.holder_procno = (uint32)holder->procno;
+	req.lock_group_procno_plus_one = cluster_ges_current_lock_group(holder);
 	req.holder_cluster_epoch_lo = (uint32)(holder->cluster_epoch & 0xffffffffu);
 	req.holder_cluster_epoch_hi = (uint32)(holder->cluster_epoch >> 32);
 	req.holder_request_id_lo = (uint32)(request_id & 0xffffffffu);
@@ -3255,6 +3278,7 @@ ges_attempt_initialize(ClusterGesRedeclareAttempt *attempt, const ClusterResId *
 	request->lockmode = mode;
 	request->holder_node_id = (uint32)holder->node_id;
 	request->holder_procno = holder->procno;
+	request->lock_group_procno_plus_one = cluster_ges_current_lock_group(holder);
 	request->holder_cluster_epoch_lo = (uint32)holder->cluster_epoch;
 	request->holder_cluster_epoch_hi = (uint32)(holder->cluster_epoch >> 32);
 	request->holder_request_id_lo = (uint32)holder->request_id;
@@ -3361,8 +3385,9 @@ cluster_ges_redeclare_poll(ClusterGesRedeclareAttempt *attempt, const ClusterRes
 	if (attempt->rejected)
 		return CLUSTER_GES_REDECLARE_REJECTED;
 	if (attempt->master == cluster_node_id) {
-		attempt->confirmed = cluster_grd_entry_rebind_or_insert_holder(
-								 resid, new_holder, cluster_node_id, (int)lockmode)
+		attempt->confirmed = cluster_grd_entry_rebind_or_insert_holder_group(
+								 resid, new_holder, cluster_node_id, (int)lockmode,
+								 attempt->request.lock_group_procno_plus_one)
 							 == CLUSTER_GRD_ENTRY_OK;
 		result
 			= attempt->confirmed ? CLUSTER_GES_REDECLARE_CONFIRMED : CLUSTER_GES_REDECLARE_PENDING;
@@ -3428,7 +3453,8 @@ cluster_ges_cf_request_poll(ClusterGesAcquireAttempt *owned, const ClusterResId 
 		attempt->sent = true;
 		action = cluster_grd_entry_enqueue_or_grant_meta(
 			resid, holder, cluster_node_id, holder->request_id,
-			(ClusterGrdWaiterMeta){ attempt->request.waiter_xid, attempt->request.wait_seq },
+			(ClusterGrdWaiterMeta){ attempt->request.waiter_xid, attempt->request.wait_seq,
+									attempt->request.lock_group_procno_plus_one },
 			attempt->master_generation, GES_REQ_OPCODE_REQUEST, mode, conflicts, &nconflicts);
 		if (action == CLUSTER_GRD_GRANT_NOW) {
 			cluster_ges_reply_wait_delete(&attempt->key);
@@ -3588,6 +3614,7 @@ ges_release_send_owned(const struct ClusterResId *resid, const struct ClusterGrd
 		req.lockmode = 0;
 		req.holder_node_id = (uint32)holder->node_id;
 		req.holder_procno = (uint32)holder->procno;
+		req.lock_group_procno_plus_one = cluster_ges_current_lock_group(holder);
 		req.holder_cluster_epoch_lo = (uint32)(holder->cluster_epoch & 0xffffffffu);
 		req.holder_cluster_epoch_hi = (uint32)(holder->cluster_epoch >> 32);
 		req.holder_request_id_lo = (uint32)(request_id & 0xffffffffu);
@@ -3806,6 +3833,7 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 	req.lockmode = requested_mode;
 	req.holder_node_id = (uint32)holder->node_id;
 	req.holder_procno = (uint32)holder->procno;
+	req.lock_group_procno_plus_one = cluster_ges_current_lock_group(holder);
 	req.holder_cluster_epoch_lo = (uint32)(holder->cluster_epoch & 0xffffffffu);
 	req.holder_cluster_epoch_hi = (uint32)(holder->cluster_epoch >> 32);
 	req.holder_request_id_lo = (uint32)(convert_request_id & 0xffffffffu);
@@ -3946,6 +3974,7 @@ cluster_ges_send_convert_rollback(const struct ClusterResId *resid, uint32 upgra
 	req.lockmode = upgraded_mode; /* locates the upgraded slot */
 	req.holder_node_id = (uint32)holder->node_id;
 	req.holder_procno = (uint32)holder->procno;
+	req.lock_group_procno_plus_one = cluster_ges_current_lock_group(holder);
 	req.holder_cluster_epoch_lo = (uint32)(holder->cluster_epoch & 0xffffffffu);
 	req.holder_cluster_epoch_hi = (uint32)(holder->cluster_epoch >> 32);
 	req.holder_request_id_lo = (uint32)(old_request_id & 0xffffffffu); /* R_old restore target */

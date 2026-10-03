@@ -325,13 +325,13 @@ typedef enum GesRequestOpcode {
 	 * dedicated opcode carries old_request_id in holder_request_id and
 	 * old_mode in current_mode so the master can run the strict inverse of
 	 * the convert (cluster_grd_entry_rollback_convert) — restore, not delete.
-	 * Reuses the 64B GesRequestPayload (per-opcode field semantics differ;
+	 * Reuses GesRequestPayload (per-opcode field semantics differ;
 	 * lockmode locates the upgraded slot).
 	 */
 	GES_REQ_OPCODE_CONVERT_ROLLBACK = 14,
 	/*
 	 * spec-5.5 D5 (Q11) — conditional (NOWAIT) acquire for try-locks
-	 * (pg_try_advisory_lock).  Same 64B GesRequestPayload + REQUEST field
+	 * (pg_try_advisory_lock).  Same GesRequestPayload + REQUEST field
 	 * semantics; the ONLY behavioural difference is at the master: a conflict
 	 * is rejected immediately with GES_REJECT_REASON_LOCK_CONFLICT and does
 	 * NOT enqueue a waiter or fan out a BAST (non-enqueuing conditional grant).
@@ -455,7 +455,7 @@ struct ClusterGrdHolderId;
  *     [ 8, 32)  holder_id       24 bytes   (ClusterGrdHolderId)
  *     [32, 48)  resid           16 bytes   (ClusterResId)
  *
- *   Total: 64 bytes (spec-5.3 D2 ABI bump from 56B — adds current_mode at
+ *   Total: 80 bytes (PRE2 group tail at 72; wait_seq at 64; current_mode at
  *   offset 56; spec-2.27 D2 / HC49 had bumped 48B->56B for the
  *   shard_master_generation dedup field).  Aligned to 8.
  *
@@ -516,11 +516,16 @@ typedef struct GesRequestPayload {
 	 * and the cross-node cancel echoes it for D5 ABA revalidate.  0 for
 	 * non-waiter opcodes. */
 	uint64 wait_seq;
+	uint32 lock_group_procno_plus_one; /* 0: independent; else PG group leader + 1 */
+	uint32 _group_pad0;				   /* must be zero */
 } GesRequestPayload;
 
-StaticAssertDecl(sizeof(GesRequestPayload) == 72,
-				 "GesRequestPayload wire ABI 72-byte lock (spec-5.3 D2 56->64; spec-5.8 D1c "
-				 "waiter_xid in tail pad; spec-5.8 D1e +8 wait_seq -> 72)");
+StaticAssertDecl(sizeof(GesRequestPayload) == 80,
+				 "GesRequestPayload wire ABI: 80 bytes, homogeneous PRE2 only");
+StaticAssertDecl(offsetof(GesRequestPayload, lock_group_procno_plus_one) == 72,
+				 "GES parallel lock group tail offset");
+
+extern uint32 cluster_ges_current_lock_group(const struct ClusterGrdHolderId *holder);
 
 /* Backend-local HW/relation REQUEST handoff.  Historical type name retained;
  * never a shared entry pointer, a new authority, or a wire payload. */

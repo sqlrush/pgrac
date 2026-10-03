@@ -1427,8 +1427,9 @@ cluster_grd_redeclare_all_registered(void)
 			if (master == cluster_node_id) {
 				/* Local master (incl. shard just remastered TO this
 				 * node):  direct insert-or-rebind, no wire. */
-				ok = (cluster_grd_entry_rebind_or_insert_holder(
-						  &resid, &new_holder, cluster_node_id, (int)locallock->tag.mode)
+				ok = (cluster_grd_entry_rebind_or_insert_holder_group(
+						  &resid, &new_holder, cluster_node_id, (int)locallock->tag.mode,
+						  cluster_ges_current_lock_group(&new_holder))
 					  == CLUSTER_GRD_ENTRY_OK);
 			} else if (master >= 0) {
 				ok = (cluster_ges_send_redeclare_and_wait(&resid, (uint32)locallock->tag.mode,
