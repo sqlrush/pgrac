@@ -2690,7 +2690,9 @@ qvotec_build_baseline_marker(ClusterFenceMarker *out)
 		memset(fenced, 0, sizeof(fenced));
 		if (any_removed)
 			cluster_reconfig_snapshot_removed_bitmap(fenced);
-		cluster_fence_marker_build_baseline(out, CLUSTER_EPOCH_INITIAL, fenced, 0 /* generation */,
+		/* A committed INITIAL cold formation advances the applied baseline;
+		 * raw transport epoch remains deliberately insufficient authority. */
+		cluster_fence_marker_build_baseline(out, applied.new_epoch, fenced, 0 /* generation */,
 											0 /* event_id */,
 											CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
 	} else {
