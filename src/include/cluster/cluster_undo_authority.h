@@ -133,10 +133,18 @@ cluster_undo_serve_authority_lookup(int32 owner_node, uint64 reconfig_epoch, int
  *	                    master, so a lookup miss fails closed, it does NOT
  *	                    fall back to the hash route (spec-5.22d 约束 #2).
  */
+/* Stack-only attribution, never owner liveness or permission to serve block0.
+ * The stale MEMBER case can qualify an independently admitted C1b inquiry. */
+typedef enum ClusterUndoRouteReason {
+	CLUSTER_UNDO_ROUTE_REASON_NONE = 0,
+	CLUSTER_UNDO_ROUTE_MEMBER_OBSERVATION_STALE
+} ClusterUndoRouteReason;
+
 typedef struct ClusterUndoServeRoute {
 	int32 destination_node;
 	uint64 reconfig_epoch;
 	ClusterUndoAuthorityStatus status;
+	ClusterUndoRouteReason reason;
 } ClusterUndoServeRoute;
 
 /*
