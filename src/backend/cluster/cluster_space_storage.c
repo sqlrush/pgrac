@@ -1030,6 +1030,49 @@ void
 cluster_space_drop_finish(ClusterSpaceDropState *state)
 {
 	Assert(state != NULL && CritSectionCount == 0);
+	if (state->published && !RecoveryInProgress()) {
+		/* COMMIT is already durable. Preserve the original locked SPACE
+		 * owner until every tombstone has an exact durable observation;
+		 * pending-delete unlink must not run after an unconfirmed result.
+		 * An unpublished preparation/abort must never write the tombstone.
+		 * Replay retains its separate recovery durability owner; it does
+		 * not create this live origin's structural completion receipt. */
+		PG_TRY();
+		{
+			for (int i = 0; i < state->count; i++) {
+				ClusterSpaceTruncateState *entry = state->entries[i];
+				ClusterSpaceStructureChange change;
+				SMgrRelation smgr;
+
+				if (!cluster_space_structure_wal_decode(entry->wal, sizeof(entry->wal), &change)
+					|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE)
+					elog(PANIC, "SPACE deletion lost its original committed record");
+				for (int j = 0; j < 2; j++)
+					FlushOneBuffer(entry->buffers[j]);
+				smgr = smgropen(change.identity.result.key.locator, InvalidBackendId);
+				smgrimmedsync(smgr, SPACE_FORKNUM);
+				for (int j = 0; j < 2; j++)
+					if (!space_structure_readback(smgr, entry->buffers[j], j))
+						ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+										errmsg("deleted SPACE page does not match its durable write"),
+										errdetail("Relation %u/%u/%u, SPACE block %d.",
+												  change.identity.result.key.locator.spcOid,
+												  change.identity.result.key.locator.dbOid,
+												  change.identity.result.key.locator.relNumber, j)));
+			}
+		}
+		PG_CATCH();
+		{
+			/* ERROR cleanup would pretend this committed transaction aborted
+			 * and expose its cached tombstone without the durable anchor. */
+			ereport(PANIC, (errcode(ERRCODE_IO_ERROR),
+							errmsg("could not durably publish committed relation deletion"),
+							errdetail("The original SPACE owners remain held before file removal."),
+							errhint("Restore storage availability and restart the instance to recover "
+									"the committed deletion.")));
+		}
+		PG_END_TRY();
+	}
 	for (int i = state->count - 1; i >= 0; i--)
 		space_truncate_release(state->entries[i]);
 	if (state->published && state->count != 0 && space_identity_cache != NULL)
