@@ -2076,6 +2076,7 @@ test_cluster_space_recovery_product.o: $(top_srcdir)/src/backend/cluster/cluster
 		$(top_srcdir)/src/include/cluster/cluster_hw.h \
 		$(top_srcdir)/src/include/cluster/cluster_lock_acquire.h \
 		$(top_srcdir)/src/include/cluster/cluster_page_stable_base.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
 		$(top_srcdir)/src/include/cluster/cluster_space_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_thread_recovery_fabric.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections -c $< -o $@

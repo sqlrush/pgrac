@@ -808,6 +808,7 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 			if (!side_native_control_valid(record_plan->source_record, identity))
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 			candidate->kind = RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;
+			candidate->control_scn = XLogRecGetScn(record_plan->source_record);
 			candidate->owned_payload_length = XLogRecGetDataLen(record_plan->source_record);
 			*payload = (const uint8 *)XLogRecGetData(record_plan->source_record);
 		} else if (record_plan->route.rmid == RM_XACT_ID
@@ -2011,7 +2012,8 @@ side_plan_apply_ops_valid(const RfSideOnlinePlanV1 *plan, const RfSideOnlineAppl
 			|| (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_SPACE
 				&& (ops->preflight_space == NULL || ops->apply_space == NULL))
 			/* No projection/TT callback may stand in for native control. */
-			|| plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
+			|| (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL
+				&& (ops->preflight_control == NULL || ops->apply_control == NULL))
 			|| plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_INVALID)
 			return false;
 	}
@@ -2053,6 +2055,8 @@ side_plan_preflight_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApp
 			accepted = ops->preflight_undo(ops->arg, &operation);
 		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE)
 			accepted = ops->preflight_space(ops->arg, &operation);
+		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL)
+			accepted = ops->preflight_control(ops->arg, &operation);
 		else
 			accepted = ops->preflight_projection(ops->arg, &operation);
 		if (!accepted)
@@ -2111,6 +2115,8 @@ side_plan_apply_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOp
 			applied = ops->apply_undo(ops->arg, &operation);
 		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_SPACE)
 			applied = ops->apply_space(ops->arg, &operation);
+		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL)
+			applied = ops->apply_control(ops->arg, &operation);
 		else
 			applied = ops->apply_projection(ops->arg, &operation);
 		if (!applied)

@@ -52,6 +52,8 @@ typedef struct RfSideOnlineOperationV1 {
 	ClusterSpaceIdentityKey space_key;
 	/* Kept for reconstruction/dependency checks; never dispatched as redo. */
 	bool history_only;
+	/* Original header SCN, not a page version or control-file authority. */
+	SCN control_scn;
 } RfSideOnlineOperationV1;
 
 typedef bool (*RfSideOnlineApplyXactV1)(void *arg, const RfSideOnlineOperationV1 *operation);
@@ -62,6 +64,7 @@ typedef bool (*RfSideOnlinePreflightUndoV1)(void *arg, const RfSideOnlineOperati
 typedef bool (*RfSideOnlinePreflightProjectionV1)(void *arg,
 												  const RfSideOnlineOperationV1 *operation);
 typedef bool (*RfSideOnlineSpaceV1)(void *arg, const RfSideOnlineOperationV1 *operation);
+typedef bool (*RfSideOnlineControlV1)(void *arg, const RfSideOnlineOperationV1 *operation);
 typedef bool (*RfSideOnlineBeginProtectedSetV1)(void *arg);
 typedef void (*RfSideOnlineEndProtectedSetV1)(void *arg, bool complete);
 
@@ -78,6 +81,8 @@ typedef struct RfSideOnlineApplyOpsV1 {
 	RfSideOnlineApplyProjectionV1 apply_projection;
 	RfSideOnlineSpaceV1 preflight_space;
 	RfSideOnlineSpaceV1 apply_space;
+	RfSideOnlineControlV1 preflight_control;
+	RfSideOnlineControlV1 apply_control;
 	/* Zero selects the whole plan. A nonzero original thread selects only
 	 * its operations; this is a selector, never recovery authority. */
 	uint16 source_thread;
