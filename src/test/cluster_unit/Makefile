@@ -187,7 +187,7 @@ TESTS = test_cluster_shared_fs_drop test_cluster_formation_restart test_cluster_
         test_cluster_membership \
         test_cluster_node_remove test_cluster_node_remove_stop test_cluster_recovery_stop test_cluster_backup_stop test_cluster_mrp_stop \
         test_cluster_hang_acceptance \
-        test_cluster_xid_stripe test_cluster_xid_stripe_evidence test_cluster_xid_allocation \
+        test_cluster_xid_stripe test_cluster_xid_stripe_evidence test_cluster_xid_stripe_boot test_cluster_xid_allocation \
         test_cluster_undo_resid \
         test_cluster_undo_authority \
         test_cluster_undo_gcs \
@@ -387,7 +387,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_control_transport test_cluster_cr_nati
 		test_cluster_resource_x_handoff test_cluster_retained_remote \
 		test_cluster_r4_d10_hint_source test_cluster_r4_d10_tt_source \
 		test_cluster_r4_d10_multi_source test_cluster_sf_dep test_cluster_wal_state_rmw \
-		test_cluster_ges_reply_wait test_cluster_xid_stripe_evidence test_cluster_xid_allocation \
+		test_cluster_ges_reply_wait test_cluster_xid_stripe_evidence test_cluster_xid_stripe_boot test_cluster_xid_allocation \
 		test_cluster_replacement_episode \
 		test_cluster_replacement_request \
 		test_cluster_undo_root_descriptor \
@@ -7724,6 +7724,24 @@ test_cluster_xid_allocation.inc: $(top_srcdir)/src/backend/access/transam/varsup
 test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
 		test_cluster_xid_allocation.inc $(CLUSTER_XID_STRIPE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Exercise the original recovery -> seed -> claim -> WAL gate. Dependency
+# boundaries are controlled by the test; the admission predicates are not.
+test_cluster_xid_stripe_boot.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe_boot.c $(top_srcdir)/src/backend/cluster/cluster_xid_stripe_xlog.c Makefile
+	awk '/^typedef enum StripeMailboxOp/ { emit=1; types++ } \
+	     /^typedef struct ClusterXidStripe(Lease|BootShmem) / { emit=1; types++ } \
+	     /^static ClusterXidStripeBootShmem \*StripeBootShmem / { print; pointers++ } \
+	     /^stripe_stage_op\(/ { print "static uint64"; emit=1; functions++ } \
+	     /^stripe_stage_seed_request\(/ { print "static void"; emit=1; functions++ } \
+	     /^cluster_xid_stripe_join_progress\(/ { print "ClusterXidStripeJoinProgress"; emit=1; functions++ } \
+	     /^cluster_xid_stripe_join_gate\(/ { print "ClusterXidStripeJoinVerdict"; emit=1; functions++ } \
+	     /^cluster_xid_stripe_(get_activation|emit_join_wal)\(/ { print "bool"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 3 || pointers != 1 || functions != 6) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_xid_stripe_boot: test_cluster_xid_stripe_boot.c unit_test.h test_cluster_xid_stripe_boot.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
 test_cluster_xid_stripe_evidence.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe_boot.c Makefile
 	awk '/^typedef enum StripeSlotRead(Class|Purpose)/ { emit=1; types++ } \
