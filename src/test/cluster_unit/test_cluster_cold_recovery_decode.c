@@ -36,6 +36,7 @@
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_page_detached.h"
+#include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_space_reservation.h"
 #include "replication/message.h"
 #include "storage/standbydefs.h"
@@ -86,6 +87,17 @@ ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, Size len, xl_xact_parsed_co
 	parsed->nspace_drops = commit_nspace_drops;
 	parsed->space_drops = commit_space_drops;
 	return true;
+}
+
+/* The bounded completion check itself is exercised with real records in
+ * test_cluster_wal_retained_cut_records; here only its verdict is used. */
+static bool abort_shape_ok;
+
+bool
+rf_side_xact_completion_shape_v1(XLogReaderState *record, bool commit)
+{
+	UT_ASSERT(record != NULL && !commit);
+	return abort_shape_ok;
 }
 
 void
@@ -145,6 +157,7 @@ fake_record(FakeRecord *record, uint8 rmid, uint8 info, int blocks)
 	preflight_plan.preflight_complete = true;
 	commit_nrels = 0;
 	abort_nrels = 0;
+	abort_shape_ok = true;
 	commit_parse_ok = true;
 	commit_nspace_drops = 0;
 	commit_space_drops = NULL;
@@ -284,6 +297,10 @@ UT_TEST(test_transaction_lifecycle_classification)
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_STRUCTURAL);
+	/* An ABORT whose sections do not lie within its data is damaged. */
+	abort_shape_ok = false;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
+				 CLUSTER_COLD_COMPONENT_INVALID);
 
 	for (i = 0; i < 3; i++) {
 		fake_record(&record, RM_XACT_ID, prepared[i], 0);

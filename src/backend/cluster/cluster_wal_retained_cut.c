@@ -35,7 +35,9 @@
  *	  SMGR CREATE needs nothing older, a native SMGR TRUNCATE ends an
  *	  incarnation, standalone invalidations and XID assignments need
  *	  nothing, and a transaction end carries its SIDE owner classes plus,
- *	  with relations to drop, the structure pin.  The
+ *	  with relations to drop, the structure pin.  A transaction end whose
+ *	  sections do not lie within its data is damaged, not unsupported, and
+ *	  refuses the census (COMPONENT_INCOMPLETE).  The
  *	  obligations go into a fixed-size sketch keeping, per bucket, the
  *	  earliest before-version and the range of incarnations; collisions
  *	  only make the answer more conservative.  History edges are spooled to
@@ -82,6 +84,7 @@
 #include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_side_online_plan.h"
+#include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_wal_claim.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_retained_cut.h"
@@ -468,9 +471,11 @@ retained_native_record(RetainedCutWork *work, XLogReaderState *record, RfPagePro
 	case XLOG_XACT_COMMIT_PREPARED: {
 		xl_xact_parsed_commit parsed;
 
+		/* Bounded: ParseCommitRecord checks every section against the
+		 * main data length first. */
 		if (!ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
 							   XLogRecGetDataLen(record), &parsed))
-			return refused;
+			return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
 		owners = RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL;
 		if ((info & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT_PREPARED)
 			owners |= RF_SIDE_CONTRIBUTION_PREPARED;
@@ -481,8 +486,10 @@ retained_native_record(RetainedCutWork *work, XLogReaderState *record, RfPagePro
 	case XLOG_XACT_ABORT_PREPARED: {
 		xl_xact_parsed_abort parsed;
 
-		if (XLogRecGetDataLen(record) < MinSizeOfXactAbort)
-			return refused;
+		/* ParseAbortRecord trusts the xinfo it reads: a damaged record
+		 * refuses the census, it does not become retention evidence. */
+		if (!rf_side_xact_completion_shape_v1(record, false))
+			return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
 		ParseAbortRecord(XLogRecGetInfo(record), (xl_xact_abort *)XLogRecGetData(record), &parsed);
 		owners = RF_SIDE_CONTRIBUTION_TERMINAL;
 		if ((info & XLOG_XACT_OPMASK) == XLOG_XACT_ABORT_PREPARED)

@@ -59,6 +59,9 @@ typedef struct RfSideXactOperationV1 {
 extern bool rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier,
 								   uint16 origin_thread, RfSideXactOperationV1 *out);
 extern bool rf_side_xact_structural_preflight_v1(const RfSideXactOperationV1 *operation);
+/* Every xinfo section of a COMMIT/ABORT lies within its main data and no
+ * unknown or misplaced section is present. */
+extern bool rf_side_xact_completion_shape_v1(XLogReaderState *record, bool commit);
 
 typedef enum RfSideXactApplyResultV1 {
 	RF_SIDE_XACT_APPLY_OK = 0,

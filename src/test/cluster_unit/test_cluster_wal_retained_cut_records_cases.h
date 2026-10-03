@@ -212,4 +212,72 @@ UT_TEST(test_records_unknown_native_record_still_refuses)
 	}
 }
 
+/* A integration reproducer (A hold 16c44655e9), extended: the typed decoder
+ * rejects a transaction end whose sections do not lie within its data, and
+ * the native fallback must reject it too -- a damaged record refuses the
+ * census instead of becoming retention evidence.  Truncated xinfo, count
+ * arrays longer than the data, trailing bytes and a section an ABORT cannot
+ * carry, for ABORT and COMMIT alike. */
+UT_TEST(test_records_short_abort_does_not_advance_retention)
+{
+	for (int variant = 0; variant < 7; variant++) {
+		uint32 self, peer;
+		ClusterWalRetainedCutV1 cut;
+		RfPageProofDetailV1 detail;
+		bool commit = variant >= 5;
+		RealRecord *record;
+		xl_xact_abort abort_record = { 0 };
+		xl_xact_commit commit_record = { 0 };
+		xl_xact_xinfo xinfo = { 0 };
+		RelFileLocator locator = rec_locator(16400);
+		TransactionId sub = 804;
+		int count = 1000;
+		uint8 junk[4] = { 9, 9, 9, 9 };
+
+		rec_two_writers(&self, &peer);
+		record = record_new(self, RM_XACT_ID,
+							(commit ? XLOG_XACT_COMMIT : XLOG_XACT_ABORT) | XLOG_XACT_HAS_INFO, 803,
+							0x2000, 0x2100);
+		if (commit)
+			record_append(record, &commit_record, MinSizeOfXactCommit);
+		else
+			record_append(record, &abort_record, MinSizeOfXactAbort);
+		if (variant == 0) /* A's case: no xinfo at all */
+			;
+		else if (variant == 1 || variant == 5) /* xinfo cut short */
+			record_append(record, junk, 2);
+		else if (variant == 2) { /* relation count beyond the data */
+			xinfo.xinfo = XACT_XINFO_HAS_RELFILELOCATORS;
+			record_append(record, &xinfo, sizeof(xinfo));
+			record_append(record, &count, sizeof(count));
+			record_append(record, &locator, sizeof(locator));
+		} else if (variant == 3) { /* bytes after the last section */
+			xinfo.xinfo = XACT_XINFO_HAS_RELFILELOCATORS;
+			count = 1;
+			record_append(record, &xinfo, sizeof(xinfo));
+			record_append(record, &count, sizeof(count));
+			record_append(record, &locator, sizeof(locator));
+			record_append(record, junk, sizeof(junk));
+		} else if (variant == 4) { /* a section only a COMMIT carries */
+			xl_xact_tt_commit tt = { 0 };
+
+			xinfo.xinfo = XACT_XINFO_HAS_TT_COMMIT;
+			record_append(record, &xinfo, sizeof(xinfo));
+			record_append(record, &tt, sizeof(tt));
+		} else { /* variant 6: subtransaction count beyond the data */
+			xinfo.xinfo = XACT_XINFO_HAS_SUBXACTS;
+			record_append(record, &xinfo, sizeof(xinfo));
+			record_append(record, &count, sizeof(count));
+			record_append(record, &sub, sizeof(sub));
+		}
+		UT_ASSERT(compute_for(self, &cut, &detail) != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(detail != RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(cut.lower, InvalidXLogRecPtr);
+		if (variant == 0) /* reaches the native fallback, which refuses it */
+			UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE);
+		if (ut_current_failed)
+			printf("# damaged transaction end variant %d\n", variant);
+	}
+}
+
 #endif /* TEST_CLUSTER_WAL_RETAINED_CUT_RECORDS_CASES_H */

@@ -367,6 +367,16 @@ rf_side_record_census_v1(const RfDetachedRecordPlanV1 *record_plan pg_attribute_
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
+/* The fixture SIDE decoder accepts every record: the native fallback and
+ * its bounded transaction-end check are never reached here (see the
+ * records test for both). */
+bool
+rf_side_xact_completion_shape_v1(XLogReaderState *record pg_attribute_unused(),
+								 bool commit pg_attribute_unused())
+{
+	abort();
+}
+
 /* ---- checkpointer driver services ---- */
 static bool self_ref_valid = true;
 static int publish_calls;
