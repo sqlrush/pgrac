@@ -34,11 +34,18 @@
  *	  src/backend/executor/execMain.c
  *
  * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
  *   Opt-in whole UPDATE execution timing, including scan and retry work.
+ *   Check storage eligibility at executor entry, including parallel workers.
+ *   See spec-s9p2-06-online-membership.md.
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_storage_quorum.h"
+#endif
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_update_trace.h"
@@ -135,6 +142,10 @@ static void EvalPlanQualStart(EPQState *epqstate, Plan *planTree);
 void
 ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: include parallel workers and extensions replacing the executor. */
+	cluster_storage_quorum_check_sql();
+#endif
 	/*
 	 * In some cases (e.g. an EXECUTE statement or an execute message with the
 	 * extended query protocol) the query_id won't be reported, so do it now.

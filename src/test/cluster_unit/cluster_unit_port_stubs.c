@@ -15,6 +15,7 @@
 #include "postgres.h"
 #include "cluster/cluster_update_trace.h"
 #include "cluster/cluster_xnode_profile.h"
+#include "cluster/cluster_storage_quorum.h"
 
 /* Profiling-aware product objects can link without a diagnostic backend.
  * Dedicated trace tests override these defaults with the real collector. */
@@ -25,6 +26,15 @@ ClusterXnodeProfileShared *ClusterXnodeProfileCtl __attribute__((weak)) = NULL;
 /* PageSetLSN reads the static shared-storage profile. Legacy standalone
  * fixtures default to off; shared-profile tests supply their own value. */
 bool cluster_shared_config __attribute__((weak)) = false;
+int cluster_node_id __attribute__((weak)) = -1;
+
+/* Legacy fixtures run the native profile. A shared voting-I/O fixture must
+ * provide its actual eligibility boundary, never silently grant authority. */
+bool __attribute__((weak))
+cluster_storage_quorum_allows_node(int node_id pg_attribute_unused())
+{
+	abort();
+}
 
 void __attribute__((weak))
 cluster_update_trace_event_at(const ClusterUpdateTraceEvent *event pg_attribute_unused(),

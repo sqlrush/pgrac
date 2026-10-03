@@ -201,6 +201,8 @@ int cluster_storage_fence_driver = CLUSTER_STORAGE_FENCE_DRIVER_AUTO;
 bool cluster_controlfile_shared_authority = false;
 /* PGRAC: root-v2 configuration profile. Author: SqlRush <sqlrush@gmail.com> */
 bool cluster_shared_config = false;
+char *cluster_storage_quorum_nodes = NULL;
+char *cluster_storage_quorum_cluster = NULL;
 bool cluster_smgr_user_relations = false;
 /*
  * spec-6.14 D1: shared system-catalog single authority.  Off by default; on
@@ -2323,6 +2325,14 @@ cluster_init_guc(void)
 	 * The startup gate rejects it until the exact bootstrap adapter is ready.
 	 * Author: SqlRush <sqlrush@gmail.com>
 	 */
+	DefineCustomStringVariable(
+		"cluster.storage_quorum_nodes", gettext_noop("Map database slots to Corosync node IDs."),
+		gettext_noop("Comma-separated slot:id pairs covering every configured database node."),
+		&cluster_storage_quorum_nodes, "", PGC_POSTMASTER, 0, NULL, NULL, NULL);
+	DefineCustomStringVariable(
+		"cluster.storage_quorum_cluster", gettext_noop("Expected Corosync storage cluster name."),
+		NULL, &cluster_storage_quorum_cluster, "", PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
 	DefineCustomBoolVariable(
 		"cluster.shared_config", gettext_noop("Use the shared root-v2 configuration profile."),
 		gettext_noop("Requires a fully qualified root-v2 migration and startup path. "

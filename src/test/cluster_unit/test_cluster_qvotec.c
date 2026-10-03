@@ -421,7 +421,37 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPt
 }
 
 #include "datatype/timestamp.h"
+#include <time.h>
 static TimestampTz mock_now = 1700000000000000LL;
+static ClusterStorageQuorumView storage_sample;
+
+int cluster_qvotec_test_clock_gettime(clockid_t clock_id, struct timespec *out);
+int
+cluster_qvotec_test_clock_gettime(clockid_t clock_id, struct timespec *out)
+{
+	Assert(clock_id == CLOCK_MONOTONIC);
+	out->tv_sec = mock_now / 1000000;
+	out->tv_nsec = (mock_now % 1000000) * 1000;
+	return 0;
+}
+
+static void
+storage_fixture_ready(void)
+{
+	memset(&storage_sample, 0, sizeof(storage_sample));
+	storage_sample.reason = CLUSTER_STORAGE_QUORUM_READY;
+	storage_sample.ring_node = 11;
+	storage_sample.ring_sequence = 8;
+	storage_sample.members[0] = UINT64_C(1) << cluster_node_id;
+	cluster_storage_quorum_refresh(cluster_storage_quorum_now_us(), 1000000);
+}
+
+void
+cluster_storage_corosync_sample(ClusterStorageQuorumView *out)
+{
+	*out = storage_sample;
+}
+
 TimestampTz
 GetCurrentTimestamp(void)
 {
@@ -1414,7 +1444,9 @@ UT_TEST(test_qvotec_preserves_replacement_request_per_disk_fail_closed)
 
 UT_TEST(test_qvotec_shmem_and_mailbox_layout)
 {
-	UT_ASSERT_EQ(cluster_qvotec_shmem_size(), 4056);
+	UT_ASSERT_EQ(CLUSTER_QVOTEC_SHMEM_STORAGE_OFFSET, 4056);
+	UT_ASSERT_EQ(sizeof(ClusterStorageQuorumState), 64);
+	UT_ASSERT_EQ(cluster_qvotec_shmem_size(), 4120);
 	UT_ASSERT_EQ(sizeof(ClusterQvotecPriorExitObservation), 3600);
 	UT_ASSERT_EQ(sizeof(ClusterQvotecMailbox), 320);
 	UT_ASSERT_EQ(offsetof(ClusterQvotecMailbox, request_seq), 0);
@@ -1619,6 +1651,51 @@ UT_TEST(test_in_quorum_missing_shmem_diagnostic_is_once_and_still_false)
 	UT_ASSERT_EQ(quorum_admission_log_count, 1);
 	UT_ASSERT(!cluster_qvotec_in_quorum());
 	UT_ASSERT_EQ(quorum_admission_log_count, 1);
+}
+
+UT_TEST(test_shared_quorum_requires_live_storage_evidence)
+{
+	bool shared_before = cluster_shared_config;
+	bool allowed;
+
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_OK);
+	pg_atomic_write_u64((pg_atomic_uint64 *)(shmem_storage + 32), mock_now + 1000000);
+	cluster_thaw_writes_set();
+	cluster_shared_config = true;
+	allowed = cluster_qvotec_in_quorum();
+	cluster_shared_config = shared_before;
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4),
+						CLUSTER_QVOTEC_QUORUM_INITIALIZING);
+	UT_ASSERT(!allowed);
+}
+
+UT_TEST(test_shared_storage_evidence_never_replaces_database_quorum)
+{
+	bool shared_before = cluster_shared_config;
+
+	cluster_shared_config = true;
+	cluster_thaw_writes_set();
+	memset(&storage_sample, 0, sizeof(storage_sample));
+	storage_sample.reason = CLUSTER_STORAGE_QUORUM_READY;
+	storage_sample.ring_node = 11;
+	storage_sample.ring_sequence = 8;
+	storage_sample.members[0] = 1;
+	cluster_storage_quorum_refresh(mock_now, 100);
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_OK);
+	pg_atomic_write_u64((pg_atomic_uint64 *)(shmem_storage + 32), mock_now + 1000000);
+	UT_ASSERT(cluster_qvotec_in_quorum());
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_LOST);
+	UT_ASSERT(!cluster_qvotec_in_quorum());
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4), CLUSTER_QVOTEC_QUORUM_OK);
+	mock_now += 100;
+	UT_ASSERT(!cluster_qvotec_in_quorum());
+	mock_now -= 100;
+	storage_sample.reason = CLUSTER_STORAGE_QUORUM_NOT_QUORATE;
+	cluster_storage_quorum_refresh(mock_now, 100);
+	UT_ASSERT(!cluster_qvotec_in_quorum());
+	cluster_shared_config = shared_before;
+	pg_atomic_write_u32((pg_atomic_uint32 *)(shmem_storage + 4),
+						CLUSTER_QVOTEC_QUORUM_INITIALIZING);
 }
 
 UT_TEST(test_in_quorum_diagnostics_preserve_exact_state_and_lease_decisions)
@@ -2245,9 +2322,12 @@ UT_TEST(test_pre2_startup_complete_observations_preserve_classification)
 	cluster_shared_config = true;
 	UT_ASSERT(normal_stop_startup_probe(&set, &unclean));
 	UT_ASSERT(unclean);
+	UT_ASSERT(!cluster_storage_quorum_allows_node(0));
+	storage_fixture_ready(); /* Restart must obtain new storage evidence. */
 	UT_ASSERT(cluster_qvotec_test_clean_shutdown(set.fds, 3, 901, 12));
 	UT_ASSERT(normal_stop_startup_probe(&set, &unclean));
 	UT_ASSERT(!unclean);
+	storage_fixture_ready();
 	for (int d = 0; d < PGSA_TEST_DISKS; d++) {
 		UT_ASSERT_EQ(cluster_voting_disk_read_slot(set.fds[d], d, 0, &slot),
 					 CLUSTER_VOTING_DISK_IO_OK);
@@ -2279,6 +2359,8 @@ UT_TEST(test_prior_exit_retains_exact_preheartbeat_slots)
 	UT_ASSERT_EQ(before.node_id, 0);
 	UT_ASSERT_EQ(before.n_disks, 3);
 	UT_ASSERT_EQ(memcmp(before.slots, old, sizeof(old)), 0);
+	UT_ASSERT(!cluster_storage_quorum_allows_node(0));
+	storage_fixture_ready();
 	for (int d = 0; d < PGSA_TEST_DISKS; d++) {
 		old[d].incarnation = 902;
 		old[d].flags = CLUSTER_VOTING_SLOT_FLAG_ALIVE;
@@ -3833,7 +3915,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(74);
+	UT_PLAN(76);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -3846,7 +3928,9 @@ main(void)
 	UT_RUN(test_qvotec_accessors_null_safe_pre_init);
 	UT_RUN(test_in_quorum_missing_shmem_diagnostic_is_once_and_still_false);
 	UT_RUN(test_qvotec_accessors_post_init);
+	UT_RUN(test_shared_quorum_requires_live_storage_evidence);
 	UT_RUN(test_in_quorum_diagnostics_preserve_exact_state_and_lease_decisions);
+	UT_RUN(test_shared_storage_evidence_never_replaces_database_quorum);
 	UT_RUN(test_quorum_owner_phase_is_read_only_and_rejects_missing_or_recycled_owner);
 	UT_RUN(test_passive_quorum_observation_neither_renews_nor_logs);
 	UT_RUN(test_quorum_lease_thirty_polls_preserves_exact_expiry_and_fail_closed);

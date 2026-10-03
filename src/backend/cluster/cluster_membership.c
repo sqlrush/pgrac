@@ -25,6 +25,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_storage_quorum.h"
 
 #include "cluster/cluster_guc.h" /* cluster_node_id (spec-5.22e D5-8) */
 #include "cluster/cluster_membership.h"
@@ -523,7 +524,7 @@ cluster_membership_vet_joiner(int32 node_id, uint64 presented_incarnation, uint6
 	 * gates on quorum before vetting, but keeping the check here makes vet
 	 * self-contained and fail-closed regardless of caller.
 	 */
-	if (!cluster_qvotec_in_quorum())
+	if (!cluster_qvotec_in_quorum() || !cluster_storage_quorum_allows_node(node_id))
 		return CLUSTER_JOIN_REJECT_QUORUM;
 
 	/*

@@ -46,6 +46,7 @@
 
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
+#include "cluster/cluster_storage_quorum.h"
 
 #undef printf
 #undef fprintf
@@ -80,6 +81,13 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
  * monotonic-incarnation cases (U1-U5) reach the floor compare.
  */
 static bool test_in_quorum = true;
+static int storage_excluded_node = -1;
+
+bool
+cluster_storage_quorum_allows_node(int node_id)
+{
+	return node_id != storage_excluded_node;
+}
 
 bool
 cluster_qvotec_in_quorum(void)
@@ -170,6 +178,16 @@ UT_TEST(test_vet_fresh_above_accept)
 {
 	cluster_membership_record_admitted(3, 5);
 	UT_ASSERT_EQ(cluster_membership_vet_joiner(3, 6, 1), CLUSTER_JOIN_ACCEPT);
+}
+
+UT_TEST(test_vet_joiner_must_belong_to_storage_component)
+{
+	cluster_membership_record_admitted(22, 5);
+	storage_excluded_node = 22;
+	UT_ASSERT_EQ(cluster_membership_vet_joiner(22, 6, 1), CLUSTER_JOIN_REJECT_QUORUM);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(22), 5);
+	storage_excluded_node = -1;
+	UT_ASSERT_EQ(cluster_membership_vet_joiner(22, 6, 1), CLUSTER_JOIN_ACCEPT);
 }
 
 /* ======================================================================
@@ -1077,8 +1095,9 @@ UT_TEST(test_operation_authority_generation_and_phase_are_required)
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(34);
 	UT_RUN(test_vet_fresh_above_accept);
+	UT_RUN(test_vet_joiner_must_belong_to_storage_component);
 	UT_RUN(test_vet_equal_reject_stale);
 	UT_RUN(test_vet_below_reject_stale);
 	UT_RUN(test_vet_node_id_out_of_range_failclosed);

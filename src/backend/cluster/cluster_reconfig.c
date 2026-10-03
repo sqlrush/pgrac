@@ -1750,6 +1750,8 @@ cluster_reconfig_compute_join_bitmap(uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BIT
 			continue; /* self is never a join candidate */
 		if (cluster_conf_lookup_node(i) == NULL)
 			continue; /* declared-peer filter */
+		if (!cluster_storage_quorum_allows_node(i))
+			continue; /* storage component is the upper bound of DB candidates */
 
 		ms = cluster_membership_get_state(i);
 		if (ms != CLUSTER_MEMBER_DEAD && ms != CLUSTER_MEMBER_ABSENT)
@@ -7829,6 +7831,8 @@ cluster_reconfig_r4_membership_observations_current(
 
 	if (candidate == NULL || cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY
 		|| !cluster_qvotec_in_quorum() || cluster_epoch_get_current() != candidate->formation_epoch
+		|| !cluster_storage_quorum_allows_members(candidate->admitted_members_lo,
+												  candidate->admitted_members_hi)
 		|| cluster_qvotec_get_self_incarnation() != candidate->local_self_boot_incarnation)
 		return false;
 	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
@@ -8793,6 +8797,8 @@ cluster_reconfig_startup_cohort_valid(const ClusterFormationCommitMarker *marker
 {
 	int first = -1;
 	int count = 0;
+	uint64 storage_members[2] = { 0, 0 };
+
 	if (!cluster_shared_config || marker->formation_generation == 0 || marker->commit_nonce == 0
 		|| marker->formation_epoch <= CLUSTER_EPOCH_INITIAL
 		|| marker->formation_epoch != cluster_epoch_get_current() || cluster_node_id < 0
@@ -8817,6 +8823,7 @@ cluster_reconfig_startup_cohort_valid(const ClusterFormationCommitMarker *marker
 			return false;
 		if (!declared)
 			continue;
+		storage_members[i / 64] |= UINT64_C(1) << (i % 64);
 		if (first < 0)
 			first = i;
 		count++;
@@ -8831,7 +8838,8 @@ cluster_reconfig_startup_cohort_valid(const ClusterFormationCommitMarker *marker
 			return false;
 	}
 	return first >= 0 && count == marker->n_admitted && marker->arbiter_node == (uint64)first
-		   && marker->arbiter_incarnation == incarnations[first];
+		   && marker->arbiter_incarnation == incarnations[first]
+		   && cluster_storage_quorum_allows_members(storage_members[0], storage_members[1]);
 }
 
 static bool

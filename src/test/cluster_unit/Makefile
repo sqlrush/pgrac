@@ -56,7 +56,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_heap_prepare_diagnostic test_cluster_generic_version test_cluster_generic_redo \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
-        test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
+        test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
         test_cluster_bufmgr_stop test_cluster_allocation_stop test_cluster_hw_cold test_cluster_hw_initdb test_cluster_native_wal_stop test_cluster_checkpointer_stop test_cluster_postmaster_stop test_cluster_xnode_profile test_cluster_adg \
         test_cluster_xnode_lever test_cluster_ges_handoff \
         test_cluster_reverse_key test_cluster_hw_lease test_cluster_pi_shadow \
@@ -398,7 +398,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_control_transport test_cluster_cr_nati
 SIMPLE_TESTS := $(filter-out test_cluster_native_wal_stop test_cluster_hw_initdb test_cluster_hw_cold test_cluster_cr_inline_stop test_cluster_mrp_stop test_cluster_backup_stop test_cluster_recovery_stop test_cluster_node_remove_stop test_cluster_postmaster_stop test_cluster_checkpointer_stop test_cluster_allocation_stop test_cluster_raw_device_capacity test_cluster_replacement_wire \
 		test_cluster_external_fence test_pgrac_external_fence_protocol \
 		test_cluster_wal_retention test_cluster_terminal_ref_census test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
-		test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop,$(SIMPLE_TESTS))
+		test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop,$(SIMPLE_TESTS))
 
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_journal test_pgrac_fenced_provider \
@@ -4327,6 +4327,10 @@ cluster_qvotec_io_test.o: $(top_srcdir)/src/backend/cluster/cluster_voting_disk_
 test_cluster_qvotec_activation_product.o: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
+test_cluster_storage_quorum_product.o: $(top_srcdir)/src/backend/cluster/cluster_storage_quorum.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Dclock_gettime=cluster_qvotec_test_clock_gettime \
+		-ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
 		cluster_unit_no_normal_stop.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_QVOTEC_PGSA_TEST_O) \
@@ -4335,7 +4339,7 @@ test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
 		$(CLUSTER_MEMBERSHIP_O) \
 		cluster_qvotec_io_test.o $(CLUSTER_UNDO_BLOCK0_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
-		test_cluster_qvotec_activation_product.o
+		test_cluster_qvotec_activation_product.o test_cluster_storage_quorum_product.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_QVOTEC_PGSA_UNIT_TEST \
 		-DQVOTEC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_qvotec.c"' \
 		-DLMON_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_lmon.c"' \
@@ -4349,7 +4353,8 @@ test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
 		$(CLUSTER_MEMBERSHIP_O) \
 		cluster_qvotec_io_test.o $(CLUSTER_UNDO_BLOCK0_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
-		test_cluster_qvotec_activation_product.o $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		test_cluster_qvotec_activation_product.o test_cluster_storage_quorum_product.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lssl -lcrypto -o $@
 
@@ -5656,6 +5661,15 @@ test_cluster_ko_stop: test_cluster_ko_stop.c unit_test.h $(CLUSTER_HW_LEASE_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_storage_quorum: test_cluster_storage_quorum.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_storage_quorum.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+test_cluster_storage_corosync: test_cluster_storage_corosync.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_storage_quorum_corosync.c \
+		$(top_srcdir)/src/backend/cluster/cluster_storage_quorum.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter -ldl,$(LIBS)) -o $@
 
 test_cluster_catalog_inval: test_cluster_catalog_inval.c unit_test.h \
 		$(top_srcdir)/src/backend/utils/cache/inval.c
@@ -7952,3 +7966,19 @@ test_cluster_initdb_tree: test_cluster_initdb_tree.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+# Compile the actual native entry bodies; no duplicated routing predicate.
+test_cluster_storage_sql_route.inc: $(top_srcdir)/src/backend/tcop/postgres.c \
+		$(top_srcdir)/src/backend/executor/execMain.c
+	awk '/^start_xact_command\(void\)/ { print "static void"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if(n!=1) exit 1 }' $(word 1,$^) > $@.tmp
+	awk '/^ExecutorStart\(QueryDesc / { print "void"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if(n!=1) exit 1 }' $(word 2,$^) >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_storage_sql_route: test_cluster_storage_sql_route.c unit_test.h \
+		test_cluster_storage_sql_route.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
+test_cluster_storage_backend: test_cluster_storage_backend.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_storage_quorum_backend.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@

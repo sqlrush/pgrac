@@ -247,6 +247,9 @@ OBJS = \
 	cluster_pi_shadow.o \
 	cluster_quorum_decision.o \
 	cluster_qvotec.o \
+	cluster_storage_quorum.o \
+	cluster_storage_quorum_backend.o \
+	cluster_storage_quorum_corosync.o \
 	cluster_scn.o \
 	cluster_semantic_activation.o \
 	cluster_catalog_bootstrap.o \

@@ -59,6 +59,7 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_storage_quorum.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_write_fence.h" /* spec-4.12 D4 marker submit stubs */
 
@@ -76,6 +77,22 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+static uint64 ut_storage_members[2] = { UINT64_MAX, UINT64_MAX };
+
+bool
+cluster_storage_quorum_allows_members(uint64 lo, uint64 hi)
+{
+	return (lo | hi) != 0 && (lo & ~ut_storage_members[0]) == 0
+		   && (hi & ~ut_storage_members[1]) == 0;
+}
+
+bool
+cluster_storage_quorum_allows_node(int node_id)
+{
+	return node_id >= 0 && node_id < CLUSTER_MAX_NODES
+		   && (ut_storage_members[node_id / 64] & (UINT64_C(1) << (node_id % 64))) != 0;
+}
 
 static ClusterReplacementEpisode ut_admitted_replacement_episode(int32 target_node_id);
 static bool jb_test(const uint8 *bmp, int i);
@@ -1175,6 +1192,7 @@ static void
 ut_reset_mocks(void)
 {
 	int i;
+	ut_storage_members[0] = ut_storage_members[1] = UINT64_MAX;
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		ut_peer_state[i] = CLUSTER_CSSD_PEER_ALIVE;
 		ut_declared_set[i] = false;
@@ -2746,6 +2764,22 @@ UT_TEST(test_r4_membership_snapshot_fails_closed_on_inexact_member_evidence)
 	UT_ASSERT_EQ(snapshot.admitted_members_lo, 0);
 }
 
+UT_TEST(test_r4_membership_cannot_admit_a_different_storage_component)
+{
+	ClusterR4MembershipSnapshot snapshot;
+
+	ut_prepare_exact_r4_membership();
+	ut_storage_members[0] = 3;
+	UT_ASSERT(!cluster_reconfig_lmon_snapshot_r4_membership(&snapshot));
+	UT_ASSERT_EQ(snapshot.admitted_members_lo, 0);
+	/* Raw admitted membership remains evidence, not a silently trimmed view. */
+	UT_ASSERT_EQ(cluster_membership_get_state(3), CLUSTER_MEMBER_MEMBER);
+	ut_storage_members[0] = 15;
+	UT_ASSERT(cluster_reconfig_lmon_snapshot_r4_membership(&snapshot));
+	UT_ASSERT_EQ(snapshot.admitted_members_lo, 15);
+	ut_storage_members[0] = UINT64_MAX;
+}
+
 UT_TEST(test_mount_membership_postmaster_never_queues_for_reconfig_lock)
 {
 	ClusterR4MembershipSnapshot snapshot, empty = { 0 };
@@ -3000,6 +3034,10 @@ UT_TEST(test_join_bitmap_declared_peer_filter)
 	UT_ASSERT_EQ(n, 1);
 	UT_ASSERT(jb_test(jb, 3));
 	UT_ASSERT(!jb_test(jb, 5));
+	ut_storage_members[0] &= ~(UINT64_C(1) << 3);
+	UT_ASSERT_EQ(cluster_reconfig_compute_join_bitmap(jb), 0);
+	UT_ASSERT(!jb_test(jb, 3));
+	ut_storage_members[0] = UINT64_MAX;
 }
 
 /* A new founding peer can be published by QVOTEC after the membership loop
@@ -6897,6 +6935,8 @@ pre2_cold_fixture(int bad)
 		state->pending_join_bitmap[0] = 1;
 	if (bad == 7)
 		state->removed_bitmap[0] = 1;
+	if (bad == 8)
+		ut_storage_members[0] = 2;
 	cluster_formation_marker_compute_crc(&marker);
 	cluster_reconfig_formation_qvotec_publish_observed(&marker, incs);
 	return state;
@@ -6941,7 +6981,7 @@ UT_TEST(test_pre2_cold_control_before_native_then_stripe)
 
 UT_TEST(test_pre2_cold_control_rejects_wrong_cohort)
 {
-	for (int bad = 1; bad <= 7; ++bad) {
+	for (int bad = 1; bad <= 8; ++bad) {
 		ClusterReconfigState *state = pre2_cold_fixture(bad);
 		ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
 		for (int i = 0; i < 3; ++i)
@@ -7342,7 +7382,7 @@ UT_TEST(test_membership_cut_generation_uses_original_shmem_owner)
 int
 main(void)
 {
-	UT_PLAN(134);
+	UT_PLAN(135);
 	UT_RUN(test_stop_membership_terminal_peer_is_not_online_admission);
 	UT_RUN(test_stop_membership_preserves_all_nonliveness_requirements);
 	UT_RUN(test_stop_reconfig_shared_owners);
@@ -7370,6 +7410,7 @@ main(void)
 	UT_RUN(test_self_join_admitted_no_pgproc_never_blocks_on_reconfig_lock);
 	UT_RUN(test_r4_membership_snapshot_captures_exact_current_four_node_view);
 	UT_RUN(test_r4_membership_snapshot_fails_closed_on_inexact_member_evidence);
+	UT_RUN(test_r4_membership_cannot_admit_a_different_storage_component);
 	UT_RUN(test_mount_membership_postmaster_never_queues_for_reconfig_lock);
 	UT_RUN(test_reconfig_replacement_episode_is_embedded_and_zero_initialized);
 	UT_RUN(test_reconfig_publish_increments_apply_counter);

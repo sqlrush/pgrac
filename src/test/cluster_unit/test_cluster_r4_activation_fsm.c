@@ -147,6 +147,7 @@ static uint8 test_terminal_peer_root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
 static bool test_stop_real_observation;
 bool cluster_shared_config;
 static int test_stop_not_fresh_peer = -1;
+static bool test_stop_storage_quorum = true;
 static bool test_capability_store_missing;
 static uint32 test_local_capability_word;
 static bool test_ctrc_shmem_is_ready = true;
@@ -739,6 +740,13 @@ cluster_reconfig_get_observed_fresh_alive(int32 node_id)
 	return node_id >= 0 && node_id < 4 && node_id != test_stop_not_fresh_peer;
 }
 
+bool
+cluster_storage_quorum_allows_members(uint64 lo, uint64 hi)
+{
+	return test_stop_storage_quorum && lo == test_membership_snapshot_lo
+		   && hi == test_membership_snapshot_hi;
+}
+
 #include "test_cluster_stop_membership_observation.inc"
 
 static bool
@@ -1190,6 +1198,7 @@ test_gate_reset(void)
 	test_qvotec_in_quorum = true;
 	test_stop_real_observation = false;
 	test_stop_not_fresh_peer = -1;
+	test_stop_storage_quorum = true;
 	test_qvotec_self_incarnation = UINT64_C(0x445566778899aabb);
 	test_last_admitted_incarnation = UINT64_C(0x445566778899aabb);
 	memset(test_remote_admitted_incarnations, 0, sizeof(test_remote_admitted_incarnations));
@@ -10457,6 +10466,10 @@ UT_TEST(test_stop_real_observation_survives_terminal_peer_alive_clear)
 	test_stop_real_observation = true;
 	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, incarnations, NULL),
 				 CLUSTER_NORMAL_STOP_READY);
+	test_stop_storage_quorum = false;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, incarnations, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	test_stop_storage_quorum = true;
 	test_terminal_peer_open = open;
 	memcpy(test_terminal_peer_root, root, sizeof(root));
 	test_terminal_peer_record_enabled = test_terminal_peer_eligible = true;

@@ -300,6 +300,8 @@ extern bool cluster_controlfile_shared_authority;
  * Author: SqlRush <sqlrush@gmail.com>
  */
 extern bool cluster_shared_config;
+extern char *cluster_storage_quorum_nodes;
+extern char *cluster_storage_quorum_cluster;
 
 
 /*

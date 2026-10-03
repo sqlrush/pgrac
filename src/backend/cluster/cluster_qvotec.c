@@ -179,6 +179,7 @@ typedef struct ClusterQvotecShmem {
 	pg_atomic_uint32 prior_exit_state; /* 0 absent, 1 incomplete, 2 immutable */
 	uint32 prior_exit_pad;
 	ClusterQvotecPriorExitObservation prior_exit;
+	ClusterStorageQuorumState storage_quorum;
 } ClusterQvotecShmem;
 
 StaticAssertDecl(sizeof(ClusterQvotecShmem) == CLUSTER_QVOTEC_SHMEM_BYTES,
@@ -780,6 +781,7 @@ cluster_qvotec_shmem_init(void)
 		QvotecShmem->prior_exit_pad = 0;
 		memset(&QvotecShmem->prior_exit, 0, sizeof(QvotecShmem->prior_exit));
 	}
+	cluster_storage_quorum_attach(&QvotecShmem->storage_quorum, !found);
 }
 
 static const ClusterShmemRegion cluster_qvotec_region = {
@@ -1089,6 +1091,10 @@ cluster_qvotec_in_quorum(void)
 			return qvotec_admission_denied(5, "STATE_INVALID", q, 0, 0);
 		}
 	}
+
+	/* Storage membership narrows admission without replacing disk evidence. */
+	if (!cluster_storage_quorum_allows_node(cluster_node_id))
+		return qvotec_admission_denied(7, "STORAGE_INELIGIBLE", q, 0, 0);
 
 	lease_expire = pg_atomic_read_u64(&QvotecShmem->lease_expire_at_us);
 	now_us = (uint64)GetCurrentTimestamp();
@@ -2889,6 +2895,9 @@ qvotec_poll_once(void)
 	bool fence_majority_written = false;		 /* RF-ROOT P6: this poll's marker tuple
 										 * reached quorum-majority durability */
 
+	cluster_storage_quorum_refresh(cluster_storage_quorum_now_us(),
+								   (uint64)cluster_quorum_poll_interval_ms * 30 * 1000ULL);
+
 	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_SEMANTIC_MAILBOX);
 	if (cluster_semantic_activation_qvotec_poll_record_read(&semantic_record_read_request)) {
 		uint8 selected[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
@@ -3688,6 +3697,9 @@ qvotec_poll_once(void)
 	 * face is PUBLISHED + MINE). */
 	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_STRIPE_HERD);
 	cluster_xid_stripe_herding_tick(qvotec_fds, qvotec_n_disks);
+
+	if (!cluster_storage_quorum_allows_node(cluster_node_id))
+		decision.quorum_state = CLUSTER_QVOTEC_QUORUM_LOST;
 
 	/* ---- 4. publish shmem ---- */
 	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_STATE_PUBLISH);

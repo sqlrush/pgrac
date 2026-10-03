@@ -604,6 +604,35 @@ production configuration; one, five, and seven are also valid odd-only
 sizes.  A startup heuristic emits a warning when the configured paths
 share a common parent directory (likely co-located on one volume).
 
+### `cluster.storage_quorum_nodes` and `cluster.storage_quorum_cluster`
+
+| Setting | Type | Default | Context |
+|---|---|---|---|
+| `cluster.storage_quorum_nodes` | string | empty | postmaster |
+| `cluster.storage_quorum_cluster` | string | empty | postmaster |
+
+Shared-configuration deployments require both values in the common shared
+configuration. Local-only settings do not grant storage eligibility. Changes
+require restarting the instances.
+
+`cluster.storage_quorum_nodes` maps every configured database node ID to a
+distinct Corosync node ID, for example `0:11,1:12,2:13,3:14`. Missing, duplicate,
+unknown or zero Corosync IDs are refused. `cluster.storage_quorum_cluster` must
+exactly match Corosync's `totem.cluster_name`.
+
+The supported storage profile uses qdevice `net`, algorithm `lms`, TLS
+`required`, default qdevice votes and one vote per Corosync node. Explicit
+`expected_votes`, `two_node`, `auto_tie_breaker` and votequorum's built-in
+`last_man_standing` must not override that profile. The local runtime requires
+`libquorum.so.5`, `libcmap.so.4` and a reachable Corosync service.
+
+Missing libraries, invalid configuration, loss of quorum or an expired
+observation deny new database admission and voting-disk writes. SQL sessions
+also recheck eligibility at command/executor entry and transaction interrupt
+points; a failed check terminates the connection with SQLSTATE `53R50`.
+Restoring storage quorum alone does not complete database recovery or admit a
+member. Native deployments with `cluster.shared_config=off` are unaffected.
+
 ### `cluster.quorum_poll_interval_ms`
 
 | | |
