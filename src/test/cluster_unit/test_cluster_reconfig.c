@@ -956,11 +956,16 @@ cluster_write_fence_submit_marker(const ClusterFenceMarker *m pg_attribute_unuse
 {
 	return CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
 }
-/* Link-only stub for the joiner-admission event helper (RF-ROOT P6); the real
- * durable-authority reader is exercised by test_cluster_write_fence_durable. */
+/* Durable I/O boundary; the reader itself is covered by the real-disk tests. */
+static bool ut_formation_authority_readable;
+static ClusterFenceAuthorityProof ut_formation_authority;
 ClusterFenceAuthorityReadResult
-cluster_write_fence_read_durable_authority(ClusterFenceAuthorityProof *out pg_attribute_unused())
+cluster_write_fence_read_durable_authority(ClusterFenceAuthorityProof *out)
 {
+	if (ut_formation_authority_readable) {
+		*out = ut_formation_authority;
+		return CLUSTER_FENCE_AUTHORITY_OK;
+	}
 	return CLUSTER_FENCE_AUTHORITY_IO_UNAVAILABLE;
 }
 
@@ -1192,6 +1197,8 @@ static void
 ut_reset_mocks(void)
 {
 	int i;
+	ut_formation_authority_readable = false;
+	memset(&ut_formation_authority, 0, sizeof(ut_formation_authority));
 	ut_storage_members[0] = ut_storage_members[1] = UINT64_MAX;
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		ut_peer_state[i] = CLUSTER_CSSD_PEER_ALIVE;
@@ -6992,6 +6999,131 @@ pre2_cold_fixture(int bad)
 	return state;
 }
 
+/* Starting from INITIAL and empty PGFM, drive the actual LMON duty order.
+ * Only disk completion/readback is a boundary stimulus; no accepted epoch or
+ * formation is installed by the fixture. Author: SqlRush <sqlrush@gmail.com> */
+static ClusterReconfigState *
+pre2_initial_fixture(void)
+{
+	ClusterReconfigState *state;
+	uint8 empty[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES] = { 0 };
+
+	ut_join_setup();
+	cluster_reconfig_test_reset_cold_formation();
+	cluster_shared_config = true;
+	cluster_online_join = true; /* exercise the competing legacy bootstrap */
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_ON;
+	ut_in_quorum_value = true;
+	ut_authority_managed = true;
+	ut_recovery_in_progress = true;
+	ut_startup_writer_installed = false;
+	ut_offpath_boot_decided = false;
+	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_HOLD;
+	ut_declared_set[1] = true;
+	cluster_reconfig_bootstrap_publish_begin();
+	cluster_reconfig_record_observed_slot(1, 88, 1, 0);
+	cluster_reconfig_record_observed_fresh_alive(1, true);
+	cluster_reconfig_bootstrap_publish_in_quorum(true);
+	cluster_reconfig_bootstrap_publish_end();
+	ut_fence_async_submit_ok = true;
+	ut_fence_async_submit_calls = 0;
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_PENDING;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+	ut_formation_authority_readable = true;
+	ut_formation_authority.total_disk_count = 3;
+	ut_formation_authority.agree_disk_count = 3;
+	cluster_fence_marker_build_baseline(&ut_formation_authority.marker, 0, empty, 0, 0, -1);
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+	state->self_join_admitted = 0;
+	return state;
+}
+
+static void
+pre2_initial_restore(void)
+{
+	cluster_shared_config = false;
+	cluster_online_join = false;
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
+	ut_formation_authority_readable = false;
+	ut_recovery_in_progress = false;
+	ut_authority_managed = false;
+	cluster_reconfig_test_reset_cold_formation();
+}
+
+UT_TEST(test_pre2_initial_lmon_produces_nonzero_control_only_after_fence_and_pgfm)
+{
+	ClusterReconfigState *state = pre2_initial_fixture();
+	ClusterFormationMarkerSubmitRequest request;
+	ClusterFormationCommitMarker marker;
+	ClusterFormationSnapshotV1 snapshot;
+	uint64 incs[CLUSTER_MAX_NODES];
+
+	for (int i = 0; i < 5; ++i)
+		cluster_reconfig_lmon_tick();
+	UT_ASSERT_EQ(cluster_epoch_get_current(), 0);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0), 0);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1), 0);
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
+	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 0);
+	UT_ASSERT_EQ(ut_fence_async_submit_calls, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state->formation_marker_request_seq), 0);
+
+	/* An ACK alone is not a current readback proof. */
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_ACKED;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_ACK;
+	cluster_reconfig_lmon_tick();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state->formation_marker_request_seq), 0);
+	ut_formation_authority.marker.fence_epoch = 1;
+	for (int i = 0; i < 3; ++i)
+		cluster_reconfig_lmon_tick();
+	UT_ASSERT_EQ(cluster_epoch_get_current(), 0);
+	UT_ASSERT(cluster_reconfig_formation_qvotec_poll_pending(&request));
+	if (pg_atomic_read_u64(&state->formation_marker_request_seq) != 0) {
+		UT_ASSERT(cluster_formation_marker_decode(request.marker_bytes, &marker, incs));
+		UT_ASSERT_EQ(marker.formation_epoch, 1);
+		UT_ASSERT_EQ(marker.formation_generation, 1);
+		UT_ASSERT_NE(marker.commit_nonce, 0);
+		UT_ASSERT_EQ(incs[0], 77);
+		UT_ASSERT_EQ(incs[1], 88);
+		cluster_reconfig_formation_qvotec_complete(true);
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(cluster_epoch_get_current(), 1);
+		UT_ASSERT_EQ(cluster_membership_get_state(0), CLUSTER_MEMBER_MEMBER);
+		UT_ASSERT_EQ(cluster_membership_get_state(1), CLUSTER_MEMBER_MEMBER);
+		UT_ASSERT_EQ(state->self_join_admitted, 0);
+		UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 0);
+		UT_ASSERT(cluster_reconfig_capture_formation_snapshot_v1(1, &snapshot));
+		UT_ASSERT_EQ(snapshot.startup_formation_generation, 1);
+		UT_ASSERT_EQ(snapshot.applied.new_epoch, 1);
+		UT_ASSERT_EQ(snapshot.applied.event_id, 0);
+	}
+	pre2_initial_restore();
+}
+
+UT_TEST(test_pre2_initial_lmon_does_not_form_without_complete_fresh_quorum)
+{
+	for (int bad = 0; bad < 4; ++bad) {
+		ClusterReconfigState *state = pre2_initial_fixture();
+		if (bad == 0)
+			cluster_reconfig_record_observed_fresh_alive(1, false);
+		if (bad == 1)
+			cluster_reconfig_record_observed_slot(1, 88, 1, 3);
+		if (bad == 2)
+			ut_in_quorum_value = false;
+		if (bad == 3)
+			ut_formation_authority_readable = false;
+		for (int i = 0; i < 6; ++i)
+			cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(state->startup_formation.formation_generation, 0);
+		UT_ASSERT_EQ(state->self_join_admitted, 0);
+		UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0), 0);
+		UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1), 0);
+		UT_ASSERT_EQ(ut_fence_async_submit_calls, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&state->formation_marker_request_seq), 0);
+		pre2_initial_restore();
+	}
+}
+
 UT_TEST(test_pre2_cold_control_before_native_then_stripe)
 {
 	ClusterReconfigState *state = pre2_cold_fixture(0);
@@ -7606,6 +7738,8 @@ main(void)
 	UT_RUN(test_pre2_cold_control_before_native_then_stripe);
 	UT_RUN(test_pre2_cold_control_rejects_wrong_cohort);
 	UT_RUN(test_pre2_cold_control_sparse_and_torn_observation);
+	UT_RUN(test_pre2_initial_lmon_produces_nonzero_control_only_after_fence_and_pgfm);
+	UT_RUN(test_pre2_initial_lmon_does_not_form_without_complete_fresh_quorum);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
