@@ -148,12 +148,19 @@ CheckClusterIndexSupport(Node *statement)
 		/* PGRAC: only user commands, not TRUNCATE's internal index rebuild. */
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("REINDEX is not supported in shared mode")));
+				 errmsg("REINDEX is not supported in shared mode"),
+				 errhint("Use DROP INDEX + CREATE INDEX without CONCURRENTLY.")));
+	else if (IsA(statement, DropStmt)
+			 && ((DropStmt *) statement)->removeType == OBJECT_INDEX)
+		concurrently = ((DropStmt *) statement)->concurrent;
 	if (concurrently)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("concurrent index creation or reindexing is not supported in shared mode"),
-				 errhint("Use CREATE INDEX without CONCURRENTLY.")));
+				 errmsg("%s is not supported in shared mode",
+						IsA(statement, DropStmt) ? "concurrent index removal"
+						: "concurrent index creation or reindexing"),
+				 errdetail("CREATE INDEX, REINDEX and DROP INDEX CONCURRENTLY are unsupported."),
+				 errhint("Use DROP INDEX + CREATE INDEX without CONCURRENTLY.")));
 }
 #endif
 

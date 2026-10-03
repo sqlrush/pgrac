@@ -170,6 +170,10 @@
 #define CLUSTER_VOTING_PGRD_FILE_BYTES_MIN                                                         \
 	((off_t)(8 * CLUSTER_MAX_NODES + 3) * CLUSTER_VOTING_SLOT_BYTES)
 
+/* PRE2 stripe history starts after every existing fixed region. Its caller
+ * checks node/index arithmetic and device capacity; no earlier offset moves. */
+#define CLUSTER_VOTING_STRIPE_HISTORY_BASE CLUSTER_VOTING_PGRD_FILE_BYTES_MIN
+
 /*
  * Payload-neutral read outcomes for the fixed append-only tail slot.  Unlike
  * the older marker helpers, callers must be able to distinguish a clean old

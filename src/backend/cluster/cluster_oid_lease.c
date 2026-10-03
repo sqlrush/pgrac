@@ -7,8 +7,8 @@
  *	  The shared OID authority is a single small durable file under
  *	  cluster.shared_data_dir holding the cluster-wide next-OID high-water
  *	  mark.  This file mirrors cluster_cf_authority's torn-safe write pattern
- *	  (temp + fsync + .bak roll + durable_rename) and fail-closed read (primary
- *	  then .bak, false when neither is trustworthy).  The per-node lease shmem
+ *	  (temp + fsync + .bak roll + durable_rename) and fail-closed primary read.
+ *	  An older backup cannot authorize allocation.  The per-node lease shmem
  *	  and the cross-node refill live in cluster_oid_lease_shmem.c; the pure
  *	  math here (carve / consume / normalize / classify) is standalone-linkable
  *	  so cluster_unit exercises it without a running backend.
@@ -89,13 +89,17 @@ cluster_oid_authority_classify(const char *buf, size_t len)
 	FIN_CRC32C(crc);
 	if (!EQ_CRC32C(crc, hdr.crc))
 		return CLUSTER_OID_AUTHORITY_INVALID_CRC;
+	if (hdr.version != CLUSTER_OID_AUTHORITY_VERSION)
+		return CLUSTER_OID_AUTHORITY_INVALID_VERSION;
+	if (hdr.reserved != 0 || (hdr.next_oid != InvalidOid && hdr.next_oid < FirstNormalObjectId))
+		return CLUSTER_OID_AUTHORITY_INVALID_STATE;
 
 	return CLUSTER_OID_AUTHORITY_VALID;
 }
 
 /*
- * cluster_oid_lease_normalize_start -- force a high-water past the reserved
- * range (mirrors the stock GetNewObjectId wraparound handling).
+ * cluster_oid_lease_normalize_start -- normalize the initial seed only.
+ * A running authority must validate its state before carving candidates.
  */
 Oid
 cluster_oid_lease_normalize_start(Oid start)
@@ -127,19 +131,24 @@ cluster_oid_lease_consume(ClusterOidLease *lease)
 }
 
 /*
- * cluster_oid_lease_carve -- pure refill math.  See header.  Normalizes hw,
- * carves [start, start+size), and computes the value to write back.  When the
- * block would overflow into the reserved range it is capped at the top of the
- * OID space (end == 0) and the authority is reset to FirstNormalObjectId.
+ * cluster_oid_lease_carve -- carve a candidate range from a live authority.
+ * The final range ends at zero and the next refill begins a new normal-OID
+ * cycle.  Catalog and file collision checks remain the caller's responsibility.
  */
 void
 cluster_oid_lease_carve(Oid hw, uint32 lease_size, Oid *out_start, Oid *out_end,
 						Oid *out_new_authority)
 {
-	Oid start = cluster_oid_lease_normalize_start(hw);
+	/* Zero is the valid v1 end-of-space marker, not a reserved candidate. */
+	Oid start = hw == InvalidOid ? FirstNormalObjectId : hw;
 	Oid end;
 
-	Assert(lease_size > 0);
+	if (start < FirstNormalObjectId || lease_size == 0) {
+		*out_start = InvalidOid;
+		*out_end = InvalidOid;
+		*out_new_authority = InvalidOid;
+		return;
+	}
 
 	end = start + lease_size; /* may wrap */
 
@@ -148,11 +157,10 @@ cluster_oid_lease_carve(Oid hw, uint32 lease_size, Oid *out_start, Oid *out_end,
 		 * The block would wrap the 32-bit OID space and spill into the
 		 * reserved (< FirstNormalObjectId) range.  Cap it at the top: an
 		 * exclusive end of 0 covers [start, 2^32), which contains no reserved
-		 * OID, and reset the authority so the next refill starts fresh at
-		 * FirstNormalObjectId.
+		 * OID.  Persist the next cycle's start before publishing this lease.
 		 */
 		end = 0;
-		*out_new_authority = (Oid)FirstNormalObjectId;
+		*out_new_authority = FirstNormalObjectId;
 	} else
 		*out_new_authority = end;
 
@@ -255,25 +263,21 @@ read_image(const char *path, char *image)
 
 /*
  * cluster_oid_authority_read -- fail-closed read of the shared high-water.
- * Tries primary then .bak; returns false when neither is trustworthy.  Never
- * ereports (safe on the bootstrap early-read path).
+ * An older .bak may precede issued leases and is never an allocation source.
+ * Never ereports (safe on the bootstrap early-read path).
  */
 bool
 cluster_oid_authority_read(Oid *next_oid)
 {
 	char primary_path[MAXPGPATH];
-	char bak_path[MAXPGPATH];
 	char image[CLUSTER_OID_AUTHORITY_FILE_SIZE];
 	ClusterOidAuthorityHeader hdr;
 
-	if (!build_path(primary_path, sizeof(primary_path), CLUSTER_OID_AUTHORITY_REL_PATH)
-		|| !build_path(bak_path, sizeof(bak_path), CLUSTER_OID_AUTHORITY_BAK_REL_PATH))
+	if (!build_path(primary_path, sizeof(primary_path), CLUSTER_OID_AUTHORITY_REL_PATH))
 		return false;
 
-	if (read_image(primary_path, image) != CLUSTER_OID_AUTHORITY_VALID) {
-		if (read_image(bak_path, image) != CLUSTER_OID_AUTHORITY_VALID)
-			return false; /* fail-closed: neither trustworthy */
-	}
+	if (read_image(primary_path, image) != CLUSTER_OID_AUTHORITY_VALID)
+		return false;
 
 	memcpy(&hdr, image, sizeof(hdr));
 	*next_oid = hdr.next_oid;
@@ -361,6 +365,11 @@ cluster_oid_authority_seed_if_absent(Oid initial_next_oid)
 
 	if (cluster_oid_authority_read(&existing))
 		return false; /* already seeded (join node / prior seed) */
+	if (cluster_oid_authority_present())
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+						errmsg("cannot seed an existing shared OID authority"),
+						errhint("Recover the current issued high-water; do not replace it with a "
+								"checkpoint or older backup.")));
 
 	cluster_oid_authority_write(cluster_oid_lease_normalize_start(initial_next_oid));
 	return true;

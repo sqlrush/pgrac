@@ -65,6 +65,63 @@
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"		  /* join-commit marker integrity */
 
+/* Exact administrative request. Generation comes from the formation owner,
+ * never a client timestamp. These host values are not a wire/disk image.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef enum ClusterMembershipOperationKind {
+	CLUSTER_MEMBERSHIP_LEAVE = 1,
+	CLUSTER_MEMBERSHIP_REMOVE,
+	CLUSTER_MEMBERSHIP_REJOIN
+} ClusterMembershipOperationKind;
+
+typedef struct ClusterMembershipRequest {
+	uint64 expected_formation;
+	uint64 operation_generation;
+	uint64 expected_old_incarnation;
+	uint64 reserved_new_incarnation;
+	int32 target_node;
+	uint32 operation_kind;
+	uint8 guest_uuid[16];
+} ClusterMembershipRequest;
+
+typedef enum ClusterMembershipOperationPhase {
+	CLUSTER_MEMBERSHIP_OP_EMPTY,
+	CLUSTER_MEMBERSHIP_OP_RESERVED,
+	CLUSTER_MEMBERSHIP_OP_RUNNING,
+	CLUSTER_MEMBERSHIP_OP_FINISHED,
+	CLUSTER_MEMBERSHIP_OP_CANCELLED_UNPUBLISHED
+} ClusterMembershipOperationPhase;
+
+typedef struct ClusterMembershipOperation {
+	ClusterMembershipRequest request;
+	ClusterMembershipOperationPhase phase;
+} ClusterMembershipOperation;
+
+typedef enum ClusterMembershipRequestResult {
+	CLUSTER_MEMBERSHIP_REQUEST_ACCEPTED,
+	CLUSTER_MEMBERSHIP_REQUEST_RETRY,
+	CLUSTER_MEMBERSHIP_REQUEST_CONFLICT,
+	CLUSTER_MEMBERSHIP_REQUEST_STALE,
+	CLUSTER_MEMBERSHIP_REQUEST_INVALID
+} ClusterMembershipRequestResult;
+
+extern bool cluster_membership_request_valid(const ClusterMembershipRequest *request);
+extern bool cluster_membership_request_same(const ClusterMembershipRequest *a,
+											const ClusterMembershipRequest *b);
+/* Owner bookkeeping only, under the reconfig lock. The caller must obtain
+ * formation/generation from durable authority and validate all admission
+ * prerequisites; these functions neither choose a coordinator nor grant I/O. */
+extern ClusterMembershipRequestResult
+cluster_membership_operation_reserve(ClusterMembershipOperation *operation,
+									 const ClusterMembershipRequest *request,
+									 uint64 current_formation, uint64 next_generation);
+/* Called only after the corresponding FSM proves this exact phase. No PID,
+ * elapsed-time or caller cancellation can retire a published operation. */
+extern bool cluster_membership_operation_advance(ClusterMembershipOperation *operation,
+												 const ClusterMembershipRequest *request,
+												 ClusterMembershipOperationPhase expected,
+												 ClusterMembershipOperationPhase next);
+
 /*
  * Verdict of cluster_membership_vet_joiner.  ACCEPT is the only value that
  * lets a join proceed; the three REJECT_* values are fail-closed holds.

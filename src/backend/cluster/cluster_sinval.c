@@ -54,6 +54,10 @@
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_membership.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_mode.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sinval.h"
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 class 5 */
@@ -64,7 +68,10 @@
 #include "storage/proc.h"
 #include "storage/shmem.h"
 #include "storage/sinvaladt.h" /* SIInsertDataEntries / SInvalShmemSize */
+#include "storage/spin.h"
 #include "utils/elog.h"
+#include "utils/relcache.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -74,7 +81,8 @@
 #endif
 
 /* Forward decl for spec-2.39 D5 helper (IC handler emit path). */
-extern void cluster_sinval_ack_outbound_enqueue(uint64 batch_id, int32 sender_node, uint16 status);
+extern void cluster_sinval_ack_outbound_enqueue(uint64 batch_id, int32 sender_node, uint16 status,
+												uint64 epoch);
 extern bool cluster_sinval_enqueue_batch_with_ack_flag(const SharedInvalidationMessage *msgs, int n,
 													   uint64 batch_id);
 
@@ -90,6 +98,9 @@ extern bool cluster_sinval_enqueue_batch_with_ack_flag(const SharedInvalidationM
 
 typedef struct ClusterSinvalQueueEntry {
 	uint64 batch_id;
+	uint64 epoch;
+	uint64 origin_incarnation;
+	uint64 target_incarnation;
 	int16 nmsgs;
 	int16 source_node;
 	uint16 flags; /* spec-2.39 D7:  SINVAL_REQUIRES_ACK / SINVAL_RESET_ALL_BROADCAST */
@@ -107,6 +118,11 @@ typedef struct ClusterSinvalQueue {
 } ClusterSinvalQueue;
 
 typedef struct ClusterSinvalShared {
+	slock_t reset_lock;
+	uint64 reset_requested;
+	uint64 reset_completed;
+	uint64 reconfig_reset_epoch;
+	uint64 reconfig_reset_ticket;
 	pg_atomic_uint32 inbound_overflow_reset_pending; /* HC134 fail-safe flag */
 	pg_atomic_uint32 sinval_bcast_pid;				 /* shared latch wake target */
 	pg_atomic_uint32 reset_all_broadcast_pending;	 /* spec-2.39 v0.3 P1:  enqueuer-
@@ -145,6 +161,12 @@ static ClusterSinvalQueue *ClusterSinvalOutbound = NULL;
 static ClusterSinvalQueue *ClusterSinvalInbound = NULL;
 static ClusterSinvalShared *ClusterSinval = NULL;
 static Latch *ClusterSinvalBcastLatch = NULL;
+static void sinval_publication_ack_enqueue(const ClusterSinvalQueueEntry *entry);
+static void sinval_publication_retry(void);
+static void sinval_receive_publication_ack(const ClusterICEnvelope *env, const void *payload);
+static ClusterSinvalAckResult sinval_publish_and_wait(const SharedInvalidationMessage *msgs, int n);
+static ClusterR4MembershipSnapshot SinvalCommitMembership;
+static bool SinvalCommitMembershipValid;
 
 
 /* ============================================================
@@ -201,6 +223,7 @@ cluster_sinval_outbound_shmem_init(void)
 		}
 
 		ClusterSinval = (ClusterSinvalShared *)(block + queue_size);
+		SpinLockInit(&ClusterSinval->reset_lock);
 		pg_atomic_init_u32(&ClusterSinval->inbound_overflow_reset_pending, 0);
 		pg_atomic_init_u32(&ClusterSinval->sinval_bcast_pid, 0);
 		pg_atomic_init_u32(&ClusterSinval->reset_all_broadcast_pending, 0);
@@ -313,6 +336,7 @@ cluster_sinval_enqueue_batch(const SharedInvalidationMessage *msgs, int n)
 	slot->nmsgs = (int16)n;
 	slot->source_node = (int16)cluster_node_id;
 	slot->flags = 0;
+	slot->epoch = cluster_epoch_get_current();
 	slot->pad = 0;
 	for (i = 0; i < n; i++)
 		slot->msgs[i] = msgs[i];
@@ -360,6 +384,7 @@ cluster_sinval_enqueue_batch_with_ack_flag(const SharedInvalidationMessage *msgs
 	slot->nmsgs = (int16)n;
 	slot->source_node = (int16)cluster_node_id;
 	slot->flags = SINVAL_REQUIRES_ACK;
+	slot->epoch = cluster_epoch_get_current();
 	slot->pad = 0;
 	for (i = 0; i < n; i++)
 		slot->msgs[i] = msgs[i];
@@ -380,13 +405,14 @@ cluster_sinval_enqueue_batch_with_ack_flag(const SharedInvalidationMessage *msgs
  *	caller (IC handler) sets inbound_overflow_reset_pending and lets SI
  *	Broadcaster aux proc apply SIResetAll() as fail-safe (HC134).
  * ============================================================ */
-bool
-cluster_sinval_inbound_try_enqueue(uint64 batch_id, const SharedInvalidationMessage *msgs, int n,
-								   int32 source_node)
+static bool
+sinval_inbound_enqueue(const SinvalBroadcastHeader *header, const SharedInvalidationMessage *msgs,
+					   uint64 origin_incarnation, uint64 target_incarnation)
 {
 	uint32 tail;
 	ClusterSinvalQueueEntry *slot;
 	int i;
+	int n = header->nmsgs;
 
 	if (msgs == NULL || n <= 0 || n > CLUSTER_SINVAL_BATCH_MAX || ClusterSinvalInbound == NULL)
 		return false;
@@ -402,9 +428,14 @@ cluster_sinval_inbound_try_enqueue(uint64 batch_id, const SharedInvalidationMess
 	tail = pg_atomic_read_u32(&ClusterSinvalInbound->tail);
 	slot = &ClusterSinvalInbound->slots[tail];
 
-	slot->batch_id = batch_id;
+	slot->batch_id = header->batch_id;
+	slot->epoch = header->epoch;
+	slot->origin_incarnation = origin_incarnation;
+	slot->target_incarnation = target_incarnation;
+	slot->flags = header->flags;
+	slot->pad = 0;
 	slot->nmsgs = (int16)n;
-	slot->source_node = (int16)source_node;
+	slot->source_node = (int16)header->source_node;
 	for (i = 0; i < n; i++)
 		slot->msgs[i] = msgs[i];
 	slot->created_at_ts = GetCurrentTimestamp();
@@ -415,6 +446,67 @@ cluster_sinval_inbound_try_enqueue(uint64 batch_id, const SharedInvalidationMess
 	return true;
 }
 
+
+bool
+cluster_sinval_inbound_try_enqueue(uint64 batch_id, const SharedInvalidationMessage *msgs, int n,
+								   int32 source_node)
+{
+	SinvalBroadcastHeader header = { 0 };
+
+	if (n <= 0 || n > CLUSTER_SINVAL_BATCH_MAX)
+		return false;
+	header.batch_id = batch_id;
+	header.epoch = cluster_epoch_get_current();
+	header.source_node = source_node;
+	header.nmsgs = n;
+	return sinval_inbound_enqueue(&header, msgs, 0, 0);
+}
+
+/* Validate this delivery's epoch and both incarnations before accepting a
+ * local SI installation obligation. Author: SqlRush <sqlrush@gmail.com> */
+static void
+sinval_receive_publication(const ClusterICEnvelope *env, const void *payload)
+{
+	const SinvalPublicationHeader *pub = payload;
+	const SinvalBroadcastHeader *hdr = &pub->base;
+	const SharedInvalidationMessage *msgs;
+
+	if (env->payload_length < sizeof(*pub)
+		|| hdr->flags != (SINVAL_PUBLICATION | SINVAL_REQUIRES_ACK) || hdr->batch_id == 0
+		|| hdr->nmsgs == 0 || hdr->nmsgs > CLUSTER_SINVAL_BATCH_MAX
+		|| env->payload_length != sizeof(*pub) + hdr->nmsgs * sizeof(*msgs) || hdr->source_node < 0
+		|| hdr->source_node >= CLUSTER_MAX_NODES || hdr->source_node == cluster_node_id
+		|| env->source_node_id != (uint32)hdr->source_node
+		|| cluster_conf_lookup_node(hdr->source_node) == NULL || pub->origin_incarnation == 0
+		|| pub->target_incarnation == 0) {
+		pg_atomic_fetch_add_u64(&ClusterSinval->validation_drop_count, 1);
+		return;
+	}
+	if (hdr->epoch != cluster_epoch_get_current()
+		|| pub->target_incarnation != cluster_qvotec_get_self_incarnation()
+		|| cluster_membership_get_state(hdr->source_node) != CLUSTER_MEMBER_MEMBER
+		|| pub->origin_incarnation
+			   != cluster_membership_get_last_admitted_incarnation(hdr->source_node)) {
+		pg_atomic_fetch_add_u64(&ClusterSinval->stale_epoch_drop_count, 1);
+		return;
+	}
+	msgs = (const SharedInvalidationMessage *)((const char *)payload + sizeof(*pub));
+	for (int i = 0; i < hdr->nmsgs; i++) {
+		if (msgs[i].id < SHAREDINVALSNAPSHOT_ID || msgs[i].id >= SysCacheSize) {
+			pg_atomic_fetch_add_u64(&ClusterSinval->validation_drop_count, 1);
+			return;
+		}
+	}
+	if (!cluster_normal_stop_service_new_work(false))
+		return;
+	if (sinval_inbound_enqueue(hdr, msgs, pub->origin_incarnation, pub->target_incarnation))
+		pg_atomic_fetch_add_u64(&ClusterSinval->broadcast_receive_count, 1);
+	else {
+		pg_atomic_fetch_add_u64(&ClusterSinval->inbound_queue_full_count, 1);
+		pg_atomic_write_u32(&ClusterSinval->inbound_overflow_reset_pending, 1);
+	}
+	cluster_sinval_set_proc_latch();
+}
 
 /* ============================================================
  * D5:  IC inbound handler — validate-only path.
@@ -453,6 +545,11 @@ cluster_sinval_handle_envelope(const ClusterICEnvelope *env, const void *payload
 		return;
 	}
 
+	if ((hdr->flags & SINVAL_PUBLICATION) != 0) {
+		sinval_receive_publication(env, payload);
+		return;
+	}
+
 	/* spec-2.39 v0.3 P1:  RESET-all broadcast sentinel — nmsgs MUST == 0 +
 	 * payload_length MUST == sizeof(header).  No tail validation, no ACK,
 	 * no inbound enqueue;  remote直调 SIResetAll fail-safe.  REQUIRES_ACK
@@ -464,7 +561,7 @@ cluster_sinval_handle_envelope(const ClusterICEnvelope *env, const void *payload
 			return;
 		}
 		current_epoch = cluster_epoch_get_current();
-		if (hdr->epoch < current_epoch) {
+		if (hdr->epoch != current_epoch) {
 			pg_atomic_fetch_add_u64(&ClusterSinval->stale_epoch_drop_count, 1);
 			return;
 		}
@@ -508,7 +605,7 @@ cluster_sinval_handle_envelope(const ClusterICEnvelope *env, const void *payload
 
 	/* HC100 epoch check */
 	current_epoch = cluster_epoch_get_current();
-	if (hdr->epoch < current_epoch) {
+	if (hdr->epoch != current_epoch) {
 		pg_atomic_fetch_add_u64(&ClusterSinval->stale_epoch_drop_count, 1);
 		return;
 	}
@@ -528,23 +625,16 @@ cluster_sinval_handle_envelope(const ClusterICEnvelope *env, const void *payload
 	/* HC133 nonblocking try-enqueue;  failure → fail-safe SIResetAll
 	 * by aux process (set flag,  no silent stale).
 	 *
-	 * spec-2.39 D5 + v0.3 P2:  if SINVAL_REQUIRES_ACK is set, emit ACK
-	 * envelope (status DONE on success, RESET_PENDING on inbound full).
-	 * Sender views both DONE and RESET_PENDING as fulfilled (HC141). */
+	 * The broadcaster emits DONE after native SI insertion. If this ring
+	 * is full, request a local reset but leave the sender awaiting delivery. */
 	{
-		bool enq_ok
-			= cluster_sinval_inbound_try_enqueue(hdr->batch_id, msgs, hdr->nmsgs, hdr->source_node);
+		bool enq_ok = sinval_inbound_enqueue(hdr, msgs, 0, 0);
 
 		if (!enq_ok) {
 			pg_atomic_fetch_add_u64(&ClusterSinval->inbound_queue_full_count, 1);
 			pg_atomic_write_u32(&ClusterSinval->inbound_overflow_reset_pending, 1);
 		} else {
 			pg_atomic_fetch_add_u64(&ClusterSinval->broadcast_receive_count, 1);
-		}
-
-		if ((hdr->flags & SINVAL_REQUIRES_ACK) != 0) {
-			ClusterSinvalAckStatus ack_status = enq_ok ? SINVAL_ACK_DONE : SINVAL_ACK_RESET_PENDING;
-			cluster_sinval_ack_outbound_enqueue(hdr->batch_id, hdr->source_node, ack_status);
 		}
 	}
 
@@ -571,6 +661,7 @@ cluster_sinval_drain_outbound_and_broadcast(void)
 						errhint("SINVAL outbound broadcast must be LMON-mediated because tier1 "
 								"TCP file descriptors are LMON process-local.")));
 
+	sinval_publication_retry();
 	while (drained < batch_limit) {
 		ClusterSinvalQueueEntry local;
 		uint32 head;
@@ -594,7 +685,7 @@ cluster_sinval_drain_outbound_and_broadcast(void)
 
 		memset(&hdr, 0, sizeof(hdr));
 		hdr.batch_id = local.batch_id;
-		hdr.epoch = cluster_epoch_get_current();
+		hdr.epoch = local.epoch;
 		hdr.source_node = cluster_node_id;
 		hdr.nmsgs = (uint16)local.nmsgs;
 		hdr.flags = local.flags; /* spec-2.39 D7:  carry REQUIRES_ACK / RESET_ALL_BROADCAST */
@@ -677,9 +768,30 @@ cluster_sinval_drain_inbound_and_apply(void)
 							(head + 1) % ClusterSinvalInbound->capacity);
 		LWLockRelease(&ClusterSinvalInbound->lock.lock);
 
+		/* A newly admitted incarnation cannot ACK its first publication
+		 * until a full native RESET for this epoch has been installed.
+		 * Keep the sender's obligation alive; its retry supplies the batch. */
+		if ((local.flags & SINVAL_PUBLICATION) != 0
+			&& !cluster_sinval_reconfig_reset_ready(local.epoch)) {
+			drained++;
+			continue;
+		}
+
 		/* aux process context — LWLock OK; SIInsertDataEntries can take
 		 * SInvalWriteLock and trigger reset broadcast internally. */
-		SendSharedInvalidMessages(local.msgs, local.nmsgs);
+		if ((local.flags & SINVAL_PUBLICATION) != 0) {
+			RelationCacheInitFilePreInvalidateAll();
+			SendSharedInvalidMessages(local.msgs, local.nmsgs);
+			RelationCacheInitFilePostInvalidate();
+		} else
+			SendSharedInvalidMessages(local.msgs, local.nmsgs);
+		/* PGRAC: receipt is complete only after every local backend can
+		 * observe the native SI queue entry or its overflow reset. */
+		if ((local.flags & SINVAL_PUBLICATION) != 0)
+			sinval_publication_ack_enqueue(&local);
+		else if ((local.flags & SINVAL_REQUIRES_ACK) != 0)
+			cluster_sinval_ack_outbound_enqueue(local.batch_id, local.source_node, SINVAL_ACK_DONE,
+												local.epoch);
 		pg_atomic_fetch_add_u64(&ClusterSinval->inject_local_queue_count, 1);
 
 		/* spec-5.2 D1 (G3):  advance the relsize apply barrier for every
@@ -702,18 +814,105 @@ void
 cluster_sinval_apply_inbound_overflow_reset_if_pending(void)
 {
 	uint32 pending;
+	uint64 requested, completed;
+	bool exhausted = false;
 
 	if (ClusterSinval == NULL)
 		return;
 
-	pending = pg_atomic_read_u32(&ClusterSinval->inbound_overflow_reset_pending);
+	pending = pg_atomic_exchange_u32(&ClusterSinval->inbound_overflow_reset_pending, 0);
+	SpinLockAcquire(&ClusterSinval->reset_lock);
+	/* Retain even an unnumbered overflow/sentinel request across errors
+	 * while removing init files. Clearing the flag alone loses that work. */
 	if (pending != 0) {
-		pg_atomic_write_u32(&ClusterSinval->inbound_overflow_reset_pending, 0);
+		if (ClusterSinval->reset_requested == PG_UINT64_MAX)
+			exhausted = true;
+		else
+			ClusterSinval->reset_requested++;
+	}
+	requested = ClusterSinval->reset_requested;
+	completed = ClusterSinval->reset_completed;
+	SpinLockRelease(&ClusterSinval->reset_lock);
+	if (exhausted)
+		elog(PANIC, "catalog cache reset identity space exhausted");
+	if (pending != 0 || requested != completed) {
 		/* Fail-safe local cache reset (HC134) — backend AcceptInvalidation-
 		 * Messages will reset its local caches on next lock acquire. */
+		RelationCacheInitFilePreInvalidateAll();
 		SIResetAll();
+		RelationCacheInitFilePostInvalidate();
+		/* A request arriving during this reset needs a later installation. */
+		SpinLockAcquire(&ClusterSinval->reset_lock);
+		ClusterSinval->reset_completed = requested;
+		SpinLockRelease(&ClusterSinval->reset_lock);
 		pg_atomic_fetch_add_u64(&ClusterSinval->inbound_overflow_reset_count, 1);
 	}
+}
+
+/* Nonblocking producer side; only the SI broadcaster completes tickets.
+ * No transaction, catalog lookup or cluster lock is needed to reset caches.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static uint64
+sinval_request_reset(uint64 epoch, bool force)
+{
+	uint64 ticket;
+	bool exhausted = false;
+	bool queued = false;
+
+	if (ClusterSinval == NULL)
+		return 0;
+	SpinLockAcquire(&ClusterSinval->reset_lock);
+	if (force || epoch != ClusterSinval->reconfig_reset_epoch) {
+		if (ClusterSinval->reset_requested == PG_UINT64_MAX)
+			exhausted = true;
+		else {
+			ClusterSinval->reset_requested++;
+			queued = true;
+			if (epoch != 0) {
+				ClusterSinval->reconfig_reset_epoch = epoch;
+				ClusterSinval->reconfig_reset_ticket = ClusterSinval->reset_requested;
+			}
+		}
+	}
+	ticket = epoch == 0 ? ClusterSinval->reset_requested : ClusterSinval->reconfig_reset_ticket;
+	SpinLockRelease(&ClusterSinval->reset_lock);
+	if (exhausted)
+		elog(PANIC, "catalog cache reset identity space exhausted");
+	if (queued)
+		cluster_sinval_set_proc_latch();
+	return ticket;
+}
+
+uint64
+cluster_sinval_request_reset(void)
+{
+	return sinval_request_reset(0, true);
+}
+
+bool
+cluster_sinval_reset_is_complete(uint64 ticket)
+{
+	bool complete;
+
+	if (ClusterSinval == NULL || ticket == 0)
+		return false;
+	SpinLockAcquire(&ClusterSinval->reset_lock);
+	complete = ticket <= ClusterSinval->reset_completed;
+	SpinLockRelease(&ClusterSinval->reset_lock);
+	return complete;
+}
+
+bool
+cluster_sinval_reconfig_reset_ready(uint64 epoch)
+{
+	uint64 ticket;
+
+	if (!cluster_shared_catalog)
+		return true;
+	if (epoch == 0 || epoch != cluster_epoch_get_current())
+		return false;
+	ticket = sinval_request_reset(epoch, false);
+	return cluster_sinval_reset_is_complete(ticket) && epoch == cluster_epoch_get_current();
 }
 
 
@@ -991,10 +1190,22 @@ typedef struct ClusterSinvalAckWaitEntry {
 	TimestampTz deadline_us;
 	uint16 status; /* ClusterSinvalAckStatus aggregate (DONE if all DONE) */
 	uint16 completion_signaled;
+	bool publication;
+	uint16 nmsgs;
+	uint64 epoch;
+	uint64 origin_incarnation;
+	uint64 targets[2];
+	uint64 received[2];
+	uint64 target_incarnation[CLUSTER_MAX_NODES];
+	TimestampTz retry_at;
+	SharedInvalidationMessage msgs[CLUSTER_SINVAL_BATCH_MAX];
 } ClusterSinvalAckWaitEntry;
 
 typedef struct ClusterSinvalAckOutboundEntry {
 	uint64 batch_id;
+	uint64 epoch;
+	uint64 origin_incarnation;
+	uint64 target_incarnation;
 	int32 sender_node; /* peer to ACK back */
 	uint16 status;	   /* ClusterSinvalAckStatus */
 	uint16 pad;
@@ -1013,6 +1224,322 @@ typedef struct ClusterSinvalAckOutboundRing {
 static HTAB *ClusterSinvalAckWaitHTAB = NULL;
 static LWLock *ClusterSinvalAckWaitLock = NULL;
 static ClusterSinvalAckOutboundRing *ClusterSinvalAckOutbound = NULL;
+
+static bool
+sinval_publication_complete(const ClusterSinvalAckWaitEntry *entry)
+{
+	return entry->received[0] == entry->targets[0] && entry->received[1] == entry->targets[1];
+}
+
+static bool
+sinval_publication_cohort_matches(const ClusterSinvalAckWaitEntry *entry,
+								  const ClusterR4MembershipSnapshot *cohort)
+{
+	uint64 targets[2] = { cohort->admitted_members_lo, cohort->admitted_members_hi };
+
+	targets[cluster_node_id / 64] &= ~(UINT64_C(1) << (cluster_node_id % 64));
+	if (entry->epoch != cohort->formation_epoch || entry->targets[0] != targets[0]
+		|| entry->targets[1] != targets[1])
+		return false;
+	for (int node = 0; node < CLUSTER_MAX_NODES; node++)
+		if ((targets[node / 64] & (UINT64_C(1) << (node % 64))) != 0
+			&& entry->target_incarnation[node] != cohort->admitted_incarnation[node])
+			return false;
+	return true;
+}
+
+/* A commit owns this exact admitted cohort, including an unreachable member.
+ * Membership recovery, not heartbeat liveness, can retire its obligation. */
+static bool
+sinval_read_membership(ClusterR4MembershipSnapshot *out)
+{
+	uint64 self_bit;
+
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| !cluster_reconfig_lmon_snapshot_r4_membership(out) || out->formation_epoch == 0
+		|| out->local_self_boot_incarnation == 0)
+		return false;
+	self_bit = UINT64_C(1) << (cluster_node_id % 64);
+	if (((cluster_node_id < 64 ? out->admitted_members_lo : out->admitted_members_hi) & self_bit)
+			== 0
+		|| out->admitted_incarnation[cluster_node_id] != out->local_self_boot_incarnation)
+		return false;
+	for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
+		uint64 mask = node < 64 ? out->admitted_members_lo : out->admitted_members_hi;
+
+		if ((mask & (UINT64_C(1) << (node % 64))) != 0 && out->admitted_incarnation[node] == 0)
+			return false;
+	}
+	return true;
+}
+
+/* Called before the durable transaction commit; ERROR is still abortable.
+ * Author: SqlRush <sqlrush@gmail.com> */
+void
+cluster_sinval_prepare_commit(void)
+{
+	SinvalCommitMembershipValid = false;
+	if (!cluster_shared_catalog || !cluster_peer_mode_enabled())
+		return;
+	if (cluster_sinval_ack_mode == CLUSTER_SINVAL_ACK_MODE_NONE || ClusterSinval == NULL
+		|| ClusterSinvalAckWaitHTAB == NULL || MyProc == NULL
+		|| !sinval_read_membership(&SinvalCommitMembership))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+						errmsg("catalog invalidation publication is not ready")));
+	SinvalCommitMembershipValid = true;
+}
+
+void
+cluster_sinval_clear_commit(void)
+{
+	SinvalCommitMembershipValid = false;
+	memset(&SinvalCommitMembership, 0, sizeof(SinvalCommitMembership));
+}
+
+/* The payload and cohort become LMON-owned together under the ACK lock. */
+static bool
+sinval_publication_begin(uint64 batch_id, const ClusterR4MembershipSnapshot *cohort,
+						 const SharedInvalidationMessage *msgs, int n)
+{
+	ClusterSinvalAckWaitEntry *entry;
+	bool found;
+
+	LWLockAcquire(ClusterSinvalAckWaitLock, LW_EXCLUSIVE);
+	entry = hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_ENTER_NULL, &found);
+	if (entry == NULL) {
+		LWLockRelease(ClusterSinvalAckWaitLock);
+		return false;
+	}
+	if (found)
+		elog(PANIC, "duplicate catalog publication identity");
+	memset(entry, 0, sizeof(*entry));
+	entry->batch_id = batch_id;
+	entry->enqueuer_pgprocno = MyProc->pgprocno;
+	entry->publication = true;
+	entry->nmsgs = n;
+	entry->epoch = cohort->formation_epoch;
+	entry->origin_incarnation = cohort->local_self_boot_incarnation;
+	entry->targets[0] = cohort->admitted_members_lo;
+	entry->targets[1] = cohort->admitted_members_hi;
+	entry->targets[cluster_node_id / 64] &= ~(UINT64_C(1) << (cluster_node_id % 64));
+	memcpy(entry->target_incarnation, cohort->admitted_incarnation,
+		   sizeof(entry->target_incarnation));
+	memcpy(entry->msgs, msgs, n * sizeof(*msgs));
+	LWLockRelease(ClusterSinvalAckWaitLock);
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_SINVAL_OUT);
+	cluster_lmon_wakeup();
+	return true;
+}
+
+static void
+sinval_publication_send(const ClusterSinvalAckWaitEntry *entry)
+{
+	struct {
+		SinvalPublicationHeader hdr;
+		SharedInvalidationMessage msgs[CLUSTER_SINVAL_BATCH_MAX];
+	} frame = { 0 };
+
+	frame.hdr.base.batch_id = entry->batch_id;
+	frame.hdr.base.epoch = entry->epoch;
+	frame.hdr.base.source_node = cluster_node_id;
+	frame.hdr.base.nmsgs = entry->nmsgs;
+	frame.hdr.base.flags = SINVAL_PUBLICATION | SINVAL_REQUIRES_ACK;
+	frame.hdr.origin_incarnation = entry->origin_incarnation;
+	memcpy(frame.msgs, entry->msgs, entry->nmsgs * sizeof(frame.msgs[0]));
+	for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
+		uint64 bit = UINT64_C(1) << (node % 64);
+		ClusterICSendResult result;
+
+		if (((entry->targets[node / 64] & ~entry->received[node / 64]) & bit) == 0)
+			continue;
+		frame.hdr.target_incarnation = entry->target_incarnation[node];
+		if (cluster_injection_should_skip("cluster-sinval-broadcast-drop-send"))
+			continue;
+		result = cluster_ic_send_envelope(PGRAC_IC_MSG_SINVAL, node, &frame,
+										  sizeof(frame.hdr) + entry->nmsgs * sizeof(frame.msgs[0]));
+		if (result == CLUSTER_IC_SEND_DONE)
+			pg_atomic_fetch_add_u64(&ClusterSinval->broadcast_send_count, 1);
+		else
+			pg_atomic_fetch_add_u64(&ClusterSinval->fanout_would_block_count, 1);
+	}
+}
+
+/* LMON retries retained payloads. A successful socket write never retires
+ * an obligation; only the exact receiver's installed-SI ACK can do so. */
+static void
+sinval_publication_retry(void)
+{
+	ClusterR4MembershipSnapshot cohort;
+	bool cohort_valid;
+
+	if (ClusterSinvalAckWaitHTAB == NULL)
+		return;
+	/* Read membership outside the ACK lock. A heartbeat miss is not a
+	 * membership removal, and a staged epoch cannot retire an obligation. */
+	cohort_valid = !cluster_reconfig_has_pending_prebump_stage() && sinval_read_membership(&cohort);
+	if (cohort_valid)
+		cohort_valid = cluster_sinval_reconfig_reset_ready(cohort.formation_epoch);
+	for (int sent = 0; sent < cluster_sinval_broadcast_batch_size; sent++) {
+		HASH_SEQ_STATUS scan;
+		ClusterSinvalAckWaitEntry *entry;
+		ClusterSinvalAckWaitEntry local;
+		bool found = false;
+		bool pending = false;
+		TimestampTz now = GetCurrentTimestamp();
+
+		LWLockAcquire(ClusterSinvalAckWaitLock, LW_EXCLUSIVE);
+		hash_seq_init(&scan, ClusterSinvalAckWaitHTAB);
+		while ((entry = hash_seq_search(&scan)) != NULL) {
+			if (!entry->publication || sinval_publication_complete(entry))
+				continue;
+			if (cohort_valid && cohort.formation_epoch >= entry->epoch
+				&& cohort.formation_epoch == cluster_epoch_get_current()
+				&& entry->origin_incarnation == cohort.local_self_boot_incarnation
+				&& !sinval_publication_cohort_matches(entry, &cohort)) {
+				/* Retain the payload/batch, but re-confirm every admitted
+				 * survivor in the new epoch. Departed incarnations can only
+				 * return through membership admission and its full reset. */
+				entry->epoch = cohort.formation_epoch;
+				entry->targets[0] = cohort.admitted_members_lo;
+				entry->targets[1] = cohort.admitted_members_hi;
+				entry->targets[cluster_node_id / 64] &= ~(UINT64_C(1) << (cluster_node_id % 64));
+				memcpy(entry->target_incarnation, cohort.admitted_incarnation,
+					   sizeof(entry->target_incarnation));
+				entry->received[0] = entry->received[1] = 0;
+				entry->completion_signaled = 0;
+				entry->retry_at = 0;
+				if (sinval_publication_complete(entry)) {
+					/* WaitLatch is also polled; signal outside the ACK lock. */
+					local = *entry;
+					entry->completion_signaled = 1;
+					found = true;
+					hash_seq_term(&scan);
+					break;
+				}
+			}
+			pending = true;
+			if (entry->retry_at > now)
+				continue;
+			local = *entry;
+			entry->retry_at = now + 100 * USECS_PER_MSEC;
+			found = true;
+			hash_seq_term(&scan);
+			break;
+		}
+		LWLockRelease(ClusterSinvalAckWaitLock);
+		if (pending)
+			cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_SINVAL_OUT);
+		if (!found)
+			break;
+		if (sinval_publication_complete(&local))
+			SetLatch(&GetPGProcByNumber(local.enqueuer_pgprocno)->procLatch);
+		else
+			sinval_publication_send(&local);
+	}
+}
+
+static void
+sinval_receive_publication_ack(const ClusterICEnvelope *env, const void *payload)
+{
+	const SinvalPublicationAckHeader *ack = payload;
+	ClusterSinvalAckWaitEntry *entry;
+	uint64 bit;
+	int node = ack->base.acker_node;
+	int procno = -1;
+	bool found;
+
+	if (env->payload_length != sizeof(*ack) || ack->base.flags != SINVAL_PUBLICATION
+		|| ack->base.status != SINVAL_ACK_DONE || ack->base.batch_id == 0 || node < 0
+		|| node >= CLUSTER_MAX_NODES || node == cluster_node_id
+		|| env->source_node_id != (uint32)node || cluster_conf_lookup_node(node) == NULL
+		|| ack->origin_incarnation == 0 || ack->target_incarnation == 0
+		|| ack->base.epoch != cluster_epoch_get_current()
+		|| ack->origin_incarnation != cluster_qvotec_get_self_incarnation())
+		return;
+	if (!LWLockConditionalAcquire(ClusterSinvalAckWaitLock, LW_EXCLUSIVE))
+		return;
+	entry = hash_search(ClusterSinvalAckWaitHTAB, &ack->base.batch_id, HASH_FIND, &found);
+	bit = UINT64_C(1) << (node % 64);
+	if (found && entry->publication && entry->epoch == ack->base.epoch
+		&& entry->origin_incarnation == ack->origin_incarnation
+		&& entry->target_incarnation[node] == ack->target_incarnation
+		&& (entry->targets[node / 64] & bit) != 0) {
+		entry->received[node / 64] |= bit;
+		if (sinval_publication_complete(entry) && !entry->completion_signaled) {
+			entry->completion_signaled = 1;
+			procno = entry->enqueuer_pgprocno;
+		}
+	}
+	LWLockRelease(ClusterSinvalAckWaitLock);
+	if (procno >= 0) {
+		pg_atomic_fetch_add_u64(&ClusterSinval->ack_received_count, 1);
+		SetLatch(&GetPGProcByNumber(procno)->procLatch);
+	}
+}
+
+static void
+sinval_publication_wait(uint64 batch_id)
+{
+	TimestampTz report_at = GetCurrentTimestamp() + cluster_sinval_ack_timeout_ms * USECS_PER_MSEC;
+
+	for (;;) {
+		ClusterSinvalAckWaitEntry *entry;
+		bool found, done;
+
+		ResetLatch(MyLatch);
+		LWLockAcquire(ClusterSinvalAckWaitLock, LW_SHARED);
+		entry = hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_FIND, &found);
+		done = found && entry->publication && sinval_publication_complete(entry);
+		LWLockRelease(ClusterSinvalAckWaitLock);
+		if (!found)
+			elog(PANIC, "catalog publication lost its retained obligation");
+		if (done)
+			break;
+		if (GetCurrentTimestamp() >= report_at) {
+			pg_atomic_fetch_add_u64(&ClusterSinval->ack_timeout_count, 1);
+			report_at = GetCurrentTimestamp() + cluster_sinval_ack_timeout_ms * USECS_PER_MSEC;
+		}
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 100L,
+						WAIT_EVENT_SINVAL_ACK_WAIT);
+	}
+	cluster_sinval_ack_wait_remove(batch_id);
+}
+
+static ClusterSinvalAckResult
+sinval_publish_and_wait(const SharedInvalidationMessage *msgs, int n)
+{
+	ClusterR4MembershipSnapshot cohort;
+
+	if (msgs == NULL || n <= 0 || MyProc == NULL || ClusterSinval == NULL
+		|| ClusterSinvalAckWaitHTAB == NULL)
+		elog(PANIC, "catalog publication has no retained owner");
+	if (SinvalCommitMembershipValid)
+		cohort = SinvalCommitMembership;
+	else if (cluster_sinval_ack_mode == CLUSTER_SINVAL_ACK_MODE_NONE
+			 || !sinval_read_membership(&cohort))
+		elog(PANIC, "catalog publication has no admitted membership identity");
+	/* Errors after a durable commit must enter recovery, never ordinary
+	 * transaction abort and lock release. Waiting has no time-based failure. */
+	START_CRIT_SECTION();
+	for (int offset = 0; offset < n; offset += CLUSTER_SINVAL_BATCH_MAX) {
+		uint64 batch_id = cluster_sinval_ack_wait_alloc_batch_id();
+		int count = Min(n - offset, CLUSTER_SINVAL_BATCH_MAX);
+
+		if (batch_id == 0 || batch_id == PG_UINT64_MAX)
+			elog(PANIC, "catalog publication identity space exhausted");
+		while (!sinval_publication_begin(batch_id, &cohort, msgs + offset, count)) {
+			cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_SINVAL_OUT);
+			cluster_lmon_wakeup();
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 100L,
+							WAIT_EVENT_SINVAL_ACK_WAIT);
+			ResetLatch(MyLatch);
+		}
+		sinval_publication_wait(batch_id);
+	}
+	END_CRIT_SECTION();
+	return CLUSTER_SINVAL_ACK_DONE;
+}
+
 
 /* Read each original ownership domain, never dequeue or satisfy an ACK here.
  * A dequeued local item is covered by its actual service work bracket, not by
@@ -1053,6 +1580,9 @@ cluster_sinval_normal_stop_poll(const char **domain_out, uint64 *key_out, const 
 		goto done;
 	}
 	reset_in = pg_atomic_read_u32(&ClusterSinval->inbound_overflow_reset_pending);
+	SpinLockAcquire(&ClusterSinval->reset_lock);
+	reset_in |= ClusterSinval->reset_requested != ClusterSinval->reset_completed;
+	SpinLockRelease(&ClusterSinval->reset_lock);
 	reset_out = pg_atomic_read_u32(&ClusterSinval->reset_all_broadcast_pending);
 	if (reset_in > 1 || reset_out > 1)
 		SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "reset", 0, "INVALID_FLAG");
@@ -1075,13 +1605,17 @@ cluster_sinval_normal_stop_poll(const char **domain_out, uint64 *key_out, const 
 		}
 		for (uint32 i = head; i != tail; i = (i + 1) % queue->capacity) {
 			const ClusterSinvalQueueEntry *item = &queue->slots[i];
-			/* Inbound's producer does not assign flags; its consumer does
-			 * not read them. Only outbound flags carry live responsibility. */
+			/* The inbound flag distinguishes legacy and incarnation-bound frames. */
 			if (item->batch_id == 0 || item->nmsgs < 1 || item->nmsgs > CLUSTER_SINVAL_BATCH_MAX
 				|| item->source_node < 0 || item->source_node >= CLUSTER_MAX_NODES
 				|| (q == 0
 					&& (item->source_node != cluster_node_id
-						|| (item->flags & ~SINVAL_REQUIRES_ACK) != 0)))
+						|| (item->flags & ~SINVAL_REQUIRES_ACK) != 0))
+				|| (q == 1
+					&& ((item->flags & ~(SINVAL_REQUIRES_ACK | SINVAL_PUBLICATION)) != 0
+						|| ((item->flags & SINVAL_PUBLICATION) != 0
+							&& (item->origin_incarnation == 0 || item->target_incarnation == 0
+								|| item->epoch == 0)))))
 				SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, name, i, "INVALID_BATCH");
 			else
 				SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_PENDING, name, i, "BATCH_OWNED");
@@ -1120,6 +1654,22 @@ cluster_sinval_normal_stop_poll(const char **domain_out, uint64 *key_out, const 
 							 "TABLE_GEOMETRY");
 			hash_seq_term(&scan);
 			break;
+		}
+		if (entry->publication) {
+			bool valid = entry->nmsgs > 0 && entry->nmsgs <= CLUSTER_SINVAL_BATCH_MAX
+						 && entry->epoch != 0 && entry->origin_incarnation != 0
+						 && (entry->received[0] & ~entry->targets[0]) == 0
+						 && (entry->received[1] & ~entry->targets[1]) == 0
+						 && (!entry->completion_signaled || sinval_publication_complete(entry));
+
+			for (int node = 0; valid && node < CLUSTER_MAX_NODES; node++) {
+				if ((entry->targets[node / 64] & (UINT64_C(1) << (node % 64))) != 0
+					&& (node == cluster_node_id || entry->target_incarnation[node] == 0))
+					valid = false;
+			}
+			if (!valid)
+				SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "ack_wait", entry->batch_id,
+								 "INVALID_PUBLICATION");
 		}
 		if (entry->batch_id == 0 || entry->enqueuer_pgprocno < 0
 			|| (uint32)entry->enqueuer_pgprocno >= ProcGlobal->allProcCount
@@ -1229,7 +1779,7 @@ cluster_sinval_ack_outbound_shmem_init(void)
  *   nonblocking constraint (HC133 family).
  */
 void
-cluster_sinval_ack_outbound_enqueue(uint64 batch_id, int32 sender_node, uint16 status)
+cluster_sinval_ack_outbound_enqueue(uint64 batch_id, int32 sender_node, uint16 status, uint64 epoch)
 {
 	uint32 tail, head, next_tail;
 
@@ -1248,6 +1798,9 @@ cluster_sinval_ack_outbound_enqueue(uint64 batch_id, int32 sender_node, uint16 s
 	}
 
 	ClusterSinvalAckOutbound->slots[tail].batch_id = batch_id;
+	ClusterSinvalAckOutbound->slots[tail].epoch = epoch;
+	ClusterSinvalAckOutbound->slots[tail].origin_incarnation = 0;
+	ClusterSinvalAckOutbound->slots[tail].target_incarnation = 0;
 	ClusterSinvalAckOutbound->slots[tail].sender_node = sender_node;
 	ClusterSinvalAckOutbound->slots[tail].status = status;
 	ClusterSinvalAckOutbound->slots[tail].pad = 0;
@@ -1258,6 +1811,38 @@ cluster_sinval_ack_outbound_enqueue(uint64 batch_id, int32 sender_node, uint16 s
 	cluster_lmon_wakeup();
 }
 
+
+/* Lost ACKs are recovered by retransmitting the retained publication.
+ * Never acknowledge a received entry until native SI insertion completed. */
+static void
+sinval_publication_ack_enqueue(const ClusterSinvalQueueEntry *entry)
+{
+	uint32 head, tail, next_tail;
+	ClusterSinvalAckOutboundEntry *ack;
+
+	if (ClusterSinvalAckOutbound == NULL
+		|| !LWLockConditionalAcquire(&ClusterSinvalAckOutbound->lock.lock, LW_EXCLUSIVE))
+		return;
+	head = pg_atomic_read_u32(&ClusterSinvalAckOutbound->head);
+	tail = pg_atomic_read_u32(&ClusterSinvalAckOutbound->tail);
+	next_tail = (tail + 1) % ClusterSinvalAckOutbound->capacity;
+	if (next_tail == head) {
+		LWLockRelease(&ClusterSinvalAckOutbound->lock.lock);
+		return;
+	}
+	ack = &ClusterSinvalAckOutbound->slots[tail];
+	memset(ack, 0, sizeof(*ack));
+	ack->batch_id = entry->batch_id;
+	ack->epoch = entry->epoch;
+	ack->origin_incarnation = entry->origin_incarnation;
+	ack->target_incarnation = entry->target_incarnation;
+	ack->sender_node = entry->source_node;
+	ack->status = SINVAL_ACK_DONE;
+	pg_atomic_write_u32(&ClusterSinvalAckOutbound->tail, next_tail);
+	LWLockRelease(&ClusterSinvalAckOutbound->lock.lock);
+	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_SINVAL_ACK_OUT);
+	cluster_lmon_wakeup();
+}
 
 /*
  * cluster_sinval_drain_ack_outbound_and_send -- LMON-only (D5).
@@ -1304,13 +1889,23 @@ cluster_sinval_drain_ack_outbound_and_send(void)
 
 		memset(&hdr, 0, sizeof(hdr));
 		hdr.batch_id = local.batch_id;
-		hdr.epoch = cluster_epoch_get_current();
+		hdr.epoch = local.epoch;
 		hdr.acker_node = cluster_node_id;
 		hdr.status = local.status;
 		hdr.flags = 0;
 
-		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_SINVAL_ACK, local.sender_node, &hdr,
-									   sizeof(hdr));
+		if (local.origin_incarnation != 0) {
+			SinvalPublicationAckHeader pub = { 0 };
+
+			pub.base = hdr;
+			pub.base.flags = SINVAL_PUBLICATION;
+			pub.origin_incarnation = local.origin_incarnation;
+			pub.target_incarnation = local.target_incarnation;
+			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_SINVAL_ACK, local.sender_node, &pub,
+										   sizeof(pub));
+		} else
+			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_SINVAL_ACK, local.sender_node, &hdr,
+										   sizeof(hdr));
 	}
 }
 
@@ -1331,6 +1926,11 @@ cluster_sinval_handle_ack_envelope(const ClusterICEnvelope *env, const void *pay
 	if (ClusterSinval == NULL || ClusterSinvalAckWaitHTAB == NULL)
 		return;
 
+	if (env->payload_length >= sizeof(SinvalAckHeader) && hdr->flags == SINVAL_PUBLICATION) {
+		sinval_receive_publication_ack(env, payload);
+		return;
+	}
+
 	/* spec-2.39 D17:  inject — SKIP bypasses validation entirely. */
 	CLUSTER_INJECTION_POINT("cluster-sinval-ack-skip-validate");
 	if (cluster_injection_should_skip("cluster-sinval-ack-skip-validate"))
@@ -1340,14 +1940,14 @@ cluster_sinval_handle_ack_envelope(const ClusterICEnvelope *env, const void *pay
 		pg_atomic_fetch_add_u64(&ClusterSinval->validation_drop_count, 1);
 		return;
 	}
-	if (hdr->flags != 0 || hdr->acker_node < 0 || hdr->acker_node >= CLUSTER_MAX_NODES
+	if (hdr->flags != 0 || hdr->acker_node < 0 || hdr->acker_node >= 32
 		|| env->source_node_id != (uint32)hdr->acker_node
 		|| cluster_conf_lookup_node(hdr->acker_node) == NULL) {
 		pg_atomic_fetch_add_u64(&ClusterSinval->validation_drop_count, 1);
 		return;
 	}
 	current_epoch = cluster_epoch_get_current();
-	if (hdr->epoch < current_epoch) {
+	if (hdr->epoch != current_epoch) {
 		pg_atomic_fetch_add_u64(&ClusterSinval->stale_epoch_drop_count, 1);
 		return;
 	}
@@ -1366,8 +1966,13 @@ match_batch:
 		return;
 	}
 
-	/* HC141 fulfilled rule:  DONE or RESET_PENDING → bit-set;DROPPED 不. */
-	if (hdr->status == SINVAL_ACK_DONE || hdr->status == SINVAL_ACK_RESET_PENDING) {
+	if (entry->publication) {
+		LWLockRelease(ClusterSinvalAckWaitLock);
+		return;
+	}
+
+	/* Only an installed SI barrier can fulfill a publication. */
+	if (hdr->status == SINVAL_ACK_DONE) {
 		acker_bit = (1u << hdr->acker_node);
 		if ((entry->alive_peer_mask & acker_bit) == 0) {
 			LWLockRelease(ClusterSinvalAckWaitLock);
@@ -1458,10 +2063,12 @@ cluster_sinval_ack_wait_begin(uint64 batch_id, uint32 alive_mask, TimestampTz de
 	LWLockAcquire(ClusterSinvalAckWaitLock, LW_EXCLUSIVE);
 	entry = (ClusterSinvalAckWaitEntry *)hash_search(ClusterSinvalAckWaitHTAB, &batch_id,
 													 HASH_ENTER_NULL, &found);
-	if (entry == NULL) {
+	if (entry == NULL || found) {
 		LWLockRelease(ClusterSinvalAckWaitLock);
 		return false;
 	}
+	memset(entry, 0, sizeof(*entry));
+	entry->batch_id = batch_id;
 	entry->enqueuer_pgprocno = MyProc->pgprocno;
 	entry->alive_peer_mask = alive_mask;
 	entry->ack_received_mask = 0;
@@ -1489,14 +2096,14 @@ cluster_sinval_ack_wait_record(uint64 batch_id, int32 acker_node)
 
 	if (ClusterSinval == NULL || ClusterSinvalAckWaitHTAB == NULL)
 		return;
-	if (acker_node < 0 || acker_node >= CLUSTER_MAX_NODES)
+	if (acker_node < 0 || acker_node >= 32)
 		return;
 	acker_bit = (1u << acker_node);
 
 	LWLockAcquire(ClusterSinvalAckWaitLock, LW_EXCLUSIVE);
 	entry = (ClusterSinvalAckWaitEntry *)hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_FIND,
 													 &found);
-	if (found && (entry->alive_peer_mask & acker_bit) != 0) {
+	if (found && !entry->publication && (entry->alive_peer_mask & acker_bit) != 0) {
 		entry->ack_received_mask |= acker_bit;
 		if ((entry->ack_received_mask & entry->alive_peer_mask) == entry->alive_peer_mask
 			&& entry->completion_signaled == 0) {
@@ -1525,7 +2132,9 @@ cluster_sinval_ack_wait_is_complete(uint64 batch_id)
 	entry = (ClusterSinvalAckWaitEntry *)hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_FIND,
 													 &found);
 	if (found)
-		complete = (entry->ack_received_mask & entry->alive_peer_mask) == entry->alive_peer_mask;
+		complete = entry->publication ? sinval_publication_complete(entry)
+									  : (entry->ack_received_mask & entry->alive_peer_mask)
+											== entry->alive_peer_mask;
 	LWLockRelease(ClusterSinvalAckWaitLock);
 	return complete;
 }
@@ -1534,13 +2143,16 @@ cluster_sinval_ack_wait_is_complete(uint64 batch_id)
 void
 cluster_sinval_ack_wait_remove(uint64 batch_id)
 {
+	ClusterSinvalAckWaitEntry *entry;
 	bool found;
 
 	if (ClusterSinval == NULL || ClusterSinvalAckWaitHTAB == NULL)
 		return;
 
 	LWLockAcquire(ClusterSinvalAckWaitLock, LW_EXCLUSIVE);
-	(void)hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_REMOVE, &found);
+	entry = hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_FIND, &found);
+	if (found && (!entry->publication || sinval_publication_complete(entry)))
+		(void)hash_search(ClusterSinvalAckWaitHTAB, &batch_id, HASH_REMOVE, &found);
 	LWLockRelease(ClusterSinvalAckWaitLock);
 }
 
@@ -1554,6 +2166,9 @@ cluster_sinval_enqueue_and_wait_ack(const SharedInvalidationMessage *msgs, int n
 	bool found;
 	int rc;
 	ClusterSinvalAckResult result = CLUSTER_SINVAL_ACK_DONE;
+
+	if (cluster_shared_catalog)
+		return sinval_publish_and_wait(msgs, n);
 
 	if (cluster_sinval_ack_mode == CLUSTER_SINVAL_ACK_MODE_NONE) {
 		(void)cluster_sinval_enqueue_batch(msgs, n);
@@ -1587,6 +2202,8 @@ cluster_sinval_enqueue_and_wait_ack(const SharedInvalidationMessage *msgs, int n
 		cluster_lmon_wakeup();
 		return CLUSTER_SINVAL_ACK_ENQUEUE_FAILED;
 	}
+	memset(entry, 0, sizeof(*entry));
+	entry->batch_id = batch_id;
 	entry->enqueuer_pgprocno = MyProc->pgprocno;
 	entry->alive_peer_mask = alive_mask;
 	entry->ack_received_mask = 0;
@@ -1699,28 +2316,28 @@ cluster_sinval_reset_all_on_reconfig(void)
 {
 	HASH_SEQ_STATUS scan;
 	ClusterSinvalAckWaitEntry *entry;
-	uint64 current_epoch;
 
 	if (ClusterSinval == NULL)
 		return;
 
-	pg_atomic_write_u32(&ClusterSinval->inbound_overflow_reset_pending, 1);
-	pg_atomic_fetch_add_u64(&ClusterSinval->inbound_overflow_reset_count, 1);
+	(void)sinval_request_reset(cluster_epoch_get_current(), true);
 
 	if (ClusterSinvalAckWaitHTAB == NULL)
 		return;
 
-	current_epoch = cluster_epoch_get_current();
 	LWLockAcquire(ClusterSinvalAckWaitLock, LW_EXCLUSIVE);
 	hash_seq_init(&scan, ClusterSinvalAckWaitHTAB);
 	while ((entry = hash_seq_search(&scan)) != NULL) {
-		Latch *latch = &GetPGProcByNumber(entry->enqueuer_pgprocno)->procLatch;
+		Latch *latch;
+
+		if (entry->publication)
+			continue; /* Epoch change is not a remote RESET completion proof. */
+		latch = &GetPGProcByNumber(entry->enqueuer_pgprocno)->procLatch;
 		entry->ack_received_mask = entry->alive_peer_mask;
 		entry->completion_signaled = 1;
 		SetLatch(latch);
 	}
 	LWLockRelease(ClusterSinvalAckWaitLock);
-	(void)current_epoch; /* reserved for future epoch-based cleanup */
 }
 
 #endif /* USE_PGRAC_CLUSTER */

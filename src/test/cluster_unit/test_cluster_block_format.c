@@ -151,10 +151,10 @@ UT_TEST(test_pd_has_itl_bit_value)
 	 * PD_UNDO_SEG_HEADER = 0x0010, bumping PD_VALID_FLAG_BITS
 	 * 0x000F -> 0x001F; spec-4.5 added PD_CLUSTER_FORCE_FPI = 0x0020
 	 * -> 0x003F.  Spec-8.4D uses bits 0x0040..0x0400 for the valid bit
-	 * plus four-bit WAL-origin identity, so the closed mask is 0x07FF.
+	 * plus four-bit WAL-origin identity; SPACE adds 0x0800.
 	 */
 	UT_ASSERT_EQ(PD_HAS_ITL, 0x0008);
-	UT_ASSERT_EQ(PD_VALID_FLAG_BITS, 0x07FF);
+	UT_ASSERT_EQ(PD_VALID_FLAG_BITS, 0x0FFF);
 }
 
 

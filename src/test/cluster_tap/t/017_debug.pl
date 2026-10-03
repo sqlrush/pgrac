@@ -61,15 +61,16 @@ ok($row_count >= 20,
 # ----------
 is( $node->safe_psql(
 		'postgres',
-		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category)
+		q{SELECT string_agg(DISTINCT category COLLATE "C", ','
+		      ORDER BY category COLLATE "C")
 		    FROM pg_cluster_state}),
-	'advisory,block_format,buffer_format,catalog,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,multixact_current,pcm,pgstat,phase,r4,reconfig,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xid_stripe,xnode_lever,xnode_profile',
-	'all 58 categories appear (Stage 8 R4 adds observation events; L122 alphabetic verify)');
+	'advisory,block_format,buffer_format,catalog,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,ctrc,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,multixact_current,normal_start,pcm,pgstat,phase,r4,reconfig,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo.cleaner.worker.0,undo.cleaner.worker.1,undo.cleaner.worker.2,undo.cleaner.worker.3,undo.cleaner.worker.4,undo.cleaner.worker.5,undo.cleaner.worker.6,undo.cleaner.worker.7,undo_cleaner,update_trace,update_trace_event,visibility,wal_thread,write_fence,xid_stripe,xnode_lever,xnode_profile',
+	'all 70 categories appear (including normal-start, CTRC, cleaner workers and update trace)');
 
 is( $node->safe_psql('postgres',
 			q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-		'121',
-		'gcs category has 121 keys (PCM-X queue observability +3)');
+		'117',
+		'gcs category has 117 keys in the current registry');
 
 
 # ----------
@@ -133,15 +134,15 @@ is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.fault_type'}),
-	'186',
-	'all 186 injection points have a .fault_type entry, including the CTRC stage barrier');
+	'187',
+	'all 187 injection points have a .fault_type entry, including the CTRC stage barrier');
 
 is( $node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state
 		   WHERE category='inject' AND key LIKE '%.hits'}),
-	'186',
-	'all 186 injection points have a .hits entry, including the CTRC stage barrier');
+	'187',
+	'all 187 injection points have a .hits entry, including the CTRC stage barrier');
 
 
 # ----------

@@ -28,7 +28,7 @@
 #          fail-closes 53R97 (D8/R11 negative leg + the heapam LOCAL-guard
 #          trigger case); disarm restores service.
 #      L5  (Q12 / §3.6 rejection face) CREATE UNLOGGED TABLE, ALTER TABLE
-#          SET UNLOGGED, CREATE DATABASE and CREATE TABLESPACE refuse with
+#          SET UNLOGGED, CREATE/DROP DATABASE and CREATE TABLESPACE refuse with
 #          feature_not_supported under shared_catalog=on.
 #      L4c (A-L6) sequence DDL + nextval on both nodes: one line of values.
 #      L4d (A-L7 serialized; runs in the END-ZONE after L4h) DDL originated
@@ -45,10 +45,8 @@
 #          (node1-originated temp) -- see comments in place.
 #      L4f (A-L11) KNOWN-BLOCKED: autovacuum orphan-reaper e2e needs a full
 #          catalog pass on node1 -- 6.15 lane (see comment in place).
-#      A3  (D5-activation) mapped-catalog rewrite works cluster-wide:
-#          node0 VACUUM FULL pg_class commits a new relfilenumber through
-#          the shared relmap authority (pending -> publish -> invalidation
-#          ack) and node1 adopts it and keeps reading the catalog.
+#      A3  Mapped-catalog rewrite is rejected before mutation; both nodes
+#          retain the same pg_class mapping and readable catalog content.
 #      L4g (B-L2/A4) KNOWN-BLOCKED: post-restart serving bricks pre-6.15
 #          (see comment in place); boot-level zero catchup = t/003 E leg.
 #      L4h (B-L5) dropped sinval ack = WARN + convergence, never stale.
@@ -613,8 +611,38 @@ like($erru2, qr/SET UNLOGGED is not supported with/,
 
 my ($rcu3, undef, $erru3) = $node0->psql('postgres', 'CREATE DATABASE q12_db');
 isnt($rcu3, 0, 'L5: CREATE DATABASE is refused');
-like($erru3, qr/CREATE DATABASE is not supported with/,
+like($erru3, qr/CREATE(?:\/DROP)? DATABASE is not supported (?:with|in)/,
 	'L5: CREATE DATABASE refusal is the explicit fail-closed message');
+
+# Real shared postmasters, with no test-only flag changes. template1 is
+# already present on both nodes and must survive even a FORCE request.
+my $template_oid = $node0->safe_psql('postgres',
+	q{SELECT oid FROM pg_database WHERE datname='template1'});
+my $postgres_oid = $node0->safe_psql('template1',
+	q{SELECT oid FROM pg_database WHERE datname='postgres'});
+for my $node ($node0, $node1)
+{
+	my ($rcdrop, undef, $errdrop) = $node->psql('postgres',
+		"\\set VERBOSITY verbose\nDROP DATABASE template1 WITH (FORCE)");
+	is($rcdrop, 3, 'L5: shared DROP DATABASE is refused before mutation');
+	like($errdrop, qr/0A000:.*(?:CREATE\/)?DROP DATABASE is not supported in shared mode/s,
+		'L5: DROP DATABASE refusal comes from the shared feature boundary');
+	is($node->safe_psql('postgres',
+		q{SELECT oid FROM pg_database WHERE datname='template1'}), $template_oid,
+		'L5: refused DROP preserves the database identity on each shared node');
+	ok(-d $node->data_dir . "/base/$template_oid",
+		'L5: refused DROP preserves the database directory');
+	my ($rcother, undef, $errother) = $node->psql('template1',
+		"\\set VERBOSITY verbose\nDROP DATABASE postgres WITH (FORCE)");
+	is($rcother, 3, 'L5: DROP postgres from template1 is refused');
+	like($errother, qr/0A000:.*(?:CREATE\/)?DROP DATABASE is not supported in shared mode/s,
+		'L5: another database connection still reaches the shared refusal');
+	is($node->safe_psql('template1',
+		q{SELECT oid FROM pg_database WHERE datname='postgres'}), $postgres_oid,
+		'L5: refused DROP postgres preserves its catalog identity');
+	is($node->safe_psql('postgres', 'SELECT 1'), '1',
+		'L5: postgres remains connectable after the refused FORCE request');
+}
 
 my ($rcu4, undef, $erru4) = $node0->psql('postgres',
 	"CREATE TABLESPACE q12_ts LOCATION ''");
@@ -623,13 +651,7 @@ like($erru4, qr/CREATE TABLESPACE is not supported with/,
 	'L5: CREATE TABLESPACE refusal is the explicit fail-closed message');
 
 # ----------
-# A3 (spec-6.14 D5-activation): mapped-catalog rewrite works CLUSTER-WIDE.
-# node0's VACUUM FULL pg_class commits a new relfilenumber through the
-# shared relmap authority (stage pending -> commit -> publish -> relmap
-# invalidation with the all-alive-peer ack barrier); the ack round
-# completes before VACUUM FULL returns, so node1's next command applies
-# the queued invalidation at AcceptInvalidationMessages and resolves the
-# NEW file.
+# A3: shared mode rejects mapped-catalog rewrites before mutation.
 # ----------
 my $fn_before0 = $node0->safe_psql('postgres',
 	"SELECT pg_relation_filenode('pg_class')");
@@ -638,16 +660,18 @@ my $fn_before1 = $node1->safe_psql('postgres',
 is($fn_before1, $fn_before0,
 	'A3: both nodes resolve the same pg_class relfilenumber before the rewrite');
 
-$node0->safe_psql('postgres', 'VACUUM FULL pg_class');
+my ($rewrite_rc, undef, $rewrite_err) = $node0->psql('postgres',
+	"\\set VERBOSITY verbose\nVACUUM FULL pg_class;");
+isnt($rewrite_rc, 0, 'A3: VACUUM FULL pg_class is refused');
+like($rewrite_err, qr/0A000:.*VACUUM FULL.*not supported in shared mode/s,
+	'A3: mapped-catalog rewrite reports feature_not_supported');
 
 my $fn_after0 = $node0->safe_psql('postgres',
 	"SELECT pg_relation_filenode('pg_class')");
-isnt($fn_after0, $fn_before0,
-	'A3: VACUUM FULL pg_class moved the mapped relfilenumber on node0');
+is($fn_after0, $fn_before0,
+	'A3: refused rewrite preserves the mapped relfilenumber on node0');
 
-# node1 adopts the new mapping (bounded poll; the inval is already in its
-# local queue -- the ack barrier guaranteed that before VACUUM FULL
-# returned -- and a fresh backend/AIM picks it up).
+# The peer must retain the same mapping after the rejected operation.
 my $fn_after1 = '';
 foreach my $i (1 .. 100)
 {
@@ -656,11 +680,11 @@ foreach my $i (1 .. 100)
 	last if $fn_after1 eq $fn_after0;
 	usleep(100_000);
 }
-is($fn_after1, $fn_after0, 'A3: node1 adopts the new mapped relfilenumber');
+is($fn_after1, $fn_before1, 'A3: node1 retains its mapped relfilenumber');
 
 is($node1->safe_psql('postgres',
 	"SELECT count(*) FROM pg_class WHERE relname = 'q12_logged'"),
-	'1', 'A3: node1 reads catalog content through the rewritten pg_class');
+	'1', 'A3: node1 reads catalog content after the refused rewrite');
 
 # ----------
 # D10b: the shared-catalog data-plane counters moved during the run.

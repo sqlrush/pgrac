@@ -51,6 +51,9 @@
  */
 #include "postgres.h"
 
+#include "access/xlog.h"
+#include "miscadmin.h"
+#include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_page_guard.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -90,6 +93,16 @@
  */
 #include "storage/shmem.h"
 #include "utils/timestamp.h"
+
+char *DataDir = NULL;
+int wal_level = WAL_LEVEL_REPLICA;
+int cluster_cold_recovery_plan_memory = CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB;
+
+int
+errcode_for_file_access(void)
+{
+	abort(); /* GUC file validation is outside this shmem-only fixture. */
+}
 
 void
 RequestAddinShmemSpace(Size size pg_attribute_unused())

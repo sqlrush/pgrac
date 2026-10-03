@@ -605,7 +605,6 @@ cluster_lms_outbound_resource_x_intent_pump(void)
 	uint8 payload[RESOURCE_X_IMAGE_V2_BYTES];
 	int staged = 0;
 	int call;
-	bool scan_more = false;
 
 	Assert(MyBackendType == B_LMS);
 	for (call = 0; call < PGRAC_LMS_RESOURCE_X_CALLS_PER_TICK; call++) {
@@ -628,11 +627,8 @@ cluster_lms_outbound_resource_x_intent_pump(void)
 			break;
 		if (probe_result == RESOURCE_X_INTENT_PROBE_CORRUPT)
 			break;
-		if (probe_result == RESOURCE_X_INTENT_PROBE_MORE) {
-			scan_more = true;
+		if (probe_result == RESOURCE_X_INTENT_PROBE_MORE)
 			continue;
-		}
-		scan_more = false;
 		if (probe_result == RESOURCE_X_INTENT_PROBE_DELIVERY) {
 			/* A local callback is not a packet and consumes the same bounded
 			 * call budget. BUSY waits for the existing event-loop tick. */
@@ -678,10 +674,10 @@ cluster_lms_outbound_resource_x_intent_pump(void)
 		else
 			(void)cluster_pcm_lock_resource_x_outbound_intent_not_admitted_exact(&intent, now_us);
 	}
-	/* Preserve the frozen 4-probe/call and 16-call/iteration bounds without
-	 * turning a truthful MORE cursor into an artificial 100ms idle period.
-	 * The existing LMS latch schedules only the next bounded iteration. */
-	if (scan_more)
+	/* Resume an exhausted scan even when its last probe found work.  A
+	 * terminal probe ends the scan without a continuation wake, including
+	 * after BUSY callbacks.  Each iteration keeps the same 4/16 bounds. */
+	if (call == PGRAC_LMS_RESOURCE_X_CALLS_PER_TICK)
 		cluster_lms_wakeup(0);
 	return staged;
 }

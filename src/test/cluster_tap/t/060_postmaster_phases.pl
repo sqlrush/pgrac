@@ -130,8 +130,8 @@ like($log_l1, qr/cluster phase 1: LMON ready/,
 	 'L4 Phase 1 LMON ready DEBUG1 message logged (spec-1.11 Sprint A real spawn)');
 like($log_l1, qr/cluster phase 2: LCK ready/,
 	 'L4 Phase 2 LCK ready DEBUG1 message logged (spec-1.12 Sprint A real spawn; LMS starts from PM_RUN ServerLoop)');
-like($log_l1, qr/Phase 3 stub:/,
-	 'L4 Phase 3 stub DEBUG1 message logged');
+like($log_l1, qr/cluster phase 3: CSSD ready .* \+ QVOTEC ready/,
+	 'L4 Phase 3 CSSD and QVOTEC ready DEBUG1 message logged');
 like($log_l1, qr/cluster phase 4: DIAG ready .* \+ Cluster Stats ready/,
 	 'L4 Phase 4 DIAG + Cluster Stats ready DEBUG1 logged (spec-1.13 Q2 A\' phase4 driver runs post-PM_RUN; spec-1.14 串行加 Cluster Stats spawn)');
 

@@ -220,6 +220,13 @@ for my $node (@ddl_nodes)
 	});
 }
 
+# Retain each catalog identity when diagnosing cross-node accounting failures.
+for my $i (0 .. 3)
+{
+	diag("node$i relation=" . $quad->node($i)->safe_psql('postgres',
+		q{SELECT pg_relation_filepath('pcm_grd_reuse')}));
+}
+
 # Seed one resource per autocommit transaction so preparation does not create
 # an unrelated multi-resource authority round.  The measured reuse delta below
 # starts only after all physical rows exist.
@@ -358,12 +365,15 @@ for my $round (0 .. $rounds - 1)
 		my $rc = eval { $run->{handle}->result(0) };
 		$rc = -1 unless defined($rc);
 		my $commits = () = $run->{stdout} =~ /^COMMIT$/mg;
+		my $updates_zero = () = $run->{stdout} =~ /^UPDATE 0$/mg;
+		my $updates_one = () = $run->{stdout} =~ /^UPDATE 1$/mg;
 		my $errors = () = $run->{stderr} =~ /(?:ERROR|FATAL|PANIC):/g;
 		$node_commits[$i] += $commits;
 		$client_failures++ if $run->{timed_out} || $rc != 0
 			|| $errors != 0 || $commits != $rows_per_node_round;
 		diag("round=$round node=$i rc=$rc timeout=$run->{timed_out} "
-			. "commits=$commits errors=$errors stderr=[$run->{stderr}]");
+			. "commits=$commits updates_zero=$updates_zero updates_one=$updates_one "
+			. "errors=$errors stderr=[$run->{stderr}]");
 	}
 }
 

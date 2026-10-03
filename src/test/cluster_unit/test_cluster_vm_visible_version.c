@@ -45,7 +45,7 @@ UT_DEFINE_GLOBALS();
 #define HEAPBLK_TO_OFFSET(x) (((x) % 4) * 2)
 
 bool cluster_enabled = true, cluster_shared_config = true, InRecovery, wal_log_hints;
-int cluster_node_id, wal_level = WAL_LEVEL_REPLICA, NBuffers = 2, NLocBuffer;
+int cluster_node_id = 0, wal_level = WAL_LEVEL_REPLICA, NBuffers = 2, NLocBuffer;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
 volatile uint32 CritSectionCount;

@@ -48,8 +48,8 @@ $node_default->start;
 my $pcm_category_rows = $node_default->safe_psql(
 	'postgres',
 	"SELECT count(*) FROM pg_cluster_state WHERE category = 'pcm'");
-is($pcm_category_rows, '110',
-	'L1 pg_cluster_state pcm category has 110 rows (measured R1 diagnostic surface)');
+is($pcm_category_rows, '312',
+	'L1 pg_cluster_state pcm category has 312 rows (measured R1 diagnostic surface)');
 
 # L3 — api_state shows "active" when GUC=-1 default
 my $api_state_default = $node_default->safe_psql(

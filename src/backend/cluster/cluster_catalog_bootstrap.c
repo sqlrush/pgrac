@@ -383,7 +383,21 @@ cluster_catalog_startup_prepare(void)
 		return; /* off: stock per-node catalog */
 	}
 
+	/* Recheck after all settings have been applied, independent of GUC order.
+	 * Catalog-only routing must not use native minimal-WAL file creation. */
+	if (wal_level == WAL_LEVEL_MINIMAL)
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("shared catalogs require wal_level=replica")));
+	/* The legacy checkpoint redo advertisement can fail with WARNING.
+	 * OID reuse requires durable root publication before unlink cleanup. */
+	if (!cluster_shared_config)
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("shared catalogs require cluster.shared_config=on")));
 	cluster_catalog_vet_xid_striping_for_shared_catalog();
+	if (cluster_sinval_ack_mode == CLUSTER_SINVAL_ACK_MODE_NONE)
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("shared catalogs require acknowledged invalidation"),
+						errhint("Set cluster.sinval_ack_mode=peer_enqueued.")));
 
 	/*
 	 * shared_catalog=on requires the shared pg_control authority (D1 vet), so
@@ -411,14 +425,15 @@ cluster_catalog_startup_prepare(void)
 		Oid oid_hw;
 
 		if (!cluster_oid_authority_read(&oid_hw) && cluster_oid_authority_present())
-			ereport(FATAL, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
-							errmsg("shared OID authority is present but corrupt"),
-							errdetail("Neither \"%s/global/pgrac_oid_authority\" nor its "
-									  ".bak fallback passes validation.",
-									  cluster_shared_data_dir),
-							errhint("Restore the shared OID authority files from a backup "
-									"of the shared tree; do not delete them (re-seeding "
-									"from a stale high-water can reissue leased OIDs).")));
+			ereport(
+				FATAL,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("shared OID authority is present but corrupt"),
+				 errdetail("The current \"%s/global/pgrac_oid_authority\" fails validation; "
+						   "an older .bak cannot prove the issued high-water.",
+						   cluster_shared_data_dir),
+				 errhint("Recover the current issued high-water from verified durable evidence; "
+						 "do not restore an older .bak or re-seed from a stale checkpoint.")));
 	}
 	if (cluster_oid_authority_seed_if_absent(cf.checkPointCopy.nextOid))
 		elog(LOG, "cluster shared_catalog: seeded OID authority high-water at %u",

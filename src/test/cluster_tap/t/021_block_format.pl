@@ -56,7 +56,7 @@ my $has_visibility_inject =
 # and +1 for the unconditional "pgrac cluster cr admit stats" region (spec-5.52 D9;
 # and +1 for the unconditional "pgrac cluster cr relgen" region (spec-5.56 D4;
 # full enumerated region list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '86' : '85'; # full cumulative registry authority lives in t/020
+  my $expected_region_count = $has_visibility_inject ? '89' : '88'; # full cumulative registry authority lives in t/020
 
 
 # ----------
@@ -188,8 +188,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '186',
-   'L11 pg_stat_cluster_injections is 186 (full breakdown in t/015)');
+   '187',
+   'L11 pg_stat_cluster_injections is 187 (full breakdown in t/015)');
 
 
 # ----------

@@ -325,12 +325,12 @@ ok(defined $postgres_bin && -x $postgres_bin,
 
 
 # ============================================================
-# §M  error injection 186 注入点 + 7 fault types (6 tests)
+# §M  error injection 187 注入点 + 7 fault types (6 tests)
 # ============================================================
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'186', 'M1 186 injection points including the CTRC stage barrier');
+	'187', 'M1 187 injection points including the CTRC stage barrier');
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_stat_cluster_injections WHERE name LIKE 'cluster-init-%'}),
@@ -360,8 +360,8 @@ ok( $node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT key) FROM pg_cluster_state
 		   WHERE category='inject' AND (key LIKE '%.fault_type' OR key LIKE '%.hits')}
-	) eq '372',
-	'M5 inject category has 186×2 = 372 sub-keys (.fault_type + .hits)');
+	) eq '374',
+	'M5 inject category has 187×2 = 374 sub-keys (.fault_type + .hits)');
 
 is($node->get_cluster_state_value('inject', 'armed_count'),
 	'0', 'M6 inject.armed_count starts at 0 in fresh backend');

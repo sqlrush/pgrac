@@ -325,6 +325,8 @@ txw_exact_waiter_vertex(ClusterLmdVertex *waiter, int procno, uint64 formation_e
 	waiter->request_id = 0;
 	waiter->xid = xid;
 	waiter->wait_seq = wait_seq;
+	if (MyProc != NULL && MyProc->pgprocno == procno && MyProc->lockGroupLeader != NULL)
+		waiter->lock_group_procno_plus_one = (uint32)MyProc->lockGroupLeader->pgprocno + 1;
 }
 
 static void
@@ -471,13 +473,7 @@ cluster_tx_enqueue_wait_internal(const ClusterTTStatusKey *holder_key, int effec
 		wait_seq = cluster_lmd_wait_state_publish(&MyProc->cluster_lmd_wait, CLUSTER_LMD_WAIT_TX, 0,
 												  wait_epoch, my_xid);
 
-		memset(&tx_wfg_waiter, 0, sizeof(tx_wfg_waiter));
-		tx_wfg_waiter.node_id = cluster_node_id;
-		tx_wfg_waiter.procno = (uint32)procno;
-		tx_wfg_waiter.cluster_epoch = wait_epoch;
-		tx_wfg_waiter.request_id = 0;
-		tx_wfg_waiter.xid = my_xid;
-		tx_wfg_waiter.wait_seq = wait_seq;
+		txw_exact_waiter_vertex(&tx_wfg_waiter, procno, wait_epoch, my_xid, wait_seq);
 
 		memset(&blocker, 0, sizeof(blocker));
 		blocker.node_id = holder_key->origin_node_id;

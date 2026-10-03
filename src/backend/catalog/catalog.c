@@ -41,6 +41,10 @@
 #include "catalog/pg_subscription.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/storage/cluster_shared_fs.h"
+#include "cluster/storage/cluster_smgr.h"
+#endif
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/fmgroids.h"
@@ -580,6 +584,24 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 															Anum_pg_class_oid);
 		else
 			rlocator.locator.relNumber = GetNewObjectId();
+
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: any fork in the selected storage namespace reserves the
+		 * locator, including MAIN tombstones and orphan auxiliary forks. */
+		if (cluster_smgr_which_for(rlocator.locator, backend) == 1)
+		{
+			ForkNumber forknum;
+
+			collides = false;
+			for (forknum = MAIN_FORKNUM; forknum <= MAX_FORKNUM; forknum++)
+				if (cluster_shared_fs_exists(rlocator.locator, forknum))
+				{
+					collides = true;
+					break;
+				}
+			continue;
+		}
+#endif
 
 		/* Check for existing file of same name */
 		rpath = relpath(rlocator, MAIN_FORKNUM);

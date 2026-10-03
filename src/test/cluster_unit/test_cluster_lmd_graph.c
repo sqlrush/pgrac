@@ -786,7 +786,7 @@ UT_TEST(test_replace_waiter_edges_rejects_conflicting_duplicate_metadata)
 	uint64 gen_before;
 	int n;
 
-	for (int variant = 0; variant < 3; variant++) {
+	for (int variant = 0; variant < 4; variant++) {
 		ClusterLmdVertex blockers[2] = { duplicate, duplicate };
 
 		reset_graph();
@@ -796,8 +796,10 @@ UT_TEST(test_replace_waiter_edges_rejects_conflicting_duplicate_metadata)
 			blockers[1].wait_seq++;
 		else if (variant == 1)
 			blockers[1].xid++;
-		else
+		else if (variant == 2)
 			blockers[1].local_start_ts_ms++;
+		else
+			blockers[1].lock_group_procno_plus_one++;
 
 		UT_ASSERT(!cluster_lmd_graph_replace_waiter_edges(&w, blockers, 2, w.request_id));
 		UT_ASSERT_EQ(cluster_lmd_graph_generation_get(), gen_before);

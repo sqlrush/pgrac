@@ -26,6 +26,7 @@ typedef struct PiRebuildJob {
 	ResourceOwner owner;
 	ClusterGrdPiRebuildCutV1 cut;
 	ClusterWalSourceRef local;
+	ClusterWalSourceRef source;
 	ClusterWalInputsV1 *inputs;
 	BufFile *spool;
 	PiRebuildContribution batch[PI_REBUILD_BATCH];
@@ -36,6 +37,8 @@ typedef struct PiRebuildJob {
 	uint64 records;
 	int source_node;
 	XLogRecPtr source_lsn;
+	XLogRecPtr recovered_end;
+	bool source_valid;
 	bool pending_valid;
 	bool scanned;
 	bool plan_blocked;
@@ -94,6 +97,11 @@ pi_rebuild_add(void *arg, const RelFileLocator *locator, ForkNumber forknum, Blo
 	PiRebuildContribution *item;
 	int home;
 
+	/* The source's exact durable recovery terminal discharged this executor.
+	 * Keep decoding its records and checking the physical suffix, but do not
+	 * recreate a holder that can no longer answer a physical-PI request. */
+	if (job->recovered_end != InvalidXLogRecPtr)
+		return token != 0;
 	if (token == 0 || job->source_node < 0 || job->source_node >= 32
 		|| XLogRecPtrIsInvalid(job->source_lsn))
 		return false;
@@ -136,6 +144,14 @@ pi_rebuild_record(XLogReaderState *record, const ClusterWalSourceRef *source,
 		|| source->claim.database_incarnation != job->local.claim.database_incarnation
 		|| memcmp(source->claim.identity.storage_uuid, job->local.claim.identity.storage_uuid, 16))
 		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+	if (!job->source_valid || memcmp(&job->source, source, sizeof(*source)) != 0) {
+		job->source = *source;
+		job->source_valid = true;
+		(void)cluster_wal_inputs_recovered_prefix_v1(job->inputs, source, &job->recovered_end);
+	}
+	if (job->recovered_end != InvalidXLogRecPtr
+		&& (record->EndRecPtr <= record->ReadRecPtr || record->EndRecPtr > job->recovered_end))
+		return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 	job->source_node = source->claim.identity.origin_node_id;
 	job->source_lsn = record->ReadRecPtr;
 	return cluster_thread_recovery_record_census_v1(record, source, cut, pi_rebuild_add, job);

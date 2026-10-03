@@ -120,6 +120,9 @@ GetNewTransactionId(bool isSubXact)
 	if (RecoveryInProgress())
 		elog(ERROR, "cannot assign TransactionIds during recovery");
 
+#ifdef USE_PGRAC_CLUSTER
+retry_cluster_xid_reservation:
+#endif
 	LWLockAcquire(XidGenLock, LW_EXCLUSIVE);
 
 	full_xid = ShmemVariableCache->nextXid;
@@ -331,6 +334,20 @@ GetNewTransactionId(bool isSubXact)
 					 errhint("The barrier completes automatically within about a second; retry the transaction. If this persists, check cluster connectivity and that every member runs a barrier-capable binary.")));
 #endif
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: consume a majority-durable stripe reservation before SLRU or
+	 * ProcArray mutation. QVOTEC may need XidGenLock to observe nextXid;
+	 * wait outside the lock, then rederive all candidates and limits.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_enabled && cluster_shared_catalog && cluster_xid_striping
+		&& !cluster_xid_stripe_lease_ready(full_xid))
+	{
+		LWLockRelease(XidGenLock);
+		cluster_xid_stripe_wait_lease(full_xid);
+		goto retry_cluster_xid_reservation;
+	}
+#endif
 
 	/*
 	 * If we are allocating the first XID of a new page of the commit log,

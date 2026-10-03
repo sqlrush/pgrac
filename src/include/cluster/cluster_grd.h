@@ -871,6 +871,10 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 										  const struct ClusterGrdHolderId *new_holder,
 										  int32 source_node_id, int lockmode);
 
+extern ClusterGrdEntryResult cluster_grd_entry_rebind_or_insert_holder_group(
+	const ClusterResId *resid, const struct ClusterGrdHolderId *new_holder, int32 source_node_id,
+	int lockmode, uint32 lock_group_procno_plus_one);
+
 /* spec-4.6 D3 — backend-side cooperative rebind walker (defined in
  * cluster_lock_acquire.c;  runs at CFI from cluster_grd_check_pending_
  * interrupts, no-throw).  Walks this backend's cluster_registered
@@ -1051,6 +1055,7 @@ StaticAssertDecl(sizeof(ClusterGrdHolderId) == 24, "ClusterGrdHolderId 4-tuple A
 typedef struct ClusterGrdWaiterMeta {
 	TransactionId xid;
 	uint64 wait_seq;
+	uint32 lock_group_procno_plus_one;
 } ClusterGrdWaiterMeta;
 
 /*
@@ -1458,18 +1463,19 @@ extern int cluster_grd_entry_release_and_pop_compatible_waiter(
  *	convert's own reply key (≠ the old grant request_id).
  */
 typedef struct ClusterGrdConvert {
-	int32 node_id;					/* node holding the lock being converted */
-	int32 source_node_id;			/* node that initiated the convert (reply routing) */
-	uint32 procno;					/* PG ProcNumber of the holder */
-	uint64 cluster_epoch;			/* epoch at enqueue (stale-epoch sweep) */
-	LOCKMODE current_mode;			/* locator: (node,procno,current_mode)+resid */
-	LOCKMODE requested_mode;		/* target mode */
-	uint64 convert_request_id;		/* convert's own reply key (≠ old grant id) */
-	uint64 shard_master_generation; /* spec-2.27 dedup key carry */
-	uint32 request_opcode;			/* = GES_REQ_OPCODE_CONVERT */
-	TransactionId waiter_xid;		/* spec-5.8 D1c — converter's xid (former pad slot) */
-	TimestampTz wait_start;			/* enqueue timestamp (timeout / observability) */
-	uint64 wait_seq;				/* spec-5.8 D1e — converter's D1d wait-state seq */
+	int32 node_id;					   /* node holding the lock being converted */
+	int32 source_node_id;			   /* node that initiated the convert (reply routing) */
+	uint32 procno;					   /* PG ProcNumber of the holder */
+	uint32 lock_group_procno_plus_one; /* compatibility only; derived from holder */
+	uint64 cluster_epoch;			   /* epoch at enqueue (stale-epoch sweep) */
+	LOCKMODE current_mode;			   /* locator: (node,procno,current_mode)+resid */
+	LOCKMODE requested_mode;		   /* target mode */
+	uint64 convert_request_id;		   /* convert's own reply key (≠ old grant id) */
+	uint64 shard_master_generation;	   /* spec-2.27 dedup key carry */
+	uint32 request_opcode;			   /* = GES_REQ_OPCODE_CONVERT */
+	TransactionId waiter_xid;		   /* spec-5.8 D1c — converter's xid (former pad slot) */
+	TimestampTz wait_start;			   /* enqueue timestamp (timeout / observability) */
+	uint64 wait_seq;				   /* spec-5.8 D1e — converter's D1d wait-state seq */
 	/*
 	 * spec-5.10 D1 — GES enqueue lock-starvation fairness state, mirroring the
 	 * private ClusterGrdWaiter fields.  Master-local + shmem-only (NEVER on the

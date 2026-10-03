@@ -29,6 +29,8 @@
  */
 #include "c.h"
 
+#include <errno.h>
+#include <limits.h>
 #include <stdlib.h> /* strtol */
 
 #include "cluster/cluster_shared_catalog.h"
@@ -100,6 +102,7 @@ int
 cluster_temp_namespace_parse_suffix(const char *suffix, int *out_node)
 {
 	long backend_id;
+	long node = -1;
 	char *endp;
 
 	if (out_node != NULL)
@@ -109,23 +112,24 @@ cluster_temp_namespace_parse_suffix(const char *suffix, int *out_node)
 		return -1;
 
 	if (suffix[0] == 'n') {
-		long node;
-
 		/* node-qualified: n<node>_<backendId> */
+		if (suffix[1] < '0' || suffix[1] > '9')
+			return -1;
+		errno = 0;
 		node = strtol(suffix + 1, &endp, 10);
-		if (endp == suffix + 1 || *endp != '_')
-			return -1; /* malformed */
-		backend_id = strtol(endp + 1, &endp, 10);
-		if (*(endp) != '\0' && *endp != '_') /* tolerate nothing after */
-			/* trailing garbage: still accept the parsed id */;
-		if (out_node != NULL)
-			*out_node = (int)node;
-		return (int)backend_id;
+		if (errno == ERANGE || node > INT_MAX || *endp != '_')
+			return -1;
+		suffix = endp + 1;
 	}
 
-	/* stock: <backendId> */
-	backend_id = strtol(suffix, &endp, 10);
-	if (endp == suffix)
+	/* Accept a complete positive backend identity, not a numeric prefix. */
+	if (suffix[0] < '0' || suffix[0] > '9')
 		return -1;
+	errno = 0;
+	backend_id = strtol(suffix, &endp, 10);
+	if (errno == ERANGE || backend_id <= 0 || backend_id > INT_MAX || *endp != '\0')
+		return -1;
+	if (out_node != NULL)
+		*out_node = (int)node;
 	return (int)backend_id;
 }

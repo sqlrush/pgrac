@@ -21,7 +21,8 @@ use IPC::Run ();
 use Test::More;
 
 my $root = abs_path("$FindBin::RealBin/../../../..");
-my $unit_dir = "$root/src/test/cluster_unit";
+my $build_root = $ENV{top_builddir} // $root;
+my $unit_dir = "$build_root/src/test/cluster_unit";
 my @suites = qw(
 	test_cluster_external_fence
 	test_pgrac_external_fence_protocol
@@ -52,7 +53,7 @@ my ($build_out, $build_err) = ('', '');
 my %output;
 
 IPC::Run::run(
-	[ 'make', '-C', "$root/src/common", 'libpgcommon.a',
+	[ 'make', '-C', "$build_root/src/common", 'libpgcommon.a',
 	  'libpgcommon_srv.a' ],
 	'>', \$build_out, '2>', \$build_err)
 	or BAIL_OUT("cannot build STOP04 common libraries: $build_err");
@@ -72,7 +73,8 @@ for my $suite (@suites)
 	$output{$suite} = $stdout . $stderr;
 }
 
-my $artifact_dir = "$root/src/test/cluster_tap/tmp_check/423_external_io_fence";
+my $artifact_root = $ENV{TESTLOGDIR} // "$build_root/src/test/cluster_tap/tmp_check";
+my $artifact_dir = "$artifact_root/423_external_io_fence";
 make_path($artifact_dir);
 open(my $artifact, '>', "$artifact_dir/provenance.json")
 	or BAIL_OUT("cannot create test-only provenance: $!");

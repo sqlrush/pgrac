@@ -81,6 +81,7 @@
 char *cluster_shared_data_dir = NULL;
 char *cluster_shared_storage_uuid = NULL;
 int cluster_node_id = 0;
+bool cluster_shared_catalog = false;
 bool IsUnderPostmaster = false;
 
 /* Scripted FileSize/pg_usleep surface for the concurrent-extend EOF tests. */
@@ -306,14 +307,15 @@ pg_fsync(int fd)
 
 /*
  * Minimal GetRelationPath: the sharedfs relpath helper goes through
- * relpathperm -> GetRelationPath.  The tests use only permanent MAIN_FORK
- * relations in the default tablespace, so the "base/<db>/<rel>" shape is
- * the full contract exercised (mirrors common/relpath.c for that case).
+ * relpathperm -> GetRelationPath.  The tests use permanent MAIN/FSM forks
+ * in the default tablespace (mirrors common/relpath.c for these cases).
  */
 char *
 GetRelationPath(Oid dbOid, Oid spcOid pg_attribute_unused(), RelFileNumber relNumber,
 				int backendId pg_attribute_unused(), ForkNumber forkNumber)
 {
+	if (forkNumber == FSM_FORKNUM)
+		return psprintf("base/%u/%u_fsm", dbOid, relNumber);
 	if (forkNumber != MAIN_FORKNUM)
 		abort();
 	return psprintf("base/%u/%u", dbOid, relNumber);
@@ -528,6 +530,58 @@ UT_TEST(test_sharedfs_roundtrip_and_owner_agnostic)
 	UT_ASSERT(!ops->exists(rl, MAIN_FORKNUM));
 }
 
+UT_TEST(test_shared_catalog_create_rejects_existing_main)
+{
+	const ClusterSharedFsOps *ops = &cluster_shared_fs_sharedfs_ops;
+	RelFileLocator rl = { .spcOid = 1663, .dbOid = 5, .relNumber = 30000 };
+	ClusterSharedFsHandle *h = NULL;
+	char original[BLCKSZ], actual[BLCKSZ];
+	pid_t child;
+	int status = 0;
+
+	fresh_root("exclusive_create");
+	cluster_shared_catalog = true;
+	ops->create(rl, MAIN_FORKNUM, false, &h);
+	memset(original, 0x5A, sizeof(original));
+	UT_ASSERT_EQ(ops->write(h, 0, original), BLCKSZ);
+	ops->close(h);
+	h = NULL;
+	fflush(NULL);
+	child = fork();
+	UT_ASSERT(child >= 0);
+	if (child == 0) {
+		ops->create(rl, MAIN_FORKNUM, false, &h);
+		_exit(0);
+	}
+	UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+	UT_ASSERT(WIFSIGNALED(status));
+	if (WIFSIGNALED(status))
+		UT_ASSERT_EQ(WTERMSIG(status), SIGABRT);
+	/* Redo keeps its existing contract; failed CREATE changed no old bytes. */
+	ops->create(rl, MAIN_FORKNUM, true, &h);
+	UT_ASSERT_EQ(ops->read(h, 0, actual), BLCKSZ);
+	UT_ASSERT_EQ(memcmp(original, actual, BLCKSZ), 0);
+	ops->close(h);
+	h = NULL;
+	/* Advisory FSM creation is for this same relation, not a new identity. */
+	ops->create(rl, FSM_FORKNUM, false, &h);
+	UT_ASSERT_EQ(ops->write(h, 0, original), BLCKSZ);
+	ops->close(h);
+	h = NULL;
+	ops->create(rl, FSM_FORKNUM, false, &h);
+	UT_ASSERT_EQ(ops->read(h, 0, actual), BLCKSZ);
+	UT_ASSERT_EQ(memcmp(original, actual, BLCKSZ), 0);
+	ops->close(h);
+	ops->unlink(rl, FSM_FORKNUM);
+	h = NULL;
+	cluster_shared_catalog = false;
+	ops->create(rl, MAIN_FORKNUM, false, &h);
+	UT_ASSERT_EQ(ops->read(h, 0, actual), BLCKSZ);
+	UT_ASSERT_EQ(memcmp(original, actual, BLCKSZ), 0);
+	ops->close(h);
+	ops->unlink(rl, MAIN_FORKNUM);
+}
+
 UT_TEST(test_sharedfs_extend_zero_fills)
 {
 	const ClusterSharedFsOps *ops = &cluster_shared_fs_sharedfs_ops;
@@ -704,9 +758,10 @@ UT_TEST(test_sentinel_missing_file_fails_closed)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_sharedfs_roundtrip_and_owner_agnostic);
 	UT_RUN(test_sharedfs_extend_zero_fills);
+	UT_RUN(test_shared_catalog_create_rejects_existing_main);
 	UT_RUN(test_nblocks_rechecks_transient_partial_extend);
 	UT_RUN(test_nblocks_persistent_partial_tail_stays_failclosed);
 	UT_RUN(test_sentinel_attach_records_self);

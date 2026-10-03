@@ -1466,7 +1466,7 @@ UT_TEST(test_startup_fenced_xcur_begin_end_owns_exact_private_phase)
 	UT_ASSERT(!cluster_undo_block0_current_startup_fenced_end(&guard));
 }
 
-UT_TEST(test_begin_preregisters_persistent_hooks_before_exact_72_byte_remote_send)
+UT_TEST(test_begin_preregisters_persistent_hooks_before_exact_80_byte_remote_send)
 {
 	ClusterUndoBlock0CurrentGuard guard = { 0 };
 	ClusterUndoBlock0LogicalKey key = test_key(1);
@@ -1480,7 +1480,7 @@ UT_TEST(test_begin_preregisters_persistent_hooks_before_exact_72_byte_remote_sen
 	UT_ASSERT_EQ(smgr_exit_hook_ensure_calls, 1);
 	UT_ASSERT(fake_exit_lifo_ok);
 	UT_ASSERT(reserve_event < insert_event && insert_event < outbound_event);
-	UT_ASSERT_EQ(last_outbound_len, 72);
+	UT_ASSERT_EQ(last_outbound_len, 80);
 	UT_ASSERT_EQ(last_outbound.opcode, GES_REQ_OPCODE_REQUEST);
 	UT_ASSERT_EQ(last_outbound.lockmode, ShareLock);
 	UT_ASSERT_EQ(last_outbound.wait_seq, 0);
@@ -2199,7 +2199,7 @@ UT_TEST(test_remote_held_cancel_stages_release_then_drops_exact_local_mirror)
 	UT_ASSERT_EQ(current_guard_data(&guard)->phase, CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP);
 }
 
-UT_TEST(test_release_reuses_exact_canonical_72_byte_ges_shape)
+UT_TEST(test_release_reuses_exact_canonical_80_byte_ges_shape)
 {
 	ClusterUndoBlock0CurrentGuard guard = { 0 };
 	ClusterUndoBlock0Result failure = CLUSTER_UNDO_BLOCK0_NOT_FOUND;
@@ -3764,7 +3764,7 @@ main(void)
 	UT_RUN(test_live_owner_resident_preregisters_persistent_exit_hooks);
 	UT_RUN(test_batch_preflight_and_eight_defensive_ensures_register_once);
 	UT_RUN(test_startup_fenced_xcur_begin_end_owns_exact_private_phase);
-	UT_RUN(test_begin_preregisters_persistent_hooks_before_exact_72_byte_remote_send);
+	UT_RUN(test_begin_preregisters_persistent_hooks_before_exact_80_byte_remote_send);
 	UT_RUN(test_census_borrows_one_caller_token_without_ordinary_reentry_or_leave);
 	UT_RUN(test_ctrc_release_borrows_census_token_for_local_xcur_only);
 	UT_RUN(test_live_owner_source_borrows_only_xcur_and_target_cannot_produce);
@@ -3789,7 +3789,7 @@ main(void)
 	UT_RUN(test_preflight_failure_restores_reusable_zero_guard);
 	UT_RUN(test_release_retains_mirror_until_exact_ack_is_consumed);
 	UT_RUN(test_remote_held_cancel_stages_release_then_drops_exact_local_mirror);
-	UT_RUN(test_release_reuses_exact_canonical_72_byte_ges_shape);
+	UT_RUN(test_release_reuses_exact_canonical_80_byte_ges_shape);
 	UT_RUN(test_explicit_perpetual_timeout_survives_acquire_and_release);
 	UT_RUN(test_perpetual_acquire_retransmits_past_attempt_threshold);
 	UT_RUN(test_perpetual_release_retransmits_past_attempt_threshold);

@@ -55,6 +55,22 @@
 #include "../../backend/access/heap/heapam_r4_private.h"
 
 #include "unit_test.h"
+#include "cluster/cluster_space_storage.h"
+
+/* The resolver fixture never enters the shared hint writer. Link the current
+ * visibility caller without manufacturing a successful SPACE mutation.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterSpaceHintResult
+cluster_space_hint_begin(Buffer buffer, RfPageProducerBatchV1 *batch)
+{
+	abort();
+}
+
+void
+cluster_space_hint_finish(Buffer buffer, bool standard, const RfPageProducerBatchV1 *batch)
+{
+	abort();
+}
 
 /* Exercise the real lossy-hint sender/receiver alongside the real resolver.
  * Function sections discard unrelated registration/shmem entry points. */

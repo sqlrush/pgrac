@@ -219,10 +219,43 @@ UT_TEST(test_temp_suffix_round_trip)
 	UT_ASSERT_EQ(node, 5);
 }
 
+/* Malformed names must not acquire another backend's cleanup identity. */
+UT_TEST(test_temp_suffix_rejects_malformed_identity)
+{
+	const char *invalid[] = { "",
+							  "0",
+							  "-1",
+							  "+7",
+							  " 7",
+							  "7garbage",
+							  "7_2",
+							  "n_7",
+							  "n-1_7",
+							  "n+2_7",
+							  "n2_",
+							  "n2_0",
+							  "n2_-1",
+							  "n2_7garbage",
+							  "n2_7_3",
+							  "n2147483648_7",
+							  "n2_2147483648",
+							  "99999999999999999999999999999",
+							  "n999999999999999999999_7" };
+	size_t i;
+
+	for (i = 0; i < lengthof(invalid); i++) {
+		int node = 999;
+
+		UT_ASSERT_EQ(cluster_temp_namespace_parse_suffix(invalid[i], &node), -1);
+		UT_ASSERT_EQ(node, -1);
+	}
+	UT_ASSERT_EQ(cluster_temp_namespace_parse_suffix(NULL, NULL), -1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
 	UT_RUN(test_vet_off_always_ok);
 	UT_RUN(test_vet_on_all_present_ok);
 	UT_RUN(test_vet_on_missing_smgr_user_relations_first);
@@ -237,6 +270,7 @@ main(void)
 	UT_RUN(test_temp_suffix_parse_stock);
 	UT_RUN(test_temp_suffix_parse_node_qualified);
 	UT_RUN(test_temp_suffix_round_trip);
+	UT_RUN(test_temp_suffix_rejects_malformed_identity);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

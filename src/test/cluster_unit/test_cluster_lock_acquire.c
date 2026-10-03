@@ -58,6 +58,8 @@
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_wal_retention.h"
 #include "miscadmin.h"
+#include "catalog/pg_class.h"
+#include "access/htup_details.h"
 #include "port/atomics.h"
 #include "storage/lock.h"
 #include "storage/proc.h"
@@ -65,6 +67,7 @@
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/memutils.h"
+#include "utils/syscache.h"
 
 /* Drop PG's port.h printf override; unit_test.h uses stdlib printf. */
 #ifdef vprintf
@@ -490,6 +493,21 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid pg_attribute
 	return CLUSTER_GRD_ENTRY_OK;
 }
 
+uint32
+cluster_ges_current_lock_group(const ClusterGrdHolderId *holder pg_attribute_unused())
+{
+	return 0; /* This fixture has no parallel group; GRD/GES tests cover it. */
+}
+
+ClusterGrdEntryResult
+cluster_grd_entry_rebind_or_insert_holder_group(const ClusterResId *resid,
+												const ClusterGrdHolderId *holder, int32 source,
+												int mode, uint32 group pg_attribute_unused())
+{
+	return cluster_grd_entry_rebind_or_insert_holder(resid, holder, source, mode);
+}
+
+
 HTAB *
 GetLockMethodLocalHash(void)
 {
@@ -522,12 +540,25 @@ hash_seq_search(HASH_SEQ_STATUS *status pg_attribute_unused())
 /* spec-2.25 D8 R10 stub audit — SearchSysCache1 / ReleaseSysCache pulled
  * in by cluster_relation_is_persistent_or_unlogged.  Standalone test does
  * not exercise the helper directly;  null-safe stubs satisfy link. */
-struct HeapTupleData;
-typedef struct HeapTupleData *HeapTuple;
+static HeapTupleData temp_tuple;
+static union {
+	uint64 alignment;
+	char data[MAXALIGN(SizeofHeapTupleHeader) + sizeof(FormData_pg_class)];
+} temp_storage;
+static Oid temp_oid;
 
 HeapTuple
 SearchSysCache1(int cache_id pg_attribute_unused(), Datum key1 pg_attribute_unused())
 {
+	if (temp_oid != InvalidOid && DatumGetObjectId(key1) == temp_oid) {
+		Form_pg_class form;
+		memset(&temp_storage, 0, sizeof(temp_storage));
+		temp_tuple.t_data = (HeapTupleHeader)temp_storage.data;
+		temp_tuple.t_data->t_hoff = MAXALIGN(SizeofHeapTupleHeader);
+		form = (Form_pg_class)GETSTRUCT(&temp_tuple);
+		form->relpersistence = RELPERSISTENCE_TEMP;
+		return &temp_tuple;
+	}
 	return NULL;
 }
 
@@ -1308,7 +1339,7 @@ UT_TEST(test_ul_session_advisory_globalize_gate)
 
 /* spec-6.14 D7 — under cluster.shared_catalog the catalog OID boundary (HC24/
  * HC27) is removed: catalog DDL and mapped-relation writes globalize, catalog
- * reads stay native, and user relations are unaffected.  The SearchSysCache1
+ * reads stay native; user relation readers participate in the DDL lock.  The SearchSysCache1
  * stub returns NULL, so cluster_relation_is_mapped fails safe to true. */
 UT_TEST(test_shared_catalog_relation_gate)
 {
@@ -1342,14 +1373,42 @@ UT_TEST(test_shared_catalog_relation_gate)
 	UT_ASSERT_EQ(cluster_lock_should_globalize(&cat, ShareUpdateExclusiveLock, false), true);
 	UT_ASSERT_EQ(cluster_lock_should_globalize(&cat, AccessExclusiveLock, false), true);
 
-	/* User relations are unchanged in ON mode: OLTP hot path (< SUEX) native,
-	 * DDL globalizes. */
-	UT_ASSERT_EQ(cluster_lock_should_globalize(&usr, RowExclusiveLock, false), false);
+	/* Readers and writers must both conflict with remote DROP/ALTER. */
+	UT_ASSERT(cluster_lock_should_globalize(&usr, AccessShareLock, false));
+	UT_ASSERT(cluster_lock_should_globalize(&usr, RowShareLock, false));
+	UT_ASSERT(cluster_lock_should_globalize(&usr, RowExclusiveLock, false));
 	UT_ASSERT_EQ(cluster_lock_should_globalize(&usr, AccessExclusiveLock, false), true);
 
-	cluster_shared_catalog = false; /* restore */
+	temp_oid = usr.locktag_field2;
+	UT_ASSERT(!cluster_lock_should_globalize(&usr, AccessShareLock, false));
+	UT_ASSERT(!cluster_lock_should_globalize(&usr, AccessExclusiveLock, false));
+	temp_oid = InvalidOid;
+	cluster_shared_catalog = false;
+	UT_ASSERT(!cluster_lock_should_globalize(&usr, AccessShareLock, false));
+	UT_ASSERT(!cluster_lock_should_globalize(&usr, RowExclusiveLock, false));
 }
 
+
+/* Schema and role references must hold the same distributed object lock
+ * that DROP takes exclusively, including built-in object OIDs. */
+UT_TEST(test_shared_object_references_conflict_with_remote_drop)
+{
+	LOCKTAG object;
+	Oid ids[] = { 10, FirstNormalObjectId + 1 };
+
+	for (unsigned i = 0; i < lengthof(ids); i++)
+		for (int shared = 0; shared <= 1; shared++)
+			for (LOCKMODE mode = AccessShareLock; mode <= AccessExclusiveLock; mode++) {
+				SET_LOCKTAG_OBJECT(object, 1, 2615, ids[i], 0);
+				cluster_shared_catalog = shared;
+				UT_ASSERT_EQ(cluster_lock_should_globalize(&object, mode, false),
+							 shared || (i == 1 && mode >= ShareUpdateExclusiveLock));
+				SET_LOCKTAG_OBJECT(object, InvalidOid, 1260, ids[i], 0);
+				UT_ASSERT_EQ(cluster_lock_should_globalize(&object, mode, false),
+							 shared || (i == 1 && mode >= ShareUpdateExclusiveLock));
+			}
+	cluster_shared_catalog = false;
+}
 
 /* ============================================================
  * spec-5.5 U6 — try-lock (NOWAIT) S4 reject mapping (D5).
@@ -1736,7 +1795,7 @@ UT_DEFINE_GLOBALS();
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(25);
+	UT_PLAN(26);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
@@ -1748,6 +1807,7 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_7step_s4_master_reject_default_deny);
 	UT_RUN(test_7step_transaction_should_globalize_gate);
 	UT_RUN(test_shared_catalog_relation_gate);
+	UT_RUN(test_shared_object_references_conflict_with_remote_drop);
 	UT_RUN(test_7step_transaction_locktag_path_routes_through_cluster);
 	UT_RUN(test_7step_transaction_locktag_release_path_safe);
 	UT_RUN(test_ul_session_advisory_globalize_gate);

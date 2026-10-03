@@ -139,7 +139,7 @@ extern void cluster_xid_stripe_latch_runtime(bool active, int my_slot,
  * padding is stable under the CRC):
  *
  *  - ClusterXidStripeSlotRecord ("PGXS"), one per stripe slot in
- *    voting-disk region 4.  Sole writer is the OWNING node (LMON tick
+ *    voting-disk region 4.  Sole writer is the OWNING node (QVOTEC poll
  *    refreshes next_xid_hwm_full -- the herding carrier), with one
  *    exception: the spec-5.18 removal coordinator cross-writes the
  *    retired flag (region-3 coordinator-writes-joiner-slot precedent).
@@ -154,14 +154,19 @@ extern void cluster_xid_stripe_latch_runtime(bool active, int my_slot,
  *    record in voting-disk region 5.  Written once by the activation
  *    coordinator; stride_mode_epoch is monotonic and never rewinds.
  *
- * Readers treat ANY integrity failure (magic / version / CRC / sanity)
- * as record-absent and fail closed (refuse activation / join / latch);
- * they never guess.  The validators below are pure and unit-tested.
+ * Readers distinguish corrupt/unsupported nonempty bytes from absence and
+ * fail closed (refuse activation / join / latch); they never guess. The
+ * validators below are pure and unit-tested. PGXS v3 binds the durable
+ * reserved ceiling and immutable prior leases; v1/v2 are rejected, not
+ * upgraded in place.
  * ----------------------------------------------------------------
  */
 
 #define CLUSTER_PGXS_MAGIC 0x50475853 /* "PGXS" */
-#define CLUSTER_PGXS_VERSION 1
+#define CLUSTER_PGXS_VERSION 3
+
+/* Full-XID positions per durable reservation (65,536 ids in one stripe). */
+#define CLUSTER_XID_STRIPE_LEASE_SPAN UINT64CONST(1048576)
 
 typedef struct ClusterXidStripeSlotRecord {
 	uint32 magic;	/* CLUSTER_PGXS_MAGIC */
@@ -174,7 +179,16 @@ typedef struct ClusterXidStripeSlotRecord {
 	uint64 next_xid_hwm_full; /* herding high watermark (full-xid U64) */
 	uint64 stride_mode_epoch; /* activation epoch the slot was claimed under */
 	uint64 generation;		  /* monotonic torn-write guard (read newest) */
-	uint32 crc32c;			  /* CRC32C over [magic .. generation] */
+	/* Version 2: one boot's reserved range; ceiling includes unused values.
+	 * All zero until first reservation. This does not reactivate RETIRED. */
+	uint64 lease_floor_full;
+	uint64 issued_limit_full; /* exclusive durable ceiling, never lowered */
+	uint64 lease_incarnation;
+	/* Immutable prior lease images in the same voting authority. Zero means
+	 * no previous nonempty lease; the sequence is never recycled. */
+	uint64 history_generation;
+	uint32 history_crc32c; /* exact predecessor record, covered by this CRC */
+	uint32 crc32c; /* CRC32C over all preceding fields */
 } ClusterXidStripeSlotRecord;
 
 #define CLUSTER_PGXA_MAGIC 0x50475841 /* "PGXA" */

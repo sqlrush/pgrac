@@ -116,6 +116,8 @@ static ClusterInjectPoint cluster_injection_registry[] = {
 	{ .name = "cluster-shared-fs-backend-register" },
 	{ .name = "cluster-shared-fs-init-top" },
 	{ .name = "cluster-shared-fs-local-open" },
+	/* DROP cleanup must preserve caller holdoffs when truncation throws. */
+	{ .name = "cluster-shared-fs-local-truncate" },
 
 	/* Stage 1.2 cluster_smgr (3 entries) */
 	{ .name = "cluster-smgr-create-top" },

@@ -28,18 +28,19 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $source_root = "$FindBin::RealBin/../../../..";
-my $unit_test = "$source_root/src/test/cluster_unit/test_cluster_undo_block0";
+my $build_root = $ENV{top_builddir} // $source_root;
+my $unit_test = "$build_root/src/test/cluster_unit/test_cluster_undo_block0";
 
 PostgreSQL::Test::Utils::command_like(
 	[$unit_test],
-	qr/^1\.\.10\n(?:ok (?:[1-9]|10) - [^\n]+\n){10}\# All 10 tests passed\.\n$/,
-	'R4A local core and fixed-false prerequisite pass in the initial process');
+	qr/^1\.\.58\n(?:ok (?:[1-9]|[1-4][0-9]|5[0-8]) - [^\n]+\n){58}\# All 58 tests passed\.\n$/,
+	'R4A local core and qualified prerequisite pass in the initial process');
 
 # A second real process proves that no prior-process state can promote the
-# fixed-false prerequisite during startup-like re-entry.
+# unbound prerequisite during startup-like re-entry.
 PostgreSQL::Test::Utils::command_like(
 	[$unit_test],
-	qr/^1\.\.10\n(?:ok (?:[1-9]|10) - [^\n]+\n){10}\# All 10 tests passed\.\n$/,
-	'R4A fixed-false prerequisite survives fresh-process startup-like re-entry');
+	qr/^1\.\.58\n(?:ok (?:[1-9]|[1-4][0-9]|5[0-8]) - [^\n]+\n){58}\# All 58 tests passed\.\n$/,
+	'R4A identity and admission checks survive fresh-process startup-like re-entry');
 
 done_testing();

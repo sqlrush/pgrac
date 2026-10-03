@@ -257,10 +257,14 @@ cluster_shared_fs_sharedfs_create(RelFileLocator rlocator, ForkNumber forknum, b
 	 * relation.  Adopting the existing file is the point of a shared-data
 	 * backend; per-relation creation ownership needs the cluster catalog
 	 * protocol (feature #11), not file-level O_EXCL.  isRedo keeps the
-	 * same open-existing behaviour.
+	 * same open-existing behaviour.  With the single shared catalog, however,
+	 * each new relation has one creator: an existing main fork is a candidate
+	 * collision, never evidence that this CREATE owns the file.  Preserve
+	 * auxiliary-fork creation and the legacy per-node-catalog profile.
 	 */
 	vfd = PathNameOpenFile(path, O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
-	if (vfd < 0 && errno == EEXIST) {
+	if (vfd < 0 && errno == EEXIST
+		&& (isRedo || !cluster_shared_catalog || forknum != MAIN_FORKNUM)) {
 		vfd = PathNameOpenFile(path, O_RDWR | PG_BINARY);
 		if (vfd >= 0 && !isRedo)
 			elog(DEBUG1, "cluster_shared_fs.shared_fs: adopting existing shared file \"%s\"", path);
@@ -435,9 +439,12 @@ cluster_shared_fs_sharedfs_unlink(RelFileLocator rlocator, ForkNumber forknum)
 {
 	char *path = cluster_shared_fs_sharedfs_relpath(rlocator, forknum);
 
+	/* Auxiliary post-commit cleanup cannot abort. MAIN keeps the existing
+	 * checkpointer failure contract; any retained fork excludes the locator. */
 	if (unlink(path) < 0 && errno != ENOENT)
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("cluster_shared_fs.shared_fs: could not unlink \"%s\": %m", path)));
+		ereport(forknum == MAIN_FORKNUM ? ERROR : WARNING,
+				(errcode_for_file_access(),
+				 errmsg("cluster_shared_fs.shared_fs: could not unlink \"%s\": %m", path)));
 
 	pfree(path);
 }

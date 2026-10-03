@@ -35,6 +35,7 @@
 #include "common/cryptohash.h"
 #include "port/atomics.h"
 #include "storage/fd.h"
+#include "storage/spin.h"
 #include "utils/timestamp.h"
 #include "unit_test.h"
 

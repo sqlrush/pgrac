@@ -232,6 +232,12 @@ refill_from_authority(Oid *out_start, Oid *out_end)
 
 		cluster_oid_lease_carve(hw, (uint32)cluster_oid_lease_size, out_start, out_end,
 								&new_authority);
+		if (*out_start == InvalidOid)
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("could not allocate a shared OID candidate range"),
+				 errhint("Check the shared OID authority and cluster.oid_lease_size.")));
 
 		/* Advance the durable high-water BEFORE handing out the block. */
 		cluster_oid_authority_write(new_authority);

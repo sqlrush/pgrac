@@ -153,6 +153,11 @@ extern void cluster_mxid_stripe_lazy_latch(void);
  */
 extern FullTransactionId cluster_xid_stripe_my_slot_floor(void);
 
+/* Shared allocation consumes only majority-durable reservations. Waiting
+ * callers must release XidGenLock and rederive the candidate on return. */
+extern bool cluster_xid_stripe_lease_ready(FullTransactionId candidate);
+extern void cluster_xid_stripe_wait_lease(FullTransactionId candidate);
+
 /* D6 observability snapshot consumed by pg_cluster_state (dump keys). */
 typedef struct ClusterXidStripeObs {
 	uint32 disk_state; /* ClusterXidStripeDiskState */
@@ -190,6 +195,13 @@ extern ClusterXidStripeSlotState cluster_xid_stripe_slot_state(void);
  * claimed (the removal driver passes the last admitted incarnation).
  */
 extern bool cluster_xid_stripe_submit_retire(int32 target_node, uint64 owner_incarnation_hint);
+
+/* QVOTEC/recovery reader over the original voting authority. Resolve the
+ * exact reserved full-XID interval, including retired/unused historical
+ * ranges. This grants neither visibility nor permission to reuse an XID.
+ * On missing/conflicting evidence leave *out_incarnation unchanged. */
+extern bool cluster_xid_stripe_lookup_incarnation_fds(const int *fds, int n_disks,
+	FullTransactionId xid, uint64 *out_incarnation);
 
 /* qvotec self-incarnation accessor (the canonical durable identity
  * seed this boot presents; consumed by the D5c slot claim). */

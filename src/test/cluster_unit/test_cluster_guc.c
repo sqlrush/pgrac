@@ -50,6 +50,7 @@
 #include <stdarg.h>
 #include <sys/un.h>
 
+#include "access/xlog.h"
 #include "common/relpath.h"
 #include "cluster/cluster_conf.h" /* ClusterConf type for the D2b latch stub */
 #include "cluster/cluster_guc.h"
@@ -89,6 +90,7 @@
 #include "cluster/cluster_cold_recovery.h"
 
 extern int cluster_undo_buffers;
+char *DataDir = NULL;
 
 /* Storage belongs to the startup owner; this fixture tests registration. */
 int cluster_cold_recovery_plan_memory = CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB;
@@ -234,6 +236,7 @@ DefineCustomStringVariable(const char *name, const char *short_desc pg_attribute
 }
 
 static GucBoolCheckHook smart_fusion_check_hook = NULL;
+int wal_level = WAL_LEVEL_REPLICA;
 static bool *smart_fusion_value_addr = NULL;
 static bool smart_fusion_boot_value = true;
 static GucContext smart_fusion_context = PGC_INTERNAL;
@@ -289,15 +292,41 @@ pg_snprintf(char *str, size_t count, const char *fmt, ...)
 	return ret;
 }
 
+static int last_reported_level;
+static sigjmp_buf expected_fatal_jmp;
+static bool expect_fatal;
+
 bool
-errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart(int elevel, const char *domain pg_attribute_unused())
 {
+	last_reported_level = elevel;
+	if (elevel >= FATAL) {
+		if (expect_fatal)
+			siglongjmp(expected_fatal_jmp, 1);
+		abort();
+	}
 	return false; /* never starts an ereport in this test */
+}
+
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
 }
 void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
 {}
+int
+errcode(int sqlerrcode pg_attribute_unused())
+{
+	return 0;
+}
+int
+errcode_for_file_access(void)
+{
+	return 0;
+}
 int
 errmsg(const char *fmt pg_attribute_unused(), ...)
 {
@@ -718,13 +747,55 @@ UT_TEST(test_cold_plan_memory_guc_bounds_and_startup_owner)
 	UT_ASSERT_EQ(cold_plan_flags, GUC_UNIT_KB);
 }
 
+UT_TEST(test_shared_catalog_requires_wal_for_new_files)
+{
+	wal_level = WAL_LEVEL_MINIMAL;
+	cluster_shared_catalog = true;
+	last_reported_level = 0;
+	expect_fatal = true;
+	if (sigsetjmp(expected_fatal_jmp, 1) == 0) {
+		cluster_init_guc();
+		UT_ASSERT(false);
+	}
+	expect_fatal = false;
+	UT_ASSERT_EQ(last_reported_level, FATAL);
+	cluster_shared_catalog = false;
+	last_reported_level = 0;
+	cluster_init_guc();
+	UT_ASSERT_EQ(last_reported_level, 0);
+	wal_level = WAL_LEVEL_REPLICA;
+	cluster_shared_catalog = true;
+	cluster_shared_config = true;
+	last_reported_level = 0;
+	cluster_init_guc();
+	UT_ASSERT_EQ(last_reported_level, 0);
+	cluster_shared_catalog = false;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_shared_catalog_requires_durable_checkpoint_publication)
+{
+	wal_level = WAL_LEVEL_REPLICA;
+	cluster_shared_config = false;
+	cluster_shared_catalog = true;
+	last_reported_level = 0;
+	expect_fatal = true;
+	if (sigsetjmp(expected_fatal_jmp, 1) == 0) {
+		cluster_init_guc();
+		UT_ASSERT(false);
+	}
+	expect_fatal = false;
+	UT_ASSERT_EQ(last_reported_level, FATAL);
+	cluster_shared_catalog = false;
+}
+
 int
 main(void)
 {
 #ifdef ENABLE_INJECTION
-	UT_PLAN(10);
+	UT_PLAN(12);
 #else
-	UT_PLAN(9);
+	UT_PLAN(11);
 #endif
 	UT_RUN(test_cluster_node_id_default_is_minus_one);
 	UT_RUN(test_cluster_node_id_address_stable);
@@ -735,6 +806,8 @@ main(void)
 	UT_RUN(test_smart_fusion_guc_is_guarded_failclosed);
 	UT_RUN(test_external_fence_guc_contract);
 	UT_RUN(test_cold_plan_memory_guc_bounds_and_startup_owner);
+	UT_RUN(test_shared_catalog_requires_wal_for_new_files);
+	UT_RUN(test_shared_catalog_requires_durable_checkpoint_publication);
 #ifdef ENABLE_INJECTION
 	UT_RUN(test_pcm_x_retain_flush_error_target_guc_contract);
 #endif

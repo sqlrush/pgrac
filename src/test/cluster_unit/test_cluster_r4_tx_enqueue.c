@@ -792,6 +792,25 @@ UT_TEST(test_live_post_registration_terminal_race_resolves)
 	assert_slot_clean();
 }
 
+UT_TEST(test_parallel_tx_wait_preserves_group_and_exact_cancel_identity)
+{
+	ClusterTxLocator locator = test_locator();
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	reset_fixture();
+	test_procs[1].pgprocno = 1;
+	MyProc->lockGroupLeader = &test_procs[1];
+	script_resolve(0, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_RESOLVE_NONE);
+	script_resolve(1, CLUSTER_TX_ABORTED, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_exact(&locator, 1000, &reason), CLUSTER_TXW_RESOLVED);
+	UT_ASSERT_EQ(test_wfg_waiter.procno, 0);
+	UT_ASSERT_EQ(test_wfg_waiter.lock_group_procno_plus_one, 2);
+	UT_ASSERT_EQ(test_wfg_blocker.lock_group_procno_plus_one, 0);
+	UT_ASSERT_EQ(test_wfg_exact_cancel_calls, 1);
+	UT_ASSERT_EQ(test_wfg_last_remove_result, CLUSTER_LMD_GRAPH_REMOVE_REMOVED);
+	assert_slot_clean();
+}
+
 UT_TEST(test_prepared_waits_and_lost_wakes_only_repoll)
 {
 	ClusterTxLocator locator = test_locator();
@@ -1655,7 +1674,8 @@ UT_TEST(test_backend_exit_counter_underflow_fails_stop_without_freeing_slot)
 int
 main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(44);
+	UT_RUN(test_parallel_tx_wait_preserves_group_and_exact_cancel_identity);
 	UT_RUN(test_exact_wait_abi_and_shmem_size_are_frozen);
 	UT_RUN(test_fixed_false_precedes_malformed_and_shared_state);
 	UT_RUN(test_initial_terminal_never_registers);

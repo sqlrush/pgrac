@@ -156,8 +156,8 @@ ok(1, 'L1b single cluster node boots');
 # Dump surface exists and is all-zero while the GUC is off.
 my $key_count = $solo->safe_psql('postgres',
 	"SELECT count(*) FROM pg_cluster_state WHERE category='xnode_profile'");
-is($key_count, '121',
-	'xnode_profile dump surface: 121 keys (28 buckets x2 + 5 probes + 5 hist components x 12 μs buckets)');
+is($key_count, '145',
+	'xnode_profile dump surface: 145 keys (40 buckets x2 + 5 probes + 5 hist components x 12 μs buckets)');
 # spec-7.4 D4: commit-latency histogram keys present (5 components x 12 buckets).
 my $hist_key_count = $solo->safe_psql('postgres',
 	"SELECT count(*) FROM pg_cluster_state WHERE category='xnode_profile' AND key LIKE 'hist.%'");

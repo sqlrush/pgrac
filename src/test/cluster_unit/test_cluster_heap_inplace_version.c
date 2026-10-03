@@ -41,7 +41,7 @@
 
 UT_DEFINE_GLOBALS();
 bool cluster_enabled = true, cluster_shared_config = true;
-int cluster_node_id, wal_level = WAL_LEVEL_REPLICA, NBuffers = 1, NLocBuffer;
+int cluster_node_id = 0, wal_level = WAL_LEVEL_REPLICA, NBuffers = 1, NLocBuffer;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
 volatile uint32 CritSectionCount;
