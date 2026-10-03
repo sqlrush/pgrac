@@ -43,6 +43,7 @@
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -474,7 +475,8 @@ lms_outbound_resource_x_intent_valid(const ResourceXIntentSlot *intent)
 	case RESOURCE_X_INTENT_OWNER_HOLDER_STATUS:
 		return (intent->payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
 				|| intent->payload_bytes == RESOURCE_X_PROOF_V1_BYTES)
-			   && intent->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+			   && (intent->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+				   || intent->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
 			   && intent->body.owner_generation == intent->logical_generation
 			   && intent->body.owner_index == 0;
 	case RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE:
@@ -516,6 +518,7 @@ lms_outbound_resource_x_intent_msg_type(const ResourceXIntentSlot *intent)
 	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2:
 		return RESOURCE_X_MSG_BLOCK_TO_N;
 	case RESOURCE_X_WIRE_BLOCKED_TO_N:
+	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2:
 		return RESOURCE_X_MSG_BLOCKED_TO_N;
 	case RESOURCE_X_WIRE_AUTHORITY_GRANT:
 	case RESOURCE_X_WIRE_IMAGE_ENVELOPE:
@@ -583,20 +586,31 @@ cluster_lms_outbound_enqueue_resource_x_intent(int worker_id, const ResourceXInt
 	}
 	{
 		ResourceXIntentResult stage_result;
+		ResourceXIntentSlot staged;
 
-		stage_result = cluster_pcm_lock_resource_x_outbound_intent_stage_exact(intent, now_us);
+		stage_result = cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(
+			intent, now_us, &staged);
 		if (stage_result != RESOURCE_X_INTENT_STAGED) {
 			memset(slot, 0, sizeof(*slot));
 			LWLockRelease(lock);
 			return stage_result == RESOURCE_X_INTENT_NOT_DUE ? CLUSTER_LMS_ENQUEUE_NOT_DUE
 															 : CLUSTER_LMS_ENQUEUE_INVALID;
 		}
+		/* The ring carries the acquired episode, not the pre-stage snapshot. */
+		memcpy(slot->payload, &staged, sizeof(staged));
 	}
 	ring->head = (ring->head + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
 	ring->count++;
 	LWLockRelease(lock);
 	cluster_lms_wakeup(worker_id);
 	return CLUSTER_LMS_ENQUEUE_ADMITTED;
+}
+
+void
+cluster_lms_outbound_resource_x_send_complete(const ResourceXIntentSlot *intent, bool sent)
+{
+	(void)cluster_pcm_lock_resource_x_outbound_transport_complete_exact(
+		intent, sent, lms_outbound_monotonic_us());
 }
 
 int
@@ -634,6 +648,10 @@ cluster_lms_outbound_resource_x_intent_pump(void)
 			/* A local callback is not a packet and consumes the same bounded
 			 * call budget. BUSY waits for the existing event-loop tick. */
 			(void)cluster_gcs_block_resource_x_delivery_tick(&delivery);
+			continue;
+		}
+		if (probe_result == RESOURCE_X_INTENT_PROBE_SOURCE_SETTLEMENT) {
+			(void)cluster_gcs_block_resource_x_source_settlement_tick(&delivery);
 			continue;
 		}
 		if (probe_result == RESOURCE_X_INTENT_PROBE_SOURCE_FINISH) {
@@ -928,6 +946,8 @@ cluster_lms_outbound_drain_send(int worker_id)
 					sizeof(resource_x_payload))
 					!= RESOURCE_X_APPLY_APPLIED
 				|| resource_x_current.state != RESOURCE_X_INTENT_SLOT_STAGED
+				|| resource_x_current.send_episode != resource_x_intent.send_episode
+				|| resource_x_current.last_attempt_us != resource_x_intent.last_attempt_us
 				|| !lms_outbound_resource_x_intent_identity_equal(&resource_x_intent,
 																  &resource_x_current))
 				continue;
@@ -1039,7 +1059,11 @@ cluster_lms_outbound_drain_send(int worker_id)
 				rc = CLUSTER_IC_SEND_DONE;
 			else
 				rc = CLUSTER_IC_SEND_HARD_ERROR;
-		} else
+		} else if (resource_x_slot)
+			rc = cluster_ic_tier1_send_resource_x_intent(slot.msg_type, (int32)slot.dest_node_id,
+														 send_payload, send_payload_len,
+														 &resource_x_intent);
+		else
 			rc = cluster_ic_send_envelope(slot.msg_type, (int32)slot.dest_node_id, send_payload,
 										  send_payload_len);
 
@@ -1054,14 +1078,10 @@ cluster_lms_outbound_drain_send(int worker_id)
 		case CLUSTER_IC_SEND_DONE:
 		case CLUSTER_IC_SEND_WOULD_BLOCK:
 			/* On the wire or admitted (transport owns a copy). */
-			if (resource_x_slot) {
-				if (resource_x_intent.body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE)
-					(void)cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
-						&resource_x_intent, lms_outbound_monotonic_us());
-				else
-					(void)cluster_pcm_lock_resource_x_outbound_intent_complete_exact(
-						&resource_x_intent);
-			}
+			/* WB is still owned by the exact tier1 tail/FIFO.  It completes
+			 * through the same callback only after all bytes leave that owner. */
+			if (resource_x_slot && rc == CLUSTER_IC_SEND_DONE)
+				cluster_lms_outbound_resource_x_send_complete(&resource_x_intent, true);
 			if (remote_s_status_slot) {
 				LWLockAcquire(lock, LW_EXCLUSIVE);
 				if (ring->count == 0 || memcmp(&ring->ring[ring->tail], &slot, sizeof(slot)) != 0) {

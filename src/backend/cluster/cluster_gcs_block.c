@@ -13532,12 +13532,13 @@ gcs_block_resource_x_requester_terminal_try(const ClusterICEnvelope *env,
 /* PGRAC adaptation: SourceSettlementV2 consumes only the exact retained
  * type-18/type-15 pair selected by the authenticated master.  Entry-lock
  * prepare/commit bracket, but never overlap, the BufferDesc release.  The
- * response is an ordinary unretained typed ACK; a full outbound queue is
- * healed by the master's still-retained kind-10 debt replay. */
+ * received request stays owned across BUSY, and the typed ACK uses the
+ * drained holder status send slot until transport completion. */
 static ResourceXApplyResult
-gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
-											   const ResourceXDecodedFrame *settlement,
-											   uint32 sender_connection_generation)
+gcs_block_resource_x_source_settlement_run(const ClusterICEnvelope *env,
+										   const ResourceXDecodedFrame *settlement,
+										   uint32 sender_connection_generation,
+										   volatile uint64 *claim)
 {
 	ResourceXDecodedFrame ack;
 	ResourceXSourceSettlementPlan plan;
@@ -13552,6 +13553,7 @@ gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
 	bool carrier_release_complete = false;
 	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
 	uint16 payload_bytes = 0;
+	uint64 acquired_claim = 0;
 
 	if (env == NULL || settlement == NULL
 		|| settlement->kind != RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
@@ -13561,8 +13563,12 @@ gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
 	memset(&plan, 0, sizeof(plan));
 	memset(&commit_observation, 0, sizeof(commit_observation));
 	memset(&prepare_observation, 0, sizeof(prepare_observation));
-	result = cluster_pcm_lock_resource_x_source_settlement_prepare_observed_exact(
-		settlement, (int32)env->source_node_id, &plan, &prepare_observation);
+	result = cluster_pcm_lock_resource_x_source_settlement_receive_begin_exact(
+		settlement, (int32)env->source_node_id, sender_connection_generation, &plan,
+		&prepare_observation, &acquired_claim);
+	*claim = acquired_claim;
+	if (result == RESOURCE_X_APPLY_DUPLICATE && acquired_claim == 0)
+		return result; /* The existing exact ACK still owns its send episode. */
 	if (result == RESOURCE_X_APPLY_APPLIED && !plan.valid) {
 		gcs_block_resource_x_source_settlement_failure_record(
 			settlement, &prepare_observation, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_PREPARE,
@@ -13653,8 +13659,12 @@ gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
 		gcs_block_resource_x_fail_closed_current();
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
-	ack_enqueued = cluster_grd_outbound_enqueue_backend_msg(
-		RESOURCE_X_MSG_BLOCKED_TO_N, env->source_node_id, payload, payload_bytes);
+	ack_enqueued = cluster_pcm_lock_resource_x_source_settlement_receive_end_exact(
+		&settlement->common.logical_assertion, *claim, &ack);
+	if (!ack_enqueued) {
+		gcs_block_resource_x_fail_closed_current();
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
 	if ((result == RESOURCE_X_APPLY_APPLIED || !ack_enqueued)
 		&& ((result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
 			|| !ack_enqueued
@@ -13669,6 +13679,52 @@ gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
 						   (unsigned long long)plan.source_generation, ack_enqueued ? 1U : 0U,
 						   sender_connection_generation)));
 	return result;
+}
+
+/* Only one ingress/tick owns physical release. Every unwind returns that
+ * local claim; it never drops the received request or the retained pair. */
+static ResourceXApplyResult
+gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
+											   const ResourceXDecodedFrame *settlement,
+											   uint32 sender_connection_generation)
+{
+	volatile uint64 claim = 0;
+	ResourceXApplyResult result;
+	PG_TRY();
+	{
+		result = gcs_block_resource_x_source_settlement_run(env, settlement,
+															sender_connection_generation, &claim);
+	}
+	PG_FINALLY();
+	{
+		if (claim != 0)
+			(void)cluster_pcm_lock_resource_x_source_settlement_receive_end_exact(
+				&settlement->common.logical_assertion, claim, NULL);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+ResourceXApplyResult
+cluster_gcs_block_resource_x_source_settlement_tick(const ResourceXAcquisitionRef *ref)
+{
+	ResourceXDecodedFrame request;
+	ClusterICEnvelope env = { 0 };
+	int32 master;
+	uint32 received_generation, current_generation;
+	ResourceXApplyResult result;
+	if (MyBackendType != B_LMS)
+		return RESOURCE_X_APPLY_INVALID;
+	result = cluster_pcm_lock_resource_x_source_settlement_receive_snapshot_exact(
+		ref, &request, &master, &received_generation);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	if (!gcs_block_pcm_x_resource_x_peer_ready_exact(master, &current_generation)
+		|| current_generation != received_generation)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	env.source_node_id = master;
+	env.dest_node_id = cluster_node_id;
+	return gcs_block_resource_x_source_settlement_ingress(&env, &request, current_generation);
 }
 
 /* Consume the exact Resource-X subdomain before any reused legacy parser.

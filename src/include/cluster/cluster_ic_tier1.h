@@ -405,6 +405,13 @@ typedef struct ClusterICTier1Stream {
 extern bool cluster_ic_tier1_stream_capture(int32 peer, ClusterICTier1Stream *out);
 extern bool cluster_ic_tier1_stream_current(const ClusterICTier1Stream *stream);
 
+/* Process-local completion owner, copied with the DATA tail/FIFO; no wire fields. */
+struct ResourceXIntentSlot;
+extern ClusterICSendResult
+cluster_ic_tier1_send_resource_x_intent(uint8 msg_type, int32 dest_node_id, const void *payload,
+										uint32 payload_len,
+										const struct ResourceXIntentSlot *intent);
+
 /*
  * Hardening v1.0.1 F3: listener metadata accessors -- read from shmem
  * (visible to any backend; not the fd itself which is process-local).

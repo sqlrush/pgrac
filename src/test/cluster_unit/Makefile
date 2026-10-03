@@ -4728,7 +4728,15 @@ test_cluster_pcm_lms_intent_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^gcs_block_resource_x_source_settlement_(run|ingress)\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
+	     /^cluster_gcs_block_resource_x_source_settlement_tick\(/ { print "ResourceXApplyResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (count != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
+		test_cluster_pcm_settlement_ingress.inc \
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
 		test_cluster_pcm_stop_fields.inc \

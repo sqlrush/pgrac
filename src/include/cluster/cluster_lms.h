@@ -90,6 +90,10 @@
 #include "cluster/cluster_lms_shard.h" /* CLUSTER_LMS_MAX_WORKERS (spec-7.3) */
 #include "cluster/cluster_pcm_own.h"
 
+struct ResourceXIntentSlot;
+extern void cluster_lms_outbound_resource_x_send_complete(const struct ResourceXIntentSlot *intent,
+														  bool sent);
+
 
 /*
  * ClusterLmsState -- HC2 4-state semantic SSOT.

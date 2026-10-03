@@ -4609,6 +4609,8 @@ cluster_gcs_resource_x_target_itl_recycle_cancel_exact(const ResourceXLocalOwner
  * ============================================================ */
 extern void cluster_gcs_block_on_epoch_advance(uint64 new_epoch);
 extern void cluster_gcs_block_on_epoch_advance_exact(uint64 new_epoch, const uint8 *dead_bitmap);
+extern ResourceXApplyResult
+cluster_gcs_block_resource_x_source_settlement_tick(const ResourceXAcquisitionRef *ref);
 extern bool cluster_gcs_block_resource_x_cutover_tick(void);
 extern bool cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch);
 extern void cluster_gcs_ctrc_dispatch_batch(const ClusterCtrcCloseDispatch *dispatches, Size count);

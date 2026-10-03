@@ -51,6 +51,7 @@
 
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic.h"
+#include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope prototype */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_clean_leave.h"
@@ -217,6 +218,7 @@ cluster_pcm_lock_resource_x_grant_intent_stage_exact(const ResourceXIntentSlot *
 		return RESOURCE_X_INTENT_STALE;
 	ut_resource_x_owner_slot.state = RESOURCE_X_INTENT_SLOT_STAGED;
 	ut_resource_x_owner_slot.last_attempt_us = now_us;
+	ut_resource_x_owner_slot.send_episode++;
 	ut_resource_x_stage_count++;
 	return RESOURCE_X_INTENT_STAGED;
 }
@@ -315,6 +317,14 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 }
 
 ResourceXApplyResult
+cluster_gcs_block_resource_x_source_settlement_tick(const ResourceXAcquisitionRef *ref)
+{
+	(void)ref;
+	UT_ASSERT(false);
+	return RESOURCE_X_APPLY_BAD_STATE;
+}
+
+ResourceXApplyResult
 cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *ref)
 {
 	UT_ASSERT_EQ(ref->formation, UINT64_C(17));
@@ -343,6 +353,40 @@ cluster_pcm_lock_resource_x_outbound_intent_stage_exact(const ResourceXIntentSlo
 	if (ut_resource_x_stage_not_due)
 		return RESOURCE_X_INTENT_NOT_DUE;
 	return cluster_pcm_lock_resource_x_grant_intent_stage_exact(expected, now_us);
+}
+
+ResourceXIntentResult
+cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(const ResourceXIntentSlot *expected,
+																uint64 now_us,
+																ResourceXIntentSlot *staged_out)
+{
+	ResourceXIntentResult result
+		= cluster_pcm_lock_resource_x_outbound_intent_stage_exact(expected, now_us);
+	if (result == RESOURCE_X_INTENT_STAGED && staged_out != NULL)
+		*staged_out = ut_resource_x_owner_slot;
+	return result;
+}
+
+bool
+cluster_pcm_lock_resource_x_outbound_transport_complete_exact(const ResourceXIntentSlot *expected,
+															  bool sent, uint64 now_us)
+{
+	if (expected->send_episode != ut_resource_x_owner_slot.send_episode
+		|| expected->last_attempt_us != ut_resource_x_owner_slot.last_attempt_us)
+		return false;
+	if (!sent || expected->body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE)
+		return cluster_pcm_lock_resource_x_grant_intent_hard_rearm_exact(expected, now_us)
+			   == RESOURCE_X_INTENT_HARD_REARMED;
+	return cluster_pcm_lock_resource_x_grant_intent_complete_exact(expected);
+}
+
+ClusterICSendResult
+cluster_ic_tier1_send_resource_x_intent(uint8 msg_type, int32 dest_node_id, const void *payload,
+										uint32 payload_len, const ResourceXIntentSlot *intent)
+{
+	UT_ASSERT_EQ(intent->state, RESOURCE_X_INTENT_SLOT_STAGED);
+	UT_ASSERT(intent->send_episode != 0);
+	return cluster_ic_send_envelope(msg_type, dest_node_id, payload, payload_len);
 }
 
 ResourceXIntentResult
@@ -1461,7 +1505,7 @@ UT_TEST(test_resource_x_settlement_intent_uses_type38_and_short_payload)
 	UT_ASSERT_EQ(ut_resource_x_complete_count, 1);
 }
 
-UT_TEST(test_resource_x_holder_release_transport_rearms_until_typed_ack)
+UT_TEST(test_resource_x_holder_release_transport_waits_for_actual_send)
 {
 	ResourceXIntentSlot intent;
 	int partial;
@@ -1482,9 +1526,10 @@ UT_TEST(test_resource_x_holder_release_transport_rearms_until_typed_ack)
 		UT_ASSERT_EQ(ut_sent_log[0].msg_type, RESOURCE_X_MSG_BLOCK_TO_N);
 		UT_ASSERT_EQ(ut_sent_log[0].payload_len, RESOURCE_X_PROOF_V1_BYTES);
 		UT_ASSERT_EQ(ut_sent_log[0].marker, 0xAC);
-		UT_ASSERT_EQ(ut_resource_x_rearm_count, 1);
+		UT_ASSERT_EQ(ut_resource_x_rearm_count, partial ? 0 : 1);
 		UT_ASSERT_EQ(ut_resource_x_complete_count, 0);
-		UT_ASSERT_EQ(ut_resource_x_owner_slot.state, RESOURCE_X_INTENT_SLOT_ARMED);
+		UT_ASSERT_EQ(ut_resource_x_owner_slot.state,
+					 partial ? RESOURCE_X_INTENT_SLOT_STAGED : RESOURCE_X_INTENT_SLOT_ARMED);
 	}
 }
 
@@ -2084,7 +2129,7 @@ main(void)
 	UT_RUN(test_resource_x_intent_admission_stages_and_completion_clears_owner);
 	UT_RUN(test_resource_x_block_intent_uses_type17_and_control_payload);
 	UT_RUN(test_resource_x_settlement_intent_uses_type38_and_short_payload);
-	UT_RUN(test_resource_x_holder_release_transport_rearms_until_typed_ack);
+	UT_RUN(test_resource_x_holder_release_transport_waits_for_actual_send);
 	UT_RUN(test_resource_x_source_settlement_ack_fits_ordinary_data_ring);
 	UT_RUN(test_resource_x_image_intent_rebinds_transport_generation);
 	UT_RUN(test_resource_x_intent_transport_refusal_rearms_without_ring_copy);
