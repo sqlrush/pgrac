@@ -713,7 +713,8 @@ test_cluster_ts: test_cluster_ts.c unit_test.h $(CLUSTER_VERSION_O) \
 # hook.
 CLUSTER_KO_O = $(top_builddir)/src/backend/cluster/cluster_ko.o
 test_cluster_ko: test_cluster_ko.c unit_test.h $(CLUSTER_VERSION_O) \
-		$(CLUSTER_KO_O) $(CLUSTER_DL_O) $(CLUSTER_IR_O) $(CLUSTER_HW_O)
+		$(CLUSTER_KO_O) $(CLUSTER_DL_O) $(CLUSTER_IR_O) $(CLUSTER_HW_O) \
+		$(top_srcdir)/src/include/cluster/cluster_ko.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_KO_O) $(CLUSTER_DL_O) $(CLUSTER_IR_O) $(CLUSTER_HW_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
