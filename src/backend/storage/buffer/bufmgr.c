@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #include "access/tableam.h"
+#include "access/xact.h"
 #include "access/xlog.h"		/* PGRAC (spec-6.14 D8): GetXLogInsertRecPtr */
 #ifdef USE_PGRAC_CLUSTER
 #include "access/transam.h"		/* FirstNormalObjectId */
@@ -11264,6 +11265,45 @@ cluster_page_data_space_key(const ClusterPageDataReceiptV1 *receipt)
 	key.locator = receipt->target.identity.locator;
 	memcpy(key.storage_uuid, receipt->target.identity.storage_uuid, 16);
 	return key;
+}
+
+bool
+cluster_page_structural_record_v1(const ClusterPageWalBindingV1 *binding,
+	const uint8 retired_incarnation[16], const ClusterThreadRecoveryFabricPlanV1 *plan,
+	ClusterSpaceStructureChange *out)
+{
+	ClusterSpaceIdentityKey key = {0};
+	RfSideSpaceIncarnationEndV1 ended;
+	uint32 operation;
+	bool truncate;
+
+	if (binding == NULL || retired_incarnation == NULL || out == NULL
+		|| binding->flags != CLUSTER_PAGE_WAL_NATIVE_FLUSHED
+		|| binding->identity.forknum != SPACE_FORKNUM || binding->identity.blockno != 0)
+		return false;
+	truncate = binding->rmid == RM_SMGR_ID
+		&& (binding->info & ~XLR_INFO_MASK) == XLOG_SMGR_SPACE_IDENTITY;
+	if (!truncate && !(binding->rmid == RM_XACT_ID
+		&& (binding->info & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT
+		&& (binding->info & XLOG_XACT_HAS_INFO) != 0))
+		return false;
+	if (!cluster_page_data_space_operation(plan, binding, &operation))
+		return false;
+	key.system_identifier = binding->identity.system_identifier;
+	key.database_incarnation = binding->source.claim.database_incarnation;
+	key.locator = binding->identity.locator;
+	memcpy(key.storage_uuid, binding->identity.storage_uuid, 16);
+	if (!rf_side_online_plan_space_incarnation_end_v1(
+		cluster_thread_recovery_fabric_side_plan_v1(plan), &key, retired_incarnation,
+		operation, &ended) || ended.operation != operation
+		|| ended.change.identity.action != (truncate ? CLUSTER_SPACE_WAL_TRUNCATE
+			: CLUSTER_SPACE_WAL_TOMBSTONE))
+		return false;
+	/* A later structural record can cover an older end in the pure SIDE
+	 * query. A receipt must bind the original end itself, not that successor.
+	 * Its physical and per-PI obligations remain with the original owner. */
+	*out = ended.change;
+	return true;
 }
 
 bool

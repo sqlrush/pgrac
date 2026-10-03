@@ -115,6 +115,16 @@ rf_side_online_plan_space_terminal_v1(const RfSideOnlinePlanV1 *plan,
 	return false;
 }
 
+bool
+rf_side_online_plan_space_incarnation_end_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterSpaceIdentityKey *key, const uint8 incarnation[16], uint32 completed_operation,
+	RfSideSpaceIncarnationEndV1 *out)
+{
+	/* Structural ancestry executes against the real SIDE planner in page_data.
+	 * This transport fixture cannot fabricate a structural completion. */
+	return false;
+}
+
 uint32
 rf_side_online_plan_space_contribution_count_v1(const RfSideOnlinePlanV1 *plan, uint32 index)
 {

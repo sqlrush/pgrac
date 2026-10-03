@@ -44,6 +44,19 @@ extern bool cluster_page_data_receipt_read_v1(const ClusterPageDataReceiptV1 *re
 extern void cluster_page_data_receipt_free_v1(ClusterPageDataReceiptV1 **receipt);
 
 struct ClusterThreadRecoveryFabricPlanV1;
+struct ClusterPageWalBindingV1;
+struct ClusterSpaceStructureChange;
+
+/* Resolve a structural SPACE0 binding to the original TRUNCATE or ordinary
+ * COMMIT-DROP ending retired_incarnation in this receiver's sealed input.
+ * Full original claim/record and retained SPACE ancestry are required.
+ * Returns the actual decoded change; refusal preserves output. This pure
+ * query proves neither physical durability, KO, per-PI PAGE ancestry nor
+ * retirement, and never grants disposal from an untrusted wire value. */
+extern bool cluster_page_structural_record_v1(const struct ClusterPageWalBindingV1 *binding,
+	const uint8 retired_incarnation[16], const struct ClusterThreadRecoveryFabricPlanV1 *plan,
+	struct ClusterSpaceStructureChange *out);
+
 /* Bind typed SPACE DATA to its exact original contribution and complete
  * retained ancestry. Ordinary PAGE receipts keep their existing proof path.
  * The caller must retain this immutable plan until all receipts/ACKs using
