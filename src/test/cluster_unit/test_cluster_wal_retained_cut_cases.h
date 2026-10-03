@@ -123,7 +123,7 @@ UT_TEST(test_retained_cut_keyless_side_classes)
 }
 
 /* A SPACE contribution is keyed by its block: a peer obligation on the
- * relation's SPACE block 0 keeps self's history SPACE edge. */
+ * relation's reservation block keeps self's history reservation edge. */
 UT_TEST(test_retained_cut_space_obligation_keeps_space_history)
 {
 	uint32 self, peer;
@@ -138,6 +138,55 @@ UT_TEST(test_retained_cut_space_obligation_keeps_space_history)
 	UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	UT_ASSERT_EQ(cut.lower, 0x1c00);
 	UT_ASSERT_EQ(cut.pin, CLUSTER_WAL_RETAINED_PIN_PAGE);
+}
+
+/* Until structural PI retirement is durable (CR20), a history record that
+ * changes a relation's SPACE structure (block 0: CREATE, TRUNCATE, a DROP
+ * tombstone, a COMMIT's drops) holds the lower at itself with no obligation
+ * at all; a reservation alone does not, nor a structure change that is
+ * still an obligation.  The earliest reason wins; a tie reports STRUCTURE. */
+UT_TEST(test_retained_cut_structure_change_pins_history)
+{
+	for (int variant = 0; variant < 6; variant++) {
+		uint32 self, peer;
+		ClusterWalRetainedCutV1 cut;
+		RfPageProofDetailV1 detail;
+		FixtureRecord *r;
+		XLogRecPtr expected = 0x1c00;
+		ClusterWalRetainedPinV1 pin = CLUSTER_WAL_RETAINED_PIN_STRUCTURE;
+
+		two_writers(&self, &peer);
+		add_record(self, 0x1000, 0x1100, 100, 1, 2);
+		r = add_record(self, 0x1c00, 0x1d00, InvalidOid, 0, 3);
+		r->space_rel = 900;
+		r->space_mask = 3;
+		if (variant == 0) { /* a later structure change does not move it */
+			r = add_record(self, 0x2400, 0x2500, InvalidOid, 0, 4);
+			r->space_rel = 902;
+			r->space_mask = 3;
+		} else if (variant == 1) /* the drops of a COMMIT */
+			r->owners = RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL;
+		else if (variant == 2) { /* a reservation is not a structure change */
+			r->space_mask = 2;
+			expected = SELF_REDO;
+			pin = CLUSTER_WAL_RETAINED_PIN_NONE;
+		} else if (variant == 3) { /* still an obligation: released later */
+			r->read = SELF_REDO;   /* starts exactly at the native redo */
+			r->end = SELF_REDO + 0x100;
+			expected = SELF_REDO;
+			pin = CLUSTER_WAL_RETAINED_PIN_NONE;
+		} else if (variant == 4) { /* an earlier page pin is the bound */
+			add_record(peer, 0x6000, 0x6100, 100, 4, 5);
+			expected = 0x1000;
+			pin = CLUSTER_WAL_RETAINED_PIN_PAGE;
+		} else if (variant == 5) /* same record also pinned by its page */
+			add_record(peer, 0x6000, 0x6100, InvalidOid, 0, 5)->space_rel = 900;
+		UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(cut.lower, expected);
+		UT_ASSERT_EQ(cut.pin, pin);
+		if (ut_current_failed)
+			printf("# structure variant %d\n", variant);
+	}
 }
 
 /* RECOVERY_COMPLETE and CLOSED inputs are history to their tails and never
@@ -307,6 +356,20 @@ UT_TEST(test_retained_cut_driver_publishes_only_an_advance)
 	cluster_wal_retained_cut_after_checkpoint_v1();
 	UT_ASSERT_EQ(publish_calls, 3);
 	UT_ASSERT_EQ(log_count, 2);
+	/* A retained structure change holds the lower: one LOG for it. */
+	publish_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	{
+		FixtureRecord *r = add_record(self, 0x1000, 0x1080, InvalidOid, 0, 9);
+
+		r->space_rel = 901;
+		r->space_mask = 3;
+	}
+	cluster_wal_retained_cut_after_checkpoint_v1();
+	cluster_wal_retained_cut_after_checkpoint_v1();
+	UT_ASSERT_EQ(publish_calls, 3);
+	UT_ASSERT_EQ(log_count, 3);
+	UT_ASSERT_EQ(retained_structure_pins, 2);
+	nrecords = 1;
 	/* Not the checkpointer, or shutting down: nothing at all. */
 	MyAuxProcType = NotAnAuxProcess;
 	cluster_wal_retained_cut_after_checkpoint_v1();

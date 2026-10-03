@@ -39,7 +39,9 @@ typedef enum ClusterWalRetainedPinV1 {
 	/* A page or SPACE block with an obligation still needs this history. */
 	CLUSTER_WAL_RETAINED_PIN_PAGE = 1,
 	/* A SIDE owner class without per-key ancestry had an obligation. */
-	CLUSTER_WAL_RETAINED_PIN_SIDE = 2
+	CLUSTER_WAL_RETAINED_PIN_SIDE = 2,
+	/* A relation CREATE/TRUNCATE/DROP in retained history (until CR20). */
+	CLUSTER_WAL_RETAINED_PIN_STRUCTURE = 3
 } ClusterWalRetainedPinV1;
 
 typedef struct ClusterWalRetainedCutV1 {

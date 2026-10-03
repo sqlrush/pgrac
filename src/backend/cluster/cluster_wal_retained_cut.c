@@ -15,7 +15,11 @@
  *	  A history record is still needed when an obligation touches the same
  *	  page or SPACE block (the PAGE dependency rule of the online plan, see
  *	  rf_page_online_plan_dependency_prefix_v1), or when it carries a SIDE
- *	  owner class that has an obligation and no per-key ancestry yet.  The
+ *	  owner class that has an obligation and no per-key ancestry yet.  A
+ *	  history record that changes a relation's SPACE structure (CREATE,
+ *	  TRUNCATE, or a DROP tombstone, including the drops of a COMMIT) is
+ *	  always needed: its structural PI responsibility has no durable
+ *	  retirement receipt yet (CR20), so its WAL is never released.  The
  *	  keys of obligations go into a fixed-size minimum sketch; collisions
  *	  only make the answer more conservative.  History edges are spooled to
  *	  a temporary file and compared after the census.  A source's bound is
@@ -78,8 +82,9 @@ typedef struct RetainedSource {
 	XLogRecPtr bound;
 	/* Earliest history record start per SIDE owner class. */
 	XLogRecPtr side_first[RETAINED_SIDE_CLASSES];
-	bool page_pinned;
-	bool side_pinned;
+	/* Earliest history record that changes a SPACE structure. */
+	XLogRecPtr structure_first;
+	ClusterWalRetainedPinV1 pin;
 } RetainedSource;
 
 /* One history edge: a page or SPACE block a durable record changed. */
@@ -114,6 +119,7 @@ typedef struct RetainedCutWork {
 } RetainedCutWork;
 
 static bool retained_logged;
+static uint64 retained_structure_pins;
 static ClusterControlRootResult retained_logged_result;
 static RfPageProofDetailV1 retained_logged_detail;
 static ClusterWalRetainedPinV1 retained_logged_pin;
@@ -215,7 +221,13 @@ static bool
 retained_space(void *arg, const RfSideSpaceContributionV1 *space)
 {
 	RetainedCutWork *work = arg;
+	RetainedSource *source = &work->sources[work->current_source];
 
+	/* SPACE block 0 changes only with the relation's structure. */
+	if (work->current_history && (space->page_mask & 1) != 0
+		&& (source->structure_first == InvalidXLogRecPtr
+			|| work->current_read < source->structure_first))
+		source->structure_first = work->current_read;
 	for (uint8 block = 0; block < 2; block++)
 		if ((space->page_mask & (1u << block)) != 0) {
 			/* A SPACE contribution has no before token: an obligation keeps
@@ -431,7 +443,19 @@ retained_sources(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluste
 	return work->self >= 0;
 }
 
-/* Fold the spooled history edges and SIDE classes into each source bound. */
+/* Lower the bound of source to at, recording why. */
+static void
+retained_pin(RetainedSource *source, XLogRecPtr at, ClusterWalRetainedPinV1 pin)
+{
+	if (at != InvalidXLogRecPtr && at < source->bound) {
+		source->bound = at;
+		source->pin = pin;
+	}
+}
+
+/* Fold the spooled history edges, SIDE classes and structure changes into
+ * each source bound.  The structure pin is applied last: on a tie it is the
+ * reported reason. */
 static void
 retained_fold(RetainedCutWork *work)
 {
@@ -446,8 +470,6 @@ retained_fold(RetainedCutWork *work)
 	}
 	remaining = work->spool != NULL ? work->spooled : work->batch_count;
 	for (uint64 i = 0; i < remaining; i++) {
-		RetainedSource *source;
-
 		if ((i % 4096) == 0)
 			CHECK_FOR_INTERRUPTS();
 		if (work->spool != NULL)
@@ -456,24 +478,20 @@ retained_fold(RetainedCutWork *work)
 			edge = work->batch[i];
 		if (!retained_edge_needed(retained_sketch_query(work->sketch, edge.key), edge.result_token))
 			continue;
-		source = &work->sources[edge.source];
 		work->retained_edges++;
-		if (edge.read_ptr < source->bound) {
-			source->bound = edge.read_ptr;
-			source->page_pinned = true;
-		}
+		retained_pin(&work->sources[edge.source], edge.read_ptr, CLUSTER_WAL_RETAINED_PIN_PAGE);
 	}
 	for (uint32 s = 0; s < work->nsources; s++) {
 		RetainedSource *source = &work->sources[s];
 
 		for (int c = 0; c < RETAINED_SIDE_CLASSES; c++)
-			if ((work->obligation_side & (1u << c)) != 0
-				&& source->side_first[c] != InvalidXLogRecPtr
-				&& source->side_first[c] < source->bound) {
-				source->bound = source->side_first[c];
-				source->side_pinned = true;
-				source->page_pinned = false;
-			}
+			if ((work->obligation_side & (1u << c)) != 0)
+				retained_pin(source, source->side_first[c], CLUSTER_WAL_RETAINED_PIN_SIDE);
+		if (source->structure_first != InvalidXLogRecPtr
+			&& source->structure_first <= source->bound) {
+			source->bound = source->structure_first;
+			source->pin = CLUSTER_WAL_RETAINED_PIN_STRUCTURE;
+		}
 	}
 }
 
@@ -513,9 +531,9 @@ retained_census(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluster
 	out->history_edges = work->history_edges;
 	out->retained_edges = work->retained_edges;
 	out->side_classes = work->obligation_side;
-	out->pin = source->side_pinned	 ? CLUSTER_WAL_RETAINED_PIN_SIDE
-			   : source->page_pinned ? CLUSTER_WAL_RETAINED_PIN_PAGE
-									 : CLUSTER_WAL_RETAINED_PIN_NONE;
+	out->pin = source->pin;
+	if (out->pin == CLUSTER_WAL_RETAINED_PIN_STRUCTURE)
+		retained_structure_pins++;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -589,6 +607,14 @@ retained_report(ClusterControlRootResult result, RfPageProofDetailV1 detail,
 				 errdetail("Retained-input census or ROOT publication result %d, proof detail %d. "
 						   "The published lower is kept.",
 						   (int)result, (int)detail)));
+	else if (pin == CLUSTER_WAL_RETAINED_PIN_STRUCTURE)
+		ereport(LOG,
+				(errmsg("cluster WAL retention lower held by a retained relation structure change"),
+				 errdetail("Lower %X/%X, native redo %X/%X: a CREATE, TRUNCATE or DROP in retained "
+						   "history keeps its WAL until structural PI retirement is durable; "
+						   "held " UINT64_FORMAT " times since start.",
+						   LSN_FORMAT_ARGS(cut->lower), LSN_FORMAT_ARGS(cut->native_redo),
+						   retained_structure_pins)));
 	else if (pin != CLUSTER_WAL_RETAINED_PIN_NONE)
 		ereport(LOG, (errmsg("cluster WAL retention lower held by %s ancestry",
 							 pin == CLUSTER_WAL_RETAINED_PIN_SIDE ? "SIDE" : "page"),

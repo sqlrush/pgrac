@@ -177,6 +177,7 @@ typedef struct FixtureRecord {
 	uint64 before[2];
 	uint32 owners;
 	Oid space_rel;
+	uint8 space_mask; /* 0: reservation (block 1); 3: structure change */
 } FixtureRecord;
 
 static ClusterWalInputV1 items[MAX_ITEMS];
@@ -322,8 +323,11 @@ rf_side_record_census_v1(const RfDetachedRecordPlanV1 *record_plan pg_attribute_
 		space.result.key.locator.spcOid = 1663;
 		space.result.key.locator.dbOid = 5;
 		space.result.key.locator.relNumber = current->space_rel;
-		space.result_token[0] = current->result_token;
-		space.page_mask = 1;
+		space.page_mask = current->space_mask != 0 ? current->space_mask : 2;
+		if (space.page_mask & 1)
+			space.result_token[0] = current->result_token;
+		if (space.page_mask & 2)
+			space.result_token[1] = current->result_token;
 		out->owners |= RF_SIDE_CONTRIBUTION_SPACE;
 		if (!visit_space(arg, &space))
 			return RF_PAGE_PROOF_DETAIL_WOULD_BLOCK;
@@ -375,6 +379,7 @@ reset(void)
 	log_count = 0;
 	spool_creates = 0;
 	retained_logged = false;
+	retained_structure_pins = 0;
 }
 
 /* thread, lifecycle, physical lower, native redo, validated tail. */
@@ -446,12 +451,13 @@ compute(ClusterWalRetainedCutV1 *cut, RfPageProofDetailV1 *detail)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_retained_cut_moves_to_native_redo_without_obligations);
 	UT_RUN(test_retained_cut_peer_obligation_keeps_history_on_its_page);
 	UT_RUN(test_retained_cut_hot_page_keeps_its_first_edge);
 	UT_RUN(test_retained_cut_keyless_side_classes);
 	UT_RUN(test_retained_cut_space_obligation_keeps_space_history);
+	UT_RUN(test_retained_cut_structure_change_pins_history);
 	UT_RUN(test_retained_cut_completion_by_lifecycle);
 	UT_RUN(test_retained_cut_never_moves_back);
 	UT_RUN(test_retained_cut_refusals_zero_the_output);
