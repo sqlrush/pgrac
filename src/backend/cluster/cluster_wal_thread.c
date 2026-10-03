@@ -277,7 +277,34 @@ cluster_wal_thread_initdb_accept(bool bootstrap)
 		if (!valid)
 			ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: bootstrap control identity changed")));
 	}
+	{
+		struct stat base_st;
+		uint8 any = 0;
+		for (int i = 0; i < sizeof(context.storage_uuid); ++i)
+			any |= context.storage_uuid[i];
+		if (context.reserved != 0
+			|| (context.base_fd == 0
+				? (context.database_incarnation != 0 || context.base_device != 0
+					|| context.base_inode != 0 || any != 0)
+				: (bootstrap || context.thread_id != 1 || context.base_fd < 3
+					|| context.database_incarnation == 0 || any == 0
+					|| fstat(context.base_fd, &base_st) != 0 || !S_ISDIR(base_st.st_mode)
+					|| base_st.st_uid != geteuid() || (base_st.st_mode & 0022) != 0
+					|| (uint64) base_st.st_dev != context.base_device
+					|| (uint64) base_st.st_ino != context.base_inode
+					|| (base_st.st_dev == data_st.st_dev && base_st.st_ino == data_st.st_ino)
+					|| (base_st.st_dev == wal_st.st_dev && base_st.st_ino == wal_st.st_ino))))
+			ereport(FATAL, (errmsg("INITDB_BASE_CONTEXT: invalid original founder target")));
+		if (context.base_fd != 0 && fcntl(context.base_fd, F_SETFD, FD_CLOEXEC) != 0)
+			ereport(FATAL, (errmsg("INITDB_BASE_CONTEXT: cannot isolate original target descriptor")));
+	}
 	initdb_wal_context = context;
+}
+
+const PgracInitdbWalContext *
+cluster_wal_thread_initdb_context(void)
+{
+	return initdb_wal_context.thread_id == 0 ? NULL : &initdb_wal_context;
 }
 
 uint64

@@ -25,8 +25,16 @@ typedef struct PgracInitdbWalContext
 	uint64 data_inode;
 	uint64 wal_device;
 	uint64 wal_inode;
+	/* Optional original founder's new shared-base target. Zero as a group
+	 * outside post-bootstrap base creation; never an online writer grant. */
+	uint64 database_incarnation;
+	uint64 base_device;
+	uint64 base_inode;
+	uint8 storage_uuid[16];
+	int32 base_fd;
+	uint32 reserved;
 } PgracInitdbWalContext;
 
-StaticAssertDecl(sizeof(PgracInitdbWalContext) == 48, "initdb pipe carrier must have no padding");
+StaticAssertDecl(sizeof(PgracInitdbWalContext) == 96, "initdb pipe carrier must have no padding");
 
 #endif
