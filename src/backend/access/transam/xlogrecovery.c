@@ -138,8 +138,9 @@
  *	Spec: spec-s9p2-05-instance-and-cluster-recovery.md
  *	What changed: With cluster.shared_config, an engaged cold merge runs the
  *	              typed cold plan: pass 1 (cluster_recovery_typed_begin)
- *	              scans every retained writer generation before the serial
- *	              set is taken; pass 2
+ *	              scans every retained writer generation of the participant
+ *	              census (crashed ones replayed, older or closed ones as
+ *	              history only) before the serial set is taken; pass 2
  *	              (cluster_recovery_typed_replay) replays the sealed
  *	              schedule, matching every page record to its pass-1
  *	              identity; SPACE changes are installed by the SPACE owner
@@ -148,11 +149,17 @@
  *	              replayed natively.  Pass 2 starts only once every consumer it
  *	              needs exists (cluster_cold_typed_ready_v1), including a
  *	              restartpoint owner that does not adopt own checkpoints
- *	              replayed inside it.  Without shared_config a cold merge
- *	              of several threads is refused before any fence or claim.
+ *	              replayed inside it.  After pass 2 every fenced generation
+ *	              whose replay ended exactly at its sealed tail is published
+ *	              RECOVERY_COMPLETE, once the files pass 2 changed are
+ *	              durable and while IR is still held until the handoff.
+ *	              Without shared_config a cold merge of several threads is
+ *	              refused before any fence or claim.
  *	Why:          Retained history before a native redo start is ancestry
  *	              only; SCN order with unconditional full-page images can
- *	              overwrite a newer durable page another thread wrote.
+ *	              overwrite a newer durable page another thread wrote.  A
+ *	              generation published recovered is never replayed again,
+ *	              so its replayed changes must be durable first.
  */
 
 #include "postgres.h"
@@ -3058,10 +3065,11 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 /*
  * Consumers this cold driver calls (cluster_cold_typed_ready_v1).  The
  * per-block redo consultation and the restartpoint hold exist once their
- * owners publish the handshake macros; the participant census, other
- * generations' typed side owners with the XID/OID/MX/SCN bound merge, and
- * completion publication are not wired yet, so every typed plan currently
- * refuses before IR.
+ * owners publish the handshake macros; pass 1 takes every generation with
+ * retained WAL from the participant census, and fenced generations are
+ * published recovered after replay.  Other generations' typed side owners
+ * with the XID/OID/MX/SCN bound merge are not wired yet, so every typed
+ * plan currently refuses before IR.
  */
 static const ClusterColdHandshakeV1 cluster_cold_handshake = {
 #ifdef CLUSTER_COLD_REDO_HOOK_CONSUMER_V1
@@ -3069,9 +3077,9 @@ static const ClusterColdHandshakeV1 cluster_cold_handshake = {
 #else
 	.redo_block_hook = false,
 #endif
-	.participant_census = false,
+	.participant_census = true,
 	.side_owners = false,
-	.completion_publish = false,
+	.completion_publish = true,
 #ifdef CLUSTER_COLD_RESTARTPOINT_HOLD_CONSUMER_V1
 	.restartpoint_hold = true,
 #else
@@ -3177,6 +3185,7 @@ typedef struct ClusterColdTypedReplay
 	bool		foreign_mutation_started;
 	bool		apply_foreign;	/* the record being applied is another generation's */
 	ClusterColdDecodedV1 decoded;	/* scratch for unscheduled records */
+	ClusterColdTouchedV1 touched;	/* files pass 2 changed, made durable before completion */
 } ClusterColdTypedReplay;
 
 static void
@@ -3222,6 +3231,7 @@ cluster_typed_replay_apply(XLogReaderState *r, void *arg)
 
 	cluster_recovery_merge_set_scn(r->record->header.xl_scn);
 	cluster_recovery_merge_set_apply_foreign(rep->apply_foreign);
+	cluster_cold_touched_add_record_v1(&rep->touched, r);
 	ApplyWalRecord(r, &r->record->header, rep->replayTLI);
 	cluster_recovery_merge_set_apply_foreign(false);
 }
@@ -3471,21 +3481,88 @@ cluster_typed_replay_stopped(ClusterColdTypedReplay *rep, const ClusterColdRepla
 	pg_unreachable();
 }
 
-/*
- * Recovery completion is published by its owner (requests R-A7), which also
- * decides when the replayed generations may serve.  That consumer is not
- * wired, and cluster_cold_typed_ready_v1 refuses every plan before IR until
- * it is; reaching this point is therefore a driver error.
- */
 static void
-cluster_typed_replay_publish(ClusterColdTypedReplay *rep)
+pg_attribute_noreturn()
+cluster_typed_replay_unpublished(uint16 thread, const char *what, int detail)
 {
 	ereport(FATAL,
 			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
-			 errmsg("typed cold recovery completion publication is not available"),
-			 errdetail("Replay of %u writer generations finished without a completion owner.",
-					   rep->typed->participant_count),
-			 errhint("Preserve all original thread WAL; do not open the database.")));
+			 errmsg("typed cold recovery could not publish thread %u recovered", (unsigned) thread),
+			 errdetail("%s (result %d).", what, detail),
+			 errhint("Retry startup; a generation not published recovered is recovered again. "
+					 "Preserve all original thread WAL; do not open the database.")));
+	pg_unreachable();
+}
+
+/*
+ * Publish every fenced generation recovered: pass 2 must have ended exactly
+ * at its sealed tail, every file pass 2 changed (and every SPACE relation)
+ * is made durable while IR is still held, then the fence plan hands each
+ * root to RECOVERY_COMPLETE.  The founder's own generation is not
+ * published here.
+ */
+static void
+cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdReplayResultV1 *result)
+{
+	ClusterColdTypedV1 *typed = rep->typed;
+	ClusterRecoveryFencePlan *plan = *rep->fence_plan;
+	uint16		origins = cluster_recovery_merge_fence_plan_origin_count(plan);
+	uint16		thread = 0;
+	int			detail = 0;
+	uint32		relations = cluster_cold_plan_space_relation_count_v1(typed->plan);
+	uint32		i;
+
+	for (i = 0; i < origins; i++)
+	{
+		ClusterControlRootSnapshot root;
+		ClusterControlRootReadToken token;
+		uint32		p;
+
+		if (!cluster_recovery_merge_fence_plan_origin(plan, (uint16) i, &thread, &root, &token))
+			cluster_typed_replay_unpublished(thread, "The fence plan lost an origin", 0);
+		for (p = 0; p < typed->replay_count; p++)
+			if (p != typed->own_participant && typed->participants[p].thread_id == thread)
+				break;
+		if (p == typed->replay_count ||
+			!cluster_cold_completion_proven_v1(typed->plan, &root, result, p))
+			cluster_typed_replay_unpublished(thread, "Replay did not end at its sealed tail",
+											 (int) result->detail);
+	}
+	for (i = 0; i < relations; i++)
+	{
+		RelFileLocator locator;
+		uint32		count = 0;
+		ForkNumber	fork;
+
+		if (!cluster_cold_plan_space_relation_v1(typed->plan, i, &locator, &count))
+			cluster_typed_replay_unpublished(0, "A SPACE relation was lost", (int) i);
+		for (fork = 0; fork <= MAX_FORKNUM; fork++)
+			cluster_cold_touched_add_v1(&rep->touched, &locator, fork);
+	}
+	cluster_cold_durable_barrier_v1(&rep->touched);
+	switch (cluster_recovery_merge_fence_plan_complete_v1(plan, &thread, &detail))
+	{
+		case CLUSTER_RECOVERY_FENCE_COMPLETE_OK:
+			break;
+		case CLUSTER_RECOVERY_FENCE_COMPLETE_AUTHORITY:
+			cluster_write_fence_note_external_publish_gate_blocked();
+			cluster_typed_replay_unpublished(thread, "Its external write exclusion became stale",
+											 detail);
+		case CLUSTER_RECOVERY_FENCE_COMPLETE_IR_RELEASE:
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("cold recovery serialization release was not confirmed"),
+					 errdetail("No fenced generation was published recovered (result %d).",
+							   detail)));
+			break;
+		default:
+			cluster_typed_replay_unpublished(thread, "The recovery completion handoff refused",
+											 detail);
+	}
+	ereport(LOG,
+			(errmsg("cluster typed cold recovery: %u fenced writer generations published recovered",
+					(unsigned) origins),
+			 errdetail_log("%u relations made durable first.", rep->touched.count)));
 }
 
 /* Pin progress to the own stream, publish completion and release. */
@@ -3510,7 +3587,7 @@ cluster_typed_replay_finish(ClusterColdTypedReplay *rep, const ClusterColdReplay
 				 errhint("Retry startup; replayed foreign state remains unpublished until the "
 						 "complete fence plan is current.")));
 	}
-	cluster_typed_replay_publish(rep);
+	cluster_typed_replay_publish(rep, result);
 	if (*rep->fence_plan != NULL)
 	{
 		if (!cluster_recovery_merge_fence_plan_release_serial(*rep->fence_plan))
@@ -3574,6 +3651,8 @@ cluster_recovery_typed_replay(ClusterColdTypedV1 **typed_address, TimeLineID *re
 						   result.pages_skipped, result.pages_applied, result.space_steps,
 						   result.space_relations_finished)));
 	own_end = result.own_end;
+	if (rep->touched.rels != NULL)
+		pfree(rep->touched.rels);
 	pfree(rep);
 	cluster_cold_typed_destroy_v1(typed_address);
 	return own_end;

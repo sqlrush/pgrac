@@ -77,6 +77,7 @@ typedef struct Harness {
 	int events;
 	TraceEvent trace[MAX_TRACE];
 	bool refuse_unscheduled;
+	bool refuse_scheduled;
 	bool refuse_space_final;
 } Harness;
 
@@ -320,7 +321,7 @@ op_scheduled(void *arg, uint32 participant, const ClusterColdStepV1 *step,
 	e->participant = participant;
 	e->read = step->read_rec_ptr;
 	e->action = action;
-	return h->current[participant] == step->read_rec_ptr;
+	return h->current[participant] == step->read_rec_ptr && !h->refuse_scheduled;
 }
 
 static bool
@@ -378,6 +379,13 @@ UT_TEST(test_replay_follows_schedule_and_drains)
 	UT_ASSERT_EQ(result.pages_skipped, 0);
 	UT_ASSERT_EQ(result.own_read, 0x1300);
 	UT_ASSERT_EQ(result.own_end, 0x1500);
+	/* each participant's last consumed record proves where its cut ended */
+	UT_ASSERT_EQ(result.last_read[0], 0x1300);
+	UT_ASSERT_EQ(result.last_end[0], 0x1500);
+	UT_ASSERT_EQ(result.last_crc[0], identity(&fix[0][3]).record_crc);
+	UT_ASSERT_EQ(result.last_read[1], 0x1100);
+	UT_ASSERT_EQ(result.last_end[1], 0x1300);
+	UT_ASSERT_EQ(result.last_crc[1], identity(&fix[1][1]).record_crc);
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
@@ -478,6 +486,36 @@ UT_TEST(test_replay_drain_proves_the_cut)
 	h.stream[1].count = 3;
 	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CUT_DIFFERS);
 	UT_ASSERT_EQ(result.participant, 1);
+
+	/* As many records as pass 1 saw, but the last ends short of the tail. */
+	harness_init(&h);
+	h.stream[1].record[1].end_rec_ptr = 0x1200;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CUT_DIFFERS);
+	UT_ASSERT_EQ(result.participant, 1);
+	UT_ASSERT_EQ(result.rec_ptr, 0x1200);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+/* A generation whose whole retained range is history replays nothing and
+ * its cut is proven at its native redo start. */
+UT_TEST(test_replay_history_only_generation)
+{
+	ClusterColdPlanV1 *plan;
+	ClusterColdReplayResultV1 result;
+	Harness h;
+
+	fixture(false);
+	cuts[1].native_redo = cuts[1].tail_end;
+	data_token[0] = 3; /* thread 2's history change is durable */
+	plan = seal();
+	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(plan, 1), 0);
+	harness_init(&h);
+	h.stream[1].count = 0;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_OK);
+	UT_ASSERT_EQ(result.own_end, 0x1500);
+	/* nothing of the history-only generation was consumed */
+	UT_ASSERT_EQ(result.last_read[1], InvalidXLogRecPtr);
+	UT_ASSERT_EQ(result.last_end[1], InvalidXLogRecPtr);
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
@@ -495,6 +533,14 @@ UT_TEST(test_replay_callback_refusal_stops)
 	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CALLBACK);
 	UT_ASSERT_EQ(result.rec_ptr, 0x1000);
 	UT_ASSERT_EQ(h.events, 1);
+
+	/* A scheduled record the adapter could not handle stops at that step. */
+	harness_init(&h);
+	h.refuse_scheduled = true;
+	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_CALLBACK);
+	UT_ASSERT_EQ(result.steps_done, 0);
+	UT_ASSERT_EQ(h.trace[h.events - 1].kind, T_SCHEDULED);
+	UT_ASSERT_EQ(result.rec_ptr, h.trace[h.events - 1].read);
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
@@ -659,6 +705,7 @@ main(void)
 	UT_RUN(test_replay_page_actions);
 	UT_RUN(test_replay_scheduled_record_must_match);
 	UT_RUN(test_replay_drain_proves_the_cut);
+	UT_RUN(test_replay_history_only_generation);
 	UT_RUN(test_replay_callback_refusal_stops);
 	UT_RUN(test_replay_space_steps_and_final_installs);
 	UT_RUN(test_unscheduled_record_handling);

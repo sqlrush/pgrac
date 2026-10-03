@@ -431,6 +431,11 @@ typedef struct ClusterColdReplayResultV1 {
 	uint64 pages_applied;
 	XLogRecPtr own_read; /* last consumed record of the own participant */
 	XLogRecPtr own_end;
+	/* Each participant's last consumed record: where its cut ended (zero
+	 * when nothing of it was replayed). */
+	XLogRecPtr last_read[CLUSTER_COLD_MAX_PARTICIPANTS];
+	XLogRecPtr last_end[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint32 last_crc[CLUSTER_COLD_MAX_PARTICIPANTS];
 } ClusterColdReplayResultV1;
 
 /* participants/participant_count must be the plan's caller-order cuts; own
@@ -569,13 +574,52 @@ extern ClusterColdDetailV1 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, ui
 													 bool space_active, bool foreign,
 													 ClusterColdScanResultV1 *result);
 
+/* Pass 2 consumed exactly the ROOT-sealed cut of replayed generation
+ * `participant`: replay finished every step, and its last record is the
+ * root's validated last record (start and CRC) ending at the validated
+ * tail.  Only then may the generation be published recovered. */
+extern bool cluster_cold_completion_proven_v1(const ClusterColdPlanV1 *plan,
+											  const ClusterControlRootSnapshot *root,
+											  const ClusterColdReplayResultV1 *result,
+											  uint32 participant);
+
+/*
+ * Relation forks whose files pass 2 changed (block references, relation
+ * creation and truncation of every replayed record, and every SPACE
+ * relation), kept sorted.  Before a replayed generation is published
+ * recovered they are made durable as PostgreSQL's end-of-recovery
+ * checkpoint would make them: their dirty buffers are written and each
+ * existing fork is fsynced.  A failed fsync raises an error.
+ */
+typedef struct ClusterColdTouchedRelV1 {
+	RelFileLocator locator;
+	uint32 forks; /* bit (1 << ForkNumber) */
+} ClusterColdTouchedRelV1;
+
+typedef struct ClusterColdTouchedV1 {
+	uint32 count;
+	uint32 capacity;
+	ClusterColdTouchedRelV1 *rels;
+} ClusterColdTouchedV1;
+
+extern void cluster_cold_touched_add_v1(ClusterColdTouchedV1 *touched,
+										const RelFileLocator *locator, ForkNumber fork);
+extern void cluster_cold_touched_add_record_v1(ClusterColdTouchedV1 *touched,
+											   struct XLogReaderState *record);
+extern void cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched);
+
 /*
  * Typed cold replay driver state (startup process).  prepare() runs pass 1
  * with external admissions held and before the serial set is taken; refusal
  * is returned in `refusal`/`refusal_detail` so the caller can release what
- * it holds before failing startup.
+ * it holds before failing startup.  Participants are the founder's crashed
+ * generation, the fence plan's origins, then every history-only generation
+ * of the participant census (cluster_cold_recovery_census.h); the census
+ * read scope is released before prepare() returns.
  */
 struct ClusterRecoveryFencePlan;
+
+struct ClusterWalInputsV1;
 
 typedef struct ClusterColdTypedV1 {
 	MemoryContext context;
@@ -583,7 +627,10 @@ typedef struct ClusterColdTypedV1 {
 	ClusterColdDetailV1 refusal; /* CLUSTER_COLD_OK when sealed */
 	char refusal_detail[512];
 	uint32 participant_count;
+	uint32 replay_count; /* [0, replay_count): crashed; the rest history only */
 	uint32 own_participant;
+	struct ClusterWalInputsV1 *inputs;				   /* census read scope, released by pass 1 */
+	uint32 input_index[CLUSTER_COLD_MAX_PARTICIPANTS]; /* history: index in that scope */
 	uint64 system_identifier;
 	uint64 scanned_records;
 	ClusterColdObserverV1 observer;

@@ -525,6 +525,33 @@ cluster_recovery_merge_fence_plan_authority(ClusterRecoveryFencePlan *plan, uint
 extern bool cluster_recovery_merge_fence_plan_release_serial(ClusterRecoveryFencePlan *plan);
 extern void cluster_recovery_merge_fence_plan_destroy(ClusterRecoveryFencePlan **plan);
 
+/*
+ * PGRAC (S9P2-05): after typed cold replay, publish every fenced origin
+ * recovered through the exclusive handoff the online recovery worker uses:
+ * each origin's terminal patch is built while the serial set is held, the
+ * retention pin is sealed, the serial set (IR) is released with
+ * confirmation, then each root is compare-and-swapped to RECOVERY_COMPLETE
+ * through the sealed pin, and the pin is released.  The caller has proven
+ * every origin's pass-2 cut and made the replayed changes durable.  On a
+ * failure nothing further is published; *failed_thread / *failed_detail
+ * name the origin and the callee's result.  Author: SqlRush
+ * <sqlrush@gmail.com>
+ */
+typedef enum ClusterRecoveryFenceCompleteV1 {
+	CLUSTER_RECOVERY_FENCE_COMPLETE_OK = 0,
+	CLUSTER_RECOVERY_FENCE_COMPLETE_INVALID = 1,   /* not a committed, held plan */
+	CLUSTER_RECOVERY_FENCE_COMPLETE_AUTHORITY = 2, /* an origin's authority is stale */
+	CLUSTER_RECOVERY_FENCE_COMPLETE_PATCH = 3,	   /* its root cannot take the terminal */
+	CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_SEAL = 4,
+	CLUSTER_RECOVERY_FENCE_COMPLETE_IR_RELEASE = 5, /* release not confirmed */
+	CLUSTER_RECOVERY_FENCE_COMPLETE_FINALIZE = 6,
+	CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_RELEASE = 7
+} ClusterRecoveryFenceCompleteV1;
+
+extern ClusterRecoveryFenceCompleteV1
+cluster_recovery_merge_fence_plan_complete_v1(ClusterRecoveryFencePlan *plan, uint16 *failed_thread,
+											  int *failed_detail);
+
 /* Sole-merger claim lifecycle (spec-6.14 D9 amend; see the pure core
  * above).  acquire_blocking runs in PerformWalRecovery BEFORE the engage
  * decision (crash recovery only -- never archive/standby/restore, whose

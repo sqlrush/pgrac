@@ -377,8 +377,10 @@ gen_event(World *w, uint32 e)
 
 /*
  * After the timeline: a later durable write to a relation's file (history
- * of any generation) makes an earlier shrink of that file durable; inputs
- * whose incarnation a history change already ended are covered by DATA.
+ * of any generation) makes an earlier shrink of that file durable; any
+ * later change of the relation follows its truncation's durable identity;
+ * inputs whose incarnation a history change already ended are covered by
+ * DATA.
  */
 static void
 gen_finish_floors(World *w)
@@ -391,6 +393,7 @@ gen_finish_floors(World *w)
 		Event *ev = &w->event[e];
 		int r = ev->kind == EV_SPACE ? (int)ev->op.locator.relNumber - REL_BASE : -1;
 		bool durable = false;
+		bool written = false;
 
 		if (r < 0 || ev->op.kind != CLUSTER_COLD_SPACE_TRUNCATE)
 			continue;
@@ -398,11 +401,17 @@ gen_finish_floors(World *w)
 			const Event *next = &w->event[later];
 			uint16 i;
 
-			for (i = 0; next->kind == EV_PAGE && next->history && i < next->count; i++)
-				durable |= next->rel[i] == r;
+			for (i = 0; next->kind == EV_PAGE && i < next->count; i++) {
+				durable |= next->history && next->rel[i] == r;
+				written |= next->rel[i] == r;
+			}
 		}
 		for (b = 0; durable && b < MAX_BLOCKS; b++)
 			w->rel[r].floor[b] = Max(w->rel[r].floor[b], ev->shrunk[b]);
+		/* The truncation persists its new identity before releasing the
+		 * relation: no later change can precede it on disk. */
+		if (written)
+			w->rel[r].ident_floor = Max(w->rel[r].ident_floor, (uint32)ev->op_index + 1);
 	}
 	for (e = 0; e < w->events; e++) {
 		Event *ev = &w->event[e];
@@ -467,16 +476,32 @@ gen_finish_anchors(World *w)
 	}
 }
 
-/* DATA a crash leaves: any state at or after each floor, maybe torn. */
+/*
+ * DATA a crash leaves: any state at or after each floor, maybe torn.  A
+ * truncation's shrink is synced before its identity is published, so an
+ * identity on disk at or past it proves the shrink.
+ */
 static void
 gen_disk(World *w)
 {
+	uint32 e;
 	int r;
 	int b;
 
 	for (r = 0; r < (int)w->rels; r++) {
 		Rel *rel = &w->rel[r];
 
+		rel->space_pos = rel->ident_floor + rng(rel->nops - rel->ident_floor + 1);
+		for (e = 0; e < w->events; e++) {
+			const Event *ev = &w->event[e];
+
+			if (ev->kind != EV_SPACE || ev->op.kind != CLUSTER_COLD_SPACE_TRUNCATE
+				|| (int)ev->op.locator.relNumber - REL_BASE != r
+				|| (uint32)ev->op_index >= rel->space_pos)
+				continue;
+			for (b = 0; b < MAX_BLOCKS; b++)
+				rel->floor[b] = Max(rel->floor[b], ev->shrunk[b]);
+		}
 		for (b = 0; b < MAX_BLOCKS; b++) {
 			int pick = rel->floor[b] + (int)rng((uint32)(rel->nhist[b] - rel->floor[b]));
 			bool written = false;
@@ -489,7 +514,6 @@ gen_disk(World *w)
 				rel->disk[b] = torn(w, &rel->disk[b]);
 		}
 		normalize(rel->disk);
-		rel->space_pos = rel->ident_floor + rng(rel->nops - rel->ident_floor + 1);
 	}
 }
 

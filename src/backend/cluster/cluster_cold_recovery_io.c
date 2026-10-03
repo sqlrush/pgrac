@@ -1,18 +1,25 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_cold_recovery_io.c
- *	  Read-only I/O for typed cold-crash replay: pass-1 root scan, DATA
- *	  observation and the pass-2 source reader.
+ *	  I/O for typed cold-crash replay: participant census, pass-1 scans,
+ *	  DATA observation, the pass-2 source reader and the completion proof
+ *	  and durability barrier.
  *
- *	  Pass 1 visits every retained record of a RECOVERY_REQUIRED root through
- *	  the sealed recovery visitor and feeds the plan; nothing visited is
- *	  trusted until the visitor and the observed cut both match the ROOT.
- *	  DATA observation and the SPACE owner's pass-1 check read storage
- *	  directly, before replay touches shared buffers.  Pass 2 re-reads the
- *	  same generation through the selected
- *	  restart-input segment opener; the caller compares each record with its
- *	  pass-1 identity.  No function here writes, locks pages or grants
- *	  replay authority.
+ *	  The census selects, from one cold read scope over every ROOT slot,
+ *	  each writer generation with retained WAL: crashed ones are replayed,
+ *	  older or closed ones are history only.  Pass 1 visits every retained
+ *	  record of a crashed (RECOVERY_REQUIRED) root through the sealed recovery
+ *	  visitor, and of a history-only generation through that read scope, and
+ *	  feeds the plan; nothing visited is trusted until the visit and the
+ *	  observed cut both match the ROOT.  DATA observation and the SPACE
+ *	  owner's pass-1 check read storage directly, before replay touches
+ *	  shared buffers.  Pass 2 re-reads the same generation through the
+ *	  selected restart-input segment opener; the caller compares each record
+ *	  with its pass-1 identity.  Before a replayed generation is published
+ *	  recovered, its pass-2 cut is proven against its ROOT and the files
+ *	  pass 2 changed are made durable (their dirty buffers written, each
+ *	  fork fsynced).  Nothing else here writes; nothing locks pages or
+ *	  grants replay authority.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -39,13 +46,16 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
+#include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_wal_restart_read.h"
 #include "cluster/cluster_wal_tail.h"
 #include "pgstat.h"
+#include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/smgr.h"
 
@@ -315,6 +325,42 @@ cold_scan_visit(XLogReaderState *reader, void *arg)
 	return true;
 }
 
+static ColdScanWork *
+cold_scan_work(ClusterColdPlanV1 *plan, uint32 participant, const ClusterControlRootIdentity *id,
+			   bool space_active, bool foreign, ClusterColdScanResultV1 *result)
+{
+	ColdScanWork *work = (ColdScanWork *)palloc0(sizeof(*work));
+
+	work->plan = plan;
+	work->participant = participant;
+	work->system_identifier = id->system_identifier;
+	memcpy(work->storage_uuid, id->storage_uuid, 16);
+	work->space_active = space_active;
+	work->foreign = foreign;
+	work->detail = CLUSTER_COLD_OK;
+	work->result = result;
+	return work;
+}
+
+/* Visited records are provisional until the visit and its observed cut
+ * (record count, complete end) match the ROOT record's validated tail. */
+static ClusterColdDetailV1
+cold_scan_finish(ColdScanWork *work, ClusterControlRootResult visit,
+				 const ClusterWalTailObservation *observed, XLogRecPtr tail)
+{
+	ClusterColdScanResultV1 *result = work->result;
+	ClusterColdDetailV1 detail = work->detail;
+
+	cluster_cold_decoded_release_v1(&work->decoded);
+	result->root_result = (int)visit;
+	if (detail == CLUSTER_COLD_OK
+		&& (visit != CLUSTER_CONTROL_ROOT_OK_PRIMARY || observed->records != result->records
+			|| observed->complete_end != tail))
+		detail = CLUSTER_COLD_SOURCE_GAP;
+	pfree(work);
+	return detail;
+}
+
 ClusterColdDetailV1
 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 						  const ClusterControlRootSnapshot *root,
@@ -324,32 +370,295 @@ cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
 	ColdScanWork *work;
 	ClusterWalTailObservation observed;
 	ClusterControlRootResult visit;
-	ClusterColdDetailV1 detail;
 
 	if (result == NULL)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
 	memset(result, 0, sizeof(*result));
 	if (plan == NULL || root == NULL || token == NULL)
 		return CLUSTER_COLD_INVALID_ARGUMENT;
-	work = (ColdScanWork *)palloc0(sizeof(*work));
-	work->plan = plan;
-	work->participant = participant;
-	work->system_identifier = root->identity.system_identifier;
-	memcpy(work->storage_uuid, root->identity.storage_uuid, 16);
-	work->space_active = space_active;
-	work->foreign = foreign;
-	work->detail = CLUSTER_COLD_OK;
-	work->result = result;
+	work = cold_scan_work(plan, participant, &root->identity, space_active, foreign, result);
+	memset(&observed, 0, sizeof(observed));
 	visit = cluster_control_root_recovery_visit(root, token, cold_scan_visit, work, &observed);
-	cluster_cold_decoded_release_v1(&work->decoded);
-	result->root_result = (int)visit;
-	detail = work->detail;
-	if (detail == CLUSTER_COLD_OK
-		&& (visit != CLUSTER_CONTROL_ROOT_OK_PRIMARY || observed.records != result->records
-			|| observed.complete_end != root->validated_tail_lsn_exclusive))
-		detail = CLUSTER_COLD_SOURCE_GAP;
-	pfree(work);
-	return detail;
+	return cold_scan_finish(work, visit, &observed, root->validated_tail_lsn_exclusive);
+}
+
+ClusterColdDetailV1
+cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterWalInputsV1 *inputs,
+						   uint32 index, bool space_active, bool foreign,
+						   ClusterColdScanResultV1 *result)
+{
+	const ClusterWalInputV1 *input;
+	ColdScanWork *work;
+	ClusterWalTailObservation observed;
+	ClusterControlRootResult visit;
+
+	if (result == NULL)
+		return CLUSTER_COLD_INVALID_ARGUMENT;
+	memset(result, 0, sizeof(*result));
+	input = inputs != NULL ? cluster_wal_inputs_at_v1(inputs, index) : NULL;
+	if (plan == NULL || input == NULL || input->kind != CLUSTER_WAL_INPUT_CHECKPOINT)
+		return CLUSTER_COLD_INVALID_ARGUMENT;
+	work = cold_scan_work(plan, participant, &input->checkpoint.identity, space_active, foreign,
+						  result);
+	memset(&observed, 0, sizeof(observed));
+	visit = cluster_wal_inputs_visit_retained_v1(inputs, index, cold_scan_visit, work, &observed);
+	return cold_scan_finish(work, visit, &observed, input->checkpoint.validated_tail_lsn_exclusive);
+}
+
+/* ---- participant census (cluster_cold_recovery_census.h) ---- */
+
+/*
+ * A checkpoint input's role, or a refusal.  Its retained range is
+ * [checkpoint lower, validated tail); the native redo start splits a
+ * crashed generation into history and replay.
+ */
+static ClusterColdCensusDetailV1
+census_checkpoint(const ClusterWalInputV1 *input, ClusterColdCensusEntryV1 *entry, bool *keep)
+{
+	const ClusterControlRootSnapshot *root = &input->checkpoint;
+	bool crashed;
+
+	*keep = false;
+	if (input->current && root->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
+		return CLUSTER_COLD_CENSUS_LIVE_WRITER;
+	crashed = input->current && root->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	if (!crashed && root->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+		&& root->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)
+		return CLUSTER_COLD_CENSUS_LIFECYCLE;
+	if ((root->root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) == 0
+		|| root->checkpoint_lower_lsn == InvalidXLogRecPtr
+		|| root->checkpoint_lower_lsn > root->validated_tail_lsn_exclusive
+		|| (crashed
+			&& (input->native_redo < root->checkpoint_lower_lsn
+				|| input->native_redo > root->validated_tail_lsn_exclusive)))
+		return CLUSTER_COLD_CENSUS_RANGE;
+	/* Nothing retained: no ancestry to prove and nothing to replay. */
+	if (!crashed && root->checkpoint_lower_lsn == root->validated_tail_lsn_exclusive)
+		return CLUSTER_COLD_CENSUS_OK;
+	memset(entry, 0, sizeof(*entry));
+	entry->role = crashed ? CLUSTER_COLD_CENSUS_REPLAY : CLUSTER_COLD_CENSUS_HISTORY;
+	entry->identity = root->identity;
+	entry->source = input->source;
+	entry->cut.thread_id = root->identity.origin_thread_id;
+	entry->cut.timeline = root->checkpoint_tli;
+	entry->cut.owner_incarnation = root->identity.origin_owner_incarnation;
+	entry->cut.physical_lower = root->checkpoint_lower_lsn;
+	entry->cut.tail_end = root->validated_tail_lsn_exclusive;
+	/* Every retained record of a closed or recovered generation is durable. */
+	entry->cut.native_redo = crashed ? input->native_redo : root->validated_tail_lsn_exclusive;
+	*keep = true;
+	return CLUSTER_COLD_CENSUS_OK;
+}
+
+ClusterColdCensusDetailV1
+cluster_cold_census_select_v1(const ClusterWalInputV1 *const *inputs, uint32 count,
+							  ClusterColdCensusEntryV1 *entries, uint32 capacity, uint32 *out_count,
+							  uint32 *bad_index)
+{
+	uint32 kept = 0;
+	uint32 i;
+
+	if (out_count == NULL || bad_index == NULL)
+		return CLUSTER_COLD_CENSUS_INVALID_ARGUMENT;
+	*out_count = 0;
+	*bad_index = 0;
+	if ((inputs == NULL && count > 0) || (entries == NULL && capacity > 0))
+		return CLUSTER_COLD_CENSUS_INVALID_ARGUMENT;
+	for (i = 0; i < count; i++) {
+		ClusterColdCensusEntryV1 entry;
+		ClusterColdCensusDetailV1 detail = CLUSTER_COLD_CENSUS_OK;
+		bool keep = false;
+
+		*bad_index = i;
+		if (inputs[i] == NULL)
+			return CLUSTER_COLD_CENSUS_INVALID_ARGUMENT;
+		if (inputs[i]->kind == CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL) {
+			/* An initialization that ended before its first checkpoint. */
+			if (inputs[i]->terminal.tail.records != 0)
+				return CLUSTER_COLD_CENSUS_TERMINAL;
+			continue;
+		}
+		if (inputs[i]->kind != CLUSTER_WAL_INPUT_CHECKPOINT)
+			return CLUSTER_COLD_CENSUS_LIFECYCLE;
+		detail = census_checkpoint(inputs[i], &entry, &keep);
+		if (detail != CLUSTER_COLD_CENSUS_OK)
+			return detail;
+		if (!keep)
+			continue;
+		if (kept >= capacity)
+			return CLUSTER_COLD_CENSUS_CAPACITY;
+		entry.input_index = i;
+		entries[kept++] = entry;
+	}
+	*bad_index = 0;
+	*out_count = kept;
+	return CLUSTER_COLD_CENSUS_OK;
+}
+
+static bool
+census_crashed_named(const ClusterColdCensusEntryV1 *entry,
+					 const ClusterControlRootSnapshot *crashed, uint32 crashed_count)
+{
+	uint32 i;
+
+	for (i = 0; i < crashed_count; i++)
+		if (cluster_control_root_identity_equal(&crashed[i].identity, &entry->identity))
+			return true;
+	return false;
+}
+
+ClusterColdCensusDetailV1
+cluster_cold_census_cover_v1(const ClusterColdCensusEntryV1 *entries, uint32 count,
+							 const ClusterControlRootSnapshot *crashed, uint32 crashed_count,
+							 uint16 *bad_thread)
+{
+	uint32 i;
+	uint32 j;
+
+	if (bad_thread == NULL || (entries == NULL && count > 0)
+		|| (crashed == NULL && crashed_count > 0))
+		return CLUSTER_COLD_CENSUS_INVALID_ARGUMENT;
+	*bad_thread = 0;
+	/* Each named root is a crashed generation of the census, exactly. */
+	for (i = 0; i < crashed_count; i++) {
+		bool found = false;
+
+		for (j = 0; j < count && !found; j++)
+			found = entries[j].role == CLUSTER_COLD_CENSUS_REPLAY
+					&& cluster_control_root_identity_equal(&entries[j].identity,
+														   &crashed[i].identity);
+		if (!found || crashed[i].lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED) {
+			*bad_thread = crashed[i].identity.origin_thread_id;
+			return CLUSTER_COLD_CENSUS_ORIGIN_MISSING;
+		}
+	}
+	/* Each crashed generation is named: none is skipped. */
+	for (j = 0; j < count; j++)
+		if (entries[j].role == CLUSTER_COLD_CENSUS_REPLAY
+			&& !census_crashed_named(&entries[j], crashed, crashed_count)) {
+			*bad_thread = entries[j].cut.thread_id;
+			return CLUSTER_COLD_CENSUS_UNCOVERED;
+		}
+	return CLUSTER_COLD_CENSUS_OK;
+}
+
+bool
+cluster_cold_completion_proven_v1(const ClusterColdPlanV1 *plan,
+								  const ClusterControlRootSnapshot *root,
+								  const ClusterColdReplayResultV1 *result, uint32 participant)
+{
+	return plan != NULL && root != NULL && result != NULL
+		   && participant < cluster_cold_plan_participant_count_v1(plan)
+		   && result->detail == CLUSTER_COLD_REPLAY_OK
+		   && result->steps_done == cluster_cold_plan_step_count_v1(plan)
+		   && root->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		   && (root->root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID) != 0
+		   && root->tail_last_record_lsn != InvalidXLogRecPtr
+		   && result->last_read[participant] == root->tail_last_record_lsn
+		   && result->last_crc[participant] == root->tail_last_record_crc32c
+		   && result->last_end[participant] == root->validated_tail_lsn_exclusive;
+}
+
+static int
+touched_compare(const RelFileLocator *a, const RelFileLocator *b)
+{
+	if (a->spcOid != b->spcOid)
+		return a->spcOid < b->spcOid ? -1 : 1;
+	if (a->dbOid != b->dbOid)
+		return a->dbOid < b->dbOid ? -1 : 1;
+	if (a->relNumber != b->relNumber)
+		return a->relNumber < b->relNumber ? -1 : 1;
+	return 0;
+}
+
+void
+cluster_cold_touched_add_v1(ClusterColdTouchedV1 *touched, const RelFileLocator *locator,
+							ForkNumber fork)
+{
+	uint32 low = 0;
+	uint32 high;
+
+	Assert(touched != NULL && locator != NULL && fork >= 0 && fork <= MAX_FORKNUM);
+	high = touched->count;
+	while (low < high) {
+		uint32 middle = low + (high - low) / 2;
+		int cmp = touched_compare(&touched->rels[middle].locator, locator);
+
+		if (cmp == 0) {
+			touched->rels[middle].forks |= UINT32_C(1) << fork;
+			return;
+		}
+		if (cmp < 0)
+			low = middle + 1;
+		else
+			high = middle;
+	}
+	if (touched->count == touched->capacity) {
+		touched->capacity = touched->capacity == 0 ? 64 : touched->capacity * 2;
+		touched->rels
+			= touched->rels == NULL
+				  ? palloc(sizeof(ClusterColdTouchedRelV1) * touched->capacity)
+				  : repalloc(touched->rels, sizeof(ClusterColdTouchedRelV1) * touched->capacity);
+	}
+	memmove(&touched->rels[low + 1], &touched->rels[low],
+			sizeof(ClusterColdTouchedRelV1) * (touched->count - low));
+	touched->rels[low].locator = *locator;
+	touched->rels[low].forks = UINT32_C(1) << fork;
+	touched->count++;
+}
+
+/* Every block reference, and the files a creation or truncation changes. */
+void
+cluster_cold_touched_add_record_v1(ClusterColdTouchedV1 *touched, XLogReaderState *record)
+{
+	uint8 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+	int block_id;
+
+	for (block_id = 0; block_id <= XLogRecMaxBlockId(record); block_id++) {
+		RelFileLocator locator;
+		ForkNumber fork;
+		BlockNumber block;
+
+		if (XLogRecGetBlockTagExtended(record, (uint8)block_id, &locator, &fork, &block, NULL))
+			cluster_cold_touched_add_v1(touched, &locator, fork);
+	}
+	if (XLogRecGetRmid(record) != RM_SMGR_ID)
+		return;
+	if (info == XLOG_SMGR_CREATE) {
+		const xl_smgr_create *create = (const xl_smgr_create *)XLogRecGetData(record);
+
+		cluster_cold_touched_add_v1(touched, &create->rlocator, create->forkNum);
+	} else if (info == XLOG_SMGR_TRUNCATE) {
+		const xl_smgr_truncate *truncate = (const xl_smgr_truncate *)XLogRecGetData(record);
+
+		cluster_cold_touched_add_v1(touched, &truncate->rlocator, MAIN_FORKNUM);
+		cluster_cold_touched_add_v1(touched, &truncate->rlocator, FSM_FORKNUM);
+		cluster_cold_touched_add_v1(touched, &truncate->rlocator, VISIBILITYMAP_FORKNUM);
+	}
+}
+
+/* Write every dirty buffer of the touched relations in one pass, then fsync
+ * each touched fork that exists (smgrDoPendingSyncs' pattern). */
+void
+cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched)
+{
+	SMgrRelation *smgrs;
+	uint32 i;
+
+	if (touched == NULL || touched->count == 0)
+		return;
+	smgrs = palloc(sizeof(SMgrRelation) * touched->count);
+	for (i = 0; i < touched->count; i++)
+		smgrs[i] = smgropen(touched->rels[i].locator, InvalidBackendId);
+	FlushRelationsAllBuffers(smgrs, (int)touched->count);
+	for (i = 0; i < touched->count; i++) {
+		ForkNumber fork;
+
+		for (fork = 0; fork <= MAX_FORKNUM; fork++)
+			if ((touched->rels[i].forks & (UINT32_C(1) << fork)) != 0 && smgrexists(smgrs[i], fork))
+				smgrimmedsync(smgrs[i], fork);
+	}
+	pfree(smgrs);
 }
 
 #endif /* USE_PGRAC_CLUSTER */
