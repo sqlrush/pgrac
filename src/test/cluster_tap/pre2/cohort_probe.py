@@ -81,7 +81,7 @@ def cleanup(q, nodes, bindir):
 
 def probe(args):
     root = args.output.resolve()
-    root.mkdir(parents=True, exist_ok=False)
+    root.mkdir(parents=True, mode=0o700, exist_ok=False)
     os.chown(root, args.uid, args.gid)
     bindir = args.install.resolve()/'bin'
     result = dict(source=args.source, binary_sha256=hashlib.sha256((bindir/'postgres').read_bytes()).hexdigest(),

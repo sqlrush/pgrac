@@ -70,7 +70,7 @@ class LocalQuorum:
         return process
 
     def start(self):
-        self.root.mkdir(parents=True, exist_ok=False)
+        self.root.mkdir(parents=True, mode=0o700, exist_ok=False)
         self.owned_root = True
         os.chown(self.root, self.uid, self.gid)
         self.lock = open('/run/lock/pgrac-local-quorum.lock', 'a')

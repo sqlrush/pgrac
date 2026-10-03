@@ -14,6 +14,35 @@ def quote(value):
     return "'" + value.replace('\\', '\\\\').replace("'", "''") + "'"
 
 
+def test_settings(lines, fixed):
+    """Render test inputs, leaving type/scope qualification to native initdb.
+
+    INSTANCE names follow config_policies in cluster_shared_config_guc.c;
+    ordinary scalar defaults are COMMON. Unsupported strings still fail the
+    original producer's policy. Discovery/identity bindings cannot be replaced.
+    """
+    instance_names = {'shared_buffers', 'unix_socket_group', 'unix_socket_permissions',
+                      'log_directory', 'log_filename', 'logging_collector', 'log_destination',
+                      'log_line_prefix', 'cluster.external_fence_socket_path'}
+    common, instance = {}, {}
+    for line in lines:
+        match = re.fullmatch(r"\s*([a-z][a-z0-9_.]*)\s*=\s*('(?:''|[^'\\\r\n])*'|[A-Za-z0-9_./:+-]+)\s*", line)
+        if not match or '\n' in line or '\r' in line or '\0' in line:
+            raise ValueError('test setting must be one scalar assignment')
+        name, value = match.groups()
+        if value.startswith("'"):
+            value = value[1:-1].replace("''", "'")
+        if name in fixed:
+            if fixed[name] is None or value != str(fixed[name]):
+                raise ValueError('test setting changes fixed cohort identity: '+name)
+            continue
+        target = instance if name in instance_names else common
+        if name in target:
+            raise ValueError('duplicate cohort test setting: '+name)
+        target[name] = value
+    return common, instance
+
+
 def request(layout, quorum_name, addresses, system_identifier, authority_uuid, storage_uuid):
     nodes = layout['nodes']
     if len(nodes) not in (2, 4) or [n['id'] for n in nodes] != list(range(len(nodes))):
@@ -24,6 +53,8 @@ def request(layout, quorum_name, addresses, system_identifier, authority_uuid, s
     for value in (authority_uuid, storage_uuid):
         if not re.fullmatch('[0-9a-f]{32}', value) or int(value, 16) == 0:
             raise ValueError('invalid creation UUID')
+    if authority_uuid[12] != '4' or authority_uuid[16] not in '89ab':
+        raise ValueError('native ROOT authority UUID must be RFC-4122 version 4')
     if not 0 < int(system_identifier) < 2**64:
         raise ValueError('invalid creation system identity')
     root = Path(layout['root'])
@@ -41,6 +72,13 @@ def request(layout, quorum_name, addresses, system_identifier, authority_uuid, s
         'cluster.storage_quorum_cluster': quorum_name,
         'cluster.storage_quorum_nodes': ','.join(f'{n}:{n+1}' for n in range(len(nodes))),
     }
+    fixed = {name: value for name, value in common.items() if name not in (
+        'cluster.lms_workers', 'cluster.cf_enqueue_timeout_ms')}
+    # These vary per node and are owned by the caller's allocated topology.
+    fixed.update({'cluster.node_id': None, 'listen_addresses': None,
+                  'port': None, 'unix_socket_directories': None})
+    extra_common, extra_instance = test_settings(layout.get('extra_conf', []), fixed)
+    common.update(extra_common)
     text = (f'@authority_uuid={authority_uuid}\n@configured_0={(1 << len(nodes))-1:016x}\n'
             f'@configured_1=0000000000000000\n@database_incarnation=1\n@format=1\n@generation=1\n'
             f'@storage_uuid={storage_uuid}\n@system_identifier={system_identifier}\n')
@@ -48,6 +86,7 @@ def request(layout, quorum_name, addresses, system_identifier, authority_uuid, s
     for node, address in zip(nodes, addresses):
         values = {'cluster.node_id': node['id'], 'listen_addresses': address, 'port': node['port'],
                   'shared_buffers': '16MB', 'unix_socket_directories': node['host']}
+        values.update(extra_instance)
         text += ''.join(f'node{node["id"]:03d}.{key}={quote(values[key])}\n' for key in sorted(values))
     return text
 

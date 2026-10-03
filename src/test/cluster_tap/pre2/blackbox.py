@@ -141,7 +141,7 @@ class BlackBox:
         for path in self.layout.get("voting_disks", []):
             if os.path.lexists(path):
                 raise ValueError("voting path already exists: " + path)
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, mode=0o700, exist_ok=True)
         (self.root / "blackbox-layout.json").write_text(json.dumps(self.layout, indent=2) + "\n")
         allowed = [self.root.resolve(), *(Path(n["data_dir"]).resolve() for n in self.layout["nodes"])]
         commands = []

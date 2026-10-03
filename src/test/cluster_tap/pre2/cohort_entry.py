@@ -139,7 +139,6 @@ class CohortEntry(BlackBox):
             (target/'pgrac.conf').write_text(topology(self.handles['name'], self.layout['nodes'], self.addresses))
             with (target/'postgresql.conf').open('a') as output:
                 output.write(discovery(self.layout, node, self.fixture['votes']))
-                output.write('\n'.join(self.layout.get('extra_conf', []))+'\n')
         # Keep regular TAP disk handles meaningful without copying authority
         # bytes or replacing the controller's disposable loop devices.
         for alias, device in zip(self.layout.get('voting_disks', []), self.fixture['votes']):

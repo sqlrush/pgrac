@@ -56,9 +56,10 @@ class CohortEntryTest(unittest.TestCase):
             self.assertEqual((data/'global/pg_control').read_bytes(), b'opaque unit control')
             self.assertTrue((data/'pg_wal').is_symlink())
             self.assertIn('cluster.voting_disks=', (data/'postgresql.conf').read_text())
-            self.assertIn('autovacuum = off', (data/'postgresql.conf').read_text())
+            self.assertNotIn('autovacuum', (data/'postgresql.conf').read_text())
             self.assertEqual(driver.command_node('pg_ctl', ['start', '-D', node['data_dir']]), node['id'])
         self.assertEqual(driver.command_node('initdb', ['--pgrac-initdb-cohort']), 0)
+        self.assertIn("common.autovacuum='off'", (self.root/'case/request.conf').read_text())
         with self.assertRaisesRegex(ValueError, 'DATA'):
             driver.command_node('pg_ctl', ['-D', '/unowned/pgdata', 'start'])
 

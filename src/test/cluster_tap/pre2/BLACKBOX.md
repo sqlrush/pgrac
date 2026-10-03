@@ -94,8 +94,10 @@ and devices remain owned and live. The adapter rechecks quorum, native raw I/O
 attestation and namespace identity before fresh creation. Initial vote images
 use the original formatter with exclusive creation and native CRC readback;
 no runtime vote or admission witness is synthesized. TAP vote paths are aliases
-to the newly attached devices. `extra_conf` remains local test configuration;
-the product rejects any forbidden override of COMMON parameters.
+to the newly attached devices. Scalar `extra_conf` settings go into the native
+creation input in their COMMON/INSTANCE scope, never into a late local
+override. Identity/topology overrides and unsupported assignment syntax are
+refused; the original producer remains responsible for GUC qualification.
 
 No lifecycle observation is advertised by default. Pass `--operations` with a
 JSON mapping to actual installed SQL/CLI observations once available. The
