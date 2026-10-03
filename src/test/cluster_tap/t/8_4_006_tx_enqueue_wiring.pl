@@ -16,6 +16,7 @@ my $postinit = File::Spec->catfile($backend, 'utils', 'init', 'postinit.c');
 my %allowed_callsite = map { $_ => 1 } (
 	File::Spec->catfile($backend, 'access', 'heap', 'heapam.c'),
 	File::Spec->catfile($backend, 'access', 'heap', 'heapam_visibility.c'),
+	File::Spec->catfile($backend, 'access', 'nbtree', 'nbtinsert.c'),
 );
 
 open(my $provider_fh, '<', $provider) or die "open $provider: $!";
@@ -54,7 +55,7 @@ find(
 	$backend);
 
 is_deeply(\@unexpected, [],
-	'TARGET production callsites are absent or confined to the named heap backend files');
+	'TARGET production callsites are confined to the named heap and btree backend files');
 
 my $grd_registration = index($postinit_source,
 	'before_shmem_exit(cluster_grd_cleanup_on_backend_exit_callback, 0)');

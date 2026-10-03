@@ -258,7 +258,7 @@ $node_lx->stop;
 
 
 # ----------
-# L9: phase 4 FATAL path works when CSSD spawn is interrupted.
+# L9: phase 3 FATAL path works when CSSD spawn is interrupted.
 # ----------
 {
 	my $node_l9 = PgracClusterNode->new('l9_cssd_spawn_fail');
@@ -270,8 +270,8 @@ $node_lx->stop;
 	$node_l9->start(fail_ok => 1);
 	my $log_l9 = slurp_file($node_l9->logfile);
 	like($log_l9,
-		 qr/SQLSTATE 53R30|CSSD_SPAWN_FAILED|cluster phase 4: failed to spawn CSSD/i,
-		 'L9 phase 4 FATAL out path works when CSSD spawn is interrupted by injection (53R30 plumbing reachable)');
+		 qr/cluster startup phase phase3_recovery failed: cluster phase 3: failed to spawn CSSD/i,
+		 'L9 phase 3 refuses startup when CSSD spawn is interrupted by injection');
 
 	$node_l9->stop('immediate', fail_ok => 1);
 }

@@ -470,6 +470,9 @@ SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
 
 # PGRAC: execute original entry-point prologues before any native mutation.
 TESTS += test_cluster_fresh_scope
+
+# Include tests registered after the initial all prerequisite expansion.
+all: $(TESTS)
 test_cluster_fresh_control.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^XLogValidateControlFile\(/ { print "void"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp

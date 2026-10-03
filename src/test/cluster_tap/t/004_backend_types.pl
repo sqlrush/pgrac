@@ -159,11 +159,11 @@ ok($node->poll_query_until(
 	q{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'lmd'}),
 	'LMD aux process visible in pg_stat_activity (spec-2.19 Sprint A)');
 
-# Undo Cleaner is spawned by postmaster's PM_RUN ServerLoop path (spec-3.13).
+# All eight Undo Cleaner workers are spawned by the PM_RUN ServerLoop path.
 ok($node->poll_query_until(
 	'postgres',
-	q{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'undo cleaner'}),
-	'Undo Cleaner aux process visible in pg_stat_activity (spec-3.13)');
+	q{SELECT count(*) = 8 FROM pg_stat_activity WHERE backend_type = 'undo cleaner'}),
+	'All eight Undo Cleaner aux processes are visible in pg_stat_activity');
 
 
 $node->stop;

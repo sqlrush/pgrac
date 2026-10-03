@@ -21,7 +21,7 @@
 #        (fail-closed production storage startup).
 #      - 12 cluster_shared_fs wait events are present in
 #        pg_stat_cluster_wait_events under type='Cluster: SharedFs'.
-#      - 3 cluster_shared_fs injection points appear in
+#      - 4 cluster_shared_fs injection points appear in
 #        pg_stat_cluster_injections (registry total: 17 = 14 + 3).
 #      - cluster_inject_fault('cluster-shared-fs-init-top','warning',0)
 #        followed by a restart bumps that point's hits counter.
@@ -125,14 +125,14 @@ is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_stat_cluster_injections
 		   WHERE name LIKE 'cluster-shared-fs-%'}),
-	'3',
-	'L8 3 cluster_shared_fs injection points registered');
+	'4',
+	'L8 4 cluster_shared_fs injection points registered');
 
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'186',
-	'L9 total injection registry size is 186 (authority synchronized with t/015)');
+	'187',
+	'L9 total injection registry size is 187 (authority synchronized with t/015)');
 
 
 # ----------

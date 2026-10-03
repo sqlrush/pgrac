@@ -65,12 +65,12 @@ $node->append_conf('postgresql.conf', "cluster.node_id = 0\n");
 $node->start;
 
 
-# L1 — pg_cluster_state.gcs surface has 121 keys (PCM-X queue observability +3).
+# L1 — pg_cluster_state.gcs surface has 117 keys (current registry).
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '121',
-   'L1 pg_cluster_state.gcs category has 121 keys (PCM-X queue observability +3)');
+   '117',
+   'L1 pg_cluster_state.gcs category has 117 keys (current registry)');
 
 
 # L2 — api_state = "active" after postmaster phase 1 init.

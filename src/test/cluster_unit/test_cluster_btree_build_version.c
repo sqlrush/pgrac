@@ -40,7 +40,7 @@
 UT_DEFINE_GLOBALS();
 
 bool cluster_enabled = true, cluster_shared_config = true;
-int cluster_node_id, wal_level = WAL_LEVEL_REPLICA;
+int cluster_node_id = 0, wal_level = WAL_LEVEL_REPLICA;
 bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
 

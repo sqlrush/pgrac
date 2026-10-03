@@ -28,12 +28,12 @@
 #      L3   the "pgrac cluster write fence" shmem region is registered
 #      L4   both write-fence wait events are registered
 #           (ClusterWriteFenceMarkerWrite + ClusterWriteFenceVerify)
-#      L5   the write_fence dump category exposes 8 counters (4 spec-4.12 +
-#           4 spec-4.12b D6 baseline), all 0 at a fresh start (no fence fired)
+#      L5   write_fence exposes 20 fields (8 cooperative + 12 external).
+#           Counters are 0 and absent external proof age is "-".
 #      L6   default ON + no voting disks -> auto-degrade to a no-op: a
 #           normal heap write/read round-trips (the fence never blocks an
 #           unfenced single node)
-#      L7   after the normal write, the 4 counters are still 0 (the gate
+#      L7   after the normal write, all counters are still 0 (the gate
 #           did not fire in the auto-degraded single-node mode)
 #      L8   qvotec logged the single-node auto-degrade notice once at
 #           startup (spec-4.12b D4 LOG-once observability)
@@ -115,8 +115,8 @@ is($waits, 'ClusterWriteFenceMarkerWrite,ClusterWriteFenceVerify',
 
 
 # ----------
-# L5: the write_fence dump category exposes 8 counters (the 4 spec-4.12 plus
-# the 4 spec-4.12b D6 baseline-subsystem fields), all 0 at a fresh start.
+# L5: all 20 cooperative/external fields must be present.  Counters are 0;
+# an absent external proof has the documented "-" age sentinel.
 # (baseline_published / baseline_authority_age_us can only be exercised by a
 # multi-node cluster authoring a baseline -> D8 e2e on CI; single-node stays 0.)
 # ----------
@@ -125,13 +125,20 @@ my $keys = $node->safe_psql('postgres',
 	    FROM pg_cluster_state WHERE category = 'write_fence'});
 is($keys,
    'baseline_author_is_self,baseline_authority_age_us,baseline_published,'
-	   . 'baseline_stale_rejected,durable_check_blocked,hot_gate_blocked,'
+	   . 'baseline_stale_rejected,durable_check_blocked,external_admit_requested,'
+	   . 'external_daemon_disconnect,external_expired,external_identity_mismatch,'
+	   . 'external_last_journal_seq,external_last_proof_age_ms,'
+	   . 'external_mutation_gate_blocked,external_publish_gate_blocked,'
+	   . 'external_rejected,external_unavailable,external_unknown,'
+	   . 'external_write_excluded,hot_gate_blocked,'
 	   . 'marker_write_failed,minority_marker_ignored',
-   'L5 write_fence dump category exposes the 8 counters (4 spec-4.12 + 4 D6)');
+   'L5 write_fence exposes exactly 20 cooperative/external fields');
 
 my $all_zero = $node->safe_psql('postgres',
-	q{SELECT bool_and(value = '0') FROM pg_cluster_state WHERE category = 'write_fence'});
-is($all_zero, 't', 'L5 all 8 write_fence counters are 0 at a fresh start');
+	q{SELECT bool_and(value = CASE key
+	    WHEN 'external_last_proof_age_ms' THEN '-' ELSE '0' END)
+	  FROM pg_cluster_state WHERE category = 'write_fence'});
+is($all_zero, 't', 'L5 counters are 0 and external proof is absent at a fresh start');
 
 
 # ----------
@@ -155,13 +162,15 @@ is($cnt2, '50', 'L6 truncate + re-extend also pass the gate in auto-degraded mod
 
 
 # ----------
-# L7: after the normal writes, the 4 counters are STILL 0 -- the gate did
+# L7: after the normal writes, the counters are STILL 0 -- the gate did
 # not fire (no false-positive fencing of an unfenced single node).
 # ----------
 my $still_zero = $node->safe_psql('postgres',
-	q{SELECT bool_and(value = '0') FROM pg_cluster_state WHERE category = 'write_fence'});
+	q{SELECT bool_and(value = CASE key
+	    WHEN 'external_last_proof_age_ms' THEN '-' ELSE '0' END)
+	  FROM pg_cluster_state WHERE category = 'write_fence'});
 is($still_zero, 't',
-   'L7 write_fence counters stay 0 after normal writes (gate did not fire)');
+   'L7 counters stay 0 and external proof stays absent after normal writes');
 
 
 # ----------
