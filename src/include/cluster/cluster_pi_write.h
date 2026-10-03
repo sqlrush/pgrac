@@ -188,7 +188,9 @@ cluster_pcm_pi_write_cut_valid_v1(const ClusterPcmPiWriteCutV1 *cut)
 		   && h->assertion.requester_node >= 0
 		   && h->assertion.requester_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
 		   && (h->assertion.resource.forkNum == MAIN_FORKNUM
-			   || h->assertion.resource.forkNum == VISIBILITYMAP_FORKNUM)
+			   || h->assertion.resource.forkNum == VISIBILITYMAP_FORKNUM
+			   || (h->assertion.resource.forkNum == SPACE_FORKNUM
+				   && h->assertion.resource.blockNum < 2))
 		   && h->phase == RESOURCE_X_MASTER_SETTLED && h->is_head == 0 && h->resource_formation != 0
 		   && h->resource_formation != UINT64_MAX && h->master_session_incarnation != 0
 		   && h->master_session_incarnation != UINT64_MAX && h->assertion_sequence != 0

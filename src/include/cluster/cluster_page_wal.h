@@ -151,7 +151,9 @@ extern void cluster_page_wal_reset_reuse_locked(struct BufferDesc *buf);
 
 /* Caller already pins and content-locks this descriptor and supplies the
  * lifecycle-qualified SPACE identity. Does not acquire any page or grant
- * write/flush authority. Failure leaves output untouched. */
+ * write/flush authority. SPACE0/1 also decode and match the complete typed
+ * identity, including its state/sequence/operation. Only SPACE may use a
+ * tombstoned identity. Failure leaves output untouched. */
 extern bool cluster_page_wal_read_v1(Buffer buffer, const ClusterSpaceIdentity *identity,
 									 ClusterPageWalBindingV1 *out);
 

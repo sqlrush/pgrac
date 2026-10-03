@@ -10736,6 +10736,7 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 	volatile bool io_started = false;
 	volatile bool data_locked = false;
 	volatile bool complete = false;
+	bool space_target, identity_target;
 	PGAlignedBlock expected, disk;
 	uint64 space_token;
 	ClusterPageDataReceiptV1 *receipt;
@@ -10746,7 +10747,8 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 		|| (!sample_identity && !rf_page_version_present_v1(&target->version))
 		|| (sample_identity && (!sample_current || cut == NULL))
 		|| (target->identity.forknum != MAIN_FORKNUM
-			&& target->identity.forknum != VISIBILITYMAP_FORKNUM)
+			&& target->identity.forknum != VISIBILITYMAP_FORKNUM
+			&& !(target->identity.forknum == SPACE_FORKNUM && target->identity.blockno < 2))
 		|| cluster_smgr_which_for(target->identity.locator, InvalidBackendId) != 1
 		|| !cluster_wal_thread_current_v2_ref(&source)
 		|| source.claim.identity.origin_thread_id == 0
@@ -10756,6 +10758,8 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 		|| source.claim.database_incarnation != target->database_incarnation
 		|| memcmp(source.claim.identity.storage_uuid, target->identity.storage_uuid, 16) != 0)
 		return false;
+	space_target = target->identity.forknum == SPACE_FORKNUM;
+	identity_target = space_target && target->identity.blockno == 0;
 	written_target = *target;
 	memset(&key, 0, sizeof(key));
 	key.system_identifier = target->identity.system_identifier;
@@ -10780,16 +10784,20 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 			uint16 stored_checksum;
 			int page_origin;
 
-			space = cluster_page_data_try_hold(space_tag, false, &space_owner);
+			space = cluster_page_data_try_hold(space_tag, identity_target, &space_owner);
 			if (space == NULL
 				|| !cluster_space_identity_page_decode(BufHdrGetBlock(space), BLCKSZ, SPACE_FORKNUM,
 													   0, &key, &space_identity, &space_token)
-				|| space_identity.state != CLUSTER_SPACE_IDENTITY_LIVE
+				|| (!space_target && space_identity.state != CLUSTER_SPACE_IDENTITY_LIVE)
 				|| (!sample_identity
 					&& memcmp(space_identity.incarnation, target->version.segment_incarnation, 16)
 						   != 0))
 				break;
-			data = cluster_page_data_try_hold(data_tag, true, &data_owner);
+			if (identity_target) {
+				data = space;
+				data_owner = space_owner;
+			} else
+				data = cluster_page_data_try_hold(data_tag, true, &data_owner);
 			data_locked = data != NULL;
 			if (data == NULL
 				|| (cut != NULL
@@ -10805,9 +10813,8 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 			header = (PageHeader)expected.data;
 			if (PageIsNew(expected.data) || PageGetPageSize(expected.data) != BLCKSZ
 				|| PageGetPageLayoutVersion(expected.data) != PG_PAGE_LAYOUT_VERSION
-				|| (header->pd_flags
-					& (~PD_VALID_FLAG_BITS | PD_SPACE_METADATA | PD_UNDO_SEG_HEADER))
-					   != 0
+				|| (header->pd_flags & (~PD_VALID_FLAG_BITS | PD_UNDO_SEG_HEADER)) != 0
+				|| (!space_target && (header->pd_flags & PD_SPACE_METADATA) != 0)
 				|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
 				|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
 				|| header->pd_block_scn != written_target.version.mutation_token
@@ -10831,9 +10838,13 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 				break;
 			/* The native write consumed a stable snapshot. Keep the raw pin
 			 * and SPACE identity owner, but let foreground current writers run
-			 * during fork fsync/readback. Reacquire without waiting below. */
-			LWLockRelease(BufferDescriptorGetContentLock(data));
-			data_locked = false;
+			 * during fork fsync/readback. Reacquire without waiting below.
+			 * SPACE0 itself owns the identity lock and must retain that single
+			 * hold; neither reacquire it recursively nor release it twice. */
+			if (!identity_target) {
+				LWLockRelease(BufferDescriptorGetContentLock(data));
+				data_locked = false;
+			}
 			smgrimmedsync(rel, target->identity.forknum);
 			smgrread(rel, target->identity.forknum, target->identity.blockno, disk.data);
 			/* Never let ignore_checksum_failure qualify physical DATA. Check
@@ -10846,7 +10857,8 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 				break;
 			header->pd_checksum = ((PageHeader)disk.data)->pd_checksum = 0;
 			if (memcmp(expected.data, disk.data, BLCKSZ) != 0
-				|| !LWLockConditionalAcquire(BufferDescriptorGetContentLock(data), LW_SHARED))
+				|| (!data_locked
+					&& !LWLockConditionalAcquire(BufferDescriptorGetContentLock(data), LW_SHARED)))
 				break;
 			data_locked = true;
 			if (!cluster_page_data_holder_ready(data, &data_tag, true, &live)
@@ -10868,7 +10880,7 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 		error_context_stack = saved_context;
 		if (io_started)
 			AbortBufferIO(BufferDescriptorGetBuffer(data));
-		if (data != NULL) {
+		if (data != NULL && data != space) {
 			/* elog(ERROR) reset holdoffs, but these exact locks remain ours. */
 			if (data_locked) {
 				if (InterruptHoldoffCount == 0)

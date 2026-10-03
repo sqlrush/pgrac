@@ -608,11 +608,11 @@ cluster_page_wal_read_v1(Buffer buffer, const ClusterSpaceIdentity *identity,
 	int origin;
 	uint32 state;
 
-	if (bindings == NULL || buffer <= 0 || buffer > NBuffers || identity == NULL || out == NULL
-		|| identity->state != CLUSTER_SPACE_IDENTITY_LIVE)
+	if (bindings == NULL || buffer <= 0 || buffer > NBuffers || identity == NULL || out == NULL)
 		return false;
 	buf = GetBufferDescriptor(buffer - 1);
-	if (!LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+	if (!LWLockHeldByMe(BufferDescriptorGetContentLock(buf))
+		|| (buf->tag.forkNum != SPACE_FORKNUM && identity->state != CLUSTER_SPACE_IDENTITY_LIVE))
 		return false;
 	state = pg_atomic_read_u32(&buf->state);
 	if ((state & (BM_VALID | BM_TAG_VALID | BM_PERMANENT))
@@ -636,6 +636,29 @@ cluster_page_wal_read_v1(Buffer buffer, const ClusterSpaceIdentity *identity,
 		|| PageGetLSN(page) != value->record_end || !PageGetLSNOrigin(page, &origin)
 		|| origin != value->source.claim.identity.origin_thread_id - 1)
 		return false;
+	if (buf->tag.forkNum == SPACE_FORKNUM) {
+		ClusterSpaceIdentity decoded;
+		uint64 token;
+
+		if (buf->tag.blockNum == 0) {
+			if (!cluster_space_identity_page_decode(page, BLCKSZ, SPACE_FORKNUM, 0, &identity->key,
+													&decoded, &token))
+				return false;
+		} else {
+			ClusterSpaceReservation reservation;
+			if (!cluster_space_reservation_page_decode(page, BLCKSZ, SPACE_FORKNUM,
+													   buf->tag.blockNum, &identity->key,
+													   &reservation, &token))
+				return false;
+			decoded = reservation.identity;
+		}
+		/* The reservation belongs to this exact structural identity. A
+		 * matching BufferTag, LSN or incarnation alone is insufficient. */
+		if (memcmp(decoded.incarnation, identity->incarnation, 16) != 0
+			|| decoded.sequence != identity->sequence || decoded.operation != identity->operation
+			|| decoded.state != identity->state || token != value->version.mutation_token)
+			return false;
+	}
 	*out = *value;
 	return true;
 }

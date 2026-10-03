@@ -25,6 +25,9 @@ typedef struct ClusterPageDataReceiptV1 ClusterPageDataReceiptV1;
  * resident, unfenced current-X; resident SPACE0 stays locked across write,
  * fsync and exact post-read; DATA content is unlocked after the native write
  * and reacquired conditionally to verify the same WAL/version after readback.
+ * SPACE0/1 require a decoded typed identity; SPACE0 is its own identity hold
+ * and stays locked once across I/O. Tombstoned identities qualify only SPACE
+ * metadata, never ordinary DATA or completion of a structural side effect.
  * Busy/missing/stale returns false, never takes
  * ownership or creates storage. The exact native WAL binding must name the
  * selected local writer generation or carry its original writer's native
