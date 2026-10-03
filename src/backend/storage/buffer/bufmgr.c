@@ -86,6 +86,7 @@
 #include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_pi_data.h"
 #include "cluster/cluster_pi_writeback.h"
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_writer.h"
@@ -11304,6 +11305,62 @@ cluster_page_structural_record_v1(const ClusterPageWalBindingV1 *binding,
 	 * Its physical and per-PI obligations remain with the original owner. */
 	*out = ended.change;
 	return true;
+}
+
+bool
+cluster_page_structural_ancestor_v1(const ClusterPageWalBindingV1 *binding,
+	const ClusterPageWalBindingV1 *pi, const ClusterThreadRecoveryFabricPlanV1 *plan)
+{
+	ClusterSpaceStructureChange change;
+	const RfPageOnlinePlanV1 *page = cluster_thread_recovery_fabric_page_plan_v1(plan);
+
+	if (!cluster_page_wal_binding_shape_v1(pi) || page == NULL
+		|| pi->flags != CLUSTER_PAGE_WAL_NATIVE_FLUSHED
+		|| (pi->identity.forknum != MAIN_FORKNUM && pi->identity.forknum != VISIBILITYMAP_FORKNUM)
+		|| !cluster_page_structural_record_v1(binding, pi->version.segment_incarnation, plan, &change)
+		|| binding->identity.system_identifier != pi->identity.system_identifier
+		|| binding->source.claim.database_incarnation != pi->source.claim.database_incarnation
+		|| memcmp(binding->identity.storage_uuid, pi->identity.storage_uuid, 16) != 0
+		|| !RelFileLocatorEquals(binding->identity.locator, pi->identity.locator))
+		return false;
+	for (uint32 i = 0; i < rf_page_online_plan_target_count_v1(page); i++) {
+		RfPageOnlineTargetViewV1 view;
+		bool found = false;
+
+		if (!rf_page_online_plan_target_v1(page, i, &view))
+			return false;
+		if (!rf_page_identity_equal_v1(&pi->identity, &view.page_identity))
+			continue;
+		if (view.contributors == NULL || view.contributors->edge_count == 0)
+			return false;
+		for (uint32 j = 0; j < view.contributors->edge_count; j++) {
+			const RfPageStableEdgeInputV1 *edge = &view.contributors->edges[j];
+			const RfPageReplayRecordIdentityV1 *record = &edge->record_identity;
+			ClusterWalSourceRef source;
+
+			/* A tag/UUID match alone is insufficient. Require the complete
+			 * old chain before this structural end, including any later edge
+			 * than the requested PI; it cannot hide behind ABSENT/REPLACED. */
+			if (edge->edge.page_class != RF_PAGE_CLASS_ORDINARY
+				|| edge->edge.result_kind != RF_PAGE_STATE_PRESENT
+				|| memcmp(edge->edge.result_incarnation, pi->version.segment_incarnation, 16) != 0
+				|| scn_total_cmp(edge->result_token, change.identity.result_token) >= 0
+				|| !rf_page_online_plan_source_v1(page, edge->participant_index, &source)
+				|| (cluster_page_data_source_covered_by(&binding->source, &source)
+					&& record->end_rec_ptr > binding->record_start))
+				return false;
+			if (edge->result_token != pi->version.mutation_token)
+				continue;
+			if (found || !cluster_page_data_source_covered_by(&pi->source, &source)
+				|| record->read_rec_ptr != pi->record_start || record->end_rec_ptr != pi->record_end
+				|| record->record_crc != pi->record_crc || record->rmid != pi->rmid
+				|| record->info != pi->info)
+				return false;
+			found = true;
+		}
+		return found;
+	}
+	return false;
 }
 
 bool

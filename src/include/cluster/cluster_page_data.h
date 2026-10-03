@@ -57,6 +57,13 @@ extern bool cluster_page_structural_record_v1(const struct ClusterPageWalBinding
 	const uint8 retired_incarnation[16], const struct ClusterThreadRecoveryFabricPlanV1 *plan,
 	struct ClusterSpaceStructureChange *out);
 
+/* Pure per-PI MAIN/VM ancestry in that same sealed input. The entire old
+ * incarnation's PAGE chain must precede the exact structural end, and pi
+ * must match an original full source/record within it. This query is not a
+ * DATA receipt, KO completion, durability proof or physical-disposal grant. */
+extern bool cluster_page_structural_ancestor_v1(const struct ClusterPageWalBindingV1 *binding,
+	const struct ClusterPageWalBindingV1 *pi, const struct ClusterThreadRecoveryFabricPlanV1 *plan);
+
 /* Bind typed SPACE DATA to its exact original contribution and complete
  * retained ancestry. Ordinary PAGE receipts keep their existing proof path.
  * The caller must retain this immutable plan until all receipts/ACKs using

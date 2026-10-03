@@ -667,6 +667,7 @@ shared_buffer_write_error_callback(void *arg)
 	} while (0)
 #include "test_cluster_space_recovery_flush.inc"
 #include "test_cluster_page_flush.inc"
+#include "test_cluster_page_data_scn.inc"
 #include "test_cluster_page_data.inc"
 #include "test_cluster_block_redeclare_scan.inc"
 
@@ -2849,8 +2850,9 @@ space_tag_receipt_exports_only_after_real_data_completion(void)
 /* Real typed SIDE/fabric and native DATA/ACK consumers, with decoded WAL and
  * existing PCM/native writer boundaries as in the ordinary PAGE cases. */
 static ClusterThreadRecoveryFabricPlanV1 *
-space_structural_plan(bool drop, bool gap, bool seal, bool successor,
-	ClusterPageWalBindingV1 *binding, ClusterSpaceStructureChange *expected)
+space_structural_plan_internal(bool drop, bool gap, bool seal, bool successor,
+	ClusterPageWalBindingV1 *binding, ClusterSpaceStructureChange *expected,
+	const SCN *tokens, ForkNumber fork, ClusterPageWalBindingV1 *pi)
 {
 	ClusterThreadRecoveryFabricPlanRequestV1 request = {0};
 	ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
@@ -2864,21 +2866,24 @@ space_structural_plan(bool drop, bool gap, bool seal, bool successor,
 	for (uint32 i = 0; i < count; i++) {
 		sources[i] = writer;
 		sources[i].claim.identity.origin_node_id = i;
-		sources[i].claim.identity.origin_thread_id = i + 1;
+		sources[i].claim.identity.origin_thread_id = sources[i].claim.identity.origin_node_id + 1;
 		sources[i].claim.claim_sha256[1] = i;
-		cuts[i].failed_thread = i + 1;
+		cuts[i].failed_thread = sources[i].claim.identity.origin_thread_id;
 		sources[i].claim.max_config_generation = 2;
 		cuts[i].origin_owner_incarnation = sources[i].claim.identity.origin_owner_incarnation;
 		cuts[i].timeline_id = sources[i].timeline;
 		cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
 		cuts[i].scan_begin_inclusive = 0x100;
-		cuts[i].scan_end_exclusive = 0x200;
+		cuts[i].scan_end_exclusive = redo[i] = tokens == NULL ? 0x200 : 0x300;
 	}
 	request.system_identifier = identity.key.system_identifier;
 	memcpy(request.storage_uuid, identity.key.storage_uuid, 16);
 	request.sources = sources;
 	request.physical_cuts = cuts;
-	request.redo_starts = redo; /* Every contribution is retained history. */
+	/* The production PI contribution owner supplies NULL to retain every
+	 * PAGE edge. Its graph cannot authorize native replay. SIDE-only tests
+	 * also check lookup of a structural end in a native historical window. */
+	request.redo_starts = tokens == NULL ? redo : NULL;
 	request.participant_count = count;
 	request.retention_binding_cookie = 41;
 	request.space_active = true;
@@ -2914,7 +2919,57 @@ space_structural_plan(bool drop, bool gap, bool seal, bool successor,
 		XLogReaderState reader = {0};
 		char error[1024];
 		uint32 length;
-		if (i == 0) {
+		uint32 role = tokens == NULL ? i : 1 - i;
+		if (tokens != NULL) {
+			union {
+				DecodedXLogRecord record;
+				char bytes[sizeof(DecodedXLogRecord) + sizeof(DecodedBkpBlock)];
+			} data = {0};
+			PGAlignedBlock image;
+			DecodedBkpBlock *block = &data.record.blocks[0];
+			RfPageVersionEdgeEntryV1 *edge = &data.record.page_version_edge.entries[0];
+			reader.record = &data.record;
+			reader.ReadRecPtr = data.record.lsn = 0x100;
+			reader.EndRecPtr = data.record.next_lsn = 0x200;
+			reader.system_identifier = request.system_identifier;
+			reader.errormsg_buf = error;
+			data.record.header.xl_rmid = RM_XLOG_ID;
+			data.record.header.xl_info = XLOG_FPI;
+			data.record.header.xl_crc = 0x8182 + i;
+			data.record.max_block_id = 0;
+			data.record.has_page_version_edge = true;
+			data.record.page_version_edge.entry_count = 1;
+			data.record.page_version_edge.result_token = tokens[role + 1];
+			memcpy(image.data, pages[1].data, BLCKSZ);
+			((PageHeader)image.data)->pd_block_scn = tokens[role + 1];
+			block->in_use = block->has_image = block->apply_image = true;
+			block->rlocator = target.identity.locator;
+			block->forknum = fork;
+			block->blkno = target.identity.blockno;
+			block->bkp_image = image.data;
+			block->bimg_len = BLCKSZ;
+			block->bimg_info = BKPIMAGE_APPLY;
+			edge->page_class = RF_PAGE_CLASS_ORDINARY;
+			edge->before_kind = edge->result_kind = RF_PAGE_STATE_PRESENT;
+			memcpy(edge->before.segment_incarnation, identity.incarnation, 16);
+			memcpy(edge->result_incarnation, identity.incarnation, 16);
+			edge->before.mutation_token = tokens[role];
+			edge->edge_flags = RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE;
+			UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_feed_record_v1(plan, &reader, i), RF_PAGE_PROOF_DETAIL_OK);
+			memset(&pi[role], 0, sizeof(pi[role]));
+			pi[role].source = sources[i];
+			pi[role].identity = target.identity;
+			pi[role].identity.forknum = fork;
+			pi[role].version = target.version;
+			pi[role].version.mutation_token = tokens[role + 1];
+			pi[role].record_start = 0x100;
+			pi[role].record_end = 0x200;
+			pi[role].record_crc = data.record.header.xl_crc;
+			pi[role].rmid = RM_XLOG_ID;
+			pi[role].info = XLOG_FPI;
+			pi[role].flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+		}
+		if (role == 0) {
 			length = CLUSTER_SPACE_RESERVATION_WAL_BYTES;
 			UT_ASSERT(cluster_space_reservation_wal_encode(&advance, payload.data, length));
 		} else {
@@ -2938,8 +2993,8 @@ space_structural_plan(bool drop, bool gap, bool seal, bool successor,
 				xl_xact_tt_commit tt = {0};
 				uint32 one = 1;
 				char *p = payload.data;
-				tt.instance = i + 1;
-				tt.segment_id = i * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+				tt.instance = sources[i].claim.identity.origin_thread_id;
+				tt.segment_id = sources[i].claim.identity.origin_node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
 				tt.segment_generation = 11;
 				tt.slot_offset = 4;
 				tt.wrap = 7;
@@ -2963,20 +3018,20 @@ space_structural_plan(bool drop, bool gap, bool seal, bool successor,
 			}
 		}
 		reader.record = &decoded;
-		reader.ReadRecPtr = decoded.lsn = 0x100;
-		reader.EndRecPtr = decoded.next_lsn = 0x200;
+		reader.ReadRecPtr = decoded.lsn = tokens == NULL ? 0x100 : 0x200;
+		reader.EndRecPtr = decoded.next_lsn = tokens == NULL ? 0x200 : 0x300;
 		reader.system_identifier = request.system_identifier;
 		reader.errormsg_buf = error;
-		decoded.header.xl_rmid = drop && i > 0 ? RM_XACT_ID : RM_SMGR_ID;
-		decoded.header.xl_info = drop && i > 0 ? XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO
-			: (i == 0 ? XLOG_SMGR_SPACE_RESERVATION : XLOG_SMGR_SPACE_IDENTITY) | XLR_SPECIAL_REL_UPDATE;
-		decoded.header.xl_xid = drop && i > 0 ? 802 : InvalidTransactionId;
+		decoded.header.xl_rmid = drop && role > 0 ? RM_XACT_ID : RM_SMGR_ID;
+		decoded.header.xl_info = drop && role > 0 ? XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO
+			: (role == 0 ? XLOG_SMGR_SPACE_RESERVATION : XLOG_SMGR_SPACE_IDENTITY) | XLR_SPECIAL_REL_UPDATE;
+		decoded.header.xl_xid = drop && role > 0 ? 802 : InvalidTransactionId;
 		decoded.header.xl_crc = 0x9192 + i;
 		decoded.max_block_id = -1;
 		decoded.main_data = payload.data;
 		decoded.main_data_len = length;
 		UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_feed_record_v1(plan, &reader, i), RF_PAGE_PROOF_DETAIL_OK);
-		if (i > 0) {
+		if (role > 0) {
 			memset(binding, 0, sizeof(*binding));
 			binding->source = sources[i];
 			binding->identity = target.identity;
@@ -2984,8 +3039,8 @@ space_structural_plan(bool drop, bool gap, bool seal, bool successor,
 			binding->identity.blockno = 0;
 			memcpy(binding->version.segment_incarnation, end.identity.result.incarnation, 16);
 			binding->version.mutation_token = end.identity.result_token;
-			binding->record_start = 0x100;
-			binding->record_end = 0x200;
+			binding->record_start = reader.ReadRecPtr;
+			binding->record_end = reader.EndRecPtr;
 			binding->record_crc = decoded.header.xl_crc;
 			binding->rmid = decoded.header.xl_rmid;
 			binding->info = decoded.header.xl_info;
@@ -2994,8 +3049,78 @@ space_structural_plan(bool drop, bool gap, bool seal, bool successor,
 		}
 	}
 	UT_ASSERT(cluster_thread_recovery_fabric_bind_database_v1(plan, identity.key.database_incarnation));
-	if (seal) UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	if (seal) {
+		RfPageProofDetailV1 detail = cluster_thread_recovery_fabric_plan_seal_v1(plan);
+		/* In a complete contribution graph, the ordinary SIDE seal already
+		 * rejects a broken reservation. The historical-only query tests
+		 * below retain the gap and reject it at the ancestry boundary. */
+		UT_ASSERT_EQ(detail, tokens != NULL && gap ? RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH
+			: RF_PAGE_PROOF_DETAIL_OK);
+	}
 	return plan;
+}
+
+static ClusterThreadRecoveryFabricPlanV1 *
+space_structural_plan(bool drop, bool gap, bool seal, bool successor,
+	ClusterPageWalBindingV1 *binding, ClusterSpaceStructureChange *expected)
+{
+	return space_structural_plan_internal(drop, gap, seal, successor, binding, expected,
+		NULL, MAIN_FORKNUM, NULL);
+}
+
+static void
+structural_ancestor_requires_the_exact_old_page_chain(void)
+{
+	const SCN tokens[] = {10, scn_encode(1, 20), 30};
+	for (unsigned drop = 0; drop < 2; drop++)
+		for (int vm = 0; vm < 2; vm++) {
+			ClusterPageWalBindingV1 binding, pi[2];
+			ClusterSpaceStructureChange change;
+			ClusterThreadRecoveryFabricPlanV1 *plan = space_structural_plan_internal(drop, false, true, false,
+				&binding, &change, tokens, vm ? VISIBILITYMAP_FORKNUM : MAIN_FORKNUM, pi);
+			UT_ASSERT(cluster_page_wal_binding_shape_v1(&pi[0]));
+			UT_ASSERT(cluster_page_wal_binding_shape_v1(&pi[1]));
+			UT_ASSERT(cluster_page_structural_record_v1(&binding, identity.incarnation, plan, &change));
+			UT_ASSERT_EQ(rf_page_online_plan_target_count_v1(cluster_thread_recovery_fabric_page_plan_v1(plan)), 1);
+			UT_ASSERT(cluster_page_structural_ancestor_v1(&binding, &pi[0], plan));
+			UT_ASSERT(cluster_page_structural_ancestor_v1(&binding, &pi[1], plan));
+			UT_ASSERT_EQ(writes + reads + syncs + pi_discards + logical_pi_retire_calls, 0);
+			cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+			clean();
+		}
+}
+
+static void
+structural_ancestor_refuses_substitution_or_unclosed_chain(void)
+{
+	for (unsigned fault = 0; fault < 18; fault++) {
+		SCN tokens[] = {10, scn_encode(1, 20), fault == 15 ? 40 : (fault == 16 ? 50 : 30)};
+		ClusterPageWalBindingV1 binding, pi[2], changed;
+		ClusterSpaceStructureChange change;
+		ClusterThreadRecoveryFabricPlanV1 *plan = space_structural_plan_internal(false, fault == 13, fault != 14, false,
+			&binding, &change, tokens, MAIN_FORKNUM, pi);
+		changed = pi[0];
+		switch (fault) {
+		case 0: changed.flags = 0; break;
+		case 1: changed.source.claim.identity.origin_owner_incarnation++; break;
+		case 2: changed.source.claim.claim_sha256[2]++; break;
+		case 3: changed.record_crc++; break;
+		case 4: changed.record_start++; break;
+		case 5: changed.record_end++; break;
+		case 6: changed.identity.blockno++; break;
+		case 7: changed.identity.forknum = FSM_FORKNUM; break;
+		case 8: changed.identity.locator.relNumber++; break;
+		case 9: changed.version.segment_incarnation[0]++; break;
+		case 10: changed.version.mutation_token++; break;
+		case 11: changed.source.claim.database_incarnation++; break;
+		case 12: changed.info = XLOG_FPI_FOR_HINT; break;
+		case 17: changed.identity.storage_uuid[0]++; break;
+		}
+		UT_ASSERT(!cluster_page_structural_ancestor_v1(&binding, &changed, plan));
+		UT_ASSERT_EQ(writes + reads + syncs + pi_discards + logical_pi_retire_calls, 0);
+		cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+		clean();
+	}
 }
 
 static void
@@ -3567,7 +3692,9 @@ int
 main(void)
 {
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
-	UT_PLAN(55);
+	UT_PLAN(57);
+	UT_RUN(structural_ancestor_requires_the_exact_old_page_chain);
+	UT_RUN(structural_ancestor_refuses_substitution_or_unclosed_chain);
 	UT_RUN(structural_binding_joins_original_record_and_retained_incarnation_end);
 	UT_RUN(structural_binding_rejects_unqualified_or_substituted_source);
 	UT_RUN(space_n_s_storage_retires_pi_without_current_x);

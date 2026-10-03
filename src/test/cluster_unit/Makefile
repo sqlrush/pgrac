@@ -2179,6 +2179,10 @@ test_cluster_page_wal: test_cluster_page_wal.c unit_test.h test_cluster_page_wal
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -lm -o $@
 
+test_cluster_page_data_scn.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c Makefile
+	awk '/^scn_(time|total)_cmp\(/ { print "int"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@
+
 test_cluster_page_data: test_cluster_page_data.c
 test_cluster_pi_writeback: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O)
@@ -2187,7 +2191,7 @@ test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c 
 		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_data_wire.h
-test_cluster_page_data test_cluster_pi_writeback: unit_test.h test_cluster_page_data.inc \
+test_cluster_page_data test_cluster_pi_writeback: unit_test.h test_cluster_page_data.inc test_cluster_page_data_scn.inc \
 		test_cluster_block_redeclare_scan.inc \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h $(CLUSTER_WAL_CLAIM_O) \
@@ -4201,6 +4205,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_block_redeclare_scan.inc
 	rm -f test_cluster_space_recovery_flush.inc
 	rm -f test_cluster_page_data.inc
+	rm -f test_cluster_page_data_scn.inc
 	rm -f test_cluster_page_wal_insert.inc
 	rm -f test_cluster_hw_remaster_native.inc
 	rm -f test_cluster_hw_authority_gate.inc
