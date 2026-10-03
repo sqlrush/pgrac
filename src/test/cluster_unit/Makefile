@@ -1350,9 +1350,9 @@ test_cluster_page_dependency: test_cluster_page_dependency.c unit_test.h \
 		$(CLUSTER_THREAD_RECOVERY_FABRIC_SCAN_O) $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 		$(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) $(CLUSTER_BLOCK_APPLY_O) \
 		test_cluster_space_bufpage_product.o test_cluster_page_dependency_base.o xlogreader_fs.o \
-		$(XLOG_PAGE_EDGE_ENCODER_O) \
+		$(XLOG_PAGE_EDGE_ENCODER_O) $(CLUSTER_WAL_CLAIM_O) \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
-		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto -llz4 -lzstd -o $@
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto $(filter -llz4 -lzstd,$(LIBS)) -o $@
 
 $(CLUSTER_PAGE_REPLAY_BATCH_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_page_replay_batch.c \
@@ -7336,6 +7336,9 @@ test_cluster_recovery_plan: test_cluster_recovery_plan.c unit_test.h \
 # PGRAC: legacy routing helpers plus real v2 claim codec/filesystem reader.
 # Author: SqlRush <sqlrush@gmail.com>
 CLUSTER_WAL_CLAIM_O = $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
+
+# Declare this after the object variable; the recipe retains the real validator.
+test_cluster_page_dependency: $(CLUSTER_WAL_CLAIM_O)
 # PGRAC: actual native segment selection with real generation files.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_native_wal_read.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile

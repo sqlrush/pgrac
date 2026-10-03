@@ -1034,12 +1034,12 @@ _classify_owners(
 _classify_owners(
     "KO_PHYSICAL_REMOVAL",
     "src/backend/catalog/storage.c",
-    ("smgr_redo_truncate",),
+    ("smgr_redo_truncate_internal",),
     "SUCCESSOR_BEFORE_PREDECESSOR",
     "WAL_REPLAY_OF_PRECLASSIFIED_MUTATION",
     "RECOVERY_STORAGE_TARGET",
     "ORIGINATING_WAL_RECORD_AND_TYPED_SPACE_PREDECESSOR",
-    "ORIGINATING_PRIMARY_KO_GATE_AND_LOCAL_REPLAY",
+    "ORIGINATING_PRIMARY_KO_GATE_OR_EXACT_TYPED_SPACE_BATCH",
     "MXA-T35",
 )
 _classify_owners(

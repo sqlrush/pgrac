@@ -255,6 +255,20 @@ rf_side_online_plan_destroy_v1(RfSideOnlinePlanV1 **plan)
 	*plan = NULL;
 }
 
+/* This fixture exercises PAGE planning, including refusal of every routed
+ * SIDE component. The separate streaming census is never entered; invoking
+ * it here must fail the test, not invent a successful SIDE observation. */
+RfPageProofDetailV1
+rf_side_record_census_v1(const RfDetachedRecordPlanV1 *record pg_attribute_unused(),
+						 const RfPageOnlineRecordIdentityV1 *identity pg_attribute_unused(),
+						 const RfContributorStreamCutV1 *cut pg_attribute_unused(),
+						 uint64 incarnation pg_attribute_unused(),
+						 RfSideCensusSpaceVisitorV1 visit pg_attribute_unused(),
+						 void *arg pg_attribute_unused(), RfSideContributionOwnersV1 *out pg_attribute_unused())
+{
+	abort();
+}
+
 static RfPageProofDetailV1
 scan_three_roots(ClusterThreadRecoveryFabricPlanV1 **out, uint64 *records)
 {

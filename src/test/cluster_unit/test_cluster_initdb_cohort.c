@@ -14,6 +14,21 @@ static jmp_buf refused;
 static bool expecting;
 static char executable[MAXPGPATH];
 static bool side_sync_fault, side_link_fault;
+static int replaced_link_parent = -1;
+static struct stat replaced_link_identity;
+static int
+side_test_fstatat(int fd, const char *name, struct stat *out, int flags)
+{
+	int result = fstatat(fd, name, out, flags);
+	/* A deleted symlink's inode may immediately be reused. Only the pathname
+	 * observation is repeated; fstat on a held original still sees its unlink. */
+	if (result == 0 && fd == replaced_link_parent && flags == AT_SYMLINK_NOFOLLOW
+		&& strcmp(name, "pg_xact") == 0) {
+		out->st_dev = replaced_link_identity.st_dev;
+		out->st_ino = replaced_link_identity.st_ino;
+	}
+	return result;
+}
 static int
 side_test_fsync(int fd)
 {
@@ -28,9 +43,11 @@ side_test_symlinkat(const char *path, int fd, const char *name)
 }
 #define fsync side_test_fsync
 #define symlinkat side_test_symlinkat
+#define fstatat side_test_fstatat
 #include "../../backend/cluster/cluster_initdb_cohort.c"
 #undef fsync
 #undef symlinkat
+#undef fstatat
 
 bool errstart(int level, const char *domain) { return level >= ERROR; }
 bool errstart_cold(int level, const char *domain) { return level >= ERROR; }
@@ -238,12 +255,16 @@ side_route_case(unsigned fault, unsigned node)
 		if (fault == 4) UT_ASSERT(mkdirat(origin.data.fd, INITDB_SIDE_ARCHIVE, 0700) == 0);
 		if (fault == 5) side_sync_fault = true;
 		if (fault == 6) side_link_fault = true;
-		if (fault >= 7 && fault <= 12) {
+		if ((fault >= 7 && fault <= 12) || fault == 14) {
 			route_original_side(&shared, &origin, node);
-			if (fault == 7 || fault == 8) {
+			if (fault == 7 || fault == 8 || fault == 14) {
 				UT_ASSERT(unlinkat(origin.data.fd, "pg_xact", 0) == 0);
 				snprintf(path, sizeof(path), "%s/pg_xact", target.path);
-				UT_ASSERT(symlinkat(fault == 7 ? path : "/tmp", origin.data.fd, "pg_xact") == 0);
+				UT_ASSERT(symlinkat(fault == 8 ? "/tmp" : path, origin.data.fd, "pg_xact") == 0);
+				if (fault == 14) {
+					replaced_link_parent = origin.data.fd;
+					replaced_link_identity = origin.side_links[0];
+				}
 			}
 			if (fault == 9) side_test_put(origin.data.fd, INITDB_SIDE_ARCHIVE "/pg_xact/0000", 'x');
 			if (fault == 10) side_test_put(target.fd, "pg_xact/0000", 'x');
@@ -372,6 +393,10 @@ static void side_routes_reject_late_identity_and_byte_changes(void)
 {
 	for (unsigned fault = 7; fault <= 12; fault++) side_route_case(fault, 3);
 }
+static void reused_link_inode_does_not_restore_original_link(void)
+{
+	side_route_case(14, 3);
+}
 
 int
 main(int argc, char **argv)
@@ -410,12 +435,13 @@ main(int argc, char **argv)
 		for (;;) pause();
 	}
 	strlcpy(executable, argv[0], sizeof(executable));
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(storage_contract_is_original_unverified_and_rechecked);
 	UT_RUN(side_routes_retain_actual_original_directories);
 	UT_RUN(side_routes_reject_unqualified_inputs_before_moving);
 	UT_RUN(side_route_io_failure_preserves_originals);
 	UT_RUN(side_routes_reject_late_identity_and_byte_changes);
+	UT_RUN(reused_link_inode_does_not_restore_original_link);
 	UT_RUN(derived_inputs_must_survive_until_primary_publication);
 	UT_RUN(completed);
 	UT_RUN(unsuccessful);

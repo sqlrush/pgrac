@@ -60,6 +60,7 @@ typedef struct InitdbOrigin
 	bool side_routed;
 	struct stat side_archive;
 	struct stat side_sources[4], side_targets[4], side_links[4];
+	int side_link_fds[4];
 	ClusterInitdbTree side_source_trees[4], side_target_trees[4];
 } InitdbOrigin;
 
@@ -693,12 +694,15 @@ static void
 creation_side_link_current(const InitdbOrigin *origin, unsigned family,
 						   const InitdbDirectory *target)
 {
-	struct stat link, routed;
+	struct stat link, held, routed;
 	const struct stat *expected = &origin->side_links[family];
 	char path[MAXPGPATH];
 	ssize_t length;
 
-	if (fstatat(origin->data.fd, side_families[family], &link, AT_SYMLINK_NOFOLLOW) != 0
+	if (fstat(origin->side_link_fds[family], &held) != 0
+		|| !S_ISLNK(held.st_mode) || held.st_nlink != 1
+		|| held.st_dev != expected->st_dev || held.st_ino != expected->st_ino
+		|| fstatat(origin->data.fd, side_families[family], &link, AT_SYMLINK_NOFOLLOW) != 0
 		|| !S_ISLNK(link.st_mode) || link.st_uid != geteuid() || link.st_nlink != 1
 		|| link.st_dev != expected->st_dev || link.st_ino != expected->st_ino)
 		refuse("original native SIDE link was replaced");
@@ -784,6 +788,18 @@ route_original_side(const InitdbDirectory *shared, InitdbOrigin *origin, unsigne
 		if (symlinkat(targets[i].path, origin->data.fd, side_families[i]) != 0
 			|| fstatat(origin->data.fd, side_families[i], &origin->side_links[i], AT_SYMLINK_NOFOLLOW) != 0)
 			refuse("cannot install original native SIDE link");
+		/* Hold the link itself until this creator exits, including every ROOT
+		 * publication recheck. An unlinked original cannot recycle its inode. */
+#if defined(__APPLE__)
+		origin->side_link_fds[i] = openat(origin->data.fd, side_families[i], O_SYMLINK | O_CLOEXEC);
+#elif defined(__linux__) && defined(O_PATH)
+		origin->side_link_fds[i] = openat(origin->data.fd, side_families[i], O_PATH | O_NOFOLLOW | O_CLOEXEC);
+#else
+		origin->side_link_fds[i] = -1;
+		errno = ENOTSUP;
+#endif
+		if (origin->side_link_fds[i] < 0)
+			refuse("cannot hold original native SIDE link");
 		creation_side_link_current(origin, i, &targets[i]);
 		if (close(sources[i].fd) != 0 || close(targets[i].fd) != 0)
 			refuse("cannot close original native SIDE directories");
