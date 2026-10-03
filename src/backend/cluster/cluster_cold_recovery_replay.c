@@ -69,6 +69,9 @@ cluster_cold_unscheduled_v1(const ClusterColdRecordV1 *record)
 			   | CLUSTER_COLD_RECORD_SIDE_UNOWNED))
 			   != 0)
 		return CLUSTER_COLD_UNSCHEDULED_REFUSE;
+	if ((record->record_flags & CLUSTER_COLD_RECORD_FOREIGN_CONTROL) != 0)
+		return record->space_count == 0 ? CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP
+										: CLUSTER_COLD_UNSCHEDULED_REFUSE;
 	if (record->space_count == 0)
 		return CLUSTER_COLD_UNSCHEDULED_NATIVE;
 	for (i = 0; i < record->space_count; i++)

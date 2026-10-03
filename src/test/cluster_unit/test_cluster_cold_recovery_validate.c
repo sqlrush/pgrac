@@ -258,12 +258,57 @@ UT_TEST(test_validate_space_effects)
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
+/*
+ * Another generation's native control records feed like any other record
+ * (no page or SPACE effect) after its native redo start, and the plan keeps
+ * the highest SCN of every record it was fed, history included, so the
+ * founder's clock can pass them all.
+ */
+UT_TEST(test_validate_foreign_control_and_scn_bound)
+{
+	ClusterColdPlanV1 *plan = fresh_plan();
+	ClusterColdRecordV1 record;
+
+	UT_ASSERT_EQ(cluster_cold_plan_max_scn_v1(plan), 0);
+	memset(&record, 0, sizeof(record));
+	record.read_rec_ptr = 0x1000;
+	record.end_rec_ptr = 0x1100;
+	record.prev_rec_ptr = 0xfc0;
+	record.scn = 40;
+	record.record_crc = 1;
+	record.rmid = RM_XLOG_ID;
+	record.record_flags = CLUSTER_COLD_RECORD_FOREIGN_CONTROL;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 1, &record), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_max_scn_v1(plan), 40);
+	record.scn = 90;
+	record.rmid = RM_HEAP_ID;
+	record.record_flags = 0;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &record), CLUSTER_COLD_OK);
+	record.read_rec_ptr = 0x1100;
+	record.end_rec_ptr = 0x1200;
+	record.prev_rec_ptr = 0x1000;
+	record.scn = 60;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 0, &record), CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_max_scn_v1(plan), 90);
+	/* a refused record does not count */
+	record.read_rec_ptr = 0x1100;
+	record.end_rec_ptr = 0x1200;
+	record.prev_rec_ptr = 0x1000;
+	record.scn = 500;
+	record.record_flags = CLUSTER_COLD_RECORD_SIDE_UNOWNED;
+	UT_ASSERT_EQ(cluster_cold_plan_feed_v1(plan, 1, &record), CLUSTER_COLD_SIDE_OWNER_MISSING);
+	UT_ASSERT_EQ(cluster_cold_plan_max_scn_v1(plan), 90);
+	UT_ASSERT_EQ(cluster_cold_plan_max_scn_v1(NULL), 0);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
 	UT_RUN(test_validate_component_shapes);
 	UT_RUN(test_validate_record_components);
 	UT_RUN(test_validate_space_effects);
+	UT_RUN(test_validate_foreign_control_and_scn_bound);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

@@ -695,6 +695,20 @@ UT_TEST(test_unscheduled_record_handling)
 	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
 	record.record_flags = CLUSTER_COLD_RECORD_UNSUPPORTED;
 	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
+	/* another generation's native control record: nothing is replayed */
+	record.record_flags = CLUSTER_COLD_RECORD_FOREIGN_CONTROL;
+	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP);
+	record.component_count = 1;
+	record.components = &c;
+	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
+	record.component_count = 0;
+	record.components = NULL;
+	record.record_flags |= CLUSTER_COLD_RECORD_SIDE_UNOWNED;
+	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
+	record.record_flags = CLUSTER_COLD_RECORD_FOREIGN_CONTROL;
+	record.space_count = 1;
+	record.space_ops = ops;
+	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
 	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(NULL), CLUSTER_COLD_UNSCHEDULED_REFUSE);
 }
 

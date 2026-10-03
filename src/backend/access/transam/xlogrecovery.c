@@ -146,7 +146,10 @@
  *	              identity; SPACE changes are installed by the SPACE owner
  *	              at their steps (repeating a TRUNCATE's shrink only where
  *	              nothing proves it durable) and in full at the end, never
- *	              replayed natively.  Pass 2 starts only once every consumer it
+ *	              replayed natively; another generation's native control
+ *	              records (checkpoints, counters, standby) have no effect on
+ *	              the founder, whose SCN is advanced past every record of
+ *	              the plan.  Pass 2 starts only once every consumer it
  *	              needs exists (cluster_cold_typed_ready_v1), including a
  *	              restartpoint owner that does not adopt own checkpoints
  *	              replayed inside it.  After pass 2 every fenced generation
@@ -3260,10 +3263,11 @@ cluster_typed_replay_next(void *arg, uint32 participant, ClusterColdReplayRecord
  * A record without a scheduled step.  Pass 1 refused every lifecycle,
  * prepared-transaction and unowned side record after native redo, so what
  * reaches here is the founder's own record (native owner), another
- * generation's rebuildable FSM-only page record or relation file creation,
- * or a SPACE change the SPACE owner installs later or the SPACE pages on disk
- * already cover (never replayed natively); anything else means pass 1 saw
- * other input (cluster_cold_unscheduled_v1).
+ * generation's rebuildable FSM-only page record, relation file creation or
+ * native control record (no effect on the founder), or a SPACE change the
+ * SPACE owner installs later or the SPACE pages on disk already cover (never
+ * replayed natively); anything else means pass 1 saw other input
+ * (cluster_cold_unscheduled_v1).
  */
 static bool
 cluster_typed_replay_unscheduled(void *arg, uint32 participant)
@@ -3289,6 +3293,10 @@ cluster_typed_replay_unscheduled(void *arg, uint32 participant)
 		case CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP:
 			if (is_own)
 				AdvanceNextFullTransactionIdPastXid(r->record->header.xl_xid);
+			return true;
+		case CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP:
+			/* Another generation's native control record: no effect here
+			 * (its SCN is covered by the plan's bound). */
 			return true;
 		case CLUSTER_COLD_UNSCHEDULED_NATIVE:
 			break;
@@ -3577,6 +3585,12 @@ cluster_typed_replay_finish(ClusterColdTypedReplay *rep, const ClusterColdReplay
 		XLogRecoveryCtl->lastReplayedTLI = *rep->replayTLI;
 		SpinLockRelease(&XLogRecoveryCtl->info_lck);
 	}
+	/*
+	 * Every generation's records, history included, were written at or
+	 * below the plan's highest SCN; the founder's clock must pass them all
+	 * before any of its own commits, also for records not replayed here.
+	 */
+	cluster_scn_recovery_replay_observe((SCN) cluster_cold_plan_max_scn_v1(rep->typed->plan));
 	if (*rep->fence_plan != NULL &&
 		!cluster_recovery_merge_fence_plan_revalidate_nowait(*rep->fence_plan))
 	{
