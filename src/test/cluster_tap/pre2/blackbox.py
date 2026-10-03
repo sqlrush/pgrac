@@ -202,12 +202,27 @@ class BlackBox:
         pending = list(self.layout["nodes"])
         while pending:
             self.check_start_logs(state)
-            pending = [n for n in pending if self.sql(n, "SELECT 1", check=False).returncode != 0]
+            # A connection during native startup creates a FATAL of its own.
+            # Wait for native readiness before probing SQL; retain every FATAL
+            # check, the deadline, and the actual SQL-success requirement.
+            pending = [n for n in pending if not self.native_ready(n)
+                       or self.sql(n, "SELECT 1", check=False).returncode != 0]
             self.remaining()
             self.check_start_logs(state)
             if pending:
                 time.sleep(0.1)
         return {}
+
+    @staticmethod
+    def native_ready(node):
+        data = Path(node['data_dir'])
+        try:
+            lines = (data/'postmaster.pid').read_text().splitlines()
+        except FileNotFoundError:
+            return False
+        return (len(lines) >= 8 and lines[0].isdigit() and int(lines[0]) > 0
+                and Path(lines[1]).resolve() == data.resolve()
+                and lines[7].strip() == 'ready')
 
     def check_start_logs(self, state):
         for node in self.layout['nodes']:

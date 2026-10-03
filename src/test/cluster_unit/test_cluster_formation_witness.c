@@ -538,10 +538,71 @@ UT_TEST(test_cold_start_control_requires_exact_fence_and_stable_binding)
 	}
 }
 
+UT_TEST(test_recovery_control_failure_diagnostic_does_not_grant_a_witness)
+{
+	ClusterFormationWitnessV1 *witness = NULL;
+	ClusterFormationWitnessDiagnosticV1 sample;
+	const char *predicates[]
+		= { "recovery_control.initial_epoch", "origin.member_floor", "member.admitted_floor",
+			"fence.authority_read",			  "snapshot.first",		 "snapshot.changed",
+			"fence.cache_sequence",			  "fence.cache_publish" };
+	for (int fault = 0; fault < 8; fault++) {
+		ClusterFormationWitnessResult result;
+		build_ready_fixture();
+		memset(snapshots, 0, sizeof(snapshots));
+		snapshots[0].membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
+		snapshots[0].membership.last_admitted_incarnation[0] = 55;
+		memset(&durable_proof, 0, sizeof(durable_proof));
+		durable_proof.marker.magic = CLUSTER_FENCE_MARKER_MAGIC;
+		durable_proof.marker.version = CLUSTER_FENCE_MARKER_VERSION;
+		durable_proof.marker.issuer_node_id = CLUSTER_FENCE_BASELINE_INITIAL_ISSUER;
+		durable_proof.marker.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+		durable_proof.agree_disk_count = 2;
+		durable_proof.total_disk_count = 3;
+		if (fault == 0)
+			snapshots[0].local_epoch = 3;
+		if (fault == 1)
+			snapshots[0].membership.last_admitted_incarnation[0] = 0;
+		if (fault == 2)
+			snapshots[0].membership.membership_state[1] = CLUSTER_MEMBER_MEMBER;
+		if (fault == 3)
+			durable_result = CLUSTER_FENCE_AUTHORITY_NO_MAJORITY;
+		if (fault == 4)
+			snapshot_available = false;
+		if (fault == 6)
+			cache_sequence = 1;
+		if (fault == 7)
+			cache_publish_ok = false;
+		snapshots[1] = snapshots[0];
+		if (fault == 5)
+			snapshots[1].startup_formation_generation = 9;
+		snapshot_call = 0;
+		result = cluster_formation_witness_build_recovery_control_wait(1, 1, &witness);
+		UT_ASSERT(result != CLUSTER_FORMATION_WITNESS_READY);
+		UT_ASSERT_NULL(witness);
+		UT_ASSERT(cluster_formation_witness_last_diagnostic_v1(&sample));
+		UT_ASSERT_EQ(sample.result, result);
+		UT_ASSERT_EQ(sample.origin_thread, 1);
+		UT_ASSERT(strcmp(sample.predicate, predicates[fault]) == 0);
+		UT_ASSERT_EQ(sample.snapshot_captured, fault != 4 && fault != 6);
+		if (sample.snapshot_captured) {
+			UT_ASSERT_EQ(sample.formation_epoch, fault == 0 ? 3 : 0);
+			UT_ASSERT_EQ(sample.admitted_floor, fault == 1 ? 0 : 55);
+			UT_ASSERT_EQ(sample.fence_captured, fault != 3);
+			if (sample.fence_captured) {
+				UT_ASSERT_EQ(sample.fence_agree, 2);
+				UT_ASSERT_EQ(sample.fence_total, 3);
+			}
+		}
+		if (fault == 2)
+			UT_ASSERT_EQ(sample.missing_floor_node, 1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(test_witness_bad_arguments_leave_null);
 	UT_RUN(test_witness_ready_borrow_revalidate_destroy);
 	UT_RUN(test_witness_unstable_or_unavailable_never_installs_handle);
@@ -549,6 +610,7 @@ main(void)
 	UT_RUN(test_live_witness_requires_same_stable_member_formation);
 	UT_RUN(test_recovery_control_witness_is_initial_only_and_survives_gate_open);
 	UT_RUN(test_cold_start_control_requires_exact_fence_and_stable_binding);
+	UT_RUN(test_recovery_control_failure_diagnostic_does_not_grant_a_witness);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

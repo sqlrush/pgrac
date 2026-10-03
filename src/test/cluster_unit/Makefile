@@ -4697,6 +4697,7 @@ $(HW_HANDOFF_OBJECTS): hw_handoff_%.o: $(top_srcdir)/src/backend/cluster/%.c \
 
 test_cluster_hw_handoff: test_cluster_hw_handoff.c test_cluster_grd.c unit_test.h \
         test_cluster_grd_stop_types.inc \
+        test_cluster_grd_routing.inc test_cluster_hw_authority_gate.inc \
         $(HW_HANDOFF_OBJECTS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(HW_HANDOFF_OBJECTS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
@@ -4708,6 +4709,7 @@ test_cluster_hw_handoff: test_cluster_hw_handoff.c test_cluster_grd.c unit_test.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_control_retire_master: test_cluster_control_retire_master.c test_cluster_hw_handoff.c test_cluster_grd.c unit_test.h \
         test_cluster_grd_stop_types.inc \
+        test_cluster_grd_routing.inc test_cluster_hw_authority_gate.inc \
 		$(HW_HANDOFF_OBJECTS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(HW_HANDOFF_OBJECTS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
@@ -4715,6 +4717,7 @@ test_cluster_control_retire_master: test_cluster_control_retire_master.c test_cl
 
 test_cluster_control_cf_poll: test_cluster_control_cf_poll.c test_cluster_hw_handoff.c test_cluster_grd.c unit_test.h \
         test_cluster_grd_stop_types.inc \
+        test_cluster_grd_routing.inc test_cluster_hw_authority_gate.inc \
 		$(HW_HANDOFF_OBJECTS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(HW_HANDOFF_OBJECTS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \

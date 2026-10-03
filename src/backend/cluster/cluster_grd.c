@@ -3398,12 +3398,17 @@ static void
 grd_recovery_format_waiting_backend(uint64 gen, uint64 episode_epoch, char *buf, Size buflen)
 {
 	uint32 procno;
+	uint64 control_version;
 
 	if (buflen == 0)
 		return;
 	buf[0] = '\0';
 	if (ProcGlobal == NULL || ProcGlobal->allProcs == NULL || ProcGlobal->allProcCount == 0) {
 		snprintf(buf, buflen, "proc_census_unavailable");
+		return;
+	}
+	if (cluster_shared_config && !cluster_control_request_census(episode_epoch, &control_version)) {
+		snprintf(buf, buflen, "control_request_census epoch=" UINT64_FORMAT, episode_epoch);
 		return;
 	}
 	for (procno = 0; procno < ProcGlobal->allProcCount; procno++) {
@@ -3743,6 +3748,8 @@ grd_recovery_authority_publish_terminal(uint64 request_generation,
 void
 cluster_grd_recovery_authority_lmon_tick(void)
 {
+	static uint64 last_reported_request;
+	static TimestampTz last_reported_at;
 	uint64 request_generation;
 	uint64 epoch;
 	uint64 bitmap_hash;
@@ -3825,8 +3832,29 @@ cluster_grd_recovery_authority_lmon_tick(void)
 			break;
 		}
 	}
-	if (!all_done)
+	if (!all_done) {
+		TimestampTz now = GetCurrentTimestamp();
+
+		if (last_reported_request != request_generation || last_reported_at == 0
+			|| now - last_reported_at >= INT64CONST(5000000)) {
+			char waiting[160];
+
+			grd_recovery_format_waiting_backend(grd_recovery_authority_lmon_redeclare_generation,
+												epoch, waiting, sizeof(waiting));
+			ereport(
+				LOG,
+				(errmsg("cluster: recovery-authority barrier pending"),
+				 errdetail("formation_epoch=" UINT64_FORMAT " request_generation=" UINT64_FORMAT
+						   " redeclare_generation=" UINT64_FORMAT " lms_generation=" UINT64_FORMAT
+						   " local_wait=%s missing_done_node=%d bitmap_hash=" UINT64_FORMAT,
+						   epoch, request_generation,
+						   grd_recovery_authority_lmon_redeclare_generation, lms_generation,
+						   waiting, i, bitmap_hash)));
+			last_reported_request = request_generation;
+			last_reported_at = now;
+		}
 		return;
+	}
 
 	(void)cluster_grd_cleanup_stale_epoch_postbarrier(epoch);
 	if (!grd_recovery_authority_request_current(request_generation)) {

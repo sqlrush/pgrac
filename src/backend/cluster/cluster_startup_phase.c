@@ -1554,6 +1554,42 @@ phase_2_handler(PhaseRunFailContext *fail_ctx)
 }
 
 
+static void
+cluster_phase3_report_formation(ClusterFormationWitnessResult result)
+{
+	ClusterFormationWitnessDiagnosticV1 sample = { 0 };
+	static const char *names[] = { "READY",
+								   "BAD_ARGUMENT",
+								   "UNSTABLE",
+								   "MARKER_UNPROVEN",
+								   "ORIGIN_NOT_EXCLUDED",
+								   "OWNER_MISMATCH",
+								   "FULL_OUTAGE_UNRECOVERED",
+								   "CAPABILITY_UNAVAILABLE",
+								   "IO_FAILED",
+								   "CORRUPT" };
+
+	if (!cluster_formation_witness_last_diagnostic_v1(&sample))
+		sample.predicate = "not_sampled";
+	else if (sample.result != result)
+		sample.predicate = "witness.copy_or_revalidate";
+	ereport(
+		LOG,
+		(errmsg("cluster phase 3: recovery-control witness result=%u (%s), predicate=%s",
+				(uint32)result, (unsigned)result < lengthof(names) ? names[result] : "UNKNOWN",
+				sample.predicate),
+		 errdetail("origin_node=%d origin_thread=%u snapshot=%d formation_epoch=" UINT64_FORMAT
+				   " formation_generation=" UINT64_FORMAT
+				   " member_state=%u admitted_floor=" UINT64_FORMAT
+				   " missing_floor_node=%d fence_result=%u fence_proven=%d fence_majority=%u/%u "
+				   "fence_epoch=" UINT64_FORMAT,
+				   sample.origin_thread == 0 ? -1 : (int)sample.origin_thread - 1,
+				   sample.origin_thread, sample.snapshot_captured, sample.formation_epoch,
+				   sample.formation_generation, sample.origin_member_state, sample.admitted_floor,
+				   sample.missing_floor_node, (uint32)sample.fence_result, sample.fence_captured,
+				   sample.fence_agree, sample.fence_total, sample.fence_epoch)));
+}
+
 static bool
 cluster_phase3_wait_for_live_formation(TimestampTz deadline, bool allow_join_readonly,
 									   ClusterFormationWitnessResult *out_result,
@@ -1563,6 +1599,7 @@ cluster_phase3_wait_for_live_formation(TimestampTz deadline, bool allow_join_rea
 {
 	ClusterFormationWitnessResult result = CLUSTER_FORMATION_WITNESS_UNSTABLE;
 	uint16 thread_id = cluster_wal_thread_id();
+	TimestampTz next_report = 0;
 
 	if (thread_id == XLP_THREAD_ID_LEGACY) {
 		if (out_result != NULL)
@@ -1604,12 +1641,17 @@ cluster_phase3_wait_for_live_formation(TimestampTz deadline, bool allow_join_rea
 				result = cluster_formation_witness_revalidate_nowait(witness);
 			cluster_formation_witness_destroy(&witness);
 			if (result == CLUSTER_FORMATION_WITNESS_READY) {
+				cluster_phase3_report_formation(result);
 				if (out_result != NULL)
 					*out_result = result;
 				return true;
 			}
 		}
 		cluster_formation_witness_destroy(&witness);
+		if (GetCurrentTimestamp() >= next_report) {
+			cluster_phase3_report_formation(result);
+			next_report = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 5000);
+		}
 
 		/* OWNER_MISMATCH is transient here while LMON publishes the exact
 		 * admitted-incarnation floor.  CAPABILITY_UNAVAILABLE is also transient
@@ -1628,6 +1670,7 @@ cluster_phase3_wait_for_live_formation(TimestampTz deadline, bool allow_join_rea
 
 	if (out_result != NULL)
 		*out_result = result;
+	cluster_phase3_report_formation(result);
 	return false;
 }
 
@@ -1785,6 +1828,8 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 	}
 
 establish_recovery_authority:
+	if (cluster_phase4_wal_state_configured())
+		elog(LOG, "cluster phase 3: recovery quorum established; checking live formation witness");
 	if (cluster_phase4_wal_state_configured()
 		&& !cluster_phase3_wait_for_live_formation(phase3_recovery_deadline, !resume_join_readonly,
 												   &formation_result, &formation_origin_thread,
@@ -2120,9 +2165,15 @@ cluster_phase4_wal_state_configured(void)
 static bool
 cluster_phase4_wait_for_quorum(TimestampTz deadline)
 {
+	TimestampTz next_report = 0;
 	for (;;) {
 		if (cluster_qvotec_in_quorum())
 			return true;
+		if (GetCurrentTimestamp() >= next_report) {
+			elog(LOG, "cluster startup: waiting for recovery quorum, state=%s",
+				 cluster_qvotec_get_quorum_state_name());
+			next_report = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 5000);
+		}
 		if (GetCurrentTimestamp() >= deadline)
 			return false;
 		pg_usleep(100000L);

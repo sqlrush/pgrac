@@ -145,7 +145,9 @@ extern bool cluster_control_request_snapshot(const ClusterControlRequestHandle *
 extern bool cluster_control_request_next(uint32 *cursor, ClusterControlRequestView *out);
 
 /* Read-only shared census, including creators no longer present in PGPROC.
- * A nonzero version may be checked again after the private-owner census. */
+ * A nonzero version may be checked again after the private-owner census.
+ * At initial formation epoch zero, only an initialized empty registry passes;
+ * this observation does not authorize epoch-zero control requests. */
 extern bool cluster_control_request_census(uint64 epoch, uint64 *version);
 extern bool cluster_control_request_census_unchanged(uint64 epoch, uint64 version);
 extern bool cluster_control_request_empty(void);

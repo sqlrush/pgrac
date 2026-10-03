@@ -95,6 +95,7 @@ class BlackBoxTest(unittest.TestCase):
 
     def test_late_sql_success_is_not_ready(self):
         driver = self.driver(self.profile())
+        self.write_start_status('ready')
         clock = [0]
         def runner(argv, **kwargs):
             if Path(argv[0]).name == "psql" and str(self.layout["nodes"][3]["port"]) in argv:
@@ -104,6 +105,42 @@ class BlackBoxTest(unittest.TestCase):
         with patch("blackbox.time.monotonic", side_effect=lambda: clock[0]):
             with self.assertRaisesRegex(RuntimeError, "deadline"):
                 driver.shared_start()
+
+    def write_start_status(self, status):
+        for node in self.layout['nodes']:
+            data = Path(node['data_dir'])
+            data.mkdir(exist_ok=True)
+            (data/'postmaster.pid').write_text(
+                f"{100 + node['id']}\n{data}\n1\n{node['port']}\n/tmp\nlocalhost\n1 1\n{status}\n")
+
+    def test_start_does_not_connect_until_native_ready(self):
+        driver = self.driver(self.profile())
+        self.write_start_status('starting')
+        ready = [False]
+        def runner(argv, **kwargs):
+            if Path(argv[0]).name == 'psql':
+                self.assertTrue(ready[0], 'startup probe itself creates FATAL before ready')
+            return subprocess.CompletedProcess(argv, 0, '1\n', '')
+        def advance(_):
+            ready[0] = True
+            self.write_start_status('ready')
+        driver.runner = runner
+        with patch('blackbox.time.sleep', side_effect=advance):
+            driver.shared_start()
+        self.assertTrue(ready[0])
+
+    def test_native_ready_status_is_not_sql_success(self):
+        driver = self.driver(self.profile())
+        node = self.layout['nodes'][0]
+        self.assertFalse(driver.native_ready(node))
+        for state in ('starting', 'stopping', 'standby', 'ready'):
+            self.write_start_status(state)
+            self.assertEqual(driver.native_ready(node), state == 'ready')
+        path = Path(node['data_dir'])/'postmaster.pid'
+        path.write_text(path.read_text().replace(node['data_dir'], '/wrong/data'))
+        self.assertFalse(driver.native_ready(node))
+        path.write_text('1\n')
+        self.assertFalse(driver.native_ready(node))
 
     def test_recovered_startup_crash_is_still_a_failure(self):
         driver = self.driver(self.profile())

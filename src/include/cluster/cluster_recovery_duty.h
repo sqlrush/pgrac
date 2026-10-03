@@ -60,6 +60,26 @@ typedef enum ClusterFormationWitnessResult {
 	CLUSTER_FORMATION_WITNESS_CORRUPT = 9
 } ClusterFormationWitnessResult;
 
+/* Process-local last builder sample only. It grants no formation, membership,
+ * fence or serving authority and does not refresh any evidence. */
+typedef struct ClusterFormationWitnessDiagnosticV1 {
+	ClusterFormationWitnessResult result;
+	ClusterFenceAuthorityReadResult fence_result;
+	uint16 origin_thread;
+	bool snapshot_captured;
+	bool fence_captured;
+	uint8 origin_member_state;
+	uint64 formation_epoch;
+	uint64 formation_generation;
+	uint64 admitted_floor;
+	uint64 fence_epoch;
+	uint32 fence_agree;
+	uint32 fence_total;
+	int32 missing_floor_node;
+	const char *predicate;
+} ClusterFormationWitnessDiagnosticV1;
+extern bool cluster_formation_witness_last_diagnostic_v1(ClusterFormationWitnessDiagnosticV1 *out);
+
 /* Internal canonical snapshot captured under the reconfig lock. */
 typedef struct ClusterFormationSnapshotV1 {
 	ReconfigEvent applied;

@@ -232,15 +232,27 @@ UT_TEST(cf_request_common_barrier_blocks_every_entry_then_admits_control_only)
 	finish_recovery_control_fixture();
 }
 
+UT_TEST(initial_shared_formation_uses_real_empty_control_census)
+{
+	cluster_control_request_shmem_init();
+	ProcGlobal = retained_grd_proc_global;
+	cluster_shared_config = true;
+	/* This existing actual GRD barrier test used to run only non-shared,
+	 * omitting the registry that blocked the first shared startup. */
+	test_recovery_authority_initial_epoch_zero_is_valid();
+	cluster_shared_config = false;
+}
+
 int
 main(void)
 {
 	MyBackendType = B_LMON;
-	UT_PLAN(4);
+	UT_PLAN(5);
 	UT_RUN(cf_poll_yields_until_remote_exact_grant);
 	UT_RUN(cf_poll_local_conflict_does_not_wait_for_its_own_drain);
 	UT_RUN(cf_poll_cut_change_keeps_the_original_attempt);
 	UT_RUN(cf_request_common_barrier_blocks_every_entry_then_admits_control_only);
+	UT_RUN(initial_shared_formation_uses_real_empty_control_census);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

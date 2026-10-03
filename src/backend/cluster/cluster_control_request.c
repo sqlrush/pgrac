@@ -851,7 +851,7 @@ cluster_control_request_census(uint64 epoch, uint64 *version)
 
 	if (version != NULL)
 		*version = 0;
-	if (control_requests == NULL || version == NULL || epoch == 0)
+	if (control_requests == NULL || version == NULL)
 		return false;
 	LWLockAcquire(&control_requests->lock, LW_SHARED);
 	if (control_requests->revision == 0)
@@ -859,8 +859,11 @@ cluster_control_request_census(uint64 epoch, uint64 *version)
 	for (i = 0; ready && i < CLUSTER_CONTROL_REQUEST_CAPACITY; ++i) {
 		const ClusterControlRequestView *record = &control_requests->records[i];
 
+		/* Initial recovery formation uses epoch zero. It may prove an empty
+		 * registry, never a HELD request: control_key_valid still forbids
+		 * acquiring at epoch zero. Keep the revision proof across PGPROC. */
 		if (record->state != CLUSTER_CONTROL_REQUEST_FREE
-			&& (record->owner_exited || record->state != CLUSTER_CONTROL_REQUEST_HELD
+			&& (epoch == 0 || record->owner_exited || record->state != CLUSTER_CONTROL_REQUEST_HELD
 				|| record->message.key.holder.cluster_epoch != epoch))
 			ready = false;
 	}
