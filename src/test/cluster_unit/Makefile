@@ -46,7 +46,7 @@ endif
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
-        test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_catalog_manifest test_cluster_initdb_tree test_cluster_initdb_cohort \
+        test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_initdb_tree test_cluster_initdb_cohort \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
         test_pgrac_fenced_target_command test_pgrac_fenced_target_reply test_pgrac_fenced_target_client \
@@ -470,7 +470,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_service_observe,$(SIMPLE_TESTS))
 # PGRAC: shared frontend/backend binding codec uses its real common library.
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_catalog_manifest,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_catalog_manifest test_cluster_catalog_init,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_init,$(SIMPLE_TESTS))
 
 # Fresh image constructor must link as a frontend, without backend services.
@@ -7962,6 +7962,20 @@ test_cluster_initdb_common: test_cluster_initdb_common.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_cf_authority.c \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+# Original allocator images through the unchanged authority consumers.
+test_cluster_catalog_init: test_cluster_catalog_init.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_catalog_init.h \
+		$(top_srcdir)/src/common/cluster_catalog_init.c \
+		$(top_srcdir)/src/backend/cluster/cluster_oid_lease.c \
+		$(top_srcdir)/src/backend/cluster/cluster_xid_authority.c \
+		$(top_srcdir)/src/backend/cluster/cluster_xid_prehistory.c cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_catalog_init.c \
+		$(top_srcdir)/src/backend/cluster/cluster_oid_lease.c \
+		$(top_srcdir)/src/backend/cluster/cluster_xid_authority.c \
+		$(top_srcdir)/src/backend/cluster/cluster_xid_prehistory.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Strict initial manifest decoder with the actual original producer.
 test_cluster_catalog_manifest: test_cluster_catalog_manifest.c unit_test.h \
