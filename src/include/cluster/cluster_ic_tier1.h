@@ -111,6 +111,7 @@ typedef struct ClusterICPeerStateShmem {
 	 * stream.  Written and read by the owning plane's process only.
 	 */
 	uint64 conn_epoch;
+	pg_atomic_uint64 resource_x_stream_generation;
 } ClusterICPeerStateShmem;
 
 /*
@@ -175,6 +176,9 @@ extern ClusterICPlane cluster_ic_tier1_my_plane(void);
 #define CLUSTER_IC_TIER1_DATA_CHANNELS 8
 extern void cluster_ic_tier1_set_my_data_channel(int channel, int n_workers);
 extern int cluster_ic_tier1_my_data_channel(void);
+/* Shared local lifetime observation, not a wire identity or authority. */
+extern uint64 cluster_ic_tier1_resource_x_stream_generation(int32 peer, int channel);
+
 extern int cluster_ic_tier1_my_n_workers(void);
 
 /* PGRAC: spec-7.2 D3 — dispatch plane-gate drop counter (per plane). */

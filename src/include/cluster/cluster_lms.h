@@ -479,6 +479,12 @@ extern bool cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type
 struct ResourceXIntentSlot;
 struct ClusterPcmOwnSnapshot;
 /* NOT_DUE retains the owner and its attempt time; it owns no ring slot. */
+struct ResourceXDecodedFrame;
+extern ClusterLmsEnqueueResult
+cluster_lms_outbound_enqueue_resource_x_requester(int32 master,
+												  const struct ResourceXDecodedFrame *control,
+												  const struct ResourceXDecodedFrame *proof);
+
 extern ClusterLmsEnqueueResult
 cluster_lms_outbound_enqueue_resource_x_intent(int worker_id,
 											   const struct ResourceXIntentSlot *intent,

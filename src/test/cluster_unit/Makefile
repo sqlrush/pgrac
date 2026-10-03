@@ -4706,10 +4706,11 @@ test_cluster_pcm_source_owner_layout.inc: $(top_srcdir)/src/backend/cluster/clus
 
 test_cluster_pcm_stop_fields.inc: $(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c Makefile
 	awk '/^typedef struct PcmConvertQueue PcmConvertQueue;/ { print; forward++ } \
+	     /^typedef struct ClusterPcmResourceXRequesterSend / { emit=1; send++ } \
 	     /^typedef struct ClusterPcmResourceXBootstrapRound / { emit=1; round++ } \
 	     /^struct GrdEntry \{/ { print "struct StopPcmEntryLayout {"; emit=1; entry++; next } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (forward != 1 || round != 1 || entry != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (forward != 1 || send != 1 || round != 1 || entry != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Use the actual bounded pump and its limits with the real PCM fixture.
@@ -4730,10 +4731,10 @@ test_cluster_pcm_lms_intent_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	mv $@.tmp $@
 
 test_cluster_pcm_settlement_ingress.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
-	awk '/^gcs_block_resource_x_source_settlement_(run|ingress)\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
+	awk '/^gcs_block_resource_x_source_settlement_(run|ingress|ingress_owned)\(/ { print "static ResourceXApplyResult"; emit=1; count++ } \
 	     /^cluster_gcs_block_resource_x_source_settlement_tick\(/ { print "ResourceXApplyResult"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (count != 3 || emit) exit 1 }' $< > $@.tmp
+	     END { if (count != 4 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \

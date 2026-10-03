@@ -235,6 +235,14 @@ tier1_stream_bind(int32 peer)
 	if (tier1_stream_next == PG_UINT64_MAX)
 		tier1_stream_exhausted = true;
 	tier1_stream_serial[peer] = tier1_stream_exhausted ? 0 : ++tier1_stream_next;
+	if (Tier1Shmem != NULL && tier1_my_plane == CLUSTER_IC_PLANE_DATA) {
+		uint64 generation
+			= pg_atomic_read_u64(&Tier1Shmem->peers[peer].resource_x_stream_generation);
+		/* One process owns each DATA channel. Exhaustion removes the observation. */
+		if (generation != UINT64_MAX)
+			pg_atomic_write_u64(&Tier1Shmem->peers[peer].resource_x_stream_generation,
+								generation + 1);
+	}
 }
 
 /*
@@ -874,6 +882,7 @@ tier1_shmem_init(void)
 				pg_atomic_init_u64(&s->peers[i].epoch_observe_advance_count, 0);
 				/* spec-2.4 v1.0.1 F3: LMON-mediated close request flag. */
 				pg_atomic_init_u32(&s->peers[i].close_requested, 0);
+				pg_atomic_init_u64(&s->peers[i].resource_x_stream_generation, 0);
 				s->peers[i].conn_epoch = 0;
 			}
 		}
@@ -3182,6 +3191,31 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 
 	if (reason != NULL)
 		ereport(LOG, (errmsg("cluster_ic tier1 peer %d closed: %s", peer_id, reason)));
+}
+
+uint64
+cluster_ic_tier1_resource_x_stream_generation(int32 peer, int channel)
+{
+	ClusterICTier1Shmem *shared;
+	uint64 generation;
+	if (peer < 0 || peer >= CLUSTER_MAX_NODES || channel < 0
+		|| channel >= CLUSTER_IC_TIER1_DATA_CHANNELS)
+		return 0;
+	if (peer == cluster_node_id)
+		return UINT64_C(1); /* Same-instance dispatch has no reconnect window. */
+	shared = Tier1ShmemSlots[tier1_slot_of(CLUSTER_IC_PLANE_DATA, channel)];
+	if (shared == NULL || shared->magic != PGRAC_IC_TIER1_SHMEM_MAGIC)
+		return 0;
+	generation = pg_atomic_read_u64(&shared->peers[peer].resource_x_stream_generation);
+	pg_read_barrier();
+	if (generation == 0 || generation == UINT64_MAX
+		|| shared->peers[peer].state != CLUSTER_IC_PEER_CONNECTED
+		|| shared->peers[peer].conn_epoch != cluster_epoch_get_current())
+		return 0;
+	pg_read_barrier();
+	return pg_atomic_read_u64(&shared->peers[peer].resource_x_stream_generation) == generation
+			   ? generation
+			   : 0;
 }
 
 const ClusterICPeerStateShmem *

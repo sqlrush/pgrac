@@ -3450,7 +3450,7 @@ UT_TEST(test_resource_x_source_settlement_uses_exact_typed_debt_and_ack)
 	static const char *const source_apply_contract[]
 		= { "ResourceXSourceSettlementPlan plan",
 			"ResourceXSourceSettlementCommitObservation prepare_observation",
-			"cluster_pcm_lock_resource_x_source_settlement_prepare_observed_exact(",
+			"cluster_pcm_lock_resource_x_source_settlement_receive_begin_exact(",
 			"&prepare_observation",
 			"if (result == RESOURCE_X_APPLY_APPLIED && plan.valid)",
 			"cluster_pcm_x_revoke_finish_mode(&plan.assertion.resource, 0)",
@@ -3475,7 +3475,7 @@ UT_TEST(test_resource_x_source_settlement_uses_exact_typed_debt_and_ack)
 			"cluster_resource_x_wire_encode(",
 			"gcs_block_resource_x_source_settlement_failure_record(",
 			"RESOURCE_X_SOURCE_SETTLEMENT_STAGE_ACK_ENCODE",
-			"cluster_grd_outbound_enqueue_backend_msg(" };
+			"cluster_pcm_lock_resource_x_source_settlement_receive_end_exact(" };
 	char *source = read_gcs_block_source();
 	const char *candidate;
 	const char *candidate_end;
@@ -3500,10 +3500,10 @@ UT_TEST(test_resource_x_source_settlement_uses_exact_typed_debt_and_ack)
 		if (proof != NULL)
 			UT_ASSERT(proof < candidate_end);
 	}
-	assert_ordered_in_function(source, "\ngcs_block_resource_x_source_settlement_ingress(",
+	assert_ordered_in_function(source, "\ngcs_block_resource_x_source_settlement_run(",
 							   "\n\nstatic", source_apply_contract,
 							   lengthof(source_apply_contract));
-	handler = strstr(source, "\ngcs_block_resource_x_source_settlement_ingress(");
+	handler = strstr(source, "\ngcs_block_resource_x_source_settlement_run(");
 	handler_end = handler != NULL ? strstr(handler, "\n\nstatic") : NULL;
 	UT_ASSERT_NOT_NULL(handler);
 	UT_ASSERT_NOT_NULL(handler_end);
@@ -3576,7 +3576,7 @@ UT_TEST(test_resource_x_source_settlement_distinguishes_retained_and_dropped_car
 	UT_ASSERT_NOT_NULL(source);
 	if (source == NULL)
 		return;
-	handler = strstr(source, "\ngcs_block_resource_x_source_settlement_ingress(");
+	handler = strstr(source, "\ngcs_block_resource_x_source_settlement_run(");
 	handler_end = handler != NULL ? strstr(handler, "\n\nstatic") : NULL;
 	UT_ASSERT_NOT_NULL(handler);
 	UT_ASSERT_NOT_NULL(handler_end);

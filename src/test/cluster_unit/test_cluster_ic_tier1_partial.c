@@ -1462,16 +1462,22 @@ UT_TEST(test_stream_data_epoch_role_and_native_fork)
 	ClusterICTier1Stream stream;
 	pid_t child;
 	int status;
+	uint64 generation;
 	MyAuxProcType = LmsProcess;
 	cluster_ic_tier1_set_my_data_channel(0, 1);
 	ut_reconnect_peer();
 	UT_ASSERT(cluster_ic_tier1_stream_capture(UT_PEER_ID, &stream));
 	UT_ASSERT_EQ(stream.plane, CLUSTER_IC_PLANE_DATA);
 	UT_ASSERT_EQ(stream.channel, 0);
+	generation = cluster_ic_tier1_resource_x_stream_generation(UT_PEER_ID, 0);
+	UT_ASSERT(generation != 0);
+	UT_ASSERT_EQ(cluster_ic_tier1_resource_x_stream_generation(cluster_node_id, 0), 1);
+
 	MyAuxProcType = LmsWorker1Process;
 	UT_ASSERT(!cluster_ic_tier1_stream_current(&stream));
 	MyAuxProcType = LmsProcess;
 	++ut_epoch;
+	UT_ASSERT_EQ(cluster_ic_tier1_resource_x_stream_generation(UT_PEER_ID, 0), 0);
 	UT_ASSERT(!cluster_ic_tier1_stream_current(&stream));
 	UT_ASSERT(!cluster_ic_tier1_stream_capture(UT_PEER_ID, &ut_first_stream));
 	--ut_epoch;
@@ -1491,7 +1497,14 @@ UT_TEST(test_stream_data_epoch_role_and_native_fork)
 	cluster_ic_tier1_set_my_plane(CLUSTER_IC_PLANE_CONTROL);
 	cluster_ic_tier1_set_my_data_channel(0, 1);
 	UT_ASSERT(!cluster_ic_tier1_stream_current(&stream));
+	UT_ASSERT_EQ(cluster_ic_tier1_resource_x_stream_generation(UT_PEER_ID, 0), generation);
+	tier1_stream_bind(UT_PEER_ID);
+	UT_ASSERT_EQ(cluster_ic_tier1_resource_x_stream_generation(UT_PEER_ID, 0), generation + 1);
+	pg_atomic_write_u64(&Tier1Shmem->peers[UT_PEER_ID].resource_x_stream_generation, UINT64_MAX);
+	tier1_stream_bind(UT_PEER_ID);
+	UT_ASSERT_EQ(cluster_ic_tier1_resource_x_stream_generation(UT_PEER_ID, 0), 0);
 	cluster_ic_tier1_close_peer(UT_PEER_ID, NULL);
+	UT_ASSERT_EQ(cluster_ic_tier1_resource_x_stream_generation(UT_PEER_ID, 0), 0);
 	close(ut_rx_fd);
 	ut_rx_fd = -1;
 	MyAuxProcType = LmonProcess;
