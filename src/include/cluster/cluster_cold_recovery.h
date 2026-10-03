@@ -654,6 +654,18 @@ extern ClusterColdTypedV1 *cluster_cold_typed_prepare_v1(struct ClusterRecoveryF
 extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
 
 /*
+ * Before the fence plan publishes its origins recovered: each origin is a
+ * replayed participant (not the founder, the same owner incarnation) whose
+ * pass 2 ended exactly at its sealed tail (cluster_cold_completion_proven_v1),
+ * and every SPACE relation of the plan joins `touched`.  On refusal *thread
+ * names the origin (0 when none can be named).
+ */
+extern bool cluster_cold_completion_ready_v1(const ClusterColdTypedV1 *typed,
+											 const struct ClusterRecoveryFencePlan *fence,
+											 const ClusterColdReplayResultV1 *result,
+											 ClusterColdTouchedV1 *touched, uint16 *thread);
+
+/*
  * Pass-2 SPACE install through the SPACE owner: bring one relation of the
  * sealed plan through its input at position `through` (never further).  At
  * that input's own SPACE step (`step`), a TRUNCATE's shrink_forks are also

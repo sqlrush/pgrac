@@ -38,6 +38,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_control_root.h"
+#include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_space_identity.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_wal_restart_read.h"
@@ -144,6 +145,128 @@ UT_TEST(test_completion_proof)
 	root.tail_last_record_lsn = 0;
 	UT_ASSERT(!cluster_cold_completion_proven_v1(plan, &root, &result, 0));
 	UT_ASSERT(!cluster_cold_completion_proven_v1(NULL, &root, &result, 0));
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
+/* ---- every fenced origin, before the handoff ---- */
+#define FENCE ((const ClusterRecoveryFencePlan *)&fence_origin_count)
+
+/* Founder (thread 1), two fenced origins (2, 3) and two history
+ * generations of thread 2: each origin's pass 2 ended at its root's sealed
+ * tail. */
+static ClusterColdPlanV1 *
+ready_fixture(ClusterColdTypedV1 *typed)
+{
+	ClusterColdPlanV1 *plan = NULL;
+	ClusterColdDiagV1 diag;
+	uint32 p;
+
+	memset(typed, 0, sizeof(*typed));
+	for (p = 0; p < 5; p++) {
+		ClusterColdParticipantV1 *part = &typed->participants[p];
+
+		part->thread_id = p < 3 ? (uint16)(p + 1) : 2;
+		part->timeline = 1;
+		part->owner_incarnation = p < 3 ? 10 + p : p + 2;
+		part->physical_lower = part->native_redo = part->tail_end = 0x2000 + 0x1000 * p;
+	}
+	typed->participant_count = 5;
+	typed->replay_count = 3;
+	typed->own_participant = 0;
+	UT_ASSERT_EQ(cluster_cold_plan_create_v1(typed->participants, 5, 1024 * 1024, &plan),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(cluster_cold_plan_seal_v1(plan, observe_nothing, NULL, &diag), CLUSTER_COLD_OK);
+	typed->plan = plan;
+	memset(&result, 0, sizeof(result));
+	result.detail = CLUSTER_COLD_REPLAY_OK;
+	fence_origin_count = 2;
+	for (p = 1; p < 3; p++) {
+		ClusterControlRootSnapshot *r = &fence_origin_root[p - 1];
+
+		fence_origin_thread[p - 1] = (uint16)(p + 1);
+		memset(r, 0, sizeof(*r));
+		r->identity.origin_thread_id = (uint16)(p + 1);
+		r->identity.origin_owner_incarnation = 10 + p;
+		r->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+		r->root_flags = CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+		r->tail_last_record_lsn = typed->participants[p].tail_end - 0x80;
+		r->tail_last_record_crc32c = 0x100 + p;
+		r->validated_tail_lsn_exclusive = typed->participants[p].tail_end;
+		result.last_read[p] = r->tail_last_record_lsn;
+		result.last_crc[p] = r->tail_last_record_crc32c;
+		result.last_end[p] = r->validated_tail_lsn_exclusive;
+	}
+	return plan;
+}
+
+/*
+ * Every fenced origin must be a replayed participant -- not the founder,
+ * not a history generation of the same thread, the same owner
+ * incarnation -- whose pass 2 ended at its sealed tail.
+ */
+UT_TEST(test_completion_ready)
+{
+	ClusterColdTypedV1 typed;
+	ClusterColdTouchedV1 touched;
+	ClusterColdPlanV1 *plan = ready_fixture(&typed);
+	uint16 thread = 99;
+
+	memset(&touched, 0, sizeof(touched));
+	UT_ASSERT(cluster_cold_completion_ready_v1(&typed, FENCE, &result, &touched, &thread));
+	UT_ASSERT_EQ(thread, 0);
+	UT_ASSERT_EQ(touched.count, 0); /* no SPACE relation in this plan */
+
+	/* origin 3 stopped one record early */
+	result.last_end[2] -= 0x10;
+	UT_ASSERT(!cluster_cold_completion_ready_v1(&typed, FENCE, &result, &touched, &thread));
+	UT_ASSERT_EQ(thread, 3);
+	result.last_end[2] += 0x10;
+
+	/* an origin the typed plan does not replay: only a history generation
+	 * of its thread is here, even one whose cut would prove */
+	typed.participants[2].thread_id = 4;
+	typed.participants[4].thread_id = 3;
+	typed.participants[4].owner_incarnation = 12;
+	result.last_read[4] = result.last_read[2];
+	result.last_crc[4] = result.last_crc[2];
+	result.last_end[4] = result.last_end[2];
+	UT_ASSERT(!cluster_cold_completion_ready_v1(&typed, FENCE, &result, &touched, &thread));
+	UT_ASSERT_EQ(thread, 3);
+	typed.participants[4].thread_id = 2;
+	typed.participants[4].owner_incarnation = 6;
+	/* not found is not the first history slot, whatever that slot holds */
+	typed.participants[3].owner_incarnation = 12;
+	result.last_read[3] = result.last_read[2];
+	result.last_crc[3] = result.last_crc[2];
+	result.last_end[3] = result.last_end[2];
+	UT_ASSERT(!cluster_cold_completion_ready_v1(&typed, FENCE, &result, &touched, &thread));
+	UT_ASSERT_EQ(thread, 3);
+	typed.participants[2].thread_id = 3;
+	typed.participants[3].owner_incarnation = 5;
+
+	/* another incarnation of the origin's thread */
+	typed.participants[1].owner_incarnation = 5;
+	UT_ASSERT(!cluster_cold_completion_ready_v1(&typed, FENCE, &result, &touched, &thread));
+	UT_ASSERT_EQ(thread, 2);
+	typed.participants[1].owner_incarnation = 11;
+
+	/* the founder's own generation never stands in for an origin */
+	fence_origin_thread[0] = 1;
+	fence_origin_root[0].identity.origin_thread_id = 1;
+	result.last_read[0] = result.last_read[1];
+	result.last_crc[0] = result.last_crc[1];
+	result.last_end[0] = result.last_end[1];
+	typed.participants[0].owner_incarnation = 11;
+	UT_ASSERT(!cluster_cold_completion_ready_v1(&typed, FENCE, &result, &touched, &thread));
+	UT_ASSERT_EQ(thread, 1);
+	cluster_cold_plan_destroy_v1(&plan);
+
+	/* an origin the fence plan cannot name */
+	plan = ready_fixture(&typed);
+	UT_ASSERT(!cluster_cold_completion_ready_v1(&typed, NULL, &result, &touched, &thread));
+	fence_origin_count = 3; /* index 2 cannot be named */
+	fence_origin_thread[2] = 0;
+	UT_ASSERT(!cluster_cold_completion_ready_v1(&typed, FENCE, &result, &touched, &thread));
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
@@ -311,8 +434,9 @@ UT_TEST(test_barrier_writes_then_syncs)
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(5);
 	UT_RUN(test_completion_proof);
+	UT_RUN(test_completion_ready);
 	UT_RUN(test_touched_set);
 	UT_RUN(test_touched_by_record);
 	UT_RUN(test_barrier_writes_then_syncs);

@@ -3512,41 +3512,14 @@ cluster_typed_replay_unpublished(uint16 thread, const char *what, int detail)
 static void
 cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdReplayResultV1 *result)
 {
-	ClusterColdTypedV1 *typed = rep->typed;
 	ClusterRecoveryFencePlan *plan = *rep->fence_plan;
 	uint16		origins = cluster_recovery_merge_fence_plan_origin_count(plan);
 	uint16		thread = 0;
 	int			detail = 0;
-	uint32		relations = cluster_cold_plan_space_relation_count_v1(typed->plan);
-	uint32		i;
 
-	for (i = 0; i < origins; i++)
-	{
-		ClusterControlRootSnapshot root;
-		ClusterControlRootReadToken token;
-		uint32		p;
-
-		if (!cluster_recovery_merge_fence_plan_origin(plan, (uint16) i, &thread, &root, &token))
-			cluster_typed_replay_unpublished(thread, "The fence plan lost an origin", 0);
-		for (p = 0; p < typed->replay_count; p++)
-			if (p != typed->own_participant && typed->participants[p].thread_id == thread)
-				break;
-		if (p == typed->replay_count ||
-			!cluster_cold_completion_proven_v1(typed->plan, &root, result, p))
-			cluster_typed_replay_unpublished(thread, "Replay did not end at its sealed tail",
-											 (int) result->detail);
-	}
-	for (i = 0; i < relations; i++)
-	{
-		RelFileLocator locator;
-		uint32		count = 0;
-		ForkNumber	fork;
-
-		if (!cluster_cold_plan_space_relation_v1(typed->plan, i, &locator, &count))
-			cluster_typed_replay_unpublished(0, "A SPACE relation was lost", (int) i);
-		for (fork = 0; fork <= MAX_FORKNUM; fork++)
-			cluster_cold_touched_add_v1(&rep->touched, &locator, fork);
-	}
+	if (!cluster_cold_completion_ready_v1(rep->typed, plan, result, &rep->touched, &thread))
+		cluster_typed_replay_unpublished(thread, "Replay did not end at its sealed tail",
+										 (int) result->detail);
 	cluster_cold_durable_barrier_v1(&rep->touched);
 	switch (cluster_recovery_merge_fence_plan_complete_v1(plan, &thread, &detail))
 	{

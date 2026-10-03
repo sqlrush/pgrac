@@ -38,6 +38,7 @@
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_control_root.h"
+#include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_space_identity.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_wal_restart_read.h"
