@@ -4709,6 +4709,14 @@ test_cluster_pcm_lms_intent_pump.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     END { if (probe != 1 || calls != 1 || pump != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Exercise the actual final LMS0 wait adjustment with the real PCM fixture.
+test_cluster_pcm_lms_intent_wait.inc: $(top_srcdir)/src/backend/cluster/cluster_lms.c Makefile
+	awk '/DATA tick owns separate management\/dispatch brackets/ { emit=1; begin++ } \
+	     emit && /if \(cluster_lms_data_plane_enabled\(\)\)/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
@@ -4719,6 +4727,7 @@ test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait
 		test_cluster_pcm_source_replay_consumer.inc \
 		test_cluster_pcm_ready_scheduler.inc \
 		test_cluster_pcm_lms_intent_pump.inc \
+		test_cluster_pcm_lms_intent_wait.inc \
 		$(CLUSTER_VERSION_O) test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \

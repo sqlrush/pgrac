@@ -50,6 +50,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -83,6 +84,17 @@ char *cluster_shared_storage_uuid = NULL;
 int cluster_node_id = 0;
 bool cluster_shared_catalog = false;
 bool IsUnderPostmaster = false;
+int io_direct_flags = 0;
+static int last_open_flags;
+static int last_open_fd;
+static bool direct_fds[4096];
+static int prefetch_calls;
+static int writeback_calls;
+static int sync_calls;
+static int open_calls;
+static int io_fault;
+static bool reject_direct_open;
+static const void *last_io_buffer;
 
 /* Scripted FileSize/pg_usleep surface for the concurrent-extend EOF tests. */
 static off_t file_size_script[8];
@@ -213,7 +225,26 @@ psprintf(const char *fmt, ...)
 File
 PathNameOpenFile(const char *fileName, int fileFlags)
 {
-	return (File)open(fileName, fileFlags, 0600);
+	last_open_flags = fileFlags;
+	open_calls++;
+	if (reject_direct_open && (fileFlags & PG_O_DIRECT)) {
+		errno = EINVAL;
+		return -1;
+	}
+#ifdef PG_O_DIRECT_USE_F_NOCACHE
+	fileFlags &= ~PG_O_DIRECT;
+#endif
+	last_open_fd = open(fileName, fileFlags, 0600);
+	if (last_open_fd >= 0) {
+		if (last_open_fd >= lengthof(direct_fds))
+			abort();
+		direct_fds[last_open_fd] = (last_open_flags & PG_O_DIRECT) != 0;
+#ifdef PG_O_DIRECT_USE_F_NOCACHE
+		if (direct_fds[last_open_fd] && fcntl(last_open_fd, F_NOCACHE, 1) < 0)
+			abort();
+#endif
+	}
+	return last_open_fd;
 }
 
 void
@@ -225,18 +256,49 @@ FileClose(File file)
 int
 FileRead(File f, void *b, size_t a, off_t o, uint32 w pg_attribute_unused())
 {
+	last_io_buffer = b;
+	if (direct_fds[f]
+		&& ((uintptr_t)b % PG_IO_ALIGN_SIZE || a % PG_IO_ALIGN_SIZE || o % PG_IO_ALIGN_SIZE)) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (io_fault == 1) {
+		memset(b, 0x17, a / 2);
+		return a / 2;
+	}
+	if (io_fault == 2) {
+		errno = EIO;
+		return -1;
+	}
 	return (int)pread((int)f, b, a, o);
 }
 
 int
 FileWrite(File f, const void *b, size_t a, off_t o, uint32 w pg_attribute_unused())
 {
+	last_io_buffer = b;
+	if (direct_fds[f]
+		&& ((uintptr_t)b % PG_IO_ALIGN_SIZE || a % PG_IO_ALIGN_SIZE || o % PG_IO_ALIGN_SIZE)) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (io_fault == 3)
+		return a / 2;
+	if (io_fault == 4) {
+		errno = EIO;
+		return -1;
+	}
 	return (int)pwrite((int)f, b, a, o);
 }
 
 int
 FileSync(File f, uint32 w pg_attribute_unused())
 {
+	sync_calls++;
+	if (io_fault == 5) {
+		errno = EIO;
+		return -1;
+	}
 	return fsync((int)f);
 }
 
@@ -244,13 +306,16 @@ int
 FilePrefetch(File f pg_attribute_unused(), off_t o pg_attribute_unused(),
 			 off_t a pg_attribute_unused(), uint32 w pg_attribute_unused())
 {
+	prefetch_calls++;
 	return 0;
 }
 
 void
 FileWriteback(File f pg_attribute_unused(), off_t o pg_attribute_unused(),
 			  off_t a pg_attribute_unused(), uint32 w pg_attribute_unused())
-{}
+{
+	writeback_calls++;
+}
 
 off_t
 FileSize(File f)
@@ -314,11 +379,11 @@ char *
 GetRelationPath(Oid dbOid, Oid spcOid pg_attribute_unused(), RelFileNumber relNumber,
 				int backendId pg_attribute_unused(), ForkNumber forkNumber)
 {
-	if (forkNumber == FSM_FORKNUM)
-		return psprintf("base/%u/%u_fsm", dbOid, relNumber);
-	if (forkNumber != MAIN_FORKNUM)
+	const char *suffixes[] = { "", "_fsm", "_vm", "_init", "_space" };
+
+	if (forkNumber < MAIN_FORKNUM || forkNumber > SPACE_FORKNUM)
 		abort();
-	return psprintf("base/%u/%u", dbOid, relNumber);
+	return psprintf("base/%u/%u%s", dbOid, relNumber, suffixes[forkNumber]);
 }
 
 int pg_dir_create_mode = 0700;
@@ -755,10 +820,206 @@ UT_TEST(test_sentinel_missing_file_fails_closed)
 }
 
 
+/* Native descriptors enforce direct alignment on Linux. The explicit check in
+ * the fd boundary also exercises that requirement on F_NOCACHE platforms. */
+UT_TEST(test_direct_flags_and_all_relation_forks)
+{
+	const ClusterSharedFsOps *ops = &cluster_shared_fs_sharedfs_ops;
+	const int modes[] = { 0, IO_DIRECT_WAL, IO_DIRECT_DATA, IO_DIRECT_DATA | IO_DIRECT_WAL };
+	RelFileLocator rl = { .spcOid = 1663, .dbOid = 5, .relNumber = 24600 };
+	PGIOAlignedBlock input[2], output[2];
+
+	fresh_root("direct_forks");
+	UT_ASSERT(PG_O_DIRECT != 0 && ops->caps->supports_odirect);
+	UT_ASSERT_EQ(ops->caps->required_io_alignment, 0);
+	UT_ASSERT_EQ(ops->caps->durability_class, CLUSTER_DURABILITY_BUFFERED);
+	for (int mode = 0; mode < lengthof(modes); mode++) {
+		io_direct_flags = modes[mode];
+		for (ForkNumber forknum = MAIN_FORKNUM; forknum <= SPACE_FORKNUM; forknum++) {
+			ClusterSharedFsHandle *handle = NULL;
+			bool direct = (io_direct_flags & IO_DIRECT_DATA) != 0;
+
+			ops->create(rl, forknum, false, &handle);
+			UT_ASSERT_EQ((last_open_flags & PG_O_DIRECT) != 0, direct);
+#ifdef O_DIRECT
+			UT_ASSERT_EQ((fcntl(last_open_fd, F_GETFL) & O_DIRECT) != 0, direct);
+#endif
+			UT_ASSERT_EQ(ops->nblocks(handle), 0);
+			memset(input[0].data + 1, 0x83 + forknum, BLCKSZ);
+			UT_ASSERT_EQ(ops->write(handle, 0, input[0].data + 1), BLCKSZ);
+			UT_ASSERT_EQ(ops->read(handle, 0, output[0].data + 1), BLCKSZ);
+			UT_ASSERT_EQ(memcmp(input[0].data + 1, output[0].data + 1, BLCKSZ), 0);
+			ops->close(handle);
+			ops->open_existing(rl, forknum, &handle);
+			UT_ASSERT_EQ((last_open_flags & PG_O_DIRECT) != 0, direct);
+			UT_ASSERT_EQ(ops->read(handle, 0, output[0].data), BLCKSZ);
+			UT_ASSERT_EQ((unsigned char)output[0].data[0], 0x83 + forknum);
+			ops->close(handle);
+			ops->create(rl, forknum, true, &handle);
+			UT_ASSERT_EQ((last_open_flags & PG_O_DIRECT) != 0, direct);
+			UT_ASSERT_EQ(ops->nblocks(handle), 1);
+			ops->close(handle);
+			ops->unlink(rl, forknum);
+		}
+	}
+	io_direct_flags = 0;
+}
+
+UT_TEST(test_direct_alignment_extension_and_sync)
+{
+	const ClusterSharedFsOps *ops = &cluster_shared_fs_sharedfs_ops;
+	RelFileLocator rl = { .spcOid = 1663, .dbOid = 5, .relNumber = 24601 };
+	ClusterSharedFsHandle *handle = NULL;
+	PGIOAlignedBlock input, output;
+
+	fresh_root("direct_extend");
+	io_direct_flags = IO_DIRECT_DATA;
+	ops->create(rl, MAIN_FORKNUM, false, &handle);
+	memset(input.data, 0x52, BLCKSZ);
+	UT_ASSERT_EQ(ops->write(handle, 0, input.data), BLCKSZ);
+	UT_ASSERT(last_io_buffer == input.data);
+	UT_ASSERT_EQ(ops->read(handle, 0, output.data), BLCKSZ);
+	UT_ASSERT(last_io_buffer == output.data);
+	UT_ASSERT_EQ(memcmp(input.data, output.data, BLCKSZ), 0);
+	for (BlockNumber block = 1; block < 4; block++) {
+		UT_ASSERT_EQ(ops->nblocks(handle), block);
+		ops->extend(handle, block);
+		UT_ASSERT_EQ((uintptr_t)last_io_buffer % PG_IO_ALIGN_SIZE, 0);
+		UT_ASSERT_EQ(ops->nblocks(handle), block + 1);
+		UT_ASSERT_EQ(ops->read(handle, block, output.data), BLCKSZ);
+		memset(input.data, 0, BLCKSZ);
+		UT_ASSERT_EQ(memcmp(input.data, output.data, BLCKSZ), 0);
+	}
+	sync_calls = 0;
+	ops->immedsync(handle);
+	ops->barrier_sync(handle);
+	UT_ASSERT_EQ(sync_calls, 2);
+	ops->truncate(handle, 1);
+	UT_ASSERT_EQ(ops->nblocks(handle), 1);
+	ops->barrier_sync(handle);
+	UT_ASSERT_EQ(sync_calls, 3);
+	ops->close(handle);
+	ops->unlink(rl, MAIN_FORKNUM);
+	io_direct_flags = 0;
+}
+
+UT_TEST(test_direct_prefetch_and_writeback_are_not_buffered)
+{
+	const ClusterSharedFsOps *ops = &cluster_shared_fs_sharedfs_ops;
+	RelFileLocator rl = { .spcOid = 1663, .dbOid = 5, .relNumber = 24602 };
+	ClusterSharedFsHandle *handle = NULL;
+
+	fresh_root("direct_prefetch");
+	for (int direct = 0; direct <= 1; direct++) {
+		io_direct_flags = direct ? IO_DIRECT_DATA : IO_DIRECT_WAL;
+		ops->create(rl, MAIN_FORKNUM, false, &handle);
+		prefetch_calls = writeback_calls = 0;
+		UT_ASSERT_EQ(ops->prefetch(handle, 0), !direct);
+		ops->writeback(handle, 0, 1);
+		UT_ASSERT_EQ(prefetch_calls, !direct);
+		UT_ASSERT_EQ(writeback_calls, !direct);
+		ops->close(handle);
+		ops->unlink(rl, MAIN_FORKNUM);
+	}
+	io_direct_flags = 0;
+}
+
+UT_TEST(test_direct_errors_and_partial_read_do_not_publish_success)
+{
+	const ClusterSharedFsOps *ops = &cluster_shared_fs_sharedfs_ops;
+	RelFileLocator rl = { .spcOid = 1663, .dbOid = 5, .relNumber = 24603 };
+	ClusterSharedFsHandle *handle = NULL;
+	char *shared = mmap(NULL, 2 * BLCKSZ, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+	PGIOAlignedBlock input;
+
+	UT_ASSERT(shared != MAP_FAILED);
+	fresh_root("direct_error");
+	io_direct_flags = IO_DIRECT_DATA;
+	ops->create(rl, MAIN_FORKNUM, false, &handle);
+	memset(input.data, 0x6d, BLCKSZ);
+	ops->write(handle, 0, input.data);
+	for (int failure = 1; failure <= 6; failure++) {
+		pid_t child;
+		int status;
+
+		memset(shared, 0x6d, 2 * BLCKSZ);
+		fflush(NULL);
+		child = fork();
+		UT_ASSERT(child >= 0);
+		if (child == 0) {
+			io_fault = failure == 6 ? 5 : failure;
+			if (failure <= 2)
+				ops->read(handle, 0, shared + 1);
+			else if (failure <= 4)
+				ops->write(handle, 0, input.data);
+			else if (failure == 5)
+				ops->immedsync(handle);
+			else
+				ops->barrier_sync(handle);
+			_exit(0);
+		}
+		UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+		UT_ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+		UT_ASSERT_EQ(memcmp(shared + 1, input.data, BLCKSZ), 0);
+	}
+	munmap(shared, 2 * BLCKSZ);
+	ops->close(handle);
+	ops->unlink(rl, MAIN_FORKNUM);
+	io_direct_flags = 0;
+}
+
+UT_TEST(test_direct_open_failure_cannot_fall_back)
+{
+	const ClusterSharedFsOps *ops = &cluster_shared_fs_sharedfs_ops;
+	RelFileLocator rl = { .spcOid = 1663, .dbOid = 5, .relNumber = 24604 };
+	ClusterSharedFsHandle *handle = NULL;
+
+	fresh_root("direct_refused");
+	io_direct_flags = 0;
+	ops->create(rl, MAIN_FORKNUM, false, &handle);
+	ops->close(handle);
+	for (int action = 0; action < 3; action++) {
+		pid_t child;
+		int status;
+
+		fflush(NULL);
+		child = fork();
+		UT_ASSERT(child >= 0);
+		if (child == 0) {
+			io_direct_flags = IO_DIRECT_DATA;
+			reject_direct_open = true;
+			if (action == 0)
+				ops->open_existing(rl, MAIN_FORKNUM, &handle);
+			else
+				ops->create(rl, action == 1 ? MAIN_FORKNUM : FSM_FORKNUM, true, &handle);
+			_exit(0);
+		}
+		UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+		UT_ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+	}
+	ops->unlink(rl, MAIN_FORKNUM);
+}
+
+UT_TEST(test_direct_data_leaves_small_sentinel_buffered)
+{
+	MirrorSharedControl control;
+	int before;
+
+	fresh_root("direct_sentinel");
+	io_direct_flags = IO_DIRECT_DATA;
+	before = open_calls;
+	cluster_shared_fs_sharedfs_ops.init();
+	UT_ASSERT(read_mirror(&control));
+	UT_ASSERT(cluster_shared_fs_sentinel_has_participant(cluster_node_id));
+	UT_ASSERT_EQ(open_calls, before);
+	UT_ASSERT(sizeof(control) < BLCKSZ);
+	io_direct_flags = 0;
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(17);
 	UT_RUN(test_sharedfs_roundtrip_and_owner_agnostic);
 	UT_RUN(test_sharedfs_extend_zero_fills);
 	UT_RUN(test_shared_catalog_create_rejects_existing_main);
@@ -770,6 +1031,12 @@ main(void)
 	UT_RUN(test_sentinel_corrupt_fails_closed);
 	UT_RUN(test_sentinel_preset_uuid_recorded);
 	UT_RUN(test_sentinel_missing_file_fails_closed);
+	UT_RUN(test_direct_flags_and_all_relation_forks);
+	UT_RUN(test_direct_alignment_extension_and_sync);
+	UT_RUN(test_direct_prefetch_and_writeback_are_not_buffered);
+	UT_RUN(test_direct_errors_and_partial_read_do_not_publish_success);
+	UT_RUN(test_direct_open_failure_cannot_fall_back);
+	UT_RUN(test_direct_data_leaves_small_sentinel_buffered);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

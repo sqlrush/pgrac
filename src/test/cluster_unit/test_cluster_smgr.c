@@ -580,6 +580,7 @@ mdwriteback(SMgrRelation r pg_attribute_unused(), ForkNumber f pg_attribute_unus
 char *cluster_shared_data_dir = NULL;
 char *cluster_shared_storage_uuid = NULL;
 int cluster_node_id = 0;
+int io_direct_flags = 0;
 int pg_dir_create_mode = 0700;
 
 char *

@@ -11088,6 +11088,22 @@ UT_TEST(test_resource_x_remote_lane0_settlement_retires_only_after_exact_source_
 				 RESOURCE_X_APPLY_BAD_STATE);
 	UT_ASSERT_EQ(successor_ack.common.base_authority_generation, UINT64_C(0));
 
+	/* Sending retains the source debt; cadence does not substitute for ACK. */
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, intent.first_armed_us + 1),
+		RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
+					 &intent, intent.first_armed_us + 2),
+				 RESOURCE_X_INTENT_HARD_REARMED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
+					 &intent, intent.first_armed_us + 500001),
+				 RESOURCE_X_INTENT_NOT_DUE);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
+					 &intent, intent.first_armed_us + 500002),
+				 RESOURCE_X_INTENT_STAGED);
+
 	source_ack = source_request;
 	source_ack.kind = RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2;
 	source_ack.common.sender_connection_generation = 64;
@@ -11095,6 +11111,10 @@ UT_TEST(test_resource_x_remote_lane0_settlement_retires_only_after_exact_source_
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_source_settlement_ack_exact(&source_ack, 0, &after_ack),
 		RESOURCE_X_APPLY_APPLIED);
+	/* ACK racing with an admitted retry retires the debt permanently. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
+					 &intent, intent.first_armed_us + 500003),
+				 RESOURCE_X_INTENT_STALE);
 	/* Pair retention canceled the unbound local attempt and preserved its
 	 * floor, so the requester legitimately retries with a higher attempt.  It
 	 * must sample the current base immediately after the old carrier settles;
@@ -13678,6 +13698,8 @@ BackendType MyBackendType = B_LMS;
 int cluster_lms_workers = 2;
 static bool ready_peer_ok = true;
 static bool ready_ring_full;
+static bool ready_interleave_once;
+static bool ready_stale_interleave_once;
 static int ready_enqueue_calls;
 static bool ready_endless_probe;
 static ResourceXIntentSlot ready_synthetic_slot;
@@ -13698,19 +13720,47 @@ cluster_lms_shard_for_tag(const BufferTag *tag, int workers)
 	return 1;
 }
 
-bool
+ClusterLmsEnqueueResult
 cluster_lms_outbound_enqueue_resource_x_intent(int worker, const ResourceXIntentSlot *intent,
 											   uint32 connection, uint64 deadline)
 {
+	ResourceXIntentResult result;
+
 	UT_ASSERT_EQ(fake_lwlock_depth, 0);
 	UT_ASSERT_EQ(worker, 1);
 	UT_ASSERT_EQ(connection, 61);
 	UT_ASSERT_EQ(deadline, fake_pcm_clock_us + (uint64)Max(cluster_gcs_reply_timeout_ms, 1) * 1000);
 	ready_enqueue_calls++;
+	if (ready_interleave_once) {
+		ready_interleave_once = false;
+		UT_ASSERT_EQ(
+			cluster_pcm_lock_resource_x_outbound_intent_stage_exact(intent, fake_pcm_clock_us - 2),
+			RESOURCE_X_INTENT_STAGED);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
+						 intent, fake_pcm_clock_us - 1),
+					 RESOURCE_X_INTENT_HARD_REARMED);
+	}
+	if (ready_stale_interleave_once) {
+		ready_stale_interleave_once = false;
+		UT_ASSERT_EQ(
+			cluster_pcm_lock_resource_x_outbound_intent_stage_exact(intent, fake_pcm_clock_us + 1),
+			RESOURCE_X_INTENT_STAGED);
+		UT_ASSERT_EQ(
+			cluster_pcm_lock_resource_x_outbound_intent_stage_exact(intent, fake_pcm_clock_us),
+			RESOURCE_X_INTENT_STALE);
+		/* Sender completes between the losing stage and its failure callback. */
+		fake_pcm_clock_us += 5;
+		UT_ASSERT_EQ(
+			cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(intent, fake_pcm_clock_us),
+			RESOURCE_X_INTENT_HARD_REARMED);
+		return CLUSTER_LMS_ENQUEUE_INVALID;
+	}
 	if (ready_ring_full)
-		return false;
-	return cluster_pcm_lock_resource_x_outbound_intent_stage_exact(intent, fake_pcm_clock_us)
-		   == RESOURCE_X_INTENT_STAGED;
+		return CLUSTER_LMS_ENQUEUE_FULL;
+	result = cluster_pcm_lock_resource_x_outbound_intent_stage_exact(intent, fake_pcm_clock_us);
+	return result == RESOURCE_X_INTENT_STAGED	 ? CLUSTER_LMS_ENQUEUE_ADMITTED
+		   : result == RESOURCE_X_INTENT_NOT_DUE ? CLUSTER_LMS_ENQUEUE_NOT_DUE
+												 : CLUSTER_LMS_ENQUEUE_INVALID;
 }
 
 static ResourceXIntentProbeResult
@@ -18049,10 +18099,10 @@ UT_TEST(test_resource_x_outbound_stage_has_one_physical_queue_owner)
 	UT_ASSERT_EQ(observed.last_attempt_us, UINT64_C(201));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(&intent, 203),
 				 RESOURCE_X_INTENT_HARD_REARMED);
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 204),
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 500203),
 				 RESOURCE_X_INTENT_STAGED);
 	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&intent));
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 205),
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 500204),
 				 RESOURCE_X_INTENT_STALE);
 }
 
@@ -18131,10 +18181,12 @@ UT_TEST(test_resource_x_ready_tag_avoids_sparse_scan_and_preserves_admission)
 	UT_ASSERT_EQ(ready_enqueue_calls, 1); /* No second queue owner. */
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(&intent, 201),
 				 RESOURCE_X_INTENT_HARD_REARMED);
+	fake_pcm_clock_us = 500201;
 	ready_peer_ok = false;
 	gcs_block_resource_x_stage_ready_tag(&tag);
 	UT_ASSERT_EQ(ready_enqueue_calls, 1);
 	ready_peer_ok = true;
+	fake_pcm_clock_us += 500000;
 	ready_ring_full = true;
 	gcs_block_resource_x_stage_ready_tag(&tag);
 	UT_ASSERT_EQ(ready_enqueue_calls, 2);
@@ -18151,10 +18203,13 @@ UT_TEST(test_resource_x_ready_tag_avoids_sparse_scan_and_preserves_admission)
 	gcs_block_resource_x_stage_ready_tag(&tag);
 	UT_ASSERT_EQ(ready_enqueue_calls, 18);
 	MyBackendType = B_LMS;
+	fake_pcm_clock_us += 500000;
 	gcs_block_resource_x_stage_ready_tag(&tag);
 	UT_ASSERT_EQ(ready_enqueue_calls, 19);
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(&intent, 202),
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
+					 &intent, fake_pcm_clock_us + 1),
 				 RESOURCE_X_INTENT_HARD_REARMED);
+	fake_pcm_clock_us += 500001;
 	MyBackendType = B_LMS_WORKER; /* Actual nonzero DATA-shard ingress owner. */
 	gcs_block_resource_x_stage_ready_tag(&tag);
 	UT_ASSERT_EQ(ready_enqueue_calls, 20);
@@ -20693,6 +20748,267 @@ cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *r
 
 #include "test_cluster_pcm_lms_intent_pump.inc"
 
+/* Real grant owner; no synthetic registry/intent bytes. */
+static ResourceXIntentSlot
+cadence_grant(BufferTag tag)
+{
+	ResourceXDecodedFrame assertion;
+	ResourceXDurableProof durable = { 0 };
+	ResourceXIntentSlot intent = { 0 };
+	ResourceXMasterSnapshot snapshot;
+	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 2, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 2, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	durable.assertion = assertion.common.logical_assertion;
+	durable.base_authority_generation = 1;
+	durable.resource_formation = 17;
+	durable.master_session_incarnation = 31;
+	durable.assertion_sequence = 41;
+	durable.requester_target_generation = 41;
+	durable.page_scn_lsn = 82;
+	durable.page_checksum = UINT32_C(0x12345678);
+	durable.source_proof_crc32c = UINT32_C(0x87654321);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(&durable, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
+					 &durable.assertion, &intent, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	return intent;
+}
+
+static long
+actual_lms_intent_wait(long lms_wait_timeout_ms)
+{
+#include "test_cluster_pcm_lms_intent_wait.inc"
+	return lms_wait_timeout_ms;
+}
+
+UT_TEST(test_resource_x_retry_locked_stage_keeps_last_attempt)
+{
+	BufferTag tag = make_tag(315);
+	ResourceXIntentSlot intent, observed;
+	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+
+	reset_fake_pcm_runtime(4);
+	fake_pcm_clock_us = 100000;
+	intent = cadence_grant(tag);
+	UT_ASSERT_EQ(intent.last_attempt_us, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 100000),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(&intent, 100001),
+				 RESOURCE_X_INTENT_HARD_REARMED);
+	/* A second scanner's earlier snapshot cannot renew or bypass the wait. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 600000),
+				 RESOURCE_X_INTENT_NOT_DUE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
+					 &intent, &observed, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(observed.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	UT_ASSERT_EQ(observed.last_attempt_us, 100001);
+	UT_ASSERT_EQ(observed.first_armed_us, intent.first_armed_us);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 100000),
+				 RESOURCE_X_INTENT_NOT_DUE); /* Clock moved backwards. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, UINT64_MAX),
+				 RESOURCE_X_INTENT_NOT_DUE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 0),
+				 RESOURCE_X_INTENT_NOT_DUE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 600001),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 600001),
+				 RESOURCE_X_INTENT_STALE); /* Exactly one physical queue owner. */
+}
+
+UT_TEST(test_resource_x_retry_sparse_scans_preserve_undue_owner)
+{
+	BufferTag tag = make_tag(316);
+	ResourceXIntentSlot intent, selected, observed;
+	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+	uint32 cursor, examined;
+	ResourceXIntentProbeResult result;
+	int cycle, call;
+
+	reset_fake_pcm_runtime(17);
+	fake_pcm_clock_us = 100000;
+	intent = cadence_grant(tag);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 100000),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(&intent, 100001),
+				 RESOURCE_X_INTENT_HARD_REARMED);
+	fake_pcm_clock_us = 600000;
+	fake_lms0_wakeup_count = 0;
+	for (cycle = 0; cycle < 3; cycle++) {
+		cursor = 0;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_ready_intent_probe_exact(&tag, &cursor, &selected),
+					 RESOURCE_X_INTENT_PROBE_COMPLETE);
+		for (call = 0; call < 16; call++) {
+			result = cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
+				4, &selected, payload, sizeof(payload), &examined);
+			UT_ASSERT(examined <= 4);
+			UT_ASSERT(result == RESOURCE_X_INTENT_PROBE_MORE
+					  || result == RESOURCE_X_INTENT_PROBE_COMPLETE);
+			if (result != RESOURCE_X_INTENT_PROBE_MORE)
+				break;
+		}
+		UT_ASSERT_EQ(result, RESOURCE_X_INTENT_PROBE_COMPLETE);
+	}
+	UT_ASSERT_EQ(fake_lms0_wakeup_count, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
+					 &intent, &observed, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(observed.last_attempt_us, 100001);
+	fake_pcm_clock_us = 600001;
+	cursor = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_ready_intent_probe_exact(&tag, &cursor, &selected),
+				 RESOURCE_X_INTENT_PROBE_FOUND);
+	UT_ASSERT_EQ(selected.first_armed_us, intent.first_armed_us);
+	for (call = 0; call < 16; call++) {
+		result = cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
+			4, &selected, payload, sizeof(payload), &examined);
+		UT_ASSERT(examined <= 4);
+		if (result == RESOURCE_X_INTENT_PROBE_FOUND)
+			break;
+	}
+	UT_ASSERT_EQ(result, RESOURCE_X_INTENT_PROBE_FOUND);
+	UT_ASSERT_EQ(selected.first_armed_us, intent.first_armed_us);
+	UT_ASSERT_EQ(selected.logical_generation, intent.logical_generation);
+}
+
+UT_TEST(test_real_pcm_pump_retries_only_when_due)
+{
+	BufferTag tag = make_tag(317);
+	ResourceXIntentSlot intent, observed;
+	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+
+	reset_fake_pcm_runtime(17);
+	fake_pcm_clock_us = 100000;
+	MyBackendType = B_LMS;
+	ready_peer_ok = true;
+	ready_endless_probe = ready_ring_full = false;
+	ready_enqueue_calls = 0;
+	intent = cadence_grant(tag);
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 1);
+	UT_ASSERT_EQ(ready_enqueue_calls, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(&intent, 100001),
+				 RESOURCE_X_INTENT_HARD_REARMED);
+	fake_pcm_clock_us = 600000;
+	fake_lms0_wakeup_count = 0;
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 0);
+	UT_ASSERT_EQ(ready_enqueue_calls, 1);
+	UT_ASSERT_EQ(fake_lms0_wakeup_count, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
+					 &intent, &observed, payload, sizeof(payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(observed.last_attempt_us, 100001);
+	if (ut_current_failed)
+		return;
+	fake_pcm_clock_us = 600001;
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 1);
+	UT_ASSERT_EQ(ready_enqueue_calls, 2);
+}
+
+UT_TEST(test_real_ready_and_pump_not_due_race_does_not_renew)
+{
+	int pump;
+
+	for (pump = 0; pump <= 1; pump++) {
+		BufferTag tag = make_tag(319);
+		ResourceXIntentSlot intent, observed;
+		uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+
+		reset_fake_pcm_runtime(4);
+		fake_pcm_clock_us = 100000;
+		MyBackendType = B_LMS;
+		ready_peer_ok = true;
+		ready_endless_probe = ready_ring_full = false;
+		intent = cadence_grant(tag);
+		ready_enqueue_calls = 0;
+		ready_interleave_once = true;
+		if (pump)
+			UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 0);
+		else
+			gcs_block_resource_x_stage_ready_tag(&tag);
+		UT_ASSERT_EQ(ready_enqueue_calls, 1);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
+						 &intent, &observed, payload, sizeof(payload)),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(observed.state, RESOURCE_X_INTENT_SLOT_ARMED);
+		UT_ASSERT_EQ(observed.last_attempt_us, 99999);
+	}
+}
+
+UT_TEST(test_real_stale_stager_cannot_overwrite_new_attempt)
+{
+	int pump;
+
+	for (pump = 0; pump <= 1; pump++) {
+		BufferTag tag = make_tag(320);
+		ResourceXIntentSlot intent, observed;
+		uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+
+		reset_fake_pcm_runtime(4);
+		fake_pcm_clock_us = 100000;
+		MyBackendType = B_LMS;
+		ready_peer_ok = true;
+		ready_endless_probe = ready_ring_full = false;
+		intent = cadence_grant(tag);
+		ready_enqueue_calls = 0;
+		ready_stale_interleave_once = true;
+		if (pump)
+			UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 0);
+		else
+			gcs_block_resource_x_stage_ready_tag(&tag);
+		UT_ASSERT_EQ(ready_enqueue_calls, 1);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
+						 &intent, &observed, payload, sizeof(payload)),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(observed.state, RESOURCE_X_INTENT_SLOT_ARMED);
+		UT_ASSERT_EQ(observed.last_attempt_us, 100005);
+		/* Late failure cannot move the newer deadline forwards either. */
+		UT_ASSERT_EQ(
+			cluster_pcm_lock_resource_x_outbound_intent_not_admitted_exact(&intent, 200000),
+			RESOURCE_X_INTENT_STALE);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
+						 &intent, &observed, payload, sizeof(payload)),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(observed.last_attempt_us, 100005);
+	}
+}
+
+UT_TEST(test_real_lms_wait_retains_quiet_retry_deadline)
+{
+	BufferTag tag = make_tag(318);
+	ResourceXIntentSlot intent, selected;
+	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+	uint32 examined;
+	int i;
+
+	reset_fake_pcm_runtime(4);
+	fake_pcm_clock_us = 100000;
+	intent = cadence_grant(tag);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 100000),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(&intent, 100001),
+				 RESOURCE_X_INTENT_HARD_REARMED);
+	UT_ASSERT_EQ(actual_lms_intent_wait(1000), 500);
+	UT_ASSERT_EQ(actual_lms_intent_wait(3), 3);
+	UT_ASSERT_EQ(actual_lms_intent_wait(0), 0);
+	/* A real completion followed by an empty scan restores the idle timeout. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&intent, 600001),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&intent));
+	for (i = 0; i < 4; i++)
+		(void)cluster_pcm_lock_resource_x_outbound_intent_probe_exact(4, &selected, payload,
+																	  sizeof(payload), &examined);
+	UT_ASSERT_EQ(actual_lms_intent_wait(1000), 1000);
+}
+
 UT_TEST(test_real_pcm_pump_continues_past_sixteenth_delivery)
 {
 	int i;
@@ -20746,7 +21062,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(313);
+	UT_PLAN(319);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -21059,6 +21375,12 @@ main(void)
 	UT_RUN(test_local_pi_read_only_carrier_does_not_create_writer_responsibility);
 	UT_RUN(test_local_pi_redeclare_does_not_need_resident_buffer_or_current_authority);
 	UT_RUN(test_local_pi_redeclare_busy_or_unknown_scope_keeps_original_cursor);
+	UT_RUN(test_resource_x_retry_locked_stage_keeps_last_attempt);
+	UT_RUN(test_resource_x_retry_sparse_scans_preserve_undue_owner);
+	UT_RUN(test_real_pcm_pump_retries_only_when_due);
+	UT_RUN(test_real_ready_and_pump_not_due_race_does_not_renew);
+	UT_RUN(test_real_stale_stager_cannot_overwrite_new_attempt);
+	UT_RUN(test_real_lms_wait_retains_quiet_retry_deadline);
 	UT_RUN(test_real_pcm_pump_continues_past_sixteenth_delivery);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

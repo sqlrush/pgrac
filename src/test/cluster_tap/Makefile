@@ -44,6 +44,18 @@ pgrac_direct_io_probe: bin/pgrac_direct_io_probe.c
 check: all
 	$(prove_check)
 
+# The PRE2 scope filter uses full filenames: shared numeric prefixes must
+# not exclude unrelated fault, consistency or fail-closed coverage.
+PRE2_DEFERRED = $(shell awk '!/^\#/ && NF {print $$1}' $(srcdir)/pre2-deferred.list)
+PRE2_TESTS = $(filter-out $(PRE2_DEFERRED),$(if $(strip $(PROVE_TESTS)),$(PROVE_TESTS),$(patsubst $(srcdir)/%,%,$(wildcard $(srcdir)/t/*.pl))))
+
+pre2-list:
+	@printf '%s\n' $(PRE2_TESTS)
+
+check-pre2:
+	@test -n '$(strip $(PRE2_TESTS))' || { echo 'ERROR: empty PRE2 TAP selection'; exit 1; }
+	$(MAKE) check PROVE_TESTS='$(PRE2_TESTS)'
+
 installcheck:
 	$(prove_installcheck)
 
@@ -57,5 +69,5 @@ clean distclean maintainer-clean:
 install installdirs uninstall:
 	@:
 
-.PHONY: all check installcheck clean distclean maintainer-clean \
+.PHONY: all check check-pre2 pre2-list installcheck clean distclean maintainer-clean \
         install installdirs uninstall

@@ -459,7 +459,8 @@ typedef enum ClusterLmsEnqueueResult {
 	CLUSTER_LMS_ENQUEUE_ADMITTED = 0,
 	CLUSTER_LMS_ENQUEUE_FULL,
 	CLUSTER_LMS_ENQUEUE_INVALID,
-	CLUSTER_LMS_ENQUEUE_UNAVAILABLE
+	CLUSTER_LMS_ENQUEUE_UNAVAILABLE,
+	CLUSTER_LMS_ENQUEUE_NOT_DUE
 } ClusterLmsEnqueueResult;
 extern ClusterLmsEnqueueResult cluster_lms_outbound_try_enqueue(int worker_id, uint8 msg_type,
 																uint32 dest_node_id,
@@ -473,10 +474,11 @@ extern bool cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type
 												   uint32 connection_generation);
 struct ResourceXIntentSlot;
 struct ClusterPcmOwnSnapshot;
-extern bool cluster_lms_outbound_enqueue_resource_x_intent(int worker_id,
-														   const struct ResourceXIntentSlot *intent,
-														   uint32 connection_generation,
-														   uint64 deadline_us);
+/* NOT_DUE retains the owner and its attempt time; it owns no ring slot. */
+extern ClusterLmsEnqueueResult
+cluster_lms_outbound_enqueue_resource_x_intent(int worker_id,
+											   const struct ResourceXIntentSlot *intent,
+											   uint32 connection_generation, uint64 deadline_us);
 
 /* Process-local handle for the current-slice remote-S holder adaptation.
  * It names one exact PENDING slot in the existing LMS DATA ring; none of

@@ -769,7 +769,8 @@ typedef enum ResourceXIntentResult {
 	RESOURCE_X_INTENT_STAGED = 1,
 	RESOURCE_X_INTENT_NOT_ADMITTED = 2,
 	RESOURCE_X_INTENT_HARD_REARMED = 3,
-	RESOURCE_X_INTENT_STALE = 4
+	RESOURCE_X_INTENT_STALE = 4,
+	RESOURCE_X_INTENT_NOT_DUE = 5
 } ResourceXIntentResult;
 
 typedef enum ResourceXIntentProbeResult {
@@ -2064,6 +2065,7 @@ cluster_pcm_lock_resource_x_ready_intent_probe_exact(const BufferTag *tag, uint3
 extern ResourceXIntentProbeResult cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
 	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out, uint16 payload_capacity,
 	uint32 *examined_out);
+extern long cluster_pcm_lock_resource_x_outbound_wait_timeout(long idle_timeout_ms);
 extern ResourceXIntentProbeResult cluster_pcm_lock_resource_x_outbound_work_probe_exact(
 	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out, uint16 payload_capacity,
 	uint32 *examined_out, ResourceXAcquisitionRef *delivery_out);

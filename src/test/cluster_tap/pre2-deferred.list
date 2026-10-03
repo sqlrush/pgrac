@@ -1,0 +1,11 @@
+# Exact paths excluded from PRE2 CI by the approved CR17 scope decision.
+# Files and assertions remain available through the unrestricted check target.
+# Test path                                           Owning scope    Basis
+t/315_cluster_5_15_online_rejoin.pl                     PRE3            CR17
+t/325_cluster_5_16_join_remaster.pl                     PRE3            CR17
+t/325_cluster_5_18_node_remove.pl                       PRE3            CR17
+t/326_cluster_5_16_join_no_double_grant.pl              PRE3            CR17
+t/326_cluster_5_18_survivor_apply.pl                    PRE3            CR17
+t/363_cluster_2_29a_marker_async_liveness.pl            PRE3            CR17
+t/320_adg_physical_standby_smoke.pl                     ADG-outside-PRE2 CR17
+t/335_adg_two_thread_rfs_apply.pl                       ADG-outside-PRE2 CR17

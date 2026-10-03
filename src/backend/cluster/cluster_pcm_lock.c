@@ -4481,6 +4481,35 @@ pcm_resource_x_intent_mark_dirty(void)
 	return pcm_resource_x_intent_mark_pending(true);
 }
 
+/* A retained owner may retry at most once per 500ms. This is a scheduling
+ * ceiling, not evidence that a frame was sent or that a response was lost.
+ * Scheduling eligibility is separate from retained protocol debt. Never
+ * renew last_attempt while merely scanning or losing a staging race. */
+static bool
+pcm_resource_x_intent_send_due(const ResourceXIntentSlot *slot, uint64 now_us)
+{
+	if (now_us == 0 || now_us == UINT64_MAX)
+		return false;
+	return slot->last_attempt_us == 0
+		   || (now_us >= slot->last_attempt_us
+			   && now_us - slot->last_attempt_us >= UINT64_C(500000));
+}
+
+/* LMS0 uses its existing event-loop timeout to revisit quiet obligations.
+ * This is a scheduling hint, not a grant or a claim of semantic completion. */
+long
+cluster_pcm_lock_resource_x_outbound_wait_timeout(long idle_timeout_ms)
+{
+	if (ClusterPcm == NULL || idle_timeout_ms <= 0)
+		return idle_timeout_ms;
+	if (pg_atomic_read_u64(&ClusterPcm->resource_x_intent_arm_generation)
+			!= pg_atomic_read_u64(&ClusterPcm->resource_x_intent_completed_generation)
+		|| pg_atomic_read_u64(&ClusterPcm->resource_x_intent_next_state_index) != 0
+		|| pg_atomic_read_u32(&ClusterPcm->resource_x_intent_next_owner_index) != 0)
+		return Min(idle_timeout_ms, 500L);
+	return idle_timeout_ms;
+}
+
 static bool
 pcm_resource_x_intent_payload_exact(ResourceXWireKind kind, uint16 payload_bytes)
 {
@@ -4550,11 +4579,13 @@ cluster_pcm_lock_resource_x_intent_not_admitted_exact(ResourceXIntentSlot *slot,
 		|| slot->logical_generation != expected->logical_generation
 		|| slot->authority_generation != expected->authority_generation
 		|| slot->first_armed_us != expected->first_armed_us
+		|| slot->last_attempt_us != expected->last_attempt_us || now_us < slot->last_attempt_us
 		|| slot->destination_node != expected->destination_node
 		|| slot->payload_bytes != expected->payload_bytes || slot->kind != expected->kind
 		|| memcmp(&slot->body, &expected->body, sizeof(slot->body)) != 0
 		|| slot->state != RESOURCE_X_INTENT_SLOT_ARMED)
 		return RESOURCE_X_INTENT_STALE;
+	/* A late refusal must not overwrite a newer staging/rearm episode. */
 	slot->last_attempt_us = now_us;
 	return RESOURCE_X_INTENT_NOT_ADMITTED;
 }
@@ -23443,9 +23474,12 @@ cluster_pcm_lock_resource_x_outbound_intent_stage_exact(const ResourceXIntentSlo
 	/* Physical queue ownership is not the idempotent semantic stage API.
 	 * An ingress worker and the scan worker can observe the same ARMED
 	 * handle: only one may acquire a ring copy under this entry lock. */
-	result = slot->state == RESOURCE_X_INTENT_SLOT_ARMED
-				 ? cluster_pcm_lock_resource_x_intent_stage_exact(slot, expected, now_us)
-				 : RESOURCE_X_INTENT_STALE;
+	if (slot->state != RESOURCE_X_INTENT_SLOT_ARMED)
+		result = RESOURCE_X_INTENT_STALE;
+	else if (!pcm_resource_x_intent_send_due(slot, now_us))
+		result = RESOURCE_X_INTENT_NOT_DUE;
+	else
+		result = cluster_pcm_lock_resource_x_intent_stage_exact(slot, expected, now_us);
 	LWLockRelease(&entry_ref.entry->entry_lock.lock);
 	pcm_entry_ref_release(&entry_ref);
 	return result;
@@ -23619,6 +23653,13 @@ cluster_pcm_lock_resource_x_ready_intent_probe_exact(const BufferTag *tag, uint3
 			|| !BufferTagsEqual(tag, &slot->body.assertion.resource)) {
 			result = RESOURCE_X_INTENT_PROBE_CORRUPT;
 			break;
+		}
+		if (!pcm_resource_x_intent_send_due(slot, pcm_resource_x_monotonic_us())) {
+			if (!pcm_resource_x_intent_mark_pending(false)) {
+				result = RESOURCE_X_INTENT_PROBE_CORRUPT;
+				break;
+			}
+			continue;
 		}
 		*slot_out = *slot;
 		*owner_cursor = index + 1;
@@ -23804,6 +23845,17 @@ cluster_pcm_lock_resource_x_outbound_work_probe_exact(uint32 probe_budget,
 				pcm_entry_ref_release(&entry_ref);
 				*examined_out = examined;
 				return RESOURCE_X_INTENT_PROBE_CORRUPT;
+			}
+			if (!pcm_resource_x_intent_send_due(slot, pcm_resource_x_monotonic_us())) {
+				/* COMPLETE may retire this scan, but not the retained owner.
+				 * Keep the next scan eligible without a busy self-wakeup. */
+				if (!pcm_resource_x_intent_mark_pending(false)) {
+					LWLockRelease(&entry->entry_lock.lock);
+					pcm_entry_ref_release(&entry_ref);
+					*examined_out = examined;
+					return RESOURCE_X_INTENT_PROBE_CORRUPT;
+				}
+				continue;
 			}
 			*slot_out = *slot;
 			memcpy(payload_out, payload, slot->payload_bytes);

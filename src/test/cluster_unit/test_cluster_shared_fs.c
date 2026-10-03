@@ -80,6 +80,7 @@ bool cluster_merged_recovery = false; /* read by D1 startup vet (D9 amend dep) *
 char *cluster_shared_data_dir = NULL;
 char *cluster_shared_storage_uuid = NULL;
 int cluster_node_id = 0;
+int io_direct_flags = 0;
 static const char *stub_block_device_storage_uuid;
 
 bool

@@ -333,7 +333,8 @@ ok(poll_query_until_timeout($pair->node1, 'postgres',
 	my $log = PostgreSQL::Test::Utils::slurp_file($pair->node1->logfile);
 	my @needles = (
 		'cluster_grd_recovery: P1 freeze',
-		'cluster_grd_recovery: P4 remaster moved',
+		# Production records the completed P4 in the same line as P1.
+		'P4 moved',
 		'cluster_grd_recovery: P5 redeclare gen',
 		'cluster_grd_recovery: local barrier done',
 		'cluster_grd_recovery: cluster gate passed; P6 swept',

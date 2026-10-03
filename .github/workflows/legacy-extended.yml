@@ -168,7 +168,8 @@ jobs:
           # clock.
           - { name: stage7-reconfig-liveness, ranges: "362-362", unit: false, regress: false }
           # t/363 spec-2.29a marker-async LMON liveness.
-          - { name: stage7-marker-async, ranges: "363-363", unit: false, regress: false }
+          # CR17: the sole 363 marker-async case is owned by PRE3, so there
+          # is no PRE2 job for that otherwise-empty shard.
           # t/364 + t/367 spec-7.3 LMS worker-pool family (single-node pool
           # smoke + 2-node topology / multi-tag routing / recycle / N=1
           # sentinel).  Every new t/ file lands in a shard the same commit
@@ -310,7 +311,9 @@ jobs:
           done)
           echo "shard ${{ matrix.shard.name }} files: $SEL"
           test -n "$SEL" || { echo "ERROR: empty shard selection"; exit 1; }
-          make -C src/test/cluster_tap check PROVE_TESTS="$SEL"
+          # CR17: retain deferred tests, but select the approved PRE2 scope.
+          # Exact paths and PRE3/ADG ownership live in pre2-deferred.list.
+          make -C src/test/cluster_tap check-pre2 PROVE_TESTS="$SEL"
 
       - name: Upload cluster_tap diffs on failure
         if: failure()
