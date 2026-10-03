@@ -23,10 +23,12 @@
  *
  *	  Non-properties (AD-004, like the local backend): this is a
  *	  passthrough over PG's fd.c VFD layer on a shared mount.  No SCSI-3
- *	  PR, no fence, no O_DIRECT, no 1GB segment splitting, no stripe, no
+ *	  PR, no fence, no 1GB segment splitting, no stripe, no
  *	  redundancy -- the shared filesystem / block layer (NFS, GFS2, OCFS2,
  *	  multi-attach + cluster FS, NVMe-oF) provides the cross-node
  *	  coherence.  pgrac does not self-build a volume manager.
+ *	  Relation forks honor debug_io_direct=data through PG's VFD layer;
+ *	  this bypasses data caching but does not replace the fsync barrier.
  *
  *	  Production deployment additionally needs cross-node agreement on the
  *	  relfilenode <-> table mapping (feature #11 catalog coordination),
@@ -79,7 +81,8 @@
 #ifdef USE_PGRAC_CLUSTER
 
 static const ClusterSharedFsCaps cluster_shared_fs_sharedfs_caps = {
-	.supports_odirect = false,
+	.supports_odirect = PG_O_DIRECT != 0 && BLCKSZ % PG_IO_ALIGN_SIZE == 0,
+	/* The backend aligns unaligned callers internally. */
 	.required_io_alignment = 0,
 	.supports_scsi3_pr = false,
 	.durability_class = CLUSTER_DURABILITY_BUFFERED,
@@ -102,6 +105,25 @@ struct ClusterSharedFsHandle {
 	File vfd;
 	bool opened;
 };
+
+/* PG keeps this startup-only flag with the VFD, including eviction/reopen.
+ * Unsupported direct I/O is an error, never a buffered fallback. */
+static int
+cluster_shared_fs_sharedfs_open_flags(void)
+{
+	int flags = O_RDWR | PG_BINARY;
+
+	if (io_direct_flags & IO_DIRECT_DATA) {
+		if (!cluster_shared_fs_sharedfs_caps.supports_odirect)
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cluster_fs direct I/O is not supported with this platform or block size"),
+				 errhint("Use a platform and block size supported by debug_io_direct=data.")));
+		flags |= PG_O_DIRECT;
+	}
+	return flags;
+}
 
 
 /*
@@ -210,7 +232,7 @@ cluster_shared_fs_sharedfs_open_existing(RelFileLocator rlocator, ForkNumber for
 
 	path = cluster_shared_fs_sharedfs_relpath(rlocator, forknum);
 
-	vfd = PathNameOpenFile(path, O_RDWR | PG_BINARY);
+	vfd = PathNameOpenFile(path, cluster_shared_fs_sharedfs_open_flags());
 	if (vfd < 0)
 		ereport(
 			ERROR,
@@ -262,10 +284,10 @@ cluster_shared_fs_sharedfs_create(RelFileLocator rlocator, ForkNumber forknum, b
 	 * collision, never evidence that this CREATE owns the file.  Preserve
 	 * auxiliary-fork creation and the legacy per-node-catalog profile.
 	 */
-	vfd = PathNameOpenFile(path, O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
+	vfd = PathNameOpenFile(path, cluster_shared_fs_sharedfs_open_flags() | O_CREAT | O_EXCL);
 	if (vfd < 0 && errno == EEXIST
 		&& (isRedo || !cluster_shared_catalog || forknum != MAIN_FORKNUM)) {
-		vfd = PathNameOpenFile(path, O_RDWR | PG_BINARY);
+		vfd = PathNameOpenFile(path, cluster_shared_fs_sharedfs_open_flags());
 		if (vfd >= 0 && !isRedo)
 			elog(DEBUG1, "cluster_shared_fs.shared_fs: adopting existing shared file \"%s\"", path);
 	}
@@ -307,11 +329,15 @@ cluster_shared_fs_sharedfs_read(ClusterSharedFsHandle *handle, BlockNumber block
 {
 	off_t offset;
 	int nbytes;
+	PGIOAlignedBlock bounce;
+	char *buffer = buf;
 
 	Assert(handle != NULL && handle->opened);
 
+	if ((io_direct_flags & IO_DIRECT_DATA) && (uintptr_t)buf % PG_IO_ALIGN_SIZE != 0)
+		buffer = bounce.data;
 	offset = (off_t)blocknum * BLCKSZ;
-	nbytes = FileRead(handle->vfd, buf, BLCKSZ, offset, WAIT_EVENT_DATA_FILE_READ);
+	nbytes = FileRead(handle->vfd, buffer, BLCKSZ, offset, WAIT_EVENT_DATA_FILE_READ);
 
 	if (nbytes < 0)
 		ereport(ERROR,
@@ -323,6 +349,9 @@ cluster_shared_fs_sharedfs_read(ClusterSharedFsHandle *handle, BlockNumber block
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("cluster_shared_fs.shared_fs: short read of block %u (got %d, expected %d)",
 						blocknum, nbytes, BLCKSZ)));
+	/* A partial/error read must not publish the bounce buffer to the caller. */
+	if (buffer != buf)
+		memcpy(buf, buffer, BLCKSZ);
 	return nbytes;
 }
 
@@ -333,11 +362,17 @@ cluster_shared_fs_sharedfs_write(ClusterSharedFsHandle *handle, BlockNumber bloc
 {
 	off_t offset;
 	int nbytes;
+	PGIOAlignedBlock bounce;
+	const char *buffer = buf;
 
 	Assert(handle != NULL && handle->opened);
 
+	if ((io_direct_flags & IO_DIRECT_DATA) && (uintptr_t)buf % PG_IO_ALIGN_SIZE != 0) {
+		memcpy(bounce.data, buf, BLCKSZ);
+		buffer = bounce.data;
+	}
 	offset = (off_t)blocknum * BLCKSZ;
-	nbytes = FileWrite(handle->vfd, buf, BLCKSZ, offset, WAIT_EVENT_DATA_FILE_WRITE);
+	nbytes = FileWrite(handle->vfd, buffer, BLCKSZ, offset, WAIT_EVENT_DATA_FILE_WRITE);
 
 	if (nbytes < 0)
 		ereport(ERROR,
@@ -358,10 +393,10 @@ static void
 cluster_shared_fs_sharedfs_extend(ClusterSharedFsHandle *handle, BlockNumber blocknum)
 {
 	/* Zero-fill the new tail block; mirrors mdextend(). */
-	char zerobuf[BLCKSZ];
+	PGIOAlignedBlock zerobuf;
 
-	memset(zerobuf, 0, sizeof(zerobuf));
-	cluster_shared_fs_sharedfs_write(handle, blocknum, zerobuf);
+	memset(zerobuf.data, 0, BLCKSZ);
+	cluster_shared_fs_sharedfs_write(handle, blocknum, zerobuf.data);
 }
 
 
@@ -731,6 +766,9 @@ cluster_shared_fs_get_storage_uuid(char *out, size_t outlen)
 static void
 cluster_shared_fs_sharedfs_init(void)
 {
+	/* Validate before any sentinel mutation; ordinary PG GUC checks do this
+	 * too, but backend activation must not silently bypass that contract. */
+	(void)cluster_shared_fs_sharedfs_open_flags();
 	if (!IsUnderPostmaster)
 		cluster_shared_fs_sentinel_attach();
 }
@@ -763,7 +801,7 @@ cluster_shared_fs_sharedfs_prefetch(ClusterSharedFsHandle *handle, BlockNumber b
 {
 	off_t offset;
 
-	if (handle == NULL || !handle->opened)
+	if (handle == NULL || !handle->opened || (io_direct_flags & IO_DIRECT_DATA))
 		return false;
 
 	offset = (off_t)blocknum * BLCKSZ;
@@ -777,7 +815,7 @@ cluster_shared_fs_sharedfs_writeback(ClusterSharedFsHandle *handle, BlockNumber 
 	off_t offset;
 	off_t nbytes;
 
-	if (handle == NULL || !handle->opened || nblocks == 0)
+	if (handle == NULL || !handle->opened || nblocks == 0 || (io_direct_flags & IO_DIRECT_DATA))
 		return;
 
 	offset = (off_t)blocknum * BLCKSZ;

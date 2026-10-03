@@ -77,6 +77,7 @@
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_tier1.h" /* CLUSTER_IC_TIER1_DATA_CHANNELS (spec-7.3 D3) */
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_startup_phase.h"
@@ -1263,6 +1264,8 @@ LmsMain(void)
 			ereport(FATAL, (errmsg_internal("LMS failed normal-stop responsibility check")));
 		/* DATA tick owns separate management/dispatch brackets. Neither
 		 * its WaitEventSetWait nor this fallback may retain our active bit. */
+		lms_wait_timeout_ms
+			= cluster_pcm_lock_resource_x_outbound_wait_timeout(lms_wait_timeout_ms);
 		if (cluster_lms_data_plane_enabled())
 			cluster_lms_data_plane_tick(lms_wait_timeout_ms);
 		else {

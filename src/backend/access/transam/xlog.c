@@ -190,6 +190,7 @@
 #include "cluster/cluster_wal_state.h" /* PGRAC: checkpoint redo / fpw sticky (spec-4.5) */
 #include "cluster/cluster_wal_retention.h" /* PGRAC: STOP-05 guarded WAL reuse */
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_initdb_base.h"
 #include "cluster/cluster_wal_writer.h" /* PGRAC: durable group-flush promise */
 #include "cluster/cluster_backup.h" /* PGRAC: spec-6.5 durable backup WAL pin */
 #include "cluster/cluster_tt_durable.h" /* PGRAC: spec-4.8 D1 crash-left ACTIVE resolution */
@@ -1014,7 +1015,7 @@ XLogInsertRecord(XLogRecData *rdata,
 		 */
 		rechdr->xl_scn = (cluster_wal_thread_id() != XLP_THREAD_ID_LEGACY)
 			? (uint64) cluster_scn_current()
-			: 0;
+			: (uint64) cluster_scn_initdb_base_current();
 #endif
 
 		/*
@@ -3888,6 +3889,13 @@ RemoveOldXlogFiles(XLogSegNo segno, XLogRecPtr lastredoptr, XLogRecPtr endptr,
 	char		lastoff[MAXFNAMELEN];
 	XLogSegNo	endlogSegNo;
 	XLogSegNo	recycleSegNo;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* The bounded original creation has not published its first ROOT or
+	 * retention cut. Keep its own native initialization and typed base WAL. */
+	if (cluster_wal_thread_initdb_stamp() != 0)
+		return;
+#endif
 
 	/* Initialize info about where to try to recycle to */
 	XLByteToSeg(endptr, endlogSegNo, wal_segment_size);
@@ -7965,6 +7973,9 @@ ShutdownXLOG(int code, Datum arg)
 		if (XLogArchivingActive())
 			RequestXLogSwitch(false);
 
+#ifdef USE_PGRAC_CLUSTER
+		cluster_initdb_base_create(code);
+#endif
 		CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE);
 	}
 }

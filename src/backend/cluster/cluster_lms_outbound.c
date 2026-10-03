@@ -539,7 +539,7 @@ lms_outbound_resource_x_intent_identity_equal(const ResourceXIntentSlot *left,
 		   && memcmp(&left->body, &right->body, sizeof(left->body)) == 0;
 }
 
-bool
+ClusterLmsEnqueueResult
 cluster_lms_outbound_enqueue_resource_x_intent(int worker_id, const ResourceXIntentSlot *intent,
 											   uint32 connection_generation, uint64 deadline_us)
 {
@@ -551,12 +551,12 @@ cluster_lms_outbound_enqueue_resource_x_intent(int worker_id, const ResourceXInt
 	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS || connection_generation == 0
 		|| deadline_us == 0 || !lms_outbound_resource_x_intent_valid(intent)
 		|| cluster_lms_outbound_rings == NULL || OB_LOCK(worker_id) == NULL)
-		return false;
+		return CLUSTER_LMS_ENQUEUE_INVALID;
 	ring = OB_RING(worker_id);
 	lock = OB_LOCK(worker_id);
 	now_us = lms_outbound_monotonic_us();
 	if (now_us == 0)
-		return false;
+		return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
 
 	/* Publish the ring slot only after the exact semantic owner changes to
 	 * STAGED.  Holding the ring lock across that owner mutation prevents a
@@ -565,7 +565,7 @@ cluster_lms_outbound_enqueue_resource_x_intent(int worker_id, const ResourceXInt
 	LWLockAcquire(lock, LW_EXCLUSIVE);
 	if (ring->count >= PGRAC_LMS_OUTBOUND_CAPACITY) {
 		LWLockRelease(lock);
-		return false;
+		return CLUSTER_LMS_ENQUEUE_FULL;
 	}
 	slot = &ring->ring[ring->head];
 	memset(slot, 0, sizeof(*slot));
@@ -579,7 +579,7 @@ cluster_lms_outbound_enqueue_resource_x_intent(int worker_id, const ResourceXInt
 	memcpy(slot->payload, intent, sizeof(*intent));
 	if (!lms_outbound_resource_x_transport_mutation_mark()) {
 		LWLockRelease(lock);
-		return false;
+		return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
 	}
 	{
 		ResourceXIntentResult stage_result;
@@ -588,14 +588,15 @@ cluster_lms_outbound_enqueue_resource_x_intent(int worker_id, const ResourceXInt
 		if (stage_result != RESOURCE_X_INTENT_STAGED) {
 			memset(slot, 0, sizeof(*slot));
 			LWLockRelease(lock);
-			return false;
+			return stage_result == RESOURCE_X_INTENT_NOT_DUE ? CLUSTER_LMS_ENQUEUE_NOT_DUE
+															 : CLUSTER_LMS_ENQUEUE_INVALID;
 		}
 	}
 	ring->head = (ring->head + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
 	ring->count++;
 	LWLockRelease(lock);
 	cluster_lms_wakeup(worker_id);
-	return true;
+	return CLUSTER_LMS_ENQUEUE_ADMITTED;
 }
 
 int
@@ -616,7 +617,7 @@ cluster_lms_outbound_resource_x_intent_pump(void)
 		uint64 now_us;
 		uint64 timeout_us;
 		int worker_id;
-		bool enqueued;
+		ClusterLmsEnqueueResult enqueue_result;
 		ResourceXAcquisitionRef delivery;
 
 		probe_result = cluster_pcm_lock_resource_x_outbound_work_probe_exact(
@@ -667,11 +668,11 @@ cluster_lms_outbound_resource_x_intent_pump(void)
 		 * new Resource-X operation timeout or runtime policy. */
 		timeout_us = (uint64)Max(cluster_gcs_reply_timeout_ms, 1) * UINT64_C(1000);
 		deadline_us = now_us > UINT64_MAX - timeout_us ? UINT64_MAX : now_us + timeout_us;
-		enqueued = cluster_lms_outbound_enqueue_resource_x_intent(
+		enqueue_result = cluster_lms_outbound_enqueue_resource_x_intent(
 			worker_id, &intent, connection_generation, deadline_us);
-		if (enqueued)
+		if (enqueue_result == CLUSTER_LMS_ENQUEUE_ADMITTED)
 			staged++;
-		else
+		else if (enqueue_result != CLUSTER_LMS_ENQUEUE_NOT_DUE)
 			(void)cluster_pcm_lock_resource_x_outbound_intent_not_admitted_exact(&intent, now_us);
 	}
 	/* Resume an exhausted scan even when its last probe found work.  A

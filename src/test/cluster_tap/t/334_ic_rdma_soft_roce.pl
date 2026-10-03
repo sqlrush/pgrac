@@ -30,9 +30,9 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep);
 
-plan skip_all => 'set PGRAC_RUN_RDMA_SOFT_ROCE=1 to run the soft-RoCE RDMA harness'
+BAIL_OUT("BLOCKED: " . 'set PGRAC_RUN_RDMA_SOFT_ROCE=1 to run the soft-RoCE RDMA harness')
   unless $ENV{PGRAC_RUN_RDMA_SOFT_ROCE};
-plan skip_all => 'soft-RoCE RDMA harness requires Linux'
+BAIL_OUT("BLOCKED: " . 'soft-RoCE RDMA harness requires Linux')
   unless $^O eq 'linux';
 
 sub command_exists
@@ -41,20 +41,20 @@ sub command_exists
 	return system('sh', '-c', "command -v $cmd >/dev/null 2>&1") == 0;
 }
 
-plan skip_all => 'rdma command not available'
+BAIL_OUT("BLOCKED: " . 'rdma command not available')
   unless command_exists('rdma');
-plan skip_all => 'ibv_devices command not available'
+BAIL_OUT("BLOCKED: " . 'ibv_devices command not available')
   unless command_exists('ibv_devices');
 
 my $rdma_links = `rdma link show 2>&1`;
-plan skip_all => 'no active RDMA link found; configure rdma_rxe before running'
+BAIL_OUT("BLOCKED: " . 'no active RDMA link found; configure rdma_rxe before running')
   unless $rdma_links =~ /\blink\b/i || $rdma_links =~ /\brxe/i;
 
 my $probe = PostgreSQL::Test::Cluster->new('rdma_probe');
 $probe->init;
 my $pg_config_bin = $probe->config_data('--bindir') . '/pg_config';
 my $configure_args = `"$pg_config_bin" --configure 2>&1`;
-plan skip_all => 'postgres binary was not configured with --with-rdma'
+BAIL_OUT("BLOCKED: " . 'postgres binary was not configured with --with-rdma')
   unless $configure_args =~ /--with-rdma\b/;
 
 my $rdma_host = $ENV{PGRAC_RDMA_TEST_ADDR};
@@ -64,7 +64,7 @@ if (!defined $rdma_host || $rdma_host eq '')
 	chomp $rdma_host;
 	($rdma_host) = split(/\s+/, $rdma_host);
 }
-plan skip_all => 'set PGRAC_RDMA_TEST_ADDR to the IP address bound to the rxe link'
+BAIL_OUT("BLOCKED: " . 'set PGRAC_RDMA_TEST_ADDR to the IP address bound to the rxe link')
   unless defined $rdma_host && $rdma_host ne '';
 
 my $pair = PostgreSQL::Test::ClusterPair->new_pair(

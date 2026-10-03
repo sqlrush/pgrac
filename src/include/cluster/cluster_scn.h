@@ -323,6 +323,11 @@ extern uint32 cluster_scn_durable_pending_discharge_upto(XLogRecPtr flushed_lsn)
 extern uint64 cluster_scn_durable_pending_count(void);
 extern bool cluster_scn_durable_frontier_frozen(void);
 extern uint64 cluster_scn_durable_frontier_overflow_count(void);
+/* Original standalone creator, after its SQL transactions have ended. Bind
+ * the existing zero SCN allocator to the validated founder, never a GUC or
+ * live instance. Refuses any already-used allocator. */
+extern bool cluster_scn_initdb_base_begin(void);
+extern SCN cluster_scn_initdb_base_current(void);
 extern uint64 cluster_scn_durable_frontier_regression_count(void);
 
 /*

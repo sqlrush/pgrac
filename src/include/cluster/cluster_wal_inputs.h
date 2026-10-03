@@ -87,6 +87,15 @@ extern bool cluster_wal_inputs_recovered_prefix_v1(ClusterWalInputsV1 *inputs,
 												   const ClusterWalSourceRef *source,
 												   XLogRecPtr *out_end);
 
+/* Provisional executor retirement for an entire selected origin. The current
+ * generation must be RECOVERY_COMPLETE; every retained checkpoint predecessor
+ * must form a continuous installed terminal chain. A lone CLOSED generation
+ * is never an executor-exit proof. The caller still needs the complete decoded
+ * input, DATA ancestry, membership/boot and final master cut. No I/O, mutation
+ * or WAL reclamation; revalidate this same held scope before consumption. */
+extern bool cluster_wal_inputs_recovered_owner_v1(ClusterWalInputsV1 *inputs, int32 node,
+												  ClusterWalSourceRef *out);
+
 /* Physically visit one selected retained source outside CF, under this exact
  * ROOT/WALR scope. OPEN returns WAIT without invalidating the scope: its original live writer must first confirm
  * a complete end after the directory cut. Terminal input is fully reclassified

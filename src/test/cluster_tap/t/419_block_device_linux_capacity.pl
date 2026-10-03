@@ -20,13 +20,13 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use PgracClusterNode;
 
-plan skip_all => 'Linux-only real block-device test'
+BAIL_OUT("BLOCKED: " . 'Linux-only real block-device test')
   unless $^O eq 'linux';
 
 my $device = $ENV{PGRAC_TEST_BLOCK_DEVICE};
-plan skip_all => 'set PGRAC_TEST_BLOCK_DEVICE to a disposable block device'
+BAIL_OUT("BLOCKED: " . 'set PGRAC_TEST_BLOCK_DEVICE to a disposable block device')
   unless defined($device) && length($device) > 0;
-plan skip_all => "$device is not a block device"
+BAIL_OUT("BLOCKED: " . "$device is not a block device")
   unless -b $device;
 
 my ($capacity_out, $capacity_err) = ('', '');

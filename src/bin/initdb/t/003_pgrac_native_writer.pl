@@ -197,16 +197,17 @@ sub refused_context
 my @data_stat = stat($data0);
 my @wal_stat = stat($wal0);
 my @context = (0x50474957, 7, 2, $id, @data_stat[0,1], @wal_stat[0,1]);
-my $context = pack('LSSQQQQQ', @context);
-is(length($context), 48, 'native carrier layout is exact');
-refused_context('short', substr($context, 0, 47));
+sub pack_context { return pack('LSSQQQQQ', @_) . ("\0" x 48); }
+my $context = pack_context(@context);
+is(length($context), 96, 'native carrier layout is exact');
+refused_context('short', substr($context, 0, 95));
 refused_context('trailing', $context . 'x');
 $context[2] = 1;
-refused_context('wrong-phase', pack('LSSQQQQQ', @context));
-refused_context('existing-bootstrap', pack('LSSQQQQQ', @context), 1);
+refused_context('wrong-phase', pack_context(@context));
+refused_context('existing-bootstrap', pack_context(@context), 1);
 $context[2] = 2;
 $context[5]++;
-refused_context('wrong-directory', pack('LSSQQQQQ', @context));
+refused_context('wrong-directory', pack_context(@context));
 refused_context('completed-database', $context);
 is(wal_digest(), $wal_before, 'all refused contexts preserve existing WAL bytes');
 

@@ -1449,7 +1449,7 @@ dump_grd_recovery(ReturnSetInfo *rsinfo)
 		static const char *const keys[]
 			= { "pi_writeback_data_proof_rejected", "pi_writeback_local_ack_rejected",
 				"pi_writeback_remote_ack_rejected", "pi_writeback_master_cut_rejected",
-				"pi_writeback_peer_physical_rejected" };
+				"pi_writeback_peer_physical_rejected", "pi_writeback_recovery_proof_rejected" };
 		for (unsigned i = 0; i < lengthof(keys); i++)
 			emit_row(rsinfo, "grd_recovery", keys[i], psprintf(UINT64_FORMAT, wb.attempts[i]));
 		emit_row(rsinfo, "grd_recovery", "pi_writeback_rejection_logs",

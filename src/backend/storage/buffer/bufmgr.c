@@ -90,6 +90,7 @@
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/cluster_membership.h"
 #include "cluster/storage/cluster_smgr.h"
 
 /*
@@ -10619,6 +10620,9 @@ struct ClusterPiPhysicalAckV1 {
 	pid_t pid;
 	int32 node;
 	bool remote;
+	ClusterWalInputsV1 *recovered_inputs;
+	ClusterWalSourceRef recovered_source;
+	uint64 membership_generation;
 };
 
 /* Neither a tag nor a pin grants write authority. Check every live fence
@@ -10732,6 +10736,7 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 	volatile bool io_started = false;
 	volatile bool data_locked = false;
 	volatile bool complete = false;
+	bool space_target, identity_target;
 	PGAlignedBlock expected, disk;
 	uint64 space_token;
 	ClusterPageDataReceiptV1 *receipt;
@@ -10742,7 +10747,8 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 		|| (!sample_identity && !rf_page_version_present_v1(&target->version))
 		|| (sample_identity && (!sample_current || cut == NULL))
 		|| (target->identity.forknum != MAIN_FORKNUM
-			&& target->identity.forknum != VISIBILITYMAP_FORKNUM)
+			&& target->identity.forknum != VISIBILITYMAP_FORKNUM
+			&& !(target->identity.forknum == SPACE_FORKNUM && target->identity.blockno < 2))
 		|| cluster_smgr_which_for(target->identity.locator, InvalidBackendId) != 1
 		|| !cluster_wal_thread_current_v2_ref(&source)
 		|| source.claim.identity.origin_thread_id == 0
@@ -10752,6 +10758,8 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 		|| source.claim.database_incarnation != target->database_incarnation
 		|| memcmp(source.claim.identity.storage_uuid, target->identity.storage_uuid, 16) != 0)
 		return false;
+	space_target = target->identity.forknum == SPACE_FORKNUM;
+	identity_target = space_target && target->identity.blockno == 0;
 	written_target = *target;
 	memset(&key, 0, sizeof(key));
 	key.system_identifier = target->identity.system_identifier;
@@ -10776,16 +10784,20 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 			uint16 stored_checksum;
 			int page_origin;
 
-			space = cluster_page_data_try_hold(space_tag, false, &space_owner);
+			space = cluster_page_data_try_hold(space_tag, identity_target, &space_owner);
 			if (space == NULL
 				|| !cluster_space_identity_page_decode(BufHdrGetBlock(space), BLCKSZ, SPACE_FORKNUM,
 													   0, &key, &space_identity, &space_token)
-				|| space_identity.state != CLUSTER_SPACE_IDENTITY_LIVE
+				|| (!space_target && space_identity.state != CLUSTER_SPACE_IDENTITY_LIVE)
 				|| (!sample_identity
 					&& memcmp(space_identity.incarnation, target->version.segment_incarnation, 16)
 						   != 0))
 				break;
-			data = cluster_page_data_try_hold(data_tag, true, &data_owner);
+			if (identity_target) {
+				data = space;
+				data_owner = space_owner;
+			} else
+				data = cluster_page_data_try_hold(data_tag, true, &data_owner);
 			data_locked = data != NULL;
 			if (data == NULL
 				|| (cut != NULL
@@ -10801,9 +10813,8 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 			header = (PageHeader)expected.data;
 			if (PageIsNew(expected.data) || PageGetPageSize(expected.data) != BLCKSZ
 				|| PageGetPageLayoutVersion(expected.data) != PG_PAGE_LAYOUT_VERSION
-				|| (header->pd_flags
-					& (~PD_VALID_FLAG_BITS | PD_SPACE_METADATA | PD_UNDO_SEG_HEADER))
-					   != 0
+				|| (header->pd_flags & (~PD_VALID_FLAG_BITS | PD_UNDO_SEG_HEADER)) != 0
+				|| (!space_target && (header->pd_flags & PD_SPACE_METADATA) != 0)
 				|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
 				|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
 				|| header->pd_block_scn != written_target.version.mutation_token
@@ -10827,9 +10838,13 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 				break;
 			/* The native write consumed a stable snapshot. Keep the raw pin
 			 * and SPACE identity owner, but let foreground current writers run
-			 * during fork fsync/readback. Reacquire without waiting below. */
-			LWLockRelease(BufferDescriptorGetContentLock(data));
-			data_locked = false;
+			 * during fork fsync/readback. Reacquire without waiting below.
+			 * SPACE0 itself owns the identity lock and must retain that single
+			 * hold; neither reacquire it recursively nor release it twice. */
+			if (!identity_target) {
+				LWLockRelease(BufferDescriptorGetContentLock(data));
+				data_locked = false;
+			}
 			smgrimmedsync(rel, target->identity.forknum);
 			smgrread(rel, target->identity.forknum, target->identity.blockno, disk.data);
 			/* Never let ignore_checksum_failure qualify physical DATA. Check
@@ -10842,7 +10857,8 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 				break;
 			header->pd_checksum = ((PageHeader)disk.data)->pd_checksum = 0;
 			if (memcmp(expected.data, disk.data, BLCKSZ) != 0
-				|| !LWLockConditionalAcquire(BufferDescriptorGetContentLock(data), LW_SHARED))
+				|| (!data_locked
+					&& !LWLockConditionalAcquire(BufferDescriptorGetContentLock(data), LW_SHARED)))
 				break;
 			data_locked = true;
 			if (!cluster_page_data_holder_ready(data, &data_tag, true, &live)
@@ -10864,7 +10880,7 @@ cluster_bufmgr_write_page_data_internal(const ClusterPageDataTargetV1 *target,
 		error_context_stack = saved_context;
 		if (io_started)
 			AbortBufferIO(BufferDescriptorGetBuffer(data));
-		if (data != NULL) {
+		if (data != NULL && data != space) {
 			/* elog(ERROR) reset holdoffs, but these exact locks remain ours. */
 			if (data_locked) {
 				if (InterruptHoldoffCount == 0)
@@ -11644,6 +11660,90 @@ cluster_bufmgr_ack_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 	return true;
 }
 
+static bool
+cluster_pi_recovered_ack_current(const ClusterPiPhysicalAckV1 *ack)
+{
+	ClusterWalSourceRef source;
+	return ack->node >= 0 && ack->node < RESOURCE_X_PROTOCOL_NODE_LIMIT
+		&& ack->node != cluster_node_id && !ack->remote
+		&& cluster_membership_cut_generation_current(ack->membership_generation)
+		&& cluster_membership_get_state(ack->node) == CLUSTER_MEMBER_DEAD
+		&& cluster_membership_get_last_admitted_incarnation(ack->node)
+			   == ack->recovered_source.claim.identity.origin_owner_incarnation
+		&& cluster_wal_inputs_revalidate_v1(ack->recovered_inputs)
+			   == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& cluster_wal_inputs_recovered_owner_v1(ack->recovered_inputs, ack->node, &source)
+		&& memcmp(&source, &ack->recovered_source, sizeof(source)) == 0
+		&& cluster_membership_cut_generation_current(ack->membership_generation);
+}
+
+bool
+cluster_bufmgr_ack_recovered_pi_at_data_v1(
+	const ClusterPageDataReceiptV1 *receipt, const RfPageOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *sources, uint32 source_count, ClusterWalInputsV1 *inputs,
+	int32 node, ClusterPiPhysicalAckV1 **out)
+{
+	ClusterPiPhysicalAckV1 candidate = { 0 }, *ack;
+	ClusterWalWriterToken after;
+	ClusterPcmPiWriteCutV1 x_cut;
+	ClusterPcmPiStorageCutV1 storage_cut;
+	uint32 expected;
+	int32 master;
+	bool matched[CLUSTER_WAL_INPUTS_MAX] = { false };
+
+	if (out == NULL || *out != NULL || inputs == NULL || sources == NULL
+		|| source_count == 0 || source_count > CLUSTER_WAL_INPUTS_MAX
+		|| source_count != cluster_wal_inputs_count_v1(inputs)
+		|| node < 0 || node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || node == cluster_node_id
+		|| !cluster_pi_ack_local_writer(&candidate.collector))
+		return false;
+	candidate.membership_generation = cluster_membership_cut_generation();
+	candidate.node = node;
+	candidate.recovered_inputs = inputs;
+	if (!cluster_wal_inputs_recovered_owner_v1(inputs, node, &candidate.recovered_source)
+		|| !cluster_pi_recovered_ack_current(&candidate))
+		return false;
+	/* A sealed subset is not the retained origin census. Match every selected
+	 * source exactly once, including explicit empty and older generations. */
+	for (uint32 i = 0; i < source_count; i++) {
+		const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, i);
+		bool found = false;
+		if (item == NULL)
+			return false;
+		for (uint32 j = 0; j < source_count; j++) {
+			if (matched[j] || !cluster_page_data_source_same(&item->source, &sources[j]))
+				continue;
+			matched[j] = found = true;
+			break;
+		}
+		if (!found)
+			return false;
+	}
+	if (cluster_page_data_pi_proof_v1(receipt, plan, sources, source_count, &x_cut)) {
+		expected = x_cut.pi_holders_bitmap;
+		master = x_cut.master_node;
+	} else if (cluster_page_data_pi_storage_proof_v1(receipt, plan, sources, source_count,
+													 &storage_cut)) {
+		expected = storage_cut.pi_holders_bitmap;
+		master = storage_cut.master_node;
+	} else
+		return false;
+	if (master != cluster_node_id || (expected & ((uint32)1u << node)) == 0
+		|| !cluster_page_data_covers_missing_pi(receipt, plan, sources, source_count)
+		|| !cluster_pi_recovered_ack_current(&candidate)
+		|| !cluster_pi_ack_local_writer(&after)
+		|| memcmp(&candidate.collector, &after, sizeof(after)) != 0)
+		return false;
+	candidate.magic = UINT64_C(0x5047504941434b31);
+	candidate.data = *receipt;
+	candidate.owner = CurrentResourceOwner;
+	candidate.pid = getpid();
+	ack = palloc(sizeof(*ack));
+	*ack = candidate;
+	*out = ack;
+	return true;
+}
+
 bool
 cluster_page_data_pi_ack_read_v1(const ClusterPiPhysicalAckV1 *ack,
 								 const ClusterPageDataReceiptV1 *receipt, int32 *out_node)
@@ -11656,7 +11756,11 @@ cluster_page_data_pi_ack_read_v1(const ClusterPiPhysicalAckV1 *ack,
 		|| ack->owner != CurrentResourceOwner || memcmp(&ack->data, receipt, sizeof(*receipt)) != 0
 		|| !cluster_pi_ack_local_writer(&current))
 		return false;
-	if (ack->remote) {
+	if (ack->recovered_inputs != NULL) {
+		if (memcmp(&ack->collector, &current, sizeof(current)) != 0
+			|| !cluster_pi_recovered_ack_current(ack))
+			return false;
+	} else if (ack->remote) {
 		ClusterPiDataFactV1 fact;
 		if (ack->node == cluster_node_id || memcmp(&ack->collector, &current, sizeof(current)) != 0
 			|| !cluster_page_data_pi_fact_v1(receipt, &fact)
@@ -11674,7 +11778,7 @@ cluster_page_data_pi_ack_export_v1(const ClusterPiPhysicalAckV1 *ack,
 								   ClusterWalWriterToken *out)
 {
 	int32 node;
-	if (out == NULL || ack == NULL || ack->remote
+	if (out == NULL || ack == NULL || ack->remote || ack->recovered_inputs != NULL
 		|| !cluster_page_data_pi_ack_read_v1(ack, receipt, &node) || node != cluster_node_id)
 		return false;
 	*out = ack->writer;

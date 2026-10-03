@@ -9277,6 +9277,7 @@ gcs_block_resource_x_stage_ready_tag(const BufferTag *tag)
 		return;
 	for (call = 0; call < 16; call++) {
 		ResourceXIntentSlot intent;
+		ClusterLmsEnqueueResult enqueue_result;
 		uint32 connection_generation = 0;
 		uint64 now_us;
 		uint64 timeout_us;
@@ -9297,8 +9298,10 @@ gcs_block_resource_x_stage_ready_tag(const BufferTag *tag)
 		worker_id = cluster_lms_shard_for_tag(tag, cluster_lms_workers);
 		timeout_us = (uint64)Max(cluster_gcs_reply_timeout_ms, 1) * UINT64_C(1000);
 		deadline_us = now_us > UINT64_MAX - timeout_us ? UINT64_MAX : now_us + timeout_us;
-		if (!cluster_lms_outbound_enqueue_resource_x_intent(worker_id, &intent,
-															connection_generation, deadline_us))
+		enqueue_result = cluster_lms_outbound_enqueue_resource_x_intent(
+			worker_id, &intent, connection_generation, deadline_us);
+		if (enqueue_result != CLUSTER_LMS_ENQUEUE_ADMITTED
+			&& enqueue_result != CLUSTER_LMS_ENQUEUE_NOT_DUE)
 			(void)cluster_pcm_lock_resource_x_outbound_intent_not_admitted_exact(&intent, now_us);
 	}
 }

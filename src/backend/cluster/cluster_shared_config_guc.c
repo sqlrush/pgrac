@@ -63,6 +63,7 @@ static const struct {
 	{ "cluster.shared_config", POLICY_COMMON | POLICY_COLD },
 	{ "cluster.undo_gcs_coherence", POLICY_COMMON | POLICY_COLD },
 	{ "cluster.enabled", POLICY_COMMON | POLICY_COLD },
+	{ "debug_io_direct", POLICY_COMMON | POLICY_COLD | POLICY_STRING },
 	{ "port", POLICY_INSTANCE },
 	{ "listen_addresses", POLICY_INSTANCE | POLICY_STRING },
 	{ "unix_socket_directories", POLICY_INSTANCE | POLICY_STRING },

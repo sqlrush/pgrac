@@ -268,6 +268,8 @@ extern void cluster_wal_thread_init(void);
 
 /* Original initdb children only; no GUC or online writer identity is installed. */
 extern void cluster_wal_thread_initdb_accept(bool bootstrap);
+struct PgracInitdbWalContext;
+extern const struct PgracInitdbWalContext *cluster_wal_thread_initdb_context(void);
 extern uint64 cluster_wal_thread_initdb_system_identifier(void);
 extern uint16 cluster_wal_thread_initdb_stamp(void);
 

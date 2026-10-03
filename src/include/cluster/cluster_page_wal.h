@@ -78,7 +78,8 @@ cluster_page_wal_binding_shape_v1(const ClusterPageWalBindingV1 *b)
 		   && memcmp(b->source.claim.claim_sha256, zero, 32) != 0 && b->source.timeline != 0
 		   && b->identity.system_identifier == id->system_identifier
 		   && memcmp(b->identity.storage_uuid, id->storage_uuid, 16) == 0
-		   && (b->identity.forknum == MAIN_FORKNUM || b->identity.forknum == VISIBILITYMAP_FORKNUM)
+		   && (b->identity.forknum == MAIN_FORKNUM || b->identity.forknum == VISIBILITYMAP_FORKNUM
+			   || (b->identity.forknum == SPACE_FORKNUM && b->identity.blockno < 2))
 		   && b->identity.reserved_zero == 0 && (b->flags & ~CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
 		   && memcmp(b->version.segment_incarnation, zero, 16) != 0
 		   && b->version.mutation_token != 0 && b->record_start != InvalidXLogRecPtr
@@ -131,6 +132,14 @@ cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1
 								   uint64 result_token, XLogRecPtr start, XLogRecPtr end,
 								   uint32 crc, uint8 rmid, uint8 info);
 
+/* Original native SPACE publisher only, after stamping both result and LSN.
+ * Observes the actual just-inserted record, never a guessed foreign LSN.
+ * The caller retains content-X; unavailable attribution requires forget,
+ * while wrong ownership/bytes/record identity remains an invariant failure. */
+extern ClusterPageWalCaptureResultV1
+cluster_page_wal_capture_space_v1(Buffer buffer, const ClusterSpaceIdentityKey *key,
+								  XLogRecPtr end);
+
 /* Clear attribution under the original pin/content-X, without allocation or
  * I/O. False means the caller no longer has the required buffer invariant. */
 extern bool cluster_page_wal_forget_v1(Buffer buffer);
@@ -142,7 +151,9 @@ extern void cluster_page_wal_reset_reuse_locked(struct BufferDesc *buf);
 
 /* Caller already pins and content-locks this descriptor and supplies the
  * lifecycle-qualified SPACE identity. Does not acquire any page or grant
- * write/flush authority. Failure leaves output untouched. */
+ * write/flush authority. SPACE0/1 also decode and match the complete typed
+ * identity, including its state/sequence/operation. Only SPACE may use a
+ * tombstoned identity. Failure leaves output untouched. */
 extern bool cluster_page_wal_read_v1(Buffer buffer, const ClusterSpaceIdentity *identity,
 									 ClusterPageWalBindingV1 *out);
 

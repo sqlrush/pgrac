@@ -17,6 +17,13 @@ make
 make -C src/test/cluster_tap check
 ```
 
+For the PRE2 CI scope, use `make -C src/test/cluster_tap check-pre2`.
+`pre2-list` prints the selected files; an optional `PROVE_TESTS` list is
+filtered by exact filename. The eight deferred cases and their PRE3 or ADG
+ownership are recorded in `pre2-deferred.list` (CR17). The unrestricted
+`check` target still includes them. Deferred cases are not reported as passed
+or skipped, and unrelated cases sharing the same numeric prefix remain selected.
+
 Or via the pgrac convenience target:
 
 ```bash

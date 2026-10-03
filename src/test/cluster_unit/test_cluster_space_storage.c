@@ -28,6 +28,7 @@
 #include "cluster/cluster_hw.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_page_producer.h"
+#include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_space_reservation.h"
@@ -69,6 +70,8 @@ static ClusterWalSourceRef ref;
 static bool have_ref, shared, exists, recovering;
 static uint8 pinned, locked;
 static unsigned io_calls, create_calls, wal_calls, dirty_calls, release_calls;
+static unsigned capture_calls, forget_calls;
+static ClusterPageWalCaptureResultV1 capture_result;
 static BlockNumber blocks;
 static uint8 wal_bytes[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 static uint8 commit_bytes[4096];
@@ -254,6 +257,28 @@ cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
 	restart_ref_reads++;
 	*out = ref;
 	return have_ref;
+}
+
+ClusterPageWalCaptureResultV1
+cluster_page_wal_capture_space_v1(Buffer buffer, const ClusterSpaceIdentityKey *key,
+								 XLogRecPtr end)
+{
+	UT_ASSERT(buffer >= 1 && buffer <= 2);
+	UT_ASSERT(CritSectionCount > 0 && !recovering);
+	UT_ASSERT((locked & (1 << (buffer - 1))) != 0);
+	UT_ASSERT(RelFileLocatorEquals(key->locator, locator));
+	UT_ASSERT_EQ(PageGetLSN(pages[buffer - 1].data), end);
+	UT_ASSERT(((PageHeader)pages[buffer - 1].data)->pd_block_scn != 0);
+	capture_calls++;
+	return capture_result;
+}
+
+bool
+cluster_page_wal_forget_v1(Buffer buffer)
+{
+	UT_ASSERT(buffer >= 1 && buffer <= 2 && (locked & (1 << (buffer - 1))) != 0);
+	forget_calls++;
+	return true;
 }
 
 bool
@@ -968,6 +993,8 @@ reset(void)
 	writer_allowed = true;
 	CritSectionCount = blocks = io_calls = create_calls = wal_calls = dirty_calls = release_calls
 		= 0;
+	capture_calls = forget_calls = 0;
+	capture_result = CLUSTER_PAGE_WAL_CAPTURED;
 	BufferBlocks = page.data;
 	storage.smgr_rlocator.locator = locator;
 }
@@ -979,6 +1006,7 @@ UT_TEST(test_real_create_binds_selected_namespace_and_wal)
 	reset();
 	UT_ASSERT(cluster_space_relation_create(locator));
 	UT_ASSERT_EQ(create_calls, 1);
+	UT_ASSERT_EQ(capture_calls, 2);
 	UT_ASSERT_EQ(wal_calls, 1);
 	UT_ASSERT_EQ(dirty_calls, 2);
 	UT_ASSERT_EQ(release_calls, 2);
@@ -994,6 +1022,16 @@ UT_TEST(test_real_create_binds_selected_namespace_and_wal)
 	UT_ASSERT_EQ(change.identity.result.incarnation[15], 0x45);
 	UT_ASSERT(cluster_space_reservation_page_valid(pages[1].data, BLCKSZ));
 	UT_ASSERT_EQ(PageGetLSN(pages[1].data), UINT64_C(0x10000200));
+}
+
+UT_TEST(test_native_space_unavailable_attribution_forgets_under_same_owner)
+{
+	reset();
+	capture_result = CLUSTER_PAGE_WAL_UNATTRIBUTED;
+	UT_ASSERT(cluster_space_relation_create(locator));
+	UT_ASSERT_EQ(capture_calls, 2);
+	UT_ASSERT_EQ(forget_calls, 2);
+	UT_ASSERT(!locked && !pinned);
 }
 
 UT_TEST(test_no_create_on_legacy_or_unproved_namespace)
@@ -1760,7 +1798,7 @@ native_truncate_relation(void)
 	rel->rd_id = locator.relNumber;
 	rel->rd_smgr = &storage;
 	truncate_owner = true;
-	wal_calls = dirty_calls = flush_calls = 0;
+	wal_calls = dirty_calls = flush_calls = capture_calls = 0;
 	return rel;
 }
 
@@ -1773,6 +1811,7 @@ UT_TEST(test_native_truncate_logs_pair_after_durable_base_before_publish)
 	uint64 token;
 
 	RelationTruncate(rel, 4);
+	UT_ASSERT_EQ(capture_calls, 2);
 	UT_ASSERT_EQ(wal_info, XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE);
 	UT_ASSERT_EQ(main_blocks, 4);
 	UT_ASSERT_EQ(truncate_calls, 1);
@@ -2112,6 +2151,7 @@ UT_TEST(test_drop_pair_stays_live_until_native_commit_is_durable)
 	UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
 	XLogFlush(UINT64_C(0x10000300)); /* Original forced COMMIT flush. */
 	cluster_space_drop_publish(state, UINT64_C(0x10000300));
+	UT_ASSERT_EQ(capture_calls, 2);
 	UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, registered_len, &change));
 	UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
 		&change.identity.result.key, &identity, &token));
@@ -2544,7 +2584,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(52);
+	UT_PLAN(53);
 	UT_RUN(test_cold_physical_truncate_touches_only_named_forks);
 	UT_RUN(test_cold_physical_truncate_leaves_already_short_forks_alone);
 	UT_RUN(test_native_truncate_persists_new_space_before_exposing_incarnation);
@@ -2557,6 +2597,7 @@ main(void)
 	UT_RUN(test_cold_physical_truncate_uses_original_forks_without_local_wal_flush);
 	UT_RUN(test_cold_physical_truncate_refuses_owner_and_vm_before_shrink);
 	UT_RUN(test_real_create_binds_selected_namespace_and_wal);
+	UT_RUN(test_native_space_unavailable_attribution_forgets_under_same_owner);
 	UT_RUN(test_no_create_on_legacy_or_unproved_namespace);
 	UT_RUN(test_existing_identity_is_never_recreated);
 	UT_RUN(test_identity_read_is_exact_and_never_creates);
