@@ -78,6 +78,15 @@ extern ClusterControlRootResult cluster_wal_inputs_revalidate_v1(ClusterWalInput
 extern uint32 cluster_wal_inputs_count_v1(ClusterWalInputsV1 *inputs);
 extern const ClusterWalInputV1 *cluster_wal_inputs_at_v1(ClusterWalInputsV1 *inputs, uint32 index);
 
+/* Provisional metadata from this held online scope: the exact source has a
+ * durable RECOVERY_COMPLETE covering its sealed tail. This does not validate
+ * WAL bytes, clear existing PI, prove another generation retired, or permit
+ * source reclamation. A census must still decode the whole selected input
+ * and revalidate ROOT before using the result. No I/O or CF acquisition. */
+extern bool cluster_wal_inputs_recovered_prefix_v1(ClusterWalInputsV1 *inputs,
+												   const ClusterWalSourceRef *source,
+												   XLogRecPtr *out_end);
+
 /* Physically visit one selected retained source outside CF, under this exact
  * ROOT/WALR scope. OPEN returns WAIT without invalidating the scope: its original live writer must first confirm
  * a complete end after the directory cut. Terminal input is fully reclassified

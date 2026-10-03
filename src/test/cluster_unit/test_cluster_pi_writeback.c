@@ -39,6 +39,10 @@ static RfPageOnlinePlanV1 *wb_page_plan;
 static unsigned wb_plan_builds, wb_input_releases, wb_sends;
 static unsigned wb_census_builds;
 static bool wb_census_tail_bad;
+static uint32 wb_recovered_sources;
+static uint64 wb_recovered_boot;
+static unsigned wb_census_decodes;
+static uint32 rebuild_expected_main_holders = 7;
 static unsigned wb_log_calls[3];
 static RfSideOnlineOperationKindV1 wb_side_kind;
 static bool wb_space_valid;
@@ -216,7 +220,7 @@ cluster_pcm_rebuild_pi_contributors_v1(const ClusterGrdPiRebuildCutV1 *cut, Buff
 	} else {
 		UT_ASSERT(tag.forkNum == MAIN_FORKNUM || tag.forkNum == VISIBILITYMAP_FORKNUM);
 		UT_ASSERT_EQ(scn, tag.forkNum == MAIN_FORKNUM ? 80 : 7);
-		UT_ASSERT_EQ(holders, tag.forkNum == MAIN_FORKNUM ? 7 : 4);
+		UT_ASSERT_EQ(holders, tag.forkNum == MAIN_FORKNUM ? rebuild_expected_main_holders : 4);
 	}
 	rebuild_applies++;
 	if (rebuild_drift)
@@ -506,6 +510,7 @@ cluster_thread_recovery_record_census_v1(XLogReaderState *record, const ClusterW
 										 const RfContributorStreamCutV1 *cut,
 										 ClusterRecoveryContributionVisitorV1 visitor, void *arg)
 {
+	wb_census_decodes++;
 	if (source->claim.identity.origin_owner_incarnation == 0
 		|| source->claim.identity.origin_owner_incarnation != cut->origin_owner_incarnation
 		|| source->claim.identity.origin_thread_id != cut->failed_thread
@@ -515,6 +520,21 @@ cluster_thread_recovery_record_census_v1(XLogReaderState *record, const ClusterW
 				   census_component.blockno, census_component.token)
 			   ? RF_PAGE_PROOF_DETAIL_OK
 			   : RF_PAGE_PROOF_DETAIL_WOULD_BLOCK;
+}
+
+/* ROOT/source validation is exercised by the actual input-owner tests. */
+bool
+cluster_wal_inputs_recovered_prefix_v1(ClusterWalInputsV1 *inputs,
+									   const ClusterWalSourceRef *source, XLogRecPtr *end)
+{
+	int node = source->claim.identity.origin_node_id;
+	UT_ASSERT(wb_inputs_pinned[cluster_node_id]);
+	*end = InvalidXLogRecPtr;
+	if (node < 0 || node >= 3 || !(wb_recovered_sources & (1u << node))
+		|| source->claim.identity.origin_owner_incarnation != wb_recovered_boot)
+		return false;
+	*end = UINT64_MAX;
+	return true;
 }
 
 ClusterControlRootResult
@@ -545,6 +565,7 @@ cluster_wal_inputs_census_v1(ClusterWalInputsV1 *inputs, ClusterWalCensusVisitor
 			UT_ASSERT(
 				rf_page_online_plan_source_v1(wb_page_plan, edge->participant_index, &source));
 			reader.ReadRecPtr = edge->record_identity.read_rec_ptr;
+			reader.EndRecPtr = edge->record_identity.end_rec_ptr;
 			census_component.token = edge->result_token;
 			*detail
 				= visitor(&reader, &source, &view.contributors->cuts[edge->participant_index], arg);
@@ -1303,6 +1324,9 @@ rebuild_setup(void)
 	rebuild_apply_blocked = 0;
 	rebuild_plan_blocked = 0;
 	rebuild_plan_failure = RF_PAGE_PROOF_DETAIL_OK;
+	wb_recovered_sources = wb_census_decodes = 0;
+	wb_recovered_boot = 9;
+	rebuild_expected_main_holders = 7;
 	rebuild_fail_after = UINT32_MAX;
 	pi_rebuild_logged = false;
 	return data;
@@ -1369,6 +1393,28 @@ UT_TEST(retained_rebuild_restores_all_original_writers_before_complete)
 	cluster_page_data_receipt_free_v1(&data);
 	rf_page_online_plan_destroy_v1(&wb_page_plan);
 	clean();
+}
+
+UT_TEST(retained_rebuild_does_not_resurrect_a_completed_executor)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterPageDataReceiptV1 *data = rebuild_setup();
+		wb_recovered_sources = 2;
+		wb_recovered_boot += fault == 1;
+		rebuild_expected_main_holders = fault == 1 ? 7 : 5;
+		wb_census_tail_bad = fault == 2;
+		UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(),
+					 fault == 2 ? CLUSTER_PI_REBUILD_WAIT : CLUSTER_PI_REBUILD_IDLE);
+		UT_ASSERT_EQ(rebuild_holders, fault == 2 ? 0 : fault == 1 ? 7 : 5);
+		UT_ASSERT_EQ(rebuild_completions, fault != 2);
+		UT_ASSERT(wb_census_decodes >= 3);
+		UT_ASSERT(!wb_inputs_pinned[0]);
+		pi_rebuild_release();
+		cluster_page_data_receipt_free_v1(&data);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+	wb_census_tail_bad = false;
 }
 
 UT_TEST(retained_rebuild_maps_both_space_pages_under_original_source)
@@ -1618,7 +1664,7 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(25);
 	UT_RUN(remote_physical_ack_runs_actual_ancestry_and_disposal);
 	UT_RUN(writeback_codec_has_exact_bounded_authenticated_facts);
 	UT_RUN(writeback_rejects_foreign_sender_boot_and_changed_master_cut);
@@ -1634,6 +1680,7 @@ main(void)
 	UT_RUN(retained_rebuild_never_completes_with_unmapped_side_contributions);
 	UT_RUN(retained_census_does_not_materialize_history_and_checks_tail_first);
 	UT_RUN(retained_rebuild_restores_all_original_writers_before_complete);
+	UT_RUN(retained_rebuild_does_not_resurrect_a_completed_executor);
 	UT_RUN(retained_rebuild_maps_both_space_pages_under_original_source);
 	UT_RUN(retained_rebuild_maps_commit_drop_and_separate_non_pcm_owners);
 	UT_RUN(retained_rebuild_waits_unpinned_and_rejects_incomplete_or_changed_cut);

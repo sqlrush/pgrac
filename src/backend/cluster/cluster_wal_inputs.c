@@ -93,6 +93,47 @@ inputs_source_selected(const ClusterWalSourceRef *source, const ClusterWalSource
 }
 
 bool
+cluster_wal_inputs_recovered_prefix_v1(ClusterWalInputsV1 *inputs,
+									   const ClusterWalSourceRef *source, XLogRecPtr *out_end)
+{
+	const uint32 required
+		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+		  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID
+		  | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID
+		  | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID;
+
+	if (out_end != NULL)
+		*out_end = InvalidXLogRecPtr;
+	if (out_end == NULL || source == NULL || !inputs_current(inputs) || inputs->cold
+		|| source->claim.identity.origin_owner_incarnation == 0)
+		return false;
+	for (uint32 i = 0; i < inputs->count; i++) {
+		const ClusterWalInputV1 *item = &inputs->items[i];
+		const ClusterControlRootSnapshot *root = &item->checkpoint;
+
+		if (item->kind != CLUSTER_WAL_INPUT_CHECKPOINT
+			|| !inputs_source_selected(source, &item->source))
+			continue;
+		/* CLOSED certifies DATA, not executor exit. Only the original recovery
+		 * terminal combines the isolated writer with fully durable replay. */
+		if (root->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+			|| (root->root_flags & required) != required || root->checkpoint_tli != source->timeline
+			|| root->tail_tli != source->timeline || root->recovered_tli != source->timeline
+			|| root->checkpoint_lower_lsn == InvalidXLogRecPtr
+			|| root->validated_tail_lsn_exclusive <= root->checkpoint_lower_lsn
+			|| root->recovered_through_lsn_exclusive != root->validated_tail_lsn_exclusive
+			|| root->tail_last_record_lsn < root->checkpoint_lower_lsn
+			|| root->tail_last_record_lsn >= root->validated_tail_lsn_exclusive
+			|| root->recovered_last_record_lsn != root->tail_last_record_lsn
+			|| root->recovered_last_record_crc32c != root->tail_last_record_crc32c)
+			return false;
+		*out_end = root->recovered_through_lsn_exclusive;
+		return true;
+	}
+	return false;
+}
+
+bool
 cluster_wal_inputs_local_predecessor_retired_v1(ClusterWalInputsV1 *inputs,
 												const ClusterWalSourceRef *predecessor,
 												const ClusterWalSourceRef *writer)

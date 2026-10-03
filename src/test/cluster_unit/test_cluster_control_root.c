@@ -19803,6 +19803,125 @@ inputs_check_physically_visit_exact_nonserving_closed_sources(bool cold)
 	inputs_native_recovery = false;
 }
 
+UT_TEST(test_wal_inputs_recovered_prefix_requires_exact_terminal_and_source)
+{
+	for (unsigned fault = 0; fault < 14; fault++) {
+		uint8 bytes[66048];
+		ClusterRecoveryAnchorV2 anchors[2];
+		ControlRootImage root;
+		ClusterWalInputsV1 *inputs = NULL;
+		ClusterWalSourceRef source;
+		ClusterControlRootSnapshot *s;
+		XLogRecPtr end = UINT64_MAX;
+		inputs_closed_wal_fixture(bytes, anchors);
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
+		s = &root.records[127];
+		s->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+		s->lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE;
+		s->root_flags |= CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID
+						 | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID;
+		s->recovered_tli = s->tail_tli;
+		s->recovered_through_lsn_exclusive = s->validated_tail_lsn_exclusive;
+		s->recovered_last_record_lsn = s->tail_last_record_lsn;
+		s->recovered_last_record_crc32c = s->tail_last_record_crc32c;
+		if (fault == 1)
+			s->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+		else if (fault == 2)
+			s->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+		else if (fault == 3)
+			s->recovered_through_lsn_exclusive -= 8;
+		else if (fault == 4)
+			s->recovered_last_record_lsn += 8;
+		else if (fault == 5)
+			s->recovered_last_record_crc32c ^= 1;
+		else if (fault == 6)
+			s->recovered_tli++;
+		else if (fault == 7) {
+			s->root_flags &= ~CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID;
+			s->recovered_through_lsn_exclusive = s->checkpoint_lower_lsn;
+			s->recovered_last_record_lsn = s->recovered_last_record_crc32c = 0;
+		}
+		UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+		v2_write_roots(root.bytes);
+		UT_ASSERT_EQ(inputs_begin_for_role(false, &inputs), 0);
+		UT_ASSERT(inputs != NULL);
+		if (inputs == NULL)
+			continue;
+		source = cluster_wal_inputs_at_v1(inputs, 1)->source;
+		if (fault == 8)
+			source.claim.identity.origin_owner_incarnation++;
+		else if (fault == 9)
+			source.claim.claim_sha256[0] ^= 1;
+		else if (fault == 10)
+			source.timeline++;
+		else if (fault == 11)
+			source.claim.identity.root_lineage_seq++;
+		else if (fault == 12)
+			source.claim.database_incarnation++;
+		else if (fault == 13)
+			source.claim.identity.origin_owner_incarnation = 0;
+		UT_ASSERT_EQ(cluster_wal_inputs_recovered_prefix_v1(inputs, &source, &end), fault == 0);
+		UT_ASSERT_EQ(end, fault == 0 ? s->validated_tail_lsn_exclusive : InvalidXLogRecPtr);
+		/* The same ROOT's other source is CLOSED, not recovered. */
+		UT_ASSERT(!cluster_wal_inputs_recovered_prefix_v1(
+			inputs, &cluster_wal_inputs_at_v1(inputs, 0)->source, &end));
+		UT_ASSERT_EQ(end, InvalidXLogRecPtr);
+		UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), 0);
+		cluster_wal_inputs_release_v1(&inputs);
+		MyBackendType = B_INVALID;
+	}
+}
+
+UT_TEST(test_wal_inputs_recovered_prefix_never_outlives_original_scope)
+{
+	uint8 bytes[66048];
+	ClusterRecoveryAnchorV2 anchors[2];
+	ControlRootImage root;
+	ClusterWalInputsV1 *inputs = NULL;
+	ClusterWalSourceRef source;
+	XLogRecPtr end = UINT64_MAX;
+	inputs_closed_wal_fixture(bytes, anchors);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
+	root.records[127].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	root.records[127].root_flags |= CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID
+									| CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID;
+	root.records[127].recovered_tli = root.records[127].tail_tli;
+	root.records[127].recovered_through_lsn_exclusive
+		= root.records[127].validated_tail_lsn_exclusive;
+	root.records[127].recovered_last_record_lsn = root.records[127].tail_last_record_lsn;
+	root.records[127].recovered_last_record_crc32c = root.records[127].tail_last_record_crc32c;
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	v2_write_roots(root.bytes);
+	UT_ASSERT_EQ(inputs_begin_for_role(false, &inputs), 0);
+	UT_ASSERT(inputs != NULL);
+	if (inputs == NULL)
+		return;
+	source = cluster_wal_inputs_at_v1(inputs, 1)->source;
+	UT_ASSERT(cluster_wal_inputs_recovered_prefix_v1(inputs, &source, &end));
+	UT_ASSERT_EQ(cluster_wal_inputs_suspend_v1(inputs), 0);
+	UT_ASSERT(!cluster_wal_inputs_recovered_prefix_v1(inputs, &source, &end));
+	UT_ASSERT_EQ(end, InvalidXLogRecPtr);
+	UT_ASSERT_EQ(cluster_wal_inputs_resume_v1(inputs), 0);
+	UT_ASSERT(cluster_wal_inputs_recovered_prefix_v1(inputs, &source, &end));
+	root.header.file_txn_seq++;
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	v2_write_roots(root.bytes);
+	UT_ASSERT_EQ(cluster_wal_inputs_revalidate_v1(inputs), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT(!cluster_wal_inputs_recovered_prefix_v1(inputs, &source, &end));
+	UT_ASSERT_EQ(end, InvalidXLogRecPtr);
+	cluster_wal_inputs_release_v1(&inputs);
+	UT_ASSERT(!cluster_wal_inputs_recovered_prefix_v1(NULL, &source, &end));
+	test_inputs_startup_cf = true;
+	UT_ASSERT_EQ(inputs_begin_for_role(true, &inputs), 0);
+	UT_ASSERT(!cluster_wal_inputs_recovered_prefix_v1(inputs, &source, &end));
+	cluster_wal_inputs_release_v1(&inputs);
+	test_inputs_startup_cf = false;
+	MyBackendType = B_INVALID;
+	inputs_native_recovery = false;
+}
+
 UT_TEST(test_wal_inputs_physically_visit_exact_nonserving_closed_sources)
 {
 	inputs_check_physically_visit_exact_nonserving_closed_sources(false);
@@ -21107,7 +21226,7 @@ main(int argc, char **argv)
 		return ut_failed_count ? 1 : 0;
 	}
 	if (getenv("PGRAC_PRE2_TEST_WAL_INPUTS") != NULL) {
-		UT_PLAN(32);
+		UT_PLAN(34);
 		UT_RUN(test_wal_inputs_cold_all_origins_exact_native_anchor);
 		UT_RUN(test_wal_inputs_cold_retained_generations_remain_distinct);
 		UT_RUN(test_wal_inputs_cold_terminal_and_pending_are_not_checkpoint_sources);
@@ -21134,6 +21253,8 @@ main(int argc, char **argv)
 		UT_RUN(test_wal_inputs_all_origins_exact_native_anchor);
 		UT_RUN(test_wal_inputs_missing_peer_or_pending_never_partial);
 		UT_RUN(test_wal_inputs_installed_predecessor_needs_exact_original_exit);
+		UT_RUN(test_wal_inputs_recovered_prefix_requires_exact_terminal_and_source);
+		UT_RUN(test_wal_inputs_recovered_prefix_never_outlives_original_scope);
 		UT_RUN(test_wal_inputs_retained_generations_remain_distinct);
 		UT_RUN(test_wal_inputs_roster_race_busy_and_stale_scope);
 		UT_RUN(test_wal_inputs_terminal_and_pending_are_not_checkpoint_sources);
@@ -21150,7 +21271,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(385);
+	UT_PLAN(387);
 	UT_RUN(test_wal_inputs_cold_all_origins_exact_native_anchor);
 	UT_RUN(test_wal_inputs_cold_retained_generations_remain_distinct);
 	UT_RUN(test_wal_inputs_cold_terminal_and_pending_are_not_checkpoint_sources);
@@ -21181,6 +21302,8 @@ main(int argc, char **argv)
 	UT_RUN(test_wal_inputs_all_origins_exact_native_anchor);
 	UT_RUN(test_wal_inputs_missing_peer_or_pending_never_partial);
 	UT_RUN(test_wal_inputs_installed_predecessor_needs_exact_original_exit);
+	UT_RUN(test_wal_inputs_recovered_prefix_requires_exact_terminal_and_source);
+	UT_RUN(test_wal_inputs_recovered_prefix_never_outlives_original_scope);
 	UT_RUN(test_wal_inputs_retained_generations_remain_distinct);
 	UT_RUN(test_wal_inputs_roster_race_busy_and_stale_scope);
 	UT_RUN(test_wal_inputs_terminal_and_pending_are_not_checkpoint_sources);
