@@ -4136,10 +4136,265 @@ UT_TEST(test_stream_census_checks_native_and_space_payloads_without_replay)
 	UT_ASSERT_EQ(calls, 1);
 }
 
+UT_TEST(test_space_retained_ancestry_covers_history_and_each_committed_drop)
+{
+	for (int history_only = 0; history_only < 2; history_only++) {
+		ClusterSpaceReservationChange advance = space_advance_fixture();
+		ClusterSpaceStructureChange drops[2]
+			= { space_drop_fixture(16384), space_drop_fixture(16385) };
+		XLogRecPtr redo = history_only ? 300 : 200;
+		RfSideOnlinePlanV1 *plan = space_online_plan_redo(300, &redo);
+		FakeXactRecord fake;
+		uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
+		bool terminal = false;
+
+		UT_ASSERT(cluster_space_reservation_wal_encode(&advance, wal, sizeof(wal)));
+		UT_ASSERT_EQ(
+			space_online_feed(plan, XLOG_SMGR_SPACE_RESERVATION, wal, sizeof(wal), 100, false),
+			RF_PAGE_PROOF_DETAIL_OK);
+		make_space_commit(&fake, drops, 2);
+		UT_ASSERT_EQ(space_commit_feed(plan, &fake, 200), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(!rf_side_online_plan_space_covers_v1(plan, &advance.result.identity.key, 1, 0, 1,
+													   &terminal));
+		UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_space_target_count_v1(plan), history_only ? 0 : 2);
+		UT_ASSERT(rf_side_online_plan_space_covers_v1(plan, &advance.result.identity.key, 1, 0, 1,
+													  &terminal));
+		UT_ASSERT(terminal);
+		UT_ASSERT(rf_side_online_plan_space_covers_v1(plan, &advance.result.identity.key, 1, 0, 0,
+													  &terminal));
+		UT_ASSERT(!terminal);
+		for (int block = 0; block < 2; block++) {
+			UT_ASSERT(rf_side_online_plan_space_covers_v1(plan, &drops[1].identity.result.key,
+														  block, 1, 1, &terminal));
+			UT_ASSERT(terminal);
+		}
+		/* The other COMMIT locator has no contribution in operation zero. */
+		UT_ASSERT(!rf_side_online_plan_space_covers_v1(plan, &drops[1].identity.result.key, 1, 0, 1,
+													   &terminal));
+		UT_ASSERT(!rf_side_online_plan_space_covers_v1(plan, &advance.result.identity.key, 0, 0, 1,
+													   &terminal));
+		UT_ASSERT(!rf_side_online_plan_space_covers_v1(plan, &advance.result.identity.key, 1, 1, 0,
+													   &terminal));
+		UT_ASSERT(!rf_side_online_plan_space_covers_v1(plan, &advance.result.identity.key, 2, 1, 1,
+													   &terminal));
+		UT_ASSERT(!rf_side_online_plan_space_covers_v1(plan, &advance.result.identity.key, 1, 0, 2,
+													   &terminal));
+		advance.result.identity.key.database_incarnation++;
+		UT_ASSERT(!rf_side_online_plan_space_covers_v1(plan, &advance.result.identity.key, 1, 1, 1,
+													   &terminal));
+		UT_ASSERT(terminal); /* Every refusal preserves output. */
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_space_retained_ancestry_rejects_broken_history_before_live_suffix)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		ClusterSpaceReservationChange advance = space_advance_fixture();
+		ClusterSpaceIdentityKey key = advance.result.identity.key;
+		XLogRecPtr redo = 200;
+		RfSideOnlinePlanV1 *plan = space_online_plan_redo(300, &redo);
+		uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
+		bool terminal = true;
+		UT_ASSERT(cluster_space_reservation_wal_encode(&advance, wal, sizeof(wal)));
+		UT_ASSERT_EQ(
+			space_online_feed(plan, XLOG_SMGR_SPACE_RESERVATION, wal, sizeof(wal), 100, false),
+			RF_PAGE_PROOF_DETAIL_OK);
+		advance.before = advance.result;
+		advance.before_token = advance.result_token;
+		if (fault == 0)
+			advance.before_token++;
+		if (fault == 1)
+			advance.before.next_block--;
+		if (fault == 2)
+			advance.before.identity.incarnation[0]++;
+		if (fault == 3) {
+			/* Replay permits survivor gaps; PI ancestry must not infer them. */
+			advance.before.next_block += 4;
+			advance.before_token = 70;
+		}
+		advance.first_block = advance.before.next_block;
+		advance.result = advance.before;
+		advance.result.next_block += advance.granted;
+		advance.result_token = 60;
+		UT_ASSERT(cluster_space_reservation_wal_encode(&advance, wal, sizeof(wal)));
+		UT_ASSERT_EQ(
+			space_online_feed(plan, XLOG_SMGR_SPACE_RESERVATION, wal, sizeof(wal), 200, false),
+			RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+		/* A valid standalone redo suffix must not bless its broken retained history. */
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT(!rf_side_online_plan_space_covers_v1(plan, &key, 1, 0, 1, &terminal));
+		UT_ASSERT(!rf_side_online_plan_space_covers_v1(plan, &key, 1, 1, 1, &terminal));
+		UT_ASSERT(terminal);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_space_retained_ancestry_orders_interleaved_writers_not_feed_or_token)
+{
+	RfContributorStreamCutV1 cuts[3] = { { 0 } };
+	RfSideOnlinePlanRequestV1 request = { 0 };
+	RfSideOnlinePlanV1 *plan = NULL;
+	ClusterSpaceReservationChange chain[3];
+	uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
+	const int feed_order[] = { 1, 2, 0 };
+	bool terminal = false;
+	chain[0] = space_advance_fixture();
+	for (int i = 0; i < 3; i++) {
+		cuts[i].failed_thread = i + 1;
+		cuts[i].origin_owner_incarnation = i + 11;
+		cuts[i].timeline_id = 7;
+		cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		cuts[i].scan_begin_inclusive = 100;
+		cuts[i].scan_end_exclusive = 200;
+		if (i > 0) {
+			chain[i] = chain[i - 1];
+			chain[i].before = chain[i - 1].result;
+			chain[i].before_token = chain[i - 1].result_token;
+			chain[i].first_block = chain[i].before.next_block;
+			chain[i].result = chain[i].before;
+			chain[i].result.next_block += chain[i].granted;
+			chain[i].result_token -= 20;
+		}
+	}
+	request.system_identifier = chain[0].before.identity.key.system_identifier;
+	memcpy(request.storage_uuid, chain[0].before.identity.key.storage_uuid, 16);
+	request.physical_cuts = cuts;
+	request.participant_count = 3;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+	for (int i = 0; i < 3; i++) {
+		int origin = feed_order[i];
+		FakeXactRecord fake;
+		RfDetachedRecordPlanV1 record;
+		RfPageOnlineRecordIdentityV1 identity;
+		UT_ASSERT(cluster_space_reservation_wal_encode(&chain[origin], wal, sizeof(wal)));
+		make_projection_record(&fake, RM_SMGR_ID,
+							   XLOG_SMGR_SPACE_RESERVATION | XLR_SPECIAL_REL_UPDATE, wal,
+							   sizeof(wal));
+		fake.u.decoded.max_block_id = -1;
+		identity = make_identity(&fake, request.storage_uuid);
+		identity.participant_index = origin;
+		identity.record.origin_thread = cuts[origin].failed_thread;
+		set_identity_range(&fake, &identity, 100, 200);
+		record = make_projection_record_plan(&fake);
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_OK);
+	}
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	/* Operation order is B,C,A; dependency order is A,B,C (tokens 80,60,40). */
+	UT_ASSERT(rf_side_online_plan_space_covers_v1(plan, &chain[0].before.identity.key, 1, 2, 1,
+												  &terminal));
+	UT_ASSERT(terminal);
+	UT_ASSERT(rf_side_online_plan_space_covers_v1(plan, &chain[0].before.identity.key, 1, 2, 0,
+												  &terminal));
+	UT_ASSERT(!terminal);
+	UT_ASSERT(!rf_side_online_plan_space_covers_v1(plan, &chain[0].before.identity.key, 1, 1, 2,
+												   &terminal));
+	UT_ASSERT(!terminal);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_space_retained_ancestry_does_not_retire_prior_truncate_incarnation)
+{
+	ClusterSpaceReservationChange advance = space_advance_fixture();
+	ClusterSpaceStructureChange truncate = { 0 };
+	RfSideOnlinePlanV1 *plan = space_online_plan(300);
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	bool terminal = false;
+	UT_ASSERT(
+		cluster_space_reservation_wal_encode(&advance, wal, CLUSTER_SPACE_RESERVATION_WAL_BYTES));
+	UT_ASSERT_EQ(space_online_feed(plan, XLOG_SMGR_SPACE_RESERVATION, wal,
+								   CLUSTER_SPACE_RESERVATION_WAL_BYTES, 100, false),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	truncate.identity.action = CLUSTER_SPACE_WAL_TRUNCATE;
+	truncate.identity.nblocks = 2;
+	truncate.identity.expected = advance.result.identity;
+	truncate.identity.result = truncate.identity.expected;
+	truncate.identity.result.incarnation[0]++;
+	truncate.identity.result.sequence++;
+	truncate.identity.result.operation++;
+	truncate.identity.before_token = 123;
+	truncate.identity.result_token = 60;
+	truncate.reservation.action = CLUSTER_SPACE_RESERVATION_RESET;
+	truncate.reservation.before = advance.result;
+	truncate.reservation.result = truncate.reservation.before;
+	truncate.reservation.result.identity = truncate.identity.result;
+	truncate.reservation.result.next_block = 2;
+	truncate.reservation.first_block = 2;
+	truncate.reservation.before_token = advance.result_token;
+	truncate.reservation.result_token = 60;
+	UT_ASSERT(cluster_space_structure_wal_encode(&truncate, wal, sizeof(wal)));
+	UT_ASSERT_EQ(space_online_feed(plan, XLOG_SMGR_SPACE_IDENTITY, wal, sizeof(wal), 200, false),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(!rf_side_online_plan_space_covers_v1(plan, &truncate.identity.result.key, 1, 0, 1,
+												   &terminal));
+	UT_ASSERT(!terminal);
+	for (int block = 0; block < 2; block++) {
+		UT_ASSERT(rf_side_online_plan_space_covers_v1(plan, &truncate.identity.result.key, block, 1,
+													  1, &terminal));
+		UT_ASSERT(terminal);
+	}
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_space_retained_ancestry_create_and_independent_page_terminal)
+{
+	ClusterSpaceReservationChange advance = space_advance_fixture();
+	ClusterSpaceStructureChange create = { 0 };
+	XLogRecPtr redo = 300;
+	RfSideOnlinePlanV1 *plan = space_online_plan_redo(300, &redo);
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	bool terminal = false;
+	create.identity.action = CLUSTER_SPACE_WAL_CREATE;
+	create.identity.nblocks = InvalidBlockNumber;
+	create.identity.result = advance.result.identity;
+	create.identity.result_token = 50;
+	create.reservation.action = CLUSTER_SPACE_RESERVATION_INIT;
+	create.reservation.result.identity = create.identity.result;
+	create.reservation.result_token = 50;
+	UT_ASSERT(cluster_space_structure_wal_encode(&create, wal, sizeof(wal)));
+	UT_ASSERT_EQ(space_online_feed(plan, XLOG_SMGR_SPACE_IDENTITY, wal, sizeof(wal), 100, false),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	advance.before = create.reservation.result;
+	advance.before_token = 50;
+	advance.first_block = 0;
+	advance.result = advance.before;
+	advance.result.next_block = advance.granted;
+	UT_ASSERT(
+		cluster_space_reservation_wal_encode(&advance, wal, CLUSTER_SPACE_RESERVATION_WAL_BYTES));
+	UT_ASSERT_EQ(space_online_feed(plan, XLOG_SMGR_SPACE_RESERVATION, wal,
+								   CLUSTER_SPACE_RESERVATION_WAL_BYTES, 200, false),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(
+		rf_side_online_plan_space_covers_v1(plan, &create.identity.result.key, 0, 0, 0, &terminal));
+	UT_ASSERT(terminal); /* ADVANCE changes only block one. */
+	UT_ASSERT(
+		rf_side_online_plan_space_covers_v1(plan, &create.identity.result.key, 1, 0, 0, &terminal));
+	UT_ASSERT(!terminal);
+	UT_ASSERT(
+		rf_side_online_plan_space_covers_v1(plan, &create.identity.result.key, 1, 0, 1, &terminal));
+	UT_ASSERT(terminal);
+	UT_ASSERT_EQ(rf_side_online_plan_space_target_count_v1(plan), 0);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(60);
+	UT_PLAN(65);
+	UT_RUN(test_space_retained_ancestry_create_and_independent_page_terminal);
+	UT_RUN(test_space_retained_ancestry_covers_history_and_each_committed_drop);
+	UT_RUN(test_space_retained_ancestry_rejects_broken_history_before_live_suffix);
+	UT_RUN(test_space_retained_ancestry_orders_interleaved_writers_not_feed_or_token);
+	UT_RUN(test_space_retained_ancestry_does_not_retire_prior_truncate_incarnation);
 	UT_RUN(test_stream_census_does_not_accumulate_a_million_side_operations);
 	UT_RUN(test_stream_census_checks_native_and_space_payloads_without_replay);
 	UT_RUN(test_standby_retains_exact_payload_and_independent_control_obligation);

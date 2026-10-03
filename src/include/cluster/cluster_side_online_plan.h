@@ -203,6 +203,16 @@ extern bool rf_side_online_plan_space_contribution_v1(const RfSideOnlinePlanV1 *
 													  uint32 operation, uint32 locator_index,
 													  RfSideSpaceContributionV1 *out);
 
+/* Pure typed ancestry within the complete retained input, including history.
+ * Both operation indices must contribute to this exact key/block and retain
+ * the same incarnation. terminal describes this block, not other effects of
+ * a structural/COMMIT record. Refusal preserves terminal. The DATA owner must
+ * separately bind both indices to full original claims and record identities;
+ * this query alone grants no durability, physical disposal or WAL retirement. */
+extern bool rf_side_online_plan_space_covers_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterSpaceIdentityKey *key, BlockNumber block, uint32 ancestor_operation,
+	uint32 completed_operation, bool *terminal);
+
 /* One decoded record, no retained operation array or payload allocation.
  * Reuses the replay decoder but returns only provisional contribution owners.
  * The caller must finish physical WAL/source validation before completing its
