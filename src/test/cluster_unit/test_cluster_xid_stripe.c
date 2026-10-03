@@ -561,6 +561,20 @@ UT_TEST(test_slot_record_sanity_rejections)
 	r.version = CLUSTER_PGXS_VERSION + 1;
 	cluster_xid_stripe_slot_record_compute_crc(&r);
 	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 4));
+	for (uint32 version = 1; version < CLUSTER_PGXS_VERSION; version++) {
+		r = make_slot_record(4);
+		r.version = version;
+		cluster_xid_stripe_slot_record_compute_crc(&r);
+		UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 4));
+	}
+	r = make_slot_record(4);
+	r.history_crc32c = 1;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 4));
+	r = make_slot_record(4);
+	r.history_generation = 1;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 4));
 
 	r = make_slot_record(4);
 	r.node_id = -1;
@@ -681,10 +695,48 @@ UT_TEST(test_activation_record_crc_rejections)
 }
 
 
+UT_TEST(test_slot_legacy_without_issued_ceiling_refuses)
+{
+	ClusterXidStripeSlotRecord r = make_slot_record(4);
+
+	r.version = 1;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&r, 4));
+}
+
+UT_TEST(test_slot_reserved_range_integrity)
+{
+	ClusterXidStripeSlotRecord r = make_slot_record(4);
+	ClusterXidStripeSlotRecord bad;
+
+	r.lease_floor_full = r.floor_full + 20;
+	r.lease_floor_full -= r.lease_floor_full % CLUSTER_XID_STRIDE;
+	r.lease_floor_full += 4;
+	r.issued_limit_full = r.lease_floor_full + CLUSTER_XID_STRIPE_LEASE_SPAN;
+	r.lease_incarnation = 72;
+	cluster_xid_stripe_slot_record_compute_crc(&r);
+	UT_ASSERT(cluster_xid_stripe_slot_record_valid(&r, 4));
+	for (int field = 0; field < 5; field++) {
+		bad = r;
+		if (field == 0)
+			bad.lease_incarnation = 0;
+		else if (field == 1)
+			bad.lease_floor_full = r.floor_full - 1;
+		else if (field == 2)
+			bad.issued_limit_full = r.lease_floor_full;
+		else if (field == 3)
+			bad.lease_floor_full++;
+		else
+			bad.issued_limit_full = 0;
+		cluster_xid_stripe_slot_record_compute_crc(&bad);
+		UT_ASSERT(!cluster_xid_stripe_slot_record_valid(&bad, 4));
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(28);
 
 	UT_RUN(test_widen_behind_same_epoch);
 	UT_RUN(test_widen_ahead_same_epoch);
@@ -714,6 +766,8 @@ main(void)
 	UT_RUN(test_slot_record_roundtrip_valid);
 	UT_RUN(test_slot_record_sanity_rejections);
 	UT_RUN(test_slot_record_crc_rejections);
+	UT_RUN(test_slot_legacy_without_issued_ceiling_refuses);
+	UT_RUN(test_slot_reserved_range_integrity);
 	UT_RUN(test_activation_record_roundtrip_valid);
 	UT_RUN(test_activation_record_sanity_rejections);
 	UT_RUN(test_activation_record_crc_rejections);

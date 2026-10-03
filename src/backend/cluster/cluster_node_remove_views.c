@@ -43,6 +43,9 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_type_d.h"
+#include "utils/fmgrprotos.h"
+#include "utils/jsonb.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"		/* superuser() */
@@ -51,10 +54,213 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h" /* cluster_enabled */
 #include "cluster/cluster_node_remove.h"
+#include "cluster/cluster_membership.h"
 #endif
 
 PG_FUNCTION_INFO_V1(cluster_get_node_removal_state);
 PG_FUNCTION_INFO_V1(pg_cluster_remove_node);
+
+/* Exact administrative identities are distinct from the legacy target-only
+ * commands. A response never grants admission or releases an operation.
+ * Author: SqlRush <sqlrush@gmail.com> */
+PG_FUNCTION_INFO_V1(pg_cluster_membership_command);
+
+#ifdef USE_PGRAC_CLUSTER
+static JsonbValue *
+membership_command_field(Jsonb *request, const char *name, enum jbvType type)
+{
+	JsonbValue key;
+	JsonbValue *value;
+
+	key.type = jbvString;
+	key.val.string.val = (char *)name;
+	key.val.string.len = strlen(name);
+	value = findJsonbValueFromContainer(&request->root, JB_FOBJECT, &key);
+	if (value == NULL || value->type != type)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid membership request field \"%s\"", name),
+				 errhint("Provide field \"%s\" as %s; run membership commands as a superuser.",
+						 name, type == jbvNumeric ? "a JSON unsigned integer" : "a JSON string")));
+	return value;
+}
+
+static uint64
+membership_command_uint64(Jsonb *request, const char *name)
+{
+	JsonbValue *value = membership_command_field(request, name, jbvNumeric);
+	char *decimal
+		= DatumGetCString(DirectFunctionCall1(numeric_out, NumericGetDatum(value->val.numeric)));
+	const char *p;
+	uint64 result = 0;
+
+	/* Numeric output is decimal text; do not round through float8 or int8. */
+	for (p = decimal; *p != '\0'; p++) {
+		if (*p < '0' || *p > '9' || result > (UINT64_MAX - (*p - '0')) / 10)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("invalid unsigned membership field \"%s\"", name),
+							errhint("Use a JSON integer from 0 through 18446744073709551615 "
+									"without quotes or a fractional part.")));
+		result = result * 10 + (*p - '0');
+	}
+	pfree(decimal);
+	return result;
+}
+
+static bool
+membership_command_string(JsonbValue *value, const char *expected)
+{
+	return value->val.string.len == strlen(expected)
+		   && memcmp(value->val.string.val, expected, value->val.string.len) == 0;
+}
+
+static void
+membership_command_validate(Jsonb *request)
+{
+	ClusterMembershipRequest key = { 0 };
+	JsonbValue *value;
+	uint64 target;
+	int i, digit = 0;
+
+	if (!JB_ROOT_IS_OBJECT(request) || JB_ROOT_COUNT(request) != 8
+		|| membership_command_uint64(request, "version") != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("exact membership request fields and version 1 are required"),
+				 errhint("Provide exactly these JSON fields: version (1), operation_kind, "
+						 "target_node, guest_uuid, expected_formation, operation_generation, "
+						 "expected_old_incarnation, reserved_new_incarnation.")));
+	value = membership_command_field(request, "operation_kind", jbvString);
+	if (membership_command_string(value, "leave"))
+		key.operation_kind = CLUSTER_MEMBERSHIP_LEAVE;
+	else if (membership_command_string(value, "remove"))
+		key.operation_kind = CLUSTER_MEMBERSHIP_REMOVE;
+	else if (membership_command_string(value, "rejoin"))
+		key.operation_kind = CLUSTER_MEMBERSHIP_REJOIN;
+	else
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("unsupported membership operation"),
+						errhint("Set request operation_kind to the JSON string \"leave\", "
+								"\"remove\", or \"rejoin\".")));
+	target = membership_command_uint64(request, "target_node");
+	/* The administrative protocol uses the current common 16-node limit. */
+	if (target >= 16)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("membership target node is outside the supported range"),
+						errhint("Set target_node to a JSON integer from 0 through 15.")));
+	key.target_node = (int32)target;
+	key.expected_formation = membership_command_uint64(request, "expected_formation");
+	key.operation_generation = membership_command_uint64(request, "operation_generation");
+	key.expected_old_incarnation = membership_command_uint64(request, "expected_old_incarnation");
+	key.reserved_new_incarnation = membership_command_uint64(request, "reserved_new_incarnation");
+	value = membership_command_field(request, "guest_uuid", jbvString);
+	if (value->val.string.len != 36)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("canonical nonzero guest UUID is required"),
+				 errhint("Use a nonzero lowercase UUID string in 8-4-4-4-12 hexadecimal format.")));
+	for (i = 0; i < 36; i++) {
+		char c = value->val.string.val[i];
+		int nibble;
+
+		if (i == 8 || i == 13 || i == 18 || i == 23) {
+			if (c == '-')
+				continue;
+		} else if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			nibble = c <= '9' ? c - '0' : c - 'a' + 10;
+			key.guest_uuid[digit / 2] |= nibble << (digit % 2 == 0 ? 4 : 0);
+			digit++;
+			continue;
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("canonical nonzero guest UUID is required"),
+				 errhint("Use a nonzero lowercase UUID string in 8-4-4-4-12 hexadecimal format.")));
+	}
+	if (!cluster_membership_request_valid(&key))
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("membership request identity is invalid"),
+			 errhint(
+				 "Use a nonzero guest UUID and positive expected_formation, operation_generation, "
+				 "and expected_old_incarnation integers. For rejoin, reserved_new_incarnation must "
+				 "exceed expected_old_incarnation; for leave/remove, it must be 0.")));
+}
+#endif
+
+Datum
+pg_cluster_membership_command(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+			 errmsg("must be superuser to issue a membership command"),
+			 errhint(
+				 "Connect as a database superuser; a function EXECUTE grant is insufficient.")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		text *action;
+		Jsonb *request = NULL;
+		JsonbValue scalar;
+		bool status;
+		const char *reason;
+		Datum args[10];
+		Oid types[10] = { TEXTOID, INT4OID, TEXTOID,  TEXTOID, TEXTOID,
+						  TEXTOID, TEXTOID, JSONBOID, TEXTOID, TEXTOID };
+		bool nulls[10] = { false };
+
+		if (PG_ARGISNULL(0))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("membership command action is required"),
+					 errhint("Use action 'precheck', 'execute', or 'status' as a superuser.")));
+		action = PG_GETARG_TEXT_PP(0);
+		status = VARSIZE_ANY_EXHDR(action) == 6 && memcmp(VARDATA_ANY(action), "status", 6) == 0;
+		if (!status
+			&& !(VARSIZE_ANY_EXHDR(action) == 8 && memcmp(VARDATA_ANY(action), "precheck", 8) == 0)
+			&& !(VARSIZE_ANY_EXHDR(action) == 7 && memcmp(VARDATA_ANY(action), "execute", 7) == 0))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("unknown membership command action"),
+					 errhint("Use action 'precheck', 'execute', or 'status' as a superuser.")));
+		if (!PG_ARGISNULL(1)) {
+			request = PG_GETARG_JSONB_P(1);
+			if (JsonbExtractScalar(&request->root, &scalar) && scalar.type == jbvNull)
+				request = NULL;
+		}
+		if (request != NULL)
+			membership_command_validate(request);
+		else if (!status)
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("exact membership request is required"),
+							errhint("Provide the version 1 JSON request with all eight identity "
+									"fields. Only 'status' permits a null request.")));
+		/* No administrative owner can publish a qualified result yet. Never
+		 * submit through LMON's mailbox from a backend or infer idle locally. */
+		reason = cluster_enabled ? "membership_authority_unavailable" : "cluster_disabled";
+		args[0] = CStringGetTextDatum("version");
+		args[1] = Int32GetDatum(1);
+		args[2] = CStringGetTextDatum("action");
+		args[3] = PointerGetDatum(action);
+		args[4] = CStringGetTextDatum("status");
+		args[5] = CStringGetTextDatum("blocked");
+		args[6] = CStringGetTextDatum("request");
+		args[7] = PointerGetDatum(request);
+		nulls[7] = request == NULL;
+		args[8] = CStringGetTextDatum("reason");
+		args[9] = CStringGetTextDatum(reason);
+		PG_RETURN_DATUM(jsonb_build_object_worker(10, args, nulls, types, false, true));
+	}
+#else
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("membership commands require a --enable-cluster build"),
+					errhint("Use a --enable-cluster server and connect as a superuser.")));
+	PG_RETURN_NULL();
+#endif
+}
+
 
 #ifdef USE_PGRAC_CLUSTER
 

@@ -348,6 +348,17 @@ cluster_xid_stripe_slot_record_valid(const ClusterXidStripeSlotRecord *rec, int3
 		return false;
 	if (rec->generation == 0)
 		return false;
+	if (rec->_pad[0] != 0 || rec->_pad[1] != 0 || rec->_pad[2] != 0
+		|| (rec->history_generation == 0 && rec->history_crc32c != 0)
+		|| (rec->history_generation != 0 && rec->lease_incarnation == 0))
+		return false;
+	if (rec->lease_floor_full != 0 || rec->issued_limit_full != 0 || rec->lease_incarnation != 0) {
+		if (rec->lease_incarnation == 0 || rec->lease_floor_full < rec->floor_full
+			|| rec->issued_limit_full <= rec->lease_floor_full
+			|| !TransactionIdIsNormal((TransactionId)rec->lease_floor_full)
+			|| rec->lease_floor_full % CLUSTER_XID_STRIDE != rec->node_id)
+			return false;
+	}
 
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, rec, offsetof(ClusterXidStripeSlotRecord, crc32c));

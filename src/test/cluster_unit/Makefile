@@ -182,7 +182,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_membership \
         test_cluster_node_remove test_cluster_node_remove_stop test_cluster_recovery_stop test_cluster_backup_stop test_cluster_mrp_stop \
         test_cluster_hang_acceptance \
-        test_cluster_xid_stripe \
+        test_cluster_xid_stripe test_cluster_xid_stripe_evidence test_cluster_xid_allocation \
         test_cluster_undo_resid \
         test_cluster_undo_authority \
         test_cluster_undo_gcs \
@@ -382,7 +382,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_control_transport test_cluster_cr_nati
 		test_cluster_resource_x_handoff test_cluster_retained_remote \
 		test_cluster_r4_d10_hint_source test_cluster_r4_d10_tt_source \
 		test_cluster_r4_d10_multi_source test_cluster_sf_dep test_cluster_wal_state_rmw \
-		test_cluster_ges_reply_wait \
+		test_cluster_ges_reply_wait test_cluster_xid_stripe_evidence test_cluster_xid_allocation \
 		test_cluster_replacement_episode \
 		test_cluster_replacement_request \
 		test_cluster_undo_root_descriptor \
@@ -7421,6 +7421,44 @@ test_cluster_cr_coordinator: test_cluster_cr_coordinator.c unit_test.h \
 # ("PGXS"/"PGXA" CRC + sanity), which pull in libpgport for CRC32C.
 # Links cluster_xid_stripe.o standalone; stubs ReadNextFullTransactionId.
 CLUSTER_XID_STRIPE_O = $(top_builddir)/src/backend/cluster/cluster_xid_stripe.o
+test_cluster_xid_allocation.inc: $(top_srcdir)/src/backend/access/transam/varsup.c \
+		$(top_srcdir)/src/backend/access/transam/transam.c Makefile
+	awk '/^GetNewTransactionId\(/ { print "FullTransactionId"; emit=1; found++ } \
+	     /^TransactionId(Precedes|FollowsOrEquals)\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_xid_allocation: test_cluster_xid_allocation.c unit_test.h \
+		test_cluster_xid_allocation.inc $(CLUSTER_XID_STRIPE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_xid_stripe_evidence.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_stripe_boot.c Makefile
+	awk '/^typedef enum StripeSlotRead(Class|Purpose)/ { emit=1; types++ } \
+	     /^typedef struct ClusterXidStripeLease / { emit=1; leases++ } \
+	     /^typedef struct ClusterXidStripeBootShmem / { emit=1; boots++ } \
+	     /^static ClusterXidStripeLease \*StripeLease / { print; pointer++ } \
+	     /^static ClusterXidStripeBootShmem \*StripeBootShmem / { print; bootptr++ } \
+	     /^buffer_is_all_zeros\(/ { print "static bool"; emit=1; zero++ } \
+	     /^cluster_xid_stripe_lookup_incarnation_fds\(/ { print "bool"; emit=1; lookup++ } \
+	     /^stripe_history_offset\(/ { print "static bool"; emit=1; history++ } \
+	     /^stripe_history_read_(one|all)\(/ { print "static StripeSlotReadClass"; emit=1; history++ } \
+	     /^stripe_history_archive\(/ { print "static int"; emit=1; history++ } \
+	     /^stripe_history_initial_capacity\(/ { print "static int"; emit=1; history++ } \
+	     /^stripe_read_slot_(one|all)\(/ { print "static StripeSlotReadClass"; emit=1; reads++ } \
+	     /^stripe_lease_(tick|fail)\(/ { print "static void"; emit=1; actions++ } \
+	     /^stripe_service_(claim|retire)\(/ { print "static uint32"; emit=1; writers++ } \
+	     /^cluster_xid_stripe_herding_tick\(/ { print "void"; emit=1; herd++ } \
+	     /^cluster_xid_stripe_herding_floor\(/ { print "FullTransactionId"; emit=1; floor++ } \
+	     /^cluster_xid_stripe_lease_ready\(/ { print "bool"; emit=1; ready++ } \
+	     /^cluster_xid_stripe_wait_lease\(/ { print "void"; emit=1; wait++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (history != 5 || lookup != 1 || types != 2 || zero != 1 || reads != 2 || leases != 1 || pointer != 1 || actions != 2 || ready != 1 || boots != 1 || bootptr != 1 || writers != 2 || herd != 1 || floor != 1 || wait != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_xid_stripe_evidence: test_cluster_xid_stripe_evidence.c unit_test.h \
+		test_cluster_xid_stripe_evidence.inc $(CLUSTER_XID_STRIPE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 test_cluster_xid_stripe: test_cluster_xid_stripe.c unit_test.h \
 		$(CLUSTER_XID_STRIPE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
