@@ -92,6 +92,7 @@
 #include "miscadmin.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "storage/bufpage.h"
+#include "pgrac_wal.h"
 #endif
 
 
@@ -3736,6 +3737,8 @@ pgrac_native_sync(void)
 	struct stat data_st, wal_st;
 	const char *paths[2] = {pgrac_native_data_path, pgrac_native_wal_path};
 	ControlFileData *control;
+	ControlFileData *after;
+	PgracInitdbWalObservation observed;
 
 	pgrac_native_check_directories(&data_st, &wal_st);
 	/* Reuse the original creator's strict file/directory walker, not the
@@ -3755,6 +3758,14 @@ pgrac_native_sync(void)
 	}
 	pgrac_native_check_directories(&data_st, &wal_st);
 	control = pgrac_native_control();
+	if (!pgrac_initdb_wal_observe(pgrac_native_wal_fd, control,
+		pgrac_native_thread, &observed))
+		pg_fatal("INITDB_WAL_READBACK: original shutdown checkpoint failed exact WAL readback");
+	pgrac_native_check_directories(&data_st, &wal_st);
+	after = pgrac_native_control();
+	if (memcmp(control, after, sizeof(*control)) != 0)
+		pg_fatal("INITDB_WAL_READBACK: native control changed during WAL readback");
+	free(after);
 	free(control);
 	if (close(pgrac_native_data_fd) != 0 || close(pgrac_native_wal_fd) != 0)
 		pg_fatal("INITDB_WAL_SYNC: cannot close original directories: %m");

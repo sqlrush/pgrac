@@ -39,6 +39,14 @@ OBJS = \
 
 all: initdb
 
+ifeq ($(enable_pgrac_cluster),yes)
+OBJS += pgrac_wal.o xlogreader.o
+pgrac_wal.o xlogreader.o: override CPPFLAGS += -DFRONTEND
+
+xlogreader.c: % : $(top_srcdir)/src/backend/access/transam/%
+	rm -f $@ && $(LN_S) $< .
+endif
+
 initdb: $(OBJS) | submake-libpq submake-libpgport submake-libpgfeutils
 	$(CC) $(CFLAGS) $(OBJS) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
 
@@ -56,7 +64,7 @@ uninstall:
 	rm -f '$(DESTDIR)$(bindir)/initdb$(X)'
 
 clean distclean maintainer-clean:
-	rm -f initdb$(X) $(OBJS) localtime.c
+	rm -f initdb$(X) $(OBJS) localtime.c xlogreader.c
 	rm -rf tmp_check
 
 # ensure that changes in datadir propagate into object file

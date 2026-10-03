@@ -46,6 +46,7 @@ endif
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
+        test_cluster_initdb_wal \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
         test_pgrac_fenced_target_command test_pgrac_fenced_target_reply test_pgrac_fenced_target_client \
@@ -3632,7 +3633,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-$(filter-out test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_initdb_wal test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # The wire behavior is inline; an updated decoder must rebuild this binary.
@@ -5473,6 +5474,16 @@ test_cluster_r4_cr_walk: test_cluster_r4_cr_walk.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# Actual native checkpoint decoding, not a synthetic tail observation.
+test_cluster_initdb_wal: test_cluster_initdb_wal.c unit_test.h \
+		$(top_srcdir)/src/bin/initdb/pgrac_wal.c $(top_srcdir)/src/bin/initdb/pgrac_wal.h \
+		$(top_srcdir)/src/backend/access/transam/xlogreader.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		$(top_srcdir)/src/bin/initdb/pgrac_wal.c \
+		$(top_srcdir)/src/backend/access/transam/xlogreader.c \
+		$(LDFLAGS) $(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
 # Actual HW startup and file/authority consumer composition.
 test_cluster_hw_initdb_sync_tail.inc: $(top_srcdir)/src/bin/initdb/initdb.c Makefile
 	@awk '/^main\(/ { fn=1 } fn && /^\tif \(do_sync\)/ { copy=1; starts++ } \
@@ -5480,10 +5491,15 @@ test_cluster_hw_initdb_sync_tail.inc: $(top_srcdir)/src/bin/initdb/initdb.c Make
 		END { if (!done || starts != 1 || n < 10) exit 1 }' $< > $@
 
 test_cluster_hw_initdb: test_cluster_hw_initdb.c test_cluster_hw_initdb_sync_tail.inc unit_test.h \
-		$(top_srcdir)/src/bin/initdb/initdb.c $(top_srcdir)/src/common/file_utils.c
+		$(top_srcdir)/src/bin/initdb/initdb.c $(top_srcdir)/src/common/file_utils.c \
+		$(top_srcdir)/src/bin/initdb/pgrac_wal.c $(top_srcdir)/src/bin/initdb/pgrac_wal.h \
+		$(top_srcdir)/src/backend/access/transam/xlogreader.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -I$(libpq_srcdir) -I$(top_srcdir)/src/timezone \
 		-ffunction-sections -fdata-sections $< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
-		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a -o $@
+		$(top_srcdir)/src/bin/initdb/pgrac_wal.c \
+		$(top_srcdir)/src/backend/access/transam/xlogreader.c \
+		$(LDFLAGS) $(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_hw_init_tail.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
 	@awk '/^InitWalRecovery\(/ { fn=1 } \
