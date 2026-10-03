@@ -315,6 +315,7 @@ typedef struct ClusterReconfigState {
 	 * (INV-J7 floor / INV-J8 decision SSOT).
 	 */
 	ClusterMembershipTable membership;
+	pg_atomic_uint64 membership_cut_generation;
 
 	/*
 	 * spec-5.15 D4 — pending-join set: declared peers currently in the
@@ -518,8 +519,8 @@ typedef struct ClusterReconfigState {
 /* PGRAC: includes the observation sequence and exact startup cohort binding;
  * the allocator uses sizeof, and all processes require the same build.
  * Author: SqlRush <sqlrush@gmail.com> */
-StaticAssertDecl(sizeof(ClusterReconfigState) == 13752,
-				 "cluster reconfig state must remain exactly 13,752 bytes");
+StaticAssertDecl(sizeof(ClusterReconfigState) == 13760,
+				 "cluster reconfig state must remain exactly 13,760 bytes");
 
 
 /* ============================================================

@@ -457,6 +457,8 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 join_pcm_fence_scope_epoch;
 	pg_atomic_uint32 recovery_direction;
 	slock_t pi_rebuild_lock;
+	/* Scope/complete publication sequence; zero disables the local ready memo. */
+	pg_atomic_uint64 pi_rebuild_publication;
 	ClusterGrdPiRebuildCutV1 pi_rebuilt;
 	pg_atomic_uint64 pi_rebuild_side_blocked_count;
 	pg_atomic_uint64 pi_rebuild_apply_blocked_count;

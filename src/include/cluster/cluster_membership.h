@@ -62,6 +62,7 @@
 #include "c.h"
 
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
+#include "port/atomics.h"
 #include "port/pg_crc32c.h"		  /* join-commit marker integrity */
 
 /*
@@ -134,6 +135,18 @@ typedef struct ClusterMembershipTable {
  * The caller owns the reconfig LWLock discipline for mutations.
  */
 extern void cluster_membership_attach(ClusterMembershipTable *table);
+
+/* Attach only to the current Reconfig shared owner after attaching its table.
+ * The owner initializes the generation to 2 exactly once. Reattachment must
+ * never reset it. All mutators retain their existing Reconfig writer lock.
+ * A zero token means missing owner, active/interrupted writer or exhaustion.
+ * An exact cut must still be sampled under the Reconfig read lock, with the
+ * generation checked before and after. A cache may use these O(1) accessors
+ * only while its other authority/epoch identities remain qualified. */
+extern void cluster_membership_attach_cut_generation(pg_atomic_uint64 *generation);
+extern uint64 cluster_membership_cut_generation(void);
+extern bool cluster_membership_cut_generation_current(uint64 expected);
+
 
 /*
  * INV-J7 bring-up durable seed.  Rebuilds last_admitted_incarnation[] from the

@@ -258,12 +258,15 @@ cluster_shmem_register_region(const void *r pg_attribute_unused())
  */
 static int32 mock_declared[CLUSTER_MAX_NODES];
 static int mock_declared_count;
+static uint64 ut_node_lookups;
 static ClusterNodeInfo mock_node_info; /* dummy non-NULL return */
 
 const ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id)
 {
 	int i;
+
+	ut_node_lookups++;
 
 	for (i = 0; i < mock_declared_count; i++) {
 		if (mock_declared[i] == node_id)
@@ -452,6 +455,22 @@ cluster_gcs_lookup_master_static(BufferTag tag)
 static int ut_member_mask = -1;
 static uint64 ut_admitted_incarnation = 11;
 static bool ut_qvotec_quorum = true;
+static uint64 ut_membership_generation;
+static uint64 ut_remote_boot;
+static bool ut_formation_unavailable;
+static bool ut_membership_drift_on_snapshot;
+uint64
+cluster_membership_cut_generation(void)
+{
+	return ut_membership_generation != 0 && (ut_membership_generation & 1) == 0
+			   ? ut_membership_generation
+			   : 0;
+}
+bool
+cluster_membership_cut_generation_current(uint64 generation)
+{
+	return generation != 0 && generation == cluster_membership_cut_generation();
+}
 bool
 cluster_membership_is_member(int32 node_id)
 {
@@ -462,9 +481,28 @@ cluster_membership_is_member(int32 node_id)
 	return ((ut_member_mask >> node_id) & 1) != 0;
 }
 uint64
-cluster_membership_get_last_admitted_incarnation(int32 node_id pg_attribute_unused())
+cluster_membership_get_last_admitted_incarnation(int32 node_id)
 {
-	return ut_admitted_incarnation;
+	ut_node_lookups++;
+	return node_id == 2 && ut_remote_boot != 0 ? ut_remote_boot : ut_admitted_incarnation;
+}
+bool
+cluster_reconfig_capture_formation_snapshot_v1(uint16 thread, ClusterFormationSnapshotV1 *out)
+{
+	UT_ASSERT(thread == cluster_node_id + 1);
+	if (ut_formation_unavailable)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->local_epoch = ut_mock_epoch;
+	for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
+		out->membership.membership_state[node]
+			= cluster_membership_is_member(node) ? CLUSTER_MEMBER_MEMBER : CLUSTER_MEMBER_DEAD;
+		out->membership.last_admitted_incarnation[node]
+			= cluster_membership_get_last_admitted_incarnation(node);
+	}
+	if (ut_membership_drift_on_snapshot)
+		ut_membership_generation += 2;
+	return true;
 }
 bool
 cluster_qvotec_in_quorum(void)
@@ -896,12 +934,14 @@ DoLockModesConflict(int a pg_attribute_unused(), int b pg_attribute_unused())
 /* spec-2.15 D11: s_lock contention stub.  PG inlines TAS spinlocks via
  * compiler primitives on most targets, but s_lock() resolves at link
  * time for the contended-spin slow path (always reachable in object
- * code, even when never entered at run time).  Stub returns immediately
- * — the cluster_unit harness never actually contends a slock. */
+ * code, even when never entered at run time). Count attempts so a warmed
+ * ready-cache test can hold the PI lock and detect any forbidden acquisition. */
+static uint64 ut_spin_waits;
 int
 s_lock(volatile slock_t *lock pg_attribute_unused(), const char *file pg_attribute_unused(),
 	   int line pg_attribute_unused(), const char *func pg_attribute_unused())
 {
+	ut_spin_waits++;
 	return 0;
 }
 
@@ -5981,6 +6021,207 @@ UT_TEST(test_join_protocol_completes_before_local_pi_service_and_new_cut_invalid
 	finish_recovery_control_fixture();
 }
 
+static void
+pi_ready_fixture(ClusterGrdPiRebuildCutV1 *cut)
+{
+	uint8 joined[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 2 };
+	uint8 excluded[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	ut_jr_setup_3node();
+	cluster_enabled = cluster_shared_config = true;
+	cluster_node_id = 1;
+	ut_mock_routed_master = ut_mock_static_master = 1;
+	ut_mock_epoch = 10;
+	ut_qvotec_quorum = true;
+	ut_admitted_incarnation = 11;
+	ut_membership_generation = 2;
+	ut_remote_boot = 0;
+	ut_formation_unavailable = ut_membership_drift_on_snapshot = false;
+	mock_lms_shard_master_generation = (UINT64_C(10) << 32) | 7;
+	cluster_grd_arm_join_pcm_fence_scope_v1(joined, excluded);
+	cluster_grd_recovery_mark_peer_done(0, 10, 0);
+	cluster_grd_recovery_mark_peer_done(2, 10, 0);
+	UT_ASSERT_EQ(cluster_grd_pi_rebuild_snapshot_v1(cut), 1);
+	MyBackendType = B_BG_WRITER;
+	UT_ASSERT(cluster_grd_pi_rebuild_complete_v1(cut));
+	UT_ASSERT(!cluster_grd_pi_rebuild_gate_v1());
+}
+
+static void
+pi_ready_finish(void)
+{
+	MyBackendType = B_LMON;
+	ut_mock_routed_master = 0;
+	ut_remote_boot = ut_membership_generation = 0;
+	ut_formation_unavailable = ut_membership_drift_on_snapshot = false;
+	cluster_shared_config = false;
+	finish_recovery_control_fixture();
+}
+
+UT_TEST(test_completed_join_pi_gate_has_constant_cost)
+{
+	ClusterGrdPiRebuildCutV1 cut;
+	BufferTag tag = { 0 };
+	pi_ready_fixture(&cut);
+	/* Warm each public service gate once, then count every node lookup. */
+	UT_ASSERT(!cluster_grd_pi_rebuild_blocked_v1(tag));
+	UT_ASSERT(cluster_grd_block_view_rebuilt(tag));
+	ut_node_lookups = 0;
+	for (int i = 0; i < 1000000; i++) {
+		UT_ASSERT(!cluster_grd_pi_rebuild_gate_v1());
+		UT_ASSERT(!cluster_grd_pi_rebuild_blocked_v1(tag));
+		UT_ASSERT(cluster_grd_block_view_rebuilt(tag));
+	}
+	UT_ASSERT_EQ(ut_node_lookups, 0);
+	pi_ready_finish();
+}
+
+/* The production JOIN completion resets direction to NONE. A warmed
+ * service gate must stay local even while another backend owns the PI lock. */
+UT_TEST(test_completed_join_pi_cache_does_not_acquire_pi_lock)
+{
+	ClusterGrdPiRebuildCutV1 cut;
+	BufferTag tag = { 0 };
+	ClusterGrdShared *shared;
+	bool found, gate, blocked, rebuilt;
+	pi_ready_fixture(&cut);
+	shared = ShmemInitStruct("pgrac cluster grd", sizeof(*shared), &found);
+	UT_ASSERT(found);
+	pg_atomic_write_u32(&shared->recovery_direction, GRD_REMASTER_DIR_NONE);
+	UT_ASSERT(!cluster_grd_pi_rebuild_gate_v1());
+	ut_spin_waits = ut_node_lookups = 0;
+	SpinLockAcquire(&shared->pi_rebuild_lock);
+	gate = cluster_grd_pi_rebuild_gate_v1();
+	blocked = cluster_grd_pi_rebuild_blocked_v1(tag);
+	rebuilt = cluster_grd_block_view_rebuilt(tag);
+	SpinLockRelease(&shared->pi_rebuild_lock);
+	UT_ASSERT(!gate && !blocked && rebuilt);
+	UT_ASSERT_EQ(ut_spin_waits, 0);
+	UT_ASSERT_EQ(ut_node_lookups, 0);
+	pi_ready_finish();
+}
+
+UT_TEST(test_completed_join_pi_cache_invalidates_on_scope_and_original_owners)
+{
+	for (int variant = 0; variant < 7; variant++) {
+		ClusterGrdPiRebuildCutV1 cut;
+		ClusterGrdShared *shared;
+		bool found;
+		pi_ready_fixture(&cut);
+		shared = ShmemInitStruct("pgrac cluster grd", sizeof(*shared), &found);
+		UT_ASSERT(found);
+		switch (variant) {
+		case 0:
+			cluster_grd_arm_join_pcm_fence_scope_v1(
+				(const uint8[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES]){ 2 },
+				(const uint8[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES]){ 4 });
+			break;
+		case 1:
+			pg_atomic_fetch_add_u64(&shared->master_map_refresh_count, 1);
+			break;
+		case 2:
+			pg_atomic_fetch_add_u64(&shared->recovery_redeclare_generation, 1);
+			break;
+		case 3:
+			mock_lms_shard_master_generation++;
+			break;
+		case 4:
+			pg_atomic_write_u32(&shared->recovery_state, GRD_RECOVERY_WAIT_BARRIER);
+			break;
+		case 5:
+			ut_membership_generation += 2;
+			ut_member_mask = 3;
+			break;
+		case 6:
+			ut_admitted_incarnation++;
+			break;
+		}
+		UT_ASSERT(cluster_grd_pi_rebuild_gate_v1());
+		UT_ASSERT(!cluster_grd_pi_rebuild_complete_v1(&cut));
+		pi_ready_finish();
+	}
+}
+
+UT_TEST(test_completed_join_pi_cache_revalidates_new_publication_and_episode)
+{
+	ClusterGrdPiRebuildCutV1 cut;
+	ClusterGrdShared *shared;
+	bool found;
+	pi_ready_fixture(&cut);
+	shared = ShmemInitStruct("pgrac cluster grd", sizeof(*shared), &found);
+	UT_ASSERT(found);
+	for (int variant = 0; variant < 3; variant++) {
+		if (variant == 0)
+			UT_ASSERT(cluster_grd_pi_rebuild_complete_v1(&cut));
+		else if (variant == 1)
+			pg_atomic_fetch_add_u64(&shared->recovery_last_event_id, 1);
+		else
+			pg_atomic_fetch_add_u64(&shared->recovery_episode_epoch, 1);
+		ut_node_lookups = 0;
+		UT_ASSERT(!cluster_grd_pi_rebuild_gate_v1());
+		UT_ASSERT(ut_node_lookups > 0);
+		ut_node_lookups = 0;
+		UT_ASSERT(!cluster_grd_pi_rebuild_gate_v1());
+		UT_ASSERT_EQ(ut_node_lookups, 0);
+	}
+	pi_ready_finish();
+}
+
+UT_TEST(test_completed_join_pi_cache_refuses_unstable_publication_and_reattach)
+{
+	ClusterGrdPiRebuildCutV1 cut;
+	ClusterGrdShared *shared;
+	bool found;
+	pi_ready_fixture(&cut);
+	shared = ShmemInitStruct("pgrac cluster grd", sizeof(*shared), &found);
+	UT_ASSERT(found);
+	for (int variant = 0; variant < 2; variant++) {
+		pg_atomic_write_u64(&shared->pi_rebuild_publication, variant == 0 ? 0 : UINT64_MAX);
+		for (int lookup = 0; lookup < 2; lookup++) {
+			ut_node_lookups = 0;
+			UT_ASSERT(!cluster_grd_pi_rebuild_gate_v1());
+			UT_ASSERT(ut_node_lookups > 0);
+		}
+	}
+	/* A later publisher must not wrap an exhausted sequence back to ready. */
+	UT_ASSERT(cluster_grd_pi_rebuild_complete_v1(&cut));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&shared->pi_rebuild_publication), 0);
+	pi_ready_finish();
+
+	pi_ready_fixture(&cut);
+	cluster_grd_shmem_init();
+	ut_node_lookups = 0;
+	UT_ASSERT(!cluster_grd_pi_rebuild_gate_v1());
+	UT_ASSERT(ut_node_lookups > 0);
+	pi_ready_finish();
+}
+
+UT_TEST(test_completed_join_pi_cache_never_crosses_membership_owner_change)
+{
+	ClusterGrdPiRebuildCutV1 cut;
+	pi_ready_fixture(&cut);
+	ut_membership_generation += 2;
+	ut_remote_boot = 12;
+	UT_ASSERT(cluster_grd_pi_rebuild_gate_v1());
+	UT_ASSERT(!cluster_grd_pi_rebuild_complete_v1(&cut));
+	UT_ASSERT_EQ(cluster_grd_pi_rebuild_snapshot_v1(&cut), 1);
+	UT_ASSERT(cluster_grd_pi_rebuild_complete_v1(&cut));
+	UT_ASSERT(!cluster_grd_pi_rebuild_gate_v1());
+	/* An interrupted or missing owner may not use a previous ready cache. */
+	for (int variant = 0; variant < 4; variant++) {
+		uint64 scanned;
+		ut_membership_generation = variant == 0 ? 0 : variant == 1 ? 5 : 6;
+		ut_formation_unavailable = variant == 2;
+		ut_membership_drift_on_snapshot = variant == 3;
+		ut_node_lookups = 0;
+		(void)cluster_grd_pi_rebuild_gate_v1();
+		scanned = ut_node_lookups;
+		UT_ASSERT(scanned > 0);
+		(void)cluster_grd_pi_rebuild_gate_v1();
+		UT_ASSERT(ut_node_lookups > scanned);
+	}
+	pi_ready_finish();
+}
+
 UT_TEST(test_recovery_control_observes_protocol_cut_without_data_thaw)
 {
 	ClusterGrdRecoveryControlSnapshotV1 snapshot;
@@ -7091,7 +7332,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(148);
+	UT_PLAN(154);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
@@ -7233,6 +7474,12 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_redeclare_fresh_join_recipient_accepts_only_its_fence);
 	UT_RUN(test_canonical_space_dead_node_returns_grd_to_normal_after_data_recovery);
 	UT_RUN(test_join_protocol_completes_before_local_pi_service_and_new_cut_invalidates);
+	UT_RUN(test_completed_join_pi_gate_has_constant_cost);
+	UT_RUN(test_completed_join_pi_cache_does_not_acquire_pi_lock);
+	UT_RUN(test_completed_join_pi_cache_invalidates_on_scope_and_original_owners);
+	UT_RUN(test_completed_join_pi_cache_revalidates_new_publication_and_episode);
+	UT_RUN(test_completed_join_pi_cache_refuses_unstable_publication_and_reattach);
+	UT_RUN(test_completed_join_pi_cache_never_crosses_membership_owner_change);
 	UT_RUN(test_control_acquire_waits_for_common_barrier_even_on_normal_shard);
 	UT_RUN(test_control_gate_unknown_cut_never_proves_frozen_or_ready);
 	UT_RUN(test_recovery_control_uses_accepted_epoch_after_observer_bump);

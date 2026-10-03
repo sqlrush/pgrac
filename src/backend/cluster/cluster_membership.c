@@ -45,6 +45,7 @@
  */
 static ClusterMembershipTable LocalMembershipTable;
 static ClusterMembershipTable *MembershipTable = &LocalMembershipTable;
+static pg_atomic_uint64 *MembershipCutGeneration;
 
 /*
  * cluster_membership_attach
@@ -57,6 +58,67 @@ void
 cluster_membership_attach(ClusterMembershipTable *table)
 {
 	MembershipTable = (table != NULL) ? table : &LocalMembershipTable;
+	MembershipCutGeneration = NULL;
+}
+
+
+void
+cluster_membership_attach_cut_generation(pg_atomic_uint64 *generation)
+{
+	MembershipCutGeneration = MembershipTable != &LocalMembershipTable ? generation : NULL;
+}
+
+uint64
+cluster_membership_cut_generation(void)
+{
+	uint64 generation;
+
+	if (MembershipCutGeneration == NULL)
+		return 0;
+	generation = pg_atomic_read_u64(MembershipCutGeneration);
+	pg_read_barrier();
+	return generation != 0 && (generation & 1) == 0 ? generation : 0;
+}
+
+bool
+cluster_membership_cut_generation_current(uint64 expected)
+{
+	pg_read_barrier();
+	return expected != 0 && cluster_membership_cut_generation() == expected;
+}
+
+/* Original Reconfig lock serializes writers. An incomplete publication is
+ * sticky: another mutator may update the table but cannot reopen caching.
+ * This is a cache generation, never a membership or recovery authority. */
+static uint64
+membership_cut_write_begin(void)
+{
+	uint64 generation;
+
+	if (MembershipCutGeneration == NULL)
+		return 0;
+	generation = pg_atomic_read_u64(MembershipCutGeneration);
+	if (generation == 0 || (generation & 1) != 0 || generation >= UINT64_MAX - 1) {
+		pg_atomic_write_u64(MembershipCutGeneration, UINT64_MAX);
+		pg_write_barrier();
+		return 0;
+	}
+	pg_atomic_write_u64(MembershipCutGeneration, generation + 1);
+	pg_write_barrier();
+	return generation;
+}
+
+static void
+membership_cut_write_end(uint64 generation)
+{
+	if (MembershipCutGeneration == NULL)
+		return;
+	pg_write_barrier();
+	if (generation == 0 || pg_atomic_read_u64(MembershipCutGeneration) != generation + 1) {
+		pg_atomic_write_u64(MembershipCutGeneration, UINT64_MAX);
+		return;
+	}
+	pg_atomic_write_u64(MembershipCutGeneration, generation + 2);
 }
 
 /* node_id is a declared-topology index in [0, CLUSTER_MAX_NODES) */
@@ -403,8 +465,11 @@ cluster_membership_record_admitted(int32 node_id, uint64 incarnation)
 	if (!node_id_in_range(node_id))
 		return;
 	if (incarnation > MembershipTable->last_admitted_incarnation[node_id]) {
+		uint64 generation = membership_cut_write_begin();
+
 		cluster_write_fence_authority_cache_invalidate();
 		MembershipTable->last_admitted_incarnation[node_id] = incarnation;
+		membership_cut_write_end(generation);
 	}
 }
 
@@ -425,9 +490,13 @@ cluster_membership_set_state(int32 node_id, ClusterMembershipState state)
 	if (!node_id_in_range(node_id))
 		return;
 	prev = (ClusterMembershipState)MembershipTable->membership_state[node_id];
-	if (prev != state)
+	if (prev != state) {
+		uint64 generation = membership_cut_write_begin();
+
 		cluster_write_fence_authority_cache_invalidate();
-	MembershipTable->membership_state[node_id] = (uint8)state;
+		MembershipTable->membership_state[node_id] = (uint8)state;
+		membership_cut_write_end(generation);
+	}
 
 	/*
 	 * spec-5.22e D5-8: capture the exact epoch at which THIS node becomes
@@ -485,12 +554,16 @@ cluster_membership_shrink_to_removed(int32 node_id, uint64 last_incarnation)
 	if (!node_id_in_range(node_id))
 		return;
 	if (last_incarnation > MembershipTable->last_admitted_incarnation[node_id]
-		|| MembershipTable->membership_state[node_id] != CLUSTER_MEMBER_REMOVED)
+		|| MembershipTable->membership_state[node_id] != CLUSTER_MEMBER_REMOVED) {
+		uint64 generation = membership_cut_write_begin();
+
 		cluster_write_fence_authority_cache_invalidate();
-	/* raise the floor first (monotone) so re-admit must exceed the removed incarnation */
-	if (last_incarnation > MembershipTable->last_admitted_incarnation[node_id])
-		MembershipTable->last_admitted_incarnation[node_id] = last_incarnation;
-	MembershipTable->membership_state[node_id] = (uint8)CLUSTER_MEMBER_REMOVED;
+		/* Publish the raised floor and removal as one cut change. */
+		if (last_incarnation > MembershipTable->last_admitted_incarnation[node_id])
+			MembershipTable->last_admitted_incarnation[node_id] = last_incarnation;
+		MembershipTable->membership_state[node_id] = (uint8)CLUSTER_MEMBER_REMOVED;
+		membership_cut_write_end(generation);
+	}
 }
 
 
