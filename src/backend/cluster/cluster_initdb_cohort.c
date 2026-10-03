@@ -22,6 +22,7 @@
 #include "utils/timestamp.h"
 #include "cluster_initdb_origin_private.h"
 #include "../../bin/initdb/pgrac_wal.h"
+#include "../../bin/initdb/pgrac_side.h"
 
 typedef struct InitdbDirectory
 {
@@ -453,6 +454,35 @@ create_origin_objects(const InitdbDirectory *shared, InitdbOrigin *origins,
 		refuse("cannot complete original anchor namespace");
 }
 
+static void
+create_peer_side(const InitdbDirectory *shared, InitdbOrigin *origins,
+				 const ClusterSharedConfigRef *config)
+{
+	struct stat held, named;
+	int native;
+
+	directory_current(shared);
+	/* Only founder's just-completed native child created this container. */
+	native = openat(shared->fd, "native_side", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (native < 0 || fstat(native, &held) != 0 || !owned_directory(&held))
+		refuse("original native SIDE namespace is invalid");
+	for (int node = 1; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++)
+	{
+		InitdbOrigin *origin = &origins[node];
+		if (!(config->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64)))) continue;
+		control_read(origin, node + 1, config->identity.system_identifier, false);
+		if (creation_cancelled || !pgrac_initdb_side_origin_create(origin->data.fd, native, node))
+			refuse("cannot persist this origin's original native SIDE");
+		control_read(origin, node + 1, config->identity.system_identifier, false);
+		if (fstatat(shared->fd, "native_side", &named, AT_SYMLINK_NOFOLLOW) != 0
+			|| !same_directory(&held, &named))
+			refuse("original native SIDE namespace was replaced");
+	}
+	directory_current(shared);
+	if (fsync(native) != 0 || close(native) != 0 || fsync(shared->fd) != 0)
+		refuse("cannot complete original native SIDE namespace");
+}
+
 void
 ClusterInitdbCohortMain(int argc, char **argv)
 {
@@ -515,6 +545,7 @@ ClusterInitdbCohortMain(int argc, char **argv)
 		for (int i = 0; i < 4; i++) directory_current(&roots[i]);
 	}
 	request_current(&request, ref);
+	create_peer_side(&roots[1], origins, ref);
 	create_origin_objects(&roots[1], origins, ref, incarnation);
 	for (int node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++)
 	{

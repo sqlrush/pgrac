@@ -91,6 +91,19 @@ for my $node (0 .. 3)
 	}
 	ok($pages > 0 && !$wrong, "all origin $node WAL pages were generated with its thread");
 	ok(!-e "$data/global/pgrac_control_binding", 'no PGCB before complete ROOT publication');
+	for my $family ('pg_xact', 'pg_subtrans', 'pg_multixact/offsets', 'pg_multixact/members', 'pg_commit_ts')
+	{
+		my $target = "$temp/valid-data/native_side/origin_$node/$family";
+		ok(-d $target, "origin $node has its native $family directory");
+		my @source = sort map { s{.*/}{}r } glob("$data/$family/*");
+		my @actual = sort map { s{.*/}{}r } glob("$target/*");
+		is_deeply(\@actual, \@source, 'native SIDE file set is exact');
+		for my $name (@actual)
+		{
+			is(sha256_hex(slurp_file("$target/$name")), sha256_hex(slurp_file("$data/$family/$name")),
+				'copied SIDE bytes match this origin');
+		}
+	}
 	my ($generation) = $wal =~ /generation_([0-9]+)$/;
 	my $claim_path = "$wal/pgrac_thread.claim";
 	ok(-f $claim_path, 'original writer has its immutable claim');
