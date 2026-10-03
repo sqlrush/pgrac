@@ -2180,6 +2180,8 @@ test_cluster_page_wal: test_cluster_page_wal.c unit_test.h test_cluster_page_wal
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -lm -o $@
 
 test_cluster_page_data: test_cluster_page_data.c
+test_cluster_pi_writeback: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
+test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
@@ -2198,7 +2200,7 @@ test_cluster_page_data test_cluster_pi_writeback: unit_test.h test_cluster_page_
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c test_cluster_page_data_stable.o test_cluster_page_wal_product.o $(CLUSTER_WAL_CLAIM_O) \
-		$(PAGE_DATA_SPACE_OBJS) \
+		$(PAGE_DATA_SPACE_OBJS) $(PI_WRITEBACK_CODEC_OBJS) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o xlogreader_fs.o \

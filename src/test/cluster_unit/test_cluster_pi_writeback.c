@@ -1798,10 +1798,16 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 	clean();
 }
 
+#include "test_cluster_pi_writeback_v2.inc"
+
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(32);
+	UT_RUN(writeback_v2_has_explicit_data_and_structural_layout);
+	UT_RUN(writeback_v2_rejects_unqualified_structural_values);
+	UT_RUN(writeback_v2_refusals_preserve_outputs_and_reject_old_wire);
+	UT_RUN(writeback_v2_ack_is_only_an_exact_ordered_subset);
 	UT_RUN(remote_physical_ack_runs_actual_ancestry_and_disposal);
 	UT_RUN(writeback_codec_has_exact_bounded_authenticated_facts);
 	UT_RUN(writeback_rejects_foreign_sender_boot_and_changed_master_cut);

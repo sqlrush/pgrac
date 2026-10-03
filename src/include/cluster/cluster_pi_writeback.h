@@ -5,6 +5,8 @@
 
 #include "cluster/cluster_pi_data.h"
 #include "cluster/cluster_wal_writer.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/cluster_space_reservation.h"
 
 #define CLUSTER_PI_WRITEBACK_MAX 16
 #define CLUSTER_PI_WRITEBACK_HEADER_BYTES 176
@@ -33,6 +35,53 @@ typedef struct ClusterPiWritebackMessageV1 {
 	ClusterWalSourceRef peer;
 	ClusterPiDataFactV1 facts[CLUSTER_PI_WRITEBACK_MAX];
 } ClusterPiWritebackMessageV1;
+
+#define CLUSTER_PI_WRITEBACK_DATA_V2 1
+#define CLUSTER_PI_WRITEBACK_STRUCTURAL_V2 2
+#define CLUSTER_PI_WRITEBACK_DATA_BYTES_V2 600
+#define CLUSTER_PI_WRITEBACK_STRUCTURAL_BYTES_V2 1424
+#define CLUSTER_PI_WRITEBACK_MAX_BYTES_V2 \
+	(CLUSTER_PI_WRITEBACK_HEADER_BYTES + CLUSTER_PI_WRITEBACK_MAX * CLUSTER_PI_WRITEBACK_STRUCTURAL_BYTES_V2)
+#define CLUSTER_PI_STRUCTURAL_WAL_FLUSHED UINT32_C(1)
+#define CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK UINT32_C(2)
+#define CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED UINT32_C(4)
+#define CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE UINT32_C(8)
+#define CLUSTER_PI_STRUCTURAL_BASE_DURABLE UINT32_C(16)
+
+/* Wire values only: the terminal binding describes SPACE block zero, while
+ * its master cut selects the old block whose responsibility is being retired.
+ * Neither flags nor decoded bytes certify an actual structural completion. */
+typedef struct ClusterPiStructuralFactV2 {
+	uint32 durability_flags;
+	ClusterPiDataFactV1 terminal;
+	ClusterSpaceStructureChange change;
+	ClusterKoSharedMessageV2 ko;
+} ClusterPiStructuralFactV2;
+
+typedef struct ClusterPiWritebackFactV2 {
+	uint16 kind;
+	union {
+		ClusterPiDataFactV1 data;
+		ClusterPiStructuralFactV2 structural;
+	} proof;
+} ClusterPiWritebackFactV2;
+
+typedef struct ClusterPiWritebackMessageV2 {
+	uint32 verb, count;
+	uint64 nonce, epoch;
+	ClusterWalSourceRef peer;
+	ClusterPiWritebackFactV2 facts[CLUSTER_PI_WRITEBACK_MAX];
+} ClusterPiWritebackMessageV2;
+
+/* Explicit kind/length, canonical bytes and exact ordered ACK subset.
+ * Every refusal preserves outputs, including length. No runtime v2 ingress
+ * or PI retirement authority is installed by these representation helpers. */
+extern bool cluster_pi_writeback_encode_v2(const ClusterPiWritebackMessageV2 *message,
+	uint8 *bytes, Size capacity, Size *length);
+extern bool cluster_pi_writeback_decode_v2(const void *bytes, Size length,
+	ClusterPiWritebackMessageV2 *out);
+extern bool cluster_pi_writeback_ack_matches_v2(const ClusterPiWritebackMessageV2 *request,
+	const ClusterPiWritebackMessageV2 *ack);
 
 typedef struct ClusterPiWritebackNoticeV1 ClusterPiWritebackNoticeV1;
 typedef struct ClusterPiWritebackJobV1 ClusterPiWritebackJobV1;
