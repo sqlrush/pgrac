@@ -584,15 +584,25 @@ cluster_ko_shared_release_v2(ClusterKoCompletionV2 **completion)
 }
 
 static void
-ko_shared_resource_release(ResourceReleasePhase phase, bool commit pg_attribute_unused(),
-	bool top pg_attribute_unused(), void *arg pg_attribute_unused())
+ko_shared_resource_release(ResourceReleasePhase phase, bool commit,
+	bool top, void *arg pg_attribute_unused())
 {
 	ClusterKoCompletionV2 **link = &ko_completions;
+	ResourceOwner parent;
 	if (phase != RESOURCE_RELEASE_BEFORE_LOCKS)
 		return;
+	parent = commit && !top ? ResourceOwnerGetParent(CurrentResourceOwner) : NULL;
 	while (*link != NULL) {
 		ClusterKoCompletionV2 *completion = *link;
 		if (completion->pid == MyProcPid && completion->owner == CurrentResourceOwner) {
+			/* A successful subtransaction does not finish its DDL. Keep the
+			 * same barrier with the parent, just as native transaction locks
+			 * survive; subabort and top-level cleanup still cancel it. */
+			if (parent != NULL) {
+				completion->owner = parent;
+				link = &completion->next;
+				continue;
+			}
 			ko_completion_cancel(completion);
 			*link = completion->next;
 			pfree(completion);

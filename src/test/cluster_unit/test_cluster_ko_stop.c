@@ -56,6 +56,13 @@ static void (*exit_callback)(int, Datum);
 static ResourceReleaseCallback resource_callback;
 ResourceOwner CurrentResourceOwner = (ResourceOwner)1;
 MemoryContext TopTransactionContext = (MemoryContext)1;
+ResourceOwner
+ResourceOwnerGetParent(ResourceOwner owner)
+{
+	Assert(owner == (ResourceOwner)1 || owner == (ResourceOwner)2 || owner == (ResourceOwner)3);
+	return owner == (ResourceOwner)3 ? (ResourceOwner)2
+		: owner == (ResourceOwner)2 ? (ResourceOwner)1 : NULL;
+}
 static int completion_allocations;
 static unsigned gate_calls;
 static unsigned liveness_calls;
@@ -1229,10 +1236,73 @@ UT_TEST(test_shared_completion_raw_copy_and_slot_reuse_do_not_convey_ownership)
 	memset(&storage.contexts[slot], 0, sizeof(storage.contexts[slot]));
 }
 
+UT_TEST(test_shared_subcommit_transfers_original_completion_to_parent)
+{
+	for (unsigned commit = 0; commit < 2; commit++) {
+		ClusterKoCompletionV2 *completion = NULL;
+		ClusterKoSharedMessageV2 original, observed;
+		int requests, removes;
+		const char *reason;
+		reset_test();
+		cluster_shared_config = drive_shared_ack = true;
+		CurrentResourceOwner = (ResourceOwner)3;
+		UT_ASSERT(cluster_ko_shared_begin_v2(space_identity.key.locator,
+			RELPERSISTENCE_PERMANENT, &completion));
+		UT_ASSERT(cluster_ko_shared_read_v2(completion, 1, &original));
+		requests = barrier_requests;
+		removes = barrier_removes;
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true, false, NULL);
+		UT_ASSERT(!cluster_ko_shared_read_v2(completion, 1, &observed));
+		CurrentResourceOwner = (ResourceOwner)2;
+		UT_ASSERT(cluster_ko_shared_read_v2(completion, 1, &observed));
+		UT_ASSERT(memcmp(&original, &observed, sizeof(original)) == 0);
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true, false, NULL);
+		UT_ASSERT(!cluster_ko_shared_read_v2(completion, 1, &observed));
+		CurrentResourceOwner = (ResourceOwner)1;
+		UT_ASSERT(cluster_ko_shared_read_v2(completion, 1, &observed));
+		UT_ASSERT(memcmp(&original, &observed, sizeof(original)) == 0);
+		UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, commit, true, NULL);
+		UT_ASSERT(!cluster_ko_shared_read_v2(completion, 1, &observed));
+		cluster_ko_shared_release_v2(&completion);
+		UT_ASSERT(completion == NULL);
+		UT_ASSERT_EQ(completion_allocations, 0);
+		UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT_EQ(barrier_requests, requests);
+		UT_ASSERT_EQ(barrier_removes, removes);
+	}
+}
+
+UT_TEST(test_shared_subabort_cancels_only_the_child_completion)
+{
+	ClusterKoCompletionV2 *parent = NULL, *child = NULL;
+	const char *reason;
+	reset_test();
+	cluster_shared_config = true;
+	/* This case isolates ResourceOwner cleanup; the preceding test exercises
+	 * real remote ACK handling. No fabricated second ACK/batch is needed. */
+	formation.membership.membership_state[1] = CLUSTER_MEMBER_ABSENT;
+	UT_ASSERT(cluster_ko_shared_begin_v2(space_identity.key.locator,
+		RELPERSISTENCE_PERMANENT, &parent));
+	CurrentResourceOwner = (ResourceOwner)2;
+	UT_ASSERT(cluster_ko_shared_begin_v2(space_identity.key.locator,
+		RELPERSISTENCE_PERMANENT, &child));
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false, NULL);
+	UT_ASSERT(!cluster_ko_shared_covers_v2(child, &space_identity.key, space_identity.incarnation));
+	cluster_ko_shared_release_v2(&child);
+	CurrentResourceOwner = (ResourceOwner)1;
+	UT_ASSERT(cluster_ko_shared_covers_v2(parent, &space_identity.key, space_identity.incarnation));
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	cluster_ko_shared_release_v2(&parent);
+	UT_ASSERT_EQ(completion_allocations, 0);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_READY);
+}
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(32);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
@@ -1263,6 +1333,8 @@ main(void)
 	UT_RUN(test_shared_completion_cleanup_is_owner_scoped_and_no_peer_is_not_an_ack);
 	UT_RUN(test_shared_completion_has_no_handle_after_cancel_or_unsupported_scope);
 	UT_RUN(test_shared_completion_raw_copy_and_slot_reuse_do_not_convey_ownership);
+	UT_RUN(test_shared_subcommit_transfers_original_completion_to_parent);
+	UT_RUN(test_shared_subabort_cancels_only_the_child_completion);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -210,6 +210,9 @@ extern void cluster_ko_flush_and_wait_ack(RelFileLocator rlocator, char relpersi
  * commit, a durable structural effect, an ancestor chain or PI retirement.
  * The legacy wrapper above discards its completion as before. */
 typedef struct ClusterKoCompletionV2 ClusterKoCompletionV2;
+/* Successful subtransaction cleanup transfers this original handle to its
+ * parent ResourceOwner. Subabort/top-level cleanup releases it; this is not
+ * a persistent COMMIT or background structural-retirement certificate. */
 extern bool cluster_ko_shared_begin_v2(RelFileLocator rlocator, char relpersistence,
 	ClusterKoCompletionV2 **out);
 extern bool cluster_ko_shared_covers_v2(const ClusterKoCompletionV2 *completion,
