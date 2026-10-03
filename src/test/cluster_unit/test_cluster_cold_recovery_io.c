@@ -42,6 +42,7 @@
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_wal_restart_read.h"
 #include "cluster/cluster_wal_tail.h"
+#include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/smgr.h"
 

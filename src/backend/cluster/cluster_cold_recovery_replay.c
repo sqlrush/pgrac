@@ -92,6 +92,9 @@ replay_consumed(ColdReplayRun *run, uint32 participant, const ClusterColdReplayR
 {
 	run->consumed[participant]++;
 	run->last_end[participant] = record->end_rec_ptr;
+	run->result->last_read[participant] = record->read_rec_ptr;
+	run->result->last_end[participant] = record->end_rec_ptr;
+	run->result->last_crc[participant] = record->record_crc;
 	if (participant == run->own) {
 		run->result->own_read = record->read_rec_ptr;
 		run->result->own_end = record->end_rec_ptr;

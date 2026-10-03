@@ -1,15 +1,15 @@
 /*-------------------------------------------------------------------------
  *
  * test_cluster_recovery_merge_seal_boundary.h
- *	  Boundary of test_cluster_recovery_merge_seal.c: a four-instance
- *	  cluster whose control roots, external fence, recovery plan and WAL
- *	  stream checks are fixtures.  The root publishers model the two
- *	  failed-writer input transitions (OPEN -> RECOVERY_REQUIRED, then the
- *	  validated tail) on the fixture roots; every other backend service the
- *	  merge module links against aborts if it is reached.
+ *	  Boundary of the merge module's cold preflight and completion tests
+ *	  (test_cluster_recovery_merge_seal.c, ..._complete.c): a four-instance
+ *	  cluster whose control roots, external fence, recovery plan, WAL stream
+ *	  checks and completion handoff are fixtures.  The root publishers model
+ *	  the failed-writer input transitions (OPEN -> RECOVERY_REQUIRED, then
+ *	  the validated tail) and the recovery completion on the fixture roots;
+ *	  every other backend service the module links against aborts.
  *
- *	  Included once by test_cluster_recovery_merge_seal.c, after the
- *	  product source.
+ *	  Included once by each test, after the product source.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -535,6 +535,117 @@ cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin)
 	return CLUSTER_WAL_PIN_OK;
 }
 
+/* ---- the completion handoff (cold completion tests) ---- */
+static ClusterThreadRecoveryAuthorityResultV1 authority_result[NODES + 1];
+static bool patch_refused[NODES + 1];
+static ClusterThreadRecoveryRootFinalizeResultV1 finalize_result[NODES + 1];
+static ClusterWalPinResult pin_seal_result;
+static ClusterRecoverySerialReleaseResult ir_release_result;
+static ClusterWalrReleaseResult pin_release_result;
+static bool pin_sealed;
+
+static void
+completion_reset(void)
+{
+	for (uint16 tid = 0; tid <= NODES; tid++) {
+		authority_result[tid] = CLUSTER_THREAD_AUTHORITY_OK;
+		patch_refused[tid] = false;
+		finalize_result[tid] = CLUSTER_THREAD_ROOT_FINALIZE_OK;
+	}
+	pin_seal_result = CLUSTER_WAL_PIN_OK;
+	ir_release_result = CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED;
+	pin_release_result = CLUSTER_WALR_RELEASE_CONFIRMED;
+	pin_sealed = false;
+}
+
+ClusterThreadRecoveryAuthorityResultV1
+cluster_thread_recovery_authority_revalidate_nowait_v1(
+	const ClusterThreadRecoveryAuthorityV1 *authority)
+{
+	return authority_result[authority->duty->origin_thread_id];
+}
+
+/* As the real builder: only under the held serial guard, only for the
+ * root's whole validated cut. */
+bool
+cluster_thread_recovery_root_complete_patch_build_v1(
+	const ClusterThreadRecoveryAuthorityV1 *authority, XLogRecPtr recovered_through,
+	ClusterControlRootPatch *out_patch)
+{
+	uint16 tid = authority->duty->origin_thread_id;
+
+	event("patch:%u;", (unsigned)tid);
+	memset(out_patch, 0, sizeof(*out_patch));
+	if (patch_refused[tid] || !authority->serial_guard->held
+		|| recovered_through != authority->root_snapshot->validated_tail_lsn_exclusive)
+		return false;
+	out_patch->mask
+		= CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE | CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS;
+	out_patch->expected_lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	out_patch->desired.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	out_patch->desired.recovered_through_lsn_exclusive = recovered_through;
+	return true;
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_seal_for_root_publish(ClusterWalRetentionPin *pin)
+{
+	UT_ASSERT(pin == (void *)&pin_obj);
+	event("seal-pin;");
+	pin_sealed = pin_seal_result == CLUSTER_WAL_PIN_OK;
+	return pin_seal_result;
+}
+
+ClusterRecoverySerialReleaseResult
+cluster_recovery_serial_release_set(ClusterRecoverySerialGuardSet *set)
+{
+	event("release-ir;");
+	if (ir_release_result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED) {
+		for (uint16 i = 0; i < set->count; i++)
+			set->guards[i].release_uncertain = true;
+		return ir_release_result;
+	}
+	memset(set->guards, 0, sizeof(set->guards));
+	set->count = 0;
+	return ir_release_result;
+}
+
+/* Only after confirmed IR release, through the sealed pin. */
+ClusterThreadRecoveryRootFinalizeResultV1
+cluster_thread_recovery_root_finalize_after_ir_v1(const ClusterThreadRecoveryAuthorityV1 *authority,
+												  const ClusterControlRootPatch *patch,
+												  ClusterControlRootSnapshot *out_snapshot)
+{
+	uint16 tid = authority->duty->origin_thread_id;
+	ClusterThreadRecoveryRootFinalizeResultV1 result = finalize_result[tid];
+
+	event("finalize:%u;", (unsigned)tid);
+	UT_ASSERT(!authority->serial_guard->held && !authority->serial_guard->release_uncertain);
+	UT_ASSERT(pin_sealed);
+	UT_ASSERT(authority->retention_pin == (void *)&pin_obj);
+	UT_ASSERT_EQ(patch->desired.recovered_through_lsn_exclusive,
+				 roots[tid].validated_tail_lsn_exclusive);
+	memset(out_snapshot, 0, sizeof(*out_snapshot));
+	if (result == CLUSTER_THREAD_ROOT_FINALIZE_OK) {
+		roots[tid].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+		root_publish(tid);
+	}
+	if (result == CLUSTER_THREAD_ROOT_FINALIZE_OK
+		|| result == CLUSTER_THREAD_ROOT_FINALIZE_ALREADY_COMPLETE)
+		*out_snapshot = roots[tid];
+	return result;
+}
+
+ClusterWalrReleaseResult
+cluster_wal_retention_pin_release(ClusterWalRetentionPin **pin)
+{
+	UT_ASSERT(*pin == (void *)&pin_obj);
+	event("release-pin;");
+	if (pin_release_result == CLUSTER_WALR_RELEASE_CONFIRMED)
+		*pin = NULL;
+	return pin_release_result;
+}
+
 /* ---- linked but never reached by these tests ---- */
 #define UNREACHED() abort()
 
@@ -552,19 +663,6 @@ cluster_recovery_serial_acquire_set(
 	uint16 count pg_attribute_unused(), int overall_acquire_timeout_ms pg_attribute_unused(),
 	ClusterRecoverySerialGuardSet *set pg_attribute_unused(),
 	uint16 *failed_index pg_attribute_unused())
-{
-	UNREACHED();
-}
-
-ClusterRecoverySerialReleaseResult
-cluster_recovery_serial_release_set(ClusterRecoverySerialGuardSet *set pg_attribute_unused())
-{
-	UNREACHED();
-}
-
-ClusterThreadRecoveryAuthorityResultV1
-cluster_thread_recovery_authority_revalidate_nowait_v1(
-	const ClusterThreadRecoveryAuthorityV1 *authority pg_attribute_unused())
 {
 	UNREACHED();
 }
@@ -601,12 +699,6 @@ cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin pg_attribute_unus
 ClusterWalPinResult
 cluster_wal_retention_pin_bind_set(ClusterWalRetentionPin *pin pg_attribute_unused(),
 								   ClusterRecoverySerialGuardSet *held_set pg_attribute_unused())
-{
-	UNREACHED();
-}
-
-ClusterWalrReleaseResult
-cluster_wal_retention_pin_release(ClusterWalRetentionPin **pin pg_attribute_unused())
 {
 	UNREACHED();
 }

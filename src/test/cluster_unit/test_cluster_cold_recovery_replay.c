@@ -379,6 +379,13 @@ UT_TEST(test_replay_follows_schedule_and_drains)
 	UT_ASSERT_EQ(result.pages_skipped, 0);
 	UT_ASSERT_EQ(result.own_read, 0x1300);
 	UT_ASSERT_EQ(result.own_end, 0x1500);
+	/* each participant's last consumed record proves where its cut ended */
+	UT_ASSERT_EQ(result.last_read[0], 0x1300);
+	UT_ASSERT_EQ(result.last_end[0], 0x1500);
+	UT_ASSERT_EQ(result.last_crc[0], identity(&fix[0][3]).record_crc);
+	UT_ASSERT_EQ(result.last_read[1], 0x1100);
+	UT_ASSERT_EQ(result.last_end[1], 0x1300);
+	UT_ASSERT_EQ(result.last_crc[1], identity(&fix[1][1]).record_crc);
 	cluster_cold_plan_destroy_v1(&plan);
 }
 
@@ -506,6 +513,9 @@ UT_TEST(test_replay_history_only_generation)
 	h.stream[1].count = 0;
 	UT_ASSERT_EQ(run(plan, &h, &result), CLUSTER_COLD_REPLAY_OK);
 	UT_ASSERT_EQ(result.own_end, 0x1500);
+	/* nothing of the history-only generation was consumed */
+	UT_ASSERT_EQ(result.last_read[1], InvalidXLogRecPtr);
+	UT_ASSERT_EQ(result.last_end[1], InvalidXLogRecPtr);
 	cluster_cold_plan_destroy_v1(&plan);
 }
 

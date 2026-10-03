@@ -67,6 +67,18 @@ palloc_extended(Size size, int flags)
 	return (flags & MCXT_ALLOC_ZERO) != 0 ? calloc(1, size) : malloc(size);
 }
 
+void *
+palloc(Size size)
+{
+	return malloc(size);
+}
+
+void *
+repalloc(void *pointer, Size size)
+{
+	return realloc(pointer, size);
+}
+
 void
 pfree(void *pointer)
 {
@@ -85,7 +97,10 @@ typedef struct FakeFork {
 } FakeFork;
 
 static FakeFork forks[4];
-static SMgrRelationData smgr_relation;
+/* One open relation per locator, as smgropen keeps them. */
+#define MAX_OPEN_RELATIONS 8
+static SMgrRelationData open_relations[MAX_OPEN_RELATIONS];
+static int open_relation_count;
 static int space_reads;
 static bool header_valid = true;
 static bool checksums_on = true;
@@ -105,6 +120,7 @@ storage_reset(void)
 	space_reads = 0;
 	header_valid = true;
 	checksums_on = true;
+	open_relation_count = 0;
 }
 
 static FakeFork *
@@ -121,10 +137,19 @@ fork_of(SMgrRelation relation, ForkNumber fork)
 SMgrRelation
 smgropen(RelFileLocator locator, BackendId backend)
 {
-	memset(&smgr_relation, 0, sizeof(smgr_relation));
-	smgr_relation.smgr_rlocator.locator = locator;
-	smgr_relation.smgr_rlocator.backend = backend;
-	return &smgr_relation;
+	SMgrRelationData *relation;
+	int i;
+
+	for (i = 0; i < open_relation_count; i++)
+		if (RelFileLocatorEquals(open_relations[i].smgr_rlocator.locator, locator))
+			return &open_relations[i];
+	if (open_relation_count == MAX_OPEN_RELATIONS)
+		abort();
+	relation = &open_relations[open_relation_count++];
+	memset(relation, 0, sizeof(*relation));
+	relation->smgr_rlocator.locator = locator;
+	relation->smgr_rlocator.backend = backend;
+	return relation;
 }
 
 bool
@@ -195,8 +220,8 @@ cluster_cold_classify_page_v1(const char *page, BlockNumber blkno, bool page_hea
 	return true;
 }
 
-static void
-data_page(FakeFork *f, BlockNumber block, char marker, uint64 token)
+static pg_attribute_unused() void data_page(FakeFork *f, BlockNumber block, char marker,
+											uint64 token)
 {
 	memset(f->blocks[block].data, 0, BLCKSZ);
 	f->blocks[block].data[0] = marker;
@@ -230,8 +255,7 @@ cluster_space_identity_page_decode(const void *page, size_t length, ForkNumber f
 	return true;
 }
 
-static void
-identity_page(FakeFork *space, char state, uint8 incarnation)
+static pg_attribute_unused() void identity_page(FakeFork *space, char state, uint8 incarnation)
 {
 	space->exists = true;
 	space->nblocks = Max(space->nblocks, 1);
@@ -436,6 +460,53 @@ cluster_wal_restart_segment_open(const char *wal_root, const ClusterWalSourceRef
 	(void)segsize;
 	*fd_out = segment_open_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ? segment_open_fd : -1;
 	return segment_open_result;
+}
+
+/* ---- the completion barrier: buffer writes and fsync, recorded ---- */
+#define MAX_BARRIER_EVENTS 32
+static char barrier_events[MAX_BARRIER_EVENTS][32];
+static int barrier_event_count;
+
+static void
+barrier_event(char kind, const RelFileLocator *locator, int fork)
+{
+	if (barrier_event_count == MAX_BARRIER_EVENTS)
+		abort();
+	snprintf(barrier_events[barrier_event_count++], sizeof(barrier_events[0]), "%c%u/%d", kind,
+			 (unsigned)locator->relNumber, fork);
+}
+
+void
+FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
+{
+	int i;
+
+	for (i = 0; i < nrels; i++)
+		barrier_event('w', &smgrs[i]->smgr_rlocator.locator, -1);
+}
+
+void
+smgrimmedsync(SMgrRelation relation, ForkNumber fork)
+{
+	barrier_event('s', &relation->smgr_rlocator.locator, (int)fork);
+}
+
+/* The decoded record's block references, as xlogreader reports them. */
+bool
+XLogRecGetBlockTagExtended(XLogReaderState *record, uint8 block_id, RelFileLocator *rlocator,
+						   ForkNumber *forknum, BlockNumber *blknum, Buffer *prefetch_buffer)
+{
+	DecodedBkpBlock *block;
+
+	if (!XLogRecHasBlockRef(record, block_id))
+		return false;
+	block = &record->record->blocks[block_id];
+	*rlocator = block->rlocator;
+	*forknum = block->forknum;
+	*blknum = block->blkno;
+	if (prefetch_buffer != NULL)
+		*prefetch_buffer = InvalidBuffer;
+	return true;
 }
 
 #endif /* TEST_CLUSTER_COLD_RECOVERY_IO_BOUNDARY_H */

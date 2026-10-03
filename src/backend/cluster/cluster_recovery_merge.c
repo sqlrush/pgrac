@@ -1764,6 +1764,77 @@ cluster_recovery_merge_fence_plan_authority(ClusterRecoveryFencePlan *plan, uint
 	return true;
 }
 
+/*
+ * PGRAC (S9P2-05): publish every fenced origin recovered, in the order the
+ * online recovery worker uses for one origin.  Each origin's authority and
+ * terminal patch are taken while the serial set is still held; once the
+ * pin is sealed the serial set is surrendered, and only a confirmed
+ * release lets the finalizer compare-and-swap each root through the sealed
+ * pin.  The first failure stops: later origins stay RECOVERY_REQUIRED and
+ * the next cold start recovers them again.  Author: SqlRush
+ * <sqlrush@gmail.com>
+ */
+ClusterRecoveryFenceCompleteV1
+cluster_recovery_merge_fence_plan_complete_v1(ClusterRecoveryFencePlan *plan, uint16 *failed_thread,
+											  int *failed_detail)
+{
+	ClusterThreadRecoveryAuthorityV1 authority[CLUSTER_WAL_STATE_SLOT_COUNT];
+	ClusterControlRootPatch patch[CLUSTER_WAL_STATE_SLOT_COUNT];
+	ClusterRecoverySerialReleaseResult released;
+	ClusterWalPinResult sealed;
+	ClusterWalrReleaseResult pin_released;
+	uint16 i;
+
+	*failed_thread = 0;
+	*failed_detail = 0;
+	if (!recovery_fence_plan_valid(plan) || !plan->committed || !plan->serial_held
+		|| plan->retention_pin == NULL || plan->origin_count == 0)
+		return CLUSTER_RECOVERY_FENCE_COMPLETE_INVALID;
+	for (i = 0; i < plan->origin_count; i++) {
+		const ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
+
+		*failed_thread = origin->origin_thread;
+		if (!cluster_recovery_merge_fence_plan_authority(plan, origin->origin_thread,
+														 &authority[i]))
+			return CLUSTER_RECOVERY_FENCE_COMPLETE_AUTHORITY;
+		if (!cluster_thread_recovery_root_complete_patch_build_v1(
+				&authority[i], origin->root_snapshot.validated_tail_lsn_exclusive, &patch[i]))
+			return CLUSTER_RECOVERY_FENCE_COMPLETE_PATCH;
+	}
+	*failed_thread = 0;
+	sealed = cluster_wal_retention_pin_seal_for_root_publish(plan->retention_pin);
+	if (sealed != CLUSTER_WAL_PIN_OK) {
+		*failed_detail = (int)sealed;
+		return CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_SEAL;
+	}
+	/* Starting the release surrenders the set's authority (release_serial). */
+	plan->serial_held = false;
+	released = cluster_recovery_serial_release_set(&plan->serial_guards);
+	if (released != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED) {
+		*failed_detail = (int)released;
+		return CLUSTER_RECOVERY_FENCE_COMPLETE_IR_RELEASE;
+	}
+	for (i = 0; i < plan->origin_count; i++) {
+		ClusterThreadRecoveryRootFinalizeResultV1 finalized;
+		ClusterControlRootSnapshot published;
+
+		finalized = cluster_thread_recovery_root_finalize_after_ir_v1(&authority[i], &patch[i],
+																	  &published);
+		if (finalized != CLUSTER_THREAD_ROOT_FINALIZE_OK
+			&& finalized != CLUSTER_THREAD_ROOT_FINALIZE_ALREADY_COMPLETE) {
+			*failed_thread = plan->origins[i].origin_thread;
+			*failed_detail = (int)finalized;
+			return CLUSTER_RECOVERY_FENCE_COMPLETE_FINALIZE;
+		}
+	}
+	pin_released = cluster_wal_retention_pin_release(&plan->retention_pin);
+	if (pin_released != CLUSTER_WALR_RELEASE_CONFIRMED) {
+		*failed_detail = (int)pin_released;
+		return CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_RELEASE;
+	}
+	return CLUSTER_RECOVERY_FENCE_COMPLETE_OK;
+}
+
 bool
 cluster_recovery_merge_fence_plan_release_serial(ClusterRecoveryFencePlan *plan)
 {

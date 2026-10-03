@@ -1,8 +1,9 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_cold_recovery_io.c
- *	  Read-only I/O for typed cold-crash replay: participant census, pass-1
- *	  scans, DATA observation and the pass-2 source reader.
+ *	  I/O for typed cold-crash replay: participant census, pass-1 scans,
+ *	  DATA observation, the pass-2 source reader and the completion proof
+ *	  and durability barrier.
  *
  *	  The census selects, from one cold read scope over every ROOT slot,
  *	  each writer generation with retained WAL: crashed ones are replayed,
@@ -14,7 +15,10 @@
  *	  owner's pass-1 check read storage directly, before replay touches
  *	  shared buffers.  Pass 2 re-reads the same generation through the
  *	  selected restart-input segment opener; the caller compares each record
- *	  with its pass-1 identity.  No function here writes, locks pages or
+ *	  with its pass-1 identity.  Before a replayed generation is published
+ *	  recovered, its pass-2 cut is proven against its ROOT and the files
+ *	  pass 2 changed are made durable (their dirty buffers written, each
+ *	  fork fsynced).  Nothing else here writes; nothing locks pages or
  *	  grants replay authority.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -42,6 +46,7 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
+#include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_control_root.h"
@@ -50,6 +55,7 @@
 #include "cluster/cluster_wal_restart_read.h"
 #include "cluster/cluster_wal_tail.h"
 #include "pgstat.h"
+#include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "storage/smgr.h"
 
@@ -534,6 +540,125 @@ cluster_cold_census_cover_v1(const ClusterColdCensusEntryV1 *entries, uint32 cou
 			return CLUSTER_COLD_CENSUS_UNCOVERED;
 		}
 	return CLUSTER_COLD_CENSUS_OK;
+}
+
+bool
+cluster_cold_completion_proven_v1(const ClusterColdPlanV1 *plan,
+								  const ClusterControlRootSnapshot *root,
+								  const ClusterColdReplayResultV1 *result, uint32 participant)
+{
+	return plan != NULL && root != NULL && result != NULL
+		   && participant < cluster_cold_plan_participant_count_v1(plan)
+		   && result->detail == CLUSTER_COLD_REPLAY_OK
+		   && result->steps_done == cluster_cold_plan_step_count_v1(plan)
+		   && root->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		   && (root->root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID) != 0
+		   && root->tail_last_record_lsn != InvalidXLogRecPtr
+		   && result->last_read[participant] == root->tail_last_record_lsn
+		   && result->last_crc[participant] == root->tail_last_record_crc32c
+		   && result->last_end[participant] == root->validated_tail_lsn_exclusive;
+}
+
+static int
+touched_compare(const RelFileLocator *a, const RelFileLocator *b)
+{
+	if (a->spcOid != b->spcOid)
+		return a->spcOid < b->spcOid ? -1 : 1;
+	if (a->dbOid != b->dbOid)
+		return a->dbOid < b->dbOid ? -1 : 1;
+	if (a->relNumber != b->relNumber)
+		return a->relNumber < b->relNumber ? -1 : 1;
+	return 0;
+}
+
+void
+cluster_cold_touched_add_v1(ClusterColdTouchedV1 *touched, const RelFileLocator *locator,
+							ForkNumber fork)
+{
+	uint32 low = 0;
+	uint32 high;
+
+	Assert(touched != NULL && locator != NULL && fork >= 0 && fork <= MAX_FORKNUM);
+	high = touched->count;
+	while (low < high) {
+		uint32 middle = low + (high - low) / 2;
+		int cmp = touched_compare(&touched->rels[middle].locator, locator);
+
+		if (cmp == 0) {
+			touched->rels[middle].forks |= UINT32_C(1) << fork;
+			return;
+		}
+		if (cmp < 0)
+			low = middle + 1;
+		else
+			high = middle;
+	}
+	if (touched->count == touched->capacity) {
+		touched->capacity = touched->capacity == 0 ? 64 : touched->capacity * 2;
+		touched->rels
+			= touched->rels == NULL
+				  ? palloc(sizeof(ClusterColdTouchedRelV1) * touched->capacity)
+				  : repalloc(touched->rels, sizeof(ClusterColdTouchedRelV1) * touched->capacity);
+	}
+	memmove(&touched->rels[low + 1], &touched->rels[low],
+			sizeof(ClusterColdTouchedRelV1) * (touched->count - low));
+	touched->rels[low].locator = *locator;
+	touched->rels[low].forks = UINT32_C(1) << fork;
+	touched->count++;
+}
+
+/* Every block reference, and the files a creation or truncation changes. */
+void
+cluster_cold_touched_add_record_v1(ClusterColdTouchedV1 *touched, XLogReaderState *record)
+{
+	uint8 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+	int block_id;
+
+	for (block_id = 0; block_id <= XLogRecMaxBlockId(record); block_id++) {
+		RelFileLocator locator;
+		ForkNumber fork;
+		BlockNumber block;
+
+		if (XLogRecGetBlockTagExtended(record, (uint8)block_id, &locator, &fork, &block, NULL))
+			cluster_cold_touched_add_v1(touched, &locator, fork);
+	}
+	if (XLogRecGetRmid(record) != RM_SMGR_ID)
+		return;
+	if (info == XLOG_SMGR_CREATE) {
+		const xl_smgr_create *create = (const xl_smgr_create *)XLogRecGetData(record);
+
+		cluster_cold_touched_add_v1(touched, &create->rlocator, create->forkNum);
+	} else if (info == XLOG_SMGR_TRUNCATE) {
+		const xl_smgr_truncate *truncate = (const xl_smgr_truncate *)XLogRecGetData(record);
+
+		cluster_cold_touched_add_v1(touched, &truncate->rlocator, MAIN_FORKNUM);
+		cluster_cold_touched_add_v1(touched, &truncate->rlocator, FSM_FORKNUM);
+		cluster_cold_touched_add_v1(touched, &truncate->rlocator, VISIBILITYMAP_FORKNUM);
+	}
+}
+
+/* Write every dirty buffer of the touched relations in one pass, then fsync
+ * each touched fork that exists (smgrDoPendingSyncs' pattern). */
+void
+cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched)
+{
+	SMgrRelation *smgrs;
+	uint32 i;
+
+	if (touched == NULL || touched->count == 0)
+		return;
+	smgrs = palloc(sizeof(SMgrRelation) * touched->count);
+	for (i = 0; i < touched->count; i++)
+		smgrs[i] = smgropen(touched->rels[i].locator, InvalidBackendId);
+	FlushRelationsAllBuffers(smgrs, (int)touched->count);
+	for (i = 0; i < touched->count; i++) {
+		ForkNumber fork;
+
+		for (fork = 0; fork <= MAX_FORKNUM; fork++)
+			if ((touched->rels[i].forks & (UINT32_C(1) << fork)) != 0 && smgrexists(smgrs[i], fork))
+				smgrimmedsync(smgrs[i], fork);
+	}
+	pfree(smgrs);
 }
 
 #endif /* USE_PGRAC_CLUSTER */
