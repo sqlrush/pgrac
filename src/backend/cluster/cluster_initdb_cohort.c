@@ -30,6 +30,7 @@
 #include "cluster_initdb_common_private.h"
 #include "cluster_initdb_catalog_private.h"
 #include "cluster_initdb_tree_private.h"
+#include "cluster_cf_contract_private.h"
 #include "../../bin/initdb/pgrac_wal.h"
 #include "../../bin/initdb/pgrac_side.h"
 
@@ -54,9 +55,12 @@ typedef struct InitdbOrigin
 	uint8 control_sha256[32];
 	struct stat control_identity;
 	ClusterInitdbTree wal_observed;
+	ClusterCfContractRecord storage_contract;
+	struct stat storage_contract_identity, storage_contract_directory;
 	bool side_routed;
 	struct stat side_archive;
 	struct stat side_sources[4], side_targets[4], side_links[4];
+	int side_link_fds[4];
 	ClusterInitdbTree side_source_trees[4], side_target_trees[4];
 } InitdbOrigin;
 
@@ -690,12 +694,15 @@ static void
 creation_side_link_current(const InitdbOrigin *origin, unsigned family,
 						   const InitdbDirectory *target)
 {
-	struct stat link, routed;
+	struct stat link, held, routed;
 	const struct stat *expected = &origin->side_links[family];
 	char path[MAXPGPATH];
 	ssize_t length;
 
-	if (fstatat(origin->data.fd, side_families[family], &link, AT_SYMLINK_NOFOLLOW) != 0
+	if (fstat(origin->side_link_fds[family], &held) != 0
+		|| !S_ISLNK(held.st_mode) || held.st_nlink != 1
+		|| held.st_dev != expected->st_dev || held.st_ino != expected->st_ino
+		|| fstatat(origin->data.fd, side_families[family], &link, AT_SYMLINK_NOFOLLOW) != 0
 		|| !S_ISLNK(link.st_mode) || link.st_uid != geteuid() || link.st_nlink != 1
 		|| link.st_dev != expected->st_dev || link.st_ino != expected->st_ino)
 		refuse("original native SIDE link was replaced");
@@ -781,6 +788,18 @@ route_original_side(const InitdbDirectory *shared, InitdbOrigin *origin, unsigne
 		if (symlinkat(targets[i].path, origin->data.fd, side_families[i]) != 0
 			|| fstatat(origin->data.fd, side_families[i], &origin->side_links[i], AT_SYMLINK_NOFOLLOW) != 0)
 			refuse("cannot install original native SIDE link");
+		/* Hold the link itself until this creator exits, including every ROOT
+		 * publication recheck. An unlinked original cannot recycle its inode. */
+#if defined(__APPLE__)
+		origin->side_link_fds[i] = openat(origin->data.fd, side_families[i], O_SYMLINK | O_CLOEXEC);
+#elif defined(__linux__) && defined(O_PATH)
+		origin->side_link_fds[i] = openat(origin->data.fd, side_families[i], O_PATH | O_NOFOLLOW | O_CLOEXEC);
+#else
+		origin->side_link_fds[i] = -1;
+		errno = ENOTSUP;
+#endif
+		if (origin->side_link_fds[i] < 0)
+			refuse("cannot hold original native SIDE link");
 		creation_side_link_current(origin, i, &targets[i]);
 		if (close(sources[i].fd) != 0 || close(targets[i].fd) != 0)
 			refuse("cannot close original native SIDE directories");
@@ -852,6 +871,52 @@ create_catalog_objects(const InitdbDirectory *shared, InitdbOrigin *origins,
 }
 
 static void
+create_storage_contracts(InitdbOrigin *origins, const ClusterSharedConfigRef *config)
+{
+	static const char digits[] = "0123456789abcdef";
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
+		InitdbOrigin *origin = &origins[node];
+		InitdbDirectory global;
+		ClusterCfContractRecord *record = &origin->storage_contract;
+		if (!(config->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64)))) continue;
+		memset(record, 0, sizeof(*record));
+		record->magic = CLUSTER_CF_CONTRACT_MAGIC;
+		record->version = CLUSTER_CF_CONTRACT_VERSION;
+		record->authority_system_identifier = config->identity.system_identifier;
+		for (unsigned i = 0; i < 16; i++) {
+			record->storage_uuid[2 * i] = digits[config->identity.storage_uuid[i] >> 4];
+			record->storage_uuid[2 * i + 1] = digits[config->identity.storage_uuid[i] & 15];
+		}
+		record->state = CLUSTER_CF_CONTRACT_UNVERIFIED;
+		INIT_CRC32C(record->crc);
+		COMP_CRC32C(record->crc, record, offsetof(ClusterCfContractRecord, crc));
+		FIN_CRC32C(record->crc);
+		open_original_child(&origin->data, "global", &global);
+		origin->storage_contract_directory = global.identity;
+		if (!cluster_initdb_object_write_observed(global.fd, "pgrac_cf_contract",
+			(const uint8 *)record, sizeof(*record), &origin->storage_contract_identity))
+			refuse("cannot persist original unverified storage identity");
+		directory_current(&global);
+		if (close(global.fd) != 0) refuse("cannot close original local global directory");
+	}
+}
+
+static void
+creation_storage_current(InitdbOrigin *origin)
+{
+	InitdbDirectory global;
+	open_original_child(&origin->data, "global", &global);
+	if (global.identity.st_dev != origin->storage_contract_directory.st_dev
+		|| global.identity.st_ino != origin->storage_contract_directory.st_ino
+		|| !cluster_initdb_object_recheck(global.fd, "pgrac_cf_contract",
+			(const uint8 *)&origin->storage_contract, sizeof(origin->storage_contract),
+			&origin->storage_contract_identity))
+		refuse("original unverified storage identity changed before ROOT publication");
+	directory_current(&global);
+	if (close(global.fd) != 0) refuse("cannot close original local global directory");
+}
+
+static void
 creation_sources_current(const PgracInitdbCohortContext *request,
 	const ClusterSharedConfigRef *config, InitdbDirectory roots[4], InitdbOrigin *origins,
 	const ClusterInitdbTree *data, const ClusterInitdbTree *undo, bool derived)
@@ -863,6 +928,7 @@ creation_sources_current(const PgracInitdbCohortContext *request,
 		control_read(&origins[node], node + 1, config->identity.system_identifier, false);
 		creation_side_current(&roots[1], &origins[node], node);
 		creation_tree_recheck(origins[node].wal.fd, false, &origins[node].wal_observed);
+		creation_storage_current(&origins[node]);
 	}
 	creation_tree_recheck(roots[1].fd, derived, data);
 	creation_tree_recheck(roots[3].fd, false, undo);
@@ -958,6 +1024,8 @@ create_root_objects(const PgracInitdbCohortContext *request, InitdbDirectory roo
 		creation_hash_feed(hash, origin->wal_observed.content, 32);
 		creation_hash_feed(hash, origin->input.refs.claim_sha256, 32);
 		creation_hash_feed(hash, origin->input.refs.anchor_sha256, 32);
+		creation_storage_current(origin);
+		creation_hash_feed(hash, &origin->storage_contract, sizeof(origin->storage_contract));
 	}
 	creation_hash_finish(hash, header->source_wal_state_sha256);
 	if (!cluster_initdb_tree_read(roots[1].fd, false, &data)
@@ -1112,6 +1180,7 @@ ClusterInitdbCohortMain(int argc, char **argv)
 	request_current(&request, ref);
 	create_peer_side(&roots[1], origins, ref);
 	create_origin_objects(&roots[1], origins, ref, incarnation);
+	create_storage_contracts(origins, ref);
 	create_common_objects(&roots[1], origins, ref, &common);
 	create_undo_directories(&roots[1], ref);
 	for (int node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++)

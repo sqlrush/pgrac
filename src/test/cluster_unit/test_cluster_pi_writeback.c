@@ -115,6 +115,16 @@ rf_side_online_plan_space_terminal_v1(const RfSideOnlinePlanV1 *plan,
 	return false;
 }
 
+bool
+rf_side_online_plan_space_incarnation_end_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterSpaceIdentityKey *key, const uint8 incarnation[16], uint32 completed_operation,
+	RfSideSpaceIncarnationEndV1 *out)
+{
+	/* Structural ancestry executes against the real SIDE planner in page_data.
+	 * This transport fixture cannot fabricate a structural completion. */
+	return false;
+}
+
 uint32
 rf_side_online_plan_space_contribution_count_v1(const RfSideOnlinePlanV1 *plan, uint32 index)
 {
@@ -1822,10 +1832,18 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 	clean();
 }
 
+#include "test_cluster_pi_writeback_v2.inc"
+
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(34);
+	UT_RUN(writeback_v2_origin_receives_original_master_ko);
+	UT_RUN(writeback_v2_origin_rejects_retargeted_or_stale_ko);
+	UT_RUN(writeback_v2_has_explicit_data_and_structural_layout);
+	UT_RUN(writeback_v2_rejects_unqualified_structural_values);
+	UT_RUN(writeback_v2_refusals_preserve_outputs_and_reject_old_wire);
+	UT_RUN(writeback_v2_ack_is_only_an_exact_ordered_subset);
 	UT_RUN(remote_physical_ack_runs_actual_ancestry_and_disposal);
 	UT_RUN(writeback_codec_has_exact_bounded_authenticated_facts);
 	UT_RUN(writeback_rejects_foreign_sender_boot_and_changed_master_cut);

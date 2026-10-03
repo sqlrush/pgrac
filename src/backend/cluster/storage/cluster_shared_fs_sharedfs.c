@@ -595,6 +595,33 @@ cluster_shared_fs_sentinel_read(int fd, PgracSharedControl *out, const char **re
 	return true;
 }
 
+/* The configuration spelling may contain UUID separators; the existing
+ * sentinel and storage identity accessors always use 32 lowercase digits. */
+static bool
+sharedfs_preset_uuid(const char *text, char out[CLUSTER_SHARED_UUID_LEN])
+{
+	size_t len = strlen(text);
+	size_t used = 0;
+	bool nonzero = false;
+
+	if (len != 32 && len != 36)
+		return false;
+	for (size_t i = 0; i < len; i++) {
+		char ch = text[i];
+		if (len == 36 && (i == 8 || i == 13 || i == 18 || i == 23)) {
+			if (ch != '-')
+				return false;
+			continue;
+		}
+		if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) || used >= 32)
+			return false;
+		out[used++] = ch;
+		nonzero |= ch != '0';
+	}
+	out[used] = '\0';
+	return used == 32 && nonzero;
+}
+
 /*
  * cluster_shared_fs_sentinel_attach -- record this node in the shared-root
  *	participant set (postmaster-once; see the init callback).
@@ -608,6 +635,12 @@ cluster_shared_fs_sentinel_attach(void)
 	const char *reason = NULL;
 	bool found = false;
 	uint32 i;
+	char preset[CLUSTER_SHARED_UUID_LEN];
+	bool have_preset = cluster_shared_storage_uuid != NULL && cluster_shared_storage_uuid[0] != '\0';
+
+	if (have_preset && !sharedfs_preset_uuid(cluster_shared_storage_uuid, preset))
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster.shared_storage_uuid is not a valid storage UUID")));
 
 	fd = OpenTransientFile(path, O_RDWR | PG_BINARY);
 	if (fd < 0 && errno == ENOENT)
@@ -632,15 +665,14 @@ cluster_shared_fs_sentinel_attach(void)
 		memset(&ctl, 0, sizeof(ctl));
 		ctl.magic = PGRAC_SHARED_CONTROL_MAGIC;
 		ctl.layout_version = PGRAC_SHARED_CONTROL_VERSION;
-		if (cluster_shared_storage_uuid != NULL && cluster_shared_storage_uuid[0] != '\0')
-			strlcpy(ctl.storage_uuid, cluster_shared_storage_uuid, sizeof(ctl.storage_uuid));
+		if (have_preset)
+			strlcpy(ctl.storage_uuid, preset, sizeof(ctl.storage_uuid));
 		else
 			cluster_shared_fs_sentinel_gen_uuid(ctl.storage_uuid);
 	}
 
 	/* An external preset uuid must match the recorded identity. */
-	if (cluster_shared_storage_uuid != NULL && cluster_shared_storage_uuid[0] != '\0'
-		&& strcmp(ctl.storage_uuid, cluster_shared_storage_uuid) != 0)
+	if (have_preset && strcmp(ctl.storage_uuid, preset) != 0)
 		ereport(
 			FATAL,
 			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

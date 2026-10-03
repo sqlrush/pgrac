@@ -751,6 +751,7 @@ extern ClusterNormalStopPollResult cluster_gcs_block_normal_stop_poll(bool post_
 																	  const char **reason_out);
 extern ClusterNormalStopPollResult
 cluster_gcs_block_normal_stop_local_poll(int *slot_out, const char **reason_out);
+extern ClusterNormalStopPollResult cluster_ko_shared_normal_stop_poll_v2(const char **reason);
 extern ClusterNormalStopPollResult cluster_ko_normal_stop_poll(uint32 *slot_out,
 															   const char **reason_out);
 extern ClusterNormalStopPollResult

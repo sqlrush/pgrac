@@ -13,6 +13,38 @@ static char directory[MAXPGPATH];
 static int root;
 
 static unsigned read_fault;
+static bool same_tick, rewrite_observed;
+static struct stat rewrite_stat;
+
+/* Some filesystems report unchanged timestamps for an equal-length rewrite
+ * in one tick. Keep the real write, and make that syscall result deterministic. */
+static void
+same_tick_stat(struct stat *st)
+{
+	if (!rewrite_observed || st->st_dev != rewrite_stat.st_dev || st->st_ino != rewrite_stat.st_ino)
+		return;
+#ifdef __APPLE__
+	st->st_mtimespec = rewrite_stat.st_mtimespec;
+	st->st_ctimespec = rewrite_stat.st_ctimespec;
+#else
+	st->st_mtim = rewrite_stat.st_mtim;
+	st->st_ctim = rewrite_stat.st_ctim;
+#endif
+}
+static int
+fault_fstat(int fd, struct stat *st)
+{
+	int result = fstat(fd, st);
+	if (result == 0) same_tick_stat(st);
+	return result;
+}
+static int
+fault_fstatat(int fd, const char *name, struct stat *st, int flags)
+{
+	int result = fstatat(fd, name, st, flags);
+	if (result == 0) same_tick_stat(st);
+	return result;
+}
 static ssize_t
 fault_pread(int fd, void *bytes, size_t length, off_t offset)
 {
@@ -21,15 +53,21 @@ fault_pread(int fd, void *bytes, size_t length, off_t offset)
 	if (read_fault == 3) {
 		int writer = openat(root, "mutating", O_WRONLY);
 		ssize_t n = pread(fd, bytes, length, offset);
+		if (same_tick && fstat(fd, &rewrite_stat) != 0) abort();
 		if (writer < 0 || pwrite(writer, "X", 1, 0) != 1 || close(writer) != 0) abort();
+		rewrite_observed = same_tick;
 		read_fault = 0;
 		return n;
 	}
 	return pread(fd, bytes, length, offset);
 }
 #define pread fault_pread
+#define fstat fault_fstat
+#define fstatat fault_fstatat
 #include "../../backend/cluster/cluster_initdb_tree.c"
 #undef pread
+#undef fstat
+#undef fstatat
 
 static void
 put(const char *name, const char *value)
@@ -146,18 +184,37 @@ UT_TEST(recursion_can_fill_and_grow_the_inventory)
 	UT_ASSERT(unlinkat(root, "many", AT_REMOVEDIR) == 0);
 }
 
+UT_TEST(same_tick_rewrite_clears_observation)
+{
+	ClusterInitdbTree out;
+	char first;
+	int fd;
+	put("mutating", "original");
+	same_tick = true;
+	read_fault = 3;
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(!cluster_initdb_tree_read(root, false, &out));
+	UT_ASSERT(zero(&out, sizeof(out)));
+	UT_ASSERT(rewrite_observed && read_fault == 0);
+	fd = openat(root, "mutating", O_RDONLY);
+	UT_ASSERT(fd >= 0 && pread(fd, &first, 1, 0) == 1 && first == 'X' && close(fd) == 0);
+	same_tick = rewrite_observed = false;
+	UT_ASSERT(unlinkat(root, "mutating", 0) == 0);
+}
+
 int main(void)
 {
 	strlcpy(directory, "/tmp/pgrac-tree-XXXXXX", sizeof(directory));
 	if (!mkdtemp(directory)) return 2;
 	root = open(directory, O_RDONLY | O_DIRECTORY);
 	if (root < 0) return 2;
-	UT_PLAN(5);
+	UT_PLAN(6);
 	UT_RUN(empty_and_sorted_tree);
 	UT_RUN(alias_and_unsafe_files_are_not_observations);
 	UT_RUN(recheck_omits_only_creator_derived_objects);
 	UT_RUN(changes_and_io_failure_clear_observation);
 	UT_RUN(recursion_can_fill_and_grow_the_inventory);
+	UT_RUN(same_tick_rewrite_clears_observation);
 	UT_ASSERT(close(root) == 0 && rmdir(directory) == 0);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;

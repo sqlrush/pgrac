@@ -39,6 +39,7 @@
 #include "replication/origin.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
+#include "storage/checksum.h"
 #include "storage/freespace.h"
 #include "storage/smgr.h"
 #include "storage/proc.h"
@@ -105,6 +106,10 @@ static int fail_shrink_sync = -1;
 static unsigned space_flushes, space_syncs;
 static int fail_space_flush, fail_space_sync;
 static PGAlignedBlock written_space[2];
+static unsigned space_readbacks;
+static bool readback_checksums;
+static int readback_fail_block, readback_corrupt_block, readback_corruption;
+static PGAlignedBlock before_space_readback[2];
 static bool cold_truncate_fixture, cold_truncate_permitted, cold_vm_clear, cold_vm_stale;
 static bool cold_main_missing;
 static int cold_fork_flags;
@@ -780,6 +785,9 @@ smgrdounlinkall(SMgrRelation *rels, int count, bool redo)
 		abort();
 	if (drop_owner) {
 		UT_ASSERT_EQ(commit_decisions, 1);
+		UT_ASSERT_EQ(space_flushes, 2);
+		UT_ASSERT_EQ(space_syncs, 1);
+		UT_ASSERT_EQ(space_readbacks, 2);
 		UT_ASSERT_EQ(locked | pinned | CritSectionCount | MyProc->delayChkptFlags, 0);
 		UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, 18);
 		UT_ASSERT_EQ(PageGetLSN(page.data), UINT64_C(0x10000300));
@@ -851,24 +859,68 @@ FlushOneBuffer(Buffer buffer)
 	UT_ASSERT_EQ(pinned, 3);
 	UT_ASSERT_EQ(CritSectionCount, 0);
 	UT_ASSERT_EQ(invalidations, 0);
-	UT_ASSERT_EQ(shrink_syncs, auxiliary_forks ? 3 : 1);
+	if (drop_owner) {
+		UT_ASSERT_EQ(shrink_syncs, 0);
+		UT_ASSERT_EQ(flush_calls, 1);
+		UT_ASSERT_EQ(unlink_calls, 0);
+	} else
+		UT_ASSERT_EQ(shrink_syncs, auxiliary_forks ? 3 : 1);
 	space_flushes++;
 	if (buffer == fail_space_flush)
 		pg_re_throw();
 	memcpy(written_space[buffer - 1].data, pages[buffer - 1].data, BLCKSZ);
+	if (readback_checksums)
+		((PageHeader)written_space[buffer - 1].data)->pd_checksum
+			= pg_checksum_page(written_space[buffer - 1].data, buffer - 1);
+}
+
+bool DataChecksumsEnabled(void) { return readback_checksums; }
+
+void
+smgrread(SMgrRelation rel, ForkNumber fork, BlockNumber block, void *buffer)
+{
+	char *out = buffer;
+	UT_ASSERT(truncate_owner && rel == &storage && fork == SPACE_FORKNUM && block < 2);
+	UT_ASSERT_EQ(space_syncs, 1);
+	UT_ASSERT_EQ(space_flushes, 2);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(pinned, 3);
+	UT_ASSERT_EQ(locked, 3);
+	UT_ASSERT_EQ(invalidations, 0);
+	space_readbacks++;
+	if ((int)block == readback_fail_block)
+		pg_re_throw();
+	memcpy(out, written_space[block].data, BLCKSZ);
+	if ((int)block != readback_corrupt_block)
+		return;
+	switch (readback_corruption) {
+	case 0: out[BLCKSZ - 1] ^= 1; break;
+	case 1: memcpy(out, before_space_readback[block].data, BLCKSZ); break;
+	case 2: PageSetLSN(out, PageGetLSN(out) + 8); break;
+	case 3: ((PageHeader)out)->pd_checksum ^= 1; return;
+	case 4: memset(out, 0, BLCKSZ); return;
+	default: abort();
+	}
+	/* A valid checksum cannot rescue stale or different content. */
+	((PageHeader)out)->pd_checksum = pg_checksum_page(out, block);
 }
 
 void
 smgrimmedsync(SMgrRelation rel, ForkNumber fork)
 {
 	UT_ASSERT((truncate_owner || recovering) && rel == &storage);
-	if (truncate_owner && fork == SPACE_FORKNUM && truncate_calls != 0) {
+	if (truncate_owner && fork == SPACE_FORKNUM && (truncate_calls != 0 || drop_owner)) {
 		UT_ASSERT_EQ(CritSectionCount, 0);
 		UT_ASSERT_EQ(locked, 3);
 		UT_ASSERT_EQ(pinned, 3);
 		UT_ASSERT_EQ(invalidations, 0);
 		UT_ASSERT_EQ(space_flushes, 2);
-		UT_ASSERT_EQ(memcmp(written_space, pages, sizeof(pages)), 0);
+		for (int i = 0; i < 2; i++) {
+			PGAlignedBlock expected = pages[i];
+			if (readback_checksums)
+				((PageHeader)expected.data)->pd_checksum = pg_checksum_page(expected.data, i);
+			UT_ASSERT_EQ(memcmp(written_space[i].data, expected.data, BLCKSZ), 0);
+		}
 		space_syncs++;
 		if (fail_space_sync)
 			pg_re_throw();
@@ -937,6 +989,10 @@ errcode(int code)
 static void
 reset(void)
 {
+	space_readbacks = 0;
+	readback_checksums = false;
+	readback_fail_block = readback_corrupt_block = -1;
+	readback_corruption = 0;
 	if (fake_relation != NULL)
 		abort();
 	fake_allocations = fake_frees = 0;
@@ -1917,6 +1973,7 @@ UT_TEST(test_native_truncate_persists_new_space_before_exposing_incarnation)
 	RelationTruncate(rel, 4);
 	UT_ASSERT_EQ(space_flushes, 2);
 	UT_ASSERT_EQ(space_syncs, 1);
+	UT_ASSERT_EQ(space_readbacks, 2);
 	UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, registered_len, &change));
 	UT_ASSERT(cluster_space_identity_page_decode(written_space[0].data, BLCKSZ, SPACE_FORKNUM, 0,
 												 &change.identity.result.key, &identity, &token));
@@ -1961,6 +2018,60 @@ UT_TEST(test_native_truncate_space_write_or_sync_error_does_not_complete)
 		/* The fixture intercepts PANIC. Production must terminate before
 		 * transaction cleanup exposes this not-yet-durable cached identity
 		 * to another backend; ordinary ERROR would fail this assertion. */
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_native_truncate_readback_requires_every_exact_page)
+{
+	for (int block = 0; block < 2; block++) {
+		for (int fault = -1; fault < 5; fault++) {
+			Relation rel = native_truncate_relation();
+			volatile bool caught = false;
+			readback_checksums = true;
+			memcpy(before_space_readback, pages, sizeof(pages));
+			readback_corrupt_block = fault < 0 ? -1 : block;
+			readback_corruption = fault;
+			expecting_error = fault >= 0;
+			PG_TRY(); { RelationTruncate(rel, 4); }
+			PG_CATCH(); { caught = true; } PG_END_TRY();
+			expecting_error = false;
+			UT_ASSERT_EQ(caught, fault >= 0);
+			UT_ASSERT_EQ(space_readbacks, fault < 0 ? 2 : block + 1);
+			UT_ASSERT_EQ(space_flushes, 2);
+			UT_ASSERT_EQ(space_syncs, 1);
+			UT_ASSERT_EQ(main_blocks, 4);
+			if (fault < 0) {
+				UT_ASSERT_EQ(pinned | locked, 0);
+				UT_ASSERT_EQ(invalidations, 1);
+			} else {
+				UT_ASSERT_EQ(reported_level, PANIC);
+				UT_ASSERT_EQ(pinned, 3);
+				UT_ASSERT_EQ(locked, 3);
+				UT_ASSERT_EQ(invalidations, 0);
+			}
+			FreeFakeRelcacheEntry(rel);
+		}
+	}
+}
+
+UT_TEST(test_native_truncate_readback_io_error_keeps_original_owner)
+{
+	for (int block = 0; block < 2; block++) {
+		Relation rel = native_truncate_relation();
+		volatile bool caught = false;
+		readback_fail_block = block;
+		expecting_error = true;
+		PG_TRY(); { RelationTruncate(rel, 4); }
+		PG_CATCH(); { caught = true; } PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(reported_level, PANIC);
+		UT_ASSERT_EQ(space_readbacks, block + 1);
+		UT_ASSERT_EQ(invalidations, 0);
+		UT_ASSERT_EQ(pinned, 3);
+		UT_ASSERT_EQ(locked, 3);
+		UT_ASSERT_EQ(CritSectionCount, 0);
 		FreeFakeRelcacheEntry(rel);
 	}
 }
@@ -2167,7 +2278,11 @@ UT_TEST(test_drop_pair_stays_live_until_native_commit_is_durable)
 	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 	END_CRIT_SECTION();
 	cluster_space_drop_finish(state);
-	UT_ASSERT_EQ(unlink_calls + truncate_calls + fork_syncs + relation_flushes, 0);
+	UT_ASSERT_EQ(unlink_calls + truncate_calls + relation_flushes, 0);
+	UT_ASSERT_EQ(space_flushes, 2);
+	UT_ASSERT_EQ(space_syncs, 1);
+	UT_ASSERT_EQ(space_readbacks, 2);
+	UT_ASSERT_EQ(fork_syncs, 1);
 	UT_ASSERT(!locked && !pinned);
 	FreeFakeRelcacheEntry(rel);
 }
@@ -2189,8 +2304,96 @@ UT_TEST(test_drop_precommit_failure_or_abandonment_preserves_live_pages)
 			cluster_space_drop_finish(state);
 		UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
 		UT_ASSERT_EQ(unlink_calls + truncate_calls + wal_calls + dirty_calls, 0);
+		UT_ASSERT_EQ(space_flushes + space_syncs + space_readbacks, 0);
 		UT_ASSERT(!locked && !pinned);
 		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+static ClusterSpaceDropState *
+publish_drop_for_finish(void)
+{
+	ClusterSpaceDropState *state;
+
+	drop_owner = true;
+	state = cluster_space_drop_prepare(&locator, 1);
+	if (state == NULL)
+		abort();
+	START_CRIT_SECTION();
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	emit_drop_commit(state, &locator, 1);
+	XLogFlush(UINT64_C(0x10000300));
+	cluster_space_drop_publish(state, UINT64_C(0x10000300));
+	MyProc->delayChkptFlags = 0;
+	END_CRIT_SECTION();
+	return state;
+}
+
+UT_TEST(test_native_drop_durable_finish_io_failure_keeps_original_owner)
+{
+	for (int failure = 0; failure < 5; failure++) {
+		Relation rel = native_truncate_relation();
+		ClusterSpaceDropState *state = publish_drop_for_finish();
+		PGAlignedBlock published[2];
+		volatile bool caught = false;
+		unsigned releases = release_calls;
+
+		memcpy(published, pages, sizeof(published));
+		fail_space_flush = failure < 2 ? failure + 1 : 0;
+		fail_space_sync = failure == 2;
+		readback_fail_block = failure >= 3 ? failure - 3 : -1;
+		expecting_error = true;
+		PG_TRY(); { cluster_space_drop_finish(state); }
+		PG_CATCH(); { caught = true; } PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(reported_level, PANIC);
+		UT_ASSERT_EQ(space_flushes, failure < 2 ? failure + 1 : 2);
+		UT_ASSERT_EQ(space_syncs, failure >= 2 ? 1 : 0);
+		UT_ASSERT_EQ(space_readbacks, failure >= 3 ? failure - 2 : 0);
+		UT_ASSERT_EQ(release_calls, releases);
+		UT_ASSERT_EQ(pinned, 3);
+		UT_ASSERT_EQ(locked, 3);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(unlink_calls + invalidations, 0);
+		UT_ASSERT_EQ(memcmp(published, pages, sizeof(published)), 0);
+		/* Intercept PANIC only in this fixture. A durable COMMIT cannot be
+		 * turned into abort or let unlink proceed after an unproved write. */
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_native_drop_durable_finish_requires_each_exact_page)
+{
+	for (int block = 0; block < 2; block++) {
+		for (int fault = -1; fault < 5; fault++) {
+			Relation rel = native_truncate_relation();
+			ClusterSpaceDropState *state;
+			volatile bool caught = false;
+
+			readback_checksums = true;
+			memcpy(before_space_readback, pages, sizeof(pages));
+			state = publish_drop_for_finish();
+			readback_corrupt_block = fault < 0 ? -1 : block;
+			readback_corruption = fault;
+			expecting_error = fault >= 0;
+			PG_TRY(); { cluster_space_drop_finish(state); }
+			PG_CATCH(); { caught = true; } PG_END_TRY();
+			expecting_error = false;
+			UT_ASSERT_EQ(caught, fault >= 0);
+			UT_ASSERT_EQ(space_flushes, 2);
+			UT_ASSERT_EQ(space_syncs, 1);
+			UT_ASSERT_EQ(space_readbacks, fault < 0 ? 2 : block + 1);
+			UT_ASSERT_EQ(unlink_calls + truncate_calls + invalidations, 0);
+			if (fault < 0)
+				UT_ASSERT_EQ(pinned | locked, 0);
+			else {
+				UT_ASSERT_EQ(reported_level, PANIC);
+				UT_ASSERT_EQ(pinned, 3);
+				UT_ASSERT_EQ(locked, 3);
+			}
+			FreeFakeRelcacheEntry(rel);
+		}
 	}
 }
 
@@ -2584,11 +2787,15 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(53);
+	UT_PLAN(57);
+	UT_RUN(test_native_drop_durable_finish_io_failure_keeps_original_owner);
+	UT_RUN(test_native_drop_durable_finish_requires_each_exact_page);
 	UT_RUN(test_cold_physical_truncate_touches_only_named_forks);
 	UT_RUN(test_cold_physical_truncate_leaves_already_short_forks_alone);
 	UT_RUN(test_native_truncate_persists_new_space_before_exposing_incarnation);
 	UT_RUN(test_native_truncate_space_write_or_sync_error_does_not_complete);
+	UT_RUN(test_native_truncate_readback_requires_every_exact_page);
+	UT_RUN(test_native_truncate_readback_io_error_keeps_original_owner);
 	UT_RUN(test_cold_physical_preflight_checks_vm_without_truncation_or_fsm_writes);
 	UT_RUN(test_native_cold_commit_later_refusal_keeps_all_targets_unmodified);
 	UT_RUN(test_native_cold_commit_uses_already_proof_without_local_flush_or_rewrite);

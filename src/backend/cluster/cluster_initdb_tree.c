@@ -64,22 +64,31 @@ tree_file(int fd, const struct stat *before, uint8 hash[32])
 {
 	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
 	uint8 bytes[65536];
+	uint8 observed[2][32];
 	struct stat after;
-	off_t offset = 0;
 	bool ok = false;
 	if (ctx == NULL) return false;
-	if (pg_cryptohash_init(ctx) < 0) goto done;
-	for (;;)
+	/* Creation owns this directory exclusively. A second observation also
+	 * catches an accidental equal-length rewrite inside one timestamp tick. */
+	for (unsigned pass = 0; pass < 2; pass++)
 	{
-		ssize_t n = pread(fd, bytes, sizeof(bytes), offset);
-		if (n < 0 && errno == EINTR) continue;
-		if (n < 0 || n > before->st_size - offset) goto done;
-		if (n == 0) break;
-		if (pg_cryptohash_update(ctx, bytes, n) < 0) goto done;
-		offset += n;
+		off_t offset = 0;
+		if (pg_cryptohash_init(ctx) < 0) goto done;
+		for (;;)
+		{
+			ssize_t n = pread(fd, bytes, sizeof(bytes), offset);
+			if (n < 0 && errno == EINTR) continue;
+			if (n < 0 || n > before->st_size - offset) goto done;
+			if (n == 0) break;
+			if (pg_cryptohash_update(ctx, bytes, n) < 0) goto done;
+			offset += n;
+		}
+		if (offset != before->st_size || fstat(fd, &after) != 0 || !tree_same(before, &after)
+			|| pg_cryptohash_final(ctx, observed[pass], 32) < 0) goto done;
 	}
-	if (offset != before->st_size || fstat(fd, &after) != 0 || !tree_same(before, &after)) goto done;
-	ok = pg_cryptohash_final(ctx, hash, 32) >= 0;
+	if (memcmp(observed[0], observed[1], 32) != 0) goto done;
+	memcpy(hash, observed[0], 32);
+	ok = true;
 done:
 	pg_cryptohash_free(ctx);
 	return ok;

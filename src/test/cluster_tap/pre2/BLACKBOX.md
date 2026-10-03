@@ -41,13 +41,16 @@ those entries exist, leave them absent. An empty mapping fails:
 {"version": 1, "initialize": [], "operations": {}}
 ```
 
-`initialize` is an ordered list of objects with `tool: "pgrac-init"` and an
-`argv` string array. Exactly one invocation must contain `--cluster-seed`.
+`initialize` is either an ordered list of objects with `tool: "pgrac-init"`
+and exactly one `--cluster-seed`, or one `tool: "initdb"` invocation with
+`--pgrac-initdb-cohort` and `--pgrac-initdb-shared-config=...`.
 All DATA/shared/WAL/voting paths must be newly created by the supported product
 initializer. `--force`, `--join-from` and `--join-from-backup` are refused.
 Do not clone a backup, strip backup_label, patch root/control/voting bytes,
-or create multiple unrelated seed databases. The adapter never runs initdb,
-copies database files or formats voting disks itself.
+or create multiple unrelated seed databases. The native cohort variant runs
+the product creator once for the complete fixed member set, then moves each
+unmodified member directory to its allocated TAP DATA path, preserving symlinks.
+It creates no control, ROOT, membership or recovery records.
 
 Argument substitutions are individual argv strings, without shell expansion:
 `${root}`, `${name}`, `${shared_data_dir}`, `${wal_root}`, `${layout_file}`,
@@ -57,6 +60,51 @@ The layout input file also supplies three fresh voting paths and `extra_conf`.
 The supported initializer must consume the complete topology and apply its
 ports, per-node identities and settings. There is no test-side activation or
 fallback configuration patch. No new `pgrac-init` option is presumed here.
+
+### Local Linux quorum controller
+
+`cohort_probe.py` supplies a disposable two- or four-member Corosync cluster,
+TLS-required net/lms qdevice, a separate qnetd namespace and three fresh loop
+devices. Use a development VM with root namespace/loop access and unpacked
+Corosync packages in `--vendor` (currently Linux ARM64). It runs no system
+services and does not qualify physical fencing. The native voting helper must
+be built from the same candidate source and installed headers/libraries:
+
+```sh
+cc -D_GNU_SOURCE -ffunction-sections -fdata-sections \
+  -I "$install/include/server" -I "$source/src/include" \
+  src/test/cluster_tap/pre2/native_vote.c \
+  "$source/src/backend/cluster/cluster_voting_disk_io.c" \
+  "$install/lib/libpgport.a" -Wl,--gc-sections -o /new/path/native_vote
+sudo python3 src/test/cluster_tap/pre2/cohort_probe.py \
+  --output /new/result/directory --vendor /path/to/unpacked-packages \
+  --install /path/to/candidate/install --vote-formatter /new/path/native_vote \
+  --source CANDIDATE_COMMIT --nodes 4 --uid DATABASE_UID --gid DATABASE_GID \
+  --tap-source /path/to/test/checkout \
+  --pg-regress /path/to/candidate/install/lib/pgxs/src/test/regress/pg_regress
+```
+
+Use `--nodes 2` without `--tap-source` for the two-member probe. Existing output
+is refused; DATA, logs, configuration and every failed attempt are retained.
+Only this controller's processes, loop handles and network bridge are removed
+on exit. Its immediate error cleanup cannot prove normal shutdown or CLOSED.
+
+The controller's `entry.json` is usable by ClusterPRE2 only while its namespaces
+and devices remain owned and live. The adapter rechecks quorum, native raw I/O
+attestation and namespace identity before fresh creation. Initial vote images
+use the original formatter with exclusive creation and native CRC readback;
+no runtime vote or admission witness is synthesized. TAP vote paths are aliases
+to the newly attached devices. Scalar `extra_conf` settings go into the native
+creation input in their COMMON/INSTANCE scope, never into a late local
+override. Identity/topology overrides and unsupported assignment syntax are
+refused; the original producer remains responsible for GUC qualification.
+
+No lifecycle observation is advertised by default. Pass `--operations` with a
+JSON mapping to actual installed SQL/CLI observations once available. The
+unmodified 431/432/433 tests fail before DATA creation on missing observations.
+Their raw TAP status remains FAIL, with the exact absent dependency recorded
+as BLOCKED. The independent startup probe still attempts native creation and
+startup, keeping product failures distinct from absent acceptance observations.
 
 `operations` maps each name below to either:
 

@@ -557,6 +557,19 @@ cluster_wal_thread_id(void)
 	return 1;
 }
 
+const char *
+cluster_qvotec_get_quorum_state_name(void)
+{
+	return "FIXTURE";
+}
+bool
+cluster_formation_witness_last_diagnostic_v1(ClusterFormationWitnessDiagnosticV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->predicate = "fixture";
+	return true;
+}
+
 ClusterFormationWitnessResult
 cluster_formation_witness_build_live_wait(uint16 origin_thread pg_attribute_unused(),
 										  int timeout_ms pg_attribute_unused(),

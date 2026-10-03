@@ -434,6 +434,43 @@ UT_TEST(shared_census_cannot_lose_exited_owner_or_aba)
 	UT_ASSERT(!cluster_control_request_census_unchanged(cut.epoch, version));
 }
 
+/* Initial recovery formation has epoch zero, before any control grant is
+ * legal.  It still needs an initialized, revision-stable EMPTY census. */
+UT_TEST(initial_formation_census_proves_empty_without_authorizing_epoch_zero)
+{
+	ClusterControlRequestHandle handle = { 0 };
+	ClusterControlRetireMessage message;
+	uint64 initial_version, version, driver;
+
+	reset();
+	UT_ASSERT(cluster_control_request_census(0, &initial_version));
+	UT_ASSERT(initial_version != 0);
+	UT_ASSERT(cluster_control_request_census_unchanged(0, initial_version));
+	UT_ASSERT(!cluster_control_request_census(0, NULL));
+	key.holder.cluster_epoch = 0;
+	UT_ASSERT(!cluster_control_request_register(&key, ExclusiveLock, &owner, 0, NoLock, &handle));
+	key.holder.cluster_epoch = cut.epoch;
+	handle = registration(0);
+	UT_ASSERT(!cluster_control_request_census(0, &version));
+	UT_ASSERT_EQ(version, 0);
+	UT_ASSERT(cluster_control_request_mark_held(&handle, &owner));
+	UT_ASSERT(!cluster_control_request_census(0, &version));
+	UT_ASSERT_EQ(version, 0);
+	UT_ASSERT(cluster_control_request_census(cut.epoch, &version));
+	cluster_control_request_owner_exit(&owner);
+	UT_ASSERT(!cluster_control_request_census(0, &version));
+	driver = cluster_control_request_driver_start();
+	UT_ASSERT(cluster_control_request_claim(&handle, driver, &cut, &message));
+	message.verb = CLUSTER_CONTROL_RETIRED;
+	UT_ASSERT(cluster_control_request_ack(&message, cut.master, driver, &cut));
+	UT_ASSERT(!cluster_control_request_census(0, &version));
+	UT_ASSERT(cluster_control_request_forget(&handle, &owner, &cut));
+	UT_ASSERT(cluster_control_request_census(0, &version));
+	UT_ASSERT(version != initial_version);
+	UT_ASSERT(!cluster_control_request_census_unchanged(0, initial_version));
+	UT_ASSERT(cluster_control_request_census_unchanged(0, version));
+}
+
 UT_TEST(rebuild_restore_cannot_consume_an_unrelated_terminal_attempt)
 {
 	ClusterControlRequestHandle original, failed, decoy;
@@ -502,7 +539,7 @@ UT_TEST(rebuild_can_reissue_rejected_restore_but_invalid_is_not_terminal)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(only_canonical_control_resources_are_registered);
 	UT_RUN(producer_fence_is_one_way_and_unknown_is_not_permission);
 	UT_RUN(retry_and_wrong_ack_do_not_erase_cleanup_debt);
@@ -514,6 +551,7 @@ main(void)
 	UT_RUN(confirmed_upgrade_and_downgrade_do_not_replay_old_mode);
 	UT_RUN(surrendered_upgrade_cannot_restore_an_already_retired_share);
 	UT_RUN(shared_census_cannot_lose_exited_owner_or_aba);
+	UT_RUN(initial_formation_census_proves_empty_without_authorizing_epoch_zero);
 	UT_RUN(rebuild_restore_cannot_consume_an_unrelated_terminal_attempt);
 	UT_RUN(rebuild_can_reissue_rejected_restore_but_invalid_is_not_terminal);
 	UT_DONE();

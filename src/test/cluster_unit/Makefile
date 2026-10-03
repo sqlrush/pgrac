@@ -921,6 +921,16 @@ test_cluster_startup_early_native.inc: $(top_srcdir)/src/backend/access/transam/
 	     /^}/ { owner=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Execute the control selection before native startup ownership is acquired.
+test_cluster_startup_control_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^StartupXLOG\(/ { owner=1 } \
+	     owner && /CurrentResourceOwner = AuxProcessResourceOwner;/ { boundary=1; next } \
+	     boundary && /^\#ifdef USE_PGRAC_CLUSTER/ { emit=1; boundary=0; count++ } \
+	     emit && /Check that contents look valid/ { complete=1; exit } \
+	     emit { if (have_line) print previous; previous=$$0; have_line=1 } \
+	     END { if (count != 1 || !complete) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_startup_directory_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^ValidateXLOGDirectoryStructure\(/ { print "static void"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
@@ -961,7 +971,7 @@ test_cluster_checkpoint_shutdown_begin.inc: $(top_srcdir)/src/backend/access/tra
 	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_startup_writer_native.inc test_cluster_startup_early_native.inc test_cluster_startup_directory_native.inc test_cluster_startup_insert_native.inc test_cluster_startup_lsn_native.inc test_cluster_startup_reserve_native.inc test_cluster_checkpoint_candidate.inc test_cluster_checkpoint_shutdown_begin.inc unit_test.h
+test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_startup_writer_native.inc test_cluster_startup_early_native.inc test_cluster_startup_control_native.inc test_cluster_startup_directory_native.inc test_cluster_startup_insert_native.inc test_cluster_startup_lsn_native.inc test_cluster_startup_reserve_native.inc test_cluster_checkpoint_candidate.inc test_cluster_checkpoint_shutdown_begin.inc unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # PGRAC: actual checkpoint scan, pin/refusal consumer and IO-completion bodies.
@@ -1340,9 +1350,9 @@ test_cluster_page_dependency: test_cluster_page_dependency.c unit_test.h \
 		$(CLUSTER_THREAD_RECOVERY_FABRIC_SCAN_O) $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 		$(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) $(CLUSTER_BLOCK_APPLY_O) \
 		test_cluster_space_bufpage_product.o test_cluster_page_dependency_base.o xlogreader_fs.o \
-		$(XLOG_PAGE_EDGE_ENCODER_O) \
+		$(XLOG_PAGE_EDGE_ENCODER_O) $(CLUSTER_WAL_CLAIM_O) \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
-		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto -llz4 -lzstd -o $@
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto $(filter -llz4 -lzstd,$(LIBS)) -o $@
 
 $(CLUSTER_PAGE_REPLAY_BATCH_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_page_replay_batch.c \
@@ -2169,13 +2179,19 @@ test_cluster_page_wal: test_cluster_page_wal.c unit_test.h test_cluster_page_wal
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -lm -o $@
 
+test_cluster_page_data_scn.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c Makefile
+	awk '/^scn_(time|total)_cmp\(/ { print "int"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@
+
 test_cluster_page_data: test_cluster_page_data.c
+test_cluster_pi_writeback: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
+test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_data_wire.h
-test_cluster_page_data test_cluster_pi_writeback: unit_test.h test_cluster_page_data.inc \
+test_cluster_page_data test_cluster_pi_writeback: unit_test.h test_cluster_page_data.inc test_cluster_page_data_scn.inc \
 		test_cluster_block_redeclare_scan.inc \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h $(CLUSTER_WAL_CLAIM_O) \
@@ -2188,7 +2204,7 @@ test_cluster_page_data test_cluster_pi_writeback: unit_test.h test_cluster_page_
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c test_cluster_page_data_stable.o test_cluster_page_wal_product.o $(CLUSTER_WAL_CLAIM_O) \
-		$(PAGE_DATA_SPACE_OBJS) \
+		$(PAGE_DATA_SPACE_OBJS) $(PI_WRITEBACK_CODEC_OBJS) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o xlogreader_fs.o \
@@ -2301,11 +2317,13 @@ test_cluster_space_commit_emit.inc: $(top_srcdir)/src/backend/access/transam/xac
 	mv $@.tmp $@
 
 test_cluster_space_storage: test_cluster_space_storage.c test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc unit_test.h test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o test_cluster_side_xact_xactdesc.o \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
 		test_cluster_space_xlogutils_product.o \
 		test_cluster_space_storage_product.o $(CLUSTER_HW_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		test_cluster_space_storage_product.o test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o \
+		$(top_builddir)/src/backend/storage/page/checksum.o \
 		test_cluster_space_xlogutils_product.o test_cluster_side_xact_xactdesc.o $(CLUSTER_HW_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
@@ -4187,6 +4205,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_block_redeclare_scan.inc
 	rm -f test_cluster_space_recovery_flush.inc
 	rm -f test_cluster_page_data.inc
+	rm -f test_cluster_page_data_scn.inc
 	rm -f test_cluster_page_wal_insert.inc
 	rm -f test_cluster_hw_remaster_native.inc
 	rm -f test_cluster_hw_authority_gate.inc
@@ -4678,6 +4697,7 @@ $(HW_HANDOFF_OBJECTS): hw_handoff_%.o: $(top_srcdir)/src/backend/cluster/%.c \
 
 test_cluster_hw_handoff: test_cluster_hw_handoff.c test_cluster_grd.c unit_test.h \
         test_cluster_grd_stop_types.inc \
+        test_cluster_grd_routing.inc test_cluster_hw_authority_gate.inc \
         $(HW_HANDOFF_OBJECTS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(HW_HANDOFF_OBJECTS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
@@ -4689,6 +4709,7 @@ test_cluster_hw_handoff: test_cluster_hw_handoff.c test_cluster_grd.c unit_test.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_control_retire_master: test_cluster_control_retire_master.c test_cluster_hw_handoff.c test_cluster_grd.c unit_test.h \
         test_cluster_grd_stop_types.inc \
+        test_cluster_grd_routing.inc test_cluster_hw_authority_gate.inc \
 		$(HW_HANDOFF_OBJECTS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(HW_HANDOFF_OBJECTS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
@@ -4696,6 +4717,7 @@ test_cluster_control_retire_master: test_cluster_control_retire_master.c test_cl
 
 test_cluster_control_cf_poll: test_cluster_control_cf_poll.c test_cluster_hw_handoff.c test_cluster_grd.c unit_test.h \
         test_cluster_grd_stop_types.inc \
+        test_cluster_grd_routing.inc test_cluster_hw_authority_gate.inc \
 		$(HW_HANDOFF_OBJECTS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(HW_HANDOFF_OBJECTS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
@@ -5694,11 +5716,12 @@ test_cluster_rdma_stop: test_cluster_rdma_stop.c test_cluster_rdma_stop.inc unit
 test_cluster_rdma_stop_disabled: test_cluster_rdma_stop.c test_cluster_rdma_stop.inc unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DPGRAC_TEST_RDMA_DISABLED $< -o $@
 
-test_cluster_ko_stop: test_cluster_ko_stop.c unit_test.h $(CLUSTER_HW_LEASE_O) \
-		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_HW_LEASE_O) \
-		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
-		$(top_builddir)/src/common/libpgcommon_srv.a \
+test_cluster_ko_stop: test_cluster_ko_stop.c unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
+		$(top_srcdir)/src/include/cluster/cluster_ko.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(filter -lcrypto,$(LIBS)) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_storage_quorum: test_cluster_storage_quorum.c unit_test.h \
@@ -7326,6 +7349,9 @@ test_cluster_recovery_plan: test_cluster_recovery_plan.c unit_test.h \
 # PGRAC: legacy routing helpers plus real v2 claim codec/filesystem reader.
 # Author: SqlRush <sqlrush@gmail.com>
 CLUSTER_WAL_CLAIM_O = $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
+
+# Declare this after the object variable; the recipe retains the real validator.
+test_cluster_page_dependency: $(CLUSTER_WAL_CLAIM_O)
 # PGRAC: actual native segment selection with real generation files.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_native_wal_read.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile

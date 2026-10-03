@@ -4,6 +4,8 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
+#include "access/xact.h"
+#include "catalog/storage_xlog.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_guc.h"
@@ -25,6 +27,10 @@
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "cluster_pi_data_wire.h"
+
+StaticAssertDecl(CLUSTER_SPACE_STRUCTURE_WAL_BYTES == 656, "structural receipt SPACE layout");
+StaticAssertDecl(CLUSTER_KO_SHARED_V2_BYTES == 160, "structural receipt KO layout");
+StaticAssertDecl(CLUSTER_PI_WRITEBACK_MAX_BYTES_V2 == 22960, "bounded v2 writeback frame");
 
 #define WB_RETRY_US INT64CONST(100000)
 enum { WB_EMPTY, WB_QUEUED, WB_RUNNING, WB_REPLIED };
@@ -409,6 +415,261 @@ cluster_pi_writeback_decode_v1(const void *data, Size length, ClusterPiWriteback
 	if (!wb_message_valid(&m))
 		return false;
 	*out = m;
+	return true;
+}
+
+static const ClusterPiDataFactV1 *
+wb_v2_page(const ClusterPiWritebackFactV2 *fact)
+{
+	if (fact->kind == CLUSTER_PI_WRITEBACK_DATA_V2)
+		return &fact->proof.data;
+	if (fact->kind == CLUSTER_PI_WRITEBACK_STRUCTURAL_V2)
+		return &fact->proof.structural.terminal;
+	return NULL;
+}
+
+static Size
+wb_v2_fact_bytes(const ClusterPiWritebackFactV2 *fact)
+{
+	return fact->kind == CLUSTER_PI_WRITEBACK_DATA_V2 ? CLUSTER_PI_WRITEBACK_DATA_BYTES_V2
+		: CLUSTER_PI_WRITEBACK_STRUCTURAL_BYTES_V2;
+}
+
+static bool
+wb_v2_structural_valid(const ClusterPiStructuralFactV2 *s)
+{
+	static const ClusterPcmPiWriteCutV1 no_x;
+	static const ClusterPcmPiStorageCutV1 no_storage;
+	const ClusterPiDataFactV1 *f = &s->terminal;
+	const ClusterPageWalBindingV1 *b = &f->binding;
+	const ClusterSpaceWalChange *change = &s->change.identity;
+	const ClusterSpaceIdentityKey *key = &change->result.key;
+	const ClusterKoSharedMessageV2 *ko = &s->ko;
+	const BufferTag *tag = wb_tag(f);
+	uint8 structure[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], ko_bytes[CLUSTER_KO_SHARED_V2_BYTES];
+	uint32 flags = CLUSTER_PI_STRUCTURAL_WAL_FLUSHED | CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK
+		| CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED | CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE;
+
+	if (!cluster_page_wal_binding_shape_v1(b) || !cluster_wal_claim_v2_ref_valid(&b->source.claim)
+		|| b->flags != CLUSTER_PAGE_WAL_NATIVE_FLUSHED
+		|| b->identity.forknum != SPACE_FORKNUM || b->identity.blockno != 0
+		|| !cluster_space_structure_wal_encode(&s->change, structure, sizeof(structure))
+		|| !cluster_ko_shared_encode_v2(ko, ko_bytes, sizeof(ko_bytes))
+		|| ko->verb != CLUSTER_KO_SHARED_REQUEST)
+		return false;
+	if (change->action == CLUSTER_SPACE_WAL_TRUNCATE) {
+		flags |= CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
+		if (b->rmid != RM_SMGR_ID || (b->info & ~XLR_INFO_MASK) != XLOG_SMGR_SPACE_IDENTITY)
+			return false;
+	} else if (change->action == CLUSTER_SPACE_WAL_TOMBSTONE) {
+		/* A plain/ABORT/PREPARED opcode cannot carry this ordinary commit's
+		 * removal. The physical owner still verifies the full retained record. */
+		if (b->rmid != RM_XACT_ID || (b->info & XLOG_XACT_OPMASK) != XLOG_XACT_COMMIT
+			|| (b->info & XLOG_XACT_HAS_INFO) == 0)
+			return false;
+	} else
+		return false;
+	if (s->durability_flags != flags
+		|| !((cluster_pcm_pi_write_cut_valid_v1(&f->write_cut) && f->write_cut.pi_holders_bitmap != 0
+			  && memcmp(&f->storage_cut, &no_storage, sizeof(no_storage)) == 0)
+			 || (cluster_pcm_pi_storage_cut_valid_v1(&f->storage_cut) && f->storage_cut.pi_holders_bitmap != 0
+				 && memcmp(&f->write_cut, &no_x, sizeof(no_x)) == 0)))
+		return false;
+	return key->system_identifier == b->identity.system_identifier
+		&& key->database_incarnation == b->source.claim.database_incarnation
+		&& memcmp(key->storage_uuid, b->identity.storage_uuid, 16) == 0
+		&& RelFileLocatorEquals(key->locator, b->identity.locator)
+		&& b->version.mutation_token == change->result_token
+		&& memcmp(b->version.segment_incarnation, change->result.incarnation, 16) == 0
+		&& ko->key.system_identifier == key->system_identifier
+		&& ko->key.database_incarnation == key->database_incarnation
+		&& memcmp(ko->key.storage_uuid, key->storage_uuid, 16) == 0
+		&& RelFileLocatorEquals(ko->key.locator, key->locator)
+		&& memcmp(ko->incarnation, change->expected.incarnation, 16) == 0
+		&& ko->origin_node == b->source.claim.identity.origin_node_id
+		&& ko->origin_boot == b->source.claim.identity.origin_owner_incarnation
+		&& tag->spcOid == key->locator.spcOid && tag->dbOid == key->locator.dbOid
+		&& tag->relNumber == key->locator.relNumber
+		&& (tag->forkNum == MAIN_FORKNUM || tag->forkNum == VISIBILITYMAP_FORKNUM
+			|| (tag->forkNum == SPACE_FORKNUM && tag->blockNum < 2));
+}
+
+static bool
+wb_v2_message_valid(const ClusterPiWritebackMessageV2 *m)
+{
+	ClusterPiWritebackMessageV1 header = {0};
+	int32 peer;
+	if (m == NULL || (m->verb != CLUSTER_PI_WRITEBACK_NOTIFY && m->verb != CLUSTER_PI_WRITEBACK_ACK)
+		|| m->count > CLUSTER_PI_WRITEBACK_MAX || (m->count == 0 && m->verb != CLUSTER_PI_WRITEBACK_ACK))
+		return false;
+	/* Reuse the unchanged header/claim rules, without constructing a DATA fact. */
+	header.verb = CLUSTER_PI_WRITEBACK_ACK;
+	header.nonce = m->nonce; header.epoch = m->epoch; header.peer = m->peer;
+	if (!wb_message_valid(&header)) return false;
+	peer = m->peer.claim.identity.origin_node_id;
+	for (uint32 i = 0; i < m->count; i++) {
+		const ClusterPiWritebackFactV2 *fact = &m->facts[i];
+		const ClusterPiDataFactV1 *f = wb_v2_page(fact);
+		if (f == NULL) return false;
+		if (fact->kind == CLUSTER_PI_WRITEBACK_DATA_V2) {
+			if (!wb_fact_valid(f)) return false;
+		} else {
+			const ClusterKoSharedMessageV2 *ko = &fact->proof.structural.ko;
+			int32 master = wb_master(f);
+			uint64 peer_boot = m->peer.claim.identity.origin_owner_incarnation;
+			if (!wb_v2_structural_valid(&fact->proof.structural) || ko->epoch != m->epoch
+				|| master < 0 || master >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+				|| (ko->members[master / 8] & (1u << (master % 8))) == 0)
+				return false;
+			if (peer == ko->origin_node) {
+				/* Notify the DDL origin using its original request to this
+				 * master. KO never has an origin -> origin request. */
+				if (ko->origin_boot != peer_boot || ko->peer_node != master
+					|| ko->peer_boot != wb_master_boot(f))
+					return false;
+			} else if (ko->peer_node != peer || ko->peer_boot != peer_boot)
+				return false;
+		}
+		if (peer == wb_master(f) || (wb_holders(f) & ((uint32)1u << peer)) == 0
+			|| wb_master(f) != wb_master(wb_v2_page(&m->facts[0]))
+			|| wb_master_boot(f) != wb_master_boot(wb_v2_page(&m->facts[0]))
+			|| !wb_namespace(&f->binding.source, &m->peer))
+			return false;
+		for (uint32 j = 0; j < i; j++)
+			if (BufferTagsEqual(wb_tag(f), wb_tag(wb_v2_page(&m->facts[j])))) return false;
+	}
+	return true;
+}
+
+static bool
+wb_v2_fact_encode(uint8 *p, const ClusterPiWritebackFactV2 *fact)
+{
+	const ClusterPiDataFactV1 *f = wb_v2_page(fact);
+	pi_data_put(p, fact->kind, 2);
+	pi_data_put(p + 4, wb_v2_fact_bytes(fact), 4);
+	if (fact->kind == CLUSTER_PI_WRITEBACK_DATA_V2) {
+		pi_data_binding_encode(p + 8, &f->binding);
+		pi_data_cut_encode(p + 240, &f->write_cut);
+		wb_storage_encode(p + 368, &f->storage_cut);
+	} else {
+		const ClusterPiStructuralFactV2 *s = &fact->proof.structural;
+		pi_data_put(p + 8, s->durability_flags, 4);
+		pi_data_binding_encode(p + 16, &f->binding);
+		if (!cluster_space_structure_wal_encode(&s->change, p + 248, CLUSTER_SPACE_STRUCTURE_WAL_BYTES)
+			|| !cluster_ko_shared_encode_v2(&s->ko, p + 904, CLUSTER_KO_SHARED_V2_BYTES)) return false;
+		pi_data_cut_encode(p + 1064, &f->write_cut);
+		wb_storage_encode(p + 1192, &f->storage_cut);
+	}
+	return true;
+}
+
+bool
+cluster_pi_writeback_encode_v2(const ClusterPiWritebackMessageV2 *m, uint8 *bytes, Size capacity,
+							   Size *length)
+{
+	uint8 encoded[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2] = {0}, source[232] = {0};
+	ClusterPageWalBindingV1 peer = {0};
+	Size n = CLUSTER_PI_WRITEBACK_HEADER_BYTES;
+	if (bytes == NULL || length == NULL || pi_data_overlap(m, sizeof(*m), bytes, capacity)
+		|| pi_data_overlap(length, sizeof(*length), bytes, capacity)
+		|| pi_data_overlap(length, sizeof(*length), m, sizeof(*m)) || !wb_v2_message_valid(m))
+		return false;
+	for (uint32 i = 0; i < m->count; i++) n += wb_v2_fact_bytes(&m->facts[i]);
+	if (capacity < n) return false;
+	memcpy(encoded, "PPWB", 4);
+	pi_data_put(encoded + 4, 2, 2);
+	pi_data_put(encoded + 6, CLUSTER_PI_WRITEBACK_HEADER_BYTES, 2);
+	pi_data_put(encoded + 8, m->verb, 4);
+	pi_data_put(encoded + 12, m->count, 4);
+	pi_data_put(encoded + 16, m->nonce, 8);
+	pi_data_put(encoded + 24, m->epoch, 8);
+	peer.source = m->peer;
+	pi_data_binding_encode(source, &peer);
+	memcpy(encoded + 32, source, 136);
+	n = CLUSTER_PI_WRITEBACK_HEADER_BYTES;
+	for (uint32 i = 0; i < m->count; i++) {
+		if (!wb_v2_fact_encode(encoded + n, &m->facts[i])) return false;
+		n += wb_v2_fact_bytes(&m->facts[i]);
+	}
+	memcpy(bytes, encoded, n);
+	*length = n;
+	return true;
+}
+
+bool
+cluster_pi_writeback_decode_v2(const void *data, Size length, ClusterPiWritebackMessageV2 *out)
+{
+	const uint8 *bytes = data;
+	ClusterPiWritebackMessageV2 m = {0};
+	ClusterPageWalBindingV1 peer = {0};
+	uint8 source[232] = {0};
+	Size at = CLUSTER_PI_WRITEBACK_HEADER_BYTES;
+	if (bytes == NULL || out == NULL || pi_data_overlap(data, length, out, sizeof(*out))
+		|| length < at || length > CLUSTER_PI_WRITEBACK_MAX_BYTES_V2
+		|| memcmp(bytes, "PPWB", 4) != 0 || pi_data_get(bytes + 4, 2) != 2
+		|| pi_data_get(bytes + 6, 2) != CLUSTER_PI_WRITEBACK_HEADER_BYTES || pi_data_get(bytes + 168, 8))
+		return false;
+	m.verb = pi_data_get(bytes + 8, 4); m.count = pi_data_get(bytes + 12, 4);
+	m.nonce = pi_data_get(bytes + 16, 8); m.epoch = pi_data_get(bytes + 24, 8);
+	if (m.count > CLUSTER_PI_WRITEBACK_MAX) return false;
+	memcpy(source, bytes + 32, 136);
+	if (!pi_data_binding_decode(source, &peer)) return false;
+	m.peer = peer.source;
+	for (uint32 i = 0; i < m.count; i++) {
+		ClusterPiWritebackFactV2 *fact = &m.facts[i];
+		const uint8 *p = bytes + at;
+		Size n;
+		if (length - at < 8 || pi_data_get(p + 2, 2)) return false;
+		fact->kind = pi_data_get(p, 2);
+		if (wb_v2_page(fact) == NULL) return false;
+		n = wb_v2_fact_bytes(fact);
+		if (n > length - at || pi_data_get(p + 4, 4) != n) return false;
+		if (fact->kind == CLUSTER_PI_WRITEBACK_DATA_V2) {
+			ClusterPiDataFactV1 *f = &fact->proof.data;
+			if (!pi_data_binding_decode(p + 8, &f->binding)
+				|| !wb_storage_decode(p + 368, &f->storage_cut)) return false;
+			pi_data_cut_decode(p + 240, &f->write_cut);
+		} else {
+			ClusterPiStructuralFactV2 *s = &fact->proof.structural;
+			ClusterPiDataFactV1 *f = &s->terminal;
+			s->durability_flags = pi_data_get(p + 8, 4);
+			if (pi_data_get(p + 12, 4) || !pi_data_binding_decode(p + 16, &f->binding)
+				|| !cluster_space_structure_wal_decode(p + 248, CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &s->change)
+				|| !cluster_ko_shared_decode_v2(p + 904, CLUSTER_KO_SHARED_V2_BYTES, &s->ko)
+				|| !wb_storage_decode(p + 1192, &f->storage_cut)) return false;
+			pi_data_cut_decode(p + 1064, &f->write_cut);
+		}
+		at += n;
+	}
+	if (at != length || !wb_v2_message_valid(&m)) return false;
+	*out = m;
+	return true;
+}
+
+bool
+cluster_pi_writeback_ack_matches_v2(const ClusterPiWritebackMessageV2 *request,
+								  const ClusterPiWritebackMessageV2 *ack)
+{
+	uint8 original[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2], reply[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
+	Size original_length, reply_length, at = CLUSTER_PI_WRITEBACK_HEADER_BYTES;
+	Size found = CLUSTER_PI_WRITEBACK_HEADER_BYTES;
+	if (!cluster_pi_writeback_encode_v2(request, original, sizeof(original), &original_length)
+		|| !cluster_pi_writeback_encode_v2(ack, reply, sizeof(reply), &reply_length)
+		|| request->verb != CLUSTER_PI_WRITEBACK_NOTIFY || ack->verb != CLUSTER_PI_WRITEBACK_ACK
+		|| ack->count > request->count || memcmp(original + 16, reply + 16, 160) != 0)
+		return false;
+	while (at < reply_length) {
+		Size n = pi_data_get(reply + at + 4, 4);
+		bool matched = false;
+		while (found < original_length) {
+			Size candidate = pi_data_get(original + found + 4, 4);
+			matched = candidate == n && memcmp(original + found, reply + at, n) == 0;
+			found += candidate;
+			if (matched) break;
+		}
+		if (!matched) return false;
+		at += n;
+	}
 	return true;
 }
 

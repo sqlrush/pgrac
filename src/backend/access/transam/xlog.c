@@ -6418,7 +6418,10 @@ StartupXLOG(void)
 	 * Never throws: on failure it leaves the contract unverified so the role
 	 * gate below fails closed rather than risk a split-brain authority write.
 	 */
-	cluster_cf_phase2_verify_or_fail(DataDir);
+	/* Canonical startup already qualified storage in the postmaster. Do not
+	 * run the legacy recovery-role rendezvous again in this child. */
+	if (!cluster_shared_config)
+		cluster_cf_phase2_verify_or_fail(DataDir);
 
 	/*
 	 * PGRAC: spec-5.6 Db5.  Recovery below writes the shared control-file
@@ -6430,7 +6433,10 @@ StartupXLOG(void)
 	 * closed until the storage is cross-node verified (split-brain guard).
 	 * No-op unless cluster.controlfile_shared_authority is on.
 	 */
-	cluster_cf_enter_bootstrap_window_or_fail();
+	/* ROOT selection and CF ownership, not a boot-local OWNER/JOIN_READONLY
+	 * window, serialize all canonical startup writes. */
+	if (!cluster_shared_config)
+		cluster_cf_enter_bootstrap_window_or_fail();
 
 	/*
 	 * PGRAC (spec-5.6a D3): load this node's per-node recovery anchor.  Under
@@ -6452,7 +6458,7 @@ StartupXLOG(void)
 	 * cluster.node_id before its final single-era shutdown, so its anchor
 	 * exists when it first boots as a cluster member.
 	 */
-	if (cluster_controlfile_shared_authority && cluster_enabled)
+	if (!cluster_shared_config && cluster_controlfile_shared_authority && cluster_enabled)
 	{
 		struct stat st;
 		bool		have_label = (stat(BACKUP_LABEL_FILE, &st) == 0);

@@ -14,6 +14,21 @@ static jmp_buf refused;
 static bool expecting;
 static char executable[MAXPGPATH];
 static bool side_sync_fault, side_link_fault;
+static int replaced_link_parent = -1;
+static struct stat replaced_link_identity;
+static int
+side_test_fstatat(int fd, const char *name, struct stat *out, int flags)
+{
+	int result = fstatat(fd, name, out, flags);
+	/* A deleted symlink's inode may immediately be reused. Only the pathname
+	 * observation is repeated; fstat on a held original still sees its unlink. */
+	if (result == 0 && fd == replaced_link_parent && flags == AT_SYMLINK_NOFOLLOW
+		&& strcmp(name, "pg_xact") == 0) {
+		out->st_dev = replaced_link_identity.st_dev;
+		out->st_ino = replaced_link_identity.st_ino;
+	}
+	return result;
+}
 static int
 side_test_fsync(int fd)
 {
@@ -28,12 +43,14 @@ side_test_symlinkat(const char *path, int fd, const char *name)
 }
 #define fsync side_test_fsync
 #define symlinkat side_test_symlinkat
+#define fstatat side_test_fstatat
 #include "../../backend/cluster/cluster_initdb_cohort.c"
 #undef fsync
 #undef symlinkat
+#undef fstatat
 
-bool errstart(int level, const char *domain) { return true; }
-bool errstart_cold(int level, const char *domain) { return true; }
+bool errstart(int level, const char *domain) { return level >= ERROR; }
+bool errstart_cold(int level, const char *domain) { return level >= ERROR; }
 int errcode(int code) { return 0; }
 int errmsg(const char *format, ...) { return 0; }
 void errfinish(const char *file, int line, const char *func)
@@ -238,12 +255,16 @@ side_route_case(unsigned fault, unsigned node)
 		if (fault == 4) UT_ASSERT(mkdirat(origin.data.fd, INITDB_SIDE_ARCHIVE, 0700) == 0);
 		if (fault == 5) side_sync_fault = true;
 		if (fault == 6) side_link_fault = true;
-		if (fault >= 7 && fault <= 12) {
+		if ((fault >= 7 && fault <= 12) || fault == 14) {
 			route_original_side(&shared, &origin, node);
-			if (fault == 7 || fault == 8) {
+			if (fault == 7 || fault == 8 || fault == 14) {
 				UT_ASSERT(unlinkat(origin.data.fd, "pg_xact", 0) == 0);
 				snprintf(path, sizeof(path), "%s/pg_xact", target.path);
-				UT_ASSERT(symlinkat(fault == 7 ? path : "/tmp", origin.data.fd, "pg_xact") == 0);
+				UT_ASSERT(symlinkat(fault == 8 ? "/tmp" : path, origin.data.fd, "pg_xact") == 0);
+				if (fault == 14) {
+					replaced_link_parent = origin.data.fd;
+					replaced_link_identity = origin.side_links[0];
+				}
 			}
 			if (fault == 9) side_test_put(origin.data.fd, INITDB_SIDE_ARCHIVE "/pg_xact/0000", 'x');
 			if (fault == 10) side_test_put(target.fd, "pg_xact/0000", 'x');
@@ -300,6 +321,65 @@ static void side_routes_retain_actual_original_directories(void)
 {
 	side_route_case(0, 0); side_route_case(0, 3);
 }
+
+static void storage_contract_is_original_unverified_and_rechecked(void)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		char temp[] = "/tmp/pgrac-storage-origin-XXXXXX", path[MAXPGPATH];
+		char *canonical;
+		InitdbDirectory base, global;
+		InitdbOrigin *origins = calloc(128, sizeof(*origins));
+		ClusterSharedConfigRef config = {0};
+		int fd;
+
+		UT_ASSERT(mkdtemp(temp) != NULL);
+		canonical = realpath(temp, NULL);
+		UT_ASSERT(canonical != NULL && origins != NULL);
+		snprintf(path, sizeof(path), "%s/new", canonical);
+		preflight_directory(path, &base); create_directory(&base);
+		create_child(&base, "node0", &origins[0].data);
+		create_child(&origins[0].data, "global", &global);
+		config.identity.configured[0] = 1;
+		config.identity.system_identifier = UINT64CONST(7584383251700000001);
+		memset(config.identity.storage_uuid, 0x12, 16);
+		create_storage_contracts(origins, &config);
+		UT_ASSERT_EQ(origins[0].storage_contract.state, 0);
+		UT_ASSERT_EQ(origins[0].storage_contract.authority_system_identifier,
+			config.identity.system_identifier);
+		UT_ASSERT_STR_EQ(origins[0].storage_contract.storage_uuid, "12121212121212121212121212121212");
+		creation_storage_current(&origins[0]);
+		if (fault == 0) {
+			struct stat identity = origins[0].storage_contract_identity;
+			expecting = true;
+			if (setjmp(refused) == 0) { create_storage_contracts(origins, &config); UT_ASSERT(false); }
+			expecting = false;
+			/* A failed creator exits in production; its output observation is
+			 * unspecified. Verify the original file itself was not replaced. */
+			UT_ASSERT(cluster_initdb_object_recheck(global.fd, "pgrac_cf_contract",
+				(const uint8 *)&origins[0].storage_contract, sizeof(ClusterCfContractRecord),
+				&identity));
+		} else {
+			if (fault == 1) {
+				fd = openat(global.fd, "pgrac_cf_contract", O_WRONLY);
+				UT_ASSERT(fd >= 0 && pwrite(fd, "X", 1, 16) == 1 && close(fd) == 0);
+			} else {
+				UT_ASSERT(renameat(global.fd, "pgrac_cf_contract", global.fd, "saved") == 0);
+				if (fault == 2)
+					UT_ASSERT(cluster_initdb_object_write_new(global.fd, "pgrac_cf_contract",
+						(const uint8 *)&origins[0].storage_contract, sizeof(ClusterCfContractRecord)));
+			}
+			expecting = true;
+			if (setjmp(refused) == 0) { creation_storage_current(&origins[0]); UT_ASSERT(false); }
+			expecting = false;
+		}
+		UT_ASSERT(faccessat(global.fd, "pgrac_control_root", F_OK, 0) != 0 && errno == ENOENT);
+		side_test_remove(base.fd);
+		UT_ASSERT(close(global.fd) == 0 && close(origins[0].data.fd) == 0);
+		UT_ASSERT(close(base.fd) == 0 && unlinkat(base.parent, base.name, AT_REMOVEDIR) == 0);
+		UT_ASSERT(close(base.parent) == 0 && rmdir(canonical) == 0);
+		free(canonical); free(origins);
+	}
+}
 static void side_routes_reject_unqualified_inputs_before_moving(void)
 {
 	for (unsigned fault = 1; fault <= 4; fault++) side_route_case(fault, 3);
@@ -312,6 +392,10 @@ static void side_route_io_failure_preserves_originals(void)
 static void side_routes_reject_late_identity_and_byte_changes(void)
 {
 	for (unsigned fault = 7; fault <= 12; fault++) side_route_case(fault, 3);
+}
+static void reused_link_inode_does_not_restore_original_link(void)
+{
+	side_route_case(14, 3);
 }
 
 int
@@ -351,11 +435,13 @@ main(int argc, char **argv)
 		for (;;) pause();
 	}
 	strlcpy(executable, argv[0], sizeof(executable));
-	UT_PLAN(8);
+	UT_PLAN(10);
+	UT_RUN(storage_contract_is_original_unverified_and_rechecked);
 	UT_RUN(side_routes_retain_actual_original_directories);
 	UT_RUN(side_routes_reject_unqualified_inputs_before_moving);
 	UT_RUN(side_route_io_failure_preserves_originals);
 	UT_RUN(side_routes_reject_late_identity_and_byte_changes);
+	UT_RUN(reused_link_inode_does_not_restore_original_link);
 	UT_RUN(derived_inputs_must_survive_until_primary_publication);
 	UT_RUN(completed);
 	UT_RUN(unsuccessful);

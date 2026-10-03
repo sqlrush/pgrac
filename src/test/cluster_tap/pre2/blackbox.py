@@ -72,16 +72,24 @@ class BlackBox:
         if profile.get("version") != 1:
             raise ValueError("unsupported test entry file version")
         seeds = 0
+        cohorts = 0
         for entry in profile["initialize"]:
-            if set(entry) != {"tool", "argv"} or entry["tool"] != "pgrac-init":
-                raise ValueError("fresh initialization must use pgrac-init")
+            if set(entry) != {"tool", "argv"} or entry["tool"] not in ("pgrac-init", "initdb"):
+                raise ValueError("fresh initialization must use a supported product creator")
             argv = entry["argv"]
             self.validate_argv(argv)
-            seeds += argv.count("--cluster-seed")
+            if entry["tool"] == "initdb":
+                cohorts += argv.count("--pgrac-initdb-cohort")
+                if argv.count("--pgrac-initdb-cohort") != 1 or sum(
+                        a.startswith("--pgrac-initdb-shared-config=") for a in argv) != 1:
+                    raise ValueError("initdb requires the native cohort and canonical request")
+            else:
+                seeds += argv.count("--cluster-seed")
             if any(a.split("=")[0] in ("--force", "--join-from", "--join-from-backup") for a in argv):
                 raise ValueError("no overwrite or backup-based PRE2 fresh initializer")
-        if seeds != 1:
-            raise ValueError("one and only one --cluster-seed is required")
+        if not ((seeds == 1 and cohorts == 0) or
+                (seeds == 0 and cohorts == 1 and len(profile["initialize"]) == 1)):
+            raise ValueError("one and only one fresh cluster creator is required")
         for entry in profile.get("operations", {}).values():
             if set(entry) == {"node", "sql"} and isinstance(entry["sql"], str) and entry["sql"].strip():
                 continue
@@ -97,7 +105,9 @@ class BlackBox:
 
     def describe(self):
         # Run even when no entry file exists: retain the actual installed CLI.
-        self.command("pgrac-init", ["--help"])
+        tool = "initdb" if self.profile and any(e.get("tool") == "initdb"
+               for e in self.profile.get("initialize", [])) else "pgrac-init"
+        self.command(tool, ["--help"])
         self.validate()
         return dict(capabilities=["fresh_init", "shared_start", "shared_stop",
                                   *self.profile.get("operations", {})])
@@ -120,6 +130,8 @@ class BlackBox:
         self.validate()
         for node in self.layout["nodes"]:
             data = Path(node["data_dir"])
+            if data.is_symlink():
+                raise ValueError("fresh DATA is a symlink: " + str(data))
             if data.exists() and any(data.iterdir()):
                 raise ValueError("fresh DATA is not empty: " + str(data))
         for key in ("shared_data_dir", "wal_root"):
@@ -127,9 +139,9 @@ class BlackBox:
             if path and path.exists() and any(path.iterdir()):
                 raise ValueError("fresh shared path is not empty: " + str(path))
         for path in self.layout.get("voting_disks", []):
-            if Path(path).exists():
+            if os.path.lexists(path):
                 raise ValueError("voting path already exists: " + path)
-        self.root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, mode=0o700, exist_ok=True)
         (self.root / "blackbox-layout.json").write_text(json.dumps(self.layout, indent=2) + "\n")
         allowed = [self.root.resolve(), *(Path(n["data_dir"]).resolve() for n in self.layout["nodes"])]
         commands = []
@@ -142,13 +154,21 @@ class BlackBox:
                     if not any(path == root or root in path.parents for root in allowed):
                         raise ValueError("initializer path is outside this disposable fixture: " + value)
             commands.append((entry["tool"], argv))
+        self.prepare_initialize()
         for tool, argv in commands:
             self.command(tool, argv)
+        self.finish_initialize()
         for node in self.layout["nodes"]:
             data = Path(node["data_dir"])
             if not (data / "global/pg_control").is_file() or (data / "backup_label").exists():
                 raise ValueError("initializer did not create fresh native PRE2 DATA")
         return {}
+
+    def prepare_initialize(self):
+        pass
+
+    def finish_initialize(self):
+        pass
 
     def sql(self, node, sql, args=None, check=True):
         argv = ["-XAtq", "-v", "ON_ERROR_STOP=1", "-h", node["host"], "-p", str(node["port"]),
@@ -181,11 +201,42 @@ class BlackBox:
             self.command("pg_ctl", ["start", "-D", node["data_dir"], "-l", node["logfile"], "-W"])
         pending = list(self.layout["nodes"])
         while pending:
-            pending = [n for n in pending if self.sql(n, "SELECT 1", check=False).returncode != 0]
+            self.check_start_logs(state)
+            # A connection during native startup creates a FATAL of its own.
+            # Wait for native readiness before probing SQL; retain every FATAL
+            # check, the deadline, and the actual SQL-success requirement.
+            pending = [n for n in pending if not self.native_ready(n)
+                       or self.sql(n, "SELECT 1", check=False).returncode != 0]
             self.remaining()
+            self.check_start_logs(state)
             if pending:
                 time.sleep(0.1)
         return {}
+
+    @staticmethod
+    def native_ready(node):
+        data = Path(node['data_dir'])
+        try:
+            lines = (data/'postmaster.pid').read_text().splitlines()
+        except FileNotFoundError:
+            return False
+        return (len(lines) >= 8 and lines[0].isdigit() and int(lines[0]) > 0
+                and Path(lines[1]).resolve() == data.resolve()
+                and lines[7].strip() == 'ready')
+
+    def check_start_logs(self, state):
+        for node in self.layout['nodes']:
+            path = Path(node['logfile'])
+            if not path.exists():
+                continue
+            with path.open('rb') as log:
+                log.seek(state['log_offsets'][str(node['id'])])
+                text = log.read().decode(errors='replace')
+            error = next((line for line in text.splitlines() if re.search(
+                r'FATAL:|PANIC:|Assertion|terminated by signal|abnormal database system shutdown|'
+                r'reinitializing|server process .*exited with exit code [1-9]', line)), None)
+            if error:
+                raise RuntimeError(f'node{node["id"]} startup failed: {error}')
 
     def is_stopped(self, node):
         result = self.command("pg_ctl", ["status", "-D", node["data_dir"]], check=False)
@@ -260,7 +311,11 @@ def main():
         bindir = str(Path(init).parent)
     profile_path = os.environ.get("PGRAC_PRE2_ENTRY_FILE")
     profile = json.loads(Path(profile_path).read_text()) if profile_path else None
-    driver = BlackBox(request.get("layout") or {}, bindir, profile)
+    driver_class = BlackBox
+    if profile and profile.get('fixture', {}).get('kind') == 'local-cohort-v1':
+        from cohort_entry import CohortEntry
+        driver_class = CohortEntry
+    driver = driver_class(request.get("layout") or {}, bindir, profile)
     driver.phase_budget(float(request.get("budget_seconds", 120)))
     if op == "describe":
         identities = {}

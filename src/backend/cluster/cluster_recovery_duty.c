@@ -1118,6 +1118,46 @@ formation_witness_decide_live_v1(const ClusterFormationSnapshotV1 *f1,
 	return CLUSTER_FORMATION_WITNESS_READY;
 }
 
+static ClusterFormationWitnessDiagnosticV1 formation_last_diagnostic;
+
+static void
+formation_diagnostic_reset(uint16 origin)
+{
+	memset(&formation_last_diagnostic, 0, sizeof(formation_last_diagnostic));
+	formation_last_diagnostic.origin_thread = origin;
+	formation_last_diagnostic.missing_floor_node = -1;
+	formation_last_diagnostic.fence_result = CLUSTER_FENCE_AUTHORITY_BAD_ARGUMENT;
+}
+
+bool
+cluster_formation_witness_last_diagnostic_v1(ClusterFormationWitnessDiagnosticV1 *out)
+{
+	if (out == NULL || formation_last_diagnostic.predicate == NULL)
+		return false;
+	*out = formation_last_diagnostic;
+	return true;
+}
+
+static ClusterFormationWitnessResult
+formation_diagnostic_result(ClusterFormationWitnessResult result, const char *predicate)
+{
+	formation_last_diagnostic.result = result;
+	formation_last_diagnostic.predicate = predicate;
+	return result;
+}
+
+static void
+formation_diagnostic_snapshot(const ClusterFormationSnapshotV1 *snapshot, uint16 origin)
+{
+	formation_last_diagnostic.snapshot_captured = true;
+	formation_last_diagnostic.formation_epoch = snapshot->local_epoch;
+	formation_last_diagnostic.formation_generation = snapshot->startup_formation_generation;
+	formation_last_diagnostic.origin_member_state
+		= snapshot->membership.membership_state[origin - 1];
+	formation_last_diagnostic.admitted_floor
+		= snapshot->membership.last_admitted_incarnation[origin - 1];
+}
+
 /* AD-023 recovery-control/serving split (internal snapshot, never wire).
  * The cold initial formation is
  * authority for recovery coordination before StartupXLOG, but it is not an
@@ -1136,11 +1176,13 @@ formation_witness_decide_recovery_control_v1(const ClusterFormationSnapshotV1 *f
 
 	if (f1 == NULL || authority == NULL || f2 == NULL || origin_thread == 0
 		|| origin_thread > CLUSTER_MAX_NODES)
-		return CLUSTER_FORMATION_WITNESS_BAD_ARGUMENT;
-	if (f2->self_join_admitted)
+		return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_BAD_ARGUMENT, "arguments");
+	if (f2->self_join_admitted) {
+		formation_last_diagnostic.predicate = "live_witness";
 		return formation_witness_decide_live_v1(f1, authority, f2, origin_thread);
+	}
 	if (memcmp(f1, f2, sizeof(*f1)) != 0)
-		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
+		return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_UNSTABLE, "snapshot.changed");
 	/* PGRAC: only a reconfig-captured exact cold cohort may replace the
 	 * epoch-0-only prerequisite. Its durable fence must still be majority-
 	 * proven at this exact epoch with no excluded writer. No live/duty builder
@@ -1156,22 +1198,28 @@ formation_witness_decide_recovery_control_v1(const ClusterFormationSnapshotV1 *f
 			|| f2->applied.reconfig_kind == RECONFIG_KIND_FAIL_STOP
 			|| f2->applied.reconfig_kind == RECONFIG_KIND_JOIN_PENDING
 			|| f2->applied.new_epoch > f2->local_epoch)
-			return CLUSTER_FORMATION_WITNESS_UNSTABLE;
+			return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_UNSTABLE,
+											   "recovery_control.cohort_debt");
 		if (authority->total_disk_count == 0
 			|| authority->agree_disk_count <= authority->total_disk_count / 2
 			|| !cluster_fence_marker_valid_v1(&authority->marker)
 			|| authority->marker.fence_epoch != f2->local_epoch
 			|| formation_bitmap_nonempty(authority->marker.fenced_dead_bitmap))
-			return CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN;
+			return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN,
+											   "fence.cohort_exact_majority");
 		origin_node = (int32)origin_thread - 1;
 		if (f2->membership.membership_state[origin_node] != CLUSTER_MEMBER_MEMBER
 			|| f2->membership.last_admitted_incarnation[origin_node] == 0)
-			return CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH;
+			return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH,
+											   "origin.member_floor");
 		for (i = 0; i < CLUSTER_MAX_NODES; ++i)
 			if (f2->membership.membership_state[i] == CLUSTER_MEMBER_MEMBER
-				&& f2->membership.last_admitted_incarnation[i] == 0)
-				return CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH;
-		return CLUSTER_FORMATION_WITNESS_READY;
+				&& f2->membership.last_admitted_incarnation[i] == 0) {
+				formation_last_diagnostic.missing_floor_node = i;
+				return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH,
+												   "member.admitted_floor");
+			}
+		return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_READY, "ready");
 	}
 	if (f2->prebump_sync_active != 0 || f2->self_join_failed
 		|| formation_bitmap_nonempty(f2->pending_join_bitmap)
@@ -1184,26 +1232,35 @@ formation_witness_decide_recovery_control_v1(const ClusterFormationSnapshotV1 *f
 		|| f2->applied.cssd_dead_generation != 0 || f2->applied.reconfig_kind != RECONFIG_KIND_NONE
 		|| formation_bitmap_nonempty(f2->applied.dead_bitmap)
 		|| formation_bitmap_nonempty(f2->applied.join_bitmap))
-		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
+		return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_UNSTABLE,
+										   f2->local_epoch != CLUSTER_EPOCH_INITIAL
+											   ? "recovery_control.initial_epoch"
+											   : "recovery_control.initial_debt");
 	if (authority->total_disk_count == 0
 		|| authority->agree_disk_count <= authority->total_disk_count / 2
 		|| !cluster_fence_marker_valid_v1(&authority->marker))
-		return CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN;
+		return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN,
+										   "fence.initial_majority");
 	formation_expected_marker(f2, &expected);
 	if (!cluster_fence_marker_valid_v1(&expected)
 		|| !cluster_fence_marker_tuple_equal(&authority->marker, &expected))
-		return CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN;
+		return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN,
+										   "fence.initial_tuple");
 
 	origin_node = (int32)origin_thread - 1;
 	if (f2->membership.membership_state[origin_node] != CLUSTER_MEMBER_MEMBER
 		|| f2->membership.last_admitted_incarnation[origin_node] == 0)
-		return CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH;
+		return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH,
+										   "origin.member_floor");
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (f2->membership.membership_state[i] == CLUSTER_MEMBER_MEMBER
-			&& f2->membership.last_admitted_incarnation[i] == 0)
-			return CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH;
+			&& f2->membership.last_admitted_incarnation[i] == 0) {
+			formation_last_diagnostic.missing_floor_node = i;
+			return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH,
+											   "member.admitted_floor");
+		}
 	}
-	return CLUSTER_FORMATION_WITNESS_READY;
+	return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_READY, "ready");
 }
 
 #define CLUSTER_FORMATION_WITNESS_MAGIC UINT32_C(0x46575631) /* FWV1 */
@@ -1266,33 +1323,49 @@ formation_witness_build_wait_internal(uint16 origin_thread, bool opening_new_dut
 	uint64 start_us;
 	uint64 deadline_us;
 
+	formation_diagnostic_reset(origin_thread);
 	if (out == NULL || *out != NULL || origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES
 		|| timeout_ms < 1 || timeout_ms > 600000)
-		return CLUSTER_FORMATION_WITNESS_BAD_ARGUMENT;
+		return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_BAD_ARGUMENT, "arguments");
 	start_us = formation_monotonic_us();
 	if (start_us == 0 || start_us > UINT64_MAX - (uint64)timeout_ms * UINT64_C(1000))
-		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+		return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE,
+										   "clock");
 	deadline_us = start_us + (uint64)timeout_ms * UINT64_C(1000);
 	for (;;) {
 		ClusterFormationSnapshotV1 f1;
 		ClusterFormationSnapshotV1 f2;
-		ClusterFenceAuthorityProof authority;
+		ClusterFenceAuthorityProof authority = { 0 };
 		ClusterFenceAuthorityReadResult read_result;
 		uint64 proof_sequence;
 		uint64 now_us;
 
+		/* No field from a prior retry may masquerade as the final sample. */
+		formation_diagnostic_reset(origin_thread);
 		proof_sequence = cluster_write_fence_authority_cache_sequence();
 		if ((proof_sequence & UINT64_C(1)) != 0 || proof_sequence >= UINT64_MAX - 1) {
-			last = CLUSTER_FORMATION_WITNESS_UNSTABLE;
+			last = formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_UNSTABLE,
+											   "fence.cache_sequence");
 			goto retry;
 		}
 		if (!cluster_reconfig_capture_formation_snapshot_v1(origin_thread, &f1))
-			return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+			return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE,
+											   "snapshot.first");
+		formation_diagnostic_snapshot(&f1, origin_thread);
 		read_result = cluster_write_fence_read_durable_authority(&authority);
+		formation_last_diagnostic.fence_result = read_result;
+		formation_last_diagnostic.fence_captured = read_result == CLUSTER_FENCE_AUTHORITY_OK;
+		formation_last_diagnostic.fence_agree = authority.agree_disk_count;
+		formation_last_diagnostic.fence_total = authority.total_disk_count;
+		formation_last_diagnostic.fence_epoch = authority.marker.fence_epoch;
+		formation_last_diagnostic.predicate = "fence.authority_read";
 		last = formation_authority_result(read_result);
 		if (last == CLUSTER_FORMATION_WITNESS_READY) {
 			if (!cluster_reconfig_capture_formation_snapshot_v1(origin_thread, &f2))
-				return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+				return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE,
+												   "snapshot.second");
+			formation_diagnostic_snapshot(&f2, origin_thread);
+			formation_last_diagnostic.predicate = "formation.decision";
 			if (mode == CLUSTER_FORMATION_WITNESS_MODE_LIVE)
 				last = formation_witness_decide_live_v1(&f1, &authority, &f2, origin_thread);
 			else if (mode == CLUSTER_FORMATION_WITNESS_MODE_RECOVERY_CONTROL)
@@ -1306,10 +1379,12 @@ formation_witness_build_wait_internal(uint16 origin_thread, bool opening_new_dut
 
 				now_us = formation_monotonic_us();
 				if (now_us == 0)
-					return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+					return formation_diagnostic_result(
+						CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE, "clock");
 				if (!cluster_write_fence_authority_cache_publish_if_unchanged(
 						&authority.marker, now_us, proof_sequence)) {
-					last = CLUSTER_FORMATION_WITNESS_UNSTABLE;
+					last = formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_UNSTABLE,
+													   "fence.cache_publish");
 					goto retry;
 				}
 				witness = (ClusterFormationWitnessV1 *)palloc(sizeof(*witness));
@@ -1326,17 +1401,17 @@ formation_witness_build_wait_internal(uint16 origin_thread, bool opening_new_dut
 					witness->f2.reserved[0] = CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL;
 				}
 				*out = witness;
-				return CLUSTER_FORMATION_WITNESS_READY;
+				return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_READY, "ready");
 			}
 		}
 		if (last != CLUSTER_FORMATION_WITNESS_UNSTABLE
 			&& last != CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN
 			&& last != CLUSTER_FORMATION_WITNESS_IO_FAILED)
-			return last;
+			return formation_diagnostic_result(last, formation_last_diagnostic.predicate);
 	retry:
 		now_us = formation_monotonic_us();
 		if (now_us == 0 || now_us >= deadline_us)
-			return last;
+			return formation_diagnostic_result(last, formation_last_diagnostic.predicate);
 		pg_usleep(1000L);
 	}
 }

@@ -114,7 +114,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/cluster_ko_lock.c",
             "src/backend/storage/smgr/smgr.c",
         ),
-        r"\b(?:cluster_ko_flush_and_wait_ack|RelationDropStorage|RelationTruncate|smgrdounlinkall|smgrtruncate2|KO_FLUSH_ACK_DONE)\b",
+        r"\b(?:cluster_ko_flush_and_wait_ack|ko_flush_and_wait_ack|cluster_ko_shared_begin_v2|RelationDropStorage|RelationTruncate|smgrdounlinkall|smgrtruncate2|KO_FLUSH_ACK_DONE)\b",
     ),
     ScanRule(
         "ITL_TERMINAL_DISCHARGE",
@@ -435,7 +435,7 @@ _classify_owners(
 _classify_owners(
     "CTRC_RELATION_GATE",
     "src/backend/cluster/cluster_ko_lock.c",
-    ("cluster_ko_drain_inbound_and_apply", "cluster_ko_flush_and_wait_ack"),
+    ("cluster_ko_drain_inbound_and_apply", "ko_flush_and_wait_ack"),
     "SUCCESSOR_BEFORE_PREDECESSOR",
     "ALL_CTRC_REFERENCE_KINDS",
     "ALL_RELATION_TARGETS",
@@ -1034,12 +1034,12 @@ _classify_owners(
 _classify_owners(
     "KO_PHYSICAL_REMOVAL",
     "src/backend/catalog/storage.c",
-    ("smgr_redo_truncate",),
+    ("smgr_redo_truncate_internal",),
     "SUCCESSOR_BEFORE_PREDECESSOR",
     "WAL_REPLAY_OF_PRECLASSIFIED_MUTATION",
     "RECOVERY_STORAGE_TARGET",
     "ORIGINATING_WAL_RECORD_AND_TYPED_SPACE_PREDECESSOR",
-    "ORIGINATING_PRIMARY_KO_GATE_AND_LOCAL_REPLAY",
+    "ORIGINATING_PRIMARY_KO_GATE_OR_EXACT_TYPED_SPACE_BATCH",
     "MXA-T35",
 )
 _classify_owners(
@@ -1049,6 +1049,8 @@ _classify_owners(
         "cluster_ko_drain_inbound_and_apply",
         "cluster_ko_flush_ack_handler",
         "cluster_ko_flush_and_wait_ack",
+        "ko_flush_and_wait_ack",
+        "cluster_ko_shared_begin_v2",
     ),
     "SUCCESSOR_BEFORE_PREDECESSOR",
     "ALL_CTRC_REFERENCE_KINDS",
