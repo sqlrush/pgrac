@@ -9,6 +9,10 @@
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "access/xlog.h"
+#include "access/xloginsert.h"
+#include "access/xact.h"
+#include "catalog/storage_xlog.h"
+#include "cluster/cluster_space_reservation.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/shmem.h"
@@ -444,10 +448,11 @@ cluster_page_wal_shmem_register(void)
 	cluster_shmem_register_region(&page_wal_region);
 }
 
-ClusterPageWalCaptureResultV1
-cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
-								   uint64 result_token, XLogRecPtr start, XLogRecPtr end,
-								   uint32 crc, uint8 rmid, uint8 info)
+static ClusterPageWalCaptureResultV1
+page_wal_capture_native(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
+						uint64 result_token, XLogRecPtr start, XLogRecPtr end,
+						uint32 crc, uint8 rmid, uint8 info,
+						const ClusterSpaceIdentityKey *space_key)
 {
 	ClusterPageWalBindingV1 value = { 0 };
 	BufferDesc *buf;
@@ -457,7 +462,8 @@ cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1
 
 	if (bindings == NULL || buffer <= 0 || buffer > NBuffers || edge == NULL || !cluster_enabled
 		|| !cluster_shared_config || RecoveryInProgress() || result_token == 0
-		|| XLogRecPtrIsInvalid(start) || start >= end || edge->page_class != RF_PAGE_CLASS_ORDINARY
+		|| XLogRecPtrIsInvalid(start) || start >= end
+		|| edge->page_class != (space_key == NULL ? RF_PAGE_CLASS_ORDINARY : RF_PAGE_CLASS_ROUTED_SPACE)
 		|| edge->result_kind != RF_PAGE_STATE_PRESENT)
 		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
 	buf = GetBufferDescriptor(buffer - 1);
@@ -468,7 +474,9 @@ cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1
 	if ((state & (BM_VALID | BM_TAG_VALID | BM_PERMANENT))
 			!= (BM_VALID | BM_TAG_VALID | BM_PERMANENT)
 		|| (state & BM_IO_ERROR) != 0
-		|| (buf->tag.forkNum != MAIN_FORKNUM && buf->tag.forkNum != VISIBILITYMAP_FORKNUM)
+		|| (space_key == NULL
+			? (buf->tag.forkNum != MAIN_FORKNUM && buf->tag.forkNum != VISIBILITYMAP_FORKNUM)
+			: (buf->tag.forkNum != SPACE_FORKNUM || buf->tag.blockNum >= 2))
 		|| cluster_smgr_which_for(BufTagGetRelFileLocator(&buf->tag), InvalidBackendId) != 1)
 		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
 	page = BufferGetPage(buffer);
@@ -483,6 +491,18 @@ cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1
 		|| value.source.claim.identity.origin_thread_id == 0
 		|| value.source.claim.identity.origin_thread_id > PGRAC_PAGE_LSN_ORIGIN_MAX + 1)
 		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	if (space_key != NULL
+		&& (space_key->system_identifier != value.source.claim.identity.system_identifier
+			|| space_key->database_incarnation != value.source.claim.database_incarnation
+			|| memcmp(space_key->storage_uuid, value.source.claim.identity.storage_uuid, 16) != 0
+			|| !RelFileLocatorEquals(space_key->locator, BufTagGetRelFileLocator(&buf->tag))))
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	if (space_key != NULL) {
+		int origin;
+		if (!PageGetLSNOrigin(page, &origin)
+			|| origin != value.source.claim.identity.origin_thread_id - 1)
+			return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	}
 	value.identity.system_identifier = value.source.claim.identity.system_identifier;
 	memcpy(value.identity.storage_uuid, value.source.claim.identity.storage_uuid, 16);
 	value.identity.locator = BufTagGetRelFileLocator(&buf->tag);
@@ -514,6 +534,67 @@ cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1
 	}
 	page_wal_slot_encode(&bindings[buffer - 1], &value, source);
 	return CLUSTER_PAGE_WAL_CAPTURED;
+}
+
+ClusterPageWalCaptureResultV1
+cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
+								 uint64 result_token, XLogRecPtr start, XLogRecPtr end,
+								 uint32 crc, uint8 rmid, uint8 info)
+{
+	return page_wal_capture_native(buffer, edge, result_token, start, end, crc, rmid, info, NULL);
+}
+
+ClusterPageWalCaptureResultV1
+cluster_page_wal_capture_space_v1(Buffer buffer, const ClusterSpaceIdentityKey *key,
+								XLogRecPtr end)
+{
+	RfPageVersionEdgeEntryV1 edge = { 0 };
+	ClusterSpaceIdentity identity;
+	ClusterSpaceReservation reservation;
+	XLogRecord record;
+	XLogRecPtr start;
+	BufferDesc *buf;
+	Page page;
+	uint64 token;
+	uint8 op;
+
+	if (bindings == NULL || buffer <= 0 || buffer > NBuffers || key == NULL
+		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress())
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (!LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE)
+		|| buf->tag.forkNum != SPACE_FORKNUM || buf->tag.blockNum >= 2
+		|| !RelFileLocatorEquals(key->locator, BufTagGetRelFileLocator(&buf->tag))
+		|| !XLogGetLastInsertRecord(end, &start, &record))
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	op = record.xl_info & ~XLR_INFO_MASK;
+	if (!((record.xl_rmid == RM_SMGR_ID
+			&& (op == XLOG_SMGR_SPACE_IDENTITY
+				|| (op == XLOG_SMGR_SPACE_RESERVATION && buf->tag.blockNum == 1)))
+		  || (record.xl_rmid == RM_XACT_ID
+			  && (record.xl_info & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT)))
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	page = BufferGetPage(buffer);
+	if (PageGetLSN(page) != end)
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	if (buf->tag.blockNum == 0) {
+		if (!cluster_space_identity_page_decode(page, BLCKSZ, SPACE_FORKNUM, 0,
+				key, &identity, &token))
+			return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	} else {
+		if (!cluster_space_reservation_page_decode(page, BLCKSZ, SPACE_FORKNUM, 1,
+				key, &reservation, &token))
+			return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+		identity = reservation.identity;
+	}
+	if ((record.xl_rmid == RM_XACT_ID)
+		!= (identity.state == CLUSTER_SPACE_IDENTITY_TOMBSTONED))
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	edge.page_class = RF_PAGE_CLASS_ROUTED_SPACE;
+	edge.result_kind = RF_PAGE_STATE_PRESENT;
+	memcpy(edge.result_incarnation, identity.incarnation, 16);
+	return page_wal_capture_native(buffer, &edge, token, start, end, record.xl_crc,
+								   record.xl_rmid, record.xl_info, key);
 }
 
 bool

@@ -2072,6 +2072,9 @@ test_cluster_space_cleanout_product.o: $(top_srcdir)/src/backend/cluster/cluster
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_space_recovery_product.o: $(top_srcdir)/src/backend/cluster/cluster_space_recovery.c \
+		$(top_srcdir)/src/include/cluster/cluster_grd.h \
+		$(top_srcdir)/src/include/cluster/cluster_hw.h \
+		$(top_srcdir)/src/include/cluster/cluster_lock_acquire.h \
 		$(top_srcdir)/src/include/cluster/cluster_page_stable_base.h \
 		$(top_srcdir)/src/include/cluster/cluster_space_recovery.h \
 		$(top_srcdir)/src/include/cluster/cluster_thread_recovery_fabric.h
@@ -2106,7 +2109,8 @@ test_cluster_page_wal_insert.inc: $(top_srcdir)/src/backend/access/transam/xlogi
 	awk '/^XLogInsert\(/ { print "XLogRecPtr"; emit=1; n++ } \
 	     /^XLogResetInsertion\(/ || /^XLogRegisterBuffer\(/ || /^XLogRegisterBlock\(/ \
 	       { print "void"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 4) exit 1 }' $< > $@
+	     /^XLogGetLastInsertRecord\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 5) exit 1 }' $< > $@
 
 test_cluster_page_wal_image.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^gcs_block_resource_x_put_u32\(/ || /^gcs_block_resource_x_put_u64\(/ \
@@ -2170,7 +2174,12 @@ test_cluster_space_recovery: test_cluster_space_recovery.c unit_test.h test_clus
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -o $@
 
-test_cluster_space_storage_product.o: $(top_srcdir)/src/backend/cluster/cluster_space_storage.c
+test_cluster_space_storage_product.o: $(top_srcdir)/src/backend/cluster/cluster_space_storage.c \
+		$(top_srcdir)/src/include/cluster/cluster_grd.h \
+		$(top_srcdir)/src/include/cluster/cluster_hw.h \
+		$(top_srcdir)/src/include/cluster/cluster_lock_acquire.h \
+		$(top_srcdir)/src/include/cluster/cluster_space_storage.h \
+		$(top_srcdir)/src/include/cluster/cluster_page_wal.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_space_producer_product.o: $(top_srcdir)/src/backend/cluster/cluster_page_producer.c

@@ -8,6 +8,9 @@
 
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "access/xact.h"
+#include "catalog/storage_xlog.h"
+#include "cluster/cluster_space_reservation.h"
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_gcs_block.h"
@@ -52,7 +55,8 @@ static bool flush_changes_source;
 static XLogRecPtr insert_end;
 static sigjmp_buf native_error_target;
 static bool catch_native_errors, native_panicked;
-XLogRecPtr ProcLastRecPtr;
+XLogRecPtr ProcLastRecPtr, XactLastRecEnd;
+static XLogRecPtr last_insert_record_end;
 ProcessingMode Mode = NormalProcessing;
 
 #include "test_cluster_pcm_checksum_owner.inc"
@@ -260,7 +264,7 @@ XLogInsertRecord(XLogRecData *data, XLogRecPtr fpw, uint8 flags, int fpi, bool t
 		return InvalidXLogRecPtr;
 	ProcLastRecPtr = 0x120;
 	record.xl_crc = 0x9192;
-	return 0x200;
+	return XactLastRecEnd = 0x200;
 }
 static void
 pg_attribute_noreturn() native_error(void)
@@ -1073,10 +1077,165 @@ cold_failure_latch_survives_process_attach_and_local_cleanup(void)
 	UT_ASSERT(cluster_page_wal_cold_redo_write_allowed_v1());
 }
 
+static void
+space_insert(unsigned block, RmgrId rmid, uint8 info, bool tombstone)
+{
+	ClusterSpaceReservation reservation = { 0 };
+	reset();
+	page_version_edge_registered = false;
+	max_registered_block_id = 0;
+	InitBufferTag(&desc.bufferdesc.tag, &space.key.locator, SPACE_FORKNUM, block);
+	if (tombstone)
+		space.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+	reservation.identity = space;
+	reservation.next_block = 16;
+	if (block == 0)
+		UT_ASSERT(cluster_space_identity_page_encode(&space, 82, page.data, BLCKSZ));
+	else
+		UT_ASSERT(cluster_space_reservation_page_encode(&reservation, 82, page.data, BLCKSZ));
+	retry_insert = true;
+	UT_ASSERT_EQ(XLogInsert(rmid, info), 0x200);
+	PageSetLSNPreserveOrigin(page.data, 0x200);
+	UT_ASSERT(PageSetLSNOrigin(page.data, 0));
+}
+
+UT_TEST(space_native_record_and_both_component_sources)
+{
+	for (unsigned block = 0; block < 2; block++) {
+		for (unsigned action = 0; action < 2; action++) {
+			ClusterPageWalBindingV1 value;
+			ClusterPageWalRefV1 retained = { 0 };
+			space_insert(block, action ? RM_XACT_ID : RM_SMGR_ID,
+				action ? XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO
+					   : XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE,
+				action != 0);
+			UT_ASSERT_EQ(assemble_calls, 2);
+			UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &space.key, 0x200),
+						 CLUSTER_PAGE_WAL_CAPTURED);
+			UT_ASSERT(cluster_page_wal_snapshot_v1(1, &value));
+			UT_ASSERT_EQ(value.identity.forknum, SPACE_FORKNUM);
+			UT_ASSERT_EQ(value.identity.blockno, block);
+			UT_ASSERT_EQ(value.record_start, 0x120);
+			UT_ASSERT_EQ(value.record_end, 0x200);
+			UT_ASSERT_EQ(value.record_crc, 0x9192);
+			UT_ASSERT_EQ(value.rmid, action ? RM_XACT_ID : RM_SMGR_ID);
+			UT_ASSERT_EQ(value.version.mutation_token, 82);
+			UT_ASSERT_EQ(value.flags, 0); /* Insertion is not a flush. */
+			UT_ASSERT(memcmp(value.version.segment_incarnation, space.incarnation, 16) == 0);
+			UT_ASSERT(cluster_page_wal_ref_retain_v1(&value, &retained));
+			UT_ASSERT(cluster_page_wal_forget_v1(1));
+			UT_ASSERT(cluster_page_wal_ref_read_v1(&retained, space.key.locator,
+				SPACE_FORKNUM, block, &value));
+			UT_ASSERT(cluster_page_wal_ref_release_v1(&retained));
+		}
+	}
+}
+
+UT_TEST(space_advance_is_only_block_one_of_live_identity)
+{
+	for (unsigned block = 0; block < 2; block++) {
+		space_insert(block, RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION, false);
+		UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &space.key, 0x200),
+			block ? CLUSTER_PAGE_WAL_CAPTURED : CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
+	}
+	space_insert(1, RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION, true);
+	UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &space.key, 0x200),
+		CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
+}
+
+UT_TEST(native_last_record_expires_on_construction_reset_and_other_insert)
+{
+	XLogRecord value, before;
+	XLogRecPtr start = 123;
+	space_insert(0, RM_SMGR_ID, XLOG_SMGR_SPACE_IDENTITY, false);
+	UT_ASSERT(XLogGetLastInsertRecord(0x200, &start, &value));
+	UT_ASSERT_EQ(start, 0x120);
+	UT_ASSERT_EQ(value.xl_crc, 0x9192);
+	before = value;
+	start = 123;
+	UT_ASSERT(!XLogGetLastInsertRecord(0x201, &start, &value));
+	UT_ASSERT_EQ(start, 123);
+	UT_ASSERT(memcmp(&before, &value, sizeof(value)) == 0);
+	begininsert_called = true;
+	UT_ASSERT(!XLogGetLastInsertRecord(0x200, &start, &value));
+	XLogResetInsertion();
+	UT_ASSERT(!XLogGetLastInsertRecord(0x200, &start, &value));
+	space_insert(0, RM_SMGR_ID, XLOG_SMGR_SPACE_IDENTITY, false);
+	ProcLastRecPtr = XactLastRecEnd = 0x300;
+	UT_ASSERT(!XLogGetLastInsertRecord(0x200, &start, &value));
+}
+
+UT_TEST(space_capture_rejects_wrong_record_key_page_and_owner)
+{
+	for (unsigned fault = 0; fault < 10; fault++) {
+		ClusterSpaceIdentityKey key;
+		space_insert(0, RM_SMGR_ID, XLOG_SMGR_SPACE_IDENTITY, false);
+		key = space.key;
+		switch (fault) {
+			case 0: record.xl_rmid = RM_XLOG_ID; break;
+			case 1: desc.bufferdesc.tag.blockNum = 2; break;
+			case 2: key.locator.spcOid++; break;
+			case 3: writer.claim.database_incarnation++; break;
+			case 4: writer.claim.identity.storage_uuid[1]++; break;
+			case 5: permitted = false; break;
+			case 6: exclusive = false; break;
+			case 7: PageSetLSNPreserveOrigin(page.data, 0x199); break;
+			case 8: ((PageHeader)page.data)->pd_block_scn = 0; break;
+			case 9: UT_ASSERT(PageSetLSNOrigin(page.data, 1)); break;
+		}
+		UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &key, 0x200),
+			CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
+	}
+	space_insert(0, RM_XACT_ID, XLOG_XACT_COMMIT, false);
+	UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &space.key, 0x200),
+		CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
+	space_insert(0, RM_XACT_ID, XLOG_XACT_ABORT, true);
+	UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &space.key, 0x200),
+		CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
+}
+
+UT_TEST(space_carrier_retains_flushed_original_source_after_transfer)
+{
+	ClusterPageWalBindingV1 native, received;
+	ClusterPageWalInstallV1 install = { 0 };
+	space_insert(1, RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION, false);
+	UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &space.key, 0x200),
+		CLUSTER_PAGE_WAL_CAPTURED);
+	UT_ASSERT(cluster_page_wal_snapshot_v1(1, &native));
+	UT_ASSERT(cluster_page_wal_forget_v1(1));
+	writer.claim.identity.origin_node_id = 1;
+	writer.claim.identity.origin_thread_id = 2;
+	UT_ASSERT(!cluster_page_wal_prepare_install_v1(1, &native, page.data, &install));
+	native.flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	UT_ASSERT(cluster_page_wal_prepare_install_v1(1, &native, page.data, &install));
+	UT_ASSERT(cluster_page_wal_publish_install_v1(1, &install));
+	UT_ASSERT_EQ(install.source_slot, 0);
+	UT_ASSERT(cluster_page_wal_snapshot_v1(1, &received));
+	UT_ASSERT(memcmp(&native, &received, sizeof(native)) == 0);
+	UT_ASSERT_EQ(flush_calls, 0); /* Receiver never flushes foreign numeric LSN. */
+}
+
+UT_TEST(space_capture_unavailable_source_is_not_mutation_failure)
+{
+	ClusterPageWalBindingV1 value;
+	space_insert(1, RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION, false);
+	selected = false;
+	UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &space.key, 0x200),
+		CLUSTER_PAGE_WAL_UNATTRIBUTED);
+	UT_ASSERT(cluster_page_wal_forget_v1(1));
+	UT_ASSERT(!cluster_page_wal_snapshot_v1(1, &value));
+}
+
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(29);
+	UT_RUN(space_native_record_and_both_component_sources);
+	UT_RUN(space_advance_is_only_block_one_of_live_identity);
+	UT_RUN(native_last_record_expires_on_construction_reset_and_other_insert);
+	UT_RUN(space_capture_rejects_wrong_record_key_page_and_owner);
+	UT_RUN(space_capture_unavailable_source_is_not_mutation_failure);
+	UT_RUN(space_carrier_retains_flushed_original_source_after_transfer);
 	UT_RUN(resident_binding_memory_budget);
 	printf("# Complete private/wire carrier: %zu bytes\n", sizeof(ClusterPageWalBindingV1));
 	cluster_page_wal_shmem_register();

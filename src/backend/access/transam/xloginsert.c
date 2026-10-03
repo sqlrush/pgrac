@@ -280,6 +280,9 @@ static RfPageVersionEdgeEntryV1
  */
 static XLogRecData hdr_rdt;
 static char *hdr_scratch = NULL;
+#ifdef USE_PGRAC_CLUSTER
+static XLogRecPtr last_insert_record_end = InvalidXLogRecPtr;
+#endif
 
 #define SizeOfXlogOrigin	(sizeof(RepOriginId) + sizeof(char))
 #define SizeOfXLogTransactionId	(sizeof(TransactionId) + sizeof(char))
@@ -428,6 +431,9 @@ XLogResetInsertion(void)
 	registered_page_version_result_token = 0;
 	registered_page_version_entry_count = 0;
 	begininsert_called = false;
+#ifdef USE_PGRAC_CLUSTER
+	last_insert_record_end = InvalidXLogRecPtr;
+#endif
 }
 
 /*
@@ -802,9 +808,26 @@ XLogInsert(RmgrId rmid, uint8 info)
 #endif
 
 	XLogResetInsertion();
+#ifdef USE_PGRAC_CLUSTER
+	last_insert_record_end = cluster_shared_config ? EndPos : InvalidXLogRecPtr;
+#endif
 
 	return EndPos;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+bool
+XLogGetLastInsertRecord(XLogRecPtr end, XLogRecPtr *start, XLogRecord *record)
+{
+	if (start == NULL || record == NULL || !cluster_shared_config || begininsert_called
+		|| hdr_scratch == NULL || end == InvalidXLogRecPtr || end != last_insert_record_end
+		|| end != XactLastRecEnd || ProcLastRecPtr == InvalidXLogRecPtr || ProcLastRecPtr >= end)
+		return false;
+	*record = *(XLogRecord *) hdr_scratch;
+	*start = ProcLastRecPtr;
+	return true;
+}
+#endif
 
 /*
  * Assemble a WAL record from the registered data and buffers into an

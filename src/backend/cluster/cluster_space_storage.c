@@ -23,6 +23,7 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_hw.h"
 #include "cluster/cluster_page_producer.h"
+#include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_space_recovery.h"
@@ -132,6 +133,22 @@ space_set_lsn(Page page, XLogRecPtr lsn, uint64 token)
 {
 	PageSetLSN(page, lsn);
 	((PageHeader)page)->pd_block_scn = token;
+}
+
+static void
+space_capture_native(Buffer buffer, const ClusterSpaceIdentityKey *key, XLogRecPtr lsn)
+{
+	ClusterPageWalCaptureResultV1 capture;
+	/* Recovery has its original retained-source owner. Never attribute it
+	 * to the recovering executor's last local insertion. */
+	if (RecoveryInProgress())
+		return;
+	capture = cluster_page_wal_capture_space_v1(buffer, key, lsn);
+	if (capture == CLUSTER_PAGE_WAL_UNATTRIBUTED) {
+		if (!cluster_page_wal_forget_v1(buffer))
+			elog(PANIC, "SPACE WAL lost its attribution owner");
+	} else if (capture != CLUSTER_PAGE_WAL_CAPTURED)
+		elog(PANIC, "SPACE WAL lost its native mutation invariant");
 }
 
 static bool
@@ -578,8 +595,10 @@ cluster_space_relation_create(RelFileLocator locator)
 	}
 	XLogRegisterData((char *)bytes, sizeof(bytes));
 	lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE);
-	for (int i = 0; i < 2; i++)
+	for (int i = 0; i < 2; i++) {
 		space_set_lsn(BufferGetPage(buffers[i]), lsn, identity->result_token);
+		space_capture_native(buffers[i], &identity->result.key, lsn);
+	}
 	END_CRIT_SECTION();
 	success = true;
 done:
@@ -652,6 +671,7 @@ cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock 
 	XLogRegisterData((char *)bytes, sizeof(bytes));
 	lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION | XLR_SPECIAL_REL_UPDATE);
 	space_set_lsn(BufferGetPage(buffer), lsn, change.result_token);
+	space_capture_native(buffer, &expected, lsn);
 	END_CRIT_SECTION();
 	XLogFlush(lsn);
 	/* A membership/activation fence during the flush may deny the grant.
@@ -830,6 +850,12 @@ space_structure_publish(ClusterSpaceTruncateState *state, XLogRecPtr lsn)
 	for (int i = 0; i < 2; i++) {
 		memcpy(BufferGetPage(state->buffers[i]), state->result[i].data, BLCKSZ);
 		space_set_lsn(BufferGetPage(state->buffers[i]), lsn, state->token);
+		if (!RecoveryInProgress()) {
+			ClusterSpaceStructureChange change;
+			if (!cluster_space_structure_wal_decode(state->wal, sizeof(state->wal), &change))
+				elog(PANIC, "SPACE publisher lost its original structural record");
+			space_capture_native(state->buffers[i], &change.identity.result.key, lsn);
+		}
 	}
 }
 
