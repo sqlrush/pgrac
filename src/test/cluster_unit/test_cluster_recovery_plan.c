@@ -326,8 +326,6 @@ UT_TEST(test_root_non_open_lifecycle_is_unknown)
 {
 	ClusterControlRootSnapshot snap;
 	uint32 lifecycles[] = {
-		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED,
-		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE,
 		CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED,
 		CLUSTER_CONTROL_ROOT_LIFECYCLE_UNUSED,
 	};
@@ -340,6 +338,43 @@ UT_TEST(test_root_non_open_lifecycle_is_unknown)
 															  ROOT_CKPT),
 					 (int)CLUSTER_RECOVERY_THREAD_UNKNOWN);
 	}
+}
+
+/*
+ * PGRAC (S9P2-05, cold founder input): a generation already sealed for
+ * recovery but not recovered still needs it, however recently it was
+ * published (its recoverer failed too); a recovered one needs none.
+ * Classifying either UNKNOWN stopped every merge with 53RA3, or, with no
+ * other candidate, sent startup down the single-stream path past it.
+ */
+UT_TEST(test_root_recovery_lifecycles)
+{
+	ClusterControlRootSnapshot snap;
+	int64 ages[] = { ROOT_FRESH_US, ROOT_STALE_US };
+	unsigned i;
+
+	for (i = 0; i < lengthof(ages); i++) {
+		fill_root_snapshot(&snap, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED, ages[i]);
+		UT_ASSERT_EQ((int)cluster_recovery_classify_root_slot(CLUSTER_CONTROL_ROOT_OK_PRIMARY,
+															  &snap, OWN_TID, ROOT_TID, NOW_US,
+															  ROOT_CKPT),
+					 (int)CLUSTER_RECOVERY_THREAD_CRASHED_CANDIDATE);
+		fill_root_snapshot(&snap, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE, ages[i]);
+		UT_ASSERT_EQ((int)cluster_recovery_classify_root_slot(CLUSTER_CONTROL_ROOT_OK_PRIMARY,
+															  &snap, OWN_TID, ROOT_TID, NOW_US,
+															  ROOT_CKPT),
+					 (int)CLUSTER_RECOVERY_THREAD_CLEAN);
+	}
+	/* Identity and read checks still come first. */
+	fill_root_snapshot(&snap, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED, ROOT_STALE_US);
+	snap.identity.origin_node_id = ROOT_NODE - 1;
+	UT_ASSERT_EQ((int)cluster_recovery_classify_root_slot(CLUSTER_CONTROL_ROOT_OK_PRIMARY, &snap,
+														  OWN_TID, ROOT_TID, NOW_US, ROOT_CKPT),
+				 (int)CLUSTER_RECOVERY_THREAD_UNKNOWN);
+	fill_root_snapshot(&snap, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED, ROOT_STALE_US);
+	UT_ASSERT_EQ((int)cluster_recovery_classify_root_slot(CLUSTER_CONTROL_ROOT_IO_ERROR, &snap,
+														  OWN_TID, ROOT_TID, NOW_US, ROOT_CKPT),
+				 (int)CLUSTER_RECOVERY_THREAD_UNKNOWN);
 }
 
 UT_TEST(test_root_identity_violation_is_unknown)
@@ -659,7 +694,7 @@ UT_TEST(test_projection_read_matching_episode_returns_pinned_fields)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(31);
+	UT_PLAN(32);
 
 	UT_RUN(test_own_priority_beats_every_verdict);
 	UT_RUN(test_empty_slot);
@@ -679,6 +714,7 @@ main(int argc, char **argv)
 	UT_RUN(test_root_threshold_boundary_exact_is_alive);
 	UT_RUN(test_root_future_published_is_alive);
 	UT_RUN(test_root_non_open_lifecycle_is_unknown);
+	UT_RUN(test_root_recovery_lifecycles);
 	UT_RUN(test_root_identity_violation_is_unknown);
 	UT_RUN(test_root_read_failure_is_unknown);
 	UT_RUN(test_root_own_thread_priority);
