@@ -108,6 +108,15 @@ cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out pg_attribute_unused()
 	abort();
 }
 
+/* No local PI responsibility: every source completes at its native redo. */
+bool
+cluster_pcm_local_pi_floor_v1(const ClusterWalSourceRef *source pg_attribute_unused(),
+							  ClusterPcmLocalPiFloorV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	return true;
+}
+
 ClusterControlRootResult
 cluster_control_root_v3_retained_lower_publish(
 	const ClusterControlRootIdentity *self pg_attribute_unused(),

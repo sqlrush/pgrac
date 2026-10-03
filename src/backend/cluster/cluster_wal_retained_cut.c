@@ -42,6 +42,15 @@
  *	  a temporary file and compared after the census.  A source's bound is
  *	  the earliest needed history record, or its completion.
  *
+ *	  This thread also completes no later than the first record of any of its
+ *	  unretired local PI responsibilities: a past image handed away before
+ *	  its version was written keeps its redo until the PI is retired, like a
+ *	  PI holding back an Oracle instance checkpoint.  The directory is read
+ *	  after the checkpoint completed; a responsibility recorded later with an
+ *	  earlier first record names a version that checkpoint already wrote.
+ *	  One whose first record is another source's but whose latest is this
+ *	  thread's cannot be bounded, and keeps the published lower.
+ *
  *	  Nothing here publishes or retires WAL.  The ROOT owner publishes the
  *	  bound only if the ROOT is unchanged since the census
  *	  (cluster_control_root_v3_retained_lower_publish); WAL cleanup reads the
@@ -70,6 +79,7 @@
 #include "catalog/storage_xlog.h"
 #include "cluster_control_root_private.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_wal_claim.h"
@@ -131,6 +141,7 @@ typedef struct RetainedBucket {
 typedef struct RetainedCutWork {
 	uint32 nsources;
 	int32 self;
+	ClusterPcmLocalPiFloorV1 local_pi;
 	RetainedSource sources[CLUSTER_WAL_INPUTS_MAX];
 	RetainedBucket *sketch;
 	uint32 obligation_side;
@@ -551,6 +562,28 @@ retained_record(XLogReaderState *record, const ClusterWalSourceRef *source,
 }
 
 /* Completion of each selected input; see the file header. */
+/* Complete this thread no later than its unretired local PI responsibilities
+ * (R-A19).  One that cannot be bounded completes it at the published lower:
+ * every retained record of this thread stays an obligation. */
+static bool
+retained_local_pi(RetainedCutWork *work, const ClusterWalInputV1 *item)
+{
+	RetainedSource *source = &work->sources[work->self];
+	XLogRecPtr floor = work->local_pi.floor;
+
+	if (work->local_pi.unbounded != 0)
+		floor = item->checkpoint.checkpoint_lower_lsn;
+	else if (work->local_pi.bounded == 0)
+		return true;
+	if (floor == InvalidXLogRecPtr)
+		return false;
+	if (floor < source->completion) {
+		source->completion = source->bound = floor;
+		source->pin = CLUSTER_WAL_RETAINED_PIN_LOCAL_PI;
+	}
+	return true;
+}
+
 static bool
 retained_sources(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const ClusterWalSourceRef *self)
 {
@@ -596,7 +629,7 @@ retained_sources(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluste
 		}
 	}
 	work->nsources = count;
-	return work->self >= 0;
+	return work->self >= 0 && retained_local_pi(work, cluster_wal_inputs_at_v1(inputs, work->self));
 }
 
 /* Lower the bound of source to at, recording why. */
@@ -689,6 +722,9 @@ retained_census(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluster
 	out->spool_bytes = work->spooled * sizeof(RetainedEdge);
 	out->side_classes = work->obligation_side;
 	out->pin = source->pin;
+	out->local_pi_floor = work->local_pi.floor;
+	out->local_pi_bounded = work->local_pi.bounded;
+	out->local_pi_unbounded = work->local_pi.unbounded;
 	if (out->pin == CLUSTER_WAL_RETAINED_PIN_STRUCTURE)
 		retained_structure_pins++;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -723,11 +759,18 @@ cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self, ClusterWalR
 	if (self == NULL || out == NULL || detail == NULL
 		|| !cluster_wal_claim_v2_ref_valid(&self->claim))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	work = palloc0(sizeof(*work));
+	/* Before selecting the input: the directory scan waits on entry locks. */
+	if (!cluster_pcm_local_pi_floor_v1(self, &work->local_pi)) {
+		pfree(work);
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	}
 	result = cluster_wal_inputs_begin_v1(self->claim.identity.storage_uuid,
 										 self->claim.identity.system_identifier, &inputs);
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		pfree(work);
 		return result;
-	work = palloc0(sizeof(*work));
+	}
 	PG_TRY();
 	{
 		result = retained_census(work, inputs, self, out, detail);
@@ -772,6 +815,15 @@ retained_report(ClusterControlRootResult result, RfPageProofDetailV1 detail,
 						   "held " UINT64_FORMAT " times since start.",
 						   LSN_FORMAT_ARGS(cut->lower), LSN_FORMAT_ARGS(cut->native_redo),
 						   retained_structure_pins)));
+	else if (pin == CLUSTER_WAL_RETAINED_PIN_LOCAL_PI)
+		ereport(LOG, (errmsg("cluster WAL retention lower held by a local PI responsibility"),
+					  errdetail("Lower %X/%X, native redo %X/%X, earliest responsibility %X/%X: "
+								"%llu bounded and %llu unbounded responsibilities keep this "
+								"thread's WAL until their PIs are retired.",
+								LSN_FORMAT_ARGS(cut->lower), LSN_FORMAT_ARGS(cut->native_redo),
+								LSN_FORMAT_ARGS(cut->local_pi_floor),
+								(unsigned long long)cut->local_pi_bounded,
+								(unsigned long long)cut->local_pi_unbounded)));
 	else if (pin != CLUSTER_WAL_RETAINED_PIN_NONE)
 		ereport(LOG, (errmsg("cluster WAL retention lower held by %s ancestry",
 							 pin == CLUSTER_WAL_RETAINED_PIN_SIDE ? "SIDE" : "page"),
@@ -796,11 +848,14 @@ retained_report_readings(const ClusterWalRetainedCutV1 *cut, ClusterControlRootR
 																		  : cut->old_lower),
 				LSN_FORMAT_ARGS(cut->native_redo)),
 		 errdetail("result %d, %llu records, %llu history edges, %llu needed, spool %llu "
-				   "bytes, census %lld ms, publication %lld ms.",
+				   "bytes, census %lld ms, publication %lld ms, local PI floor %X/%X "
+				   "(%llu bounded, %llu unbounded).",
 				   (int)result, (unsigned long long)cut->records,
 				   (unsigned long long)cut->history_edges, (unsigned long long)cut->retained_edges,
 				   (unsigned long long)cut->spool_bytes, (long long)(census_us / 1000),
-				   (long long)(publication_us / 1000))));
+				   (long long)(publication_us / 1000), LSN_FORMAT_ARGS(cut->local_pi_floor),
+				   (unsigned long long)cut->local_pi_bounded,
+				   (unsigned long long)cut->local_pi_unbounded)));
 }
 
 void

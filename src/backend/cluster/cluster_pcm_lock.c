@@ -10366,6 +10366,86 @@ cluster_pcm_local_pi_redeclare_scan_chunk(int start, int max_scan, uint64 epoch,
 	return end;
 }
 
+/* D S09 R-A19: the same WAL source as a binding's, in this thread's LSN
+ * space.  The configuration generation a reference names may differ. */
+static bool
+pcm_local_pi_source_equal(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b)
+{
+	return memcmp(&a->claim.identity, &b->claim.identity, sizeof(a->claim.identity)) == 0
+		   && a->claim.database_incarnation == b->claim.database_incarnation
+		   && memcmp(a->claim.claim_sha256, b->claim.claim_sha256, 32) == 0
+		   && a->timeline == b->timeline;
+}
+
+/*
+ * D S09 R-A19: least first record of the unretired local PI responsibilities
+ * of one source, for the WAL retention lower.  Every responsibility that is
+ * unretired when the call starts and still unretired when its entry is
+ * examined is counted: an entry holding one cannot be reclaimed, so it stays
+ * in its registry slot, and a slot found empty or reused held nothing owed.
+ * Each slot is read under the directory lock and its entry under the entry
+ * lock in shared mode (the normal directory-then-entry order), one at a
+ * time; no pin is taken, so a quiescing entry is left quiescing.  Read-only
+ * and allocation-free.
+ */
+bool
+cluster_pcm_local_pi_floor_v1(const ClusterWalSourceRef *source, ClusterPcmLocalPiFloorV1 *out)
+{
+	ClusterPcmLocalPiFloorV1 value = { 0 };
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (source == NULL || !cluster_shared_config || ClusterPcm == NULL || cluster_pcm_htab == NULL
+		|| cluster_pcm_resource_x_slots == NULL || pcm_grd_effective <= 0)
+		return false;
+	for (int i = 0; i < pcm_grd_effective; i++) {
+		ClusterPcmResourceXSlot slot;
+		ClusterPcmLocalPiSnapshotV1 local;
+		struct GrdEntry *entry;
+		bool found = false, valid;
+
+		if ((i & 1023) == 0)
+			CHECK_FOR_INTERRUPTS();
+		LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+		slot = cluster_pcm_resource_x_slots[i];
+		if (slot.state != PCM_REGISTRY_LIVE) {
+			LWLockRelease(&ClusterPcm->htab_lock.lock);
+			if (slot.state != PCM_REGISTRY_EMPTY && slot.state != PCM_REGISTRY_TOMBSTONE)
+				return false;
+			continue;
+		}
+		/* Entry and slot change together under the exclusive directory lock. */
+		entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &slot.tag, HASH_FIND, &found);
+		valid = found && entry != NULL && slot.reserved == 0
+				&& slot.retired_authority_generation == 0 && slot.binding_generation != 0
+				&& slot.binding_generation != UINT64_MAX
+				&& entry->binding_generation == slot.binding_generation
+				&& entry->registry_slot == (uint32)i;
+		if (valid) {
+			LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+			valid = pcm_local_pi_snapshot_locked(entry, &local);
+			LWLockRelease(&entry->entry_lock.lock);
+		}
+		LWLockRelease(&ClusterPcm->htab_lock.lock);
+		if (!valid)
+			return false;
+		value.examined++;
+		if (local.first.record_start == InvalidXLogRecPtr)
+			continue;
+		if (pcm_local_pi_source_equal(&local.first.source, source)) {
+			value.bounded++;
+			if (value.floor == InvalidXLogRecPtr || local.first.record_start < value.floor)
+				value.floor = local.first.record_start;
+		} else if (pcm_local_pi_source_equal(&local.last.source, source))
+			value.unbounded++;
+		else
+			value.foreign++;
+	}
+	*out = value;
+	return true;
+}
+
 static bool
 pcm_pi_storage_snapshot_locked(struct GrdEntry *entry, ClusterPcmPiStorageCutV1 *out)
 {

@@ -41,7 +41,9 @@ typedef enum ClusterWalRetainedPinV1 {
 	/* A SIDE owner class without per-key ancestry had an obligation. */
 	CLUSTER_WAL_RETAINED_PIN_SIDE = 2,
 	/* A relation CREATE/TRUNCATE/DROP in retained history (until CR20). */
-	CLUSTER_WAL_RETAINED_PIN_STRUCTURE = 3
+	CLUSTER_WAL_RETAINED_PIN_STRUCTURE = 3,
+	/* An unretired local PI responsibility of this thread. */
+	CLUSTER_WAL_RETAINED_PIN_LOCAL_PI = 4
 } ClusterWalRetainedPinV1;
 
 typedef struct ClusterWalRetainedCutV1 {
@@ -60,12 +62,17 @@ typedef struct ClusterWalRetainedCutV1 {
 	/* SIDE contribution owner bits whose obligations pinned history. */
 	uint32 side_classes;
 	ClusterWalRetainedPinV1 pin;
+	/* This thread's local PI responsibilities (cluster_pcm_local_pi_floor_v1). */
+	XLogRecPtr local_pi_floor;
+	uint64 local_pi_bounded;
+	uint64 local_pi_unbounded;
 } ClusterWalRetainedCutV1;
 
 /*
- * Checkpointer (or bgwriter) only, outside CF.  Select the complete retained
- * input, census every record once and return the bound for this node's
- * current writer generation.  Live OPEN ends follow the original writer;
+ * Checkpointer (or bgwriter) only, outside CF, after the checkpoint whose
+ * native redo the ROOT names has completed.  Read this thread's local PI
+ * responsibilities, select the complete retained input, census every record
+ * once and return the bound for this node's current writer generation.  Live OPEN ends follow the original writer;
  * a peer cut that is not confirmed yet returns RECONFIG_WAIT.  On any refusal
  * the output is zeroed and detail names a PAGE/SIDE decode refusal.
  * Publishing is a separate ROOT operation that must compare root_token.

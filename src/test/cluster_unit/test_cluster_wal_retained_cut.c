@@ -396,10 +396,32 @@ cluster_control_root_v3_retained_lower_publish(const ClusterControlRootIdentity 
 	return publish_result;
 }
 
+/* ---- local PI directory ---- */
+static bool local_pi_ok;
+static ClusterPcmLocalPiFloorV1 local_pi;
+static int local_pi_calls, local_pi_scopes_at_call;
+
+bool
+cluster_pcm_local_pi_floor_v1(const ClusterWalSourceRef *source, ClusterPcmLocalPiFloorV1 *out)
+{
+	UT_ASSERT(memcmp(source, &self_ref, sizeof(*source)) == 0);
+	local_pi_calls++;
+	local_pi_scopes_at_call = scopes_open;
+	memset(out, 0, sizeof(*out));
+	if (!local_pi_ok)
+		return false;
+	*out = local_pi;
+	return true;
+}
+
 /* ---- fixture builders ---- */
 static void
 reset(void)
 {
+	local_pi_ok = true;
+	memset(&local_pi, 0, sizeof(local_pi));
+	local_pi_calls = 0;
+	local_pi_scopes_at_call = -1;
 	memset(items, 0, sizeof(items));
 	memset(records, 0, sizeof(records));
 	nitems = nrecords = 0;
@@ -483,7 +505,7 @@ compute(ClusterWalRetainedCutV1 *cut, RfPageProofDetailV1 *detail)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(16);
 	UT_RUN(test_retained_cut_moves_to_native_redo_without_obligations);
 	UT_RUN(test_retained_cut_peer_obligation_keeps_successors_on_its_page);
 	UT_RUN(test_retained_cut_hot_page_releases_predecessors);
@@ -498,6 +520,8 @@ main(void)
 	UT_RUN(test_retained_cut_spills_history_to_a_temp_file);
 	UT_RUN(test_retained_sketch_is_conservative);
 	UT_RUN(test_retained_cut_driver_publishes_only_an_advance);
+	UT_RUN(test_retained_cut_local_pi_floor_holds_this_thread);
+	UT_RUN(test_retained_cut_local_pi_floor_unavailable_refuses);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

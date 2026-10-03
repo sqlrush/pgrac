@@ -470,4 +470,101 @@ UT_TEST(test_retained_cut_driver_publishes_only_an_advance)
 	UT_ASSERT_EQ(log_count, 4);
 }
 
+/* R-A19: an unretired local PI responsibility of this thread completes it
+ * at its first record (Oracle keeps a PI's redo until the PI is retired).
+ * Records from there to the native redo become obligations; a responsibility
+ * starting at another source's record with this thread's latest record
+ * cannot be bounded, so the lower stays; one of other sources only is not
+ * this thread's. */
+UT_TEST(test_retained_cut_local_pi_floor_holds_this_thread)
+{
+	for (int variant = 0; variant < 7; variant++) {
+		uint32 self, peer;
+		ClusterWalRetainedCutV1 cut;
+		RfPageProofDetailV1 detail;
+		XLogRecPtr lower = 0x2000;
+		ClusterWalRetainedPinV1 pin = CLUSTER_WAL_RETAINED_PIN_LOCAL_PI;
+
+		two_writers(&self, &peer);
+		add_record(self, 0x1000, 0x1100, 100, 1, 2);
+		add_record(self, 0x2000, 0x2100, 101, 1, 2);
+		add_record(self, 0x2800, 0x2900, 101, 2, 3);
+		local_pi.floor = 0x2000;
+		local_pi.bounded = 1;
+		if (variant == 1) { /* a page obligation needs older history */
+			add_record(peer, 0x6000, 0x6100, 100, 1, 7);
+			lower = 0x1000;
+			pin = CLUSTER_WAL_RETAINED_PIN_PAGE;
+		} else if (variant == 2) { /* responsibility after the native redo */
+			local_pi.floor = 0x3800;
+			lower = SELF_REDO;
+			pin = CLUSTER_WAL_RETAINED_PIN_NONE;
+		} else if (variant == 3) { /* exactly at the native redo */
+			local_pi.floor = SELF_REDO;
+			lower = SELF_REDO;
+			pin = CLUSTER_WAL_RETAINED_PIN_NONE;
+		} else if (variant == 4) { /* below the published lower: kept */
+			local_pi.floor = 0x800;
+			lower = SELF_LOWER;
+		} else if (variant == 5) { /* own latest record, foreign first */
+			local_pi.floor = 0x2800;
+			local_pi.unbounded = 1;
+			lower = SELF_LOWER;
+		} else if (variant == 6) { /* other sources only */
+			local_pi.floor = InvalidXLogRecPtr;
+			local_pi.bounded = 0;
+			local_pi.foreign = 2;
+			lower = SELF_REDO;
+			pin = CLUSTER_WAL_RETAINED_PIN_NONE;
+		}
+		UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(cut.lower, lower);
+		UT_ASSERT_EQ(cut.pin, pin);
+		UT_ASSERT_EQ(cut.local_pi_floor, local_pi.floor);
+		UT_ASSERT_EQ(cut.local_pi_bounded, local_pi.bounded);
+		UT_ASSERT_EQ(cut.local_pi_unbounded, local_pi.unbounded);
+		UT_ASSERT_EQ(local_pi_calls, 1);
+		/* Read before the input is selected: no directory wait inside it. */
+		UT_ASSERT_EQ(local_pi_scopes_at_call, 0);
+		if (variant == 0) /* the record from the floor on is an obligation */
+			UT_ASSERT_EQ(cut.history_edges, 1);
+		if (ut_current_failed)
+			printf("# local PI variant %d\n", variant);
+	}
+}
+
+/* A directory that cannot be read refuses the census before any input is
+ * selected; the driver keeps the published lower and logs once. */
+UT_TEST(test_retained_cut_local_pi_floor_unavailable_refuses)
+{
+	uint32 self, peer;
+	ClusterWalRetainedCutV1 cut;
+	RfPageProofDetailV1 detail;
+
+	two_writers(&self, &peer);
+	add_record(self, 0x1000, 0x1100, 100, 1, 2);
+	local_pi_ok = false;
+	UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	UT_ASSERT(v_zero(&cut, sizeof(cut)));
+	UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+	cluster_wal_retained_cut_after_checkpoint_v1();
+	cluster_wal_retained_cut_after_checkpoint_v1();
+	UT_ASSERT_EQ(publish_calls, 0);
+	UT_ASSERT_EQ(log_count, 1);
+	/* Held by a responsibility: no publication, one LOG for it. */
+	local_pi_ok = true;
+	local_pi.floor = 0x800;
+	local_pi.bounded = 1;
+	cluster_wal_retained_cut_after_checkpoint_v1();
+	cluster_wal_retained_cut_after_checkpoint_v1();
+	UT_ASSERT_EQ(publish_calls, 0);
+	UT_ASSERT_EQ(log_count, 2);
+	UT_ASSERT_EQ(scopes_open, 0);
+	/* An unbounded responsibility with no published lower to keep. */
+	items[self].checkpoint.checkpoint_lower_lsn = InvalidXLogRecPtr;
+	local_pi.unbounded = 1;
+	UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+	UT_ASSERT(v_zero(&cut, sizeof(cut)));
+}
+
 #endif /* TEST_CLUSTER_WAL_RETAINED_CUT_CASES_H */
