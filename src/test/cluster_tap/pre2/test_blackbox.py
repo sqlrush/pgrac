@@ -39,6 +39,20 @@ class BlackBoxTest(unittest.TestCase):
         self.assertEqual(self.calls[0][0][1:], ["--help"])
         self.assertEqual(len(self.calls), 1)
 
+    def test_native_cohort_entry_is_a_single_fresh_creator(self):
+        profile = self.profile()
+        profile['initialize'] = [dict(tool='initdb', argv=[
+            '-D', '${root}/cohort', '-k', '-A', 'trust', '--no-locale',
+            '--pgrac-initdb-cohort',
+            '--pgrac-initdb-shared-config=${root}/request.conf'])]
+        self.driver(profile).validate()
+        # Neither a legacy initdb nor several independent clusters is a cohort.
+        for entries in ([dict(tool='initdb', argv=['-D', '${root}/cohort'])],
+                        profile['initialize'] * 2):
+            profile['initialize'] = entries
+            with self.assertRaises(ValueError):
+                self.driver(profile).validate()
+
     def test_no_shell_backup_or_literal_observation(self):
         for bad in (dict(tool="sh", argv=["-c", "echo yes"]),
                     dict(tool="pgrac-init", argv=["--cluster-seed", "--join-from=x"]),
