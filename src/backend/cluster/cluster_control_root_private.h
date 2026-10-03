@@ -655,6 +655,15 @@ extern ClusterControlRootResult
 cluster_control_root_v3_failure_tail_publish(const struct ClusterRecoverySerialRequest *request,
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token);
+/* PGRAC (S9P2-05, PU-D-5): the founder's StartupProcess seals this node's
+ * own crashed generation (OPEN, or sealed without its tail) on self-seal
+ * evidence; min_dead_us is the caller's death threshold, raised to the
+ * write lease.  OK returns the sealed RECOVERY_REQUIRED root.  Refusal
+ * clears outputs; never recovery, completion or serving permission. */
+extern ClusterControlRootResult
+cluster_control_root_v3_self_seal_v1(const ClusterWalSourceRef *restart, uint64 min_dead_us,
+									 ClusterControlRootSnapshot *out,
+									 ClusterControlRootReadToken *out_token);
 
 extern bool
 cluster_control_root_create_authority_current_v1(const ClusterControlRootMigrationImage *image,

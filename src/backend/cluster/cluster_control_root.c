@@ -6920,7 +6920,57 @@ typedef struct FailureInputV2Work {
 	LOCKMODE cf_mode;
 	int32 publisher_node;
 	uint64 publisher_incarnation;
+	/* PGRAC (S9P2-05): founder self-seal of this node's own crashed
+	 * generation -- no external fence and no IR (self_predecessor_authorized). */
+	bool self;
+	uint64 self_min_dead_us;
+	ClusterWalSourceRef self_restart;
 } FailureInputV2Work;
+
+/*
+ * PGRAC (S9P2-05, PU-D-5): after every instance failed, the founder seals
+ * its own previous generation without isolating that old incarnation
+ * externally.  The evidence: this is the startup process of a postmaster
+ * holding PostgreSQL's data-directory interlock; the quorum admitted this
+ * boot's strictly newer incarnation of the node as a MEMBER; this boot's
+ * pre-heartbeat voting snapshot shows the old incarnation on every disk with
+ * a last heartbeat older than both the death threshold and the write lease;
+ * and the bootstrap-validated restart input names exactly this root's claim.
+ * Residual risk (same node id restarted elsewhere while the old instance,
+ * partitioned, still writes) is a deployment limit.  Author: SqlRush
+ * <sqlrush@gmail.com>
+ */
+static bool
+self_predecessor_authorized(const ClusterRecoverySerialRequest *request,
+							const FailureInputV2Work *work)
+{
+	ClusterQvotecPriorExitObservation death;
+	ClusterWalSourceRef restart;
+	uint64 self = cluster_qvotec_get_self_incarnation();
+	int index = (int)request->duty.origin_thread_id - 1;
+
+	if (MyBackendType != B_STARTUP || ShutdownRequestPending
+		|| cluster_node_id != work->publisher_node || self == 0
+		|| self != work->publisher_incarnation || request->duty.origin_node_id != cluster_node_id
+		|| request->duty.origin_thread_id != (uint16)(cluster_node_id + 1)
+		|| self <= request->duty.origin_owner_incarnation || !cluster_qvotec_in_quorum()
+		|| cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != self
+		|| !cluster_wal_thread_restart_v2_ref(&restart)
+		|| memcmp(&restart, &work->self_restart, sizeof(restart)) != 0
+		|| !cluster_control_root_identity_equal(&restart.claim.identity, &request->duty))
+		return false;
+	/* Once the root is read, the restart input is exactly its claim. */
+	if (work->base.header.file_txn_seq != 0
+		&& (memcmp(restart.claim.claim_sha256, work->base.refs[index].claim_sha256, 32) != 0
+			|| restart.claim.database_incarnation != work->base.header.v2.database_incarnation
+			|| restart.claim.max_config_generation != work->base.header.v2.config_generation
+			|| restart.timeline != work->base.records[index].checkpoint_tli))
+		return false;
+	return cluster_qvotec_prior_death_observe(
+		(uint32)cluster_node_id, request->duty.origin_owner_incarnation, self,
+		(uint64)GetCurrentTimestamp(), work->self_min_dead_us, &death);
+}
 
 static bool
 failure_v2_authorized(const ClusterRecoverySerialRequest *request, const FailureInputV2Work *work)
@@ -6930,6 +6980,8 @@ failure_v2_authorized(const ClusterRecoverySerialRequest *request, const Failure
 	uint32 count;
 	bool original_owner = false;
 
+	if (work->self)
+		return self_predecessor_authorized(request, work);
 	if (cluster_node_id != work->publisher_node
 		|| cluster_qvotec_get_self_incarnation() != work->publisher_incarnation
 		|| work->publisher_incarnation == 0
@@ -7756,8 +7808,9 @@ static bool
 failure_v2_current(const ClusterRecoverySerialRequest *request, FailureInputV2Work *work)
 {
 	return failure_v2_authorized(request, work)
-		   && cluster_recovery_serial_input_revalidate(&work->serial)
-				  == CLUSTER_RECOVERY_SERIAL_CURRENT;
+		   && (work->self
+			   || cluster_recovery_serial_input_revalidate(&work->serial)
+					  == CLUSTER_RECOVERY_SERIAL_CURRENT);
 }
 
 /* PGRAC: observe under owned CF, but never keep CF over the WAL scan.
@@ -7876,9 +7929,12 @@ failure_v2_tail_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 	if (retained != CLUSTER_WAL_PIN_OK)
 		return retained == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
 												 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
-	acquired = cluster_recovery_serial_acquire(request, &work->serial);
-	if (acquired != CLUSTER_RECOVERY_SERIAL_GRANTED)
-		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	/* PGRAC: a self-seal holds no IR; the root CAS and WALR still apply. */
+	if (!work->self) {
+		acquired = cluster_recovery_serial_acquire(request, &work->serial);
+		if (acquired != CLUSTER_RECOVERY_SERIAL_GRANTED)
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	}
 	result = failure_v2_tail_read(request, work, ShareLock);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -7993,7 +8049,8 @@ failure_v2_open_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 
 static ClusterControlRootResult
 failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRootSnapshot *out,
-				   ClusterControlRootReadToken *out_token, bool seal_tail, uint16 version)
+				   ClusterControlRootReadToken *out_token, bool seal_tail, uint16 version,
+				   const ClusterWalSourceRef *self_restart, uint64 self_min_dead_us)
 {
 	FailureInputV2Work *work;
 	ClusterControlRootResult result;
@@ -8013,8 +8070,10 @@ failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRo
 		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
 		|| request->mode != CLUSTER_RECOVERY_SERIAL_INPUT_SEAL
 		|| !cluster_recovery_duty_key_valid_for_claim(&request->duty, true)
-		|| request->duty.system_identifier != GetSystemIdentifier() || request->formation == NULL
-		|| request->fence_need_set == NULL || request->fence_admission_set == NULL)
+		|| request->duty.system_identifier != GetSystemIdentifier()
+		|| (self_restart == NULL
+			&& (request->formation == NULL || request->fence_need_set == NULL
+				|| request->fence_admission_set == NULL)))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
@@ -8022,6 +8081,11 @@ failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRo
 	work->format_version = version;
 	work->publisher_node = cluster_node_id;
 	work->publisher_incarnation = cluster_qvotec_get_self_incarnation();
+	if (self_restart != NULL) {
+		work->self = true;
+		work->self_min_dead_us = self_min_dead_us;
+		work->self_restart = *self_restart;
+	}
 	PG_TRY();
 	{
 		if (!failure_v2_authorized(request, work))
@@ -8051,7 +8115,7 @@ cluster_control_root_v2_failure_open_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, false, 2);
+	return failure_v2_publish(request, out, out_token, false, 2, NULL, 0);
 }
 
 ClusterControlRootResult
@@ -8059,7 +8123,7 @@ cluster_control_root_v2_failure_tail_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, true, 2);
+	return failure_v2_publish(request, out, out_token, true, 2, NULL, 0);
 }
 
 ClusterControlRootResult
@@ -8067,7 +8131,7 @@ cluster_control_root_v3_failure_open_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, false, 3);
+	return failure_v2_publish(request, out, out_token, false, 3, NULL, 0);
 }
 
 ClusterControlRootResult
@@ -8075,7 +8139,65 @@ cluster_control_root_v3_failure_tail_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, true, 3);
+	return failure_v2_publish(request, out, out_token, true, 3, NULL, 0);
+}
+
+/*
+ * PGRAC (S9P2-05, PU-D-5): seal this node's own crashed generation -- OPEN
+ * to RECOVERY_REQUIRED, then the validated tail -- with the self-seal
+ * evidence instead of an external fence (self_predecessor_authorized).  A
+ * generation already sealed with its tail is reported as it is.  Each step
+ * is a compare-and-swap on the root just read.  Author: SqlRush
+ * <sqlrush@gmail.com>
+ */
+ClusterControlRootResult
+cluster_control_root_v3_self_seal_v1(const ClusterWalSourceRef *restart, uint64 min_dead_us,
+									 ClusterControlRootSnapshot *out,
+									 ClusterControlRootReadToken *out_token)
+{
+	const uint32 required
+		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+		  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+	ClusterRecoverySerialRequest request;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken token;
+	ClusterControlRootResult result;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out_token != NULL)
+		memset(out_token, 0, sizeof(*out_token));
+	if (restart == NULL || out == NULL || out_token == NULL || cluster_node_id < 0
+		|| restart->claim.identity.origin_node_id != cluster_node_id
+		|| restart->claim.identity.origin_thread_id != (uint16)(cluster_node_id + 1))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = cluster_control_root_read_canonical(
+		restart->claim.identity.origin_thread_id, &restart->claim.identity,
+		CLUSTER_CONTROL_ROOT_READ_STRONG, &snapshot, &token);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	memset(&request, 0, sizeof(request));
+	request.mode = CLUSTER_RECOVERY_SERIAL_INPUT_SEAL;
+	request.duty = restart->claim.identity;
+	request.expected_root_token = token;
+	if (snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
+		result = failure_v2_publish(&request, &snapshot, &token, false, 3, restart, min_dead_us);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		request.expected_root_token = token;
+	}
+	if (snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		&& (snapshot.root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) == 0) {
+		result = failure_v2_publish(&request, &snapshot, &token, true, 3, restart, min_dead_us);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	}
+	if (snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		|| (snapshot.root_flags & required) != required)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	*out = snapshot;
+	*out_token = token;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 /* PGRAC: the raw shutdown anchor and native insertion cut are independent

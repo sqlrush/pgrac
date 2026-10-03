@@ -520,6 +520,14 @@ extern bool cluster_qvotec_prior_unclean_death(void);
 extern bool cluster_qvotec_prior_exit_observe(uint32 node_id, uint64 prior_incarnation,
 											  uint64 observing_incarnation,
 											  ClusterQvotecPriorExitObservation *out);
+/* PGRAC (S9P2-05): every configured slot names exactly the old incarnation
+ * and its last heartbeat is older than max(min_dead_us, the write lease) at
+ * now_us.  Evidence for this node's own founder self-seal, never admission.
+ * Refusal clears output; no input may alias that output. */
+extern bool cluster_qvotec_prior_death_observe(uint32 node_id, uint64 prior_incarnation,
+											   uint64 observing_incarnation, uint64 now_us,
+											   uint64 min_dead_us,
+											   ClusterQvotecPriorExitObservation *out);
 
 
 /* ----------
