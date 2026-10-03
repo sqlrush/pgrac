@@ -142,6 +142,23 @@ for my $node (0 .. 3)
 	}
 }
 is(scalar keys %generations, 4, 'four independent writer directories');
+sub entries
+{
+	my ($path) = @_;
+	opendir(my $dir, $path) or return undef;
+	my @names = sort grep { $_ ne '.' && $_ ne '..' } readdir($dir);
+	closedir $dir or die "close directory: $!";
+	return \@names;
+}
+is_deeply(entries("$temp/valid-data/pg_undo"), [map { "instance_$_" } 0 .. 3],
+	'canonical shared UNDO contains the complete original owner directories');
+for my $node (0 .. 3)
+{
+	my $directory = "$temp/valid-data/pg_undo/instance_$node";
+	ok(-d $directory && !-l $directory, 'original undo owner directory exists');
+	is_deeply(entries($directory), [], 'no bootstrap segment or shared TT is fabricated before live allocation');
+}
+ok(!-e "$temp/valid-data/pg_undo/pgrac_undo_root.control", 'creation does not grant online PGRD authority');
 my ($versioned, $beyond_checkpoint) = (0, 0);
 for my $dir ("$temp/valid-data/global", grep { -d $_ } glob("$temp/valid-data/base/*"))
 {

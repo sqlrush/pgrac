@@ -2,6 +2,7 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "postgres.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -232,6 +233,54 @@ create_child(const InitdbDirectory *parent, const char *name, InitdbDirectory *c
 	if (snprintf(child->path, sizeof(child->path), "%s/%s", parent->path, name) >= sizeof(child->path))
 		refuse("new child path is too long");
 	create_directory(child);
+}
+
+static void
+require_empty_directory(const InitdbDirectory *directory)
+{
+	struct dirent *entry;
+	DIR *scan;
+	int fd;
+	bool empty = true;
+
+	directory_current(directory);
+	fd = openat(directory->fd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (fd < 0 || (scan = fdopendir(fd)) == NULL)
+		refuse("cannot read original empty directory");
+	errno = 0;
+	while ((entry = readdir(scan)) != NULL)
+	{
+		if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0)
+			empty = false;
+	}
+	if (errno != 0 || closedir(scan) != 0 || !empty)
+		refuse("original undo directory is not an observed empty set");
+	directory_current(directory);
+}
+
+/* Shared segments/TT are first published by the admitted live current owner.
+ * Preserve the original empty namespace; local bootstrap seg_0 is not a seed. */
+static void
+create_undo_directories(const InitdbDirectory *shared, const ClusterSharedConfigRef *config)
+{
+	InitdbDirectory undo, child;
+	char name[32];
+
+	create_child(shared, "pg_undo", &undo);
+	require_empty_directory(&undo);
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++)
+	{
+		if (!(config->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64)))) continue;
+		snprintf(name, sizeof(name), "instance_%u", node);
+		create_child(&undo, name, &child);
+		require_empty_directory(&child);
+		if (fsync(child.fd) != 0 || close(child.fd) != 0)
+			refuse("cannot persist original empty undo owner directory");
+	}
+	directory_current(&undo);
+	if (fsync(undo.fd) != 0 || close(undo.fd) != 0 || fsync(shared->fd) != 0)
+		refuse("cannot persist original empty undo namespace");
+	directory_current(shared);
 }
 
 static void
@@ -601,6 +650,7 @@ ClusterInitdbCohortMain(int argc, char **argv)
 	create_peer_side(&roots[1], origins, ref);
 	create_origin_objects(&roots[1], origins, ref, incarnation);
 	create_common_objects(&roots[1], origins, ref);
+	create_undo_directories(&roots[1], ref);
 	for (int node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++)
 	{
 		InitdbOrigin *origin = &origins[node];
