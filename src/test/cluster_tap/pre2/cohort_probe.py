@@ -14,9 +14,8 @@ import pwd
 import signal
 import subprocess
 import time
-import uuid
 
-from cohort import request, topology, discovery
+from cohort_entry import CohortEntry, entry_profile
 from local_quorum import LocalQuorum
 
 
@@ -96,12 +95,11 @@ def probe(args):
         sockets = root/'sockets'
         sockets.mkdir()
         os.chown(sockets, args.uid, args.gid)
-        nodes = [dict(id=n, data_dir=str(root/f'cohort/node_{n}'), port=18000+n,
+        nodes = [dict(id=n, data_dir=str(root/f'node{n}/pgdata'), port=18000+n,
                       host=str(sockets), ic_port=19000+n, data_port=20000+2*n,
                       logfile=str(root/f'node{n}.log')) for n in range(args.nodes)]
         layout = dict(name=q.name, root=str(root), shared_data_dir=str(root/'data'),
-                      wal_root=str(root/'wal'), nodes=nodes)
-        addresses = [n['address'] for n in q.nodes[:args.nodes]]
+                      wal_root=str(root/'wal'), nodes=nodes, extra_conf=[])
         votes = []
         for n in range(3):
             path = root/f'vote{n}.image'
@@ -111,48 +109,23 @@ def probe(args):
             q.run(['setpriv', '--reuid', str(args.uid), '--regid', str(args.gid), '--init-groups',
                    args.vote_formatter.resolve(), '--attest', votes[-1], str(n)])
         result['steps']['fresh_votes'] = 'PASS'
-        text = request(layout, q.name, addresses, (int(time.time()) << 32) | 1,
-                       uuid.uuid4().hex, uuid.uuid4().hex)
+        profile = entry_profile(root/'quorum/handles.json', args.vote_formatter.resolve(), votes)
+        if args.operations:
+            profile['operations'] = json.loads(args.operations.read_text())
+        (root/'entry.json').write_text(json.dumps(profile, indent=2)+'\n')
+        if args.tap_source:
+            from cohort_scenarios import run_taps
+            result['scenarios'] = run_taps(q, args, root/'entry.json')
+        driver = CohortEntry(layout, bindir, profile)
+        driver.phase_budget(120)
+        driver.fresh_init()
         config = root/'request.conf'
-        config.write_text(text)
-        os.chown(config, args.uid, args.gid)
-        config.chmod(0o600)
         result['config_sha256'] = hashlib.sha256(config.read_bytes()).hexdigest()
         result['layout'] = layout
-        q.run(q.ns(0, [bindir/'initdb', '-D', root/'cohort', '-k', '-A', 'trust', '--no-locale',
-                       '--pgrac-initdb-cohort', '--pgrac-initdb-shared-config='+str(config)], database=True))
         result['steps']['native_cohort'] = 'PASS'
-        for node in nodes:
-            data = Path(node['data_dir'])
-            (data/'pgrac.conf').write_text(topology(q.name, nodes, addresses))
-            with (data/'postgresql.conf').open('a') as output:
-                output.write(discovery(layout, node, votes))
         result['steps']['StartupXLOG'] = 'NOT_REACHED'
-        deadline = time.monotonic() + 60
-        for node in nodes:
-            q.run(q.ns(node['id'], [bindir/'pg_ctl', '-D', node['data_dir'], '-l', node['logfile'],
-                                   '-W', 'start'], database=True))
-        ready = set()
-        while time.monotonic() < deadline:
-            for node in nodes:
-                log = Path(node['logfile']).read_text(errors='replace')
-                if 'database system was shut down at' in log:
-                    result['steps']['StartupXLOG_node'+str(node['id'])] = 'PASS'
-                if 'FATAL:' in log or 'PANIC:' in log or 'Assertion' in log:
-                    raise RuntimeError('node'+str(node['id'])+': '+next(line for line in log.splitlines()
-                        if any(s in line for s in ('FATAL:', 'PANIC:', 'Assertion'))))
-                if node['id'] not in ready:
-                    answer = q.run([bindir/'psql', '-XAtq', '-U', pwd.getpwuid(args.uid).pw_name,
-                                    '-h', node['host'], '-p', str(node['port']), '-d', 'postgres',
-                                    '-c', 'SELECT 1'], check=False, timeout=4)
-                    if answer.returncode == 0:
-                        ready.add(node['id'])
-            if len(ready) == args.nodes:
-                result['steps']['sql_connections'] = 'PASS'
-                break
-            time.sleep(.2)
-        else:
-            raise RuntimeError('60-second startup budget expired; inspect node logs and quorum snapshots')
+        driver.shared_start()
+        result['steps']['sql_connections'] = 'PASS'
         # Actual cross-node SQL is the next independent obligation; no SQL retry.
         for n, sql in [(0, 'CREATE TABLE p3b_cohort_smoke(id int PRIMARY KEY, v int); '
                            'INSERT INTO p3b_cohort_smoke VALUES(1,1)'),
@@ -171,6 +144,10 @@ def probe(args):
         result['first_error'] = type(error).__name__+': '+str(error)
     finally:
         errors = []
+        for node in nodes:
+            path = Path(node['logfile'])
+            if path.exists() and 'database system was shut down at' in path.read_text(errors='replace'):
+                result['steps']['StartupXLOG_node'+str(node['id'])] = 'PASS'
         try:
             cleanup(q, nodes, bindir)
         except Exception as error:
@@ -182,7 +159,8 @@ def probe(args):
         result['cleanup'] = 'FAILED: '+ '; '.join(errors) if errors else 'OWNED_PROCESSES_STOPPED'
         (root/'result.json').write_text(json.dumps(result, indent=2)+'\n')
     print(json.dumps(result, indent=2))
-    return 1 if result['first_error'] or errors else 0
+    # SQL success alone is not an OPEN or normal-restart acceptance result.
+    return 1 if result['first_error'] or errors else 2
 
 
 if __name__ == '__main__':
@@ -195,4 +173,7 @@ if __name__ == '__main__':
     parser.add_argument('--nodes', type=int, choices=[2, 4], required=True)
     parser.add_argument('--uid', type=int, required=True)
     parser.add_argument('--gid', type=int, required=True)
+    parser.add_argument('--tap-source', type=Path, help='run unchanged 431/432/433 against this entry (four nodes)')
+    parser.add_argument('--pg-regress', type=Path, help='pg_regress from a matching independent test build')
+    parser.add_argument('--operations', type=Path, help='JSON mapping to actual product observations; no literal results')
     raise SystemExit(probe(parser.parse_args()))

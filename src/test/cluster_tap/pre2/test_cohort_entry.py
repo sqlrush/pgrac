@@ -31,7 +31,7 @@ class CohortEntryTest(unittest.TestCase):
 
     def runner(self, argv, **kwargs):
         self.calls.append(argv)
-        if Path(argv[0]).name == 'initdb':
+        if Path(argv[0]).name == 'initdb' and '-D' in argv:
             parent = Path(argv[argv.index('-D')+1])
             for n in range(2):
                 data = parent/f'node_{n}'

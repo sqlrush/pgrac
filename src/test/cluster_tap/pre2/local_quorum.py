@@ -186,6 +186,7 @@ class LocalQuorum:
     def save(self):
         (self.root/'handles.json').write_text(json.dumps(dict(
             bridge=self.tag, name=self.name, nodes=self.nodes, loops=self.loops,
+            vendor=str(self.vendor), count=self.count, uid=self.uid, gid=self.gid,
             processes=[p.pid for p in self.processes]), indent=2)+'\n')
 
     def stop(self):

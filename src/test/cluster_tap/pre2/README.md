@@ -3,9 +3,10 @@
 These tests create disposable databases. They do not convert an existing
 database, edit control/page/WAL formats, or remove a `backup_label` to start a
 server. The first-chain TAP tests use the built-in black-box command adapter;
-see [BLACKBOX.md](BLACKBOX.md). Its fresh PRE2 product entry mapping is still
-required. Without the S11/S12 entries it reports **BLOCKED** with failing TAP
-assertions and exit 1. The older Python acceptance runner below continues to
+see [BLACKBOX.md](BLACKBOX.md). The local Linux controller supports the native
+`initdb --pgrac-initdb-cohort` entry with real quorum and fresh voting devices.
+Supported product lifecycle observations are still required. Missing entries
+report **BLOCKED** with failing TAP assertions and exit 1. The older Python acceptance runner below continues to
 use the external adapter interface.
 
 `PASS` means every real assertion and fixture shutdown succeeded. A missing
