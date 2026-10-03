@@ -7125,6 +7125,55 @@ UT_TEST(test_pre2_initial_lmon_produces_nonzero_control_only_after_fence_and_pgf
 	pre2_initial_restore();
 }
 
+/* Persistent voting state survives loss of every postmaster's shmem. */
+UT_TEST(test_pre2_restart_advances_past_persistent_fence)
+{
+	for (int interrupted = 0; interrupted < 2; ++interrupted) {
+		ClusterReconfigState *state = pre2_initial_fixture();
+		ClusterFormationMarkerSubmitRequest request;
+		ClusterFormationCommitMarker marker;
+		uint64 incs[CLUSTER_MAX_NODES];
+		uint64 old_epoch = interrupted ? 1 : 7;
+
+		ut_formation_authority.marker.fence_epoch = old_epoch;
+		cluster_reconfig_formation_qvotec_note_max_generation(interrupted ? 0 : 3);
+		for (int i = 0; i < 5; ++i)
+			cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(ut_fence_async_submit_calls, 1);
+		UT_ASSERT_EQ(ut_fence_async_marker.fence_epoch, old_epoch + 1);
+		UT_ASSERT_EQ(cluster_epoch_get_current(), 0);
+		ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_ACKED;
+		ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_ACK;
+		ut_formation_authority.marker.fence_epoch = old_epoch + 1;
+		for (int i = 0; i < 3; ++i)
+			cluster_reconfig_lmon_tick();
+		UT_ASSERT(cluster_reconfig_formation_qvotec_poll_pending(&request));
+		if (pg_atomic_read_u64(&state->formation_marker_request_seq) != 0) {
+			UT_ASSERT(cluster_formation_marker_decode(request.marker_bytes, &marker, incs));
+			UT_ASSERT_EQ(marker.formation_epoch, old_epoch + 1);
+			UT_ASSERT_EQ(marker.formation_generation, interrupted ? 1 : 4);
+			UT_ASSERT_EQ(incs[0], 77);
+			UT_ASSERT_EQ(incs[1], 88);
+			cluster_reconfig_formation_qvotec_complete(true);
+			cluster_reconfig_lmon_tick();
+			UT_ASSERT_EQ(cluster_epoch_get_current(), old_epoch + 1);
+			UT_ASSERT_EQ(state->startup_formation.formation_generation, marker.formation_generation);
+			UT_ASSERT_EQ(state->self_join_admitted, 0);
+		}
+		pre2_initial_restore();
+	}
+}
+
+UT_TEST(test_pre2_unadmitted_lmon_never_reads_voting_disks)
+{
+	(void)pre2_initial_fixture();
+	unsigned before = ut_formation_authority_reads;
+	for (int i = 0; i < 6; ++i)
+		cluster_reconfig_lmon_tick();
+	UT_ASSERT_EQ(ut_formation_authority_reads, before);
+	pre2_initial_restore();
+}
+
 UT_TEST(test_pre2_initial_lmon_does_not_form_without_complete_fresh_quorum)
 {
 	for (int bad = 0; bad < 4; ++bad) {
@@ -7713,7 +7762,7 @@ UT_TEST(test_membership_cut_generation_uses_original_shmem_owner)
 int
 main(void)
 {
-	UT_PLAN(142);
+	UT_PLAN(144);
 	UT_RUN(test_stop_membership_terminal_peer_is_not_online_admission);
 	UT_RUN(test_stop_membership_preserves_all_nonliveness_requirements);
 	UT_RUN(test_stop_reconfig_shared_owners);
@@ -7892,6 +7941,8 @@ main(void)
 	UT_RUN(test_pre2_initial_commit_requires_current_majority_and_boot_tuple);
 	UT_RUN(test_pre2_initial_slow_peer_consumes_same_commit_and_stripe_refuses);
 	UT_RUN(test_pre2_initial_stale_commit_and_failed_fence_cannot_admit);
+	UT_RUN(test_pre2_restart_advances_past_persistent_fence);
+	UT_RUN(test_pre2_unadmitted_lmon_never_reads_voting_disks);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
