@@ -180,6 +180,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_hang_resolve \
         test_cluster_cr_server_policy \
         test_cluster_runtime_visibility \
+		test_cluster_tt_terminal_route \
         test_cluster_touched_peers \
         test_cluster_clean_leave \
         test_cluster_membership \
@@ -412,6 +413,7 @@ SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_ctl,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge test_cluster_port_runtime,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_prepare_diagnostic,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_tt_terminal_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_pacemaker test_pgrac_fenced_cib,$(SIMPLE_TESTS))
 # PGRAC: production journal validation is linked into target command tests.
@@ -786,6 +788,23 @@ test_cluster_runtime_visibility: test_cluster_runtime_visibility.c unit_test.h $
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Exercise the original requester branch and live membership wrapper, with
+# proof/transport boundaries supplied by the fixture rather than copied logic.
+test_cluster_tt_terminal_route.inc: $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_authority_snapshot.c Makefile
+	awk '/^(rtvis_local_freshref_c1b_pair_eligible|cluster_undo_verdict_resolve_internal|cluster_undo_serve_authority_lookup|cluster_undo_serve_authority)\(/ \
+	     { print previous; emit=1; found++ } emit { print } /^}/ { emit=0 } \
+	     { previous=$$0 } END { if (found != 4 || emit) exit 1 }' \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_authority_snapshot.c \
+		$(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tt_terminal_route: test_cluster_tt_terminal_route.c unit_test.h \
+		test_cluster_tt_terminal_route.inc $(top_builddir)/src/backend/cluster/cluster_undo_authority.o \
+		$(CLUSTER_RUNTIME_VIS_POLICY_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNDO_AUTHORITY_O) \
+		$(CLUSTER_RUNTIME_VIS_POLICY_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # spec-5.14 D1: test_cluster_touched_peers links cluster_touched_peers.o (the
 # pure per-tx touched bitmap: stamp / poison / intersect / reset / DSM merge).
@@ -4157,6 +4176,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_tt_terminal_route.inc test_cluster_tt_terminal_route.inc.tmp
 	rm -f test_cluster_typed_redo_reader.inc test_cluster_typed_redo_fpi.inc test_cluster_cold_init_native.inc
 	rm -f test_cluster_current_mx_local_sample.inc test_cluster_current_mx_reply_builder.inc
 	rm -f test_cluster_page_cold_redo_product.o
