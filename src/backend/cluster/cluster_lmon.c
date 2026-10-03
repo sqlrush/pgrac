@@ -1139,6 +1139,10 @@ lmon_normal_stop_observe(bool final_observation)
 			aggregate = cluster_pi_writeback_normal_stop_poll_v1(&observation.reason);
 			observation.domain = "physical-pi-writeback";
 		}
+		if (aggregate == CLUSTER_NORMAL_STOP_READY) {
+			aggregate = cluster_ko_shared_normal_stop_poll_v2(&observation.reason);
+			observation.domain = "shared-object-flush";
+		}
 		if (aggregate != CLUSTER_NORMAL_STOP_READY) {
 			observation.slot = -1;
 			observation.key = 0;
@@ -1503,6 +1507,7 @@ LmonMain(void)
 					cluster_wal_cut_lmon_tick_v1();
 					cluster_pi_data_lmon_tick_v1();
 					cluster_pi_writeback_lmon_tick_v1();
+					cluster_ko_lmon_tick_v2();
 					cluster_shared_config_delivery_lmon_tick();
 				}
 				/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
@@ -2316,6 +2321,7 @@ LmonMain(void)
 					cluster_wal_cut_lmon_tick_v1();
 					cluster_pi_data_lmon_tick_v1();
 					cluster_pi_writeback_lmon_tick_v1();
+					cluster_ko_lmon_tick_v2();
 					cluster_shared_config_delivery_lmon_tick();
 				}
 				(void)cluster_gcs_block_lmon_drain_direct_land_aborts();

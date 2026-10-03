@@ -608,7 +608,7 @@ cluster_ic_local_capability_word(void)
 	/* PGRAC: codec support only; never an application/admission assertion.
 	 * Author: SqlRush <sqlrush@gmail.com> */
 	if (cluster_shared_config)
-		capabilities |= PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3;
+		capabilities |= PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3 | PGRAC_IC_HELLO_CAP_KO_SHARED_V2;
 	if (cluster_smart_fusion && cluster_interconnect_tier == cluster_smart_fusion_tier_min)
 		capabilities |= PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2;
 	if (!cluster_ic_suppress_caps_reply)

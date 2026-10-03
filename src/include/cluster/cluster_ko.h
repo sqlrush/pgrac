@@ -220,6 +220,8 @@ extern void cluster_ko_flush_ack_handler(const ClusterICEnvelope *env, const voi
  * full buffer-pool scan.
  */
 extern void cluster_ko_drain_inbound_and_apply(void);
+/* Original LMON drains the shared-only fixed frame queue, outside locks. */
+extern void cluster_ko_lmon_tick_v2(void);
 
 /* ---- observability counters (dump_ko; surfaced by pg_cluster_state) - */
 extern uint64 cluster_ko_flush_count(void);		   /* barriers initiated (enqueuer) */

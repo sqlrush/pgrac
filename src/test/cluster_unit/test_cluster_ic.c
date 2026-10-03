@@ -1014,9 +1014,10 @@ UT_TEST(test_config_members_capability_profile)
 {
 	uint32 baseline = cluster_ic_local_capability_word();
 	UT_ASSERT_EQ(baseline & PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3, 0);
+	UT_ASSERT_EQ(baseline & PGRAC_IC_HELLO_CAP_KO_SHARED_V2, 0);
 	cluster_shared_config = true;
 	UT_ASSERT_EQ(cluster_ic_local_capability_word(),
-				 baseline | PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3);
+				 baseline | PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3 | PGRAC_IC_HELLO_CAP_KO_SHARED_V2);
 	cluster_shared_config = false;
 	UT_ASSERT_EQ(cluster_ic_local_capability_word(), baseline);
 }

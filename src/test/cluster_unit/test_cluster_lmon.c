@@ -43,6 +43,7 @@
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_control_retire.h"
 #include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_cf_enqueue.h"
@@ -117,7 +118,7 @@ static char test_stop_last_detail[256];
 static TimestampTz test_stop_now;
 static LWLock *test_stop_locks[8];
 static unsigned test_stop_lock_depth;
-static ClusterNormalStopPollResult test_stop_observation[24];
+static ClusterNormalStopPollResult test_stop_observation[25];
 bool cluster_shared_config;
 static unsigned test_control_owner_polls;
 
@@ -1548,6 +1549,9 @@ void
 cluster_pi_writeback_lmon_tick_v1(void)
 {}
 void
+cluster_ko_lmon_tick_v2(void)
+{}
+void
 cluster_wal_cut_register_v1(void)
 {}
 void
@@ -1567,6 +1571,12 @@ cluster_pi_writeback_normal_stop_poll_v1(const char **reason)
 {
 	*reason = "FIXTURE_PI_WRITEBACK";
 	return test_stop_poll(22);
+}
+ClusterNormalStopPollResult
+cluster_ko_shared_normal_stop_poll_v2(const char **reason)
+{
+	*reason = "FIXTURE_SHARED_KO";
+	return test_stop_poll(24);
 }
 ClusterNormalStopPollResult
 cluster_wal_cut_normal_stop_poll_v1(const char **reason)
@@ -1844,7 +1854,7 @@ test_stop_wait(WaitEvent *events)
 					  || test_stop_case == 27 || test_stop_case == 29 || test_stop_case == 31
 					  || test_stop_case == 33 || test_stop_case == 35 || test_stop_case == 37
 					  || test_stop_case == 48
-					  || (test_stop_case >= 49 && test_stop_case <= 54 && test_stop_case % 2))
+					  || (test_stop_case >= 49 && test_stop_case <= 56 && test_stop_case % 2))
 							 && test_lmon_wait_calls == 1
 						 ? 0
 						 : 1);
@@ -1857,7 +1867,7 @@ test_stop_wait(WaitEvent *events)
 		test_stop_observation[20] = CLUSTER_NORMAL_STOP_READY;
 		return 0; /* Exact cleanup consumer, not observer, discharges debt. */
 	}
-	if (test_stop_case >= 49 && test_stop_case <= 54 && test_stop_case % 2
+	if (test_stop_case >= 49 && test_stop_case <= 56 && test_stop_case % 2
 		&& test_lmon_wait_calls == 1) {
 		test_stop_observation[21 + (test_stop_case - 49) / 2] = CLUSTER_NORMAL_STOP_READY;
 		return 0; /* Simulated original mailbox consumer, not its stop observer. */
@@ -1970,7 +1980,7 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 	test_stop_exit_code = -1;
 	test_stop_duties = test_stop_events = test_stop_polls = test_stop_frees = 0;
 	test_control_owner_polls = 0;
-	cluster_shared_config = scenario >= 48 && scenario <= 54;
+	cluster_shared_config = scenario >= 48 && scenario <= 56;
 	test_stop_last_detail[0] = '\0';
 	test_stop_lock_depth = 0;
 	test_lmon_wait_calls = 0;
@@ -1981,7 +1991,7 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 		test_stop_observation[i] = CLUSTER_NORMAL_STOP_READY;
 	if (scenario == 48)
 		test_stop_observation[20] = CLUSTER_NORMAL_STOP_PENDING;
-	if (scenario >= 49 && scenario <= 54)
+	if (scenario >= 49 && scenario <= 56)
 		test_stop_observation[21 + (scenario - 49) / 2]
 			= scenario % 2 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID;
 	if (scenario == 1 || scenario == 6)
@@ -2047,10 +2057,10 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 	cluster_node_id = saved_node_id;
 }
 
-UT_TEST(test_stop_real_lmon_pi_and_wal_mailboxes_block_until_original_consumer)
+UT_TEST(test_stop_real_lmon_pi_wal_and_ko_mailboxes_block_until_original_consumer)
 {
 	for (int mode = 0; mode < 2; mode++)
-		for (unsigned scenario = 49; scenario <= 54; scenario += 2) {
+		for (unsigned scenario = 49; scenario <= 56; scenario += 2) {
 			test_run_normal_stop_lmon(mode, scenario);
 			UT_ASSERT_EQ(test_stop_exit_code, 0);
 			UT_ASSERT_EQ(test_lmon_wait_calls, 2);
@@ -2112,9 +2122,9 @@ UT_TEST(test_stop_real_lmon_late_invalid_overrides_pending)
 	for (int mode = 0; mode < 2; mode++) {
 		test_run_normal_stop_lmon(mode, 6);
 		UT_ASSERT_EQ(test_stop_exit_code, 1);
-		/* The native profile skips the shared-config registry and the three
-		 * shared PI/DATA/WAL mailbox owners. */
-		UT_ASSERT_EQ(test_stop_polls, lengthof(test_stop_observation) - 4);
+		/* The native profile skips the shared-config registry and the four
+		 * shared PI/DATA/WAL/KO mailbox owners. */
+		UT_ASSERT_EQ(test_stop_polls, lengthof(test_stop_observation) - 5);
 		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
 	}
 }
@@ -2420,7 +2430,7 @@ main(void)
 	UT_RUN(test_lmon_duty_lazy_truth_table);
 	UT_RUN(test_lmon_pid_no_pgproc_never_uses_blocking_lwlock);
 	UT_RUN(test_stop_real_lmon_both_modes_work_wait_exit);
-	UT_RUN(test_stop_real_lmon_pi_and_wal_mailboxes_block_until_original_consumer);
+	UT_RUN(test_stop_real_lmon_pi_wal_and_ko_mailboxes_block_until_original_consumer);
 	UT_RUN(test_stop_real_lmon_request_during_outer_pass);
 	UT_RUN(test_stop_real_lmon_early_and_last_cut_refuse_exit);
 	UT_RUN(test_stop_real_lmon_both_error_segments_unwind);
