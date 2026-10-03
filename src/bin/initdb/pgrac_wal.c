@@ -1,7 +1,11 @@
 /* Author: SqlRush <sqlrush@gmail.com> */
 /* Original creator's exact, read-only native shutdown record inspection.
  * Author: SqlRush <sqlrush@gmail.com> */
+#ifdef FRONTEND
 #include "postgres_fe.h"
+#else
+#include "postgres.h"
+#endif
 
 #include <fcntl.h>
 #include <sys/stat.h>
