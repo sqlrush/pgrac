@@ -15,6 +15,7 @@
 #include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_initdb_base.h"
+#include "cluster/cluster_initdb_config.h"
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_space_reservation.h"
@@ -508,6 +509,7 @@ cluster_initdb_base_create(int exit_code)
 {
 	const PgracInitdbWalContext *context = cluster_wal_thread_initdb_context();
 	BaseCreate *create;
+	ClusterInitdbConfig *config;
 	struct stat data_st, target_st;
 	int source, base, target_base;
 	DIR *dir;
@@ -525,6 +527,7 @@ cluster_initdb_base_create(int exit_code)
 		|| (uint64) target_st.st_dev != context->base_device || (uint64) target_st.st_ino != context->base_inode)
 		base_refuse("original source or target identity changed");
 	require_empty(context->base_fd);
+	config = cluster_initdb_config_prepare(context);
 	/* Own the actual native flush before reading the completed SQL/catalog
 	 * tree. The later shutdown checkpoint covers the typed copy records. */
 	CreateCheckPoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE);
@@ -580,6 +583,7 @@ cluster_initdb_base_create(int exit_code)
 		for (; i < end; ++i)
 			copy_file(create, &create->files[i], &identity);
 	}
+	cluster_initdb_config_create(config, create->dirs[0].target);
 	for (uint32 i = 0; i < create->ndirs; ++i)
 	{
 		sync_directory_close(i == 0 ? context->base_fd : target_base,

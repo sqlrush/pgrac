@@ -197,9 +197,9 @@ sub refused_context
 my @data_stat = stat($data0);
 my @wal_stat = stat($wal0);
 my @context = (0x50474957, 7, 2, $id, @data_stat[0,1], @wal_stat[0,1]);
-sub pack_context { return pack('LSSQQQQQ', @_) . ("\0" x 48); }
+sub pack_context { return pack('LSSQQQQQ', @_) . ("\0" x 104); }
 my $context = pack_context(@context);
-is(length($context), 96, 'native carrier layout is exact');
+is(length($context), 152, 'native carrier layout is exact');
 refused_context('short', substr($context, 0, 95));
 refused_context('trailing', $context . 'x');
 $context[2] = 1;

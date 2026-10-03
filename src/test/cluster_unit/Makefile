@@ -46,7 +46,7 @@ endif
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
-        test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side \
+        test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_config \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
         test_pgrac_fenced_target_command test_pgrac_fenced_target_reply test_pgrac_fenced_target_client \
@@ -3656,7 +3656,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-$(filter-out test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_config test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # The wire behavior is inline; an updated decoder must rebuild this binary.
@@ -5523,6 +5523,14 @@ test_cluster_initdb_side: test_cluster_initdb_side.c unit_test.h \
 
 # Original creation I/O boundaries: real files and SHA256; only failing syscalls
 # are injected. The whole successful creator is exercised by initdb TAP 004.
+test_cluster_initdb_config: test_cluster_initdb_config.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_config.c \
+		$(top_srcdir)/src/common/file_perm.c cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/file_perm.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
+		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
 test_cluster_initdb_base: test_cluster_initdb_base.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_base.c cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \

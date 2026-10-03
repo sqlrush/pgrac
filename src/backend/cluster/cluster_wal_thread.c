@@ -298,6 +298,27 @@ cluster_wal_thread_initdb_accept(bool bootstrap)
 		if (context.base_fd != 0 && fcntl(context.base_fd, F_SETFD, FD_CLOEXEC) != 0)
 			ereport(FATAL, (errmsg("INITDB_BASE_CONTEXT: cannot isolate original target descriptor")));
 	}
+	{
+		static const PgracInitdbConfigContext empty = { 0 };
+		struct stat config_st;
+		uint8 any = 0;
+		for (int i = 0; i < sizeof(context.config.sha256); i++)
+			any |= context.config.sha256[i];
+		if (context.config.fd == 0) {
+			if (memcmp(&context.config, &empty, sizeof(empty)) != 0)
+				ereport(FATAL, (errmsg("INITDB_CONFIG_CONTEXT: incomplete creation request")));
+		} else if (bootstrap || context.base_fd < 3 || context.config.fd < 3
+				   || context.config.fd == context.base_fd || context.config.bytes == 0
+				   || context.config.bytes > PGRAC_INITDB_CONFIG_MAX_BYTES || any == 0
+				   || fstat(context.config.fd, &config_st) != 0 || !S_ISREG(config_st.st_mode)
+				   || config_st.st_uid != geteuid() || (config_st.st_mode & 0022) != 0
+				   || config_st.st_nlink != 1 || config_st.st_size != context.config.bytes
+				   || (uint64)config_st.st_dev != context.config.device
+				   || (uint64)config_st.st_ino != context.config.inode
+				   || fcntl(context.config.fd, F_SETFD, FD_CLOEXEC) != 0)
+			ereport(FATAL,
+					(errmsg("INITDB_CONFIG_CONTEXT: invalid original configuration request")));
+	}
 	initdb_wal_context = context;
 }
 

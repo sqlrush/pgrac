@@ -76,6 +76,7 @@
 #include "cluster/cluster_wal_state.h"
 #include "common/cluster_hw_snapshot_codec.h"
 #include "common/pgrac_initdb_wal.h"
+#include "common/cryptohash.h"
 #include "datatype/timestamp.h"
 #endif
 #include "common/controldata_utils.h"
@@ -201,6 +202,9 @@ static uint64 pgrac_native_database_incarnation;
 static uint8 pgrac_native_storage_bytes[16];
 static int pgrac_native_base_fd = -1;
 static int pgrac_native_base_child_fd = -1;
+static char *pgrac_native_config_path;
+static PgracInitdbConfigContext pgrac_native_config;
+static int pgrac_native_config_child_fd = -1;
 static void pgrac_native_bind_creation(void);
 static int pgrac_native_child_begin(bool bootstrap);
 static void pgrac_native_child_started(int context_fd);
@@ -2596,7 +2600,10 @@ usage(const char *progname)
 			 "      --pgrac-initdb-storage-uuid=HEX\n"
 			 "                            shared storage identity, 32 lowercase hex digits\n"
 			 "      --pgrac-initdb-database-incarnation=N\n"
-			 "                            database generation for the new shared base\n"));
+			 "                            database generation for the new shared base\n"
+			 "      --pgrac-initdb-shared-config=FILE\n"
+			 "                            canonical generation-1 configuration request\n"
+			 "                            (requires shared base and explicit system identity)\n"));
 #endif
 	printf(_("\nLess commonly used options:\n"));
 	printf(_("  -c, --set NAME=VALUE      override default setting for server parameter\n"));
@@ -3569,6 +3576,10 @@ pgrac_native_validate_options(void)
 {
 	if (getenv(PGRAC_INITDB_WAL_CONTEXT_ENV) != NULL)
 		pg_fatal("INITDB_WAL_CONTEXT: initdb cannot inherit a child context");
+	if (pgrac_native_config_path != NULL
+		&& (pgrac_native_base_path == NULL || pgrac_native_sysid == 0))
+		pg_fatal("INITDB_CONFIG_OPTIONS: original shared base and explicit common system identity "
+				 "required");
 	if (pgrac_native_base_path != NULL || pgrac_native_storage_uuid != NULL
 		|| pgrac_native_database_incarnation != 0)
 	{
@@ -3600,6 +3611,69 @@ pgrac_native_validate_options(void)
 	if (extra_guc_names != NULL || share_path != NULL || pgrac_hw_snapshot_root != NULL
 		|| pgrac_hw_snapshot_owner >= 0 || pgrac_wal_state_root != NULL)
 		pg_fatal("INITDB_WAL_OVERRIDE: native writer creation does not accept parameter, input or legacy authority overrides");
+}
+
+/* Bind a logical request before creating any native files. It is not a
+ * previously installed object or permission to adopt an old database. */
+static void
+pgrac_native_config_check(bool first)
+{
+	struct stat held, named;
+	PgracInitdbConfigContext observed = { 0 };
+	pg_cryptohash_ctx *hash;
+	char *resolved, *bytes, extra;
+	Size used = 0;
+	ssize_t n;
+	if (pgrac_native_config_path == NULL)
+		return;
+	resolved = realpath(pgrac_native_config_path, NULL);
+	if (resolved == NULL || strcmp(resolved, pgrac_native_config_path) != 0)
+		pg_fatal("INITDB_CONFIG_PATH: configuration request must be a canonical regular file");
+	free(resolved);
+	if (first) {
+		pgrac_native_config.fd
+			= open(pgrac_native_config_path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+		if (pgrac_native_config.fd < 3)
+			pg_fatal("INITDB_CONFIG_PATH: cannot bind configuration request: %m");
+	}
+	if (fstat(pgrac_native_config.fd, &held) != 0 || lstat(pgrac_native_config_path, &named) != 0
+		|| !S_ISREG(held.st_mode) || !S_ISREG(named.st_mode) || held.st_dev != named.st_dev
+		|| held.st_ino != named.st_ino || held.st_uid != geteuid() || held.st_nlink != 1
+		|| (held.st_mode & 0022) != 0 || held.st_size <= 0
+		|| held.st_size > PGRAC_INITDB_CONFIG_MAX_BYTES)
+		pg_fatal("INITDB_CONFIG_PATH: configuration request identity or ownership is invalid");
+	observed.fd = pgrac_native_config.fd;
+	observed.device = held.st_dev;
+	observed.inode = held.st_ino;
+	observed.bytes = held.st_size;
+	bytes = pg_malloc(observed.bytes);
+	while (used < observed.bytes) {
+		n = pread(observed.fd, bytes + used, observed.bytes - used, used);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			pg_fatal("INITDB_CONFIG_READ: cannot read original configuration request: %m");
+		used += n;
+	}
+	do {
+		n = pread(observed.fd, &extra, 1, used);
+	} while (n < 0 && errno == EINTR);
+	if (n != 0 || fstat(observed.fd, &named) != 0 || named.st_size != held.st_size
+		|| named.st_mode != held.st_mode || named.st_uid != held.st_uid
+		|| named.st_nlink != held.st_nlink || named.st_mtime != held.st_mtime
+		|| named.st_ctime != held.st_ctime)
+		pg_fatal("INITDB_CONFIG_READ: configuration request changed while being read");
+	hash = pg_cryptohash_create(PG_SHA256);
+	if (hash == NULL || pg_cryptohash_init(hash) < 0
+		|| pg_cryptohash_update(hash, (uint8 *)bytes, used) < 0
+		|| pg_cryptohash_final(hash, observed.sha256, sizeof(observed.sha256)) < 0)
+		pg_fatal("INITDB_CONFIG_READ: cannot hash original configuration request");
+	pg_cryptohash_free(hash);
+	pg_free(bytes);
+	if (first)
+		pgrac_native_config = observed;
+	else if (memcmp(&observed, &pgrac_native_config, sizeof(observed)) != 0)
+		pg_fatal("INITDB_CONFIG_READ: configuration request changed after binding");
 }
 
 static void
@@ -3659,6 +3733,7 @@ pgrac_native_prepare_paths(void)
 		if (lstat(parent, &st) != 0 || !S_ISDIR(st.st_mode))
 			pg_fatal("INITDB_WAL_PATH: original data and WAL parents must already exist");
 	}
+	pgrac_native_config_check(true);
 }
 
 static void
@@ -3762,6 +3837,7 @@ pgrac_native_child_begin(bool bootstrap)
 
 	if (pgrac_native_thread < 0)
 		return -1;
+	pgrac_native_config_check(false);
 	pgrac_native_check_directories(&data_st, &wal_st);
 	context.magic = PGRAC_INITDB_WAL_CONTEXT_MAGIC;
 	context.thread_id = pgrac_native_thread;
@@ -3789,6 +3865,14 @@ pgrac_native_child_begin(bool bootstrap)
 			context.base_device = base_st.st_dev;
 			context.base_inode = base_st.st_ino;
 			memcpy(context.storage_uuid, pgrac_native_storage_bytes, sizeof(context.storage_uuid));
+			if (pgrac_native_config.fd >= 3) {
+				context.config = pgrac_native_config;
+				pgrac_native_config_child_fd = fcntl(pgrac_native_config.fd, F_DUPFD, 3);
+				if (pgrac_native_config_child_fd < 3)
+					pg_fatal(
+						"INITDB_CONFIG_CONTEXT: cannot pass original configuration request: %m");
+				context.config.fd = pgrac_native_config_child_fd;
+			}
 		}
 	}
 	if (pipe(descriptors) != 0)
@@ -3814,6 +3898,11 @@ pgrac_native_child_started(int context_fd)
 			pg_fatal("INITDB_BASE_CONTEXT: cannot release child target fd: %m");
 		pgrac_native_base_child_fd = -1;
 	}
+	if (pgrac_native_config_child_fd >= 0) {
+		if (close(pgrac_native_config_child_fd) != 0)
+			pg_fatal("INITDB_CONFIG_CONTEXT: cannot release child configuration fd: %m");
+		pgrac_native_config_child_fd = -1;
+	}
 }
 
 static void
@@ -3825,6 +3914,7 @@ pgrac_native_sync(void)
 	ControlFileData *after;
 	PgracInitdbWalObservation observed;
 
+	pgrac_native_config_check(false);
 	pgrac_native_check_directories(&data_st, &wal_st);
 	/* Reuse the original creator's strict file/directory walker, not the
 	 * best-effort generic frontend sync walk. */
@@ -3871,6 +3961,10 @@ pgrac_native_sync(void)
 	if (pgrac_native_base_fd >= 0 && close(pgrac_native_base_fd) != 0)
 		pg_fatal("INITDB_BASE_SYNC: cannot close original shared base: %m");
 	pgrac_native_base_fd = -1;
+	pgrac_native_config_check(false);
+	if (pgrac_native_config.fd >= 3 && close(pgrac_native_config.fd) != 0)
+		pg_fatal("INITDB_CONFIG_SYNC: cannot release original configuration request: %m");
+	memset(&pgrac_native_config, 0, sizeof(pgrac_native_config));
 }
 
 /* Only main's successful post-bootstrap, post-fsync edge calls this producer. */
@@ -4333,6 +4427,7 @@ main(int argc, char *argv[])
 			{ "pgrac-initdb-shared-base", required_argument, NULL, 23 },
 			{ "pgrac-initdb-storage-uuid", required_argument, NULL, 24 },
 			{ "pgrac-initdb-database-incarnation", required_argument, NULL, 25 },
+			{ "pgrac-initdb-shared-config", required_argument, NULL, 26 },
 #endif
 			{ NULL, 0, NULL, 0 } };
 
@@ -4561,6 +4656,11 @@ main(int argc, char *argv[])
 				if (pgrac_native_storage_uuid != NULL)
 					pg_fatal("INITDB_BASE_OPTIONS: duplicate storage identity");
 				pgrac_native_storage_uuid = pg_strdup(optarg);
+				break;
+			case 26:
+				if (pgrac_native_config_path != NULL)
+					pg_fatal("INITDB_CONFIG_OPTIONS: duplicate configuration request");
+				pgrac_native_config_path = pg_strdup(optarg);
 				break;
 #endif
 			default:
