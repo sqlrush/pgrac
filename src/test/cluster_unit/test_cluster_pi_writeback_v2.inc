@@ -102,6 +102,107 @@ wb_v2_drop(ClusterPiWritebackMessageV2 *m)
 	s->durability_flags = 15;
 }
 
+static void
+wb_v2_origin_fixture(ClusterPiWritebackMessageV2 *m, const ClusterPiDataFactV1 *data)
+{
+	ClusterPiStructuralFactV2 *s;
+	wb_v2_fixture(m, data);
+	m->facts[0] = m->facts[1];
+	m->count = 1;
+	m->peer = wb_sources[2];
+	s = &m->facts[0].proof.structural;
+	UT_ASSERT_EQ(s->ko.origin_node, 2);
+	UT_ASSERT_EQ(s->terminal.storage_cut.master_node, 0);
+	/* The original DDL barrier was 2 -> 0. Master 0 later notifies 2;
+	 * no KO self-request is invented for that notification. */
+	s->ko.peer_node = 0;
+	s->ko.peer_boot = wb_sources[0].claim.identity.origin_owner_incarnation;
+}
+
+UT_TEST(writeback_v2_origin_receives_original_master_ko)
+{
+	ClusterPageDataReceiptV1 *receipt = wb_setup();
+	ClusterPiDataFactV1 data;
+	ClusterPiWritebackMessageV2 m, decoded, ack;
+	uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
+	Size length = 0;
+	UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &data));
+	for (unsigned mode = 0; mode < 2; mode++) {
+		ClusterPiStructuralFactV2 *s;
+		wb_v2_origin_fixture(&m, &data);
+		s = &m.facts[0].proof.structural;
+		if (mode == 1) {
+			s->terminal.write_cut = data_pi_cut();
+			s->terminal.write_cut.master_node = 0;
+			s->terminal.write_cut.pi_holders_bitmap = 7;
+			s->terminal.write_cut.holder.master_session_incarnation = 9;
+			s->terminal.write_cut.holder.requester_target_generation = 73;
+			s->terminal.write_cut.holder.assertion.resource = s->terminal.storage_cut.resource;
+			memset(&s->terminal.storage_cut, 0, sizeof(s->terminal.storage_cut));
+		}
+		UT_ASSERT(cluster_pi_writeback_encode_v2(&m, bytes, sizeof(bytes), &length));
+		UT_ASSERT_EQ(length, 176 + 1424);
+		UT_ASSERT(cluster_pi_writeback_decode_v2(bytes, length, &decoded));
+		UT_ASSERT_EQ(decoded.peer.claim.identity.origin_node_id, 2);
+		UT_ASSERT_EQ(decoded.facts[0].proof.structural.ko.origin_node, 2);
+		UT_ASSERT_EQ(decoded.facts[0].proof.structural.ko.peer_node, 0);
+		ack = decoded;
+		ack.verb = CLUSTER_PI_WRITEBACK_ACK;
+		UT_ASSERT(cluster_pi_writeback_ack_matches_v2(&m, &ack));
+		ack.facts[0].proof.structural.ko.batch_id++;
+		UT_ASSERT(!cluster_pi_writeback_ack_matches_v2(&m, &ack));
+		ack = decoded;
+		ack.verb = CLUSTER_PI_WRITEBACK_ACK;
+		if (mode == 0) ack.facts[0].proof.structural.terminal.storage_cut.authority.transition_count++;
+		else ack.facts[0].proof.structural.terminal.write_cut.transition_count++;
+		UT_ASSERT(!cluster_pi_writeback_ack_matches_v2(&m, &ack));
+	}
+	cluster_page_data_receipt_free_v1(&receipt);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(writeback_v2_origin_rejects_retargeted_or_stale_ko)
+{
+	ClusterPageDataReceiptV1 *receipt = wb_setup();
+	ClusterPiDataFactV1 data;
+	ClusterPiWritebackMessageV2 m, out, sentinel;
+	uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2], unchanged[sizeof(bytes)];
+	Size length = 0;
+	UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &data));
+	wb_v2_origin_fixture(&m, &data);
+	UT_ASSERT(cluster_pi_writeback_encode_v2(&m, bytes, sizeof(bytes), &length));
+	memset(unchanged, 0xa5, sizeof(unchanged));
+	for (unsigned fault = 0; fault < 7; fault++) {
+		ClusterPiStructuralFactV2 *s;
+		wb_v2_origin_fixture(&m, &data);
+		s = &m.facts[0].proof.structural;
+		if (fault == 0) s->ko.peer_node = 1;
+		if (fault == 1) s->ko.peer_boot++;
+		if (fault == 2) m.peer.claim.identity.origin_owner_incarnation++;
+		if (fault == 3) s->terminal.storage_cut.master_session_incarnation++;
+		if (fault == 4) s->ko.peer_node = s->ko.origin_node;
+		if (fault == 5) s->ko.members[0] &= ~1u;
+		if (fault == 6) s->ko.origin_boot++;
+		length = 93;
+		memcpy(bytes, unchanged, sizeof(bytes));
+		UT_ASSERT(!cluster_pi_writeback_encode_v2(&m, bytes, sizeof(bytes), &length));
+		UT_ASSERT_EQ(length, 93);
+		UT_ASSERT(memcmp(bytes, unchanged, sizeof(bytes)) == 0);
+	}
+	/* Decoder enforces the same master-peer relationship. */
+	wb_v2_origin_fixture(&m, &data);
+	UT_ASSERT(cluster_pi_writeback_encode_v2(&m, bytes, sizeof(bytes), &length));
+	bytes[176 + 904 + 110] = 1;
+	memset(&sentinel, 0xa5, sizeof(sentinel));
+	out = sentinel;
+	UT_ASSERT(!cluster_pi_writeback_decode_v2(bytes, length, &out));
+	UT_ASSERT(memcmp(&out, &sentinel, sizeof(out)) == 0);
+	cluster_page_data_receipt_free_v1(&receipt);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
 UT_TEST(writeback_v2_has_explicit_data_and_structural_layout)
 {
 	ClusterPageDataReceiptV1 *receipt = wb_setup();
@@ -187,7 +288,7 @@ UT_TEST(writeback_v2_rejects_unqualified_structural_values)
 	uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2], unchanged[sizeof(bytes)];
 	UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &data));
 	memset(unchanged, 0xa5, sizeof(unchanged));
-	for (unsigned fault = 0; fault < 23; fault++) {
+	for (unsigned fault = 0; fault < 24; fault++) {
 		ClusterPiStructuralFactV2 *s;
 		Size length = 93;
 		wb_v2_fixture(&m, &data);
@@ -215,6 +316,7 @@ UT_TEST(writeback_v2_rejects_unqualified_structural_values)
 		if (fault == 20) s->terminal.write_cut = data_pi_cut();
 		if (fault == 21) memset(s->terminal.binding.source.claim.identity.authority_uuid, 0, 16);
 		if (fault == 22) m.peer.claim.identity.storage_uuid[0]++;
+		if (fault == 23) s->ko.members[0] &= ~1u; /* master is neither KO endpoint */
 		memcpy(bytes, unchanged, sizeof(bytes));
 		UT_ASSERT(!cluster_pi_writeback_encode_v2(&m, bytes, sizeof(bytes), &length));
 		UT_ASSERT_EQ(length, 93);

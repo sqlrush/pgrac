@@ -515,8 +515,19 @@ wb_v2_message_valid(const ClusterPiWritebackMessageV2 *m)
 			if (!wb_fact_valid(f)) return false;
 		} else {
 			const ClusterKoSharedMessageV2 *ko = &fact->proof.structural.ko;
+			int32 master = wb_master(f);
+			uint64 peer_boot = m->peer.claim.identity.origin_owner_incarnation;
 			if (!wb_v2_structural_valid(&fact->proof.structural) || ko->epoch != m->epoch
-				|| ko->peer_node != peer || ko->peer_boot != m->peer.claim.identity.origin_owner_incarnation)
+				|| master < 0 || master >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+				|| (ko->members[master / 8] & (1u << (master % 8))) == 0)
+				return false;
+			if (peer == ko->origin_node) {
+				/* Notify the DDL origin using its original request to this
+				 * master. KO never has an origin -> origin request. */
+				if (ko->origin_boot != peer_boot || ko->peer_node != master
+					|| ko->peer_boot != wb_master_boot(f))
+					return false;
+			} else if (ko->peer_node != peer || ko->peer_boot != peer_boot)
 				return false;
 		}
 		if (peer == wb_master(f) || (wb_holders(f) & ((uint32)1u << peer)) == 0
