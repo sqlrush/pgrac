@@ -50,6 +50,7 @@ OBJS_COMMON = \
 	archive.o \
 	base64.o \
 	checksum_helper.o \
+	cluster_catalog_manifest.o \
 	cluster_hw_snapshot_codec.o \
 	cluster_relmap_init.o \
 	cluster_space_identity.o \

@@ -7969,12 +7969,13 @@ test_cluster_catalog_manifest: test_cluster_catalog_manifest.c unit_test.h \
 		$(top_srcdir)/src/common/cluster_catalog_manifest.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_common.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_common_private.h \
-		$(top_srcdir)/src/backend/cluster/cluster_cf_authority.c cluster_unit_port_stubs.o
+		$(top_srcdir)/src/backend/cluster/cluster_cf_authority.c cluster_unit_port_stubs.o \
+		$(top_builddir)/src/common/libpgcommon.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_srcdir)/src/common/cluster_catalog_manifest.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_common.c \
 		$(top_srcdir)/src/backend/cluster/cluster_cf_authority.c \
-		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # Bounded original-tree observation with real filesystem identities.
