@@ -2860,7 +2860,7 @@ test_cluster_wal_inputs_product.o: $(top_srcdir)/src/backend/cluster/cluster_wal
 		-Dcluster_wal_claim_v2_read=test_wal_inputs_claim_read -c $< -o $@
 
 test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc \
-		test_cluster_control_root_initialized.inc \
+		test_cluster_control_root_initialized.inc test_cluster_control_root_first_start.inc \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		test_cluster_control_native_xid.inc \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \

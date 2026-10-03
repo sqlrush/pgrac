@@ -287,7 +287,8 @@ extern ClusterControlRootResult cluster_wal_origin_inputs_read_locked(const Cont
 																	  uint32 node,
 																	  ClusterWalOriginInputs *out);
 
-/* Native StartupProcess advances one exact clean-cohort observation. WAIT
+/* Native StartupProcess advances one exact clean or original kind4 cohort.
+ * Kind4 consumes existing creator evidence; it never fabricates clean exit. WAIT
  * means no native mutation permission; repeat only after releasing all holds.
  * OK returns this target's INITIALIZING operation, not serving permission.
  * An interrupted initialized writer needs recovery, never caller adoption. */

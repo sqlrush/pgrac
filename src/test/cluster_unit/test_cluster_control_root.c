@@ -191,6 +191,7 @@ static ClusterStartupExitResult test_reserve_evidence;
 static ClusterFormationSnapshotV1 test_reserve_formation;
 static ClusterStartupExitCut test_reserve_cut;
 static int test_reserve_fault;
+static unsigned test_startup_exit_requests;
 static bool test_startup_bound;
 static ClusterWalStartupImage test_startup_operation;
 
@@ -245,6 +246,7 @@ cluster_reconfig_capture_formation_snapshot_v1(uint16 thread, ClusterFormationSn
 ClusterStartupExitResult
 cluster_startup_exit_request(const ClusterStartupExitCut *cut, uint8 digest[32])
 {
+	test_startup_exit_requests++;
 	memset(digest, 0, 32);
 	if (!test_reserve_mode || memcmp(cut, &test_reserve_cut, sizeof(*cut)) != 0)
 		return CLUSTER_STARTUP_EXIT_UNAVAILABLE;
@@ -8757,6 +8759,8 @@ v3_driver_restart(const ControlRootImage *root, unsigned node)
 	test_self_incarnation = test_membership_incarnation = test_reserve_cut.observer[node];
 	return ref;
 }
+
+#include "test_cluster_control_root_first_start.inc"
 
 UT_TEST(test_v3_native_driver_prepares_sparse_targets_then_returns_initializing)
 {
@@ -21328,6 +21332,14 @@ main(int argc, char **argv)
 	if (argc > 1)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_FIRST_START") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_first_start_io_and_late_races_never_publish_authority);
+		UT_RUN(test_first_start_binds_original_inputs_without_clean_exit);
+		UT_RUN(test_first_start_rejects_incomplete_or_changed_formation);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_WORKER_FINALIZE") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_runtime_v3_worker_done_requires_durable_canonical_completion);
@@ -21384,7 +21396,10 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(404);
+	UT_PLAN(407);
+	UT_RUN(test_first_start_io_and_late_races_never_publish_authority);
+	UT_RUN(test_first_start_binds_original_inputs_without_clean_exit);
+	UT_RUN(test_first_start_rejects_incomplete_or_changed_formation);
 	UT_RUN(test_initialized_complete_cohort_constructs_all_selected_inputs);
 	UT_RUN(test_initialized_cohort_refuses_incomplete_or_existing_sources);
 	UT_RUN(test_initialized_cohort_refuses_wrong_identity_or_geometry);

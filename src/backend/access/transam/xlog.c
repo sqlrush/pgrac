@@ -6189,7 +6189,8 @@ ClusterStartupWriterSelect(void)
 			 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_COHORT_UNPROVEN result=%d",
 					   (int)result)));
 	if (selected.phase != CLUSTER_WAL_STARTUP_INITIALIZING
-		|| selected.input_kind != CLUSTER_WAL_STARTUP_CLEAN
+		|| (selected.input_kind != CLUSTER_WAL_STARTUP_CLEAN
+			&& selected.input_kind != CLUSTER_WAL_STARTUP_INITIALIZED)
 		|| selected.segment_size != wal_segment_size || !IsValidWalSegSize(wal_segment_size)
 		|| selected.first_segment_lsn == 0 || selected.first_segment_lsn % wal_segment_size != 0
 		|| selected.first_segment_lsn < selected.sealed_input_end

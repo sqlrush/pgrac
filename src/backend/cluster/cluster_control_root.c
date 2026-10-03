@@ -5174,8 +5174,8 @@ typedef struct ReserveCleanWork {
 } ReserveCleanWork;
 
 static bool
-startup_owner_current(uint64 system_identifier, uint64 epoch, uint64 incarnation,
-					  const uint64 required[2])
+startup_owner_for_input(uint64 system_identifier, uint64 epoch, uint64 incarnation,
+						const uint64 required[2], uint32 kind)
 {
 	ClusterFenceAuthorityProof authority;
 
@@ -5187,7 +5187,9 @@ startup_owner_current(uint64 system_identifier, uint64 epoch, uint64 incarnation
 		|| cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER
 		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != incarnation
 		|| !cluster_qvotec_in_quorum() || cluster_reconfig_has_pending_prebump_stage()
-		|| !cluster_external_fence_runtime_active() || !cluster_write_fence_enforcing()
+		|| (kind != CLUSTER_WAL_STARTUP_CLEAN && kind != CLUSTER_WAL_STARTUP_INITIALIZED)
+		|| (kind == CLUSTER_WAL_STARTUP_CLEAN && !cluster_external_fence_runtime_active())
+		|| !cluster_write_fence_enforcing()
 		|| !cluster_write_fence_allowed() || cluster_epoch_get_current() != epoch
 		|| cluster_write_fence_read_durable_authority(&authority) != CLUSTER_FENCE_AUTHORITY_OK
 		|| authority.marker.fence_epoch != epoch)
@@ -5197,6 +5199,55 @@ startup_owner_current(uint64 system_identifier, uint64 epoch, uint64 incarnation
 			&& cluster_fence_marker_node_is_fenced(authority.marker.fenced_dead_bitmap, node))
 			return false;
 	return cluster_epoch_get_current() == epoch && cluster_write_fence_allowed();
+}
+
+static bool
+startup_owner_current(uint64 system_identifier, uint64 epoch, uint64 incarnation,
+					  const uint64 required[2])
+{
+	return startup_owner_for_input(system_identifier, epoch, incarnation, required,
+		CLUSTER_WAL_STARTUP_CLEAN);
+}
+
+/* Kind4 has no previous admitted writer to fence. It still needs the actual
+ * accepted complete formation and durable current write fence. This exception
+ * never applies to a clean/recovered or interrupted online generation. */
+static bool
+startup_initialized_formation(const ControlRootImage *root,
+							  const ClusterFormationSnapshotV1 *formation, bool seed)
+{
+	/* Native writer installation precedes self_join_admitted. The accepted
+	 * formation, not the later serving gate, authorizes this startup work. */
+	if (formation->self_join_admitted > 1 || formation->self_join_failed
+		|| formation->startup_formation_generation == 0
+		|| (!seed && root->header.v2.formation_seq != formation->startup_formation_generation)
+		|| formation->local_epoch == 0 || formation->local_epoch != cluster_epoch_get_current()
+		|| formation->prebump_sync_active != 0
+		|| !bytes_are_zero(formation->reserved, sizeof(formation->reserved))
+		|| !bytes_are_zero(formation->pending_join_bitmap, sizeof(formation->pending_join_bitmap))
+		|| !bytes_are_zero(formation->excluded_bitmap, sizeof(formation->excluded_bitmap))
+		|| !bytes_are_zero(formation->clean_departed_bitmap, sizeof(formation->clean_departed_bitmap))
+		|| !bytes_are_zero(formation->removed_bitmap, sizeof(formation->removed_bitmap)))
+		return false;
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; node++) {
+		bool required = (root->header.v2.configured[node / 64] & (UINT64_C(1) << (node % 64))) != 0;
+		if (required != (formation->membership.membership_state[node] == CLUSTER_MEMBER_MEMBER))
+			return false;
+		if (required && (formation->membership.last_admitted_incarnation[node] == 0
+			|| (seed && formation->membership.last_admitted_incarnation[node]
+				== root->records[node].identity.origin_owner_incarnation)))
+			return false;
+	}
+	return startup_owner_for_input(root->header.system_identifier, formation->local_epoch,
+		cluster_qvotec_get_self_incarnation(), root->header.v2.configured,
+		CLUSTER_WAL_STARTUP_INITIALIZED);
+}
+
+static bool
+startup_operation_owner(const ControlRootImage *root, const ClusterWalStartupImage *op)
+{
+	return startup_owner_for_input(op->claim.identity.system_identifier, op->formation_epoch,
+		op->claim.identity.origin_owner_incarnation, root->header.v2.configured, op->input_kind);
 }
 
 static bool
@@ -5549,6 +5600,185 @@ typedef struct StartupAdvanceWork {
 	bool cf_held;
 } StartupAdvanceWork;
 
+/* Read the original selected inputs again; never synthesize creation/exit
+ * evidence. All target bindings keep each origin's own immutable digest. */
+static ClusterControlRootResult
+startup_initialized_reobserve(ReserveCleanWork *work, bool published)
+{
+	ControlFileData common;
+	ClusterControlRootFileToken token;
+	ClusterFormationSnapshotV1 formation;
+	ClusterControlRootResult result = read_control_version(work->base.header.storage_uuid,
+		work->base.header.system_identifier, &work->scan.base, &common, &token, 3);
+
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(work->scan.base.bytes, published ? work->next.bytes : work->base.bytes,
+		CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	if (!cluster_reconfig_capture_formation_snapshot_v1(cluster_node_id + 1, &formation)
+		|| memcmp(&formation, &work->formation, sizeof(formation)) != 0
+		|| !startup_initialized_formation(&work->base, &formation, true)
+		|| !startup_initialized_root(&work->base))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; node++) {
+		ClusterWalStartupImage original, selected;
+		if (!work->base.present[node]) continue;
+		if (node < (unsigned)cluster_node_id)
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		result = cluster_wal_startup_read_locked(&work->base, node, &original);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		if (original.input_kind != CLUSTER_WAL_STARTUP_INITIALIZED
+			|| original.formation_epoch != 0 || original.segment_size != wal_segment_size)
+			return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+		if (published) {
+			result = cluster_wal_startup_read_locked(&work->scan.base, node, &selected);
+			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				return result;
+			if (memcmp(&selected, &work->operations[node], sizeof(selected)) != 0)
+				return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
+startup_initialized_publish(ReserveCleanWork *work)
+{
+	CheckpointV2Work *scan = &work->scan;
+	ClusterControlRootResult result;
+	uint8 root_hash[32];
+
+	if (!acquire_clusterwide_cf(ShareLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = ShareLock;
+	result = startup_initialized_reobserve(work, false);
+	work->cf_mode = NoLock;
+	result = release_cf(ShareLock, result);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!control_root_sha256(work->base.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES, root_hash))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; node++) {
+		ClusterWalStartupImage *op = &work->operations[node];
+		uint8 claim[CLUSTER_WAL_CLAIM_V2_BYTES];
+		uint64 mask = wal_segment_size - 1;
+		if (!work->base.present[node]) continue;
+		make_read_token(&work->base, node + 1, CONTROL_ROOT_SOURCE_PRIMARY, &scan->thread_token);
+		if (cluster_wal_retention_root_publish_begin_exact(&scan->thread_token, false, &scan->walr)
+			!= CLUSTER_WAL_PIN_OK)
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		if (!acquire_clusterwide_cf(ShareLock))
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		scan->cf_mode = ShareLock;
+		result = reserve_clean_input_locked(work, node);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_startup_read_locked(&work->base, node, op);
+		scan->cf_mode = NoLock;
+		result = release_cf(ShareLock, result);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		result = checkpoint_v2_wal_verify(scan, &work->base.records[node].identity, &scan->old_view,
+			work->base.records[node].validated_tail_lsn_exclusive);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		if (scan->checkpoint_crc != op->input_record_crc
+			|| !checkpoint_v2_wal_paths_current(scan, &work->base.records[node].identity))
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		result = checkpoint_v2_cleanup(scan, result);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		if (op->sealed_input_end > UINT64_MAX - mask)
+			return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
+		op->formation_epoch = work->formation.local_epoch;
+		op->predecessor_file_sequence = 1;
+		memcpy(op->predecessor_file_sha256, root_hash, 32);
+		op->generation = 2;
+		op->first_segment_lsn = (op->sealed_input_end + mask) & ~mask;
+		op->claim.identity = op->predecessor.snapshot.identity;
+		op->claim.identity.origin_owner_incarnation = work->formation.membership.last_admitted_incarnation[node];
+		op->claim.identity.root_lineage_seq = 2;
+		op->claim.identity.thread_claim_created_at = GetCurrentTimestamp();
+		op->claim.identity.thread_claim_crc32c = 0;
+		op->claim.database_incarnation = op->database_incarnation;
+		op->claim.config_generation = op->config_generation;
+		op->claim.claim_generation = op->generation;
+		result = cluster_wal_claim_v2_encode(&op->claim, claim);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		op->claim.identity.thread_claim_crc32c = read_u32_le(claim + 104);
+	}
+	if (!acquire_clusterwide_cf(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = ExclusiveLock;
+	result = startup_initialized_reobserve(work, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	work->next = work->base;
+	work->next.header.file_txn_seq = 2;
+	work->next.header.v2.formation_seq = work->formation.startup_formation_generation;
+	work->next.header.published_at_usec = GetCurrentTimestamp();
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; node++) {
+		ClusterWalStartupStage *stage = &work->stages[node];
+		ClusterWalStartupImage readback;
+		if (!work->base.present[node]) continue;
+		result = reserve_clean_input_locked(work, node);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		result = cluster_wal_startup_prepare(&work->next, node, &work->operations[node], stage);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		result = cluster_wal_startup_install(stage);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		work->next.startup[node].generation = stage->generation;
+		memcpy(work->next.startup[node].sha256, stage->sha256, 32);
+		result = cluster_wal_startup_read_locked(&work->next, node, &readback);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		if (memcmp(&readback, &work->operations[node], sizeof(readback)) != 0)
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	result = cluster_control_root_v3_encode(&work->next);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = startup_initialized_reobserve(work, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!publish_updated_image(&work->base, &work->next))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	return startup_initialized_reobserve(work, true);
+}
+
+static ClusterControlRootResult
+startup_bind_initialized(const StartupAdvanceWork *selected)
+{
+	ReserveCleanWork *work = palloc0(sizeof(*work));
+	ClusterControlRootResult result;
+
+	work->base = selected->root;
+	work->formation = selected->formation;
+	work->scan.purpose = CHECKPOINT_V2_SHUTDOWN_EVIDENCE;
+	work->scan.format_version = CONTROL_ROOT_HEADER_VERSION_V3;
+	for (unsigned i = 0; i < lengthof(work->scan.wal_dirs); i++) work->scan.wal_dirs[i] = -1;
+	for (unsigned i = 0; i < lengthof(work->scan.wal_segments); i++) work->scan.wal_segments[i] = -1;
+	PG_TRY();
+	{
+		result = startup_initialized_publish(work);
+	}
+	PG_CATCH();
+	{
+		(void)reserve_clean_cleanup(work, CLUSTER_CONTROL_ROOT_IO_ERROR);
+		pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	result = reserve_clean_cleanup(work, result);
+	pfree(work);
+	return result;
+}
+
 static ClusterControlRootResult
 startup_advance_observe(StartupAdvanceWork *work, const ClusterWalSourceRef *restart)
 {
@@ -5572,13 +5802,13 @@ startup_advance_observe(StartupAdvanceWork *work, const ClusterWalSourceRef *res
 		|| restart->claim.database_incarnation != work->root.header.v2.database_incarnation
 		|| restart->claim.max_config_generation != work->root.header.v2.config_generation
 		|| restart->timeline != work->root.records[node].checkpoint_tli
-		|| memcmp(restart->claim.claim_sha256, work->root.refs[node].claim_sha256, 32) != 0
-		|| !startup_owner_current(
-			restart->claim.identity.system_identifier, cluster_epoch_get_current(),
-			cluster_qvotec_get_self_incarnation(), work->root.header.v2.configured))
+		|| memcmp(restart->claim.claim_sha256, work->root.refs[node].claim_sha256, 32) != 0)
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (work->root.header.v2.database_state == CLUSTER_CONTROL_ROOT_DATABASE_CLOSED) {
-		if (!cluster_reconfig_capture_formation_snapshot_v1(node + 1, &work->formation))
+		if (!startup_owner_current(restart->claim.identity.system_identifier,
+			cluster_epoch_get_current(), cluster_qvotec_get_self_incarnation(),
+			work->root.header.v2.configured)
+			|| !cluster_reconfig_capture_formation_snapshot_v1(node + 1, &work->formation))
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		return cluster_control_root_v3_clean_exit_cut(
 			work->root.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES, restart->claim.identity.storage_uuid,
@@ -5591,7 +5821,14 @@ startup_advance_observe(StartupAdvanceWork *work, const ClusterWalSourceRef *res
 	result = cluster_wal_startup_read_locked(&work->root, node, &work->op);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (work->op.input_kind != CLUSTER_WAL_STARTUP_CLEAN
+	if (work->op.input_kind == CLUSTER_WAL_STARTUP_INITIALIZED && work->op.formation_epoch == 0) {
+		if (!startup_initialized_root(&work->root)
+			|| !cluster_reconfig_capture_formation_snapshot_v1(node + 1, &work->formation)
+			|| !startup_initialized_formation(&work->root, &work->formation, true))
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+	if (!startup_operation_owner(&work->root, &work->op)
 		|| work->op.claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation()
 		|| work->op.formation_epoch != cluster_epoch_get_current())
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
@@ -5624,6 +5861,12 @@ startup_advance_step(StartupAdvanceWork *work, const ClusterWalSourceRef *restar
 		result = cluster_control_root_v3_reserve_clean(&work->cut, &published);
 		return result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
 														 : result;
+	}
+	if (work->op.input_kind == CLUSTER_WAL_STARTUP_INITIALIZED && work->op.formation_epoch == 0) {
+		if (coordinator != (unsigned)cluster_node_id)
+			return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+		result = startup_bind_initialized(work);
+		return result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT : result;
 	}
 	if (work->op.phase == CLUSTER_WAL_STARTUP_RESERVED) {
 		result = cluster_control_root_v3_startup_prepare_target(&work->op.claim.identity,
@@ -5698,6 +5941,7 @@ typedef enum StartupTargetAction {
  * A missing member is never an excuse to shrink a clean-start operation. */
 static ClusterControlRootResult
 startup_operation_formation(const ControlRootImage *root, uint32 phase, bool allow_progress,
+							uint32 kind,
 							ClusterFormationSnapshotV1 *formation)
 {
 	if (root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
@@ -5738,13 +5982,18 @@ startup_operation_formation(const ControlRootImage *root, uint32 phase, bool all
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 		if ((op.phase != phase && !(allow_progress && op.phase == CLUSTER_WAL_STARTUP_DURABLE))
-			|| op.input_kind != CLUSTER_WAL_STARTUP_CLEAN
+			|| (op.input_kind != CLUSTER_WAL_STARTUP_CLEAN
+				&& op.input_kind != CLUSTER_WAL_STARTUP_INITIALIZED)
+			|| op.input_kind != kind
 			|| op.config_generation != root->header.v2.config_generation
 			|| op.formation_epoch != formation->local_epoch
 			|| op.claim.identity.origin_owner_incarnation
 				   != formation->membership.last_admitted_incarnation[node])
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	}
+	if (kind == CLUSTER_WAL_STARTUP_INITIALIZED
+		&& !startup_initialized_formation(root, formation, false))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -5771,10 +6020,9 @@ startup_prepare_target_locked(StartupTargetWork *work, const ClusterControlRootI
 	if (work->op.phase != phase
 		|| !cluster_control_root_identity_equal(self, &work->op.claim.identity)
 		|| memcmp(operation_uuid, work->op.operation_uuid, 16) != 0
-		|| !startup_owner_current(self->system_identifier, work->op.formation_epoch,
-								  self->origin_owner_incarnation, work->base.header.v2.configured))
+		|| !startup_operation_owner(&work->base, &work->op))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	result = startup_operation_formation(&work->base, phase, writer, &work->formation);
+	result = startup_operation_formation(&work->base, phase, writer, work->op.input_kind, &work->formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	result = cluster_wal_startup_empty_locked(&work->base, node, !writer, !writer);
@@ -5795,12 +6043,11 @@ startup_prepare_target_locked(StartupTargetWork *work, const ClusterControlRootI
 		return result;
 	if (memcmp(work->observed.bytes, work->base.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
-	result = startup_operation_formation(&work->observed, phase, writer, &formation);
+	result = startup_operation_formation(&work->observed, phase, writer, work->op.input_kind, &formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(&formation, &work->formation, sizeof(formation)) != 0
-		|| !startup_owner_current(self->system_identifier, work->op.formation_epoch,
-								  self->origin_owner_incarnation, work->base.header.v2.configured))
+		|| !startup_operation_owner(&work->base, &work->op))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	return cluster_wal_startup_empty_locked(&work->observed, node, false, false);
 }
@@ -5928,11 +6175,9 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 		return result;
 	if (!cluster_control_root_identity_equal(self, &target->op.claim.identity)
 		|| memcmp(operation_uuid, target->op.operation_uuid, 16) != 0
-		|| !startup_owner_current(self->system_identifier, target->op.formation_epoch,
-								  self->origin_owner_incarnation,
-								  target->base.header.v2.configured))
+		|| !startup_operation_owner(&target->base, &target->op))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	result = startup_operation_formation(&target->base, CLUSTER_WAL_STARTUP_RESERVED, false,
+	result = startup_operation_formation(&target->base, CLUSTER_WAL_STARTUP_RESERVED, false, target->op.input_kind,
 										 &target->formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -5953,8 +6198,9 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 			return result;
 		if (op->predecessor_file_sequence != target->op.predecessor_file_sequence
 			|| memcmp(op->predecessor_file_sha256, target->op.predecessor_file_sha256, 32) != 0
-			|| memcmp(op->predecessor_evidence_sha256, target->op.predecessor_evidence_sha256, 32)
-				   != 0)
+			|| op->input_kind != target->op.input_kind
+			|| (op->input_kind == CLUSTER_WAL_STARTUP_CLEAN
+				&& memcmp(op->predecessor_evidence_sha256, target->op.predecessor_evidence_sha256, 32) != 0))
 			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 		/* A remote target may have failed after creating readable metadata
 		 * but before its fsync. Reestablish durability ourselves before CAS. */
@@ -5992,14 +6238,12 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 		return result;
 	if (!file_token_equal(expected, &token))
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
-	result = startup_operation_formation(&target->observed, CLUSTER_WAL_STARTUP_RESERVED, false,
+	result = startup_operation_formation(&target->observed, CLUSTER_WAL_STARTUP_RESERVED, false, target->op.input_kind,
 										 &formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(&formation, &target->formation, sizeof(formation)) != 0
-		|| !startup_owner_current(self->system_identifier, target->op.formation_epoch,
-								  self->origin_owner_incarnation,
-								  target->base.header.v2.configured))
+		|| !startup_operation_owner(&target->base, &target->op))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node) {
 		if (work->operations[node].phase == 0)
@@ -6016,14 +6260,12 @@ startup_begin_locked(StartupBeginWork *work, const ClusterControlRootIdentity *s
 		return result;
 	if (memcmp(target->observed.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
-	result = startup_operation_formation(&target->observed, CLUSTER_WAL_STARTUP_INITIALIZING, false,
+	result = startup_operation_formation(&target->observed, CLUSTER_WAL_STARTUP_INITIALIZING, false, target->op.input_kind,
 										 &formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(&formation, &target->formation, sizeof(formation)) != 0
-		|| !startup_owner_current(self->system_identifier, target->op.formation_epoch,
-								  self->origin_owner_incarnation,
-								  target->base.header.v2.configured))
+		|| !startup_operation_owner(&target->base, &target->op))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	*out = token;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -6100,9 +6342,7 @@ startup_checkpoint_owner(const StartupCheckpointWork *work, const ClusterControl
 	/* The dedicated EOR accessor observes native fsync before recovery DONE. */
 	return GetXLogInsertEndRecPtr() == end
 		   && ClusterXLogStartupFlushCovers(end, work->op.timeline)
-		   && startup_owner_current(self->system_identifier, work->op.formation_epoch,
-									self->origin_owner_incarnation,
-									work->scan.base.header.v2.configured)
+		   && startup_operation_owner(&work->scan.base, &work->op)
 		   && cluster_wal_writer_startup_matches(self, work->op.operation_uuid,
 												  work->op.first_segment_lsn);
 }
@@ -6125,7 +6365,7 @@ startup_checkpoint_reobserve(StartupCheckpointWork *work, const ClusterControlRo
 			   CLUSTER_CONTROL_ROOT_FILE_BYTES)
 		!= 0)
 		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
-	result = startup_operation_formation(&work->observed, CLUSTER_WAL_STARTUP_INITIALIZING, true,
+	result = startup_operation_formation(&work->observed, CLUSTER_WAL_STARTUP_INITIALIZING, true, work->op.input_kind,
 										 &formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -6171,7 +6411,7 @@ startup_checkpoint_publish(StartupCheckpointWork *work, const ClusterControlRoot
 		|| !cluster_control_root_identity_equal(self, &work->op.claim.identity)
 		|| work->op.segment_size != wal_segment_size || !startup_checkpoint_owner(work, self, end))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	result = startup_operation_formation(&scan->base, CLUSTER_WAL_STARTUP_INITIALIZING, true,
+	result = startup_operation_formation(&scan->base, CLUSTER_WAL_STARTUP_INITIALIZING, true, work->op.input_kind,
 										 &work->formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -6607,7 +6847,7 @@ startup_install_publish(StartupInstallWork *work, const ClusterWalStartupImage *
 		|| check->op.segment_size != wal_segment_size
 		|| !startup_checkpoint_owner(check, self, end))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	result = startup_operation_formation(&scan->base, CLUSTER_WAL_STARTUP_INITIALIZING, true,
+	result = startup_operation_formation(&scan->base, CLUSTER_WAL_STARTUP_INITIALIZING, true, check->op.input_kind,
 										 &check->formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -6736,7 +6976,8 @@ cluster_control_root_v3_startup_install_writer(const ClusterWalStartupImage *exp
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	if (alias || expected == NULL || out == NULL || expected->phase != CLUSTER_WAL_STARTUP_DURABLE
-		|| expected->input_kind != CLUSTER_WAL_STARTUP_CLEAN
+		|| (expected->input_kind != CLUSTER_WAL_STARTUP_CLEAN
+			&& expected->input_kind != CLUSTER_WAL_STARTUP_INITIALIZED)
 		|| expected->claim.identity.origin_node_id != cluster_node_id
 		|| expected->claim.identity.origin_node_id >= CLUSTER_MAX_NODES
 		|| expected->claim.identity.origin_node_id < 0
