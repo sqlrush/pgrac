@@ -2861,8 +2861,12 @@ test_cluster_wal_inputs_product.o: $(top_srcdir)/src/backend/cluster/cluster_wal
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-Dcluster_wal_claim_v2_read=test_wal_inputs_claim_read -c $< -o $@
 
+test_cluster_catalog_origin_io.o: $(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin_private.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc \
-		test_cluster_control_root_initialized.inc test_cluster_control_root_first_start.inc \
+		test_cluster_control_root_initialized.inc test_cluster_control_root_first_start.inc test_cluster_control_catalog.inc \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		test_cluster_control_native_xid.inc \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
@@ -2872,6 +2876,10 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixt
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
 		cluster_control_bootstrap_read_test.o \
+		$(top_builddir)/src/backend/cluster/cluster_control_catalog_read.o \
+		$(top_builddir)/src/backend/cluster/cluster_initdb_catalog.o \
+		test_cluster_catalog_origin_io.o \
+		$(top_builddir)/src/backend/cluster/cluster_initdb_common.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o \
@@ -2883,6 +2891,10 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixt
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
 		cluster_control_bootstrap_read_test.o \
+		$(top_builddir)/src/backend/cluster/cluster_control_catalog_read.o \
+		$(top_builddir)/src/backend/cluster/cluster_initdb_catalog.o \
+		test_cluster_catalog_origin_io.o \
+		$(top_builddir)/src/backend/cluster/cluster_initdb_common.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
@@ -2901,7 +2913,9 @@ cluster_control_bootstrap_read_test.o: cluster_control_bootstrap_read_test.c \
 		$(top_srcdir)/src/include/cluster/cluster_native_startup.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
-xlogreader_fs.o: $(top_srcdir)/src/backend/access/transam/xlogreader.c
+xlogreader_fs.o: $(top_srcdir)/src/backend/access/transam/xlogreader.c \
+		$(top_srcdir)/src/include/access/xlog_internal.h \
+		$(top_srcdir)/src/include/access/xlogrecord.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -c $< -o $@
 
 CLUSTER_WAL_RETENTION_O = $(top_builddir)/src/backend/cluster/cluster_wal_retention.o
@@ -8039,3 +8053,13 @@ test_cluster_storage_sql_route: test_cluster_storage_sql_route.c unit_test.h \
 test_cluster_storage_backend: test_cluster_storage_backend.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_storage_quorum_backend.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
+# Original catalog source I/O and exclusive publication use actual files.
+test_cluster_initdb_catalog: test_cluster_initdb_catalog.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_catalog.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_catalog_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
+		$(top_srcdir)/src/common/cluster_catalog_init.c cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_catalog_init.c $(top_srcdir)/src/common/file_perm.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@

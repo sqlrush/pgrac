@@ -28,6 +28,7 @@
 #include "utils/timestamp.h"
 #include "cluster_initdb_origin_private.h"
 #include "cluster_initdb_common_private.h"
+#include "cluster_initdb_catalog_private.h"
 #include "cluster_initdb_tree_private.h"
 #include "../../bin/initdb/pgrac_wal.h"
 #include "../../bin/initdb/pgrac_side.h"
@@ -795,6 +796,62 @@ route_original_side(const InitdbDirectory *shared, InitdbOrigin *origin, unsigne
 }
 
 static void
+create_catalog_objects(const InitdbDirectory *shared, InitdbOrigin *origins,
+	const ClusterSharedConfigRef *config)
+{
+	ClusterCatalogInitialInput input = {0};
+	InitdbDirectory global;
+	uint8 *founder = NULL;
+	Size founder_length = 0;
+
+	input.identity.system_identifier = config->identity.system_identifier;
+	input.identity.database_incarnation = config->identity.database_incarnation;
+	memcpy(input.identity.storage_uuid, config->identity.storage_uuid, 16);
+	memcpy(input.identity.authority_uuid, config->identity.authority_uuid, 16);
+	input.native_control = &origins[0].control;
+	input.native_control_length = sizeof(origins[0].control);
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
+		InitdbDirectory archive, clog;
+		uint8 *bytes = NULL;
+		Size length = 0;
+		if (!(config->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64)))) continue;
+		control_read(&origins[node], node + 1, config->identity.system_identifier, false);
+		creation_side_current(shared, &origins[node], node);
+		open_original_child(&origins[node].data, INITDB_SIDE_ARCHIVE, &archive);
+		open_original_child(&archive, "pg_xact", &clog);
+		if (!cluster_initdb_catalog_read_clog(clog.fd,
+			U64FromFullTransactionId(origins[node].control.checkPointCopy.nextXid), &bytes, &length))
+			refuse("cannot read original native catalog transaction history");
+		if (node == 0) { founder = bytes; founder_length = length; }
+		else {
+			if (length != founder_length || memcmp(bytes, founder, length) != 0)
+				refuse("original cohort catalog transaction histories disagree");
+			free(bytes);
+		}
+		directory_current(&clog);
+		directory_current(&archive);
+		if (close(clog.fd) != 0 || close(archive.fd) != 0)
+			refuse("cannot close original catalog transaction history");
+		creation_side_current(shared, &origins[node], node);
+	}
+	input.native_clog = founder;
+	input.native_clog_length = founder_length;
+	open_original_child(shared, "global", &global);
+	if (!cluster_initdb_catalog_create(global.fd, &input))
+		refuse("cannot persist original catalog allocator inputs");
+	directory_current(&global);
+	if (close(global.fd) != 0) refuse("cannot close original catalog namespace");
+	free(founder);
+	/* The retained, independent native history remains available at each
+	 * origin. ROOT observes both the shared native bytes and these outputs. */
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
+		if (!(config->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64)))) continue;
+		control_read(&origins[node], node + 1, config->identity.system_identifier, false);
+		creation_side_current(shared, &origins[node], node);
+	}
+}
+
+static void
 creation_sources_current(const PgracInitdbCohortContext *request,
 	const ClusterSharedConfigRef *config, InitdbDirectory roots[4], InitdbOrigin *origins,
 	const ClusterInitdbTree *data, const ClusterInitdbTree *undo, bool derived)
@@ -1066,6 +1123,7 @@ ClusterInitdbCohortMain(int argc, char **argv)
 		if (fsync(origin->wal.fd) != 0 || fsync(origin->thread.fd) != 0 || fsync(origin->data.fd) != 0)
 			refuse("cannot persist original writer directories");
 	}
+	create_catalog_objects(&roots[1], origins, ref);
 	for (int i = 0; i < 4; i++)
 	{
 		directory_current(&roots[i]);

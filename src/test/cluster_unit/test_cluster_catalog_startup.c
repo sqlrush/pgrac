@@ -41,8 +41,8 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 {
 	abort();
 }
-bool
-cluster_cf_authority_read(ControlFileData *out)
+static bool
+catalog_test_legacy_authority_read(ControlFileData *out)
 {
 	legacy_reads++;
 	*out = control;
@@ -95,7 +95,9 @@ cluster_catalog_prepare_xid_authority(const ControlFileData *cf, ClusterCatalogM
 	} while (0)
 #undef elog
 #define elog(...) ((void)0)
+#define cluster_cf_authority_read catalog_test_legacy_authority_read
 #include "test_cluster_catalog_startup_entry.inc"
+#undef cluster_cf_authority_read
 
 static bool
 read_input(ClusterCatalogStartupInput *out, void *arg)

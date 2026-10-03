@@ -53,6 +53,7 @@
 #include "utils/elog.h"
 #include <sys/wait.h>
 #include "../../backend/cluster/cluster_control_root_private.h"
+#include "../../backend/cluster/cluster_control_bootstrap_private.h"
 
 #undef printf
 #undef fprintf
@@ -149,7 +150,7 @@ errmsg(const char *fmt, ...)
 {
 	if (runtime_guard_error_expected)
 		runtime_guard_message_matched
-			= strcmp(fmt, "PRE2 shared-control startup is not yet available") == 0;
+			= strcmp(fmt, "catalog startup has no exact ROOT bootstrap preparation") == 0;
 	return 0;
 }
 int
@@ -863,6 +864,14 @@ UT_TEST(test_bootstrap_role)
 	UT_ASSERT_EQ(cluster_cf_bootstrap_role(true, CLUSTER_CF_LIVENESS_UNKNOWN,
 										   CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED),
 				 CLUSTER_CF_ROLE_FAILCLOSED);
+}
+
+/* This routing fixture has no early postmaster preparation. */
+void
+cluster_control_bootstrap_catalog_prepare(const char *pgdata)
+{
+	if (pgdata != NULL) abort();
+	ereport(FATAL, (errmsg("catalog startup has no exact ROOT bootstrap preparation")));
 }
 
 UT_TEST(test_shared_config_startup_cannot_use_legacy_migration)

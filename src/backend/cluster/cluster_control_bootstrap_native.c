@@ -12,6 +12,7 @@
 #include "utils/resowner.h"
 
 #include "cluster_control_bootstrap_private.h"
+#include "cluster_control_catalog_private.h"
 
 typedef struct BootstrapPreparation {
 	char *paths[4];
@@ -24,6 +25,16 @@ typedef struct BootstrapPreparation {
 static bool bootstrap_prepared_valid;
 static ClusterControlBootstrapPrepared bootstrap_prepared;
 static char bootstrap_paths[4][MAXPGPATH];
+
+typedef struct BootstrapCatalogSource {
+	ClusterControlCatalogRead *read;
+	ResourceOwner owner;
+	ResourceOwner saved_owner;
+} BootstrapCatalogSource;
+
+static BootstrapCatalogSource bootstrap_catalog;
+
+static void bootstrap_catalog_release(void *arg);
 
 void
 cluster_control_bootstrap_native_inputs_require(const char *pgdata)
@@ -75,6 +86,8 @@ cluster_control_bootstrap_prepare(const char *pgdata, const char *shared_root, c
 		ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						errmsg("native bootstrap preparation requires early startup")));
 	bootstrap_prepared_valid = false;
+	bootstrap_catalog_release(&bootstrap_catalog);
+	(void)cluster_catalog_startup_set_source(NULL);
 	memset(&bootstrap_prepared, 0, sizeof(bootstrap_prepared));
 	if (out == NULL || node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
 		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -186,6 +199,82 @@ cluster_control_bootstrap_prepare(const char *pgdata, const char *shared_root, c
 	for (size_t i = 0; i < lengthof(state->paths); i++)
 		pfree(state->paths[i]);
 	pfree(state);
+}
+
+static bool
+bootstrap_catalog_context_valid(void)
+{
+	return !IsUnderPostmaster && bootstrap_prepared_valid && cluster_shared_config && cluster_enabled
+		&& cluster_node_id == (int)bootstrap_prepared.applied.node_id
+		&& cluster_shared_data_dir != NULL && cluster_wal_threads_dir != NULL
+		&& cluster_undo_tablespace_path != NULL
+		&& strcmp(cluster_shared_data_dir, bootstrap_paths[1]) == 0
+		&& strcmp(cluster_wal_threads_dir, bootstrap_paths[2]) == 0
+		&& strcmp(cluster_undo_tablespace_path, bootstrap_paths[3]) == 0
+		&& GetSystemIdentifier() == bootstrap_prepared.snapshot.binding.system_identifier;
+}
+
+static bool
+bootstrap_catalog_read(ClusterCatalogStartupInput *out, void *arg)
+{
+	BootstrapCatalogSource *source = arg;
+	MemoryContext saved = CurrentMemoryContext;
+	volatile bool ok = false;
+
+	if (!bootstrap_catalog_context_valid() || source->owner != NULL || source->read != NULL)
+		return false;
+	source->saved_owner = CurrentResourceOwner;
+	source->owner = ResourceOwnerCreate(source->saved_owner, "catalog bootstrap read");
+	CurrentResourceOwner = source->owner;
+	PG_TRY();
+	{
+		ok = cluster_control_catalog_read(bootstrap_paths[0], bootstrap_paths[1],
+			&bootstrap_prepared.snapshot, &source->read, out);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(saved);
+		FlushErrorState();
+		memset(out, 0, sizeof(*out));
+		ok = false;
+	}
+	PG_END_TRY();
+	/* B's pure decoder also needs the same temporary hash resource owner.
+	 * Its unconditional release callback closes this owner after validation. */
+	return ok;
+}
+
+static bool
+bootstrap_catalog_current(void *arg)
+{
+	BootstrapCatalogSource *source = arg;
+	return bootstrap_catalog_context_valid() && source->owner != NULL
+		&& CurrentResourceOwner == source->owner && cluster_control_catalog_current(source->read);
+}
+
+static void
+bootstrap_catalog_release(void *arg)
+{
+	BootstrapCatalogSource *source = arg;
+	cluster_control_catalog_release(&source->read);
+	if (source->owner != NULL) {
+		bootstrap_preparation_release(source->owner, source->saved_owner, false);
+		source->owner = source->saved_owner = NULL;
+	}
+}
+
+void
+cluster_control_bootstrap_catalog_prepare(const char *pgdata)
+{
+	ClusterCatalogStartupSource source = {bootstrap_catalog_read, bootstrap_catalog_current,
+		bootstrap_catalog_release, &bootstrap_catalog};
+
+	bootstrap_catalog_release(&bootstrap_catalog);
+	(void)cluster_catalog_startup_set_source(NULL);
+	if (pgdata == NULL || strcmp(pgdata, bootstrap_paths[0]) != 0
+		|| !bootstrap_catalog_context_valid() || !cluster_catalog_startup_set_source(&source))
+		ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			errmsg("catalog startup has no exact ROOT bootstrap preparation")));
 }
 
 void

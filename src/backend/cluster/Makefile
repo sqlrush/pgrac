@@ -44,6 +44,7 @@ OBJS = \
 	cluster_initdb_cohort.o \
 	cluster_initdb_tree.o \
 	cluster_initdb_common.o \
+	cluster_initdb_catalog.o \
 	cluster_initdb_origin.o \
 	cluster_initdb_side.o \
 	cluster_initdb_wal.o \
@@ -69,6 +70,7 @@ OBJS = \
 	cluster_control_bootstrap.o \
 	cluster_control_bootstrap_read.o \
 	cluster_control_bootstrap_native.o \
+	cluster_control_catalog_read.o \
 	cluster_formation_marker.o \
 	cluster_page_version.o \
 	cluster_page_cold_redo.o \
