@@ -120,4 +120,23 @@ is($creates, $space, 'every relation has one actual typed CREATE/INIT record');
 ok($advances > 0, 'nonempty relations have native reservation WAL');
 unlike($records, qr/invalid SPACE/, 'all typed SPACE records pass production codecs');
 
+my $side_root = "$shared/native_side/origin_0";
+ok(-d $side_root, 'original founder owns a persistent origin-specific SIDE base');
+my $side_wrong = 0;
+my $side_files = 0;
+for my $part ('pg_xact', 'pg_subtrans', 'pg_multixact/offsets',
+	'pg_multixact/members', 'pg_commit_ts')
+{
+	$side_wrong++ unless -d "$side_root/$part";
+	for my $source (glob("$data/$part/*"))
+	{
+		(my $name = $source) =~ s/.*\///;
+		$side_files++;
+		if (!-f "$side_root/$part/$name") { ++$side_wrong; next; }
+		$side_wrong++ if slurp_file($source) ne slurp_file("$side_root/$part/$name");
+	}
+}
+is($side_wrong, 0, 'all original native SIDE bytes persist in the founder namespace');
+ok($side_files >= 3, 'real initial SLRU segments were checked');
+
 done_testing();

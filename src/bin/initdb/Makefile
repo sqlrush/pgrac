@@ -40,7 +40,7 @@ OBJS = \
 all: initdb
 
 ifeq ($(enable_pgrac_cluster),yes)
-OBJS += pgrac_wal.o xlogreader.o
+OBJS += pgrac_wal.o pgrac_side.o xlogreader.o
 pgrac_wal.o xlogreader.o: override CPPFLAGS += -DFRONTEND
 
 xlogreader.c: % : $(top_srcdir)/src/backend/access/transam/%

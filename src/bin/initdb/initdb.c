@@ -93,6 +93,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "storage/bufpage.h"
 #include "pgrac_wal.h"
+#include "pgrac_side.h"
 #endif
 
 
@@ -3852,6 +3853,17 @@ pgrac_native_sync(void)
 	if (memcmp(control, after, sizeof(*control)) != 0)
 		pg_fatal("INITDB_WAL_READBACK: native control changed during WAL readback");
 	free(after);
+	if (pgrac_native_base_fd >= 0)
+	{
+		if (control->track_commit_timestamp
+			|| !pgrac_initdb_side_create(pgrac_native_data_fd, pgrac_native_base_fd))
+			pg_fatal("INITDB_SIDE_CREATE: original native SIDE creation failed");
+		pgrac_native_check_directories(&data_st, &wal_st);
+		after = pgrac_native_control();
+		if (memcmp(control, after, sizeof(*control)) != 0)
+			pg_fatal("INITDB_SIDE_CREATE: native control changed during SIDE creation");
+		free(after);
+	}
 	free(control);
 	if (close(pgrac_native_data_fd) != 0 || close(pgrac_native_wal_fd) != 0)
 		pg_fatal("INITDB_WAL_SYNC: cannot close original directories: %m");
