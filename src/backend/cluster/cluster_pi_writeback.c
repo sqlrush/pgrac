@@ -123,7 +123,7 @@ wb_rejected(ClusterPiWritebackRejectionV1 reason, const BufferTag *tag, int32 pe
 			uint64 boot)
 {
 	static const char *const names[]
-		= { "DATA_PROOF", "LOCAL_ACK", "REMOTE_ACK", "MASTER_CUT", "PEER_PHYSICAL" };
+		= { "DATA_PROOF", "LOCAL_ACK", "REMOTE_ACK", "MASTER_CUT", "PEER_PHYSICAL", "RECOVERY_PROOF" };
 	bool log;
 	if (wb_shared == NULL || tag == NULL || (uint32)reason >= CLUSTER_PI_WRITEBACK_REJECTION_COUNT)
 		return;
@@ -1180,8 +1180,23 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 				}
 				continue;
 			}
-			if (!wb_batch_peer(node, &peer))
-				goto done;
+			if (!wb_batch_peer(node, &peer)) {
+				for (uint32 j = 0; j < wb_batch->group_count; j++) {
+					uint32 i = wb_batch->group_indices[j], n = wb_batch->ack_count[i];
+					if (n >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+						|| !cluster_bufmgr_ack_recovered_pi_at_data_v1(
+							wb_batch->receipts[i], page, wb_batch->sources, wb_batch->source_count,
+							wb_batch->inputs, node, &wb_batch->acks[i][n])) {
+						wb_batch->qualified[i] = false;
+						wb_rejected(CLUSTER_PI_WRITEBACK_RECOVERY_PROOF, &wb_batch->tags[i], node,
+									wb_batch->epoch,
+									wb_batch->local.claim.identity.origin_owner_incarnation);
+						continue;
+					}
+					wb_batch->ack_count[i]++;
+				}
+				continue;
+			}
 			result = cluster_pi_writeback_begin_v1(receipts, wb_batch->group_count, &peer,
 												   &wb_batch->physical_job);
 			if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)

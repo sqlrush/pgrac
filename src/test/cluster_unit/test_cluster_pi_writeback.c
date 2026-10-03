@@ -30,6 +30,7 @@ PGPROC *MyProc;
 PROC_HDR *ProcGlobal;
 static uint64 wb_epoch = 1, wb_nonce;
 static uint64 wb_boots[3] = { 9, 9, 9 };
+static uint64 wb_membership_generation = 2;
 static bool wb_quorum = true, wb_stop, wb_input_current = true, wb_input_wait;
 static ClusterWalSourceRef wb_sources[3];
 static ClusterPcmPiStorageCutV1 wb_storage_cut;
@@ -349,7 +350,19 @@ GetCurrentTimestamp(void)
 ClusterMembershipState
 cluster_membership_get_state(int32 node)
 {
+	if (node >= 0 && node < 3 && (wb_recovered_sources & (1u << node)))
+		return CLUSTER_MEMBER_DEAD;
 	return node >= 0 && node < 3 ? CLUSTER_MEMBER_MEMBER : CLUSTER_MEMBER_ABSENT;
+}
+uint64
+cluster_membership_cut_generation(void)
+{
+	return wb_membership_generation;
+}
+bool
+cluster_membership_cut_generation_current(uint64 expected)
+{
+	return expected != 0 && !(expected & 1) && expected == wb_membership_generation;
 }
 uint64
 cluster_membership_get_last_admitted_incarnation(int32 node)
@@ -534,6 +547,20 @@ cluster_wal_inputs_recovered_prefix_v1(ClusterWalInputsV1 *inputs,
 		|| source->claim.identity.origin_owner_incarnation != wb_recovered_boot)
 		return false;
 	*end = UINT64_MAX;
+	return true;
+}
+
+bool
+cluster_wal_inputs_recovered_owner_v1(ClusterWalInputsV1 *inputs, int32 node,
+									ClusterWalSourceRef *out)
+{
+	XLogRecPtr end;
+	if (node < 0 || node >= 3 || !wb_inputs_pinned[cluster_node_id]
+		|| !wb_inputs[node].current
+		|| wb_inputs[node].checkpoint.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+		|| !cluster_wal_inputs_recovered_prefix_v1(inputs, &wb_inputs[node].source, &end))
+		return false;
+	*out = wb_inputs[node].source;
 	return true;
 }
 
@@ -736,6 +763,9 @@ wb_setup(void)
 	ClusterPageDataReceiptV1 *data = NULL;
 	wb_multiple = false;
 	wb_epoch = ack_writer_epoch = 1;
+	wb_membership_generation = 2;
+	wb_recovered_sources = 0;
+	wb_recovered_boot = 9;
 	wb_quorum = wb_input_current = true;
 	wb_stop = wb_input_wait = false;
 	wb_send_result = CLUSTER_IC_SEND_DONE;
@@ -1100,6 +1130,96 @@ UT_TEST(checkpointer_releases_pending_batch_before_native_checkpoint)
 	cluster_page_data_receipt_free_v1(&previous);
 	rf_page_online_plan_destroy_v1(&wb_page_plan);
 	clean();
+}
+
+UT_TEST(checkpointer_discharges_recovered_writer_without_remote_physical_ack)
+{
+	ClusterPageDataReceiptV1 *previous = wb_setup();
+	wb_storage_cut.pi_holders_bitmap = 3;
+	wb_candidates = true;
+	wb_inputs[1].checkpoint.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	wb_recovered_sources = 2;
+	wb_recovered_boot = 9;
+	physical_pi_from_source(&wb_sources[0], 80);
+	wb_select(0, B_CHECKPOINTER);
+	UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+	UT_ASSERT_EQ(wb_master_completions, 1);
+	UT_ASSERT_EQ(wb_storage_cut.pi_holders_bitmap, 0);
+	UT_ASSERT_EQ(pi_discards, 1); /* Only the live local PI needs disposal. */
+	UT_ASSERT_EQ(wb_sends, 0);
+	UT_ASSERT_EQ(wb_input_releases, 1);
+	wb_recovered_sources = 0;
+	cluster_pi_writeback_checkpointer_release_v1();
+	cluster_page_data_receipt_free_v1(&previous);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(checkpointer_recovery_refusal_is_visible_and_keeps_all_master_bits)
+{
+	ClusterPageDataReceiptV1 *previous = wb_setup();
+	ClusterPiWritebackRejectionsV1 counts;
+	wb_storage_cut.pi_holders_bitmap = 3;
+	wb_candidates = true;
+	wb_inputs[1].checkpoint.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	wb_recovered_sources = 2;
+	wb_boots[1]++; /* A completed older boot cannot discharge this executor. */
+	for (unsigned i = 0; i < 2; i++) {
+		wb_candidates = true; /* The fixture registry supplies one scan at a time. */
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT_EQ(wb_master_completions, 0);
+		UT_ASSERT_EQ(wb_storage_cut.pi_holders_bitmap, 3);
+		UT_ASSERT(!wb_inputs_pinned[0]);
+	}
+	UT_ASSERT(cluster_pi_writeback_rejections_v1(&counts));
+	UT_ASSERT_EQ(counts.attempts[CLUSTER_PI_WRITEBACK_RECOVERY_PROOF], 2);
+	UT_ASSERT_EQ(wb_log_calls[0], 1);
+	UT_ASSERT_EQ(wb_sends, 0);
+	wb_recovered_sources = 0;
+	cluster_page_data_receipt_free_v1(&previous);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(checkpointer_mixes_recovery_and_remote_ack_only_in_original_scope)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterPageDataReceiptV1 *previous = wb_setup();
+		wb_storage_cut.pi_holders_bitmap = 7;
+		wb_candidates = true;
+		wb_inputs[1].checkpoint.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+		wb_recovered_sources = 2;
+		physical_pi_from_source(&wb_sources[0], 80);
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT_EQ(wb_master_completions, 0);
+		UT_ASSERT(!wb_inputs_pinned[0]);
+		wb_select(0, B_LMON);
+		cluster_pi_writeback_lmon_tick_v1();
+		UT_ASSERT_EQ(wb_destination, 2);
+		InitBufferTag(&descriptors[1].bufferdesc.tag, &target.identity.locator,
+					  target.identity.forknum, target.identity.blockno);
+		physical_pi_from_source(&wb_sources[2], 7);
+		wb_deliver(0, 2, wb_wire, wb_length);
+		wb_select(2, B_BG_WRITER);
+		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+		wb_select(2, B_LMON);
+		cluster_pi_writeback_lmon_tick_v1();
+		wb_deliver(2, 0, wb_wire, wb_length);
+		wb_select(0, B_CHECKPOINTER);
+		if (fault == 1)
+			wb_membership_generation += 2;
+		if (fault == 2)
+			wb_input_current = false;
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT_EQ(wb_master_completions, fault == 0 ? 1 : 0);
+		UT_ASSERT_EQ(wb_storage_cut.pi_holders_bitmap, fault == 0 ? 0 : 7);
+		UT_ASSERT(!wb_inputs_pinned[0]);
+		UT_ASSERT_EQ(pi_discards, 2); /* Recovered B never supplied a physical ACK. */
+		wb_recovered_sources = 0;
+		cluster_page_data_receipt_free_v1(&previous);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
 }
 
 UT_TEST(remote_batch_preserves_other_page_when_one_pi_retries)
@@ -1664,7 +1784,7 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(28);
 	UT_RUN(remote_physical_ack_runs_actual_ancestry_and_disposal);
 	UT_RUN(writeback_codec_has_exact_bounded_authenticated_facts);
 	UT_RUN(writeback_rejects_foreign_sender_boot_and_changed_master_cut);
@@ -1673,6 +1793,9 @@ main(void)
 	UT_RUN(writeback_reply_is_retired_and_retries_only_transport_refusal);
 	UT_RUN(checkpointer_batch_reaches_actual_local_and_remote_physical_owners);
 	UT_RUN(checkpointer_releases_pending_batch_before_native_checkpoint);
+	UT_RUN(checkpointer_discharges_recovered_writer_without_remote_physical_ack);
+	UT_RUN(checkpointer_recovery_refusal_is_visible_and_keeps_all_master_bits);
+	UT_RUN(checkpointer_mixes_recovery_and_remote_ack_only_in_original_scope);
 	UT_RUN(remote_batch_preserves_other_page_when_one_pi_retries);
 	UT_RUN(checkpointer_batch_skips_local_retry_and_retires_other_page);
 	UT_RUN(writeback_rejections_survive_batches_and_throttle_per_boot_epoch);

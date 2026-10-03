@@ -134,6 +134,84 @@ cluster_wal_inputs_recovered_prefix_v1(ClusterWalInputsV1 *inputs,
 }
 
 bool
+cluster_wal_inputs_recovered_owner_v1(ClusterWalInputsV1 *inputs, int32 node,
+									ClusterWalSourceRef *out)
+{
+	const ClusterWalInputV1 *current = NULL;
+	bool seen[CLUSTER_WAL_INPUTS_MAX] = { false };
+	uint32 count = 0;
+	XLogRecPtr end;
+	const uint32 closed_flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+		| CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+		| CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || !inputs_current(inputs) || inputs->cold || node < 0
+		|| node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		return false;
+	for (uint32 i = 0; i < inputs->count; i++) {
+		const ClusterWalInputV1 *item = &inputs->items[i];
+		if (item->source.claim.identity.origin_node_id != node)
+			continue;
+		if (item->kind == CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL) {
+			/* The original selected terminal reader already qualified durable
+			 * isolation/closure. It cannot stand in for an installed writer. */
+			if (item->current || item->terminal.checkpoint_records != 0
+				|| item->terminal.unsupported_records != 0)
+				return false;
+			continue;
+		}
+		if (item->kind != CLUSTER_WAL_INPUT_CHECKPOINT)
+			return false;
+		count++;
+		if (item->current) {
+			if (current != NULL)
+				return false;
+			current = item;
+		}
+	}
+	if (current == NULL
+		|| !cluster_wal_inputs_recovered_prefix_v1(inputs, &current->source, &end))
+		return false;
+	for (uint32 i = 0; i < inputs->count; i++) {
+		const ClusterWalInputV1 *item = &inputs->items[i];
+		const ClusterControlRootSnapshot *root = &item->checkpoint;
+		uint64 offset;
+		if (item->source.claim.identity.origin_node_id != node
+			|| item->kind != CLUSTER_WAL_INPUT_CHECKPOINT)
+			continue;
+		if (item->source.claim.identity.root_lineage_seq == 0
+			|| item->source.claim.identity.root_lineage_seq
+				   > current->source.claim.identity.root_lineage_seq)
+			return false;
+		offset = current->source.claim.identity.root_lineage_seq
+			- item->source.claim.identity.root_lineage_seq;
+		if (offset >= count || seen[offset])
+			return false;
+		seen[offset] = true;
+		if (item == current)
+			continue;
+		/* A selected successor exists for every retained predecessor. Native
+		 * INSTALL retained this chain only after the original exit/recovery
+		 * proof. CLOSED without that successor is deliberately insufficient. */
+		if (root->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED) {
+			if (root->checkpoint_source_kind != CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1
+				|| (root->root_flags & closed_flags) != closed_flags
+				|| root->tail_tli != item->source.timeline
+				|| root->checkpoint_lower_lsn == InvalidXLogRecPtr
+				|| root->tail_last_record_lsn != item->checkpoint_start
+				|| root->tail_last_record_lsn < root->checkpoint_lower_lsn
+				|| root->tail_last_record_lsn >= root->validated_tail_lsn_exclusive)
+				return false;
+		} else if (!cluster_wal_inputs_recovered_prefix_v1(inputs, &item->source, &end))
+			return false;
+	}
+	*out = current->source;
+	return true;
+}
+
+bool
 cluster_wal_inputs_local_predecessor_retired_v1(ClusterWalInputsV1 *inputs,
 												const ClusterWalSourceRef *predecessor,
 												const ClusterWalSourceRef *writer)

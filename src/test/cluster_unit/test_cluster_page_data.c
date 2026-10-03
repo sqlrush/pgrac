@@ -24,6 +24,7 @@
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/cluster_membership.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -171,6 +172,60 @@ static bool ack_writer_ready = true, ack_epoch_race;
 static bool ack_retired_allowed;
 static unsigned ack_retired_calls;
 static ClusterWalSourceRef ack_retired_source, ack_retired_writer;
+#ifndef PGRAC_TEST_REAL_PI_WRITEBACK
+/* The complete ROOT reader has separate native-file tests. These predicates
+ * are its explicit boundary; DATA/ancestry and acknowledgements below are real. */
+static ClusterWalInputV1 recovered_inputs[3];
+static bool recovered_ready, recovered_pinned;
+static ClusterMembershipState recovered_state;
+static uint64 recovered_boot, recovered_membership;
+uint64
+cluster_membership_cut_generation(void)
+{
+	return recovered_membership;
+}
+bool
+cluster_membership_cut_generation_current(uint64 expected)
+{
+	return expected != 0 && (expected & 1) == 0 && expected == recovered_membership;
+}
+ClusterMembershipState
+cluster_membership_get_state(int32 node)
+{
+	return node == 1 ? recovered_state : CLUSTER_MEMBER_MEMBER;
+}
+uint64
+cluster_membership_get_last_admitted_incarnation(int32 node)
+{
+	return node == 1 ? recovered_boot : 9;
+}
+uint32
+cluster_wal_inputs_count_v1(ClusterWalInputsV1 *inputs)
+{
+	return inputs == (void *)1 && recovered_pinned ? 3 : 0;
+}
+const ClusterWalInputV1 *
+cluster_wal_inputs_at_v1(ClusterWalInputsV1 *inputs, uint32 i)
+{
+	return cluster_wal_inputs_count_v1(inputs) == 3 && i < 3 ? &recovered_inputs[i] : NULL;
+}
+ClusterControlRootResult
+cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
+{
+	return inputs == (void *)1 && recovered_pinned && recovered_ready
+		? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+bool
+cluster_wal_inputs_recovered_owner_v1(ClusterWalInputsV1 *inputs, int32 node,
+										ClusterWalSourceRef *out)
+{
+	if (node != 1 || cluster_wal_inputs_revalidate_v1(inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return false;
+	*out = recovered_inputs[1].source;
+	return true;
+}
+#endif
+
 bool
 cluster_wal_inputs_local_predecessor_retired_v1(ClusterWalInputsV1 *inputs,
 												const ClusterWalSourceRef *predecessor,
@@ -2393,10 +2448,149 @@ physical_ack_rechecks_detached_responsibility_after_consumption(void)
 	}
 }
 
+#ifndef PGRAC_TEST_REAL_PI_WRITEBACK
+static void
+recovered_fixture(const ClusterWalSourceRef sources[3])
+{
+	memset(recovered_inputs, 0, sizeof(recovered_inputs));
+	for (uint32 i = 0; i < 3; i++)
+		recovered_inputs[i].source = sources[i];
+	recovered_ready = recovered_pinned = true;
+	recovered_state = CLUSTER_MEMBER_DEAD;
+	recovered_boot = sources[1].claim.identity.origin_owner_incarnation;
+	recovered_membership = 2;
+}
+
+static void
+recovery_ack_needs_full_input_terminal_data_and_exact_dead_boot(void)
+{
+	for (int fault = 0; fault < 11; fault++) {
+		ClusterWalSourceRef sources[3];
+		ClusterPcmPiStorageCutV1 cut;
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		ClusterPiPhysicalAckV1 *ack = NULL;
+		ClusterWalWriterToken exported;
+		int32 node = -1;
+		RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &cut);
+		UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt));
+		recovered_fixture(sources);
+		if (fault == 1)
+			recovered_ready = false;
+		if (fault == 2)
+			recovered_pinned = false;
+		if (fault == 3)
+			recovered_inputs[2].source = recovered_inputs[0].source;
+		if (fault == 4)
+			recovered_inputs[0].source.claim.claim_sha256[0] ^= 1;
+		if (fault == 5)
+			recovered_state = CLUSTER_MEMBER_MEMBER;
+		if (fault == 6)
+			recovered_boot++;
+		if (fault == 7)
+			recovered_membership = 0;
+		if (fault == 8)
+			recovered_membership = 3;
+		if (fault == 9)
+			receipt->storage_cut.master_node = 2;
+		if (fault == 10)
+			receipt->storage_cut.pi_holders_bitmap &= ~2u;
+		UT_ASSERT_EQ(cluster_bufmgr_ack_recovered_pi_at_data_v1(
+			receipt, plan, sources, 3, (void *)1, 1, &ack), fault == 0);
+		UT_ASSERT_EQ(pi_discards + writes, 0);
+		if (fault == 0) {
+			UT_ASSERT(cluster_page_data_pi_ack_read_v1(ack, receipt, &node));
+			UT_ASSERT_EQ(node, 1);
+			UT_ASSERT(!cluster_page_data_pi_ack_export_v1(ack, receipt, &exported));
+		}
+		cluster_page_data_pi_ack_free_v1(&ack);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&plan);
+		clean();
+	}
+}
+
+static void
+recovery_ack_cannot_outlive_original_input_membership_or_owner(void)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		ClusterWalSourceRef sources[3];
+		ClusterPcmPiStorageCutV1 cut;
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		ClusterPiPhysicalAckV1 *ack = NULL;
+		ResourceOwner owner;
+		int32 node = -1;
+		RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &cut);
+		UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&target, &cut, plan, sources, 3, &receipt));
+		recovered_fixture(sources);
+		UT_ASSERT(cluster_bufmgr_ack_recovered_pi_at_data_v1(
+			receipt, plan, sources, 3, (void *)1, 1, &ack));
+		owner = CurrentResourceOwner;
+		if (fault == 1)
+			recovered_pinned = false;
+		if (fault == 2)
+			recovered_ready = false;
+		if (fault == 3)
+			recovered_membership += 2;
+		if (fault == 4)
+			recovered_state = CLUSTER_MEMBER_JOINING;
+		if (fault == 5)
+			recovered_boot++;
+		if (fault == 6)
+			CurrentResourceOwner = (void *)9;
+		if (fault == 7)
+			receipt->storage_cut.authority.transition_count++;
+		if (fault == 8)
+			recovered_inputs[1].source.claim.identity.root_lineage_seq++;
+		UT_ASSERT_EQ(cluster_page_data_pi_ack_read_v1(ack, receipt, &node), fault == 0);
+		UT_ASSERT_EQ(node, fault == 0 ? 1 : -1);
+		CurrentResourceOwner = owner;
+		cluster_page_data_pi_ack_free_v1(&ack);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&plan);
+		clean();
+	}
+}
+
+static void
+recovery_ack_refuses_successor_pi_not_covered_by_actual_data(void)
+{
+	ClusterWalSourceRef sources[3];
+	ClusterPcmPiStorageCutV1 storage_cut;
+	ClusterPcmPiWriteCutV1 cut, verified;
+	ClusterPageDataReceiptV1 *receipt = NULL;
+	ClusterPiPhysicalAckV1 *ack = NULL;
+	RfPageOnlinePlanV1 *plan = prepare_storage_observation(sources, &storage_cut);
+	physical_pi_from_source(&sources[0], 80);
+	storage_read = false;
+	descriptors[1].bufferdesc.pcm_state = PCM_STATE_X;
+	descriptors[1].bufferdesc.buffer_type = BUF_TYPE_XCUR;
+	pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_VALID | BM_DIRTY);
+	target.version.mutation_token = 80;
+	cut = data_pi_cut();
+	UT_ASSERT(cluster_bufmgr_write_page_data_at_cut_v1(&target, &cut, &receipt));
+	UT_ASSERT(cluster_page_data_pi_proof_v1(receipt, plan, sources, 3, &verified));
+	recovered_fixture(sources);
+	UT_ASSERT(!cluster_bufmgr_ack_recovered_pi_at_data_v1(
+		receipt, plan, sources, 3, (void *)1, 1, &ack));
+	UT_ASSERT(ack == NULL);
+	UT_ASSERT_EQ(pi_discards, 0);
+	cluster_page_data_receipt_free_v1(&receipt);
+	rf_page_online_plan_destroy_v1(&plan);
+	clean();
+}
+#endif
+
 int
 main(void)
 {
+#ifndef PGRAC_TEST_REAL_PI_WRITEBACK
+	UT_PLAN(40);
+	UT_RUN(recovery_ack_needs_full_input_terminal_data_and_exact_dead_boot);
+	UT_RUN(recovery_ack_cannot_outlive_original_input_membership_or_owner);
+	UT_RUN(recovery_ack_refuses_successor_pi_not_covered_by_actual_data);
+#else
 	UT_PLAN(37);
+#endif
 	UT_RUN(missing_pi_terminal_receipt_accepts_original_claim_ceiling);
 	UT_RUN(data_sync_releases_content_and_rechecks_clean_replacement);
 	UT_RUN(redeclare_scan_includes_physical_pi_and_preserves_unacknowledged_cursor);

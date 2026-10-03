@@ -159,6 +159,16 @@ extern bool cluster_bufmgr_ack_pi_at_data_v1(const ClusterPageDataReceiptV1 *rec
 											 const ClusterWalSourceRef *sources,
 											 uint32 source_count, ClusterWalInputsV1 *inputs,
 											 ClusterPiPhysicalAckV1 **out);
+/* Master-local alternative for a durably recovered DEAD executor, not a
+ * physical observation at a remote instance. Requires the complete selected
+ * input set and terminal DATA ancestry for this page. The acknowledgement
+ * borrows inputs, which must stay alive until the acknowledgement is freed;
+ * suspension, ROOT/membership change or a different owner prevents use.
+ * It cannot be exported as a physical acknowledgement or authorize WAL GC. */
+extern bool cluster_bufmgr_ack_recovered_pi_at_data_v1(
+	const ClusterPageDataReceiptV1 *receipt, const RfPageOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *sources, uint32 source_count, ClusterWalInputsV1 *inputs,
+	int32 node, ClusterPiPhysicalAckV1 **out);
 extern bool cluster_page_data_pi_ack_read_v1(const ClusterPiPhysicalAckV1 *ack,
 											 const ClusterPageDataReceiptV1 *receipt,
 											 int32 *out_node);
@@ -236,7 +246,7 @@ extern bool cluster_page_data_pi_proof_v1(const ClusterPageDataReceiptV1 *receip
 										  ClusterPcmPiWriteCutV1 *out);
 
 /* Clear only the unchanged master cut after exact DATA/ancestry proof AND
- * qualified physical acknowledgements for every original holder. Missing,
+ * qualified physical or original recovery acknowledgements for every holder. Missing,
  * duplicate or foreign-cut acknowledgements never retire a subset. A retry
  * against an unchanged already-cleared cut is idempotent. holders_out reports
  * the completed set, never a queue of notifications still owed. The retained

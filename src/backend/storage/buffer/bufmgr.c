@@ -90,6 +90,7 @@
 #include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_inputs.h"
+#include "cluster/cluster_membership.h"
 #include "cluster/storage/cluster_smgr.h"
 
 /*
@@ -10619,6 +10620,9 @@ struct ClusterPiPhysicalAckV1 {
 	pid_t pid;
 	int32 node;
 	bool remote;
+	ClusterWalInputsV1 *recovered_inputs;
+	ClusterWalSourceRef recovered_source;
+	uint64 membership_generation;
 };
 
 /* Neither a tag nor a pin grants write authority. Check every live fence
@@ -11644,6 +11648,90 @@ cluster_bufmgr_ack_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 	return true;
 }
 
+static bool
+cluster_pi_recovered_ack_current(const ClusterPiPhysicalAckV1 *ack)
+{
+	ClusterWalSourceRef source;
+	return ack->node >= 0 && ack->node < RESOURCE_X_PROTOCOL_NODE_LIMIT
+		&& ack->node != cluster_node_id && !ack->remote
+		&& cluster_membership_cut_generation_current(ack->membership_generation)
+		&& cluster_membership_get_state(ack->node) == CLUSTER_MEMBER_DEAD
+		&& cluster_membership_get_last_admitted_incarnation(ack->node)
+			   == ack->recovered_source.claim.identity.origin_owner_incarnation
+		&& cluster_wal_inputs_revalidate_v1(ack->recovered_inputs)
+			   == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& cluster_wal_inputs_recovered_owner_v1(ack->recovered_inputs, ack->node, &source)
+		&& memcmp(&source, &ack->recovered_source, sizeof(source)) == 0
+		&& cluster_membership_cut_generation_current(ack->membership_generation);
+}
+
+bool
+cluster_bufmgr_ack_recovered_pi_at_data_v1(
+	const ClusterPageDataReceiptV1 *receipt, const RfPageOnlinePlanV1 *plan,
+	const ClusterWalSourceRef *sources, uint32 source_count, ClusterWalInputsV1 *inputs,
+	int32 node, ClusterPiPhysicalAckV1 **out)
+{
+	ClusterPiPhysicalAckV1 candidate = { 0 }, *ack;
+	ClusterWalWriterToken after;
+	ClusterPcmPiWriteCutV1 x_cut;
+	ClusterPcmPiStorageCutV1 storage_cut;
+	uint32 expected;
+	int32 master;
+	bool matched[CLUSTER_WAL_INPUTS_MAX] = { false };
+
+	if (out == NULL || *out != NULL || inputs == NULL || sources == NULL
+		|| source_count == 0 || source_count > CLUSTER_WAL_INPUTS_MAX
+		|| source_count != cluster_wal_inputs_count_v1(inputs)
+		|| node < 0 || node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || node == cluster_node_id
+		|| !cluster_pi_ack_local_writer(&candidate.collector))
+		return false;
+	candidate.membership_generation = cluster_membership_cut_generation();
+	candidate.node = node;
+	candidate.recovered_inputs = inputs;
+	if (!cluster_wal_inputs_recovered_owner_v1(inputs, node, &candidate.recovered_source)
+		|| !cluster_pi_recovered_ack_current(&candidate))
+		return false;
+	/* A sealed subset is not the retained origin census. Match every selected
+	 * source exactly once, including explicit empty and older generations. */
+	for (uint32 i = 0; i < source_count; i++) {
+		const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, i);
+		bool found = false;
+		if (item == NULL)
+			return false;
+		for (uint32 j = 0; j < source_count; j++) {
+			if (matched[j] || !cluster_page_data_source_same(&item->source, &sources[j]))
+				continue;
+			matched[j] = found = true;
+			break;
+		}
+		if (!found)
+			return false;
+	}
+	if (cluster_page_data_pi_proof_v1(receipt, plan, sources, source_count, &x_cut)) {
+		expected = x_cut.pi_holders_bitmap;
+		master = x_cut.master_node;
+	} else if (cluster_page_data_pi_storage_proof_v1(receipt, plan, sources, source_count,
+													 &storage_cut)) {
+		expected = storage_cut.pi_holders_bitmap;
+		master = storage_cut.master_node;
+	} else
+		return false;
+	if (master != cluster_node_id || (expected & ((uint32)1u << node)) == 0
+		|| !cluster_page_data_covers_missing_pi(receipt, plan, sources, source_count)
+		|| !cluster_pi_recovered_ack_current(&candidate)
+		|| !cluster_pi_ack_local_writer(&after)
+		|| memcmp(&candidate.collector, &after, sizeof(after)) != 0)
+		return false;
+	candidate.magic = UINT64_C(0x5047504941434b31);
+	candidate.data = *receipt;
+	candidate.owner = CurrentResourceOwner;
+	candidate.pid = getpid();
+	ack = palloc(sizeof(*ack));
+	*ack = candidate;
+	*out = ack;
+	return true;
+}
+
 bool
 cluster_page_data_pi_ack_read_v1(const ClusterPiPhysicalAckV1 *ack,
 								 const ClusterPageDataReceiptV1 *receipt, int32 *out_node)
@@ -11656,7 +11744,11 @@ cluster_page_data_pi_ack_read_v1(const ClusterPiPhysicalAckV1 *ack,
 		|| ack->owner != CurrentResourceOwner || memcmp(&ack->data, receipt, sizeof(*receipt)) != 0
 		|| !cluster_pi_ack_local_writer(&current))
 		return false;
-	if (ack->remote) {
+	if (ack->recovered_inputs != NULL) {
+		if (memcmp(&ack->collector, &current, sizeof(current)) != 0
+			|| !cluster_pi_recovered_ack_current(ack))
+			return false;
+	} else if (ack->remote) {
 		ClusterPiDataFactV1 fact;
 		if (ack->node == cluster_node_id || memcmp(&ack->collector, &current, sizeof(current)) != 0
 			|| !cluster_page_data_pi_fact_v1(receipt, &fact)
@@ -11674,7 +11766,7 @@ cluster_page_data_pi_ack_export_v1(const ClusterPiPhysicalAckV1 *ack,
 								   ClusterWalWriterToken *out)
 {
 	int32 node;
-	if (out == NULL || ack == NULL || ack->remote
+	if (out == NULL || ack == NULL || ack->remote || ack->recovered_inputs != NULL
 		|| !cluster_page_data_pi_ack_read_v1(ack, receipt, &node) || node != cluster_node_id)
 		return false;
 	*out = ack->writer;
