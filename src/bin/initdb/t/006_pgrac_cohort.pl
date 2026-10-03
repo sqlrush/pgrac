@@ -107,16 +107,23 @@ for my $node (0 .. 3)
 	}
 	ok($pages > 0 && !$wrong, "all origin $node WAL pages were generated with its thread");
 	ok(-f "$data/global/pgrac_control_binding", 'original local binding follows complete ROOT publication');
+	for my $family ('pg_xact', 'pg_subtrans', 'pg_multixact', 'pg_commit_ts')
+	{
+		is(readlink("$data/$family"), "$temp/valid-data/native_side/origin_$node/$family",
+			'original creator installs exact native SIDE routing');
+	}
 	for my $family ('pg_xact', 'pg_subtrans', 'pg_multixact/offsets', 'pg_multixact/members', 'pg_commit_ts')
 	{
 		my $target = "$temp/valid-data/native_side/origin_$node/$family";
+		my $original = "$data/pgrac_initdb_native_side/$family";
 		ok(-d $target, "origin $node has its native $family directory");
-		my @source = sort map { s{.*/}{}r } glob("$data/$family/*");
+		ok(-d $original && !-l $original, 'original native SIDE directory is retained');
+		my @source = sort map { s{.*/}{}r } glob("$original/*");
 		my @actual = sort map { s{.*/}{}r } glob("$target/*");
 		is_deeply(\@actual, \@source, 'native SIDE file set is exact');
 		for my $name (@actual)
 		{
-			is(sha256_hex(slurp_file("$target/$name")), sha256_hex(slurp_file("$data/$family/$name")),
+			is(sha256_hex(slurp_file("$target/$name")), sha256_hex(slurp_file("$original/$name")),
 				'copied SIDE bytes match this origin');
 		}
 	}

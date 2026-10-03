@@ -7915,13 +7915,15 @@ test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete: %: %.c un
 # The same fork/exec/wait path as original native creation, with real children.
 test_cluster_initdb_cohort: test_cluster_initdb_cohort.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_cohort.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
 		$(top_srcdir)/src/common/file_perm.c cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree.c \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
 		$(top_srcdir)/src/common/file_perm.c \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # Original immutable claim/anchor persistence with syscall faults.
 test_cluster_initdb_origin: test_cluster_initdb_origin.c unit_test.h \

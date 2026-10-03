@@ -9,6 +9,10 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <linux/fs.h>
+#include <sys/syscall.h>
+#endif
 
 #include "access/xlog_internal.h"
 #include "cluster/cluster_initdb_cohort.h"
@@ -49,7 +53,16 @@ typedef struct InitdbOrigin
 	uint8 control_sha256[32];
 	struct stat control_identity;
 	ClusterInitdbTree wal_observed;
+	bool side_routed;
+	struct stat side_archive;
+	struct stat side_sources[4], side_targets[4], side_links[4];
+	ClusterInitdbTree side_source_trees[4], side_target_trees[4];
 } InitdbOrigin;
+
+static const char *const side_families[] = {
+	"pg_xact", "pg_subtrans", "pg_multixact", "pg_commit_ts"
+};
+#define INITDB_SIDE_ARCHIVE "pgrac_initdb_native_side"
 
 static volatile sig_atomic_t creation_cancelled;
 
@@ -659,6 +672,128 @@ creation_tree_recheck(int fd, bool derived, const ClusterInitdbTree *expected)
 		refuse("original file tree changed before publication");
 }
 
+static int
+move_original_directory(int from, const char *name, int to)
+{
+#ifdef __APPLE__
+	return renameatx_np(from, name, to, name, RENAME_EXCL);
+#elif defined(__linux__) && defined(SYS_renameat2)
+	return syscall(SYS_renameat2, from, name, to, name, RENAME_NOREPLACE);
+#else
+	errno = ENOTSUP;
+	return -1;
+#endif
+}
+
+static void
+creation_side_link_current(const InitdbOrigin *origin, unsigned family,
+						   const InitdbDirectory *target)
+{
+	struct stat link, routed;
+	const struct stat *expected = &origin->side_links[family];
+	char path[MAXPGPATH];
+	ssize_t length;
+
+	if (fstatat(origin->data.fd, side_families[family], &link, AT_SYMLINK_NOFOLLOW) != 0
+		|| !S_ISLNK(link.st_mode) || link.st_uid != geteuid() || link.st_nlink != 1
+		|| link.st_dev != expected->st_dev || link.st_ino != expected->st_ino)
+		refuse("original native SIDE link was replaced");
+	length = readlinkat(origin->data.fd, side_families[family], path, sizeof(path));
+	if (length < 0 || length != strlen(target->path)
+		|| memcmp(path, target->path, length) != 0
+		|| fstatat(origin->data.fd, side_families[family], &routed, 0) != 0
+		|| !same_directory(&routed, &target->identity))
+		refuse("original native SIDE link no longer selects its shared directory");
+}
+
+static void
+creation_side_current(const InitdbDirectory *shared, const InitdbOrigin *origin, unsigned node)
+{
+	InitdbDirectory native, target_root, archive;
+	char name[32];
+
+	if (!origin->side_routed) refuse("original native SIDE routing is incomplete");
+	open_original_child(shared, "native_side", &native);
+	snprintf(name, sizeof(name), "origin_%u", node);
+	open_original_child(&native, name, &target_root);
+	open_original_child(&origin->data, INITDB_SIDE_ARCHIVE, &archive);
+	if (!same_directory(&archive.identity, &origin->side_archive))
+		refuse("original native SIDE archive was replaced");
+	for (unsigned i = 0; i < lengthof(side_families); i++) {
+		InitdbDirectory source, target;
+		open_original_child(&archive, side_families[i], &source);
+		open_original_child(&target_root, side_families[i], &target);
+		if (!same_directory(&source.identity, &origin->side_sources[i])
+			|| !same_directory(&target.identity, &origin->side_targets[i]))
+			refuse("original native SIDE directory was replaced");
+		creation_tree_recheck(source.fd, false, &origin->side_source_trees[i]);
+		creation_tree_recheck(target.fd, false, &origin->side_target_trees[i]);
+		creation_side_link_current(origin, i, &target);
+		directory_current(&source);
+		directory_current(&target);
+		if (close(source.fd) != 0 || close(target.fd) != 0)
+			refuse("cannot close original native SIDE observation");
+	}
+	directory_current(&archive);
+	directory_current(&target_root);
+	directory_current(&native);
+	if (close(archive.fd) != 0 || close(target_root.fd) != 0 || close(native.fd) != 0)
+		refuse("cannot close original native SIDE namespace");
+}
+
+/* Only the original creator calls this, after every native child has exited.
+ * Retain the original directories; no startup reader may perform this move. */
+static void
+route_original_side(const InitdbDirectory *shared, InitdbOrigin *origin, unsigned node)
+{
+	InitdbDirectory native, target_root, archive, sources[4], targets[4];
+	char name[32];
+
+	if (origin->side_routed || node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		refuse("original native SIDE routing cannot be repeated");
+	open_original_child(shared, "native_side", &native);
+	snprintf(name, sizeof(name), "origin_%u", node);
+	open_original_child(&native, name, &target_root);
+	/* Inspect all four pairs before the first change to this PGDATA. */
+	for (unsigned i = 0; i < lengthof(side_families); i++) {
+		open_original_child(&origin->data, side_families[i], &sources[i]);
+		open_original_child(&target_root, side_families[i], &targets[i]);
+		if ((sources[i].identity.st_dev == targets[i].identity.st_dev
+			 && sources[i].identity.st_ino == targets[i].identity.st_ino)
+			|| !cluster_initdb_tree_read(sources[i].fd, false, &origin->side_source_trees[i])
+			|| !cluster_initdb_tree_read(targets[i].fd, false, &origin->side_target_trees[i])
+			|| memcmp(origin->side_source_trees[i].content, origin->side_target_trees[i].content, 32) != 0)
+			refuse("shared native SIDE differs from its original completed child");
+		origin->side_sources[i] = sources[i].identity;
+		origin->side_targets[i] = targets[i].identity;
+	}
+	create_child(&origin->data, INITDB_SIDE_ARCHIVE, &archive);
+	origin->side_archive = archive.identity;
+	for (unsigned i = 0; i < lengthof(side_families); i++) {
+		directory_current(&sources[i]);
+		directory_current(&targets[i]);
+		directory_current(&archive);
+		creation_tree_recheck(sources[i].fd, false, &origin->side_source_trees[i]);
+		creation_tree_recheck(targets[i].fd, false, &origin->side_target_trees[i]);
+		if (move_original_directory(origin->data.fd, side_families[i], archive.fd) != 0)
+			refuse("cannot exclusively retain original native SIDE directory");
+		if (symlinkat(targets[i].path, origin->data.fd, side_families[i]) != 0
+			|| fstatat(origin->data.fd, side_families[i], &origin->side_links[i], AT_SYMLINK_NOFOLLOW) != 0)
+			refuse("cannot install original native SIDE link");
+		creation_side_link_current(origin, i, &targets[i]);
+		if (close(sources[i].fd) != 0 || close(targets[i].fd) != 0)
+			refuse("cannot close original native SIDE directories");
+	}
+	directory_current(&archive);
+	directory_current(&target_root);
+	directory_current(&native);
+	if (fsync(archive.fd) != 0 || fsync(origin->data.fd) != 0
+		|| close(archive.fd) != 0 || close(target_root.fd) != 0 || close(native.fd) != 0)
+		refuse("cannot persist original native SIDE routing");
+	origin->side_routed = true;
+	creation_side_current(shared, origin, node);
+}
+
 static void
 creation_sources_current(const PgracInitdbCohortContext *request,
 	const ClusterSharedConfigRef *config, InitdbDirectory roots[4], InitdbOrigin *origins,
@@ -669,6 +804,7 @@ creation_sources_current(const PgracInitdbCohortContext *request,
 	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
 		if (!(config->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64)))) continue;
 		control_read(&origins[node], node + 1, config->identity.system_identifier, false);
+		creation_side_current(&roots[1], &origins[node], node);
 		creation_tree_recheck(origins[node].wal.fd, false, &origins[node].wal_observed);
 	}
 	creation_tree_recheck(roots[1].fd, derived, data);
@@ -749,6 +885,7 @@ create_root_objects(const PgracInitdbCohortContext *request, InitdbDirectory roo
 		InitdbOrigin *origin = &origins[node];
 		if (!(shared->configured[node / 64] & (UINT64CONST(1) << (node % 64)))) continue;
 		control_read(origin, node + 1, config->identity.system_identifier, false);
+		creation_side_current(&roots[1], origin, node);
 		if (!cluster_initdb_tree_read(origin->wal.fd, false, &origin->wal_observed)
 			|| !pg_strong_random(ids[node], 16)) refuse("cannot observe original native source");
 		ids[node][6] = (ids[node][6] & 0x0f) | 0x40;
@@ -844,6 +981,7 @@ create_root_objects(const PgracInitdbCohortContext *request, InitdbDirectory roo
 		InitdbDirectory local_global;
 		if (!root->present[node]) continue;
 		control_read(&origins[node], node + 1, config->identity.system_identifier, false);
+		creation_side_current(&roots[1], &origins[node], node);
 		open_original_child(&origins[node].data, "global", &local_global);
 		if (!cluster_initdb_object_write_new(local_global.fd, PGRAC_CONTROL_BINDING_NAME,
 			bindings[node], PGRAC_CONTROL_BINDING_BYTES) || close(local_global.fd) != 0)
@@ -924,6 +1062,7 @@ ClusterInitdbCohortMain(int argc, char **argv)
 		InitdbOrigin *origin = &origins[node];
 		if (!(ref->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64)))) continue;
 		control_read(origin, node + 1, ref->identity.system_identifier, false);
+		route_original_side(&roots[1], origin, node);
 		if (fsync(origin->wal.fd) != 0 || fsync(origin->thread.fd) != 0 || fsync(origin->data.fd) != 0)
 			refuse("cannot persist original writer directories");
 	}

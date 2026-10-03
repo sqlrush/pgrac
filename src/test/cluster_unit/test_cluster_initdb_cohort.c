@@ -3,6 +3,8 @@
 #include "postgres.h"
 #include <setjmp.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "unit_test.h"
@@ -11,7 +13,24 @@ UT_DEFINE_GLOBALS();
 static jmp_buf refused;
 static bool expecting;
 static char executable[MAXPGPATH];
+static bool side_sync_fault, side_link_fault;
+static int
+side_test_fsync(int fd)
+{
+	if (side_sync_fault) { errno = EIO; return -1; }
+	return fsync(fd);
+}
+static int
+side_test_symlinkat(const char *path, int fd, const char *name)
+{
+	if (side_link_fault) { errno = EIO; return -1; }
+	return symlinkat(path, fd, name);
+}
+#define fsync side_test_fsync
+#define symlinkat side_test_symlinkat
 #include "../../backend/cluster/cluster_initdb_cohort.c"
+#undef fsync
+#undef symlinkat
 
 bool errstart(int level, const char *domain) { return true; }
 bool errstart_cold(int level, const char *domain) { return true; }
@@ -140,6 +159,161 @@ static void derived_inputs_must_survive_until_primary_publication(void)
 	}
 }
 
+static void
+side_test_put(int parent, const char *name, char value)
+{
+	char bytes[8192];
+	int fd = openat(parent, name, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	memset(bytes, value, sizeof(bytes));
+	UT_ASSERT(fd >= 0 && write(fd, bytes, sizeof(bytes)) == sizeof(bytes) && close(fd) == 0);
+}
+
+/* Remove only this fixture's owned tree; never follow a routed symlink. */
+static void
+side_test_remove(int parent)
+{
+	DIR *stream = fdopendir(openat(parent, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW));
+	struct dirent *entry;
+	UT_ASSERT(stream != NULL);
+	if (stream == NULL) return;
+	while ((entry = readdir(stream)) != NULL) {
+		struct stat st;
+		if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+		UT_ASSERT(fstatat(parent, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0);
+		if (S_ISDIR(st.st_mode)) {
+			int child = openat(parent, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+			UT_ASSERT(child >= 0);
+			side_test_remove(child);
+			UT_ASSERT(close(child) == 0 && unlinkat(parent, entry->d_name, AT_REMOVEDIR) == 0);
+		} else UT_ASSERT(unlinkat(parent, entry->d_name, 0) == 0);
+	}
+	UT_ASSERT(closedir(stream) == 0);
+}
+
+static void
+side_route_case(unsigned fault, unsigned node)
+{
+	char temp[] = "/tmp/pgrac-side-route-XXXXXX", path[MAXPGPATH], name[32];
+	char *canonical;
+	InitdbDirectory base, shared, native, target;
+	InitdbOrigin origin = {0};
+	pid_t child;
+	int status;
+
+	UT_ASSERT(mkdtemp(temp) != NULL);
+	canonical = realpath(temp, NULL);
+	UT_ASSERT(canonical != NULL);
+	snprintf(path, sizeof(path), "%s/new", canonical);
+	preflight_directory(path, &base); create_directory(&base);
+	create_child(&base, "data", &origin.data);
+	create_child(&base, "shared", &shared);
+	create_child(&shared, "native_side", &native);
+	snprintf(name, sizeof(name), "origin_%u", node);
+	create_child(&native, name, &target);
+	for (unsigned i = 0; i < lengthof(side_families); i++) {
+		InitdbDirectory source_dir, target_dir;
+		create_child(&origin.data, side_families[i], &source_dir);
+		create_child(&target, side_families[i], &target_dir);
+		if (i != 3) {
+			side_test_put(source_dir.fd, "0000", 'a' + i);
+			side_test_put(target_dir.fd, "0000", 'a' + i);
+		}
+		UT_ASSERT(close(source_dir.fd) == 0 && close(target_dir.fd) == 0);
+	}
+	/* FATAL deliberately terminates the original owner; the child isolates its
+	 * process-owned descriptors exactly as production failure does. */
+	fflush(NULL);
+	child = fork();
+	UT_ASSERT(child >= 0);
+	if (child == 0) {
+		struct stat before, after;
+		bool rejected = false;
+		UT_ASSERT(fstatat(origin.data.fd, "pg_xact", &before, AT_SYMLINK_NOFOLLOW) == 0);
+		if (fault == 1) side_test_put(target.fd, "pg_commit_ts/extra", 'x');
+		if (fault == 2) side_test_put(target.fd, "pg_xact/0000", 'x');
+		if (fault == 3) {
+			UT_ASSERT(renameat(target.fd, "pg_xact", target.fd, "old") == 0);
+			UT_ASSERT(symlinkat("old", target.fd, "pg_xact") == 0);
+		}
+		if (fault == 4) UT_ASSERT(mkdirat(origin.data.fd, INITDB_SIDE_ARCHIVE, 0700) == 0);
+		if (fault == 5) side_sync_fault = true;
+		if (fault == 6) side_link_fault = true;
+		if (fault >= 7 && fault <= 12) {
+			route_original_side(&shared, &origin, node);
+			if (fault == 7 || fault == 8) {
+				UT_ASSERT(unlinkat(origin.data.fd, "pg_xact", 0) == 0);
+				snprintf(path, sizeof(path), "%s/pg_xact", target.path);
+				UT_ASSERT(symlinkat(fault == 7 ? path : "/tmp", origin.data.fd, "pg_xact") == 0);
+			}
+			if (fault == 9) side_test_put(origin.data.fd, INITDB_SIDE_ARCHIVE "/pg_xact/0000", 'x');
+			if (fault == 10) side_test_put(target.fd, "pg_xact/0000", 'x');
+			if (fault == 11) {
+				UT_ASSERT(renameat(origin.data.fd, INITDB_SIDE_ARCHIVE, origin.data.fd, "old") == 0);
+				UT_ASSERT(mkdirat(origin.data.fd, INITDB_SIDE_ARCHIVE, 0700) == 0);
+			}
+			if (fault == 12) {
+				UT_ASSERT(renameat(target.fd, "pg_xact", target.fd, "old") == 0);
+				UT_ASSERT(mkdirat(target.fd, "pg_xact", 0700) == 0);
+			}
+		}
+		if (fault == 13) {
+			/* Even an empty destination may not be overwritten by the move. */
+			UT_ASSERT(unlinkat(target.fd, "pg_xact/0000", 0) == 0);
+			UT_ASSERT(fstatat(target.fd, "pg_xact", &after, AT_SYMLINK_NOFOLLOW) == 0);
+			UT_ASSERT(move_original_directory(origin.data.fd, "pg_xact", target.fd) < 0);
+			UT_ASSERT(fstatat(target.fd, "pg_xact", &before, AT_SYMLINK_NOFOLLOW) == 0);
+			UT_ASSERT(same_directory(&before, &after));
+		} else {
+			expecting = fault != 0;
+			if (setjmp(refused) == 0) {
+				if (fault >= 7) creation_side_current(&shared, &origin, node);
+				else route_original_side(&shared, &origin, node);
+			} else rejected = true;
+			expecting = false;
+			UT_ASSERT(rejected == (fault != 0));
+			if (fault == 0) {
+				creation_side_current(&shared, &origin, node);
+				UT_ASSERT(fstatat(origin.data.fd, INITDB_SIDE_ARCHIVE "/pg_xact", &after, AT_SYMLINK_NOFOLLOW) == 0);
+				UT_ASSERT(same_directory(&before, &after));
+				UT_ASSERT(origin.side_routed);
+			} else if (fault <= 4) {
+				UT_ASSERT(fstatat(origin.data.fd, "pg_xact", &after, AT_SYMLINK_NOFOLLOW) == 0);
+				UT_ASSERT(same_directory(&before, &after));
+			} else if (fault <= 6) {
+				UT_ASSERT(fstatat(origin.data.fd, INITDB_SIDE_ARCHIVE "/pg_xact", &after, AT_SYMLINK_NOFOLLOW) == 0);
+				UT_ASSERT(same_directory(&before, &after));
+				UT_ASSERT(!origin.side_routed);
+			}
+		}
+		fflush(NULL);
+		_exit(ut_current_failed ? 1 : 0);
+	}
+	UT_ASSERT(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	UT_ASSERT(close(target.fd) == 0 && close(native.fd) == 0 && close(shared.fd) == 0 && close(origin.data.fd) == 0);
+	side_test_remove(base.fd);
+	UT_ASSERT(close(base.fd) == 0 && unlinkat(base.parent, base.name, AT_REMOVEDIR) == 0);
+	UT_ASSERT(close(base.parent) == 0 && rmdir(canonical) == 0);
+	free(canonical);
+}
+
+static void side_routes_retain_actual_original_directories(void)
+{
+	side_route_case(0, 0); side_route_case(0, 3);
+}
+static void side_routes_reject_unqualified_inputs_before_moving(void)
+{
+	for (unsigned fault = 1; fault <= 4; fault++) side_route_case(fault, 3);
+	side_route_case(13, 0);
+}
+static void side_route_io_failure_preserves_originals(void)
+{
+	side_route_case(5, 0); side_route_case(6, 3);
+}
+static void side_routes_reject_late_identity_and_byte_changes(void)
+{
+	for (unsigned fault = 7; fault <= 12; fault++) side_route_case(fault, 3);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -177,7 +351,11 @@ main(int argc, char **argv)
 		for (;;) pause();
 	}
 	strlcpy(executable, argv[0], sizeof(executable));
-	UT_PLAN(4);
+	UT_PLAN(8);
+	UT_RUN(side_routes_retain_actual_original_directories);
+	UT_RUN(side_routes_reject_unqualified_inputs_before_moving);
+	UT_RUN(side_route_io_failure_preserves_originals);
+	UT_RUN(side_routes_reject_late_identity_and_byte_changes);
 	UT_RUN(derived_inputs_must_survive_until_primary_publication);
 	UT_RUN(completed);
 	UT_RUN(unsuccessful);
