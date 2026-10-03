@@ -480,6 +480,7 @@ cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
 			owner->last_end = record->end_rec_ptr;
 			if (record->end_rec_ptr > owner->cut.native_redo)
 				owner->replay_records++;
+			plan->max_scn = Max(plan->max_scn, record->scn);
 		}
 	}
 	if (detail != CLUSTER_COLD_OK)
@@ -682,6 +683,12 @@ cluster_cold_plan_replay_record_count_v1(const ClusterColdPlanV1 *plan, uint32 p
 	if (!plan_valid(plan) || participant >= plan->participant_count)
 		return 0;
 	return plan->participants[plan->canonical[participant]].replay_records;
+}
+
+uint64
+cluster_cold_plan_max_scn_v1(const ClusterColdPlanV1 *plan)
+{
+	return plan_valid(plan) ? plan->max_scn : 0;
 }
 
 void

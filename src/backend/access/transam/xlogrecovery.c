@@ -146,7 +146,10 @@
  *	              identity; SPACE changes are installed by the SPACE owner
  *	              at their steps (repeating a TRUNCATE's shrink only where
  *	              nothing proves it durable) and in full at the end, never
- *	              replayed natively.  Pass 2 starts only once every consumer it
+ *	              replayed natively; another generation's native control
+ *	              records (checkpoints, counters, standby) have no effect on
+ *	              the founder, whose SCN is advanced past every record of
+ *	              the plan.  Pass 2 starts only once every consumer it
  *	              needs exists (cluster_cold_typed_ready_v1), including a
  *	              restartpoint owner that does not adopt own checkpoints
  *	              replayed inside it.  After pass 2 every fenced generation
@@ -3260,10 +3263,11 @@ cluster_typed_replay_next(void *arg, uint32 participant, ClusterColdReplayRecord
  * A record without a scheduled step.  Pass 1 refused every lifecycle,
  * prepared-transaction and unowned side record after native redo, so what
  * reaches here is the founder's own record (native owner), another
- * generation's rebuildable FSM-only page record or relation file creation,
- * or a SPACE change the SPACE owner installs later or the SPACE pages on disk
- * already cover (never replayed natively); anything else means pass 1 saw
- * other input (cluster_cold_unscheduled_v1).
+ * generation's rebuildable FSM-only page record, relation file creation or
+ * native control record (no effect on the founder), or a SPACE change the
+ * SPACE owner installs later or the SPACE pages on disk already cover (never
+ * replayed natively); anything else means pass 1 saw other input
+ * (cluster_cold_unscheduled_v1).
  */
 static bool
 cluster_typed_replay_unscheduled(void *arg, uint32 participant)
@@ -3289,6 +3293,10 @@ cluster_typed_replay_unscheduled(void *arg, uint32 participant)
 		case CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP:
 			if (is_own)
 				AdvanceNextFullTransactionIdPastXid(r->record->header.xl_xid);
+			return true;
+		case CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP:
+			/* Another generation's native control record: no effect here
+			 * (its SCN is covered by the plan's bound). */
 			return true;
 		case CLUSTER_COLD_UNSCHEDULED_NATIVE:
 			break;
@@ -3504,41 +3512,14 @@ cluster_typed_replay_unpublished(uint16 thread, const char *what, int detail)
 static void
 cluster_typed_replay_publish(ClusterColdTypedReplay *rep, const ClusterColdReplayResultV1 *result)
 {
-	ClusterColdTypedV1 *typed = rep->typed;
 	ClusterRecoveryFencePlan *plan = *rep->fence_plan;
 	uint16		origins = cluster_recovery_merge_fence_plan_origin_count(plan);
 	uint16		thread = 0;
 	int			detail = 0;
-	uint32		relations = cluster_cold_plan_space_relation_count_v1(typed->plan);
-	uint32		i;
 
-	for (i = 0; i < origins; i++)
-	{
-		ClusterControlRootSnapshot root;
-		ClusterControlRootReadToken token;
-		uint32		p;
-
-		if (!cluster_recovery_merge_fence_plan_origin(plan, (uint16) i, &thread, &root, &token))
-			cluster_typed_replay_unpublished(thread, "The fence plan lost an origin", 0);
-		for (p = 0; p < typed->replay_count; p++)
-			if (p != typed->own_participant && typed->participants[p].thread_id == thread)
-				break;
-		if (p == typed->replay_count ||
-			!cluster_cold_completion_proven_v1(typed->plan, &root, result, p))
-			cluster_typed_replay_unpublished(thread, "Replay did not end at its sealed tail",
-											 (int) result->detail);
-	}
-	for (i = 0; i < relations; i++)
-	{
-		RelFileLocator locator;
-		uint32		count = 0;
-		ForkNumber	fork;
-
-		if (!cluster_cold_plan_space_relation_v1(typed->plan, i, &locator, &count))
-			cluster_typed_replay_unpublished(0, "A SPACE relation was lost", (int) i);
-		for (fork = 0; fork <= MAX_FORKNUM; fork++)
-			cluster_cold_touched_add_v1(&rep->touched, &locator, fork);
-	}
+	if (!cluster_cold_completion_ready_v1(rep->typed, plan, result, &rep->touched, &thread))
+		cluster_typed_replay_unpublished(thread, "Replay did not end at its sealed tail",
+										 (int) result->detail);
 	cluster_cold_durable_barrier_v1(&rep->touched);
 	switch (cluster_recovery_merge_fence_plan_complete_v1(plan, &thread, &detail))
 	{
@@ -3577,6 +3558,12 @@ cluster_typed_replay_finish(ClusterColdTypedReplay *rep, const ClusterColdReplay
 		XLogRecoveryCtl->lastReplayedTLI = *rep->replayTLI;
 		SpinLockRelease(&XLogRecoveryCtl->info_lck);
 	}
+	/*
+	 * Every generation's records, history included, were written at or
+	 * below the plan's highest SCN; the founder's clock must pass them all
+	 * before any of its own commits, also for records not replayed here.
+	 */
+	cluster_scn_recovery_replay_observe((SCN) cluster_cold_plan_max_scn_v1(rep->typed->plan));
 	if (*rep->fence_plan != NULL &&
 		!cluster_recovery_merge_fence_plan_revalidate_nowait(*rep->fence_plan))
 	{

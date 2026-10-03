@@ -39,11 +39,15 @@
 
 #include "access/heapam_xlog.h"
 #include "access/xact.h"
+#include "access/xlog_internal.h"
 #include "access/xlogreader.h"
+#include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_page_detached.h"
 #include "cluster/cluster_space_reservation.h"
+#include "replication/message.h"
+#include "storage/standbydefs.h"
 #include "utils/memutils.h"
 
 #ifdef USE_CLUSTER_UNIT
@@ -293,6 +297,60 @@ cold_record_flags(XLogReaderState *reader, uint64 system_identifier, const uint8
 	}
 }
 
+/*
+ * Another generation's native control record, in its native shape.  Crash
+ * recovery gives these no effect on the founder: checkpoints, NEXTOID,
+ * parameter, FPW and timeline records describe that writer's own control
+ * file and counters (the founder's come from its own stream; XIDs and
+ * MultiXacts are striped per instance and OIDs leased cluster-wide), standby
+ * records act only during hot standby, a logical message only for logical
+ * decoding, and switch, no-op, backup-end, restore-point and contrecord
+ * records carry nothing to apply.
+ */
+static bool
+cold_foreign_control(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan)
+{
+	uint32 length = XLogRecGetDataLen(reader);
+	uint8 info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+
+	if (XLogRecMaxBlockId(reader) >= 0 || (XLogRecGetInfo(reader) & XLR_INFO_MASK) != 0)
+		return false;
+	if (plan->route.record_owner == RF_ROUTE_OWNER_LOGICAL_NOOP)
+		return XLogRecGetRmid(reader) == RM_LOGICALMSG_ID && info == XLOG_LOGICAL_MESSAGE;
+	if (plan->route.record_owner != RF_ROUTE_OWNER_SIDE_TYPED)
+		return false;
+	if (XLogRecGetRmid(reader) == RM_STANDBY_ID)
+		return info == XLOG_STANDBY_LOCK || info == XLOG_RUNNING_XACTS
+			   || info == XLOG_INVALIDATIONS;
+	if (XLogRecGetRmid(reader) != RM_XLOG_ID)
+		return false;
+	switch (info) {
+	case XLOG_CHECKPOINT_SHUTDOWN:
+	case XLOG_CHECKPOINT_ONLINE:
+		return length == sizeof(CheckPoint);
+	case XLOG_NEXTOID:
+		return length == sizeof(Oid);
+	case XLOG_PARAMETER_CHANGE:
+		return length == sizeof(xl_parameter_change);
+	case XLOG_FPW_CHANGE:
+		return length == sizeof(bool);
+	case XLOG_SWITCH:
+		return length == 0;
+	case XLOG_NOOP:
+		return true;
+	case XLOG_BACKUP_END:
+		return length == sizeof(XLogRecPtr);
+	case XLOG_RESTORE_POINT:
+		return length == sizeof(xl_restore_point);
+	case XLOG_END_OF_RECOVERY:
+		return length == sizeof(xl_end_of_recovery);
+	case XLOG_OVERWRITE_CONTRECORD:
+		return length == sizeof(xl_overwrite_contrecord);
+	default:
+		return false;
+	}
+}
+
 static ClusterColdDetailV1
 cold_map_components(XLogReaderState *reader, const RfDetachedRecordPlanV1 *plan,
 					uint64 system_identifier, const uint8 storage_uuid[16],
@@ -388,16 +446,18 @@ cluster_cold_recovery_decode_v1(struct XLogReaderState *reader, uint64 system_id
 		return detail;
 
 	/*
-	 * Another generation's non-page effects (outcomes, checkpoints, counters,
-	 * undo, SLRU) have no typed cold owner yet; never a silent no-op.  Its
-	 * SPACE changes have the SPACE owner, and creating a relation file is
-	 * idempotent, so their native redo is the owner's.
+	 * Another generation's side effects (outcomes, undo, SLRU) have no typed
+	 * cold owner yet; never a silent no-op.  Its SPACE changes have the SPACE
+	 * owner, and creating a relation file is idempotent, so their native redo
+	 * is the owner's.  Its native control records are typed no-ops.
 	 */
 	has_owner = XLogRecGetRmid(reader) == RM_SMGR_ID
 				&& ((XLogRecGetInfo(reader) & ~XLR_INFO_MASK) == XLOG_SMGR_CREATE
 					|| out->record.space_count > 0);
 	if (foreign && plan.route.record_owner != RF_ROUTE_OWNER_PAGE_CODEC && !has_owner)
-		out->record.record_flags |= CLUSTER_COLD_RECORD_SIDE_UNOWNED;
+		out->record.record_flags |= cold_foreign_control(reader, &plan)
+										? CLUSTER_COLD_RECORD_FOREIGN_CONTROL
+										: CLUSTER_COLD_RECORD_SIDE_UNOWNED;
 	return cold_map_components(reader, &plan, system_identifier, storage_uuid, out);
 }
 

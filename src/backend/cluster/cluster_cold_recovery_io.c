@@ -51,6 +51,7 @@
 #include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_wal_restart_read.h"
 #include "cluster/cluster_wal_tail.h"
@@ -557,6 +558,50 @@ cluster_cold_completion_proven_v1(const ClusterColdPlanV1 *plan,
 		   && result->last_read[participant] == root->tail_last_record_lsn
 		   && result->last_crc[participant] == root->tail_last_record_crc32c
 		   && result->last_end[participant] == root->validated_tail_lsn_exclusive;
+}
+
+bool
+cluster_cold_completion_ready_v1(const ClusterColdTypedV1 *typed,
+								 const struct ClusterRecoveryFencePlan *fence,
+								 const ClusterColdReplayResultV1 *result,
+								 ClusterColdTouchedV1 *touched, uint16 *thread)
+{
+	uint16 origins;
+	uint32 relations;
+	uint32 i;
+
+	*thread = 0;
+	if (typed == NULL || fence == NULL || result == NULL || touched == NULL)
+		return false;
+	origins = cluster_recovery_merge_fence_plan_origin_count(fence);
+	for (i = 0; i < origins; i++) {
+		ClusterControlRootSnapshot root;
+		ClusterControlRootReadToken token;
+		uint32 p;
+
+		if (!cluster_recovery_merge_fence_plan_origin(fence, (uint16)i, thread, &root, &token))
+			return false;
+		for (p = 0; p < typed->replay_count; p++)
+			if (p != typed->own_participant && typed->participants[p].thread_id == *thread)
+				break;
+		if (p == typed->replay_count
+			|| typed->participants[p].owner_incarnation != root.identity.origin_owner_incarnation
+			|| !cluster_cold_completion_proven_v1(typed->plan, &root, result, p))
+			return false;
+	}
+	*thread = 0;
+	relations = cluster_cold_plan_space_relation_count_v1(typed->plan);
+	for (i = 0; i < relations; i++) {
+		RelFileLocator locator;
+		uint32 count = 0;
+		ForkNumber fork;
+
+		if (!cluster_cold_plan_space_relation_v1(typed->plan, i, &locator, &count))
+			return false;
+		for (fork = 0; fork <= MAX_FORKNUM; fork++)
+			cluster_cold_touched_add_v1(touched, &locator, fork);
+	}
+	return true;
 }
 
 static int

@@ -185,6 +185,7 @@ struct ClusterColdPlanV1 {
 	uint32 magic;
 	uint8 phase;
 	bool namespace_known;
+	uint64 max_scn; /* highest xl_scn of every accepted record */
 	uint64 system_identifier;
 	uint8 storage_uuid[16];
 	uint32 participant_count;

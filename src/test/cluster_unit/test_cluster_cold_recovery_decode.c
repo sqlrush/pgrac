@@ -28,13 +28,17 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "access/xlog_internal.h"
 #include "access/xlogreader.h"
+#include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
 #include "access/heapam_xlog.h"
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_page_detached.h"
 #include "cluster/cluster_space_reservation.h"
+#include "replication/message.h"
+#include "storage/standbydefs.h"
 
 #include "unit_test.h"
 
@@ -341,15 +345,16 @@ UT_TEST(test_malformed_plan_refused)
 				 CLUSTER_COLD_INVALID_ARGUMENT);
 }
 
-/* A foreign record that is not a page record has no cold owner yet; it is
- * flagged so the plan refuses it after the native redo start.  The founder's
- * own records keep their native owner. */
+/* A foreign side record has no cold owner yet; it is flagged so the plan
+ * refuses it after the native redo start.  The founder's own records keep
+ * their native owner. */
 UT_TEST(test_foreign_side_records_have_no_cold_owner)
 {
 	FakeRecord record;
 	ClusterColdDecodedV1 out = { 0 };
 
-	fake_record(&record, RM_XLOG_ID, 0x10, 0); /* CHECKPOINT_ONLINE */
+	fake_record(&record, RM_XLOG_ID, XLOG_CHECKPOINT_ONLINE, 0);
+	record.storage.decoded.main_data_len = sizeof(CheckPoint) + 1; /* not a checkpoint */
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, 0);
@@ -357,14 +362,43 @@ UT_TEST(test_foreign_side_records_have_no_cold_owner)
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
 
-	fake_record(&record, RM_LOGICALMSG_ID, 0x00, 0);
-	preflight_plan.route.record_owner = RF_ROUTE_OWNER_LOGICAL_NOOP;
+	fake_record(&record, RM_XACT_ID, XLOG_XACT_COMMIT, 0);
+	commit_nrels = 1;
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
 
-	fake_record(&record, RM_XACT_ID, XLOG_XACT_COMMIT, 0);
-	commit_nrels = 1;
+	/* An XLOG record outside the native control set (or with blocks) is no
+	 * control record. */
+	fake_record(&record, RM_XLOG_ID, 0xE0, 0);
+	record.storage.decoded.main_data_len = 0;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+	fake_record(&record, RM_STANDBY_ID, 0x30, 0);
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+	fake_record(&record, RM_XLOG_ID, XLOG_NOOP, 0);
+	record.storage.decoded.header.xl_info |= XLR_SPECIAL_REL_UPDATE;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+	/* a side record routed with block references, or not routed as a side
+	 * record at all, is no control record */
+	fake_record(&record, RM_XLOG_ID, XLOG_NOOP, 1);
+	preflight_plan.route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+	fake_record(&record, RM_XLOG_ID, XLOG_NOOP, 0);
+	preflight_plan.route.record_owner = 0;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+	/* an outcome record whose info value matches a control record's */
+	fake_record(&record, RM_XACT_ID, XLOG_XACT_ABORT, 0);
+	UT_ASSERT_EQ(XLOG_XACT_ABORT, XLOG_NOOP);
 	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
@@ -381,6 +415,73 @@ UT_TEST(test_foreign_side_records_have_no_cold_owner)
 				 CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(out.record.record_flags, 0);
 	UT_ASSERT_EQ(out.record.component_count, 1);
+}
+
+/*
+ * Another generation's native control records -- checkpoints, NEXTOID,
+ * parameter, FPW and timeline records, segment switches, restore points,
+ * standby records and logical messages -- do on the founder exactly what
+ * crash recovery does with them: nothing.  Only their native shape is
+ * accepted; the founder's own keep their native owner.
+ */
+UT_TEST(test_foreign_native_control_is_typed_noop)
+{
+	FakeRecord record;
+	ClusterColdDecodedV1 out = { 0 };
+	static const struct {
+		uint8 rmid;
+		uint8 info;
+		uint32 length;
+	} cases[] = { { RM_XLOG_ID, XLOG_CHECKPOINT_SHUTDOWN, sizeof(CheckPoint) },
+				  { RM_XLOG_ID, XLOG_CHECKPOINT_ONLINE, sizeof(CheckPoint) },
+				  { RM_XLOG_ID, XLOG_NOOP, 0 },
+				  { RM_XLOG_ID, XLOG_NEXTOID, sizeof(Oid) },
+				  { RM_XLOG_ID, XLOG_SWITCH, 0 },
+				  { RM_XLOG_ID, XLOG_BACKUP_END, sizeof(XLogRecPtr) },
+				  { RM_XLOG_ID, XLOG_PARAMETER_CHANGE, sizeof(xl_parameter_change) },
+				  { RM_XLOG_ID, XLOG_RESTORE_POINT, sizeof(xl_restore_point) },
+				  { RM_XLOG_ID, XLOG_FPW_CHANGE, sizeof(bool) },
+				  { RM_XLOG_ID, XLOG_END_OF_RECOVERY, sizeof(xl_end_of_recovery) },
+				  { RM_XLOG_ID, XLOG_OVERWRITE_CONTRECORD, sizeof(xl_overwrite_contrecord) },
+				  { RM_STANDBY_ID, XLOG_STANDBY_LOCK, 0 },
+				  { RM_STANDBY_ID, XLOG_RUNNING_XACTS, 0 },
+				  { RM_STANDBY_ID, XLOG_INVALIDATIONS, 0 } };
+	Size i;
+
+	for (i = 0; i < lengthof(cases); i++) {
+		fake_record(&record, cases[i].rmid, cases[i].info, 0);
+		record.storage.decoded.main_data_len = cases[i].length;
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+					 CLUSTER_COLD_OK);
+		if (out.record.record_flags != CLUSTER_COLD_RECORD_FOREIGN_CONTROL)
+			printf("# case %zu rmid %u info 0x%02x flags %u\n", i, cases[i].rmid, cases[i].info,
+				   out.record.record_flags);
+		UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_CONTROL);
+		UT_ASSERT_EQ(out.record.component_count, 0);
+		UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, false, &out),
+					 CLUSTER_COLD_OK);
+		UT_ASSERT_EQ(out.record.record_flags, 0);
+		/* a wrong payload length is no such record */
+		if (cases[i].rmid == RM_XLOG_ID && cases[i].info != XLOG_NOOP) {
+			record.storage.decoded.main_data_len = cases[i].length + 1;
+			UT_ASSERT_EQ(
+				cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				CLUSTER_COLD_OK);
+			UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
+		}
+	}
+
+	fake_record(&record, RM_LOGICALMSG_ID, XLOG_LOGICAL_MESSAGE, 0);
+	preflight_plan.route.record_owner = RF_ROUTE_OWNER_LOGICAL_NOOP;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_FOREIGN_CONTROL);
+	/* the logical no-op route is only a logical message */
+	fake_record(&record, RM_XLOG_ID, XLOG_NOOP, 0);
+	preflight_plan.route.record_owner = RF_ROUTE_OWNER_LOGICAL_NOOP;
+	UT_ASSERT_EQ(cluster_cold_recovery_decode_v1(&record.reader, 99, UUID, true, true, &out),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(out.record.record_flags, CLUSTER_COLD_RECORD_SIDE_UNOWNED);
 }
 
 /* SPACE payloads built with the SPACE owner's own WAL codec. */
@@ -616,7 +717,7 @@ UT_TEST(test_commit_space_drops_are_typed)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_page_record_maps_ordinary_components);
 	UT_RUN(test_registry_refusal_is_opcode_unsupported);
 	UT_RUN(test_cold_owner_policy);
@@ -624,6 +725,7 @@ main(void)
 	UT_RUN(test_storage_lifecycle_classification);
 	UT_RUN(test_malformed_plan_refused);
 	UT_RUN(test_foreign_side_records_have_no_cold_owner);
+	UT_RUN(test_foreign_native_control_is_typed_noop);
 	UT_RUN(test_space_identity_changes_are_typed);
 	UT_RUN(test_space_reservation_advance_is_typed);
 	UT_RUN(test_commit_space_drops_are_typed);

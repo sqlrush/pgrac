@@ -462,6 +462,32 @@ cluster_wal_restart_segment_open(const char *wal_root, const ClusterWalSourceRef
 	return segment_open_result;
 }
 
+/* ---- the fence plan's origins, as the completion check reads them ---- */
+#define MAX_FENCE_ORIGINS 4
+static uint16 fence_origin_count;
+static uint16 fence_origin_thread[MAX_FENCE_ORIGINS];
+static ClusterControlRootSnapshot fence_origin_root[MAX_FENCE_ORIGINS];
+
+uint16
+cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *plan)
+{
+	return plan == NULL ? 0 : fence_origin_count;
+}
+
+bool
+cluster_recovery_merge_fence_plan_origin(const ClusterRecoveryFencePlan *plan, uint16 index,
+										 uint16 *origin_thread,
+										 struct ClusterControlRootSnapshot *root,
+										 struct ClusterControlRootReadToken *token)
+{
+	if (plan == NULL || index >= fence_origin_count || fence_origin_thread[index] == 0)
+		return false;
+	*origin_thread = fence_origin_thread[index];
+	*root = fence_origin_root[index];
+	memset(token, 0, sizeof(*token));
+	return true;
+}
+
 /* ---- the completion barrier: buffer writes and fsync, recorded ---- */
 #define MAX_BARRIER_EVENTS 32
 static char barrier_events[MAX_BARRIER_EVENTS][32];

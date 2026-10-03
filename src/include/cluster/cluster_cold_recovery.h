@@ -143,14 +143,19 @@ typedef struct ClusterColdSpaceOpV1 {
  * already-durable history before it.  UNSUPPORTED marks input outside the
  * supported profile (prepared transactions) and is refused anywhere.
  * SIDE_UNOWNED marks a non-page effect of another generation for which no
- * typed cold owner exists yet (transaction outcomes, checkpoints, XID/OID/MX
- * counters, undo, SLRU); like STRUCTURAL it is refused after native redo and
- * is never replayed as a no-op.
+ * typed cold owner exists yet (transaction outcomes, undo, SLRU); like
+ * STRUCTURAL it is refused after native redo and is never replayed as a
+ * no-op.  FOREIGN_CONTROL marks another generation's native control record
+ * (XLOG checkpoint, NEXTOID, parameter, FPW, timeline and segment records,
+ * standby records, logical messages): on the founder its typed effect is
+ * none, as in crash recovery -- they describe that writer's own control file
+ * and counters -- so it is consumed without native replay.
  */
 #define CLUSTER_COLD_RECORD_STRUCTURAL UINT8_C(0x01)
 #define CLUSTER_COLD_RECORD_UNSUPPORTED UINT8_C(0x02)
 #define CLUSTER_COLD_RECORD_SIDE_UNOWNED UINT8_C(0x04)
-#define CLUSTER_COLD_RECORD_KNOWN_FLAGS UINT8_C(0x07)
+#define CLUSTER_COLD_RECORD_FOREIGN_CONTROL UINT8_C(0x08)
+#define CLUSTER_COLD_RECORD_KNOWN_FLAGS UINT8_C(0x0F)
 
 /* Every decoded record of a participant is fed, in its LSN order.  Records
  * without ordinary page components only advance the participant cursor. */
@@ -297,6 +302,10 @@ extern bool cluster_cold_plan_step_space_v1(const ClusterColdPlanV1 *plan, uint3
 extern uint64 cluster_cold_plan_replay_record_count_v1(const ClusterColdPlanV1 *plan,
 													   uint32 participant);
 
+/* The highest xl_scn of every record the plan accepted, of every
+ * participant and history included: the founder's SCN must pass it. */
+extern uint64 cluster_cold_plan_max_scn_v1(const ClusterColdPlanV1 *plan);
+
 extern void cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan);
 
 /*
@@ -367,13 +376,15 @@ extern ClusterColdPageActionV1 cluster_cold_page_action_v1(const ClusterColdStep
 /*
  * Pass-2 handling of a decoded record without a scheduled step.  SPACE
  * effects are never replayed natively: the SPACE owner installs them, or the
- * SPACE pages on disk already cover them.  Page versions, refused flags or a
- * commit's drops (always a step) mean pass 1 saw other input.
+ * SPACE pages on disk already cover them.  Another generation's native
+ * control record is consumed without replay.  Page versions, refused flags
+ * or a commit's drops (always a step) mean pass 1 saw other input.
  */
 typedef enum ClusterColdUnscheduledV1 {
 	CLUSTER_COLD_UNSCHEDULED_NATIVE = 0,
 	CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP = 1,
-	CLUSTER_COLD_UNSCHEDULED_REFUSE = 2
+	CLUSTER_COLD_UNSCHEDULED_REFUSE = 2,
+	CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP = 3
 } ClusterColdUnscheduledV1;
 
 extern ClusterColdUnscheduledV1 cluster_cold_unscheduled_v1(const ClusterColdRecordV1 *record);
@@ -641,6 +652,18 @@ typedef struct ClusterColdTypedV1 {
 extern ClusterColdTypedV1 *cluster_cold_typed_prepare_v1(struct ClusterRecoveryFencePlan *fence,
 														 uint16 own_thread, XLogRecPtr own_redo);
 extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
+
+/*
+ * Before the fence plan publishes its origins recovered: each origin is a
+ * replayed participant (not the founder, the same owner incarnation) whose
+ * pass 2 ended exactly at its sealed tail (cluster_cold_completion_proven_v1),
+ * and every SPACE relation of the plan joins `touched`.  On refusal *thread
+ * names the origin (0 when none can be named).
+ */
+extern bool cluster_cold_completion_ready_v1(const ClusterColdTypedV1 *typed,
+											 const struct ClusterRecoveryFencePlan *fence,
+											 const ClusterColdReplayResultV1 *result,
+											 ClusterColdTouchedV1 *touched, uint16 *thread);
 
 /*
  * Pass-2 SPACE install through the SPACE owner: bring one relation of the
