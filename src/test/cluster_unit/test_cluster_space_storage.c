@@ -1217,11 +1217,47 @@ UT_TEST(test_truncate_replay_checks_identity_before_native_shrink)
 	UT_ASSERT(!pinned && !locked);
 	saved = page;
 	UT_ASSERT(cluster_space_relation_redo(&reader));
-	UT_ASSERT_EQ(truncate_calls, 2);
+	UT_ASSERT_EQ(truncate_calls, 1);
 	UT_ASSERT(memcmp(&page, &saved, BLCKSZ) == 0);
 	UT_ASSERT_EQ(dirty_calls, 4); /* Two pages, CREATE and first TRUNCATE only. */
-	UT_ASSERT_EQ(fake_allocations, 2);
+	UT_ASSERT_EQ(fake_allocations, 1);
 	UT_ASSERT_EQ(fake_frees, fake_allocations);
+}
+
+UT_TEST(test_truncate_replay_preserves_peer_extension_after_durable_identity)
+{
+	for (int with_auxiliary = 0; with_auxiliary < 2; with_auxiliary++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		ClusterSpaceStructureChange change;
+		ClusterSpaceReservation successor;
+		PGAlignedBlock saved[2];
+
+		reset();
+		truncate_record(&reader, &decoded);
+		UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, sizeof(wal_bytes), &change));
+		/* A's durable result means its physical shrink already completed.
+		 * B subsequently reserved and checkpointed blocks above that EOF. */
+		UT_ASSERT(cluster_space_identity_page_encode(
+			&change.identity.result, change.identity.result_token, pages[0].data, BLCKSZ));
+		successor = change.reservation.result;
+		successor.next_block = 12;
+		UT_ASSERT(cluster_space_reservation_page_encode(&successor, UINT64_C(0x0200000000000064),
+														pages[1].data, BLCKSZ));
+		main_blocks = 12;
+		auxiliary_forks = with_auxiliary != 0;
+		memcpy(saved, pages, sizeof(saved));
+		dirty_calls = 0;
+		/* Replaying only A's stream twice must preserve B's DATA and SPACE. */
+		for (int retry = 0; retry < 2; retry++) {
+			smgr_redo(&reader);
+			UT_ASSERT_EQ(main_blocks, 12);
+			UT_ASSERT_EQ(truncate_calls + flush_calls + shrink_syncs + fsm_vacuums, 0);
+			UT_ASSERT_EQ(fake_allocations + fake_frees + dirty_calls, 0);
+			UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+			UT_ASSERT(!pinned && !locked);
+		}
+	}
 }
 
 UT_TEST(test_truncate_mismatch_or_foreign_input_does_not_touch_files)
@@ -1409,16 +1445,19 @@ UT_TEST(test_truncate_partial_restart_finishes_original_physical_owner)
 		reset();
 		truncate_record(&reader, &decoded);
 		UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, sizeof(wal_bytes), &change));
-		if (installed & 1)
+		if (installed & 1) {
 			UT_ASSERT(cluster_space_identity_page_encode(&change.identity.result,
 				change.identity.result_token, page.data, BLCKSZ));
+			/* The owner cannot publish result identity before durable shrink. */
+			main_blocks = 4;
+		}
 		if (installed & 2)
 			UT_ASSERT(cluster_space_reservation_page_encode(&change.reservation.result,
 				change.reservation.result_token, pages[1].data, BLCKSZ));
 		dirty_calls = 0;
 		UT_ASSERT(cluster_space_relation_redo(&reader));
-		UT_ASSERT_EQ(truncate_calls, 1);
-		UT_ASSERT_EQ(flush_calls, 1);
+		UT_ASSERT_EQ(truncate_calls, (installed & 1) ? 0 : 1);
+		UT_ASSERT_EQ(flush_calls, (installed & 1) ? 0 : 1);
 		UT_ASSERT_EQ(main_blocks, 4);
 		UT_ASSERT_EQ(dirty_calls, 2 - ((installed & 1) != 0) - ((installed & 2) != 0));
 		UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, change.identity.result_token);
@@ -2505,7 +2544,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(51);
+	UT_PLAN(52);
 	UT_RUN(test_cold_physical_truncate_touches_only_named_forks);
 	UT_RUN(test_cold_physical_truncate_leaves_already_short_forks_alone);
 	UT_RUN(test_native_truncate_persists_new_space_before_exposing_incarnation);
@@ -2526,6 +2565,7 @@ main(void)
 	UT_RUN(test_native_create_registers_abort_cleanup_before_space);
 	UT_RUN(test_native_descriptor_recognizes_typed_record);
 	UT_RUN(test_truncate_replay_checks_identity_before_native_shrink);
+	UT_RUN(test_truncate_replay_preserves_peer_extension_after_durable_identity);
 	UT_RUN(test_truncate_mismatch_or_foreign_input_does_not_touch_files);
 	UT_RUN(test_truncate_replay_preserves_native_auxiliary_forks);
 	UT_RUN(test_aborted_drop_keeps_existing_live_identity);

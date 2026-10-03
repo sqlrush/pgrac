@@ -1256,16 +1256,16 @@ cluster_space_relation_redo(XLogReaderState *record)
 			|| memcmp(BufferGetPage(buffers[i]), zero.data, BLCKSZ) != 0)
 			goto done;
 	}
-	if (identity->action == CLUSTER_SPACE_WAL_TRUNCATE) {
+	if (identity->action == CLUSTER_SPACE_WAL_TRUNCATE && (apply_mask & 1)) {
 		xl_smgr_truncate truncate;
 
 		truncate.rlocator = expected.locator;
 		truncate.blkno = identity->nblocks;
 		truncate.flags = SMGR_TRUNCATE_ALL;
 		/* Native preparation allocates memory; only its physical shrink is
-		 * critical. Keep SPACE locked, finish the structural action first,
-		 * then publish identity. A restart can repeat a completed shrink even
-		 * when SPACE already has result, or still has expected identity. */
+		 * critical. Keep SPACE locked and finish the shrink before publishing
+		 * identity. Result identity proves this shrink was already durable;
+		 * repeating it could remove a peer's later checkpointed extension. */
 		smgr_redo_truncate(record->EndRecPtr, &truncate);
 	}
 	if (apply_mask != 0) {
