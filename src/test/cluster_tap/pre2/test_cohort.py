@@ -40,6 +40,21 @@ class CohortTest(unittest.TestCase):
                 quote(value)
         self.assertEqual(quote("a'b"), "'a''b'")
 
+    def test_test_settings_are_in_original_common_or_instance_input(self):
+        layout = self.layout(2)
+        layout['extra_conf'] = ['autovacuum = off', 'cluster.read_scache = on',
+                                "shared_buffers = '32MB'", 'cluster.xnode_profile = on']
+        text = self.render(layout)
+        self.assertIn("common.autovacuum='off'\n", text)
+        self.assertIn("common.cluster.read_scache='on'\n", text)
+        self.assertIn("common.cluster.xnode_profile='on'\n", text)
+        self.assertIn("node001.shared_buffers='32MB'\n", text)
+        for bad in ("cluster.storage_quorum_nodes='0:10,1:11'", 'port=22222',
+                    'autovacuum=off\ncluster.enabled=off'):
+            layout['extra_conf'] = [bad]
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.render(layout)
+
     def test_connected_tls_profile_requires_actual_qdevice_votes(self):
         device = 'Algorithm:\t\tLMS\nState:\t\t\tConnected\n'
         good = 'Quorate:          Yes\n  1  1 A,V,NMW (local)\n  2  1 A,V,NMW \n'
