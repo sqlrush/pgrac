@@ -253,6 +253,7 @@ OBJS = \
 	cluster_scn.o \
 	cluster_semantic_activation.o \
 	cluster_catalog_bootstrap.o \
+	cluster_catalog_startup_input.o \
 	cluster_catalog_migrate.o \
 	cluster_catalog_stats.o \
 	cluster_oid_lease.o \

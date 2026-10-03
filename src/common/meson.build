@@ -7,6 +7,7 @@ common_sources = files(
   'checksum_helper.c',
   'cluster_catalog_init.c',
   'cluster_catalog_manifest.c',
+  'cluster_catalog_verify.c',
   'cluster_hw_snapshot_codec.c',
   'cluster_relmap_init.c',
   'cluster_space_identity.c',
