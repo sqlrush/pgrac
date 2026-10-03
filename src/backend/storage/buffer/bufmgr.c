@@ -10609,6 +10609,10 @@ struct ClusterPageDataReceiptV1 {
 	ClusterPageWalBindingV1 wal;
 	ClusterPcmPiWriteCutV1 pi_cut;
 	ClusterPcmPiStorageCutV1 storage_cut;
+	/* Borrowed immutable input: its owner frees all receipts/ACKs first. */
+	const ClusterThreadRecoveryFabricPlanV1 *space_plan;
+	uint32 space_operation;
+	bool space_terminal;
 };
 
 struct ClusterPiPhysicalAckV1 {
@@ -11181,6 +11185,119 @@ done:
 	return valid;
 }
 
+/* Bind a typed contribution to the original full claim and physical record.
+ * Coordinates alone are ambiguous across boots; inspect every matching source
+ * and require one exact contribution, never the current receiver's WAL. */
+static bool
+cluster_page_data_space_operation(const ClusterThreadRecoveryFabricPlanV1 *fabric,
+								  const ClusterPageWalBindingV1 *wal, uint32 *out)
+{
+	const RfSideOnlinePlanV1 *side = cluster_thread_recovery_fabric_side_plan_v1(fabric);
+	const RfPageOnlinePlanV1 *page = cluster_thread_recovery_fabric_page_plan_v1(fabric);
+	uint32 found = UINT32_MAX;
+
+	if (side == NULL || page == NULL || out == NULL || !cluster_page_wal_binding_shape_v1(wal)
+		|| wal->identity.forknum != SPACE_FORKNUM || wal->identity.blockno > 1)
+		return false;
+	for (uint32 i = 0; i < rf_side_online_plan_operation_count_v1(side); i++) {
+		RfSideOnlineOperationV1 operation;
+		const RfPageReplayRecordIdentityV1 *record = &operation.identity.record;
+		ClusterWalSourceRef source;
+		RfContributorStreamCutV1 cut;
+		uint32 count;
+
+		if (!rf_side_online_plan_operation_v1(side, i, &operation))
+			return false;
+		if (record->system_identifier != wal->identity.system_identifier
+			|| memcmp(record->storage_uuid, wal->identity.storage_uuid, 16) != 0
+			|| record->origin_thread != wal->source.claim.identity.origin_thread_id
+			|| record->timeline_id != wal->source.timeline
+			|| record->read_rec_ptr != wal->record_start || record->end_rec_ptr != wal->record_end
+			|| record->record_crc != wal->record_crc || record->rmid != wal->rmid
+			|| record->info != wal->info)
+			continue;
+		if (!rf_page_online_plan_source_v1(page, operation.identity.participant_index, &source)
+			|| !cluster_thread_recovery_fabric_cut_v1(fabric, operation.identity.participant_index,
+													  &cut)
+			|| cut.origin_owner_incarnation == 0
+			|| cut.origin_owner_incarnation != source.claim.identity.origin_owner_incarnation
+			|| cut.failed_thread != record->origin_thread || cut.timeline_id != record->timeline_id)
+			return false;
+		if (!cluster_page_data_source_covered_by(&wal->source, &source))
+			continue;
+		count = rf_side_online_plan_space_contribution_count_v1(side, i);
+		if (count == UINT32_MAX)
+			return false;
+		for (uint32 j = 0; j < count; j++) {
+			RfSideSpaceContributionV1 contribution;
+			const ClusterSpaceIdentityKey *key = &contribution.result.key;
+			if (!rf_side_online_plan_space_contribution_v1(side, i, j, &contribution))
+				return false;
+			if (!RelFileLocatorEquals(key->locator, wal->identity.locator)
+				|| (contribution.page_mask & (1u << wal->identity.blockno)) == 0)
+				continue;
+			if (key->system_identifier != wal->identity.system_identifier
+				|| key->database_incarnation != wal->source.claim.database_incarnation
+				|| memcmp(key->storage_uuid, wal->identity.storage_uuid, 16) != 0)
+				return false;
+			if (contribution.result_token[wal->identity.blockno] != wal->version.mutation_token
+				|| memcmp(contribution.result.incarnation, wal->version.segment_incarnation, 16)
+					   != 0)
+				continue;
+			if (found != UINT32_MAX)
+				return false;
+			found = i;
+		}
+	}
+	if (found == UINT32_MAX)
+		return false;
+	*out = found;
+	return true;
+}
+
+static ClusterSpaceIdentityKey
+cluster_page_data_space_key(const ClusterPageDataReceiptV1 *receipt)
+{
+	ClusterSpaceIdentityKey key = { 0 };
+	key.system_identifier = receipt->target.identity.system_identifier;
+	key.database_incarnation = receipt->target.database_incarnation;
+	key.locator = receipt->target.identity.locator;
+	memcpy(key.storage_uuid, receipt->target.identity.storage_uuid, 16);
+	return key;
+}
+
+bool
+cluster_page_data_bind_plan_v1(ClusterPageDataReceiptV1 *receipt,
+							   const ClusterThreadRecoveryFabricPlanV1 *plan)
+{
+	ClusterPageDataTargetV1 target;
+	ClusterSpaceIdentityKey key;
+	uint32 operation;
+	bool terminal;
+
+	if (!cluster_page_data_receipt_read_v1(receipt, &target))
+		return false;
+	if (target.identity.forknum != SPACE_FORKNUM)
+		return true; /* Its original PAGE proof remains mandatory. */
+	if (receipt->space_plan != NULL)
+		return receipt->space_plan == plan;
+	if (!rf_page_identity_equal_v1(&target.identity, &receipt->wal.identity)
+		|| !rf_page_version_equal_v1(&target.version, &receipt->wal.version)
+		|| target.database_incarnation != receipt->wal.source.claim.database_incarnation
+		|| (receipt->wal.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+		|| !cluster_page_data_space_operation(plan, &receipt->wal, &operation))
+		return false;
+	key = cluster_page_data_space_key(receipt);
+	if (!rf_side_online_plan_space_covers_v1(cluster_thread_recovery_fabric_side_plan_v1(plan),
+											 &key, target.identity.blockno, operation, operation,
+											 &terminal))
+		return false;
+	receipt->space_plan = plan;
+	receipt->space_operation = operation;
+	receipt->space_terminal = terminal;
+	return true;
+}
+
 bool
 cluster_page_data_pi_proof_v1(const ClusterPageDataReceiptV1 *receipt,
 							  const RfPageOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
@@ -11192,8 +11309,14 @@ cluster_page_data_pi_proof_v1(const ClusterPageDataReceiptV1 *receipt,
 
 	if (out == NULL || !cluster_page_data_receipt_read_v1(receipt, &target)
 		|| !cluster_pcm_pi_write_cut_valid_v1(&receipt->pi_cut)
-		|| receipt->pi_cut.pi_holders_bitmap == 0
-		|| !cluster_page_data_prefix_v1(plan, sources, source_count, &receipt, 1, prefixes))
+		|| receipt->pi_cut.pi_holders_bitmap == 0)
+		return false;
+	if (target.identity.forknum == SPACE_FORKNUM) {
+		if (receipt->space_plan == NULL
+			|| cluster_thread_recovery_fabric_page_plan_v1(receipt->space_plan) != plan
+			|| !cluster_page_data_prefix_v1(plan, sources, source_count, NULL, 0, prefixes))
+			return false;
+	} else if (!cluster_page_data_prefix_v1(plan, sources, source_count, &receipt, 1, prefixes))
 		return false;
 	InitBufferTag(&tag, &target.identity.locator, target.identity.forknum, target.identity.blockno);
 	if (!BufferTagsEqual(&tag, &receipt->pi_cut.holder.assertion.resource))
@@ -11398,6 +11521,18 @@ cluster_page_data_covers_pi(const ClusterPageDataReceiptV1 *receipt, const RfPag
 		|| memcmp(receipt->target.version.segment_incarnation, pi->version.segment_incarnation, 16)
 			   != 0)
 		return false;
+	if (receipt->target.identity.forknum == SPACE_FORKNUM) {
+		ClusterSpaceIdentityKey key = cluster_page_data_space_key(receipt);
+		uint32 operation;
+		bool terminal;
+		return receipt->space_plan != NULL
+			   && cluster_thread_recovery_fabric_page_plan_v1(receipt->space_plan) == plan
+			   && cluster_page_data_space_operation(receipt->space_plan, pi, &operation)
+			   && rf_side_online_plan_space_covers_v1(
+				   cluster_thread_recovery_fabric_side_plan_v1(receipt->space_plan), &key,
+				   receipt->target.identity.blockno, operation, receipt->space_operation,
+				   &terminal);
+	}
 	for (uint32 i = 0; i < rf_page_online_plan_target_count_v1(plan); i++) {
 		RfPageOnlineTargetViewV1 view;
 		bool found = false;
@@ -11488,6 +11623,10 @@ cluster_page_data_covers_missing_pi(const ClusterPageDataReceiptV1 *receipt,
 									const ClusterWalSourceRef *sources, uint32 source_count)
 {
 	ClusterPageWalBindingV1 terminal, original = receipt->wal;
+
+	if (receipt->target.identity.forknum == SPACE_FORKNUM)
+		return receipt->space_plan != NULL && receipt->space_terminal
+			&& cluster_thread_recovery_fabric_page_plan_v1(receipt->space_plan) == plan;
 
 	/* Without the old physical binding there is no exact PI to look up.
 	 * Require DATA to cover every possible ancestor in the complete sealed

@@ -892,6 +892,7 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 		ClusterWalWriterToken native;
 		bool valid
 			= cluster_page_data_from_notice_v1(wb_notice, i, &receipt)
+			  && cluster_page_data_bind_plan_v1(receipt, wb_notice->plan)
 			  && cluster_bufmgr_ack_pi_at_data_v1(receipt, page, sources, count, wb_notice->inputs,
 												  &ack)
 			  && cluster_page_data_pi_ack_export_v1(ack, receipt, &native)
@@ -1131,6 +1132,7 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 			AbsorbSyncRequests();
 			wb_batch->qualified[i]
 				= wb_batch->receipts[i] != NULL
+				  && cluster_page_data_bind_plan_v1(wb_batch->receipts[i], wb_batch->plan)
 				  && (cluster_page_data_pi_proof_v1(wb_batch->receipts[i], page, wb_batch->sources,
 													wb_batch->source_count, &x)
 					  || cluster_page_data_pi_storage_proof_v1(wb_batch->receipts[i], page,

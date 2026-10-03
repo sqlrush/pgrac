@@ -2843,11 +2843,360 @@ space_tag_receipt_exports_only_after_real_data_completion(void)
 	}
 }
 
+
+#ifndef PGRAC_TEST_REAL_PI_WRITEBACK
+/* Real typed SIDE/fabric and native DATA/ACK consumers, with decoded WAL and
+ * existing PCM/native writer boundaries as in the ordinary PAGE cases. */
+static ClusterThreadRecoveryFabricPlanV1 *
+space_contribution_plan(const ClusterWalSourceRef sources[2], bool later, bool gap, bool seal)
+{
+	ClusterThreadRecoveryFabricPlanRequestV1 request = { 0 };
+	ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
+	RfContributorStreamCutV1 cuts[2] = { { 0 } };
+	XLogRecPtr redo[2] = { 0x200, later ? 0x300 : 0x200 };
+	ClusterSpaceStructureChange create = { 0 };
+	ClusterSpaceReservationChange advance = { 0 };
+	for (int i = 0; i < 2; i++) {
+		cuts[i].failed_thread = sources[i].claim.identity.origin_thread_id;
+		cuts[i].origin_owner_incarnation = sources[i].claim.identity.origin_owner_incarnation;
+		cuts[i].timeline_id = sources[i].timeline;
+		cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		cuts[i].scan_begin_inclusive = 0x100;
+		cuts[i].scan_end_exclusive = redo[i];
+	}
+	request.system_identifier = identity.key.system_identifier;
+	memcpy(request.storage_uuid, identity.key.storage_uuid, 16);
+	request.sources = sources;
+	request.physical_cuts = cuts;
+	request.redo_starts = redo;
+	request.participant_count = 2;
+	request.retention_binding_cookie = 41;
+	request.space_active = true;
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_create_v1(&request, &plan),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	create.identity.action = CLUSTER_SPACE_WAL_CREATE;
+	create.identity.nblocks = InvalidBlockNumber;
+	create.identity.result = identity;
+	create.identity.result_token = 50;
+	create.reservation.action = CLUSTER_SPACE_RESERVATION_INIT;
+	create.reservation.result.identity = identity;
+	create.reservation.result_token = 50;
+	advance.action = CLUSTER_SPACE_RESERVATION_ADVANCE;
+	advance.before = create.reservation.result;
+	advance.before_token = gap ? 70 : 50;
+	advance.first_block = advance.before.next_block = gap ? 5 : 0;
+	advance.granted = 17 - advance.first_block;
+	advance.result = advance.before;
+	advance.result.next_block = 17;
+	advance.result_token = 80;
+	for (int i = 0; i < (later ? 3 : 2); i++) {
+		DecodedXLogRecord decoded = { 0 };
+		XLogReaderState reader = { 0 };
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		char error[1024];
+		uint32 length;
+		if (i == 0) {
+			length = CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
+			UT_ASSERT(cluster_space_structure_wal_encode(&create, wal, length));
+		} else {
+			if (i == 2) {
+				advance.before = advance.result;
+				advance.before_token = advance.result_token;
+				advance.first_block = advance.before.next_block;
+				advance.granted = 10;
+				advance.result.next_block += 10;
+				advance.result_token = 19;
+			}
+			length = CLUSTER_SPACE_RESERVATION_WAL_BYTES;
+			UT_ASSERT(cluster_space_reservation_wal_encode(&advance, wal, length));
+		}
+		reader.record = &decoded;
+		reader.ReadRecPtr = decoded.lsn = i == 2 ? 0x200 : 0x100;
+		reader.EndRecPtr = decoded.next_lsn = i == 2 ? 0x300 : 0x200;
+		reader.system_identifier = request.system_identifier;
+		reader.errormsg_buf = error;
+		decoded.header.xl_rmid = RM_SMGR_ID;
+		decoded.header.xl_info = (i == 0 ? XLOG_SMGR_SPACE_IDENTITY : XLOG_SMGR_SPACE_RESERVATION)
+								 | XLR_SPECIAL_REL_UPDATE;
+		decoded.header.xl_crc = 0x9192 + i;
+		decoded.max_block_id = -1;
+		decoded.main_data = (char *)wal;
+		decoded.main_data_len = length;
+		UT_ASSERT_EQ(
+			cluster_thread_recovery_fabric_plan_feed_record_v1(plan, &reader, i == 0 ? 0 : 1),
+			RF_PAGE_PROOF_DETAIL_OK);
+	}
+	UT_ASSERT(
+		cluster_thread_recovery_fabric_bind_database_v1(plan, identity.key.database_incarnation));
+	if (seal)
+		UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	return plan;
+}
+
+static void
+space_receipt_setup(int block, ClusterWalSourceRef sources[2], ClusterPageWalBindingV1 *ancestor)
+{
+	ClusterSpaceReservation reservation = { 0 };
+	ClusterPageWalBindingV1 binding = { 0 };
+	reset();
+	memset(&logical_pi, 0, sizeof(logical_pi));
+	logical_pi_raced = false;
+	logical_pi_retire_calls = 0;
+	sources[0] = sources[1] = writer;
+	sources[1].claim.identity.origin_thread_id = 2;
+	sources[1].claim.identity.origin_node_id = 1;
+	sources[1].claim.claim_sha256[0]++;
+	writer = sources[1];
+	cluster_node_id = 1;
+	data_slot = block;
+	target.identity.forknum = SPACE_FORKNUM;
+	target.identity.blockno = block;
+	target.version.mutation_token = block == 0 ? 50 : 80;
+	UT_ASSERT(cluster_space_identity_page_encode(&identity, 50, pages[0].data, BLCKSZ));
+	reservation.identity = identity;
+	reservation.next_block = 17;
+	UT_ASSERT(cluster_space_reservation_page_encode(&reservation, 80, pages[1].data, BLCKSZ));
+	InitBufferTag(&descriptors[block].bufferdesc.tag, &identity.key.locator, SPACE_FORKNUM, block);
+	descriptors[block].bufferdesc.pcm_state = PCM_STATE_X;
+	descriptors[block].bufferdesc.buffer_type = BUF_TYPE_XCUR;
+	pg_atomic_fetch_or_u32(&descriptors[block].bufferdesc.state, BM_DIRTY);
+	PageSetLSNPreserveOrigin(pages[block].data, 0x200);
+	UT_ASSERT(PageSetLSNOrigin(pages[block].data, block == 0 ? 0 : 1));
+	binding.source = sources[block];
+	binding.identity = target.identity;
+	binding.version = target.version;
+	binding.record_start = 0x100;
+	binding.record_end = 0x200;
+	binding.record_crc = 0x9192 + block;
+	binding.rmid = RM_SMGR_ID;
+	binding.info = (block == 0 ? XLOG_SMGR_SPACE_IDENTITY : XLOG_SMGR_SPACE_RESERVATION)
+				   | XLR_SPECIAL_REL_UPDATE;
+	writer = binding.source;
+	UT_ASSERT(cluster_page_wal_flush_source_v1(&binding, &binding));
+	writer = sources[1];
+	install_space_source(&binding);
+	*ancestor = binding;
+	ancestor->source = sources[0];
+	ancestor->version.mutation_token = 50;
+	ancestor->record_crc = 0x9192;
+	ancestor->info = XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE;
+	ancestor->flags = 0;
+	writer = sources[0];
+	UT_ASSERT(cluster_page_wal_flush_source_v1(ancestor, ancestor));
+	writer = sources[1];
+}
+
+static void
+space_physical_pi(const ClusterPageWalBindingV1 *binding, BlockNumber next_block)
+{
+	ClusterSpaceReservation reservation = { 0 };
+	BufferDesc *buf = &descriptors[data_slot].bufferdesc;
+	if (data_slot == 0)
+		UT_ASSERT(cluster_space_identity_page_encode(&identity, binding->version.mutation_token,
+													 pages[0].data, BLCKSZ));
+	else {
+		reservation.identity = identity;
+		reservation.next_block = next_block;
+		UT_ASSERT(cluster_space_reservation_page_encode(
+			&reservation, binding->version.mutation_token, pages[1].data, BLCKSZ));
+	}
+	PageSetLSNPreserveOrigin(pages[data_slot].data, binding->record_end);
+	UT_ASSERT(PageSetLSNOrigin(pages[data_slot].data,
+							   binding->source.claim.identity.origin_thread_id - 1));
+	install_space_source(binding);
+	buf->pcm_state = PCM_STATE_N;
+	buf->buffer_type = BUF_TYPE_PI;
+	pg_atomic_write_u32(&buf->state, BM_TAG_VALID | BM_PERMANENT);
+	resident[data_slot] = true;
+}
+
+static void
+space_data_qualifies_original_physical_and_logical_pi(void)
+{
+	for (int block = 0; block < 2; block++)
+		for (int state = 0; state < 3; state++) {
+			ClusterWalSourceRef sources[2];
+			ClusterPageWalBindingV1 ancestor;
+			ClusterPageDataReceiptV1 *receipt = NULL;
+			ClusterPiPhysicalAckV1 *ack = NULL;
+			ClusterPcmPiWriteCutV1 cut, proven;
+			ClusterThreadRecoveryFabricPlanV1 *fabric;
+			const RfPageOnlinePlanV1 *page;
+			int32 node = -1;
+			space_receipt_setup(block, sources, &ancestor);
+			fabric = space_contribution_plan(sources, false, false, true);
+			page = cluster_thread_recovery_fabric_page_plan_v1(fabric);
+			cut = data_pi_cut();
+			UT_ASSERT(cluster_bufmgr_write_page_data_at_cut_v1(&target, &cut, &receipt));
+			UT_ASSERT_EQ(writes, 1);
+			UT_ASSERT_EQ(syncs, 1);
+			UT_ASSERT_EQ(reads, 1);
+			UT_ASSERT(!cluster_page_data_pi_proof_v1(receipt, page, sources, 2, &proven));
+			UT_ASSERT(cluster_page_data_bind_plan_v1(receipt, fabric));
+			UT_ASSERT(cluster_page_data_bind_plan_v1(receipt, fabric));
+			UT_ASSERT(cluster_page_data_pi_proof_v1(receipt, page, sources, 2, &proven));
+			UT_ASSERT_EQ(memcmp(&cut, &proven, sizeof(cut)), 0);
+			logical_pi.resource = cut.holder.assertion.resource;
+			logical_pi.binding_generation = logical_pi.revision = 1;
+			logical_pi.first = logical_pi.last = ancestor;
+			writer = sources[0];
+			cluster_node_id = 0;
+			if (state == 0)
+				space_physical_pi(&ancestor, 0);
+			if (state == 1)
+				resident[data_slot] = false;
+			/* state 2 leaves the current DATA image, requiring terminal proof. */
+			UT_ASSERT(cluster_bufmgr_ack_pi_at_data_v1(receipt, page, sources, 2, NULL, &ack));
+			UT_ASSERT(cluster_page_data_pi_ack_read_v1(ack, receipt, &node));
+			UT_ASSERT_EQ(node, 0);
+			UT_ASSERT_EQ(pi_discards, state == 0 ? 1 : 0);
+			UT_ASSERT_EQ(logical_pi_retire_calls, 1);
+			cluster_page_data_pi_ack_free_v1(&ack);
+			cluster_page_data_receipt_free_v1(&receipt);
+			cluster_thread_recovery_fabric_plan_destroy_v1(&fabric);
+			clean();
+		}
+	memset(&logical_pi, 0, sizeof(logical_pi));
+}
+
+static void
+space_data_rejects_missing_or_substituted_original_contribution(void)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		ClusterWalSourceRef sources[2], selected[2];
+		ClusterPageWalBindingV1 ancestor;
+		ClusterPageDataReceiptV1 *receipt = NULL;
+		ClusterPcmPiWriteCutV1 cut, untouched;
+		ClusterThreadRecoveryFabricPlanV1 *fabric;
+		space_receipt_setup(1, sources, &ancestor);
+		cut = data_pi_cut();
+		UT_ASSERT(cluster_bufmgr_write_page_data_at_cut_v1(&target, &cut, &receipt));
+		memcpy(selected, sources, sizeof(selected));
+		if (fault == 0)
+			selected[1].claim.claim_sha256[0]++;
+		if (fault == 1)
+			selected[1].claim.identity.origin_owner_incarnation++;
+		if (fault == 2)
+			selected[1].claim.identity.root_lineage_seq++;
+		/* Private fixture corruption represents an unmatching native receipt,
+		 * not caller-supplied coverage: none may qualify the sealed input. */
+		if (fault == 3)
+			receipt->wal.record_crc++;
+		if (fault == 4)
+			receipt->wal.record_start += 8;
+		if (fault == 5)
+			receipt->wal.info = XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE;
+		if (fault == 6)
+			receipt->wal.source.claim.database_incarnation++;
+		fabric = space_contribution_plan(selected, false, fault == 7, fault != 8);
+		UT_ASSERT(!cluster_page_data_bind_plan_v1(receipt, fabric));
+		memset(&untouched, 0xa5, sizeof(untouched));
+		cut = untouched;
+		UT_ASSERT(!cluster_page_data_pi_proof_v1(
+			receipt, cluster_thread_recovery_fabric_page_plan_v1(fabric), selected, 2, &cut));
+		UT_ASSERT_EQ(memcmp(&cut, &untouched, sizeof(cut)), 0);
+		UT_ASSERT_EQ(pi_discards + logical_pi_retire_calls, 0);
+		cluster_page_data_receipt_free_v1(&receipt);
+		cluster_thread_recovery_fabric_plan_destroy_v1(&fabric);
+		clean();
+	}
+}
+
+static void
+space_absent_replaced_and_successor_pi_require_per_block_terminal(void)
+{
+	for (int block = 0; block < 2; block++)
+		for (int state = 0; state < 4; state++) {
+			ClusterWalSourceRef sources[2];
+			ClusterPageWalBindingV1 ancestor;
+			ClusterPageDataReceiptV1 *receipt = NULL;
+			ClusterPcmPiWriteCutV1 cut;
+			ClusterThreadRecoveryFabricPlanV1 *fabric;
+			const RfPageOnlinePlanV1 *page;
+			ClusterPiPhysicalResultV1 expected;
+			space_receipt_setup(block, sources, &ancestor);
+			fabric = space_contribution_plan(sources, true, false, true);
+			page = cluster_thread_recovery_fabric_page_plan_v1(fabric);
+			cut = data_pi_cut();
+			UT_ASSERT(cluster_bufmgr_write_page_data_at_cut_v1(&target, &cut, &receipt));
+			UT_ASSERT(cluster_page_data_bind_plan_v1(receipt, fabric));
+			if (state == 0) {
+				space_physical_pi(&ancestor, 0);
+				expected = CLUSTER_PI_PHYSICAL_DISCARDED;
+			} else if (state == 1) {
+				resident[data_slot] = false;
+				expected = block == 0 ? CLUSTER_PI_PHYSICAL_ABSENT : CLUSTER_PI_PHYSICAL_RETRY;
+			} else if (state == 2) {
+				expected = block == 0 ? CLUSTER_PI_PHYSICAL_REPLACED : CLUSTER_PI_PHYSICAL_RETRY;
+			} else {
+				if (block == 1) {
+					ancestor.source = sources[1];
+					ancestor.version.mutation_token = 19;
+					ancestor.record_start = 0x200;
+					ancestor.record_end = 0x300;
+					ancestor.record_crc = 0x9194;
+					ancestor.info = XLOG_SMGR_SPACE_RESERVATION | XLR_SPECIAL_REL_UPDATE;
+				} else
+					ancestor.source.claim.claim_sha256[0]++;
+				space_physical_pi(&ancestor, 27);
+				expected = CLUSTER_PI_PHYSICAL_RETRY;
+			}
+			UT_ASSERT_EQ(cluster_bufmgr_discard_pi_at_data_v1(receipt, page, sources, 2), expected);
+			UT_ASSERT_EQ(pi_discards, expected == CLUSTER_PI_PHYSICAL_DISCARDED ? 1 : 0);
+			cluster_page_data_receipt_free_v1(&receipt);
+			cluster_thread_recovery_fabric_plan_destroy_v1(&fabric);
+			clean();
+		}
+}
+
+static void
+remote_space_receipt_rebinds_receiver_plan_before_physical_ack(void)
+{
+	ClusterWalSourceRef sources[2];
+	ClusterPageWalBindingV1 ancestor;
+	ClusterPageDataReceiptV1 *written = NULL, *imported = NULL;
+	ClusterPiPhysicalAckV1 *ack = NULL;
+	ClusterPcmPiWriteCutV1 cut;
+	ClusterThreadRecoveryFabricPlanV1 *sender, *receiver;
+	const RfPageOnlinePlanV1 *page;
+	space_receipt_setup(1, sources, &ancestor);
+	sender = space_contribution_plan(sources, false, false, true);
+	receiver = space_contribution_plan(sources, false, false, true);
+	cut = data_pi_cut();
+	UT_ASSERT(cluster_bufmgr_write_page_data_at_cut_v1(&target, &cut, &written));
+	UT_ASSERT(cluster_page_data_bind_plan_v1(written, sender));
+	UT_ASSERT(!cluster_page_data_bind_plan_v1(written, receiver));
+	memset(&notice_fact, 0, sizeof(notice_fact));
+	UT_ASSERT(cluster_page_data_pi_fact_v1(written, &notice_fact));
+	notice_ready = true;
+	UT_ASSERT(cluster_page_data_from_notice_v1((void *)1, 0, &imported));
+	page = cluster_thread_recovery_fabric_page_plan_v1(receiver);
+	writer = sources[0];
+	cluster_node_id = 0;
+	space_physical_pi(&ancestor, 0);
+	UT_ASSERT(!cluster_bufmgr_ack_pi_at_data_v1(imported, page, sources, 2, NULL, &ack));
+	UT_ASSERT_EQ(pi_discards, 0);
+	UT_ASSERT(cluster_page_data_bind_plan_v1(imported, receiver));
+	UT_ASSERT(cluster_bufmgr_ack_pi_at_data_v1(imported, page, sources, 2, NULL, &ack));
+	UT_ASSERT_EQ(pi_discards, 1);
+	cluster_page_data_pi_ack_free_v1(&ack);
+	cluster_page_data_receipt_free_v1(&imported);
+	cluster_page_data_receipt_free_v1(&written);
+	cluster_thread_recovery_fabric_plan_destroy_v1(&receiver);
+	cluster_thread_recovery_fabric_plan_destroy_v1(&sender);
+	clean();
+}
+#endif
+
 int
 main(void)
 {
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
-	UT_PLAN(46);
+	UT_PLAN(50);
+	UT_RUN(space_data_qualifies_original_physical_and_logical_pi);
+	UT_RUN(space_data_rejects_missing_or_substituted_original_contribution);
+	UT_RUN(space_absent_replaced_and_successor_pi_require_per_block_terminal);
+	UT_RUN(remote_space_receipt_rebinds_receiver_plan_before_physical_ack);
 	UT_RUN(recovery_ack_needs_full_input_terminal_data_and_exact_dead_boot);
 	UT_RUN(recovery_ack_cannot_outlive_original_input_membership_or_owner);
 	UT_RUN(recovery_ack_refuses_successor_pi_not_covered_by_actual_data);

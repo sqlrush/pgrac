@@ -2155,6 +2155,7 @@ test_cluster_page_data test_cluster_pi_writeback: unit_test.h test_cluster_page_
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c test_cluster_page_data_stable.o test_cluster_page_wal_product.o $(CLUSTER_WAL_CLAIM_O) \
+		$(PAGE_DATA_SPACE_OBJS) \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(CLUSTER_PAGE_ONLINE_PLAN_O) $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o xlogreader_fs.o \
@@ -2631,6 +2632,16 @@ test_cluster_side_xact: test_cluster_side_xact.c unit_test.h test_cluster_undo_h
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
 
 CLUSTER_SIDE_ONLINE_OWNER_O = test_cluster_side_online_owner_product.o
+# The DATA integration uses the actual immutable fabric and typed SIDE
+# planner. The writeback scheduling fixture keeps its explicit input boundary.
+test_cluster_page_data: PAGE_DATA_SPACE_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
+		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
+		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
+test_cluster_page_data: $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
+		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
+		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
 test_cluster_space_recovery: $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_XACTDESC_O) $(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
