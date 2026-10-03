@@ -105,6 +105,17 @@ class BlackBoxTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "deadline"):
                 driver.shared_start()
 
+    def test_recovered_startup_crash_is_still_a_failure(self):
+        driver = self.driver(self.profile())
+        def runner(argv, **kwargs):
+            if Path(argv[0]).name == 'pg_ctl' and str(self.layout['nodes'][0]['data_dir']) in argv:
+                Path(self.layout['nodes'][0]['logfile']).write_text(
+                    'PANIC: injected startup crash\ndatabase system is ready to accept connections\n')
+            return subprocess.CompletedProcess(argv, 0, '1\n', '')
+        driver.runner = runner
+        with self.assertRaisesRegex(RuntimeError, 'startup.*PANIC'):
+            driver.shared_start()
+
     def prepare_stop(self):
         driver = self.driver(self.profile())
         for node in self.layout["nodes"]:
