@@ -218,8 +218,9 @@ UT_TEST(test_space_refail_later_truncate_proves_shrink)
 	hand_disk_floor(&w);
 	hand_disk(&w, 0, 0, CLUSTER_COLD_DATA_PRESENT, w.rel[0].hist[0][0].token);
 	hand_disk(&w, 0, 1, CLUSTER_COLD_DATA_PRESENT, between);
-	/* the later preparation synced the SPACE fork too */
-	UT_ASSERT_EQ(w.rel[0].space_pos, 1);
+	/* the later preparation synced the SPACE fork too, and the change after
+	 * the later TRUNCATE follows its durable identity */
+	UT_ASSERT_EQ(w.rel[0].space_pos, 2);
 	UT_ASSERT_EQ(plan_world(&w, &plan), CLUSTER_COLD_OK);
 	UT_ASSERT_EQ(input_shrink(plan, &w, 0), 0);
 	UT_ASSERT_EQ(input_shrink(plan, &w, 2), CLUSTER_COLD_SHRINK_FORKS);
@@ -298,11 +299,12 @@ UT_TEST(test_space_refail_retired_after_carry)
 }
 
 /*
- * Known gap (worklog F-D-21, requests.md R-A17): history re-extended a
- * block a replayed TRUNCATE retired, but the SPACE identity on disk still
- * predates that TRUNCATE.  The page's header cannot be told from the
- * retired content and nothing replayable rebuilds it: refused before any
- * change, never trusted.
+ * History re-extended a block a replayed TRUNCATE retired while the SPACE
+ * identity on disk still predates that TRUNCATE (worklog F-D-21).  A
+ * truncation now persists its identity before releasing the relation, so
+ * this DATA cannot arise; should it, the page's header cannot be told from
+ * the retired content and nothing replayable rebuilds it: refused before
+ * any change, never trusted.
  */
 UT_TEST(test_space_refail_stale_identity_after_retire_refuses)
 {
@@ -340,15 +342,17 @@ UT_TEST(test_space_refail_stale_identity_after_retire_refuses)
  * identity, pages and size, and no block is applied to a state other than
  * the expected one or under another incarnation.  The SPACE owner is handed
  * exactly the uncovered inputs.  The only accepted refusals are pages no
- * anchor after their last settled change can rebuild, and the known gap
- * stale_identity_refusal describes, counted apart.
+ * anchor after their last settled change can rebuild.  (A stale SPACE
+ * identity over a page re-extended after a replayed truncation cannot
+ * arise: the truncation persists its identity before releasing the
+ * relation; test_space_refail_stale_identity_after_retire_refuses keeps
+ * the plan's answer to such input fail-closed.)
  */
 UT_TEST(test_space_refail_converges_from_any_prefix)
 {
 	uint32 trial;
 	uint32 converged_trials = 0;
 	uint32 refused_trials = 0;
-	uint32 stale_trials = 0;
 	uint32 refails = 0;
 	uint32 truncating = 0;
 	uint32 dropping = 0;
@@ -375,9 +379,8 @@ UT_TEST(test_space_refail_converges_from_any_prefix)
 		}
 		if (only != NULL)
 			dump_world(&w);
-		if (outcome == RUN_REFUSED || outcome == RUN_REFUSED_STALE) {
-			refused_trials += outcome == RUN_REFUSED;
-			stale_trials += outcome == RUN_REFUSED_STALE;
+		if (outcome == RUN_REFUSED) {
+			refused_trials++;
 			continue;
 		}
 		if (outcome != RUN_OK || !finished || !converged(&w)) {
@@ -397,11 +400,11 @@ UT_TEST(test_space_refail_converges_from_any_prefix)
 			creating += kind == CLUSTER_COLD_SPACE_CREATE;
 		}
 	}
-	printf("# converged %u, refused (no anchor) %u, refused (stale identity, F-D-21) %u of %u; "
+	printf("# converged %u, refused (no anchor) %u of %u; "
 		   "%u re-failures; replayed truncations %u, drops %u, creations %u; truncation steps "
 		   "shrinking again %u, keeping proven files %u\n",
-		   converged_trials, refused_trials, stale_trials, TRIALS, refails, truncating, dropping,
-		   creating, shrinks_repeated, shrinks_kept);
+		   converged_trials, refused_trials, TRIALS, refails, truncating, dropping, creating,
+		   shrinks_repeated, shrinks_kept);
 	if (only != NULL)
 		return;
 	/* The generator must exercise the interesting paths, not refuse them. */
@@ -412,7 +415,6 @@ UT_TEST(test_space_refail_converges_from_any_prefix)
 	UT_ASSERT(creating > TRIALS / 20);
 	UT_ASSERT(shrinks_repeated > TRIALS / 2);
 	UT_ASSERT(shrinks_kept > TRIALS / 2);
-	UT_ASSERT(stale_trials < TRIALS / 50);
 }
 
 int

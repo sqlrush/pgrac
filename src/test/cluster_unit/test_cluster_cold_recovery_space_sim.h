@@ -327,8 +327,7 @@ sim_step(World *w, const ClusterColdPlanV1 *plan, uint32 index, const ClusterCol
 
 typedef enum RunOutcome {
 	RUN_OK,
-	RUN_REFUSED,	   /* a page nothing can rebuild: fail-closed */
-	RUN_REFUSED_STALE, /* F-D-21: see stale_identity_refusal */
+	RUN_REFUSED, /* a page nothing can rebuild: fail-closed */
 	RUN_BROKEN
 } RunOutcome;
 
@@ -351,31 +350,6 @@ refusal_explained(const World *w, ClusterColdDetailV1 detail)
 				return true;
 			if (detail == CLUSTER_COLD_CONTENT_UNPROVEN && !w->checksums
 				&& rel->disk[b].kind == CLUSTER_COLD_DATA_PRESENT)
-				return true;
-		}
-	return false;
-}
-
-/*
- * Known liveness gap (worklog F-D-21, requests.md R-A17): a block that a
- * replayed TRUNCATE retired and history re-extended holds its new content
- * while the SPACE identity on disk still predates that TRUNCATE.  The
- * header then cannot be told from the retired content, nothing replayable
- * rebuilds the page, and the plan refuses (fail-closed, before any change).
- */
-static bool
-stale_identity_refusal(const World *w, ClusterColdDetailV1 detail)
-{
-	int r;
-	int b;
-
-	for (r = 0; detail == CLUSTER_COLD_ANCHOR_MISSING && r < (int)w->rels; r++)
-		for (b = 0; b < MAX_BLOCKS; b++) {
-			const Rel *rel = &w->rel[r];
-
-			if (rel->replayable[b] && !rel->anchored[b] && rel->retire_op[b] >= 0
-				&& rel->disk[b].kind == CLUSTER_COLD_DATA_PRESENT
-				&& (int)rel->space_pos <= rel->retire_op[b])
 				return true;
 		}
 	return false;
@@ -416,8 +390,6 @@ run_once(World *w, bool fail, bool *finished)
 		cluster_cold_plan_destroy_v1(&plan);
 		if (!w->check_mismatch && refusal_explained(w, detail))
 			return RUN_REFUSED;
-		if (!w->check_mismatch && stale_identity_refusal(w, detail))
-			return RUN_REFUSED_STALE;
 		printf("# seal refused: detail %d%s\n", (int)detail,
 			   w->check_mismatch ? " (SPACE inputs differ from the timeline)" : "");
 		return RUN_BROKEN;
