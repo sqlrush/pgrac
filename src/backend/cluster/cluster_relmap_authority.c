@@ -39,12 +39,8 @@
 #include "cluster/cluster_relmap_authority.h"
 #include "storage/fd.h"
 
-/* Fixed on-disk file size: header + two full-width image slots. */
-#define CLUSTER_RELMAP_AUTHORITY_FILE_SIZE                                                         \
-	((int)(sizeof(ClusterRelmapAuthorityHeader) + 2 * CLUSTER_RELMAP_IMAGE_MAX))
-
-#define COMMITTED_SLOT_OFFSET ((int)sizeof(ClusterRelmapAuthorityHeader))
-#define PENDING_SLOT_OFFSET (COMMITTED_SLOT_OFFSET + CLUSTER_RELMAP_IMAGE_MAX)
+#define COMMITTED_SLOT_OFFSET CLUSTER_RELMAP_COMMITTED_OFFSET
+#define PENDING_SLOT_OFFSET CLUSTER_RELMAP_PENDING_OFFSET
 
 /* Relative authority path within cluster_shared_data_dir. */
 #define AUTHORITY_BASENAME "pgrac_relmap_authority"

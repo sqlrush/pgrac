@@ -77,7 +77,8 @@ typedef enum ClusterRelmapAuthorityValidity {
  * ClusterRelmapAuthorityHeader -- durable authority header + crash-arbitration
  * SSOT (spec §2.1).  Laid out on disk as:
  *     [ ClusterRelmapAuthorityHeader ][ committed image ][ pending image ]
- * with each image occupying image_size bytes.
+ * Each slot occupies CLUSTER_RELMAP_IMAGE_MAX bytes; image_size is its valid
+ * image prefix length.
  */
 typedef struct ClusterRelmapAuthorityHeader {
 	uint32 magic;
