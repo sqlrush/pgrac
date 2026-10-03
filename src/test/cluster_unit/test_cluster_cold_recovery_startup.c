@@ -216,6 +216,43 @@ UT_TEST(test_prepare_refuses_restart_redo_mismatch)
 	cluster_cold_typed_destroy_v1(&typed);
 }
 
+/*
+ * The own generation replayed is the one this node restarts from: the
+ * bootstrap-validated restart input must name the sealed root's identity
+ * and claim, not only lead to the same redo.
+ */
+UT_TEST(test_prepare_binds_own_generation_to_restart_input)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	restart_ref_present = false;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
+	UT_ASSERT(strstr(typed->refusal_detail, "restart input") != NULL);
+	UT_ASSERT_NULL(typed->plan);
+	cluster_cold_typed_destroy_v1(&typed);
+
+	fixture();
+	restart_ref.claim.identity.origin_owner_incarnation++; /* a later generation */
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
+	UT_ASSERT(strstr(typed->refusal_detail, "restart input") != NULL);
+	cluster_cold_typed_destroy_v1(&typed);
+
+	fixture();
+	restart_ref.claim.claim_sha256[31] ^= 1; /* same identity, another claim */
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
+	UT_ASSERT(strstr(typed->refusal_detail, "restart input") != NULL);
+	cluster_cold_typed_destroy_v1(&typed);
+
+	fixture();
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	cluster_cold_typed_destroy_v1(&typed);
+}
+
 UT_TEST(test_prepare_refuses_unproven_origin_source)
 {
 	ClusterColdTypedV1 *typed;
@@ -644,12 +681,13 @@ UT_TEST(test_refusal_hints)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(19);
 	UT_RUN(test_prepare_seals_own_and_fenced_generations);
 	UT_RUN(test_prepare_takes_history_generations_from_the_census);
 	UT_RUN(test_prepare_refuses_what_the_census_refuses);
 	UT_RUN(test_prepare_refuses_unsealed_own_generation);
 	UT_RUN(test_prepare_refuses_restart_redo_mismatch);
+	UT_RUN(test_prepare_binds_own_generation_to_restart_input);
 	UT_RUN(test_prepare_refuses_unproven_origin_source);
 	UT_RUN(test_prepare_reports_scan_and_seal_refusals);
 	UT_RUN(test_redo_block_decisions);

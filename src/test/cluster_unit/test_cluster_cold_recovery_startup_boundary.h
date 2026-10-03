@@ -87,7 +87,19 @@ static uint16 fence_count;
 static ClusterColdDetailV1 scan_result[NROOTS + 1];
 static uint64 data_token;
 static uint64 database_incarnation[NROOTS + 1];
-static bool scan_space; /* thread 2 extends relation 300 before its page record */
+static bool scan_space;					/* thread 2 extends relation 300 before its page record */
+static ClusterWalSourceRef restart_ref; /* this node's bootstrap-validated restart input */
+static bool restart_ref_present;
+
+bool
+cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!restart_ref_present)
+		return false;
+	*out = restart_ref;
+	return true;
+}
 
 /* The ROOT module's identity equality, field by field. */
 bool
@@ -128,6 +140,7 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 	memset(source, 0, sizeof(*source));
 	source->claim.identity = root->identity;
 	source->claim.database_incarnation = database_incarnation[thread];
+	memset(source->claim.claim_sha256, thread, sizeof(source->claim.claim_sha256));
 	source->timeline = root->checkpoint_tli;
 	*redo = native_redo[thread];
 	return source_result[thread];
@@ -500,6 +513,11 @@ fixture(void)
 		tokens[thread].origin_thread_id = thread;
 		tokens[thread].file_txn_seq = 77;
 	}
+	memset(&restart_ref, 0, sizeof(restart_ref));
+	restart_ref.claim.identity = roots[1].identity;
+	memset(restart_ref.claim.claim_sha256, 1, sizeof(restart_ref.claim.claim_sha256));
+	restart_ref.timeline = 1;
+	restart_ref_present = true;
 	fence_count = 2;
 	data_token = 5;
 	contexts_alive = 0;

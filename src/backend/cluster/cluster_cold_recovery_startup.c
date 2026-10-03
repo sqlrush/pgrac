@@ -4,18 +4,16 @@
  *	  Startup-process driver state for typed cold-crash replay.
  *
  *	  Pass 1 runs here, with every foreign origin's external admission held
- *	  and before the serial set (retention pin, then IR) is taken, so its
- *	  ROOT/CF reads and WAL scans never run under IR.  Its results are
- *	  provisional: the caller recommits the unchanged ROOT tokens under the
- *	  serial set and pass 2 matches every record against pass 1.  Every participant is a RECOVERY_REQUIRED writer generation:
- *	  the founder's own previous generation plus every fenced origin.  Each
- *	  root's exact source and native redo come from one ROOT token; its whole
- *	  retained cut is scanned, DATA is observed and the plan is sealed.  Any
- *	  refusal returns before the first mutation with an exact reason.
+ *	  and before the serial set (retention pin, then IR), so its ROOT/CF
+ *	  reads and WAL scans never run under IR; the caller recommits the
+ *	  unchanged ROOT tokens under the serial set and pass 2 matches every
+ *	  record against pass 1.  Participants are the founder's own sealed
+ *	  generation (its restart input), every fenced origin and, from the
+ *	  participant census, every other generation with retained WAL as
+ *	  history.  Any refusal returns before the first mutation.
  *
- *	  Pass 2 runs in xlogrecovery.c.  While it applies one scheduled record,
- *	  the record's per-block verdicts are published here for the typed redo
- *	  block consultation in XLogReadBufferForRedoExtended.
+ *	  Pass 2 runs in xlogrecovery.c; the per-block verdicts of the record
+ *	  it applies are published here for XLogReadBufferForRedoExtended.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -45,6 +43,7 @@
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_wal_tail.h"
+#include "cluster/cluster_wal_thread.h"
 #include "storage/bufpage.h"
 #include "storage/checksum.h"
 #include "utils/memutils.h"
@@ -172,6 +171,36 @@ cold_participant(ClusterColdTypedV1 *typed, const ColdRoot *root, uint32 index)
 	return true;
 }
 
+/* The founder replays the generation it restarts from: the restart input
+ * its bootstrap validated names the claim of its sealed root, and native
+ * startup chose the same redo. */
+static bool
+cold_own_restart(ClusterColdTypedV1 *typed, uint16 own_thread, XLogRecPtr own_redo)
+{
+	const ClusterWalSourceRef *source = &typed->sources[typed->own_participant];
+	XLogRecPtr native_redo = typed->participants[typed->own_participant].native_redo;
+	ClusterWalSourceRef restart;
+
+	if (!cluster_wal_thread_restart_v2_ref(&restart)
+		|| memcmp(&restart.claim.identity, &source->claim.identity, sizeof(restart.claim.identity))
+			   != 0
+		|| memcmp(restart.claim.claim_sha256, source->claim.claim_sha256,
+				  sizeof(restart.claim.claim_sha256))
+			   != 0) {
+		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+					"own thread %u sealed generation is not this node's restart input",
+					(unsigned)own_thread);
+		return false;
+	}
+	if (native_redo != own_redo) {
+		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+					"own thread %u native redo %X/%X differs from the restart redo %X/%X",
+					(unsigned)own_thread, LSN_FORMAT_ARGS(native_redo), LSN_FORMAT_ARGS(own_redo));
+		return false;
+	}
+	return true;
+}
+
 static bool
 cold_collect_roots(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence, uint16 own_thread,
 				   ColdRoot *roots)
@@ -226,10 +255,8 @@ cold_refuse_diag(ClusterColdTypedV1 *typed, ClusterColdDetailV1 detail, const ch
 		LSN_FORMAT_ARGS(diag->has_dependency ? diag->dependency_read_rec_ptr : InvalidXLogRecPtr));
 }
 
-/*
- * SPACE effects are keyed by the namespace every participant must share:
- * the cluster's identity and the database incarnation of their claims.
- */
+/* SPACE effects are keyed by the namespace every participant must share:
+ * the cluster's identity and the database incarnation of their claims. */
 static bool
 cold_space_namespace(ClusterColdTypedV1 *typed)
 {
@@ -288,10 +315,8 @@ cold_census_name(ClusterColdCensusDetailV1 detail)
 	}
 }
 
-/*
- * The census's crashed generations are exactly the roots already taken, with
- * the same cut; append its history-only generations as participants.
- */
+/* The census's crashed generations are exactly the roots already taken, with
+ * the same cut; append its history-only generations as participants. */
 static bool
 cold_census_take(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 				 const ClusterColdCensusEntryV1 *entries, uint32 count)
@@ -330,10 +355,8 @@ cold_census_take(ClusterColdTypedV1 *typed, const ColdRoot *roots,
 	return true;
 }
 
-/*
- * Complete participant census: every generation with retained WAL under one
- * cold read scope, held until pass 1 has scanned the history-only ones.
- */
+/* Complete participant census: every generation with retained WAL under one
+ * cold read scope, held until pass 1 has scanned the history-only ones. */
 static bool
 cold_census(ClusterColdTypedV1 *typed, const ColdRoot *roots)
 {
@@ -479,15 +502,7 @@ cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread
 	for (uint32 i = 0; i < typed->participant_count; i++)
 		if (!cold_participant(typed, &roots[i], i))
 			goto done;
-	if (typed->participants[typed->own_participant].native_redo != own_redo) {
-		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
-					"own thread %u native redo %X/%X differs from the restart redo %X/%X",
-					(unsigned)own_thread,
-					LSN_FORMAT_ARGS(typed->participants[typed->own_participant].native_redo),
-					LSN_FORMAT_ARGS(own_redo));
-		goto done;
-	}
-	if (!cold_census(typed, roots))
+	if (!cold_own_restart(typed, own_thread, own_redo) || !cold_census(typed, roots))
 		goto done;
 	typed->system_identifier = roots[0].root.identity.system_identifier;
 	detail
