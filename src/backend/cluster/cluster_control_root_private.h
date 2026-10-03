@@ -58,6 +58,7 @@ typedef struct ControlRootHeader {
 	uint8 storage_uuid[16];
 	uint8 authority_uuid[16];
 	uint32 activation_state;
+	uint32 lineage_kind;
 	int64 created_at_usec;
 	int64 published_at_usec;
 	uint32 body_crc32c;

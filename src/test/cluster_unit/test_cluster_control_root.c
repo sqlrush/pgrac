@@ -17176,6 +17176,36 @@ UT_TEST(test_v3_locked_read_requires_exact_format_primary_and_objects)
 	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
 }
 
+UT_TEST(test_creation_pair_rejects_older_backup_from_other_domain)
+{
+	uint8 bytes[66048];
+	ClusterRecoveryAnchorV2 anchors[2];
+	ControlRootImage root;
+	ControlFileData out;
+	ClusterControlRootFileToken token;
+	char path[MAXPGPATH];
+
+	v2_thread_fixture(bytes, anchors);
+	root_fixture_version3(bytes);
+	put_u64_le(bytes + 64, 0x15);
+	put_u64_le(bytes + 164, 1);
+	put_u64_le(bytes + 172, 0);
+	put_u64_le(bytes + 180, 0);
+	v2_checksums(bytes);
+	v2_write_roots(bytes);
+	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID,
+		&root, &out, &token), 0);
+	/* Even an older, otherwise identical valid backup cannot change domains. */
+	put_u64_le(bytes + 64, 0x0d);
+	put_u64_le(bytes + 16, root.header.file_txn_seq - 1);
+	v2_checksums(bytes);
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_BAK_REL_PATH);
+	write_all_or_abort(path, bytes, sizeof(bytes));
+	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID,
+		&root, &out, &token), CLUSTER_CONTROL_ROOT_COPY_DIVERGENT);
+	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+}
+
 UT_TEST(test_bootstrap_v3_reads_exact_current_and_flat_history)
 {
 	BootstrapFixture f;
@@ -21354,11 +21384,15 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(399);
+	UT_PLAN(404);
 	UT_RUN(test_initialized_complete_cohort_constructs_all_selected_inputs);
 	UT_RUN(test_initialized_cohort_refuses_incomplete_or_existing_sources);
 	UT_RUN(test_initialized_cohort_refuses_wrong_identity_or_geometry);
 	UT_RUN(test_initialized_cohort_overlap_never_changes_input);
+	UT_RUN(test_creation_root_codec_has_separate_literal_domain);
+	UT_RUN(test_creation_root_rejects_mixed_flags_and_fake_open);
+	UT_RUN(test_initialized_kind_requires_creation_root);
+	UT_RUN(test_bootstrap_binding_never_crosses_lineage_domain);
 	UT_RUN(test_initialized_seed_literal_roundtrip_has_no_writer);
 	UT_RUN(test_initialized_bound_phases_keep_real_successor_rules);
 	UT_RUN(test_initialized_seed_refuses_unearned_target_and_prior_root);
@@ -21504,6 +21538,7 @@ main(int argc, char **argv)
 	UT_RUN(test_origin_input_union_preserves_current_history_and_pending);
 	UT_RUN(test_origin_input_union_refuses_partial_or_unowned_metadata);
 	UT_RUN(test_origin_input_union_alias_and_bounds_clear_all_output);
+	UT_RUN(test_creation_pair_rejects_older_backup_from_other_domain);
 	UT_RUN(test_bootstrap_v3_reads_exact_current_and_flat_history);
 	UT_RUN(test_bootstrap_v3_pending_is_never_missing_from_capacity);
 	UT_RUN(test_bootstrap_pending_route_never_masks_bad_inputs_or_namespace);

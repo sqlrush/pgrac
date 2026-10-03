@@ -923,7 +923,8 @@ encode_header_version(ControlRootImage *image, uint16 version)
 	write_u64_le(dst + 24, image->header.system_identifier);
 	memcpy(dst + 32, image->header.storage_uuid, 16);
 	memcpy(dst + 48, image->header.authority_uuid, 16);
-	write_u64_le(dst + 64, CLUSTER_CONTROL_ROOT_FORMAT_FLAGS_V1);
+	write_u64_le(dst + 64, image->header.lineage_kind == PGRAC_CONTROL_LINEAGE_CREATION_V1
+		? CLUSTER_CONTROL_ROOT_FORMAT_CREATION_FLAGS_V1 : CLUSTER_CONTROL_ROOT_FORMAT_FLAGS_V1);
 	write_u16_le(dst + 72, version);
 	write_u16_le(dst + 74, version);
 	write_u32_le(dst + 76, image->header.activation_state);
@@ -1015,7 +1016,9 @@ decode_image_version(ControlRootImage *image, const uint8 current_uuid[16], uint
 		|| read_u16_le(src + 8) != CLUSTER_CONTROL_ROOT_RECORD_BYTES
 		|| read_u16_le(src + 10) != CLUSTER_CONTROL_ROOT_RECORD_COUNT
 		|| read_u16_le(src + 72) != expected_version || read_u16_le(src + 74) != expected_version
-		|| read_u64_le(src + 64) != CLUSTER_CONTROL_ROOT_FORMAT_FLAGS_V1)
+		|| (read_u64_le(src + 64) != CLUSTER_CONTROL_ROOT_FORMAT_FLAGS_V1
+			&& !(expected_version == CONTROL_ROOT_HEADER_VERSION_V3
+				 && read_u64_le(src + 64) == CLUSTER_CONTROL_ROOT_FORMAT_CREATION_FLAGS_V1)))
 		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
 	if (read_u32_le(src + 12) != CONTROL_ROOT_ENDIAN_TAG)
 		return CLUSTER_CONTROL_ROOT_BAD_ENDIAN;
@@ -1030,6 +1033,8 @@ decode_image_version(ControlRootImage *image, const uint8 current_uuid[16], uint
 	memcpy(image->header.storage_uuid, src + 32, 16);
 	memcpy(image->header.authority_uuid, src + 48, 16);
 	image->header.activation_state = read_u32_le(src + 76);
+	image->header.lineage_kind = read_u64_le(src + 64) == CLUSTER_CONTROL_ROOT_FORMAT_CREATION_FLAGS_V1
+		? PGRAC_CONTROL_LINEAGE_CREATION_V1 : PGRAC_CONTROL_LINEAGE_MIGRATION_V1;
 	image->header.created_at_usec = (int64)read_u64_le(src + 80);
 	image->header.published_at_usec = (int64)read_u64_le(src + 88);
 	image->header.body_crc32c = read_u32_le(src + 96);
@@ -1052,6 +1057,10 @@ decode_image_version(ControlRootImage *image, const uint8 current_uuid[16], uint
 	if (bytes_are_zero(image->header.migration_round_sha256, PG_SHA256_DIGEST_LENGTH)
 		|| bytes_are_zero(image->header.source_wal_state_sha256, PG_SHA256_DIGEST_LENGTH)
 		|| image->header.migration_prepare_generation == 0
+		|| (image->header.lineage_kind == PGRAC_CONTROL_LINEAGE_CREATION_V1
+			&& (image->header.migration_prepare_generation != 1
+				|| image->header.migration_transition_epoch != 0
+				|| image->header.source_feature_bitmap != 0))
 		|| !cluster_control_root_feature_bitmap_is_known(image->header.source_feature_bitmap)
 		|| !cluster_control_root_feature_bitmap_is_known(image->header.target_feature_bitmap)
 		|| (image->header.target_feature_bitmap
@@ -1148,7 +1157,10 @@ encode_extended_image(ControlRootImage *image, uint16 version)
 	if (image == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	memset(image->bytes, 0, sizeof(image->bytes));
-	if (image->header.format_version != version)
+	if (image->header.format_version != version
+		|| (image->header.lineage_kind != PGRAC_CONTROL_LINEAGE_MIGRATION_V1
+			&& !(version == CONTROL_ROOT_HEADER_VERSION_V3
+				 && image->header.lineage_kind == PGRAC_CONTROL_LINEAGE_CREATION_V1)))
 		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
 	if (version != CONTROL_ROOT_HEADER_VERSION_V3
 		&& !bytes_are_zero(image->startup, sizeof(image->startup)))
@@ -1288,7 +1300,8 @@ startup_initialized_record(const ClusterControlRootSnapshot *record,
 static bool
 startup_initialized_root(const ControlRootImage *root)
 {
-	if (root->header.file_txn_seq != 1
+	if (root->header.lineage_kind != PGRAC_CONTROL_LINEAGE_CREATION_V1
+		|| root->header.file_txn_seq != 1
 		|| root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
 		|| root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
 		|| root->header.v2.formation_seq != 1 || root->header.v2.serving[0] != 0
@@ -1402,6 +1415,8 @@ startup_decode_fields(const uint8 *bytes, const ControlRootImage *root, uint32 n
 	out->input_timeline = read_u32_le(bytes + 172);
 	out->sealed_input_end = read_u64_le(bytes + 176);
 	initialized = out->input_kind == CLUSTER_WAL_STARTUP_INITIALIZED;
+	if (initialized && root->header.lineage_kind != PGRAC_CONTROL_LINEAGE_CREATION_V1)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 	seed = initialized && out->formation_epoch == 0;
 	if (out->phase < CLUSTER_WAL_STARTUP_RESERVED || out->phase > CLUSTER_WAL_STARTUP_DURABLE
 		|| (out->input_kind != CLUSTER_WAL_STARTUP_CLEAN
@@ -2074,7 +2089,8 @@ read_one_image(const char *path, const uint8 current_uuid[16], uint64 current_sy
 static bool
 same_immutable_header(const ControlRootImage *left, const ControlRootImage *right)
 {
-	return left->header.system_identifier == right->header.system_identifier
+	return left->header.lineage_kind == right->header.lineage_kind
+		   && left->header.system_identifier == right->header.system_identifier
 		   && memcmp(left->header.storage_uuid, right->header.storage_uuid, 16) == 0
 		   && memcmp(left->header.authority_uuid, right->header.authority_uuid, 16) == 0
 		   && memcmp(left->header.migration_round_sha256, right->header.migration_round_sha256,
@@ -2562,7 +2578,8 @@ cluster_control_root_restore_bit22_latch_if_active(void)
 	if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return false;
-	if (primary.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+	if (primary.header.lineage_kind != PGRAC_CONTROL_LINEAGE_MIGRATION_V1
+		|| primary.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
 		|| (primary.header.target_feature_bitmap
 			& PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1)
 			   == 0
@@ -2597,7 +2614,8 @@ cluster_control_root_bootstrap_validate_active_round(
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
-	if (primary.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+	if (primary.header.lineage_kind != PGRAC_CONTROL_LINEAGE_MIGRATION_V1
+		|| primary.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
 		|| memcmp(primary.header.migration_round_sha256, sha, PG_SHA256_DIGEST_LENGTH) != 0)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (token != NULL)
@@ -2633,7 +2651,8 @@ cluster_control_root_bootstrap_validate_active_round_fields(uint64 transition_ep
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
-	if (primary.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+	if (primary.header.lineage_kind != PGRAC_CONTROL_LINEAGE_MIGRATION_V1
+		|| primary.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
 		|| primary.header.migration_transition_epoch != transition_epoch
 		|| primary.header.migration_prepare_generation != prepare_generation
 		|| primary.header.source_feature_bitmap != source_feature_bitmap

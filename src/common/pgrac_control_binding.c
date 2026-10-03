@@ -48,8 +48,13 @@ static bool
 binding_valid(const PgracControlBinding *binding)
 {
 	return binding != NULL && binding->system_identifier != 0 && binding->database_incarnation != 0
-		   && binding->node_id < PGRAC_CONTROL_BINDING_MAX_NODES && binding->reserved == 0
-		   && binding->migration_prepare_generation != 0 && binding->migration_transition_epoch != 0
+		   && binding->node_id < PGRAC_CONTROL_BINDING_MAX_NODES
+		   && ((binding->lineage_kind == PGRAC_CONTROL_LINEAGE_MIGRATION_V1
+				&& binding->migration_prepare_generation != 0
+				&& binding->migration_transition_epoch != 0)
+			   || (binding->lineage_kind == PGRAC_CONTROL_LINEAGE_CREATION_V1
+				   && binding->migration_prepare_generation == 1
+				   && binding->migration_transition_epoch == 0))
 		   && !binding_zero(binding->storage_uuid, 16) && !binding_zero(binding->authority_uuid, 16)
 		   && !binding_zero(binding->migration_round_sha256, 32)
 		   && !binding_zero(binding->source_wal_state_sha256, 32);
@@ -95,9 +100,10 @@ pgrac_control_binding_encode(const PgracControlBinding *binding, uint8 *bytes, s
 		|| !binding_valid(binding))
 		return false;
 	memcpy(bytes, "PGCB", 4);
-	binding_put(bytes, 4, 2, 2);
+	binding_put(bytes, 4, binding->lineage_kind == PGRAC_CONTROL_LINEAGE_CREATION_V1 ? 3 : 2, 2);
 	binding_put(bytes, 6, PGRAC_CONTROL_BINDING_BYTES, 2);
 	binding_put(bytes, 8, UINT32_C(0x01020304), 4);
+	binding_put(bytes, 12, binding->lineage_kind, 4);
 	binding_put(bytes, 16, binding->system_identifier, 8);
 	memcpy(bytes + 24, binding->storage_uuid, 16);
 	memcpy(bytes + 40, binding->authority_uuid, 16);
@@ -121,9 +127,13 @@ pgrac_control_binding_decode(const uint8 *bytes, size_t length, PgracControlBind
 		memset(out, 0, sizeof(*out));
 	if (overlap || out == NULL || bytes == NULL || length != PGRAC_CONTROL_BINDING_BYTES)
 		return false;
-	if (memcmp(bytes, "PGCB", 4) != 0 || binding_get(bytes, 4, 2) != 2
+	if (memcmp(bytes, "PGCB", 4) != 0
+		|| !((binding_get(bytes, 4, 2) == 2
+			  && binding_get(bytes, 12, 4) == PGRAC_CONTROL_LINEAGE_MIGRATION_V1)
+			 || (binding_get(bytes, 4, 2) == 3
+				 && binding_get(bytes, 12, 4) == PGRAC_CONTROL_LINEAGE_CREATION_V1))
 		|| binding_get(bytes, 6, 2) != PGRAC_CONTROL_BINDING_BYTES
-		|| binding_get(bytes, 8, 4) != UINT32_C(0x01020304) || !binding_zero(bytes + 12, 4)
+		|| binding_get(bytes, 8, 4) != UINT32_C(0x01020304)
 		|| !binding_zero(bytes + 72, 80) || !binding_zero(bytes + 68, 4)
 		|| !binding_zero(bytes + 232, 16) || !binding_zero(bytes + 252, 4)
 		|| binding_get(bytes, 248, 4) != binding_crc(bytes))
@@ -134,6 +144,7 @@ pgrac_control_binding_decode(const uint8 *bytes, size_t length, PgracControlBind
 	memcpy(decoded.authority_uuid, bytes + 40, 16);
 	decoded.database_incarnation = binding_get(bytes, 56, 8);
 	decoded.node_id = binding_get(bytes, 64, 4);
+	decoded.lineage_kind = binding_get(bytes, 12, 4);
 	memcpy(decoded.migration_round_sha256, bytes + 152, 32);
 	memcpy(decoded.source_wal_state_sha256, bytes + 184, 32);
 	decoded.migration_prepare_generation = binding_get(bytes, 216, 8);

@@ -33,6 +33,10 @@ initialized_fixture(uint8 bytes[1536], ControlRootImage *root, bool seed, uint32
 {
 	uint8 *record = bytes + 256, *claim = bytes + 1280;
 	startup_fixture(bytes, root, phase);
+	root->header.lineage_kind = PGRAC_CONTROL_LINEAGE_CREATION_V1;
+	root->header.migration_prepare_generation = 1;
+	root->header.migration_transition_epoch = 0;
+	root->header.source_feature_bitmap = 0;
 	root->header.v2.config_generation = 1;
 	root->header.v2.control_image_generation = 1;
 	root->header.v2.catalog_manifest_generation = 1;
@@ -349,4 +353,87 @@ UT_TEST(test_initialized_cohort_overlap_never_changes_input)
 		&sources, inputs), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
 	UT_ASSERT_EQ(memcmp(&sources, &before, sizeof(sources)), 0);
 	UT_ASSERT_EQ(inputs[0][0], 0x33);
+}
+
+UT_TEST(test_creation_root_codec_has_separate_literal_domain)
+{
+	ControlRootImage root, decoded;
+	uint8 input[1536];
+
+	initialized_fixture(input, &root, true, 1);
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	UT_ASSERT(root.bytes[64] == 0x15 && v2_zero(root.bytes + 65, 7));
+	UT_ASSERT(root.bytes[164] == 1 && v2_zero(root.bytes + 165, 7));
+	UT_ASSERT(v2_zero(root.bytes + 172, 8));
+	UT_ASSERT_EQ(cluster_control_root_v3_decode(root.bytes, sizeof(root.bytes),
+		root.header.storage_uuid, root.header.system_identifier, &decoded), 0);
+	UT_ASSERT_EQ(decoded.header.lineage_kind, PGRAC_CONTROL_LINEAGE_CREATION_V1);
+	UT_ASSERT(memcmp(root.header.migration_round_sha256,
+		decoded.header.migration_round_sha256, 32) == 0);
+}
+
+UT_TEST(test_creation_root_rejects_mixed_flags_and_fake_open)
+{
+	ControlRootImage root, decoded;
+	uint8 input[1536], bytes[CLUSTER_CONTROL_ROOT_FILE_BYTES];
+	static const struct { unsigned offset; uint64 value; } invalid[] = {
+		{64, 0x1d}, {64, 0x35}, {164, 0}, {164, 2}, {172, 1}, {180, 1}
+	};
+
+	initialized_fixture(input, &root, true, 1);
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	for (unsigned i = 0; i < lengthof(invalid); i++) {
+		memcpy(bytes, root.bytes, sizeof(bytes));
+		put_u64_le(bytes + invalid[i].offset, invalid[i].value);
+		v2_checksums(bytes);
+		UT_ASSERT(cluster_control_root_v3_decode(bytes, sizeof(bytes), root.header.storage_uuid,
+			root.header.system_identifier, &decoded) != 0);
+		UT_ASSERT(v2_zero(&decoded, sizeof(decoded)));
+	}
+	memcpy(bytes, root.bytes, sizeof(bytes));
+	put_u16_le(bytes + 4, 2);
+	put_u16_le(bytes + 72, 2);
+	put_u16_le(bytes + 74, 2);
+	v2_checksums(bytes);
+	UT_ASSERT_EQ(cluster_control_root_v2_decode(bytes, sizeof(bytes), root.header.storage_uuid,
+		root.header.system_identifier, &decoded), CLUSTER_CONTROL_ROOT_BAD_VERSION);
+	root.header.lineage_kind = 2;
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), CLUSTER_CONTROL_ROOT_BAD_VERSION);
+}
+
+UT_TEST(test_initialized_kind_requires_creation_root)
+{
+	uint8 bytes[1536];
+	ControlRootImage root;
+	ClusterWalStartupImage input;
+
+	for (unsigned seed = 0; seed < 2; seed++) {
+		initialized_fixture(bytes, &root, seed != 0, 1);
+		root.header.lineage_kind = PGRAC_CONTROL_LINEAGE_MIGRATION_V1;
+		UT_ASSERT(cluster_control_root_v3_startup_decode(bytes, sizeof(bytes), &root, 0, &input) != 0);
+		UT_ASSERT(v2_zero(&input, sizeof(input)));
+	}
+}
+
+UT_TEST(test_bootstrap_binding_never_crosses_lineage_domain)
+{
+	ControlRootImage root;
+	PgracControlBinding binding;
+	uint8 input[1536];
+
+	initialized_fixture(input, &root, true, 1);
+	memset(&binding, 0, sizeof(binding));
+	binding.system_identifier = root.header.system_identifier;
+	binding.database_incarnation = root.header.v2.database_incarnation;
+	memcpy(binding.storage_uuid, root.header.storage_uuid, 16);
+	memcpy(binding.authority_uuid, root.header.authority_uuid, 16);
+	memcpy(binding.migration_round_sha256, root.header.migration_round_sha256, 32);
+	memcpy(binding.source_wal_state_sha256, root.header.source_wal_state_sha256, 32);
+	binding.migration_prepare_generation = root.header.migration_prepare_generation;
+	binding.migration_transition_epoch = root.header.migration_transition_epoch;
+	binding.lineage_kind = root.header.lineage_kind;
+	UT_ASSERT_EQ(cluster_control_bootstrap_root_bound(&binding, &root), 0);
+	binding.lineage_kind = PGRAC_CONTROL_LINEAGE_MIGRATION_V1;
+	UT_ASSERT_EQ(cluster_control_bootstrap_root_bound(&binding, &root),
+		CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
 }
