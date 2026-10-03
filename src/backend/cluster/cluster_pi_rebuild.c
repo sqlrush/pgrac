@@ -97,11 +97,10 @@ pi_rebuild_add(void *arg, const RelFileLocator *locator, ForkNumber forknum, Blo
 	PiRebuildContribution *item;
 	int home;
 
-	/* The source's exact durable recovery terminal discharged this executor.
-	 * Keep decoding its records and checking the physical suffix, but do not
-	 * recreate a holder that can no longer answer a physical-PI request. */
-	if (job->recovered_end != InvalidXLogRecPtr)
-		return token != 0;
+	/* PGRAC: an exact RECOVERY_COMPLETE prefix qualifies only the ROOT chain.
+	 * A recovered writer's responsibility is rebuilt like any other; only
+	 * the recovered acknowledgement (actual DATA, its exact DEAD boot and the
+	 * complete master cut) discharges it, never this single ROOT value. */
 	if (token == 0 || job->source_node < 0 || job->source_node >= 32
 		|| XLogRecPtrIsInvalid(job->source_lsn))
 		return false;
@@ -149,6 +148,7 @@ pi_rebuild_record(XLogReaderState *record, const ClusterWalSourceRef *source,
 		job->source_valid = true;
 		(void)cluster_wal_inputs_recovered_prefix_v1(job->inputs, source, &job->recovered_end);
 	}
+	/* A recovered source still ends exactly at its recovered prefix. */
 	if (job->recovered_end != InvalidXLogRecPtr
 		&& (record->EndRecPtr <= record->ReadRecPtr || record->EndRecPtr > job->recovered_end))
 		return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
