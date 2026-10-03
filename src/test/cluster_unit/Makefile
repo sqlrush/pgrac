@@ -4434,7 +4434,13 @@ test_cluster_fence: test_cluster_fence.c unit_test.h \
 # spec-5.15 D2: cluster_reconfig.o now references cluster_membership_attach (and
 # the membership-state accessors in the tick), so the standalone test links
 # cluster_membership.o too; cluster_qvotec_in_quorum is stubbed in the test.
-test_cluster_reconfig: test_cluster_reconfig.c unit_test.h \
+test_cluster_qvotec_baseline.inc: $(top_srcdir)/src/backend/cluster/cluster_qvotec.c Makefile
+	awk '/^qvotec_build_baseline_marker\(/ { emit=1; count++; print "static void" } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_reconfig: test_cluster_reconfig.c unit_test.h test_cluster_qvotec_baseline.inc \
 		$(CLUSTER_VERSION_O) $(CLUSTER_RECONFIG_O) $(CLUSTER_EPOCH_O) \
 		$(CLUSTER_EPOCH_BALLOT_O) \
 		$(CLUSTER_TOUCHED_PEERS_O) $(CLUSTER_MEMBERSHIP_O) \
