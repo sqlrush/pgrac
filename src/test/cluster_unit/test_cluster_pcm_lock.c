@@ -243,9 +243,14 @@ cluster_lms_get_shard_master_generation(void)
 	return ut_lms_master_generation;
 }
 
+static int fake_lms0_wakeup_count;
+
 void
-cluster_lms_wakeup(int worker_id pg_attribute_unused())
-{}
+cluster_lms_wakeup(int worker_id)
+{
+	if (worker_id == 0)
+		fake_lms0_wakeup_count++;
+}
 
 #define FAKE_PCM_MAX_ENTRIES 24
 #define FAKE_PCM_ENTRY_BYTES 1232
@@ -20634,11 +20639,114 @@ UT_TEST(test_local_pi_redeclare_busy_or_unknown_scope_keeps_original_cursor)
 	local_pi_writer_ready = cluster_shared_config = false;
 }
 
+/* Exercise the production pump against the real PCM registry and clock.
+ * Only the OS wake/capability/ring and local callback boundaries are doubles. */
+static int pump_delivery_calls;
+
+static uint64
+lms_outbound_monotonic_us(void)
+{
+	return fake_pcm_clock_us;
+}
+
+uint32
+cluster_ic_local_capability_word(void)
+{
+	return PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+}
+
+bool
+cluster_sf_peer_capability_word_sample(int32 node, uint32 required, uint32 *cap, uint32 *gen)
+{
+	UT_ASSERT(node >= 0 && node < RESOURCE_X_PROTOCOL_NODE_LIMIT);
+	*cap = required;
+	*gen = 61;
+	return true;
+}
+
+ResourceXApplyResult
+cluster_gcs_block_resource_x_delivery_tick(const ResourceXAcquisitionRef *ref)
+{
+	ResourceXInstallClaimJoinObservation observation;
+	ResourceXDeliveryTarget target;
+	ResourceXDeliveryClaim claim;
+
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_target_snapshot_exact(ref, &observation,
+																		   &target),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_begin_exact(
+					 ref, &target, RESOURCE_X_DELIVERY_NORMAL, fake_pcm_clock_us, &claim),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_claim_end_exact(&claim),
+				 RESOURCE_X_APPLY_APPLIED);
+	pump_delivery_calls++;
+	return RESOURCE_X_APPLY_BAD_STATE;
+}
+
+ResourceXApplyResult
+cluster_gcs_block_resource_x_source_finish_tick(const ResourceXAcquisitionRef *ref)
+{
+	(void)ref;
+	UT_ASSERT(false); /* No source-finish work in this fixture. */
+	return RESOURCE_X_APPLY_BAD_STATE;
+}
+
+#include "test_cluster_pcm_lms_intent_pump.inc"
+
+UT_TEST(test_real_pcm_pump_continues_past_sixteenth_delivery)
+{
+	int i;
+
+	reset_fake_pcm_runtime(24);
+	MyBackendType = B_LMS;
+	cluster_node_id = 2;
+	fake_gcs_master_node = 0;
+	fake_pcm_clock_us = 1000000;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	for (i = 0; i < 17; i++) {
+		BufferTag tag = make_tag(287 + i);
+		ResourceXAssertion assertion;
+		ResourceXDecodedFrame request;
+		ResourceXAcquisitionRef terminal;
+		ResourceXInstallClaimJoinObservation observation;
+		ClusterPcmOwnSnapshot own = { 0 };
+
+		UT_ASSERT(resource_x_assertion_init(&tag, 2, &assertion));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+						 &assertion, 0, 17, 31, 77, 51, 61, 4000000, 3000000,
+						 1000000, 10000, false, 0, &request, &terminal),
+					 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_install_claim_join_observe_exact(
+						 &assertion, 0, 17, 31, 77, 51, 61, &observation),
+					 RESOURCE_X_APPLY_APPLIED);
+		own.tag = tag;
+		own.generation = 7;
+		own.pcm_state = PCM_STATE_N;
+		own.buffer_type = BUF_TYPE_CURRENT;
+		own.semantic_buf_state = BM_TAG_VALID | BM_VALID;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_delivery_bind_target_exact(
+						 &observation, i, &own, &own), RESOURCE_X_APPLY_APPLIED);
+	}
+	fake_pcm_clock_us = 1100000;
+	fake_lms0_wakeup_count = pump_delivery_calls = 0;
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 0);
+	UT_ASSERT_EQ(pump_delivery_calls, 16);
+	UT_ASSERT_EQ(fake_lms0_wakeup_count, 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 0);
+	UT_ASSERT_EQ(pump_delivery_calls, 17);
+	/* All callbacks remain BUSY, but their retry slices exclude another claim. */
+	fake_lms0_wakeup_count = 0;
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 0);
+	UT_ASSERT_EQ(pump_delivery_calls, 17);
+	UT_ASSERT_EQ(fake_lms0_wakeup_count, 0);
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(312);
+	UT_PLAN(313);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -20951,6 +21059,7 @@ main(void)
 	UT_RUN(test_local_pi_read_only_carrier_does_not_create_writer_responsibility);
 	UT_RUN(test_local_pi_redeclare_does_not_need_resident_buffer_or_current_authority);
 	UT_RUN(test_local_pi_redeclare_busy_or_unknown_scope_keeps_original_cursor);
+	UT_RUN(test_real_pcm_pump_continues_past_sixteenth_delivery);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

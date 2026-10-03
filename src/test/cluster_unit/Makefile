@@ -4679,6 +4679,15 @@ test_cluster_pcm_stop_fields.inc: $(top_srcdir)/src/backend/cluster/cluster_pcm_
 	     END { if (forward != 1 || round != 1 || entry != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Use the actual bounded pump and its limits with the real PCM fixture.
+test_cluster_pcm_lms_intent_pump.inc: $(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c Makefile
+	awk '/^#define PGRAC_LMS_RESOURCE_X_PROBE_BUDGET / { print; probe++ } \
+	     /^#define PGRAC_LMS_RESOURCE_X_CALLS_PER_TICK / { print; calls++ } \
+	     /^cluster_lms_outbound_resource_x_intent_pump\(/ { print "int"; emit=1; pump++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (probe != 1 || calls != 1 || pump != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait_consumer.inc \
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
@@ -4688,6 +4697,7 @@ test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h test_cluster_pcm_wait
 		test_cluster_pcm_source_replay.inc \
 		test_cluster_pcm_source_replay_consumer.inc \
 		test_cluster_pcm_ready_scheduler.inc \
+		test_cluster_pcm_lms_intent_pump.inc \
 		$(CLUSTER_VERSION_O) test_cluster_pcm_lock_clock_product.o $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
