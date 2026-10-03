@@ -90,7 +90,7 @@ exercise(enum Fault value)
 		if (fault == ALIAS) UT_ASSERT(symlinkat("original", parent, "object") == 0);
 	}
 	if (fault == UNSAFE) UT_ASSERT(fchmod(parent, 0777) == 0);
-	UT_ASSERT(origin_write_new(parent, "object", bytes, sizeof(bytes)) == (fault == NONE || fault == PARTIAL));
+	UT_ASSERT(cluster_initdb_object_write_new(parent, "object", bytes, sizeof(bytes)) == (fault == NONE || fault == PARTIAL));
 	if (fault == NONE || fault == PARTIAL)
 	{
 		fd = openat(parent, "object", O_RDONLY);

@@ -4,6 +4,8 @@ use strict;
 use warnings;
 use Cwd qw(realpath);
 use Digest::SHA qw(sha256_hex);
+use File::Copy qw(copy);
+use JSON::PP qw(decode_json);
 use PostgreSQL::Test::Utils;
 use Test::More;
 
@@ -126,6 +128,31 @@ for my $node (0 .. 3)
 	}
 }
 is(scalar keys %generations, 4, 'four independent writer directories');
+my @controls = glob("$temp/valid-data/global/control_images/1-*.bin");
+is(scalar @controls, 1, 'cohort has one immutable common control image');
+my @catalogs = glob("$temp/valid-data/global/catalog_checkpoints/1-*.json");
+is(scalar @catalogs, 1, 'cohort has an explicit initial catalog manifest');
+if (@controls == 1)
+{
+	my $bytes = slurp_file($controls[0]);
+	is(length $bytes, 8192, 'common native control has exact original size');
+	like($controls[0], qr/1-\Q@{[sha256_hex($bytes)]}\E\.bin$/, 'common control name selects exact bytes');
+	mkdir "$temp/common-read" or die "mkdir: $!";
+	mkdir "$temp/common-read/global" or die "mkdir: $!";
+	copy($controls[0], "$temp/common-read/global/pg_control") or die "copy: $!";
+	command_like(['pg_controldata', "$temp/common-read"], qr/Database system identifier:\s+$sysid\b/,
+		'original native reader validates the common image');
+}
+if (@catalogs == 1)
+{
+	my $bytes = slurp_file($catalogs[0]);
+	my $expected = {version => 1, generation => '1', entries => [], database_identity => {
+		authority_uuid => '123456789abc4ef0923456789abcdef0', database_incarnation => '1',
+		storage_uuid => $storage, system_identifier => $sysid }};
+	is_deeply(decode_json($bytes), $expected, 'empty catalog manifest has original database identity');
+	is($bytes, JSON::PP->new->canonical->encode($expected) . "\n", 'initial manifest uses canonical JSON');
+	like($catalogs[0], qr/1-\Q@{[sha256_hex($bytes)]}\E\.json$/, 'catalog manifest name selects exact bytes');
+}
 my $source = sha256_hex(slurp_file("$temp/valid-caches/node_0/global/pg_control"));
 command_fails_like([options('valid')], qr/INITDB_COHORT_/,
 	'new invocation refuses prior complete or partial preparation');

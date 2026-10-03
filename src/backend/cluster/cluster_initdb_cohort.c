@@ -21,6 +21,7 @@
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "cluster_initdb_origin_private.h"
+#include "cluster_initdb_common_private.h"
 #include "../../bin/initdb/pgrac_wal.h"
 #include "../../bin/initdb/pgrac_side.h"
 
@@ -483,6 +484,57 @@ create_peer_side(const InitdbDirectory *shared, InitdbOrigin *origins,
 		refuse("cannot complete original native SIDE namespace");
 }
 
+static void
+create_common_objects(const InitdbDirectory *shared, InitdbOrigin *origins,
+					  const ClusterSharedConfigRef *config)
+{
+	const ControlFileData *sources[CLUSTER_CONTROL_ROOT_RECORD_COUNT] = {0};
+	ClusterInitdbCommon common;
+	InitdbDirectory global = {0};
+	const char *directories[] = {"control_images", "catalog_checkpoints"};
+	char hex[65], name[96];
+
+	for (int node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++)
+	{
+		if (!(config->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64)))) continue;
+		control_read(&origins[node], node + 1, config->identity.system_identifier, false);
+		sources[node] = &origins[node].control;
+	}
+	if (!cluster_initdb_common_build(config, sources, &common))
+		refuse("original cohort common control fields disagree");
+	directory_current(shared);
+	global.parent = shared->fd;
+	global.parent_identity = shared->identity;
+	strlcpy(global.name, "global", sizeof(global.name));
+	if (snprintf(global.path, sizeof(global.path), "%s/global", shared->path) >= sizeof(global.path))
+		refuse("original global path is too long");
+	global.fd = openat(shared->fd, global.name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (global.fd < 0 || fstat(global.fd, &global.identity) != 0 || !owned_directory(&global.identity))
+		refuse("original global directory is invalid");
+	directory_current(&global);
+	for (unsigned i = 0; i < lengthof(directories); i++)
+	{
+		InitdbDirectory objects, staging;
+		const uint8 *hash = i == 0 ? common.control_sha256 : common.catalog_sha256;
+		const uint8 *bytes = i == 0 ? common.control : common.catalog;
+		Size length = i == 0 ? sizeof(common.control) : common.catalog_length;
+		create_child(&global, directories[i], &objects);
+		create_child(&objects, ".staging", &staging);
+		for (unsigned j = 0; j < 32; j++) snprintf(hex + j * 2, 3, "%02x", hash[j]);
+		snprintf(name, sizeof(name), "1-%s.%s", hex, i == 0 ? "bin" : "json");
+		if (!cluster_initdb_object_write_new(objects.fd, name, bytes, length))
+			refuse("cannot persist original common control/catalog object");
+		directory_current(&objects);
+		directory_current(&staging);
+		if (fsync(staging.fd) != 0 || fsync(objects.fd) != 0
+			|| close(staging.fd) != 0 || close(objects.fd) != 0)
+			refuse("cannot persist original common object directories");
+	}
+	directory_current(&global);
+	if (fsync(global.fd) != 0 || close(global.fd) != 0)
+		refuse("cannot complete original common objects");
+}
+
 void
 ClusterInitdbCohortMain(int argc, char **argv)
 {
@@ -547,6 +599,7 @@ ClusterInitdbCohortMain(int argc, char **argv)
 	request_current(&request, ref);
 	create_peer_side(&roots[1], origins, ref);
 	create_origin_objects(&roots[1], origins, ref, incarnation);
+	create_common_objects(&roots[1], origins, ref);
 	for (int node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++)
 	{
 		InitdbOrigin *origin = &origins[node];

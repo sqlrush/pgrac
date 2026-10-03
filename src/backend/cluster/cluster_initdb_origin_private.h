@@ -15,4 +15,8 @@ extern bool cluster_initdb_origin_create(const ClusterSharedConfigRef *config,
 	uint32 node, int64 created_at, int wal_fd, int anchor_fd,
 	const ControlFileData *control, ClusterWalHistoryRecord *out);
 
+/* Bounded original-object I/O, not creation ownership or selection proof. */
+extern bool cluster_initdb_object_write_new(int directory, const char *name,
+	const uint8 *bytes, Size length);
+
 #endif

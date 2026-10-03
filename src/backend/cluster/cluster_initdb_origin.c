@@ -37,17 +37,19 @@ origin_same(const struct stat *left, const struct stat *right)
 
 /* No overwrite, rename or cleanup of an unselected partial result. Reopen
  * the name after fsync, compare actual bytes and persist its directory entry. */
-static bool
-origin_write_new(int directory, const char *name, const uint8 *bytes, Size length)
+bool
+cluster_initdb_object_write_new(int directory, const char *name, const uint8 *bytes, Size length)
 {
 	struct stat parent, current, file, named;
-	uint8 readback[CLUSTER_RECOVERY_ANCHOR_SIZE + 1];
+	uint8 readback[PG_CONTROL_FILE_SIZE + 1];
 	Size used = 0;
 	ssize_t n;
 	int fd = -1;
 	bool ok = false;
 
-	if (length == 0 || length >= sizeof(readback) || fstat(directory, &parent) != 0
+	if (bytes == NULL || name == NULL || name[0] == '\0' || strchr(name, '/') != NULL
+		|| strcmp(name, ".") == 0 || strcmp(name, "..") == 0
+		|| length == 0 || length >= sizeof(readback) || fstat(directory, &parent) != 0
 		|| !S_ISDIR(parent.st_mode) || parent.st_uid != geteuid()
 		|| (parent.st_mode & 0022) != 0)
 		return false;
@@ -173,8 +175,8 @@ cluster_initdb_origin_create(const ClusterSharedConfigRef *config, uint32 node,
 	for (unsigned i = 0; i < 32; i++)
 		snprintf(hex + i * 2, 3, "%02x", anchor_ref.anchor_sha256[i]);
 	snprintf(name, sizeof(name), "anchor_1-%s.bin", hex);
-	if (!origin_write_new(wal_fd, CLUSTER_WAL_THREAD_CLAIM_FILENAME, claim_bytes, sizeof(claim_bytes))
-		|| !origin_write_new(anchor_fd, name, anchor_bytes, sizeof(anchor_bytes)))
+	if (!cluster_initdb_object_write_new(wal_fd, CLUSTER_WAL_THREAD_CLAIM_FILENAME, claim_bytes, sizeof(claim_bytes))
+		|| !cluster_initdb_object_write_new(anchor_fd, name, anchor_bytes, sizeof(anchor_bytes)))
 		return false;
 	record->identity = claim.identity;
 	record->root_publish_seq = 1;
