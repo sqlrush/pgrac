@@ -4,6 +4,7 @@ use strict;
 use warnings;
 use Cwd qw(realpath);
 use File::Copy qw(copy);
+use File::Path qw(make_path);
 use PostgreSQL::Test::Utils;
 use Test::More;
 
@@ -54,10 +55,16 @@ ok(IPC::Run::run(['pg_controldata', $data], '>', \$control, '2>', \$stderr),
 my ($sysid) = $control =~ /Database system identifier:\s+(\d+)/;
 my ($checkpoint) = $control =~ /Latest checkpoint location:\s+([0-9A-F]+\/[0-9A-F]+)/;
 like($control, qr/Database cluster state:\s+shut down/, 'original writer shut down');
+# pg_checksums accepts native DATA pages, not relmap authority envelopes.
+# Hard-link every actual DATA/SPACE file into a separate verifier tree; metadata
+# is checked below through its full image, never fed to a page checksum parser.
+my $verifier = "$temp/page-verifier";
+make_path("$verifier/pg_tblspc");
 my ($files, $pages, $wrong, $ordinary, $space) = (0, 0, 0, 0, 0);
 for my $dir ("$data/global", sort grep { -d $_ && /\/\d+$/ } glob("$data/base/*"))
 {
 	(my $rel = $dir) =~ s/^\Q$data\E\///;
+	make_path("$verifier/$rel");
 	my %relations;
 	for my $source (sort glob("$dir/*"))
 	{
@@ -68,6 +75,7 @@ for my $dir ("$data/global", sort grep { -d $_ && /\/\d+$/ } glob("$data/base/*"
 		$files++;
 		my $original = slurp_file($source);
 		my $result = slurp_file("$shared/$rel/$name");
+		link("$shared/$rel/$name", "$verifier/$rel/$name") or die "link DATA verifier: $!";
 		$wrong++ if length($original) != length($result) || length($result) % 8192;
 		for (my $off = 0; $off < length($original); $off += 8192)
 		{
@@ -87,6 +95,8 @@ for my $dir ("$data/global", sort grep { -d $_ && /\/\d+$/ } glob("$data/base/*"
 	for my $number (sort keys %relations)
 	{
 		my $bytes = slurp_file("$shared/$rel/${number}_space");
+		link("$shared/$rel/${number}_space", "$verifier/$rel/${number}_space")
+			or die "link SPACE verifier: $!";
 		$space++;
 		$wrong++ unless length($bytes) == 2 * 8192
 			&& substr($bytes, 32, 4) eq 'PSI1'
@@ -105,11 +115,8 @@ ok(!-e "$shared/global/pgrac_control_root" && !-e "$data/global/pgrac_control_bi
 command_ok(['pg_checksums', '--check', '-D', $data], 'original native DATA checksums remain valid');
 # Only the isolated verifier tree receives a compatibility control copy.
 # It is not a product authority or input to any startup.
-copy("$data/global/pg_control", "$shared/global/pg_control") or die "copy verifier control: $!";
-mkdir "$shared/pg_tblspc" or die "create verifier tablespace directory: $!";
-command_ok(['pg_checksums', '--check', '-D', $shared], 'actual shared DATA and SPACE checksums verify');
-unlink "$shared/global/pg_control" or die "remove verifier control: $!";
-rmdir "$shared/pg_tblspc" or die "remove verifier tablespace directory: $!";
+copy("$data/global/pg_control", "$verifier/global/pg_control") or die "copy verifier control: $!";
+command_ok(['pg_checksums', '--check', '-D', $verifier], 'actual shared DATA and SPACE checksums verify');
 my ($records, $err);
 ok(IPC::Run::run(['pg_waldump', '-p', $wal, '-s', '0/1000000', '-e', $checkpoint,
 	'-r', 'Storage'], '>', \$records, '2>', \$err),
@@ -138,5 +145,24 @@ for my $part ('pg_xact', 'pg_subtrans', 'pg_multixact/offsets',
 }
 is($side_wrong, 0, 'all original native SIDE bytes persist in the founder namespace');
 ok($side_files >= 3, 'real initial SLRU segments were checked');
+
+my @map_paths = ('global', 'base/1', 'base/4', 'base/5');
+for my $part (@map_paths)
+{
+	my $path = "$shared/$part/pgrac_relmap_authority";
+	my $map = slurp_file("$data/$part/pg_filenode.map");
+	my $image = -f $path ? slurp_file($path) : '';
+	my $dbid = $part eq 'global' ? 0 : (split '/', $part)[1];
+	ok(length($image) == 2120
+		&& unpack('Q', substr($image, 8, 8)) == 1
+		&& unpack('Q', substr($image, 16, 8)) == 0
+		&& substr($image, 30, 26) eq "\0" x 26
+		&& unpack('L', substr($image, 24, 4)) == $dbid
+		&& unpack('C', substr($image, 28, 1)) == ($dbid ? 0 : 1)
+		&& unpack('L', substr($image, 56, 4)) == length($map)
+		&& substr($image, 72, length($map)) eq $map
+		&& substr($image, 1096, length($map)) eq $map,
+		"$part original native map has a committed generation-one authority");
+}
 
 done_testing();

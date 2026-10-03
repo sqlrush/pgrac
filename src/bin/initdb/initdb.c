@@ -95,6 +95,7 @@
 #include "storage/bufpage.h"
 #include "pgrac_wal.h"
 #include "pgrac_side.h"
+#include "pgrac_relmap.h"
 #endif
 
 
@@ -3948,10 +3949,12 @@ pgrac_native_sync(void)
 		if (control->track_commit_timestamp
 			|| !pgrac_initdb_side_create(pgrac_native_data_fd, pgrac_native_base_fd))
 			pg_fatal("INITDB_SIDE_CREATE: original native SIDE creation failed");
+		if (!pgrac_initdb_relmap_create(pgrac_native_data_fd, pgrac_native_base_fd))
+			pg_fatal("INITDB_RELMAP_CREATE: original relmap authority creation failed");
 		pgrac_native_check_directories(&data_st, &wal_st);
 		after = pgrac_native_control();
 		if (memcmp(control, after, sizeof(*control)) != 0)
-			pg_fatal("INITDB_SIDE_CREATE: native control changed during SIDE creation");
+			pg_fatal("INITDB_BASE_CREATE: native control changed during shared state creation");
 		free(after);
 	}
 	free(control);
