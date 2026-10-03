@@ -8571,6 +8571,157 @@ failure_v2_open_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/*
+ * PGRAC (S9P2-05): an OPEN generation the founder seals itself is read under
+ * the open preconditions only.  Its serving bit may still be set; the seal
+ * clears it.  Author: SqlRush <sqlrush@gmail.com>
+ */
+static ClusterControlRootResult
+failure_v2_self_open_read(const ClusterRecoverySerialRequest *request, FailureInputV2Work *work,
+						  LOCKMODE mode)
+{
+	ClusterControlRootResult result;
+	ClusterControlRootFileToken file_token;
+	const ClusterControlRootSnapshot *record;
+	int index = request->duty.origin_thread_id - 1;
+
+	if (!cluster_cf_lock(mode))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = mode;
+	if (!cluster_cf_held_is_clusterwide(mode))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	result = read_thread_version(&request->duty, &work->base, &work->control, &file_token,
+								 work->format_version);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	make_read_token(&work->base, request->duty.origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
+					&work->token);
+	if (!read_token_equal(&work->token, &request->expected_root_token))
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	record = &work->base.records[index];
+	if (work->base.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| work->base.header.v2.database_state < CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+		|| work->base.header.v2.database_state > CLUSTER_CONTROL_ROOT_DATABASE_OPEN
+		|| record->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if (work->base.header.file_txn_seq == UINT64_MAX || record->root_publish_seq == UINT64_MAX)
+		return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
+	return failure_v2_current(request, work) ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+											 : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+/*
+ * PGRAC (S9P2-05): the founder seals its own OPEN generation -- OPEN to
+ * RECOVERY_REQUIRED together with the validated tail -- in one
+ * compare-and-swap.  An OPEN record whose retained lower is behind its
+ * native redo is readable only with its tail; publishing the open step alone
+ * (failure_v2_open_work clears the tail) would leave a root that its own
+ * reader and every retry reject.  The record keeps its original range and
+ * tail until the sealed tail replaces them; the lower never moves.  The tail
+ * is observed outside CF and observed again under CF X before publication,
+ * as for the fenced tail step.  Author: SqlRush <sqlrush@gmail.com>
+ */
+static ClusterControlRootResult
+failure_v2_self_seal_work(const ClusterRecoverySerialRequest *request, FailureInputV2Work *work)
+{
+	ClusterControlRootResult result;
+	ClusterControlRootFileToken file_token;
+	ClusterWalTailObservation fresh;
+	ClusterWalPinResult retained;
+	ClusterControlRootSnapshot *record;
+	XLogRecPtr lower;
+	int index = request->duty.origin_thread_id - 1;
+
+	retained = cluster_wal_retention_root_publish_begin_exact(&request->expected_root_token, false,
+															  &work->walr);
+	if (retained != CLUSTER_WAL_PIN_OK)
+		return retained == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+												 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	result = failure_v2_self_open_read(request, work, ShareLock);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	record = &work->base.records[index];
+	if (work->control.checkPoint < record->checkpoint_lower_lsn
+		|| work->control.checkPoint == UINT64_MAX)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	work->source_ref.claim.identity = record->identity;
+	work->source_ref.claim.database_incarnation = work->base.header.v2.database_incarnation;
+	work->source_ref.claim.max_config_generation = work->base.header.v2.config_generation;
+	memcpy(work->source_ref.claim.claim_sha256, work->base.refs[index].claim_sha256, 32);
+	work->source_ref.timeline = record->checkpoint_tli;
+	work->cf_mode = NoLock;
+	result = release_cf(ShareLock, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_wal_tail_observe_checkpoint(
+		cluster_wal_threads_dir, &work->source_ref, wal_segment_size, record->checkpoint_lower_lsn,
+		work->control.checkPoint + 1, work->control.checkPoint, record->checkpoint_record_crc32c,
+		&work->tail);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	/* The evidence is checked again with the root under CF X. */
+	result = failure_v2_self_open_read(request, work, ExclusiveLock);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	record = &work->base.records[index];
+	lower = record->checkpoint_lower_lsn;
+	result = cluster_wal_tail_observe_checkpoint(cluster_wal_threads_dir, &work->source_ref,
+												 wal_segment_size, lower, work->tail.complete_end,
+												 work->control.checkPoint,
+												 record->checkpoint_record_crc32c, &fresh);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(&fresh, &work->tail, sizeof(fresh)) != 0)
+		return CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
+	work->next = work->base;
+	record = &work->next.records[index];
+	record->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	/* As the open step: the failed writer's unsafe-FPW history survives. */
+	record->root_flags
+		= (record->root_flags & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF)
+		  | CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+		  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID
+		  | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+	record->tail_tli = record->checkpoint_tli;
+	record->tail_validation_kind = CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
+	record->validated_tail_lsn_exclusive = work->tail.complete_end;
+	record->tail_last_record_lsn = work->tail.last_record_start;
+	record->tail_last_record_crc32c = work->tail.last_record_crc;
+	record->recovered_tli = record->checkpoint_tli;
+	record->recovered_through_lsn_exclusive = lower;
+	record->recovered_last_record_lsn = 0;
+	record->recovered_last_record_crc32c = 0;
+	record->conservative_bound_kind = CLUSTER_CONTROL_ROOT_BOUND_NONE;
+	record->conservative_commit_scn = 0;
+	record->lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_FAILURE_TAIL_VALIDATED;
+	record->root_publish_seq++;
+	record->published_at_usec = GetCurrentTimestamp();
+	work->next.publisher_node[index] = work->publisher_node;
+	work->next.publisher_incarnation[index] = work->publisher_incarnation;
+	work->next.header.v2.serving[request->duty.origin_node_id / 64]
+		&= ~(UINT64_C(1) << (request->duty.origin_node_id % 64));
+	work->next.header.file_txn_seq++;
+	work->next.header.published_at_usec = record->published_at_usec;
+	result = encode_extended_image(&work->next, work->format_version);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!failure_v2_current(request, work))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (!publish_updated_image(&work->base, &work->next))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	result = read_thread_version(&request->duty, &work->base, &work->control, &file_token,
+								 work->format_version);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(work->base.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
+		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
+	if (!failure_v2_current(request, work))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	make_read_token(&work->base, request->duty.origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
+					&work->token);
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 static ClusterControlRootResult
 failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRootSnapshot *out,
 				   ClusterControlRootReadToken *out_token, bool seal_tail, uint16 version,
@@ -8615,8 +8766,9 @@ failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRo
 		if (!failure_v2_authorized(request, work))
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		else
-			result = seal_tail ? failure_v2_tail_work(request, work)
-							   : failure_v2_open_work(request, work);
+			result = seal_tail	  ? failure_v2_tail_work(request, work)
+					 : work->self ? failure_v2_self_seal_work(request, work)
+								  : failure_v2_open_work(request, work);
 	}
 	PG_CATCH();
 	{
@@ -8668,10 +8820,12 @@ cluster_control_root_v3_failure_tail_publish(const ClusterRecoverySerialRequest 
 
 /*
  * PGRAC (S9P2-05, PU-D-5): seal this node's own crashed generation -- OPEN
- * to RECOVERY_REQUIRED, then the validated tail -- with the self-seal
- * evidence instead of an external fence (self_predecessor_authorized).  A
- * generation already sealed with its tail is reported as it is.  Each step
- * is a compare-and-swap on the root just read.  Author: SqlRush
+ * to RECOVERY_REQUIRED with the validated tail -- with the self-seal
+ * evidence instead of an external fence (self_predecessor_authorized).  An
+ * OPEN generation is sealed in one compare-and-swap so that every published
+ * root stays readable (failure_v2_self_seal_work); a RECOVERY_REQUIRED one
+ * without its tail (left by an earlier sealer) gets the tail step; one
+ * already sealed with its tail is reported as it is.  Author: SqlRush
  * <sqlrush@gmail.com>
  */
 ClusterControlRootResult

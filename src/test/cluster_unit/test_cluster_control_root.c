@@ -18555,6 +18555,23 @@ self_seal_done(void)
 	cluster_shared_config = false;
 }
 
+/* Whether the published root still lists node as serving. */
+static bool
+self_seal_serving(const ClusterControlRootIdentity *self)
+{
+	ControlRootImage root;
+	ControlFileData view;
+	ClusterControlRootFileToken token;
+	int node = self->origin_node_id;
+	bool serving;
+
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(self, &root, &view, &token), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	serving = (root.header.v2.serving[node / 64] & (UINT64_C(1) << (node % 64))) != 0;
+	return serving;
+}
+
 UT_TEST(test_v3_self_seal_seals_own_crashed_generation)
 {
 	uint8 before[66048], after[66048];
@@ -18564,7 +18581,9 @@ UT_TEST(test_v3_self_seal_seals_own_crashed_generation)
 	char path[MAXPGPATH];
 
 	self_seal_fixture(before, &request, false);
+	UT_ASSERT(self_seal_serving(&request.duty));
 	UT_ASSERT_EQ(cluster_control_root_v3_self_seal_v1(&test_restart_ref, 3000000, &out, &token), 0);
+	UT_ASSERT(!self_seal_serving(&request.duty));
 	if (ut_current_failed) {
 		self_seal_done();
 		return;
@@ -19022,6 +19041,90 @@ v3_retained_lower_fixture(uint8 published[66048], ClusterControlRootIdentity *se
 	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
 	read_all_or_abort(path, published, 66048);
 	return lower;
+}
+
+/* The founder's one compare-and-swap re-checks its evidence, the WAL tail
+ * and the root under CF X; a change after the first observation publishes
+ * nothing.  Author: SqlRush <sqlrush@gmail.com> */
+static int test_self_seal_late_change;
+
+static void
+self_seal_late_change(void)
+{
+	uint8 bytes[66048];
+	char primary[MAXPGPATH];
+
+	test_checkpoint_x_hook = NULL;
+	if (test_self_seal_late_change == 0)
+		test_death_proven = false;
+	else if (test_self_seal_late_change == 1)
+		v2_checkpoint_append_noop();
+	else {
+		path_for(primary, sizeof(primary), CLUSTER_CONTROL_ROOT_REL_PATH);
+		read_all_or_abort(primary, bytes, sizeof(bytes));
+		bytes[16]++; /* another publisher changed the common sequence */
+		v2_checksums(bytes);
+		v2_write_roots(bytes);
+	}
+}
+
+UT_TEST(test_v3_self_seal_rechecks_evidence_wal_and_root_under_cf_x)
+{
+	for (int change = 0; change < 3; change++) {
+		uint8 before[66048];
+		ClusterRecoverySerialRequest request;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootReadToken token;
+
+		self_seal_fixture(before, &request, false);
+		test_self_seal_late_change = change;
+		test_checkpoint_x_hook = self_seal_late_change;
+		UT_ASSERT(cluster_control_root_v3_self_seal_v1(&test_restart_ref, 3000000, &out, &token)
+				  != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+		if (change == 2) {
+			before[16]++;
+			v2_checksums(before);
+		}
+		v2_assert_primary_unchanged(before);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		if (ut_current_failed)
+			printf("# self-seal late change %d\n", change);
+		test_checkpoint_x_hook = NULL;
+		self_seal_done();
+	}
+}
+
+/* A integration reproducer (A hold 16c44655e9): a self-seal over a root
+ * whose CR16 lower is behind the native redo must stay readable while the
+ * tail is unsealed and after it is sealed, and keep the lower. */
+UT_TEST(test_v3_self_seal_keeps_dual_range_until_tail_is_sealed)
+{
+	uint8 before[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate;
+	ClusterControlRootFileToken census;
+	ClusterControlRootReadToken token;
+	ClusterControlRootSnapshot out;
+	XLogRecPtr lower = v3_retained_lower_fixture(before, &self, &candidate, &census);
+
+	UT_ASSERT(lower < candidate.checkPointCopy.redo);
+	test_failure_formation = test_failure_needs = test_failure_admissions = false;
+	MyBackendType = B_STARTUP;
+	cluster_node_id = self.origin_node_id;
+	test_self_incarnation = test_membership_incarnation = self.origin_owner_incarnation + 1;
+	test_member_state = CLUSTER_MEMBER_MEMBER;
+	test_reserve_mode = test_reserve_quorum = true;
+	test_restart_ref = test_checkpoint_prefix_ref;
+	test_restart_ref_valid = test_death_proven = true;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(1, &self, &out, &token), 0);
+	UT_ASSERT_EQ(out.checkpoint_lower_lsn, lower);
+	UT_ASSERT_EQ(cluster_control_root_v3_self_seal_v1(&test_restart_ref, 3000000, &out, &token), 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(1, &self, &out, &token), 0);
+	UT_ASSERT_EQ(out.checkpoint_lower_lsn, lower);
+	UT_ASSERT_EQ(cluster_control_root_v3_self_seal_v1(&test_restart_ref, 3000000, &out, &token), 0);
+	self_seal_done();
 }
 
 /* The lower moves forward to a census bound, never past the same-token
@@ -21909,7 +22012,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(419);
+	UT_PLAN(421);
 	UT_RUN(test_first_start_io_and_late_races_never_publish_authority);
 	UT_RUN(test_first_start_binds_original_inputs_without_clean_exit);
 	UT_RUN(test_first_start_rejects_incomplete_or_changed_formation);
@@ -22061,6 +22164,8 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_self_seal_seals_own_crashed_generation);
 	UT_RUN(test_v3_self_seal_resumes_a_sealed_generation_without_tail);
 	UT_RUN(test_v3_self_seal_refuses_without_each_evidence);
+	UT_RUN(test_v3_self_seal_keeps_dual_range_until_tail_is_sealed);
+	UT_RUN(test_v3_self_seal_rechecks_evidence_wal_and_root_under_cf_x);
 	UT_RUN(test_v3_checkpoint_publish_preserves_pending_and_real_wal_guards);
 	UT_RUN(test_v3_checkpoint_reads_retained_history_once);
 	UT_RUN(test_wal_prefix_identity_recheck_detects_a_changed_namespace);
