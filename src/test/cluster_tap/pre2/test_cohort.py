@@ -13,7 +13,12 @@ class CohortTest(unittest.TestCase):
 
     def render(self, layout):
         return request(layout, 'p3b_test', [f'10.0.0.{n+1}' for n in range(len(layout['nodes']))],
-                       '7584383251700000001', 'a'*32, 'b'*32)
+                       '7584383251700000001', 'a'*12+'4'+'a'*3+'8'+'a'*15, 'b'*32)
+
+    def test_root_authority_requires_native_uuid_v4(self):
+        with self.assertRaisesRegex(ValueError, 'authority UUID'):
+            request(self.layout(2), 'p3b_test', ['10.0.0.1', '10.0.0.2'],
+                    '7584383251700000001', '1'*32, '2'*32)
 
     def test_creation_identity_and_shared_quorum_mapping(self):
         for count in (2, 4):
