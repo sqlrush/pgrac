@@ -12,15 +12,24 @@
  *	  at or before its source's completion is history, the rest are
  *	  obligations (a record crossing the completion is refused).
  *
- *	  A history record is still needed when an obligation touches the same
- *	  page or SPACE block (the PAGE dependency rule of the online plan, see
- *	  rf_page_online_plan_dependency_prefix_v1), or when it carries a SIDE
- *	  owner class that has an obligation and no per-key ancestry yet.  A
+ *	  On a page or SPACE block, the obligations' earliest before-version is
+ *	  durable on disk (every earlier edge is history of a completed source),
+ *	  so recovery either applies that obligation to it or proves that the
+ *	  disk version descends from it through the later edges.  A history
+ *	  edge is therefore needed only if its result is newer than that
+ *	  before-version, or if it belongs to another segment incarnation than
+ *	  every obligation on the block (PU-D-7; this narrows
+ *	  rf_page_online_plan_dependency_prefix_v1, which keeps every edge of
+ *	  such a page).  Versions are compared in SCN total order and every edge
+ *	  must strictly advance its page (result after before), otherwise the
+ *	  census refuses.  A history record is also needed when it carries a
+ *	  SIDE owner class that has an obligation and no per-key ancestry yet.  A
  *	  history record that changes a relation's SPACE structure (CREATE,
  *	  TRUNCATE, or a DROP tombstone, including the drops of a COMMIT) is
  *	  always needed: its structural PI responsibility has no durable
  *	  retirement receipt yet (CR20), so its WAL is never released.  The
- *	  keys of obligations go into a fixed-size minimum sketch; collisions
+ *	  obligations go into a fixed-size sketch keeping, per bucket, the
+ *	  earliest before-version and the range of incarnations; collisions
  *	  only make the answer more conservative.  History edges are spooled to
  *	  a temporary file and compared after the census.  A source's bound is
  *	  the earliest needed history record, or its completion.
@@ -50,6 +59,7 @@
 #include "access/xlogreader.h"
 #include "cluster_control_root_private.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_wal_claim.h"
 #include "cluster/cluster_wal_inputs.h"
@@ -61,10 +71,9 @@
 #include "storage/buf_internals.h"
 #include "storage/buffile.h"
 
-/* 2^19 buckets of 8 bytes: 4 MiB, independent of the database size. */
-#define RETAINED_SKETCH_BITS 19
+/* 2^18 buckets of 40 bytes: 10 MiB, independent of the database size. */
+#define RETAINED_SKETCH_BITS 18
 #define RETAINED_SKETCH_BUCKETS (UINT32_C(1) << RETAINED_SKETCH_BITS)
-#define RETAINED_SKETCH_EMPTY UINT64_MAX
 #define RETAINED_BATCH 256
 #define RETAINED_SIDE_CLASSES 9
 
@@ -94,13 +103,24 @@ typedef struct RetainedEdge {
 	XLogRecPtr read_ptr;
 	uint32 source;
 	uint32 reserved_zero;
+	uint8 incarnation[16];
 } RetainedEdge;
+
+/*
+ * Obligations of every key hashed here: the earliest before-version and the
+ * lowest and highest segment incarnation.  Empty while inc_min > inc_max.
+ */
+typedef struct RetainedBucket {
+	SCN before;
+	uint8 inc_min[16];
+	uint8 inc_max[16];
+} RetainedBucket;
 
 typedef struct RetainedCutWork {
 	uint32 nsources;
 	int32 self;
 	RetainedSource sources[CLUSTER_WAL_INPUTS_MAX];
-	uint64 *sketch;
+	RetainedBucket *sketch;
 	uint32 obligation_side;
 	RetainedEdge batch[RETAINED_BATCH];
 	uint32 batch_count;
@@ -146,38 +166,75 @@ retained_bucket(uint64 key, int which)
 	return h & (RETAINED_SKETCH_BUCKETS - 1);
 }
 
-/* Remember the earliest before-version token of an obligation on key. */
 static void
-retained_sketch_add(uint64 *sketch, uint64 key, uint64 before_token)
+retained_sketch_init(RetainedBucket *sketch)
+{
+	for (uint32 i = 0; i < RETAINED_SKETCH_BUCKETS; i++) {
+		sketch[i].before = InvalidScn;
+		memset(sketch[i].inc_min, 0xff, 16);
+		memset(sketch[i].inc_max, 0, 16);
+	}
+}
+
+static inline bool
+retained_bucket_empty(const RetainedBucket *bucket)
+{
+	return memcmp(bucket->inc_min, bucket->inc_max, 16) > 0;
+}
+
+static void
+retained_bucket_incarnation(RetainedBucket *bucket, const uint8 incarnation[16])
+{
+	if (memcmp(incarnation, bucket->inc_min, 16) < 0)
+		memcpy(bucket->inc_min, incarnation, 16);
+	if (memcmp(incarnation, bucket->inc_max, 16) > 0)
+		memcpy(bucket->inc_max, incarnation, 16);
+}
+
+/*
+ * Remember an obligation on key: the version it starts from and its
+ * incarnations.  A chain start (no present before-version) records the
+ * smallest SCN, so it keeps every history edge of its incarnation.
+ */
+static void
+retained_sketch_add(RetainedBucket *sketch, uint64 key, SCN before,
+					const uint8 before_incarnation[16], const uint8 result_incarnation[16])
 {
 	for (int i = 0; i < 2; i++) {
-		uint64 *bucket = &sketch[retained_bucket(key, i)];
+		RetainedBucket *bucket = &sketch[retained_bucket(key, i)];
 
-		if (before_token < *bucket)
-			*bucket = before_token;
+		if (retained_bucket_empty(bucket) || scn_total_cmp(before, bucket->before) < 0)
+			bucket->before = before;
+		retained_bucket_incarnation(bucket, before_incarnation);
+		retained_bucket_incarnation(bucket, result_incarnation);
 	}
 }
 
 /*
- * A lower bound of the earliest obligation before-token on key, or EMPTY
- * when no obligation can be on it.  Each bucket holds the minimum of every
- * key hashed to it, hence the larger of the two is still <= the true value.
+ * PAGE dependency rule (PU-D-7).  No obligation can be on key if either of
+ * its buckets is empty.  Unless every obligation in both buckets has this
+ * edge's incarnation, keep it.  Otherwise the later of the two bucket minima
+ * is still at or before the true earliest before-version of key, so an edge
+ * whose result is not after it is a predecessor and is not needed.
  */
-static uint64
-retained_sketch_query(const uint64 *sketch, uint64 key)
+static bool
+retained_edge_needed(const RetainedBucket *sketch, uint64 key, SCN result,
+					 const uint8 incarnation[16])
 {
-	return Max(sketch[retained_bucket(key, 0)], sketch[retained_bucket(key, 1)]);
-}
+	SCN floor = InvalidScn;
 
-/*
- * PAGE dependency rule (approved CR16 semantics, as in
- * rf_page_online_plan_dependency_prefix_v1): while any edge of a page is an
- * obligation, every edge of that page is retained.
- */
-static inline bool
-retained_edge_needed(uint64 obligation_before, uint64 result_token pg_attribute_unused())
-{
-	return obligation_before != RETAINED_SKETCH_EMPTY;
+	for (int i = 0; i < 2; i++) {
+		const RetainedBucket *bucket = &sketch[retained_bucket(key, i)];
+
+		if (retained_bucket_empty(bucket))
+			return false;
+		if (memcmp(bucket->inc_min, incarnation, 16) != 0
+			|| memcmp(bucket->inc_max, incarnation, 16) != 0)
+			return true;
+		if (i == 0 || scn_total_cmp(bucket->before, floor) > 0)
+			floor = bucket->before;
+	}
+	return scn_total_cmp(result, floor) > 0;
 }
 
 static void
@@ -193,7 +250,8 @@ retained_spill(RetainedCutWork *work)
 }
 
 static void
-retained_history_edge(RetainedCutWork *work, uint64 key, uint64 result_token)
+retained_history_edge(RetainedCutWork *work, uint64 key, uint64 result_token,
+					  const uint8 incarnation[16])
 {
 	RetainedEdge *edge;
 
@@ -205,16 +263,18 @@ retained_history_edge(RetainedCutWork *work, uint64 key, uint64 result_token)
 	edge->result_token = result_token;
 	edge->read_ptr = work->current_read;
 	edge->source = work->current_source;
+	memcpy(edge->incarnation, incarnation, 16);
 	work->history_edges++;
 }
 
 static void
-retained_key_seen(RetainedCutWork *work, uint64 key, uint64 before_token, uint64 result_token)
+retained_key_seen(RetainedCutWork *work, uint64 key, SCN before, const uint8 before_incarnation[16],
+				  SCN result, const uint8 result_incarnation[16])
 {
 	if (work->current_history)
-		retained_history_edge(work, key, result_token);
+		retained_history_edge(work, key, result, result_incarnation);
 	else
-		retained_sketch_add(work->sketch, key, before_token);
+		retained_sketch_add(work->sketch, key, before, before_incarnation, result_incarnation);
 }
 
 static bool
@@ -230,10 +290,11 @@ retained_space(void *arg, const RfSideSpaceContributionV1 *space)
 		source->structure_first = work->current_read;
 	for (uint8 block = 0; block < 2; block++)
 		if ((space->page_mask & (1u << block)) != 0) {
-			/* A SPACE contribution has no before token: an obligation keeps
-			 * every history edge of the block, whatever the rule. */
+			/* A SPACE contribution carries no before-version: as an
+			 * obligation it keeps every history edge of its incarnation. */
 			retained_key_seen(work, retained_key(&space->result.key.locator, SPACE_FORKNUM, block),
-							  0, space->result_token[block]);
+							  InvalidScn, space->result.incarnation, space->result_token[block],
+							  space->result.incarnation);
 		}
 	return true;
 }
@@ -379,17 +440,23 @@ retained_record(XLogReaderState *record, const ClusterWalSourceRef *source,
 	for (uint32 i = 0; i < plan.component_count; i++) {
 		const RfDetachedComponentPlanV1 *component = &plan.components[i];
 		const DecodedBkpBlock *block = &decoded->blocks[component->block_id];
+		bool present;
 
 		if (component->owner == RF_DETACHED_COMPONENT_REBUILDABLE)
 			continue;
 		if (component->owner != RF_DETACHED_COMPONENT_PAGE_CODEC
 			|| component->page_class != RF_PAGE_CLASS_ORDINARY || plan.result_token == 0)
 			return work->detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
-		/* An unformatted or absent before-state is the start of the chain. */
-		retained_key_seen(
-			work, retained_key(&block->rlocator, block->forknum, block->blkno),
-			component->before_kind == RF_PAGE_STATE_PRESENT ? component->before.mutation_token : 0,
-			plan.result_token);
+		/* Every edge strictly advances its page; an unformatted or absent
+		 * before-state is the start of the chain. */
+		present = component->before_kind == RF_PAGE_STATE_PRESENT;
+		if (present && scn_total_cmp(plan.result_token, component->before.mutation_token) <= 0)
+			return work->detail = RF_PAGE_PROOF_DETAIL_ORDER_VIOLATION;
+		retained_key_seen(work, retained_key(&block->rlocator, block->forknum, block->blkno),
+						  present ? component->before.mutation_token : InvalidScn,
+						  present ? component->before.segment_incarnation
+								  : component->result.segment_incarnation,
+						  plan.result_token, component->result.segment_incarnation);
 	}
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
@@ -476,7 +543,7 @@ retained_fold(RetainedCutWork *work)
 			BufFileReadExact(work->spool, &edge, sizeof(edge));
 		else
 			edge = work->batch[i];
-		if (!retained_edge_needed(retained_sketch_query(work->sketch, edge.key), edge.result_token))
+		if (!retained_edge_needed(work->sketch, edge.key, edge.result_token, edge.incarnation))
 			continue;
 		work->retained_edges++;
 		retained_pin(&work->sources[edge.source], edge.read_ptr, CLUSTER_WAL_RETAINED_PIN_PAGE);
@@ -506,8 +573,8 @@ retained_census(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluster
 
 	if (!retained_sources(work, inputs, self))
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
-	work->sketch = palloc(sizeof(uint64) * RETAINED_SKETCH_BUCKETS);
-	memset(work->sketch, 0xff, sizeof(uint64) * RETAINED_SKETCH_BUCKETS);
+	work->sketch = palloc(sizeof(RetainedBucket) * RETAINED_SKETCH_BUCKETS);
+	retained_sketch_init(work->sketch);
 	result = cluster_wal_inputs_census_v1(inputs, retained_record, work, &records, detail);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		if (*detail == RF_PAGE_PROOF_DETAIL_OK)

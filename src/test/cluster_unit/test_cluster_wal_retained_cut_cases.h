@@ -59,9 +59,10 @@ UT_TEST(test_retained_cut_moves_to_native_redo_without_obligations)
 	UT_ASSERT_EQ(spool_creates, 0);
 }
 
-/* A peer obligation on a page keeps self's history edge on that page (the
- * earliest one), and nothing on other pages. */
-UT_TEST(test_retained_cut_peer_obligation_keeps_history_on_its_page)
+/* PU-D-7: on a page with an obligation, only history edges after the
+ * obligation's before-version are kept (they prove the disk version
+ * descends from it); its predecessors and other pages are released. */
+UT_TEST(test_retained_cut_peer_obligation_keeps_successors_on_its_page)
 {
 	uint32 self, peer;
 	ClusterWalRetainedCutV1 cut;
@@ -69,30 +70,102 @@ UT_TEST(test_retained_cut_peer_obligation_keeps_history_on_its_page)
 
 	two_writers(&self, &peer);
 	add_record(self, 0x1000, 0x1100, 100, 1, 2);
-	add_record(self, 0x1800, 0x1900, 200, 1, 2);
-	add_record(self, 0x2000, 0x2100, 200, 2, 3);
-	add_record(peer, 0x6000, 0x6100, 200, 3, 4); /* peer obligation on 200 */
+	add_record(self, 0x1400, 0x1500, 200, 1, 2); /* predecessor: released */
+	add_record(self, 0x1800, 0x1900, 200, 4, 5); /* successor of the obligation */
+	add_record(self, 0x2000, 0x2100, 200, 5, 6);
+	add_record(peer, 0x6000, 0x6100, 200, 3, 4); /* peer obligation 3 -> 4 */
 	UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	UT_ASSERT_EQ(cut.lower, 0x1800);
 	UT_ASSERT_EQ(cut.pin, CLUSTER_WAL_RETAINED_PIN_PAGE);
 	UT_ASSERT_EQ(cut.retained_edges, 2);
 }
 
-/* F-D-26: under the approved rule a page with an obligation keeps all its
- * edges, so a page that keeps changing holds the lower at its first edge. */
-UT_TEST(test_retained_cut_hot_page_keeps_its_first_edge)
+/* F-D-26 closed by PU-D-7: a page that keeps changing no longer holds the
+ * lower; only an edge newer than the earliest obligation's base would. */
+UT_TEST(test_retained_cut_hot_page_releases_predecessors)
 {
-	uint32 self, peer;
-	ClusterWalRetainedCutV1 cut;
-	RfPageProofDetailV1 detail;
+	for (int variant = 0; variant < 2; variant++) {
+		uint32 self, peer;
+		ClusterWalRetainedCutV1 cut;
+		RfPageProofDetailV1 detail;
 
-	two_writers(&self, &peer);
-	add_record(self, 0x1000, 0x1100, 300, 1, 2);
-	add_record(self, 0x2000, 0x2100, 300, 2, 3);
-	add_record(self, 0x3000, 0x3100, 300, 3, 4); /* own obligation, same page */
-	UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
-	UT_ASSERT_EQ(cut.lower, SELF_LOWER);
-	UT_ASSERT_EQ(cut.pin, CLUSTER_WAL_RETAINED_PIN_PAGE);
+		two_writers(&self, &peer);
+		add_record(self, 0x1000, 0x1100, 300, 1, 2);
+		add_record(self, 0x2000, 0x2100, 300, 2, 3);
+		add_record(self, 0x3000, 0x3100, 300, 3, 4); /* own obligation, same page */
+		if (variant == 1)							 /* an older peer obligation base */
+			add_record(peer, 0x6000, 0x6100, 300, 1, 7);
+		UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(cut.lower, variant == 0 ? SELF_REDO : 0x1000);
+		UT_ASSERT_EQ(cut.pin,
+					 variant == 0 ? CLUSTER_WAL_RETAINED_PIN_NONE : CLUSTER_WAL_RETAINED_PIN_PAGE);
+		if (ut_current_failed)
+			printf("# hot variant %d\n", variant);
+	}
+}
+
+/* An edge of another segment incarnation than every obligation on the block
+ * is kept whatever its version; a chain start (no present before-version)
+ * keeps every history edge of its incarnation. */
+UT_TEST(test_retained_cut_other_incarnation_is_kept)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		uint32 self, peer;
+		ClusterWalRetainedCutV1 cut;
+		RfPageProofDetailV1 detail;
+		FixtureRecord *history, *obligation;
+
+		two_writers(&self, &peer);
+		add_record(self, 0x1000, 0x1100, 100, 1, 2);
+		history = add_record(self, 0x1800, 0x1900, 400, 1, 2);
+		obligation = add_record(peer, 0x6000, 0x6100, 400, 3, 4);
+		if (variant == 1)
+			history->inc = 2; /* the obligation is on incarnation 1 */
+		else if (variant == 2) {
+			obligation->before_inc = 2; /* the obligation spans incarnations */
+			obligation->inc = 1;
+			history->inc = 2;
+		} else if (variant == 3)
+			obligation->before_kind[0] = RF_PAGE_STATE_UNFORMATTED;
+		UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(cut.lower, variant == 0 ? SELF_REDO : 0x1800);
+		if (ut_current_failed)
+			printf("# incarnation variant %d\n", variant);
+	}
+}
+
+/* Every edge must strictly advance its page in SCN total order (local part,
+ * then node id); otherwise nothing proves which edges precede the base. */
+UT_TEST(test_retained_cut_refuses_a_chain_that_does_not_advance)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		uint32 self, peer;
+		ClusterWalRetainedCutV1 cut;
+		RfPageProofDetailV1 detail;
+		FixtureRecord *r;
+		bool accepted = variant >= 2;
+
+		two_writers(&self, &peer);
+		add_record(self, 0x1000, 0x1100, 100, 1, 2);
+		r = add_record(variant % 2 == 0 ? self : peer, variant % 2 == 0 ? 0x1800 : 0x6000,
+					   variant % 2 == 0 ? 0x1900 : 0x6100, 500, 5, 5);
+		if (variant == 1)
+			r->result_token = 4; /* backwards */
+		else if (variant == 2) {
+			/* A raw integer comparison would call this backwards. */
+			r->before[0] = scn_encode(3, 10);
+			r->result_token = scn_encode(1, 11);
+		} else if (variant == 3) {
+			r->before[0] = scn_encode(1, 10); /* same local, later node */
+			r->result_token = scn_encode(2, 10);
+		}
+		UT_ASSERT_EQ(compute(&cut, &detail), accepted ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+													  : CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+		UT_ASSERT_EQ(detail,
+					 accepted ? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_ORDER_VIOLATION);
+		if (ut_current_failed)
+			printf("# order variant %d\n", variant);
+	}
 }
 
 /* A keyless SIDE class with any obligation keeps the earliest history record
@@ -175,7 +248,9 @@ UT_TEST(test_retained_cut_structure_change_pins_history)
 			r->end = SELF_REDO + 0x100;
 			expected = SELF_REDO;
 			pin = CLUSTER_WAL_RETAINED_PIN_NONE;
-		} else if (variant == 4) { /* an earlier page pin is the bound */
+		} else if (variant == 4) {	  /* an earlier page pin is the bound */
+			records[0].before[0] = 5; /* a successor of the peer obligation */
+			records[0].result_token = 6;
 			add_record(peer, 0x6000, 0x6100, 100, 4, 5);
 			expected = 0x1000;
 			pin = CLUSTER_WAL_RETAINED_PIN_PAGE;
@@ -212,7 +287,7 @@ UT_TEST(test_retained_cut_completion_by_lifecycle)
 			items[other].first_segment = 0x5000 - SizeOfXLogLongPHD;
 		}
 		add_record(self, 0x1000, 0x1100, 100, 1, 2);
-		add_record(self, 0x2000, 0x2100, 601, 2, 3);
+		add_record(self, 0x2000, 0x2100, 601, 5, 6);  /* after the other's 601 edge */
 		add_record(other, 0x5000, 0x5100, 600, 3, 4); /* before the other's redo */
 		add_record(other, 0x6800, 0x6900, 601, 4, 5); /* after its redo, before its tail */
 		UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
@@ -231,7 +306,7 @@ UT_TEST(test_retained_cut_never_moves_back)
 
 	two_writers(&self, &peer);
 	items[self].checkpoint.checkpoint_lower_lsn = 0x1800;
-	add_record(self, 0x1000, 0x1100, 700, 1, 2); /* older than the published lower */
+	add_record(self, 0x1000, 0x1100, 700, 3, 4); /* older than the published lower */
 	add_record(peer, 0x6000, 0x6100, 700, 2, 3);
 	UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	UT_ASSERT_EQ(cut.lower, 0x1800);
@@ -297,7 +372,7 @@ UT_TEST(test_retained_cut_spills_history_to_a_temp_file)
 	two_writers(&self, &peer);
 	for (uint32 i = 0; i < 600; i++)
 		add_record(self, 0x1000 + i * 8, 0x1000 + i * 8 + 8, 1000 + i, 1, 2);
-	add_record(peer, 0x6000, 0x6100, 1000 + 450, 2, 3);
+	add_record(peer, 0x6000, 0x6100, 1000 + 450, 1, 3); /* base older than edge 450 */
 	UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	UT_ASSERT_EQ(spool_creates, 1);
 	UT_ASSERT_EQ(cut.history_edges, 600);
@@ -305,27 +380,32 @@ UT_TEST(test_retained_cut_spills_history_to_a_temp_file)
 	UT_ASSERT(cut.retained_edges >= 1);
 }
 
-/* Each bucket keeps the minimum over every key hashed to it: a key's answer
- * is never above its own obligations, and EMPTY only when it has none. */
+/* Each bucket keeps the earliest base and the incarnation range of every
+ * key hashed to it: a key's answer is never less conservative than its own
+ * obligations, and a key with no obligation in either bucket keeps nothing. */
 UT_TEST(test_retained_sketch_is_conservative)
 {
-	uint64 *sketch = palloc(sizeof(uint64) * RETAINED_SKETCH_BUCKETS);
+	RetainedBucket *sketch = palloc(sizeof(RetainedBucket) * RETAINED_SKETCH_BUCKETS);
 	uint64 a = UINT64CONST(0x0000000500000003), b = UINT64CONST(0x0000000700000003);
+	uint64 twin = a | (UINT64CONST(1) << 20) | (UINT64CONST(1) << 52); /* both buckets of a */
 	uint64 c = UINT64CONST(0x0000000900000011);
+	uint8 one[16] = { 1 }, two[16] = { 2 };
 
-	memset(sketch, 0xff, sizeof(uint64) * RETAINED_SKETCH_BUCKETS);
-	UT_ASSERT_EQ(retained_sketch_query(sketch, a), RETAINED_SKETCH_EMPTY);
-	retained_sketch_add(sketch, a, 50);
-	retained_sketch_add(sketch, a, 40);
-	UT_ASSERT_EQ(retained_sketch_query(sketch, a), 40);
-	/* b shares a's first bucket only: still EMPTY. */
-	UT_ASSERT_EQ(retained_sketch_query(sketch, b), RETAINED_SKETCH_EMPTY);
-	retained_sketch_add(sketch, b, 10);
-	UT_ASSERT_EQ(retained_sketch_query(sketch, b), 10);
-	UT_ASSERT(retained_sketch_query(sketch, a) <= 40);
-	UT_ASSERT_EQ(retained_sketch_query(sketch, c), RETAINED_SKETCH_EMPTY);
-	UT_ASSERT(retained_edge_needed(retained_sketch_query(sketch, a), 1));
-	UT_ASSERT(!retained_edge_needed(retained_sketch_query(sketch, c), 1));
+	retained_sketch_init(sketch);
+	UT_ASSERT(!retained_edge_needed(sketch, a, 100, one));
+	retained_sketch_add(sketch, a, 50, one, one);
+	retained_sketch_add(sketch, a, 40, one, one);
+	UT_ASSERT(!retained_edge_needed(sketch, a, 40, one)); /* produced the base */
+	UT_ASSERT(retained_edge_needed(sketch, a, 41, one));
+	UT_ASSERT(retained_edge_needed(sketch, a, 1, two));	   /* another incarnation */
+	UT_ASSERT(!retained_edge_needed(sketch, b, 100, one)); /* one bucket is empty */
+	UT_ASSERT(!retained_edge_needed(sketch, c, 100, one));
+	retained_sketch_add(sketch, b, 10, one, one);		  /* shares only a's first bucket */
+	UT_ASSERT(!retained_edge_needed(sketch, a, 20, one)); /* a's own bucket bounds it */
+	retained_sketch_add(sketch, twin, 10, one, one);
+	UT_ASSERT(retained_edge_needed(sketch, a, 20, one)); /* the floor only drops */
+	retained_sketch_add(sketch, twin, 60, two, two);
+	UT_ASSERT(retained_edge_needed(sketch, a, 1, one)); /* mixed incarnations */
 	pfree(sketch);
 }
 
@@ -344,7 +424,7 @@ UT_TEST(test_retained_cut_driver_publishes_only_an_advance)
 	UT_ASSERT_EQ(publish_lower, SELF_REDO);
 	UT_ASSERT_EQ(log_count, 0);
 	/* Held at the published lower: no publication, one LOG. */
-	add_record(self, 0x3000, 0x3100, 100, 2, 3);
+	add_record(peer, 0x6000, 0x6100, 100, 1, 3); /* keeps the self edge 1 -> 2 */
 	cluster_wal_retained_cut_after_checkpoint_v1();
 	cluster_wal_retained_cut_after_checkpoint_v1();
 	UT_ASSERT_EQ(publish_calls, 1);

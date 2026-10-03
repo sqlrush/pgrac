@@ -112,6 +112,17 @@ errdetail(const char *fmt pg_attribute_unused(), ...)
 	return 0;
 }
 
+/* SCN total order: local part, then node id (never the raw integer). */
+int
+scn_total_cmp(SCN a, SCN b)
+{
+	if (scn_local(a) != scn_local(b))
+		return scn_local(a) < scn_local(b) ? -1 : 1;
+	if (scn_node_id(a) != scn_node_id(b))
+		return scn_node_id(a) < scn_node_id(b) ? -1 : 1;
+	return 0;
+}
+
 bool
 cluster_wal_claim_v2_ref_valid(const ClusterWalThreadClaimRefV2 *ref)
 {
@@ -178,6 +189,8 @@ typedef struct FixtureRecord {
 	uint32 owners;
 	Oid space_rel;
 	uint8 space_mask; /* 0: reservation (block 1); 3: structure change */
+	uint8 inc;		  /* result segment incarnation id, 0 means 1 */
+	uint8 before_inc; /* before incarnation id, 0 means inc */
 } FixtureRecord;
 
 static ClusterWalInputV1 items[MAX_ITEMS];
@@ -303,6 +316,12 @@ rf_page_detached_preflight_v1(XLogReaderState *record pg_attribute_unused(),
 		plan->components[b].page_class = RF_PAGE_CLASS_ORDINARY;
 		plan->components[b].before_kind = current->before_kind[b];
 		plan->components[b].before.mutation_token = current->before[b];
+		plan->components[b].before.segment_incarnation[0] = current->before_inc != 0
+																? current->before_inc
+															: current->inc != 0 ? current->inc
+																				: 1;
+		plan->components[b].result.segment_incarnation[0] = current->inc != 0 ? current->inc : 1;
+		plan->components[b].result.mutation_token = current->result_token;
 	}
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
@@ -323,6 +342,7 @@ rf_side_record_census_v1(const RfDetachedRecordPlanV1 *record_plan pg_attribute_
 		space.result.key.locator.spcOid = 1663;
 		space.result.key.locator.dbOid = 5;
 		space.result.key.locator.relNumber = current->space_rel;
+		space.result.incarnation[0] = current->inc != 0 ? current->inc : 1;
 		space.page_mask = current->space_mask != 0 ? current->space_mask : 2;
 		if (space.page_mask & 1)
 			space.result_token[0] = current->result_token;
@@ -451,10 +471,12 @@ compute(ClusterWalRetainedCutV1 *cut, RfPageProofDetailV1 *detail)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
 	UT_RUN(test_retained_cut_moves_to_native_redo_without_obligations);
-	UT_RUN(test_retained_cut_peer_obligation_keeps_history_on_its_page);
-	UT_RUN(test_retained_cut_hot_page_keeps_its_first_edge);
+	UT_RUN(test_retained_cut_peer_obligation_keeps_successors_on_its_page);
+	UT_RUN(test_retained_cut_hot_page_releases_predecessors);
+	UT_RUN(test_retained_cut_other_incarnation_is_kept);
+	UT_RUN(test_retained_cut_refuses_a_chain_that_does_not_advance);
 	UT_RUN(test_retained_cut_keyless_side_classes);
 	UT_RUN(test_retained_cut_space_obligation_keeps_space_history);
 	UT_RUN(test_retained_cut_structure_change_pins_history);
