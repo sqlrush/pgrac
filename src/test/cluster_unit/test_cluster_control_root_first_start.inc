@@ -250,6 +250,47 @@ UT_TEST(test_first_start_rejects_incomplete_or_changed_formation)
 	}
 }
 
+UT_TEST(test_first_start_d116_wal_refuses_before_any_root_write)
+{
+	for (unsigned node = 0; node <= 3; node += 3) {
+		uint8 before[66048], backup[66048], after[66048];
+		ControlRootImage root;
+		ClusterWalStartupImage op;
+		ClusterWalSourceRef restart;
+		ClusterControlRootResult result;
+		char path[MAXPGPATH];
+		uint16 old_magic = UINT16_C(0xD116);
+		int fd, renames;
+		XLogRecPtr at;
+
+		first_start_fixture(before, &root);
+		if (ut_current_failed) return;
+		restart = v3_driver_restart(&root, 0);
+		at = root.records[node].tail_last_record_lsn;
+		v2_checkpoint_wal_path(&root.records[node].identity, at,
+			root.records[node].checkpoint_tli, path);
+		fd = open(path, O_RDWR);
+		UT_ASSERT(fd >= 0);
+		UT_ASSERT_EQ(pwrite(fd, &old_magic, sizeof(old_magic),
+			(at % wal_segment_size) - (at % XLOG_BLCKSZ)), sizeof(old_magic));
+		UT_ASSERT_EQ(fsync(fd), 0);
+		UT_ASSERT_EQ(close(fd), 0);
+		path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_BAK_REL_PATH);
+		read_all_or_abort(path, backup, sizeof(backup));
+		renames = test_durable_rename_calls;
+		result = cluster_control_root_v3_startup_advance_clean(&restart, &op);
+		UT_ASSERT(result != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		UT_ASSERT(v2_zero(&op, sizeof(op)));
+		UT_ASSERT_EQ(test_durable_rename_calls, renames);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		v2_assert_primary_unchanged(before);
+		read_all_or_abort(path, after, sizeof(after));
+		UT_ASSERT(memcmp(backup, after, sizeof(backup)) == 0);
+	}
+}
+
 static void
 first_start_late_change(void)
 {

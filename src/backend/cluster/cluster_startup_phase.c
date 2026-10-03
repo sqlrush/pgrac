@@ -1723,10 +1723,9 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 	 * contract, while the StartupXLOG-side verify runs in the startup
 	 * process — which this postmaster phase machine does not fork until
 	 * phase 3 completes, so the startup verify can never precede the
-	 * formation wait.  Postmaster context has the loaded topology, so the
-	 * fresh nonce+ack rendezvous runs here; the StartupXLOG call remains
-	 * (idempotent — a second fresh rendezvous re-confirms and rewrites
-	 * the same CROSSNODE_VERIFIED state).
+	 * formation wait. Postmaster context has the loaded topology, so the
+	 * fresh nonce+ack rendezvous runs here. Canonical StartupXLOG consumes
+	 * this qualified contract; only legacy startup repeats the rendezvous.
 	 */
 	if (cluster_phase4_wal_state_configured())
 		cluster_cf_phase2_verify_or_fail(DataDir);

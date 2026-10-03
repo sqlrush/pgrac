@@ -85,6 +85,15 @@ my $founder_scn;
 for my $node (0 .. 3)
 {
 	my $data = "$temp/valid-caches/node_$node";
+	ok(-f "$data/global/pgrac_cf_contract", 'original creator supplies storage identity without qualification');
+	if (-f "$data/global/pgrac_cf_contract")
+	{
+		my $contract = slurp_file("$data/global/pgrac_cf_contract");
+		is(length $contract, 64, 'original storage contract retains the existing layout');
+		is(unpack('Q', substr($contract, 8, 8)), $sysid, 'storage contract binds the original system');
+		is(substr($contract, 16, 33), "$storage\0", 'storage contract binds the full compact UUID');
+		is(unpack('L', substr($contract, 52, 4)), 0, 'creation does not invent cross-node storage verification');
+	}
 	my $thread = $node + 1;
 	my $wal = readlink "$data/pg_wal";
 	like($wal, qr{^\Q$temp/valid-wal/thread_$thread/\Egeneration_[1-9][0-9]*$},
@@ -324,7 +333,8 @@ if (-f "$temp/valid-data/global/pgrac_control_root")
 		my ($generation) = $wal =~ /generation_([0-9]+)$/;
 		my ($anchor) = glob("$temp/valid-data/global/anchor_images/thread_$thread/generation_$generation/anchor_1-*.bin");
 		$origins .= pack('V', $node) . sha256(slurp_file("$temp/valid-caches/node_$node/global/pg_control"))
-			. tree_digest($wal, 0) . sha256(slurp_file("$wal/pgrac_thread.claim")) . sha256(slurp_file($anchor));
+			. tree_digest($wal, 0) . sha256(slurp_file("$wal/pgrac_thread.claim")) . sha256(slurp_file($anchor))
+			. slurp_file("$temp/valid-caches/node_$node/global/pgrac_cf_contract");
 		my $binding = slurp_file("$temp/valid-caches/node_$node/global/pgrac_control_binding");
 		is(length($binding), 256, 'local binding has exact length');
 		is(unpack('v', substr($binding, 4, 2)), 3, 'PGCB uses v3');
@@ -341,7 +351,7 @@ if (-f "$temp/valid-data/global/pgrac_control_root")
 		is(substr($root, 512 + $node * 512 + 336, 32), sha256($input), 'ROOT selects exact kind4 bytes');
 	}
 	my $native_hash = sha256($origins);
-	is(substr($root, 132, 32), $native_hash, 'ROOT binds all actual native control/WAL/claim/anchor bytes');
+	is(substr($root, 132, 32), $native_hash, 'ROOT binds all actual native control/WAL/claim/anchor/storage identity bytes');
 	my $cohort = "PGRAC-CREATION-COHORT-V1\0" . substr($root, 24, 8) . substr($root, 32, 32)
 		. substr($root, 200, 8) . substr($root, 216, 16) . substr($root, 4, 2)
 		. substr($root, 64, 8) . substr($root, 188, 8) . substr($root, 248, 40)

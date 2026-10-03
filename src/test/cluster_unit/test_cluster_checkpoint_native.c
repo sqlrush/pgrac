@@ -26,6 +26,7 @@
 #include "postmaster/startup.h"
 #include "storage/latch.h"
 #include "cluster/cluster_config_members.h"
+#include "cluster/cluster_recovery_anchor.h"
 #include "storage/fd.h"
 #include "storage/lwlock.h"
 #include "utils/wait_event.h"
@@ -39,6 +40,7 @@ UT_DEFINE_GLOBALS();
 bool cluster_shared_config = true, cluster_enabled = true;
 bool enableFsync = true;
 bool cluster_controlfile_shared_authority = true;
+char *DataDir = "/unused-native-adapter";
 AuxProcType MyAuxProcType = CheckpointerProcess;
 volatile uint32 CritSectionCount;
 volatile sig_atomic_t InterruptPending;
@@ -451,6 +453,8 @@ native_shutdown_begin(bool shutdown)
 }
 /* Only the native lock boundary is substituted. Actual candidate assignments,
  * CRC and old-writer dispatch below come from CreateCheckPoint. */
+#undef SpinLockAcquire
+#undef SpinLockRelease
 #define SpinLockAcquire(lock) ((void)(lock))
 #define SpinLockRelease(lock) ((void)(lock))
 static ControlFileData
@@ -900,6 +904,79 @@ startup_first_native_site(void)
 	return true;
 }
 
+static unsigned input_checks, legacy_probes, legacy_windows, legacy_anchors;
+static bool input_qualified;
+static ClusterRecoveryAnchor legacy_anchor;
+int cluster_node_id;
+void
+cluster_control_bootstrap_native_inputs_require(const char *pgdata pg_attribute_unused())
+{
+	input_checks++;
+	if (!input_qualified)
+		siglongjmp(error_boundary, 1);
+}
+static void
+cluster_cf_phase2_verify_or_fail(const char *pgdata pg_attribute_unused())
+{
+	legacy_probes++;
+}
+static void
+cluster_cf_enter_bootstrap_window_or_fail(void)
+{
+	legacy_windows++;
+}
+bool
+cluster_recovery_anchor_load(uint64 sysid pg_attribute_unused(), bool *bak)
+{
+	legacy_anchors++;
+	*bak = false;
+	return true;
+}
+const ClusterRecoveryAnchor *
+cluster_recovery_anchor_get(void)
+{
+	legacy_anchor.state = DB_SHUTDOWNED;
+	return &legacy_anchor;
+}
+#define CLUSTER_INJECTION_POINT(name) ((void)0)
+#define cluster_injection_should_skip(name) false
+static bool
+startup_control_site(void)
+{
+	if (sigsetjmp(error_boundary, 1))
+		return false;
+#include "test_cluster_startup_control_native.inc"
+	return true;
+}
+
+UT_TEST(shared_startup_does_not_adopt_legacy_control_authority)
+{
+	cluster_shared_config = cluster_enabled = cluster_controlfile_shared_authority = true;
+	input_qualified = true;
+	input_checks = legacy_probes = legacy_windows = legacy_anchors = 0;
+	UT_ASSERT(startup_control_site());
+	UT_ASSERT_EQ(input_checks, 1);
+	UT_ASSERT_EQ(legacy_probes, 0);
+	UT_ASSERT_EQ(legacy_windows, 0);
+	UT_ASSERT_EQ(legacy_anchors, 0);
+	input_qualified = false;
+	UT_ASSERT(!startup_control_site());
+	UT_ASSERT_EQ(input_checks, 2);
+	UT_ASSERT_EQ(legacy_probes + legacy_windows + legacy_anchors, 0);
+}
+
+UT_TEST(legacy_startup_keeps_its_control_authority_path)
+{
+	cluster_shared_config = false;
+	cluster_enabled = cluster_controlfile_shared_authority = true;
+	input_checks = legacy_probes = legacy_windows = legacy_anchors = 0;
+	UT_ASSERT(startup_control_site());
+	UT_ASSERT_EQ(input_checks, 0);
+	UT_ASSERT_EQ(legacy_probes, 1);
+	UT_ASSERT_EQ(legacy_windows, 1);
+	UT_ASSERT_EQ(legacy_anchors, 1);
+}
+
 /* PGRAC: actual directory validator on real scratch files, not a mocked
  * existence result. Only the ordinary mkdir wrapper is replaced.
  * Author: SqlRush <sqlrush@gmail.com> */
@@ -1288,8 +1365,10 @@ UT_TEST(native_startup_insert_has_no_link_or_page_from_predecessor)
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(35);
 	UT_RUN(clean_restart_uses_shutdown_checkpoint_above_retained_floor);
+	UT_RUN(shared_startup_does_not_adopt_legacy_control_authority);
+	UT_RUN(legacy_startup_keeps_its_control_authority_path);
 	UT_RUN(clean_restart_rejects_wrong_shutdown_tail_at_each_native_boundary);
 	UT_RUN(static_common_wait_precedes_initializer_and_native_directory);
 	UT_RUN(static_common_mismatch_or_cancel_never_writes);

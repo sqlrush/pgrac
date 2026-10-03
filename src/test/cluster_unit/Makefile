@@ -921,6 +921,16 @@ test_cluster_startup_early_native.inc: $(top_srcdir)/src/backend/access/transam/
 	     /^}/ { owner=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# Execute the control selection before native startup ownership is acquired.
+test_cluster_startup_control_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^StartupXLOG\(/ { owner=1 } \
+	     owner && /CurrentResourceOwner = AuxProcessResourceOwner;/ { boundary=1; next } \
+	     boundary && /^\#ifdef USE_PGRAC_CLUSTER/ { emit=1; boundary=0; count++ } \
+	     emit && /Check that contents look valid/ { complete=1; exit } \
+	     emit { if (have_line) print previous; previous=$$0; have_line=1 } \
+	     END { if (count != 1 || !complete) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_startup_directory_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^ValidateXLOGDirectoryStructure\(/ { print "static void"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
@@ -961,7 +971,7 @@ test_cluster_checkpoint_shutdown_begin.inc: $(top_srcdir)/src/backend/access/tra
 	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_startup_writer_native.inc test_cluster_startup_early_native.inc test_cluster_startup_directory_native.inc test_cluster_startup_insert_native.inc test_cluster_startup_lsn_native.inc test_cluster_startup_reserve_native.inc test_cluster_checkpoint_candidate.inc test_cluster_checkpoint_shutdown_begin.inc unit_test.h
+test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_startup_writer_native.inc test_cluster_startup_early_native.inc test_cluster_startup_control_native.inc test_cluster_startup_directory_native.inc test_cluster_startup_insert_native.inc test_cluster_startup_lsn_native.inc test_cluster_startup_reserve_native.inc test_cluster_checkpoint_candidate.inc test_cluster_checkpoint_shutdown_begin.inc unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # PGRAC: actual checkpoint scan, pin/refusal consumer and IO-completion bodies.

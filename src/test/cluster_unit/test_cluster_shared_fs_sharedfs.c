@@ -819,6 +819,65 @@ UT_TEST(test_sentinel_missing_file_fails_closed)
 	UT_ASSERT(!cluster_shared_fs_sentinel_has_participant(3));
 }
 
+UT_TEST(test_sentinel_uuid_from_shared_configuration)
+{
+	MirrorSharedControl m;
+	static char formatted[] = "01234567-89ab-cdef-0123-456789abcdef";
+	static char compact[] = "0123456789abcdef0123456789abcdef";
+
+	fresh_root("shared_config_uuid");
+	cluster_node_id = 0;
+	cluster_shared_storage_uuid = formatted;
+	cluster_shared_fs_sentinel_attach();
+	UT_ASSERT(read_mirror(&m));
+	UT_ASSERT_STR_EQ(m.storage_uuid, compact);
+	UT_ASSERT(cluster_shared_fs_sentinel_has_participant(0));
+	cluster_node_id = 1;
+	cluster_shared_storage_uuid = compact;
+	cluster_shared_fs_sentinel_attach();
+	UT_ASSERT(read_mirror(&m));
+	UT_ASSERT_STR_EQ(m.storage_uuid, compact);
+	UT_ASSERT_EQ(m.participant_count, 2);
+	cluster_shared_storage_uuid = NULL;
+}
+
+UT_TEST(test_sentinel_uuid_refusal_preserves_identity)
+{
+	static const char *bad[] = {
+		"0123456789abc-def-0123-456789abcdef",
+		"01234567_89ab-cdef-0123-456789abcdef",
+		"00000000-0000-0000-0000-000000000000",
+		"11234567-89ab-cdef-0123-456789abcdef"
+	};
+	MirrorSharedControl before, after;
+
+	for (unsigned i = 0; i < lengthof(bad); i++) {
+		pid_t child;
+		int status;
+
+		fresh_root("bad_uuid");
+		cluster_node_id = 0;
+		cluster_shared_storage_uuid = "01234567-89ab-cdef-0123-456789abcdef";
+		cluster_shared_fs_sentinel_attach();
+		UT_ASSERT(read_mirror(&before));
+		fflush(NULL);
+		child = fork();
+		UT_ASSERT(child >= 0);
+		if (child == 0) {
+			cluster_node_id = 1;
+			cluster_shared_storage_uuid = (char *)bad[i];
+			cluster_shared_fs_sentinel_attach();
+			_exit(0);
+		}
+		UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+		UT_ASSERT(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+		UT_ASSERT(read_mirror(&after));
+		UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+		UT_ASSERT(!cluster_shared_fs_sentinel_has_participant(1));
+	}
+	cluster_shared_storage_uuid = NULL;
+}
+
 
 /* Native descriptors enforce direct alignment on Linux. The explicit check in
  * the fd boundary also exercises that requirement on F_NOCACHE platforms. */
@@ -1019,7 +1078,7 @@ UT_TEST(test_direct_data_leaves_small_sentinel_buffered)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(19);
 	UT_RUN(test_sharedfs_roundtrip_and_owner_agnostic);
 	UT_RUN(test_sharedfs_extend_zero_fills);
 	UT_RUN(test_shared_catalog_create_rejects_existing_main);
@@ -1030,6 +1089,8 @@ main(void)
 	UT_RUN(test_sentinel_second_node_joins);
 	UT_RUN(test_sentinel_corrupt_fails_closed);
 	UT_RUN(test_sentinel_preset_uuid_recorded);
+	UT_RUN(test_sentinel_uuid_from_shared_configuration);
+	UT_RUN(test_sentinel_uuid_refusal_preserves_identity);
 	UT_RUN(test_sentinel_missing_file_fails_closed);
 	UT_RUN(test_direct_flags_and_all_relation_forks);
 	UT_RUN(test_direct_alignment_extension_and_sync);

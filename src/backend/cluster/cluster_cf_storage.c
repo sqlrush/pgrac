@@ -52,6 +52,7 @@
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
+#include "cluster_cf_contract_private.h"
 
 /* A node's local control path is always $PGDATA/global/pg_control. */
 #define CLUSTER_CF_LOCAL_REL "global/pg_control"
@@ -68,19 +69,6 @@ static const char cf_probe_nonce[] = "PGRAC_CF_RENAME_PROBE_v1";
  * and forces re-verification (fail-closed).  CRC-protected; a torn or corrupt
  * record reads as UNVERIFIED.
  */
-#define CLUSTER_CF_CONTRACT_MAGIC 0x43464354 /* 'CFCT' */
-#define CLUSTER_CF_CONTRACT_VERSION 2
-
-typedef struct ClusterCfContractRecord {
-	uint32 magic;
-	uint32 version;
-	uint64 authority_system_identifier; /* v2: this node's bound authority sysid */
-	char storage_uuid[CLUSTER_SHARED_UUID_LEN];
-	char _pad[3];  /* keep `state` 4-byte aligned */
-	uint32 state;  /* a ClusterCfContractState value */
-	pg_crc32c crc; /* over [0, offsetof(crc)) */
-} ClusterCfContractRecord;
-
 /*
  * cluster_cf_startup_verdict -- pure startup-gate decision.
  *

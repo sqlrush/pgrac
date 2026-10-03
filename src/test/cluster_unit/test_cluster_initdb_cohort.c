@@ -32,8 +32,8 @@ side_test_symlinkat(const char *path, int fd, const char *name)
 #undef fsync
 #undef symlinkat
 
-bool errstart(int level, const char *domain) { return true; }
-bool errstart_cold(int level, const char *domain) { return true; }
+bool errstart(int level, const char *domain) { return level >= ERROR; }
+bool errstart_cold(int level, const char *domain) { return level >= ERROR; }
 int errcode(int code) { return 0; }
 int errmsg(const char *format, ...) { return 0; }
 void errfinish(const char *file, int line, const char *func)
@@ -300,6 +300,65 @@ static void side_routes_retain_actual_original_directories(void)
 {
 	side_route_case(0, 0); side_route_case(0, 3);
 }
+
+static void storage_contract_is_original_unverified_and_rechecked(void)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		char temp[] = "/tmp/pgrac-storage-origin-XXXXXX", path[MAXPGPATH];
+		char *canonical;
+		InitdbDirectory base, global;
+		InitdbOrigin *origins = calloc(128, sizeof(*origins));
+		ClusterSharedConfigRef config = {0};
+		int fd;
+
+		UT_ASSERT(mkdtemp(temp) != NULL);
+		canonical = realpath(temp, NULL);
+		UT_ASSERT(canonical != NULL && origins != NULL);
+		snprintf(path, sizeof(path), "%s/new", canonical);
+		preflight_directory(path, &base); create_directory(&base);
+		create_child(&base, "node0", &origins[0].data);
+		create_child(&origins[0].data, "global", &global);
+		config.identity.configured[0] = 1;
+		config.identity.system_identifier = UINT64CONST(7584383251700000001);
+		memset(config.identity.storage_uuid, 0x12, 16);
+		create_storage_contracts(origins, &config);
+		UT_ASSERT_EQ(origins[0].storage_contract.state, 0);
+		UT_ASSERT_EQ(origins[0].storage_contract.authority_system_identifier,
+			config.identity.system_identifier);
+		UT_ASSERT_STR_EQ(origins[0].storage_contract.storage_uuid, "12121212121212121212121212121212");
+		creation_storage_current(&origins[0]);
+		if (fault == 0) {
+			struct stat identity = origins[0].storage_contract_identity;
+			expecting = true;
+			if (setjmp(refused) == 0) { create_storage_contracts(origins, &config); UT_ASSERT(false); }
+			expecting = false;
+			/* A failed creator exits in production; its output observation is
+			 * unspecified. Verify the original file itself was not replaced. */
+			UT_ASSERT(cluster_initdb_object_recheck(global.fd, "pgrac_cf_contract",
+				(const uint8 *)&origins[0].storage_contract, sizeof(ClusterCfContractRecord),
+				&identity));
+		} else {
+			if (fault == 1) {
+				fd = openat(global.fd, "pgrac_cf_contract", O_WRONLY);
+				UT_ASSERT(fd >= 0 && pwrite(fd, "X", 1, 16) == 1 && close(fd) == 0);
+			} else {
+				UT_ASSERT(renameat(global.fd, "pgrac_cf_contract", global.fd, "saved") == 0);
+				if (fault == 2)
+					UT_ASSERT(cluster_initdb_object_write_new(global.fd, "pgrac_cf_contract",
+						(const uint8 *)&origins[0].storage_contract, sizeof(ClusterCfContractRecord)));
+			}
+			expecting = true;
+			if (setjmp(refused) == 0) { creation_storage_current(&origins[0]); UT_ASSERT(false); }
+			expecting = false;
+		}
+		UT_ASSERT(faccessat(global.fd, "pgrac_control_root", F_OK, 0) != 0 && errno == ENOENT);
+		side_test_remove(base.fd);
+		UT_ASSERT(close(global.fd) == 0 && close(origins[0].data.fd) == 0);
+		UT_ASSERT(close(base.fd) == 0 && unlinkat(base.parent, base.name, AT_REMOVEDIR) == 0);
+		UT_ASSERT(close(base.parent) == 0 && rmdir(canonical) == 0);
+		free(canonical); free(origins);
+	}
+}
 static void side_routes_reject_unqualified_inputs_before_moving(void)
 {
 	for (unsigned fault = 1; fault <= 4; fault++) side_route_case(fault, 3);
@@ -351,7 +410,8 @@ main(int argc, char **argv)
 		for (;;) pause();
 	}
 	strlcpy(executable, argv[0], sizeof(executable));
-	UT_PLAN(8);
+	UT_PLAN(9);
+	UT_RUN(storage_contract_is_original_unverified_and_rechecked);
 	UT_RUN(side_routes_retain_actual_original_directories);
 	UT_RUN(side_routes_reject_unqualified_inputs_before_moving);
 	UT_RUN(side_route_io_failure_preserves_originals);

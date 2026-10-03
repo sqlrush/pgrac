@@ -21586,10 +21586,11 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(414);
+	UT_PLAN(415);
 	UT_RUN(test_first_start_io_and_late_races_never_publish_authority);
 	UT_RUN(test_first_start_binds_original_inputs_without_clean_exit);
 	UT_RUN(test_first_start_rejects_incomplete_or_changed_formation);
+	UT_RUN(test_first_start_d116_wal_refuses_before_any_root_write);
 	UT_RUN(test_initialized_complete_cohort_constructs_all_selected_inputs);
 	UT_RUN(test_initialized_cohort_refuses_incomplete_or_existing_sources);
 	UT_RUN(test_initialized_cohort_refuses_wrong_identity_or_geometry);
