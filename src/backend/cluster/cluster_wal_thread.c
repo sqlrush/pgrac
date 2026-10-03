@@ -43,8 +43,14 @@
 
 #include <sys/stat.h>
 #include <unistd.h>
+#include <limits.h>
+#include <fcntl.h>
 
 #include "access/xlog_internal.h" /* XLOGDIR */
+#include "access/transam.h"
+#include "catalog/catversion.h"
+#include "common/controldata_utils.h"
+#include "common/pgrac_initdb_wal.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw.h"
@@ -58,6 +64,7 @@
 #include "miscadmin.h" /* IsUnderPostmaster, DataDir */
 #include "port/atomics.h"
 #include "storage/fd.h" /* BasicOpenFile, pg_fsync */
+#include "storage/bufpage.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
 #include "utils/timestamp.h" /* GetCurrentTimestamp */
@@ -149,6 +156,142 @@ cluster_wal_thread_shmem_register(void)
  * ----------------------------------------------------------------
  */
 
+static PgracInitdbWalContext initdb_wal_context;
+
+/* BKI bootstrap finishes with a real shutdown checkpoint, but has not allocated
+ * any normal XID.  Post-bootstrap SQL necessarily advances it.  A valid pipe
+ * must not turn a completed database into initdb or change its WAL thread. */
+static bool
+initdb_bootstrap_wal_matches(const ControlFileData *control,
+							 const PgracInitdbWalContext *context)
+{
+	XLogLongPageHeaderData header;
+	const TimeLineID bootstrap_tli = 1; /* BootStrapXLOG's original timeline */
+	struct stat st;
+	char path[MAXPGPATH];
+	int fd;
+	ssize_t n;
+	bool valid;
+
+	if (!IsValidWalSegSize(control->xlog_seg_size)
+		|| control->checkPoint < (XLogRecPtr) control->xlog_seg_size + SizeOfXLogLongPHD
+		|| control->checkPointCopy.redo != control->checkPoint
+		|| U64FromFullTransactionId(control->checkPointCopy.nextXid) != FirstNormalTransactionId
+		|| control->checkPointCopy.ThisTimeLineID != bootstrap_tli)
+		return false;
+	XLogFilePath(path, bootstrap_tli, 1, control->xlog_seg_size);
+	fd = BasicOpenFile(path, O_RDONLY | PG_BINARY | O_NOFOLLOW);
+	if (fd < 0)
+		return false;
+	do { n = read(fd, &header, sizeof(header)); } while (n < 0 && errno == EINTR);
+	valid = n == sizeof(header) && fstat(fd, &st) == 0
+		&& S_ISREG(st.st_mode) && st.st_nlink == 1 && st.st_uid == geteuid()
+		&& st.st_size == control->xlog_seg_size
+		&& header.std.xlp_magic == XLOG_PAGE_MAGIC && header.std.xlp_info == XLP_LONG_HEADER
+		&& header.std.xlp_tli == bootstrap_tli
+		&& header.std.xlp_pageaddr == control->xlog_seg_size && header.std.xlp_rem_len == 0
+		&& header.std.xlp_thread_id == context->thread_id
+		&& header.std.xlp_cluster_flags == XLP_CLUSTER_FLAGS_RESERVED
+		&& header.xlp_sysid == context->system_identifier
+		&& header.xlp_seg_size == control->xlog_seg_size && header.xlp_xlog_blcksz == XLOG_BLCKSZ;
+	if (close(fd) != 0)
+		valid = false;
+	return valid;
+}
+
+/* The original frontend has already created and pinned these two new
+ * directories.  Consume its one-shot pipe before native control/WAL writes.
+ * This accepts no path, checkpoint, claim or authority supplied by a GUC.
+ */
+void
+cluster_wal_thread_initdb_accept(bool bootstrap)
+{
+	const char *value = getenv(PGRAC_INITDB_WAL_CONTEXT_ENV);
+	PgracInitdbWalContext context;
+	struct stat pipe_st, data_st, wal_st, control_st;
+	char *end;
+	long fd;
+	size_t got = 0;
+	char extra;
+	ssize_t n;
+
+	if (value == NULL)
+		return;
+	errno = 0;
+	fd = strtol(value, &end, 10);
+	if (IsUnderPostmaster || initdb_wal_context.thread_id != 0
+		|| value[0] < '0' || value[0] > '9' || *end != '\0' || errno != 0
+		|| fd < 3 || fd > INT_MAX || fstat((int) fd, &pipe_st) != 0
+		|| !S_ISFIFO(pipe_st.st_mode) || pipe_st.st_uid != geteuid())
+		ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: invalid original-creator pipe")));
+	/* Never wait for an untrusted or unfinished context producer. */
+	if (fcntl((int) fd, F_SETFL, O_NONBLOCK) < 0)
+		ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: cannot read creator pipe: %m")));
+	while (got < sizeof(context))
+	{
+		n = read((int) fd, (char *) &context + got, sizeof(context) - got);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: incomplete creator pipe")));
+		got += n;
+	}
+	do { n = read((int) fd, &extra, 1); } while (n < 0 && errno == EINTR);
+	if (n != 0 || close((int) fd) != 0 || unsetenv(PGRAC_INITDB_WAL_CONTEXT_ENV) != 0)
+		ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: creator pipe is not exactly closed")));
+	if (context.magic != PGRAC_INITDB_WAL_CONTEXT_MAGIC
+		|| context.thread_id == 0 || context.thread_id > CLUSTER_WAL_THREAD_MAX
+		|| context.phase != (bootstrap ? PGRAC_INITDB_WAL_BOOTSTRAP : PGRAC_INITDB_WAL_POSTBOOTSTRAP)
+		|| stat(".", &data_st) != 0 || stat(XLOGDIR, &wal_st) != 0
+		|| !S_ISDIR(data_st.st_mode) || !S_ISDIR(wal_st.st_mode)
+		|| data_st.st_uid != geteuid() || wal_st.st_uid != geteuid()
+		|| (data_st.st_mode & 0022) != 0 || (wal_st.st_mode & 0022) != 0
+		|| (uint64) data_st.st_dev != context.data_device
+		|| (uint64) data_st.st_ino != context.data_inode
+		|| (uint64) wal_st.st_dev != context.wal_device
+		|| (uint64) wal_st.st_ino != context.wal_inode)
+		ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: creator directory or phase changed")));
+	if (bootstrap)
+	{
+		if (lstat(XLOG_CONTROL_FILE, &control_st) == 0 || errno != ENOENT)
+			ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: bootstrap control already exists")));
+	}
+	else
+	{
+		ControlFileData *control;
+		bool crc_ok;
+		bool valid;
+
+		if (lstat(XLOG_CONTROL_FILE, &control_st) != 0 || !S_ISREG(control_st.st_mode)
+			|| control_st.st_nlink != 1 || control_st.st_uid != geteuid())
+			ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: invalid bootstrap control file")));
+		control = get_controlfile(DataDir, &crc_ok);
+		valid = crc_ok && context.system_identifier != 0
+			&& control->system_identifier == context.system_identifier
+			&& control->pg_control_version == PG_CONTROL_VERSION
+			&& control->catalog_version_no == CATALOG_VERSION_NO
+			&& control->state == DB_SHUTDOWNED
+			&& control->data_checksum_version == PG_DATA_CHECKSUM_VERSION
+			&& initdb_bootstrap_wal_matches(control, &context);
+		pfree(control);
+		if (!valid)
+			ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: bootstrap control identity changed")));
+	}
+	initdb_wal_context = context;
+}
+
+uint64
+cluster_wal_thread_initdb_system_identifier(void)
+{
+	return initdb_wal_context.system_identifier;
+}
+
+uint16
+cluster_wal_thread_initdb_stamp(void)
+{
+	return initdb_wal_context.thread_id;
+}
+
 uint16
 cluster_wal_thread_id(void)
 {
@@ -159,6 +302,12 @@ uint16
 cluster_wal_thread_stamp(void)
 {
 	uint16 tid = cluster_wal_thread_id();
+
+	/* Initial DATA/catalog creation is still native standalone processing.
+	 * Its page stamp must not install an online identity or call the SCN/GCS
+	 * path merely to identify the original writer's WAL. */
+	if (initdb_wal_context.thread_id != 0)
+		return initdb_wal_context.thread_id;
 
 	/*
 	 * nofail + critical-section-safe: one conditional atomic add, no

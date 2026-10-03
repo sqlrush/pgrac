@@ -83,6 +83,7 @@
 #include "cluster/cluster_fence.h" /* spec-2.28 D4 cluster_fence_check_interrupts */
 #include "cluster/cluster_grd.h"   /* spec-2.17 BAST/CANCEL pending dispatch */
 #include "cluster/cluster_hang.h"  /* spec-5.11 D5 hang-dump pending dispatch */
+#include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_reconfig.h" /* spec-2.29 D4 cluster_reconfig_check_pending_in_proc_interrupts */
 #include "cluster/cluster_clean_leave.h" /* spec-5.13 D7 cluster_clean_leave_check_pending_in_proc_interrupts */
 #endif
@@ -3890,6 +3891,9 @@ PostgresSingleUserMain(int argc, char *argv[], const char *username)
 	CreateDataDirLockFile(false);
 
 	/* read control file (error checking and contains config ) */
+#ifdef USE_PGRAC_CLUSTER
+	cluster_wal_thread_initdb_accept(false);
+#endif
 	LocalProcessControlFile(false);
 
 	/*

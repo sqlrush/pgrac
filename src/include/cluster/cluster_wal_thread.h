@@ -266,6 +266,11 @@ extern uint16 cluster_wal_thread_stamp(void);
  */
 extern void cluster_wal_thread_init(void);
 
+/* Original initdb children only; no GUC or online writer identity is installed. */
+extern void cluster_wal_thread_initdb_accept(bool bootstrap);
+extern uint64 cluster_wal_thread_initdb_system_identifier(void);
+extern uint16 cluster_wal_thread_initdb_stamp(void);
+
 /* L206 five-step shmem region registration ("pgrac wal thread"). */
 extern void cluster_wal_thread_shmem_register(void);
 

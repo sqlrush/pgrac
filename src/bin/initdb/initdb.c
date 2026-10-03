@@ -75,6 +75,7 @@
 #include "cluster/cluster_undo_segment_init.h"  /* seed segment helper */
 #include "cluster/cluster_wal_state.h"
 #include "common/cluster_hw_snapshot_codec.h"
+#include "common/pgrac_initdb_wal.h"
 #include "datatype/timestamp.h"
 #endif
 #include "common/controldata_utils.h"
@@ -89,6 +90,9 @@
 #include "getopt_long.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "storage/bufpage.h"
+#endif
 
 
 /* Ideally this would be in a .h file, but it hardly seems worth the trouble */
@@ -183,6 +187,15 @@ static char *pgrac_hw_pgdata_path = NULL;
 static int pgrac_hw_wal_fd = -1;
 static char *pgrac_hw_wal_path = NULL;
 static void pgrac_hw_bind_creation(void);
+static int pgrac_native_thread = -1;
+static uint64 pgrac_native_sysid = 0;
+static int pgrac_native_data_fd = -1;
+static int pgrac_native_wal_fd = -1;
+static char *pgrac_native_data_path;
+static char *pgrac_native_wal_path;
+static void pgrac_native_bind_creation(void);
+static int pgrac_native_child_begin(bool bootstrap);
+static void pgrac_native_child_started(int context_fd);
 #endif
 static char *str_wal_segment_size_mb = NULL;
 static int	wal_segment_size_mb;
@@ -796,10 +809,10 @@ cleanup_directories_atexit(void)
 
 #ifdef USE_PGRAC_CLUSTER
 	/* A failed explicit creation is evidence, never a license to erase a root. */
-	if (pgrac_hw_snapshot_root != NULL) {
+	if (pgrac_hw_snapshot_root != NULL || pgrac_native_thread >= 0) {
 		if (made_new_pgdata || found_existing_pgdata || made_new_xlogdir || found_existing_xlogdir)
 			pg_log_info(
-				"incomplete cluster HW creation retained with PGDATA and WAL for inspection");
+				"incomplete cluster creation retained with PGDATA and WAL for inspection");
 		return;
 	}
 #endif
@@ -1568,6 +1581,9 @@ static void
 bootstrap_template1(void)
 {
 	PG_CMD_DECL;
+#ifdef USE_PGRAC_CLUSTER
+	int native_context_fd;
+#endif
 	char	  **line;
 	char	  **bki_lines;
 	char		headerline[MAXPGPATH];
@@ -1638,7 +1654,13 @@ bootstrap_template1(void)
 			 debug ? "-d 5" : "");
 
 
+#ifdef USE_PGRAC_CLUSTER
+	native_context_fd = pgrac_native_child_begin(true);
+#endif
 	PG_CMD_OPEN;
+#ifdef USE_PGRAC_CLUSTER
+	pgrac_native_child_started(native_context_fd);
+#endif
 
 	for (line = bki_lines; *line != NULL; line++)
 	{
@@ -2556,6 +2578,11 @@ usage(const char *progname)
 			 "                            empty canonical shared root for a new seed\n"
 			 "      --pgrac-hw-snapshot-owner=N\n"
 			 "                            seed owner 0..127 (requires root and sync)\n"));
+	printf(_("      --pgrac-initdb-thread=N\n"
+			 "                            prepare a new native WAL thread 1..128\n"
+			 "                            (requires new -D/-X, checksums and full sync)\n"
+			 "      --pgrac-initdb-system-identifier=N\n"
+			 "                            use a common identity for that new writer\n"));
 #endif
 	printf(_("\nLess commonly used options:\n"));
 	printf(_("  -c, --set NAME=VALUE      override default setting for server parameter\n"));
@@ -3057,6 +3084,9 @@ initialize_data_directory(void)
 {
 	PG_CMD_DECL;
 	int			i;
+#ifdef USE_PGRAC_CLUSTER
+	int native_context_fd;
+#endif
 
 	setup_signals();
 
@@ -3075,6 +3105,7 @@ initialize_data_directory(void)
 #ifdef USE_PGRAC_CLUSTER
 	if (pgrac_hw_snapshot_root != NULL)
 		pgrac_hw_bind_creation();
+	pgrac_native_bind_creation();
 #endif
 
 	/* Create required subdirectories (other than pg_wal) */
@@ -3201,7 +3232,13 @@ initialize_data_directory(void)
 			 backend_exec, backend_options, extra_options,
 			 DEVNULL);
 
+#ifdef USE_PGRAC_CLUSTER
+	native_context_fd = pgrac_native_child_begin(false);
+#endif
 	PG_CMD_OPEN;
+#ifdef USE_PGRAC_CLUSTER
+	pgrac_native_child_started(native_context_fd);
+#endif
 
 	setup_auth(cmdfd);
 
@@ -3507,6 +3544,221 @@ pgrac_hw_sync_new_pgdata(void)
 	if (pgrac_hw_wal_fd >= 0)
 		pgrac_hw_sync_directory(pgrac_hw_wal_fd, false, 0);
 	pgrac_hw_check_bound_directories();
+}
+
+/* Author: SqlRush <sqlrush@gmail.com>
+ * These switches prepare an original native writer, not a shared database.
+ * The cohort initializer still owes SPACE/base, immutable objects and ROOT.
+ * Do not permit a general backend option to impersonate this creator. */
+static void
+pgrac_native_validate_options(void)
+{
+	if (getenv(PGRAC_INITDB_WAL_CONTEXT_ENV) != NULL)
+		pg_fatal("INITDB_WAL_CONTEXT: initdb cannot inherit a child context");
+	if (pgrac_native_thread < 0)
+	{
+		if (pgrac_native_sysid != 0)
+			pg_fatal("INITDB_WAL_OPTION: system identifier requires an initdb thread");
+		return;
+	}
+	if (!do_sync || sync_only || !data_checksums)
+		pg_fatal("INITDB_WAL_SYNC: native writer creation requires checksums and full initdb sync");
+	if (xlog_dir == NULL)
+		pg_fatal("INITDB_WAL_OPTION: native writer creation requires a separate new WAL directory");
+	if (extra_guc_names != NULL || share_path != NULL || pgrac_hw_snapshot_root != NULL
+		|| pgrac_hw_snapshot_owner >= 0 || pgrac_wal_state_root != NULL)
+		pg_fatal("INITDB_WAL_OVERRIDE: native writer creation does not accept parameter, input or legacy authority overrides");
+}
+
+static void
+pgrac_native_prepare_paths(void)
+{
+	char *data_abs;
+	char *wal_abs;
+	const char *paths[2];
+
+	if (pgrac_native_thread < 0)
+		return;
+	data_abs = make_absolute_path(pg_data);
+	wal_abs = make_absolute_path(xlog_dir);
+	pgrac_native_data_path = pgrac_hw_resolve_target(pg_data);
+	pgrac_native_wal_path = pgrac_hw_resolve_target(xlog_dir);
+	if (data_abs == NULL || wal_abs == NULL
+		|| strcmp(data_abs, pgrac_native_data_path) != 0
+		|| strcmp(wal_abs, pgrac_native_wal_path) != 0
+		|| pgrac_hw_path_contains(data_abs, wal_abs) || pgrac_hw_path_contains(wal_abs, data_abs))
+		pg_fatal("INITDB_WAL_PATH: original data and WAL must be distinct canonical directories");
+	free(data_abs);
+	free(wal_abs);
+	/* Both checks precede creation of either directory.  An occupied target
+	 * never causes partial changes to the other member of the pair. */
+	paths[0] = pgrac_native_data_path;
+	paths[1] = pgrac_native_wal_path;
+	for (int i = 0; i < 2; ++i)
+	{
+		int state = pg_check_dir(paths[i]);
+		char parent[MAXPGPATH];
+		struct stat st;
+
+		if (state != 0 && state != 1)
+			pg_fatal("INITDB_WAL_PATH: original data and WAL directories must be empty and accessible");
+		/* The creator persists exactly these two new directory entries. */
+		strlcpy(parent, paths[i], sizeof(parent));
+		get_parent_directory(parent);
+		if (lstat(parent, &st) != 0 || !S_ISDIR(st.st_mode))
+			pg_fatal("INITDB_WAL_PATH: original data and WAL parents must already exist");
+	}
+}
+
+static void
+pgrac_native_check_directory(const char *path, int fd, struct stat *held)
+{
+	struct stat named;
+	char *resolved = realpath(path, NULL);
+
+	if (resolved == NULL || strcmp(path, resolved) != 0 || fstat(fd, held) != 0
+		|| lstat(path, &named) != 0 || !S_ISDIR(held->st_mode) || !S_ISDIR(named.st_mode)
+		|| held->st_uid != geteuid() || (held->st_mode & 0022) != 0
+		|| held->st_dev != named.st_dev || held->st_ino != named.st_ino)
+		pg_fatal("INITDB_WAL_IDENTITY: original directory identity changed");
+	free(resolved);
+}
+
+static void
+pgrac_native_check_directories(struct stat *data_st, struct stat *wal_st)
+{
+	char *link = psprintf("%s/pg_wal", pgrac_native_data_path);
+	char *resolved = realpath(link, NULL);
+	struct stat named;
+
+	pgrac_native_check_directory(pgrac_native_data_path, pgrac_native_data_fd, data_st);
+	pgrac_native_check_directory(pgrac_native_wal_path, pgrac_native_wal_fd, wal_st);
+	if (resolved == NULL || strcmp(resolved, pgrac_native_wal_path) != 0
+		|| lstat(link, &named) != 0 || !S_ISLNK(named.st_mode))
+		pg_fatal("INITDB_WAL_IDENTITY: original WAL link changed");
+	free(resolved);
+	free(link);
+}
+
+static void
+pgrac_native_bind_creation(void)
+{
+	struct stat data_st, wal_st;
+
+	if (pgrac_native_thread < 0)
+		return;
+	if (!(made_new_pgdata || found_existing_pgdata)
+		|| !(made_new_xlogdir || found_existing_xlogdir))
+		pg_fatal("INITDB_WAL_IDENTITY: only the original directory creator can bind a writer");
+	pgrac_native_data_fd = open(pgrac_native_data_path,
+								 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	pgrac_native_wal_fd = open(pgrac_native_wal_path,
+								O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (pgrac_native_data_fd < 0 || pgrac_native_wal_fd < 0)
+		pg_fatal("INITDB_WAL_IDENTITY: cannot pin original directories: %m");
+	pgrac_native_check_directories(&data_st, &wal_st);
+}
+
+static ControlFileData *
+pgrac_native_control(void)
+{
+	ControlFileData *control;
+	bool crc_ok;
+	struct stat st;
+	char *path = psprintf("%s/global/pg_control", pgrac_native_data_path);
+
+	if (lstat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1
+		|| st.st_uid != geteuid())
+		pg_fatal("INITDB_WAL_CONTROL: native control identity changed");
+	free(path);
+	control = get_controlfile(pgrac_native_data_path, &crc_ok);
+	if (!crc_ok || control->system_identifier == 0
+		|| (pgrac_native_sysid != 0 && control->system_identifier != pgrac_native_sysid)
+		|| control->pg_control_version != PG_CONTROL_VERSION
+		|| control->catalog_version_no != CATALOG_VERSION_NO || control->state != DB_SHUTDOWNED
+		|| control->data_checksum_version != PG_DATA_CHECKSUM_VERSION
+		|| control->checkPoint == InvalidXLogRecPtr
+		|| control->checkPointCopy.redo == InvalidXLogRecPtr
+		|| control->checkPointCopy.redo > control->checkPoint)
+		pg_fatal("INITDB_WAL_CONTROL: original writer has no valid native shutdown checkpoint");
+	return control;
+}
+
+static int
+pgrac_native_child_begin(bool bootstrap)
+{
+	PgracInitdbWalContext context = {0};
+	struct stat data_st, wal_st;
+	int descriptors[2];
+	char value[32];
+	ssize_t n;
+
+	if (pgrac_native_thread < 0)
+		return -1;
+	pgrac_native_check_directories(&data_st, &wal_st);
+	context.magic = PGRAC_INITDB_WAL_CONTEXT_MAGIC;
+	context.thread_id = pgrac_native_thread;
+	context.phase = bootstrap ? PGRAC_INITDB_WAL_BOOTSTRAP : PGRAC_INITDB_WAL_POSTBOOTSTRAP;
+	context.system_identifier = pgrac_native_sysid;
+	context.data_device = data_st.st_dev;
+	context.data_inode = data_st.st_ino;
+	context.wal_device = wal_st.st_dev;
+	context.wal_inode = wal_st.st_ino;
+	if (!bootstrap)
+	{
+		ControlFileData *control = pgrac_native_control();
+
+		pgrac_native_sysid = context.system_identifier = control->system_identifier;
+		free(control);
+	}
+	if (pipe(descriptors) != 0)
+		pg_fatal("INITDB_WAL_CONTEXT: cannot create original child pipe: %m");
+	do { n = write(descriptors[1], &context, sizeof(context)); } while (n < 0 && errno == EINTR);
+	if (n != sizeof(context) || close(descriptors[1]) != 0)
+		pg_fatal("INITDB_WAL_CONTEXT: cannot close complete original child pipe: %m");
+	snprintf(value, sizeof(value), "%d", descriptors[0]);
+	if (setenv(PGRAC_INITDB_WAL_CONTEXT_ENV, value, 1) != 0)
+		pg_fatal("INITDB_WAL_CONTEXT: cannot pass original child pipe: %m");
+	return descriptors[0];
+}
+
+static void
+pgrac_native_child_started(int context_fd)
+{
+	if (context_fd >= 0
+		&& (close(context_fd) != 0 || unsetenv(PGRAC_INITDB_WAL_CONTEXT_ENV) != 0))
+		pg_fatal("INITDB_WAL_CONTEXT: cannot release original child pipe: %m");
+}
+
+static void
+pgrac_native_sync(void)
+{
+	struct stat data_st, wal_st;
+	const char *paths[2] = {pgrac_native_data_path, pgrac_native_wal_path};
+	ControlFileData *control;
+
+	pgrac_native_check_directories(&data_st, &wal_st);
+	/* Reuse the original creator's strict file/directory walker, not the
+	 * best-effort generic frontend sync walk. */
+	pgrac_hw_sync_directory(pgrac_native_data_fd, true, 0);
+	pgrac_hw_sync_directory(pgrac_native_wal_fd, false, 0);
+	for (int i = 0; i < 2; ++i)
+	{
+		char parent[MAXPGPATH];
+		int fd;
+
+		strlcpy(parent, paths[i], sizeof(parent));
+		get_parent_directory(parent);
+		fd = open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		if (fd < 0 || fsync(fd) != 0 || close(fd) != 0)
+			pg_fatal("INITDB_WAL_SYNC: cannot persist original directory entry: %m");
+	}
+	pgrac_native_check_directories(&data_st, &wal_st);
+	control = pgrac_native_control();
+	free(control);
+	if (close(pgrac_native_data_fd) != 0 || close(pgrac_native_wal_fd) != 0)
+		pg_fatal("INITDB_WAL_SYNC: cannot close original directories: %m");
+	pgrac_native_data_fd = pgrac_native_wal_fd = -1;
 }
 
 /* Only main's successful post-bootstrap, post-fsync edge calls this producer. */
@@ -3964,6 +4216,8 @@ main(int argc, char *argv[])
 			{ "pgrac-wal-state-root", required_argument, NULL, 18 },
 			{ "pgrac-hw-snapshot-root", required_argument, NULL, 19 },
 			{ "pgrac-hw-snapshot-owner", required_argument, NULL, 20 },
+			{ "pgrac-initdb-thread", required_argument, NULL, 21 },
+			{ "pgrac-initdb-system-identifier", required_argument, NULL, 22 },
 #endif
 			{ NULL, 0, NULL, 0 } };
 
@@ -4163,6 +4417,22 @@ main(int argc, char *argv[])
 					pg_fatal("HW_OWNER_INVALID: snapshot owner must be 0..127");
 				pgrac_hw_snapshot_owner = (int)owner;
 			} break;
+			case 21:
+			case 22: {
+				char *end;
+				unsigned long long number;
+
+				errno = 0;
+				number = strtoull(optarg, &end, 10);
+				if (optarg[0] < '0' || optarg[0] > '9' || *end != '\0' || errno != 0
+					|| number == 0 || (c == 21 && (number > 128 || pgrac_native_thread >= 0))
+					|| (c == 22 && pgrac_native_sysid != 0))
+					pg_fatal("INITDB_WAL_OPTION: invalid or repeated native writer identity");
+				if (c == 21)
+					pgrac_native_thread = (int) number;
+				else
+					pgrac_native_sysid = (uint64) number;
+			} break;
 #endif
 			default:
 				/* getopt_long already emitted a complaint */
@@ -4202,6 +4472,7 @@ main(int argc, char *argv[])
 
 #ifdef USE_PGRAC_CLUSTER
 	pgrac_hw_validate_options();
+	pgrac_native_validate_options();
 	if (pgrac_wal_state_root != NULL)
 	{
 		if (sync_only)
@@ -4308,6 +4579,7 @@ main(int argc, char *argv[])
 #ifdef USE_PGRAC_CLUSTER
 	if (pgrac_hw_snapshot_root != NULL)
 		pgrac_hw_prepare_paths();
+	pgrac_native_prepare_paths();
 #endif
 	initialize_data_directory();
 
@@ -4323,6 +4595,8 @@ main(int argc, char *argv[])
 #ifdef USE_PGRAC_CLUSTER
 		if (pgrac_hw_snapshot_root != NULL)
 			pgrac_hw_sync_new_pgdata();
+		else if (pgrac_native_thread >= 0)
+			pgrac_native_sync();
 		else
 #endif
 			fsync_pgdata(pg_data, PG_VERSION_NUM);

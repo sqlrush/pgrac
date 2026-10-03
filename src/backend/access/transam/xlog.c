@@ -5737,10 +5737,19 @@ BootStrapXLOG(void)
 	 * determine the initialization time of the installation, which could
 	 * perhaps be useful sometimes.
 	 */
-	gettimeofday(&tv, NULL);
-	sysidentifier = ((uint64) tv.tv_sec) << 32;
-	sysidentifier |= ((uint64) tv.tv_usec) << 12;
-	sysidentifier |= getpid() & 0xFFF;
+	sysidentifier = 0;
+#ifdef USE_PGRAC_CLUSTER
+	/* A common identity is consumed only by this original bootstrap call,
+	 * before any control or WAL file exists.  It is never a control rewrite. */
+	sysidentifier = cluster_wal_thread_initdb_system_identifier();
+#endif
+	if (sysidentifier == 0)
+	{
+		gettimeofday(&tv, NULL);
+		sysidentifier = ((uint64) tv.tv_sec) << 32;
+		sysidentifier |= ((uint64) tv.tv_usec) << 12;
+		sysidentifier |= getpid() & 0xFFF;
+	}
 
 	/* page buffer must be aligned suitably for O_DIRECT */
 	buffer = (char *) palloc(XLOG_BLCKSZ + XLOG_BLCKSZ);
@@ -5787,12 +5796,15 @@ BootStrapXLOG(void)
 	page->xlp_tli = BootstrapTimeLineID;
 	page->xlp_pageaddr = wal_segment_size;
 	/*
-	 * PGRAC (spec-1.19): Stage 1 placeholder cluster fields.  initdb
-	 * runs this once; no critical section, no inject hook (Stage 1 only
-	 * AdvanceXLInsertBuffer's site fires the cluster-wal-page-init-
-	 * thread-id injection).  Mirrors AdvanceXLInsertBuffer write.
+	 * Ordinary initdb retains thread zero.  An original native writer stamps
+	 * its explicit thread from birth, consistently with subsequent pages in
+	 * AdvanceXLInsertBuffer.  This does not install an online writer identity.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	page->xlp_thread_id = cluster_wal_thread_initdb_stamp();
+#else
 	page->xlp_thread_id = XLP_THREAD_ID_LEGACY;
+#endif
 	page->xlp_cluster_flags = XLP_CLUSTER_FLAGS_RESERVED;
 	longpage = (XLogLongPageHeader) page;
 	longpage->xlp_sysid = sysidentifier;
