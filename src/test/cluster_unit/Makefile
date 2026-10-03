@@ -2872,7 +2872,8 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixt
 		cluster_control_bootstrap_read_test.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
-		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o \
+		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
@@ -2886,7 +2887,7 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixt
 		xlogreader_fs.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
-		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # PGRAC: perturb only syscall timing/failure; all read/decoder/selection code is
 # production code. Author: SqlRush <sqlrush@gmail.com>

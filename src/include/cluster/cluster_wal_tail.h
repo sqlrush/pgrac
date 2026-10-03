@@ -143,6 +143,27 @@ cluster_wal_checkpoint_prefix_observe(const char *wal_root, const ClusterWalSour
 									  XLogRecPtr checkpoint_end, XLogRecPtr checkpoint_start,
 									  pg_crc32c checkpoint_crc, ClusterWalTailObservation *out);
 
+/* PGRAC: the checkpoint scans above, also returning the inode identities of
+ * the scanned namespace (root/thread/generation directories and every read
+ * segment).  A publisher scans its retained prefix once outside CF and later
+ * proves the same input with cluster_wal_prefix_identity_recheck, which
+ * stats instead of re-reading; WALR still owns retention.  The identity is
+ * allocated in the current context and set only on success.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterWalPrefixIdentity ClusterWalPrefixIdentity;
+extern ClusterControlRootResult cluster_wal_checkpoint_prefix_observe_identity(
+	const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
+	XLogRecPtr physical_lower, XLogRecPtr checkpoint_end, XLogRecPtr checkpoint_start,
+	pg_crc32c checkpoint_crc, ClusterWalTailObservation *out, ClusterWalPrefixIdentity **identity);
+extern ClusterControlRootResult cluster_wal_tail_observe_checkpoint_identity(
+	const char *wal_root, const ClusterWalSourceRef *ref, int segment_size, XLogRecPtr scan_lower,
+	XLogRecPtr minimum_end, XLogRecPtr checkpoint_start, pg_crc32c checkpoint_crc,
+	ClusterWalTailObservation *out, ClusterWalPrefixIdentity **identity);
+extern ClusterControlRootResult
+cluster_wal_prefix_identity_recheck(const char *wal_root, const ClusterWalSourceRef *ref,
+									const ClusterWalPrefixIdentity *identity);
+extern void cluster_wal_prefix_identity_free(ClusterWalPrefixIdentity **identity);
+
 /* Read through the original live writer's independently confirmed complete
  * record end, which must be <= its native flush boundary. Scan must reach
  * that exact end: a damaged length cannot shorten a confirmed prefix. Bytes

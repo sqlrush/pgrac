@@ -18645,6 +18645,192 @@ UT_TEST(test_v3_checkpoint_publish_preserves_pending_and_real_wal_guards)
 	}
 }
 
+/* D (S07): a v3 checkpoint with retained history before its native redo,
+ * as in the test above.  Returns the physical lower. */
+static XLogRecPtr
+v3_retained_checkpoint_fixture(bool shutdown, uint8 before[66048], ClusterControlRootIdentity *self,
+							   ControlFileData *candidate)
+{
+	ClusterRecoveryAnchorV2 old_anchor;
+	XLogRecPtr lower;
+	char path[MAXPGPATH];
+
+	if (shutdown)
+		v2_shutdown_checkpoint_fixture(before, self, candidate);
+	else
+		v2_checkpoint_fixture(before, self, candidate);
+	old_anchor = v2_stop_clean_anchor(before, self);
+	old_anchor.checkpoint_copy.redo += SizeOfXLogLongPHD;
+	lower = old_anchor.checkpoint_copy.redo;
+	put_u64_le(before + 512 + 112, lower);
+	v2_anchor_object(before, &old_anchor, self, path);
+	candidate->minRecoveryPoint = 0;
+	candidate->minRecoveryPointTLI = 0;
+	INIT_CRC32C(candidate->crc);
+	COMP_CRC32C(candidate->crc, candidate, offsetof(ControlFileData, crc));
+	FIN_CRC32C(candidate->crc);
+	v2_checkpoint_retained_prefix(self, candidate, lower);
+	root_fixture_version3(before);
+	v3_mark_pending(before, 127);
+	v2_write_roots(before);
+	return lower;
+}
+
+static char v3_history_path[MAXPGPATH];
+static off_t v3_history_offset;
+
+static void
+v3_flip_history_byte(void)
+{
+	uint8 byte;
+	int fd = open(v3_history_path, O_RDWR);
+
+	test_checkpoint_x_hook = NULL;
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pread(fd, &byte, 1, v3_history_offset), 1);
+	byte ^= 1;
+	UT_ASSERT_EQ(pwrite(fd, &byte, 1, v3_history_offset), 1);
+	UT_ASSERT_EQ(close(fd), 0);
+}
+
+/* The retained prefix is validated once, outside CF.  Inside CF-X the
+ * publisher rereads only its checkpoint (and, at shutdown, the absence of a
+ * later record) and stats the scanned files; it does not reread history. */
+UT_TEST(test_v3_checkpoint_reads_retained_history_once)
+{
+	for (int shutdown = 0; shutdown < 2; shutdown++) {
+		uint8 before[66048];
+		ClusterControlRootIdentity self;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootFileToken token;
+		ControlFileData candidate, view;
+		XLogRecPtr lower = v3_retained_checkpoint_fixture(shutdown, before, &self, &candidate);
+
+		v2_checkpoint_wal_path(&self, lower, candidate.checkPointCopy.ThisTimeLineID,
+							   v3_history_path);
+		v3_history_offset = (lower + SizeOfXLogRecord + 5) % wal_segment_size;
+		test_checkpoint_x_hook = v3_flip_history_byte;
+		UT_ASSERT_EQ(shutdown ? cluster_control_root_v3_shutdown_checkpoint_publish(
+									&self, &candidate, test_checkpoint_end, &out, &token, &view)
+							  : cluster_control_root_v3_checkpoint_publish(
+									&self, &candidate, test_checkpoint_end, &out, &token, &view),
+					 0);
+		UT_ASSERT(test_checkpoint_x_hook == NULL);
+		v3_flip_history_byte(); /* undo the in-place change */
+		UT_ASSERT_EQ(out.checkpoint_lower_lsn, lower);
+		UT_ASSERT_EQ(out.validated_tail_lsn_exclusive, test_checkpoint_end);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		test_checkpoint_x_hook = NULL;
+		if (ut_current_failed)
+			printf("# history-once shutdown=%d\n", shutdown);
+	}
+}
+
+/* Copy of a fixture file, so a fault can be undone for later fixtures. */
+static uint8 *
+v3_file_copy(const char *path, off_t *size)
+{
+	struct stat st;
+	uint8 *copy;
+
+	UT_ASSERT_EQ(stat(path, &st), 0);
+	copy = malloc(Max(st.st_size, 1));
+	UT_ASSERT(copy != NULL);
+	read_all_or_abort(path, copy, st.st_size);
+	*size = st.st_size;
+	return copy;
+}
+
+/* The identity recheck reads no WAL; it refuses any change to the scanned
+ * namespace: a replaced or removed segment, a resized one, a replaced
+ * generation directory, or another source reference. */
+UT_TEST(test_wal_prefix_identity_recheck_detects_a_changed_namespace)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		uint8 before[66048];
+		ClusterControlRootIdentity self;
+		ControlFileData candidate;
+		ClusterWalTailObservation tail;
+		ClusterWalPrefixIdentity *identity = NULL;
+		ClusterWalSourceRef ref;
+		char segment[MAXPGPATH], generation[MAXPGPATH], moved[MAXPGPATH];
+		uint8 *saved;
+		off_t saved_size;
+		XLogRecPtr lower = v3_retained_checkpoint_fixture(false, before, &self, &candidate);
+
+		ref = test_checkpoint_prefix_ref;
+		UT_ASSERT_EQ(cluster_wal_checkpoint_prefix_observe_identity(
+						 cluster_wal_threads_dir, &ref, wal_segment_size, lower,
+						 test_checkpoint_end, candidate.checkPoint, test_checkpoint_crc, &tail,
+						 &identity),
+					 0);
+		UT_ASSERT(identity != NULL);
+		UT_ASSERT_EQ(tail.complete_end, test_checkpoint_end);
+		UT_ASSERT_EQ(cluster_wal_prefix_identity_recheck(cluster_wal_threads_dir, &ref, identity),
+					 0);
+		v2_checkpoint_wal_path(&self, lower, candidate.checkPointCopy.ThisTimeLineID, segment);
+		snprintf(generation, sizeof(generation), "%s/thread_%u/generation_" UINT64_FORMAT,
+				 cluster_wal_threads_dir, self.origin_thread_id, self.origin_owner_incarnation);
+		snprintf(moved, sizeof(moved), "%s.moved", fault == 4 ? generation : segment);
+		saved = v3_file_copy(segment, &saved_size);
+		if (fault == 1) {
+			UT_ASSERT_EQ(rename(segment, moved), 0);
+			write_all_or_abort(segment, saved, saved_size);
+		} else if (fault == 2)
+			UT_ASSERT_EQ(rename(segment, moved), 0);
+		else if (fault == 3)
+			UT_ASSERT_EQ(truncate(segment, wal_segment_size / 2), 0);
+		else if (fault == 4) {
+			UT_ASSERT_EQ(rename(generation, moved), 0);
+			UT_ASSERT_EQ(mkdir(generation, 0700), 0);
+		} else if (fault == 5)
+			ref.claim.claim_sha256[0] ^= 1;
+		UT_ASSERT_EQ(cluster_wal_prefix_identity_recheck(cluster_wal_threads_dir, &ref, identity),
+					 fault == 0 ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+								: CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+		/* Later fixtures reuse these names: put the original files back. */
+		if (fault == 1)
+			UT_ASSERT_EQ(unlink(segment), 0);
+		if (fault == 4)
+			UT_ASSERT_EQ(rmdir(generation), 0);
+		if (fault == 1 || fault == 2 || fault == 4)
+			UT_ASSERT_EQ(rename(moved, fault == 4 ? generation : segment), 0);
+		if (fault == 3)
+			write_all_or_abort(segment, saved, saved_size);
+		free(saved);
+		cluster_wal_prefix_identity_free(&identity);
+		UT_ASSERT(identity == NULL);
+		if (ut_current_failed)
+			printf("# identity fault %d\n", fault);
+	}
+}
+
+/* A failed scan returns no identity. */
+UT_TEST(test_wal_prefix_identity_is_absent_after_a_failed_scan)
+{
+	uint8 before[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate;
+	ClusterWalTailObservation tail;
+	ClusterWalPrefixIdentity *identity = (ClusterWalPrefixIdentity *)&tail;
+	XLogRecPtr lower = v3_retained_checkpoint_fixture(false, before, &self, &candidate);
+
+	UT_ASSERT(cluster_wal_checkpoint_prefix_observe_identity(
+				  cluster_wal_threads_dir, &test_checkpoint_prefix_ref, wal_segment_size, lower,
+				  test_checkpoint_end, candidate.checkPoint, test_checkpoint_crc ^ 1, &tail,
+				  &identity)
+			  != 0);
+	UT_ASSERT(identity == NULL);
+	UT_ASSERT(v2_zero(&tail, sizeof(tail)));
+	identity = (ClusterWalPrefixIdentity *)&tail;
+	UT_ASSERT(cluster_wal_tail_observe_checkpoint_identity(
+				  cluster_wal_threads_dir, &test_checkpoint_prefix_ref, wal_segment_size, lower,
+				  test_checkpoint_end, 0, test_checkpoint_crc, &tail, &identity)
+			  != 0);
+	UT_ASSERT(identity == NULL);
+}
+
 UT_TEST(test_v3_publishers_do_not_fallback_or_weaken_physical_checks)
 {
 	for (int fault = 0; fault < 5; fault++) {
@@ -21396,7 +21582,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(407);
+	UT_PLAN(410);
 	UT_RUN(test_first_start_io_and_late_races_never_publish_authority);
 	UT_RUN(test_first_start_binds_original_inputs_without_clean_exit);
 	UT_RUN(test_first_start_rejects_incomplete_or_changed_formation);
@@ -21542,6 +21728,9 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_recovery_complete_alias_refuses_before_authority);
 	UT_RUN(test_v3_failure_publication_retains_old_authority_and_no_fallback);
 	UT_RUN(test_v3_checkpoint_publish_preserves_pending_and_real_wal_guards);
+	UT_RUN(test_v3_checkpoint_reads_retained_history_once);
+	UT_RUN(test_wal_prefix_identity_recheck_detects_a_changed_namespace);
+	UT_RUN(test_wal_prefix_identity_is_absent_after_a_failed_scan);
 	UT_RUN(test_v3_publishers_do_not_fallback_or_weaken_physical_checks);
 	UT_RUN(test_v3_normal_close_sparse_pair_preserves_exact_roster);
 	UT_RUN(test_v3_normal_close_cannot_discard_foreign_pending_initialization);

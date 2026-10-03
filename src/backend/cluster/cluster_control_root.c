@@ -4848,6 +4848,12 @@ typedef struct CheckpointV2Work {
 	uint32 checkpoint_crc;
 	/* Original physical responsibility, independent of the selected native redo. */
 	XLogRecPtr retained_lower;
+	/* PGRAC: the retained prefix is read once, outside CF.  Later cuts of the
+	 * same input prove its namespace identity instead of re-reading it. */
+	ClusterWalPrefixIdentity *prefix_identity;
+	ClusterWalSourceRef prefix_source;
+	XLogRecPtr prefix_lower, prefix_end, prefix_checkpoint;
+	uint32 prefix_crc;
 } CheckpointV2Work;
 
 static bool
@@ -5067,29 +5073,54 @@ checkpoint_v2_input_observe(CheckpointV2Work *work, const ControlFileData *contr
 							XLogRecPtr end, uint32 crc)
 {
 	ClusterWalThreadClaimV2 claim;
+	ClusterWalTailObservation tail;
+	bool scanned
+		= work->prefix_identity != NULL && work->prefix_lower == work->retained_lower
+		  && work->prefix_end == end && work->prefix_checkpoint == control->checkPoint
+		  && work->prefix_crc == crc
+		  && memcmp(&work->prefix_source, &work->source_ref, sizeof(work->source_ref)) == 0;
 	ClusterControlRootResult result
 		= cluster_wal_claim_v2_read(cluster_wal_threads_dir, &work->source_ref.claim, &claim);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
+	/* PGRAC: the retained history before the checkpoint record is immutable
+	 * and held by WALR.  Validate it once per publication; every later cut
+	 * stats the same files and rereads only the checkpoint (and, at shutdown,
+	 * the absence of a later record), never the whole history inside CF-X. */
+	if (work->retained_lower != InvalidXLogRecPtr && !scanned) {
+		cluster_wal_prefix_identity_free(&work->prefix_identity);
+		result = work->purpose == CHECKPOINT_V2_SHUTDOWN_EVIDENCE
+					 ? cluster_wal_tail_observe_checkpoint_identity(
+						   cluster_wal_threads_dir, &work->source_ref, wal_segment_size,
+						   work->retained_lower, end, control->checkPoint, crc, &tail,
+						   &work->prefix_identity)
+					 : cluster_wal_checkpoint_prefix_observe_identity(
+						   cluster_wal_threads_dir, &work->source_ref, wal_segment_size,
+						   work->retained_lower, end, control->checkPoint, crc, &tail,
+						   &work->prefix_identity);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		work->prefix_source = work->source_ref;
+		work->prefix_lower = work->retained_lower;
+		work->prefix_end = end;
+		work->prefix_checkpoint = control->checkPoint;
+		work->prefix_crc = crc;
+	} else if (work->retained_lower != InvalidXLogRecPtr) {
+		result = cluster_wal_prefix_identity_recheck(cluster_wal_threads_dir, &work->source_ref,
+													 work->prefix_identity);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	}
 	if (work->purpose == CHECKPOINT_V2_SHUTDOWN_EVIDENCE) {
-		ClusterWalTailObservation tail;
-		result = cluster_wal_tail_observe_checkpoint(
-			cluster_wal_threads_dir, &work->source_ref, wal_segment_size,
-			work->retained_lower != InvalidXLogRecPtr ? work->retained_lower : control->checkPoint,
-			end, control->checkPoint, crc, &tail);
+		if (work->retained_lower == InvalidXLogRecPtr || scanned)
+			result = cluster_wal_tail_observe_checkpoint(cluster_wal_threads_dir, &work->source_ref,
+														 wal_segment_size, control->checkPoint, end,
+														 control->checkPoint, crc, &tail);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 		return tail.complete_end == end && tail.last_record_start == control->checkPoint
 				   && tail.last_record_crc == crc
 				   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	}
-	if (work->retained_lower != InvalidXLogRecPtr) {
-		ClusterWalTailObservation prefix;
-		result = cluster_wal_checkpoint_prefix_observe(cluster_wal_threads_dir, &work->source_ref,
-													   wal_segment_size, work->retained_lower, end,
-													   control->checkPoint, crc, &prefix);
-		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			return result;
 	}
 	result = checkpoint_v2_wal_verify(work, &work->source_ref.claim.identity, control, end);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -5115,6 +5146,7 @@ checkpoint_v2_cleanup(CheckpointV2Work *work, ClusterControlRootResult result)
 		pfree(work->checkpoint_history_check);
 		work->checkpoint_history_check = NULL;
 	}
+	cluster_wal_prefix_identity_free(&work->prefix_identity);
 	if (work->wal_reader != NULL) {
 		XLogReaderFree(work->wal_reader);
 		work->wal_reader = NULL;
