@@ -296,12 +296,14 @@ static bool cluster_reconfig_observed_formation_read(ClusterFormationCommitMarke
  * tests; in production the state is per-postmaster and never reset).
  * Mirrors the cluster_qvotec_test_* hook pattern.
  */
+static uint64 formation_qvotec_last_processed_seq = 0;
 extern void cluster_reconfig_test_reset_cold_formation(void);
 void
 cluster_reconfig_test_reset_cold_formation(void)
 {
 	memset(&cold_formation_state, 0, sizeof(cold_formation_state));
 	cold_formation_commit_nonce = 0;
+	formation_qvotec_last_processed_seq = 0;
 }
 
 typedef struct ClusterReconfigFenceStage {
@@ -8673,7 +8675,6 @@ cluster_reconfig_join_qvotec_complete(ClusterJoinMarkerMailboxOperationV1 operat
  *	nodes keep the ordinary JCMK join.  The root never seeds membership.
  * ============================================================ */
 
-static uint64 formation_qvotec_last_processed_seq = 0;
 static uint32
 formation_bitmap_popcount(const uint8 *bmp, int bytes)
 {
@@ -8836,6 +8837,50 @@ cluster_reconfig_observed_formation_read(ClusterFormationCommitMarker *marker, u
 /* PGRAC: accepted cold membership is CONTROL, not serving. All callers hold
  * the reconfig lock; no I/O or secondary lock occurs in these predicates.
  * Author: SqlRush <sqlrush@gmail.com> */
+/* The disk owner invalidates before I/O. A stalled or replaced owner cannot
+ * leave reusable admission evidence. No reader performs disk I/O here.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_reconfig_formation_needs_disk_snapshot(void)
+{
+	bool needed;
+	if (ReconfigShmem == NULL || !cluster_shared_config)
+		return false;
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	needed = ReconfigShmem->startup_formation.formation_generation == 0;
+	LWLockRelease(&ReconfigShmem->lock);
+	return needed;
+}
+
+void
+cluster_reconfig_formation_qvotec_publish_disk_snapshot(
+	const ClusterFormationDiskSnapshot *snapshot)
+{
+	if (ReconfigShmem == NULL)
+		return;
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (snapshot == NULL)
+		memset(&ReconfigShmem->formation_disk_snapshot, 0,
+			   sizeof(ReconfigShmem->formation_disk_snapshot));
+	else
+		ReconfigShmem->formation_disk_snapshot = *snapshot;
+	LWLockRelease(&ReconfigShmem->lock);
+}
+
+static bool
+cluster_reconfig_formation_disk_snapshot_current(void)
+{
+	const ClusterFormationDiskSnapshot *s = &ReconfigShmem->formation_disk_snapshot;
+	uint64 now = (uint64)GetCurrentTimestamp();
+	uint64 lease = (uint64)cluster_quorum_poll_interval_ms * 30 * 1000;
+
+	return cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON
+		&& s->complete && s->sampled_at_us > 0 && now >= s->sampled_at_us
+		&& now - s->sampled_at_us < lease && s->self_incarnation != 0
+		&& s->self_incarnation == cluster_qvotec_get_self_incarnation()
+		&& cluster_qvotec_in_quorum();
+}
+
 static bool
 cluster_reconfig_startup_cohort_valid_at_epoch(const ClusterFormationCommitMarker *marker,
 									  const uint64 *incarnations, bool published, uint64 epoch)
@@ -9112,7 +9157,7 @@ cluster_reconfig_cold_formation_admit(const ClusterFormationCommitMarker *marker
 			|| !cluster_reconfig_cold_formation_boots_current(marker, incarnation_by_node))
 			return;
 		if (epoch == CLUSTER_EPOCH_INITIAL) {
-			if (marker->formation_epoch != epoch + 1
+			if (marker->formation_epoch <= epoch
 				|| ReconfigShmem->last_applied.event_id != 0
 				|| !cluster_reconfig_startup_cohort_valid_at_epoch(
 					marker, incarnation_by_node, false, marker->formation_epoch))
@@ -9229,6 +9274,125 @@ cluster_reconfig_cold_formation_admit(const ClusterFormationCommitMarker *marker
 						 (unsigned)marker->n_admitted)));
 }
 
+/* Preserve one exact proposal across delayed observations and partial disk
+ * writes. The epoch is a successor of disk evidence, never of reset shmem.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+cluster_reconfig_shared_cold_formation_tick_locked(void)
+{
+	const ClusterFormationDiskSnapshot *disk = &ReconfigShmem->formation_disk_snapshot;
+	ClusterFormationCommitMarker marker;
+	uint64 incarnations[CLUSTER_MAX_NODES];
+	uint8 bytes[CLUSTER_VOTING_SLOT_BYTES];
+	uint8 empty[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES] = { 0 };
+	ClusterFenceMarker baseline;
+	uint64 lo, hi;
+	uint32 result;
+
+	if (cold_formation_state.admission_done
+		|| ReconfigShmem->startup_formation.formation_generation != 0
+		|| !cluster_reconfig_formation_disk_snapshot_current())
+		return;
+	if (cluster_reconfig_observed_formation_read(&marker, incarnations)
+		&& marker.formation_generation == disk->max_generation
+		&& marker.formation_epoch == disk->max_epoch) {
+		cluster_reconfig_cold_formation_admit(&marker, incarnations, &disk->fence);
+		if (ReconfigShmem->startup_formation.formation_generation != 0)
+			return;
+	}
+	if (!cold_formation_state.initial_staged) {
+		int arbiter = -1;
+		if (cluster_reconfig_cold_formation_window(&lo, &hi) != CLUSTER_COLD_FORMATION_COBOOT) {
+			cold_formation_state.observe_ticks = 0;
+			return;
+		}
+		if (++cold_formation_state.observe_ticks < CLUSTER_COLD_FORMATION_WINDOW_TICKS)
+			return;
+		for (int node = 0; node < CLUSTER_MAX_NODES; ++node)
+			if (cluster_conf_lookup_node(node) != NULL) {
+				arbiter = node;
+				break;
+			}
+		if (arbiter != cluster_node_id || disk->max_epoch == UINT64_MAX
+			|| disk->max_generation == UINT64_MAX || cold_formation_commit_nonce == UINT64_MAX
+			|| ReconfigShmem->last_applied.event_id != 0
+			|| !cluster_reconfig_formation_fence_exact(&disk->fence, disk->fence.marker.fence_epoch))
+			return;
+		memset(&marker, 0, sizeof(marker));
+		memset(incarnations, 0, sizeof(incarnations));
+		marker.magic = CLUSTER_FORMATION_MARKER_MAGIC;
+		marker.version = CLUSTER_FORMATION_MARKER_VERSION;
+		marker.phase = CLUSTER_FORMATION_MARKER_PHASE_COMMITTED;
+		marker.formation_generation = disk->max_generation + 1;
+		marker.formation_epoch = disk->max_epoch + 1;
+		marker.arbiter_node = (uint64)arbiter;
+		marker.arbiter_incarnation = cluster_qvotec_get_self_incarnation();
+		marker.commit_nonce = ++cold_formation_commit_nonce;
+		for (int node = 0; node < CLUSTER_MAX_NODES; ++node) {
+			if (cluster_conf_lookup_node(node) == NULL)
+				continue;
+			marker.admitted_nodes[node / 8] |= (uint8)(1u << (node % 8));
+			marker.n_admitted++;
+			incarnations[node] = node == cluster_node_id ? marker.arbiter_incarnation
+				: cluster_reconfig_cold_formation_observed_incarnation(node);
+		}
+		if (!cluster_reconfig_startup_cohort_valid_at_epoch(
+				&marker, incarnations, false, marker.formation_epoch)
+			|| !cluster_reconfig_cold_formation_boots_current(&marker, incarnations)
+			|| !cluster_formation_marker_encode(&marker, incarnations, bytes))
+			return;
+		cold_formation_state.initial_marker = marker;
+		memcpy(cold_formation_state.initial_incarnations, incarnations, sizeof(incarnations));
+		cluster_marker_async_init(&cold_formation_state.initial_fence);
+		cold_formation_state.initial_staged = true;
+	}
+	marker = cold_formation_state.initial_marker;
+	memcpy(incarnations, cold_formation_state.initial_incarnations, sizeof(incarnations));
+	if (disk->max_epoch > marker.formation_epoch
+		|| disk->max_generation > marker.formation_generation
+		|| !cluster_reconfig_cold_formation_boots_current(&marker, incarnations)
+		|| !cluster_reconfig_startup_cohort_valid_at_epoch(
+			&marker, incarnations, false, marker.formation_epoch))
+		return;
+	cluster_fence_marker_build_baseline(&baseline, marker.formation_epoch, empty, 0, 0,
+									   CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
+	if (!cold_formation_state.initial_fence_acked) {
+		if (!cluster_marker_async_is_submitted(&cold_formation_state.initial_fence)) {
+			(void)cluster_write_fence_submit_marker_async(&cold_formation_state.initial_fence,
+				&baseline, CLUSTER_MARKER_KIND_FORMATION_BASELINE, cluster_node_id, GetCurrentTimestamp());
+			return;
+		}
+		if (cluster_write_fence_poll_marker_async(&cold_formation_state.initial_fence,
+				GetCurrentTimestamp(), &result, NULL) != CLUSTER_MARKER_POLL_ACKED
+			|| result != CLUSTER_FENCE_MARKER_SUBMIT_ACK)
+			return;
+		cold_formation_state.initial_fence_acked = true;
+	}
+	if (!cluster_reconfig_formation_fence_exact(&disk->fence, marker.formation_epoch)
+		|| !cluster_fence_marker_tuple_equal(&disk->fence.marker, &baseline))
+		return;
+	if (cold_formation_state.arbiter_submitted) {
+		if (pg_atomic_read_u64(&ReconfigShmem->formation_marker_completion_seq)
+			!= cold_formation_state.arbiter_seq)
+			return;
+		if (pg_atomic_read_u32(&ReconfigShmem->formation_marker_result) != 0) {
+			cluster_reconfig_cold_formation_admit(&marker, incarnations, &disk->fence);
+			return;
+		}
+		cold_formation_state.arbiter_submitted = false;
+	}
+	if (!cluster_formation_marker_encode(&marker, incarnations, bytes)
+		|| !cluster_reconfig_formation_marker_submit(bytes, marker.admitted_nodes))
+		return;
+	cold_formation_state.arbiter_seq
+		= pg_atomic_read_u64(&ReconfigShmem->formation_marker_request_seq);
+	cold_formation_state.arbiter_submitted = true;
+	ereport(LOG, (errmsg("cluster membership: node %d cold-formation arbiter "
+		"submitted formation marker (generation %llu, epoch %llu, members %u)",
+		cluster_node_id, (unsigned long long)marker.formation_generation,
+		(unsigned long long)marker.formation_epoch, (unsigned)marker.n_admitted)));
+}
+
 /*
  * Cold-formation state machine — one call per LMON tick while this node is
  * un-formed and the cluster is past INITIAL with an ABSENT peer.
@@ -9242,21 +9406,6 @@ cluster_reconfig_cold_formation_tick_locked(const ClusterFenceAuthorityProof *pr
 
 	if (cold_formation_state.admission_done)
 		return;
-	if (cluster_shared_config && ReconfigShmem->startup_formation.formation_generation != 0) {
-		return;
-	}
-	if (cluster_shared_config) {
-		ClusterFormationCommitMarker marker;
-		uint64 incarnations[CLUSTER_MAX_NODES];
-		/* An exact commit names this boot and the entire configured cohort.
-		 * A peer already entering CONTROL does not invalidate that durable
-		 * commit. The window is needed to produce it, not to re-create it. */
-		if (cluster_reconfig_observed_formation_read(&marker, incarnations)) {
-			cluster_reconfig_cold_formation_admit(&marker, incarnations, proof);
-			if (ReconfigShmem->startup_formation.formation_generation != 0)
-				return;
-		}
-	}
 
 	/* 1. Observation window (three-state; quorum-stable, no survivor
 	 * past INITIAL). */
@@ -9383,52 +9532,7 @@ cluster_reconfig_cold_formation_tick_locked(const ClusterFenceAuthorityProof *pr
 		}
 		marker.n_admitted = (uint16)formation_bitmap_popcount(
 			marker.admitted_nodes, CLUSTER_FORMATION_MARKER_BITMAP_BYTES);
-		if (cluster_shared_config && marker.formation_epoch == CLUSTER_EPOCH_INITIAL) {
-			ClusterFenceMarker baseline;
-			uint8 empty[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES] = { 0 };
-			uint32 result;
-			ClusterMarkerPollResult polled;
 
-			marker.formation_epoch++;
-			if (!cold_formation_state.initial_staged) {
-				if (!cluster_reconfig_startup_cohort_valid_at_epoch(
-						&marker, incarnation_by_node, false, marker.formation_epoch)
-					|| !cluster_reconfig_cold_formation_boots_current(&marker, incarnation_by_node)
-					|| !cluster_reconfig_formation_fence_exact(proof, CLUSTER_EPOCH_INITIAL)
-					|| ReconfigShmem->last_applied.event_id != 0)
-					return;
-				cold_formation_state.initial_marker = marker;
-				memcpy(cold_formation_state.initial_incarnations, incarnation_by_node,
-					   sizeof(incarnation_by_node));
-				cluster_marker_async_init(&cold_formation_state.initial_fence);
-				cold_formation_state.initial_staged = true;
-			}
-			marker = cold_formation_state.initial_marker;
-			memcpy(incarnation_by_node, cold_formation_state.initial_incarnations,
-				   sizeof(incarnation_by_node));
-			if (!cluster_reconfig_cold_formation_boots_current(&marker, incarnation_by_node)
-				|| !cluster_reconfig_startup_cohort_valid_at_epoch(
-					&marker, incarnation_by_node, false, marker.formation_epoch))
-				return;
-			cluster_fence_marker_build_baseline(&baseline, marker.formation_epoch, empty, 0, 0,
-												   CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
-			if (!cold_formation_state.initial_fence_acked) {
-				if (!cluster_marker_async_is_submitted(&cold_formation_state.initial_fence)) {
-					(void)cluster_write_fence_submit_marker_async(
-						&cold_formation_state.initial_fence, &baseline,
-						CLUSTER_MARKER_KIND_FORMATION_BASELINE, cluster_node_id, GetCurrentTimestamp());
-					return;
-				}
-				polled = cluster_write_fence_poll_marker_async(
-					&cold_formation_state.initial_fence, GetCurrentTimestamp(), &result, NULL);
-				if (polled != CLUSTER_MARKER_POLL_ACKED || result != CLUSTER_FENCE_MARKER_SUBMIT_ACK)
-					return;
-				cold_formation_state.initial_fence_acked = true;
-			}
-			if (!cluster_reconfig_formation_fence_exact(proof, marker.formation_epoch)
-				|| !cluster_fence_marker_tuple_equal(&proof->marker, &baseline))
-				return;
-		}
 		cluster_formation_marker_compute_crc(&marker);
 		if (!cluster_formation_marker_encode(&marker, incarnation_by_node, marker_bytes))
 			return;
@@ -9466,22 +9570,17 @@ void
 cluster_reconfig_cold_formation_tick(void)
 {
 	bool drive = false;
-	ClusterFenceAuthorityProof proof;
-	const ClusterFenceAuthorityProof *current = NULL;
 	if (ReconfigShmem == NULL)
 		return;
-	/* The existing majority reader owns disk I/O. Never hold Reconfig over it. */
-	if (cluster_shared_config && !cold_formation_state.admission_done
-		&& ReconfigShmem->startup_formation.formation_generation == 0 && cluster_qvotec_in_quorum()
-		&& cluster_write_fence_read_durable_authority(&proof) == CLUSTER_FENCE_AUTHORITY_OK)
-		current = &proof;
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
 	for (int i = 0; i < CLUSTER_MAX_NODES; ++i)
 		if (cluster_conf_lookup_node(i) != NULL
 			&& cluster_membership_get_state(i) == CLUSTER_MEMBER_ABSENT)
 			drive = true;
-	if (drive || (cluster_shared_config && !cold_formation_state.admission_done))
-		cluster_reconfig_cold_formation_tick_locked(current);
+	if (cluster_shared_config)
+		cluster_reconfig_shared_cold_formation_tick_locked();
+	else if (drive)
+		cluster_reconfig_cold_formation_tick_locked(NULL);
 	LWLockRelease(&ReconfigShmem->lock);
 	if (cluster_shared_config)
 		cluster_reconfig_startup_formation_progress();
@@ -10307,6 +10406,15 @@ void
 cluster_reconfig_formation_qvotec_complete(bool success pg_attribute_unused())
 {}
 
+bool
+cluster_reconfig_formation_needs_disk_snapshot(void)
+{
+	return false;
+}
+void
+cluster_reconfig_formation_qvotec_publish_disk_snapshot(
+	const ClusterFormationDiskSnapshot *snapshot pg_attribute_unused())
+{}
 void
 cluster_reconfig_formation_qvotec_note_max_generation(uint64 generation pg_attribute_unused())
 {}

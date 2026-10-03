@@ -941,6 +941,15 @@ cluster_reconfig_record_observed_fresh_alive(int32 node_id pg_attribute_unused()
  * the other reconfig symbols.  The formation-marker tests live in
  * test_cluster_formation_marker / test_cluster_reconfig. */
 bool
+cluster_reconfig_formation_needs_disk_snapshot(void)
+{
+	return false;
+}
+void
+cluster_reconfig_formation_qvotec_publish_disk_snapshot(
+	const ClusterFormationDiskSnapshot *snapshot pg_attribute_unused())
+{}
+bool
 cluster_reconfig_formation_qvotec_poll_pending(
 	ClusterFormationMarkerSubmitRequest *out pg_attribute_unused())
 {
