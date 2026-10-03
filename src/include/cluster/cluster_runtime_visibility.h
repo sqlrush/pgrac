@@ -223,12 +223,15 @@ extern bool cluster_runtime_visibility_local_terminal_lookup_exact(
 	bool *precommit_retry_out);
 /* Resolve an updater from its exact page-derived DATA locator.  The function
  * executes the same DATA -> canonical TT -> DATA proof used by the remote
- * origin adapter and never substitutes a by-xid locator. */
+ * origin adapter and never substitutes a by-xid locator.  On false, the optional
+ * precommit flag is a negative observation after guard release and admission
+ * recheck; all proof outputs remain empty. */
 extern bool cluster_runtime_visibility_current_mx_updater_provenance_exact(
 	const ClusterTxLocator *locator, TimestampTz deadline, ClusterTTStatusKey *key_out,
 	ClusterTTStatusResult *result_out, uint32 *ctrc_grant_out,
 	uint32 *participant_capability_generation_out, ClusterCtrcTxnKeyV1 *ctrc_key_out,
-	ClusterTxLocator *canonical_locator_out, bool *cross_segment_out);
+	ClusterTxLocator *canonical_locator_out, bool *cross_segment_out,
+	bool *precommit_retry_out);
 extern bool cluster_runtime_visibility_active_proof_ctrc_identity_exact(
 	const ClusterCurrentMemberProofKey *proof_key, uint32 ctrc_grant,
 	uint32 requester_capability_generation, ClusterCtrcTxnKeyV1 *ctrc_key_out,

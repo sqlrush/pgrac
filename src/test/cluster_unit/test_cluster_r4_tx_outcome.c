@@ -118,6 +118,10 @@ static PGAlignedBlock test_candidate_io_page;
 static int test_candidate_release_calls;
 static bool test_candidate_release_failed;
 static bool test_candidate_release_epoch_drift;
+static bool test_candidate_release_admission_drift;
+static int test_candidate_release_fault_call;
+static bool test_admission_revoked;
+static const bool *test_updater_retry_observer;
 static int test_candidate_cancel_calls;
 static int test_candidate_poll_calls;
 static int test_candidate_wait_calls;
@@ -535,7 +539,9 @@ cluster_scn_current(void)
 static bool
 test_admission_token_exact(const ClusterSemanticAdmissionToken *token)
 {
-	return token != NULL && token->entered
+	if (test_updater_retry_observer != NULL)
+		UT_ASSERT(!*test_updater_retry_observer);
+	return !test_admission_revoked && token != NULL && token->entered
 		   && token->feature_bit == CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
 		   && token->side == CLUSTER_SEMANTIC_TARGET_SIDE
 		   && token->formation_epoch == test_formation_epoch;
@@ -727,6 +733,17 @@ cluster_ctrc_origin_touch_exact(const ClusterCtrcTxnKeyV1 *key,
 	return test_ctrc_touch_grant == 0 ? CLUSTER_CTRC_TOUCH_REFUSED : CLUSTER_CTRC_TOUCH_RECORDED;
 }
 
+bool
+cluster_ctrc_origin_grant_publishable(const ClusterCtrcTxnKeyV1 *key,
+									  const ClusterCtrcParticipantIdentity *participant,
+									  uint32 grant_generation)
+{
+	return key != NULL && participant != NULL && grant_generation != 0
+		&& grant_generation == test_ctrc_touch_grant
+		&& key->xid == TEST_ORIGIN_XID && key->formation_epoch == test_formation_epoch
+		&& participant->formation_epoch == test_formation_epoch;
+}
+
 uint32
 cluster_tt_slot_current_segment(int node_id)
 {
@@ -898,8 +915,15 @@ cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard
 										  ClusterUndoBlock0Result *failure pg_attribute_unused())
 {
 	test_candidate_release_calls++;
+	if (test_updater_retry_observer != NULL)
+		UT_ASSERT(!*test_updater_retry_observer);
 	UT_ASSERT(test_candidate_held_count > 0);
 	test_candidate_held_count--;
+	if (test_candidate_release_fault_call != 0
+		&& test_candidate_release_calls != test_candidate_release_fault_call)
+		return CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
+	if (test_candidate_release_admission_drift)
+		test_admission_revoked = true;
 	if (test_candidate_release_epoch_drift)
 		test_formation_epoch++;
 	if (test_candidate_release_failed)
@@ -1009,6 +1033,10 @@ reset_exact_origin_fixture(void)
 	test_candidate_release_calls = 0;
 	test_candidate_release_failed = false;
 	test_candidate_release_epoch_drift = false;
+	test_candidate_release_admission_drift = false;
+	test_candidate_release_fault_call = 0;
+	test_admission_revoked = false;
+	test_updater_retry_observer = NULL;
 	test_candidate_cancel_calls = 0;
 	test_candidate_poll_calls = 0;
 	test_candidate_wait_calls = 0;
@@ -1445,6 +1473,151 @@ UT_TEST(test_current_mx_precommit_keeps_unknown_and_release_fences)
 		UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
 		UT_ASSERT_EQ(test_candidate_held_count, 0);
 		UT_ASSERT_EQ(test_candidate_cancel_calls, variant == 0 ? 1 : 0);
+	}
+}
+
+static void
+check_local_updater_sample(bool expected_proof, bool expected_retry, bool optional_flag)
+{
+	ClusterTTStatusKey key;
+	ClusterTTStatusResult result;
+	ClusterCtrcTxnKeyV1 ctrc_key;
+	ClusterTxLocator canonical;
+	uint32 grant = 99;
+	uint32 capability = 99;
+	bool cross_segment = true;
+	bool retry = true;
+	bool sampled;
+
+	memset(&key, 0xa5, sizeof(key));
+	memset(&result, 0xa5, sizeof(result));
+	memset(&ctrc_key, 0xa5, sizeof(ctrc_key));
+	memset(&canonical, 0xa5, sizeof(canonical));
+	test_updater_retry_observer = optional_flag ? NULL : &retry;
+	sampled = cluster_runtime_visibility_current_mx_updater_provenance_exact(
+		&test_origin_locator, 0, &key, &result, &grant, &capability, &ctrc_key,
+		&canonical, &cross_segment, optional_flag ? NULL : &retry);
+	test_updater_retry_observer = NULL;
+	UT_ASSERT_EQ(sampled, expected_proof);
+	if (!optional_flag)
+		UT_ASSERT_EQ(retry, expected_retry);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(grant, 0);
+	UT_ASSERT_EQ(capability, 0);
+	UT_ASSERT_EQ(test_ctrc_touch_calls, 0);
+	UT_ASSERT_EQ(ctrc_key.xid, 0);
+	if (sampled) {
+		UT_ASSERT(result.authoritative);
+		UT_ASSERT_EQ(result.status, test_native_status == TRANSACTION_STATUS_COMMITTED
+			? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_ABORTED);
+		UT_ASSERT_EQ(canonical.xid, TEST_ORIGIN_XID);
+		UT_ASSERT_EQ(canonical.tt_wrap, TEST_ORIGIN_WRAP);
+		UT_ASSERT_EQ(cross_segment, test_origin_record.tt_slot_segment_id != TEST_RECORD_SEGMENT);
+	} else {
+		UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
+		UT_ASSERT(!result.authoritative);
+		UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+		UT_ASSERT_EQ(key.local_xid, 0);
+		UT_ASSERT_EQ(canonical.xid, 0);
+		UT_ASSERT_EQ(canonical.uba.raw[0], 0);
+		UT_ASSERT_EQ(canonical.uba.raw[1], 0);
+		UT_ASSERT(!cross_segment);
+	}
+}
+
+UT_TEST(test_local_updater_precommit_retries_only_after_guard_release)
+{
+	int cross_segment;
+	int optional_flag;
+
+	for (cross_segment = 0; cross_segment < 2; cross_segment++) {
+		for (optional_flag = 0; optional_flag < 2; optional_flag++) {
+			reset_exact_origin_fixture();
+			test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+			test_origin_record.tt_slot_segment_id = cross_segment ? TEST_TT_SEGMENT : TEST_RECORD_SEGMENT;
+			test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+			test_twophase_xid = TEST_ORIGIN_XID;
+			check_local_updater_sample(false, true, optional_flag != 0);
+			UT_ASSERT_EQ(test_candidate_acquire_calls, cross_segment ? 2 : 1);
+			UT_ASSERT_EQ(test_candidate_release_calls, test_candidate_acquire_calls);
+			UT_ASSERT_EQ(test_candidate_max_held_count, 1);
+			UT_ASSERT_EQ(test_by_xid_scan_calls, 0);
+		}
+	}
+}
+
+UT_TEST(test_local_updater_precommit_release_and_admission_failure_stay_unknown)
+{
+	int cross_segment;
+	int fault;
+
+	for (cross_segment = 0; cross_segment < 2; cross_segment++) {
+		for (fault = 0; fault < 3; fault++) {
+			reset_exact_origin_fixture();
+			test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+			test_origin_record.tt_slot_segment_id = cross_segment ? TEST_TT_SEGMENT : TEST_RECORD_SEGMENT;
+			test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+			test_twophase_xid = TEST_ORIGIN_XID;
+			test_candidate_release_fault_call = cross_segment ? 2 : 1;
+			test_candidate_release_failed = fault == 0;
+			test_candidate_release_epoch_drift = fault == 1;
+			test_candidate_release_admission_drift = fault == 2;
+			check_local_updater_sample(false, false, false);
+			UT_ASSERT_EQ(test_candidate_release_calls, cross_segment ? 2 : 1);
+			UT_ASSERT_EQ(test_candidate_cancel_calls, fault == 0 ? 1 : 0);
+		}
+	}
+}
+
+UT_TEST(test_local_updater_does_not_retry_unproven_samples)
+{
+	int cross_segment;
+	int fault;
+
+	for (cross_segment = 0; cross_segment < 2; cross_segment++) {
+		for (fault = 0; fault < 8; fault++) {
+			reset_exact_origin_fixture();
+			test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+			test_origin_record.tt_slot_segment_id = cross_segment ? TEST_TT_SEGMENT : TEST_RECORD_SEGMENT;
+			test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+			test_twophase_xid = TEST_ORIGIN_XID;
+			switch (fault) {
+			case 0: test_twophase_prepared = true; break;
+			case 1: test_tt_slot.commit_scn = InvalidScn; break;
+			case 2: test_tt_slot.wrap++; break;
+			case 3: test_tt_slot.status = TT_SLOT_ACTIVE; break;
+			case 4: test_native_status = TRANSACTION_STATUS_ABORTED; break;
+			case 5: test_candidate_sample_result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED; break;
+			case 6: test_origin_locator.tt_wrap = TEST_ORIGIN_WRAP; break;
+			case 7: test_tt_slot.xid++; break;
+			}
+			check_local_updater_sample(false, false, false);
+		}
+	}
+}
+
+UT_TEST(test_local_updater_precommit_resamples_terminal_without_grant)
+{
+	int cross_segment;
+	int aborted;
+
+	for (cross_segment = 0; cross_segment < 2; cross_segment++) {
+		for (aborted = 0; aborted < 2; aborted++) {
+			reset_exact_origin_fixture();
+			test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+			test_origin_record.tt_slot_segment_id = cross_segment ? TEST_TT_SEGMENT : TEST_RECORD_SEGMENT;
+			test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+			test_twophase_xid = TEST_ORIGIN_XID;
+			check_local_updater_sample(false, true, false);
+			/* SCUR is gone: model the writer's exact terminal publication. */
+			test_native_status = aborted ? TRANSACTION_STATUS_ABORTED : TRANSACTION_STATUS_COMMITTED;
+			if (aborted) {
+				test_tt_slot.status = TT_SLOT_ABORTED;
+				test_tt_slot.commit_scn = InvalidScn;
+			}
+			check_local_updater_sample(true, false, false);
+			UT_ASSERT_EQ(test_candidate_release_calls, test_candidate_acquire_calls);
+		}
 	}
 }
 
@@ -4315,7 +4488,11 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(131);
+	UT_PLAN(135);
+	UT_RUN(test_local_updater_precommit_retries_only_after_guard_release);
+	UT_RUN(test_local_updater_precommit_release_and_admission_failure_stay_unknown);
+	UT_RUN(test_local_updater_does_not_retry_unproven_samples);
+	UT_RUN(test_local_updater_precommit_resamples_terminal_without_grant);
 	UT_RUN(test_current_mx_precommit_resamples_exact_terminal_without_grant);
 	UT_RUN(test_current_mx_precommit_keeps_unknown_and_release_fences);
 	UT_RUN(test_current_mx_malformed_active_is_not_precommit_retry);

@@ -1356,13 +1356,17 @@ cluster_multixact_current_members_resolve_internal(
 				uint32 ctrc_grant = 0;
 				uint32 participant_capability_generation = 0;
 				bool cross_segment = false;
+				bool precommit_retry = false;
 
 				if (!cluster_runtime_visibility_current_mx_updater_provenance_exact(
 						&wire_challenge->candidate_next_xmin_locator, operation_deadline,
 						&initial_key, &initial_result, &ctrc_grant,
 						&participant_capability_generation, &ctrc_key, &canonical_locator,
-						&cross_segment)
-					|| !cluster_multixact_current_resolve_origin_member_proof(
+						&cross_segment, &precommit_retry)) {
+					result = precommit_retry ? CMX_RESOLVE_RETRY : CMX_RESOLVE_UNKNOWN;
+					goto non_ok;
+				}
+				if (!cluster_multixact_current_resolve_origin_member_proof(
 						wire_challenge->updater_xid, wire_challenge->member_status,
 						wire_challenge->member_ordinal, (uint16)cluster_node_id,
 						(uint32)current_epoch,

@@ -2078,7 +2078,8 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 	const ClusterTxLocator *locator, TimestampTz deadline, ClusterTTStatusKey *key_out,
 	ClusterTTStatusResult *result_out, uint32 *ctrc_grant_out,
 	uint32 *participant_capability_generation_out, ClusterCtrcTxnKeyV1 *ctrc_key_out,
-	ClusterTxLocator *canonical_locator_out, bool *cross_segment_out)
+	ClusterTxLocator *canonical_locator_out, bool *cross_segment_out,
+	bool *precommit_retry_out)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterUndoBlock0LogicalKey data_logical;
@@ -2114,8 +2115,11 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 	bool same_segment = false;
 	bool physical_active = false;
 	bool sampled = false;
+	bool precommit_retry = false;
 	bool entered = false;
 
+	if (precommit_retry_out != NULL)
+		*precommit_retry_out = false;
 	if (key_out != NULL)
 		memset(key_out, 0, sizeof(*key_out));
 	if (result_out != NULL) {
@@ -2221,7 +2225,11 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 
 		if (!cluster_runtime_visibility_physical_locator_sample_held(
 				&physical, &admission, &guard, &phase_root, &sampled_key, &sampled_result,
-				&physical_active, NULL))
+				&physical_active, &precommit_retry))
+			goto protected_done;
+		/* This observation cannot authorize a member or updater proof.  Let
+		 * cleanup release SCUR before the caller can retry the whole batch. */
+		if (precommit_retry)
 			goto protected_done;
 		if (sampled_result.status == CLUSTER_TT_STATUS_IN_PROGRESS) {
 			owner.segment_id = physical.segment_id;
@@ -2299,6 +2307,7 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 				!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
 				cluster_undo_block0_current_cancel(&guard);
 				sampled = false;
+				precommit_retry = false;
 			}
 			cleanup.active = false;
 		}
@@ -2306,17 +2315,21 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 	PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
 								PointerGetDatum(&cleanup));
 
-	if (sampled
+	if ((sampled || precommit_retry)
 		&& (cluster_epoch_get_current() != epoch
 			|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY,
 															 &admission)
 			|| (grant != 0
-				&& !cluster_ctrc_origin_grant_publishable(&ctrc_key, &participant, grant))))
+				&& !cluster_ctrc_origin_grant_publishable(&ctrc_key, &participant, grant)))) {
 		sampled = false;
+		precommit_retry = false;
+	}
 
 done:
 	if (entered)
 		cluster_semantic_activation_leave(&admission);
+	if (precommit_retry_out != NULL)
+		*precommit_retry_out = precommit_retry;
 	if (!sampled)
 		return false;
 	*key_out = sampled_key;
