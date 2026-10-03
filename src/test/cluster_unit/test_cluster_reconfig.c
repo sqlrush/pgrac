@@ -958,10 +958,12 @@ cluster_write_fence_submit_marker(const ClusterFenceMarker *m pg_attribute_unuse
 }
 /* Durable I/O boundary; the reader itself is covered by the real-disk tests. */
 static bool ut_formation_authority_readable;
+static unsigned ut_formation_authority_reads;
 static ClusterFenceAuthorityProof ut_formation_authority;
 ClusterFenceAuthorityReadResult
 cluster_write_fence_read_durable_authority(ClusterFenceAuthorityProof *out)
 {
+	ut_formation_authority_reads++;
 	if (ut_formation_authority_readable) {
 		*out = ut_formation_authority;
 		return CLUSTER_FENCE_AUTHORITY_OK;
@@ -7107,6 +7109,14 @@ UT_TEST(test_pre2_initial_lmon_produces_nonzero_control_only_after_fence_and_pgf
 		UT_ASSERT_EQ(snapshot.startup_formation_generation, 1);
 		UT_ASSERT_EQ(snapshot.applied.new_epoch, 1);
 		UT_ASSERT_EQ(snapshot.applied.event_id, 0);
+		/* CONTROL has consumed both durable proofs. Re-reading all voting
+		 * slots on every tick would starve this same LMON's CF/GES duties. */
+		{
+			unsigned reads = ut_formation_authority_reads;
+			for (int i = 0; i < 3; ++i)
+				cluster_reconfig_lmon_tick();
+			UT_ASSERT_EQ(ut_formation_authority_reads, reads);
+		}
 		qvotec_build_baseline_marker(&baseline);
 		UT_ASSERT_EQ(baseline.fence_epoch, 1);
 		UT_ASSERT_EQ(baseline.fence_event_id, 0);
