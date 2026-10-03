@@ -7,14 +7,13 @@
  *	  Covers (spec §4):
  *	    U5-U7 pure lease math: carve produces pairwise-disjoint blocks from a
  *	          monotonic high-water, consume advances a block, normalize forces
- *	          past the reserved range, and the 32-bit wraparound is capped so
- *	          no reserved OID is ever handed out
+ *	          past the reserved range, and wrap restarts normal OID candidates
  *	    authority I/O: classify (valid / short / bad magic / bad CRC), a real
  *	          write -> read round trip against a temp dir, and fail-closed read
- *	          when neither primary nor .bak is trustworthy
+ *	          when the current primary cannot be validated
  *
  *	  Like test_cluster_cf_authority.c the fd.c openers map onto open(2) etc.,
- *	  so the torn-safe write / fallback behaviour is verified end to end.
+ *	  so file replacement and stale-backup rejection exercise real I/O.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -36,6 +35,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -59,6 +59,8 @@ UT_DEFINE_GLOBALS();
 
 /* Global read by cluster_oid_lease.o's authority I/O. */
 char *cluster_shared_data_dir = NULL;
+static bool expect_authority_error = false;
+static jmp_buf authority_error_jmp;
 
 /* ---- Assert + ereport machinery (aborts on ERROR; the read path never
  * ereports, the write path only PANICs on real I/O failure). ---- */
@@ -72,6 +74,8 @@ bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
 	if (elevel >= ERROR) {
+		if (expect_authority_error)
+			longjmp(authority_error_jmp, 1);
 		printf("# unexpected ereport(elevel=%d) -- aborting\n", elevel);
 		abort();
 	}
@@ -188,15 +192,15 @@ UT_TEST(test_carve_basic_block)
 	UT_ASSERT_EQ(newauth, 100000 + 8192);
 }
 
-UT_TEST(test_carve_normalizes_reserved_hw)
+UT_TEST(test_carve_rejects_reserved_hw)
 {
 	Oid start, end, newauth;
 
-	/* hw below FirstNormalObjectId is forced up before carving. */
+	/* Only first-seed normalization may move a reserved value upward. */
 	cluster_oid_lease_carve(5, 8192, &start, &end, &newauth);
-	UT_ASSERT_EQ(start, (Oid)FirstNormalObjectId);
-	UT_ASSERT_EQ(end, (Oid)FirstNormalObjectId + 8192);
-	UT_ASSERT_EQ(newauth, (Oid)FirstNormalObjectId + 8192);
+	UT_ASSERT_EQ(start, InvalidOid);
+	UT_ASSERT_EQ(end, InvalidOid);
+	UT_ASSERT_EQ(newauth, InvalidOid);
 }
 
 UT_TEST(test_carve_disjoint_from_monotonic_hw)
@@ -211,17 +215,57 @@ UT_TEST(test_carve_disjoint_from_monotonic_hw)
 	UT_ASSERT(s2 >= e1);
 }
 
-UT_TEST(test_carve_wraparound_capped)
+UT_TEST(test_carve_wrap_restarts_after_tail)
 {
+	ClusterOidLease tail;
 	Oid start, end, newauth;
+	Oid expected;
 
-	/* hw near the top of the OID space: the block must not spill into the
-	 * reserved range.  end is capped to 0 (top of space) and the authority is
-	 * reset to FirstNormalObjectId for the next refill. */
-	cluster_oid_lease_carve(0xFFFFF000u, 8192, &start, &end, &newauth);
-	UT_ASSERT_EQ(start, 0xFFFFF000u);
-	UT_ASSERT_EQ(end, 0); /* exclusive end wraps to top of space */
-	UT_ASSERT_EQ(newauth, (Oid)FirstNormalObjectId);
+	/* Keep the tail separate from the next cycle, without reserved OIDs. */
+	cluster_oid_lease_carve(0xFFFFF000u, 8192, &tail.next, &tail.end, &newauth);
+	UT_ASSERT_EQ(tail.next, 0xFFFFF000u);
+	UT_ASSERT_EQ(tail.end, 0);
+	UT_ASSERT_EQ(newauth, FirstNormalObjectId);
+	cluster_oid_lease_carve(newauth, 8192, &start, &end, &newauth);
+	UT_ASSERT_EQ(start, FirstNormalObjectId);
+	UT_ASSERT_EQ(end, FirstNormalObjectId + 8192);
+	UT_ASSERT_EQ(newauth, end);
+	cluster_oid_lease_carve(newauth, 8192, &start, &end, &newauth);
+	UT_ASSERT_EQ(start, FirstNormalObjectId + 8192);
+	UT_ASSERT_EQ(newauth, FirstNormalObjectId + 16384);
+	for (expected = 0xFFFFF000u; expected != 0; expected++)
+		UT_ASSERT_EQ(cluster_oid_lease_consume(&tail), expected);
+	UT_ASSERT_EQ(cluster_oid_lease_consume(&tail), InvalidOid);
+}
+
+UT_TEST(test_wrap_can_overlap_an_old_candidate_lease)
+{
+	ClusterOidLease old, tail, wrapped;
+	Oid authority;
+
+	/* A slow node may still hold candidates from a previous cycle.  The
+	 * callers' catalog/file collision checks, not leases, establish identity. */
+	cluster_oid_lease_carve(FirstNormalObjectId, 2, &old.next, &old.end, &authority);
+	cluster_oid_lease_carve(UINT32_MAX, 1, &tail.next, &tail.end, &authority);
+	cluster_oid_lease_carve(authority, 2, &wrapped.next, &wrapped.end, &authority);
+	UT_ASSERT_EQ(cluster_oid_lease_consume(&old), FirstNormalObjectId);
+	UT_ASSERT_EQ(cluster_oid_lease_consume(&wrapped), FirstNormalObjectId);
+	UT_ASSERT_EQ(cluster_oid_lease_consume(&tail), UINT32_MAX);
+	UT_ASSERT_EQ(cluster_oid_lease_consume(&tail), InvalidOid);
+}
+
+UT_TEST(test_last_oid_consumed_once)
+{
+	ClusterOidLease lease;
+	Oid newauth;
+
+	cluster_oid_lease_carve(UINT32_MAX, 1, &lease.next, &lease.end, &newauth);
+	UT_ASSERT_EQ(newauth, FirstNormalObjectId);
+	UT_ASSERT_EQ(cluster_oid_lease_consume(&lease), UINT32_MAX);
+	UT_ASSERT_EQ(cluster_oid_lease_consume(&lease), InvalidOid);
+	cluster_oid_lease_carve(50000, 0, &lease.next, &lease.end, &newauth);
+	UT_ASSERT_EQ(lease.next, InvalidOid);
+	UT_ASSERT_EQ(lease.end, InvalidOid);
 }
 
 UT_TEST(test_consume_advances_and_exhausts)
@@ -309,7 +353,7 @@ UT_TEST(test_authority_write_read_round_trip)
 	UT_ASSERT_EQ(got, 888888u);
 }
 
-UT_TEST(test_authority_primary_corrupt_falls_back_to_bak)
+UT_TEST(test_authority_primary_corrupt_rejects_stale_bak)
 {
 	char primary[MAXPGPATH];
 	Oid got = 0;
@@ -333,9 +377,104 @@ UT_TEST(test_authority_primary_corrupt_falls_back_to_bak)
 		close(fd);
 	}
 
-	/* read now falls back to the .bak (the rolled 111111) */
+	/* A valid older backup cannot prove the already-issued high-water. */
+	UT_ASSERT_EQ(cluster_oid_authority_read(&got), false);
+	UT_ASSERT_EQ(got, 0);
+	UT_ASSERT_EQ(unlink(primary), 0);
+	UT_ASSERT_EQ(cluster_oid_authority_read(&got), false);
+	UT_ASSERT_EQ(cluster_oid_authority_present(), true);
+}
+
+UT_TEST(test_authority_rejects_unknown_version_and_reserved_state)
+{
+	ClusterOidAuthorityHeader hdr;
+	int field;
+
+	for (field = 0; field < 3; field++) {
+		memset(&hdr, 0, sizeof(hdr));
+		hdr.magic = CLUSTER_OID_AUTHORITY_MAGIC;
+		hdr.version = CLUSTER_OID_AUTHORITY_VERSION;
+		hdr.next_oid = 50000;
+		if (field == 0)
+			hdr.version++;
+		else if (field == 1)
+			hdr.reserved = 1;
+		else
+			hdr.next_oid = 5;
+		INIT_CRC32C(hdr.crc);
+		COMP_CRC32C(hdr.crc, (char *)&hdr, offsetof(ClusterOidAuthorityHeader, crc));
+		FIN_CRC32C(hdr.crc);
+		UT_ASSERT(cluster_oid_authority_classify((char *)&hdr, sizeof(hdr))
+				  != CLUSTER_OID_AUTHORITY_VALID);
+	}
+}
+
+UT_TEST(test_authority_legacy_end_marker_wraps)
+{
+	Oid got = 1;
+	Oid start, end, newauth;
+
+	setup_shared_dir();
+	unlink_authority();
+	cluster_oid_authority_write(InvalidOid);
 	UT_ASSERT_EQ(cluster_oid_authority_read(&got), true);
-	UT_ASSERT_EQ(got, 111111u);
+	UT_ASSERT_EQ(got, InvalidOid);
+	UT_ASSERT_EQ(cluster_oid_authority_seed_if_absent(50000), false);
+	cluster_oid_lease_carve(got, 8192, &start, &end, &newauth);
+	UT_ASSERT_EQ(start, FirstNormalObjectId);
+	UT_ASSERT_EQ(end, FirstNormalObjectId + 8192);
+	UT_ASSERT_EQ(newauth, end);
+}
+
+UT_TEST(test_authority_wrap_survives_reopen)
+{
+	Oid got = InvalidOid;
+	Oid start, end, newauth;
+
+	setup_shared_dir();
+	unlink_authority();
+	cluster_oid_authority_write(UINT32_MAX - 2);
+	UT_ASSERT(cluster_oid_authority_read(&got));
+	cluster_oid_lease_carve(got, 8192, &start, &end, &newauth);
+	UT_ASSERT_EQ(start, UINT32_MAX - 2);
+	UT_ASSERT_EQ(end, InvalidOid);
+	UT_ASSERT_EQ(newauth, FirstNormalObjectId);
+	cluster_oid_authority_write(newauth);
+	/* Losing the unused tail must not restore it from the older .bak. */
+	UT_ASSERT(cluster_oid_authority_read(&got));
+	UT_ASSERT_EQ(got, FirstNormalObjectId);
+	UT_ASSERT_EQ(cluster_oid_authority_seed_if_absent(UINT32_MAX - 2), false);
+	cluster_oid_lease_carve(got, 8192, &start, &end, &newauth);
+	cluster_oid_authority_write(newauth);
+	UT_ASSERT(cluster_oid_authority_read(&got));
+	UT_ASSERT_EQ(got, FirstNormalObjectId + 8192);
+}
+
+UT_TEST(test_seed_never_replaces_unreadable_existing_authority)
+{
+	char primary[MAXPGPATH];
+	Oid got = 0;
+	int fd;
+	volatile bool rejected = false;
+
+	setup_shared_dir();
+	unlink_authority();
+	cluster_oid_authority_write(70000);
+	cluster_oid_authority_write(80000);
+	UT_ASSERT_EQ(cluster_oid_authority_read(&got), true);
+	snprintf(primary, sizeof(primary), "%s/%s", test_root, CLUSTER_OID_AUTHORITY_REL_PATH);
+	fd = open(primary, O_WRONLY | O_TRUNC);
+	UT_ASSERT(fd >= 0);
+	if (fd >= 0)
+		close(fd);
+	expect_authority_error = true;
+	if (setjmp(authority_error_jmp) == 0)
+		(void)cluster_oid_authority_seed_if_absent(50000);
+	else
+		rejected = true;
+	expect_authority_error = false;
+	UT_ASSERT(rejected);
+	UT_ASSERT_EQ(cluster_oid_authority_read(&got), false);
 }
 
 UT_TEST(test_authority_seed_if_absent)
@@ -430,20 +569,26 @@ UT_TEST(test_authority_present_fails_closed_on_unreadable)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(19);
 	UT_RUN(test_normalize_forces_reserved_up);
 	UT_RUN(test_carve_basic_block);
-	UT_RUN(test_carve_normalizes_reserved_hw);
+	UT_RUN(test_carve_rejects_reserved_hw);
 	UT_RUN(test_carve_disjoint_from_monotonic_hw);
-	UT_RUN(test_carve_wraparound_capped);
+	UT_RUN(test_carve_wrap_restarts_after_tail);
+	UT_RUN(test_wrap_can_overlap_an_old_candidate_lease);
 	UT_RUN(test_consume_advances_and_exhausts);
 	UT_RUN(test_consume_no_overlap_between_two_leases);
 	UT_RUN(test_classify_short_and_magic_and_crc);
 	UT_RUN(test_authority_write_read_round_trip);
-	UT_RUN(test_authority_primary_corrupt_falls_back_to_bak);
+	UT_RUN(test_authority_primary_corrupt_rejects_stale_bak);
+	UT_RUN(test_authority_rejects_unknown_version_and_reserved_state);
+	UT_RUN(test_authority_legacy_end_marker_wraps);
+	UT_RUN(test_authority_wrap_survives_reopen);
 	UT_RUN(test_authority_seed_if_absent);
 	UT_RUN(test_authority_present_distinguishes_corrupt_from_absent);
 	UT_RUN(test_authority_present_fails_closed_on_unreadable);
+	UT_RUN(test_last_oid_consumed_once);
+	UT_RUN(test_seed_never_replaces_unreadable_existing_authority);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -37,8 +37,11 @@
 #include "postgres.h"
 
 #include <limits.h>
+#include <sys/stat.h>
 
+#include "access/xlog.h"
 #include "common/relpath.h"
+#include "miscadmin.h"
 #include "storage/block.h"
 #include "utils/guc.h"
 #include "libpq/pqcomm.h"
@@ -1066,6 +1069,28 @@ static const struct config_enum_entry cluster_storage_fence_driver_options[]
  *	prepends it to a relative relpath, and every node must name the same
  *	shared mount, which only an absolute path can express unambiguously.
  */
+/* Shared catalog coherence cannot be disabled by configuration reload or
+ * by changing startup assignment order. Author: SqlRush <sqlrush@gmail.com> */
+static bool
+check_cluster_sinval_ack_mode(int *newval, void **extra, GucSource source)
+{
+	if (cluster_shared_catalog && *newval == CLUSTER_SINVAL_ACK_MODE_NONE) {
+		GUC_check_errdetail("shared catalogs require acknowledged invalidation");
+		return false;
+	}
+	return true;
+}
+
+static bool
+check_cluster_shared_catalog(bool *newval, void **extra, GucSource source)
+{
+	if (*newval && cluster_sinval_ack_mode == CLUSTER_SINVAL_ACK_MODE_NONE) {
+		GUC_check_errdetail("shared catalogs require acknowledged invalidation");
+		return false;
+	}
+	return true;
+}
+
 static bool
 check_cluster_shared_data_dir(char **newval, void **extra, GucSource source)
 {
@@ -2398,11 +2423,42 @@ cluster_init_guc(void)
 					 "visible on the others.  Off keeps per-node catalog copies. "
 					 "All nodes in a cluster must set the same value."),
 		&cluster_shared_catalog, false,
-		PGC_POSTMASTER, /* routing + bootstrap mode fixed at startup */
-		0,				/* flags */
-		NULL,			/* check_hook */
-		NULL,			/* assign_hook */
-		NULL);			/* show_hook */
+		PGC_POSTMASTER,				  /* routing + bootstrap mode fixed at startup */
+		0,							  /* flags */
+		check_cluster_shared_catalog, /* check_hook */
+		NULL,						  /* assign_hook */
+		NULL);						  /* show_hook */
+
+	/* Reject shared backup recovery before control-file selection/migration
+	 * or startup replay. Media recovery cannot reconstruct a missing DROP
+	 * reservation until its owner qualifies the closed recovery window. */
+	if ((cluster_shared_catalog || cluster_shared_config) && DataDir != NULL) {
+		char label_path[MAXPGPATH];
+		struct stat st;
+
+		snprintf(label_path, sizeof(label_path), "%s/%s", DataDir, BACKUP_LABEL_FILE);
+		if (lstat(label_path, &st) == 0)
+			ereport(FATAL, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("backup_label recovery is not supported in shared mode"),
+							errhint("Preserve the backup and use a supported native restore. "
+									"Do not remove backup_label to bypass recovery.")));
+		else if (errno != ENOENT)
+			ereport(FATAL, (errcode_for_file_access(),
+							errmsg("could not inspect backup label \"%s\": %m", label_path)));
+	}
+
+	/* Placeholder conversion reports check-hook failures as WARNING and
+	 * retains the default. Reject startup explicitly instead of silently
+	 * turning the requested shared catalog off. Bootstrap rechecks after
+	 * applying the final settings. */
+	if (cluster_shared_catalog && wal_level == WAL_LEVEL_MINIMAL)
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("shared catalogs require wal_level=replica")));
+	/* The legacy checkpoint redo advertisement can fail with WARNING.
+	 * OID reuse requires durable root publication before unlink cleanup. */
+	if (cluster_shared_catalog && !cluster_shared_config)
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("shared catalogs require cluster.shared_config=on")));
 
 	/*
 	 * cluster.oid_lease_size -- spec-6.14 D6.  Under shared_catalog=on a node
@@ -4534,44 +4590,25 @@ cluster_init_guc(void)
 							&cluster_sinval_broadcast_max_queue_size, 1024, 64, 65536,
 							PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
-	/*
-	 * spec-2.39 D12:  cluster.sinval_ack_mode (enum) — DDL commit ack barrier
-	 * mode.  none = fire-and-forget (spec-2.38 行为);peer_enqueued = wait
-	 * until all declared+CSSD-ALIVE peers ACK received the batch into their
-	 * inbound queue (or走 RESET_PENDING fail-safe).  PGC_SIGHUP reload.
-	 */
-	DefineCustomEnumVariable("cluster.sinval_ack_mode",
-							 gettext_noop("Sinval propagation ack/barrier mode."),
-							 gettext_noop("none = fire-and-forget;peer_enqueued = wait IC ACK "
-										  "from each declared+CSSD-ALIVE peer (default).  Caller "
-										  "blocks WaitLatch until cluster.sinval_ack_timeout_ms."),
-							 &cluster_sinval_ack_mode, CLUSTER_SINVAL_ACK_MODE_PEER_ENQUEUED,
-							 cluster_sinval_ack_mode_options, PGC_SIGHUP, 0, NULL, NULL, NULL);
-
-	/*
-	 * spec-2.39 D12:  cluster.sinval_ack_timeout_ms (int) — ack wait timeout.
-	 * On timeout WARN with SQLSTATE 53R95 + bump ack_timeout_count + DDL
-	 * continues (already committed locally + WAL flushed, no rollback).
-	 */
+	/* Shared catalog waits end only after exact installed-SI ACKs. The
+	 * timeout setting is an observation interval, not permission to proceed. */
+	DefineCustomEnumVariable(
+		"cluster.sinval_ack_mode", gettext_noop("Sinval propagation acknowledgement mode."),
+		gettext_noop("Shared catalogs require peer_enqueued: wait for each admitted "
+					 "peer to install invalidation in its local SI queue."),
+		&cluster_sinval_ack_mode, CLUSTER_SINVAL_ACK_MODE_PEER_ENQUEUED,
+		cluster_sinval_ack_mode_options, PGC_SIGHUP, 0, check_cluster_sinval_ack_mode, NULL, NULL);
 	DefineCustomIntVariable(
-		"cluster.sinval_ack_timeout_ms", gettext_noop("Sinval ack wait timeout in milliseconds."),
-		gettext_noop("Maximum time cluster_sinval_enqueue_and_wait_ack will "
-					 "block waiting for peer ACKs.  Timeout → WARN 53R95 + "
-					 "ack_timeout_count++ + DDL continues.  PGC_SIGHUP."),
+		"cluster.sinval_ack_timeout_ms",
+		gettext_noop("Sinval acknowledgement observation interval in milliseconds."),
+		gettext_noop("Shared catalog publication remains pending and retries after this interval. "
+					 "Legacy non-shared propagation retains its timeout result."),
 		&cluster_sinval_ack_timeout_ms, 5000, 100, 60000, PGC_SIGHUP, 0, NULL, NULL, NULL);
-
-	/*
-	 * spec-2.39 D12:  cluster.sinval_ack_wait_slots (int) — ack_wait HTAB
-	 * capacity (concurrent in-flight DDL ack waits).  PGC_POSTMASTER because
-	 * shmem is allocated once at startup from this value.
-	 */
 	DefineCustomIntVariable(
 		"cluster.sinval_ack_wait_slots", gettext_noop("Capacity of ClusterSinvalAckWait HTAB."),
-		gettext_noop("Maximum concurrent in-flight DDL ack waits per node.  "
-					 "Full → cluster_sinval_enqueue_and_wait_ack returns "
-					 "ENQUEUE_FAILED + bump outbound_queue_full_count + LMON "
-					 "broadcasts SINVAL_RESET_ALL_BROADCAST fail-safe.  "
-					 "PGC_POSTMASTER."),
+		gettext_noop(
+			"Maximum concurrent invalidation publications and acknowledgement waits. "
+			"Shared catalog publication waits for capacity without discarding its payload."),
 		&cluster_sinval_ack_wait_slots, 256, 64, 4096, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	/*

@@ -954,8 +954,10 @@ set_mock_declared(int count, const int32 *nodes)
 /* spec-5.10 D7 GUC stubs (defined in cluster_guc.c in the backend build). */
 /* From B's audited fixture update: recovery is outside this fairness test.
  * Unexpected use stays closed instead of fabricating an empty census. */
+bool cluster_shared_catalog = false;
 bool cluster_control_request_census(uint64 epoch, uint64 *version);
 bool cluster_control_request_census_unchanged(uint64 epoch, uint64 version);
+bool cluster_sinval_reconfig_reset_ready(uint64 epoch);
 bool
 cluster_control_request_census(uint64 epoch pg_attribute_unused(), uint64 *version)
 {
@@ -964,7 +966,12 @@ cluster_control_request_census(uint64 epoch pg_attribute_unused(), uint64 *versi
 }
 bool
 cluster_control_request_census_unchanged(uint64 epoch pg_attribute_unused(),
-										 uint64 version pg_attribute_unused())
+									   uint64 version pg_attribute_unused())
+{
+	return false;
+}
+bool
+cluster_sinval_reconfig_reset_ready(uint64 epoch pg_attribute_unused())
 {
 	return false;
 }

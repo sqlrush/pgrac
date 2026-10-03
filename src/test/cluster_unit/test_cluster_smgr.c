@@ -76,9 +76,43 @@
 /* GUC variables read by cluster_smgr / cluster_shared_fs. */
 int cluster_shared_storage_backend = 0;
 bool cluster_smgr_user_relations = false;
+bool cluster_shared_config = false;
 bool cluster_shared_catalog = false;			   /* spec-6.14 D3 routing flip */
 bool cluster_controlfile_shared_authority = false; /* read by D1 startup vet */
 bool cluster_merged_recovery = false;			   /* read by D1 startup vet (D9 amend dep) */
+bool IsBinaryUpgrade = false;
+volatile uint32 InterruptHoldoffCount = 0;
+volatile uint32 QueryCancelHoldoffCount = 0;
+
+/* This standalone unit does not provide PG's error stack. These link-only
+ * paths must never manufacture a successful unit result. */
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+ErrorData *
+CopyErrorData(void)
+{
+	abort();
+}
+void
+FlushErrorState(void)
+{
+	abort();
+}
+void
+ThrowErrorData(ErrorData *edata pg_attribute_unused())
+{
+	abort();
+}
+void
+FreeErrorData(ErrorData *edata pg_attribute_unused())
+{
+	abort();
+}
+void
+pg_re_throw(void)
+{
+	abort();
+}
 
 void
 pg_usleep(long microsec pg_attribute_unused())

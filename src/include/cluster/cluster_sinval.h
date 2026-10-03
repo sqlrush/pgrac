@@ -88,7 +88,8 @@ StaticAssertDecl(sizeof(SharedInvalidationMessage) == 16,
 /*
  * Upper bound for sinval messages per broadcast envelope.  Together with
  * sizeof(SinvalBroadcastHeader) == 24 this caps wire payload at
- * 24 + 64 * 16 = 1048B per envelope (well below PGRAC_IC_PAYLOAD_MAX).
+ * 24 + 64 * 16 = 1048B for legacy frames, or 1064B with incarnation fields
+ * for a publication (both below PGRAC_IC_PAYLOAD_MAX).
  *
  * cluster.sinval_broadcast_batch_size GUC has a check hook enforcing
  * 1 <= value <= CLUSTER_SINVAL_BATCH_MAX to prevent runtime misconfigure.
@@ -103,10 +104,11 @@ StaticAssertDecl(sizeof(SharedInvalidationMessage) == 16,
  *     [  8,  16) epoch         -- HC100 stale-reply 校验 (cluster_epoch)
  *     [ 16,  20) source_node   -- HC135 echo defense (sender cluster_node_id)
  *     [ 20,  22) nmsgs         -- actual msg count in tail (1..CLUSTER_SINVAL_BATCH_MAX)
- *     [ 22,  24) flags         -- reserved for future use (must be 0)
+ *     [ 22,  24) flags         -- SINVAL_* framing and acknowledgement bits
  *
- *   Followed by `nmsgs × SharedInvalidationMessage` (each 16B per HC137).
- *   Envelope.payload_length = 24 + 16 * nmsgs;  checksum lives in
+ *   Legacy frames append `nmsgs × SharedInvalidationMessage` (16B each).
+ *   SINVAL_PUBLICATION adds the two incarnation fields before those messages.
+ *   Envelope.payload_length = header size + 16 * nmsgs; checksum lives in
  *   ClusterICEnvelope.payload_crc32c (envelope covers full payload).
  */
 typedef struct SinvalBroadcastHeader {
@@ -114,7 +116,7 @@ typedef struct SinvalBroadcastHeader {
 	uint64 epoch;	   /*  8B [  8,  16) HC100 */
 	int32 source_node; /*  4B [ 16,  20) HC135 envelope-level echo defense */
 	uint16 nmsgs;	   /*  2B [ 20,  22) tail message count */
-	uint16 flags;	   /*  2B [ 22,  24) reserved (0) */
+	uint16 flags;	   /*  2B [ 22,  24) framing flags */
 } SinvalBroadcastHeader;
 
 StaticAssertDecl(sizeof(SinvalBroadcastHeader) == 24,
@@ -124,7 +126,7 @@ StaticAssertDecl(sizeof(SinvalBroadcastHeader) == 24,
 /* ============================================================
  * HC139:  producer mask — only LMON may send PGRAC_IC_MSG_SINVAL wire
  *         envelopes because it owns tier1 TCP fds.  Backends MUST enqueue
- *         into ClusterSinvalOutbound via cluster_sinval_enqueue_batch();
+ *         into ClusterSinvalOutbound or retain a publication in the ACK table;
  *         SinvalBcast only applies inbound messages locally.
  * ============================================================ */
 #define CLUSTER_IC_PRODUCER_SINVAL_FANOUT ((uint32)(1u << B_LMON))
@@ -138,16 +140,16 @@ StaticAssertDecl(sizeof(SinvalBroadcastHeader) == 24,
  *     [  8,  16) epoch         -- HC100 stale-reply 校验 (cluster_epoch)
  *     [ 16,  20) acker_node    -- sender (the peer applying SI locally)
  *     [ 20,  22) status        -- ClusterSinvalAckStatus enum
- *     [ 22,  24) flags         -- reserved (must be 0)
+ *     [ 22,  24) flags         -- 0 for legacy, SINVAL_PUBLICATION for bound ACK
  *
- *   envelope.payload_length = 24.  Envelope CRC32C covers all 24 bytes
- *   (Hardening v1.0.1 L164 extension).
+ *   Legacy envelope.payload_length = 24; publication ACK length = 40.
+ *   Envelope CRC32C covers the complete payload.
  *
  *   HC140 (NEW):  ack envelope wire ABI invariants:
  *     - sizeof(SinvalAckHeader) == 24 锁 (StaticAssertDecl)
  *     - status MUST be valid ClusterSinvalAckStatus value (0/1/2)
- *     - flags MUST be 0 (reserved for future)
- *     - acker_node MUST be in [0, CLUSTER_MAX_NODES)
+ *     - legacy flags MUST be 0; publication flags MUST be SINVAL_PUBLICATION
+ *     - publication acker_node MUST be in [0, CLUSTER_MAX_NODES)
  *     - epoch MUST match current cluster_epoch (HC100)
  * ============================================================ */
 typedef struct SinvalAckHeader {
@@ -155,28 +157,33 @@ typedef struct SinvalAckHeader {
 	uint64 epoch;	  /*  8B [  8,  16) HC100 */
 	int32 acker_node; /*  4B [ 16,  20) sender peer id */
 	uint16 status;	  /*  2B [ 20,  22) ClusterSinvalAckStatus */
-	uint16 flags;	  /*  2B [ 22,  24) reserved (0) */
+	uint16 flags;	  /*  2B [ 22,  24) framing flags */
 } SinvalAckHeader;
 
 StaticAssertDecl(sizeof(SinvalAckHeader) == 24,
 				 "spec-2.39 D4 SinvalAckHeader wire ABI 24B fixed; HC140");
 
+/* PGRAC: an acknowledged publication binds both postmaster incarnations.
+ * The original prefix remains the framing discriminator. Author: SqlRush. */
+typedef struct SinvalPublicationHeader {
+	SinvalBroadcastHeader base;
+	uint64 origin_incarnation;
+	uint64 target_incarnation;
+} SinvalPublicationHeader;
+
+typedef struct SinvalPublicationAckHeader {
+	SinvalAckHeader base;
+	uint64 origin_incarnation;
+	uint64 target_incarnation;
+} SinvalPublicationAckHeader;
+
+StaticAssertDecl(sizeof(SinvalPublicationHeader) == 40, "sinval publication header size");
+StaticAssertDecl(sizeof(SinvalPublicationAckHeader) == 40, "sinval publication ACK size");
+
 /*
- * ClusterSinvalAckStatus -- v0.3 P2 显式三态.
- *
- *   SINVAL_ACK_DONE          -- peer cluster_sinval_inbound_try_enqueue OK;
- *                               sender ack_received_mask bit-set fulfilled.
- *   SINVAL_ACK_DROPPED       -- peer validation 失败 (echo defense / epoch
- *                               stale / source_node bound 等);sender 不计
- *                               fulfilled (normally not emitted on wire —
- *                               validation drop 在 ack send 之前;included
- *                               for wire ABI completeness + future extension).
- *   SINVAL_ACK_RESET_PENDING -- peer inbound queue full → 触发 fail-safe
- *                               SIResetAll() path;sender 视为 fulfilled
- *                               (远端 catalog 通过 RESET-all 兜底).
- *
- *   Sender bit-set fulfilled rule (HC141 NEW):
- *     DONE | RESET_PENDING → bit-set;DROPPED → 不 bit-set (走 timeout).
+ * DONE means native SI insertion completed (and for a publication, local
+ * relcache init files were invalidated). DROPPED and RESET_PENDING never
+ * satisfy a sender. Their numeric values remain part of the legacy ABI.
  */
 typedef enum ClusterSinvalAckStatus {
 	SINVAL_ACK_DONE = 0,
@@ -190,7 +197,7 @@ typedef enum ClusterSinvalAckStatus {
 /* ============================================================
  * spec-2.39 D7 + v0.3 P1 — SinvalBroadcastHeader.flags bits.
  *
- *   SINVAL_REQUIRES_ACK         -- enqueuer 等 ACK (peer_enqueued barrier).
+ *   SINVAL_REQUIRES_ACK         -- enqueuer waits for an installed-SI ACK.
  *                                  When set, every receiving peer MUST
  *                                  emit a PGRAC_IC_MSG_SINVAL_ACK envelope.
  *   SINVAL_RESET_ALL_BROADCAST  -- (v0.3 P1) outbound queue full fallback
@@ -207,7 +214,8 @@ typedef enum ClusterSinvalAckStatus {
  * ============================================================ */
 #define SINVAL_REQUIRES_ACK ((uint16)0x0001)
 #define SINVAL_RESET_ALL_BROADCAST ((uint16)0x0002)
-#define SINVAL_KNOWN_FLAGS (SINVAL_REQUIRES_ACK | SINVAL_RESET_ALL_BROADCAST)
+#define SINVAL_PUBLICATION ((uint16)0x0004)
+#define SINVAL_KNOWN_FLAGS (SINVAL_REQUIRES_ACK | SINVAL_RESET_ALL_BROADCAST | SINVAL_PUBLICATION)
 
 
 /* ============================================================
@@ -330,34 +338,25 @@ extern void cluster_sinval_request_reset_all_broadcast(void);
 extern bool cluster_sinval_is_active(void);
 
 /*
- * spec-2.39 D2 — peer_enqueued ack/barrier blocking variant.
+ * Shared-catalog publication retains the payload and the exact admitted
+ * cohort until every target incarnation has installed native SI invalidation.
+ * The precommit hook snapshots membership before durability; publication and
+ * LMON retries run after durability, while transaction locks remain held.
+ * Timeout is diagnostic only. LMON revalidates the cohort after epoch changes
+ * and retries its surviving/new incarnations; the change itself is no ACK.
+ * ack_mode=none is forbidden in this mode. Only DONE is returned.
  *
- *   Used by AtEOXact_Inval(true) + COMMIT PREPARED production hook (D1).
- *   Caller blocks (WaitLatch) until all declared+CSSD-ALIVE peers ACK
- *   received the batch (status DONE or RESET_PENDING — both視 fulfilled
- *   per HC141) or cluster.sinval_ack_timeout_ms elapses.
- *
- *   GUC cluster.sinval_ack_mode controls behavior:
- *     none           -- skip ack wait entirely;equivalent to plain
- *                       cluster_sinval_enqueue_batch (fire-and-forget).
- *     peer_enqueued  -- (default) wait for IC ack envelope from each
- *                       alive peer (v0.3 P2 semantics).
- *
- *   Returns:
- *     CLUSTER_SINVAL_ACK_DONE          -- all alive peers ACK'd in time
- *     CLUSTER_SINVAL_ACK_TIMEOUT       -- timeout elapsed;bump
- *                                         ack_timeout_count;WARN 53R95
- *     CLUSTER_SINVAL_ACK_ENQUEUE_FAILED -- enqueue_batch returned false
- *                                         (outbound queue full);caller
- *                                         WARNS 53R94 + LMON broadcasts
- *                                         SINVAL_RESET_ALL_BROADCAST
- *                                         sentinel as fail-safe (v0.3 P1).
+ * Outside shared-catalog mode, the legacy API uses its bounded wait and can
+ * return TIMEOUT or ENQUEUE_FAILED. Callers must handle these results.
  */
 typedef enum ClusterSinvalAckResult {
 	CLUSTER_SINVAL_ACK_DONE = 0,
 	CLUSTER_SINVAL_ACK_TIMEOUT,
 	CLUSTER_SINVAL_ACK_ENQUEUE_FAILED
 } ClusterSinvalAckResult;
+
+extern void cluster_sinval_prepare_commit(void);
+extern void cluster_sinval_clear_commit(void);
 
 extern ClusterSinvalAckResult
 cluster_sinval_enqueue_and_wait_ack(const SharedInvalidationMessage *msgs, int n);
@@ -382,6 +381,13 @@ extern void cluster_sinval_broadcast_reset_all(void);
  *   弹性收敛 across cluster (no cross-node coordination needed).
  */
 extern void cluster_sinval_reset_all_on_reconfig(void);
+
+/* Full native cache reset, including relcache init files. A nonzero ticket
+ * completes only after installation; callers must keep their admission
+ * barrier closed while it is pending. Author: SqlRush <sqlrush@gmail.com> */
+extern uint64 cluster_sinval_request_reset(void);
+extern bool cluster_sinval_reset_is_complete(uint64 ticket);
+extern bool cluster_sinval_reconfig_reset_ready(uint64 epoch);
 
 /*
  * spec-2.39 D3 — ack_wait shmem region size / init.

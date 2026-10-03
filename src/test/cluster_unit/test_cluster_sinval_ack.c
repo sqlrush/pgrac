@@ -10,7 +10,7 @@
  *	    L2  CLUSTER_IC_PRODUCER_SINVAL_ACK == (1u << B_LMON)  (L172 family)
  *	    L3  sizeof(SinvalAckHeader) == 24  (HC140 wire ABI lock)
  *	    L4  SINVAL_REQUIRES_ACK == 0x0001 + SINVAL_RESET_ALL_BROADCAST ==
- *	        0x0002 + SINVAL_KNOWN_FLAGS == 0x0003  (HC142 v0.3 P1)
+ *	        0x0002 + SINVAL_KNOWN_FLAGS == 0x0007  (HC142 v0.3 P1)
  *	    L5  ClusterSinvalAckStatus enum tri-state (DONE=0/DROPPED=1/
  *	        RESET_PENDING=2)  (v0.3 P2)
  *	    L6  HC141 sender fulfilled rule:  DONE & RESET_PENDING both视
@@ -192,12 +192,13 @@ UT_TEST(test_ack_header_sizeof_24)
 UT_TEST(test_known_flags_invariants)
 {
 	/* v0.3 P1:  SINVAL_REQUIRES_ACK = 1 + SINVAL_RESET_ALL_BROADCAST = 2.
-	 * SINVAL_KNOWN_FLAGS must include both and only both. */
+	 * SINVAL_KNOWN_FLAGS also includes the incarnation-bound publication flag. */
 	UT_ASSERT_EQ((unsigned int)SINVAL_REQUIRES_ACK, 0x0001u);
 	UT_ASSERT_EQ((unsigned int)SINVAL_RESET_ALL_BROADCAST, 0x0002u);
-	UT_ASSERT_EQ((unsigned int)SINVAL_KNOWN_FLAGS, 0x0003u);
-	UT_ASSERT_EQ((unsigned int)(SINVAL_REQUIRES_ACK | SINVAL_RESET_ALL_BROADCAST),
-				 (unsigned int)SINVAL_KNOWN_FLAGS);
+	UT_ASSERT_EQ((unsigned int)SINVAL_KNOWN_FLAGS, 0x0007u);
+	UT_ASSERT_EQ(
+		(unsigned int)(SINVAL_REQUIRES_ACK | SINVAL_RESET_ALL_BROADCAST | SINVAL_PUBLICATION),
+		(unsigned int)SINVAL_KNOWN_FLAGS);
 }
 
 UT_TEST(test_ack_status_enum_tri_state)
@@ -209,13 +210,11 @@ UT_TEST(test_ack_status_enum_tri_state)
 	UT_ASSERT_EQ((int)SINVAL_ACK_RESET_PENDING, 2);
 }
 
-UT_TEST(test_ack_fulfilled_rule_hc141)
+UT_TEST(test_ack_status_values_are_distinct)
 {
-	/* HC141:  sender bit-set fulfilled rule.  Verified via enum value
-	 * relationship:  DONE & RESET_PENDING both视 fulfilled (sender
-	 * mask bit-set);DROPPED 不 (走 timeout path).  Test 是 static
-	 * contract statement;  runtime path 在 cluster_tap t/118 L? 验. */
+	/* Wire values only. Runtime completion is tested by test_cluster_sinval_stop. */
 	UT_ASSERT_NE((int)SINVAL_ACK_DONE, (int)SINVAL_ACK_DROPPED);
+	UT_ASSERT_NE((int)SINVAL_ACK_RESET_PENDING, (int)SINVAL_ACK_DONE);
 	UT_ASSERT_NE((int)SINVAL_ACK_RESET_PENDING, (int)SINVAL_ACK_DROPPED);
 }
 
@@ -293,12 +292,13 @@ UT_TEST(test_batch_max_inheritance_unchanged)
 int
 main(void)
 {
+	UT_PLAN(16);
 	UT_RUN(test_ack_msg_type_is_19);
 	UT_RUN(test_ack_producer_mask_equals_lmon_bit);
 	UT_RUN(test_ack_header_sizeof_24);
 	UT_RUN(test_known_flags_invariants);
 	UT_RUN(test_ack_status_enum_tri_state);
-	UT_RUN(test_ack_fulfilled_rule_hc141);
+	UT_RUN(test_ack_status_values_are_distinct);
 	UT_RUN(test_enqueue_and_wait_ack_prototype_linkable);
 	UT_RUN(test_broadcast_reset_all_prototype_linkable);
 	UT_RUN(test_reset_all_on_reconfig_prototype_linkable);

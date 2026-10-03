@@ -88,6 +88,7 @@ static void
 CheckClusterSharedUtilitySupport(Node *statement)
 {
 	const char *unsupported = NULL;
+	ObjectType object_type = OBJECT_TABLE;
 	ListCell *lc;
 
 	if (statement == NULL || (!cluster_shared_config && !cluster_shared_catalog))
@@ -95,6 +96,14 @@ CheckClusterSharedUtilitySupport(Node *statement)
 	check_stack_depth();
 	switch (nodeTag(statement))
 	{
+		case T_TransactionStmt:
+			/* Prepared transactions do not yet own a durable shared-catalog
+			 * publication obligation. Reject before prepare or finish work. */
+			if (((TransactionStmt *) statement)->kind == TRANS_STMT_PREPARE
+				|| ((TransactionStmt *) statement)->kind == TRANS_STMT_COMMIT_PREPARED
+				|| ((TransactionStmt *) statement)->kind == TRANS_STMT_ROLLBACK_PREPARED)
+				unsupported = "two-phase transactions";
+			break;
 		case T_ClusterStmt:
 			unsupported = "CLUSTER";
 			break;
@@ -108,6 +117,24 @@ CheckClusterSharedUtilitySupport(Node *statement)
 			break;
 		case T_CreateExtensionStmt:
 			unsupported = "CREATE EXTENSION";
+			break;
+		case T_CompositeTypeStmt:
+		case T_CreateDomainStmt:
+		case T_CreateEnumStmt:
+		case T_CreateRangeStmt:
+		case T_AlterDomainStmt:
+		case T_AlterEnumStmt:
+		case T_AlterTypeStmt:
+			unsupported = "custom types";
+			break;
+		case T_CreateOpClassStmt:
+		case T_CreateOpFamilyStmt:
+		case T_AlterOpFamilyStmt:
+		case T_AlterOperatorStmt:
+			unsupported = "custom operators";
+			break;
+		case T_DefineStmt:
+			object_type = ((DefineStmt *) statement)->kind;
 			break;
 		case T_CreateSubscriptionStmt:
 			/* Creation itself persists a replication origin. */
@@ -132,6 +159,9 @@ CheckClusterSharedUtilitySupport(Node *statement)
 			if (((CreateStmt *) statement)->relation != NULL
 				&& ((CreateStmt *) statement)->relation->relpersistence == RELPERSISTENCE_UNLOGGED)
 				unsupported = "UNLOGGED tables";
+			else if (((CreateStmt *) statement)->inhRelations != NIL)
+				/* CREATE ... INHERITS / PARTITION OF also attaches a child. */
+				unsupported = "partition and inheritance attachment";
 			break;
 		case T_CreateTableAsStmt:
 			{
@@ -145,6 +175,7 @@ CheckClusterSharedUtilitySupport(Node *statement)
 			}
 			break;
 		case T_AlterTableStmt:
+			object_type = ((AlterTableStmt *) statement)->objtype;
 			if (((AlterTableStmt *) statement)->objtype == OBJECT_MATVIEW)
 				unsupported = "materialized views";
 			else
@@ -156,23 +187,54 @@ CheckClusterSharedUtilitySupport(Node *statement)
 				unsupported = "UNLOGGED tables";
 			else if (((AlterTableCmd *) statement)->subtype == AT_SetTableSpace)
 				unsupported = "ALTER TABLE SET TABLESPACE";
+			else if (((AlterTableCmd *) statement)->subtype == AT_AddInherit
+					 || ((AlterTableCmd *) statement)->subtype == AT_DropInherit
+					 || ((AlterTableCmd *) statement)->subtype == AT_AttachPartition
+					 || ((AlterTableCmd *) statement)->subtype == AT_DetachPartition
+					 || ((AlterTableCmd *) statement)->subtype == AT_DetachPartitionFinalize)
+				unsupported = "partition and inheritance attachment or detachment";
 			break;
 		case T_DropStmt:
-			if (((DropStmt *) statement)->removeType == OBJECT_MATVIEW)
-				unsupported = "materialized views";
+			object_type = ((DropStmt *) statement)->removeType;
 			break;
 		case T_RenameStmt:
+			object_type = ((RenameStmt *) statement)->renameType;
+			if (((RenameStmt *) statement)->relationType == OBJECT_TYPE
+				|| object_type == OBJECT_DOMCONSTRAINT)
+				object_type = OBJECT_TYPE;
 			if (((RenameStmt *) statement)->renameType == OBJECT_MATVIEW
 				|| ((RenameStmt *) statement)->relationType == OBJECT_MATVIEW)
 				unsupported = "materialized views";
 			break;
 		case T_AlterObjectSchemaStmt:
-			if (((AlterObjectSchemaStmt *) statement)->objectType == OBJECT_MATVIEW)
-				unsupported = "materialized views";
+			object_type = ((AlterObjectSchemaStmt *) statement)->objectType;
+			break;
+		case T_AlterOwnerStmt:
+			object_type = ((AlterOwnerStmt *) statement)->objectType;
 			break;
 		case T_CreateSchemaStmt:
 			foreach(lc, ((CreateSchemaStmt *) statement)->schemaElts)
 				CheckClusterSharedUtilitySupport((Node *) lfirst(lc));
+			break;
+		default:
+			break;
+	}
+	switch (object_type)
+	{
+		case OBJECT_MATVIEW:
+			unsupported = "materialized views";
+			break;
+		case OBJECT_TYPE:
+		case OBJECT_DOMAIN:
+			unsupported = "custom types";
+			break;
+		case OBJECT_OPERATOR:
+		case OBJECT_OPCLASS:
+		case OBJECT_OPFAMILY:
+			unsupported = "custom operators";
+			break;
+		case OBJECT_EXTENSION:
+			unsupported = "CREATE/DROP EXTENSION";
 			break;
 		default:
 			break;

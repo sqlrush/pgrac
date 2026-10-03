@@ -316,6 +316,7 @@ UT_TEST(test_inbound_full_sets_reset_flag)
 int
 main(void)
 {
+	UT_PLAN(24);
 	UT_RUN(test_sinval_msg_type_is_7);
 	UT_RUN(test_producer_mask_equals_lmon_bit);
 	UT_RUN(test_broadcast_header_sizeof_24);

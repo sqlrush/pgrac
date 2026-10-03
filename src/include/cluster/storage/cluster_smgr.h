@@ -27,8 +27,10 @@
  *	    - fsync registration: spec-6.0a wires cluster_smgr writes into
  *	      PG's RegisterSyncRequest path via SYNC_HANDLER_CLUSTER_SHARED;
  *	      queue-full fallback performs an immediate backend barrier_sync.
- *	      Pending-unlink remains backend-specific because raw layout frees
- *	      extents through WAL-logged metadata rather than md.c segments.
+ *	      Non-redo permanent MAIN keeps a zero-length tombstone, retired
+ *	      through that handler after the dropping node's next checkpoint.
+ *	      Shared replay retains MAIN until its recovery window is durably
+ *	      closed; it must not enqueue ordinary checkpoint unlink meanwhile.
  *	    - GUC `cluster.smgr_user_relations` is EXPERIMENTAL in
  *	      Stage 1.X (default off; ON triggers postmaster startup
  *	      WARNING from cluster_shared_fs_init -- moved here from

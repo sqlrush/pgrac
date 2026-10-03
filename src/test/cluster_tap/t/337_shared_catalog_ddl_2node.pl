@@ -28,7 +28,7 @@
 #          fail-closes 53R97 (D8/R11 negative leg + the heapam LOCAL-guard
 #          trigger case); disarm restores service.
 #      L5  (Q12 / §3.6 rejection face) CREATE UNLOGGED TABLE, ALTER TABLE
-#          SET UNLOGGED, CREATE DATABASE and CREATE TABLESPACE refuse with
+#          SET UNLOGGED, CREATE/DROP DATABASE and CREATE TABLESPACE refuse with
 #          feature_not_supported under shared_catalog=on.
 #      L4c (A-L6) sequence DDL + nextval on both nodes: one line of values.
 #      L4d (A-L7 serialized; runs in the END-ZONE after L4h) DDL originated
@@ -613,8 +613,26 @@ like($erru2, qr/SET UNLOGGED is not supported with/,
 
 my ($rcu3, undef, $erru3) = $node0->psql('postgres', 'CREATE DATABASE q12_db');
 isnt($rcu3, 0, 'L5: CREATE DATABASE is refused');
-like($erru3, qr/CREATE DATABASE is not supported with/,
+like($erru3, qr/CREATE(?:\/DROP)? DATABASE is not supported (?:with|in)/,
 	'L5: CREATE DATABASE refusal is the explicit fail-closed message');
+
+# Real shared postmasters, with no test-only flag changes. template1 is
+# already present on both nodes and must survive even a FORCE request.
+my $template_oid = $node0->safe_psql('postgres',
+	q{SELECT oid FROM pg_database WHERE datname='template1'});
+for my $node ($node0, $node1)
+{
+	my ($rcdrop, undef, $errdrop) = $node->psql('postgres',
+		"\\set VERBOSITY verbose\nDROP DATABASE template1 WITH (FORCE)");
+	is($rcdrop, 3, 'L5: shared DROP DATABASE is refused before mutation');
+	like($errdrop, qr/0A000:.*(?:CREATE\/)?DROP DATABASE is not supported in shared mode/s,
+		'L5: DROP DATABASE refusal comes from the shared feature boundary');
+	is($node->safe_psql('postgres',
+		q{SELECT oid FROM pg_database WHERE datname='template1'}), $template_oid,
+		'L5: refused DROP preserves the database identity on each shared node');
+	ok(-d $node->data_dir . "/base/$template_oid",
+		'L5: refused DROP preserves the database directory');
+}
 
 my ($rcu4, undef, $erru4) = $node0->psql('postgres',
 	"CREATE TABLESPACE q12_ts LOCATION ''");

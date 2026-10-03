@@ -44,7 +44,7 @@
 #include "catalog/pg_tablespace.h"
 #include "commands/comment.h"
 #ifdef USE_PGRAC_CLUSTER
-#include "cluster/cluster_guc.h" /* PGRAC: spec-6.14 shared-catalog CREATE DATABASE refusal */
+#include "cluster/cluster_guc.h" /* PGRAC: shared database lifecycle refusal */
 #endif
 #include "commands/dbcommands.h"
 #include "commands/dbcommands_xlog.h"
@@ -739,12 +739,10 @@ createdb(ParseState *pstate, const CreatedbStmt *stmt)
 	 * are a separate feature (spec-6.14b).  Explicit fail-closed refusal
 	 * until then.
 	 */
-	if (cluster_shared_catalog)
+	if (cluster_shared_catalog || cluster_shared_config)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("CREATE DATABASE is not supported with cluster.shared_catalog"),
-				 errhint("Multi-database shared catalog support is not yet implemented "
-						 "(spec-6.14b).")));
+				 errmsg("CREATE DATABASE is not supported in shared mode")));
 #endif
 
 	/* Extract options from the statement node tree */
@@ -1615,6 +1613,16 @@ dropdb(const char *dbname, bool missing_ok, bool force)
 	int			nslots,
 				nslots_active;
 	int			nsubscriptions;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Directory removal has no shared recovery-window closure proof. Refuse
+	 * before any catalog lock, backend termination, or file mutation, including
+	 * direct internal callers that do not pass through ProcessUtility. */
+	if (cluster_shared_catalog || cluster_shared_config)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("DROP DATABASE is not supported in shared mode")));
+#endif
 
 	/*
 	 * Look up the target database's OID, and get exclusive lock on it. We

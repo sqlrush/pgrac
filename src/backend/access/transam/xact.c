@@ -2845,6 +2845,12 @@ CommitTransaction(void)
 	if (!is_parallel_worker)
 		PreCommit_CheckForSerializationFailure();
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: publication identity must be ready before the durable commit. */
+	if (!is_parallel_worker)
+		PreCommit_ClusterInval();
+#endif
+
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();
 

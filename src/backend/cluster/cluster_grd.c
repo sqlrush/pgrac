@@ -57,6 +57,7 @@
 #include "cluster/cluster_signal.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_sinval.h"
 #include "cluster/cluster_cssd.h"			/* spec-2.16 D8 newly-dead bitmap diff */
 #include "cluster/cluster_ic_tier1.h"		/* cluster_ic_tier1_get_peer_fd (RF-ROOT P6 diag) */
 #include "cluster/cluster_epoch.h"			/* spec-4.6 D1 — accepted epoch reads */
@@ -4775,7 +4776,12 @@ cluster_grd_recovery_lmon_tick(void)
 		 * just defers the announce until the whole pool is swept.
 		 */
 		if (grd_recovery_barrier_complete(gen, episode_epoch)
-			&& grd_block_redeclare_scan_complete(episode_epoch)) {
+			&& grd_block_redeclare_scan_complete(episode_epoch)
+			&& cluster_sinval_reconfig_reset_ready(episode_epoch)) {
+			/* Full SI RESET must be installed before this survivor's DONE
+			 * allows any master to discard failed holders and grant again.
+			 * Data-recovery completion has a separate final reset ticket.
+			 * Author: SqlRush <sqlrush@gmail.com> */
 			/*
 			 * Local rebind barrier complete:  announce to every survivor
 			 * (REDECLARE_DONE) and record self for the LOCKED episode
@@ -8482,6 +8488,13 @@ cluster_grd_lmon_tick_dead_sweep(void)
 	uint64 current_dead_bitmap = 0;
 	uint64 newly_dead;
 	int peer_id;
+
+	/* Shared-catalog holders survive a heartbeat death until P6 has the
+	 * recovery/barrier proof. Sweeping before the epoch bump could grant
+	 * a failed DDL's lock before any survivor installed its RESET.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_catalog)
+		return;
 
 	/* Postmaster-only tick (single LMON consumer).  No LWLock needed
 	 * for static state. */

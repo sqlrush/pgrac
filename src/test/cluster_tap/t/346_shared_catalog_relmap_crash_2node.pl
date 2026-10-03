@@ -1,25 +1,13 @@
 #-------------------------------------------------------------------------
 #
 # 346_shared_catalog_relmap_crash_2node.pl
-#    spec-6.14 D5-activation -- relmap authority crash arbitration, 2 nodes.
+#    Shared catalog scope and OID authority crash checks, 2 nodes.
 #
-#    A mapped-catalog rewrite (VACUUM FULL pg_class) commits its new map
-#    through the shared relmap authority in two halves: stage PENDING
-#    pre-commit, PUBLISH post-commit (INV-14-8).  A writer that dies between
-#    the halves leaves a durable pending image that the next sole merger
-#    (merge-claim holder) arbitrates by the owner xid's terminal status.
-#    The two crash windows are unreachable by natural SQL timing, so two
-#    designed-PANIC injection points drive them:
+#    R1/R2 arm the former mapped-rewrite crash points and prove that user
+#    VACUUM FULL is rejected with 0A000 before either point can execute.
+#    R3 exercises supported TRUNCATE and its internal btree rebuild.
+#    These cases do not claim mapped-rewrite crash-recovery coverage.
 #
-#      R1  cluster-relmap-crash-after-stage: die with a staged,
-#          UNCOMMITTED pending -> crash arbitration DISCARDS it; the
-#          mapped relfilenumber is unchanged on both nodes.
-#      R2  cluster-relmap-crash-before-publish: die with a committed,
-#          UNPUBLISHED pending -> crash arbitration PUBLISHES it (the
-#          deferred post-commit half) and broadcasts the relmap
-#          invalidation; both nodes adopt the new relfilenumber.
-#      R3  the write path is healthy after both crashes: a plain
-#          VACUUM FULL pg_class round-trips cluster-wide.
 #      R4  (B-L10) OID lease crash non-reissue: a kill mid-lease loses the
 #          lease's unconsumed tail but never reissues -- every OID handed
 #          out after the cold restart is strictly above everything issued
@@ -290,8 +278,7 @@ sub owner_settle
 
 owner_settle();
 
-# One designed-crash round trip: node0 is already dead from the injection
-# PANIC (postmaster exits; TAP default restart_after_crash=off).  node1
+# One OID-lease crash round trip: node0 has been stopped immediately. Node1
 # declares it dead, then crashes too (immediate stop keeps its tail), and
 # both cold-restart -- the first claim holder's merged recovery runs the
 # relmap arbitration (the second finds nothing pending; idempotent).
@@ -382,81 +369,52 @@ sub authority_filenode
 	return '';
 }
 
-# The arbitration runs on whichever node holds the merge claim first; its
-# LOG line lands in that node's file.
-sub both_logs
+# User rewrites must stop at the SQL scope guard, even with a lower-level
+# crash injection armed. A nonzero psql status alone is not a PANIC witness.
+for my $point ('cluster-relmap-crash-after-stage',
+               'cluster-relmap-crash-before-publish')
 {
-	return PostgreSQL::Test::Utils::slurp_file($node0->logfile)
-		. PostgreSQL::Test::Utils::slurp_file($node1->logfile);
+    $node0->safe_psql('postgres',
+        "ALTER SYSTEM SET cluster.injection_points = '$point:skip'");
+    $node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
+    my $before = length(PostgreSQL::Test::Utils::slurp_file($node0->logfile));
+    my ($out, $err);
+    my $rc = $node0->psql('postgres',
+        "\\set VERBOSITY verbose\nVACUUM FULL pg_class;",
+        stdout => \$out, stderr => \$err);
+    isnt($rc, 0, "$point: user rewrite refuses");
+    like($err, qr/0A000:.*VACUUM FULL.*not supported in shared mode/s,
+        "$point: refusal is the scope guard, not a crash");
+    is($node0->safe_psql('postgres', 'SELECT 1'), '1',
+        "$point: writer stays available without restart");
+    unlike(substr(PostgreSQL::Test::Utils::slurp_file($node0->logfile), $before),
+        qr/\Q$point\E injection/, "$point: mapped rewrite callback was not reached");
+    $node0->safe_psql('postgres',
+        "ALTER SYSTEM SET cluster.injection_points = '$point:none'");
+    $node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
+    is($node0->safe_psql('postgres', "SELECT pg_relation_filenode('pg_class')"),
+        $fn_base, "$point: writer mapped file is unchanged");
+    is($node1->safe_psql('postgres', "SELECT pg_relation_filenode('pg_class')"),
+        $fn_base, "$point: peer mapped file is unchanged");
+    is(authority_filenode(1259), $fn_base,
+        "$point: authority retains the original mapped file");
 }
 
-# ----------
-# R1 (discard shape): die with a staged, UNCOMMITTED pending.
-# ----------
-$node0->safe_psql('postgres',
-	"ALTER SYSTEM SET cluster.injection_points = 'cluster-relmap-crash-after-stage:skip'");
-$node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
-
-my ($r1rc) = $node0->psql('postgres', 'VACUUM FULL pg_class');
-isnt($r1rc, 0, 'R1: VACUUM FULL dies at the designed after-stage PANIC');
-
-ok(cold_restart_both('R1'), 'R1: cluster cold-restarted after the crash');
-
-# Disarm before anything else writes relmap.  NB: an EMPTY list (ALTER
-# SYSTEM RESET) does NOT disarm a skip-armed point -- disarming needs an
-# explicit ':none' (spec-0.27 lever semantics).
-$node0->safe_psql('postgres',
-	"ALTER SYSTEM SET cluster.injection_points = 'cluster-relmap-crash-after-stage:none'");
-$node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
-
-my $logs = both_logs();
-like($logs, qr/cluster-relmap-crash-after-stage injection/,
-	'R1: the designed PANIC fired');
-like($logs, qr/cluster relmap arbitration discarded pending generation/,
-	'R1: crash arbitration DISCARDED the uncommitted pending');
-
-is($node0->safe_psql('postgres', "SELECT pg_relation_filenode('pg_class')"),
-	$fn_base, 'R1: node0 still resolves the pre-crash relfilenumber');
-is(authority_filenode(1259), $fn_base,
-	'R1: the authority committed image still maps pg_class to the pre-crash file');
-
-# ----------
-# R2 (publish shape): die with a committed, UNPUBLISHED pending.
-# ----------
-$node0->safe_psql('postgres',
-	"ALTER SYSTEM SET cluster.injection_points = 'cluster-relmap-crash-before-publish:skip'");
-$node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
-
-my ($r2rc) = $node0->psql('postgres', 'VACUUM FULL pg_class');
-isnt($r2rc, 0, 'R2: VACUUM FULL dies at the designed before-publish PANIC');
-
-ok(cold_restart_both('R2'), 'R2: cluster cold-restarted after the crash');
-
-$node0->safe_psql('postgres',
-	"ALTER SYSTEM SET cluster.injection_points = 'cluster-relmap-crash-before-publish:none'");
-$node0->safe_psql('postgres', 'SELECT pg_reload_conf()');
-
-$logs = both_logs();
-like($logs, qr/cluster-relmap-crash-before-publish injection/,
-	'R2: the designed PANIC fired');
-like($logs, qr/cluster relmap arbitration published pending generation/,
-	'R2: crash arbitration PUBLISHED the committed pending');
-
-my $fn_r2 = $node0->safe_psql('postgres',
-	"SELECT pg_relation_filenode('pg_class')");
-isnt($fn_r2, $fn_base, 'R2: node0 resolves the rewritten relfilenumber');
-is(authority_filenode(1259), $fn_r2,
-	'R2: the authority committed image maps pg_class to the arbitration-published file');
-
-# ----------
-# R3: the write path is healthy after both crash shapes.
-# ----------
-$node0->safe_psql('postgres', 'VACUUM FULL pg_class');
-my $fn_r3 = $node0->safe_psql('postgres',
-	"SELECT pg_relation_filenode('pg_class')");
-isnt($fn_r3, $fn_r2, 'R3: a plain mapped rewrite works after the crashes');
-is(authority_filenode(1259), $fn_r3,
-	'R3: the authority committed image maps pg_class to the plain-rewrite file');
+# Supported TRUNCATE retains transactional rollback and the btree index.
+$node0->safe_psql('postgres', q{
+CREATE TABLE truncate_scope(id integer PRIMARY KEY);
+INSERT INTO truncate_scope VALUES (1);
+BEGIN; TRUNCATE truncate_scope; ROLLBACK;
+});
+is($node0->safe_psql('postgres', 'SELECT count(*) FROM truncate_scope'), '1',
+    'R3: rolled-back TRUNCATE retains rows');
+$node0->safe_psql('postgres', 'TRUNCATE truncate_scope');
+is($node0->safe_psql('postgres', 'SELECT count(*) FROM truncate_scope'), '0',
+    'R3: committed TRUNCATE removes rows');
+$node0->safe_psql('postgres', 'INSERT INTO truncate_scope VALUES (2)');
+is($node0->safe_psql('postgres', q{
+SET enable_seqscan=off; SELECT id FROM truncate_scope WHERE id=2}), '2',
+    'R3: internally rebuilt btree remains usable');
 
 # oid_authority_hw -- the durable OID authority high-water (header field
 # next_oid), read straight from the shared file like authority_filenode.

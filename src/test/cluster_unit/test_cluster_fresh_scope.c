@@ -843,10 +843,25 @@ UT_TEST(test_schema_prechecks_removed_children_but_retains_supported_commands)
 	check_utility_scope(&view, false);
 }
 
+UT_TEST(test_shared_two_phase_refuses_but_transaction_control_remains_native)
+{
+	TransactionStmt stmt = { .type = T_TransactionStmt };
+	TransactionStmtKind kinds[] = { TRANS_STMT_BEGIN,			TRANS_STMT_START,
+									TRANS_STMT_COMMIT,			TRANS_STMT_ROLLBACK,
+									TRANS_STMT_SAVEPOINT,		TRANS_STMT_RELEASE,
+									TRANS_STMT_ROLLBACK_TO,		TRANS_STMT_PREPARE,
+									TRANS_STMT_COMMIT_PREPARED, TRANS_STMT_ROLLBACK_PREPARED };
+
+	for (unsigned i = 0; i < lengthof(kinds); i++) {
+		stmt.kind = kinds[i];
+		check_utility_scope((Node *)&stmt, i >= 7);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(19);
 	UT_RUN(test_pre1_startup_refuses_before_root_and_without_writes);
 	UT_RUN(test_selected_pre1_image_and_corruption_are_distinct);
 	UT_RUN(test_nonshared_startup_remains_native);
@@ -865,6 +880,7 @@ main(void)
 	UT_RUN(test_shared_selected_control_requires_supported_checksums);
 	UT_RUN(test_shared_unbound_checksum_refusal_precedes_root_and_writes);
 	UT_RUN(test_nonshared_control_keeps_native_checksum_choice);
+	UT_RUN(test_shared_two_phase_refuses_but_transaction_control_remains_native);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

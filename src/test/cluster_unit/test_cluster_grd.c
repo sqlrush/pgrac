@@ -292,10 +292,12 @@ struct PGPROC *MyProc = NULL;
 /* spec-2.16 D8 L104 stubs:  cluster_grd_lmon_tick_dead_sweep depends on
  * cluster_cssd_get_dead_generation + cluster_cssd_get_peer_state.  Mock
  * to default-ALIVE (no sweep triggered). */
+static uint64 ut_cssd_dead_generation;
+static int ut_cssd_dead_node = -1;
 uint64
 cluster_cssd_get_dead_generation(void)
 {
-	return 0;
+	return ut_cssd_dead_generation;
 }
 
 typedef enum { CSSD_PEER_ALIVE = 0, CSSD_PEER_SUSPECTED = 1, CSSD_PEER_DEAD = 2 } _stub_peer_state;
@@ -304,8 +306,8 @@ static uint32 ut_routing_dead_mask;
 int /* ClusterCssdPeerState */
 cluster_cssd_get_peer_state(int32 peer_id)
 {
-	return ut_real_gcs_routing && peer_id >= 0 && peer_id < 32
-				   && (ut_routing_dead_mask & (1u << peer_id))
+	return peer_id == ut_cssd_dead_node || (ut_real_gcs_routing && peer_id >= 0 && peer_id < 32
+				   && (ut_routing_dead_mask & (1u << peer_id)))
 			   ? CSSD_PEER_DEAD
 			   : CSSD_PEER_ALIVE;
 }
@@ -717,6 +719,14 @@ pg_usleep(long microsec)
 void
 cluster_grd_redeclare_all_registered(void)
 {}
+
+static bool ut_sinval_reset_ready = true;
+bool cluster_sinval_reconfig_reset_ready(uint64 epoch);
+bool
+cluster_sinval_reconfig_reset_ready(uint64 epoch)
+{
+	return ut_sinval_reset_ready;
+}
 
 /* spec-4.6 P0#3 stub:  REDECLARE_DONE broadcast enqueues to the outbound
  * ring.  Standalone fixture has no ring; no-op success.  (peer-state stub
@@ -1150,6 +1160,7 @@ LWLockPadded *MainLWLockArray = NULL;
 int MaxBackends = 100;
 static PGPROC stub_proc_slots[1];
 bool cluster_shared_config = false;
+bool cluster_shared_catalog = false;
 static bool ut_control_census_ready = true;
 static bool ut_control_census_stable = true;
 
@@ -2252,6 +2263,21 @@ UT_TEST(test_grd_transaction_cleanup_on_node_dead_removes_entry)
 	UT_ASSERT_EQ(cluster_grd_entry_has_pending_waiter(entry), true);
 	cluster_grd_entry_release(entry);
 
+	/* A heartbeat death cannot release shared-catalog holders ahead of
+	 * the recovery and SI RESET barrier. The native profile still sweeps. */
+	cluster_shared_catalog = true;
+	ut_cssd_dead_generation = 1;
+	ut_cssd_dead_node = 5;
+	cluster_grd_lmon_tick_dead_sweep();
+	r = cluster_grd_entry_lookup_or_create(&resid, false, &after);
+	UT_ASSERT_EQ(r, CLUSTER_GRD_ENTRY_OK);
+	if (r == CLUSTER_GRD_ENTRY_OK) {
+		UT_ASSERT(cluster_grd_entry_has_remote_holder(after, 0));
+		cluster_grd_entry_release(after);
+	}
+	cluster_shared_catalog = false;
+	ut_cssd_dead_node = -1;
+	ut_cssd_dead_generation = 0;
 	cluster_grd_cleanup_on_node_dead(5);
 
 	r = cluster_grd_entry_lookup_or_create(&resid, false, &after);
@@ -6407,6 +6433,20 @@ UT_TEST(test_recovery_barrier_does_not_treat_missing_census_as_empty)
 	finish_recovery_control_fixture();
 }
 
+UT_TEST(test_recovery_barrier_waits_for_installed_cache_reset)
+{
+	setup_recovery_control_fixture(false);
+	ut_sinval_reset_ready = false;
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_BARRIER);
+	UT_ASSERT(cluster_grd_recovery_done_epoch_for(0) != 9);
+	ut_sinval_reset_ready = true;
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_CLUSTER);
+	UT_ASSERT_EQ(cluster_grd_recovery_done_epoch_for(0), 9);
+	finish_recovery_control_fixture();
+}
+
 UT_TEST(test_recovery_barrier_keeps_shared_debt_after_creator_exit)
 {
 	setup_recovery_control_fixture(false);
@@ -7569,7 +7609,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(161);
+	UT_PLAN(162);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 	UT_RUN(test_parallel_group_worker_cannot_wait_behind_blocked_ddl);
 	UT_RUN(test_parallel_group_convert_uses_original_holder_group);
@@ -7730,6 +7770,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_recovery_barrier_waits_for_auxiliary_and_self_owners);
 	UT_RUN(test_recovery_barrier_does_not_treat_missing_census_as_empty);
 	UT_RUN(test_recovery_barrier_keeps_shared_debt_after_creator_exit);
+	UT_RUN(test_recovery_barrier_waits_for_installed_cache_reset);
 	UT_RUN(test_recovery_owner_slot_reuse_resets_registration);
 	UT_RUN(test_recovery_control_refuses_other_failure_or_live_origin);
 	UT_RUN(test_recovery_control_requires_survivors_quorum_and_usable_map);

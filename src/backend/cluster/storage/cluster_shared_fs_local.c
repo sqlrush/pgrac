@@ -345,6 +345,7 @@ cluster_shared_fs_local_truncate(ClusterSharedFsHandle *handle, BlockNumber nblo
 	Assert(handle != NULL && handle->opened);
 
 	newsize = (off_t)nblocks * BLCKSZ;
+	CLUSTER_INJECTION_POINT("cluster-shared-fs-local-truncate");
 	if (FileTruncate(handle->vfd, newsize, WAIT_EVENT_DATA_FILE_TRUNCATE) < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
@@ -368,9 +369,13 @@ cluster_shared_fs_local_unlink(RelFileLocator rlocator, ForkNumber forknum)
 {
 	char *path = cluster_shared_fs_local_relpath(rlocator, forknum);
 
+	/* Auxiliary cleanup may run after commit is irreversible. Its retained
+	 * name still excludes this locator. MAIN failures use the checkpointer's
+	 * existing error-to-warning path and return a failed unlink request. */
 	if (unlink(path) < 0 && errno != ENOENT)
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("cluster_shared_fs.local: could not unlink \"%s\": %m", path)));
+		ereport(forknum == MAIN_FORKNUM ? ERROR : WARNING,
+				(errcode_for_file_access(),
+				 errmsg("cluster_shared_fs.local: could not unlink \"%s\": %m", path)));
 
 	pfree(path);
 }

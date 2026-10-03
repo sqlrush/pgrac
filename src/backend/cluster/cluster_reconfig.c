@@ -891,6 +891,10 @@ cluster_reconfig_publish_event(const ReconfigEvent *evt)
 		return;
 
 	memcpy(&published, evt, sizeof(ReconfigEvent));
+	/* Observer events also need RESET, even when the epoch was learned
+	 * before local membership reconciliation. This only queues work;
+	 * GRD waits for installation before announcing its local DONE. */
+	cluster_sinval_reset_all_on_reconfig();
 
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
 	cluster_write_fence_authority_cache_invalidate();
