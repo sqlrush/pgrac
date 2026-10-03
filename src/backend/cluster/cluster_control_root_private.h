@@ -665,6 +665,15 @@ cluster_control_root_v3_self_seal_v1(const ClusterWalSourceRef *restart, uint64 
 									 ClusterControlRootSnapshot *out,
 									 ClusterControlRootReadToken *out_token);
 
+/* S07: move this thread's ROOT physical retention lower forward to a bound
+ * computed by the retained-cut census under census_token (the whole ROOT
+ * file token).  Refuses unless the ROOT and the anchor's native redo are the
+ * ones the census used; old lower <= lower <= native redo.  Checkpointer
+ * only, no CF held; the published value is durable and reread on success. */
+extern ClusterControlRootResult cluster_control_root_v3_retained_lower_publish(
+	const ClusterControlRootIdentity *self, const ClusterControlRootFileToken *census_token,
+	XLogRecPtr native_redo, XLogRecPtr lower, ClusterControlRootSnapshot *out);
+
 extern bool
 cluster_control_root_create_authority_current_v1(const ClusterControlRootMigrationImage *image,
 												 const ClusterControlRootMigrationRoundV1 *round);

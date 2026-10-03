@@ -122,6 +122,21 @@
  *	  previous generation like any other; its input is sealed on the
  *	  self-seal evidence (newer admitted incarnation, old incarnation dead
  *	  on the voting disks, exact restart input), never by guesswork.
+ *
+ * PGRAC MODIFICATIONS (S07 retention lower)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-s9p2-03-shared-wal-and-checkpoint.md
+ *
+ *	What changed:
+ *	  - CreateCheckPoint(): after an online checkpoint's ROOT is published
+ *	    and before WAL cleanup, cluster_wal_retained_cut_after_checkpoint_v1
+ *	    may move the ROOT physical retention lower forward.
+ *
+ *	Why:
+ *	  The ROOT lower otherwise keeps every retained segment of the thread
+ *	  forever; cleanup can only use a lower that the complete retained
+ *	  input proves and that is already published.
  */
 
 #include "postgres.h"
@@ -207,6 +222,7 @@
 #include "cluster/cluster_scn.h" /* PGRAC: xl_scn stamp (spec-4.5) */
 #include "cluster/cluster_wal_state.h" /* PGRAC: checkpoint redo / fpw sticky (spec-4.5) */
 #include "cluster/cluster_wal_retention.h" /* PGRAC: STOP-05 guarded WAL reuse */
+#include "cluster/cluster_wal_retained_cut.h" /* PGRAC: S07 retention lower */
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_initdb_base.h"
 #include "cluster/cluster_wal_writer.h" /* PGRAC: durable group-flush promise */
@@ -9245,6 +9261,13 @@ CreateCheckPoint(int flags)
 	 * outer CF, native content lock or critical section encloses this wait. */
 	if (cluster_shared_config)
 		ClusterCheckpointV3Publish(&v3_checkpoint, recptr);
+
+	/* PGRAC (S07): with this checkpoint's ROOT published, move the physical
+	 * retention lower forward when the complete retained input allows it.
+	 * The WAL cleanup below reads only the published ROOT.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config && !shutdown)
+		cluster_wal_retained_cut_after_checkpoint_v1();
 
 	/*
 	 * RF A1 W5a: only a non-EOR checkpoint advertises its now-durable redo

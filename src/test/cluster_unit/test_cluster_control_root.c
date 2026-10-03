@@ -18959,6 +18959,165 @@ UT_TEST(test_wal_prefix_identity_is_absent_after_a_failed_scan)
 	UT_ASSERT(identity == NULL);
 }
 
+/* D (S07): publish a v3 checkpoint over retained history, then return the
+ * whole-file token a retained-cut census would have used. */
+static XLogRecPtr
+v3_retained_lower_fixture(uint8 published[66048], ClusterControlRootIdentity *self,
+						  ControlFileData *candidate, ClusterControlRootFileToken *census)
+{
+	uint8 before[66048];
+	ClusterControlRootSnapshot out;
+	ClusterControlRootFileToken token;
+	ControlRootImage root;
+	ControlFileData view;
+	char path[MAXPGPATH];
+	XLogRecPtr lower = v3_retained_checkpoint_fixture(false, before, self, candidate);
+
+	UT_ASSERT_EQ(cluster_control_root_v3_checkpoint_publish(self, candidate, test_checkpoint_end,
+															&out, &token, &view),
+				 0);
+	UT_ASSERT_EQ(out.checkpoint_lower_lsn, lower);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(self, &root, &view, census), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	UT_ASSERT_EQ(view.checkPointCopy.redo, candidate->checkPointCopy.redo);
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, published, 66048);
+	return lower;
+}
+
+/* The lower moves forward to a census bound, never past the same-token
+ * native redo; only the lower, the publication sequence and publisher fields
+ * change; repeating the same bound changes nothing. */
+UT_TEST(test_v3_retained_lower_publish_advances_monotonically)
+{
+	uint8 published[66048], after[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate, view;
+	ClusterControlRootFileToken census, token;
+	ClusterControlRootSnapshot out, before_record;
+	ControlRootImage root;
+	char path[MAXPGPATH];
+	XLogRecPtr redo, lower = v3_retained_lower_fixture(published, &self, &candidate, &census);
+
+	redo = candidate.checkPointCopy.redo;
+	UT_ASSERT(lower < redo);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&self, &root, &view, &token), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	before_record = root.records[self.origin_thread_id - 1];
+	UT_ASSERT_EQ(cluster_control_root_v3_retained_lower_publish(&self, &census, redo, redo, &out),
+				 0);
+	UT_ASSERT_EQ(out.checkpoint_lower_lsn, redo);
+	UT_ASSERT_EQ(out.root_publish_seq, before_record.root_publish_seq + 1);
+	UT_ASSERT_EQ(out.validated_tail_lsn_exclusive, before_record.validated_tail_lsn_exclusive);
+	UT_ASSERT_EQ(out.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&self, &root, &view, &token), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	UT_ASSERT_EQ(view.checkPointCopy.redo, redo); /* the anchor is untouched */
+	UT_ASSERT_EQ(root.records[self.origin_thread_id - 1].checkpoint_lower_lsn, redo);
+	{
+		ClusterControlRootSnapshot expected = before_record;
+		const ClusterControlRootSnapshot *actual = &root.records[self.origin_thread_id - 1];
+
+		expected.checkpoint_lower_lsn = redo;
+		expected.root_publish_seq = actual->root_publish_seq;
+		expected.published_at_usec = actual->published_at_usec;
+		expected.lifecycle_reason = actual->lifecycle_reason;
+		UT_ASSERT(memcmp(&expected, actual, sizeof(expected)) == 0);
+	}
+	/* Other records are untouched. */
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, after, sizeof(after));
+	UT_ASSERT(memcmp(after + 1024 + 512, published + 1024 + 512, 66048 - 1024 - 512) == 0);
+	/* The same bound again is a no-op, whatever the token. */
+	UT_ASSERT_EQ(cluster_control_root_v3_retained_lower_publish(&self, &token, redo, redo, &out),
+				 0);
+	UT_ASSERT_EQ(out.checkpoint_lower_lsn, redo);
+	v2_assert_primary_unchanged(after);
+}
+
+static int test_retained_lower_fault;
+
+static void
+v3_retained_lower_x_race(void)
+{
+	test_checkpoint_x_hook = NULL;
+	if (test_retained_lower_fault == 0)
+		v2_checkpoint_root_race();
+	else
+		test_epoch++;
+}
+
+/* Each refusal leaves the ROOT unchanged and releases CF and WALR. */
+UT_TEST(test_v3_retained_lower_publish_refuses_without_the_census_input)
+{
+	for (int fault = 0; fault < 11; fault++) {
+		uint8 published[66048];
+		ClusterControlRootIdentity self, other;
+		ControlFileData candidate;
+		ClusterControlRootFileToken census;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootResult expected = CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		XLogRecPtr lower = v3_retained_lower_fixture(published, &self, &candidate, &census);
+		XLogRecPtr redo = candidate.checkPointCopy.redo, native = redo, proposed = redo;
+
+		other = self;
+		if (fault == 0) {
+			census.file_txn_seq++; /* census of another ROOT */
+			expected = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		} else if (fault == 1) {
+			native = redo - 8; /* census of another native redo */
+			proposed = native;
+			expected = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		} else if (fault == 2)
+			proposed = redo + 8; /* past the native redo */
+		else if (fault == 3)
+			proposed = lower - 8; /* backwards */
+		else if (fault == 4)
+			proposed = InvalidXLogRecPtr;
+		else if (fault == 5) {
+			MyAuxProcType = NotAnAuxProcess;
+			expected = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		} else if (fault == 6) {
+			other.origin_owner_incarnation++;
+			expected = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		} else if (fault == 7 || fault == 8) {
+			test_retained_lower_fault = fault - 7;
+			test_checkpoint_x_hook = v3_retained_lower_x_race;
+			expected
+				= fault == 7 ? CLUSTER_CONTROL_ROOT_CAS_CONFLICT : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		} else if (fault == 9) {
+			test_actual_cf = test_cf_mode = ShareLock; /* caller holds CF */
+			expected = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		} else {
+			cluster_shared_config = false;
+			expected = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		}
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_retained_lower_publish(&other, &census, native, proposed, &out),
+			expected);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		if (fault == 9)
+			test_actual_cf = test_cf_mode = NoLock;
+		cluster_shared_config = true;
+		MyAuxProcType = CheckpointerProcess;
+		test_checkpoint_x_hook = NULL;
+		if (fault != 7)
+			v2_assert_primary_unchanged(published);
+		else
+			v2_assert_primary_unchanged(v2_race_winner);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		if (ut_current_failed)
+			printf("# retained lower fault %d\n", fault);
+	}
+}
+
 UT_TEST(test_v3_publishers_do_not_fallback_or_weaken_physical_checks)
 {
 	for (int fault = 0; fault < 5; fault++) {
@@ -21702,7 +21861,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(394);
+	UT_PLAN(396);
 	UT_RUN(test_wal_inputs_cold_all_origins_exact_native_anchor);
 	UT_RUN(test_wal_inputs_cold_retained_generations_remain_distinct);
 	UT_RUN(test_wal_inputs_cold_terminal_and_pending_are_not_checkpoint_sources);
@@ -21836,6 +21995,8 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_checkpoint_reads_retained_history_once);
 	UT_RUN(test_wal_prefix_identity_recheck_detects_a_changed_namespace);
 	UT_RUN(test_wal_prefix_identity_is_absent_after_a_failed_scan);
+	UT_RUN(test_v3_retained_lower_publish_advances_monotonically);
+	UT_RUN(test_v3_retained_lower_publish_refuses_without_the_census_input);
 	UT_RUN(test_v3_publishers_do_not_fallback_or_weaken_physical_checks);
 	UT_RUN(test_v3_normal_close_sparse_pair_preserves_exact_roster);
 	UT_RUN(test_v3_normal_close_cannot_discard_foreign_pending_initialization);

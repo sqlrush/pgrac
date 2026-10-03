@@ -8639,6 +8639,155 @@ cluster_control_root_v3_shutdown_checkpoint_publish(const ClusterControlRootIden
 								 view, 3);
 }
 
+/* PGRAC (S07): move this thread's physical retention lower forward to a
+ * bound computed by the retained-cut census (cluster_wal_retained_cut.c)
+ * under census_token.  The whole ROOT must still be the one the census read
+ * and the anchor's native redo the one it used; the lower only moves
+ * forward and never past that redo.  Only the lower and the publication
+ * fields change: the anchor, tail and history are untouched.  WALR is held
+ * from before CF; the new lower is durable and reread before return, so
+ * WAL cleanup can only ever see the published value.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterControlRootResult
+retained_lower_publish_work(CheckpointV2Work *work, const ClusterControlRootIdentity *self,
+							const ClusterControlRootFileToken *census, XLogRecPtr native_redo,
+							XLogRecPtr lower, uint64 epoch, ClusterControlRootSnapshot *out)
+{
+	ClusterControlRootResult result;
+	ClusterControlRootFileToken actual;
+	ClusterControlRootSnapshot *record;
+	ClusterWalPinResult walr_result;
+	int index = self->origin_thread_id - 1;
+
+	if (!acquire_clusterwide_cf(ShareLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = ShareLock;
+	result = read_thread_version(self, &work->base, &work->old_view, &work->before, 3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	record = &work->base.records[index];
+	if (work->base.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| work->base.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN
+		|| (work->base.header.v2.serving[cluster_node_id / 64]
+			& (UINT64_C(1) << (cluster_node_id % 64)))
+			   == 0
+		|| record->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+		|| work->old_view.state != DB_IN_PRODUCTION)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if (lower == record->checkpoint_lower_lsn) {
+		*out = *record; /* already published */
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+	if (!file_token_equal(census, &work->before)
+		|| work->old_view.checkPointCopy.redo != native_redo)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (lower < record->checkpoint_lower_lsn || lower > native_redo
+		|| native_redo > record->validated_tail_lsn_exclusive)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (work->base.header.file_txn_seq == UINT64_MAX || record->root_publish_seq == UINT64_MAX)
+		return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
+	if (!checkpoint_v2_owner_current(self, epoch, record->checkpoint_tli,
+									 record->validated_tail_lsn_exclusive))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	make_read_token(&work->base, self->origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
+					&work->thread_token);
+	work->cf_mode = NoLock;
+	result = release_cf(ShareLock, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	walr_result
+		= cluster_wal_retention_root_publish_begin_exact(&work->thread_token, false, &work->walr);
+	if (walr_result != CLUSTER_WAL_PIN_OK)
+		return walr_result == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+													: CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (!acquire_clusterwide_cf(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = ExclusiveLock;
+	result = read_thread_version(self, &work->next, &work->new_view, &actual, 3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	if (!file_token_equal(&work->before, &actual))
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	record = &work->next.records[index];
+	if (!checkpoint_v2_owner_current(self, epoch, record->checkpoint_tli,
+									 record->validated_tail_lsn_exclusive))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	record->checkpoint_lower_lsn = lower;
+	record->root_publish_seq++;
+	record->published_at_usec = GetCurrentTimestamp();
+	record->lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_CHECKPOINT_ADVANCE;
+	work->next.publisher_incarnation[index] = self->origin_owner_incarnation;
+	work->next.publisher_node[index] = self->origin_node_id;
+	work->next.header.file_txn_seq++;
+	work->next.header.published_at_usec = record->published_at_usec;
+	result = encode_extended_image(&work->next, 3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!publish_updated_image(&work->base, &work->next))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	result = read_thread_version(self, &work->base, &work->new_view, &work->after, 3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	if (memcmp(work->base.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
+		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
+	*out = work->base.records[index];
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_retained_lower_publish(const ClusterControlRootIdentity *self,
+											   const ClusterControlRootFileToken *census_token,
+											   XLogRecPtr native_redo, XLogRecPtr lower,
+											   ClusterControlRootSnapshot *out)
+{
+	CheckpointV2Work *work;
+	ClusterControlRootSnapshot published;
+	ClusterControlRootResult result;
+	uint64 epoch;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (self == NULL || census_token == NULL || out == NULL || !cluster_shared_config
+		|| !AmCheckpointerProcess() || !enableFsync || self->origin_thread_id == 0
+		|| self->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
+		|| native_redo == InvalidXLogRecPtr)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (lower == InvalidXLogRecPtr || lower > native_redo)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	/* Never invert an outer CF hold into WALR acquisition. */
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	epoch = cluster_epoch_get_current();
+	work = palloc0(sizeof(*work));
+	work->purpose = CHECKPOINT_V2_ONLINE;
+	work->format_version = 3;
+	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i)
+		work->wal_dirs[i] = -1;
+	for (size_t i = 0; i < lengthof(work->wal_segments); ++i)
+		work->wal_segments[i] = -1;
+	memset(&published, 0, sizeof(published));
+	PG_TRY();
+	{
+		result = retained_lower_publish_work(work, self, census_token, native_redo, lower, epoch,
+											 &published);
+	}
+	PG_CATCH();
+	{
+		(void)checkpoint_v2_cleanup(work, CLUSTER_CONTROL_ROOT_IO_ERROR);
+		pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	result = checkpoint_v2_cleanup(work, result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = published;
+	pfree(work);
+	return result;
+}
+
 ClusterControlRootResult
 cluster_control_root_v3_shutdown_observe(const ClusterWalSourceRef *ref,
 										 ClusterControlRootSnapshot *out,
