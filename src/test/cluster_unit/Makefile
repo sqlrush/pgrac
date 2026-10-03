@@ -792,10 +792,12 @@ test_cluster_runtime_visibility: test_cluster_runtime_visibility.c unit_test.h $
 # Exercise the original requester branch and live membership wrapper, with
 # proof/transport boundaries supplied by the fixture rather than copied logic.
 test_cluster_tt_terminal_route.inc: $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c \
-		$(top_srcdir)/src/backend/cluster/cluster_undo_authority_snapshot.c Makefile
-	awk '/^(rtvis_local_freshref_c1b_pair_eligible|cluster_undo_verdict_resolve_internal|cluster_undo_serve_authority_lookup|cluster_undo_serve_authority)\(/ \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_authority_snapshot.c \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_gcs.c Makefile
+	awk '/^(rtvis_try_origin_verdict|cluster_undo_serve_allowed|rtvis_local_freshref_c1b_pair_eligible|cluster_undo_verdict_resolve_internal|cluster_undo_serve_authority_lookup|cluster_undo_serve_authority)\(/ \
 	     { print previous; emit=1; found++ } emit { print } /^}/ { emit=0 } \
-	     { previous=$$0 } END { if (found != 4 || emit) exit 1 }' \
+	     { previous=$$0 } END { if (found != 6 || emit) exit 1 }' \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_gcs.c \
 		$(top_srcdir)/src/backend/cluster/cluster_undo_authority_snapshot.c \
 		$(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c > $@.tmp
 	mv $@.tmp $@
