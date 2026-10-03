@@ -72,16 +72,24 @@ class BlackBox:
         if profile.get("version") != 1:
             raise ValueError("unsupported test entry file version")
         seeds = 0
+        cohorts = 0
         for entry in profile["initialize"]:
-            if set(entry) != {"tool", "argv"} or entry["tool"] != "pgrac-init":
-                raise ValueError("fresh initialization must use pgrac-init")
+            if set(entry) != {"tool", "argv"} or entry["tool"] not in ("pgrac-init", "initdb"):
+                raise ValueError("fresh initialization must use a supported product creator")
             argv = entry["argv"]
             self.validate_argv(argv)
-            seeds += argv.count("--cluster-seed")
+            if entry["tool"] == "initdb":
+                cohorts += argv.count("--pgrac-initdb-cohort")
+                if argv.count("--pgrac-initdb-cohort") != 1 or sum(
+                        a.startswith("--pgrac-initdb-shared-config=") for a in argv) != 1:
+                    raise ValueError("initdb requires the native cohort and canonical request")
+            else:
+                seeds += argv.count("--cluster-seed")
             if any(a.split("=")[0] in ("--force", "--join-from", "--join-from-backup") for a in argv):
                 raise ValueError("no overwrite or backup-based PRE2 fresh initializer")
-        if seeds != 1:
-            raise ValueError("one and only one --cluster-seed is required")
+        if not ((seeds == 1 and cohorts == 0) or
+                (seeds == 0 and cohorts == 1 and len(profile["initialize"]) == 1)):
+            raise ValueError("one and only one fresh cluster creator is required")
         for entry in profile.get("operations", {}).values():
             if set(entry) == {"node", "sql"} and isinstance(entry["sql"], str) and entry["sql"].strip():
                 continue
@@ -97,7 +105,9 @@ class BlackBox:
 
     def describe(self):
         # Run even when no entry file exists: retain the actual installed CLI.
-        self.command("pgrac-init", ["--help"])
+        tool = "initdb" if self.profile and any(e.get("tool") == "initdb"
+               for e in self.profile.get("initialize", [])) else "pgrac-init"
+        self.command(tool, ["--help"])
         self.validate()
         return dict(capabilities=["fresh_init", "shared_start", "shared_stop",
                                   *self.profile.get("operations", {})])
