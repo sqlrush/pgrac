@@ -352,6 +352,30 @@ extern bool cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_cen
 extern bool cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
 	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent, uint32 owner_instance,
 	uint32 segment_id, ClusterUndoBlock0ResolvedRoot *out);
+/* Stack-only evidence for one terminal inquiry. It grants no owner liveness,
+ * block/writer authority or visibility. Retain verbatim until current(). */
+#define CLUSTER_SEMANTIC_TERMINAL_DATA_CHANNELS 8
+typedef struct ClusterSemanticTerminalPeerSnapshot {
+	uint64 record_generation, formation_epoch, admission_publication_seq;
+	uint64 membership_cut_generation, ack_publication_seq, local_boot_incarnation;
+	uint64 peer_boot_id, peer_admitted_incarnation;
+	uint64 peer_control_generation, peer_capability_generation;
+	uint64 peer_control_stream_generation;
+	uint64 peer_data_generation[CLUSTER_SEMANTIC_TERMINAL_DATA_CHANNELS];
+	uint32 peer_data_channels;
+	int32 peer_node_id;
+	uint32 required_hello_caps;
+} ClusterSemanticTerminalPeerSnapshot;
+
+/* Caller holds the same entered R4 TARGET token across the original C1b
+ * request and current(). Capture failure clears out. Neither call publishes. */
+extern bool cluster_semantic_activation_terminal_peer_capture(
+	const ClusterSemanticAdmissionToken *admission, int32 peer_node_id,
+	uint32 required_hello_caps, ClusterSemanticTerminalPeerSnapshot *out);
+extern bool cluster_semantic_activation_terminal_peer_current(
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterSemanticTerminalPeerSnapshot *expected);
+
 extern bool cluster_semantic_activation_peer_open_matches(
 	const ClusterSemanticAdmissionToken *token, int32 authenticated_peer_node_id,
 	uint32 required_hello_caps, uint32 sampled_capability_generation);

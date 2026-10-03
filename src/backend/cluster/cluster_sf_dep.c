@@ -227,8 +227,7 @@ cluster_sf_dep_shmem_register(void)
  *
  * spec-2.2 additive amendment (spec-5.22e D5 prereq): record the peer's
  * verified HELLO capability word, bound to the connection generation that
- * carried it (tier1: the peer's reconnect_count while the connection was
- * established).  Called from the acceptor's HELLO verify, from the dialer's
+ * carried it (tier1: the CONTROL owner's nonzero stream lifetime).  Called from the acceptor's HELLO verify, from the dialer's
  * PEER_CAPS_REPLY handler, and from RDMA verify (generation 0; tier1-only
  * generation boundary, see cluster_sf_dep.h).
  */

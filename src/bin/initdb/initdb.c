@@ -53,6 +53,7 @@
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #ifdef USE_ICU
 #include <unicode/ucol.h>
 #endif
@@ -76,6 +77,7 @@
 #include "cluster/cluster_wal_state.h"
 #include "common/cluster_hw_snapshot_codec.h"
 #include "common/pgrac_initdb_wal.h"
+#include "common/pgrac_initdb_cohort.h"
 #include "common/cryptohash.h"
 #include "datatype/timestamp.h"
 #endif
@@ -95,6 +97,7 @@
 #include "storage/bufpage.h"
 #include "pgrac_wal.h"
 #include "pgrac_side.h"
+#include "pgrac_relmap.h"
 #endif
 
 
@@ -190,6 +193,7 @@ static char *pgrac_hw_pgdata_path = NULL;
 static int pgrac_hw_wal_fd = -1;
 static char *pgrac_hw_wal_path = NULL;
 static void pgrac_hw_bind_creation(void);
+static bool pgrac_native_cohort;
 static int pgrac_native_thread = -1;
 static uint64 pgrac_native_sysid = 0;
 static int pgrac_native_data_fd = -1;
@@ -2590,6 +2594,8 @@ usage(const char *progname)
 			 "                            empty canonical shared root for a new seed\n"
 			 "      --pgrac-hw-snapshot-owner=N\n"
 			 "                            seed owner 0..127 (requires root and sync)\n"));
+	printf(_("      --pgrac-initdb-cohort\n"
+			 "                        prepare all original writers from shared config; -D names new local-cache parent\n"));
 	printf(_("      --pgrac-initdb-thread=N\n"
 			 "                            prepare a new native WAL thread 1..128\n"
 			 "                            (requires new -D/-X, checksums and full sync)\n"
@@ -3574,8 +3580,21 @@ pgrac_hw_sync_new_pgdata(void)
 static void
 pgrac_native_validate_options(void)
 {
-	if (getenv(PGRAC_INITDB_WAL_CONTEXT_ENV) != NULL)
+	if (getenv(PGRAC_INITDB_WAL_CONTEXT_ENV) != NULL
+		|| getenv(PGRAC_INITDB_COHORT_ENV) != NULL)
 		pg_fatal("INITDB_WAL_CONTEXT: initdb cannot inherit a child context");
+	if (pgrac_native_cohort)
+	{
+		if (pgrac_native_config_path == NULL || !do_sync || sync_only || !data_checksums
+			|| pgrac_native_thread >= 0 || pgrac_native_sysid != 0 || xlog_dir != NULL
+			|| pgrac_native_base_path != NULL || pgrac_native_storage_uuid != NULL
+			|| pgrac_native_database_incarnation != 0 || extra_guc_names != NULL
+			|| share_path != NULL || pgrac_hw_snapshot_root != NULL
+			|| pgrac_hw_snapshot_owner >= 0 || pgrac_wal_state_root != NULL
+			|| pwprompt || pwfilename || pg_dir_create_mode != PG_DIR_MODE_OWNER || show_setting)
+			pg_fatal("INITDB_COHORT_OPTIONS: complete new cohort requires config, checksums and full sync without native or legacy overrides");
+		return;
+	}
 	if (pgrac_native_config_path != NULL
 		&& (pgrac_native_base_path == NULL || pgrac_native_sysid == 0))
 		pg_fatal("INITDB_CONFIG_OPTIONS: original shared base and explicit common system identity "
@@ -3674,6 +3693,68 @@ pgrac_native_config_check(bool first)
 		pgrac_native_config = observed;
 	else if (memcmp(&observed, &pgrac_native_config, sizeof(observed)) != 0)
 		pg_fatal("INITDB_CONFIG_READ: configuration request changed after binding");
+}
+
+/* The original frontend alone launches this synchronous owner. The request
+ * stays in a pipe; it is never a file a later startup could adopt. */
+static void
+pgrac_native_create_cohort(void)
+{
+	PgracInitdbCohortContext request = {0};
+	int descriptors[2], status;
+	pid_t child, waited;
+	size_t used = 0;
+	pqsigfunc previous;
+	bool written = true;
+
+	if (locale_provider != COLLPROVIDER_LIBC || strcmp(lc_collate, "C") != 0
+		|| strcmp(lc_ctype, "C") != 0)
+		pg_fatal("INITDB_COHORT_OPTIONS: original cohort currently requires libc C locale");
+	pgrac_native_config_check(true);
+	request.magic = PGRAC_INITDB_COHORT_MAGIC;
+	request.segment_size = wal_segment_size_mb * 1024 * 1024;
+	request.creator_pid = getpid();
+	request.config = pgrac_native_config;
+	request.config.fd = fcntl(pgrac_native_config.fd, F_DUPFD, 3);
+	if (request.config.fd < 3 || strlcpy(request.cache_root, pg_data, sizeof(request.cache_root)) >= sizeof(request.cache_root)
+		|| strlcpy(request.config_path, pgrac_native_config_path, sizeof(request.config_path)) >= sizeof(request.config_path)
+		|| strlcpy(request.username, username, sizeof(request.username)) >= sizeof(request.username)
+		|| strlcpy(request.encoding, pg_encoding_to_char(encodingid), sizeof(request.encoding)) >= sizeof(request.encoding)
+		|| strlcpy(request.auth_local, authmethodlocal, sizeof(request.auth_local)) >= sizeof(request.auth_local)
+		|| strlcpy(request.auth_host, authmethodhost, sizeof(request.auth_host)) >= sizeof(request.auth_host)
+		|| pipe(descriptors) != 0)
+		pg_fatal("INITDB_COHORT_CONTEXT: cannot bind original creation request");
+	fflush(NULL);
+	child = fork();
+	if (child < 0)
+		pg_fatal("INITDB_COHORT_CONTEXT: cannot launch original creation owner: %m");
+	if (child == 0)
+	{
+		char value[32];
+		close(descriptors[1]);
+		snprintf(value, sizeof(value), "%d", descriptors[0]);
+		if (setenv(PGRAC_INITDB_COHORT_ENV, value, 1) != 0) _exit(127);
+		execl(backend_exec, backend_exec, "--pgrac-initdb-cohort", (char *)NULL);
+		_exit(127);
+	}
+	close(descriptors[0]);
+	close(request.config.fd);
+	previous = signal(SIGPIPE, SIG_IGN);
+	while (used < sizeof(request))
+	{
+		ssize_t n = write(descriptors[1], (char *)&request + used, sizeof(request) - used);
+		if (n < 0 && errno == EINTR) continue;
+		if (n <= 0) { written = false; break; }
+		used += n;
+	}
+	if (close(descriptors[1]) != 0) written = false;
+	signal(SIGPIPE, previous);
+	do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+	if (!written || waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+		pg_fatal("INITDB_COHORT_CREATE: original creation owner did not complete");
+	pgrac_native_config_check(false);
+	if (close(pgrac_native_config.fd) != 0)
+		pg_fatal("INITDB_COHORT_CONTEXT: cannot close original request");
 }
 
 static void
@@ -3948,10 +4029,12 @@ pgrac_native_sync(void)
 		if (control->track_commit_timestamp
 			|| !pgrac_initdb_side_create(pgrac_native_data_fd, pgrac_native_base_fd))
 			pg_fatal("INITDB_SIDE_CREATE: original native SIDE creation failed");
+		if (!pgrac_initdb_relmap_create(pgrac_native_data_fd, pgrac_native_base_fd))
+			pg_fatal("INITDB_RELMAP_CREATE: original relmap authority creation failed");
 		pgrac_native_check_directories(&data_st, &wal_st);
 		after = pgrac_native_control();
 		if (memcmp(control, after, sizeof(*control)) != 0)
-			pg_fatal("INITDB_SIDE_CREATE: native control changed during SIDE creation");
+			pg_fatal("INITDB_BASE_CREATE: native control changed during shared state creation");
 		free(after);
 	}
 	free(control);
@@ -4428,6 +4511,7 @@ main(int argc, char *argv[])
 			{ "pgrac-initdb-storage-uuid", required_argument, NULL, 24 },
 			{ "pgrac-initdb-database-incarnation", required_argument, NULL, 25 },
 			{ "pgrac-initdb-shared-config", required_argument, NULL, 26 },
+			{ "pgrac-initdb-cohort", no_argument, NULL, 27 },
 #endif
 			{ NULL, 0, NULL, 0 } };
 
@@ -4657,6 +4741,11 @@ main(int argc, char *argv[])
 					pg_fatal("INITDB_BASE_OPTIONS: duplicate storage identity");
 				pgrac_native_storage_uuid = pg_strdup(optarg);
 				break;
+			case 27:
+				if (pgrac_native_cohort)
+					pg_fatal("INITDB_COHORT_OPTIONS: duplicate cohort option");
+				pgrac_native_cohort = true;
+				break;
 			case 26:
 				if (pgrac_native_config_path != NULL)
 					pg_fatal("INITDB_CONFIG_OPTIONS: duplicate configuration request");
@@ -4806,6 +4895,11 @@ main(int argc, char *argv[])
 	printf("\n");
 
 #ifdef USE_PGRAC_CLUSTER
+	if (pgrac_native_cohort)
+	{
+		pgrac_native_create_cohort();
+		return 0;
+	}
 	if (pgrac_hw_snapshot_root != NULL)
 		pgrac_hw_prepare_paths();
 	pgrac_native_prepare_paths();

@@ -46,7 +46,7 @@ endif
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
-        test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_config \
+        test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
         test_pgrac_fenced_target_command test_pgrac_fenced_target_reply test_pgrac_fenced_target_client \
@@ -56,7 +56,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_heap_prepare_diagnostic test_cluster_generic_version test_cluster_generic_redo \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
-        test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
+        test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
         test_cluster_bufmgr_stop test_cluster_allocation_stop test_cluster_hw_cold test_cluster_hw_initdb test_cluster_native_wal_stop test_cluster_checkpointer_stop test_cluster_postmaster_stop test_cluster_xnode_profile test_cluster_adg \
         test_cluster_xnode_lever test_cluster_ges_handoff \
         test_cluster_reverse_key test_cluster_hw_lease test_cluster_pi_shadow \
@@ -101,7 +101,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_shared_catalog \
         test_cluster_oid_lease \
         test_cluster_xid_authority \
-        test_cluster_relmap_authority \
+        test_cluster_relmap_authority test_cluster_relmap_init \
         test_cluster_hw \
         test_cluster_hw_remaster_retry \
         test_cluster_dl \
@@ -398,7 +398,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_control_transport test_cluster_cr_nati
 SIMPLE_TESTS := $(filter-out test_cluster_native_wal_stop test_cluster_hw_initdb test_cluster_hw_cold test_cluster_cr_inline_stop test_cluster_mrp_stop test_cluster_backup_stop test_cluster_recovery_stop test_cluster_node_remove_stop test_cluster_postmaster_stop test_cluster_checkpointer_stop test_cluster_allocation_stop test_cluster_raw_device_capacity test_cluster_replacement_wire \
 		test_cluster_external_fence test_pgrac_external_fence_protocol \
 		test_cluster_wal_retention test_cluster_terminal_ref_census test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
-		test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop,$(SIMPLE_TESTS))
+		test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop,$(SIMPLE_TESTS))
 
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_journal test_pgrac_fenced_provider \
@@ -470,6 +470,15 @@ SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_service_observe,$(SIMPLE_TESTS))
 # PGRAC: shared frontend/backend binding codec uses its real common library.
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_relmap_init,$(SIMPLE_TESTS))
+
+# Fresh image constructor must link as a frontend, without backend services.
+test_cluster_relmap_init: test_cluster_relmap_init.c unit_test.h \
+		$(top_srcdir)/src/include/common/relmap.h \
+		$(top_srcdir)/src/include/cluster/cluster_relmap_authority.h \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a -o $@
 
 # PGRAC: execute original entry-point prologues before any native mutation.
 TESTS += test_cluster_fresh_scope
@@ -704,7 +713,8 @@ test_cluster_ts: test_cluster_ts.c unit_test.h $(CLUSTER_VERSION_O) \
 # hook.
 CLUSTER_KO_O = $(top_builddir)/src/backend/cluster/cluster_ko.o
 test_cluster_ko: test_cluster_ko.c unit_test.h $(CLUSTER_VERSION_O) \
-		$(CLUSTER_KO_O) $(CLUSTER_DL_O) $(CLUSTER_IR_O) $(CLUSTER_HW_O)
+		$(CLUSTER_KO_O) $(CLUSTER_DL_O) $(CLUSTER_IR_O) $(CLUSTER_HW_O) \
+		$(top_srcdir)/src/include/cluster/cluster_ko.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_KO_O) $(CLUSTER_DL_O) $(CLUSTER_IR_O) $(CLUSTER_HW_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
@@ -2163,7 +2173,7 @@ test_cluster_page_data test_cluster_pi_writeback: unit_test.h test_cluster_page_
 		$(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
-		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto -llz4 -lzstd -lm -o $@
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto $(filter -llz4 -lzstd,$(LIBS)) -lm -o $@
 
 test_cluster_space_recovery: test_cluster_space_recovery.c unit_test.h test_cluster_space_recovery_flush.inc \
 		test_cluster_space_recovery_product.o test_cluster_space_storage_product.o $(CLUSTER_HW_O) $(CLUSTER_UNIT_CRYPTOHASH_O) \
@@ -2851,6 +2861,7 @@ test_cluster_wal_inputs_product.o: $(top_srcdir)/src/backend/cluster/cluster_wal
 		-Dcluster_wal_claim_v2_read=test_wal_inputs_claim_read -c $< -o $@
 
 test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc \
+		test_cluster_control_root_initialized.inc test_cluster_control_root_first_start.inc \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		test_cluster_control_native_xid.inc \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
@@ -2862,7 +2873,8 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixt
 		cluster_control_bootstrap_read_test.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
-		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o \
+		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
@@ -2876,7 +2888,7 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixt
 		xlogreader_fs.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
-		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # PGRAC: perturb only syscall timing/failure; all read/decoder/selection code is
 # production code. Author: SqlRush <sqlrush@gmail.com>
@@ -3314,10 +3326,16 @@ test_cluster_xid_authority: test_cluster_xid_authority.c unit_test.h \
 # stubbed locally; CRC32C from libpgport.  The write-path activation (relmapper
 # hook, publish-then-invalidate, crash arbitration) is exercised by TAP.
 CLUSTER_RELMAP_AUTHORITY_O = $(top_builddir)/src/backend/cluster/cluster_relmap_authority.o
+test_cluster_relmap_consumer.inc: $(top_srcdir)/src/backend/utils/cache/relmapper.c Makefile
+	awk '/^cluster_read_relmap_from_authority\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_relmap_authority: test_cluster_relmap_authority.c unit_test.h \
-		$(CLUSTER_RELMAP_AUTHORITY_O)
+		test_cluster_relmap_consumer.inc $(CLUSTER_RELMAP_AUTHORITY_O) \
+		$(top_srcdir)/src/include/common/relmap.h $(top_builddir)/src/common/libpgcommon_srv.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_RELMAP_AUTHORITY_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # spec-5.6 Da2: test_cluster_cf_storage links cluster_cf_storage.o (migration
@@ -3604,7 +3622,7 @@ test_cluster_thread_replay_pi: test_cluster_thread_replay_pi.c unit_test.h \
 		test_cluster_thread_replay_pi.inc test_cluster_thread_replay_missing.inc \
 		test_cluster_thread_replay_stream.inc $(SIDE_XACT_XACTDESC_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(SIDE_XACT_XACTDESC_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_thread_replay_missing.inc: $(top_srcdir)/src/backend/cluster/cluster_thread_recovery_replay.c Makefile
 	awk '/^typedef struct ClusterThreadMissingRels/ { emit=1; count++ } \
@@ -3656,7 +3674,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-$(filter-out test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_config test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # The wire behavior is inline; an updated decoder must rebuild this binary.
@@ -4311,6 +4329,10 @@ cluster_qvotec_io_test.o: $(top_srcdir)/src/backend/cluster/cluster_voting_disk_
 test_cluster_qvotec_activation_product.o: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
+test_cluster_storage_quorum_product.o: $(top_srcdir)/src/backend/cluster/cluster_storage_quorum.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Dclock_gettime=cluster_qvotec_test_clock_gettime \
+		-ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
 		cluster_unit_no_normal_stop.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_QVOTEC_PGSA_TEST_O) \
@@ -4319,7 +4341,7 @@ test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
 		$(CLUSTER_MEMBERSHIP_O) \
 		cluster_qvotec_io_test.o $(CLUSTER_UNDO_BLOCK0_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
-		test_cluster_qvotec_activation_product.o
+		test_cluster_qvotec_activation_product.o test_cluster_storage_quorum_product.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_QVOTEC_PGSA_UNIT_TEST \
 		-DQVOTEC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_qvotec.c"' \
 		-DLMON_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_lmon.c"' \
@@ -4333,7 +4355,8 @@ test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
 		$(CLUSTER_MEMBERSHIP_O) \
 		cluster_qvotec_io_test.o $(CLUSTER_UNDO_BLOCK0_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
-		test_cluster_qvotec_activation_product.o $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		test_cluster_qvotec_activation_product.o test_cluster_storage_quorum_product.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lssl -lcrypto -o $@
 
@@ -5515,6 +5538,12 @@ test_cluster_r4_cr_walk: test_cluster_r4_cr_walk.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+test_cluster_initdb_relmap: test_cluster_initdb_relmap.c unit_test.h \
+		$(top_srcdir)/src/bin/initdb/pgrac_relmap.c $(top_srcdir)/src/bin/initdb/pgrac_relmap.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< $(LDFLAGS) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
 test_cluster_initdb_side: test_cluster_initdb_side.c unit_test.h \
 		$(top_srcdir)/src/bin/initdb/pgrac_side.c $(top_srcdir)/src/bin/initdb/pgrac_side.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< $(LDFLAGS) \
@@ -5555,11 +5584,11 @@ test_cluster_hw_initdb_sync_tail.inc: $(top_srcdir)/src/bin/initdb/initdb.c Make
 
 test_cluster_hw_initdb: test_cluster_hw_initdb.c test_cluster_hw_initdb_sync_tail.inc unit_test.h \
 		$(top_srcdir)/src/bin/initdb/initdb.c $(top_srcdir)/src/common/file_utils.c \
-		$(top_srcdir)/src/bin/initdb/pgrac_side.c $(top_srcdir)/src/bin/initdb/pgrac_wal.c $(top_srcdir)/src/bin/initdb/pgrac_wal.h \
+		$(top_srcdir)/src/bin/initdb/pgrac_relmap.c $(top_srcdir)/src/bin/initdb/pgrac_side.c $(top_srcdir)/src/bin/initdb/pgrac_wal.c $(top_srcdir)/src/bin/initdb/pgrac_wal.h \
 		$(top_srcdir)/src/backend/access/transam/xlogreader.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -I$(libpq_srcdir) -I$(top_srcdir)/src/timezone \
 		-ffunction-sections -fdata-sections $< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
-		$(top_srcdir)/src/bin/initdb/pgrac_side.c $(top_srcdir)/src/bin/initdb/pgrac_wal.c \
+		$(top_srcdir)/src/bin/initdb/pgrac_relmap.c $(top_srcdir)/src/bin/initdb/pgrac_side.c $(top_srcdir)/src/bin/initdb/pgrac_wal.c \
 		$(top_srcdir)/src/backend/access/transam/xlogreader.c \
 		$(LDFLAGS) $(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
@@ -5634,6 +5663,15 @@ test_cluster_ko_stop: test_cluster_ko_stop.c unit_test.h $(CLUSTER_HW_LEASE_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_storage_quorum: test_cluster_storage_quorum.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_storage_quorum.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+test_cluster_storage_corosync: test_cluster_storage_corosync.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_storage_quorum_corosync.c \
+		$(top_srcdir)/src/backend/cluster/cluster_storage_quorum.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter -ldl,$(LIBS)) -o $@
 
 test_cluster_catalog_inval: test_cluster_catalog_inval.c unit_test.h \
 		$(top_srcdir)/src/backend/utils/cache/inval.c
@@ -6525,6 +6563,7 @@ test_cluster_stop_membership_observation.inc: $(top_srcdir)/src/backend/cluster/
 		END { if (!done || starts != 1) exit 1 }' $< > $@
 
 test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h test_cluster_normal_cold_scn.inc \
+		test_cluster_terminal_peer.inc \
 		test_cluster_stop_membership_observation.inc \
 		test_cluster_normal_cold_startup.h test_cluster_normal_cold_capture.inc \
 		test_cluster_normal_cold_prepare.inc test_cluster_normal_cold_postjobs.inc test_cluster_hw_complete_tail.inc \
@@ -7889,3 +7928,60 @@ test_cluster_recovery_merge_seal test_cluster_recovery_merge_complete: %: %.c un
 		$(top_srcdir)/src/include/cluster/cluster_recovery_merge.h \
 		$(top_srcdir)/src/include/cluster/cluster_recovery_plan.h cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+# The same fork/exec/wait path as original native creation, with real children.
+test_cluster_initdb_cohort: test_cluster_initdb_cohort.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_cohort.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
+		$(top_srcdir)/src/common/file_perm.c cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
+		$(top_srcdir)/src/common/file_perm.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+# Original immutable claim/anchor persistence with syscall faults.
+test_cluster_initdb_origin: test_cluster_initdb_origin.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin_private.h \
+		$(top_srcdir)/src/common/file_perm.c cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/file_perm.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Real native control codec and frontend hash provider for pure cohort checks.
+test_cluster_initdb_common: test_cluster_initdb_common.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_common.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_common_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_cf_authority.c cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_common.c \
+		$(top_srcdir)/src/backend/cluster/cluster_cf_authority.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
+		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+# Bounded original-tree observation with real filesystem identities.
+test_cluster_initdb_tree: test_cluster_initdb_tree.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree_private.h cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+# Compile the actual native entry bodies; no duplicated routing predicate.
+test_cluster_storage_sql_route.inc: $(top_srcdir)/src/backend/tcop/postgres.c \
+		$(top_srcdir)/src/backend/executor/execMain.c
+	awk '/^start_xact_command\(void\)/ { print "static void"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if(n!=1) exit 1 }' $(word 1,$^) > $@.tmp
+	awk '/^ExecutorStart\(QueryDesc / { print "void"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if(n!=1) exit 1 }' $(word 2,$^) >> $@.tmp
+	mv $@.tmp $@
+
+test_cluster_storage_sql_route: test_cluster_storage_sql_route.c unit_test.h \
+		test_cluster_storage_sql_route.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
+test_cluster_storage_backend: test_cluster_storage_backend.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_storage_quorum_backend.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@

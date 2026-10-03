@@ -17,6 +17,15 @@
  *-------------------------------------------------------------------------
  */
 
+/*-------------------------------------------------------------------------
+ * PGRAC MODIFICATIONS
+ *    Modified by: SqlRush <sqlrush@gmail.com>
+ *    Check storage eligibility before command access and at interrupt-safe
+ *    points. Existing cluster fence, reconfiguration and lock callbacks share
+ *    the native interrupt dispatch. See spec-s9p2-06-online-membership.md.
+ *-------------------------------------------------------------------------
+ */
+
 #include "postgres.h"
 
 #include <fcntl.h>
@@ -81,6 +90,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_fence.h" /* spec-2.28 D4 cluster_fence_check_interrupts */
+#include "cluster/cluster_storage_quorum.h"
 #include "cluster/cluster_grd.h"   /* spec-2.17 BAST/CANCEL pending dispatch */
 #include "cluster/cluster_hang.h"  /* spec-5.11 D5 hang-dump pending dispatch */
 #include "cluster/cluster_wal_thread.h"
@@ -2551,6 +2561,10 @@ exec_describe_portal_message(const char *portal_name)
 static void
 start_xact_command(void)
 {
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: recheck shared storage before any command/catalog work. */
+	cluster_storage_quorum_check_sql();
+#endif
 	if (!xact_started) {
 		StartTransactionCommand();
 
@@ -3053,6 +3067,8 @@ ProcessInterrupts(void)
 	 *	abort takes priority over connection check.
 	 */
 	cluster_fence_check_interrupts();
+	/* PGRAC: consume periodic storage reminders only at this safe point. */
+	cluster_storage_quorum_check_interrupts();
 
 	/*
 	 * PGRAC: spec-2.29 Sprint A Step 2 D4 — reconfig in-flight abort.

@@ -36,6 +36,7 @@
 #include "cluster/cluster_replacement_wire.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
+#include "cluster/cluster_write_fence.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_control_root.h" /* bit22 feature bit (contract OPEN_APPLIED) */
 #include "cluster/cluster_undo_smgr.h"
@@ -9467,6 +9468,141 @@ cluster_semantic_activation_peer_open_matches(const ClusterSemanticAdmissionToke
 	return semantic_activation_ack_complete_image_current(&table, members_lo, members_hi, epoch,
 														  coordinator, cluster_node_id,
 														  cluster_ic_local_capability_word());
+}
+
+/* Terminal proof is a read inquiry, never a replacement OWNER_LIVE route.
+ * Keep ordinary OPEN, Resource-X and normal-stop consumers unchanged.
+ * Author: SqlRush <sqlrush@gmail.com> */
+StaticAssertDecl(CLUSTER_SEMANTIC_TERMINAL_DATA_CHANNELS == CLUSTER_IC_TIER1_DATA_CHANNELS,
+				 "terminal inquiry must bind every configured DATA channel");
+
+static bool
+semantic_terminal_local_current(const ClusterSemanticAdmissionToken *token)
+{
+	int feature;
+
+	return token != NULL && token->entered
+		&& token->feature_bit == CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		&& token->side == CLUSTER_SEMANTIC_TARGET_SIDE
+		&& semantic_activation_feature_index(token->feature_bit, &feature)
+		&& semantic_activation_exit_hook_pid == MyProcPid
+		&& semantic_activation_local_inflight[CLUSTER_SEMANTIC_TARGET_SIDE][feature] != 0
+		&& cluster_semantic_activation_recheck(token) && !RecoveryInProgress()
+		&& cluster_grd_recovery_state_value() == GRD_RECOVERY_IDLE
+		&& !cluster_reconfig_has_pending_prebump_stage() && !cluster_reconfig_join_in_progress()
+		&& !cluster_normal_stop_requested() && cluster_write_fence_allowed()
+		&& cluster_qvotec_get_status() == CLUSTER_QVOTEC_READY && cluster_qvotec_in_quorum();
+}
+
+bool
+cluster_semantic_activation_terminal_peer_capture(
+	const ClusterSemanticAdmissionToken *token, int32 peer_node_id, uint32 required_hello_caps,
+	ClusterSemanticTerminalPeerSnapshot *out)
+{
+	ClusterSemanticTerminalPeerSnapshot candidate;
+	SemanticActivationAdmissionSnapshot admission, rechecked_admission;
+	ClusterR4MembershipSnapshot members, rechecked_members;
+	ClusterSemanticActivationAckTableV1 table;
+	ClusterICTerminalPeerSessions sessions, rechecked_sessions;
+	const SemanticActivationAckTuple *peer;
+	const uint32 complete = CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+		| CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE;
+	uint64 cut, ack_seq;
+	int32 coordinator = -1;
+
+	memset(&candidate, 0, sizeof(candidate));
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || peer_node_id < 0 || peer_node_id >= CLUSTER_MAX_NODES
+		|| peer_node_id == cluster_node_id
+		|| (required_hello_caps & CLUSTER_SEMANTIC_REPLACEMENT_REQUIRED_CAPS)
+			!= CLUSTER_SEMANTIC_REPLACEMENT_REQUIRED_CAPS
+		|| !semantic_terminal_local_current(token) || !semantic_activation_snapshot(&admission)
+		|| admission.seq == 0 || admission.record_generation == 0 || admission.record_generation != token->record_generation
+		|| admission.formation_epoch != token->formation_epoch)
+		return false;
+	cut = cluster_membership_cut_generation();
+	if (cut == 0 || !cluster_reconfig_terminal_peer_membership(peer_node_id, &members)
+		|| members.formation_epoch != token->formation_epoch || members.admitted_members_lo == 0
+		|| members.admitted_members_hi != 0 || (members.admitted_members_lo & ~UINT64_C(0xffff)) != 0
+		|| members.local_self_boot_incarnation == 0 || members.admitted_incarnation[peer_node_id] == 0
+		|| !semantic_activation_ack_table_snapshot(&table))
+		return false;
+	ack_seq = pg_atomic_read_u64(&table.publication_seq);
+	if (ack_seq == 0 || (ack_seq & 1) != 0
+		|| table.stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED
+		|| table.record_generation != token->record_generation
+		|| table.transition_epoch != token->formation_epoch || table.capability_sample_digest == 0
+		|| (table.target_feature_bitmap & token->feature_bit) == 0 || table.rollback_feature_bitmap != 0
+		|| (table.flags != complete && table.flags != (complete | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_OPEN_PROOF))
+		|| ((table.flags & CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_OPEN_PROOF) != 0
+			&& !cluster_r4_bit22_cutover_active()))
+		return false;
+	for (int node = 0; node < 16; node++)
+		if ((members.admitted_members_lo & (UINT64_C(1) << node)) != 0) {
+			coordinator = node;
+			break;
+		}
+	if (!semantic_activation_ack_complete_image_current(&table, members.admitted_members_lo,
+		members.admitted_members_hi, members.formation_epoch, coordinator, cluster_node_id,
+		cluster_ic_local_capability_word()))
+		return false;
+	peer = &table.expected[peer_node_id];
+	if (peer->boot_id != members.admitted_incarnation[peer_node_id]
+		|| peer->admitted_incarnation != peer->boot_id || peer->capability_generation > UINT32_MAX
+		|| (peer->capability_word & required_hello_caps) != required_hello_caps
+		|| !cluster_sf_peer_capability_generation_matches(peer_node_id, required_hello_caps,
+			(uint32)peer->capability_generation)
+		|| !cluster_ic_tier1_terminal_peer_sessions(peer_node_id, token->formation_epoch,
+			(uint32)peer->capability_generation, cluster_lms_workers, &sessions))
+		return false;
+	if (!cluster_reconfig_terminal_peer_membership(peer_node_id, &rechecked_members)
+		|| memcmp(&members, &rechecked_members, sizeof(members)) != 0
+		|| !semantic_activation_ack_complete_image_current(&table, members.admitted_members_lo,
+			members.admitted_members_hi, members.formation_epoch, coordinator, cluster_node_id,
+			cluster_ic_local_capability_word())
+		|| !cluster_ic_tier1_terminal_peer_sessions(peer_node_id, token->formation_epoch,
+			(uint32)peer->capability_generation, cluster_lms_workers, &rechecked_sessions)
+		|| memcmp(&sessions, &rechecked_sessions, sizeof(sessions)) != 0
+		|| !semantic_activation_snapshot(&rechecked_admission)
+		|| admission.seq != rechecked_admission.seq || !semantic_terminal_local_current(token)
+		|| !cluster_membership_cut_generation_current(cut)
+		|| cluster_qvotec_get_self_incarnation() != members.local_self_boot_incarnation)
+		return false;
+	pg_read_barrier();
+	if (SemanticActivationAckTable == NULL
+		|| pg_atomic_read_u64(&SemanticActivationAckTable->publication_seq) != ack_seq)
+		return false;
+	candidate.record_generation = token->record_generation;
+	candidate.formation_epoch = token->formation_epoch;
+	candidate.admission_publication_seq = admission.seq;
+	candidate.membership_cut_generation = cut;
+	candidate.ack_publication_seq = ack_seq;
+	candidate.local_boot_incarnation = members.local_self_boot_incarnation;
+	candidate.peer_boot_id = peer->boot_id;
+	candidate.peer_admitted_incarnation = peer->admitted_incarnation;
+	candidate.peer_control_generation = peer->control_connection_generation;
+	candidate.peer_capability_generation = peer->capability_generation;
+	candidate.peer_control_stream_generation = sessions.control_stream_generation;
+	memcpy(candidate.peer_data_generation, sessions.data_stream_generation,
+		   sizeof(candidate.peer_data_generation));
+	candidate.peer_data_channels = sessions.data_channels;
+	candidate.peer_node_id = peer_node_id;
+	candidate.required_hello_caps = required_hello_caps;
+	*out = candidate;
+	return true;
+}
+
+bool
+cluster_semantic_activation_terminal_peer_current(
+	const ClusterSemanticAdmissionToken *token, const ClusterSemanticTerminalPeerSnapshot *expected)
+{
+	ClusterSemanticTerminalPeerSnapshot current;
+
+	return expected != NULL
+		&& cluster_semantic_activation_terminal_peer_capture(token, expected->peer_node_id,
+			expected->required_hello_caps, &current)
+		&& memcmp(expected, &current, sizeof(current)) == 0;
 }
 
 /* Resource-X owns a distinct target-only admission bit.  Its peer proof is

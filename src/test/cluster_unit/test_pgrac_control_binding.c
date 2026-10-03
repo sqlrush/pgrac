@@ -113,6 +113,82 @@ UT_TEST(test_golden_round_trip_and_node_endpoints)
 	UT_ASSERT(memcmp(&decoded, &expected, sizeof(expected)) == 0);
 }
 
+static void
+creation_literal(uint8 bytes[256])
+{
+	memcpy(bytes, golden, 256);
+	bytes[4] = 3;
+	bytes[12] = 1;
+	memset(bytes + 216, 0, 16);
+	bytes[216] = 1;
+	repair_crc(bytes);
+}
+
+UT_TEST(test_creation_literal_is_distinct_from_open_lineage)
+{
+	PgracControlBinding expected, decoded;
+	uint8 literal[256], encoded[256];
+
+	fixture(&expected);
+	expected.lineage_kind = PGRAC_CONTROL_LINEAGE_CREATION_V1;
+	expected.migration_prepare_generation = 1;
+	expected.migration_transition_epoch = 0;
+	creation_literal(literal);
+	UT_ASSERT(pgrac_control_binding_decode(literal, sizeof(literal), &decoded));
+	UT_ASSERT(memcmp(&expected, &decoded, sizeof(expected)) == 0);
+	UT_ASSERT(pgrac_control_binding_encode(&expected, encoded, sizeof(encoded)));
+	UT_ASSERT(memcmp(literal, encoded, sizeof(literal)) == 0);
+}
+
+UT_TEST(test_creation_rejects_version_tag_and_origin_corruption)
+{
+	static const struct { size_t offset; uint8 value; } invalid[] = {
+		{4, 2}, {4, 4}, {12, 0}, {12, 2}, {13, 1},
+		{216, 0}, {216, 2}, {217, 1}, {224, 1}, {231, 1},
+		{72, 1}, {151, 1}, {232, 1}, {252, 1}
+	};
+	uint8 bytes[256];
+
+	for (size_t i = 0; i < lengthof(invalid); i++) {
+		creation_literal(bytes);
+		bytes[invalid[i].offset] = invalid[i].value;
+		repair_crc(bytes);
+		UT_ASSERT(decode_refuses(bytes, sizeof(bytes)));
+	}
+	for (size_t i = 0; i < 256; i++) {
+		creation_literal(bytes);
+		bytes[i] ^= 1;
+		UT_ASSERT(decode_refuses(bytes, sizeof(bytes)));
+	}
+	for (size_t i = 0; i < 2; i++) {
+		creation_literal(bytes);
+		memset(bytes + 152 + 32 * i, 0, 32);
+		repair_crc(bytes);
+		UT_ASSERT(decode_refuses(bytes, sizeof(bytes)));
+	}
+}
+
+UT_TEST(test_creation_encoder_refuses_fabricated_epoch_or_generation)
+{
+	PgracControlBinding binding;
+	uint8 bytes[256];
+
+	for (unsigned i = 0; i < 5; i++) {
+		fixture(&binding);
+		binding.lineage_kind = PGRAC_CONTROL_LINEAGE_CREATION_V1;
+		binding.migration_prepare_generation = 1;
+		binding.migration_transition_epoch = 0;
+		if (i == 0) binding.migration_prepare_generation = 0;
+		if (i == 1) binding.migration_prepare_generation = 2;
+		if (i == 2) binding.migration_transition_epoch = 1;
+		if (i == 3) binding.lineage_kind = 2;
+		if (i == 4) binding.lineage_kind = PGRAC_CONTROL_LINEAGE_MIGRATION_V1;
+		memset(bytes, 0xa5, sizeof(bytes));
+		UT_ASSERT(!pgrac_control_binding_encode(&binding, bytes, sizeof(bytes)));
+		UT_ASSERT(all_zero(bytes, sizeof(bytes)));
+	}
+}
+
 UT_TEST(test_exact_sizes_nulls_and_bounded_output)
 {
 	PgracControlBinding binding;
@@ -233,7 +309,7 @@ UT_TEST(test_encoder_refuses_incomplete_identity)
 		else if (i == lengthof(required))
 			binding.node_id = 128;
 		else
-			binding.reserved = 1;
+			binding.lineage_kind = 1;
 		memset(bytes, 0xa5, sizeof(bytes));
 		UT_ASSERT(!pgrac_control_binding_encode(&binding, bytes, sizeof(bytes)));
 		UT_ASSERT(all_zero(bytes, sizeof(bytes)));
@@ -429,9 +505,12 @@ main(void)
 		perror("mkdir global");
 		return 2;
 	}
-	UT_PLAN(12);
+	UT_PLAN(15);
 	UT_RUN(test_fresh_binding_rejects_cold_import);
 	UT_RUN(test_golden_round_trip_and_node_endpoints);
+	UT_RUN(test_creation_literal_is_distinct_from_open_lineage);
+	UT_RUN(test_creation_rejects_version_tag_and_origin_corruption);
+	UT_RUN(test_creation_encoder_refuses_fabricated_epoch_or_generation);
 	UT_RUN(test_exact_sizes_nulls_and_bounded_output);
 	UT_RUN(test_every_byte_is_checked);
 	UT_RUN(test_crc_valid_invalid_fields);

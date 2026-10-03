@@ -1701,14 +1701,17 @@ rf_side_online_plan_space_contribution_v1(const RfSideOnlinePlanV1 *plan, uint32
 static bool
 side_space_ancestry(const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKey *key,
 					BlockNumber block, uint32 ancestor_operation, uint32 completed_operation,
-					bool *terminal, RfSideSpaceTerminalV1 *selected)
+					bool *terminal, RfSideSpaceTerminalV1 *selected,
+					const uint8 incarnation[16], RfSideSpaceIncarnationEndV1 *ended)
 {
 	ClusterSpaceRecoveryInput *inputs = NULL;
 	uint32 *operations = NULL, *order = NULL;
 	RfSideSpaceContributionV1 ancestor = { 0 }, completed = { 0 };
+	RfSideSpaceIncarnationEndV1 ending = { 0 };
 	uint32 count = 0, next = 0;
 	uint32 ancestor_position = UINT32_MAX, completed_position = UINT32_MAX;
 	uint32 last_position = UINT32_MAX;
+	uint32 end_position = UINT32_MAX;
 	bool ancestor_found = false, completed_found = false, covered = false;
 	uint8 previous_result[CLUSTER_SPACE_RESERVATION_BYTES];
 	uint64 previous_token = 0;
@@ -1717,9 +1720,10 @@ side_space_ancestry(const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKe
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed || key == NULL
 		|| block > 1 || plan->database_incarnation == 0
-		|| (selected == NULL
-			&& (terminal == NULL || ancestor_operation >= plan->operation_count
-				|| completed_operation >= plan->operation_count))
+		|| (selected == NULL && completed_operation >= plan->operation_count)
+		|| (selected == NULL && ended == NULL
+			&& (terminal == NULL || ancestor_operation >= plan->operation_count))
+		|| (ended != NULL && (incarnation == NULL || !side_bytes_nonzero(incarnation, 16)))
 		|| key->database_incarnation != plan->database_incarnation
 		|| !side_space_key_matches_plan(plan, key))
 		return false;
@@ -1756,9 +1760,10 @@ side_space_ancestry(const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKe
 				completed_found = true;
 			}
 		}
-	if ((selected == NULL
-		 && (!ancestor_found || !completed_found
-			 || memcmp(ancestor.result.incarnation, completed.result.incarnation, 16) != 0))
+	if ((selected == NULL && !completed_found)
+		|| (selected == NULL && ended == NULL
+			&& (!ancestor_found
+				|| memcmp(ancestor.result.incarnation, completed.result.incarnation, 16) != 0))
 		|| count == 0
 		|| count > plan->memory_budget / (sizeof(*inputs) + sizeof(*operations) + sizeof(*order)))
 		return false;
@@ -1792,6 +1797,7 @@ side_space_ancestry(const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKe
 	for (uint32 i = 0; i < count; i++) {
 		uint32 index = order[i];
 		ClusterSpaceReservationChange change;
+		ClusterSpaceStructureChange structure = { 0 };
 		uint8 before[CLUSTER_SPACE_RESERVATION_BYTES];
 
 		if (inputs[index].length == CLUSTER_SPACE_RESERVATION_WAL_BYTES) {
@@ -1799,7 +1805,6 @@ side_space_ancestry(const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKe
 													  &change))
 				goto done;
 		} else {
-			ClusterSpaceStructureChange structure;
 			if (!cluster_space_structure_wal_decode(inputs[index].data, inputs[index].length,
 													&structure))
 				goto done;
@@ -1817,6 +1822,24 @@ side_space_ancestry(const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKe
 											  sizeof(previous_result)))
 			goto done;
 		previous_token = change.result_token;
+		if (ended != NULL) {
+			/* A later reuse of the old UUID cannot inherit an earlier end. */
+			if (end_position != UINT32_MAX
+				&& ((change.before.identity.state == CLUSTER_SPACE_IDENTITY_LIVE
+					 && memcmp(change.before.identity.incarnation, incarnation, 16) == 0)
+					|| (change.result.identity.state == CLUSTER_SPACE_IDENTITY_LIVE
+						&& memcmp(change.result.identity.incarnation, incarnation, 16) == 0)))
+				goto done;
+			if ((structure.identity.action == CLUSTER_SPACE_WAL_TRUNCATE
+				 || structure.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE)
+				&& memcmp(structure.identity.expected.incarnation, incarnation, 16) == 0) {
+				if (end_position != UINT32_MAX)
+					goto done;
+				end_position = i;
+				ending.operation = operations[index];
+				ending.change = structure;
+			}
+		}
 		if (block == 0 && inputs[index].length == CLUSTER_SPACE_RESERVATION_WAL_BYTES)
 			continue;
 		if (operations[index] == ancestor_operation)
@@ -1832,6 +1855,12 @@ side_space_ancestry(const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKe
 			goto done;
 		result.operation = operations[order[last_position]];
 		*selected = result;
+	} else if (ended != NULL) {
+		if (end_position == UINT32_MAX || completed_position == UINT32_MAX
+			|| end_position > completed_position)
+			goto done;
+		ending.terminal = completed_position == last_position;
+		*ended = ending;
 	} else {
 		if (ancestor_position == UINT32_MAX || completed_position == UINT32_MAX
 			|| ancestor_position > completed_position)
@@ -1856,7 +1885,7 @@ rf_side_online_plan_space_covers_v1(const RfSideOnlinePlanV1 *plan,
 									bool *terminal)
 {
 	return side_space_ancestry(plan, key, block, ancestor_operation, completed_operation, terminal,
-							   NULL);
+							   NULL, NULL, NULL);
 }
 
 bool
@@ -1864,7 +1893,8 @@ rf_side_online_plan_space_terminal_v1(const RfSideOnlinePlanV1 *plan,
 									  const ClusterSpaceIdentityKey *key, BlockNumber block,
 									  RfSideSpaceTerminalV1 *out)
 {
-	return out != NULL && side_space_ancestry(plan, key, block, UINT32_MAX, UINT32_MAX, NULL, out);
+	return out != NULL
+		&& side_space_ancestry(plan, key, block, UINT32_MAX, UINT32_MAX, NULL, out, NULL, NULL);
 }
 
 bool
@@ -1876,6 +1906,16 @@ rf_side_online_plan_space_target_v1(const RfSideOnlinePlanV1 *plan, uint32 index
 		return false;
 	*out = plan->space_targets[index];
 	return true;
+}
+
+bool
+rf_side_online_plan_space_incarnation_end_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterSpaceIdentityKey *key, const uint8 incarnation[16], uint32 completed_operation,
+	RfSideSpaceIncarnationEndV1 *out)
+{
+	return out != NULL
+		&& side_space_ancestry(plan, key, 0, UINT32_MAX, completed_operation, NULL, NULL,
+							   incarnation, out);
 }
 
 RfPageProofDetailV1

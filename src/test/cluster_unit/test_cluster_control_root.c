@@ -191,6 +191,7 @@ static ClusterStartupExitResult test_reserve_evidence;
 static ClusterFormationSnapshotV1 test_reserve_formation;
 static ClusterStartupExitCut test_reserve_cut;
 static int test_reserve_fault;
+static unsigned test_startup_exit_requests;
 static bool test_startup_bound;
 static ClusterWalStartupImage test_startup_operation;
 
@@ -245,6 +246,7 @@ cluster_reconfig_capture_formation_snapshot_v1(uint16 thread, ClusterFormationSn
 ClusterStartupExitResult
 cluster_startup_exit_request(const ClusterStartupExitCut *cut, uint8 digest[32])
 {
+	test_startup_exit_requests++;
 	memset(digest, 0, 32);
 	if (!test_reserve_mode || memcmp(cut, &test_reserve_cut, sizeof(*cut)) != 0)
 		return CLUSTER_STARTUP_EXIT_UNAVAILABLE;
@@ -5574,6 +5576,8 @@ UT_TEST(test_startup_rejects_import_and_preserves_recovery)
 	UT_ASSERT_EQ(out.input_kind, CLUSTER_WAL_STARTUP_RECOVERED);
 }
 
+#include "test_cluster_control_root_initialized.inc"
+
 UT_TEST(test_startup_invalid_arguments_and_aliases_cannot_leave_partial_input)
 {
 	uint8 bytes[1536];
@@ -8772,6 +8776,8 @@ v3_driver_restart(const ControlRootImage *root, unsigned node)
 	test_self_incarnation = test_membership_incarnation = test_reserve_cut.observer[node];
 	return ref;
 }
+
+#include "test_cluster_control_root_first_start.inc"
 
 UT_TEST(test_v3_native_driver_prepares_sparse_targets_then_returns_initializing)
 {
@@ -17191,6 +17197,36 @@ UT_TEST(test_v3_locked_read_requires_exact_format_primary_and_objects)
 	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
 }
 
+UT_TEST(test_creation_pair_rejects_older_backup_from_other_domain)
+{
+	uint8 bytes[66048];
+	ClusterRecoveryAnchorV2 anchors[2];
+	ControlRootImage root;
+	ControlFileData out;
+	ClusterControlRootFileToken token;
+	char path[MAXPGPATH];
+
+	v2_thread_fixture(bytes, anchors);
+	root_fixture_version3(bytes);
+	put_u64_le(bytes + 64, 0x15);
+	put_u64_le(bytes + 164, 1);
+	put_u64_le(bytes + 172, 0);
+	put_u64_le(bytes + 180, 0);
+	v2_checksums(bytes);
+	v2_write_roots(bytes);
+	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID,
+		&root, &out, &token), 0);
+	/* Even an older, otherwise identical valid backup cannot change domains. */
+	put_u64_le(bytes + 64, 0x0d);
+	put_u64_le(bytes + 16, root.header.file_txn_seq - 1);
+	v2_checksums(bytes);
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_BAK_REL_PATH);
+	write_all_or_abort(path, bytes, sizeof(bytes));
+	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID,
+		&root, &out, &token), CLUSTER_CONTROL_ROOT_COPY_DIVERGENT);
+	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+}
+
 UT_TEST(test_bootstrap_v3_reads_exact_current_and_flat_history)
 {
 	BootstrapFixture f;
@@ -21805,6 +21841,14 @@ main(int argc, char **argv)
 	if (argc > 1)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_FIRST_START") != NULL) {
+		UT_PLAN(3);
+		UT_RUN(test_first_start_io_and_late_races_never_publish_authority);
+		UT_RUN(test_first_start_binds_original_inputs_without_clean_exit);
+		UT_RUN(test_first_start_rejects_incomplete_or_changed_formation);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_WORKER_FINALIZE") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_runtime_v3_worker_done_requires_durable_canonical_completion);
@@ -21861,7 +21905,25 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(396);
+	UT_PLAN(415);
+	UT_RUN(test_first_start_io_and_late_races_never_publish_authority);
+	UT_RUN(test_first_start_binds_original_inputs_without_clean_exit);
+	UT_RUN(test_first_start_rejects_incomplete_or_changed_formation);
+	UT_RUN(test_initialized_complete_cohort_constructs_all_selected_inputs);
+	UT_RUN(test_initialized_cohort_refuses_incomplete_or_existing_sources);
+	UT_RUN(test_initialized_cohort_refuses_wrong_identity_or_geometry);
+	UT_RUN(test_initialized_cohort_overlap_never_changes_input);
+	UT_RUN(test_creation_root_codec_has_separate_literal_domain);
+	UT_RUN(test_creation_root_rejects_mixed_flags_and_fake_open);
+	UT_RUN(test_initialized_kind_requires_creation_root);
+	UT_RUN(test_bootstrap_binding_never_crosses_lineage_domain);
+	UT_RUN(test_initialized_seed_literal_roundtrip_has_no_writer);
+	UT_RUN(test_initialized_bound_phases_keep_real_successor_rules);
+	UT_RUN(test_initialized_seed_refuses_unearned_target_and_prior_root);
+	UT_RUN(test_initialized_seed_requires_complete_initial_root);
+	UT_RUN(test_initialized_bound_source_cannot_be_a_served_generation);
+	UT_RUN(test_initialized_digest_binds_original_common_objects_and_cut);
+	UT_RUN(test_initialized_does_not_make_clean_or_import_legal);
 	UT_RUN(test_wal_inputs_cold_all_origins_exact_native_anchor);
 	UT_RUN(test_wal_inputs_cold_retained_generations_remain_distinct);
 	UT_RUN(test_wal_inputs_cold_terminal_and_pending_are_not_checkpoint_sources);
@@ -22008,6 +22070,7 @@ main(int argc, char **argv)
 	UT_RUN(test_origin_input_union_preserves_current_history_and_pending);
 	UT_RUN(test_origin_input_union_refuses_partial_or_unowned_metadata);
 	UT_RUN(test_origin_input_union_alias_and_bounds_clear_all_output);
+	UT_RUN(test_creation_pair_rejects_older_backup_from_other_domain);
 	UT_RUN(test_bootstrap_v3_reads_exact_current_and_flat_history);
 	UT_RUN(test_bootstrap_v3_pending_is_never_missing_from_capacity);
 	UT_RUN(test_bootstrap_pending_route_never_masks_bad_inputs_or_namespace);

@@ -97,7 +97,8 @@ cluster_control_bootstrap_root_bound(const PgracControlBinding *binding,
 	node = binding->node_id;
 	header = &root->header;
 
-	if (header->system_identifier != binding->system_identifier
+	if (header->lineage_kind != binding->lineage_kind
+		|| header->system_identifier != binding->system_identifier
 		|| memcmp(header->storage_uuid, binding->storage_uuid, 16) != 0
 		|| memcmp(header->authority_uuid, binding->authority_uuid, 16) != 0
 		|| header->v2.database_incarnation != binding->database_incarnation

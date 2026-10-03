@@ -2221,6 +2221,31 @@ make_space_commit(FakeXactRecord *fake, const ClusterSpaceStructureChange *drops
 	}
 }
 
+static ClusterSpaceStructureChange
+space_truncate_fixture(const ClusterSpaceReservation *before, uint64 before_token,
+						uint64 identity_token, uint64 result_token, uint8 incarnation)
+{
+	ClusterSpaceStructureChange change = { 0 };
+
+	change.identity.action = CLUSTER_SPACE_WAL_TRUNCATE;
+	change.identity.nblocks = 2;
+	change.identity.expected = before->identity;
+	change.identity.result = before->identity;
+	memset(change.identity.result.incarnation, incarnation, 16);
+	change.identity.result.sequence++;
+	change.identity.result.operation++;
+	change.identity.before_token = identity_token;
+	change.identity.result_token = result_token;
+	change.reservation.action = CLUSTER_SPACE_RESERVATION_RESET;
+	change.reservation.before = *before;
+	change.reservation.result = *before;
+	change.reservation.result.identity = change.identity.result;
+	change.reservation.result.next_block = change.reservation.first_block = 2;
+	change.reservation.before_token = before_token;
+	change.reservation.result_token = result_token;
+	return change;
+}
+
 static RfPageProofDetailV1
 space_commit_feed(RfSideOnlinePlanV1 *plan, FakeXactRecord *fake, XLogRecPtr begin)
 {
@@ -4352,6 +4377,10 @@ UT_TEST(test_space_retained_ancestry_covers_history_and_each_committed_drop)
 		FakeXactRecord fake;
 		uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
 		bool terminal = false;
+		RfSideSpaceIncarnationEndV1 ended, untouched;
+
+		memset(&untouched, 0xa5, sizeof(untouched));
+		ended = untouched;
 
 		UT_ASSERT(cluster_space_reservation_wal_encode(&advance, wal, sizeof(wal)));
 		UT_ASSERT_EQ(
@@ -4361,9 +4390,27 @@ UT_TEST(test_space_retained_ancestry_covers_history_and_each_committed_drop)
 		UT_ASSERT_EQ(space_commit_feed(plan, &fake, 200), RF_PAGE_PROOF_DETAIL_OK);
 		UT_ASSERT(!rf_side_online_plan_space_covers_v1(plan, &advance.result.identity.key, 1, 0, 1,
 													   &terminal));
+		UT_ASSERT(!rf_side_online_plan_space_incarnation_end_v1(plan, &advance.result.identity.key,
+			advance.result.identity.incarnation, 1, &ended));
+		UT_ASSERT_EQ(memcmp(&ended, &untouched, sizeof(ended)), 0);
 		UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
 		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 		UT_ASSERT_EQ(rf_side_online_plan_space_target_count_v1(plan), history_only ? 0 : 2);
+		for (int locator = 0; locator < 2; locator++) {
+			memset(&ended, 0, sizeof(ended));
+			UT_ASSERT(rf_side_online_plan_space_incarnation_end_v1(plan,
+				&drops[locator].identity.expected.key, drops[locator].identity.expected.incarnation,
+				1, &ended));
+			UT_ASSERT_EQ(ended.operation, 1);
+			UT_ASSERT_EQ(ended.change.identity.action, CLUSTER_SPACE_WAL_TOMBSTONE);
+			UT_ASSERT_EQ(ended.change.identity.expected.key.locator.relNumber, 16384 + locator);
+			UT_ASSERT_EQ(ended.change.identity.result_token, 70);
+			UT_ASSERT(ended.terminal);
+		}
+		ended = untouched;
+		UT_ASSERT(!rf_side_online_plan_space_incarnation_end_v1(plan, &advance.result.identity.key,
+			advance.result.identity.incarnation, 0, &ended)); /* ADVANCE is not SPACE0. */
+		UT_ASSERT_EQ(memcmp(&ended, &untouched, sizeof(ended)), 0);
 		UT_ASSERT(rf_side_online_plan_space_covers_v1(plan, &advance.result.identity.key, 1, 0, 1,
 													  &terminal));
 		UT_ASSERT(terminal);
@@ -4608,10 +4655,142 @@ UT_TEST(test_space_retained_ancestry_create_and_independent_page_terminal)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+UT_TEST(test_space_incarnation_end_requires_an_actual_later_space0_contribution)
+{
+	ClusterSpaceReservationChange advance = space_advance_fixture();
+	ClusterSpaceStructureChange changes[2];
+	RfContributorStreamCutV1 cuts[3] = { { 0 } };
+	RfSideOnlinePlanRequestV1 request = { 0 };
+	RfSideOnlinePlanV1 *plan = NULL;
+	RfSideSpaceIncarnationEndV1 ended = { 0 }, untouched;
+	const int feed_order[] = { 1, 2, 0 };
+	XLogRecPtr redo[] = { 200, 200, 200 };
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+
+	changes[0] = space_truncate_fixture(&advance.result, 80, 123, 60, 0x18);
+	changes[1] = space_truncate_fixture(&changes[0].reservation.result, 60, 60, 40, 0x19);
+	for (int i = 0; i < 3; i++) {
+		cuts[i].failed_thread = i + 1;
+		cuts[i].origin_owner_incarnation = i + 11;
+		cuts[i].timeline_id = 7;
+		cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		cuts[i].scan_begin_inclusive = 100;
+		cuts[i].scan_end_exclusive = 200;
+	}
+	request.system_identifier = advance.before.identity.key.system_identifier;
+	memcpy(request.storage_uuid, advance.before.identity.key.storage_uuid, 16);
+	request.physical_cuts = cuts;
+	request.participant_count = 3;
+	request.redo_starts = redo;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+	for (int i = 0; i < 3; i++) {
+		int origin = feed_order[i];
+		FakeXactRecord fake;
+		RfDetachedRecordPlanV1 record;
+		RfPageOnlineRecordIdentityV1 identity;
+		uint32 length = origin == 0 ? CLUSTER_SPACE_RESERVATION_WAL_BYTES : sizeof(wal);
+		uint8 opcode = origin == 0 ? XLOG_SMGR_SPACE_RESERVATION : XLOG_SMGR_SPACE_IDENTITY;
+		if (origin == 0)
+			UT_ASSERT(cluster_space_reservation_wal_encode(&advance, wal, length));
+		else
+			UT_ASSERT(cluster_space_structure_wal_encode(&changes[origin - 1], wal, length));
+		make_projection_record(&fake, RM_SMGR_ID, opcode | XLR_SPECIAL_REL_UPDATE, wal, length);
+		fake.u.decoded.max_block_id = -1;
+		identity = make_identity(&fake, request.storage_uuid);
+		identity.participant_index = origin;
+		identity.record.origin_thread = cuts[origin].failed_thread;
+		set_identity_range(&fake, &identity, 100, 200);
+		record = make_projection_record_plan(&fake);
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+			RF_PAGE_PROOF_DETAIL_OK);
+	}
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_space_target_count_v1(plan), 0); /* All history. */
+	/* Feed B,C,A, tokens 80,60,40: neither feed nor numeric order is ancestry. */
+	UT_ASSERT(rf_side_online_plan_space_incarnation_end_v1(plan, &advance.before.identity.key,
+		advance.before.identity.incarnation, 0, &ended));
+	UT_ASSERT_EQ(ended.operation, 0);
+	UT_ASSERT_EQ(ended.change.identity.action, CLUSTER_SPACE_WAL_TRUNCATE);
+	UT_ASSERT_EQ(ended.change.identity.nblocks, 2);
+	UT_ASSERT_EQ(ended.change.identity.expected.incarnation[0], 0x17);
+	UT_ASSERT_EQ(ended.change.identity.result.incarnation[0], 0x18);
+	UT_ASSERT(!ended.terminal);
+	UT_ASSERT(rf_side_online_plan_space_incarnation_end_v1(plan, &advance.before.identity.key,
+		advance.before.identity.incarnation, 1, &ended));
+	UT_ASSERT_EQ(ended.operation, 0); /* Original end, not its later covering operation. */
+	UT_ASSERT(ended.terminal);
+	UT_ASSERT(rf_side_online_plan_space_incarnation_end_v1(plan, &advance.before.identity.key,
+		changes[0].identity.result.incarnation, 1, &ended));
+	UT_ASSERT_EQ(ended.operation, 1);
+	UT_ASSERT_EQ(ended.change.identity.result_token, 40);
+	memset(&untouched, 0xa5, sizeof(untouched));
+	for (int fault = 0; fault < 9; fault++) {
+		ClusterSpaceIdentityKey key = advance.before.identity.key;
+		uint8 incarnation[16];
+		uint32 completed = 1;
+		memcpy(incarnation, changes[0].identity.result.incarnation, 16);
+		if (fault == 0) completed = 0; /* Before this incarnation ended. */
+		if (fault == 1) completed = 2; /* Reservation-only contribution. */
+		if (fault == 2) completed = 3;
+		if (fault == 3) key.database_incarnation++;
+		if (fault == 4) key.locator.spcOid++;
+		if (fault == 5) key.locator.dbOid++;
+		if (fault == 6) key.system_identifier++;
+		if (fault == 7) memset(incarnation, 0, 16);
+		if (fault == 8) memcpy(incarnation, changes[1].identity.result.incarnation, 16);
+		ended = untouched;
+		UT_ASSERT(!rf_side_online_plan_space_incarnation_end_v1(plan, &key, incarnation,
+			completed, &ended));
+		UT_ASSERT_EQ(memcmp(&ended, &untouched, sizeof(ended)), 0);
+	}
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_gaps)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		ClusterSpaceReservationChange advance = space_advance_fixture();
+		ClusterSpaceStructureChange changes[2];
+		XLogRecPtr redo = 400;
+		RfSideOnlinePlanV1 *plan = space_online_plan_redo(400, &redo);
+		RfSideSpaceIncarnationEndV1 ended, untouched;
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		changes[0] = space_truncate_fixture(&advance.result, 80, 123, 60, 0x18);
+		changes[1] = space_truncate_fixture(&changes[0].reservation.result, 60, 60, 40,
+			fault == 0 ? 0x17 : 0x19);
+		if (fault == 1) changes[0].reservation.before_token++;
+		if (fault == 2) changes[0].reservation.before.next_block++;
+		if (fault == 3) changes[1].reservation.before_token++;
+		if (fault == 4) changes[1].reservation.before.next_block++;
+		UT_ASSERT(cluster_space_reservation_wal_encode(&advance, wal,
+			CLUSTER_SPACE_RESERVATION_WAL_BYTES));
+		UT_ASSERT_EQ(space_online_feed(plan, XLOG_SMGR_SPACE_RESERVATION, wal,
+			CLUSTER_SPACE_RESERVATION_WAL_BYTES, 100, false), RF_PAGE_PROOF_DETAIL_OK);
+		for (int i = 0; i < 2; i++) {
+			UT_ASSERT(cluster_space_structure_wal_encode(&changes[i], wal, sizeof(wal)));
+			UT_ASSERT_EQ(space_online_feed(plan, XLOG_SMGR_SPACE_IDENTITY, wal, sizeof(wal),
+				200 + i * 100, false), RF_PAGE_PROOF_DETAIL_OK);
+		}
+		UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		memset(&untouched, 0xa5, sizeof(untouched));
+		for (int completed = 1; completed <= 2; completed++) {
+			ended = untouched;
+			UT_ASSERT(!rf_side_online_plan_space_incarnation_end_v1(plan,
+				&advance.before.identity.key, advance.before.identity.incarnation, completed, &ended));
+			UT_ASSERT_EQ(memcmp(&ended, &untouched, sizeof(ended)), 0);
+		}
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(67);
+	UT_PLAN(69);
+	UT_RUN(test_space_incarnation_end_requires_an_actual_later_space0_contribution);
+	UT_RUN(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_gaps);
 	UT_RUN(test_space_retained_ancestry_create_and_independent_page_terminal);
 	UT_RUN(test_space_retained_ancestry_covers_history_and_each_committed_drop);
 	UT_RUN(test_space_retained_ancestry_rejects_broken_history_before_live_suffix);

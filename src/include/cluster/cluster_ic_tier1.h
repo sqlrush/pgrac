@@ -179,6 +179,18 @@ extern int cluster_ic_tier1_my_data_channel(void);
 /* Shared local lifetime observation, not a wire identity or authority. */
 extern uint64 cluster_ic_tier1_resource_x_stream_generation(int32 peer, int channel);
 
+/* Stack-only local lifetimes for a retained terminal-proof request. Every
+ * configured DATA channel is bound because the inquiry API has no block tag. */
+typedef struct ClusterICTerminalPeerSessions {
+	uint64 control_stream_generation;
+	uint64 data_stream_generation[CLUSTER_IC_TIER1_DATA_CHANNELS];
+	uint32 data_channels;
+} ClusterICTerminalPeerSessions;
+extern bool cluster_ic_tier1_terminal_peer_sessions(
+	int32 peer, uint64 epoch, uint32 control_capability_generation, int data_channels,
+	ClusterICTerminalPeerSessions *out);
+
+
 extern int cluster_ic_tier1_my_n_workers(void);
 
 /* PGRAC: spec-7.2 D3 — dispatch plane-gate drop counter (per plane). */

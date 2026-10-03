@@ -1750,6 +1750,8 @@ cluster_reconfig_compute_join_bitmap(uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BIT
 			continue; /* self is never a join candidate */
 		if (cluster_conf_lookup_node(i) == NULL)
 			continue; /* declared-peer filter */
+		if (!cluster_storage_quorum_allows_node(i))
+			continue; /* storage component is the upper bound of DB candidates */
 
 		ms = cluster_membership_get_state(i);
 		if (ms != CLUSTER_MEMBER_DEAD && ms != CLUSTER_MEMBER_ABSENT)
@@ -7823,12 +7825,15 @@ out:
 static bool
 cluster_reconfig_r4_membership_observations_current(
 	ClusterR4MembershipSnapshot *candidate, bool freeze_generations,
-	const ClusterSemanticActivationRecord *stop_record, const uint8 *stop_root)
+	const ClusterSemanticActivationRecord *stop_record, const uint8 *stop_root,
+	int32 terminal_peer)
 {
 	int node;
 
 	if (candidate == NULL || cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY
 		|| !cluster_qvotec_in_quorum() || cluster_epoch_get_current() != candidate->formation_epoch
+		|| !cluster_storage_quorum_allows_members(candidate->admitted_members_lo,
+												  candidate->admitted_members_hi)
 		|| cluster_qvotec_get_self_incarnation() != candidate->local_self_boot_incarnation)
 		return false;
 	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
@@ -7843,7 +7848,7 @@ cluster_reconfig_r4_membership_observations_current(
 		if (cluster_conf_lookup_node(node) == NULL
 			|| !cluster_reconfig_get_observed_slot(node, &incarnation, &generation)
 			|| generation == 0 || incarnation != candidate->admitted_incarnation[node]
-			|| (!cluster_reconfig_get_observed_fresh_alive(node)
+			|| (node != terminal_peer && !cluster_reconfig_get_observed_fresh_alive(node)
 				&& (stop_record == NULL || stop_root == NULL || node == cluster_node_id
 					|| !cluster_normal_stop_peer_receipt_tail(stop_record, stop_root, node,
 															  incarnation)))
@@ -7865,7 +7870,7 @@ cluster_reconfig_r4_membership_observations_current(
 static bool
 cluster_reconfig_lmon_snapshot_r4_membership_internal(
 	ClusterR4MembershipSnapshot *out, const ClusterSemanticActivationRecord *stop_record,
-	const uint8 *stop_root)
+	const uint8 *stop_root, int32 terminal_peer)
 {
 	ClusterR4MembershipSnapshot candidate;
 	uint64 self_bit;
@@ -7883,7 +7888,8 @@ cluster_reconfig_lmon_snapshot_r4_membership_internal(
 	if (candidate.local_self_boot_incarnation == 0)
 		return false;
 
-	if (!cluster_reconfig_handoff_lock_acquire(LW_SHARED))
+	if (!(terminal_peer >= 0 ? LWLockConditionalAcquire(&ReconfigShmem->lock, LW_SHARED)
+						 : cluster_reconfig_handoff_lock_acquire(LW_SHARED)))
 		return false;
 	candidate.formation_epoch = cluster_epoch_get_current();
 	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
@@ -7910,10 +7916,11 @@ cluster_reconfig_lmon_snapshot_r4_membership_internal(
 								 : (candidate.admitted_members_hi & self_bit) == 0)
 		|| candidate.admitted_incarnation[cluster_node_id] != candidate.local_self_boot_incarnation
 		|| !cluster_reconfig_r4_membership_observations_current(&candidate, true, stop_record,
-																stop_root))
+																stop_root, terminal_peer))
 		return false;
 
-	if (!cluster_reconfig_handoff_lock_acquire(LW_SHARED))
+	if (!(terminal_peer >= 0 ? LWLockConditionalAcquire(&ReconfigShmem->lock, LW_SHARED)
+						 : cluster_reconfig_handoff_lock_acquire(LW_SHARED)))
 		return false;
 	if (cluster_epoch_get_current() != candidate.formation_epoch)
 		exact = false;
@@ -7932,7 +7939,7 @@ cluster_reconfig_lmon_snapshot_r4_membership_internal(
 	LWLockRelease(&ReconfigShmem->lock);
 	if (!exact
 		|| !cluster_reconfig_r4_membership_observations_current(&candidate, false, stop_record,
-																stop_root))
+																stop_root, terminal_peer))
 		return false;
 	*out = candidate;
 	return true;
@@ -7941,7 +7948,26 @@ cluster_reconfig_lmon_snapshot_r4_membership_internal(
 bool
 cluster_reconfig_lmon_snapshot_r4_membership(ClusterR4MembershipSnapshot *out)
 {
-	return cluster_reconfig_lmon_snapshot_r4_membership_internal(out, NULL, NULL);
+	return cluster_reconfig_lmon_snapshot_r4_membership_internal(out, NULL, NULL, -1);
+}
+
+bool
+cluster_reconfig_terminal_peer_membership(int32 peer_node_id, ClusterR4MembershipSnapshot *out)
+{
+	ClusterR4MembershipSnapshot candidate;
+	uint64 cut = cluster_membership_cut_generation();
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || cut == 0 || peer_node_id < 0 || peer_node_id >= CLUSTER_MAX_NODES
+		|| peer_node_id == cluster_node_id
+		|| !cluster_reconfig_lmon_snapshot_r4_membership_internal(&candidate, NULL, NULL,
+																	peer_node_id)
+		|| candidate.admitted_incarnation[peer_node_id] == 0
+		|| !cluster_membership_cut_generation_current(cut))
+		return false;
+	*out = candidate;
+	return true;
 }
 
 /* Compatibility projection for callers that consume only the global bitmap
@@ -7982,7 +8008,7 @@ cluster_reconfig_normal_stop_snapshot_admitted_membership(
 	if (open_record == NULL || root_descriptor == NULL || out_members_lo == NULL
 		|| out_members_hi == NULL || out_formation_epoch == NULL
 		|| !cluster_reconfig_lmon_snapshot_r4_membership_internal(&snapshot, open_record,
-																  root_descriptor))
+																  root_descriptor, -1))
 		return false;
 	*out_members_lo = snapshot.admitted_members_lo;
 	*out_members_hi = snapshot.admitted_members_hi;
@@ -8793,6 +8819,8 @@ cluster_reconfig_startup_cohort_valid(const ClusterFormationCommitMarker *marker
 {
 	int first = -1;
 	int count = 0;
+	uint64 storage_members[2] = { 0, 0 };
+
 	if (!cluster_shared_config || marker->formation_generation == 0 || marker->commit_nonce == 0
 		|| marker->formation_epoch <= CLUSTER_EPOCH_INITIAL
 		|| marker->formation_epoch != cluster_epoch_get_current() || cluster_node_id < 0
@@ -8817,6 +8845,7 @@ cluster_reconfig_startup_cohort_valid(const ClusterFormationCommitMarker *marker
 			return false;
 		if (!declared)
 			continue;
+		storage_members[i / 64] |= UINT64_C(1) << (i % 64);
 		if (first < 0)
 			first = i;
 		count++;
@@ -8831,7 +8860,8 @@ cluster_reconfig_startup_cohort_valid(const ClusterFormationCommitMarker *marker
 			return false;
 	}
 	return first >= 0 && count == marker->n_admitted && marker->arbiter_node == (uint64)first
-		   && marker->arbiter_incarnation == incarnations[first];
+		   && marker->arbiter_incarnation == incarnations[first]
+		   && cluster_storage_quorum_allows_members(storage_members[0], storage_members[1]);
 }
 
 static bool

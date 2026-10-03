@@ -41,6 +41,12 @@ OBJS = \
 	cluster.o \
 	cluster_initdb_base.o \
 	cluster_initdb_config.o \
+	cluster_initdb_cohort.o \
+	cluster_initdb_tree.o \
+	cluster_initdb_common.o \
+	cluster_initdb_origin.o \
+	cluster_initdb_side.o \
+	cluster_initdb_wal.o \
 	cluster_adg.o \
 	cluster_adg_xlog.o \
 	cluster_apply_master_election.o \
@@ -241,6 +247,9 @@ OBJS = \
 	cluster_pi_shadow.o \
 	cluster_quorum_decision.o \
 	cluster_qvotec.o \
+	cluster_storage_quorum.o \
+	cluster_storage_quorum_backend.o \
+	cluster_storage_quorum_corosync.o \
 	cluster_scn.o \
 	cluster_semantic_activation.o \
 	cluster_catalog_bootstrap.o \
@@ -425,3 +434,10 @@ cluster_control_root.o cluster_control_bootstrap.o cluster_control_bootstrap_rea
 cluster_wal_history.o cluster_thread_recovery_worker.o: \
 	$(srcdir)/cluster_control_bootstrap_private.h
 cluster_control_root.o cluster_recovery_anchor.o: $(srcdir)/cluster_recovery_anchor_private.h
+
+# Both original creation processes use the same exact native record reader.
+cluster_initdb_wal.o: $(top_srcdir)/src/bin/initdb/pgrac_wal.c $(top_srcdir)/src/bin/initdb/pgrac_wal.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+cluster_initdb_side.o: $(top_srcdir)/src/bin/initdb/pgrac_side.c $(top_srcdir)/src/bin/initdb/pgrac_side.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@

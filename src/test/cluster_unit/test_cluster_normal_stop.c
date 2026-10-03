@@ -1675,6 +1675,12 @@ cluster_gcs_block_r4_tx_resolve_wait_timeout(long idle)
 {
 	return idle;
 }
+long
+cluster_pcm_lock_resource_x_outbound_wait_timeout(long idle_timeout_ms)
+{
+	return idle_timeout_ms; /* This fixture has no retained PCM send owner. */
+}
+
 int
 cluster_lms_outbound_resource_x_intent_pump(void)
 {

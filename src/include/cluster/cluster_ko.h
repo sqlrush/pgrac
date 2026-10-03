@@ -80,6 +80,46 @@ StaticAssertDecl(CLUSTER_KO_RESID_TYPE != CLUSTER_DL_RESID_TYPE,
  */
 extern void cluster_ko_resid_encode(RelFileLocator rloc, ClusterResId *dst);
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_space_identity.h"
+
+#define CLUSTER_KO_SHARED_V2_BYTES 160
+#define CLUSTER_KO_SHARED_MEMBER_BYTES 16
+#define CLUSTER_KO_SHARED_REQUEST 1
+#define CLUSTER_KO_SHARED_ACK 2
+#define CLUSTER_KO_SHARED_REQUEST_STATUS 0
+#define CLUSTER_KO_SHARED_DONE 1
+#define CLUSTER_KO_SHARED_FAILED 2
+
+/* Values only, never a wire struct. The codec validates representation, not
+ * membership, physical flush completion or permission to retire a PI.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterKoSharedMessageV2 {
+	uint16 verb;
+	uint16 status;
+	uint64 batch_id;
+	uint64 epoch;
+	uint64 origin_boot;
+	uint64 peer_boot;
+	ClusterSpaceIdentityKey key;
+	uint8 incarnation[16];
+	uint16 origin_node;
+	uint16 peer_node;
+	uint8 members[CLUSTER_KO_SHARED_MEMBER_BYTES];
+	uint8 member_digest[32];
+} ClusterKoSharedMessageV2;
+
+/* Exact length, little-endian, unaligned buffers accepted. Refusal preserves
+ * output; overlapping input and output is refused. Nonshared legacy payloads
+ * below remain separate and are never accepted by these shared codecs. */
+extern bool cluster_ko_shared_encode_v2(const ClusterKoSharedMessageV2 *message,
+	void *bytes, size_t length);
+extern bool cluster_ko_shared_decode_v2(const void *bytes, size_t length,
+	ClusterKoSharedMessageV2 *out);
+extern bool cluster_ko_shared_ack_matches_v2(const ClusterKoSharedMessageV2 *request,
+	const ClusterKoSharedMessageV2 *ack);
+#endif
+
 #ifndef FRONTEND
 
 #include "cluster/cluster_ic_envelope.h" /* ClusterICEnvelope */

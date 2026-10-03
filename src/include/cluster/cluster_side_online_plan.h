@@ -229,6 +229,23 @@ typedef struct RfSideSpaceTerminalV1 {
 extern bool rf_side_online_plan_space_terminal_v1(const RfSideOnlinePlanV1 *plan,
 	const ClusterSpaceIdentityKey *key, BlockNumber block, RfSideSpaceTerminalV1 *out);
 
+typedef struct RfSideSpaceIncarnationEndV1 {
+	uint32 operation;
+	ClusterSpaceStructureChange change;
+	bool terminal;
+} RfSideSpaceIncarnationEndV1;
+
+/* Find the original TRUNCATE or committed TOMBSTONE ending this incarnation
+ * in the complete strict retained chain. completed_operation must contribute
+ * SPACE0 at or after that end; terminal describes that completed SPACE0.
+ * This is not ordinary DATA ancestry across incarnations, nor permission to
+ * dispose of PI. The original owner must separately prove durable structural
+ * completion, surviving base, lifecycle isolation and the exact source/master
+ * cut. No I/O or authority is granted. Refusal preserves output. */
+extern bool rf_side_online_plan_space_incarnation_end_v1(const RfSideOnlinePlanV1 *plan,
+	const ClusterSpaceIdentityKey *key, const uint8 incarnation[16], uint32 completed_operation,
+	RfSideSpaceIncarnationEndV1 *out);
+
 /* One decoded record, no retained operation array or payload allocation.
  * Reuses the replay decoder but returns only provisional contribution owners.
  * The caller must finish physical WAL/source validation before completing its

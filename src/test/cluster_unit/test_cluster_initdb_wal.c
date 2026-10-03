@@ -72,6 +72,7 @@ prepare(bool crossing, bool other_rmid)
 	record.xl_tot_len = sizeof(record_bytes);
 	record.xl_rmid = other_rmid ? RM_HEAP_ID : RM_XLOG_ID;
 	record.xl_info = XLOG_CHECKPOINT_SHUTDOWN;
+	record.xl_scn = UINT64_C(87345);
 	memcpy(record_bytes, &record, SizeOfXLogRecord);
 	record_bytes[SizeOfXLogRecord] = (char) XLR_BLOCK_ID_DATA_SHORT;
 	record_bytes[SizeOfXLogRecord + 1] = sizeof(CheckPoint);
@@ -122,6 +123,7 @@ UT_TEST(exact_native_checkpoint)
 	UT_ASSERT(pgrac_initdb_wal_observe(directory_fd, &control, 7, &out));
 	UT_ASSERT(out.checkpoint_start == control.checkPoint && out.checkpoint_end == expected_end);
 	UT_ASSERT(out.checkpoint_crc == ((XLogRecord *)(pages[0].data + SizeOfXLogLongPHD))->xl_crc);
+	UT_ASSERT(out.checkpoint_scn == UINT64_C(87345));
 }
 
 UT_TEST(native_checkpoint_spans_pages)
@@ -130,6 +132,7 @@ UT_TEST(native_checkpoint_spans_pages)
 	prepare(true, false);
 	UT_ASSERT(pgrac_initdb_wal_observe(directory_fd, &control, 7, &out));
 	UT_ASSERT(out.checkpoint_start == control.checkPoint && out.checkpoint_end == expected_end);
+	UT_ASSERT(out.checkpoint_scn == UINT64_C(87345));
 }
 
 UT_TEST(wrong_thread_including_legacy_refuses)
@@ -163,6 +166,10 @@ UT_TEST(wrong_sysid_timeline_and_record_refuse)
 
 UT_TEST(crc_and_control_payload_mismatch_refuse)
 {
+	prepare(false, false);
+	((XLogRecord *)(pages[0].data + SizeOfXLogLongPHD))->xl_scn++;
+	save_pages();
+	refused();
 	prepare(false, false);
 	pages[0].data[SizeOfXLogLongPHD + SizeOfXLogRecord + 9] ^= 1;
 	save_pages();
@@ -240,4 +247,5 @@ main(void)
 	UT_ASSERT(unlinkat(directory_fd, filename, 0) == 0 && close(directory_fd) == 0);
 	UT_ASSERT(rmdir(directory) == 0);
 	UT_DONE();
+	return ut_failed_count ? 1 : 0;
 }

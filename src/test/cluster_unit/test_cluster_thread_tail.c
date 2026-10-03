@@ -1693,10 +1693,52 @@ UT_TEST(live_prefix_ignores_unflushed_suffix_but_preserves_cleanup)
 	}
 }
 
+/* A cancellation after the original namespace was opened must close those
+ * exact descriptors; identity memory stays owned by the caller for retry. */
+UT_TEST(prefix_identity_recheck_preserves_cancel_and_close_cleanup)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		ClusterControlRootSnapshot root = sealed_fixture(false);
+		ClusterWalTailObservation tail;
+		ClusterWalPrefixIdentity *identity = NULL;
+		volatile bool caught = false;
+		int before = fd_count();
+
+		UT_ASSERT_EQ(cluster_wal_checkpoint_prefix_observe_identity(
+			scratch, &ref, wal_segment_size, root.checkpoint_lower_lsn,
+			root.validated_tail_lsn_exclusive, root.tail_last_record_lsn,
+			root.tail_last_record_crc32c, &tail, &identity), 0);
+		UT_ASSERT(identity != NULL);
+		UT_ASSERT_EQ(fd_count(), before);
+		InterruptPending = fault == 1;
+		close_action = fault == 2;
+		PG_TRY();
+		{
+			ClusterControlRootResult result
+				= cluster_wal_prefix_identity_recheck(scratch, &ref, identity);
+			UT_ASSERT(fault != 1);
+			UT_ASSERT_EQ(result, fault == 2 ? CLUSTER_CONTROL_ROOT_IO_ERROR
+										 : CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 1);
+		UT_ASSERT_EQ(fd_count(), before);
+		UT_ASSERT_EQ(cluster_wal_prefix_identity_recheck(scratch, &ref, identity), 0);
+		UT_ASSERT_EQ(fd_count(), before);
+		cluster_wal_prefix_identity_free(&identity);
+		UT_ASSERT(identity == NULL);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(57);
+	UT_PLAN(58);
+	UT_RUN(prefix_identity_recheck_preserves_cancel_and_close_cleanup);
 	UT_RUN(retained_reader_keeps_lifecycle_and_strict_physical_checks);
 	UT_RUN(retained_input_does_not_open_recovery_or_live_tail);
 	UT_RUN(live_prefix_rejects_oversized_record_inside_confirmed_complete_end);

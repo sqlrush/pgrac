@@ -1083,9 +1083,9 @@ cluster_wal_prefix_identity_recheck(const char *wal_root, const ClusterWalSource
 	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
 	char thread[32], generation[48];
 	const char *parts[] = { thread, generation };
-	int dirs[3] = { -1, -1, -1 };
+	volatile int dirs[3] = { -1, -1, -1 };
 	struct stat st;
-	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	volatile ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 
 	if (wal_root == NULL || wal_root[0] == '\0' || ref == NULL || identity == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
@@ -1094,32 +1094,40 @@ cluster_wal_prefix_identity_recheck(const char *wal_root, const ClusterWalSource
 	snprintf(thread, sizeof(thread), "thread_%u", ref->claim.identity.origin_thread_id);
 	snprintf(generation, sizeof(generation), "generation_" UINT64_FORMAT,
 			 ref->claim.identity.origin_owner_incarnation);
-	dirs[0] = open(wal_root, flags);
-	for (size_t i = 0; result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && i < lengthof(dirs); ++i) {
-		if (i > 0)
-			dirs[i] = openat(dirs[i - 1], parts[i - 1], flags);
-		if (dirs[i] < 0)
-			result = errno == ENOENT ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
-									 : CLUSTER_CONTROL_ROOT_IO_ERROR;
-		else if (fstat(dirs[i], &st) != 0)
-			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
-		else if (!wal_tail_same(&identity->dirs[i], &st, true))
-			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	}
-	for (uint32 i = 0; result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && i < identity->count; i++) {
-		char filename[MAXFNAMELEN];
+	/* Raw directory descriptors must also close when a cancellation unwinds. */
+	PG_TRY();
+	{
+		dirs[0] = open(wal_root, flags);
+		for (size_t i = 0; result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && i < lengthof(dirs); ++i) {
+			if (i > 0)
+				dirs[i] = openat(dirs[i - 1], parts[i - 1], flags);
+			if (dirs[i] < 0)
+				result = errno == ENOENT ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+										 : CLUSTER_CONTROL_ROOT_IO_ERROR;
+			else if (fstat(dirs[i], &st) != 0)
+				result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			else if (!wal_tail_same(&identity->dirs[i], &st, true))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
+		for (uint32 i = 0; result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && i < identity->count; i++) {
+			char filename[MAXFNAMELEN];
 
-		CHECK_FOR_INTERRUPTS();
-		XLogFileName(filename, ref->timeline, identity->numbers[i], identity->segment_size);
-		if (fstatat(dirs[2], filename, &st, AT_SYMLINK_NOFOLLOW) != 0)
-			result = errno == ENOENT ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
-									 : CLUSTER_CONTROL_ROOT_IO_ERROR;
-		else if (!wal_tail_same(&identity->segments[i], &st, false))
-			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			CHECK_FOR_INTERRUPTS();
+			XLogFileName(filename, ref->timeline, identity->numbers[i], identity->segment_size);
+			if (fstatat(dirs[2], filename, &st, AT_SYMLINK_NOFOLLOW) != 0)
+				result = errno == ENOENT ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+										 : CLUSTER_CONTROL_ROOT_IO_ERROR;
+			else if (!wal_tail_same(&identity->segments[i], &st, false))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		}
 	}
-	for (size_t i = 0; i < lengthof(dirs); ++i)
-		if (dirs[i] >= 0 && close(dirs[i]) != 0)
-			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	PG_FINALLY();
+	{
+		for (size_t i = 0; i < lengthof(dirs); ++i)
+			if (dirs[i] >= 0 && close(dirs[i]) != 0)
+				result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	}
+	PG_END_TRY();
 	return result;
 }
 

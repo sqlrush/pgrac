@@ -13,6 +13,9 @@
 #define PGRAC_CONTROL_BINDING_MAX_NODES 128
 #define PGRAC_CONTROL_BINDING_NAME "pgrac_control_binding"
 
+#define PGRAC_CONTROL_LINEAGE_MIGRATION_V1 UINT32_C(0)
+#define PGRAC_CONTROL_LINEAGE_CREATION_V1 UINT32_C(1)
+
 /* In-memory carrier, never a native-struct disk format. */
 typedef struct PgracControlBinding {
 	uint64 system_identifier;
@@ -20,7 +23,10 @@ typedef struct PgracControlBinding {
 	uint8 authority_uuid[16];
 	uint64 database_incarnation;
 	uint32 node_id;
-	uint32 reserved;
+	uint32 lineage_kind;
+	/* Explicit tagged disk union: migration round/source, or original
+	 * creation cohort/native sources. Creation uses generation 1, epoch 0.
+	 * The tag never grants an online OPEN or writer permission. */
 	uint8 migration_round_sha256[32];
 	uint8 source_wal_state_sha256[32];
 	uint64 migration_prepare_generation;

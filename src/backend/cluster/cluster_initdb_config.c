@@ -19,6 +19,7 @@ struct ClusterInitdbConfig {
 	ClusterSharedConfigRef ref;
 	Size len;
 	char *bytes;
+	char paths[3][MAXPGPATH];
 };
 
 static void
@@ -85,26 +86,20 @@ owned_file(const struct stat *st, const PgracInitdbConfigContext *source)
 }
 
 ClusterInitdbConfig *
-cluster_initdb_config_prepare(const PgracInitdbWalContext *context)
+cluster_initdb_config_preflight(const PgracInitdbConfigContext *source)
 {
 	ClusterInitdbConfig *config;
 	ClusterSharedConfigIdentity *id;
 	ClusterSharedConfigPolicyReport policy;
-	const PgracInitdbConfigContext *source = &context->config;
-	struct stat before, after, target;
+	struct stat before, after;
 	pg_cryptohash_ctx *hash;
 	char value[64], data[MAXPGPATH], wal[MAXPGPATH], undo[MAXPGPATH], extra;
-	char *resolved;
 	uint8 bitmap[8], digest[32];
 	Size offset = 0, used = 0;
 	uint32 count;
 	ssize_t n;
-	int fd;
 
-	if (source->fd == 0)
-		return NULL;
-	if (IsUnderPostmaster || context->phase != PGRAC_INITDB_WAL_POSTBOOTSTRAP
-		|| context->thread_id != 1 || context->base_fd < 3 || source->fd < 3 || source->bytes == 0
+	if (IsUnderPostmaster || source == NULL || source->fd < 3 || source->bytes == 0
 		|| source->bytes > CLUSTER_SHARED_CONFIG_MAX_BYTES || fstat(source->fd, &before) != 0
 		|| !owned_file(&before, source))
 		config_refuse("configuration request is not bound to the original creator");
@@ -157,12 +152,11 @@ cluster_initdb_config_prepare(const PgracInitdbWalContext *context)
 	request_hex(value, id->storage_uuid, 16);
 	request_field(config, &offset, "@system_identifier=", value, sizeof(value));
 	id->system_identifier = request_number(value);
-	if (id->generation != 1 || id->system_identifier != context->system_identifier
-		|| id->database_incarnation != context->database_incarnation
-		|| memcmp(id->storage_uuid, context->storage_uuid, 16) != 0 || (id->configured[0] & 1) == 0
+	if (id->generation != 1 || (id->configured[0] & 1) == 0
 		|| cluster_shared_config_validate(config->bytes, config->len, &config->ref, &count)
 			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		config_refuse("configuration request is not a canonical first input for this new database");
+
 	if (cluster_shared_config_lookup(config->bytes, config->len, &config->ref, -1,
 									 "cluster.shared_data_dir", data, sizeof(data))
 			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -180,6 +174,54 @@ cluster_initdb_config_prepare(const PgracInitdbWalContext *context)
 						errmsg("INITDB_CONFIG_CREATE: invalid or incomplete bootstrap profile"),
 						errdetail("Configuration reason=%d node=%d parameter=%s.", policy.reason,
 								  policy.node_id, policy.name)));
+	strlcpy(config->paths[0], data, MAXPGPATH);
+	strlcpy(config->paths[1], wal, MAXPGPATH);
+	strlcpy(config->paths[2], undo, MAXPGPATH);
+	return config;
+}
+
+const ClusterSharedConfigRef *
+cluster_initdb_config_reference(const ClusterInitdbConfig *config)
+{
+	return &config->ref;
+}
+
+const char *
+cluster_initdb_config_path(const ClusterInitdbConfig *config, unsigned index)
+{
+	Assert(index < lengthof(config->paths));
+	return config->paths[index];
+}
+
+void
+cluster_initdb_config_free(ClusterInitdbConfig *config)
+{
+	pfree(config->bytes);
+	pfree(config);
+}
+
+ClusterInitdbConfig *
+cluster_initdb_config_prepare(const PgracInitdbWalContext *context)
+{
+	ClusterInitdbConfig *config;
+	const ClusterSharedConfigIdentity *id;
+	const char *data;
+	char *resolved;
+	struct stat target;
+	int fd;
+
+	if (context->config.fd == 0)
+		return NULL;
+	if (IsUnderPostmaster || context->phase != PGRAC_INITDB_WAL_POSTBOOTSTRAP
+		|| context->thread_id != 1 || context->base_fd < 3)
+		config_refuse("configuration request is not bound to the original creator");
+	config = cluster_initdb_config_preflight(&context->config);
+	id = &config->ref.identity;
+	if (id->system_identifier != context->system_identifier
+		|| id->database_incarnation != context->database_incarnation
+		|| memcmp(id->storage_uuid, context->storage_uuid, 16) != 0)
+		config_refuse("configuration request is not a canonical first input for this new database");
+	data = config->paths[0];
 	/* Only DATA exists at this creation step. The full cohort owner still
 	 * must independently qualify WAL/undo deployment paths before ROOT-last. */
 	resolved = realpath(data, NULL);

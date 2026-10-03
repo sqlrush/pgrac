@@ -111,6 +111,7 @@
 #include "port/atomics.h"
 #include "storage/lwlock.h"
 
+#include "cluster/cluster_storage_quorum.h"
 #include "cluster/cluster_conf.h"				 /* CLUSTER_MAX_NODES */
 #include "cluster/cluster_semantic_activation.h" /* record types */
 
@@ -146,7 +147,9 @@
 #define CLUSTER_QVOTEC_SHMEM_PREFIX_BYTES 128
 #define CLUSTER_QVOTEC_MAILBOX_BYTES 320
 #define CLUSTER_QVOTEC_SHMEM_PRIOR_OFFSET 448
-#define CLUSTER_QVOTEC_SHMEM_BYTES (448 + 8 + 16 + 512 * CLUSTER_MAX_VOTING_DISKS)
+#define CLUSTER_QVOTEC_SHMEM_STORAGE_OFFSET (448 + 8 + 16 + 512 * CLUSTER_MAX_VOTING_DISKS)
+#define CLUSTER_QVOTEC_SHMEM_BYTES                                                                 \
+	(CLUSTER_QVOTEC_SHMEM_STORAGE_OFFSET + CLUSTER_STORAGE_QUORUM_STATE_BYTES)
 #define CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES 128
 #define CLUSTER_QVOTEC_BALLOT_BYTES 32
 #define CLUSTER_QVOTEC_CONFIGURED_DISK_MASK UINT8_C(0x7f)

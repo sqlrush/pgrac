@@ -61,6 +61,8 @@ static const struct {
 	{ "cluster.controlfile_shared_authority", POLICY_COMMON | POLICY_COLD },
 	{ "cluster.shared_catalog", POLICY_COMMON | POLICY_COLD },
 	{ "cluster.shared_config", POLICY_COMMON | POLICY_COLD },
+	{ "cluster.storage_quorum_cluster", POLICY_COMMON | POLICY_COLD | POLICY_STRING },
+	{ "cluster.storage_quorum_nodes", POLICY_COMMON | POLICY_COLD | POLICY_STRING },
 	{ "cluster.undo_gcs_coherence", POLICY_COMMON | POLICY_COLD },
 	{ "cluster.enabled", POLICY_COMMON | POLICY_COLD },
 	{ "debug_io_direct", POLICY_COMMON | POLICY_COLD | POLICY_STRING },

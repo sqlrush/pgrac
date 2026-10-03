@@ -58,6 +58,7 @@ typedef struct ControlRootHeader {
 	uint8 storage_uuid[16];
 	uint8 authority_uuid[16];
 	uint32 activation_state;
+	uint32 lineage_kind;
 	int64 created_at_usec;
 	int64 published_at_usec;
 	uint32 body_crc32c;
@@ -149,8 +150,9 @@ typedef enum ClusterWalStartupPhase {
 
 typedef enum ClusterWalStartupInputKind {
 	CLUSTER_WAL_STARTUP_CLEAN = 1,
-	CLUSTER_WAL_STARTUP_RECOVERED = 2
+	CLUSTER_WAL_STARTUP_RECOVERED = 2,
 	/* Value 3 was cold import; deliberately not supported or reused. */
+	CLUSTER_WAL_STARTUP_INITIALIZED = 4
 } ClusterWalStartupInputKind;
 
 typedef struct ClusterWalStartupImage {
@@ -176,6 +178,19 @@ typedef struct ClusterWalStartupImage {
 	ClusterWalHistoryRecord successor;
 	ClusterWalThreadClaimV2 claim;
 } ClusterWalStartupImage;
+
+/* Original creator's memory-only composition of a complete first-input set.
+ * sources contains the actual original records/common object references and
+ * no startup references. Each configured origin supplies a distinct nonzero
+ * operation UUID; nonmembers supply zero. No I/O, randomness, creation proof,
+ * serving or writer permission. The creator must independently validate and
+ * persist every referenced object before publishing the returned ROOT last.
+ * Distinct outputs clear on refusal; overlapping arguments are not touched. */
+extern ClusterControlRootResult cluster_control_root_v3_initialized_inputs(
+	const ControlRootImage *sources,
+	const uint8 operation_ids[CLUSTER_CONTROL_ROOT_RECORD_COUNT][16], uint32 segment_size,
+	ControlRootImage *root,
+	uint8 inputs[CLUSTER_CONTROL_ROOT_RECORD_COUNT][CLUSTER_WAL_STARTUP_BYTES]);
 
 /* Checkpoint-less initialization terminal. Logical carrier only: the embedded
  * original and physical census grant neither recovery nor serving permission.
@@ -272,7 +287,8 @@ extern ClusterControlRootResult cluster_wal_origin_inputs_read_locked(const Cont
 																	  uint32 node,
 																	  ClusterWalOriginInputs *out);
 
-/* Native StartupProcess advances one exact clean-cohort observation. WAIT
+/* Native StartupProcess advances one exact clean or original kind4 cohort.
+ * Kind4 consumes existing creator evidence; it never fabricates clean exit. WAIT
  * means no native mutation permission; repeat only after releasing all holds.
  * OK returns this target's INITIALIZING operation, not serving permission.
  * An interrupted initialized writer needs recovery, never caller adoption. */

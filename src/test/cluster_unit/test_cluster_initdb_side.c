@@ -178,10 +178,61 @@ UT_TEST(fsync_failure_refuses) { io_failure(SYNC_FAIL); }
 UT_TEST(changed_readback_refuses) { io_failure(CORRUPT); }
 UT_TEST(short_readback_refuses) { io_failure(SHORT_READ); }
 
+UT_TEST(peer_copies_its_own_original_source)
+{
+	int native, file;
+	char byte;
+	prepare();
+	UT_ASSERT(pgrac_initdb_side_create(source_fd, shared_fd));
+	native = open_directory(shared_fd, "native_side");
+	UT_ASSERT(native >= 0);
+	file = openat(source_fd, "pg_xact/0000", O_WRONLY);
+	UT_ASSERT(file >= 0 && pwrite(file, "b", 1, 0) == 1 && fsync(file) == 0 && close(file) == 0);
+	UT_ASSERT(pgrac_initdb_side_origin_create(source_fd, native, 127));
+	file = openat(native, "origin_127/pg_xact/0000", O_RDONLY);
+	UT_ASSERT(file >= 0 && read(file, &byte, 1) == 1 && byte == 'b' && close(file) == 0);
+	file = openat(native, "origin_0/pg_xact/0000", O_RDONLY);
+	UT_ASSERT(file >= 0 && read(file, &byte, 1) == 1 && byte == 'a' && close(file) == 0);
+	writes = 0;
+	UT_ASSERT(!pgrac_initdb_side_origin_create(source_fd, native, 127) && writes == 0);
+	UT_ASSERT(!pgrac_initdb_side_origin_create(source_fd, native, 0) && writes == 0);
+	UT_ASSERT(!pgrac_initdb_side_origin_create(source_fd, native, 128) && writes == 0);
+	UT_ASSERT(close(native) == 0);
+	cleanup();
+}
+
+UT_TEST(peer_alias_is_not_adopted)
+{
+	int native;
+	prepare();
+	UT_ASSERT(pgrac_initdb_side_create(source_fd, shared_fd));
+	native = open_directory(shared_fd, "native_side");
+	UT_ASSERT(native >= 0 && symlinkat("origin_0", native, "origin_1") == 0);
+	writes = 0;
+	UT_ASSERT(!pgrac_initdb_side_origin_create(source_fd, native, 1) && writes == 0);
+	UT_ASSERT(close(native) == 0);
+	cleanup();
+}
+
+UT_TEST(peer_failed_write_cannot_be_adopted)
+{
+	int native;
+	prepare();
+	UT_ASSERT(pgrac_initdb_side_create(source_fd, shared_fd));
+	native = open_directory(shared_fd, "native_side");
+	UT_ASSERT(native >= 0);
+	writes = 0; fault = SYNC_FAIL;
+	UT_ASSERT(!pgrac_initdb_side_origin_create(source_fd, native, 1) && writes > 0);
+	writes = 0; fault = NONE;
+	UT_ASSERT(!pgrac_initdb_side_origin_create(source_fd, native, 1) && writes == 0);
+	UT_ASSERT(close(native) == 0);
+	cleanup();
+}
+
 int main(int argc, char **argv)
 {
 	pg_logging_init(argv[0]);
-	UT_PLAN(9);
+	UT_PLAN(12);
 	UT_RUN(actual_copy_sync_and_readback);
 	UT_RUN(existing_namespace_is_unchanged);
 	UT_RUN(source_alias_refuses_before_mutation);
@@ -191,5 +242,8 @@ int main(int argc, char **argv)
 	UT_RUN(fsync_failure_refuses);
 	UT_RUN(changed_readback_refuses);
 	UT_RUN(short_readback_refuses);
+	UT_RUN(peer_copies_its_own_original_source);
+	UT_RUN(peer_alias_is_not_adopted);
+	UT_RUN(peer_failed_write_cannot_be_adopted);
 	UT_DONE();
 }

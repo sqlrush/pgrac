@@ -1,7 +1,11 @@
 /* Author: SqlRush <sqlrush@gmail.com> */
 /* Original creator's exact, read-only native shutdown record inspection.
  * Author: SqlRush <sqlrush@gmail.com> */
+#ifdef FRONTEND
 #include "postgres_fe.h"
+#else
+#include "postgres.h"
+#endif
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -170,6 +174,7 @@ pgrac_initdb_wal_observe(int directory_fd, const ControlFileData *control,
 	{
 		observed.checkpoint_start = reader->ReadRecPtr;
 		observed.checkpoint_end = reader->EndRecPtr;
+		observed.checkpoint_scn = XLogRecGetScn(reader);
 		observed.checkpoint_crc = record->xl_crc;
 		valid = true;
 	}

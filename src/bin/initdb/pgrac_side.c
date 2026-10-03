@@ -1,6 +1,10 @@
 /* Original initdb's per-origin native state, after its child has exited.
  * Author: SqlRush <sqlrush@gmail.com> */
+#ifdef FRONTEND
 #include "postgres_fe.h"
+#else
+#include "postgres.h"
+#endif
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -171,18 +175,24 @@ done:
 	return ok;
 }
 
-bool
-pgrac_initdb_side_create(int source_fd, int shared_fd)
+static bool
+side_create(int source_fd, int shared_fd, uint32 node, bool create_root)
 {
 	int source[7], target[7], native = -1;
+#ifdef FRONTEND
 	SideFile *files = pg_malloc0(sizeof(*files) * SIDE_FILES_MAX);
+#else
+	SideFile *files = palloc0(sizeof(*files) * SIDE_FILES_MAX);
+#endif
 	unsigned count = 0;
 	bool ok = false;
 	struct stat a, b;
+	char origin[32];
 
 	for (unsigned i = 0; i < lengthof(source); ++i) source[i] = target[i] = -1;
 	source[0] = source_fd;
-	if (fstat(source_fd, &a) != 0 || fstat(shared_fd, &b) != 0
+	if (node >= 128 || (create_root && node != 0) || (!create_root && node == 0)
+		|| fstat(source_fd, &a) != 0 || fstat(shared_fd, &b) != 0
 		|| !S_ISDIR(a.st_mode) || !S_ISDIR(b.st_mode) || a.st_uid != geteuid() || b.st_uid != geteuid()
 		|| ((a.st_mode | b.st_mode) & 0022) != 0 || (a.st_dev == b.st_dev && a.st_ino == b.st_ino)) goto done;
 	for (unsigned i = 0; i < lengthof(directories); ++i)
@@ -192,10 +202,11 @@ pgrac_initdb_side_create(int source_fd, int shared_fd)
 	}
 	if (!collect(source, files, &count)) goto done;
 	/* The creator can only make a new namespace. Failure never adopts one. */
-	if (mkdirat(shared_fd, "native_side", pg_dir_create_mode) != 0) goto done;
-	native = open_directory(shared_fd, "native_side");
-	if (native < 0 || mkdirat(native, "origin_0", pg_dir_create_mode) != 0) goto done;
-	target[0] = open_directory(native, "origin_0");
+	if (create_root && mkdirat(shared_fd, "native_side", pg_dir_create_mode) != 0) goto done;
+	native = open_directory(shared_fd, create_root ? "native_side" : ".");
+	snprintf(origin, sizeof(origin), "origin_%u", node);
+	if (native < 0 || mkdirat(native, origin, pg_dir_create_mode) != 0) goto done;
+	target[0] = open_directory(native, origin);
 	if (target[0] < 0) goto done;
 	for (unsigned i = 0; i < lengthof(directories); ++i)
 	{
@@ -209,8 +220,8 @@ pgrac_initdb_side_create(int source_fd, int shared_fd)
 		if (!directory_current(source[parents[i]], directories[i], source[i + 1])
 			|| fsync(target[i + 1]) != 0
 			|| !directory_current(target[parents[i]], directories[i], target[i + 1])) goto done;
-	if (fsync(target[0]) != 0 || !directory_current(native, "origin_0", target[0])
-		|| fsync(native) != 0 || !directory_current(shared_fd, "native_side", native)
+	if (fsync(target[0]) != 0 || !directory_current(native, origin, target[0])
+		|| fsync(native) != 0 || !directory_current(shared_fd, create_root ? "native_side" : ".", native)
 		|| fsync(shared_fd) != 0) goto done;
 	ok = true;
 done:
@@ -220,6 +231,22 @@ done:
 		if (i > 0 && source[i] >= 0 && close(source[i]) != 0) ok = false;
 	}
 	if (native >= 0 && close(native) != 0) ok = false;
+#ifdef FRONTEND
 	free(files);
+#else
+	pfree(files);
+#endif
 	return ok;
+}
+
+bool
+pgrac_initdb_side_create(int source_fd, int shared_fd)
+{
+	return side_create(source_fd, shared_fd, 0, true);
+}
+
+bool
+pgrac_initdb_side_origin_create(int source_fd, int native_fd, uint32 node)
+{
+	return side_create(source_fd, native_fd, node, false);
 }

@@ -18,6 +18,8 @@
 #include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_write_fence.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_control_root.h" /* bit22 (G3 accessor test) */
@@ -147,6 +149,16 @@ static uint8 test_terminal_peer_root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
 static bool test_stop_real_observation;
 bool cluster_shared_config;
 static int test_stop_not_fresh_peer = -1;
+static bool test_stop_storage_quorum = true;
+static uint64 test_terminal_membership_cut = 2;
+static bool test_terminal_fenced, test_terminal_prebump, test_terminal_join, test_terminal_stop;
+static bool test_terminal_sessions_ok = true;
+static int test_terminal_qv_status = CLUSTER_QVOTEC_READY;
+static int test_terminal_nonmember = -1;
+static ClusterICTerminalPeerSessions test_terminal_sessions;
+static unsigned test_terminal_session_calls, test_terminal_session_hook_at;
+static void (*test_terminal_session_hook)(void);
+
 static bool test_capability_store_missing;
 static uint32 test_local_capability_word;
 static bool test_ctrc_shmem_is_ready = true;
@@ -690,7 +702,7 @@ cluster_membership_member_count(void)
 bool
 cluster_membership_is_member(int32 node_id)
 {
-	return node_id >= 0 && node_id < 4;
+	return node_id >= 0 && node_id < 4 && node_id != test_terminal_nonmember;
 }
 
 ClusterMembershipState
@@ -723,7 +735,7 @@ cluster_reconfig_get_observed_epoch(int32 node_id)
 int
 cluster_qvotec_get_status(void)
 {
-	return CLUSTER_QVOTEC_READY;
+	return test_terminal_qv_status;
 }
 
 const ClusterNodeInfo *
@@ -739,6 +751,13 @@ cluster_reconfig_get_observed_fresh_alive(int32 node_id)
 	return node_id >= 0 && node_id < 4 && node_id != test_stop_not_fresh_peer;
 }
 
+bool
+cluster_storage_quorum_allows_members(uint64 lo, uint64 hi)
+{
+	return test_stop_storage_quorum && lo == test_membership_snapshot_lo
+		   && hi == test_membership_snapshot_hi;
+}
+
 #include "test_cluster_stop_membership_observation.inc"
 
 static bool
@@ -752,8 +771,54 @@ test_stop_observation_current(const ClusterSemanticActivationRecord *open, const
 	for (int node = 0; node < 4; node++)
 		candidate.admitted_incarnation[node]
 			= cluster_membership_get_last_admitted_incarnation(node);
-	return cluster_reconfig_r4_membership_observations_current(&candidate, true, open, root)
-		   && cluster_reconfig_r4_membership_observations_current(&candidate, false, open, root);
+	return cluster_reconfig_r4_membership_observations_current(&candidate, true, open, root, -1)
+		   && cluster_reconfig_r4_membership_observations_current(&candidate, false, open, root, -1);
+}
+
+/* Real coherent membership acquisition is tested in test_cluster_reconfig.
+ * This boundary still executes the original observed-slot predicate. */
+bool
+cluster_reconfig_terminal_peer_membership(int32 peer, ClusterR4MembershipSnapshot *out)
+{
+	ClusterR4MembershipSnapshot candidate = { 0 };
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || !test_membership_snapshot_valid || peer < 0 || peer >= 4
+		|| peer == cluster_node_id || !cluster_membership_is_member(peer)
+		|| (test_membership_snapshot_lo & (UINT64_C(1) << peer)) == 0)
+		return false;
+	candidate.formation_epoch = test_membership_snapshot_epoch;
+	candidate.admitted_members_lo = test_membership_snapshot_lo;
+	candidate.admitted_members_hi = test_membership_snapshot_hi;
+	candidate.local_self_boot_incarnation = cluster_qvotec_get_self_incarnation();
+	for (int node = 0; node < 4; node++)
+		candidate.admitted_incarnation[node] = cluster_membership_get_last_admitted_incarnation(node);
+	if (!cluster_reconfig_r4_membership_observations_current(&candidate, true, NULL, NULL, peer)
+		|| !cluster_reconfig_r4_membership_observations_current(&candidate, false, NULL, NULL, peer))
+		return false;
+	*out = candidate;
+	return true;
+}
+uint64 cluster_membership_cut_generation(void) { return test_terminal_membership_cut; }
+bool cluster_membership_cut_generation_current(uint64 cut)
+{ return cut != 0 && cut == test_terminal_membership_cut; }
+bool cluster_write_fence_allowed(void) { return !test_terminal_fenced; }
+bool cluster_reconfig_has_pending_prebump_stage(void) { return test_terminal_prebump; }
+bool cluster_reconfig_join_in_progress(void) { return test_terminal_join; }
+bool cluster_normal_stop_requested(void) { return test_terminal_stop; }
+bool
+cluster_ic_tier1_terminal_peer_sessions(int32 peer, uint64 epoch, uint32 cap, int channels,
+									  ClusterICTerminalPeerSessions *out)
+{
+	memset(out, 0, sizeof(*out));
+	test_terminal_session_calls++;
+	if (test_terminal_session_calls == test_terminal_session_hook_at && test_terminal_session_hook != NULL)
+		test_terminal_session_hook();
+	if (!test_terminal_sessions_ok || peer < 0 || peer >= 4 || epoch != test_current_epoch
+		|| cap != test_peer_capability_generation || channels != (int)test_terminal_sessions.data_channels)
+		return false;
+	*out = test_terminal_sessions;
+	return true;
 }
 
 bool
@@ -1190,6 +1255,15 @@ test_gate_reset(void)
 	test_qvotec_in_quorum = true;
 	test_stop_real_observation = false;
 	test_stop_not_fresh_peer = -1;
+	test_stop_storage_quorum = true;
+	test_terminal_membership_cut = 2;
+	test_terminal_fenced = test_terminal_prebump = test_terminal_join = test_terminal_stop = false;
+	test_terminal_sessions_ok = true;
+	test_terminal_qv_status = CLUSTER_QVOTEC_READY;
+	test_terminal_nonmember = -1;
+	memset(&test_terminal_sessions, 0, sizeof(test_terminal_sessions));
+	test_terminal_session_calls = test_terminal_session_hook_at = 0;
+	test_terminal_session_hook = NULL;
 	test_qvotec_self_incarnation = UINT64_C(0x445566778899aabb);
 	test_last_admitted_incarnation = UINT64_C(0x445566778899aabb);
 	memset(test_remote_admitted_incarnations, 0, sizeof(test_remote_admitted_incarnations));
@@ -7672,6 +7746,8 @@ ut_resource_x_open_carrier_setup(ClusterSemanticAdmissionToken *token)
 	ut_resource_x_open_carrier_setup_at_epoch(token, 7);
 }
 
+#include "test_cluster_terminal_peer.inc"
+
 /* The ordinary cutover retains R4 in its current target bitmap.  Its exact
  * complete OPEN_APPLIED image is not a recovery OPEN_PROOF image: a read-only
  * R4 consumer must accept the same current formation without rewriting it. */
@@ -10457,6 +10533,10 @@ UT_TEST(test_stop_real_observation_survives_terminal_peer_alive_clear)
 	test_stop_real_observation = true;
 	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, incarnations, NULL),
 				 CLUSTER_NORMAL_STOP_READY);
+	test_stop_storage_quorum = false;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, incarnations, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	test_stop_storage_quorum = true;
 	test_terminal_peer_open = open;
 	memcpy(test_terminal_peer_root, root, sizeof(root));
 	test_terminal_peer_record_enabled = test_terminal_peer_eligible = true;
@@ -11049,7 +11129,7 @@ UT_TEST(test_a148_stop_poll_includes_original_phase3_handoff)
 int
 main(void)
 {
-	UT_PLAN(322);
+	UT_PLAN(327);
 	UT_RUN(test_normal_actual_finish_preserves_unconfigured_native_startup);
 	UT_RUN(test_normal_start_pending_ack_does_not_reuse_root_after_valid_mirror_drift);
 	UT_RUN(test_normal_start_confirmed_new_root_permanently_rejects_old_completion);
@@ -11283,6 +11363,11 @@ main(void)
 	UT_RUN(test_145e_restore_open_proof_is_idempotent);
 	UT_RUN(test_145f_restore_open_proof_requires_active_latch);
 	UT_RUN(test_145g_peer_open_matches_consumes_open_proof);
+	UT_RUN(test_terminal_peer_stale_origin_has_only_inquiry_qualification);
+	UT_RUN(test_terminal_peer_missing_authority_clears_output);
+	UT_RUN(test_terminal_peer_aba_invalidates_original_snapshot);
+	UT_RUN(test_terminal_peer_mid_sample_drift_is_refused);
+	UT_RUN(test_terminal_peer_uses_actual_recovered_open_carrier);
 	UT_RUN(test_r4_peer_accepts_completed_ordinary_cutover_without_recovery_flag);
 	UT_RUN(test_ordinary_open_reaches_real_master_route_and_stale_peer_does_not);
 	UT_RUN(test_r4_peer_ordinary_open_rechecks_every_member_and_feature);
