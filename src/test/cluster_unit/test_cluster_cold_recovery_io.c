@@ -36,6 +36,7 @@
 #include "access/xlogreader.h"
 #include "miscadmin.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_space_identity.h"
 #include "cluster/cluster_space_reservation.h"
@@ -447,6 +448,270 @@ UT_TEST(test_reader_open_read_close)
 	free(expected);
 }
 
+/* ---- participant census ---- */
+static const ClusterWalInputV1 *scope_ptr[MAX_SCOPE];
+
+static void
+scope_reset(void)
+{
+	memset(scope_inputs, 0, sizeof(scope_inputs));
+	scope_count = 0;
+	retained_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+/* A checkpoint input of (thread, incarnation): [lower, redo, tail). */
+static ClusterWalInputV1 *
+generation(uint16 thread, uint64 incarnation, bool current, uint32 lifecycle, XLogRecPtr lower,
+		   XLogRecPtr redo, XLogRecPtr tail)
+{
+	ClusterWalInputV1 *i = &scope_inputs[scope_count];
+
+	scope_ptr[scope_count++] = i;
+	i->kind = CLUSTER_WAL_INPUT_CHECKPOINT;
+	i->current = current;
+	i->checkpoint.identity.system_identifier = 77;
+	memset(i->checkpoint.identity.storage_uuid, 5, 16);
+	i->checkpoint.identity.origin_thread_id = thread;
+	i->checkpoint.identity.origin_node_id = thread - 1;
+	i->checkpoint.identity.origin_owner_incarnation = incarnation;
+	i->checkpoint.identity.root_lineage_seq = 1;
+	i->checkpoint.lifecycle = lifecycle;
+	i->checkpoint.root_flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+							   | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+							   | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID;
+	i->checkpoint.checkpoint_tli = 1;
+	i->checkpoint.checkpoint_lower_lsn = lower;
+	i->checkpoint.validated_tail_lsn_exclusive = tail;
+	i->native_redo = redo;
+	i->checkpoint_start = redo;
+	i->source.claim.identity = i->checkpoint.identity;
+	i->source.timeline = 1;
+	return i;
+}
+
+static ClusterWalInputV1 *
+terminal(uint16 thread, uint64 records)
+{
+	ClusterWalInputV1 *i = &scope_inputs[scope_count];
+
+	scope_ptr[scope_count++] = i;
+	i->kind = CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL;
+	i->source.claim.identity.origin_thread_id = thread;
+	i->first_segment = 0x1000000;
+	i->terminal.tail.records = records;
+	return i;
+}
+
+#define REQUIRED CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+#define CLOSED CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+#define COMPLETE CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+#define OPEN CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+
+static ClusterColdCensusDetailV1
+census(ClusterColdCensusEntryV1 *out, uint32 capacity, uint32 *count, uint32 *bad)
+{
+	return cluster_cold_census_select_v1(scope_ptr, scope_count, out, capacity, count, bad);
+}
+
+/*
+ * Two generations of one thread: the crashed current one is replayed, the
+ * older one kept in the ROOT history is history only, ending at its tail.
+ */
+UT_TEST(test_census_two_generations_of_one_thread)
+{
+	ClusterColdCensusEntryV1 out[MAX_SCOPE];
+	uint32 count = 99;
+	uint32 bad = 0;
+
+	scope_reset();
+	generation(1, 10, false, CLOSED, 0x100, 0x300, 0x400);
+	generation(1, 11, true, REQUIRED, 0x500, 0x800, 0x2000);
+	UT_ASSERT_EQ(census(out, MAX_SCOPE, &count, &bad), CLUSTER_COLD_CENSUS_OK);
+	UT_ASSERT_EQ(count, 2);
+	UT_ASSERT_EQ(out[0].role, CLUSTER_COLD_CENSUS_HISTORY);
+	UT_ASSERT_EQ(out[0].input_index, 0);
+	UT_ASSERT_EQ(out[0].cut.thread_id, 1);
+	UT_ASSERT_EQ(out[0].cut.owner_incarnation, 10);
+	UT_ASSERT_EQ(out[0].cut.physical_lower, 0x100);
+	UT_ASSERT_EQ(out[0].cut.native_redo, 0x400); /* nothing of it is replayed */
+	UT_ASSERT_EQ(out[0].cut.tail_end, 0x400);
+	UT_ASSERT_EQ(out[1].role, CLUSTER_COLD_CENSUS_REPLAY);
+	UT_ASSERT_EQ(out[1].input_index, 1);
+	UT_ASSERT_EQ(out[1].cut.owner_incarnation, 11);
+	UT_ASSERT_EQ(out[1].cut.physical_lower, 0x500);
+	UT_ASSERT_EQ(out[1].cut.native_redo, 0x800);
+	UT_ASSERT_EQ(out[1].cut.tail_end, 0x2000);
+	UT_ASSERT_EQ(out[1].cut.timeline, 1);
+	UT_ASSERT_EQ(out[1].identity.origin_owner_incarnation, 11);
+	UT_ASSERT_EQ(out[1].source.claim.identity.origin_owner_incarnation, 11);
+}
+
+/*
+ * A closed or recovered current generation still retaining WAL is history;
+ * a generation (or terminal) with nothing retained is left out.
+ */
+UT_TEST(test_census_history_and_empty_generations)
+{
+	ClusterColdCensusEntryV1 out[MAX_SCOPE];
+	uint32 count = 0;
+	uint32 bad = 0;
+
+	scope_reset();
+	generation(2, 20, true, CLOSED, 0x100, 0x300, 0x380);
+	generation(3, 30, true, COMPLETE, 0x100, 0x200, 0x900);
+	generation(4, 40, true, CLOSED, 0x700, 0x700, 0x700); /* nothing retained */
+	terminal(5, 0);										  /* empty initializer terminal */
+	UT_ASSERT_EQ(census(out, MAX_SCOPE, &count, &bad), CLUSTER_COLD_CENSUS_OK);
+	UT_ASSERT_EQ(count, 2);
+	UT_ASSERT_EQ(out[0].role, CLUSTER_COLD_CENSUS_HISTORY);
+	UT_ASSERT_EQ(out[0].cut.thread_id, 2);
+	UT_ASSERT_EQ(out[0].cut.native_redo, 0x380);
+	UT_ASSERT_EQ(out[1].role, CLUSTER_COLD_CENSUS_HISTORY);
+	UT_ASSERT_EQ(out[1].cut.thread_id, 3);
+	UT_ASSERT_EQ(out[1].cut.native_redo, 0x900);
+}
+
+/* What the census cannot take part in is refused, naming the input. */
+UT_TEST(test_census_refusals)
+{
+	ClusterColdCensusEntryV1 out[MAX_SCOPE];
+	uint32 count = 0;
+	uint32 bad = 0;
+	ClusterWalInputV1 *g;
+
+	/* a live writer, or a crash nobody sealed */
+	scope_reset();
+	generation(1, 11, true, REQUIRED, 0x500, 0x800, 0x2000);
+	generation(2, 20, true, OPEN, 0x100, 0x300, 0x400);
+	UT_ASSERT_EQ(census(out, MAX_SCOPE, &count, &bad), CLUSTER_COLD_CENSUS_LIVE_WRITER);
+	UT_ASSERT_EQ(bad, 1);
+	UT_ASSERT_EQ(count, 0);
+
+	/* a lifecycle the census does not know (retired) */
+	scope_reset();
+	generation(2, 20, true, CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED, 0x100, 0x300, 0x400);
+	UT_ASSERT_EQ(census(out, MAX_SCOPE, &count, &bad), CLUSTER_COLD_CENSUS_LIFECYCLE);
+	UT_ASSERT_EQ(bad, 0);
+
+	/* an initializer terminal with records has no cold owner */
+	scope_reset();
+	terminal(5, 3);
+	UT_ASSERT_EQ(census(out, MAX_SCOPE, &count, &bad), CLUSTER_COLD_CENSUS_TERMINAL);
+
+	/* bounds out of order, or a tail nobody validated */
+	scope_reset();
+	generation(1, 11, true, REQUIRED, 0x900, 0x800, 0x2000);
+	UT_ASSERT_EQ(census(out, MAX_SCOPE, &count, &bad), CLUSTER_COLD_CENSUS_RANGE);
+	scope_reset();
+	generation(1, 11, true, REQUIRED, 0x500, 0x2100, 0x2000);
+	UT_ASSERT_EQ(census(out, MAX_SCOPE, &count, &bad), CLUSTER_COLD_CENSUS_RANGE);
+	scope_reset();
+	g = generation(2, 20, false, CLOSED, 0x100, 0x300, 0x400);
+	g->checkpoint.root_flags &= ~CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID;
+	UT_ASSERT_EQ(census(out, MAX_SCOPE, &count, &bad), CLUSTER_COLD_CENSUS_RANGE);
+
+	/* more generations than room */
+	scope_reset();
+	generation(1, 10, false, CLOSED, 0x100, 0x300, 0x400);
+	generation(1, 11, true, REQUIRED, 0x500, 0x800, 0x2000);
+	UT_ASSERT_EQ(census(out, 1, &count, &bad), CLUSTER_COLD_CENSUS_CAPACITY);
+	UT_ASSERT_EQ(cluster_cold_census_select_v1(NULL, 1, out, 1, &count, &bad),
+				 CLUSTER_COLD_CENSUS_INVALID_ARGUMENT);
+}
+
+/*
+ * Every crashed generation is the founder's or a fence origin, and every
+ * fence origin is a crashed generation of the same identity.
+ */
+UT_TEST(test_census_covers_exactly_the_crashed_generations)
+{
+	ClusterColdCensusEntryV1 out[MAX_SCOPE];
+	ClusterControlRootSnapshot crashed[3];
+	uint32 count = 0;
+	uint32 bad = 0;
+	uint16 thread = 0;
+
+	scope_reset();
+	generation(1, 11, true, REQUIRED, 0x500, 0x800, 0x2000);
+	generation(2, 19, false, CLOSED, 0x100, 0x300, 0x400);
+	generation(2, 20, true, REQUIRED, 0x500, 0x800, 0x2000);
+	generation(3, 30, true, REQUIRED, 0x500, 0x800, 0x2000);
+	UT_ASSERT_EQ(census(out, MAX_SCOPE, &count, &bad), CLUSTER_COLD_CENSUS_OK);
+	crashed[0] = scope_inputs[0].checkpoint;
+	crashed[1] = scope_inputs[2].checkpoint;
+	crashed[2] = scope_inputs[3].checkpoint;
+	UT_ASSERT_EQ(cluster_cold_census_cover_v1(out, count, crashed, 3, &thread),
+				 CLUSTER_COLD_CENSUS_OK);
+
+	/* thread 3 crashed but the plan does not name it: it would be skipped */
+	UT_ASSERT_EQ(cluster_cold_census_cover_v1(out, count, crashed, 2, &thread),
+				 CLUSTER_COLD_CENSUS_UNCOVERED);
+	UT_ASSERT_EQ(thread, 3);
+
+	/* the plan names another generation of thread 2 than the crashed one */
+	crashed[1].identity.origin_owner_incarnation = 19;
+	UT_ASSERT_EQ(cluster_cold_census_cover_v1(out, count, crashed, 3, &thread),
+				 CLUSTER_COLD_CENSUS_ORIGIN_MISSING);
+	UT_ASSERT_EQ(thread, 2);
+
+	/* or a thread with no crashed generation at all */
+	crashed[1] = scope_inputs[2].checkpoint;
+	crashed[2].identity.origin_thread_id = 4;
+	UT_ASSERT_EQ(cluster_cold_census_cover_v1(out, count, crashed, 3, &thread),
+				 CLUSTER_COLD_CENSUS_ORIGIN_MISSING);
+	UT_ASSERT_EQ(thread, 4);
+}
+
+/* A history-only generation is scanned under the read scope, in its own
+ * namespace, and accepted only when the observed cut matches its record. */
+UT_TEST(test_scan_input_proves_the_cut)
+{
+	ClusterColdScanResultV1 result;
+	ClusterColdPlanV1 *plan;
+
+	scope_reset();
+	generation(1, 11, true, REQUIRED, 0x500, 0x800, 0x2000);
+	generation(2, 12, false, CLOSED, 0x1000, 0x1300, 0x1300);
+	scan_reset();
+	plan = scan_plan();
+	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 1, false, true, &result),
+				 CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(retained_index_seen, 1);
+	UT_ASSERT_EQ(result.records, 2);
+	UT_ASSERT_EQ(decode_saw_system, 77);
+	UT_ASSERT_EQ(decode_saw_uuid0, 5);
+	UT_ASSERT(decode_saw_foreign && !decode_saw_space_active);
+	UT_ASSERT_EQ(decode_releases, 1);
+	cluster_cold_plan_destroy_v1(&plan);
+
+	scan_reset();
+	plan = scan_plan();
+	retained_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 1, false, true, &result),
+				 CLUSTER_COLD_SOURCE_GAP);
+	cluster_cold_plan_destroy_v1(&plan);
+	retained_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+
+	scan_reset();
+	plan = scan_plan();
+	observed_end = 0x1200;
+	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 1, false, true, &result),
+				 CLUSTER_COLD_SOURCE_GAP);
+	cluster_cold_plan_destroy_v1(&plan);
+
+	/* no such input, a terminal, or no scope */
+	scan_reset();
+	plan = scan_plan();
+	terminal(3, 0);
+	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 7, false, true, &result),
+				 CLUSTER_COLD_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, SCOPE, 2, false, true, &result),
+				 CLUSTER_COLD_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_cold_scan_input_v1(plan, 0, NULL, 1, false, true, &result),
+				 CLUSTER_COLD_INVALID_ARGUMENT);
+	cluster_cold_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
@@ -456,6 +721,11 @@ main(void)
 	UT_RUN(test_space_check_adapter);
 	UT_RUN(test_scan_root_proves_the_cut);
 	UT_RUN(test_reader_open_read_close);
+	UT_RUN(test_census_two_generations_of_one_thread);
+	UT_RUN(test_census_history_and_empty_generations);
+	UT_RUN(test_census_refusals);
+	UT_RUN(test_census_covers_exactly_the_crashed_generations);
+	UT_RUN(test_scan_input_proves_the_cut);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

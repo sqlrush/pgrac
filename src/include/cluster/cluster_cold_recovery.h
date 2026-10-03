@@ -573,9 +573,14 @@ extern ClusterColdDetailV1 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, ui
  * Typed cold replay driver state (startup process).  prepare() runs pass 1
  * with external admissions held and before the serial set is taken; refusal
  * is returned in `refusal`/`refusal_detail` so the caller can release what
- * it holds before failing startup.
+ * it holds before failing startup.  Participants are the founder's crashed
+ * generation, the fence plan's origins, then every history-only generation
+ * of the participant census (cluster_cold_recovery_census.h); the census
+ * read scope is released before prepare() returns.
  */
 struct ClusterRecoveryFencePlan;
+
+struct ClusterWalInputsV1;
 
 typedef struct ClusterColdTypedV1 {
 	MemoryContext context;
@@ -583,7 +588,10 @@ typedef struct ClusterColdTypedV1 {
 	ClusterColdDetailV1 refusal; /* CLUSTER_COLD_OK when sealed */
 	char refusal_detail[512];
 	uint32 participant_count;
+	uint32 replay_count; /* [0, replay_count): crashed; the rest history only */
 	uint32 own_participant;
+	struct ClusterWalInputsV1 *inputs;				   /* census read scope, released by pass 1 */
+	uint32 input_index[CLUSTER_COLD_MAX_PARTICIPANTS]; /* history: index in that scope */
 	uint64 system_identifier;
 	uint64 scanned_records;
 	ClusterColdObserverV1 observer;

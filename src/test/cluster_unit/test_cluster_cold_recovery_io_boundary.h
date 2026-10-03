@@ -343,6 +343,43 @@ cluster_cold_decoded_release_v1(ClusterColdDecodedV1 *decoded)
 	decode_releases++;
 }
 
+/* ---- the cold read scope over every ROOT slot ---- */
+#define MAX_SCOPE 8
+static ClusterWalInputV1 scope_inputs[MAX_SCOPE];
+static uint32 scope_count;
+static ClusterControlRootResult retained_result;
+static uint32 retained_index_seen;
+static int scope_token;
+#define SCOPE ((ClusterWalInputsV1 *)&scope_token)
+
+const ClusterWalInputV1 *
+cluster_wal_inputs_at_v1(ClusterWalInputsV1 *inputs, uint32 index)
+{
+	return inputs == SCOPE && index < scope_count ? &scope_inputs[index] : NULL;
+}
+
+/* The same table-driven records as the root visitor, under the scope. */
+ClusterControlRootResult
+cluster_wal_inputs_visit_retained_v1(ClusterWalInputsV1 *inputs, uint32 index,
+									 ClusterWalRecordVisitor visitor, void *arg,
+									 ClusterWalTailObservation *out)
+{
+	ClusterControlRootResult result;
+
+	UT_ASSERT(inputs == SCOPE);
+	retained_index_seen = index;
+	result = cluster_control_root_recovery_visit(NULL, NULL, visitor, arg, out);
+	return retained_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY ? retained_result : result;
+}
+
+/* The ROOT module's identity equality, field by field. */
+bool
+cluster_control_root_identity_equal(const ClusterControlRootIdentity *left,
+									const ClusterControlRootIdentity *right)
+{
+	return left != NULL && right != NULL && memcmp(left, right, sizeof(*left)) == 0;
+}
+
 /* ---- the pass-2 WAL reader ---- */
 static XLogRecPtr begin_read_at;
 static bool read_record_answer;

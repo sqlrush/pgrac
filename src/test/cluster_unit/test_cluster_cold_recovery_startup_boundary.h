@@ -3,8 +3,8 @@
  * test_cluster_cold_recovery_startup_boundary.h
  *	  Fixtures for test_cluster_cold_recovery_startup.c: memory contexts,
  *	  ROOT lookup and source selection, fence-plan origins, the pass-1
- *	  visitor scan, A's page consumer bracket, DATA observation and the
- *	  SPACE owner's pass-1 check.
+ *	  visitor scan, the participant census and its cold read scope, A's page
+ *	  consumer bracket, DATA observation and the SPACE owner's pass-1 check.
  *
  *	  Included once by test_cluster_cold_recovery_startup.c; defines the
  *	  external symbols cluster_cold_recovery_startup.c links against.
@@ -88,6 +88,14 @@ static ClusterColdDetailV1 scan_result[NROOTS + 1];
 static uint64 data_token;
 static uint64 database_incarnation[NROOTS + 1];
 static bool scan_space; /* thread 2 extends relation 300 before its page record */
+
+/* The ROOT module's identity equality, field by field. */
+bool
+cluster_control_root_identity_equal(const ClusterControlRootIdentity *left,
+									const ClusterControlRootIdentity *right)
+{
+	return left != NULL && right != NULL && memcmp(left, right, sizeof(*left)) == 0;
+}
 
 ClusterRecoveryDutyCompare
 cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *a, const ClusterRecoveryDutyKey *b)
@@ -295,6 +303,167 @@ cluster_cold_space_check_v1(void *arg, const RelFileLocator *locator,
 	return true;
 }
 
+/*
+ * The participant census and its cold read scope.  By default the census
+ * finds exactly the crashed roots the fence plan names, with their cuts;
+ * census_history adds history-only generations.  The census selection
+ * itself is tested with the I/O module.
+ */
+#define MAX_HISTORY 2
+static int census_scope;
+static ClusterControlRootResult census_begin_result;
+static ClusterControlRootResult census_revalidate_result;
+static ClusterColdCensusDetailV1 census_select_result;
+static ClusterColdCensusDetailV1 census_cover_result;
+static uint16 census_bad_thread;
+static XLogRecPtr census_redo_skew; /* added to thread 2's census native redo */
+static ClusterColdCensusEntryV1 census_history[MAX_HISTORY];
+static uint32 census_history_count;
+static int census_begins;
+static int census_releases;
+static int history_scans;
+static uint32 history_scan_index;
+
+ClusterControlRootResult
+cluster_wal_inputs_cold_begin_v1(const uint8 storage_uuid[16], uint64 system_identifier,
+								 ClusterWalInputsV1 **out)
+{
+	census_begins++;
+	UT_ASSERT_EQ(system_identifier, 9);
+	UT_ASSERT_EQ(storage_uuid[0], 1);
+	*out = census_begin_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			   ? (ClusterWalInputsV1 *)&census_scope
+			   : NULL;
+	return census_begin_result;
+}
+
+uint32
+cluster_wal_inputs_count_v1(ClusterWalInputsV1 *inputs)
+{
+	UT_ASSERT(inputs == (ClusterWalInputsV1 *)&census_scope);
+	return 0;
+}
+
+const ClusterWalInputV1 *
+cluster_wal_inputs_at_v1(ClusterWalInputsV1 *inputs, uint32 index)
+{
+	(void)inputs;
+	(void)index;
+	return NULL;
+}
+
+ClusterControlRootResult
+cluster_wal_inputs_revalidate_v1(ClusterWalInputsV1 *inputs)
+{
+	UT_ASSERT(inputs == (ClusterWalInputsV1 *)&census_scope);
+	return census_revalidate_result;
+}
+
+void
+cluster_wal_inputs_release_v1(ClusterWalInputsV1 **inputs)
+{
+	UT_ASSERT(*inputs == (ClusterWalInputsV1 *)&census_scope);
+	census_releases++;
+	*inputs = NULL;
+}
+
+ClusterColdCensusDetailV1
+cluster_cold_census_select_v1(const ClusterWalInputV1 *const *inputs, uint32 count,
+							  ClusterColdCensusEntryV1 *entries, uint32 capacity, uint32 *out_count,
+							  uint32 *bad_index)
+{
+	uint32 n = 0;
+	uint16 thread;
+	uint32 i;
+
+	(void)inputs;
+	(void)count;
+	*out_count = 0;
+	*bad_index = 3;
+	if (census_select_result != CLUSTER_COLD_CENSUS_OK)
+		return census_select_result;
+	for (thread = 1; thread <= 1 + fence_count && thread <= NROOTS && n < capacity; thread++) {
+		ClusterColdCensusEntryV1 *e = &entries[n++];
+
+		memset(e, 0, sizeof(*e));
+		e->input_index = thread;
+		e->role = CLUSTER_COLD_CENSUS_REPLAY;
+		e->identity = roots[thread].identity;
+		e->source.claim.identity = roots[thread].identity;
+		e->cut.thread_id = thread;
+		e->cut.timeline = roots[thread].checkpoint_tli;
+		e->cut.owner_incarnation = roots[thread].identity.origin_owner_incarnation;
+		e->cut.physical_lower = roots[thread].checkpoint_lower_lsn;
+		e->cut.native_redo = native_redo[thread] + (thread == 2 ? census_redo_skew : 0);
+		e->cut.tail_end = roots[thread].validated_tail_lsn_exclusive;
+	}
+	for (i = 0; i < census_history_count && n < capacity; i++)
+		entries[n++] = census_history[i];
+	*out_count = n;
+	*bad_index = 0;
+	return CLUSTER_COLD_CENSUS_OK;
+}
+
+ClusterColdCensusDetailV1
+cluster_cold_census_cover_v1(const ClusterColdCensusEntryV1 *entries, uint32 count,
+							 const ClusterControlRootSnapshot *crashed, uint32 crashed_count,
+							 uint16 *bad_thread)
+{
+	(void)entries;
+	(void)count;
+	UT_ASSERT_EQ(crashed_count, (uint32)fence_count + 1);
+	UT_ASSERT_EQ(crashed[0].identity.origin_thread_id, 1);
+	*bad_thread = census_bad_thread;
+	return census_cover_result;
+}
+
+/* A history-only generation: one retained record covering its range. */
+ClusterColdDetailV1
+cluster_cold_scan_input_v1(ClusterColdPlanV1 *plan, uint32 participant, ClusterWalInputsV1 *inputs,
+						   uint32 index, bool space_active, bool foreign,
+						   ClusterColdScanResultV1 *result)
+{
+	const ClusterColdCensusEntryV1 *entry = NULL;
+	ClusterColdRecordV1 record;
+	uint32 i;
+
+	UT_ASSERT(inputs == (ClusterWalInputsV1 *)&census_scope);
+	UT_ASSERT(!space_active && foreign);
+	history_scans++;
+	history_scan_index = index;
+	memset(result, 0, sizeof(*result));
+	for (i = 0; i < census_history_count; i++)
+		if (census_history[i].input_index == index)
+			entry = &census_history[i];
+	UT_ASSERT(entry != NULL);
+	memset(&record, 0, sizeof(record));
+	record.read_rec_ptr = entry->cut.physical_lower;
+	record.end_rec_ptr = entry->cut.tail_end;
+	record.prev_rec_ptr = 0x10;
+	result->records = 1;
+	return cluster_cold_plan_feed_v1(plan, participant, &record);
+}
+
+static void
+history_generation(uint16 thread, uint64 incarnation, XLogRecPtr lower, XLogRecPtr tail)
+{
+	ClusterColdCensusEntryV1 *e = &census_history[census_history_count++];
+
+	memset(e, 0, sizeof(*e));
+	e->input_index = 10 + census_history_count;
+	e->role = CLUSTER_COLD_CENSUS_HISTORY;
+	e->identity = roots[thread].identity;
+	e->identity.origin_owner_incarnation = incarnation;
+	e->source.claim.identity = e->identity;
+	e->source.claim.database_incarnation = 5;
+	e->cut.thread_id = thread;
+	e->cut.timeline = 1;
+	e->cut.owner_incarnation = incarnation;
+	e->cut.physical_lower = lower;
+	e->cut.native_redo = tail;
+	e->cut.tail_end = tail;
+}
+
 static void
 fixture(void)
 {
@@ -334,6 +503,15 @@ fixture(void)
 	fence_count = 2;
 	data_token = 5;
 	contexts_alive = 0;
+	census_begin_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	census_revalidate_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	census_select_result = CLUSTER_COLD_CENSUS_OK;
+	census_cover_result = CLUSTER_COLD_CENSUS_OK;
+	census_bad_thread = 0;
+	census_redo_skew = 0;
+	census_history_count = 0;
+	census_begins = census_releases = history_scans = 0;
+	history_scan_index = 0;
 }
 
 static ClusterColdTypedV1 *

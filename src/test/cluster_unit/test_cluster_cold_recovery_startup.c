@@ -29,6 +29,7 @@
 
 #include "access/xlogreader.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_page_cold_redo.h"
 #include "storage/checksum.h"
 #include "storage/checksum_impl.h"
@@ -74,6 +75,99 @@ UT_TEST(test_prepare_seals_own_and_fenced_generations)
 	cluster_cold_typed_destroy_v1(&typed);
 	UT_ASSERT_NULL(typed);
 	UT_ASSERT_EQ(contexts_alive, 0);
+}
+
+/*
+ * The census's history-only generations follow the crashed ones as
+ * participants with nothing to replay; they are scanned under the census
+ * scope, which pass 1 releases before it returns.
+ */
+UT_TEST(test_prepare_takes_history_generations_from_the_census)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	history_generation(2, 9, 0x40, 0x80);
+	typed = prepare(0x800);
+	if (typed->refusal != CLUSTER_COLD_OK)
+		printf("# refusal: %s\n", typed->refusal_detail);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_OK);
+	UT_ASSERT_EQ(typed->replay_count, 3);
+	UT_ASSERT_EQ(typed->participant_count, 4);
+	UT_ASSERT_EQ(typed->participants[3].thread_id, 2);
+	UT_ASSERT_EQ(typed->participants[3].owner_incarnation, 9);
+	UT_ASSERT_EQ(typed->participants[3].native_redo, 0x80);
+	UT_ASSERT_EQ(typed->input_index[3], 11);
+	UT_ASSERT_EQ(history_scans, 1);
+	UT_ASSERT_EQ(history_scan_index, 11);
+	UT_ASSERT_EQ(typed->scanned_records, 7);
+	UT_ASSERT_EQ(census_begins, 1);
+	UT_ASSERT_EQ(census_releases, 1);
+	UT_ASSERT_NULL(typed->inputs);
+	/* history only: still the three crashed generations' steps */
+	UT_ASSERT_EQ(cluster_cold_plan_step_count_v1(typed->plan), 3);
+	UT_ASSERT_EQ(cluster_cold_plan_replay_record_count_v1(typed->plan, 3), 0);
+	cluster_cold_typed_destroy_v1(&typed);
+	UT_ASSERT_EQ(census_releases, 1);
+}
+
+/* Every census refusal stops pass 1 before the plan is built or scanned,
+ * and the census scope is released. */
+UT_TEST(test_prepare_refuses_what_the_census_refuses)
+{
+	ClusterColdTypedV1 *typed;
+
+	fixture();
+	census_begin_result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
+	UT_ASSERT(strstr(typed->refusal_detail, "participant census unavailable") != NULL);
+	UT_ASSERT_NULL(typed->plan);
+	cluster_cold_typed_destroy_v1(&typed);
+	UT_ASSERT_EQ(census_releases, 0);
+
+	fixture();
+	census_select_result = CLUSTER_COLD_CENSUS_LIVE_WRITER;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
+	UT_ASSERT(strstr(typed->refusal_detail, "still OPEN (input 3") != NULL);
+	UT_ASSERT_NULL(typed->plan);
+	cluster_cold_typed_destroy_v1(&typed);
+	UT_ASSERT_EQ(census_releases, 1);
+
+	/* a crashed thread the fence plan leaves out would be skipped */
+	fixture();
+	census_cover_result = CLUSTER_COLD_CENSUS_UNCOVERED;
+	census_bad_thread = 4;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
+	UT_ASSERT(strstr(typed->refusal_detail, "missing from the fence plan") != NULL);
+	UT_ASSERT(strstr(typed->refusal_detail, "thread 4") != NULL);
+	UT_ASSERT_NULL(typed->plan);
+	cluster_cold_typed_destroy_v1(&typed);
+	UT_ASSERT_EQ(census_releases, 1);
+
+	/* the census and the ROOT source disagree on a crashed cut */
+	fixture();
+	census_redo_skew = 0x10;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
+	UT_ASSERT(strstr(typed->refusal_detail, "thread 2 census cut differs") != NULL);
+	UT_ASSERT_NULL(typed->plan);
+	cluster_cold_typed_destroy_v1(&typed);
+	UT_ASSERT_EQ(census_releases, 1);
+
+	/* the scope changed while the history was read */
+	fixture();
+	history_generation(3, 7, 0x40, 0x80);
+	census_revalidate_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_SOURCE_GAP);
+	UT_ASSERT(strstr(typed->refusal_detail, "census changed") != NULL);
+	UT_ASSERT_NULL(typed->inputs);
+	UT_ASSERT_EQ(census_releases, 1);
+	cluster_cold_typed_destroy_v1(&typed);
+	UT_ASSERT_EQ(census_releases, 1);
 }
 
 UT_TEST(test_prepare_refuses_unsealed_own_generation)
@@ -550,8 +644,10 @@ UT_TEST(test_refusal_hints)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(18);
 	UT_RUN(test_prepare_seals_own_and_fenced_generations);
+	UT_RUN(test_prepare_takes_history_generations_from_the_census);
+	UT_RUN(test_prepare_refuses_what_the_census_refuses);
 	UT_RUN(test_prepare_refuses_unsealed_own_generation);
 	UT_RUN(test_prepare_refuses_restart_redo_mismatch);
 	UT_RUN(test_prepare_refuses_unproven_origin_source);

@@ -39,6 +39,7 @@
 
 #include "access/xlogreader.h"
 #include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_recovery_census.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_recovery_duty.h"
@@ -264,6 +265,156 @@ cold_space_namespace(ClusterColdTypedV1 *typed)
 	return true;
 }
 
+static const char *
+cold_census_name(ClusterColdCensusDetailV1 detail)
+{
+	switch (detail) {
+	case CLUSTER_COLD_CENSUS_LIVE_WRITER:
+		return "a current generation is still OPEN";
+	case CLUSTER_COLD_CENSUS_LIFECYCLE:
+		return "unknown generation lifecycle";
+	case CLUSTER_COLD_CENSUS_TERMINAL:
+		return "initializer terminal with records";
+	case CLUSTER_COLD_CENSUS_RANGE:
+		return "retained range invalid";
+	case CLUSTER_COLD_CENSUS_UNCOVERED:
+		return "crashed generation missing from the fence plan";
+	case CLUSTER_COLD_CENSUS_ORIGIN_MISSING:
+		return "fence origin is not a crashed generation";
+	case CLUSTER_COLD_CENSUS_CAPACITY:
+		return "more generations than participants";
+	default:
+		return "invalid census input";
+	}
+}
+
+/*
+ * The census's crashed generations are exactly the roots already taken, with
+ * the same cut; append its history-only generations as participants.
+ */
+static bool
+cold_census_take(ClusterColdTypedV1 *typed, const ColdRoot *roots,
+				 const ClusterColdCensusEntryV1 *entries, uint32 count)
+{
+	uint32 crashed = typed->participant_count;
+	uint32 i;
+	uint32 k;
+
+	for (i = 0; i < count; i++) {
+		const ClusterColdCensusEntryV1 *entry = &entries[i];
+
+		if (entry->role == CLUSTER_COLD_CENSUS_REPLAY) {
+			for (k = 0; k < crashed; k++)
+				if (cluster_control_root_identity_equal(&roots[k].root.identity, &entry->identity))
+					break;
+			if (k == crashed
+				|| memcmp(&typed->participants[k], &entry->cut, sizeof(entry->cut)) != 0) {
+				cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+							"thread %u census cut differs from its ROOT source (native redo %X/%X)",
+							(unsigned)entry->cut.thread_id,
+							LSN_FORMAT_ARGS(entry->cut.native_redo));
+				return false;
+			}
+			continue;
+		}
+		if (typed->participant_count >= CLUSTER_COLD_MAX_PARTICIPANTS) {
+			cold_refuse(typed, CLUSTER_COLD_CAPACITY, "more than %d retained generations",
+						CLUSTER_COLD_MAX_PARTICIPANTS);
+			return false;
+		}
+		typed->participants[typed->participant_count] = entry->cut;
+		typed->sources[typed->participant_count] = entry->source;
+		typed->input_index[typed->participant_count] = entry->input_index;
+		typed->participant_count++;
+	}
+	return true;
+}
+
+/*
+ * Complete participant census: every generation with retained WAL under one
+ * cold read scope, held until pass 1 has scanned the history-only ones.
+ */
+static bool
+cold_census(ClusterColdTypedV1 *typed, const ColdRoot *roots)
+{
+	const ClusterControlRootIdentity *own = &roots[0].root.identity;
+	const ClusterWalInputV1 **inputs;
+	ClusterColdCensusEntryV1 *entries;
+	ClusterControlRootSnapshot *crashed;
+	ClusterControlRootResult result;
+	ClusterColdCensusDetailV1 detail;
+	uint32 count;
+	uint32 kept = 0;
+	uint32 bad = 0;
+	uint16 thread = 0;
+	uint32 i;
+	bool taken = false;
+
+	typed->replay_count = typed->participant_count;
+	result = cluster_wal_inputs_cold_begin_v1(own->storage_uuid, own->system_identifier,
+											  &typed->inputs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+					"participant census unavailable (root result %d)", (int)result);
+		return false;
+	}
+	count = cluster_wal_inputs_count_v1(typed->inputs);
+	inputs = (const ClusterWalInputV1 **)palloc0(sizeof(*inputs) * Max(count, 1));
+	entries = (ClusterColdCensusEntryV1 *)palloc0(sizeof(*entries) * CLUSTER_COLD_MAX_PARTICIPANTS);
+	crashed = (ClusterControlRootSnapshot *)palloc0(sizeof(*crashed) * typed->participant_count);
+	for (i = 0; i < count; i++)
+		inputs[i] = cluster_wal_inputs_at_v1(typed->inputs, i);
+	for (i = 0; i < typed->participant_count; i++)
+		crashed[i] = roots[i].root;
+	detail = cluster_cold_census_select_v1(inputs, count, entries, CLUSTER_COLD_MAX_PARTICIPANTS,
+										   &kept, &bad);
+	if (detail == CLUSTER_COLD_CENSUS_OK)
+		detail = cluster_cold_census_cover_v1(entries, kept, crashed, typed->participant_count,
+											  &thread);
+	if (detail != CLUSTER_COLD_CENSUS_OK)
+		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+					"participant census refused: %s (input %u, thread %u)",
+					cold_census_name(detail), bad, (unsigned)thread);
+	else
+		taken = cold_census_take(typed, roots, entries, kept);
+	pfree(crashed);
+	pfree(entries);
+	pfree(inputs);
+	return taken;
+}
+
+/* The history-only generations, under the census scope; then release it. */
+static bool
+cold_scan_history(ClusterColdTypedV1 *typed)
+{
+	ClusterControlRootResult result;
+	uint32 i;
+
+	for (i = typed->replay_count; i < typed->participant_count; i++) {
+		ClusterColdScanResultV1 scan;
+		ClusterColdDetailV1 detail = cluster_cold_scan_input_v1(
+			typed->plan, i, typed->inputs, typed->input_index[i], false, true, &scan);
+
+		typed->scanned_records += scan.records;
+		if (detail != CLUSTER_COLD_OK) {
+			cold_refuse(typed, detail,
+						"pass-1 scan refused: %s; history thread %u record %X/%X (root result %d)",
+						cold_detail_name(detail), (unsigned)typed->participants[i].thread_id,
+						LSN_FORMAT_ARGS(scan.failed_read_rec_ptr), scan.root_result);
+			return false;
+		}
+	}
+	result = cluster_wal_inputs_revalidate_v1(typed->inputs);
+	cluster_wal_inputs_release_v1(&typed->inputs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+					"participant census changed while it was scanned (root result %d)",
+					(int)result);
+		return false;
+	}
+	return true;
+}
+
 static bool
 cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots)
 {
@@ -280,7 +431,7 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots)
 		return false;
 	}
 
-	for (i = 0; i < typed->participant_count; i++) {
+	for (i = 0; i < typed->replay_count; i++) {
 		ClusterColdScanResultV1 scan;
 
 		detail = cluster_cold_scan_root_v1(typed->plan, i, &roots[i].root, &roots[i].token, false,
@@ -296,6 +447,8 @@ cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots)
 			return false;
 		}
 	}
+	if (!cold_scan_history(typed))
+		return false;
 	detail = cluster_cold_plan_seal_v1(typed->plan, cluster_cold_observe_data_v1, &typed->observer,
 									   &diag);
 	if (detail != CLUSTER_COLD_OK) {
@@ -334,6 +487,8 @@ cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread
 					LSN_FORMAT_ARGS(own_redo));
 		goto done;
 	}
+	if (!cold_census(typed, roots))
+		goto done;
 	typed->system_identifier = roots[0].root.identity.system_identifier;
 	detail
 		= cluster_cold_plan_create_v1(typed->participants, typed->participant_count,
@@ -360,6 +515,8 @@ cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
 		return;
 	typed = *typed_address;
 	*typed_address = NULL;
+	if (typed->inputs != NULL)
+		cluster_wal_inputs_release_v1(&typed->inputs);
 	if (typed->plan != NULL)
 		cluster_cold_plan_destroy_v1(&typed->plan);
 	MemoryContextDelete(typed->context);

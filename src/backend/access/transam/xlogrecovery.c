@@ -138,8 +138,9 @@
  *	Spec: spec-s9p2-05-instance-and-cluster-recovery.md
  *	What changed: With cluster.shared_config, an engaged cold merge runs the
  *	              typed cold plan: pass 1 (cluster_recovery_typed_begin)
- *	              scans every retained writer generation before the serial
- *	              set is taken; pass 2
+ *	              scans every retained writer generation of the participant
+ *	              census (crashed ones replayed, older or closed ones as
+ *	              history only) before the serial set is taken; pass 2
  *	              (cluster_recovery_typed_replay) replays the sealed
  *	              schedule, matching every page record to its pass-1
  *	              identity; SPACE changes are installed by the SPACE owner
@@ -3058,10 +3059,10 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 /*
  * Consumers this cold driver calls (cluster_cold_typed_ready_v1).  The
  * per-block redo consultation and the restartpoint hold exist once their
- * owners publish the handshake macros; the participant census, other
- * generations' typed side owners with the XID/OID/MX/SCN bound merge, and
- * completion publication are not wired yet, so every typed plan currently
- * refuses before IR.
+ * owners publish the handshake macros; pass 1 takes every generation with
+ * retained WAL from the participant census.  Other generations' typed side
+ * owners with the XID/OID/MX/SCN bound merge, and completion publication,
+ * are not wired yet, so every typed plan currently refuses before IR.
  */
 static const ClusterColdHandshakeV1 cluster_cold_handshake = {
 #ifdef CLUSTER_COLD_REDO_HOOK_CONSUMER_V1
@@ -3069,7 +3070,7 @@ static const ClusterColdHandshakeV1 cluster_cold_handshake = {
 #else
 	.redo_block_hook = false,
 #endif
-	.participant_census = false,
+	.participant_census = true,
 	.side_owners = false,
 	.completion_publish = false,
 #ifdef CLUSTER_COLD_RESTARTPOINT_HOLD_CONSUMER_V1
