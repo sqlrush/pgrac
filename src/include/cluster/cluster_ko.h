@@ -202,6 +202,25 @@ StaticAssertDecl(sizeof(KoFlushAckHeader) == 24, "spec-5.7 D6 KoFlushAckHeader w
  */
 extern void cluster_ko_flush_and_wait_ack(RelFileLocator rlocator, char relpersistence);
 
+#ifdef USE_PGRAC_CLUSTER
+/* Original barrier's process/ResourceOwner-local completion. The caller still
+ * holds exclusive relation lifecycle authority. Only a successful original
+ * barrier can construct this handle; raw ACK bytes cannot. Release before its
+ * owner ends, on every exit. These APIs certify only the KO scope, never a
+ * commit, a durable structural effect, an ancestor chain or PI retirement.
+ * The legacy wrapper above discards its completion as before. */
+typedef struct ClusterKoCompletionV2 ClusterKoCompletionV2;
+extern bool cluster_ko_shared_begin_v2(RelFileLocator rlocator, char relpersistence,
+	ClusterKoCompletionV2 **out);
+extern bool cluster_ko_shared_covers_v2(const ClusterKoCompletionV2 *completion,
+	const ClusterSpaceIdentityKey *key, const uint8 incarnation[16]);
+/* Only actual remote members have a wire projection; a one-member barrier
+ * has a local completion but cannot fabricate a peer request or ACK. */
+extern bool cluster_ko_shared_read_v2(const ClusterKoCompletionV2 *completion,
+	int32 peer, ClusterKoSharedMessageV2 *out);
+extern void cluster_ko_shared_release_v2(ClusterKoCompletionV2 **completion);
+#endif
+
 /* ---- shmem region (counters + the SPSC peer inbound ring) ---------- */
 extern Size cluster_ko_shmem_size(void);
 extern void cluster_ko_shmem_init(void);

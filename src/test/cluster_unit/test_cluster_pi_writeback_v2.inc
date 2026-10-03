@@ -1,5 +1,23 @@
-/* Canonical transport values, not a structural completion certificate.
- * Author: SqlRush <sqlrush@gmail.com> */
+/*-------------------------------------------------------------------------
+ *
+ * test_cluster_pi_writeback_v2.inc
+ *	  Canonical structural transport values and refusal boundaries.
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/test/cluster_unit/test_cluster_pi_writeback_v2.inc
+ *
+ * NOTES
+ *	  PGRAC-original tests included by the writeback unit. Canonical wire
+ *	  values alone never constitute a structural completion certificate.
+ *
+ *-------------------------------------------------------------------------
+ */
 #include "catalog/storage_xlog.h"
 #include "catalog/pg_tablespace_d.h"
 

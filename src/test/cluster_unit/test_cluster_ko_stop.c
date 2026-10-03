@@ -4,6 +4,8 @@
 #include "postgres.h"
 #include "cluster/cluster_hw_lease.h"
 #include "cluster/storage/cluster_smgr.h"
+#include "utils/memutils.h"
+#include "utils/resowner.h"
 #include "../../backend/cluster/cluster_ko_lock.c"
 #undef printf
 #include "unit_test.h"
@@ -51,6 +53,10 @@ static bool cancel_wait;
 static bool drive_shared_ack;
 static ClusterKoSharedMessageV2 last_shared_request, last_shared_ack;
 static void (*exit_callback)(int, Datum);
+static ResourceReleaseCallback resource_callback;
+ResourceOwner CurrentResourceOwner = (ResourceOwner)1;
+MemoryContext TopTransactionContext = (MemoryContext)1;
+static int completion_allocations;
 static unsigned gate_calls;
 static unsigned liveness_calls;
 int cluster_ges_request_timeout_ms = 100;
@@ -58,6 +64,21 @@ int cluster_sinval_ack_timeout_ms = 100;
 Latch *MyLatch;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
+
+void *
+MemoryContextAllocZero(MemoryContext context, Size size)
+{
+	Assert(context == TopTransactionContext);
+	completion_allocations++;
+	return calloc(1, size);
+}
+void pfree(void *p) { completion_allocations--; free(p); }
+void
+RegisterResourceReleaseCallback(ResourceReleaseCallback callback, void *arg)
+{
+	Assert(arg == NULL);
+	resource_callback = callback;
+}
 
 
 void ProcessInterrupts(void)
@@ -390,6 +411,9 @@ poll_queue(void)
 static void
 reset_test(void)
 {
+	Assert(completion_allocations == 0);
+	CurrentResourceOwner = (ResourceOwner)1;
+	TopTransactionContext = (MemoryContext)1;
 	memset(&storage, 0, sizeof(storage));
 	IsUnderPostmaster = false;
 	cluster_ko_shmem_init();
@@ -1031,10 +1055,184 @@ UT_TEST(test_shared_capacity_and_backend_exit_preserve_other_owners)
 	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
 }
 
+UT_TEST(test_shared_completion_survives_original_wait_and_checks_scope)
+{
+	ClusterKoCompletionV2 *completion = NULL;
+	ClusterKoSharedMessageV2 projection, unchanged;
+	ClusterSpaceIdentityKey key;
+	uint8 incarnation[16];
+	const char *reason;
+	reset_test();
+	cluster_shared_config = drive_shared_ack = true;
+	UT_ASSERT(cluster_ko_shared_begin_v2(space_identity.key.locator,
+		RELPERSISTENCE_PERMANENT, &completion));
+	UT_ASSERT_NOT_NULL(completion);
+	UT_ASSERT_EQ(barrier_removes, 1);
+	UT_ASSERT(!barrier_active);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(strcmp(reason, "KO_SHARED_COMPLETION_OWNED"), 0);
+	key = space_identity.key;
+	memcpy(incarnation, space_identity.incarnation, 16);
+	UT_ASSERT(cluster_ko_shared_covers_v2(completion, &key, incarnation));
+	UT_ASSERT(cluster_ko_shared_read_v2(completion, 1, &projection));
+	UT_ASSERT_EQ(projection.batch_id, last_shared_request.batch_id);
+	UT_ASSERT_EQ(projection.origin_boot, 11);
+	UT_ASSERT_EQ(projection.peer_boot, 22);
+	UT_ASSERT_EQ(projection.verb, CLUSTER_KO_SHARED_REQUEST);
+	UT_ASSERT_EQ(projection.status, 0);
+	/* A structural owner consumes the old identity after publication; the
+	 * receipt does not mistake a newly published identity for its old scope. */
+	space_identity.incarnation[0]++;
+	UT_ASSERT(cluster_ko_shared_covers_v2(completion, &key, incarnation));
+	UT_ASSERT(!cluster_ko_shared_covers_v2(completion, &key, space_identity.incarnation));
+	key.locator.relNumber++;
+	UT_ASSERT(!cluster_ko_shared_covers_v2(completion, &key, incarnation));
+	memset(&projection, 0x93, sizeof(projection));
+	unchanged = projection;
+	UT_ASSERT(!cluster_ko_shared_read_v2(completion, 0, &projection));
+	UT_ASSERT(!cluster_ko_shared_read_v2(completion, 2, &projection));
+	UT_ASSERT_EQ(memcmp(&projection, &unchanged, sizeof(projection)), 0);
+	cluster_ko_shared_release_v2(&completion);
+	UT_ASSERT(completion == NULL);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(barrier_removes, 1); /* No second removal of the wait entry. */
+}
+
+UT_TEST(test_shared_completion_rejects_other_owner_and_every_changed_cut)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		ClusterKoCompletionV2 *completion = NULL;
+		ClusterKoSharedMessageV2 projection, before;
+		reset_test();
+		cluster_shared_config = drive_shared_ack = true;
+		UT_ASSERT(cluster_ko_shared_begin_v2(space_identity.key.locator,
+			RELPERSISTENCE_PERMANENT, &completion));
+		memset(&projection, 0xa2, sizeof(projection));
+		before = projection;
+		switch (fault) {
+		case 0: CurrentResourceOwner = (ResourceOwner)2; break;
+		case 1: MyProcPid++; break;
+		case 2: current_epoch++; break;
+		case 3: formation.membership.last_admitted_incarnation[1]++; break;
+		case 4: writer.claim.database_incarnation++; break;
+		case 5: generation_race = true; break;
+		case 6: cap_ok = false; break;
+		}
+		UT_ASSERT(!cluster_ko_shared_read_v2(completion, 1, &projection));
+		UT_ASSERT_EQ(memcmp(&projection, &before, sizeof(before)), 0);
+		if (fault < 2) {
+			cluster_ko_shared_release_v2(&completion);
+			UT_ASSERT_NOT_NULL(completion);
+		}
+		CurrentResourceOwner = (ResourceOwner)1;
+		if (fault == 1) MyProcPid--;
+		cluster_ko_shared_release_v2(&completion);
+		UT_ASSERT(completion == NULL);
+	}
+}
+
+UT_TEST(test_shared_completion_cleanup_is_owner_scoped_and_no_peer_is_not_an_ack)
+{
+	ClusterKoCompletionV2 *completion = NULL, *other = NULL;
+	ClusterKoSharedMessageV2 projection;
+	const char *reason;
+	reset_test();
+	cluster_shared_config = true;
+	formation.membership.membership_state[1] = CLUSTER_MEMBER_ABSENT;
+	UT_ASSERT(cluster_ko_shared_begin_v2(space_identity.key.locator,
+		RELPERSISTENCE_PERMANENT, &completion));
+	UT_ASSERT_EQ(barrier_requests, 0);
+	UT_ASSERT_EQ(barrier_removes, 0);
+	UT_ASSERT_EQ(record_count, 0);
+	UT_ASSERT(cluster_ko_shared_covers_v2(completion, &space_identity.key, space_identity.incarnation));
+	UT_ASSERT(!cluster_ko_shared_read_v2(completion, 0, &projection));
+	UT_ASSERT(!cluster_ko_shared_read_v2(completion, 1, &projection));
+	CurrentResourceOwner = (ResourceOwner)2;
+	UT_ASSERT(cluster_ko_shared_begin_v2(space_identity.key.locator,
+		RELPERSISTENCE_PERMANENT, &other));
+	UT_ASSERT(resource_callback != NULL);
+	resource_callback(RESOURCE_RELEASE_AFTER_LOCKS, false, false, NULL);
+	UT_ASSERT(cluster_ko_shared_covers_v2(other, &space_identity.key, space_identity.incarnation));
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false, NULL);
+	UT_ASSERT(!cluster_ko_shared_covers_v2(other, &space_identity.key, space_identity.incarnation));
+	cluster_ko_shared_release_v2(&other);
+	CurrentResourceOwner = (ResourceOwner)1;
+	UT_ASSERT(cluster_ko_shared_covers_v2(completion, &space_identity.key, space_identity.incarnation));
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	exit_callback(0, (Datum)0);
+	UT_ASSERT(!cluster_ko_shared_covers_v2(completion, &space_identity.key, space_identity.incarnation));
+	cluster_ko_shared_release_v2(&completion);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(barrier_removes, 0);
+}
+
+UT_TEST(test_shared_completion_has_no_handle_after_cancel_or_unsupported_scope)
+{
+	ClusterKoCompletionV2 *completion = NULL;
+	volatile bool caught = false;
+	const char *reason;
+	reset_test();
+	UT_ASSERT(!cluster_ko_shared_begin_v2(space_identity.key.locator,
+		RELPERSISTENCE_PERMANENT, &completion));
+	cluster_shared_config = true;
+	UT_ASSERT(!cluster_ko_shared_begin_v2(space_identity.key.locator,
+		RELPERSISTENCE_TEMP, &completion));
+	CurrentResourceOwner = NULL;
+	UT_ASSERT(!cluster_ko_shared_begin_v2(space_identity.key.locator,
+		RELPERSISTENCE_PERMANENT, &completion));
+	CurrentResourceOwner = (ResourceOwner)1;
+	UT_ASSERT_EQ(barrier_requests, 0);
+	barrier_complete = false;
+	cancel_wait = true;
+	PG_TRY();
+	{
+		(void)cluster_ko_shared_begin_v2(space_identity.key.locator,
+			RELPERSISTENCE_PERMANENT, &completion);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT(completion == NULL);
+	UT_ASSERT_EQ(completion_allocations, 0);
+	UT_ASSERT_EQ(barrier_removes, 1);
+	shared_send_tick();
+	UT_ASSERT_EQ(send_calls, 0);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_shared_completion_raw_copy_and_slot_reuse_do_not_convey_ownership)
+{
+	ClusterKoCompletionV2 *completion = NULL;
+	ClusterKoCompletionV2 copy;
+	ClusterKoSharedMessageV2 projection;
+	unsigned slot;
+	reset_test();
+	cluster_shared_config = drive_shared_ack = true;
+	UT_ASSERT(cluster_ko_shared_begin_v2(space_identity.key.locator,
+		RELPERSISTENCE_PERMANENT, &completion));
+	copy = *completion;
+	UT_ASSERT(!cluster_ko_shared_covers_v2(&copy, &space_identity.key, space_identity.incarnation));
+	UT_ASSERT(!cluster_ko_shared_read_v2(&copy, 1, &projection));
+	slot = completion->slot;
+	/* Reusing a bounded slot, even for the same batch/PID, cannot revive or
+	 * release an earlier completion. This models a changed original owner. */
+	storage.contexts[slot].serial++;
+	UT_ASSERT(!cluster_ko_shared_covers_v2(completion, &space_identity.key, space_identity.incarnation));
+	UT_ASSERT(!cluster_ko_shared_read_v2(completion, 1, &projection));
+	cluster_ko_shared_release_v2(&completion);
+	UT_ASSERT(completion == NULL);
+	UT_ASSERT(storage.contexts[slot].used);
+	UT_ASSERT(storage.contexts[slot].complete);
+	memset(&storage.contexts[slot], 0, sizeof(storage.contexts[slot]));
+}
+
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(30);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
@@ -1060,6 +1258,11 @@ main(void)
 	UT_RUN(test_shared_cancel_releases_context_and_suppresses_unsent_request);
 	UT_RUN(test_shared_ack_needs_exact_registered_original_scope);
 	UT_RUN(test_shared_capacity_and_backend_exit_preserve_other_owners);
+	UT_RUN(test_shared_completion_survives_original_wait_and_checks_scope);
+	UT_RUN(test_shared_completion_rejects_other_owner_and_every_changed_cut);
+	UT_RUN(test_shared_completion_cleanup_is_owner_scoped_and_no_peer_is_not_an_ack);
+	UT_RUN(test_shared_completion_has_no_handle_after_cancel_or_unsupported_scope);
+	UT_RUN(test_shared_completion_raw_copy_and_slot_reuse_do_not_convey_ownership);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

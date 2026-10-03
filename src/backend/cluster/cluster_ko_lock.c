@@ -82,6 +82,8 @@
 #include "storage/spin.h"
 #include "datatype/timestamp.h"
 #include "utils/timestamp.h"
+#include "utils/memutils.h"
+#include "utils/resowner.h"
 #include "utils/wait_event.h"
 
 /* PG core doesn't define USECS_PER_MSEC;  define locally (mirror cluster_sinval.c). */
@@ -105,7 +107,9 @@
 
 typedef struct ClusterKoSharedContext {
 	bool used;
+	bool complete;
 	int32 pid;
+	uint64 serial;
 	ClusterKoSharedMessageV2 request;
 	uint64 peer_boots[CLUSTER_KO_SHARED_NODE_LIMIT];
 } ClusterKoSharedContext;
@@ -136,11 +140,23 @@ typedef struct ClusterKoShared {
 	slock_t shared_lock;
 	uint32 send_head, send_count;
 	ClusterKoSharedMessageV2 send[CLUSTER_KO_SHARED_CAPACITY];
+	uint64 context_serial;
 	ClusterKoSharedContext contexts[CLUSTER_KO_SHARED_CAPACITY];
 } ClusterKoShared;
 
 static ClusterKoShared *ko_state = NULL;
 static bool ko_exit_registered;
+
+struct ClusterKoCompletionV2 {
+	ResourceOwner owner;
+	int32 pid;
+	unsigned slot;
+	uint64 serial;
+	struct ClusterKoCompletionV2 *next;
+};
+
+static ClusterKoCompletionV2 *ko_completions;
+static bool ko_resource_registered;
 
 ClusterNormalStopPollResult
 cluster_ko_normal_stop_poll(uint32 *slot_out, const char **reason_out)
@@ -216,6 +232,7 @@ cluster_ko_shmem_init(void)
 		pg_atomic_init_u32(&ko_state->inbound_tail, 0);
 		SpinLockInit(&ko_state->shared_lock);
 		ko_state->send_head = ko_state->send_count = 0;
+		ko_state->context_serial = 0;
 		memset(ko_state->contexts, 0, sizeof(ko_state->contexts));
 	}
 }
@@ -496,6 +513,142 @@ ko_shared_space_current(const ClusterKoSharedMessageV2 *message)
 		&& memcmp(identity.incarnation, message->incarnation, 16) == 0;
 }
 
+/* The origin's local scope also covers a one-member cohort, for which no
+ * remote message can be encoded. A completed barrier remains tied to the old
+ * segment; publishing the structural successor does not rewrite that fact. */
+static bool
+ko_shared_origin_current(const ClusterKoSharedContext *context)
+{
+	const ClusterKoSharedMessageV2 *m = &context->request;
+	ClusterKoSharedMessageV2 current = *m;
+	ClusterWalSourceRef ref;
+	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], generation;
+
+	return cluster_enabled && cluster_shared_config && !RecoveryInProgress()
+		&& cluster_node_id == m->origin_node
+		&& cluster_wal_thread_current_v2_ref(&ref)
+		&& ref.claim.identity.origin_node_id == m->origin_node
+		&& ref.claim.identity.origin_owner_incarnation == m->origin_boot
+		&& ref.claim.identity.system_identifier == m->key.system_identifier
+		&& ref.claim.database_incarnation == m->key.database_incarnation
+		&& memcmp(ref.claim.identity.storage_uuid, m->key.storage_uuid, 16) == 0
+		&& ko_shared_members(&current, boots, &generation)
+		&& boots[cluster_node_id] == m->origin_boot
+		&& current.epoch == m->epoch
+		&& memcmp(current.members, m->members, sizeof(m->members)) == 0
+		&& memcmp(current.member_digest, m->member_digest, sizeof(m->member_digest)) == 0
+		&& memcmp(boots, context->peer_boots, sizeof(boots)) == 0
+		&& cluster_membership_cut_generation_current(generation);
+}
+
+/* Test pointer membership before dereferencing an opaque caller handle. */
+static ClusterKoCompletionV2 **
+ko_completion_link(const ClusterKoCompletionV2 *completion)
+{
+	ClusterKoCompletionV2 **link = &ko_completions;
+	while (*link != NULL && *link != completion)
+		link = &(*link)->next;
+	return link;
+}
+
+static void
+ko_completion_cancel(ClusterKoCompletionV2 *completion)
+{
+	if (ko_state != NULL && completion->slot < CLUSTER_KO_SHARED_CAPACITY) {
+		ClusterKoSharedContext *entry;
+		SpinLockAcquire(&ko_state->shared_lock);
+		entry = &ko_state->contexts[completion->slot];
+		if (entry->used && entry->pid == completion->pid && entry->serial == completion->serial)
+			memset(entry, 0, sizeof(*entry));
+		SpinLockRelease(&ko_state->shared_lock);
+	}
+}
+
+void
+cluster_ko_shared_release_v2(ClusterKoCompletionV2 **completion)
+{
+	ClusterKoCompletionV2 **link;
+	if (completion == NULL || *completion == NULL)
+		return;
+	link = ko_completion_link(*completion);
+	if (*link == NULL) {
+		*completion = NULL; /* Its ResourceOwner already disposed of it. */
+		return;
+	}
+	if ((*link)->pid != MyProcPid || (*link)->owner != CurrentResourceOwner)
+		return;
+	ko_completion_cancel(*link);
+	*link = (*link)->next;
+	pfree(*completion);
+	*completion = NULL;
+}
+
+static void
+ko_shared_resource_release(ResourceReleasePhase phase, bool commit pg_attribute_unused(),
+	bool top pg_attribute_unused(), void *arg pg_attribute_unused())
+{
+	ClusterKoCompletionV2 **link = &ko_completions;
+	if (phase != RESOURCE_RELEASE_BEFORE_LOCKS)
+		return;
+	while (*link != NULL) {
+		ClusterKoCompletionV2 *completion = *link;
+		if (completion->pid == MyProcPid && completion->owner == CurrentResourceOwner) {
+			ko_completion_cancel(completion);
+			*link = completion->next;
+			pfree(completion);
+		} else
+			link = &completion->next;
+	}
+}
+
+static bool
+ko_completion_snapshot(const ClusterKoCompletionV2 *completion, ClusterKoSharedContext *out)
+{
+	bool valid;
+	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
+	if (owned == NULL || owned->pid != MyProcPid || owned->owner != CurrentResourceOwner
+		|| CurrentResourceOwner == NULL || CritSectionCount != 0 || ko_state == NULL
+		|| owned->slot >= CLUSTER_KO_SHARED_CAPACITY)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	*out = ko_state->contexts[owned->slot];
+	valid = out->used && out->complete && out->pid == owned->pid && out->serial == owned->serial;
+	SpinLockRelease(&ko_state->shared_lock);
+	return valid && ko_shared_origin_current(out);
+}
+
+bool
+cluster_ko_shared_covers_v2(const ClusterKoCompletionV2 *completion,
+	const ClusterSpaceIdentityKey *key, const uint8 incarnation[16])
+{
+	ClusterKoSharedContext context;
+	return key != NULL && incarnation != NULL && ko_completion_snapshot(completion, &context)
+		&& context.request.key.system_identifier == key->system_identifier
+		&& context.request.key.database_incarnation == key->database_incarnation
+		&& memcmp(context.request.key.storage_uuid, key->storage_uuid, 16) == 0
+		&& RelFileLocatorEquals(context.request.key.locator, key->locator)
+		&& memcmp(context.request.incarnation, incarnation, 16) == 0;
+}
+
+bool
+cluster_ko_shared_read_v2(const ClusterKoCompletionV2 *completion, int32 peer,
+	ClusterKoSharedMessageV2 *out)
+{
+	ClusterKoSharedContext context;
+	ClusterKoSharedMessageV2 request;
+	if (out == NULL || peer < 0 || peer >= CLUSTER_KO_SHARED_NODE_LIMIT
+		|| peer == cluster_node_id || !ko_completion_snapshot(completion, &context)
+		|| context.peer_boots[peer] == 0)
+		return false;
+	request = context.request;
+	request.peer_node = peer;
+	request.peer_boot = context.peer_boots[peer];
+	if (!ko_shared_control_current(&request))
+		return false;
+	*out = request;
+	return true;
+}
+
 static bool
 ko_shared_enqueue(const ClusterKoSharedMessageV2 *message)
 {
@@ -534,7 +687,7 @@ ko_shared_request_owned(const ClusterKoSharedMessageV2 *message)
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 		const ClusterKoSharedContext *entry = &ko_state->contexts[i];
 		ClusterKoSharedMessageV2 expected;
-		if (!entry->used || entry->request.batch_id != message->batch_id
+		if (!entry->used || entry->complete || entry->request.batch_id != message->batch_id
 			|| message->peer_node >= CLUSTER_KO_SHARED_NODE_LIMIT)
 			continue;
 		expected = entry->request;
@@ -558,12 +711,19 @@ ko_shared_backend_exit(int code, Datum arg)
 	SpinLockAcquire(&ko_state->shared_lock);
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
 		if (ko_state->contexts[i].used && ko_state->contexts[i].pid == MyProcPid) {
-			batches[count++] = ko_state->contexts[i].request.batch_id;
+			if (!ko_state->contexts[i].complete)
+				batches[count++] = ko_state->contexts[i].request.batch_id;
 			memset(&ko_state->contexts[i], 0, sizeof(ko_state->contexts[i]));
 		}
 	SpinLockRelease(&ko_state->shared_lock);
 	for (unsigned i = 0; i < count; i++)
 		cluster_sinval_ack_wait_remove(batches[i]);
+	/* Exit owns all this process's ResourceOwners, not just its current one. */
+	while (ko_completions != NULL) {
+		ClusterKoCompletionV2 *completion = ko_completions;
+		ko_completions = completion->next;
+		pfree(completion);
+	}
 }
 
 void
@@ -620,7 +780,7 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
 		if (ko_state->contexts[i].used && result == CLUSTER_NORMAL_STOP_READY) {
 			result = CLUSTER_NORMAL_STOP_PENDING;
-			why = "KO_SHARED_BARRIER_PENDING";
+			why = ko_state->contexts[i].complete ? "KO_SHARED_COMPLETION_OWNED" : "KO_SHARED_BARRIER_PENDING";
 		}
 	SpinLockRelease(&ko_state->shared_lock);
 	if (reason != NULL)
@@ -629,50 +789,50 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 }
 
 static bool
-ko_run_shared_barrier(RelFileLocator locator)
+ko_shared_prepare_request(RelFileLocator locator, ClusterKoSharedMessageV2 *request,
+	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], uint32 *mask)
 {
 	ClusterSpaceIdentity identity;
 	ClusterWalSourceRef ref;
-	ClusterKoSharedMessageV2 request = {0};
-	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], generation;
-	uint32 mask = 0;
-	uint64 batch_id;
-	volatile int context = -1;
-	volatile bool begun = false, ok = false;
-	TimestampTz deadline;
+	uint64 generation;
 
 	if (ko_state == NULL || !cluster_wal_thread_current_v2_ref(&ref)
 		|| ref.claim.identity.origin_node_id != cluster_node_id
 		|| !cluster_space_relation_read_identity(locator, &identity)
 		|| identity.state != CLUSTER_SPACE_IDENTITY_LIVE
-		|| !ko_shared_members(&request, boots, &generation)
+		|| !ko_shared_members(request, boots, &generation)
 		|| boots[cluster_node_id] == 0
 		|| boots[cluster_node_id] != ref.claim.identity.origin_owner_incarnation
 		|| identity.key.system_identifier != ref.claim.identity.system_identifier
 		|| identity.key.database_incarnation != ref.claim.database_incarnation
 		|| memcmp(identity.key.storage_uuid, ref.claim.identity.storage_uuid, 16) != 0)
 		return false;
-	request.verb = CLUSTER_KO_SHARED_REQUEST;
-	batch_id = request.batch_id = cluster_sinval_ack_wait_alloc_batch_id();
-	request.origin_node = cluster_node_id;
-	request.origin_boot = boots[cluster_node_id];
-	request.key = identity.key;
-	memcpy(request.incarnation, identity.incarnation, 16);
+	request->verb = CLUSTER_KO_SHARED_REQUEST;
+	request->batch_id = cluster_sinval_ack_wait_alloc_batch_id();
+	if (request->batch_id == 0 || request->batch_id == UINT64_MAX)
+		return false;
+	request->origin_node = cluster_node_id;
+	request->origin_boot = boots[cluster_node_id];
+	request->key = identity.key;
+	memcpy(request->incarnation, identity.incarnation, 16);
+	*mask = 0;
 	for (int n = 0; n < CLUSTER_KO_SHARED_NODE_LIMIT; n++) {
 		if (n == cluster_node_id || boots[n] == 0)
 			continue;
-		request.peer_node = n;
-		request.peer_boot = boots[n];
-		if (!ko_shared_control_current(&request))
+		request->peer_node = n;
+		request->peer_boot = boots[n];
+		if (!ko_shared_control_current(request))
 			return false;
-		mask |= 1u << n;
+		*mask |= 1u << n;
 	}
-	if (!cluster_membership_cut_generation_current(generation))
-		return false;
-	if (mask == 0) {
-		KO_BUMP(native_count);
-		return true;
-	}
+	return cluster_membership_cut_generation_current(generation);
+}
+
+static int
+ko_shared_reserve(const ClusterKoSharedMessageV2 *request,
+	const uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], ClusterKoCompletionV2 *completion)
+{
+	int context = -1;
 	if (!ko_exit_registered) {
 		before_shmem_exit(ko_shared_backend_exit, (Datum)0);
 		ko_exit_registered = true;
@@ -680,66 +840,114 @@ ko_run_shared_barrier(RelFileLocator locator)
 	SpinLockAcquire(&ko_state->shared_lock);
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 		ClusterKoSharedContext *entry = &ko_state->contexts[i];
-		if (!entry->used) {
+		if (!entry->used && ko_state->context_serial != UINT64_MAX) {
 			entry->used = true;
+			entry->complete = false;
 			entry->pid = MyProcPid;
-			entry->request = request;
-			memcpy(entry->peer_boots, boots, sizeof(boots));
+			entry->serial = ++ko_state->context_serial;
+			entry->request = *request;
+			memcpy(entry->peer_boots, boots, sizeof(entry->peer_boots));
 			context = i;
+			if (completion != NULL) {
+				completion->slot = i;
+				completion->serial = entry->serial;
+			}
 			break;
 		}
 	}
 	SpinLockRelease(&ko_state->shared_lock);
+	return context;
+}
+
+static bool
+ko_shared_wait_for_acks(ClusterKoSharedMessageV2 *request, uint32 mask,
+	const uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], TimestampTz deadline)
+{
+	ResetLatch(MyLatch);
+	KO_BUMP(flush_count);
+	for (int n = 0; n < CLUSTER_KO_SHARED_NODE_LIMIT; n++) {
+		if ((mask & (1u << n)) == 0)
+			continue;
+		request->peer_node = n;
+		request->peer_boot = boots[n];
+		if (!ko_shared_control_current(request) || !ko_shared_enqueue(request))
+			return false;
+	}
+	while (ko_shared_control_current(request)) {
+		TimestampTz now;
+		int events;
+		CHECK_FOR_INTERRUPTS();
+		if (cluster_sinval_ack_wait_is_complete(request->batch_id))
+			return ko_shared_control_current(request) && ko_shared_space_current(request);
+		now = GetCurrentTimestamp();
+		if (now >= deadline)
+			break;
+		events = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+			(deadline - now + USECS_PER_MSEC - 1) / USECS_PER_MSEC,
+			WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT);
+		ResetLatch(MyLatch);
+		if (events & WL_POSTMASTER_DEATH)
+			break;
+	}
+	return false;
+}
+
+static bool
+ko_run_shared_barrier_impl(RelFileLocator locator, ClusterKoCompletionV2 *completion)
+{
+	ClusterKoSharedMessageV2 request = {0};
+	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT];
+	uint64 batch_id;
+	uint32 mask;
+	int context;
+	volatile bool begun = false, ok = false;
+	TimestampTz deadline;
+
+	if (!ko_shared_prepare_request(locator, &request, boots, &mask))
+		return false;
+	if (mask == 0 && completion == NULL) {
+		KO_BUMP(native_count);
+		return true;
+	}
+	context = ko_shared_reserve(&request, boots, completion);
 	if (context < 0)
 		return false;
+	/* request's peer fields change inside TRY. Keep the original wait key
+	 * separately so ERROR cleanup never reads a longjmp-clobbered object. */
+	batch_id = request.batch_id;
 	deadline = GetCurrentTimestamp() + (int64)cluster_sinval_ack_timeout_ms * USECS_PER_MSEC;
 	PG_TRY();
 	{
-		begun = cluster_sinval_ack_wait_begin(request.batch_id, mask, deadline);
-		if (begun) {
-			bool sent = true;
-			ResetLatch(MyLatch);
-			KO_BUMP(flush_count);
-			for (int n = 0; n < CLUSTER_KO_SHARED_NODE_LIMIT; n++) {
-				if ((mask & (1u << n)) == 0)
-					continue;
-				request.peer_node = n;
-				request.peer_boot = boots[n];
-				if (!ko_shared_control_current(&request) || !ko_shared_enqueue(&request)) {
-					sent = false;
-					break;
-				}
-			}
-			while (sent && ko_shared_control_current(&request)) {
-				TimestampTz now;
-				int events;
-				CHECK_FOR_INTERRUPTS();
-				if (cluster_sinval_ack_wait_is_complete(request.batch_id)) {
-					ok = ko_shared_control_current(&request) && ko_shared_space_current(&request);
-					break;
-				}
-				now = GetCurrentTimestamp();
-				if (now >= deadline)
-					break;
-				events = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-					(deadline - now + USECS_PER_MSEC - 1) / USECS_PER_MSEC,
-					WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT);
-				ResetLatch(MyLatch);
-				if (events & WL_POSTMASTER_DEATH)
-					break;
-			}
-		}
+		if (mask == 0) {
+			ClusterKoSharedContext scope = {0};
+			scope.request = request;
+			memcpy(scope.peer_boots, boots, sizeof(boots));
+			ok = ko_shared_origin_current(&scope) && ko_shared_space_current(&request);
+			if (ok) KO_BUMP(native_count);
+		} else
+			begun = cluster_sinval_ack_wait_begin(request.batch_id, mask, deadline);
+		if (begun)
+			ok = ko_shared_wait_for_acks(&request, mask, boots, deadline);
 	}
 	PG_FINALLY();
 	{
 		if (begun)
 			cluster_sinval_ack_wait_remove(batch_id);
 		SpinLockAcquire(&ko_state->shared_lock);
-		memset(&ko_state->contexts[context], 0, sizeof(ko_state->contexts[context]));
+		if (ok && completion != NULL)
+			ko_state->contexts[context].complete = true;
+		else
+			memset(&ko_state->contexts[context], 0, sizeof(ko_state->contexts[context]));
 		SpinLockRelease(&ko_state->shared_lock);
 	}
 	PG_END_TRY();
 	return ok;
+}
+
+static bool
+ko_run_shared_barrier(RelFileLocator locator)
+{
+	return ko_run_shared_barrier_impl(locator, NULL);
 }
 
 
@@ -823,8 +1031,8 @@ ko_run_barrier(RelFileLocator rloc, uint32 alive_mask)
 	return ok;
 }
 
-void
-cluster_ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence)
+static void
+ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence, ClusterKoCompletionV2 *completion)
 {
 	ClusterResId resid;
 	KoLock lk;
@@ -897,7 +1105,7 @@ cluster_ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence)
 		uint32 alive_mask = 0;
 
 		if (cluster_shared_config)
-			ok = ko_run_shared_barrier(rloc);
+			ok = completion != NULL ? ko_run_shared_barrier_impl(rloc, completion) : ko_run_shared_barrier(rloc);
 		else {
 			alive_mask = cluster_sinval_compute_alive_peer_mask();
 			if (alive_mask == 0) {
@@ -925,6 +1133,45 @@ cluster_ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence)
 				 errhint("A peer did not acknowledge the cross-node buffer flush within "
 						 "cluster.sinval_ack_timeout_ms; check cluster health and retry.")));
 	}
+}
+
+void
+cluster_ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence)
+{
+	ko_flush_and_wait_ack(rloc, relpersistence, NULL);
+}
+
+bool
+cluster_ko_shared_begin_v2(RelFileLocator rloc, char relpersistence, ClusterKoCompletionV2 **out)
+{
+	ClusterKoCompletionV2 *completion;
+	if (out == NULL || *out != NULL || !cluster_enabled || !cluster_shared_config
+		|| relpersistence == RELPERSISTENCE_TEMP || RecoveryInProgress() || cluster_node_id < 0
+		|| CurrentResourceOwner == NULL || TopTransactionContext == NULL || CritSectionCount != 0
+		|| MyProcPid <= 0)
+		return false;
+	if (!ko_resource_registered) {
+		RegisterResourceReleaseCallback(ko_shared_resource_release, NULL);
+		ko_resource_registered = true;
+	}
+	completion = MemoryContextAllocZero(TopTransactionContext, sizeof(*completion));
+	completion->owner = CurrentResourceOwner;
+	completion->pid = MyProcPid;
+	completion->slot = CLUSTER_KO_SHARED_CAPACITY;
+	completion->next = ko_completions;
+	ko_completions = completion;
+	PG_TRY();
+	{
+		ko_flush_and_wait_ack(rloc, relpersistence, completion);
+	}
+	PG_CATCH();
+	{
+		cluster_ko_shared_release_v2(&completion);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	*out = completion;
+	return true;
 }
 
 
@@ -1050,7 +1297,7 @@ cluster_ko_flush_ack_handler(const ClusterICEnvelope *env, const void *payload)
 		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 			const ClusterKoSharedContext *entry = &ko_state->contexts[i];
 			ClusterKoSharedMessageV2 expected;
-			if (!entry->used || entry->request.batch_id != ack.batch_id)
+			if (!entry->used || entry->complete || entry->request.batch_id != ack.batch_id)
 				continue;
 			expected = entry->request;
 			expected.peer_node = ack.peer_node;
