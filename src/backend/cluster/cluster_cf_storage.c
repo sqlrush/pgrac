@@ -28,6 +28,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster_control_bootstrap_private.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -835,15 +836,13 @@ cluster_cf_startup_prepare(const char *pgdata)
 	ClusterCfStartupVerdict v;
 	ClusterCfIdentityVerdict idv;
 
-	/* PGRAC: never let the old first-start migration manufacture authority for
-	 * root-v2. Early sizing/config binding and formation must be wired before
-	 * this profile can start. Author: SqlRush <sqlrush@gmail.com>
-	 */
-	if (cluster_shared_config)
-		ereport(FATAL, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("PRE2 shared-control startup is not yet available"),
-						errhint("Keep cluster.shared_config off until the complete root-v2 "
-								"fresh initialization and startup path is qualified.")));
+	/* PGRAC: exact early ROOT preparation feeds the read-only catalog entry.
+	 * Shared startup never migrates or adopts local control/catalog files.
+	 * The later physical qualification and formation gates remain mandatory. */
+	if (cluster_shared_config) {
+		cluster_control_bootstrap_catalog_prepare(pgdata);
+		return;
+	}
 	if (!cluster_controlfile_shared_authority)
 		return; /* off: stock per-node pg_control */
 

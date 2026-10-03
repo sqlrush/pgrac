@@ -104,7 +104,9 @@ typedef struct ClusterOidLease {
  * cluster_oid_resid_encode -- build the singleton OID-authority resource id
  *	(all map fields zero; the type byte places it in the OID namespace).
  */
+#ifndef FRONTEND
 extern void cluster_oid_resid_encode(ClusterResId *dst);
+#endif
 
 /*
  * cluster_oid_authority_classify -- pure validity check of an authority image

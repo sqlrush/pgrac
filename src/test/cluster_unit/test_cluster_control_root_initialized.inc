@@ -34,6 +34,8 @@ initialized_fixture(uint8 bytes[1536], ControlRootImage *root, bool seed, uint32
 	uint8 *record = bytes + 256, *claim = bytes + 1280;
 	startup_fixture(bytes, root, phase);
 	root->header.lineage_kind = PGRAC_CONTROL_LINEAGE_CREATION_V1;
+	root->header.target_feature_bitmap |= PGRAC_CONTROL_ROOT_FEATURE_SPACE_IDENTITY_V1
+		| PGRAC_CONTROL_ROOT_FEATURE_SPACE_RESERVATION_V1;
 	root->header.migration_prepare_generation = 1;
 	root->header.migration_transition_epoch = 0;
 	root->header.source_feature_bitmap = 0;

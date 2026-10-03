@@ -107,6 +107,12 @@ cluster_control_bootstrap_root_bound(const PgracControlBinding *binding,
 		|| header->migration_prepare_generation != binding->migration_prepare_generation
 		|| header->migration_transition_epoch != binding->migration_transition_epoch)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (binding->lineage_kind == PGRAC_CONTROL_LINEAGE_CREATION_V1) {
+		uint64 required = PGRAC_CONTROL_ROOT_FEATURE_SPACE_IDENTITY_V1
+			| PGRAC_CONTROL_ROOT_FEATURE_SPACE_RESERVATION_V1;
+		if ((header->target_feature_bitmap & required) != required)
+			return CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED;
+	}
 	if (header->v2.database_state < CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
 		|| header->v2.database_state > CLUSTER_CONTROL_ROOT_DATABASE_CLOSED)
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;

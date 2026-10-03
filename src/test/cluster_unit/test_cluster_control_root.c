@@ -2618,7 +2618,9 @@ UT_TEST(test_abi_identity_and_features)
 				   | PGRAC_CONTROL_ROOT_FEATURE_CONSERVATIVE_COMMIT_SCN_V1
 				   | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1
 				   | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_SERIAL_V1
-				   | PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1;
+				   | PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1
+				   | PGRAC_CONTROL_ROOT_FEATURE_SPACE_IDENTITY_V1
+				   | PGRAC_CONTROL_ROOT_FEATURE_SPACE_RESERVATION_V1;
 
 	UT_ASSERT_EQ(CLUSTER_CONTROL_ROOT_FILE_BYTES, 66048);
 	UT_ASSERT_EQ(CLUSTER_CONTROL_ROOT_FORMAT_FLAGS_V1, UINT64_C(0x0d));
@@ -2627,7 +2629,7 @@ UT_TEST(test_abi_identity_and_features)
 	UT_ASSERT_EQ(PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1, UINT64_C(0x00400000));
 	UT_ASSERT_EQ(PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_SERIAL_V1, UINT64_C(0x00800000));
 	UT_ASSERT_EQ(PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1, UINT64_C(0x01000000));
-	UT_ASSERT_EQ(PGRAC_CONTROL_ROOT_FEATURE_KNOWN_MASK_V1, UINT64_C(0x01ee0001));
+	UT_ASSERT_EQ(PGRAC_CONTROL_ROOT_FEATURE_KNOWN_MASK_V1, UINT64_C(0x07ee0001));
 	UT_ASSERT_EQ(known, PGRAC_CONTROL_ROOT_FEATURE_KNOWN_MASK_V1);
 	fill_identity(&left);
 	right = left;
@@ -21829,6 +21831,8 @@ UT_TEST(test_wal_inputs_cold_selection_and_pin_lifetime_are_exact)
 	cluster_node_id = saved_node;
 }
 
+#include "test_cluster_control_catalog.inc"
+
 int
 main(int argc, char **argv)
 {
@@ -21905,7 +21909,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(415);
+	UT_PLAN(419);
 	UT_RUN(test_first_start_io_and_late_races_never_publish_authority);
 	UT_RUN(test_first_start_binds_original_inputs_without_clean_exit);
 	UT_RUN(test_first_start_rejects_incomplete_or_changed_formation);
@@ -21913,6 +21917,10 @@ main(int argc, char **argv)
 	UT_RUN(test_initialized_cohort_refuses_incomplete_or_existing_sources);
 	UT_RUN(test_initialized_cohort_refuses_wrong_identity_or_geometry);
 	UT_RUN(test_initialized_cohort_overlap_never_changes_input);
+	UT_RUN(test_creation_bootstrap_requires_both_space_format_bits);
+	UT_RUN(test_catalog_read_requires_independent_original_and_exact_root);
+	UT_RUN(test_catalog_recheck_rejects_replaced_root_and_changed_allocator);
+	UT_RUN(test_catalog_read_refuses_missing_corrupt_and_unsafe_objects);
 	UT_RUN(test_creation_root_codec_has_separate_literal_domain);
 	UT_RUN(test_creation_root_rejects_mixed_flags_and_fake_open);
 	UT_RUN(test_initialized_kind_requires_creation_root);

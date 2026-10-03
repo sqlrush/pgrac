@@ -51,6 +51,8 @@
 #define PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1 (UINT64_C(1) << 22)
 #define PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_SERIAL_V1 (UINT64_C(1) << 23)
 #define PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1 (UINT64_C(1) << 24)
+#define PGRAC_CONTROL_ROOT_FEATURE_SPACE_IDENTITY_V1 (UINT64_C(1) << 25)
+#define PGRAC_CONTROL_ROOT_FEATURE_SPACE_RESERVATION_V1 (UINT64_C(1) << 26)
 /* Bit 0 is the already-frozen R4 synchronous-CR semantic feature.  Keep the
  * complete root-v1 known set public so every reader rejects the same unknown
  * bits; inclusion here is understanding, not activation. */
@@ -61,7 +63,9 @@
 	 | PGRAC_CONTROL_ROOT_FEATURE_CONSERVATIVE_COMMIT_SCN_V1                                       \
 	 | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1                                        \
 	 | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_SERIAL_V1                                               \
-	 | PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1)
+	 | PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1                                               \
+	 | PGRAC_CONTROL_ROOT_FEATURE_SPACE_IDENTITY_V1                                               \
+	 | PGRAC_CONTROL_ROOT_FEATURE_SPACE_RESERVATION_V1)
 
 typedef enum ClusterControlRootLifecycle {
 	CLUSTER_CONTROL_ROOT_LIFECYCLE_UNUSED = 0,

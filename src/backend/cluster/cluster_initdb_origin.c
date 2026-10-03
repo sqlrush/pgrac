@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_xid_authority.h"
 #include "common/cryptohash.h"
 #include "common/file_perm.h"
 #include "miscadmin.h"
@@ -50,7 +51,9 @@ origin_object_arguments(int directory, const char *name, const uint8 *bytes,
 {
 	return bytes != NULL && name != NULL && name[0] != '\0' && strchr(name, '/') == NULL
 		&& strcmp(name, ".") != 0 && strcmp(name, "..") != 0
-		&& length > 0 && length <= CLUSTER_CONTROL_ROOT_FILE_BYTES
+		&& length > 0
+		&& length <= Max(CLUSTER_CONTROL_ROOT_FILE_BYTES,
+			sizeof(ClusterXidPrehistoryHeader) + CLUSTER_XID_PREHISTORY_MAX_XID / 4)
 		&& fstat(directory, parent) == 0 && S_ISDIR(parent->st_mode)
 		&& parent->st_uid == geteuid() && (parent->st_mode & 0022) == 0;
 }

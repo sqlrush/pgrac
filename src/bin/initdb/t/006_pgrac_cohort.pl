@@ -62,6 +62,24 @@ BAIL_OUT('cohort not created') unless -f "$temp/valid-caches/node_3/global/pg_co
 like($out, qr/shared startup remains closed/,
 	'creation publication does not claim shared OPEN');
 ok(-f "$temp/valid-data/global/pgrac_control_root", 'complete creator publishes ROOT last');
+for my $name ('pgrac_oid_authority', 'pgrac_catalog_authority',
+	'pgrac_xid_authority', 'pgrac_xid_authority.bak',
+	'pgrac_xid_prehistory', 'pgrac_xid_prehistory.bak')
+{
+	ok(-f "$temp/valid-data/global/$name" && !-l "$temp/valid-data/global/$name",
+		"original creator persists $name before ROOT");
+}
+if (-f "$temp/valid-data/global/pgrac_xid_prehistory")
+{
+	my $history = slurp_file("$temp/valid-data/global/pgrac_xid_prehistory");
+	my $clog = slurp_file("$temp/valid-caches/node_0/pgrac_initdb_native_side/pg_xact/0000");
+	is(substr($history, 32), $clog, 'prehistory retains the complete actual founder CLOG');
+	is($history, slurp_file("$temp/valid-data/global/pgrac_xid_prehistory.bak"),
+		'original prehistory backup contains identical bytes');
+	is(slurp_file("$temp/valid-data/global/pgrac_xid_authority"),
+		slurp_file("$temp/valid-data/global/pgrac_xid_authority.bak"),
+		'original XID backup contains identical bytes');
+}
 my %generations;
 my $founder_scn;
 for my $node (0 .. 3)
@@ -107,6 +125,29 @@ for my $node (0 .. 3)
 	}
 	ok($pages > 0 && !$wrong, "all origin $node WAL pages were generated with its thread");
 	ok(-f "$data/global/pgrac_control_binding", 'original local binding follows complete ROOT publication');
+	my $before_bootstrap = sha256_hex(slurp_file("$temp/valid-data/global/pgrac_control_root"));
+	my @bootstrap = ('postgres', '-D', $data, '-C', 'shared_memory_size',
+		'-c', 'cluster.enabled=on', '-c', 'cluster.shared_config=on',
+		'-c', 'cluster.controlfile_shared_authority=on', '-c', "cluster.node_id=$node",
+		'-c', "cluster.shared_data_dir=$temp/valid-data",
+		'-c', "cluster.wal_threads_dir=$temp/valid-wal",
+		'-c', "cluster.undo_tablespace_path=$temp/valid-undo");
+	command_fails_like(\@bootstrap, qr/shared configuration conflicts with a higher-priority source/,
+		'command-line settings cannot override ROOT-selected configuration') if $node == 0;
+	# Bootstrap discovery is local FILE input. ROOT remains the authority for
+	# common/instance values; even identical higher-priority overrides refuse.
+	append_to_file("$data/postgresql.conf", "\ncluster.enabled=on\ncluster.shared_config=on\n"
+		. "cluster.controlfile_shared_authority=on\ncluster.node_id=$node\n"
+		. "cluster.shared_data_dir='$temp/valid-data'\n"
+		. "cluster.wal_threads_dir='$temp/valid-wal'\n"
+		. "cluster.undo_tablespace_path='$temp/valid-undo'\n");
+	@bootstrap = ('postgres', '-D', $data, '-C', 'shared_memory_size');
+	my ($bootstrap_out, $bootstrap_err);
+	ok(IPC::Run::run(\@bootstrap, '>', \$bootstrap_out, '2>', \$bootstrap_err),
+		'ordinary early native bootstrap consumes original creation') or diag $bootstrap_err;
+	like($bootstrap_out, qr/^\d+\s*$/, 'native preparation reaches shared memory sizing');
+	is(sha256_hex(slurp_file("$temp/valid-data/global/pgrac_control_root")), $before_bootstrap,
+		'early native preparation does not publish ROOT');
 	for my $family ('pg_xact', 'pg_subtrans', 'pg_multixact', 'pg_commit_ts')
 	{
 		is(readlink("$data/$family"), "$temp/valid-data/native_side/origin_$node/$family",
@@ -308,5 +349,26 @@ if (-f "$temp/valid-data/global/pgrac_control_root")
 		. substr($root, 336, 8) . $native_hash . tree_digest("$temp/valid-data", 1)
 		. tree_digest("$temp/valid-undo", 0);
 	is(substr($root, 100, 32), sha256($cohort), 'ROOT cohort digest independently matches complete original objects');
+}
+# Exercise the production postmaster source, not just the pure catalog codec.
+# An ordinary startup cannot heal a missing or corrupt original authority.
+{
+	my $marker = "$temp/valid-data/global/pgrac_catalog_authority";
+	my $saved = "$marker.saved";
+	my @bootstrap = ('postgres', '-D', "$temp/valid-caches/node_0", '-C', 'shared_memory_size');
+	my $root = slurp_file("$temp/valid-data/global/pgrac_control_root");
+	rename $marker, $saved or die "save marker: $!";
+	command_fails_like(\@bootstrap, qr/selected shared catalog inputs are unavailable or inconsistent/,
+		'missing creator catalog marker refuses through the actual startup source');
+	ok(!-e $marker, 'ordinary startup does not recreate the missing marker');
+	append_to_file($marker, 'invalid');
+	command_fails_like(\@bootstrap, qr/selected shared catalog inputs are unavailable or inconsistent/,
+		'corrupt creator catalog marker refuses through the actual startup source');
+	is(slurp_file($marker), 'invalid', 'ordinary startup does not repair the corrupt marker');
+	unlink $marker or die "remove corrupt marker: $!";
+	rename $saved, $marker or die "restore marker: $!";
+	is(slurp_file("$temp/valid-data/global/pgrac_control_root"), $root,
+		'catalog refusal never changes the selected ROOT');
+	command_ok(\@bootstrap, 'original catalog inputs remain restartable after negative probes');
 }
 done_testing();

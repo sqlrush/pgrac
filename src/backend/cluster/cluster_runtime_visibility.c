@@ -3773,6 +3773,60 @@ cluster_undo_verdict_resolve_internal(int origin_node, uint32 undo_segment_id,
 			break; /* live owner: unchanged CP3 + CP5 path below */
 		case CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED:
 		default:
+			/* A temporarily stale MEMBER remains UNKNOWN, not OWNER_LIVE.
+			 * An exact admitted peer/session can permit a terminal inquiry,
+			 * without a CP3 block0 grant or borrowing survivor authority. */
+			if (freshref_pair && route.status == CLUSTER_UNDO_AUTHORITY_UNKNOWN
+				&& route.reason == CLUSTER_UNDO_ROUTE_MEMBER_OBSERVATION_STALE
+				&& route.reconfig_epoch == (uint64)ref_epoch) {
+				ClusterSemanticAdmissionToken admission;
+				ClusterSemanticTerminalPeerSnapshot peer;
+				volatile bool resolved = false;
+				const uint32 caps = PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+									| PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
+									| PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
+									| PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1;
+
+				if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+													  CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
+					== CLUSTER_SEMANTIC_ADMISSION_OK) {
+					PG_TRY();
+					{
+						if (admission.formation_epoch == route.reconfig_epoch
+							&& cluster_epoch_get_current() == route.reconfig_epoch
+							&& cluster_semantic_activation_terminal_peer_capture(
+								&admission, origin_node, caps, &peer)
+							&& rtvis_try_origin_verdict(
+								origin_node, undo_segment_id, raw_xid, expected_tt_slot_id,
+								ref_epoch, freshref_pair_scn, freshref_pair_scn, read_scn, true,
+								&committed, &in_progress, &commit_scn, &is_bound)
+							&& committed && !in_progress && !is_bound
+							&& commit_scn == freshref_pair_scn
+							&& cluster_semantic_activation_terminal_peer_current(&admission,
+																				 &peer)) {
+							ClusterUndoServeRoute after
+								= cluster_undo_serve_authority(&rid, ref_epoch);
+
+							/* The original transport/proof guard has returned, while
+							 * this admission is still held. Recovered freshness is
+							 * harmless; any new route or epoch is not. */
+							resolved = cluster_epoch_get_current() == (uint64)ref_epoch
+									   && ((after.status == CLUSTER_UNDO_AUTHORITY_UNKNOWN
+											&& after.reason
+												   == CLUSTER_UNDO_ROUTE_MEMBER_OBSERVATION_STALE)
+										   || (after.status == CLUSTER_UNDO_AUTHORITY_OWNER_LIVE
+											   && after.destination_node == origin_node));
+						}
+					}
+					PG_FINALLY();
+					{
+						cluster_semantic_activation_leave(&admission);
+					}
+					PG_END_TRY();
+				}
+				if (resolved)
+					return cluster_undo_verdict_from_resolve(true, true, freshref_pair_scn, false);
+			}
 			/*
 			 * Owner liveness unproven / no derivable authority: fail
 			 * closed, NEVER the native CLOG/hint path (Rule 8.A).

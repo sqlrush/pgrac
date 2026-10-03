@@ -1368,6 +1368,8 @@ PostmasterMain(int argc, char *argv[])
 	 * (FATAL) on a per-node, foreign, or torn control file.  This runs once in
 	 * the postmaster, before the startup process is forked and writes the
 	 * control file.  A no-op unless the authority is enabled (default off).
+	 * The shared-config profile instead retains the early ROOT selection and
+	 * registers its read-only catalog source; it never runs legacy migration.
 	 */
 	cluster_cf_startup_prepare(DataDir);
 
@@ -1375,7 +1377,9 @@ PostmasterMain(int argc, char *argv[])
 	 * PGRAC: spec-6.14 D2.  With the shared pg_control authority established
 	 * above, seed the shared catalog authorities (OID high-water) from it when
 	 * cluster.shared_catalog is on.  Seed node creates them; join node adopts.
-	 * No-op when shared_catalog is off (default).
+	 * No-op when shared_catalog is off (default).  The shared-config profile
+	 * only verifies the original creator's ROOT-selected objects and rechecks
+	 * that selection; it cannot seed or adopt an authority during startup.
 	 */
 	cluster_catalog_startup_prepare();
 #endif

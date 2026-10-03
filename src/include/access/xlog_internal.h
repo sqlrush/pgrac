@@ -71,7 +71,7 @@
 /*
  * Each page of XLOG file has a header like this:
  */
-#define XLOG_PAGE_MAGIC 0xD116 /* PGRAC spec-6.4: ADG barrier rmgr (was 0xD115) */
+#define XLOG_PAGE_MAGIC 0xD117 /* PGRAC: shared SPACE and versioned page WAL. */
 
 typedef struct XLogPageHeaderData
 {

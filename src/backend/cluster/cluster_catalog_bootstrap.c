@@ -3,6 +3,10 @@
  * cluster_catalog_bootstrap.c
  *	  Shared-catalog runtime bootstrap (spec-6.14 D2).
  *
+ *	  Shared-config startup only verifies the selected original inputs;
+ *	  it never seeds, adopts, or repairs an authority. The remaining legacy
+ *	  bootstrap helpers below retain their non-shared behavior.
+ *
  *	  cluster_catalog_startup_prepare() runs postmaster-once at startup.  When
  *	  cluster.shared_catalog is on it seeds the shared OID authority from the
  *	  shared pg_control's next-OID high-water (a value both seed and join nodes
@@ -42,6 +46,7 @@
 #include "catalog/pg_control.h"
 #include "cluster/cluster_catalog_bootstrap.h"
 #include "cluster/cluster_catalog_migrate.h"
+#include "cluster/cluster_catalog_startup.h"
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
@@ -372,6 +377,9 @@ cluster_catalog_startup_prepare(void)
 	/* Postmaster-once: only the postmaster seeds; forked backends inherit. */
 	if (IsUnderPostmaster)
 		return;
+	if (cluster_shared_config && !cluster_shared_catalog)
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("shared configuration requires cluster.shared_catalog=on")));
 
 	if (!cluster_shared_catalog) {
 		/*
@@ -398,6 +406,15 @@ cluster_catalog_startup_prepare(void)
 		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("shared catalogs require acknowledged invalidation"),
 						errhint("Set cluster.sinval_ack_mode=peer_enqueued.")));
+	if (cluster_shared_config) {
+		if (!cluster_catalog_startup_shared_verify())
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+					 errmsg("selected shared catalog inputs are unavailable or inconsistent"),
+					 errhint("Use the verified shared bootstrap input source; startup cannot "
+							 "seed, adopt, or repair catalog authorities.")));
+		return;
+	}
 
 	/*
 	 * shared_catalog=on requires the shared pg_control authority (D1 vet), so

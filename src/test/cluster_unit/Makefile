@@ -46,7 +46,7 @@ endif
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
-        test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort \
+        test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup test_cluster_initdb_tree test_cluster_initdb_cohort \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
         test_pgrac_fenced_target_command test_pgrac_fenced_target_reply test_pgrac_fenced_target_client \
@@ -180,6 +180,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_hang_resolve \
         test_cluster_cr_server_policy \
         test_cluster_runtime_visibility \
+		test_cluster_tt_terminal_route \
         test_cluster_touched_peers \
         test_cluster_clean_leave \
         test_cluster_membership \
@@ -412,6 +413,7 @@ SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_ctl,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge test_cluster_port_runtime,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_prepare_diagnostic,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_tt_terminal_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_pacemaker test_pgrac_fenced_cib,$(SIMPLE_TESTS))
 # PGRAC: production journal validation is linked into target command tests.
@@ -470,6 +472,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_service_observe,$(SIMPLE_TESTS))
 # PGRAC: shared frontend/backend binding codec uses its real common library.
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_relmap_init,$(SIMPLE_TESTS))
 
 # Fresh image constructor must link as a frontend, without backend services.
@@ -785,6 +788,25 @@ test_cluster_runtime_visibility: test_cluster_runtime_visibility.c unit_test.h $
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Exercise the original requester branch and live membership wrapper, with
+# proof/transport boundaries supplied by the fixture rather than copied logic.
+test_cluster_tt_terminal_route.inc: $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_authority_snapshot.c \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_gcs.c Makefile
+	awk '/^(rtvis_try_origin_verdict|cluster_undo_serve_allowed|rtvis_local_freshref_c1b_pair_eligible|cluster_undo_verdict_resolve_internal|cluster_undo_serve_authority_lookup_internal|cluster_undo_serve_authority_lookup|cluster_undo_serve_authority)\(/ \
+	     { print previous; emit=1; found++ } emit { print } /^}/ { emit=0 } \
+	     { previous=$$0 } END { if (found != 7 || emit) exit 1 }' \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_gcs.c \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_authority_snapshot.c \
+		$(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_tt_terminal_route: test_cluster_tt_terminal_route.c unit_test.h \
+		test_cluster_tt_terminal_route.inc $(top_builddir)/src/backend/cluster/cluster_undo_authority.o \
+		$(CLUSTER_RUNTIME_VIS_POLICY_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNDO_AUTHORITY_O) \
+		$(CLUSTER_RUNTIME_VIS_POLICY_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # spec-5.14 D1: test_cluster_touched_peers links cluster_touched_peers.o (the
 # pure per-tx touched bitmap: stamp / poison / intersect / reset / DSM merge).
@@ -2860,8 +2882,12 @@ test_cluster_wal_inputs_product.o: $(top_srcdir)/src/backend/cluster/cluster_wal
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-Dcluster_wal_claim_v2_read=test_wal_inputs_claim_read -c $< -o $@
 
+test_cluster_catalog_origin_io.o: $(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin_private.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixture.h test_cluster_control_root_worker.inc \
-		test_cluster_control_root_initialized.inc test_cluster_control_root_first_start.inc \
+		test_cluster_control_root_initialized.inc test_cluster_control_root_first_start.inc test_cluster_control_catalog.inc \
 		$(top_builddir)/src/backend/cluster/cluster_thread_recovery_finalize.o \
 		test_cluster_control_native_xid.inc \
 		$(WAL_INPUT_CONTRIBUTION_TEST_OBJS) \
@@ -2871,6 +2897,10 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixt
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
 		cluster_control_bootstrap_read_test.o \
+		$(top_builddir)/src/backend/cluster/cluster_control_catalog_read.o \
+		$(top_builddir)/src/backend/cluster/cluster_initdb_catalog.o \
+		test_cluster_catalog_origin_io.o \
+		$(top_builddir)/src/backend/cluster/cluster_initdb_common.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o \
@@ -2882,6 +2912,10 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h wal_test_fixt
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
 		cluster_control_bootstrap_read_test.o \
+		$(top_builddir)/src/backend/cluster/cluster_control_catalog_read.o \
+		$(top_builddir)/src/backend/cluster/cluster_initdb_catalog.o \
+		test_cluster_catalog_origin_io.o \
+		$(top_builddir)/src/backend/cluster/cluster_initdb_common.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
@@ -2900,7 +2934,9 @@ cluster_control_bootstrap_read_test.o: cluster_control_bootstrap_read_test.c \
 		$(top_srcdir)/src/include/cluster/cluster_native_startup.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
-xlogreader_fs.o: $(top_srcdir)/src/backend/access/transam/xlogreader.c
+xlogreader_fs.o: $(top_srcdir)/src/backend/access/transam/xlogreader.c \
+		$(top_srcdir)/src/include/access/xlog_internal.h \
+		$(top_srcdir)/src/include/access/xlogrecord.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -c $< -o $@
 
 CLUSTER_WAL_RETENTION_O = $(top_builddir)/src/backend/cluster/cluster_wal_retention.o
@@ -4142,6 +4178,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_tt_terminal_route.inc test_cluster_tt_terminal_route.inc.tmp
 	rm -f test_cluster_typed_redo_reader.inc test_cluster_typed_redo_fpi.inc test_cluster_cold_init_native.inc
 	rm -f test_cluster_current_mx_local_sample.inc test_cluster_current_mx_reply_builder.inc
 	rm -f test_cluster_page_cold_redo_product.o
@@ -7962,6 +7999,59 @@ test_cluster_initdb_common: test_cluster_initdb_common.c unit_test.h \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_CRYPTOHASH_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
+# Execute the complete production entry body, retaining all legacy branches.
+test_cluster_catalog_startup_entry.inc: $(top_srcdir)/src/backend/cluster/cluster_catalog_bootstrap.c
+	awk '/^cluster_catalog_startup_prepare\(void\)/ { print "void"; emit=1; n++ } emit { print } /^}/ { emit=0 } END { if(n!=1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_catalog_startup: test_cluster_catalog_startup.c unit_test.h \
+		test_cluster_catalog_startup_entry.inc \
+		$(top_srcdir)/src/include/cluster/cluster_catalog_startup.h \
+		$(top_srcdir)/src/common/cluster_catalog_verify.c \
+		$(top_srcdir)/src/common/cluster_catalog_init.c \
+		$(top_srcdir)/src/common/cluster_catalog_manifest.c \
+		$(top_srcdir)/src/backend/cluster/cluster_catalog_startup_input.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_common.c \
+		$(top_srcdir)/src/backend/cluster/cluster_cf_authority.c cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_catalog_verify.c \
+		$(top_srcdir)/src/common/cluster_catalog_init.c \
+		$(top_srcdir)/src/common/cluster_catalog_manifest.c \
+		$(top_srcdir)/src/backend/cluster/cluster_catalog_startup_input.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_common.c \
+		$(top_srcdir)/src/backend/cluster/cluster_cf_authority.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+# Original allocator images through the unchanged authority consumers.
+test_cluster_catalog_init: test_cluster_catalog_init.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_catalog_init.h \
+		$(top_srcdir)/src/common/cluster_catalog_init.c \
+		$(top_srcdir)/src/backend/cluster/cluster_oid_lease.c \
+		$(top_srcdir)/src/backend/cluster/cluster_xid_authority.c \
+		$(top_srcdir)/src/backend/cluster/cluster_xid_prehistory.c cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_catalog_init.c \
+		$(top_srcdir)/src/backend/cluster/cluster_oid_lease.c \
+		$(top_srcdir)/src/backend/cluster/cluster_xid_authority.c \
+		$(top_srcdir)/src/backend/cluster/cluster_xid_prehistory.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Strict initial manifest decoder with the actual original producer.
+test_cluster_catalog_manifest: test_cluster_catalog_manifest.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_catalog_manifest.h \
+		$(top_srcdir)/src/common/cluster_catalog_manifest.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_common.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_common_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_cf_authority.c cluster_unit_port_stubs.o \
+		$(top_builddir)/src/common/libpgcommon.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_catalog_manifest.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_common.c \
+		$(top_srcdir)/src/backend/cluster/cluster_cf_authority.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
 # Bounded original-tree observation with real filesystem identities.
 test_cluster_initdb_tree: test_cluster_initdb_tree.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_initdb_tree.c \
@@ -7985,3 +8075,13 @@ test_cluster_storage_sql_route: test_cluster_storage_sql_route.c unit_test.h \
 test_cluster_storage_backend: test_cluster_storage_backend.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_storage_quorum_backend.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
+# Original catalog source I/O and exclusive publication use actual files.
+test_cluster_initdb_catalog: test_cluster_initdb_catalog.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_catalog.c \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_catalog_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_initdb_origin.c \
+		$(top_srcdir)/src/common/cluster_catalog_init.c cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_srcdir)/src/common/cluster_catalog_init.c $(top_srcdir)/src/common/file_perm.c \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@

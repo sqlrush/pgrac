@@ -169,4 +169,8 @@ extern void cluster_control_bootstrap_prepare(const char *pgdata, const char *sh
 extern void cluster_control_bootstrap_wal_recheck(const char *pgdata,
 												  ClusterWalSourceRef *out);
 
+/* Register only the same postmaster's qualified early observation with the
+ * read-only catalog consumer. No migration, input creation or serving grant. */
+extern void cluster_control_bootstrap_catalog_prepare(const char *pgdata);
+
 #endif /* CLUSTER_CONTROL_BOOTSTRAP_PRIVATE_H */
