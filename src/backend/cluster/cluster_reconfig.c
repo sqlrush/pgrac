@@ -9472,6 +9472,7 @@ cluster_reconfig_cold_formation_tick(void)
 		return;
 	/* The existing majority reader owns disk I/O. Never hold Reconfig over it. */
 	if (cluster_shared_config && !cold_formation_state.admission_done
+		&& ReconfigShmem->startup_formation.formation_generation == 0 && cluster_qvotec_in_quorum()
 		&& cluster_write_fence_read_durable_authority(&proof) == CLUSTER_FENCE_AUTHORITY_OK)
 		current = &proof;
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
