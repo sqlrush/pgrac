@@ -10,12 +10,15 @@ typedef struct PgracInitdbWalObservation
 {
 	XLogRecPtr checkpoint_start;
 	XLogRecPtr checkpoint_end;
+	uint64 checkpoint_scn;
 	pg_crc32c checkpoint_crc;
 } PgracInitdbWalObservation;
 
 /* The original creator holds the new WAL directory and has synced its files.
  * Decode exactly control's shutdown record, never search forward or accept an
- * incomplete tail.  This is physical evidence, not an owner/close/ROOT grant.
+ * incomplete tail. SCN comes from that record's CRC-protected header, including
+ * a true zero when this creator never allocated shared-base versions.
+ * This is physical evidence, not an owner/close/ROOT grant.
  * Caller still rechecks directory/control identity before publishing anything.
  * No writes, no ownership of directory_fd. Refusal clears a distinct out. */
 extern bool pgrac_initdb_wal_observe(int directory_fd, const ControlFileData *control,

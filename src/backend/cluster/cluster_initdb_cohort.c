@@ -292,6 +292,7 @@ control_read(InitdbOrigin *origin, uint16 thread, uint64 system_identifier, bool
 		|| (!first && (memcmp(&control, &origin->control, sizeof(control)) != 0
 			|| observed.checkpoint_start != origin->checkpoint.checkpoint_start
 			|| observed.checkpoint_end != origin->checkpoint.checkpoint_end
+			|| observed.checkpoint_scn != origin->checkpoint.checkpoint_scn
 			|| observed.checkpoint_crc != origin->checkpoint.checkpoint_crc)))
 		refuse("native shutdown checkpoint differs from its original completed child");
 	origin->control = control;

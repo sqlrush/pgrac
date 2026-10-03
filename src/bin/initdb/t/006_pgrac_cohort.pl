@@ -63,6 +63,7 @@ like($out, qr/shared startup authority is not published/,
 	'preparation does not claim shared startup or OPEN');
 ok(!-e "$temp/valid-data/global/pgrac_control_root", 'no premature ROOT');
 my %generations;
+my $founder_scn;
 for my $node (0 .. 3)
 {
 	my $data = "$temp/valid-caches/node_$node";
@@ -77,8 +78,21 @@ for my $node (0 .. 3)
 	like($ctl, qr/Database system identifier:\s+$sysid\b/, 'common native system identity');
 	like($ctl, qr/Database cluster state:\s+shut down/, 'actual native child exited');
 	my ($checkpoint) = $ctl =~ /Latest checkpoint location:\s+([0-9A-F]+\/[0-9A-F]+)/;
-	command_like(['pg_waldump', '-p', $wal, '-s', $checkpoint, '-n', '1'],
-		qr/CHECKPOINT_SHUTDOWN/, 'actual final checkpoint decodes');
+	my $record;
+	ok(IPC::Run::run(['pg_waldump', '-p', $wal, '-s', $checkpoint, '-n', '1'],
+		'>', \$record, '2>', \$stderr), 'actual final checkpoint decodes') or diag $stderr;
+	like($record, qr/CHECKPOINT_SHUTDOWN/, 'record is the actual final shutdown checkpoint');
+	my ($scn) = $record =~ /scn: ([0-9]+),/;
+	if ($node == 0)
+	{
+		$founder_scn = $scn;
+		ok(defined($scn) && $scn > 0 && $scn < 2**56,
+			'founder checkpoint retains its real shared-base SCN');
+	}
+	else
+	{
+		is($scn, 0, 'peer without shared-base allocation retains a true zero SCN');
+	}
 	my ($pages, $wrong) = (0, 0);
 	for my $file (grep { /\/[0-9A-F]{24}$/ } glob("$wal/*"))
 	{
@@ -128,6 +142,23 @@ for my $node (0 .. 3)
 	}
 }
 is(scalar keys %generations, 4, 'four independent writer directories');
+my ($versioned, $beyond_checkpoint) = (0, 0);
+for my $dir ("$temp/valid-data/global", grep { -d $_ } glob("$temp/valid-data/base/*"))
+{
+	for my $file (grep { /\/[1-9][0-9]*(?:_(?:vm|space))?(?:\.[1-9][0-9]*)?$/ } glob("$dir/*"))
+	{
+		open my $fh, '<:raw', $file or die "open shared DATA: $!";
+		while (read($fh, my $page, 8192) == 8192)
+		{
+			my $scn = unpack('Q', substr($page, 24, 8));
+			$versioned++ if $scn > 0;
+			$beyond_checkpoint++ if !defined($founder_scn) || $scn > $founder_scn;
+		}
+		close $fh or die "close shared DATA: $!";
+	}
+}
+ok($versioned > 1000, 'SCN bound covers a real shared DATA/SPACE corpus');
+is($beyond_checkpoint, 0, 'final native checkpoint bounds every created page SCN');
 my @controls = glob("$temp/valid-data/global/control_images/1-*.bin");
 is(scalar @controls, 1, 'cohort has one immutable common control image');
 my @catalogs = glob("$temp/valid-data/global/catalog_checkpoints/1-*.json");

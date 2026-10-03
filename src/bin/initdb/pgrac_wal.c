@@ -174,6 +174,7 @@ pgrac_initdb_wal_observe(int directory_fd, const ControlFileData *control,
 	{
 		observed.checkpoint_start = reader->ReadRecPtr;
 		observed.checkpoint_end = reader->EndRecPtr;
+		observed.checkpoint_scn = XLogRecGetScn(reader);
 		observed.checkpoint_crc = record->xl_crc;
 		valid = true;
 	}
