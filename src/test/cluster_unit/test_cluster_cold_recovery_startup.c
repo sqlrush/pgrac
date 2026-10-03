@@ -406,6 +406,22 @@ UT_TEST(test_prepare_refuses_unsealed_own_generation)
 	typed = prepare(0x800);
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
 	cluster_cold_typed_destroy_v1(&typed);
+
+	/* The root found for this node is a valid claim of another thread. */
+	fixture();
+	{
+		ClusterWalThreadClaim claim;
+
+		roots[1].identity.origin_thread_id = 2;
+		roots[1].identity.origin_node_id = 1;
+		cluster_wal_thread_claim_fill(&claim, 2, 1, 42);
+		roots[1].identity.thread_claim_crc32c = claim.crc;
+	}
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
+	UT_ASSERT(strstr(typed->refusal_detail, "own thread 1 root") != NULL);
+	UT_ASSERT_NULL(typed->plan);
+	cluster_cold_typed_destroy_v1(&typed);
 }
 
 UT_TEST(test_prepare_refuses_restart_redo_mismatch)
@@ -492,6 +508,8 @@ UT_TEST(test_redo_block_decisions)
 	UT_ASSERT_EQ(out.expected_kind, CLUSTER_COLD_DATA_INVALID);
 	UT_ASSERT(cluster_cold_redo_block_decision_v1(&reader, 1, &out));
 	UT_ASSERT_EQ(out.action, CLUSTER_COLD_REDO_APPLY);
+	/* the consumer must check the exact before-state, not accept anything */
+	UT_ASSERT_EQ(out.expected_kind, CLUSTER_COLD_DATA_PRESENT);
 	UT_ASSERT_EQ(out.expected_before.mutation_token, 5);
 	UT_ASSERT_EQ(out.result.mutation_token, 6);
 	UT_ASSERT(cluster_cold_redo_block_decision_v1(&reader, 2, &out));
@@ -568,6 +586,16 @@ UT_TEST(test_ready_requires_every_consumer_before_ir)
 	UT_ASSERT(cluster_cold_typed_ready_v1(typed, &all, reason, sizeof(reason)));
 	UT_ASSERT(!cluster_cold_typed_ready_v1(NULL, &all, reason, sizeof(reason)));
 	cluster_cold_typed_destroy_v1(&typed);
+
+	/* A plan whose seal was refused keeps its (failed) plan: never ready. */
+	fixture();
+	data_token = 3;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_ANCESTOR_MISSING);
+	UT_ASSERT_NOT_NULL(typed->plan);
+	UT_ASSERT(!cluster_cold_typed_ready_v1(typed, &all, reason, sizeof(reason)));
+	UT_ASSERT(strstr(reason, "no sealed typed cold plan") != NULL);
+	cluster_cold_typed_destroy_v1(&typed);
 }
 
 /*
@@ -612,6 +640,20 @@ UT_TEST(test_space_effects_checked_and_need_the_space_owner)
 	typed = prepare(0x800);
 	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
 	UT_ASSERT(strstr(typed->refusal_detail, "database incarnation") != NULL);
+	cluster_cold_typed_destroy_v1(&typed);
+
+	/* Nor do generations of another cluster or another storage. */
+	fixture();
+	roots[3].identity.system_identifier = 8;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
+	UT_ASSERT(strstr(typed->refusal_detail, "thread 3 claims system 8") != NULL);
+	cluster_cold_typed_destroy_v1(&typed);
+	fixture();
+	roots[2].identity.storage_uuid[15] = 2;
+	typed = prepare(0x800);
+	UT_ASSERT_EQ(typed->refusal, CLUSTER_COLD_PARTICIPANT_INVALID);
+	UT_ASSERT(strstr(typed->refusal_detail, "another storage uuid") != NULL);
 	cluster_cold_typed_destroy_v1(&typed);
 	scan_space = false;
 }

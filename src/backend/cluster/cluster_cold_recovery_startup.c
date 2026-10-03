@@ -238,18 +238,23 @@ cold_space_namespace(ClusterColdTypedV1 *typed)
 
 	for (i = 0; i < typed->participant_count; i++) {
 		const ClusterWalSourceRef *source = &typed->sources[i];
+		bool other_storage
+			= memcmp(source->claim.identity.storage_uuid, own->claim.identity.storage_uuid, 16)
+			  != 0;
 
 		if (source->claim.database_incarnation != own->claim.database_incarnation
 			|| source->claim.identity.system_identifier != own->claim.identity.system_identifier
-			|| memcmp(source->claim.identity.storage_uuid, own->claim.identity.storage_uuid, 16)
-				   != 0) {
-			cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
-						"thread %u claims database incarnation " UINT64_FORMAT
-						", thread %u " UINT64_FORMAT "; generations share no namespace",
-						(unsigned)typed->participants[i].thread_id,
-						source->claim.database_incarnation,
-						(unsigned)typed->participants[typed->own_participant].thread_id,
-						own->claim.database_incarnation);
+			|| other_storage) {
+			cold_refuse(
+				typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+				"thread %u claims system " UINT64_FORMAT ", database incarnation " UINT64_FORMAT
+				"%s; thread %u claims system " UINT64_FORMAT ", database incarnation " UINT64_FORMAT
+				"; generations share no namespace",
+				(unsigned)typed->participants[i].thread_id,
+				source->claim.identity.system_identifier, source->claim.database_incarnation,
+				other_storage ? ", another storage uuid" : "",
+				(unsigned)typed->participants[typed->own_participant].thread_id,
+				own->claim.identity.system_identifier, own->claim.database_incarnation);
 			return false;
 		}
 	}
