@@ -856,6 +856,8 @@ bool cluster_write_fence_allowed(void) { return !test_terminal_fenced; }
 bool cluster_reconfig_has_pending_prebump_stage(void) { return test_terminal_prebump; }
 bool cluster_reconfig_join_in_progress(void) { return test_terminal_join; }
 bool cluster_normal_stop_requested(void) { return test_terminal_stop; }
+static bool test_clean_admitted = true;
+
 bool
 cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread, ClusterFormationSnapshotV1 *out)
 {
@@ -864,9 +866,10 @@ cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread, ClusterForm
 		return false;
 	out->startup_formation_generation = test_serving_formation;
 	out->local_epoch = test_current_epoch;
-	out->self_join_admitted = 1;
+	out->self_join_admitted = test_clean_admitted ? 1 : 0;
 	for (int node = 0; node < 4; node++) {
-		out->membership.membership_state[node] = CLUSTER_MEMBER_MEMBER;
+		out->membership.membership_state[node] = (test_membership_snapshot_lo & (UINT64_C(1) << node))
+			? CLUSTER_MEMBER_MEMBER : CLUSTER_MEMBER_ABSENT;
 		out->membership.last_admitted_incarnation[node] = cluster_membership_get_last_admitted_incarnation(node);
 	}
 	return true;
@@ -11352,7 +11355,7 @@ static void test_serving_finish_root(void);
 int
 main(void)
 {
-	UT_PLAN(377);
+	UT_PLAN(378);
 	UT_RUN(test_barrier_waits_for_both_late_peer_samples_in_either_order);
 	UT_RUN(test_staged_sample_ack_survives_idle_authority_gap);
 	UT_RUN(test_sample_ack_waits_for_local_gate_epoch);
@@ -11661,6 +11664,7 @@ main(void)
 	UT_RUN(test_clean_formation_early_late_duplicate_ack_keeps_exact_round);
 	UT_RUN(test_clean_formation_binding_ack_cannot_be_reused_for_another_root);
 	UT_RUN(test_clean_formation_first_request_survives_membership_observation_gap);
+	UT_RUN(test_clean_formation_preinstall_input_does_not_borrow_final_admission);
 	UT_RUN(test_clean_formation_stop_terminal_receipt_is_not_partial_open);
 
 	UT_RUN(test_normal_census_full_owner_namespace_retains_terminal_history);

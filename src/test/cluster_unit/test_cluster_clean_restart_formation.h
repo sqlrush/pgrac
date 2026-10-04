@@ -177,9 +177,9 @@ UT_TEST(test_clean_formation_bridge_contradictions_fail_before_loading)
 			case 5: memset(test_clean_input.predecessor_root_sha256, 0, 32); break;
 			case 6: test_clean_input.successor.config_generation++; break;
 			case 7: test_clean_input.operation_generation = 0; break;
-			case 8: test_initial_clean_snapshot.members_lo = 7; break;
-			case 9: test_initial_clean_snapshot.formation_marker_generation = 0; break;
-			case 10: test_initial_clean_snapshot.admitted_incarnation[cluster_node_id]++; break;
+			case 8: test_membership_snapshot_lo = 7; break;
+			case 9: test_serving_formation = 0; break;
+			case 10: test_last_admitted_incarnation++; break;
 			case 11: test_clean_input.predecessor.origin_owner_incarnation = test_qvotec_self_incarnation; break;
 		}
 		UT_ASSERT(!cluster_semantic_normal_start_prepare(true, 0, &failure));
@@ -205,7 +205,7 @@ UT_TEST(test_clean_formation_actual_loader_requires_exact_installed_claim)
 			case 2: test_first_writer.claim.claim_sha256[0] ^= 1; break;
 			case 3: test_first_writer_epoch++; break;
 			case 4: test_first_writer.timeline++; break;
-			case 5: test_initial_clean_snapshot.admitted_incarnation[2]++; break;
+			case 5: test_remote_admitted_incarnations[2]++; break;
 		}
 		UT_ASSERT_EQ(cluster_semantic_normal_start_finish(&failure), fault == -1);
 		UT_ASSERT_EQ(cluster_semantic_normal_start_state(), fault == -1
@@ -443,5 +443,38 @@ UT_TEST(test_clean_formation_stop_terminal_receipt_is_not_partial_open)
 		!= CLUSTER_NORMAL_STOP_READY);
 	UT_ASSERT_EQ(epoch, 0);
 	test_terminal_peer_record_enabled = test_terminal_peer_eligible = false;
+	ut_cold_cleanup();
+}
+
+UT_TEST(test_clean_formation_preinstall_input_does_not_borrow_final_admission)
+{
+	const char *failure;
+	ut_cold_setup(2);
+	test_clean_formation_bind();
+	ut_cold_file(255, TT_SLOT_ABORTED);
+	/* Real native ordering: accepted complete PGFM precedes INSTALL; the
+	 * final join/stripe admission is still closed at this original call. */
+	test_clean_admitted = false;
+	test_initial_clean_snapshot_valid = false;
+	UT_ASSERT(cluster_semantic_normal_start_prepare(true, 0, &failure));
+	UT_ASSERT_EQ(cluster_semantic_normal_start_state(), CLUSTER_NORMAL_START_TARGET_LOADING);
+	test_clean_install();
+	UT_ASSERT(cluster_semantic_normal_start_finish(&failure));
+	MyAuxProcType = LmonProcess;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(semantic_activation_restart.read_seq, 0);
+	UT_ASSERT(!semantic_activation_restart.opened);
+	UT_ASSERT_EQ(SemanticActivationAckTable->observed_members_lo, 0);
+	test_clean_admitted = true;
+	cluster_semantic_activation_lmon_tick();
+	(void)ut_a142_complete_open_read(0);
+	ut_a142_frame(0, false, 23, 0);
+	if (!semantic_activation_restart.have_open) {
+		cluster_semantic_activation_lmon_tick();
+		(void)ut_a142_complete_open_read(0);
+	}
+	UT_ASSERT(semantic_activation_restart.have_open);
+	ut_a142_local_root(false);
+	test_clean_round_finish(23);
 	ut_cold_cleanup();
 }

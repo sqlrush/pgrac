@@ -12594,12 +12594,63 @@ normal_start_binding(const ClusterNormalStartCompletion *image, uint8 out[32])
 	return normal_start_sha256(bytes, sizeof(bytes), out);
 }
 
+/* The accepted full startup formation precedes native INSTALL and final
+ * local stripe admission. Reading it creates neither writer nor service
+ * authority. LMON must additionally require the latter admission for ACK. */
+static bool
+normal_start_capture_clean_formation(ClusterInitialCleanFormationSnapshot *out,
+	bool require_admitted)
+{
+	ClusterFormationSnapshotV1 formation, after;
+	ClusterInitialCleanFormationSnapshot image = { 0 };
+
+	memset(out, 0, sizeof(*out));
+	if (cluster_node_id < 0 || cluster_node_id >= 4 || !cluster_qvotec_in_quorum()
+		|| !cluster_write_fence_allowed()
+		|| !cluster_reconfig_capture_formation_snapshot_v1(cluster_node_id + 1, &formation)
+		|| formation.local_epoch == 0 || formation.local_epoch == UINT64_MAX
+		|| formation.local_epoch != cluster_epoch_get_current()
+		|| formation.startup_formation_generation == 0
+		|| formation.startup_formation_generation == UINT64_MAX
+		|| formation.self_join_admitted > 1 || (require_admitted && !formation.self_join_admitted)
+		|| formation.self_join_failed || formation.prebump_sync_active
+		|| formation.applied.event_id != 0 || formation.applied.reconfig_kind != RECONFIG_KIND_NONE
+		|| !semantic_activation_bytes_are_zero(formation.reserved, sizeof(formation.reserved))
+		|| !semantic_activation_bytes_are_zero(formation.pending_join_bitmap, sizeof(formation.pending_join_bitmap))
+		|| !semantic_activation_bytes_are_zero(formation.excluded_bitmap, sizeof(formation.excluded_bitmap))
+		|| !semantic_activation_bytes_are_zero(formation.clean_departed_bitmap, sizeof(formation.clean_departed_bitmap))
+		|| !semantic_activation_bytes_are_zero(formation.removed_bitmap, sizeof(formation.removed_bitmap)))
+		return false;
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; node++) {
+		if ((node < 4) != (formation.membership.membership_state[node] == CLUSTER_MEMBER_MEMBER))
+			return false;
+		if (node < 4) {
+			image.admitted_incarnation[node] = formation.membership.last_admitted_incarnation[node];
+			if (image.admitted_incarnation[node] == 0 || image.admitted_incarnation[node] == UINT64_MAX)
+				return false;
+		}
+	}
+	if (image.admitted_incarnation[cluster_node_id] != cluster_qvotec_get_self_incarnation()
+		|| !cluster_reconfig_capture_formation_snapshot_v1(cluster_node_id + 1, &after)
+		|| memcmp(&formation, &after, sizeof(formation)) != 0
+		|| formation.local_epoch != cluster_epoch_get_current() || !cluster_qvotec_in_quorum()
+		|| !cluster_write_fence_allowed())
+		return false;
+	image.members_lo = 15;
+	image.formation_epoch = formation.local_epoch;
+	image.formation_marker_generation = formation.startup_formation_generation;
+	image.arbiter_node = 0;
+	image.arbiter_incarnation = image.admitted_incarnation[0];
+	*out = image;
+	return true;
+}
+
 static bool
 normal_start_clean_formation_current(const ClusterNormalStartCompletion *image)
 {
 	ClusterInitialCleanFormationSnapshot current;
 	return image->epoch != 0 && image->epoch != UINT64_MAX
-		&& cluster_reconfig_snapshot_initial_clean_formation(&current)
+		&& normal_start_capture_clean_formation(&current, !AmStartupProcess())
 		&& current.formation_epoch == image->epoch
 		&& current.formation_marker_generation != 0
 		&& current.formation_marker_generation != UINT64_MAX
@@ -12776,7 +12827,7 @@ cluster_semantic_normal_start_prepare(bool clean, int prepared_count, const char
 					(unsigned long long)image.epoch, (int)result)));
 			return normal_start_prepare_failed(failure, "NORMAL_START_CLEAN_INPUT_READ_UNPROVEN");
 		}
-		if (!cluster_reconfig_snapshot_initial_clean_formation(&image.clean_formation))
+		if (!normal_start_capture_clean_formation(&image.clean_formation, false))
 			return normal_start_prepare_failed(failure, "NORMAL_START_CLEAN_FORMATION_UNPROVEN");
 		if (!normal_start_clean_input_valid(&image, &record))
 			return normal_start_prepare_failed(failure, "NORMAL_START_CLEAN_BRIDGE_UNPROVEN");
@@ -13229,7 +13280,8 @@ semantic_activation_restart_current(void)
 		   && cluster_grd_recovery_state_value() == GRD_RECOVERY_IDLE
 		   && semantic_activation_snapshot(&gate) && gate.transition_closed && gate.active_bits == 0
 		   && gate.record_generation == 0 && gate.formation_epoch == cluster_epoch_get_current()
-		   && cluster_reconfig_snapshot_initial_clean_formation(&clean)
+		   && (cluster_shared_config ? normal_start_capture_clean_formation(&clean, true)
+			: cluster_reconfig_snapshot_initial_clean_formation(&clean))
 		   && (cluster_shared_config ? clean.formation_marker_generation != 0
 									 : clean.formation_marker_generation == 0)
 		   && clean.formation_epoch == gate.formation_epoch && clean.members_lo == UINT64_C(15)
