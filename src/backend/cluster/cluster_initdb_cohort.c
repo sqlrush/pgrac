@@ -518,7 +518,7 @@ static void
 create_origin_objects(const InitdbDirectory *shared, InitdbOrigin *origins,
 					  const ClusterSharedConfigRef *config, uint64 incarnation)
 {
-	InitdbDirectory global = {0}, images;
+	InitdbDirectory global = {0}, images, histories;
 	char name[64];
 	struct stat st;
 
@@ -544,9 +544,13 @@ create_origin_objects(const InitdbDirectory *shared, InitdbOrigin *origins,
 		refuse("original global directory is invalid");
 	directory_current(&global);
 	create_child(&global, "anchor_images", &images);
+	/* INSTALL retains the founder input. Runtime history writers deliberately
+	 * do not create directories; the original creator owns this empty namespace
+	 * before its complete DATA tree is bound into the creation lineage. */
+	create_child(&global, "wal_history", &histories);
 	for (int node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++)
 	{
-		InitdbDirectory thread, generation, staging;
+		InitdbDirectory thread, generation, staging, history_thread, history_staging;
 		InitdbOrigin *origin = &origins[node];
 		if (!(config->identity.configured[node / 64] & (UINT64CONST(1) << (node % 64)))) continue;
 		snprintf(name, sizeof(name), "thread_%d", node + 1);
@@ -564,11 +568,21 @@ create_origin_objects(const InitdbDirectory *shared, InitdbOrigin *origins,
 		if (fsync(staging.fd) != 0 || fsync(generation.fd) != 0 || fsync(thread.fd) != 0
 			|| close(staging.fd) != 0 || close(generation.fd) != 0 || close(thread.fd) != 0)
 			refuse("cannot persist original anchor directories");
+		snprintf(name, sizeof(name), "thread_%d", node + 1);
+		create_child(&histories, name, &history_thread);
+		create_child(&history_thread, ".staging", &history_staging);
+		directory_current(&history_staging);
+		directory_current(&history_thread);
+		if (fsync(history_staging.fd) != 0 || fsync(history_thread.fd) != 0
+			|| close(history_staging.fd) != 0 || close(history_thread.fd) != 0)
+			refuse("cannot persist original history directories");
 	}
 	directory_current(&images);
+	directory_current(&histories);
 	directory_current(&global);
-	if (fsync(images.fd) != 0 || fsync(global.fd) != 0 || close(images.fd) != 0 || close(global.fd) != 0)
-		refuse("cannot complete original anchor namespace");
+	if (fsync(images.fd) != 0 || fsync(histories.fd) != 0 || fsync(global.fd) != 0
+		|| close(images.fd) != 0 || close(histories.fd) != 0 || close(global.fd) != 0)
+		refuse("cannot complete original anchor and history namespaces");
 }
 
 static void
