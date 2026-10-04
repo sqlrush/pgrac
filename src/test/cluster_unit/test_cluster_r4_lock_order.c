@@ -85,6 +85,7 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 #undef snprintf
 
 #include "unit_test.h"
+#include "cluster_snapshot_test_stubs.h"
 
 UT_DEFINE_GLOBALS();
 
@@ -7260,6 +7261,7 @@ main(void)
 	UT_RUN(test_lock_only_writer_routes_to_unlocked_exact_owner);
 	UT_RUN(test_successor_wait_canonicalizes_and_rejects_unproved_wakes);
 	UT_RUN(test_successor_perpetual_wait_reaches_exact_target_and_preserves_mode);
+	UT_ASSERT(ut_snapshot_scope == NULL);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

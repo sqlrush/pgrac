@@ -406,6 +406,7 @@ main(void)
 	UT_RUN(nonnormal_creator_does_not_authorize_native_status);
 	UT_RUN(original_master_switch_and_local_snapshot_stay_dormant);
 	UT_RUN(real_cleanout_positive_control_does_mutate_exact_creator);
+	UT_ASSERT(ut_snapshot_scope == NULL);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

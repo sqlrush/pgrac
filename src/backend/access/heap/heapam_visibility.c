@@ -2163,8 +2163,8 @@ cluster_heap_r4_trace_format(const ClusterR4ScratchTrace *trace, char *out, Size
  * HeapTupleSatisfiesMVCC(), CR, cleanout, hints, or SSI; the existing origin
  * service still owns its transaction-table/CLOG cross-checks.
  */
-bool
-HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
+static bool
+HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 							  const ClusterR4HotScratchTestContext *context)
 {
 #ifdef USE_PGRAC_CLUSTER
@@ -2354,6 +2354,31 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 #endif
 }
 
+/* Keep the actual evaluator separate from the ActiveSnapshot stack. */
+bool
+HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
+							  const ClusterR4HotScratchTestContext *context)
+{
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSnapshotReadScopeV1 scope;
+	bool result;
+
+	cluster_snapshot_read_enter_v1(&scope, snapshot);
+	PG_TRY();
+	{
+		result = HeapTupleSatisfiesMVCCScratchInternal(htup, snapshot, context);
+	}
+	PG_FINALLY();
+	{
+		cluster_snapshot_read_exit_v1(&scope);
+	}
+	PG_END_TRY();
+	return result;
+#else
+	return HeapTupleSatisfiesMVCCScratchInternal(htup, snapshot, context);
+#endif
+}
+
 /*
  * HeapTupleSatisfiesMVCC
  *		True iff heap tuple is valid for the given MVCC snapshot.
@@ -2377,7 +2402,7 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
  * and more contention on ProcArrayLock.
  */
 static bool
-HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
+HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 {
 	HeapTupleHeader tuple = htup->t_data;
 
@@ -3106,6 +3131,31 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	return false;
 }
 
+
+static bool
+HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (snapshot->cluster_source == SNAPSHOT_SOURCE_CLUSTER)
+	{
+		ClusterSnapshotReadScopeV1 scope;
+		bool result;
+
+		cluster_snapshot_read_enter_v1(&scope, snapshot);
+		PG_TRY();
+		{
+			result = HeapTupleSatisfiesMVCCInternal(htup, snapshot, buffer);
+		}
+		PG_FINALLY();
+		{
+			cluster_snapshot_read_exit_v1(&scope);
+		}
+		PG_END_TRY();
+		return result;
+	}
+#endif
+	return HeapTupleSatisfiesMVCCInternal(htup, snapshot, buffer);
+}
 
 #ifdef USE_CLUSTER_UNIT
 bool
