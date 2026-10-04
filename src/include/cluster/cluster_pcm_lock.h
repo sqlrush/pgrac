@@ -1794,17 +1794,25 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_round_note_x_t
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_block_to_n_exact(const ResourceXDecodedFrame *block,
 											 int32 authenticated_master_node);
+/* holder_first (D S09 R-A22): the X source's owned reference to the first own
+ * record since the page was clean, sampled with its copy (zero = none), or
+ * NULL when this call did not copy again (replay).  A new PENDING pair takes
+ * it (zeroing the caller's); otherwise the caller still owns it.  It is a
+ * process-local argument, never part of a frame or the wire. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_source_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
-	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope);
+	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope,
+	struct ClusterPageWalRefV1 *holder_first);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
 	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope,
-	const struct ClusterPcmOwnSnapshot *revoking, const ResourceXLocalOwnerHandle *owner);
+	const struct ClusterPcmOwnSnapshot *revoking, const ResourceXLocalOwnerHandle *owner,
+	struct ClusterPageWalRefV1 *holder_first);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
 	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope,
-	const struct ClusterPcmOwnSnapshot *revoking, const ResourceXLocalOwnerHandle *owner);
+	const struct ClusterPcmOwnSnapshot *revoking, const ResourceXLocalOwnerHandle *owner,
+	struct ClusterPageWalRefV1 *holder_first);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
 	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope,

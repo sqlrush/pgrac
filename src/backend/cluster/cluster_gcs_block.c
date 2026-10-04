@@ -1658,7 +1658,7 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
 					tag, out_page_lsn, (char *)scratch, out_sf_dep_vec);
 			else
 				copied = cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, (char *)scratch,
-														   out_copy_refusal, NULL);
+														   out_copy_refusal, NULL, NULL);
 			if (!copied) {
 				if (smart_fusion_reply && out_copy_refusal != NULL)
 					*out_copy_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_SMART_FUSION_UNCLASSIFIED;
@@ -1693,7 +1693,7 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
 			*out_sf_dep_valid = true;
 		gcs_block_note_scratch_copy();
 	} else if (!cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, copy_buf, out_copy_refusal,
-												  NULL))
+												  NULL, NULL))
 		return false;
 	else
 		gcs_block_note_scratch_copy();
@@ -10145,6 +10145,9 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 {
 	PGAlignedBlock aligned_page;
 	ClusterPageWalBindingV1 page_wal = { 0 };
+	/* D S09 R-A22: owned first own record since the page was clean; moved
+	 * into the PENDING pair or released on every non-error exit. */
+	ClusterPageWalRefV1 page_first = { 0 };
 	BufferDesc *buf;
 	ClusterPcmOwnHeldXRevoke held_x_revoke;
 	ClusterPcmOwnResult own_result;
@@ -10578,7 +10581,8 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 		failure_stage = "source-copy";
 		if (!shared_s_source
 			&& !cluster_bufmgr_copy_block_for_gcs(block->common.logical_assertion.resource,
-												  &page_lsn, aligned_page.data, NULL, &page_wal)) {
+												  &page_lsn, aligned_page.data, NULL, &page_wal,
+												  &page_first)) {
 			failure_result = RESOURCE_X_APPLY_BAD_STATE;
 			goto pre_retained_failure;
 		}
@@ -10594,6 +10598,7 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 		}
 	}
 	failure_stage = "retained-pair-apply";
+	/* A replay that did not copy again has no new sample (NULL first). */
 	if (shared_s_source && semantic_retained && !finish_required)
 		result = RESOURCE_X_APPLY_DUPLICATE;
 	else if (shared_s_source)
@@ -10602,13 +10607,18 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 			image.body.image_envelope.page_checksum);
 	else if (tagless_target_x && target_x_drop)
 		result = cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
-			block, authenticated_master_node, &status, &image, &revoking, &target_revoke_owner);
+			block, authenticated_master_node, &status, &image, &revoking, &target_revoke_owner,
+			semantic_retained ? NULL : &page_first);
 	else if (tagless_target_x && target_x_retain)
 		result = cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(
-			block, authenticated_master_node, &status, &image, &revoking, &target_revoke_owner);
+			block, authenticated_master_node, &status, &image, &revoking, &target_revoke_owner,
+			semantic_retained ? NULL : &page_first);
 	else
 		result = cluster_pcm_lock_resource_x_block_to_n_source_exact(
-			block, authenticated_master_node, &status, &image);
+			block, authenticated_master_node, &status, &image,
+			semantic_retained ? NULL : &page_first);
+	/* Moved into the PENDING pair (zeroed) or still ours. */
+	(void)cluster_page_wal_ref_release_v1(&page_first);
 	if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE) {
 		if (semantic_retained && carrier_superseded && result == RESOURCE_X_APPLY_STALE) {
 			pair_result = cluster_pcm_lock_resource_x_holder_pair_supersedes_exact(
@@ -10647,6 +10657,7 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 		tagless_target_x, target_x_drop, result);
 
 pre_retained_failure:
+	(void)cluster_page_wal_ref_release_v1(&page_first);
 	ereport(LOG,
 			(errmsg_internal("Resource-X type-17 holder diagnostic"),
 			 errdetail(

@@ -119,17 +119,35 @@ static bool transition_pi_first_present;
 static unsigned transition_first_handovers, transition_first_clears;
 static uint64 transition_first_clear_token;
 
+static bool transition_first_drifts;	   /* each observation sees a new record */
+static bool transition_flush_clears_first; /* the write's clean finish clears it */
+
 ClusterPageWalFirstResultV1
 cluster_page_wal_first_observe_locked_v1(BufferDesc *buf, ClusterPageWalRefV1 *out)
 {
 	UT_ASSERT((pg_atomic_read_u32(&buf->state) & BM_LOCKED) != 0);
 	memset(out, 0, sizeof(*out));
 	if (transition_first_state == CLUSTER_PAGE_WAL_FIRST_PRESENT) {
+		if (transition_first_drifts) {
+			transition_first_binding.record_start += 8;
+			transition_first_binding.record_end += 8;
+		}
 		out->start = transition_first_binding.record_start;
 		out->token = transition_first_binding.version.mutation_token;
 		out->source_flags = 1;
 	}
 	return transition_first_state;
+}
+bool
+cluster_page_wal_ref_retain_v1(const ClusterPageWalBindingV1 *binding, ClusterPageWalRefV1 *out)
+{
+	UT_ASSERT(transition_content_held);
+	UT_ASSERT_EQ(binding->flags, CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
+	memset(out, 0, sizeof(*out));
+	out->start = binding->record_start;
+	out->token = binding->version.mutation_token;
+	out->source_flags = 1;
+	return true;
 }
 bool
 cluster_page_wal_ref_read_v1(const ClusterPageWalRefV1 *ref, RelFileLocator locator,
@@ -443,6 +461,8 @@ transition_flush(BufferDesc *buf)
 	if (!transition_flush_leaves_dirty)
 		pg_atomic_write_u32(&buf->state,
 							state & ~(BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED));
+	if (transition_flush_clears_first && !transition_flush_leaves_dirty)
+		transition_first_state = CLUSTER_PAGE_WAL_FIRST_ABSENT;
 }
 
 static void
@@ -2425,6 +2445,7 @@ transition_fixture(BufferDesc *buf, ClusterPcmOwnEntry *entry, ClusterPcmOwnSnap
 	transition_pi_first_present = false;
 	transition_first_handovers = transition_first_clears = 0;
 	transition_first_clear_token = 0;
+	transition_first_drifts = transition_flush_clears_first = false;
 	transition_wal_source_changes = 0;
 	transition_s_prepare = false;
 	transition_wal_publishes = 0;
@@ -3636,8 +3657,8 @@ UT_TEST(test_real_gcs_wal_recheck_yields_without_exporting_an_image)
 		memcpy(output.data, sentinel.data, BLCKSZ);
 		copied_lsn = UINT64_C(0xdead);
 		transition_wal_changes = 2;
-		UT_ASSERT(
-			!cluster_bufmgr_copy_block_for_gcs(buf.tag, &copied_lsn, output.data, &refusal, NULL));
+		UT_ASSERT(!cluster_bufmgr_copy_block_for_gcs(buf.tag, &copied_lsn, output.data, &refusal,
+													 NULL, NULL));
 		statuses[attempt] = GcsBlockMasterDirectCopyRefusalStatus(refusal);
 		UT_ASSERT_EQ(copied_lsn, UINT64_C(0xdead));
 		UT_ASSERT_EQ(memcmp(output.data, sentinel.data, BLCKSZ), 0);
@@ -3651,7 +3672,7 @@ UT_TEST(test_real_gcs_wal_recheck_yields_without_exporting_an_image)
 	cluster_shared_config = true;
 	transition_page_wal.record_start = 0x120;
 	UT_ASSERT(cluster_bufmgr_copy_block_for_gcs(buf.tag, &copied_lsn, output.data, &refusal,
-												&copied_wal));
+												&copied_wal, NULL));
 	UT_ASSERT(cluster_page_wal_same_mutation_v1(&copied_wal, &transition_page_wal));
 	UT_ASSERT_EQ(copied_wal.flags, CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
 	UT_ASSERT_EQ(transition_page_wal.flags, 0);
@@ -3670,6 +3691,65 @@ UT_TEST(test_real_gcs_wal_recheck_yields_without_exporting_an_image)
 	ClusterPcmOwnArray = saved;
 	for (attempt = 0; attempt < 3; attempt++)
 		UT_ASSERT_EQ(statuses[attempt], GCS_BLOCK_REPLY_DENIED_PENDING_X);
+}
+
+/* D S09 R-A22: the copy samples the first own record with its image: an
+ * owned, flushed reference when present; none when absent or when this
+ * attempt's own clean write covered it; a drifting or unattributable first
+ * record yields no image. */
+UT_TEST(test_r_a22_copy_samples_first_record_with_its_image)
+{
+	static const int expected_certifications[] = { 1, 2, 2, 4, 0 };
+
+	for (int variant = 0; variant < 5; variant++) {
+		BufferDesc buf;
+		ClusterPcmOwnEntry entry;
+		ClusterPcmOwnSnapshot ignored;
+		ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+		ClusterBufmgrGcsCopyRefusal refusal;
+		PGIOAlignedBlock output;
+		ClusterPageWalBindingV1 copied_wal;
+		ClusterPageWalRefV1 first;
+		XLogRecPtr copied_lsn = 0xdead;
+		bool copied;
+		bool ok = variant <= 2;
+
+		transition_fixture(&buf, &entry, &ignored, variant == 2);
+		transition_copy_active = true;
+		cluster_shared_config = true;
+		buf.pcm_state = PCM_STATE_X;
+		buf.buffer_type = BUF_TYPE_XCUR;
+		pg_atomic_write_u32(&entry.flags, 0);
+		transition_page_wal.record_start = 0x120;
+		transition_first_binding = transition_page_wal;
+		transition_first_binding.record_start = 0x100;
+		transition_first_binding.record_end = 0x110;
+		transition_first_state = variant == 0	? CLUSTER_PAGE_WAL_FIRST_ABSENT
+								 : variant == 4 ? CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED
+												: CLUSTER_PAGE_WAL_FIRST_PRESENT;
+		transition_flush_clears_first = variant == 2;
+		transition_first_drifts = variant == 3;
+		memset(&first, 0xa5, sizeof(first));
+		copied = cluster_bufmgr_copy_block_for_gcs(buf.tag, &copied_lsn, output.data, &refusal,
+												   &copied_wal, &first);
+		cluster_shared_config = false;
+		ClusterPcmOwnArray = saved;
+		UT_ASSERT_EQ(copied, ok);
+		UT_ASSERT_EQ(refusal, ok ? CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE
+								 : CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID);
+		UT_ASSERT_EQ(first.source_flags, variant == 1 ? 1 : 0);
+		if (variant == 1)
+			UT_ASSERT_EQ(first.start, 0x100);
+		UT_ASSERT_EQ(transition_flush_count, variant == 2);
+		/* Certifying flushes: the latest record, plus the first record when
+		 * present, in one attempt; the drifting first record spends both
+		 * attempts; the unattributable one is refused before any. */
+		UT_ASSERT_EQ(transition_wal_calls, expected_certifications[variant]);
+		UT_ASSERT_EQ(transition_pin_count, 0);
+		UT_ASSERT(!transition_content_held && !transition_mapping_held);
+		if (ut_current_failed)
+			printf("# copy first variant %d\n", variant);
+	}
 }
 
 UT_TEST(test_real_gcs_exact_source_recheck_and_error_cleanup)
@@ -3700,7 +3780,7 @@ UT_TEST(test_real_gcs_exact_source_recheck_and_error_cleanup)
 		PG_TRY();
 		{
 			copied = cluster_bufmgr_copy_block_for_gcs(buf.tag, &copied_lsn, output.data, &refusal,
-													   &copied_wal);
+													   &copied_wal, NULL);
 		}
 		PG_CATCH();
 		{
@@ -3805,8 +3885,8 @@ UT_TEST(test_real_gcs_wal_recheck_preserves_invalid_image_and_io_refusals)
 		memset(output.data, 0xa5, BLCKSZ);
 		PG_TRY();
 		{
-			copied
-				= cluster_bufmgr_copy_block_for_gcs(tag, &copied_lsn, output.data, &refusal, NULL);
+			copied = cluster_bufmgr_copy_block_for_gcs(tag, &copied_lsn, output.data, &refusal,
+													   NULL, NULL);
 		}
 		PG_CATCH();
 		{
@@ -8854,7 +8934,7 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(151);
+	UT_PLAN(152);
 	UT_RUN(test_shared_leave_releases_dirty_and_clean_x_through_exact_owner);
 	UT_RUN(test_shared_leave_write_and_sync_error_keep_x_and_mapping);
 	UT_RUN(test_shared_leave_waits_for_pin_and_revoke_without_skipping_x);
@@ -8998,6 +9078,7 @@ main(void)
 	UT_RUN(test_resource_x_preuse_drift_reprobes_only_current_valid_tuple);
 	UT_RUN(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only);
 	UT_RUN(test_real_gcs_wal_recheck_yields_without_exporting_an_image);
+	UT_RUN(test_r_a22_copy_samples_first_record_with_its_image);
 	UT_RUN(test_real_gcs_exact_source_recheck_and_error_cleanup);
 	UT_RUN(test_real_s_source_owns_wal_certification_cleanup);
 	UT_RUN(test_real_gcs_wal_recheck_preserves_invalid_image_and_io_refusals);

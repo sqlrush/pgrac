@@ -3771,9 +3771,13 @@ GcsBlockMasterDirectCopyRefusalStatus(ClusterBufmgrGcsCopyRefusal refusal)
 }
 
 extern const char *cluster_bufmgr_gcs_copy_refusal_name(ClusterBufmgrGcsCopyRefusal refusal);
+/* out_first (D S09 R-A22, NULL to skip): an owned reference to the flushed
+ * first own record since the page was clean, or zero; the caller moves or
+ * releases it. */
 extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
 											  ClusterBufmgrGcsCopyRefusal *out_refusal,
-											  ClusterPageWalBindingV1 *out_wal);
+											  ClusterPageWalBindingV1 *out_wal,
+											  ClusterPageWalRefV1 *out_first);
 extern bool cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag, SCN expected_page_scn,
 												XLogRecPtr *page_lsn_out, SCN *page_scn_out,
 												char *dst,
