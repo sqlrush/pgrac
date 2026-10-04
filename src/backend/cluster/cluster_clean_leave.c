@@ -137,6 +137,9 @@ typedef struct ClNormalStopFrontInbox {
 	ClusterLeaveAckPayload release_ack;
 } ClNormalStopFrontInbox;
 static ClNormalStopFrontInbox cl_normal_stop_front_inbox[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+/* An asynchronous identity read remains this LMON duty's work until its
+ * original CF release/completion is consumed, even if no new frame arrives. */
+static bool cl_normal_stop_front_read_pending;
 
 static void cl_normal_stop_fronts_lmon_tick(void);
 static void cl_normal_stop_post_lmon_tick(void);
@@ -1523,7 +1526,29 @@ cl_normal_stop_fronts_lmon_tick(void)
 	/* The checkpoint/STOPPED successor has its own WAL-state and nonce cut. */
 	if (phase >= CLUSTER_NORMAL_STOP_CHECKPOINT)
 		return;
+	if (cluster_shared_config) {
+		bool work;
+		uint32 peers;
+
+		/* Do not manufacture CF/GES debt while the controller is trying to
+		 * observe idle owners. Read only for an actual receive/send or the
+		 * initial binding; an existing read must still finish through its
+		 * owner. This skips no identity check for any transmitted evidence. */
+		LWLockAcquire(&cl_state->lock, LW_SHARED);
+		peers = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
+		work = inbox_work || pg_atomic_read_u32(&cl_normal_stop->identity_published) == 0
+			   || (phase == CLUSTER_NORMAL_STOP_WAIT_PEER_FRONTS && cluster_normal_stop_requested()
+				   && pg_atomic_read_u32(&cl_normal_stop->frontends_gone) == 1
+				   && cl_normal_stop->peer_request_sent != peers)
+			   || (phase == CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK
+				   && (cl_normal_stop->peer_reply_pending & ~cl_normal_stop->peer_reply_sent) != 0);
+		LWLockRelease(&cl_state->lock);
+		if (!work && !cl_normal_stop_front_read_pending)
+			return;
+	}
 	result = cl_normal_stop_identity_poll(false, &observed, NULL);
+	cl_normal_stop_front_read_pending
+		= cluster_shared_config && result == CLUSTER_NORMAL_STOP_PENDING;
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return;
 
@@ -3095,6 +3120,10 @@ cluster_clean_leave_service_poll(int *peer_out, const char **reason_out)
 		reason = "CLOSE_SERVICE_IDLE";
 	}
 	LWLockRelease(&cl_state->lock);
+	if (result == CLUSTER_NORMAL_STOP_READY && cl_normal_stop_front_read_pending) {
+		result = CLUSTER_NORMAL_STOP_PENDING;
+		reason = "CLOSE_SERVICE_IDENTITY_READ_PENDING";
+	}
 	if (result == CLUSTER_NORMAL_STOP_READY)
 		for (int peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; ++peer) {
 			const ClNormalStopFrontInbox *inbox = &cl_normal_stop_front_inbox[peer];
@@ -3126,6 +3155,11 @@ cluster_clean_leave_normal_stop_local_poll(int *peer_out, const char **reason_ou
 		|| !cluster_normal_stop_requested()
 		|| cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
 		return CLUSTER_NORMAL_STOP_INVALID;
+	if (cl_normal_stop_front_read_pending) {
+		if (reason_out != NULL)
+			*reason_out = "NORMAL_STOP_CONTROL_IDENTITY_READ_PENDING";
+		return CLUSTER_NORMAL_STOP_PENDING;
+	}
 	/* An early STOPPED successor is intentionally retained while this node
 	 * finishes CHECKPOINT. It is a control obligation, not a page producer;
 	 * the post-STOPPED tick must consume it before the final close cut. */
