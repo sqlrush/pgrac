@@ -1874,7 +1874,8 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 int
 main(void)
 {
-	UT_PLAN(40);
+	UT_PLAN(41);
+	UT_RUN(writeback_v2_structural_notice_requires_its_live_original_slot);
 	UT_RUN(writeback_v2_request_cut_checks_real_sender_and_recipient);
 	UT_RUN(writeback_v2_request_cut_refuses_missing_or_changed_proofs);
 	UT_RUN(writeback_v2_relation_offer_has_no_page_master_authority);

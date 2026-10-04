@@ -71,7 +71,11 @@ struct ClusterPiWritebackNoticeV1 {
 	ResourceOwner owner;
 	pid_t pid;
 	uint64 revision;
-	ClusterPiWritebackMessageV1 request;
+	uint32 version;
+	union {
+		ClusterPiWritebackMessageV1 request;
+		ClusterPiWritebackMessageV2 request_v2;
+	};
 	ClusterWalInputsV1 *inputs;
 	ClusterThreadRecoveryFabricPlanV1 *plan;
 };
@@ -1083,10 +1087,36 @@ cluster_pi_writeback_notice_read_v1(const ClusterPiWritebackNoticeV1 *notice, ui
 									ClusterPiDataFactV1 *out)
 {
 	if (notice == NULL || notice != wb_notice || out == NULL || notice->pid != getpid()
-		|| notice->owner != CurrentResourceOwner || MyBackendType != B_BG_WRITER || !wb_background()
-		|| index >= notice->request.count || !wb_current(&notice->request, false))
+		|| notice->version != 1 || notice->owner != CurrentResourceOwner
+		|| MyBackendType != B_BG_WRITER || !wb_background() || index >= notice->request.count
+		|| !wb_current(&notice->request, false))
 		return false;
 	*out = notice->request.facts[index];
+	return true;
+}
+
+bool
+cluster_pi_writeback_structural_notice_read_v2(const ClusterPiWritebackNoticeV1 *notice,
+											   uint32 index, uint64 *revision,
+											   ClusterPiWritebackFactV2 *out)
+{
+	bool live;
+	if (notice == NULL || notice != wb_notice || out == NULL || revision == NULL
+		|| wb_shared == NULL || notice->pid != getpid() || notice->owner != CurrentResourceOwner
+		|| MyBackendType != B_BG_WRITER || !wb_background() || notice->revision == 0
+		|| notice->revision == UINT64_MAX || notice->version != 2
+		|| index >= notice->request_v2.count
+		|| !cluster_pi_writeback_request_current_v2(&notice->request_v2, false)
+		|| notice->request_v2.facts[index].kind != CLUSTER_PI_WRITEBACK_STRUCTURAL_V2)
+		return false;
+	SpinLockAcquire(&wb_shared->lock);
+	live = wb_shared->inbound_state == WB_RUNNING && wb_shared->inbound_pid == MyProcPid
+		   && wb_shared->inbound_revision == notice->revision;
+	SpinLockRelease(&wb_shared->lock);
+	if (!live)
+		return false;
+	*revision = notice->revision;
+	*out = notice->request_v2.facts[index];
 	return true;
 }
 
@@ -1204,6 +1234,7 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 		notice->pid = getpid();
 		notice->owner = CurrentResourceOwner;
 		notice->revision = revision;
+		notice->version = 1;
 		notice->request = request;
 		SpinLockAcquire(&wb_shared->lock);
 		if (wb_shared->inbound_state == WB_QUEUED && wb_shared->inbound_pid == 0

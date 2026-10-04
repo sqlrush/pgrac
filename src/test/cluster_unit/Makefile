@@ -2210,7 +2210,8 @@ test_cluster_page_data_scn.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c 
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@
 
 test_cluster_page_data: test_cluster_page_data.c
-test_cluster_pi_writeback: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
+test_cluster_page_data test_cluster_pi_writeback: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
+test_cluster_page_data: $(CLUSTER_KO_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c \

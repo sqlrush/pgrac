@@ -137,6 +137,9 @@ static ClusterPageWalBindingV1 structural_terminal;
 static uint8 structural_wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 static ClusterPcmPiWriteCutV1 structural_write_cut;
 static ClusterPcmPiStorageCutV1 structural_storage_cut;
+static bool structural_notice_ready;
+static uint64 structural_notice_revision = 71;
+static ClusterPiWritebackFactV2 structural_notice_fact;
 
 bool
 cluster_ko_shared_structure_observation_v2(uint32 slot, uint64 serial,
@@ -205,6 +208,18 @@ cluster_pcm_lock_pi_storage_snapshot_v1(BufferTag tag, ClusterPcmPiStorageCutV1 
 #endif
 
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
+bool
+cluster_pi_writeback_structural_notice_read_v2(const ClusterPiWritebackNoticeV1 *notice,
+											   uint32 index, uint64 *revision,
+											   ClusterPiWritebackFactV2 *out)
+{
+	if (!structural_notice_ready || notice != (const void *)41 || index != 2)
+		return false;
+	*revision = structural_notice_revision;
+	*out = structural_notice_fact;
+	return true;
+}
+
 bool
 cluster_pi_writeback_notice_read_v1(const ClusterPiWritebackNoticeV1 *notice, uint32 index,
 									ClusterPiDataFactV1 *out)
@@ -3439,6 +3454,185 @@ prepare_structural_ack_inputs(const ClusterThreadRecoveryFabricPlanV1 *plan,
 }
 
 static void
+structural_remote_notice_uses_actual_plan_and_peer_physical_owner(void)
+{
+	const SCN tokens[] = { 10, scn_encode(1, 20), 30 };
+	for (unsigned mode = 0; mode < 3; mode++)
+		for (unsigned vm = 0; vm < 2; vm++)
+			for (unsigned absent = 0; absent < 2; absent++) {
+				ClusterPageWalBindingV1 binding, pi[2];
+				ClusterSpaceStructureChange change;
+				ClusterPageStructuralReceiptV2 *master = NULL, *peer = NULL;
+				ClusterPiStructuralAckV2 *ack = NULL;
+				ClusterWalWriterToken exported = { 0 };
+				int32 node = -1;
+				ClusterThreadRecoveryFabricPlanV1 *plan = space_structural_plan_internal(
+					false, false, true, false, &binding, &change, tokens,
+					vm ? VISIBILITYMAP_FORKNUM : MAIN_FORKNUM, pi);
+				prepare_structural_master(&binding, &change, &pi[0].identity, mode);
+				if (mode == 0)
+					structural_write_cut.holder.master_session_incarnation
+						= binding.source.claim.identity.origin_owner_incarnation;
+				else
+					structural_storage_cut.master_session_incarnation
+						= binding.source.claim.identity.origin_owner_incarnation;
+				UT_ASSERT(
+					cluster_page_structural_from_ko_v2(7, 19, &pi[0].identity, plan, &master));
+				UT_ASSERT(cluster_page_structural_pi_fact_v2(master, 1, &structural_notice_fact));
+				structural_notice_fact.proof.structural.ko.peer_boot
+					= pi[0].source.claim.identity.origin_owner_incarnation;
+				prepare_structural_ack_inputs(plan, pi);
+				logical_pi.first = logical_pi.last = pi[0];
+				cluster_node_id = 1;
+				writer = pi[0].source;
+				ack_boot = writer.claim.identity.origin_owner_incarnation;
+				structural_notice_ready = true;
+				/* pi[] follows version order: the older contributor is node 1. */
+				UT_ASSERT_EQ(pi[0].source.claim.identity.origin_node_id, 1);
+				physical_pi_from_binding(&pi[0]);
+				if (absent)
+					resident[1] = false;
+				UT_ASSERT(cluster_page_structural_from_notice_v2((void *)41, 2, plan, &peer));
+				for (unsigned drift = 0; drift < 6; drift++) {
+					ClusterPiWritebackFactV2 saved = structural_notice_fact;
+					uint64 revision = structural_notice_revision;
+					switch (drift) {
+					case 0:
+						structural_notice_revision++;
+						break; /* same address, new slot owner */
+					case 1:
+						structural_notice_fact.proof.structural.terminal.binding.record_crc++;
+						break;
+					case 2:
+						structural_notice_fact.proof.structural.ko.batch_id++;
+						break;
+					case 3:
+						structural_notice_fact.proof.structural.durability_flags ^= 1;
+						break;
+					case 4:
+						structural_notice_fact.proof.structural.change.identity.nblocks++;
+						break;
+					case 5:
+						if (mode == 0)
+							structural_notice_fact.proof.structural.terminal.write_cut
+								.transition_count++;
+						else
+							structural_notice_fact.proof.structural.terminal.storage_cut
+								.binding_generation++;
+						break;
+					}
+					UT_ASSERT(!cluster_bufmgr_ack_pi_at_structure_v2(peer, (void *)1, &ack));
+					UT_ASSERT(ack == NULL);
+					UT_ASSERT_EQ(pi_discards + logical_pi_retire_calls, 0);
+					structural_notice_fact = saved;
+					structural_notice_revision = revision;
+				}
+				UT_ASSERT(cluster_bufmgr_ack_pi_at_structure_v2(peer, (void *)1, &ack));
+				UT_ASSERT(cluster_page_structural_pi_ack_read_v2(ack, peer, &node));
+				UT_ASSERT_EQ(node, 1);
+				UT_ASSERT(cluster_page_structural_pi_ack_export_v2(ack, peer, &exported));
+				UT_ASSERT_EQ(exported.ref.claim.identity.origin_node_id, 1);
+				UT_ASSERT_EQ(pi_discards, absent ? 0 : 1);
+				UT_ASSERT_EQ(logical_pi_retire_calls, 1);
+				UT_ASSERT_EQ(writes + reads + syncs + wal_flushes, 0);
+				/* Peer physical work cannot clear the master's directory bitmap. */
+				UT_ASSERT_EQ(mode == 0 ? structural_write_cut.pi_holders_bitmap
+									   : structural_storage_cut.pi_holders_bitmap,
+							 3);
+				structural_notice_ready = false;
+				UT_ASSERT(!cluster_page_structural_pi_ack_read_v2(ack, peer, &node));
+				cluster_page_structural_pi_ack_free_v2(&ack);
+				cluster_page_structural_receipt_free_v2(&peer);
+				cluster_page_structural_receipt_free_v2(&master);
+				cluster_node_id = 0;
+				cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+				clean();
+			}
+}
+
+static void
+structural_remote_notice_refuses_wrong_record_page_owner_and_expired_scope(void)
+{
+	const SCN tokens[] = { 10, scn_encode(1, 20), 30 };
+	for (unsigned fault = 0; fault < 15; fault++) {
+		ClusterPageWalBindingV1 binding, pi[2];
+		ClusterSpaceStructureChange change;
+		ClusterPageStructuralReceiptV2 *master = NULL, *peer = NULL;
+		ClusterThreadRecoveryFabricPlanV1 *plan = space_structural_plan_internal(
+			false, false, true, false, &binding, &change, tokens, MAIN_FORKNUM, pi);
+		prepare_structural_master(&binding, &change, &pi[0].identity, 0);
+		structural_write_cut.holder.master_session_incarnation
+			= binding.source.claim.identity.origin_owner_incarnation;
+		UT_ASSERT(cluster_page_structural_from_ko_v2(7, 19, &pi[0].identity, plan, &master));
+		UT_ASSERT(cluster_page_structural_pi_fact_v2(master, 1, &structural_notice_fact));
+		structural_notice_fact.proof.structural.ko.peer_boot
+			= pi[0].source.claim.identity.origin_owner_incarnation;
+		structural_notice_ready = true;
+		cluster_node_id = 1;
+		writer = pi[0].source;
+		ack_boot = writer.claim.identity.origin_owner_incarnation;
+		switch (fault) {
+		case 0:
+			structural_notice_ready = false;
+			break;
+		case 1:
+			structural_notice_fact.kind = CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2;
+			break;
+		case 2:
+			structural_notice_fact.proof.structural.terminal.binding.record_crc++;
+			break;
+		case 3:
+			structural_notice_fact.proof.structural.change.identity.nblocks++;
+			break;
+		case 4:
+			structural_notice_fact.proof.structural.terminal.write_cut.holder.assertion.resource
+				.blockNum++;
+			break;
+		case 5:
+			structural_notice_fact.proof.structural.terminal.write_cut.pi_holders_bitmap = 1;
+			break;
+		case 6:
+			structural_notice_fact.proof.structural.terminal.write_cut.master_node = 1;
+			break;
+		case 7:
+			MyBackendType = B_LMON;
+			break;
+		case 8:
+			CurrentResourceOwner = NULL;
+			break;
+		case 9:
+			CritSectionCount = 1;
+			break;
+		case 10:
+			structural_notice_fact.proof.structural.terminal.storage_cut.binding_generation = 1;
+			break;
+		case 11:
+			break; /* wrong opaque notice */
+		case 12:
+			break; /* wrong index */
+		case 13:
+			break; /* unavailable plan */
+		case 14:
+			structural_notice_fact.proof.structural.terminal.binding.source.claim.claim_sha256[0]++;
+			break;
+		}
+		UT_ASSERT(!cluster_page_structural_from_notice_v2(fault == 11 ? (void *)42 : (void *)41,
+														  fault == 12 ? 1 : 2,
+														  fault == 13 ? NULL : plan, &peer));
+		UT_ASSERT(peer == NULL);
+		UT_ASSERT_EQ(pi_discards + logical_pi_retire_calls + writes + reads + syncs, 0);
+		CritSectionCount = 0;
+		CurrentResourceOwner = (void *)1;
+		MyBackendType = B_BG_WRITER;
+		structural_notice_ready = false;
+		cluster_node_id = 0;
+		cluster_page_structural_receipt_free_v2(&master);
+		cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+		clean();
+	}
+}
+
+static void
 structural_logical_both_anchors_must_belong_to_the_old_incarnation(void)
 {
 	const SCN tokens[] = {10, scn_encode(1, 20), 30};
@@ -4417,7 +4611,9 @@ int
 main(void)
 {
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
-	UT_PLAN(70);
+	UT_PLAN(72);
+	UT_RUN(structural_remote_notice_uses_actual_plan_and_peer_physical_owner);
+	UT_RUN(structural_remote_notice_refuses_wrong_record_page_owner_and_expired_scope);
 	UT_RUN(structural_drop_ack_preserves_reused_incarnation_and_requires_exact_ancestry);
 	UT_RUN(structural_logical_both_anchors_must_belong_to_the_old_incarnation);
 	UT_RUN(structural_ack_requires_physical_completion_and_exact_local_responsibility);

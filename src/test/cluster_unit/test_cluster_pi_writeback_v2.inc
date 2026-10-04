@@ -446,6 +446,101 @@ UT_TEST(writeback_v2_request_cut_checks_real_sender_and_recipient)
 	clean();
 }
 
+/* Exercise the opaque reader itself; queue/transport activation is separate.
+ * The fixture establishes the original singleton owner, never PAGE proof. */
+UT_TEST(writeback_v2_structural_notice_requires_its_live_original_slot)
+{
+	for (unsigned fault = 0; fault < 19; fault++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiWritebackNoticeV1 notice = { 0 }, other = { 0 };
+		ClusterPiDataFactV1 data;
+		ClusterPiWritebackFactV2 out, before;
+		uint64 revision = 83;
+		UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &data));
+		wb_v2_fixture(&notice.request_v2, &data);
+		wb_select(1, B_BG_WRITER);
+		notice.owner = CurrentResourceOwner;
+		notice.pid = getpid();
+		notice.version = 2;
+		notice.revision = 71;
+		wb_notice = &notice;
+		wb_shared->inbound_revision = notice.revision;
+		wb_shared->inbound_pid = MyProcPid;
+		wb_shared->inbound_state = WB_RUNNING;
+		memset(&out, 0x5a, sizeof(out));
+		before = out;
+		switch (fault) {
+		case 1:
+			wb_notice = NULL;
+			break;
+		case 2:
+			notice.pid++;
+			break;
+		case 3:
+			notice.owner = (void *)3;
+			break;
+		case 4:
+			notice.version = 1;
+			break;
+		case 5:
+			MyBackendType = B_LMON;
+			break;
+		case 6:
+			CritSectionCount = 1;
+			break;
+		case 7:
+			wb_peer_caps = 0;
+			break;
+		case 8:
+			wb_shared->inbound_revision++;
+			break;
+		case 9:
+			wb_shared->inbound_pid++;
+			break;
+		case 10:
+			wb_shared->inbound_state = WB_REPLIED;
+			break;
+		case 11:
+			notice.revision = wb_shared->inbound_revision = 0;
+			break;
+		case 12:
+			notice.revision = wb_shared->inbound_revision = UINT64_MAX;
+			break;
+		case 13:
+			break; /* unknown opaque handle */
+		case 14:
+			break; /* DATA kind cannot construct structural authority */
+		case 15:
+			break; /* absent index */
+		case 16:
+			wb_ko_current = false;
+			break;
+		case 17:
+			wb_shared = NULL;
+			break;
+		case 18:
+			break; /* missing revision output */
+		}
+		UT_ASSERT_EQ(cluster_pi_writeback_structural_notice_read_v2(fault == 13 ? &other : &notice,
+																	fault == 14	  ? 0
+																	: fault == 15 ? 2
+																				  : 1,
+																	fault == 18 ? NULL : &revision,
+																	&out),
+					 fault == 0);
+		UT_ASSERT_EQ(revision, fault == 0 ? notice.revision : 83);
+		UT_ASSERT(memcmp(&out, fault == 0 ? &notice.request_v2.facts[1] : &before, sizeof(out))
+				  == 0);
+		UT_ASSERT_EQ(wb_sends + wb_plan_builds + pi_discards, 0);
+		wb_notice = NULL;
+		CritSectionCount = 0;
+		wb_select(0, B_CHECKPOINTER);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
 UT_TEST(writeback_v2_request_cut_refuses_missing_or_changed_proofs)
 {
 	for (unsigned fault = 0; fault < 20; fault++) {
