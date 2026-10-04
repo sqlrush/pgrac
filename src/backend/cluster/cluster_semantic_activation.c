@@ -2508,10 +2508,15 @@ semantic_activation_ack_barrier_request_ahead_state(
 		|| message->kind != CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST
 		|| message->stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER
 		|| message->result != CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST
-		|| message->source_feature_bitmap != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
-		|| message->target_feature_bitmap
-			   != (CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
-				   | CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1)
+		/* Both existing rounds can overtake a SAMPLE ACK on another peer
+		 * connection.  Retain evidence; the complete exact SAMPLE below is
+		 * still required before installing BARRIER or publishing any ACK. */
+		|| !((message->source_feature_bitmap == 0
+			  && message->target_feature_bitmap == CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1)
+			 || (message->source_feature_bitmap == CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+				 && message->target_feature_bitmap
+						== (CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+							| CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1)))
 		|| message->rollback_feature_bitmap != 0 || current_coordinator_node < 0
 		|| current_coordinator_node >= CLUSTER_MAX_NODES || local_node_id < 0
 		|| local_node_id >= CLUSTER_MAX_NODES || local_node_id == current_coordinator_node

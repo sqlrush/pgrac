@@ -11164,7 +11164,9 @@ UT_TEST(test_a148_stop_poll_includes_original_phase3_handoff)
 int
 main(void)
 {
-	UT_PLAN(335);
+	UT_PLAN(337);
+	UT_RUN(test_first_open_barrier_waits_for_last_sample_ack);
+	UT_RUN(test_first_open_barrier_rejects_changed_authority);
 	UT_RUN(test_first_open_requires_installed_original_input);
 	UT_RUN(test_first_open_request_cannot_publish_admission);
 	UT_RUN(test_first_open_foreign_mailbox_is_not_consumed);
