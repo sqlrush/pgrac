@@ -48,8 +48,8 @@ typedef enum ClusterWalRetainedPinV1 {
 	CLUSTER_WAL_RETAINED_PIN_DIRTY_BUFFER = 5
 } ClusterWalRetainedPinV1;
 
-/* Older generations a census reports as deletable, at most. */
-#define CLUSTER_WAL_RETAINED_PRUNABLE_MAX 8
+/* Older generations a census lists as unneeded, at most. */
+#define CLUSTER_WAL_RETAINED_UNNEEDED_MAX 8
 
 typedef struct ClusterWalRetainedCutV1 {
 	/* Whole ROOT file the input was selected and revalidated under. */
@@ -78,11 +78,12 @@ typedef struct ClusterWalRetainedCutV1 {
 	uint32 dirty_buffers;
 	uint32 dirty_foreign;
 	uint32 dirty_unattributed;
-	/* Older generations whose WAL serves no obligation and that nothing in
-	 * memory can still reference (the first CLUSTER_WAL_RETAINED_PRUNABLE_MAX
-	 * of prunable_generations).  A judgement only: nothing is deleted. */
-	uint32 prunable_generations;
-	ClusterControlRootIdentity prunable[CLUSTER_WAL_RETAINED_PRUNABLE_MAX];
+	/* Older CLOSED generations whose WAL no obligation of this census needs
+	 * (the first CLUSTER_WAL_RETAINED_UNNEEDED_MAX of unneeded_generations).
+	 * A readout only, never permission to delete: nothing proves that no
+	 * running or restarted instance still refers to them. */
+	uint32 unneeded_generations;
+	ClusterControlRootIdentity unneeded[CLUSTER_WAL_RETAINED_UNNEEDED_MAX];
 } ClusterWalRetainedCutV1;
 
 /*

@@ -627,7 +627,7 @@ retained_census(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluster
 	out->dirty_buffers = work->dirty.dirty;
 	out->dirty_foreign = work->dirty.foreign;
 	out->dirty_unattributed = work->dirty.unattributed;
-	retained_prunable(work, inputs, out);
+	retained_unneeded(work, inputs, out);
 	if (out->pin == CLUSTER_WAL_RETAINED_PIN_STRUCTURE)
 		retained_structure_pins++;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -806,14 +806,14 @@ retained_report_readings(const ClusterWalRetainedCutV1 *cut, ClusterControlRootR
 			 "result %d, %llu records, %llu history edges, %llu needed, spool %llu "
 			 "bytes, census %lld ms, publication %lld ms, local PI floor %X/%X "
 			 "(%llu bounded, %llu unbounded, %llu pending), dirty floor %X/%X (%u "
-			 "buffers, %u foreign, %u unattributed), %u older generations deletable.",
+			 "buffers, %u foreign, %u unattributed), %u older generations unneeded.",
 			 (int)result, (unsigned long long)cut->records, (unsigned long long)cut->history_edges,
 			 (unsigned long long)cut->retained_edges, (unsigned long long)cut->spool_bytes,
 			 (long long)(census_us / 1000), (long long)(publication_us / 1000),
 			 LSN_FORMAT_ARGS(cut->local_pi_floor), (unsigned long long)cut->local_pi_bounded,
 			 (unsigned long long)cut->local_pi_unbounded, (unsigned long long)cut->local_pi_pending,
 			 LSN_FORMAT_ARGS(cut->dirty_floor), cut->dirty_buffers, cut->dirty_foreign,
-			 cut->dirty_unattributed, cut->prunable_generations)));
+			 cut->dirty_unattributed, cut->unneeded_generations)));
 }
 
 void

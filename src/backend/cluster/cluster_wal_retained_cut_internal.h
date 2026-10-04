@@ -149,7 +149,7 @@ extern RfPageProofDetailV1 retained_native_record(RetainedCutWork *work, XLogRea
 extern void retained_side_fold(RetainedCutWork *work);
 
 /* cluster_wal_retained_generation.c */
-extern void retained_prunable(RetainedCutWork *work, ClusterWalInputsV1 *inputs,
+extern void retained_unneeded(RetainedCutWork *work, ClusterWalInputsV1 *inputs,
 							  ClusterWalRetainedCutV1 *out);
 
 #endif /* CLUSTER_WAL_RETAINED_CUT_INTERNAL_H */
