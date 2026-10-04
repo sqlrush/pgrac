@@ -321,6 +321,13 @@ cl_full_stop_capture_formation_only(bool require_shutdown_suppressed, uint64 exp
 	if (formation.self_join_admitted == 0 || formation.self_join_failed != 0)
 		goto invalid;
 	memset(&empty_event, 0, sizeof(empty_event));
+	/* Fixed-cohort adoption projects its epoch into an otherwise empty event.
+	 * The snapshot supplies a generation only for the current published cohort. */
+	if (cluster_shared_config && formation.startup_formation_generation != 0
+		&& formation.startup_formation_generation != UINT64_MAX
+		&& expected_epoch > CLUSTER_EPOCH_INITIAL
+		&& formation.applied.new_epoch == expected_epoch)
+		empty_event.new_epoch = expected_epoch;
 	reason = "NORMAL_STOP_FORMATION_APPLIED_EVENT";
 	if (memcmp(&formation.applied, &empty_event, sizeof(empty_event)) != 0)
 		goto invalid;
