@@ -43,7 +43,7 @@ extern bool cluster_semantic_activation_resolve_shared_undo_root_live_owner_sour
 
 #define TEST_SEMANTIC_GATE_SHMEM_BYTES 1104
 #define TEST_SEMANTIC_UTILITY_MAILBOX_BYTES 80
-#define TEST_SEMANTIC_ACK_TABLE_BYTES 16496
+#define TEST_SEMANTIC_ACK_TABLE_BYTES 16528
 #define TEST_SEMANTIC_PGRD_SNAPSHOT_BYTES 528
 /* RF-ROOT P7 (contract §B): ClusterR4Bit22CutoverLatchShmem = u32+u32+u64+u64 */
 #define TEST_SEMANTIC_BIT22_LATCH_BYTES 24
@@ -102,7 +102,7 @@ typedef struct TestSemanticSourceCloseStorage {
 static TestSemanticSourceCloseStorage test_semantic_source_close;
 static TestSemanticBit22SeamStorage test_semantic_bit22_seam;
 static pg_atomic_uint32 test_semantic_clean_start;
-static TestSemanticShmemStorage test_normal_start_completion;
+static union { pg_atomic_uint64 align; uint8 bytes[1568]; } test_normal_start_completion;
 static TestSemanticShmemStorage test_serving_completion;
 static bool test_serving_found;
 static bool test_serving_formation_valid;
@@ -1207,6 +1207,7 @@ test_gate_inflight(ClusterSemanticAdmissionSide side, int feature_index)
 static void
 test_gate_reset(void)
 {
+	cluster_shared_config = false;
 	test_capture_activation_log = false;
 	test_activation_diag_logs = 0;
 	test_activation_last_diag[0] = '\0';
@@ -5574,7 +5575,7 @@ UT_TEST(test_99_shared_gate_layout_and_bootstrap_are_fail_closed)
 					 + MAXALIGN(TEST_SEMANTIC_BIT22_SEAM_BYTES)
 					 + MAXALIGN(TEST_SEMANTIC_BIT22_SOURCE_CLOSE_BYTES)
 					 + MAXALIGN(sizeof(SemanticServingCompletion))
-					 + MAXALIGN(sizeof(pg_atomic_uint32)) + MAXALIGN(1104));
+					 + MAXALIGN(sizeof(pg_atomic_uint32)) + MAXALIGN(1568));
 	UT_ASSERT(!cluster_r4_bit22_cutover_active());
 	UT_ASSERT(SemanticActivationAckTable
 			  == (ClusterSemanticActivationAckTableV1 *)test_semantic_ack_table.bytes);
@@ -8743,6 +8744,8 @@ ut_a142_setup(int node)
 	test_pgrd_candidate_state = CLUSTER_UNDO_SMGR_ROOT_MIRROR_EXACT;
 }
 
+static void test_clean_ready_for_node(int node);
+
 static void
 ut_a142_open_bytes(uint8 *bytes, int fault)
 {
@@ -8751,6 +8754,7 @@ ut_a142_open_bytes(uint8 *bytes, int fault)
 	memset(&open, 0, sizeof(open));
 	open.phase = fault == 1 ? CLUSTER_SEMANTIC_PHASE_COMMIT : CLUSTER_SEMANTIC_PHASE_OPEN;
 	open.record_generation = 6;
+	open.transition_epoch = cluster_shared_config ? 1 : 0;
 	open.source_feature_bitmap = 1;
 	open.target_feature_bitmap = 1025;
 	open.admitted_members_lo = fault == 2 ? 7 : 15;
@@ -9166,7 +9170,7 @@ UT_TEST(test_normal_start_separate_record_and_own_checkpoint_capture)
 	const char *failure;
 
 	ut_normal_start_setup();
-	UT_ASSERT_EQ(test_normal_start_requested_size, 1104);
+	UT_ASSERT_EQ(test_normal_start_requested_size, 1568);
 	UT_ASSERT_NOT_NULL(NormalStartCompletion);
 	if (NormalStartCompletion == NULL)
 		return;
@@ -9462,6 +9466,10 @@ ut_a142_frame(int source, bool ack, uint64 nonce, uint64 incarnation)
 	message.target_feature_bitmap = 1025;
 	message.admitted_members_lo = 15;
 	message.capability_sample_digest = UINT64_C(0xabc123);
+	if (cluster_shared_config) {
+		message.transition_epoch = NormalStartCompletion->epoch;
+		memcpy(message.restart_binding, NormalStartCompletion->restart_binding, 32);
+	}
 	if (ack) {
 		message.boot_id = incarnation;
 		message.admitted_incarnation = incarnation;
@@ -9473,6 +9481,7 @@ ut_a142_frame(int source, bool ack, uint64 nonce, uint64 incarnation)
 	envelope.source_node_id = source;
 	envelope.dest_node_id = cluster_node_id;
 	envelope.payload_length = sizeof(payload);
+	envelope.epoch = message.transition_epoch;
 	cluster_semantic_activation_ack_handler(&envelope, payload);
 	semantic_activation_ack_lmon_drain();
 }
@@ -9645,9 +9654,12 @@ UT_TEST(test_clean_restart_missing_fanout_peer_retries_before_open)
 		uint64 incarnations[4], generation;
 		const char *reason;
 
-		ut_a142_setup(3);
-		cluster_shared_config = shared;
-		ut_a148_ready_input();
+		if (shared)
+			test_clean_ready_for_node(3);
+		else {
+			ut_a142_setup(3);
+			ut_a148_ready_input();
+		}
 		cluster_semantic_activation_lmon_tick();
 		(void)ut_a142_complete_open_read(0);
 		ut_a142_frame(0, false, 23, 0);
@@ -9707,7 +9719,8 @@ UT_TEST(test_clean_restart_missing_fanout_peer_retries_before_open)
 			read.request_seq, CLUSTER_SEMANTIC_ACTIVATION_OK, false, bytes));
 		UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&open, root, incarnations, &reason),
 					 CLUSTER_NORMAL_STOP_READY);
-		test_gate_reset();
+		if (shared) ut_cold_cleanup();
+		else test_gate_reset();
 	}
 }
 
@@ -11339,7 +11352,7 @@ static void test_serving_finish_root(void);
 int
 main(void)
 {
-	UT_PLAN(367);
+	UT_PLAN(377);
 	UT_RUN(test_barrier_waits_for_both_late_peer_samples_in_either_order);
 	UT_RUN(test_staged_sample_ack_survives_idle_authority_gap);
 	UT_RUN(test_sample_ack_waits_for_local_gate_epoch);
@@ -11639,6 +11652,17 @@ main(void)
 	UT_RUN(test_normal_start_separate_record_and_own_checkpoint_capture);
 	UT_RUN(test_clean_formation_old_pgsa_classifies_loading_at_current_epoch);
 	UT_RUN(test_clean_formation_missing_original_input_cannot_classify_ready);
+	UT_RUN(test_clean_formation_bridge_contradictions_fail_before_loading);
+	UT_RUN(test_clean_formation_actual_loader_requires_exact_installed_claim);
+	UT_RUN(test_clean_formation_ready_enters_original_restart_read_owner);
+	UT_RUN(test_clean_restart_rejects_previous_ack_wire_version);
+	UT_RUN(test_clean_formation_all_nodes_reach_current_open_without_rewriting_pgsa);
+	UT_RUN(test_clean_formation_current_epoch_refuses_changed_bridge_and_carriers);
+	UT_RUN(test_clean_formation_early_late_duplicate_ack_keeps_exact_round);
+	UT_RUN(test_clean_formation_binding_ack_cannot_be_reused_for_another_root);
+	UT_RUN(test_clean_formation_first_request_survives_membership_observation_gap);
+	UT_RUN(test_clean_formation_stop_terminal_receipt_is_not_partial_open);
+
 	UT_RUN(test_normal_census_full_owner_namespace_retains_terminal_history);
 	UT_RUN(test_normal_census_sparse_and_zero_are_complete_not_cursor_based);
 	UT_RUN(test_normal_census_refuses_active_invalid_short_and_wrong_owner_without_writes);

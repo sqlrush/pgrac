@@ -795,6 +795,12 @@ extern ClusterNormalStopPollResult cluster_semantic_normal_stop_match(
 	const ClusterSemanticActivationRecord *open_record,
 	const uint8 root_descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
 	uint64 member_incarnations_out[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT], const char **reason_out);
+/* Read-only semantic precheck for the original ROOT publisher and stop owner.
+ * Does not depend on ROOT serving publication; does not authorize I/O or stop.
+ * A non-READY result always clears epoch_out. */
+extern ClusterNormalStopPollResult cluster_semantic_normal_stop_current_epoch(
+	const ClusterSemanticActivationRecord *open_record,
+	const uint8 root_descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES], uint64 *epoch_out);
 /* LMON only: nonblocking original QVOTEC read, then full live revalidation.
  * No identity output escapes before READY; no admission/drain is implied. */
 extern ClusterNormalStopPollResult cluster_semantic_normal_stop_read_identity(
