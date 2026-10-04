@@ -721,6 +721,8 @@ struct ClusterSpaceTruncateState {
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	uint64 token;
 	XLogRecPtr lsn;
+	bool base_synced;
+	bool truncate_published;
 };
 
 struct ClusterSpaceDropState {
@@ -816,6 +818,7 @@ ClusterSpaceTruncateState *
 cluster_space_truncate_prepare(Relation rel, BlockNumber nblocks)
 {
 	ClusterSpaceIdentityKey expected;
+	ClusterSpaceTruncateState *state;
 	SMgrRelation smgr;
 
 	if (rel == NULL || RecoveryInProgress() || !RelationIsPermanent(rel)
@@ -835,7 +838,10 @@ cluster_space_truncate_prepare(Relation rel, BlockNumber nblocks)
 		if (smgrexists(smgr, fork))
 			smgrimmedsync(smgr, fork);
 	}
-	return space_structure_prepare(&expected, CLUSTER_SPACE_WAL_TRUNCATE, nblocks);
+	state = space_structure_prepare(&expected, CLUSTER_SPACE_WAL_TRUNCATE, nblocks);
+	if (state != NULL)
+		state->base_synced = true;
+	return state;
 }
 
 static XLogRecPtr
@@ -879,6 +885,10 @@ void
 cluster_space_truncate_publish(ClusterSpaceTruncateState *state)
 {
 	space_structure_publish(state, state->lsn);
+	/* The sole native caller has completed smgrtruncate2 and synced every
+	 * shrunken fork inside its original critical section before publishing.
+	 * Merely logging the record or publishing DROP cannot set this phase. */
+	state->truncate_published = true;
 }
 
 /* The caller retains both content-X locks and relation lifecycle authority.
@@ -917,8 +927,11 @@ space_structure_observe(ClusterSpaceTruncateState *state)
 		|| !cluster_page_wal_read_v1(state->buffers[0], &change.identity.result, &after)
 		|| memcmp(&before, &after, sizeof(before)) != 0)
 		return;
-	(void)cluster_ko_shared_observe_space_v2(state->ko_completion, &certified,
-		state->wal, sizeof(state->wal));
+	if (cluster_ko_shared_observe_space_v2(state->ko_completion, &certified,
+			state->wal, sizeof(state->wal))
+		&& change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE && state->base_synced
+		&& state->truncate_published)
+		(void)cluster_ko_shared_observe_truncate_v2(state->ko_completion);
 }
 
 void

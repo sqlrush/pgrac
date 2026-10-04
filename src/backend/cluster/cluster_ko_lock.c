@@ -159,6 +159,7 @@ struct ClusterKoCompletionV2 {
 	bool native_transaction;
 	bool native_pending;
 	bool space_observed;
+	bool truncate_observed;
 	bool postcommit;
 	ClusterPageWalBindingV1 terminal;
 	uint8 structure[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
@@ -754,6 +755,36 @@ cluster_ko_shared_space_observation_v2(const ClusterKoCompletionV2 *completion,
 	*terminal = owned->terminal;
 	memcpy(wal, owned->structure, sizeof(owned->structure));
 	return true;
+}
+
+bool
+cluster_ko_shared_observe_truncate_v2(ClusterKoCompletionV2 *completion)
+{
+	ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
+	ClusterPageWalBindingV1 terminal;
+	ClusterSpaceStructureChange change;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+
+	if (owned == NULL || owned->truncate_observed || owned->postcommit
+		|| !cluster_ko_shared_space_observation_v2(owned, &terminal, wal, sizeof(wal))
+		|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &change)
+		|| change.identity.action != CLUSTER_SPACE_WAL_TRUNCATE)
+		return false;
+	/* Only the original native finish calls this after its physical sync
+	 * and exact SPACE readback. The saved KO/WAL scope cannot be replaced
+	 * by a wire flag or by DROP's earlier SPACE-only observation. */
+	owned->truncate_observed = true;
+	return true;
+}
+
+bool
+cluster_ko_shared_truncate_observation_v2(const ClusterKoCompletionV2 *completion,
+	struct ClusterPageWalBindingV1 *terminal, void *wal, Size wal_length)
+{
+	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
+
+	return owned != NULL && owned->truncate_observed
+		&& cluster_ko_shared_space_observation_v2(owned, terminal, wal, wal_length);
 }
 
 bool

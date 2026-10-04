@@ -231,6 +231,13 @@ extern bool cluster_ko_shared_observe_space_v2(ClusterKoCompletionV2 *completion
 	const struct ClusterPageWalBindingV1 *terminal, const void *wal, Size wal_length);
 extern bool cluster_ko_shared_space_observation_v2(const ClusterKoCompletionV2 *completion,
 	struct ClusterPageWalBindingV1 *terminal, void *wal, Size wal_length);
+/* Original native TRUNCATE finish only, after the inherited base and every
+ * physical shrink have been synced and the SPACE observation is saved.
+ * This records a local physical effect, not COMMIT or PI retirement. DROP
+ * needs its separate post-commit storage owner and cannot use this entry. */
+extern bool cluster_ko_shared_observe_truncate_v2(ClusterKoCompletionV2 *completion);
+extern bool cluster_ko_shared_truncate_observation_v2(const ClusterKoCompletionV2 *completion,
+	struct ClusterPageWalBindingV1 *terminal, void *wal, Size wal_length);
 /* Borrow the original native COMMIT-DROP owner after the top commit callback
  * and before pending-delete cleanup ends. This is not a physical deletion or
  * PI certificate.

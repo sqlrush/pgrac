@@ -1702,6 +1702,98 @@ UT_TEST(test_native_space_observation_refuses_foreign_or_changed_record)
 	}
 }
 
+UT_TEST(test_native_truncate_effect_needs_original_space_and_is_once_only)
+{
+	ClusterPageWalBindingV1 binding, observed = {0};
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], copied[sizeof(wal)] = {0};
+	ClusterKoCompletionV2 *completion = prepare_native_structure(false, &binding, wal);
+	int reads = space_reads, requests = barrier_requests;
+
+	UT_ASSERT(!cluster_ko_shared_observe_truncate_v2(completion));
+	UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
+	UT_ASSERT(!cluster_ko_shared_truncate_observation_v2(completion, &observed, copied, sizeof(copied)));
+	UT_ASSERT(cluster_ko_shared_observe_truncate_v2(completion));
+	UT_ASSERT(!cluster_ko_shared_observe_truncate_v2(completion));
+	UT_ASSERT(cluster_ko_shared_truncate_observation_v2(completion, &observed, copied, sizeof(copied)));
+	UT_ASSERT(memcmp(&binding, &observed, sizeof(binding)) == 0);
+	UT_ASSERT(memcmp(wal, copied, sizeof(wal)) == 0);
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT(!cluster_ko_shared_truncate_observation_v2(completion, &observed, copied, sizeof(copied)));
+	cluster_ko_shared_release_v2(&completion);
+	UT_ASSERT_EQ(completion_allocations, 0);
+	UT_ASSERT_EQ(space_reads, reads);
+	UT_ASSERT_EQ(barrier_requests, requests);
+}
+
+UT_TEST(test_native_truncate_effect_refuses_drop_late_or_changed_owner)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterPageWalBindingV1 binding, observed, saved;
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], copied[sizeof(wal)], before[sizeof(wal)];
+		ClusterKoCompletionV2 *completion = prepare_native_structure(fault == 0, &binding, wal);
+
+		UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
+		if (fault == 1)
+			CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)2;
+		else if (fault == 2)
+			current_epoch++;
+		else if (fault == 3)
+			writer.claim.claim_sha256[0]++;
+		else if (fault == 4)
+			resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		else if (fault == 5)
+			xact_callback(XACT_EVENT_COMMIT, NULL);
+		memset(&saved, 0x5a, sizeof(saved));
+		memset(before, 0x5a, sizeof(before));
+		observed = saved;
+		memcpy(copied, before, sizeof(copied));
+		UT_ASSERT(!cluster_ko_shared_observe_truncate_v2(completion));
+		UT_ASSERT(!cluster_ko_shared_truncate_observation_v2(completion, &observed, copied, sizeof(copied)));
+		UT_ASSERT(memcmp(&observed, &saved, sizeof(saved)) == 0);
+		UT_ASSERT(memcmp(copied, before, sizeof(before)) == 0);
+		CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)1;
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		cluster_ko_shared_release_v2(&completion);
+		UT_ASSERT_EQ(completion_allocations, 0);
+	}
+}
+
+UT_TEST(test_native_truncate_effect_export_rechecks_cut_without_changing_output)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterPageWalBindingV1 binding, observed, saved;
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], copied[sizeof(wal)], before[sizeof(wal)];
+		ClusterKoCompletionV2 *completion = prepare_native_structure(false, &binding, wal);
+		Size len = sizeof(copied);
+
+		UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
+		UT_ASSERT(cluster_ko_shared_observe_truncate_v2(completion));
+		if (fault == 0)
+			len--;
+		else if (fault == 1)
+			CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)2;
+		else if (fault == 2)
+			current_epoch++;
+		else if (fault == 3)
+			writer.claim.claim_sha256[0]++;
+		else if (fault == 4)
+			formation.membership.last_admitted_incarnation[1]++;
+		else
+			resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		memset(&saved, 0x5a, sizeof(saved));
+		memset(before, 0x5a, sizeof(before));
+		observed = saved;
+		memcpy(copied, before, sizeof(copied));
+		UT_ASSERT(!cluster_ko_shared_truncate_observation_v2(completion, &observed, copied, len));
+		UT_ASSERT(memcmp(&observed, &saved, sizeof(saved)) == 0);
+		UT_ASSERT(memcmp(copied, before, sizeof(before)) == 0);
+		CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)1;
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		cluster_ko_shared_release_v2(&completion);
+		UT_ASSERT_EQ(completion_allocations, 0);
+	}
+}
+
 /* Execute the real native sequence from ResourceOwner release through
  * pending deletes and its local KO cleanup. Storage is a boundary here:
  * reaching it is not a durability certificate. */
@@ -1943,7 +2035,7 @@ UT_TEST(test_prepare_and_noncommit_events_never_retain_native_observation)
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(51);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
@@ -1985,6 +2077,9 @@ main(void)
 	UT_RUN(test_native_barrier_rejects_missing_or_unrelated_transaction_before_io);
 	UT_RUN(test_native_space_observation_is_original_once_and_transaction_owned);
 	UT_RUN(test_native_space_observation_refuses_foreign_or_changed_record);
+	UT_RUN(test_native_truncate_effect_needs_original_space_and_is_once_only);
+	UT_RUN(test_native_truncate_effect_refuses_drop_late_or_changed_owner);
+	UT_RUN(test_native_truncate_effect_export_rechecks_cut_without_changing_output);
 	UT_RUN(test_native_postcommit_retains_exact_observation_until_pending_deletes_return);
 	UT_RUN(test_native_postcommit_refuses_drift_but_always_cleans_original_local_owner);
 	UT_RUN(test_native_postcommit_error_and_exit_do_not_leave_a_completion);

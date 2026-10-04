@@ -95,6 +95,7 @@ static ClusterSpaceIdentityKey ko_key;
 static uint8 ko_incarnation[16];
 static int ko_handle;
 static unsigned space_observe_calls, space_observations, observation_reads;
+static unsigned truncate_observations;
 static unsigned observation_fault;
 static unsigned current_ref_reads, restart_ref_reads;
 static bool reject_current_ref;
@@ -365,6 +366,23 @@ cluster_ko_shared_observe_space_v2(ClusterKoCompletionV2 *completion,
 	if (observation_fault == 4)
 		return false;
 	space_observations++;
+	return true;
+}
+
+bool
+cluster_ko_shared_observe_truncate_v2(ClusterKoCompletionV2 *completion)
+{
+	UT_ASSERT(completion == (ClusterKoCompletionV2 *)&ko_handle);
+	UT_ASSERT(truncate_owner && !drop_owner);
+	UT_ASSERT_EQ(locked, 3);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(space_observations, 1);
+	UT_ASSERT_EQ(space_readbacks, 2);
+	UT_ASSERT_EQ(relation_flushes, 1);
+	UT_ASSERT_EQ(truncate_calls, 1);
+	UT_ASSERT_EQ(shrink_syncs, auxiliary_forks ? 3 : 1);
+	UT_ASSERT_EQ(main_blocks, 4);
+	truncate_observations++;
 	return true;
 }
 
@@ -1159,6 +1177,7 @@ reset(void)
 	ko_claims = 0;
 	ko_pending = ko_claim_unavailable = false;
 	space_observe_calls = space_observations = observation_reads = observation_fault = 0;
+	truncate_observations = 0;
 	current_ref_reads = restart_ref_reads = 0;
 	reject_current_ref = false;
 	next_token = 17;
@@ -2047,6 +2066,21 @@ UT_TEST(test_native_truncate_syncs_all_shrunken_forks_before_identity)
 	FreeFakeRelcacheEntry(rel);
 }
 
+UT_TEST(test_native_truncate_effect_follows_original_sync_and_space_readback)
+{
+	for (unsigned aux = 0; aux < 2; aux++) {
+		Relation rel = native_truncate_relation();
+
+		auxiliary_forks = aux;
+		RelationTruncate(rel, 4);
+		UT_ASSERT_EQ(truncate_observations, 1);
+		UT_ASSERT_EQ(space_observations, 1);
+		UT_ASSERT_EQ(shrink_syncs, aux ? 3 : 1);
+		UT_ASSERT(!locked && !pinned);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
 UT_TEST(test_native_truncate_failed_sync_does_not_publish_identity)
 {
 	for (int fork = MAIN_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++) {
@@ -2068,6 +2102,7 @@ UT_TEST(test_native_truncate_failed_sync_does_not_publish_identity)
 		PG_END_TRY();
 		UT_ASSERT(caught);
 		UT_ASSERT_EQ(shrink_syncs, fork + 1);
+		UT_ASSERT_EQ(truncate_observations, 0);
 		UT_ASSERT_EQ(main_blocks, 4);
 		UT_ASSERT_EQ(truncate_calls, 1);
 		UT_ASSERT_EQ(invalidations, 0);
@@ -2189,6 +2224,7 @@ UT_TEST(test_native_truncate_readback_io_error_keeps_original_owner)
 		UT_ASSERT_EQ(reported_level, PANIC);
 		UT_ASSERT_EQ(space_readbacks, block + 1);
 		UT_ASSERT_EQ(space_observe_calls, 0);
+		UT_ASSERT_EQ(truncate_observations, 0);
 		UT_ASSERT_EQ(invalidations, 0);
 		UT_ASSERT_EQ(pinned, 3);
 		UT_ASSERT_EQ(locked, 3);
@@ -2483,6 +2519,7 @@ UT_TEST(test_native_drop_durable_finish_io_failure_keeps_original_owner)
 		UT_ASSERT_EQ(space_syncs, failure >= 2 ? 1 : 0);
 		UT_ASSERT_EQ(space_readbacks, failure >= 3 ? failure - 2 : 0);
 		UT_ASSERT_EQ(space_observe_calls, 0);
+		UT_ASSERT_EQ(truncate_observations, 0);
 		UT_ASSERT_EQ(release_calls, releases);
 		UT_ASSERT_EQ(pinned, 3);
 		UT_ASSERT_EQ(locked, 3);
@@ -2546,6 +2583,7 @@ UT_TEST(test_native_structure_observation_needs_attribution_and_stable_native_fl
 			UT_ASSERT_EQ(space_readbacks, 2);
 			UT_ASSERT_EQ(space_observe_calls, fault == 0 || fault == 4 ? 1 : 0);
 			UT_ASSERT_EQ(space_observations, fault == 0 ? 1 : 0);
+			UT_ASSERT_EQ(truncate_observations, !drop && fault == 0 ? 1 : 0);
 			UT_ASSERT_EQ(pinned | locked, 0);
 			UT_ASSERT_EQ(reported_level, 0);
 			FreeFakeRelcacheEntry(rel);
@@ -2992,7 +3030,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(60);
+	UT_PLAN(61);
 	UT_RUN(test_native_drop_durable_finish_io_failure_keeps_original_owner);
 	UT_RUN(test_native_drop_durable_finish_requires_each_exact_page);
 	UT_RUN(test_native_structure_observation_needs_attribution_and_stable_native_flush);
@@ -3041,6 +3079,7 @@ main(void)
 	UT_RUN(test_drop_missing_or_replaced_original_ko_refuses_before_structural_change);
 	UT_RUN(test_native_truncate_bad_pair_refuses_before_physical_change);
 	UT_RUN(test_native_truncate_syncs_all_shrunken_forks_before_identity);
+	UT_RUN(test_native_truncate_effect_follows_original_sync_and_space_readback);
 	UT_RUN(test_native_truncate_failed_sync_does_not_publish_identity);
 	UT_RUN(test_native_truncate_without_shared_space_keeps_original_sync_policy);
 	UT_RUN(test_drop_pair_stays_live_until_native_commit_is_durable);
