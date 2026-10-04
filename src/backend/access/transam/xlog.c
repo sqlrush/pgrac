@@ -6231,6 +6231,7 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 	ClusterWalStartupImage selected, routed;
 	ClusterControlRootResult result;
 	XLogRecPtr first = InvalidXLogRecPtr;
+	const char *operation = "route";
 
 	if (input == NULL || MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
 		|| !cluster_controlfile_shared_authority || !clusterStartupWriterSelected
@@ -6266,16 +6267,18 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& memcmp(&routed, &selected, sizeof(selected)) != 0)
 		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		operation = "prepare";
 		result = cluster_wal_writer_startup_prepare(&selected.claim.identity,
 													 selected.operation_uuid, &first);
+	}
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || first != selected.first_segment_lsn)
 		ereport(FATAL,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 				 errmsg("could not bind the native successor WAL stream"),
 				 errdetail(
-					 "PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_WAL_ROUTE_UNPROVEN result=%d",
-					 (int)result)));
+					 "PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_WAL_ROUTE_UNPROVEN operation=%s result=%d",
+					 operation, (int)result)));
 	clusterStartupWriter = selected;
 	clusterStartupWriterBound = true;
 	return first;
