@@ -54,6 +54,7 @@
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope prototype */
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_membership.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_r4_observe.h"
@@ -118,6 +119,49 @@ BackendType MyBackendType = B_LMS;
 int cluster_node_id = 0;
 int cluster_lms_workers = 2;
 int cluster_gcs_reply_timeout_ms = 5000;
+int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+static uint64 ut_request_epoch = 7;
+static uint64 ut_member_cut = 2;
+static uint64 ut_data_stream[CLUSTER_MAX_NODES];
+static int ut_absent_member = -1;
+
+uint64
+cluster_epoch_get_current(void)
+{
+	return ut_request_epoch;
+}
+
+uint64
+cluster_membership_cut_generation(void)
+{
+	return ut_member_cut;
+}
+
+bool
+cluster_membership_cut_generation_current(uint64 generation)
+{
+	return generation != 0 && generation == ut_member_cut;
+}
+
+ClusterMembershipState
+cluster_membership_get_state(int32 node)
+{
+	return node == ut_absent_member ? CLUSTER_MEMBER_ABSENT : CLUSTER_MEMBER_MEMBER;
+}
+
+uint64
+cluster_membership_get_last_admitted_incarnation(int32 node)
+{
+	return UINT64_C(0x100) + node;
+}
+
+uint64
+cluster_ic_tier1_resource_x_stream_generation(int32 peer, int channel)
+{
+	UT_ASSERT(channel >= 0 && channel < CLUSTER_LMS_MAX_WORKERS);
+	UT_ASSERT(peer >= 0 && peer < CLUSTER_MAX_NODES);
+	return ut_data_stream[peer];
+}
 static uint32 ut_peer_capabilities[CLUSTER_MAX_NODES];
 static uint32 ut_peer_cap_generation[CLUSTER_MAX_NODES];
 static ResourceXIntentSlot ut_resource_x_owner_slot;
@@ -783,6 +827,11 @@ ut_count_marker(uint8 marker)
 static void
 ut_reset_log(void)
 {
+	ut_request_epoch = 7;
+	ut_member_cut = 2;
+	ut_absent_member = -1;
+	for (int node = 0; node < CLUSTER_MAX_NODES; node++)
+		ut_data_stream[node] = 11;
 	ut_sent_n = 0;
 	ut_requester_begins = ut_requester_completed = ut_requester_pending = 0;
 	ut_requester_not_due = false;
@@ -2269,10 +2318,130 @@ UT_TEST(test_requester_transport_refusal_and_capability_drift_return_owner)
 	UT_ASSERT_EQ(ut_requester_begins, 0);
 }
 
+static bool
+ut_enqueue_first_read(int worker, int peer, uint64 request_id)
+{
+	GcsBlockRequestPayload request = { 0 };
+
+	request.request_id = request_id;
+	request.epoch = ut_request_epoch;
+	request.sender_node = cluster_node_id;
+	request.requester_backend_id = 3;
+	request.transition_id = PCM_TRANS_N_TO_S;
+	return cluster_lms_outbound_enqueue(worker, PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
+										 peer, &request, sizeof(request));
+}
+
+UT_TEST(test_first_read_waits_for_data_peer_without_losing_owner_or_peer_order)
+{
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	ut_data_stream[UT_PEER_X] = 0;
+	/* Result measured by the native TCP test before socket creation. */
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_HARD_ERROR;
+	ut_peer_rc[UT_PEER_Y] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT(ut_enqueue_first_read(1, UT_PEER_X, 0x31));
+	UT_ASSERT(ut_enqueue_first_read(1, UT_PEER_Y, 0x32));
+	UT_ASSERT(ut_enqueue_first_read(1, UT_PEER_X, 0x33));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 2);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	UT_ASSERT_EQ(ut_sent_log[0].marker, 0x32);
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 2);
+	ut_data_stream[UT_PEER_X] = 11;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 2);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+	UT_ASSERT_EQ(ut_sent_n, 3);
+	UT_ASSERT_EQ(ut_sent_log[1].marker, 0x31);
+	UT_ASSERT_EQ(ut_sent_log[2].marker, 0x33);
+}
+
+UT_TEST(test_first_read_hello_pending_then_transport_owned_is_never_resubmitted)
+{
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	ut_data_stream[UT_PEER_X] = 0;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	UT_ASSERT(ut_enqueue_first_read(1, UT_PEER_X, 0x41));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 1);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+	ut_data_stream[UT_PEER_X] = 11;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_WOULD_BLOCK;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+	ut_data_stream[UT_PEER_X]++;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+}
+
+UT_TEST(test_first_read_retained_request_rejects_epoch_boot_and_stream_drift)
+{
+	for (int drift = 0; drift < 5; drift++) {
+		ut_captured_region->init_fn();
+		ut_reset_log();
+		ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+		ut_data_stream[UT_PEER_X] = drift == 3 ? 11 : 0;
+		UT_ASSERT(ut_enqueue_first_read(1, UT_PEER_X, 0x51));
+		if (drift == 0)
+			ut_request_epoch++;
+		else if (drift == 1)
+			ut_member_cut += 2; /* membership owner publishes a new admitted boot */
+		else if (drift == 2)
+			ut_absent_member = UT_PEER_X;
+		else if (drift == 3)
+			ut_data_stream[UT_PEER_X] = 12;
+		else {
+			/* First stream refused without a copy; the retained physical
+			 * attempt is now bound and cannot migrate to the next stream. */
+			ut_data_stream[UT_PEER_X] = 11;
+			ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+			UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+			UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 1);
+			ut_sent_n = 0;
+			ut_data_stream[UT_PEER_X] = 12;
+			ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+		}
+		if (drift < 3)
+			ut_data_stream[UT_PEER_X] = 11;
+		UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+		UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+		UT_ASSERT_EQ(ut_sent_n, 0);
+	}
+}
+
+UT_TEST(test_first_read_real_send_failure_is_not_reclassified_as_peer_wait)
+{
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_HARD_ERROR;
+	UT_ASSERT(ut_enqueue_first_read(1, UT_PEER_X, 0x61));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+}
+
+UT_TEST(test_first_read_unknown_membership_cannot_create_retained_qualification)
+{
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	ut_member_cut = 0;
+	UT_ASSERT(!ut_enqueue_first_read(1, UT_PEER_X, 0x71));
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+	ut_reset_log();
+}
+
 int
 main(void)
 {
-	UT_PLAN(46);
+	UT_PLAN(51);
 
 	UT_RUN(test_normal_stop_missing_outbound_is_not_empty);
 	UT_RUN(test_ring_shmem_init);
@@ -2320,6 +2489,11 @@ main(void)
 	UT_RUN(test_normal_stop_full_and_bad_frames_remain_debt);
 	UT_RUN(test_requester_pair_atomic_admission_and_transport_handoff);
 	UT_RUN(test_requester_transport_refusal_and_capability_drift_return_owner);
+	UT_RUN(test_first_read_waits_for_data_peer_without_losing_owner_or_peer_order);
+	UT_RUN(test_first_read_hello_pending_then_transport_owned_is_never_resubmitted);
+	UT_RUN(test_first_read_retained_request_rejects_epoch_boot_and_stream_drift);
+	UT_RUN(test_first_read_real_send_failure_is_not_reclassified_as_peer_wait);
+	UT_RUN(test_first_read_unknown_membership_cannot_create_retained_qualification);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
