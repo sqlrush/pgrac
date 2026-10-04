@@ -59,6 +59,7 @@
 #include <unistd.h>
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_chunk.h"
@@ -1722,11 +1723,66 @@ UT_TEST(test_stream_shutdown_and_exhaustion_never_wrap)
 	ut_rx_fd = -1;
 }
 
+UT_TEST(test_data_first_request_samples_native_transport_readiness)
+{
+	char frame[sizeof(ClusterICEnvelope) + sizeof(GcsBlockRequestPayload)] = { 0 };
+	char received[sizeof(frame)];
+	struct sockaddr_in sa;
+	socklen_t salen = sizeof(sa);
+	int listener, port;
+	ClusterICSendResult absent, hello_pending, old_epoch, ready;
+
+	cluster_ic_tier1_close_peer(UT_PEER_ID, NULL);
+	if (ut_rx_fd >= 0)
+		close(ut_rx_fd);
+	ut_rx_fd = -1;
+	MyAuxProcType = LmsProcess;
+	cluster_ic_tier1_set_my_data_channel(0, 1);
+	absent = ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame, sizeof(frame));
+	/* The transport now leaves an unconnected declared peer with its caller. */
+	UT_ASSERT_EQ(absent, CLUSTER_IC_SEND_NOT_ADMITTED);
+	UT_ASSERT(!cluster_ic_tier1_pending_outbound(UT_PEER_ID));
+
+	listener = ut_open_listener(&port);
+	snprintf(ut_peer_info.data_addr, sizeof(ut_peer_info.data_addr), "127.0.0.1:%d", port);
+	UT_ASSERT(cluster_ic_tier1_connect_one(UT_PEER_ID, &ut_tx_fd));
+	UT_ASSERT(ut_tx_fd >= 0);
+	ut_rx_fd = accept(listener, (struct sockaddr *)&sa, &salen);
+	UT_ASSERT(ut_rx_fd >= 0);
+	hello_pending = ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame, sizeof(frame));
+	UT_ASSERT_EQ(hello_pending, CLUSTER_IC_SEND_NOT_ADMITTED);
+	UT_ASSERT(!cluster_ic_tier1_pending_outbound(UT_PEER_ID));
+	UT_ASSERT_EQ(recv(ut_rx_fd, received, sizeof(received), MSG_DONTWAIT), -1);
+	UT_ASSERT(errno == EAGAIN || errno == EWOULDBLOCK);
+	UT_ASSERT(cluster_ic_tier1_finish_connect(UT_PEER_ID, ut_tx_fd));
+	UT_ASSERT_EQ(ut_drain_all_and_sweep(UT_PEER_ID, ut_rx_fd, ut_acc, sizeof(ut_acc)),
+				 PGRAC_IC_HELLO_BYTES);
+
+	ut_epoch++;
+	old_epoch = ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame, sizeof(frame));
+	UT_ASSERT_EQ(old_epoch, CLUSTER_IC_SEND_HARD_ERROR);
+	UT_ASSERT(!cluster_ic_tier1_pending_outbound(UT_PEER_ID));
+	ut_epoch--;
+	ready = ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame, sizeof(frame));
+	UT_ASSERT_EQ(ready, CLUSTER_IC_SEND_DONE);
+	UT_ASSERT_EQ(ut_drain_all_and_sweep(UT_PEER_ID, ut_rx_fd, ut_acc, sizeof(ut_acc)), sizeof(frame));
+	UT_ASSERT_EQ(memcmp(frame, ut_acc, sizeof(frame)), 0);
+	printf("# native DATA send sample: absent=%d hello_pending=%d old_epoch=%d ready=%d\n",
+		   absent, hello_pending, old_epoch, ready);
+	cluster_ic_tier1_close_peer(UT_PEER_ID, NULL);
+	close(ut_rx_fd);
+	close(listener);
+	ut_rx_fd = -1;
+	MyAuxProcType = LmonProcess;
+	cluster_ic_tier1_set_my_plane(CLUSTER_IC_PLANE_CONTROL);
+	ut_reconnect_peer();
+}
+
 int
 main(void)
 {
 	MyProcPid = getpid();
-	UT_PLAN(31);
+	UT_PLAN(32);
 
 	UT_RUN(test_stop_poll_requires_initialized_actual_plane_owner);
 	UT_RUN(test_connect_registers_peer_fd);
@@ -1758,6 +1814,7 @@ main(void)
 	UT_RUN(test_stream_data_epoch_role_and_native_fork);
 	UT_RUN(test_terminal_sessions_bind_control_and_all_data_channels);
 	UT_RUN(test_control_hello_generation_survives_first_reconnect_and_exhaustion);
+	UT_RUN(test_data_first_request_samples_native_transport_readiness);
 	UT_RUN(test_stream_shutdown_and_exhaustion_never_wrap);
 
 	UT_DONE();
