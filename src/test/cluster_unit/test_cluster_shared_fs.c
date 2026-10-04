@@ -73,6 +73,7 @@
 int cluster_shared_storage_backend = 0;
 bool cluster_smgr_user_relations = false;
 /* spec-6.14 D1: read by the shared_catalog startup vet in cluster_shared_fs_init. */
+bool enableFsync = true;
 bool cluster_shared_catalog = false;
 bool cluster_controlfile_shared_authority = false;
 bool cluster_merged_recovery = false; /* read by D1 startup vet (D9 amend dep) */

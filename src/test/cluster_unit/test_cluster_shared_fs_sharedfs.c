@@ -82,6 +82,7 @@
 char *cluster_shared_data_dir = NULL;
 char *cluster_shared_storage_uuid = NULL;
 int cluster_node_id = 0;
+bool enableFsync = true;
 bool cluster_shared_catalog = false;
 bool IsUnderPostmaster = false;
 int io_direct_flags = 0;

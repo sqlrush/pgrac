@@ -485,13 +485,169 @@ cluster_shared_fs_sharedfs_unlink(RelFileLocator rlocator, ForkNumber forknum)
 	pfree(path);
 }
 
-/* Fail-closed API scaffold: no production caller until its I/O and the
- * original postcommit owner handoff have both been established. */
+typedef struct SharedFsDropFork {
+	int fd;
+	const char *name;
+	struct stat identity;
+	bool removed;
+} SharedFsDropFork;
+
+static bool
+sharedfs_drop_same_file(const struct stat *left, const struct stat *right)
+{
+	return left->st_dev == right->st_dev && left->st_ino == right->st_ino;
+}
+
+static bool
+sharedfs_drop_space_matches(int fd, const ClusterSpaceIdentity *expected,
+						   const uint8 *expected_bytes, uint64 expected_token)
+{
+	PGIOAlignedBlock page;
+	ClusterSpaceIdentity actual;
+	uint8 bytes[CLUSTER_SPACE_IDENTITY_BYTES];
+	uint64 token;
+	ssize_t nread;
+
+	do {
+		nread = pread(fd, page.data, BLCKSZ, 0);
+	} while (nread < 0 && errno == EINTR);
+	return nread == BLCKSZ
+		   && cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
+											 &expected->key, &actual, &token)
+		   && token == expected_token
+		   && cluster_space_identity_encode(&actual, bytes, sizeof(bytes))
+		   && memcmp(bytes, expected_bytes, sizeof(bytes)) == 0;
+}
+
+static bool
+sharedfs_drop_namespace_matches(int directory, const char *path, const struct stat *original,
+								const SharedFsDropFork *forks, bool main_zero)
+{
+	struct stat current;
+	ForkNumber fork;
+
+	if (lstat(path, &current) != 0 || !S_ISDIR(current.st_mode)
+		|| !sharedfs_drop_same_file(original, &current))
+		return false;
+	for (fork = 0; fork <= MAX_FORKNUM; fork++) {
+		const SharedFsDropFork *f = &forks[fork];
+
+		if (f->fd < 0 || f->removed) {
+			if (fstatat(directory, f->name, &current, AT_SYMLINK_NOFOLLOW) == 0
+				|| errno != ENOENT)
+				return false;
+			if (f->fd >= 0 && (fstat(f->fd, &current) != 0 || current.st_nlink != 0))
+				return false;
+		} else if (fstatat(directory, f->name, &current, AT_SYMLINK_NOFOLLOW) != 0
+				   || !S_ISREG(current.st_mode) || current.st_nlink != 1
+				   || !sharedfs_drop_same_file(&f->identity, &current)
+				   || (main_zero && fork == MAIN_FORKNUM && current.st_size != 0))
+			return false;
+	}
+	return true;
+}
+
+/* The original KO owner excludes other qualified writers throughout this
+ * operation. Keep every original inode open and recheck its namespace; a
+ * later ENOENT, replacement, or error is not this DROP's durability result.
+ * Allocation precedes all descriptor acquisition. I/O failures return false
+ * without ERROR, so the postcommit caller can preserve its holdoff counters.
+ * This metadata operation does not change the data-fork O_DIRECT contract.
+ * Author: SqlRush <sqlrush@gmail.com> */
 bool
 cluster_shared_fs_sharedfs_drop_durable(const ClusterSpaceIdentity *identity,
 									  uint64 mutation_token)
 {
-	return false;
+	SharedFsDropFork forks[MAX_FORKNUM + 1];
+	char *paths[MAX_FORKNUM + 1];
+	char *parent;
+	char *separator;
+	struct stat parent_identity;
+	uint8 expected_bytes[CLUSTER_SPACE_IDENTITY_BYTES];
+	int directory = -1;
+	int saved_errno;
+	bool durable = false;
+	ForkNumber fork;
+
+	if (!enableFsync || identity == NULL || mutation_token == 0
+		|| identity->state != CLUSTER_SPACE_IDENTITY_TOMBSTONED
+		|| !cluster_space_identity_encode(identity, expected_bytes, sizeof(expected_bytes))) {
+		errno = EINVAL;
+		return false;
+	}
+	memset(forks, 0, sizeof(forks));
+	for (fork = 0; fork <= MAX_FORKNUM; fork++) {
+		paths[fork] = cluster_shared_fs_sharedfs_relpath(identity->key.locator, fork);
+		forks[fork].fd = -1;
+		forks[fork].name = strrchr(paths[fork], '/') + 1;
+	}
+	parent = pstrdup(paths[MAIN_FORKNUM]);
+	separator = strrchr(parent, '/');
+	*separator = '\0';
+
+	/* No creation/adoption, symlink final components, or blocking special files.
+	 * The bounded raw descriptors are closed on every following exit. */
+	directory = open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | PG_BINARY);
+	if (directory < 0 || fstat(directory, &parent_identity) != 0)
+		goto done;
+	for (fork = 0; fork <= MAX_FORKNUM; fork++) {
+		SharedFsDropFork *f = &forks[fork];
+
+		f->fd = openat(directory, f->name,
+					   (fork == MAIN_FORKNUM ? O_RDWR : O_RDONLY) | O_NOFOLLOW | O_NONBLOCK
+						   | PG_BINARY);
+		if (f->fd < 0) {
+			if (errno == ENOENT && fork != MAIN_FORKNUM && fork != SPACE_FORKNUM)
+				continue;
+			goto done;
+		}
+		if (fstat(f->fd, &f->identity) != 0 || !S_ISREG(f->identity.st_mode)
+			|| f->identity.st_nlink != 1)
+			goto done;
+	}
+	if (!sharedfs_drop_namespace_matches(directory, parent, &parent_identity, forks, false)
+		|| !sharedfs_drop_space_matches(forks[SPACE_FORKNUM].fd, identity, expected_bytes,
+									   mutation_token))
+		goto done;
+	if (ftruncate(forks[MAIN_FORKNUM].fd, 0) != 0 || pg_fsync(forks[MAIN_FORKNUM].fd) != 0)
+		goto done;
+
+	for (fork = 1; fork <= MAX_FORKNUM; fork++) {
+		SharedFsDropFork *f = &forks[fork];
+
+		if (!sharedfs_drop_namespace_matches(directory, parent, &parent_identity, forks, true)
+			|| !sharedfs_drop_space_matches(forks[SPACE_FORKNUM].fd, identity, expected_bytes,
+										   mutation_token))
+			goto done;
+		if (f->fd < 0)
+			continue; /* absent before mutation, never an unlink success */
+		if (unlinkat(directory, f->name, 0) != 0)
+			goto done;
+		f->removed = true;
+	}
+	if (pg_fsync(directory) != 0
+		|| !sharedfs_drop_namespace_matches(directory, parent, &parent_identity, forks, true)
+		|| !sharedfs_drop_space_matches(forks[SPACE_FORKNUM].fd, identity, expected_bytes,
+									   mutation_token))
+		goto done;
+	durable = true;
+
+done:
+	saved_errno = errno != 0 ? errno : EIO;
+	for (fork = 0; fork <= MAX_FORKNUM; fork++) {
+		if (forks[fork].fd >= 0 && close(forks[fork].fd) != 0) {
+			durable = false;
+			saved_errno = errno;
+		}
+		pfree(paths[fork]);
+	}
+	if (directory >= 0 && close(directory) != 0) {
+		durable = false;
+		saved_errno = errno;
+	}
+	pfree(parent);
+	errno = durable ? 0 : saved_errno;
+	return durable;
 }
 
 

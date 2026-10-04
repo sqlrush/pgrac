@@ -1,11 +1,10 @@
 /* Actual sharedfs DROP I/O with faults only at the POSIX boundary.
  * Author: SqlRush <sqlrush@gmail.com> */
+int sharedfs_existing_tests_main(void);
 #define main sharedfs_existing_tests_main
 #include "test_cluster_shared_fs_sharedfs.c"
 #undef main
 #include "cluster/cluster_space_identity.h"
-
-bool enableFsync = true;
 
 enum DropFault {
 	DROP_OK,
@@ -29,6 +28,18 @@ static int drop_main_syncs;
 static int drop_directory_syncs;
 static int drop_unlinks;
 static int drop_truncates;
+
+static int
+drop_descriptor_count(void)
+{
+	int fd;
+	int count = 0;
+
+	for (fd = 0; fd < 1024; fd++)
+		if (fcntl(fd, F_GETFD) >= 0)
+			count++;
+	return count;
+}
 
 static void
 write_drop_file(const char *path, const void *bytes, size_t length)
@@ -198,10 +209,17 @@ UT_TEST(test_drop_absent_optional_is_not_a_failed_unlink)
 
 #define FAULT_TEST(name, fault) \
 	UT_TEST(name) { \
+		int descriptors; \
 		drop_setup(#name, fault != DROP_NEW_OPTIONAL); \
+		descriptors = drop_descriptor_count(); \
 		drop_fault = fault; \
 		UT_ASSERT(!cluster_shared_fs_sharedfs_drop_durable(&drop_identity, 17)); \
 		UT_ASSERT(drop_truncates == 1); \
+		UT_ASSERT_EQ(drop_descriptor_count(), descriptors); \
+		if (fault == DROP_PARTIAL) { \
+			UT_ASSERT(access(drop_paths[FSM_FORKNUM], F_OK) < 0); \
+			UT_ASSERT_EQ(access(drop_paths[VISIBILITYMAP_FORKNUM], F_OK), 0); \
+		} \
 	}
 FAULT_TEST(test_drop_truncate_failure, DROP_TRUNCATE)
 FAULT_TEST(test_drop_main_sync_failure, DROP_MAIN_SYNC)
@@ -252,10 +270,32 @@ UT_TEST(test_drop_disabled_fsync_cannot_prove_durability)
 	enableFsync = true;
 }
 
+UT_TEST(test_drop_corrupt_and_short_space_preserve_main)
+{
+	int fd;
+	uint8 byte;
+	struct stat st;
+
+	drop_setup("corrupt_space", true);
+	fd = open(drop_paths[SPACE_FORKNUM], O_RDWR);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pread(fd, &byte, 1, 100), 1);
+	byte ^= 1;
+	UT_ASSERT_EQ(pwrite(fd, &byte, 1, 100), 1);
+	UT_ASSERT(!cluster_shared_fs_sharedfs_drop_durable(&drop_identity, 17));
+	UT_ASSERT_EQ(drop_truncates, 0);
+	UT_ASSERT_EQ(ftruncate(fd, BLCKSZ - 1), 0);
+	UT_ASSERT(!cluster_shared_fs_sharedfs_drop_durable(&drop_identity, 17));
+	UT_ASSERT_EQ(drop_truncates, 0);
+	UT_ASSERT_EQ(stat(drop_paths[MAIN_FORKNUM], &st), 0);
+	UT_ASSERT_EQ(st.st_size, BLCKSZ);
+	close(fd);
+}
+
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(test_drop_durable_all_forks);
 	UT_RUN(test_drop_absent_optional_is_not_a_failed_unlink);
 	UT_RUN(test_drop_truncate_failure);
@@ -272,6 +312,7 @@ main(void)
 	UT_RUN(test_drop_missing_required_forks);
 	UT_RUN(test_drop_identity_or_token_mismatch);
 	UT_RUN(test_drop_disabled_fsync_cannot_prove_durability);
+	UT_RUN(test_drop_corrupt_and_short_space_preserve_main);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
