@@ -1118,6 +1118,22 @@ static bool ut_recovery_in_progress = false;
 /* PGRAC: typed successor INSTALL is a runtime boundary, not a native startup
  * simulation. Author: SqlRush <sqlrush@gmail.com> */
 static bool ut_startup_writer_installed;
+static ClusterFenceAuthorityCacheResult ut_startup_fence_cache = CLUSTER_FENCE_CACHE_MATCH;
+static bool ut_startup_fence_allowed = true;
+static bool ut_startup_fence_drift_during_stripe;
+bool
+cluster_write_fence_allowed(void)
+{
+	return ut_startup_fence_allowed;
+}
+ClusterFenceAuthorityCacheResult
+cluster_write_fence_revalidate_cached_nowait(const ClusterFenceMarker *expected, uint64 now_us)
+{
+	if (ut_startup_fence_cache != CLUSTER_FENCE_CACHE_MATCH)
+		return ut_startup_fence_cache;
+	return now_us > 0 && cluster_fence_marker_semantic_equal(expected, &ut_formation_authority.marker)
+		? CLUSTER_FENCE_CACHE_MATCH : CLUSTER_FENCE_CACHE_STALE;
+}
 bool
 cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
@@ -1134,6 +1150,8 @@ cluster_xid_stripe_join_gate(bool self_may_seed)
 {
 	ut_xid_stripe_join_gate_calls++;
 	ut_xid_stripe_last_may_seed = self_may_seed;
+	if (ut_startup_fence_drift_during_stripe)
+		ut_startup_fence_cache = CLUSTER_FENCE_CACHE_STALE;
 	return ut_xid_stripe_verdict;
 }
 ClusterXidStripeJoinProgress
@@ -1216,6 +1234,9 @@ ut_reset_mocks(void)
 	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
 	ut_xid_stripe_join_gate_calls = 0;
 	ut_xid_stripe_last_may_seed = false;
+	ut_startup_fence_cache = CLUSTER_FENCE_CACHE_MATCH;
+	ut_startup_fence_allowed = true;
+	ut_startup_fence_drift_during_stripe = false;
 	ut_xid_stripe_progress = STRIPE_JOIN_PROCEED;
 	ut_xid_stripe_join_progress_calls = 0;
 	ut_xid_stripe_progress_last_may_seed = false;
@@ -7340,6 +7361,43 @@ UT_TEST(test_pre2_stripe_seed_caller_requires_current_fixed_cohort)
 	}
 }
 
+UT_TEST(test_pre2_stripe_dispatch_and_admit_require_current_fence)
+{
+	for (int bad = 0; bad < 8; ++bad) {
+		ClusterReconfigState *state = pre2_initial_fixture();
+		ClusterFormationCommitMarker marker;
+		uint64 incarnations[CLUSTER_MAX_NODES];
+
+		UT_ASSERT(pre2_initial_request(state, &marker, incarnations));
+		cluster_reconfig_formation_qvotec_complete(true);
+		pre2_lmon_tick();
+		UT_ASSERT_EQ(state->startup_formation.formation_generation, 1);
+		ut_startup_writer_installed = true;
+		ut_recovery_in_progress = false;
+		ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
+		if (bad < 4)
+			ut_startup_fence_cache = (ClusterFenceAuthorityCacheResult)(bad + 1);
+		if (bad == 4)
+			ut_startup_fence_allowed = false;
+		if (bad == 5) {
+			ut_formation_authority.marker.fence_epoch++;
+		}
+		if (bad == 6) {
+			ut_formation_authority.marker.fenced_dead_bitmap[0] = 2;
+			ut_formation_authority.marker.issuer_node_id = 0;
+			ut_formation_authority.marker.fence_event_id = 1;
+			ut_formation_authority.marker.fence_generation = 1;
+		}
+		if (bad == 7)
+			ut_startup_fence_drift_during_stripe = true;
+		pre2_cold_tick();
+		UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, bad == 7 ? 1 : 0);
+		UT_ASSERT_EQ(state->self_join_admitted, 0);
+		UT_ASSERT_EQ(state->self_join_failed, 0);
+		pre2_initial_restore();
+	}
+}
+
 UT_TEST(test_pre2_restart_window_reopen_keeps_one_generation_and_slow_peers)
 {
 	for (int members = 2; members <= 4; members += 2) {
@@ -8013,7 +8071,7 @@ UT_TEST(test_membership_cut_generation_uses_original_shmem_owner)
 int
 main(void)
 {
-	UT_PLAN(149);
+	UT_PLAN(150);
 	UT_RUN(test_stop_membership_terminal_peer_is_not_online_admission);
 	UT_RUN(test_stop_membership_preserves_all_nonliveness_requirements);
 	UT_RUN(test_stop_reconfig_shared_owners);
@@ -8196,6 +8254,7 @@ main(void)
 	UT_RUN(test_pre2_unadmitted_lmon_never_reads_voting_disks);
 	UT_RUN(test_pre2_fixed_cohort_has_one_post_recovery_stripe_seed_caller);
 	UT_RUN(test_pre2_stripe_seed_caller_requires_current_fixed_cohort);
+	UT_RUN(test_pre2_stripe_dispatch_and_admit_require_current_fence);
 	UT_RUN(test_pre2_restart_window_reopen_keeps_one_generation_and_slow_peers);
 	UT_RUN(test_pre2_reboot_uses_new_incarnations_and_next_durable_generation);
 	UT_RUN(test_pre2_restart_snapshot_expiry_owner_drift_and_unknown_io_stay_closed);
