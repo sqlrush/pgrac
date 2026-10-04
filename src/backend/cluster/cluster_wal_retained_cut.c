@@ -22,23 +22,15 @@
  *	  rf_page_online_plan_dependency_prefix_v1, which keeps every edge of
  *	  such a page).  Versions are compared in SCN total order and every edge
  *	  must strictly advance its page (result after before), otherwise the
- *	  census refuses.  A history record is also needed when it carries a
- *	  SIDE owner class that has an obligation and no per-key ancestry yet.  A
- *	  history record that ends a relation incarnation (TRUNCATE, a DROP
- *	  tombstone, the dropped relations of a COMMIT or an ABORT) is always
- *	  needed: its structural PI responsibility has no durable retirement
+ *	  census refuses.  SIDE records are keyed and classified in
+ *	  cluster_wal_retained_side.c.  A history record that ends a relation
+ *	  incarnation (TRUNCATE, a DROP tombstone, the dropped relations of a
+ *	  COMMIT or an ABORT) is always needed: its structural PI responsibility has no durable retirement
  *	  receipt yet (CR20), so its WAL is never released.  A CREATE starts an
  *	  incarnation and has no such responsibility.
  *
  *	  Native records the typed SIDE decoder does not own yet are classified
- *	  from their own format instead of abandoning the census: a native
- *	  SMGR CREATE needs nothing older, a native SMGR TRUNCATE ends an
- *	  incarnation, standalone invalidations and XID assignments need
- *	  nothing, and a transaction end carries its SIDE owner classes plus,
- *	  with relations to drop, the structure pin.  A transaction end whose
- *	  sections do not lie within its data is damaged, not unsupported, and
- *	  refuses the census (COMPONENT_INCOMPLETE).  The
- *	  obligations go into a fixed-size sketch keeping, per bucket, the
+ *	  from their own format there too.  The obligations go into a fixed-size sketch keeping, per bucket, the
  *	  earliest before-version and the range of incarnations; collisions
  *	  only make the answer more conservative.  History edges are spooled to
  *	  a temporary file and compared after the census.  A source's bound is
@@ -89,80 +81,13 @@
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_retained_cut.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster_wal_retained_cut_internal.h"
 #include "common/hashfn.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
 #include "storage/buf_internals.h"
 #include "storage/buffile.h"
 #include "utils/timestamp.h"
-
-/* 2^18 buckets of 40 bytes: 10 MiB, independent of the database size. */
-#define RETAINED_SKETCH_BITS 18
-#define RETAINED_SKETCH_BUCKETS (UINT32_C(1) << RETAINED_SKETCH_BITS)
-#define RETAINED_BATCH 256
-#define RETAINED_SIDE_CLASSES 9
-
-/* SIDE owners whose ancestry is not keyed yet.  SPACE contributes PCM
- * BufferTags and is keyed like a page; NATIVE_CONTROL records are consumed
- * as typed control observations and never need an older record. */
-#define RETAINED_SIDE_KEYLESS                                                                      \
-	(RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_UNDO_BLOCK                            \
-	 | RF_SIDE_CONTRIBUTION_TERMINAL | RF_SIDE_CONTRIBUTION_PREPARED | RF_SIDE_CONTRIBUTION_CLOG   \
-	 | RF_SIDE_CONTRIBUTION_MULTIXACT | RF_SIDE_CONTRIBUTION_COMMIT_TS)
-
-typedef struct RetainedSource {
-	ClusterWalSourceRef ref;
-	XLogRecPtr completion;
-	XLogRecPtr bound;
-	/* Earliest history record start per SIDE owner class. */
-	XLogRecPtr side_first[RETAINED_SIDE_CLASSES];
-	/* Earliest history record that changes a SPACE structure. */
-	XLogRecPtr structure_first;
-	ClusterWalRetainedPinV1 pin;
-} RetainedSource;
-
-/* One history edge: a page or SPACE block a durable record changed. */
-typedef struct RetainedEdge {
-	uint64 key;
-	uint64 result_token;
-	XLogRecPtr read_ptr;
-	uint32 source;
-	uint32 reserved_zero;
-	uint8 incarnation[16];
-} RetainedEdge;
-
-/*
- * Obligations of every key hashed here: the earliest before-version and the
- * lowest and highest segment incarnation.  Empty while inc_min > inc_max.
- */
-typedef struct RetainedBucket {
-	SCN before;
-	uint8 inc_min[16];
-	uint8 inc_max[16];
-} RetainedBucket;
-
-typedef struct RetainedCutWork {
-	uint32 nsources;
-	int32 self;
-	ClusterPcmLocalPiFloorV1 local_pi;
-	RetainedSource sources[CLUSTER_WAL_INPUTS_MAX];
-	RetainedBucket *sketch;
-	uint32 obligation_side;
-	RetainedEdge batch[RETAINED_BATCH];
-	uint32 batch_count;
-	BufFile *spool;
-	uint64 spooled;
-	uint64 records;
-	uint64 history_edges;
-	uint64 retained_edges;
-	uint32 last_source;
-	/* Classification of the record being decoded. */
-	uint32 current_source;
-	bool current_history;
-	XLogRecPtr current_read;
-	XLogRecPtr current_end;
-	RfPageProofDetailV1 detail;
-} RetainedCutWork;
 
 static bool retained_logged;
 static uint64 retained_structure_pins;
@@ -277,7 +202,7 @@ retained_spill(RetainedCutWork *work)
 
 static void
 retained_history_edge(RetainedCutWork *work, uint64 key, uint64 result_token,
-					  const uint8 incarnation[16])
+					  const uint8 incarnation[16], uint32 side)
 {
 	RetainedEdge *edge;
 
@@ -289,22 +214,23 @@ retained_history_edge(RetainedCutWork *work, uint64 key, uint64 result_token,
 	edge->result_token = result_token;
 	edge->read_ptr = work->current_read;
 	edge->source = work->current_source;
+	edge->side = side;
 	memcpy(edge->incarnation, incarnation, 16);
 	work->history_edges++;
 }
 
-static void
+void
 retained_key_seen(RetainedCutWork *work, uint64 key, SCN before, const uint8 before_incarnation[16],
-				  SCN result, const uint8 result_incarnation[16])
+				  SCN result, const uint8 result_incarnation[16], uint32 side)
 {
 	if (work->current_history)
-		retained_history_edge(work, key, result, result_incarnation);
+		retained_history_edge(work, key, result, result_incarnation, side);
 	else
 		retained_sketch_add(work->sketch, key, before, before_incarnation, result_incarnation);
 }
 
 /* A history record that ends a relation incarnation holds its source. */
-static void
+void
 retained_structure(RetainedCutWork *work)
 {
 	RetainedSource *source = &work->sources[work->current_source];
@@ -332,26 +258,9 @@ retained_space(void *arg, const RfSideSpaceContributionV1 *space)
 			 * obligation it keeps every history edge of its incarnation. */
 			retained_key_seen(work, retained_key(&space->result.key.locator, SPACE_FORKNUM, block),
 							  InvalidScn, space->result.incarnation, space->result_token[block],
-							  space->result.incarnation);
+							  space->result.incarnation, 0);
 		}
 	return true;
-}
-
-static void
-retained_side(RetainedCutWork *work, uint32 owners)
-{
-	RetainedSource *source = &work->sources[work->current_source];
-
-	owners &= RETAINED_SIDE_KEYLESS;
-	if (!work->current_history) {
-		work->obligation_side |= owners;
-		return;
-	}
-	for (int c = 0; c < RETAINED_SIDE_CLASSES; c++)
-		if ((owners & (1u << c)) != 0
-			&& (source->side_first[c] == InvalidXLogRecPtr
-				|| work->current_read < source->side_first[c]))
-			source->side_first[c] = work->current_read;
 }
 
 /* The same routing policy as the online contribution census
@@ -437,75 +346,6 @@ retained_classify(RetainedCutWork *work, XLogReaderState *record, const ClusterW
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
-/*
- * A record the page route accepted but the typed SIDE decoder refused,
- * classified from its native format (see the file header).  Records with
- * block references, and every other refusal, stay refused.
- */
-static RfPageProofDetailV1
-retained_native_record(RetainedCutWork *work, XLogReaderState *record, RfPageProofDetailV1 refused)
-{
-	uint8 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
-	uint32 owners = 0;
-	bool drops = false;
-
-	if ((refused != RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE
-		 && refused != RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED)
-		|| XLogRecHasAnyBlockRefs(record))
-		return refused;
-	if (XLogRecGetRmid(record) == RM_SMGR_ID) {
-		if (info == XLOG_SMGR_CREATE)
-			return RF_PAGE_PROOF_DETAIL_OK;
-		if (info != XLOG_SMGR_TRUNCATE)
-			return refused;
-		retained_structure(work);
-		return RF_PAGE_PROOF_DETAIL_OK;
-	}
-	if (XLogRecGetRmid(record) != RM_XACT_ID)
-		return refused;
-	switch (info & XLOG_XACT_OPMASK) {
-	case XLOG_XACT_INVALIDATIONS:
-	case XLOG_XACT_ASSIGNMENT:
-		return RF_PAGE_PROOF_DETAIL_OK;
-	case XLOG_XACT_COMMIT:
-	case XLOG_XACT_COMMIT_PREPARED: {
-		xl_xact_parsed_commit parsed;
-
-		/* Bounded: ParseCommitRecord checks every section against the
-		 * main data length first. */
-		if (!ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
-							   XLogRecGetDataLen(record), &parsed))
-			return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
-		owners = RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL;
-		if ((info & XLOG_XACT_OPMASK) == XLOG_XACT_COMMIT_PREPARED)
-			owners |= RF_SIDE_CONTRIBUTION_PREPARED;
-		drops = parsed.nrels > 0 || parsed.nspace_drops > 0;
-		break;
-	}
-	case XLOG_XACT_ABORT:
-	case XLOG_XACT_ABORT_PREPARED: {
-		xl_xact_parsed_abort parsed;
-
-		/* ParseAbortRecord trusts the xinfo it reads: a damaged record
-		 * refuses the census, it does not become retention evidence. */
-		if (!rf_side_xact_completion_shape_v1(record, false))
-			return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
-		ParseAbortRecord(XLogRecGetInfo(record), (xl_xact_abort *)XLogRecGetData(record), &parsed);
-		owners = RF_SIDE_CONTRIBUTION_TERMINAL;
-		if ((info & XLOG_XACT_OPMASK) == XLOG_XACT_ABORT_PREPARED)
-			owners |= RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_PREPARED;
-		drops = parsed.nrels > 0;
-		break;
-	}
-	default:
-		return refused;
-	}
-	retained_side(work, owners);
-	if (drops)
-		retained_structure(work);
-	return RF_PAGE_PROOF_DETAIL_OK;
-}
-
 static RfPageProofDetailV1
 retained_record(XLogReaderState *record, const ClusterWalSourceRef *source,
 				const RfContributorStreamCutV1 *cut, void *arg)
@@ -543,7 +383,7 @@ retained_record(XLogReaderState *record, const ClusterWalSourceRef *source,
 									  retained_space, work, &owners);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		return work->detail = retained_native_record(work, record, detail);
-	retained_side(work, owners.owners);
+	retained_side_record(work, record, source, cut, owners.owners);
 	for (uint32 i = 0; i < plan.component_count; i++) {
 		const RfDetachedComponentPlanV1 *component = &plan.components[i];
 		const DecodedBkpBlock *block = &decoded->blocks[component->block_id];
@@ -563,7 +403,7 @@ retained_record(XLogReaderState *record, const ClusterWalSourceRef *source,
 						  present ? component->before.mutation_token : InvalidScn,
 						  present ? component->before.segment_incarnation
 								  : component->result.segment_incarnation,
-						  plan.result_token, component->result.segment_incarnation);
+						  plan.result_token, component->result.segment_incarnation, 0);
 	}
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
@@ -640,7 +480,7 @@ retained_sources(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluste
 }
 
 /* Lower the bound of source to at, recording why. */
-static void
+void
 retained_pin(RetainedSource *source, XLogRecPtr at, ClusterWalRetainedPinV1 pin)
 {
 	if (at != InvalidXLogRecPtr && at < source->bound) {
@@ -649,9 +489,9 @@ retained_pin(RetainedSource *source, XLogRecPtr at, ClusterWalRetainedPinV1 pin)
 	}
 }
 
-/* Fold the spooled history edges, SIDE classes and structure changes into
- * each source bound.  The structure pin is applied last: on a tie it is the
- * reported reason. */
+/* Fold the spooled history edges, SIDE keys and classes and structure
+ * changes into each source bound.  The structure pin is applied last: on a
+ * tie it is the reported reason. */
 static void
 retained_fold(RetainedCutWork *work)
 {
@@ -675,14 +515,15 @@ retained_fold(RetainedCutWork *work)
 		if (!retained_edge_needed(work->sketch, edge.key, edge.result_token, edge.incarnation))
 			continue;
 		work->retained_edges++;
-		retained_pin(&work->sources[edge.source], edge.read_ptr, CLUSTER_WAL_RETAINED_PIN_PAGE);
+		work->pinned_side |= edge.side;
+		retained_pin(&work->sources[edge.source], edge.read_ptr,
+					 edge.side != 0 ? CLUSTER_WAL_RETAINED_PIN_SIDE
+									: CLUSTER_WAL_RETAINED_PIN_PAGE);
 	}
+	retained_side_fold(work);
 	for (uint32 s = 0; s < work->nsources; s++) {
 		RetainedSource *source = &work->sources[s];
 
-		for (int c = 0; c < RETAINED_SIDE_CLASSES; c++)
-			if ((work->obligation_side & (1u << c)) != 0)
-				retained_pin(source, source->side_first[c], CLUSTER_WAL_RETAINED_PIN_SIDE);
 		if (source->structure_first != InvalidXLogRecPtr
 			&& source->structure_first <= source->bound) {
 			source->bound = source->structure_first;
@@ -727,7 +568,7 @@ retained_census(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluster
 	out->history_edges = work->history_edges;
 	out->retained_edges = work->retained_edges;
 	out->spool_bytes = work->spooled * sizeof(RetainedEdge);
-	out->side_classes = work->obligation_side;
+	out->side_classes = work->pinned_side;
 	out->pin = source->pin;
 	out->local_pi_floor = work->local_pi.floor;
 	out->local_pi_bounded = work->local_pi.bounded;

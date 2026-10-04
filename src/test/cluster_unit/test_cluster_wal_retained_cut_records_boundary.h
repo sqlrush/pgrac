@@ -456,6 +456,50 @@ rec_commit(uint32 source, XLogRecPtr read, XLogRecPtr end, TransactionId xid,
 	return r;
 }
 
+/* XLOG_UNDO_TT_SLOT_COMMIT: the durable commit stamp of one TT slot of the
+ * source's first undo segment. */
+static RealRecord *
+rec_tt_commit(uint32 source, XLogRecPtr read, XLogRecPtr end, TransactionId xid, uint16 slot)
+{
+	uint16 thread = items[source].source.claim.identity.origin_thread_id;
+	RealRecord *r
+		= record_new(source, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_COMMIT, xid, read, end);
+	xl_undo_tt_slot_commit rec = { 0 };
+
+	rec.segment_id = (uint32)(thread - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	rec.slot_offset = slot;
+	rec.wrap = 7;
+	rec.xid = xid;
+	rec.instance = (uint8)thread;
+	rec.commit_scn = scn_encode(thread - 1, 900 + read);
+	record_append(r, &rec, sizeof(rec));
+	return r;
+}
+
+/* XLOG_XACT_COMMIT_PREPARED of twophase_xid, without the GID and TT
+ * bindings the typed decoder requires: classified natively. */
+static RealRecord *
+rec_commit_prepared(uint32 source, XLogRecPtr read, XLogRecPtr end, TransactionId twophase_xid)
+{
+	uint16 thread = items[source].source.claim.identity.origin_thread_id;
+	RealRecord *r = record_new(source, RM_XACT_ID, XLOG_XACT_COMMIT_PREPARED | XLOG_XACT_HAS_INFO,
+							   InvalidTransactionId, read, end);
+	xl_xact_commit commit = { 0 };
+	xl_xact_xinfo xinfo = { 0 };
+	xl_xact_twophase twophase = { 0 };
+	xl_xact_scn scn = { 0 };
+
+	commit.xact_time = 123456;
+	xinfo.xinfo = XACT_XINFO_HAS_TWOPHASE | XACT_XINFO_HAS_SCN;
+	twophase.xid = twophase_xid;
+	scn.scn = scn_encode(thread - 1, 900 + read);
+	record_append(r, &commit, sizeof(commit));
+	record_append(r, &xinfo, sizeof(xinfo));
+	record_append(r, &twophase, sizeof(twophase));
+	record_append(r, &scn, sizeof(scn));
+	return r;
+}
+
 /* XLOG_XACT_ABORT with the relations it created and now drops. */
 static RealRecord *
 rec_abort(uint32 source, XLogRecPtr read, XLogRecPtr end, TransactionId xid,

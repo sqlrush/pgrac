@@ -47,7 +47,8 @@ expect_cut(uint32 source, XLogRecPtr lower, ClusterWalRetainedPinV1 pin, uint32 
 
 /* A COMMIT whose typed tombstones the SIDE decoder accepts: the DROP ends an
  * incarnation, so in history it holds its source (CR20).  The same COMMIT
- * still an obligation, or a plain COMMIT in history, holds nothing. */
+ * still an obligation, or a plain COMMIT in history, holds nothing (no
+ * obligation needs its TT slot). */
 UT_TEST(test_records_commit_tombstone_pins_its_source)
 {
 	static const RelFileNumber drops[] = { 16384, 16390 };
@@ -64,22 +65,22 @@ UT_TEST(test_records_commit_tombstone_pins_its_source)
 			rec_commit(self, 0x1800, 0x1900, 801, NULL, 0, false, 0);
 		expect_cut(
 			self, variant == 0 ? 0x1800 : REC_SELF_REDO,
-			variant == 0 ? CLUSTER_WAL_RETAINED_PIN_STRUCTURE : CLUSTER_WAL_RETAINED_PIN_NONE,
-			variant == 1 ? RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL : 0);
+			variant == 0 ? CLUSTER_WAL_RETAINED_PIN_STRUCTURE : CLUSTER_WAL_RETAINED_PIN_NONE, 0);
 		if (ut_current_failed)
 			printf("# tombstone variant %d\n", variant);
 	}
 }
 
 /* The SIDE decoder does not own a COMMIT with invalidation messages yet.
- * The census classifies it instead of giving up: its SIDE classes follow
- * the class rule; with relations to drop but no typed tombstones it holds
- * its source like a DROP. */
+ * The census classifies it instead of giving up: its TT delta keys its
+ * slot (a later commit on the same slot keeps it, one on another node's
+ * segment does not); with relations to drop but no typed tombstones it
+ * holds its source like a DROP. */
 UT_TEST(test_records_commit_with_invalidations_is_classified)
 {
 	static const RelFileNumber drops[] = { 16384 };
 
-	for (int variant = 0; variant < 5; variant++) {
+	for (int variant = 0; variant < 7; variant++) {
 		uint32 self, peer;
 		XLogRecPtr lower = REC_SELF_REDO;
 		ClusterWalRetainedPinV1 pin = CLUSTER_WAL_RETAINED_PIN_NONE;
@@ -102,11 +103,20 @@ UT_TEST(test_records_commit_with_invalidations_is_classified)
 		} else
 			rec_commit(self, 0x1800, 0x1900, 801, variant == 2 ? drops : NULL, variant == 2 ? 1 : 0,
 					   false, 3);
-		if (variant == 1) { /* a peer obligation of the same class */
+		if (variant == 1) /* a peer commit: its own segment's slot */
 			rec_commit(peer, 0x6100, 0x6200, 902, NULL, 0, false, 0);
+		else if (variant == 5) { /* a later typed commit on the same TT slot */
+			rec_commit(self, 0x3200, 0x3300, 802, NULL, 0, false, 0);
 			lower = 0x1800;
 			pin = CLUSTER_WAL_RETAINED_PIN_SIDE;
-			side = RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL;
+			side = RF_SIDE_CONTRIBUTION_UNDO_HEADER;
+		} else if (variant == 6) {
+			/* A native COMMIT PREPARED: its TT slots are unkeyed, so as an
+			 * obligation it keeps all UNDO_HEADER history. */
+			rec_commit_prepared(self, 0x3200, 0x3300, 990);
+			lower = 0x1800;
+			pin = CLUSTER_WAL_RETAINED_PIN_SIDE;
+			side = RF_SIDE_CONTRIBUTION_UNDO_HEADER;
 		} else if (variant == 2) {
 			lower = 0x1800;
 			pin = CLUSTER_WAL_RETAINED_PIN_STRUCTURE;
@@ -277,6 +287,28 @@ UT_TEST(test_records_short_abort_does_not_advance_retention)
 			UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE);
 		if (ut_current_failed)
 			printf("# damaged transaction end variant %d\n", variant);
+	}
+}
+
+/* R-A18 with the real undo decoder: a TT slot stamped again after the
+ * completion keeps its earlier stamps, another slot's do not. */
+UT_TEST(test_records_tt_slot_stamps_are_keyed)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		uint32 self, peer;
+
+		rec_two_writers(&self, &peer);
+		rec_tt_commit(self, 0x1400, 0x1440, 801, 4);
+		rec_tt_commit(self, 0x1800, 0x1840, 802, 5);
+		if (variant == 0)
+			rec_tt_commit(self, 0x3200, 0x3240, 803, 4);
+		else if (variant == 1)
+			rec_tt_commit(self, 0x3200, 0x3240, 803, 9);
+		expect_cut(self, variant == 0 ? 0x1400 : REC_SELF_REDO,
+				   variant == 0 ? CLUSTER_WAL_RETAINED_PIN_SIDE : CLUSTER_WAL_RETAINED_PIN_NONE,
+				   variant == 0 ? RF_SIDE_CONTRIBUTION_UNDO_HEADER : 0);
+		if (ut_current_failed)
+			printf("# tt stamp variant %d\n", variant);
 	}
 }
 
