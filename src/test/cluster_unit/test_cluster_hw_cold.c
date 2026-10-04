@@ -429,6 +429,54 @@ UT_TEST(recovery_keeps_original_load_and_state_contract)
 	cluster_hw_snapshot_checkpoint_write(8192);
 	UT_ASSERT_EQ(cold_writes, reads);
 }
+/* D S09 R-A15: a single-node root-backed crash recovery rebuilds its own
+ * checkpoint snapshot before the tail, so its checkpoints keep the snapshot
+ * bound to their redo and the next clean boot loads it.  Without the exact
+ * snapshot, recovery still starts and nothing is rewritten. */
+UT_TEST(single_node_recovery_rebuilds_and_keeps_the_snapshot_current)
+{
+	const char *reason = NULL;
+	ClusterHwSnapshotHeader hdr = { 0 };
+	ClusterHwSnapshotEntry entries[3] = { { 0 } };
+	ClusterResId tail = cold_key(20001);
+	unsigned writes;
+
+	for (unsigned leg = 0; leg < 3; leg++) {
+		cold_setup();
+		fixture_node_count = 1;
+		if (leg != 2)
+			cold_snapshot(CLUSTER_HW_SNAPSHOT_CHECKPOINT, leg == 0 ? 4096 : 2048,
+						  GetSystemIdentifier(), 2);
+		else { /* no snapshot at all */
+			char path[MAXPGPATH];
+
+			UT_ASSERT(cluster_hw_snapshot_path(7, path, sizeof(path)));
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		UT_ASSERT(cluster_hw_startup_prepare(true, false, 4096, &reason));
+		UT_ASSERT(reason == NULL);
+		UT_ASSERT_EQ(cluster_hw_cold_boot_mode(), CLUSTER_HW_BOOT_EXISTING_RECOVERY);
+		UT_ASSERT_EQ(cluster_hw_cold_boot_state(),
+					 leg == 0 ? CLUSTER_HW_REBUILT : CLUSTER_HW_FAILED);
+		cluster_hw_apply_hwm(&tail, 250); /* HW_RESERVE redo after the redo point */
+		UT_ASSERT(cluster_hw_startup_complete(&reason));
+		writes = cold_writes;
+		UT_ASSERT(!cold_checkpoint_rejected(8192));
+		UT_ASSERT_EQ(cold_writes, writes + (leg == 0 ? 1 : 0));
+		UT_ASSERT_EQ(
+			cluster_hw_snapshot_normal_read(7, GetSystemIdentifier(), 8192, &hdr, entries, 3),
+			leg == 0 ? CLUSTER_HW_NORMAL_READ_VALID
+					 : (leg == 1 ? CLUSTER_HW_NORMAL_READ_LSN : CLUSTER_HW_NORMAL_READ_MISSING));
+		if (leg == 0) { /* max(snapshot, tail) */
+			UT_ASSERT_EQ(hdr.n_entries, 2);
+			UT_ASSERT_EQ(entries[0].next_hwm, 100);
+			UT_ASSERT_EQ(entries[1].next_hwm, 250);
+		}
+		if (ut_current_failed)
+			printf("# recovery snapshot leg %u\n", leg);
+	}
+	fixture_node_count = 4;
+}
 UT_TEST(normal_has_no_partial_success_when_shared_table_cannot_hold_the_file)
 {
 	const char *reason = NULL;
@@ -542,7 +590,7 @@ main(void)
 {
 	if (mkdtemp(cold_root) == NULL)
 		return 2;
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(shared_space_startup_does_not_load_or_admit_legacy_cache);
 	UT_RUN(shared_space_checkpoint_and_recovery_have_no_snapshot_io);
 	UT_RUN(shared_space_native_startup_keeps_role_and_checkpoint_prerequisites);
@@ -552,6 +600,7 @@ main(void)
 	UT_RUN(normal_read_failure_is_sticky_and_never_becomes_recovery);
 	UT_RUN(seed_metadata_is_maintained_without_enabling_single_node_allocation);
 	UT_RUN(recovery_keeps_original_load_and_state_contract);
+	UT_RUN(single_node_recovery_rebuilds_and_keeps_the_snapshot_current);
 	UT_RUN(normal_has_no_partial_success_when_shared_table_cannot_hold_the_file);
 	UT_RUN(startup_role_classification_and_no_metadata_are_distinct);
 	UT_RUN(actual_wal_tail_uses_own_decoded_checkpoint_and_recovery_decision);

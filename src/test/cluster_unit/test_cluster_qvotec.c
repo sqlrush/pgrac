@@ -2445,6 +2445,93 @@ UT_TEST(test_prior_exit_cannot_be_replaced_by_another_probe)
 	pgsa_disk_set_close(&set);
 }
 
+/*
+ * PGRAC (S9P2-05, founder self-seal): the boot's own pre-heartbeat snapshot
+ * proves an old incarnation dead only when every configured slot names
+ * exactly that incarnation and its last heartbeat is older than both the
+ * caller's death threshold and this node's write lease (so a still-living
+ * old instance could no longer commit).  Author: SqlRush <sqlrush@gmail.com>
+ */
+#define DEATH_LEASE_US ((uint64)2000 * 30 * 1000)
+
+UT_TEST(test_prior_death_proves_stale_unclean_slots)
+{
+	PgsaDiskSet set;
+	ClusterQvotecPriorExitObservation out;
+	bool unclean;
+
+	UT_ASSERT(normal_stop_disk_set(&set)); /* ALIVE incarnation 901, heartbeat 1 */
+	cluster_shared_config = true;
+	UT_ASSERT(normal_stop_startup_probe(&set, &unclean));
+	UT_ASSERT(unclean);
+	UT_ASSERT(
+		cluster_qvotec_prior_death_observe(0, 901, 902, 1 + DEATH_LEASE_US + 1, 3000000, &out));
+	UT_ASSERT_EQ(out.observing_incarnation, 902);
+	UT_ASSERT_EQ(out.n_disks, 3);
+	UT_ASSERT_EQ(out.slots[2].incarnation, 901);
+	/* not older than the write lease yet */
+	UT_ASSERT(!cluster_qvotec_prior_death_observe(0, 901, 902, 1 + DEATH_LEASE_US, 3000000, &out));
+	UT_ASSERT_EQ(out.n_disks, 0);
+	/* a death threshold above the lease rules */
+	UT_ASSERT(!cluster_qvotec_prior_death_observe(0, 901, 902, 1 + DEATH_LEASE_US + 1,
+												  DEATH_LEASE_US * 2, &out));
+	UT_ASSERT(cluster_qvotec_prior_death_observe(0, 901, 902, 1 + DEATH_LEASE_US * 2 + 1,
+												 DEATH_LEASE_US * 2, &out));
+	cluster_shared_config = false;
+	pgsa_disk_set_close(&set);
+
+	/* A cleanly closed old incarnation is dead too. */
+	UT_ASSERT(normal_stop_disk_set(&set));
+	UT_ASSERT(cluster_qvotec_test_clean_shutdown(set.fds, 3, 901, 12));
+	cluster_shared_config = true;
+	UT_ASSERT(normal_stop_startup_probe(&set, &unclean));
+	UT_ASSERT(!unclean);
+	UT_ASSERT(cluster_qvotec_prior_death_observe(
+		0, 901, 902, (uint64)GetCurrentTimestamp() + DEATH_LEASE_US + 1, 3000000, &out));
+	cluster_shared_config = false;
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_prior_death_refuses_mixed_fresh_or_other_boot)
+{
+	for (int fault = 0; fault < 10; fault++) {
+		PgsaDiskSet set;
+		ClusterVotingSlot slot;
+		ClusterQvotecPriorExitObservation out, zero = { 0 };
+		bool unclean;
+		uint64 now = 1 + DEATH_LEASE_US + 1;
+
+		UT_ASSERT(normal_stop_disk_set(&set));
+		UT_ASSERT_EQ(cluster_voting_disk_read_slot(set.fds[1], 1, 0, &slot), 0);
+		if (fault == 0)
+			slot.generation = 0;
+		else if (fault == 1)
+			slot.incarnation = 900; /* an older incarnation on one disk */
+		else if (fault == 2)
+			slot.heartbeat_ts_us = now + 1; /* in the future */
+		else if (fault == 3)
+			slot.heartbeat_ts_us = now - 10; /* still within the lease */
+		else if (fault == 4)
+			slot.flags |= UINT64_C(1) << 5; /* unknown flag */
+		UT_ASSERT_EQ(cluster_voting_disk_write_slot(set.fds[1], &slot), 0);
+		cluster_shared_config = true;
+		UT_ASSERT(normal_stop_startup_probe(&set, &unclean));
+		if (fault == 5)
+			cluster_qvotec_publish_self_incarnation(903);
+		if (fault == 6)
+			cluster_voting_disks = "disk0,disk1";
+		memset(&out, 0xff, sizeof(out));
+		UT_ASSERT(!cluster_qvotec_prior_death_observe(fault == 7 ? 1 : 0,
+													  fault == 8   ? 902
+													  : fault == 9 ? 0
+																   : 901,
+													  902, now, 3000000, &out));
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		cluster_shared_config = false;
+		pgsa_disk_set_close(&set);
+	}
+}
+
 UT_TEST(test_normal_stop_third_disk_write_failure_is_not_majority_success)
 {
 	PgsaDiskSet set;
@@ -3924,7 +4011,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(76);
+	UT_PLAN(78);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -3995,6 +4082,8 @@ main(void)
 	UT_RUN(test_prior_exit_retains_exact_preheartbeat_slots);
 	UT_RUN(test_prior_exit_refuses_empty_mixed_live_or_other_boot);
 	UT_RUN(test_prior_exit_cannot_be_replaced_by_another_probe);
+	UT_RUN(test_prior_death_proves_stale_unclean_slots);
+	UT_RUN(test_prior_death_refuses_mixed_fresh_or_other_boot);
 	UT_RUN(test_normal_stop_third_disk_write_failure_is_not_majority_success);
 	UT_RUN(test_normal_stop_third_disk_read_and_missing_fd_fail);
 	UT_RUN(test_normal_stop_sync_and_short_write_fail_even_after_bytes_change);

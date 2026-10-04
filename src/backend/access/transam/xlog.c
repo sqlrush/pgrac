@@ -104,6 +104,39 @@
  *	Why:
  *	  Cold crash recovery must be serialized cluster-wide under the
  *	  spec-5.6 rendezvous-forced concurrent boots (INV-D9-R).
+ *
+ * PGRAC MODIFICATIONS (S9P2-05 founder self-seal)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-s9p2-05-instance-and-cluster-recovery.md
+ *
+ *	What changed:
+ *	  - StartupXLOG(): with cluster.shared_config, a start whose own
+ *	    thread crashed (in production, shutting down or in crash
+ *	    recovery) first seals this node's crashed generation
+ *	    (ClusterStartupCrashSeal) instead of selecting a clean successor;
+ *	    every other start is unchanged.
+ *
+ *	Why:
+ *	  After every instance failed, the founder must recover its own
+ *	  previous generation like any other; its input is sealed on the
+ *	  self-seal evidence (newer admitted incarnation, old incarnation dead
+ *	  on the voting disks, exact restart input), never by guesswork.
+ *
+ * PGRAC MODIFICATIONS (S07 retention lower)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-s9p2-03-shared-wal-and-checkpoint.md
+ *
+ *	What changed:
+ *	  - CreateCheckPoint(): after an online checkpoint's ROOT is published
+ *	    and before WAL cleanup, cluster_wal_retained_cut_after_checkpoint_v1
+ *	    may move the ROOT physical retention lower forward.
+ *
+ *	Why:
+ *	  The ROOT lower otherwise keeps every retained segment of the thread
+ *	  forever; cleanup can only use a lower that the complete retained
+ *	  input proves and that is already published.
  */
 
 #include "postgres.h"
@@ -189,6 +222,7 @@
 #include "cluster/cluster_scn.h" /* PGRAC: xl_scn stamp (spec-4.5) */
 #include "cluster/cluster_wal_state.h" /* PGRAC: checkpoint redo / fpw sticky (spec-4.5) */
 #include "cluster/cluster_wal_retention.h" /* PGRAC: STOP-05 guarded WAL reuse */
+#include "cluster/cluster_wal_retained_cut.h" /* PGRAC: S07 retention lower */
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_initdb_base.h"
 #include "cluster/cluster_wal_writer.h" /* PGRAC: durable group-flush promise */
@@ -6222,6 +6256,72 @@ ClusterStartupWriterSelect(void)
 	clusterStartupWriterSelected = true;
 }
 
+/*
+ * PGRAC (S9P2-05): this node's own thread did not shut down cleanly.  Seal
+ * its crashed generation (OPEN, or sealed without its tail) on the self-seal
+ * evidence before recovery reads it; a generation already sealed is taken as
+ * it is.  Evidence that is not there yet -- the quorum or this boot's
+ * membership still forming, the old incarnation's last heartbeat not yet past
+ * the death threshold and its write lease -- is waited for; a contradiction
+ * stops startup.  Recovery itself, completion and the successor writer come
+ * later.  Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+ClusterStartupCrashSeal(void)
+{
+	ClusterWalSourceRef restart;
+	ClusterControlRootSnapshot sealed;
+	ClusterControlRootReadToken token;
+	ClusterControlRootResult result;
+	uint64		min_dead_us = (uint64) cluster_cssd_dead_deadband_factor *
+		(uint64) cluster_cssd_heartbeat_interval_ms * 1000;
+	TimestampTz last_report = 0;
+
+	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || CritSectionCount != 0
+		|| ShutdownRequestPending || InRecovery || ArchiveRecoveryRequested
+		|| ControlFile->state == DB_SHUTDOWNED || LWLockHeldByMe(ControlFileLock)
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| !cluster_wal_thread_restart_v2_ref(&restart))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("crashed shared startup has no exact immutable input")));
+	for (;;) {
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		ClusterStartupConfigurationRequire();
+		result = cluster_control_root_v3_self_seal_v1(&restart, min_dead_us, &sealed, &token);
+		if (result != CLUSTER_CONTROL_ROOT_STALE_TOKEN
+			&& result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+			&& result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+			&& result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
+			break;
+		if (TimestampDifferenceExceeds(last_report, GetCurrentTimestamp(), 10000)) {
+			ereport(LOG,
+					(errmsg("waiting to seal this node's crashed generation (result %d)",
+							(int) result),
+					 errdetail("The quorum must admit this boot as a member and the old "
+							   "incarnation's last voting-disk heartbeat must be older than its "
+							   "death threshold and write lease.")));
+			last_report = GetCurrentTimestamp();
+		}
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 100,
+						 WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+		ResetLatch(MyLatch);
+	}
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("could not seal this node's crashed generation"),
+				 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=SELF_SEAL_REFUSED result=%d",
+						   (int) result),
+				 errhint("Preserve this node's WAL and the voting disks; do not clear them to "
+						 "force a start.")));
+	ereport(LOG,
+			(errmsg("sealed this node's crashed generation (thread %u, validated tail %X/%X)",
+					(unsigned) sealed.identity.origin_thread_id,
+					LSN_FORMAT_ARGS(sealed.validated_tail_lsn_exclusive))));
+}
+
 /* PGRAC: after FinishWalRecovery, revalidate the selected initializer and
  * bind its independent successor stream before native WAL writes.
  * Author: SqlRush <sqlrush@gmail.com> */
@@ -6548,7 +6648,11 @@ StartupXLOG(void)
 	/* PGRAC: native startup can change side files before it emits any WAL.
 	 * First make that work belong to the exact recoverable initializer.
 	 * Author: SqlRush <sqlrush@gmail.com> */
-	if (cluster_shared_config)
+	if (cluster_shared_config
+		&& (ControlFile->state == DB_IN_PRODUCTION || ControlFile->state == DB_SHUTDOWNING
+			|| ControlFile->state == DB_IN_CRASH_RECOVERY))
+		ClusterStartupCrashSeal();
+	else if (cluster_shared_config)
 		ClusterStartupWriterSelect();
 #endif
 
@@ -9196,6 +9300,13 @@ CreateCheckPoint(int flags)
 	 * outer CF, native content lock or critical section encloses this wait. */
 	if (cluster_shared_config)
 		ClusterCheckpointV3Publish(&v3_checkpoint, recptr);
+
+	/* PGRAC (S07): with this checkpoint's ROOT published, move the physical
+	 * retention lower forward when the complete retained input allows it.
+	 * The WAL cleanup below reads only the published ROOT.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config && !shutdown)
+		cluster_wal_retained_cut_after_checkpoint_v1();
 
 	/*
 	 * RF A1 W5a: only a non-EOR checkpoint advertises its now-durable redo

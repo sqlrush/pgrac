@@ -21004,6 +21004,176 @@ UT_TEST(test_local_pi_redeclare_busy_or_unknown_scope_keeps_original_cursor)
 	local_pi_writer_ready = cluster_shared_config = false;
 }
 
+/* D S09 R-A19: the local PI floor of one WAL source (read-only scan). */
+static ClusterPageWalBindingV1
+local_pi_floor_record(BufferTag tag, ClusterPageWalBindingV1 b, XLogRecPtr start)
+{
+	b.identity.locator = BufTagGetRelFileLocator(&tag);
+	b.identity.forknum = tag.forkNum;
+	b.identity.blockno = tag.blockNum;
+	b.version.mutation_token += start;
+	b.record_start = start;
+	b.record_end = start + 40;
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &b));
+	return b;
+}
+
+static ClusterWalSourceRef
+local_pi_floor_foreign(ClusterWalSourceRef source)
+{
+	source.claim.identity.origin_node_id = 1;
+	source.claim.identity.origin_thread_id = 2;
+	source.claim.identity.origin_owner_incarnation = 71;
+	return source;
+}
+
+UT_TEST(test_local_pi_floor_of_an_empty_directory)
+{
+	BufferTag tag = make_tag(930);
+	ClusterPageWalBindingV1 b = local_pi_setup(tag);
+	ClusterPcmLocalPiFloorV1 floor;
+
+	memset(&floor, 0x7f, sizeof(floor));
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&b.source, &floor));
+	UT_ASSERT_EQ(floor.floor, InvalidXLogRecPtr);
+	UT_ASSERT_EQ(floor.bounded + floor.unbounded + floor.foreign + floor.examined, 0);
+	UT_ASSERT(!cluster_pcm_local_pi_floor_v1(NULL, &floor));
+	UT_ASSERT(!cluster_pcm_local_pi_floor_v1(&b.source, NULL));
+	cluster_shared_config = false;
+	memset(&floor, 0x7f, sizeof(floor));
+	UT_ASSERT(!cluster_pcm_local_pi_floor_v1(&b.source, &floor));
+	UT_ASSERT_EQ(floor.floor, InvalidXLogRecPtr);
+	UT_ASSERT_EQ(floor.examined, 0);
+	local_pi_writer_ready = false;
+}
+
+/* The least first record of the source's responsibilities; a later record
+ * of a responsibility does not move it, a retirement does. */
+UT_TEST(test_local_pi_floor_is_the_least_first_record_of_the_source)
+{
+	BufferTag a = make_tag(931), b_tag = make_tag(932), c = make_tag(933), d = make_tag(934);
+	ClusterPageWalBindingV1 b = local_pi_setup(a), latest;
+	ClusterPcmLocalPiFloorV1 floor;
+	ClusterPcmLocalPiSnapshotV1 current;
+	const ClusterPageDataReceiptV1 *receipt = (const void *)&pi_receipt_fixture;
+
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	(void)local_pi_floor_record(a, b, 300);
+	latest = local_pi_floor_record(b_tag, b, 100);
+	(void)local_pi_floor_record(c, b, 200);
+	/* An entry with no responsibility. */
+	UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(d, PCM_STATE_X, 5, 19, 2, 7));
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&b.source, &floor));
+	UT_ASSERT_EQ(floor.floor, 100);
+	UT_ASSERT_EQ(floor.bounded, 3);
+	UT_ASSERT_EQ(floor.unbounded + floor.foreign, 0);
+	UT_ASSERT_EQ(floor.examined, 4);
+	(void)local_pi_floor_record(b_tag, latest, 500);
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&b.source, &floor));
+	UT_ASSERT_EQ(floor.floor, 100);
+	pi_receipt_valid = true;
+	pi_storage_receipt_valid = false;
+	memset(&pi_receipt_cut, 0, sizeof(pi_receipt_cut));
+	pi_ack_cut = pi_receipt_cut;
+	pi_ack_available = 1;
+	pi_ack_imported = 0;
+	local_pi_covered = true;
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(b_tag, &current));
+	UT_ASSERT(cluster_pcm_local_pi_retire_v1(&current, receipt, NULL, NULL, 0, pi_acks[0]));
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&b.source, &floor));
+	UT_ASSERT_EQ(floor.floor, 200);
+	UT_ASSERT_EQ(floor.bounded, 2);
+	UT_ASSERT_EQ(floor.examined, 4);
+	/* Its directory entry can now be reclaimed: the tombstone is skipped. */
+	UT_ASSERT(pcm_entry_try_retire_exact(&b_tag, current.binding_generation,
+										 PCM_RETIRE_REASON_PI_DISCARDED));
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&b.source, &floor));
+	UT_ASSERT_EQ(floor.floor, 200);
+	UT_ASSERT_EQ(floor.examined, 3);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	local_pi_writer_ready = cluster_shared_config = false;
+}
+
+/* A responsibility that starts at another source's record cannot bound
+ * this source: if its latest record is this source's, it is unbounded;
+ * if neither is, it does not concern this source. */
+UT_TEST(test_local_pi_floor_classifies_responsibilities_of_other_sources)
+{
+	BufferTag a = make_tag(935), b_tag = make_tag(936), c = make_tag(937);
+	ClusterPageWalBindingV1 b = local_pi_setup(a), other = b;
+	ClusterPcmLocalPiFloorV1 floor;
+
+	other.source = local_pi_floor_foreign(b.source);
+	(void)local_pi_floor_record(a, other, 50);
+	(void)local_pi_floor_record(a, b, 400); /* foreign first, own latest */
+	(void)local_pi_floor_record(b_tag, other, 60);
+	(void)local_pi_floor_record(c, b, 700);
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&b.source, &floor));
+	UT_ASSERT_EQ(floor.floor, 700);
+	UT_ASSERT_EQ(floor.bounded, 1);
+	UT_ASSERT_EQ(floor.unbounded, 1);
+	UT_ASSERT_EQ(floor.foreign, 1);
+	UT_ASSERT_EQ(floor.examined, 3);
+	/* From the other source's view the roles swap. */
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&other.source, &floor));
+	UT_ASSERT_EQ(floor.floor, 50);
+	UT_ASSERT_EQ(floor.bounded, 2);
+	UT_ASSERT_EQ(floor.unbounded, 0);
+	UT_ASSERT_EQ(floor.foreign, 1);
+	/* The same identity on another timeline, claim or database incarnation
+	 * is another source; a configuration generation is not. */
+	for (int variant = 0; variant < 4; variant++) {
+		other = b;
+		if (variant == 0)
+			other.source.timeline++;
+		else if (variant == 1)
+			other.source.claim.claim_sha256[31]++;
+		else if (variant == 2)
+			other.source.claim.database_incarnation++;
+		else
+			other.source.claim.max_config_generation++;
+		UT_ASSERT(cluster_pcm_local_pi_floor_v1(&other.source, &floor));
+		UT_ASSERT_EQ(floor.bounded, variant == 3 ? 1 : 0);
+		UT_ASSERT_EQ(floor.unbounded, variant == 3 ? 1 : 0);
+		UT_ASSERT_EQ(floor.foreign, variant == 3 ? 1 : 3);
+		if (ut_current_failed)
+			printf("# floor source variant %d\n", variant);
+	}
+	local_pi_writer_ready = cluster_shared_config = false;
+}
+
+/* The scan takes no pin: a quiescing entry stays quiescing.  A broken
+ * responsibility snapshot refuses the whole floor. */
+UT_TEST(test_local_pi_floor_is_read_only_and_refuses_a_broken_entry)
+{
+	BufferTag tag = make_tag(938);
+	ClusterPageWalBindingV1 b = local_pi_setup(tag);
+	ClusterPcmLocalPiFloorV1 floor;
+	struct StopPcmEntryLayout *entry;
+	uint16 flags;
+
+	(void)local_pi_floor_record(tag, b, 100);
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	pg_atomic_write_u32(&entry->lifecycle, PCM_ENTRY_QUIESCING);
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&b.source, &floor));
+	UT_ASSERT_EQ(floor.floor, 100);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->lifecycle), PCM_ENTRY_QUIESCING);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pin_count), 0);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	pg_atomic_write_u32(&entry->lifecycle, PCM_ENTRY_LIVE);
+	flags = entry->local_pi_last.source_flags;
+	entry->local_pi_last.source_flags = 0;
+	memset(&floor, 0x7f, sizeof(floor));
+	UT_ASSERT(!cluster_pcm_local_pi_floor_v1(&b.source, &floor));
+	UT_ASSERT_EQ(floor.floor, InvalidXLogRecPtr);
+	UT_ASSERT_EQ(floor.bounded, 0);
+	UT_ASSERT_EQ(fake_lwlock_depth, 0);
+	entry->local_pi_last.source_flags = flags;
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&b.source, &floor));
+	local_pi_writer_ready = cluster_shared_config = false;
+}
+
 /* Exercise the production pump against the real PCM registry and clock.
  * Only the OS wake/capability/ring and local callback boundaries are doubles. */
 static int pump_delivery_calls;
@@ -21508,7 +21678,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(323);
+	UT_PLAN(327);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -21823,6 +21993,10 @@ main(void)
 	UT_RUN(test_local_pi_read_only_carrier_does_not_create_writer_responsibility);
 	UT_RUN(test_local_pi_redeclare_does_not_need_resident_buffer_or_current_authority);
 	UT_RUN(test_local_pi_redeclare_busy_or_unknown_scope_keeps_original_cursor);
+	UT_RUN(test_local_pi_floor_of_an_empty_directory);
+	UT_RUN(test_local_pi_floor_is_the_least_first_record_of_the_source);
+	UT_RUN(test_local_pi_floor_classifies_responsibilities_of_other_sources);
+	UT_RUN(test_local_pi_floor_is_read_only_and_refuses_a_broken_entry);
 	UT_RUN(test_resource_x_retry_locked_stage_keeps_last_attempt);
 	UT_RUN(test_resource_x_transport_completion_rejects_old_episode);
 	UT_RUN(test_resource_x_retry_sparse_scans_preserve_undue_owner);

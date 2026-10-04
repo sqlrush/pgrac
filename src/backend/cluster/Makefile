@@ -282,6 +282,7 @@ OBJS = \
 	cluster_visibility_verdict.o \
 	cluster_writer_chain.o \
 	cluster_wal_retention.o \
+	cluster_wal_retained_cut.o \
 	cluster_undo_record.o \
 	cluster_undo_resid.o \
 	cluster_undo_authority.o \

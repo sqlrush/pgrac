@@ -513,6 +513,15 @@ rf_side_xact_structural_preflight_v1(const RfSideXactOperationV1 *operation)
 	}
 }
 
+/* D S09 (A request, S07 integration): the bounded completion shape for
+ * readers that classify a transaction end the typed decoder does not own.
+ * A record it refuses is damaged, not merely unsupported. */
+bool
+rf_side_xact_completion_shape_v1(XLogReaderState *record, bool commit)
+{
+	return record != NULL && side_xact_completion_shape_valid(record, commit);
+}
+
 bool
 rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier, uint16 origin_thread,
 					   RfSideXactOperationV1 *out)

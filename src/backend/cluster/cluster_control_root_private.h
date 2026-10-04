@@ -671,6 +671,24 @@ extern ClusterControlRootResult
 cluster_control_root_v3_failure_tail_publish(const struct ClusterRecoverySerialRequest *request,
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token);
+/* PGRAC (S9P2-05, PU-D-5): the founder's StartupProcess seals this node's
+ * own crashed generation (OPEN, or sealed without its tail) on self-seal
+ * evidence; min_dead_us is the caller's death threshold, raised to the
+ * write lease.  OK returns the sealed RECOVERY_REQUIRED root.  Refusal
+ * clears outputs; never recovery, completion or serving permission. */
+extern ClusterControlRootResult
+cluster_control_root_v3_self_seal_v1(const ClusterWalSourceRef *restart, uint64 min_dead_us,
+									 ClusterControlRootSnapshot *out,
+									 ClusterControlRootReadToken *out_token);
+
+/* S07: move this thread's ROOT physical retention lower forward to a bound
+ * computed by the retained-cut census under census_token (the whole ROOT
+ * file token).  Refuses unless the ROOT and the anchor's native redo are the
+ * ones the census used; old lower <= lower <= native redo.  Checkpointer
+ * only, no CF held; the published value is durable and reread on success. */
+extern ClusterControlRootResult cluster_control_root_v3_retained_lower_publish(
+	const ClusterControlRootIdentity *self, const ClusterControlRootFileToken *census_token,
+	XLogRecPtr native_redo, XLogRecPtr lower, ClusterControlRootSnapshot *out);
 
 extern bool
 cluster_control_root_create_authority_current_v1(const ClusterControlRootMigrationImage *image,

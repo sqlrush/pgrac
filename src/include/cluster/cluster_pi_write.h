@@ -142,6 +142,25 @@ typedef struct ClusterPcmLocalPiSnapshotV1 {
  * leaves the previous responsibility intact and the handoff must retry. */
 extern bool cluster_pcm_local_pi_record_v1(BufferTag tag, const ClusterPageWalBindingV1 *binding);
 extern bool cluster_pcm_local_pi_snapshot_v1(BufferTag tag, ClusterPcmLocalPiSnapshotV1 *out);
+
+/* Local PI responsibilities as seen by one WAL source. A responsibility is
+ * bounded when its first binding is the source's record; unbounded when
+ * only its latest binding is (an earlier own record may lie in between). */
+typedef struct ClusterPcmLocalPiFloorV1 {
+	XLogRecPtr floor; /* least bounded first record_start, or Invalid */
+	uint64 bounded;
+	uint64 unbounded;
+	uint64 foreign;	 /* neither binding is the source's */
+	uint64 examined; /* live directory entries examined */
+} ClusterPcmLocalPiFloorV1;
+
+/* Read-only scan of the local directory, one entry lock at a time; takes no
+ * pin. Counts every responsibility unretired when the call starts and still
+ * unretired when its entry is examined; one first recorded after the call
+ * starts may be missed and must be bounded by the caller. False (output
+ * zeroed) when the directory is not ready or an entry is inconsistent. */
+extern bool cluster_pcm_local_pi_floor_v1(const ClusterWalSourceRef *source,
+										  ClusterPcmLocalPiFloorV1 *out);
 extern bool cluster_page_data_covers_local_pi_v1(const ClusterPageDataReceiptV1 *receipt,
 												 const RfPageOnlinePlanV1 *plan,
 												 const ClusterWalSourceRef *sources,

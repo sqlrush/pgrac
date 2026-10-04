@@ -418,10 +418,13 @@ qvotec_pgstat_lookup_all(void)
  * The real poll owner publishes a thirty-period laboratory lease. Observers never
  * renew it. This is PGRAC policy, not a verified Oracle internal lease value.
  */
+#define QVOTEC_LEASE_POLL_PERIODS 30
+
 static void
 qvotec_publish_poll_lease(uint64 now_us)
 {
-	uint64 next_lease_expire = now_us + (uint64)cluster_quorum_poll_interval_ms * 30 * 1000ULL;
+	uint64 next_lease_expire
+		= now_us + (uint64)cluster_quorum_poll_interval_ms * QVOTEC_LEASE_POLL_PERIODS * 1000ULL;
 
 	pg_atomic_write_u64(&QvotecShmem->last_poll_ts_us, now_us);
 	pg_atomic_write_u64(&QvotecShmem->lease_expire_at_us, next_lease_expire);
@@ -962,6 +965,62 @@ cluster_qvotec_prior_exit_observe(uint32 node_id, uint64 prior_incarnation,
 		if (slot->magic != CLUSTER_VOTING_SLOT_MAGIC || slot->version != CLUSTER_VOTING_SLOT_VERSION
 			|| slot->node_id != node_id || slot->disk_index != d || slot->generation == 0
 			|| slot->incarnation != prior_incarnation || slot->flags != 0
+			|| slot->crc32c != cluster_voting_disk_compute_crc32c(slot))
+			return false;
+	}
+	*out = *observed;
+	pg_read_barrier();
+	if (pg_atomic_read_u32(&QvotecShmem->prior_exit_state) != 2
+		|| cluster_qvotec_get_self_incarnation() != observing_incarnation) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	return true;
+}
+
+/*
+ * PGRAC (S9P2-05): the boot's own pre-heartbeat snapshot proves `prior_incarnation`
+ * of this node dead at now_us only when every configured slot names exactly
+ * that incarnation (live, frozen or closed) and its last heartbeat is older
+ * than both min_dead_us and this node's write lease: an old instance still
+ * running would have lost its commit lease by then.  An old instance still
+ * heartbeating meets the Q6 newer-self refusal instead.  Refusal clears the
+ * output.  Author: SqlRush <sqlrush@gmail.com>
+ */
+bool
+cluster_qvotec_prior_death_observe(uint32 node_id, uint64 prior_incarnation,
+								   uint64 observing_incarnation, uint64 now_us, uint64 min_dead_us,
+								   ClusterQvotecPriorExitObservation *out)
+{
+	const ClusterQvotecPriorExitObservation *observed;
+	uint64 dead_us = (uint64)cluster_quorum_poll_interval_ms * QVOTEC_LEASE_POLL_PERIODS * 1000ULL;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || QvotecShmem == NULL || !cluster_shared_config || node_id >= CLUSTER_MAX_NODES
+		|| cluster_node_id != (int)node_id || prior_incarnation == 0 || observing_incarnation == 0
+		|| prior_incarnation == observing_incarnation
+		|| pg_atomic_read_u32(&QvotecShmem->prior_exit_state) != 2)
+		return false;
+	dead_us = Max(dead_us, min_dead_us);
+	pg_read_barrier();
+	observed = &QvotecShmem->prior_exit;
+	if (QvotecShmem->prior_exit_pad != 0 || observed->node_id != node_id
+		|| observed->observing_incarnation != observing_incarnation
+		|| cluster_qvotec_get_self_incarnation() != observing_incarnation || observed->n_disks == 0
+		|| observed->n_disks > CLUSTER_MAX_VOTING_DISKS
+		|| qvotec_shutdown_configured_disks() != (int)observed->n_disks)
+		return false;
+	for (uint32 d = 0; d < observed->n_disks; d++) {
+		const ClusterVotingSlot *slot = &observed->slots[d];
+
+		if (slot->magic != CLUSTER_VOTING_SLOT_MAGIC || slot->version != CLUSTER_VOTING_SLOT_VERSION
+			|| slot->node_id != node_id || slot->disk_index != d || slot->generation == 0
+			|| slot->incarnation != prior_incarnation
+			|| (slot->flags
+				& ~(CLUSTER_VOTING_SLOT_FLAG_ALIVE | CLUSTER_VOTING_SLOT_FLAG_WRITE_FROZEN))
+				   != 0
+			|| slot->heartbeat_ts_us > now_us || now_us - slot->heartbeat_ts_us <= dead_us
 			|| slot->crc32c != cluster_voting_disk_compute_crc32c(slot))
 			return false;
 	}
@@ -4714,6 +4773,18 @@ cluster_qvotec_prior_exit_observe(uint32 node_id pg_attribute_unused(),
 								  uint64 prior_incarnation pg_attribute_unused(),
 								  uint64 observing_incarnation pg_attribute_unused(),
 								  ClusterQvotecPriorExitObservation *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
+bool
+cluster_qvotec_prior_death_observe(uint32 node_id pg_attribute_unused(),
+								   uint64 prior_incarnation pg_attribute_unused(),
+								   uint64 observing_incarnation pg_attribute_unused(),
+								   uint64 now_us pg_attribute_unused(),
+								   uint64 min_dead_us pg_attribute_unused(),
+								   ClusterQvotecPriorExitObservation *out)
 {
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));

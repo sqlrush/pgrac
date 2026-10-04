@@ -482,6 +482,23 @@ cluster_qvotec_prior_exit_observe(uint32 node, uint64 prior, uint64 observer,
 		   && observer == inputs_observer_boot;
 }
 
+/* PGRAC (S9P2-05): the founder self-seal's voting evidence, recorded. */
+static bool test_death_proven;
+static uint64 test_death_prior, test_death_observer, test_death_min_us;
+static int test_death_calls;
+bool
+cluster_qvotec_prior_death_observe(uint32 node, uint64 prior, uint64 observer, uint64 now_us,
+								   uint64 min_dead_us, ClusterQvotecPriorExitObservation *out)
+{
+	(void)now_us;
+	memset(out, 0, sizeof(*out));
+	test_death_calls++;
+	test_death_prior = prior;
+	test_death_observer = observer;
+	test_death_min_us = min_dead_us;
+	return test_death_proven && node == (uint32)cluster_node_id;
+}
+
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
@@ -18498,6 +18515,172 @@ UT_TEST(test_v3_failure_publishers_preserve_pending_and_authenticate_native_inpu
 	}
 }
 
+/*
+ * PGRAC (S9P2-05, PU-D-5): the founder seals its own crashed generation on
+ * self-seal evidence, with no external fence and no IR: a newer admitted
+ * MEMBER incarnation in quorum, the old incarnation dead on the voting
+ * disks, and the restart input naming exactly this root.  Author: SqlRush
+ * <sqlrush@gmail.com>
+ */
+static void
+self_seal_fixture(uint8 before[66048], ClusterRecoverySerialRequest *request, bool opened)
+{
+	char path[MAXPGPATH];
+
+	v2_failure_fixture(before, request, opened);
+	root_fixture_version3(before);
+	v2_write_roots(before);
+	test_failure_formation = test_failure_needs = test_failure_admissions = false;
+	MyBackendType = B_STARTUP;
+	cluster_node_id = request->duty.origin_node_id;
+	test_self_incarnation = test_membership_incarnation
+		= request->duty.origin_owner_incarnation + 1;
+	test_member_state = CLUSTER_MEMBER_MEMBER;
+	test_reserve_mode = test_reserve_quorum = true;
+	test_restart_ref = test_checkpoint_prefix_ref;
+	test_restart_ref_valid = true;
+	test_death_proven = true;
+	test_death_calls = 0;
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, before, 66048);
+}
+
+static void
+self_seal_done(void)
+{
+	MyBackendType = B_INVALID;
+	test_reserve_mode = test_reserve_quorum = false;
+	test_restart_ref_valid = false;
+	test_death_proven = false;
+	cluster_shared_config = false;
+}
+
+/* Whether the published root still lists node as serving. */
+static bool
+self_seal_serving(const ClusterControlRootIdentity *self)
+{
+	ControlRootImage root;
+	ControlFileData view;
+	ClusterControlRootFileToken token;
+	int node = self->origin_node_id;
+	bool serving;
+
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(self, &root, &view, &token), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	serving = (root.header.v2.serving[node / 64] & (UINT64_C(1) << (node % 64))) != 0;
+	return serving;
+}
+
+UT_TEST(test_v3_self_seal_seals_own_crashed_generation)
+{
+	uint8 before[66048], after[66048];
+	ClusterRecoverySerialRequest request;
+	ClusterControlRootSnapshot out, again;
+	ClusterControlRootReadToken token, again_token;
+	char path[MAXPGPATH];
+
+	self_seal_fixture(before, &request, false);
+	UT_ASSERT(self_seal_serving(&request.duty));
+	UT_ASSERT_EQ(cluster_control_root_v3_self_seal_v1(&test_restart_ref, 3000000, &out, &token), 0);
+	UT_ASSERT(!self_seal_serving(&request.duty));
+	if (ut_current_failed) {
+		self_seal_done();
+		return;
+	}
+	UT_ASSERT_EQ(out.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED);
+	UT_ASSERT_EQ(
+		out.root_flags
+			& (CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID),
+		CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID);
+	UT_ASSERT_EQ(out.validated_tail_lsn_exclusive, test_checkpoint_end);
+	UT_ASSERT(cluster_control_root_identity_equal(&out.identity, &request.duty));
+	/* the evidence was asked about exactly the old and the new incarnation */
+	UT_ASSERT(test_death_calls > 0);
+	UT_ASSERT_EQ(test_death_prior, request.duty.origin_owner_incarnation);
+	UT_ASSERT_EQ(test_death_observer, request.duty.origin_owner_incarnation + 1);
+	UT_ASSERT_EQ(test_death_min_us, 3000000);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(1, &request.duty, &again, &again_token), 0);
+	UT_ASSERT_EQ(memcmp(&again, &out, sizeof(out)), 0);
+
+	/* Re-entry finds it sealed with its tail and changes nothing. */
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, before, 66048);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_self_seal_v1(&test_restart_ref, 3000000, &again, &again_token), 0);
+	UT_ASSERT_EQ(memcmp(&again, &out, sizeof(out)), 0);
+	read_all_or_abort(path, after, 66048);
+	UT_ASSERT_EQ(memcmp(before, after, sizeof(before)), 0);
+	self_seal_done();
+}
+
+/* A sealer that failed before validating the tail is resumed. */
+UT_TEST(test_v3_self_seal_resumes_a_sealed_generation_without_tail)
+{
+	uint8 before[66048];
+	ClusterRecoverySerialRequest request;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootReadToken token;
+
+	self_seal_fixture(before, &request, true);
+	UT_ASSERT_EQ(cluster_control_root_v3_self_seal_v1(&test_restart_ref, 3000000, &out, &token), 0);
+	UT_ASSERT_EQ(out.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED);
+	UT_ASSERT((out.root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) != 0);
+	UT_ASSERT_EQ(out.validated_tail_lsn_exclusive, test_checkpoint_end);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	self_seal_done();
+}
+
+/* Without any one piece of evidence nothing changes. */
+UT_TEST(test_v3_self_seal_refuses_without_each_evidence)
+{
+	for (int fault = 0; fault < 11; fault++) {
+		uint8 before[66048];
+		ClusterRecoverySerialRequest request;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootReadToken token;
+		ClusterWalSourceRef restart;
+
+		self_seal_fixture(before, &request, false);
+		restart = test_restart_ref;
+		if (fault == 0)
+			MyBackendType = B_LMON;
+		else if (fault == 1)
+			test_self_incarnation = test_membership_incarnation
+				= request.duty.origin_owner_incarnation; /* not newer */
+		else if (fault == 2)
+			test_reserve_quorum = false;
+		else if (fault == 3)
+			test_member_state = CLUSTER_MEMBER_DEAD;
+		else if (fault == 4)
+			test_membership_incarnation++; /* another admitted incarnation */
+		else if (fault == 5)
+			test_restart_ref_valid = false;
+		else if (fault == 6)
+			test_restart_ref.claim.claim_sha256[0] ^= 1; /* another claim */
+		else if (fault == 7)
+			test_restart_ref.claim.database_incarnation++;
+		else if (fault == 8)
+			test_death_proven = false;
+		else if (fault == 9)
+			restart.claim.claim_sha256[0] ^= 1; /* not this boot's restart input */
+		else if (fault == 10)
+			test_restart_ref.timeline++;
+		if (fault == 6 || fault == 7 || fault == 10)
+			restart = test_restart_ref;
+		UT_ASSERT(cluster_control_root_v3_self_seal_v1(&restart, 3000000, &out, &token) != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+		v2_assert_primary_unchanged(before);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		if (ut_current_failed)
+			printf("# self-seal fault %d\n", fault);
+		self_seal_done();
+	}
+}
+
 UT_TEST(test_v3_failure_publication_retains_old_authority_and_no_fallback)
 {
 	for (int fault = 0; fault < 6; fault++) {
@@ -18831,6 +19014,249 @@ UT_TEST(test_wal_prefix_identity_is_absent_after_a_failed_scan)
 				  test_checkpoint_end, 0, test_checkpoint_crc, &tail, &identity)
 			  != 0);
 	UT_ASSERT(identity == NULL);
+}
+
+/* D (S07): publish a v3 checkpoint over retained history, then return the
+ * whole-file token a retained-cut census would have used. */
+static XLogRecPtr
+v3_retained_lower_fixture(uint8 published[66048], ClusterControlRootIdentity *self,
+						  ControlFileData *candidate, ClusterControlRootFileToken *census)
+{
+	uint8 before[66048];
+	ClusterControlRootSnapshot out;
+	ClusterControlRootFileToken token;
+	ControlRootImage root;
+	ControlFileData view;
+	char path[MAXPGPATH];
+	XLogRecPtr lower = v3_retained_checkpoint_fixture(false, before, self, candidate);
+
+	UT_ASSERT_EQ(cluster_control_root_v3_checkpoint_publish(self, candidate, test_checkpoint_end,
+															&out, &token, &view),
+				 0);
+	UT_ASSERT_EQ(out.checkpoint_lower_lsn, lower);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(self, &root, &view, census), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	UT_ASSERT_EQ(view.checkPointCopy.redo, candidate->checkPointCopy.redo);
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, published, 66048);
+	return lower;
+}
+
+/* The founder's one compare-and-swap re-checks its evidence, the WAL tail
+ * and the root under CF X; a change after the first observation publishes
+ * nothing.  Author: SqlRush <sqlrush@gmail.com> */
+static int test_self_seal_late_change;
+
+static void
+self_seal_late_change(void)
+{
+	uint8 bytes[66048];
+	char primary[MAXPGPATH];
+
+	test_checkpoint_x_hook = NULL;
+	if (test_self_seal_late_change == 0)
+		test_death_proven = false;
+	else if (test_self_seal_late_change == 1)
+		v2_checkpoint_append_noop();
+	else {
+		path_for(primary, sizeof(primary), CLUSTER_CONTROL_ROOT_REL_PATH);
+		read_all_or_abort(primary, bytes, sizeof(bytes));
+		bytes[16]++; /* another publisher changed the common sequence */
+		v2_checksums(bytes);
+		v2_write_roots(bytes);
+	}
+}
+
+UT_TEST(test_v3_self_seal_rechecks_evidence_wal_and_root_under_cf_x)
+{
+	for (int change = 0; change < 3; change++) {
+		uint8 before[66048];
+		ClusterRecoverySerialRequest request;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootReadToken token;
+
+		self_seal_fixture(before, &request, false);
+		test_self_seal_late_change = change;
+		test_checkpoint_x_hook = self_seal_late_change;
+		UT_ASSERT(cluster_control_root_v3_self_seal_v1(&test_restart_ref, 3000000, &out, &token)
+				  != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+		if (change == 2) {
+			before[16]++;
+			v2_checksums(before);
+		}
+		v2_assert_primary_unchanged(before);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		if (ut_current_failed)
+			printf("# self-seal late change %d\n", change);
+		test_checkpoint_x_hook = NULL;
+		self_seal_done();
+	}
+}
+
+/* A integration reproducer (A hold 16c44655e9): a self-seal over a root
+ * whose CR16 lower is behind the native redo must stay readable while the
+ * tail is unsealed and after it is sealed, and keep the lower. */
+UT_TEST(test_v3_self_seal_keeps_dual_range_until_tail_is_sealed)
+{
+	uint8 before[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate;
+	ClusterControlRootFileToken census;
+	ClusterControlRootReadToken token;
+	ClusterControlRootSnapshot out;
+	XLogRecPtr lower = v3_retained_lower_fixture(before, &self, &candidate, &census);
+
+	UT_ASSERT(lower < candidate.checkPointCopy.redo);
+	test_failure_formation = test_failure_needs = test_failure_admissions = false;
+	MyBackendType = B_STARTUP;
+	cluster_node_id = self.origin_node_id;
+	test_self_incarnation = test_membership_incarnation = self.origin_owner_incarnation + 1;
+	test_member_state = CLUSTER_MEMBER_MEMBER;
+	test_reserve_mode = test_reserve_quorum = true;
+	test_restart_ref = test_checkpoint_prefix_ref;
+	test_restart_ref_valid = test_death_proven = true;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(1, &self, &out, &token), 0);
+	UT_ASSERT_EQ(out.checkpoint_lower_lsn, lower);
+	UT_ASSERT_EQ(cluster_control_root_v3_self_seal_v1(&test_restart_ref, 3000000, &out, &token), 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(1, &self, &out, &token), 0);
+	UT_ASSERT_EQ(out.checkpoint_lower_lsn, lower);
+	UT_ASSERT_EQ(cluster_control_root_v3_self_seal_v1(&test_restart_ref, 3000000, &out, &token), 0);
+	self_seal_done();
+}
+
+/* The lower moves forward to a census bound, never past the same-token
+ * native redo; only the lower, the publication sequence and publisher fields
+ * change; repeating the same bound changes nothing. */
+UT_TEST(test_v3_retained_lower_publish_advances_monotonically)
+{
+	uint8 published[66048], after[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate, view;
+	ClusterControlRootFileToken census, token;
+	ClusterControlRootSnapshot out, before_record;
+	ControlRootImage root;
+	char path[MAXPGPATH];
+	XLogRecPtr redo, lower = v3_retained_lower_fixture(published, &self, &candidate, &census);
+
+	redo = candidate.checkPointCopy.redo;
+	UT_ASSERT(lower < redo);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&self, &root, &view, &token), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	before_record = root.records[self.origin_thread_id - 1];
+	UT_ASSERT_EQ(cluster_control_root_v3_retained_lower_publish(&self, &census, redo, redo, &out),
+				 0);
+	UT_ASSERT_EQ(out.checkpoint_lower_lsn, redo);
+	UT_ASSERT_EQ(out.root_publish_seq, before_record.root_publish_seq + 1);
+	UT_ASSERT_EQ(out.validated_tail_lsn_exclusive, before_record.validated_tail_lsn_exclusive);
+	UT_ASSERT_EQ(out.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&self, &root, &view, &token), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	UT_ASSERT_EQ(view.checkPointCopy.redo, redo); /* the anchor is untouched */
+	UT_ASSERT_EQ(root.records[self.origin_thread_id - 1].checkpoint_lower_lsn, redo);
+	{
+		ClusterControlRootSnapshot expected = before_record;
+		const ClusterControlRootSnapshot *actual = &root.records[self.origin_thread_id - 1];
+
+		expected.checkpoint_lower_lsn = redo;
+		expected.root_publish_seq = actual->root_publish_seq;
+		expected.published_at_usec = actual->published_at_usec;
+		expected.lifecycle_reason = actual->lifecycle_reason;
+		UT_ASSERT(memcmp(&expected, actual, sizeof(expected)) == 0);
+	}
+	/* Other records are untouched. */
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, after, sizeof(after));
+	UT_ASSERT(memcmp(after + 1024 + 512, published + 1024 + 512, 66048 - 1024 - 512) == 0);
+	/* The same bound again is a no-op, whatever the token. */
+	UT_ASSERT_EQ(cluster_control_root_v3_retained_lower_publish(&self, &token, redo, redo, &out),
+				 0);
+	UT_ASSERT_EQ(out.checkpoint_lower_lsn, redo);
+	v2_assert_primary_unchanged(after);
+}
+
+static int test_retained_lower_fault;
+
+static void
+v3_retained_lower_x_race(void)
+{
+	test_checkpoint_x_hook = NULL;
+	if (test_retained_lower_fault == 0)
+		v2_checkpoint_root_race();
+	else
+		test_epoch++;
+}
+
+/* Each refusal leaves the ROOT unchanged and releases CF and WALR. */
+UT_TEST(test_v3_retained_lower_publish_refuses_without_the_census_input)
+{
+	for (int fault = 0; fault < 11; fault++) {
+		uint8 published[66048];
+		ClusterControlRootIdentity self, other;
+		ControlFileData candidate;
+		ClusterControlRootFileToken census;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootResult expected = CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		XLogRecPtr lower = v3_retained_lower_fixture(published, &self, &candidate, &census);
+		XLogRecPtr redo = candidate.checkPointCopy.redo, native = redo, proposed = redo;
+
+		other = self;
+		if (fault == 0) {
+			census.file_txn_seq++; /* census of another ROOT */
+			expected = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		} else if (fault == 1) {
+			native = redo - 8; /* census of another native redo */
+			proposed = native;
+			expected = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		} else if (fault == 2)
+			proposed = redo + 8; /* past the native redo */
+		else if (fault == 3)
+			proposed = lower - 8; /* backwards */
+		else if (fault == 4)
+			proposed = InvalidXLogRecPtr;
+		else if (fault == 5) {
+			MyAuxProcType = NotAnAuxProcess;
+			expected = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		} else if (fault == 6) {
+			other.origin_owner_incarnation++;
+			expected = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		} else if (fault == 7 || fault == 8) {
+			test_retained_lower_fault = fault - 7;
+			test_checkpoint_x_hook = v3_retained_lower_x_race;
+			expected
+				= fault == 7 ? CLUSTER_CONTROL_ROOT_CAS_CONFLICT : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		} else if (fault == 9) {
+			test_actual_cf = test_cf_mode = ShareLock; /* caller holds CF */
+			expected = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		} else {
+			cluster_shared_config = false;
+			expected = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		}
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_retained_lower_publish(&other, &census, native, proposed, &out),
+			expected);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		if (fault == 9)
+			test_actual_cf = test_cf_mode = NoLock;
+		cluster_shared_config = true;
+		MyAuxProcType = CheckpointerProcess;
+		test_checkpoint_x_hook = NULL;
+		if (fault != 7)
+			v2_assert_primary_unchanged(published);
+		else
+			v2_assert_primary_unchanged(v2_race_winner);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		if (ut_current_failed)
+			printf("# retained lower fault %d\n", fault);
+	}
 }
 
 UT_TEST(test_v3_publishers_do_not_fallback_or_weaken_physical_checks)
@@ -21586,7 +22012,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(415);
+	UT_PLAN(422);
 	UT_RUN(test_first_start_io_and_late_races_never_publish_authority);
 	UT_RUN(test_first_start_binds_original_inputs_without_clean_exit);
 	UT_RUN(test_first_start_rejects_incomplete_or_changed_formation);
@@ -21736,10 +22162,17 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_recovery_complete_errors_unwind_without_reverting_published_fact);
 	UT_RUN(test_v3_recovery_complete_alias_refuses_before_authority);
 	UT_RUN(test_v3_failure_publication_retains_old_authority_and_no_fallback);
+	UT_RUN(test_v3_self_seal_seals_own_crashed_generation);
+	UT_RUN(test_v3_self_seal_resumes_a_sealed_generation_without_tail);
+	UT_RUN(test_v3_self_seal_refuses_without_each_evidence);
+	UT_RUN(test_v3_self_seal_keeps_dual_range_until_tail_is_sealed);
+	UT_RUN(test_v3_self_seal_rechecks_evidence_wal_and_root_under_cf_x);
 	UT_RUN(test_v3_checkpoint_publish_preserves_pending_and_real_wal_guards);
 	UT_RUN(test_v3_checkpoint_reads_retained_history_once);
 	UT_RUN(test_wal_prefix_identity_recheck_detects_a_changed_namespace);
 	UT_RUN(test_wal_prefix_identity_is_absent_after_a_failed_scan);
+	UT_RUN(test_v3_retained_lower_publish_advances_monotonically);
+	UT_RUN(test_v3_retained_lower_publish_refuses_without_the_census_input);
 	UT_RUN(test_v3_publishers_do_not_fallback_or_weaken_physical_checks);
 	UT_RUN(test_v3_normal_close_sparse_pair_preserves_exact_roster);
 	UT_RUN(test_v3_normal_close_cannot_discard_foreign_pending_initialization);

@@ -7455,7 +7455,57 @@ typedef struct FailureInputV2Work {
 	LOCKMODE cf_mode;
 	int32 publisher_node;
 	uint64 publisher_incarnation;
+	/* PGRAC (S9P2-05): founder self-seal of this node's own crashed
+	 * generation -- no external fence and no IR (self_predecessor_authorized). */
+	bool self;
+	uint64 self_min_dead_us;
+	ClusterWalSourceRef self_restart;
 } FailureInputV2Work;
+
+/*
+ * PGRAC (S9P2-05, PU-D-5): after every instance failed, the founder seals
+ * its own previous generation without isolating that old incarnation
+ * externally.  The evidence: this is the startup process of a postmaster
+ * holding PostgreSQL's data-directory interlock; the quorum admitted this
+ * boot's strictly newer incarnation of the node as a MEMBER; this boot's
+ * pre-heartbeat voting snapshot shows the old incarnation on every disk with
+ * a last heartbeat older than both the death threshold and the write lease;
+ * and the bootstrap-validated restart input names exactly this root's claim.
+ * Residual risk (same node id restarted elsewhere while the old instance,
+ * partitioned, still writes) is a deployment limit.  Author: SqlRush
+ * <sqlrush@gmail.com>
+ */
+static bool
+self_predecessor_authorized(const ClusterRecoverySerialRequest *request,
+							const FailureInputV2Work *work)
+{
+	ClusterQvotecPriorExitObservation death;
+	ClusterWalSourceRef restart;
+	uint64 self = cluster_qvotec_get_self_incarnation();
+	int index = (int)request->duty.origin_thread_id - 1;
+
+	if (MyBackendType != B_STARTUP || ShutdownRequestPending
+		|| cluster_node_id != work->publisher_node || self == 0
+		|| self != work->publisher_incarnation || request->duty.origin_node_id != cluster_node_id
+		|| request->duty.origin_thread_id != (uint16)(cluster_node_id + 1)
+		|| self <= request->duty.origin_owner_incarnation || !cluster_qvotec_in_quorum()
+		|| cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != self
+		|| !cluster_wal_thread_restart_v2_ref(&restart)
+		|| memcmp(&restart, &work->self_restart, sizeof(restart)) != 0
+		|| !cluster_control_root_identity_equal(&restart.claim.identity, &request->duty))
+		return false;
+	/* Once the root is read, the restart input is exactly its claim. */
+	if (work->base.header.file_txn_seq != 0
+		&& (memcmp(restart.claim.claim_sha256, work->base.refs[index].claim_sha256, 32) != 0
+			|| restart.claim.database_incarnation != work->base.header.v2.database_incarnation
+			|| restart.claim.max_config_generation != work->base.header.v2.config_generation
+			|| restart.timeline != work->base.records[index].checkpoint_tli))
+		return false;
+	return cluster_qvotec_prior_death_observe(
+		(uint32)cluster_node_id, request->duty.origin_owner_incarnation, self,
+		(uint64)GetCurrentTimestamp(), work->self_min_dead_us, &death);
+}
 
 static bool
 failure_v2_authorized(const ClusterRecoverySerialRequest *request, const FailureInputV2Work *work)
@@ -7465,6 +7515,8 @@ failure_v2_authorized(const ClusterRecoverySerialRequest *request, const Failure
 	uint32 count;
 	bool original_owner = false;
 
+	if (work->self)
+		return self_predecessor_authorized(request, work);
 	if (cluster_node_id != work->publisher_node
 		|| cluster_qvotec_get_self_incarnation() != work->publisher_incarnation
 		|| work->publisher_incarnation == 0
@@ -8291,8 +8343,9 @@ static bool
 failure_v2_current(const ClusterRecoverySerialRequest *request, FailureInputV2Work *work)
 {
 	return failure_v2_authorized(request, work)
-		   && cluster_recovery_serial_input_revalidate(&work->serial)
-				  == CLUSTER_RECOVERY_SERIAL_CURRENT;
+		   && (work->self
+			   || cluster_recovery_serial_input_revalidate(&work->serial)
+					  == CLUSTER_RECOVERY_SERIAL_CURRENT);
 }
 
 /* PGRAC: observe under owned CF, but never keep CF over the WAL scan.
@@ -8411,9 +8464,12 @@ failure_v2_tail_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 	if (retained != CLUSTER_WAL_PIN_OK)
 		return retained == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
 												 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
-	acquired = cluster_recovery_serial_acquire(request, &work->serial);
-	if (acquired != CLUSTER_RECOVERY_SERIAL_GRANTED)
-		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	/* PGRAC: a self-seal holds no IR; the root CAS and WALR still apply. */
+	if (!work->self) {
+		acquired = cluster_recovery_serial_acquire(request, &work->serial);
+		if (acquired != CLUSTER_RECOVERY_SERIAL_GRANTED)
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	}
 	result = failure_v2_tail_read(request, work, ShareLock);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -8526,9 +8582,161 @@ failure_v2_open_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/*
+ * PGRAC (S9P2-05): an OPEN generation the founder seals itself is read under
+ * the open preconditions only.  Its serving bit may still be set; the seal
+ * clears it.  Author: SqlRush <sqlrush@gmail.com>
+ */
+static ClusterControlRootResult
+failure_v2_self_open_read(const ClusterRecoverySerialRequest *request, FailureInputV2Work *work,
+						  LOCKMODE mode)
+{
+	ClusterControlRootResult result;
+	ClusterControlRootFileToken file_token;
+	const ClusterControlRootSnapshot *record;
+	int index = request->duty.origin_thread_id - 1;
+
+	if (!cluster_cf_lock(mode))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = mode;
+	if (!cluster_cf_held_is_clusterwide(mode))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	result = read_thread_version(&request->duty, &work->base, &work->control, &file_token,
+								 work->format_version);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	make_read_token(&work->base, request->duty.origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
+					&work->token);
+	if (!read_token_equal(&work->token, &request->expected_root_token))
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	record = &work->base.records[index];
+	if (work->base.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| work->base.header.v2.database_state < CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+		|| work->base.header.v2.database_state > CLUSTER_CONTROL_ROOT_DATABASE_OPEN
+		|| record->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if (work->base.header.file_txn_seq == UINT64_MAX || record->root_publish_seq == UINT64_MAX)
+		return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
+	return failure_v2_current(request, work) ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+											 : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+/*
+ * PGRAC (S9P2-05): the founder seals its own OPEN generation -- OPEN to
+ * RECOVERY_REQUIRED together with the validated tail -- in one
+ * compare-and-swap.  An OPEN record whose retained lower is behind its
+ * native redo is readable only with its tail; publishing the open step alone
+ * (failure_v2_open_work clears the tail) would leave a root that its own
+ * reader and every retry reject.  The record keeps its original range and
+ * tail until the sealed tail replaces them; the lower never moves.  The tail
+ * is observed outside CF and observed again under CF X before publication,
+ * as for the fenced tail step.  Author: SqlRush <sqlrush@gmail.com>
+ */
+static ClusterControlRootResult
+failure_v2_self_seal_work(const ClusterRecoverySerialRequest *request, FailureInputV2Work *work)
+{
+	ClusterControlRootResult result;
+	ClusterControlRootFileToken file_token;
+	ClusterWalTailObservation fresh;
+	ClusterWalPinResult retained;
+	ClusterControlRootSnapshot *record;
+	XLogRecPtr lower;
+	int index = request->duty.origin_thread_id - 1;
+
+	retained = cluster_wal_retention_root_publish_begin_exact(&request->expected_root_token, false,
+															  &work->walr);
+	if (retained != CLUSTER_WAL_PIN_OK)
+		return retained == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+												 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	result = failure_v2_self_open_read(request, work, ShareLock);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	record = &work->base.records[index];
+	if (work->control.checkPoint < record->checkpoint_lower_lsn
+		|| work->control.checkPoint == UINT64_MAX)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	work->source_ref.claim.identity = record->identity;
+	work->source_ref.claim.database_incarnation = work->base.header.v2.database_incarnation;
+	work->source_ref.claim.max_config_generation = work->base.header.v2.config_generation;
+	memcpy(work->source_ref.claim.claim_sha256, work->base.refs[index].claim_sha256, 32);
+	work->source_ref.timeline = record->checkpoint_tli;
+	work->cf_mode = NoLock;
+	result = release_cf(ShareLock, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_wal_tail_observe_checkpoint(
+		cluster_wal_threads_dir, &work->source_ref, wal_segment_size, record->checkpoint_lower_lsn,
+		work->control.checkPoint + 1, work->control.checkPoint, record->checkpoint_record_crc32c,
+		&work->tail);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	/* The evidence is checked again with the root under CF X. */
+	result = failure_v2_self_open_read(request, work, ExclusiveLock);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	record = &work->base.records[index];
+	lower = record->checkpoint_lower_lsn;
+	result = cluster_wal_tail_observe_checkpoint(cluster_wal_threads_dir, &work->source_ref,
+												 wal_segment_size, lower, work->tail.complete_end,
+												 work->control.checkPoint,
+												 record->checkpoint_record_crc32c, &fresh);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(&fresh, &work->tail, sizeof(fresh)) != 0)
+		return CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
+	work->next = work->base;
+	record = &work->next.records[index];
+	record->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	/* As the open step: the failed writer's unsafe-FPW history survives. */
+	record->root_flags
+		= (record->root_flags & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF)
+		  | CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+		  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID
+		  | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+	record->tail_tli = record->checkpoint_tli;
+	record->tail_validation_kind = CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
+	record->validated_tail_lsn_exclusive = work->tail.complete_end;
+	record->tail_last_record_lsn = work->tail.last_record_start;
+	record->tail_last_record_crc32c = work->tail.last_record_crc;
+	record->recovered_tli = record->checkpoint_tli;
+	record->recovered_through_lsn_exclusive = lower;
+	record->recovered_last_record_lsn = 0;
+	record->recovered_last_record_crc32c = 0;
+	record->conservative_bound_kind = CLUSTER_CONTROL_ROOT_BOUND_NONE;
+	record->conservative_commit_scn = 0;
+	record->lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_FAILURE_TAIL_VALIDATED;
+	record->root_publish_seq++;
+	record->published_at_usec = GetCurrentTimestamp();
+	work->next.publisher_node[index] = work->publisher_node;
+	work->next.publisher_incarnation[index] = work->publisher_incarnation;
+	work->next.header.v2.serving[request->duty.origin_node_id / 64]
+		&= ~(UINT64_C(1) << (request->duty.origin_node_id % 64));
+	work->next.header.file_txn_seq++;
+	work->next.header.published_at_usec = record->published_at_usec;
+	result = encode_extended_image(&work->next, work->format_version);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!failure_v2_current(request, work))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (!publish_updated_image(&work->base, &work->next))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	result = read_thread_version(&request->duty, &work->base, &work->control, &file_token,
+								 work->format_version);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(work->base.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
+		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
+	if (!failure_v2_current(request, work))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	make_read_token(&work->base, request->duty.origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
+					&work->token);
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 static ClusterControlRootResult
 failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRootSnapshot *out,
-				   ClusterControlRootReadToken *out_token, bool seal_tail, uint16 version)
+				   ClusterControlRootReadToken *out_token, bool seal_tail, uint16 version,
+				   const ClusterWalSourceRef *self_restart, uint64 self_min_dead_us)
 {
 	FailureInputV2Work *work;
 	ClusterControlRootResult result;
@@ -8548,8 +8756,10 @@ failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRo
 		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
 		|| request->mode != CLUSTER_RECOVERY_SERIAL_INPUT_SEAL
 		|| !cluster_recovery_duty_key_valid_for_claim(&request->duty, true)
-		|| request->duty.system_identifier != GetSystemIdentifier() || request->formation == NULL
-		|| request->fence_need_set == NULL || request->fence_admission_set == NULL)
+		|| request->duty.system_identifier != GetSystemIdentifier()
+		|| (self_restart == NULL
+			&& (request->formation == NULL || request->fence_need_set == NULL
+				|| request->fence_admission_set == NULL)))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
@@ -8557,13 +8767,19 @@ failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRo
 	work->format_version = version;
 	work->publisher_node = cluster_node_id;
 	work->publisher_incarnation = cluster_qvotec_get_self_incarnation();
+	if (self_restart != NULL) {
+		work->self = true;
+		work->self_min_dead_us = self_min_dead_us;
+		work->self_restart = *self_restart;
+	}
 	PG_TRY();
 	{
 		if (!failure_v2_authorized(request, work))
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		else
-			result = seal_tail ? failure_v2_tail_work(request, work)
-							   : failure_v2_open_work(request, work);
+			result = seal_tail	  ? failure_v2_tail_work(request, work)
+					 : work->self ? failure_v2_self_seal_work(request, work)
+								  : failure_v2_open_work(request, work);
 	}
 	PG_CATCH();
 	{
@@ -8586,7 +8802,7 @@ cluster_control_root_v2_failure_open_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, false, 2);
+	return failure_v2_publish(request, out, out_token, false, 2, NULL, 0);
 }
 
 ClusterControlRootResult
@@ -8594,7 +8810,7 @@ cluster_control_root_v2_failure_tail_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, true, 2);
+	return failure_v2_publish(request, out, out_token, true, 2, NULL, 0);
 }
 
 ClusterControlRootResult
@@ -8602,7 +8818,7 @@ cluster_control_root_v3_failure_open_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, false, 3);
+	return failure_v2_publish(request, out, out_token, false, 3, NULL, 0);
 }
 
 ClusterControlRootResult
@@ -8610,7 +8826,67 @@ cluster_control_root_v3_failure_tail_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, true, 3);
+	return failure_v2_publish(request, out, out_token, true, 3, NULL, 0);
+}
+
+/*
+ * PGRAC (S9P2-05, PU-D-5): seal this node's own crashed generation -- OPEN
+ * to RECOVERY_REQUIRED with the validated tail -- with the self-seal
+ * evidence instead of an external fence (self_predecessor_authorized).  An
+ * OPEN generation is sealed in one compare-and-swap so that every published
+ * root stays readable (failure_v2_self_seal_work); a RECOVERY_REQUIRED one
+ * without its tail (left by an earlier sealer) gets the tail step; one
+ * already sealed with its tail is reported as it is.  Author: SqlRush
+ * <sqlrush@gmail.com>
+ */
+ClusterControlRootResult
+cluster_control_root_v3_self_seal_v1(const ClusterWalSourceRef *restart, uint64 min_dead_us,
+									 ClusterControlRootSnapshot *out,
+									 ClusterControlRootReadToken *out_token)
+{
+	const uint32 required
+		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+		  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+	ClusterRecoverySerialRequest request;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken token;
+	ClusterControlRootResult result;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out_token != NULL)
+		memset(out_token, 0, sizeof(*out_token));
+	if (restart == NULL || out == NULL || out_token == NULL || cluster_node_id < 0
+		|| restart->claim.identity.origin_node_id != cluster_node_id
+		|| restart->claim.identity.origin_thread_id != (uint16)(cluster_node_id + 1))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = cluster_control_root_read_canonical(
+		restart->claim.identity.origin_thread_id, &restart->claim.identity,
+		CLUSTER_CONTROL_ROOT_READ_STRONG, &snapshot, &token);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	memset(&request, 0, sizeof(request));
+	request.mode = CLUSTER_RECOVERY_SERIAL_INPUT_SEAL;
+	request.duty = restart->claim.identity;
+	request.expected_root_token = token;
+	if (snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
+		result = failure_v2_publish(&request, &snapshot, &token, false, 3, restart, min_dead_us);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		request.expected_root_token = token;
+	}
+	if (snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		&& (snapshot.root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) == 0) {
+		result = failure_v2_publish(&request, &snapshot, &token, true, 3, restart, min_dead_us);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	}
+	if (snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		|| (snapshot.root_flags & required) != required)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	*out = snapshot;
+	*out_token = token;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 /* PGRAC: the raw shutdown anchor and native insertion cut are independent
@@ -9018,6 +9294,155 @@ cluster_control_root_v3_shutdown_checkpoint_publish(const ClusterControlRootIden
 {
 	return checkpoint_v2_publish(CHECKPOINT_V2_SHUTDOWN_EVIDENCE, self, control, end, out, token,
 								 view, 3);
+}
+
+/* PGRAC (S07): move this thread's physical retention lower forward to a
+ * bound computed by the retained-cut census (cluster_wal_retained_cut.c)
+ * under census_token.  The whole ROOT must still be the one the census read
+ * and the anchor's native redo the one it used; the lower only moves
+ * forward and never past that redo.  Only the lower and the publication
+ * fields change: the anchor, tail and history are untouched.  WALR is held
+ * from before CF; the new lower is durable and reread before return, so
+ * WAL cleanup can only ever see the published value.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterControlRootResult
+retained_lower_publish_work(CheckpointV2Work *work, const ClusterControlRootIdentity *self,
+							const ClusterControlRootFileToken *census, XLogRecPtr native_redo,
+							XLogRecPtr lower, uint64 epoch, ClusterControlRootSnapshot *out)
+{
+	ClusterControlRootResult result;
+	ClusterControlRootFileToken actual;
+	ClusterControlRootSnapshot *record;
+	ClusterWalPinResult walr_result;
+	int index = self->origin_thread_id - 1;
+
+	if (!acquire_clusterwide_cf(ShareLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = ShareLock;
+	result = read_thread_version(self, &work->base, &work->old_view, &work->before, 3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	record = &work->base.records[index];
+	if (work->base.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| work->base.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN
+		|| (work->base.header.v2.serving[cluster_node_id / 64]
+			& (UINT64_C(1) << (cluster_node_id % 64)))
+			   == 0
+		|| record->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+		|| work->old_view.state != DB_IN_PRODUCTION)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if (lower == record->checkpoint_lower_lsn) {
+		*out = *record; /* already published */
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+	if (!file_token_equal(census, &work->before)
+		|| work->old_view.checkPointCopy.redo != native_redo)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (lower < record->checkpoint_lower_lsn || lower > native_redo
+		|| native_redo > record->validated_tail_lsn_exclusive)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (work->base.header.file_txn_seq == UINT64_MAX || record->root_publish_seq == UINT64_MAX)
+		return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
+	if (!checkpoint_v2_owner_current(self, epoch, record->checkpoint_tli,
+									 record->validated_tail_lsn_exclusive))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	make_read_token(&work->base, self->origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
+					&work->thread_token);
+	work->cf_mode = NoLock;
+	result = release_cf(ShareLock, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	walr_result
+		= cluster_wal_retention_root_publish_begin_exact(&work->thread_token, false, &work->walr);
+	if (walr_result != CLUSTER_WAL_PIN_OK)
+		return walr_result == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+													: CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (!acquire_clusterwide_cf(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = ExclusiveLock;
+	result = read_thread_version(self, &work->next, &work->new_view, &actual, 3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	if (!file_token_equal(&work->before, &actual))
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	record = &work->next.records[index];
+	if (!checkpoint_v2_owner_current(self, epoch, record->checkpoint_tli,
+									 record->validated_tail_lsn_exclusive))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	record->checkpoint_lower_lsn = lower;
+	record->root_publish_seq++;
+	record->published_at_usec = GetCurrentTimestamp();
+	record->lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_CHECKPOINT_ADVANCE;
+	work->next.publisher_incarnation[index] = self->origin_owner_incarnation;
+	work->next.publisher_node[index] = self->origin_node_id;
+	work->next.header.file_txn_seq++;
+	work->next.header.published_at_usec = record->published_at_usec;
+	result = encode_extended_image(&work->next, 3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!publish_updated_image(&work->base, &work->next))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	result = read_thread_version(self, &work->base, &work->new_view, &work->after, 3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	if (memcmp(work->base.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
+		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
+	*out = work->base.records[index];
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_retained_lower_publish(const ClusterControlRootIdentity *self,
+											   const ClusterControlRootFileToken *census_token,
+											   XLogRecPtr native_redo, XLogRecPtr lower,
+											   ClusterControlRootSnapshot *out)
+{
+	CheckpointV2Work *work;
+	ClusterControlRootSnapshot published;
+	ClusterControlRootResult result;
+	uint64 epoch;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (self == NULL || census_token == NULL || out == NULL || !cluster_shared_config
+		|| !AmCheckpointerProcess() || !enableFsync || self->origin_thread_id == 0
+		|| self->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
+		|| native_redo == InvalidXLogRecPtr)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (lower == InvalidXLogRecPtr || lower > native_redo)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	/* Never invert an outer CF hold into WALR acquisition. */
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	epoch = cluster_epoch_get_current();
+	work = palloc0(sizeof(*work));
+	work->purpose = CHECKPOINT_V2_ONLINE;
+	work->format_version = 3;
+	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i)
+		work->wal_dirs[i] = -1;
+	for (size_t i = 0; i < lengthof(work->wal_segments); ++i)
+		work->wal_segments[i] = -1;
+	memset(&published, 0, sizeof(published));
+	PG_TRY();
+	{
+		result = retained_lower_publish_work(work, self, census_token, native_redo, lower, epoch,
+											 &published);
+	}
+	PG_CATCH();
+	{
+		(void)checkpoint_v2_cleanup(work, CLUSTER_CONTROL_ROOT_IO_ERROR);
+		pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	result = checkpoint_v2_cleanup(work, result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = published;
+	pfree(work);
+	return result;
 }
 
 ClusterControlRootResult

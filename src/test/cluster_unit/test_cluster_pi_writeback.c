@@ -1542,26 +1542,50 @@ UT_TEST(retained_rebuild_restores_all_original_writers_before_complete)
 	clean();
 }
 
-UT_TEST(retained_rebuild_does_not_resurrect_a_completed_executor)
+/* D (F-D-27): an exact RECOVERY_COMPLETE prefix is ROOT-chain qualification
+ * only.  The rebuild restores the recovered writer's holder bit like any
+ * other writer's, still decoding its prefix in full; only the checkpointer's
+ * recovered acknowledgement (actual DATA, DEAD membership of that exact
+ * boot, the complete master cut) then discharges it.  A boot that does not
+ * match keeps every master bit. */
+UT_TEST(retained_rebuild_keeps_a_recovered_writer_until_discharged)
 {
 	for (unsigned fault = 0; fault < 3; fault++) {
 		ClusterPageDataReceiptV1 *data = rebuild_setup();
 		wb_recovered_sources = 2;
-		wb_recovered_boot += fault == 1;
-		rebuild_expected_main_holders = fault == 1 ? 7 : 5;
 		wb_census_tail_bad = fault == 2;
 		UT_ASSERT_EQ(cluster_pi_rebuild_bgwriter_tick_v1(),
 					 fault == 2 ? CLUSTER_PI_REBUILD_WAIT : CLUSTER_PI_REBUILD_IDLE);
-		UT_ASSERT_EQ(rebuild_holders, fault == 2 ? 0 : fault == 1 ? 7 : 5);
+		UT_ASSERT_EQ(rebuild_holders, fault == 2 ? 0 : 7);
 		UT_ASSERT_EQ(rebuild_completions, fault != 2);
 		UT_ASSERT(wb_census_decodes >= 3);
 		UT_ASSERT(!wb_inputs_pinned[0]);
 		pi_rebuild_release();
+		if (fault != 2) {
+			/* The rebuilt master bits of the page: A (live) and recovered B. */
+			wb_storage_cut.pi_holders_bitmap = 3;
+			wb_candidates = true;
+			wb_inputs[1].checkpoint.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+			if (fault == 1)
+				wb_boots[1]++; /* B's admitted boot is not the recovered one */
+			physical_pi_from_source(&wb_sources[0], 80);
+			wb_select(0, B_CHECKPOINTER);
+			UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+			UT_ASSERT_EQ(wb_master_completions, fault == 0 ? 1 : 0);
+			UT_ASSERT_EQ(wb_storage_cut.pi_holders_bitmap, fault == 0 ? 0 : 3);
+			UT_ASSERT_EQ(wb_sends, 0);
+			cluster_pi_writeback_checkpointer_release_v1();
+			if (fault == 1)
+				wb_boots[1]--;
+		}
+		if (ut_current_failed)
+			printf("# recovered rebuild fault %u\n", fault);
 		cluster_page_data_receipt_free_v1(&data);
 		rf_page_online_plan_destroy_v1(&wb_page_plan);
 		clean();
 	}
 	wb_census_tail_bad = false;
+	wb_recovered_sources = 0;
 }
 
 UT_TEST(retained_rebuild_maps_both_space_pages_under_original_source)
@@ -1838,7 +1862,7 @@ main(void)
 	UT_RUN(retained_rebuild_never_completes_with_unmapped_side_contributions);
 	UT_RUN(retained_census_does_not_materialize_history_and_checks_tail_first);
 	UT_RUN(retained_rebuild_restores_all_original_writers_before_complete);
-	UT_RUN(retained_rebuild_does_not_resurrect_a_completed_executor);
+	UT_RUN(retained_rebuild_keeps_a_recovered_writer_until_discharged);
 	UT_RUN(retained_rebuild_maps_both_space_pages_under_original_source);
 	UT_RUN(retained_rebuild_maps_commit_drop_and_separate_non_pcm_owners);
 	UT_RUN(retained_rebuild_waits_unpinned_and_rejects_incomplete_or_changed_cut);

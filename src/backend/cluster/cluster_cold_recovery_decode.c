@@ -45,6 +45,7 @@
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_page_detached.h"
+#include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_space_reservation.h"
 #include "replication/message.h"
 #include "storage/standbydefs.h"
@@ -187,7 +188,9 @@ cold_xact_flags(XLogReaderState *reader, uint64 system_identifier, const uint8 s
 	case XLOG_XACT_ABORT: {
 		xl_xact_parsed_abort parsed;
 
-		if (XLogRecGetDataLen(reader) < MinSizeOfXactAbort)
+		/* ParseAbortRecord trusts the xinfo it reads; check every section
+		 * lies within the data first (a damaged record is refused). */
+		if (!rf_side_xact_completion_shape_v1(reader, false))
 			return CLUSTER_COLD_COMPONENT_INVALID;
 		ParseAbortRecord(info, (xl_xact_abort *)XLogRecGetData(reader), &parsed);
 		*flags = parsed.nrels > 0 ? CLUSTER_COLD_RECORD_STRUCTURAL : 0;

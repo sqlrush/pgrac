@@ -12,6 +12,7 @@
 #include "postmaster/interrupt.h"
 #include "storage/buffile.h"
 #include "utils/resowner.h"
+#include "utils/timestamp.h"
 
 #define PI_REBUILD_BATCH 64
 
@@ -42,6 +43,8 @@ typedef struct PiRebuildJob {
 	bool pending_valid;
 	bool scanned;
 	bool plan_blocked;
+	/* PGRAC: when this cut's census began, for its completion reading. */
+	TimestampTz started;
 } PiRebuildJob;
 
 static PiRebuildJob *pi_rebuild_job;
@@ -97,11 +100,10 @@ pi_rebuild_add(void *arg, const RelFileLocator *locator, ForkNumber forknum, Blo
 	PiRebuildContribution *item;
 	int home;
 
-	/* The source's exact durable recovery terminal discharged this executor.
-	 * Keep decoding its records and checking the physical suffix, but do not
-	 * recreate a holder that can no longer answer a physical-PI request. */
-	if (job->recovered_end != InvalidXLogRecPtr)
-		return token != 0;
+	/* PGRAC: an exact RECOVERY_COMPLETE prefix qualifies only the ROOT chain.
+	 * A recovered writer's responsibility is rebuilt like any other; only
+	 * the recovered acknowledgement (actual DATA, its exact DEAD boot and the
+	 * complete master cut) discharges it, never this single ROOT value. */
 	if (token == 0 || job->source_node < 0 || job->source_node >= 32
 		|| XLogRecPtrIsInvalid(job->source_lsn))
 		return false;
@@ -149,6 +151,7 @@ pi_rebuild_record(XLogReaderState *record, const ClusterWalSourceRef *source,
 		job->source_valid = true;
 		(void)cluster_wal_inputs_recovered_prefix_v1(job->inputs, source, &job->recovered_end);
 	}
+	/* A recovered source still ends exactly at its recovered prefix. */
 	if (job->recovered_end != InvalidXLogRecPtr
 		&& (record->EndRecPtr <= record->ReadRecPtr || record->EndRecPtr > job->recovered_end))
 		return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
@@ -234,6 +237,7 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 	if (pi_rebuild_job == NULL) {
 		PiRebuildJob *job = palloc0(sizeof(*job));
 		job->owner = CurrentResourceOwner;
+		job->started = GetCurrentTimestamp();
 		job->cut = cut;
 		job->local = local;
 		pi_rebuild_job = job;
@@ -307,8 +311,21 @@ cluster_pi_rebuild_bgwriter_tick_v1(void)
 		goto wait;
 	}
 	if (cluster_wal_inputs_revalidate_v1(pi_rebuild_job->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		&& cluster_grd_pi_rebuild_complete_v1(&cut))
+		&& cluster_grd_pi_rebuild_complete_v1(&cut)) {
+		/* The fault-cut reading: census and registration of this cut. */
+		ereport(DEBUG1,
+				(errmsg("cluster PI rebuild completed for epoch " UINT64_FORMAT,
+						pi_rebuild_job->cut.epoch),
+				 errdetail("%llu records, %llu contributions, spool %llu bytes, %lld ms.",
+						   (unsigned long long)pi_rebuild_job->records,
+						   (unsigned long long)pi_rebuild_job->total,
+						   (unsigned long long)(pi_rebuild_job->spool != NULL
+													? pi_rebuild_job->total
+														  * sizeof(PiRebuildContribution)
+													: 0),
+						   (long long)((GetCurrentTimestamp() - pi_rebuild_job->started) / 1000))));
 		cluster_lmon_wakeup();
+	}
 done:
 	pi_rebuild_release();
 	return CLUSTER_PI_REBUILD_IDLE;

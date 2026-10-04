@@ -87,7 +87,7 @@ TESTS = test_cluster_formation_restart test_cluster_basic test_cluster_version t
         test_cluster_r4_itl_capacity \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent test_cluster_undo_extent_claim \
-        test_cluster_wal_thread test_cluster_wal_checkpoint_sample test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_wal_cut test_cluster_pi_data test_cluster_thread_tail test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
+        test_cluster_wal_thread test_cluster_wal_checkpoint_sample test_cluster_wal_retained_cut test_cluster_wal_retained_cut_records test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_wal_cut test_cluster_pi_data test_cluster_thread_tail test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
         test_cluster_backup test_cluster_retained_remote \
         test_cluster_recovery_worker test_cluster_recovery_merge test_cluster_remote_xact test_cluster_remote_xact_writer \
         test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay \
@@ -441,6 +441,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_install,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_producer test_cluster_space_fork test_cluster_space_identity test_cluster_space_page_verify test_cluster_space_table_size test_cluster_space_wal test_cluster_space_storage test_cluster_space_recovery test_cluster_space_cache test_cluster_space_recovery_route test_cluster_space_copy test_cluster_space_copy_version test_cluster_heap_insert_version test_cluster_vm_version test_cluster_vm_redo,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_generic_version test_cluster_generic_redo,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_wal_checkpoint_sample,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_wal_retained_cut test_cluster_wal_retained_cut_records,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_inplace_version test_cluster_heap_maintenance_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_vm_visible_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_btree_build_version,$(SIMPLE_TESTS))
@@ -907,9 +908,9 @@ test_cluster_checkpoint_native.inc: $(top_srcdir)/src/backend/access/transam/xlo
 	mv $@.tmp $@
 
 test_cluster_startup_writer_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
-	awk '/^ClusterStartupConfigurationRequire\(/ || /^ClusterStartupWriterSelect\(/ { print "static void"; emit=1; count++ } \
+	awk '/^ClusterStartupConfigurationRequire\(/ || /^ClusterStartupWriterSelect\(/ || /^ClusterStartupCrashSeal\(/ { print "static void"; emit=1; count++ } \
 	     /^ClusterStartupWriterBegin\(/ { print "static XLogRecPtr"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 3) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (count != 4) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: execute the real earliest startup-directory mutation call site.
@@ -2971,6 +2972,30 @@ xlogreader_fs.o: $(top_srcdir)/src/backend/access/transam/xlogreader.c \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -c $< -o $@
 
 CLUSTER_WAL_RETENTION_O = $(top_builddir)/src/backend/cluster/cluster_wal_retention.o
+
+# S07 census and native record classifications use the product implementation.
+test_cluster_wal_retained_cut: test_cluster_wal_retained_cut.c unit_test.h \
+		test_cluster_wal_retained_cut_cases.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_retained_cut.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_retained_cut.h \
+		$(SIDE_XACT_XACTDESC_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(SIDE_XACT_XACTDESC_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+RETAINED_RECORD_OBJS = $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
+		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
+		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
+		$(CLUSTER_REMOTE_XACT_IDENTITY_O) $(CLUSTER_SIDE_ROUTE_O)
+test_cluster_wal_retained_cut_records: test_cluster_wal_retained_cut_records.c unit_test.h \
+		test_cluster_wal_retained_cut_records_boundary.h test_cluster_wal_retained_cut_records_cases.h \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_retained_cut.c \
+		$(top_srcdir)/src/include/cluster/cluster_wal_retained_cut.h \
+		$(RETAINED_RECORD_OBJS) $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(RETAINED_RECORD_OBJS) \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
 # PGRAC: real exact-generation claim validation for physical WAL reuse tests.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_wal_retention: test_cluster_wal_retention.c unit_test.h \

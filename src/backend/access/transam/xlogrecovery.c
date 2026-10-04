@@ -157,7 +157,9 @@
  *	              RECOVERY_COMPLETE, once the files pass 2 changed are
  *	              durable and while IR is still held until the handoff.
  *	              Without shared_config a cold merge of several threads is
- *	              refused before any fence or claim.
+ *	              refused before any fence or claim; with it, a crash start
+ *	              the typed plan does not engage is refused before the claim
+ *	              (never a native replay of this node's stream alone).
  *	Why:          Retained history before a native redo start is ancestry
  *	              only; SCN order with unconditional full-page images can
  *	              overwrite a newer durable page another thread wrote.  A
@@ -2515,6 +2517,24 @@ PerformWalRecovery(void)
 					 errhint("PRE2 supports crash recovery of several failed nodes only in "
 							 "shared mode (cluster.shared_config = on). Preserve every "
 							 "thread's WAL; single-node recovery is unaffected.")));
+
+		/*
+		 * PGRAC (S9P2-05): in the shared profile this node's own crashed
+		 * generation is replayed only through the typed cold plan.  Its native
+		 * stream alone could rewrite pages other generations changed later
+		 * (their LSNs are not comparable), so a crash start the typed path does
+		 * not engage stops here, before the claim and any replay.
+		 */
+		if (cluster_shared_config && cluster_engage != CLUSTER_MERGE_ENGAGE)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("crash recovery of this node is not supported without the shared "
+							"cold path"),
+					 errdetail("The cold merge decision was %d; only a cold start with crashed "
+							   "peers is recovered by the typed plan in this build.",
+							   (int) cluster_engage),
+					 errhint("Preserve every thread's WAL; this node's sealed generation stays "
+							 "sealed until it is recovered.")));
 		cluster_recovery_merge_claim_acquire_blocking();
 	}
 	/*
