@@ -46,6 +46,9 @@ typedef enum ClusterWalRetainedPinV1 {
 	CLUSTER_WAL_RETAINED_PIN_LOCAL_PI = 4
 } ClusterWalRetainedPinV1;
 
+/* Older generations a census reports as deletable, at most. */
+#define CLUSTER_WAL_RETAINED_PRUNABLE_MAX 8
+
 typedef struct ClusterWalRetainedCutV1 {
 	/* Whole ROOT file the input was selected and revalidated under. */
 	ClusterControlRootFileToken root_token;
@@ -66,6 +69,11 @@ typedef struct ClusterWalRetainedCutV1 {
 	XLogRecPtr local_pi_floor;
 	uint64 local_pi_bounded;
 	uint64 local_pi_unbounded;
+	/* Older generations whose WAL serves no obligation and that nothing in
+	 * memory can still reference (the first CLUSTER_WAL_RETAINED_PRUNABLE_MAX
+	 * of prunable_generations).  A judgement only: nothing is deleted. */
+	uint32 prunable_generations;
+	ClusterControlRootIdentity prunable[CLUSTER_WAL_RETAINED_PRUNABLE_MAX];
 } ClusterWalRetainedCutV1;
 
 /*

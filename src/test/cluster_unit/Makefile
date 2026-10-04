@@ -2988,6 +2988,9 @@ CLUSTER_WAL_RETENTION_O = $(top_builddir)/src/backend/cluster/cluster_wal_retent
 test_cluster_wal_retained_cut: test_cluster_wal_retained_cut.c unit_test.h \
 		test_cluster_wal_retained_cut_cases.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_retained_cut.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_retained_side.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_retained_generation.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_retained_cut_internal.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_retained_cut.h \
 		$(SIDE_XACT_XACTDESC_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< $(SIDE_XACT_XACTDESC_O) \
@@ -3001,6 +3004,9 @@ RETAINED_RECORD_OBJS = $(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 test_cluster_wal_retained_cut_records: test_cluster_wal_retained_cut_records.c unit_test.h \
 		test_cluster_wal_retained_cut_records_boundary.h test_cluster_wal_retained_cut_records_cases.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_retained_cut.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_retained_side.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_retained_generation.c \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_retained_cut_internal.h \
 		$(top_srcdir)/src/include/cluster/cluster_wal_retained_cut.h \
 		$(RETAINED_RECORD_OBJS) $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(RETAINED_RECORD_OBJS) \

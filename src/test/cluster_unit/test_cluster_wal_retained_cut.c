@@ -41,7 +41,12 @@ static int log_count;
 			log_count++;                                                                           \
 	} while (0)
 
+/* Small enough to overflow from a test. */
+#define RETAINED_PREPARED_MAX 2
+
 #include "../../backend/cluster/cluster_wal_retained_cut.c"
+#include "../../backend/cluster/cluster_wal_retained_side.c"
+#include "../../backend/cluster/cluster_wal_retained_generation.c"
 
 #include "unit_test.h"
 
@@ -183,7 +188,7 @@ BufFileClose(BufFile *file)
 }
 
 /* ---- the retained input scope ---- */
-#define MAX_ITEMS 4
+#define MAX_ITEMS 6
 #define MAX_RECORDS 700
 
 typedef struct FixtureRecord {
@@ -200,6 +205,15 @@ typedef struct FixtureRecord {
 	bool space_create; /* the structure change is a CREATE */
 	uint8 inc;		   /* result segment incarnation id, 0 means 1 */
 	uint8 before_inc;  /* before incarnation id, 0 means inc */
+	/* SIDE keys, as the undo and transaction decoders would report them. */
+	uint8 rmid;		  /* 0: neither decoder applies */
+	uint8 undo_kind;  /* ClusterUndoDecodedKind */
+	uint8 xact_kind;  /* RfSideXactKindV1 */
+	bool undecodable; /* the decoder refuses the record */
+	bool full_image;
+	uint32 segment;
+	uint32 sub; /* TT slot or undo block */
+	TransactionId xid;
 } FixtureRecord;
 
 static ClusterWalInputV1 items[MAX_ITEMS];
@@ -291,6 +305,7 @@ cluster_wal_inputs_census_v1(ClusterWalInputsV1 *inputs pg_attribute_unused(),
 		reader.ReadRecPtr = records[i].read;
 		reader.EndRecPtr = records[i].end;
 		reader.record = decoded;
+		decoded->header.xl_rmid = records[i].rmid;
 		for (uint32 b = 0; b < records[i].ncomp; b++) {
 			decoded->blocks[b].rlocator.spcOid = 1663;
 			decoded->blocks[b].rlocator.dbOid = 5;
@@ -365,6 +380,42 @@ rf_side_record_census_v1(const RfDetachedRecordPlanV1 *record_plan pg_attribute_
 			return RF_PAGE_PROOF_DETAIL_WOULD_BLOCK;
 	}
 	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+bool
+cluster_undo_decode(XLogReaderState *record pg_attribute_unused(), ClusterUndoDecoded *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (current->undecodable)
+		return false;
+	out->kind = (ClusterUndoDecodedKind)current->undo_kind;
+	out->segment_id = current->segment;
+	out->slot_offset = (uint16)current->sub;
+	out->block_no = current->sub;
+	out->has_fpi = current->full_image;
+	return true;
+}
+
+bool
+rf_side_xact_decode_v1(XLogReaderState *record pg_attribute_unused(),
+					   uint64 system_identifier pg_attribute_unused(),
+					   uint16 origin_thread pg_attribute_unused(), RfSideXactOperationV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (current->undecodable)
+		return false;
+	out->kind = (RfSideXactKindV1)current->xact_kind;
+	out->xid = current->xid;
+	if (out->kind == RF_SIDE_XACT_COMMIT) {
+		out->has_tt_delta = true;
+		out->tt_delta.segment_id = current->segment;
+		out->tt_delta.slot_offset = (uint16)current->sub;
+	} else if (out->kind == RF_SIDE_XACT_PREPARE) {
+		out->prepared_binding_count = 1;
+		out->prepared_bindings[0].undo_segment_id = current->segment;
+		out->prepared_bindings[0].slot_offset = (uint16)current->sub;
+	}
+	return true;
 }
 
 /* The fixture SIDE decoder accepts every record: the native fallback and
@@ -515,7 +566,7 @@ compute(ClusterWalRetainedCutV1 *cut, RfPageProofDetailV1 *detail)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(21);
 	UT_RUN(test_retained_cut_moves_to_native_redo_without_obligations);
 	UT_RUN(test_retained_cut_peer_obligation_keeps_successors_on_its_page);
 	UT_RUN(test_retained_cut_hot_page_releases_predecessors);
@@ -532,6 +583,11 @@ main(void)
 	UT_RUN(test_retained_cut_driver_publishes_only_an_advance);
 	UT_RUN(test_retained_cut_local_pi_floor_holds_this_thread);
 	UT_RUN(test_retained_cut_local_pi_floor_unavailable_refuses);
+	UT_RUN(test_retained_cut_side_tt_slots_are_keyed);
+	UT_RUN(test_retained_cut_side_undo_blocks_are_keyed);
+	UT_RUN(test_retained_cut_side_prepared_transactions_are_keyed);
+	UT_RUN(test_retained_cut_side_unkeyed_records_are_kept_by_class);
+	UT_RUN(test_retained_cut_older_generation_deletable_only_when_proven);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

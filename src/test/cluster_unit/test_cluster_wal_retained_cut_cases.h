@@ -168,8 +168,10 @@ UT_TEST(test_retained_cut_refuses_a_chain_that_does_not_advance)
 	}
 }
 
-/* A keyless SIDE class with any obligation keeps the earliest history record
- * of that class; native control records never do. */
+/* A SIDE record neither decoder can key (here: no undo or transaction
+ * record) is kept by class: an unkeyed UNDO_HEADER obligation keeps all
+ * UNDO_HEADER history.  NATIVE_CONTROL and MULTIXACT history is never
+ * needed (MULTIXACT pages are durable at their source's checkpoint). */
 UT_TEST(test_retained_cut_keyless_side_classes)
 {
 	for (int variant = 0; variant < 3; variant++) {
@@ -186,10 +188,10 @@ UT_TEST(test_retained_cut_keyless_side_classes)
 		add_record(self, 0x2000, 0x2100, InvalidOid, 0, 3)->owners = owner;
 		add_record(peer, 0x6000, 0x6100, InvalidOid, 0, 4)->owners = owner;
 		UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
-		UT_ASSERT_EQ(cut.lower, variant == 1 ? SELF_REDO : 0x1400);
+		UT_ASSERT_EQ(cut.lower, variant == 0 ? 0x1400 : SELF_REDO);
 		UT_ASSERT_EQ(cut.pin,
-					 variant == 1 ? CLUSTER_WAL_RETAINED_PIN_NONE : CLUSTER_WAL_RETAINED_PIN_SIDE);
-		UT_ASSERT_EQ(cut.side_classes, variant == 1 ? 0 : owner);
+					 variant == 0 ? CLUSTER_WAL_RETAINED_PIN_SIDE : CLUSTER_WAL_RETAINED_PIN_NONE);
+		UT_ASSERT_EQ(cut.side_classes, variant == 0 ? owner : 0);
 		if (ut_current_failed)
 			printf("# side variant %d\n", variant);
 	}
@@ -565,6 +567,306 @@ UT_TEST(test_retained_cut_local_pi_floor_unavailable_refuses)
 	local_pi.unbounded = 1;
 	UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
 	UT_ASSERT(v_zero(&cut, sizeof(cut)));
+}
+
+/* ---- R-A18: SIDE keys ---- */
+static FixtureRecord *
+side_record(uint32 source, XLogRecPtr read, uint32 owners)
+{
+	FixtureRecord *r = add_record(source, read, read + 0x100, InvalidOid, 0, 2);
+
+	r->owners = owners;
+	return r;
+}
+
+static FixtureRecord *
+undo_record(uint32 source, XLogRecPtr read, uint8 kind, uint32 segment, uint32 sub)
+{
+	uint32 owners = RF_SIDE_CONTRIBUTION_UNDO_HEADER;
+	FixtureRecord *r;
+
+	if (kind == CLUSTER_UNDO_KIND_BLOCK_WRITE)
+		owners = RF_SIDE_CONTRIBUTION_UNDO_BLOCK;
+	else if (kind == CLUSTER_UNDO_KIND_SEGMENT_INIT || kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE)
+		owners |= RF_SIDE_CONTRIBUTION_UNDO_BLOCK;
+	r = side_record(source, read, owners);
+	r->rmid = RM_CLUSTER_UNDO_ID;
+	r->undo_kind = kind;
+	r->segment = segment;
+	r->sub = sub;
+	return r;
+}
+
+static FixtureRecord *
+xact_record(uint32 source, XLogRecPtr read, uint8 kind, TransactionId xid, uint32 segment,
+			uint32 slot)
+{
+	uint32 owners = RF_SIDE_CONTRIBUTION_UNDO_HEADER | RF_SIDE_CONTRIBUTION_TERMINAL;
+	FixtureRecord *r;
+
+	if (kind != RF_SIDE_XACT_COMMIT)
+		owners |= RF_SIDE_CONTRIBUTION_PREPARED;
+	r = side_record(source, read, owners);
+	r->rmid = RM_XACT_ID;
+	r->xact_kind = kind;
+	r->xid = xid;
+	r->segment = segment;
+	r->sub = slot;
+	return r;
+}
+
+static void
+expect_side(XLogRecPtr lower, uint32 side)
+{
+	ClusterWalRetainedCutV1 cut;
+	RfPageProofDetailV1 detail;
+
+	UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(cut.lower, lower);
+	UT_ASSERT_EQ(cut.pin,
+				 side != 0 ? CLUSTER_WAL_RETAINED_PIN_SIDE : CLUSTER_WAL_RETAINED_PIN_NONE);
+	UT_ASSERT_EQ(cut.side_classes, side);
+}
+
+/* An obligation on a TT slot keeps the history of that slot and of its
+ * segment header, nothing else; a COMMIT's TT delta names its slot; a
+ * segment INIT carries the whole header. */
+UT_TEST(test_retained_cut_side_tt_slots_are_keyed)
+{
+	const uint32 header = RF_SIDE_CONTRIBUTION_UNDO_HEADER;
+
+	for (int variant = 0; variant < 7; variant++) {
+		uint32 self, peer;
+		XLogRecPtr lower = 0x1400;
+		uint32 side = header;
+
+		two_writers(&self, &peer);
+		add_record(self, 0x1000, 0x1100, 100, 1, 2);
+		if (variant == 3 || variant == 4)
+			undo_record(self, 0x1200, CLUSTER_UNDO_KIND_SEGMENT_INIT, 10, 0);
+		if (variant == 5)
+			xact_record(self, 0x1400, RF_SIDE_XACT_COMMIT, 801, 10, 3);
+		else if (variant != 4)
+			undo_record(self, 0x1400, CLUSTER_UNDO_KIND_TT_COMMIT, 10, 3);
+		undo_record(self, 0x1800, CLUSTER_UNDO_KIND_TT_COMMIT, 10, 4);
+		if (variant == 0 || variant == 5)
+			undo_record(self, 0x3200, CLUSTER_UNDO_KIND_TT_BIND, 10, 3);
+		else if (variant == 1) {
+			undo_record(self, 0x3200, CLUSTER_UNDO_KIND_TT_BIND, 10, 4);
+			lower = 0x1800;
+		} else if (variant == 2) {
+			undo_record(self, 0x3200, CLUSTER_UNDO_KIND_TT_BIND, 11, 3);
+			lower = SELF_REDO;
+			side = 0;
+		} else if (variant == 3) { /* the INIT counts for both undo classes */
+			undo_record(self, 0x3200, CLUSTER_UNDO_KIND_TT_BIND, 10, 4);
+			lower = 0x1200;
+			side = header | RF_SIDE_CONTRIBUTION_UNDO_BLOCK;
+		} else if (variant == 4) {
+			undo_record(self, 0x3200, CLUSTER_UNDO_KIND_SEGMENT_INIT, 10, 0);
+			lower = SELF_REDO;
+			side = 0;
+		} else /* a peer's obligation on the same key keeps it too */
+			undo_record(peer, 0x6100, CLUSTER_UNDO_KIND_TT_BIND, 10, 3);
+		expect_side(lower, side);
+		if (ut_current_failed)
+			printf("# tt slot variant %d\n", variant);
+	}
+}
+
+/* A full-image undo block obligation needs nothing; a delta keeps its
+ * block's history and its segment's INIT/REUSE. */
+UT_TEST(test_retained_cut_side_undo_blocks_are_keyed)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		uint32 self, peer;
+		FixtureRecord *r;
+		XLogRecPtr lower = SELF_REDO;
+		uint32 side = 0;
+
+		two_writers(&self, &peer);
+		add_record(self, 0x1000, 0x1100, 100, 1, 2);
+		if (variant == 3)
+			undo_record(self, 0x1200, CLUSTER_UNDO_KIND_SEGMENT_INIT, 10, 0);
+		undo_record(self, 0x1400, CLUSTER_UNDO_KIND_BLOCK_WRITE, 10, 5);
+		r = undo_record(self, 0x3200, CLUSTER_UNDO_KIND_BLOCK_WRITE, 10, variant >= 2 ? 6 : 5);
+		r->full_image = variant == 0;
+		if (variant == 1) {
+			lower = 0x1400;
+			side = RF_SIDE_CONTRIBUTION_UNDO_BLOCK;
+		} else if (variant == 3) {
+			lower = 0x1200;
+			side = RF_SIDE_CONTRIBUTION_UNDO_BLOCK | RF_SIDE_CONTRIBUTION_UNDO_HEADER;
+		}
+		expect_side(lower, side);
+		if (ut_current_failed)
+			printf("# undo block variant %d\n", variant);
+	}
+}
+
+/* A history PREPARE is kept while no history COMMIT/ABORT PREPARED resolves
+ * it; an obligation COMMIT PREPARED keeps it (and, its TT slots being
+ * unkeyed, all UNDO_HEADER history).  Beyond the exact capacity every
+ * PREPARED history record is kept. */
+UT_TEST(test_retained_cut_side_prepared_transactions_are_keyed)
+{
+	const uint32 prepared = RF_SIDE_CONTRIBUTION_PREPARED;
+
+	for (int variant = 0; variant < 6; variant++) {
+		uint32 self, peer;
+		XLogRecPtr lower = 0x1400;
+		uint32 side = prepared;
+
+		two_writers(&self, &peer);
+		add_record(self, 0x1000, 0x1100, 100, 1, 2);
+		xact_record(self, 0x1400, RF_SIDE_XACT_PREPARE, 900, 10, 3);
+		if (variant == 4) { /* three PREPAREs, one resolved: capacity two */
+			xact_record(self, 0x1500, RF_SIDE_XACT_COMMIT_PREPARED, 900, 0, 0);
+			xact_record(self, 0x1800, RF_SIDE_XACT_PREPARE, 901, 10, 4);
+			xact_record(self, 0x2000, RF_SIDE_XACT_PREPARE, 902, 10, 5);
+		} else if (variant == 5) { /* its TT binding slot is bound again */
+			xact_record(self, 0x1800, RF_SIDE_XACT_COMMIT_PREPARED, 900, 0, 0);
+			undo_record(self, 0x3200, CLUSTER_UNDO_KIND_TT_BIND, 10, 3);
+			side = RF_SIDE_CONTRIBUTION_UNDO_HEADER;
+		}
+		if (variant == 1) {
+			xact_record(self, 0x1800, RF_SIDE_XACT_COMMIT_PREPARED, 900, 0, 0);
+			lower = SELF_REDO;
+			side = 0;
+		} else if (variant == 2) {
+			xact_record(self, 0x3200, RF_SIDE_XACT_COMMIT_PREPARED, 900, 0, 0);
+			side = prepared | RF_SIDE_CONTRIBUTION_UNDO_HEADER;
+		} else if (variant == 3) { /* three resolved pairs, capacity two */
+			xact_record(self, 0x1500, RF_SIDE_XACT_ABORT_PREPARED, 900, 0, 0);
+			xact_record(self, 0x1800, RF_SIDE_XACT_PREPARE, 901, 10, 4);
+			xact_record(self, 0x1900, RF_SIDE_XACT_COMMIT_PREPARED, 901, 0, 0);
+			xact_record(self, 0x2000, RF_SIDE_XACT_PREPARE, 902, 10, 5);
+			xact_record(self, 0x2100, RF_SIDE_XACT_COMMIT_PREPARED, 902, 0, 0);
+		}
+		expect_side(lower, side);
+		if (ut_current_failed)
+			printf("# prepared variant %d\n", variant);
+	}
+}
+
+/* A record whose keys cannot be derived is kept by class: in history while
+ * its class has any obligation, as an obligation it keeps all history of
+ * its class. */
+UT_TEST(test_retained_cut_side_unkeyed_records_are_kept_by_class)
+{
+	const uint32 header = RF_SIDE_CONTRIBUTION_UNDO_HEADER;
+
+	for (int variant = 0; variant < 4; variant++) {
+		uint32 self, peer;
+		XLogRecPtr lower = 0x1400;
+		uint32 side = header;
+
+		two_writers(&self, &peer);
+		add_record(self, 0x1000, 0x1100, 100, 1, 2);
+		if (variant == 2) {
+			undo_record(self, 0x1200, CLUSTER_UNDO_KIND_TT_COMMIT, 10, 3);
+			undo_record(self, 0x1800, CLUSTER_UNDO_KIND_TT_COMMIT, 10, 4);
+			undo_record(self, 0x3200, CLUSTER_UNDO_KIND_TT_BIND, 10, 6)->undecodable = true;
+			lower = 0x1200;
+		} else if (variant == 3) {
+			side_record(self, 0x1400, RF_SIDE_CONTRIBUTION_UNDO_BLOCK); /* no decoder */
+			undo_record(self, 0x3200, CLUSTER_UNDO_KIND_BLOCK_WRITE, 10, 5);
+			side = RF_SIDE_CONTRIBUTION_UNDO_BLOCK;
+		} else {
+			undo_record(self, 0x1400, CLUSTER_UNDO_KIND_TT_COMMIT, 10, 3)->undecodable = true;
+			if (variant == 0)
+				undo_record(self, 0x3200, CLUSTER_UNDO_KIND_TT_BIND, 11, 9);
+			else { /* no UNDO_HEADER obligation at all */
+				side_record(self, 0x3200, RF_SIDE_CONTRIBUTION_TERMINAL);
+				lower = SELF_REDO;
+				side = 0;
+			}
+		}
+		expect_side(lower, side);
+		if (ut_current_failed)
+			printf("# unkeyed variant %d\n", variant);
+	}
+}
+
+/* ---- R-A20: older generations ---- */
+static uint32
+add_old_generation(uint16 thread, uint64 incarnation, uint8 lifecycle, uint64 closed_seq,
+				   XLogRecPtr tail)
+{
+	uint32 i = add_item(thread, lifecycle, 0x100, tail, tail, false);
+
+	items[i].source.claim.identity.origin_owner_incarnation = incarnation;
+	items[i].source.claim.claim_sha256[1] = (uint8)incarnation;
+	items[i].checkpoint.identity = items[i].source.claim.identity;
+	items[i].checkpoint.root_publish_seq = closed_seq;
+	return i;
+}
+
+static bool
+cut_names(const ClusterWalRetainedCutV1 *cut, uint32 item)
+{
+	for (uint32 i = 0; i < Min(cut->prunable_generations, CLUSTER_WAL_RETAINED_PRUNABLE_MAX); i++)
+		if (memcmp(&cut->prunable[i], &items[item].checkpoint.identity, sizeof(cut->prunable[i]))
+			== 0)
+			return true;
+	return false;
+}
+
+/* An older generation is reported deletable only if it is CLOSED, nothing
+ * in it is needed, and every running instance of another thread restarted
+ * after it closed.  Self's old generation closed at 40; the peer's own
+ * predecessor (when present) closed at 50, or 35 in variant 1, where the
+ * peer's generation is the deletable one instead (self restarted after it). */
+UT_TEST(test_retained_cut_older_generation_deletable_only_when_proven)
+{
+	for (int variant = 0; variant < 10; variant++) {
+		uint32 self, peer, old, peer_old = UINT32_MAX;
+		ClusterWalRetainedCutV1 cut;
+		RfPageProofDetailV1 detail;
+		bool deletable = variant == 0 || variant == 6 || variant == 8 || variant == 9;
+
+		two_writers(&self, &peer);
+		add_record(self, 0x1000, 0x1100, 100, 1, 2);
+		old = add_old_generation(1, 20,
+								 variant == 3 ? CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+											  : CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED,
+								 40, 0x800);
+		if (variant == 1)
+			peer_old = add_old_generation(2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 35, 0x900);
+		else if (variant == 7) { /* the peer's predecessor is an initializer terminal */
+			ClusterWalInputV1 *terminal = &items[add_old_generation(
+				2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 50, 0x900)];
+
+			terminal->kind = CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL;
+			terminal->first_segment = 0x1000000;
+		} else if (variant == 8) { /* only the peer's latest restart counts */
+			add_old_generation(2, 25, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 30, 0x900);
+			add_old_generation(2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 50, 0x900);
+		} else if (variant == 9) /* both closed by one publication */
+			add_old_generation(2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 40, 0x900);
+		else if (variant != 2 && variant != 6) /* variant 2: the peer never restarted */
+			add_old_generation(2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 50, 0x900);
+		if (variant == 4) { /* an obligation needs one of its edges */
+			add_record(old, 0x200, 0x300, 700, 1, 2);
+			add_record(self, 0x3000, 0x3100, 700, 1, 3);
+		} else if (variant == 5) { /* it ends a relation incarnation */
+			FixtureRecord *r = add_record(old, 0x200, 0x280, InvalidOid, 0, 9);
+
+			r->space_rel = 901;
+			r->space_mask = 3;
+		} else if (variant == 6) /* the peer is not running at all */
+			items[peer].checkpoint.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+		UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(cut_names(&cut, old), deletable);
+		/* Variants 1, 8 and 9 also free a peer generation self outlived. */
+		UT_ASSERT_EQ(cut.prunable_generations,
+					 (deletable ? 1u : 0u)
+						 + (variant == 1 || variant == 8 || variant == 9 ? 1u : 0u));
+		if (variant == 1)
+			UT_ASSERT(cut_names(&cut, peer_old));
+		if (ut_current_failed)
+			printf("# older generation variant %d\n", variant);
+	}
 }
 
 #endif /* TEST_CLUSTER_WAL_RETAINED_CUT_CASES_H */

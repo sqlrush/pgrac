@@ -32,12 +32,15 @@
 #include <stdlib.h>
 
 #include "../../backend/cluster/cluster_wal_retained_cut.c"
+#include "../../backend/cluster/cluster_wal_retained_side.c"
+#include "../../backend/cluster/cluster_wal_retained_generation.c"
 
 #include "access/xact.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_block_apply.h"
 #include "cluster/cluster_space_reservation.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -49,7 +52,7 @@ UT_DEFINE_GLOBALS();
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(test_records_commit_tombstone_pins_its_source);
 	UT_RUN(test_records_commit_with_invalidations_is_classified);
 	UT_RUN(test_records_abort_with_relations_pins_its_source);
@@ -57,6 +60,7 @@ main(void)
 	UT_RUN(test_records_foreign_source_pins_only_itself);
 	UT_RUN(test_records_unknown_native_record_still_refuses);
 	UT_RUN(test_records_short_abort_does_not_advance_retention);
+	UT_RUN(test_records_tt_slot_stamps_are_keyed);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
