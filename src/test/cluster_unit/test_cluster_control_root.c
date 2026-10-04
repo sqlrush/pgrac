@@ -22317,7 +22317,9 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_SERVING") != NULL) {
-		UT_PLAN(11);
+		UT_PLAN(13);
+		UT_RUN(test_serving_clean_restart_keeps_old_open_with_current_epoch);
+		UT_RUN(test_serving_current_epoch_is_required_before_any_publication);
 		UT_RUN(test_serving_requires_coordinator_publish_then_startup_is_active);
 		UT_RUN(test_serving_startup_checkpoint_remains_active_after_live_wal);
 		UT_RUN(test_serving_shutdown_checkpoint_still_requires_terminal_wal);
@@ -22397,9 +22399,11 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(441);
+	UT_PLAN(443);
 	UT_RUN(test_clean_restart_without_provider_keeps_collective_exit_and_actual_install);
 	UT_RUN(test_clean_restart_without_provider_refuses_missing_exit_formation_and_fence);
+	UT_RUN(test_serving_clean_restart_keeps_old_open_with_current_epoch);
+	UT_RUN(test_serving_current_epoch_is_required_before_any_publication);
 	UT_RUN(test_serving_requires_coordinator_publish_then_startup_is_active);
 	UT_RUN(test_serving_startup_checkpoint_remains_active_after_live_wal);
 	UT_RUN(test_serving_shutdown_checkpoint_still_requires_terminal_wal);

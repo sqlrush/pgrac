@@ -6,6 +6,8 @@ static ClusterSemanticActivationRecord serving_open;
 static uint8 serving_descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
 static ClusterNormalStopPollResult serving_match = CLUSTER_NORMAL_STOP_READY;
 static unsigned serving_match_calls;
+static uint64 serving_current_epoch;
+static ClusterNormalStopPollResult serving_epoch_result;
 static void (*serving_match_hook)(void);
 
 ClusterNormalStopPollResult
@@ -29,6 +31,20 @@ cluster_semantic_normal_stop_match(const ClusterSemanticActivationRecord *open,
 		if ((open->admitted_members_lo & (UINT64_C(1) << node)) != 0)
 			members[node] = test_reserve_cut.observer[node];
 	return CLUSTER_NORMAL_STOP_READY;
+}
+
+ClusterNormalStopPollResult
+cluster_semantic_normal_stop_current_epoch(
+	const ClusterSemanticActivationRecord *open,
+	const uint8 descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES], uint64 *epoch)
+{
+	*epoch = 0;
+	if (memcmp(open, &serving_open, sizeof(*open)) != 0
+		|| memcmp(descriptor, serving_descriptor, sizeof(serving_descriptor)) != 0)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	if (serving_epoch_result == CLUSTER_NORMAL_STOP_READY)
+		*epoch = serving_current_epoch;
+	return serving_epoch_result;
 }
 
 static void
@@ -94,6 +110,8 @@ serving_fixture_installed(uint8 before[66048], ControlRootImage *root, bool all)
 	memset(serving_descriptor, 0x71, sizeof(serving_descriptor));
 	serving_match = CLUSTER_NORMAL_STOP_READY;
 	serving_match_calls = 0;
+	serving_current_epoch = test_epoch;
+	serving_epoch_result = CLUSTER_NORMAL_STOP_READY;
 	serving_match_hook = NULL;
 	UT_ASSERT_EQ(root->header.v2.database_state, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
 	UT_ASSERT_EQ(root->header.v2.serving[0], 0);
@@ -826,10 +844,11 @@ UT_TEST(test_serving_real_shutdown_checkpoints_close_installed_cohort)
 		cluster_node_id = 0;
 		test_self_incarnation = test_membership_incarnation = test_reserve_cut.observer[0];
 		MyBackendType = B_LMON;
-		/* The live semantic owner has now completed OPEN_APPLIED for the new
-		 * boots/epoch; the immutable original creation lineage stays intact. */
-		serving_open.transition_epoch = test_epoch;
-		serving_open.coordinator_incarnation = test_self_incarnation;
+		/* The live semantic owner completed OPEN_APPLIED for the new boots;
+		 * the durable OPEN record still belongs to the original generation. */
+		serving_current_epoch = test_epoch;
+		UT_ASSERT_EQ(serving_open.transition_epoch, test_epoch - 1);
+		UT_ASSERT_EQ(serving_open.coordinator_incarnation, test_self_incarnation - 1000);
 		UT_ASSERT_EQ(
 			cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &token), 0);
 		test_cf_mode = test_actual_cf = ShareLock;
@@ -842,6 +861,53 @@ UT_TEST(test_serving_real_shutdown_checkpoints_close_installed_cohort)
 		UT_ASSERT_EQ(observed.header.v2.serving[0], 9);
 		UT_ASSERT_EQ(cluster_control_root_v3_stop_phase_read(1, test_self_incarnation, &stop), 0);
 		UT_ASSERT_EQ(stop.phase, CLUSTER_CONTROL_ROOT_STOP_ACTIVE);
+	}
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_serving_clean_restart_keeps_old_open_with_current_epoch)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterControlRootFileToken token;
+	ClusterSemanticActivationRecord immutable;
+	serving_fixture(before, &root);
+	if (ut_current_failed)
+		return;
+	serving_open.transition_epoch = test_epoch - 1;
+	immutable = serving_open;
+	UT_ASSERT_EQ(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &token),
+				 0);
+	UT_ASSERT(memcmp(&immutable, &serving_open, sizeof(immutable)) == 0);
+	UT_ASSERT_EQ(token.file_txn_seq, root.header.file_txn_seq + 1);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_serving_current_epoch_is_required_before_any_publication)
+{
+	for (unsigned bad = 0; bad < 4; bad++) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ClusterControlRootFileToken token;
+		int writes;
+		serving_fixture(before, &root);
+		if (ut_current_failed)
+			return;
+		writes = test_durable_rename_calls;
+		if (bad == 0)
+			serving_epoch_result = CLUSTER_NORMAL_STOP_PENDING;
+		if (bad == 1)
+			serving_epoch_result = CLUSTER_NORMAL_STOP_INVALID;
+		if (bad == 2)
+			serving_current_epoch--;
+		if (bad == 3)
+			serving_current_epoch++;
+		UT_ASSERT(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &token)
+				  != 0);
+		UT_ASSERT_EQ(test_durable_rename_calls, writes);
+		UT_ASSERT(v2_zero(&token, sizeof(token)));
+		v2_assert_primary_unchanged(before);
 	}
 	test_reserve_mode = false;
 }

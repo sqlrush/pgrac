@@ -4700,16 +4700,20 @@ serving_cut_read(const ClusterSemanticActivationRecord *open, const uint8 *descr
 	ClusterFormationSnapshotV1 formation;
 	ClusterFenceAuthorityProof authority;
 	ClusterNormalStopPollResult matched;
+	uint64 current_epoch;
 
 	memset(cut, 0, sizeof(*cut));
 	matched = cluster_semantic_normal_stop_match(open, descriptor, cut->members, NULL);
 	if (matched != CLUSTER_NORMAL_STOP_READY)
 		return matched == CLUSTER_NORMAL_STOP_PENDING ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
 													  : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	matched = cluster_semantic_normal_stop_current_epoch(open, descriptor, &current_epoch);
+	if (matched != CLUSTER_NORMAL_STOP_READY)
+		return matched == CLUSTER_NORMAL_STOP_PENDING ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+													  : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (!config_aux_cut(&cut->control)
 		|| !cluster_reconfig_capture_formation_snapshot_v1(cluster_node_id + 1, &formation)
-		|| formation.local_epoch != cut->control.epoch
-		|| open->transition_epoch != formation.local_epoch
+		|| formation.local_epoch != cut->control.epoch || current_epoch != formation.local_epoch
 		|| formation.startup_formation_generation == 0
 		|| formation.startup_formation_generation == UINT64_MAX || formation.self_join_admitted != 1
 		|| formation.self_join_failed || formation.prebump_sync_active

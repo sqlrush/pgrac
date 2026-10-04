@@ -23,6 +23,50 @@
 int cluster_node_id = 0;
 bool cluster_enabled = true;
 
+/* This codec fixture has no postmaster, formation, or ROOT serving owner.
+ * Linux retains the whole LMON call graph; reaching one of these is a bug. */
+bool IsUnderPostmaster = false;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+uint64
+cluster_membership_cut_generation(void)
+{
+	abort();
+}
+bool
+cluster_normal_stop_requested(void)
+{
+	abort();
+}
+bool
+cluster_write_fence_allowed(void)
+{
+	abort();
+}
+bool
+cluster_reconfig_has_pending_prebump_stage(void)
+{
+	abort();
+}
+bool
+cluster_reconfig_capture_formation_snapshot_v1(
+	uint16 thread pg_attribute_unused(), ClusterFormationSnapshotV1 *out pg_attribute_unused())
+{
+	abort();
+}
+ClusterControlRootResult
+cluster_control_root_v3_serving_poll(
+	const ClusterSemanticActivationRecord *open pg_attribute_unused(),
+	const uint8 descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] pg_attribute_unused(),
+	ClusterControlRootFileToken *out pg_attribute_unused())
+{
+	abort();
+}
+void
+cluster_control_root_v3_serving_cancel(void)
+{
+	abort();
+}
+
 /* This codec/mailbox fixture has no running LMON.  Match the original
  * notification's NULL-latch behavior; completion authority is tested below
  * and publication-before-notification is tested by the FSM fixture. */
