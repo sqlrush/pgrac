@@ -6755,7 +6755,7 @@ test_cluster_stop_membership_observation.inc: $(top_srcdir)/src/backend/cluster/
 		emit { print } emit && /^}/ { done=1; exit } \
 		END { if (!done || starts != 1) exit 1 }' $< > $@
 
-test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h test_cluster_first_open.h test_cluster_serving_admission.h test_cluster_sample_ack_handoff.h test_cluster_normal_cold_scn.inc \
+test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h test_cluster_first_open.h test_cluster_serving_admission.h test_cluster_sample_ack_handoff.h test_cluster_clean_restart_formation.h test_cluster_normal_cold_scn.inc \
 		test_cluster_terminal_peer.inc \
 		test_cluster_stop_membership_observation.inc \
 		test_cluster_normal_cold_startup.h test_cluster_normal_cold_capture.inc \

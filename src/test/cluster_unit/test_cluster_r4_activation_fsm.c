@@ -11334,11 +11334,12 @@ static void test_serving_finish_root(void);
 #include "test_cluster_first_open.h"
 #include "test_cluster_serving_admission.h"
 #include "test_cluster_sample_ack_handoff.h"
+#include "test_cluster_clean_restart_formation.h"
 
 int
 main(void)
 {
-	UT_PLAN(365);
+	UT_PLAN(367);
 	UT_RUN(test_barrier_waits_for_both_late_peer_samples_in_either_order);
 	UT_RUN(test_staged_sample_ack_survives_idle_authority_gap);
 	UT_RUN(test_sample_ack_waits_for_local_gate_epoch);
@@ -11636,6 +11637,8 @@ main(void)
 	UT_RUN(test_145u_cas_binding_copy_contradiction_cannot_retain_utility);
 	UT_RUN(test_a142_clean_restart_requests_fresh_open_while_closed);
 	UT_RUN(test_normal_start_separate_record_and_own_checkpoint_capture);
+	UT_RUN(test_clean_formation_old_pgsa_classifies_loading_at_current_epoch);
+	UT_RUN(test_clean_formation_missing_original_input_cannot_classify_ready);
 	UT_RUN(test_normal_census_full_owner_namespace_retains_terminal_history);
 	UT_RUN(test_normal_census_sparse_and_zero_are_complete_not_cursor_based);
 	UT_RUN(test_normal_census_refuses_active_invalid_short_and_wrong_owner_without_writes);
