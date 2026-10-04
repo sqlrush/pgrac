@@ -461,17 +461,50 @@ stats_fill_wal_state_update(ClusterWalStateUpdateKind kind, int64 started_at,
 static void
 stats_validate_native_writer(void)
 {
-	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	bool logged_wait = false;
 
-	if (!RecoveryInProgress())
-		result = cluster_wal_writer_ready(GetWALInsertionTimeLine());
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	for (;;) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+
+		/* Reset before observing stop/reload flags, so their wakeup cannot
+		 * be lost between the proof check and the wait. No authority is held. */
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+		if (ShutdownRequestPending || stats_shutdown_requested())
+			return;
+		if (ConfigReloadPending) {
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+		if (!RecoveryInProgress())
+			result = cluster_wal_writer_ready(GetWALInsertionTimeLine());
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return;
+		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+			|| result == CLUSTER_CONTROL_ROOT_STALE_TOKEN) {
+			/* QVOTEC may be renewing the current writer's lease. Remain
+			 * SPAWNING and obtain a new exact proof on the next tick; never
+			 * turn the unqualified observation into READY or a new producer. */
+			if (!logged_wait) {
+				ereport(LOG,
+						(errmsg("Cluster Stats is waiting for the installed native WAL writer"),
+						 errdetail("The original native-writer check returned result %d; "
+								   "Stats remains outside READY admission.",
+								   (int)result)));
+				logged_wait = true;
+			}
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							cluster_cluster_stats_main_loop_interval,
+							WAIT_EVENT_CLUSTER_BGPROC_CLUSTER_STATS_MAIN_LOOP);
+			continue;
+		}
 		ereport(FATAL,
 				(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
 				 errmsg("Cluster Stats could not validate the installed native WAL writer"),
 				 errdetail("The original native-writer check returned result %d.", (int)result),
 				 errhint("Preserve the ROOT-selected claim and startup evidence; Stats cannot "
 						 "create or repair writer admission.")));
+	}
 }
 
 /*
@@ -655,6 +688,8 @@ ClusterStatsMain(void)
 	/* Publish SPAWNING (records pid + spawned_at). */
 	stats_publish_status(CLUSTER_STATS_SPAWNING);
 	suppress_wal_telemetry = stats_prepare_incarnation();
+	if (ShutdownRequestPending || stats_shutdown_requested())
+		goto shutdown;
 
 	/* Sprint B inject: ready-publish (test slow startup / phase 1 wait timeout). */
 	CLUSTER_INJECTION_POINT("cluster-stats-ready-publish");
@@ -704,6 +739,7 @@ ClusterStatsMain(void)
 			ResetLatch(MyLatch);
 	}
 
+shutdown:
 	/* Sprint B inject: shutdown-pre (test cleanup-time fault). */
 	CLUSTER_INJECTION_POINT("cluster-stats-shutdown-pre");
 
