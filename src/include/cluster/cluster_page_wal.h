@@ -157,6 +157,47 @@ extern void cluster_page_wal_reset_reuse_locked(struct BufferDesc *buf);
 extern bool cluster_page_wal_read_v1(Buffer buffer, const ClusterSpaceIdentity *identity,
 									 ClusterPageWalBindingV1 *out);
 
+/*
+ * First own record since the page was last clean (D S09 R-A22).  A capture
+ * sets it when it is empty; later captures, installs and forget leave it.
+ * All functions below require the descriptor header lock (and the content
+ * lock the caller already holds for the page).  A present first record is
+ * returned as its 48-byte reference; observe copies it without a source
+ * reference, retain takes one the caller must move or release.
+ */
+typedef enum ClusterPageWalFirstResultV1 {
+	CLUSTER_PAGE_WAL_FIRST_ABSENT,
+	CLUSTER_PAGE_WAL_FIRST_PRESENT,
+	CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED, /* an LSN with no source: keep the lower */
+	CLUSTER_PAGE_WAL_FIRST_INVALID,
+} ClusterPageWalFirstResultV1;
+
+extern ClusterPageWalFirstResultV1
+cluster_page_wal_first_observe_locked_v1(struct BufferDesc *buf, ClusterPageWalRefV1 *out);
+extern ClusterPageWalFirstResultV1
+cluster_page_wal_first_retain_locked_v1(struct BufferDesc *buf, ClusterPageWalRefV1 *out);
+/* The write owner, after TerminateBufferIO(true) and still under content
+ * SHARE: clears the first record observed before the write only when the
+ * page is clean now, the slot is unchanged and the written version covers
+ * it.  False keeps it (re-dirtied, drifted or failed). */
+extern bool cluster_page_wal_first_clear_written_locked_v1(struct BufferDesc *buf,
+														   const ClusterPageWalRefV1 *observed,
+														   uint64 written_token);
+/* A producer whose receiver already holds this first record clears it. */
+extern bool cluster_page_wal_first_handover_locked_v1(struct BufferDesc *buf,
+													  const ClusterPageWalRefV1 *observed);
+
+typedef struct ClusterPageWalDirtyFloorV1 {
+	XLogRecPtr floor; /* least first record of the source; 0 = none */
+	uint32 dirty;	  /* buffers with a first record */
+	uint32 foreign;	  /* ... of another source (not compared numerically) */
+	uint32 unattributed;
+} ClusterPageWalDirtyFloorV1;
+
+/* Lock-free scan of every buffer's first record for one WAL source. */
+extern bool cluster_page_wal_dirty_floor_v1(const ClusterWalSourceRef *source,
+											ClusterPageWalDirtyFloorV1 *out);
+
 /* Carrier-only observation under the existing pin/content lock. Does not
  * establish current SPACE incarnation or qualify a DATA write. */
 extern bool cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out);
