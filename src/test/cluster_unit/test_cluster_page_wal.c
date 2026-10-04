@@ -365,8 +365,9 @@ resident_binding_memory_budget(void)
 	many = cluster_page_wal_shmem_size();
 	printf("# Resident WAL bytes per buffer: %zu; 16384-buffer region: %zu bytes\n",
 		   (many - one) / 16383, many);
-	UT_ASSERT_EQ(many - one, (Size)48 * 16383);
-	UT_ASSERT(many <= (Size)48 * NBuffers + 65536);
+	/* Latest binding 48B + first record 48B + its atomic LSN 8B (R-A22). */
+	UT_ASSERT_EQ(many - one, (Size)104 * 16383);
+	UT_ASSERT(many <= (Size)104 * NBuffers + 65536);
 	NBuffers = 1;
 }
 static void
@@ -808,6 +809,20 @@ shared_claim_and_descriptor_reuse_do_not_alias(void)
 	UT_ASSERT_EQ(allocations, before_allocations);
 }
 
+/* R-A22: forget keeps a first record, which holds its own source reference;
+ * end it as its producer would after handing it over. */
+static void
+drop_first(int index)
+{
+	BufferDesc *buf = &many_descriptors[index].bufferdesc;
+	ClusterPageWalRefV1 first;
+	pg_atomic_fetch_or_u32(&buf->state, BM_LOCKED);
+	UT_ASSERT_EQ(cluster_page_wal_first_observe_locked_v1(buf, &first),
+				 CLUSTER_PAGE_WAL_FIRST_PRESENT);
+	UT_ASSERT(cluster_page_wal_first_handover_locked_v1(buf, &first));
+	pg_atomic_fetch_and_u32(&buf->state, ~BM_LOCKED);
+}
+
 static void
 bounded_claim_pool_and_t2_reservation_release(void)
 {
@@ -827,12 +842,14 @@ bounded_claim_pool_and_t2_reservation_release(void)
 	UT_ASSERT(!cluster_page_wal_prepare_install_v1(258, &carrier, many_pages[257].data, &prepared));
 	UT_ASSERT_EQ(prepared.source_slot, 0);
 	UT_ASSERT(cluster_page_wal_forget_v1(1));
+	drop_first(0);
 	UT_ASSERT(cluster_page_wal_prepare_install_v1(258, &carrier, many_pages[257].data, &prepared));
 	/* Preparation pins its source before any page or authority mutation. */
 	UT_ASSERT_EQ(capture_many(256, 501), CLUSTER_PAGE_WAL_UNATTRIBUTED);
 	cluster_page_wal_release_install_v1(&prepared); /* failed/duplicate T2 */
 	UT_ASSERT_EQ(capture_many(256, 501), CLUSTER_PAGE_WAL_CAPTURED);
 	UT_ASSERT(cluster_page_wal_forget_v1(257));
+	drop_first(256);
 	UT_ASSERT(cluster_page_wal_prepare_install_v1(258, &carrier, many_pages[257].data, &prepared));
 	UT_ASSERT(cluster_page_wal_publish_install_v1(258, &prepared));
 	UT_ASSERT_EQ(prepared.source_slot, 0);
@@ -877,6 +894,176 @@ pregrant_owner_releases_preparation_on_all_outcomes(void)
 		UT_ASSERT_EQ(capture_many(256, 900), CLUSTER_PAGE_WAL_CAPTURED);
 	}
 }
+/* ---- D S09 R-A22: first own record since the page was last clean ---- */
+
+/* The page moves to version token under a record [start, end); like a
+ * native caller, set the page LSN after the capture. */
+static bool
+capture_at(uint64 token, XLogRecPtr start, XLogRecPtr end)
+{
+	bool captured;
+	((PageHeader)page.data)->pd_block_scn = token;
+	edge.before.mutation_token = token - 1;
+	captured
+		= cluster_page_wal_capture_native_v1(1, &edge, token, start, end, 0x9192, RM_HEAP_ID, 0)
+		  == CLUSTER_PAGE_WAL_CAPTURED;
+	PageSetLSNPreserveOrigin(page.data, end);
+	return captured;
+}
+
+static ClusterPageWalDirtyFloorV1
+writer_floor(void)
+{
+	ClusterPageWalDirtyFloorV1 floor;
+	UT_ASSERT(cluster_page_wal_dirty_floor_v1(&writer, &floor));
+	return floor;
+}
+
+static ClusterPageWalFirstResultV1
+observe_first(ClusterPageWalRefV1 *out)
+{
+	ClusterPageWalFirstResultV1 result;
+	pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_LOCKED);
+	result = cluster_page_wal_first_observe_locked_v1(&desc.bufferdesc, out);
+	pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_LOCKED);
+	return result;
+}
+
+/* The write owner's clear, with the page made clean by the write. */
+static bool
+clear_written(const ClusterPageWalRefV1 *observed, uint64 written, uint32 extra_state)
+{
+	bool cleared;
+	pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~(BM_DIRTY | BM_JUST_DIRTIED));
+	pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_LOCKED | extra_state);
+	cleared = cluster_page_wal_first_clear_written_locked_v1(&desc.bufferdesc, observed, written);
+	pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~(BM_LOCKED | extra_state));
+	return cleared;
+}
+
+/* r1 then r2 without a write: the first record (and the floor) stays r1. */
+static void
+first_record_is_first_capture_since_clean(void)
+{
+	ClusterPageWalRefV1 first;
+	ClusterPageWalDirtyFloorV1 floor;
+	reset();
+	floor = writer_floor();
+	UT_ASSERT_EQ(floor.dirty, 0);
+	UT_ASSERT(capture_at(80, 0x120, 0x200));
+	UT_ASSERT(capture_at(81, 0x220, 0x300));
+	floor = writer_floor();
+	UT_ASSERT_EQ(floor.floor, 0x120);
+	UT_ASSERT_EQ(floor.dirty, 1);
+	UT_ASSERT_EQ(floor.foreign + floor.unattributed, 0);
+	UT_ASSERT_EQ(observe_first(&first), CLUSTER_PAGE_WAL_FIRST_PRESENT);
+	UT_ASSERT_EQ(first.token, 80);
+	UT_ASSERT_EQ(first.start, 0x120);
+	/* Its flush is certified separately, never copied from the latest. */
+	UT_ASSERT_EQ(first.source_flags & 0x8000, 0);
+	/* Without the header lock nothing is observed. */
+	UT_ASSERT_EQ(cluster_page_wal_first_observe_locked_v1(&desc.bufferdesc, &first),
+				 CLUSTER_PAGE_WAL_FIRST_INVALID);
+}
+
+/* Only a write that made the page clean, of a version covering the first
+ * record, with the slot unchanged, clears it; the next capture sets it. */
+static void
+first_record_clears_only_after_its_clean_write(void)
+{
+	for (int variant = 0; variant < 6; variant++) {
+		ClusterPageWalRefV1 first, changed;
+		reset();
+		UT_ASSERT(capture_at(80, 0x120, 0x200));
+		UT_ASSERT(capture_at(81, 0x220, 0x300));
+		UT_ASSERT_EQ(observe_first(&first), CLUSTER_PAGE_WAL_FIRST_PRESENT);
+		changed = first;
+		changed.start++;
+		UT_ASSERT_EQ(clear_written(variant == 4 ? &changed : &first, variant == 3 ? 79 : 81,
+								   variant == 1	  ? BM_DIRTY
+								   : variant == 2 ? BM_JUST_DIRTIED
+								   : variant == 5 ? BM_IO_IN_PROGRESS
+												  : 0),
+					 variant == 0);
+		UT_ASSERT_EQ(writer_floor().floor, variant == 0 ? 0 : 0x120);
+		if (variant == 0) {
+			UT_ASSERT_EQ(observe_first(&first), CLUSTER_PAGE_WAL_FIRST_ABSENT);
+			UT_ASSERT(capture_at(82, 0x320, 0x400));
+			UT_ASSERT_EQ(writer_floor().floor, 0x320);
+		}
+		if (ut_current_failed)
+			printf("# clear variant %d\n", variant);
+	}
+}
+
+/* forget and an install keep an unhanded first record; reuse ends it. */
+static void
+first_record_survives_forget_and_install_not_reuse(void)
+{
+	ClusterPageWalInstallV1 prepared = { 0 };
+	ClusterPageWalBindingV1 zero = { 0 };
+	reset();
+	UT_ASSERT(capture_at(80, 0x120, 0x200));
+	UT_ASSERT(cluster_page_wal_forget_v1(1));
+	UT_ASSERT_EQ(writer_floor().floor, 0x120);
+	UT_ASSERT(cluster_page_wal_prepare_install_v1(1, &zero, page.data, &prepared));
+	UT_ASSERT(cluster_page_wal_publish_install_v1(1, &prepared));
+	UT_ASSERT_EQ(writer_floor().floor, 0x120);
+	pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_LOCKED);
+	cluster_page_wal_reset_reuse_locked(&desc.bufferdesc);
+	pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_LOCKED);
+	UT_ASSERT_EQ(writer_floor().dirty, 0);
+	UT_ASSERT_EQ(observe_first(&(ClusterPageWalRefV1){ 0 }), CLUSTER_PAGE_WAL_FIRST_ABSENT);
+}
+
+/* A retained first record outlives the descriptor; handover clears it. */
+static void
+first_record_retain_and_handover(void)
+{
+	ClusterPageWalRefV1 retained = { 0 }, observed;
+	ClusterPageWalBindingV1 read;
+	reset();
+	UT_ASSERT(capture_at(80, 0x120, 0x200));
+	pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_LOCKED);
+	UT_ASSERT_EQ(cluster_page_wal_first_retain_locked_v1(&desc.bufferdesc, &retained),
+				 CLUSTER_PAGE_WAL_FIRST_PRESENT);
+	UT_ASSERT_EQ(cluster_page_wal_first_observe_locked_v1(&desc.bufferdesc, &observed),
+				 CLUSTER_PAGE_WAL_FIRST_PRESENT);
+	observed.start++;
+	UT_ASSERT(!cluster_page_wal_first_handover_locked_v1(&desc.bufferdesc, &observed));
+	observed.start--;
+	UT_ASSERT(cluster_page_wal_first_handover_locked_v1(&desc.bufferdesc, &observed));
+	UT_ASSERT(!cluster_page_wal_first_handover_locked_v1(&desc.bufferdesc, &observed));
+	cluster_page_wal_reset_reuse_locked(&desc.bufferdesc);
+	pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_LOCKED);
+	UT_ASSERT_EQ(writer_floor().dirty, 0);
+	UT_ASSERT(cluster_page_wal_ref_read_v1(&retained, space.key.locator, MAIN_FORKNUM, 7, &read));
+	UT_ASSERT_EQ(read.record_start, 0x120);
+	UT_ASSERT_EQ(read.source.claim.identity.origin_owner_incarnation, 7);
+	UT_ASSERT(cluster_page_wal_ref_release_v1(&retained));
+}
+
+/* Another writer's first record is foreign to this source's floor. */
+static void
+first_record_of_another_writer_is_foreign(void)
+{
+	ClusterWalSourceRef original;
+	ClusterPageWalDirtyFloorV1 floor;
+	reset();
+	original = writer;
+	UT_ASSERT(capture_at(80, 0x120, 0x200));
+	writer.claim.identity.origin_owner_incarnation++;
+	writer.claim.claim_sha256[15]++;
+	UT_ASSERT(capture_at(81, 0x220, 0x300));
+	floor = writer_floor();
+	UT_ASSERT_EQ(floor.floor, 0);
+	UT_ASSERT_EQ(floor.foreign, 1);
+	UT_ASSERT(cluster_page_wal_dirty_floor_v1(&original, &floor));
+	UT_ASSERT_EQ(floor.floor, 0x120);
+	UT_ASSERT_EQ(floor.foreign, 0);
+	writer = original;
+}
+
 static void
 pi_snapshot_requires_frozen_header_owner(void)
 {
@@ -1229,7 +1416,7 @@ UT_TEST(space_capture_unavailable_source_is_not_mutation_failure)
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(34);
 	UT_RUN(space_native_record_and_both_component_sources);
 	UT_RUN(space_advance_is_only_block_one_of_live_identity);
 	UT_RUN(native_last_record_expires_on_construction_reset_and_other_insert);
@@ -1257,6 +1444,11 @@ main(void)
 	UT_RUN(shared_claim_and_descriptor_reuse_do_not_alias);
 	UT_RUN(bounded_claim_pool_and_t2_reservation_release);
 	UT_RUN(pregrant_owner_releases_preparation_on_all_outcomes);
+	UT_RUN(first_record_is_first_capture_since_clean);
+	UT_RUN(first_record_clears_only_after_its_clean_write);
+	UT_RUN(first_record_survives_forget_and_install_not_reuse);
+	UT_RUN(first_record_retain_and_handover);
+	UT_RUN(first_record_of_another_writer_is_foreign);
 	UT_RUN(pi_snapshot_requires_frozen_header_owner);
 	UT_RUN(eviction_snapshot_requires_exact_clean_revoke);
 	UT_RUN(detached_reference_survives_descriptor_reuse);

@@ -30,15 +30,26 @@ typedef struct PageWalSource {
 	uint32 references;
 } PageWalSource;
 
+/*
+ * Per buffer: the latest binding (slots), the first own capture since the
+ * page was last clean (firsts) and that capture's start LSN (first_lsn).  The
+ * first slot and its LSN are written only under content-X (capture) or under
+ * the header lock with content SHARE after a write made the page clean
+ * (clear); first_lsn is published after its slot and cleared before it, so a
+ * lock-free reader can attribute it by re-reading the LSN.
+ */
 typedef struct PageWalShared {
 	slock_t source_lock;
 	pg_atomic_uint32 cold_redo_failed;
 	PageWalSource sources[PAGE_WAL_SOURCE_SLOTS];
 	PageWalSlot slots[FLEXIBLE_ARRAY_MEMBER];
+	/* PageWalSlot firsts[NBuffers]; pg_atomic_uint64 first_lsn[NBuffers]; */
 } PageWalShared;
 
 static PageWalShared *page_wal_shared;
 #define bindings (page_wal_shared == NULL ? NULL : page_wal_shared->slots)
+#define firsts (page_wal_shared->slots + NBuffers)
+#define first_lsns ((pg_atomic_uint64 *)(firsts + NBuffers))
 
 static bool
 page_wal_same_source(const ClusterWalSourceRef *a, const ClusterWalSourceRef *b)
@@ -96,6 +107,22 @@ page_wal_source_release(uint16 index)
 		page_wal_shared->sources[index - 1].references--;
 	SpinLockRelease(&page_wal_shared->source_lock);
 	return valid;
+}
+
+/* One more reference on a source the caller already references. */
+static bool
+page_wal_source_retain_index(uint16 index)
+{
+	bool retained;
+	if (index == 0 || index > PAGE_WAL_SOURCE_SLOTS)
+		return false;
+	SpinLockAcquire(&page_wal_shared->source_lock);
+	retained = page_wal_shared->sources[index - 1].references != 0
+			   && page_wal_shared->sources[index - 1].references != UINT32_MAX;
+	if (retained)
+		page_wal_shared->sources[index - 1].references++;
+	SpinLockRelease(&page_wal_shared->source_lock);
+	return retained;
 }
 
 static void
@@ -396,15 +423,23 @@ cluster_page_wal_reset_reuse_locked(BufferDesc *buf)
 		return;
 	if (buf == NULL || buf->buf_id < 0 || buf->buf_id >= NBuffers
 		|| (pg_atomic_read_u32(&buf->state) & BM_LOCKED) == 0
-		|| !page_wal_source_release(bindings[buf->buf_id].source_flags & PAGE_WAL_SOURCE_MASK))
+		|| !page_wal_source_release(bindings[buf->buf_id].source_flags & PAGE_WAL_SOURCE_MASK)
+		|| !page_wal_source_release(firsts[buf->buf_id].source_flags & PAGE_WAL_SOURCE_MASK))
 		elog(PANIC, "page WAL descriptor reuse lost its source owner");
 	memset(&bindings[buf->buf_id], 0, sizeof(PageWalSlot));
+	/* The old residency ends; its first record leaves with it. */
+	pg_atomic_write_u64(&first_lsns[buf->buf_id], 0);
+	pg_write_barrier();
+	memset(&firsts[buf->buf_id], 0, sizeof(PageWalSlot));
 }
 
 Size
 cluster_page_wal_shmem_size(void)
 {
-	return add_size(offsetof(PageWalShared, slots), mul_size((Size)NBuffers, sizeof(PageWalSlot)));
+	StaticAssertStmt(sizeof(PageWalSlot) % sizeof(pg_atomic_uint64) == 0,
+					 "first-record LSNs follow the slot arrays aligned");
+	return add_size(offsetof(PageWalShared, slots),
+					mul_size((Size)NBuffers, 2 * sizeof(PageWalSlot) + sizeof(pg_atomic_uint64)));
 }
 
 void
@@ -417,6 +452,8 @@ cluster_page_wal_shmem_init(void)
 		memset(page_wal_shared, 0, cluster_page_wal_shmem_size());
 		SpinLockInit(&page_wal_shared->source_lock);
 		pg_atomic_init_u32(&page_wal_shared->cold_redo_failed, 0);
+		for (int i = 0; i < NBuffers; i++)
+			pg_atomic_init_u64(&first_lsns[i], 0);
 	}
 }
 
@@ -446,6 +483,27 @@ void
 cluster_page_wal_shmem_register(void)
 {
 	cluster_shmem_register_region(&page_wal_region);
+}
+
+/*
+ * Under content-X, after the capture of a record [start, end): the first own
+ * capture since the page was last clean becomes its first record.  Later
+ * captures leave it.  It never copies the latest flags: its own flush is
+ * certified separately.  Without a reference the LSN is still published,
+ * unattributed, so the floor cannot pass it.
+ */
+static void
+page_wal_first_capture(int buf_id, const ClusterPageWalBindingV1 *value, uint16 source)
+{
+	ClusterPageWalBindingV1 first = *value;
+
+	if (firsts[buf_id].source_flags != 0 || pg_atomic_read_u64(&first_lsns[buf_id]) != 0)
+		return;
+	first.flags = 0;
+	if (page_wal_source_retain_index(source))
+		page_wal_slot_encode(&firsts[buf_id], &first, source);
+	pg_write_barrier();
+	pg_atomic_write_u64(&first_lsns[buf_id], value->record_start);
 }
 
 static ClusterPageWalCaptureResultV1
@@ -533,6 +591,7 @@ page_wal_capture_native(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
 		}
 	}
 	page_wal_slot_encode(&bindings[buffer - 1], &value, source);
+	page_wal_first_capture(buffer - 1, &value, source);
 	return CLUSTER_PAGE_WAL_CAPTURED;
 }
 
@@ -660,5 +719,138 @@ cluster_page_wal_read_v1(Buffer buffer, const ClusterSpaceIdentity *identity,
 			return false;
 	}
 	*out = *value;
+	return true;
+}
+
+/* Whether the header-locked descriptor has a first record (attributed or not). */
+static bool
+page_wal_first_present_locked(BufferDesc *buf)
+{
+	return bindings != NULL && buf != NULL && buf->buf_id >= 0 && buf->buf_id < NBuffers
+		   && (pg_atomic_read_u32(&buf->state) & BM_LOCKED) != 0
+		   && pg_atomic_read_u64(&first_lsns[buf->buf_id]) != 0;
+}
+
+ClusterPageWalFirstResultV1
+cluster_page_wal_first_observe_locked_v1(BufferDesc *buf, ClusterPageWalRefV1 *out)
+{
+	if (out == NULL)
+		return CLUSTER_PAGE_WAL_FIRST_INVALID;
+	memset(out, 0, sizeof(*out));
+	if (bindings == NULL || buf == NULL || buf->buf_id < 0 || buf->buf_id >= NBuffers
+		|| (pg_atomic_read_u32(&buf->state) & BM_LOCKED) == 0)
+		return CLUSTER_PAGE_WAL_FIRST_INVALID;
+	if (!page_wal_first_present_locked(buf))
+		return CLUSTER_PAGE_WAL_FIRST_ABSENT;
+	if (firsts[buf->buf_id].source_flags == 0)
+		return CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED;
+	*out = firsts[buf->buf_id];
+	return CLUSTER_PAGE_WAL_FIRST_PRESENT;
+}
+
+ClusterPageWalFirstResultV1
+cluster_page_wal_first_retain_locked_v1(BufferDesc *buf, ClusterPageWalRefV1 *out)
+{
+	ClusterPageWalFirstResultV1 result = cluster_page_wal_first_observe_locked_v1(buf, out);
+
+	if (result != CLUSTER_PAGE_WAL_FIRST_PRESENT)
+		return result;
+	if (!page_wal_source_retain_index(out->source_flags & PAGE_WAL_SOURCE_MASK)) {
+		memset(out, 0, sizeof(*out));
+		return CLUSTER_PAGE_WAL_FIRST_INVALID;
+	}
+	return CLUSTER_PAGE_WAL_FIRST_PRESENT;
+}
+
+bool
+cluster_page_wal_first_clear_written_locked_v1(BufferDesc *buf, const ClusterPageWalRefV1 *observed,
+											   uint64 written_token)
+{
+	uint32 state;
+	if (observed == NULL || !page_wal_first_present_locked(buf)
+		|| memcmp(&firsts[buf->buf_id], observed, sizeof(*observed)) != 0)
+		return false;
+	state = pg_atomic_read_u32(&buf->state);
+	/* A page still (or again) dirty, invalid, or written below its first
+	 * record keeps it; a conservative keep only delays the floor. */
+	if ((state & (BM_VALID | BM_TAG_VALID)) != (BM_VALID | BM_TAG_VALID)
+		|| (state & (BM_DIRTY | BM_JUST_DIRTIED | BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0
+		|| observed->source_flags == 0 || written_token < observed->token)
+		return false;
+	pg_atomic_write_u64(&first_lsns[buf->buf_id], 0);
+	pg_write_barrier();
+	if (!page_wal_source_release(firsts[buf->buf_id].source_flags & PAGE_WAL_SOURCE_MASK))
+		elog(PANIC, "page WAL first record lost its source owner");
+	memset(&firsts[buf->buf_id], 0, sizeof(PageWalSlot));
+	return true;
+}
+
+bool
+cluster_page_wal_first_handover_locked_v1(BufferDesc *buf, const ClusterPageWalRefV1 *observed)
+{
+	if (observed == NULL || !page_wal_first_present_locked(buf)
+		|| memcmp(&firsts[buf->buf_id], observed, sizeof(*observed)) != 0
+		|| observed->source_flags == 0)
+		return false;
+	pg_atomic_write_u64(&first_lsns[buf->buf_id], 0);
+	pg_write_barrier();
+	if (!page_wal_source_release(firsts[buf->buf_id].source_flags & PAGE_WAL_SOURCE_MASK))
+		elog(PANIC, "page WAL first record lost its source owner");
+	memset(&firsts[buf->buf_id], 0, sizeof(PageWalSlot));
+	return true;
+}
+
+/*
+ * Lock-free: for every buffer with a first record, attribute it by reading
+ * its slot between two reads of its LSN (published after, cleared before the
+ * slot), then the referenced source, which cannot change while referenced.
+ * A buffer whose first record changes three times in a row, or carries none,
+ * is unattributed: the caller must keep its lower.
+ */
+bool
+cluster_page_wal_dirty_floor_v1(const ClusterWalSourceRef *source, ClusterPageWalDirtyFloorV1 *out)
+{
+	ClusterPageWalDirtyFloorV1 value = { 0 };
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (source == NULL || page_wal_shared == NULL)
+		return false;
+	for (int i = 0; i < NBuffers; i++) {
+		bool attributed = false, own = false;
+		XLogRecPtr lsn = 0;
+
+		for (int attempt = 0; attempt < 3; attempt++) {
+			uint16 index;
+			ClusterWalSourceRef owner;
+
+			lsn = pg_atomic_read_u64(&first_lsns[i]);
+			if (lsn == 0)
+				break;
+			pg_read_barrier();
+			index = firsts[i].source_flags & PAGE_WAL_SOURCE_MASK;
+			if (index != 0 && index <= PAGE_WAL_SOURCE_SLOTS)
+				owner = page_wal_shared->sources[index - 1].source;
+			pg_read_barrier();
+			if (pg_atomic_read_u64(&first_lsns[i]) != lsn)
+				continue;
+			if (index != 0 && index <= PAGE_WAL_SOURCE_SLOTS) {
+				attributed = true;
+				own = page_wal_same_source(&owner, source);
+			}
+			break;
+		}
+		if (lsn == 0)
+			continue;
+		value.dirty++;
+		if (!attributed)
+			value.unattributed++;
+		else if (!own)
+			value.foreign++;
+		else if (value.floor == InvalidXLogRecPtr || lsn < value.floor)
+			value.floor = lsn;
+	}
+	*out = value;
 	return true;
 }
