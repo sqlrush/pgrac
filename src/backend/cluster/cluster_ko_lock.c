@@ -62,6 +62,7 @@
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_page_wal.h"
+#include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_lock_acquire.h"
@@ -785,6 +786,32 @@ cluster_ko_shared_truncate_observation_v2(const ClusterKoCompletionV2 *completio
 
 	return owned != NULL && owned->truncate_observed
 		&& cluster_ko_shared_space_observation_v2(owned, terminal, wal, wal_length);
+}
+
+bool
+cluster_ko_shared_structure_offer_v2(const ClusterKoCompletionV2 *completion,
+	int32 peer, struct ClusterPiWritebackFactV2 *out)
+{
+	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
+	ClusterPiWritebackFactV2 value = {0};
+	ClusterPiStructuralFactV2 *s = &value.proof.structural;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+
+	if (out == NULL || owned == NULL || !owned->postcommit
+		|| !cluster_ko_shared_truncate_observation_v2(owned, &s->terminal.binding,
+			wal, sizeof(wal))
+		|| !cluster_ko_shared_read_v2(owned, peer, &s->ko)
+		|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &s->change))
+		return false;
+	value.kind = CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2;
+	s->durability_flags = CLUSTER_PI_STRUCTURAL_WAL_FLUSHED
+		| CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK | CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED
+		| CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE | CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
+	/* This value has no page/master cut. It can only transfer the completed
+	 * relation result to the original peer's background owner; it cannot
+	 * acknowledge a page or extend this transaction's local ownership. */
+	*out = value;
+	return true;
 }
 
 bool

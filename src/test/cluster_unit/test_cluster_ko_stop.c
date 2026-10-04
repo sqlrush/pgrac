@@ -8,6 +8,7 @@
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_hw_lease.h"
 #include "cluster/cluster_page_wal.h"
+#include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "utils/memutils.h"
@@ -1794,6 +1795,71 @@ UT_TEST(test_native_truncate_effect_export_rechecks_cut_without_changing_output)
 	}
 }
 
+UT_TEST(test_native_relation_offer_requires_real_commit_and_original_effect)
+{
+	ClusterPageWalBindingV1 binding;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	ClusterPiWritebackFactV2 offer, before;
+	ClusterKoCompletionV2 *completion = prepare_native_structure(false, &binding, wal);
+	ClusterKoSharedMessageV2 ko;
+
+	UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
+	UT_ASSERT(cluster_ko_shared_observe_truncate_v2(completion));
+	memset(&before, 0xa5, sizeof(before));
+	offer = before;
+	UT_ASSERT(!cluster_ko_shared_structure_offer_v2(completion, 1, &offer));
+	UT_ASSERT(memcmp(&offer, &before, sizeof(before)) == 0);
+	xact_callback(XACT_EVENT_COMMIT, NULL);
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true, true, NULL);
+	UT_ASSERT(cluster_ko_shared_read_v2(completion, 1, &ko));
+	UT_ASSERT(cluster_ko_shared_structure_offer_v2(completion, 1, &offer));
+	UT_ASSERT_EQ(offer.kind, CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2);
+	UT_ASSERT_EQ(offer.proof.structural.durability_flags, 31);
+	UT_ASSERT(memcmp(&offer.proof.structural.terminal.binding, &binding, sizeof(binding)) == 0);
+	UT_ASSERT(memcmp(&offer.proof.structural.ko, &ko, sizeof(ko)) == 0);
+	UT_ASSERT_EQ(offer.proof.structural.terminal.write_cut.binding_generation, 0);
+	UT_ASSERT_EQ(offer.proof.structural.terminal.storage_cut.binding_generation, 0);
+	UT_ASSERT_EQ(offer.proof.structural.change.identity.nblocks, 4);
+	cluster_ko_shared_postcommit_cleanup_v2();
+	offer = before;
+	UT_ASSERT(!cluster_ko_shared_structure_offer_v2(completion, 1, &offer));
+	UT_ASSERT(memcmp(&offer, &before, sizeof(before)) == 0);
+	cluster_ko_shared_release_v2(&completion);
+	UT_ASSERT_EQ(completion_allocations, 0);
+}
+
+UT_TEST(test_native_relation_offer_refuses_drop_missing_effect_and_changed_scope)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		ClusterPageWalBindingV1 binding;
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		ClusterPiWritebackFactV2 offer, before;
+		ClusterKoCompletionV2 *completion = prepare_native_structure(fault == 0, &binding, wal);
+		int peer = fault == 2 ? 0 : 1;
+
+		UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
+		if (fault >= 2)
+			UT_ASSERT(cluster_ko_shared_observe_truncate_v2(completion));
+		xact_callback(fault == 6 ? XACT_EVENT_PREPARE : XACT_EVENT_COMMIT, NULL);
+		if (fault == 3)
+			formation.membership.last_admitted_incarnation[1]++;
+		if (fault == 4)
+			CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)2;
+		if (fault == 5)
+			writer.claim.claim_sha256[0]++;
+		if (fault == 7)
+			resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		memset(&before, 0xa5, sizeof(before));
+		offer = before;
+		UT_ASSERT(!cluster_ko_shared_structure_offer_v2(completion, peer, &offer));
+		UT_ASSERT(memcmp(&offer, &before, sizeof(before)) == 0);
+		CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)1;
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		cluster_ko_shared_release_v2(&completion);
+		UT_ASSERT_EQ(completion_allocations, 0);
+	}
+}
+
 /* Execute the real native sequence from ResourceOwner release through
  * pending deletes and its local KO cleanup. Storage is a boundary here:
  * reaching it is not a durability certificate. */
@@ -2035,7 +2101,7 @@ UT_TEST(test_prepare_and_noncommit_events_never_retain_native_observation)
 int
 main(void)
 {
-	UT_PLAN(51);
+	UT_PLAN(53);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
@@ -2080,6 +2146,8 @@ main(void)
 	UT_RUN(test_native_truncate_effect_needs_original_space_and_is_once_only);
 	UT_RUN(test_native_truncate_effect_refuses_drop_late_or_changed_owner);
 	UT_RUN(test_native_truncate_effect_export_rechecks_cut_without_changing_output);
+	UT_RUN(test_native_relation_offer_requires_real_commit_and_original_effect);
+	UT_RUN(test_native_relation_offer_refuses_drop_missing_effect_and_changed_scope);
 	UT_RUN(test_native_postcommit_retains_exact_observation_until_pending_deletes_return);
 	UT_RUN(test_native_postcommit_refuses_drift_but_always_cleans_original_local_owner);
 	UT_RUN(test_native_postcommit_error_and_exit_do_not_leave_a_completion);

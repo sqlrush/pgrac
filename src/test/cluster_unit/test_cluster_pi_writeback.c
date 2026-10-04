@@ -1837,7 +1837,11 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(38);
+	UT_RUN(writeback_v2_relation_offer_has_no_page_master_authority);
+	UT_RUN(writeback_v2_relation_offer_rejects_misrouting_mixed_or_master_cuts);
+	UT_RUN(writeback_v2_relation_offer_ack_cannot_ack_a_page_fact);
+	UT_RUN(writeback_v2_relation_offer_batch_is_bounded_and_ack_ordered);
 	UT_RUN(writeback_v2_origin_receives_original_master_ko);
 	UT_RUN(writeback_v2_origin_rejects_retargeted_or_stale_ko);
 	UT_RUN(writeback_v2_has_explicit_data_and_structural_layout);
