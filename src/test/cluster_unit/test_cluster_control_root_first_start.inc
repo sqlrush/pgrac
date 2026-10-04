@@ -123,6 +123,92 @@ first_start_fixture(uint8 before[66048], ControlRootImage *root)
 	enableFsync = true;
 }
 
+static ClusterWalSourceRef first_start_race_coordinator;
+static unsigned first_start_race_calls;
+
+static void
+first_start_begin_between_observation_and_prepare(void)
+{
+	ClusterWalSourceRef saved_restart = test_restart_ref;
+	ClusterWalStartupImage observed;
+	int saved_node = cluster_node_id;
+	uint64 saved_self = test_self_incarnation, saved_member = test_membership_incarnation;
+
+	test_checkpoint_x_hook = NULL;
+	first_start_race_calls++;
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	cluster_node_id = 0;
+	test_self_incarnation = test_membership_incarnation = test_reserve_cut.observer[0];
+	test_restart_ref = first_start_race_coordinator;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&first_start_race_coordinator,
+		&observed), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	cluster_node_id = saved_node;
+	test_self_incarnation = saved_self;
+	test_membership_incarnation = saved_member;
+	test_restart_ref = saved_restart;
+}
+
+UT_TEST(test_first_start_peer_begin_race_reobserves_exact_operation)
+{
+	uint8 before[66048], after[66048], wrong_uuid[16];
+	ControlRootImage root, current;
+	ClusterWalSourceRef restart;
+	ClusterWalStartupImage observed, peer;
+	ClusterControlRootIdentity wrong_identity;
+	char path[MAXPGPATH];
+
+	first_start_fixture(before, &root);
+	if (ut_current_failed) return;
+	first_start_race_coordinator = v3_driver_restart(&root, 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&first_start_race_coordinator,
+		&observed), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT); /* Bind original inputs. */
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&first_start_race_coordinator,
+		&observed), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT); /* Prepare coordinator. */
+	restart = v3_driver_restart(&root, 3);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed),
+		CLUSTER_CONTROL_ROOT_RECONFIG_WAIT); /* Prepare peer, no BEGIN authority. */
+	if (ut_current_failed) return;
+	first_start_race_calls = 0;
+	test_checkpoint_x_hook = first_start_begin_between_observation_and_prepare;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed),
+		CLUSTER_CONTROL_ROOT_CAS_CONFLICT);
+	UT_ASSERT_EQ(first_start_race_calls, 1);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, after, sizeof(after));
+	UT_ASSERT_EQ(cluster_control_root_v3_decode(after, sizeof(after), v2_storage, TEST_SYSID,
+		&current), 0);
+	test_cf_mode = test_actual_cf = ShareLock;
+	UT_ASSERT_EQ(cluster_wal_startup_read_locked(&current, 3, &peer), 0);
+	test_cf_mode = test_actual_cf = NoLock;
+	UT_ASSERT_EQ(peer.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
+	/* Progress cannot hide an unrelated operation, writer, or formation. */
+	memcpy(wrong_uuid, peer.operation_uuid, sizeof(wrong_uuid));
+	wrong_uuid[0] ^= 1;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_prepare_target(&peer.claim.identity,
+		wrong_uuid, &observed), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	wrong_identity = peer.claim.identity;
+	wrong_identity.origin_owner_incarnation++;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_prepare_target(&wrong_identity,
+		peer.operation_uuid, &observed), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	test_reserve_formation.startup_formation_generation++;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_prepare_target(&peer.claim.identity,
+		peer.operation_uuid, &observed), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	test_reserve_formation.startup_formation_generation--;
+	v2_assert_primary_unchanged(after);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed), 0);
+	UT_ASSERT(memcmp(&observed, &peer, sizeof(peer)) == 0);
+	v2_assert_primary_unchanged(after);
+	cluster_node_id = 0;
+	test_reserve_mode = false;
+}
+
 UT_TEST(test_first_start_binds_original_inputs_without_clean_exit)
 {
 	uint8 before[66048], after[66048];

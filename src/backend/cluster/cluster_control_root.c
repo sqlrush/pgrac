@@ -6060,11 +6060,23 @@ startup_prepare_target_locked(StartupTargetWork *work, const ClusterControlRootI
 	result = cluster_wal_startup_read_locked(&work->base, node, &work->op);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (work->op.phase != phase
-		|| !cluster_control_root_identity_equal(self, &work->op.claim.identity)
+	if (!cluster_control_root_identity_equal(self, &work->op.claim.identity)
 		|| memcmp(operation_uuid, work->op.operation_uuid, 16) != 0
 		|| !startup_operation_owner(&work->base, &work->op))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (work->op.phase != phase) {
+		/* The coordinator may BEGIN after this peer observed RESERVED and
+		 * dropped CF-S. Only the exact same operation and complete formation
+		 * can classify that forward step as a retry; no target is created or
+		 * writer returned from the obsolete PREPARE observation. */
+		if (action != STARTUP_TARGET_PREPARE
+			|| work->op.phase != CLUSTER_WAL_STARTUP_INITIALIZING)
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		result = startup_operation_formation(&work->base, CLUSTER_WAL_STARTUP_INITIALIZING,
+			true, work->op.input_kind, &work->formation);
+		return result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ? CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+			: result;
+	}
 	result = startup_operation_formation(&work->base, phase, writer, work->op.input_kind, &work->formation);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
