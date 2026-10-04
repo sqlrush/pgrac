@@ -3288,7 +3288,8 @@ RecordTransactionAbortPrepared(TransactionId xid, int nchildren, TransactionId *
 	 * written (cluster_undo_smgr.h); native aborts keep PG's behavior.
 	 */
 	tt_abort_staged = cluster_tt_twophase_has_staged(xid);
-	if (tt_abort_staged) {
+	if (tt_abort_staged)
+	{
 		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
 		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 	}
