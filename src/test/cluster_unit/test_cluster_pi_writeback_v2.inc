@@ -27,6 +27,7 @@ wb_v2_fixture(ClusterPiWritebackMessageV2 *m, const ClusterPiDataFactV1 *data)
 	ClusterPiStructuralFactV2 *s;
 	ClusterSpaceWalChange *id;
 	ClusterSpaceReservationChange *r;
+	wb_local_caps = wb_peer_caps = PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
 	memset(m, 0, sizeof(*m));
 	m->verb = CLUSTER_PI_WRITEBACK_NOTIFY;
 	m->count = 2;
@@ -372,7 +373,7 @@ UT_TEST(writeback_v2_ack_is_only_an_exact_ordered_subset)
 {
 	ClusterPageDataReceiptV1 *receipt = wb_setup();
 	ClusterPiDataFactV1 data;
-	ClusterPiWritebackMessageV2 m, ack;
+	ClusterPiWritebackMessageV2 m, ack = { 0 };
 	UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &data));
 	wb_v2_fixture(&m, &data);
 	m.count = 3;
@@ -465,6 +466,7 @@ UT_TEST(writeback_v2_structural_notice_requires_its_live_original_slot)
 		notice.revision = 71;
 		wb_notice = &notice;
 		wb_shared->inbound_revision = notice.revision;
+		wb_shared->inbound_version = 2;
 		wb_shared->inbound_pid = MyProcPid;
 		wb_shared->inbound_state = WB_RUNNING;
 		memset(&out, 0x5a, sizeof(out));
@@ -539,6 +541,289 @@ UT_TEST(writeback_v2_structural_notice_requires_its_live_original_slot)
 		rf_page_online_plan_destroy_v1(&wb_page_plan);
 		clean();
 	}
+}
+
+static Size
+wb_v2_request(ClusterPageDataReceiptV1 *receipt, ClusterPiWritebackMessageV2 *m,
+			  uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2], bool structural)
+{
+	ClusterPiDataFactV1 fact;
+	Size length = 0;
+	UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &fact));
+	wb_v2_fixture(m, &fact);
+	if (!structural)
+		m->count = 1;
+	UT_ASSERT(cluster_pi_writeback_encode_v2(m, bytes, CLUSTER_PI_WRITEBACK_MAX_BYTES_V2, &length));
+	return length;
+}
+
+UT_TEST(writeback_v2_ingress_reaches_real_data_disposal_and_exact_reply)
+{
+	ClusterPageDataReceiptV1 *receipt = wb_setup();
+	ClusterPiWritebackMessageV2 m, ack;
+	uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
+	Size length = wb_v2_request(receipt, &m, bytes, false);
+	physical_pi_from_source(&wb_sources[1], 19);
+	wb_deliver(0, 1, bytes, length);
+	UT_ASSERT_EQ(wb_shared->inbound_state, WB_QUEUED);
+	wb_select(1, B_BG_WRITER);
+	UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+	UT_ASSERT_EQ(pi_discards, 1);
+	UT_ASSERT_EQ(wb_shared->inbound_state, WB_REPLIED);
+	UT_ASSERT_EQ(wb_input_releases, 1);
+	wb_select(1, B_LMON);
+	cluster_pi_writeback_lmon_tick_v1();
+	UT_ASSERT_EQ(wb_sends, 1);
+	UT_ASSERT_EQ(wb_destination, 0);
+	UT_ASSERT(cluster_pi_writeback_decode_v2(wb_wire, wb_length, &ack));
+	UT_ASSERT_EQ(ack.count, 1);
+	UT_ASSERT(cluster_pi_writeback_ack_matches_v2(&m, &ack));
+	/* The exact duplicate resends the original response without redoing PI. */
+	wb_now += WB_RETRY_US;
+	wb_deliver(0, 1, bytes, length);
+	cluster_pi_writeback_lmon_tick_v1();
+	UT_ASSERT_EQ(wb_sends, 2);
+	UT_ASSERT_EQ(pi_discards, 1);
+	UT_ASSERT_EQ(wb_plan_builds, 1);
+	UT_ASSERT_EQ(wb_master_completions, 0);
+	wb_select(0, B_CHECKPOINTER);
+	cluster_page_data_receipt_free_v1(&receipt);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(writeback_v2_notice_is_authenticated_before_structural_consumer)
+{
+	ClusterPageDataReceiptV1 *receipt = wb_setup();
+	ClusterPiWritebackMessageV2 m, ack = { 0 };
+	ClusterPiWritebackFactV2 fact = { 0 };
+	uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
+	uint64 revision = 0;
+	Size length = wb_v2_request(receipt, &m, bytes, true);
+	physical_pi_from_source(&wb_sources[1], 19);
+	wb_deliver(0, 1, bytes, length);
+	wb_input_wait = true;
+	wb_select(1, B_BG_WRITER);
+	UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+	UT_ASSERT(cluster_pi_writeback_structural_notice_read_v2(wb_notice, 1, &revision, &fact));
+	UT_ASSERT(revision != 0);
+	UT_ASSERT_EQ(memcmp(&fact, &m.facts[1], sizeof(fact)), 0);
+	UT_ASSERT(!wb_inputs_pinned[1]);
+	UT_ASSERT_EQ(pi_discards | wb_sends, 0);
+	wb_input_wait = false;
+	UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+	/* The real PAGE ancestry accepts DATA; absent typed structural WAL can
+	 * never manufacture a structural ACK from a valid wire representation. */
+	UT_ASSERT_EQ(pi_discards, 1);
+	UT_ASSERT_EQ(wb_shared->rejections.attempts[CLUSTER_PI_WRITEBACK_PEER_PHYSICAL], 1);
+	wb_select(1, B_LMON);
+	cluster_pi_writeback_lmon_tick_v1();
+	UT_ASSERT(cluster_pi_writeback_decode_v2(wb_wire, wb_length, &ack));
+	UT_ASSERT_EQ(ack.count, 1);
+	UT_ASSERT_EQ(ack.facts[0].kind, CLUSTER_PI_WRITEBACK_DATA_V2);
+	UT_ASSERT(cluster_pi_writeback_ack_matches_v2(&m, &ack));
+	UT_ASSERT_EQ(wb_master_completions, 0);
+	wb_select(0, B_CHECKPOINTER);
+	cluster_page_data_receipt_free_v1(&receipt);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+static bool
+wb_v2_allocation_error_caught(void)
+{
+	volatile bool caught = false;
+	wb_allocation_error = true;
+	PG_TRY();
+	{
+		(void)cluster_pi_writeback_bgwriter_tick_v1();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		wb_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	}
+	PG_END_TRY();
+	wb_allocation_error = false;
+	return caught;
+}
+
+UT_TEST(writeback_v2_original_queue_survives_busy_drift_and_allocation_error)
+{
+	for (unsigned fault = 0; fault < 4; ++fault) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiWritebackMessageV2 m;
+		uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
+		Size length = wb_v2_request(receipt, &m, bytes, false);
+		uint64 revision;
+		physical_pi_from_source(&wb_sources[1], 19);
+		wb_deliver(0, 1, bytes, length);
+		revision = wb_shared->inbound_revision;
+		wb_select(1, B_BG_WRITER);
+		if (fault == 0) {
+			UT_ASSERT(wb_v2_allocation_error_caught());
+			UT_ASSERT(wb_notice == NULL);
+			UT_ASSERT_EQ(wb_shared->inbound_state, WB_QUEUED);
+		}
+		wb_input_wait = true;
+		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+		m.nonce++;
+		UT_ASSERT(cluster_pi_writeback_encode_v2(&m, bytes, sizeof(bytes), &length));
+		wb_deliver(0, 1, bytes, length);
+		UT_ASSERT_EQ(wb_shared->inbound_revision, revision);
+		UT_ASSERT_EQ(wb_shared->inbound_state, WB_RUNNING);
+		wb_select(1, B_BG_WRITER);
+		wb_input_wait = false;
+		if (fault == 1)
+			wb_peer_caps = 0;
+		if (fault == 2)
+			wb_stop = true;
+		if (fault == 3)
+			wb_input_current = false;
+		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+		UT_ASSERT_EQ(pi_discards, fault == 0 ? 1 : 0);
+		UT_ASSERT_EQ(wb_shared->inbound_state, fault == 0 ? WB_REPLIED : WB_EMPTY);
+		UT_ASSERT(wb_notice == NULL);
+		UT_ASSERT(!wb_inputs_pinned[1]);
+		UT_ASSERT_EQ(wb_input_releases, 1);
+		wb_allocation_error = false;
+		wb_select(0, B_CHECKPOINTER);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_v2_ingress_refuses_old_wire_unready_peers_and_relation_offers)
+{
+	for (unsigned fault = 0; fault < 10; ++fault) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiWritebackMessageV2 m;
+		ClusterICEnvelope env = { 0 };
+		uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
+		Size length = wb_v2_request(receipt, &m, bytes, false);
+		env.msg_type = PGRAC_IC_MSG_PI_WRITEBACK;
+		env.source_node_id = 0;
+		env.dest_node_id = 1;
+		env.epoch = wb_epoch;
+		env.payload_length = length;
+		wb_select(1, B_LMON);
+		switch (fault) {
+		case 0:
+			wb_local_caps = 0;
+			break;
+		case 1:
+			wb_peer_caps = 0;
+			break;
+		case 2:
+			wb_cap_generation = 0;
+			break;
+		case 3:
+			env.source_node_id = 2;
+			break;
+		case 4:
+			env.epoch++;
+			break;
+		case 5:
+			env.dest_node_id = 0;
+			break;
+		case 6:
+			m.verb = CLUSTER_PI_WRITEBACK_ACK;
+			UT_ASSERT(cluster_pi_writeback_encode_v2(&m, bytes, sizeof(bytes), &length));
+			break;
+		case 7: {
+			ClusterPiDataFactV1 fact = m.facts[0].proof.data;
+			wb_v2_offer_fixture(&m, &fact, false);
+			env.source_node_id = m.facts[0].proof.structural.ko.origin_node;
+			UT_ASSERT(cluster_pi_writeback_encode_v2(&m, bytes, sizeof(bytes), &length));
+			env.payload_length = length;
+			break;
+		}
+		case 8: {
+			ClusterPiWritebackMessageV1 old = { 0 };
+			old.verb = m.verb;
+			old.count = 1;
+			old.nonce = m.nonce;
+			old.epoch = m.epoch;
+			old.peer = m.peer;
+			old.facts[0] = m.facts[0].proof.data;
+			UT_ASSERT(cluster_pi_writeback_encode_v1(&old, bytes, sizeof(bytes), &length));
+			env.payload_length = length;
+			break;
+		}
+		case 9:
+			env.payload_length--;
+			break;
+		}
+		cluster_pi_writeback_ingress_v1(&env, bytes);
+		UT_ASSERT_EQ(wb_shared->inbound_state, WB_EMPTY);
+		UT_ASSERT_EQ(wb_shared->inbound_revision, 0);
+		UT_ASSERT_EQ(wb_plan_builds | wb_sends | pi_discards, 0);
+		wb_select(0, B_CHECKPOINTER);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_v2_reply_rechecks_identity_after_physical_completion)
+{
+	for (unsigned fault = 0; fault < 4; ++fault) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiWritebackMessageV2 m;
+		uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
+		Size length = wb_v2_request(receipt, &m, bytes, false);
+		physical_pi_from_source(&wb_sources[1], 19);
+		wb_deliver(0, 1, bytes, length);
+		wb_select(1, B_BG_WRITER);
+		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+		UT_ASSERT_EQ(pi_discards, 1);
+		UT_ASSERT_EQ(wb_shared->inbound_state, WB_REPLIED);
+		wb_select(1, B_LMON);
+		if (fault == 0)
+			wb_peer_caps = 0;
+		if (fault == 1)
+			wb_boots[0]++;
+		if (fault == 2)
+			wb_epoch++;
+		if (fault == 3)
+			wb_shared->reply_v2.facts[0].proof.data.storage_cut.authority.transition_count++;
+		cluster_pi_writeback_lmon_tick_v1();
+		UT_ASSERT_EQ(wb_sends | wb_master_completions, 0);
+		UT_ASSERT(wb_shared->reply_pending);
+		UT_ASSERT(!wb_inputs_pinned[1]);
+		wb_select(0, B_CHECKPOINTER);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_v2_ack_preserves_selected_claim_ceiling)
+{
+	ClusterPageDataReceiptV1 *receipt = wb_setup();
+	ClusterPiWritebackMessageV2 m, ack = { 0 };
+	uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
+	Size length = wb_v2_request(receipt, &m, bytes, false);
+	m.peer.claim.max_config_generation++;
+	UT_ASSERT(cluster_pi_writeback_encode_v2(&m, bytes, sizeof(bytes), &length));
+	physical_pi_from_source(&wb_sources[1], 19);
+	wb_deliver(0, 1, bytes, length);
+	wb_select(1, B_BG_WRITER);
+	UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+	UT_ASSERT_EQ(pi_discards, 1);
+	UT_ASSERT_EQ(wb_shared->inbound_state, WB_REPLIED);
+	wb_select(1, B_LMON);
+	cluster_pi_writeback_lmon_tick_v1();
+	UT_ASSERT_EQ(wb_sends, 1);
+	UT_ASSERT(cluster_pi_writeback_decode_v2(wb_wire, wb_length, &ack));
+	UT_ASSERT_EQ(ack.count, 1);
+	UT_ASSERT_EQ(memcmp(&ack.peer, &m.peer, sizeof(m.peer)), 0);
+	UT_ASSERT(cluster_pi_writeback_ack_matches_v2(&m, &ack));
+	wb_select(0, B_CHECKPOINTER);
+	cluster_page_data_receipt_free_v1(&receipt);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
 }
 
 UT_TEST(writeback_v2_request_cut_refuses_missing_or_changed_proofs)

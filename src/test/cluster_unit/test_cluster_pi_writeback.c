@@ -155,8 +155,10 @@ cluster_thread_recovery_fabric_cut_v1(const ClusterThreadRecoveryFabricPlanV1 *p
 	return true;
 }
 static const ClusterShmemRegion *wb_region;
-static uint8 wb_memory[3][65536] pg_attribute_aligned(MAXIMUM_ALIGNOF);
-static uint8 wb_wire[CLUSTER_PI_WRITEBACK_MAX_BYTES];
+static uint8
+	wb_memory[3][2 * sizeof(ClusterPiWritebackMessageV1) + 2 * sizeof(ClusterPiWritebackMessageV2)
+				 + 4096] pg_attribute_aligned(MAXIMUM_ALIGNOF);
+static uint8 wb_wire[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
 static uint32 wb_length;
 static int32 wb_destination;
 static TimestampTz wb_now = 1000000;
@@ -824,7 +826,7 @@ wb_setup(void)
 	wb_multiple = false;
 	wb_epoch = ack_writer_epoch = 1;
 	wb_membership_generation = 2;
-	wb_local_caps = wb_peer_caps = PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+	wb_local_caps = wb_peer_caps = 0;
 	wb_cap_generation = 7;
 	wb_cap_available = wb_ko_current = true;
 	wb_cap_samples = wb_cap_drift = wb_route = 0;
@@ -965,7 +967,8 @@ UT_TEST(writeback_codec_has_exact_bounded_authenticated_facts)
 		m.facts[i].binding.identity.blockno += i;
 		m.facts[i].storage_cut.resource.blockNum += i;
 	}
-	UT_ASSERT(!cluster_pi_writeback_encode_v1(&m, wb_wire, sizeof(wb_wire) - 1, &length));
+	UT_ASSERT(
+		!cluster_pi_writeback_encode_v1(&m, wb_wire, CLUSTER_PI_WRITEBACK_MAX_BYTES - 1, &length));
 	UT_ASSERT_EQ(length, 0);
 	UT_ASSERT(cluster_pi_writeback_encode_v1(&m, wb_wire, sizeof(wb_wire), &length));
 	UT_ASSERT_EQ(length, CLUSTER_PI_WRITEBACK_MAX_BYTES);
@@ -1874,7 +1877,13 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 int
 main(void)
 {
-	UT_PLAN(41);
+	UT_PLAN(47);
+	UT_RUN(writeback_v2_ack_preserves_selected_claim_ceiling);
+	UT_RUN(writeback_v2_ingress_refuses_old_wire_unready_peers_and_relation_offers);
+	UT_RUN(writeback_v2_reply_rechecks_identity_after_physical_completion);
+	UT_RUN(writeback_v2_ingress_reaches_real_data_disposal_and_exact_reply);
+	UT_RUN(writeback_v2_notice_is_authenticated_before_structural_consumer);
+	UT_RUN(writeback_v2_original_queue_survives_busy_drift_and_allocation_error);
 	UT_RUN(writeback_v2_structural_notice_requires_its_live_original_slot);
 	UT_RUN(writeback_v2_request_cut_checks_real_sender_and_recipient);
 	UT_RUN(writeback_v2_request_cut_refuses_missing_or_changed_proofs);
