@@ -9185,6 +9185,9 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	uint64		writer_activation_token;
 	uint64		resource_x_activation_generation;
 	ClusterPageWalBindingV1 observed_wal, certified_wal;
+	ClusterPageWalRefV1 first_before;
+	bool		first_observed = false;
+	uint64		written_token = 0;
 
 	/* Cold redo reports dirty-hook violations outside critical sections.
 	 * Observe its shared failure latch under content SHARE, before any I/O;
@@ -9409,6 +9412,23 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 						errmsg("DATA write changed its exact WAL source before I/O"),
 						errhint("Retry through the current page owner.")));
 #endif
+#ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * PGRAC (D S09 R-A22): content SHARE keeps the first own WAL record since
+	 * the page was clean stable across this write (a capture needs
+	 * EXCLUSIVE).  Remember it and the written version; only a write that
+	 * leaves the page clean may clear it below.
+	 */
+	written_token = ((PageHeader) bufToWrite)->pd_block_scn;
+	if (recovery == NULL && cluster_shared_config)
+	{
+		buf_state = LockBufHdr(buf);
+		first_observed = cluster_page_wal_first_observe_locked_v1(buf, &first_before)
+			== CLUSTER_PAGE_WAL_FIRST_PRESENT;
+		UnlockBufHdr(buf, buf_state);
+	}
+#endif
 	if (write_attempted != NULL)
 		*write_attempted = true;
 	smgrwrite(reln,
@@ -9471,6 +9491,21 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_pcm_x_finish_retain_flush_io_active)
 		cluster_pcm_x_finish_retain_flush_io_active = false;
+
+	/*
+	 * PGRAC (D S09 R-A22): TerminateBufferIO keeps BM_DIRTY when the page was
+	 * dirtied again meanwhile.  The helper clears the first record only if
+	 * the page is clean now, the slot is the one observed before the write
+	 * and the written version covers it; otherwise it stays (conservative).
+	 * Writing is not an fsync: the WAL lower is published only after the
+	 * checkpoint's durability barrier.
+	 */
+	if (first_observed)
+	{
+		buf_state = LockBufHdr(buf);
+		(void) cluster_page_wal_first_clear_written_locked_v1(buf, &first_before, written_token);
+		UnlockBufHdr(buf, buf_state);
+	}
 #endif
 
 	TRACE_POSTGRESQL_BUFFER_FLUSH_DONE(BufTagGetForkNum(&buf->tag),
@@ -15925,24 +15960,51 @@ cluster_bufmgr_finish_direct_land_target_for_gcs(BufferDesc *buf, bool valid,
  * notify may leave a conservative source anchor: only a qualified DATA/PI
  * retirement (or the existing terminal close owner) can erase that anchor.
  * Unattributed pages still require the eager DATA guard; absence is no proof. */
+/* D S09 R-A22: the first own record since the page was clean (empty when the
+ * guarded write already made the page clean) moves with the responsibility:
+ * the local PI holds it before the descriptor releases it.  An unattributable
+ * first record cannot be handed over. */
 static bool
 cluster_bufmgr_downgrade_record_pi(BufferDesc *buf, volatile bool *content_locked)
 {
-	ClusterPageWalBindingV1 wal, latest;
+	ClusterPageWalBindingV1 wal, latest, first;
+	ClusterPageWalRefV1 first_ref;
+	ClusterPageWalFirstResultV1 first_state;
 	LWLock *content_lock = BufferDescriptorGetContentLock(buf);
+	uint32		buf_state;
+	bool		has_first;
 
 	if (!cluster_shared_config
 		|| !cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal))
 		return true;
+	buf_state = LockBufHdr(buf);
+	first_state = cluster_page_wal_first_observe_locked_v1(buf, &first_ref);
+	UnlockBufHdr(buf, buf_state);
+	has_first = first_state == CLUSTER_PAGE_WAL_FIRST_PRESENT;
+	if ((!has_first && first_state != CLUSTER_PAGE_WAL_FIRST_ABSENT)
+		|| (has_first
+			&& !cluster_page_wal_ref_read_v1(&first_ref, BufTagGetRelFileLocator(&buf->tag),
+											 buf->tag.forkNum, buf->tag.blockNum, &first)))
+		return false;
 	LWLockRelease(content_lock);
 	*content_locked = false;
 	if (!cluster_page_wal_flush_source_v1(&wal, &wal)
-		|| !cluster_pcm_local_pi_record_v1(buf->tag, &wal)
+		|| (has_first && !cluster_page_wal_flush_source_v1(&first, &first))
+		|| !cluster_pcm_local_pi_record_first_v1(buf->tag, has_first ? &first : NULL, &wal)
 		|| !LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE))
 		return false;
 	*content_locked = true;
-	return cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &latest)
-		   && cluster_page_wal_same_mutation_v1(&wal, &latest);
+	if (!cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &latest)
+		|| !cluster_page_wal_same_mutation_v1(&wal, &latest))
+		return false;
+	/* A first record cleared meanwhile by a clean write stays covered twice. */
+	if (has_first)
+	{
+		buf_state = LockBufHdr(buf);
+		(void) cluster_page_wal_first_handover_locked_v1(buf, &first_ref);
+		UnlockBufHdr(buf, buf_state);
+	}
+	return true;
 }
 
 ClusterBufmgrGcsDowngradeOutcome
