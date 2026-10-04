@@ -26,6 +26,7 @@
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_wal_thread.h"
@@ -715,10 +716,13 @@ cluster_space_reserve_exact(const ClusterSpaceIdentity *identity, BlockNumber fi
 
 struct ClusterSpaceTruncateState {
 	Buffer buffers[2];
+	ClusterKoCompletionV2 *ko_completion;
 	PGAlignedBlock result[2];
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	uint64 token;
 	XLogRecPtr lsn;
+	bool base_synced;
+	bool truncate_published;
 };
 
 struct ClusterSpaceDropState {
@@ -775,6 +779,12 @@ space_structure_prepare(const ClusterSpaceIdentityKey *expected,
 		|| identity->expected.sequence == UINT64_MAX
 		|| (action == CLUSTER_SPACE_WAL_TRUNCATE && nblocks > reservation->before.next_block))
 		goto refused;
+	/* Take the original barrier while the exact old identity is still
+	 * locked. Its ResourceOwner retains the completion through transaction
+	 * exit; preparing a replacement page does not prove durable completion. */
+	if (!cluster_ko_shared_claim_v2(expected, identity->expected.incarnation,
+								  &state->ko_completion))
+		goto refused;
 	identity->action = action;
 	identity->nblocks = nblocks;
 	identity->result = identity->expected;
@@ -808,6 +818,7 @@ ClusterSpaceTruncateState *
 cluster_space_truncate_prepare(Relation rel, BlockNumber nblocks)
 {
 	ClusterSpaceIdentityKey expected;
+	ClusterSpaceTruncateState *state;
 	SMgrRelation smgr;
 
 	if (rel == NULL || RecoveryInProgress() || !RelationIsPermanent(rel)
@@ -827,7 +838,10 @@ cluster_space_truncate_prepare(Relation rel, BlockNumber nblocks)
 		if (smgrexists(smgr, fork))
 			smgrimmedsync(smgr, fork);
 	}
-	return space_structure_prepare(&expected, CLUSTER_SPACE_WAL_TRUNCATE, nblocks);
+	state = space_structure_prepare(&expected, CLUSTER_SPACE_WAL_TRUNCATE, nblocks);
+	if (state != NULL)
+		state->base_synced = true;
+	return state;
 }
 
 static XLogRecPtr
@@ -848,6 +862,7 @@ static void
 space_structure_publish(ClusterSpaceTruncateState *state, XLogRecPtr lsn)
 {
 	Assert(state != NULL && CritSectionCount > 0 && !XLogRecPtrIsInvalid(lsn));
+	state->lsn = lsn;
 	for (int i = 0; i < 2; i++) {
 		memcpy(BufferGetPage(state->buffers[i]), state->result[i].data, BLCKSZ);
 		space_set_lsn(BufferGetPage(state->buffers[i]), lsn, state->token);
@@ -870,6 +885,10 @@ void
 cluster_space_truncate_publish(ClusterSpaceTruncateState *state)
 {
 	space_structure_publish(state, state->lsn);
+	/* The sole native caller has completed smgrtruncate2 and synced every
+	 * shrunken fork inside its original critical section before publishing.
+	 * Merely logging the record or publishing DROP cannot set this phase. */
+	state->truncate_published = true;
 }
 
 /* The caller retains both content-X locks and relation lifecycle authority.
@@ -889,6 +908,30 @@ space_structure_readback(SMgrRelation rel, Buffer buffer, BlockNumber block)
 		return false;
 	((PageHeader)disk.data)->pd_checksum = expected->pd_checksum;
 	return memcmp(disk.data, expected, BLCKSZ) == 0;
+}
+
+/* Keep the original record with its preallocated KO owner. Missing native
+ * attribution cannot manufacture a structural completion or retire a PI. */
+static void
+space_structure_observe(ClusterSpaceTruncateState *state)
+{
+	ClusterSpaceStructureChange change;
+	ClusterPageWalBindingV1 before, after, certified;
+	if (state->ko_completion == NULL || RecoveryInProgress())
+		return;
+	if (!cluster_space_structure_wal_decode(state->wal, sizeof(state->wal), &change))
+		elog(PANIC, "SPACE observation lost its original structural record");
+	if (!cluster_page_wal_read_v1(state->buffers[0], &change.identity.result, &before)
+		|| before.record_end != state->lsn
+		|| !cluster_page_wal_flush_source_v1(&before, &certified)
+		|| !cluster_page_wal_read_v1(state->buffers[0], &change.identity.result, &after)
+		|| memcmp(&before, &after, sizeof(before)) != 0)
+		return;
+	if (cluster_ko_shared_observe_space_v2(state->ko_completion, &certified,
+			state->wal, sizeof(state->wal))
+		&& change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE && state->base_synced
+		&& state->truncate_published)
+		(void)cluster_ko_shared_observe_truncate_v2(state->ko_completion);
 }
 
 void
@@ -914,6 +957,7 @@ cluster_space_truncate_finish(ClusterSpaceTruncateState *state, Relation rel)
 								errdetail("Relation %u/%u/%u, SPACE block %d.", rel->rd_locator.spcOid,
 										  rel->rd_locator.dbOid, rel->rd_locator.relNumber, i),
 								errhint("Check the storage device before restarting the instance.")));
+		space_structure_observe(state);
 	}
 	PG_CATCH();
 	{
@@ -1059,6 +1103,7 @@ cluster_space_drop_finish(ClusterSpaceDropState *state)
 												  change.identity.result.key.locator.spcOid,
 												  change.identity.result.key.locator.dbOid,
 												  change.identity.result.key.locator.relNumber, j)));
+				space_structure_observe(entry);
 			}
 		}
 		PG_CATCH();

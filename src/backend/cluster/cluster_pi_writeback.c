@@ -423,7 +423,8 @@ wb_v2_page(const ClusterPiWritebackFactV2 *fact)
 {
 	if (fact->kind == CLUSTER_PI_WRITEBACK_DATA_V2)
 		return &fact->proof.data;
-	if (fact->kind == CLUSTER_PI_WRITEBACK_STRUCTURAL_V2)
+	if (fact->kind == CLUSTER_PI_WRITEBACK_STRUCTURAL_V2
+		|| fact->kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2)
 		return &fact->proof.structural.terminal;
 	return NULL;
 }
@@ -431,12 +432,14 @@ wb_v2_page(const ClusterPiWritebackFactV2 *fact)
 static Size
 wb_v2_fact_bytes(const ClusterPiWritebackFactV2 *fact)
 {
+	if (fact->kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2)
+		return CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_BYTES_V2;
 	return fact->kind == CLUSTER_PI_WRITEBACK_DATA_V2 ? CLUSTER_PI_WRITEBACK_DATA_BYTES_V2
 		: CLUSTER_PI_WRITEBACK_STRUCTURAL_BYTES_V2;
 }
 
 static bool
-wb_v2_structural_valid(const ClusterPiStructuralFactV2 *s)
+wb_v2_structural_valid(const ClusterPiStructuralFactV2 *s, bool offer)
 {
 	static const ClusterPcmPiWriteCutV1 no_x;
 	static const ClusterPcmPiStorageCutV1 no_storage;
@@ -469,8 +472,13 @@ wb_v2_structural_valid(const ClusterPiStructuralFactV2 *s)
 			return false;
 	} else
 		return false;
-	if (s->durability_flags != flags
-		|| !((cluster_pcm_pi_write_cut_valid_v1(&f->write_cut) && f->write_cut.pi_holders_bitmap != 0
+	if (s->durability_flags != flags)
+		return false;
+	if (offer) {
+		if (memcmp(&f->write_cut, &no_x, sizeof(no_x)) != 0
+			|| memcmp(&f->storage_cut, &no_storage, sizeof(no_storage)) != 0)
+			return false;
+	} else if (!((cluster_pcm_pi_write_cut_valid_v1(&f->write_cut) && f->write_cut.pi_holders_bitmap != 0
 			  && memcmp(&f->storage_cut, &no_storage, sizeof(no_storage)) == 0)
 			 || (cluster_pcm_pi_storage_cut_valid_v1(&f->storage_cut) && f->storage_cut.pi_holders_bitmap != 0
 				 && memcmp(&f->write_cut, &no_x, sizeof(no_x)) == 0)))
@@ -488,10 +496,10 @@ wb_v2_structural_valid(const ClusterPiStructuralFactV2 *s)
 		&& memcmp(ko->incarnation, change->expected.incarnation, 16) == 0
 		&& ko->origin_node == b->source.claim.identity.origin_node_id
 		&& ko->origin_boot == b->source.claim.identity.origin_owner_incarnation
-		&& tag->spcOid == key->locator.spcOid && tag->dbOid == key->locator.dbOid
+		&& (offer || (tag->spcOid == key->locator.spcOid && tag->dbOid == key->locator.dbOid
 		&& tag->relNumber == key->locator.relNumber
 		&& (tag->forkNum == MAIN_FORKNUM || tag->forkNum == VISIBILITYMAP_FORKNUM
-			|| (tag->forkNum == SPACE_FORKNUM && tag->blockNum < 2));
+			|| (tag->forkNum == SPACE_FORKNUM && tag->blockNum < 2))));
 }
 
 static bool
@@ -510,14 +518,36 @@ wb_v2_message_valid(const ClusterPiWritebackMessageV2 *m)
 	for (uint32 i = 0; i < m->count; i++) {
 		const ClusterPiWritebackFactV2 *fact = &m->facts[i];
 		const ClusterPiDataFactV1 *f = wb_v2_page(fact);
+		bool offer = fact->kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2;
 		if (f == NULL) return false;
+		if (offer != (m->facts[0].kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2))
+			return false;
+		if (offer) {
+			const ClusterPiStructuralFactV2 *s = &fact->proof.structural;
+			const ClusterPiStructuralFactV2 *first = &m->facts[0].proof.structural;
+			if (!wb_v2_structural_valid(s, true) || s->ko.epoch != m->epoch
+				|| s->ko.peer_node != peer
+				|| s->ko.peer_boot != m->peer.claim.identity.origin_owner_incarnation
+				|| s->ko.origin_node != first->ko.origin_node
+				|| s->ko.origin_boot != first->ko.origin_boot
+				|| !wb_namespace(&f->binding.source, &m->peer))
+				return false;
+			/* A relation offer has no page/master authority. Do not pass it
+			 * through the page-holder tests or accept duplicate relations as
+			 * separate acknowledgements of the same source obligation. */
+			for (uint32 j = 0; j < i; j++)
+				if (RelFileLocatorEquals(f->binding.identity.locator,
+						m->facts[j].proof.structural.terminal.binding.identity.locator))
+					return false;
+			continue;
+		}
 		if (fact->kind == CLUSTER_PI_WRITEBACK_DATA_V2) {
 			if (!wb_fact_valid(f)) return false;
 		} else {
 			const ClusterKoSharedMessageV2 *ko = &fact->proof.structural.ko;
 			int32 master = wb_master(f);
 			uint64 peer_boot = m->peer.claim.identity.origin_owner_incarnation;
-			if (!wb_v2_structural_valid(&fact->proof.structural) || ko->epoch != m->epoch
+			if (!wb_v2_structural_valid(&fact->proof.structural, false) || ko->epoch != m->epoch
 				|| master < 0 || master >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 				|| (ko->members[master / 8] & (1u << (master % 8))) == 0)
 				return false;
@@ -557,8 +587,10 @@ wb_v2_fact_encode(uint8 *p, const ClusterPiWritebackFactV2 *fact)
 		pi_data_binding_encode(p + 16, &f->binding);
 		if (!cluster_space_structure_wal_encode(&s->change, p + 248, CLUSTER_SPACE_STRUCTURE_WAL_BYTES)
 			|| !cluster_ko_shared_encode_v2(&s->ko, p + 904, CLUSTER_KO_SHARED_V2_BYTES)) return false;
-		pi_data_cut_encode(p + 1064, &f->write_cut);
-		wb_storage_encode(p + 1192, &f->storage_cut);
+		if (fact->kind == CLUSTER_PI_WRITEBACK_STRUCTURAL_V2) {
+			pi_data_cut_encode(p + 1064, &f->write_cut);
+			wb_storage_encode(p + 1192, &f->storage_cut);
+		}
 	}
 	return true;
 }
@@ -635,9 +667,11 @@ cluster_pi_writeback_decode_v2(const void *data, Size length, ClusterPiWriteback
 			s->durability_flags = pi_data_get(p + 8, 4);
 			if (pi_data_get(p + 12, 4) || !pi_data_binding_decode(p + 16, &f->binding)
 				|| !cluster_space_structure_wal_decode(p + 248, CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &s->change)
-				|| !cluster_ko_shared_decode_v2(p + 904, CLUSTER_KO_SHARED_V2_BYTES, &s->ko)
-				|| !wb_storage_decode(p + 1192, &f->storage_cut)) return false;
-			pi_data_cut_decode(p + 1064, &f->write_cut);
+				|| !cluster_ko_shared_decode_v2(p + 904, CLUSTER_KO_SHARED_V2_BYTES, &s->ko)) return false;
+			if (fact->kind == CLUSTER_PI_WRITEBACK_STRUCTURAL_V2) {
+				if (!wb_storage_decode(p + 1192, &f->storage_cut)) return false;
+				pi_data_cut_decode(p + 1064, &f->write_cut);
+			}
 		}
 		at += n;
 	}

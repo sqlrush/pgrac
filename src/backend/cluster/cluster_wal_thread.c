@@ -98,7 +98,7 @@ typedef struct ClusterWalThreadShmemData {
 	pg_atomic_uint64 wal_state_refresh_fail_count;
 	slock_t checkpoint_sample_lock;
 	ClusterWalThreadCheckpointSampleV1 checkpoint_sample;
-	char _reserved[8]; /* remaining headroom */
+	uint64 initialized_writer_epoch; /* zero unless installed from never-served input */
 } ClusterWalThreadShmemData;
 
 static ClusterWalThreadShmemData *cluster_wal_thread_shmem = NULL;
@@ -132,7 +132,7 @@ cluster_wal_thread_shmem_init(void)
 		SpinLockInit(&cluster_wal_thread_shmem->checkpoint_sample_lock);
 		memset(&cluster_wal_thread_shmem->checkpoint_sample, 0,
 			   sizeof(cluster_wal_thread_shmem->checkpoint_sample));
-		memset(cluster_wal_thread_shmem->_reserved, 0, sizeof(cluster_wal_thread_shmem->_reserved));
+		cluster_wal_thread_shmem->initialized_writer_epoch = 0;
 	}
 }
 
@@ -421,6 +421,17 @@ cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 }
 
 bool
+cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *expected, uint64 epoch)
+{
+	ClusterWalSourceRef current;
+	/* The current-ref read supplies the READY acquire barrier for both fields.
+	 * This fact never replaces the caller's live membership/write-fence checks. */
+	return expected != NULL && epoch != 0 && cluster_wal_thread_current_v2_ref(&current)
+		   && cluster_wal_thread_shmem->initialized_writer_epoch == epoch
+		   && memcmp(expected, &current, sizeof(current)) == 0;
+}
+
+bool
 cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
 {
 	if (out == NULL)
@@ -486,6 +497,7 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 	ClusterWalSourceRef installed;
 	ClusterControlRootResult result;
 	uint32 state = 0;
+	uint64 initialized_epoch;
 	if (expected == NULL || !cluster_enabled || !cluster_shared_config
 		|| cluster_wal_thread_shmem == NULL || !cluster_wal_thread_shmem->restart_ref_valid
 		|| !cluster_wal_thread_shmem->dir_validated)
@@ -503,11 +515,14 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 		|| !cluster_wal_writer_startup_matches(&installed.claim.identity, expected->operation_uuid,
 												expected->first_segment_lsn))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	initialized_epoch = expected->input_kind == CLUSTER_WAL_STARTUP_INITIALIZED
+							? expected->formation_epoch : 0;
 	if (!pg_atomic_compare_exchange_u32(&cluster_wal_thread_shmem->writer_ref_state, &state, 1)) {
 		if (state != 2)
 			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 		pg_read_barrier();
 		return memcmp(&installed, &cluster_wal_thread_shmem->v2_ref, sizeof(installed)) == 0
+				   && initialized_epoch == cluster_wal_thread_shmem->initialized_writer_epoch
 				   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
 				   : CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	}
@@ -515,6 +530,7 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 	 * Readers inspect READY then use an acquire barrier; bytes never change
 	 * afterwards. The immutable predecessor mirror is never touched here. */
 	cluster_wal_thread_shmem->v2_ref = installed;
+	cluster_wal_thread_shmem->initialized_writer_epoch = initialized_epoch;
 	pg_write_barrier();
 	pg_atomic_write_u32(&cluster_wal_thread_shmem->writer_ref_state, 2);
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;

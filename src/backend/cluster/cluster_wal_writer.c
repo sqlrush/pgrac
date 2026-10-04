@@ -29,6 +29,7 @@ static struct {
 	int pid;
 	uint64 epoch;
 	XLogRecPtr first_lsn;
+	uint32 input_kind;
 	uint8 operation_uuid[16];
 	ClusterWalSourceRef ref;
 } writer_startup;
@@ -62,7 +63,7 @@ cluster_wal_writer_check(const ClusterWalWriterToken *work)
 	fresh.epoch = work->epoch;
 
 	if (!cluster_enabled || !cluster_shared_config || !enableFsync
-		|| !cluster_external_fence_runtime_active() || cluster_node_id != id->origin_node_id
+		|| cluster_node_id != id->origin_node_id
 		|| id->system_identifier != GetSystemIdentifier()
 		|| cluster_qvotec_get_self_incarnation() != id->origin_owner_incarnation
 		|| cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER
@@ -71,6 +72,14 @@ cluster_wal_writer_check(const ClusterWalWriterToken *work)
 		|| work->epoch == 0 || !writer_select(&fresh)
 		|| fresh.startup_first_lsn != work->startup_first_lsn
 		|| memcmp(&fresh.ref, &work->ref, sizeof(fresh.ref)) != 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	/* The selected never-served input has no prior online writer to fence.
+	 * Keep that qualification on the exact startup binding, then on its
+	 * once-published INSTALL and original epoch. A route alone is not enough. */
+	if (!cluster_external_fence_runtime_active()
+		&& (MyBackendType == B_STARTUP
+				? writer_startup.input_kind != CLUSTER_WAL_STARTUP_INITIALIZED
+				: !cluster_wal_thread_initialized_writer_matches(&work->ref, work->epoch)))
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	cluster_write_fence_observe(&fence);
 	if (!fence.enforcing || !fence.attached || !fence.engaged || fence.self_fenced
@@ -331,6 +340,7 @@ cluster_wal_writer_startup_prepare(const ClusterControlRootIdentity *self,
 	writer_startup.pid = MyProcPid;
 	writer_startup.epoch = work.epoch;
 	writer_startup.first_lsn = op.first_segment_lsn;
+	writer_startup.input_kind = op.input_kind;
 	memcpy(writer_startup.operation_uuid, op.operation_uuid, 16);
 	writer_startup.ref = work.ref;
 	writer_startup.valid = true;

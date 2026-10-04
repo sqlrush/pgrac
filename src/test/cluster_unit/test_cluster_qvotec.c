@@ -153,6 +153,7 @@ extern long cluster_qvotec_test_poll_wait_timeout_ms(uint64 elapsed_us, int poll
 extern bool cluster_qvotec_test_clean_shutdown(const int *fds, int n_disks, uint64 incarnation,
 											   uint64 generation);
 extern void cluster_qvotec_test_probe_prior_slots(const int *fds, int n_disks, uint64 incarnation);
+extern void cluster_qvotec_test_poll_once(const int *fds, int n_disks, uint64 incarnation);
 #ifdef __APPLE__
 extern void cluster_qvotec_test_poll_pre_injection(void) __attribute__((weak_import));
 extern void cluster_qvotec_test_publish_poll_lease(uint64 now_us) __attribute__((weak_import));
@@ -423,15 +424,35 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPt
 #include "datatype/timestamp.h"
 #include <time.h>
 static TimestampTz mock_now = 1700000000000000LL;
+static uint64 fence_mock_monotonic_us;
+static uint64 fence_mock_storage_us;
 static ClusterStorageQuorumView storage_sample;
 
 int cluster_qvotec_test_clock_gettime(clockid_t clock_id, struct timespec *out);
 int
 cluster_qvotec_test_clock_gettime(clockid_t clock_id, struct timespec *out)
 {
+	uint64 now = fence_mock_storage_us != 0 ? fence_mock_storage_us :
+		(fence_mock_monotonic_us != 0 ? fence_mock_monotonic_us : (uint64)mock_now);
+
 	Assert(clock_id == CLOCK_MONOTONIC);
-	out->tv_sec = mock_now / 1000000;
-	out->tv_nsec = (mock_now % 1000000) * 1000;
+	out->tv_sec = now / 1000000;
+	out->tv_nsec = (now % 1000000) * 1000;
+	return 0;
+}
+
+/* Keep the two clock domains distinct even on test hosts where both map to
+ * CLOCK_MONOTONIC. Darwin's fence consumer uses PG_INSTR_CLOCK (RAW). */
+#include "portability/instr_time.h"
+extern int cluster_qvotec_test_instr_clock_gettime(clockid_t clock_id, struct timespec *out);
+int
+cluster_qvotec_test_instr_clock_gettime(clockid_t clock_id, struct timespec *out)
+{
+	uint64 now = fence_mock_monotonic_us != 0 ? fence_mock_monotonic_us : (uint64)mock_now;
+
+	Assert(clock_id == PG_INSTR_CLOCK);
+	out->tv_sec = now / 1000000;
+	out->tv_nsec = (now % 1000000) * 1000;
 	return 0;
 }
 
@@ -534,9 +555,41 @@ cluster_sf_peer_capability_word_sample(int32 peer_id pg_attribute_unused(),
 	return false;
 }
 
+/* Capture the real poll's cache boundary. The publisher's atomic interleavings
+ * remain covered by test_cluster_write_fence_cache; the cache judge is real. */
+static uint64 fence_cache_sequence;
+static uint64 fence_cache_sampled_us;
+static ClusterFenceMarker fence_cache_marker;
+static bool fence_cache_valid;
+static unsigned fence_cache_publications;
+
 void
 cluster_write_fence_authority_cache_invalidate(void)
-{}
+{
+	fence_cache_valid = false;
+	if (fence_cache_sequence < UINT64_MAX - 2)
+		fence_cache_sequence += 2;
+}
+
+uint64
+cluster_write_fence_authority_cache_sequence(void)
+{
+	return fence_cache_sequence;
+}
+
+bool
+cluster_write_fence_authority_cache_publish_if_unchanged(const ClusterFenceMarker *marker,
+														 uint64 sampled_us, uint64 expected)
+{
+	if (expected != fence_cache_sequence || (expected & 1) || expected >= UINT64_MAX - 1)
+		return false;
+	fence_cache_marker = *marker;
+	fence_cache_sampled_us = sampled_us;
+	fence_cache_valid = true;
+	fence_cache_sequence += 2;
+	fence_cache_publications++;
+	return true;
+}
 
 #include "cluster/cluster_elog.h"
 void
@@ -765,6 +818,8 @@ decide_quorum_view(const ClusterVotingSlot *slots pg_attribute_unused(),
 				   uint64 heartbeat_timeout_us pg_attribute_unused(),
 				   ClusterQuorumDecision *out pg_attribute_unused())
 {
+	memset(out, 0, sizeof(*out));
+	out->quorum_state = CLUSTER_QVOTEC_QUORUM_LOST;
 	return CLUSTER_QVOTEC_QUORUM_LOST;
 }
 ClusterPgstatCounter *
@@ -940,6 +995,15 @@ cluster_reconfig_record_observed_fresh_alive(int32 node_id pg_attribute_unused()
  * reconfig.o is not linked into this binary — stub the B′ surfaces like
  * the other reconfig symbols.  The formation-marker tests live in
  * test_cluster_formation_marker / test_cluster_reconfig. */
+bool
+cluster_reconfig_formation_needs_disk_snapshot(void)
+{
+	return false;
+}
+void
+cluster_reconfig_formation_qvotec_publish_disk_snapshot(
+	const ClusterFormationDiskSnapshot *snapshot pg_attribute_unused())
+{}
 bool
 cluster_reconfig_formation_qvotec_poll_pending(
 	ClusterFormationMarkerSubmitRequest *out pg_attribute_unused())
@@ -2145,6 +2209,249 @@ pgsa_disk_set_close(PgsaDiskSet *set)
 		if (set->paths[i][0] != '\0')
 			(void)unlink(set->paths[i]);
 		set->fds[i] = -1;
+	}
+}
+
+/* Exercise the real poll and disk codec. Only the clock, one read completion,
+ * and the cache publication boundary are controlled; selection is production. */
+static int fence_read_action;
+static char fence_poll_config[PGSA_TEST_DISKS * MAXPGPATH];
+static ClusterFenceMarker fence_replacement;
+extern ClusterVotingDiskIoState cluster_qvotec_test_poll_read_slot(int fd, uint32 disk,
+																uint32 node, ClusterVotingSlot *out);
+
+ClusterVotingDiskIoState
+cluster_qvotec_test_poll_read_slot(int fd, uint32 disk, uint32 node, ClusterVotingSlot *out)
+{
+	ClusterVotingDiskIoState rc = cluster_voting_disk_read_slot(fd, disk, node, out);
+
+	if (disk == 0 && node == 1) {
+		int action = fence_read_action;
+
+		fence_read_action = 0;
+		if (action == 1)
+			cluster_write_fence_authority_cache_invalidate();
+		else if (action == 2)
+			(void)cluster_write_fence_authority_cache_publish_if_unchanged(
+				&fence_replacement, fence_mock_monotonic_us, fence_cache_sequence);
+		else if (action == 3)
+			fence_mock_monotonic_us += CLUSTER_FENCE_AUTHORITY_CACHE_MAX_AGE_US + 1;
+		else if (action == 4)
+			return CLUSTER_VOTING_DISK_IO_FAILED;
+	}
+	return rc;
+}
+
+static void
+fence_poll_write(PgsaDiskSet *set, int disk, uint32 node, const ClusterFenceMarker *marker)
+{
+	ClusterVotingSlot slot;
+
+	memset(&slot, 0, sizeof(slot));
+	slot.magic = CLUSTER_VOTING_SLOT_MAGIC;
+	slot.version = CLUSTER_VOTING_SLOT_VERSION;
+	slot.node_id = node;
+	slot.incarnation = 901;
+	slot.heartbeat_ts_us = (uint64)mock_now;
+	slot.current_epoch = marker->fence_epoch;
+	slot.flags = CLUSTER_VOTING_SLOT_FLAG_ALIVE;
+	slot.disk_index = disk;
+	slot.generation = 10;
+	memcpy(slot._reserved1, marker, sizeof(*marker));
+	UT_ASSERT_EQ(cluster_voting_disk_write_slot(set->fds[disk], &slot),
+				 CLUSTER_VOTING_DISK_IO_OK);
+}
+
+static bool
+fence_poll_fixture(PgsaDiskSet *set, ClusterFenceMarker *marker)
+{
+	if (!pgsa_disk_set_open(set))
+		return false;
+	memset(marker, 0, sizeof(*marker));
+	marker->magic = CLUSTER_FENCE_MARKER_MAGIC;
+	marker->version = CLUSTER_FENCE_MARKER_VERSION;
+	marker->fence_epoch = 8;
+	marker->fence_generation = 2;
+	marker->fence_event_id = 29;
+	marker->issuer_node_id = 0;
+	marker->marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+	for (int d = 0; d < PGSA_TEST_DISKS; d++) {
+		UT_ASSERT_EQ(cluster_voting_disk_format(set->fds[d], CLUSTER_MAX_NODES, d),
+					 CLUSTER_VOTING_DISK_IO_OK);
+		fence_poll_write(set, d, 0, marker);
+	}
+	cluster_node_id = 0;
+	cluster_shared_config = true;
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_ON;
+	snprintf(fence_poll_config, sizeof(fence_poll_config), "%s,%s,%s",
+			 set->paths[0], set->paths[1], set->paths[2]);
+	cluster_voting_disks = fence_poll_config;
+	fence_cache_sequence = 2;
+	fence_cache_valid = true; /* Failed renewal must revoke an existing proof. */
+	fence_cache_marker = *marker;
+	fence_mock_monotonic_us = 1000000;
+	fence_mock_storage_us = 0;
+	fence_cache_sampled_us = fence_mock_monotonic_us;
+	fence_cache_publications = 0;
+	fence_read_action = 0;
+	shmem_init_done = false;
+	cluster_qvotec_shmem_init();
+	storage_fixture_ready();
+	return true;
+}
+
+static void
+fence_poll_close(PgsaDiskSet *set)
+{
+	pgsa_disk_set_close(set);
+	cluster_shared_config = false;
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
+	cluster_voting_disks = NULL;
+	fence_mock_monotonic_us = 0;
+	fence_mock_storage_us = 0;
+	fence_read_action = 0;
+}
+
+static ClusterFenceAuthorityCacheResult
+fence_poll_cached(const ClusterFenceMarker *expected)
+{
+	return cluster_fence_authority_cache_decide_v1(expected, fence_cache_sequence,
+		fence_cache_sequence, fence_cache_valid, &fence_cache_marker, fence_cache_sampled_us,
+		fence_cache_sampled_us + CLUSTER_FENCE_AUTHORITY_CACHE_MAX_AGE_US,
+		fence_mock_monotonic_us);
+}
+
+UT_TEST(test_poll_renews_real_majority_across_two_expiry_periods)
+{
+	PgsaDiskSet set;
+	ClusterFenceMarker marker;
+
+	UT_ASSERT(fence_poll_fixture(&set, &marker));
+	for (int round = 0; round < 7; round++) {
+		fence_mock_monotonic_us = UINT64_C(1000000) + round * UINT64_C(2000000);
+		cluster_qvotec_test_poll_once(set.fds, PGSA_TEST_DISKS, 901);
+		UT_ASSERT_EQ(fence_cache_publications, round + 1);
+		UT_ASSERT_EQ(fence_cache_sampled_us, fence_mock_monotonic_us);
+		UT_ASSERT_EQ(fence_poll_cached(&marker), CLUSTER_FENCE_CACHE_MATCH);
+		UT_ASSERT(cluster_fence_marker_semantic_equal(&marker, &fence_cache_marker));
+	}
+	fence_poll_close(&set);
+}
+
+UT_TEST(test_poll_uses_fence_consumer_clock_when_quorum_clock_differs)
+{
+	for (int direction = 0; direction < 2; direction++) {
+		PgsaDiskSet set;
+		ClusterFenceMarker marker;
+
+		UT_ASSERT(fence_poll_fixture(&set, &marker));
+		fence_mock_monotonic_us = direction == 0 ? 1000000 : 31000000;
+		fence_mock_storage_us = direction == 0 ? 31000000 : 1000000;
+		cluster_qvotec_test_poll_once(set.fds, PGSA_TEST_DISKS, 901);
+		UT_ASSERT_EQ(fence_cache_publications, 1);
+		UT_ASSERT_EQ(fence_cache_sampled_us, fence_mock_monotonic_us);
+		UT_ASSERT_EQ(fence_poll_cached(&marker), CLUSTER_FENCE_CACHE_MATCH);
+		fence_poll_close(&set);
+	}
+}
+
+UT_TEST(test_poll_cannot_republish_invalidated_or_replaced_scan)
+{
+	for (int action = 1; action <= 3; action++) {
+		PgsaDiskSet set;
+		ClusterFenceMarker marker;
+
+		UT_ASSERT(fence_poll_fixture(&set, &marker));
+		fence_replacement = marker;
+		fence_replacement.fence_epoch++;
+		fence_read_action = action;
+		cluster_qvotec_test_poll_once(set.fds, PGSA_TEST_DISKS, 901);
+		UT_ASSERT(fence_poll_cached(&marker) != CLUSTER_FENCE_CACHE_MATCH);
+		if (action == 2) {
+			UT_ASSERT_EQ(fence_cache_publications, 1);
+			UT_ASSERT_EQ(fence_poll_cached(&fence_replacement), CLUSTER_FENCE_CACHE_MATCH);
+		}
+		if (action == 3)
+			UT_ASSERT_EQ(fence_cache_sampled_us, UINT64_C(1000000));
+		fence_poll_close(&set);
+	}
+}
+
+UT_TEST(test_poll_failed_proofs_revoke_cache_without_shrinking_denominator)
+{
+	for (int failure = 0; failure < 10; failure++) {
+		PgsaDiskSet set;
+		ClusterFenceMarker marker;
+		int ndisks = PGSA_TEST_DISKS;
+		int saved_fd = -1;
+
+		UT_ASSERT(fence_poll_fixture(&set, &marker));
+		if (failure == 0) { /* One real disk cannot form a three-disk quorum. */
+			close(set.fds[1]); set.fds[1] = -1;
+			close(set.fds[2]); set.fds[2] = -1;
+		} else if (failure == 1) { /* Open list omitted a configured disk. */
+			ndisks = 2;
+		} else if (failure == 2) { /* Two handles to one physical medium. */
+			saved_fd = set.fds[1];
+			set.fds[1] = set.fds[0];
+		} else if (failure == 3) { /* Same order, conflicting tuple on one disk. */
+			marker.fence_event_id++;
+			fence_poll_write(&set, 0, 1, &marker);
+		} else if (failure == 4) {
+			marker.version++;
+			fence_poll_write(&set, 0, 1, &marker);
+		} else if (failure == 5) { /* Read failure away from slot zero counts. */
+			close(set.fds[2]); set.fds[2] = -1;
+			fence_read_action = 4;
+		} else if (failure == 6) { /* Each disk's highest marker differs. */
+			for (int d = 0; d < PGSA_TEST_DISKS; d++) {
+				marker.fence_epoch++;
+				fence_poll_write(&set, d, 1, &marker);
+			}
+		} else if (failure == 7)
+			ndisks = 0;
+		else if (failure == 8)
+			snprintf(fence_poll_config, sizeof(fence_poll_config), "%s,%s,%s",
+					 set.paths[0], set.paths[0], set.paths[2]);
+		else
+			cluster_voting_disks = "one,,three";
+		cluster_qvotec_test_poll_once(set.fds, ndisks, 901);
+		UT_ASSERT(!fence_cache_valid);
+		UT_ASSERT_EQ(fence_cache_publications, 0);
+		if (saved_fd >= 0)
+			set.fds[1] = saved_fd;
+		fence_poll_close(&set);
+	}
+}
+
+UT_TEST(test_poll_preserves_majority_crc_and_legacy_boundaries)
+{
+	for (int mode = 0; mode < 5; mode++) {
+		PgsaDiskSet set;
+		ClusterFenceMarker marker;
+
+		UT_ASSERT(fence_poll_fixture(&set, &marker));
+		if (mode == 0) {
+			close(set.fds[2]); set.fds[2] = -1;
+		} else if (mode == 1) {
+			uint8 bad;
+			UT_ASSERT_EQ(pread(set.fds[2], &bad, 1, 508), 1);
+			bad ^= 0xff;
+			UT_ASSERT_EQ(pwrite(set.fds[2], &bad, 1, 508), 1); /* bad outer CRC */
+		} else if (mode == 2)
+			cluster_shared_config = false;
+		else if (mode == 3)
+			fence_cache_sequence = 3;
+		else
+			fence_cache_sequence = UINT64_MAX;
+		cluster_qvotec_test_poll_once(set.fds, PGSA_TEST_DISKS, 901);
+		UT_ASSERT_EQ(fence_cache_publications, mode < 2 ? 1 : 0);
+		if (mode < 2) {
+			UT_ASSERT_EQ(fence_poll_cached(&marker), CLUSTER_FENCE_CACHE_MATCH);
+			marker.fence_epoch++;
+			UT_ASSERT_EQ(fence_poll_cached(&marker), CLUSTER_FENCE_CACHE_STALE);
+		}
+		fence_poll_close(&set);
 	}
 }
 
@@ -4002,7 +4309,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(76);
+	UT_PLAN(83);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -4081,6 +4388,11 @@ main(void)
 	UT_RUN(test_normal_stop_wrong_incarnation_and_uncommitted_protocol_do_not_clear);
 	UT_RUN(test_normal_stop_marker_preservation_and_replacement_hold);
 	UT_RUN(test_normal_stop_no_config_generation_overflow_and_legacy_boundary);
+	UT_RUN(test_poll_renews_real_majority_across_two_expiry_periods);
+	UT_RUN(test_poll_uses_fence_consumer_clock_when_quorum_clock_differs);
+	UT_RUN(test_poll_cannot_republish_invalidated_or_replaced_scan);
+	UT_RUN(test_poll_failed_proofs_revoke_cache_without_shrinking_denominator);
+	UT_RUN(test_poll_preserves_majority_crc_and_legacy_boundaries);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

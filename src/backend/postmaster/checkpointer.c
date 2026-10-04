@@ -57,6 +57,7 @@
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
+#include "postmaster/startup.h"
 #include "replication/syncrep.h"
 #include "storage/bufmgr.h"
 #include "storage/condition_variable.h"
@@ -117,13 +118,24 @@
  * the requests fields are protected by CheckpointerCommLock.
  *----------
  */
-typedef struct
+typedef struct CheckpointerRequest
 {
 	SyncRequestType type;		/* request type */
 	FileTag		ftag;			/* file identifier */
 } CheckpointerRequest;
 
-typedef struct
+#ifdef USE_PGRAC_CLUSTER
+typedef enum StartupSyncState
+{
+	STARTUP_SYNC_IDLE,
+	STARTUP_SYNC_REQUESTED,
+	STARTUP_SYNC_RUNNING,
+	STARTUP_SYNC_DONE,
+	STARTUP_SYNC_FAILED
+} StartupSyncState;
+#endif
+
+typedef struct CheckpointerShmemStruct
 {
 	pid_t		checkpointer_pid;	/* PID (0 if not started) */
 
@@ -138,6 +150,14 @@ typedef struct
 	ConditionVariable start_cv; /* signaled when ckpt_started advances */
 	ConditionVariable done_cv;	/* signaled when ckpt_done advances */
 
+#ifdef USE_PGRAC_CLUSTER
+	/* File-sync completion only; never advances the checkpoint counters. */
+	uint64 startup_sync_request;
+	pid_t startup_sync_requester;
+	pid_t startup_sync_checkpointer;
+	StartupSyncState startup_sync_state;
+#endif
+
 	uint32		num_backend_writes; /* counts user backend buffer writes */
 	uint32		num_backend_fsync;	/* counts user backend fsync calls */
 
@@ -147,6 +167,12 @@ typedef struct
 } CheckpointerShmemStruct;
 
 static CheckpointerShmemStruct *CheckpointerShmem;
+
+#ifdef USE_PGRAC_CLUSTER
+static uint64 startup_sync_active_request;
+static void CheckpointerStartupSyncFinish(bool success);
+static void CheckpointerStartupSyncPoll(void);
+#endif
 
 /* interval for calling AbsorbSyncRequests in CheckpointWriteDelay */
 #define WRITES_PER_ABSORB		1000
@@ -294,6 +320,9 @@ CheckpointerMain(void)
 		 * files.
 		 */
 		LWLockReleaseAll();
+#ifdef USE_PGRAC_CLUSTER
+		CheckpointerStartupSyncFinish(false);
+#endif
 		ConditionVariableCancelSleep();
 		pgstat_report_wait_end();
 		UnlockBuffers();
@@ -388,6 +417,7 @@ CheckpointerMain(void)
 		HandleCheckpointerInterrupts();
 
 #ifdef USE_PGRAC_CLUSTER
+		CheckpointerStartupSyncPoll();
 		/* PGRAC: a latch-only idle checkpoint loop must also advance owned
 		 * control cleanup. Author: SqlRush <sqlrush@gmail.com> */
 		cluster_cf_retirement_poll();
@@ -1176,6 +1206,111 @@ CheckpointerShmemInit(void)
  *	CHECKPOINT_CAUSE_XLOG: checkpoint is requested due to xlog filling.
  *		(This affects logging, and in particular enables CheckPointWarning.)
  */
+#ifdef USE_PGRAC_CLUSTER
+/* Keep file-sync requests with their existing owner. Startup owns the WAL
+ * checkpoint and ROOT publication after this receipt, not this process.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+CheckpointerStartupSyncFinish(bool success)
+{
+	bool notify = false;
+	if (startup_sync_active_request == 0)
+		return;
+	SpinLockAcquire(&CheckpointerShmem->ckpt_lck);
+	if (CheckpointerShmem->startup_sync_request == startup_sync_active_request
+		&& CheckpointerShmem->startup_sync_checkpointer == MyProcPid
+		&& CheckpointerShmem->startup_sync_state == STARTUP_SYNC_RUNNING) {
+		CheckpointerShmem->startup_sync_state = success ? STARTUP_SYNC_DONE : STARTUP_SYNC_FAILED;
+		notify = true;
+	}
+	SpinLockRelease(&CheckpointerShmem->ckpt_lck);
+	startup_sync_active_request = 0;
+	if (notify)
+		ConditionVariableBroadcast(&CheckpointerShmem->done_cv);
+}
+
+static void
+CheckpointerStartupSyncPoll(void)
+{
+	if (!cluster_shared_config || !AmCheckpointerProcess())
+		return;
+	SpinLockAcquire(&CheckpointerShmem->ckpt_lck);
+	if (CheckpointerShmem->startup_sync_state == STARTUP_SYNC_REQUESTED
+		&& CheckpointerShmem->startup_sync_checkpointer == MyProcPid) {
+		startup_sync_active_request = CheckpointerShmem->startup_sync_request;
+		CheckpointerShmem->startup_sync_state = STARTUP_SYNC_RUNNING;
+	}
+	SpinLockRelease(&CheckpointerShmem->ckpt_lck);
+	if (startup_sync_active_request == 0)
+		return;
+	if (!RecoveryInProgress() || ShutdownRequestPending) {
+		CheckpointerStartupSyncFinish(false);
+		return;
+	}
+	/* This includes requests already absorbed by this checkpointer, plus
+	 * the native queue cut taken inside ProcessSyncRequests. Later requests
+	 * and unlinks keep their native next-checkpoint retirement rules. */
+	ProcessSyncRequests();
+	CheckpointerStartupSyncFinish(true);
+}
+
+bool
+RequestStartupSync(void)
+{
+	uint64 request;
+	pid_t server;
+	bool success = false;
+	if (!cluster_enabled || !cluster_shared_config || !IsUnderPostmaster
+		|| MyBackendType != B_STARTUP || !AmStartupProcess() || MyProcPid <= 0
+		|| ShutdownRequestPending
+		|| !RecoveryInProgress() || CheckpointerShmem == NULL)
+		return false;
+	HandleStartupProcInterrupts();
+	SpinLockAcquire(&CheckpointerShmem->ckpt_lck);
+	server = CheckpointerShmem->checkpointer_pid;
+	if (server <= 0 || CheckpointerShmem->startup_sync_state != STARTUP_SYNC_IDLE
+		|| CheckpointerShmem->startup_sync_request == UINT64_MAX) {
+		SpinLockRelease(&CheckpointerShmem->ckpt_lck);
+		return false;
+	}
+	request = ++CheckpointerShmem->startup_sync_request;
+	CheckpointerShmem->startup_sync_requester = MyProcPid;
+	CheckpointerShmem->startup_sync_checkpointer = server;
+	CheckpointerShmem->startup_sync_state = STARTUP_SYNC_REQUESTED;
+	SpinLockRelease(&CheckpointerShmem->ckpt_lck);
+	if (kill(server, SIGINT) != 0)
+		return false;
+	ConditionVariablePrepareToSleep(&CheckpointerShmem->done_cv);
+	for (;;) {
+		StartupSyncState state;
+		bool exact;
+		/* Startup's SIGTERM flag is distinct from ShutdownRequestPending.
+		 * Its original exit path also cancels this auxiliary process's CV. */
+		HandleStartupProcInterrupts();
+		SpinLockAcquire(&CheckpointerShmem->ckpt_lck);
+		exact = CheckpointerShmem->startup_sync_request == request
+			&& CheckpointerShmem->startup_sync_requester == MyProcPid
+			&& CheckpointerShmem->startup_sync_checkpointer == server
+			&& CheckpointerShmem->checkpointer_pid == server;
+		state = CheckpointerShmem->startup_sync_state;
+		if (exact && (state == STARTUP_SYNC_DONE || state == STARTUP_SYNC_FAILED)) {
+			success = state == STARTUP_SYNC_DONE;
+			CheckpointerShmem->startup_sync_state = STARTUP_SYNC_IDLE;
+		}
+		SpinLockRelease(&CheckpointerShmem->ckpt_lck);
+		if (!exact || state == STARTUP_SYNC_DONE || state == STARTUP_SYNC_FAILED
+			|| ShutdownRequestPending)
+			break;
+		/* The timeout rechecks the same owner. It never proves completion. */
+		(void) ConditionVariableTimedSleep(&CheckpointerShmem->done_cv, 100,
+										   WAIT_EVENT_CHECKPOINT_DONE);
+	}
+	ConditionVariableCancelSleep();
+	HandleStartupProcInterrupts();
+	return success && !ShutdownRequestPending;
+}
+#endif
+
 void
 RequestCheckpoint(int flags)
 {

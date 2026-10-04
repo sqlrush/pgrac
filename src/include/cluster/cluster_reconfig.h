@@ -102,6 +102,21 @@ typedef enum ClusterReplacementCommittedClosedPublishResultV1 {
  */
 #define CLUSTER_RECONFIG_DEAD_BITMAP_BYTES 16
 
+#include "cluster/cluster_write_fence.h"
+
+/* QVOTEC-only disk observation; memory, never a persistent authority.
+ * sampled_at_us is the beginning of the scan, not the end of a slow I/O.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterFormationDiskSnapshot {
+	uint64 sampled_at_us;
+	uint64 self_incarnation;
+	uint64 max_epoch;
+	uint64 max_generation;
+	ClusterFenceAuthorityProof fence;
+	bool complete;
+} ClusterFormationDiskSnapshot;
+
+
 /*
  * spec-5.14 D6 — number of touched_peers ingress classes (mirrors
  * CLUSTER_TOUCH_KIND_COUNT in cluster_touched_peers.h; kept as a plain
@@ -512,6 +527,7 @@ typedef struct ClusterReconfigState {
 	/* PGRAC: accepted durable formation, recovery CONTROL only until native
 	 * INSTALL and stripe completion. Protected by lock, never disk authority.
 	 * Author: SqlRush <sqlrush@gmail.com> */
+	ClusterFormationDiskSnapshot formation_disk_snapshot;
 	ClusterFormationCommitMarker startup_formation;
 	uint64 startup_formation_incarnations[CLUSTER_MAX_NODES];
 } ClusterReconfigState;
@@ -519,8 +535,8 @@ typedef struct ClusterReconfigState {
 /* PGRAC: includes the observation sequence and exact startup cohort binding;
  * the allocator uses sizeof, and all processes require the same build.
  * Author: SqlRush <sqlrush@gmail.com> */
-StaticAssertDecl(sizeof(ClusterReconfigState) == 13760,
-				 "cluster reconfig state must remain exactly 13,760 bytes");
+StaticAssertDecl(sizeof(ClusterReconfigState) == 13872,
+				 "cluster reconfig state must remain exactly 13,872 bytes");
 
 
 /* ============================================================
@@ -818,6 +834,9 @@ extern bool
 cluster_reconfig_formation_qvotec_poll_pending(ClusterFormationMarkerSubmitRequest *out);
 extern void cluster_reconfig_formation_qvotec_complete(bool success);
 extern void cluster_reconfig_formation_qvotec_note_max_generation(uint64 generation);
+extern bool cluster_reconfig_formation_needs_disk_snapshot(void);
+extern void cluster_reconfig_formation_qvotec_publish_disk_snapshot(
+	const ClusterFormationDiskSnapshot *snapshot);
 extern void
 cluster_reconfig_formation_qvotec_publish_observed(const ClusterFormationCommitMarker *marker,
 												   const uint64 *incarnation_by_node);

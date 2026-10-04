@@ -89,6 +89,14 @@ static Relation fake_relation;
 static unsigned fake_allocations, fake_frees;
 static int nest_level;
 static unsigned ko_calls;
+static unsigned ko_claims;
+static bool ko_pending, ko_claim_unavailable;
+static ClusterSpaceIdentityKey ko_key;
+static uint8 ko_incarnation[16];
+static int ko_handle;
+static unsigned space_observe_calls, space_observations, observation_reads;
+static unsigned truncate_observations;
+static unsigned observation_fault;
 static unsigned current_ref_reads, restart_ref_reads;
 static bool reject_current_ref;
 static uint64 next_token;
@@ -283,6 +291,98 @@ cluster_page_wal_forget_v1(Buffer buffer)
 {
 	UT_ASSERT(buffer >= 1 && buffer <= 2 && (locked & (1 << (buffer - 1))) != 0);
 	forget_calls++;
+	return true;
+}
+
+bool
+cluster_page_wal_read_v1(Buffer buffer, const ClusterSpaceIdentity *identity,
+	ClusterPageWalBindingV1 *out)
+{
+	ClusterSpaceIdentity actual;
+	uint64 token;
+	ClusterPageWalBindingV1 value = {0};
+	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT_EQ(locked, 3);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(space_readbacks, 2);
+	observation_reads++;
+	if (capture_result != CLUSTER_PAGE_WAL_CAPTURED)
+		return false;
+	UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
+		&identity->key, &actual, &token));
+	UT_ASSERT_EQ(actual.sequence, identity->sequence);
+	UT_ASSERT_EQ(actual.operation, identity->operation);
+	UT_ASSERT_EQ(actual.state, identity->state);
+	UT_ASSERT(memcmp(actual.incarnation, identity->incarnation, 16) == 0);
+	value.source = ref;
+	value.identity.system_identifier = identity->key.system_identifier;
+	memcpy(value.identity.storage_uuid, identity->key.storage_uuid, 16);
+	value.identity.locator = identity->key.locator;
+	value.identity.forknum = SPACE_FORKNUM;
+	memcpy(value.version.segment_incarnation, identity->incarnation, 16);
+	value.version.mutation_token = token;
+	value.record_end = PageGetLSN(page.data);
+	value.record_start = value.record_end - 0x100;
+	value.record_crc = 7;
+	value.rmid = drop_owner ? RM_XACT_ID : RM_SMGR_ID;
+	value.info = wal_info;
+	if (observation_fault == 3 && observation_reads == 2)
+		value.record_crc++;
+	*out = value;
+	return true;
+}
+
+bool
+cluster_page_wal_flush_source_v1(const ClusterPageWalBindingV1 *binding,
+	ClusterPageWalBindingV1 *out)
+{
+	UT_ASSERT_EQ(locked, 3);
+	UT_ASSERT_EQ(space_readbacks, 2);
+	UT_ASSERT_EQ(binding->record_end, PageGetLSN(page.data));
+	if (observation_fault == 2)
+		return false;
+	*out = *binding;
+	out->flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	return true;
+}
+
+bool
+cluster_ko_shared_observe_space_v2(ClusterKoCompletionV2 *completion,
+	const ClusterPageWalBindingV1 *binding, const void *wal, Size length)
+{
+	ClusterSpaceStructureChange change;
+	UT_ASSERT(completion == (ClusterKoCompletionV2 *)&ko_handle);
+	UT_ASSERT_EQ(locked, 3);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(space_readbacks, 2);
+	UT_ASSERT_EQ(space_syncs, 1);
+	UT_ASSERT_EQ(unlink_calls, 0); /* SPACE completion is not an unlink result. */
+	UT_ASSERT(cluster_space_structure_wal_decode(wal, length, &change));
+	UT_ASSERT_EQ(binding->record_end, PageGetLSN(page.data));
+	UT_ASSERT_EQ(binding->version.mutation_token, change.identity.result_token);
+	UT_ASSERT_EQ(binding->flags, CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
+	UT_ASSERT(memcmp(binding->version.segment_incarnation, change.identity.result.incarnation, 16) == 0);
+	space_observe_calls++;
+	if (observation_fault == 4)
+		return false;
+	space_observations++;
+	return true;
+}
+
+bool
+cluster_ko_shared_observe_truncate_v2(ClusterKoCompletionV2 *completion)
+{
+	UT_ASSERT(completion == (ClusterKoCompletionV2 *)&ko_handle);
+	UT_ASSERT(truncate_owner && !drop_owner);
+	UT_ASSERT_EQ(locked, 3);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(space_observations, 1);
+	UT_ASSERT_EQ(space_readbacks, 2);
+	UT_ASSERT_EQ(relation_flushes, 1);
+	UT_ASSERT_EQ(truncate_calls, 1);
+	UT_ASSERT_EQ(shrink_syncs, auxiliary_forks ? 3 : 1);
+	UT_ASSERT_EQ(main_blocks, 4);
+	truncate_observations++;
 	return true;
 }
 
@@ -808,6 +908,39 @@ cluster_ko_flush_and_wait_ack(RelFileLocator tag, char persistence)
 	if (!RelFileLocatorEquals(tag, locator) || persistence != RELPERSISTENCE_PERMANENT)
 		abort();
 	ko_calls++;
+	if (cluster_shared_config) {
+		ClusterSpaceIdentity identity;
+		uint64 token;
+		memset(&ko_key, 0, sizeof(ko_key));
+		ko_key.locator = tag;
+		ko_key.system_identifier = ref.claim.identity.system_identifier;
+		ko_key.database_incarnation = ref.claim.database_incarnation;
+		memcpy(ko_key.storage_uuid, ref.claim.identity.storage_uuid, 16);
+		ko_pending = cluster_space_identity_page_decode(page.data, BLCKSZ,
+			SPACE_FORKNUM, 0, &ko_key, &identity, &token);
+		if (ko_pending)
+			memcpy(ko_incarnation, identity.incarnation, 16);
+	}
+}
+
+bool
+cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key,
+	const uint8 incarnation[16], ClusterKoCompletionV2 **out)
+{
+	ko_claims++;
+	UT_ASSERT(CritSectionCount == 0);
+	UT_ASSERT_EQ(wal_calls + dirty_calls + truncate_calls + unlink_calls, 0);
+	if (!ko_pending || ko_claim_unavailable || key == NULL || incarnation == NULL
+		|| out == NULL || *out != NULL
+		|| !RelFileLocatorEquals(key->locator, ko_key.locator)
+		|| key->system_identifier != ko_key.system_identifier
+		|| key->database_incarnation != ko_key.database_incarnation
+		|| memcmp(key->storage_uuid, ko_key.storage_uuid, 16) != 0
+		|| memcmp(incarnation, ko_incarnation, 16) != 0)
+		return false;
+	ko_pending = false;
+	*out = (ClusterKoCompletionV2 *)&ko_handle;
+	return true;
 }
 int
 errmsg(const char *fmt, ...)
@@ -1041,6 +1174,10 @@ reset(void)
 	auxiliary_forks = false;
 	nest_level = 1;
 	ko_calls = 0;
+	ko_claims = 0;
+	ko_pending = ko_claim_unavailable = false;
+	space_observe_calls = space_observations = observation_reads = observation_fault = 0;
+	truncate_observations = 0;
 	current_ref_reads = restart_ref_reads = 0;
 	reject_current_ref = false;
 	next_token = 17;
@@ -1929,6 +2066,21 @@ UT_TEST(test_native_truncate_syncs_all_shrunken_forks_before_identity)
 	FreeFakeRelcacheEntry(rel);
 }
 
+UT_TEST(test_native_truncate_effect_follows_original_sync_and_space_readback)
+{
+	for (unsigned aux = 0; aux < 2; aux++) {
+		Relation rel = native_truncate_relation();
+
+		auxiliary_forks = aux;
+		RelationTruncate(rel, 4);
+		UT_ASSERT_EQ(truncate_observations, 1);
+		UT_ASSERT_EQ(space_observations, 1);
+		UT_ASSERT_EQ(shrink_syncs, aux ? 3 : 1);
+		UT_ASSERT(!locked && !pinned);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
 UT_TEST(test_native_truncate_failed_sync_does_not_publish_identity)
 {
 	for (int fork = MAIN_FORKNUM; fork <= VISIBILITYMAP_FORKNUM; fork++) {
@@ -1950,6 +2102,7 @@ UT_TEST(test_native_truncate_failed_sync_does_not_publish_identity)
 		PG_END_TRY();
 		UT_ASSERT(caught);
 		UT_ASSERT_EQ(shrink_syncs, fork + 1);
+		UT_ASSERT_EQ(truncate_observations, 0);
 		UT_ASSERT_EQ(main_blocks, 4);
 		UT_ASSERT_EQ(truncate_calls, 1);
 		UT_ASSERT_EQ(invalidations, 0);
@@ -1975,6 +2128,7 @@ UT_TEST(test_native_truncate_persists_new_space_before_exposing_incarnation)
 	UT_ASSERT_EQ(space_syncs, 1);
 	UT_ASSERT_EQ(space_readbacks, 2);
 	UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, registered_len, &change));
+	UT_ASSERT_EQ(space_observations, 1);
 	UT_ASSERT(cluster_space_identity_page_decode(written_space[0].data, BLCKSZ, SPACE_FORKNUM, 0,
 												 &change.identity.result.key, &identity, &token));
 	UT_ASSERT_EQ(token, change.identity.result_token);
@@ -2041,6 +2195,7 @@ UT_TEST(test_native_truncate_readback_requires_every_exact_page)
 			UT_ASSERT_EQ(space_flushes, 2);
 			UT_ASSERT_EQ(space_syncs, 1);
 			UT_ASSERT_EQ(main_blocks, 4);
+			UT_ASSERT_EQ(space_observations, fault < 0 ? 1 : 0);
 			if (fault < 0) {
 				UT_ASSERT_EQ(pinned | locked, 0);
 				UT_ASSERT_EQ(invalidations, 1);
@@ -2068,6 +2223,8 @@ UT_TEST(test_native_truncate_readback_io_error_keeps_original_owner)
 		UT_ASSERT(caught);
 		UT_ASSERT_EQ(reported_level, PANIC);
 		UT_ASSERT_EQ(space_readbacks, block + 1);
+		UT_ASSERT_EQ(space_observe_calls, 0);
+		UT_ASSERT_EQ(truncate_observations, 0);
 		UT_ASSERT_EQ(invalidations, 0);
 		UT_ASSERT_EQ(pinned, 3);
 		UT_ASSERT_EQ(locked, 3);
@@ -2237,6 +2394,15 @@ emit_drop_commit(ClusterSpaceDropState *state, const RelFileLocator *deletes, in
 		0, NULL, 0, NULL, false, 0, InvalidTransactionId, NULL, InvalidScn, NULL, data, len);
 }
 
+/* Direct commit fixtures include the native pre-commit object barrier.
+ * Its opaque owner matching is exercised by test_cluster_ko_stop. */
+static ClusterSpaceDropState *
+prepare_original_drop(const RelFileLocator *deletes, int count)
+{
+	cluster_ko_flush_and_wait_ack(locator, RELPERSISTENCE_PERMANENT);
+	return cluster_space_drop_prepare(deletes, count);
+}
+
 UT_TEST(test_drop_pair_stays_live_until_native_commit_is_durable)
 {
 	Relation rel = native_truncate_relation();
@@ -2250,7 +2416,7 @@ UT_TEST(test_drop_pair_stays_live_until_native_commit_is_durable)
 
 	drop_owner = true;
 	memcpy(saved, pages, sizeof(saved));
-	state = cluster_space_drop_prepare(deletes, 2);
+	state = prepare_original_drop(deletes, 2);
 	UT_ASSERT(state != NULL);
 	if (state == NULL) { FreeFakeRelcacheEntry(rel); return; }
 	UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
@@ -2283,6 +2449,7 @@ UT_TEST(test_drop_pair_stays_live_until_native_commit_is_durable)
 	UT_ASSERT_EQ(space_syncs, 1);
 	UT_ASSERT_EQ(space_readbacks, 2);
 	UT_ASSERT_EQ(fork_syncs, 1);
+	UT_ASSERT_EQ(space_observations, 1);
 	UT_ASSERT(!locked && !pinned);
 	FreeFakeRelcacheEntry(rel);
 }
@@ -2298,7 +2465,7 @@ UT_TEST(test_drop_precommit_failure_or_abandonment_preserves_live_pages)
 		if (corrupt)
 			pages[1].data[BLCKSZ - 1] = 1;
 		memcpy(saved, pages, sizeof(saved));
-		state = cluster_space_drop_prepare(&locator, 1);
+		state = prepare_original_drop(&locator, 1);
 		UT_ASSERT((state != NULL) == !corrupt);
 		if (state != NULL)
 			cluster_space_drop_finish(state);
@@ -2316,7 +2483,7 @@ publish_drop_for_finish(void)
 	ClusterSpaceDropState *state;
 
 	drop_owner = true;
-	state = cluster_space_drop_prepare(&locator, 1);
+	state = prepare_original_drop(&locator, 1);
 	if (state == NULL)
 		abort();
 	START_CRIT_SECTION();
@@ -2351,6 +2518,8 @@ UT_TEST(test_native_drop_durable_finish_io_failure_keeps_original_owner)
 		UT_ASSERT_EQ(space_flushes, failure < 2 ? failure + 1 : 2);
 		UT_ASSERT_EQ(space_syncs, failure >= 2 ? 1 : 0);
 		UT_ASSERT_EQ(space_readbacks, failure >= 3 ? failure - 2 : 0);
+		UT_ASSERT_EQ(space_observe_calls, 0);
+		UT_ASSERT_EQ(truncate_observations, 0);
 		UT_ASSERT_EQ(release_calls, releases);
 		UT_ASSERT_EQ(pinned, 3);
 		UT_ASSERT_EQ(locked, 3);
@@ -2384,6 +2553,7 @@ UT_TEST(test_native_drop_durable_finish_requires_each_exact_page)
 			UT_ASSERT_EQ(space_flushes, 2);
 			UT_ASSERT_EQ(space_syncs, 1);
 			UT_ASSERT_EQ(space_readbacks, fault < 0 ? 2 : block + 1);
+			UT_ASSERT_EQ(space_observations, fault < 0 ? 1 : 0);
 			UT_ASSERT_EQ(unlink_calls + truncate_calls + invalidations, 0);
 			if (fault < 0)
 				UT_ASSERT_EQ(pinned | locked, 0);
@@ -2392,6 +2562,30 @@ UT_TEST(test_native_drop_durable_finish_requires_each_exact_page)
 				UT_ASSERT_EQ(pinned, 3);
 				UT_ASSERT_EQ(locked, 3);
 			}
+			FreeFakeRelcacheEntry(rel);
+		}
+	}
+}
+
+UT_TEST(test_native_structure_observation_needs_attribution_and_stable_native_flush)
+{
+	for (unsigned drop = 0; drop < 2; drop++) {
+		for (unsigned fault = 0; fault < 5; fault++) {
+			Relation rel = native_truncate_relation();
+			observation_fault = fault;
+			if (fault == 1)
+				capture_result = CLUSTER_PAGE_WAL_UNATTRIBUTED;
+			if (drop) {
+				ClusterSpaceDropState *state = publish_drop_for_finish();
+				cluster_space_drop_finish(state);
+			} else
+				RelationTruncate(rel, 4);
+			UT_ASSERT_EQ(space_readbacks, 2);
+			UT_ASSERT_EQ(space_observe_calls, fault == 0 || fault == 4 ? 1 : 0);
+			UT_ASSERT_EQ(space_observations, fault == 0 ? 1 : 0);
+			UT_ASSERT_EQ(truncate_observations, !drop && fault == 0 ? 1 : 0);
+			UT_ASSERT_EQ(pinned | locked, 0);
+			UT_ASSERT_EQ(reported_level, 0);
 			FreeFakeRelcacheEntry(rel);
 		}
 	}
@@ -2455,7 +2649,7 @@ drop_replay_record(XLogReaderState *reader, DecodedXLogRecord *decoded)
 	ClusterSpaceDropState *state;
 
 	drop_owner = true;
-	state = cluster_space_drop_prepare(&locator, 1);
+	state = prepare_original_drop(&locator, 1);
 	if (state == NULL)
 		abort();
 	START_CRIT_SECTION();
@@ -2719,7 +2913,7 @@ UT_TEST(test_native_commit_optional_tail_and_bounded_parser)
 	const char *data;
 
 	drop_owner = true;
-	state = cluster_space_drop_prepare(&locator, 1);
+	state = prepare_original_drop(&locator, 1);
 	UT_ASSERT(state != NULL);
 	if (state == NULL) { FreeFakeRelcacheEntry(rel); return; }
 	data = cluster_space_drop_wal(state, &len);
@@ -2783,13 +2977,63 @@ UT_TEST(test_native_prepared_commit_preserves_empty_gid)
 	FreeFakeRelcacheEntry(rel);
 }
 
+UT_TEST(test_truncate_lost_original_ko_refuses_before_structural_change)
+{
+	Relation rel = native_truncate_relation();
+	PGAlignedBlock saved[2];
+	volatile bool caught = false;
+	uint64 token_before = next_token;
+
+	memcpy(saved, pages, sizeof(saved));
+	ko_claim_unavailable = true;
+	expecting_error = true;
+	PG_TRY(); { RelationTruncate(rel, 4); }
+	PG_CATCH(); { caught = true; } PG_END_TRY();
+	expecting_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(ko_calls, 1);
+	UT_ASSERT_EQ(ko_claims, 1);
+	UT_ASSERT_EQ(wal_calls + dirty_calls + truncate_calls + unlink_calls, 0);
+	UT_ASSERT_EQ(next_token, token_before);
+	UT_ASSERT_EQ(pinned | locked, 0);
+	UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_drop_missing_or_replaced_original_ko_refuses_before_structural_change)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		Relation rel = native_truncate_relation();
+		ClusterSpaceDropState *state;
+		PGAlignedBlock saved[2];
+		uint64 token_before = next_token;
+		drop_owner = true;
+		memcpy(saved, pages, sizeof(saved));
+		if (fault != 0) {
+			cluster_ko_flush_and_wait_ack(locator, RELPERSISTENCE_PERMANENT);
+			if (fault == 1) ko_incarnation[0] ^= 1;
+			else ko_key.storage_uuid[0] ^= 1;
+		}
+		state = cluster_space_drop_prepare(&locator, 1);
+		UT_ASSERT(state == NULL);
+		if (state != NULL) cluster_space_drop_finish(state);
+		UT_ASSERT_EQ(ko_claims, 1);
+		UT_ASSERT_EQ(wal_calls + dirty_calls + truncate_calls + unlink_calls, 0);
+		UT_ASSERT_EQ(next_token, token_before);
+		UT_ASSERT_EQ(pinned | locked, 0);
+		UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(57);
+	UT_PLAN(61);
 	UT_RUN(test_native_drop_durable_finish_io_failure_keeps_original_owner);
 	UT_RUN(test_native_drop_durable_finish_requires_each_exact_page);
+	UT_RUN(test_native_structure_observation_needs_attribution_and_stable_native_flush);
 	UT_RUN(test_cold_physical_truncate_touches_only_named_forks);
 	UT_RUN(test_cold_physical_truncate_leaves_already_short_forks_alone);
 	UT_RUN(test_native_truncate_persists_new_space_before_exposing_incarnation);
@@ -2831,8 +3075,11 @@ main(void)
 	UT_RUN(test_private_owner_requires_exact_range_and_releases_hw);
 	UT_RUN(test_private_owner_releases_hw_on_wal_flush_error);
 	UT_RUN(test_native_truncate_logs_pair_after_durable_base_before_publish);
+	UT_RUN(test_truncate_lost_original_ko_refuses_before_structural_change);
+	UT_RUN(test_drop_missing_or_replaced_original_ko_refuses_before_structural_change);
 	UT_RUN(test_native_truncate_bad_pair_refuses_before_physical_change);
 	UT_RUN(test_native_truncate_syncs_all_shrunken_forks_before_identity);
+	UT_RUN(test_native_truncate_effect_follows_original_sync_and_space_readback);
 	UT_RUN(test_native_truncate_failed_sync_does_not_publish_identity);
 	UT_RUN(test_native_truncate_without_shared_space_keeps_original_sync_policy);
 	UT_RUN(test_drop_pair_stays_live_until_native_commit_is_durable);

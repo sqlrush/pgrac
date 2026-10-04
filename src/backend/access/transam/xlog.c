@@ -6164,12 +6164,27 @@ CheckRequiredParameterValues(void)
 static void
 ClusterStartupConfigurationRequire(void)
 {
+	ClusterFormationWitnessResult last_proof = CLUSTER_FORMATION_WITNESS_READY;
+
 	for (;;) {
 		ClusterConfigMountResult result;
+		ClusterFormationWitnessResult proof;
 		HandleStartupProcInterrupts();
 		CHECK_FOR_INTERRUPTS();
 		ResetLatch(MyLatch);
-		result = cluster_config_members_mount_status();
+		/* The finite phase-3 witness may expire before configuration or native
+		 * writer installation finishes. Renew it here under the actual startup
+		 * owner, outside CF/WAL critical sections; LMON performs no disk read. */
+		proof = cluster_authority_startup_refresh_recovery(100);
+		if (proof != last_proof) {
+			ereport(LOG, (errmsg("native startup control proof changed"),
+						 errdetail("PGRAC_FAMILY=STARTUP_CONTROL operation=config_mount "
+								   "witness_result=%d readiness=%d", (int)proof,
+								   (int)cluster_authority_readiness_get())));
+			last_proof = proof;
+		}
+		result = proof == CLUSTER_FORMATION_WITNESS_READY
+					 ? cluster_config_members_mount_status() : CLUSTER_CONFIG_MOUNT_UNPROVEN;
 		if (result == CLUSTER_CONFIG_MOUNT_MATCH)
 			return;
 		if (result == CLUSTER_CONFIG_MOUNT_MISMATCH)
@@ -6316,6 +6331,7 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 	ClusterWalStartupImage selected, routed;
 	ClusterControlRootResult result;
 	XLogRecPtr first = InvalidXLogRecPtr;
+	const char *operation = "route";
 
 	if (input == NULL || MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
 		|| !cluster_controlfile_shared_authority || !clusterStartupWriterSelected
@@ -6351,16 +6367,18 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& memcmp(&routed, &selected, sizeof(selected)) != 0)
 		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		operation = "prepare";
 		result = cluster_wal_writer_startup_prepare(&selected.claim.identity,
 													 selected.operation_uuid, &first);
+	}
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || first != selected.first_segment_lsn)
 		ereport(FATAL,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 				 errmsg("could not bind the native successor WAL stream"),
 				 errdetail(
-					 "PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_WAL_ROUTE_UNPROVEN result=%d",
-					 (int)result)));
+					 "PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_WAL_ROUTE_UNPROVEN operation=%s result=%d",
+					 operation, (int)result)));
 	clusterStartupWriter = selected;
 	clusterStartupWriterBound = true;
 	return first;
@@ -8329,6 +8347,20 @@ update_checkpoint_display(int flags, bool restartpoint, bool reset)
 
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: purpose-bound native checkpoint adapter. Author: SqlRush <sqlrush@gmail.com> */
+static bool
+ClusterStartupFileSync(void)
+{
+	ClusterWalWriterToken writer;
+	return MyBackendType == B_STARTUP && AmStartupProcess() && cluster_shared_config
+		&& clusterStartupWriterBound && !clusterStartupWriterInstalled
+		&& !LWLockHeldByMe(ControlFileLock) && !cluster_cf_held(ShareLock)
+		&& !cluster_cf_held(ExclusiveLock)
+		&& cluster_wal_writer_begin(clusterStartupWriter.timeline, &writer)
+			== CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& RequestStartupSync()
+		&& cluster_wal_writer_check(&writer) == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 static void
 ClusterStartupCheckpointPrepare(int flags, ControlFileData *selected)
 {
@@ -9708,7 +9740,13 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	{
 		uint64		pi_note_presync_seq = cluster_gcs_block_pi_note_presync_snapshot();
 
-		ProcessSyncRequests();
+		if (cluster_shared_config && MyBackendType == B_STARTUP) {
+			if (!ClusterStartupFileSync())
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						 errmsg("native startup file synchronization is unproven")));
+		} else
+			ProcessSyncRequests();
 		cluster_gcs_block_pi_note_confirm(pi_note_presync_seq);
 	}
 #else

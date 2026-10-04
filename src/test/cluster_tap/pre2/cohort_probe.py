@@ -148,6 +148,11 @@ def probe(args):
             path = Path(node['logfile'])
             if path.exists() and 'database system was shut down at' in path.read_text(errors='replace'):
                 result['steps']['StartupXLOG_node'+str(node['id'])] = 'PASS'
+        reached = sum(result['steps'].get('StartupXLOG_node'+str(node['id'])) == 'PASS'
+                      for node in nodes)
+        # Entry is diagnostic only: it cannot prove recovery completion or OPEN.
+        result['steps']['StartupXLOG'] = ('ENTRY_REACHED' if nodes and reached == len(nodes)
+                                         else 'ENTRY_PARTIAL' if reached else 'NOT_REACHED')
         try:
             cleanup(q, nodes, bindir)
         except Exception as error:

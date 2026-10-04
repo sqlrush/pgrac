@@ -209,6 +209,17 @@ sub entries
 }
 is_deeply(entries("$temp/valid-data/pg_undo"), [map { "instance_$_" } 0 .. 3],
 	'canonical shared UNDO contains the complete original owner directories');
+is_deeply(entries("$temp/valid-data/global/wal_history"), [map { "thread_$_" } 1 .. 4],
+	'original creator persists every configured retained-history namespace');
+for my $thread (1 .. 4)
+{
+	my $directory = "$temp/valid-data/global/wal_history/thread_$thread";
+	ok(-d $directory && !-l $directory && (stat($directory))[4] == $>
+		&& ((stat($directory))[2] & 0022) == 0, 'history namespace is an owned directory');
+	is_deeply(entries($directory), ['.staging'], 'creation does not fabricate retained history');
+	ok(-d "$directory/.staging" && !-l "$directory/.staging", 'history staging directory exists');
+	is_deeply(entries("$directory/.staging"), [], 'history staging starts empty');
+}
 for my $node (0 .. 3)
 {
 	my $directory = "$temp/valid-data/pg_undo/instance_$node";

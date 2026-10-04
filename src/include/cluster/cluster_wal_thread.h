@@ -197,6 +197,10 @@ cluster_wal_thread_dir_name(uint16 thread_id, char *buf, size_t buflen)
  * False until the exact initializer completes INSTALL and publishes the new
  * reference, or outside PRE2. Callers still need their runtime gates. */
 extern bool cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out);
+/* Exact never-served input qualification, available only after actual INSTALL
+ * and only in its original formation epoch. Does not grant runtime authority. */
+extern bool cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *expected,
+														  uint64 epoch);
 /* Immutable restart input, independent of the ordinary writer reference.
  * Reading this mirror never authorizes WAL insertion or serving. */
 extern bool cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out);

@@ -10617,6 +10617,22 @@ struct ClusterPageDataReceiptV1 {
 	bool space_terminal;
 };
 
+/* A structural receipt remains owned by the original completed KO slot.
+ * It is deliberately separate from DATA and cannot enter DATA prefix/GC APIs. */
+struct ClusterPageStructuralReceiptV2 {
+	uint64 magic;
+	ResourceOwner owner;
+	pid_t pid;
+	uint32 slot;
+	uint64 serial;
+	RfPageIdentityV1 page;
+	ClusterPageWalBindingV1 terminal;
+	ClusterSpaceStructureChange change;
+	ClusterPcmPiWriteCutV1 write_cut;
+	ClusterPcmPiStorageCutV1 storage_cut;
+	const ClusterThreadRecoveryFabricPlanV1 *plan;
+};
+
 struct ClusterPiPhysicalAckV1 {
 	uint64 magic;
 	ClusterPageDataReceiptV1 data;
@@ -10629,6 +10645,16 @@ struct ClusterPiPhysicalAckV1 {
 	ClusterWalInputsV1 *recovered_inputs;
 	ClusterWalSourceRef recovered_source;
 	uint64 membership_generation;
+};
+
+struct ClusterPiStructuralAckV2 {
+	uint64 magic;
+	ClusterPageStructuralReceiptV2 structural;
+	ClusterWalWriterToken writer;
+	ClusterWalInputsV1 *inputs;
+	ResourceOwner owner;
+	pid_t pid;
+	int32 node;
 };
 
 /* Neither a tag nor a pin grants write authority. Check every live fence
@@ -11363,6 +11389,174 @@ cluster_page_structural_ancestor_v1(const ClusterPageWalBindingV1 *binding,
 	return false;
 }
 
+/* Identify the terminal old PAGE edge, then use the same complete-chain
+ * qualification as a specific physical PI. ABSENT/REPLACED cannot bypass
+ * this query merely because a descriptor is no longer resident. */
+static bool
+cluster_page_structural_page_covered(const ClusterPageWalBindingV1 *terminal,
+	const ClusterSpaceStructureChange *change, const RfPageIdentityV1 *identity,
+	const ClusterThreadRecoveryFabricPlanV1 *plan)
+{
+	const RfPageOnlinePlanV1 *page = cluster_thread_recovery_fabric_page_plan_v1(plan);
+	if (page == NULL || !rf_page_identity_valid_v1(identity)
+		|| (identity->forknum != MAIN_FORKNUM && identity->forknum != VISIBILITYMAP_FORKNUM))
+		return false;
+	for (uint32 i = 0; i < rf_page_online_plan_target_count_v1(page); i++) {
+		RfPageOnlineTargetViewV1 view;
+		const RfPageStableEdgeInputV1 *edge;
+		ClusterPageWalBindingV1 pi = {0};
+		if (!rf_page_online_plan_target_v1(page, i, &view))
+			return false;
+		if (!rf_page_identity_equal_v1(identity, &view.page_identity))
+			continue;
+		if (view.contributors == NULL || view.contributors->edge_count == 0)
+			return false;
+		edge = &view.contributors->edges[view.contributors->edge_count - 1];
+		if (memcmp(edge->edge.result_incarnation, change->identity.expected.incarnation, 16) != 0
+			|| !rf_page_online_plan_source_v1(page, edge->participant_index, &pi.source))
+			return false;
+		pi.identity = *identity;
+		memcpy(pi.version.segment_incarnation, edge->edge.result_incarnation, 16);
+		pi.version.mutation_token = edge->result_token;
+		pi.record_start = edge->record_identity.read_rec_ptr;
+		pi.record_end = edge->record_identity.end_rec_ptr;
+		pi.record_crc = edge->record_identity.record_crc;
+		pi.rmid = edge->record_identity.rmid;
+		pi.info = edge->record_identity.info;
+		pi.flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+		return cluster_page_structural_ancestor_v1(terminal, &pi, plan);
+	}
+	return false;
+}
+
+static bool
+cluster_page_structural_owner_current(const ClusterPageStructuralReceiptV2 *receipt)
+{
+	ClusterPageWalBindingV1 terminal;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], expected[sizeof(wal)];
+	return receipt != NULL && receipt->magic == UINT64_C(0x5047535452454332)
+		&& receipt->pid == getpid() && receipt->owner == CurrentResourceOwner
+		&& CurrentResourceOwner != NULL && CritSectionCount == 0
+		&& (MyBackendType == B_BG_WRITER || MyBackendType == B_CHECKPOINTER)
+		&& cluster_enabled && cluster_shared_config && !RecoveryInProgress()
+		&& receipt->plan != NULL
+		&& cluster_ko_shared_structure_observation_v2(receipt->slot, receipt->serial,
+			&terminal, wal, sizeof(wal))
+		&& memcmp(&terminal, &receipt->terminal, sizeof(terminal)) == 0
+		&& cluster_space_structure_wal_encode(&receipt->change, expected, sizeof(expected))
+		&& memcmp(wal, expected, sizeof(wal)) == 0;
+}
+
+bool
+cluster_page_structural_pi_proof_v2(const ClusterPageStructuralReceiptV2 *receipt,
+	ClusterPcmPiWriteCutV1 *write_cut, ClusterPcmPiStorageCutV1 *storage_cut)
+{
+	ClusterPcmPiWriteCutV1 x = {0};
+	ClusterPcmPiStorageCutV1 s = {0};
+	BufferTag tag;
+	if (write_cut == NULL || storage_cut == NULL || !cluster_page_structural_owner_current(receipt))
+		return false;
+	InitBufferTag(&tag, &receipt->page.locator, receipt->page.forknum, receipt->page.blockno);
+	if (receipt->write_cut.binding_generation != 0) {
+		if (!cluster_pcm_lock_pi_write_snapshot_v1(tag, &x)
+			|| !cluster_pcm_pi_write_cut_valid_v1(&x) || x.master_node != cluster_node_id
+			|| x.pi_holders_bitmap == 0 || !BufferTagsEqual(&tag, &x.holder.assertion.resource))
+			return false;
+	} else if (!cluster_pcm_lock_pi_storage_snapshot_v1(tag, &s)
+		|| !cluster_pcm_pi_storage_cut_valid_v1(&s) || s.master_node != cluster_node_id
+		|| s.pi_holders_bitmap == 0 || !BufferTagsEqual(&tag, &s.resource))
+		return false;
+	if (memcmp(&x, &receipt->write_cut, sizeof(x)) != 0
+		|| memcmp(&s, &receipt->storage_cut, sizeof(s)) != 0)
+		return false;
+	*write_cut = x;
+	*storage_cut = s;
+	return true;
+}
+
+bool
+cluster_page_structural_from_ko_v2(uint32 slot, uint64 serial,
+	const RfPageIdentityV1 *page, const ClusterThreadRecoveryFabricPlanV1 *plan,
+	ClusterPageStructuralReceiptV2 **out)
+{
+	ClusterPageStructuralReceiptV2 value = {0}, *receipt;
+	ClusterPcmPiWriteCutV1 x;
+	ClusterPcmPiStorageCutV1 s;
+	ClusterSpaceStructureChange decoded;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], actual[sizeof(wal)];
+	BufferTag tag;
+	if (out == NULL || *out != NULL || !rf_page_identity_valid_v1(page)
+		|| (page->forknum != MAIN_FORKNUM && page->forknum != VISIBILITYMAP_FORKNUM)
+		|| !cluster_ko_shared_structure_observation_v2(slot, serial, &value.terminal, wal, sizeof(wal))
+		|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &decoded)
+		|| decoded.identity.action != CLUSTER_SPACE_WAL_TRUNCATE
+		|| !cluster_page_structural_record_v1(&value.terminal, decoded.identity.expected.incarnation,
+			plan, &value.change)
+		|| !cluster_space_structure_wal_encode(&value.change, actual, sizeof(actual))
+		|| memcmp(wal, actual, sizeof(wal)) != 0
+		|| !cluster_page_structural_page_covered(&value.terminal, &value.change, page, plan))
+		return false;
+	value.magic = UINT64_C(0x5047535452454332);
+	value.owner = CurrentResourceOwner;
+	value.pid = getpid();
+	value.slot = slot;
+	value.serial = serial;
+	value.page = *page;
+	value.plan = plan;
+	InitBufferTag(&tag, &page->locator, page->forknum, page->blockno);
+	if (!cluster_pcm_lock_pi_write_snapshot_v1(tag, &value.write_cut)
+		&& !cluster_pcm_lock_pi_storage_snapshot_v1(tag, &value.storage_cut))
+		return false;
+	if (!cluster_page_structural_pi_proof_v2(&value, &x, &s))
+		return false;
+	receipt = palloc(sizeof(*receipt));
+	*receipt = value;
+	*out = receipt;
+	return true;
+}
+
+bool
+cluster_page_structural_pi_fact_v2(const ClusterPageStructuralReceiptV2 *receipt,
+	int32 peer, struct ClusterPiWritebackFactV2 *out)
+{
+	ClusterPiWritebackFactV2 fact;
+	ClusterPcmPiWriteCutV1 x;
+	ClusterPcmPiStorageCutV1 s;
+	uint8 actual[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], expected[sizeof(actual)];
+	uint32 cursor, holders;
+	uint64 serial;
+	if (out == NULL || peer < 0 || peer >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| peer == cluster_node_id || !cluster_page_structural_pi_proof_v2(receipt, &x, &s))
+		return false;
+	holders = x.binding_generation != 0 ? x.pi_holders_bitmap : s.pi_holders_bitmap;
+	cursor = receipt->slot;
+	if ((holders & ((uint32)1u << peer)) == 0
+		|| !cluster_ko_shared_structure_offer_next_v2(&cursor, peer, &serial, &fact)
+		|| cursor != receipt->slot + 1 || serial != receipt->serial
+		|| fact.kind != CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2
+		|| memcmp(&fact.proof.structural.terminal.binding, &receipt->terminal,
+			sizeof(receipt->terminal)) != 0
+		|| !cluster_space_structure_wal_encode(&fact.proof.structural.change, actual, sizeof(actual))
+		|| !cluster_space_structure_wal_encode(&receipt->change, expected, sizeof(expected))
+		|| memcmp(actual, expected, sizeof(actual)) != 0)
+		return false;
+	fact.kind = CLUSTER_PI_WRITEBACK_STRUCTURAL_V2;
+	fact.proof.structural.terminal.write_cut = x;
+	fact.proof.structural.terminal.storage_cut = s;
+	*out = fact;
+	return true;
+}
+
+void
+cluster_page_structural_receipt_free_v2(ClusterPageStructuralReceiptV2 **receipt)
+{
+	if (receipt == NULL || *receipt == NULL)
+		return;
+	explicit_bzero(*receipt, sizeof(**receipt));
+	pfree(*receipt);
+	*receipt = NULL;
+}
+
 bool
 cluster_page_data_bind_plan_v1(ClusterPageDataReceiptV1 *receipt,
 							   const ClusterThreadRecoveryFabricPlanV1 *plan)
@@ -11825,6 +12019,70 @@ cluster_pi_physical_unfenced_locked(BufferDesc *buf, uint32 state)
 		   && cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0;
 }
 
+ClusterPiPhysicalResultV1
+cluster_bufmgr_discard_pi_at_structure_v2(const ClusterPageStructuralReceiptV2 *receipt)
+{
+	ClusterPcmPiWriteCutV1 x_cut;
+	ClusterPcmPiStorageCutV1 storage_cut;
+	ClusterPageWalBindingV1 pi, reobserved;
+	BufferTag tag;
+	BufferDesc *buf;
+	LWLock *partition;
+	uint64 generation;
+	uint32 hash, state;
+	int id;
+	bool valid;
+	ClusterPiPhysicalResultV1 result = CLUSTER_PI_PHYSICAL_RETRY;
+
+	/* Whole-chain qualification also gates ABSENT/REPLACED. A missing old
+	 * descriptor cannot stand in for retained ancestry or the actual native
+	 * structural completion. No directory responsibility is retired here. */
+	if (!cluster_page_structural_pi_proof_v2(receipt, &x_cut, &storage_cut)
+		|| !cluster_page_structural_page_covered(&receipt->terminal, &receipt->change,
+			&receipt->page, receipt->plan))
+		return result;
+	InitBufferTag(&tag, &receipt->page.locator, receipt->page.forknum, receipt->page.blockno);
+	hash = BufTableHashCode(&tag);
+	partition = BufMappingPartitionLock(hash);
+	LWLockAcquire(partition, LW_SHARED);
+	id = BufTableLookup(&tag, hash);
+	if (id < 0) {
+		LWLockRelease(partition);
+		return CLUSTER_PI_PHYSICAL_ABSENT;
+	}
+	buf = GetBufferDescriptor(id);
+	state = LockBufHdr(buf);
+	generation = cluster_pcm_own_gen_get(id);
+	valid = BufferTagsEqual(&buf->tag, &tag) && cluster_pi_physical_unfenced_locked(buf, state);
+	if (valid && cluster_bufmgr_pcm_current_image_locked(buf, state)) {
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		return CLUSTER_PI_PHYSICAL_REPLACED;
+	}
+	valid = valid && cluster_page_wal_pi_snapshot_locked_v1(buf, &pi);
+	UnlockBufHdr(buf, state);
+	LWLockRelease(partition);
+	if (!valid || !cluster_page_structural_ancestor_v1(&receipt->terminal, &pi, receipt->plan))
+		return result;
+
+	/* Reuse the native invalidation commit owner under its final mapping
+	 * and header locks. A concurrent same-tag install, pin or mutation must
+	 * preserve the replacement and leave retirement to a later exact cut. */
+	LWLockAcquire(partition, LW_EXCLUSIVE);
+	state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag) || cluster_pcm_own_gen_get(id) != generation
+		|| !cluster_pi_physical_unfenced_locked(buf, state)
+		|| !cluster_page_wal_pi_snapshot_locked_v1(buf, &reobserved)
+		|| memcmp(&pi, &reobserved, sizeof(pi)) != 0) {
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		return result;
+	}
+	if (InvalidateBufferCommitLocked(buf, &tag, hash, partition, state))
+		result = CLUSTER_PI_PHYSICAL_DISCARDED;
+	return result;
+}
+
 bool
 cluster_page_data_covers_local_pi_v1(const ClusterPageDataReceiptV1 *receipt,
 									 const RfPageOnlinePlanV1 *plan,
@@ -11859,6 +12117,30 @@ cluster_page_data_covers_local_pi_v1(const ClusterPageDataReceiptV1 *receipt,
 		   && cluster_page_wal_binding_shape_v1(&local->last)
 		   && cluster_page_data_covers_pi(receipt, plan, sources, source_count, &local->first)
 		   && cluster_page_data_covers_pi(receipt, plan, sources, source_count, &local->last);
+}
+
+bool
+cluster_page_structural_covers_local_pi_v2(const ClusterPageStructuralReceiptV2 *receipt,
+	const ClusterPcmLocalPiSnapshotV1 *local)
+{
+	static const ClusterPageWalBindingV1 empty = {0};
+	ClusterPcmPiWriteCutV1 x_cut;
+	ClusterPcmPiStorageCutV1 storage_cut;
+	BufferTag tag;
+	bool first_empty, last_empty;
+	if (local == NULL || !cluster_page_structural_pi_proof_v2(receipt, &x_cut, &storage_cut))
+		return false;
+	InitBufferTag(&tag, &receipt->page.locator, receipt->page.forknum, receipt->page.blockno);
+	if (!BufferTagsEqual(&tag, &local->resource) || local->binding_generation == UINT64_MAX
+		|| local->revision == UINT64_MAX)
+		return false;
+	first_empty = memcmp(&local->first, &empty, sizeof(empty)) == 0;
+	last_empty = memcmp(&local->last, &empty, sizeof(empty)) == 0;
+	if (first_empty || last_empty)
+		return first_empty && last_empty;
+	return local->binding_generation != 0 && local->revision != 0
+		&& cluster_page_structural_ancestor_v1(&receipt->terminal, &local->first, receipt->plan)
+		&& cluster_page_structural_ancestor_v1(&receipt->terminal, &local->last, receipt->plan);
 }
 
 static bool
@@ -11972,6 +12254,130 @@ cluster_pi_ack_local_writer(ClusterWalWriterToken *out)
 		   && cluster_wal_writer_begin(source.timeline, out) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		   && out->startup_first_lsn == InvalidXLogRecPtr
 		   && cluster_page_data_source_same(&source, &out->ref);
+}
+
+static bool
+cluster_page_structural_ack_inputs_current(const ClusterPageStructuralReceiptV2 *receipt,
+	ClusterWalInputsV1 *inputs, const ClusterWalWriterToken *writer)
+{
+	const RfPageOnlinePlanV1 *page;
+	uint32 count;
+	bool found = false;
+	bool matched[CLUSTER_WAL_INPUTS_MAX] = {false};
+	if (inputs == NULL || receipt == NULL || receipt->plan == NULL)
+		return false;
+	count = cluster_thread_recovery_fabric_participant_count_v1(receipt->plan);
+	page = cluster_thread_recovery_fabric_page_plan_v1(receipt->plan);
+	if (count == 0 || count > CLUSTER_WAL_INPUTS_MAX || page == NULL
+		|| count != cluster_wal_inputs_count_v1(inputs))
+		return false;
+	/* The input owner sorts contribution streams by thread/boot, which need
+	 * not be ROOT selection order. Match each full source exactly once; no
+	 * omitted source or copied subset can certify an absent PI. */
+	for (uint32 i = 0; i < count; i++) {
+		ClusterWalSourceRef source;
+		bool selected = false;
+		if (!rf_page_online_plan_source_v1(page, i, &source))
+			return false;
+		for (uint32 j = 0; j < count; j++) {
+			const ClusterWalInputV1 *input = cluster_wal_inputs_at_v1(inputs, j);
+			if (input == NULL)
+				return false;
+			if (!matched[j] && memcmp(&source, &input->source, sizeof(source)) == 0) {
+				matched[j] = selected = true;
+				break;
+			}
+		}
+		if (!selected)
+			return false;
+		if (source.claim.identity.origin_node_id != cluster_node_id)
+			continue;
+		if (source.claim.identity.origin_owner_incarnation
+				!= writer->ref.claim.identity.origin_owner_incarnation
+			&& !cluster_wal_inputs_local_predecessor_retired_v1(inputs, &source, &writer->ref))
+			return false;
+		if (cluster_page_data_source_covered_by(&writer->ref, &source))
+			found = true;
+	}
+	return found && cluster_wal_inputs_revalidate_v1(inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+bool
+cluster_page_structural_pi_ack_read_v2(const ClusterPiStructuralAckV2 *ack,
+	const ClusterPageStructuralReceiptV2 *receipt, int32 *out_node)
+{
+	ClusterWalWriterToken current;
+	ClusterPcmPiWriteCutV1 x;
+	ClusterPcmPiStorageCutV1 s;
+	if (out_node != NULL)
+		*out_node = -1;
+	if (ack == NULL || receipt == NULL || out_node == NULL
+		|| ack->magic != UINT64_C(0x5047535441434b32) || ack->pid != getpid()
+		|| ack->owner != CurrentResourceOwner || ack->node != cluster_node_id
+		|| memcmp(&ack->structural, receipt, sizeof(*receipt)) != 0
+		|| !cluster_pi_ack_local_writer(&current)
+		|| memcmp(&ack->writer, &current, sizeof(current)) != 0
+		|| !cluster_page_structural_pi_proof_v2(receipt, &x, &s)
+		|| !cluster_page_structural_ack_inputs_current(receipt, ack->inputs, &current))
+		return false;
+	*out_node = ack->node;
+	return true;
+}
+
+void
+cluster_page_structural_pi_ack_free_v2(ClusterPiStructuralAckV2 **ack)
+{
+	if (ack == NULL || *ack == NULL)
+		return;
+	explicit_bzero(*ack, sizeof(**ack));
+	pfree(*ack);
+	*ack = NULL;
+}
+
+bool
+cluster_bufmgr_ack_pi_at_structure_v2(const ClusterPageStructuralReceiptV2 *receipt,
+	ClusterWalInputsV1 *inputs, ClusterPiStructuralAckV2 **out)
+{
+	ClusterWalWriterToken writer, after;
+	ClusterPcmPiWriteCutV1 x;
+	ClusterPcmPiStorageCutV1 s;
+	ClusterPcmLocalPiSnapshotV1 local;
+	ClusterPiStructuralAckV2 *ack;
+	ClusterPiPhysicalResultV1 physical;
+	BufferTag tag;
+	uint32 holders;
+	if (out == NULL || *out != NULL || !cluster_pi_ack_local_writer(&writer)
+		|| !cluster_page_structural_pi_proof_v2(receipt, &x, &s)
+		|| !cluster_page_structural_ack_inputs_current(receipt, inputs, &writer))
+		return false;
+	holders = x.binding_generation != 0 ? x.pi_holders_bitmap : s.pi_holders_bitmap;
+	if ((holders & ((uint32)1u << cluster_node_id)) == 0)
+		return false;
+	InitBufferTag(&tag, &receipt->page.locator, receipt->page.forknum, receipt->page.blockno);
+	if (!cluster_pcm_local_pi_snapshot_v1(tag, &local)
+		|| !cluster_page_structural_covers_local_pi_v2(receipt, &local))
+		return false;
+	physical = cluster_bufmgr_discard_pi_at_structure_v2(receipt);
+	if ((physical != CLUSTER_PI_PHYSICAL_ABSENT && physical != CLUSTER_PI_PHYSICAL_REPLACED
+		 && physical != CLUSTER_PI_PHYSICAL_DISCARDED)
+		|| !cluster_pi_ack_local_writer(&after) || memcmp(&writer, &after, sizeof(writer)) != 0)
+		return false;
+	ack = palloc0(sizeof(*ack));
+	ack->magic = UINT64_C(0x5047535441434b32);
+	ack->structural = *receipt;
+	ack->writer = writer;
+	ack->inputs = inputs;
+	ack->owner = CurrentResourceOwner;
+	ack->pid = getpid();
+	ack->node = cluster_node_id;
+	/* This original directory consumer rereads the ACK/input proof outside
+	 * entry-X, then compares the entire local snapshot under that lock. */
+	if (!cluster_pcm_local_pi_retire_structural_v2(&local, receipt, ack)) {
+		cluster_page_structural_pi_ack_free_v2(&ack);
+		return false;
+	}
+	*out = ack;
+	return true;
 }
 
 bool

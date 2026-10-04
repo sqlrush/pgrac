@@ -132,6 +132,21 @@ cluster_page_data_covers_local_pi_v1(const ClusterPageDataReceiptV1 *receipt pg_
 {
 	return false;
 }
+bool
+cluster_page_structural_covers_local_pi_v2(
+	const ClusterPageStructuralReceiptV2 *receipt pg_attribute_unused(),
+	const ClusterPcmLocalPiSnapshotV1 *local pg_attribute_unused())
+{
+	return false;
+}
+bool
+cluster_page_structural_pi_ack_read_v2(const ClusterPiStructuralAckV2 *ack pg_attribute_unused(),
+	const ClusterPageStructuralReceiptV2 *receipt pg_attribute_unused(), int32 *out_node)
+{
+	if (out_node != NULL)
+		*out_node = -1;
+	return false;
+}
 uint64
 cluster_ic_tier1_resource_x_stream_generation(int32 peer pg_attribute_unused(),
 											   int channel pg_attribute_unused())

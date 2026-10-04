@@ -60,7 +60,8 @@ typedef enum ClusterMarkerAsyncKind {
 	CLUSTER_MARKER_KIND_CLEAN_LEAVE_COMMITTED,
 	CLUSTER_MARKER_KIND_NODE_REMOVE_REMOVING,
 	CLUSTER_MARKER_KIND_NODE_REMOVE_SHRUNK,
-	CLUSTER_MARKER_KIND_NODE_REMOVE_REMOVED
+	CLUSTER_MARKER_KIND_NODE_REMOVE_REMOVED,
+	CLUSTER_MARKER_KIND_FORMATION_BASELINE
 } ClusterMarkerAsyncKind;
 
 typedef struct ClusterMarkerAsync {
@@ -104,6 +105,8 @@ cluster_marker_async_kind_name(ClusterMarkerAsyncKind kind)
 		return "node_remove_shrunk";
 	case CLUSTER_MARKER_KIND_NODE_REMOVE_REMOVED:
 		return "node_remove_removed";
+	case CLUSTER_MARKER_KIND_FORMATION_BASELINE:
+		return "formation_baseline";
 	case CLUSTER_MARKER_KIND_UNKNOWN:
 	default:
 		return "unknown";

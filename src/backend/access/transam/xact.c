@@ -177,6 +177,7 @@
 #include "cluster/cluster_reconfig.h"			  /* PGRAC: spec-5.15 §2.4 joiner write gate */
 #include "cluster/cluster_sf_dep.h"			  /* PGRAC: spec-6.2 Smart Fusion commit brake */
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_xnode_profile.h"	  /* PGRAC: spec-7.4 D0 commit census probes */
 #include "cluster/storage/cluster_undo_xlog.h" /* PGRAC: spec-3.18 D4.1 TT fold redo stamp */
 #endif
@@ -2969,6 +2970,12 @@ CommitTransaction(void)
 	 * attempt to access affected files.
 	 */
 	smgrDoPendingDeletes(true);
+#ifdef USE_PGRAC_CLUSTER
+	/* Native KO observations span the actual postcommit storage owner. The
+	 * return above is not a durability receipt; cancel the local handles
+	 * before their original transaction context is destroyed. */
+	cluster_ko_shared_postcommit_cleanup_v2();
+#endif
 
 	/*
 	 * Send out notification signals to other backends (and do other

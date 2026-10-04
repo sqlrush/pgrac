@@ -23,6 +23,7 @@
 #include "../../backend/cluster/cluster_control_root_private.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
+#include "postmaster/bgwriter.h"
 #include "postmaster/startup.h"
 #include "storage/latch.h"
 #include "cluster/cluster_config_members.h"
@@ -30,6 +31,7 @@
 #include "storage/fd.h"
 #include "storage/lwlock.h"
 #include "utils/wait_event.h"
+#include "utils/timestamp.h"
 #include "port/pg_crc32c.h"
 
 #undef printf
@@ -66,6 +68,15 @@ static ClusterControlRootResult returns[4];
 static ClusterWalStartupImage clusterStartupWriter;
 static bool clusterStartupWriterBound, clusterStartupWriterInstalled;
 static bool clusterStartupWriterSelected;
+static bool startup_sync_ok = true, startup_sync_change_epoch;
+static unsigned startup_sync_calls;
+
+ClusterFormationWitnessResult
+cluster_authority_startup_refresh_recovery(int timeout_ms)
+{
+	UT_ASSERT_EQ(timeout_ms, 100);
+	return CLUSTER_FORMATION_WITNESS_READY;
+}
 static unsigned startup_directory_calls;
 static bool directory_before_selection;
 BackendType MyBackendType = B_INVALID;
@@ -81,6 +92,32 @@ static bool restart_ok, route_ok, bind_ok, writer_read_ok, writer_read_changed;
 static ClusterControlRootResult advance_returns[4];
 static ClusterConfigMountResult mount_result;
 static unsigned mount_waits;
+int cluster_cssd_heartbeat_interval_ms = 1000, cluster_cssd_dead_deadband_factor = 5;
+static unsigned self_seal_calls;
+static ClusterControlRootResult self_seal_returns[4];
+
+TimestampTz GetCurrentTimestamp(void) { return 10000000; }
+bool TimestampDifferenceExceeds(TimestampTz start, TimestampTz end, int msec)
+{
+	return end - start >= (int64)msec * 1000;
+}
+
+/* The native adapter calls the real ROOT self-seal owner. Its quorum,
+ * durable tail and refusal semantics have independent ROOT/QVOTEC tests. */
+ClusterControlRootResult
+cluster_control_root_v3_self_seal_v1(const ClusterWalSourceRef *restart, uint64 min_dead_us,
+	ClusterControlRootSnapshot *out, ClusterControlRootReadToken *token)
+{
+	UT_ASSERT(cf_mode == NoLock && !local_lock && CritSectionCount == 0);
+	UT_ASSERT_EQ(memcmp(restart, &ref, sizeof(ref)), 0);
+	UT_ASSERT_EQ(min_dead_us, 5000000);
+	UT_ASSERT(!clusterStartupWriterSelected && !clusterStartupWriterBound);
+	UT_ASSERT_EQ(startup_directory_calls | advance_calls | route_calls | bind_calls, 0);
+	UT_ASSERT(self_seal_calls < lengthof(self_seal_returns));
+	memset(out, 0, sizeof(*out));
+	memset(token, 0, sizeof(*token));
+	return self_seal_returns[self_seal_calls++];
+}
 ClusterConfigMountResult
 cluster_config_members_mount_status(void)
 {
@@ -129,6 +166,11 @@ errmsg(const char *f pg_attribute_unused(), ...)
 }
 int
 errdetail(const char *f pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errhint(const char *f pg_attribute_unused(), ...)
 {
 	return 0;
 }
@@ -314,6 +356,33 @@ cluster_wal_writer_startup_matches(const ClusterControlRootIdentity *self, const
 		   && memcmp(self, &clusterStartupWriter.claim.identity, sizeof(*self)) == 0
 		   && memcmp(uuid, clusterStartupWriter.operation_uuid, 16) == 0
 		   && first == clusterStartupWriter.first_segment_lsn;
+}
+
+ClusterControlRootResult
+cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *writer)
+{
+	memset(writer, 0, sizeof(*writer));
+	writer->ref = ref;
+	writer->epoch = epoch;
+	return startup_binding_ok && fence_ok && timeline == clusterStartupWriter.timeline
+		? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+ClusterControlRootResult
+cluster_wal_writer_check(const ClusterWalWriterToken *writer)
+{
+	return writer->epoch == epoch && startup_binding_ok && fence_ok
+		? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+bool RequestStartupSync(void)
+{
+	UT_ASSERT_EQ(cf_mode, NoLock);
+	UT_ASSERT(!local_lock);
+	startup_sync_calls++;
+	if (startup_sync_change_epoch)
+		epoch++;
+	return startup_sync_ok;
 }
 
 ClusterControlRootResult
@@ -521,6 +590,9 @@ reset_fixture(void)
 	writer_read_changed = false;
 	mount_result = CLUSTER_CONFIG_MOUNT_MATCH;
 	mount_waits = 0;
+	self_seal_calls = 0;
+	for (unsigned i = 0; i < lengthof(self_seal_returns); i++)
+		self_seal_returns[i] = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 	InRecovery = ArchiveRecoveryRequested = false;
 }
 static bool
@@ -774,6 +846,29 @@ UT_TEST(startup_prepare_uses_only_bound_initializer_without_serving)
 	UT_ASSERT_EQ(candidate.checkPoint, 100);
 	UT_ASSERT_EQ(candidate.state, DB_SHUTDOWNED);
 	UT_ASSERT_EQ(reads | local_updates | native_writes, 0);
+}
+
+UT_TEST(startup_file_sync_rechecks_original_writer_and_keeps_native_owner)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		startup_fixture();
+		startup_sync_calls = 0;
+		startup_sync_ok = true;
+		startup_sync_change_epoch = false;
+		switch (fault) {
+		case 1: clusterStartupWriterBound = false; break;
+		case 2: clusterStartupWriterInstalled = true; break;
+		case 3: startup_binding_ok = false; break;
+		case 4: startup_sync_ok = false; break;
+		case 5: startup_sync_change_epoch = true; break;
+		case 6: cf_mode = ExclusiveLock; break;
+		case 7: local_lock = true; break;
+		}
+		UT_ASSERT_EQ(ClusterStartupFileSync(), fault == 0);
+		UT_ASSERT_EQ(startup_sync_calls, fault == 0 || fault == 4 || fault == 5 ? 1 : 0);
+		UT_ASSERT_EQ(root_calls | local_updates | native_writes, 0);
+	}
+	startup_sync_change_epoch = false;
 }
 
 UT_TEST(startup_prepare_rejects_other_purposes_and_lost_owner)
@@ -1149,6 +1244,45 @@ UT_TEST(legacy_startup_does_not_select_shared_initializer)
 	UT_ASSERT(!clusterStartupWriterSelected);
 }
 
+UT_TEST(shared_crash_startup_uses_original_self_seal_before_native_directory)
+{
+	DBState crashed[] = {DB_IN_PRODUCTION, DB_SHUTDOWNING, DB_IN_CRASH_RECOVERY};
+	for (unsigned i = 0; i < lengthof(crashed); i++) {
+		writer_begin_fixture();
+		current.state = crashed[i];
+		self_seal_returns[0] = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+		self_seal_returns[1] = CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+		self_seal_returns[2] = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		UT_ASSERT(startup_first_native_site());
+		UT_ASSERT_EQ(self_seal_calls, 3);
+		UT_ASSERT_EQ(waits, 2);
+		UT_ASSERT_EQ(startup_directory_calls, 1);
+		UT_ASSERT_EQ(advance_calls | route_calls | bind_calls | native_writes, 0);
+		UT_ASSERT(!clusterStartupWriterSelected && !clusterStartupWriterBound);
+		UT_ASSERT_EQ(current.state, crashed[i]);
+	}
+}
+
+UT_TEST(shared_crash_refusal_or_cancel_never_reaches_native_mutation)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		writer_begin_fixture();
+		current.state = DB_IN_PRODUCTION;
+		if (fault == 1) {
+			self_seal_returns[0] = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+			cancel_on_wait = true;
+		} else if (fault == 2)
+			restart_ok = false;
+		else if (fault == 3)
+			mount_result = CLUSTER_CONFIG_MOUNT_MISMATCH;
+		UT_ASSERT(!startup_first_native_site());
+		UT_ASSERT_EQ(self_seal_calls, fault < 2 ? 1 : 0);
+		UT_ASSERT_EQ(startup_directory_calls | advance_calls | route_calls | bind_calls | native_writes, 0);
+		UT_ASSERT(!clusterStartupWriterSelected && !clusterStartupWriterBound);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+	}
+}
+
 UT_TEST(clean_restart_uses_shutdown_checkpoint_above_retained_floor)
 {
 	writer_begin_fixture();
@@ -1365,7 +1499,10 @@ UT_TEST(native_startup_insert_has_no_link_or_page_from_predecessor)
 int
 main(void)
 {
-	UT_PLAN(35);
+	UT_PLAN(38);
+	UT_RUN(startup_file_sync_rechecks_original_writer_and_keeps_native_owner);
+	UT_RUN(shared_crash_startup_uses_original_self_seal_before_native_directory);
+	UT_RUN(shared_crash_refusal_or_cancel_never_reaches_native_mutation);
 	UT_RUN(clean_restart_uses_shutdown_checkpoint_above_retained_floor);
 	UT_RUN(shared_startup_does_not_adopt_legacy_control_authority);
 	UT_RUN(legacy_startup_keeps_its_control_authority_path);

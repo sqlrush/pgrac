@@ -323,6 +323,9 @@ extern void cluster_authority_readiness_clear(void);
 extern bool cluster_recovery_transport_is_current(void);
 extern bool cluster_recovery_transport_components_current(void); /* RF-ROOT P6 */
 extern bool cluster_recovery_authority_is_current(void);
+/* Actual StartupProcess only, outside CF/critical sections. Re-read the same
+ * bound control proof; never create a binding or publish ordinary service. */
+extern ClusterFormationWitnessResult cluster_authority_startup_refresh_recovery(int timeout_ms);
 /* Only singleton CF-S, including the pre-SERVING phase-4 handoff. */
 extern bool cluster_configuration_read_transport_is_current(const ClusterResId *resid,
 															LOCKMODE mode);

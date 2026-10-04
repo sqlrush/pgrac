@@ -10304,6 +10304,33 @@ cluster_pcm_local_pi_retire_v1(const ClusterPcmLocalPiSnapshotV1 *local,
 	return result;
 }
 
+bool
+cluster_pcm_local_pi_retire_structural_v2(const ClusterPcmLocalPiSnapshotV1 *local,
+	const ClusterPageStructuralReceiptV2 *receipt, const ClusterPiStructuralAckV2 *ack)
+{
+	ClusterPcmLocalPiSnapshotV1 current;
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	int32 node;
+	bool result;
+	if (local == NULL || !cluster_shared_config || cluster_pcm_htab == NULL
+		|| !cluster_page_structural_pi_ack_read_v2(ack, receipt, &node) || node != cluster_node_id
+		|| !cluster_page_structural_covers_local_pi_v2(receipt, local))
+		return false;
+	if (!pcm_entry_ref_acquire(&local->resource, false, &ref, &acquired))
+		return acquired == PCM_ENTRY_ACQUIRE_NOT_FOUND && local->binding_generation == 0
+			&& local->revision == 0 && local->first.record_start == 0 && local->last.record_start == 0;
+	pcm_entry_lock_exclusive(ref.entry);
+	result = pcm_local_pi_snapshot_locked(ref.entry, &current)
+		&& memcmp(&current, local, sizeof(current)) == 0
+		&& ref.entry->local_pi_revision < UINT64_MAX - 1;
+	if (result)
+		pcm_local_pi_release_locked(ref.entry);
+	LWLockRelease(&ref.entry->entry_lock.lock);
+	pcm_entry_ref_release(&ref);
+	return result;
+}
+
 int
 cluster_pcm_local_pi_redeclare_scan_chunk(int start, int max_scan, uint64 epoch,
 										  ClusterGcsRedeclareCallback cb, void *arg)

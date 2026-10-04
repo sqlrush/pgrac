@@ -38,8 +38,10 @@ typedef struct ClusterPiWritebackMessageV1 {
 
 #define CLUSTER_PI_WRITEBACK_DATA_V2 1
 #define CLUSTER_PI_WRITEBACK_STRUCTURAL_V2 2
+#define CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2 3
 #define CLUSTER_PI_WRITEBACK_DATA_BYTES_V2 600
 #define CLUSTER_PI_WRITEBACK_STRUCTURAL_BYTES_V2 1424
+#define CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_BYTES_V2 1064
 #define CLUSTER_PI_WRITEBACK_MAX_BYTES_V2 \
 	(CLUSTER_PI_WRITEBACK_HEADER_BYTES + CLUSTER_PI_WRITEBACK_MAX * CLUSTER_PI_WRITEBACK_STRUCTURAL_BYTES_V2)
 #define CLUSTER_PI_STRUCTURAL_WAL_FLUSHED UINT32_C(1)
@@ -50,6 +52,8 @@ typedef struct ClusterPiWritebackMessageV1 {
 
 /* Wire values only: the terminal binding describes SPACE block zero, while
  * its master cut selects the old block whose responsibility is being retired.
+ * A STRUCTURE_OFFER carries only the relation result, with both master cuts
+ * zero. Its transport acknowledgement cannot retire any page responsibility.
  * Neither flags nor decoded bytes certify an actual structural completion. */
 typedef struct ClusterPiStructuralFactV2 {
 	uint32 durability_flags;

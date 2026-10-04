@@ -68,6 +68,8 @@
  */
 #include "postgres.h"
 
+#include <sys/stat.h>
+
 #include "cluster/cluster_qvotec.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -2749,7 +2751,9 @@ qvotec_build_baseline_marker(ClusterFenceMarker *out)
 		memset(fenced, 0, sizeof(fenced));
 		if (any_removed)
 			cluster_reconfig_snapshot_removed_bitmap(fenced);
-		cluster_fence_marker_build_baseline(out, CLUSTER_EPOCH_INITIAL, fenced, 0 /* generation */,
+		/* A committed INITIAL cold formation advances the applied baseline;
+		 * raw transport epoch remains deliberately insufficient authority. */
+		cluster_fence_marker_build_baseline(out, applied.new_epoch, fenced, 0 /* generation */,
 											0 /* event_id */,
 											CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
 	} else {
@@ -2912,6 +2916,108 @@ qvotec_apply_lease_cas(const ClusterAdgApplyMasterLease *desired, const uint8 *a
 	return CLUSTER_MRP_APPLY_LEASE_SUBMIT_ACK;
 }
 
+/* Unformed heartbeat writes must not erase an undecodable predecessor fence.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+qvotec_formation_prior_fence_valid(const ClusterVotingSlot *slot)
+{
+	ClusterFenceMarker marker;
+	ClusterFenceMarker empty = { 0 };
+	memcpy(&marker, slot->_reserved1, sizeof(marker));
+	return memcmp(&marker, &empty, sizeof(marker)) == 0 || cluster_fence_marker_valid_v1(&marker);
+}
+
+/* Original-disk census for an unformed fixed cohort. Minority records raise
+ * the allocation floor, but never prove a commit. No caller holds Reconfig.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+qvotec_formation_disk_snapshot(const int *fds, int n_disks, const ClusterVotingSlot *matrix,
+							   bool all_slots_read, uint64 sampled_at_us, uint64 self_incarnation,
+							   ClusterFormationDiskSnapshot *out, uint8 *committed_image)
+{
+	ClusterFenceMarker disk_markers[CLUSTER_MAX_VOTING_DISKS];
+	ClusterFenceDiskVoteState states[CLUSTER_MAX_VOTING_DISKS];
+	uint8 selected[CLUSTER_VOTING_SLOT_BYTES] = { 0 };
+	uint8 zero[CLUSTER_VOTING_SLOT_BYTES] = { 0 };
+	ClusterFormationCommitMarker candidate;
+
+	memset(out, 0, sizeof(*out));
+	memset(committed_image, 0, CLUSTER_VOTING_SLOT_BYTES);
+	memset(&candidate, 0, sizeof(candidate));
+	if (!all_slots_read || fds == NULL || matrix == NULL || n_disks <= 0
+		|| n_disks > CLUSTER_MAX_VOTING_DISKS || sampled_at_us == 0 || self_incarnation == 0)
+		return false;
+	for (int d = 0; d < n_disks; ++d) {
+		ClusterFenceMarker slots[CLUSTER_MAX_NODES];
+		bool valid[CLUSTER_MAX_NODES];
+		for (int node = 0; node < CLUSTER_MAX_NODES; ++node) {
+			memcpy(&slots[node], matrix[d * CLUSTER_MAX_NODES + node]._reserved1,
+				   sizeof(slots[node]));
+			valid[node] = true; /* read_slot verified every outer CRC */
+		}
+		states[d] = cluster_fence_disk_vote_select_v1(slots, valid, CLUSTER_MAX_NODES,
+													 &disk_markers[d]);
+		if (states[d] != CLUSTER_FENCE_DISK_VOTE_VALID && states[d] != CLUSTER_FENCE_DISK_VOTE_EMPTY)
+			return false;
+		if (states[d] == CLUSTER_FENCE_DISK_VOTE_VALID)
+			out->max_epoch = Max(out->max_epoch, disk_markers[d].fence_epoch);
+	}
+	if (cluster_fence_authority_prove_v1(disk_markers, states, n_disks, &out->fence)
+		!= CLUSTER_FENCE_AUTHORITY_OK)
+		return false;
+	for (int node = 0; node < CLUSTER_MAX_NODES; ++node)
+		for (int d = 0; d < n_disks; ++d) {
+			uint8 image[CLUSTER_VOTING_SLOT_BYTES];
+			ClusterFormationCommitMarker m;
+			if (cluster_voting_disk_read_formation_slot(fds[d], (uint32)node, image)
+				!= CLUSTER_VOTING_DISK_IO_OK)
+				return false;
+			if (memcmp(image, zero, sizeof(image)) == 0)
+				continue;
+			if (!cluster_formation_marker_decode(image, &m, NULL))
+				return false;
+			out->max_epoch = Max(out->max_epoch, m.formation_epoch);
+			if (m.formation_generation > out->max_generation) {
+				candidate = m;
+				out->max_generation = m.formation_generation;
+				memcpy(selected, image, sizeof(selected));
+			} else if (m.formation_generation == out->max_generation
+					   && memcmp(selected, image, sizeof(selected)) != 0)
+				return false;
+		}
+	if (out->max_generation != 0) {
+		bool committed = true;
+		for (int node = 0; node < CLUSTER_MAX_NODES; ++node) {
+			unsigned agree = 0;
+			if ((candidate.admitted_nodes[node / 8] & (uint8)(1u << (node % 8))) == 0)
+				continue;
+			for (int d = 0; d < n_disks; ++d) {
+				uint8 image[CLUSTER_VOTING_SLOT_BYTES];
+				ClusterFormationCommitMarker m;
+				if (cluster_voting_disk_read_formation_slot(fds[d], (uint32)node, image)
+					!= CLUSTER_VOTING_DISK_IO_OK)
+					return false;
+				if (memcmp(image, zero, sizeof(image)) != 0
+					&& (!cluster_formation_marker_decode(image, &m, NULL)
+						|| m.formation_generation > candidate.formation_generation
+						|| (m.formation_generation == candidate.formation_generation
+							&& memcmp(image, selected, sizeof(image)) != 0)))
+					return false;
+				if (memcmp(image, selected, sizeof(image)) == 0)
+					agree++;
+			}
+			if (agree <= (unsigned)n_disks / 2)
+				committed = false;
+		}
+		if (committed)
+			memcpy(committed_image, selected, sizeof(selected));
+	}
+	out->sampled_at_us = sampled_at_us;
+	out->self_incarnation = self_incarnation;
+	out->complete = true;
+	return true;
+}
+
 static void
 qvotec_poll_once(void)
 {
@@ -2922,6 +3028,17 @@ qvotec_poll_once(void)
 	ClusterVotingSlot self_slot;
 	ClusterVotingDiskIoState io_states[CLUSTER_MAX_VOTING_DISKS];
 	bool own_prior_read_ok[CLUSTER_MAX_VOTING_DISKS] = { false };
+	bool renew_authority = cluster_shared_config;
+	bool authority_config_ok = false;
+	uint64 authority_sequence = UINT64_MAX;
+	uint64 authority_sampled_us = 0;
+	ClusterFenceMarker authority_disk_markers[CLUSTER_MAX_VOTING_DISKS];
+	ClusterFenceDiskVoteState authority_disk_states[CLUSTER_MAX_VOTING_DISKS];
+	struct stat authority_disk_stats[CLUSTER_MAX_VOTING_DISKS];
+	bool authority_stat_valid[CLUSTER_MAX_VOTING_DISKS] = { false };
+	bool formation_scan = cluster_reconfig_formation_needs_disk_snapshot();
+	bool all_slots_read = true;
+	uint64 observed_max_fence_epoch = 0;
 	ClusterQuorumDecision decision;
 	uint64 now_us;
 	uint64 heartbeat_timeout_us;
@@ -2954,6 +3071,8 @@ qvotec_poll_once(void)
 	bool fence_majority_written = false;		 /* RF-ROOT P6: this poll's marker tuple
 										 * reached quorum-majority durability */
 
+	if (formation_scan)
+		cluster_reconfig_formation_qvotec_publish_disk_snapshot(NULL);
 	cluster_storage_quorum_refresh(cluster_storage_quorum_now_us(),
 								   (uint64)cluster_quorum_poll_interval_ms * 30 * 1000ULL);
 
@@ -3061,6 +3180,8 @@ qvotec_poll_once(void)
 	have_apply_lease_request = cluster_mrp_qvotec_poll_apply_lease_request(&apply_lease_request);
 
 	if (qvotec_n_disks == 0) {
+		if (renew_authority)
+			cluster_write_fence_authority_cache_invalidate();
 		/* Single-node compat: no disks, no quorum to decide.  Hold
 		 * quorum_state at INITIALIZING so any explicit consumer that
 		 * does check it stays fail-closed (per Q4 v0.2 default). */
@@ -3094,6 +3215,8 @@ qvotec_poll_once(void)
 	}
 
 	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES) {
+		if (renew_authority)
+			cluster_write_fence_authority_cache_invalidate();
 		/* Defensive: invalid node_id ⇒ cannot author a self slot.
 		 * Leave shmem at last-known state and skip the cycle.  Q7
 		 * startup validator (next commit) will reject this config
@@ -3138,9 +3261,82 @@ qvotec_poll_once(void)
 
 	/* ---- 1. read full slot matrix BEFORE writing ---- */
 	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_VOTE_MATRIX);
+	if (renew_authority) {
+		instr_time authority_started;
+		int64 authority_started_ns;
+
+		/* Match the durable reader's configured denominator and distinct physical
+		 * targets. Configuration is PGC_POSTMASTER; open fds retain that order.
+		 * Capture before any scan I/O: a slow scan cannot acquire a new TTL at
+		 * completion, nor can it undo a concurrent epoch/identity invalidation. */
+		authority_sequence = cluster_write_fence_authority_cache_sequence();
+		/* Use the fence consumer's PG_INSTR_CLOCK domain (RAW on Darwin),
+		 * not the storage-quorum domain. Both must age the same evidence. */
+		INSTR_TIME_SET_CURRENT(authority_started);
+		authority_started_ns = INSTR_TIME_GET_NANOSEC(authority_started);
+		authority_sampled_us = authority_started_ns <= 0
+			? 0 : (uint64)authority_started_ns / UINT64_C(1000);
+		authority_config_ok = cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON
+			&& qvotec_shutdown_configured_disks() == qvotec_n_disks
+			&& authority_sampled_us != 0;
+		memset(authority_disk_markers, 0, sizeof(authority_disk_markers));
+		if (authority_config_ok) {
+			const char *paths[CLUSTER_MAX_VOTING_DISKS];
+			size_t lengths[CLUSTER_MAX_VOTING_DISKS];
+			const char *p = cluster_voting_disks;
+
+			for (i = 0; i < qvotec_n_disks; i++) {
+				const char *end;
+				int j;
+
+				while (*p == ' ' || *p == '\t')
+					p++;
+				paths[i] = p;
+				while (*p != '\0' && *p != ',')
+					p++;
+				end = p;
+				while (end > paths[i] && (end[-1] == ' ' || end[-1] == '\t'))
+					end--;
+				lengths[i] = end - paths[i];
+				if (*p == ',')
+					p++;
+				for (j = 0; j < i; j++)
+					if (lengths[i] == lengths[j]
+						&& memcmp(paths[i], paths[j], lengths[i]) == 0)
+						authority_config_ok = false;
+			}
+		}
+		for (i = 0; i < qvotec_n_disks; i++) {
+			struct stat *st = &authority_disk_stats[i];
+			int j;
+
+			authority_disk_states[i] = CLUSTER_FENCE_DISK_VOTE_UNREADABLE;
+			if (fstat(qvotec_fds[i], st) != 0)
+				continue;
+			if (!S_ISREG(st->st_mode) && !S_ISBLK(st->st_mode) && !S_ISCHR(st->st_mode)) {
+				authority_config_ok = false;
+				continue;
+			}
+			authority_stat_valid[i] = true;
+			for (j = 0; j < i; j++) {
+				const struct stat *prior = &authority_disk_stats[j];
+
+				if (authority_stat_valid[j]
+					&& ((S_ISREG(st->st_mode) && S_ISREG(prior->st_mode)
+						 && st->st_dev == prior->st_dev && st->st_ino == prior->st_ino)
+						|| ((S_ISBLK(st->st_mode) || S_ISCHR(st->st_mode))
+							&& (S_ISBLK(prior->st_mode) || S_ISCHR(prior->st_mode))
+							&& st->st_rdev == prior->st_rdev)))
+					authority_config_ok = false;
+			}
+		}
+	}
 	memset(qvotec_slot_matrix, 0,
 		   sizeof(ClusterVotingSlot) * CLUSTER_MAX_VOTING_DISKS * CLUSTER_MAX_NODES);
 	for (i = 0; i < qvotec_n_disks; i++) {
+		ClusterFenceMarker slot_markers[CLUSTER_MAX_NODES];
+		bool outer_crc_valid[CLUSTER_MAX_NODES] = { false };
+		bool authority_disk_failed = false;
 		uint32 node;
 
 		/* Hardening v0.4 P1.2: io_states starts OK and DOWNGRADES on
@@ -3155,9 +3351,17 @@ qvotec_poll_once(void)
 			ClusterVotingDiskIoState rrc;
 
 			rrc = cluster_voting_disk_read_slot(qvotec_fds[i], i, node, cell);
+			if (renew_authority) {
+				if (rrc == CLUSTER_VOTING_DISK_IO_OK) {
+					memcpy(&slot_markers[node], cell->_reserved1, sizeof(ClusterFenceMarker));
+					outer_crc_valid[node] = true;
+				} else if (rrc != CLUSTER_VOTING_DISK_IO_TORN)
+					authority_disk_failed = true;
+			}
 			if (node == (uint32)cluster_node_id && rrc == CLUSTER_VOTING_DISK_IO_OK)
 				own_prior_read_ok[i] = true;
 			if (rrc != CLUSTER_VOTING_DISK_IO_OK) {
+				all_slots_read = false;
 				/* Per-slot miss is no-data;whole-disk failure only
 				 * on FAILED at offset 0 (header read).  TORN on one
 				 * peer's slot is not a whole-disk failure. */
@@ -3166,6 +3370,9 @@ qvotec_poll_once(void)
 				memset(cell, 0, sizeof(*cell));
 			}
 		}
+		if (renew_authority && authority_stat_valid[i] && !authority_disk_failed)
+			authority_disk_states[i] = cluster_fence_disk_vote_select_v1(slot_markers,
+				outer_crc_valid, CLUSTER_MAX_NODES, &authority_disk_markers[i]);
 	}
 
 	/*
@@ -3250,8 +3457,26 @@ qvotec_poll_once(void)
 		ClusterFenceAuthority authority;
 
 		qvotec_diagnostic_phase_enter(QVOTEC_DIAG_FENCE_DECISION);
-		for (i = 0; i < qvotec_n_disks; i++)
+		if (renew_authority) {
+			ClusterFenceAuthorityProof proof;
+
+			if (!authority_config_ok
+				|| cluster_fence_authority_prove_v1(authority_disk_markers,
+					   authority_disk_states, qvotec_n_disks, &proof)
+					   != CLUSTER_FENCE_AUTHORITY_OK)
+				cluster_write_fence_authority_cache_invalidate();
+			else if ((authority_sequence & UINT64_C(1)) == 0
+					 && authority_sequence < UINT64_MAX - 1)
+				/* A failed CAS belongs to a newer publisher/invalidator. Do not
+				 * overwrite or invalidate its state with this older scan. */
+				(void)cluster_write_fence_authority_cache_publish_if_unchanged(
+					&proof.marker, authority_sampled_us, authority_sequence);
+		}
+		for (i = 0; i < qvotec_n_disks; i++) {
 			disk_has_marker[i] = qvotec_best_marker_on_disk(i, &disk_markers[i]);
+			if (disk_has_marker[i])
+				observed_max_fence_epoch = Max(observed_max_fence_epoch, disk_markers[i].fence_epoch);
+		}
 
 		authority = cluster_fence_authority_decide(disk_markers, disk_has_marker, qvotec_n_disks);
 		if (authority.has_authority) {
@@ -3460,7 +3685,9 @@ qvotec_poll_once(void)
 	if (!have_submit && cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON
 		&& is_leader) {
 		qvotec_build_baseline_marker(&baseline_marker);
-		if (!cluster_fence_baseline_author_permitted_v1(
+		if ((formation_scan && (!all_slots_read
+								|| baseline_marker.fence_epoch < observed_max_fence_epoch))
+			|| !cluster_fence_baseline_author_permitted_v1(
 				&baseline_marker, durable_has_authority,
 				durable_has_authority ? &durable_authority_marker : NULL))
 			cluster_write_fence_note_baseline_stale(); /* non-monotonic or same-order conflict */
@@ -3530,7 +3757,8 @@ qvotec_poll_once(void)
 		self_slot.disk_index = (uint32)i;
 
 
-		if (rplm_state == CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD)
+		if (rplm_state == CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD
+			|| (formation_scan && !qvotec_formation_prior_fence_valid(own_prior)))
 			wrc = CLUSTER_VOTING_DISK_IO_FAILED;
 		else
 			wrc = cluster_voting_disk_write_slot(qvotec_fds[i], &self_slot);
@@ -3787,6 +4015,22 @@ qvotec_poll_once(void)
 	 * marker standing on a strict majority of disks (exact same image) is
 	 * published for the cold-formation admission; otherwise the observation
 	 * is cleared (fail-closed: no marker, no admission). */
+	if (cluster_shared_config) {
+		if (formation_scan) {
+			ClusterFormationDiskSnapshot snapshot;
+			ClusterFormationCommitMarker marker;
+			uint64 incarnations[CLUSTER_MAX_NODES];
+			uint8 image[CLUSTER_VOTING_SLOT_BYTES];
+			bool complete = qvotec_formation_disk_snapshot(qvotec_fds, qvotec_n_disks,
+				qvotec_slot_matrix, all_slots_read, now_us, qvotec_self_incarnation,
+				&snapshot, image);
+			if (complete && cluster_formation_marker_decode(image, &marker, incarnations))
+				cluster_reconfig_formation_qvotec_publish_observed(&marker, incarnations);
+			else
+				cluster_reconfig_formation_qvotec_clear_observed();
+			cluster_reconfig_formation_qvotec_publish_disk_snapshot(complete ? &snapshot : NULL);
+		}
+	} else
 	{
 		uint8 images[CLUSTER_MAX_VOTING_DISKS][CLUSTER_VOTING_SLOT_BYTES];
 		bool valid[CLUSTER_MAX_VOTING_DISKS];
@@ -4167,6 +4411,17 @@ ClusterQvotecMain(void)
 	 * Runs once, postmaster-spawned, after the disks are open.
 	 */
 	cluster_clean_leave_publish_qvotec_latch(MyLatch);
+	/*
+	 * Hardening v0.4 P1.4: install per-I/O timeout handler for the
+	 * voting disk slot R/W syscalls.  qvotec is the sole production
+	 * caller of cluster_voting_disk_read_slot / write_slot, so it is
+	 * safe to claim SIGALRM here (we previously SIG_IGN'd it).  The
+	 * timeout value is read from cluster.voting_disk_io_timeout_ms
+	 * each cycle so SIGHUP can adjust without restart.
+	 */
+	cluster_voting_disk_io_install_timeout_handler();
+	cluster_voting_disk_io_set_timeout_ms(cluster_voting_disk_io_timeout_ms);
+
 	cluster_clean_leave_rebuild_from_disks(qvotec_fds, qvotec_n_disks);
 
 	/* spec-6.4: qvotec is the sole writer for the ADG apply-master lease CAS. */
@@ -4224,16 +4479,7 @@ ClusterQvotecMain(void)
 	 */
 	cluster_xid_stripe_scan_disks(qvotec_fds, qvotec_n_disks);
 
-	/*
-	 * Hardening v0.4 P1.4: install per-I/O timeout handler for the
-	 * voting disk slot R/W syscalls.  qvotec is the sole production
-	 * caller of cluster_voting_disk_read_slot / write_slot, so it is
-	 * safe to claim SIGALRM here (we previously SIG_IGN'd it).  The
-	 * timeout value is read from cluster.voting_disk_io_timeout_ms
-	 * each cycle so SIGHUP can adjust without restart.
-	 */
-	cluster_voting_disk_io_install_timeout_handler();
-	cluster_voting_disk_io_set_timeout_ms(cluster_voting_disk_io_timeout_ms);
+
 
 	/*
 	 * P1.3 step 2 — boot incarnation + slot matrix + counter handles.
