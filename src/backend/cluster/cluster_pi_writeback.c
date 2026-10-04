@@ -73,6 +73,8 @@ typedef struct WritebackShared {
 
 struct ClusterPiWritebackJobV1 {
 	ResourceOwner owner;
+	uint64 offer_serial;
+	uint32 offer_slot;
 	pid_t pid;
 	uint64 revision;
 	uint32 version;
@@ -981,15 +983,17 @@ wb_cleanup_register(void)
 	}
 }
 
-/* Both receipt kinds use the original singleton owner. Allocation precedes
+/* Every proof kind uses the original singleton owner. Allocation precedes
  * publication, and all identity/receipt work is complete before the lock. */
 static ClusterControlRootResult
 wb_enqueue(const ClusterPiWritebackMessageV1 *m, const ClusterPiWritebackMessageV2 *m2,
-		   ClusterPiWritebackJobV1 **out)
+		   ClusterPiWritebackJobV1 **out, uint32 offer_slot, uint64 offer_serial)
 {
 	ClusterPiWritebackJobV1 *job = palloc0(sizeof(*job));
 	bool acquired = false;
 	job->owner = CurrentResourceOwner;
+	job->offer_slot = offer_slot;
+	job->offer_serial = offer_serial;
 	job->pid = getpid();
 	job->version = m2 != NULL ? 2 : 1;
 	if (m2 != NULL)
@@ -1058,7 +1062,7 @@ cluster_pi_writeback_begin_v1(const ClusterPageDataReceiptV1 *const *receipts, u
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	} else if (!wb_current(&m, true))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	return wb_enqueue(&m, version2 ? &m2 : NULL, out);
+	return wb_enqueue(&m, version2 ? &m2 : NULL, out, 0, 0);
 }
 
 ClusterControlRootResult
@@ -1085,14 +1089,65 @@ cluster_pi_writeback_structural_begin_v2(const ClusterPageStructuralReceiptV2 *c
 	if (!pg_strong_random(&m.nonce, sizeof(m.nonce))
 		|| !cluster_pi_writeback_request_current_v2(&m, true))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	return wb_enqueue(NULL, &m, out);
+	return wb_enqueue(NULL, &m, out, 0, 0);
+}
+
+/* Resolve only the original origin's retained background obligation. The
+ * iterator may skip a stale slot; that is not a match for this job. */
+static bool
+wb_offer_fact(uint32 slot, uint64 serial, int32 peer, ClusterPiWritebackFactV2 *out)
+{
+	uint32 cursor = slot;
+	uint64 found = 0;
+	ClusterPiWritebackFactV2 fact;
+
+	if (slot == UINT32_MAX || serial == 0
+		|| !cluster_ko_shared_structure_offer_next_v2(&cursor, peer, &found, &fact)
+		|| cursor != slot + 1 || found != serial
+		|| fact.kind != CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2)
+		return false;
+	*out = fact;
+	return true;
+}
+
+ClusterControlRootResult
+cluster_pi_writeback_structure_offer_begin_v2(uint32 slot, uint64 serial,
+											  const ClusterWalSourceRef *peer,
+											  ClusterPiWritebackJobV1 **out)
+{
+	ClusterPiWritebackMessageV2 m = { 0 };
+
+	if (peer == NULL || out == NULL || *out != NULL || !wb_background() || wb_shared == NULL
+		|| MyProcPid <= 0 || serial == 0 || slot == UINT32_MAX)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (wb_active != NULL)
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	m.verb = CLUSTER_PI_WRITEBACK_NOTIFY;
+	m.count = 1;
+	m.peer = *peer;
+	m.epoch = cluster_epoch_get_current();
+	if (!wb_offer_fact(slot, serial, peer->claim.identity.origin_node_id, &m.facts[0])
+		|| !pg_strong_random(&m.nonce, sizeof(m.nonce))
+		|| !cluster_pi_writeback_request_current_v2(&m, true))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	return wb_enqueue(NULL, &m, out, slot, serial);
 }
 
 static bool
 wb_job_current(const ClusterPiWritebackJobV1 *job)
 {
-	return job->version == 2 ? cluster_pi_writeback_request_current_v2(&job->requested_v2, true)
-							 : job->version == 1 && wb_current(&job->requested, true);
+	if (job->version == 2) {
+		ClusterPiWritebackFactV2 fact;
+		if (!cluster_pi_writeback_request_current_v2(&job->requested_v2, true))
+			return false;
+		if (job->requested_v2.facts[0].kind != CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2)
+			return true;
+		return job->requested_v2.count == 1
+			   && wb_offer_fact(job->offer_slot, job->offer_serial,
+								job->requested_v2.peer.claim.identity.origin_node_id, &fact)
+			   && memcmp(&fact, &job->requested_v2.facts[0], sizeof(fact)) == 0;
+	}
+	return job->version == 1 && wb_current(&job->requested, true);
 }
 
 ClusterControlRootResult
@@ -1239,6 +1294,28 @@ cluster_pi_writeback_structural_ack_read_v2(const ClusterPiWritebackJobV1 *job, 
 	peer.epoch = job->accepted_v2.epoch;
 	if (!cluster_pi_writeback_structural_ack_current_v2(&fact, &peer))
 		return false;
+	*out = peer;
+	return true;
+}
+
+/* A positive result transfers no local responsibility. The original KO owner
+ * still owns its slot and must finish every local and remote page obligation. */
+bool
+cluster_pi_writeback_structure_offer_ack_v2(const ClusterPiWritebackJobV1 *job, uint32 slot,
+											uint64 serial, ClusterWalWriterToken *out)
+{
+	ClusterWalWriterToken peer = { 0 };
+
+	if (job == NULL || out == NULL || !wb_background() || job->pid != getpid()
+		|| job->owner != CurrentResourceOwner || job->version != 2 || job->stale || !job->complete
+		|| job->offer_slot != slot || job->offer_serial != serial || job->requested_v2.count != 1
+		|| job->accepted_v2.count != 1
+		|| job->requested_v2.facts[0].kind != CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2
+		|| !cluster_pi_writeback_ack_matches_v2(&job->requested_v2, &job->accepted_v2)
+		|| !wb_job_current(job))
+		return false;
+	peer.ref = job->accepted_v2.peer;
+	peer.epoch = job->accepted_v2.epoch;
 	*out = peer;
 	return true;
 }

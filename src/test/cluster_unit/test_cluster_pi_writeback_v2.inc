@@ -1599,3 +1599,175 @@ UT_TEST(writeback_v2_relation_offer_batch_is_bounded_and_ack_ordered)
 	rf_page_online_plan_destroy_v1(&wb_page_plan);
 	clean();
 }
+
+/* The KO suite exercises the real fixed-slot lifetime. Here its observation
+ * is an exact slot/serial/fact seam, never a caller-supplied wire flag. */
+static bool wb_offer_present;
+static uint32 wb_offer_slot;
+static uint64 wb_offer_serial;
+static ClusterPiWritebackFactV2 wb_offer_observed;
+static bool
+wb_offer_read_for_transport(uint32 *cursor, int32 peer, uint64 *serial,
+							ClusterPiWritebackFactV2 *out)
+{
+	if (!wb_offer_present || *cursor > wb_offer_slot
+		|| peer != wb_offer_observed.proof.structural.ko.peer_node
+		|| cluster_node_id != wb_offer_observed.proof.structural.ko.origin_node)
+		return false;
+	*cursor = wb_offer_slot + 1;
+	*serial = wb_offer_serial;
+	*out = wb_offer_observed;
+	return true;
+}
+
+static void
+wb_offer_setup(ClusterPageDataReceiptV1 *receipt)
+{
+	ClusterPiDataFactV1 fact;
+	ClusterPiWritebackMessageV2 message;
+	UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &fact));
+	fact.binding.source = wb_sources[2];
+	wb_v2_offer_fixture(&message, &fact, false);
+	wb_offer_slot = 4;
+	wb_offer_serial = 27;
+	wb_offer_observed = message.facts[0];
+	wb_offer_present = true;
+	wb_offer_accept_mask = 1;
+	wb_offer_accept_calls = 0;
+	wb_select(2, B_BG_WRITER);
+}
+
+UT_TEST(writeback_v2_original_offer_job_reaches_remote_acceptance)
+{
+	for (unsigned accepted = 0; accepted < 2; accepted++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiWritebackJobV1 *job = NULL, *blocked = NULL;
+		ClusterPiWritebackMessageV2 request, reply;
+		ClusterWalWriterToken peer = { 0 };
+		wb_offer_setup(receipt);
+		wb_offer_accept_mask = accepted;
+		UT_ASSERT_EQ(cluster_pi_writeback_structure_offer_begin_v2(4, 27, &wb_sources[1], &job),
+					 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		if (job == NULL)
+			goto done;
+		UT_ASSERT_EQ(cluster_pi_writeback_structure_offer_begin_v2(4, 27, &wb_sources[1], &blocked),
+					 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		UT_ASSERT(blocked == NULL);
+		UT_ASSERT(!cluster_pi_writeback_structure_offer_ack_v2(job, 4, 27, &peer));
+		wb_select(2, B_LMON);
+		cluster_pi_writeback_lmon_tick_v1();
+		UT_ASSERT_EQ(wb_destination, 1);
+		UT_ASSERT(cluster_pi_writeback_decode_v2(wb_wire, wb_length, &request));
+		UT_ASSERT_EQ(request.facts[0].kind, CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2);
+		wb_deliver(2, 1, wb_wire, wb_length);
+		wb_select(1, B_BG_WRITER);
+		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+		UT_ASSERT_EQ(wb_offer_accept_calls, 1);
+		UT_ASSERT(!wb_inputs_pinned[1]);
+		wb_select(1, B_LMON);
+		cluster_pi_writeback_lmon_tick_v1();
+		UT_ASSERT_EQ(wb_destination, 2);
+		UT_ASSERT(cluster_pi_writeback_decode_v2(wb_wire, wb_length, &reply));
+		UT_ASSERT_EQ(reply.count, accepted);
+		wb_deliver(1, 2, wb_wire, wb_length);
+		wb_select(2, B_BG_WRITER);
+		UT_ASSERT_EQ(cluster_pi_writeback_poll_v1(job), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(cluster_pi_writeback_structure_offer_ack_v2(job, 4, 27, &peer)
+				  == (accepted != 0));
+		if (accepted)
+			UT_ASSERT(memcmp(&peer.ref, &wb_sources[1], sizeof(peer.ref)) == 0);
+		UT_ASSERT(!cluster_pi_writeback_structural_ack_read_v2(job, 0, (const void *)73, &peer));
+		UT_ASSERT_EQ(pi_discards | wb_master_completions | logical_pi_retire_calls | wb_plan_builds,
+					 0);
+		UT_ASSERT(wb_offer_present);
+	done:
+		wb_select(2, B_BG_WRITER);
+		cluster_pi_writeback_release_v1(&job);
+		wb_select(0, B_CHECKPOINTER);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_v2_offer_refuses_missing_changed_or_reused_slot)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiWritebackJobV1 *job = NULL;
+		wb_offer_setup(receipt);
+		if (fault == 0)
+			wb_offer_present = false;
+		if (fault == 1)
+			wb_offer_serial++;
+		if (fault == 2)
+			wb_offer_slot++;
+		if (fault == 3)
+			wb_peer_caps = 0;
+		if (fault == 4)
+			wb_offer_observed.kind = CLUSTER_PI_WRITEBACK_STRUCTURAL_V2;
+		if (fault == 5)
+			wb_offer_observed.proof.structural.ko.origin_boot++;
+		UT_ASSERT_NE(cluster_pi_writeback_structure_offer_begin_v2(4, 27, &wb_sources[1], &job),
+					 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(job == NULL);
+		UT_ASSERT_EQ(wb_shared->outbound_pid | wb_sends | wb_master_completions, 0);
+		wb_select(0, B_CHECKPOINTER);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_v2_offer_late_ack_cannot_survive_original_owner_or_slot_change)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiWritebackJobV1 *job = NULL;
+		ClusterPiWritebackMessageV2 reply;
+		ClusterWalWriterToken peer, sentinel;
+		Size length;
+		wb_offer_setup(receipt);
+		UT_ASSERT_EQ(cluster_pi_writeback_structure_offer_begin_v2(4, 27, &wb_sources[1], &job), 0);
+		if (job == NULL)
+			goto done;
+		wb_select(2, B_LMON);
+		cluster_pi_writeback_lmon_tick_v1();
+		UT_ASSERT(cluster_pi_writeback_decode_v2(wb_wire, wb_length, &reply));
+		reply.verb = CLUSTER_PI_WRITEBACK_ACK;
+		UT_ASSERT(cluster_pi_writeback_encode_v2(&reply, wb_wire, sizeof(wb_wire), &length));
+		wb_select(2, B_BG_WRITER);
+		if (fault == 0)
+			wb_offer_present = false;
+		if (fault == 1)
+			wb_offer_serial++;
+		if (fault == 2)
+			wb_offer_slot++;
+		if (fault == 3)
+			wb_offer_observed.proof.structural.ko.batch_id++;
+		if (fault == 4)
+			wb_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		wb_deliver(1, 2, wb_wire, length);
+		wb_select(2, B_BG_WRITER);
+		if (fault < 5)
+			UT_ASSERT_NE(cluster_pi_writeback_poll_v1(job), 0);
+		else
+			UT_ASSERT_EQ(cluster_pi_writeback_poll_v1(job), 0);
+		if (fault == 5)
+			wb_offer_serial++;
+		if (fault == 6)
+			wb_epoch++;
+		memset(&sentinel, 0xa5, sizeof(sentinel));
+		peer = sentinel;
+		UT_ASSERT(!cluster_pi_writeback_structure_offer_ack_v2(job, 4, 27, &peer));
+		UT_ASSERT(memcmp(&peer, &sentinel, sizeof(peer)) == 0);
+		UT_ASSERT_EQ(pi_discards | wb_master_completions | logical_pi_retire_calls, 0);
+	done:
+		wb_select(2, B_BG_WRITER);
+		cluster_pi_writeback_release_v1(&job);
+		wb_select(0, B_CHECKPOINTER);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}

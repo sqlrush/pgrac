@@ -186,6 +186,14 @@ extern ClusterControlRootResult
 cluster_pi_writeback_structural_begin_v2(const ClusterPageStructuralReceiptV2 *const *receipts,
 										 uint32 count, const ClusterWalSourceRef *peer,
 										 ClusterPiWritebackJobV1 **out);
+/* Relation responsibility only: the original background KO slot must remain
+ * exact through the same singleton transport job and its peer acceptance.
+ * Neither API releases the KO slot or creates a per-page retirement proof. */
+extern ClusterControlRootResult cluster_pi_writeback_structure_offer_begin_v2(
+	uint32 slot, uint64 serial, const ClusterWalSourceRef *peer, ClusterPiWritebackJobV1 **out);
+extern bool cluster_pi_writeback_structure_offer_ack_v2(const ClusterPiWritebackJobV1 *job,
+														uint32 slot, uint64 serial,
+														ClusterWalWriterToken *peer);
 extern ClusterControlRootResult cluster_pi_writeback_poll_v1(ClusterPiWritebackJobV1 *job);
 extern void cluster_pi_writeback_release_v1(ClusterPiWritebackJobV1 **job);
 

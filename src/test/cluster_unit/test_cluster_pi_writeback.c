@@ -817,8 +817,12 @@ wb_structural_fact_for_transport(const ClusterPageStructuralReceiptV2 *receipt, 
 	return true;
 }
 #define cluster_page_structural_pi_fact_v2 wb_structural_fact_for_transport
+static bool wb_offer_read_for_transport(uint32 *cursor, int32 peer, uint64 *serial,
+										ClusterPiWritebackFactV2 *out);
+#define cluster_ko_shared_structure_offer_next_v2 wb_offer_read_for_transport
 #include "../../backend/cluster/cluster_pi_writeback.c"
 #undef cluster_page_structural_pi_fact_v2
+#undef cluster_ko_shared_structure_offer_next_v2
 #include "../../backend/cluster/cluster_pi_rebuild.c"
 #undef palloc0
 
@@ -1893,7 +1897,10 @@ int
 main(void)
 {
 	printf("# sizeof_WritebackShared=%zu\n", sizeof(WritebackShared));
-	UT_PLAN(59);
+	UT_PLAN(62);
+	UT_RUN(writeback_v2_original_offer_job_reaches_remote_acceptance);
+	UT_RUN(writeback_v2_offer_refuses_missing_changed_or_reused_slot);
+	UT_RUN(writeback_v2_offer_late_ack_cannot_survive_original_owner_or_slot_change);
 	UT_RUN(writeback_v2_relation_offer_ack_requires_original_owner_acceptance);
 	UT_RUN(writeback_v2_relation_offer_reader_rejects_lost_original_notice);
 	UT_RUN(writeback_v2_structural_empty_ack_keeps_page_obligation);
