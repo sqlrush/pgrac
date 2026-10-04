@@ -803,6 +803,7 @@ semantic_activation_ack_wire_value_valid(const ClusterSemanticActivationAckWireV
 static bool semantic_activation_bytes_are_zero(const uint8 *bytes, Size len);
 static bool semantic_activation_ack_sample_digest(const ClusterSemanticActivationAckTableV1 *image,
 												  uint64 *digest_out);
+static bool semantic_activation_first_writer_live(void);
 static bool semantic_activation_r4_initial_clean_sample_basis(uint64 expected_generation,
 															  bool coordinator_only);
 static bool semantic_activation_round_descriptor(
@@ -2148,11 +2149,10 @@ semantic_activation_ack_stage_ahead_refusal_exact(const SemanticActivationAckIng
 /*
  * A positive SAMPLE ACK may cross the coordinator's directed SAMPLE
  * REQUEST because the ACK is fanned out by a different peer connection.
- * Retain it only while every field can already be checked against the current
- * formation, admission snapshot, authenticated source, and either the exact
- * initial EMPTY basis or the exact complete OPEN predecessor.  The matching
- * REQUEST remains the sole authority that installs the round; this helper
- * never publishes a table or an ACK.
+ * Retain its exact authenticated tuple while the initial local gate catches
+ * up, or against the complete OPEN predecessor of a later round. The matching
+ * REQUEST still installs the round through the ordinary gate checks; this
+ * helper never publishes a table or an ACK.
  */
 static bool
 semantic_activation_ack_before_sample_request_candidate(
@@ -2205,17 +2205,18 @@ semantic_activation_ack_before_sample_request_candidate(
 		|| cluster_membership_get_state(current_coordinator_node) != CLUSTER_MEMBER_MEMBER
 		|| cluster_membership_get_state(local_node_id) != CLUSTER_MEMBER_MEMBER
 		|| (local_capability_word & required_caps) != required_caps
-		|| (snapshot.seq & UINT64_C(1)) != 0 || snapshot.formation_epoch != current_epoch
+		|| (snapshot.seq & UINT64_C(1)) != 0
 		|| snapshot.record_generation == UINT64_MAX
 		|| !semantic_activation_ack_remote_tuple(item, current_members_lo, current_members_hi,
 												 current_epoch, current_coordinator_node, &tuple))
 		return false;
 
-	exact_basis = !snapshot.transition_closed && snapshot.record_generation == 0
+	exact_basis = semantic_activation_first_writer_live() && snapshot.record_generation == 0
 				  && snapshot.active_bits == 0 && message->source_feature_bitmap == 0
+				  && (snapshot.formation_epoch == CLUSTER_EPOCH_INITIAL
+					  || snapshot.formation_epoch == current_epoch)
 				  && message->record_generation == 1
 				  && message->target_feature_bitmap == CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
-				  && semantic_activation_r4_initial_clean_sample_basis(0, false)
 				  && semantic_activation_bytes_are_zero((const uint8 *)&image + payload_offset,
 														sizeof(image) - payload_offset);
 	if (!exact_basis) {
@@ -2231,7 +2232,7 @@ semantic_activation_ack_before_sample_request_candidate(
 			  && semantic_activation_ack_complete_image_current(
 				  &image, current_members_lo, current_members_hi, current_epoch,
 				  current_coordinator_node, local_node_id, local_capability_word);
-		exact_basis = complete_open_predecessor
+		exact_basis = complete_open_predecessor && snapshot.formation_epoch == current_epoch
 					  && ((!snapshot.transition_closed
 						   && snapshot.record_generation == image.record_generation
 						   && snapshot.active_bits == image.target_feature_bitmap)

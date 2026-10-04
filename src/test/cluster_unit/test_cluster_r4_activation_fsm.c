@@ -3199,7 +3199,10 @@ test_member_early_sample_ack(int observation_gap)
 		break;
 	case 10: test_terminal_nonmember = 1; break;
 	case 11: test_remote_admitted_incarnations[1]++; break;
-	case 12: test_peer_capability_generation++; break;
+	case 12:
+		test_peer_capability_generation++;
+		test_capability_missing_peer = 1; /* old peer generation no longer matches */
+		break;
 	default: break;
 	}
 	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
@@ -3212,6 +3215,7 @@ test_member_early_sample_ack(int observation_gap)
 	if (observation_gap >= 7 && observation_gap <= 12) {
 		UT_ASSERT_EQ(table.observed_members_lo & UINT64_C(2), UINT64_C(0));
 		UT_ASSERT_EQ(table.flags & CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE, 0);
+		test_capability_missing_peer = -1;
 		test_gate_reset();
 		return;
 	}
