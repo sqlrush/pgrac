@@ -416,6 +416,79 @@ wb_v2_offer_fixture(ClusterPiWritebackMessageV2 *m, const ClusterPiDataFactV1 *d
 		sizeof(m->facts[0].proof.structural.terminal.storage_cut));
 }
 
+UT_TEST(writeback_v2_request_cut_checks_real_sender_and_recipient)
+{
+	ClusterPageDataReceiptV1 *receipt = wb_setup();
+	ClusterPiDataFactV1 data;
+	ClusterPiWritebackMessageV2 m;
+	UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &data));
+	for (unsigned shape = 0; shape < 4; shape++) {
+		int sender = shape == 3 ? 2 : 0;
+		if (shape == 3)
+			wb_v2_offer_fixture(&m, &data, false);
+		else if (shape == 2)
+			wb_v2_origin_fixture(&m, &data);
+		else {
+			wb_v2_fixture(&m, &data);
+			if (shape == 0) m.count = 1;
+		}
+		wb_select(sender, B_BG_WRITER);
+		UT_ASSERT(cluster_pi_writeback_request_current_v2(&m, true));
+		UT_ASSERT(!cluster_pi_writeback_request_current_v2(&m, false));
+		wb_select(m.peer.claim.identity.origin_node_id, B_BG_WRITER);
+		UT_ASSERT(cluster_pi_writeback_request_current_v2(&m, false));
+		UT_ASSERT(!cluster_pi_writeback_request_current_v2(&m, true));
+		UT_ASSERT_EQ(wb_sends + wb_plan_builds + pi_discards, 0);
+	}
+	wb_select(0, B_CHECKPOINTER);
+	cluster_page_data_receipt_free_v1(&receipt);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(writeback_v2_request_cut_refuses_missing_or_changed_proofs)
+{
+	for (unsigned fault = 0; fault < 20; fault++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiDataFactV1 data;
+		ClusterPiWritebackMessageV2 m, before;
+		UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &data));
+		wb_v2_fixture(&m, &data);
+		switch (fault) {
+		case 0: wb_local_caps = 0; break;
+		case 1: wb_peer_caps = 0; break;
+		case 2: wb_cap_available = false; break;
+		case 3: wb_cap_generation = 0; break;
+		case 4: wb_ko_current = false; break;
+		case 5: wb_cap_drift = 1; break;
+		case 6: wb_cap_drift = 2; break;
+		case 7: wb_cap_drift = 3; break;
+		case 8: wb_route = 2; break;
+		case 9: wb_stop = true; break;
+		case 10: wb_quorum = false; break;
+		case 11: m.epoch++; break;
+		case 12: wb_boots[1]++; break;
+		case 13: wb_recovered_sources = 2; break;
+		case 14: writer.claim.database_incarnation++; break;
+		case 15: m.verb = CLUSTER_PI_WRITEBACK_ACK; m.count = 0; break;
+		case 16: wb_membership_generation++; break;
+		case 17: wb_select(2, B_BG_WRITER); break;
+		case 18: m.peer.claim.identity.origin_owner_incarnation++; break;
+		case 19: selected = false; break;
+		}
+		before = m;
+		UT_ASSERT(!cluster_pi_writeback_request_current_v2(&m, true));
+		UT_ASSERT(memcmp(&before, &m, sizeof(m)) == 0);
+		UT_ASSERT_EQ(wb_sends + wb_plan_builds + pi_discards, 0);
+		selected = true;
+		wb_select(0, B_CHECKPOINTER);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+	UT_ASSERT(!cluster_pi_writeback_request_current_v2(NULL, true));
+}
+
 UT_TEST(writeback_v2_relation_offer_has_no_page_master_authority)
 {
 	ClusterPageDataReceiptV1 *receipt = wb_setup();

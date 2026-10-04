@@ -31,6 +31,9 @@ PROC_HDR *ProcGlobal;
 static uint64 wb_epoch = 1, wb_nonce;
 static uint64 wb_boots[3] = { 9, 9, 9 };
 static uint64 wb_membership_generation = 2;
+static uint32 wb_local_caps, wb_peer_caps, wb_cap_generation;
+static bool wb_cap_available, wb_ko_current;
+static int wb_cap_samples, wb_cap_drift, wb_route;
 static bool wb_quorum = true, wb_stop, wb_input_current = true, wb_input_wait;
 static ClusterWalSourceRef wb_sources[3];
 static ClusterPcmPiStorageCutV1 wb_storage_cut;
@@ -391,6 +394,36 @@ cluster_membership_cut_generation_current(uint64 expected)
 {
 	return expected != 0 && !(expected & 1) && expected == wb_membership_generation;
 }
+/* External read-only identity boundaries; this never substitutes for a
+ * structural receipt, retained ancestry, physical discard or opaque ACK. */
+uint32
+cluster_ic_local_capability_word(void)
+{
+	return wb_local_caps;
+}
+bool
+cluster_sf_peer_capability_word_sample(int32 peer, uint32 required, uint32 *word,
+	uint32 *generation)
+{
+	UT_ASSERT(peer >= 0 && peer < 3 && peer != cluster_node_id);
+	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2);
+	*word = wb_peer_caps;
+	*generation = wb_cap_generation;
+	wb_cap_samples++;
+	if (wb_cap_samples > 1 && wb_cap_drift == 1)
+		(*generation)++;
+	if (wb_cap_samples == 1 && wb_cap_drift == 2)
+		wb_membership_generation += 2;
+	if (wb_cap_samples == 1 && wb_cap_drift == 3)
+		writer.claim.identity.origin_owner_incarnation++;
+	return wb_cap_available && (wb_peer_caps & required) == required;
+}
+bool
+cluster_ko_shared_cut_current_v2(const ClusterKoSharedMessageV2 *request)
+{
+	UT_ASSERT(request != NULL && request->verb == CLUSTER_KO_SHARED_REQUEST);
+	return wb_ko_current;
+}
 uint64
 cluster_membership_get_last_admitted_incarnation(int32 node)
 {
@@ -399,7 +432,7 @@ cluster_membership_get_last_admitted_incarnation(int32 node)
 int32
 cluster_gcs_lookup_master(BufferTag tag)
 {
-	return 0;
+	return wb_route;
 }
 bool
 cluster_pcm_lock_pi_write_snapshot_v1(BufferTag tag, ClusterPcmPiWriteCutV1 *out)
@@ -791,6 +824,10 @@ wb_setup(void)
 	wb_multiple = false;
 	wb_epoch = ack_writer_epoch = 1;
 	wb_membership_generation = 2;
+	wb_local_caps = wb_peer_caps = PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+	wb_cap_generation = 7;
+	wb_cap_available = wb_ko_current = true;
+	wb_cap_samples = wb_cap_drift = wb_route = 0;
 	wb_recovered_sources = 0;
 	wb_recovered_boot = 9;
 	wb_quorum = wb_input_current = true;
@@ -1837,7 +1874,9 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(40);
+	UT_RUN(writeback_v2_request_cut_checks_real_sender_and_recipient);
+	UT_RUN(writeback_v2_request_cut_refuses_missing_or_changed_proofs);
 	UT_RUN(writeback_v2_relation_offer_has_no_page_master_authority);
 	UT_RUN(writeback_v2_relation_offer_rejects_misrouting_mixed_or_master_cuts);
 	UT_RUN(writeback_v2_relation_offer_ack_cannot_ack_a_page_fact);
