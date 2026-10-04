@@ -10,6 +10,7 @@
  *	      F4  a failed prefinish releases what it staged; abort is a no-op
  *	      F5  stamps that would precede their flushed record PANIC
  *	      F6  the abort callback is registered once per backend
+ *	      F7  only a live stage of the transaction reports staged
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -505,6 +506,26 @@ UT_TEST(test_f5_stamps_before_their_record_panic)
 	UT_ASSERT_EQ(leaves, 1);
 }
 
+/* Only a live stage of this transaction makes the abort record path delay
+ * checkpoints. */
+UT_TEST(test_f7_has_staged_names_only_a_live_stage)
+{
+	reset();
+	UT_ASSERT(!cluster_tt_twophase_has_staged(XID));
+	UT_ASSERT(!raises(prefinish_commit));
+	UT_ASSERT(cluster_tt_twophase_has_staged(XID));
+	UT_ASSERT(!cluster_tt_twophase_has_staged(XID + 1));
+	cluster_tt_twophase_emit_staged(XID);
+	UT_ASSERT(!raises(apply_staged));
+	cluster_tt_twophase_postfinish(XID);
+	UT_ASSERT(!cluster_tt_twophase_has_staged(XID));
+
+	reset();
+	UT_ASSERT(!raises(prefinish_commit));
+	abort_event();
+	UT_ASSERT(!cluster_tt_twophase_has_staged(XID));
+}
+
 UT_TEST(test_f6_abort_callback_registered_once)
 {
 	UT_ASSERT_EQ(registrations, 1);
@@ -514,12 +535,13 @@ int
 main(void)
 {
 	make_record();
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_f1_normal_finish_publishes_and_releases_once);
 	UT_RUN(test_f2_abort_after_stage_releases_stage_and_admission);
 	UT_RUN(test_f3_abort_after_record_releases_without_publishing);
 	UT_RUN(test_f4_failed_prefinish_releases_what_it_staged);
 	UT_RUN(test_f5_stamps_before_their_record_panic);
+	UT_RUN(test_f7_has_staged_names_only_a_live_stage);
 	UT_RUN(test_f6_abort_callback_registered_once);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

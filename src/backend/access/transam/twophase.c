@@ -82,6 +82,8 @@
  *	    written after the record is flushed and before pg_xact, and the
  *	    allocator, overlay and hint follow in FinishPreparedTransaction once
  *	    the gxact is no longer valid (cluster_tt_twophase_postfinish).
+ *	  - RecordTransactionAbortPrepared delays checkpoints from the staged TT
+ *	    record insert until its stamps are written, as the commit side does.
  *
  *	What changed (spec-1.16 v0.2):
  *	  - FinishPreparedTransaction(): hooks cluster_scn_advance_for_commit
@@ -3259,6 +3261,9 @@ RecordTransactionAbortPrepared(TransactionId xid, int nchildren, TransactionId *
 {
 	XLogRecPtr recptr;
 	bool replorigin;
+#ifdef USE_PGRAC_CLUSTER
+	bool tt_abort_staged;
+#endif
 
 	/*
 	 * Are we using the replication origins feature?  Or, in other words, are
@@ -3277,7 +3282,16 @@ RecordTransactionAbortPrepared(TransactionId xid, int nchildren, TransactionId *
 	START_CRIT_SECTION();
 
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: F-D-31 -- the staged TT abort WAL goes just before the record. */
+	/*
+	 * PGRAC: F-D-31 -- the staged TT abort WAL goes just before the record.
+	 * Like a commit, checkpoints wait from that insert until the stamps are
+	 * written (cluster_undo_smgr.h); native aborts keep PG's behavior.
+	 */
+	tt_abort_staged = cluster_tt_twophase_has_staged(xid);
+	if (tt_abort_staged) {
+		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	}
 	cluster_tt_twophase_emit_staged(xid);
 #endif
 
@@ -3304,6 +3318,8 @@ RecordTransactionAbortPrepared(TransactionId xid, int nchildren, TransactionId *
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: F-D-31 -- the ABORTED stamps follow their flushed record. */
 	cluster_tt_twophase_apply_staged(xid, recptr);
+	if (tt_abort_staged)
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 #endif
 
 	/*

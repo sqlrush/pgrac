@@ -409,12 +409,17 @@ UT_TEST(test_s14_prepared_finish_publishes_tt_only_after_its_record)
 		"cluster_tt_twophase_apply_staged(xid, recptr);",
 		"TransactionIdCommitTree(",
 	};
+	/* P2: a staged abort, like a commit, keeps checkpoints waiting from its
+	 * TT record insert until the stamps are written (cluster_undo_smgr.h). */
 	static const char *const abort_record[] = {
 		"START_CRIT_SECTION();",
+		"cluster_tt_twophase_has_staged(xid)",
+		"MyProc->delayChkptFlags |= DELAY_CHKPT_START;",
 		"cluster_tt_twophase_emit_staged(xid);",
 		"XactLogAbortRecord(",
 		"XLogFlush(recptr);",
 		"cluster_tt_twophase_apply_staged(xid, recptr);",
+		"MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;",
 		"TransactionIdAbortTree(",
 	};
 	static const char *const finish[] = {

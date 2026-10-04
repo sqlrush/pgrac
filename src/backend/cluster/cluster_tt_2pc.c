@@ -553,6 +553,13 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 	tt_2pc_stage.armed = true;
 }
 
+/* Whether this transaction's finish has a live stage (critical-section safe). */
+bool
+cluster_tt_twophase_has_staged(TransactionId xid)
+{
+	return tt_2pc_stage.armed && tt_2pc_stage.xid == xid;
+}
+
 /*
  * Inside the COMMIT/ROLLBACK PREPARED critical section, just before its
  * record: insert the staged bindings' TT WAL.  A transaction without cluster
@@ -573,9 +580,8 @@ cluster_tt_twophase_emit_staged(TransactionId xid)
 
 /*
  * Inside the same critical section, after the record ending at record_end is
- * flushed and before pg_xact: write the staged successors.  The caller still
- * delays checkpoints for a commit; an abort's lost write leaves an ACTIVE slot
- * that crash-left resolution aborts.
+ * flushed and before pg_xact: write the staged successors.  The caller delays
+ * checkpoints from the TT record insert until this returns.
  */
 void
 cluster_tt_twophase_apply_staged(TransactionId xid, XLogRecPtr record_end)

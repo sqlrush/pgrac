@@ -562,6 +562,8 @@ static bool g_allocator_rollover_after_first_owner = false;
 static int g_bind_emit_calls = 0;
 static xl_undo_tt_slot_bind g_last_bind;
 static int g_abort_exact_emit_calls = 0;
+static int g_emit_delay_flags = -1;	 /* MyProc->delayChkptFlags at the 0x60 insert */
+static int g_write_delay_flags = -1; /* ... and at the header write */
 static XLogRecPtr g_abort_exact_lsn = (XLogRecPtr)0xfedcba;
 static XLogRecPtr g_flushed_lsn = InvalidXLogRecPtr;
 static bool g_abort_flush_seen = false;
@@ -743,6 +745,7 @@ cluster_undo_emit_tt_slot_abort_exact(uint8 instance pg_attribute_unused(),
 									  TransactionId xid pg_attribute_unused())
 {
 	g_abort_exact_emit_calls++;
+	g_emit_delay_flags = MyProc->delayChkptFlags;
 	return g_abort_exact_lsn;
 }
 
@@ -852,6 +855,7 @@ cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent pg_attribute_u
 									 uint32 len)
 {
 	g_write_hdr_calls++;
+	g_write_delay_flags = MyProc->delayChkptFlags;
 	g_ctrc_write_order = ++g_ctrc_event_sequence;
 	if (g_require_abort_flush_before_write && !g_abort_flush_seen)
 		return false;
@@ -2756,6 +2760,45 @@ UT_TEST(test_ordinary_abort_flushes_exact_carrier_before_terminal_write)
 	UT_ASSERT_EQ(g_current_cancel_calls, 2);
 }
 
+/*
+ * P2 (F-D-29 review): the 0x60 record is inserted outside the block-zero
+ * content lock, so record insert through header write must sit inside a
+ * DELAY_CHKPT_START window (cluster_undo_smgr.h); otherwise a checkpoint whose
+ * redo point passes the record can sync headers before the write.  The window
+ * closes on success and on ERROR.
+ */
+UT_TEST(test_ordinary_abort_delays_checkpoint_from_record_to_write)
+{
+	ClusterSemanticAdmissionToken admission = target_modifier_token();
+	TTSlot successor;
+	volatile bool caught = false;
+
+	reset_current_write_mock();
+	seed_current_exact_active(7, 100, 5);
+	MyProc->delayChkptFlags = 0;
+	g_emit_delay_flags = g_write_delay_flags = -1;
+	(void)cluster_tt_slot_durable_abort_exact(1, 4, 7, 100, 5, &admission, &successor);
+	UT_ASSERT(g_emit_delay_flags >= 0 && (g_emit_delay_flags & DELAY_CHKPT_START) != 0);
+	UT_ASSERT(g_write_delay_flags >= 0 && (g_write_delay_flags & DELAY_CHKPT_START) != 0);
+	UT_ASSERT_EQ(MyProc->delayChkptFlags, 0);
+
+	reset_current_write_mock();
+	seed_current_exact_active(7, 100, 5);
+	g_write_hdr_ok = false;
+	PG_TRY();
+	{
+		(void)cluster_tt_slot_durable_abort_exact(1, 4, 7, 100, 5, &admission, &successor);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	g_write_hdr_ok = true;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(MyProc->delayChkptFlags, 0);
+}
+
 UT_TEST(test_commit_stage_missing_canonical_active_refuses_without_write)
 {
 	ClusterSemanticAdmissionToken admission = source_modifier_token();
@@ -3580,7 +3623,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(109);
+	UT_PLAN(110);
 
 	UT_RUN(test_layout_sizes);
 
@@ -3642,6 +3685,7 @@ main(int argc, char **argv)
 	UT_RUN(test_prepared_apply_write_failure_panics);
 	UT_RUN(test_commit_stage_release_failure_is_nothrow_cleanup);
 	UT_RUN(test_ordinary_abort_flushes_exact_carrier_before_terminal_write);
+	UT_RUN(test_ordinary_abort_delays_checkpoint_from_record_to_write);
 	UT_RUN(test_commit_stage_missing_canonical_active_refuses_without_write);
 	UT_RUN(test_commit_stage_missing_pgrd_nonempty_refuses_without_write);
 

@@ -1442,12 +1442,29 @@ cluster_tt_slot_durable_abort_exact(uint32 segment_id, uint32 segment_generation
 	owner = tt_slot_durable_terminal_exact(segment_id, segment_generation, slot_offset, xid, wrap,
 										   TT_SLOT_ABORTED, InvalidScn, false, admission, NULL,
 										   &prepared_successor);
-	abort_lsn = cluster_undo_emit_tt_slot_abort_exact(owner, segment_id, segment_generation,
-													  slot_offset, wrap, xid);
-	XLogFlush(abort_lsn);
-	(void)tt_slot_durable_terminal_exact(segment_id, segment_generation, slot_offset, xid, wrap,
-										 TT_SLOT_ABORTED, InvalidScn, true, admission, NULL,
-										 successor_out);
+
+	/*
+	 * The record is inserted outside the block-zero content lock: from its
+	 * insert until the stamp is written and noted, checkpoints wait
+	 * (cluster_undo_smgr.h), or one whose redo point passed the record could
+	 * sync headers before the write.
+	 */
+	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	PG_TRY();
+	{
+		abort_lsn = cluster_undo_emit_tt_slot_abort_exact(owner, segment_id, segment_generation,
+														  slot_offset, wrap, xid);
+		XLogFlush(abort_lsn);
+		(void)tt_slot_durable_terminal_exact(segment_id, segment_generation, slot_offset, xid, wrap,
+											 TT_SLOT_ABORTED, InvalidScn, true, admission, NULL,
+											 successor_out);
+	}
+	PG_FINALLY();
+	{
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+	}
+	PG_END_TRY();
 	return abort_lsn;
 }
 

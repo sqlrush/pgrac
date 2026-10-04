@@ -170,10 +170,14 @@ extern void PostPrepare_ClusterTT(void);
  *   before pg_xact, write the stamps (PANIC on failure).
  * postfinish: after the gxact is no longer valid, publish allocator, overlay
  *   and hint, and release the stage.
+ * has_staged: whether the record path must delay checkpoints from the staged
+ *   TT record insert until apply_staged returns (an abort sets the delay only
+ *   then; a commit always does).
  * All but prefinish are no-ops when nothing was staged.
  */
 extern void cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit,
 										  const void *recdata, uint32 len);
+extern bool cluster_tt_twophase_has_staged(TransactionId xid);
 extern void cluster_tt_twophase_emit_staged(TransactionId xid);
 extern void cluster_tt_twophase_apply_staged(TransactionId xid, XLogRecPtr record_end);
 extern void cluster_tt_twophase_postfinish(TransactionId xid);
