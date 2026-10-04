@@ -54,6 +54,7 @@
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_config_members.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_ges.h"
@@ -144,10 +145,9 @@ cluster_cf_held(LOCKMODE mode pg_attribute_unused())
 const char *cluster_phase = "pre_init";
 
 void
-ExceptionalCondition(const char *conditionName pg_attribute_unused(),
-					 const char *fileName pg_attribute_unused(),
-					 int lineNumber pg_attribute_unused())
+ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
 {
+	fprintf(stderr, "assertion failed: %s (%s:%d)\n", conditionName, fileName, lineNumber);
 	abort();
 }
 
@@ -155,6 +155,7 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 static jmp_buf phase4_fatal_jump;
 static bool phase4_capture_fatal = false;
 static int phase4_last_elevel = 0;
+static char phase4_last_error[512];
 
 bool
 errstart(int e, const char *d pg_attribute_unused())
@@ -190,8 +191,14 @@ errcode(int s pg_attribute_unused())
 	return 0;
 }
 int
-errmsg(const char *f pg_attribute_unused(), ...)
+errmsg(const char *f, ...)
 {
+	if (phase4_capture_fatal && phase4_last_elevel >= ERROR) {
+		va_list ap;
+		va_start(ap, f);
+		vsnprintf(phase4_last_error, sizeof(phase4_last_error), f, ap);
+		va_end(ap);
+	}
 	return 0;
 }
 int
@@ -421,6 +428,20 @@ static bool phase_test_self_join_admitted = false;
 static uint64 phase_test_episode_epoch = 0;
 static bool phase_test_join_remaster = false;
 bool cluster_shared_config = false;
+static int phase_test_semantic_poll_calls;
+static int phase_test_semantic_ready_after;
+
+bool
+cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refusal)
+{
+	phase_test_semantic_poll_calls++;
+	memset(refusal, 0, sizeof(*refusal));
+	refusal->result = CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED;
+	/* Original postmaster caller must remain off every backend wait edge. */
+	Assert(!IsUnderPostmaster && MyProc == NULL && !phase_test_cf_held);
+	return phase_test_semantic_ready_after > 0
+		&& phase_test_semantic_poll_calls >= phase_test_semantic_ready_after;
+}
 static ReconfigEvent phase_test_protocol_event;
 static uint32 phase_test_protocol_state = GRD_RECOVERY_IDLE;
 static uint64 phase_test_protocol_event_id;
@@ -958,6 +979,8 @@ cluster_lms_is_ready(void)
 static void
 reset_phase_service_fixture(bool formed_registry)
 {
+	phase_test_semantic_poll_calls = 0;
+	phase_test_semantic_ready_after = 1;
 	MyBackendType = B_INVALID;
 	MyAuxProcType = NotAnAuxProcess;
 	phase_test_fence_cache_expired = false;
@@ -2383,6 +2406,82 @@ UT_TEST(test_join_readonly_rebuild_binds_generation_once_per_iteration)
 }
 
 
+UT_TEST(test_shared_phase4_waits_for_actual_semantic_open)
+{
+	bool caught_fatal = false;
+
+	reset_phase_service_fixture(true);
+	phase_lwlock_conditional_result = true;
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	cluster_run_startup_sequence();
+	cluster_shared_config = true;
+	test_mount_result = CLUSTER_CONFIG_MOUNT_MATCH;
+	phase_test_control_acquire_ready = true;
+	phase_test_semantic_ready_after = 3;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0) {
+		cluster_run_phase4_sequence();
+		cluster_finalize_startup_running();
+	}
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	if (caught_fatal)
+		printf("# unexpected phase4 refusal: %s\n", phase4_last_error);
+	UT_ASSERT(!caught_fatal);
+	UT_ASSERT_EQ(phase_test_semantic_poll_calls, 3);
+	UT_ASSERT_EQ(cluster_current_phase(), CLUSTER_PHASE_RUNNING);
+	UT_ASSERT(phase4_test_now >= 40000);
+	reset_phase_service_fixture(true);
+}
+
+UT_TEST(test_shared_phase4_cannot_publish_running_without_semantic_open)
+{
+	bool caught_fatal = false;
+	int saved_timeout = cluster_phase4_timeout;
+
+	reset_phase_service_fixture(true);
+	phase_lwlock_conditional_result = true;
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	cluster_run_startup_sequence();
+	cluster_shared_config = true;
+	test_mount_result = CLUSTER_CONFIG_MOUNT_MATCH;
+	phase_test_control_acquire_ready = true;
+	phase_test_semantic_ready_after = 0;
+	cluster_phase4_timeout = 1;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0) {
+		cluster_run_phase4_sequence();
+		cluster_finalize_startup_running();
+	}
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	cluster_phase4_timeout = saved_timeout;
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT(phase_test_semantic_poll_calls > 1);
+	UT_ASSERT_EQ(cluster_current_phase(), CLUSTER_PHASE_4_NORMAL);
+	UT_ASSERT(phase4_test_now <= INT64CONST(1000000));
+	reset_phase_service_fixture(true);
+}
+
+UT_TEST(test_nonshared_phase4_keeps_original_activation_entry)
+{
+	reset_phase_service_fixture(true);
+	phase_lwlock_conditional_result = true;
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	cluster_run_startup_sequence();
+	phase_test_semantic_ready_after = 0;
+	cluster_run_phase4_sequence();
+	cluster_finalize_startup_running();
+	UT_ASSERT_EQ(phase_test_semantic_poll_calls, 0);
+	UT_ASSERT_EQ(cluster_current_phase(), CLUSTER_PHASE_RUNNING);
+	reset_phase_service_fixture(true);
+}
+
 /* ============================================================
  * Test runner
  * ============================================================ */
@@ -2390,7 +2489,10 @@ UT_TEST(test_join_readonly_rebuild_binds_generation_once_per_iteration)
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(51);
+	UT_RUN(test_shared_phase4_waits_for_actual_semantic_open);
+	UT_RUN(test_shared_phase4_cannot_publish_running_without_semantic_open);
+	UT_RUN(test_nonshared_phase4_keeps_original_activation_entry);
 	UT_RUN(test_startup_refresh_requires_exact_owner_and_fresh_unchanged_proof);
 	UT_RUN(test_native_initializer_walr_share_nowait_reaches_all_startup_gates);
 	UT_RUN(test_native_initializer_walr_share_cannot_borrow_another_role_or_generation);

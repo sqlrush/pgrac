@@ -42,6 +42,7 @@
 #include "postgres.h"
 
 #include "port/pg_bitutils.h" /* pg_number_of_ones (cold-formation bitmap) */
+#include "portability/instr_time.h"
 
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_recovery_duty.h"
@@ -8992,13 +8993,31 @@ cluster_reconfig_startup_formation_current_locked(void)
 		&ReconfigShmem->startup_formation, ReconfigShmem->startup_formation_incarnations, true);
 }
 
+/* Revalidate the accepted marker against the continuously renewed proof.
+ * The remembered identity never extends that proof's lifetime.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+cluster_reconfig_startup_fence_current(const ClusterFenceMarker *expected)
+{
+	instr_time now;
+	int64 ns;
+
+	INSTR_TIME_SET_CURRENT(now);
+	ns = INSTR_TIME_GET_NANOSEC(now);
+	return ns > 0 && cluster_write_fence_allowed()
+		&& cluster_write_fence_revalidate_cached_nowait(expected, (uint64)ns / 1000)
+			== CLUSTER_FENCE_CACHE_MATCH;
+}
+
 static void
 cluster_reconfig_startup_formation_progress(void)
 {
 	ClusterWalSourceRef writer;
 	ClusterXidStripeJoinVerdict stripe;
+	ClusterFenceMarker expected_fence;
 	uint64 generation;
 	uint64 incarnation;
+	bool self_may_seed;
 	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
 	if (!cluster_reconfig_startup_formation_current_locked() || ReconfigShmem->self_join_admitted
 		|| cold_formation_state.admission_done) {
@@ -9007,18 +9026,22 @@ cluster_reconfig_startup_formation_progress(void)
 	}
 	generation = ReconfigShmem->startup_formation.formation_generation;
 	incarnation = ReconfigShmem->startup_formation_incarnations[cluster_node_id];
+	self_may_seed = ReconfigShmem->startup_formation.arbiter_node == (uint64)cluster_node_id;
+	expected_fence = ReconfigShmem->startup_expected_fence;
 	LWLockRelease(&ReconfigShmem->lock);
 	/* The exact native writer is installed only by the typed root/claim/anchor
 	 * path. Never call the WAL-producing stripe gate on the predecessor. */
 	if (RecoveryInProgress() || !cluster_wal_thread_current_v2_ref(&writer)
 		|| writer.claim.identity.origin_node_id != cluster_node_id
-		|| writer.claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation())
+		|| writer.claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation()
+		|| !cluster_reconfig_startup_fence_current(&expected_fence))
 		return;
-	stripe = cluster_xid_stripe_join_gate(false);
+	stripe = cluster_xid_stripe_join_gate(self_may_seed);
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
 	if (!cluster_reconfig_startup_formation_current_locked()
 		|| ReconfigShmem->startup_formation.formation_generation != generation
-		|| ReconfigShmem->startup_formation_incarnations[cluster_node_id] != incarnation) {
+		|| ReconfigShmem->startup_formation_incarnations[cluster_node_id] != incarnation
+		|| !cluster_reconfig_startup_fence_current(&expected_fence)) {
 		LWLockRelease(&ReconfigShmem->lock);
 		return;
 	}
@@ -9189,6 +9212,7 @@ cluster_reconfig_cold_formation_admit(const ClusterFormationCommitMarker *marker
 				ReconfigShmem->clean_departed_bitmap[i / 8] &= (uint8) ~(1u << (i % 8));
 			}
 		ReconfigShmem->startup_formation = *marker;
+		ReconfigShmem->startup_expected_fence = proof->marker;
 		if (ReconfigShmem->last_applied.event_id == 0)
 			ReconfigShmem->last_applied.new_epoch = marker->formation_epoch;
 		memcpy(ReconfigShmem->startup_formation_incarnations, incarnation_by_node,

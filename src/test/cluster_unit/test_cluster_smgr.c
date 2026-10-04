@@ -42,6 +42,7 @@
 
 #include <stdarg.h>
 
+#include "cluster/cluster_ko.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "cluster/storage/cluster_shared_fs.h"
 
@@ -77,12 +78,37 @@
 int cluster_shared_storage_backend = 0;
 bool cluster_smgr_user_relations = false;
 bool cluster_shared_config = false;
+bool enableFsync = true;
 bool cluster_shared_catalog = false;			   /* spec-6.14 D3 routing flip */
 bool cluster_controlfile_shared_authority = false; /* read by D1 startup vet */
 bool cluster_merged_recovery = false;			   /* read by D1 startup vet (D9 amend dep) */
 bool IsBinaryUpgrade = false;
 volatile uint32 InterruptHoldoffCount = 0;
 volatile uint32 QueryCancelHoldoffCount = 0;
+
+/* This link-only fixture has no original postcommit DROP owner. */
+bool
+cluster_ko_shared_pending_drop_v2(RelFileLocator locator pg_attribute_unused(),
+	ClusterKoCompletionV2 **completion)
+{
+	if (completion != NULL)
+		*completion = NULL;
+	return false;
+}
+
+bool
+cluster_ko_shared_space_observation_v2(const ClusterKoCompletionV2 *completion pg_attribute_unused(),
+	struct ClusterPageWalBindingV1 *terminal pg_attribute_unused(),
+	void *wal pg_attribute_unused(), Size wal_length pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_ko_shared_observe_drop_v2(ClusterKoCompletionV2 *completion pg_attribute_unused())
+{
+	return false;
+}
 
 /* This standalone unit does not provide PG's error stack. These link-only
  * paths must never manufacture a successful unit result. */

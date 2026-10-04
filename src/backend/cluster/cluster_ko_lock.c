@@ -166,6 +166,7 @@ struct ClusterKoCompletionV2 {
 	bool native_pending;
 	bool space_observed;
 	bool truncate_observed;
+	bool drop_observed;
 	bool postcommit;
 	ClusterPageWalBindingV1 terminal;
 	uint8 structure[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
@@ -796,6 +797,36 @@ cluster_ko_shared_truncate_observation_v2(const ClusterKoCompletionV2 *completio
 }
 
 bool
+cluster_ko_shared_observe_drop_v2(ClusterKoCompletionV2 *completion)
+{
+	ClusterKoCompletionV2 *owned = *ko_completion_link(completion), *borrowed = NULL;
+	ClusterPageWalBindingV1 terminal;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+
+	if (owned == NULL || owned->drop_observed || !owned->postcommit
+		|| !cluster_ko_shared_space_observation_v2(owned, &terminal, wal, sizeof(wal))
+		|| !cluster_ko_shared_pending_drop_v2(terminal.identity.locator, &borrowed)
+		|| borrowed != owned)
+		return false;
+	/* The original storage owner reports its physical result only after the
+	 * exact COMMIT-DROP's durable namespace operation. Re-borrowing the same
+	 * unique top-transaction handle also rejects ambiguous retained barriers.
+	 * No raw physical-result flag or replacement owner can create this fact. */
+	owned->drop_observed = true;
+	return true;
+}
+
+static bool
+ko_structure_effect_observation(const ClusterKoCompletionV2 *completion,
+	ClusterPageWalBindingV1 *terminal, void *wal, Size wal_length)
+{
+	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
+
+	return owned != NULL && (owned->truncate_observed || owned->drop_observed)
+		&& cluster_ko_shared_space_observation_v2(owned, terminal, wal, wal_length);
+}
+
+bool
 cluster_ko_shared_structure_offer_v2(const ClusterKoCompletionV2 *completion,
 	int32 peer, struct ClusterPiWritebackFactV2 *out)
 {
@@ -805,7 +836,7 @@ cluster_ko_shared_structure_offer_v2(const ClusterKoCompletionV2 *completion,
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 
 	if (out == NULL || owned == NULL || !owned->postcommit
-		|| !cluster_ko_shared_truncate_observation_v2(owned, &s->terminal.binding,
+		|| !ko_structure_effect_observation(owned, &s->terminal.binding,
 			wal, sizeof(wal))
 		|| !cluster_ko_shared_read_v2(owned, peer, &s->ko)
 		|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &s->change))
@@ -813,7 +844,9 @@ cluster_ko_shared_structure_offer_v2(const ClusterKoCompletionV2 *completion,
 	value.kind = CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2;
 	s->durability_flags = CLUSTER_PI_STRUCTURAL_WAL_FLUSHED
 		| CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK | CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED
-		| CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE | CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
+		| CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE;
+	if (s->change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE)
+		s->durability_flags |= CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
 	/* This value has no page/master cut. It can only transfer the completed
 	 * relation result to the original peer's background owner; it cannot
 	 * acknowledge a page or extend this transaction's local ownership. */
@@ -835,7 +868,7 @@ cluster_ko_shared_structure_handoff_v2(ClusterKoCompletionV2 **completion)
 	link = ko_completion_link(*completion);
 	owned = *link;
 	if (owned == NULL || !owned->postcommit
-		|| !cluster_ko_shared_truncate_observation_v2(owned, &terminal, wal, sizeof(wal))
+		|| !ko_structure_effect_observation(owned, &terminal, wal, sizeof(wal))
 		|| !ko_completion_snapshot(owned, &before))
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
@@ -914,13 +947,16 @@ cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer, uint64 *se
 		if (!ko_shared_control_current(&s->ko)
 			|| !cluster_space_structure_wal_decode(context.structure, sizeof(context.structure),
 				&s->change)
-			|| s->change.identity.action != CLUSTER_SPACE_WAL_TRUNCATE)
+			|| (s->change.identity.action != CLUSTER_SPACE_WAL_TRUNCATE
+				&& s->change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE))
 			continue;
 		value.kind = CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2;
 		s->terminal.binding = context.terminal;
 		s->durability_flags = CLUSTER_PI_STRUCTURAL_WAL_FLUSHED
 			| CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK | CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED
-			| CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE | CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
+			| CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE;
+		if (s->change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE)
+			s->durability_flags |= CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
 		*out = value;
 		*serial = context.serial;
 		*cursor = i + 1;

@@ -334,5 +334,11 @@ extern bool cluster_pcm_lock_pi_storage_complete_v1(const ClusterPageDataReceipt
 													uint32 source_count,
 													const ClusterPiPhysicalAckV1 *const *acks,
 													uint32 ack_count, uint32 *holders_out);
+/* Original structural owner, never DATA/ROOT/GC authority. Qualify every
+ * holder before taking directory locks, then compare the entire X or N/S
+ * master cut under entry X. Refusal zeroes holders_out without changing
+ * the directory. The caller retains the receipt and all ACK/input scopes. */
+extern bool cluster_pcm_lock_pi_structural_complete_v2(const ClusterPageStructuralReceiptV2 *receipt,
+	const ClusterPiStructuralAckV2 *const *acks, uint32 ack_count, uint32 *holders_out);
 #endif
 #endif /* CLUSTER_PI_WRITE_H */

@@ -209,6 +209,8 @@ static bool owner_ack_on_wait;
 static bool owner_rebuild_frozen;
 static unsigned owner_wait_calls;
 static bool acknowledge_retirements(void);
+#include "test_cluster_startup_interrupt_fixture.h"
+static unsigned owner_shutdown_on_wait;
 
 /* The common gate itself is exercised against the real GRD FSM separately. */
 bool
@@ -235,6 +237,12 @@ WaitLatch(Latch *latch pg_attribute_unused(), int wake_events pg_attribute_unuse
 		  long timeout pg_attribute_unused(), uint32 event pg_attribute_unused())
 {
 	owner_wait_calls++;
+	if (owner_shutdown_on_wait != 0) {
+		StartupProcShutdownHandler(SIGTERM);
+		/* Bound RED without changing the first missing-ACK observation. */
+		if (--owner_shutdown_on_wait == 0)
+			UT_ASSERT(acknowledge_retirements());
+	}
 	if (owner_ack_on_wait)
 		UT_ASSERT(acknowledge_retirements());
 	return WL_LATCH_SET;

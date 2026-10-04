@@ -159,10 +159,10 @@ cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer, uint64 *se
 	if (!structural_scope_ready || *cursor != 7 || peer != 1)
 		return false;
 	value.kind = CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2;
-	s->durability_flags = 31;
 	s->terminal.binding = structural_terminal;
 	if (!cluster_space_structure_wal_decode(structural_wal, sizeof(structural_wal), &s->change))
 		return false;
+	s->durability_flags = s->change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE ? 31 : 15;
 	s->ko.verb = CLUSTER_KO_SHARED_REQUEST;
 	s->ko.batch_id = 51;
 	s->ko.epoch = 1;
@@ -3513,6 +3513,60 @@ structural_ack_requires_physical_completion_and_exact_local_responsibility(void)
 }
 
 static void
+structural_drop_ack_preserves_reused_incarnation_and_requires_exact_ancestry(void)
+{
+	const SCN tokens[] = {10, scn_encode(1, 20), 30};
+	for (unsigned mode = 0; mode < 3; mode++)
+		for (unsigned vm = 0; vm < 2; vm++)
+			for (unsigned physical = 0; physical < 4; physical++) {
+				ClusterPageWalBindingV1 binding, pi[2];
+				ClusterSpaceStructureChange change;
+				ClusterPageStructuralReceiptV2 *receipt = NULL;
+				ClusterPiStructuralAckV2 *ack = NULL;
+				ClusterPiWritebackFactV2 fact;
+				int32 node = 99;
+				ClusterThreadRecoveryFabricPlanV1 *plan = space_structural_plan_internal(true,
+					false, true, false, &binding, &change, tokens,
+					vm ? VISIBILITYMAP_FORKNUM : MAIN_FORKNUM, pi);
+				prepare_structural_master(&binding, &change, &pi[0].identity, mode);
+				UT_ASSERT_EQ(binding.rmid, RM_XACT_ID);
+				UT_ASSERT_EQ(change.identity.action, CLUSTER_SPACE_WAL_TOMBSTONE);
+				UT_ASSERT(cluster_page_structural_from_ko_v2(7, 19, &pi[0].identity, plan, &receipt));
+				/* The preceding assertion records constructor refusal as FAIL;
+				 * avoid dereferencing a missing receipt while collecting all cases. */
+				if (receipt != NULL) {
+					UT_ASSERT(cluster_page_structural_pi_fact_v2(receipt, 1, &fact));
+					UT_ASSERT_EQ(fact.kind, CLUSTER_PI_WRITEBACK_STRUCTURAL_V2);
+					UT_ASSERT_EQ(fact.proof.structural.durability_flags, 15);
+					prepare_structural_ack_inputs(plan, pi);
+					if (physical == 0 || physical == 3) {
+						ClusterPageWalBindingV1 resident_pi = pi[0];
+						if (physical == 3) resident_pi.version.segment_incarnation[0]++;
+						physical_pi_from_binding(&resident_pi);
+					} else if (physical == 1)
+						resident[1] = false;
+					UT_ASSERT_EQ(cluster_bufmgr_ack_pi_at_structure_v2(receipt, (void *)1, &ack),
+						physical != 3);
+					UT_ASSERT_EQ(ack != NULL, physical != 3);
+					if (physical != 3) {
+						UT_ASSERT(cluster_page_structural_pi_ack_read_v2(ack, receipt, &node));
+						UT_ASSERT_EQ(node, 0);
+					} else
+						UT_ASSERT(resident[1]);
+					UT_ASSERT_EQ(pi_discards, physical == 0 ? 1 : 0);
+					UT_ASSERT_EQ(logical_pi_retire_calls, physical == 3 ? 0 : 1);
+					UT_ASSERT_EQ(mode == 0 ? structural_write_cut.pi_holders_bitmap
+						: structural_storage_cut.pi_holders_bitmap, 3);
+				}
+				UT_ASSERT_EQ(writes + reads + syncs + wal_flushes, 0);
+				cluster_page_structural_pi_ack_free_v2(&ack);
+				cluster_page_structural_receipt_free_v2(&receipt);
+				cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+				clean();
+			}
+}
+
+static void
 structural_ack_refuses_incomplete_inputs_and_postphysical_races(void)
 {
 	const SCN tokens[] = {10, scn_encode(1, 20), 30};
@@ -4363,7 +4417,8 @@ int
 main(void)
 {
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
-	UT_PLAN(69);
+	UT_PLAN(70);
+	UT_RUN(structural_drop_ack_preserves_reused_incarnation_and_requires_exact_ancestry);
 	UT_RUN(structural_logical_both_anchors_must_belong_to_the_old_incarnation);
 	UT_RUN(structural_ack_requires_physical_completion_and_exact_local_responsibility);
 	UT_RUN(structural_ack_refuses_incomplete_inputs_and_postphysical_races);

@@ -30,10 +30,12 @@ pg_re_throw(void)
 	abort();
 }
 
+static int test_route_node_count = 4;
+
 int
 cluster_conf_node_count(void)
 {
-	return 4;
+	return test_route_node_count;
 }
 
 bool

@@ -6917,7 +6917,24 @@ StartupXLOG(void)
 		 * backup history file.
 		 *
 		 * No need to hold ControlFileLock yet, we aren't up far enough.
+		 *
+		 * PGRAC: self-sealing the crashed input does not publish a typed
+		 * recovery-start control purpose or select a RECOVERED successor.
+		 * Until that owner is wired, reject here outside critical sections;
+		 * never send this known unsupported purpose to the unclassified
+		 * UpdateControlFile PANIC, nor reinterpret it as clean startup.
 		 */
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_shared_config)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					 errmsg("shared crash recovery startup control purpose is not available"),
+					 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=COLD_START_PURPOSE_PENDING "
+							   "native_state=%d checkpoint=%X/%X",
+							   (int) ControlFile->state, LSN_FORMAT_ARGS(ControlFile->checkPoint)),
+					 errhint("Preserve the sealed WAL and ROOT. Shared crash restart requires "
+							 "typed recovery completion and its recovered successor.")));
+#endif
 		UpdateControlFile();
 
 		/*

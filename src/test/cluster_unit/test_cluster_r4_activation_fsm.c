@@ -28,6 +28,8 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_terminal_ref_census.h"
+#include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 
@@ -148,6 +150,38 @@ static ClusterSemanticActivationRecord test_terminal_peer_open;
 static uint8 test_terminal_peer_root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
 static bool test_stop_real_observation;
 bool cluster_shared_config;
+static ClusterWalSourceRef test_first_writer;
+static bool test_first_writer_installed, test_first_writer_initialized;
+static uint64 test_first_writer_epoch;
+static int test_first_live_checks;
+static ClusterControlRootResult test_first_live_result;
+
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
+{
+	if (!test_first_writer_installed)
+		return false;
+	*out = test_first_writer;
+	return true;
+}
+
+bool
+cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *expected, uint64 epoch)
+{
+	return test_first_writer_installed && test_first_writer_initialized
+		   && epoch == test_first_writer_epoch
+		   && memcmp(expected, &test_first_writer, sizeof(*expected)) == 0;
+}
+
+ClusterControlRootResult
+cluster_wal_writer_ready(TimeLineID timeline)
+{
+	/* The postmaster adapter must never enter this live worker check. */
+	Assert(IsUnderPostmaster);
+	++test_first_live_checks;
+	return timeline == test_first_writer.timeline ? test_first_live_result
+													 : CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+}
 static int test_stop_not_fresh_peer = -1;
 static bool test_stop_storage_quorum = true;
 static uint64 test_terminal_membership_cut = 2;
@@ -11125,11 +11159,24 @@ UT_TEST(test_a148_stop_poll_includes_original_phase3_handoff)
 }
 
 #include "test_cluster_normal_cold_startup.h"
+#include "test_cluster_first_open.h"
 
 int
 main(void)
 {
-	UT_PLAN(327);
+	UT_PLAN(339);
+	UT_RUN(test_first_open_authority_submit_notifies_after_exact_publication);
+	UT_RUN(test_first_open_authority_completion_notifies_after_exact_publication);
+	UT_RUN(test_first_open_barrier_waits_for_last_sample_ack);
+	UT_RUN(test_first_open_barrier_rejects_changed_authority);
+	UT_RUN(test_first_open_requires_installed_original_input);
+	UT_RUN(test_first_open_request_cannot_publish_admission);
+	UT_RUN(test_first_open_foreign_mailbox_is_not_consumed);
+	UT_RUN(test_first_open_exact_reply_is_not_open_proof);
+	UT_RUN(test_first_open_epoch_or_writer_drift_cannot_rebind);
+	UT_RUN(test_first_open_requires_both_real_admission_gates);
+	UT_RUN(test_first_open_lmon_rechecks_live_writer);
+	UT_RUN(test_first_open_request_drives_original_sample_consumer);
 	UT_RUN(test_normal_actual_finish_preserves_unconfigured_native_startup);
 	UT_RUN(test_normal_start_pending_ack_does_not_reuse_root_after_valid_mirror_drift);
 	UT_RUN(test_normal_start_confirmed_new_root_permanently_rejects_old_completion);

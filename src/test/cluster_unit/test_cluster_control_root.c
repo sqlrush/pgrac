@@ -21949,7 +21949,8 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_FIRST_START") != NULL) {
-		UT_PLAN(3);
+		UT_PLAN(4);
+		UT_RUN(test_first_start_peer_begin_race_reobserves_exact_operation);
 		UT_RUN(test_first_start_io_and_late_races_never_publish_authority);
 		UT_RUN(test_first_start_binds_original_inputs_without_clean_exit);
 		UT_RUN(test_first_start_rejects_incomplete_or_changed_formation);
@@ -22012,7 +22013,8 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(422);
+	UT_PLAN(423);
+	UT_RUN(test_first_start_peer_begin_race_reobserves_exact_operation);
 	UT_RUN(test_first_start_io_and_late_races_never_publish_authority);
 	UT_RUN(test_first_start_binds_original_inputs_without_clean_exit);
 	UT_RUN(test_first_start_rejects_incomplete_or_changed_formation);

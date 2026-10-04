@@ -12,6 +12,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_lmon.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "port/pg_crc32c.h"
 #include "storage/shmem.h"
@@ -21,6 +22,20 @@
 
 int cluster_node_id = 0;
 bool cluster_enabled = true;
+
+/* This codec/mailbox fixture has no running LMON.  Match the original
+ * notification's NULL-latch behavior; completion authority is tested below
+ * and publication-before-notification is tested by the FSM fixture. */
+void
+cluster_lmon_marker_complete_wakeup(void)
+{
+}
+
+/* No QVOTEC owner is registered in this codec/mailbox fixture. */
+void
+cluster_qvotec_wakeup(void)
+{
+}
 
 bool
 RecoveryInProgress(void)

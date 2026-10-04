@@ -33,8 +33,11 @@ main(int argc, char **argv)
 	fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
 	if (fd < 0)
 		return 3;
+	/* The fixed-region minimum ends exactly where stripe history begins.
+	 * A loop device cannot grow at EOF; leave real zero-filled capacity for
+	 * the first reservation and same-cohort restart history. */
 	if (cluster_voting_disk_format(fd, CLUSTER_MAX_NODES, index) != CLUSTER_VOTING_DISK_IO_OK
-		|| ftruncate(fd, CLUSTER_VOTING_PGRD_FILE_BYTES_MIN) != 0 || fdatasync(fd) != 0
+		|| ftruncate(fd, (off_t)16 * 1024 * 1024) != 0 || fdatasync(fd) != 0
 		|| close(fd) != 0)
 		return 4;
 readback:

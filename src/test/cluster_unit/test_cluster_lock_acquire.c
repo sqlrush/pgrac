@@ -642,6 +642,7 @@ errcode(int s pg_attribute_unused())
  * and the process-context symbols the fixture does not otherwise stub. */
 bool IsUnderPostmaster = false;
 int MyProcPid = 0;
+#include "test_cluster_startup_interrupt_fixture.h"
 
 bool
 cluster_grd_join_remaster_in_progress(void)

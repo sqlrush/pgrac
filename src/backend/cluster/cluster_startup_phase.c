@@ -67,6 +67,7 @@
 #include "cluster/cluster_guc.h"	/* cluster_phase{1..4}_timeout (D2 F2) */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_stats.h"	/* cluster_stats_start / wait_for_ready (1.14 Sprint A) */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_lck.h"	/* cluster_lck_start / wait_for_ready (1.12 Sprint A) */
 #include "cluster/cluster_lms.h"	/* cluster_lms_start / wait_for_ready (spec-2.18 Sprint A) */
@@ -2586,6 +2587,40 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 	if (registry_configured
 		&& cluster_phase4_start_stats(fail_ctx, phase4_deadline, &stats_pid) == PHASE_RUN_FATAL)
 		return PHASE_RUN_FATAL;
+
+	if (cluster_shared_config) {
+		ClusterSemanticActivationRefusal refusal;
+		TimestampTz next_report = 0;
+
+		/* SQL connection startup already needs Resource-X. The original
+		 * postmaster requests activation asynchronously, under the existing
+		 * phase budget; LMON/QVOTEC still own all proof and gate publication. */
+		for (;;) {
+			TimestampTz now;
+
+			if (cluster_semantic_activation_startup_poll(&refusal)
+				&& cluster_serving_ready_is_current())
+				break;
+			now = GetCurrentTimestamp();
+			if (now >= next_report || now >= phase4_deadline) {
+				elog(LOG, "cluster phase 4: waiting for semantic OPEN "
+					 "(result=%d feature=%llu generation=%llu epoch=%llu)",
+					 (int)refusal.result, (unsigned long long)refusal.feature_bit,
+					 (unsigned long long)refusal.expected_generation,
+					 (unsigned long long)cluster_epoch_get_current());
+				next_report = TimestampTzPlusMilliseconds(now, 5000);
+			}
+			if (now >= phase4_deadline) {
+				cluster_authority_readiness_clear();
+				fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+				fail_ctx->errmsg = "cluster phase 4: semantic OPEN proof is unavailable";
+				fail_ctx->errhint = "Inspect the last activation result and original LMON/QVOTEC "
+					"diagnostics. Both PGSA TARGET and current Resource-X OPEN are required.";
+				return PHASE_RUN_FATAL;
+			}
+			pg_usleep(20000L);
+		}
+	}
 
 	if (registry_configured)
 		elog(DEBUG1,

@@ -50,6 +50,37 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_lmon.h"
+#include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_writer.h"
+
+/* This link/lifecycle fixture does not run a semantic authority round. */
+void
+cluster_lmon_marker_complete_wakeup(void)
+{
+	abort();
+}
+
+/* This voting fixture never installs a native first-start writer. Keep
+ * unrelated activation dependencies explicit and impossible to synthesize. */
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_wal_thread_initialized_writer_matches(
+	const ClusterWalSourceRef *expected pg_attribute_unused(), uint64 epoch pg_attribute_unused())
+{
+	abort();
+}
+
+ClusterControlRootResult
+cluster_wal_writer_ready(TimeLineID timeline pg_attribute_unused())
+{
+	abort();
+}
 
 #include <fcntl.h>
 #include <errno.h>
@@ -79,6 +110,8 @@
 #include "cluster/cluster_write_fence.h" /* ClusterFenceMarker for D2/D4 stubs */
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "storage/proc.h"
+#include "storage/latch.h"
+#include "storage/ipc.h"
 #include "access/xlog.h"
 #include "cluster_unit_no_normal_stop.h"
 
@@ -113,6 +146,8 @@
 #ifndef CLUSTER_MAKEFILE_PATH
 #error "CLUSTER_MAKEFILE_PATH must identify the backend cluster Makefile"
 #endif
+
+extern void cluster_qvotec_test_register_wakeup(void);
 
 /* Test-only linkage; deliberately absent from every product header/ABI. */
 extern ClusterSemanticActivationResult cluster_qvotec_test_semantic_activation_record_cas_write(
@@ -496,6 +531,24 @@ cluster_replacement_phase3_handoff_observed_count_local(void)
 	return 0; /* No replacement handoff actor is present in this harness. */
 }
 struct Latch *MyLatch = NULL;
+static struct Latch *last_notified_latch;
+static unsigned int notified_latch_count;
+static pg_on_exit_callback notify_exit_callback;
+static Datum notify_exit_arg;
+
+void
+SetLatch(struct Latch *latch)
+{
+	last_notified_latch = latch;
+	notified_latch_count++;
+}
+
+void
+before_shmem_exit(pg_on_exit_callback callback, Datum arg)
+{
+	notify_exit_callback = callback;
+	notify_exit_arg = arg;
+}
 
 void
 ProcessInterrupts(void)
@@ -1510,7 +1563,7 @@ UT_TEST(test_qvotec_shmem_and_mailbox_layout)
 {
 	UT_ASSERT_EQ(CLUSTER_QVOTEC_SHMEM_STORAGE_OFFSET, 4056);
 	UT_ASSERT_EQ(sizeof(ClusterStorageQuorumState), 64);
-	UT_ASSERT_EQ(cluster_qvotec_shmem_size(), 4120);
+	UT_ASSERT_EQ(cluster_qvotec_shmem_size(), 4128); /* Added volatile wakeup pointer. */
 	UT_ASSERT_EQ(sizeof(ClusterQvotecPriorExitObservation), 3600);
 	UT_ASSERT_EQ(sizeof(ClusterQvotecMailbox), 320);
 	UT_ASSERT_EQ(offsetof(ClusterQvotecMailbox, request_seq), 0);
@@ -1682,6 +1735,75 @@ UT_TEST(test_qvotec_accessors_null_safe_pre_init)
 	UT_ASSERT_EQ(cluster_qvotec_get_current_epoch_at_boot(), 0);
 	UT_ASSERT_EQ(cluster_qvotec_get_self_incarnation(), 0);
 	UT_ASSERT_STR_EQ(cluster_qvotec_get_collision_state_name(), "(uninitialised)");
+}
+
+UT_TEST(test_qvotec_wakeup_without_registration_is_noop)
+{
+	notified_latch_count = 0;
+	cluster_qvotec_wakeup();
+	UT_ASSERT_EQ(notified_latch_count, 0);
+}
+
+UT_TEST(test_qvotec_wakeup_owner_lifecycle)
+{
+	Latch owner = {0};
+	Latch *saved_latch = MyLatch;
+
+	shmem_init_done = false;
+	cluster_qvotec_shmem_init();
+	notified_latch_count = 0;
+	cluster_qvotec_wakeup();
+	UT_ASSERT_EQ(notified_latch_count, 0);
+	MyLatch = &owner;
+	notify_exit_callback = NULL;
+	cluster_qvotec_test_register_wakeup();
+	UT_ASSERT(notify_exit_callback != NULL);
+	cluster_qvotec_wakeup();
+	UT_ASSERT_EQ(notified_latch_count, 1);
+	UT_ASSERT(last_notified_latch == &owner);
+
+	/* Attaching another process must not reset the owner's registration. */
+	cluster_qvotec_shmem_init();
+	cluster_qvotec_wakeup();
+	UT_ASSERT_EQ(notified_latch_count, 2);
+	UT_ASSERT(last_notified_latch == &owner);
+	if (notify_exit_callback != NULL)
+		notify_exit_callback(0, notify_exit_arg);
+	cluster_qvotec_wakeup();
+	UT_ASSERT_EQ(notified_latch_count, 2);
+	MyLatch = saved_latch;
+}
+
+UT_TEST(test_qvotec_wakeup_old_exit_preserves_new_owner)
+{
+	Latch first = {0};
+	Latch second = {0};
+	Latch *saved_latch = MyLatch;
+	pg_on_exit_callback old_exit;
+	Datum old_arg;
+
+	shmem_init_done = false;
+	cluster_qvotec_shmem_init();
+	notified_latch_count = 0;
+	MyLatch = &first;
+	cluster_qvotec_test_register_wakeup();
+	old_exit = notify_exit_callback;
+	old_arg = notify_exit_arg;
+	MyLatch = &second;
+	cluster_qvotec_test_register_wakeup();
+	UT_ASSERT(old_exit != NULL && notify_exit_callback != NULL);
+	if (old_exit != NULL)
+		old_exit(1, old_arg);
+	cluster_qvotec_wakeup();
+	UT_ASSERT_EQ(notified_latch_count, 1);
+	UT_ASSERT(last_notified_latch == &second);
+	if (notify_exit_callback != NULL)
+		notify_exit_callback(0, notify_exit_arg);
+	if (old_exit != NULL)
+		old_exit(1, old_arg);
+	cluster_qvotec_wakeup();
+	UT_ASSERT_EQ(notified_latch_count, 1);
+	MyLatch = saved_latch;
 }
 
 UT_TEST(test_qvotec_accessors_post_init)
@@ -4309,7 +4431,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(83);
+	UT_PLAN(86);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -4320,6 +4442,7 @@ main(void)
 	UT_RUN(test_qvotec_mailbox_rejects_invalid_and_holds_on_sequence_overflow);
 	UT_RUN(test_qvotec_mailbox_terminal_hold_completion);
 	UT_RUN(test_qvotec_accessors_null_safe_pre_init);
+	UT_RUN(test_qvotec_wakeup_without_registration_is_noop);
 	UT_RUN(test_in_quorum_missing_shmem_diagnostic_is_once_and_still_false);
 	UT_RUN(test_qvotec_accessors_post_init);
 	UT_RUN(test_shared_quorum_requires_live_storage_evidence);
@@ -4393,6 +4516,8 @@ main(void)
 	UT_RUN(test_poll_cannot_republish_invalidated_or_replaced_scan);
 	UT_RUN(test_poll_failed_proofs_revoke_cache_without_shrinking_denominator);
 	UT_RUN(test_poll_preserves_majority_crc_and_legacy_boundaries);
+	UT_RUN(test_qvotec_wakeup_owner_lifecycle);
+	UT_RUN(test_qvotec_wakeup_old_exit_preserves_new_owner);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

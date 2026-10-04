@@ -182,6 +182,7 @@ typedef struct ClusterQvotecShmem {
 	uint32 prior_exit_pad;
 	ClusterQvotecPriorExitObservation prior_exit;
 	ClusterStorageQuorumState storage_quorum;
+	pg_atomic_uint64 wakeup_latch;
 } ClusterQvotecShmem;
 
 StaticAssertDecl(sizeof(ClusterQvotecShmem) == CLUSTER_QVOTEC_SHMEM_BYTES,
@@ -785,8 +786,40 @@ cluster_qvotec_shmem_init(void)
 		pg_atomic_init_u32(&QvotecShmem->prior_exit_state, 0);
 		QvotecShmem->prior_exit_pad = 0;
 		memset(&QvotecShmem->prior_exit, 0, sizeof(QvotecShmem->prior_exit));
+		pg_atomic_init_u64(&QvotecShmem->wakeup_latch, 0);
 	}
 	cluster_storage_quorum_attach(&QvotecShmem->storage_quorum, !found);
+}
+
+void
+cluster_qvotec_wakeup(void)
+{
+	uint64 registered;
+
+	if (QvotecShmem == NULL)
+		return;
+	registered = pg_atomic_read_u64(&QvotecShmem->wakeup_latch);
+	if (registered != 0)
+		SetLatch((Latch *)(uintptr_t)registered);
+}
+
+static void
+qvotec_clear_wakeup_latch(int code pg_attribute_unused(), Datum arg)
+{
+	uint64 expected = (uint64)(uintptr_t)DatumGetPointer(arg);
+
+	if (QvotecShmem != NULL)
+		(void)pg_atomic_compare_exchange_u64(&QvotecShmem->wakeup_latch, &expected, 0);
+}
+
+static void
+qvotec_register_wakeup_latch(void)
+{
+	if (QvotecShmem == NULL || MyLatch == NULL)
+		return;
+	/* Clear before PGPROC release; a delayed old exit cannot clear a new owner. */
+	before_shmem_exit(qvotec_clear_wakeup_latch, PointerGetDatum(MyLatch));
+	pg_atomic_write_u64(&QvotecShmem->wakeup_latch, (uint64)(uintptr_t)MyLatch);
 }
 
 static const ClusterShmemRegion cluster_qvotec_region = {
@@ -4377,6 +4410,7 @@ ClusterQvotecMain(void)
 	qvotec_open_disks();
 	pg_atomic_write_u32(&QvotecShmem->disks_total_count, (uint32)qvotec_n_disks);
 	on_shmem_exit(qvotec_close_disks_atexit, (Datum)0);
+	qvotec_register_wakeup_latch();
 
 	/*
 	 * spec-4.12b D4: with enforcement default ON, a single node / no-voting-disk
@@ -4802,6 +4836,10 @@ cluster_get_voting_disks(PG_FUNCTION_ARGS)
 
 
 #else /* !USE_PGRAC_CLUSTER */
+
+void
+cluster_qvotec_wakeup(void)
+{}
 
 void
 cluster_qvotec_observe(ClusterQvotecObservation *out)

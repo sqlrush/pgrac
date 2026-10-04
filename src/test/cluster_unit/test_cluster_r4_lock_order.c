@@ -34,6 +34,7 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_writer.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tx_enqueue.h"
@@ -2068,6 +2069,12 @@ bool
 cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
 {
 	(void)out;
+	abort();
+}
+ClusterControlRootResult
+cluster_wal_writer_ready(TimeLineID timeline pg_attribute_unused())
+{
+	/* Native first-start INSTALL is outside this lock-order fixture. */
 	abort();
 }
 SCN

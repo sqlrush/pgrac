@@ -11489,7 +11489,8 @@ cluster_page_structural_from_ko_v2(uint32 slot, uint64 serial,
 		|| (page->forknum != MAIN_FORKNUM && page->forknum != VISIBILITYMAP_FORKNUM)
 		|| !cluster_ko_shared_structure_observation_v2(slot, serial, &value.terminal, wal, sizeof(wal))
 		|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &decoded)
-		|| decoded.identity.action != CLUSTER_SPACE_WAL_TRUNCATE
+		|| (decoded.identity.action != CLUSTER_SPACE_WAL_TRUNCATE
+			&& decoded.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE)
 		|| !cluster_page_structural_record_v1(&value.terminal, decoded.identity.expected.incarnation,
 			plan, &value.change)
 		|| !cluster_space_structure_wal_encode(&value.change, actual, sizeof(actual))

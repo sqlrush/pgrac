@@ -103,6 +103,7 @@ cluster_ic_send_envelope(uint8 type pg_attribute_unused(), int32 dest pg_attribu
 #endif
 
 PROC_HDR *ProcGlobal;
+#include "test_cluster_startup_interrupt_fixture.h"
 
 /* Fixture checks must execute in both assertion and production builds. */
 #define HW_CHECK(condition)                                                                        \

@@ -377,6 +377,10 @@ walr_request_acquire_actual(ClusterLockAcquireRequest *request)
 	ClusterLockAcquireRequest native = *request;
 
 	if (cluster_shared_config) {
+		/* NOWAIT forbids queueing on a conflicting lock, not waiting for its
+		 * remote reply. Use the existing GES exchange budget, which the same
+		 * stable owner also needs to observe its exact RETIRE acknowledgement. */
+		request->timeout_ms = 0;
 		walr_native_locktag_init((uint16)native.resid.field1, &native.locktag);
 		PG_TRY();
 		{
@@ -435,6 +439,9 @@ walr_request_convert_actual(ClusterLockAcquireRequest *request, uint64 preserve_
 	if (out_cleanup_required != NULL)
 		*out_cleanup_required = false;
 	if (cluster_shared_config) {
+		/* A manual NOWAIT conversion must not restore the old 1ms exchange
+		 * budget after the shared owner has already acquired its original S. */
+		request->timeout_ms = 0;
 		walr_native_locktag_init((uint16)native.resid.field1, &native.locktag);
 		PG_TRY();
 		{

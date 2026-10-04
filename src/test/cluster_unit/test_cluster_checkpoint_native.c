@@ -64,6 +64,7 @@ static bool provider_ok, prebump, cancel_on_wait, change_epoch_on_wait, read_err
 static uint64 epoch;
 static unsigned root_calls, waits, local_updates, reads, releases;
 static unsigned native_writes, shutdown_calls;
+static int native_error_level;
 static ClusterControlRootResult returns[4];
 static ClusterWalStartupImage clusterStartupWriter;
 static bool clusterStartupWriterBound, clusterStartupWriterInstalled;
@@ -151,6 +152,8 @@ ExceptionalCondition(const char *c, const char *f, int l)
 bool
 errstart(int l, const char *d pg_attribute_unused())
 {
+	if (l >= ERROR)
+		native_error_level = l;
 	/* Native ARM CRC dispatch may emit DEBUG1 during its first invocation. */
 	return l >= ERROR;
 }
@@ -572,6 +575,7 @@ reset_fixture(void)
 	MyBackendType = B_CHECKPOINTER;
 	root_calls = waits = local_updates = reads = releases = 0;
 	native_writes = shutdown_calls = 0;
+	native_error_level = 0;
 	cluster_shared_config = cluster_enabled = cluster_controlfile_shared_authority = true;
 	memset(returns, 0, sizeof(returns));
 	memset(install_returns, 0, sizeof(install_returns));
@@ -1072,6 +1076,42 @@ UT_TEST(legacy_startup_keeps_its_control_authority_path)
 	UT_ASSERT_EQ(legacy_anchors, 1);
 }
 
+static bool
+startup_recovery_control_site(void)
+{
+	if (sigsetjmp(error_boundary, 1))
+		return false;
+#include "test_cluster_startup_recovery_control.inc"
+	return true;
+}
+
+UT_TEST(shared_crash_control_refuses_before_untyped_publication)
+{
+	reset_fixture();
+	MyBackendType = B_STARTUP;
+	InRecovery = true;
+	current.state = DB_IN_CRASH_RECOVERY;
+	selected = current;
+	UT_ASSERT(!startup_recovery_control_site());
+	UT_ASSERT_EQ(native_error_level, FATAL);
+	UT_ASSERT_EQ(native_writes, 0);
+	UT_ASSERT_EQ(root_calls + startup_calls + install_calls, 0);
+	UT_ASSERT_EQ(memcmp(&selected, &current, sizeof(current)), 0);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+}
+
+UT_TEST(legacy_crash_control_keeps_native_publication)
+{
+	reset_fixture();
+	cluster_shared_config = false;
+	MyBackendType = B_STARTUP;
+	InRecovery = true;
+	current.state = DB_IN_CRASH_RECOVERY;
+	UT_ASSERT(startup_recovery_control_site());
+	UT_ASSERT_EQ(native_error_level, 0);
+	UT_ASSERT_EQ(native_writes, 1);
+}
+
 /* PGRAC: actual directory validator on real scratch files, not a mocked
  * existence result. Only the ordinary mkdir wrapper is replaced.
  * Author: SqlRush <sqlrush@gmail.com> */
@@ -1499,7 +1539,9 @@ UT_TEST(native_startup_insert_has_no_link_or_page_from_predecessor)
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(40);
+	UT_RUN(shared_crash_control_refuses_before_untyped_publication);
+	UT_RUN(legacy_crash_control_keeps_native_publication);
 	UT_RUN(startup_file_sync_rechecks_original_writer_and_keeps_native_owner);
 	UT_RUN(shared_crash_startup_uses_original_self_seal_before_native_directory);
 	UT_RUN(shared_crash_refusal_or_cancel_never_reaches_native_mutation);
