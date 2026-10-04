@@ -3078,7 +3078,7 @@ test_member_early_sample_ack(int observation_gap)
 	else if (observation_gap == 2)
 		test_membership_snapshot_fail_at_call = test_membership_snapshot_calls + 2;
 	cluster_semantic_activation_lmon_tick();
-	if (observation_gap != 0) {
+	if (observation_gap == 1 || observation_gap == 2) {
 		UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(
 			&semantic_activation_ack_local_ingress), UINT32_C(1));
 		UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(0));
@@ -3092,6 +3092,12 @@ test_member_early_sample_ack(int observation_gap)
 	UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(1));
 	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
 	UT_ASSERT_EQ(table.expected_members_lo, UINT64_C(0));
+	if (observation_gap == 3) {
+		test_membership_snapshot_valid = false;
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(1));
+		test_membership_snapshot_valid = true;
+	}
 
 	memset(&message, 0, sizeof(message));
 	message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
@@ -3140,6 +3146,11 @@ UT_TEST(test_early_sample_ack_waits_for_coherent_authority)
 UT_TEST(test_early_sample_ack_survives_second_authority_read_gap)
 {
 	test_member_early_sample_ack(2);
+}
+
+UT_TEST(test_staged_sample_ack_survives_idle_authority_gap)
+{
+	test_member_early_sample_ack(3);
 }
 
 UT_TEST(test_93da2_member_retains_next_round_sample_ack_until_exact_request_arrives)
@@ -11195,7 +11206,10 @@ UT_TEST(test_a148_stop_poll_includes_original_phase3_handoff)
 int
 main(void)
 {
-	UT_PLAN(344);
+	UT_PLAN(347);
+	UT_RUN(test_barrier_waits_for_both_late_peer_samples_in_either_order);
+	UT_RUN(test_staged_sample_ack_survives_idle_authority_gap);
+	UT_RUN(test_sample_observable_drift_still_invalidates_retained_proof);
 	UT_RUN(test_early_sample_ack_waits_for_coherent_authority);
 	UT_RUN(test_early_sample_ack_survives_second_authority_read_gap);
 	UT_RUN(test_sample_barrier_preserves_partial_proof_during_observation_gap);

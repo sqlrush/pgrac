@@ -821,6 +821,16 @@ semantic_activation_ack_ingress_push(SemanticActivationAckIngress *ingress,
 }
 
 static bool
+semantic_activation_ack_ingress_peek(const SemanticActivationAckIngress *ingress,
+									 SemanticActivationAckIngressItem *out)
+{
+	if (ingress == NULL || out == NULL || semantic_activation_ack_ingress_pending(ingress) == 0)
+		return false;
+	*out = ingress->items[ingress->consumer_seq % CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY];
+	return true;
+}
+
+static bool
 semantic_activation_ack_ingress_poll(SemanticActivationAckIngress *ingress,
 									 SemanticActivationAckIngressItem *out)
 {
@@ -2835,7 +2845,12 @@ semantic_activation_ack_lmon_retain_request_ahead(
 	state = semantic_activation_ack_request_ahead_state(
 		item, snapshot, current_members_lo, current_members_hi, current_epoch,
 		current_coordinator_node, local_capability_word);
-	if (state != SEMANTIC_ACTIVATION_ACK_REQUEST_AHEAD_WAIT) {
+	if (state != SEMANTIC_ACTIVATION_ACK_REQUEST_AHEAD_WAIT
+		&& !(state == SEMANTIC_ACTIVATION_ACK_REQUEST_AHEAD_READY
+			 && !semantic_activation_ack_local_pending_send.invalidated
+			 && (semantic_activation_ack_local_pending_send.pending_members_lo != 0
+				 || semantic_activation_ack_local_pending_send.pending_members_hi != 0)
+			 && item->message.stage > semantic_activation_ack_local_pending_send.message.stage)) {
 		if (retained->valid && item != NULL
 			&& item->message.kind == CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST
 			&& item->message.stage == retained->item.message.stage
@@ -3531,6 +3546,82 @@ semantic_activation_ack_carrier_not_contradicted(
 	return true;
 }
 
+/* An incomplete SAMPLE is evidence owned by LMON, not an admission grant.
+ * A missing coherent membership publication must not erase rows that other
+ * members have already handed off. Check every observable contradiction;
+ * the ordinary consumers still need a fresh coherent view before using any
+ * retained row. BARRIER retains the complete SAMPLE expected image. */
+static bool
+semantic_activation_ack_source_open_carrier_not_contradicted(void)
+{
+	ClusterSemanticActivationAckTableV1 image;
+	SemanticActivationAdmissionSnapshot snapshot;
+	uint64 members_lo;
+	uint64 members_hi;
+	uint64 epoch;
+	uint32 required_caps;
+	int node;
+
+	if (!semantic_activation_ack_table_snapshot(&image)
+		|| !semantic_activation_snapshot(&snapshot) || snapshot.transition_closed
+		|| (image.stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
+			&& image.stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER)
+		|| image.expected_members_lo == 0 || image.expected_members_hi != 0
+		|| image.observed_members_hi != 0
+		|| (image.observed_members_lo & ~image.expected_members_lo) != 0
+		|| image.round_nonce == 0 || snapshot.record_generation == UINT64_MAX
+		|| image.record_generation != snapshot.record_generation + 1
+		|| image.source_feature_bitmap != snapshot.active_bits
+		|| image.transition_epoch != snapshot.formation_epoch
+		|| image.transition_epoch != cluster_epoch_get_current()
+		|| !semantic_activation_ack_round_required_caps(image.source_feature_bitmap,
+			image.target_feature_bitmap, image.rollback_feature_bitmap, &required_caps))
+		return false;
+	if (cluster_reconfig_lmon_snapshot_admitted_membership(&members_lo, &members_hi, &epoch)
+		&& (members_lo != image.expected_members_lo || members_hi != image.expected_members_hi
+			|| epoch != image.transition_epoch))
+		return false;
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		bool member = semantic_activation_ack_member_present(image.expected_members_lo, 0, node);
+		bool observed = semantic_activation_ack_member_present(image.observed_members_lo, 0, node);
+		const SemanticActivationAckTuple *tuple;
+
+		if ((cluster_membership_get_state(node) == CLUSTER_MEMBER_MEMBER) != member)
+			return false;
+		if (!member || (image.stage == CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE && !observed))
+			continue;
+		tuple = image.stage == CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
+			? &image.observed[node] : &image.expected[node];
+		if (!semantic_activation_ack_tuple_structural(tuple, node, image.transition_epoch,
+				image.record_generation, required_caps)
+			|| tuple->admitted_incarnation != cluster_membership_get_last_admitted_incarnation(node))
+			return false;
+		if (node == cluster_node_id) {
+			SemanticActivationAckTuple self;
+
+			if (!semantic_activation_ack_self_tuple(node, cluster_ic_local_capability_word(),
+					image.transition_epoch, image.record_generation, &self)
+				|| !semantic_activation_ack_matches(tuple, &self))
+				return false;
+		} else {
+			ClusterSfPeerCap capability;
+			uint64 observed_incarnation = 0;
+			uint64 observed_generation = 0;
+
+			if (cluster_reconfig_get_observed_slot(node, &observed_incarnation, &observed_generation)
+				&& (observed_generation == 0 || observed_incarnation != tuple->boot_id
+					|| cluster_reconfig_get_observed_epoch(node) != image.transition_epoch))
+				return false;
+			if (cluster_sf_peer_capability_record_snapshot(node, &capability)
+				&& (!capability.valid || capability.bits != tuple->capability_word
+					|| capability.generation != tuple->control_connection_generation
+					|| capability.generation != tuple->capability_generation))
+				return false;
+		}
+	}
+	return true;
+}
+
 static void
 semantic_activation_ack_lmon_drain(void)
 {
@@ -3583,6 +3674,7 @@ semantic_activation_ack_lmon_drain(void)
 	if (!semantic_activation_ack_current_authority(cluster_node_id, &current_members_lo,
 												   &current_members_hi, &current_epoch,
 												   &current_coordinator_node)) {
+	authority_unavailable:
 		/* A coherent admitted snapshot can be briefly unavailable while QVOTEC
 		 * publishes its next observation.  Absence alone cannot erase either a
 		 * completed OPEN carrier or an exact source-closed in-progress carrier.
@@ -3625,6 +3717,18 @@ semantic_activation_ack_lmon_drain(void)
 			return;
 		if (semantic_activation_lmon_utility_round_retained())
 			return;
+		if (semantic_activation_ack_source_open_carrier_not_contradicted())
+			return;
+		/* Transport has already handed these positive frames to this LMON.
+		 * Keep the original bounded ingress copy until it can be validated;
+		 * retaining it neither installs a row nor acknowledges a stage. */
+		if (semantic_activation_ack_table_snapshot(&closed_image)
+			&& closed_image.expected_members_lo == 0 && closed_image.expected_members_hi == 0
+			&& semantic_activation_ack_ingress_peek(&semantic_activation_ack_local_ingress, &item)
+			&& item.message.kind == CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK
+			&& item.message.result == CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK
+			&& item.message.transition_epoch == cluster_epoch_get_current())
+			return;
 		semantic_activation_ack_lmon_invalidate_active();
 		if ((semantic_activation_ack_local_pending_send.pending_members_lo != 0
 			 || semantic_activation_ack_local_pending_send.pending_members_hi != 0)
@@ -3635,8 +3739,13 @@ semantic_activation_ack_lmon_drain(void)
 			semantic_activation_ack_local_pending_send.invalidated = true;
 		}
 		while (consumed < CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY
-			   && semantic_activation_ack_ingress_poll(&semantic_activation_ack_local_ingress,
+			   && semantic_activation_ack_ingress_peek(&semantic_activation_ack_local_ingress,
 													   &item)) {
+			if (item.message.kind == CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK
+				&& item.message.result == CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK
+				&& item.message.transition_epoch == cluster_epoch_get_current())
+				break;
+			(void)semantic_activation_ack_ingress_poll(&semantic_activation_ack_local_ingress, &item);
 			consumed++;
 			if (!semantic_activation_ack_pending_send_begin_refused(
 					&semantic_activation_ack_local_pending_send, &item,
@@ -3652,14 +3761,15 @@ semantic_activation_ack_lmon_drain(void)
 		current_members_lo, current_members_hi, current_epoch, current_coordinator_node);
 
 	while (consumed < CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY
-		   && semantic_activation_ack_ingress_poll(&semantic_activation_ack_local_ingress, &item)) {
-		consumed++;
+		   && semantic_activation_ack_ingress_pending(&semantic_activation_ack_local_ingress) != 0) {
 		if (!semantic_activation_ack_current_authority(cluster_node_id, &current_members_lo,
 													   &current_members_hi, &current_epoch,
 													   &current_coordinator_node)) {
-			semantic_activation_ack_lmon_invalidate_active();
-			continue;
+			goto authority_unavailable;
 		}
+		if (!semantic_activation_ack_ingress_poll(&semantic_activation_ack_local_ingress, &item))
+			break;
+		consumed++;
 		if (semantic_activation_restart_ingress(&item))
 			continue;
 		if (item.message.kind == CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK) {
@@ -3688,6 +3798,17 @@ semantic_activation_ack_lmon_drain(void)
 
 			if (!semantic_activation_snapshot(&snapshot))
 				continue;
+			/* The next REQUEST can overtake this member's earlier ACK to a
+			 * different peer. Retain it under the existing exact request owner
+			 * until the previous fanout has transferred every destination. */
+			if ((semantic_activation_ack_local_pending_send.pending_members_lo != 0
+				 || semantic_activation_ack_local_pending_send.pending_members_hi != 0)
+				&& item.message.stage > semantic_activation_ack_local_pending_send.message.stage) {
+				(void)semantic_activation_ack_lmon_retain_request_ahead(
+					&item, &snapshot, current_members_lo, current_members_hi, current_epoch,
+					current_coordinator_node, local_capability_word);
+				continue;
+			}
 			if (item.message.stage == CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE) {
 				result = semantic_activation_ack_lmon_accept_current_sample_request(
 					&item, &snapshot, current_members_lo, current_members_hi, current_epoch,
