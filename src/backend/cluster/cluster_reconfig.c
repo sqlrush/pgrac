@@ -8999,6 +8999,7 @@ cluster_reconfig_startup_formation_progress(void)
 	ClusterXidStripeJoinVerdict stripe;
 	uint64 generation;
 	uint64 incarnation;
+	bool self_may_seed;
 	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
 	if (!cluster_reconfig_startup_formation_current_locked() || ReconfigShmem->self_join_admitted
 		|| cold_formation_state.admission_done) {
@@ -9007,6 +9008,7 @@ cluster_reconfig_startup_formation_progress(void)
 	}
 	generation = ReconfigShmem->startup_formation.formation_generation;
 	incarnation = ReconfigShmem->startup_formation_incarnations[cluster_node_id];
+	self_may_seed = ReconfigShmem->startup_formation.arbiter_node == (uint64)cluster_node_id;
 	LWLockRelease(&ReconfigShmem->lock);
 	/* The exact native writer is installed only by the typed root/claim/anchor
 	 * path. Never call the WAL-producing stripe gate on the predecessor. */
@@ -9014,7 +9016,7 @@ cluster_reconfig_startup_formation_progress(void)
 		|| writer.claim.identity.origin_node_id != cluster_node_id
 		|| writer.claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation())
 		return;
-	stripe = cluster_xid_stripe_join_gate(false);
+	stripe = cluster_xid_stripe_join_gate(self_may_seed);
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
 	if (!cluster_reconfig_startup_formation_current_locked()
 		|| ReconfigShmem->startup_formation.formation_generation != generation
