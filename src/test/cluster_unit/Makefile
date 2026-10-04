@@ -4106,6 +4106,14 @@ test_cluster_smgr: test_cluster_smgr.c unit_test.h \
 		$(CLUSTER_SHARED_FS_LOCAL_O) \
 		$(CLUSTER_SHARED_FS_SHAREDFS_O) $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+# Original pending-delete caller; standalone owner/I/O dependency boundaries.
+test_cluster_smgr_drop: test_cluster_smgr_drop.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_smgr.c \
+		$(top_builddir)/src/common/libpgcommon_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
 # test_cluster_startup_phase links cluster_startup_phase.o standalone.
 # cluster_startup_phase.c references ereport / GetCurrentTimestamp /
 # timestamptz_to_str / cluster_phase legacy mirror / IsUnderPostmaster
