@@ -807,6 +807,63 @@ UT_TEST(test_drain_on_dead_peer_hard_errors)
 	UT_ASSERT(cluster_ic_tier1_drain_outbound(CLUSTER_MAX_NODES) == CLUSTER_IC_SEND_HARD_ERROR);
 }
 
+UT_TEST(test_unconnected_declared_peer_keeps_frame_with_caller)
+{
+	static const char frame[] = "caller-owned before connect";
+	ClusterICPlane plane;
+
+	strlcpy(ut_peer_info.data_addr, ut_peer_info.interconnect_addr,
+			sizeof(ut_peer_info.data_addr));
+	for (plane = CLUSTER_IC_PLANE_CONTROL; plane <= CLUSTER_IC_PLANE_DATA; plane++) {
+		uint64 refused;
+		int state;
+
+		cluster_ic_tier1_set_my_plane(plane);
+		UT_ASSERT_EQ(cluster_ic_tier1_get_peer_fd(UT_PEER_ID), -1);
+		refused = pg_atomic_read_u64(&Tier1Shmem->send_not_admitted_count);
+		for (state = CLUSTER_IC_PEER_DOWN; state <= CLUSTER_IC_PEER_CONNECTING; state++) {
+			Tier1Shmem->peers[UT_PEER_ID].state = state;
+			UT_ASSERT_EQ(ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame, sizeof(frame)),
+						 CLUSTER_IC_SEND_NOT_ADMITTED);
+			UT_ASSERT(!cluster_ic_tier1_pending_outbound(UT_PEER_ID));
+			UT_ASSERT_EQ(tier1_outbound_fifo_frames[UT_PEER_ID], 0);
+		}
+		UT_ASSERT_EQ(pg_atomic_read_u64(&Tier1Shmem->send_not_admitted_count), refused + 2);
+		Tier1Shmem->peers[UT_PEER_ID].state = CLUSTER_IC_PEER_DOWN;
+	}
+	cluster_ic_tier1_set_my_plane(CLUSTER_IC_PLANE_CONTROL);
+}
+
+UT_TEST(test_missing_socket_preserves_invalid_peer_refusal)
+{
+	static const char frame[] = "must remain unsent";
+	ClusterICTier1Shmem *saved = Tier1Shmem;
+	uint64 refused = pg_atomic_read_u64(&Tier1Shmem->send_not_admitted_count);
+
+	ut_peer_declared = false;
+	UT_ASSERT_EQ(ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame, sizeof(frame)),
+				 CLUSTER_IC_SEND_HARD_ERROR);
+	ut_peer_declared = true;
+	Tier1Shmem->peers[UT_PEER_ID].state = CLUSTER_IC_PEER_REJECTED;
+	UT_ASSERT_EQ(ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame, sizeof(frame)),
+				 CLUSTER_IC_SEND_HARD_ERROR);
+	Tier1Shmem->peers[UT_PEER_ID].state = CLUSTER_IC_PEER_CONNECTED;
+	UT_ASSERT_EQ(ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame, sizeof(frame)),
+				 CLUSTER_IC_SEND_HARD_ERROR);
+	Tier1Shmem->peers[UT_PEER_ID].state = CLUSTER_IC_PEER_DOWN;
+	Tier1Shmem = NULL;
+	UT_ASSERT_EQ(ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame, sizeof(frame)),
+				 CLUSTER_IC_SEND_HARD_ERROR);
+	Tier1Shmem = saved;
+	UT_ASSERT_EQ(pg_atomic_read_u64(&Tier1Shmem->send_not_admitted_count), refused);
+	UT_ASSERT(!cluster_ic_tier1_pending_outbound(UT_PEER_ID));
+	cluster_ic_tier1_set_my_plane(CLUSTER_IC_PLANE_DATA);
+	ut_peer_info.data_addr[0] = '\0';
+	UT_ASSERT_EQ(ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame, sizeof(frame)),
+				 CLUSTER_IC_SEND_HARD_ERROR);
+	cluster_ic_tier1_set_my_plane(CLUSTER_IC_PLANE_CONTROL);
+}
+
 /* ============================================================
  * GCS serve-stall round-5: multi-frame backpressure legs.
  *
@@ -864,7 +921,22 @@ ut_reconnect_peer(void)
 
 UT_TEST(test_reconnect_after_close)
 {
+	static const char frame[] = "caller-owned before connect";
+	char received[sizeof(frame) + 1];
+
 	ut_reconnect_peer();
+	Tier1Shmem->peers[UT_PEER_ID].state = CLUSTER_IC_PEER_CONNECTING;
+	UT_ASSERT_EQ(ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame, sizeof(frame)),
+				 CLUSTER_IC_SEND_NOT_ADMITTED);
+	UT_ASSERT(!cluster_ic_tier1_pending_outbound(UT_PEER_ID));
+	UT_ASSERT_EQ(recv(ut_rx_fd, received, sizeof(received), MSG_DONTWAIT), -1);
+	UT_ASSERT(errno == EAGAIN || errno == EWOULDBLOCK);
+	Tier1Shmem->peers[UT_PEER_ID].state = CLUSTER_IC_PEER_CONNECTED;
+	UT_ASSERT_EQ(ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame, sizeof(frame)),
+				 CLUSTER_IC_SEND_DONE);
+	UT_ASSERT_EQ(ut_drain_all_and_sweep(UT_PEER_ID, ut_rx_fd, ut_acc, sizeof(ut_acc)),
+				 sizeof(frame));
+	UT_ASSERT(memcmp(ut_acc, frame, sizeof(frame)) == 0);
 }
 
 /*
@@ -1479,6 +1551,9 @@ UT_TEST(test_stream_data_epoch_role_and_native_fork)
 	UT_ASSERT_EQ(cluster_ic_tier1_resource_x_stream_generation(UT_PEER_ID, 0), 0);
 	UT_ASSERT(!cluster_ic_tier1_stream_current(&stream));
 	UT_ASSERT(!cluster_ic_tier1_stream_capture(UT_PEER_ID, &ut_first_stream));
+	UT_ASSERT_EQ(ClusterICOps_Tier1.send_bytes(UT_PEER_ID, "old epoch", 10),
+				 CLUSTER_IC_SEND_HARD_ERROR);
+	UT_ASSERT(!cluster_ic_tier1_pending_outbound(UT_PEER_ID));
 	--ut_epoch;
 	child = fork();
 	UT_ASSERT(child >= 0);
@@ -1651,7 +1726,7 @@ int
 main(void)
 {
 	MyProcPid = getpid();
-	UT_PLAN(29);
+	UT_PLAN(31);
 
 	UT_RUN(test_stop_poll_requires_initialized_actual_plane_owner);
 	UT_RUN(test_connect_registers_peer_fd);
@@ -1663,6 +1738,8 @@ main(void)
 	UT_RUN(test_pending_cleared_and_counter_moved);
 	UT_RUN(test_close_peer_resets_queued_tail);
 	UT_RUN(test_drain_on_dead_peer_hard_errors);
+	UT_RUN(test_unconnected_declared_peer_keeps_frame_with_caller);
+	UT_RUN(test_missing_socket_preserves_invalid_peer_refusal);
 	UT_RUN(test_reconnect_after_close);
 	UT_RUN(test_stream_reconnect_is_not_same_epoch_or_diagnostic_identity);
 	UT_RUN(test_recv_drain_yields_after_bounded_frames);

@@ -1345,8 +1345,20 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 	}
 
 	fd = tier1_peer_fds[target_node_id];
-	if (fd < 0)
-		return CLUSTER_IC_SEND_HARD_ERROR; /* not connected */
+	if (fd < 0) {
+		/* PGRAC: no stream has admitted this new frame. A declared peer
+		 * awaiting connection leaves ownership with the caller, just as
+		 * HELLO-pending does below. Rejected or inconsistent peers remain
+		 * hard errors; draining an already admitted tail is unchanged. */
+		if (Tier1Shmem != NULL
+			&& (Tier1Shmem->peers[target_node_id].state == CLUSTER_IC_PEER_DOWN
+				|| Tier1Shmem->peers[target_node_id].state == CLUSTER_IC_PEER_CONNECTING)
+			&& peer_addr(target_node_id) != NULL) {
+			pg_atomic_fetch_add_u64(&Tier1Shmem->send_not_admitted_count, 1);
+			return CLUSTER_IC_SEND_NOT_ADMITTED;
+		}
+		return CLUSTER_IC_SEND_HARD_ERROR;
+	}
 
 	/*
 	 * spec-2.13 Hardening v1.0.2 root-cause fix (L66-family真根因):
