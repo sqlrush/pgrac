@@ -147,6 +147,13 @@ extern bool cluster_page_structural_pi_fact_v2(const ClusterPageStructuralReceip
 	int32 peer, struct ClusterPiWritebackFactV2 *out);
 extern void cluster_page_structural_receipt_free_v2(ClusterPageStructuralReceiptV2 **receipt);
 
+/* Local physical consumption of the original committed structural result.
+ * The caller retains its sealed plan/input scope. Strictly unpinned old PI
+ * only; ABSENT/REPLACED require the same complete old ancestry. This is not
+ * a logical retirement, master-clear grant, remote ACK or WAL reuse proof. */
+extern ClusterPiPhysicalResultV1
+cluster_bufmgr_discard_pi_at_structure_v2(const ClusterPageStructuralReceiptV2 *receipt);
+
 /* Local departed-writer responsibility. Binding identity and revision fence
  * an exact snapshot across DATA/physical I/O; neither counter orders pages.
  * Empty is a qualified directory observation, not proof of a retired boot. */

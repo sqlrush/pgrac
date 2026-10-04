@@ -12009,6 +12009,70 @@ cluster_pi_physical_unfenced_locked(BufferDesc *buf, uint32 state)
 		   && cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0;
 }
 
+ClusterPiPhysicalResultV1
+cluster_bufmgr_discard_pi_at_structure_v2(const ClusterPageStructuralReceiptV2 *receipt)
+{
+	ClusterPcmPiWriteCutV1 x_cut;
+	ClusterPcmPiStorageCutV1 storage_cut;
+	ClusterPageWalBindingV1 pi, reobserved;
+	BufferTag tag;
+	BufferDesc *buf;
+	LWLock *partition;
+	uint64 generation;
+	uint32 hash, state;
+	int id;
+	bool valid;
+	ClusterPiPhysicalResultV1 result = CLUSTER_PI_PHYSICAL_RETRY;
+
+	/* Whole-chain qualification also gates ABSENT/REPLACED. A missing old
+	 * descriptor cannot stand in for retained ancestry or the actual native
+	 * structural completion. No directory responsibility is retired here. */
+	if (!cluster_page_structural_pi_proof_v2(receipt, &x_cut, &storage_cut)
+		|| !cluster_page_structural_page_covered(&receipt->terminal, &receipt->change,
+			&receipt->page, receipt->plan))
+		return result;
+	InitBufferTag(&tag, &receipt->page.locator, receipt->page.forknum, receipt->page.blockno);
+	hash = BufTableHashCode(&tag);
+	partition = BufMappingPartitionLock(hash);
+	LWLockAcquire(partition, LW_SHARED);
+	id = BufTableLookup(&tag, hash);
+	if (id < 0) {
+		LWLockRelease(partition);
+		return CLUSTER_PI_PHYSICAL_ABSENT;
+	}
+	buf = GetBufferDescriptor(id);
+	state = LockBufHdr(buf);
+	generation = cluster_pcm_own_gen_get(id);
+	valid = BufferTagsEqual(&buf->tag, &tag) && cluster_pi_physical_unfenced_locked(buf, state);
+	if (valid && cluster_bufmgr_pcm_current_image_locked(buf, state)) {
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		return CLUSTER_PI_PHYSICAL_REPLACED;
+	}
+	valid = valid && cluster_page_wal_pi_snapshot_locked_v1(buf, &pi);
+	UnlockBufHdr(buf, state);
+	LWLockRelease(partition);
+	if (!valid || !cluster_page_structural_ancestor_v1(&receipt->terminal, &pi, receipt->plan))
+		return result;
+
+	/* Reuse the native invalidation commit owner under its final mapping
+	 * and header locks. A concurrent same-tag install, pin or mutation must
+	 * preserve the replacement and leave retirement to a later exact cut. */
+	LWLockAcquire(partition, LW_EXCLUSIVE);
+	state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag) || cluster_pcm_own_gen_get(id) != generation
+		|| !cluster_pi_physical_unfenced_locked(buf, state)
+		|| !cluster_page_wal_pi_snapshot_locked_v1(buf, &reobserved)
+		|| memcmp(&pi, &reobserved, sizeof(pi)) != 0) {
+		UnlockBufHdr(buf, state);
+		LWLockRelease(partition);
+		return result;
+	}
+	if (InvalidateBufferCommitLocked(buf, &tag, hash, partition, state))
+		result = CLUSTER_PI_PHYSICAL_DISCARDED;
+	return result;
+}
+
 bool
 cluster_page_data_covers_local_pi_v1(const ClusterPageDataReceiptV1 *receipt,
 									 const RfPageOnlinePlanV1 *plan,
