@@ -2343,7 +2343,7 @@ UT_TEST(test_poll_cannot_republish_invalidated_or_replaced_scan)
 
 UT_TEST(test_poll_failed_proofs_revoke_cache_without_shrinking_denominator)
 {
-	for (int failure = 0; failure < 8; failure++) {
+	for (int failure = 0; failure < 10; failure++) {
 		PgsaDiskSet set;
 		ClusterFenceMarker marker;
 		int ndisks = PGSA_TEST_DISKS;
@@ -2372,8 +2372,13 @@ UT_TEST(test_poll_failed_proofs_revoke_cache_without_shrinking_denominator)
 				marker.fence_epoch++;
 				fence_poll_write(&set, d, 1, &marker);
 			}
-		} else
+		} else if (failure == 7)
 			ndisks = 0;
+		else if (failure == 8)
+			snprintf(fence_poll_config, sizeof(fence_poll_config), "%s,%s,%s",
+					 set.paths[0], set.paths[0], set.paths[2]);
+		else
+			cluster_voting_disks = "one,,three";
 		cluster_qvotec_test_poll_once(set.fds, ndisks, 901);
 		UT_ASSERT(!fence_cache_valid);
 		UT_ASSERT_EQ(fence_cache_publications, 0);
@@ -2393,7 +2398,9 @@ UT_TEST(test_poll_preserves_majority_crc_and_legacy_boundaries)
 		if (mode == 0) {
 			close(set.fds[2]); set.fds[2] = -1;
 		} else if (mode == 1) {
-			uint8 bad = 0xff;
+			uint8 bad;
+			UT_ASSERT_EQ(pread(set.fds[2], &bad, 1, 508), 1);
+			bad ^= 0xff;
 			UT_ASSERT_EQ(pwrite(set.fds[2], &bad, 1, 508), 1); /* bad outer CRC */
 		} else if (mode == 2)
 			cluster_shared_config = false;

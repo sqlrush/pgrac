@@ -68,6 +68,8 @@
  */
 #include "postgres.h"
 
+#include <sys/stat.h>
+
 #include "cluster/cluster_qvotec.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -3026,6 +3028,14 @@ qvotec_poll_once(void)
 	ClusterVotingSlot self_slot;
 	ClusterVotingDiskIoState io_states[CLUSTER_MAX_VOTING_DISKS];
 	bool own_prior_read_ok[CLUSTER_MAX_VOTING_DISKS] = { false };
+	bool renew_authority = cluster_shared_config;
+	bool authority_config_ok = false;
+	uint64 authority_sequence = UINT64_MAX;
+	uint64 authority_sampled_us = 0;
+	ClusterFenceMarker authority_disk_markers[CLUSTER_MAX_VOTING_DISKS];
+	ClusterFenceDiskVoteState authority_disk_states[CLUSTER_MAX_VOTING_DISKS];
+	struct stat authority_disk_stats[CLUSTER_MAX_VOTING_DISKS];
+	bool authority_stat_valid[CLUSTER_MAX_VOTING_DISKS] = { false };
 	bool formation_scan = cluster_reconfig_formation_needs_disk_snapshot();
 	bool all_slots_read = true;
 	uint64 observed_max_fence_epoch = 0;
@@ -3170,6 +3180,8 @@ qvotec_poll_once(void)
 	have_apply_lease_request = cluster_mrp_qvotec_poll_apply_lease_request(&apply_lease_request);
 
 	if (qvotec_n_disks == 0) {
+		if (renew_authority)
+			cluster_write_fence_authority_cache_invalidate();
 		/* Single-node compat: no disks, no quorum to decide.  Hold
 		 * quorum_state at INITIALIZING so any explicit consumer that
 		 * does check it stays fail-closed (per Q4 v0.2 default). */
@@ -3203,6 +3215,8 @@ qvotec_poll_once(void)
 	}
 
 	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES) {
+		if (renew_authority)
+			cluster_write_fence_authority_cache_invalidate();
 		/* Defensive: invalid node_id ⇒ cannot author a self slot.
 		 * Leave shmem at last-known state and skip the cycle.  Q7
 		 * startup validator (next commit) will reject this config
@@ -3247,9 +3261,74 @@ qvotec_poll_once(void)
 
 	/* ---- 1. read full slot matrix BEFORE writing ---- */
 	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_VOTE_MATRIX);
+	if (renew_authority) {
+		/* Match the durable reader's configured denominator and distinct physical
+		 * targets. Configuration is PGC_POSTMASTER; open fds retain that order.
+		 * Capture before any scan I/O: a slow scan cannot acquire a new TTL at
+		 * completion, nor can it undo a concurrent epoch/identity invalidation. */
+		authority_sequence = cluster_write_fence_authority_cache_sequence();
+		authority_sampled_us = cluster_storage_quorum_now_us();
+		authority_config_ok = cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON
+			&& qvotec_shutdown_configured_disks() == qvotec_n_disks
+			&& authority_sampled_us != 0;
+		memset(authority_disk_markers, 0, sizeof(authority_disk_markers));
+		if (authority_config_ok) {
+			const char *paths[CLUSTER_MAX_VOTING_DISKS];
+			size_t lengths[CLUSTER_MAX_VOTING_DISKS];
+			const char *p = cluster_voting_disks;
+
+			for (i = 0; i < qvotec_n_disks; i++) {
+				const char *end;
+				int j;
+
+				while (*p == ' ' || *p == '\t')
+					p++;
+				paths[i] = p;
+				while (*p != '\0' && *p != ',')
+					p++;
+				end = p;
+				while (end > paths[i] && (end[-1] == ' ' || end[-1] == '\t'))
+					end--;
+				lengths[i] = end - paths[i];
+				if (*p == ',')
+					p++;
+				for (j = 0; j < i; j++)
+					if (lengths[i] == lengths[j]
+						&& memcmp(paths[i], paths[j], lengths[i]) == 0)
+						authority_config_ok = false;
+			}
+		}
+		for (i = 0; i < qvotec_n_disks; i++) {
+			struct stat *st = &authority_disk_stats[i];
+			int j;
+
+			authority_disk_states[i] = CLUSTER_FENCE_DISK_VOTE_UNREADABLE;
+			if (fstat(qvotec_fds[i], st) != 0)
+				continue;
+			if (!S_ISREG(st->st_mode) && !S_ISBLK(st->st_mode) && !S_ISCHR(st->st_mode)) {
+				authority_config_ok = false;
+				continue;
+			}
+			authority_stat_valid[i] = true;
+			for (j = 0; j < i; j++) {
+				const struct stat *prior = &authority_disk_stats[j];
+
+				if (authority_stat_valid[j]
+					&& ((S_ISREG(st->st_mode) && S_ISREG(prior->st_mode)
+						 && st->st_dev == prior->st_dev && st->st_ino == prior->st_ino)
+						|| ((S_ISBLK(st->st_mode) || S_ISCHR(st->st_mode))
+							&& (S_ISBLK(prior->st_mode) || S_ISCHR(prior->st_mode))
+							&& st->st_rdev == prior->st_rdev)))
+					authority_config_ok = false;
+			}
+		}
+	}
 	memset(qvotec_slot_matrix, 0,
 		   sizeof(ClusterVotingSlot) * CLUSTER_MAX_VOTING_DISKS * CLUSTER_MAX_NODES);
 	for (i = 0; i < qvotec_n_disks; i++) {
+		ClusterFenceMarker slot_markers[CLUSTER_MAX_NODES];
+		bool outer_crc_valid[CLUSTER_MAX_NODES] = { false };
+		bool authority_disk_failed = false;
 		uint32 node;
 
 		/* Hardening v0.4 P1.2: io_states starts OK and DOWNGRADES on
@@ -3264,6 +3343,13 @@ qvotec_poll_once(void)
 			ClusterVotingDiskIoState rrc;
 
 			rrc = cluster_voting_disk_read_slot(qvotec_fds[i], i, node, cell);
+			if (renew_authority) {
+				if (rrc == CLUSTER_VOTING_DISK_IO_OK) {
+					memcpy(&slot_markers[node], cell->_reserved1, sizeof(ClusterFenceMarker));
+					outer_crc_valid[node] = true;
+				} else if (rrc != CLUSTER_VOTING_DISK_IO_TORN)
+					authority_disk_failed = true;
+			}
 			if (node == (uint32)cluster_node_id && rrc == CLUSTER_VOTING_DISK_IO_OK)
 				own_prior_read_ok[i] = true;
 			if (rrc != CLUSTER_VOTING_DISK_IO_OK) {
@@ -3276,6 +3362,9 @@ qvotec_poll_once(void)
 				memset(cell, 0, sizeof(*cell));
 			}
 		}
+		if (renew_authority && authority_stat_valid[i] && !authority_disk_failed)
+			authority_disk_states[i] = cluster_fence_disk_vote_select_v1(slot_markers,
+				outer_crc_valid, CLUSTER_MAX_NODES, &authority_disk_markers[i]);
 	}
 
 	/*
@@ -3360,6 +3449,21 @@ qvotec_poll_once(void)
 		ClusterFenceAuthority authority;
 
 		qvotec_diagnostic_phase_enter(QVOTEC_DIAG_FENCE_DECISION);
+		if (renew_authority) {
+			ClusterFenceAuthorityProof proof;
+
+			if (!authority_config_ok
+				|| cluster_fence_authority_prove_v1(authority_disk_markers,
+					   authority_disk_states, qvotec_n_disks, &proof)
+					   != CLUSTER_FENCE_AUTHORITY_OK)
+				cluster_write_fence_authority_cache_invalidate();
+			else if ((authority_sequence & UINT64_C(1)) == 0
+					 && authority_sequence < UINT64_MAX - 1)
+				/* A failed CAS belongs to a newer publisher/invalidator. Do not
+				 * overwrite or invalidate its state with this older scan. */
+				(void)cluster_write_fence_authority_cache_publish_if_unchanged(
+					&proof.marker, authority_sampled_us, authority_sequence);
+		}
 		for (i = 0; i < qvotec_n_disks; i++) {
 			disk_has_marker[i] = qvotec_best_marker_on_disk(i, &disk_markers[i]);
 			if (disk_has_marker[i])
