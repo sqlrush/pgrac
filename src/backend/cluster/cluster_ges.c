@@ -69,6 +69,8 @@
 #include "cluster/cluster_extend_gate.h"   /* spec-5.7 Direction B — SOLE reclassify */
 #include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D2 profiling */
 #include "storage/condition_variable.h"
+#include "storage/ipc.h"
+#include "postmaster/startup.h"
 #include "storage/proc.h"		/* MyProc->cluster_grd_bast_pending (D5) */
 #include "storage/procarray.h"	/* ProcSignalReason dispatch helper */
 #include "storage/procsignal.h" /* SendProcSignal + PROCSIG_CLUSTER_GES_BAST */
@@ -2464,6 +2466,22 @@ ges_arm_local_request_grant(ClusterGesHwGrant *grant, const ClusterResId *resid,
 	grant->cleanup_pending = true;
 }
 
+/* Startup uses private signal flags. Check both sides of each real sleep so
+ * a reply racing SIGTERM cannot turn a cancelled wait into further recovery.
+ * Original proc_exit owns CV/native-lock cleanup and shared CONTROL transfer. */
+static bool
+ges_timed_sleep(ConditionVariable *cv, long timeout_ms, uint32 wait_event)
+{
+	bool timed_out;
+
+	if (AmStartupProcess() && !proc_exit_inprogress)
+		HandleStartupProcInterrupts();
+	timed_out = ConditionVariableTimedSleep(cv, timeout_ms, wait_event);
+	if (AmStartupProcess() && !proc_exit_inprogress)
+		HandleStartupProcInterrupts();
+	return timed_out;
+}
+
 static uint32
 ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmode,
 								 uint32 current_mode, const struct ClusterGrdHolderId *holder,
@@ -2720,7 +2738,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 						sleep_ms = (int)remaining_ms;
 				}
 
-				(void)ConditionVariableTimedSleep(&entry->cv, sleep_ms, wait_ev);
+				(void)ges_timed_sleep(&entry->cv, sleep_ms, wait_ev);
 				CHECK_FOR_INTERRUPTS();
 			}
 		}
@@ -3009,7 +3027,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 				sleep_ms = (int)remaining_ms;
 		}
 
-		if (!ConditionVariableTimedSleep(&entry->cv, sleep_ms, wait_ev)) {
+		if (!ges_timed_sleep(&entry->cv, sleep_ms, wait_ev)) {
 			/* CV signaled — re-check loop predicate. */
 			continue;
 		}
@@ -3671,7 +3689,7 @@ ges_release_send_owned(const struct ClusterResId *resid, const struct ClusterGrd
 					sleep_ms = (int)remaining_ms;
 			}
 
-			if (!ConditionVariableTimedSleep(&entry->cv, sleep_ms, effective_wait_event))
+			if (!ges_timed_sleep(&entry->cv, sleep_ms, effective_wait_event))
 				continue;
 
 			attempt++;
@@ -3932,7 +3950,7 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 			remaining_ms = 1;
 		if (remaining_ms > 100)
 			remaining_ms = 100;
-		(void)ConditionVariableTimedSleep(&entry->cv, remaining_ms, WAIT_EVENT_GES_CONVERT_WAIT);
+		(void)ges_timed_sleep(&entry->cv, remaining_ms, WAIT_EVENT_GES_CONVERT_WAIT);
 	}
 	ConditionVariableCancelSleep();
 	cluster_xp_end(&xp_wait); /* PGRAC: spec-5.59 D2 profiling */

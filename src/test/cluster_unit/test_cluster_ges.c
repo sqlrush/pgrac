@@ -1305,6 +1305,9 @@ static TimestampTz stub_now = 0;
 static bool stub_cv_timeout_expires = true;
 static TimestampTz stub_cv_now_after_sleep = 0;
 static int stub_cv_waits, stub_cv_grant_on_wait;
+#include "test_cluster_startup_interrupt_fixture.h"
+static bool stub_startup_shutdown_on_wait;
+static bool stub_cv_sleeping;
 
 TimestampTz
 GetCurrentTimestamp(void)
@@ -1319,7 +1322,7 @@ PGPROC *MyProc;
 #include "storage/condition_variable.h"
 void
 ConditionVariablePrepareToSleep(ConditionVariable *cv pg_attribute_unused())
-{}
+{ stub_cv_sleeping = true; }
 /* HW consumes the real reply table in test_cluster_hw_handoff. */
 GesReplyWaitPollResult
 cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key, GesReplyWaitVerdict *verdict)
@@ -1343,6 +1346,7 @@ cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key, GesReplyWaitVerd
 bool
 ConditionVariableCancelSleep(void)
 {
+	stub_cv_sleeping = false;
 	return false;
 }
 bool
@@ -1351,6 +1355,8 @@ ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(),
 							uint32 wait_event pg_attribute_unused())
 {
 	stub_cooperative_cv_calls++;
+	if (stub_startup_shutdown_on_wait)
+		StartupProcShutdownHandler(SIGTERM);
 	if (stub_cv_now_after_sleep > 0)
 		stub_now = stub_cv_now_after_sleep;
 	if (stub_cv_grant_on_wait > 0 && ++stub_cv_waits >= stub_cv_grant_on_wait) {
@@ -3152,10 +3158,91 @@ UT_TEST(test_ges_parallel_group_wire_and_origin)
 	MyProc = saved_proc;
 }
 
+static void
+startup_wait_exit_cleanup(void)
+{
+	UT_ASSERT(stub_cv_sleeping);
+	/* AuxiliaryProcKill removes an exiting process from the original CV. */
+	ConditionVariableCancelSleep();
+}
+
+UT_TEST(test_startup_shutdown_at_actual_ges_wait_boundaries)
+{
+	ClusterResId resid = { 0 };
+	ClusterGrdHolderId holder = { 0 };
+	int saved_timeout = cluster_ges_request_timeout_ms;
+
+	resid.type = CLUSTER_WAL_RETENTION_RESID_TYPE;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	resid.field1 = 2;
+	holder.node_id = cluster_node_id;
+	holder.procno = 31;
+	holder.cluster_epoch = cluster_epoch_get_current();
+	holder.request_id = 10031;
+	stub_authority_managed = false; /* Admission is covered by its dedicated cases. */
+	stub_cooperative_reply_table = false;
+	stub_cooperative_outbound_full = false;
+	stub_master_unknown = false;
+	stub_remaster_on_second_lookup = false;
+	MyAuxProcType = StartupProcess;
+	MyBackendType = B_STARTUP;
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_clock_advances = false;
+	stub_now = 0;
+	stub_cv_now_after_sleep = 0;
+	stub_cv_timeout_expires = false;
+	stub_backend_request_ready_after = 0;
+	stub_startup_shutdown_on_wait = true;
+	startup_fixture_armed = true;
+	startup_fixture_exit_hook = startup_wait_exit_cleanup;
+	for (int leg = 0; leg < 4; leg++) {
+		for (int race = 0; race < 2; race++) {
+			volatile bool exited = false;
+			/* Missing ACK with no deadline, and ACK racing SIGTERM. A second
+			 * fixture wake bounds RED, never substitutes for the first wake. */
+			cluster_ges_request_timeout_ms = race ? 60000 : -1;
+			stub_cv_grant_on_wait = race ? 1 : 2;
+			stub_cv_waits = 0;
+			stub_backend_request_enqueue_count = 0;
+			if (sigsetjmp(startup_fixture_exit, 1) == 0) {
+				if (leg == 0)
+					(void)cluster_ges_send_request_nowait_and_wait(&resid, ShareLock, &holder,
+																	 holder.request_id, 0, 0);
+				else if (leg == 1)
+					(void)cluster_ges_send_convert_nowait_and_wait(&resid, ExclusiveLock, ShareLock,
+																		 &holder, holder.request_id, 10030, 0, 0);
+				else if (leg == 2)
+					(void)cluster_ges_send_convert_and_wait(&resid, ShareLock, ExclusiveLock, &holder,
+																  holder.request_id, 0);
+				else
+					(void)cluster_ges_send_release_and_wait(&resid, &holder, holder.request_id, 0, 0);
+			} else
+				exited = true;
+			UT_ASSERT(exited);
+			UT_ASSERT_EQ(startup_fixture_exit_code, 1);
+			UT_ASSERT_EQ(stub_cv_waits, 1);
+			UT_ASSERT(!stub_cv_sleeping);
+			proc_exit_inprogress = false;
+			shutdown_requested = false;
+			PG_exception_stack = NULL; /* Actual proc_exit never resumes its caller. */
+		}
+	}
+	startup_fixture_armed = false;
+	startup_fixture_exit_hook = NULL;
+	stub_startup_shutdown_on_wait = false;
+	stub_cv_grant_on_wait = 0;
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	cluster_ges_request_timeout_ms = saved_timeout;
+	MyAuxProcType = NotAnAuxProcess;
+	MyBackendType = B_BACKEND;
+}
+
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(50);
+	UT_PLAN(51);
 	UT_RUN(test_block0_protected_failure_detail_is_not_elapsed_timeout);
 
 	UT_RUN(test_ges_request_handler_linkable);
@@ -3207,6 +3294,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_redeclare_poll_local_rebind_is_not_fresh_acquisition);
 	UT_RUN(test_redeclare_poll_invalid_or_unknown_route_never_grants);
 	UT_RUN(test_redeclare_poll_reject_and_post_reply_cut_are_not_ack);
+	UT_RUN(test_startup_shutdown_at_actual_ges_wait_boundaries);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

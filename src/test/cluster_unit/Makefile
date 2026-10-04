@@ -7509,6 +7509,11 @@ test_cluster_startup_interrupt.inc: $(top_srcdir)/src/backend/postmaster/startup
 	     END { if (functions != 2 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_cf_enqueue test_cluster_control_walr test_cluster_control_ir \
+test_cluster_lock_acquire test_cluster_ges test_cluster_hw_handoff \
+test_cluster_control_retire_master test_cluster_control_cf_poll: \
+		test_cluster_startup_interrupt_fixture.h test_cluster_startup_interrupt.inc
+
 test_cluster_startup_sync: test_cluster_startup_sync.c test_cluster_startup_sync.inc test_cluster_startup_interrupt.inc unit_test.h \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/storage/lmgr/s_lock.o \

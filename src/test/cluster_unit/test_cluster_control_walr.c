@@ -505,6 +505,111 @@ UT_TEST(foreground_release_waits_but_lmon_never_waits_on_itself)
 	MyBackendType = B_INVALID;
 }
 
+UT_TEST(shared_nowait_keeps_transport_and_retirement_budget)
+{
+	ClusterLockAcquireRequest request = walr_fixture_request(), convert;
+	ClusterLockAcquireResult released;
+	unsigned before = owner_wait_calls;
+	int saved_timeout = cluster_ges_request_timeout_ms;
+	bool cleanup = false;
+
+	cluster_ges_request_timeout_ms = 1000;
+	MyBackendType = B_STARTUP;
+	UT_ASSERT_EQ(walr_request_acquire_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT(request.dontwait);
+	UT_ASSERT_EQ(request.timeout_ms, 0);
+	/* A real registry ACK after the first scheduling turn; two milliseconds
+	 * already elapse before WaitLatch. NOWAIT only rejects lock conflicts. */
+	owner_clock_step = 2000;
+	owner_ack_on_wait = true;
+	released = walr_request_release_actual(&request);
+	UT_ASSERT_EQ(released, CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(owner_wait_calls, before + 1);
+	if (released != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
+		UT_ASSERT(acknowledge_retirements());
+		UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	}
+	UT_ASSERT_EQ(native_refs[ShareLock], 0);
+	owner_ack_on_wait = false;
+
+	request = walr_fixture_request();
+	UT_ASSERT_EQ(walr_request_acquire_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	convert = request;
+	convert.op = CLUSTER_LOCK_OP_CONVERT;
+	convert.current_mode = ShareLock;
+	convert.lockmode = ExclusiveLock;
+	convert.convert_old_request_id = request.request_id;
+	convert.timeout_ms = 1; /* Existing manual conversion producers. */
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
+	UT_ASSERT_EQ(walr_request_convert_actual(&convert, 0, &cleanup), CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
+	UT_ASSERT(!cleanup && convert.dontwait);
+	UT_ASSERT_EQ(convert.timeout_ms, 0);
+	UT_ASSERT(acknowledge_retirements());
+	/* Exhausting the configured exchange budget is still not retirement. */
+	cluster_ges_request_timeout_ms = 1;
+	before = owner_wait_calls;
+	UT_ASSERT_EQ(walr_request_release_actual(&convert), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT_EQ(owner_wait_calls, before);
+	UT_ASSERT_EQ(native_refs[ExclusiveLock], 1);
+	UT_ASSERT(!cluster_lock_owner_request_usable(&convert));
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(walr_request_release_actual(&convert), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	walr_native_lock_release_or_fatal(&request);
+	UT_ASSERT_EQ(native_refs[ExclusiveLock], 0);
+	UT_ASSERT_EQ(native_refs[ShareLock], 0);
+	cluster_ges_request_timeout_ms = saved_timeout;
+	owner_clock_step = 60000000;
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(startup_shutdown_interrupts_retirement_without_forgetting_owner)
+{
+	int saved_timeout = cluster_ges_request_timeout_ms;
+
+	for (int perpetual = 0; perpetual < 2; perpetual++) {
+		ClusterLockAcquireRequest request = walr_fixture_request();
+		volatile bool exited = false;
+		unsigned before = owner_wait_calls;
+
+		cluster_ges_request_timeout_ms = perpetual ? -1 : 60000;
+		MyBackendType = B_STARTUP;
+		MyAuxProcType = StartupProcess;
+		UT_ASSERT_EQ(walr_request_acquire_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+		owner_clock_step = 1;
+		owner_shutdown_on_wait = 2;
+		startup_fixture_armed = true;
+		if (sigsetjmp(startup_fixture_exit, 1) == 0)
+			(void)walr_request_release_actual(&request);
+		else
+			exited = true;
+		UT_ASSERT(exited);
+		UT_ASSERT_EQ(startup_fixture_exit_code, 1);
+		UT_ASSERT_EQ(owner_wait_calls, before + 1);
+		UT_ASSERT_EQ(native_refs[ShareLock], 1);
+		UT_ASSERT(!cluster_lock_owner_request_usable(&request));
+		if (exited) {
+			/* proc_exit cleanup must poll, never recursively consume Startup's
+			 * still-set shutdown flag or wait for a peer that may have exited. */
+			before = owner_wait_calls;
+			UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_PENDING);
+			UT_ASSERT_EQ(owner_wait_calls, before);
+			UT_ASSERT_EQ(native_refs[ShareLock], 1);
+			UT_ASSERT(acknowledge_retirements());
+			proc_exit_inprogress = false;
+			shutdown_requested = false;
+			UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+		}
+		startup_fixture_armed = false;
+		owner_shutdown_on_wait = 0;
+		proc_exit_inprogress = false;
+		shutdown_requested = false;
+	}
+	owner_clock_step = 60000000;
+	cluster_ges_request_timeout_ms = saved_timeout;
+	MyBackendType = B_INVALID;
+	MyAuxProcType = NotAnAuxProcess;
+}
+
 int
 main(void)
 {
@@ -516,7 +621,7 @@ main(void)
 	cluster_control_request_shmem_init();
 	retire_driver = cluster_control_request_driver_start();
 	cluster_shared_config = true;
-	UT_PLAN(11);
+	UT_PLAN(13);
 	UT_RUN(native_s_is_kept_until_exact_retirement);
 	UT_RUN(failed_native_publication_keeps_only_owned_cleanup);
 	UT_RUN(upgrade_uses_new_attempt_and_downgrade_keeps_confirmed_identity);
@@ -528,6 +633,8 @@ main(void)
 	UT_RUN(two_recoverers_cannot_write_across_exclusive_completion);
 	UT_RUN(error_in_acquire_cannot_leave_an_unpublished_native_ref);
 	UT_RUN(foreground_release_waits_but_lmon_never_waits_on_itself);
+	UT_RUN(shared_nowait_keeps_transport_and_retirement_budget);
+	UT_RUN(startup_shutdown_interrupts_retirement_without_forgetting_owner);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

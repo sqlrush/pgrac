@@ -16,6 +16,7 @@
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_wal_retention.h"
 #include "miscadmin.h"
+#include "postmaster/startup.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
@@ -960,7 +961,8 @@ lock_owner_release_wait(ClusterLockOwner *owner, int timeout_ms, uint32 event)
 	if (lock_owner_release_poll(owner))
 		return true;
 	if (owner == NULL || !owner->shared || owner->state != CLUSTER_LOCK_OWNER_RETIRING
-		|| MyBackendType == B_LMON || MyBackendType == B_LMS || MyLatch == NULL)
+		|| MyBackendType == B_LMON || MyBackendType == B_LMS || MyLatch == NULL
+		|| proc_exit_inprogress)
 		return false;
 	if (effective == 0)
 		effective = 600000; /* Same fallback as the existing S6 adapter. */
@@ -978,8 +980,15 @@ lock_owner_release_wait(ClusterLockOwner *owner, int timeout_ms, uint32 event)
 		if (deadline != 0)
 			wait_ms = Min(wait_ms, Max(1L, (long)((deadline - now) / 1000)));
 		CHECK_FOR_INTERRUPTS();
+		/* Startup's SIGTERM sets a private flag, not InterruptPending. The
+		 * original exit callbacks transfer shared retirement and release local
+		 * locks; an exit callback must never re-enter this waiting loop. */
+		if (AmStartupProcess())
+			HandleStartupProcInterrupts();
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 						event != 0 ? event : WAIT_EVENT_CLUSTER_GES_REPLY_WAIT);
+		if (AmStartupProcess())
+			HandleStartupProcInterrupts();
 	}
 }
 
