@@ -264,6 +264,64 @@ UT_TEST(test_serving_missing_inputs_never_publish)
 	test_reserve_mode = false;
 }
 
+UT_TEST(test_serving_pending_peer_installs_before_same_cut_publication)
+{
+	uint8 before[66048], after[66048];
+	ControlRootImage root;
+	ClusterControlRootFileToken out;
+	ClusterWalStartupImage pending;
+	ClusterWalSourceRef writer;
+	char path[MAXPGPATH];
+
+	serving_fixture_installed(before, &root, false);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT(root.startup[3].generation != 0);
+	UT_ASSERT(root.records[3].identity.origin_owner_incarnation
+			  != test_reserve_cut.observer[3]);
+	memset(&out, 0xff, sizeof(out));
+	UT_ASSERT_EQ(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &out),
+				 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	v2_assert_primary_unchanged(before);
+
+	/* Consume the actual pending checkpoint through its original INSTALL
+	 * owner. Do not fabricate an installed ROOT to complete the test. */
+	(void)v3_driver_restart(&root, 3);
+	MyBackendType = B_STARTUP;
+	test_cf_mode = test_actual_cf = ShareLock;
+	UT_ASSERT_EQ(cluster_wal_startup_read_locked(&root, 3, &pending), 0);
+	test_cf_mode = test_actual_cf = NoLock;
+	UT_ASSERT_EQ(pending.phase, CLUSTER_WAL_STARTUP_DURABLE);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&pending, &writer), 0);
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, after, sizeof(after));
+	UT_ASSERT_EQ(cluster_control_root_v3_decode(after, sizeof(after), v2_storage, TEST_SYSID,
+											  &root), 0);
+	UT_ASSERT_EQ(root.startup[3].generation, 0);
+	UT_ASSERT_EQ(root.records[3].identity.origin_owner_incarnation,
+				 test_reserve_cut.observer[3]);
+	cluster_node_id = 0;
+	test_self_incarnation = test_membership_incarnation = test_reserve_cut.observer[0];
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &out), 0);
+	UT_ASSERT(!v2_zero(&out, sizeof(out)));
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+
+	/* A current formation with a different boot and no pending INSTALL is
+	 * a contradiction, not another lawful installation wait. */
+	test_reserve_cut.observer[3]++;
+	test_reserve_formation.membership.last_admitted_incarnation[3]++;
+	read_all_or_abort(path, before, sizeof(before));
+	UT_ASSERT_EQ(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &out),
+				 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	v2_assert_primary_unchanged(before);
+	test_reserve_mode = false;
+}
+
 UT_TEST(test_serving_waits_for_own_release_and_revalidates_cut)
 {
 	for (unsigned fault = 0; fault < 4; fault++) {
