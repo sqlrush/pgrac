@@ -428,7 +428,8 @@ UT_TEST(test_first_open_requires_both_real_admission_gates)
 	ClusterSemanticActivationRefusal refusal;
 	uint64 request_seq;
 
-	test_first_open_reset();
+	test_serving_setup(false);
+	test_gate_publish(2, 0, 0, test_current_epoch, false);
 	UT_ASSERT(!cluster_semantic_activation_startup_poll(&refusal));
 	request_seq = semantic_activation_first_start.request_seq;
 	test_gate_publish(4, target, 6, test_current_epoch, false);
@@ -454,6 +455,7 @@ UT_TEST(test_first_open_requires_both_real_admission_gates)
 	test_gate_publish(8, target, 5, test_current_epoch, false);
 	UT_ASSERT(!cluster_semantic_activation_startup_poll(&refusal));
 	test_gate_publish(10, target, 6, test_current_epoch, false);
+	test_serving_finish_root();
 	UT_ASSERT(cluster_semantic_activation_startup_poll(&refusal));
 	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_OK);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&SemanticActivationUtilityMailbox->utility_mailbox_state),
