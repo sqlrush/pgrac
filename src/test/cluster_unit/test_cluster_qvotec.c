@@ -425,15 +425,32 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPt
 #include <time.h>
 static TimestampTz mock_now = 1700000000000000LL;
 static uint64 fence_mock_monotonic_us;
+static uint64 fence_mock_storage_us;
 static ClusterStorageQuorumView storage_sample;
 
 int cluster_qvotec_test_clock_gettime(clockid_t clock_id, struct timespec *out);
 int
 cluster_qvotec_test_clock_gettime(clockid_t clock_id, struct timespec *out)
 {
-	uint64 now = fence_mock_monotonic_us != 0 ? fence_mock_monotonic_us : (uint64)mock_now;
+	uint64 now = fence_mock_storage_us != 0 ? fence_mock_storage_us :
+		(fence_mock_monotonic_us != 0 ? fence_mock_monotonic_us : (uint64)mock_now);
 
 	Assert(clock_id == CLOCK_MONOTONIC);
+	out->tv_sec = now / 1000000;
+	out->tv_nsec = (now % 1000000) * 1000;
+	return 0;
+}
+
+/* Keep the two clock domains distinct even on test hosts where both map to
+ * CLOCK_MONOTONIC. Darwin's fence consumer uses PG_INSTR_CLOCK (RAW). */
+#include "portability/instr_time.h"
+extern int cluster_qvotec_test_instr_clock_gettime(clockid_t clock_id, struct timespec *out);
+int
+cluster_qvotec_test_instr_clock_gettime(clockid_t clock_id, struct timespec *out)
+{
+	uint64 now = fence_mock_monotonic_us != 0 ? fence_mock_monotonic_us : (uint64)mock_now;
+
+	Assert(clock_id == PG_INSTR_CLOCK);
 	out->tv_sec = now / 1000000;
 	out->tv_nsec = (now % 1000000) * 1000;
 	return 0;
@@ -2273,6 +2290,7 @@ fence_poll_fixture(PgsaDiskSet *set, ClusterFenceMarker *marker)
 	fence_cache_valid = true; /* Failed renewal must revoke an existing proof. */
 	fence_cache_marker = *marker;
 	fence_mock_monotonic_us = 1000000;
+	fence_mock_storage_us = 0;
 	fence_cache_sampled_us = fence_mock_monotonic_us;
 	fence_cache_publications = 0;
 	fence_read_action = 0;
@@ -2290,6 +2308,7 @@ fence_poll_close(PgsaDiskSet *set)
 	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
 	cluster_voting_disks = NULL;
 	fence_mock_monotonic_us = 0;
+	fence_mock_storage_us = 0;
 	fence_read_action = 0;
 }
 
@@ -2317,6 +2336,23 @@ UT_TEST(test_poll_renews_real_majority_across_two_expiry_periods)
 		UT_ASSERT(cluster_fence_marker_semantic_equal(&marker, &fence_cache_marker));
 	}
 	fence_poll_close(&set);
+}
+
+UT_TEST(test_poll_uses_fence_consumer_clock_when_quorum_clock_differs)
+{
+	for (int direction = 0; direction < 2; direction++) {
+		PgsaDiskSet set;
+		ClusterFenceMarker marker;
+
+		UT_ASSERT(fence_poll_fixture(&set, &marker));
+		fence_mock_monotonic_us = direction == 0 ? 1000000 : 31000000;
+		fence_mock_storage_us = direction == 0 ? 31000000 : 1000000;
+		cluster_qvotec_test_poll_once(set.fds, PGSA_TEST_DISKS, 901);
+		UT_ASSERT_EQ(fence_cache_publications, 1);
+		UT_ASSERT_EQ(fence_cache_sampled_us, fence_mock_monotonic_us);
+		UT_ASSERT_EQ(fence_poll_cached(&marker), CLUSTER_FENCE_CACHE_MATCH);
+		fence_poll_close(&set);
+	}
 }
 
 UT_TEST(test_poll_cannot_republish_invalidated_or_replaced_scan)
@@ -4273,7 +4309,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(82);
+	UT_PLAN(83);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -4353,6 +4389,7 @@ main(void)
 	UT_RUN(test_normal_stop_marker_preservation_and_replacement_hold);
 	UT_RUN(test_normal_stop_no_config_generation_overflow_and_legacy_boundary);
 	UT_RUN(test_poll_renews_real_majority_across_two_expiry_periods);
+	UT_RUN(test_poll_uses_fence_consumer_clock_when_quorum_clock_differs);
 	UT_RUN(test_poll_cannot_republish_invalidated_or_replaced_scan);
 	UT_RUN(test_poll_failed_proofs_revoke_cache_without_shrinking_denominator);
 	UT_RUN(test_poll_preserves_majority_crc_and_legacy_boundaries);

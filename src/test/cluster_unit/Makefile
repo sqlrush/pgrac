@@ -4428,6 +4428,7 @@ $(CLUSTER_QVOTEC_PGSA_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_qvotec.
 
 cluster_qvotec_poll_test.o: cluster_qvotec_poll_test.c $(top_srcdir)/src/backend/cluster/cluster_qvotec.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_QVOTEC_PGSA_UNIT_TEST \
+		-Dclock_gettime=cluster_qvotec_test_instr_clock_gettime \
 		-DQVOTEC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_qvotec.c"' \
 		-c $< -o $@
 
