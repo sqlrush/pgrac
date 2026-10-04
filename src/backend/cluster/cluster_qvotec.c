@@ -3262,12 +3262,20 @@ qvotec_poll_once(void)
 	/* ---- 1. read full slot matrix BEFORE writing ---- */
 	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_VOTE_MATRIX);
 	if (renew_authority) {
+		instr_time authority_started;
+		int64 authority_started_ns;
+
 		/* Match the durable reader's configured denominator and distinct physical
 		 * targets. Configuration is PGC_POSTMASTER; open fds retain that order.
 		 * Capture before any scan I/O: a slow scan cannot acquire a new TTL at
 		 * completion, nor can it undo a concurrent epoch/identity invalidation. */
 		authority_sequence = cluster_write_fence_authority_cache_sequence();
-		authority_sampled_us = cluster_storage_quorum_now_us();
+		/* Use the fence consumer's PG_INSTR_CLOCK domain (RAW on Darwin),
+		 * not the storage-quorum domain. Both must age the same evidence. */
+		INSTR_TIME_SET_CURRENT(authority_started);
+		authority_started_ns = INSTR_TIME_GET_NANOSEC(authority_started);
+		authority_sampled_us = authority_started_ns <= 0
+			? 0 : (uint64)authority_started_ns / UINT64_C(1000);
 		authority_config_ok = cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON
 			&& qvotec_shutdown_configured_disks() == qvotec_n_disks
 			&& authority_sampled_us != 0;
