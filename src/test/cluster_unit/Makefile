@@ -4426,6 +4426,11 @@ test_cluster_cssd: test_cluster_cssd.c unit_test.h \
 $(CLUSTER_QVOTEC_PGSA_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_qvotec.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_QVOTEC_PGSA_UNIT_TEST -c $< -o $@
 
+cluster_qvotec_poll_test.o: cluster_qvotec_poll_test.c $(top_srcdir)/src/backend/cluster/cluster_qvotec.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_QVOTEC_PGSA_UNIT_TEST \
+		-DQVOTEC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_qvotec.c"' \
+		-c $< -o $@
+
 cluster_qvotec_io_test.o: $(top_srcdir)/src/backend/cluster/cluster_voting_disk_io.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Dfdatasync=cluster_qvotec_test_fdatasync \
 		-Dpwrite=cluster_qvotec_test_pwrite -c $< -o $@
@@ -4441,7 +4446,7 @@ test_cluster_storage_quorum_product.o: $(top_srcdir)/src/backend/cluster/cluster
 
 test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
 		cluster_unit_no_normal_stop.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_QVOTEC_PGSA_TEST_O) \
+		$(CLUSTER_VERSION_O) cluster_qvotec_poll_test.o \
 		$(CLUSTER_NODE_REMOVE_POLICY_O) \
 		$(CLUSTER_EPOCH_BALLOT_O) $(CLUSTER_REPLACEMENT_REQUEST_O) \
 		$(CLUSTER_MEMBERSHIP_O) \
@@ -4455,7 +4460,7 @@ test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
 		-DSEMANTIC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_semantic_activation.c"' \
 		-DSEMANTIC_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_semantic_activation.h"' \
 		-DCLUSTER_MAKEFILE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/Makefile"' $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_QVOTEC_PGSA_TEST_O) \
+		$(CLUSTER_VERSION_O) cluster_qvotec_poll_test.o \
 		$(CLUSTER_NODE_REMOVE_POLICY_O) \
 		$(CLUSTER_EPOCH_BALLOT_O) $(CLUSTER_REPLACEMENT_REQUEST_O) \
 		$(CLUSTER_MEMBERSHIP_O) \
