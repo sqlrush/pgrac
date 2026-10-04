@@ -1648,6 +1648,20 @@ cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
 }
 
 
+/* A replayed record whose effect or a newer state the slot already shows:
+ * see cluster_undo_smgr_header_unchanged_durable. */
+static void
+tt_redo_present_durable(uint8 instance, uint32 segment_id)
+{
+	if (!cluster_undo_smgr_header_unchanged_durable(
+			cluster_undo_recovery_intent_for_owner(instance), segment_id, instance)) {
+		cluster_tt_durable_io_wait_end();
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not make undo segment %u durable in TT redo: %m", segment_id)));
+	}
+}
+
 void
 cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id, uint16 slot_offset,
 								   uint16 wrap, TransactionId xid)
@@ -1677,6 +1691,7 @@ cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id, uint16 slo
 						errmsg("invalid TT status %u in typed abort redo", slot.status)));
 	}
 	if (decision == CLUSTER_TT_REDO_SKIP) {
+		tt_redo_present_durable(instance, segment_id);
 		cluster_tt_durable_io_wait_end();
 		cluster_vis_bump_recovery_undo_redo_skips();
 		return;
@@ -1732,11 +1747,13 @@ cluster_tt_durable_redo_abort_slot_exact(uint8 instance, uint32 segment_id,
 													 header->wrap_count, segment_generation, xid,
 													 wrap, TT_SLOT_ABORTED, InvalidScn);
 	if (decision == CLUSTER_TT_TERMINAL_STALE) {
+		tt_redo_present_durable(instance, segment_id);
 		cluster_tt_durable_io_wait_end();
 		cluster_vis_bump_recovery_undo_redo_skips();
 		return;
 	}
 	if (decision == CLUSTER_TT_TERMINAL_IDEMPOTENT) {
+		tt_redo_present_durable(instance, segment_id);
 		cluster_tt_durable_io_wait_end();
 		return;
 	}
@@ -1785,6 +1802,7 @@ cluster_tt_durable_redo_set_head_slot(uint8 instance, uint32 segment_id, uint16 
 							   slot_offset, segment_id)));
 	}
 	if (slot.status != TT_SLOT_ABORTED || slot.xid != xid || slot.wrap != wrap) {
+		tt_redo_present_durable(instance, segment_id);
 		cluster_tt_durable_io_wait_end();
 		cluster_vis_bump_recovery_undo_redo_skips();
 		return;

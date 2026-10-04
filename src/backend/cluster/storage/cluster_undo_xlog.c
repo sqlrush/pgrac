@@ -843,8 +843,10 @@ static const UBA InvalidUbaVal = InvalidUba_init;
 /*
  * Replay one exact canonical ACTIVE binding.  Unlike the historical terminal
  * last-writer table, BIND never overwrites a same-incarnation different xid.
- * Segment generation orders stale records; every equal-generation collision
- * is either an exact idempotent ACTIVE or recovery corruption.
+ * Segment generation orders stale records; an equal-generation collision is
+ * an exact idempotent ACTIVE, the same transaction's later terminal stamp
+ * (stale), or recovery corruption.  State found already present is made
+ * durable before replay moves past the record.
  */
 void
 cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id, uint32 segment_generation,
@@ -909,9 +911,15 @@ cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id, uint32 segm
 	decision = cluster_undo_prepare_header_v1(&decoded, NULL, 0, blockbuf.data, prepared.data);
 	switch (decision) {
 	case CLUSTER_UNDO_HEADER_SKIP_STALE:
-		cluster_vis_bump_recovery_undo_redo_skips();
-		break;
 	case CLUSTER_UNDO_HEADER_ALREADY:
+		/* Present, possibly only in a crashed run's page cache: make durable. */
+		if (!cluster_undo_smgr_header_unchanged_durable(
+				cluster_undo_recovery_intent_for_owner(instance), segment_id, instance))
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not make undo segment \"%s\" durable in TT redo: %m", path)));
+		if (decision == CLUSTER_UNDO_HEADER_SKIP_STALE)
+			cluster_vis_bump_recovery_undo_redo_skips();
 		break;
 	case CLUSTER_UNDO_HEADER_APPLY:
 		successor = ((UndoSegmentHeaderData *)prepared.data)->tt_slots[slot_offset];
@@ -1040,7 +1048,12 @@ cluster_tt_durable_redo_stamp_slot(uint8 instance, uint32 segment_id, uint16 slo
 							   path, slot_offset, slot->status)));
 		break;
 	case CLUSTER_TT_REDO_SKIP:
-		/* stale record; a newer commit is already durable -> no write. */
+		/* stale record; a newer commit is already present -> no write. */
+		if (!cluster_undo_smgr_header_unchanged_durable(
+				cluster_undo_recovery_intent_for_owner(instance), segment_id, instance))
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not make undo segment \"%s\" durable in TT redo: %m", path)));
 		cluster_vis_bump_recovery_undo_redo_skips(); /* spec-3.16 D5 */
 		break;
 	case CLUSTER_TT_REDO_APPLY: {
@@ -1134,10 +1147,16 @@ cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
 	}
 	decision = cluster_undo_prepare_commit_v1(instance, segment_id, segment_generation,
 		slot_offset, wrap, xid, commit_scn, blockbuf.data, blockbuf.data);
-	if (decision == CLUSTER_UNDO_HEADER_SKIP_STALE) {
-		cluster_vis_bump_recovery_undo_redo_skips();
-	} else if (decision == CLUSTER_UNDO_HEADER_ALREADY) {
-		/* Byte-identical exact replay. */
+	if (decision == CLUSTER_UNDO_HEADER_SKIP_STALE || decision == CLUSTER_UNDO_HEADER_ALREADY) {
+		/* Stale, or a byte-identical exact replay: the present bytes may be
+		 * only in a crashed run's page cache -- make them durable. */
+		if (!cluster_undo_smgr_header_unchanged_durable(
+				cluster_undo_recovery_intent_for_owner(instance), segment_id, instance))
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not make undo segment \"%s\" durable in TT redo: %m", path)));
+		if (decision == CLUSTER_UNDO_HEADER_SKIP_STALE)
+			cluster_vis_bump_recovery_undo_redo_skips();
 	} else if (decision == CLUSTER_UNDO_HEADER_APPLY) {
 		ssize_t written;
 

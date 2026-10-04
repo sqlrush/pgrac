@@ -15,6 +15,7 @@
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_segment_init.h"
+#include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "unit_test.h"
@@ -22,7 +23,13 @@
 UT_DEFINE_GLOBALS();
 
 static PGAlignedBlock disk;
+/* What survives a power loss: the file as of its last fsync, or as of the
+ * last checkpoint that found the segment recorded for it. */
+static PGAlignedBlock durable;
 static uint32 opens, writes, syncs, closes, extends, mkdirs, dirsyncs, applies, skips;
+static uint32 notes;
+static bool note_accept;
+static bool note_pending;
 static bool expect_panic;
 static bool fail_sync;
 static jmp_buf panic_jump;
@@ -89,10 +96,45 @@ static int
 fixture_sync(int fd)
 {
 	UT_ASSERT_EQ(fd, 42);
-	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT(writes <= 1);
 	UT_ASSERT_EQ(closes, 0);
 	syncs++;
-	return fail_sync ? -1 : 0;
+	if (fail_sync)
+		return -1;
+	memcpy(durable.data, disk.data, BLCKSZ);
+	return 0;
+}
+
+static int fixture_sync(int fd);
+
+/* Record the segment for the next checkpoint (own runtime undo) or fsync it
+ * now (a path the checkpointer cannot resolve). */
+bool
+cluster_undo_smgr_header_unchanged_durable(ClusterUndoPathIntent intent pg_attribute_unused(),
+										   uint32 segment_id, uint8 owner_instance)
+{
+	UT_ASSERT_EQ(segment_id, 513);
+	UT_ASSERT_EQ(owner_instance, 3);
+	notes++;
+	if (note_accept) {
+		note_pending = true;
+		return true;
+	}
+	return fixture_sync(42) == 0;
+}
+
+static void
+fixture_checkpoint(void)
+{
+	if (note_pending)
+		memcpy(durable.data, disk.data, BLCKSZ);
+	note_pending = false;
+}
+
+static void
+fixture_power_loss(void)
+{
+	memcpy(disk.data, durable.data, BLCKSZ);
 }
 
 static int
@@ -133,12 +175,15 @@ fixture_dir_sync(const char *path, bool isdir)
 #include "test_cluster_undo_lifecycle_native.inc"
 #define cluster_undo_redo_open_segment(instance_, segment_, path_, create_) fixture_open(path_, 0)
 #define cluster_tt_durable_count_redo_apply() ((void)0)
+static const UBA InvalidUbaVal = InvalidUba_init; /* the legacy stamp's head reset */
 #include "test_cluster_undo_bind_native.inc"
 
 static void
 reset_io(void)
 {
 	opens = writes = syncs = closes = extends = mkdirs = dirsyncs = applies = skips = 0;
+	notes = 0;
+	note_pending = false;
 	fail_sync = false;
 }
 
@@ -280,7 +325,10 @@ UT_TEST(test_native_bind_uses_complete_header_identity_and_durable_slot)
 			UT_ASSERT_EQ(applies, 1);
 			reset_io();
 			cluster_tt_durable_redo_bind_slot(3, 513, 9, 4, 2, 701);
-			UT_ASSERT_EQ(writes + syncs + applies + skips, 0);
+			/* Present state is made durable, not rewritten (F-D-29 residue). */
+			UT_ASSERT_EQ(writes + applies + skips, 0);
+			UT_ASSERT_EQ(notes, 1);
+			UT_ASSERT_EQ(syncs, 1);
 		} else {
 			UT_ASSERT_EQ(writes + syncs + applies, 0);
 			UT_ASSERT(memcmp(disk.data, before.data, BLCKSZ) == 0);
@@ -291,7 +339,9 @@ UT_TEST(test_native_bind_uses_complete_header_identity_and_durable_slot)
 	((UndoSegmentHeaderData *)disk.data)->wrap_count = 10;
 	reset_io();
 	cluster_tt_durable_redo_bind_slot(3, 513, 9, 4, 2, 701);
-	UT_ASSERT_EQ(writes + syncs + applies, 0);
+	UT_ASSERT_EQ(writes + applies, 0);
+	UT_ASSERT_EQ(notes, 1);
+	UT_ASSERT_EQ(syncs, 1);
 	UT_ASSERT_EQ(skips, 1);
 	((UndoSegmentHeaderData *)disk.data)->wrap_count = 9;
 	reset_io();
@@ -308,7 +358,8 @@ UT_TEST(test_native_bind_uses_complete_header_identity_and_durable_slot)
 }
 
 /* PU-D-9 (F-D-30): BIND redo over the same entity's durable terminal stamp
- * skips without writing; another xid at that wrap still PANICs. */
+ * skips without rewriting (it only makes the present bytes durable); another
+ * xid at that wrap still PANICs. */
 UT_TEST(test_native_bind_replay_over_own_terminal_skips)
 {
 	static const uint8 terminal[] = { TT_SLOT_COMMITTED, TT_SLOT_ABORTED };
@@ -332,7 +383,9 @@ UT_TEST(test_native_bind_replay_over_own_terminal_skips)
 			cluster_tt_durable_redo_bind_slot(3, 513, 9, 4, 2, 701);
 		else
 			UT_ASSERT(false);
-		UT_ASSERT_EQ(writes + syncs + applies, 0);
+		UT_ASSERT_EQ(writes + applies, 0);
+		UT_ASSERT_EQ(notes, 1);
+		UT_ASSERT_EQ(syncs, 1);
 		UT_ASSERT_EQ(skips, 1);
 		UT_ASSERT_EQ(closes, 1);
 		UT_ASSERT(memcmp(disk.data, before.data, BLCKSZ) == 0);
@@ -349,6 +402,83 @@ UT_TEST(test_native_bind_replay_over_own_terminal_skips)
 		if (ut_current_failed)
 			printf("# terminal status %u\n", terminal[i]);
 	}
+}
+
+/*
+ * F-D-29 review P1: after a process crash the page cache may still hold a TT
+ * stamp that was never fsynced, while shared memory -- and its checkpoint
+ * record of unsynced header writes -- was rebuilt.  A replayed record whose
+ * effect block zero already shows must therefore be made durable, or
+ * recorded for the next checkpoint, like a fresh write; otherwise that
+ * checkpoint moves past the record and a power loss drops the stamp.
+ */
+UT_TEST(test_native_replay_of_present_tt_state_survives_power_loss)
+{
+	/* Replay kinds: exact commit (ALREADY), bind (ALREADY), legacy commit over
+	 * a newer wrap (SKIP), exact commit into a newer generation (SKIP_STALE). */
+	enum { EXACT_ALREADY, BIND_ALREADY, LEGACY_SKIP, EXACT_STALE, NKINDS };
+
+	for (int variant = 0; variant < NKINDS * 2; variant++) {
+		int kind = variant / 2;
+		UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)disk.data;
+		TTSlot *slot = &header->tt_slots[4];
+
+		cluster_undo_segment_make_header_bytes(513, 3, disk.data);
+		header->wrap_count = 9;
+		slot->xid = 701;
+		slot->wrap = 2;
+		slot->flags = TT_FLAGS_RESERVED;
+		slot->first_undo_block = (UBA)InvalidUba_init;
+		slot->status = kind == BIND_ALREADY ? TT_SLOT_UNUSED : TT_SLOT_ACTIVE;
+		if (kind == BIND_ALREADY)
+			memset(slot, 0, sizeof(*slot));
+		durable = disk; /* last checkpoint: before the record */
+		/* The crashed process left the record's effect -- or a newer state --
+		 * in the page cache only. */
+		slot->xid = 701;
+		slot->wrap = kind == LEGACY_SKIP ? 3 : 2;
+		slot->flags = TT_FLAGS_RESERVED;
+		slot->first_undo_block = (UBA)InvalidUba_init;
+		slot->status = kind == BIND_ALREADY ? TT_SLOT_ACTIVE : TT_SLOT_COMMITTED;
+		slot->commit_scn = kind == BIND_ALREADY ? InvalidScn : 804;
+		if (kind == EXACT_STALE)
+			header->wrap_count = 10;
+		reset_io();
+		note_accept = variant % 2 == 0; /* own runtime undo vs recovery scope */
+		expect_panic = false;
+		if (setjmp(panic_jump) == 0) {
+			if (kind == BIND_ALREADY)
+				cluster_tt_durable_redo_bind_slot(3, 513, 9, 4, 2, 701);
+			else if (kind == LEGACY_SKIP)
+				cluster_tt_durable_redo_stamp_slot(3, 513, 4, 2, 701, 804);
+			else
+				cluster_tt_durable_redo_stamp_slot_exact(3, 513, 9, 4, 2, 701, 804);
+		} else
+			UT_ASSERT(false);
+		UT_ASSERT_EQ(writes, 0);
+		UT_ASSERT_EQ(notes, 1);
+		UT_ASSERT_EQ(syncs, note_accept ? 0 : 1);
+		fixture_checkpoint();
+		fixture_power_loss();
+		UT_ASSERT_EQ(slot->status, kind == BIND_ALREADY ? TT_SLOT_ACTIVE : TT_SLOT_COMMITTED);
+		UT_ASSERT_EQ(slot->xid, 701);
+		UT_ASSERT_EQ(slot->wrap, kind == LEGACY_SKIP ? 3 : 2);
+		UT_ASSERT_EQ(header->wrap_count, kind == EXACT_STALE ? 10 : 9);
+		if (ut_current_failed)
+			printf("# replay durability variant %d\n", variant);
+	}
+	note_accept = false;
+
+	/* A failed sync of the present state PANICs; replay never skips past it. */
+	reset_io();
+	fail_sync = expect_panic = true;
+	if (setjmp(panic_jump) == 0) {
+		cluster_tt_durable_redo_stamp_slot_exact(3, 513, 9, 4, 2, 701, 804);
+		UT_ASSERT(false);
+	}
+	fail_sync = expect_panic = false;
+	UT_ASSERT_EQ(writes, 0);
+	UT_ASSERT_EQ(notes, 1);
 }
 
 UT_TEST(test_private_abort_head_release_and_exact_stale_results)
@@ -657,11 +787,12 @@ UT_TEST(test_native_exact_commit_rejects_bad_header_before_write)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_native_exact_commit_rejects_bad_header_before_write);
 	UT_RUN(test_private_abort_head_release_and_exact_stale_results);
 	UT_RUN(test_native_bind_uses_complete_header_identity_and_durable_slot);
 	UT_RUN(test_native_bind_replay_over_own_terminal_skips);
+	UT_RUN(test_native_replay_of_present_tt_state_survives_power_loss);
 	UT_RUN(test_private_tt_header_sequence_and_unrelated_bytes);
 	UT_RUN(test_private_tt_header_refuses_identity_and_conflicting_predecessor);
 	UT_RUN(test_native_init_validates_real_image_before_file_mutation);

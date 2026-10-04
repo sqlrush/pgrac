@@ -724,10 +724,71 @@ UT_TEST(test_runtime_header_write_of_another_owner_is_not_deferred)
 	UT_ASSERT_EQ(model_files[6].fsyncs, 1);
 }
 
+/* A process crash rebuilds shared memory; the kernel page cache survives. */
+static void
+process_crash_restart(void)
+{
+	free(shmem_buf);
+	shmem_buf = NULL;
+	cluster_undo_smgr_fd_cache_reset();
+	cluster_undo_buf_shmem_init();
+}
+
+/*
+ * After a process crash restart the checkpoint has lost its record of the
+ * crashed run's unsynced header writes.  Redo that finds a stamp already
+ * present makes it durable: recorded for the next checkpoint when the
+ * checkpointer can resolve the path, fsynced at once inside the recoverer's
+ * scope otherwise.  Without that, the end-of-recovery checkpoint passes the
+ * record and a power loss drops the stamp.
+ */
+UT_TEST(test_present_header_after_restart_is_made_durable)
+{
+	char stamp[32];
+
+	/* The loss being closed: a checkpoint after the restart skips the stamp. */
+	fresh_instance();
+	stamp_bytes(stamp, 0x7b);
+	UT_ASSERT(cluster_undo_smgr_write_header_bytes(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 3, 1,
+												   STAMP_OFFSET, stamp, sizeof(stamp)));
+	process_crash_restart();
+	UT_ASSERT(!checkpoint_raises());
+	model_crash();
+	UT_ASSERT(memcmp(model_files[3].durable + STAMP_OFFSET, stamp, sizeof(stamp)) != 0);
+
+	/* Own runtime undo: recorded, then fsynced by the checkpoint. */
+	fresh_instance();
+	UT_ASSERT(cluster_undo_smgr_write_header_bytes(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 3, 1,
+												   STAMP_OFFSET, stamp, sizeof(stamp)));
+	process_crash_restart();
+	UT_ASSERT(cluster_undo_smgr_header_unchanged_durable(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 3, 1));
+	UT_ASSERT_EQ(model_files[3].fsyncs, 0);
+	UT_ASSERT(!checkpoint_raises());
+	UT_ASSERT_EQ(model_files[3].fsyncs, 1);
+	model_crash();
+	UT_ASSERT_EQ(memcmp(model_files[3].durable + STAMP_OFFSET, stamp, sizeof(stamp)), 0);
+
+	/* Recovery scope: fsynced at once, never left to the checkpointer. */
+	fresh_instance();
+	recovery_scope_active = true;
+	model_files[4].cache[STAMP_OFFSET] = 0x7b;
+	UT_ASSERT(
+		cluster_undo_smgr_header_unchanged_durable(CLUSTER_UNDO_PATH_RECOVERY_SHARED, 260, 2));
+	UT_ASSERT_EQ(model_files[4].fsyncs, 1);
+	UT_ASSERT_EQ(model_files[4].durable[STAMP_OFFSET], 0x7b);
+
+	/* A failed sync is reported, not skipped. */
+	model_fsync_fails = true;
+	UT_ASSERT(
+		!cluster_undo_smgr_header_unchanged_durable(CLUSTER_UNDO_PATH_RECOVERY_SHARED, 260, 2));
+	model_fsync_fails = false;
+	recovery_scope_active = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_checkpoint_makes_prior_header_writes_durable);
 	UT_RUN(test_write_after_checkpoint_is_left_to_the_next_checkpoint);
 	UT_RUN(test_checkpoint_fsyncs_each_written_segment_once);
@@ -738,6 +799,7 @@ main(void)
 	UT_RUN(test_recovery_header_sync_failure_fails_the_write);
 	UT_RUN(test_owned_and_materialized_header_writes_stay_deferred);
 	UT_RUN(test_runtime_header_write_of_another_owner_is_not_deferred);
+	UT_RUN(test_present_header_after_restart_is_made_durable);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
