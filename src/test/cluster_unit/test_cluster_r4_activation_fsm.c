@@ -11164,7 +11164,8 @@ UT_TEST(test_a148_stop_poll_includes_original_phase3_handoff)
 int
 main(void)
 {
-	UT_PLAN(338);
+	UT_PLAN(339);
+	UT_RUN(test_first_open_authority_submit_notifies_after_exact_publication);
 	UT_RUN(test_first_open_authority_completion_notifies_after_exact_publication);
 	UT_RUN(test_first_open_barrier_waits_for_last_sample_ack);
 	UT_RUN(test_first_open_barrier_rejects_changed_authority);

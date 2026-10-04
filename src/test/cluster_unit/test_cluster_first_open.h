@@ -36,6 +36,67 @@ test_first_open_finish(void)
 static unsigned test_semantic_completion_wakes;
 static uint64 test_semantic_completion_expected_seq;
 static ClusterSemanticActivationResult test_semantic_completion_expected_result;
+static unsigned test_semantic_submit_wakes;
+static uint64 test_semantic_submit_expected_seq;
+static ClusterSemanticAuthorityRequestKind test_semantic_submit_expected_kind;
+static uint8 test_semantic_submit_expected_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+
+void
+cluster_qvotec_wakeup(void)
+{
+	test_semantic_submit_wakes++;
+	if (test_semantic_submit_expected_seq != 0) {
+		UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq),
+					 test_semantic_submit_expected_seq);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&SemanticActivationShmem->record_cas_request_kind),
+					 test_semantic_submit_expected_kind);
+		UT_ASSERT_EQ(SemanticActivationShmem->record_cas_expected_generation, 17);
+		UT_ASSERT_EQ(SemanticActivationShmem->record_cas_expected_source_feature_bitmap, 23);
+		UT_ASSERT(memcmp(SemanticActivationShmem->record_cas_desired_bytes,
+						 test_semantic_submit_expected_bytes,
+						 sizeof(test_semantic_submit_expected_bytes)) == 0);
+	}
+}
+
+UT_TEST(test_first_open_authority_submit_notifies_after_exact_publication)
+{
+	const ClusterSemanticAuthorityRequestKind kinds[] = {
+		CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_CAS,
+		CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR,
+		CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_READ,
+		CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ
+	};
+	uint64 seq = 0;
+	unsigned i;
+
+	test_first_open_reset();
+	test_semantic_submit_wakes = 0;
+	memset(test_semantic_submit_expected_bytes, 0x5a, sizeof(test_semantic_submit_expected_bytes));
+	UT_ASSERT(!semantic_activation_authority_mailbox_submit(kinds[0], 17, 23, NULL, &seq));
+	UT_ASSERT_EQ(test_semantic_submit_wakes, 0);
+	for (i = 0; i < lengthof(kinds); i++) {
+		test_semantic_submit_expected_seq = i + 1;
+		test_semantic_submit_expected_kind = kinds[i];
+		UT_ASSERT(semantic_activation_authority_mailbox_submit(kinds[i], 17, 23,
+			test_semantic_submit_expected_bytes, &seq));
+		UT_ASSERT_EQ(seq, i + 1);
+		UT_ASSERT_EQ(test_semantic_submit_wakes, i + 1);
+		UT_ASSERT(!semantic_activation_authority_mailbox_submit(kinds[i], 17, 23,
+			test_semantic_submit_expected_bytes, &seq));
+		UT_ASSERT(!semantic_activation_authority_mailbox_complete(kinds[i], seq + 1,
+			CLUSTER_SEMANTIC_ACTIVATION_OK));
+		UT_ASSERT_EQ(test_semantic_submit_wakes, i + 1);
+		UT_ASSERT(semantic_activation_authority_mailbox_complete(kinds[i], seq,
+			CLUSTER_SEMANTIC_ACTIVATION_OK));
+	}
+	pg_atomic_write_u64(&SemanticActivationShmem->record_cas_request_seq, UINT64_MAX);
+	pg_atomic_write_u64(&SemanticActivationShmem->record_cas_completion_seq, UINT64_MAX);
+	UT_ASSERT(!semantic_activation_authority_mailbox_submit(kinds[0], 17, 23,
+		test_semantic_submit_expected_bytes, &seq));
+	UT_ASSERT_EQ(test_semantic_submit_wakes, lengthof(kinds));
+	test_semantic_submit_expected_seq = 0;
+	test_first_open_finish();
+}
 
 void
 cluster_lmon_marker_complete_wakeup(void)

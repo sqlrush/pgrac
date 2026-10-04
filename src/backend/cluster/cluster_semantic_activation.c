@@ -10591,6 +10591,8 @@ semantic_activation_authority_mailbox_submit(
 	request_seq++;
 	pg_atomic_write_u64(&SemanticActivationShmem->record_cas_request_seq, request_seq);
 	*out_request_seq = request_seq;
+	/* Notify only after the exact request is visible to its original owner. */
+	cluster_qvotec_wakeup();
 	return true;
 }
 
