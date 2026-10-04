@@ -13774,7 +13774,7 @@ UT_TEST(test_bootstrap_composes_exact_threads_without_admission)
 		UT_ASSERT_EQ(out.control.checkPoint, f.local_anchor.checkpoint);
 		UT_ASSERT_EQ(out.control.minRecoveryPoint, f.local_anchor.min_recovery_point);
 		UT_ASSERT_EQ(out.control.MaxConnections, 300 + node);
-		UT_ASSERT_EQ(out.control.checkPointCopy.nextOid, 60001);
+		UT_ASSERT_EQ(out.control.checkPointCopy.nextOid, f.local_anchor.checkpoint_copy.nextOid);
 		UT_ASSERT_EQ(out.config.identity.generation, 47);
 		UT_ASSERT_EQ(out.root_sequence, 7);
 		UT_ASSERT_EQ(out.database_state, CLUSTER_CONTROL_ROOT_DATABASE_OPEN);
@@ -13935,6 +13935,54 @@ bootstrap_replace_anchor(BootstrapFixture *f)
 	memcpy(f->before + 512 + 264, hash, 32);
 	v2_checksums(f->before);
 	memcpy(f->after, f->before, sizeof(f->after));
+}
+
+/* Native SLRU cursors belong to this origin's physical checkpoint. The
+ * ordinary projection still keeps common allocator/horizon fields. */
+UT_TEST(test_bootstrap_native_cursors_do_not_borrow_common_projection)
+{
+	BootstrapFixture f;
+	ClusterControlBootstrapSnapshot out;
+	ClusterRecoveryAnchorRefV2 ref;
+	ControlRootImage root;
+	ControlFileData common, runtime;
+	uint8 before[PG_CONTROL_FILE_SIZE];
+
+	bootstrap_fixture(&f, 0);
+	f.local_anchor.checkpoint_copy.nextXid = FullTransactionIdFromU64(4195121);
+	f.local_anchor.checkpoint_copy.nextOid = 61001;
+	f.local_anchor.checkpoint_copy.nextMulti = 43;
+	f.local_anchor.checkpoint_copy.nextMultiOffset = 83;
+	bootstrap_replace_anchor(&f);
+	root_fixture_version3(f.before);
+	memcpy(f.after, f.before, sizeof(f.after));
+	memcpy(before, f.common, sizeof(before));
+	memcpy(&common, f.common, sizeof(common));
+	UT_ASSERT_EQ(cluster_control_bootstrap_decode(&f.input, &out), 0);
+	UT_ASSERT(
+		memcmp(&out.control.checkPointCopy, &f.local_anchor.checkpoint_copy, sizeof(CheckPoint))
+		== 0);
+	UT_ASSERT(memcmp(before, f.common, sizeof(before)) == 0);
+	UT_ASSERT_EQ(test_cf_lock_calls, 0);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(f.before, sizeof(f.before), v2_storage, TEST_SYSID, &root),
+		0);
+	memset(&ref, 0, sizeof(ref));
+	ref.identity = f.local_anchor.identity;
+	ref.database_incarnation = f.local_anchor.database_incarnation;
+	ref.max_config_generation = root.header.v2.config_generation;
+	ref.anchor_generation = f.local_anchor.anchor_generation;
+	memcpy(ref.anchor_sha256, root.refs[0].anchor_sha256, 32);
+	memcpy(ref.claim_sha256, root.refs[0].claim_sha256, 32);
+	UT_ASSERT_EQ(
+		cluster_recovery_anchor_v2_project(f.anchor, sizeof(f.anchor), &ref, &common, &runtime), 0);
+	UT_ASSERT_EQ(U64FromFullTransactionId(runtime.checkPointCopy.nextXid),
+				 U64FromFullTransactionId(common.checkPointCopy.nextXid));
+	UT_ASSERT_EQ(runtime.checkPointCopy.nextOid, common.checkPointCopy.nextOid);
+	UT_ASSERT_EQ(runtime.checkPointCopy.nextMulti, common.checkPointCopy.nextMulti);
+	UT_ASSERT_EQ(runtime.checkPointCopy.nextMultiOffset, common.checkPointCopy.nextMultiOffset);
+	f.anchor[64] ^= 1;
+	UT_ASSERT(bootstrap_refused(&f.input) != 0);
 }
 
 UT_TEST(test_bootstrap_refuses_native_commit_ts_profile)
@@ -22225,7 +22273,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(438);
+	UT_PLAN(439);
 	UT_RUN(test_clean_restart_without_provider_keeps_collective_exit_and_actual_install);
 	UT_RUN(test_clean_restart_without_provider_refuses_missing_exit_formation_and_fence);
 	UT_RUN(test_serving_requires_coordinator_publish_then_startup_is_active);
@@ -22638,6 +22686,7 @@ main(int argc, char **argv)
 	UT_RUN(test_runtime_v3_runtime_native_inplace_identity_is_never_cleared);
 	UT_RUN(test_v2_view_requires_exact_config_object);
 	UT_RUN(test_bootstrap_composes_exact_threads_without_admission);
+	UT_RUN(test_bootstrap_native_cursors_do_not_borrow_common_projection);
 	UT_RUN(test_bootstrap_refuses_native_commit_ts_profile);
 	UT_RUN(test_bootstrap_thread_lifecycle_overrides_old_clean_anchor);
 	UT_RUN(test_bootstrap_closed_thread_requires_clean_anchor);

@@ -43,6 +43,7 @@ typedef struct ClusterControlBootstrapSnapshot {
 	ClusterWalSourceRef pending_wal;
 	bool pending_wal_valid;
 	ClusterSharedConfigRef config;
+	/* Native restart input: full own checkpoint, not common allocator cursors. */
 	ControlFileData control;
 	uint8 root_sha256[32];
 	uint64 root_sequence;
