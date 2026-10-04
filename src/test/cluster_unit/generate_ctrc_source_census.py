@@ -143,7 +143,7 @@ SCAN_RULES: Tuple[ScanRule, ...] = (
             "src/backend/cluster/storage/cluster_undo_xlog.c",
             "src/backend/cluster/cluster_side_undo.c",
         ),
-        r"(?:\b(?:slot|successor|fresh|entry|s)->status|\b(?:slot|successor|fresh|entry)\.status)\s*=\s*(?:(?:\(uint8\)\s*)?TT_SLOT_(?:ACTIVE|COMMITTED|ABORTED|RECYCLABLE|UNUSED)|decoded->kind\s*==\s*CLUSTER_UNDO_KIND_TT_COMMIT\s*\?\s*TT_SLOT_COMMITTED\s*:\s*TT_SLOT_ABORTED)",
+        r"(?:\b(?:slot|successor|fresh|entry|s)->status|\b(?:slot|successor|fresh|entry)\.status)\s*=\s*(?:(?:\(uint8\)\s*)?TT_SLOT_(?:ACTIVE|COMMITTED|ABORTED|RECYCLABLE|UNUSED)|decoded->kind\s*==\s*CLUSTER_UNDO_KIND_TT_COMMIT\s*\?\s*TT_SLOT_COMMITTED\s*:\s*TT_SLOT_ABORTED|commit\s*\?\s*TT_SLOT_COMMITTED\s*:\s*TT_SLOT_ABORTED)",
     ),
     ScanRule(
         "TT_RELEASE_FLAG_WRITER",
@@ -1275,7 +1275,6 @@ _classify_owners(
         "cluster_tt_durable_redo_abort_slot",
         "cluster_tt_durable_redo_abort_slot_exact",
         "cluster_tt_slot_durable_abort",
-        "tt_slot_write_committed",
     ),
     "TERMINAL_PROJECTION_DISCHARGE",
     "ALL_CTRC_REFERENCE_KINDS",
@@ -1294,6 +1293,17 @@ _classify_owners(
     "PRIVATE_HEADER_NATIVE_TT_TRANSITION_DECISION",
     "ORIGINAL_DURABLE_REDO_OR_TYPED_SIDE_APPLY",
     "MXA-T20",
+)
+_classify_owners(
+    "TT_STATUS_WRITER",
+    "src/backend/cluster/cluster_tt_durable.c",
+    ("cluster_tt_slot_durable_prepared_stage",),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "ALL_CTRC_REFERENCE_KINDS",
+    "CANONICAL_TT_SLOT",
+    "PRIVATE_TERMINAL_STATUS_WITH_RELEASE_BIT_CLEARED",
+    "cluster_tt_twophase_apply_staged",
+    "MXA-T33",
 )
 _classify_owners(
     "TT_STATUS_WRITER",
