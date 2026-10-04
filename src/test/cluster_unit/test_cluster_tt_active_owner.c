@@ -89,12 +89,6 @@ cluster_tt_slot_recyclable(uint8 status pg_attribute_unused(), SCN commit_scn pg
 	return false; /* This fixture allocates only fresh FREE slots. */
 }
 
-int
-errhint(const char *fmt pg_attribute_unused(), ...)
-{
-	return 0;
-}
-
 ClusterJoinGateVerdict
 cluster_reconfig_self_join_gate_verdict(void)
 {

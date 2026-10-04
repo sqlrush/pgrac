@@ -177,6 +177,8 @@ typedef struct ClusterTTLocalBinding {
 static ClusterTTLocalBinding *cluster_tt_local_bindings = NULL;
 static uint32 cluster_tt_local_binding_count = 0;
 static uint32 cluster_tt_local_binding_capacity = 0;
+/* Modifier admission held from the commit stamp's stage to its apply. */
+static ClusterSemanticAdmissionToken cluster_tt_local_commit_admission;
 
 static int
 cluster_tt_local_find_binding(TransactionId xid)
@@ -934,12 +936,14 @@ cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 	 * binding is still present.  C1b: this only stamps commit_scn; whether the
 	 * xact actually committed is still decided by the commit record / CLOG.
 	 *
-	 * spec-3.18 D4.1: instead of emitting a standalone 0x30, write the slot via
-	 * cluster_tt_slot_durable_commit_writeonly() and hand the equivalent delta
-	 * back to RecordTransactionCommit, which folds it into the commit record.
-	 * One record now carries both the TT stamp and CLOG commit -> they become
-	 * durable atomically (no stamped-but-uncommitted window).  2PC keeps the
-	 * standalone 0x30 (cluster_tt_slot_durable_commit) -- not this path.
+	 * spec-3.18 D4.1: instead of emitting a standalone 0x30, hand the
+	 * equivalent delta back to RecordTransactionCommit, which folds it into the
+	 * commit record.  One record carries both the TT stamp and CLOG commit.
+	 * The slot itself is only staged here (cluster_tt_slot_durable_commit_stage)
+	 * and written by cluster_tt_local_commit_durable_apply() after that record
+	 * is flushed, so no stamped-but-uncommitted state ever reaches storage.
+	 * The modifier admission stays held until then.  2PC keeps the standalone
+	 * 0x30 (cluster_tt_slot_durable_commit) -- not this path.
 	 */
 	if (!cluster_tt_local_get_published_binding(xid, &binding))
 		return false;
@@ -970,9 +974,9 @@ cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 		 * the whole xact, so its wrap cannot have changed.
 		 */
 		cluster_tt_local_modifier_recheck_or_error(&modifier_token);
-		owner = cluster_tt_slot_durable_commit_writeonly(segment_id, segment_generation,
-														 slot_offset, xid, wrap, commit_scn,
-														 &modifier_token, &successor);
+		owner
+			= cluster_tt_slot_durable_commit_stage(segment_id, segment_generation, slot_offset, xid,
+												   wrap, commit_scn, &modifier_token, &successor);
 
 		/*
 		 * Build the fold delta (mirrors xl_undo_tt_slot_commit fields).  xid is the
@@ -991,12 +995,28 @@ cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 		out_fold->commit_scn = successor.commit_scn;
 		cluster_tt_local_bindings[idx].terminal_state = CLUSTER_TT_LOCAL_TERMINAL_COMMIT_STAGED;
 	}
-	PG_FINALLY();
+	PG_CATCH();
 	{
+		cluster_tt_slot_durable_commit_unstage();
 		cluster_semantic_activation_leave(&modifier_token);
+		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	cluster_tt_local_commit_admission = modifier_token;
 	return true;
+}
+
+/*
+ * Write the staged commit stamp now that the commit record ending at
+ * commit_end is flushed (F-D-29).  RecordTransactionCommit calls this inside
+ * its commit critical section, before pg_xact is updated; nothing here may
+ * throw below PANIC.
+ */
+void
+cluster_tt_local_commit_durable_apply(XLogRecPtr commit_end)
+{
+	cluster_tt_slot_durable_commit_apply(commit_end);
+	cluster_semantic_activation_leave(&cluster_tt_local_commit_admission);
 }
 
 bool
@@ -1021,6 +1041,14 @@ cluster_tt_local_preabort_durable_finish(TransactionId xid)
 						errmsg("canonical transaction publication is unproved during abort"),
 						errdetail("xid=%u publication=%u terminal=%u", xid, binding->publish_state,
 								  binding->terminal_state)));
+	if (binding->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_COMMIT_STAGED
+		&& cluster_tt_slot_durable_commit_staged(binding->segment_id, binding->slot_offset,
+												 binding->top_xid, binding->wrap)) {
+		/* The commit failed before its record; the stamp never reached storage. */
+		cluster_tt_slot_durable_commit_unstage();
+		cluster_semantic_activation_leave(&cluster_tt_local_commit_admission);
+		binding->terminal_state = CLUSTER_TT_LOCAL_TERMINAL_NONE;
+	}
 	if (binding->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE)
 		return true;
 	if (binding->terminal_state != CLUSTER_TT_LOCAL_TERMINAL_NONE)

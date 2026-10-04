@@ -185,31 +185,43 @@ cluster_tt_durable_classify(int xid_matches, bool match_has_valid_scn, bool scan
 /*
  * cluster_tt_slot_durable_commit -- durably stamp commit_scn (status COMMITTED)
  *	on the own-instance TT slot (segment_id, slot_offset) owned by `xid`/`wrap`.
- *	Emits XLOG_UNDO_TT_SLOT_COMMIT (before the commit record -- caller is in the
- *	pre-commit hook), then per-slot 32-byte targeted write of the TTSlot.  No
- *	fsync (WAL-protected).  ereport(ERROR) on I/O failure.
+ *	Emits and flushes XLOG_UNDO_TT_SLOT_COMMIT (before the commit record --
+ *	caller is the 2PC pre-finish hook), then per-slot 32-byte targeted write of
+ *	the TTSlot, delaying checkpoints across both.  No fsync (WAL-protected
+ *	until the next checkpoint fsyncs it).  ereport(ERROR) on I/O failure.
  */
 extern void cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset, TransactionId xid,
 										   uint16 wrap, SCN commit_scn);
 
 /*
- * cluster_tt_slot_durable_commit_writeonly -- spec-3.18 D4.1 (normal commit).
- *	Same per-slot 32-byte COMMITTED stamp as cluster_tt_slot_durable_commit, but
- *	WITHOUT the standalone XLOG_UNDO_TT_SLOT_COMMIT (0x30): the caller folds an
- *	equivalent xl_xact_tt_commit delta into the commit record, whose flush makes
- *	both durable atomically.  Returns the owner instance (1..128) for the
- *	delta's path-resolution field and copies the exact written successor to
+ * cluster_tt_slot_durable_commit_stage -- spec-3.18 D4.1 (normal commit).
+ *	Proves the same per-slot 32-byte COMMITTED transition as
+ *	cluster_tt_slot_durable_commit against the exact canonical ACTIVE
+ *	predecessor, WITHOUT the standalone XLOG_UNDO_TT_SLOT_COMMIT (0x30) and
+ *	without writing: the caller folds an equivalent xl_xact_tt_commit delta
+ *	into the commit record and calls cluster_tt_slot_durable_commit_apply()
+ *	once that record is flushed, or cluster_tt_slot_durable_commit_unstage()
+ *	if the commit fails before it.  Returns the owner instance (1..128) for the
+ *	delta's path-resolution field and copies the exact successor to
  *	`successor_out`.  The caller supplies its already-held normal modifier
- *	admission; this function borrows it while acquiring the exact local block0
- *	current and resident content authority.  It neither enters nor leaves the
- *	admission.  ereport(ERROR) on authority or I/O failure.  Redo side:
+ *	admission and keeps it until apply or unstage; this function borrows it
+ *	while acquiring the exact local block0 current and resident content
+ *	authority.  ereport(ERROR) on authority or I/O failure.  Redo side:
  *	cluster_tt_durable_redo_stamp_slot() (cluster_undo_xlog.c), driven by
  *	xact_redo_commit instead of the 0x30 redo.
  */
-extern uint8 cluster_tt_slot_durable_commit_writeonly(
-	uint32 segment_id, uint32 segment_generation, uint16 slot_offset, TransactionId xid,
-	uint16 wrap, SCN commit_scn, const ClusterSemanticAdmissionToken *admission,
-	TTSlot *successor_out);
+extern uint8 cluster_tt_slot_durable_commit_stage(uint32 segment_id, uint32 segment_generation,
+												  uint16 slot_offset, TransactionId xid,
+												  uint16 wrap, SCN commit_scn,
+												  const ClusterSemanticAdmissionToken *admission,
+												  TTSlot *successor_out);
+/* True when exactly this transaction's slot stamp is staged and unwritten. */
+extern bool cluster_tt_slot_durable_commit_staged(uint32 segment_id, uint16 slot_offset,
+												  TransactionId xid, uint16 wrap);
+/* Critical-section safe: write the staged stamp; PANIC on any failure. */
+extern void cluster_tt_slot_durable_commit_apply(XLogRecPtr commit_end);
+/* Never throws: release a staged stamp that was never written. */
+extern void cluster_tt_slot_durable_commit_unstage(void);
 
 /* Ordinary abort: verify exact ACTIVE, emit+flush exact 0x60, then
  * apply the identical ABORTED successor before allocator reuse. */

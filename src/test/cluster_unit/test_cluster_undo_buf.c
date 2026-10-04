@@ -47,6 +47,7 @@
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_buf.h"
+#include "storage/fd.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/memutils.h"
@@ -381,6 +382,26 @@ cluster_undo_smgr_write_block(ClusterUndoPathIntent intent pg_attribute_unused()
 	smgr_last_write_block = block_no;
 	smgr_last_write_byte0 = buf[0];
 	return true;
+}
+
+/* Checkpoint header-sync seams (F-D-29): U1-U9 write no header bytes, so the
+ * block-zero region hands out nothing and these are never reached. */
+bool
+cluster_undo_smgr_fsync_header(ClusterUndoPathIntent intent pg_attribute_unused(),
+							   uint32 segment_id pg_attribute_unused(),
+							   uint8 owner_instance pg_attribute_unused())
+{
+	abort();
+}
+int
+data_sync_elevel(int elevel)
+{
+	return elevel;
+}
+int
+errcode_for_file_access(void)
+{
+	return 0;
 }
 
 /* XLogFlush stub: the write-back flush path (flush_dirty_slot) references it,

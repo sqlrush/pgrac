@@ -31,6 +31,14 @@
  *	    path) deliberately skipped -- only top-level abort decisions
  *	    advance SCN per Q4.
  *
+ *	What changed (F-D-29, Spec: spec-s9p2-05-instance-and-cluster-recovery.md):
+ *	  - RecordTransactionCommit(): the folded TT commit stamp is only staged
+ *	    before the commit record; it is written after our own XLogFlush,
+ *	    inside the commit critical section and before pg_xact is updated
+ *	    (cluster_tt_local_commit_durable_apply).  A commit carrying a staged
+ *	    stamp therefore always flushes its commit record, even when
+ *	    synchronous_commit is off.
+ *
  *	What changed (spec-7.4 D1):
  *	  - RecordTransactionCommit(): durable-frontier wiring.  LSN fill-in
  *	    after XactLogCommitRecord (crit-section-safe shmem write);  a
@@ -1497,6 +1505,9 @@ RecordTransactionCommit(void)
 	 * additional SCN allocation.
 	 */
 	SCN			tt_commit_scn = InvalidScn;
+	bool		tt_stamp_staged = false;	/* PGRAC: F-D-29 -- a folded TT
+											 * commit stamp waits for this
+											 * commit record's flush */
 	bool		commit_record_flushed = false;	/* PGRAC: spec-7.4 D1 -- set
 												 * inside the commit critical
 												 * section after our own
@@ -1696,6 +1707,7 @@ RecordTransactionCommit(void)
 				cluster_xp_begin(&commit_xps, CLXP_C_COMMIT_TT_STAMP);
 				has_tt_fold =
 					cluster_tt_local_precommit_durable_finish(xid, tt_commit_scn, &tt_fold);
+				tt_stamp_staged = has_tt_fold;
 				cluster_xp_end(&commit_xps);
 			}
 
@@ -1814,7 +1826,13 @@ RecordTransactionCommit(void)
 	 */
 	if ((wrote_xlog && markXidCommitted &&
 		 synchronous_commit > SYNCHRONOUS_COMMIT_OFF) ||
-		forceSyncCommit || nrels > 0)
+		forceSyncCommit || nrels > 0
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: F-D-29 -- the staged TT stamp may only follow a flushed
+		 * commit record, and it must be written before pg_xact. */
+		|| tt_stamp_staged
+#endif
+		)
 		{
 #ifdef USE_PGRAC_CLUSTER
 			/* PGRAC: spec-7.4 D0 -- commit-record flush component (includes
@@ -1833,6 +1851,11 @@ RecordTransactionCommit(void)
 			 * after END_CRIT_SECTION (mini-plan v1.1 ruling #3: no publish
 			 * step may run inside the commit critical section). */
 			commit_record_flushed = true;
+			/* PGRAC: F-D-29 -- the TT stamp reaches storage only now, still
+			 * inside the critical section and before pg_xact, while
+			 * checkpoints wait for us (DELAY_CHKPT_START). */
+			if (tt_stamp_staged)
+				cluster_tt_local_commit_durable_apply(XactLastRecEnd);
 #endif
 
 			/*
