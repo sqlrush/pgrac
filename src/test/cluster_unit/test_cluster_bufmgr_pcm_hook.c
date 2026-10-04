@@ -133,6 +133,15 @@ cluster_page_data_covers_local_pi_v1(const ClusterPageDataReceiptV1 *receipt pg_
 	return false;
 }
 bool
+cluster_page_structural_pi_proof_v2(
+	const ClusterPageStructuralReceiptV2 *receipt pg_attribute_unused(),
+	ClusterPcmPiWriteCutV1 *x pg_attribute_unused(),
+	ClusterPcmPiStorageCutV1 *s pg_attribute_unused())
+{
+	/* This buffer/PCM fixture has no completed structural owner. */
+	return false;
+}
+bool
 cluster_page_structural_covers_local_pi_v2(
 	const ClusterPageStructuralReceiptV2 *receipt pg_attribute_unused(),
 	const ClusterPcmLocalPiSnapshotV1 *local pg_attribute_unused())

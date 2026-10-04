@@ -10758,6 +10758,87 @@ cluster_pcm_lock_pi_storage_complete_v1(const ClusterPageDataReceiptV1 *receipt,
 	return complete;
 }
 
+bool
+cluster_pcm_lock_pi_structural_complete_v2(const ClusterPageStructuralReceiptV2 *receipt,
+	const ClusterPiStructuralAckV2 *const *acks, uint32 ack_count, uint32 *holders_out)
+{
+	ClusterPcmPiWriteCutV1 x = {0}, current_x;
+	ClusterPcmPiStorageCutV1 s = {0}, current_s;
+	const ClusterPcmPiWriteCutV1 no_x = {0};
+	const ClusterPcmPiStorageCutV1 no_s = {0};
+	BufferTag tag;
+	struct GrdEntry *entry;
+	uint32 expected, confirmed = 0;
+	uint64 master_boot;
+	int32 master;
+	bool write_cut, found, complete = false;
+
+	if (holders_out != NULL)
+		*holders_out = 0;
+	/* These opaque owners may allocate and revalidate retained inputs.
+	 * Complete that work before entering either directory lock. */
+	if (holders_out == NULL || !cluster_shared_config || ClusterPcm == NULL
+		|| cluster_pcm_htab == NULL || acks == NULL || ack_count == 0
+		|| ack_count > RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| !cluster_page_structural_pi_proof_v2(receipt, &x, &s))
+		return false;
+	write_cut = x.binding_generation != 0;
+	if (write_cut) {
+		if (!cluster_pcm_pi_write_cut_valid_v1(&x) || memcmp(&s, &no_s, sizeof(s)) != 0)
+			return false;
+		tag = x.holder.assertion.resource;
+		expected = x.pi_holders_bitmap;
+		master = x.master_node;
+		master_boot = x.holder.master_session_incarnation;
+	} else {
+		if (!cluster_pcm_pi_storage_cut_valid_v1(&s) || memcmp(&x, &no_x, sizeof(x)) != 0)
+			return false;
+		tag = s.resource;
+		expected = s.pi_holders_bitmap;
+		master = s.master_node;
+		master_boot = s.master_session_incarnation;
+	}
+	if (expected == 0 || master != cluster_node_id)
+		return false;
+	for (uint32 i = 0; i < ack_count; i++) {
+		int32 node;
+		uint32 bit;
+		if (!cluster_page_structural_pi_ack_read_v2(acks[i], receipt, &node)
+			|| node < 0 || node >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
+			return false;
+		bit = (uint32)1u << node;
+		if ((expected & bit) == 0 || (confirmed & bit) != 0)
+			return false;
+		confirmed |= bit;
+	}
+	if (confirmed != expected || cluster_gcs_lookup_master(tag) != cluster_node_id
+		|| master_boot != cluster_qvotec_get_self_incarnation())
+		return false;
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		/* Reobserve the complete authority after the final ACK. Never
+		 * retire a subset or reuse an old receipt for a later handoff. */
+		if (cluster_gcs_lookup_master(tag) == cluster_node_id
+			&& master_boot == cluster_qvotec_get_self_incarnation()
+			&& (write_cut
+				? pcm_pi_write_snapshot_locked(entry, &current_x)
+					&& memcmp(&x, &current_x, sizeof(x)) == 0
+				: pcm_pi_storage_snapshot_locked(entry, &current_s)
+					&& memcmp(&s, &current_s, sizeof(s)) == 0)) {
+			pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
+			entry->pi_watermark_lsn = InvalidXLogRecPtr;
+			entry->pi_watermark_scn = InvalidScn;
+			*holders_out = expected;
+			complete = true;
+		}
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	return complete;
+}
+
 static bool
 pcm_resource_x_assert_common_matches_request(const ResourceXDecodedCommon *common,
 											 const ClusterPcmResourceXMasterRequest *request)
