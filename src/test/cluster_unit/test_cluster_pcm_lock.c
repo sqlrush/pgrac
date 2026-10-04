@@ -144,6 +144,8 @@ static char pi_ack_fixtures[3];
 static uint32 pi_ack_available;
 static uint32 pi_ack_imported;
 static bool local_pi_writer_ready, local_pi_covered;
+static char structural_receipt_fixture, structural_ack_fixture;
+static bool structural_ack_valid;
 static ClusterWalSourceRef local_pi_writer;
 static union {
 	uint64 align;
@@ -166,6 +168,23 @@ cluster_page_data_covers_local_pi_v1(const ClusterPageDataReceiptV1 *receipt,
 	/* The actual sealed-plan/physical receipt owner is exercised separately
 	 * in test_cluster_page_data. This fixture never constructs DATA proof. */
 	return local_pi_covered && (const void *)receipt == &pi_receipt_fixture;
+}
+bool
+cluster_page_structural_covers_local_pi_v2(const ClusterPageStructuralReceiptV2 *receipt,
+	const ClusterPcmLocalPiSnapshotV1 *local)
+{
+	return local_pi_covered && (const void *)receipt == &structural_receipt_fixture;
+}
+bool
+cluster_page_structural_pi_ack_read_v2(const ClusterPiStructuralAckV2 *ack,
+	const ClusterPageStructuralReceiptV2 *receipt, int32 *out_node)
+{
+	*out_node = -1;
+	if (!structural_ack_valid || (const void *)receipt != &structural_receipt_fixture
+		|| (const void *)ack != &structural_ack_fixture)
+		return false;
+	*out_node = cluster_node_id; /* Actual local-only ACK semantics. */
+	return true;
 }
 static const ClusterPiPhysicalAckV1 *pi_acks[3]
 	= { (const void *)&pi_ack_fixtures[0], (const void *)&pi_ack_fixtures[1],
@@ -20721,6 +20740,43 @@ UT_TEST(test_local_pi_retirement_requires_exact_responsibility_and_physical_ack)
 	cluster_shared_config = false;
 }
 
+UT_TEST(test_local_structural_retirement_preserves_concurrent_responsibility)
+{
+	BufferTag tag = make_tag(920);
+	ClusterPageWalBindingV1 binding = local_pi_setup(tag);
+	ClusterPcmLocalPiSnapshotV1 before, current, empty;
+	const ClusterPageStructuralReceiptV2 *receipt = (const void *)&structural_receipt_fixture;
+	const ClusterPiStructuralAckV2 *ack = (const void *)&structural_ack_fixture;
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &binding));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &before));
+	structural_ack_valid = false;
+	local_pi_covered = true;
+	UT_ASSERT(!cluster_pcm_local_pi_retire_structural_v2(&before, receipt, ack));
+	structural_ack_valid = true;
+	local_pi_covered = false;
+	UT_ASSERT(!cluster_pcm_local_pi_retire_structural_v2(&before, receipt, ack));
+	local_pi_covered = true;
+	UT_ASSERT(!cluster_pcm_local_pi_retire_structural_v2(&before, receipt, NULL));
+	binding.record_start = 300;
+	binding.record_end = 400;
+	binding.version.mutation_token++;
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &binding));
+	UT_ASSERT(!cluster_pcm_local_pi_retire_structural_v2(&before, receipt, ack));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &current));
+	UT_ASSERT(cluster_pcm_local_pi_retire_structural_v2(&current, receipt, ack));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &empty));
+	UT_ASSERT_EQ(empty.first.record_start, 0);
+	UT_ASSERT_EQ(empty.last.record_start, 0);
+	UT_ASSERT(empty.revision > current.revision);
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &binding));
+	UT_ASSERT(!cluster_pcm_local_pi_retire_structural_v2(&current, receipt, ack));
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &empty));
+	UT_ASSERT_EQ(empty.first.record_start, 300);
+	structural_ack_valid = false;
+	local_pi_writer_ready = false;
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_local_pi_alone_prevents_directory_reclamation)
 {
 	BufferTag tag = make_tag(915);
@@ -21678,7 +21734,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(327);
+	UT_PLAN(328);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -21987,6 +22043,7 @@ main(void)
 	UT_RUN(test_local_pi_keeps_first_and_latest_across_master_changes);
 	UT_RUN(test_local_pi_rejects_unqualified_replacement_without_losing_anchors);
 	UT_RUN(test_local_pi_retirement_requires_exact_responsibility_and_physical_ack);
+	UT_RUN(test_local_structural_retirement_preserves_concurrent_responsibility);
 	UT_RUN(test_local_pi_alone_prevents_directory_reclamation);
 	UT_RUN(test_local_pi_is_owned_before_source_pair_becomes_sendable);
 	UT_RUN(test_local_pi_requires_original_all_member_stop_cut);

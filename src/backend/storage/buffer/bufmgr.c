@@ -10647,6 +10647,16 @@ struct ClusterPiPhysicalAckV1 {
 	uint64 membership_generation;
 };
 
+struct ClusterPiStructuralAckV2 {
+	uint64 magic;
+	ClusterPageStructuralReceiptV2 structural;
+	ClusterWalWriterToken writer;
+	ClusterWalInputsV1 *inputs;
+	ResourceOwner owner;
+	pid_t pid;
+	int32 node;
+};
+
 /* Neither a tag nor a pin grants write authority. Check every live fence
  * while the original descriptor remains content-locked. SPACE may be S;
  * DATA must be the current X holder. Do not borrow an in-flight transfer. */
@@ -12109,6 +12119,30 @@ cluster_page_data_covers_local_pi_v1(const ClusterPageDataReceiptV1 *receipt,
 		   && cluster_page_data_covers_pi(receipt, plan, sources, source_count, &local->last);
 }
 
+bool
+cluster_page_structural_covers_local_pi_v2(const ClusterPageStructuralReceiptV2 *receipt,
+	const ClusterPcmLocalPiSnapshotV1 *local)
+{
+	static const ClusterPageWalBindingV1 empty = {0};
+	ClusterPcmPiWriteCutV1 x_cut;
+	ClusterPcmPiStorageCutV1 storage_cut;
+	BufferTag tag;
+	bool first_empty, last_empty;
+	if (local == NULL || !cluster_page_structural_pi_proof_v2(receipt, &x_cut, &storage_cut))
+		return false;
+	InitBufferTag(&tag, &receipt->page.locator, receipt->page.forknum, receipt->page.blockno);
+	if (!BufferTagsEqual(&tag, &local->resource) || local->binding_generation == UINT64_MAX
+		|| local->revision == UINT64_MAX)
+		return false;
+	first_empty = memcmp(&local->first, &empty, sizeof(empty)) == 0;
+	last_empty = memcmp(&local->last, &empty, sizeof(empty)) == 0;
+	if (first_empty || last_empty)
+		return first_empty && last_empty;
+	return local->binding_generation != 0 && local->revision != 0
+		&& cluster_page_structural_ancestor_v1(&receipt->terminal, &local->first, receipt->plan)
+		&& cluster_page_structural_ancestor_v1(&receipt->terminal, &local->last, receipt->plan);
+}
+
 static bool
 cluster_page_data_covers_missing_pi(const ClusterPageDataReceiptV1 *receipt,
 									const RfPageOnlinePlanV1 *plan,
@@ -12220,6 +12254,130 @@ cluster_pi_ack_local_writer(ClusterWalWriterToken *out)
 		   && cluster_wal_writer_begin(source.timeline, out) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		   && out->startup_first_lsn == InvalidXLogRecPtr
 		   && cluster_page_data_source_same(&source, &out->ref);
+}
+
+static bool
+cluster_page_structural_ack_inputs_current(const ClusterPageStructuralReceiptV2 *receipt,
+	ClusterWalInputsV1 *inputs, const ClusterWalWriterToken *writer)
+{
+	const RfPageOnlinePlanV1 *page;
+	uint32 count;
+	bool found = false;
+	bool matched[CLUSTER_WAL_INPUTS_MAX] = {false};
+	if (inputs == NULL || receipt == NULL || receipt->plan == NULL)
+		return false;
+	count = cluster_thread_recovery_fabric_participant_count_v1(receipt->plan);
+	page = cluster_thread_recovery_fabric_page_plan_v1(receipt->plan);
+	if (count == 0 || count > CLUSTER_WAL_INPUTS_MAX || page == NULL
+		|| count != cluster_wal_inputs_count_v1(inputs))
+		return false;
+	/* The input owner sorts contribution streams by thread/boot, which need
+	 * not be ROOT selection order. Match each full source exactly once; no
+	 * omitted source or copied subset can certify an absent PI. */
+	for (uint32 i = 0; i < count; i++) {
+		ClusterWalSourceRef source;
+		bool selected = false;
+		if (!rf_page_online_plan_source_v1(page, i, &source))
+			return false;
+		for (uint32 j = 0; j < count; j++) {
+			const ClusterWalInputV1 *input = cluster_wal_inputs_at_v1(inputs, j);
+			if (input == NULL)
+				return false;
+			if (!matched[j] && memcmp(&source, &input->source, sizeof(source)) == 0) {
+				matched[j] = selected = true;
+				break;
+			}
+		}
+		if (!selected)
+			return false;
+		if (source.claim.identity.origin_node_id != cluster_node_id)
+			continue;
+		if (source.claim.identity.origin_owner_incarnation
+				!= writer->ref.claim.identity.origin_owner_incarnation
+			&& !cluster_wal_inputs_local_predecessor_retired_v1(inputs, &source, &writer->ref))
+			return false;
+		if (cluster_page_data_source_covered_by(&writer->ref, &source))
+			found = true;
+	}
+	return found && cluster_wal_inputs_revalidate_v1(inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+bool
+cluster_page_structural_pi_ack_read_v2(const ClusterPiStructuralAckV2 *ack,
+	const ClusterPageStructuralReceiptV2 *receipt, int32 *out_node)
+{
+	ClusterWalWriterToken current;
+	ClusterPcmPiWriteCutV1 x;
+	ClusterPcmPiStorageCutV1 s;
+	if (out_node != NULL)
+		*out_node = -1;
+	if (ack == NULL || receipt == NULL || out_node == NULL
+		|| ack->magic != UINT64_C(0x5047535441434b32) || ack->pid != getpid()
+		|| ack->owner != CurrentResourceOwner || ack->node != cluster_node_id
+		|| memcmp(&ack->structural, receipt, sizeof(*receipt)) != 0
+		|| !cluster_pi_ack_local_writer(&current)
+		|| memcmp(&ack->writer, &current, sizeof(current)) != 0
+		|| !cluster_page_structural_pi_proof_v2(receipt, &x, &s)
+		|| !cluster_page_structural_ack_inputs_current(receipt, ack->inputs, &current))
+		return false;
+	*out_node = ack->node;
+	return true;
+}
+
+void
+cluster_page_structural_pi_ack_free_v2(ClusterPiStructuralAckV2 **ack)
+{
+	if (ack == NULL || *ack == NULL)
+		return;
+	explicit_bzero(*ack, sizeof(**ack));
+	pfree(*ack);
+	*ack = NULL;
+}
+
+bool
+cluster_bufmgr_ack_pi_at_structure_v2(const ClusterPageStructuralReceiptV2 *receipt,
+	ClusterWalInputsV1 *inputs, ClusterPiStructuralAckV2 **out)
+{
+	ClusterWalWriterToken writer, after;
+	ClusterPcmPiWriteCutV1 x;
+	ClusterPcmPiStorageCutV1 s;
+	ClusterPcmLocalPiSnapshotV1 local;
+	ClusterPiStructuralAckV2 *ack;
+	ClusterPiPhysicalResultV1 physical;
+	BufferTag tag;
+	uint32 holders;
+	if (out == NULL || *out != NULL || !cluster_pi_ack_local_writer(&writer)
+		|| !cluster_page_structural_pi_proof_v2(receipt, &x, &s)
+		|| !cluster_page_structural_ack_inputs_current(receipt, inputs, &writer))
+		return false;
+	holders = x.binding_generation != 0 ? x.pi_holders_bitmap : s.pi_holders_bitmap;
+	if ((holders & ((uint32)1u << cluster_node_id)) == 0)
+		return false;
+	InitBufferTag(&tag, &receipt->page.locator, receipt->page.forknum, receipt->page.blockno);
+	if (!cluster_pcm_local_pi_snapshot_v1(tag, &local)
+		|| !cluster_page_structural_covers_local_pi_v2(receipt, &local))
+		return false;
+	physical = cluster_bufmgr_discard_pi_at_structure_v2(receipt);
+	if ((physical != CLUSTER_PI_PHYSICAL_ABSENT && physical != CLUSTER_PI_PHYSICAL_REPLACED
+		 && physical != CLUSTER_PI_PHYSICAL_DISCARDED)
+		|| !cluster_pi_ack_local_writer(&after) || memcmp(&writer, &after, sizeof(writer)) != 0)
+		return false;
+	ack = palloc0(sizeof(*ack));
+	ack->magic = UINT64_C(0x5047535441434b32);
+	ack->structural = *receipt;
+	ack->writer = writer;
+	ack->inputs = inputs;
+	ack->owner = CurrentResourceOwner;
+	ack->pid = getpid();
+	ack->node = cluster_node_id;
+	/* This original directory consumer rereads the ACK/input proof outside
+	 * entry-X, then compares the entire local snapshot under that lock. */
+	if (!cluster_pcm_local_pi_retire_structural_v2(&local, receipt, ack)) {
+		cluster_page_structural_pi_ack_free_v2(&ack);
+		return false;
+	}
+	*out = ack;
+	return true;
 }
 
 bool

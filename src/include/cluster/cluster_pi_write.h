@@ -129,6 +129,7 @@ cluster_bufmgr_discard_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 typedef struct ClusterPiPhysicalAckV1 ClusterPiPhysicalAckV1;
 
 typedef struct ClusterPageStructuralReceiptV2 ClusterPageStructuralReceiptV2;
+typedef struct ClusterPiStructuralAckV2 ClusterPiStructuralAckV2;
 struct ClusterPiWritebackFactV2;
 /* Original master only: join an already handed-off native KO result to this
  * exact MAIN/VM target and its whole old-incarnation PAGE chain in a sealed
@@ -197,6 +198,20 @@ extern bool cluster_pcm_local_pi_retire_v1(const ClusterPcmLocalPiSnapshotV1 *lo
 										   const RfPageOnlinePlanV1 *plan,
 										   const ClusterWalSourceRef *sources, uint32 source_count,
 										   const ClusterPiPhysicalAckV1 *ack);
+
+extern bool cluster_page_structural_covers_local_pi_v2(const ClusterPageStructuralReceiptV2 *receipt,
+	const ClusterPcmLocalPiSnapshotV1 *local);
+extern bool cluster_pcm_local_pi_retire_structural_v2(const ClusterPcmLocalPiSnapshotV1 *local,
+	const ClusterPageStructuralReceiptV2 *receipt, const ClusterPiStructuralAckV2 *ack);
+/* Exact local boot only, under the original complete retained input scope.
+ * The caller keeps both inputs and receipt/plan alive through ACK consumption.
+ * Every logical endpoint must be an ancestor, followed by physical disposal
+ * and the original local-entry revision CAS. No remote or master retirement. */
+extern bool cluster_bufmgr_ack_pi_at_structure_v2(const ClusterPageStructuralReceiptV2 *receipt,
+	ClusterWalInputsV1 *inputs, ClusterPiStructuralAckV2 **out);
+extern bool cluster_page_structural_pi_ack_read_v2(const ClusterPiStructuralAckV2 *ack,
+	const ClusterPageStructuralReceiptV2 *receipt, int32 *out_node);
+extern void cluster_page_structural_pi_ack_free_v2(ClusterPiStructuralAckV2 **ack);
 
 /* Actual local physical completion, qualified for the original writer/boot.
  * It covers this instance, including older boots only when the original
