@@ -155,6 +155,10 @@ cluster_tt_active_transition_decide(const TTSlot *predecessor, uint32 disk_gener
 		return CLUSTER_TT_ACTIVE_CORRUPT;
 	if (predecessor->wrap > wrap)
 		return CLUSTER_TT_ACTIVE_STALE;
+	/* The same entity already went terminal: the binding is older than the
+	 * slot (redo started below a stamp that is already durable). */
+	if (predecessor->wrap == wrap && predecessor->xid == xid)
+		return CLUSTER_TT_ACTIVE_STALE;
 	if (predecessor->wrap >= TT_WRAP_MAX || wrap != (uint16)(predecessor->wrap + 1))
 		return CLUSTER_TT_ACTIVE_CONFLICT;
 	return CLUSTER_TT_ACTIVE_APPLY;
