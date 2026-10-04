@@ -78,6 +78,15 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 
 /* Exercise the real product-local policy helpers without exporting a test API. */
 #include "../../backend/cluster/cluster_semantic_activation.c"
+
+/* This lock-policy fixture does not install a native startup writer. */
+bool
+cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *ref pg_attribute_unused(),
+	uint64 epoch pg_attribute_unused())
+{
+	abort();
+}
+
 #include "../../backend/cluster/cluster_uba.c"
 
 #undef printf
