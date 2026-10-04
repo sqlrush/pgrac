@@ -469,9 +469,9 @@ cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment_id, u
  *   fsync: the durable TT commit is WAL-protected (XLOG_UNDO_TT_SLOT_COMMIT),
  *   so a torn data-file write is recovered by redo (spec-3.11 C10).  That
  *   holds only until a checkpoint moves the redo pointer past the record, so
- *   each write is recorded for the checkpoint's fsync; without the shared
- *   record (no block-zero region) the write is fsynced here.  offset+len
- *   must stay inside block 0 (BLCKSZ).
+ *   a write to a path the checkpointer resolves itself is recorded for its
+ *   fsync; any other write (a recovery-scoped path, or no block-zero region)
+ *   is fsynced here.  offset+len must stay inside block 0 (BLCKSZ).
  */
 bool
 cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent, uint32 segment_id,
@@ -514,7 +514,9 @@ cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent, uint32 segmen
 	return header_write_recorded(fd, intent, segment_id, owner_instance);
 }
 
-/* Leave a written header range to the checkpoint's fsync, or fsync it now. */
+/* Leave a written header range to the checkpoint's fsync, or fsync it now
+ * through the descriptor this process resolved (for a recovery-scoped path,
+ * inside the recoverer's scope). */
 static bool
 header_write_recorded(int fd, ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance)
 {

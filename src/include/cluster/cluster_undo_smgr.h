@@ -120,8 +120,10 @@ extern bool cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 inst
  *	Targeted read/write of a byte range within segment header block 0 (e.g. one
  *	32-byte TTSlot at offset 112 + slot*32).  Lock-free per-slot durable TT
  *	writes (each xact owns a distinct slot = non-overlapping range).  The write
- *	does not fsync: the caller's WAL record protects it until the next
- *	checkpoint fsyncs it (cluster_undo_buf_flush_all).  The caller must have
+ *	does not fsync a path the checkpointer resolves itself (own runtime undo,
+ *	local materialized copy): the caller's WAL record protects it until the
+ *	next checkpoint fsyncs it (cluster_undo_buf_flush_all).  A recovery-scoped
+ *	path is fsynced before returning, inside the caller's scope.  The caller must have
  *	inserted that record either while holding the segment's exclusive
  *	block-zero content lock or inside a DELAY_CHKPT_START window.  offset+len
  *	must be within BLCKSZ.  Returns true on success, false on bad args / I/O

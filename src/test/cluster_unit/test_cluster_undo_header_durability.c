@@ -318,13 +318,26 @@ cluster_undo_recovery_path_resolve_v1(uint8 owner pg_attribute_unused(), uint32 
 
 	return ret < 0 || (size_t)ret >= buf_size ? -1 : 0;
 }
-int
-cluster_undo_path_resolve(ClusterUndoPathIntent intent pg_attribute_unused(),
-						  uint8 owner_instance pg_attribute_unused(), uint32 segment_id, char *buf,
-						  size_t buf_size)
-{
-	int ret = snprintf(buf, buf_size, "model/seg_%u", (unsigned)segment_id);
+/*
+ * A recovery-scoped path resolves only inside the recoverer's process-private
+ * scope (cluster_undo_recovery_path_resolve_v1); every other process, the
+ * checkpointer included, fails to resolve it.
+ */
+static bool recovery_scope_active = false;
+static int recovery_resolve_calls = 0;
 
+int
+cluster_undo_path_resolve(ClusterUndoPathIntent intent, uint8 owner_instance pg_attribute_unused(),
+						  uint32 segment_id, char *buf, size_t buf_size)
+{
+	int ret;
+
+	if (intent == CLUSTER_UNDO_PATH_RECOVERY_SHARED) {
+		recovery_resolve_calls++;
+		if (!recovery_scope_active)
+			return -1;
+	}
+	ret = snprintf(buf, buf_size, "model/seg_%u", (unsigned)segment_id);
 	return ret < 0 || (size_t)ret >= buf_size ? -1 : 0;
 }
 bool
@@ -352,8 +365,8 @@ FreeDir(DIR *dir pg_attribute_unused())
 }
 
 /*
- * Page-cache model of one segment file's block zero.  The descriptor of a
- * segment is MODEL_FD_BASE + segment id.
+ * Page-cache model of one segment file's block zero.  Segment s of any owner
+ * uses model file (s - 1) % 256 + 1, descriptor MODEL_FD_BASE + that index.
  */
 #define MODEL_FD_BASE 1000
 #define MODEL_SEGMENTS 8
@@ -397,9 +410,10 @@ BasicOpenFile(const char *fileName, int fileFlags pg_attribute_unused())
 {
 	unsigned segment;
 
-	if (sscanf(fileName, "model/seg_%u", &segment) != 1 || segment < 1 || segment >= MODEL_SEGMENTS)
+	if (sscanf(fileName, "model/seg_%u", &segment) != 1 || segment < 1
+		|| (segment - 1) % 256 + 1 >= MODEL_SEGMENTS)
 		return -1;
-	return MODEL_FD_BASE + (int)segment;
+	return MODEL_FD_BASE + (int)((segment - 1) % 256 + 1);
 }
 int
 pg_fsync(int fd)
@@ -469,8 +483,28 @@ fresh_instance(void)
 		shmem_buf = NULL;
 	}
 	model_reset();
+	recovery_scope_active = false;
+	recovery_resolve_calls = 0;
 	cluster_undo_smgr_fd_cache_reset();
 	cluster_undo_buf_shmem_init();
+}
+
+/* Run the undo checkpoint step; report whether it raised an error. */
+static bool
+checkpoint_raises(void)
+{
+	sigjmp_buf local_sigjmp_buf;
+	sigjmp_buf *save_exception_stack = PG_exception_stack;
+	volatile bool raised = false;
+
+	error_reports = 0;
+	if (sigsetjmp(local_sigjmp_buf, 0) == 0) {
+		PG_exception_stack = &local_sigjmp_buf;
+		cluster_undo_buf_flush_all(true);
+	} else
+		raised = true;
+	PG_exception_stack = save_exception_stack;
+	return raised;
 }
 
 static void
@@ -607,16 +641,103 @@ UT_TEST(test_header_write_without_shared_region_fsyncs_itself)
 	cluster_undo_buffers = saved_buffers;
 }
 
+/*
+ * A recovery-scoped header write is synced inside the recoverer's scope and
+ * never left to the checkpointer, which cannot resolve that path: after the
+ * scope ends the checkpoint neither asks for it nor fails.
+ */
+UT_TEST(test_recovery_header_write_is_synced_in_its_scope)
+{
+	char stamp[32];
+
+	fresh_instance();
+	stamp_bytes(stamp, 0x77);
+	recovery_scope_active = true;
+	UT_ASSERT(cluster_undo_smgr_write_header_bytes(CLUSTER_UNDO_PATH_RECOVERY_SHARED, 260, 2,
+												   STAMP_OFFSET, stamp, sizeof(stamp)));
+	UT_ASSERT_EQ(model_files[4].fsyncs, 1);
+	UT_ASSERT_EQ(memcmp(model_files[4].durable + STAMP_OFFSET, stamp, sizeof(stamp)), 0);
+
+	recovery_scope_active = false;
+	cluster_undo_smgr_fd_cache_reset();
+	recovery_resolve_calls = 0;
+	UT_ASSERT(!checkpoint_raises());
+	UT_ASSERT_EQ(recovery_resolve_calls, 0);
+	UT_ASSERT_EQ(model_files[4].fsyncs, 1);
+}
+
+/* A failed sync in the recoverer's scope fails the write itself. */
+UT_TEST(test_recovery_header_sync_failure_fails_the_write)
+{
+	char stamp[32];
+
+	fresh_instance();
+	stamp_bytes(stamp, 0x78);
+	recovery_scope_active = true;
+	model_fsync_fails = true;
+	UT_ASSERT(!cluster_undo_smgr_write_header_bytes(CLUSTER_UNDO_PATH_RECOVERY_SHARED, 260, 2,
+													STAMP_OFFSET, stamp, sizeof(stamp)));
+	model_fsync_fails = false;
+	recovery_scope_active = false;
+	cluster_undo_smgr_fd_cache_reset();
+	recovery_resolve_calls = 0;
+	UT_ASSERT(!checkpoint_raises());
+	UT_ASSERT_EQ(recovery_resolve_calls, 0);
+}
+
+/*
+ * The checkpointer resolves this node's runtime undo and local materialized
+ * copies of other owners itself: their writes stay deferred to it.
+ */
+UT_TEST(test_owned_and_materialized_header_writes_stay_deferred)
+{
+	char stamp[32];
+
+	fresh_instance();
+	stamp_bytes(stamp, 0x79);
+	UT_ASSERT(cluster_undo_smgr_write_header_bytes(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 3, 1,
+												   STAMP_OFFSET, stamp, sizeof(stamp)));
+	UT_ASSERT(cluster_undo_smgr_write_header_bytes(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, 261, 2,
+												   STAMP_OFFSET, stamp, sizeof(stamp)));
+	UT_ASSERT_EQ(model_files[3].fsyncs, 0);
+	UT_ASSERT_EQ(model_files[5].fsyncs, 0);
+	UT_ASSERT(!checkpoint_raises());
+	UT_ASSERT_EQ(model_files[3].fsyncs, 1);
+	UT_ASSERT_EQ(model_files[5].fsyncs, 1);
+	model_crash();
+	UT_ASSERT_EQ(memcmp(model_files[3].durable + STAMP_OFFSET, stamp, sizeof(stamp)), 0);
+	UT_ASSERT_EQ(memcmp(model_files[5].durable + STAMP_OFFSET, stamp, sizeof(stamp)), 0);
+}
+
+/* The checkpointer resolves a runtime path only for this node's own undo; a
+ * write naming another owner's runtime path is synced by its writer. */
+UT_TEST(test_runtime_header_write_of_another_owner_is_not_deferred)
+{
+	char stamp[32];
+
+	fresh_instance();
+	stamp_bytes(stamp, 0x7a);
+	UT_ASSERT(cluster_undo_smgr_write_header_bytes(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 262, 2,
+												   STAMP_OFFSET, stamp, sizeof(stamp)));
+	UT_ASSERT_EQ(model_files[6].fsyncs, 1);
+	UT_ASSERT(!checkpoint_raises());
+	UT_ASSERT_EQ(model_files[6].fsyncs, 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(10);
 	UT_RUN(test_checkpoint_makes_prior_header_writes_durable);
 	UT_RUN(test_write_after_checkpoint_is_left_to_the_next_checkpoint);
 	UT_RUN(test_checkpoint_fsyncs_each_written_segment_once);
 	UT_RUN(test_precommit_opened_writer_is_covered_by_checkpoint);
 	UT_RUN(test_checkpoint_fsync_failure_errors_and_keeps_the_write_pending);
 	UT_RUN(test_header_write_without_shared_region_fsyncs_itself);
+	UT_RUN(test_recovery_header_write_is_synced_in_its_scope);
+	UT_RUN(test_recovery_header_sync_failure_fails_the_write);
+	UT_RUN(test_owned_and_materialized_header_writes_stay_deferred);
+	UT_RUN(test_runtime_header_write_of_another_owner_is_not_deferred);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

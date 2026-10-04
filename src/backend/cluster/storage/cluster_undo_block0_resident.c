@@ -1843,8 +1843,12 @@ cluster_undo_block0_release_reservation(ClusterUndoBlock0Pin *pin)
 
 /*
  * Record that header bytes of one segment reached its file without an fsync.
- * Never throws, so a critical section may call it.  Returns false when there
- * is no shared region to record into; the caller must then fsync itself.
+ * Never throws, so a critical section may call it.  Only paths the
+ * checkpointer resolves on its own are accepted: this node's runtime undo and
+ * local materialized copies of other owners.  A recovery-scoped path resolves
+ * only inside its recoverer's process-private scope, so its writer must sync
+ * it there.  Returns false when the write is not accepted or there is no
+ * shared region to record into; the caller must then fsync itself.
  */
 bool
 cluster_undo_block0_note_unsynced_header(uint32 segment_id, uint8 owner_instance,
@@ -1852,12 +1856,15 @@ cluster_undo_block0_note_unsynced_header(uint32 segment_id, uint8 owner_instance
 {
 	ClusterUndoBlock0LogicalKey logical;
 	ClusterUndoBlock0SlotData *meta;
+	bool own_owner = cluster_node_id >= 0 && owner_instance == (uint8)(cluster_node_id + 1);
 	uint32 bit;
 	uint32 slotno;
 
 	logical.segment_id = segment_id;
 	logical.owner_instance = owner_instance;
-	if (Block0Ctl == NULL || (uint32)intent >= 32
+	if (Block0Ctl == NULL
+		|| !((intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED && own_owner)
+			 || (intent == CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL && !own_owner))
 		|| cluster_undo_block0_logical_slot(&logical, &slotno) != CLUSTER_UNDO_BLOCK0_OK)
 		return false;
 	meta = &Block0Slots[slotno].data;
