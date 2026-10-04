@@ -245,6 +245,18 @@ struct ClusterPiWritebackFactV2;
  * a raw value cannot extend that lifetime. DROP requires its physical owner. */
 extern bool cluster_ko_shared_structure_offer_v2(const ClusterKoCompletionV2 *completion,
 	int32 peer, struct ClusterPiWritebackFactV2 *out);
+/* Transfer the actual committed native result into its original reserved KO
+ * slot. Success consumes the local opaque handle; transaction/backend exit
+ * must then preserve the shared obligation. No caller activates this until
+ * the original background consumer can finish every page responsibility. */
+extern bool cluster_ko_shared_structure_handoff_v2(ClusterKoCompletionV2 **completion);
+/* Bounded read-only background scan, starting at *cursor (initially zero).
+ * On success cursor becomes selected slot + 1 and serial identifies that
+ * original slot lifetime. Only an actual remote peer gets a wire offer.
+ * Refusal preserves all outputs and never cancels a stale obligation. No
+ * acknowledgement, PI retirement or GC authority is returned here. */
+extern bool cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer,
+	uint64 *serial, struct ClusterPiWritebackFactV2 *out);
 /* Borrow the original native COMMIT-DROP owner after the top commit callback
  * and before pending-delete cleanup ends. This is not a physical deletion or
  * PI certificate.

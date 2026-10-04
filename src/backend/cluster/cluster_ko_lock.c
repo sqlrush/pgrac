@@ -113,10 +113,15 @@
 typedef struct ClusterKoSharedContext {
 	bool used;
 	bool complete;
+	bool structure_owned;
 	int32 pid;
 	uint64 serial;
 	ClusterKoSharedMessageV2 request;
 	uint64 peer_boots[CLUSTER_KO_SHARED_NODE_LIMIT];
+	/* Reserved before the DDL starts; never allocate a second post-commit
+	 * queue slot. The original background owner must clear this obligation. */
+	ClusterPageWalBindingV1 terminal;
+	uint8 structure[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 } ClusterKoSharedContext;
 
 typedef struct ClusterKoInboundSlot {
@@ -570,7 +575,8 @@ ko_completion_cancel(ClusterKoCompletionV2 *completion)
 		ClusterKoSharedContext *entry;
 		SpinLockAcquire(&ko_state->shared_lock);
 		entry = &ko_state->contexts[completion->slot];
-		if (entry->used && entry->pid == completion->pid && entry->serial == completion->serial)
+		if (entry->used && !entry->structure_owned && entry->pid == completion->pid
+			&& entry->serial == completion->serial)
 			memset(entry, 0, sizeof(*entry));
 		SpinLockRelease(&ko_state->shared_lock);
 	}
@@ -680,7 +686,8 @@ ko_completion_snapshot(const ClusterKoCompletionV2 *completion, ClusterKoSharedC
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
 	*out = ko_state->contexts[owned->slot];
-	valid = out->used && out->complete && out->pid == owned->pid && out->serial == owned->serial;
+	valid = out->used && out->complete && !out->structure_owned
+		&& out->pid == owned->pid && out->serial == owned->serial;
 	SpinLockRelease(&ko_state->shared_lock);
 	return valid && ko_shared_origin_current(out);
 }
@@ -812,6 +819,88 @@ cluster_ko_shared_structure_offer_v2(const ClusterKoCompletionV2 *completion,
 	 * acknowledge a page or extend this transaction's local ownership. */
 	*out = value;
 	return true;
+}
+
+bool
+cluster_ko_shared_structure_handoff_v2(ClusterKoCompletionV2 **completion)
+{
+	ClusterKoCompletionV2 **link, *owned;
+	ClusterKoSharedContext before;
+	ClusterPageWalBindingV1 terminal;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	bool transferred = false;
+
+	if (completion == NULL || *completion == NULL)
+		return false;
+	link = ko_completion_link(*completion);
+	owned = *link;
+	if (owned == NULL || !owned->postcommit
+		|| !cluster_ko_shared_truncate_observation_v2(owned, &terminal, wal, sizeof(wal))
+		|| !ko_completion_snapshot(owned, &before))
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	if (memcmp(&ko_state->contexts[owned->slot], &before, sizeof(before)) == 0) {
+		ClusterKoSharedContext *entry = &ko_state->contexts[owned->slot];
+		entry->terminal = terminal;
+		memcpy(entry->structure, wal, sizeof(wal));
+		entry->structure_owned = true;
+		transferred = true;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	if (!transferred)
+		return false;
+	/* From this point even an exit before local cleanup must preserve the
+	 * original shared obligation. There is no caller-supplied cancel token. */
+	*link = owned->next;
+	pfree(owned);
+	*completion = NULL;
+	return true;
+}
+
+bool
+cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer, uint64 *serial,
+	struct ClusterPiWritebackFactV2 *out)
+{
+	if (cursor == NULL || serial == NULL || out == NULL || ko_state == NULL
+		|| *cursor >= CLUSTER_KO_SHARED_CAPACITY || peer < 0
+		|| peer >= CLUSTER_KO_SHARED_NODE_LIMIT || peer == cluster_node_id
+		|| (MyBackendType != B_BG_WRITER && MyBackendType != B_CHECKPOINTER)
+		|| CurrentResourceOwner == NULL || CritSectionCount != 0)
+		return false;
+	for (uint32 i = *cursor; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		ClusterKoSharedContext context;
+		ClusterWalSourceRef current;
+		ClusterPiWritebackFactV2 value = {0};
+		ClusterPiStructuralFactV2 *s = &value.proof.structural;
+
+		SpinLockAcquire(&ko_state->shared_lock);
+		context = ko_state->contexts[i];
+		SpinLockRelease(&ko_state->shared_lock);
+		if (!context.used || !context.complete || !context.structure_owned
+			|| context.serial == 0 || context.peer_boots[peer] == 0
+			|| !ko_shared_origin_current(&context)
+			|| !cluster_wal_thread_current_v2_ref(&current)
+			|| memcmp(&current, &context.terminal.source, sizeof(current)) != 0)
+			continue;
+		s->ko = context.request;
+		s->ko.peer_node = peer;
+		s->ko.peer_boot = context.peer_boots[peer];
+		if (!ko_shared_control_current(&s->ko)
+			|| !cluster_space_structure_wal_decode(context.structure, sizeof(context.structure),
+				&s->change)
+			|| s->change.identity.action != CLUSTER_SPACE_WAL_TRUNCATE)
+			continue;
+		value.kind = CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2;
+		s->terminal.binding = context.terminal;
+		s->durability_flags = CLUSTER_PI_STRUCTURAL_WAL_FLUSHED
+			| CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK | CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED
+			| CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE | CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
+		*out = value;
+		*serial = context.serial;
+		*cursor = i + 1;
+		return true;
+	}
+	return false;
 }
 
 bool
@@ -971,7 +1060,8 @@ ko_shared_backend_exit(int code, Datum arg)
 		return;
 	SpinLockAcquire(&ko_state->shared_lock);
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
-		if (ko_state->contexts[i].used && ko_state->contexts[i].pid == MyProcPid) {
+		if (ko_state->contexts[i].used && !ko_state->contexts[i].structure_owned
+			&& ko_state->contexts[i].pid == MyProcPid) {
 			if (!ko_state->contexts[i].complete)
 				batches[count++] = ko_state->contexts[i].request.batch_id;
 			memset(&ko_state->contexts[i], 0, sizeof(ko_state->contexts[i]));
@@ -1041,7 +1131,9 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
 		if (ko_state->contexts[i].used && result == CLUSTER_NORMAL_STOP_READY) {
 			result = CLUSTER_NORMAL_STOP_PENDING;
-			why = ko_state->contexts[i].complete ? "KO_SHARED_COMPLETION_OWNED" : "KO_SHARED_BARRIER_PENDING";
+			why = ko_state->contexts[i].structure_owned ? "KO_SHARED_STRUCTURE_OWNED"
+				: ko_state->contexts[i].complete ? "KO_SHARED_COMPLETION_OWNED"
+				: "KO_SHARED_BARRIER_PENDING";
 		}
 	SpinLockRelease(&ko_state->shared_lock);
 	if (reason != NULL)
