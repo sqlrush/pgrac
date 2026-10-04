@@ -805,67 +805,97 @@ add_old_generation(uint16 thread, uint64 incarnation, uint8 lifecycle, uint64 cl
 static bool
 cut_names(const ClusterWalRetainedCutV1 *cut, uint32 item)
 {
-	for (uint32 i = 0; i < Min(cut->prunable_generations, CLUSTER_WAL_RETAINED_PRUNABLE_MAX); i++)
-		if (memcmp(&cut->prunable[i], &items[item].checkpoint.identity, sizeof(cut->prunable[i]))
+	for (uint32 i = 0; i < Min(cut->unneeded_generations, CLUSTER_WAL_RETAINED_UNNEEDED_MAX); i++)
+		if (memcmp(&cut->unneeded[i], &items[item].checkpoint.identity, sizeof(cut->unneeded[i]))
 			== 0)
 			return true;
 	return false;
 }
 
-/* An older generation is reported deletable only if it is CLOSED, nothing
- * in it is needed, and every running instance of another thread restarted
- * after it closed.  Self's old generation closed at 40; the peer's own
- * predecessor (when present) closed at 50, or 35 in variant 1, where the
- * peer's generation is the deletable one instead (self restarted after it). */
-UT_TEST(test_retained_cut_older_generation_deletable_only_when_proven)
+/* An older generation is listed as unneeded only if it is CLOSED and nothing
+ * in it serves an obligation: not RECOVERY_COMPLETE (variant 1), not when an
+ * obligation needs one of its edges (2) or it ends a relation incarnation
+ * (3).  Variant 4 adds the peer's own closed predecessor, also unneeded. */
+UT_TEST(test_retained_cut_older_generation_unneeded_only_when_no_obligation)
 {
-	for (int variant = 0; variant < 10; variant++) {
+	for (int variant = 0; variant < 5; variant++) {
 		uint32 self, peer, old, peer_old = UINT32_MAX;
 		ClusterWalRetainedCutV1 cut;
 		RfPageProofDetailV1 detail;
-		bool deletable = variant == 0 || variant == 6 || variant == 8 || variant == 9;
+		bool unneeded = variant == 0 || variant == 4;
 
 		two_writers(&self, &peer);
 		add_record(self, 0x1000, 0x1100, 100, 1, 2);
 		old = add_old_generation(1, 20,
-								 variant == 3 ? CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+								 variant == 1 ? CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
 											  : CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED,
 								 40, 0x800);
-		if (variant == 1)
-			peer_old = add_old_generation(2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 35, 0x900);
-		else if (variant == 7) { /* the peer's predecessor is an initializer terminal */
-			ClusterWalInputV1 *terminal = &items[add_old_generation(
-				2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 50, 0x900)];
-
-			terminal->kind = CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL;
-			terminal->first_segment = 0x1000000;
-		} else if (variant == 8) { /* only the peer's latest restart counts */
-			add_old_generation(2, 25, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 30, 0x900);
-			add_old_generation(2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 50, 0x900);
-		} else if (variant == 9) /* both closed by one publication */
-			add_old_generation(2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 40, 0x900);
-		else if (variant != 2 && variant != 6) /* variant 2: the peer never restarted */
-			add_old_generation(2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 50, 0x900);
-		if (variant == 4) { /* an obligation needs one of its edges */
+		if (variant == 2) {
 			add_record(old, 0x200, 0x300, 700, 1, 2);
 			add_record(self, 0x3000, 0x3100, 700, 1, 3);
-		} else if (variant == 5) { /* it ends a relation incarnation */
+		} else if (variant == 3) {
 			FixtureRecord *r = add_record(old, 0x200, 0x280, InvalidOid, 0, 9);
 
 			r->space_rel = 901;
 			r->space_mask = 3;
-		} else if (variant == 6) /* the peer is not running at all */
-			items[peer].checkpoint.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+		} else if (variant == 4)
+			peer_old = add_old_generation(2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 50, 0x900);
 		UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
-		UT_ASSERT_EQ(cut_names(&cut, old), deletable);
-		/* Variants 1, 8 and 9 also free a peer generation self outlived. */
-		UT_ASSERT_EQ(cut.prunable_generations,
-					 (deletable ? 1u : 0u)
-						 + (variant == 1 || variant == 8 || variant == 9 ? 1u : 0u));
-		if (variant == 1)
+		UT_ASSERT_EQ(cut_names(&cut, old), unneeded);
+		UT_ASSERT_EQ(cut.unneeded_generations, (unneeded ? 1u : 0u) + (variant == 4 ? 1u : 0u));
+		if (variant == 4)
 			UT_ASSERT(cut_names(&cut, peer_old));
 		if (ut_current_failed)
 			printf("# older generation variant %d\n", variant);
+	}
+}
+
+/*
+ * R-A20 counterexample: root_publish_seq is per record for checkpoints and
+ * normal stops, so it does not order closes across threads.  The peer's
+ * predecessor reached 100 by its own checkpoints and restarted first; this
+ * thread's old generation closed later at 40, and the peer may still hold a
+ * reference to it.  Peers' restarts therefore play no part: the old
+ * generation is listed exactly as when the peer never restarted (or is not
+ * running), and the listing is a readout, not permission to delete.
+ */
+UT_TEST(test_r_a20_cross_thread_publish_seq_proves_no_restart)
+{
+	ClusterControlRootIdentity first[CLUSTER_WAL_RETAINED_UNNEEDED_MAX];
+
+	memset(first, 0, sizeof(first));
+	for (int variant = 0; variant < 5; variant++) {
+		uint32 self, peer, old;
+		ClusterWalRetainedCutV1 cut;
+		RfPageProofDetailV1 detail;
+
+		/* 0: the peer never restarted; 1: it restarted after a predecessor
+		 * that published 100 times; 2: 35 times; 3: from an initializer
+		 * terminal; 4: it is not running.  The peer's predecessors are
+		 * RECOVERY_COMPLETE so that only self's old generation is listed. */
+		two_writers(&self, &peer);
+		add_record(self, 0x1000, 0x1100, 100, 1, 2);
+		old = add_old_generation(1, 20, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 40, 0x800);
+		if (variant == 1 || variant == 2)
+			add_old_generation(2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE,
+							   variant == 1 ? 100 : 35, 0x900);
+		else if (variant == 3) {
+			ClusterWalInputV1 *terminal = &items[add_old_generation(
+				2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 100, 0x900)];
+
+			terminal->kind = CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL;
+			terminal->first_segment = 0x1000000;
+		} else if (variant == 4)
+			items[peer].checkpoint.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+		UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(cut_names(&cut, old));
+		UT_ASSERT_EQ(cut.unneeded_generations, 1);
+		if (variant == 0)
+			memcpy(first, cut.unneeded, sizeof(first));
+		else
+			UT_ASSERT_EQ(memcmp(first, cut.unneeded, sizeof(first)), 0);
+		if (ut_current_failed)
+			printf("# restart order variant %d\n", variant);
 	}
 }
 

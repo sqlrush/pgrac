@@ -614,7 +614,8 @@ main(void)
 	UT_RUN(test_retained_cut_side_undo_blocks_are_keyed);
 	UT_RUN(test_retained_cut_side_prepared_transactions_are_keyed);
 	UT_RUN(test_retained_cut_side_unkeyed_records_are_kept_by_class);
-	UT_RUN(test_retained_cut_older_generation_deletable_only_when_proven);
+	UT_RUN(test_retained_cut_older_generation_unneeded_only_when_no_obligation);
+	UT_RUN(test_r_a20_cross_thread_publish_seq_proves_no_restart);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
