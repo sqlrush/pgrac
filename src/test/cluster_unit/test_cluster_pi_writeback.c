@@ -802,7 +802,23 @@ wb_elog(int level, const char *format, ...)
 		} else if ((level) == LOG)                                                                 \
 			rebuild_logs++;                                                                        \
 	} while (0)
+/* This transport-only boundary supplies an original owner's exported fact.
+ * Real KO/sealed SIDE/PAGE construction and remote import are exercised by
+ * page_data; a returned transport ACK here is not a physical-disposal test. */
+static bool wb_structural_fact_ready;
+static ClusterPiWritebackFactV2 wb_structural_fact;
+static bool
+wb_structural_fact_for_transport(const ClusterPageStructuralReceiptV2 *receipt, int32 peer,
+								 ClusterPiWritebackFactV2 *out)
+{
+	if (!wb_structural_fact_ready || receipt != (const void *)73 || peer != 1)
+		return false;
+	*out = wb_structural_fact;
+	return true;
+}
+#define cluster_page_structural_pi_fact_v2 wb_structural_fact_for_transport
 #include "../../backend/cluster/cluster_pi_writeback.c"
+#undef cluster_page_structural_pi_fact_v2
 #include "../../backend/cluster/cluster_pi_rebuild.c"
 #undef palloc0
 
@@ -1876,7 +1892,11 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 int
 main(void)
 {
-	UT_PLAN(53);
+	UT_PLAN(57);
+	UT_RUN(writeback_v2_structural_empty_ack_keeps_page_obligation);
+	UT_RUN(writeback_v2_structural_job_binds_original_fact_and_ack);
+	UT_RUN(writeback_v2_structural_job_refuses_missing_original_owner);
+	UT_RUN(writeback_v2_structural_job_cannot_accept_data_or_stale_cut);
 	UT_RUN(writeback_v2_data_job_reaches_actual_remote_ack);
 	UT_RUN(writeback_v2_data_job_preserves_partial_ack_and_master_cut);
 	UT_RUN(writeback_v2_data_job_rejects_unrelated_and_old_ack);
