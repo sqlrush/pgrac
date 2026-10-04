@@ -61,9 +61,12 @@
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_mrp.h" /* spec-6.4 INV-ADG5 — standby write gate */
+#include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sinval.h"		 /* spec-5.2 D1: relsize inval broadcast */
+#include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_write_fence.h" /* spec-4.12 D5 — hot write-path fence gate */
 #include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -566,6 +569,87 @@ cluster_smgr_unlink_fork(RelFileLocatorBackend rlocator, ForkNumber forknum, boo
 }
 
 
+/* Report only the original committed DROP's exact, durable physical result.
+ * Once that owner is found, failure must retain its responsibility and MAIN
+ * reservation, never fall through to unqualified per-fork cleanup. The KO
+ * consumer owns subsequent PI retirement; this function grants none.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+cluster_smgr_unlink_committed_drop(RelFileLocator locator)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+	const uint32 save_interrupt_holdoff = InterruptHoldoffCount;
+	const uint32 save_cancel_holdoff = QueryCancelHoldoffCount;
+	const uint32 save_crit_section = CritSectionCount;
+	volatile bool handled = false;
+
+	PG_TRY();
+	{
+		ClusterKoCompletionV2 *completion = NULL;
+
+		if (cluster_ko_shared_pending_drop_v2(locator, &completion)) {
+			ClusterPageWalBindingV1 terminal;
+			ClusterSpaceStructureChange change;
+			uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+			const ClusterSharedFsOps *ops = cluster_shared_fs_get_active_ops();
+			bool completed = false;
+
+			handled = true;
+			if (completion != NULL && ops != NULL
+				&& ops->id == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
+				&& cluster_ko_shared_space_observation_v2(completion, &terminal, wal, sizeof(wal))
+				&& cluster_space_structure_wal_decode(wal, sizeof(wal), &change)
+				&& change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE
+				&& RelFileLocatorEquals(change.identity.result.key.locator, locator)
+				&& RelFileLocatorEquals(terminal.identity.locator, locator)
+				&& change.identity.result.key.system_identifier == terminal.identity.system_identifier
+				&& change.identity.result.key.database_incarnation
+					== terminal.source.claim.database_incarnation
+				&& memcmp(change.identity.result.key.storage_uuid, terminal.identity.storage_uuid, 16) == 0
+				&& memcmp(change.identity.result.incarnation, terminal.version.segment_incarnation, 16) == 0
+				&& change.identity.result_token == terminal.version.mutation_token) {
+				ForkNumber f;
+
+				/* MAIN remains occupied until the original checkpoint cycle. */
+				for (f = MAIN_FORKNUM + 1; f <= MAX_FORKNUM; f++)
+					cluster_smgr_forget_fsync(locator, f);
+				if (cluster_shared_fs_sharedfs_drop_durable(&change.identity.result,
+						change.identity.result_token)
+					&& cluster_ko_shared_observe_drop_v2(completion)) {
+					FileTag tag;
+
+					cluster_smgr_init_filetag(&tag, locator, MAIN_FORKNUM);
+					RegisterSyncRequest(&tag, SYNC_UNLINK_REQUEST, true);
+					completed = true;
+				}
+			}
+			if (!completed)
+				ereport(WARNING,
+						(errmsg("could not establish the durable shared DROP result"),
+						 errdetail("Relation %u/%u/%u retains its original cleanup responsibility and MAIN reservation.",
+								   locator.spcOid, locator.dbOid, locator.relNumber)));
+		}
+	}
+	PG_CATCH();
+	{
+		ErrorData *edata;
+
+		/* An error may precede the borrow result; do not run legacy cleanup. */
+		handled = true;
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		FlushErrorState();
+		InterruptHoldoffCount = save_interrupt_holdoff;
+		QueryCancelHoldoffCount = save_cancel_holdoff;
+		CritSectionCount = save_crit_section;
+		edata->elevel = WARNING;
+		ThrowErrorData(edata);
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+	return handled;
+}
+
 void
 cluster_smgr_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
@@ -597,8 +681,11 @@ cluster_smgr_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isR
 	if (forknum == InvalidForkNumber) {
 		ForkNumber f;
 
-		for (f = 0; f <= MAX_FORKNUM; f++)
-			cluster_smgr_unlink_fork(rlocator, f, isRedo);
+		if (!(cluster_shared_config && !isRedo && !IsBinaryUpgrade
+			  && !RelFileLocatorBackendIsTemp(rlocator)
+			  && cluster_smgr_unlink_committed_drop(rlocator.locator)))
+			for (f = 0; f <= MAX_FORKNUM; f++)
+				cluster_smgr_unlink_fork(rlocator, f, isRedo);
 
 		/* No backend handles remain, including the retained MAIN tombstone. */
 		if (cluster_smgr_relations != NULL)
