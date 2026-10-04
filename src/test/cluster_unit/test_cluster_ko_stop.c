@@ -2,7 +2,11 @@
 /* Actual KO SPSC admission/drain, with explicit storage and ACK-queue boundary
  * fixtures. A queue-empty observation alone does not certify flush completion. */
 #include "postgres.h"
+#include "access/xact.h"
+#include "catalog/storage_xlog.h"
 #include "cluster/cluster_hw_lease.h"
+#include "cluster/cluster_page_wal.h"
+#include "cluster/cluster_space_reservation.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
@@ -1553,10 +1557,130 @@ UT_TEST(test_native_barrier_rejects_missing_or_unrelated_transaction_before_io)
 	}
 }
 
+static ClusterKoCompletionV2 *
+prepare_native_structure(bool drop, ClusterPageWalBindingV1 *binding, uint8 *wal)
+{
+	ClusterKoCompletionV2 *completion = NULL;
+	ClusterSpaceStructureChange change = {0};
+	reset_test();
+	cluster_shared_config = drive_shared_ack = true;
+	writer.claim.identity.origin_thread_id = 1;
+	writer.claim.identity.thread_claim_created_at = 123;
+	writer.claim.identity.root_lineage_seq = 1;
+	writer.claim.identity.authority_uuid[0] = 17;
+	writer.claim.max_config_generation = 1;
+	writer.claim.claim_sha256[0] = 19;
+	writer.timeline = 1;
+	space_identity.key.locator.dbOid = 44;
+	space_identity.sequence = 1;
+	space_identity.operation = 10;
+	cluster_ko_flush_and_wait_ack(space_identity.key.locator, RELPERSISTENCE_PERMANENT);
+	UT_ASSERT(cluster_ko_shared_claim_v2(&space_identity.key, space_identity.incarnation, &completion));
+	change.identity.expected = space_identity;
+	change.identity.result = space_identity;
+	change.identity.result.sequence++;
+	change.identity.result.operation = change.identity.result_token = 20;
+	change.identity.before_token = 10;
+	change.identity.action = drop ? CLUSTER_SPACE_WAL_TOMBSTONE : CLUSTER_SPACE_WAL_TRUNCATE;
+	change.identity.nblocks = drop ? InvalidBlockNumber : 4;
+	if (drop)
+		change.identity.result.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+	else
+		change.identity.result.incarnation[0]++;
+	change.reservation.action = drop ? CLUSTER_SPACE_RESERVATION_TOMBSTONE : CLUSTER_SPACE_RESERVATION_RESET;
+	change.reservation.before.identity = space_identity;
+	change.reservation.before.next_block = 8;
+	change.reservation.before_token = 10;
+	change.reservation.result.identity = change.identity.result;
+	change.reservation.result.next_block = drop ? 8 : 4;
+	change.reservation.first_block = drop ? 0 : 4;
+	change.reservation.result_token = 20;
+	UT_ASSERT(cluster_space_structure_wal_encode(&change, wal, CLUSTER_SPACE_STRUCTURE_WAL_BYTES));
+	memset(binding, 0, sizeof(*binding));
+	binding->source = writer;
+	binding->identity.system_identifier = space_identity.key.system_identifier;
+	memcpy(binding->identity.storage_uuid, space_identity.key.storage_uuid, 16);
+	binding->identity.locator = space_identity.key.locator;
+	binding->identity.forknum = SPACE_FORKNUM;
+	memcpy(binding->version.segment_incarnation, change.identity.result.incarnation, 16);
+	binding->version.mutation_token = 20;
+	binding->record_start = 0x100;
+	binding->record_end = 0x180;
+	binding->record_crc = 7;
+	binding->rmid = drop ? RM_XACT_ID : RM_SMGR_ID;
+	binding->info = drop ? XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO : XLOG_SMGR_SPACE_IDENTITY;
+	binding->flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	UT_ASSERT(cluster_page_wal_binding_shape_v1(binding));
+	return completion;
+}
+
+UT_TEST(test_native_space_observation_is_original_once_and_transaction_owned)
+{
+	for (unsigned drop = 0; drop < 2; drop++) {
+		ClusterPageWalBindingV1 binding, observed = {0};
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], copied[sizeof(wal)] = {0};
+		ClusterKoCompletionV2 *completion = prepare_native_structure(drop, &binding, wal);
+		int reads = space_reads, requests = barrier_requests;
+		UT_ASSERT(!cluster_ko_shared_space_observation_v2(completion, &observed, copied, sizeof(copied)));
+		UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
+		UT_ASSERT(!cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
+		UT_ASSERT(cluster_ko_shared_space_observation_v2(completion, &observed, copied, sizeof(copied)));
+		UT_ASSERT(memcmp(&observed, &binding, sizeof(binding)) == 0);
+		UT_ASSERT(memcmp(copied, wal, sizeof(wal)) == 0);
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		UT_ASSERT(!cluster_ko_shared_space_observation_v2(completion, &observed, copied, sizeof(copied)));
+		cluster_ko_shared_release_v2(&completion);
+		UT_ASSERT_EQ(completion_allocations, 0);
+		UT_ASSERT_EQ(space_reads, reads);
+		UT_ASSERT_EQ(barrier_requests, requests);
+	}
+}
+
+UT_TEST(test_native_space_observation_refuses_foreign_or_changed_record)
+{
+	for (unsigned fault = 0; fault < 17; fault++) {
+		ClusterPageWalBindingV1 binding, observed, before;
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], copied[sizeof(wal)], previous[sizeof(wal)];
+		ClusterKoCompletionV2 *completion = prepare_native_structure(fault % 2, &binding, wal);
+		Size len = sizeof(wal);
+		switch (fault) {
+		case 0: binding.flags = 0; break;
+		case 1: binding.source.claim.identity.origin_owner_incarnation++; break;
+		case 2: binding.source.claim.claim_sha256[0]++; break;
+		case 3: binding.source.timeline++; break;
+		case 4: binding.identity.forknum = MAIN_FORKNUM; break;
+		case 5: binding.identity.blockno = 1; break;
+		case 6: binding.identity.locator.relNumber++; break;
+		case 7: binding.version.segment_incarnation[0]++; break;
+		case 8: binding.version.mutation_token++; break;
+		case 9: binding.rmid = RM_HEAP_ID; break;
+		case 10: binding.info = XLOG_SMGR_TRUNCATE; break;
+		case 11: binding.record_start = binding.record_end; break;
+		case 12: wal[40] ^= 1; break;
+		case 13: len--; break;
+		case 14: CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)2; break;
+		case 15: current_epoch++; break;
+		case 16: resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL); break;
+		}
+		memset(&before, 0x5a, sizeof(before));
+		memset(previous, 0x5a, sizeof(previous));
+		observed = before;
+		memcpy(copied, previous, sizeof(copied));
+		UT_ASSERT(!cluster_ko_shared_observe_space_v2(completion, &binding, wal, len));
+		UT_ASSERT(!cluster_ko_shared_space_observation_v2(completion, &observed, copied, sizeof(copied)));
+		UT_ASSERT(memcmp(&observed, &before, sizeof(before)) == 0);
+		UT_ASSERT(memcmp(copied, previous, sizeof(previous)) == 0);
+		CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)1;
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		cluster_ko_shared_release_v2(&completion);
+		UT_ASSERT_EQ(completion_allocations, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(39);
+	UT_PLAN(41);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
@@ -1596,6 +1720,8 @@ main(void)
 	UT_RUN(test_native_portal_barrier_survives_precommit_without_portal_release);
 	UT_RUN(test_native_portal_subtransaction_keeps_exact_transaction_scope);
 	UT_RUN(test_native_barrier_rejects_missing_or_unrelated_transaction_before_io);
+	UT_RUN(test_native_space_observation_is_original_once_and_transaction_owned);
+	UT_RUN(test_native_space_observation_refuses_foreign_or_changed_record);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

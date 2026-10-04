@@ -856,6 +856,7 @@ static void
 space_structure_publish(ClusterSpaceTruncateState *state, XLogRecPtr lsn)
 {
 	Assert(state != NULL && CritSectionCount > 0 && !XLogRecPtrIsInvalid(lsn));
+	state->lsn = lsn;
 	for (int i = 0; i < 2; i++) {
 		memcpy(BufferGetPage(state->buffers[i]), state->result[i].data, BLCKSZ);
 		space_set_lsn(BufferGetPage(state->buffers[i]), lsn, state->token);
@@ -899,6 +900,27 @@ space_structure_readback(SMgrRelation rel, Buffer buffer, BlockNumber block)
 	return memcmp(disk.data, expected, BLCKSZ) == 0;
 }
 
+/* Keep the original record with its preallocated KO owner. Missing native
+ * attribution cannot manufacture a structural completion or retire a PI. */
+static void
+space_structure_observe(ClusterSpaceTruncateState *state)
+{
+	ClusterSpaceStructureChange change;
+	ClusterPageWalBindingV1 before, after, certified;
+	if (state->ko_completion == NULL || RecoveryInProgress())
+		return;
+	if (!cluster_space_structure_wal_decode(state->wal, sizeof(state->wal), &change))
+		elog(PANIC, "SPACE observation lost its original structural record");
+	if (!cluster_page_wal_read_v1(state->buffers[0], &change.identity.result, &before)
+		|| before.record_end != state->lsn
+		|| !cluster_page_wal_flush_source_v1(&before, &certified)
+		|| !cluster_page_wal_read_v1(state->buffers[0], &change.identity.result, &after)
+		|| memcmp(&before, &after, sizeof(before)) != 0)
+		return;
+	(void)cluster_ko_shared_observe_space_v2(state->ko_completion, &certified,
+		state->wal, sizeof(state->wal));
+}
+
 void
 cluster_space_truncate_finish(ClusterSpaceTruncateState *state, Relation rel)
 {
@@ -922,6 +944,7 @@ cluster_space_truncate_finish(ClusterSpaceTruncateState *state, Relation rel)
 								errdetail("Relation %u/%u/%u, SPACE block %d.", rel->rd_locator.spcOid,
 										  rel->rd_locator.dbOid, rel->rd_locator.relNumber, i),
 								errhint("Check the storage device before restarting the instance.")));
+		space_structure_observe(state);
 	}
 	PG_CATCH();
 	{
@@ -1067,6 +1090,7 @@ cluster_space_drop_finish(ClusterSpaceDropState *state)
 												  change.identity.result.key.locator.spcOid,
 												  change.identity.result.key.locator.dbOid,
 												  change.identity.result.key.locator.relNumber, j)));
+				space_structure_observe(entry);
 			}
 		}
 		PG_CATCH();

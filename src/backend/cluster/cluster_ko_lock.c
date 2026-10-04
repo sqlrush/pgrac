@@ -45,7 +45,9 @@
 #include "postgres.h"
 
 #include "access/xlog.h" /* RecoveryInProgress */
+#include "access/xact.h"
 #include "catalog/pg_class.h"
+#include "catalog/storage_xlog.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_clean_leave.h"
@@ -59,6 +61,8 @@
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_ko.h"
+#include "cluster/cluster_page_wal.h"
+#include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_shmem.h"
@@ -154,6 +158,9 @@ struct ClusterKoCompletionV2 {
 	uint64 serial;
 	bool native_transaction;
 	bool native_pending;
+	bool space_observed;
+	ClusterPageWalBindingV1 terminal;
+	uint8 structure[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	struct ClusterKoCompletionV2 *next;
 };
 
@@ -662,6 +669,66 @@ cluster_ko_shared_covers_v2(const ClusterKoCompletionV2 *completion,
 		&& memcmp(context.request.key.storage_uuid, key->storage_uuid, 16) == 0
 		&& RelFileLocatorEquals(context.request.key.locator, key->locator)
 		&& memcmp(context.request.incarnation, incarnation, 16) == 0;
+}
+
+bool
+cluster_ko_shared_observe_space_v2(ClusterKoCompletionV2 *completion,
+	const struct ClusterPageWalBindingV1 *terminal, const void *wal, Size wal_length)
+{
+	ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
+	ClusterSpaceStructureChange change;
+	ClusterWalSourceRef current;
+	const ClusterSpaceIdentityKey *key;
+	if (owned == NULL || !owned->native_transaction || owned->native_pending
+		|| owned->space_observed || !cluster_page_wal_binding_shape_v1(terminal)
+		|| terminal->flags != CLUSTER_PAGE_WAL_NATIVE_FLUSHED
+		|| terminal->identity.forknum != SPACE_FORKNUM || terminal->identity.blockno != 0
+		|| !cluster_space_structure_wal_decode(wal, wal_length, &change)
+		|| !cluster_wal_thread_current_v2_ref(&current)
+		|| memcmp(&current, &terminal->source, sizeof(current)) != 0)
+		return false;
+	key = &change.identity.result.key;
+	if (key->system_identifier != terminal->identity.system_identifier
+		|| key->database_incarnation != terminal->source.claim.database_incarnation
+		|| memcmp(key->storage_uuid, terminal->identity.storage_uuid, 16) != 0
+		|| !RelFileLocatorEquals(key->locator, terminal->identity.locator)
+		|| change.identity.result_token != terminal->version.mutation_token
+		|| memcmp(change.identity.result.incarnation, terminal->version.segment_incarnation, 16) != 0)
+		return false;
+	if (change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE) {
+		if (terminal->rmid != RM_SMGR_ID
+			|| (terminal->info & ~XLR_INFO_MASK) != XLOG_SMGR_SPACE_IDENTITY)
+			return false;
+	} else if (change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE) {
+		if (terminal->rmid != RM_XACT_ID || (terminal->info & XLOG_XACT_OPMASK) != XLOG_XACT_COMMIT
+			|| (terminal->info & XLOG_XACT_HAS_INFO) == 0)
+			return false;
+	} else
+		return false;
+	if (!cluster_ko_shared_covers_v2(owned, &change.identity.expected.key,
+								   change.identity.expected.incarnation))
+		return false;
+	owned->terminal = *terminal;
+	memcpy(owned->structure, wal, sizeof(owned->structure));
+	owned->space_observed = true;
+	return true;
+}
+
+bool
+cluster_ko_shared_space_observation_v2(const ClusterKoCompletionV2 *completion,
+	struct ClusterPageWalBindingV1 *terminal, void *wal, Size wal_length)
+{
+	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
+	ClusterKoSharedContext context;
+	ClusterWalSourceRef current;
+	if (owned == NULL || !owned->space_observed || terminal == NULL || wal == NULL
+		|| wal_length != sizeof(owned->structure) || !ko_completion_snapshot(owned, &context)
+		|| !cluster_wal_thread_current_v2_ref(&current)
+		|| memcmp(&current, &owned->terminal.source, sizeof(current)) != 0)
+		return false;
+	*terminal = owned->terminal;
+	memcpy(wal, owned->structure, sizeof(owned->structure));
+	return true;
 }
 
 /* Only the original native wrapper offers a completion for SPACE to take.

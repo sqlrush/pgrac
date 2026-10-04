@@ -222,6 +222,14 @@ extern bool cluster_ko_shared_begin_v2(RelFileLocator rlocator, char relpersiste
  * second barrier. Refusal leaves out unchanged. */
 extern bool cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key,
 	const uint8 incarnation[16], ClusterKoCompletionV2 **out);
+struct ClusterPageWalBindingV1;
+/* Original SPACE finish, after both pages have an exact durable observation.
+ * Saves only that observation in the already reserved native handle. This is
+ * not COMMIT, durable unlink, per-PI ancestry or retirement authority. */
+extern bool cluster_ko_shared_observe_space_v2(ClusterKoCompletionV2 *completion,
+	const struct ClusterPageWalBindingV1 *terminal, const void *wal, Size wal_length);
+extern bool cluster_ko_shared_space_observation_v2(const ClusterKoCompletionV2 *completion,
+	struct ClusterPageWalBindingV1 *terminal, void *wal, Size wal_length);
 extern bool cluster_ko_shared_covers_v2(const ClusterKoCompletionV2 *completion,
 	const ClusterSpaceIdentityKey *key, const uint8 incarnation[16]);
 /* Only actual remote members have a wire projection; a one-member barrier
