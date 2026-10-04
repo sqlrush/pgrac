@@ -11338,7 +11338,7 @@ static void test_serving_finish_root(void);
 int
 main(void)
 {
-	UT_PLAN(362);
+	UT_PLAN(365);
 	UT_RUN(test_barrier_waits_for_both_late_peer_samples_in_either_order);
 	UT_RUN(test_staged_sample_ack_survives_idle_authority_gap);
 	UT_RUN(test_sample_ack_waits_for_local_gate_epoch);
@@ -11366,6 +11366,9 @@ main(void)
 	UT_RUN(test_clean_restart_sql_waits_for_root_serving);
 	UT_RUN(test_serving_owner_waits_for_exact_root_release_and_frees_mailbox);
 	UT_RUN(test_serving_rejects_failed_or_empty_completion);
+	UT_RUN(test_serving_retries_transient_root_conflict_without_ready);
+	UT_RUN(test_serving_transient_retry_still_rejects_changed_epoch);
+	UT_RUN(test_serving_identity_mismatch_stays_terminal_for_same_cut);
 	UT_RUN(test_serving_old_result_rejected_after_cut_changes);
 	UT_RUN(test_serving_rechecks_identity_after_root_poll);
 	UT_RUN(test_serving_only_original_lmon_consumes_complete_open);
