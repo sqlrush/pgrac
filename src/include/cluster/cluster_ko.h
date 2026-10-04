@@ -275,6 +275,10 @@ extern bool cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer
  * authority. Refusal leaves out unchanged and performs no page or network I/O. */
 extern bool cluster_ko_shared_peer_projection_v2(const ClusterKoSharedMessageV2 *request,
 	int32 peer, ClusterKoSharedMessageV2 *out);
+/* Read-only full cohort/namespace/peer-cut check, also usable by a third
+ * member serving as the page master. This grants no KO completion, notice,
+ * disposal or GC authority and does not relax KO ingress endpoint checks. */
+extern bool cluster_ko_shared_cut_current_v2(const ClusterKoSharedMessageV2 *request);
 /* Borrow the original native COMMIT-DROP owner after the top commit callback
  * and before pending-delete cleanup ends. This is not a physical deletion or
  * PI certificate.
