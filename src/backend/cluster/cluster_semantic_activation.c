@@ -13724,7 +13724,8 @@ semantic_serving_lmon_tick(void)
 		return false;
 	semantic_serving.polling = true;
 	result = cluster_control_root_v3_serving_poll(&semantic_serving.open, semantic_serving.root, &token);
-	if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE || result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
+	if (result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE || result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+		|| result == CLUSTER_CONTROL_ROOT_STALE_TOKEN || result == CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
 		return false;
 	semantic_serving.polling = false;
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && semantic_serving_token_valid(&token, cut.system_identifier)
