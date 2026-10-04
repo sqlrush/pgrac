@@ -11201,6 +11201,7 @@ UT_TEST(test_a148_stop_poll_includes_original_phase3_handoff)
 
 #include "test_cluster_normal_cold_startup.h"
 #include "test_cluster_first_open.h"
+#include "test_cluster_serving_admission.h"
 #include "test_cluster_sample_ack_handoff.h"
 
 int
@@ -11225,6 +11226,8 @@ main(void)
 	UT_RUN(test_first_open_exact_reply_is_not_open_proof);
 	UT_RUN(test_first_open_epoch_or_writer_drift_cannot_rebind);
 	UT_RUN(test_first_open_requires_both_real_admission_gates);
+	UT_RUN(test_first_start_sql_waits_for_root_serving);
+	UT_RUN(test_clean_restart_sql_waits_for_root_serving);
 	UT_RUN(test_first_open_lmon_rechecks_live_writer);
 	UT_RUN(test_first_open_request_drives_original_sample_consumer);
 	UT_RUN(test_normal_actual_finish_preserves_unconfigured_native_startup);
