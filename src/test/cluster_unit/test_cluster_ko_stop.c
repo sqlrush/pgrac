@@ -51,10 +51,13 @@ static int space_reads, send_calls, lock_calls;
 static int boot_change_phase;
 static bool cancel_wait;
 static bool drive_shared_ack;
+static bool expecting_error;
+static int reported_sqlstate;
 static ClusterKoSharedMessageV2 last_shared_request, last_shared_ack;
 static void (*exit_callback)(int, Datum);
 static ResourceReleaseCallback resource_callback;
 ResourceOwner CurrentResourceOwner = (ResourceOwner)1;
+ResourceOwner CurTransactionResourceOwner = (ResourceOwner)1;
 MemoryContext TopTransactionContext = (MemoryContext)1;
 ResourceOwner
 ResourceOwnerGetParent(ResourceOwner owner)
@@ -184,6 +187,18 @@ pg_re_throw(void)
 	siglongjmp(*PG_exception_stack, 1);
 }
 int errhint(const char *format, ...) { return 0; }
+bool errstart(int level, const char *domain) { return level >= ERROR; }
+bool errstart_cold(int level, const char *domain) { return errstart(level, domain); }
+int errmsg(const char *format, ...) { Assert(expecting_error); return 0; }
+int errcode(int sqlstate) { reported_sqlstate = sqlstate; return 0; }
+void
+errfinish(const char *file, int line, const char *function)
+{
+	if (expecting_error)
+		pg_re_throw();
+	fprintf(stderr, "unexpected error %s:%d %s\n", file, line, function);
+	abort();
+}
 ClusterExtendEngage cluster_extend_liveness_engage(bool wait_for_lms)
 {
 	Assert(!wait_for_lms);
@@ -420,6 +435,7 @@ reset_test(void)
 {
 	Assert(completion_allocations == 0);
 	CurrentResourceOwner = (ResourceOwner)1;
+	CurTransactionResourceOwner = (ResourceOwner)1;
 	TopTransactionContext = (MemoryContext)1;
 	memset(&storage, 0, sizeof(storage));
 	IsUnderPostmaster = false;
@@ -434,6 +450,8 @@ reset_test(void)
 	cluster_shared_config = false;
 	capture_ok = cap_ok = space_ok = true;
 	generation_race = cancel_wait = drive_shared_ack = false;
+	expecting_error = false;
+	reported_sqlstate = 0;
 	InterruptPending = false;
 	space_reads = send_calls = lock_calls = boot_change_phase = 0;
 	member_generation = 2;
@@ -587,6 +605,11 @@ UT_TEST(test_origin_barrier_discards_lease_even_without_remote_work)
 		UT_ASSERT_EQ(liveness_calls, 0); /* Shared uses the full member cut, not liveness. */
 		UT_ASSERT_EQ(lock_calls, shared);
 		UT_ASSERT_EQ(cluster_ko_native_count(), shared);
+		if (shared) {
+			UT_ASSERT_EQ(completion_allocations, 1);
+			resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+			UT_ASSERT_EQ(completion_allocations, 0);
+		}
 	}
 }
 UT_TEST(test_full_ring_wrap_and_retained_stale_bytes)
@@ -1299,10 +1322,241 @@ UT_TEST(test_shared_subabort_cancels_only_the_child_completion)
 	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_READY);
 }
 
+UT_TEST(test_native_shared_barrier_is_claimed_once_by_original_space_owner)
+{
+	ClusterKoCompletionV2 *completion = NULL, *second = NULL;
+	ClusterKoSharedMessageV2 original, observed;
+	const char *reason;
+	int reads, requests, sends;
+	reset_test();
+	cluster_shared_config = drive_shared_ack = true;
+	CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)3;
+	cluster_ko_flush_and_wait_ack(space_identity.key.locator, RELPERSISTENCE_PERMANENT);
+	reads = space_reads;
+	requests = barrier_requests;
+	sends = send_calls;
+	UT_ASSERT(cluster_ko_shared_claim_v2(&space_identity.key, space_identity.incarnation, &completion));
+	UT_ASSERT(cluster_ko_shared_read_v2(completion, 1, &original));
+	UT_ASSERT(!cluster_ko_shared_claim_v2(&space_identity.key, space_identity.incarnation, &second));
+	UT_ASSERT(second == NULL);
+	UT_ASSERT(!cluster_ko_shared_claim_v2(&space_identity.key, space_identity.incarnation, &completion));
+	UT_ASSERT(completion != NULL);
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true, false, NULL);
+	CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)2;
+	UT_ASSERT(cluster_ko_shared_read_v2(completion, 1, &observed));
+	UT_ASSERT(memcmp(&observed, &original, sizeof(observed)) == 0);
+	UT_ASSERT(!cluster_ko_shared_claim_v2(&space_identity.key, space_identity.incarnation, &second));
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true, false, NULL);
+	CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)1;
+	UT_ASSERT(cluster_ko_shared_covers_v2(completion, &space_identity.key, space_identity.incarnation));
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT(!cluster_ko_shared_read_v2(completion, 1, &observed));
+	cluster_ko_shared_release_v2(&completion);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(space_reads, reads);
+	UT_ASSERT_EQ(barrier_requests, requests);
+	UT_ASSERT_EQ(send_calls, sends);
+	UT_ASSERT_EQ(completion_allocations, 0);
+}
+
+UT_TEST(test_native_completion_claim_refuses_changed_identity_and_owner)
+{
+	for (int fault = 0; fault < 15; fault++) {
+		ClusterKoCompletionV2 *completion = NULL;
+		ClusterSpaceIdentityKey key;
+		uint8 incarnation[16];
+		int reads, requests;
+		reset_test();
+		cluster_shared_config = drive_shared_ack = true;
+		cluster_ko_flush_and_wait_ack(space_identity.key.locator, RELPERSISTENCE_PERMANENT);
+		reads = space_reads;
+		requests = barrier_requests;
+		key = space_identity.key;
+		memcpy(incarnation, space_identity.incarnation, sizeof(incarnation));
+		switch (fault) {
+		case 0: key.system_identifier++; break;
+		case 1: key.database_incarnation++; break;
+		case 2: key.storage_uuid[0]++; break;
+		case 3: key.locator.dbOid++; break;
+		case 4: key.locator.relNumber++; break;
+		case 5: incarnation[0]++; break;
+		case 6: CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)2; break;
+		case 7: current_epoch++; break;
+		case 8: formation.membership.last_admitted_incarnation[1]++; break;
+		case 9: writer.claim.identity.origin_owner_incarnation++; break;
+		case 10: capture_ok = false; break;
+		case 11: generation_race = true; break;
+		case 12: CritSectionCount++; break;
+		case 13: resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL); break;
+		case 14: formation.pending_join_bitmap[0] = 2; break;
+		}
+		UT_ASSERT(!cluster_ko_shared_claim_v2(&key, incarnation, &completion));
+		UT_ASSERT(completion == NULL);
+		UT_ASSERT_EQ(space_reads, reads);
+		UT_ASSERT_EQ(barrier_requests, requests);
+		CritSectionCount = 0;
+		CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)1;
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		UT_ASSERT_EQ(completion_allocations, 0);
+	}
+}
+
+UT_TEST(test_native_claim_cannot_borrow_direct_handle_and_full_capacity_refuses_before_send)
+{
+	ClusterKoCompletionV2 *direct = NULL, *claimed = NULL;
+	volatile bool caught = false;
+	reset_test();
+	cluster_shared_config = drive_shared_ack = true;
+	UT_ASSERT(cluster_ko_shared_begin_v2(space_identity.key.locator, RELPERSISTENCE_PERMANENT, &direct));
+	UT_ASSERT(!cluster_ko_shared_claim_v2(&space_identity.key, space_identity.incarnation, &claimed));
+	UT_ASSERT(claimed == NULL);
+	cluster_ko_shared_release_v2(&direct);
+	reset_test();
+	cluster_shared_config = true;
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		storage.contexts[i].used = true;
+		storage.contexts[i].pid = MyProcPid + 1;
+	}
+	expecting_error = true;
+	PG_TRY();
+	{
+		cluster_ko_flush_and_wait_ack(space_identity.key.locator, RELPERSISTENCE_PERMANENT);
+	}
+	PG_CATCH(); { caught = true; }
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(reported_sqlstate, ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE);
+	UT_ASSERT_EQ(completion_allocations, 0);
+	UT_ASSERT_EQ(send_calls + barrier_requests + flush_count, 0);
+	UT_ASSERT(!cluster_ko_shared_claim_v2(&space_identity.key, space_identity.incarnation, &claimed));
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+		UT_ASSERT(storage.contexts[i].used && storage.contexts[i].pid == MyProcPid + 1);
+}
+
+UT_TEST(test_native_claim_rejects_ambiguous_repeated_barriers)
+{
+	ClusterKoCompletionV2 *claimed = NULL;
+	int reads, requests;
+	reset_test();
+	cluster_shared_config = true;
+	formation.membership.membership_state[1] = CLUSTER_MEMBER_ABSENT;
+	for (unsigned i = 0; i < 2; i++)
+		cluster_ko_flush_and_wait_ack(space_identity.key.locator, RELPERSISTENCE_PERMANENT);
+	reads = space_reads;
+	requests = barrier_requests;
+	UT_ASSERT_EQ(completion_allocations, 2);
+	UT_ASSERT(!cluster_ko_shared_claim_v2(&space_identity.key, space_identity.incarnation, &claimed));
+	UT_ASSERT(claimed == NULL);
+	UT_ASSERT(!cluster_ko_shared_claim_v2(&space_identity.key, space_identity.incarnation, &claimed));
+	UT_ASSERT_EQ(space_reads, reads);
+	UT_ASSERT_EQ(barrier_requests, requests);
+	UT_ASSERT_EQ(completion_allocations, 2);
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT_EQ(completion_allocations, 0);
+}
+
+UT_TEST(test_native_portal_barrier_survives_precommit_without_portal_release)
+{
+	for (unsigned immediate = 0; immediate < 2; immediate++) {
+		ClusterKoCompletionV2 *completion = NULL;
+		int reads, requests, sends;
+		reset_test();
+		cluster_shared_config = drive_shared_ack = true;
+		/* PortalRun uses the portal child while the original transaction
+		 * owner remains current for transaction resources. */
+		CurrentResourceOwner = (ResourceOwner)2;
+		cluster_ko_flush_and_wait_ack(space_identity.key.locator, RELPERSISTENCE_PERMANENT);
+		reads = space_reads;
+		requests = barrier_requests;
+		sends = send_calls;
+		if (immediate)
+			UT_ASSERT(cluster_ko_shared_claim_v2(&space_identity.key,
+				space_identity.incarnation, &completion));
+		/* PreCommit_Portals -> PortalDrop(true) does NOT release a successful
+		 * portal's resources before RecordTransactionCommit prepares SPACE. */
+		CurrentResourceOwner = (ResourceOwner)1;
+		if (!immediate)
+			UT_ASSERT(cluster_ko_shared_claim_v2(&space_identity.key,
+				space_identity.incarnation, &completion));
+		UT_ASSERT(cluster_ko_shared_covers_v2(completion,
+			&space_identity.key, space_identity.incarnation));
+		/* Original recursive transaction cleanup, child before parent. */
+		CurrentResourceOwner = (ResourceOwner)2;
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true, true, NULL);
+		CurrentResourceOwner = (ResourceOwner)1;
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true, true, NULL);
+		cluster_ko_shared_release_v2(&completion);
+		UT_ASSERT_EQ(completion_allocations, 0);
+		UT_ASSERT_EQ(space_reads, reads);
+		UT_ASSERT_EQ(barrier_requests, requests);
+		UT_ASSERT_EQ(send_calls, sends);
+	}
+}
+
+UT_TEST(test_native_portal_subtransaction_keeps_exact_transaction_scope)
+{
+	for (unsigned commit = 0; commit < 2; commit++) {
+		ClusterKoCompletionV2 *parent = NULL, *child = NULL;
+		reset_test();
+		cluster_shared_config = true;
+		formation.membership.membership_state[1] = CLUSTER_MEMBER_ABSENT;
+		cluster_ko_flush_and_wait_ack(space_identity.key.locator, RELPERSISTENCE_PERMANENT);
+		CurTransactionResourceOwner = (ResourceOwner)2;
+		CurrentResourceOwner = (ResourceOwner)3;
+		UT_ASSERT(!cluster_ko_shared_claim_v2(&space_identity.key,
+			space_identity.incarnation, &child));
+		cluster_ko_flush_and_wait_ack(space_identity.key.locator, RELPERSISTENCE_PERMANENT);
+		UT_ASSERT(cluster_ko_shared_claim_v2(&space_identity.key,
+			space_identity.incarnation, &child));
+		/* Portal cleanup cannot retire the subtransaction's responsibility. */
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true, false, NULL);
+		UT_ASSERT(cluster_ko_shared_covers_v2(child,
+			&space_identity.key, space_identity.incarnation));
+		CurrentResourceOwner = (ResourceOwner)2;
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, commit, false, NULL);
+		CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)1;
+		UT_ASSERT_EQ(cluster_ko_shared_covers_v2(child,
+			&space_identity.key, space_identity.incarnation), commit);
+		UT_ASSERT(cluster_ko_shared_claim_v2(&space_identity.key,
+			space_identity.incarnation, &parent));
+		UT_ASSERT(cluster_ko_shared_covers_v2(parent,
+			&space_identity.key, space_identity.incarnation));
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		cluster_ko_shared_release_v2(&child);
+		cluster_ko_shared_release_v2(&parent);
+		UT_ASSERT_EQ(completion_allocations, 0);
+	}
+}
+
+UT_TEST(test_native_barrier_rejects_missing_or_unrelated_transaction_before_io)
+{
+	for (unsigned unrelated = 0; unrelated < 2; unrelated++) {
+		volatile bool caught = false;
+		reset_test();
+		cluster_shared_config = drive_shared_ack = true;
+		CurTransactionResourceOwner = unrelated ? (ResourceOwner)2 : NULL;
+		expecting_error = true;
+		PG_TRY();
+		{
+			cluster_ko_flush_and_wait_ack(space_identity.key.locator, RELPERSISTENCE_PERMANENT);
+		}
+		PG_CATCH(); { caught = true; }
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(reported_sqlstate, ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE);
+		UT_ASSERT_EQ(completion_allocations, 0);
+		UT_ASSERT_EQ(space_reads + barrier_requests + send_calls, 0);
+		/* Also dispose of the old implementation's incorrectly accepted
+		 * completion so every RED case can run and be classified. */
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(32);
+	UT_PLAN(39);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
@@ -1335,6 +1589,13 @@ main(void)
 	UT_RUN(test_shared_completion_raw_copy_and_slot_reuse_do_not_convey_ownership);
 	UT_RUN(test_shared_subcommit_transfers_original_completion_to_parent);
 	UT_RUN(test_shared_subabort_cancels_only_the_child_completion);
+	UT_RUN(test_native_shared_barrier_is_claimed_once_by_original_space_owner);
+	UT_RUN(test_native_completion_claim_refuses_changed_identity_and_owner);
+	UT_RUN(test_native_claim_cannot_borrow_direct_handle_and_full_capacity_refuses_before_send);
+	UT_RUN(test_native_claim_rejects_ambiguous_repeated_barriers);
+	UT_RUN(test_native_portal_barrier_survives_precommit_without_portal_release);
+	UT_RUN(test_native_portal_subtransaction_keeps_exact_transaction_scope);
+	UT_RUN(test_native_barrier_rejects_missing_or_unrelated_transaction_before_io);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

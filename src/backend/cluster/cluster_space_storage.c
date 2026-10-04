@@ -26,6 +26,7 @@
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_wal_thread.h"
@@ -715,6 +716,7 @@ cluster_space_reserve_exact(const ClusterSpaceIdentity *identity, BlockNumber fi
 
 struct ClusterSpaceTruncateState {
 	Buffer buffers[2];
+	ClusterKoCompletionV2 *ko_completion;
 	PGAlignedBlock result[2];
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	uint64 token;
@@ -774,6 +776,12 @@ space_structure_prepare(const ClusterSpaceIdentityKey *expected,
 		|| identity->expected.state != CLUSTER_SPACE_IDENTITY_LIVE
 		|| identity->expected.sequence == UINT64_MAX
 		|| (action == CLUSTER_SPACE_WAL_TRUNCATE && nblocks > reservation->before.next_block))
+		goto refused;
+	/* Take the original barrier while the exact old identity is still
+	 * locked. Its ResourceOwner retains the completion through transaction
+	 * exit; preparing a replacement page does not prove durable completion. */
+	if (!cluster_ko_shared_claim_v2(expected, identity->expected.incarnation,
+								  &state->ko_completion))
 		goto refused;
 	identity->action = action;
 	identity->nblocks = nblocks;

@@ -152,6 +152,8 @@ struct ClusterKoCompletionV2 {
 	int32 pid;
 	unsigned slot;
 	uint64 serial;
+	bool native_transaction;
+	bool native_pending;
 	struct ClusterKoCompletionV2 *next;
 };
 
@@ -564,6 +566,28 @@ ko_completion_cancel(ClusterKoCompletionV2 *completion)
 	}
 }
 
+/* Native DDL may execute in a portal but finish at transaction commit. */
+static bool
+ko_native_transaction_current(void)
+{
+	if (CurTransactionResourceOwner == NULL)
+		return false;
+	for (ResourceOwner owner = CurrentResourceOwner; owner != NULL;
+		 owner = ResourceOwnerGetParent(owner))
+		if (owner == CurTransactionResourceOwner)
+			return true;
+	return false;
+}
+
+static bool
+ko_completion_owner_current(const ClusterKoCompletionV2 *completion)
+{
+	if (completion->native_transaction)
+		return completion->owner == CurTransactionResourceOwner
+			&& ko_native_transaction_current();
+	return CurrentResourceOwner != NULL && completion->owner == CurrentResourceOwner;
+}
+
 void
 cluster_ko_shared_release_v2(ClusterKoCompletionV2 **completion)
 {
@@ -575,7 +599,7 @@ cluster_ko_shared_release_v2(ClusterKoCompletionV2 **completion)
 		*completion = NULL; /* Its ResourceOwner already disposed of it. */
 		return;
 	}
-	if ((*link)->pid != MyProcPid || (*link)->owner != CurrentResourceOwner)
+	if ((*link)->pid != MyProcPid || !ko_completion_owner_current(*link))
 		return;
 	ko_completion_cancel(*link);
 	*link = (*link)->next;
@@ -616,7 +640,7 @@ ko_completion_snapshot(const ClusterKoCompletionV2 *completion, ClusterKoSharedC
 {
 	bool valid;
 	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
-	if (owned == NULL || owned->pid != MyProcPid || owned->owner != CurrentResourceOwner
+	if (owned == NULL || owned->pid != MyProcPid || !ko_completion_owner_current(owned)
 		|| CurrentResourceOwner == NULL || CritSectionCount != 0 || ko_state == NULL
 		|| owned->slot >= CLUSTER_KO_SHARED_CAPACITY)
 		return false;
@@ -638,6 +662,32 @@ cluster_ko_shared_covers_v2(const ClusterKoCompletionV2 *completion,
 		&& memcmp(context.request.key.storage_uuid, key->storage_uuid, 16) == 0
 		&& RelFileLocatorEquals(context.request.key.locator, key->locator)
 		&& memcmp(context.request.incarnation, incarnation, 16) == 0;
+}
+
+/* Only the original native wrapper offers a completion for SPACE to take.
+ * Keep the ResourceOwner throughout; taking it does not complete the DDL or
+ * convey COMMIT/durability. Ambiguous repeated barriers are not authority. */
+bool
+cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key,
+	const uint8 incarnation[16], ClusterKoCompletionV2 **out)
+{
+	ClusterKoCompletionV2 *candidate = NULL;
+	if (out == NULL || *out != NULL || key == NULL || incarnation == NULL)
+		return false;
+	for (ClusterKoCompletionV2 *completion = ko_completions; completion != NULL;
+		 completion = completion->next) {
+		if (!completion->native_pending
+			|| !cluster_ko_shared_covers_v2(completion, key, incarnation))
+			continue;
+		if (candidate != NULL)
+			return false;
+		candidate = completion;
+	}
+	if (candidate == NULL || !cluster_ko_shared_covers_v2(candidate, key, incarnation))
+		return false;
+	candidate->native_pending = false;
+	*out = candidate;
+	return true;
 }
 
 bool
@@ -1148,6 +1198,21 @@ ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence, ClusterKoComplet
 void
 cluster_ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence)
 {
+	/* Preserve a live shared DDL's exact original barrier until its SPACE
+	 * owner takes it, or the transaction owner cancels it. Private/native
+	 * recovery calls retain their original no-op/legacy behavior. */
+	if (cluster_enabled && cluster_shared_config && relpersistence != RELPERSISTENCE_TEMP
+		&& !RecoveryInProgress() && cluster_node_id >= 0) {
+		ClusterKoCompletionV2 *completion = NULL;
+		if (!ko_native_transaction_current()
+			|| !cluster_ko_shared_begin_v2(rloc, relpersistence, &completion))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
+							errmsg("could not retain the original shared object flush owner")));
+		completion->owner = CurTransactionResourceOwner;
+		completion->native_transaction = true;
+		completion->native_pending = true;
+		return;
+	}
 	ko_flush_and_wait_ack(rloc, relpersistence, NULL);
 }
 

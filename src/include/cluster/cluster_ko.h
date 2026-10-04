@@ -208,13 +208,20 @@ extern void cluster_ko_flush_and_wait_ack(RelFileLocator rlocator, char relpersi
  * barrier can construct this handle; raw ACK bytes cannot. Release before its
  * owner ends, on every exit. These APIs certify only the KO scope, never a
  * commit, a durable structural effect, an ancestor chain or PI retirement.
- * The legacy wrapper above discards its completion as before. */
+ * Direct begin binds CurrentResourceOwner. The native shared DDL wrapper
+ * retains its completion with CurTransactionResourceOwner for SPACE. */
 typedef struct ClusterKoCompletionV2 ClusterKoCompletionV2;
 /* Successful subtransaction cleanup transfers this original handle to its
  * parent ResourceOwner. Subabort/top-level cleanup releases it; this is not
  * a persistent COMMIT or background structural-retirement certificate. */
 extern bool cluster_ko_shared_begin_v2(RelFileLocator rlocator, char relpersistence,
 	ClusterKoCompletionV2 **out);
+/* Original native DDL -> SPACE owner, before its first structural change.
+ * Takes an existing native-wrapper completion exactly once in that exact
+ * transaction (including its portal owners). No allocation, page I/O or
+ * second barrier. Refusal leaves out unchanged. */
+extern bool cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key,
+	const uint8 incarnation[16], ClusterKoCompletionV2 **out);
 extern bool cluster_ko_shared_covers_v2(const ClusterKoCompletionV2 *completion,
 	const ClusterSpaceIdentityKey *key, const uint8 incarnation[16]);
 /* Only actual remote members have a wire projection; a one-member barrier
