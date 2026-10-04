@@ -68,12 +68,14 @@ def request(layout, quorum_name, addresses, system_identifier, authority_uuid, s
         'cluster.smgr_user_relations': 'on', 'cluster.undo_tablespace_path': str(root/'undo'),
         'cluster.wal_threads_dir': layout['wal_root'], 'cluster.interconnect_tier': 'tier1',
         'cluster.lms_workers': '1', 'cluster.online_join': 'on', 'cluster.xid_striping': 'on',
+        'cluster.crossnode_runtime_visibility': 'on', 'cluster.undo_gcs_coherence': 'on',
         'cluster.cf_enqueue_timeout_ms': '1000',
         'cluster.storage_quorum_cluster': quorum_name,
         'cluster.storage_quorum_nodes': ','.join(f'{n}:{n+1}' for n in range(len(nodes))),
     }
     fixed = {name: value for name, value in common.items() if name not in (
-        'cluster.lms_workers', 'cluster.cf_enqueue_timeout_ms')}
+        'cluster.lms_workers', 'cluster.cf_enqueue_timeout_ms',
+        'cluster.crossnode_runtime_visibility', 'cluster.undo_gcs_coherence')}
     # These vary per node and are owned by the caller's allocated topology.
     fixed.update({'cluster.node_id': None, 'listen_addresses': None,
                   'port': None, 'unix_socket_directories': None})
