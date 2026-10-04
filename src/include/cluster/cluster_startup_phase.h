@@ -329,6 +329,7 @@ extern ClusterFormationWitnessResult cluster_authority_startup_refresh_recovery(
 /* Only singleton CF-S, including the pre-SERVING phase-4 handoff. */
 extern bool cluster_configuration_read_transport_is_current(const ClusterResId *resid,
 															LOCKMODE mode);
+extern bool cluster_startup_control_transport_is_current(const ClusterResId *resid, LOCKMODE mode);
 extern bool cluster_serving_ready_is_current(void);
 extern bool cluster_authority_serving_rebind_lmon(void);
 /* RF-ROOT P6 (L5 shutdown handoff): the committed LEAVER's serving rebind

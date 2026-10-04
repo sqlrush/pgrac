@@ -339,6 +339,7 @@ static bool stub_serving_ready = false;
 static bool stub_recovery_ready = false;
 static bool stub_recovery_transport_ready = false;
 static bool stub_survivor_protocol_ready = false;
+static bool stub_startup_control_ready = false;
 
 static uint64 stub_replacement_capability_sample_count = 0;
 static uint32 stub_replacement_required_capabilities = 0;
@@ -395,6 +396,15 @@ bool
 cluster_recovery_transport_is_current(void)
 {
 	return stub_recovery_transport_ready || stub_recovery_ready || stub_survivor_protocol_ready;
+}
+
+bool
+cluster_startup_control_transport_is_current(const ClusterResId *resid, LOCKMODE mode)
+{
+	/* The phase test exercises the real binding; this boundary separates the
+	 * master's phase-4 transport from its phase-3 requester permission. */
+	return cluster_shared_config && (stub_recovery_ready || stub_startup_control_ready)
+		   && cluster_recovery_authority_resid_mode_allowed(resid, mode);
 }
 
 ClusterAuthorityReadiness
@@ -1752,6 +1762,56 @@ UT_TEST(test_ges_recovery_master_rechecks_before_mutation)
 	stub_recovery_ready = false;
 }
 
+UT_TEST(test_phase4_master_completes_exact_startup_walr_request)
+{
+	GesRequestPayload req = { 0 };
+	ClusterResId resid = { .type = CLUSTER_WAL_RETENTION_RESID_TYPE,
+						   .field1 = 4,
+						   .lockmethodid = DEFAULT_LOCKMETHOD };
+	cluster_shared_config = true;
+	stub_authority_managed = stub_startup_control_ready = true;
+	stub_recovery_ready = stub_serving_ready = false;
+	req.opcode = GES_REQ_OPCODE_REQUEST_NOWAIT;
+	req.lockmode = ShareLock;
+	req.holder_node_id = 3;
+	req.holder_procno = 129;
+	req.holder_request_id_lo = 51;
+	req.holder_cluster_epoch_lo = (uint32)stub_current_epoch;
+	req.holder_cluster_epoch_hi = (uint32)(stub_current_epoch >> 32);
+	req.shard_master_generation_lo = (uint32)stub_master_generation;
+	req.shard_master_generation_hi = (uint32)(stub_master_generation >> 32);
+	memcpy(req.resid, &resid, sizeof(resid));
+	memset(&stub_work_queue_dequeue_item, 0, sizeof(stub_work_queue_dequeue_item));
+	stub_work_queue_dequeue_item.routing_generation = stub_master_generation;
+	stub_work_queue_dequeue_item.source_node_id = 3;
+	stub_work_queue_dequeue_item.payload_len = sizeof(req);
+	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));
+	for (int pass = 0; pass < 3; pass++) {
+		uint64 replies = stub_lmon_reply_enqueue_count;
+		stub_work_queue_dequeue_pending = true;
+		if (pass == 1)
+			stub_work_queue_dequeue_item.routing_generation++;
+		if (pass == 2) {
+			stub_work_queue_dequeue_item.routing_generation = stub_master_generation;
+			stub_startup_control_ready = false;
+		}
+		UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+		UT_ASSERT_EQ(stub_lmon_reply_enqueue_count, replies + 1);
+		UT_ASSERT_EQ(stub_lmon_reply_last.holder_request_id_lo, 51);
+		UT_ASSERT_EQ(stub_lmon_reply_last.holder_node_id, 3);
+		UT_ASSERT_EQ(stub_lmon_reply_last.holder_procno, 129);
+		UT_ASSERT_EQ(stub_lmon_reply_last.reply_for_opcode, GES_REQ_OPCODE_REQUEST_NOWAIT);
+		UT_ASSERT_EQ(stub_lmon_reply_last.opcode,
+					 pass == 0 ? GES_REPLY_OPCODE_GRANT : GES_REPLY_OPCODE_REJECT);
+		UT_ASSERT_EQ(stub_lmon_reply_last.reject_reason, pass == 0 ? GES_REJECT_REASON_NONE
+														 : pass == 1
+															 ? GES_REJECT_REASON_EPOCH_MISMATCH
+															 : GES_REJECT_REASON_WORK_QUEUE_FULL);
+	}
+	stub_authority_managed = stub_startup_control_ready = false;
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_startup_cf_local_release_and_cancel_handoff)
 {
 	ClusterResId cf = { 0 };
@@ -1798,7 +1858,14 @@ UT_TEST(test_startup_cf_local_release_and_cancel_handoff)
 				 CLUSTER_CONTROL_RETIRED);
 	UT_ASSERT(stub_retire_drain_budget > 0);
 	UT_ASSERT_EQ(stub_lmon_reply_last.holder_request_id_lo, 312);
+	/* Master phase 4 still hands the original CF queue to the slow peer. */
 	stub_recovery_ready = false;
+	stub_startup_control_ready = true;
+	UT_ASSERT_EQ(cluster_ges_control_retire_at_master(&message, &stub_retire_cut),
+				 CLUSTER_CONTROL_RETIRED);
+	UT_ASSERT(stub_retire_drain_budget > 0);
+	UT_ASSERT_EQ(stub_lmon_reply_last.holder_request_id_lo, 312);
+	stub_startup_control_ready = false;
 	stub_recovery_transport_ready = true;
 	UT_ASSERT_EQ(cluster_ges_control_retire_at_master(&message, &stub_retire_cut),
 				 CLUSTER_CONTROL_RETIRED);
@@ -3242,7 +3309,7 @@ UT_TEST(test_startup_shutdown_at_actual_ges_wait_boundaries)
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(51);
+	UT_PLAN(52);
 	UT_RUN(test_block0_protected_failure_detail_is_not_elapsed_timeout);
 
 	UT_RUN(test_ges_request_handler_linkable);
@@ -3257,6 +3324,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_recovery_ingress_exact_allowlist);
 	UT_RUN(test_pre2_startup_cf_x_protocol_owner);
 	UT_RUN(test_startup_cf_local_release_and_cancel_handoff);
+	UT_RUN(test_phase4_master_completes_exact_startup_walr_request);
 	UT_RUN(test_ges_recovery_master_rechecks_before_mutation);
 	UT_RUN(test_ges_starting_redeclare_uses_preseal_transport_only);
 	UT_RUN(test_pre2_survivor_redeclare_send_does_not_open_requests);
