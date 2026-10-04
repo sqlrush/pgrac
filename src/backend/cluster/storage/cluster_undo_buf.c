@@ -55,6 +55,7 @@
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_buf.h"
 #include "miscadmin.h"
+#include "storage/fd.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/errcodes.h"
@@ -450,9 +451,11 @@ flush_dirty_slot(int slotno)
 	 * (cluster_undo_buf_pin rejects block_no < FIRST_DATA_BLOCK), so it never
 	 * reaches this flush path -- its durability is a SEPARATE contract:  the TT
 	 * slot WAL (XLOG_UNDO_TT_SLOT_* / the folded commit-record delta) is emitted
-	 * before the slot's byte-targeted write, which is itself NOT fsync'd;  block
-	 * 0 becomes durable only via WAL redo re-stamp (cluster_tt_durable.c).  This
-	 * Assert pins that the pool only ever flushes data blocks.
+	 * before the slot's byte-targeted write, which is itself NOT fsync'd;  the
+	 * checkpoint fsyncs those writes (undo_buf_sync_headers, called from
+	 * cluster_undo_buf_flush_all) and redo re-stamps the newer ones
+	 * (cluster_tt_durable.c).  This Assert pins that the pool only ever flushes
+	 * data blocks.
 	 */
 	Assert(s->block_no >= CLUSTER_UNDO_BUF_FIRST_DATA_BLOCK);
 
@@ -925,9 +928,43 @@ cluster_undo_buf_unlock_ref(int slot)
 }
 
 
+/*
+ * Segment header (block zero) bytes are written outside this pool and without
+ * an fsync.  A checkpoint must make every such write that precedes its redo
+ * pointer durable, because redo no longer restores it once the checkpoint
+ * completes.  Runs after the checkpoint's DELAY_CHKPT_START wait.
+ */
+static void
+undo_buf_sync_headers(void)
+{
+	for (uint32 slotno = 0; slotno < CLUSTER_UNDO_BLOCK0_SLOT_COUNT; slotno++) {
+		uint32 segment_id = 0;
+		uint8 owner_instance = 0;
+		uint32 intents;
+
+		intents = cluster_undo_block0_take_unsynced_headers(slotno, &segment_id, &owner_instance);
+		for (uint32 intent = 0; intents != 0 && intent < 32; intent++) {
+			if ((intents & (UINT32_C(1) << intent)) == 0
+				|| cluster_undo_smgr_fsync_header((ClusterUndoPathIntent)intent, segment_id,
+												  owner_instance))
+				continue;
+			cluster_undo_block0_return_unsynced_headers(slotno, intents);
+			ereport(
+				data_sync_elevel(ERROR),
+				(errcode_for_file_access(),
+				 errmsg("could not fsync undo segment %u header for checkpoint: %m", segment_id),
+				 errhint("The checkpoint cannot complete until the undo segment file is "
+						 "durable.")));
+		}
+	}
+}
+
 void
 cluster_undo_buf_flush_all(bool is_checkpoint)
 {
+	if (is_checkpoint)
+		undo_buf_sync_headers();
+
 	if (UndoBufPool == NULL)
 		return;
 

@@ -37,6 +37,7 @@
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "miscadmin.h"
+#include "storage/proc.h"
 #include "utils/elog.h"
 #include "utils/timestamp.h"
 
@@ -931,15 +932,15 @@ static const UBA InvalidUbaVal = InvalidUba_init;
  * §2.2).  NOT fsync'd (C10): durability comes from the WAL flush of whichever
  * record carries the delta; a crash before that flush leaves neither durable.
  *
- * spec-4.8ab D3 durability-ordering contract:  the TT slot WAL is emitted
- * BEFORE this byte-targeted write (cluster_tt_slot_durable_commit emits the 0x30
- * first; the fold path inserts the commit-record delta first), and this write is
- * NOT fsync'd.  So the commit_scn evidence is durable only via that WAL flush +
- * redo re-stamp -- the on-disk block-0 bytes are never authoritative ahead of
- * their WAL.  TT slots live in undo block 0, which is NOT poolable, so the
- * checkpoint-writeback boundary (spec-4.8ab D1, cluster_undo_buf.c) does not
- * cover them:  data blocks are flushed WAL-before-data by the pool, block 0 is
- * WAL-redo-only here.  The two durability domains are disjoint by design.
+ * spec-4.8ab D3 durability-ordering contract:  the TT slot WAL is flushed
+ * BEFORE this byte-targeted write (cluster_tt_slot_durable_commit flushes the
+ * 0x30; the normal commit writes through cluster_tt_slot_durable_commit_apply
+ * after its commit record is flushed), so the on-disk block-0 bytes are never
+ * ahead of their WAL.  The write is NOT fsync'd: redo re-stamps it until a
+ * checkpoint passes the record, and that checkpoint fsyncs it
+ * (cluster_undo_buf_flush_all).  TT slots live in undo block 0, which is NOT
+ * poolable, so the pool's checkpoint-writeback boundary (spec-4.8ab D1,
+ * cluster_undo_buf.c) covers only data blocks.
  *
  * spec-4.8 D7-A (P1#1): clearing first_undo_block here (and in durable_abort +
  * both redo APPLY paths) keeps the D7 physical-rollback invariant -- an ABORTED
@@ -990,6 +991,7 @@ cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset, Transactio
 							   uint16 wrap, SCN commit_scn)
 {
 	uint8 owner = tt_owner_instance_for_segment(segment_id);
+	XLogRecPtr commit_lsn;
 
 	Assert(slot_offset < TT_SLOTS_PER_SEGMENT);
 	Assert(TransactionIdIsValid(xid));
@@ -998,25 +1000,77 @@ cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset, Transactio
 	/*
 	 * spec-3.11 C1: standalone XLOG_UNDO_TT_SLOT_COMMIT (0x30) BEFORE the
 	 * commit record (caller is the 2PC COMMIT PREPARED durable hook).  The
-	 * commit record's XLogFlush / group commit makes it durable; the data-file
-	 * write below is NOT fsync'd (C10) -- a crash before the commit record
-	 * means neither is durable; after, redo replays this WAL.
+	 * data-file write below is NOT fsync'd (C10): the 0x30 is flushed first,
+	 * redo replays it, and the next checkpoint fsyncs the write.
 	 *
 	 * spec-3.18 D4.1: only the 2PC path still emits 0x30; normal commits fold
-	 * the equivalent delta into the commit record via
-	 * cluster_tt_slot_durable_commit_writeonly() (no 0x30).  Leaving 2PC on the
-	 * standalone record keeps PREPARE/COMMIT PREPARED untouched (user boundary).
+	 * the equivalent delta into the commit record (no 0x30; see
+	 * cluster_tt_slot_durable_commit_stage).  Leaving 2PC on the standalone
+	 * record keeps PREPARE/COMMIT PREPARED untouched (user boundary).
+	 *
+	 * A checkpoint whose redo pointer passes the 0x30 must find this write
+	 * recorded for its fsync, so checkpoints are delayed from the insert until
+	 * the write is recorded.
 	 */
-	(void)cluster_undo_emit_tt_slot_commit(owner, segment_id, slot_offset, wrap, xid, commit_scn);
-
-	tt_slot_write_committed(segment_id, owner, slot_offset, xid, wrap, commit_scn, NULL);
+	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	PG_TRY();
+	{
+		commit_lsn = cluster_undo_emit_tt_slot_commit(owner, segment_id, slot_offset, wrap, xid,
+													  commit_scn);
+		XLogFlush(commit_lsn);
+		tt_slot_write_committed(segment_id, owner, slot_offset, xid, wrap, commit_scn, NULL);
+	}
+	PG_FINALLY();
+	{
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+	}
+	PG_END_TRY();
 }
 
+/*
+ * A normal commit's TT stamp between its precommit proof and its commit
+ * record flush (F-D-29).  The proof runs under block-zero current authority
+ * against the exact canonical ACTIVE predecessor; the stamp itself reaches
+ * neither the undo file nor the resident copy until
+ * cluster_tt_slot_durable_commit_apply(), so no writer of block zero can make
+ * it durable ahead of the commit record.  The reservation keeps the resident
+ * frame from being evicted; only this transaction may change its own slot.
+ */
+typedef struct TTCommitStage {
+	bool armed;
+	uint8 owner;
+	uint16 slot_offset;
+	uint32 segment_id;
+	ClusterUndoBlock0Generation generation;
+	ClusterUndoPathIntent intent;
+	int fd;
+	TTSlot predecessor;
+	TTSlot successor;
+	ClusterUndoBlock0Pin pin;
+} TTCommitStage;
+
+static TTCommitStage tt_commit_stage = { .fd = -1, .pin = { .slot = -1 } };
+
+static void
+tt_commit_stage_clear(TTCommitStage *stage)
+{
+	cluster_undo_smgr_header_writer_close(stage->fd);
+	memset(stage, 0, sizeof(*stage));
+	stage->fd = -1;
+	stage->pin.slot = -1;
+}
+
+/*
+ * stage == NULL applies (apply_transition) or only verifies the transition
+ * under the current authority.  stage != NULL verifies a COMMITTED transition
+ * and keeps it staged without writing; see TTCommitStage.
+ */
 static uint8
 tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uint16 slot_offset,
 							   TransactionId xid, uint16 wrap, uint8 terminal_status,
 							   SCN terminal_scn, bool apply_transition,
-							   const ClusterSemanticAdmissionToken *admission,
+							   const ClusterSemanticAdmissionToken *admission, TTCommitStage *stage,
 							   TTSlot *successor_out)
 {
 	uint8 owner = tt_owner_instance_for_segment(segment_id);
@@ -1026,7 +1080,8 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 	ClusterUndoBlock0ResolvedRoot final_root;
 	ClusterUndoBlock0Generation generation = { false, 0 };
 	ClusterUndoBlock0CurrentGuard guard = { 0 };
-	ClusterUndoBlock0Pin pin;
+	ClusterUndoBlock0Pin local_pin;
+	ClusterUndoBlock0Pin *pin = stage != NULL ? &stage->pin : &local_pin;
 	ClusterUndoBlock0CurrentStep step;
 	ClusterUndoBlock0Result result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	ClusterUndoBlock0Result current_failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
@@ -1048,6 +1103,8 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 	if (admission == NULL || successor_out == NULL || !admission->entered
 		|| segment_generation == UINT32_MAX
 		|| (terminal_status != TT_SLOT_COMMITTED && terminal_status != TT_SLOT_ABORTED)
+		|| (stage != NULL
+			&& (stage->armed || apply_transition || terminal_status != TT_SLOT_COMMITTED))
 		|| (admission->side != CLUSTER_SEMANTIC_SOURCE_SIDE
 			&& admission->side != CLUSTER_SEMANTIC_TARGET_SIDE)
 		|| cluster_node_id < 0 || owner != (uint8)(cluster_node_id + 1))
@@ -1066,8 +1123,8 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 	expected_owner.commit_scn = InvalidScn;
 	memset(&root, 0, sizeof(root));
 	memset(&final_root, 0, sizeof(final_root));
-	memset(&pin, 0, sizeof(pin));
-	pin.slot = -1;
+	memset(pin, 0, sizeof(*pin));
+	pin->slot = -1;
 	target_side = admission->side == CLUSTER_SEMANTIC_TARGET_SIDE;
 	root_available
 		= target_side ? cluster_semantic_activation_resolve_shared_undo_root(
@@ -1100,14 +1157,13 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 	current_active = true;
 
 	/*
-	 * spec-3.18 D4.1 (normal commit): write the 32B slot WITHOUT emitting a
-	 * standalone 0x30.  The caller (cluster_tt_local_precommit_durable_finish)
-	 * folds an equivalent xl_xact_tt_commit delta into the commit record, whose
-	 * flush makes both the delta and CLOG durable atomically (one record, no
-	 * intermediate stamped-but-uncommitted window).  Redo re-stamps via
-	 * cluster_tt_durable_redo_stamp_slot() from xact_redo_commit instead of the
-	 * 0x30 redo.  Returns the owner instance so the caller can fill the delta's
-	 * path-resolution field.
+	 * spec-3.18 D4.1 (normal commit): no standalone 0x30.  The caller
+	 * (cluster_tt_local_precommit_durable_finish) folds an equivalent
+	 * xl_xact_tt_commit delta into the commit record and redo re-stamps via
+	 * cluster_tt_durable_redo_stamp_slot() from xact_redo_commit.  The commit
+	 * path only stages here; the 32B slot is written after the commit record
+	 * is flushed (cluster_tt_slot_durable_commit_apply).  Returns the owner
+	 * instance so the caller can fill the delta's path-resolution field.
 	 */
 	PG_TRY();
 	{
@@ -1135,7 +1191,7 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 			|| generation.value != segment_generation)
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
 							errmsg("cannot commit a transaction: canonical generation changed")));
-		result = cluster_undo_block0_current_pin_exclusive(&guard, &root, &generation, &pin,
+		result = cluster_undo_block0_current_pin_exclusive(&guard, &root, &generation, pin,
 														   (char **)&resident_header);
 		if (result != CLUSTER_UNDO_BLOCK0_OK || resident_header == NULL)
 			ereport(
@@ -1221,14 +1277,36 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
 							errmsg("canonical TT commit authority drifted after transition")));
 
+		if (stage != NULL) {
+			stage->fd = cluster_undo_smgr_header_writer_open(root.intent, segment_id, owner);
+			if (stage->fd < 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("cannot open canonical TT block zero of undo segment %u for commit",
+								segment_id),
+						 errhint("The transaction was refused before its commit record; retry "
+								 "is safe.")));
+			cluster_undo_block0_pin_downgrade(pin);
+			pin_held = false;
+			stage->owner = owner;
+			stage->slot_offset = slot_offset;
+			stage->segment_id = segment_id;
+			stage->generation = generation;
+			stage->intent = root.intent;
+			stage->predecessor = disk_header->tt_slots[slot_offset];
+			stage->successor = successor;
+			stage->armed = true;
+		}
 		*successor_out = successor;
 	}
 	PG_FINALLY();
 	{
 		if (pin_held) {
-			cluster_undo_block0_unpin(&pin);
+			cluster_undo_block0_unpin(pin);
 			pin_held = false;
 		}
+		if (stage != NULL && !stage->armed)
+			tt_commit_stage_clear(stage);
 		if (current_active) {
 			/* This is the existing no-wait owned-resource release path.  In
 			 * particular, after successor publication it stages reliable remote
@@ -1243,19 +1321,87 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 }
 
 uint8
-cluster_tt_slot_durable_commit_writeonly(uint32 segment_id, uint32 segment_generation,
-										 uint16 slot_offset, TransactionId xid, uint16 wrap,
-										 SCN commit_scn,
-										 const ClusterSemanticAdmissionToken *admission,
-										 TTSlot *successor_out)
+cluster_tt_slot_durable_commit_stage(uint32 segment_id, uint32 segment_generation,
+									 uint16 slot_offset, TransactionId xid, uint16 wrap,
+									 SCN commit_scn, const ClusterSemanticAdmissionToken *admission,
+									 TTSlot *successor_out)
 {
-	uint8 owner;
+	if (tt_commit_stage.armed)
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("a canonical TT commit stamp is already staged")));
+	return tt_slot_durable_terminal_exact(segment_id, segment_generation, slot_offset, xid, wrap,
+										  TT_SLOT_COMMITTED, commit_scn, false, admission,
+										  &tt_commit_stage, successor_out);
+}
 
-	owner = tt_slot_durable_terminal_exact(segment_id, segment_generation, slot_offset, xid, wrap,
-										   TT_SLOT_COMMITTED, commit_scn, true, admission,
-										   successor_out);
+bool
+cluster_tt_slot_durable_commit_staged(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+									  uint16 wrap)
+{
+	const TTCommitStage *stage = &tt_commit_stage;
+
+	return stage->armed && stage->segment_id == segment_id && stage->slot_offset == slot_offset
+		   && stage->successor.xid == xid && stage->successor.wrap == wrap;
+}
+
+/*
+ * Write the staged stamp once its commit record is durable.  The caller is in
+ * the commit critical section, after its own XLogFlush, before pg_xact is
+ * updated and while it still delays checkpoints: no checkpoint can complete
+ * with a redo pointer past the commit record before this write is recorded
+ * for that checkpoint's fsync.  Every failure is a PANIC; the commit record is
+ * durable and redo restamps the slot.
+ */
+void
+cluster_tt_slot_durable_commit_apply(XLogRecPtr commit_end)
+{
+	TTCommitStage *stage = &tt_commit_stage;
+	UndoSegmentHeaderData *resident;
+	char *page = NULL;
+
+	if (!stage->armed)
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("no canonical TT commit stamp is staged for this commit record")));
+	if (XLogRecPtrIsInvalid(commit_end) || GetFlushRecPtr(NULL) < commit_end)
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("canonical TT commit stamp would precede its commit record"),
+						errdetail("commit_end=%X/%X", LSN_FORMAT_ARGS(commit_end))));
+	if (cluster_undo_block0_lock_content(&stage->pin, &stage->generation,
+										 CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &page)
+			!= CLUSTER_UNDO_BLOCK0_OK
+		|| page == NULL)
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("staged canonical TT block zero of undo segment %u is gone",
+							   stage->segment_id)));
+	resident = (UndoSegmentHeaderData *)page;
+	if (resident->wrap_count != stage->generation.value
+		|| memcmp(&resident->tt_slots[stage->slot_offset], &stage->predecessor, sizeof(TTSlot))
+			   != 0)
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("staged canonical TT predecessor of undo segment %u slot %u "
+							   "changed before its commit stamp",
+							   stage->segment_id, stage->slot_offset)));
+	if (!cluster_undo_smgr_header_writer_write(stage->fd, stage->intent, stage->segment_id,
+											   stage->owner,
+											   tt_slot_file_offset(stage->slot_offset),
+											   (const char *)&stage->successor, sizeof(TTSlot)))
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not write canonical TT commit stamp of undo segment %u: %m",
+							   stage->segment_id)));
+	memcpy(&resident->tt_slots[stage->slot_offset], &stage->successor, sizeof(TTSlot));
+	cluster_undo_block0_unpin(&stage->pin);
+	tt_commit_stage_clear(stage);
 	cluster_tt_durable_count_commit();
-	return owner;
+}
+
+/* The commit failed before its record: nothing was written, so just let go. */
+void
+cluster_tt_slot_durable_commit_unstage(void)
+{
+	if (!tt_commit_stage.armed)
+		return;
+	cluster_undo_block0_release_reservation(&tt_commit_stage.pin);
+	tt_commit_stage_clear(&tt_commit_stage);
 }
 
 XLogRecPtr
@@ -1269,13 +1415,13 @@ cluster_tt_slot_durable_abort_exact(uint32 segment_id, uint32 segment_generation
 	uint8 owner;
 
 	owner = tt_slot_durable_terminal_exact(segment_id, segment_generation, slot_offset, xid, wrap,
-										   TT_SLOT_ABORTED, InvalidScn, false, admission,
+										   TT_SLOT_ABORTED, InvalidScn, false, admission, NULL,
 										   &prepared_successor);
 	abort_lsn = cluster_undo_emit_tt_slot_abort_exact(owner, segment_id, segment_generation,
 													  slot_offset, wrap, xid);
 	XLogFlush(abort_lsn);
 	(void)tt_slot_durable_terminal_exact(segment_id, segment_generation, slot_offset, xid, wrap,
-										 TT_SLOT_ABORTED, InvalidScn, true, admission,
+										 TT_SLOT_ABORTED, InvalidScn, true, admission, NULL,
 										 successor_out);
 	return abort_lsn;
 }

@@ -235,6 +235,14 @@ extern void cluster_undo_block0_mark_wal_dirty(ClusterUndoBlock0Pin *pin, XLogRe
 extern void cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char *successor_page,
 										   XLogRecPtr required_wal_lsn, bool fsync_parent);
 extern void cluster_undo_block0_unpin(ClusterUndoBlock0Pin *pin);
+extern void cluster_undo_block0_pin_downgrade(ClusterUndoBlock0Pin *pin);
+extern void cluster_undo_block0_release_reservation(ClusterUndoBlock0Pin *pin);
+/* Checkpoint coverage of header bytes written without an fsync. */
+extern bool cluster_undo_block0_note_unsynced_header(uint32 segment_id, uint8 owner_instance,
+													 ClusterUndoPathIntent intent);
+extern uint32 cluster_undo_block0_take_unsynced_headers(uint32 slotno, uint32 *segment_id,
+														uint8 *owner_instance);
+extern void cluster_undo_block0_return_unsynced_headers(uint32 slotno, uint32 intents);
 extern ClusterR4PrerequisiteSnapshot cluster_undo_block0_r4_prerequisite_snapshot(void);
 extern bool cluster_undo_block0_r4_publish_ready(const ClusterR4PrerequisiteSnapshot *expected);
 

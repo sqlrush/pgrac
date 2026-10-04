@@ -50,6 +50,7 @@
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/storage/cluster_undo_alloc.h"
+#include "cluster/storage/cluster_undo_block0.h"
 
 
 /*
@@ -78,6 +79,8 @@ static bool cached_fd_exit_registered = false;
 static uint64 provision_temp_counter = 0;
 
 static bool provision_fsync_parent(const char *final_path);
+static bool header_write_recorded(int fd, ClusterUndoPathIntent intent, uint32 segment_id,
+								  uint8 owner_instance);
 
 #define PGRD_MIRROR_NAME "pgrac_undo_root.control"
 #define PGRD_MIRROR_TEMP_MARKER ".pgrac-rdtmp."
@@ -464,7 +467,10 @@ cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment_id, u
  *   pwrite to disjoint ranges is safe; lifecycle writes the header prefix at
  *   offset 32-111, also disjoint from the slot array).  The write does NOT
  *   fsync: the durable TT commit is WAL-protected (XLOG_UNDO_TT_SLOT_COMMIT),
- *   so a torn data-file write is recovered by redo (spec-3.11 C10).  offset+len
+ *   so a torn data-file write is recovered by redo (spec-3.11 C10).  That
+ *   holds only until a checkpoint moves the redo pointer past the record, so
+ *   each write is recorded for the checkpoint's fsync; without the shared
+ *   record (no block-zero region) the write is fsynced here.  offset+len
  *   must stay inside block 0 (BLCKSZ).
  */
 bool
@@ -503,8 +509,59 @@ cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent, uint32 segmen
 
 	nwritten = pg_pwrite(fd, buf, len, (off_t)offset);
 	cluster_undo_record_note_smgr_pwrite();
-	/* No fsync: WAL-protected (spec-3.11 C10). */
-	return (nwritten == (ssize_t)len);
+	if (nwritten != (ssize_t)len)
+		return false;
+	return header_write_recorded(fd, intent, segment_id, owner_instance);
+}
+
+/* Leave a written header range to the checkpoint's fsync, or fsync it now. */
+static bool
+header_write_recorded(int fd, ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance)
+{
+	if (cluster_undo_block0_note_unsynced_header(segment_id, owner_instance, intent))
+		return true;
+	return pg_fsync(fd) == 0;
+}
+
+int
+cluster_undo_smgr_header_writer_open(ClusterUndoPathIntent intent, uint32 segment_id,
+									 uint8 owner_instance)
+{
+	int fd = get_segment_fd(intent, segment_id, owner_instance);
+
+	return fd < 0 ? -1 : dup(fd);
+}
+
+bool
+cluster_undo_smgr_header_writer_write(int fd, ClusterUndoPathIntent intent, uint32 segment_id,
+									  uint8 owner_instance, uint32 offset, const char *buf,
+									  uint32 len)
+{
+	ssize_t nwritten;
+
+	if (fd < 0 || buf == NULL || len == 0 || (uint64)offset + (uint64)len > (uint64)BLCKSZ)
+		return false;
+	nwritten = pg_pwrite(fd, buf, len, (off_t)offset);
+	cluster_undo_record_note_smgr_pwrite();
+	if (nwritten != (ssize_t)len)
+		return false;
+	return header_write_recorded(fd, intent, segment_id, owner_instance);
+}
+
+void
+cluster_undo_smgr_header_writer_close(int fd)
+{
+	if (fd >= 0)
+		(void)close(fd);
+}
+
+bool
+cluster_undo_smgr_fsync_header(ClusterUndoPathIntent intent, uint32 segment_id,
+							   uint8 owner_instance)
+{
+	int fd = get_segment_fd(intent, segment_id, owner_instance);
+
+	return fd >= 0 && pg_fsync(fd) == 0;
 }
 
 

@@ -96,10 +96,11 @@ extern void cluster_tt_local_record_commit(TransactionId xid, SCN commit_scn);
 
 /*
  * cluster_tt_local_precommit_durable_finish (spec-3.11 D4 / spec-3.18 D4.1) --
- * durably stamp commit_scn on this xact's TT slot (undo segment header) BEFORE
- * the commit record (xact.c pre-commit hook; spec-3.11 C1).  D4.1: writes the
- * slot WITHOUT a standalone 0x30; on success fills *out_fold with the delta to
- * fold into the commit record and returns true.  Returns false (out_fold
+ * stage the commit_scn stamp on this xact's TT slot (undo segment header)
+ * BEFORE the commit record (xact.c pre-commit hook; spec-3.11 C1).  D4.1: no
+ * standalone 0x30; on success fills *out_fold with the delta to fold into the
+ * commit record and returns true, and the caller must then flush that record
+ * and call cluster_tt_local_commit_durable_apply().  Returns false (out_fold
  * untouched) when the xact has no TT binding -> caller leaves
  * XACT_XINFO_HAS_TT_COMMIT clear.  Distinct from cluster_tt_local_record_commit
  * (post-commit overlay install) -- this is the durable-write half (record_commit
@@ -107,6 +108,8 @@ extern void cluster_tt_local_record_commit(TransactionId xid, SCN commit_scn);
  */
 extern bool cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 													  struct xl_xact_tt_commit *out_fold);
+/* Critical-section safe: write the staged stamp after the commit record flush. */
+extern void cluster_tt_local_commit_durable_apply(XLogRecPtr commit_end);
 extern bool cluster_tt_local_preabort_durable_finish(TransactionId xid);
 
 /*
