@@ -128,6 +128,25 @@ cluster_bufmgr_discard_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
 
 typedef struct ClusterPiPhysicalAckV1 ClusterPiPhysicalAckV1;
 
+typedef struct ClusterPageStructuralReceiptV2 ClusterPageStructuralReceiptV2;
+struct ClusterPiWritebackFactV2;
+/* Original master only: join an already handed-off native KO result to this
+ * exact MAIN/VM target and its whole old-incarnation PAGE chain in a sealed
+ * fabric. The caller retains that immutable plan until receipt release.
+ * No buffer/storage I/O or PI retirement occurs; actual consumption still
+ * requires the original input pins, physical acknowledgements and exact CAS. */
+extern bool cluster_page_structural_from_ko_v2(uint32 slot, uint64 serial,
+	const RfPageIdentityV1 *page, const struct ClusterThreadRecoveryFabricPlanV1 *plan,
+	ClusterPageStructuralReceiptV2 **out);
+/* Process/ResourceOwner-local. Each read rechecks the original shared owner
+ * and master cut. Exactly one output cut is populated; refusal preserves
+ * both. Export is only for a real original peer, never raw flags as proof. */
+extern bool cluster_page_structural_pi_proof_v2(const ClusterPageStructuralReceiptV2 *receipt,
+	ClusterPcmPiWriteCutV1 *write_cut, ClusterPcmPiStorageCutV1 *storage_cut);
+extern bool cluster_page_structural_pi_fact_v2(const ClusterPageStructuralReceiptV2 *receipt,
+	int32 peer, struct ClusterPiWritebackFactV2 *out);
+extern void cluster_page_structural_receipt_free_v2(ClusterPageStructuralReceiptV2 **receipt);
+
 /* Local departed-writer responsibility. Binding identity and revision fence
  * an exact snapshot across DATA/physical I/O; neither counter orders pages.
  * Empty is a qualified directory observation, not proof of a retired boot. */

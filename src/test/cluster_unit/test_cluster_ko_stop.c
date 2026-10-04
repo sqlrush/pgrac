@@ -1895,6 +1895,22 @@ UT_TEST(test_structure_handoff_consumes_original_handle_without_new_work)
 	UT_ASSERT(strcmp(reason, "KO_SHARED_STRUCTURE_OWNED") == 0);
 	MyProcPid = pid + 1;
 	MyBackendType = B_BG_WRITER;
+	{
+		ClusterPageWalBindingV1 observed, unchanged;
+		uint8 bytes[sizeof(wal)], saved[sizeof(wal)];
+		UT_ASSERT(cluster_ko_shared_structure_observation_v2(slot, original_serial,
+			&observed, bytes, sizeof(bytes)));
+		UT_ASSERT(memcmp(&observed, &binding, sizeof(binding)) == 0);
+		UT_ASSERT(memcmp(bytes, wal, sizeof(wal)) == 0);
+		unchanged = observed;
+		memcpy(saved, bytes, sizeof(saved));
+		UT_ASSERT(!cluster_ko_shared_structure_observation_v2(slot, original_serial + 1,
+			&observed, bytes, sizeof(bytes)));
+		UT_ASSERT(!cluster_ko_shared_structure_observation_v2(slot, original_serial,
+			&observed, bytes, sizeof(bytes) - 1));
+		UT_ASSERT(memcmp(&observed, &unchanged, sizeof(observed)) == 0);
+		UT_ASSERT(memcmp(bytes, saved, sizeof(bytes)) == 0);
+	}
 	UT_ASSERT(cluster_ko_shared_structure_offer_next_v2(&cursor, 1, &serial, &actual));
 	UT_ASSERT_EQ(cursor, slot + 1);
 	UT_ASSERT_EQ(serial, original_serial);
@@ -2032,6 +2048,14 @@ UT_TEST(test_structure_one_member_keeps_local_owner_without_fake_peer)
 	xact_callback(XACT_EVENT_COMMIT, NULL);
 	UT_ASSERT(cluster_ko_shared_structure_handoff_v2(&completion));
 	MyBackendType = B_BG_WRITER;
+	{
+		ClusterPageWalBindingV1 observed;
+		uint8 copied[sizeof(wal)];
+		UT_ASSERT(cluster_ko_shared_structure_observation_v2(0, storage.contexts[0].serial,
+			&observed, copied, sizeof(copied)));
+		UT_ASSERT(memcmp(&observed, &binding, sizeof(binding)) == 0);
+		UT_ASSERT(memcmp(copied, wal, sizeof(wal)) == 0);
+	}
 	UT_ASSERT(!cluster_ko_shared_structure_offer_next_v2(&cursor, 0, &serial, &value));
 	UT_ASSERT(!cluster_ko_shared_structure_offer_next_v2(&cursor, 1, &serial, &value));
 	UT_ASSERT_EQ(cursor, 0);

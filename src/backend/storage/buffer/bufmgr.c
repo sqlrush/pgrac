@@ -10617,6 +10617,22 @@ struct ClusterPageDataReceiptV1 {
 	bool space_terminal;
 };
 
+/* A structural receipt remains owned by the original completed KO slot.
+ * It is deliberately separate from DATA and cannot enter DATA prefix/GC APIs. */
+struct ClusterPageStructuralReceiptV2 {
+	uint64 magic;
+	ResourceOwner owner;
+	pid_t pid;
+	uint32 slot;
+	uint64 serial;
+	RfPageIdentityV1 page;
+	ClusterPageWalBindingV1 terminal;
+	ClusterSpaceStructureChange change;
+	ClusterPcmPiWriteCutV1 write_cut;
+	ClusterPcmPiStorageCutV1 storage_cut;
+	const ClusterThreadRecoveryFabricPlanV1 *plan;
+};
+
 struct ClusterPiPhysicalAckV1 {
 	uint64 magic;
 	ClusterPageDataReceiptV1 data;
@@ -11361,6 +11377,174 @@ cluster_page_structural_ancestor_v1(const ClusterPageWalBindingV1 *binding,
 		return found;
 	}
 	return false;
+}
+
+/* Identify the terminal old PAGE edge, then use the same complete-chain
+ * qualification as a specific physical PI. ABSENT/REPLACED cannot bypass
+ * this query merely because a descriptor is no longer resident. */
+static bool
+cluster_page_structural_page_covered(const ClusterPageWalBindingV1 *terminal,
+	const ClusterSpaceStructureChange *change, const RfPageIdentityV1 *identity,
+	const ClusterThreadRecoveryFabricPlanV1 *plan)
+{
+	const RfPageOnlinePlanV1 *page = cluster_thread_recovery_fabric_page_plan_v1(plan);
+	if (page == NULL || !rf_page_identity_valid_v1(identity)
+		|| (identity->forknum != MAIN_FORKNUM && identity->forknum != VISIBILITYMAP_FORKNUM))
+		return false;
+	for (uint32 i = 0; i < rf_page_online_plan_target_count_v1(page); i++) {
+		RfPageOnlineTargetViewV1 view;
+		const RfPageStableEdgeInputV1 *edge;
+		ClusterPageWalBindingV1 pi = {0};
+		if (!rf_page_online_plan_target_v1(page, i, &view))
+			return false;
+		if (!rf_page_identity_equal_v1(identity, &view.page_identity))
+			continue;
+		if (view.contributors == NULL || view.contributors->edge_count == 0)
+			return false;
+		edge = &view.contributors->edges[view.contributors->edge_count - 1];
+		if (memcmp(edge->edge.result_incarnation, change->identity.expected.incarnation, 16) != 0
+			|| !rf_page_online_plan_source_v1(page, edge->participant_index, &pi.source))
+			return false;
+		pi.identity = *identity;
+		memcpy(pi.version.segment_incarnation, edge->edge.result_incarnation, 16);
+		pi.version.mutation_token = edge->result_token;
+		pi.record_start = edge->record_identity.read_rec_ptr;
+		pi.record_end = edge->record_identity.end_rec_ptr;
+		pi.record_crc = edge->record_identity.record_crc;
+		pi.rmid = edge->record_identity.rmid;
+		pi.info = edge->record_identity.info;
+		pi.flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+		return cluster_page_structural_ancestor_v1(terminal, &pi, plan);
+	}
+	return false;
+}
+
+static bool
+cluster_page_structural_owner_current(const ClusterPageStructuralReceiptV2 *receipt)
+{
+	ClusterPageWalBindingV1 terminal;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], expected[sizeof(wal)];
+	return receipt != NULL && receipt->magic == UINT64_C(0x5047535452454332)
+		&& receipt->pid == getpid() && receipt->owner == CurrentResourceOwner
+		&& CurrentResourceOwner != NULL && CritSectionCount == 0
+		&& (MyBackendType == B_BG_WRITER || MyBackendType == B_CHECKPOINTER)
+		&& cluster_enabled && cluster_shared_config && !RecoveryInProgress()
+		&& receipt->plan != NULL
+		&& cluster_ko_shared_structure_observation_v2(receipt->slot, receipt->serial,
+			&terminal, wal, sizeof(wal))
+		&& memcmp(&terminal, &receipt->terminal, sizeof(terminal)) == 0
+		&& cluster_space_structure_wal_encode(&receipt->change, expected, sizeof(expected))
+		&& memcmp(wal, expected, sizeof(wal)) == 0;
+}
+
+bool
+cluster_page_structural_pi_proof_v2(const ClusterPageStructuralReceiptV2 *receipt,
+	ClusterPcmPiWriteCutV1 *write_cut, ClusterPcmPiStorageCutV1 *storage_cut)
+{
+	ClusterPcmPiWriteCutV1 x = {0};
+	ClusterPcmPiStorageCutV1 s = {0};
+	BufferTag tag;
+	if (write_cut == NULL || storage_cut == NULL || !cluster_page_structural_owner_current(receipt))
+		return false;
+	InitBufferTag(&tag, &receipt->page.locator, receipt->page.forknum, receipt->page.blockno);
+	if (receipt->write_cut.binding_generation != 0) {
+		if (!cluster_pcm_lock_pi_write_snapshot_v1(tag, &x)
+			|| !cluster_pcm_pi_write_cut_valid_v1(&x) || x.master_node != cluster_node_id
+			|| x.pi_holders_bitmap == 0 || !BufferTagsEqual(&tag, &x.holder.assertion.resource))
+			return false;
+	} else if (!cluster_pcm_lock_pi_storage_snapshot_v1(tag, &s)
+		|| !cluster_pcm_pi_storage_cut_valid_v1(&s) || s.master_node != cluster_node_id
+		|| s.pi_holders_bitmap == 0 || !BufferTagsEqual(&tag, &s.resource))
+		return false;
+	if (memcmp(&x, &receipt->write_cut, sizeof(x)) != 0
+		|| memcmp(&s, &receipt->storage_cut, sizeof(s)) != 0)
+		return false;
+	*write_cut = x;
+	*storage_cut = s;
+	return true;
+}
+
+bool
+cluster_page_structural_from_ko_v2(uint32 slot, uint64 serial,
+	const RfPageIdentityV1 *page, const ClusterThreadRecoveryFabricPlanV1 *plan,
+	ClusterPageStructuralReceiptV2 **out)
+{
+	ClusterPageStructuralReceiptV2 value = {0}, *receipt;
+	ClusterPcmPiWriteCutV1 x;
+	ClusterPcmPiStorageCutV1 s;
+	ClusterSpaceStructureChange decoded;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], actual[sizeof(wal)];
+	BufferTag tag;
+	if (out == NULL || *out != NULL || !rf_page_identity_valid_v1(page)
+		|| (page->forknum != MAIN_FORKNUM && page->forknum != VISIBILITYMAP_FORKNUM)
+		|| !cluster_ko_shared_structure_observation_v2(slot, serial, &value.terminal, wal, sizeof(wal))
+		|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &decoded)
+		|| decoded.identity.action != CLUSTER_SPACE_WAL_TRUNCATE
+		|| !cluster_page_structural_record_v1(&value.terminal, decoded.identity.expected.incarnation,
+			plan, &value.change)
+		|| !cluster_space_structure_wal_encode(&value.change, actual, sizeof(actual))
+		|| memcmp(wal, actual, sizeof(wal)) != 0
+		|| !cluster_page_structural_page_covered(&value.terminal, &value.change, page, plan))
+		return false;
+	value.magic = UINT64_C(0x5047535452454332);
+	value.owner = CurrentResourceOwner;
+	value.pid = getpid();
+	value.slot = slot;
+	value.serial = serial;
+	value.page = *page;
+	value.plan = plan;
+	InitBufferTag(&tag, &page->locator, page->forknum, page->blockno);
+	if (!cluster_pcm_lock_pi_write_snapshot_v1(tag, &value.write_cut)
+		&& !cluster_pcm_lock_pi_storage_snapshot_v1(tag, &value.storage_cut))
+		return false;
+	if (!cluster_page_structural_pi_proof_v2(&value, &x, &s))
+		return false;
+	receipt = palloc(sizeof(*receipt));
+	*receipt = value;
+	*out = receipt;
+	return true;
+}
+
+bool
+cluster_page_structural_pi_fact_v2(const ClusterPageStructuralReceiptV2 *receipt,
+	int32 peer, struct ClusterPiWritebackFactV2 *out)
+{
+	ClusterPiWritebackFactV2 fact;
+	ClusterPcmPiWriteCutV1 x;
+	ClusterPcmPiStorageCutV1 s;
+	uint8 actual[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], expected[sizeof(actual)];
+	uint32 cursor, holders;
+	uint64 serial;
+	if (out == NULL || peer < 0 || peer >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| peer == cluster_node_id || !cluster_page_structural_pi_proof_v2(receipt, &x, &s))
+		return false;
+	holders = x.binding_generation != 0 ? x.pi_holders_bitmap : s.pi_holders_bitmap;
+	cursor = receipt->slot;
+	if ((holders & ((uint32)1u << peer)) == 0
+		|| !cluster_ko_shared_structure_offer_next_v2(&cursor, peer, &serial, &fact)
+		|| cursor != receipt->slot + 1 || serial != receipt->serial
+		|| fact.kind != CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2
+		|| memcmp(&fact.proof.structural.terminal.binding, &receipt->terminal,
+			sizeof(receipt->terminal)) != 0
+		|| !cluster_space_structure_wal_encode(&fact.proof.structural.change, actual, sizeof(actual))
+		|| !cluster_space_structure_wal_encode(&receipt->change, expected, sizeof(expected))
+		|| memcmp(actual, expected, sizeof(actual)) != 0)
+		return false;
+	fact.kind = CLUSTER_PI_WRITEBACK_STRUCTURAL_V2;
+	fact.proof.structural.terminal.write_cut = x;
+	fact.proof.structural.terminal.storage_cut = s;
+	*out = fact;
+	return true;
+}
+
+void
+cluster_page_structural_receipt_free_v2(ClusterPageStructuralReceiptV2 **receipt)
+{
+	if (receipt == NULL || *receipt == NULL)
+		return;
+	explicit_bzero(*receipt, sizeof(**receipt));
+	pfree(*receipt);
+	*receipt = NULL;
 }
 
 bool

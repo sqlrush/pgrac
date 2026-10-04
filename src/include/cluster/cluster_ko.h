@@ -250,6 +250,11 @@ extern bool cluster_ko_shared_structure_offer_v2(const ClusterKoCompletionV2 *co
  * must then preserve the shared obligation. No caller activates this until
  * the original background consumer can finish every page responsibility. */
 extern bool cluster_ko_shared_structure_handoff_v2(ClusterKoCompletionV2 **completion);
+/* Original background owner, including a one-member cohort. Exact slot and
+ * serial name an already handed-off result, never a raw receipt constructor.
+ * Refusal preserves both outputs; no peer request is fabricated. */
+extern bool cluster_ko_shared_structure_observation_v2(uint32 slot, uint64 serial,
+	struct ClusterPageWalBindingV1 *terminal, void *wal, Size wal_length);
 /* Bounded read-only background scan, starting at *cursor (initially zero).
  * On success cursor becomes selected slot + 1 and serial identifies that
  * original slot lifetime. Only an actual remote peer gets a wire offer.
