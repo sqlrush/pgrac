@@ -67,6 +67,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_write_fence.h"
 
 
@@ -453,11 +454,32 @@ stats_fill_wal_state_update(ClusterWalStateUpdateKind kind, int64 started_at,
 }
 
 
+/* Shared lifecycle belongs to ROOT INSTALL and the original native writer.
+ * Stats observes that completed handoff; it must not recreate a flat registry
+ * or publish a second ACTIVE/checkpoint. The normal serving gates remain in
+ * the original phase-4 owner. A respawn uses the same exact writer check. */
+static void
+stats_validate_native_writer(void)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+
+	if (!RecoveryInProgress())
+		result = cluster_wal_writer_ready(GetWALInsertionTimeLine());
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+				 errmsg("Cluster Stats could not validate the installed native WAL writer"),
+				 errdetail("The original native-writer check returned result %d.", (int)result),
+				 errhint("Preserve the ROOT-selected claim and startup evidence; Stats cannot "
+						 "create or repair writer admission.")));
+}
+
 /*
- * Initial phase-4 Stats owns W2 because AuxiliaryProcessMain has already
+ * Non-shared initial phase-4 Stats owns W2 because AuxiliaryProcessMain has already
  * assigned its PGPROC.  A RUNNING respawn only validates the previously
  * published ACTIVE slot; it never repeats W2 or the forced checkpoint.
- * The return value suppresses W4 for the existing self-fenced terminal.
+ * The return value suppresses legacy W4 in shared mode and for the existing
+ * self-fenced terminal.
  */
 static bool
 stats_prepare_incarnation(void)
@@ -469,7 +491,7 @@ stats_prepare_incarnation(void)
 		ClusterWalStateUpdateResult result;
 		int64 started_at;
 
-		if (!stats_wal_state_configured())
+		if (!cluster_shared_config && !stats_wal_state_configured())
 			return false;
 
 		if (cluster_write_fence_startup_self_check()) {
@@ -481,6 +503,10 @@ stats_prepare_incarnation(void)
 							   "ACTIVE, the startup checkpoint, and telemetry are skipped."),
 					 errhint("Recover only through the controlled rejoin or cold-admin "
 							 "procedure; never clear a live-cluster fence marker manually.")));
+			return true;
+		}
+		if (cluster_shared_config) {
+			stats_validate_native_writer();
 			return true;
 		}
 
@@ -525,6 +551,10 @@ stats_prepare_incarnation(void)
 		ClusterWalStateSlot slot;
 		ClusterWalSlotVerdict verdict;
 
+		if (cluster_shared_config) {
+			stats_validate_native_writer();
+			return true;
+		}
 		if (!stats_wal_state_configured())
 			return false;
 		memset(&slot, 0, sizeof(slot));
@@ -559,7 +589,7 @@ stats_refresh_wal_state(void)
 	ClusterWalStateUpdate update;
 	ClusterWalStateUpdateResult result;
 
-	if (!stats_wal_state_configured())
+	if (cluster_shared_config || !stats_wal_state_configured())
 		return;
 	stats_fill_wal_state_update(CLUSTER_WAL_STATE_UPDATE_TELEMETRY, 0, &update);
 	result = cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL);

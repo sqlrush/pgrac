@@ -49,6 +49,7 @@
 #include "cluster/cluster_stats.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_write_fence.h"
 
 #undef printf
@@ -76,6 +77,9 @@ bool IsUnderPostmaster = false;
 volatile sig_atomic_t ConfigReloadPending = false;
 volatile sig_atomic_t ShutdownRequestPending = false;
 int MyProcPid = 0;
+static jmp_buf stats_main_exit;
+static int stats_main_exit_code = -1;
+static int stats_test_errors = 0;
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -86,19 +90,23 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 }
 
 bool
-errstart(int e pg_attribute_unused(), const char *d pg_attribute_unused())
+errstart(int e, const char *d pg_attribute_unused())
 {
-	return false;
+	return e >= ERROR;
 }
 bool
-errstart_cold(int e pg_attribute_unused(), const char *d pg_attribute_unused())
+errstart_cold(int e, const char *d pg_attribute_unused())
 {
-	return false;
+	return e >= ERROR;
 }
 void
 errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
 		  const char *fn pg_attribute_unused())
-{}
+{
+	stats_test_errors++;
+	stats_main_exit_code = -2;
+	longjmp(stats_main_exit, 1);
+}
 int
 errcode(int s pg_attribute_unused())
 {
@@ -234,9 +242,6 @@ void
 init_ps_display(const char *fixed_part pg_attribute_unused())
 {}
 
-static jmp_buf stats_main_exit;
-static int stats_main_exit_code = -1;
-
 void
 proc_exit(int code)
 {
@@ -277,6 +282,7 @@ BackendType MyBackendType = B_INVALID;
 
 /* ---------- RF A1 W2/W4 lifecycle fixtures. ---------- */
 bool cluster_enabled = true;
+bool cluster_shared_config = false;
 char *cluster_wal_threads_dir = "/rf-a1/formed";
 int cluster_node_id = 3;
 
@@ -296,6 +302,18 @@ static ClusterStatsStatus stats_test_telemetry_status = CLUSTER_STATS_NOT_STARTE
 static ClusterWalStateUpdate stats_test_active_update;
 static ClusterWalStateUpdate stats_test_telemetry_update;
 static uint64 stats_test_refresh_fail_count = 0;
+static bool stats_test_recovery = false;
+static int stats_test_native_calls = 0;
+static ClusterControlRootResult stats_test_native_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+
+ClusterControlRootResult
+cluster_wal_writer_ready(TimeLineID timeline)
+{
+	UT_ASSERT_EQ(timeline, 7);
+	UT_ASSERT_EQ(cluster_stats_status(), CLUSTER_STATS_SPAWNING);
+	stats_test_native_calls++;
+	return stats_test_native_result;
+}
 
 ClusterStartupPhase
 cluster_current_phase(void)
@@ -326,7 +344,7 @@ RequestCheckpoint(int flags)
 bool
 RecoveryInProgress(void)
 {
-	return false;
+	return stats_test_recovery;
 }
 
 TimeLineID
@@ -420,6 +438,11 @@ reset_stats_lifecycle_fixture(void)
 	ConfigReloadPending = false;
 	ShutdownRequestPending = false;
 	stats_main_exit_code = -1;
+	stats_test_errors = 0;
+	cluster_shared_config = false;
+	stats_test_recovery = false;
+	stats_test_native_calls = 0;
+	stats_test_native_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	stats_test_phase = CLUSTER_PHASE_4_NORMAL;
 	stats_test_self_fenced = false;
 	stats_test_self_check_calls = 0;
@@ -453,6 +476,68 @@ run_one_stats_incarnation(void)
 
 UT_DEFINE_GLOBALS();
 
+
+UT_TEST(test_shared_stats_observes_installed_writer_without_legacy_writes)
+{
+	for (unsigned respawn = 0; respawn < 2; respawn++) {
+		reset_stats_lifecycle_fixture();
+		cluster_shared_config = true;
+		stats_test_phase = respawn ? CLUSTER_PHASE_RUNNING : CLUSTER_PHASE_4_NORMAL;
+		/* Absence of the old registry must not become a fallback producer. */
+		stats_test_active_result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		stats_test_slot_verdict = CLUSTER_WAL_SLOT_EMPTY;
+		run_one_stats_incarnation();
+		UT_ASSERT_EQ(stats_test_native_calls, 1);
+		UT_ASSERT_EQ(stats_test_active_calls, 0);
+		UT_ASSERT_EQ(stats_test_slot_read_calls, 0);
+		UT_ASSERT_EQ(stats_test_checkpoint_calls, 0);
+		UT_ASSERT_EQ(stats_test_telemetry_calls, 0);
+		UT_ASSERT_EQ(stats_test_errors, 0);
+	}
+}
+
+UT_TEST(test_shared_stats_refuses_missing_or_stale_native_writer_before_ready)
+{
+	const ClusterControlRootResult refused[] = {
+		CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT,
+		CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH,
+		CLUSTER_CONTROL_ROOT_STALE_TOKEN,
+		CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+	};
+	for (unsigned respawn = 0; respawn < 2; respawn++)
+		for (unsigned i = 0; i < lengthof(refused); i++) {
+			reset_stats_lifecycle_fixture();
+			cluster_shared_config = true;
+			stats_test_phase = respawn ? CLUSTER_PHASE_RUNNING : CLUSTER_PHASE_4_NORMAL;
+			stats_test_native_result = refused[i];
+			if (setjmp(stats_main_exit) == 0)
+				ClusterStatsMain();
+			UT_ASSERT_EQ(stats_main_exit_code, -2);
+			UT_ASSERT_EQ(stats_test_errors, 1);
+			UT_ASSERT_EQ(cluster_stats_status(), CLUSTER_STATS_SPAWNING);
+			UT_ASSERT_EQ(stats_test_native_calls, 1);
+			UT_ASSERT_EQ(stats_test_active_calls, 0);
+			UT_ASSERT_EQ(stats_test_slot_read_calls, 0);
+			UT_ASSERT_EQ(stats_test_checkpoint_calls, 0);
+			UT_ASSERT_EQ(stats_test_telemetry_calls, 0);
+		}
+}
+
+UT_TEST(test_shared_stats_never_infers_writer_while_recovery_is_running)
+{
+	reset_stats_lifecycle_fixture();
+	cluster_shared_config = true;
+	stats_test_recovery = true;
+	if (setjmp(stats_main_exit) == 0)
+		ClusterStatsMain();
+	UT_ASSERT_EQ(stats_main_exit_code, -2);
+	UT_ASSERT_EQ(stats_test_errors, 1);
+	UT_ASSERT_EQ(cluster_stats_status(), CLUSTER_STATS_SPAWNING);
+	UT_ASSERT_EQ(stats_test_native_calls, 0);
+	UT_ASSERT_EQ(stats_test_active_calls, 0);
+	UT_ASSERT_EQ(stats_test_checkpoint_calls, 0);
+	UT_ASSERT_EQ(stats_test_telemetry_calls, 0);
+}
 
 /* ============================================================
  * Compile-time anchors
@@ -602,7 +687,7 @@ UT_TEST(test_rf_a1_w4_failure_increments_existing_counter)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(13);
 	UT_RUN(test_stats_status_enum_values_frozen);
 	UT_RUN(test_stats_shared_state_size_under_4kb);
 	UT_RUN(test_stats_status_to_string_lookup);
@@ -613,6 +698,9 @@ main(void)
 	UT_RUN(test_rf_a1_running_respawn_validates_active_without_replaying_w2);
 	UT_RUN(test_rf_a1_unconfigured_registry_keeps_stats_vanilla);
 	UT_RUN(test_rf_a1_w4_failure_increments_existing_counter);
+	UT_RUN(test_shared_stats_observes_installed_writer_without_legacy_writes);
+	UT_RUN(test_shared_stats_refuses_missing_or_stale_native_writer_before_ready);
+	UT_RUN(test_shared_stats_never_infers_writer_while_recovery_is_running);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
