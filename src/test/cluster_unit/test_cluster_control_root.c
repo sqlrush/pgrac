@@ -18864,6 +18864,88 @@ v3_retained_checkpoint_fixture(bool shutdown, uint8 before[66048], ClusterContro
 static char v3_history_path[MAXPGPATH];
 static off_t v3_history_offset;
 
+/* A real writer advances its local checkpoint counters independently of the
+ * common control projection. STOPPED must compare WAL with the selected
+ * native anchor, while leaving the public aggregate view unchanged.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_v3_shutdown_observe_uses_native_checkpoint_counters)
+{
+	uint8 before[66048], published[66048];
+	ClusterControlRootIdentity self;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootFileToken token;
+	ControlRootImage root;
+	ControlFileData candidate, view;
+	XLogRecPtr lower = v3_retained_checkpoint_fixture(true, before, &self, &candidate);
+	int writes;
+
+	candidate.checkPointCopy.nextXid
+		= FullTransactionIdFromU64(U64FromFullTransactionId(candidate.checkPointCopy.nextXid) + 10);
+	candidate.checkPointCopy.nextOid += 20;
+	candidate.checkPointCopy.nextMulti += 30;
+	candidate.checkPointCopy.nextMultiOffset += 40;
+	candidate.checkPointCopy.oldestXid += 2;
+	candidate.checkPointCopy.oldestMulti += 3;
+	INIT_CRC32C(candidate.crc);
+	COMP_CRC32C(candidate.crc, &candidate, offsetof(ControlFileData, crc));
+	FIN_CRC32C(candidate.crc);
+	v2_checkpoint_wal_record(&self, &candidate, 0);
+	v2_checkpoint_retained_prefix(&self, &candidate, lower);
+	UT_ASSERT_EQ(cluster_control_root_v3_shutdown_checkpoint_publish(
+					 &self, &candidate, test_checkpoint_end, &out, &token, &view),
+				 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&self, &root, &view, &token), 0);
+	UT_ASSERT(
+		!FullTransactionIdEquals(view.checkPointCopy.nextXid, candidate.checkPointCopy.nextXid));
+	UT_ASSERT(view.checkPointCopy.nextOid != candidate.checkPointCopy.nextOid);
+	memcpy(published, root.bytes, sizeof(published));
+	writes = test_durable_rename_calls;
+	ShutdownRequestPending = true;
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_shutdown_observe(&test_checkpoint_prefix_ref, &out, &token), 0);
+	UT_ASSERT_EQ(out.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	UT_ASSERT_EQ(out.tail_last_record_lsn, candidate.checkPoint);
+	UT_ASSERT_EQ(test_durable_rename_calls, writes);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	v2_assert_primary_unchanged(published);
+}
+
+UT_TEST(test_v3_shutdown_observe_refuses_changed_native_checkpoint_counters)
+{
+	for (unsigned field = 0; field < 2; field++) {
+		uint8 before[66048], published[66048];
+		ClusterControlRootIdentity self;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootFileToken token;
+		ControlRootImage root;
+		ControlFileData candidate, view;
+		XLogRecPtr lower = v3_retained_checkpoint_fixture(true, before, &self, &candidate);
+
+		UT_ASSERT_EQ(cluster_control_root_v3_shutdown_checkpoint_publish(
+						 &self, &candidate, test_checkpoint_end, &out, &token, &view),
+					 0);
+		UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&self, &root, &view, &token), 0);
+		memcpy(published, root.bytes, sizeof(published));
+		if (field == 0)
+			candidate.checkPointCopy.nextXid = FullTransactionIdFromU64(
+				U64FromFullTransactionId(candidate.checkPointCopy.nextXid) + 1);
+		else
+			candidate.checkPointCopy.nextOid++;
+		/* Real WAL with a valid record CRC still cannot replace the anchor. */
+		v2_checkpoint_wal_record(&self, &candidate, 0);
+		v2_checkpoint_retained_prefix(&self, &candidate, lower);
+		ShutdownRequestPending = true;
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_shutdown_observe(&test_checkpoint_prefix_ref, &out, &token),
+			CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+		UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		v2_assert_primary_unchanged(published);
+	}
+}
+
 static void
 v3_flip_history_byte(void)
 {
@@ -22029,7 +22111,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(433);
+	UT_PLAN(435);
 	UT_RUN(test_serving_requires_coordinator_publish_then_startup_is_active);
 	UT_RUN(test_serving_startup_checkpoint_remains_active_after_live_wal);
 	UT_RUN(test_serving_shutdown_checkpoint_still_requires_terminal_wal);
@@ -22196,6 +22278,8 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_self_seal_keeps_dual_range_until_tail_is_sealed);
 	UT_RUN(test_v3_self_seal_rechecks_evidence_wal_and_root_under_cf_x);
 	UT_RUN(test_v3_checkpoint_publish_preserves_pending_and_real_wal_guards);
+	UT_RUN(test_v3_shutdown_observe_uses_native_checkpoint_counters);
+	UT_RUN(test_v3_shutdown_observe_refuses_changed_native_checkpoint_counters);
 	UT_RUN(test_v3_checkpoint_reads_retained_history_once);
 	UT_RUN(test_wal_prefix_identity_recheck_detects_a_changed_namespace);
 	UT_RUN(test_wal_prefix_identity_is_absent_after_a_failed_scan);

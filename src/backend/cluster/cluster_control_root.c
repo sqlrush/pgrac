@@ -9283,7 +9283,11 @@ shutdown_v2_observe_work(CheckpointV2Work *work, const ClusterWalSourceRef *expe
 	anchor.anchor_generation = work->base.refs[index].anchor_generation;
 	memcpy(anchor.anchor_sha256, work->base.refs[index].anchor_sha256, 32);
 	memcpy(anchor.claim_sha256, work->base.refs[index].claim_sha256, 32);
-	result = cluster_recovery_anchor_v2_read_locked(&anchor, &work->new_view, &work->old_view);
+	/* Verify this origin's WAL against its native checkpoint, not the common
+	 * allocator/horizon projection retained by read_thread_version above.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	result
+		= cluster_recovery_anchor_v2_read_native_locked(&anchor, &work->new_view, &work->old_view);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	end = record->validated_tail_lsn_exclusive;
