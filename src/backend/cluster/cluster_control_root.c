@@ -3031,6 +3031,14 @@ stop_phase_v2_locked(const ControlRootImage *root, uint32 index, const ControlFi
 	result = shutdown_v2_record_input(root, record, &root->refs[index], &raw);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
+	/* The native startup checkpoint is genuinely SHUTDOWNED, but INSTALL
+	 * starts a new OPEN writer. Only its later checkpointer publication can
+	 * supply this boot's normal-stop checkpoint. Keep the actual anchor bytes. */
+	if (root->header.format_version >= 3 && record->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+		&& record->lifecycle_reason == CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN) {
+		*phase = CLUSTER_CONTROL_ROOT_STOP_ACTIVE;
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
 	*phase = record->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
 				 ? CLUSTER_CONTROL_ROOT_STOP_CLOSED
 				 : CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
@@ -4651,6 +4659,313 @@ cluster_control_root_config_cancel(void)
 	config_aux_clear();
 	if (cluster_cf_held_by(ShareLock, &config_aux_caller))
 		(void)cluster_cf_unlock_owned(ShareLock, &config_aux_caller);
+}
+
+/* PGRAC: INSTALL leaves MOUNTED. Only the existing live OPEN owner can
+ * supply the serving cut; this publisher records it, never creates it.
+ * CF is polled and released by one tagged LMON duty, without remote waits.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ServingCut {
+	ConfigAuxCut control;
+	uint64 formation;
+	uint64 members[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+} ServingCut;
+
+typedef struct ServingPublication {
+	bool pending;
+	LOCKMODE mode;
+	uint64 cookie;
+	ServingCut cut;
+	ClusterSemanticActivationRecord open;
+	uint8 descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	ClusterControlRootResult result;
+	ClusterControlRootFileToken selected;
+} ServingPublication;
+
+static const char serving_caller;
+static ServingPublication serving_publication;
+
+static ClusterControlRootResult
+serving_cut_read(const ClusterSemanticActivationRecord *open, const uint8 *descriptor,
+				 ServingCut *cut)
+{
+	ClusterFormationSnapshotV1 formation;
+	ClusterFenceAuthorityProof authority;
+	ClusterNormalStopPollResult matched;
+
+	memset(cut, 0, sizeof(*cut));
+	matched = cluster_semantic_normal_stop_match(open, descriptor, cut->members, NULL);
+	if (matched != CLUSTER_NORMAL_STOP_READY)
+		return matched == CLUSTER_NORMAL_STOP_PENDING ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+													  : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (!config_aux_cut(&cut->control)
+		|| !cluster_reconfig_capture_formation_snapshot_v1(cluster_node_id + 1, &formation)
+		|| formation.local_epoch != cut->control.epoch
+		|| open->transition_epoch != formation.local_epoch
+		|| formation.startup_formation_generation == 0
+		|| formation.startup_formation_generation == UINT64_MAX || formation.self_join_admitted != 1
+		|| formation.self_join_failed || formation.prebump_sync_active
+		|| cluster_reconfig_has_pending_prebump_stage()
+		|| !bytes_are_zero(formation.reserved, sizeof(formation.reserved))
+		|| !bytes_are_zero(formation.pending_join_bitmap, sizeof(formation.pending_join_bitmap))
+		|| !bytes_are_zero(formation.excluded_bitmap, sizeof(formation.excluded_bitmap))
+		|| !bytes_are_zero(formation.clean_departed_bitmap, sizeof(formation.clean_departed_bitmap))
+		|| !bytes_are_zero(formation.removed_bitmap, sizeof(formation.removed_bitmap))
+		|| !cluster_qvotec_in_quorum() || !cluster_write_fence_allowed()
+		|| !cluster_write_fence_enforcing()
+		|| cluster_write_fence_read_durable_authority(&authority) != CLUSTER_FENCE_AUTHORITY_OK
+		|| authority.marker.fence_epoch != cut->control.epoch)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; node++) {
+		bool required = node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+						&& (open->admitted_members_lo & (UINT64_C(1) << node)) != 0;
+		if (required != (formation.membership.membership_state[node] == CLUSTER_MEMBER_MEMBER))
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (required
+			&& (cut->members[node] == 0 || cut->members[node] == UINT64_MAX
+				|| formation.membership.last_admitted_incarnation[node] != cut->members[node]
+				|| cluster_fence_marker_node_is_fenced(authority.marker.fenced_dead_bitmap, node)))
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	if (cut->members[cluster_node_id] != cut->control.incarnation
+		|| cluster_epoch_get_current() != cut->control.epoch)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	cut->formation = formation.startup_formation_generation;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+/* Authenticate every selected installed writer under this same CF interval.
+ * History and immutable creation lineage are carried unchanged by the CAS. */
+static ClusterControlRootResult
+serving_root_read(const ServingPublication *pending, const uint8 storage_uuid[16],
+				  ControlRootImage *root, ControlRootImage *scratch,
+				  ClusterControlRootFileToken *token)
+{
+	ControlFileData view;
+	ClusterControlRootFileToken peer;
+	ClusterControlRootResult result;
+	bool opened;
+
+	result = read_control_version(storage_uuid, GetSystemIdentifier(), root, &view, token, 3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	opened = root->header.v2.database_state == CLUSTER_CONTROL_ROOT_DATABASE_OPEN;
+	if (root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| (!opened && root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED)
+		|| root->header.v2.configured[0] != pending->open.admitted_members_lo
+		|| root->header.v2.configured[1] != pending->open.admitted_members_hi
+		|| root->header.v2.serving[1] != 0
+		|| root->header.v2.serving[0] != (opened ? pending->open.admitted_members_lo : 0)
+		|| root->header.v2.formation_seq > pending->cut.formation
+		|| (opened && root->header.v2.formation_seq != pending->cut.formation))
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	for (unsigned node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
+		if (root->startup[node].generation != 0)
+			return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+		if (node >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT || pending->cut.members[node] == 0)
+			continue;
+		if (!root->present[node]
+			|| root->records[node].lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+			|| root->records[node].identity.origin_owner_incarnation != pending->cut.members[node]
+			|| root->publisher_node[node] != node
+			|| root->publisher_incarnation[node] != pending->cut.members[node])
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		/* Before first OPEN no ordinary checkpoint publisher is eligible. */
+		if (!opened
+			&& root->records[node].lifecycle_reason != CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN)
+			return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+		result = read_thread_version(&root->records[node].identity, scratch, &view, &peer, 3);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+			return result;
+		if (!file_token_equal(token, &peer))
+			return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
+serving_publish_locked(ServingPublication *pending)
+{
+	/* Scratch is in the caller's tick context, never retained across ticks. */
+	ControlRootImage *base = palloc0(sizeof(*base));
+	ControlRootImage *next = palloc0(sizeof(*next));
+	ControlRootImage *observed = palloc0(sizeof(*observed));
+	ClusterControlRootFileToken before, after;
+	ServingCut now;
+	uint8 storage_uuid[16];
+	ClusterControlRootResult result;
+
+	result = serving_cut_read(&pending->open, pending->descriptor, &pending->cut);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	if (!current_storage_uuid(storage_uuid)) {
+		result = CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED;
+		goto done;
+	}
+	result = serving_root_read(pending, storage_uuid, base, observed, &before);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	if (base->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN) {
+		if (cluster_node_id != 0) {
+			result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+			goto done;
+		}
+		if (base->header.file_txn_seq == UINT64_MAX) {
+			result = CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
+			goto done;
+		}
+	}
+	result = serving_root_read(pending, storage_uuid, observed, next, &after);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	if (!file_token_equal(&before, &after)) {
+		result = CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+		goto done;
+	}
+	result = serving_cut_read(&pending->open, pending->descriptor, &now);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	if (memcmp(&now, &pending->cut, sizeof(now)) != 0) {
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto done;
+	}
+	*next = *base;
+	if (base->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN) {
+		next->header.file_txn_seq++;
+		next->header.published_at_usec = GetCurrentTimestamp();
+		next->header.v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_OPEN;
+		next->header.v2.formation_seq = pending->cut.formation;
+		next->header.v2.serving[0] = pending->open.admitted_members_lo;
+		result = cluster_control_root_v3_encode(next);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			goto done;
+		if (!publish_updated_image(base, next)) {
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			goto done;
+		}
+	} else if (!fsync_parent_global()) {
+		/* Every ROOT producer fsyncs its temporary file before rename. A
+		 * visible OPEN may still be the residue of failed directory sync;
+		 * coordinator and read-only members must finish that durability
+		 * before readback. No bytes or generation are changed here. */
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		goto done;
+	}
+	make_file_token(next, &pending->selected);
+	result = serving_root_read(pending, storage_uuid, observed, base, &after);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& (!file_token_equal(&pending->selected, &after)
+			|| observed->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN))
+		result = CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
+done:
+	pfree(base);
+	pfree(next);
+	pfree(observed);
+	return result;
+}
+
+static ClusterControlRootResult
+serving_finish(const ClusterSemanticActivationRecord *open, const uint8 *descriptor,
+			   ClusterControlRootFileToken *out)
+{
+	ServingPublication *pending = &serving_publication;
+	ServingCut now;
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+
+	cluster_cf_retirement_poll();
+	if (!cluster_cf_release_completed(pending->mode, pending->cookie)) {
+		if (cluster_cf_held_by(pending->mode, &serving_caller))
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	} else if (memcmp(open, &pending->open, sizeof(*open)) == 0
+			   && memcmp(descriptor, pending->descriptor, sizeof(pending->descriptor)) == 0) {
+		result = pending->result;
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			result = serving_cut_read(open, descriptor, &now);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+				if (memcmp(&now, &pending->cut, sizeof(now)) == 0)
+					*out = pending->selected;
+				else
+					result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			}
+		}
+	}
+	memset(pending, 0, sizeof(*pending));
+	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_serving_poll(const ClusterSemanticActivationRecord *open,
+									 const uint8 *root_descriptor, ClusterControlRootFileToken *out)
+{
+	ServingPublication *pending = &serving_publication;
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	MemoryContext caller = CurrentMemoryContext;
+	MemoryContext context;
+	LOCKMODE mode = cluster_node_id == 0 ? ExclusiveLock : ShareLock;
+
+	if (history_ranges_overlap(open, sizeof(*open), out, sizeof(*out))
+		|| history_ranges_overlap(root_descriptor, CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES, out,
+								  sizeof(*out)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (open == NULL || root_descriptor == NULL || out == NULL || !cluster_shared_config
+		|| !cluster_enabled || !cluster_controlfile_shared_authority || !enableFsync
+		|| MyBackendType != B_LMON || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+		|| open->admitted_members_hi != 0 || open->admitted_members_lo == 0
+		|| (open->admitted_members_lo & ~UINT64_C(15)) != 0
+		|| (open->admitted_members_lo & (UINT64_C(1) << cluster_node_id)) == 0
+		|| (open->admitted_members_lo & 1) == 0 || open->coordinator_node != 0)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	context = AllocSetContextCreate(caller, "ROOT serving publication", ALLOCSET_DEFAULT_SIZES);
+	MemoryContextSwitchTo(context);
+	PG_TRY();
+	{
+		cluster_cf_retirement_poll();
+		if (pending->pending)
+			result = serving_finish(open, root_descriptor, out);
+		else if (!cluster_cf_held(mode == ExclusiveLock ? ShareLock : ExclusiveLock)
+				 && (!cluster_cf_held(mode)
+					 || cluster_cf_acquire_pending_owned(mode, &serving_caller))
+				 && cluster_cf_lock_poll_owned(mode, &serving_caller)) {
+			pending->mode = mode;
+			pending->cookie = cluster_cf_owner_cookie(mode);
+			pending->open = *open;
+			memcpy(pending->descriptor, root_descriptor, sizeof(pending->descriptor));
+			pending->result = !cluster_cf_held_is_clusterwide(mode) || pending->cookie == 0
+								  ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+								  : serving_publish_locked(pending);
+			pending->pending = true;
+			(void)cluster_cf_unlock_owned(mode, &serving_caller);
+			result = serving_finish(open, root_descriptor, out);
+		}
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(caller);
+		MemoryContextDelete(context);
+		cluster_control_root_v3_serving_cancel();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(caller);
+	MemoryContextDelete(context);
+	return result;
+}
+
+void
+cluster_control_root_v3_serving_cancel(void)
+{
+	if (MyBackendType != B_LMON)
+		return;
+	memset(&serving_publication, 0, sizeof(serving_publication));
+	if (cluster_cf_held_by(ShareLock, &serving_caller))
+		(void)cluster_cf_unlock_owned(ShareLock, &serving_caller);
+	if (cluster_cf_held_by(ExclusiveLock, &serving_caller))
+		(void)cluster_cf_unlock_owned(ExclusiveLock, &serving_caller);
 }
 
 static ClusterControlRootResult
@@ -8939,6 +9254,8 @@ shutdown_v2_observe_work(CheckpointV2Work *work, const ClusterWalSourceRef *expe
 		|| (work->base.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN
 			&& !(close_plan != NULL
 				 && work->base.header.v2.database_state == CLUSTER_CONTROL_ROOT_DATABASE_CLOSED))
+		|| (work->format_version >= 3
+			&& record->lifecycle_reason == CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN)
 		|| (record->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
 			&& !(close_plan != NULL && record->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED))
 		|| (work->base.header.v2.serving[cluster_node_id / 64]

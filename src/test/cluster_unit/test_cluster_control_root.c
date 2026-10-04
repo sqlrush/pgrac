@@ -21935,6 +21935,7 @@ UT_TEST(test_wal_inputs_cold_selection_and_pin_lifetime_are_exact)
 }
 
 #include "test_cluster_control_catalog.inc"
+#include "test_cluster_control_root_serving.inc"
 
 int
 main(int argc, char **argv)
@@ -21948,6 +21949,19 @@ main(int argc, char **argv)
 	if (argc > 1)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_SERVING") != NULL) {
+		UT_PLAN(8);
+		UT_RUN(test_serving_requires_coordinator_publish_then_startup_is_active);
+		UT_RUN(test_serving_refuses_changed_or_unqualified_live_cut);
+		UT_RUN(test_serving_missing_inputs_never_publish);
+		UT_RUN(test_serving_waits_for_own_release_and_revalidates_cut);
+		UT_RUN(test_serving_io_failure_and_visible_rename_are_not_durability);
+		UT_RUN(test_serving_fresh_cut_and_original_owner_error_cleanup);
+		UT_RUN(test_serving_startup_anchor_cannot_close_the_new_writer);
+		UT_RUN(test_serving_real_shutdown_checkpoints_close_installed_cohort);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_FIRST_START") != NULL) {
 		UT_PLAN(4);
 		UT_RUN(test_first_start_peer_begin_race_reobserves_exact_operation);
@@ -22013,7 +22027,15 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(423);
+	UT_PLAN(431);
+	UT_RUN(test_serving_requires_coordinator_publish_then_startup_is_active);
+	UT_RUN(test_serving_refuses_changed_or_unqualified_live_cut);
+	UT_RUN(test_serving_missing_inputs_never_publish);
+	UT_RUN(test_serving_waits_for_own_release_and_revalidates_cut);
+	UT_RUN(test_serving_io_failure_and_visible_rename_are_not_durability);
+	UT_RUN(test_serving_fresh_cut_and_original_owner_error_cleanup);
+	UT_RUN(test_serving_startup_anchor_cannot_close_the_new_writer);
+	UT_RUN(test_serving_real_shutdown_checkpoints_close_installed_cohort);
 	UT_RUN(test_first_start_peer_begin_race_reobserves_exact_operation);
 	UT_RUN(test_first_start_io_and_late_races_never_publish_authority);
 	UT_RUN(test_first_start_binds_original_inputs_without_clean_exit);
