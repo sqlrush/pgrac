@@ -8617,6 +8617,7 @@ v3_reserve_fixture(uint8 before[66048], ControlRootImage *root)
 	v2_write_roots(before);
 	memset(&test_reserve_formation, 0, sizeof(test_reserve_formation));
 	test_reserve_formation.local_epoch = test_epoch;
+	test_reserve_formation.startup_formation_generation = root->header.v2.formation_seq + 1;
 	test_reserve_formation.self_join_admitted = 1;
 	for (int node = 0; node <= 3; node += 3) {
 		test_reserve_formation.membership.membership_state[node] = CLUSTER_MEMBER_MEMBER;
@@ -8626,7 +8627,7 @@ v3_reserve_fixture(uint8 before[66048], ControlRootImage *root)
 	UT_ASSERT_EQ(cluster_control_root_v3_clean_exit_cut(before, 66048, v2_storage, TEST_SYSID,
 														&test_reserve_formation, &test_reserve_cut),
 				 0);
-	test_reserve_mode = test_reserve_provider = test_reserve_quorum = true;
+	test_reserve_mode = test_reserve_provider = test_reserve_quorum = test_fence = true;
 	test_reserve_fault = 0;
 	test_history_fail_sync = test_history_sync_count = 0;
 	test_reserve_evidence = CLUSTER_STARTUP_EXIT_READY;
@@ -8824,7 +8825,7 @@ UT_TEST(test_v3_native_driver_rejects_foreign_input_and_owner_without_mutation)
 		if (fault == 0)
 			restart.claim.claim_sha256[0] ^= 1;
 		if (fault == 1)
-			test_reserve_provider = false;
+			test_fence = false;
 		if (fault == 2)
 			MyBackendType = B_BACKEND;
 		if (fault == 3)
@@ -9028,7 +9029,7 @@ UT_TEST(test_v3_begin_requires_all_declared_empty_targets_before_native_mutation
 			MyBackendType = B_BACKEND;
 			break;
 		case 1:
-			test_reserve_provider = false;
+			test_fence = false;
 			break;
 		case 2:
 			++test_self_incarnation;
@@ -9057,7 +9058,7 @@ UT_TEST(test_v3_begin_requires_all_declared_empty_targets_before_native_mutation
 		UT_ASSERT(v2_zero(&observed, sizeof(observed)));
 		UT_ASSERT_EQ(test_actual_cf, fault == 6 ? ShareLock : NoLock);
 		MyBackendType = B_STARTUP;
-		test_reserve_provider = true;
+		test_reserve_provider = test_fence = true;
 		test_self_incarnation = self.claim.identity.origin_owner_incarnation;
 		ShutdownRequestPending = false;
 		CritSectionCount = 0;
@@ -9089,7 +9090,7 @@ UT_TEST(test_v3_target_rejects_wrong_owner_before_creation)
 		if (fault == 0)
 			MyBackendType = B_LMON;
 		if (fault == 1)
-			test_reserve_provider = false;
+			test_fence = false;
 		if (fault == 2)
 			op.operation_uuid[0] ^= 1;
 		if (fault == 3)
@@ -9208,10 +9209,10 @@ v3_target_late_change(void)
 	if (test_reserve_fault == 3)
 		test_reserve_formation.membership.last_admitted_incarnation[3]++;
 	else
-		test_reserve_provider = false;
+		test_fence = false;
 }
 
-UT_TEST(test_v3_target_reobserves_formation_and_provider_after_files)
+UT_TEST(test_v3_target_reobserves_formation_and_write_fence_after_files)
 {
 	for (int fault = 3; fault <= 4; ++fault) {
 		uint8 before[66048];
@@ -9421,7 +9422,7 @@ UT_TEST(test_v3_startup_route_requires_exact_owner_and_restart_input)
 			enableFsync = false;
 			break;
 		case 9:
-			test_reserve_provider = false;
+			test_fence = false;
 			break;
 		case 10:
 			test_self_incarnation++;
@@ -9573,7 +9574,7 @@ v3_route_late_change(void)
 	test_startup_sync_hook = NULL;
 	switch (test_route_cut) {
 	case 0:
-		test_reserve_provider = false;
+		test_fence = false;
 		break;
 	case 1:
 		test_reserve_formation.membership.last_admitted_incarnation[3]++;
@@ -9973,7 +9974,7 @@ UT_TEST(test_v3_startup_install_refuses_wrong_owner_and_intent)
 				CritSectionCount = 1;
 				break;
 			case 4:
-				test_reserve_provider = false;
+				test_fence = false;
 				break;
 			case 5:
 				++test_self_incarnation;
@@ -10485,7 +10486,7 @@ UT_TEST(test_v3_startup_checkpoint_refuses_runtime_and_control_drift)
 			CritSectionCount = 1;
 			break;
 		case 4:
-			test_reserve_provider = false;
+			test_fence = false;
 			break;
 		case 5:
 			++test_self_incarnation;
@@ -10657,7 +10658,7 @@ UT_TEST(test_v3_begin_failures_preserve_selected_obligations_without_permission)
 		if (fault == 2)
 			MyBackendType = B_LMON;
 		if (fault == 3)
-			test_reserve_provider = false;
+			test_fence = false;
 		if (fault == 4) {
 			snprintf(path, sizeof(path),
 					 "%s/thread_4/generation_" UINT64_FORMAT "/archive_status/unexpected",
@@ -10726,7 +10727,7 @@ UT_TEST(test_v3_reserve_requires_actual_collective_evidence_and_owner)
 		if (fault == 1)
 			test_reserve_evidence = CLUSTER_STARTUP_EXIT_UNAVAILABLE;
 		if (fault == 2)
-			test_reserve_provider = false;
+			test_fence = false;
 		if (fault == 3)
 			test_reserve_quorum = false;
 		if (fault == 4)
@@ -10765,7 +10766,7 @@ v3_reserve_late_change(void)
 	if (test_reserve_fault == 3)
 		test_reserve_formation.membership.last_admitted_incarnation[3]++;
 	else if (test_reserve_fault == 4)
-		test_reserve_provider = false;
+		test_fence = false;
 	else if (test_reserve_fault == 5)
 		test_reserve_evidence = CLUSTER_STARTUP_EXIT_WAITING;
 	else if (test_reserve_fault == 6)
@@ -22019,6 +22020,118 @@ UT_TEST(test_wal_inputs_cold_selection_and_pin_lifetime_are_exact)
 #include "test_cluster_control_catalog.inc"
 #include "test_cluster_control_root_serving.inc"
 
+/* The live exit/formation boundaries are fixtures; all selected files,
+ * checkpoints and ROOT publications below use the original owners.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_clean_restart_without_provider_keeps_collective_exit_and_actual_install)
+{
+	uint8 before[66048];
+	ControlRootImage root, observed;
+	ClusterWalStartupImage op, durable;
+	ClusterWalSourceRef restart, writer;
+	ClusterControlRootFileToken token;
+	ControlFileData candidate;
+	char path[MAXPGPATH];
+	unsigned exits;
+
+	v3_reserve_fixture(before, &root);
+	if (ut_current_failed)
+		return;
+	test_reserve_provider = false;
+	exits = test_startup_exit_requests;
+	restart = v3_driver_restart(&root, 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &op),
+				 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(test_startup_exit_requests > exits);
+	if (ut_current_failed)
+		return;
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, before, sizeof(before));
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(before, sizeof(before), v2_storage, TEST_SYSID, &root), 0);
+	for (unsigned step = 0; step < 3; step++) {
+		restart = v3_driver_restart(&root, step == 1 ? 3 : 0);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &op),
+					 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		UT_ASSERT(v2_zero(&op, sizeof(op)));
+	}
+	for (unsigned node = 0; node <= 3; node += 3) {
+		restart = v3_driver_restart(&root, node);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &op), 0);
+		UT_ASSERT_EQ(op.input_kind, CLUSTER_WAL_STARTUP_CLEAN);
+		UT_ASSERT_EQ(op.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
+		UT_ASSERT_EQ(op.formation_epoch, test_epoch);
+		UT_ASSERT_EQ(op.claim.identity.origin_owner_incarnation, test_reserve_cut.observer[node]);
+		UT_ASSERT_EQ(op.predecessor_evidence_sha256[0], 0x79);
+		test_cf_mode = test_actual_cf = ShareLock;
+		UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&op.predecessor.snapshot.identity,
+																&observed, &candidate, &token),
+					 0);
+		test_cf_mode = test_actual_cf = NoLock;
+		v3_startup_native_record(&op, &candidate);
+		history_stage_dirs(node);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_checkpoint(&op.claim.identity,
+																op.operation_uuid, &candidate,
+																test_checkpoint_end, &durable),
+					 0);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&durable, &writer), 0);
+		UT_ASSERT_EQ(writer.claim.identity.origin_owner_incarnation,
+					 test_reserve_cut.observer[node]);
+		UT_ASSERT(!cluster_external_fence_runtime_active());
+	}
+	read_all_or_abort(path, before, sizeof(before));
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(before, sizeof(before), v2_storage, TEST_SYSID, &root), 0);
+	UT_ASSERT_EQ(root.startup[0].generation | root.startup[3].generation, 0);
+	UT_ASSERT_EQ(root.header.v2.database_state, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+	UT_ASSERT_EQ(root.header.v2.serving[0] | root.header.v2.serving[1], 0);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	test_reserve_mode = false;
+	cluster_node_id = 0;
+}
+
+UT_TEST(test_clean_restart_without_provider_refuses_missing_exit_formation_and_fence)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ClusterControlRootFileToken token;
+		v3_reserve_fixture(before, &root);
+		if (ut_current_failed)
+			return;
+		test_reserve_provider = false;
+		switch (fault) {
+		case 0:
+			test_reserve_evidence = CLUSTER_STARTUP_EXIT_WAITING;
+			break;
+		case 1:
+			test_reserve_evidence = CLUSTER_STARTUP_EXIT_UNAVAILABLE;
+			break;
+		case 2:
+			test_reserve_formation.membership.membership_state[3] = CLUSTER_MEMBER_DEAD;
+			break;
+		case 3:
+			test_reserve_formation.startup_formation_generation = 0;
+			break;
+		case 4:
+			test_reserve_fault = 1;
+			break;
+		case 5:
+			test_reserve_fault = 2;
+			break;
+		case 6:
+			test_fence = false;
+			break;
+		}
+		UT_ASSERT_NE(cluster_control_root_v3_reserve_clean(&test_reserve_cut, &token), 0);
+		UT_ASSERT(v2_zero(&token, sizeof(token)));
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		v2_assert_primary_unchanged(before);
+	}
+	test_reserve_mode = false;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -22112,7 +22225,9 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(436);
+	UT_PLAN(438);
+	UT_RUN(test_clean_restart_without_provider_keeps_collective_exit_and_actual_install);
+	UT_RUN(test_clean_restart_without_provider_refuses_missing_exit_formation_and_fence);
 	UT_RUN(test_serving_requires_coordinator_publish_then_startup_is_active);
 	UT_RUN(test_serving_startup_checkpoint_remains_active_after_live_wal);
 	UT_RUN(test_serving_shutdown_checkpoint_still_requires_terminal_wal);
@@ -22253,7 +22368,7 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_target_rejects_wrong_owner_before_creation);
 	UT_RUN(test_v3_target_never_adopts_foreign_or_nonempty_namespace);
 	UT_RUN(test_v3_target_sync_failures_never_grant_initialization);
-	UT_RUN(test_v3_target_reobserves_formation_and_provider_after_files);
+	UT_RUN(test_v3_target_reobserves_formation_and_write_fence_after_files);
 	UT_RUN(test_v3_begin_failures_preserve_selected_obligations_without_permission);
 	UT_RUN(test_v3_reserve_requires_actual_collective_evidence_and_owner);
 	UT_RUN(test_v3_reserve_rechecks_cut_after_wal_scan);

@@ -201,6 +201,10 @@ extern bool cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out);
  * and only in its original formation epoch. Does not grant runtime authority. */
 extern bool cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *expected,
 														  uint64 epoch);
+/* Exact CLEAN qualification from collective exit evidence and actual INSTALL.
+ * It is not the never-served input and does not replace live runtime gates. */
+extern bool cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected,
+													uint64 epoch);
 /* Immutable restart input, independent of the ordinary writer reference.
  * Reading this mirror never authorizes WAL insertion or serving. */
 extern bool cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out);

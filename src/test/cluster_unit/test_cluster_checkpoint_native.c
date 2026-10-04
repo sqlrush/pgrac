@@ -61,7 +61,7 @@ Latch *MyLatch = &latch;
 static LOCKMODE cf_mode;
 static bool local_lock, ref_ok, lock_ok, read_ok, release_ok, fence_ok, serving_ok;
 static bool provider_ok, prebump, cancel_on_wait, change_epoch_on_wait, read_error;
-static bool initialized_ok, lose_initialized_on_release;
+static bool initialized_ok, clean_ok, lose_initialized_on_release;
 static ClusterWalSourceRef initialized_ref;
 static uint64 initialized_epoch;
 static uint64 epoch;
@@ -243,7 +243,7 @@ cluster_cf_unlock_confirmed(LOCKMODE m)
 	cf_mode = NoLock;
 	releases++;
 	if (lose_initialized_on_release)
-		initialized_ok = false;
+		initialized_ok = clean_ok = false;
 	return release_ok ? CLUSTER_CF_RELEASE_CONFIRMED : CLUSTER_CF_RELEASE_UNCONFIRMED;
 }
 bool
@@ -267,6 +267,12 @@ cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *expecte
 											  uint64 observed_epoch)
 {
 	return initialized_ok && ref_ok && observed_epoch == initialized_epoch
+		   && memcmp(expected, &initialized_ref, sizeof(*expected)) == 0;
+}
+bool
+cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected, uint64 observed_epoch)
+{
+	return clean_ok && ref_ok && observed_epoch == initialized_epoch
 		   && memcmp(expected, &initialized_ref, sizeof(*expected)) == 0;
 }
 bool
@@ -578,7 +584,7 @@ reset_fixture(void)
 	prebump = local_lock = cancel_on_wait = change_epoch_on_wait = read_error = false;
 	cf_mode = NoLock;
 	epoch = 9;
-	initialized_ok = lose_initialized_on_release = false;
+	initialized_ok = clean_ok = lose_initialized_on_release = false;
 	initialized_ref = ref;
 	initialized_epoch = epoch;
 	CritSectionCount = InterruptHoldoffCount = QueryCancelHoldoffCount = 0;
@@ -664,6 +670,45 @@ UT_TEST(prepare_refuses_unsupported_or_unproven_input)
 									: 0));
 		UT_ASSERT_EQ(current.checkPoint, 100);
 		UT_ASSERT_EQ(cf_mode, NoLock);
+	}
+}
+UT_TEST(clean_writer_checkpoint_uses_exact_existing_fence_qualification)
+{
+	for (unsigned shutdown = 0; shutdown < 2; shutdown++) {
+		reset_fixture();
+		provider_ok = false;
+		clean_ok = true;
+		ShutdownRequestPending = shutdown != 0;
+		UT_ASSERT(prepare(shutdown ? CHECKPOINT_IS_SHUTDOWN : CHECKPOINT_FORCE));
+		UT_ASSERT_EQ(reads, 1);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+		candidate.checkPoint = 200;
+		candidate.state = shutdown ? DB_SHUTDOWNED : DB_IN_PRODUCTION;
+		UT_ASSERT(publish());
+		UT_ASSERT_EQ(root_calls, 1);
+		UT_ASSERT_EQ(shutdown_calls, shutdown);
+		UT_ASSERT_EQ(current.checkPoint, 200);
+	}
+}
+UT_TEST(clean_checkpoint_cannot_borrow_other_input_epoch_or_writer)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		reset_fixture();
+		provider_ok = false;
+		clean_ok = fault != 0;
+		if (fault == 1)
+			initialized_epoch++;
+		if (fault == 2)
+			initialized_ref.claim.identity.origin_owner_incarnation++;
+		if (fault == 3)
+			lose_initialized_on_release = true;
+		UT_ASSERT(!prepare(CHECKPOINT_FORCE));
+		UT_ASSERT_EQ(reads, fault == 3 ? 1 : 0);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+		UT_ASSERT(!publish());
+		UT_ASSERT_EQ(root_calls, 0);
+		UT_ASSERT_EQ(local_updates, 0);
+		UT_ASSERT_EQ(current.checkPoint, 100);
 	}
 }
 UT_TEST(initialized_writer_checkpoint_uses_exact_existing_fence_qualification)
@@ -1286,6 +1331,20 @@ UT_TEST(initializer_selection_precedes_first_native_side_effect)
 	UT_ASSERT_EQ(current.checkPoint, 100);
 }
 
+UT_TEST(initializer_selection_waits_for_original_lock_before_native_side_effect)
+{
+	writer_begin_fixture();
+	advance_returns[0] = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	advance_returns[1] = CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	UT_ASSERT(startup_first_native_site());
+	UT_ASSERT_EQ(advance_calls, 3);
+	UT_ASSERT_EQ(waits, 2);
+	UT_ASSERT_EQ(startup_directory_calls, 1);
+	UT_ASSERT(!directory_before_selection);
+	UT_ASSERT_EQ(route_calls | bind_calls, 0);
+	UT_ASSERT_EQ(current.checkPoint, 100);
+}
+
 UT_TEST(early_selection_refusal_or_cancel_precedes_native_mutation)
 {
 	for (unsigned f = 0; f < 7; ++f) {
@@ -1593,7 +1652,10 @@ UT_TEST(native_startup_insert_has_no_link_or_page_from_predecessor)
 int
 main(void)
 {
-	UT_PLAN(42);
+	UT_PLAN(45);
+	UT_RUN(initializer_selection_waits_for_original_lock_before_native_side_effect);
+	UT_RUN(clean_writer_checkpoint_uses_exact_existing_fence_qualification);
+	UT_RUN(clean_checkpoint_cannot_borrow_other_input_epoch_or_writer);
 	UT_RUN(shared_crash_control_refuses_before_untyped_publication);
 	UT_RUN(legacy_crash_control_keeps_native_publication);
 	UT_RUN(startup_file_sync_rechecks_original_writer_and_keeps_native_owner);
