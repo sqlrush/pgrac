@@ -98,6 +98,7 @@ void errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unu
 int errcode(int value pg_attribute_unused()) { return 0; }
 int errcode_for_file_access(void) { return 0; }
 int errmsg(const char *format pg_attribute_unused(), ...) { return 0; }
+int errmsg_internal(const char *format pg_attribute_unused(), ...) { return 0; }
 int errdetail(const char *format pg_attribute_unused(), ...) { return 0; }
 int errhint(const char *format pg_attribute_unused(), ...) { return 0; }
 ErrorData *CopyErrorData(void) { return &copied_error; }
