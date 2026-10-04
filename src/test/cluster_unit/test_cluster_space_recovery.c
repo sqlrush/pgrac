@@ -670,6 +670,11 @@ shared_buffer_write_error_callback(void *arg)
 #define cluster_page_wal_snapshot_v1(buffer, out) ((void)(buffer), (void)(out), false)
 #define cluster_page_wal_same_mutation_v1(a, b) ((void)(a), (void)(b), false)
 #define cluster_page_wal_flush_source_v1(a, b) ((void)(a), (void)(b), false)
+/* SPACE recovery writes skip the first-record bookkeeping (R-A22). */
+#define cluster_page_wal_first_observe_locked_v1(buf, out)                                         \
+	((void)(buf), (void)(out), CLUSTER_PAGE_WAL_FIRST_ABSENT)
+#define cluster_page_wal_first_clear_written_locked_v1(buf, observed, token)                       \
+	((void)(buf), (void)(observed), (void)(token), false)
 #include "test_cluster_space_recovery_flush.inc"
 
 static void

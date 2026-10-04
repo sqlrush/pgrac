@@ -168,6 +168,11 @@ typedef struct ClusterPcmLocalPiSnapshotV1 {
  * This can add responsibility, never grant or retire it. Failed retain
  * leaves the previous responsibility intact and the handoff must retry. */
 extern bool cluster_pcm_local_pi_record_v1(BufferTag tag, const ClusterPageWalBindingV1 *binding);
+/* D S09 R-A22: the producer also hands over the first own record since the
+ * page was clean (NULL = binding); the responsibility keeps the earliest. */
+extern bool cluster_pcm_local_pi_record_first_v1(BufferTag tag,
+												 const ClusterPageWalBindingV1 *first,
+												 const ClusterPageWalBindingV1 *binding);
 extern bool cluster_pcm_local_pi_snapshot_v1(BufferTag tag, ClusterPcmLocalPiSnapshotV1 *out);
 
 /* Local PI responsibilities as seen by one WAL source. A responsibility is
