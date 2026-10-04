@@ -529,14 +529,15 @@ typedef struct ClusterReconfigState {
 	 * Author: SqlRush <sqlrush@gmail.com> */
 	ClusterFormationDiskSnapshot formation_disk_snapshot;
 	ClusterFormationCommitMarker startup_formation;
+	ClusterFenceMarker startup_expected_fence;
 	uint64 startup_formation_incarnations[CLUSTER_MAX_NODES];
 } ClusterReconfigState;
 
 /* PGRAC: includes the observation sequence and exact startup cohort binding;
  * the allocator uses sizeof, and all processes require the same build.
  * Author: SqlRush <sqlrush@gmail.com> */
-StaticAssertDecl(sizeof(ClusterReconfigState) == 13872,
-				 "cluster reconfig state must remain exactly 13,872 bytes");
+StaticAssertDecl(sizeof(ClusterReconfigState) == 13936,
+				 "cluster reconfig state must remain exactly 13,936 bytes");
 
 
 /* ============================================================

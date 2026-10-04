@@ -1467,7 +1467,7 @@ UT_TEST(test_self_join_admitted_no_pgproc_never_blocks_on_reconfig_lock)
 /* spec-5.15A: the node-local replacement episode is part of the existing
  * reconfig region and starts as the exact canonical empty image.  Together
  * with the v3 mailbox widening plus P04's volatile fast-rejoin evidence this
- * is the 13,872-byte shared state shape. */
+ * is the 13,936-byte shared state shape. */
 UT_TEST(test_reconfig_replacement_episode_is_embedded_and_zero_initialized)
 {
 	ClusterReconfigState *state;
@@ -1478,7 +1478,7 @@ UT_TEST(test_reconfig_replacement_episode_is_embedded_and_zero_initialized)
 	state = (ClusterReconfigState *)reconfig_shmem_storage;
 	memset(&empty_episode, 0, sizeof(empty_episode));
 
-	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 13872);
+	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 13936);
 	UT_ASSERT_EQ(memcmp(&state->replacement_episode, &empty_episode, sizeof(empty_episode)), 0);
 }
 
@@ -5501,7 +5501,7 @@ UT_TEST(test_reconfig_region3_mailbox_request_word_is_exact_duplex)
 
 	ut_join_setup();
 	state = (ClusterReconfigState *)reconfig_shmem_storage;
-	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 13872);
+	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 13936);
 	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_TARGET_MASK, UINT32_C(0x0000007f));
 	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_RESERVED_MASK, UINT32_C(0x7fffff80));
 	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_VERIFY_COMMITTED_CLOSED, UINT32_C(0x80000000));
