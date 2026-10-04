@@ -43,7 +43,9 @@ typedef enum ClusterWalRetainedPinV1 {
 	/* A relation CREATE/TRUNCATE/DROP in retained history (until CR20). */
 	CLUSTER_WAL_RETAINED_PIN_STRUCTURE = 3,
 	/* An unretired local PI responsibility of this thread. */
-	CLUSTER_WAL_RETAINED_PIN_LOCAL_PI = 4
+	CLUSTER_WAL_RETAINED_PIN_LOCAL_PI = 4,
+	/* A buffer still owes its first own record since it was clean (R-A22). */
+	CLUSTER_WAL_RETAINED_PIN_DIRTY_BUFFER = 5
 } ClusterWalRetainedPinV1;
 
 /* Older generations a census reports as deletable, at most. */
@@ -69,12 +71,28 @@ typedef struct ClusterWalRetainedCutV1 {
 	XLogRecPtr local_pi_floor;
 	uint64 local_pi_bounded;
 	uint64 local_pi_unbounded;
+	uint64 local_pi_pending; /* of which PENDING holder pairs (R-A22) */
+	/* Buffers' first own records since clean (cluster_page_wal_dirty_floor_v1;
+	 * R-A22): the least of this thread's, and how many could not bound it. */
+	XLogRecPtr dirty_floor;
+	uint32 dirty_buffers;
+	uint32 dirty_foreign;
+	uint32 dirty_unattributed;
 	/* Older generations whose WAL serves no obligation and that nothing in
 	 * memory can still reference (the first CLUSTER_WAL_RETAINED_PRUNABLE_MAX
 	 * of prunable_generations).  A judgement only: nothing is deleted. */
 	uint32 prunable_generations;
 	ClusterControlRootIdentity prunable[CLUSTER_WAL_RETAINED_PRUNABLE_MAX];
 } ClusterWalRetainedCutV1;
+
+/*
+ * Checkpointer only, inside CreateCheckPoint after its redo point is chosen
+ * and before CheckPointGuts (D S09 R-A22): snapshots the buffers' first own
+ * records, so a page the checkpoint does not write but someone writes after
+ * its sync barrier (and before the census) is still counted.  The census of
+ * that checkpoint takes the lesser of this snapshot and its own scan.
+ */
+extern void cluster_wal_retained_cut_before_sync_v1(XLogRecPtr redo);
 
 /*
  * Checkpointer (or bgwriter) only, outside CF, after the checkpoint whose
