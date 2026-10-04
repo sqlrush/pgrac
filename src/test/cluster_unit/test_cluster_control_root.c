@@ -9843,6 +9843,130 @@ UT_TEST(test_v3_startup_checkpoint_retry_requires_selected_root_durability)
 	test_reserve_mode = false;
 }
 
+/* Startup publishes the actual origin's checkpoint, including allocator
+ * counters that have advanced independently of the common runtime view.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_v3_startup_publication_and_install_use_native_counters)
+{
+	uint8 before[66048], published[66048];
+	ControlRootImage root, selected;
+	ControlFileData candidate, view;
+	ClusterControlRootFileToken token;
+	ClusterWalStartupImage op = v3_startup_checkpoint_fixture(before, &root, &candidate), durable,
+						   retry;
+	ClusterWalSourceRef writer;
+	ClusterWalHistoryImage history;
+	CheckPoint common = candidate.checkPointCopy;
+	int result;
+
+	if (ut_current_failed)
+		return;
+	candidate.checkPointCopy.nextXid = FullTransactionIdFromU64(4195121);
+	candidate.checkPointCopy.nextOid += 20;
+	candidate.checkPointCopy.nextMulti += 30;
+	candidate.checkPointCopy.nextMultiOffset += 40;
+	candidate.checkPointCopy.oldestXid += 2;
+	candidate.checkPointCopy.oldestXidDB += 1;
+	candidate.checkPointCopy.oldestMulti += 3;
+	candidate.checkPointCopy.oldestMultiDB += 1;
+	candidate.checkPointCopy.oldestActiveXid += 4;
+	INIT_CRC32C(candidate.crc);
+	COMP_CRC32C(candidate.crc, &candidate, offsetof(ControlFileData, crc));
+	FIN_CRC32C(candidate.crc);
+	v2_checkpoint_wal_record(&op.claim.identity, &candidate, 8);
+	history_stage_dirs(0);
+	result = cluster_control_root_v3_startup_checkpoint(&op.claim.identity, op.operation_uuid,
+														&candidate, test_checkpoint_end, &durable);
+	UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		UT_ASSERT(v2_zero(&durable, sizeof(durable)));
+		v2_assert_primary_unchanged(before);
+		test_reserve_mode = false;
+		return;
+	}
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, &selected,
+															 &view, &token),
+				 0);
+	memcpy(published, selected.bytes, sizeof(published));
+	test_actual_cf = test_cf_mode = NoLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_checkpoint(&op.claim.identity, op.operation_uuid,
+															&candidate, test_checkpoint_end,
+															&retry),
+				 0);
+	UT_ASSERT(memcmp(&retry, &durable, sizeof(retry)) == 0);
+	v2_assert_primary_unchanged(published);
+	result = cluster_control_root_v3_startup_install_writer(&durable, &writer);
+	UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		test_reserve_mode = false;
+		return;
+	}
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_read_thread_locked(&op.claim.identity, &selected, &view, &token),
+		0);
+	UT_ASSERT(FullTransactionIdEquals(view.checkPointCopy.nextXid, common.nextXid));
+	UT_ASSERT_EQ(view.checkPointCopy.nextOid, common.nextOid);
+	UT_ASSERT_EQ(view.checkPointCopy.nextMulti, common.nextMulti);
+	UT_ASSERT_EQ(view.checkPointCopy.nextMultiOffset, common.nextMultiOffset);
+	UT_ASSERT_EQ(view.checkPointCopy.oldestXid, common.oldestXid);
+	UT_ASSERT_EQ(view.checkPointCopy.oldestXidDB, common.oldestXidDB);
+	UT_ASSERT_EQ(view.checkPointCopy.oldestMulti, common.oldestMulti);
+	UT_ASSERT_EQ(view.checkPointCopy.oldestMultiDB, common.oldestMultiDB);
+	UT_ASSERT_EQ(view.checkPointCopy.oldestActiveXid, common.oldestActiveXid);
+	UT_ASSERT_EQ(selected.header.v2.serving[0], 0);
+	UT_ASSERT_EQ(selected.header.v2.database_state, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+	UT_ASSERT_EQ(cluster_wal_history_read_locked(&selected, 0, &history), 0);
+	UT_ASSERT_EQ(history.count, 1);
+	UT_ASSERT(memcmp(&history.records[0].snapshot, &op.predecessor.snapshot,
+					 sizeof(op.predecessor.snapshot))
+			  == 0);
+	memcpy(published, selected.bytes, sizeof(published));
+	test_actual_cf = test_cf_mode = NoLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&durable, &writer), 0);
+	v2_assert_primary_unchanged(published);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_v3_startup_install_rejects_changed_native_counters)
+{
+	for (unsigned installed = 0; installed < 2; installed++) {
+		uint8 before[66048];
+		char path[MAXPGPATH];
+		ControlRootImage root;
+		ControlFileData candidate;
+		ClusterWalStartupImage op = v3_startup_checkpoint_fixture(before, &root, &candidate),
+							   durable;
+		ClusterWalSourceRef writer;
+
+		if (ut_current_failed)
+			return;
+		history_stage_dirs(0);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_checkpoint(&op.claim.identity,
+																op.operation_uuid, &candidate,
+																test_checkpoint_end, &durable),
+					 0);
+		if (installed)
+			UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&durable, &writer), 0);
+		path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+		read_all_or_abort(path, before, sizeof(before));
+		/* A correctly encoded replacement record must still match the exact
+		 * selected anchor; a valid record CRC is not sufficient evidence. */
+		candidate.checkPointCopy.nextOid++;
+		v2_checkpoint_wal_record(&op.claim.identity, &candidate, 8);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&durable, &writer),
+					 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+		UT_ASSERT(v2_zero(&writer, sizeof(writer)));
+		v2_assert_primary_unchanged(before);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		test_reserve_mode = false;
+	}
+}
+
 UT_TEST(test_v3_startup_install_retains_predecessor_without_serving)
 {
 	uint8 before[66048];
@@ -22273,7 +22397,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(439);
+	UT_PLAN(441);
 	UT_RUN(test_clean_restart_without_provider_keeps_collective_exit_and_actual_install);
 	UT_RUN(test_clean_restart_without_provider_refuses_missing_exit_formation_and_fence);
 	UT_RUN(test_serving_requires_coordinator_publish_then_startup_is_active);
@@ -22393,6 +22517,8 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_native_driver_uncertain_observation_release_does_not_advance);
 	UT_RUN(test_v3_startup_checkpoint_publishes_only_actual_new_durability);
 	UT_RUN(test_v3_startup_checkpoint_retry_requires_selected_root_durability);
+	UT_RUN(test_v3_startup_publication_and_install_use_native_counters);
+	UT_RUN(test_v3_startup_install_rejects_changed_native_counters);
 	UT_RUN(test_v3_startup_install_retains_predecessor_without_serving);
 	UT_RUN(test_v3_startup_install_refuses_wrong_owner_and_intent);
 	UT_RUN(test_v3_new_generation_archives_the_retained_range);

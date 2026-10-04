@@ -6898,7 +6898,10 @@ startup_checkpoint_publish(StartupCheckpointWork *work, const ClusterControlRoot
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 	}
-	result = cluster_recovery_anchor_v2_read_locked(&anchor_ref, &scan->old_view, &scan->new_view);
+	/* Compare the selected origin's physical checkpoint, not the common
+	 * allocator projection. INSTALL and its reobservation use the same view. */
+	result = cluster_recovery_anchor_v2_read_native_locked(&anchor_ref, &scan->old_view,
+														   &scan->new_view);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (scan->new_view.state != DB_SHUTDOWNED || scan->new_view.checkPoint != cf->checkPoint
@@ -7159,7 +7162,7 @@ startup_install_reobserve(StartupInstallWork *work, bool published)
 	anchor.anchor_generation = check->op.successor.refs.anchor_generation;
 	memcpy(anchor.anchor_sha256, check->op.successor.refs.anchor_sha256, 32);
 	memcpy(anchor.claim_sha256, check->op.successor.refs.claim_sha256, 32);
-	result = cluster_recovery_anchor_v2_read_locked(&anchor, &scan->old_view, &actual);
+	result = cluster_recovery_anchor_v2_read_native_locked(&anchor, &scan->old_view, &actual);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	return memcmp(&actual, &scan->new_view, sizeof(actual)) == 0
@@ -7258,7 +7261,8 @@ startup_install_publish(StartupInstallWork *work, const ClusterWalStartupImage *
 	anchor.anchor_generation = check->op.successor.refs.anchor_generation;
 	memcpy(anchor.anchor_sha256, check->op.successor.refs.anchor_sha256, 32);
 	memcpy(anchor.claim_sha256, check->op.successor.refs.claim_sha256, 32);
-	result = cluster_recovery_anchor_v2_read_locked(&anchor, &scan->old_view, &scan->new_view);
+	result
+		= cluster_recovery_anchor_v2_read_native_locked(&anchor, &scan->old_view, &scan->new_view);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (scan->new_view.state != DB_SHUTDOWNED
