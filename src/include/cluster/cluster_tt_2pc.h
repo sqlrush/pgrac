@@ -40,6 +40,7 @@
 
 #include "c.h"
 #include "access/transam.h"
+#include "access/xlogdefs.h"
 
 #include "cluster/cluster_itl_slot.h" /* UBA (spec-4.8 D7-A undo head) */
 #include "cluster/cluster_scn.h"
@@ -158,14 +159,24 @@ extern void AtPrepare_ClusterTT(void);
 extern void PostPrepare_ClusterTT(void);
 
 /*
- * FinishPreparedTransaction prefinish (C-P6): called AFTER final_scn is
- * produced and BEFORE RecordTransactionCommitPrepared/AbortPrepared.
- * Commit: per-binding 0x30 durable commit + overlay COMMITTED.
- * Abort:  per-binding 0x60 durable abort-clear + overlay ABORTED.
- * Failure here is safe: the xact is still prepared and retryable.
+ * FinishPreparedTransaction two-phase finish (C-P6, F-D-31).
+ * prefinish: AFTER final_scn is produced and BEFORE
+ *   RecordTransactionCommitPrepared/AbortPrepared, prove and stage every
+ *   binding (commit: COMMITTED + final_scn; abort: ABORTED + captured head);
+ *   writes nothing, so a failure leaves the xact prepared and retryable.
+ * emit_staged: in the record's critical section just before the record,
+ *   insert the staged 0x30 (or 0x31 / 0x90) WAL.
+ * apply_staged: in the same critical section after the record is flushed and
+ *   before pg_xact, write the stamps (PANIC on failure).
+ * postfinish: after the gxact is no longer valid, publish allocator, overlay
+ *   and hint, and release the stage.
+ * All but prefinish are no-ops when nothing was staged.
  */
 extern void cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit,
 										  const void *recdata, uint32 len);
+extern void cluster_tt_twophase_emit_staged(TransactionId xid);
+extern void cluster_tt_twophase_apply_staged(TransactionId xid, XLogRecPtr record_end);
+extern void cluster_tt_twophase_postfinish(TransactionId xid);
 
 /*
  * twophase_rmgr callbacks (registered at step 3).  recover re-pins the

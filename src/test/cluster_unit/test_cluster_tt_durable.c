@@ -710,6 +710,19 @@ cluster_undo_emit_tt_slot_bind(uint8 instance, uint32 segment_id, uint32 segment
 }
 
 /* spec-3.15 D5 stub: 0x31 emit (WAL machinery not linked in unit). */
+/* Order of the standalone TT WAL a test emits (0x31 = 'a', 0x90 = 'h',
+ * 0x30 = 'c'). */
+static char g_tt_wal_order[8];
+static int g_tt_wal_count = 0;
+static UBA g_last_set_head;
+
+static void
+note_tt_wal(char kind)
+{
+	if (g_tt_wal_count < (int)sizeof(g_tt_wal_order) - 1)
+		g_tt_wal_order[g_tt_wal_count++] = kind;
+}
+
 XLogRecPtr
 cluster_undo_emit_tt_slot_abort(uint8 instance pg_attribute_unused(),
 								uint32 segment_id pg_attribute_unused(),
@@ -717,6 +730,7 @@ cluster_undo_emit_tt_slot_abort(uint8 instance pg_attribute_unused(),
 								uint16 wrap pg_attribute_unused(),
 								TransactionId xid pg_attribute_unused())
 {
+	note_tt_wal('a');
 	return InvalidXLogRecPtr;
 }
 
@@ -745,9 +759,10 @@ cluster_undo_emit_tt_slot_set_head(uint8 instance pg_attribute_unused(),
 								   uint32 segment_id pg_attribute_unused(),
 								   uint16 slot_offset pg_attribute_unused(),
 								   uint16 wrap pg_attribute_unused(),
-								   TransactionId xid pg_attribute_unused(),
-								   UBA first_undo_block pg_attribute_unused())
+								   TransactionId xid pg_attribute_unused(), UBA first_undo_block)
 {
+	note_tt_wal('h');
+	g_last_set_head = first_undo_block;
 	return InvalidXLogRecPtr;
 }
 
@@ -762,6 +777,7 @@ cluster_undo_emit_tt_slot_commit(uint8 instance pg_attribute_unused(),
 								 TransactionId xid pg_attribute_unused(),
 								 SCN commit_scn pg_attribute_unused())
 {
+	note_tt_wal('c');
 	g_commit_0x30_emits++;
 	return g_commit_0x30_lsn;
 }
@@ -839,10 +855,6 @@ cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent pg_attribute_u
 	g_ctrc_write_order = ++g_ctrc_event_sequence;
 	if (g_require_abort_flush_before_write && !g_abort_flush_seen)
 		return false;
-	if (!XLogRecPtrIsInvalid(g_commit_0x30_lsn)
-		&& (g_flushed_lsn < g_commit_0x30_lsn
-			|| (MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0))
-		g_write_before_flush = true;
 	if (buf != NULL && len == sizeof(TTSlot))
 		memcpy(&g_last_written_slot, buf, sizeof(TTSlot));
 	return g_write_hdr_ok && buf != NULL && len == sizeof(TTSlot);
@@ -1062,6 +1074,9 @@ reset_current_write_mock(void)
 	g_write_before_flush = false;
 	g_commit_0x30_lsn = InvalidXLogRecPtr;
 	g_commit_0x30_emits = 0;
+	memset(g_tt_wal_order, 0, sizeof(g_tt_wal_order));
+	g_tt_wal_count = 0;
+	memset(&g_last_set_head, 0, sizeof(g_last_set_head));
 	memset(&g_fake_proc, 0, sizeof(g_fake_proc));
 }
 
@@ -2480,50 +2495,187 @@ UT_TEST(test_commit_stage_refuses_while_another_stamp_is_staged)
 	UT_ASSERT_EQ(g_current_acquire_calls, 1);
 }
 
-UT_TEST(test_twophase_commit_flushes_0x30_before_stamp_and_delays_checkpoints)
+/* A prepared binding whose slot still names it (xid 100, wrap 5). */
+static void
+seed_prepared_slot(uint8 status)
 {
 	reset_current_write_mock();
 	memset(&g_canned_slot, 0, sizeof(g_canned_slot));
-	g_canned_slot.status = TT_SLOT_ACTIVE;
+	g_canned_slot.status = status;
 	g_canned_slot.xid = 100;
 	g_canned_slot.wrap = 5;
-	g_commit_0x30_lsn = (XLogRecPtr)0x7000;
-
-	cluster_tt_slot_durable_commit(1, 7, 100, 5, scn_encode(1, 42));
-
-	UT_ASSERT_EQ(g_commit_0x30_emits, 1);
-	UT_ASSERT_EQ(g_flushed_lsn, (XLogRecPtr)0x7000);
-	UT_ASSERT_EQ(g_write_hdr_calls, 1);
-	UT_ASSERT(!g_write_before_flush);
-	UT_ASSERT_EQ(g_last_written_slot.status, TT_SLOT_COMMITTED);
-	UT_ASSERT_EQ(MyProc->delayChkptFlags & DELAY_CHKPT_START, 0);
+	g_canned_slot.flags = TT_FLAGS_RESERVED;
+	if (status == TT_SLOT_COMMITTED)
+		g_canned_slot.commit_scn = scn_encode(1, 7);
 }
 
-UT_TEST(test_twophase_commit_write_failure_clears_checkpoint_delay)
+/*
+ * F-D-31: COMMIT PREPARED stages its binding without WAL or write, emits the
+ * 0x30 as a separate step, and writes the COMMITTED successor only on apply.
+ */
+UT_TEST(test_prepared_commit_stage_emits_and_writes_only_when_told)
 {
+	ClusterTTPreparedStage stage;
+	UBA head = InvalidUba_init;
+
+	/* A commit never keeps an undo-chain head, even if one is passed. */
+	head.raw[0] = UINT64_C(1) | (UINT64_C(3) << 32);
+	head.raw[1] = UINT64_C(9);
+	seed_prepared_slot(TT_SLOT_ACTIVE);
+	cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, true, scn_encode(1, 42), head, &stage);
+	UT_ASSERT_EQ(g_write_hdr_calls, 0);
+	UT_ASSERT_EQ(g_tt_wal_count, 0);
+	UT_ASSERT_EQ(g_writer_open_calls, 1);
+	UT_ASSERT_EQ(g_writer_fd_open, 1);
+
+	cluster_tt_slot_durable_prepared_emit(&stage);
+	UT_ASSERT_EQ(g_tt_wal_count, 1);
+	UT_ASSERT_EQ(g_tt_wal_order[0], 'c');
+	UT_ASSERT_EQ(g_write_hdr_calls, 0);
+
+	cluster_tt_slot_durable_prepared_apply(&stage);
+	UT_ASSERT_EQ(g_write_hdr_calls, 1);
+	UT_ASSERT_EQ(g_last_written_slot.status, TT_SLOT_COMMITTED);
+	UT_ASSERT_EQ(g_last_written_slot.xid, 100);
+	UT_ASSERT_EQ(g_last_written_slot.wrap, 5);
+	UT_ASSERT_EQ(g_last_written_slot.commit_scn, scn_encode(1, 42));
+	UT_ASSERT(UBA_is_invalid(g_last_written_slot.first_undo_block));
+	cluster_tt_slot_durable_prepared_release(&stage);
+	UT_ASSERT_EQ(g_writer_fd_open, 0);
+	UT_ASSERT_EQ(stage.fd, -1);
+}
+
+/* ROLLBACK PREPARED: 0x31 then 0x90 for a captured head, and the ABORTED
+ * successor carries that head; without a head there is no 0x90. */
+UT_TEST(test_prepared_abort_stage_carries_the_captured_head)
+{
+	ClusterTTPreparedStage stage;
+	UBA head = InvalidUba_init;
+
+	head.raw[0] = UINT64_C(1) | (UINT64_C(3) << 32);
+	head.raw[1] = UINT64_C(9);
+	seed_prepared_slot(TT_SLOT_ACTIVE);
+	cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, false, InvalidScn, head, &stage);
+	cluster_tt_slot_durable_prepared_emit(&stage);
+	UT_ASSERT_EQ(g_tt_wal_count, 2);
+	UT_ASSERT_EQ(g_tt_wal_order[0], 'a');
+	UT_ASSERT_EQ(g_tt_wal_order[1], 'h');
+	UT_ASSERT_EQ(memcmp(&g_last_set_head, &head, sizeof(head)), 0);
+	UT_ASSERT_EQ(g_write_hdr_calls, 0);
+	cluster_tt_slot_durable_prepared_apply(&stage);
+	UT_ASSERT_EQ(g_last_written_slot.status, TT_SLOT_ABORTED);
+	UT_ASSERT(!SCN_VALID(g_last_written_slot.commit_scn));
+	UT_ASSERT_EQ(memcmp(&g_last_written_slot.first_undo_block, &head, sizeof(head)), 0);
+	cluster_tt_slot_durable_prepared_release(&stage);
+
+	head = (UBA)InvalidUba_init;
+	seed_prepared_slot(TT_SLOT_ACTIVE);
+	cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, false, InvalidScn, head, &stage);
+	cluster_tt_slot_durable_prepared_emit(&stage);
+	UT_ASSERT_EQ(g_tt_wal_count, 1);
+	UT_ASSERT_EQ(g_tt_wal_order[0], 'a');
+	cluster_tt_slot_durable_prepared_apply(&stage);
+	UT_ASSERT(UBA_is_invalid(g_last_written_slot.first_undo_block));
+	cluster_tt_slot_durable_prepared_release(&stage);
+}
+
+/* The slot must still name the binding; an earlier interrupted finish's
+ * terminal state of the same entity is superseded. */
+UT_TEST(test_prepared_stage_requires_the_slot_to_name_the_binding)
+{
+	static const struct {
+		uint8 status;
+		TransactionId xid;
+		uint16 wrap;
+		bool accepted;
+	} cases[] = {
+		{ TT_SLOT_ACTIVE, 100, 5, true },  { TT_SLOT_COMMITTED, 100, 5, true },
+		{ TT_SLOT_ABORTED, 100, 5, true }, { TT_SLOT_ACTIVE, 101, 5, false },
+		{ TT_SLOT_ACTIVE, 100, 6, false }, { TT_SLOT_RECYCLABLE, 100, 5, false },
+		{ TT_SLOT_UNUSED, 0, 0, false },
+	};
+
+	for (int i = 0; i < (int)lengthof(cases); i++) {
+		ClusterTTPreparedStage stage;
+		UBA head = InvalidUba_init;
+		volatile bool caught = false;
+
+		seed_prepared_slot(cases[i].status);
+		g_canned_slot.xid = cases[i].xid;
+		g_canned_slot.wrap = cases[i].wrap;
+		PG_TRY();
+		{
+			cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, true, scn_encode(1, 42), head,
+												   &stage);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, !cases[i].accepted);
+		UT_ASSERT_EQ(g_writer_fd_open, cases[i].accepted ? 1 : 0);
+		UT_ASSERT_EQ(g_write_hdr_calls + g_tt_wal_count, 0);
+		if (cases[i].accepted)
+			cluster_tt_slot_durable_prepared_release(&stage);
+		if (ut_current_failed)
+			printf("# prepared stage case %d\n", i);
+	}
+}
+
+/* An unreadable slot or an unopenable descriptor refuses before anything. */
+UT_TEST(test_prepared_stage_io_failures_refuse_and_leave_nothing)
+{
+	for (int variant = 0; variant < 2; variant++) {
+		ClusterTTPreparedStage stage;
+		UBA head = InvalidUba_init;
+		volatile bool caught = false;
+
+		seed_prepared_slot(TT_SLOT_ACTIVE);
+		if (variant == 0)
+			g_read_hdr_ok = false;
+		else
+			g_writer_open_ok = false;
+		PG_TRY();
+		{
+			cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, true, scn_encode(1, 42), head,
+												   &stage);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(g_writer_fd_open, 0);
+		UT_ASSERT_EQ(g_write_hdr_calls + g_tt_wal_count, 0);
+		g_read_hdr_ok = true;
+	}
+}
+
+/* A failed write after the record is a PANIC: redo restamps the slot. */
+UT_TEST(test_prepared_apply_write_failure_panics)
+{
+	ClusterTTPreparedStage stage;
+	UBA head = InvalidUba_init;
 	volatile bool caught = false;
 
-	reset_current_write_mock();
-	memset(&g_canned_slot, 0, sizeof(g_canned_slot));
-	g_canned_slot.status = TT_SLOT_ACTIVE;
-	g_canned_slot.xid = 100;
-	g_canned_slot.wrap = 5;
-	g_commit_0x30_lsn = (XLogRecPtr)0x7000;
+	seed_prepared_slot(TT_SLOT_ACTIVE);
+	cluster_tt_slot_durable_prepared_stage(1, 7, 100, 5, true, scn_encode(1, 42), head, &stage);
 	g_write_hdr_ok = false;
-
 	PG_TRY();
 	{
-		cluster_tt_slot_durable_commit(1, 7, 100, 5, scn_encode(1, 42));
+		cluster_tt_slot_durable_prepared_apply(&stage);
 	}
 	PG_CATCH();
 	{
 		caught = true;
 	}
 	PG_END_TRY();
-
 	UT_ASSERT(caught);
-	UT_ASSERT_EQ(MyProc->delayChkptFlags & DELAY_CHKPT_START, 0);
+	UT_ASSERT_EQ(last_ereport_elevel, PANIC);
 	g_write_hdr_ok = true;
+	cluster_tt_slot_durable_prepared_release(&stage);
 }
 
 UT_TEST(test_commit_stage_release_failure_is_nothrow_cleanup)
@@ -3322,7 +3474,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(105);
+	UT_PLAN(108);
 
 	UT_RUN(test_layout_sizes);
 
@@ -3377,8 +3529,11 @@ main(int argc, char **argv)
 	UT_RUN(test_commit_unstage_releases_reservation_without_write);
 	UT_RUN(test_commit_stage_writer_open_failure_refuses_and_unpins);
 	UT_RUN(test_commit_stage_refuses_while_another_stamp_is_staged);
-	UT_RUN(test_twophase_commit_flushes_0x30_before_stamp_and_delays_checkpoints);
-	UT_RUN(test_twophase_commit_write_failure_clears_checkpoint_delay);
+	UT_RUN(test_prepared_commit_stage_emits_and_writes_only_when_told);
+	UT_RUN(test_prepared_abort_stage_carries_the_captured_head);
+	UT_RUN(test_prepared_stage_requires_the_slot_to_name_the_binding);
+	UT_RUN(test_prepared_stage_io_failures_refuse_and_leave_nothing);
+	UT_RUN(test_prepared_apply_write_failure_panics);
 	UT_RUN(test_commit_stage_release_failure_is_nothrow_cleanup);
 	UT_RUN(test_ordinary_abort_flushes_exact_carrier_before_terminal_write);
 	UT_RUN(test_commit_stage_missing_canonical_active_refuses_without_write);

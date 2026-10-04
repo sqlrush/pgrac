@@ -183,20 +183,35 @@ extern ClusterTTDurableResolve
 cluster_tt_durable_classify(int xid_matches, bool match_has_valid_scn, bool scan_complete);
 
 /*
- * cluster_tt_slot_durable_commit -- durably stamp commit_scn (status COMMITTED)
- *	on the own-instance TT slot (segment_id, slot_offset) owned by `xid`/`wrap`.
- *	Emits and flushes XLOG_UNDO_TT_SLOT_COMMIT (before the commit record --
- *	caller is the 2PC pre-finish hook), then per-slot 32-byte targeted write of
- *	the TTSlot, delaying checkpoints across both.  No fsync (WAL-protected
- *	until the next checkpoint fsyncs it).  ereport(ERROR) on I/O failure.
+ * Two-phase finish (F-D-31).  _prepared_stage proves one prepared transaction
+ * binding (the slot must still name xid/wrap) and opens the descriptor of its
+ * write; ereport(ERROR) on failure, leaving the transaction prepared.  Inside
+ * the COMMIT/ROLLBACK PREPARED critical section, _prepared_emit inserts the
+ * binding's standalone TT WAL (0x30, or 0x31 and 0x90 for a captured undo-chain
+ * head) just before the record, and _prepared_apply writes the successor after
+ * the record is flushed (PANIC on failure).  _prepared_release never throws.
  */
-extern void cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset, TransactionId xid,
-										   uint16 wrap, SCN commit_scn);
+typedef struct ClusterTTPreparedStage {
+	uint32 segment_id;
+	uint16 slot_offset;
+	uint8 owner;
+	uint8 intent; /* ClusterUndoPathIntent of the write */
+	int fd;		  /* private write descriptor, -1 when none */
+	bool emit_head;
+	TTSlot successor;
+} ClusterTTPreparedStage;
+
+extern void cluster_tt_slot_durable_prepared_stage(uint32 segment_id, uint16 slot_offset,
+												   TransactionId xid, uint16 wrap, bool commit,
+												   SCN commit_scn, UBA head,
+												   ClusterTTPreparedStage *stage);
+extern void cluster_tt_slot_durable_prepared_emit(const ClusterTTPreparedStage *stage);
+extern void cluster_tt_slot_durable_prepared_apply(ClusterTTPreparedStage *stage);
+extern void cluster_tt_slot_durable_prepared_release(ClusterTTPreparedStage *stage);
 
 /*
  * cluster_tt_slot_durable_commit_stage -- spec-3.18 D4.1 (normal commit).
- *	Proves the same per-slot 32-byte COMMITTED transition as
- *	cluster_tt_slot_durable_commit against the exact canonical ACTIVE
+ *	Proves the per-slot 32-byte COMMITTED transition against the exact canonical ACTIVE
  *	predecessor, WITHOUT the standalone XLOG_UNDO_TT_SLOT_COMMIT (0x30) and
  *	without writing: the caller folds an equivalent xl_xact_tt_commit delta
  *	into the commit record and calls cluster_tt_slot_durable_commit_apply()
@@ -230,21 +245,12 @@ extern XLogRecPtr cluster_tt_slot_durable_abort_exact(
 	uint16 wrap, const ClusterSemanticAdmissionToken *admission, TTSlot *successor_out);
 
 /*
- * cluster_tt_slot_durable_abort -- spec-3.15 D5 (ROLLBACK PREPARED).
- * Stamps TT_SLOT_ABORTED preserving xid/wrap (V-2), emitting 0x31.
- * Same C10 durability contract as durable_commit.
+ * cluster_tt_slot_durable_abort -- spec-3.15 D5.  Stamps TT_SLOT_ABORTED
+ * preserving xid/wrap (V-2), emitting 0x31 first.  Used by crash-left ACTIVE
+ * resolution; ROLLBACK PREPARED uses the staged two-phase finish above.
  */
 extern void cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, TransactionId xid,
 										  uint16 wrap);
-
-/*
- * cluster_tt_slot_durable_set_head -- spec-4.8 D7-A.  Durably stamp the slot's
- *	undo-chain head (first_undo_block) via WAL 0x90 + targeted RMW, gated by the
- *	slot still owning (xid, wrap); does not change slot.status.  Called from the
- *	ROLLBACK PREPARED prefinish abort path so D7 physical rollback can walk it.
- */
-extern void cluster_tt_slot_durable_set_head(uint32 segment_id, uint16 slot_offset,
-											 TransactionId xid, uint16 wrap, UBA first_undo_block);
 
 /*
  * cluster_tt_slot_durable_lookup -- read the durable TT slot (segment_id,
