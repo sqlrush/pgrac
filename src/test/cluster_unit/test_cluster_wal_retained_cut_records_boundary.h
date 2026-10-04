@@ -108,6 +108,15 @@ cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out pg_attribute_unused()
 	abort();
 }
 
+/* No buffer owes a first record (R-A22). */
+bool
+cluster_page_wal_dirty_floor_v1(const ClusterWalSourceRef *source pg_attribute_unused(),
+								ClusterPageWalDirtyFloorV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	return true;
+}
+
 /* No local PI responsibility: every source completes at its native redo. */
 bool
 cluster_pcm_local_pi_floor_v1(const ClusterWalSourceRef *source pg_attribute_unused(),

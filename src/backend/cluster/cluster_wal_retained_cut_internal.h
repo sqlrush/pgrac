@@ -24,6 +24,7 @@
 
 #include "access/xlogreader.h"
 #include "cluster/cluster_page_detached.h"
+#include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pi_write.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_side_xact.h"
@@ -100,6 +101,7 @@ typedef struct RetainedCutWork {
 	uint32 nsources;
 	int32 self;
 	ClusterPcmLocalPiFloorV1 local_pi;
+	ClusterPageWalDirtyFloorV1 dirty;
 	RetainedSource sources[CLUSTER_WAL_INPUTS_MAX];
 	RetainedBucket *sketch;
 	/* SIDE owner bits of all obligations, of obligations whose keys could

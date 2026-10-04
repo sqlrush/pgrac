@@ -44,7 +44,7 @@ UT_TEST(test_retained_cut_moves_to_native_redo_without_obligations)
 	two_writers(&self, &peer);
 	add_record(self, 0x1000, 0x1100, 100, 1, 2);
 	add_record(self, 0x2000, 0x2100, 101, 2, 3);
-	add_record(peer, 0x5100, 0x5200, 102, 3, 4); /* peer history */
+	add_record(peer, 0x4f00, 0x5000, 102, 3, 4); /* peer history: before its lower */
 	add_record(self, 0x2f00, 0x3000, 104, 5, 6); /* ends exactly at the redo */
 	add_record(self, 0x3000, 0x3100, 103, 4, 5); /* self obligation, own page */
 	UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
@@ -866,6 +866,153 @@ UT_TEST(test_retained_cut_older_generation_deletable_only_when_proven)
 			UT_ASSERT(cut_names(&cut, peer_old));
 		if (ut_current_failed)
 			printf("# older generation variant %d\n", variant);
+	}
+}
+
+/*
+ * D S09 R-A22: this thread completes no later than its buffers' first own
+ * records since they were clean, read before the local PI directory.  A
+ * buffer whose first record cannot be attributed, or is another source's,
+ * keeps the published lower; the lesser of the PI and buffer floors binds.
+ */
+UT_TEST(test_r_a22_dirty_floor_holds_this_thread)
+{
+	for (int variant = 0; variant < 6; variant++) {
+		uint32 self, peer;
+		ClusterWalRetainedCutV1 cut;
+		RfPageProofDetailV1 detail;
+		XLogRecPtr lower = 0x2000;
+		ClusterWalRetainedPinV1 pin = CLUSTER_WAL_RETAINED_PIN_DIRTY_BUFFER;
+
+		two_writers(&self, &peer);
+		add_record(self, 0x1000, 0x1100, 100, 1, 2);
+		add_record(self, 0x2000, 0x2100, 101, 1, 2);
+		add_record(self, 0x2800, 0x2900, 101, 2, 3);
+		dirty.floor = 0x2000;
+		dirty.dirty = 1;
+		if (variant == 1) { /* after the native redo */
+			dirty.floor = 0x3800;
+			lower = SELF_REDO;
+			pin = CLUSTER_WAL_RETAINED_PIN_NONE;
+		} else if (variant == 2) { /* unattributable */
+			dirty.unattributed = 1;
+			lower = SELF_LOWER;
+		} else if (variant == 3) { /* another source's first record */
+			dirty.foreign = 1;
+			lower = SELF_LOWER;
+		} else if (variant == 4) { /* the buffer floor is below the PI floor */
+			local_pi.floor = 0x2800;
+			local_pi.bounded = 1;
+		} else if (variant == 5) { /* the PI floor is below the buffer floor */
+			dirty.floor = 0x2800;
+			local_pi.floor = 0x2000;
+			local_pi.bounded = 1;
+			pin = CLUSTER_WAL_RETAINED_PIN_LOCAL_PI;
+		}
+		UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(cut.lower, lower);
+		UT_ASSERT_EQ(cut.pin, pin);
+		UT_ASSERT_EQ(cut.dirty_floor, dirty.floor);
+		UT_ASSERT_EQ(cut.dirty_unattributed, dirty.unattributed);
+		UT_ASSERT_EQ(cut.dirty_foreign, dirty.foreign);
+		UT_ASSERT_EQ(dirty_calls, 1);
+		UT_ASSERT(dirty_scanned_at > 0 && dirty_scanned_at < local_pi_scanned_at);
+		if (ut_current_failed)
+			printf("# dirty floor variant %d\n", variant);
+	}
+	/* A buffer scan that cannot run refuses the census like the directory. */
+	{
+		uint32 self, peer;
+		ClusterWalRetainedCutV1 cut;
+		RfPageProofDetailV1 detail;
+
+		two_writers(&self, &peer);
+		dirty_ok = false;
+		UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+		UT_ASSERT_EQ(local_pi_calls, 0);
+	}
+}
+
+/*
+ * The checkpoint's pre-sync snapshot counts a buffer the census itself no
+ * longer sees (written after the sync barrier, not yet fsynced); it is used
+ * by that one census only, and only for the same writer.
+ */
+UT_TEST(test_r_a22_presync_snapshot_is_merged_once)
+{
+	uint32 self, peer;
+	ClusterWalRetainedCutV1 cut;
+	RfPageProofDetailV1 detail;
+
+	two_writers(&self, &peer);
+	add_record(self, 0x1000, 0x1100, 100, 1, 2);
+	add_record(self, 0x1800, 0x1900, 101, 1, 2);
+	add_record(self, 0x2800, 0x2900, 101, 2, 3);
+	dirty.floor = 0x1800;
+	dirty.dirty = 1;
+	MyAuxProcType = NotAnAuxProcess;
+	cluster_wal_retained_cut_before_sync_v1(SELF_REDO); /* not the checkpointer */
+	MyAuxProcType = CheckpointerProcess;
+	memset(&dirty, 0, sizeof(dirty));
+	UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(cut.lower, SELF_REDO);
+
+	dirty.floor = 0x1800;
+	dirty.dirty = 1;
+	cluster_wal_retained_cut_before_sync_v1(SELF_REDO);
+	memset(&dirty, 0, sizeof(dirty)); /* written after the barrier */
+	UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(cut.lower, 0x1800);
+	UT_ASSERT_EQ(cut.pin, CLUSTER_WAL_RETAINED_PIN_DIRTY_BUFFER);
+	UT_ASSERT_EQ(cut.dirty_floor, 0x1800);
+	/* Used once. */
+	UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(cut.lower, SELF_REDO);
+
+	/* Another writer's snapshot is not this census's. */
+	dirty.floor = 0x1800;
+	dirty.dirty = 1;
+	cluster_wal_retained_cut_before_sync_v1(SELF_REDO);
+	memset(&dirty, 0, sizeof(dirty));
+	self_ref.claim.claim_sha256[31]++;
+	items[self].source = self_ref;
+	items[self].checkpoint.identity = self_ref.claim.identity;
+	UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(cut.lower, SELF_REDO);
+}
+
+/*
+ * R-A22 point 3: another OPEN or RECOVERY_REQUIRED thread completes at its
+ * published lower, not its native redo, so its records in [lower, redo) are
+ * obligations and this thread keeps the history they need.
+ */
+UT_TEST(test_r_a22_peer_completion_is_its_published_lower)
+{
+	static const uint8 lifecycle[]
+		= { CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED };
+
+	for (int variant = 0; variant < 3; variant++) {
+		uint32 self, peer;
+		ClusterWalRetainedCutV1 cut;
+		RfPageProofDetailV1 detail;
+
+		reset();
+		self = add_item(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, SELF_LOWER, SELF_REDO, SELF_TAIL,
+						true);
+		peer = add_item(2, lifecycle[variant % 2], 0x5000, 0x6000, 0x7000, variant == 0);
+		add_record(self, 0x1000, 0x1100, 100, 1, 2);
+		add_record(self, 0x1800, 0x1900, 700, 4, 5); /* successor of the peer change */
+		add_record(peer, 0x5100, 0x5200, 700, 3, 4); /* after its lower, before its redo */
+		if (variant == 2) /* a peer that never published a lower cannot complete */
+			items[peer].checkpoint.checkpoint_lower_lsn = InvalidXLogRecPtr;
+		UT_ASSERT_EQ(compute(&cut, &detail), variant == 2 ? CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH
+														  : CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		if (variant < 2) {
+			UT_ASSERT_EQ(cut.lower, 0x1800);
+			UT_ASSERT_EQ(cut.pin, CLUSTER_WAL_RETAINED_PIN_PAGE);
+		}
+		if (ut_current_failed)
+			printf("# peer lifecycle variant %d\n", variant);
 	}
 }
 
