@@ -3288,6 +3288,7 @@ cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullS
 {
 	ClusterNormalStopModuleObservation ignored;
 	ClusterPhase1FullStopPlan observed;
+	const ClusterPhase1FullStopPlan *current_observation = NULL;
 	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
 	uint32 phase, peer_bits;
 	uint64 now;
@@ -3323,10 +3324,31 @@ cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullS
 	result = cl_normal_stop_checkpoint_state_locked(expected_services, phase, now)
 				 ? CLUSTER_NORMAL_STOP_READY
 				 : CLUSTER_NORMAL_STOP_INVALID;
+	if (result == CLUSTER_NORMAL_STOP_READY && cluster_shared_config
+		&& phase == CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK) {
+		peer_bits = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
+		if (cl_state->ack_bitmap[0] != peer_bits || cl_normal_stop->peer_reply_sent != peer_bits
+			|| cl_normal_stop->peer_reply_pending != 0) {
+			/* The remote producer still needs the original control services.
+			 * Re-reading ROOT cannot supply its missing ACK, and creates CF
+			 * debt that can prevent that peer from finishing its own cut. */
+			result = CLUSTER_NORMAL_STOP_PENDING;
+			observation->reason = "NORMAL_STOP_AWAIT_ALL_PRODUCER_ACKS";
+		}
+	}
 	LWLockRelease(&cl_state->lock);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
-	result = cluster_normal_stop_modules_poll(false, observation);
+	if (cluster_shared_config) {
+		result = cl_normal_stop_identity_poll(false, &observed, &observation->reason);
+		if (result != CLUSTER_NORMAL_STOP_READY)
+			return result;
+		/* One confirmed CF observation belongs to this synchronous call.
+		 * Each census and the final cut recheck its live identity, without
+		 * dispatching new control work AFTER observing those owners idle. */
+		current_observation = &observed;
+	}
+	result = cl_normal_stop_modules_poll(false, true, observation, current_observation);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
 	if (phase == CLUSTER_NORMAL_STOP_DRAIN) {
@@ -3353,21 +3375,24 @@ cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullS
 		/* Work admitted before seal 1 may have finished after the earlier
 		 * census and left shared debt despite a now-idle actor. The sealed
 		 * producer cut must precede the census that authorizes our ACK. */
-		result = cluster_normal_stop_modules_poll(false, observation);
+		result = cl_normal_stop_modules_poll(false, true, observation, current_observation);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return result;
 	} else if (phase == CLUSTER_NORMAL_STOP_QUIESCE) {
 		/* A cleaner's final pass or previously admitted service can complete
 		 * after the first census. Inspect again after observing every park;
 		 * this authorizes our producer ACK, never an early data seal. */
-		result = cluster_normal_stop_modules_poll(false, observation);
+		result = cl_normal_stop_modules_poll(false, true, observation, current_observation);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return result;
 	}
 	/* A service may have entered after the module poll or seal 1. Recheck
 	 * its original active/idle publication under the SAME leave lock that
 	 * admits work, immediately before either phase transition. */
-	result = cl_normal_stop_identity_poll(false, &observed, &observation->reason);
+	result = current_observation != NULL
+				 ? cl_normal_stop_identity_recheck(false, current_observation, &observed,
+												   &observation->reason)
+				 : cl_normal_stop_identity_poll(false, &observed, &observation->reason);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
 	result = CLUSTER_NORMAL_STOP_PENDING;
