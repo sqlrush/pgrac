@@ -155,7 +155,8 @@ wb_rejected(ClusterPiWritebackRejectionV1 reason, const BufferTag *tag, int32 pe
 			uint64 boot)
 {
 	static const char *const names[]
-		= { "DATA_PROOF", "LOCAL_ACK", "REMOTE_ACK", "MASTER_CUT", "PEER_PHYSICAL", "RECOVERY_PROOF" };
+		= { "DATA_PROOF",	 "LOCAL_ACK",	   "REMOTE_ACK",	 "MASTER_CUT",
+			"PEER_PHYSICAL", "RECOVERY_PROOF", "STRUCTURE_OWNER" };
 	bool log;
 	if (wb_shared == NULL || tag == NULL || (uint32)reason >= CLUSTER_PI_WRITEBACK_REJECTION_COUNT)
 		return;
@@ -1284,10 +1285,9 @@ cluster_pi_writeback_notice_read_v1(const ClusterPiWritebackNoticeV1 *notice, ui
 	return true;
 }
 
-bool
-cluster_pi_writeback_structural_notice_read_v2(const ClusterPiWritebackNoticeV1 *notice,
-											   uint32 index, uint64 *revision,
-											   ClusterPiWritebackFactV2 *out)
+static bool
+wb_structural_notice_read_v2(const ClusterPiWritebackNoticeV1 *notice, uint32 index,
+							 uint64 *revision, ClusterPiWritebackFactV2 *out, uint32 kind)
 {
 	bool live;
 	if (notice == NULL || notice != wb_notice || out == NULL || revision == NULL
@@ -1296,7 +1296,7 @@ cluster_pi_writeback_structural_notice_read_v2(const ClusterPiWritebackNoticeV1 
 		|| notice->revision == UINT64_MAX || notice->version != 2
 		|| index >= notice->request_v2.count
 		|| !cluster_pi_writeback_request_current_v2(&notice->request_v2, false)
-		|| notice->request_v2.facts[index].kind != CLUSTER_PI_WRITEBACK_STRUCTURAL_V2)
+		|| notice->request_v2.facts[index].kind != kind)
 		return false;
 	SpinLockAcquire(&wb_shared->lock);
 	live = wb_shared->inbound_version == 2 && wb_shared->inbound_state == WB_RUNNING
@@ -1310,9 +1310,25 @@ cluster_pi_writeback_structural_notice_read_v2(const ClusterPiWritebackNoticeV1 
 	return true;
 }
 
-/* Only original page-master notifications have a disposal consumer here.
- * Relation offers need the original master's result-owner handoff before
- * they can be acknowledged; a page slot cannot stand in for that owner. */
+bool
+cluster_pi_writeback_structural_notice_read_v2(const ClusterPiWritebackNoticeV1 *notice,
+											   uint32 index, uint64 *revision,
+											   ClusterPiWritebackFactV2 *out)
+{
+	return wb_structural_notice_read_v2(notice, index, revision, out,
+										CLUSTER_PI_WRITEBACK_STRUCTURAL_V2);
+}
+
+bool
+cluster_pi_writeback_structure_offer_read_v2(const ClusterPiWritebackNoticeV1 *notice, uint32 index,
+											 uint64 *revision, ClusterPiWritebackFactV2 *out)
+{
+	return wb_structural_notice_read_v2(notice, index, revision, out,
+										CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2);
+}
+
+/* Relation offers reach the original KO owner before an ownership ACK is
+ * possible. They never use a page receipt as a substitute for that owner. */
 static void
 wb_ingress_v2(const ClusterICEnvelope *env, const void *payload)
 {
@@ -1347,8 +1363,10 @@ wb_ingress_v2(const ClusterICEnvelope *env, const void *payload)
 		return;
 	}
 	if (m.verb != CLUSTER_PI_WRITEBACK_NOTIFY
-		|| m.facts[0].kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2
-		|| env->source_node_id != (uint32)wb_master(wb_v2_page(&m.facts[0]))
+		|| env->source_node_id
+			   != (uint32)(m.facts[0].kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2
+							   ? m.facts[0].proof.structural.ko.origin_node
+							   : wb_master(wb_v2_page(&m.facts[0])))
 		|| !cluster_pi_writeback_request_current_v2(&m, false))
 		return;
 	SpinLockAcquire(&wb_shared->lock);
@@ -1484,6 +1502,29 @@ wb_reply_current_v2(const ClusterPiWritebackMessageV2 *request,
 		   && cluster_wal_thread_current_v2_ref(&local) && wb_source_covered(&local, &reply->peer);
 }
 
+static void
+wb_accept_structure_offers(void)
+{
+	ClusterPiWritebackMessageV2 reply = wb_notice->request_v2;
+	reply.verb = CLUSTER_PI_WRITEBACK_ACK;
+	reply.count = 0;
+	for (uint32 i = 0; i < wb_notice->request_v2.count; i++) {
+		const ClusterPiWritebackFactV2 *fact = &wb_notice->request_v2.facts[i];
+		if (cluster_ko_shared_structure_accept_v2(wb_notice, i))
+			reply.facts[reply.count++] = *fact;
+		else {
+			BufferTag tag;
+			const ClusterPiStructuralFactV2 *s = &fact->proof.structural;
+			InitBufferTag(&tag, &s->terminal.binding.identity.locator, SPACE_FORKNUM, 0);
+			wb_rejected(CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER, &tag, s->ko.origin_node, reply.epoch,
+						reply.peer.claim.identity.origin_owner_incarnation);
+		}
+	}
+	/* The origin keeps every unacknowledged result. Accepted KO slots are
+	 * independent of this notice even if this last check rejects the reply. */
+	wb_server_finish(wb_reply_current_v2(&wb_notice->request_v2, &reply) ? &reply : NULL);
+}
+
 bool
 cluster_pi_writeback_bgwriter_tick_v1(void)
 {
@@ -1548,6 +1589,12 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 		return true;
 	}
 	v2 = wb_notice->version == 2;
+	if (v2 && wb_notice->request_v2.facts[0].kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2) {
+		/* Responsibility transfer needs no WAL read pin. Every eventual
+		 * page retirement still builds and verifies its own sealed plan. */
+		wb_accept_structure_offers();
+		return true;
+	}
 	if (v2) {
 		request_v2 = wb_notice->request_v2;
 		peer = &request_v2.peer;
@@ -2018,8 +2065,12 @@ wb_lmon_reply_v2(uint64 revision, const ClusterPiWritebackMessageV2 *request,
 	SpinLockRelease(&wb_shared->lock);
 	if (!send)
 		return;
-	sent = cluster_ic_send_envelope(PGRAC_IC_MSG_PI_WRITEBACK,
-									wb_master(wb_v2_page(&request->facts[0])), bytes, length);
+	sent
+		= cluster_ic_send_envelope(PGRAC_IC_MSG_PI_WRITEBACK,
+								   request->facts[0].kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2
+									   ? request->facts[0].proof.structural.ko.origin_node
+									   : wb_master(wb_v2_page(&request->facts[0])),
+								   bytes, length);
 	if (sent != CLUSTER_IC_SEND_DONE && sent != CLUSTER_IC_SEND_WOULD_BLOCK) {
 		SpinLockAcquire(&wb_shared->lock);
 		if (wb_shared->inbound_version == 2 && wb_shared->inbound_revision == revision

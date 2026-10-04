@@ -1892,7 +1892,10 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 int
 main(void)
 {
-	UT_PLAN(57);
+	printf("# sizeof_WritebackShared=%zu\n", sizeof(WritebackShared));
+	UT_PLAN(59);
+	UT_RUN(writeback_v2_relation_offer_ack_requires_original_owner_acceptance);
+	UT_RUN(writeback_v2_relation_offer_reader_rejects_lost_original_notice);
 	UT_RUN(writeback_v2_structural_empty_ack_keeps_page_obligation);
 	UT_RUN(writeback_v2_structural_job_binds_original_fact_and_ack);
 	UT_RUN(writeback_v2_structural_job_refuses_missing_original_owner);

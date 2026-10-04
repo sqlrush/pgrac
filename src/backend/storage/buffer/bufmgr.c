@@ -11626,30 +11626,34 @@ bool
 cluster_page_structural_pi_fact_v2(const ClusterPageStructuralReceiptV2 *receipt,
 	int32 peer, struct ClusterPiWritebackFactV2 *out)
 {
-	ClusterPiWritebackFactV2 fact;
+	ClusterPiWritebackFactV2 fact = { 0 };
+	ClusterPiStructuralFactV2 *proof = &fact.proof.structural;
 	ClusterPcmPiWriteCutV1 x;
 	ClusterPcmPiStorageCutV1 s;
 	uint8 actual[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], expected[sizeof(actual)];
-	uint32 cursor, holders;
-	uint64 serial;
+	uint32 holders;
 	if (out == NULL || peer < 0 || peer >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| peer == cluster_node_id || !cluster_page_structural_pi_proof_v2(receipt, &x, &s))
 		return false;
+
 	holders = x.binding_generation != 0 ? x.pi_holders_bitmap : s.pi_holders_bitmap;
-	cursor = receipt->slot;
 	if ((holders & ((uint32)1u << peer)) == 0
-		|| !cluster_ko_shared_structure_offer_next_v2(&cursor, peer, &serial, &fact)
-		|| cursor != receipt->slot + 1 || serial != receipt->serial
-		|| fact.kind != CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2
-		|| memcmp(&fact.proof.structural.terminal.binding, &receipt->terminal,
-			sizeof(receipt->terminal)) != 0
-		|| !cluster_space_structure_wal_encode(&fact.proof.structural.change, actual, sizeof(actual))
+		|| !cluster_ko_shared_structure_observation_v2(
+			receipt->slot, receipt->serial, &proof->terminal.binding, actual, sizeof(actual))
+		|| memcmp(&proof->terminal.binding, &receipt->terminal, sizeof(receipt->terminal)) != 0
 		|| !cluster_space_structure_wal_encode(&receipt->change, expected, sizeof(expected))
-		|| memcmp(actual, expected, sizeof(actual)) != 0)
+		|| memcmp(actual, expected, sizeof(actual)) != 0
+		|| !cluster_ko_shared_structure_peer_v2(receipt->slot, receipt->serial, peer, &proof->ko))
 		return false;
 	fact.kind = CLUSTER_PI_WRITEBACK_STRUCTURAL_V2;
-	fact.proof.structural.terminal.write_cut = x;
-	fact.proof.structural.terminal.storage_cut = s;
+	proof->change = receipt->change;
+	proof->durability_flags
+		= CLUSTER_PI_STRUCTURAL_WAL_FLUSHED | CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK
+		  | CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED | CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE;
+	if (proof->change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE)
+		proof->durability_flags |= CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
+	proof->terminal.write_cut = x;
+	proof->terminal.storage_cut = s;
 	*out = fact;
 	return true;
 }

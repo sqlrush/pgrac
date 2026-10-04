@@ -128,6 +128,7 @@ typedef enum ClusterPiWritebackRejectionV1 {
 	CLUSTER_PI_WRITEBACK_MASTER_CUT,
 	CLUSTER_PI_WRITEBACK_PEER_PHYSICAL,
 	CLUSTER_PI_WRITEBACK_RECOVERY_PROOF,
+	CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER,
 	CLUSTER_PI_WRITEBACK_REJECTION_COUNT
 } ClusterPiWritebackRejectionV1;
 
@@ -140,6 +141,12 @@ typedef struct ClusterPiWritebackRejectionsV1 {
 	uint32 last_reason;
 	int32 last_peer;
 } ClusterPiWritebackRejectionsV1;
+/* A live original kind3 notice is a responsibility handoff, never a page
+ * receipt. Refusal preserves both outputs; no copied/unregistered notice is
+ * accepted. Only the original KO owner consumes this observation. */
+extern bool cluster_pi_writeback_structure_offer_read_v2(const ClusterPiWritebackNoticeV1 *notice,
+														 uint32 index, uint64 *revision,
+														 ClusterPiWritebackFactV2 *out);
 extern bool cluster_pi_writeback_rejections_v1(ClusterPiWritebackRejectionsV1 *out);
 
 extern bool cluster_pi_writeback_encode_v1(const ClusterPiWritebackMessageV1 *message, uint8 *bytes,

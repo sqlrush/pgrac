@@ -817,6 +817,158 @@ wb_v2_offer_fixture(ClusterPiWritebackMessageV2 *m, const ClusterPiDataFactV1 *d
 		sizeof(m->facts[0].proof.structural.terminal.storage_cut));
 }
 
+static uint32 wb_offer_accept_mask;
+static unsigned wb_offer_accept_calls;
+/* The real KO fixed-slot owner is tested in ko_stop. This endpoint fixture
+ * checks the authenticated notice boundary and only acknowledges accepted
+ * ownership, without manufacturing PAGE/physical disposal authority. */
+bool
+cluster_ko_shared_structure_accept_v2(const ClusterPiWritebackNoticeV1 *notice, uint32 index)
+{
+	ClusterPiWritebackFactV2 fact;
+	uint64 revision;
+	bool live = cluster_pi_writeback_structure_offer_read_v2(notice, index, &revision, &fact);
+	UT_ASSERT(live);
+	if (!live)
+		return false;
+	UT_ASSERT_EQ(fact.kind, CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2);
+	UT_ASSERT_EQ(revision, wb_shared->inbound_revision);
+	wb_offer_accept_calls++;
+	return (wb_offer_accept_mask & (1u << index)) != 0;
+}
+
+UT_TEST(writeback_v2_relation_offer_ack_requires_original_owner_acceptance)
+{
+	for (unsigned mask = 0; mask < 8; mask++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiDataFactV1 data;
+		ClusterPiWritebackMessageV2 request, reply;
+		ClusterPiStructuralFactV2 *second;
+		uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
+		Size length;
+		UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &data));
+		data.binding.source = wb_sources[(mask & 4) ? 2 : 0];
+		wb_v2_offer_fixture(&request, &data, false);
+		request.count = 2;
+		request.facts[1] = request.facts[0];
+		second = &request.facts[1].proof.structural;
+		second->terminal.binding.identity.locator.relNumber++;
+		second->ko.key.locator.relNumber++;
+		second->change.identity.expected.key.locator.relNumber++;
+		second->change.identity.result.key.locator.relNumber++;
+		second->change.reservation.before.identity.key.locator.relNumber++;
+		second->change.reservation.result.identity.key.locator.relNumber++;
+		UT_ASSERT(cluster_pi_writeback_encode_v2(&request, bytes, sizeof(bytes), &length));
+		wb_offer_accept_mask = mask;
+		wb_offer_accept_calls = 0;
+		wb_deliver(request.facts[0].proof.structural.ko.origin_node, 1, bytes, length);
+		UT_ASSERT_EQ(wb_shared->inbound_state, WB_QUEUED);
+		wb_select(1, B_BG_WRITER);
+		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+		UT_ASSERT_EQ(wb_offer_accept_calls, 2);
+		UT_ASSERT_EQ(wb_shared->rejections.attempts[CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER],
+					 2 - (mask & 1) - ((mask >> 1) & 1));
+		UT_ASSERT_EQ(wb_shared->rejections.log_events, (mask & 3) == 3 ? 0 : 1);
+		UT_ASSERT_EQ(wb_shared->inbound_state, WB_REPLIED);
+		UT_ASSERT(wb_notice == NULL);
+		UT_ASSERT_EQ(wb_plan_builds + pi_discards + wb_master_completions, 0);
+		UT_ASSERT(!wb_inputs_pinned[1]);
+		wb_select(1, B_LMON);
+		cluster_pi_writeback_lmon_tick_v1();
+		UT_ASSERT_EQ(wb_destination, request.facts[0].proof.structural.ko.origin_node);
+		UT_ASSERT(cluster_pi_writeback_decode_v2(wb_wire, wb_length, &reply));
+		UT_ASSERT(cluster_pi_writeback_ack_matches_v2(&request, &reply));
+		UT_ASSERT_EQ(reply.count, (mask & 1) + ((mask >> 1) & 1));
+		if (reply.count != 0)
+			UT_ASSERT_EQ(
+				memcmp(&reply.facts[0], &request.facts[(mask & 1) ? 0 : 1], sizeof(reply.facts[0])),
+				0);
+		wb_select(0, B_CHECKPOINTER);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_v2_relation_offer_reader_rejects_lost_original_notice)
+{
+	for (unsigned fault = 0; fault < 14; fault++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiWritebackNoticeV1 notice = { 0 }, copy;
+		ClusterPiDataFactV1 data;
+		ClusterPiWritebackFactV2 out, before;
+		uint64 revision = 83;
+		UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &data));
+		wb_v2_offer_fixture(&notice.request_v2, &data, false);
+		wb_select(1, B_BG_WRITER);
+		notice.owner = CurrentResourceOwner;
+		notice.pid = getpid();
+		notice.version = 2;
+		notice.revision = 71;
+		wb_notice = &notice;
+		wb_shared->inbound_revision = notice.revision;
+		wb_shared->inbound_version = 2;
+		wb_shared->inbound_pid = MyProcPid;
+		wb_shared->inbound_state = WB_RUNNING;
+		memset(&before, 0x5a, sizeof(before));
+		out = before;
+		copy = notice;
+		switch (fault) {
+		case 1:
+			wb_notice = &copy;
+			break;
+		case 2:
+			notice.pid++;
+			break;
+		case 3:
+			notice.owner = (void *)3;
+			break;
+		case 4:
+			notice.version = 1;
+			break;
+		case 5:
+			MyBackendType = B_LMON;
+			break;
+		case 6:
+			CritSectionCount++;
+			break;
+		case 7:
+			wb_peer_caps = 0;
+			break;
+		case 8:
+			wb_shared->inbound_revision++;
+			break;
+		case 9:
+			wb_shared->inbound_pid++;
+			break;
+		case 10:
+			wb_shared->inbound_state = WB_REPLIED;
+			break;
+		case 11:
+			notice.revision = wb_shared->inbound_revision = 0;
+			break;
+		case 12:
+			wb_ko_current = false;
+			break;
+		case 13:
+			break; /* index out of range */
+		}
+		UT_ASSERT_EQ(cluster_pi_writeback_structure_offer_read_v2(&notice, fault == 13 ? 1 : 0,
+																  &revision, &out),
+					 fault == 0);
+		UT_ASSERT_EQ(revision, fault == 0 ? 71 : 83);
+		UT_ASSERT_EQ(memcmp(&out, fault == 0 ? &notice.request_v2.facts[0] : &before, sizeof(out)),
+					 0);
+		UT_ASSERT_EQ(wb_sends + wb_plan_builds + pi_discards, 0);
+		wb_notice = NULL;
+		CritSectionCount = 0;
+		wb_select(0, B_CHECKPOINTER);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
 UT_TEST(writeback_v2_request_cut_checks_real_sender_and_recipient)
 {
 	ClusterPageDataReceiptV1 *receipt = wb_setup();
@@ -1134,7 +1286,7 @@ UT_TEST(writeback_v2_ingress_refuses_old_wire_unready_peers_and_relation_offers)
 		case 7: {
 			ClusterPiDataFactV1 fact = m.facts[0].proof.data;
 			wb_v2_offer_fixture(&m, &fact, false);
-			env.source_node_id = m.facts[0].proof.structural.ko.origin_node;
+			env.source_node_id = m.facts[0].proof.structural.ko.origin_node + 1;
 			UT_ASSERT(cluster_pi_writeback_encode_v2(&m, bytes, sizeof(bytes), &length));
 			env.payload_length = length;
 			break;

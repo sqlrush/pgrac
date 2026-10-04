@@ -132,7 +132,7 @@ static ClusterWalWriterToken remote_ack_writer;
 
 /* Original KO owner boundary. Its actual COMMIT/exit/cut semantics are
  * exercised by test_cluster_ko_stop; this fixture never certifies storage. */
-static bool structural_scope_ready, structural_offer_changed;
+static bool structural_scope_ready, structural_offer_changed, structural_imported_owner;
 static uint64 structural_offer_peer_boot = 31;
 static ClusterPageWalBindingV1 structural_terminal;
 static uint8 structural_wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
@@ -150,6 +150,8 @@ cluster_ko_shared_structure_observation_v2(uint32 slot, uint64 serial,
 		|| length != sizeof(structural_wal))
 		return false;
 	*terminal = structural_terminal;
+	if (structural_offer_changed)
+		terminal->record_crc++;
 	memcpy(wal, structural_wal, length);
 	return true;
 }
@@ -160,7 +162,7 @@ cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer, uint64 *se
 {
 	ClusterPiWritebackFactV2 value = {0};
 	ClusterPiStructuralFactV2 *s = &value.proof.structural;
-	if (!structural_scope_ready || *cursor != 7 || peer != 1)
+	if (!structural_scope_ready || structural_imported_owner || *cursor != 7 || peer != 1)
 		return false;
 	value.kind = CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2;
 	s->terminal.binding = structural_terminal;
@@ -183,6 +185,27 @@ cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer, uint64 *se
 	*out = value;
 	*cursor = 8;
 	*serial = 19;
+	return true;
+}
+
+bool
+cluster_ko_shared_structure_peer_v2(uint32 slot, uint64 serial, int32 peer,
+									ClusterKoSharedMessageV2 *out)
+{
+	ClusterPiWritebackFactV2 fact;
+	uint32 cursor = slot;
+	uint64 observed;
+	bool imported = structural_imported_owner, valid;
+	if (serial != 19 || (imported ? peer != 0 : peer != 1) || structural_offer_changed)
+		return false;
+	structural_imported_owner = false;
+	valid = cluster_ko_shared_structure_offer_next_v2(&cursor, 1, &observed, &fact);
+	structural_imported_owner = imported;
+	if (!valid || observed != serial)
+		return false;
+	/* Imported origin 0 -> master 1 remains that exact request when the
+	 * original master asks origin 0 to retire its own old PI. */
+	*out = fact.proof.structural.ko;
 	return true;
 }
 
@@ -846,7 +869,7 @@ reset(void)
 	memset(&logical_pi, 0, sizeof(logical_pi));
 	logical_pi_raced = false;
 	logical_pi_retire_calls = 0;
-	structural_scope_ready = structural_offer_changed = false;
+	structural_scope_ready = structural_offer_changed = structural_imported_owner = false;
 	structural_offer_peer_boot = 31;
 	memset(&structural_write_cut, 0, sizeof(structural_write_cut));
 	memset(&structural_storage_cut, 0, sizeof(structural_storage_cut));
@@ -4115,6 +4138,37 @@ structural_master_receipt_rechecks_owner_source_and_transition(void)
 }
 
 static void
+structural_imported_owner_exports_original_origin_after_sealed_page_proof(void)
+{
+	const SCN tokens[] = { 10, scn_encode(1, 20), 30 };
+	for (unsigned mode = 0; mode < 3; mode++) {
+		ClusterPageWalBindingV1 binding, pi[2];
+		ClusterSpaceStructureChange change;
+		ClusterPageStructuralReceiptV2 *receipt = NULL;
+		ClusterPiWritebackFactV2 fact = { 0 };
+		ClusterThreadRecoveryFabricPlanV1 *plan = space_structural_plan_internal(
+			false, false, true, false, &binding, &change, tokens, MAIN_FORKNUM, pi);
+		cluster_node_id = 1;
+		prepare_structural_master(&binding, &change, &pi[0].identity, mode);
+		structural_imported_owner = true;
+		UT_ASSERT_EQ(binding.source.claim.identity.origin_node_id, 0);
+		UT_ASSERT(cluster_page_structural_from_ko_v2(7, 19, &pi[0].identity, plan, &receipt));
+		UT_ASSERT(cluster_page_structural_pi_fact_v2(receipt, 0, &fact));
+		UT_ASSERT_EQ(fact.kind, CLUSTER_PI_WRITEBACK_STRUCTURAL_V2);
+		UT_ASSERT_EQ(fact.proof.structural.ko.origin_node, 0);
+		UT_ASSERT_EQ(fact.proof.structural.ko.peer_node, 1);
+		UT_ASSERT_EQ(mode == 0 ? fact.proof.structural.terminal.write_cut.master_node
+							   : fact.proof.structural.terminal.storage_cut.master_node,
+					 1);
+		UT_ASSERT_EQ(writes + reads + syncs + pi_discards + logical_pi_retire_calls, 0);
+		cluster_page_structural_receipt_free_v2(&receipt);
+		cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+		cluster_node_id = 0;
+		clean();
+	}
+}
+
+static void
 structural_master_export_requires_original_peer_and_result(void)
 {
 	const SCN tokens[] = {10, scn_encode(1, 20), 30};
@@ -4763,7 +4817,7 @@ int
 main(void)
 {
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
-	UT_PLAN(74);
+	UT_PLAN(75);
 	UT_RUN(structural_remote_ack_import_binds_original_inputs_and_cut);
 	UT_RUN(structural_remote_ack_refuses_transport_input_and_collector_drift);
 	UT_RUN(structural_remote_notice_uses_actual_plan_and_peer_physical_owner);
@@ -4780,6 +4834,7 @@ main(void)
 	UT_RUN(structural_master_receipt_joins_original_owner_page_and_exact_cut);
 	UT_RUN(structural_master_receipt_refuses_unqualified_owner_plan_or_page);
 	UT_RUN(structural_master_receipt_rechecks_owner_source_and_transition);
+	UT_RUN(structural_imported_owner_exports_original_origin_after_sealed_page_proof);
 	UT_RUN(structural_master_export_requires_original_peer_and_result);
 	UT_RUN(structural_ancestor_requires_the_exact_old_page_chain);
 	UT_RUN(structural_ancestor_refuses_substitution_or_unclosed_chain);
