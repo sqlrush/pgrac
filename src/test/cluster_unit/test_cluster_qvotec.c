@@ -147,14 +147,7 @@ cluster_wal_writer_ready(TimeLineID timeline pg_attribute_unused())
 #error "CLUSTER_MAKEFILE_PATH must identify the backend cluster Makefile"
 #endif
 
-/* Weak only so the pre-implementation regression reports a TAP failure. */
-#ifdef __APPLE__
-#define QVOTEC_TEST_WEAK __attribute__((weak_import))
-#else
-#define QVOTEC_TEST_WEAK __attribute__((weak))
-#endif
-extern void cluster_qvotec_wakeup(void) QVOTEC_TEST_WEAK;
-extern void cluster_qvotec_test_register_wakeup(void) QVOTEC_TEST_WEAK;
+extern void cluster_qvotec_test_register_wakeup(void);
 
 /* Test-only linkage; deliberately absent from every product header/ABI. */
 extern ClusterSemanticActivationResult cluster_qvotec_test_semantic_activation_record_cas_write(
@@ -1570,7 +1563,7 @@ UT_TEST(test_qvotec_shmem_and_mailbox_layout)
 {
 	UT_ASSERT_EQ(CLUSTER_QVOTEC_SHMEM_STORAGE_OFFSET, 4056);
 	UT_ASSERT_EQ(sizeof(ClusterStorageQuorumState), 64);
-	UT_ASSERT_EQ(cluster_qvotec_shmem_size(), 4120);
+	UT_ASSERT_EQ(cluster_qvotec_shmem_size(), 4128); /* Added volatile wakeup pointer. */
 	UT_ASSERT_EQ(sizeof(ClusterQvotecPriorExitObservation), 3600);
 	UT_ASSERT_EQ(sizeof(ClusterQvotecMailbox), 320);
 	UT_ASSERT_EQ(offsetof(ClusterQvotecMailbox, request_seq), 0);
@@ -1746,9 +1739,6 @@ UT_TEST(test_qvotec_accessors_null_safe_pre_init)
 
 UT_TEST(test_qvotec_wakeup_without_registration_is_noop)
 {
-	UT_ASSERT(cluster_qvotec_wakeup != NULL);
-	if (cluster_qvotec_wakeup == NULL)
-		return;
 	notified_latch_count = 0;
 	cluster_qvotec_wakeup();
 	UT_ASSERT_EQ(notified_latch_count, 0);
@@ -1759,10 +1749,6 @@ UT_TEST(test_qvotec_wakeup_owner_lifecycle)
 	Latch owner = {0};
 	Latch *saved_latch = MyLatch;
 
-	UT_ASSERT(cluster_qvotec_wakeup != NULL);
-	UT_ASSERT(cluster_qvotec_test_register_wakeup != NULL);
-	if (cluster_qvotec_wakeup == NULL || cluster_qvotec_test_register_wakeup == NULL)
-		return;
 	shmem_init_done = false;
 	cluster_qvotec_shmem_init();
 	notified_latch_count = 0;
@@ -1796,10 +1782,6 @@ UT_TEST(test_qvotec_wakeup_old_exit_preserves_new_owner)
 	pg_on_exit_callback old_exit;
 	Datum old_arg;
 
-	UT_ASSERT(cluster_qvotec_wakeup != NULL);
-	UT_ASSERT(cluster_qvotec_test_register_wakeup != NULL);
-	if (cluster_qvotec_wakeup == NULL || cluster_qvotec_test_register_wakeup == NULL)
-		return;
 	shmem_init_done = false;
 	cluster_qvotec_shmem_init();
 	notified_latch_count = 0;
