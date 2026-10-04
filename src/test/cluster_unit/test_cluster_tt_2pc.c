@@ -331,82 +331,130 @@ UT_TEST(test_s13_v2_null_heads_all_invalid)
 	UT_ASSERT_EQ((int)UBA_is_invalid(p.heads[0]), 1);
 }
 
-/*
- * Spec 8.4A I18/I19: COMMIT/ROLLBACK PREPARED is an ordinary live modifier.
- * It must own the common modifier debt before parsing or touching durable TT,
- * recheck that admission at each binding, and release through one ERROR-safe
- * funnel.  This source-edge test complements the pure record fixture without
- * linking the full backend-only prefinish call graph.
- */
-UT_TEST(test_s14_prefinish_is_modifier_gated_and_error_safe)
+/* Bounds of one column-zero function body: from its definition to the first
+ * column-zero closing brace. */
+static void
+function_body(const char *source, const char *definition, const char **start, const char **end)
 {
-	char *source = read_tt_2pc_source();
+	*start = source == NULL ? NULL : strstr(source, definition);
+	*end = *start == NULL ? NULL : strstr(*start, "\n}\n");
+}
+
+/* Ordered occurrence of needles inside [start, end). */
+static bool
+in_order(const char *start, const char *end, const char *const *needles, int count)
+{
+	const char *at = start;
+
+	if (start == NULL || end == NULL)
+		return false;
+	for (int i = 0; i < count; i++) {
+		at = strstr(at, needles[i]);
+		if (at == NULL || at >= end) {
+			printf("# missing or out of order: %s\n", needles[i]);
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool
+absent(const char *start, const char *end, const char *needle)
+{
+	const char *at = start == NULL ? NULL : strstr(start, needle);
+
+	return start != NULL && (at == NULL || at >= end);
+}
+
+/*
+ * Spec 8.4A I18/I19 + F-D-29/F-D-31: COMMIT/ROLLBACK PREPARED is an ordinary
+ * live modifier that owns the modifier debt before parsing and rechecks it at
+ * each binding, but its prefinish only proves and stages the bindings: no TT
+ * WAL, durable write, allocator mark, overlay or hint may precede the prepared
+ * commit/abort record.  The record path emits the staged TT WAL just before
+ * the record, writes the stamps after flushing it and before pg_xact, and the
+ * allocator, overlay and hint follow once the gxact is no longer valid.
+ */
+UT_TEST(test_s14_prepared_finish_publishes_tt_only_after_its_record)
+{
+	char *tt = read_tt_2pc_source();
+	char *xact = read_source(TWOPHASE_SOURCE_PATH);
 	const char *start;
 	const char *end;
-	const char *enter;
-	const char *try_block;
-	const char *parse;
-	const char *loop;
-	const char *commit_recheck;
-	const char *durable_commit;
-	const char *abort_recheck;
-	const char *durable_abort;
-	const char *head_recheck;
-	const char *durable_set_head;
-	const char *finally_block;
-	const char *leave;
+	static const char *const prefinish[] = {
+		"cluster_semantic_activation_modifier_enter(",
+		"PG_TRY();",
+		"parse_or_corrupt(",
+		"for (i = 0; i < p.nbindings; i++)",
+		"cluster_tt_twophase_modifier_recheck_or_error(",
+		"cluster_tt_slot_durable_prepared_stage(",
+		"PG_CATCH();",
+		"tt_2pc_stage_release(",
+		"PG_RE_THROW();",
+	};
+	static const char *const forbidden[] = {
+		"cluster_undo_emit_",
+		"cluster_tt_slot_durable_commit(",
+		"cluster_tt_slot_durable_abort(",
+		"cluster_tt_slot_durable_prepared_apply(",
+		"cluster_tt_slot_mark_",
+		"cluster_tt_status_source_dispatch(",
+		"cluster_tt_status_hint_source_dispatch(",
+	};
+	static const char *const commit_record[] = {
+		"MyProc->delayChkptFlags |= DELAY_CHKPT_START;",
+		"cluster_tt_twophase_emit_staged(xid);",
+		"XactLogCommitRecord(",
+		"XLogFlush(recptr);",
+		"cluster_tt_twophase_apply_staged(xid, recptr);",
+		"TransactionIdCommitTree(",
+	};
+	static const char *const abort_record[] = {
+		"START_CRIT_SECTION();",
+		"cluster_tt_twophase_emit_staged(xid);",
+		"XactLogAbortRecord(",
+		"XLogFlush(recptr);",
+		"cluster_tt_twophase_apply_staged(xid, recptr);",
+		"TransactionIdAbortTree(",
+	};
+	static const char *const finish[] = {
+		"ProcessClusterTTPrefinish(",			"RecordTransactionCommitPrepared(",
+		"ProcArrayRemove(proc, latestXid);",	"gxact->valid = false;",
+		"cluster_tt_twophase_postfinish(xid);",
+	};
+	static const char *const postfinish[] = {
+		"PG_TRY();",	 "cluster_tt_slot_mark_committed(", "cluster_tt_slot_mark_aborted(",
+		"PG_FINALLY();", "tt_2pc_stage_release(",
+	};
 
-	if (source == NULL)
+	if (tt == NULL || xact == NULL) {
+		free(tt);
+		free(xact);
 		return;
-	start = strstr(source, "\ncluster_tt_twophase_prefinish(");
-	end = start == NULL ? NULL : strstr(start, "\n}\n\n#endif /* USE_PGRAC_CLUSTER */");
-	enter = start == NULL ? NULL : strstr(start, "cluster_semantic_activation_modifier_enter(");
-	try_block = start == NULL ? NULL : strstr(start, "PG_TRY();");
-	parse = start == NULL ? NULL : strstr(start, "parse_or_corrupt(");
-	loop = start == NULL ? NULL : strstr(start, "for (i = 0; i < p.nbindings; i++)");
-	commit_recheck
-		= loop == NULL ? NULL : strstr(loop, "cluster_tt_twophase_modifier_recheck_or_error(");
-	durable_commit = start == NULL ? NULL : strstr(start, "cluster_tt_slot_durable_commit(");
-	abort_recheck = durable_commit == NULL
-						? NULL
-						: strstr(durable_commit, "cluster_tt_twophase_modifier_recheck_or_error(");
-	durable_abort = start == NULL ? NULL : strstr(start, "cluster_tt_slot_durable_abort(");
-	head_recheck = durable_abort == NULL
-					   ? NULL
-					   : strstr(durable_abort, "cluster_tt_twophase_modifier_recheck_or_error(");
-	durable_set_head = start == NULL ? NULL : strstr(start, "cluster_tt_slot_durable_set_head(");
-	finally_block = start == NULL ? NULL : strstr(start, "PG_FINALLY();");
-	leave = finally_block == NULL ? NULL
-								  : strstr(finally_block, "cluster_semantic_activation_leave(");
-
-	UT_ASSERT_NOT_NULL(start);
-	UT_ASSERT_NOT_NULL(end);
-	UT_ASSERT_NOT_NULL(enter);
-	UT_ASSERT_NOT_NULL(try_block);
-	UT_ASSERT_NOT_NULL(parse);
-	UT_ASSERT_NOT_NULL(loop);
-	UT_ASSERT_NOT_NULL(commit_recheck);
-	UT_ASSERT_NOT_NULL(durable_commit);
-	UT_ASSERT_NOT_NULL(abort_recheck);
-	UT_ASSERT_NOT_NULL(durable_abort);
-	UT_ASSERT_NOT_NULL(head_recheck);
-	UT_ASSERT_NOT_NULL(durable_set_head);
-	UT_ASSERT_NOT_NULL(finally_block);
-	UT_ASSERT_NOT_NULL(leave);
-	if (start != NULL && end != NULL && enter != NULL && try_block != NULL && parse != NULL
-		&& loop != NULL && commit_recheck != NULL && durable_commit != NULL && abort_recheck != NULL
-		&& durable_abort != NULL && head_recheck != NULL && durable_set_head != NULL
-		&& finally_block != NULL && leave != NULL)
-		UT_ASSERT(start < enter && enter < try_block && try_block < parse && parse < loop
-				  && loop < commit_recheck && commit_recheck < durable_commit
-				  && durable_commit < abort_recheck && abort_recheck < durable_abort
-				  && durable_abort < head_recheck && head_recheck < durable_set_head
-				  && durable_set_head < finally_block && finally_block < leave && leave < end);
-	free(source);
+	}
+	function_body(tt, "\ncluster_tt_twophase_prefinish(", &start, &end);
+	UT_ASSERT(in_order(start, end, prefinish, lengthof(prefinish)));
+	for (int i = 0; i < (int)lengthof(forbidden); i++) {
+		UT_ASSERT(absent(start, end, forbidden[i]));
+		if (ut_current_failed)
+			printf("# prefinish must not call %s\n", forbidden[i]);
+	}
+	function_body(xact, "\nRecordTransactionCommitPrepared(", &start, &end);
+	UT_ASSERT(in_order(start, end, commit_record, lengthof(commit_record)));
+	function_body(xact, "\nRecordTransactionAbortPrepared(", &start, &end);
+	UT_ASSERT(in_order(start, end, abort_record, lengthof(abort_record)));
+	function_body(xact, "\nFinishPreparedTransaction(", &start, &end);
+	UT_ASSERT(in_order(start, end, finish, lengthof(finish)));
+	function_body(tt, "\ncluster_tt_twophase_postfinish(", &start, &end);
+	UT_ASSERT(in_order(start, end, postfinish, lengthof(postfinish)));
+	UT_ASSERT(absent(start, end, "cluster_undo_emit_"));
+	free(tt);
+	free(xact);
 }
 
 /* RF-SIDE: a survivor resolving a failed-origin prepared transaction must
- * preserve the binding's striped segment owner in the overlay key. */
+ * preserve the binding's striped segment owner in the overlay key (built by
+ * the postfinish once the record is durable). */
 UT_TEST(test_s15_prefinish_preserves_binding_origin)
 {
 	char *source = read_tt_2pc_source();
@@ -418,8 +466,7 @@ UT_TEST(test_s15_prefinish_preserves_binding_origin)
 
 	if (source == NULL)
 		return;
-	start = strstr(source, "\ncluster_tt_twophase_prefinish(");
-	end = start == NULL ? NULL : strstr(start, "\n}\n\n#endif /* USE_PGRAC_CLUSTER */");
+	function_body(source, "\ncluster_tt_twophase_postfinish(", &start, &end);
 	derive = start == NULL
 				 ? NULL
 				 : strstr(start, "cluster_tt_2pc_binding_origin_node(b, &origin_node_id)");
@@ -782,7 +829,7 @@ main(void)
 	UT_RUN(test_s11_count_tamper_trips_length_check);
 	UT_RUN(test_s12_v2_heads_roundtrip);
 	UT_RUN(test_s13_v2_null_heads_all_invalid);
-	UT_RUN(test_s14_prefinish_is_modifier_gated_and_error_safe);
+	UT_RUN(test_s14_prepared_finish_publishes_tt_only_after_its_record);
 	UT_RUN(test_s15_prefinish_preserves_binding_origin);
 	UT_RUN(test_s16_recovery_pending_activates_native_owner_before_success);
 	UT_RUN(test_s17_recovery_pending_remains_reco_owned_after_activation);
