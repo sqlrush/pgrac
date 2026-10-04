@@ -1765,10 +1765,11 @@ UT_TEST(test_data_first_request_samples_native_transport_readiness)
 	ut_epoch--;
 	ready = ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame, sizeof(frame));
 	UT_ASSERT_EQ(ready, CLUSTER_IC_SEND_DONE);
-	UT_ASSERT_EQ(ut_drain_all_and_sweep(UT_PEER_ID, ut_rx_fd, ut_acc, sizeof(ut_acc)), sizeof(frame));
+	UT_ASSERT_EQ(ut_drain_all_and_sweep(UT_PEER_ID, ut_rx_fd, ut_acc, sizeof(ut_acc)),
+				 sizeof(frame));
 	UT_ASSERT_EQ(memcmp(frame, ut_acc, sizeof(frame)), 0);
-	printf("# native DATA send sample: absent=%d hello_pending=%d old_epoch=%d ready=%d\n",
-		   absent, hello_pending, old_epoch, ready);
+	printf("# native DATA send sample: absent=%d hello_pending=%d old_epoch=%d ready=%d\n", absent,
+		   hello_pending, old_epoch, ready);
 	cluster_ic_tier1_close_peer(UT_PEER_ID, NULL);
 	close(ut_rx_fd);
 	close(listener);

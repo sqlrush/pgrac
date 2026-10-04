@@ -120,6 +120,7 @@ int cluster_node_id = 0;
 int cluster_lms_workers = 2;
 int cluster_gcs_reply_timeout_ms = 5000;
 int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
+bool cluster_shared_config = true;
 static uint64 ut_request_epoch = 7;
 static uint64 ut_member_cut = 2;
 static uint64 ut_data_stream[CLUSTER_MAX_NODES];
@@ -719,6 +720,8 @@ static uint8 ut_local_dispatch_marker = 0;
 static int ut_direct_zero_reply_count = 0;
 static GcsBlockReplyHeader ut_direct_zero_reply_header;
 static int ut_checksum_call_count = 0;
+static int ut_refill_worker = -1;
+static int ut_refill_admitted = 0;
 static bool ut_r4_real_checksum = false;
 static char ut_r4_reply_payload[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
 
@@ -792,6 +795,18 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 	}
 	ut_sent_n++;
 	UT_ASSERT(dest_node_id >= 0 && dest_node_id < CLUSTER_MAX_NODES);
+	if (ut_refill_worker >= 0) {
+		uint8 marker = 0x82;
+		int worker;
+		uint32 slot;
+		const char *reason;
+
+		UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		while (cluster_lms_outbound_enqueue(ut_refill_worker, UT_MSG_TYPE, UT_PEER_Y, &marker,
+											sizeof(marker)))
+			ut_refill_admitted++;
+	}
 	return ut_peer_rc[dest_node_id];
 }
 
@@ -827,6 +842,8 @@ ut_count_marker(uint8 marker)
 static void
 ut_reset_log(void)
 {
+	ut_refill_worker = -1;
+	ut_refill_admitted = 0;
 	ut_request_epoch = 7;
 	ut_member_cut = 2;
 	ut_absent_member = -1;
@@ -2328,8 +2345,8 @@ ut_enqueue_first_read(int worker, int peer, uint64 request_id)
 	request.sender_node = cluster_node_id;
 	request.requester_backend_id = 3;
 	request.transition_id = PCM_TRANS_N_TO_S;
-	return cluster_lms_outbound_enqueue(worker, PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
-										 peer, &request, sizeof(request));
+	return cluster_lms_outbound_enqueue(worker, PGRAC_IC_MSG_GCS_BLOCK_REQUEST, peer, &request,
+										sizeof(request));
 }
 
 UT_TEST(test_first_read_waits_for_data_peer_without_losing_owner_or_peer_order)
@@ -2438,10 +2455,38 @@ UT_TEST(test_first_read_unknown_membership_cannot_create_retained_qualification)
 	ut_reset_log();
 }
 
+UT_TEST(test_first_read_reserves_return_capacity_during_concurrent_refill)
+{
+	int drops = ut_requeue_drop_count;
+	int sent;
+
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	ut_peer_rc[UT_PEER_Y] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT(ut_enqueue_first_read(1, UT_PEER_X, 0x81));
+	UT_ASSERT(ut_enqueue_marker(1, UT_PEER_Y, 0x82));
+	ut_refill_worker = 1;
+	sent = cluster_lms_outbound_drain_send(1);
+	UT_ASSERT_EQ(sent, 63);
+	UT_ASSERT_EQ(ut_refill_admitted, 254);
+	UT_ASSERT_EQ(ut_requeue_drop_count, drops);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 256 - sent);
+	ut_refill_worker = -1;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	ut_sent_n = 0;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 64);
+	UT_ASSERT_EQ(ut_sent_log[0].marker, 0x81);
+	UT_ASSERT_EQ(ut_count_marker(0x81), 1);
+	while (cluster_lms_outbound_depth(1) > 0)
+		(void)cluster_lms_outbound_drain_send(1);
+	UT_ASSERT_EQ(ut_count_marker(0x81), 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(51);
+	UT_PLAN(52);
 
 	UT_RUN(test_normal_stop_missing_outbound_is_not_empty);
 	UT_RUN(test_ring_shmem_init);
@@ -2494,6 +2539,7 @@ main(void)
 	UT_RUN(test_first_read_retained_request_rejects_epoch_boot_and_stream_drift);
 	UT_RUN(test_first_read_real_send_failure_is_not_reclassified_as_peer_wait);
 	UT_RUN(test_first_read_unknown_membership_cannot_create_retained_qualification);
+	UT_RUN(test_first_read_reserves_return_capacity_during_concurrent_refill);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
