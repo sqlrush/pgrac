@@ -212,8 +212,9 @@ extern void cluster_ko_flush_and_wait_ack(RelFileLocator rlocator, char relpersi
  * retains its completion with CurTransactionResourceOwner for SPACE. */
 typedef struct ClusterKoCompletionV2 ClusterKoCompletionV2;
 /* Successful subtransaction cleanup transfers this original handle to its
- * parent ResourceOwner. Subabort/top-level cleanup releases it; this is not
- * a persistent COMMIT or background structural-retirement certificate. */
+ * parent ResourceOwner. Native observed handles span top-level commit's
+ * pending deletes; all others end at the original ResourceOwner cleanup.
+ * Neither is a persistent or background structural-retirement certificate. */
 extern bool cluster_ko_shared_begin_v2(RelFileLocator rlocator, char relpersistence,
 	ClusterKoCompletionV2 **out);
 /* Original native DDL -> SPACE owner, before its first structural change.
@@ -230,6 +231,14 @@ extern bool cluster_ko_shared_observe_space_v2(ClusterKoCompletionV2 *completion
 	const struct ClusterPageWalBindingV1 *terminal, const void *wal, Size wal_length);
 extern bool cluster_ko_shared_space_observation_v2(const ClusterKoCompletionV2 *completion,
 	struct ClusterPageWalBindingV1 *terminal, void *wal, Size wal_length);
+/* Borrow the original native COMMIT-DROP owner after the top commit callback
+ * and before pending-delete cleanup ends. This is not a physical deletion or
+ * PI certificate.
+ * Refusal preserves out. The original transaction tail cancels these local
+ * handles; no background lifetime is activated by this interface. */
+extern bool cluster_ko_shared_pending_drop_v2(RelFileLocator locator,
+	ClusterKoCompletionV2 **out);
+extern void cluster_ko_shared_postcommit_cleanup_v2(void);
 extern bool cluster_ko_shared_covers_v2(const ClusterKoCompletionV2 *completion,
 	const ClusterSpaceIdentityKey *key, const uint8 incarnation[16]);
 /* Only actual remote members have a wire projection; a one-member barrier

@@ -4238,6 +4238,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_page_flush.inc
 	rm -f test_cluster_pcm_s_prepare.inc
 	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
+	rm -f test_cluster_ko_postcommit.inc
 	rm -f test_cluster_space_extend.inc test_cluster_space_extend_finish.inc
 	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc
 	rm -f test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc
@@ -5746,7 +5747,14 @@ test_cluster_rdma_stop: test_cluster_rdma_stop.c test_cluster_rdma_stop.inc unit
 test_cluster_rdma_stop_disabled: test_cluster_rdma_stop.c test_cluster_rdma_stop.inc unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DPGRAC_TEST_RDMA_DISABLED $< -o $@
 
-test_cluster_ko_stop: test_cluster_ko_stop.c unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+test_cluster_ko_postcommit.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^CommitTransaction\(/ { inside=1 } \
+	     inside && /^\tCallXactCallbacks\(is_parallel_worker \? XACT_EVENT_PARALLEL_COMMIT/ { emit=1; found++ } \
+	     emit && /^\tAtCommit_Notify\(\);/ { emit=0; inside=0; done++ } \
+	     emit { print } /^}/ { inside=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_postcommit.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_ko.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \

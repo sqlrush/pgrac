@@ -159,6 +159,7 @@ struct ClusterKoCompletionV2 {
 	bool native_transaction;
 	bool native_pending;
 	bool space_observed;
+	bool postcommit;
 	ClusterPageWalBindingV1 terminal;
 	uint8 structure[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	struct ClusterKoCompletionV2 *next;
@@ -615,6 +616,20 @@ cluster_ko_shared_release_v2(ClusterKoCompletionV2 **completion)
 }
 
 static void
+ko_shared_xact_event(XactEvent event, void *arg pg_attribute_unused())
+{
+	/* ResourceOwnerRelease(true, true) is also used by PREPARE. Only the
+	 * real native COMMIT event enters the pending-delete lifetime. */
+	for (ClusterKoCompletionV2 *completion = ko_completions; completion != NULL;
+		 completion = completion->next)
+		if (completion->pid == MyProcPid && completion->native_transaction)
+			completion->postcommit = event == XACT_EVENT_COMMIT && completion->space_observed
+				&& !completion->native_pending && completion->owner == TopTransactionResourceOwner
+				&& CurrentResourceOwner == TopTransactionResourceOwner
+				&& CurTransactionResourceOwner == TopTransactionResourceOwner;
+}
+
+static void
 ko_shared_resource_release(ResourceReleasePhase phase, bool commit,
 	bool top, void *arg pg_attribute_unused())
 {
@@ -628,9 +643,19 @@ ko_shared_resource_release(ResourceReleasePhase phase, bool commit,
 		if (completion->pid == MyProcPid && completion->owner == CurrentResourceOwner) {
 			/* A successful subtransaction does not finish its DDL. Keep the
 			 * same barrier with the parent, just as native transaction locks
-			 * survive; subabort and top-level cleanup still cancel it. */
+			 * survive; subabort still cancels it. */
 			if (parent != NULL) {
 				completion->owner = parent;
+				link = &completion->next;
+				continue;
+			}
+			/* Native pending deletes run after all ResourceOwner phases.
+			 * Keep only a prepared structural observation with this same
+			 * top transaction until its explicit postcommit tail cleanup. */
+			if (commit && top && completion->native_transaction && completion->postcommit
+				&& completion->space_observed
+				&& !completion->native_pending && completion->owner == TopTransactionResourceOwner
+				&& CurTransactionResourceOwner == TopTransactionResourceOwner) {
 				link = &completion->next;
 				continue;
 			}
@@ -729,6 +754,57 @@ cluster_ko_shared_space_observation_v2(const ClusterKoCompletionV2 *completion,
 	*terminal = owned->terminal;
 	memcpy(wal, owned->structure, sizeof(owned->structure));
 	return true;
+}
+
+bool
+cluster_ko_shared_pending_drop_v2(RelFileLocator locator, ClusterKoCompletionV2 **out)
+{
+	ClusterKoCompletionV2 *candidate = NULL;
+	if (out == NULL || *out != NULL || CurrentResourceOwner == NULL
+		|| CurrentResourceOwner != TopTransactionResourceOwner
+		|| CurTransactionResourceOwner != TopTransactionResourceOwner)
+		return false;
+	for (ClusterKoCompletionV2 *completion = ko_completions; completion != NULL;
+		 completion = completion->next) {
+		ClusterPageWalBindingV1 terminal;
+		ClusterSpaceStructureChange change;
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		if (!completion->native_transaction || !completion->postcommit
+			|| !cluster_ko_shared_space_observation_v2(completion, &terminal, wal, sizeof(wal))
+			|| !RelFileLocatorEquals(terminal.identity.locator, locator)
+			|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &change)
+			|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE)
+			continue;
+		if (candidate != NULL)
+			return false;
+		candidate = completion;
+	}
+	if (candidate == NULL)
+		return false;
+	*out = candidate;
+	return true;
+}
+
+/* This is still the original backend/transaction owner. A pending-delete
+ * return does not certify its physical effects, and no background ownership
+ * is created here. Keep this cleanup independent of now-stale cluster scope. */
+void
+cluster_ko_shared_postcommit_cleanup_v2(void)
+{
+	ClusterKoCompletionV2 **link = &ko_completions;
+	if (CurrentResourceOwner == NULL || CurrentResourceOwner != TopTransactionResourceOwner
+		|| CurTransactionResourceOwner != TopTransactionResourceOwner)
+		return;
+	while (*link != NULL) {
+		ClusterKoCompletionV2 *completion = *link;
+		if (completion->pid == MyProcPid && completion->owner == CurrentResourceOwner
+			&& completion->native_transaction && completion->postcommit) {
+			ko_completion_cancel(completion);
+			*link = completion->next;
+			pfree(completion);
+		} else
+			link = &completion->next;
+	}
 }
 
 /* Only the original native wrapper offers a completion for SPACE to take.
@@ -1294,6 +1370,7 @@ cluster_ko_shared_begin_v2(RelFileLocator rloc, char relpersistence, ClusterKoCo
 		return false;
 	if (!ko_resource_registered) {
 		RegisterResourceReleaseCallback(ko_shared_resource_release, NULL);
+		RegisterXactCallback(ko_shared_xact_event, NULL);
 		ko_resource_registered = true;
 	}
 	completion = MemoryContextAllocZero(TopTransactionContext, sizeof(*completion));
