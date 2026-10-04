@@ -23,6 +23,7 @@
 #include "../../backend/cluster/cluster_control_root_private.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
+#include "postmaster/bgwriter.h"
 #include "postmaster/startup.h"
 #include "storage/latch.h"
 #include "cluster/cluster_config_members.h"
@@ -66,6 +67,15 @@ static ClusterControlRootResult returns[4];
 static ClusterWalStartupImage clusterStartupWriter;
 static bool clusterStartupWriterBound, clusterStartupWriterInstalled;
 static bool clusterStartupWriterSelected;
+static bool startup_sync_ok = true, startup_sync_change_epoch;
+static unsigned startup_sync_calls;
+
+ClusterFormationWitnessResult
+cluster_authority_startup_refresh_recovery(int timeout_ms)
+{
+	UT_ASSERT_EQ(timeout_ms, 100);
+	return CLUSTER_FORMATION_WITNESS_READY;
+}
 static unsigned startup_directory_calls;
 static bool directory_before_selection;
 BackendType MyBackendType = B_INVALID;
@@ -314,6 +324,33 @@ cluster_wal_writer_startup_matches(const ClusterControlRootIdentity *self, const
 		   && memcmp(self, &clusterStartupWriter.claim.identity, sizeof(*self)) == 0
 		   && memcmp(uuid, clusterStartupWriter.operation_uuid, 16) == 0
 		   && first == clusterStartupWriter.first_segment_lsn;
+}
+
+ClusterControlRootResult
+cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *writer)
+{
+	memset(writer, 0, sizeof(*writer));
+	writer->ref = ref;
+	writer->epoch = epoch;
+	return startup_binding_ok && fence_ok && timeline == clusterStartupWriter.timeline
+		? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+ClusterControlRootResult
+cluster_wal_writer_check(const ClusterWalWriterToken *writer)
+{
+	return writer->epoch == epoch && startup_binding_ok && fence_ok
+		? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+bool RequestStartupSync(void)
+{
+	UT_ASSERT_EQ(cf_mode, NoLock);
+	UT_ASSERT(!local_lock);
+	startup_sync_calls++;
+	if (startup_sync_change_epoch)
+		epoch++;
+	return startup_sync_ok;
 }
 
 ClusterControlRootResult
@@ -774,6 +811,29 @@ UT_TEST(startup_prepare_uses_only_bound_initializer_without_serving)
 	UT_ASSERT_EQ(candidate.checkPoint, 100);
 	UT_ASSERT_EQ(candidate.state, DB_SHUTDOWNED);
 	UT_ASSERT_EQ(reads | local_updates | native_writes, 0);
+}
+
+UT_TEST(startup_file_sync_rechecks_original_writer_and_keeps_native_owner)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		startup_fixture();
+		startup_sync_calls = 0;
+		startup_sync_ok = true;
+		startup_sync_change_epoch = false;
+		switch (fault) {
+		case 1: clusterStartupWriterBound = false; break;
+		case 2: clusterStartupWriterInstalled = true; break;
+		case 3: startup_binding_ok = false; break;
+		case 4: startup_sync_ok = false; break;
+		case 5: startup_sync_change_epoch = true; break;
+		case 6: cf_mode = ExclusiveLock; break;
+		case 7: local_lock = true; break;
+		}
+		UT_ASSERT_EQ(ClusterStartupFileSync(), fault == 0);
+		UT_ASSERT_EQ(startup_sync_calls, fault == 0 || fault == 4 || fault == 5 ? 1 : 0);
+		UT_ASSERT_EQ(root_calls | local_updates | native_writes, 0);
+	}
+	startup_sync_change_epoch = false;
 }
 
 UT_TEST(startup_prepare_rejects_other_purposes_and_lost_owner)
@@ -1365,7 +1425,8 @@ UT_TEST(native_startup_insert_has_no_link_or_page_from_predecessor)
 int
 main(void)
 {
-	UT_PLAN(35);
+	UT_PLAN(36);
+	UT_RUN(startup_file_sync_rechecks_original_writer_and_keeps_native_owner);
 	UT_RUN(clean_restart_uses_shutdown_checkpoint_above_retained_floor);
 	UT_RUN(shared_startup_does_not_adopt_legacy_control_authority);
 	UT_RUN(legacy_startup_keeps_its_control_authority_path);

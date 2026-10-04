@@ -8243,6 +8243,20 @@ update_checkpoint_display(int flags, bool restartpoint, bool reset)
 
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: purpose-bound native checkpoint adapter. Author: SqlRush <sqlrush@gmail.com> */
+static bool
+ClusterStartupFileSync(void)
+{
+	ClusterWalWriterToken writer;
+	return MyBackendType == B_STARTUP && AmStartupProcess() && cluster_shared_config
+		&& clusterStartupWriterBound && !clusterStartupWriterInstalled
+		&& !LWLockHeldByMe(ControlFileLock) && !cluster_cf_held(ShareLock)
+		&& !cluster_cf_held(ExclusiveLock)
+		&& cluster_wal_writer_begin(clusterStartupWriter.timeline, &writer)
+			== CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& RequestStartupSync()
+		&& cluster_wal_writer_check(&writer) == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 static void
 ClusterStartupCheckpointPrepare(int flags, ControlFileData *selected)
 {
@@ -9615,7 +9629,13 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	{
 		uint64		pi_note_presync_seq = cluster_gcs_block_pi_note_presync_snapshot();
 
-		ProcessSyncRequests();
+		if (cluster_shared_config && MyBackendType == B_STARTUP) {
+			if (!ClusterStartupFileSync())
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						 errmsg("native startup file synchronization is unproven")));
+		} else
+			ProcessSyncRequests();
 		cluster_gcs_block_pi_note_confirm(pi_note_presync_seq);
 	}
 #else

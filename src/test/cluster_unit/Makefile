@@ -144,6 +144,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_service_observe \
 		test_cluster_control_root \
 		test_cluster_checkpoint_native \
+		test_cluster_startup_sync \
 		test_cluster_checkpoint_buffers \
 		test_cluster_page_data test_cluster_pi_writeback test_cluster_block_redeclare \
 		test_cluster_page_wal \
@@ -536,7 +537,7 @@ test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
 SIMPLE_TESTS := $(filter-out test_cluster_wal_restart_read test_cluster_wal_writer test_cluster_wal_cut test_cluster_pi_data test_cluster_thread_tail,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers test_cluster_page_data test_cluster_pi_writeback test_cluster_block_redeclare test_cluster_page_wal,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_startup_sync test_cluster_checkpoint_buffers test_cluster_page_data test_cluster_pi_writeback test_cluster_block_redeclare test_cluster_page_wal,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_request,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire_master,$(SIMPLE_TESTS))
@@ -901,7 +902,8 @@ test_cluster_checkpointer_stop.inc: $(top_srcdir)/src/backend/postmaster/checkpo
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_checkpoint_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^Cluster(CheckpointV3|StartupCheckpoint)(Prepare|Publish)\(/ { print "static void"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 4) exit 1 }' $< > $@.tmp
+	     /^ClusterStartupFileSync\(/ { print "static bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_startup_writer_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
@@ -7439,6 +7441,29 @@ test_cluster_wal_publish_entry.inc: $(top_srcdir)/src/backend/access/transam/xlo
 	mv $@.tmp $@
 
 test_cluster_wal_writer: test_cluster_wal_writer.c
+
+# PGRAC: original checkpointer request/consumer and separate completion state.
+test_cluster_startup_sync.inc: $(top_srcdir)/src/backend/postmaster/checkpointer.c Makefile
+	awk '/^typedef enum StartupSyncState/ || /^typedef struct CheckpointerShmemStruct/ || /^typedef struct CheckpointerRequest/ { emit=1; types++ } \
+	     /^CheckpointerStartupSyncFinish\(/ || /^CheckpointerStartupSyncPoll\(/ { print "static void"; emit=1; functions++ } \
+	     /^RequestStartupSync\(/ { print "bool"; emit=1; functions++ } \
+	     /^static CheckpointerShmemStruct \*CheckpointerShmem;/ || /^static uint64 startup_sync_active_request;/ { print } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (types != 3 || functions != 3 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_startup_interrupt.inc: $(top_srcdir)/src/backend/postmaster/startup.c Makefile
+	awk '/^StartupProcShutdownHandler\(/ { print "static void"; emit=1; functions++ } \
+	     /^HandleStartupProcInterrupts\(/ { print "void"; emit=1; functions++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (functions != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_startup_sync: test_cluster_startup_sync.c test_cluster_startup_sync.inc test_cluster_startup_interrupt.inc unit_test.h \
+		$(top_builddir)/src/backend/storage/lmgr/s_lock.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/storage/lmgr/s_lock.o \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_block_redeclare: test_cluster_block_redeclare.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_block_redeclare.h \
