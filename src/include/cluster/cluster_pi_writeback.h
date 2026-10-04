@@ -86,9 +86,27 @@ extern bool cluster_pi_writeback_decode_v2(const void *bytes, Size length,
 	ClusterPiWritebackMessageV2 *out);
 extern bool cluster_pi_writeback_ack_matches_v2(const ClusterPiWritebackMessageV2 *request,
 	const ClusterPiWritebackMessageV2 *ack);
+/* Current transport identities only; sending selects the original origin
+ * for relation offers and the actual page master otherwise. Not an opaque
+ * notice, completion or disposal proof. ACKs require their original request.
+ * Requires the separate v2 capability, which is not yet advertised. */
+extern bool cluster_pi_writeback_request_current_v2(const ClusterPiWritebackMessageV2 *request,
+	bool sending);
 
 typedef struct ClusterPiWritebackNoticeV1 ClusterPiWritebackNoticeV1;
 typedef struct ClusterPiWritebackJobV1 ClusterPiWritebackJobV1;
+/* The original notice owner authenticates the structural kind before the
+ * buffer consumer independently rebinds its complete retained WAL plan. */
+extern bool cluster_pi_writeback_structural_notice_read_v2(const ClusterPiWritebackNoticeV1 *notice,
+														   uint32 index, uint64 *revision,
+														   ClusterPiWritebackFactV2 *out);
+extern bool
+cluster_page_structural_from_notice_v2(const ClusterPiWritebackNoticeV1 *notice, uint32 index,
+									   const struct ClusterThreadRecoveryFabricPlanV1 *plan,
+									   ClusterPageStructuralReceiptV2 **out);
+extern bool cluster_page_structural_pi_ack_export_v2(const ClusterPiStructuralAckV2 *ack,
+													 const ClusterPageStructuralReceiptV2 *receipt,
+													 ClusterWalWriterToken *out);
 
 typedef enum ClusterPiWritebackRejectionV1 {
 	CLUSTER_PI_WRITEBACK_DATA_PROOF = 0,

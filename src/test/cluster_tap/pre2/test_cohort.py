@@ -39,6 +39,21 @@ class CohortTest(unittest.TestCase):
             with self.subTest(ids=ids), self.assertRaises(ValueError):
                 self.render(layout)
 
+    def test_shared_business_input_enables_remote_visibility_and_coherence(self):
+        text = self.render(self.layout(4))
+        self.assertIn("common.cluster.crossnode_runtime_visibility='on'\n", text)
+        self.assertIn("common.cluster.undo_gcs_coherence='on'\n", text)
+
+    def test_explicit_visibility_negatives_keep_their_original_inputs(self):
+        for visibility, coherence in (('off', 'off'), ('off', 'on'), ('on', 'off')):
+            layout = self.layout(4)
+            layout['extra_conf'] = [f'cluster.crossnode_runtime_visibility={visibility}',
+                                    f'cluster.undo_gcs_coherence={coherence}']
+            with self.subTest(visibility=visibility, coherence=coherence):
+                text = self.render(layout)
+                self.assertIn(f"common.cluster.crossnode_runtime_visibility='{visibility}'\n", text)
+                self.assertIn(f"common.cluster.undo_gcs_coherence='{coherence}'\n", text)
+
     def test_canonical_values_cannot_inject_another_assignment(self):
         for value in ("hello\ncommon.cluster.xid_striping='off'", 'x\r', 'x\0'):
             with self.assertRaises(ValueError):

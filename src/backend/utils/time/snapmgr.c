@@ -182,8 +182,10 @@ static void FreeSnapshot(Snapshot snapshot);
 static void SnapshotResetXmin(void);
 #ifdef USE_PGRAC_CLUSTER
 static void cluster_recompute_proc_read_scn(void); /* PGRAC: spec-3.12 D1 */
+static void cluster_snapshot_read_invalidate(Snapshot snapshot);
 #else
 #define cluster_recompute_proc_read_scn() ((void) 0)
+#define cluster_snapshot_read_invalidate(snapshot) ((void) 0)
 #endif
 
 /*
@@ -556,6 +558,7 @@ InvalidateCatalogSnapshot(void)
 {
 	if (CatalogSnapshot)
 	{
+		cluster_snapshot_read_invalidate(CatalogSnapshot);
 		pairingheap_remove(&RegisteredSnapshots, &CatalogSnapshot->ph_node);
 		CatalogSnapshot = NULL;
 		SnapshotResetXmin();
@@ -795,6 +798,7 @@ FreeSnapshot(Snapshot snapshot)
 	Assert(snapshot->active_count == 0);
 	Assert(snapshot->copied);
 
+	cluster_snapshot_read_invalidate(snapshot);
 	pfree(snapshot);
 }
 
@@ -1074,6 +1078,118 @@ xmin_cmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
  * not actually critical, but this would be.)
  */
 #ifdef USE_PGRAC_CLUSTER
+static ClusterSnapshotReadScopeV1 *ClusterSnapshotReadScope;
+
+static bool
+cluster_snapshot_in_registered_heap(pairingheap_node *node, Snapshot snapshot)
+{
+	while (node != NULL)
+	{
+		if (pairingheap_container(SnapshotData, ph_node, node) == snapshot ||
+			cluster_snapshot_in_registered_heap(node->first_child, snapshot))
+			return true;
+		node = node->next_sibling;
+	}
+	return false;
+}
+
+static bool
+cluster_snapshot_is_live(Snapshot snapshot)
+{
+	ActiveSnapshotElt *active;
+
+	if (snapshot == NULL)
+		return false;
+	for (active = ActiveSnapshot; active != NULL; active = active->as_next)
+		if (active->as_snap == snapshot)
+			return true;
+	return cluster_snapshot_in_registered_heap(RegisteredSnapshots.ph_root, snapshot);
+}
+
+static void
+cluster_snapshot_read_invalidate(Snapshot snapshot)
+{
+	ClusterSnapshotReadScopeV1 *scope;
+
+	for (scope = ClusterSnapshotReadScope; scope != NULL; scope = scope->previous)
+		if (snapshot == NULL || scope->snapshot == snapshot)
+			scope->invalidated = true;
+}
+
+/*
+ * Bind the actual evaluator without changing its native snapshot lifetime.
+ * An unretained snapshot cannot become admissible later during this scope.
+ */
+void
+cluster_snapshot_read_enter_v1(ClusterSnapshotReadScopeV1 *scope, Snapshot snapshot)
+{
+	SCN			floor = MyProc == NULL ? InvalidScn :
+		pg_atomic_read_u64(&MyProc->cluster_read_scn_atomic);
+
+	memset(scope, 0, sizeof(*scope));
+	scope->previous = ClusterSnapshotReadScope;
+	scope->snapshot = snapshot;
+	scope->owner = CurrentResourceOwner;
+	scope->invalidated = !cluster_snapshot_is_live(snapshot);
+	if (!scope->invalidated)
+	{
+		scope->read_scn = snapshot->read_scn;
+		scope->read_epoch = snapshot->read_epoch;
+		scope->cluster_source = snapshot->cluster_source;
+		scope->invalidated = snapshot->snapshot_type != SNAPSHOT_MVCC ||
+			snapshot->cluster_source != SNAPSHOT_SOURCE_CLUSTER ||
+			!SCN_VALID(snapshot->read_scn) || !SCN_VALID(floor) ||
+			scn_time_cmp(floor, snapshot->read_scn) > 0;
+	}
+	ClusterSnapshotReadScope = scope;
+}
+
+void
+cluster_snapshot_read_exit_v1(ClusterSnapshotReadScopeV1 *scope)
+{
+	Assert(ClusterSnapshotReadScope == scope);
+	ClusterSnapshotReadScope = scope->previous;
+}
+
+bool
+cluster_snapshot_read_evidence_v1(SCN resolver_read_scn, Snapshot *snapshot,
+								 SCN *retained_floor, const char **reason)
+{
+	ClusterSnapshotReadScopeV1 *scope = ClusterSnapshotReadScope;
+	Snapshot	actual = scope != NULL ? scope->snapshot :
+		(ActiveSnapshot != NULL ? ActiveSnapshot->as_snap : NULL);
+	SCN			floor = MyProc == NULL ? InvalidScn :
+		pg_atomic_read_u64(&MyProc->cluster_read_scn_atomic);
+	const char *refusal = NULL;
+
+	*snapshot = NULL;
+	*retained_floor = floor;
+	/* Check membership before dereferencing a possibly released pointer. */
+	if ((scope != NULL && scope->invalidated) || !cluster_snapshot_is_live(actual))
+		refusal = "no live retained snapshot for this evaluation";
+	else
+	{
+		*snapshot = actual;
+		if (scope != NULL && (scope->owner != CurrentResourceOwner ||
+			actual->read_scn != scope->read_scn ||
+			actual->read_epoch != scope->read_epoch ||
+			actual->cluster_source != scope->cluster_source))
+			refusal = "evaluated snapshot identity changed";
+		else if (actual->snapshot_type != SNAPSHOT_MVCC ||
+				 actual->cluster_source != SNAPSHOT_SOURCE_CLUSTER ||
+				 !SCN_VALID(actual->read_scn))
+			refusal = "evaluated snapshot has no cluster read identity";
+		else if ((SCN_VALID(resolver_read_scn) && actual->read_scn != resolver_read_scn) ||
+				 (scope != NULL && !SCN_VALID(resolver_read_scn)))
+			refusal = "resolver read SCN does not match the evaluated snapshot";
+		else if (!SCN_VALID(floor) || scn_time_cmp(floor, actual->read_scn) > 0)
+			refusal = "published retention floor does not cover the evaluated snapshot";
+	}
+	/* InvalidScn terminal callers retain only their original Active boundary. */
+	*reason = refusal;
+	return refusal == NULL;
+}
+
 /*
  * PGRAC: spec-3.12 D1 — recompute this backend's retention read_scn.
  *
@@ -1219,6 +1335,8 @@ AtSubAbort_Snapshot(int level)
 void
 AtEOXact_Snapshot(bool isCommit, bool resetXmin)
 {
+	cluster_snapshot_read_invalidate(NULL);
+
 	/*
 	 * In transaction-snapshot mode we must release our privately-managed
 	 * reference to the transaction snapshot.  We must remove it from

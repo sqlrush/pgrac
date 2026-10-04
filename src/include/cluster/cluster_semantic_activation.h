@@ -471,8 +471,9 @@ extern bool cluster_semantic_activation_qvotec_complete_undo_root_descriptor_rea
 extern void cluster_semantic_activation_ack_handler(const ClusterICEnvelope *env,
 													const void *payload);
 extern void cluster_semantic_activation_lmon_tick(void);
-/* Original phase4 postmaster requester; bounded atomic reads/mailbox work only.
- * Never publishes admission. True requires actual PGSA and Resource-X OPEN.
+/* Original phase4 postmaster requester; bounded memory reads/mailbox work only.
+ * Never publishes admission. True requires actual PGSA/Resource-X OPEN and
+ * the original LMON's completed ROOT publication for the same live cut.
  * Only the installed never-served writer may request first activation. */
 extern bool
 cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refusal);

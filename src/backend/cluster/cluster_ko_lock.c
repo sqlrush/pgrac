@@ -484,6 +484,63 @@ ko_shared_members(ClusterKoSharedMessageV2 *message,
 	return true;
 }
 
+bool
+cluster_ko_shared_cut_current_v2(const ClusterKoSharedMessageV2 *request)
+{
+	ClusterKoSharedMessageV2 current;
+	ClusterWalSourceRef before, after;
+	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], generation;
+	uint32 capability[2], connection[2];
+	int endpoints[2];
+	uint8 expected[CLUSTER_KO_SHARED_V2_BYTES], observed[sizeof(expected)];
+
+	if (request == NULL || !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_KO_SHARED_NODE_LIMIT
+		|| request->origin_node >= CLUSTER_KO_SHARED_NODE_LIMIT
+		|| request->peer_node >= CLUSTER_KO_SHARED_NODE_LIMIT
+		|| request->verb != CLUSTER_KO_SHARED_REQUEST
+		|| !cluster_ko_shared_encode_v2(request, expected, sizeof(expected))
+		|| !cluster_wal_thread_current_v2_ref(&before)
+		|| before.claim.identity.origin_node_id != cluster_node_id
+		|| before.claim.identity.system_identifier != request->key.system_identifier
+		|| before.claim.database_incarnation != request->key.database_incarnation
+		|| memcmp(before.claim.identity.storage_uuid, request->key.storage_uuid, 16) != 0)
+		return false;
+	current = *request;
+	if (!ko_shared_members(&current, boots, &generation)
+		|| boots[cluster_node_id] == 0
+		|| boots[cluster_node_id] != before.claim.identity.origin_owner_incarnation)
+		return false;
+	current.origin_boot = boots[request->origin_node];
+	current.peer_boot = boots[request->peer_node];
+	if (!cluster_ko_shared_encode_v2(&current, observed, sizeof(observed))
+		|| memcmp(expected, observed, sizeof(expected)) != 0)
+		return false;
+	endpoints[0] = request->origin_node;
+	endpoints[1] = request->peer_node;
+	for (int i = 0; i < 2; i++) {
+		if (endpoints[i] == cluster_node_id)
+			continue;
+		if (!cluster_sf_peer_capability_word_sample(endpoints[i], PGRAC_IC_HELLO_CAP_KO_SHARED_V2,
+				&capability[i], &connection[i]) || connection[i] == 0
+			|| (capability[i] & PGRAC_IC_HELLO_CAP_KO_SHARED_V2) == 0)
+			return false;
+	}
+	/* A decoded relation result is still untrusted. In particular, one
+	 * endpoint's new CONTROL connection cannot inherit the old cut. */
+	for (int i = 0; i < 2; i++) {
+		uint32 word, sampled;
+		if (endpoints[i] == cluster_node_id)
+			continue;
+		if (!cluster_sf_peer_capability_word_sample(endpoints[i], PGRAC_IC_HELLO_CAP_KO_SHARED_V2,
+				&word, &sampled) || word != capability[i] || sampled != connection[i])
+			return false;
+	}
+	return cluster_wal_thread_current_v2_ref(&after)
+		&& memcmp(&before, &after, sizeof(before)) == 0
+		&& cluster_membership_cut_generation_current(generation);
+}
+
 static bool
 ko_shared_control_current(const ClusterKoSharedMessageV2 *message)
 {
@@ -529,6 +586,53 @@ ko_shared_space_current(const ClusterKoSharedMessageV2 *message)
 		&& RelFileLocatorEquals(identity.key.locator, message->key.locator)
 		&& memcmp(identity.key.storage_uuid, message->key.storage_uuid, 16) == 0
 		&& memcmp(identity.incarnation, message->incarnation, 16) == 0;
+}
+
+bool
+cluster_ko_shared_peer_projection_v2(const ClusterKoSharedMessageV2 *request,
+	int32 peer, ClusterKoSharedMessageV2 *out)
+{
+	ClusterKoSharedMessageV2 current, projected;
+	ClusterWalSourceRef writer_before, writer_after;
+	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], generation, sampled_generation;
+	uint32 capabilities, capability_generation;
+	uint8 original[CLUSTER_KO_SHARED_V2_BYTES], observed[sizeof(original)];
+
+	if (request == NULL || out == NULL || peer < 0 || peer >= CLUSTER_KO_SHARED_NODE_LIMIT
+		|| peer == cluster_node_id || request->verb != CLUSTER_KO_SHARED_REQUEST
+		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
+		|| (MyBackendType != B_BG_WRITER && MyBackendType != B_CHECKPOINTER)
+		|| CurrentResourceOwner == NULL || CritSectionCount != 0)
+		return false;
+	generation = cluster_membership_cut_generation();
+	if (generation == 0 || !cluster_wal_thread_current_v2_ref(&writer_before)
+		|| !ko_shared_control_current(request))
+		return false;
+	current = *request;
+	if (!ko_shared_members(&current, boots, &sampled_generation)
+		|| sampled_generation != generation || boots[peer] == 0
+		|| !cluster_ko_shared_encode_v2(request, original, sizeof(original))
+		|| !cluster_ko_shared_encode_v2(&current, observed, sizeof(observed))
+		|| memcmp(original, observed, sizeof(original)) != 0
+		|| !cluster_sf_peer_capability_word_sample(peer, PGRAC_IC_HELLO_CAP_KO_SHARED_V2,
+			&capabilities, &capability_generation)
+		|| capability_generation == 0
+		|| (capabilities & PGRAC_IC_HELLO_CAP_KO_SHARED_V2) == 0)
+		return false;
+	projected = *request;
+	/* An origin recipient verifies the same original request that the
+	 * master received. It must never receive a fabricated self request. */
+	if (peer != request->origin_node) {
+		projected.peer_node = peer;
+		projected.peer_boot = boots[peer];
+	}
+	if (!cluster_ko_shared_encode_v2(&projected, observed, sizeof(observed))
+		|| !cluster_wal_thread_current_v2_ref(&writer_after)
+		|| memcmp(&writer_before, &writer_after, sizeof(writer_before)) != 0
+		|| !cluster_membership_cut_generation_current(generation))
+		return false;
+	*out = projected;
+	return true;
 }
 
 /* The origin's local scope also covers a one-member cohort, for which no

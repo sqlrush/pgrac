@@ -422,7 +422,7 @@ reuse_xlog_abort(GenericXLogState *state)
 #define ReleaseBuffer reuse_release
 #define UnlockReleaseBuffer reuse_unlock_release
 #define GenericXLogStartInternal reuse_xlog_start
-#define cluster_space_relation_read_identity reuse_space_identity
+#define cluster_space_relation_read_maintenance_identity reuse_space_identity
 #define GenericXLogRegisterBufferVersioned reuse_xlog_register
 #define GenericXLogFinish reuse_xlog_finish
 #define GenericXLogAbort reuse_xlog_abort
@@ -443,7 +443,7 @@ reuse_xlog_abort(GenericXLogState *state)
 #undef ReleaseBuffer
 #undef UnlockReleaseBuffer
 #undef GenericXLogStartInternal
-#undef cluster_space_relation_read_identity
+#undef cluster_space_relation_read_maintenance_identity
 #undef GenericXLogRegisterBufferVersioned
 #undef GenericXLogFinish
 #undef GenericXLogAbort

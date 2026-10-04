@@ -10631,6 +10631,13 @@ struct ClusterPageStructuralReceiptV2 {
 	ClusterPcmPiWriteCutV1 write_cut;
 	ClusterPcmPiStorageCutV1 storage_cut;
 	const ClusterThreadRecoveryFabricPlanV1 *plan;
+	/* Borrowed from the original authenticated background owner. A peer
+	 * receipt is valid only while that exact notice and fact remain live. */
+	const ClusterPiWritebackNoticeV1 *notice;
+	uint64 notice_revision;
+	uint32 notice_index;
+	uint32 durability_flags;
+	ClusterKoSharedMessageV2 ko;
 };
 
 struct ClusterPiPhysicalAckV1 {
@@ -11434,17 +11441,40 @@ cluster_page_structural_owner_current(const ClusterPageStructuralReceiptV2 *rece
 {
 	ClusterPageWalBindingV1 terminal;
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], expected[sizeof(wal)];
-	return receipt != NULL && receipt->magic == UINT64_C(0x5047535452454332)
-		&& receipt->pid == getpid() && receipt->owner == CurrentResourceOwner
-		&& CurrentResourceOwner != NULL && CritSectionCount == 0
-		&& (MyBackendType == B_BG_WRITER || MyBackendType == B_CHECKPOINTER)
-		&& cluster_enabled && cluster_shared_config && !RecoveryInProgress()
-		&& receipt->plan != NULL
-		&& cluster_ko_shared_structure_observation_v2(receipt->slot, receipt->serial,
-			&terminal, wal, sizeof(wal))
-		&& memcmp(&terminal, &receipt->terminal, sizeof(terminal)) == 0
-		&& cluster_space_structure_wal_encode(&receipt->change, expected, sizeof(expected))
-		&& memcmp(wal, expected, sizeof(wal)) == 0;
+	if (receipt == NULL || receipt->magic != UINT64_C(0x5047535452454332)
+		|| receipt->pid != getpid() || receipt->owner != CurrentResourceOwner
+		|| CurrentResourceOwner == NULL || CritSectionCount != 0
+		|| (MyBackendType != B_BG_WRITER && MyBackendType != B_CHECKPOINTER) || !cluster_enabled
+		|| !cluster_shared_config || RecoveryInProgress() || receipt->plan == NULL)
+		return false;
+	if (receipt->notice != NULL) {
+		ClusterPiWritebackFactV2 fact;
+		uint64 revision;
+		const ClusterPiStructuralFactV2 *s = &fact.proof.structural;
+		uint8 ko[CLUSTER_KO_SHARED_V2_BYTES], ko_expected[sizeof(ko)];
+		return cluster_pi_writeback_structural_notice_read_v2(
+				   receipt->notice, receipt->notice_index, &revision, &fact)
+			   && revision == receipt->notice_revision
+			   && fact.kind == CLUSTER_PI_WRITEBACK_STRUCTURAL_V2
+			   && s->durability_flags == receipt->durability_flags
+			   && memcmp(&s->terminal.binding, &receipt->terminal, sizeof(receipt->terminal)) == 0
+			   && memcmp(&s->terminal.write_cut, &receipt->write_cut, sizeof(receipt->write_cut))
+					  == 0
+			   && memcmp(&s->terminal.storage_cut, &receipt->storage_cut,
+						 sizeof(receipt->storage_cut))
+					  == 0
+			   && cluster_space_structure_wal_encode(&s->change, wal, sizeof(wal))
+			   && cluster_space_structure_wal_encode(&receipt->change, expected, sizeof(expected))
+			   && memcmp(wal, expected, sizeof(wal)) == 0
+			   && cluster_ko_shared_encode_v2(&s->ko, ko, sizeof(ko))
+			   && cluster_ko_shared_encode_v2(&receipt->ko, ko_expected, sizeof(ko_expected))
+			   && memcmp(ko, ko_expected, sizeof(ko)) == 0;
+	}
+	return cluster_ko_shared_structure_observation_v2(receipt->slot, receipt->serial, &terminal,
+													  wal, sizeof(wal))
+		   && memcmp(&terminal, &receipt->terminal, sizeof(terminal)) == 0
+		   && cluster_space_structure_wal_encode(&receipt->change, expected, sizeof(expected))
+		   && memcmp(wal, expected, sizeof(wal)) == 0;
 }
 
 bool
@@ -11457,6 +11487,31 @@ cluster_page_structural_pi_proof_v2(const ClusterPageStructuralReceiptV2 *receip
 	if (write_cut == NULL || storage_cut == NULL || !cluster_page_structural_owner_current(receipt))
 		return false;
 	InitBufferTag(&tag, &receipt->page.locator, receipt->page.forknum, receipt->page.blockno);
+	if (receipt->notice != NULL) {
+		int32 master;
+		uint32 holders;
+		static const ClusterPcmPiWriteCutV1 no_x;
+		static const ClusterPcmPiStorageCutV1 no_s;
+		x = receipt->write_cut;
+		s = receipt->storage_cut;
+		if (cluster_pcm_pi_write_cut_valid_v1(&x) && memcmp(&s, &no_s, sizeof(s)) == 0
+			&& BufferTagsEqual(&tag, &x.holder.assertion.resource)) {
+			master = x.master_node;
+			holders = x.pi_holders_bitmap;
+		} else if (cluster_pcm_pi_storage_cut_valid_v1(&s) && memcmp(&x, &no_x, sizeof(x)) == 0
+				   && BufferTagsEqual(&tag, &s.resource)) {
+			master = s.master_node;
+			holders = s.pi_holders_bitmap;
+		} else
+			return false;
+		if (master < 0 || master >= RESOURCE_X_PROTOCOL_NODE_LIMIT || master == cluster_node_id
+			|| cluster_node_id < 0 || cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+			|| (holders & ((uint32)1u << cluster_node_id)) == 0)
+			return false;
+		*write_cut = x;
+		*storage_cut = s;
+		return true;
+	}
 	if (receipt->write_cut.binding_generation != 0) {
 		if (!cluster_pcm_lock_pi_write_snapshot_v1(tag, &x)
 			|| !cluster_pcm_pi_write_cut_valid_v1(&x) || x.master_node != cluster_node_id
@@ -11509,6 +11564,55 @@ cluster_page_structural_from_ko_v2(uint32 slot, uint64 serial,
 		&& !cluster_pcm_lock_pi_storage_snapshot_v1(tag, &value.storage_cut))
 		return false;
 	if (!cluster_page_structural_pi_proof_v2(&value, &x, &s))
+		return false;
+	receipt = palloc(sizeof(*receipt));
+	*receipt = value;
+	*out = receipt;
+	return true;
+}
+
+bool
+cluster_page_structural_from_notice_v2(const ClusterPiWritebackNoticeV1 *notice, uint32 index,
+									   const ClusterThreadRecoveryFabricPlanV1 *plan,
+									   ClusterPageStructuralReceiptV2 **out)
+{
+	ClusterPageStructuralReceiptV2 value = { 0 }, *receipt;
+	ClusterPiWritebackFactV2 fact;
+	const ClusterPiStructuralFactV2 *s = &fact.proof.structural;
+	const BufferTag *tag;
+	ClusterPcmPiWriteCutV1 x;
+	ClusterPcmPiStorageCutV1 storage;
+	uint8 expected[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], actual[sizeof(expected)];
+	if (out == NULL || *out != NULL || plan == NULL || MyBackendType != B_BG_WRITER
+		|| CurrentResourceOwner == NULL || CritSectionCount != 0
+		|| !cluster_pi_writeback_structural_notice_read_v2(notice, index, &value.notice_revision,
+														   &fact)
+		|| fact.kind != CLUSTER_PI_WRITEBACK_STRUCTURAL_V2
+		|| !cluster_space_structure_wal_encode(&s->change, expected, sizeof(expected))
+		|| !cluster_page_structural_record_v1(
+			&s->terminal.binding, s->change.identity.expected.incarnation, plan, &value.change)
+		|| !cluster_space_structure_wal_encode(&value.change, actual, sizeof(actual))
+		|| memcmp(expected, actual, sizeof(expected)) != 0)
+		return false;
+	value.magic = UINT64_C(0x5047535452454332);
+	value.owner = CurrentResourceOwner;
+	value.pid = getpid();
+	value.plan = plan;
+	value.notice = notice;
+	value.notice_index = index;
+	value.durability_flags = s->durability_flags;
+	value.ko = s->ko;
+	value.terminal = s->terminal.binding;
+	value.write_cut = s->terminal.write_cut;
+	value.storage_cut = s->terminal.storage_cut;
+	tag = value.write_cut.binding_generation != 0 ? &value.write_cut.holder.assertion.resource
+												  : &value.storage_cut.resource;
+	value.page = value.terminal.identity;
+	value.page.locator = BufTagGetRelFileLocator(tag);
+	value.page.forknum = tag->forkNum;
+	value.page.blockno = tag->blockNum;
+	if (!cluster_page_structural_page_covered(&value.terminal, &value.change, &value.page, plan)
+		|| !cluster_page_structural_pi_proof_v2(&value, &x, &storage))
 		return false;
 	receipt = palloc(sizeof(*receipt));
 	*receipt = value;
@@ -12333,6 +12437,19 @@ cluster_page_structural_pi_ack_free_v2(ClusterPiStructuralAckV2 **ack)
 	explicit_bzero(*ack, sizeof(**ack));
 	pfree(*ack);
 	*ack = NULL;
+}
+
+bool
+cluster_page_structural_pi_ack_export_v2(const ClusterPiStructuralAckV2 *ack,
+										 const ClusterPageStructuralReceiptV2 *receipt,
+										 ClusterWalWriterToken *out)
+{
+	int32 node;
+	if (out == NULL || !cluster_page_structural_pi_ack_read_v2(ack, receipt, &node)
+		|| node != cluster_node_id)
+		return false;
+	*out = ack->writer;
+	return true;
 }
 
 bool

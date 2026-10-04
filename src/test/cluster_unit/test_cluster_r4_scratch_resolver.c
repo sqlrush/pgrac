@@ -55,6 +55,7 @@
 #include "../../backend/access/heap/heapam_r4_private.h"
 
 #include "unit_test.h"
+#include "cluster_snapshot_test_stubs.h"
 #include "cluster/cluster_space_storage.h"
 
 /* The resolver fixture never enters the shared hint writer. Link the current
@@ -80,12 +81,17 @@ UT_DEFINE_GLOBALS();
 
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
+static sigjmp_buf ut_error_jump;
+static bool ut_error_armed;
 
 void
 pg_re_throw(void)
 {
 	if (PG_exception_stack != NULL)
 		siglongjmp(*PG_exception_stack, 1);
+	/* The outer fixture catch remains active after product PG_FINALLY. */
+	if (ut_error_armed)
+		siglongjmp(ut_error_jump, 1);
 	abort();
 }
 
@@ -234,8 +240,6 @@ static uint64 ut_current_epoch;
 static int ut_native_calls;
 static int ut_hint_mutations;
 static int ut_live_cr_gate_calls;
-static sigjmp_buf ut_error_jump;
-static bool ut_error_armed;
 static int ut_error_level;
 static int ut_error_code;
 static char ut_error_detail[512];
@@ -352,6 +356,7 @@ ut_exact_peer_ref(void)
 static void
 ut_reset(ClusterTTStatus status, SCN scn)
 {
+	UT_ASSERT(ut_snapshot_scope == NULL);
 	cluster_vis_resolve_abort_reset();
 	cluster_page_scn_shortcut = false;
 	MyProc = NULL;
@@ -2394,6 +2399,7 @@ main(void)
 	UT_RUN(test_full_scratch_retained_scn_both_origins_and_tuple_sides);
 	UT_RUN(test_full_scratch_retained_unknown_malformed_missing_and_epoch_change);
 	UT_RUN(test_full_scratch_retained_pair_error_unwinds_then_exact_live_works);
+	UT_ASSERT(ut_snapshot_scope == NULL);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

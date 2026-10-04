@@ -416,6 +416,174 @@ wb_v2_offer_fixture(ClusterPiWritebackMessageV2 *m, const ClusterPiDataFactV1 *d
 		sizeof(m->facts[0].proof.structural.terminal.storage_cut));
 }
 
+UT_TEST(writeback_v2_request_cut_checks_real_sender_and_recipient)
+{
+	ClusterPageDataReceiptV1 *receipt = wb_setup();
+	ClusterPiDataFactV1 data;
+	ClusterPiWritebackMessageV2 m;
+	UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &data));
+	for (unsigned shape = 0; shape < 4; shape++) {
+		int sender = shape == 3 ? 2 : 0;
+		if (shape == 3)
+			wb_v2_offer_fixture(&m, &data, false);
+		else if (shape == 2)
+			wb_v2_origin_fixture(&m, &data);
+		else {
+			wb_v2_fixture(&m, &data);
+			if (shape == 0) m.count = 1;
+		}
+		wb_select(sender, B_BG_WRITER);
+		UT_ASSERT(cluster_pi_writeback_request_current_v2(&m, true));
+		UT_ASSERT(!cluster_pi_writeback_request_current_v2(&m, false));
+		wb_select(m.peer.claim.identity.origin_node_id, B_BG_WRITER);
+		UT_ASSERT(cluster_pi_writeback_request_current_v2(&m, false));
+		UT_ASSERT(!cluster_pi_writeback_request_current_v2(&m, true));
+		UT_ASSERT_EQ(wb_sends + wb_plan_builds + pi_discards, 0);
+	}
+	wb_select(0, B_CHECKPOINTER);
+	cluster_page_data_receipt_free_v1(&receipt);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+/* Exercise the opaque reader itself; queue/transport activation is separate.
+ * The fixture establishes the original singleton owner, never PAGE proof. */
+UT_TEST(writeback_v2_structural_notice_requires_its_live_original_slot)
+{
+	for (unsigned fault = 0; fault < 19; fault++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiWritebackNoticeV1 notice = { 0 }, other = { 0 };
+		ClusterPiDataFactV1 data;
+		ClusterPiWritebackFactV2 out, before;
+		uint64 revision = 83;
+		UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &data));
+		wb_v2_fixture(&notice.request_v2, &data);
+		wb_select(1, B_BG_WRITER);
+		notice.owner = CurrentResourceOwner;
+		notice.pid = getpid();
+		notice.version = 2;
+		notice.revision = 71;
+		wb_notice = &notice;
+		wb_shared->inbound_revision = notice.revision;
+		wb_shared->inbound_pid = MyProcPid;
+		wb_shared->inbound_state = WB_RUNNING;
+		memset(&out, 0x5a, sizeof(out));
+		before = out;
+		switch (fault) {
+		case 1:
+			wb_notice = NULL;
+			break;
+		case 2:
+			notice.pid++;
+			break;
+		case 3:
+			notice.owner = (void *)3;
+			break;
+		case 4:
+			notice.version = 1;
+			break;
+		case 5:
+			MyBackendType = B_LMON;
+			break;
+		case 6:
+			CritSectionCount = 1;
+			break;
+		case 7:
+			wb_peer_caps = 0;
+			break;
+		case 8:
+			wb_shared->inbound_revision++;
+			break;
+		case 9:
+			wb_shared->inbound_pid++;
+			break;
+		case 10:
+			wb_shared->inbound_state = WB_REPLIED;
+			break;
+		case 11:
+			notice.revision = wb_shared->inbound_revision = 0;
+			break;
+		case 12:
+			notice.revision = wb_shared->inbound_revision = UINT64_MAX;
+			break;
+		case 13:
+			break; /* unknown opaque handle */
+		case 14:
+			break; /* DATA kind cannot construct structural authority */
+		case 15:
+			break; /* absent index */
+		case 16:
+			wb_ko_current = false;
+			break;
+		case 17:
+			wb_shared = NULL;
+			break;
+		case 18:
+			break; /* missing revision output */
+		}
+		UT_ASSERT_EQ(cluster_pi_writeback_structural_notice_read_v2(fault == 13 ? &other : &notice,
+																	fault == 14	  ? 0
+																	: fault == 15 ? 2
+																				  : 1,
+																	fault == 18 ? NULL : &revision,
+																	&out),
+					 fault == 0);
+		UT_ASSERT_EQ(revision, fault == 0 ? notice.revision : 83);
+		UT_ASSERT(memcmp(&out, fault == 0 ? &notice.request_v2.facts[1] : &before, sizeof(out))
+				  == 0);
+		UT_ASSERT_EQ(wb_sends + wb_plan_builds + pi_discards, 0);
+		wb_notice = NULL;
+		CritSectionCount = 0;
+		wb_select(0, B_CHECKPOINTER);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_v2_request_cut_refuses_missing_or_changed_proofs)
+{
+	for (unsigned fault = 0; fault < 20; fault++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiDataFactV1 data;
+		ClusterPiWritebackMessageV2 m, before;
+		UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &data));
+		wb_v2_fixture(&m, &data);
+		switch (fault) {
+		case 0: wb_local_caps = 0; break;
+		case 1: wb_peer_caps = 0; break;
+		case 2: wb_cap_available = false; break;
+		case 3: wb_cap_generation = 0; break;
+		case 4: wb_ko_current = false; break;
+		case 5: wb_cap_drift = 1; break;
+		case 6: wb_cap_drift = 2; break;
+		case 7: wb_cap_drift = 3; break;
+		case 8: wb_route = 2; break;
+		case 9: wb_stop = true; break;
+		case 10: wb_quorum = false; break;
+		case 11: m.epoch++; break;
+		case 12: wb_boots[1]++; break;
+		case 13: wb_recovered_sources = 2; break;
+		case 14: writer.claim.database_incarnation++; break;
+		case 15: m.verb = CLUSTER_PI_WRITEBACK_ACK; m.count = 0; break;
+		case 16: wb_membership_generation++; break;
+		case 17: wb_select(2, B_BG_WRITER); break;
+		case 18: m.peer.claim.identity.origin_owner_incarnation++; break;
+		case 19: selected = false; break;
+		}
+		before = m;
+		UT_ASSERT(!cluster_pi_writeback_request_current_v2(&m, true));
+		UT_ASSERT(memcmp(&before, &m, sizeof(m)) == 0);
+		UT_ASSERT_EQ(wb_sends + wb_plan_builds + pi_discards, 0);
+		selected = true;
+		wb_select(0, B_CHECKPOINTER);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+	UT_ASSERT(!cluster_pi_writeback_request_current_v2(NULL, true));
+}
+
 UT_TEST(writeback_v2_relation_offer_has_no_page_master_authority)
 {
 	ClusterPageDataReceiptV1 *receipt = wb_setup();

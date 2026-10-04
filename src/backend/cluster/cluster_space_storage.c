@@ -153,27 +153,30 @@ space_capture_native(Buffer buffer, const ClusterSpaceIdentityKey *key, XLogRecP
 		elog(PANIC, "SPACE WAL lost its native mutation invariant");
 }
 
-static bool
-space_read_identity(RelFileLocator locator, bool redo, ClusterSpaceIdentity *out)
+static Buffer
+space_read_identity_buffer(RelFileLocator locator, bool redo, ClusterSpaceIdentityKey *expected)
 {
-	ClusterSpaceIdentityKey expected;
-	ClusterSpaceIdentity identity;
 	SMgrRelation rel;
-	Buffer buffer;
+
+	if (RecoveryInProgress() != redo || !space_namespace(locator, redo, expected, NULL))
+		return InvalidBuffer;
+	rel = smgropen(locator, InvalidBackendId);
+	if (!smgrexists(rel, SPACE_FORKNUM) || smgrnblocks(rel, SPACE_FORKNUM) != 2)
+		return InvalidBuffer;
+	return ReadBufferWithoutRelcache(locator, SPACE_FORKNUM, 0, RBM_NORMAL, NULL, true);
+}
+
+static bool
+space_read_locked_identity(Buffer buffer, const ClusterSpaceIdentityKey *expected,
+						   ClusterSpaceIdentity *out)
+{
+	ClusterSpaceIdentity identity;
 	bool valid;
 	uint64 token;
 
-	if (out == NULL || RecoveryInProgress() != redo
-		|| !space_namespace(locator, redo, &expected, NULL))
-		return false;
-	rel = smgropen(locator, InvalidBackendId);
-	if (!smgrexists(rel, SPACE_FORKNUM) || smgrnblocks(rel, SPACE_FORKNUM) != 2)
-		return false;
-	buffer = ReadBufferWithoutRelcache(locator, SPACE_FORKNUM, 0, RBM_NORMAL, NULL, true);
-	LockBuffer(buffer, BUFFER_LOCK_SHARE);
 	valid = BufferGetBlockNumber(buffer) == 0
 			&& cluster_space_identity_page_decode(BufferGetPage(buffer), BLCKSZ, SPACE_FORKNUM, 0,
-												  &expected, &identity, &token)
+												  expected, &identity, &token)
 			&& identity.state == CLUSTER_SPACE_IDENTITY_LIVE;
 	UnlockReleaseBuffer(buffer);
 	if (valid)
@@ -181,10 +184,46 @@ space_read_identity(RelFileLocator locator, bool redo, ClusterSpaceIdentity *out
 	return valid;
 }
 
+static bool
+space_read_identity(RelFileLocator locator, bool redo, ClusterSpaceIdentity *out)
+{
+	ClusterSpaceIdentityKey expected;
+	Buffer buffer;
+
+	if (out == NULL)
+		return false;
+	buffer = space_read_identity_buffer(locator, redo, &expected);
+	if (!BufferIsValid(buffer))
+		return false;
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	return space_read_locked_identity(buffer, &expected, out);
+}
+
 bool
 cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentity *out)
 {
 	return space_read_identity(locator, false, out);
+}
+
+bool
+cluster_space_relation_read_maintenance_identity(RelFileLocator locator, ClusterSpaceIdentity *out)
+{
+	ClusterSpaceIdentityKey expected;
+	Buffer buffer;
+
+	if (out == NULL)
+		return false;
+	buffer = space_read_identity_buffer(locator, false, &expected);
+	if (!BufferIsValid(buffer))
+		return false;
+	/* The legacy shared-read requester is backend-indexed. Maintenance
+	 * already uses this current owner for its target page; use the same
+	 * auxiliary-capable path for the preceding identity read. */
+	if (!ClusterLockBufferExclusiveRetryAware(buffer)) {
+		ReleaseBuffer(buffer);
+		return false;
+	}
+	return space_read_locked_identity(buffer, &expected, out);
 }
 
 bool

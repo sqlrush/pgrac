@@ -63,6 +63,27 @@ extern PGDLLIMPORT SnapshotData SnapshotSelfData;
 extern PGDLLIMPORT SnapshotData SnapshotAnyData;
 extern PGDLLIMPORT SnapshotData CatalogSnapshotData;
 
+#ifdef USE_PGRAC_CLUSTER
+/* Caller-owned evaluation scope; does not acquire an Active/Registered ref. */
+typedef struct ClusterSnapshotReadScopeV1
+{
+	struct ClusterSnapshotReadScopeV1 *previous;
+	Snapshot	snapshot;
+	ResourceOwner owner;
+	SCN			read_scn;
+	uint64		read_epoch;
+	uint8		cluster_source;
+	bool		invalidated;
+} ClusterSnapshotReadScopeV1;
+
+extern void cluster_snapshot_read_enter_v1(ClusterSnapshotReadScopeV1 *scope,
+										   Snapshot snapshot);
+extern void cluster_snapshot_read_exit_v1(ClusterSnapshotReadScopeV1 *scope);
+extern bool cluster_snapshot_read_evidence_v1(SCN resolver_read_scn,
+											Snapshot *snapshot, SCN *retained_floor,
+											const char **reason);
+#endif
+
 #define SnapshotSelf		(&SnapshotSelfData)
 #define SnapshotAny			(&SnapshotAnyData)
 

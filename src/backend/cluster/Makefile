@@ -283,6 +283,8 @@ OBJS = \
 	cluster_writer_chain.o \
 	cluster_wal_retention.o \
 	cluster_wal_retained_cut.o \
+	cluster_wal_retained_side.o \
+	cluster_wal_retained_generation.o \
 	cluster_undo_record.o \
 	cluster_undo_resid.o \
 	cluster_undo_authority.o \

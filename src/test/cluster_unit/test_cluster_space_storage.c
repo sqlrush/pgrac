@@ -99,6 +99,8 @@ static unsigned truncate_observations;
 static unsigned observation_fault;
 static unsigned current_ref_reads, restart_ref_reads;
 static bool reject_current_ref;
+static unsigned shared_identity_locks, maintenance_identity_locks;
+static bool refuse_maintenance_lock;
 static uint64 next_token;
 static bool reserve_owner, writer_allowed, revoke_on_flush;
 static bool hw_held, fail_hw_lock, throw_reserve_flush;
@@ -157,6 +159,13 @@ bool cluster_smart_fusion = false;
 static unsigned native_commits, commit_decisions;
 static bool plain_commit_emitter;
 static bool forceSyncCommit;
+/* This native commit fixture owns SPACE only; TT durability has its own
+ * real-owner tests. An unexpected staged TT write must not silently pass. */
+static void
+cluster_tt_local_commit_durable_apply(XLogRecPtr commit_lsn)
+{
+	UT_ASSERT(false);
+}
 int synchronous_commit = SYNCHRONOUS_COMMIT_OFF;
 Oid MyDatabaseId = 5, MyDatabaseTableSpace = DEFAULTTABLESPACE_OID;
 RepOriginId replorigin_session_origin = InvalidRepOriginId;
@@ -649,7 +658,29 @@ LockBuffer(Buffer buffer, int mode)
 	if (buffer < 1 || buffer > 2 || !(pinned & (1 << (buffer - 1))) || (locked & (1 << (buffer - 1)))
 		|| (mode != BUFFER_LOCK_EXCLUSIVE && mode != BUFFER_LOCK_SHARE))
 		abort();
+	if (mode == BUFFER_LOCK_SHARE)
+		shared_identity_locks++;
 	locked |= 1 << (buffer - 1);
+}
+
+bool
+ClusterLockBufferExclusiveRetryAware(Buffer buffer)
+{
+	maintenance_identity_locks++;
+	if (refuse_maintenance_lock)
+		return false;
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	return true;
+}
+
+void
+ReleaseBuffer(Buffer buffer)
+{
+	if (buffer < 1 || buffer > 2 || !(pinned & (1 << (buffer - 1)))
+		|| (locked & (1 << (buffer - 1))))
+		abort();
+	pinned &= ~(1 << (buffer - 1));
+	release_calls++;
 }
 
 void
@@ -1122,6 +1153,9 @@ errcode(int code)
 static void
 reset(void)
 {
+	MyBackendId = 1;
+	shared_identity_locks = maintenance_identity_locks = 0;
+	refuse_maintenance_lock = false;
 	space_readbacks = 0;
 	readback_checksums = false;
 	readback_fail_block = readback_corrupt_block = -1;
@@ -1329,6 +1363,90 @@ UT_TEST(test_recovery_identity_uses_only_restart_namespace)
 	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
 	UT_ASSERT_EQ(wal_calls, writes);
 	UT_ASSERT(!pinned && !locked);
+}
+
+UT_TEST(test_maintenance_identity_uses_current_owner_without_backend_id)
+{
+	ClusterSpaceIdentity out;
+	PGAlignedBlock before[2];
+	unsigned writes, dirties;
+
+	reset();
+	UT_ASSERT(cluster_space_relation_create(locator));
+	memcpy(before, pages, sizeof(before));
+	writes = wal_calls;
+	dirties = dirty_calls;
+	MyBackendId = InvalidBackendId;
+	UT_ASSERT(cluster_space_relation_read_maintenance_identity(locator, &out));
+	UT_ASSERT_EQ(out.state, CLUSTER_SPACE_IDENTITY_LIVE);
+	UT_ASSERT_EQ(out.incarnation[15], 0x45);
+	UT_ASSERT_EQ(MyBackendId, InvalidBackendId);
+	UT_ASSERT_EQ(shared_identity_locks, 0);
+	UT_ASSERT_EQ(maintenance_identity_locks, 1);
+	UT_ASSERT_EQ(wal_calls, writes);
+	UT_ASSERT_EQ(dirty_calls, dirties);
+	UT_ASSERT_EQ(pinned | locked, 0);
+	UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+
+	MyBackendId = 1;
+	UT_ASSERT(cluster_space_relation_read_identity(locator, &out));
+	UT_ASSERT_EQ(shared_identity_locks, 1);
+	UT_ASSERT_EQ(maintenance_identity_locks, 1);
+}
+
+UT_TEST(test_maintenance_identity_retry_keeps_work_and_releases_pin)
+{
+	ClusterSpaceIdentity out, saved;
+	unsigned writes, releases;
+
+	reset();
+	UT_ASSERT(cluster_space_relation_create(locator));
+	writes = wal_calls;
+	releases = release_calls;
+	memset(&out, 0xa5, sizeof(out));
+	saved = out;
+	MyBackendId = InvalidBackendId;
+	refuse_maintenance_lock = true;
+	UT_ASSERT(!cluster_space_relation_read_maintenance_identity(locator, &out));
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	UT_ASSERT_EQ(pinned | locked, 0);
+	UT_ASSERT_EQ(release_calls, releases + 1);
+	UT_ASSERT_EQ(shared_identity_locks, 0);
+	UT_ASSERT_EQ(wal_calls, writes);
+	refuse_maintenance_lock = false;
+	UT_ASSERT(cluster_space_relation_read_maintenance_identity(locator, &out));
+	UT_ASSERT_EQ(maintenance_identity_locks, 2);
+	UT_ASSERT_EQ(pinned | locked, 0);
+}
+
+UT_TEST(test_maintenance_identity_preserves_namespace_and_live_page_checks)
+{
+	ClusterSpaceIdentity out, saved, tombstone;
+
+	reset();
+	UT_ASSERT(cluster_space_relation_create(locator));
+	UT_ASSERT(cluster_space_relation_read_identity(locator, &tombstone));
+	memset(&out, 0xa5, sizeof(out));
+	saved = out;
+	MyBackendId = InvalidBackendId;
+	ref.claim.database_incarnation++;
+	UT_ASSERT(!cluster_space_relation_read_maintenance_identity(locator, &out));
+	UT_ASSERT_EQ(pinned | locked, 0);
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	ref.claim.database_incarnation--;
+	page.data[160] = 1;
+	UT_ASSERT(!cluster_space_relation_read_maintenance_identity(locator, &out));
+	UT_ASSERT_EQ(pinned | locked, 0);
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	tombstone.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+	UT_ASSERT(cluster_space_identity_page_encode(&tombstone, 18, page.data, BLCKSZ));
+	UT_ASSERT(!cluster_space_relation_read_maintenance_identity(locator, &out));
+	UT_ASSERT_EQ(pinned | locked, 0);
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	recovering = true;
+	UT_ASSERT(!cluster_space_relation_read_maintenance_identity(locator, &out));
+	UT_ASSERT_EQ(maintenance_identity_locks, 3);
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
 }
 
 UT_TEST(test_real_replay_exact_duplicate_and_preserved_token)
@@ -2599,6 +2717,7 @@ UT_TEST(test_native_commit_logs_decides_and_publishes_before_checkpoint_release)
 	uint32 space_drop_len;
 	bool wrote_xlog = true, markXidCommitted = true, forceSyncCommit = false;
 	bool RelcacheInitFileInval = false, has_tt_fold = false, commit_record_flushed = false;
+	bool tt_stamp_staged = false;
 	int nchildren = 0, nrels = 1, ndroppedstats = 0, nmsgs = 0;
 	int synchronous_commit = SYNCHRONOUS_COMMIT_OFF;
 	TransactionId xid = 501, *children = NULL;
@@ -3030,7 +3149,10 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(61);
+	UT_PLAN(64);
+	UT_RUN(test_maintenance_identity_uses_current_owner_without_backend_id);
+	UT_RUN(test_maintenance_identity_retry_keeps_work_and_releases_pin);
+	UT_RUN(test_maintenance_identity_preserves_namespace_and_live_page_checks);
 	UT_RUN(test_native_drop_durable_finish_io_failure_keeps_original_owner);
 	UT_RUN(test_native_drop_durable_finish_requires_each_exact_page);
 	UT_RUN(test_native_structure_observation_needs_attribution_and_stable_native_flush);

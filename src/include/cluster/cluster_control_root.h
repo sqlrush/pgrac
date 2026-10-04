@@ -285,6 +285,21 @@ typedef struct ClusterControlRootFileToken {
 	uint8 image_sha256[32];
 } ClusterControlRootFileToken;
 
+/* PGRAC: original LMON consumes the durable PGSA OPEN and its exact PGRD
+ * (CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES bytes). The live OPEN_APPLIED/formation
+ * owners are rechecked here; caller bytes alone never authorize publication.
+ * Coordinator publishes installed fixed-cohort writers MOUNTED -> OPEN;
+ * members only observe that publication. Only OK_PRIMARY returns a token,
+ * after durable readback and confirmed release of this duty's CF owner.
+ * LOCK_UNAVAILABLE/RECONFIG_WAIT require a later tick, not a blocking wait.
+ * Cancel retires only this duty; neither call grants SQL admission by itself.
+ * Author: SqlRush <sqlrush@gmail.com> */
+struct ClusterSemanticActivationRecord;
+extern ClusterControlRootResult cluster_control_root_v3_serving_poll(
+	const struct ClusterSemanticActivationRecord *open, const uint8 *root_descriptor,
+	ClusterControlRootFileToken *out);
+extern void cluster_control_root_v3_serving_cancel(void);
+
 /* PGRAC: checkpoint-less initialization is a separate recovery subject, not
  * a checkpoint-bearing root record. These value-owned observations confer no
  * isolation, WAL retention, replay or publication authority.

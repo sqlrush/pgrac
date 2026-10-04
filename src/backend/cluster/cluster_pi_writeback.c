@@ -15,6 +15,7 @@
 #include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_inputs.h"
 #include "cluster/cluster_wal_thread.h"
@@ -70,7 +71,11 @@ struct ClusterPiWritebackNoticeV1 {
 	ResourceOwner owner;
 	pid_t pid;
 	uint64 revision;
-	ClusterPiWritebackMessageV1 request;
+	uint32 version;
+	union {
+		ClusterPiWritebackMessageV1 request;
+		ClusterPiWritebackMessageV2 request_v2;
+	};
 	ClusterWalInputsV1 *inputs;
 	ClusterThreadRecoveryFabricPlanV1 *plan;
 };
@@ -787,6 +792,78 @@ wb_current(const ClusterPiWritebackMessageV1 *m, bool master)
 }
 
 static bool
+wb_v2_fact_current(const ClusterPiWritebackFactV2 *fact, const ClusterWalSourceRef *peer,
+	uint64 epoch, bool sending)
+{
+	const ClusterPiStructuralFactV2 *s;
+	const ClusterPiDataFactV1 *page;
+	int32 origin, recipient = peer->claim.identity.origin_node_id;
+	uint64 origin_boot, recipient_boot = peer->claim.identity.origin_owner_incarnation;
+	bool offer;
+
+	if (fact->kind == CLUSTER_PI_WRITEBACK_DATA_V2)
+		return wb_fact_current(&fact->proof.data, peer, epoch, sending);
+	s = &fact->proof.structural;
+	page = &s->terminal;
+	offer = fact->kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2;
+	origin = offer ? s->ko.origin_node : wb_master(page);
+	origin_boot = offer ? s->ko.origin_boot : wb_master_boot(page);
+	return origin >= 0 && origin < RESOURCE_X_PROTOCOL_NODE_LIMIT
+		&& recipient >= 0 && recipient < RESOURCE_X_PROTOCOL_NODE_LIMIT
+		&& origin != recipient && cluster_node_id == (sending ? origin : recipient)
+		&& cluster_membership_get_state(origin) == CLUSTER_MEMBER_MEMBER
+		&& cluster_membership_get_last_admitted_incarnation(origin) == origin_boot
+		&& cluster_membership_get_state(recipient) == CLUSTER_MEMBER_MEMBER
+		&& cluster_membership_get_last_admitted_incarnation(recipient) == recipient_boot
+		&& cluster_qvotec_get_self_incarnation() == (sending ? origin_boot : recipient_boot)
+		&& cluster_ko_shared_cut_current_v2(&s->ko)
+		&& (offer || cluster_gcs_lookup_master(*wb_tag(page)) == origin);
+}
+
+bool
+cluster_pi_writeback_request_current_v2(const ClusterPiWritebackMessageV2 *m, bool sending)
+{
+	ClusterWalSourceRef before, after;
+	uint64 generation;
+	uint32 word, connection, after_word, after_connection;
+	int32 remote;
+
+	if (!wb_v2_message_valid(m) || m->verb != CLUSTER_PI_WRITEBACK_NOTIFY
+		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
+		|| cluster_normal_stop_requested() || !cluster_qvotec_in_quorum()
+		|| cluster_reconfig_has_pending_prebump_stage()
+		|| cluster_epoch_get_current() != m->epoch
+		|| (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0)
+		return false;
+	generation = cluster_membership_cut_generation();
+	if (!cluster_membership_cut_generation_current(generation)
+		|| !cluster_wal_thread_current_v2_ref(&before)
+		|| before.claim.identity.origin_node_id != cluster_node_id
+		|| before.claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation()
+		|| GetSystemIdentifier() != m->peer.claim.identity.system_identifier
+		|| !wb_namespace(&before, &m->peer)
+		|| (!sending && !wb_source_covered(&before, &m->peer)))
+		return false;
+	for (uint32 i = 0; i < m->count; i++)
+		if (!wb_v2_fact_current(&m->facts[i], &m->peer, m->epoch, sending))
+			return false;
+	remote = sending ? m->peer.claim.identity.origin_node_id
+		: m->facts[0].kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2
+			? m->facts[0].proof.structural.ko.origin_node : wb_master(wb_v2_page(&m->facts[0]));
+	if (remote == cluster_node_id
+		|| !cluster_sf_peer_capability_word_sample(remote, PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2,
+			&word, &connection) || connection == 0
+		|| (word & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0)
+		return false;
+	return cluster_sf_peer_capability_word_sample(remote, PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2,
+			&after_word, &after_connection)
+		&& after_word == word && after_connection == connection
+		&& cluster_wal_thread_current_v2_ref(&after)
+		&& memcmp(&before, &after, sizeof(before)) == 0
+		&& cluster_membership_cut_generation_current(generation);
+}
+
+static bool
 wb_master_fact_cut(const ClusterPiDataFactV1 *f)
 {
 	if (f->write_cut.binding_generation != 0) {
@@ -1010,10 +1087,36 @@ cluster_pi_writeback_notice_read_v1(const ClusterPiWritebackNoticeV1 *notice, ui
 									ClusterPiDataFactV1 *out)
 {
 	if (notice == NULL || notice != wb_notice || out == NULL || notice->pid != getpid()
-		|| notice->owner != CurrentResourceOwner || MyBackendType != B_BG_WRITER || !wb_background()
-		|| index >= notice->request.count || !wb_current(&notice->request, false))
+		|| notice->version != 1 || notice->owner != CurrentResourceOwner
+		|| MyBackendType != B_BG_WRITER || !wb_background() || index >= notice->request.count
+		|| !wb_current(&notice->request, false))
 		return false;
 	*out = notice->request.facts[index];
+	return true;
+}
+
+bool
+cluster_pi_writeback_structural_notice_read_v2(const ClusterPiWritebackNoticeV1 *notice,
+											   uint32 index, uint64 *revision,
+											   ClusterPiWritebackFactV2 *out)
+{
+	bool live;
+	if (notice == NULL || notice != wb_notice || out == NULL || revision == NULL
+		|| wb_shared == NULL || notice->pid != getpid() || notice->owner != CurrentResourceOwner
+		|| MyBackendType != B_BG_WRITER || !wb_background() || notice->revision == 0
+		|| notice->revision == UINT64_MAX || notice->version != 2
+		|| index >= notice->request_v2.count
+		|| !cluster_pi_writeback_request_current_v2(&notice->request_v2, false)
+		|| notice->request_v2.facts[index].kind != CLUSTER_PI_WRITEBACK_STRUCTURAL_V2)
+		return false;
+	SpinLockAcquire(&wb_shared->lock);
+	live = wb_shared->inbound_state == WB_RUNNING && wb_shared->inbound_pid == MyProcPid
+		   && wb_shared->inbound_revision == notice->revision;
+	SpinLockRelease(&wb_shared->lock);
+	if (!live)
+		return false;
+	*revision = notice->revision;
+	*out = notice->request_v2.facts[index];
 	return true;
 }
 
@@ -1131,6 +1234,7 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 		notice->pid = getpid();
 		notice->owner = CurrentResourceOwner;
 		notice->revision = revision;
+		notice->version = 1;
 		notice->request = request;
 		SpinLockAcquire(&wb_shared->lock);
 		if (wb_shared->inbound_state == WB_QUEUED && wb_shared->inbound_pid == 0

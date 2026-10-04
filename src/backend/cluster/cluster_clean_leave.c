@@ -122,6 +122,8 @@ static const ClusterPhase1FullStopPlan *cl_durable_close_owner;
  * identity reader finishes. No shared layout, new message or authority. */
 typedef struct ClNormalStopFrontInbox {
 	bool pending;
+	/* Scheduling only: revalidate this retained frame after our checkpoint. */
+	bool wait_for_post_checkpoint;
 	ClusterICEnvelope envelope;
 	ClusterLeaveAnnouncePayload request;
 	bool ack_pending;
@@ -137,6 +139,10 @@ typedef struct ClNormalStopFrontInbox {
 	ClusterLeaveAckPayload release_ack;
 } ClNormalStopFrontInbox;
 static ClNormalStopFrontInbox cl_normal_stop_front_inbox[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+/* An asynchronous identity read remains this LMON duty's work until its
+ * original CF release/completion is consumed, even if no new frame arrives. */
+static bool cl_normal_stop_front_read_pending;
+static bool cl_normal_stop_post_read_pending;
 
 static void cl_normal_stop_fronts_lmon_tick(void);
 static void cl_normal_stop_post_lmon_tick(void);
@@ -321,6 +327,13 @@ cl_full_stop_capture_formation_only(bool require_shutdown_suppressed, uint64 exp
 	if (formation.self_join_admitted == 0 || formation.self_join_failed != 0)
 		goto invalid;
 	memset(&empty_event, 0, sizeof(empty_event));
+	/* Fixed-cohort adoption projects its epoch into an otherwise empty event.
+	 * The snapshot supplies a generation only for the current published cohort. */
+	if (cluster_shared_config && formation.startup_formation_generation != 0
+		&& formation.startup_formation_generation != UINT64_MAX
+		&& expected_epoch > CLUSTER_EPOCH_INITIAL
+		&& formation.applied.new_epoch == expected_epoch)
+		empty_event.new_epoch = expected_epoch;
 	reason = "NORMAL_STOP_FORMATION_APPLIED_EVENT";
 	if (memcmp(&formation.applied, &empty_event, sizeof(empty_event)) != 0)
 		goto invalid;
@@ -1434,6 +1447,7 @@ cl_normal_stop_fronts_announce(const ClusterICEnvelope *env,
 		inbox->envelope = *env;
 		inbox->request = *request;
 		inbox->pending = true;
+		inbox->wait_for_post_checkpoint = false;
 	}
 	LWLockRelease(&cl_state->lock);
 }
@@ -1504,10 +1518,17 @@ cl_normal_stop_fronts_lmon_tick(void)
 	if (!IsUnderPostmaster || !AmLmonProcess() || cl_state == NULL || cl_normal_stop == NULL
 		|| !cluster_enabled || cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
 		return;
-	for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++)
-		inbox_work |= cl_normal_stop_front_inbox[peer].pending
-					  || cl_normal_stop_front_inbox[peer].ack_pending;
-	if (!inbox_work
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
+		const ClNormalStopFrontInbox *inbox = &cl_normal_stop_front_inbox[peer];
+		inbox_work
+			|= (inbox->pending && (!cluster_shared_config || !inbox->wait_for_post_checkpoint))
+			   || (inbox->ack_pending
+				   && (!cluster_shared_config || inbox->ack.nak
+					   || (cl_normal_stop->peer_requests_seen & (UINT32_C(1) << peer)) != 0));
+	}
+	LWLockRelease(&cl_state->lock);
+	if (!inbox_work && !cl_normal_stop_front_read_pending
 		&& (!cluster_normal_stop_requested()
 			|| (pg_atomic_read_u32(&cl_normal_stop->identity_published) == 0
 				&& cluster_semantic_activation_phase1_pristine())))
@@ -1516,7 +1537,29 @@ cl_normal_stop_fronts_lmon_tick(void)
 	/* The checkpoint/STOPPED successor has its own WAL-state and nonce cut. */
 	if (phase >= CLUSTER_NORMAL_STOP_CHECKPOINT)
 		return;
+	if (cluster_shared_config) {
+		bool work;
+		uint32 peers;
+
+		/* Do not manufacture CF/GES debt while the controller is trying to
+		 * observe idle owners. Read only for an actual receive/send or the
+		 * initial binding; an existing read must still finish through its
+		 * owner. This skips no identity check for any transmitted evidence. */
+		LWLockAcquire(&cl_state->lock, LW_SHARED);
+		peers = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
+		work = inbox_work || pg_atomic_read_u32(&cl_normal_stop->identity_published) == 0
+			   || (phase == CLUSTER_NORMAL_STOP_WAIT_PEER_FRONTS && cluster_normal_stop_requested()
+				   && pg_atomic_read_u32(&cl_normal_stop->frontends_gone) == 1
+				   && cl_normal_stop->peer_request_sent != peers)
+			   || (phase == CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK
+				   && (cl_normal_stop->peer_reply_pending & ~cl_normal_stop->peer_reply_sent) != 0);
+		LWLockRelease(&cl_state->lock);
+		if (!work && !cl_normal_stop_front_read_pending)
+			return;
+	}
 	result = cl_normal_stop_identity_poll(false, &observed, NULL);
+	cl_normal_stop_front_read_pending
+		= cluster_shared_config && result == CLUSTER_NORMAL_STOP_PENDING;
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return;
 
@@ -1526,7 +1569,7 @@ cl_normal_stop_fronts_lmon_tick(void)
 		bool source_active = false, source_stopped = false;
 		uint32 bit = UINT32_C(1) << peer;
 
-		if (!inbox->pending)
+		if (!inbox->pending || (cluster_shared_config && inbox->wait_for_post_checkpoint))
 			continue;
 		if (inbox->envelope.epoch != observed.epoch
 			|| !cl_normal_stop_capture_source_phase(&observed, peer, inbox->request.leave_nonce,
@@ -1536,8 +1579,13 @@ cl_normal_stop_fronts_lmon_tick(void)
 		}
 		/* A transport-consumed frame is retained if it is a STOPPED successor;
 		 * it must never be used as an ACTIVE frontend-cut request. */
-		if (!source_active || source_stopped)
+		if (!source_active || source_stopped) {
+			/* The frame remains owned by this inbox. Re-reading CF before its
+			 * consumer phase only obstructs our own checkpoint; this flag is
+			 * never used as STOPPED proof by that later consumer. */
+			inbox->wait_for_post_checkpoint = cluster_shared_config;
 			continue;
+		}
 		result = cl_normal_stop_identity_recheck(false, &observed, &verified, NULL);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return;
@@ -2183,6 +2231,7 @@ static void
 cl_normal_stop_post_lmon_tick(void)
 {
 	ClusterPhase1FullStopPlan plan;
+	ClusterNormalStopPollResult result;
 	uint32 expected, peer_bits;
 	bool valid;
 	if (!IsUnderPostmaster || !AmLmonProcess() || cl_state == NULL || cl_normal_stop == NULL
@@ -2192,9 +2241,41 @@ cl_normal_stop_post_lmon_tick(void)
 		|| pg_atomic_read_u32(&cl_state->preflight_pending) == 0)
 		return;
 	expected = cl_normal_stop_config_service_mask();
-	if (cl_normal_stop_identity_poll(true, &plan, NULL) != CLUSTER_NORMAL_STOP_READY)
-		return;
 	peer_bits = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
+	if (cluster_shared_config) {
+		bool work;
+		uint32 active, idle;
+		uint64 nonce;
+
+		/* A peer still finishing its checkpoint is not work for this reader.
+		 * Keep its early ACK, but start a new observation only when a request
+		 * makes it consumable. Actual sends/receives retain every old check. */
+		LWLockAcquire(&cl_state->lock, LW_SHARED);
+		active = pg_atomic_read_u32(&cl_normal_stop->service_active_mask);
+		idle = pg_atomic_read_u32(&cl_normal_stop->service_idle_mask);
+		nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+		work = cl_phase1_post_stopped_request_round_nonce == 0
+			   || cl_phase1_post_stopped_request_sent[0] != peer_bits
+			   || ((cl_state->phase1_post_stopped_reply_pending[0]
+					& ~cl_state->phase1_post_stopped_reply_sent[0])
+					   != 0
+				   && (active & ~UINT32_C(1)) == 0 && ((idle | active) & expected) == expected);
+		for (int peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
+			const ClNormalStopFrontInbox *inbox = &cl_normal_stop_front_inbox[peer];
+			work |= inbox->pending
+					|| (inbox->ack_pending
+						&& (inbox->ack.leave_nonce != nonce
+							|| cl_state->phase1_release_request_nonce[peer] != 0));
+		}
+		LWLockRelease(&cl_state->lock);
+		if (!work && !cl_normal_stop_post_read_pending)
+			return;
+	}
+	result = cl_normal_stop_identity_poll(true, &plan, NULL);
+	cl_normal_stop_post_read_pending
+		= cluster_shared_config && result == CLUSTER_NORMAL_STOP_PENDING;
+	if (result != CLUSTER_NORMAL_STOP_READY)
+		return;
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 	plan.valid = true;
 	plan.attempt_nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
@@ -2236,6 +2317,7 @@ cl_normal_stop_post_lmon_tick(void)
 						cl_phase1_member_bit_set(cl_state->phase1_post_stopped_reply_pending, peer);
 					}
 					inbox->pending = false;
+					inbox->wait_for_post_checkpoint = false;
 				}
 			}
 			LWLockRelease(&cl_state->lock);
@@ -3088,6 +3170,11 @@ cluster_clean_leave_service_poll(int *peer_out, const char **reason_out)
 		reason = "CLOSE_SERVICE_IDLE";
 	}
 	LWLockRelease(&cl_state->lock);
+	if (result == CLUSTER_NORMAL_STOP_READY
+		&& (cl_normal_stop_front_read_pending || cl_normal_stop_post_read_pending)) {
+		result = CLUSTER_NORMAL_STOP_PENDING;
+		reason = "CLOSE_SERVICE_IDENTITY_READ_PENDING";
+	}
 	if (result == CLUSTER_NORMAL_STOP_READY)
 		for (int peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; ++peer) {
 			const ClNormalStopFrontInbox *inbox = &cl_normal_stop_front_inbox[peer];
@@ -3119,6 +3206,11 @@ cluster_clean_leave_normal_stop_local_poll(int *peer_out, const char **reason_ou
 		|| !cluster_normal_stop_requested()
 		|| cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
 		return CLUSTER_NORMAL_STOP_INVALID;
+	if (cl_normal_stop_front_read_pending || cl_normal_stop_post_read_pending) {
+		if (reason_out != NULL)
+			*reason_out = "NORMAL_STOP_CONTROL_IDENTITY_READ_PENDING";
+		return CLUSTER_NORMAL_STOP_PENDING;
+	}
 	/* An early STOPPED successor is intentionally retained while this node
 	 * finishes CHECKPOINT. It is a control obligation, not a page producer;
 	 * the post-STOPPED tick must consume it before the final close cut. */
@@ -3196,6 +3288,7 @@ cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullS
 {
 	ClusterNormalStopModuleObservation ignored;
 	ClusterPhase1FullStopPlan observed;
+	const ClusterPhase1FullStopPlan *current_observation = NULL;
 	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
 	uint32 phase, peer_bits;
 	uint64 now;
@@ -3231,10 +3324,31 @@ cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullS
 	result = cl_normal_stop_checkpoint_state_locked(expected_services, phase, now)
 				 ? CLUSTER_NORMAL_STOP_READY
 				 : CLUSTER_NORMAL_STOP_INVALID;
+	if (result == CLUSTER_NORMAL_STOP_READY && cluster_shared_config
+		&& phase == CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK) {
+		peer_bits = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
+		if (cl_state->ack_bitmap[0] != peer_bits || cl_normal_stop->peer_reply_sent != peer_bits
+			|| cl_normal_stop->peer_reply_pending != 0) {
+			/* The remote producer still needs the original control services.
+			 * Re-reading ROOT cannot supply its missing ACK, and creates CF
+			 * debt that can prevent that peer from finishing its own cut. */
+			result = CLUSTER_NORMAL_STOP_PENDING;
+			observation->reason = "NORMAL_STOP_AWAIT_ALL_PRODUCER_ACKS";
+		}
+	}
 	LWLockRelease(&cl_state->lock);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
-	result = cluster_normal_stop_modules_poll(false, observation);
+	if (cluster_shared_config) {
+		result = cl_normal_stop_identity_poll(false, &observed, &observation->reason);
+		if (result != CLUSTER_NORMAL_STOP_READY)
+			return result;
+		/* One confirmed CF observation belongs to this synchronous call.
+		 * Each census and the final cut recheck its live identity, without
+		 * dispatching new control work AFTER observing those owners idle. */
+		current_observation = &observed;
+	}
+	result = cl_normal_stop_modules_poll(false, true, observation, current_observation);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
 	if (phase == CLUSTER_NORMAL_STOP_DRAIN) {
@@ -3261,21 +3375,24 @@ cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullS
 		/* Work admitted before seal 1 may have finished after the earlier
 		 * census and left shared debt despite a now-idle actor. The sealed
 		 * producer cut must precede the census that authorizes our ACK. */
-		result = cluster_normal_stop_modules_poll(false, observation);
+		result = cl_normal_stop_modules_poll(false, true, observation, current_observation);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return result;
 	} else if (phase == CLUSTER_NORMAL_STOP_QUIESCE) {
 		/* A cleaner's final pass or previously admitted service can complete
 		 * after the first census. Inspect again after observing every park;
 		 * this authorizes our producer ACK, never an early data seal. */
-		result = cluster_normal_stop_modules_poll(false, observation);
+		result = cl_normal_stop_modules_poll(false, true, observation, current_observation);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return result;
 	}
 	/* A service may have entered after the module poll or seal 1. Recheck
 	 * its original active/idle publication under the SAME leave lock that
 	 * admits work, immediately before either phase transition. */
-	result = cl_normal_stop_identity_poll(false, &observed, &observation->reason);
+	result = current_observation != NULL
+				 ? cl_normal_stop_identity_recheck(false, current_observation, &observed,
+												   &observation->reason)
+				 : cl_normal_stop_identity_poll(false, &observed, &observation->reason);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
 	result = CLUSTER_NORMAL_STOP_PENDING;

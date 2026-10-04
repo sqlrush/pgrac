@@ -69,6 +69,7 @@ static void (*pi_cut_race_after_shared_unlock)(void);
 static LWLockMode last_leave_lock_mode;
 static bool module_change_root;
 static uint32 module_late_active;
+static bool identity_read_dispatch_lmon;
 static bool module_late_completed_debt;
 static int disconnected_terminal_peer = -1;
 static ClusterNormalStopPollResult lmon_local_observation;
@@ -211,6 +212,16 @@ module_fixture(unsigned index, bool post, const char **reason)
 	module_post_calls += post;
 	if (index == 12 && module_change_root)
 		identity_root[80] ^= 1;
+	if (index == 12 && identity_read_dispatch_lmon && cl_normal_stop_service_depth != 0) {
+		/* Finish the real actor segment dispatched by the CF read. The
+		 * external GRD/transport is a boundary, not a manufactured idle bit. */
+		MyAuxProcType = LmonProcess;
+		if (!cluster_normal_stop_service_leave(true)
+			|| cluster_normal_stop_service_idle(CLUSTER_NORMAL_STOP_READY)
+				   != CLUSTER_NORMAL_STOP_READY)
+			abort();
+		MyAuxProcType = CheckpointerProcess;
+	}
 	if (index == 12 && module_late_active != 0) {
 		MyAuxProcType = LmsProcess;
 		if (!cluster_normal_stop_service_enter())
@@ -459,6 +470,8 @@ reset_region(void)
 	identity_lock_countdown = 0;
 	fixture_now = 1000000;
 	memset(cl_normal_stop_front_inbox, 0, sizeof(cl_normal_stop_front_inbox));
+	cl_normal_stop_front_read_pending = false;
+	cl_normal_stop_post_read_pending = false;
 	cl_phase1_post_stopped_request_round_nonce = 0;
 	memset(cl_phase1_post_stopped_request_sent, 0, sizeof(cl_phase1_post_stopped_request_sent));
 	for (unsigned index = 0; index < lengthof(module_results); index++)
@@ -470,6 +483,7 @@ reset_region(void)
 	pi_cut_race_after_shared_unlock = NULL;
 	module_change_root = false;
 	module_late_active = 0;
+	identity_read_dispatch_lmon = false;
 	lmon_local_observation = CLUSTER_NORMAL_STOP_READY;
 	lmon_late_actor = false;
 	module_late_completed_debt = false;
@@ -2223,6 +2237,12 @@ cluster_control_root_v3_stop_phase_read(uint16 thread, uint64 incarnation,
 	if (lock_holds != 0)
 		abort();
 	identity_pre2_reads++;
+	if (identity_read_dispatch_lmon && AmCheckpointerProcess()) {
+		MyAuxProcType = LmonProcess;
+		if (!cluster_normal_stop_service_enter())
+			abort();
+		MyAuxProcType = CheckpointerProcess;
+	}
 	memset(out, 0, sizeof(*out));
 	/* A fresh CF read needs a new GES request. At that external boundary
 	 * compose the real admission guard used by a master dedup MISS; do not
@@ -2579,6 +2599,56 @@ UT_TEST(test_pre2_stop_identity_uses_declared_members_not_slot_capacity)
 			UT_ASSERT_EQ(out.member_incarnations[node],
 						 (sets[i] & (UINT32_C(1) << node)) ? 100 + node : 0);
 		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pre2_stop_accepts_exact_published_cohort_epoch_projection)
+{
+	for (int self = 0; self < 4; self++) {
+		ClusterPhase1FullStopPlan out;
+		reset_pre2_members(15, self);
+		identity_formation.startup_formation_generation = 2;
+		identity_formation.applied.new_epoch = identity_formation.local_epoch;
+		UT_ASSERT_EQ(cl_normal_stop_identity_poll(false, &out, NULL), CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT_EQ(out.epoch, identity_open.transition_epoch);
+		UT_ASSERT_EQ(cl_normal_stop->peer_requests_seen, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_IDLE);
+		UT_ASSERT(!cluster_normal_stop_requested());
+		UT_ASSERT_EQ(identity_formation.applied.new_epoch, identity_formation.local_epoch);
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pre2_stop_cohort_projection_does_not_admit_reconfiguration_debt)
+{
+	for (unsigned bad = 0; bad < 15; bad++) {
+		ClusterPhase1FullStopPlan out;
+		const char *reason = NULL;
+		reset_pre2_members(15, 0);
+		identity_formation.startup_formation_generation = 2;
+		identity_formation.applied.new_epoch = identity_formation.local_epoch;
+		switch (bad) {
+		case 0: identity_formation.startup_formation_generation = 0; break;
+		case 1: identity_formation.startup_formation_generation = UINT64_MAX; break;
+		case 2: identity_formation.applied.new_epoch--; break;
+		case 3: identity_formation.applied.new_epoch++; break;
+		case 4: identity_formation.applied.event_id = 1; break;
+		case 5: identity_formation.applied.event_seq = 1; break;
+		case 6: identity_formation.applied.old_epoch = 1; break;
+		case 7: identity_formation.applied.reconfig_kind = RECONFIG_KIND_CLEAN_LEAVE; break;
+		case 8: identity_formation.applied.reconfig_kind = RECONFIG_KIND_FAIL_STOP; break;
+		case 9: identity_formation.applied.reconfig_kind = RECONFIG_KIND_JOIN_COMMITTED; break;
+		case 10: identity_formation.applied.dead_bitmap[0] = 1; break;
+		case 11: identity_formation.applied.join_bitmap[0] = 1; break;
+		case 12: identity_formation.applied.observer_role = CLUSTER_RECONFIG_OBSERVER_SURVIVOR; break;
+		case 13: identity_formation.applied.cssd_dead_generation = 1; break;
+		case 14: cluster_shared_config = false; break;
+		}
+		UT_ASSERT_EQ(cl_full_stop_capture_formation_only(false, identity_open.transition_epoch,
+													   &out, &reason), CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT(strcmp(reason, "NORMAL_STOP_FORMATION_APPLIED_EVENT") == 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->identity_published), 0);
 	}
 	cluster_shared_config = false;
 }
@@ -5053,6 +5123,257 @@ pre2_declared_to_post_barrier(uint32 members, int self, ClusterPhase1FullStopPla
 	return true;
 }
 
+static void
+pre2_fronts_to_drain(void)
+{
+	ClusterPhase1FullStopPlan plan;
+	reset_pre2_members(15, 2);
+	front_peer_request(0, 1801);
+	front_peer_request(1, 1802);
+	front_peer_request(3, 1804);
+	cl_normal_stop_fronts_lmon_tick();
+	front_local_postmaster_cut(true);
+	UT_ASSERT_EQ(cluster_normal_stop_fronts_poll(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	MyAuxProcType = LmonProcess;
+	cl_normal_stop_fronts_lmon_tick();
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_fronts_poll(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_DRAIN);
+}
+
+UT_TEST(test_pre2_idle_front_tick_does_not_reacquire_cf_during_drain)
+{
+	unsigned reads;
+	ClusterPhase1FullStopPlan plan;
+	pre2_fronts_to_drain();
+	reads = identity_pre2_reads;
+	MyAuxProcType = LmonProcess;
+	for (unsigned tick = 0; tick < 8; tick++)
+		cl_normal_stop_fronts_lmon_tick();
+	UT_ASSERT_EQ(identity_pre2_reads, reads);
+	UT_ASSERT_EQ(front_ack_sends, 0);
+	UT_ASSERT_EQ(cluster_clean_leave_normal_stop_local_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	/* The real controller may now inspect debt and park the producers. */
+	idle_original_actors();
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_QUIESCE);
+	reads = identity_pre2_reads;
+	MyAuxProcType = LmonProcess;
+	cl_normal_stop_fronts_lmon_tick();
+	UT_ASSERT_EQ(identity_pre2_reads, reads);
+	UT_ASSERT_EQ(front_ack_sends, 0);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+}
+
+UT_TEST(test_pre2_front_read_stays_owned_until_completion_then_goes_idle)
+{
+	const char *reason = NULL;
+	unsigned reads;
+	pre2_fronts_to_drain();
+	identity_pre2_pending_reads = 2;
+	front_peer_ack(1, pg_atomic_read_u64(&cl_state->leave_attempt_nonce), false);
+	MyAuxProcType = LmonProcess;
+	cl_normal_stop_fronts_lmon_tick();
+	UT_ASSERT_EQ(cluster_clean_leave_normal_stop_local_poll(NULL, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(reason, "NORMAL_STOP_CONTROL_IDENTITY_READ_PENDING") == 0);
+	UT_ASSERT(cl_normal_stop_front_inbox[1].ack_pending);
+	cl_normal_stop_fronts_lmon_tick();
+	UT_ASSERT_EQ(cluster_clean_leave_normal_stop_local_poll(NULL, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	cl_normal_stop_fronts_lmon_tick();
+	UT_ASSERT(!cl_normal_stop_front_inbox[1].ack_pending);
+	UT_ASSERT_EQ(cl_state->ack_bitmap[0], 2);
+	UT_ASSERT_EQ(cluster_clean_leave_normal_stop_local_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	reads = identity_pre2_reads;
+	cl_normal_stop_fronts_lmon_tick();
+	UT_ASSERT_EQ(identity_pre2_reads, reads);
+	UT_ASSERT_EQ(front_ack_sends, 0);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+}
+
+static void
+pre2_fronts_to_wait_ack(void)
+{
+	ClusterPhase1FullStopPlan plan;
+	pre2_fronts_to_drain();
+	idle_original_actors();
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	park_and_idle_original_actors();
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	deliver_all_drain_acks();
+}
+
+UT_TEST(test_pre2_early_stopped_frame_waits_without_blocking_own_checkpoint)
+{
+	ClusterPhase1FullStopPlan plan;
+	unsigned reads;
+	pre2_fronts_to_wait_ack();
+	identity_pre2_phase[1] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+	front_peer_request(1, 3001);
+	identity_pre2_pending_reads = 1;
+	cl_normal_stop_fronts_lmon_tick();
+	UT_ASSERT_EQ(cluster_clean_leave_normal_stop_local_poll(NULL, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	cl_normal_stop_fronts_lmon_tick();
+	reads = identity_pre2_reads;
+	/* Keep the successor intact, including exact transport replays. It has
+	 * no consumer until our checkpoint, and is not an ACTIVE drain request. */
+	for (unsigned tick = 0; tick < 8; tick++) {
+		front_peer_request(1, 3001);
+		cl_normal_stop_fronts_lmon_tick();
+	}
+	UT_ASSERT_EQ(identity_pre2_reads, reads);
+	UT_ASSERT(cl_normal_stop_front_inbox[1].pending);
+	UT_ASSERT_EQ(cl_normal_stop->peer_request_nonce[1], 1802);
+	UT_ASSERT_EQ(cl_state->phase1_release_request_nonce[1], 0);
+	UT_ASSERT_EQ(front_ack_sends, 3);
+	UT_ASSERT_EQ(cluster_clean_leave_normal_stop_local_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	idle_original_actors();
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	identity_pre2_phase[2] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	MyAuxProcType = LmonProcess;
+	reads = identity_pre2_reads;
+	cl_normal_stop_post_lmon_tick();
+	UT_ASSERT(identity_pre2_reads > reads);
+	UT_ASSERT(!cl_normal_stop_front_inbox[1].pending);
+	UT_ASSERT_EQ(cl_state->phase1_release_request_nonce[1], 3001);
+	UT_ASSERT_EQ(cl_state->phase1_post_stopped_reply_sent[0], 2);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+}
+
+UT_TEST(test_pre2_post_waits_for_peer_without_reopening_cf)
+{
+	ClusterPhase1FullStopPlan plan;
+	unsigned reads;
+	UT_ASSERT(pre2_declared_to_checkpoint(15, 2, &plan));
+	identity_pre2_phase[2] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	MyAuxProcType = LmonProcess;
+	cl_normal_stop_post_lmon_tick();
+	UT_ASSERT_EQ(cl_phase1_post_stopped_request_sent[0], 11);
+	reads = identity_pre2_reads;
+	for (unsigned tick = 0; tick < 8; tick++)
+		cl_normal_stop_post_lmon_tick();
+	UT_ASSERT_EQ(identity_pre2_reads, reads);
+	UT_ASSERT_EQ(cluster_clean_leave_normal_stop_local_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	/* An ACK delivered before that peer's request is retained, not counted.
+	 * The request makes it consumable; then a fresh ROOT observation is due. */
+	front_peer_ack(1, plan.attempt_nonce, false);
+	for (unsigned tick = 0; tick < 8; tick++)
+		cl_normal_stop_post_lmon_tick();
+	UT_ASSERT_EQ(identity_pre2_reads, reads);
+	UT_ASSERT(cl_normal_stop_front_inbox[1].ack_pending);
+	UT_ASSERT_EQ(cl_state->ack_bitmap[0], 0);
+	UT_ASSERT_EQ(cluster_clean_leave_normal_stop_local_poll(NULL, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	identity_pre2_phase[1] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+	front_peer_request(1, 3001);
+	cl_normal_stop_post_lmon_tick();
+	UT_ASSERT(identity_pre2_reads > reads);
+	UT_ASSERT(!cl_normal_stop_front_inbox[1].pending);
+	UT_ASSERT(!cl_normal_stop_front_inbox[1].ack_pending);
+	UT_ASSERT_EQ(cl_state->ack_bitmap[0], 2);
+	UT_ASSERT_EQ(cl_state->phase1_post_stopped_reply_sent[0], 2);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+}
+
+UT_TEST(test_pre2_post_identity_read_is_owned_through_completion)
+{
+	ClusterPhase1FullStopPlan plan;
+	unsigned reads;
+	const char *reason = NULL;
+	UT_ASSERT(pre2_declared_to_checkpoint(15, 2, &plan));
+	identity_pre2_phase[2] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	MyAuxProcType = LmonProcess;
+	identity_pre2_pending_reads = 2;
+	for (unsigned tick = 0; tick < 2; tick++) {
+		cl_normal_stop_post_lmon_tick();
+		UT_ASSERT_EQ(cl_phase1_post_stopped_request_sent[0], 0);
+		UT_ASSERT_EQ(cluster_clean_leave_normal_stop_local_poll(NULL, &reason),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT(strcmp(reason, "NORMAL_STOP_CONTROL_IDENTITY_READ_PENDING") == 0);
+	}
+	cl_normal_stop_post_lmon_tick();
+	UT_ASSERT_EQ(cl_phase1_post_stopped_request_sent[0], 11);
+	UT_ASSERT_EQ(cluster_clean_leave_normal_stop_local_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	reads = identity_pre2_reads;
+	cl_normal_stop_post_lmon_tick();
+	UT_ASSERT_EQ(identity_pre2_reads, reads);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+}
+
+UT_TEST(test_pre2_deferred_stopped_frame_is_not_cached_authority)
+{
+	ClusterPhase1FullStopPlan plan;
+	unsigned reads;
+	pre2_fronts_to_wait_ack();
+	identity_pre2_phase[1] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+	front_peer_request(1, 3001);
+	cl_normal_stop_fronts_lmon_tick();
+	UT_ASSERT(cl_normal_stop_front_inbox[1].pending);
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	identity_pre2_phase[2] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	MyAuxProcType = LmonProcess;
+	reads = identity_pre2_reads;
+	identity_pre2_phase[1] = CLUSTER_CONTROL_ROOT_STOP_ACTIVE;
+	cl_normal_stop_post_lmon_tick();
+	UT_ASSERT(identity_pre2_reads > reads);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
+	UT_ASSERT(cl_normal_stop_front_inbox[1].pending);
+	UT_ASSERT_EQ(cl_state->phase1_release_request_nonce[1], 0);
+	UT_ASSERT_EQ(cl_phase1_post_stopped_request_sent[0], 0);
+	UT_ASSERT_EQ(cl_state->phase1_post_stopped_reply_sent[0], 0);
+}
+
+UT_TEST(test_pre2_checkpoint_wait_for_peer_does_not_create_cf_debt)
+{
+	ClusterPhase1FullStopPlan plan;
+	unsigned reads;
+	pre2_fronts_to_drain();
+	idle_original_actors();
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	park_and_idle_original_actors();
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK);
+	reads = identity_pre2_reads;
+	for (unsigned tick = 0; tick < 8; tick++)
+		UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, NULL),
+					 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(identity_pre2_reads, reads);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 0);
+	deliver_all_drain_acks();
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT(identity_pre2_reads > reads);
+}
+
+UT_TEST(test_pre2_checkpoint_observation_does_not_recreate_finished_control_work)
+{
+	ClusterPhase1FullStopPlan plan;
+	unsigned reads;
+	pre2_fronts_to_wait_ack();
+	reads = identity_pre2_reads;
+	identity_read_dispatch_lmon = true;
+	/* Reading ROOT dispatches LMON. The owner census observes its eventual
+	 * completion; another read after that census would recreate the debt. */
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(identity_pre2_reads, reads + 1);
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_active_mask), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_CHECKPOINT);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+}
+
 static bool
 pre2_declared_to_release(uint32 members, int self, ClusterPhase1FullStopPlan *plan)
 {
@@ -5224,7 +5545,9 @@ UT_TEST(test_pre2_pair_rejects_nondeclared_release_reply_even_after_seal)
 int
 main(void)
 {
-	UT_PLAN(126);
+	UT_PLAN(136);
+	UT_RUN(test_pre2_stop_accepts_exact_published_cohort_epoch_projection);
+	UT_RUN(test_pre2_stop_cohort_projection_does_not_admit_reconfiguration_debt);
 	UT_RUN(test_actual_region_size_matches_frozen_tail);
 	UT_RUN(test_actual_fresh_initializer_initializes_full_tail_once);
 	UT_RUN(test_online_close_observation_accepts_real_idle_without_shutdown);
@@ -5267,6 +5590,14 @@ main(void)
 	UT_RUN(test_pre2_identity_async_completion_does_not_start_a_second_read);
 	UT_RUN(test_pre2_identity_rechecks_formation_semantics_and_peer_incarnation);
 	UT_RUN(test_pre2_fronts_pending_then_completes_one_root_read_per_tick);
+	UT_RUN(test_pre2_idle_front_tick_does_not_reacquire_cf_during_drain);
+	UT_RUN(test_pre2_front_read_stays_owned_until_completion_then_goes_idle);
+	UT_RUN(test_pre2_early_stopped_frame_waits_without_blocking_own_checkpoint);
+	UT_RUN(test_pre2_post_waits_for_peer_without_reopening_cf);
+	UT_RUN(test_pre2_post_identity_read_is_owned_through_completion);
+	UT_RUN(test_pre2_deferred_stopped_frame_is_not_cached_authority);
+	UT_RUN(test_pre2_checkpoint_wait_for_peer_does_not_create_cf_debt);
+	UT_RUN(test_pre2_checkpoint_observation_does_not_recreate_finished_control_work);
 	UT_RUN(test_identity_role_gaps_and_original_pristine_are_separate);
 	UT_RUN(test_identity_real_formation_wal_and_published_drift_refuse);
 	UT_RUN(test_identity_post_publication_recheck_cannot_sign_mixed_root);

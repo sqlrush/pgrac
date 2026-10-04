@@ -345,13 +345,21 @@ cmp_ok(hang_val('hang_resolve_evaluations'), '>', $eval_off2,
 # backend to signal — SKIP_2PC "no live backend" / fail-CLOSED contract).
 # ----------
 $node->safe_psql('postgres', "ALTER SYSTEM SET cluster.hang_resolution_mode = enforce");
-$node->reload;
+# Cluster mode refuses PREPARE TRANSACTION (PRE2 limitation): prepare the
+# holder with cluster mode off; restarting in cluster mode recovers it with its
+# lock and no live backend.
+$node->stop;
+$node->append_conf('postgresql.conf', "cluster.enabled = off\n");
+$node->start;
 $node->safe_psql('postgres', 'CREATE TABLE hangt3 (i int)');
 $node->safe_psql('postgres', q{
 	BEGIN;
 	LOCK TABLE hangt3 IN ACCESS EXCLUSIVE MODE;
 	PREPARE TRANSACTION 'hang5_12_2pc';
 });
+$node->stop;
+$node->append_conf('postgresql.conf', "cluster.enabled = on\n");
+$node->start;
 my $w2pc = $node->background_psql('postgres', on_error_die => 1);
 my $w2pc_pid = $w2pc->query_safe('SELECT pg_backend_pid()');
 bg_start_blocking($w2pc, 'BEGIN; LOCK TABLE hangt3 IN ACCESS EXCLUSIVE MODE');

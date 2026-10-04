@@ -8537,8 +8537,13 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 		|| (flags & CHECKPOINT_END_OF_RECOVERY) != 0
 		|| ((flags & CHECKPOINT_IS_SHUTDOWN) != 0 && !ShutdownRequestPending)
 		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
-		|| cluster_cf_held(ExclusiveLock) || epoch == 0 || !cluster_external_fence_runtime_active()
-		|| !cluster_wal_thread_current_v2_ref(&ref))
+		|| cluster_cf_held(ExclusiveLock) || epoch == 0
+		|| !cluster_wal_thread_current_v2_ref(&ref)
+		/* Use the same exact, original-epoch INITIALIZED qualification as
+		 * native WAL I/O. CLEAN/RECOVERED inputs cannot borrow this fact.
+		 * Author: SqlRush <sqlrush@gmail.com> */
+		|| (!cluster_external_fence_runtime_active()
+			&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)))
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("root-v3 checkpoint requires its admitted native owner")));
 	if (!cluster_cf_lock(ShareLock))
@@ -8564,7 +8569,9 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 		|| selected->minRecoveryPoint != InvalidXLogRecPtr
 		|| selected->minRecoveryPointTLI != 0 || selected->backupStartPoint != 0
 		|| selected->backupEndPoint != 0 || selected->backupEndRequired
-		|| cluster_epoch_get_current() != epoch)
+		|| cluster_epoch_get_current() != epoch
+		|| (!cluster_external_fence_runtime_active()
+			&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)))
 	{
 		memset(selected, 0, sizeof(*selected));
 		ereport(ERROR,
@@ -8603,7 +8610,8 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 		CHECK_FOR_INTERRUPTS();
 		if (cluster_epoch_get_current() != epoch
 			|| cluster_reconfig_has_pending_prebump_stage()
-			|| !cluster_external_fence_runtime_active()
+			|| (!cluster_external_fence_runtime_active()
+				&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch))
 			|| !cluster_serving_ready_is_current() || !cluster_write_fence_allowed())
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
