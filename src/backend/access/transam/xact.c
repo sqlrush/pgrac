@@ -39,6 +39,14 @@
  *	    stamp therefore always flushes its commit record, even when
  *	    synchronous_commit is off.
  *
+ *	What changed (PRE2 two-phase limitation, Spec:
+ *	spec-s9p2-05-instance-and-cluster-recovery.md):
+ *	  - PrepareTransaction(): with cluster mode on, PREPARE TRANSACTION is
+ *	    refused after PostgreSQL's own "cannot PREPARE" checks and before any
+ *	    prepare work, so the transaction rolls back and its block ends as for
+ *	    those checks.  COMMIT/ROLLBACK PREPARED still finish an existing
+ *	    prepared transaction.
+ *
  *	What changed (spec-7.4 D1):
  *	  - RecordTransactionCommit(): durable-frontier wiring.  LSN fill-in
  *	    after XactLogCommitRecord (crit-section-safe shmem write);  a
@@ -3193,6 +3201,27 @@ PrepareTransaction(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot PREPARE a transaction that has exported snapshots")));
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: a prepared finish writes its TT stamps under a WAL record of
+	 * their own, inserted just before the COMMIT/ROLLBACK PREPARED record; a
+	 * crash between the two can leave a transaction that is still prepared
+	 * while its TT slot already reads committed or aborted.  Until the finish
+	 * record itself carries the stamps, cluster mode prepares nothing (shared
+	 * mode already refuses two-phase statements at the utility entry).
+	 * Refusing here, like the checks above, rolls the transaction back and
+	 * ends its block; finishing an existing prepared transaction stays
+	 * possible, so none strands.
+	 */
+	if (cluster_enabled)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("two-phase transactions are not supported in cluster mode"),
+				 errdetail("PGRAC_FAMILY=CLUSTER_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED"),
+				 errhint("Use COMMIT or ROLLBACK instead.  COMMIT PREPARED and ROLLBACK PREPARED "
+						 "still finish an existing prepared transaction.")));
+#endif
 
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();
