@@ -50,6 +50,29 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_writer.h"
+
+/* This voting fixture never installs a native first-start writer. Keep
+ * unrelated activation dependencies explicit and impossible to synthesize. */
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_wal_thread_initialized_writer_matches(
+	const ClusterWalSourceRef *expected pg_attribute_unused(), uint64 epoch pg_attribute_unused())
+{
+	abort();
+}
+
+ClusterControlRootResult
+cluster_wal_writer_ready(TimeLineID timeline pg_attribute_unused())
+{
+	abort();
+}
 
 #include <fcntl.h>
 #include <errno.h>

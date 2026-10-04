@@ -43,6 +43,8 @@
 #include "cluster/cluster_uba.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_wal_state.h" /* GATE-BOUND census self-check (implementation, follow-up contract ②) */
+#include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_writer.h"
 #include "common/cryptohash.h"
 #include "common/sha2.h"
 #include "port/atomics.h"
@@ -563,6 +565,17 @@ typedef struct SemanticActivationRestart {
 } SemanticActivationRestart;
 
 static SemanticActivationRestart semantic_activation_restart;
+
+/* The original postmaster owns only its exact utility request. This local
+ * binding neither survives a postmaster nor supplies a PGSA/formation proof. */
+typedef struct SemanticActivationFirstStart {
+	ClusterWalSourceRef writer;
+	uint64 epoch;
+	uint64 request_seq;
+	bool bound;
+} SemanticActivationFirstStart;
+
+static SemanticActivationFirstStart semantic_activation_first_start;
 static bool
 semantic_activation_restart_collecting(const ClusterSemanticActivationAckTableV1 *table);
 static bool semantic_activation_restart_ingress(const SemanticActivationAckIngressItem *item);
@@ -5894,6 +5907,42 @@ semantic_activation_initial_clean_snapshot_equal(const ClusterInitialCleanFormat
 	return left != NULL && right != NULL && memcmp(left, right, sizeof(*left)) == 0;
 }
 
+/* INSTALL qualification is immutable and acquire-published by Startup. This
+ * read-only half is safe in postmaster; it supplies no live write authority. */
+static bool
+semantic_activation_first_writer(ClusterWalSourceRef *out, uint64 epoch)
+{
+	return epoch != 0 && cluster_wal_thread_current_v2_ref(out)
+		   && out->timeline != 0 && out->claim.identity.origin_node_id == cluster_node_id
+		   && out->claim.identity.origin_owner_incarnation != 0
+		   && out->claim.identity.origin_owner_incarnation == cluster_qvotec_get_self_incarnation()
+		   && cluster_wal_thread_initialized_writer_matches(out, epoch)
+		   && cluster_epoch_get_current() == epoch;
+}
+
+/* LMON/QVOTEC retain the live writer/fence checks at the mutation boundary.
+ * A CLEAN input, old boot or changed formation cannot borrow kind4. */
+static bool
+semantic_activation_first_writer_live(void)
+{
+	ClusterWalSourceRef writer;
+	uint64 epoch = cluster_epoch_get_current();
+
+	return !cluster_shared_config
+		   || (cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_SOURCE_ZERO
+			   && !RecoveryInProgress() && semantic_activation_first_writer(&writer, epoch)
+			   && cluster_wal_writer_ready(writer.timeline) == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			   && semantic_activation_first_writer(&writer, epoch));
+}
+
+static bool
+semantic_activation_first_round_live(void)
+{
+	return !cluster_shared_config
+		   || cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_SOURCE_ZERO
+		   || semantic_activation_first_writer_live();
+}
+
 static bool
 semantic_activation_initial_clean_pgrd_mirror(uint8 out[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
 {
@@ -5937,7 +5986,8 @@ semantic_activation_r4_initial_clean_sample_basis(uint64 expected_generation, bo
 	int32 coordinator_node;
 	int node;
 
-	if (expected_generation != 0 || cluster_grd_recovery_state_value() != GRD_RECOVERY_IDLE
+	if (expected_generation != 0 || !semantic_activation_first_writer_live()
+		|| cluster_grd_recovery_state_value() != GRD_RECOVERY_IDLE
 		|| !cluster_reconfig_snapshot_initial_clean_formation(&clean_before)
 		|| (clean_before.formation_marker_generation == 0
 			&& clean_before.formation_epoch != CLUSTER_EPOCH_INITIAL)
@@ -5977,7 +6027,8 @@ semantic_activation_r4_initial_clean_sample_basis(uint64 expected_generation, bo
 			return false;
 	}
 
-	return cluster_grd_recovery_state_value() == GRD_RECOVERY_IDLE
+	return semantic_activation_first_writer_live()
+		   && cluster_grd_recovery_state_value() == GRD_RECOVERY_IDLE
 		   && cluster_reconfig_snapshot_initial_clean_formation(&clean_after)
 		   && semantic_activation_initial_clean_snapshot_equal(&clean_before, &clean_after)
 		   && semantic_activation_initial_clean_pgrd_mirror(pgrd_after)
@@ -6530,7 +6581,7 @@ r4_initial_clean_stage_current(uint64 generation, ClusterSemanticActivationAckSt
 	int32 coordinator_node;
 	int node;
 
-	if (generation == 0
+	if (generation == 0 || !semantic_activation_first_writer_live()
 		|| (stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED
 			&& stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED
 			&& stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED)
@@ -6586,7 +6637,8 @@ r4_initial_clean_stage_current(uint64 generation, ClusterSemanticActivationAckSt
 	} else if (!semantic_activation_ack_member_prepared_image_current(&table_before, NULL))
 		return false;
 
-	return cluster_grd_recovery_state_value() == GRD_RECOVERY_IDLE
+	return semantic_activation_first_writer_live()
+		   && cluster_grd_recovery_state_value() == GRD_RECOVERY_IDLE
 		   && cluster_reconfig_snapshot_initial_clean_formation(&clean_after)
 		   && semantic_activation_initial_clean_snapshot_equal(&clean_before, &clean_after)
 		   && semantic_activation_initial_clean_pgrd_mirror(pgrd_after)
@@ -6692,7 +6744,7 @@ r11_resource_x_frozen_stage(uint64 generation)
 {
 	uint64 digest;
 
-	return r11_resource_x_cutover_digest_exact(
+	return semantic_activation_first_round_live() && r11_resource_x_cutover_digest_exact(
 			   generation, CLUSTER_SEMANTIC_R11_CUTOVER_SOURCE_CLOSED, false, &digest)
 			   ? CLUSTER_SEMANTIC_ACTIVATION_OK
 			   : CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
@@ -6707,7 +6759,8 @@ r11_resource_x_readiness(uint64 expected_generation, ClusterSemanticActivationRe
 	uint64 r4_generation = 0;
 
 	writer_path = cluster_resource_x_writer_path_snapshot(&r4_generation);
-	result = expected_generation != 0 && expected_generation != UINT64_MAX
+	result = semantic_activation_first_round_live()
+					 && expected_generation != 0 && expected_generation != UINT64_MAX
 					 && writer_path == RESOURCE_X_WRITER_CLOSED
 					 && r4_generation == expected_generation
 					 && r11_resource_x_gate_snapshot_exact(&gate)
@@ -6798,7 +6851,7 @@ r11_resource_x_open_target(uint64 generation)
 {
 	uint64 digest;
 
-	return r11_resource_x_cutover_digest_exact(
+	return semantic_activation_first_round_live() && r11_resource_x_cutover_digest_exact(
 			   generation, CLUSTER_SEMANTIC_R11_CUTOVER_DURABLE_OPEN_PENDING_LOCAL, true, &digest)
 			   ? CLUSTER_SEMANTIC_ACTIVATION_OK
 			   : CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
@@ -9790,6 +9843,7 @@ cluster_semantic_activation_shmem_init(void)
 
 	if (!gate_found) {
 		memset(&semantic_activation_restart, 0, sizeof(semantic_activation_restart));
+		memset(&semantic_activation_first_start, 0, sizeof(semantic_activation_first_start));
 		pg_atomic_init_u64(&SemanticActivationShmem->record_cas_request_seq, 0);
 		pg_atomic_init_u64(&SemanticActivationShmem->record_cas_completion_seq, 0);
 		pg_atomic_init_u32(&SemanticActivationShmem->record_cas_result,
@@ -10315,9 +10369,10 @@ cluster_r4_bit22_cutover_seam_store(const ClusterControlRootFileToken *file_toke
 }
 
 /*
- * One single-slot ProcessUtility -> formation-LMON request/result mailbox.  The
+ * One single-slot requester -> formation-LMON request/result mailbox. The
+ * requester is ProcessUtility or the original first-start postmaster. The
  * state word is the publication fence: writers own WRITING, LMON alone
- * consumes PENDING, and only the publishing backend consumes COMPLETE.
+ * consumes PENDING, and only the publishing requester consumes COMPLETE.
  * This mailbox carries no PGSA bytes and cannot bypass QVOTEC.
  */
 static bool
@@ -11891,6 +11946,12 @@ semantic_activation_lmon_consume_utility(void)
 
 	if (!semantic_activation_utility_mailbox_poll(&request))
 		return;
+	/* No stale first-start request may drive PGRD/PGSA. Keep the exact slot
+	 * owned while deferred, including any outstanding QVOTEC completion. */
+	if (cluster_shared_config
+		&& cluster_semantic_normal_start_state() == CLUSTER_NORMAL_START_SOURCE_ZERO
+		&& !semantic_activation_first_writer_live())
+		return;
 
 	memset(&refusal, 0, sizeof(refusal));
 	if (request.action != CLUSTER_SEMANTIC_ENABLE_ALL
@@ -13352,6 +13413,94 @@ cluster_semantic_activation_lmon_tick(void)
 	semantic_activation_pgrd_snapshot_clear();
 	(void)semantic_activation_lmon_publish_gate(&snapshot, snapshot.active_bits,
 												snapshot.record_generation, current_epoch, true);
+}
+
+/* Bounded, nonblocking postmaster adapter for the two existing first-OPEN
+ * rounds. Only LMON/QVOTEC publish their durable records and admission gates.
+ * A reply merely retires this request; readiness is sampled independently. */
+bool
+cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refusal)
+{
+	const uint64 r4 = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	const uint64 target = r4 | CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1;
+	SemanticActivationFirstStart *start = &semantic_activation_first_start;
+	SemanticActivationAdmissionSnapshot before, after;
+	ClusterWalSourceRef writer;
+	ResourceXGateSnapshot gate, gate_after;
+	ClusterSemanticActivationRefusal completion;
+	ClusterNormalStartState state;
+	uint64 epoch = cluster_epoch_get_current();
+	uint64 next_bits;
+
+	semantic_activation_set_refusal(refusal, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE, 0, 0);
+	if (IsUnderPostmaster || !cluster_shared_config || epoch == 0
+		|| cluster_conf_node_count() != 4 || cluster_node_id < 0 || cluster_node_id >= 4)
+		return false;
+	state = cluster_semantic_normal_start_state();
+	if (state == CLUSTER_NORMAL_START_SOURCE_ZERO) {
+		if (!semantic_activation_first_writer(&writer, epoch))
+			return false;
+		if (!start->bound) {
+			start->writer = writer;
+			start->epoch = epoch;
+			start->bound = true;
+		}
+		if (start->epoch != epoch || memcmp(&start->writer, &writer, sizeof(writer)) != 0)
+			return false;
+	} else if (state != CLUSTER_NORMAL_START_TARGET_READY || start->bound)
+		return false;
+
+	semantic_activation_set_refusal(refusal, CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED, 0, 0);
+	if (start->request_seq != 0) {
+		if (semantic_activation_snapshot(&before))
+			semantic_activation_set_refusal(refusal, CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED,
+											 target & ~before.active_bits, before.record_generation);
+		if (!semantic_activation_utility_mailbox_poll_completion(start->request_seq, &completion))
+			return false;
+		start->request_seq = 0;
+		if (refusal != NULL)
+			*refusal = completion;
+		if (completion.result != CLUSTER_SEMANTIC_ACTIVATION_OK)
+			return false;
+	}
+
+	if (!semantic_activation_snapshot(&before) || before.transition_closed
+		|| before.formation_epoch != epoch || before.record_generation == UINT64_MAX)
+		return false;
+	semantic_activation_set_refusal(refusal, CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED,
+									 target & ~before.active_bits, before.record_generation);
+	if (before.active_bits == target && before.record_generation >= 6
+		&& cluster_pcm_lock_resource_x_gate_snapshot(&gate)
+		&& gate.phase == RESOURCE_X_GATE_OPEN && gate.formation != 0
+		&& gate.formation != UINT64_MAX && gate.freeze_generation != 0
+		&& gate.freeze_generation != UINT64_MAX && gate.reserved == 0
+		&& semantic_activation_snapshot(&after) && before.seq == after.seq
+		&& cluster_pcm_lock_resource_x_gate_snapshot(&gate_after)
+		&& memcmp(&gate, &gate_after, sizeof(gate)) == 0
+		&& cluster_epoch_get_current() == epoch) {
+		/* TARGET publication already passed r11_resource_x_open_target's
+		 * exact native R8/R10 proof. Observe its still-OPEN native gate here;
+		 * native formation (e.g. 1 -> 2) is never a membership epoch. */
+		semantic_activation_set_refusal(refusal, CLUSTER_SEMANTIC_ACTIVATION_OK, 0,
+										 before.record_generation);
+		return true;
+	}
+	/* Normal restart has its own consumer. Followers never acquire the
+	 * coordinator's utility slot, even when they reach phase4 first. */
+	if (state != CLUSTER_NORMAL_START_SOURCE_ZERO || cluster_node_id != 0)
+		return false;
+	if (before.active_bits == 0 && before.record_generation == 0)
+		next_bits = r4;
+	else if (before.active_bits == r4 && before.record_generation == 3)
+		next_bits = target;
+	else
+		return false;
+	if (!semantic_activation_utility_mailbox_submit(CLUSTER_SEMANTIC_ENABLE_ALL,
+													 before.active_bits, next_bits, 0,
+													 before.record_generation, &start->request_seq))
+		semantic_activation_set_refusal(refusal, CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD,
+										 next_bits, before.record_generation);
+	return false;
 }
 
 ClusterSemanticActivationResult
