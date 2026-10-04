@@ -912,7 +912,8 @@ test_cluster_checkpoint_native.inc: $(top_srcdir)/src/backend/access/transam/xlo
 test_cluster_startup_writer_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^ClusterStartupConfigurationRequire\(/ || /^ClusterStartupWriterSelect\(/ || /^ClusterStartupCrashSeal\(/ { print "static void"; emit=1; count++ } \
 	     /^ClusterStartupWriterBegin\(/ { print "static XLogRecPtr"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 4) exit 1 }' $< > $@.tmp
+	     /^cluster_wal_startup_clean_input_v1\(/ { print "ClusterControlRootResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: execute the real earliest startup-directory mutation call site.

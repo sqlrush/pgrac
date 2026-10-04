@@ -6258,6 +6258,56 @@ ClusterStartupWriterSelect(void)
 	clusterStartupWriterSelected = true;
 }
 
+/* PGRAC: semantic normal-start must consume the original CLEAN selection,
+ * before native WAL binding, instead of guessing from an old OPEN record.
+ * Reuse the ROOT owner's exact selected-operation/formation/fence checks;
+ * this observation creates no writer or serving authority.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterControlRootResult
+cluster_wal_startup_clean_input_v1(ClusterWalStartupCleanInputV1 *out)
+{
+	ClusterWalStartupImage observed;
+	ClusterWalStartupCleanInputV1 image = { 0 };
+	ClusterControlRootResult result;
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || !clusterStartupWriterSelected
+		|| clusterStartupWriterBound || clusterStartupWriterInstalled || CritSectionCount != 0
+		|| ShutdownRequestPending || InRecovery || ArchiveRecoveryRequested
+		|| ControlFile->state != DB_SHUTDOWNED || LWLockHeldByMe(ControlFileLock)
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| clusterStartupWriter.input_kind != CLUSTER_WAL_STARTUP_CLEAN
+		|| clusterStartupWriter.phase != CLUSTER_WAL_STARTUP_INITIALIZING)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = cluster_control_root_v3_startup_read_writer(
+		&clusterStartupWriter.claim.identity, clusterStartupWriter.operation_uuid, &observed);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(&observed, &clusterStartupWriter, sizeof(observed)) != 0
+		|| ControlFile->checkPoint != observed.input_record_start
+		|| ControlFile->checkPointCopy.ThisTimeLineID != observed.input_timeline)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	image.predecessor = observed.predecessor.snapshot.identity;
+	memcpy(image.predecessor_claim_sha256, observed.predecessor.refs.claim_sha256, 32);
+	image.successor = observed.claim;
+	image.formation_epoch = observed.formation_epoch;
+	image.config_generation = observed.config_generation;
+	image.predecessor_root_sequence = observed.predecessor_file_sequence;
+	memcpy(image.predecessor_root_sha256, observed.predecessor_file_sha256, 32);
+	memcpy(image.exit_evidence_sha256, observed.predecessor_evidence_sha256, 32);
+	memcpy(image.operation_uuid, observed.operation_uuid, 16);
+	image.operation_generation = observed.generation;
+	image.checkpoint_lsn = observed.input_record_start;
+	image.checkpoint_end = observed.input_record_end;
+	image.checkpoint_crc32c = observed.input_record_crc;
+	image.timeline = observed.input_timeline;
+	*out = image;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 /*
  * PGRAC (S9P2-05): this node's own thread did not shut down cleanly.  Seal
  * its crashed generation (OPEN, or sealed without its tail) on the self-seal
