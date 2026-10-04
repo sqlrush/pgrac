@@ -49,6 +49,10 @@ typedef struct ClusterControlBootstrapSnapshot {
 	uint64 root_sequence;
 	uint32 database_state;
 	uint32 activation_state;
+	/* Literal selected metadata for read-only lifecycle observations. */
+	uint32 root_format_version;
+	uint32 writer_lifecycle;
+	uint64 serving[2];
 } ClusterControlBootstrapSnapshot;
 
 /*

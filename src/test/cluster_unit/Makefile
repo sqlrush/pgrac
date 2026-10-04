@@ -8309,3 +8309,7 @@ test_cluster_initdb_catalog: test_cluster_initdb_catalog.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_srcdir)/src/common/cluster_catalog_init.c $(top_srcdir)/src/common/file_perm.c \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Exact private bootstrap observation layout shared by backend and fixture.
+$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o: \
+	$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_private.h

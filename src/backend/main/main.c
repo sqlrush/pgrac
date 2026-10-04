@@ -36,6 +36,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_version_macros.h" /* PGRAC_VERSION_STRING */
 #include "cluster/cluster_initdb_cohort.h"
+#include "cluster/cluster_control_observe.h"
 #endif
 
 #if defined(WIN32)
@@ -218,6 +219,8 @@ main(int argc, char *argv[])
 	 */
 
 #ifdef USE_PGRAC_CLUSTER
+	if (argc > 1 && strcmp(argv[1], "--pgrac-observe-writer") == 0)
+		ClusterControlObserveMain(argc, argv);
 	if (argc > 1 && strcmp(argv[1], "--pgrac-initdb-cohort") == 0)
 		ClusterInitdbCohortMain(argc, argv);
 #endif

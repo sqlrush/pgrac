@@ -15140,6 +15140,10 @@ UT_TEST(test_bootstrap_read_exact_files_and_owned_config)
 		UT_ASSERT_EQ(out.snapshot.thread.origin_thread_id, node + 1);
 		UT_ASSERT_EQ(out.snapshot.control.checkPoint, f.local_anchor.checkpoint);
 		UT_ASSERT_EQ(out.snapshot.control.MaxConnections, 300 + node);
+		UT_ASSERT_EQ(out.snapshot.root_format_version, 2);
+		UT_ASSERT_EQ(out.snapshot.writer_lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+		UT_ASSERT_EQ(out.snapshot.serving[0], 1);
+		UT_ASSERT_EQ(out.snapshot.serving[1], UINT64_C(1) << 63);
 		UT_ASSERT_EQ(out.config_len, f.input.config.len);
 		UT_ASSERT(memcmp(out.config_bytes, f.config, out.config_len) == 0);
 		UT_ASSERT_EQ(out.config_bytes[out.config_len], '\0');
@@ -22316,6 +22320,23 @@ main(int argc, char **argv)
 	if (argc > 1)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
+	if (getenv("PGRAC_PRE2_TEST_BOOTSTRAP_OBSERVE") != NULL) {
+		UT_PLAN(12);
+		UT_RUN(test_bootstrap_read_exact_files_and_owned_config);
+		UT_RUN(test_bootstrap_read_requires_independent_binding_and_node);
+		UT_RUN(test_bootstrap_read_never_falls_back_to_valid_bak);
+		UT_RUN(test_bootstrap_read_rejects_every_bad_selected_file);
+		UT_RUN(test_bootstrap_read_unsafe_leaves_do_not_block_or_leak);
+		UT_RUN(test_bootstrap_read_unsafe_directories_are_refused);
+		UT_RUN(test_bootstrap_read_real_root_replacement_and_binding_races);
+		UT_RUN(test_bootstrap_read_invalid_paths_outputs_and_alias);
+		UT_RUN(test_bootstrap_read_pinned_directory_is_not_replacement);
+		UT_RUN(test_bootstrap_read_close_failure_never_returns_partial_success);
+		UT_RUN(test_bootstrap_capacity_checks_nonlocal_content_not_just_file_presence);
+		UT_RUN(test_bootstrap_closed_thread_requires_clean_anchor);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
 	if (getenv("PGRAC_PRE2_TEST_SERVING") != NULL) {
 		UT_PLAN(13);
 		UT_RUN(test_serving_clean_restart_keeps_old_open_with_current_epoch);

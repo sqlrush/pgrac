@@ -65,6 +65,7 @@ OBJS = \
 	cluster_config_members.o \
 	cluster_service_observe.o \
 	cluster_control_root.o \
+	cluster_control_observe.o \
 	cluster_wal_history.o \
 	cluster_wal_tail.o \
 	cluster_control_bootstrap.o \
@@ -437,7 +438,8 @@ include $(top_srcdir)/src/backend/common.mk
 cluster_control_bootstrap_read.o: $(top_srcdir)/src/include/cluster/cluster_native_startup.h \
 	$(top_srcdir)/src/include/cluster/cluster_xid_authority.h
 cluster_control_root.o cluster_control_bootstrap.o cluster_control_bootstrap_read.o \
-cluster_wal_history.o cluster_thread_recovery_worker.o: \
+cluster_wal_history.o cluster_thread_recovery_worker.o cluster_control_observe.o \
+cluster_control_bootstrap_native.o cluster_control_catalog_read.o cluster_cf_storage.o cluster_wal_thread.o: \
 	$(srcdir)/cluster_control_bootstrap_private.h
 cluster_control_root.o cluster_recovery_anchor.o: $(srcdir)/cluster_recovery_anchor_private.h
 

@@ -274,6 +274,9 @@ cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
 	snapshot.root_sequence = before->header.file_txn_seq;
 	snapshot.database_state = before->header.v2.database_state;
 	snapshot.activation_state = before->header.activation_state;
+	snapshot.root_format_version = before->header.format_version;
+	snapshot.writer_lifecycle = before->records[input->node_id].lifecycle;
+	memcpy(snapshot.serving, before->header.v2.serving, sizeof(snapshot.serving));
 	*out = snapshot;
 done:
 	pfree(after);
