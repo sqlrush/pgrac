@@ -2993,7 +2993,8 @@ UT_TEST(test_93da0_exact_refusal_completes_active_utility_as_deferred)
 	test_gate_reset();
 }
 
-UT_TEST(test_93da1_member_retains_sample_ack_until_exact_request_arrives)
+static void
+test_member_early_sample_ack(int observation_gap)
 {
 	const uint64 system_identifier = UINT64_C(0x8070605040302010);
 	ClusterSemanticActivationAckTableV1 table;
@@ -3072,7 +3073,21 @@ UT_TEST(test_93da1_member_retains_sample_ack_until_exact_request_arrives)
 	message.round_nonce = UINT64_C(78);
 	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
 	cluster_semantic_activation_ack_handler(&envelope, payload);
+	if (observation_gap == 1)
+		test_membership_snapshot_valid = false;
+	else if (observation_gap == 2)
+		test_membership_snapshot_fail_at_call = test_membership_snapshot_calls + 2;
 	cluster_semantic_activation_lmon_tick();
+	if (observation_gap != 0) {
+		UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(
+			&semantic_activation_ack_local_ingress), UINT32_C(1));
+		UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(0));
+		UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
+		UT_ASSERT_EQ(table.expected_members_lo, UINT64_C(0));
+		test_membership_snapshot_valid = true;
+		test_membership_snapshot_fail_at_call = 0;
+		cluster_semantic_activation_lmon_tick();
+	}
 
 	UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(1));
 	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
@@ -3110,6 +3125,21 @@ UT_TEST(test_93da1_member_retains_sample_ack_until_exact_request_arrives)
 								.record_generation = 1,
 							}));
 	test_gate_reset();
+}
+
+UT_TEST(test_93da1_member_retains_sample_ack_until_exact_request_arrives)
+{
+	test_member_early_sample_ack(0);
+}
+
+UT_TEST(test_early_sample_ack_waits_for_coherent_authority)
+{
+	test_member_early_sample_ack(1);
+}
+
+UT_TEST(test_early_sample_ack_survives_second_authority_read_gap)
+{
+	test_member_early_sample_ack(2);
 }
 
 UT_TEST(test_93da2_member_retains_next_round_sample_ack_until_exact_request_arrives)
@@ -11160,11 +11190,17 @@ UT_TEST(test_a148_stop_poll_includes_original_phase3_handoff)
 
 #include "test_cluster_normal_cold_startup.h"
 #include "test_cluster_first_open.h"
+#include "test_cluster_sample_ack_handoff.h"
 
 int
 main(void)
 {
-	UT_PLAN(339);
+	UT_PLAN(344);
+	UT_RUN(test_early_sample_ack_waits_for_coherent_authority);
+	UT_RUN(test_early_sample_ack_survives_second_authority_read_gap);
+	UT_RUN(test_sample_barrier_preserves_partial_proof_during_observation_gap);
+	UT_RUN(test_sample_barrier_preserves_partial_proof_at_second_read_gap);
+	UT_RUN(test_sample_fanout_finishes_before_barrier_replaces_owner);
 	UT_RUN(test_first_open_authority_submit_notifies_after_exact_publication);
 	UT_RUN(test_first_open_authority_completion_notifies_after_exact_publication);
 	UT_RUN(test_first_open_barrier_waits_for_last_sample_ack);
