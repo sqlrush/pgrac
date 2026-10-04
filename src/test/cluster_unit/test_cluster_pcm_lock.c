@@ -21111,42 +21111,58 @@ UT_TEST(test_local_pi_is_owned_before_source_pair_becomes_sendable)
  * source is refused without change; an exact replay with no new sample or
  * the same first record is a duplicate, another first record is not.
  */
-UT_TEST(test_r_a22_holder_pair_carries_first_record_to_local_pi)
+/*
+ * A self-mastered X holder about to retain its BLOCKED_TO_N pair under
+ * formation 17, with a shared-mode page WAL binding for the image and an
+ * earlier own record of the same page as its first record.
+ */
+static void
+r_a22_holder_pair_fixture(BufferTag tag, ClusterPageWalBindingV1 *binding,
+						  ClusterPageWalBindingV1 *first, ResourceXDecodedFrame *block,
+						  ResourceXDecodedFrame *status, ResourceXDecodedFrame *image)
 {
-	BufferTag tag = make_tag(956);
-	ClusterPageWalBindingV1 binding = local_pi_setup(tag), first, bad;
-	ClusterPcmLocalPiSnapshotV1 local;
-	ClusterPcmLocalPiFloorV1 floor;
-	ClusterPageWalRefV1 ref = { 0 }, again = { 0 };
-	ResourceXDecodedFrame block, grant, image, status;
+	ResourceXDecodedFrame grant;
 	PGAlignedBlock page;
 
+	*binding = local_pi_setup(tag);
 	UT_ASSERT(cluster_gcs_block_master_rebuild_from_redeclare(
-		tag, PCM_STATE_X, binding.record_end, binding.version.mutation_token, 0, 7));
+		tag, PCM_STATE_X, binding->record_end, binding->version.mutation_token, 0, 7));
 	fake_gcs_master_node = 1;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
 				 RESOURCE_X_APPLY_APPLIED);
-	block = make_resource_x_master_frame(RESOURCE_X_WIRE_BLOCK_TO_N, tag, 1, 0);
-	block.common.observed_mode = PCM_STATE_X;
-	block.common.target_mode = PCM_STATE_N;
-	block.common.source_candidate = block.common.retain_pi_if_dirty = 1;
-	make_resource_x_remote_join_pair(tag, 1, &grant, &image);
-	binding.version.mutation_token = image.body.image_envelope.page_scn_lsn;
+	*block = make_resource_x_master_frame(RESOURCE_X_WIRE_BLOCK_TO_N, tag, 1, 0);
+	block->common.observed_mode = PCM_STATE_X;
+	block->common.target_mode = PCM_STATE_N;
+	block->common.source_candidate = block->common.retain_pi_if_dirty = 1;
+	make_resource_x_remote_join_pair(tag, 1, &grant, image);
+	binding->version.mutation_token = image->body.image_envelope.page_scn_lsn;
 	memset(page.data, 0, BLCKSZ);
 	((PageHeader)page.data)->pd_upper = BLCKSZ;
-	((PageHeader)page.data)->pd_block_scn = binding.version.mutation_token;
-	PageSetLSNPreserveOrigin(page.data, binding.record_end);
+	((PageHeader)page.data)->pd_block_scn = binding->version.mutation_token;
+	PageSetLSNPreserveOrigin(page.data, binding->record_end);
 	UT_ASSERT(PageSetLSNOrigin(page.data, 0));
-	memcpy(image.body.image_envelope.page_bytes, page.data, BLCKSZ);
-	image.body.image_envelope.page_wal = binding;
-	image.body.image_envelope.image_flags = RESOURCE_X_IMAGE_HAS_WAL;
-	canonicalize_resource_x_test_image(&image);
-	status = make_resource_x_remote_blocked_frame(tag, 1, 0);
-	status.body.blocked_to_n.source_proof_crc32c = image.common.semantic_crc32c;
-	first = binding;
-	first.version.mutation_token--;
-	first.record_start = binding.record_start > 100 ? binding.record_start - 100 : 1;
-	first.record_end = binding.record_start;
+	memcpy(image->body.image_envelope.page_bytes, page.data, BLCKSZ);
+	image->body.image_envelope.page_wal = *binding;
+	image->body.image_envelope.image_flags = RESOURCE_X_IMAGE_HAS_WAL;
+	canonicalize_resource_x_test_image(image);
+	*status = make_resource_x_remote_blocked_frame(tag, 1, 0);
+	status->body.blocked_to_n.source_proof_crc32c = image->common.semantic_crc32c;
+	*first = *binding;
+	first->version.mutation_token--;
+	first->record_start = binding->record_start > 100 ? binding->record_start - 100 : 1;
+	first->record_end = binding->record_start;
+}
+
+UT_TEST(test_r_a22_holder_pair_carries_first_record_to_local_pi)
+{
+	BufferTag tag = make_tag(956);
+	ClusterPageWalBindingV1 binding, first, bad;
+	ClusterPcmLocalPiSnapshotV1 local;
+	ClusterPcmLocalPiFloorV1 floor;
+	ClusterPageWalRefV1 ref = { 0 }, again = { 0 };
+	ResourceXDecodedFrame block, image, status;
+
+	r_a22_holder_pair_fixture(tag, &binding, &first, &block, &status, &image);
 
 	for (int variant = 0; variant < 3; variant++) {
 		bad = first;
@@ -21214,6 +21230,79 @@ UT_TEST(test_r_a22_holder_pair_carries_first_record_to_local_pi)
 					 &block.common.logical_assertion, block.common.assertion_sequence, 1,
 					 block.common.master_session_incarnation),
 				 RESOURCE_X_APPLY_DUPLICATE);
+	local_pi_writer_ready = cluster_shared_config = false;
+}
+
+/* A pending first record that cannot reach a local PI receiver blocks the
+ * publish and keeps being counted; it leaves only with its receiver. */
+UT_TEST(test_r_a22_unpublishable_first_record_stays_pending)
+{
+	BufferTag tag = make_tag(957);
+	ClusterPageWalBindingV1 binding, first;
+	ClusterPcmLocalPiSnapshotV1 local;
+	ClusterPcmLocalPiFloorV1 floor;
+	ClusterPageWalRefV1 ref = { 0 };
+	ResourceXDecodedFrame block, image, status;
+
+	r_a22_holder_pair_fixture(tag, &binding, &first, &block, &status, &image);
+	UT_ASSERT(cluster_page_wal_ref_retain_v1(&first, &ref));
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_block_to_n_source_exact(&block, 1, &status, &image, &ref),
+		RESOURCE_X_APPLY_APPLIED);
+	cluster_shared_config = false;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_publish_exact(
+					 &block.common.logical_assertion, block.common.assertion_sequence, 1,
+					 block.common.master_session_incarnation),
+				 RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	cluster_shared_config = true;
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&binding.source, &floor));
+	UT_ASSERT_EQ(floor.floor, first.record_start);
+	UT_ASSERT_EQ(floor.pending, 1);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &local));
+	UT_ASSERT_EQ(local.first.record_start, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_publish_exact(
+					 &block.common.logical_assertion, block.common.assertion_sequence, 1,
+					 block.common.master_session_incarnation),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&binding.source, &floor));
+	UT_ASSERT_EQ(floor.floor, first.record_start);
+	UT_ASSERT_EQ(floor.pending, 0);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &local));
+	UT_ASSERT(cluster_page_wal_same_mutation_v1(&local.first, &first));
+	local_pi_writer_ready = cluster_shared_config = false;
+}
+
+/* Reconfiguration keeps an unpublished pair with its first record: the
+ * record stays counted and the sweep reports no zero residual. */
+UT_TEST(test_r_a22_pending_first_record_survives_reconfiguration)
+{
+	BufferTag tag = make_tag(958);
+	ClusterPageWalBindingV1 binding, first;
+	ClusterPcmLocalPiFloorV1 floor;
+	ClusterPageWalRefV1 ref = { 0 };
+	ResourceXDecodedFrame block, image, status;
+	ResourceXReconfigToken token;
+	ResourceXReconfigBatch batch;
+	ResourceXReconfigResult result;
+	int steps = 0;
+
+	r_a22_holder_pair_fixture(tag, &binding, &first, &block, &status, &image);
+	UT_ASSERT(cluster_page_wal_ref_retain_v1(&first, &ref));
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_block_to_n_source_exact(&block, 1, &status, &image, &ref),
+		RESOURCE_X_APPLY_APPLIED);
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
+	do
+		result = cluster_resource_x_reconfig_sweep(&token, 4, &batch);
+	while (result == RESOURCE_X_RECONFIG_MORE && ++steps < 64);
+	UT_ASSERT(result != RESOURCE_X_RECONFIG_CORRUPT);
+	UT_ASSERT_EQ(batch.zero_residual, 0);
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&binding.source, &floor));
+	UT_ASSERT_EQ(floor.floor, first.record_start);
+	UT_ASSERT_EQ(floor.pending, 1);
+	if (ut_current_failed)
+		printf("# reconfig result %d after %d steps\n", (int)result, steps);
 	local_pi_writer_ready = cluster_shared_config = false;
 }
 
@@ -22543,6 +22632,8 @@ main(void)
 	UT_RUN(test_local_pi_alone_prevents_directory_reclamation);
 	UT_RUN(test_local_pi_is_owned_before_source_pair_becomes_sendable);
 	UT_RUN(test_r_a22_holder_pair_carries_first_record_to_local_pi);
+	UT_RUN(test_r_a22_unpublishable_first_record_stays_pending);
+	UT_RUN(test_r_a22_pending_first_record_survives_reconfiguration);
 	UT_RUN(test_local_pi_requires_original_all_member_stop_cut);
 	UT_RUN(test_local_pi_read_only_carrier_does_not_create_writer_responsibility);
 	UT_RUN(test_local_pi_redeclare_does_not_need_resident_buffer_or_current_authority);
