@@ -288,14 +288,25 @@ sub healthy_slow_query
 sub twopc_holder
 {
 	my ($self, $gid) = @_;
+	my $node = $self->{node};
 	$gid //= 'hc_2pc_' . (++$self->{nseq});
 	my $tbl = $self->_next_tbl('twopc');
+
+	# Cluster mode refuses PREPARE TRANSACTION (PRE2 limitation).  Prepare the
+	# holder with cluster mode off; restarting in cluster mode recovers it with
+	# its lock and no live backend.  Call with no tracked handles open.
+	$node->stop;
+	$node->append_conf('postgresql.conf', "cluster.enabled = off\n");
+	$node->start;
 	$self->_create_table($tbl);
-	$self->{node}->safe_psql('postgres', qq{
+	$node->safe_psql('postgres', qq{
 		BEGIN;
 		LOCK TABLE $tbl IN ACCESS EXCLUSIVE MODE;
 		PREPARE TRANSACTION '$gid';
 	});
+	$node->stop;
+	$node->append_conf('postgresql.conf', "cluster.enabled = on\n");
+	$node->start;
 	$self->{prepared}{$gid} = 1;
 	return { table => $tbl, gid => $gid };
 }
