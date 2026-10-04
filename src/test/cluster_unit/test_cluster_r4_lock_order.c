@@ -79,7 +79,24 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 /* Exercise the real product-local policy helpers without exporting a test API. */
 #include "../../backend/cluster/cluster_semantic_activation.c"
 
-/* This lock-policy fixture does not install a native startup writer. */
+/* This lock-policy fixture does not install a native startup writer or
+ * run its CLEAN formation owner. Retained ELF sections must still link. */
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+
+bool
+cluster_write_fence_allowed(void)
+{
+	abort();
+}
+
+bool
+cluster_reconfig_capture_formation_snapshot_v1(
+	uint16 origin_thread pg_attribute_unused(),
+	ClusterFormationSnapshotV1 *out pg_attribute_unused())
+{
+	abort();
+}
+
 bool
 cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *ref pg_attribute_unused(),
 	uint64 epoch pg_attribute_unused())
