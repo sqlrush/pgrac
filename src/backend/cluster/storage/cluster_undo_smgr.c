@@ -558,6 +558,15 @@ cluster_undo_smgr_header_writer_close(int fd)
 }
 
 bool
+cluster_undo_smgr_header_unchanged_durable(ClusterUndoPathIntent intent, uint32 segment_id,
+										   uint8 owner_instance)
+{
+	int fd = get_segment_fd(intent, segment_id, owner_instance);
+
+	return fd >= 0 && header_write_recorded(fd, intent, segment_id, owner_instance);
+}
+
+bool
 cluster_undo_smgr_fsync_header(ClusterUndoPathIntent intent, uint32 segment_id,
 							   uint8 owner_instance)
 {

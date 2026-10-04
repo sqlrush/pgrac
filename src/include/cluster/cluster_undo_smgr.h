@@ -149,6 +149,16 @@ extern bool cluster_undo_smgr_header_writer_write(int fd, ClusterUndoPathIntent 
 												  uint32 offset, const char *buf, uint32 len);
 extern void cluster_undo_smgr_header_writer_close(int fd);
 
+/*
+ * Redo: block zero already shows a replayed TT record's effect (or a newer
+ * state), but those bytes may still be only in the page cache of a crashed
+ * predecessor while shared memory -- and the checkpoint's record of unsynced
+ * header writes -- was rebuilt.  Record them for the next checkpoint like a
+ * fresh write, or fsync them now.  Returns false on failure.
+ */
+extern bool cluster_undo_smgr_header_unchanged_durable(ClusterUndoPathIntent intent,
+													   uint32 segment_id, uint8 owner_instance);
+
 /* Checkpoint: fsync one segment file through the intent its header used. */
 extern bool cluster_undo_smgr_fsync_header(ClusterUndoPathIntent intent, uint32 segment_id,
 										   uint8 owner_instance);

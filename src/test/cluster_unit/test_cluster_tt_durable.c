@@ -868,6 +868,20 @@ cluster_undo_smgr_fsync_segment_file(uint32 segment_id pg_attribute_unused(),
 	return true;
 }
 
+/* Redo branches that find the record's effect already present make those
+ * bytes durable instead of rewriting them (F-D-29 restart residue). */
+static int g_present_durable_calls = 0;
+static bool g_present_durable_ok = true;
+
+bool
+cluster_undo_smgr_header_unchanged_durable(ClusterUndoPathIntent intent pg_attribute_unused(),
+										   uint32 segment_id pg_attribute_unused(),
+										   uint8 owner_instance pg_attribute_unused())
+{
+	g_present_durable_calls++;
+	return g_present_durable_ok;
+}
+
 int
 cluster_undo_smgr_header_writer_open(ClusterUndoPathIntent intent pg_attribute_unused(),
 									 uint32 segment_id pg_attribute_unused(),
@@ -3261,9 +3275,101 @@ UT_TEST(test_typed_redo_set_head_requires_aborted_identity)
 	g_canned_slot.status = TT_SLOT_COMMITTED;
 	g_write_hdr_calls = 0;
 	g_fsync_segment_calls = 0;
+	g_present_durable_calls = 0;
 	cluster_tt_durable_redo_set_head_slot(1, 1, 7, 5, 778, head);
 	UT_ASSERT_EQ(g_write_hdr_calls, 0);
 	UT_ASSERT_EQ(g_fsync_segment_calls, 0);
+	UT_ASSERT_EQ(g_present_durable_calls, 1);
+}
+
+/* Seed the canned block zero of segment 1 (owner 1, generation 4) with slot 7
+ * in the given state. */
+static void
+seed_exact_abort_block(uint8 status, uint16 wrap, uint32 generation)
+{
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)g_canned_block;
+	TTSlot *slot = &header->tt_slots[7];
+	UBA invalid = InvalidUba_init;
+
+	memset(g_canned_block, 0, sizeof(g_canned_block));
+	header->segment_id = 1;
+	header->owner_instance = 1;
+	header->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	header->wrap_count = generation;
+	slot->status = status;
+	slot->xid = 778;
+	slot->wrap = wrap;
+	slot->flags = TT_FLAGS_RESERVED;
+	slot->commit_scn = InvalidScn;
+	slot->first_undo_block = invalid;
+	g_read_block_ok = true;
+	g_canned_block_segment = 1;
+}
+
+/*
+ * F-D-29 restart residue: a crash restart rebuilds shared memory -- and the
+ * checkpoint's record of unsynced header writes -- while the page cache still
+ * holds the crashed run's TT stamps.  Every redo branch that finds the
+ * record's effect (or a newer state) already present must make those bytes
+ * durable before the end-of-recovery checkpoint passes the record; failing to
+ * do so PANICs rather than letting that checkpoint drop them.
+ */
+UT_TEST(test_typed_redo_present_state_is_made_durable)
+{
+	volatile bool caught = false;
+
+	/* Legacy abort over a newer wrap: SKIP. */
+	g_read_hdr_ok = true;
+	memset(&g_canned_slot, 0, sizeof(g_canned_slot));
+	g_canned_slot.status = TT_SLOT_ABORTED;
+	g_canned_slot.xid = 778;
+	g_canned_slot.wrap = 6;
+	g_write_hdr_calls = g_fsync_segment_calls = g_present_durable_calls = 0;
+	cluster_tt_durable_redo_abort_slot(1, 1, 7, 5, 778);
+	UT_ASSERT_EQ(g_write_hdr_calls + g_fsync_segment_calls, 0);
+	UT_ASSERT_EQ(g_present_durable_calls, 1);
+
+	/* Exact abort already applied: IDEMPOTENT. */
+	seed_exact_abort_block(TT_SLOT_ABORTED, 5, 4);
+	g_write_hdr_calls = g_fsync_segment_calls = g_present_durable_calls = 0;
+	cluster_tt_durable_redo_abort_slot_exact(1, 1, 4, 7, 5, 778);
+	UT_ASSERT_EQ(g_write_hdr_calls + g_fsync_segment_calls, 0);
+	UT_ASSERT_EQ(g_present_durable_calls, 1);
+
+	/* Exact abort into a newer segment generation, or under a newer wrap: STALE. */
+	seed_exact_abort_block(TT_SLOT_ACTIVE, 5, 5);
+	g_write_hdr_calls = g_fsync_segment_calls = g_present_durable_calls = 0;
+	cluster_tt_durable_redo_abort_slot_exact(1, 1, 4, 7, 5, 778);
+	UT_ASSERT_EQ(g_write_hdr_calls + g_fsync_segment_calls, 0);
+	UT_ASSERT_EQ(g_present_durable_calls, 1);
+	seed_exact_abort_block(TT_SLOT_ACTIVE, 6, 4);
+	g_write_hdr_calls = g_fsync_segment_calls = g_present_durable_calls = 0;
+	cluster_tt_durable_redo_abort_slot_exact(1, 1, 4, 7, 5, 778);
+	UT_ASSERT_EQ(g_write_hdr_calls + g_fsync_segment_calls, 0);
+	UT_ASSERT_EQ(g_present_durable_calls, 1);
+
+	/* The ACTIVE predecessor still applies through the write + fsync path. */
+	seed_exact_abort_block(TT_SLOT_ACTIVE, 5, 4);
+	g_write_hdr_calls = g_fsync_segment_calls = g_present_durable_calls = 0;
+	cluster_tt_durable_redo_abort_slot_exact(1, 1, 4, 7, 5, 778);
+	UT_ASSERT_EQ(g_write_hdr_calls, 1);
+	UT_ASSERT_EQ(g_fsync_segment_calls, 1);
+	UT_ASSERT_EQ(g_present_durable_calls, 0);
+
+	/* Failing to make the present state durable is a PANIC, not a skip. */
+	g_present_durable_ok = false;
+	PG_TRY();
+	{
+		cluster_tt_durable_redo_abort_slot(1, 1, 7, 5, 778);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	g_present_durable_ok = true;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(last_ereport_elevel, PANIC);
 }
 
 
@@ -3474,7 +3580,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(108);
+	UT_PLAN(109);
 
 	UT_RUN(test_layout_sizes);
 
@@ -3569,6 +3675,7 @@ main(int argc, char **argv)
 	UT_RUN(test_durable_abort_preserves_identity);
 	UT_RUN(test_typed_redo_abort_is_durable_and_idempotent);
 	UT_RUN(test_typed_redo_set_head_requires_aborted_identity);
+	UT_RUN(test_typed_redo_present_state_is_made_durable);
 
 	UT_RUN(test_redo_decide_idempotent_replay);
 	UT_RUN(test_redo_decide_abort_shares_commit_table);
