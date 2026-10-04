@@ -15382,7 +15382,7 @@ cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag, SCN expected_page_scn,
 bool
 cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
 								  ClusterBufmgrGcsCopyRefusal *out_refusal,
-								  ClusterPageWalBindingV1 *out_wal)
+								  ClusterPageWalBindingV1 *out_wal, ClusterPageWalRefV1 *out_first)
 {
 	uint32 hashcode;
 	LWLock *partition_lock;
@@ -15403,9 +15403,18 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	ClusterPageWalBindingV1 latest_wal;
 	bool has_wal;
 	bool latest_has_wal;
+	/* D S09 R-A22: the first own record since the page was clean, sampled
+	 * with the copy for a holder that hands its responsibility over. */
+	ClusterPageWalRefV1 first_seen, first_now;
+	ClusterPageWalBindingV1 first_wal = { 0 };
+	ClusterPageWalFirstResultV1 first_state = CLUSTER_PAGE_WAL_FIRST_ABSENT;
+	ClusterPageWalFirstResultV1 first_state_now;
+	bool flushed_here;
 
 	if (out_wal != NULL)
 		memset(out_wal, 0, sizeof(*out_wal));
+	if (out_first != NULL)
+		memset(out_first, 0, sizeof(*out_first));
 
 	if (out_refusal != NULL)
 		*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
@@ -15481,6 +15490,28 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 			memset(&wal, 0, sizeof(wal));
 			has_wal = cluster_shared_config
 					  && cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal);
+			flushed_here = false;
+			first_state = CLUSTER_PAGE_WAL_FIRST_ABSENT;
+			if (out_first != NULL && cluster_shared_config) {
+				uint32 buf_state = LockBufHdr(buf);
+
+				first_state = cluster_page_wal_first_observe_locked_v1(buf, &first_seen);
+				UnlockBufHdr(buf, buf_state);
+				/* The descriptor still references it under this content lock. */
+				if ((first_state != CLUSTER_PAGE_WAL_FIRST_ABSENT
+					 && first_state != CLUSTER_PAGE_WAL_FIRST_PRESENT)
+					|| (first_state == CLUSTER_PAGE_WAL_FIRST_PRESENT
+						&& !cluster_page_wal_ref_read_v1(&first_seen,
+														 BufTagGetRelFileLocator(&buf->tag),
+														 buf->tag.forkNum, buf->tag.blockNum,
+														 &first_wal))) {
+					if (out_refusal != NULL)
+						*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID;
+					LWLockRelease(content_lock);
+					content_locked = false;
+					break;
+				}
+			}
 			LWLockRelease(content_lock);
 			content_locked = false;
 
@@ -15502,6 +15533,12 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 				}
 			} else if (!XLogRecPtrIsInvalid(first_lsn))
 				XLogFlush(cluster_gcs_clamp_ship_flush_lsn(first_lsn));
+			if (first_state == CLUSTER_PAGE_WAL_FIRST_PRESENT
+				&& !cluster_page_wal_flush_source_v1(&first_wal, &first_wal)) {
+				if (out_refusal != NULL)
+					*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID;
+				break;
+			}
 
 			/*
 		 * Reacquire content_lock SHARED and revalidate that the page LSN has
@@ -15577,6 +15614,7 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 						FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
 					cluster_pcm_x_finish_retain_flush_active = false;
 					flush_owned = false;
+					flushed_here = true;
 				}
 
 				buf_state = LockBufHdr(buf);
@@ -15611,7 +15649,18 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 									  & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED
 										 | BM_IO_ERROR | BM_IO_IN_PROGRESS))
 										 == 0;
+				first_state_now = out_first != NULL && cluster_shared_config
+									  ? cluster_page_wal_first_observe_locked_v1(buf, &first_now)
+									  : CLUSTER_PAGE_WAL_FIRST_ABSENT;
 				UnlockBufHdr(buf, buf_state);
+				/* The first record must be the one certified above, or gone
+				 * because this attempt's own clean write covered it. */
+				if (first_state_now == CLUSTER_PAGE_WAL_FIRST_PRESENT
+						? first_state != CLUSTER_PAGE_WAL_FIRST_PRESENT
+							  || memcmp(&first_now, &first_seen, sizeof(first_now)) != 0
+						: first_state_now != CLUSTER_PAGE_WAL_FIRST_ABSENT
+							  || (first_state == CLUSTER_PAGE_WAL_FIRST_PRESENT && !flushed_here))
+					storage_current = false;
 				if (!storage_current || has_wal != latest_has_wal
 					|| (has_wal && !cluster_page_wal_same_mutation_v1(&wal, &latest_wal))) {
 					if (out_refusal != NULL)
@@ -15621,6 +15670,14 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 					continue;
 				}
 
+				if (first_state_now == CLUSTER_PAGE_WAL_FIRST_PRESENT
+					&& !cluster_page_wal_ref_retain_v1(&first_wal, out_first)) {
+					if (out_refusal != NULL)
+						*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID;
+					LWLockRelease(content_lock);
+					content_locked = false;
+					break;
+				}
 				*out_page_lsn = second_lsn;
 				if (out_wal != NULL)
 					*out_wal = wal;
@@ -17363,7 +17420,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
-		(void)cluster_bufmgr_copy_block_for_gcs(tag, &written_lsn, scratch.data, NULL, NULL);
+		(void)cluster_bufmgr_copy_block_for_gcs(tag, &written_lsn, scratch.data, NULL, NULL, NULL);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
 
@@ -17884,7 +17941,7 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
-		(void)cluster_bufmgr_copy_block_for_gcs(tag, &written_lsn, scratch.data, NULL, NULL);
+		(void)cluster_bufmgr_copy_block_for_gcs(tag, &written_lsn, scratch.data, NULL, NULL, NULL);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
 
