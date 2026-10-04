@@ -155,9 +155,8 @@ cluster_thread_recovery_fabric_cut_v1(const ClusterThreadRecoveryFabricPlanV1 *p
 	return true;
 }
 static const ClusterShmemRegion *wb_region;
-static uint8
-	wb_memory[3][2 * sizeof(ClusterPiWritebackMessageV1) + 2 * sizeof(ClusterPiWritebackMessageV2)
-				 + 4096] pg_attribute_aligned(MAXIMUM_ALIGNOF);
+static uint8 wb_memory[3][4 * sizeof(ClusterPiWritebackMessageV2) + 4096] pg_attribute_aligned(
+	MAXIMUM_ALIGNOF);
 static uint8 wb_wire[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
 static uint32 wb_length;
 static int32 wb_destination;
@@ -1877,7 +1876,13 @@ UT_TEST(retained_rebuild_error_cleanup_and_postapply_root_check)
 int
 main(void)
 {
-	UT_PLAN(47);
+	UT_PLAN(53);
+	UT_RUN(writeback_v2_data_job_reaches_actual_remote_ack);
+	UT_RUN(writeback_v2_data_job_preserves_partial_ack_and_master_cut);
+	UT_RUN(writeback_v2_data_job_rejects_unrelated_and_old_ack);
+	UT_RUN(writeback_v2_data_job_original_owner_retires_late_ack);
+	UT_RUN(writeback_v2_data_job_refuses_identity_and_capability_drift);
+	UT_RUN(writeback_v2_data_begin_never_falls_back_to_old_peer);
 	UT_RUN(writeback_v2_ack_preserves_selected_claim_ceiling);
 	UT_RUN(writeback_v2_ingress_refuses_old_wire_unready_peers_and_relation_offers);
 	UT_RUN(writeback_v2_reply_rechecks_identity_after_physical_completion);

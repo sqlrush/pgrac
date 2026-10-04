@@ -21,6 +21,255 @@
 #include "catalog/storage_xlog.h"
 #include "catalog/pg_tablespace_d.h"
 
+/* Run the actual sender, peer physical owner and reply transport. A failed
+ * decode is an assertion failure, followed by caller cleanup, never a skip. */
+static bool
+wb_v2_data_reply(ClusterPiWritebackMessageV2 *request, ClusterPiWritebackMessageV2 *reply)
+{
+	bool decoded = cluster_pi_writeback_decode_v2(wb_wire, wb_length, request);
+	UT_ASSERT(decoded);
+	if (!decoded)
+		return false;
+	wb_deliver(0, 1, wb_wire, wb_length);
+	wb_select(1, B_BG_WRITER);
+	UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+	UT_ASSERT(!wb_inputs_pinned[1]);
+	wb_select(1, B_LMON);
+	cluster_pi_writeback_lmon_tick_v1();
+	UT_ASSERT_EQ(wb_destination, 0);
+	decoded = cluster_pi_writeback_decode_v2(wb_wire, wb_length, reply);
+	UT_ASSERT(decoded);
+	if (decoded)
+		UT_ASSERT(cluster_pi_writeback_ack_matches_v2(request, reply));
+	return decoded;
+}
+
+UT_TEST(writeback_v2_data_job_reaches_actual_remote_ack)
+{
+	for (unsigned ceiling = 0; ceiling < 2; ceiling++) {
+		ClusterPageDataReceiptV1 *data = wb_setup();
+		ClusterPiWritebackJobV1 *job = NULL;
+		ClusterPiPhysicalAckV1 *ack = NULL;
+		ClusterWalSourceRef peer = wb_sources[1];
+		ClusterPiWritebackMessageV2 request, reply;
+		int32 node = -1;
+		peer.claim.max_config_generation += ceiling;
+		wb_local_caps = wb_peer_caps = PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		UT_ASSERT_EQ(
+			cluster_pi_writeback_begin_v1((const ClusterPageDataReceiptV1 **)&data, 1, &peer, &job),
+			CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		wb_select(0, B_LMON);
+		cluster_pi_writeback_lmon_tick_v1();
+		physical_pi_from_source(&wb_sources[1], 19);
+		if (!wb_v2_data_reply(&request, &reply))
+			goto done;
+		UT_ASSERT_EQ(request.facts[0].kind, CLUSTER_PI_WRITEBACK_DATA_V2);
+		UT_ASSERT_EQ(reply.count, 1);
+		UT_ASSERT_EQ(memcmp(&reply.peer, &peer, sizeof(peer)), 0);
+		UT_ASSERT_EQ(pi_discards, 1);
+		UT_ASSERT_EQ(wb_master_completions, 0);
+		wb_deliver(1, 0, wb_wire, wb_length);
+		wb_select(0, B_CHECKPOINTER);
+		UT_ASSERT_EQ(cluster_pi_writeback_poll_v1(job), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(cluster_page_data_pi_ack_import_v1(job, 0, data, &ack));
+		UT_ASSERT(cluster_page_data_pi_ack_read_v1(ack, data, &node));
+		UT_ASSERT_EQ(node, 1);
+		UT_ASSERT_EQ(wb_master_completions, 0); /* A wire ACK alone never clears master bits. */
+	done:
+		wb_select(0, B_CHECKPOINTER);
+		cluster_page_data_pi_ack_free_v1(&ack);
+		cluster_pi_writeback_release_v1(&job);
+		cluster_page_data_receipt_free_v1(&data);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_v2_data_job_preserves_partial_ack_and_master_cut)
+{
+	ClusterPageDataReceiptV1 *data[2];
+	ClusterPiWritebackJobV1 *job = NULL;
+	ClusterPiPhysicalAckV1 *ack = NULL;
+	ClusterPiWritebackMessageV2 request, reply;
+	data[0] = wb_setup();
+	data[1] = wb_second_page();
+	wb_local_caps = wb_peer_caps = PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+	UT_ASSERT_EQ(cluster_pi_writeback_begin_v1((const ClusterPageDataReceiptV1 **)data, 2,
+											   &wb_sources[1], &job),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	wb_select(0, B_LMON);
+	cluster_pi_writeback_lmon_tick_v1();
+	physical_pi_from_source(&wb_sources[1], 19);
+	pg_atomic_fetch_add_u32(&descriptors[1].bufferdesc.state, 1);
+	if (!wb_v2_data_reply(&request, &reply))
+		goto done;
+	UT_ASSERT_EQ(reply.count, 1);
+	UT_ASSERT_EQ(reply.facts[0].proof.data.binding.identity.forknum, VISIBILITYMAP_FORKNUM);
+	UT_ASSERT_EQ(pi_discards, 0);
+	wb_deliver(1, 0, wb_wire, wb_length);
+	wb_select(0, B_CHECKPOINTER);
+	wb_storage_cut.authority.transition_count++;
+	UT_ASSERT_EQ(cluster_pi_writeback_poll_v1(job), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT(!cluster_page_data_pi_ack_import_v1(job, 0, data[0], &ack));
+	UT_ASSERT(cluster_page_data_pi_ack_import_v1(job, 1, data[1], &ack));
+	cluster_page_data_pi_ack_free_v1(&ack);
+	wb_vm_cut.authority.transition_count++;
+	UT_ASSERT(!cluster_page_data_pi_ack_import_v1(job, 1, data[1], &ack));
+done:
+	wb_select(0, B_CHECKPOINTER);
+	pg_atomic_fetch_sub_u32(&descriptors[1].bufferdesc.state, 1);
+	cluster_page_data_pi_ack_free_v1(&ack);
+	cluster_pi_writeback_release_v1(&job);
+	cluster_page_data_receipt_free_v1(&data[0]);
+	cluster_page_data_receipt_free_v1(&data[1]);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(writeback_v2_data_job_rejects_unrelated_and_old_ack)
+{
+	ClusterPageDataReceiptV1 *data = wb_setup();
+	ClusterPiWritebackJobV1 *job;
+	ClusterPiWritebackMessageV2 request, reply, wrong;
+	ClusterPiWritebackMessageV1 old = { 0 };
+	uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
+	Size length;
+	wb_local_caps = wb_peer_caps = PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+	job = wb_start(data);
+	physical_pi_from_source(&wb_sources[1], 19);
+	if (!wb_v2_data_reply(&request, &reply))
+		goto done;
+	for (unsigned fault = 0; fault < 10; fault++) {
+		wrong = reply;
+		if (fault == 0)
+			wrong.nonce++;
+		if (fault == 1)
+			wrong.epoch++;
+		if (fault == 2)
+			wrong.peer.claim.claim_sha256[0]++;
+		if (fault == 3)
+			wrong.peer.claim.identity.origin_owner_incarnation++;
+		if (fault == 4)
+			wrong.peer.claim.max_config_generation++;
+		if (fault == 5)
+			wrong.facts[0].proof.data.binding.record_crc++;
+		if (fault == 6)
+			wrong.facts[0].proof.data.storage_cut.authority.transition_count++;
+		if (fault == 7) {
+			old.verb = reply.verb;
+			old.count = reply.count;
+			old.nonce = reply.nonce;
+			old.epoch = reply.epoch;
+			old.peer = reply.peer;
+			old.facts[0] = reply.facts[0].proof.data;
+			UT_ASSERT(cluster_pi_writeback_encode_v1(&old, bytes, sizeof(bytes), &length));
+		} else
+			UT_ASSERT(cluster_pi_writeback_encode_v2(&wrong, bytes, sizeof(bytes), &length));
+		if (fault == 9)
+			wb_peer_caps = 0;
+		wb_deliver(fault == 8 ? 2 : 1, 0, bytes, length);
+		UT_ASSERT(!wb_shared->outbound_complete);
+		wb_peer_caps = PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		wb_select(0, B_CHECKPOINTER);
+		UT_ASSERT_EQ(cluster_pi_writeback_poll_v1(job), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	}
+	UT_ASSERT(cluster_pi_writeback_encode_v2(&reply, bytes, sizeof(bytes), &length));
+	wb_deliver(1, 0, bytes, length);
+	wb_select(0, B_CHECKPOINTER);
+	UT_ASSERT_EQ(cluster_pi_writeback_poll_v1(job), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+done:
+	wb_select(0, B_CHECKPOINTER);
+	cluster_pi_writeback_release_v1(&job);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(writeback_v2_data_job_original_owner_retires_late_ack)
+{
+	ClusterPageDataReceiptV1 *data = wb_setup();
+	ClusterPiWritebackJobV1 *job, *next = NULL;
+	ClusterPiWritebackMessageV2 request, reply;
+	uint8 late[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
+	Size length;
+	wb_local_caps = wb_peer_caps = PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+	job = wb_start(data);
+	physical_pi_from_source(&wb_sources[1], 19);
+	if (!wb_v2_data_reply(&request, &reply))
+		goto done;
+	UT_ASSERT(cluster_pi_writeback_encode_v2(&reply, late, sizeof(late), &length));
+	wb_select(0, B_CHECKPOINTER);
+	UT_ASSERT_EQ(cluster_pi_writeback_begin_v1((const ClusterPageDataReceiptV1 **)&data, 1,
+											   &wb_sources[1], &next),
+				 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(next == NULL);
+	wb_resource_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT_EQ(wb_shared->outbound_pid, 0);
+	UT_ASSERT_EQ(cluster_pi_writeback_poll_v1(job), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	cluster_pi_writeback_release_v1(&job);
+	UT_ASSERT_EQ(cluster_pi_writeback_begin_v1((const ClusterPageDataReceiptV1 **)&data, 1,
+											   &wb_sources[1], &next),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	wb_deliver(1, 0, late, length);
+	wb_select(0, B_CHECKPOINTER);
+	UT_ASSERT_EQ(cluster_pi_writeback_poll_v1(next), CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(!wb_shared->outbound_complete);
+	wb_exit(0, (Datum)0);
+	UT_ASSERT_EQ(wb_shared->outbound_pid, 0);
+done:
+	wb_select(0, B_CHECKPOINTER);
+	cluster_pi_writeback_release_v1(&job);
+	cluster_pi_writeback_release_v1(&next);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(writeback_v2_data_job_refuses_identity_and_capability_drift)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterPageDataReceiptV1 *data = wb_setup();
+		ClusterPiWritebackJobV1 *job;
+		wb_local_caps = wb_peer_caps = PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		job = wb_start(data);
+		wb_select(0, B_CHECKPOINTER);
+		if (fault == 0)
+			wb_peer_caps = 0;
+		if (fault == 1)
+			wb_local_caps = 0;
+		if (fault == 2)
+			wb_boots[1]++;
+		if (fault == 3)
+			wb_epoch++;
+		if (fault == 4)
+			wb_stop = true;
+		UT_ASSERT_EQ(cluster_pi_writeback_poll_v1(job), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+		UT_ASSERT_EQ(wb_shared->outbound_pid, 0);
+		UT_ASSERT_EQ(wb_master_completions | pi_discards, 0);
+		cluster_pi_writeback_release_v1(&job);
+		cluster_page_data_receipt_free_v1(&data);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_v2_data_begin_never_falls_back_to_old_peer)
+{
+	ClusterPageDataReceiptV1 *data = wb_setup();
+	ClusterPiWritebackJobV1 *job = NULL;
+	wb_local_caps = PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+	wb_peer_caps = 0;
+	UT_ASSERT_EQ(cluster_pi_writeback_begin_v1((const ClusterPageDataReceiptV1 **)&data, 1,
+											   &wb_sources[1], &job),
+				 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT(job == NULL);
+	UT_ASSERT_EQ(wb_shared->outbound_pid | wb_sends | pi_discards, 0);
+	cluster_pi_writeback_release_v1(&job);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
 static void
 wb_v2_fixture(ClusterPiWritebackMessageV2 *m, const ClusterPiDataFactV1 *data)
 {
