@@ -33,6 +33,52 @@ test_first_open_finish(void)
 	test_gate_reset();
 }
 
+static unsigned test_semantic_completion_wakes;
+static uint64 test_semantic_completion_expected_seq;
+static ClusterSemanticActivationResult test_semantic_completion_expected_result;
+
+void
+cluster_lmon_marker_complete_wakeup(void)
+{
+	test_semantic_completion_wakes++;
+	if (test_semantic_completion_expected_seq != 0) {
+		UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->record_cas_completion_seq),
+					 test_semantic_completion_expected_seq);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&SemanticActivationShmem->record_cas_result),
+					 test_semantic_completion_expected_result);
+	}
+}
+
+UT_TEST(test_first_open_authority_completion_notifies_after_exact_publication)
+{
+	uint8 empty[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES] = {0};
+	uint64 seq;
+	int result;
+
+	test_first_open_reset();
+	test_semantic_completion_wakes = 0;
+	for (result = 0; result < 2; result++) {
+		UT_ASSERT(semantic_activation_record_read_mailbox_submit(&seq));
+		test_semantic_completion_expected_seq = seq;
+		test_semantic_completion_expected_result = result == 0
+			? CLUSTER_SEMANTIC_ACTIVATION_OK : CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
+		UT_ASSERT_EQ(test_semantic_completion_wakes, (unsigned)result);
+		UT_ASSERT(!cluster_semantic_activation_qvotec_complete_record_read(
+			seq + 1, CLUSTER_SEMANTIC_ACTIVATION_OK, true, empty));
+		UT_ASSERT(!cluster_semantic_activation_qvotec_complete_record_cas(
+			seq, CLUSTER_SEMANTIC_ACTIVATION_OK));
+		UT_ASSERT_EQ(test_semantic_completion_wakes, (unsigned)result);
+		UT_ASSERT(cluster_semantic_activation_qvotec_complete_record_read(
+			seq, test_semantic_completion_expected_result, result == 0, empty));
+		UT_ASSERT_EQ(test_semantic_completion_wakes, (unsigned)result + 1);
+		UT_ASSERT(!cluster_semantic_activation_qvotec_complete_record_read(
+			seq, test_semantic_completion_expected_result, result == 0, empty));
+		UT_ASSERT_EQ(test_semantic_completion_wakes, (unsigned)result + 1);
+	}
+	test_semantic_completion_expected_seq = 0;
+	test_first_open_finish();
+}
+
 /* A BARRIER from the coordinator and a SAMPLE ACK from another member use
  * different connections.  The former is evidence only until the latter
  * completes this receiver's exact initial-round sample. */

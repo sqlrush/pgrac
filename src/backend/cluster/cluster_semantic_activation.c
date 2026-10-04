@@ -30,6 +30,7 @@
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_lmon.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
@@ -10809,6 +10810,9 @@ semantic_activation_authority_mailbox_complete(ClusterSemanticAuthorityRequestKi
 	pg_atomic_write_u32(&SemanticActivationShmem->record_cas_result, (uint32)result);
 	pg_write_barrier();
 	pg_atomic_write_u64(&SemanticActivationShmem->record_cas_completion_seq, request_seq);
+	/* Wake the original consumer only after its exact result is visible.
+	 * The ordinary LMON tick remains the missed-notification backstop. */
+	cluster_lmon_marker_complete_wakeup();
 	return true;
 }
 

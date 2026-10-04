@@ -50,8 +50,16 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_lmon.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_writer.h"
+
+/* This link/lifecycle fixture does not run a semantic authority round. */
+void
+cluster_lmon_marker_complete_wakeup(void)
+{
+	abort();
+}
 
 /* This voting fixture never installs a native first-start writer. Keep
  * unrelated activation dependencies explicit and impossible to synthesize. */
