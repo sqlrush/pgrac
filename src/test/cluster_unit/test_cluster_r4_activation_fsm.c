@@ -3119,12 +3119,18 @@ test_member_early_sample_ack(int observation_gap)
 	cluster_semantic_activation_lmon_tick();
 	UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(0));
 
-	if (observation_gap == 4)
+	if (observation_gap >= 4 && observation_gap != 5)
 		test_gate_publish(4, 0, 0, CLUSTER_EPOCH_INITIAL, true);
 	else if (observation_gap == 5)
 		test_gate_publish(4, 0, 0, test_current_epoch, true);
 	else
 		test_gate_publish(4, 0, 0, test_current_epoch, false);
+	if (observation_gap == 6) {
+		/* A stale frame ahead of the live ACK may be consumed in the same
+		 * drain; readiness must be checked again before taking the next. */
+		UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
+		cluster_semantic_activation_ack_handler(&envelope, payload);
+	}
 	message.record_generation = 1;
 	message.round_nonce = UINT64_C(78);
 	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
@@ -3134,14 +3140,19 @@ test_member_early_sample_ack(int observation_gap)
 	else if (observation_gap == 2)
 		test_membership_snapshot_fail_at_call = test_membership_snapshot_calls + 2;
 	cluster_semantic_activation_lmon_tick();
-	if (observation_gap == 4 || observation_gap == 5) {
-		/* The original LMON still owns this frame while the local gate
-		 * catches up. It must not install a row before the exact request. */
+	if (observation_gap >= 4) {
+		/* The original stage-ahead owner keeps the exact frame while the
+		 * local gate catches up; no row exists before the exact request. */
 		UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(
-			&semantic_activation_ack_local_ingress), UINT32_C(1));
-		UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(0));
+			&semantic_activation_ack_local_ingress), UINT32_C(0));
+		UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(1));
 		UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
 		UT_ASSERT_EQ(table.observed_members_lo, UINT64_C(0));
+		if (observation_gap == 13) {
+			cluster_semantic_activation_ack_handler(&envelope, payload);
+			cluster_semantic_activation_lmon_tick();
+			UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(1));
+		}
 		test_gate_publish(6, 0, 0, test_current_epoch, false);
 		cluster_semantic_activation_lmon_tick();
 	}
@@ -3177,6 +3188,20 @@ test_member_early_sample_ack(int observation_gap)
 	message.round_nonce = UINT64_C(78);
 	message.target_feature_bitmap = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
 	message.admitted_members_lo = UINT64_C(0x0f);
+	switch (observation_gap) {
+	case 7: message.round_nonce++; break;
+	case 8: message.record_generation++; break;
+	case 9:
+		test_current_epoch++;
+		message.transition_epoch = test_current_epoch;
+		envelope.epoch = test_current_epoch;
+		test_gate_publish(8, 0, 0, test_current_epoch, false);
+		break;
+	case 10: test_terminal_nonmember = 1; break;
+	case 11: test_remote_admitted_incarnations[1]++; break;
+	case 12: test_peer_capability_generation++; break;
+	default: break;
+	}
 	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
 	envelope.source_node_id = 0;
 	cluster_semantic_activation_ack_handler(&envelope, payload);
@@ -3184,6 +3209,12 @@ test_member_early_sample_ack(int observation_gap)
 
 	UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(0));
 	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
+	if (observation_gap >= 7 && observation_gap <= 12) {
+		UT_ASSERT_EQ(table.observed_members_lo & UINT64_C(2), UINT64_C(0));
+		UT_ASSERT_EQ(table.flags & CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE, 0);
+		test_gate_reset();
+		return;
+	}
 	UT_ASSERT_EQ(table.stage, CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
 	UT_ASSERT_EQ(table.observed_members_lo, UINT64_C(0x0a));
 	UT_ASSERT(semantic_activation_ack_matches(
@@ -3228,6 +3259,22 @@ UT_TEST(test_sample_ack_waits_for_local_gate_epoch)
 UT_TEST(test_sample_ack_waits_for_local_empty_gate_proof)
 {
 	test_member_early_sample_ack(5);
+}
+
+UT_TEST(test_sample_ack_waits_after_stale_head_frame)
+{
+	test_member_early_sample_ack(6);
+}
+
+UT_TEST(test_retained_sample_ack_rechecks_round_and_peer_identity)
+{
+	for (int fault = 7; fault <= 12; fault++)
+		test_member_early_sample_ack(fault);
+}
+
+UT_TEST(test_retained_sample_ack_duplicate_during_gate_wait)
+{
+	test_member_early_sample_ack(13);
 }
 
 UT_TEST(test_93da2_member_retains_next_round_sample_ack_until_exact_request_arrives)
@@ -11287,11 +11334,14 @@ static void test_serving_finish_root(void);
 int
 main(void)
 {
-	UT_PLAN(359);
+	UT_PLAN(362);
 	UT_RUN(test_barrier_waits_for_both_late_peer_samples_in_either_order);
 	UT_RUN(test_staged_sample_ack_survives_idle_authority_gap);
 	UT_RUN(test_sample_ack_waits_for_local_gate_epoch);
 	UT_RUN(test_sample_ack_waits_for_local_empty_gate_proof);
+	UT_RUN(test_sample_ack_waits_after_stale_head_frame);
+	UT_RUN(test_retained_sample_ack_rechecks_round_and_peer_identity);
+	UT_RUN(test_retained_sample_ack_duplicate_during_gate_wait);
 	UT_RUN(test_sample_observable_drift_still_invalidates_retained_proof);
 	UT_RUN(test_early_sample_ack_waits_for_coherent_authority);
 	UT_RUN(test_early_sample_ack_survives_second_authority_read_gap);
