@@ -57,6 +57,7 @@ static ClusterWalSourceRef writer;
 static ClusterSpaceIdentity space_identity;
 static uint64 member_generation;
 static bool capture_ok, cap_ok, space_ok, generation_race;
+static int cap_missing_peer = -1, cap_zero_peer = -1, cap_change_cut_peer = -1;
 static int space_reads, send_calls, lock_calls;
 static int boot_change_phase;
 static bool cancel_wait;
@@ -149,10 +150,13 @@ bool cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceId
 bool cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required,
 	uint32 *word, uint32 *generation)
 {
-	Assert(peer_id == 1 && required == PGRAC_IC_HELLO_CAP_KO_SHARED_V2);
+	Assert(peer_id >= 0 && peer_id < CLUSTER_KO_SHARED_NODE_LIMIT
+		&& peer_id != cluster_node_id && required == PGRAC_IC_HELLO_CAP_KO_SHARED_V2);
 	*word = required;
-	*generation = 19;
-	return cap_ok;
+	*generation = peer_id == cap_zero_peer ? 0 : 19;
+	if (peer_id == cap_change_cut_peer)
+		member_generation++;
+	return cap_ok && peer_id != cap_missing_peer;
 }
 static void shared_send_tick(void)
 {
@@ -471,6 +475,7 @@ reset_test(void)
 	liveness_calls = 0;
 	cluster_shared_config = false;
 	capture_ok = cap_ok = space_ok = true;
+	cap_missing_peer = cap_zero_peer = cap_change_cut_peer = -1;
 	generation_race = cancel_wait = drive_shared_ack = false;
 	expecting_error = false;
 	reported_sqlstate = 0;
@@ -2464,10 +2469,115 @@ UT_TEST(test_native_drop_result_handoff_preserves_original_shared_obligation)
 	MyProcPid = pid;
 }
 
+static ClusterKoSharedMessageV2
+structure_projection_setup(void)
+{
+	cluster_node_id = 0;
+	reset_test();
+	cluster_shared_config = true;
+	MyBackendType = B_BG_WRITER;
+	formation.membership.membership_state[2] = CLUSTER_MEMBER_MEMBER;
+	formation.membership.last_admitted_incarnation[2] = 33;
+	return shared_request(123, current_epoch);
+}
+
+UT_TEST(test_structure_projection_keeps_original_cut_and_origin_route)
+{
+	ClusterKoSharedMessageV2 request = structure_projection_setup(), result, expected;
+	ClusterKoShared before = storage;
+	uint8 original_bytes[CLUSTER_KO_SHARED_V2_BYTES], projected_bytes[sizeof(original_bytes)];
+
+	UT_ASSERT(cluster_ko_shared_peer_projection_v2(&request, 2, &result));
+	expected = request;
+	expected.peer_node = 2;
+	expected.peer_boot = 33;
+	UT_ASSERT(memcmp(&expected, &result, sizeof(result)) == 0);
+	UT_ASSERT(cluster_ko_shared_encode_v2(&request, original_bytes, sizeof(original_bytes)));
+	UT_ASSERT(cluster_ko_shared_encode_v2(&result, projected_bytes, sizeof(projected_bytes)));
+	/* Only the actual peer coordinates change; the complete original KO
+	 * batch, old segment and canonical membership digest stay immutable. */
+	for (unsigned i = 0; i < sizeof(original_bytes); i++)
+		if ((i < 40 || i >= 48) && (i < 110 || i >= 112))
+			UT_ASSERT_EQ(original_bytes[i], projected_bytes[i]);
+	UT_ASSERT(cluster_ko_shared_peer_projection_v2(&request, 1, &result));
+	UT_ASSERT(memcmp(&request, &result, sizeof(result)) == 0);
+	UT_ASSERT_EQ(space_reads + flush_count + sync_count + drop_count + send_calls, 0);
+	UT_ASSERT_EQ(completion_allocations, 0);
+	UT_ASSERT(memcmp(&before, &storage, sizeof(storage)) == 0);
+}
+
+UT_TEST(test_structure_projection_preserves_origin_endpoint_and_local_role)
+{
+	ClusterKoSharedMessageV2 request = structure_projection_setup(), result;
+	cluster_node_id = 1;
+	writer.claim.identity.origin_node_id = 1;
+	writer.claim.identity.origin_owner_incarnation = 22;
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT(cluster_ko_shared_peer_projection_v2(&request, 2, &result));
+	UT_ASSERT_EQ(result.origin_node, 1);
+	UT_ASSERT_EQ(result.origin_boot, 22);
+	UT_ASSERT_EQ(result.peer_node, 2);
+	UT_ASSERT_EQ(result.peer_boot, 33);
+	UT_ASSERT(cluster_ko_shared_peer_projection_v2(&request, 0, &result));
+	UT_ASSERT(memcmp(&request, &result, sizeof(result)) == 0);
+	cluster_node_id = 0;
+}
+
+UT_TEST(test_structure_projection_refuses_changed_cut_capability_and_wrong_actor)
+{
+	for (unsigned fault = 0; fault < 27; fault++) {
+		ClusterKoSharedMessageV2 request = structure_projection_setup(), output, before;
+		int32 target = 2;
+		switch (fault) {
+		case 0: request.origin_boot++; break;
+		case 1: request.peer_boot++; break;
+		case 2: request.epoch++; break;
+		case 3: request.key.system_identifier++; break;
+		case 4: request.key.database_incarnation++; break;
+		case 5: request.key.storage_uuid[1]++; break;
+		case 6: request.member_digest[0] ^= 1; break;
+		case 7: cap_missing_peer = 1; break;
+		case 8: cap_missing_peer = 2; break;
+		case 9: cap_zero_peer = 1; break;
+		case 10: cap_zero_peer = 2; break;
+		case 11: cap_change_cut_peer = 2; break;
+		case 12: generation_race = true; break;
+		case 13: formation.membership.last_admitted_incarnation[2]++; break;
+		case 14: formation.membership.membership_state[2] = CLUSTER_MEMBER_DEAD; break;
+		case 15: capture_ok = false; break;
+		case 16: target = 0; break;
+		case 17: target = -1; break;
+		case 18: target = CLUSTER_KO_SHARED_NODE_LIMIT; break;
+		case 19: MyBackendType = B_BACKEND; break;
+		case 20: MyBackendType = B_LMON; break;
+		case 21: CurrentResourceOwner = NULL; break;
+		case 22: CritSectionCount = 1; break;
+		case 23: cluster_shared_config = false; break;
+		case 24: request.verb = CLUSTER_KO_SHARED_ACK; request.status = CLUSTER_KO_SHARED_DONE; break;
+		case 25: writer.claim.identity.origin_owner_incarnation++; break;
+		case 26:
+			cluster_node_id = 2;
+			writer.claim.identity.origin_node_id = 2;
+			writer.claim.identity.origin_owner_incarnation = 33;
+			target = 0;
+			break;
+		}
+		memset(&before, 0xa5, sizeof(before));
+		output = before;
+		UT_ASSERT(!cluster_ko_shared_peer_projection_v2(&request, target, &output));
+		UT_ASSERT(memcmp(&output, &before, sizeof(output)) == 0);
+		UT_ASSERT_EQ(space_reads + flush_count + sync_count + drop_count + send_calls, 0);
+		UT_ASSERT_EQ(completion_allocations, 0);
+		CritSectionCount = 0;
+		cluster_node_id = 0;
+	}
+	UT_ASSERT(!cluster_ko_shared_peer_projection_v2(NULL, 1, NULL));
+}
+
 int
 main(void)
 {
-	UT_PLAN(61);
+	UT_PLAN(64);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
@@ -2529,6 +2639,9 @@ main(void)
 	UT_RUN(test_native_drop_effect_is_once_only_after_original_top_commit);
 	UT_RUN(test_native_drop_effect_refuses_wrong_lifetime_scope_or_handle);
 	UT_RUN(test_native_drop_result_handoff_preserves_original_shared_obligation);
+	UT_RUN(test_structure_projection_keeps_original_cut_and_origin_route);
+	UT_RUN(test_structure_projection_preserves_origin_endpoint_and_local_role);
+	UT_RUN(test_structure_projection_refuses_changed_cut_capability_and_wrong_actor);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -268,6 +268,13 @@ extern bool cluster_ko_shared_structure_observation_v2(uint32 slot, uint64 seria
  * acknowledgement, PI retirement or GC authority is returned here. */
 extern bool cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer,
 	uint64 *serial, struct ClusterPiWritebackFactV2 *out);
+/* Reproject an original request inside its unchanged member/boot cut for a
+ * background recipient. Sending back to the origin retains the original
+ * origin -> master request, never a self request. This only returns wire
+ * values: it cannot create a completion, an authenticated notice or PI/GC
+ * authority. Refusal leaves out unchanged and performs no page or network I/O. */
+extern bool cluster_ko_shared_peer_projection_v2(const ClusterKoSharedMessageV2 *request,
+	int32 peer, ClusterKoSharedMessageV2 *out);
 /* Borrow the original native COMMIT-DROP owner after the top commit callback
  * and before pending-delete cleanup ends. This is not a physical deletion or
  * PI certificate.

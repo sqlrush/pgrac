@@ -531,6 +531,53 @@ ko_shared_space_current(const ClusterKoSharedMessageV2 *message)
 		&& memcmp(identity.incarnation, message->incarnation, 16) == 0;
 }
 
+bool
+cluster_ko_shared_peer_projection_v2(const ClusterKoSharedMessageV2 *request,
+	int32 peer, ClusterKoSharedMessageV2 *out)
+{
+	ClusterKoSharedMessageV2 current, projected;
+	ClusterWalSourceRef writer_before, writer_after;
+	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], generation, sampled_generation;
+	uint32 capabilities, capability_generation;
+	uint8 original[CLUSTER_KO_SHARED_V2_BYTES], observed[sizeof(original)];
+
+	if (request == NULL || out == NULL || peer < 0 || peer >= CLUSTER_KO_SHARED_NODE_LIMIT
+		|| peer == cluster_node_id || request->verb != CLUSTER_KO_SHARED_REQUEST
+		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
+		|| (MyBackendType != B_BG_WRITER && MyBackendType != B_CHECKPOINTER)
+		|| CurrentResourceOwner == NULL || CritSectionCount != 0)
+		return false;
+	generation = cluster_membership_cut_generation();
+	if (generation == 0 || !cluster_wal_thread_current_v2_ref(&writer_before)
+		|| !ko_shared_control_current(request))
+		return false;
+	current = *request;
+	if (!ko_shared_members(&current, boots, &sampled_generation)
+		|| sampled_generation != generation || boots[peer] == 0
+		|| !cluster_ko_shared_encode_v2(request, original, sizeof(original))
+		|| !cluster_ko_shared_encode_v2(&current, observed, sizeof(observed))
+		|| memcmp(original, observed, sizeof(original)) != 0
+		|| !cluster_sf_peer_capability_word_sample(peer, PGRAC_IC_HELLO_CAP_KO_SHARED_V2,
+			&capabilities, &capability_generation)
+		|| capability_generation == 0
+		|| (capabilities & PGRAC_IC_HELLO_CAP_KO_SHARED_V2) == 0)
+		return false;
+	projected = *request;
+	/* An origin recipient verifies the same original request that the
+	 * master received. It must never receive a fabricated self request. */
+	if (peer != request->origin_node) {
+		projected.peer_node = peer;
+		projected.peer_boot = boots[peer];
+	}
+	if (!cluster_ko_shared_encode_v2(&projected, observed, sizeof(observed))
+		|| !cluster_wal_thread_current_v2_ref(&writer_after)
+		|| memcmp(&writer_before, &writer_after, sizeof(writer_before)) != 0
+		|| !cluster_membership_cut_generation_current(generation))
+		return false;
+	*out = projected;
+	return true;
+}
+
 /* The origin's local scope also covers a one-member cohort, for which no
  * remote message can be encoded. A completed barrier remains tied to the old
  * segment; publishing the structural successor does not rewrite that fact. */
