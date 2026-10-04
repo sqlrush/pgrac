@@ -307,6 +307,50 @@ UT_TEST(test_native_bind_uses_complete_header_identity_and_durable_slot)
 	UT_ASSERT_EQ(applies + skips, 0);
 }
 
+/* PU-D-9 (F-D-30): BIND redo over the same entity's durable terminal stamp
+ * skips without writing; another xid at that wrap still PANICs. */
+UT_TEST(test_native_bind_replay_over_own_terminal_skips)
+{
+	static const uint8 terminal[] = { TT_SLOT_COMMITTED, TT_SLOT_ABORTED };
+
+	for (int i = 0; i < (int)lengthof(terminal); i++) {
+		UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)disk.data;
+		TTSlot *slot = &header->tt_slots[4];
+		PGAlignedBlock before;
+
+		cluster_undo_segment_make_header_bytes(513, 3, disk.data);
+		header->wrap_count = 9;
+		slot->xid = 701;
+		slot->wrap = 2;
+		slot->flags = TT_FLAGS_RESERVED;
+		slot->status = terminal[i];
+		slot->commit_scn = terminal[i] == TT_SLOT_COMMITTED ? 804 : InvalidScn;
+		before = disk;
+		reset_io();
+		expect_panic = false;
+		if (setjmp(panic_jump) == 0)
+			cluster_tt_durable_redo_bind_slot(3, 513, 9, 4, 2, 701);
+		else
+			UT_ASSERT(false);
+		UT_ASSERT_EQ(writes + syncs + applies, 0);
+		UT_ASSERT_EQ(skips, 1);
+		UT_ASSERT_EQ(closes, 1);
+		UT_ASSERT(memcmp(disk.data, before.data, BLCKSZ) == 0);
+
+		reset_io();
+		expect_panic = true;
+		if (setjmp(panic_jump) == 0) {
+			cluster_tt_durable_redo_bind_slot(3, 513, 9, 4, 2, 702);
+			UT_ASSERT(false);
+		}
+		expect_panic = false;
+		UT_ASSERT_EQ(writes + syncs + applies + skips, 0);
+		UT_ASSERT(memcmp(disk.data, before.data, BLCKSZ) == 0);
+		if (ut_current_failed)
+			printf("# terminal status %u\n", terminal[i]);
+	}
+}
+
 UT_TEST(test_private_abort_head_release_and_exact_stale_results)
 {
 	for (int exact = 0; exact < 2; exact++) {
@@ -613,10 +657,11 @@ UT_TEST(test_native_exact_commit_rejects_bad_header_before_write)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_native_exact_commit_rejects_bad_header_before_write);
 	UT_RUN(test_private_abort_head_release_and_exact_stale_results);
 	UT_RUN(test_native_bind_uses_complete_header_identity_and_durable_slot);
+	UT_RUN(test_native_bind_replay_over_own_terminal_skips);
 	UT_RUN(test_private_tt_header_sequence_and_unrelated_bytes);
 	UT_RUN(test_private_tt_header_refuses_identity_and_conflicting_predecessor);
 	UT_RUN(test_native_init_validates_real_image_before_file_mutation);

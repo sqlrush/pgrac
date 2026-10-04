@@ -1466,6 +1466,61 @@ UT_TEST(test_active_bind_predecessor_table_is_exact)
 				 CLUSTER_TT_ACTIVE_CORRUPT);
 }
 
+/*
+ * PU-D-9 (F-D-30): replaying a BIND over the same entity's later terminal
+ * stamp (same xid, same wrap, legal terminal shape) is a stale record, not a
+ * conflict: recovery starts at a checkpoint's redo pointer and the slot may
+ * already be durable past the record.  Another xid at the same wrap, or a wrap
+ * that does not follow, still conflicts.
+ */
+UT_TEST(test_active_bind_over_own_later_terminal_is_stale)
+{
+	static const uint8 terminal[] = { TT_SLOT_COMMITTED, TT_SLOT_ABORTED, TT_SLOT_RECYCLABLE };
+	TTSlot slot;
+
+	for (int i = 0; i < (int)lengthof(terminal); i++) {
+		memset(&slot, 0, sizeof(slot));
+		slot.xid = 100;
+		slot.wrap = 5;
+		slot.flags = TT_FLAGS_RESERVED;
+		slot.status = terminal[i];
+		slot.commit_scn = terminal[i] == TT_SLOT_COMMITTED ? scn_encode(1, 42) : InvalidScn;
+		UT_ASSERT_EQ(cluster_tt_active_transition_decide(&slot, 7, 7, 100, 5, true),
+					 CLUSTER_TT_ACTIVE_STALE);
+		slot.flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
+		UT_ASSERT_EQ(cluster_tt_active_transition_decide(&slot, 7, 7, 100, 5, true),
+					 CLUSTER_TT_ACTIVE_STALE);
+		slot.flags = TT_FLAGS_RESERVED;
+		/* Another entity at the same wrap, or a wrap gap, still conflicts. */
+		UT_ASSERT_EQ(cluster_tt_active_transition_decide(&slot, 7, 7, 200, 5, true),
+					 CLUSTER_TT_ACTIVE_CONFLICT);
+		UT_ASSERT_EQ(cluster_tt_active_transition_decide(&slot, 7, 7, 100, 7, true),
+					 CLUSTER_TT_ACTIVE_CONFLICT);
+		/* The next wrap is a legal new binding. */
+		UT_ASSERT_EQ(cluster_tt_active_transition_decide(&slot, 7, 7, 300, 6, true),
+					 CLUSTER_TT_ACTIVE_APPLY);
+		/* An unauthorized identity, a bad shape or an older generation never
+		 * becomes stale through this rule. */
+		UT_ASSERT_EQ(cluster_tt_active_transition_decide(&slot, 7, 7, 100, 5, false),
+					 CLUSTER_TT_ACTIVE_CONFLICT);
+		UT_ASSERT_EQ(cluster_tt_active_transition_decide(&slot, 6, 7, 100, 5, true),
+					 CLUSTER_TT_ACTIVE_CORRUPT);
+		slot.flags = UINT8_C(0x80);
+		UT_ASSERT_EQ(cluster_tt_active_transition_decide(&slot, 7, 7, 100, 5, true),
+					 CLUSTER_TT_ACTIVE_CORRUPT);
+		if (ut_current_failed)
+			printf("# terminal status %u\n", terminal[i]);
+	}
+	/* A COMMITTED stamp without its SCN is not a legal terminal shape. */
+	memset(&slot, 0, sizeof(slot));
+	slot.xid = 100;
+	slot.wrap = 5;
+	slot.flags = TT_FLAGS_RESERVED;
+	slot.status = TT_SLOT_COMMITTED;
+	UT_ASSERT_EQ(cluster_tt_active_transition_decide(&slot, 7, 7, 100, 5, true),
+				 CLUSTER_TT_ACTIVE_CORRUPT);
+}
+
 UT_TEST(test_terminal_transition_requires_same_exact_active_entity)
 {
 	TTSlot slot;
@@ -3267,7 +3322,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(104);
+	UT_PLAN(105);
 
 	UT_RUN(test_layout_sizes);
 
@@ -3297,6 +3352,7 @@ main(int argc, char **argv)
 	UT_RUN(test_read_exact_stable_rejects_torn_slot);
 	UT_RUN(test_read_exact_stable_rejects_either_io_failure);
 	UT_RUN(test_active_bind_predecessor_table_is_exact);
+	UT_RUN(test_active_bind_over_own_later_terminal_is_stale);
 	UT_RUN(test_terminal_transition_requires_same_exact_active_entity);
 	UT_RUN(test_active_publish_wal_precedes_identical_disk_and_resident_successor);
 	UT_RUN(test_active_publish_waits_for_released_origin_notification_before_bind);
