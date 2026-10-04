@@ -12768,11 +12768,19 @@ cluster_semantic_normal_start_prepare(bool clean, int prepared_count, const char
 	image.own_redo_lsn = normal_start_checkpoint.redo;
 	image.own_next_full_xid = normal_start_checkpoint.next_full_xid;
 	image.own_checkpoint_scn = normal_start_checkpoint.scn;
-	if (cluster_shared_config
-		&& (cluster_wal_startup_clean_input_v1(&image.clean_input) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			|| !cluster_reconfig_snapshot_initial_clean_formation(&image.clean_formation)
-			|| !normal_start_clean_input_valid(&image, &record)))
-		return normal_start_prepare_failed(failure, "NORMAL_START_CLEAN_INPUT_UNPROVEN");
+	if (cluster_shared_config) {
+		ClusterControlRootResult result = cluster_wal_startup_clean_input_v1(&image.clean_input);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			ereport(LOG, (errmsg("cluster normal startup CLEAN input unavailable"),
+				errdetail("node=%d epoch=%llu result=%d", cluster_node_id,
+					(unsigned long long)image.epoch, (int)result)));
+			return normal_start_prepare_failed(failure, "NORMAL_START_CLEAN_INPUT_READ_UNPROVEN");
+		}
+		if (!cluster_reconfig_snapshot_initial_clean_formation(&image.clean_formation))
+			return normal_start_prepare_failed(failure, "NORMAL_START_CLEAN_FORMATION_UNPROVEN");
+		if (!normal_start_clean_input_valid(&image, &record))
+			return normal_start_prepare_failed(failure, "NORMAL_START_CLEAN_BRIDGE_UNPROVEN");
+	}
 	if (!normal_start_identity_current(&image) || !normal_start_closed_snapshot(&before))
 		return normal_start_prepare_failed(failure, "NORMAL_START_NOT_EXCLUSIVE");
 	if (cluster_qvotec_bootstrap_read_undo_root_descriptor(image.system_identifier, image.pgrd)

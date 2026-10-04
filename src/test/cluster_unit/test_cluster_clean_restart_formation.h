@@ -156,6 +156,7 @@ UT_TEST(test_clean_formation_missing_original_input_cannot_classify_ready)
 	test_clean_formation_input();
 	test_clean_input_result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	UT_ASSERT(!cluster_semantic_normal_start_prepare(true, 0, &failure));
+	UT_ASSERT_STR_EQ(failure, "NORMAL_START_CLEAN_INPUT_READ_UNPROVEN");
 	UT_ASSERT_EQ(cluster_semantic_normal_start_state(), CLUSTER_NORMAL_START_FAILED);
 	UT_ASSERT(!semantic_activation_restart.local_ready);
 	cluster_shared_config = false;
