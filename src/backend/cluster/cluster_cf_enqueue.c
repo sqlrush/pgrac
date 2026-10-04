@@ -263,7 +263,16 @@ acquire:
 		if (slot->owner.state == CLUSTER_LOCK_OWNER_EMPTY)
 			memset(slot, 0, sizeof(*slot));
 		cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
-		ereport(LOG, (errmsg("cluster CF acquire failed (mode %d, result %d)", (int)mode, (int)r)));
+		ereport(LOG,
+				(errmsg("cluster CF acquire failed (mode %d, result %d)", (int)mode, (int)r),
+				 errdetail("PGRAC_FAMILY=CF_ACQUIRE request=" UINT64_FORMAT
+						   " epoch=" UINT64_FORMAT " master_generation=" UINT64_FORMAT
+						   " owner_state=%d registration=%s",
+						   req->request_id, req->holder.cluster_epoch, req->master_gen_snapshot,
+						   (int)slot->owner.state,
+						   req->registration_failure_reason != NULL
+							   ? req->registration_failure_reason
+							   : "UNREPORTED")));
 		return false;
 	}
 }
