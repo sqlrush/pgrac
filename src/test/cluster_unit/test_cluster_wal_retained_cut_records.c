@@ -33,6 +33,7 @@
 
 #include "../../backend/cluster/cluster_wal_retained_cut.c"
 #include "../../backend/cluster/cluster_wal_retained_side.c"
+#include "../../backend/cluster/cluster_wal_retained_generation.c"
 
 #include "access/xact.h"
 #include "catalog/pg_tablespace_d.h"

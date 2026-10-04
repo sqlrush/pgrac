@@ -2,8 +2,9 @@
  *
  * cluster_wal_retained_cut_internal.h
  *	  Private state of the retention lower census (S07), shared by its page
- *	  core (cluster_wal_retained_cut.c) and its SIDE and native-record
- *	  classification (cluster_wal_retained_side.c).
+ *	  core (cluster_wal_retained_cut.c), its SIDE and native-record
+ *	  classification (cluster_wal_retained_side.c) and its older-generation
+ *	  judgement (cluster_wal_retained_generation.c).
  *
  * Portions Copyright (c) 2026, pgrac contributors
  *
@@ -144,5 +145,9 @@ extern void retained_side_record(RetainedCutWork *work, XLogReaderState *record,
 extern RfPageProofDetailV1 retained_native_record(RetainedCutWork *work, XLogReaderState *record,
 												  RfPageProofDetailV1 refused);
 extern void retained_side_fold(RetainedCutWork *work);
+
+/* cluster_wal_retained_generation.c */
+extern void retained_prunable(RetainedCutWork *work, ClusterWalInputsV1 *inputs,
+							  ClusterWalRetainedCutV1 *out);
 
 #endif /* CLUSTER_WAL_RETAINED_CUT_INTERNAL_H */

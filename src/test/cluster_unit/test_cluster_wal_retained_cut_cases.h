@@ -788,4 +788,85 @@ UT_TEST(test_retained_cut_side_unkeyed_records_are_kept_by_class)
 	}
 }
 
+/* ---- R-A20: older generations ---- */
+static uint32
+add_old_generation(uint16 thread, uint64 incarnation, uint8 lifecycle, uint64 closed_seq,
+				   XLogRecPtr tail)
+{
+	uint32 i = add_item(thread, lifecycle, 0x100, tail, tail, false);
+
+	items[i].source.claim.identity.origin_owner_incarnation = incarnation;
+	items[i].source.claim.claim_sha256[1] = (uint8)incarnation;
+	items[i].checkpoint.identity = items[i].source.claim.identity;
+	items[i].checkpoint.root_publish_seq = closed_seq;
+	return i;
+}
+
+static bool
+cut_names(const ClusterWalRetainedCutV1 *cut, uint32 item)
+{
+	for (uint32 i = 0; i < Min(cut->prunable_generations, CLUSTER_WAL_RETAINED_PRUNABLE_MAX); i++)
+		if (memcmp(&cut->prunable[i], &items[item].checkpoint.identity, sizeof(cut->prunable[i]))
+			== 0)
+			return true;
+	return false;
+}
+
+/* An older generation is reported deletable only if it is CLOSED, nothing
+ * in it is needed, and every running instance of another thread restarted
+ * after it closed.  Self's old generation closed at 40; the peer's own
+ * predecessor (when present) closed at 50, or 35 in variant 1, where the
+ * peer's generation is the deletable one instead (self restarted after it). */
+UT_TEST(test_retained_cut_older_generation_deletable_only_when_proven)
+{
+	for (int variant = 0; variant < 10; variant++) {
+		uint32 self, peer, old, peer_old = UINT32_MAX;
+		ClusterWalRetainedCutV1 cut;
+		RfPageProofDetailV1 detail;
+		bool deletable = variant == 0 || variant == 6 || variant == 8 || variant == 9;
+
+		two_writers(&self, &peer);
+		add_record(self, 0x1000, 0x1100, 100, 1, 2);
+		old = add_old_generation(1, 20,
+								 variant == 3 ? CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+											  : CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED,
+								 40, 0x800);
+		if (variant == 1)
+			peer_old = add_old_generation(2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 35, 0x900);
+		else if (variant == 7) { /* the peer's predecessor is an initializer terminal */
+			ClusterWalInputV1 *terminal = &items[add_old_generation(
+				2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 50, 0x900)];
+
+			terminal->kind = CLUSTER_WAL_INPUT_INITIALIZER_TERMINAL;
+			terminal->first_segment = 0x1000000;
+		} else if (variant == 8) { /* only the peer's latest restart counts */
+			add_old_generation(2, 25, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 30, 0x900);
+			add_old_generation(2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 50, 0x900);
+		} else if (variant == 9) /* both closed by one publication */
+			add_old_generation(2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 40, 0x900);
+		else if (variant != 2 && variant != 6) /* variant 2: the peer never restarted */
+			add_old_generation(2, 30, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 50, 0x900);
+		if (variant == 4) { /* an obligation needs one of its edges */
+			add_record(old, 0x200, 0x300, 700, 1, 2);
+			add_record(self, 0x3000, 0x3100, 700, 1, 3);
+		} else if (variant == 5) { /* it ends a relation incarnation */
+			FixtureRecord *r = add_record(old, 0x200, 0x280, InvalidOid, 0, 9);
+
+			r->space_rel = 901;
+			r->space_mask = 3;
+		} else if (variant == 6) /* the peer is not running at all */
+			items[peer].checkpoint.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+		UT_ASSERT_EQ(compute(&cut, &detail), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(cut_names(&cut, old), deletable);
+		/* Variants 1, 8 and 9 also free a peer generation self outlived. */
+		UT_ASSERT_EQ(cut.prunable_generations,
+					 (deletable ? 1u : 0u)
+						 + (variant == 1 || variant == 8 || variant == 9 ? 1u : 0u));
+		if (variant == 1)
+			UT_ASSERT(cut_names(&cut, peer_old));
+		if (ut_current_failed)
+			printf("# older generation variant %d\n", variant);
+	}
+}
+
 #endif /* TEST_CLUSTER_WAL_RETAINED_CUT_CASES_H */

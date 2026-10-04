@@ -573,6 +573,7 @@ retained_census(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluster
 	out->local_pi_floor = work->local_pi.floor;
 	out->local_pi_bounded = work->local_pi.bounded;
 	out->local_pi_unbounded = work->local_pi.unbounded;
+	retained_prunable(work, inputs, out);
 	if (out->pin == CLUSTER_WAL_RETAINED_PIN_STRUCTURE)
 		retained_structure_pins++;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -697,13 +698,13 @@ retained_report_readings(const ClusterWalRetainedCutV1 *cut, ClusterControlRootR
 				LSN_FORMAT_ARGS(cut->native_redo)),
 		 errdetail("result %d, %llu records, %llu history edges, %llu needed, spool %llu "
 				   "bytes, census %lld ms, publication %lld ms, local PI floor %X/%X "
-				   "(%llu bounded, %llu unbounded).",
+				   "(%llu bounded, %llu unbounded), %u older generations deletable.",
 				   (int)result, (unsigned long long)cut->records,
 				   (unsigned long long)cut->history_edges, (unsigned long long)cut->retained_edges,
 				   (unsigned long long)cut->spool_bytes, (long long)(census_us / 1000),
 				   (long long)(publication_us / 1000), LSN_FORMAT_ARGS(cut->local_pi_floor),
 				   (unsigned long long)cut->local_pi_bounded,
-				   (unsigned long long)cut->local_pi_unbounded)));
+				   (unsigned long long)cut->local_pi_unbounded, cut->prunable_generations)));
 }
 
 void

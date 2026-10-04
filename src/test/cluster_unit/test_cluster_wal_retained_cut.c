@@ -46,6 +46,7 @@ static int log_count;
 
 #include "../../backend/cluster/cluster_wal_retained_cut.c"
 #include "../../backend/cluster/cluster_wal_retained_side.c"
+#include "../../backend/cluster/cluster_wal_retained_generation.c"
 
 #include "unit_test.h"
 
@@ -187,7 +188,7 @@ BufFileClose(BufFile *file)
 }
 
 /* ---- the retained input scope ---- */
-#define MAX_ITEMS 4
+#define MAX_ITEMS 6
 #define MAX_RECORDS 700
 
 typedef struct FixtureRecord {
@@ -565,7 +566,7 @@ compute(ClusterWalRetainedCutV1 *cut, RfPageProofDetailV1 *detail)
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(21);
 	UT_RUN(test_retained_cut_moves_to_native_redo_without_obligations);
 	UT_RUN(test_retained_cut_peer_obligation_keeps_successors_on_its_page);
 	UT_RUN(test_retained_cut_hot_page_releases_predecessors);
@@ -586,6 +587,7 @@ main(void)
 	UT_RUN(test_retained_cut_side_undo_blocks_are_keyed);
 	UT_RUN(test_retained_cut_side_prepared_transactions_are_keyed);
 	UT_RUN(test_retained_cut_side_unkeyed_records_are_kept_by_class);
+	UT_RUN(test_retained_cut_older_generation_deletable_only_when_proven);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
