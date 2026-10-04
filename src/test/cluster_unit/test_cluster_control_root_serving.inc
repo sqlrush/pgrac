@@ -509,6 +509,120 @@ serving_append_shutdown(const ControlRootImage *root, unsigned node, ControlFile
 	v2_checkpoint_prefix_write();
 }
 
+static void
+serving_append_live_record(const ControlRootImage *root, unsigned node)
+{
+	const ClusterControlRootSnapshot *prior = &root->records[node];
+	XLogRecord record = { 0 };
+	char path[MAXPGPATH];
+	int fd;
+
+	record.xl_tot_len = SizeOfXLogRecord;
+	record.xl_prev = prior->tail_last_record_lsn;
+	record.xl_rmid = RM_XLOG_ID;
+	record.xl_info = XLOG_NOOP;
+	INIT_CRC32C(record.xl_crc);
+	COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(record.xl_crc);
+	UT_ASSERT(prior->validated_tail_lsn_exclusive % XLOG_BLCKSZ + sizeof(record) < XLOG_BLCKSZ);
+	v2_checkpoint_wal_path(&prior->identity, prior->validated_tail_lsn_exclusive,
+						   prior->checkpoint_tli, path);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(
+		pwrite(fd, &record, sizeof(record), prior->validated_tail_lsn_exclusive % wal_segment_size),
+		sizeof(record));
+	UT_ASSERT_EQ(fsync(fd), 0);
+	UT_ASSERT_EQ(close(fd), 0);
+}
+
+UT_TEST(test_serving_startup_checkpoint_remains_active_after_live_wal)
+{
+	uint8 before[66048], original, corrupt;
+	ControlRootImage root;
+	ClusterControlRootFileToken token;
+	ClusterControlRootStopObservation stop;
+	char path[MAXPGPATH];
+	int fd;
+
+	serving_fixture(before, &root);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &token),
+				 0);
+	/* An actual full-sized live stream has grown since the installed startup
+	 * checkpoint. A peer's stop observation must still classify it ACTIVE. */
+	serving_append_live_record(&root, 0);
+	if (ut_current_failed)
+		return;
+	for (unsigned node = 0; node <= 3; node += 3) {
+		cluster_node_id = node;
+		test_self_incarnation = test_membership_incarnation = test_reserve_cut.observer[node];
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_stop_phase_read(node + 1, test_self_incarnation, &stop), 0);
+		UT_ASSERT_EQ(stop.phase, CLUSTER_CONTROL_ROOT_STOP_ACTIVE);
+		UT_ASSERT_EQ(stop.members[0].phase, CLUSTER_CONTROL_ROOT_STOP_ACTIVE);
+		UT_ASSERT_EQ(stop.members[3].phase, CLUSTER_CONTROL_ROOT_STOP_ACTIVE);
+	}
+	/* Prefix qualification must still decode the selected checkpoint and CRC. */
+	v2_checkpoint_wal_path(&root.records[0].identity, root.records[0].tail_last_record_lsn,
+						   root.records[0].checkpoint_tli, path);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pread(fd, &original, 1, root.records[0].tail_last_record_lsn % wal_segment_size),
+				 1);
+	corrupt = original ^ 1;
+	UT_ASSERT_EQ(pwrite(fd, &corrupt, 1, root.records[0].tail_last_record_lsn % wal_segment_size),
+				 1);
+	UT_ASSERT_EQ(fsync(fd), 0);
+	memset(&stop, 0x71, sizeof(stop));
+	UT_ASSERT(cluster_control_root_v3_stop_phase_read(4, test_self_incarnation, &stop) != 0);
+	UT_ASSERT(v2_zero(&stop, sizeof(stop)));
+	UT_ASSERT_EQ(pwrite(fd, &original, 1, root.records[0].tail_last_record_lsn % wal_segment_size),
+				 1);
+	UT_ASSERT_EQ(fsync(fd), 0);
+	UT_ASSERT_EQ(close(fd), 0);
+	test_reserve_mode = false;
+	cluster_node_id = 0;
+}
+
+UT_TEST(test_serving_shutdown_checkpoint_still_requires_terminal_wal)
+{
+	uint8 before[66048];
+	ControlRootImage root, observed;
+	ClusterControlRootFileToken token;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootStopObservation stop;
+	ControlFileData candidate, view;
+
+	serving_fixture(before, &root);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(cluster_control_root_v3_serving_poll(&serving_open, serving_descriptor, &token),
+				 0);
+	serving_shutdown_owner(&root, 0);
+	test_cf_mode = test_actual_cf = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&root.records[0].identity, &observed,
+															&candidate, &token),
+				 0);
+	test_cf_mode = test_actual_cf = NoLock;
+	serving_append_shutdown(&root, 0, &candidate);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_shutdown_checkpoint_publish(
+			&root.records[0].identity, &candidate, test_checkpoint_end, &snapshot, &token, &view),
+		0);
+	UT_ASSERT_EQ(cluster_control_root_v3_stop_phase_read(1, test_self_incarnation, &stop), 0);
+	UT_ASSERT_EQ(stop.phase, CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT);
+	root.records[0] = snapshot;
+	serving_append_live_record(&root, 0);
+	if (ut_current_failed)
+		return;
+	memset(&stop, 0x71, sizeof(stop));
+	UT_ASSERT(cluster_control_root_v3_stop_phase_read(1, test_self_incarnation, &stop) != 0);
+	UT_ASSERT(v2_zero(&stop, sizeof(stop)));
+	test_reserve_mode = false;
+}
+
 UT_TEST(test_serving_startup_anchor_cannot_close_the_new_writer)
 {
 	uint8 before[66048];

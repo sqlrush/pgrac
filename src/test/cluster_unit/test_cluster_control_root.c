@@ -21950,8 +21950,10 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 	if (getenv("PGRAC_PRE2_TEST_SERVING") != NULL) {
-		UT_PLAN(8);
+		UT_PLAN(10);
 		UT_RUN(test_serving_requires_coordinator_publish_then_startup_is_active);
+		UT_RUN(test_serving_startup_checkpoint_remains_active_after_live_wal);
+		UT_RUN(test_serving_shutdown_checkpoint_still_requires_terminal_wal);
 		UT_RUN(test_serving_refuses_changed_or_unqualified_live_cut);
 		UT_RUN(test_serving_missing_inputs_never_publish);
 		UT_RUN(test_serving_waits_for_own_release_and_revalidates_cut);
@@ -22027,8 +22029,10 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(431);
+	UT_PLAN(433);
 	UT_RUN(test_serving_requires_coordinator_publish_then_startup_is_active);
+	UT_RUN(test_serving_startup_checkpoint_remains_active_after_live_wal);
+	UT_RUN(test_serving_shutdown_checkpoint_still_requires_terminal_wal);
 	UT_RUN(test_serving_refuses_changed_or_unqualified_live_cut);
 	UT_RUN(test_serving_missing_inputs_never_publish);
 	UT_RUN(test_serving_waits_for_own_release_and_revalidates_cut);

@@ -2905,13 +2905,14 @@ canonical_aux_finish(uint16 thread, const ClusterControlRootIdentity *expected,
 	return true;
 }
 
-/* PGRAC: the exact persistent tail is required for current and historical
- * clean records alike; a selected shutdown anchor alone is insufficient.
+/* PGRAC: a shutdown checkpoint is an exact persistent tail. An installed
+ * startup checkpoint remains only a prefix of its now-OPEN writer's WAL;
+ * classifying it ACTIVE must not require that writer to have stayed idle.
  * Author: SqlRush <sqlrush@gmail.com>
  */
 static ClusterControlRootResult
-shutdown_v2_record_input(const ControlRootImage *root, const ClusterControlRootSnapshot *record,
-						  const ControlRootRecordRefsV2 *refs, const ControlFileData *raw)
+checkpoint_v2_record_input(const ControlRootImage *root, const ClusterControlRootSnapshot *record,
+						   const ControlRootRecordRefsV2 *refs, const ControlFileData *raw)
 {
 	ClusterWalSourceRef ref = { 0 };
 	ClusterWalTailObservation tail;
@@ -2936,10 +2937,17 @@ shutdown_v2_record_input(const ControlRootImage *root, const ClusterControlRootS
 	ref.claim.max_config_generation = root->header.v2.config_generation;
 	memcpy(ref.claim.claim_sha256, refs->claim_sha256, 32);
 	ref.timeline = record->checkpoint_tli;
-	result = cluster_wal_tail_observe_checkpoint(
-		cluster_wal_threads_dir, &ref, wal_segment_size, record->checkpoint_lower_lsn,
-		record->validated_tail_lsn_exclusive, raw->checkPoint, record->checkpoint_record_crc32c,
-		&tail);
+	if (root->header.format_version >= 3 && record->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+		&& record->lifecycle_reason == CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN)
+		result = cluster_wal_checkpoint_prefix_observe(
+			cluster_wal_threads_dir, &ref, wal_segment_size, record->checkpoint_lower_lsn,
+			record->validated_tail_lsn_exclusive, raw->checkPoint, record->checkpoint_record_crc32c,
+			&tail);
+	else
+		result = cluster_wal_tail_observe_checkpoint(
+			cluster_wal_threads_dir, &ref, wal_segment_size, record->checkpoint_lower_lsn,
+			record->validated_tail_lsn_exclusive, raw->checkPoint, record->checkpoint_record_crc32c,
+			&tail);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (tail.complete_end != record->validated_tail_lsn_exclusive
@@ -2983,7 +2991,7 @@ closed_v2_record_locked(const ControlRootImage *root, const ClusterControlRootSn
 	result = cluster_recovery_anchor_v2_thread_state(&anchor, record, &raw);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	return shutdown_v2_record_input(root, record, refs, &raw);
+	return checkpoint_v2_record_input(root, record, refs, &raw);
 }
 
 /* The projected native view deliberately says IN_PRODUCTION while the
@@ -3028,7 +3036,7 @@ stop_phase_v2_locked(const ControlRootImage *root, uint32 index, const ControlFi
 		*phase = CLUSTER_CONTROL_ROOT_STOP_ACTIVE;
 		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	}
-	result = shutdown_v2_record_input(root, record, &root->refs[index], &raw);
+	result = checkpoint_v2_record_input(root, record, &root->refs[index], &raw);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	/* The native startup checkpoint is genuinely SHUTDOWNED, but INSTALL
