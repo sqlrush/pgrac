@@ -36,6 +36,7 @@
 
 #include "access/twophase.h"
 #include "access/twophase_rmgr.h"
+#include "access/xact.h" /* RegisterXactCallback (two-phase finish stage) */
 #include "access/xlog.h" /* GetFlushRecPtr (two-phase finish stamps) */
 
 #include "cluster/cluster_guc.h"
@@ -437,6 +438,7 @@ typedef struct TT2PCFinishStage {
 } TT2PCFinishStage;
 
 static TT2PCFinishStage tt_2pc_stage;
+static bool tt_2pc_abort_callback_registered = false;
 
 /* Never throws: release every staged descriptor and the admission. */
 static void
@@ -447,6 +449,21 @@ tt_2pc_stage_release(void)
 	cluster_semantic_activation_leave(&tt_2pc_stage.admission);
 	tt_2pc_stage.armed = false;
 	tt_2pc_stage.nbindings = 0;
+}
+
+/*
+ * A transaction that ends abnormally between the prefinish and the postfinish
+ * -- an ERROR after the stage, or after the record -- must not keep the stage
+ * and its modifier admission for the rest of the backend's life.  Durable
+ * state needs nothing here: before the record nothing was emitted or written;
+ * after it the stamps are written and only the allocator, overlay and hint,
+ * which fall back to the durable slot, are skipped.
+ */
+static void
+tt_2pc_abort_callback(XactEvent event, void *arg pg_attribute_unused())
+{
+	if ((event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT) && tt_2pc_stage.armed)
+		tt_2pc_stage_release();
 }
 
 /*
@@ -478,6 +495,10 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 	if (tt_2pc_stage.armed)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("a prepared transaction finish is already staged")));
+	if (!tt_2pc_abort_callback_registered) {
+		RegisterXactCallback(tt_2pc_abort_callback, NULL);
+		tt_2pc_abort_callback_registered = true;
+	}
 
 	memset(&tt_2pc_stage, 0, sizeof(tt_2pc_stage));
 	admission = cluster_semantic_activation_modifier_enter(cluster_tt_twophase_writable_admission(),
