@@ -7980,7 +7980,8 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 	locator.relNumber = receipt->target.rel_number;
 	/* No heap content lock is held here. The APPLIED receipt and exact
 	 * target rechecks remain mandatory; SPACE lookup is not an authority. */
-	if (cluster_shared_config && !cluster_space_relation_read_identity(locator, &space_identity)) {
+	if (cluster_shared_config
+		&& !cluster_space_relation_read_maintenance_identity(locator, &space_identity)) {
 		cluster_semantic_activation_leave(&admission);
 		return false;
 	}
@@ -8375,7 +8376,8 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	locator.spcOid = receipt->target.spc_oid;
 	locator.dbOid = receipt->target.db_oid;
 	locator.relNumber = receipt->target.rel_number;
-	if (cluster_shared_config && !cluster_space_relation_read_identity(locator, &space_identity)) {
+	if (cluster_shared_config
+		&& !cluster_space_relation_read_maintenance_identity(locator, &space_identity)) {
 		cluster_semantic_activation_leave(&admission);
 		return false;
 	}

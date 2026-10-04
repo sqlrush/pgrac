@@ -32,6 +32,14 @@ extern bool cluster_space_relation_create(RelFileLocator locator);
  * on refusal. Caller must not hold a page content lock across this read. */
 extern bool cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentity *out);
 
+/* Pass-based maintenance owner, under its original lifecycle/admission proof.
+ * Uses the existing Resource-X current path, including for auxiliary processes
+ * without a backend identity. False releases every pin/lock and leaves output
+ * unchanged; the caller retains its work for another pass. No content lock
+ * may be held on entry. This read grants no cleanup authority. */
+extern bool cluster_space_relation_read_maintenance_identity(RelFileLocator locator,
+															 ClusterSpaceIdentity *out);
+
 /* Recovery executor, under its existing isolation and selected restart input.
  * Uses restart namespace, never current writer/relcache or identity creation.
  * Same output/locking contract as the runtime raw reader; not admission. */
