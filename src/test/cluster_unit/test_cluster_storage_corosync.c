@@ -38,6 +38,7 @@ static int quorate, notified_quorate, finalize_count, track_count;
 static bool notify_enabled, api_failed, changed_after_notify;
 static bool tracking_enabled;
 static unsigned notification_mismatch;
+static int failing_api_step;
 static const char *bad_key;
 static struct config_generic shared_settings[2];
 
@@ -111,6 +112,8 @@ static int
 fixture_quorate(uint64 handle, int *out)
 {
 	Assert(handle == 123);
+	if (failing_api_step == CLUSTER_STORAGE_PROVIDER_GETQUORATE)
+		return 3;
 	*out = quorate;
 	return STORAGE_CS_OK;
 }
@@ -122,6 +125,8 @@ fixture_dispatch(uint64 handle, int flags)
 	uint32 members[] = { 11, 12 };
 
 	Assert(handle == 123 && flags == STORAGE_CS_DISPATCH_ALL);
+	if (failing_api_step == CLUSTER_STORAGE_PROVIDER_DISPATCH)
+		return 4;
 	if (notify_enabled) {
 		StorageCorosyncRing member_ring = ring;
 		uint32 member_count = 2;
@@ -130,6 +135,8 @@ fixture_dispatch(uint64 handle, int flags)
 			member_ring.sequence++;
 		if (notification_mismatch & 2)
 			member_count = 1;
+		if (notification_mismatch & 4)
+			member_ring.node = 13;
 		callbacks.members_notify(handle, member_ring, member_count, members, 0, NULL, 0, NULL);
 		callbacks.quorum_notify(handle, notified_quorate, ring, 2, members);
 	}
@@ -201,6 +208,7 @@ reset_fixture(void)
 	tracking_enabled = false;
 	api_failed = changed_after_notify = false;
 	notification_mismatch = 0;
+	failing_api_step = 0;
 	bad_key = NULL;
 	finalize_count = track_count = 0;
 	memset(shared_settings, 0, sizeof(shared_settings));
@@ -349,10 +357,69 @@ UT_TEST(test_old_quorum_after_new_nodelist_cannot_renew_permission)
 	cluster_storage_quorum_attach(NULL, false);
 }
 
+UT_TEST(test_provider_failure_step_cannot_retain_success_detail)
+{
+	const int stages[] = { CLUSTER_STORAGE_PROVIDER_TRACK_CURRENT,
+						   CLUSTER_STORAGE_PROVIDER_GETQUORATE, CLUSTER_STORAGE_PROVIDER_DISPATCH };
+	const int errors[] = { 2, 3, 4 };
+	Size i;
+
+	for (i = 0; i < lengthof(stages); i++) {
+		ClusterStorageQuorumView view;
+
+		reset_fixture();
+		cluster_storage_corosync_sample(&view);
+		UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_READY);
+		api_failed = stages[i] == CLUSTER_STORAGE_PROVIDER_TRACK_CURRENT;
+		failing_api_step = stages[i];
+		cluster_storage_corosync_sample(&view);
+		UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_UNAVAILABLE);
+		UT_ASSERT_EQ(view.members[0], 0);
+		UT_ASSERT_EQ(view.provider_diagnostic,
+					 CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(stages[i], errors[i]));
+		UT_ASSERT(!storage_connected);
+		api_failed = false;
+		failing_api_step = 0;
+		cluster_storage_corosync_sample(&view);
+		UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_READY);
+		UT_ASSERT_EQ(view.provider_diagnostic, CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
+												   CLUSTER_STORAGE_PROVIDER_READY, STORAGE_CS_OK));
+	}
+}
+
+UT_TEST(test_provider_notification_refusal_detail_is_exact)
+{
+	ClusterStorageQuorumView view;
+
+	reset_fixture();
+	notify_enabled = false;
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_UNAVAILABLE);
+	UT_ASSERT_EQ(view.provider_diagnostic, CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
+											   CLUSTER_STORAGE_PROVIDER_NOTIFICATION_MISSING, 0));
+	notify_enabled = true;
+	notification_mismatch = 1;
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_UNAVAILABLE);
+	UT_ASSERT_EQ(view.provider_diagnostic, CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
+											   CLUSTER_STORAGE_PROVIDER_NOTIFICATION_MISMATCH, 0));
+	notification_mismatch = 4;
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_UNAVAILABLE);
+	UT_ASSERT_EQ(view.provider_diagnostic, CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
+											   CLUSTER_STORAGE_PROVIDER_NOTIFICATION_INVALID, 0));
+	notification_mismatch = 0;
+	bad_key = "totem.cluster_name";
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_CONFIGURATION);
+	UT_ASSERT_EQ(view.provider_diagnostic,
+				 CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_PROFILE, 0));
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(9);
 	UT_RUN(test_exact_profile_and_current_component);
 	UT_RUN(test_cached_callback_cannot_renew_current_permission);
 	UT_RUN(test_loss_disconnects_without_retaining_success);
@@ -360,6 +427,8 @@ main(void)
 	UT_RUN(test_configuration_failure_revokes_previously_valid_observation);
 	UT_RUN(test_local_settings_cannot_supply_storage_authority);
 	UT_RUN(test_old_quorum_after_new_nodelist_cannot_renew_permission);
+	UT_RUN(test_provider_failure_step_cannot_retain_success_detail);
+	UT_RUN(test_provider_notification_refusal_detail_is_exact);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

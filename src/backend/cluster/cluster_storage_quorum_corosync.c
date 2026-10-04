@@ -265,23 +265,38 @@ void
 cluster_storage_corosync_sample(ClusterStorageQuorumView *out)
 {
 	int quorate = 0;
+	int result;
 
 	memset(out, 0, sizeof(*out));
+	out->provider_diagnostic
+		= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_LOAD, 0);
 	if (!storage_load_api())
 		return;
 	if (!storage_connected) {
 		StorageCorosyncModel model = { 1, storage_quorum_notify, storage_members_notify };
 		uint32 quorum_type = 0;
 
-		if (storage_api.cmap_initialize(&storage_cmap_handle) != STORAGE_CS_OK
-			|| storage_api.initialize(&storage_quorum_handle, 1, &model, &quorum_type, NULL)
-				   != STORAGE_CS_OK
-			|| quorum_type != 1)
+		result = storage_api.cmap_initialize(&storage_cmap_handle);
+		out->provider_diagnostic
+			= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_CMAP_INITIALIZE, result);
+		if (result != STORAGE_CS_OK)
 			goto failed;
+		result = storage_api.initialize(&storage_quorum_handle, 1, &model, &quorum_type, NULL);
+		out->provider_diagnostic = CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
+			CLUSTER_STORAGE_PROVIDER_QUORUM_INITIALIZE, result);
+		if (result != STORAGE_CS_OK)
+			goto failed;
+		if (quorum_type != 1) {
+			out->provider_diagnostic
+				= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_QUORUM_TYPE, 0);
+			goto failed;
+		}
 		storage_connected = true;
 	}
 	if (!storage_profile_current()) {
 		out->reason = CLUSTER_STORAGE_QUORUM_CONFIGURATION;
+		out->provider_diagnostic
+			= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_PROFILE, 0);
 		goto failed;
 	}
 	/* CURRENT queues a complete nodelist/quorum pair before the reply.
@@ -289,23 +304,51 @@ cluster_storage_corosync_sample(ClusterStorageQuorumView *out)
 	 * return CS_ERR_EXIST. Every poll must obtain its own complete sample. */
 	memset(&storage_notified, 0, sizeof(storage_notified));
 	memset(&storage_members_notified, 0, sizeof(storage_members_notified));
-	if (storage_api.trackstart(storage_quorum_handle, STORAGE_CS_TRACK_CURRENT) != STORAGE_CS_OK
-		|| storage_api.getquorate(storage_quorum_handle, &quorate) != STORAGE_CS_OK
-		|| storage_api.dispatch(storage_quorum_handle, STORAGE_CS_DISPATCH_ALL) != STORAGE_CS_OK)
+	result = storage_api.trackstart(storage_quorum_handle, STORAGE_CS_TRACK_CURRENT);
+	out->provider_diagnostic
+		= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_TRACK_CURRENT, result);
+	if (result != STORAGE_CS_OK)
+		goto failed;
+	result = storage_api.getquorate(storage_quorum_handle, &quorate);
+	out->provider_diagnostic
+		= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_GETQUORATE, result);
+	if (result != STORAGE_CS_OK)
+		goto failed;
+	result = storage_api.dispatch(storage_quorum_handle, STORAGE_CS_DISPATCH_ALL);
+	out->provider_diagnostic
+		= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_DISPATCH, result);
+	if (result != STORAGE_CS_OK)
 		goto failed;
 	if (quorate != 1 || storage_notified.reason == CLUSTER_STORAGE_QUORUM_NOT_QUORATE) {
 		out->reason = CLUSTER_STORAGE_QUORUM_NOT_QUORATE;
+		out->provider_diagnostic
+			= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_NOT_QUORATE, 0);
+		return;
+	}
+	if (storage_notified.reason == CLUSTER_STORAGE_QUORUM_UNAVAILABLE
+		|| storage_members_notified.reason == CLUSTER_STORAGE_QUORUM_UNAVAILABLE) {
+		out->provider_diagnostic
+			= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_NOTIFICATION_MISSING, 0);
 		return;
 	}
 	if (storage_notified.reason != CLUSTER_STORAGE_QUORUM_READY
-		|| storage_members_notified.reason != CLUSTER_STORAGE_QUORUM_READY
-		|| storage_notified.ring_node != storage_members_notified.ring_node
+		|| storage_members_notified.reason != CLUSTER_STORAGE_QUORUM_READY) {
+		out->provider_diagnostic
+			= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_NOTIFICATION_INVALID, 0);
+		return;
+	}
+	if (storage_notified.ring_node != storage_members_notified.ring_node
 		|| storage_notified.ring_sequence != storage_members_notified.ring_sequence
 		|| memcmp(storage_notified.members, storage_members_notified.members,
 				  sizeof(storage_notified.members))
-			   != 0)
+			   != 0) {
+		out->provider_diagnostic = CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
+			CLUSTER_STORAGE_PROVIDER_NOTIFICATION_MISMATCH, 0);
 		return;
+	}
 	*out = storage_notified;
+	out->provider_diagnostic
+		= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_READY, STORAGE_CS_OK);
 	return;
 failed:
 	storage_disconnect();

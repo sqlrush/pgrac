@@ -155,7 +155,7 @@ cluster_storage_quorum_attach(ClusterStorageQuorumState *state, bool initialize)
 	pg_atomic_init_u32(&state->sequence, 0);
 	pg_atomic_init_u32(&state->reason, CLUSTER_STORAGE_QUORUM_UNAVAILABLE);
 	pg_atomic_init_u32(&state->ring_node, 0);
-	state->pad = 0;
+	pg_atomic_init_u32(&state->provider_diagnostic, 0);
 	pg_atomic_init_u64(&state->ring_sequence, 0);
 	pg_atomic_init_u64(&state->members[0], 0);
 	pg_atomic_init_u64(&state->members[1], 0);
@@ -197,6 +197,7 @@ cluster_storage_quorum_refresh(uint64 now_us, uint64 duration_us)
 	pg_write_barrier();
 	pg_atomic_write_u32(&storage_state->reason, view.reason);
 	pg_atomic_write_u32(&storage_state->ring_node, view.ring_node);
+	pg_atomic_write_u32(&storage_state->provider_diagnostic, view.provider_diagnostic);
 	pg_atomic_write_u64(&storage_state->ring_sequence, view.ring_sequence);
 	pg_atomic_write_u64(&storage_state->members[0], view.members[0]);
 	pg_atomic_write_u64(&storage_state->members[1], view.members[1]);
@@ -209,8 +210,8 @@ cluster_storage_quorum_refresh(uint64 now_us, uint64 duration_us)
 }
 
 /* Obtain one stable view. The expiry is never extended by readers. */
-bool
-cluster_storage_quorum_snapshot(ClusterStorageQuorumView *out)
+static bool
+storage_snapshot(ClusterStorageQuorumView *out, ClusterStorageQuorumCheck *check)
 {
 	int retry;
 
@@ -221,7 +222,12 @@ cluster_storage_quorum_snapshot(ClusterStorageQuorumView *out)
 		return false;
 	for (retry = 0; retry < 4; retry++) {
 		uint32 before = pg_atomic_read_u32(&storage_state->sequence);
+		uint32 after;
 
+		if (check != NULL) {
+			check->attempts = retry + 1;
+			check->sequence_before = check->sequence_after = before;
+		}
 		if (before & 1)
 			continue;
 		pg_read_barrier();
@@ -233,37 +239,98 @@ cluster_storage_quorum_snapshot(ClusterStorageQuorumView *out)
 		out->sampled_us = pg_atomic_read_u64(&storage_state->sampled_us);
 		out->expires_us = pg_atomic_read_u64(&storage_state->expires_us);
 		out->generation = pg_atomic_read_u64(&storage_state->generation);
+		out->provider_diagnostic = pg_atomic_read_u32(&storage_state->provider_diagnostic);
 		pg_read_barrier();
-		if (before == pg_atomic_read_u32(&storage_state->sequence))
+		after = pg_atomic_read_u32(&storage_state->sequence);
+		if (check != NULL)
+			check->sequence_after = after;
+		if (before == after)
 			return true;
 	}
 	memset(out, 0, sizeof(*out));
 	return false;
 }
 
+bool
+cluster_storage_quorum_snapshot(ClusterStorageQuorumView *out)
+{
+	return storage_snapshot(out, NULL);
+}
+
+static ClusterStorageCheckResult
+storage_view_result(const ClusterStorageQuorumView *view, uint64 now)
+{
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_STORAGE_CHECK_INVALID_SELF;
+	if (view->reason != CLUSTER_STORAGE_QUORUM_READY)
+		return CLUSTER_STORAGE_CHECK_PROVIDER;
+	if (view->generation == 0 || view->ring_node == 0 || view->ring_sequence == 0
+		|| view->sampled_us == 0)
+		return CLUSTER_STORAGE_CHECK_INCOMPLETE;
+	if (now < view->sampled_us)
+		return CLUSTER_STORAGE_CHECK_CLOCK_BEFORE_SAMPLE;
+	if (now >= view->expires_us)
+		return CLUSTER_STORAGE_CHECK_EXPIRED;
+	if ((view->members[cluster_node_id / 64] & (UINT64_C(1) << (cluster_node_id % 64))) == 0)
+		return CLUSTER_STORAGE_CHECK_SELF_ABSENT;
+	return CLUSTER_STORAGE_CHECK_ALLOWED;
+}
+
 static bool
 storage_view_current(const ClusterStorageQuorumView *view)
 {
-	uint64 now = cluster_storage_quorum_now_us();
-
-	return cluster_node_id >= 0 && cluster_node_id < CLUSTER_MAX_NODES
-		   && view->reason == CLUSTER_STORAGE_QUORUM_READY && view->generation != 0
-		   && view->ring_node != 0 && view->ring_sequence != 0 && view->sampled_us > 0
-		   && now >= view->sampled_us && now < view->expires_us
-		   && (view->members[cluster_node_id / 64] & (UINT64_C(1) << (cluster_node_id % 64))) != 0;
+	return storage_view_result(view, cluster_storage_quorum_now_us())
+		   == CLUSTER_STORAGE_CHECK_ALLOWED;
 }
 
 /* No new authority is created here: this only narrows existing DB admission. */
 bool
 cluster_storage_quorum_allows_node(int node_id)
 {
-	ClusterStorageQuorumView view;
+	return cluster_storage_quorum_check_node(node_id, NULL);
+}
 
-	if (!cluster_shared_config)
-		return true;
-	return node_id >= 0 && node_id < CLUSTER_MAX_NODES && cluster_storage_quorum_snapshot(&view)
-		   && storage_view_current(&view)
-		   && (view.members[node_id / 64] & (UINT64_C(1) << (node_id % 64))) != 0;
+/* The optional output captures the same predicate inputs, with no resample,
+ * extra retry, or authority. Provider diagnostics never affect the verdict. */
+bool
+cluster_storage_quorum_check_node(int node_id, ClusterStorageQuorumCheck *out)
+{
+	ClusterStorageQuorumView view;
+	ClusterStorageCheckResult result;
+	uint64 now;
+
+	if (out != NULL) {
+		memset(out, 0, sizeof(*out));
+		out->target_node = node_id;
+		out->self_node = cluster_node_id;
+	}
+	if (!cluster_shared_config) {
+		result = CLUSTER_STORAGE_CHECK_NATIVE;
+		goto done;
+	}
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES) {
+		result = CLUSTER_STORAGE_CHECK_INVALID_TARGET;
+		goto done;
+	}
+	if (!storage_snapshot(&view, out)) {
+		result = storage_state == NULL ? CLUSTER_STORAGE_CHECK_UNATTACHED
+									   : CLUSTER_STORAGE_CHECK_UNSTABLE;
+		goto done;
+	}
+	now = cluster_storage_quorum_now_us();
+	if (out != NULL) {
+		out->stable = true;
+		out->now_us = now;
+		out->view = view;
+	}
+	result = storage_view_result(&view, now);
+	if (result == CLUSTER_STORAGE_CHECK_ALLOWED
+		&& (view.members[node_id / 64] & (UINT64_C(1) << (node_id % 64))) == 0)
+		result = CLUSTER_STORAGE_CHECK_TARGET_ABSENT;
+done:
+	if (out != NULL)
+		out->result = result;
+	return result == CLUSTER_STORAGE_CHECK_ALLOWED || result == CLUSTER_STORAGE_CHECK_NATIVE;
 }
 
 bool

@@ -208,10 +208,109 @@ UT_TEST(test_wall_clock_rollback_cannot_extend_storage_eligibility)
 	UT_ASSERT(!cluster_storage_quorum_allows_node(0));
 }
 
+UT_TEST(test_refusal_capture_keeps_the_actual_expired_sample)
+{
+	ClusterStorageQuorumCheck check;
+
+	ready();
+	fake_monotonic = 150;
+	UT_ASSERT(!cluster_storage_quorum_check_node(0, &check));
+	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_EXPIRED);
+	UT_ASSERT(check.stable);
+	UT_ASSERT_EQ(check.attempts, 1);
+	UT_ASSERT_EQ(check.sequence_before, check.sequence_after);
+	UT_ASSERT_EQ(check.now_us, 150);
+	UT_ASSERT_EQ(check.view.sampled_us, 100);
+	UT_ASSERT_EQ(check.view.expires_us, 150);
+	UT_ASSERT_EQ(check.view.generation, 1);
+	UT_ASSERT_EQ(check.view.members[0], 3);
+	/* A later successful publication cannot rewrite the rejection evidence. */
+	cluster_storage_quorum_refresh(150, 50);
+	UT_ASSERT(cluster_storage_quorum_allows_node(0));
+	UT_ASSERT_EQ(check.view.generation, 1);
+	UT_ASSERT_EQ(check.view.expires_us, 150);
+	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_EXPIRED);
+}
+
+UT_TEST(test_refusal_capture_distinguishes_unsampled_and_unstable)
+{
+	ClusterStorageQuorumCheck check;
+	ClusterStorageQuorumView zero = { 0 };
+
+	memset(&zero, 0, sizeof(zero));
+	ready();
+	pg_atomic_fetch_add_u32(&test_state.sequence, 1);
+	UT_ASSERT(!cluster_storage_quorum_check_node(0, &check));
+	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_UNSTABLE);
+	UT_ASSERT(!check.stable);
+	UT_ASSERT_EQ(check.attempts, 4);
+	UT_ASSERT(check.sequence_before & 1);
+	UT_ASSERT_EQ(check.now_us, 0);
+	UT_ASSERT_EQ(memcmp(&check.view, &zero, sizeof(zero)), 0);
+	cluster_storage_quorum_attach(NULL, false);
+	UT_ASSERT(!cluster_storage_quorum_check_node(0, &check));
+	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_UNATTACHED);
+	UT_ASSERT_EQ(check.attempts, 0);
+	UT_ASSERT(!check.stable);
+	UT_ASSERT_EQ(memcmp(&check.view, &zero, sizeof(zero)), 0);
+	ready();
+}
+
+UT_TEST(test_refusal_capture_does_not_change_member_or_clock_polarity)
+{
+	ClusterStorageQuorumCheck check;
+
+	ready();
+	UT_ASSERT(cluster_storage_quorum_check_node(0, &check));
+	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_ALLOWED);
+	UT_ASSERT_EQ(check.target_node, 0);
+	UT_ASSERT_EQ(check.self_node, 0);
+	UT_ASSERT(!cluster_storage_quorum_check_node(2, &check));
+	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_TARGET_ABSENT);
+	fake_monotonic = 99;
+	UT_ASSERT(!cluster_storage_quorum_check_node(0, &check));
+	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_CLOCK_BEFORE_SAMPLE);
+	fake_monotonic = 100;
+	supplied.members[0] = 2;
+	cluster_storage_quorum_refresh(100, 50);
+	UT_ASSERT(!cluster_storage_quorum_check_node(1, &check));
+	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_SELF_ABSENT);
+	UT_ASSERT(!cluster_storage_quorum_check_node(CLUSTER_MAX_NODES, &check));
+	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_INVALID_TARGET);
+	UT_ASSERT_EQ(check.attempts, 0);
+	cluster_shared_config = false;
+	UT_ASSERT(cluster_storage_quorum_check_node(-1, &check));
+	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_NATIVE);
+	UT_ASSERT(!check.stable);
+	cluster_shared_config = true;
+	ready();
+}
+
+UT_TEST(test_provider_failure_detail_travels_with_the_rejected_generation)
+{
+	ClusterStorageQuorumCheck check;
+
+	ready();
+	supplied.reason = CLUSTER_STORAGE_QUORUM_UNAVAILABLE;
+	supplied.provider_diagnostic
+		= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_TRACK_CURRENT, 2);
+	cluster_storage_quorum_refresh(101, 50);
+	UT_ASSERT(!cluster_storage_quorum_check_node(0, &check));
+	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_PROVIDER);
+	UT_ASSERT(check.stable);
+	UT_ASSERT_EQ(check.view.generation, 2);
+	UT_ASSERT_EQ(check.view.members[0], 0);
+	UT_ASSERT_EQ(check.view.provider_diagnostic, supplied.provider_diagnostic);
+	ready();
+	UT_ASSERT(cluster_storage_quorum_allows_node(0));
+	UT_ASSERT_EQ(check.view.generation, 2);
+	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_PROVIDER);
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(12);
 	UT_RUN(test_mapping_rejects_aliases_missing_slots_and_overflow);
 	UT_RUN(test_provider_component_requires_exact_mapping_and_local_identity);
 	UT_RUN(test_current_component_gates_self_peers_and_candidate_as_one_snapshot);
@@ -220,6 +319,10 @@ main(void)
 	UT_RUN(test_new_storage_component_revokes_old_targets);
 	UT_RUN(test_native_profile_preserved_and_uninitialized_shared_refused);
 	UT_RUN(test_wall_clock_rollback_cannot_extend_storage_eligibility);
+	UT_RUN(test_refusal_capture_keeps_the_actual_expired_sample);
+	UT_RUN(test_refusal_capture_distinguishes_unsampled_and_unstable);
+	UT_RUN(test_refusal_capture_does_not_change_member_or_clock_polarity);
+	UT_RUN(test_provider_failure_detail_travels_with_the_rejected_generation);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

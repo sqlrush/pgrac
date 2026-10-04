@@ -76,6 +76,7 @@
 
 #include <errno.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "access/xlog.h"
 #include "libpq/pqsignal.h"
@@ -1209,12 +1210,44 @@ qvotec_admission_denied(unsigned int diagnostic_bit, const char *reason, uint32 
 	return false;
 }
 
+/* Keep the predicate's own inputs. A second snapshot here could hide the
+ * rejection after a concurrent QVOTEC publication. This is evidence only. */
+static bool
+qvotec_storage_admission_denied(uint32 state, const ClusterStorageQuorumCheck *check)
+{
+	static pid_t reported_pid;
+	pid_t pid = getpid();
+
+	if (reported_pid != pid) {
+		reported_pid = pid;
+		ereport(
+			LOG,
+			(errmsg_internal(
+				"PGRAC_FAMILY=STORAGE_QUORUM_CAPTURE node=%d target=%d result=%u stable=%d "
+				"attempts=%u sequence_before=%u sequence_after=%u now_us=%llu "
+				"reason=%u ring_node=%u ring_sequence=%llu members_lo=%016llx members_hi=%016llx "
+				"generation=%llu sampled_us=%llu expires_us=%llu provider_step=%u provider_rc=%u",
+				check->self_node, check->target_node, (unsigned int)check->result, check->stable,
+				check->attempts, check->sequence_before, check->sequence_after,
+				(unsigned long long)check->now_us, (unsigned int)check->view.reason,
+				check->view.ring_node, (unsigned long long)check->view.ring_sequence,
+				(unsigned long long)check->view.members[0],
+				(unsigned long long)check->view.members[1],
+				(unsigned long long)check->view.generation,
+				(unsigned long long)check->view.sampled_us,
+				(unsigned long long)check->view.expires_us, check->view.provider_diagnostic >> 16,
+				check->view.provider_diagnostic & UINT32_C(0xffff))));
+	}
+	return qvotec_admission_denied(7, "STORAGE_INELIGIBLE", state, 0, 0);
+}
+
 bool
 cluster_qvotec_in_quorum(void)
 {
 	uint64 now_us;
 	uint64 lease_expire;
 	uint32 q;
+	ClusterStorageQuorumCheck storage_check;
 
 	/* Disable-cluster / pre-shmem path: fail-closed. */
 	if (QvotecShmem == NULL)
@@ -1240,8 +1273,8 @@ cluster_qvotec_in_quorum(void)
 	}
 
 	/* Storage membership narrows admission without replacing disk evidence. */
-	if (!cluster_storage_quorum_allows_node(cluster_node_id))
-		return qvotec_admission_denied(7, "STORAGE_INELIGIBLE", q, 0, 0);
+	if (!cluster_storage_quorum_check_node(cluster_node_id, &storage_check))
+		return qvotec_storage_admission_denied(q, &storage_check);
 
 	lease_expire = pg_atomic_read_u64(&QvotecShmem->lease_expire_at_us);
 	now_us = (uint64)GetCurrentTimestamp();
