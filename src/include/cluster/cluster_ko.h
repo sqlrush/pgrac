@@ -238,11 +238,17 @@ extern bool cluster_ko_shared_space_observation_v2(const ClusterKoCompletionV2 *
 extern bool cluster_ko_shared_observe_truncate_v2(ClusterKoCompletionV2 *completion);
 extern bool cluster_ko_shared_truncate_observation_v2(const ClusterKoCompletionV2 *completion,
 	struct ClusterPageWalBindingV1 *terminal, void *wal, Size wal_length);
+/* Original postcommit pending-delete storage owner only, after durable MAIN
+ * reservation, auxiliary-fork removal and directory sync for this exact
+ * TOMBSTONE. Records one local physical result in the original opaque handle;
+ * it grants neither PI retirement nor a new lifetime. */
+extern bool cluster_ko_shared_observe_drop_v2(ClusterKoCompletionV2 *completion);
 struct ClusterPiWritebackFactV2;
-/* Project a completed native TRUNCATE after actual top-level COMMIT for its
+/* Project a completed native TRUNCATE or durable postcommit DROP for its
  * original peer. This relation offer contains no page/master cut and grants
  * no retirement. The original transaction still owns and cleans the handle;
- * a raw value cannot extend that lifetime. DROP requires its physical owner. */
+ * a raw value cannot extend that lifetime. Each action needs its original
+ * physical owner observation; a SPACE-only result is never sufficient. */
 extern bool cluster_ko_shared_structure_offer_v2(const ClusterKoCompletionV2 *completion,
 	int32 peer, struct ClusterPiWritebackFactV2 *out);
 /* Transfer the actual committed native result into its original reserved KO

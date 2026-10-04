@@ -2279,6 +2279,8 @@ UT_TEST(test_pending_drop_rejects_ambiguous_original_native_completions)
 	UT_ASSERT_EQ(completion_allocations, 2);
 	UT_ASSERT(!cluster_ko_shared_pending_drop_v2(binding.identity.locator, &borrowed));
 	UT_ASSERT(borrowed == NULL);
+	UT_ASSERT(!cluster_ko_shared_observe_drop_v2(first));
+	UT_ASSERT(!cluster_ko_shared_observe_drop_v2(second));
 	cluster_ko_shared_postcommit_cleanup_v2();
 	UT_ASSERT_EQ(completion_allocations, 0);
 	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_READY);
@@ -2304,10 +2306,135 @@ UT_TEST(test_prepare_and_noncommit_events_never_retain_native_observation)
 	}
 }
 
+UT_TEST(test_native_drop_effect_is_once_only_after_original_top_commit)
+{
+	ClusterPageWalBindingV1 binding;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	ClusterKoCompletionV2 *completion = prepare_native_structure(true, &binding, wal);
+	ClusterKoCompletionV2 *borrowed = NULL;
+	ClusterPiWritebackFactV2 offer, before;
+	int reads = space_reads, requests = barrier_requests, syncs = sync_count;
+
+	UT_ASSERT(!cluster_ko_shared_observe_drop_v2(completion));
+	UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
+	UT_ASSERT(!cluster_ko_shared_observe_drop_v2(completion));
+	xact_callback(XACT_EVENT_COMMIT, NULL);
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true, true, NULL);
+	UT_ASSERT(cluster_ko_shared_pending_drop_v2(binding.identity.locator, &borrowed));
+	UT_ASSERT(borrowed == completion);
+	memset(&before, 0xa5, sizeof(before));
+	offer = before;
+	UT_ASSERT(!cluster_ko_shared_structure_offer_v2(completion, 1, &offer));
+	UT_ASSERT(memcmp(&offer, &before, sizeof(before)) == 0);
+	UT_ASSERT(cluster_ko_shared_observe_drop_v2(borrowed));
+	UT_ASSERT(!cluster_ko_shared_observe_drop_v2(borrowed));
+	UT_ASSERT(!cluster_ko_shared_observe_truncate_v2(borrowed));
+	UT_ASSERT(cluster_ko_shared_structure_offer_v2(completion, 1, &offer));
+	UT_ASSERT_EQ(offer.kind, CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2);
+	UT_ASSERT_EQ(offer.proof.structural.durability_flags, 31);
+	UT_ASSERT_EQ(offer.proof.structural.change.identity.action, CLUSTER_SPACE_WAL_TOMBSTONE);
+	UT_ASSERT(memcmp(&offer.proof.structural.terminal.binding, &binding, sizeof(binding)) == 0);
+	UT_ASSERT_EQ(offer.proof.structural.terminal.write_cut.binding_generation, 0);
+	UT_ASSERT_EQ(offer.proof.structural.terminal.storage_cut.binding_generation, 0);
+	cluster_ko_shared_postcommit_cleanup_v2();
+	UT_ASSERT(!cluster_ko_shared_observe_drop_v2(borrowed));
+	offer = before;
+	UT_ASSERT(!cluster_ko_shared_structure_offer_v2(completion, 1, &offer));
+	UT_ASSERT(memcmp(&offer, &before, sizeof(before)) == 0);
+	cluster_ko_shared_release_v2(&completion);
+	UT_ASSERT_EQ(completion_allocations, 0);
+	UT_ASSERT_EQ(space_reads, reads);
+	UT_ASSERT_EQ(barrier_requests, requests);
+	UT_ASSERT_EQ(sync_count, syncs);
+}
+
+UT_TEST(test_native_drop_effect_refuses_wrong_lifetime_scope_or_handle)
+{
+	for (unsigned fault = 0; fault < 18; fault++) {
+		ClusterPageWalBindingV1 binding;
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		ClusterKoCompletionV2 *completion = prepare_native_structure(fault != 3, &binding, wal);
+		ClusterKoCompletionV2 copy = *completion, *candidate = completion;
+		ClusterKoSharedContext before;
+		unsigned slot = completion->slot;
+		int pid = MyProcPid;
+
+		if (fault != 4)
+			UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
+		if (fault != 0)
+			xact_callback(fault == 1 ? XACT_EVENT_PREPARE
+				: fault == 2 ? XACT_EVENT_ABORT : XACT_EVENT_COMMIT, NULL);
+		switch (fault) {
+		case 5: CurrentResourceOwner = (ResourceOwner)2; break;
+		case 6: CurTransactionResourceOwner = (ResourceOwner)2; break;
+		case 7: TopTransactionResourceOwner = (ResourceOwner)2; break;
+		case 8: MyProcPid++; break;
+		case 9: writer.claim.identity.origin_owner_incarnation++; break;
+		case 10: writer.claim.claim_sha256[0]++; break;
+		case 11: formation.membership.last_admitted_incarnation[1]++; break;
+		case 12: current_epoch++; break;
+		case 13: CritSectionCount = 1; break;
+		case 14: generation_race = true; break;
+		case 15: cluster_ko_shared_postcommit_cleanup_v2(); break;
+		case 16: candidate = &copy; break;
+		case 17: candidate = NULL; break;
+		}
+		before = storage.contexts[slot];
+		UT_ASSERT(!cluster_ko_shared_observe_drop_v2(candidate));
+		UT_ASSERT(memcmp(&storage.contexts[slot], &before, sizeof(before)) == 0);
+		MyProcPid = pid;
+		CurrentResourceOwner = CurTransactionResourceOwner = TopTransactionResourceOwner = (ResourceOwner)1;
+		CritSectionCount = 0;
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		cluster_ko_shared_release_v2(&completion);
+		UT_ASSERT_EQ(completion_allocations, 0);
+	}
+}
+
+UT_TEST(test_native_drop_result_handoff_preserves_original_shared_obligation)
+{
+	ClusterPageWalBindingV1 binding;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	ClusterKoCompletionV2 *completion = prepare_native_structure(true, &binding, wal), *old;
+	ClusterPiWritebackFactV2 expected, actual;
+	unsigned slot = completion->slot;
+	uint64 original_serial = completion->serial, serial = 0;
+	uint32 cursor = 0;
+	const char *reason;
+	int pid = MyProcPid, sends = send_calls, reads = space_reads, syncs = sync_count;
+
+	UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
+	xact_callback(XACT_EVENT_COMMIT, NULL);
+	UT_ASSERT(!cluster_ko_shared_structure_handoff_v2(&completion));
+	UT_ASSERT(cluster_ko_shared_observe_drop_v2(completion));
+	UT_ASSERT(cluster_ko_shared_structure_offer_v2(completion, 1, &expected));
+	old = completion;
+	UT_ASSERT(cluster_ko_shared_structure_handoff_v2(&completion));
+	UT_ASSERT(completion == NULL);
+	UT_ASSERT(!cluster_ko_shared_observe_drop_v2(old));
+	UT_ASSERT_EQ(completion_allocations, 0);
+	UT_ASSERT_EQ(storage.contexts[slot].serial, original_serial);
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true, true, NULL);
+	cluster_ko_shared_postcommit_cleanup_v2();
+	exit_callback(0, (Datum)0);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(reason, "KO_SHARED_STRUCTURE_OWNED") == 0);
+	MyProcPid = pid + 1;
+	MyBackendType = B_BG_WRITER;
+	UT_ASSERT(cluster_ko_shared_structure_offer_next_v2(&cursor, 1, &serial, &actual));
+	UT_ASSERT_EQ(cursor, slot + 1);
+	UT_ASSERT_EQ(serial, original_serial);
+	UT_ASSERT(memcmp(&actual, &expected, sizeof(actual)) == 0);
+	UT_ASSERT_EQ(send_calls, sends);
+	UT_ASSERT_EQ(space_reads, reads);
+	UT_ASSERT_EQ(sync_count, syncs);
+	MyProcPid = pid;
+}
+
 int
 main(void)
 {
-	UT_PLAN(58);
+	UT_PLAN(61);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
@@ -2366,6 +2493,9 @@ main(void)
 	UT_RUN(test_pending_drop_refuses_other_owner_and_changed_scope_without_touching_output);
 	UT_RUN(test_pending_drop_rejects_ambiguous_original_native_completions);
 	UT_RUN(test_prepare_and_noncommit_events_never_retain_native_observation);
+	UT_RUN(test_native_drop_effect_is_once_only_after_original_top_commit);
+	UT_RUN(test_native_drop_effect_refuses_wrong_lifetime_scope_or_handle);
+	UT_RUN(test_native_drop_result_handoff_preserves_original_shared_obligation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
