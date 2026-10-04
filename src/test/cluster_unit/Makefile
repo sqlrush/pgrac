@@ -5810,10 +5810,17 @@ test_cluster_ko_postcommit.inc: $(top_srcdir)/src/backend/access/transam/xact.c 
 	     emit { print } /^}/ { inside=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_ko_writeback_codec.o: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c \
+		$(top_srcdir)/src/backend/cluster/cluster_pi_data_wire.h \
+		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_postcommit.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_ko.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) \
 		$(top_builddir)/src/common/libpgcommon.a $(filter -lcrypto,$(LIBS)) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@

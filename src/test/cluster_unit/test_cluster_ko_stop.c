@@ -95,6 +95,8 @@ MemoryContextAllocZero(MemoryContext context, Size size)
 	return calloc(1, size);
 }
 void pfree(void *p) { completion_allocations--; free(p); }
+/* Only the allocation-free writeback codec is reachable in this fixture. */
+void *palloc0(Size size) { abort(); }
 void
 RegisterResourceReleaseCallback(ResourceReleaseCallback callback, void *arg)
 {
@@ -1642,6 +1644,33 @@ prepare_native_structure(bool drop, ClusterPageWalBindingV1 *binding, uint8 *wal
 	return prepare_native_structure_owner(drop, binding, wal, (ResourceOwner)1, true);
 }
 
+/* Use the original KO output as-is at the real PPWB codec boundary. A
+ * separately corrected fixture must not hide an incompatible native offer. */
+static void
+assert_structure_offer_codec(const ClusterPiWritebackFactV2 *offer)
+{
+	const ClusterKoSharedMessageV2 *ko = &offer->proof.structural.ko;
+	ClusterPiWritebackMessageV2 message = {0}, decoded;
+	uint8 bytes[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
+	Size length = 0;
+	message.verb = CLUSTER_PI_WRITEBACK_NOTIFY;
+	message.count = 1;
+	message.nonce = ko->batch_id;
+	message.epoch = ko->epoch;
+	message.peer = offer->proof.structural.terminal.binding.source;
+	message.peer.claim.identity.origin_node_id = ko->peer_node;
+	message.peer.claim.identity.origin_thread_id = ko->peer_node + 1;
+	message.peer.claim.identity.origin_owner_incarnation = ko->peer_boot;
+	message.facts[0] = *offer;
+	UT_ASSERT(cluster_pi_writeback_encode_v2(&message, bytes, sizeof(bytes), &length));
+	if (length != 0) {
+		UT_ASSERT(cluster_pi_writeback_decode_v2(bytes, length, &decoded));
+		UT_ASSERT(memcmp(&decoded.facts[0], offer, sizeof(*offer)) == 0);
+	}
+	message.facts[0].proof.structural.durability_flags ^= CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
+	UT_ASSERT(!cluster_pi_writeback_encode_v2(&message, bytes, sizeof(bytes), &length));
+}
+
 UT_TEST(test_native_space_observation_is_original_once_and_transaction_owned)
 {
 	for (unsigned drop = 0; drop < 2; drop++) {
@@ -1817,6 +1846,7 @@ UT_TEST(test_native_relation_offer_requires_real_commit_and_original_effect)
 	UT_ASSERT(cluster_ko_shared_structure_offer_v2(completion, 1, &offer));
 	UT_ASSERT_EQ(offer.kind, CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2);
 	UT_ASSERT_EQ(offer.proof.structural.durability_flags, 31);
+	assert_structure_offer_codec(&offer);
 	UT_ASSERT(memcmp(&offer.proof.structural.terminal.binding, &binding, sizeof(binding)) == 0);
 	UT_ASSERT(memcmp(&offer.proof.structural.ko, &ko, sizeof(ko)) == 0);
 	UT_ASSERT_EQ(offer.proof.structural.terminal.write_cut.binding_generation, 0);
@@ -1916,6 +1946,7 @@ UT_TEST(test_structure_handoff_consumes_original_handle_without_new_work)
 	UT_ASSERT_EQ(serial, original_serial);
 	UT_ASSERT(memcmp(&actual, &expected, sizeof(actual)) == 0);
 	UT_ASSERT(!cluster_ko_shared_structure_offer_next_v2(&cursor, 1, &serial, &actual));
+	assert_structure_offer_codec(&actual);
 	UT_ASSERT_EQ(send_calls, sends);
 	UT_ASSERT_EQ(sync_count, syncs);
 	UT_ASSERT_EQ(space_reads, reads);
@@ -2331,8 +2362,9 @@ UT_TEST(test_native_drop_effect_is_once_only_after_original_top_commit)
 	UT_ASSERT(!cluster_ko_shared_observe_truncate_v2(borrowed));
 	UT_ASSERT(cluster_ko_shared_structure_offer_v2(completion, 1, &offer));
 	UT_ASSERT_EQ(offer.kind, CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2);
-	UT_ASSERT_EQ(offer.proof.structural.durability_flags, 31);
+	UT_ASSERT_EQ(offer.proof.structural.durability_flags, 15);
 	UT_ASSERT_EQ(offer.proof.structural.change.identity.action, CLUSTER_SPACE_WAL_TOMBSTONE);
+	assert_structure_offer_codec(&offer);
 	UT_ASSERT(memcmp(&offer.proof.structural.terminal.binding, &binding, sizeof(binding)) == 0);
 	UT_ASSERT_EQ(offer.proof.structural.terminal.write_cut.binding_generation, 0);
 	UT_ASSERT_EQ(offer.proof.structural.terminal.storage_cut.binding_generation, 0);
@@ -2425,6 +2457,7 @@ UT_TEST(test_native_drop_result_handoff_preserves_original_shared_obligation)
 	UT_ASSERT_EQ(cursor, slot + 1);
 	UT_ASSERT_EQ(serial, original_serial);
 	UT_ASSERT(memcmp(&actual, &expected, sizeof(actual)) == 0);
+	assert_structure_offer_codec(&actual);
 	UT_ASSERT_EQ(send_calls, sends);
 	UT_ASSERT_EQ(space_reads, reads);
 	UT_ASSERT_EQ(sync_count, syncs);

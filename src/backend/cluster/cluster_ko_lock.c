@@ -844,7 +844,9 @@ cluster_ko_shared_structure_offer_v2(const ClusterKoCompletionV2 *completion,
 	value.kind = CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2;
 	s->durability_flags = CLUSTER_PI_STRUCTURAL_WAL_FLUSHED
 		| CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK | CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED
-		| CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE | CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
+		| CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE;
+	if (s->change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE)
+		s->durability_flags |= CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
 	/* This value has no page/master cut. It can only transfer the completed
 	 * relation result to the original peer's background owner; it cannot
 	 * acknowledge a page or extend this transaction's local ownership. */
@@ -952,7 +954,9 @@ cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer, uint64 *se
 		s->terminal.binding = context.terminal;
 		s->durability_flags = CLUSTER_PI_STRUCTURAL_WAL_FLUSHED
 			| CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK | CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED
-			| CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE | CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
+			| CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE;
+		if (s->change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE)
+			s->durability_flags |= CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
 		*out = value;
 		*serial = context.serial;
 		*cursor = i + 1;
