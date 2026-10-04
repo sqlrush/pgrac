@@ -358,6 +358,16 @@ extern const ClusterSharedFsOps cluster_shared_fs_block_device_ops;
 /* Stage 4.5a (spec-4.5a D1): first genuinely cross-node-shared backend. */
 extern const ClusterSharedFsOps cluster_shared_fs_sharedfs_ops;
 
+/* Local physical result only, not authority or a PI receipt. The original
+ * postcommit DROP owner supplies its exact TOMBSTONED SPACE identity/token.
+ * No caller is entitled to use this for redo, TEMP, or partial-fork removal.
+ * True retains a synced zero-length MAIN and durably removes the auxiliaries.
+ * False grants no completion; the caller retains its original responsibility.
+ * Author: SqlRush <sqlrush@gmail.com> */
+struct ClusterSpaceIdentity;
+extern bool cluster_shared_fs_sharedfs_drop_durable(const struct ClusterSpaceIdentity *identity,
+												  uint64 mutation_token);
+
 /*
  * Length of the shared-storage uuid recorded in the cross-node sentinel:
  * 32 lowercase hex characters plus a NUL.  Public so other cluster modules

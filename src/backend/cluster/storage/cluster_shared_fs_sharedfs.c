@@ -75,6 +75,7 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_space_identity.h"
 #include "cluster/storage/cluster_shared_fs.h"
 
 
@@ -482,6 +483,15 @@ cluster_shared_fs_sharedfs_unlink(RelFileLocator rlocator, ForkNumber forknum)
 				 errmsg("cluster_shared_fs.shared_fs: could not unlink \"%s\": %m", path)));
 
 	pfree(path);
+}
+
+/* Fail-closed API scaffold: no production caller until its I/O and the
+ * original postcommit owner handoff have both been established. */
+bool
+cluster_shared_fs_sharedfs_drop_durable(const ClusterSpaceIdentity *identity,
+									  uint64 mutation_token)
+{
+	return false;
 }
 
 

@@ -45,7 +45,7 @@ CLUSTER_UNIT_CRYPTOHASH_O = $(top_builddir)/src/common/cryptohash.o
 endif
 
 # Test source files (each becomes a standalone executable)
-TESTS = test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
+TESTS = test_cluster_shared_fs_drop test_cluster_formation_restart test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
         test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_catalog_manifest test_cluster_catalog_init test_cluster_catalog_startup test_cluster_initdb_tree test_cluster_initdb_cohort \
         test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
@@ -4057,6 +4057,12 @@ test_cluster_shared_fs_sharedfs: test_cluster_shared_fs_sharedfs.c unit_test.h \
 # spec-6.0a: runtime unit for the raw block_device backend over a
 # temporary regular file that stands in for a block device.  Links only
 # the provider object; WAL/GES entry points are stubbed by the test.
+test_cluster_shared_fs_drop: test_cluster_shared_fs_drop.c test_cluster_shared_fs_sharedfs.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_shared_fs_sharedfs.c $(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 test_cluster_shared_fs_block_device: test_cluster_shared_fs_block_device.c unit_test.h \
 		$(CLUSTER_SHARED_FS_BLOCK_DEVICE_O) $(CLUSTER_PR_SCSI_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
