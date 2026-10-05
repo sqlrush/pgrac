@@ -41,7 +41,10 @@ CLUSTER_UNIT_CLANG ?= $(if $(strip $(CLANG)),$(CLANG),clang)
 ifeq ($(with_ssl),openssl)
 CLUSTER_UNIT_CRYPTOHASH_O = $(top_builddir)/src/common/cryptohash_openssl.o
 else
-CLUSTER_UNIT_CRYPTOHASH_O = $(top_builddir)/src/common/cryptohash.o
+# The fallback provider dispatches to PostgreSQL's own digest objects.
+CLUSTER_UNIT_CRYPTOHASH_O = $(top_builddir)/src/common/cryptohash.o \
+	$(top_builddir)/src/common/md5.o $(top_builddir)/src/common/sha1.o \
+	$(top_builddir)/src/common/sha2.o
 endif
 
 # Test source files (each becomes a standalone executable)
@@ -1200,7 +1203,7 @@ test_cluster_page_edge_reader: test_cluster_page_edge_reader.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< xlogreader_fs.o \
 		$(XLOG_PAGE_EDGE_ENCODER_O) $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
-		-lssl -lcrypto -llz4 -lzstd -o $@
+		-lssl -lcrypto $(filter -llz4 -lzstd,$(LIBS)) -o $@
 
 CLUSTER_RF_ROUTE_O = $(top_builddir)/src/backend/cluster/cluster_rf_route.o
 
@@ -2457,7 +2460,7 @@ test_cluster_page_anchor_cache: test_cluster_page_anchor_cache.c unit_test.h \
 		$(CLUSTER_PAGE_ANCHOR_CACHE_O) $(CLUSTER_PAGE_STABLE_BASE_O) \
 		xlogreader_fs.o $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
-		-lssl -lcrypto -llz4 -lzstd -o $@
+		-lssl -lcrypto $(filter -llz4 -lzstd,$(LIBS)) -o $@
 $(CLUSTER_PAGE_STABLE_BASE_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c \
 		$(top_srcdir)/src/include/cluster/cluster_page_stable_base.h
@@ -2471,7 +2474,7 @@ test_cluster_page_stable_base: test_cluster_page_stable_base.c unit_test.h \
 		cluster_thread_recovery_authority_test.o $(CLUSTER_PAGE_AUTHORITY_O) $(CLUSTER_PAGE_GUARD_O) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
-		-lssl -lcrypto -llz4 -lzstd -o $@
+		-lssl -lcrypto $(filter -llz4 -lzstd,$(LIBS)) -o $@
 
 CLUSTER_PAGE_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_page_version.o
 test_cluster_page_version: test_cluster_page_version.c unit_test.h \
@@ -2667,7 +2670,7 @@ test_cluster_undo_producer: test_cluster_undo_producer.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) xlogreader_fs.o \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
-		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto -llz4 -lzstd -o $@
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto $(filter -llz4 -lzstd,$(LIBS)) -o $@
 
 test_cluster_side_undo: test_cluster_side_undo.c unit_test.h \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
