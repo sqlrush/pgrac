@@ -10565,11 +10565,14 @@ pcm_pi_storage_snapshot_locked(struct GrdEntry *entry, ClusterPcmPiStorageCutV1 
 	ClusterPcmResourceXMasterState *state;
 	ClusterPcmResourceXMasterRequest *head;
 	ResourceXGateSnapshot gate;
+	uint32 lifecycle = pg_atomic_read_u32(&entry->lifecycle);
 	int32 head_node = -1;
 
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
 		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
-	if (pg_atomic_read_u32(&entry->lifecycle) != PCM_ENTRY_LIVE
+	/* A released entry may already be quiescing. Its PI prevents reclamation,
+	 * so the original storage receipt must remain able to discharge it. */
+	if ((lifecycle != PCM_ENTRY_LIVE && lifecycle != PCM_ENTRY_QUIESCING)
 		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
 		|| !cluster_pcm_lock_resource_x_gate_open_exact(gate.formation)
 		|| (entry->resource_x_formation != 0 && entry->resource_x_formation != gate.formation))
@@ -25749,6 +25752,11 @@ cluster_pcm_lock_resource_x_release_x_exact(const ResourceXDecodedFrame *release
 		 * until the following requester commit clears the binding. */
 		pcm_transition_apply_internal(entry, PCM_TRANS_X_TO_N_RELEASE, requester_node,
 									  preserve_local_terminal_cover);
+		/* A clean eviction can still owe a durable write and older local PI.
+		 * Preserve that holder for the original storage receipt/ACK path; the
+		 * release itself is not a durable DATA receipt. */
+		if (cluster_shared_config)
+			pg_atomic_fetch_or_u32(&entry->pi_holders_bitmap, requester_bit);
 		state->authority_generation = legacy_generation + 1;
 		released_without_successor = true;
 	} else if (successor->phase != RESOURCE_X_MASTER_WAIT_BLOCKERS

@@ -8998,7 +8998,8 @@ UT_TEST(test_cached_x_eviction_keeps_logical_pi_after_release)
 	cached_x_eviction_case(true);
 }
 
-UT_TEST(test_resource_x_local_master_release_keeps_cached_cover_until_commit)
+static void
+local_master_release_case(bool shared)
 {
 	BufferTag tag = make_tag(203);
 	ResourceXAssertion assertion;
@@ -9107,6 +9108,7 @@ UT_TEST(test_resource_x_local_master_release_keeps_cached_cover_until_commit)
 	/* Local-master kind-4 apply mutates the canonical GRD X to N, but the
 	 * requester cover is still the immutable admission evidence required by
 	 * the matching release commit.  Only that commit may clear it. */
+	cluster_shared_config = shared;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_release_x_exact(&release, 0, &snapshot),
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT(
@@ -9114,8 +9116,25 @@ UT_TEST(test_resource_x_local_master_release_keeps_cached_cover_until_commit)
 	UT_ASSERT_EQ(
 		cluster_pcm_lock_resource_x_target_evict_commit_exact(&release, 0, 77, 8, &eviction),
 		RESOURCE_X_APPLY_APPLIED);
+	if (shared) {
+		ClusterPcmPiStorageCutV1 cut;
+		/* Query immediately: no intervening requester may revive QUIESCING. */
+		UT_ASSERT(cluster_pcm_lock_pi_storage_snapshot_v1(tag, &cut));
+		UT_ASSERT_EQ(cut.pi_holders_bitmap, 1u);
+	}
 	UT_ASSERT(
 		!cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(&expected_ref, 31, 77, 8));
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_resource_x_local_master_release_keeps_cached_cover_until_commit)
+{
+	local_master_release_case(false);
+}
+
+UT_TEST(test_shared_local_master_release_preserves_cover_and_retirement_candidate)
+{
+	local_master_release_case(true);
 }
 
 UT_TEST(test_resource_x_local_n_without_evicting_owner_is_post_mutation_ambiguity)
@@ -9679,7 +9698,7 @@ setup_pi_write_master_with_holders(BufferTag tag, uint32 holders)
 	for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++)
 		if (holders & (1u << node))
 			cluster_pcm_lock_pi_holder_note(tag, node);
-	UT_ASSERT(cluster_pcm_lock_pi_write_snapshot_v1(tag, &pi_receipt_cut));
+	UT_ASSERT_EQ(cluster_pcm_lock_pi_write_snapshot_v1(tag, &pi_receipt_cut), holders != 0);
 	pi_ack_cut = pi_receipt_cut;
 }
 
@@ -9698,8 +9717,8 @@ release_pi_write_master_internal(BufferTag tag, bool add_reader, bool has_pi)
 		= make_resource_x_master_frame(RESOURCE_X_WIRE_RELEASE_X, tag, 2, 2);
 	ResourceXMasterSnapshot snapshot;
 
-	/* The third PI is an explicit keeper report, not inferred from a clean
-	 * RELEASE_X (which need not leave a physical PI). */
+	/* An explicit earlier keeper report remains independent of the release's
+	 * shared-mode obligation, even when no physical PI remains resident. */
 	if (has_pi)
 		cluster_pcm_lock_pi_holder_note(tag, 2);
 	release.common.observed_mode = PCM_STATE_X;
@@ -9718,6 +9737,91 @@ static void
 release_pi_write_master(BufferTag tag, bool add_reader)
 {
 	release_pi_write_master_internal(tag, add_reader, true);
+}
+
+UT_TEST(test_shared_eviction_release_retires_through_the_original_storage_cut)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		BufferTag tag = make_tag(6550 + variant), tags[2];
+		uint32 original = variant == 1 ? 1u << 1 : 0;
+		uint32 expected = original | (1u << 2), cursor = 0, holders = 99;
+		ResourceXDecodedFrame release;
+		ResourceXMasterSnapshot snapshot;
+		struct StopPcmEntryLayout *entry;
+		const ClusterPiPhysicalAckV1 *acks[2] = { pi_acks[1], pi_acks[2] };
+
+		setup_pi_write_master_with_holders(tag, original);
+		if (variant == 3) {
+			ResourceXAssertion assertion;
+
+			UT_ASSERT(resource_x_assertion_init(&tag, 2, &assertion));
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(&assertion, &snapshot),
+						 RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_settled_retire_exact(
+							 &assertion, snapshot.assertion_sequence, &snapshot),
+						 RESOURCE_X_APPLY_APPLIED);
+		}
+		if (variant == 2)
+			cluster_shared_config = false;
+		release_pi_write_master_internal(tag, false, false);
+		entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+		UT_ASSERT_NOT_NULL(entry);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->master_state), PCM_STATE_N);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap),
+					 variant == 2 ? original : expected);
+		if (variant == 2)
+			continue;
+		if (variant == 3)
+			UT_ASSERT_EQ(pg_atomic_read_u32(&entry->lifecycle), PCM_ENTRY_QUIESCING);
+		UT_ASSERT_EQ(cluster_pcm_lock_pi_candidates_v1(&cursor, 4, tags, lengthof(tags)), 1);
+		UT_ASSERT(BufferTagsEqual(&tags[0], &tag));
+		if (!cluster_pcm_lock_pi_storage_snapshot_v1(tag, &pi_storage_receipt_cut)) {
+			UT_ASSERT(false); /* A storage cut must exist for the released holder. */
+			continue;
+		}
+		{
+			ClusterPcmPiStorageCutV1 untouched = pi_storage_receipt_cut;
+			uint32 lifecycle = pg_atomic_read_u32(&entry->lifecycle);
+
+			pg_atomic_write_u32(&entry->lifecycle, PCM_ENTRY_RETIRING);
+			UT_ASSERT(!cluster_pcm_lock_pi_storage_snapshot_v1(tag, &untouched));
+			UT_ASSERT_EQ(memcmp(&untouched, &pi_storage_receipt_cut, sizeof(untouched)), 0);
+			pg_atomic_write_u32(&entry->lifecycle, lifecycle);
+		}
+		pi_storage_ack_cut = pi_storage_receipt_cut;
+		pi_storage_receipt_valid = true;
+		pi_storage_ack_cut.authority.transition_count++;
+		UT_ASSERT(!cluster_pcm_lock_pi_storage_complete_v1((void *)&pi_receipt_fixture, NULL, NULL,
+														   0, variant == 1 ? acks : &acks[1],
+														   variant == 1 ? 2 : 1, &holders));
+		UT_ASSERT_EQ(holders, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), expected);
+		pi_storage_ack_cut = pi_storage_receipt_cut;
+		pi_ack_available = original;
+		UT_ASSERT(!cluster_pcm_lock_pi_storage_complete_v1((void *)&pi_receipt_fixture, NULL, NULL,
+														   0, variant == 1 ? acks : &acks[1],
+														   variant == 1 ? 2 : 1, &holders));
+		UT_ASSERT_EQ(holders, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), expected);
+		pi_ack_available = expected;
+		UT_ASSERT(cluster_pcm_lock_pi_storage_complete_v1((void *)&pi_receipt_fixture, NULL, NULL,
+														  0, variant == 1 ? acks : &acks[1],
+														  variant == 1 ? 2 : 1, &holders));
+		UT_ASSERT_EQ(holders, expected);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 0);
+		release = make_resource_x_master_frame(RESOURCE_X_WIRE_RELEASE_X, tag, 2, 2);
+		release.common.observed_mode = PCM_STATE_X;
+		release.common.target_mode = PCM_STATE_N;
+		release.common.outcome = RESOURCE_X_OUTCOME_OK;
+		release.common.base_authority_generation = 1;
+		release.common.authority_generation = 2;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_release_x_exact(&release, 2, &snapshot),
+					 RESOURCE_X_APPLY_DUPLICATE);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 0);
+		cursor = 0;
+		UT_ASSERT_EQ(cluster_pcm_lock_pi_candidates_v1(&cursor, 4, tags, lengthof(tags)), 0);
+	}
+	cluster_shared_config = false;
 }
 
 static ResourceXDecodedFrame resource_x_admitted_test_assert(
@@ -10188,9 +10292,25 @@ static struct StopPcmEntryLayout *
 setup_structural_master_completion(BufferTag tag, unsigned mode, uint32 holders)
 {
 	struct StopPcmEntryLayout *entry;
-	setup_pi_write_master_with_holders(tag, holders);
-	if (mode != 0)
+	setup_pi_write_master_with_holders(tag, mode == 0 ? holders : 0);
+	if (mode != 0) {
+		uint32 retired = 0;
+
 		release_pi_write_master_internal(tag, mode == 2, false);
+		/* Retire the departed remote holder through the actual DATA consumer
+		 * before setting up this local-only structural ACK boundary. A release
+		 * is no longer itself evidence of durable DATA. */
+		UT_ASSERT(cluster_pcm_lock_pi_storage_snapshot_v1(tag, &pi_storage_receipt_cut));
+		pi_storage_ack_cut = pi_storage_receipt_cut;
+		pi_storage_receipt_valid = true;
+		UT_ASSERT(cluster_pcm_lock_pi_storage_complete_v1((void *)&pi_receipt_fixture, NULL, NULL,
+														  0, &pi_acks[2], 1, &retired));
+		UT_ASSERT_EQ(retired, 1u << 2);
+		pi_storage_receipt_valid = false;
+		for (int node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++)
+			if (holders & (1u << node))
+				cluster_pcm_lock_pi_holder_note(tag, node);
+	}
 	memset(&structural_master_write_cut, 0, sizeof(structural_master_write_cut));
 	memset(&structural_master_storage_cut, 0, sizeof(structural_master_storage_cut));
 	if (mode == 0)
@@ -22862,7 +22982,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(351);
+	UT_PLAN(353);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
@@ -22999,6 +23119,7 @@ main(void)
 	UT_RUN(test_resource_x_cached_x_eviction_prepares_and_commits_release);
 	UT_RUN(test_cached_x_eviction_keeps_logical_pi_after_release);
 	UT_RUN(test_resource_x_local_master_release_keeps_cached_cover_until_commit);
+	UT_RUN(test_shared_local_master_release_preserves_cover_and_retirement_candidate);
 	UT_RUN(test_resource_x_local_n_without_evicting_owner_is_post_mutation_ambiguity);
 	UT_RUN(test_resource_x_terminal_remote_holder_binds_exact_final_authority);
 	UT_RUN(test_resource_x_adapter_adopts_only_exact_pristine_legacy_base);
@@ -23008,6 +23129,7 @@ main(void)
 	UT_RUN(test_pi_write_master_requires_physical_confirmation);
 	UT_RUN(test_pi_master_rejects_unqualified_foreign_ack_and_scans_bounded);
 	UT_RUN(test_pi_completion_requires_entire_unique_confirmation_set);
+	UT_RUN(test_shared_eviction_release_retires_through_the_original_storage_cut);
 	UT_RUN(test_pi_storage_completion_is_exact_and_idempotent);
 	UT_RUN(test_shared_legacy_x_apis_refuse_without_changing_authority);
 	UT_RUN(test_shared_remote_holder_downgrade_registers_cached_reader);
