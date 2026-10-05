@@ -34,7 +34,9 @@ StaticAssertDecl(CLUSTER_KO_SHARED_V2_BYTES == 160, "structural receipt KO layou
 StaticAssertDecl(CLUSTER_PI_WRITEBACK_MAX_BYTES_V2 == 22960, "bounded v2 writeback frame");
 
 #define WB_RETRY_US INT64CONST(100000)
+#define WB_OFFER_QUANTUM_US (10 * WB_RETRY_US)
 enum { WB_EMPTY, WB_QUEUED, WB_RUNNING, WB_REPLIED };
+enum { WB_BATCH_OFFER, WB_BATCH_DATA, WB_BATCH_STRUCTURE, WB_BATCH_KINDS };
 
 typedef struct WritebackShared {
 	slock_t lock;
@@ -108,12 +110,22 @@ typedef struct WritebackBatch {
 	pid_t pid;
 	uint64 epoch;
 	ClusterWalSourceRef local;
+	bool structure_offer;
+	bool offer_completed;
+	bool structure_pages;
+	bool structure_handled;
+	TimestampTz offer_started;
+	uint32 offer_slot, offer_peer;
+	uint64 offer_serial;
 	uint32 count, data_index, peer_index, group_count, source_count;
 	BufferTag tags[CLUSTER_PI_WRITEBACK_MAX];
 	ClusterPcmPiWriteCutV1 write_cuts[CLUSTER_PI_WRITEBACK_MAX];
 	ClusterPcmPiStorageCutV1 storage_cuts[CLUSTER_PI_WRITEBACK_MAX];
 	ClusterPageDataReceiptV1 *receipts[CLUSTER_PI_WRITEBACK_MAX];
 	ClusterPiPhysicalAckV1 *acks[CLUSTER_PI_WRITEBACK_MAX][RESOURCE_X_PROTOCOL_NODE_LIMIT];
+	ClusterPageStructuralReceiptV2 *structural[CLUSTER_PI_WRITEBACK_MAX];
+	ClusterPiStructuralAckV2
+		*structural_acks[CLUSTER_PI_WRITEBACK_MAX][RESOURCE_X_PROTOCOL_NODE_LIMIT];
 	uint32 ack_count[CLUSTER_PI_WRITEBACK_MAX];
 	uint32 group_indices[CLUSTER_PI_WRITEBACK_MAX];
 	bool qualified[CLUSTER_PI_WRITEBACK_MAX];
@@ -129,6 +141,11 @@ static ClusterPiWritebackJobV1 *wb_active;
 static ClusterPiWritebackNoticeV1 *wb_notice;
 static WritebackBatch *wb_batch;
 static uint32 wb_scan_cursor;
+static uint32 wb_offer_scan[RESOURCE_X_PROTOCOL_NODE_LIMIT], wb_offer_peer;
+static uint32 wb_batch_turn = WB_BATCH_STRUCTURE;
+static uint32 wb_structure_scan;
+static uint32 wb_structure_page_scan[CLUSTER_KO_SHARED_CONTEXT_LIMIT_V2];
+static uint64 wb_structure_serials[CLUSTER_KO_SHARED_CONTEXT_LIMIT_V2];
 static bool wb_callbacks;
 static TimestampTz wb_last_send;
 static uint64 wb_sent_revision, wb_sent_inbound;
@@ -1785,9 +1802,12 @@ cluster_pi_writeback_checkpointer_release_v1(void)
 	cluster_pi_writeback_release_v1(&batch->physical_job);
 	cluster_pi_data_release_v1(&batch->data_job);
 	for (uint32 i = 0; i < batch->count; i++) {
-		for (uint32 j = 0; j < batch->ack_count[i]; j++)
+		for (uint32 j = 0; j < batch->ack_count[i]; j++) {
 			cluster_page_data_pi_ack_free_v1(&batch->acks[i][j]);
+			cluster_page_structural_pi_ack_free_v2(&batch->structural_acks[i][j]);
+		}
 		cluster_page_data_receipt_free_v1(&batch->receipts[i]);
+		cluster_page_structural_receipt_free_v2(&batch->structural[i]);
 	}
 	cluster_thread_recovery_fabric_plan_destroy_v1(&batch->plan);
 	cluster_wal_inputs_release_v1(&batch->inputs);
@@ -1810,27 +1830,101 @@ wb_batch_current(void)
 		   && memcmp(&local, &wb_batch->local, sizeof(local)) == 0;
 }
 
-static bool
-wb_batch_start(void)
+static void
+wb_batch_allocate(const ClusterWalSourceRef *local)
 {
-	BufferTag tags[CLUSTER_PI_WRITEBACK_MAX];
-	ClusterWalSourceRef local;
-	uint32 count;
-	if (RecoveryInProgress() || cluster_normal_stop_requested() || !cluster_qvotec_in_quorum()
-		|| cluster_reconfig_has_pending_prebump_stage()
-		|| !cluster_wal_thread_current_v2_ref(&local)
-		|| !cluster_wal_claim_v2_ref_valid(&local.claim) || local.timeline == 0
-		|| local.claim.identity.origin_node_id != cluster_node_id
-		|| local.claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation())
-		return false;
-	count = cluster_pcm_lock_pi_candidates_v1(&wb_scan_cursor, 128, tags, CLUSTER_PI_WRITEBACK_MAX);
-	if (count == 0 || count > CLUSTER_PI_WRITEBACK_MAX)
-		return false;
 	wb_batch = palloc0(sizeof(*wb_batch));
 	wb_batch->owner = CurrentResourceOwner;
 	wb_batch->pid = getpid();
-	wb_batch->local = local;
+	wb_batch->local = *local;
 	wb_batch->epoch = cluster_epoch_get_current();
+}
+
+static bool
+wb_batch_offer_start(const ClusterWalSourceRef *local)
+{
+	if ((cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0)
+		return false;
+	for (uint32 n = 0; n < RESOURCE_X_PROTOCOL_NODE_LIMIT; n++) {
+		ClusterPiWritebackFactV2 fact;
+		uint64 serial;
+		uint32 peer = wb_offer_peer++ % RESOURCE_X_PROTOCOL_NODE_LIMIT;
+
+		if (peer == cluster_node_id || cluster_membership_get_state(peer) != CLUSTER_MEMBER_MEMBER)
+			continue;
+		if (!cluster_ko_shared_structure_offer_next_v2(&wb_offer_scan[peer], peer, &serial,
+													   &fact)) {
+			/* Wrap on the next pass; never scan a second full slot range in
+			 * one tick or let a retained failed peer monopolize the batch. */
+			wb_offer_scan[peer] = 0;
+			continue;
+		}
+		wb_batch_allocate(local);
+		wb_batch->structure_offer = true;
+		wb_batch->offer_started = GetCurrentTimestamp();
+		wb_batch->offer_slot = wb_offer_scan[peer] - 1;
+		wb_batch->offer_serial = serial;
+		wb_batch->offer_peer = peer;
+		InitBufferTag(&wb_batch->tags[0], &fact.proof.structural.terminal.binding.identity.locator,
+					  SPACE_FORKNUM, 0);
+		return true;
+	}
+	return false;
+}
+
+static bool
+wb_batch_structure_start(const ClusterWalSourceRef *local)
+{
+	ClusterPageWalBindingV1 terminal;
+	BufferTag tags[CLUSTER_PI_WRITEBACK_MAX];
+	uint64 serial;
+	uint32 slot, count, selected = 0;
+	if ((cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0)
+		return false;
+	if (!cluster_ko_shared_structure_next_v2(&wb_structure_scan, &serial, &terminal)) {
+		wb_structure_scan = 0;
+		return false;
+	}
+	if (wb_structure_scan == 0 || wb_structure_scan > CLUSTER_KO_SHARED_CONTEXT_LIMIT_V2
+		|| serial == 0
+		|| terminal.identity.system_identifier != local->claim.identity.system_identifier
+		|| memcmp(terminal.identity.storage_uuid, local->claim.identity.storage_uuid, 16) != 0
+		|| terminal.source.claim.database_incarnation != local->claim.database_incarnation)
+		return false;
+	slot = wb_structure_scan - 1;
+	if (wb_structure_serials[slot] != serial) {
+		wb_structure_page_scan[slot] = 0;
+		wb_structure_serials[slot] = serial;
+	}
+	count = cluster_pcm_lock_pi_candidates_v1(&wb_structure_page_scan[slot], 128, tags,
+											  CLUSTER_PI_WRITEBACK_MAX);
+	if (count > CLUSTER_PI_WRITEBACK_MAX)
+		return false;
+	for (uint32 i = 0; i < count; i++)
+		if ((tags[i].forkNum == MAIN_FORKNUM || tags[i].forkNum == VISIBILITYMAP_FORKNUM)
+			&& RelFileLocatorEquals(BufTagGetRelFileLocator(&tags[i]), terminal.identity.locator))
+			tags[selected++] = tags[i];
+	if (selected == 0)
+		return false;
+	wb_batch_allocate(local);
+	wb_batch->structure_pages = true;
+	wb_batch->offer_started = GetCurrentTimestamp();
+	wb_batch->offer_slot = slot;
+	wb_batch->offer_serial = serial;
+	wb_batch->count = selected;
+	memcpy(wb_batch->tags, tags, selected * sizeof(*tags));
+	return true;
+}
+
+static bool
+wb_batch_data_start(const ClusterWalSourceRef *local)
+{
+	BufferTag tags[CLUSTER_PI_WRITEBACK_MAX];
+	uint32 count;
+	count = cluster_pcm_lock_pi_candidates_v1(&wb_scan_cursor, 128, tags, CLUSTER_PI_WRITEBACK_MAX);
+	if (count == 0 || count > CLUSTER_PI_WRITEBACK_MAX)
+		return false;
+	wb_batch_allocate(local);
 	for (uint32 i = 0; i < count; i++) {
 		uint32 next = wb_batch->count;
 		if (!cluster_pcm_lock_pi_write_snapshot_v1(tags[i], &wb_batch->write_cuts[next])
@@ -1844,6 +1938,30 @@ wb_batch_start(void)
 		wb_batch = NULL;
 		return false;
 	}
+	return true;
+}
+
+static bool
+wb_batch_start(void)
+{
+	ClusterWalSourceRef local;
+	if (RecoveryInProgress() || cluster_normal_stop_requested() || !cluster_qvotec_in_quorum()
+		|| cluster_reconfig_has_pending_prebump_stage()
+		|| !cluster_wal_thread_current_v2_ref(&local)
+		|| !cluster_wal_claim_v2_ref_valid(&local.claim) || local.timeline == 0
+		|| local.claim.identity.origin_node_id != cluster_node_id
+		|| local.claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation())
+		return false;
+	for (uint32 n = 0; n < WB_BATCH_KINDS; n++) {
+		uint32 kind = wb_batch_turn;
+		wb_batch_turn = (wb_batch_turn + 1) % WB_BATCH_KINDS;
+		if (kind == WB_BATCH_OFFER		 ? wb_batch_offer_start(&local)
+			: kind == WB_BATCH_STRUCTURE ? wb_batch_structure_start(&local)
+										 : wb_batch_data_start(&local))
+			break;
+	}
+	if (wb_batch == NULL)
+		return false;
 	SpinLockAcquire(&wb_shared->lock);
 	wb_shared->checkpointer_pid = MyProcPid;
 	SpinLockRelease(&wb_shared->lock);
@@ -1939,6 +2057,125 @@ wb_batch_peer(int32 node, ClusterWalSourceRef *out)
 	return found;
 }
 
+static ClusterControlRootResult
+wb_batch_structure_pages(void)
+{
+	ClusterControlRootResult result;
+	if (wb_batch->plan == NULL) {
+		uint64 records;
+		RfPageProofDetailV1 detail;
+		result = cluster_wal_inputs_contributions_v1(wb_batch->inputs, true, &wb_batch->plan,
+													 &records, &detail);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		for (uint32 i = 0; i < wb_batch->count; i++) {
+			RfPageIdentityV1 page = { 0 };
+			page.system_identifier = wb_batch->local.claim.identity.system_identifier;
+			memcpy(page.storage_uuid, wb_batch->local.claim.identity.storage_uuid, 16);
+			page.locator = BufTagGetRelFileLocator(&wb_batch->tags[i]);
+			page.forknum = wb_batch->tags[i].forkNum;
+			page.blockno = wb_batch->tags[i].blockNum;
+			wb_batch->qualified[i]
+				= cluster_page_structural_from_ko_v2(wb_batch->offer_slot, wb_batch->offer_serial,
+													 &page, wb_batch->plan,
+													 &wb_batch->structural[i])
+				  && cluster_page_structural_pi_proof_v2(wb_batch->structural[i],
+														 &wb_batch->write_cuts[i],
+														 &wb_batch->storage_cuts[i]);
+			if (!wb_batch->qualified[i])
+				wb_rejected(CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER, &wb_batch->tags[i],
+							cluster_node_id, wb_batch->epoch,
+							wb_batch->local.claim.identity.origin_owner_incarnation);
+			AbsorbSyncRequests();
+		}
+	}
+	for (; wb_batch->peer_index < RESOURCE_X_PROTOCOL_NODE_LIMIT; wb_batch->peer_index++) {
+		int32 node = wb_batch->peer_index;
+		if (wb_batch->physical_job == NULL) {
+			const ClusterPageStructuralReceiptV2 *receipts[CLUSTER_PI_WRITEBACK_MAX];
+			ClusterWalSourceRef peer;
+			wb_batch->group_count = 0;
+			for (uint32 i = 0; i < wb_batch->count; i++) {
+				uint32 holders = wb_batch->write_cuts[i].binding_generation != 0
+									 ? wb_batch->write_cuts[i].pi_holders_bitmap
+									 : wb_batch->storage_cuts[i].pi_holders_bitmap;
+				if (!wb_batch->qualified[i] || (holders & (UINT32_C(1) << node)) == 0)
+					continue;
+				wb_batch->group_indices[wb_batch->group_count] = i;
+				receipts[wb_batch->group_count++] = wb_batch->structural[i];
+			}
+			if (wb_batch->group_count == 0)
+				continue;
+			if (node == cluster_node_id) {
+				for (uint32 j = 0; j < wb_batch->group_count; j++) {
+					uint32 i = wb_batch->group_indices[j], n = wb_batch->ack_count[i];
+					if (n >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+						|| !cluster_bufmgr_ack_pi_at_structure_v2(
+							wb_batch->structural[i], wb_batch->inputs,
+							&wb_batch->structural_acks[i][n])) {
+						wb_batch->qualified[i] = false;
+						wb_rejected(CLUSTER_PI_WRITEBACK_LOCAL_ACK, &wb_batch->tags[i], node,
+									wb_batch->epoch,
+									wb_batch->local.claim.identity.origin_owner_incarnation);
+						continue;
+					}
+					wb_batch->ack_count[i]++;
+				}
+				continue;
+			}
+			if (!wb_batch_peer(node, &peer)) {
+				/* A live peer cannot acknowledge a dead boot's responsibility.
+				 * Keep it for the original recovery owner. */
+				for (uint32 j = 0; j < wb_batch->group_count; j++) {
+					uint32 i = wb_batch->group_indices[j];
+					wb_batch->qualified[i] = false;
+					wb_rejected(CLUSTER_PI_WRITEBACK_RECOVERY_PROOF, &wb_batch->tags[i], node,
+								wb_batch->epoch,
+								wb_batch->local.claim.identity.origin_owner_incarnation);
+				}
+				continue;
+			}
+			result = cluster_pi_writeback_structural_begin_v2(receipts, wb_batch->group_count,
+															  &peer, &wb_batch->physical_job);
+			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				return result;
+		}
+		result = cluster_pi_writeback_poll_v1(wb_batch->physical_job);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		for (uint32 j = 0; j < wb_batch->group_count; j++) {
+			uint32 i = wb_batch->group_indices[j], n = wb_batch->ack_count[i];
+			if (n >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+				|| !cluster_page_structural_pi_ack_import_v2(
+					wb_batch->physical_job, j, wb_batch->structural[i], wb_batch->inputs,
+					&wb_batch->structural_acks[i][n])) {
+				wb_batch->qualified[i] = false;
+				wb_rejected(CLUSTER_PI_WRITEBACK_REMOTE_ACK, &wb_batch->tags[i], node,
+							wb_batch->epoch,
+							wb_batch->local.claim.identity.origin_owner_incarnation);
+				continue;
+			}
+			wb_batch->ack_count[i]++;
+		}
+		cluster_pi_writeback_release_v1(&wb_batch->physical_job);
+	}
+	if (!wb_batch_current()
+		|| cluster_wal_inputs_revalidate_v1(wb_batch->inputs) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	for (uint32 i = 0; i < wb_batch->count; i++) {
+		uint32 holders;
+		if (wb_batch->qualified[i]
+			&& !cluster_pcm_lock_pi_structural_complete_v2(
+				wb_batch->structural[i],
+				(const ClusterPiStructuralAckV2 *const *)wb_batch->structural_acks[i],
+				wb_batch->ack_count[i], &holders))
+			wb_rejected(CLUSTER_PI_WRITEBACK_MASTER_CUT, &wb_batch->tags[i], cluster_node_id,
+						wb_batch->epoch, wb_batch->local.claim.identity.origin_owner_incarnation);
+		AbsorbSyncRequests();
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 bool
 cluster_pi_writeback_checkpointer_tick_v1(void)
 {
@@ -1952,7 +2189,7 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 		return false;
 	if (!wb_batch_current())
 		goto done;
-	if (!wb_batch_data())
+	if (!wb_batch->structure_pages && !wb_batch_data())
 		return true;
 	/* Poll a peer's in-memory reply before resuming any WAL input. A silent
 	 * or busy peer must leave the GC writer a real lock-free interval. */
@@ -1968,7 +2205,7 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 											 wb_batch->local.claim.identity.system_identifier,
 											 &wb_batch->inputs);
 		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
-			return true;
+			goto wait;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			goto done;
 	}
@@ -1977,6 +2214,33 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 		goto wait;
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
+	if (wb_batch->structure_offer) {
+		/* The input scope qualifies the peer's original OPEN claim only.
+		 * No WAL census or page plan is needed for relation acceptance. */
+		if (wb_batch->physical_job == NULL) {
+			ClusterWalSourceRef peer;
+			if (!wb_batch_peer(wb_batch->offer_peer, &peer))
+				goto done;
+			result = cluster_pi_writeback_structure_offer_begin_v2(
+				wb_batch->offer_slot, wb_batch->offer_serial, &peer, &wb_batch->physical_job);
+			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
+				goto done;
+			goto wait;
+		}
+		if (cluster_wal_inputs_revalidate_v1(wb_batch->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			wb_batch->offer_completed = cluster_ko_shared_structure_offer_complete_v2(
+				wb_batch->offer_slot, wb_batch->offer_serial, wb_batch->physical_job);
+		goto done;
+	}
+	if (wb_batch->structure_pages) {
+		result = wb_batch_structure_pages();
+		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+			|| result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
+			goto wait;
+		wb_batch->structure_handled = result == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		goto done;
+	}
 	if (wb_batch->plan == NULL) {
 		uint64 records;
 		RfPageProofDetailV1 detail;
@@ -2114,10 +2378,26 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 	}
 	goto done;
 wait:
+	if (wb_batch->structure_offer || wb_batch->structure_pages) {
+		TimestampTz now = GetCurrentTimestamp();
+		if (now < wb_batch->offer_started || now - wb_batch->offer_started >= WB_OFFER_QUANTUM_US) {
+			/* Yield only this attempt. The original KO slot remains pending,
+			 * and the next batch scans DATA before retrying relation offers. */
+			wb_batch_turn = WB_BATCH_DATA;
+			cluster_pi_writeback_checkpointer_release_v1();
+			return true;
+		}
+	}
 	if (wb_batch->inputs == NULL
 		|| cluster_wal_inputs_suspend_v1(wb_batch->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return true;
 done:
+	if (wb_batch->structure_pages && !wb_batch->structure_handled)
+		wb_rejected(CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER, &wb_batch->tags[0], cluster_node_id,
+					wb_batch->epoch, wb_batch->local.claim.identity.origin_owner_incarnation);
+	if (wb_batch->structure_offer && !wb_batch->offer_completed)
+		wb_rejected(CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER, &wb_batch->tags[0], wb_batch->offer_peer,
+					wb_batch->epoch, wb_batch->local.claim.identity.origin_owner_incarnation);
 	cluster_pi_writeback_checkpointer_release_v1();
 	return true;
 }

@@ -1602,21 +1602,30 @@ UT_TEST(writeback_v2_relation_offer_batch_is_bounded_and_ack_ordered)
 
 /* The KO suite exercises the real fixed-slot lifetime. Here its observation
  * is an exact slot/serial/fact seam, never a caller-supplied wire flag. */
-static bool wb_offer_present;
-static uint32 wb_offer_slot;
-static uint64 wb_offer_serial;
-static ClusterPiWritebackFactV2 wb_offer_observed;
 static bool
 wb_offer_read_for_transport(uint32 *cursor, int32 peer, uint64 *serial,
 							ClusterPiWritebackFactV2 *out)
 {
-	if (!wb_offer_present || *cursor > wb_offer_slot
+	if (!wb_offer_present || *cursor > wb_offer_slot || (wb_offer_accepted & (1u << peer)) != 0
 		|| peer != wb_offer_observed.proof.structural.ko.peer_node
 		|| cluster_node_id != wb_offer_observed.proof.structural.ko.origin_node)
 		return false;
 	*cursor = wb_offer_slot + 1;
 	*serial = wb_offer_serial;
 	*out = wb_offer_observed;
+	return true;
+}
+
+/* Only the exact original transport ACK crosses this KO boundary. The KO
+ * suite separately runs the actual slot/serial compare under its lock. */
+static bool
+wb_offer_complete_for_transport(uint32 slot, uint64 serial, const ClusterPiWritebackJobV1 *job)
+{
+	ClusterWalWriterToken peer;
+	wb_offer_complete_calls++;
+	if (!cluster_pi_writeback_structure_offer_ack_v2(job, slot, serial, &peer))
+		return false;
+	wb_offer_accepted |= (uint16)(1u << peer.ref.claim.identity.origin_node_id);
 	return true;
 }
 
@@ -1635,6 +1644,402 @@ wb_offer_setup(ClusterPageDataReceiptV1 *receipt)
 	wb_offer_accept_mask = 1;
 	wb_offer_accept_calls = 0;
 	wb_select(2, B_BG_WRITER);
+}
+
+static void
+wb_structure_schedule_setup(ClusterPageDataReceiptV1 *receipt, ForkNumber fork)
+{
+	ClusterPiDataFactV1 fact;
+	ClusterPiWritebackMessageV2 message;
+	UT_ASSERT(cluster_page_data_pi_fact_v1(receipt, &fact));
+	fact.storage_cut.resource.forkNum = fork;
+	fact.storage_cut.pi_holders_bitmap = 3;
+	wb_storage_cut = fact.storage_cut;
+	wb_v2_fixture(&message, &fact);
+	wb_structural_fact = message.facts[1];
+	wb_structural_fact_ready = wb_structure_schedule = wb_candidates = true;
+	wb_select(0, B_CHECKPOINTER);
+}
+
+UT_TEST(writeback_v2_structure_scheduler_collects_all_original_page_acks)
+{
+	for (unsigned vm = 0; vm < 3; vm++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiWritebackMessageV2 reply;
+		ClusterPiWritebackRejectionsV1 rejected;
+		Size length;
+		unsigned io = writes + reads + syncs;
+		wb_structure_schedule_setup(receipt, vm == 1 ? VISIBILITYMAP_FORKNUM : MAIN_FORKNUM);
+		if (vm == 2) {
+			/* The second page has no qualified structural receipt. */
+			wb_multiple = true;
+			wb_vm_cut = wb_storage_cut;
+			wb_vm_cut.resource.forkNum = VISIBILITYMAP_FORKNUM;
+		}
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT(wb_active != NULL && wb_active->version == 2);
+		if (wb_active == NULL || wb_active->version != 2)
+			goto done;
+		UT_ASSERT_EQ(wb_active->requested_v2.facts[0].kind, CLUSTER_PI_WRITEBACK_STRUCTURAL_V2);
+		if (wb_active->requested_v2.facts[0].kind != CLUSTER_PI_WRITEBACK_STRUCTURAL_V2)
+			goto done;
+		UT_ASSERT_EQ(wb_structure_local_acks, 1);
+		UT_ASSERT_EQ(wb_structure_imports | wb_structure_completions, 0);
+		UT_ASSERT(!wb_inputs_pinned[0]);
+		UT_ASSERT_EQ(wb_plan_builds, 1);
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT_EQ(wb_plan_builds, 1);
+		UT_ASSERT(!wb_inputs_pinned[0]);
+		wb_select(0, B_LMON);
+		cluster_pi_writeback_lmon_tick_v1();
+		UT_ASSERT(cluster_pi_writeback_decode_v2(wb_wire, wb_length, &reply));
+		UT_ASSERT_EQ(wb_destination, 1);
+		/* The peer's opaque physical proof is a separate PAGE boundary.
+		 * Drive its exact authenticated ACK through the real transport. */
+		reply.verb = CLUSTER_PI_WRITEBACK_ACK;
+		UT_ASSERT(cluster_pi_writeback_encode_v2(&reply, wb_wire, sizeof(wb_wire), &length));
+		wb_deliver(1, 0, wb_wire, length);
+		wb_select(0, B_CHECKPOINTER);
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT_EQ(wb_structure_imports, 1);
+		UT_ASSERT_EQ(wb_structure_completions, 1);
+		UT_ASSERT(wb_batch == NULL && wb_active == NULL && !wb_inputs_pinned[0]);
+		UT_ASSERT_EQ(writes + reads + syncs, io);
+		UT_ASSERT(cluster_pi_writeback_rejections_v1(&rejected));
+		UT_ASSERT_EQ(rejected.attempts[CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER], vm == 2 ? 1 : 0);
+		UT_ASSERT(wb_structure_schedule); /* Page completion never retires KO. */
+	done:
+		wb_select(0, B_CHECKPOINTER);
+		cluster_pi_writeback_checkpointer_release_v1();
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_v2_structure_scheduler_refuses_unproved_pages_and_partial_acks)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiWritebackMessageV2 reply;
+		Size length;
+		wb_structure_schedule_setup(receipt, MAIN_FORKNUM);
+		if (fault == 0)
+			wb_structure_proof_ok = false;
+		if (fault == 1)
+			wb_structure_local_ok = false;
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		if (fault < 2)
+			UT_ASSERT(wb_active == NULL && wb_batch == NULL);
+		else {
+			UT_ASSERT(wb_active != NULL && wb_active->version == 2);
+			if (wb_active == NULL || wb_active->version != 2)
+				goto done;
+			reply = wb_active->requested_v2;
+			UT_ASSERT_EQ(reply.facts[0].kind, CLUSTER_PI_WRITEBACK_STRUCTURAL_V2);
+			if (reply.facts[0].kind != CLUSTER_PI_WRITEBACK_STRUCTURAL_V2)
+				goto done;
+			reply.verb = CLUSTER_PI_WRITEBACK_ACK;
+			if (fault == 2)
+				reply.count = 0;
+			UT_ASSERT(cluster_pi_writeback_encode_v2(&reply, wb_wire, sizeof(wb_wire), &length));
+			wb_deliver(1, 0, wb_wire, length);
+			wb_select(0, B_CHECKPOINTER);
+			if (fault == 3)
+				wb_structure_proof_ok = false;
+			if (fault == 4)
+				wb_input_current = false;
+			UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+			UT_ASSERT(wb_active == NULL && wb_batch == NULL);
+		}
+		UT_ASSERT_EQ(wb_structure_completions, 0);
+		UT_ASSERT(wb_structure_schedule && !wb_inputs_pinned[0]);
+	done:
+		wb_select(0, B_CHECKPOINTER);
+		cluster_pi_writeback_checkpointer_release_v1();
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_v2_structure_scheduler_yields_or_cancels_without_clearing_ko)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		wb_structure_schedule_setup(receipt, MAIN_FORKNUM);
+		if (fault == 1)
+			wb_resume_wait = true;
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT(wb_batch != NULL && wb_batch->structure_pages && !wb_inputs_pinned[0]);
+		if (fault == 2) {
+			WritebackBatch *abandoned = wb_batch;
+			ClusterPiWritebackJobV1 *job = wb_active;
+			wb_resource_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+			cluster_pi_writeback_release_v1(&job);
+			pfree(abandoned);
+		} else {
+			wb_now += 1000000;
+			UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		}
+		UT_ASSERT(wb_batch == NULL && wb_active == NULL && !wb_inputs_pinned[0]);
+		UT_ASSERT(wb_structure_schedule);
+		UT_ASSERT_EQ(wb_structure_completions, 0);
+		if (fault < 2) {
+			wb_resume_wait = false;
+			wb_candidates = true;
+			wb_offer_present = true;
+			wb_offer_slot = 4;
+			wb_offer_serial = 27;
+			wb_offer_observed = wb_structural_fact;
+			wb_offer_observed.kind = CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2;
+			wb_offer_observed.proof.structural.ko.origin_node = 0;
+			wb_offer_observed.proof.structural.terminal.binding.source = wb_sources[0];
+			memset(&wb_offer_observed.proof.structural.terminal.write_cut, 0,
+				   sizeof(wb_offer_observed.proof.structural.terminal.write_cut));
+			memset(&wb_offer_observed.proof.structural.terminal.storage_cut, 0,
+				   sizeof(wb_offer_observed.proof.structural.terminal.storage_cut));
+			UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+			UT_ASSERT(wb_batch == NULL
+					  || (!wb_batch->structure_pages && !wb_batch->structure_offer));
+			UT_ASSERT(!wb_candidates);
+		}
+		cluster_pi_writeback_checkpointer_release_v1();
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_v2_checkpointer_dispatches_offer_without_data)
+{
+	ClusterPageDataReceiptV1 *receipt = wb_setup();
+	ClusterPiWritebackMessageV2 request;
+	wb_offer_setup(receipt);
+	wb_select(2, B_CHECKPOINTER);
+	UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+	UT_ASSERT(wb_active != NULL);
+	if (wb_active == NULL)
+		goto done;
+	UT_ASSERT(!wb_inputs_pinned[2]);
+	UT_ASSERT_EQ(wb_plan_builds, 0);
+	UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+	UT_ASSERT(!wb_inputs_pinned[2]);
+	wb_select(2, B_LMON);
+	cluster_pi_writeback_lmon_tick_v1();
+	UT_ASSERT_EQ(wb_destination, 1);
+	UT_ASSERT(cluster_pi_writeback_decode_v2(wb_wire, wb_length, &request));
+	UT_ASSERT_EQ(request.facts[0].kind, CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2);
+	wb_deliver(2, 1, wb_wire, wb_length);
+	wb_select(1, B_BG_WRITER);
+	UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+	wb_select(1, B_LMON);
+	cluster_pi_writeback_lmon_tick_v1();
+	wb_deliver(1, 2, wb_wire, wb_length);
+	wb_select(2, B_CHECKPOINTER);
+	UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+	UT_ASSERT_EQ(wb_offer_complete_calls, 1);
+	UT_ASSERT_EQ(wb_offer_accepted, 2);
+	UT_ASSERT(wb_active == NULL && wb_batch == NULL && !wb_inputs_pinned[2]);
+	UT_ASSERT(!cluster_pi_writeback_checkpointer_tick_v1());
+	UT_ASSERT(wb_offer_present);
+	UT_ASSERT_EQ(pi_discards | wb_master_completions | logical_pi_retire_calls | wb_plan_builds, 0);
+done:
+	wb_select(2, B_CHECKPOINTER);
+	cluster_pi_writeback_checkpointer_release_v1();
+	wb_select(0, B_CHECKPOINTER);
+	cluster_page_data_receipt_free_v1(&receipt);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(writeback_v2_checkpointer_preserves_offer_on_refusal_and_stop)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		wb_offer_setup(receipt);
+		wb_select(2, B_CHECKPOINTER);
+		if (fault == 0)
+			wb_local_caps = 0;
+		if (fault == 1)
+			wb_inputs[1].current = false;
+		if (fault == 2)
+			wb_inputs[1].source.claim.identity.origin_owner_incarnation++;
+		(void)cluster_pi_writeback_checkpointer_tick_v1();
+		if (fault < 3)
+			UT_ASSERT(wb_active == NULL && wb_batch == NULL);
+		else {
+			UT_ASSERT(wb_active != NULL);
+			if (fault == 3)
+				wb_stop = true;
+			else
+				wb_offer_serial++;
+			(void)cluster_pi_writeback_checkpointer_tick_v1();
+			UT_ASSERT(wb_active == NULL && wb_batch == NULL);
+		}
+		UT_ASSERT(!wb_inputs_pinned[2] && wb_offer_present);
+		UT_ASSERT_EQ(wb_offer_accepted | wb_offer_complete_calls | wb_plan_builds, 0);
+		cluster_pi_writeback_checkpointer_release_v1();
+		wb_select(0, B_CHECKPOINTER);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_v2_checkpointer_empty_ack_keeps_offer_and_yields_to_data)
+{
+	ClusterPageDataReceiptV1 *receipt = wb_setup();
+	ClusterPiWritebackRejectionsV1 rejected;
+	unsigned plans;
+	wb_offer_setup(receipt);
+	wb_offer_observed.proof.structural.ko.origin_node = 0;
+	wb_offer_observed.proof.structural.terminal.binding.source = wb_sources[0];
+	wb_offer_accept_mask = 0;
+	wb_candidates = true;
+	wb_select(0, B_CHECKPOINTER);
+	UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+	UT_ASSERT(wb_active != NULL && wb_batch != NULL && wb_batch->structure_offer);
+	if (wb_active == NULL)
+		goto done;
+	UT_ASSERT(wb_candidates); /* The offer did not consume the DATA scan. */
+	wb_select(0, B_LMON);
+	cluster_pi_writeback_lmon_tick_v1();
+	wb_deliver(0, 1, wb_wire, wb_length);
+	wb_select(1, B_BG_WRITER);
+	UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+	wb_select(1, B_LMON);
+	cluster_pi_writeback_lmon_tick_v1();
+	wb_deliver(1, 0, wb_wire, wb_length);
+	wb_select(0, B_CHECKPOINTER);
+	UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+	UT_ASSERT_EQ(wb_offer_accepted, 0);
+	UT_ASSERT(wb_offer_present && wb_active == NULL && wb_batch == NULL);
+	UT_ASSERT(cluster_pi_writeback_rejections_v1(&rejected));
+	UT_ASSERT_EQ(rejected.attempts[CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER], 1);
+	UT_ASSERT_EQ(wb_log_calls[0], 1);
+	plans = wb_plan_builds;
+	UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+	UT_ASSERT(!wb_candidates && wb_plan_builds > plans);
+	UT_ASSERT(wb_batch == NULL || !wb_batch->structure_offer);
+done:
+	wb_select(0, B_CHECKPOINTER);
+	cluster_pi_writeback_checkpointer_release_v1();
+	cluster_page_data_receipt_free_v1(&receipt);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
+UT_TEST(writeback_v2_checkpointer_pending_offer_yields_without_clearing_obligation)
+{
+	for (unsigned delayed = 0; delayed < 2; delayed++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiWritebackRejectionsV1 rejected;
+		uint8 late[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
+		Size late_length = 0;
+		unsigned plans;
+		wb_offer_setup(receipt);
+		wb_offer_observed.proof.structural.ko.origin_node = 0;
+		wb_offer_observed.proof.structural.terminal.binding.source = wb_sources[0];
+		wb_candidates = true;
+		wb_select(0, B_CHECKPOINTER);
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT(wb_active != NULL && wb_batch != NULL && wb_batch->structure_offer);
+		if (wb_active == NULL)
+			goto done;
+		if (delayed) {
+			wb_select(0, B_LMON);
+			cluster_pi_writeback_lmon_tick_v1();
+			wb_deliver(0, 1, wb_wire, wb_length);
+			wb_select(1, B_BG_WRITER);
+			UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+			wb_select(1, B_LMON);
+			cluster_pi_writeback_lmon_tick_v1();
+			late_length = wb_length;
+			memcpy(late, wb_wire, late_length);
+			wb_select(0, B_CHECKPOINTER);
+		}
+		wb_now += 999999;
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT(wb_active != NULL && wb_candidates && !wb_inputs_pinned[0]);
+		wb_now++;
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT(wb_active == NULL && wb_batch == NULL && !wb_inputs_pinned[0]);
+		UT_ASSERT(wb_offer_present && wb_candidates);
+		UT_ASSERT_EQ(wb_offer_accepted | wb_offer_complete_calls | wb_plan_builds, 0);
+		UT_ASSERT(cluster_pi_writeback_rejections_v1(&rejected));
+		UT_ASSERT_EQ(rejected.attempts[CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER], 0);
+		plans = wb_plan_builds;
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT(!wb_candidates && wb_plan_builds > plans);
+		UT_ASSERT(wb_batch == NULL || !wb_batch->structure_offer);
+		if (late_length != 0)
+			wb_deliver(1, 0, late, late_length);
+		UT_ASSERT_EQ(wb_offer_accepted | wb_offer_complete_calls, 0);
+		UT_ASSERT(wb_offer_present);
+	done:
+		wb_select(0, B_CHECKPOINTER);
+		cluster_pi_writeback_checkpointer_release_v1();
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_v2_checkpointer_offer_input_wait_yields_to_data)
+{
+	for (unsigned backwards = 0; backwards < 2; backwards++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		wb_offer_setup(receipt);
+		wb_offer_observed.proof.structural.ko.origin_node = 0;
+		wb_offer_observed.proof.structural.terminal.binding.source = wb_sources[0];
+		wb_candidates = wb_resume_wait = true;
+		wb_select(0, B_CHECKPOINTER);
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT(wb_batch != NULL && wb_active == NULL && !wb_inputs_pinned[0]);
+		wb_now += backwards ? -1 : 1000000;
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT(wb_batch == NULL && wb_offer_present && !wb_inputs_pinned[0]);
+		UT_ASSERT_EQ(wb_offer_accepted | wb_offer_complete_calls | wb_plan_builds, 0);
+		wb_resume_wait = false;
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT(!wb_candidates && wb_plan_builds > 0);
+		UT_ASSERT(wb_batch == NULL || !wb_batch->structure_offer);
+		cluster_pi_writeback_checkpointer_release_v1();
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(writeback_v2_checkpointer_owner_error_preserves_original_offer)
+{
+	ClusterPageDataReceiptV1 *receipt = wb_setup();
+	WritebackBatch *abandoned;
+	ClusterPiWritebackJobV1 *job;
+	wb_offer_setup(receipt);
+	wb_select(2, B_CHECKPOINTER);
+	UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+	abandoned = wb_batch;
+	job = wb_active;
+	UT_ASSERT(abandoned != NULL && job != NULL);
+	if (abandoned == NULL || job == NULL)
+		goto done;
+	UT_ASSERT(!wb_inputs_pinned[2]);
+	wb_resource_release(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT(wb_batch == NULL && wb_active == NULL && wb_shared->outbound_pid == 0);
+	UT_ASSERT(wb_offer_present && wb_offer_accepted == 0 && !wb_inputs_pinned[2]);
+	/* The backend's native resource/memory owners reclaim these on ERROR.
+	 * This single-process boundary releases only its abandoned allocations. */
+	cluster_pi_writeback_release_v1(&job);
+	pfree(abandoned);
+done:
+	wb_select(2, B_CHECKPOINTER);
+	cluster_pi_writeback_checkpointer_release_v1();
+	wb_select(0, B_CHECKPOINTER);
+	cluster_page_data_receipt_free_v1(&receipt);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
 }
 
 UT_TEST(writeback_v2_original_offer_job_reaches_remote_acceptance)

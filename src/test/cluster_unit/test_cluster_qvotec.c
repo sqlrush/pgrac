@@ -51,8 +51,12 @@
  */
 #include "postgres.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_conf.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_wal_claim.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_writer.h"
+#include "cluster/cluster_write_fence.h"
 
 /* This link/lifecycle fixture does not run a semantic authority round. */
 void
@@ -80,6 +84,41 @@ ClusterControlRootResult
 cluster_wal_writer_ready(TimeLineID timeline pg_attribute_unused())
 {
 	abort();
+}
+
+bool
+cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected pg_attribute_unused(),
+										uint64 epoch pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread pg_attribute_unused(),
+											   struct ClusterFormationSnapshotV1 *out
+												   pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_write_fence_allowed(void)
+{
+	abort();
+}
+
+ClusterControlRootResult
+cluster_wal_claim_v2_encode(const ClusterWalThreadClaimV2 *claim pg_attribute_unused(),
+							uint8 bytes[CLUSTER_WAL_CLAIM_V2_BYTES] pg_attribute_unused())
+{
+	abort();
+}
+
+/* No cluster.conf is loaded by this descriptor-owned voting fixture. */
+const ClusterNodeInfo *
+cluster_conf_lookup_node(int32 node_id pg_attribute_unused())
+{
+	return NULL;
 }
 
 #include <fcntl.h>

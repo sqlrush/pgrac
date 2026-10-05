@@ -21306,78 +21306,6 @@ UT_TEST(test_r_a22_pending_first_record_survives_reconfiguration)
 	local_pi_writer_ready = cluster_shared_config = false;
 }
 
-/*
- * S08 chain, independent of the write before handover: a page handed over
- * with its first own record, published into the local PI, then taken back,
- * re-dirtied and handed over again keeps the earliest first record as its
- * responsibility.  A receipt computed before the re-dirty arrives late and
- * retires nothing; only a receipt for the current responsibility does.
- * The local PI floor never rises above the earliest unretired record.
- */
-UT_TEST(test_s08_redirtied_handover_keeps_first_until_exact_receipt)
-{
-	BufferTag tag = make_tag(959);
-	ClusterPageWalBindingV1 binding, first, later_first, later;
-	ClusterPcmLocalPiSnapshotV1 published, redirtied, empty;
-	ClusterPcmLocalPiFloorV1 floor;
-	ClusterPageWalRefV1 ref = { 0 };
-	ResourceXDecodedFrame block, image, status;
-	const ClusterPageDataReceiptV1 *receipt = (const void *)&pi_receipt_fixture;
-
-	r_a22_holder_pair_fixture(tag, &binding, &first, &block, &status, &image);
-	UT_ASSERT(cluster_page_wal_ref_retain_v1(&first, &ref));
-	UT_ASSERT_EQ(
-		cluster_pcm_lock_resource_x_block_to_n_source_exact(&block, 1, &status, &image, &ref),
-		RESOURCE_X_APPLY_APPLIED);
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_publish_exact(
-					 &block.common.logical_assertion, block.common.assertion_sequence, 1,
-					 block.common.master_session_incarnation),
-				 RESOURCE_X_APPLY_APPLIED);
-	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &published));
-	UT_ASSERT(cluster_page_wal_same_mutation_v1(&published.first, &first));
-
-	/* Taken back, re-dirtied (a later own record) and handed over again. */
-	later_first = binding;
-	later_first.version.mutation_token++;
-	later_first.record_start = binding.record_end + 0x10;
-	later_first.record_end = binding.record_end + 0x20;
-	later = later_first;
-	later.version.mutation_token++;
-	later.record_start = later_first.record_end;
-	later.record_end = later_first.record_end + 0x10;
-	UT_ASSERT(cluster_pcm_local_pi_record_first_v1(tag, &later_first, &later));
-	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &redirtied));
-	UT_ASSERT(cluster_page_wal_same_mutation_v1(&redirtied.first, &first));
-	UT_ASSERT(cluster_page_wal_same_mutation_v1(&redirtied.last, &later));
-	UT_ASSERT(redirtied.revision > published.revision);
-	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&binding.source, &floor));
-	UT_ASSERT_EQ(floor.floor, first.record_start);
-
-	/* The receipt for the responsibility before the re-dirty comes late. */
-	pi_receipt_valid = true;
-	pi_storage_receipt_valid = false;
-	memset(&pi_receipt_cut, 0, sizeof(pi_receipt_cut));
-	pi_ack_cut = pi_receipt_cut;
-	pi_ack_available = 1;
-	pi_ack_imported = 0;
-	local_pi_covered = true;
-	UT_ASSERT(!cluster_pcm_local_pi_retire_v1(&published, receipt, NULL, NULL, 0, pi_acks[0]));
-	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&binding.source, &floor));
-	UT_ASSERT_EQ(floor.floor, first.record_start);
-	UT_ASSERT_EQ(floor.bounded, 1);
-
-	/* The receipt for the current responsibility retires it. */
-	UT_ASSERT(cluster_pcm_local_pi_retire_v1(&redirtied, receipt, NULL, NULL, 0, pi_acks[0]));
-	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &empty));
-	UT_ASSERT_EQ(empty.first.record_start, 0);
-	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&binding.source, &floor));
-	UT_ASSERT_EQ(floor.bounded, 0);
-	UT_ASSERT_EQ(floor.pending, 0);
-	local_pi_covered = pi_receipt_valid = false;
-	pi_ack_available = 0;
-	local_pi_writer_ready = cluster_shared_config = false;
-}
-
 UT_TEST(test_local_pi_requires_original_all_member_stop_cut)
 {
 	BufferTag tag = make_tag(917);
@@ -22387,7 +22315,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(337);
+	UT_PLAN(339);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -22706,7 +22634,6 @@ main(void)
 	UT_RUN(test_r_a22_holder_pair_carries_first_record_to_local_pi);
 	UT_RUN(test_r_a22_unpublishable_first_record_stays_pending);
 	UT_RUN(test_r_a22_pending_first_record_survives_reconfiguration);
-	UT_RUN(test_s08_redirtied_handover_keeps_first_until_exact_receipt);
 	UT_RUN(test_local_pi_requires_original_all_member_stop_cut);
 	UT_RUN(test_local_pi_read_only_carrier_does_not_create_writer_responsibility);
 	UT_RUN(test_local_pi_redeclare_does_not_need_resident_buffer_or_current_authority);

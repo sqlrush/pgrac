@@ -84,6 +84,7 @@ extern void cluster_ko_resid_encode(RelFileLocator rloc, ClusterResId *dst);
 #include "cluster/cluster_space_identity.h"
 
 #define CLUSTER_KO_SHARED_V2_BYTES 160
+#define CLUSTER_KO_SHARED_CONTEXT_LIMIT_V2 64
 #define CLUSTER_KO_SHARED_MEMBER_BYTES 16
 #define CLUSTER_KO_SHARED_REQUEST 1
 #define CLUSTER_KO_SHARED_ACK 2
@@ -272,6 +273,12 @@ extern bool cluster_ko_shared_structure_peer_v2(uint32 slot, uint64 serial, int3
  * Refusal preserves both outputs; no peer request is fabricated. */
 extern bool cluster_ko_shared_structure_observation_v2(uint32 slot, uint64 serial,
 	struct ClusterPageWalBindingV1 *terminal, void *wal, Size wal_length);
+/* Bounded original-owner scan for local page work, including imported
+ * results and a one-member cohort. Success advances cursor to slot + 1;
+ * the serial/terminal are observations, never page or retirement proofs.
+ * Refusal leaves every output and every shared obligation unchanged. */
+extern bool cluster_ko_shared_structure_next_v2(uint32 *cursor, uint64 *serial,
+												struct ClusterPageWalBindingV1 *terminal);
 /* Bounded read-only background scan, starting at *cursor (initially zero).
  * On success cursor becomes selected slot + 1 and serial identifies that
  * original slot lifetime. Only an actual remote peer gets a wire offer.
@@ -279,6 +286,13 @@ extern bool cluster_ko_shared_structure_observation_v2(uint32 slot, uint64 seria
  * acknowledgement, PI retirement or GC authority is returned here. */
 extern bool cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer,
 	uint64 *serial, struct ClusterPiWritebackFactV2 *out);
+struct ClusterPiWritebackJobV1;
+/* Record only a peer's acceptance from the original completed opaque job.
+ * The exact shared slot remains owned; this is neither per-page retirement
+ * nor permission to release a KO slot, retained WAL or a locator. */
+extern bool
+cluster_ko_shared_structure_offer_complete_v2(uint32 slot, uint64 serial,
+											  const struct ClusterPiWritebackJobV1 *job);
 /* Reproject an original request inside its unchanged member/boot cut for a
  * background recipient. Sending back to the origin retains the original
  * origin -> master request, never a self request. This only returns wire

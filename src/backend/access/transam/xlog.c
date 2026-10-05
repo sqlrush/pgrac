@@ -132,6 +132,9 @@
  *	  - CreateCheckPoint(): after an online checkpoint's ROOT is published
  *	    and before WAL cleanup, cluster_wal_retained_cut_after_checkpoint_v1
  *	    may move the ROOT physical retention lower forward.
+ *	  - CreateCheckPoint(): before CheckPointGuts, an online checkpoint
+ *	    snapshots the buffers' first own records for that census
+ *	    (cluster_wal_retained_cut_before_sync_v1).
  *
  *	Why:
  *	  The ROOT lower otherwise keeps every retained segment of the thread
@@ -9201,6 +9204,15 @@ CreateCheckPoint(int flags)
 											  DELAY_CHKPT_START));
 	}
 	pfree(vxids);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC (S07 R-A22): snapshot the buffers' first own records before the
+	 * sync barrier, so a page this checkpoint does not write but someone
+	 * writes after the barrier is still counted by its census.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config && !shutdown)
+		cluster_wal_retained_cut_before_sync_v1(checkPoint.redo);
+#endif
 
 	CheckPointGuts(checkPoint.redo, flags);
 
