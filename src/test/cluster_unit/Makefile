@@ -2191,6 +2191,7 @@ test_cluster_page_data.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Ma
 	     emit && /^#endif/ { print; emit=0 } emit { print } \
 	     END { if (n != 1 || emit) exit 1 }' $< > $@
 
+# PGRAC: FlushBuffer wraps FlushBufferWithAttempt; declare and extract both.
 test_cluster_page_flush.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk 'BEGIN { print "static void FlushBufferWithAttempt(BufferDesc *, SMgrRelation, IOObject, IOContext, volatile bool *);" } \
 	     /^FlushBuffer\(/ || /^FlushBufferWithAttempt\(/ { print "static void"; emit=1; n++ } \
@@ -4366,6 +4367,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_page_wal_pregrant.inc
 	rm -f test_cluster_page_wal_image.inc
 	rm -f test_cluster_page_flush.inc
+	rm -f test_cluster_page_identity_equal.c test_cluster_page_identity_equal.o
 	rm -f test_cluster_pcm_s_prepare.inc
 	rm -f test_cluster_pcm_page_identity.inc test_cluster_pcm_page_identity.inc.tmp
 	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
@@ -6118,12 +6120,22 @@ test_cluster_lms_outbound: test_cluster_lms_outbound.c unit_test.h \
 # fake LockBuffer wrapper that mirrors the D3 hook structure.  Links
 # cluster_pcm_lock.o (real acquire/release behavior) + reuses the same
 # stub family as test_cluster_pcm_lock.
+# PGRAC: the real page identity comparison that cluster_pcm_lock.o calls,
+# without the rest of cluster_page_stable_base.c.
+test_cluster_page_identity_equal.c: $(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c Makefile
+	@{ echo '#include "postgres.h"'; echo '#include "cluster/cluster_page_stable_base.h"'; \
+	   awk '/^rf_page_identity_equal_v1\(/ { print "bool"; emit=1; n++ } \
+	        emit { print } emit && /^}/ { emit=0 } END { if (n != 1) exit 1 }' $<; } > $@
+
+test_cluster_page_identity_equal.o: test_cluster_page_identity_equal.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
 test_cluster_bufmgr_pcm_hook: test_cluster_bufmgr_pcm_hook.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
-		$(CLUSTER_RESOURCE_X_NODE_WIRE_O)
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) test_cluster_page_identity_equal.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
-		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) test_cluster_page_identity_equal.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
