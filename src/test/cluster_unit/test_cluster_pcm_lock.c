@@ -21378,6 +21378,213 @@ UT_TEST(test_s08_redirtied_handover_keeps_first_until_exact_receipt)
 	local_pi_writer_ready = cluster_shared_config = false;
 }
 
+/*
+ * W06 surviving PI lifecycle, end to end on the real PCM owner (DATA
+ * receipts and physical acknowledgements stay the fixtures every PI test
+ * here uses; their producers run in test_cluster_page_data/pi_writeback).
+ */
+
+/* X->N: the master's BLOCKED_TO_N records the departing holder's PI bit;
+ * the write cut against the new X holder retires it only with every
+ * holder's acknowledgement, and only once. */
+UT_TEST(test_w06_x_to_n_handover_bit_is_retired_by_the_write_cut)
+{
+	BufferTag tag = make_tag(6530);
+	struct StopPcmEntryLayout *entry;
+	const ClusterPiPhysicalAckV1 *partial[1] = { pi_acks[1] };
+	const ClusterPiPhysicalAckV1 *all[2] = { pi_acks[1], pi_acks[2] };
+	uint32 holders = 99;
+
+	setup_pi_write_master_with_holders(tag, 1u << 1); /* an earlier keeper */
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 1u << 1);
+	handoff_pi_write_master(tag); /* holder 2 -> requester 3 */
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), (1u << 1) | (1u << 2));
+	UT_ASSERT(cluster_pcm_lock_pi_write_snapshot_v1(tag, &pi_receipt_cut));
+	UT_ASSERT_EQ(pi_receipt_cut.pi_holders_bitmap, (1u << 1) | (1u << 2));
+	pi_ack_cut = pi_receipt_cut;
+	pi_receipt_valid = true;
+	UT_ASSERT(!cluster_pcm_lock_pi_write_complete_v1((void *)&pi_receipt_fixture, NULL, NULL, 0,
+													 partial, 1, &holders));
+	UT_ASSERT_EQ(holders, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), (1u << 1) | (1u << 2));
+	UT_ASSERT(cluster_pcm_lock_pi_write_complete_v1((void *)&pi_receipt_fixture, NULL, NULL, 0, all,
+													2, &holders));
+	UT_ASSERT_EQ(holders, (1u << 1) | (1u << 2));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 0);
+	UT_ASSERT_EQ(cluster_pcm_master_holder_node_by_tag(tag), 3); /* authority untouched */
+	cluster_shared_config = false;
+}
+
+/* X->S: the master's downgrade records the PI and the S reader; the
+ * storage cut (state S) retires the PI and leaves the reader. */
+UT_TEST(test_w06_x_to_s_downgrade_bit_is_retired_by_the_storage_cut)
+{
+	BufferTag tag = make_tag(6531);
+	struct StopPcmEntryLayout *entry;
+	ClusterPcmPiStorageCutV1 cut;
+	const ClusterPiPhysicalAckV1 *acks[1] = { pi_acks[2] };
+	uint32 holders = 99;
+
+	setup_pi_write_master_with_holders(tag, 1u << 1);
+	release_pi_write_master_internal(tag, false, false); /* X(2) -> N, keeper 1 */
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	pg_atomic_write_u32(&entry->pi_holders_bitmap, 0); /* earlier keeper retired */
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_S, 2),
+				 PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 0);
+	pg_atomic_write_u32(&entry->master_state, PCM_STATE_X);
+	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
+	entry->x_holder_node = 2;
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_X_TO_S_DOWNGRADE, 2),
+				 PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 1u << 2);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->s_holders_bitmap), 1u << 2);
+	UT_ASSERT(cluster_pcm_lock_pi_storage_snapshot_v1(tag, &cut));
+	UT_ASSERT_EQ(cut.authority.state, PCM_STATE_S);
+	pi_receipt_valid = false;
+	pi_storage_receipt_valid = true;
+	pi_storage_receipt_cut = pi_storage_ack_cut = cut;
+	UT_ASSERT(cluster_pcm_lock_pi_storage_complete_v1((void *)&pi_receipt_fixture, NULL, NULL, 0,
+													  acks, 1, &holders));
+	UT_ASSERT_EQ(holders, 1u << 2);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&entry->s_holders_bitmap), 1u << 2);
+	cluster_shared_config = false;
+}
+
+/* After a restart the master rebuilds holder bits from retained WAL
+ * contributors only; the storage cut retires them with every contributor's
+ * acknowledgement.  A live handover that adds a holder after the cut was
+ * taken makes that cut stale. */
+UT_TEST(test_w06_rebuilt_contributor_bits_are_retired_by_the_storage_cut)
+{
+	for (int variant = 0; variant < 2; variant++) {
+		/* Every static home is affected by this cut; this node is master. */
+		ClusterGrdPiRebuildCutV1 rebuild = { .epoch = 7, .affected = { 0xff } };
+		BufferTag tag = make_tag(6532 + variant);
+		struct StopPcmEntryLayout *entry;
+		ClusterPcmPiStorageCutV1 cut;
+		const ClusterPiPhysicalAckV1 *partial[1] = { pi_acks[0] };
+		const ClusterPiPhysicalAckV1 *all[2] = { pi_acks[0], pi_acks[1] };
+		uint32 holders = 99;
+
+		reset_fake_pcm_runtime(4);
+		cluster_node_id = 0;
+		cluster_shared_config = true;
+		pi_ack_available = 7;
+		pi_ack_imported = 6;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+					 RESOURCE_X_APPLY_APPLIED);
+		MyBackendType = B_BG_WRITER;
+		UT_ASSERT(
+			cluster_pcm_rebuild_pi_contributors_v1(&rebuild, tag, (1u << 0) | (1u << 1), 80, 90));
+		MyBackendType = B_BACKEND;
+		entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+		UT_ASSERT_NOT_NULL(entry);
+		if (entry == NULL)
+			break;
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), (1u << 0) | (1u << 1));
+		UT_ASSERT(cluster_pcm_lock_pi_storage_snapshot_v1(tag, &cut));
+		UT_ASSERT_EQ(cut.authority.state, PCM_STATE_N);
+		UT_ASSERT_EQ(cut.pi_holders_bitmap, (1u << 0) | (1u << 1));
+		pi_receipt_valid = false;
+		pi_storage_receipt_valid = true;
+		pi_storage_receipt_cut = pi_storage_ack_cut = cut;
+		UT_ASSERT(!cluster_pcm_lock_pi_storage_complete_v1((void *)&pi_receipt_fixture, NULL, NULL,
+														   0, partial, 1, &holders));
+		UT_ASSERT_EQ(holders, 0);
+		if (variant == 1) /* a live keeper report after the cut */
+			cluster_pcm_lock_pi_holder_note(tag, 2);
+		UT_ASSERT_EQ(cluster_pcm_lock_pi_storage_complete_v1((void *)&pi_receipt_fixture, NULL,
+															 NULL, 0, all, 2, &holders),
+					 variant == 0);
+		UT_ASSERT_EQ(holders, variant == 0 ? (1u << 0) | (1u << 1) : 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap),
+					 variant == 0 ? 0 : (1u << 0) | (1u << 1) | (1u << 2));
+		if (ut_current_failed)
+			printf("# rebuilt retirement variant %d\n", variant);
+	}
+	cluster_shared_config = false;
+}
+
+/* Normal stop: an in-flight handover keeps stop pending; once its pair has
+ * been sent and drained, the all-member stop cut retires the local PI the
+ * handover published, floor included, and nothing earlier does. */
+UT_TEST(test_w06_published_handover_is_retired_by_the_stop_cut)
+{
+	BufferTag tag = make_tag(6534);
+	ClusterPageWalBindingV1 binding, first;
+	ClusterPcmLocalPiSnapshotV1 local;
+	ClusterPcmLocalPiFloorV1 floor;
+	ClusterPageWalRefV1 ref = { 0 };
+	ResourceXDecodedFrame block, image, status;
+	ResourceXIntentSlot image_intent, status_intent;
+	uint8 image_payload[RESOURCE_X_IMAGE_V2_BYTES];
+	uint8 status_payload[RESOURCE_X_PROOF_V1_BYTES];
+	uint64 source_generation = 0;
+
+	r_a22_holder_pair_fixture(tag, &binding, &first, &block, &status, &image);
+	UT_ASSERT(cluster_page_wal_ref_retain_v1(&first, &ref));
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_block_to_n_source_exact(&block, 1, &status, &image, &ref),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_publish_exact(
+					 &block.common.logical_assertion, block.common.assertion_sequence, 1,
+					 block.common.master_session_incarnation),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &local));
+	UT_ASSERT(cluster_page_wal_same_mutation_v1(&local.first, &first));
+	/* The pair is still in flight: stop waits, and retires nothing. */
+	UT_ASSERT_EQ(stop_pcm_poll(true, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	stop_pi_cut_allowed = true;
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT(stop_pcm_retire() != CLUSTER_NORMAL_STOP_READY);
+	stop_pi_cut_allowed = false;
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &local));
+	UT_ASSERT(cluster_page_wal_same_mutation_v1(&local.first, &first));
+	/* Send both halves and drain the pair. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_status_intent_snapshot_exact(
+					 &block.common.logical_assertion, &status_intent, status_payload,
+					 sizeof(status_payload)),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(
+			&block.common.logical_assertion, &image_intent, image_payload, sizeof(image_payload)),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&status_intent, 105),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&status_intent));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_outbound_intent_stage_exact(&image_intent, 106),
+				 RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_outbound_intent_complete_exact(&image_intent));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_drain_prepare_exact(
+					 &block.common.logical_assertion, block.common.assertion_sequence, 1,
+					 block.common.master_session_incarnation, &source_generation),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_drain_commit_exact(
+					 &block.common.logical_assertion, block.common.assertion_sequence, 1,
+					 block.common.master_session_incarnation, source_generation),
+				 RESOURCE_X_APPLY_APPLIED);
+	/* Draining ends the transport, never the logical PI. */
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &local));
+	UT_ASSERT(cluster_page_wal_same_mutation_v1(&local.first, &first));
+	UT_ASSERT_EQ(stop_pcm_retire(), CLUSTER_NORMAL_STOP_INVALID); /* no stop cut yet */
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&binding.source, &floor));
+	UT_ASSERT_EQ(floor.floor, first.record_start);
+	stop_pi_cut_allowed = true;
+	UT_ASSERT_EQ(stop_pcm_retire(), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &local));
+	UT_ASSERT_EQ(local.first.record_start, 0);
+	UT_ASSERT_EQ(local.last.record_start, 0);
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&binding.source, &floor));
+	UT_ASSERT_EQ(floor.bounded, 0);
+	UT_ASSERT_EQ(stop_pcm_poll(true, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	local_pi_writer_ready = cluster_shared_config = false;
+}
+
 UT_TEST(test_local_pi_requires_original_all_member_stop_cut)
 {
 	BufferTag tag = make_tag(917);
@@ -22707,6 +22914,10 @@ main(void)
 	UT_RUN(test_r_a22_unpublishable_first_record_stays_pending);
 	UT_RUN(test_r_a22_pending_first_record_survives_reconfiguration);
 	UT_RUN(test_s08_redirtied_handover_keeps_first_until_exact_receipt);
+	UT_RUN(test_w06_x_to_n_handover_bit_is_retired_by_the_write_cut);
+	UT_RUN(test_w06_x_to_s_downgrade_bit_is_retired_by_the_storage_cut);
+	UT_RUN(test_w06_rebuilt_contributor_bits_are_retired_by_the_storage_cut);
+	UT_RUN(test_w06_published_handover_is_retired_by_the_stop_cut);
 	UT_RUN(test_local_pi_requires_original_all_member_stop_cut);
 	UT_RUN(test_local_pi_read_only_carrier_does_not_create_writer_responsibility);
 	UT_RUN(test_local_pi_redeclare_does_not_need_resident_buffer_or_current_authority);
