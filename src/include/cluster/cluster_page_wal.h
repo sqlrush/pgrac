@@ -240,5 +240,10 @@ extern bool cluster_page_wal_prepare_install_v1(Buffer buffer,
 												ClusterPageWalInstallV1 *prepared);
 extern bool cluster_page_wal_publish_install_v1(Buffer buffer, ClusterPageWalInstallV1 *prepared);
 extern void cluster_page_wal_release_install_v1(ClusterPageWalInstallV1 *prepared);
+/* Original T2/T3 owner, still content-X: compare the installed attribution
+ * with that acquisition's original carrier, including explicit absence.
+ * A failed snapshot is never evidence that the sidecar is empty. */
+extern bool cluster_page_wal_install_matches_v1(Buffer buffer,
+											 const ClusterPageWalBindingV1 *expected);
 
 #endif

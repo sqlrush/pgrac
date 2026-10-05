@@ -427,6 +427,30 @@ cluster_page_wal_release_install_v1(ClusterPageWalInstallV1 *prepared)
 }
 
 bool
+cluster_page_wal_install_matches_v1(Buffer buffer, const ClusterPageWalBindingV1 *expected)
+{
+	static const ClusterPageWalBindingV1 zero = { 0 };
+	static const PageWalSlot empty = { 0 };
+	ClusterPageWalBindingV1 installed;
+	BufferDesc *buf;
+	uint32 state;
+
+	if (bindings == NULL || buffer <= 0 || buffer > NBuffers || expected == NULL)
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (!LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE))
+		return false;
+	state = pg_atomic_read_u32(&buf->state);
+	if ((state & (BM_VALID | BM_TAG_VALID)) != (BM_VALID | BM_TAG_VALID)
+		|| (state & (BM_IO_ERROR | BM_IO_IN_PROGRESS)) != 0)
+		return false;
+	if (memcmp(expected, &zero, sizeof(zero)) == 0)
+		return memcmp(&bindings[buffer - 1], &empty, sizeof(empty)) == 0;
+	return cluster_page_wal_snapshot_v1(buffer, &installed)
+		   && memcmp(&installed, expected, sizeof(installed)) == 0;
+}
+
+bool
 cluster_page_wal_forget_v1(Buffer buffer)
 {
 	ClusterPageWalInstallV1 zero = { 0 };

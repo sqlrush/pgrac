@@ -11477,7 +11477,7 @@ gcs_block_pcm_x_resource_x_join_terminal_try(const ResourceXAssertion *assertion
 					&ref, committed_generation, direct_init_token, &activation_proof);
 			else
 				buffer_result = cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
-					&ref, &activation_proof);
+					&ref, &image.page_wal, remote_proof, &activation_proof);
 			if (buffer_result != RESOURCE_X_BUFFER_T2_INSTALLED
 				&& buffer_result != RESOURCE_X_BUFFER_ALREADY_INSTALLED) {
 				cluster_pcm_lock_resource_x_publish_no_progress_exact(
