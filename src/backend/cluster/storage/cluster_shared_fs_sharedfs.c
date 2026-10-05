@@ -474,7 +474,7 @@ cluster_shared_fs_sharedfs_immedsync(ClusterSharedFsHandle *handle)
 	Assert(handle != NULL && handle->opened);
 
 	if (FileSync(handle->vfd, WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
-		ereport(ERROR, (errcode_for_file_access(),
+		ereport(data_sync_elevel(ERROR), (errcode_for_file_access(),
 						errmsg("cluster_shared_fs.shared_fs: could not fsync: %m")));
 }
 
@@ -697,6 +697,37 @@ cluster_shared_fs_sharedfs_drop_work_size(void)
 	return sizeof(SharedFsDropWorkState);
 }
 
+/* The original owner may dispose its descriptors after losing the execution
+ * cut. Abandon never clears shared WAL/structure responsibility or completes
+ * the work. An uncertain close must not later close a reused descriptor. */
+void
+cluster_shared_fs_sharedfs_drop_work_abandon(ClusterKoDropWorkV2 *work)
+{
+	SharedFsDropWorkState *state = cluster_ko_shared_drop_work_abandon_v2(work, sizeof(*state));
+	int saved_errno = errno;
+
+	if (state == NULL || !state->initialized)
+		return;
+	state->failed = true;
+	for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++) {
+		int fd = state->forks[fork].fd;
+
+		if (fd < 0)
+			continue;
+		state->forks[fork].fd = -1;
+		(void)close(fd);
+		ReleaseExternalFD();
+	}
+	if (state->directory >= 0) {
+		int fd = state->directory;
+
+		state->directory = -1;
+		(void)close(fd);
+		ReleaseExternalFD();
+	}
+	errno = saved_errno;
+}
+
 /* A known namespace/identity contradiction cannot be retried as new work. */
 static bool
 sharedfs_drop_work_invalid(SharedFsDropWorkState *state)
@@ -803,16 +834,14 @@ sharedfs_drop_work_namespace(const ClusterKoDropWorkV2 *work, SharedFsDropWorkSt
 
 /* One bounded attempt on the original state. False never clears responsibility;
  * after all I/O and closes succeed, future attempts perform no pathname I/O. */
-bool
-cluster_shared_fs_sharedfs_drop_work(ClusterKoDropWorkV2 *work)
+static bool
+sharedfs_drop_work_attempt(ClusterKoDropWorkV2 *work, SharedFsDropWorkState *state)
 {
-	SharedFsDropWorkState *state;
 	ClusterPageWalBindingV1 terminal;
 	ClusterSpaceStructureChange change;
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	uint8 identity_bytes[CLUSTER_SPACE_IDENTITY_BYTES];
 
-	state = cluster_ko_shared_drop_work_state_v2(work, sizeof(*state));
 	if (state == NULL || state->failed || !enableFsync
 		|| !cluster_ko_shared_drop_work_read_v2(work, &terminal, wal, sizeof(wal))
 		|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &change)
@@ -1000,6 +1029,27 @@ cluster_shared_fs_sharedfs_drop_work(ClusterKoDropWorkV2 *work)
 	}
 	state->durable = true;
 	return true;
+}
+
+bool
+cluster_shared_fs_sharedfs_drop_work(ClusterKoDropWorkV2 *work, bool *failed)
+{
+	SharedFsDropWorkState *state;
+	bool completed;
+
+	if (failed == NULL)
+		return false;
+	*failed = false;
+	state = cluster_ko_shared_drop_work_state_v2(work, sizeof(*state));
+	if (state == NULL)
+		return false;
+	completed = sharedfs_drop_work_attempt(work, state);
+	/* This original state was authenticated before the attempt. Once an I/O
+	 * failure is known, a subsequent unavailable execution cut cannot hide
+	 * it from the original owner's cleanup-only abandon boundary. This is
+	 * never new permission to mutate storage or finish the obligation. */
+	*failed = state->failed;
+	return completed;
 }
 
 

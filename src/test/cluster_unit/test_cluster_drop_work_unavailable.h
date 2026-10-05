@@ -35,6 +35,19 @@ cluster_ko_shared_drop_work_finish_v2(ClusterKoDropWorkV2 **work pg_attribute_un
 {
 	return false;
 }
+void *
+cluster_ko_shared_drop_work_abandon_v2(ClusterKoDropWorkV2 *work pg_attribute_unused(),
+									   Size size pg_attribute_unused())
+{
+	return NULL;
+}
+bool
+cluster_ko_shared_drop_work_abandon_next_v2(uint32 *cursor pg_attribute_unused(),
+											Size size pg_attribute_unused(),
+											ClusterKoDropWorkV2 **out pg_attribute_unused())
+{
+	return false;
+}
 bool
 AcquireExternalFD(void)
 {

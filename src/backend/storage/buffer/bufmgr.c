@@ -1303,19 +1303,6 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 					result = RESOURCE_X_BUFFER_T2_INSTALLED;
 			}
 
-			/* A transferred current image may never have reached DATA. The
-			 * receiver becomes its writeback owner at the same T2 publication
-			 * as the native WAL binding, without inventing a first own record.
-			 * A duplicate activation may follow a completed write: do not
-			 * re-dirty it. Guarded/older peers may conservatively send a page
-			 * already on DATA; an extra dirty obligation is harmless. */
-			if (result == RESOURCE_X_BUFFER_T2_INSTALLED && cluster_shared_config
-				&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
-				&& lookup_tag.spcOid != UNDOTABLESPACE_OID
-				&& (lookup_tag.forkNum == MAIN_FORKNUM || lookup_tag.forkNum == VISIBILITYMAP_FORKNUM)
-				&& (prepared_wal.binding.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) != 0
-				&& cluster_page_wal_binding_shape_v1(&prepared_wal.binding))
-				buf_state |= BM_DIRTY | BM_JUST_DIRTIED;
 
 			if (result == RESOURCE_X_BUFFER_T2_INSTALLED
 				|| result == RESOURCE_X_BUFFER_ALREADY_INSTALLED)
@@ -1422,23 +1409,43 @@ cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
 		result = RESOURCE_X_BUFFER_BUSY;
 	else
 	{
-		own_result = cluster_pcm_own_resource_x_activation_clear_exact(
-			buf->buf_id, live.generation, live.reservation_token,
-			ref->acquisition_generation);
-		if (own_result == CLUSTER_PCM_OWN_OK)
-		{
-			cluster_pcm_own_snapshot_locked(buf, &live);
-			out_proof->ownership_generation = live.generation;
-			out_proof->writer_activation_token = live.writer_activation_token;
-			out_proof->resource_x_activation_generation
-				= live.resource_x_activation_generation;
-			result = RESOURCE_X_BUFFER_T2_INSTALLED;
-		}
+		ClusterPageWalBindingV1 wal;
+		bool deferred_data = cluster_shared_config
+			&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
+			&& lookup_tag.spcOid != UNDOTABLESPACE_OID
+			&& (lookup_tag.forkNum == MAIN_FORKNUM || lookup_tag.forkNum == VISIBILITYMAP_FORKNUM);
+
+		/* T2 installs fenced bytes. Only this original T3 success can make
+		 * the receiver a dirty writeback owner. Keep the header/content locks
+		 * across opening the fence and setting dirty, without inventing a
+		 * first local WAL record or re-dirtying a repeated completed T3. */
+		if (deferred_data
+			&& (!cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal)
+				|| (wal.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+				|| !cluster_page_wal_binding_shape_v1(&wal)))
+			result = RESOURCE_X_BUFFER_CORRUPT;
 		else
-			result = own_result == CLUSTER_PCM_OWN_BUSY ? RESOURCE_X_BUFFER_BUSY
-				: own_result == CLUSTER_PCM_OWN_NOT_READY ? RESOURCE_X_BUFFER_ABSENT
-				: own_result == CLUSTER_PCM_OWN_CORRUPT ? RESOURCE_X_BUFFER_CORRUPT
-				: RESOURCE_X_BUFFER_STALE;
+		{
+			own_result = cluster_pcm_own_resource_x_activation_clear_exact(
+				buf->buf_id, live.generation, live.reservation_token,
+				ref->acquisition_generation);
+			if (own_result == CLUSTER_PCM_OWN_OK)
+			{
+				if (deferred_data)
+					buf_state |= BM_DIRTY | BM_JUST_DIRTIED;
+				cluster_pcm_own_snapshot_locked(buf, &live);
+				out_proof->ownership_generation = live.generation;
+				out_proof->writer_activation_token = live.writer_activation_token;
+				out_proof->resource_x_activation_generation
+					= live.resource_x_activation_generation;
+				result = RESOURCE_X_BUFFER_T2_INSTALLED;
+			}
+			else
+				result = own_result == CLUSTER_PCM_OWN_BUSY ? RESOURCE_X_BUFFER_BUSY
+					: own_result == CLUSTER_PCM_OWN_NOT_READY ? RESOURCE_X_BUFFER_ABSENT
+					: own_result == CLUSTER_PCM_OWN_CORRUPT ? RESOURCE_X_BUFFER_CORRUPT
+					: RESOURCE_X_BUFFER_STALE;
+		}
 	}
 	UnlockBufHdr(buf, buf_state);
 
@@ -6113,7 +6120,7 @@ cluster_bufmgr_resource_x_target_evict_locked(
 															"TARGET cached-X WAL capture");
 		}
 	}
-	if (cluster_shared_config && wal_result == CLUSTER_PAGE_WAL_CAPTURED) {
+	if (cluster_shared_config) {
 		/* REVOKING, no I/O and only the eviction pin make these bytes
 		 * quiescent. Keep a value copy while the original descriptor still
 		 * owns its reference; PREPARE takes its own before local N. */
@@ -6138,7 +6145,8 @@ cluster_bufmgr_resource_x_target_evict_locked(
 		}
 		plan = palloc0(sizeof(*plan));
 		if (first_result == CLUSTER_PAGE_WAL_FIRST_ABSENT
-			|| first_result == CLUSTER_PAGE_WAL_FIRST_PRESENT)
+			|| (first_result == CLUSTER_PAGE_WAL_FIRST_PRESENT
+				&& wal_result == CLUSTER_PAGE_WAL_CAPTURED))
 			prepare_result = cluster_gcs_resource_x_target_evict_prepare_exact(
 				tag, &revoking, r4_record_generation, reservation_token,
 				wal_result == CLUSTER_PAGE_WAL_CAPTURED ? &wal : NULL, plan,
@@ -9206,10 +9214,16 @@ FlushBufferWithAttempt(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	/* Native checkpoint, replacement and background writers keep their
 	 * original buffer authority. A known version uses its exact WAL source,
 	 * including certified foreign images, without a local-LSN comparison. */
-	if (cluster_enabled && cluster_shared_config && !RecoveryInProgress()
-		&& cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal)) {
-		FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, &wal, write_attempted);
-		return;
+	if (cluster_enabled && cluster_shared_config && !RecoveryInProgress()) {
+		if (cluster_page_wal_output_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal)) {
+			FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, &wal, write_attempted);
+			return;
+		}
+		if ((pg_atomic_read_u32(&buf->state) & BM_IO_ERROR) != 0
+			&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("cannot retry DATA output without its exact WAL source"),
+							errhint("Retry through the current page owner.")));
 	}
 #endif
 	FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, NULL, write_attempted);
@@ -9249,7 +9263,7 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 
 	if (data_wal != NULL
 		&& (recovery != NULL || !cluster_shared_config
-			|| !cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &observed_wal)
+			|| !cluster_page_wal_output_snapshot_v1(BufferDescriptorGetBuffer(buf), &observed_wal)
 			|| !cluster_page_wal_same_mutation_v1(data_wal, &observed_wal)))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						errmsg("DATA write lost its exact WAL source"),
@@ -9456,7 +9470,7 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 		&& !cluster_space_recovery_flush_permitted_v1(recovery, BufferDescriptorGetBuffer(buf)))
 		ereport(ERROR, (errmsg("SPACE recovery flush lost its retained source authority")));
 	if (data_wal != NULL
-		&& (!cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &observed_wal)
+		&& (!cluster_page_wal_output_snapshot_v1(BufferDescriptorGetBuffer(buf), &observed_wal)
 			|| !cluster_page_wal_same_mutation_v1(data_wal, &observed_wal)))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						errmsg("DATA write changed its exact WAL source before I/O"),
@@ -19544,6 +19558,13 @@ cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(BufferDesc *buf,
 		result = CLUSTER_PCM_OWN_STALE;
 	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
 		result = CLUSTER_PCM_OWN_CORRUPT;
+	else if (finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_BUSY) {
+		if (out_refusal != NULL) {
+			out_refusal->reason = CLUSTER_PCM_OWN_FINISH_REFUSAL_VM_FSM_PINNED;
+			out_refusal->shared_refcount = shared_refcount;
+		}
+		result = CLUSTER_PCM_OWN_BUSY;
+	}
 	/* Dirty DROP requires the original PENDING first plus the receiving
 	 * dirty-install protocol, not just equal LSNs or a wire copy. */
 	else if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0
@@ -19559,12 +19580,7 @@ cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(BufferDesc *buf,
 			out_refusal->live_flags = flags;
 			out_refusal->live_token = live_token;
 		}
-		if (finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_BUSY) {
-			if (out_refusal != NULL)
-				out_refusal->reason = CLUSTER_PCM_OWN_FINISH_REFUSAL_VM_FSM_PINNED;
-			result = CLUSTER_PCM_OWN_BUSY;
-		}
-		else if (finish_mode != CLUSTER_PCM_X_REVOKE_FINISH_DROP)
+		if (finish_mode != CLUSTER_PCM_X_REVOKE_FINISH_DROP)
 			result = CLUSTER_PCM_OWN_CORRUPT;
 		else if ((buf_state & BM_IO_IN_PROGRESS) != 0) {
 			if (out_refusal != NULL)
@@ -19652,6 +19668,8 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 	bool		needs_flush = false;
 	bool forced_test_flush = false;
 	bool defer_data = false;
+	bool retry_output;
+	volatile bool drop_after_flush = false;
 	ClusterPageWalRefV1 first_ref = { 0 };
 #ifdef ENABLE_INJECTION
 	bool finish_fault_armed = false;
@@ -19683,12 +19701,25 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 	finish_mode = cluster_pcm_x_revoke_finish_mode(&tag, 0);
 	if (finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_INVALID)
 		return CLUSTER_PCM_OWN_INVALID;
-	if (finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_DROP)
-		return cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(buf, expected_revoking,
+	retry_output = cluster_shared_config
+		&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
+		&& (tag.forkNum == MAIN_FORKNUM || tag.forkNum == VISIBILITYMAP_FORKNUM);
+	if (finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_DROP) {
+		bool failed_output;
+
+		/* REVOKING prevents the background writer from taking a new VM
+		 * pin. Retry its failed output with this finish owner's own pin;
+		 * the original zero-pin DROP still owns the final transition. */
+		buf_state = LockBufHdr(buf);
+		failed_output = retry_output && BUF_STATE_GET_REFCOUNT(buf_state) == 0
+			&& (buf_state & (BM_VALID | BM_DIRTY | BM_IO_ERROR))
+				== (BM_VALID | BM_DIRTY | BM_IO_ERROR);
+		UnlockBufHdr(buf, buf_state);
+		if (!failed_output)
+			return cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(buf, expected_revoking,
 																  expected_lsn, out_retained, out_refusal, retained_wal);
-	if (finish_mode != CLUSTER_PCM_X_REVOKE_FINISH_RETAIN)
+	} else if (finish_mode != CLUSTER_PCM_X_REVOKE_FINISH_RETAIN)
 		return CLUSTER_PCM_OWN_INVALID;
-	Assert(finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_RETAIN);
 
 	/*
 	 * Bind tag -> descriptor under mapping authority, then add this DATA
@@ -19710,8 +19741,17 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 		result = CLUSTER_PCM_OWN_STALE;
 	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
 		result = CLUSTER_PCM_OWN_CORRUPT;
-	else if ((buf_state & BM_IO_ERROR) != 0)
+	else if ((buf_state & BM_IO_ERROR) != 0
+		&& (!retry_output || (buf_state & BM_DIRTY) == 0))
 		result = CLUSTER_PCM_OWN_CORRUPT;
+	else if (finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_DROP
+		&& BUF_STATE_GET_REFCOUNT(buf_state) != 0) {
+		if (out_refusal != NULL) {
+			out_refusal->reason = CLUSTER_PCM_OWN_FINISH_REFUSAL_VM_FSM_PINNED;
+			out_refusal->shared_refcount = BUF_STATE_GET_REFCOUNT(buf_state);
+		}
+		result = CLUSTER_PCM_OWN_BUSY;
+	}
 	else if ((buf_state & BM_IO_IN_PROGRESS) != 0) {
 		if (out_refusal != NULL) {
 			out_refusal->reason = CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS;
@@ -19747,7 +19787,8 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 			result = CLUSTER_PCM_OWN_STALE;
 		else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
 			result = CLUSTER_PCM_OWN_CORRUPT;
-		else if ((buf_state & BM_IO_ERROR) != 0)
+		else if ((buf_state & BM_IO_ERROR) != 0
+			&& (!retry_output || (buf_state & BM_DIRTY) == 0))
 			result = CLUSTER_PCM_OWN_CORRUPT;
 		else if ((buf_state & BM_IO_IN_PROGRESS) != 0) {
 			if (out_refusal != NULL) {
@@ -19847,11 +19888,14 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 						result = CLUSTER_PCM_OWN_STALE;
 				}
 
-				if (result == CLUSTER_PCM_OWN_OK)
+				if (result == CLUSTER_PCM_OWN_OK
+					&& finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_DROP)
+					drop_after_flush = true;
+				else if (result == CLUSTER_PCM_OWN_OK)
 					result = cluster_pcm_own_revoke_retain_commit_exact(
 						buf->buf_id, expected_revoking->generation,
 						expected_revoking->reservation_token, &committed_generation);
-				if (result == CLUSTER_PCM_OWN_OK) {
+				if (result == CLUSTER_PCM_OWN_OK && !drop_after_flush) {
 					buf->pcm_state = (uint8)PCM_STATE_N;
 					buf->buffer_type = (uint8)BUF_TYPE_PI;
 					if (defer_data && first_ref.source_flags != 0
@@ -19937,6 +19981,9 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 
 	if (caller_pinned)
 		cluster_bufmgr_unpin_for_gcs(buf);
+	if (drop_after_flush)
+		return cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(buf, expected_revoking,
+			expected_lsn, out_retained, out_refusal, retained_wal);
 #ifdef ENABLE_INJECTION
 	if (result == CLUSTER_PCM_OWN_OK && log_non_target_finish)
 		ereport(LOG,

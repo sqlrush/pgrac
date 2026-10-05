@@ -211,6 +211,7 @@ TESTS += test_cluster_cr_native_origin test_cluster_cr_mvcc_origin
 TESTS += test_cluster_pcm_aux_consumer test_cluster_pcm_aux_reobserve test_cluster_resource_x_terminal_ingress
 TESTS += test_cluster_pcm_aux_mutation test_cluster_heap_extend_current
 TESTS += test_cluster_cr_inline_stop
+TESTS += test_cluster_sync_error
 
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
 
@@ -2190,13 +2191,10 @@ test_cluster_page_data.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Ma
 	     emit && /^#endif/ { print; emit=0 } emit { print } \
 	     END { if (n != 1 || emit) exit 1 }' $< > $@
 
-# PGRAC: FlushBuffer is a wrapper of FlushBufferWithAttempt; emit the callee first.
 test_cluster_page_flush.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^FlushBuffer\(/ { cur = "wrapper"; wrapper = "static void\n"; n++ } \
-	     /^FlushBufferWithAttempt\(/ { cur = "callee"; print "static void"; n++ } \
-	     cur == "wrapper" { wrapper = wrapper $$0 "\n" } cur == "callee" { print } \
-	     cur != "" && /^}/ { cur = "" } \
-	     END { printf "%s", wrapper; if (n != 2) exit 1 }' $< > $@
+	awk 'BEGIN { print "static void FlushBufferWithAttempt(BufferDesc *, SMgrRelation, IOObject, IOContext, volatile bool *);" } \
+	     /^FlushBuffer\(/ || /^FlushBufferWithAttempt\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@
 
 test_cluster_block_redeclare_scan.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^cluster_bufmgr_redeclare_scan_chunk\(/ { print "int"; emit=1; n++ } \
@@ -2245,15 +2243,15 @@ test_cluster_page_data_scn.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c 
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@
 
 test_cluster_page_data: test_cluster_page_data.c
-test_cluster_page_data test_cluster_pi_writeback: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
-test_cluster_page_data: $(CLUSTER_KO_O)
+test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
+test_cluster_page_data test_cluster_sync_error: $(CLUSTER_KO_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_data_wire.h
-test_cluster_page_data test_cluster_pi_writeback: unit_test.h test_cluster_page_data.inc test_cluster_page_data_scn.inc \
+test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error: unit_test.h test_cluster_page_data.inc test_cluster_page_data_scn.inc \
 		test_cluster_block_redeclare_scan.inc \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h $(CLUSTER_WAL_CLAIM_O) \
@@ -2274,6 +2272,34 @@ test_cluster_page_data test_cluster_pi_writeback: unit_test.h test_cluster_page_
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto $(filter -llz4 -lzstd,$(LIBS)) -lm -o $@
+
+# Keep the native sync policy and the exact queue-full/provider boundaries.
+test_cluster_data_sync_policy.inc: $(top_srcdir)/src/backend/storage/file/fd.c Makefile
+	awk 'BEGIN { print "#include \"storage/fd.h\"\nbool data_sync_retry = false;" } \
+	     /^data_sync_elevel\(/ { print "int"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@
+
+test_cluster_sync_providers.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_shared_fs_local.c \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_shared_fs_sharedfs.c \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_shared_fs_block_device.c Makefile
+	awk '/^cluster_shared_fs_(local|sharedfs|block_device)_immedsync\(/ { print "static void"; emit=1; n++ } \
+	     /^cluster_shared_fs_(local|sharedfs|block_device)_barrier_sync\(/ { print "static int"; emit=1; n++ } \
+	     /^cluster_shared_fs_(local|sharedfs)_write\(/ || /^raw_device_sync\(/ { print "static int"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 9 || emit) exit 1 }' $(filter %.c,$^) > $@
+
+test_cluster_sync_dispatch.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_shared_fs.c Makefile
+	awk '/^cluster_shared_fs_(write|barrier_sync)\(/ { print "int"; emit=1; n++ } \
+	     /^cluster_shared_fs_immedsync\(/ { print "void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@
+
+test_cluster_sync_smgr.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_smgr.c Makefile
+	awk '/^cluster_smgr_(init_filetag|register_dirty)\(/ { print "static void"; emit=1; n++ } \
+	     /^cluster_smgr_write\(/ { print "void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@
+
+test_cluster_sync_error: test_cluster_sync_error.c test_cluster_page_data.c \
+		test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc
+test_cluster_shared_fs test_cluster_smgr test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_shared_fs_drop: test_cluster_data_sync_policy.inc
 
 test_cluster_space_recovery: test_cluster_space_recovery.c unit_test.h test_cluster_space_recovery_flush.inc \
 		test_cluster_space_recovery_product.o test_cluster_space_storage_product.o $(CLUSTER_HW_O) $(CLUSTER_UNIT_CRYPTOHASH_O) \
@@ -2749,11 +2775,11 @@ test_cluster_side_xact: test_cluster_side_xact.c unit_test.h test_cluster_undo_h
 CLUSTER_SIDE_ONLINE_OWNER_O = test_cluster_side_online_owner_product.o
 # The DATA integration uses the actual immutable fabric and typed SIDE
 # planner. The writeback scheduling fixture keeps its explicit input boundary.
-test_cluster_page_data: PAGE_DATA_SPACE_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
+test_cluster_page_data test_cluster_sync_error: PAGE_DATA_SPACE_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
-test_cluster_page_data: $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
+test_cluster_page_data test_cluster_sync_error: $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
@@ -3827,7 +3853,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-$(filter-out test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # The wire behavior is inline; an updated decoder must rebuild this binary.
@@ -4321,6 +4347,8 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc \
+		test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc
 	rm -f test_cluster_tt_rollback_entry.inc
 	rm -f test_cluster_tt_terminal_route.inc test_cluster_tt_terminal_route.inc.tmp
 	rm -f test_cluster_typed_redo_reader.inc test_cluster_typed_redo_fpi.inc test_cluster_cold_init_native.inc
@@ -4342,7 +4370,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_pcm_s_prepare.inc
 	rm -f test_cluster_pcm_page_identity.inc test_cluster_pcm_page_identity.inc.tmp
 	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
-	rm -f test_cluster_ko_postcommit.inc
+	rm -f test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc
 	rm -f test_cluster_space_extend.inc test_cluster_space_extend_finish.inc
 	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc
 	rm -f test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc
@@ -5925,6 +5953,18 @@ test_cluster_ko_postcommit.inc: $(top_srcdir)/src/backend/access/transam/xact.c 
 	     emit { print } /^}/ { inside=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_ko_drop_buffers.inc: $(top_srcdir)/src/backend/storage/smgr/smgr.c Makefile
+	awk '/^smgrdounlinkall\(/ { inside=1 } \
+	     inside && /DropRelationsAllBuffers\(rels, nrels\);/ { emit=1; found++ } \
+	     emit { print } emit && /^#endif/ { emit=0; inside=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ko_unlink.inc: $(top_srcdir)/src/backend/storage/smgr/smgr.c Makefile
+	awk '/^smgrdounlinkall\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_ko_checkpointer.inc: $(top_srcdir)/src/backend/postmaster/checkpointer.c Makefile
 	awk '/^\t\tpi_pending = cluster_ko_shared_native_poll_v2\(\);/ { emit=1; found++ } \
 	     emit { print } \
@@ -5937,7 +5977,7 @@ test_cluster_ko_writeback_codec.o: $(top_srcdir)/src/backend/cluster/cluster_pi_
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
 		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_ko.h
@@ -5948,7 +5988,7 @@ test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_abandon.h test_clus
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Actual original KO owner and storage consumer; syscall faults use real files.
-test_cluster_drop_work: test_cluster_drop_work.c test_cluster_ko_abandon.h test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test_cluster_ko_checkpointer.inc unit_test.h \
+test_cluster_drop_work: test_cluster_drop_work.c test_cluster_ko_abandon.h test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h \
 		$(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_smgr.c \

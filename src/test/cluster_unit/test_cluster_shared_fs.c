@@ -54,6 +54,7 @@
 #undef strerror_r
 
 #include "unit_test.h"
+#include "test_cluster_data_sync_policy.inc"
 #include "test_cluster_drop_work_unavailable.h"
 #include "storage/sync.h"
 

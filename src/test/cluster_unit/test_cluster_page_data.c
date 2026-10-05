@@ -51,6 +51,13 @@ volatile uint32 CritSectionCount, InterruptHoldoffCount;
 int cluster_node_id = 0, NBuffers = 2, NLocBuffer;
 bool cluster_enabled = true, cluster_shared_config = true, cluster_shared_catalog = true;
 bool cluster_smart_fusion, cluster_past_image;
+#ifndef PGRAC_TEST_REAL_PI_WRITEBACK
+uint32
+cluster_ic_local_capability_word(void)
+{
+	return PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+}
+#endif
 ResourceOwner CurrentResourceOwner = (void *)1;
 BackendType MyBackendType = B_BG_WRITER;
 MemoryContext TopMemoryContext = (void *)1;
@@ -122,6 +129,8 @@ cluster_grd_block_redeclare_state_v1(BufferTag tag, uint64 epoch, uint64 *hash)
 }
 static bool stale_sync, redirty_sync, checksums = true;
 static bool zero_disk, late_fence;
+/* A storage-boundary fixture may drive the original smgr/provider chain. */
+static void (*storage_write_hook)(SMgrRelation, ForkNumber, BlockNumber, const void *, bool);
 static bool storage_read, storage_cut_current = true, storage_cut_changed, storage_space_changed;
 static bool remote_data_ready;
 static ClusterPageWalBindingV1 remote_data_binding;
@@ -702,6 +711,10 @@ smgropen(RelFileLocator r, BackendId b)
 void
 smgrwrite(SMgrRelation r, ForkNumber f, BlockNumber b, const void *data, bool skip)
 {
+	if (storage_write_hook != NULL) {
+		storage_write_hook(r, f, b, data, skip);
+		return;
+	}
 	UT_ASSERT(locks[0] && locks[data_slot] && wal_flushes);
 	UT_ASSERT_EQ(f, target.identity.forknum);
 	UT_ASSERT_EQ(b, target.identity.blockno);
@@ -812,12 +825,14 @@ shared_buffer_write_error_callback(void *arg)
 #define BufferIsPinned(buf) (pins[(buf) - 1] != 0)
 #define pgstat_prepare_io_time() ((instr_time){ 0 })
 #define pgstat_count_io_op_time(a, b, c, d, e) ((void)(d))
+#ifndef PGRAC_TEST_SYNC_ERROR
 #undef ereport
 #define ereport(level, rest)                                                                       \
 	do {                                                                                           \
 		InterruptHoldoffCount = 0;                                                                 \
 		pg_re_throw();                                                                             \
 	} while (0)
+#endif
 #include "test_cluster_space_recovery_flush.inc"
 #include "test_cluster_page_flush.inc"
 #include "test_cluster_page_data_scn.inc"
@@ -1233,7 +1248,8 @@ foreign_certified_image_uses_original_wal(void)
 static void
 ordinary_flush_uses_original_source(void)
 {
-	for (int scenario = 0; scenario < 4; scenario++) {
+	for (int failed_output = 0; failed_output < 2; failed_output++)
+	for (int scenario = 0; scenario < 4 + failed_output; scenario++) {
 		ClusterPageWalBindingV1 certified, original;
 		ClusterPageWalInstallV1 prepared = { 0 };
 		volatile bool threw = false;
@@ -1260,6 +1276,13 @@ ordinary_flush_uses_original_source(void)
 		 * page. Its ordinary ResourceOwner error cleanup is a fixture here. */
 		pins[1] = 1;
 		locks[0] = locks[1] = true;
+		if (failed_output)
+			pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_IO_ERROR);
+		if (scenario == 4) {
+			source_capture = true;
+			UT_ASSERT(cluster_page_wal_forget_v1(2));
+			source_capture = false;
+		}
 		PG_TRY();
 		{
 			FlushBuffer(&descriptors[1].bufferdesc, &relation, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
@@ -1273,11 +1296,60 @@ ordinary_flush_uses_original_source(void)
 		PG_END_TRY();
 		locks[0] = locks[1] = false;
 		pins[1] = 0;
-		UT_ASSERT_EQ(threw, scenario == 3);
+		UT_ASSERT_EQ(threw, scenario >= 3);
 		UT_ASSERT_EQ(wal_flushes, 1); /* Foreign cases only flushed at A. */
-		UT_ASSERT_EQ(writes, scenario == 3 ? 0 : 1);
+		UT_ASSERT_EQ(writes, scenario >= 3 ? 0 : 1);
 		clean();
 	}
+}
+
+static void
+ordinary_clean_write_discharges_first_after_later_capture_loss(void)
+{
+	ClusterPageWalRefV1 first, after;
+	ClusterPageWalBindingV1 ignored;
+	RfPageVersionEdgeEntryV1 edge = { 0 };
+	BufferDesc *buf;
+
+	reset();
+	buf = &descriptors[1].bufferdesc;
+	pins[1] = 1;
+	source_capture = locks[0] = locks[1] = true;
+	pg_atomic_fetch_or_u32(&buf->state, BM_LOCKED);
+	UT_ASSERT_EQ(cluster_page_wal_first_observe_locked_v1(buf, &first),
+		CLUSTER_PAGE_WAL_FIRST_PRESENT);
+	pg_atomic_fetch_and_u32(&buf->state, ~BM_LOCKED);
+	edge.page_class = RF_PAGE_CLASS_ORDINARY;
+	edge.result_kind = RF_PAGE_STATE_PRESENT;
+	memcpy(edge.result_incarnation, identity.incarnation, 16);
+	((PageHeader)pages[1].data)->pd_block_scn++;
+	selected = false;
+	UT_ASSERT_EQ(cluster_page_wal_capture_native_v1(2, &edge,
+		((PageHeader)pages[1].data)->pd_block_scn, 0x220, 0x300, 0x9292, RM_HEAP_ID, 0),
+		CLUSTER_PAGE_WAL_UNATTRIBUTED);
+	UT_ASSERT(cluster_page_wal_forget_v1(2));
+	PageSetLSNPreserveOrigin(pages[1].data, 0x300);
+	UT_ASSERT(!cluster_page_wal_snapshot_v1(2, &ignored));
+	UT_ASSERT(pg_atomic_read_u32(&buf->state) & BM_DIRTY);
+	pg_atomic_fetch_or_u32(&buf->state, BM_LOCKED);
+	UT_ASSERT_EQ(cluster_page_wal_first_observe_locked_v1(buf, &after),
+		CLUSTER_PAGE_WAL_FIRST_PRESENT);
+	pg_atomic_fetch_and_u32(&buf->state, ~BM_LOCKED);
+	UT_ASSERT_EQ(memcmp(&first, &after, sizeof(first)), 0);
+	selected = true;
+	source_capture = false;
+	FlushBuffer(buf, &relation, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+	UT_ASSERT_EQ(wal_flushes, 1);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&buf->state) & (BM_DIRTY | BM_IO_ERROR | BM_IO_IN_PROGRESS), 0);
+	pg_atomic_fetch_or_u32(&buf->state, BM_LOCKED);
+	UT_ASSERT_EQ(cluster_page_wal_first_observe_locked_v1(buf, &after),
+		CLUSTER_PAGE_WAL_FIRST_ABSENT);
+	pg_atomic_fetch_and_u32(&buf->state, ~BM_LOCKED);
+	UT_ASSERT(!cluster_page_wal_snapshot_v1(2, &ignored));
+	locks[0] = locks[1] = false;
+	pins[1] = 0;
+	clean();
 }
 
 /* Decoded WAL is an explicit input boundary; actual preflight, detached FPI
@@ -4817,7 +4889,7 @@ int
 main(void)
 {
 #ifndef PGRAC_TEST_REAL_PI_WRITEBACK
-	UT_PLAN(75);
+	UT_PLAN(76);
 	UT_RUN(structural_remote_ack_import_binds_original_inputs_and_cut);
 	UT_RUN(structural_remote_ack_refuses_transport_input_and_collector_drift);
 	UT_RUN(structural_remote_notice_uses_actual_plan_and_peer_physical_owner);
@@ -4851,7 +4923,7 @@ main(void)
 	UT_RUN(recovery_ack_cannot_outlive_original_input_membership_or_owner);
 	UT_RUN(recovery_ack_refuses_successor_pi_not_covered_by_actual_data);
 #else
-	UT_PLAN(43);
+	UT_PLAN(44);
 #endif
 	UT_RUN(space_data_writes_exact_typed_live_and_tombstoned_pages);
 	UT_RUN(space_binding_rejects_wrong_typed_identity_before_io);
@@ -4885,6 +4957,7 @@ main(void)
 	UT_RUN(new_claim_never_flushes_old_coordinate);
 	UT_RUN(foreign_certified_image_uses_original_wal);
 	UT_RUN(ordinary_flush_uses_original_source);
+	UT_RUN(ordinary_clean_write_discharges_first_after_later_capture_loss);
 	UT_RUN(plan_sources_are_immutable);
 	UT_RUN(pi_cut_must_match_current_holder_before_data);
 	UT_RUN(physical_receipts_close_only_exact_contributions);
