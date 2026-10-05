@@ -4215,7 +4215,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(99);
+	UT_PLAN(100);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
@@ -4315,6 +4315,7 @@ main(void)
 	UT_RUN(test_drop_abandon_authenticates_original_pointer_actor_and_size);
 	UT_RUN(test_drop_abandon_scan_keeps_transient_wait_retryable);
 	UT_RUN(test_drop_abandon_scan_requires_original_executor_of_replaced_context);
+	UT_RUN(test_drop_abandon_requires_recovery_at_normal_stop_even_with_pending_work);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

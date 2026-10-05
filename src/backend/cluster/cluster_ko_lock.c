@@ -116,6 +116,7 @@ typedef struct ClusterKoSharedContext {
 	bool complete;
 	bool structure_owned;
 	bool structure_drop_pending;
+	bool structure_drop_failed; /* Original executor requires retained-WAL recovery. */
 	uint16 structure_peers_accepted;
 	uint32 structure_scan;
 	uint64 structure_scan_freeze;
@@ -1369,7 +1370,8 @@ ko_drop_context_current(const ClusterKoSharedContext *context)
 	ClusterWalSourceRef current;
 
 	return context->used && context->complete && context->structure_owned
-		   && context->structure_drop_pending && context->serial != 0
+		   && context->structure_drop_pending && !context->structure_drop_failed
+		   && context->serial != 0
 		   && context->request.origin_node == cluster_node_id
 		   && cluster_space_structure_wal_decode(context->structure, sizeof(context->structure),
 												 &change)
@@ -1432,9 +1434,18 @@ cluster_ko_shared_drop_work_abandon_v2(ClusterKoDropWorkV2 *work, Size storage_b
 {
 	if (!ko_drop_work_owned(work) || work->storage_bytes != storage_bytes)
 		return NULL;
-	/* Local resource cleanup only. Keep the shared obligation and original
-	 * executor stamp; neither a restored cut nor another process may resume. */
+	/* Keep the shared obligation and original executor stamp; neither a
+	 * restored cut nor another process may resume. Only this exact original
+	 * context may receive the negative normal-stop diagnostic. A replaced
+	 * slot belongs to a different work, even though its old fd needs cleanup. */
 	work->abandoned = true;
+	if (ko_state != NULL) {
+		SpinLockAcquire(&ko_state->shared_lock);
+		if (memcmp(&ko_state->contexts[work->slot], &work->context,
+				   sizeof(work->context)) == 0)
+			ko_state->contexts[work->slot].structure_drop_failed = true;
+		SpinLockRelease(&ko_state->shared_lock);
+	}
 	return (char *)work + MAXALIGN(sizeof(*work));
 }
 
@@ -1491,7 +1502,8 @@ cluster_ko_shared_drop_work_begin_v2(uint32 *cursor, Size storage_bytes, Cluster
 		if (work != NULL) {
 			if (work->storage_bytes != storage_bytes
 				|| !cluster_ko_shared_drop_work_revalidate_v2(work)) {
-				ko_native_deferred(&work->context, &ko_drop_report_serial[slot], "DROP_CUT");
+				ko_native_deferred(&work->context, &ko_drop_report_serial[slot],
+								   work->abandoned ? "DROP_RECOVERY_REQUIRED" : "DROP_CUT");
 				continue;
 			}
 		} else {
@@ -2093,13 +2105,20 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 		result = CLUSTER_NORMAL_STOP_PENDING;
 		why = "KO_SHARED_SEND_PENDING";
 	}
-	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
-		if (ko_state->contexts[i].used && result == CLUSTER_NORMAL_STOP_READY) {
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		if (ko_state->contexts[i].used && ko_state->contexts[i].structure_drop_failed
+			&& result != CLUSTER_NORMAL_STOP_INVALID) {
+			/* A permanent failure cannot be hidden behind other work that
+			 * is still allowed to wait. LMON owns the existing failed stop. */
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			why = "KO_SHARED_DROP_RECOVERY_REQUIRED";
+		} else if (ko_state->contexts[i].used && result == CLUSTER_NORMAL_STOP_READY) {
 			result = CLUSTER_NORMAL_STOP_PENDING;
 			why = ko_state->contexts[i].structure_owned ? "KO_SHARED_STRUCTURE_OWNED"
 				: ko_state->contexts[i].complete ? "KO_SHARED_COMPLETION_OWNED"
 				: "KO_SHARED_BARRIER_PENDING";
 		}
+	}
 	SpinLockRelease(&ko_state->shared_lock);
 	if (reason != NULL)
 		*reason = why;

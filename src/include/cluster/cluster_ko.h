@@ -330,6 +330,8 @@ extern bool cluster_ko_shared_drop_work_revalidate_v2(const ClusterKoDropWorkV2 
  * after its cut is lost. The caller may close only the already retained raw
  * resources; no pathname operation, sync or physical-success publication.
  * The local state and shared pending/executor remain retained for recovery.
+ * An exact unchanged shared context receives only a negative diagnostic:
+ * normal-stop must fail for recovery instead of waiting for impossible work.
  * An abandoned work can never read, revalidate or finish again. */
 extern void *cluster_ko_shared_drop_work_abandon_v2(ClusterKoDropWorkV2 *work, Size storage_bytes);
 /* One original work whose context/epoch/boot was positively replaced, or

@@ -45,6 +45,7 @@ UT_TEST(test_drop_abandon_preserves_debt_and_permanently_refuses_execution)
 	UT_ASSERT(cluster_ko_shared_drop_work_state_v2(work, 16) == NULL);
 	UT_ASSERT(cluster_ko_shared_drop_work_abandon_v2(work, 16) == state);
 	UT_ASSERT_EQ(state[0], 0);
+	before.structure_drop_failed = true; /* No authority or debt bytes may change. */
 	UT_ASSERT(memcmp(&before, &storage.contexts[slot], sizeof(before)) == 0);
 	UT_ASSERT(storage.contexts[slot].structure_drop_pending);
 	abandon_fixture_process_exit(slot, &before);
@@ -80,6 +81,7 @@ UT_TEST(test_drop_abandon_authenticates_original_pointer_actor_and_size)
 	/* Storage may explicitly abandon an irreparable namespace with a live cut. */
 	UT_ASSERT(cluster_ko_shared_drop_work_abandon_v2(work, 16) != NULL);
 	UT_ASSERT(!cluster_ko_shared_drop_work_revalidate_v2(work));
+	before.structure_drop_failed = true;
 	abandon_fixture_process_exit(slot, &before);
 }
 
@@ -106,6 +108,7 @@ UT_TEST(test_drop_abandon_scan_keeps_transient_wait_retryable)
 	UT_ASSERT(selected == work);
 	UT_ASSERT_EQ(cursor, slot + 1);
 	UT_ASSERT(cluster_ko_shared_drop_work_abandon_v2(selected, 16) != NULL);
+	before.structure_drop_failed = true;
 	UT_ASSERT(memcmp(&before, &storage.contexts[slot], sizeof(before)) == 0);
 	abandon_fixture_process_exit(slot, &before);
 }
@@ -130,4 +133,36 @@ UT_TEST(test_drop_abandon_scan_requires_original_executor_of_replaced_context)
 	UT_ASSERT(selected == work);
 	UT_ASSERT(memcmp(&before, &storage.contexts[slot], sizeof(before)) == 0);
 	abandon_fixture_process_exit(slot, &before);
+}
+
+UT_TEST(test_drop_abandon_requires_recovery_at_normal_stop_even_with_pending_work)
+{
+	ClusterPageWalBindingV1 terminal;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	uint32 slot = prepare_promoted_drop(&terminal, wal), cursor = slot;
+	ClusterKoDropWorkV2 *work = NULL;
+	ClusterKoSharedContext retained;
+	const char *reason = NULL;
+
+	UT_ASSERT(cluster_ko_shared_drop_work_begin_v2(&cursor, 16, &work));
+	UT_ASSERT(cluster_ko_shared_drop_work_abandon_v2(work, 16) != NULL);
+	retained = storage.contexts[slot];
+	UT_ASSERT(retained.structure_drop_failed);
+	/* Other waiting obligations cannot mask a permanent recovery requirement. */
+	storage.native_waiting = 1;
+	storage.send_count = 1;
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(strcmp(reason, "KO_SHARED_DROP_RECOVERY_REQUIRED") == 0);
+	UT_ASSERT_EQ(storage.native_waiting, 1);
+	UT_ASSERT_EQ(storage.send_count, 1);
+	UT_ASSERT(storage.contexts[slot].structure_drop_pending);
+	UT_ASSERT_EQ(storage.contexts[slot].drop_executor_pid, MyProcPid);
+	UT_ASSERT(memcmp(&retained, &storage.contexts[slot], sizeof(retained)) == 0);
+	MyBackendType = B_CHECKPOINTER;
+	storage.native_waiting = 0;
+	storage.send_count = 0;
+	abandon_fixture_process_exit(slot, &retained);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(strcmp(reason, "KO_SHARED_DROP_RECOVERY_REQUIRED") == 0);
 }
