@@ -3174,7 +3174,7 @@ eviction_capture(BufferDesc *buf, const ClusterPcmOwnSnapshot *fence, uint32 pin
 	if (eviction_scenario == 4 && eviction_wal_captures == 1)
 		out->record_start++;
 	eviction_wal_captures++;
-	return CLUSTER_PAGE_WAL_CAPTURED;
+	return eviction_scenario >= 7 ? CLUSTER_PAGE_WAL_UNATTRIBUTED : CLUSTER_PAGE_WAL_CAPTURED;
 }
 
 static void *
@@ -3206,8 +3206,9 @@ eviction_prepare(const BufferTag *tag, const ClusterPcmOwnSnapshot *revoking, ui
 				 ResourceXTargetEvictionPlan *plan, const ClusterPageWalBindingV1 *first)
 {
 	UT_ASSERT_EQ(eviction_wal_captures, 1);
-	UT_ASSERT(wal != NULL);
-	UT_ASSERT_EQ(wal->record_start, 0x120);
+	UT_ASSERT_EQ(wal != NULL, eviction_scenario < 7);
+	if (wal != NULL)
+		UT_ASSERT_EQ(wal->record_start, 0x120);
 	if (transition_first_state == CLUSTER_PAGE_WAL_FIRST_PRESENT) {
 		UT_ASSERT(first != NULL);
 		if (first != NULL) UT_ASSERT_EQ(first->record_start, transition_first_binding.record_start);
@@ -3221,9 +3222,11 @@ eviction_prepare(const BufferTag *tag, const ClusterPcmOwnSnapshot *revoking, ui
 	plan->owner.buffer_ownership_generation = revoking->generation;
 	plan->owner.reservation_token = token;
 	plan->prepared = true;
-	plan->pi_refs[0].source_flags = 1;
-	plan->pi_refs[1].source_flags = 2;
-	eviction_reserved_refs = 2;
+	if (wal != NULL) {
+		plan->pi_refs[0].source_flags = 1;
+		plan->pi_refs[1].source_flags = 2;
+		eviction_reserved_refs = 2;
+	}
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
@@ -3682,7 +3685,7 @@ UT_TEST(test_real_eviction_pending_excludes_clock_sweep_and_keeps_one_owner)
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
 
 	for (initial_pins = 0; initial_pins <= 1; initial_pins++) {
-		for (leg = 0; leg < 7; leg++) {
+		for (leg = 0; leg < 10; leg++) {
 			BufferDesc buf;
 			ClusterPcmOwnEntry entry;
 			ClusterPcmOwnSnapshot base;
@@ -3703,11 +3706,13 @@ UT_TEST(test_real_eviction_pending_excludes_clock_sweep_and_keeps_one_owner)
 			eviction_plan_allocations = eviction_plan_frees = 0;
 			cluster_shared_config = true;
 			eviction_scenario = leg;
-			if (leg == 0) {
+			if (leg == 0 || leg == 7 || leg == 9) {
 				transition_first_state = CLUSTER_PAGE_WAL_FIRST_PRESENT;
 				transition_first_binding.record_start = 0x40;
 				transition_first_binding.record_end = 0x50;
 			}
+			if (leg == 9)
+				transition_first_state = CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED;
 			eviction_mapping_deleted = eviction_pin_reserved = false;
 			tag = buf.tag;
 			eviction_mapping_acquire(&transition_mapping_lock, LW_EXCLUSIVE);
@@ -3724,18 +3729,24 @@ UT_TEST(test_real_eviction_pending_excludes_clock_sweep_and_keeps_one_owner)
 				completed = false;
 			}
 			PG_END_TRY();
-			UT_ASSERT(completed == (leg == 0));
+			UT_ASSERT(completed == (leg == 0 || leg == 8));
 			UT_ASSERT_EQ(eviction_reuse_observed, 0);
-			UT_ASSERT_EQ(eviction_publishes, leg == 0 ? 4 : (leg == 4 || leg == 6) ? 0 : 1);
-			UT_ASSERT_EQ(eviction_sleeps, leg == 0 ? 3 : leg == 2 ? 1 : 0);
-			UT_ASSERT_EQ(eviction_fuses, leg == 0 || (leg == 4 || leg == 6) ? 0 : 1);
-			UT_ASSERT_EQ(eviction_frees, initial_pins == 0 && leg == 0 ? 1 : 0);
+			UT_ASSERT_EQ(eviction_publishes, leg == 0 || leg == 8 ? 4
+				: leg == 4 || leg == 6 || leg >= 7 ? 0 : 1);
+			UT_ASSERT_EQ(eviction_sleeps, leg == 0 || leg == 8 ? 3 : leg == 2 ? 1 : 0);
+			UT_ASSERT_EQ(eviction_fuses, leg == 0 || leg == 4 || leg == 6 || leg >= 7 ? 0 : 1);
+			UT_ASSERT_EQ(eviction_frees, initial_pins == 0 && (leg == 0 || leg == 8) ? 1 : 0);
 			UT_ASSERT_EQ(eviction_private_pins, initial_pins);
 			UT_ASSERT_EQ(eviction_reserved_refs, 0);
 			UT_ASSERT_EQ(eviction_entry_refs, leg == 5 ? 2 : 0);
 			UT_ASSERT_EQ(eviction_plan_allocations, leg == 6 ? 0 : 1);
 			UT_ASSERT_EQ(eviction_plan_frees, eviction_plan_allocations);
-			if (leg == 4 || leg == 6) {
+			if (leg == 7 || leg == 9) {
+				UT_ASSERT_EQ(eviction_wal_captures, 1); /* No remote prepare or late abort. */
+				UT_ASSERT_EQ(transition_first_state, leg == 7 ? CLUSTER_PAGE_WAL_FIRST_PRESENT
+					: CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED);
+			}
+			if (leg == 4 || leg == 6 || leg == 7 || leg == 9) {
 				UT_ASSERT_EQ(buf.pcm_state, PCM_STATE_X);
 				UT_ASSERT(BufferTagsEqual(&buf.tag, &tag));
 				UT_ASSERT_EQ(pg_atomic_read_u32(&entry.flags), 0);

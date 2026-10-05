@@ -6120,7 +6120,7 @@ cluster_bufmgr_resource_x_target_evict_locked(
 															"TARGET cached-X WAL capture");
 		}
 	}
-	if (cluster_shared_config && wal_result == CLUSTER_PAGE_WAL_CAPTURED) {
+	if (cluster_shared_config) {
 		/* REVOKING, no I/O and only the eviction pin make these bytes
 		 * quiescent. Keep a value copy while the original descriptor still
 		 * owns its reference; PREPARE takes its own before local N. */
@@ -6145,7 +6145,8 @@ cluster_bufmgr_resource_x_target_evict_locked(
 		}
 		plan = palloc0(sizeof(*plan));
 		if (first_result == CLUSTER_PAGE_WAL_FIRST_ABSENT
-			|| first_result == CLUSTER_PAGE_WAL_FIRST_PRESENT)
+			|| (first_result == CLUSTER_PAGE_WAL_FIRST_PRESENT
+				&& wal_result == CLUSTER_PAGE_WAL_CAPTURED))
 			prepare_result = cluster_gcs_resource_x_target_evict_prepare_exact(
 				tag, &revoking, r4_record_generation, reservation_token,
 				wal_result == CLUSTER_PAGE_WAL_CAPTURED ? &wal : NULL, plan,
