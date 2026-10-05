@@ -62,6 +62,9 @@
 #include "utils/pg_rusage.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_heap_horizon.h"
+#endif
 
 
 /*
@@ -1140,6 +1143,25 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 		}
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	if (rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT)
+	{
+		TransactionId frozen;
+
+		if (!cluster_heap_freeze_cutoff_v1(cutoffs->OldestXmin, &cutoffs->OldestXmin)
+			|| !cluster_heap_freeze_cutoff_v1(cutoffs->relfrozenxid, &frozen))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shared heap freeze boundary is not established"),
+					 errhint("Check cluster XID stripe activation and the retained XID window before retrying.")));
+		if (frozen != cutoffs->relfrozenxid)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("shared relation freeze metadata exceeds its proven XID boundary"),
+					 errdetail("relfrozenxid %u exceeds boundary %u.", cutoffs->relfrozenxid, frozen),
+					 errhint("Preserve the relation and WAL for inspection; its freeze metadata cannot be repaired implicitly.")));
+	}
+#endif
 	Assert(TransactionIdIsNormal(cutoffs->OldestXmin));
 
 	/* Acquire OldestMxact */

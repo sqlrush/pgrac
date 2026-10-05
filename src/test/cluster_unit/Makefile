@@ -190,7 +190,7 @@ TESTS = test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_dro
         test_cluster_membership \
         test_cluster_node_remove test_cluster_node_remove_stop test_cluster_recovery_stop test_cluster_backup_stop test_cluster_mrp_stop \
         test_cluster_hang_acceptance \
-        test_cluster_xid_stripe test_cluster_xid_stripe_evidence test_cluster_xid_stripe_boot test_cluster_xid_allocation \
+        test_cluster_xid_stripe test_cluster_heap_horizon test_cluster_xid_stripe_evidence test_cluster_xid_stripe_boot test_cluster_xid_allocation \
         test_cluster_undo_resid \
         test_cluster_undo_authority \
         test_cluster_undo_gcs \
@@ -421,6 +421,7 @@ SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_ctl,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge test_cluster_port_runtime,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_prepare_diagnostic,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_heap_horizon,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_tt_terminal_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_pacemaker test_pgrac_fenced_cib,$(SIMPLE_TESTS))
@@ -8074,6 +8075,20 @@ test_cluster_xid_stripe: test_cluster_xid_stripe.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_XID_STRIPE_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_heap_horizon_create.inc: $(top_srcdir)/src/backend/access/heap/heapam_handler.c Makefile
+	awk '/^heapam_relation_set_new_filelocator\(/ { print "static void"; emit=1; start++ } \
+	     emit && !/^\tSMgrRelation srel;/ { print } \
+	     emit && /^\t\*minmulti = GetOldestMultiXactId\(\);/ { print "}"; emit=0; finish++ } \
+	     END { if (start != 1 || finish != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_horizon: test_cluster_heap_horizon.c test_cluster_xid_stripe.c unit_test.h \
+		test_cluster_heap_horizon_create.inc \
+		$(CLUSTER_XID_STRIPE_O) $(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_srcdir)/src/backend/cluster/cluster_heap_horizon.c \
+		$(CLUSTER_XID_STRIPE_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # spec-5.22a D1: test_cluster_undo_resid — shared-undo block resource
 # identity pure layer (undo resid class byte + encode/decode +
