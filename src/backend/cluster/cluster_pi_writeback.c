@@ -146,6 +146,7 @@ static uint32 wb_batch_turn = WB_BATCH_STRUCTURE;
 static uint32 wb_structure_scan;
 static uint32 wb_structure_page_scan[CLUSTER_KO_SHARED_CONTEXT_LIMIT_V2];
 static uint64 wb_structure_serials[CLUSTER_KO_SHARED_CONTEXT_LIMIT_V2];
+static bool wb_structure_progress;
 static bool wb_callbacks;
 static TimestampTz wb_last_send;
 static uint64 wb_sent_revision, wb_sent_inbound;
@@ -1876,6 +1877,7 @@ static bool
 wb_batch_structure_start(const ClusterWalSourceRef *local)
 {
 	ClusterPageWalBindingV1 terminal;
+	ClusterKoStructurePollV2 ended;
 	BufferTag tags[CLUSTER_PI_WRITEBACK_MAX];
 	uint64 serial;
 	uint32 slot, count, selected = 0;
@@ -1892,6 +1894,18 @@ wb_batch_structure_start(const ClusterWalSourceRef *local)
 		|| terminal.source.claim.database_incarnation != local->claim.database_incarnation)
 		return false;
 	slot = wb_structure_scan - 1;
+	ended = cluster_ko_shared_structure_finish_local_v2(slot, serial);
+	if (ended == CLUSTER_KO_STRUCTURE_RELEASED || ended == CLUSTER_KO_STRUCTURE_PROGRESS)
+		wb_structure_progress = true;
+	if (ended == CLUSTER_KO_STRUCTURE_RELEASED)
+		return false;
+	if (ended == CLUSTER_KO_STRUCTURE_INVALID) {
+		BufferTag tag;
+		InitBufferTag(&tag, &terminal.identity.locator, MAIN_FORKNUM, 0);
+		wb_rejected(CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER, &tag, cluster_node_id,
+					cluster_epoch_get_current(), local->claim.identity.origin_owner_incarnation);
+		return false;
+	}
 	if (wb_structure_serials[slot] != serial) {
 		wb_structure_page_scan[slot] = 0;
 		wb_structure_serials[slot] = serial;
@@ -2185,8 +2199,9 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 		|| !cluster_shared_config)
 		return false;
 	wb_cleanup_register();
+	wb_structure_progress = false;
 	if (wb_batch == NULL && !wb_batch_start())
-		return false;
+		return wb_structure_progress;
 	if (!wb_batch_current())
 		goto done;
 	if (!wb_batch->structure_pages && !wb_batch_data())

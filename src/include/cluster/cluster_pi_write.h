@@ -285,6 +285,22 @@ extern bool cluster_pcm_lock_pi_write_snapshot_v1(BufferTag tag, ClusterPcmPiWri
 extern uint32 cluster_pcm_lock_pi_candidates_v1(uint32 *cursor, uint32 probe_budget,
 												BufferTag *tags, uint32 capacity);
 
+/* Read-only, bounded relation observation for the original completed KO
+ * owner. MORE/PENDING preserve its prefix, INVALID grants no progress.
+ * EMPTY covers only local MAIN/VM responsibility. The caller must independently
+ * exclude new old-incarnation producers with its exact structural/barrier cut;
+ * this observation never clears PI or authorizes WAL/file reclamation. */
+typedef enum ClusterPcmPiRelationScanV2 {
+	CLUSTER_PCM_PI_RELATION_INVALID,
+	CLUSTER_PCM_PI_RELATION_PENDING,
+	CLUSTER_PCM_PI_RELATION_MORE,
+	CLUSTER_PCM_PI_RELATION_EMPTY
+} ClusterPcmPiRelationScanV2;
+extern ClusterPcmPiRelationScanV2 cluster_pcm_lock_pi_relation_scan_v2(RelFileLocator locator,
+																	   uint64 formation,
+																	   uint32 budget,
+																	   uint32 *cursor);
+
 /* Actual holder DATA write. The cut is captured before this call; it must
  * match the installed current-X buffer generation. No ownership acquisition.
  * A receipt from the ordinary endpoint cannot retire master PI obligations. */

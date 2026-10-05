@@ -112,6 +112,42 @@ ko_offer_notice_fixture(const ClusterPiWritebackNoticeV1 *notice, uint32 index, 
 	*out = offered_structure;
 	return true;
 }
+/* PCM is the explicit read-only module boundary in this owner fixture;
+ * the PCM unit exercises its actual registry/protocol table. */
+static ClusterPcmPiRelationScanV2 relation_scan_result;
+static uint32 relation_scan_calls, relation_scan_advance;
+static bool relation_scan_epoch_drift, relation_scan_slot_drift, relation_scan_freeze_drift;
+static uint64 relation_gate_freeze;
+static bool relation_gate_ok;
+bool
+cluster_pcm_lock_resource_x_gate_snapshot(ResourceXGateSnapshot *out)
+{
+	if (!relation_gate_ok)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->phase = RESOURCE_X_GATE_OPEN;
+	out->formation = current_epoch;
+	out->freeze_generation = relation_gate_freeze;
+	return true;
+}
+ClusterPcmPiRelationScanV2
+cluster_pcm_lock_pi_relation_scan_v2(RelFileLocator locator, uint64 epoch, uint32 budget,
+									 uint32 *cursor)
+{
+	UT_ASSERT_EQ(locator.relNumber, 99);
+	UT_ASSERT_EQ(epoch, current_epoch);
+	UT_ASSERT_EQ(budget, 128);
+	relation_scan_calls++;
+	*cursor += relation_scan_advance;
+	if (relation_scan_epoch_drift)
+		current_epoch++;
+	if (relation_scan_slot_drift)
+		storage.contexts[0].serial++;
+	if (relation_scan_freeze_drift)
+		relation_gate_freeze++;
+	return relation_scan_result;
+}
+
 static void (*exit_callback)(int, Datum);
 static ResourceReleaseCallback resource_callback;
 static XactCallback xact_callback;
@@ -517,11 +553,17 @@ static void
 reset_test(void)
 {
 	Assert(completion_allocations == 0);
+	cluster_enabled = true;
 	MyBackendType = B_BACKEND;
 	CurrentResourceOwner = (ResourceOwner)1;
 	CurTransactionResourceOwner = (ResourceOwner)1;
 	TopTransactionContext = (MemoryContext)1;
 	memset(&storage, 0, sizeof(storage));
+	relation_scan_result = CLUSTER_PCM_PI_RELATION_PENDING;
+	relation_scan_calls = relation_scan_advance = 0;
+	relation_scan_epoch_drift = relation_scan_slot_drift = relation_scan_freeze_drift = false;
+	relation_gate_freeze = 3;
+	relation_gate_ok = true;
 	IsUnderPostmaster = false;
 	cluster_ko_shmem_init();
 	IsUnderPostmaster = true;
@@ -3006,6 +3048,133 @@ UT_TEST(test_structure_page_scan_refuses_stale_cut_without_modifying_outputs)
 	}
 }
 
+
+static void
+structure_finish_setup(bool imported, bool single)
+{
+	cluster_node_id = 0;
+	MyProcPid = 199;
+	CritSectionCount = 0;
+	TopTransactionResourceOwner = (ResourceOwner)1;
+	if (imported) {
+		remote_structure_setup(false);
+		UT_ASSERT(cluster_ko_shared_structure_accept_v2(offer_notice, 0));
+	} else {
+		ClusterPageWalBindingV1 binding;
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		ClusterKoCompletionV2 *owner
+			= prepare_native_structure_owner(false, &binding, wal, (ResourceOwner)1, !single);
+		UT_ASSERT(cluster_ko_shared_observe_space_v2(owner, &binding, wal, sizeof(wal)));
+		UT_ASSERT(cluster_ko_shared_observe_truncate_v2(owner));
+		xact_callback(XACT_EVENT_COMMIT, NULL);
+		UT_ASSERT(cluster_ko_shared_structure_handoff_v2(&owner));
+	}
+	MyBackendType = B_CHECKPOINTER;
+}
+
+UT_TEST(test_structure_local_work_end_requires_complete_scan_and_peer_owner)
+{
+	for (unsigned mode = 0; mode < 3; mode++) {
+		uint64 serial;
+		ClusterKoSharedContext before;
+		structure_finish_setup(mode == 2, mode == 1);
+		serial = storage.contexts[0].serial;
+		before = storage.contexts[0];
+		if (mode == 0) {
+			UT_ASSERT_EQ(cluster_ko_shared_structure_finish_local_v2(0, serial),
+						 CLUSTER_KO_STRUCTURE_PENDING);
+			UT_ASSERT_EQ(relation_scan_calls, 0);
+			UT_ASSERT_EQ(memcmp(&storage.contexts[0], &before, sizeof(before)), 0);
+			/* This unit's completed-job boundary is checked by offer tests. */
+			storage.contexts[0].structure_peers_accepted = 2;
+		}
+		relation_scan_result = CLUSTER_PCM_PI_RELATION_MORE;
+		relation_scan_advance = 128;
+		UT_ASSERT_EQ(cluster_ko_shared_structure_finish_local_v2(0, serial),
+					 CLUSTER_KO_STRUCTURE_PROGRESS);
+		UT_ASSERT_EQ(storage.contexts[0].structure_scan, 128);
+		UT_ASSERT(storage.contexts[0].used);
+		relation_scan_result = CLUSTER_PCM_PI_RELATION_PENDING;
+		relation_scan_advance = 0;
+		before = storage.contexts[0];
+		UT_ASSERT_EQ(cluster_ko_shared_structure_finish_local_v2(0, serial),
+					 CLUSTER_KO_STRUCTURE_PENDING);
+		UT_ASSERT_EQ(memcmp(&storage.contexts[0], &before, sizeof(before)), 0);
+		relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+		relation_scan_advance = 64;
+		UT_ASSERT_EQ(cluster_ko_shared_structure_finish_local_v2(0, serial),
+					 CLUSTER_KO_STRUCTURE_RELEASED);
+		UT_ASSERT(!storage.contexts[0].used);
+		UT_ASSERT_EQ(cluster_ko_shared_structure_finish_local_v2(0, serial),
+					 CLUSTER_KO_STRUCTURE_INVALID);
+		cluster_node_id = 0;
+	}
+}
+
+UT_TEST(test_structure_local_work_end_rejects_drift_and_invalid_scan)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		ClusterKoSharedContext before;
+		uint64 serial;
+		structure_finish_setup(false, true);
+		serial = storage.contexts[0].serial;
+		relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+		relation_scan_advance = 64;
+		switch (fault) {
+		case 0:
+			relation_scan_result = CLUSTER_PCM_PI_RELATION_INVALID;
+			break;
+		case 1:
+			relation_scan_epoch_drift = true;
+			break;
+		case 2:
+			relation_scan_slot_drift = true;
+			break;
+		case 3:
+			serial++;
+			break;
+		case 4:
+			CurrentResourceOwner = NULL;
+			break;
+		case 5:
+			relation_gate_ok = false;
+			break;
+		case 6:
+			relation_scan_freeze_drift = true;
+			break;
+		}
+		before = storage.contexts[0];
+		UT_ASSERT_EQ(cluster_ko_shared_structure_finish_local_v2(0, serial),
+					 CLUSTER_KO_STRUCTURE_INVALID);
+		if (fault == 2)
+			before.serial++;
+		UT_ASSERT_EQ(memcmp(&storage.contexts[0], &before, sizeof(before)), 0);
+		UT_ASSERT_EQ(storage.contexts[0].structure_scan, 0);
+		cluster_node_id = 0;
+	}
+}
+
+UT_TEST(test_structure_local_work_end_restarts_prefix_after_gate_generation_change)
+{
+	uint64 serial;
+	structure_finish_setup(false, true);
+	serial = storage.contexts[0].serial;
+	relation_scan_result = CLUSTER_PCM_PI_RELATION_MORE;
+	relation_scan_advance = 128;
+	UT_ASSERT_EQ(cluster_ko_shared_structure_finish_local_v2(0, serial),
+				 CLUSTER_KO_STRUCTURE_PROGRESS);
+	relation_gate_freeze++;
+	relation_scan_result = CLUSTER_PCM_PI_RELATION_EMPTY;
+	UT_ASSERT_EQ(cluster_ko_shared_structure_finish_local_v2(0, serial),
+				 CLUSTER_KO_STRUCTURE_PROGRESS);
+	UT_ASSERT(storage.contexts[0].used);
+	UT_ASSERT_EQ(storage.contexts[0].structure_scan, 0);
+	UT_ASSERT_EQ(relation_scan_calls, 1);
+	UT_ASSERT_EQ(cluster_ko_shared_structure_finish_local_v2(0, serial),
+				 CLUSTER_KO_STRUCTURE_RELEASED);
+	cluster_node_id = 0;
+}
+
 UT_TEST(test_remote_structure_accept_is_idempotent_and_never_overwrites_conflict)
 {
 	ClusterKoShared before;
@@ -3290,7 +3459,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(79);
+	UT_PLAN(82);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
@@ -3370,6 +3539,9 @@ main(void)
 	UT_RUN(test_structural_cut_query_accepts_each_current_member_without_authority);
 	UT_RUN(test_structural_cut_query_refuses_wire_only_nodes_before_sampling);
 	UT_RUN(test_structural_cut_query_rejects_changed_identity_or_sample);
+	UT_RUN(test_structure_local_work_end_requires_complete_scan_and_peer_owner);
+	UT_RUN(test_structure_local_work_end_rejects_drift_and_invalid_scan);
+	UT_RUN(test_structure_local_work_end_restarts_prefix_after_gate_generation_change);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

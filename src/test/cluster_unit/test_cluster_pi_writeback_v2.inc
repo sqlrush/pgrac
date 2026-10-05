@@ -1661,6 +1661,32 @@ wb_structure_schedule_setup(ClusterPageDataReceiptV1 *receipt, ForkNumber fork)
 	wb_select(0, B_CHECKPOINTER);
 }
 
+UT_TEST(writeback_v2_structure_scheduler_checks_local_work_without_wal_pins)
+{
+	for (unsigned state = CLUSTER_KO_STRUCTURE_INVALID; state <= CLUSTER_KO_STRUCTURE_RELEASED;
+		 state++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiWritebackRejectionsV1 rejected;
+		unsigned io = writes + reads + syncs;
+		wb_structure_schedule_setup(receipt, MAIN_FORKNUM);
+		wb_candidates = false;
+		wb_structure_finish_result = (ClusterKoStructurePollV2)state;
+		UT_ASSERT_EQ(cluster_pi_writeback_checkpointer_tick_v1(),
+					 state == CLUSTER_KO_STRUCTURE_PROGRESS
+						 || state == CLUSTER_KO_STRUCTURE_RELEASED);
+		UT_ASSERT_EQ(wb_structure_finish_calls, 1);
+		UT_ASSERT(wb_batch == NULL && wb_active == NULL && !wb_inputs_pinned[0]);
+		UT_ASSERT_EQ(wb_plan_builds | wb_sends, 0);
+		UT_ASSERT_EQ(writes + reads + syncs, io);
+		UT_ASSERT(cluster_pi_writeback_rejections_v1(&rejected));
+		UT_ASSERT_EQ(rejected.attempts[CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER],
+					 state == CLUSTER_KO_STRUCTURE_INVALID);
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
 UT_TEST(writeback_v2_structure_scheduler_collects_all_original_page_acks)
 {
 	for (unsigned vm = 0; vm < 3; vm++) {

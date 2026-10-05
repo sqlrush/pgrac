@@ -115,6 +115,8 @@ typedef struct ClusterKoSharedContext {
 	bool complete;
 	bool structure_owned;
 	uint16 structure_peers_accepted;
+	uint32 structure_scan;
+	uint64 structure_scan_freeze;
 	int32 pid;
 	uint64 serial;
 	ClusterKoSharedMessageV2 request;
@@ -1189,6 +1191,66 @@ cluster_ko_shared_structure_peer_v2(uint32 slot, uint64 serial, int32 peer,
 	return out != NULL && serial != 0 && ko_shared_structure_snapshot(slot, &context)
 		   && context.serial == serial
 		   && cluster_ko_shared_peer_projection_v2(&context.request, peer, out);
+}
+
+ClusterKoStructurePollV2
+cluster_ko_shared_structure_finish_local_v2(uint32 slot, uint64 serial)
+{
+	ClusterKoSharedContext before, current;
+	ResourceXGateSnapshot gate, after;
+	ClusterPcmPiRelationScanV2 scanned;
+	ClusterKoStructurePollV2 result = CLUSTER_KO_STRUCTURE_INVALID;
+	uint32 cursor;
+	uint16 expected = 0;
+	bool reset;
+
+	if (serial == 0 || MyBackendType != B_CHECKPOINTER
+		|| !ko_shared_structure_snapshot(slot, &before) || before.serial != serial
+		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate) || gate.phase != RESOURCE_X_GATE_OPEN
+		|| gate.formation != before.request.epoch)
+		return result;
+	if (before.request.origin_node == cluster_node_id) {
+		for (unsigned peer = 0; peer < CLUSTER_KO_SHARED_NODE_LIMIT; peer++)
+			if (peer != cluster_node_id && before.peer_boots[peer] != 0)
+				expected |= (uint16)(1u << peer);
+		if ((before.structure_peers_accepted & ~expected) != 0)
+			return result;
+		if (before.structure_peers_accepted != expected)
+			return CLUSTER_KO_STRUCTURE_PENDING;
+	}
+	cursor = before.structure_scan;
+	reset = cursor != 0 && before.structure_scan_freeze != gate.freeze_generation;
+	if (reset) {
+		cursor = 0;
+		scanned = CLUSTER_PCM_PI_RELATION_MORE;
+	} else {
+		/* No KO lock, CF pin or remote wait spans the directory observer.
+		 * The original barrier has ended all old buffer producers. */
+		scanned = cluster_pcm_lock_pi_relation_scan_v2(before.request.key.locator,
+													   before.request.epoch, 128, &cursor);
+	}
+	if (scanned == CLUSTER_PCM_PI_RELATION_INVALID || (!reset && cursor < before.structure_scan)
+		|| !ko_shared_structure_snapshot(slot, &current)
+		|| memcmp(&before, &current, sizeof(before)) != 0
+		|| !cluster_pcm_lock_resource_x_gate_snapshot(&after)
+		|| memcmp(&gate, &after, sizeof(gate)) != 0)
+		return result;
+	SpinLockAcquire(&ko_state->shared_lock);
+	if (memcmp(&ko_state->contexts[slot], &before, sizeof(before)) == 0) {
+		if (scanned == CLUSTER_PCM_PI_RELATION_EMPTY) {
+			/* Every remaining peer has its own original owner. This removes
+			 * only completed local work, never a PI, file or retained WAL. */
+			memset(&ko_state->contexts[slot], 0, sizeof(before));
+			result = CLUSTER_KO_STRUCTURE_RELEASED;
+		} else {
+			ko_state->contexts[slot].structure_scan = cursor;
+			ko_state->contexts[slot].structure_scan_freeze = gate.freeze_generation;
+			result = scanned == CLUSTER_PCM_PI_RELATION_PENDING ? CLUSTER_KO_STRUCTURE_PENDING
+																: CLUSTER_KO_STRUCTURE_PROGRESS;
+		}
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return result;
 }
 
 bool
