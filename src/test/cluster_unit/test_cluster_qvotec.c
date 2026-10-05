@@ -900,20 +900,6 @@ cluster_mrp_qvotec_complete_apply_lease_request(
 	ClusterMrpApplyLeaseSubmitResult result pg_attribute_unused(),
 	const ClusterAdgApplyMasterLeaseQuorum *winner pg_attribute_unused())
 {}
-ClusterQvotecQuorumState
-decide_quorum_view(const ClusterVotingSlot *slots pg_attribute_unused(),
-				   const ClusterVotingDiskIoState *io_states pg_attribute_unused(),
-				   uint32 n_disks pg_attribute_unused(), uint32 n_max_nodes pg_attribute_unused(),
-				   uint32 self_node_id pg_attribute_unused(),
-				   uint64 self_incarnation pg_attribute_unused(),
-				   uint64 now_us pg_attribute_unused(),
-				   uint64 heartbeat_timeout_us pg_attribute_unused(),
-				   ClusterQuorumDecision *out pg_attribute_unused())
-{
-	memset(out, 0, sizeof(*out));
-	out->quorum_state = CLUSTER_QVOTEC_QUORUM_LOST;
-	return CLUSTER_QVOTEC_QUORUM_LOST;
-}
 ClusterPgstatCounter *
 cluster_pgstat_lookup(const char *name pg_attribute_unused())
 {

@@ -900,7 +900,7 @@ UT_TEST(test_batch_slots_validate_every_header_and_crc)
 	ClusterVotingDiskIoState states[CLUSTER_MAX_NODES];
 	UT_ASSERT(fd >= 0);
 	for (int fault = 0; fault < 5; ++fault) {
-		ClusterVotingSlot bad;
+		ClusterVotingSlot bad __attribute__((aligned(512)));
 		UT_ASSERT_EQ(cluster_voting_disk_format(fd, CLUSTER_MAX_NODES, 0), CLUSTER_VOTING_DISK_IO_OK);
 		UT_ASSERT_EQ(cluster_voting_disk_read_slot(fd, 0, 71, &bad), CLUSTER_VOTING_DISK_IO_OK);
 		if (fault == 0) bad.magic++;
@@ -926,7 +926,8 @@ UT_TEST(test_batch_short_io_bounds_and_raw_regions)
 	int fd = cluster_voting_disk_open(path, true);
 	ClusterVotingSlot slots[2];
 	ClusterVotingDiskIoState states[2];
-	uint8 raw[2 * CLUSTER_VOTING_SLOT_BYTES], observed[sizeof(raw)];
+	uint8 raw[2 * CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	uint8 observed[sizeof(raw)];
 	UT_ASSERT(fd >= 0);
 	UT_ASSERT_EQ(cluster_voting_disk_format(fd, CLUSTER_MAX_NODES, 0), CLUSTER_VOTING_DISK_IO_OK);
 	cluster_voting_disk_read_slots(fd, 0, CLUSTER_MAX_NODES - 1, 2, slots, states);

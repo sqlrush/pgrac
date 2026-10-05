@@ -4487,7 +4487,7 @@ test_cluster_storage_quorum_product.o: $(top_srcdir)/src/backend/cluster/cluster
 
 test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
 		cluster_unit_no_normal_stop.h \
-		$(CLUSTER_VERSION_O) cluster_qvotec_poll_test.o \
+		$(CLUSTER_VERSION_O) cluster_qvotec_poll_test.o $(CLUSTER_QUORUM_DECISION_O) \
 		$(CLUSTER_NODE_REMOVE_POLICY_O) \
 		$(CLUSTER_EPOCH_BALLOT_O) $(CLUSTER_REPLACEMENT_REQUEST_O) \
 		$(CLUSTER_MEMBERSHIP_O) \
@@ -4501,7 +4501,7 @@ test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
 		-DSEMANTIC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_semantic_activation.c"' \
 		-DSEMANTIC_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_semantic_activation.h"' \
 		-DCLUSTER_MAKEFILE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/Makefile"' $< \
-		$(CLUSTER_VERSION_O) cluster_qvotec_poll_test.o \
+		$(CLUSTER_VERSION_O) cluster_qvotec_poll_test.o $(CLUSTER_QUORUM_DECISION_O) \
 		$(CLUSTER_NODE_REMOVE_POLICY_O) \
 		$(CLUSTER_EPOCH_BALLOT_O) $(CLUSTER_REPLACEMENT_REQUEST_O) \
 		$(CLUSTER_MEMBERSHIP_O) \

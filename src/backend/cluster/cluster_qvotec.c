@@ -3408,6 +3408,8 @@ qvotec_poll_once(void)
 						authority_config_ok = false;
 			}
 		}
+		if (formation_scan && !authority_config_ok)
+			cluster_reconfig_formation_qvotec_publish_disk_snapshot(NULL);
 		for (i = 0; i < qvotec_n_disks; i++) {
 			struct stat *st = &authority_disk_stats[i];
 			int j;
@@ -3417,6 +3419,8 @@ qvotec_poll_once(void)
 				continue;
 			if (!S_ISREG(st->st_mode) && !S_ISBLK(st->st_mode) && !S_ISCHR(st->st_mode)) {
 				authority_config_ok = false;
+				if (formation_scan)
+					cluster_reconfig_formation_qvotec_publish_disk_snapshot(NULL);
 				continue;
 			}
 			authority_stat_valid[i] = true;
@@ -3431,6 +3435,8 @@ qvotec_poll_once(void)
 							&& st->st_rdev == prior->st_rdev)))
 					authority_config_ok = false;
 			}
+			if (formation_scan && !authority_config_ok)
+				cluster_reconfig_formation_qvotec_publish_disk_snapshot(NULL);
 		}
 	}
 	memset(qvotec_slot_matrix, 0,
@@ -3468,6 +3474,10 @@ qvotec_poll_once(void)
 			if (node == (uint32)cluster_node_id && rrc == CLUSTER_VOTING_DISK_IO_OK)
 				own_prior_read_ok[i] = true;
 			if (rrc != CLUSTER_VOTING_DISK_IO_OK) {
+				/* A known bad slot is a failed census, even when other reads
+				 * are still pending. Revoke before the next possibly slow I/O. */
+				if (formation_scan && all_slots_read)
+					cluster_reconfig_formation_qvotec_publish_disk_snapshot(NULL);
 				all_slots_read = false;
 				/* Per-slot miss is no-data;whole-disk failure only
 				 * on FAILED at offset 0 (header read).  TORN on one
@@ -3481,8 +3491,13 @@ qvotec_poll_once(void)
 			authority_disk_states[i] = cluster_fence_disk_vote_select_v1(slot_markers,
 				outer_crc_valid, CLUSTER_MAX_NODES, &authority_disk_markers[i]);
 	}
-	if (formation_scan && (!all_slots_read || !authority_config_ok))
-		cluster_reconfig_formation_qvotec_publish_disk_snapshot(NULL);
+	if (formation_scan) {
+		ClusterFenceAuthorityProof proof;
+		if (!all_slots_read || !authority_config_ok
+			|| cluster_fence_authority_prove_v1(authority_disk_markers,
+				authority_disk_states, qvotec_n_disks, &proof) != CLUSTER_FENCE_AUTHORITY_OK)
+			cluster_reconfig_formation_qvotec_publish_disk_snapshot(NULL);
+	}
 
 	/*
 	 * RF-ROOT P9 verification (cold-formation): the per-node observed-slot
@@ -3688,6 +3703,9 @@ qvotec_poll_once(void)
 	(void)decide_quorum_view(qvotec_slot_matrix, io_states, (uint32)qvotec_n_disks,
 							 CLUSTER_MAX_NODES, (uint32)cluster_node_id, qvotec_self_incarnation,
 							 now_us, heartbeat_timeout_us, &decision);
+	if (formation_scan && (decision.quorum_state != CLUSTER_QVOTEC_QUORUM_OK
+		|| decision.collision_state == CLUSTER_COLLISION_FATAL_NEWER_SELF))
+		cluster_reconfig_formation_qvotec_publish_disk_snapshot(NULL);
 
 	/*
 	 * RF-ROOT P9 verification (cold-formation): the per-node FRESH-ALIVE
@@ -3991,6 +4009,8 @@ qvotec_poll_once(void)
 			decision.quorum_state = CLUSTER_QVOTEC_QUORUM_LOST;
 		else
 			decision.quorum_state = CLUSTER_QVOTEC_QUORUM_UNCERTAIN;
+		if (formation_scan && decision.quorum_state != CLUSTER_QVOTEC_QUORUM_OK)
+			cluster_reconfig_formation_qvotec_publish_disk_snapshot(NULL);
 
 		/*
 		 * spec-4.12 D4: ack the in-flight marker submit.  The marker rode in the
