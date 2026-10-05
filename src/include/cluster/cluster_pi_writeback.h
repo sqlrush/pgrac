@@ -107,6 +107,19 @@ cluster_page_structural_from_notice_v2(const ClusterPiWritebackNoticeV1 *notice,
 extern bool cluster_page_structural_pi_ack_export_v2(const ClusterPiStructuralAckV2 *ack,
 													 const ClusterPageStructuralReceiptV2 *receipt,
 													 ClusterWalWriterToken *out);
+/* Import only an exact original-job acknowledgement. The caller retains
+ * its full sealed input owner until final master completion. */
+extern bool cluster_page_structural_pi_ack_import_v2(const ClusterPiWritebackJobV1 *job,
+													 uint32 index,
+													 const ClusterPageStructuralReceiptV2 *receipt,
+													 ClusterWalInputsV1 *inputs,
+													 ClusterPiStructuralAckV2 **out);
+extern bool
+cluster_pi_writeback_structural_ack_read_v2(const ClusterPiWritebackJobV1 *job, uint32 index,
+											const ClusterPageStructuralReceiptV2 *receipt,
+											ClusterWalWriterToken *out);
+extern bool cluster_pi_writeback_structural_ack_current_v2(const ClusterPiWritebackFactV2 *fact,
+														   const ClusterWalWriterToken *peer);
 
 typedef enum ClusterPiWritebackRejectionV1 {
 	CLUSTER_PI_WRITEBACK_DATA_PROOF = 0,
@@ -115,6 +128,7 @@ typedef enum ClusterPiWritebackRejectionV1 {
 	CLUSTER_PI_WRITEBACK_MASTER_CUT,
 	CLUSTER_PI_WRITEBACK_PEER_PHYSICAL,
 	CLUSTER_PI_WRITEBACK_RECOVERY_PROOF,
+	CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER,
 	CLUSTER_PI_WRITEBACK_REJECTION_COUNT
 } ClusterPiWritebackRejectionV1;
 
@@ -127,6 +141,12 @@ typedef struct ClusterPiWritebackRejectionsV1 {
 	uint32 last_reason;
 	int32 last_peer;
 } ClusterPiWritebackRejectionsV1;
+/* A live original kind3 notice is a responsibility handoff, never a page
+ * receipt. Refusal preserves both outputs; no copied/unregistered notice is
+ * accepted. Only the original KO owner consumes this observation. */
+extern bool cluster_pi_writeback_structure_offer_read_v2(const ClusterPiWritebackNoticeV1 *notice,
+														 uint32 index, uint64 *revision,
+														 ClusterPiWritebackFactV2 *out);
 extern bool cluster_pi_writeback_rejections_v1(ClusterPiWritebackRejectionsV1 *out);
 
 extern bool cluster_pi_writeback_encode_v1(const ClusterPiWritebackMessageV1 *message, uint8 *bytes,
@@ -155,10 +175,25 @@ extern bool cluster_pi_writeback_ack_current_v1(const ClusterPiDataFactV1 *fact,
 
 /* Background job only. A batch targets one original PI instance. Every
  * receipt must already have exact DATA/ancestry proof in the caller's held
- * full input. Poll confirms all physical owners, not a partial subset. */
+ * full input. Poll completes the batch; only exact acknowledged indices
+ * may be imported. A partial reply never clears the omitted obligations. */
 extern ClusterControlRootResult
 cluster_pi_writeback_begin_v1(const ClusterPageDataReceiptV1 *const *receipts, uint32 count,
 							  const ClusterWalSourceRef *peer, ClusterPiWritebackJobV1 **out);
+/* Same original job and slot, using only opaque master structural receipts;
+ * not a constructor from raw wire values or a relation-offer ACK. */
+extern ClusterControlRootResult
+cluster_pi_writeback_structural_begin_v2(const ClusterPageStructuralReceiptV2 *const *receipts,
+										 uint32 count, const ClusterWalSourceRef *peer,
+										 ClusterPiWritebackJobV1 **out);
+/* Relation responsibility only: the original background KO slot must remain
+ * exact through the same singleton transport job and its peer acceptance.
+ * Neither API releases the KO slot or creates a per-page retirement proof. */
+extern ClusterControlRootResult cluster_pi_writeback_structure_offer_begin_v2(
+	uint32 slot, uint64 serial, const ClusterWalSourceRef *peer, ClusterPiWritebackJobV1 **out);
+extern bool cluster_pi_writeback_structure_offer_ack_v2(const ClusterPiWritebackJobV1 *job,
+														uint32 slot, uint64 serial,
+														ClusterWalWriterToken *peer);
 extern ClusterControlRootResult cluster_pi_writeback_poll_v1(ClusterPiWritebackJobV1 *job);
 extern void cluster_pi_writeback_release_v1(ClusterPiWritebackJobV1 **job);
 

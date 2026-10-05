@@ -6222,10 +6222,12 @@ ClusterStartupWriterSelect(void)
 		ClusterStartupConfigurationRequire();
 		result = cluster_control_root_v3_startup_advance_clean(&restart, &selected);
 		if (result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
-			&& result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
+			&& result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+			&& result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
 			break;
-		/* The observer dropped CF/WALR. A missing peer target is not a
-		 * timeout or permission to reduce the declared startup cohort. */
+		/* The original attempt dropped CF/WALR. Lock contention or a
+		 * pending collective exit witness grants no side effects. A missing
+		 * peer target is not permission to reduce the startup cohort. */
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
 						WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
 		ResetLatch(MyLatch);
@@ -6254,6 +6256,56 @@ ClusterStartupWriterSelect(void)
 						errmsg("native startup contradicts its selected clean input")));
 	clusterStartupWriter = selected;
 	clusterStartupWriterSelected = true;
+}
+
+/* PGRAC: semantic normal-start must consume the original CLEAN selection,
+ * before native WAL binding, instead of guessing from an old OPEN record.
+ * Reuse the ROOT owner's exact selected-operation/formation/fence checks;
+ * this observation creates no writer or serving authority.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterControlRootResult
+cluster_wal_startup_clean_input_v1(ClusterWalStartupCleanInputV1 *out)
+{
+	ClusterWalStartupImage observed;
+	ClusterWalStartupCleanInputV1 image = { 0 };
+	ClusterControlRootResult result;
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || !clusterStartupWriterSelected
+		|| clusterStartupWriterBound || clusterStartupWriterInstalled || CritSectionCount != 0
+		|| ShutdownRequestPending || InRecovery || ArchiveRecoveryRequested
+		|| ControlFile->state != DB_SHUTDOWNED || LWLockHeldByMe(ControlFileLock)
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| clusterStartupWriter.input_kind != CLUSTER_WAL_STARTUP_CLEAN
+		|| clusterStartupWriter.phase != CLUSTER_WAL_STARTUP_INITIALIZING)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = cluster_control_root_v3_startup_read_writer(
+		&clusterStartupWriter.claim.identity, clusterStartupWriter.operation_uuid, &observed);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(&observed, &clusterStartupWriter, sizeof(observed)) != 0
+		|| ControlFile->checkPoint != observed.input_record_start
+		|| ControlFile->checkPointCopy.ThisTimeLineID != observed.input_timeline)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	image.predecessor = observed.predecessor.snapshot.identity;
+	memcpy(image.predecessor_claim_sha256, observed.predecessor.refs.claim_sha256, 32);
+	image.successor = observed.claim;
+	image.formation_epoch = observed.formation_epoch;
+	image.config_generation = observed.config_generation;
+	image.predecessor_root_sequence = observed.predecessor_file_sequence;
+	memcpy(image.predecessor_root_sha256, observed.predecessor_file_sha256, 32);
+	memcpy(image.exit_evidence_sha256, observed.predecessor_evidence_sha256, 32);
+	memcpy(image.operation_uuid, observed.operation_uuid, 16);
+	image.operation_generation = observed.generation;
+	image.checkpoint_lsn = observed.input_record_start;
+	image.checkpoint_end = observed.input_record_end;
+	image.checkpoint_crc32c = observed.input_record_crc;
+	image.timeline = observed.input_timeline;
+	*out = image;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 /*
@@ -8539,11 +8591,12 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
 		|| cluster_cf_held(ExclusiveLock) || epoch == 0
 		|| !cluster_wal_thread_current_v2_ref(&ref)
-		/* Use the same exact, original-epoch INITIALIZED qualification as
-		 * native WAL I/O. CLEAN/RECOVERED inputs cannot borrow this fact.
+		/* Use the same exact, original-epoch CLEAN or INITIALIZED qualification
+		 * as native WAL I/O. RECOVERED inputs cannot borrow either fact.
 		 * Author: SqlRush <sqlrush@gmail.com> */
 		|| (!cluster_external_fence_runtime_active()
-			&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)))
+			&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+			&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)))
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("root-v3 checkpoint requires its admitted native owner")));
 	if (!cluster_cf_lock(ShareLock))
@@ -8562,17 +8615,16 @@ ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	if (cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED
-		|| !readable || selected->state != DB_IN_PRODUCTION
+	if (cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED || !readable
+		|| selected->state != DB_IN_PRODUCTION
 		|| selected->system_identifier != ref.claim.identity.system_identifier
 		|| selected->checkPointCopy.ThisTimeLineID != ref.timeline
-		|| selected->minRecoveryPoint != InvalidXLogRecPtr
-		|| selected->minRecoveryPointTLI != 0 || selected->backupStartPoint != 0
-		|| selected->backupEndPoint != 0 || selected->backupEndRequired
-		|| cluster_epoch_get_current() != epoch
+		|| selected->minRecoveryPoint != InvalidXLogRecPtr || selected->minRecoveryPointTLI != 0
+		|| selected->backupStartPoint != 0 || selected->backupEndPoint != 0
+		|| selected->backupEndRequired || cluster_epoch_get_current() != epoch
 		|| (!cluster_external_fence_runtime_active()
-			&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)))
-	{
+			&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+			&& !cluster_wal_thread_clean_writer_matches(&ref, epoch))) {
 		memset(selected, 0, sizeof(*selected));
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -8608,10 +8660,10 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 	for (;;)
 	{
 		CHECK_FOR_INTERRUPTS();
-		if (cluster_epoch_get_current() != epoch
-			|| cluster_reconfig_has_pending_prebump_stage()
+		if (cluster_epoch_get_current() != epoch || cluster_reconfig_has_pending_prebump_stage()
 			|| (!cluster_external_fence_runtime_active()
-				&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch))
+				&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+				&& !cluster_wal_thread_clean_writer_matches(&ref, epoch))
 			|| !cluster_serving_ready_is_current() || !cluster_write_fence_allowed())
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),

@@ -227,13 +227,16 @@ ges_readiness_allows_protocol_request(uint32 opcode, const ClusterResId *resid, 
 		return true;
 	if (opcode == GES_REQ_OPCODE_REDECLARE)
 		return ges_readiness_allows_redeclare(resid, mode);
-	/* PGRAC: the configuration reader can complete and retire CF-S while
-	 * StartupXLOG hands off to pre-SERVING phase 4. No CF-X or DATA is opened.
+	/* The master may enter phase 4 while a peer still owns Startup CONTROL.
+	 * Keep the original opcode and canonical resource surface, independently
+	 * of this master's local requester gate. No DATA permission is implied.
 	 * Author: SqlRush <sqlrush@gmail.com> */
-	if ((opcode == GES_REQ_OPCODE_REQUEST
-		 && cluster_configuration_read_transport_is_current(resid, mode))
+	if (((opcode == GES_REQ_OPCODE_REQUEST
+		  || (opcode == GES_REQ_OPCODE_REQUEST_NOWAIT && resid != NULL
+			  && resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE && mode == ShareLock))
+		 && cluster_startup_control_transport_is_current(resid, mode))
 		|| (opcode == GES_REQ_OPCODE_RELEASE
-			&& cluster_configuration_read_transport_is_current(resid, ShareLock)))
+			&& cluster_startup_control_transport_is_current(resid, ShareLock)))
 		return true;
 	if (opcode == GES_REQ_OPCODE_REQUEST && cluster_grd_control_recovery_ready(resid, mode))
 		return cluster_recovery_transport_is_current();
@@ -283,8 +286,10 @@ ges_readiness_allows_grant(const ClusterGrdGrantIdentity *grant, const ClusterRe
 		return false;
 	if (grant->request_opcode == GES_REQ_OPCODE_REDECLARE)
 		return ges_readiness_allows_redeclare(resid, grant->mode);
-	if (grant->request_opcode == GES_REQ_OPCODE_REQUEST
-		&& cluster_configuration_read_transport_is_current(resid, grant->mode))
+	if ((grant->request_opcode == GES_REQ_OPCODE_REQUEST
+		 || (grant->request_opcode == GES_REQ_OPCODE_REQUEST_NOWAIT
+			 && resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE && grant->mode == ShareLock))
+		&& cluster_startup_control_transport_is_current(resid, grant->mode))
 		return true;
 	if (grant->request_opcode == GES_REQ_OPCODE_REQUEST
 		&& cluster_grd_control_recovery_ready(resid, grant->mode))
@@ -347,7 +352,7 @@ ges_startup_cf_handoff_allowed(const ClusterResId *resid)
 	return cluster_shared_config && resid != NULL && resid->type == CLUSTER_CF_RESID_TYPE
 		   && cluster_recovery_authority_resid_mode_allowed(resid, ExclusiveLock)
 		   && cluster_grd_control_acquire_allowed(resid, ExclusiveLock)
-		   && cluster_recovery_authority_is_current();
+		   && cluster_startup_control_transport_is_current(resid, ExclusiveLock);
 }
 
 static inline bool

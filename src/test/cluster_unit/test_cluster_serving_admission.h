@@ -148,6 +148,66 @@ UT_TEST(test_serving_rejects_failed_or_empty_completion)
 	}
 }
 
+UT_TEST(test_serving_retries_transient_root_conflict_without_ready)
+{
+	const ClusterControlRootResult transient[] = {
+		CLUSTER_CONTROL_ROOT_STALE_TOKEN, CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+	};
+	for (unsigned restart = 0; restart < 2; restart++) {
+		for (unsigned fault = 0; fault < lengthof(transient); fault++) {
+			ClusterSemanticActivationRefusal refusal;
+			test_serving_setup(restart != 0);
+			test_serving_tick();
+			test_serving_complete_read();
+			test_serving_result = transient[fault];
+			for (unsigned attempt = 0; attempt < 3; attempt++) {
+				test_serving_tick();
+				UT_ASSERT_EQ(test_serving_calls, attempt + 1);
+				UT_ASSERT(!cluster_semantic_activation_startup_poll(&refusal));
+				UT_ASSERT_EQ(semantic_activation_authority_mailbox_owner(true), -1);
+			}
+			test_serving_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+			test_serving_tick();
+			UT_ASSERT_EQ(test_serving_calls, 4);
+			UT_ASSERT(cluster_semantic_activation_startup_poll(&refusal));
+			test_first_open_finish();
+		}
+	}
+}
+
+UT_TEST(test_serving_transient_retry_still_rejects_changed_epoch)
+{
+	ClusterSemanticActivationRefusal refusal;
+	test_serving_setup(false);
+	test_serving_tick();
+	test_serving_complete_read();
+	test_serving_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	test_serving_tick();
+	test_current_epoch++;
+	test_serving_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	test_serving_tick();
+	UT_ASSERT_EQ(test_serving_calls, 1);
+	UT_ASSERT(!cluster_semantic_activation_startup_poll(&refusal));
+	UT_ASSERT_EQ(semantic_activation_authority_mailbox_owner(true), -1);
+	test_first_open_finish();
+}
+
+UT_TEST(test_serving_identity_mismatch_stays_terminal_for_same_cut)
+{
+	ClusterSemanticActivationRefusal refusal;
+	test_serving_setup(false);
+	test_serving_tick();
+	test_serving_complete_read();
+	test_serving_result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	test_serving_tick();
+	test_serving_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	test_serving_tick();
+	UT_ASSERT_EQ(test_serving_calls, 1);
+	UT_ASSERT(!cluster_semantic_activation_startup_poll(&refusal));
+	UT_ASSERT_EQ(semantic_activation_authority_mailbox_owner(true), -1);
+	test_first_open_finish();
+}
+
 UT_TEST(test_serving_old_result_rejected_after_cut_changes)
 {
 	for (unsigned fault = 0; fault < 9; fault++) {

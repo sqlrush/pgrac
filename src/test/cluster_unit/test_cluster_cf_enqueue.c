@@ -131,6 +131,12 @@ errmsg(const char *fmt pg_attribute_unused(), ...)
 	return 0;
 }
 
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0; /* errstart keeps the standalone fixture's LOG path disabled. */
+}
+
 bool
 cluster_clean_leave_node_refuses_writes(void)
 {

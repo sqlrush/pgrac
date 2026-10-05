@@ -59,7 +59,7 @@ static bool held = true, mapping_held, active = true, member = true, fence = tru
 			have_ref = true;
 static bool fence_epoch_lag, fence_lease_zero, fence_expired, self_fenced;
 static uint64 epoch = 7, incarnation = 99;
-static uint64 initialized_writer_epoch;
+static uint64 initialized_writer_epoch, clean_writer_epoch;
 static ClusterWalSourceRef ref;
 static ClusterWalSourceRef restart_ref;
 static ClusterWalStartupImage startup_op;
@@ -146,6 +146,13 @@ cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *o)
 	*o = restart_ref;
 	return true;
 }
+bool
+cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *o, uint64 selected_epoch)
+{
+	return have_ref && clean_writer_epoch != 0 && selected_epoch == clean_writer_epoch
+		   && memcmp(o, &ref, sizeof(ref)) == 0;
+}
+
 ClusterControlRootResult
 cluster_control_root_v3_startup_read_writer(const ClusterControlRootIdentity *self,
 											const uint8 operation_uuid[16],
@@ -498,7 +505,7 @@ fixture(void)
 	ShutdownRequestPending = false;
 	memset(&writer_startup, 0, sizeof(writer_startup));
 	epoch = 7;
-	initialized_writer_epoch = 0;
+	initialized_writer_epoch = clean_writer_epoch = 0;
 	incarnation = 99;
 	CritSectionCount = 1;
 	CurrentMemoryContext = (MemoryContext)2;
@@ -920,7 +927,7 @@ UT_TEST(test_startup_rejects_changed_selection_route_or_owner)
 		case 10: startup_selection = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID; break;
 		case 11: route_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN; break;
 		case 12: startup_changed = true; break;
-		case 13: active = false; break;
+		case 13: fence_expired = true; break;
 		case 14: startup_op.formation_epoch++; break;
 		case 15: self_fenced = true; break;
 		}
@@ -929,6 +936,31 @@ UT_TEST(test_startup_rejects_changed_selection_route_or_owner)
 		UT_ASSERT_EQ(start, 0);
 		UT_ASSERT(!writer_startup.valid);
 	}
+}
+
+UT_TEST(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch)
+{
+	XLogRecPtr start;
+	startup_fixture();
+	startup_op.input_kind = CLUSTER_WAL_STARTUP_CLEAN;
+	active = false;
+	have_ref = false;
+	UT_ASSERT_EQ(
+		cluster_wal_writer_startup_prepare(&ref.claim.identity, startup_op.operation_uuid, &start),
+		CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(cluster_wal_writer_begin(1, &writer), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	MyBackendType = B_BACKEND;
+	UT_ASSERT_NE(cluster_wal_writer_begin(1, &writer), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	have_ref = true;
+	UT_ASSERT_NE(cluster_wal_writer_begin(1, &writer), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	clean_writer_epoch = epoch;
+	UT_ASSERT_EQ(cluster_wal_writer_begin(1, &writer), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	++epoch;
+	UT_ASSERT_NE(cluster_wal_writer_begin(1, &writer), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	--epoch;
+	UT_ASSERT_EQ(cluster_wal_writer_begin(1, &writer), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	ref.claim.identity.root_lineage_seq++;
+	UT_ASSERT_NE(cluster_wal_writer_check(&writer), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 }
 
 UT_TEST(test_initialized_writer_requires_selected_input_and_installed_same_epoch)
@@ -957,15 +989,19 @@ UT_TEST(test_initialized_writer_requires_selected_input_and_installed_same_epoch
 
 UT_TEST(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals)
 {
-	for (unsigned fault = 0; fault < 10; ++fault) {
-		XLogRecPtr start = 123;
-		startup_fixture();
-		startup_op.input_kind = CLUSTER_WAL_STARTUP_INITIALIZED;
-		active = false;
-		switch (fault) {
-		case 0: startup_selection = CLUSTER_CONTROL_ROOT_STALE_TOKEN; break;
-		case 1: startup_op.input_kind = CLUSTER_WAL_STARTUP_CLEAN; break;
-		case 2: startup_op.input_kind = CLUSTER_WAL_STARTUP_RECOVERED; break;
+	for (unsigned kind = 0; kind < 2; kind++)
+		for (unsigned fault = 0; fault < 10; ++fault) {
+			XLogRecPtr start = 123;
+			startup_fixture();
+			startup_op.input_kind
+				= kind == 0 ? CLUSTER_WAL_STARTUP_INITIALIZED : CLUSTER_WAL_STARTUP_CLEAN;
+			active = false;
+			switch (fault) {
+			case 0: startup_selection = CLUSTER_CONTROL_ROOT_STALE_TOKEN; break;
+			case 1:
+				startup_op.input_kind = 3;
+				break;
+			case 2: startup_op.input_kind = CLUSTER_WAL_STARTUP_RECOVERED; break;
 		case 3: startup_op.formation_epoch++; break;
 		case 4: self_fenced = true; break;
 		case 5: fence = false; break;
@@ -1276,7 +1312,8 @@ UT_TEST(test_requested_flush_rejects_foreign_or_unsafe_context_without_io)
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(31);
+	UT_RUN(test_clean_writer_requires_selected_exit_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_requires_selected_input_and_installed_same_epoch);
 	UT_RUN(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals);
 	UT_RUN(test_requested_background_cut_actively_flushes_fixed_end);

@@ -8,6 +8,7 @@
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_wal_claim.h"
 #include "common/cryptohash.h"
+#include "port/pg_crc32c.h"
 #include "cluster_control_bootstrap_private.h"
 #include "cluster_control_root_private.h"
 #include "cluster_recovery_anchor_private.h"
@@ -168,6 +169,7 @@ cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
 	ClusterWalThreadClaimRefV2 claim_ref;
 	ClusterWalThreadClaimV2 claim;
 	ClusterRecoveryAnchorRefV2 anchor_ref;
+	ClusterRecoveryAnchorV2 anchor;
 	ClusterControlRootResult result;
 	uint32 count;
 	bool alias = bootstrap_output_alias(input, out);
@@ -240,6 +242,19 @@ cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
 												&common, &snapshot.control);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
+	/* Bootstrap seeds this origin's native SLRU cursors. A common runtime
+	 * projection can lag its shutdown checkpoint after striped allocation.
+	 * Keep the ordinary projection unchanged and consume the same selected
+	 * anchor's actual checkpoint here, without creating missing side files.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	result = cluster_recovery_anchor_v2_decode(input->anchor.data, input->anchor.len, &anchor_ref,
+											   &anchor);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	snapshot.control.checkPointCopy = anchor.checkpoint_copy;
+	INIT_CRC32C(snapshot.control.crc);
+	COMP_CRC32C(snapshot.control.crc, &snapshot.control, offsetof(ControlFileData, crc));
+	FIN_CRC32C(snapshot.control.crc);
 	if (snapshot.control.track_commit_timestamp
 		|| TransactionIdIsValid(snapshot.control.checkPointCopy.oldestCommitTsXid)
 		|| TransactionIdIsValid(snapshot.control.checkPointCopy.newestCommitTsXid)) {
@@ -259,6 +274,9 @@ cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
 	snapshot.root_sequence = before->header.file_txn_seq;
 	snapshot.database_state = before->header.v2.database_state;
 	snapshot.activation_state = before->header.activation_state;
+	snapshot.root_format_version = before->header.format_version;
+	snapshot.writer_lifecycle = before->records[input->node_id].lifecycle;
+	memcpy(snapshot.serving, before->header.v2.serving, sizeof(snapshot.serving));
 	*out = snapshot;
 done:
 	pfree(after);

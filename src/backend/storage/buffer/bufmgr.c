@@ -10693,10 +10693,12 @@ struct ClusterPiStructuralAckV2 {
 	uint64 magic;
 	ClusterPageStructuralReceiptV2 structural;
 	ClusterWalWriterToken writer;
+	ClusterWalWriterToken collector;
 	ClusterWalInputsV1 *inputs;
 	ResourceOwner owner;
 	pid_t pid;
 	int32 node;
+	bool remote;
 };
 
 /* Neither a tag nor a pin grants write authority. Check every live fence
@@ -11659,30 +11661,34 @@ bool
 cluster_page_structural_pi_fact_v2(const ClusterPageStructuralReceiptV2 *receipt,
 	int32 peer, struct ClusterPiWritebackFactV2 *out)
 {
-	ClusterPiWritebackFactV2 fact;
+	ClusterPiWritebackFactV2 fact = { 0 };
+	ClusterPiStructuralFactV2 *proof = &fact.proof.structural;
 	ClusterPcmPiWriteCutV1 x;
 	ClusterPcmPiStorageCutV1 s;
 	uint8 actual[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], expected[sizeof(actual)];
-	uint32 cursor, holders;
-	uint64 serial;
+	uint32 holders;
 	if (out == NULL || peer < 0 || peer >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| peer == cluster_node_id || !cluster_page_structural_pi_proof_v2(receipt, &x, &s))
 		return false;
+
 	holders = x.binding_generation != 0 ? x.pi_holders_bitmap : s.pi_holders_bitmap;
-	cursor = receipt->slot;
 	if ((holders & ((uint32)1u << peer)) == 0
-		|| !cluster_ko_shared_structure_offer_next_v2(&cursor, peer, &serial, &fact)
-		|| cursor != receipt->slot + 1 || serial != receipt->serial
-		|| fact.kind != CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2
-		|| memcmp(&fact.proof.structural.terminal.binding, &receipt->terminal,
-			sizeof(receipt->terminal)) != 0
-		|| !cluster_space_structure_wal_encode(&fact.proof.structural.change, actual, sizeof(actual))
+		|| !cluster_ko_shared_structure_observation_v2(
+			receipt->slot, receipt->serial, &proof->terminal.binding, actual, sizeof(actual))
+		|| memcmp(&proof->terminal.binding, &receipt->terminal, sizeof(receipt->terminal)) != 0
 		|| !cluster_space_structure_wal_encode(&receipt->change, expected, sizeof(expected))
-		|| memcmp(actual, expected, sizeof(actual)) != 0)
+		|| memcmp(actual, expected, sizeof(actual)) != 0
+		|| !cluster_ko_shared_structure_peer_v2(receipt->slot, receipt->serial, peer, &proof->ko))
 		return false;
 	fact.kind = CLUSTER_PI_WRITEBACK_STRUCTURAL_V2;
-	fact.proof.structural.terminal.write_cut = x;
-	fact.proof.structural.terminal.storage_cut = s;
+	proof->change = receipt->change;
+	proof->durability_flags
+		= CLUSTER_PI_STRUCTURAL_WAL_FLUSHED | CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK
+		  | CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED | CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE;
+	if (proof->change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE)
+		proof->durability_flags |= CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
+	proof->terminal.write_cut = x;
+	proof->terminal.storage_cut = s;
 	*out = fact;
 	return true;
 }
@@ -12453,12 +12459,19 @@ cluster_page_structural_pi_ack_read_v2(const ClusterPiStructuralAckV2 *ack,
 		*out_node = -1;
 	if (ack == NULL || receipt == NULL || out_node == NULL
 		|| ack->magic != UINT64_C(0x5047535441434b32) || ack->pid != getpid()
-		|| ack->owner != CurrentResourceOwner || ack->node != cluster_node_id
+		|| ack->owner != CurrentResourceOwner
 		|| memcmp(&ack->structural, receipt, sizeof(*receipt)) != 0
 		|| !cluster_pi_ack_local_writer(&current)
-		|| memcmp(&ack->writer, &current, sizeof(current)) != 0
 		|| !cluster_page_structural_pi_proof_v2(receipt, &x, &s)
 		|| !cluster_page_structural_ack_inputs_current(receipt, ack->inputs, &current))
+		return false;
+	if (ack->remote) {
+		ClusterPiWritebackFactV2 fact;
+		if (ack->node == cluster_node_id || memcmp(&ack->collector, &current, sizeof(current)) != 0
+			|| !cluster_page_structural_pi_fact_v2(receipt, ack->node, &fact)
+			|| !cluster_pi_writeback_structural_ack_current_v2(&fact, &ack->writer))
+			return false;
+	} else if (ack->node != cluster_node_id || memcmp(&ack->writer, &current, sizeof(current)) != 0)
 		return false;
 	*out_node = ack->node;
 	return true;
@@ -12480,10 +12493,62 @@ cluster_page_structural_pi_ack_export_v2(const ClusterPiStructuralAckV2 *ack,
 										 ClusterWalWriterToken *out)
 {
 	int32 node;
-	if (out == NULL || !cluster_page_structural_pi_ack_read_v2(ack, receipt, &node)
-		|| node != cluster_node_id)
+	if (out == NULL || ack == NULL || ack->remote
+		|| !cluster_page_structural_pi_ack_read_v2(ack, receipt, &node) || node != cluster_node_id)
 		return false;
 	*out = ack->writer;
+	return true;
+}
+
+bool
+cluster_page_structural_pi_ack_import_v2(const ClusterPiWritebackJobV1 *job, uint32 index,
+										 const ClusterPageStructuralReceiptV2 *receipt,
+										 ClusterWalInputsV1 *inputs, ClusterPiStructuralAckV2 **out)
+{
+	ClusterWalWriterToken collector, peer;
+	ClusterPiWritebackFactV2 fact;
+	ClusterPiStructuralAckV2 *ack;
+	uint32 holders;
+	int32 node, master;
+	if (out == NULL || *out != NULL || !cluster_pi_ack_local_writer(&collector)
+		|| !cluster_page_structural_ack_inputs_current(receipt, inputs, &collector)
+		|| !cluster_pi_writeback_structural_ack_read_v2(job, index, receipt, &peer)
+		|| !cluster_wal_claim_v2_ref_valid(&peer.ref.claim) || peer.startup_first_lsn != 0
+		|| peer.epoch != collector.epoch
+		|| !cluster_page_structural_pi_fact_v2(receipt, peer.ref.claim.identity.origin_node_id,
+											   &fact)
+		|| fact.kind != CLUSTER_PI_WRITEBACK_STRUCTURAL_V2
+		|| peer.ref.claim.identity.system_identifier
+			   != fact.proof.structural.terminal.binding.identity.system_identifier
+		|| peer.ref.claim.database_incarnation
+			   != fact.proof.structural.terminal.binding.source.claim.database_incarnation
+		|| memcmp(peer.ref.claim.identity.storage_uuid,
+				  fact.proof.structural.terminal.binding.identity.storage_uuid, 16)
+			   != 0
+		|| !cluster_pi_writeback_structural_ack_current_v2(&fact, &peer))
+		return false;
+	if (cluster_pcm_pi_write_cut_valid_v1(&fact.proof.structural.terminal.write_cut)) {
+		holders = fact.proof.structural.terminal.write_cut.pi_holders_bitmap;
+		master = fact.proof.structural.terminal.write_cut.master_node;
+	} else {
+		holders = fact.proof.structural.terminal.storage_cut.pi_holders_bitmap;
+		master = fact.proof.structural.terminal.storage_cut.master_node;
+	}
+	node = peer.ref.claim.identity.origin_node_id;
+	if (master != cluster_node_id || node < 0 || node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| node == cluster_node_id || (holders & ((uint32)1u << node)) == 0)
+		return false;
+	ack = palloc0(sizeof(*ack));
+	ack->magic = UINT64_C(0x5047535441434b32);
+	ack->structural = *receipt;
+	ack->writer = peer;
+	ack->collector = collector;
+	ack->inputs = inputs;
+	ack->owner = CurrentResourceOwner;
+	ack->pid = getpid();
+	ack->node = node;
+	ack->remote = true;
+	*out = ack;
 	return true;
 }
 

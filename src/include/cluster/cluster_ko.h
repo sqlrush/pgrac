@@ -256,6 +256,17 @@ extern bool cluster_ko_shared_structure_offer_v2(const ClusterKoCompletionV2 *co
  * must then preserve the shared obligation. No caller activates this until
  * the original background consumer can finish every page responsibility. */
 extern bool cluster_ko_shared_structure_handoff_v2(ClusterKoCompletionV2 **completion);
+struct ClusterPiWritebackNoticeV1;
+/* Accept only the original authenticated relation-offer notice. A positive
+ * result means the original KO region owns the responsibility, not that any
+ * page, PI, retained WAL or locator may be retired. Full/conflicting slots
+ * refuse without replacing an existing obligation; exact retries are idempotent. */
+extern bool cluster_ko_shared_structure_accept_v2(const struct ClusterPiWritebackNoticeV1 *notice,
+												  uint32 index);
+/* Read an exact local/imported result's original peer scope. The page owner
+ * must separately prove its sealed ancestry and current master cut. */
+extern bool cluster_ko_shared_structure_peer_v2(uint32 slot, uint64 serial, int32 peer,
+												ClusterKoSharedMessageV2 *out);
 /* Original background owner, including a one-member cohort. Exact slot and
  * serial name an already handed-off result, never a raw receipt constructor.
  * Refusal preserves both outputs; no peer request is fabricated. */

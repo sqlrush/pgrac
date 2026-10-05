@@ -912,7 +912,8 @@ test_cluster_checkpoint_native.inc: $(top_srcdir)/src/backend/access/transam/xlo
 test_cluster_startup_writer_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^ClusterStartupConfigurationRequire\(/ || /^ClusterStartupWriterSelect\(/ || /^ClusterStartupCrashSeal\(/ { print "static void"; emit=1; count++ } \
 	     /^ClusterStartupWriterBegin\(/ { print "static XLogRecPtr"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 4) exit 1 }' $< > $@.tmp
+	     /^cluster_wal_startup_clean_input_v1\(/ { print "ClusterControlRootResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: execute the real earliest startup-directory mutation call site.
@@ -6754,7 +6755,7 @@ test_cluster_stop_membership_observation.inc: $(top_srcdir)/src/backend/cluster/
 		emit { print } emit && /^}/ { done=1; exit } \
 		END { if (!done || starts != 1) exit 1 }' $< > $@
 
-test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h test_cluster_first_open.h test_cluster_serving_admission.h test_cluster_sample_ack_handoff.h test_cluster_normal_cold_scn.inc \
+test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h test_cluster_first_open.h test_cluster_serving_admission.h test_cluster_sample_ack_handoff.h test_cluster_clean_restart_formation.h test_cluster_normal_cold_scn.inc \
 		test_cluster_terminal_peer.inc \
 		test_cluster_stop_membership_observation.inc \
 		test_cluster_normal_cold_startup.h test_cluster_normal_cold_capture.inc \
@@ -6764,11 +6765,12 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h tes
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_REPLACEMENT_EPISODE_O) \
 		$(CLUSTER_REPLACEMENT_WIRE_O) $(CLUSTER_EPOCH_BALLOT_O) \
-		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O)
+		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_REPLACEMENT_EPISODE_O) \
 		$(CLUSTER_REPLACEMENT_WIRE_O) $(CLUSTER_EPOCH_BALLOT_O) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) $(CLUSTER_R4_OPEN_ROUTE_TEST_O) \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
@@ -7497,7 +7499,7 @@ test_cluster_native_wal_read.inc: $(top_srcdir)/src/backend/access/transam/xlogr
 # PGRAC: actual postmaster mirror initialization and both identity consumers.
 test_cluster_wal_restart_mirror.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_thread.c Makefile
 	awk '/^typedef struct ClusterWalThreadShmemData/ { emit=1; types++ } \
-	     /^cluster_wal_thread_current_v2_ref\(/ || /^cluster_wal_thread_restart_v2_ref\(/ || /^cluster_wal_thread_initialized_writer_matches\(/ { print "bool"; emit=1; functions++ } \
+	     /^cluster_wal_thread_current_v2_ref\(/ || /^cluster_wal_thread_restart_v2_ref\(/ || /^cluster_wal_thread_initialized_writer_matches\(/ || /^cluster_wal_thread_clean_writer_matches\(/ { print "bool"; emit=1; functions++ } \
 	     /^cluster_wal_thread_install_startup\(/ { print "ClusterControlRootResult"; emit=1; installs++ } \
 	     /^cluster_wal_thread_init\(/ { owner=1 } \
 	     owner && /^\tif \(cluster_shared_config\) \{/ { print "static void actual_select_input(void) {"; emit=1; branch=1; init++ } \
@@ -7505,7 +7507,7 @@ test_cluster_wal_restart_mirror.inc: $(top_srcdir)/src/backend/cluster/cluster_w
 	     branch && /^\t}/ { print "}"; emit=0; branch=0; owner=0 } \
 	     /^} ClusterWalThreadShmemData;/ { print "static ClusterWalThreadShmemData *cluster_wal_thread_shmem;" } \
 	     /^}/ { emit=0 } \
-	     END { if (types != 1 || functions != 3 || installs != 1 || init != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (types != 1 || functions != 4 || installs != 1 || init != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_wal_restart_read: test_cluster_wal_restart_read.c test_cluster_native_wal_read.inc test_cluster_wal_restart_mirror.inc unit_test.h $(CLUSTER_WAL_CLAIM_O) \
@@ -8307,3 +8309,7 @@ test_cluster_initdb_catalog: test_cluster_initdb_catalog.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_srcdir)/src/common/cluster_catalog_init.c $(top_srcdir)/src/common/file_perm.c \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# Exact private bootstrap observation layout shared by backend and fixture.
+$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o: \
+	$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_private.h

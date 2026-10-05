@@ -1934,6 +1934,117 @@ UT_TEST(test_native_initializer_walr_share_cannot_borrow_another_role_or_generat
 	reset_phase_service_fixture(true);
 }
 
+/* A remote master can finish its local Startup while another cohort member
+ * is still installing. These are the real protocol predicates, not a grant
+ * fixture. Local startup admission remains phase-3-only. */
+UT_TEST(test_slow_startup_control_crosses_remote_master_phase4)
+{
+	for (int kind = 0; kind < 4; kind++) {
+		ClusterResId resid = { .lockmethodid = DEFAULT_LOCKMETHOD };
+		ClusterGrdGrantIdentity grant = { 0 };
+		static PGPROC startup_proc;
+		uint32 opcode = kind == 2 ? GES_REQ_OPCODE_REQUEST_NOWAIT : GES_REQ_OPCODE_REQUEST;
+		LOCKMODE mode = kind % 2 == 0 ? ShareLock : ExclusiveLock;
+
+		reset_phase_service_fixture(true);
+		cluster_run_startup_sequence();
+		cluster_shared_config = true;
+		phase_test_control_acquire_ready = true;
+		resid.type = kind < 2 ? CLUSTER_CF_RESID_TYPE : CLUSTER_WAL_RETENTION_RESID_TYPE;
+		resid.field1 = kind < 2 ? 0 : 4;
+		IsUnderPostmaster = true;
+		MyBackendType = B_STARTUP;
+		MyAuxProcType = StartupProcess;
+		MyProc = &startup_proc;
+		UT_ASSERT(cluster_recovery_authority_request_allowed(&resid, mode, true));
+		grant.mode = mode;
+		grant.request_opcode = opcode;
+		UT_ASSERT(ges_readiness_allows_protocol_request(opcode, &resid, mode));
+		UT_ASSERT(ges_readiness_allows_grant(&grant, &resid));
+		IsUnderPostmaster = false;
+		cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
+		IsUnderPostmaster = true;
+		UT_ASSERT(!cluster_recovery_authority_request_allowed(&resid, mode, true));
+		MyBackendType = B_LMON;
+		MyAuxProcType = NotAnAuxProcess;
+		UT_ASSERT(ges_readiness_allows_early_opcode(opcode));
+		UT_ASSERT(ges_readiness_allows_protocol_request(opcode, &resid, mode));
+		UT_ASSERT(ges_readiness_allows_grant(&grant, &resid));
+		UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &resid, NoLock));
+		UT_ASSERT(!cluster_serving_ready_is_current());
+		UT_ASSERT(!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_CONVERT, &resid, mode));
+		UT_ASSERT(!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REDECLARE, &resid, mode));
+		if (ut_current_failed)
+			printf("# startup control kind %d\n", kind);
+		MyProc = NULL;
+		IsUnderPostmaster = false;
+	}
+	reset_phase_service_fixture(true);
+}
+
+UT_TEST(test_phase4_startup_control_keeps_identity_and_namespace_refusals)
+{
+	for (int variant = 0; variant < 13; variant++) {
+		ClusterResId resid = { .type = CLUSTER_WAL_RETENTION_RESID_TYPE,
+							   .field1 = 4,
+							   .lockmethodid = DEFAULT_LOCKMETHOD };
+		ClusterGrdGrantIdentity grant
+			= { .mode = ShareLock, .request_opcode = GES_REQ_OPCODE_REQUEST_NOWAIT };
+		reset_phase_service_fixture(true);
+		cluster_run_startup_sequence();
+		cluster_shared_config = true;
+		phase_test_control_acquire_ready = true;
+		cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
+		switch (variant) {
+		case 0:
+			phase_test_fence_cache_expired = true;
+			break;
+		case 1:
+			phase_test_lms_generation++;
+			break;
+		case 2:
+			phase_test_grd_authority_ok = false;
+			break;
+		case 3:
+			phase_test_classification_current = false;
+			break;
+		case 4:
+			phase_test_membership_member = false;
+			break;
+		case 5:
+			phase4_test_in_quorum = false;
+			break;
+		case 6:
+			phase_test_last_admitted_incarnation++;
+			break;
+		case 7:
+			phase_test_lms_recovery_ready_ok = false;
+			break;
+		case 8:
+			phase_test_control_acquire_ready = false;
+			break;
+		case 9:
+			resid.field2 = 1;
+			break;
+		case 10:
+			resid.type = LOCKTAG_RELATION;
+			break;
+		case 11:
+			grant.mode = AccessExclusiveLock;
+			break;
+		case 12:
+			cluster_shared_config = false;
+			break;
+		}
+		UT_ASSERT(!ges_readiness_allows_protocol_request(grant.request_opcode, &resid, grant.mode));
+		UT_ASSERT(!ges_readiness_allows_grant(&grant, &resid));
+		UT_ASSERT(!cluster_serving_ready_is_current());
+		if (ut_current_failed)
+			printf("# startup control refusal %d\n", variant);
+	}
+	reset_phase_service_fixture(true);
+}
+
 UT_TEST(test_expired_cache_refuses_control_without_destroying_refresh_identity)
 {
 	ClusterResId cf = { .type = CLUSTER_CF_RESID_TYPE, .lockmethodid = DEFAULT_LOCKMETHOD };
@@ -2035,10 +2146,16 @@ UT_TEST(test_config_read_crosses_real_s1_and_ges_admission_before_serving)
 	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid));
 	UT_ASSERT(ges_readiness_allows_local_release_origin(&req.resid));
 	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &req.resid, NoLock));
+	/* Local LMON still cannot request CF-X, but the master must finish a
+	 * remote Startup's original CF-X protocol after its own phase change. */
+	req.lockmode = ExclusiveLock;
+	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
+	UT_ASSERT(!ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ExclusiveLock,
+												 NoLock));
 	UT_ASSERT(
-		!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &req.resid, ExclusiveLock));
+		ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &req.resid, ExclusiveLock));
 	grant.mode = ExclusiveLock;
-	UT_ASSERT(!ges_readiness_allows_grant(&grant, &req.resid));
+	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid));
 	MyProc = NULL;
 	IsUnderPostmaster = false;
 	reset_phase_service_fixture(true);
@@ -2489,7 +2606,9 @@ UT_TEST(test_nonshared_phase4_keeps_original_activation_entry)
 int
 main(void)
 {
-	UT_PLAN(51);
+	UT_PLAN(53);
+	UT_RUN(test_slow_startup_control_crosses_remote_master_phase4);
+	UT_RUN(test_phase4_startup_control_keeps_identity_and_namespace_refusals);
 	UT_RUN(test_shared_phase4_waits_for_actual_semantic_open);
 	UT_RUN(test_shared_phase4_cannot_publish_running_without_semantic_open);
 	UT_RUN(test_nonshared_phase4_keeps_original_activation_entry);

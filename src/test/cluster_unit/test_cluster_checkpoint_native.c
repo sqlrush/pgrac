@@ -61,7 +61,7 @@ Latch *MyLatch = &latch;
 static LOCKMODE cf_mode;
 static bool local_lock, ref_ok, lock_ok, read_ok, release_ok, fence_ok, serving_ok;
 static bool provider_ok, prebump, cancel_on_wait, change_epoch_on_wait, read_error;
-static bool initialized_ok, lose_initialized_on_release;
+static bool initialized_ok, clean_ok, lose_initialized_on_release;
 static ClusterWalSourceRef initialized_ref;
 static uint64 initialized_epoch;
 static uint64 epoch;
@@ -243,7 +243,7 @@ cluster_cf_unlock_confirmed(LOCKMODE m)
 	cf_mode = NoLock;
 	releases++;
 	if (lose_initialized_on_release)
-		initialized_ok = false;
+		initialized_ok = clean_ok = false;
 	return release_ok ? CLUSTER_CF_RELEASE_CONFIRMED : CLUSTER_CF_RELEASE_UNCONFIRMED;
 }
 bool
@@ -267,6 +267,12 @@ cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *expecte
 											  uint64 observed_epoch)
 {
 	return initialized_ok && ref_ok && observed_epoch == initialized_epoch
+		   && memcmp(expected, &initialized_ref, sizeof(*expected)) == 0;
+}
+bool
+cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected, uint64 observed_epoch)
+{
+	return clean_ok && ref_ok && observed_epoch == initialized_epoch
 		   && memcmp(expected, &initialized_ref, sizeof(*expected)) == 0;
 }
 bool
@@ -478,8 +484,8 @@ cluster_control_root_v3_startup_read_writer(const ClusterControlRootIdentity *se
 {
 	UT_ASSERT(cf_mode == NoLock && !local_lock && CritSectionCount == 0);
 	UT_ASSERT(clusterStartupWriterSelected && !clusterStartupWriterBound);
-	UT_ASSERT(memcmp(self, &offered.claim.identity, sizeof(*self)) == 0);
-	UT_ASSERT(memcmp(uuid, offered.operation_uuid, 16) == 0);
+	UT_ASSERT(memcmp(self, &clusterStartupWriter.claim.identity, sizeof(*self)) == 0);
+	UT_ASSERT(memcmp(uuid, clusterStartupWriter.operation_uuid, 16) == 0);
 	writer_read_calls++;
 	*out = offered;
 	if (writer_read_changed)
@@ -578,7 +584,7 @@ reset_fixture(void)
 	prebump = local_lock = cancel_on_wait = change_epoch_on_wait = read_error = false;
 	cf_mode = NoLock;
 	epoch = 9;
-	initialized_ok = lose_initialized_on_release = false;
+	initialized_ok = clean_ok = lose_initialized_on_release = false;
 	initialized_ref = ref;
 	initialized_epoch = epoch;
 	CritSectionCount = InterruptHoldoffCount = QueryCancelHoldoffCount = 0;
@@ -664,6 +670,45 @@ UT_TEST(prepare_refuses_unsupported_or_unproven_input)
 									: 0));
 		UT_ASSERT_EQ(current.checkPoint, 100);
 		UT_ASSERT_EQ(cf_mode, NoLock);
+	}
+}
+UT_TEST(clean_writer_checkpoint_uses_exact_existing_fence_qualification)
+{
+	for (unsigned shutdown = 0; shutdown < 2; shutdown++) {
+		reset_fixture();
+		provider_ok = false;
+		clean_ok = true;
+		ShutdownRequestPending = shutdown != 0;
+		UT_ASSERT(prepare(shutdown ? CHECKPOINT_IS_SHUTDOWN : CHECKPOINT_FORCE));
+		UT_ASSERT_EQ(reads, 1);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+		candidate.checkPoint = 200;
+		candidate.state = shutdown ? DB_SHUTDOWNED : DB_IN_PRODUCTION;
+		UT_ASSERT(publish());
+		UT_ASSERT_EQ(root_calls, 1);
+		UT_ASSERT_EQ(shutdown_calls, shutdown);
+		UT_ASSERT_EQ(current.checkPoint, 200);
+	}
+}
+UT_TEST(clean_checkpoint_cannot_borrow_other_input_epoch_or_writer)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		reset_fixture();
+		provider_ok = false;
+		clean_ok = fault != 0;
+		if (fault == 1)
+			initialized_epoch++;
+		if (fault == 2)
+			initialized_ref.claim.identity.origin_owner_incarnation++;
+		if (fault == 3)
+			lose_initialized_on_release = true;
+		UT_ASSERT(!prepare(CHECKPOINT_FORCE));
+		UT_ASSERT_EQ(reads, fault == 3 ? 1 : 0);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+		UT_ASSERT(!publish());
+		UT_ASSERT_EQ(root_calls, 0);
+		UT_ASSERT_EQ(local_updates, 0);
+		UT_ASSERT_EQ(current.checkPoint, 100);
 	}
 }
 UT_TEST(initialized_writer_checkpoint_uses_exact_existing_fence_qualification)
@@ -1057,6 +1102,175 @@ startup_first_native_site(void)
 	return true;
 }
 
+static void
+clean_input_fixture(void)
+{
+	writer_begin_fixture();
+	offered.generation = 23;
+	offered.predecessor_file_sequence = 19;
+	offered.predecessor_file_sha256[0] = 71;
+	offered.predecessor_evidence_sha256[0] = 83;
+	offered.predecessor.snapshot.identity = ref.claim.identity;
+	offered.predecessor.snapshot.identity.origin_owner_incarnation = 41;
+	offered.predecessor.refs.claim_sha256[0] = 37;
+	offered.config_generation = offered.claim.config_generation = 6;
+	offered.claim.claim_generation = 22;
+	offered.claim.database_incarnation = 12;
+	offered.input_record_crc = 167;
+	UT_ASSERT(startup_first_native_site());
+}
+
+UT_TEST(clean_input_observation_preserves_exact_old_and_new_owners)
+{
+	ClusterWalStartupCleanInputV1 got, expected = { 0 }, again;
+	clean_input_fixture();
+	provider_ok = false;
+	expected.predecessor = offered.predecessor.snapshot.identity;
+	memcpy(expected.predecessor_claim_sha256, offered.predecessor.refs.claim_sha256, 32);
+	expected.successor = offered.claim;
+	expected.formation_epoch = offered.formation_epoch;
+	expected.config_generation = offered.config_generation;
+	expected.predecessor_root_sequence = offered.predecessor_file_sequence;
+	memcpy(expected.predecessor_root_sha256, offered.predecessor_file_sha256, 32);
+	memcpy(expected.exit_evidence_sha256, offered.predecessor_evidence_sha256, 32);
+	memcpy(expected.operation_uuid, offered.operation_uuid, 16);
+	expected.operation_generation = offered.generation;
+	expected.checkpoint_lsn = offered.input_record_start;
+	expected.checkpoint_end = offered.input_record_end;
+	expected.checkpoint_crc32c = offered.input_record_crc;
+	expected.timeline = offered.timeline;
+	UT_ASSERT_EQ(cluster_wal_startup_clean_input_v1(&got), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(memcmp(&got, &expected, sizeof(got)), 0);
+	UT_ASSERT_EQ(cluster_wal_startup_clean_input_v1(&again), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(memcmp(&again, &got, sizeof(got)), 0);
+	UT_ASSERT_EQ(writer_read_calls, 2);
+	UT_ASSERT_EQ(route_calls | bind_calls | native_writes | install_calls, 0);
+	UT_ASSERT(!clusterStartupWriterBound && !clusterStartupWriterInstalled);
+	UT_ASSERT_EQ(cf_mode, NoLock);
+}
+
+UT_TEST(clean_input_observation_rejects_other_input_kinds)
+{
+	const uint32 kinds[]
+		= { 0, CLUSTER_WAL_STARTUP_INITIALIZED, CLUSTER_WAL_STARTUP_RECOVERED, 3, UINT32_MAX };
+	ClusterWalStartupCleanInputV1 got, zero = { 0 };
+	for (unsigned i = 0; i < lengthof(kinds); ++i) {
+		clean_input_fixture();
+		clusterStartupWriter.input_kind = offered.input_kind = kinds[i];
+		memset(&got, 0x55, sizeof(got));
+		UT_ASSERT(cluster_wal_startup_clean_input_v1(&got) != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(memcmp(&got, &zero, sizeof(got)), 0);
+		UT_ASSERT_EQ(writer_read_calls | route_calls | bind_calls | native_writes, 0);
+	}
+}
+
+UT_TEST(clean_input_observation_rejects_wrong_owner_phase_and_lock_context)
+{
+	ClusterWalStartupCleanInputV1 got, zero = { 0 };
+	for (unsigned fault = 0; fault < 16; ++fault) {
+		clean_input_fixture();
+		switch (fault) {
+		case 0:
+			clusterStartupWriterSelected = false;
+			break;
+		case 1:
+			clusterStartupWriterBound = true;
+			break;
+		case 2:
+			clusterStartupWriterInstalled = true;
+			break;
+		case 3:
+			clusterStartupWriter.phase = CLUSTER_WAL_STARTUP_RESERVED;
+			break;
+		case 4:
+			clusterStartupWriter.phase = CLUSTER_WAL_STARTUP_DURABLE;
+			break;
+		case 5:
+			MyBackendType = B_CHECKPOINTER;
+			break;
+		case 6:
+			cluster_shared_config = false;
+			break;
+		case 7:
+			cluster_enabled = false;
+			break;
+		case 8:
+			cluster_controlfile_shared_authority = false;
+			break;
+		case 9:
+			CritSectionCount = 1;
+			break;
+		case 10:
+			ShutdownRequestPending = true;
+			break;
+		case 11:
+			InRecovery = true;
+			break;
+		case 12:
+			ArchiveRecoveryRequested = true;
+			break;
+		case 13:
+			current.state = DB_IN_PRODUCTION;
+			break;
+		case 14:
+			local_lock = true;
+			break;
+		case 15:
+			cf_mode = ShareLock;
+			break;
+		}
+		memset(&got, 0x55, sizeof(got));
+		UT_ASSERT(cluster_wal_startup_clean_input_v1(&got) != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(memcmp(&got, &zero, sizeof(got)), 0);
+		UT_ASSERT_EQ(writer_read_calls | route_calls | bind_calls | native_writes, 0);
+	}
+	clean_input_fixture();
+	UT_ASSERT_EQ(cluster_wal_startup_clean_input_v1(NULL), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(writer_read_calls, 0);
+}
+
+UT_TEST(clean_input_observation_rechecks_root_and_native_checkpoint)
+{
+	ClusterWalStartupCleanInputV1 got, zero = { 0 };
+	for (unsigned fault = 0; fault < 9; ++fault) {
+		clean_input_fixture();
+		switch (fault) {
+		case 0:
+			writer_read_ok = false;
+			break;
+		case 1:
+			writer_read_changed = true;
+			break;
+		case 2:
+			offered.claim.identity.origin_owner_incarnation++;
+			break;
+		case 3:
+			offered.predecessor_evidence_sha256[0]++;
+			break;
+		case 4:
+			offered.claim.claim_generation++;
+			break;
+		case 5:
+			current.checkPoint++;
+			break;
+		case 6:
+			current.checkPointCopy.ThisTimeLineID++;
+			break;
+		case 7:
+			offered.predecessor_file_sha256[0]++;
+			break;
+		case 8:
+			offered.operation_uuid[1]++;
+			break;
+		}
+		memset(&got, 0x55, sizeof(got));
+		UT_ASSERT(cluster_wal_startup_clean_input_v1(&got) != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(memcmp(&got, &zero, sizeof(got)), 0);
+		UT_ASSERT_EQ(route_calls | bind_calls | native_writes | install_calls, 0);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+	}
+}
+
 static unsigned input_checks, legacy_probes, legacy_windows, legacy_anchors;
 static bool input_qualified;
 static ClusterRecoveryAnchor legacy_anchor;
@@ -1283,6 +1497,20 @@ UT_TEST(initializer_selection_precedes_first_native_side_effect)
 	UT_ASSERT_EQ(route_calls | bind_calls, 0);
 	UT_ASSERT_EQ(advance_calls, 2);
 	UT_ASSERT_EQ(waits, 1);
+	UT_ASSERT_EQ(current.checkPoint, 100);
+}
+
+UT_TEST(initializer_selection_waits_for_original_lock_before_native_side_effect)
+{
+	writer_begin_fixture();
+	advance_returns[0] = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	advance_returns[1] = CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	UT_ASSERT(startup_first_native_site());
+	UT_ASSERT_EQ(advance_calls, 3);
+	UT_ASSERT_EQ(waits, 2);
+	UT_ASSERT_EQ(startup_directory_calls, 1);
+	UT_ASSERT(!directory_before_selection);
+	UT_ASSERT_EQ(route_calls | bind_calls, 0);
 	UT_ASSERT_EQ(current.checkPoint, 100);
 }
 
@@ -1593,7 +1821,14 @@ UT_TEST(native_startup_insert_has_no_link_or_page_from_predecessor)
 int
 main(void)
 {
-	UT_PLAN(42);
+	UT_PLAN(49);
+	UT_RUN(clean_input_observation_preserves_exact_old_and_new_owners);
+	UT_RUN(clean_input_observation_rejects_other_input_kinds);
+	UT_RUN(clean_input_observation_rejects_wrong_owner_phase_and_lock_context);
+	UT_RUN(clean_input_observation_rechecks_root_and_native_checkpoint);
+	UT_RUN(initializer_selection_waits_for_original_lock_before_native_side_effect);
+	UT_RUN(clean_writer_checkpoint_uses_exact_existing_fence_qualification);
+	UT_RUN(clean_checkpoint_cannot_borrow_other_input_epoch_or_writer);
 	UT_RUN(shared_crash_control_refuses_before_untyped_publication);
 	UT_RUN(legacy_crash_control_keeps_native_publication);
 	UT_RUN(startup_file_sync_rechecks_original_writer_and_keeps_native_owner);

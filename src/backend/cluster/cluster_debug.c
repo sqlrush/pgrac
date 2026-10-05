@@ -103,6 +103,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D7: undo buffer counters */
 #include "cluster/cluster_cr.h"				  /* cluster_cr_* counter accessors (spec-3.9 D8) */
 #include "cluster/cluster_r4_observe.h"
+#include "cluster/cluster_control_observe.h"
 #include "cluster/cluster_cr_pool.h"	   /* cluster_cr_pool_* counters (spec-5.51 D9) */
 #include "cluster/cluster_cr_admit.h"	   /* cluster_cr_admit_stat_* counters (spec-5.52 D9) */
 #include "cluster/cluster_cr_tuple.h"	   /* cluster_cr_tuple_stat_* counters (spec-5.54 D5) */
@@ -4411,6 +4412,12 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		 */
 		dump_shmem(rsinfo);
 		dump_normal_start(rsinfo);
+		{
+			char *writer = cluster_control_observe_writer_json();
+			emit_row(rsinfo, "lifecycle", "native_writer", writer != NULL ? writer : "unavailable");
+			if (writer != NULL)
+				pfree(writer);
+		}
 		dump_guc(rsinfo);
 		dump_ic(rsinfo);
 		dump_inject(rsinfo);

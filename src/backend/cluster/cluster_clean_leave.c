@@ -863,6 +863,29 @@ cluster_normal_stop_failure(void)
 			   : (ClusterNormalStopFailure)pg_atomic_read_u32(&cl_normal_stop->failure_reason);
 }
 
+/* Keep the durable OPEN carrier immutable; CLEAN restart can serve under
+ * a later, independently qualified formation. No stop request is created. */
+static ClusterNormalStopPollResult
+cl_normal_stop_match_current(const ClusterSemanticActivationRecord *open,
+							 const uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+							 uint64 *incarnations, uint64 *epoch, const char **reason)
+{
+	ClusterNormalStopPollResult result;
+
+	*epoch = 0;
+	result = cluster_semantic_normal_stop_match(open, root, incarnations, reason);
+	if (result != CLUSTER_NORMAL_STOP_READY)
+		return result;
+	if (!cluster_shared_config) {
+		*epoch = open->transition_epoch;
+		return CLUSTER_NORMAL_STOP_READY;
+	}
+	result = cluster_semantic_normal_stop_current_epoch(open, root, epoch);
+	if (result != CLUSTER_NORMAL_STOP_READY && reason != NULL)
+		*reason = "NORMAL_STOP_CURRENT_SEMANTIC_EPOCH_UNAVAILABLE";
+	return result;
+}
+
 /* PGRAC: close the blocking observation interval with live formation and
  * the original semantic identity. This does not mint or refresh root evidence.
  * Author: SqlRush <sqlrush@gmail.com> */
@@ -875,18 +898,19 @@ cl_normal_stop_recheck_observation(const ClusterSemanticActivationRecord *open,
 	ClusterNormalStopPollResult result;
 	ClusterPhase1FullStopPlan after;
 	uint64 incarnations[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+	uint64 epoch, after_epoch;
 
-	result = cluster_semantic_normal_stop_match(open, root, incarnations, reason_out);
+	result = cl_normal_stop_match_current(open, root, incarnations, &epoch, reason_out);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
-	result = cl_full_stop_capture_formation_only(cluster_normal_stop_requested(),
-												 open->transition_epoch, &after, reason_out);
+	result = cl_full_stop_capture_formation_only(cluster_normal_stop_requested(), epoch, &after,
+												 reason_out);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
-	result = cluster_semantic_normal_stop_match(open, root, incarnations, reason_out);
+	result = cl_normal_stop_match_current(open, root, incarnations, &after_epoch, reason_out);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
-	if (sample->epoch != after.epoch
+	if (after_epoch != after.epoch || sample->epoch != after.epoch
 		|| memcmp(sample->member_incarnations, after.member_incarnations,
 				  sizeof(sample->member_incarnations))
 			   != 0
@@ -909,6 +933,7 @@ cl_normal_stop_observe_identity(const ClusterSemanticActivationRecord *open,
 	ClusterPhase1FullStopPlan before, after;
 	uint64 incarnations[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
 	unsigned pass;
+	uint64 epoch;
 
 	/* This is the current pre-bit22 OPEN branch, not SOURCE cutover. All
 	 * original formation/WAL fields keep their original validation. */
@@ -918,12 +943,11 @@ cl_normal_stop_observe_identity(const ClusterSemanticActivationRecord *open,
 		return CLUSTER_NORMAL_STOP_INVALID;
 	}
 	if (cluster_shared_config) {
-		result = cluster_semantic_normal_stop_match(open, root, incarnations, reason_out);
+		result = cl_normal_stop_match_current(open, root, incarnations, &epoch, reason_out);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return result;
 		result = cl_full_stop_capture_formation_identity(wal_state, cluster_normal_stop_requested(),
-														 open->transition_epoch, true, &before,
-														 reason_out);
+														 epoch, true, &before, reason_out);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return result;
 		if (memcmp(before.member_incarnations, incarnations, sizeof(incarnations)) != 0)
@@ -1056,7 +1080,9 @@ cluster_normal_stop_peer_receipt_tail(
 			&& pg_atomic_read_u32(&cl_state->phase) == CLUSTER_LEAVE_IDLE
 			&& (pg_atomic_read_u32(&cl_state->request_in_progress) == 0
 				|| pg_atomic_read_u32(&cl_state->shutdown_driven) == 1)
-			&& cl_normal_stop->epoch == open_record->transition_epoch
+			&& cl_normal_stop->epoch
+				   == (cluster_shared_config ? cluster_epoch_get_current()
+											 : open_record->transition_epoch)
 			&& cl_normal_stop->member_incarnations[peer] == admitted_incarnation
 			&& memcmp(&cl_normal_stop->open_record, open_record, sizeof(*open_record)) == 0
 			&& memcmp(cl_normal_stop->root_descriptor, root_descriptor,

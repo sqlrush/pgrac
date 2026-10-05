@@ -2187,6 +2187,9 @@ static ClusterWalStateSlot identity_wal;
 static ClusterWalStateSlot identity_peer_wal[4];
 static ClusterNormalStopPollResult identity_read_result;
 static ClusterNormalStopPollResult identity_match_result;
+static ClusterNormalStopPollResult identity_epoch_result;
+static uint64 identity_semantic_epoch;
+static unsigned identity_epoch_reads;
 static ClusterWalSlotVerdict identity_wal_result;
 static unsigned identity_reads;
 static unsigned identity_wal_reads, identity_change_on_wal_read;
@@ -2498,6 +2501,23 @@ cluster_semantic_normal_stop_match(const ClusterSemanticActivationRecord *open,
 	return CLUSTER_NORMAL_STOP_READY;
 }
 
+ClusterNormalStopPollResult
+cluster_semantic_normal_stop_current_epoch(const ClusterSemanticActivationRecord *open,
+										   const uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+										   uint64 *epoch)
+{
+	identity_epoch_reads++;
+	*epoch = 0;
+	if (lock_holds != 0)
+		abort();
+	if (memcmp(open, &identity_open, sizeof(*open)) != 0
+		|| memcmp(root, identity_root, sizeof(identity_root)) != 0)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	if (identity_epoch_result == CLUSTER_NORMAL_STOP_READY)
+		*epoch = identity_semantic_epoch;
+	return identity_epoch_result;
+}
+
 static void
 reset_identity(void)
 {
@@ -2562,6 +2582,9 @@ reset_identity(void)
 	identity_wal.started_at = 555;
 	identity_wal_result = CLUSTER_WAL_SLOT_OK;
 	identity_read_result = identity_match_result = CLUSTER_NORMAL_STOP_READY;
+	identity_epoch_result = CLUSTER_NORMAL_STOP_READY;
+	identity_semantic_epoch = identity_formation.local_epoch;
+	identity_epoch_reads = 0;
 	identity_snapshot_ok = identity_quorum = identity_suppressed = true;
 	identity_pristine = false;
 	identity_reads = 0;
@@ -2585,6 +2608,43 @@ reset_pre2_members(uint32 members, int self)
 			identity_formation.membership.membership_state[node] = CLUSTER_MEMBER_ABSENT;
 			identity_formation.membership.last_admitted_incarnation[node] = 0;
 		}
+}
+
+UT_TEST(test_pre2_stop_clean_restart_binds_current_epoch_and_original_record)
+{
+	for (int self = 0; self < 4; self++) {
+		ClusterPhase1FullStopPlan out;
+		reset_pre2_members(15, self);
+		identity_open.transition_epoch--;
+		UT_ASSERT_EQ(cl_normal_stop_identity_poll(false, &out, NULL), CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT_EQ(out.epoch, identity_semantic_epoch);
+		UT_ASSERT_EQ(cl_normal_stop->open_record.transition_epoch, identity_open.transition_epoch);
+		UT_ASSERT(identity_epoch_reads > 0);
+		UT_ASSERT(!cluster_normal_stop_requested());
+		UT_ASSERT_EQ(cl_normal_stop->peer_requests_seen, 0);
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pre2_stop_refuses_unqualified_or_changed_current_epoch)
+{
+	for (unsigned bad = 0; bad < 4; bad++) {
+		ClusterPhase1FullStopPlan out;
+		reset_pre2_members(15, 0);
+		if (bad == 0)
+			identity_epoch_result = CLUSTER_NORMAL_STOP_PENDING;
+		if (bad == 1)
+			identity_epoch_result = CLUSTER_NORMAL_STOP_INVALID;
+		if (bad == 2)
+			identity_semantic_epoch--;
+		if (bad == 3)
+			identity_semantic_epoch++;
+		UT_ASSERT(cl_normal_stop_identity_poll(false, &out, NULL) != CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->identity_published), 0);
+		UT_ASSERT(!cluster_normal_stop_requested());
+		UT_ASSERT_EQ(cl_normal_stop->peer_requests_seen, 0);
+	}
+	cluster_shared_config = false;
 }
 
 UT_TEST(test_pre2_stop_identity_uses_declared_members_not_slot_capacity)
@@ -4870,6 +4930,33 @@ UT_TEST(test_terminal_peer_tail_requires_real_five_legs_not_last_receipt)
 	UT_ASSERT(!cluster_normal_stop_protocol_closed());
 }
 
+UT_TEST(test_clean_restart_terminal_receipt_uses_saved_current_epoch_without_recursion)
+{
+	ClusterPhase1FullStopPlan plan;
+	unsigned calls;
+	seed_post_barrier(&plan);
+	for (int peer = 0; peer < 4; peer++)
+		if (peer != cluster_node_id)
+			release_peer_message(peer, CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE, 3000 + peer);
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	release_reply_on_request = true;
+	release_receipt_on_reply = false;
+	MyAuxProcType = LmonProcess;
+	cl_normal_stop_release_lmon_tick();
+	cluster_shared_config = true;
+	identity_open.transition_epoch--;
+	cl_normal_stop->open_record = identity_open;
+	calls = identity_epoch_reads;
+	UT_ASSERT(cluster_normal_stop_peer_receipt_tail(&identity_open, identity_root, 1, 101));
+	UT_ASSERT_EQ(identity_epoch_reads, calls);
+	cl_normal_stop->epoch++;
+	UT_ASSERT(!cluster_normal_stop_peer_receipt_tail(&identity_open, identity_root, 1, 101));
+	cl_normal_stop->epoch--;
+	cluster_shared_config = false;
+	UT_ASSERT(!cluster_normal_stop_peer_receipt_tail(&identity_open, identity_root, 1, 101));
+}
+
 UT_TEST(test_terminal_peer_tail_rejects_each_missing_leg_or_changed_binding)
 {
 	ClusterPhase1FullStopPlan plan;
@@ -5545,7 +5632,10 @@ UT_TEST(test_pre2_pair_rejects_nondeclared_release_reply_even_after_seal)
 int
 main(void)
 {
-	UT_PLAN(136);
+	UT_PLAN(139);
+	UT_RUN(test_pre2_stop_clean_restart_binds_current_epoch_and_original_record);
+	UT_RUN(test_pre2_stop_refuses_unqualified_or_changed_current_epoch);
+	UT_RUN(test_clean_restart_terminal_receipt_uses_saved_current_epoch_without_recursion);
 	UT_RUN(test_pre2_stop_accepts_exact_published_cohort_epoch_projection);
 	UT_RUN(test_pre2_stop_cohort_projection_does_not_admit_reconfiguration_debt);
 	UT_RUN(test_actual_region_size_matches_frozen_tail);

@@ -15,7 +15,11 @@
 #include "utils/resowner.h"
 #include "utils/inval.h"
 #include "utils/relcache.h"
+static bool ko_offer_notice_fixture(const ClusterPiWritebackNoticeV1 *, uint32, uint64 *,
+									ClusterPiWritebackFactV2 *);
+#define cluster_pi_writeback_structure_offer_read_v2 ko_offer_notice_fixture
 #include "../../backend/cluster/cluster_ko_lock.c"
+#undef cluster_pi_writeback_structure_offer_read_v2
 #undef printf
 #include "unit_test.h"
 
@@ -67,6 +71,22 @@ static bool drive_shared_ack;
 static bool expecting_error;
 static int reported_sqlstate;
 static ClusterKoSharedMessageV2 last_shared_request, last_shared_ack;
+static ClusterPiWritebackFactV2 offered_structure;
+static bool offer_notice_live;
+static const ClusterPiWritebackNoticeV1 *offer_notice = (const ClusterPiWritebackNoticeV1 *)9;
+/* The authenticated WB notice is this unit's explicit input boundary. Its
+ * runtime identity checks execute in the writeback unit; no raw public fact
+ * is accepted by the KO owner. */
+static bool
+ko_offer_notice_fixture(const ClusterPiWritebackNoticeV1 *notice, uint32 index, uint64 *revision,
+						ClusterPiWritebackFactV2 *out)
+{
+	if (!offer_notice_live || notice != offer_notice || index != 0)
+		return false;
+	*revision = 7;
+	*out = offered_structure;
+	return true;
+}
 static void (*exit_callback)(int, Datum);
 static ResourceReleaseCallback resource_callback;
 static XactCallback xact_callback;
@@ -2490,6 +2510,193 @@ structure_projection_setup(void)
 	return shared_request(123, current_epoch);
 }
 
+static void
+remote_structure_setup(bool drop)
+{
+	ClusterPageWalBindingV1 binding;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	ClusterKoCompletionV2 *completion;
+	cluster_node_id = 0;
+	completion = prepare_native_structure(drop, &binding, wal);
+	UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
+	if (!drop)
+		UT_ASSERT(cluster_ko_shared_observe_truncate_v2(completion));
+	xact_callback(XACT_EVENT_COMMIT, NULL);
+	if (drop)
+		UT_ASSERT(cluster_ko_shared_observe_drop_v2(completion));
+	UT_ASSERT(cluster_ko_shared_structure_offer_v2(completion, 1, &offered_structure));
+	cluster_ko_shared_release_v2(&completion);
+	UT_ASSERT_EQ(completion_allocations, 0);
+	/* Add the third member to the authenticated-notice fixture's complete
+	 * cut. This is not a claim that the preceding two-node KO used it. */
+	formation.membership.membership_state[2] = CLUSTER_MEMBER_MEMBER;
+	formation.membership.last_admitted_incarnation[2] = 33;
+	offered_structure.proof.structural.ko = shared_request(123, current_epoch);
+	offered_structure.proof.structural.ko.origin_node = 0;
+	offered_structure.proof.structural.ko.origin_boot = 11;
+	offered_structure.proof.structural.ko.peer_node = 1;
+	offered_structure.proof.structural.ko.peer_boot = 22;
+	assert_structure_offer_codec(&offered_structure);
+	cluster_node_id = 1;
+	writer.claim.identity.origin_node_id = 1;
+	writer.claim.identity.origin_thread_id = 2;
+	writer.claim.identity.origin_owner_incarnation = 22;
+	MyBackendType = B_BG_WRITER;
+	offer_notice_live = true;
+}
+
+UT_TEST(test_remote_structure_accept_preserves_responsibility_after_notice_and_exit)
+{
+	for (unsigned drop = 0; drop < 2; drop++) {
+		ClusterPageWalBindingV1 observed = { 0 };
+		ClusterKoSharedMessageV2 projected = { 0 };
+		ClusterPiWritebackFactV2 forbidden;
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES] = { 0 }, expected[sizeof(wal)];
+		uint32 cursor = 0;
+		uint64 serial;
+		const char *reason;
+		int sends, syncs, reads;
+		remote_structure_setup(drop);
+		sends = send_calls;
+		syncs = sync_count;
+		reads = space_reads;
+		UT_ASSERT(cluster_ko_shared_structure_accept_v2(offer_notice, 0));
+		serial = storage.contexts[0].serial;
+		UT_ASSERT(serial != 0 && storage.contexts[0].used && storage.contexts[0].structure_owned);
+		UT_ASSERT_EQ(storage.contexts[0].request.origin_node, 0);
+		offer_notice_live = false;
+		ko_shared_backend_exit(0, (Datum)0);
+		UT_ASSERT(
+			cluster_ko_shared_structure_observation_v2(0, serial, &observed, wal, sizeof(wal)));
+		UT_ASSERT_EQ(memcmp(&observed, &offered_structure.proof.structural.terminal.binding,
+							sizeof(observed)),
+					 0);
+		UT_ASSERT(cluster_space_structure_wal_encode(&offered_structure.proof.structural.change,
+													 expected, sizeof(expected)));
+		UT_ASSERT_EQ(memcmp(wal, expected, sizeof(wal)), 0);
+		UT_ASSERT(cluster_ko_shared_structure_peer_v2(0, serial, 0, &projected));
+		UT_ASSERT_EQ(projected.origin_node, 0);
+		UT_ASSERT_EQ(projected.peer_node, 1); /* Origin is never its own peer. */
+		UT_ASSERT(cluster_ko_shared_structure_peer_v2(0, serial, 2, &projected));
+		UT_ASSERT_EQ(projected.origin_node, 0);
+		UT_ASSERT_EQ(projected.peer_node, 2);
+		UT_ASSERT(!cluster_ko_shared_structure_offer_next_v2(&cursor, 2, &serial, &forbidden));
+		UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(send_calls, sends);
+		UT_ASSERT_EQ(sync_count, syncs);
+		UT_ASSERT_EQ(space_reads, reads);
+		UT_ASSERT_EQ(completion_allocations, 0);
+	}
+	cluster_node_id = 0;
+}
+
+UT_TEST(test_remote_structure_accept_is_idempotent_and_never_overwrites_conflict)
+{
+	ClusterKoShared before;
+	remote_structure_setup(false);
+	UT_ASSERT(cluster_ko_shared_structure_accept_v2(offer_notice, 0));
+	before = storage;
+	UT_ASSERT(cluster_ko_shared_structure_accept_v2(offer_notice, 0));
+	UT_ASSERT_EQ(memcmp(&storage, &before, sizeof(storage)), 0);
+	offered_structure.proof.structural.terminal.binding.record_crc++;
+	UT_ASSERT(!cluster_ko_shared_structure_accept_v2(offer_notice, 0));
+	UT_ASSERT_EQ(memcmp(&storage, &before, sizeof(storage)), 0);
+	cluster_node_id = 0;
+}
+
+UT_TEST(test_remote_structure_accept_full_and_stale_cut_preserve_every_slot)
+{
+	for (unsigned fault = 0; fault < 12; fault++) {
+		ClusterKoShared before;
+		remote_structure_setup(false);
+		switch (fault) {
+		case 0:
+			offer_notice_live = false;
+			break;
+		case 1:
+			CurrentResourceOwner = NULL;
+			break;
+		case 2:
+			MyBackendType = B_LMON;
+			break;
+		case 3:
+			CritSectionCount++;
+			break;
+		case 4:
+			current_epoch++;
+			break;
+		case 5:
+			formation.membership.last_admitted_incarnation[0]++;
+			break;
+		case 6:
+			writer.claim.identity.origin_owner_incarnation++;
+			break;
+		case 7:
+			cap_ok = false;
+			break;
+		case 8:
+			generation_race = true;
+			break;
+		case 9:
+			for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+				storage.contexts[i].used = true;
+				storage.contexts[i].serial = i + 1;
+			}
+			break;
+		case 10:
+			storage.context_serial = UINT64_MAX;
+			break;
+		case 11:
+			offered_structure.kind = CLUSTER_PI_WRITEBACK_STRUCTURAL_V2;
+			break;
+		}
+		before = storage;
+		UT_ASSERT(!cluster_ko_shared_structure_accept_v2(offer_notice, 0));
+		UT_ASSERT_EQ(memcmp(&storage, &before, sizeof(storage)), 0);
+		CritSectionCount = 0;
+	}
+	cluster_node_id = 0;
+}
+
+UT_TEST(test_remote_structure_observation_rechecks_cut_and_exact_lifetime)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		ClusterKoShared before;
+		ClusterPageWalBindingV1 observed, saved;
+		ClusterKoSharedMessageV2 projected, original;
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], original_wal[sizeof(wal)];
+		uint64 serial;
+		remote_structure_setup(false);
+		UT_ASSERT(cluster_ko_shared_structure_accept_v2(offer_notice, 0));
+		serial = storage.contexts[0].serial;
+		if (fault == 0)
+			current_epoch++;
+		if (fault == 1)
+			formation.membership.last_admitted_incarnation[2]++;
+		if (fault == 2)
+			serial++;
+		if (fault == 3)
+			writer.claim.identity.origin_owner_incarnation++;
+		if (fault == 4)
+			cap_ok = false;
+		before = storage;
+		memset(&saved, 0x5a, sizeof(saved));
+		observed = saved;
+		memset(original_wal, 0x5a, sizeof(original_wal));
+		memcpy(wal, original_wal, sizeof(wal));
+		memset(&original, 0x5a, sizeof(original));
+		projected = original;
+		UT_ASSERT(
+			!cluster_ko_shared_structure_observation_v2(0, serial, &observed, wal, sizeof(wal)));
+		UT_ASSERT(!cluster_ko_shared_structure_peer_v2(0, serial, 2, &projected));
+		UT_ASSERT_EQ(memcmp(&storage, &before, sizeof(storage)), 0);
+		UT_ASSERT_EQ(memcmp(&observed, &saved, sizeof(saved)), 0);
+		UT_ASSERT_EQ(memcmp(wal, original_wal, sizeof(wal)), 0);
+		UT_ASSERT_EQ(memcmp(&projected, &original, sizeof(original)), 0);
+	}
+	cluster_node_id = 0;
+}
+
 UT_TEST(test_structure_projection_keeps_original_cut_and_origin_route)
 {
 	ClusterKoSharedMessageV2 request = structure_projection_setup(), result, expected;
@@ -2666,7 +2873,8 @@ UT_TEST(test_structural_cut_query_rejects_changed_identity_or_sample)
 int
 main(void)
 {
-	UT_PLAN(67);
+	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
+	UT_PLAN(71);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
@@ -2728,6 +2936,10 @@ main(void)
 	UT_RUN(test_native_drop_effect_is_once_only_after_original_top_commit);
 	UT_RUN(test_native_drop_effect_refuses_wrong_lifetime_scope_or_handle);
 	UT_RUN(test_native_drop_result_handoff_preserves_original_shared_obligation);
+	UT_RUN(test_remote_structure_accept_preserves_responsibility_after_notice_and_exit);
+	UT_RUN(test_remote_structure_accept_is_idempotent_and_never_overwrites_conflict);
+	UT_RUN(test_remote_structure_accept_full_and_stale_cut_preserve_every_slot);
+	UT_RUN(test_remote_structure_observation_rechecks_cut_and_exact_lifetime);
 	UT_RUN(test_structure_projection_keeps_original_cut_and_origin_route);
 	UT_RUN(test_structure_projection_preserves_origin_endpoint_and_local_role);
 	UT_RUN(test_structure_projection_refuses_changed_cut_capability_and_wrong_actor);

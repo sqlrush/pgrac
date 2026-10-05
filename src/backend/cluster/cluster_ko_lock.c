@@ -995,6 +995,79 @@ cluster_ko_shared_structure_handoff_v2(ClusterKoCompletionV2 **completion)
 }
 
 static bool
+ko_shared_import_current(const ClusterKoSharedContext *context)
+{
+	ClusterKoSharedMessageV2 current = context->request;
+	const ClusterWalSourceRef *source = &context->terminal.source;
+	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], generation;
+
+	return cluster_node_id == current.peer_node && cluster_node_id != current.origin_node
+		   && source->claim.identity.origin_node_id == current.origin_node
+		   && source->claim.identity.origin_owner_incarnation == current.origin_boot
+		   && cluster_ko_shared_cut_current_v2(&current)
+		   && ko_shared_members(&current, boots, &generation)
+		   && memcmp(boots, context->peer_boots, sizeof(boots)) == 0
+		   && cluster_membership_cut_generation_current(generation);
+}
+
+bool
+cluster_ko_shared_structure_accept_v2(const ClusterPiWritebackNoticeV1 *notice, uint32 index)
+{
+	ClusterPiWritebackFactV2 fact;
+	ClusterKoSharedContext incoming = { 0 };
+	uint64 revision, generation;
+	bool accepted = false;
+	int free_slot = -1;
+
+	if (ko_state == NULL || MyBackendType != B_BG_WRITER || CurrentResourceOwner == NULL
+		|| CritSectionCount != 0 || MyProcPid <= 0
+		|| !cluster_pi_writeback_structure_offer_read_v2(notice, index, &revision, &fact)
+		|| revision == 0 || fact.kind != CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2)
+		return false;
+	incoming.request = fact.proof.structural.ko;
+	incoming.terminal = fact.proof.structural.terminal.binding;
+	if (incoming.request.peer_node != cluster_node_id
+		|| incoming.request.origin_node == cluster_node_id
+		|| !cluster_space_structure_wal_encode(&fact.proof.structural.change, incoming.structure,
+											   sizeof(incoming.structure))
+		|| !ko_shared_members(&incoming.request, incoming.peer_boots, &generation)
+		|| memcmp(&incoming.request, &fact.proof.structural.ko, sizeof(incoming.request)) != 0
+		|| !ko_shared_import_current(&incoming)
+		|| !cluster_membership_cut_generation_current(generation))
+		return false;
+	incoming.used = incoming.complete = incoming.structure_owned = true;
+	incoming.pid = MyProcPid;
+	SpinLockAcquire(&ko_state->shared_lock);
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		const ClusterKoSharedContext *entry = &ko_state->contexts[i];
+		if (!entry->used) {
+			if (free_slot < 0)
+				free_slot = i;
+			continue;
+		}
+		if (entry->request.origin_node != incoming.request.origin_node
+			|| entry->request.origin_boot != incoming.request.origin_boot
+			|| entry->request.epoch != incoming.request.epoch
+			|| entry->request.batch_id != incoming.request.batch_id)
+			continue;
+		accepted = entry->complete && entry->structure_owned && entry->serial != 0
+				   && memcmp(&entry->request, &incoming.request, sizeof(entry->request)) == 0
+				   && memcmp(entry->peer_boots, incoming.peer_boots, sizeof(entry->peer_boots)) == 0
+				   && memcmp(&entry->terminal, &incoming.terminal, sizeof(entry->terminal)) == 0
+				   && memcmp(entry->structure, incoming.structure, sizeof(entry->structure)) == 0;
+		goto done;
+	}
+	if (free_slot >= 0 && ko_state->context_serial != UINT64_MAX) {
+		incoming.serial = ++ko_state->context_serial;
+		ko_state->contexts[free_slot] = incoming;
+		accepted = true;
+	}
+done:
+	SpinLockRelease(&ko_state->shared_lock);
+	return accepted;
+}
+
+static bool
 ko_shared_structure_snapshot(uint32 slot, ClusterKoSharedContext *out)
 {
 	ClusterKoSharedContext context;
@@ -1008,9 +1081,11 @@ ko_shared_structure_snapshot(uint32 slot, ClusterKoSharedContext *out)
 	context = ko_state->contexts[slot];
 	SpinLockRelease(&ko_state->shared_lock);
 	if (!context.used || !context.complete || !context.structure_owned || context.serial == 0
-		|| !ko_shared_origin_current(&context)
-		|| !cluster_wal_thread_current_v2_ref(&current)
-		|| memcmp(&current, &context.terminal.source, sizeof(current)) != 0)
+		|| (context.request.origin_node == cluster_node_id
+				? (!ko_shared_origin_current(&context)
+				   || !cluster_wal_thread_current_v2_ref(&current)
+				   || memcmp(&current, &context.terminal.source, sizeof(current)) != 0)
+				: !ko_shared_import_current(&context)))
 		return false;
 	*out = context;
 	return true;
@@ -1031,6 +1106,16 @@ cluster_ko_shared_structure_observation_v2(uint32 slot, uint64 serial,
 }
 
 bool
+cluster_ko_shared_structure_peer_v2(uint32 slot, uint64 serial, int32 peer,
+									ClusterKoSharedMessageV2 *out)
+{
+	ClusterKoSharedContext context;
+	return out != NULL && serial != 0 && ko_shared_structure_snapshot(slot, &context)
+		   && context.serial == serial
+		   && cluster_ko_shared_peer_projection_v2(&context.request, peer, out);
+}
+
+bool
 cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer, uint64 *serial,
 	struct ClusterPiWritebackFactV2 *out)
 {
@@ -1043,7 +1128,8 @@ cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer, uint64 *se
 		ClusterPiWritebackFactV2 value = {0};
 		ClusterPiStructuralFactV2 *s = &value.proof.structural;
 
-		if (!ko_shared_structure_snapshot(i, &context) || context.peer_boots[peer] == 0)
+		if (!ko_shared_structure_snapshot(i, &context)
+			|| context.request.origin_node != cluster_node_id || context.peer_boots[peer] == 0)
 			continue;
 		s->ko = context.request;
 		s->ko.peer_node = peer;

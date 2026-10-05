@@ -832,24 +832,29 @@ cluster_authority_startup_refresh_recovery(int timeout_ms)
 	return result;
 }
 
-/* PGRAC: static configuration comparison is an input to SERVING. The exact
- * sealed recovery binding survives the phase-3 to phase-4 handoff; only its
- * CF read transport may continue across that boundary. Do not broaden the
- * recovery/DATA predicate or admit a components-only configuration read.
+/* A master can finish its local Startup before a peer finishes installing.
+ * Keep that peer's sealed CONTROL protocol available through phase 4. This
+ * does not authorize a local requester, DATA, or a components-only binding.
  * Author: SqlRush <sqlrush@gmail.com> */
 bool
-cluster_configuration_read_transport_is_current(const ClusterResId *resid, LOCKMODE mode)
+cluster_startup_control_transport_is_current(const ClusterResId *resid, LOCKMODE mode)
 {
 	ClusterAuthorityBindingLocal binding;
 	ClusterStartupPhase phase = cluster_current_phase();
 
-	return cluster_shared_config && resid != NULL && resid->type == CLUSTER_CF_RESID_TYPE
-		   && mode == ShareLock && cluster_recovery_authority_resid_mode_allowed(resid, mode)
+	return cluster_shared_config && cluster_recovery_authority_resid_mode_allowed(resid, mode)
 		   && (phase == CLUSTER_PHASE_3_RECOVERY || phase == CLUSTER_PHASE_4_NORMAL)
 		   && cluster_authority_binding_copy(&binding)
 		   && binding.state == CLUSTER_AUTHORITY_RECOVERY_READY
 		   && cluster_authority_binding_components_current(&binding, false)
 		   && cluster_lms_is_recovery_ready();
+}
+
+bool
+cluster_configuration_read_transport_is_current(const ClusterResId *resid, LOCKMODE mode)
+{
+	return resid != NULL && resid->type == CLUSTER_CF_RESID_TYPE && mode == ShareLock
+		   && cluster_startup_control_transport_is_current(resid, mode);
 }
 
 bool

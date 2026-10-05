@@ -201,9 +201,38 @@ extern bool cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out);
  * and only in its original formation epoch. Does not grant runtime authority. */
 extern bool cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *expected,
 														  uint64 epoch);
+/* Exact CLEAN qualification from collective exit evidence and actual INSTALL.
+ * It is not the never-served input and does not replace live runtime gates. */
+extern bool cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected,
+													uint64 epoch);
 /* Immutable restart input, independent of the ordinary writer reference.
  * Reading this mirror never authorizes WAL insertion or serving. */
 extern bool cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out);
+
+/* Read-only native Startup observation of its selected CLEAN input, before
+ * WAL binding or INSTALL. The root owner revalidates the complete formation
+ * and durable fence. This value does not authorize serving or mutation. */
+typedef struct ClusterWalStartupCleanInputV1 {
+	ClusterControlRootIdentity predecessor;
+	uint8 predecessor_claim_sha256[32];
+	ClusterWalThreadClaimV2 successor;
+	uint64 formation_epoch;
+	uint64 config_generation;
+	uint64 predecessor_root_sequence;
+	uint8 predecessor_root_sha256[32];
+	uint8 exit_evidence_sha256[32];
+	uint8 operation_uuid[16];
+	uint64 operation_generation;
+	XLogRecPtr checkpoint_lsn;
+	XLogRecPtr checkpoint_end;
+	uint32 checkpoint_crc32c;
+	TimeLineID timeline;
+} ClusterWalStartupCleanInputV1;
+
+/* Refusal clears out; never substitutes a caller flag or installed writer
+ * for the original selected input. Implemented by the native xlog owner. */
+extern ClusterControlRootResult
+cluster_wal_startup_clean_input_v1(ClusterWalStartupCleanInputV1 *out);
 
 /* Last successful native checkpoint observation, never retention authority.
  * Byte intervals derived from these LSNs exclude other writer generations,
