@@ -23,12 +23,15 @@
 #include "catalog/storage.h"
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_page_wal.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/smgr.h"
+#include "storage/shmem.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -51,6 +54,32 @@ static PGAlignedBlock buffers[3], written, image;
 #define source_page buffers[1]
 #define target_page buffers[2]
 static ClusterWalSourceRef ref;
+static BufferDescPadded descriptors[3];
+BufferDescPadded *BufferDescriptors = descriptors;
+static void *binding_memory;
+static bool source_available, lose_source_on_insert, capture_permitted;
+static uint32 wait_event;
+uint32 *my_wait_event_info = &wait_event;
+
+Size
+add_size(Size a, Size b)
+{
+	return a + b;
+}
+Size
+mul_size(Size a, Size b)
+{
+	return a * b;
+}
+void *
+ShmemInitStruct(const char *name, Size size, bool *found)
+{
+	free(binding_memory);
+	binding_memory = calloc(1, size);
+	*found = false;
+	return binding_memory;
+}
+
 static ClusterSpaceIdentity identity;
 static RfPageVersionEdgeEntryV1 entry;
 static ForkNumber test_fork;
@@ -61,11 +90,27 @@ static unsigned reopens;
 static uint64 token;
 static bool buffered;
 static bool data_pins[2], data_locks[2];
+bool
+LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
+{
+	return lock == BufferDescriptorGetContentLock(&descriptors[2].bufferdesc) && data_locks[1];
+}
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	return LWLockHeldByMeInMode(lock, LW_EXCLUSIVE);
+}
+bool
+cluster_bufmgr_pcm_x_content_holder_write_permitted(BufferDesc *buf)
+{
+	return buf == &descriptors[2].bufferdesc && capture_permitted && data_locks[1];
+}
 static unsigned dirties, strategies;
 static RelFileLocator buffer_locator;
 static bool expecting_error;
 static jmp_buf error_jump;
 static char last_error[256];
+static int last_error_level;
 static unsigned reservations;
 static bool reservation_refused, invalidate_on_reserve;
 
@@ -133,6 +178,8 @@ RecoveryInProgress(void)
 bool
 cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
+	if (!source_available)
+		return false;
 	*out = ref;
 	return true;
 }
@@ -365,6 +412,7 @@ MarkBufferDirty(Buffer buffer)
 	if (!buffered || buffer != 3 || !data_pins[1] || !data_locks[1] || CritSectionCount == 0)
 		abort();
 	dirties++;
+	pg_atomic_fetch_or_u32(&descriptors[2].bufferdesc.state, BM_DIRTY);
 }
 
 XLogRecPtr
@@ -430,7 +478,25 @@ XLogInsert(RmgrId rmid, uint8 info)
 	}
 	begun = false;
 	new_wal++;
+	if (lose_source_on_insert)
+		source_available = false;
 	return 200;
+}
+
+bool
+XLogGetLastInsertRecord(XLogRecPtr end, XLogRecPtr *start, XLogRecord *record)
+{
+	UT_ASSERT(!begun && new_wal == 1 && buffered && data_locks[1]);
+	UT_ASSERT_EQ(CritSectionCount, 1);
+	UT_ASSERT_EQ(end, 200);
+	UT_ASSERT_EQ(PageGetLSN(target_page.data), 200);
+	UT_ASSERT_EQ(((PageHeader)target_page.data)->pd_block_scn, token);
+	memset(record, 0, sizeof(*record));
+	record->xl_rmid = RM_XLOG_ID;
+	record->xl_info = XLOG_FPI;
+	record->xl_crc = 0x1928;
+	*start = 120;
+	return true;
 }
 
 void
@@ -456,8 +522,10 @@ errstart(int elevel, const char *domain)
 	(void)domain;
 	if (elevel == DEBUG1)
 		return false;
-	if (expecting_error && elevel == ERROR)
+	if (expecting_error && elevel >= ERROR) {
+		last_error_level = elevel;
 		return true;
+	}
 	abort();
 }
 
@@ -539,6 +607,7 @@ reset(ForkNumber forknum)
 	CritSectionCount = 0;
 	expecting_error = false;
 	last_error[0] = '\0';
+	last_error_level = 0;
 	invalidate_on_read = handles_retired = false;
 	reopens = 0;
 	old_wal = new_wal = edges = writes = syncs = flushes = space_reads = 0;
@@ -547,6 +616,24 @@ reset(ForkNumber forknum)
 	cluster_shared_config = true;
 	test_fork = forknum;
 	token = 99;
+	source_available = capture_permitted = true;
+	lose_source_on_insert = false;
+	ref.claim.identity.authority_uuid[0] = 31;
+	ref.claim.identity.origin_thread_id = 1;
+	ref.claim.identity.thread_claim_created_at = 32;
+	ref.claim.identity.origin_owner_incarnation = 33;
+	ref.claim.identity.root_lineage_seq = 1;
+	ref.claim.max_config_generation = 1;
+	ref.claim.claim_sha256[0] = 34;
+	ref.timeline = 1;
+	memset(descriptors, 0, sizeof(descriptors));
+	for (int i = 0; i < 3; i++) {
+		descriptors[i].bufferdesc.buf_id = i;
+		InitBufferTag(&descriptors[i].bufferdesc.tag, &identity.key.locator, forknum, 0);
+		pg_atomic_init_u32(&descriptors[i].bufferdesc.state,
+						   BM_VALID | BM_TAG_VALID | BM_PERMANENT);
+	}
+	cluster_page_wal_shmem_init();
 }
 
 UT_TEST(test_copy_main_has_new_identity_edge_and_wal_before_data)
@@ -918,10 +1005,104 @@ UT_TEST(test_copy_refuses_before_any_zero_fill_or_wal_without_reservation)
 	}
 }
 
+static ClusterPageWalFirstResultV1
+resident_first(ClusterPageWalRefV1 *first)
+{
+	ClusterPageWalFirstResultV1 result;
+	BufferDesc *buf = &descriptors[2].bufferdesc;
+	pg_atomic_fetch_or_u32(&buf->state, BM_LOCKED);
+	result = cluster_page_wal_first_observe_locked_v1(buf, first);
+	pg_atomic_fetch_and_u32(&buf->state, ~BM_LOCKED);
+	return result;
+}
+
+/* Real producer + real resident source pool; only WAL insertion and its
+ * last-record metadata are the explicit fixture boundary. */
+UT_TEST(test_resident_init_and_copy_bind_the_first_record)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		ClusterPageWalRefV1 first;
+		ClusterPageWalBindingV1 latest = { 0 };
+		ClusterPageWalDirtyFloorV1 floor;
+		reset(variant == 1 ? VISIBILITYMAP_FORKNUM : MAIN_FORKNUM);
+		buffered = true;
+		data_pins[0] = data_locks[0] = data_pins[1] = data_locks[1] = true;
+		UT_ASSERT(variant == 0	 ? cluster_space_init_heap_buffer_wal(&identity, 3)
+				  : variant == 1 ? cluster_space_init_vm_buffer_wal(&identity, 3)
+								 : cluster_space_copy_buffer_wal(&identity, source_page.data, 3));
+		UT_ASSERT_EQ(resident_first(&first), CLUSTER_PAGE_WAL_FIRST_PRESENT);
+		UT_ASSERT_EQ(first.start, 120);
+		UT_ASSERT_EQ(first.end, 200);
+		UT_ASSERT_EQ(first.crc, 0x1928);
+		UT_ASSERT_EQ(first.rmid, RM_XLOG_ID);
+		UT_ASSERT_EQ(first.info, XLOG_FPI);
+		UT_ASSERT(cluster_page_wal_snapshot_v1(3, &latest));
+		UT_ASSERT_EQ(latest.record_start, 120);
+		UT_ASSERT(cluster_page_wal_dirty_floor_v1(&ref, &floor));
+		UT_ASSERT_EQ(floor.floor, 120);
+		UT_ASSERT_EQ(floor.dirty, 1);
+		UT_ASSERT_EQ(flushes + syncs, 0);
+
+		/* A later mutation cannot replace the still-unwritten init/copy. */
+		((PageHeader)target_page.data)->pd_block_scn = 101;
+		UT_ASSERT_EQ(
+			cluster_page_wal_capture_native_v1(3, &entry, 101, 210, 300, 0x1929, RM_HEAP_ID, 0),
+			CLUSTER_PAGE_WAL_CAPTURED);
+		PageSetLSN(target_page.data, 300);
+		UT_ASSERT_EQ(resident_first(&first), CLUSTER_PAGE_WAL_FIRST_PRESENT);
+		UT_ASSERT_EQ(first.start, 120);
+		UT_ASSERT(cluster_page_wal_snapshot_v1(3, &latest));
+		UT_ASSERT_EQ(latest.record_start, 210);
+	}
+}
+
+UT_TEST(test_resident_capture_loss_keeps_unknown_first)
+{
+	ClusterPageWalRefV1 first;
+	ClusterPageWalBindingV1 latest = { 0 };
+	ClusterPageWalDirtyFloorV1 floor;
+	reset(MAIN_FORKNUM);
+	buffered = true;
+	data_pins[0] = data_locks[0] = data_pins[1] = data_locks[1] = true;
+	lose_source_on_insert = true;
+	UT_ASSERT(cluster_space_init_heap_buffer_wal(&identity, 3));
+	UT_ASSERT_EQ(resident_first(&first), CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED);
+	UT_ASSERT_EQ(first.start, 120);
+	UT_ASSERT(!cluster_page_wal_snapshot_v1(3, &latest));
+	UT_ASSERT(cluster_page_wal_dirty_floor_v1(&ref, &floor));
+	UT_ASSERT_EQ(floor.unattributed, 1);
+	UT_ASSERT_EQ(flushes + syncs, 0);
+}
+
+UT_TEST(test_resident_broken_owner_panics_before_unlock)
+{
+	volatile bool caught = false;
+	reset(MAIN_FORKNUM);
+	buffered = true;
+	data_pins[0] = data_locks[0] = data_pins[1] = data_locks[1] = true;
+	capture_permitted = false;
+	expecting_error = true;
+	if (setjmp(error_jump) == 0)
+		(void)cluster_space_init_heap_buffer_wal(&identity, 3);
+	else
+		caught = true;
+	expecting_error = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(last_error_level, PANIC);
+	UT_ASSERT_EQ(CritSectionCount, 1);
+	UT_ASSERT(data_locks[1]);
+	UT_ASSERT_EQ(new_wal, 1);
+	UT_ASSERT_EQ(flushes + syncs, 0);
+	CritSectionCount = 0;
+}
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(21);
+	UT_RUN(test_resident_init_and_copy_bind_the_first_record);
+	UT_RUN(test_resident_capture_loss_keeps_unknown_first);
+	UT_RUN(test_resident_broken_owner_panics_before_unlock);
 	UT_RUN(test_vm_init_versions_zero_before_without_heap_layout);
 	UT_RUN(test_vm_init_refuses_nonzero_before_and_wrong_fork);
 	UT_RUN(test_minimal_wal_copy_uses_versioned_producers);

@@ -521,6 +521,7 @@ cluster_space_copy_buffer_wal(const ClusterSpaceIdentity *identity, const void *
 	ForkNumber forknum;
 	BlockNumber block;
 	Page target;
+	XLogRecPtr lsn;
 
 	if (identity == NULL || !BufferIsValid(destination) || BufferIsLocal(destination)
 		|| !BufferIsPermanent(destination))
@@ -538,8 +539,20 @@ cluster_space_copy_buffer_wal(const ClusterSpaceIdentity *identity, const void *
 	 * marking it only after WAL insertion could leave a zero DATA page
 	 * behind that checkpoint's redo boundary. */
 	MarkBufferDirty(destination);
-	(void)space_copy_insert(identity, forknum, block, result.data, &batch);
+	lsn = space_copy_insert(identity, forknum, block, result.data, &batch);
 	memcpy(target, result.data, BLCKSZ);
+	if (batch.entries[0].page_class == RF_PAGE_CLASS_ORDINARY) {
+		ClusterPageWalCaptureResultV1 capture;
+
+		/* RegisterBlock described private bytes. This resident destination
+		 * still owes the init/copy record, including when no DML follows. */
+		capture = cluster_page_wal_capture_published_v1(destination, &batch.entries[0],
+														batch.result_token, lsn);
+		if (capture == CLUSTER_PAGE_WAL_INVARIANT_BROKEN
+			|| (capture == CLUSTER_PAGE_WAL_UNATTRIBUTED
+				&& !cluster_page_wal_forget_v1(destination)))
+			elog(PANIC, "new SPACE resident page lost its native WAL owner");
+	}
 	END_CRIT_SECTION();
 	return true;
 }

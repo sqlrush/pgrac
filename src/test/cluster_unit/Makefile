@@ -2316,12 +2316,14 @@ test_cluster_space_copy_buffer.inc: $(top_srcdir)/src/backend/storage/buffer/buf
 
 test_cluster_space_copy_version: test_cluster_space_copy_version.c test_cluster_space_copy_buffer.inc \
 		test_cluster_heap_extend_page.inc unit_test.h \
+		test_cluster_page_wal_product.o test_cluster_page_data_stable.o $(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		test_cluster_space_copy_catalog_product.o test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_copy_catalog_product.o \
+		test_cluster_page_wal_product.o test_cluster_page_data_stable.o $(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
-		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lm -o $@
 
 test_cluster_space_copy_catalog_product.o: $(top_srcdir)/src/backend/catalog/storage.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Dcluster_space_reserve_exact=fixture_copy_reserve \
@@ -6915,12 +6917,16 @@ test_cluster_heap_inplace_version: test_cluster_heap_inplace_version.c unit_test
 		test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		test_cluster_inplace_itemptr_product.o \
+		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		test_cluster_inplace_itemptr_product.o \
+		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \
+		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
-		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lm -o $@
 
 test_cluster_heap_epq_consumer.inc: $(top_srcdir)/src/backend/access/heap/heapam_handler.c Makefile
 	awk '/^heapam_tuple_lock\(/ { print "static TM_Result"; emit=1; found++ } \

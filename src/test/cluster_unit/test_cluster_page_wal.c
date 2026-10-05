@@ -1503,6 +1503,79 @@ UT_TEST(native_last_record_expires_on_construction_reset_and_other_insert)
 	UT_ASSERT(!XLogGetLastInsertRecord(0x200, &start, &value));
 }
 
+UT_TEST(private_record_resident_publication_uses_native_last_insert)
+{
+	for (unsigned unavailable = 0; unavailable < 2; unavailable++) {
+		ClusterPageWalRefV1 first;
+		ClusterPageWalBindingV1 latest = { 0 };
+		reset();
+		memcpy(private_page.data, page.data, BLCKSZ);
+		XLogRegisterBlock(0, &space.key.locator, MAIN_FORKNUM, 7, private_page.data,
+						  REGBUF_STANDARD);
+		UT_ASSERT_EQ(XLogInsert(RM_HEAP_ID, 0), 0x200);
+		UT_ASSERT_EQ(observe_first(&first), CLUSTER_PAGE_WAL_FIRST_ABSENT);
+		memcpy(page.data, private_page.data, BLCKSZ);
+		PageSetLSNPreserveOrigin(page.data, 0x200);
+		selected = !unavailable;
+		UT_ASSERT_EQ(cluster_page_wal_capture_published_v1(1, &edge, 80, 0x200),
+					 unavailable ? CLUSTER_PAGE_WAL_UNATTRIBUTED : CLUSTER_PAGE_WAL_CAPTURED);
+		if (unavailable)
+			UT_ASSERT(cluster_page_wal_forget_v1(1));
+		UT_ASSERT_EQ(observe_first(&first), unavailable ? CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED
+														: CLUSTER_PAGE_WAL_FIRST_PRESENT);
+		UT_ASSERT_EQ(first.start, 0x120);
+		UT_ASSERT_EQ(first.end, 0x200);
+		UT_ASSERT_EQ(first.crc, 0x9192);
+		UT_ASSERT_EQ(cluster_page_wal_snapshot_v1(1, &latest), !unavailable);
+		UT_ASSERT_EQ(allocations, 1); /* no allocation in publication */
+		UT_ASSERT_EQ(flush_calls, 0); /* attribution is not durability */
+	}
+}
+
+UT_TEST(private_record_publication_rejects_expired_record_or_changed_owner)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		ClusterPageWalRefV1 first;
+		reset();
+		memcpy(private_page.data, page.data, BLCKSZ);
+		XLogRegisterBlock(0, &space.key.locator, MAIN_FORKNUM, 7, private_page.data,
+						  REGBUF_STANDARD);
+		UT_ASSERT_EQ(XLogInsert(RM_HEAP_ID, 0), 0x200);
+		PageSetLSNPreserveOrigin(page.data, 0x200);
+		switch (fault) {
+		case 0:
+			begininsert_called = true;
+			break;
+		case 1:
+			XLogResetInsertion();
+			break;
+		case 2:
+			ProcLastRecPtr = XactLastRecEnd = 0x300;
+			break;
+		case 3:
+			PageSetLSNPreserveOrigin(page.data, 0x199);
+			break;
+		case 4:
+			((PageHeader)page.data)->pd_block_scn++;
+			break;
+		case 5:
+			exclusive = false;
+			break;
+		case 6:
+			permitted = false;
+			break;
+		case 7:
+			break; /* caller supplies a different record end */
+		}
+		UT_ASSERT_EQ(
+			cluster_page_wal_capture_published_v1(1, &edge, 80, fault == 7 ? 0x201 : 0x200),
+			CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
+		UT_ASSERT_EQ(observe_first(&first), CLUSTER_PAGE_WAL_FIRST_ABSENT);
+		UT_ASSERT_EQ(allocations, 1);
+		UT_ASSERT_EQ(flush_calls, 0);
+	}
+}
+
 UT_TEST(space_capture_rejects_wrong_record_key_page_and_owner)
 {
 	for (unsigned fault = 0; fault < 10; fault++) {
@@ -1569,7 +1642,9 @@ UT_TEST(space_capture_unavailable_source_is_not_mutation_failure)
 int
 main(void)
 {
-	UT_PLAN(39);
+	UT_PLAN(41);
+	UT_RUN(private_record_resident_publication_uses_native_last_insert);
+	UT_RUN(private_record_publication_rejects_expired_record_or_changed_owner);
 	UT_RUN(space_native_record_and_both_component_sources);
 	UT_RUN(space_advance_is_only_block_one_of_live_identity);
 	UT_RUN(native_last_record_expires_on_construction_reset_and_other_insert);

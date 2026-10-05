@@ -132,6 +132,14 @@ cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1
 								   uint64 result_token, XLogRecPtr start, XLogRecPtr end,
 								   uint32 crc, uint8 rmid, uint8 info);
 
+/* Original private-WAL/resident publisher, immediately after installing its
+ * successful record's bytes, version and LSN under the same content-X.
+ * A private bulk image alone must never call this. No new WAL, allocation,
+ * I/O or lock upgrade; the capture result has the same polarity as above. */
+extern ClusterPageWalCaptureResultV1
+cluster_page_wal_capture_published_v1(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
+									  uint64 result_token, XLogRecPtr end);
+
 /* Original native SPACE publisher only, after stamping both result and LSN.
  * Observes the actual just-inserted record, never a guessed foreign LSN.
  * The caller retains content-X; unavailable attribution requires forget,
