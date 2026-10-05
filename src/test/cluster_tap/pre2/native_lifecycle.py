@@ -70,7 +70,7 @@ def _open(driver, node):
         return pending
     for member in members:
         selected = cuts[member['node_id']]['writer']
-        if (member.get('declared') is not True or member.get('state') != 'MEMBER'
+        if (member.get('declared') is not True or member.get('state') != 'member'
                 or member.get('removed') is not False
                 or member.get('admitted_epoch') != runtime['epoch']
                 or _incarnation(member.get('presented_incarnation')) != selected['incarnation']

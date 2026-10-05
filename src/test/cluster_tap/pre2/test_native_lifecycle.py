@@ -23,7 +23,8 @@ class NativeLifecycleTest(unittest.TestCase):
         self.runtime = dict(epoch=3, resource_x_formation=8, r4_generation=6,
                             writer=dict(self.writers[1], predecessor=dict(self.writers[1],
                                         incarnation=60, boot=f'{60:016x}', wal_generation=2)))
-        self.members = [dict(node_id=n, declared=True, state='MEMBER',
+        # cluster_get_membership() exposes lowercase SQL labels, not C enums.
+        self.members = [dict(node_id=n, declared=True, state='member',
                              presented_incarnation=70+n, last_admitted_incarnation=70+n,
                              admitted_epoch=3, removed=False) for n in range(2)]
         self.calls = []
@@ -71,7 +72,9 @@ class NativeLifecycleTest(unittest.TestCase):
     def test_incomplete_old_or_nonmember_cannot_prove_open(self):
         original = copy.deepcopy(self.members)
         variants = [[original[1]], original + [original[1]]]
-        for key, value in [('state', 'DEAD'), ('removed', True), ('admitted_epoch', 2),
+        for key, value in [('state', 'dead'), ('state', 'joining'),
+                           ('state', 'MEMBER'), ('state', None),
+                           ('removed', True), ('admitted_epoch', 2),
                            ('presented_incarnation', 1), ('last_admitted_incarnation', 1)]:
             rows = copy.deepcopy(original)
             rows[0][key] = value
