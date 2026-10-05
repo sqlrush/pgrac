@@ -1747,7 +1747,32 @@ test_cluster_vm_visible_empty.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 	     emit { print } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_vm_repair_versioned.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_clear_visibility_versioned\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_repair_clear.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	awk '/^visibilitymap_clear(_locked)?\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_repair_missing_heap.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/elog\(WARNING, "page is not marked all-visible/ { emit=1; found++ } \
+	     emit && /^\t\t}/ { emit=0; done++ } emit { print } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_repair_lpdead.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/elog\(WARNING, "page containing LP_DEAD/ { emit=1; found++ } \
+	     emit && /^\t\t}/ { emit=0; done++ } emit { print } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_vm_visible_version: test_cluster_vm_visible_version.c unit_test.h \
+		test_cluster_vm_repair_versioned.inc \
+		test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc \
+		test_cluster_vm_repair_lpdead.inc \
 		test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc \
 		test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc \
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
@@ -4324,6 +4349,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_multi_version.inc test_cluster_heap_multi_capture.inc
 	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc
 	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc
+	rm -f test_cluster_vm_repair_versioned.inc
+	rm -f test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc test_cluster_vm_repair_lpdead.inc
 	rm -f test_cluster_btree_build_writer.inc test_cluster_btree_build_state.inc \
 		test_cluster_btree_build_finish.inc
 	rm -f test_cluster_btree_leaf_meta.inc test_cluster_btree_leaf_vacuum.inc test_cluster_btree_leaf_delete.inc test_cluster_btree_leaf_dedup.inc test_cluster_btree_leaf_cycle.inc
