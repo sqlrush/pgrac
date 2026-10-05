@@ -252,10 +252,12 @@ struct ClusterPiWritebackFactV2;
  * physical owner observation; a SPACE-only result is never sufficient. */
 extern bool cluster_ko_shared_structure_offer_v2(const ClusterKoCompletionV2 *completion,
 	int32 peer, struct ClusterPiWritebackFactV2 *out);
-/* Transfer the actual committed native result into its original reserved KO
- * slot. Success consumes the local opaque handle; transaction/backend exit
- * must then preserve the shared obligation. No caller activates this until
- * the original background consumer can finish every page responsibility. */
+/* Transfer the actual committed native result from its preallocated original
+ * owner into the bounded KO region (or its still-reserved direct-API slot).
+ * Full preserves the handle and every proof for retry; success consumes it.
+ * Transaction/backend exit must then preserve the shared obligation. No caller
+ * activates this until the producer preserves retries and the original
+ * background consumer can finish every page responsibility. */
 extern bool cluster_ko_shared_structure_handoff_v2(ClusterKoCompletionV2 **completion);
 struct ClusterPiWritebackNoticeV1;
 /* Accept only the original authenticated relation-offer notice. A positive

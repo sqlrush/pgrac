@@ -119,8 +119,9 @@ typedef struct ClusterKoSharedContext {
 	uint64 serial;
 	ClusterKoSharedMessageV2 request;
 	uint64 peer_boots[CLUSTER_KO_SHARED_NODE_LIMIT];
-	/* Reserved before the DDL starts; never allocate a second post-commit
-	 * queue slot. The original background owner must clear this obligation. */
+	/* The original background owner must clear an installed obligation.
+	 * Completed native barriers wait in their preallocated transaction owner
+	 * until the structural result can enter this bounded shared region. */
 	ClusterPageWalBindingV1 terminal;
 	uint8 structure[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 } ClusterKoSharedContext;
@@ -169,6 +170,11 @@ struct ClusterKoCompletionV2 {
 	bool truncate_observed;
 	bool drop_observed;
 	bool postcommit;
+	/* Native DDL keeps its verified barrier in the original ResourceOwner,
+	 * releasing the transport slot before the next relation's barrier. */
+	bool barrier_private;
+	ClusterKoSharedMessageV2 barrier_request;
+	uint64 barrier_boots[CLUSTER_KO_SHARED_NODE_LIMIT];
 	ClusterPageWalBindingV1 terminal;
 	uint8 structure[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	struct ClusterKoCompletionV2 *next;
@@ -787,8 +793,21 @@ ko_completion_snapshot(const ClusterKoCompletionV2 *completion, ClusterKoSharedC
 	bool valid;
 	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
 	if (owned == NULL || owned->pid != MyProcPid || !ko_completion_owner_current(owned)
-		|| CurrentResourceOwner == NULL || CritSectionCount != 0 || ko_state == NULL
-		|| owned->slot >= CLUSTER_KO_SHARED_CAPACITY)
+		|| CurrentResourceOwner == NULL || CritSectionCount != 0 || ko_state == NULL)
+		return false;
+	if (owned->barrier_private) {
+		if (!owned->native_transaction || owned->slot != CLUSTER_KO_SHARED_CAPACITY
+			|| owned->serial == 0)
+			return false;
+		memset(out, 0, sizeof(*out));
+		out->used = out->complete = true;
+		out->pid = owned->pid;
+		out->serial = owned->serial;
+		out->request = owned->barrier_request;
+		memcpy(out->peer_boots, owned->barrier_boots, sizeof(out->peer_boots));
+		return ko_shared_origin_current(out);
+	}
+	if (owned->slot >= CLUSTER_KO_SHARED_CAPACITY)
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
 	*out = ko_state->contexts[owned->slot];
@@ -796,6 +815,30 @@ ko_completion_snapshot(const ClusterKoCompletionV2 *completion, ClusterKoSharedC
 		&& out->pid == owned->pid && out->serial == owned->serial;
 	SpinLockRelease(&ko_state->shared_lock);
 	return valid && ko_shared_origin_current(out);
+}
+
+/* No public value can create this proof. Move only this process's exact
+ * completed barrier, with its original full cut, before recycling the slot.
+ * Backend/transaction cleanup still owns the preallocated opaque handle. */
+static bool
+ko_native_barrier_to_owner(ClusterKoCompletionV2 *completion)
+{
+	ClusterKoSharedContext before;
+	bool moved = false;
+	if (completion == NULL || !completion->native_transaction || completion->barrier_private
+		|| !ko_completion_snapshot(completion, &before))
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	if (memcmp(&ko_state->contexts[completion->slot], &before, sizeof(before)) == 0) {
+		completion->barrier_request = before.request;
+		memcpy(completion->barrier_boots, before.peer_boots, sizeof(before.peer_boots));
+		completion->barrier_private = true;
+		memset(&ko_state->contexts[completion->slot], 0, sizeof(before));
+		completion->slot = CLUSTER_KO_SHARED_CAPACITY;
+		moved = true;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return moved;
 }
 
 bool
@@ -967,6 +1010,7 @@ cluster_ko_shared_structure_handoff_v2(ClusterKoCompletionV2 **completion)
 	ClusterPageWalBindingV1 terminal;
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	bool transferred = false;
+	ClusterKoSharedContext *entry = NULL;
 
 	if (completion == NULL || *completion == NULL)
 		return false;
@@ -977,8 +1021,20 @@ cluster_ko_shared_structure_handoff_v2(ClusterKoCompletionV2 **completion)
 		|| !ko_completion_snapshot(owned, &before))
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
-	if (memcmp(&ko_state->contexts[owned->slot], &before, sizeof(before)) == 0) {
-		ClusterKoSharedContext *entry = &ko_state->contexts[owned->slot];
+	if (owned->barrier_private) {
+		/* Full leaves the original proof and handle untouched. The original
+		 * producer must keep servicing this handoff before ending its owner;
+		 * no allocation or remote wait occurs under this lock. */
+		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+			if (!ko_state->contexts[i].used && ko_state->context_serial != UINT64_MAX) {
+				entry = &ko_state->contexts[i];
+				*entry = before;
+				entry->serial = ++ko_state->context_serial;
+				break;
+			}
+	} else if (memcmp(&ko_state->contexts[owned->slot], &before, sizeof(before)) == 0)
+		entry = &ko_state->contexts[owned->slot];
+	if (entry != NULL) {
 		entry->terminal = terminal;
 		memcpy(entry->structure, wal, sizeof(wal));
 		entry->structure_owned = true;
@@ -1806,6 +1862,9 @@ cluster_ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence)
 							errmsg("could not retain the original shared object flush owner")));
 		completion->owner = CurTransactionResourceOwner;
 		completion->native_transaction = true;
+		if (!ko_native_barrier_to_owner(completion))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
+							errmsg("could not preserve the completed shared object flush proof")));
 		completion->native_pending = true;
 		return;
 	}

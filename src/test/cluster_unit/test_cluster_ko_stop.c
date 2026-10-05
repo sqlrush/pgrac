@@ -58,6 +58,9 @@ static uint64 recorded_batch;
 static int record_count;
 static bool barrier_active, barrier_complete, epoch_change_complete;
 static int barrier_requests, barrier_waits, barrier_removes;
+static bool multiple_barriers;
+static uint64 allocated_batch, active_batch;
+static int barrier_record_base;
 static KoFlushHeader last_request;
 static bool gate_admit = true;
 static ClusterFormationSnapshotV1 formation;
@@ -291,19 +294,22 @@ uint32 cluster_sinval_compute_alive_peer_mask(void) { abort(); }
 uint64
 cluster_sinval_ack_wait_alloc_batch_id(void)
 {
-	return 912;
+	return multiple_barriers ? ++allocated_batch : 912;
 }
 bool
 cluster_sinval_ack_wait_begin(uint64 batch, uint32 mask, TimestampTz deadline)
 {
-	Assert(batch == 912 && mask == (1u << 1) && !barrier_active);
+	Assert((multiple_barriers ? batch == allocated_batch : batch == 912) && mask == (1u << 1)
+		   && !barrier_active);
+	active_batch = batch;
+	barrier_record_base = record_count;
 	barrier_active = true;
 	return true;
 }
 bool
 cluster_sinval_ack_wait_is_complete(uint64 batch)
 {
-	Assert(barrier_active && batch == 912);
+	Assert(barrier_active && batch == active_batch);
 	if (drive_shared_ack) {
 		ClusterICEnvelope env = {0};
 		uint8 bytes[CLUSTER_KO_SHARED_V2_BYTES];
@@ -316,7 +322,7 @@ cluster_sinval_ack_wait_is_complete(uint64 batch)
 		env.source_node_id = 1;
 		env.payload_length = sizeof(bytes);
 		cluster_ko_flush_ack_handler(&env, bytes);
-		barrier_complete = record_count == 1;
+		barrier_complete = record_count == barrier_record_base + 1;
 	}
 	if (epoch_change_complete)
 		current_epoch++;
@@ -325,7 +331,7 @@ cluster_sinval_ack_wait_is_complete(uint64 batch)
 void
 cluster_sinval_ack_wait_remove(uint64 batch)
 {
-	Assert(barrier_active && batch == 912);
+	Assert(barrier_active && batch == active_batch);
 	barrier_removes++;
 	barrier_active = false;
 }
@@ -409,13 +415,15 @@ cluster_injection_should_skip(const char *name)
 bool
 cluster_ctrc_relation_removal_ready_shared(uint32 spc, uint32 db, uint32 rel)
 {
-	Assert(spc == 1663 && rel == 99);
+	Assert(spc == 1663 && rel == (multiple_barriers ? space_identity.key.locator.relNumber : 99));
 	return removal_ready;
 }
 SMgrRelation
 smgropen(RelFileLocator locator, BackendId backend)
 {
-	Assert(locator.spcOid == 1663 && locator.relNumber == 99 && backend == InvalidBackendId);
+	Assert(locator.spcOid == 1663
+		   && locator.relNumber == (multiple_barriers ? space_identity.key.locator.relNumber : 99)
+		   && backend == InvalidBackendId);
 	return &relation;
 }
 void
@@ -451,7 +459,9 @@ DropRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 int
 cluster_smgr_which_for(RelFileLocator locator, BackendId backend)
 {
-	Assert(locator.spcOid == 1663 && locator.relNumber == 99 && backend == InvalidBackendId);
+	Assert(locator.spcOid == 1663
+		   && locator.relNumber == (multiple_barriers ? space_identity.key.locator.relNumber : 99)
+		   && backend == InvalidBackendId);
 	return shared_relation ? 1 : 0;
 }
 bool
@@ -566,6 +576,10 @@ reset_test(void)
 	record_count = 0;
 	barrier_active = false;
 	barrier_complete = true;
+	multiple_barriers = false;
+	allocated_batch = 911;
+	active_batch = 0;
+	barrier_record_base = 0;
 	epoch_change_complete = false;
 	barrier_requests = barrier_waits = barrier_removes = 0;
 	memset(&last_ack, 0, sizeof(last_ack));
@@ -1400,6 +1414,57 @@ UT_TEST(test_shared_subabort_cancels_only_the_child_completion)
 	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_READY);
 }
 
+/* A transaction keeps original proof handles, not completed transport slots.
+ * DROP claims them at commit; TRUNCATE takes each immediately. Both use the
+ * actual shared codec and ACK consumer for every distinct batch. */
+UT_TEST(test_native_seventy_two_relations_do_not_hold_completed_transport_slots)
+{
+	for (unsigned truncate = 0; truncate < 2; truncate++) {
+		ClusterKoCompletionV2 *handles[72] = { 0 };
+		ClusterSpaceIdentityKey keys[72];
+		volatile unsigned finished = 0;
+		volatile bool caught = false;
+		reset_test();
+		cluster_shared_config = drive_shared_ack = multiple_barriers = true;
+		expecting_error = true;
+		PG_TRY();
+		{
+			for (unsigned i = 0; i < lengthof(handles); i++) {
+				space_identity.key.locator.relNumber = 1000 + i;
+				keys[i] = space_identity.key;
+				cluster_ko_flush_and_wait_ack(keys[i].locator, RELPERSISTENCE_PERMANENT);
+				if (truncate)
+					UT_ASSERT(cluster_ko_shared_claim_v2(&keys[i], space_identity.incarnation,
+														 &handles[i]));
+				finished++;
+			}
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(!caught);
+		UT_ASSERT_EQ(finished, lengthof(handles));
+		UT_ASSERT_EQ(record_count, finished);
+		UT_ASSERT_EQ(barrier_removes, finished);
+		for (unsigned i = 0; !caught && i < finished; i++) {
+			ClusterKoSharedMessageV2 request;
+			if (!truncate)
+				UT_ASSERT(
+					cluster_ko_shared_claim_v2(&keys[i], space_identity.incarnation, &handles[i]));
+			UT_ASSERT(
+				cluster_ko_shared_covers_v2(handles[i], &keys[i], space_identity.incarnation));
+			UT_ASSERT(cluster_ko_shared_read_v2(handles[i], 1, &request));
+			UT_ASSERT_EQ(request.batch_id, 912 + i);
+		}
+		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+			UT_ASSERT(!storage.contexts[i].used);
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+		UT_ASSERT_EQ(completion_allocations, 0);
+	}
+}
+
 UT_TEST(test_native_shared_barrier_is_claimed_once_by_original_space_owner)
 {
 	ClusterKoCompletionV2 *completion = NULL, *second = NULL;
@@ -1427,7 +1492,9 @@ UT_TEST(test_native_shared_barrier_is_claimed_once_by_original_space_owner)
 	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true, false, NULL);
 	CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)1;
 	UT_ASSERT(cluster_ko_shared_covers_v2(completion, &space_identity.key, space_identity.incarnation));
-	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	/* Backend drain, not the shared transport poll, owns this live transaction. */
+	UT_ASSERT_EQ(completion_allocations, 1);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_READY);
 	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
 	UT_ASSERT(!cluster_ko_shared_read_v2(completion, 1, &observed));
 	cluster_ko_shared_release_v2(&completion);
@@ -1694,6 +1761,20 @@ prepare_native_structure_owner(bool drop, ClusterPageWalBindingV1 *binding, uint
 	return completion;
 }
 
+/* Observe the one actual shared structural owner created by these cases. */
+static unsigned
+structure_owned_slot(void)
+{
+	unsigned slot = CLUSTER_KO_SHARED_CAPACITY;
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+		if (storage.contexts[i].used && storage.contexts[i].structure_owned) {
+			UT_ASSERT_EQ(slot, CLUSTER_KO_SHARED_CAPACITY);
+			slot = i;
+		}
+	Assert(slot < CLUSTER_KO_SHARED_CAPACITY);
+	return slot;
+}
+
 static ClusterKoCompletionV2 *
 prepare_native_structure(bool drop, ClusterPageWalBindingV1 *binding, uint8 *wal)
 {
@@ -1958,7 +2039,7 @@ UT_TEST(test_structure_handoff_consumes_original_handle_without_new_work)
 	const char *reason;
 	uint32 cursor = 0;
 	uint64 serial = 0, original_serial = completion->serial;
-	unsigned slot = completion->slot;
+	unsigned slot;
 	int sends = send_calls, syncs = sync_count, reads = space_reads, pid = MyProcPid;
 
 	UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
@@ -1967,6 +2048,9 @@ UT_TEST(test_structure_handoff_consumes_original_handle_without_new_work)
 	UT_ASSERT(cluster_ko_shared_structure_offer_v2(completion, 1, &expected));
 	old = completion;
 	UT_ASSERT(cluster_ko_shared_structure_handoff_v2(&completion));
+	slot = structure_owned_slot();
+	UT_ASSERT(storage.contexts[slot].serial > original_serial);
+	original_serial = storage.contexts[slot].serial;
 	UT_ASSERT(completion == NULL);
 	UT_ASSERT_EQ(completion_allocations, 0);
 	UT_ASSERT(!cluster_ko_shared_structure_handoff_v2(&old));
@@ -2016,8 +2100,7 @@ UT_TEST(test_structure_handoff_refuses_uncommitted_incomplete_and_wrong_owner)
 		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 		ClusterKoCompletionV2 *completion = prepare_native_structure(fault == 1, &binding, wal);
 		ClusterKoCompletionV2 copy, *argument;
-		ClusterKoSharedContext before;
-		unsigned slot = completion->slot;
+		ClusterKoSharedContext before[CLUSTER_KO_SHARED_CAPACITY];
 		UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
 		if (fault != 1 && fault != 2)
 			UT_ASSERT(cluster_ko_shared_observe_truncate_v2(completion));
@@ -2029,10 +2112,10 @@ UT_TEST(test_structure_handoff_refuses_uncommitted_incomplete_and_wrong_owner)
 		if (fault == 6) formation.membership.last_admitted_incarnation[1]++;
 		if (fault == 7) writer.claim.claim_sha256[0]++;
 		if (fault == 8) CritSectionCount = 1;
-		before = storage.contexts[slot];
+		memcpy(before, storage.contexts, sizeof(before));
 		UT_ASSERT(!cluster_ko_shared_structure_handoff_v2(&argument));
 		UT_ASSERT(argument == (fault == 4 ? &copy : completion));
-		UT_ASSERT(memcmp(&before, &storage.contexts[slot], sizeof(before)) == 0);
+		UT_ASSERT(memcmp(before, storage.contexts, sizeof(before)) == 0);
 		CritSectionCount = 0;
 		CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)1;
 		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
@@ -2052,12 +2135,12 @@ UT_TEST(test_structure_offer_ack_only_advances_original_peer_progress)
 	uint32 cursor = 0;
 	uint64 serial;
 
-	offer_ack_slot = completion->slot;
-	offer_ack_serial = completion->serial;
 	UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
 	UT_ASSERT(cluster_ko_shared_observe_truncate_v2(completion));
 	xact_callback(XACT_EVENT_COMMIT, NULL);
 	UT_ASSERT(cluster_ko_shared_structure_handoff_v2(&completion));
+	offer_ack_slot = structure_owned_slot();
+	offer_ack_serial = storage.contexts[offer_ack_slot].serial;
 	MyBackendType = B_CHECKPOINTER;
 	UT_ASSERT(cluster_ko_shared_structure_offer_next_v2(&cursor, 1, &serial, &fact));
 	memset(&offered_peer, 0, sizeof(offered_peer));
@@ -2086,12 +2169,12 @@ UT_TEST(test_structure_offer_ack_refuses_wrong_scope_and_concurrent_slot_reuse)
 		ClusterKoCompletionV2 *completion = prepare_native_structure(false, &binding, wal);
 		ClusterKoSharedContext before;
 
-		offer_ack_slot = completion->slot;
-		offer_ack_serial = completion->serial;
 		UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
 		UT_ASSERT(cluster_ko_shared_observe_truncate_v2(completion));
 		xact_callback(XACT_EVENT_COMMIT, NULL);
 		UT_ASSERT(cluster_ko_shared_structure_handoff_v2(&completion));
+		offer_ack_slot = structure_owned_slot();
+		offer_ack_serial = storage.contexts[offer_ack_slot].serial;
 		MyBackendType = B_CHECKPOINTER;
 		memset(&offered_peer, 0, sizeof(offered_peer));
 		offered_peer.ref = writer;
@@ -2173,7 +2256,7 @@ UT_TEST(test_structure_background_scan_preserves_stale_responsibility)
 	}
 }
 
-UT_TEST(test_structure_handoff_uses_reserved_slot_even_at_capacity)
+UT_TEST(test_structure_handoff_uses_last_free_background_slot)
 {
 	ClusterPageWalBindingV1 binding;
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
@@ -2198,6 +2281,92 @@ UT_TEST(test_structure_handoff_uses_reserved_slot_even_at_capacity)
 	exit_callback(0, (Datum)0);
 	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
 		UT_ASSERT(storage.contexts[i].used);
+}
+
+UT_TEST(test_native_full_background_region_preserves_proof_until_retry)
+{
+	for (unsigned drop = 0; drop < 2; drop++) {
+		ClusterPageWalBindingV1 binding;
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		ClusterKoCompletionV2 *completion = prepare_native_structure(drop, &binding, wal), *old;
+		ClusterKoSharedContext before[CLUSTER_KO_SHARED_CAPACITY];
+		ClusterPiWritebackFactV2 offered, retried;
+		uint64 barrier_serial = completion->serial;
+		int sends = send_calls, reads = space_reads, syncs = sync_count;
+		UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
+		if (!drop)
+			UT_ASSERT(cluster_ko_shared_observe_truncate_v2(completion));
+		xact_callback(XACT_EVENT_COMMIT, NULL);
+		if (drop)
+			UT_ASSERT(cluster_ko_shared_observe_drop_v2(completion));
+		UT_ASSERT(cluster_ko_shared_structure_offer_v2(completion, 1, &offered));
+		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+			storage.contexts[i].used = storage.contexts[i].structure_owned = true;
+			storage.contexts[i].pid = MyProcPid + 1;
+			storage.contexts[i].serial = ++storage.context_serial;
+		}
+		memcpy(before, storage.contexts, sizeof(before));
+		old = completion;
+		UT_ASSERT(!cluster_ko_shared_structure_handoff_v2(&completion));
+		UT_ASSERT(completion == old);
+		UT_ASSERT_EQ(completion_allocations, 1);
+		UT_ASSERT_EQ(memcmp(before, storage.contexts, sizeof(before)), 0);
+		/* The original transaction owner still holds exactly the same proof. */
+		resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true, true, NULL);
+		UT_ASSERT(cluster_ko_shared_structure_offer_v2(completion, 1, &retried));
+		UT_ASSERT_EQ(memcmp(&offered, &retried, sizeof(offered)), 0);
+		memset(&storage.contexts[7], 0, sizeof(storage.contexts[7]));
+		UT_ASSERT(cluster_ko_shared_structure_handoff_v2(&completion));
+		UT_ASSERT(completion == NULL);
+		UT_ASSERT_EQ(completion_allocations, 0);
+		UT_ASSERT(!cluster_ko_shared_structure_handoff_v2(&old));
+		UT_ASSERT(storage.contexts[7].serial > barrier_serial);
+		UT_ASSERT(storage.contexts[7].structure_owned);
+		UT_ASSERT_EQ(memcmp(&storage.contexts[7].terminal, &binding, sizeof(binding)), 0);
+		for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+			if (i != 7)
+				UT_ASSERT_EQ(memcmp(&before[i], &storage.contexts[i], sizeof(before[i])), 0);
+		UT_ASSERT_EQ(send_calls, sends);
+		UT_ASSERT_EQ(space_reads, reads);
+		UT_ASSERT_EQ(sync_count, syncs);
+	}
+}
+
+UT_TEST(test_native_private_proof_survives_slot_reuse_but_not_cut_or_owner_change)
+{
+	ClusterKoCompletionV2 *native = NULL, *direct = NULL;
+	ClusterKoCompletionV2 copy;
+	ClusterKoSharedMessageV2 before, after;
+	ClusterSpaceIdentityKey first;
+	reset_test();
+	cluster_shared_config = drive_shared_ack = multiple_barriers = true;
+	first = space_identity.key;
+	cluster_ko_flush_and_wait_ack(first.locator, RELPERSISTENCE_PERMANENT);
+	UT_ASSERT(cluster_ko_shared_claim_v2(&first, space_identity.incarnation, &native));
+	UT_ASSERT(cluster_ko_shared_read_v2(native, 1, &before));
+	copy = *native;
+	space_identity.key.locator.relNumber++;
+	UT_ASSERT(
+		cluster_ko_shared_begin_v2(space_identity.key.locator, RELPERSISTENCE_PERMANENT, &direct));
+	UT_ASSERT(storage.contexts[0].used);
+	UT_ASSERT(storage.contexts[0].serial > native->serial);
+	UT_ASSERT(cluster_ko_shared_read_v2(native, 1, &after));
+	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	UT_ASSERT(!cluster_ko_shared_read_v2(&copy, 1, &after));
+	CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)2;
+	UT_ASSERT(!cluster_ko_shared_read_v2(native, 1, &after));
+	CurrentResourceOwner = CurTransactionResourceOwner = (ResourceOwner)1;
+	current_epoch++;
+	UT_ASSERT(!cluster_ko_shared_read_v2(native, 1, &after));
+	current_epoch--;
+	formation.membership.last_admitted_incarnation[1]++;
+	UT_ASSERT(!cluster_ko_shared_read_v2(native, 1, &after));
+	formation.membership.last_admitted_incarnation[1]--;
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT(!cluster_ko_shared_read_v2(native, 1, &after));
+	cluster_ko_shared_release_v2(&native);
+	cluster_ko_shared_release_v2(&direct);
+	UT_ASSERT_EQ(completion_allocations, 0);
 }
 
 UT_TEST(test_structure_one_member_keeps_local_owner_without_fake_peer)
@@ -2523,8 +2692,7 @@ UT_TEST(test_native_drop_effect_refuses_wrong_lifetime_scope_or_handle)
 		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 		ClusterKoCompletionV2 *completion = prepare_native_structure(fault != 3, &binding, wal);
 		ClusterKoCompletionV2 copy = *completion, *candidate = completion;
-		ClusterKoSharedContext before;
-		unsigned slot = completion->slot;
+		ClusterKoSharedContext before[CLUSTER_KO_SHARED_CAPACITY];
 		int pid = MyProcPid;
 
 		if (fault != 4)
@@ -2547,9 +2715,9 @@ UT_TEST(test_native_drop_effect_refuses_wrong_lifetime_scope_or_handle)
 		case 16: candidate = &copy; break;
 		case 17: candidate = NULL; break;
 		}
-		before = storage.contexts[slot];
+		memcpy(before, storage.contexts, sizeof(before));
 		UT_ASSERT(!cluster_ko_shared_observe_drop_v2(candidate));
-		UT_ASSERT(memcmp(&storage.contexts[slot], &before, sizeof(before)) == 0);
+		UT_ASSERT(memcmp(storage.contexts, before, sizeof(before)) == 0);
 		MyProcPid = pid;
 		CurrentResourceOwner = CurTransactionResourceOwner = TopTransactionResourceOwner = (ResourceOwner)1;
 		CritSectionCount = 0;
@@ -2565,7 +2733,7 @@ UT_TEST(test_native_drop_result_handoff_preserves_original_shared_obligation)
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	ClusterKoCompletionV2 *completion = prepare_native_structure(true, &binding, wal), *old;
 	ClusterPiWritebackFactV2 expected, actual;
-	unsigned slot = completion->slot;
+	unsigned slot;
 	uint64 original_serial = completion->serial, serial = 0;
 	uint32 cursor = 0;
 	const char *reason;
@@ -2578,6 +2746,9 @@ UT_TEST(test_native_drop_result_handoff_preserves_original_shared_obligation)
 	UT_ASSERT(cluster_ko_shared_structure_offer_v2(completion, 1, &expected));
 	old = completion;
 	UT_ASSERT(cluster_ko_shared_structure_handoff_v2(&completion));
+	slot = structure_owned_slot();
+	UT_ASSERT(storage.contexts[slot].serial > original_serial);
+	original_serial = storage.contexts[slot].serial;
 	UT_ASSERT(completion == NULL);
 	UT_ASSERT(!cluster_ko_shared_observe_drop_v2(old));
 	UT_ASSERT_EQ(completion_allocations, 0);
@@ -3119,7 +3290,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(76);
+	UT_PLAN(79);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
@@ -3153,6 +3324,7 @@ main(void)
 	UT_RUN(test_shared_subcommit_transfers_original_completion_to_parent);
 	UT_RUN(test_shared_subabort_cancels_only_the_child_completion);
 	UT_RUN(test_native_shared_barrier_is_claimed_once_by_original_space_owner);
+	UT_RUN(test_native_seventy_two_relations_do_not_hold_completed_transport_slots);
 	UT_RUN(test_native_completion_claim_refuses_changed_identity_and_owner);
 	UT_RUN(test_native_claim_cannot_borrow_direct_handle_and_full_capacity_refuses_before_send);
 	UT_RUN(test_native_claim_rejects_ambiguous_repeated_barriers);
@@ -3174,7 +3346,9 @@ main(void)
 	UT_RUN(test_structure_offer_ack_refuses_wrong_scope_and_concurrent_slot_reuse);
 	UT_RUN(test_structure_handoff_refuses_uncommitted_incomplete_and_wrong_owner);
 	UT_RUN(test_structure_background_scan_preserves_stale_responsibility);
-	UT_RUN(test_structure_handoff_uses_reserved_slot_even_at_capacity);
+	UT_RUN(test_structure_handoff_uses_last_free_background_slot);
+	UT_RUN(test_native_full_background_region_preserves_proof_until_retry);
+	UT_RUN(test_native_private_proof_survives_slot_reuse_but_not_cut_or_owner_change);
 	UT_RUN(test_structure_one_member_keeps_local_owner_without_fake_peer);
 	UT_RUN(test_native_postcommit_retains_exact_observation_until_pending_deletes_return);
 	UT_RUN(test_native_postcommit_refuses_drift_but_always_cleans_original_local_owner);
