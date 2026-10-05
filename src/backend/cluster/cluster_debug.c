@@ -1450,11 +1450,18 @@ dump_grd_recovery(ReturnSetInfo *rsinfo)
 		static const char *const keys[]
 			= { "pi_writeback_data_proof_rejected", "pi_writeback_local_ack_rejected",
 				"pi_writeback_remote_ack_rejected", "pi_writeback_master_cut_rejected",
-				"pi_writeback_peer_physical_rejected", "pi_writeback_recovery_proof_rejected" };
+				"pi_writeback_peer_physical_rejected", "pi_writeback_recovery_proof_rejected",
+				"pi_writeback_structure_owner_rejected", "pi_writeback_contribution_plan_rejected" };
+		StaticAssertDecl(lengthof(keys) == CLUSTER_PI_WRITEBACK_REJECTION_COUNT,
+						"every PI rejection requires a dump key");
 		for (unsigned i = 0; i < lengthof(keys); i++)
 			emit_row(rsinfo, "grd_recovery", keys[i], psprintf(UINT64_FORMAT, wb.attempts[i]));
 		emit_row(rsinfo, "grd_recovery", "pi_writeback_rejection_logs",
 				 psprintf(UINT64_FORMAT, wb.log_events));
+		emit_row(rsinfo, "grd_recovery", "pi_writeback_last_plan_result",
+				 psprintf("%u", wb.last_plan_result));
+		emit_row(rsinfo, "grd_recovery", "pi_writeback_last_plan_detail",
+				 psprintf("%u", wb.last_plan_detail));
 	}
 	/* Shape A (crash-rejoin re-declare barrier): off-path crash-rejoin fence-arm
 	 * events (standalone counter, not part of the snapshot struct). */

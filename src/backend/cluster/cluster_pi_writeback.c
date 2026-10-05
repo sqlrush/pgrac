@@ -171,13 +171,15 @@ cluster_pi_writeback_rejections_v1(ClusterPiWritebackRejectionsV1 *out)
  * boot/membership cut, not a batch nonce or a checkpoint. No diagnostic
  * observation authorizes retirement or removes the page from later scans. */
 static void
-wb_rejected(ClusterPiWritebackRejectionV1 reason, const BufferTag *tag, int32 peer, uint64 epoch,
-			uint64 boot)
+wb_rejected_detail(ClusterPiWritebackRejectionV1 reason, const BufferTag *tag, int32 peer,
+	uint64 epoch, uint64 boot, uint32 result, uint32 detail)
 {
 	static const char *const names[]
 		= { "DATA_PROOF",	 "LOCAL_ACK",	   "REMOTE_ACK",	 "MASTER_CUT",
-			"PEER_PHYSICAL", "RECOVERY_PROOF", "STRUCTURE_OWNER" };
+			"PEER_PHYSICAL", "RECOVERY_PROOF", "STRUCTURE_OWNER", "CONTRIBUTION_PLAN" };
 	bool log;
+	StaticAssertDecl(lengthof(names) == CLUSTER_PI_WRITEBACK_REJECTION_COUNT,
+					"every PI rejection requires a diagnostic name");
 	if (wb_shared == NULL || tag == NULL || (uint32)reason >= CLUSTER_PI_WRITEBACK_REJECTION_COUNT)
 		return;
 	SpinLockAcquire(&wb_shared->lock);
@@ -186,6 +188,10 @@ wb_rejected(ClusterPiWritebackRejectionV1 reason, const BufferTag *tag, int32 pe
 	wb_shared->rejections.last_resource = *tag;
 	wb_shared->rejections.last_reason = reason;
 	wb_shared->rejections.last_peer = peer;
+	if (reason == CLUSTER_PI_WRITEBACK_CONTRIBUTION_PLAN) {
+		wb_shared->rejections.last_plan_result = result;
+		wb_shared->rejections.last_plan_detail = detail;
+	}
 	log = wb_shared->logged_epoch[reason] != epoch || wb_shared->logged_boot[reason] != boot;
 	if (log) {
 		wb_shared->logged_epoch[reason] = epoch;
@@ -197,9 +203,29 @@ wb_rejected(ClusterPiWritebackRejectionV1 reason, const BufferTag *tag, int32 pe
 	if (log)
 		elog(LOG,
 			 "PGRAC_FAMILY=PI_WRITEBACK action=PAGE_DEFERRED stage=%s "
-			 "resource=%u/%u/%u/%u/%u peer=%d epoch=" UINT64_FORMAT " boot=" UINT64_FORMAT,
+			 "resource=%u/%u/%u/%u/%u peer=%d epoch=" UINT64_FORMAT " boot=" UINT64_FORMAT
+			 " result=%u detail=%u",
 			 names[reason], tag->spcOid, tag->dbOid, tag->relNumber, tag->forkNum, tag->blockNum,
-			 peer, epoch, boot);
+			 peer, epoch, boot, result, detail);
+}
+
+static void
+wb_rejected(ClusterPiWritebackRejectionV1 reason, const BufferTag *tag, int32 peer, uint64 epoch,
+			uint64 boot)
+{
+	wb_rejected_detail(reason, tag, peer, epoch, boot, 0, 0);
+}
+
+/* The live WAL visitor wraps a rejected record as RECONFIG_WAIT. Preserve
+ * its typed detail rather than confusing it with an unready flush cut.
+ * This observation neither retries nor retires any responsibility. */
+static void
+wb_plan_rejected(ClusterControlRootResult result, RfPageProofDetailV1 detail,
+	const BufferTag *tag, int32 peer, uint64 epoch, uint64 boot)
+{
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY && detail != RF_PAGE_PROOF_DETAIL_OK)
+		wb_rejected_detail(CLUSTER_PI_WRITEBACK_CONTRIBUTION_PLAN, tag, peer, epoch, boot,
+						   result, detail);
 }
 
 static void
@@ -1718,6 +1744,10 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 	if (wb_notice->plan == NULL) {
 		result = cluster_wal_inputs_contributions_v1(wb_notice->inputs, true, &wb_notice->plan,
 													 &records, &detail);
+		wb_plan_rejected(result, detail,
+			wb_tag(v2 ? wb_v2_page(&request_v2.facts[0]) : &request.facts[0]),
+			peer->claim.identity.origin_node_id, epoch,
+			peer->claim.identity.origin_owner_incarnation);
 		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
 			goto wait;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -2082,6 +2112,8 @@ wb_batch_structure_pages(void)
 		RfPageProofDetailV1 detail;
 		result = cluster_wal_inputs_contributions_v1(wb_batch->inputs, true, &wb_batch->plan,
 													 &records, &detail);
+		wb_plan_rejected(result, detail, &wb_batch->tags[0], cluster_node_id, wb_batch->epoch,
+			wb_batch->local.claim.identity.origin_owner_incarnation);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 		for (uint32 i = 0; i < wb_batch->count; i++) {
@@ -2263,6 +2295,8 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 		RfPageProofDetailV1 detail;
 		result = cluster_wal_inputs_contributions_v1(wb_batch->inputs, true, &wb_batch->plan,
 													 &records, &detail);
+		wb_plan_rejected(result, detail, &wb_batch->tags[0], cluster_node_id, wb_batch->epoch,
+			wb_batch->local.claim.identity.origin_owner_incarnation);
 		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
 			goto wait;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY

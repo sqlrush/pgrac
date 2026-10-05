@@ -49,6 +49,7 @@ static RfPageOnlinePlanV1 *wb_page_plan;
 static unsigned wb_plan_builds, wb_input_releases, wb_sends;
 static unsigned wb_census_builds;
 static bool wb_census_tail_bad;
+static bool wb_plan_failure_wait;
 static uint32 wb_recovered_sources;
 static uint64 wb_recovered_boot;
 static unsigned wb_census_decodes;
@@ -570,7 +571,8 @@ cluster_wal_inputs_contributions_v1(ClusterWalInputsV1 *inputs, bool space_activ
 	wb_plan_builds++;
 	if (rebuild_plan_failure != RF_PAGE_PROOF_DETAIL_OK) {
 		*detail = rebuild_plan_failure;
-		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		return wb_plan_failure_wait ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+									: CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	}
 	*out = (void *)wb_page_plan;
 	*records = 3;
@@ -987,6 +989,8 @@ wb_setup(void)
 	wb_recovered_boot = 9;
 	wb_quorum = wb_input_current = true;
 	wb_stop = wb_input_wait = false;
+	wb_plan_failure_wait = false;
+	rebuild_plan_failure = RF_PAGE_PROOF_DETAIL_OK;
 	wb_send_result = CLUSTER_IC_SEND_DONE;
 	wb_plan_builds = wb_input_releases = wb_sends = 0;
 	memset(wb_log_calls, 0, sizeof(wb_log_calls));
@@ -1623,6 +1627,69 @@ UT_TEST(writeback_rejections_survive_batches_and_throttle_per_boot_epoch)
 	clean();
 }
 
+UT_TEST(writeback_plan_rejection_is_visible_without_discharging_pi)
+{
+	for (unsigned waiting = 0; waiting < 2; waiting++) {
+		ClusterPageDataReceiptV1 *data = wb_setup();
+		ClusterPiWritebackRejectionsV1 observed;
+		uint32 holders = wb_storage_cut.pi_holders_bitmap;
+		wb_plan_failure_wait = waiting != 0;
+		rebuild_plan_failure = RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		for (unsigned attempt = 0; attempt < 2; attempt++) {
+			wb_candidates = true;
+			UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+			UT_ASSERT_EQ(wb_master_completions, 0);
+			UT_ASSERT_EQ(wb_storage_cut.pi_holders_bitmap, holders);
+			UT_ASSERT_EQ(pi_discards, 0);
+			UT_ASSERT_EQ(wb_sends, 0);
+			UT_ASSERT(!wb_inputs_pinned[0]);
+		}
+		UT_ASSERT_EQ(wb_log_calls[0], 1);
+		UT_ASSERT(cluster_pi_writeback_rejections_v1(&observed));
+		UT_ASSERT_EQ(observed.attempts[CLUSTER_PI_WRITEBACK_CONTRIBUTION_PLAN], 2);
+		UT_ASSERT_EQ(observed.last_plan_result, waiting ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+			: CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+		UT_ASSERT_EQ(observed.last_plan_detail, RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		cluster_pi_writeback_checkpointer_release_v1();
+		cluster_page_data_receipt_free_v1(&data);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
+UT_TEST(remote_plan_rejection_is_visible_but_ordinary_cut_wait_is_silent)
+{
+	ClusterPageDataReceiptV1 *data = wb_setup();
+	ClusterPiWritebackJobV1 *job = wb_start(data);
+	ClusterPiWritebackRejectionsV1 observed;
+	physical_pi_from_source(&wb_sources[1], 19);
+	wb_deliver(0, 1, wb_wire, wb_length);
+	wb_select(1, B_BG_WRITER);
+	wb_input_wait = true;
+	UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+	UT_ASSERT_EQ(wb_log_calls[1], 0);
+	wb_input_wait = false;
+	wb_plan_failure_wait = true;
+	rebuild_plan_failure = RF_PAGE_PROOF_DETAIL_CAPACITY;
+	for (unsigned attempt = 0; attempt < 2; attempt++) {
+		UT_ASSERT(cluster_pi_writeback_bgwriter_tick_v1());
+		UT_ASSERT_EQ(pi_discards, 0);
+		UT_ASSERT_EQ(wb_shared->inbound_state, WB_RUNNING);
+		UT_ASSERT(!wb_inputs_pinned[1]);
+	}
+	UT_ASSERT_EQ(wb_log_calls[1], 1);
+	UT_ASSERT(cluster_pi_writeback_rejections_v1(&observed));
+	UT_ASSERT_EQ(observed.attempts[CLUSTER_PI_WRITEBACK_CONTRIBUTION_PLAN], 2);
+	UT_ASSERT_EQ(observed.last_plan_result, CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT_EQ(observed.last_plan_detail, RF_PAGE_PROOF_DETAIL_CAPACITY);
+	wb_server_finish(NULL);
+	wb_select(0, B_CHECKPOINTER);
+	cluster_pi_writeback_release_v1(&job);
+	cluster_page_data_receipt_free_v1(&data);
+	rf_page_online_plan_destroy_v1(&wb_page_plan);
+	clean();
+}
+
 UT_TEST(writeback_initial_allocation_error_cannot_orphan_running_owner)
 {
 	ClusterPageDataReceiptV1 *data = wb_setup();
@@ -2045,7 +2112,7 @@ int
 main(void)
 {
 	printf("# sizeof_WritebackShared=%zu\n", sizeof(WritebackShared));
-	UT_PLAN(73);
+	UT_PLAN(75);
 	UT_RUN(writeback_v2_structure_scheduler_checks_local_work_without_wal_pins);
 	UT_RUN(writeback_v2_structure_scheduler_counts_invalid_completion_and_continues);
 	UT_RUN(writeback_v2_structure_scheduler_collects_all_original_page_acks);
@@ -2105,6 +2172,8 @@ main(void)
 	UT_RUN(remote_batch_preserves_other_page_when_one_pi_retries);
 	UT_RUN(checkpointer_batch_skips_local_retry_and_retires_other_page);
 	UT_RUN(writeback_rejections_survive_batches_and_throttle_per_boot_epoch);
+	UT_RUN(writeback_plan_rejection_is_visible_without_discharging_pi);
+	UT_RUN(remote_plan_rejection_is_visible_but_ordinary_cut_wait_is_silent);
 	UT_RUN(writeback_initial_allocation_error_cannot_orphan_running_owner);
 	UT_RUN(retained_rebuild_never_completes_with_unmapped_side_contributions);
 	UT_RUN(retained_census_does_not_materialize_history_and_checks_tail_first);

@@ -129,6 +129,7 @@ typedef enum ClusterPiWritebackRejectionV1 {
 	CLUSTER_PI_WRITEBACK_PEER_PHYSICAL,
 	CLUSTER_PI_WRITEBACK_RECOVERY_PROOF,
 	CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER,
+	CLUSTER_PI_WRITEBACK_CONTRIBUTION_PLAN,
 	CLUSTER_PI_WRITEBACK_REJECTION_COUNT
 } ClusterPiWritebackRejectionV1;
 
@@ -140,6 +141,8 @@ typedef struct ClusterPiWritebackRejectionsV1 {
 	BufferTag last_resource;
 	uint32 last_reason;
 	int32 last_peer;
+	uint32 last_plan_result;
+	uint32 last_plan_detail;
 } ClusterPiWritebackRejectionsV1;
 /* A live original kind3 notice is a responsibility handoff, never a page
  * receipt. Refusal preserves both outputs; no copied/unregistered notice is
