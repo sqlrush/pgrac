@@ -49,6 +49,12 @@ class CohortEntry(BlackBox):
     def command_node(self, tool, argv):
         if tool == 'initdb':
             return 0
+        if tool == 'postgres' and len(argv) == 5 and argv[0] == '--pgrac-observe-writer':
+            for node in self.layout.get('nodes', []):
+                if argv[1:] == [node['data_dir'], self.layout['shared_data_dir'],
+                               self.layout['wal_root'], str(node['id'])]:
+                    return node['id']
+            raise ValueError('native writer observation does not belong to this cohort')
         if tool != 'pg_ctl':
             return None
         if '-D' in argv and argv.index('-D') + 1 < len(argv):

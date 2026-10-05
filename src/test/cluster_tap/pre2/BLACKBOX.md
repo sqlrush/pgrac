@@ -106,6 +106,16 @@ Their raw TAP status remains FAIL, with the exact absent dependency recorded
 as BLOCKED. The independent startup probe still attempts native creation and
 startup, keeping product failures distinct from absent acceptance observations.
 
+For a candidate that provides `postgres --pgrac-observe-writer` and the
+`cluster_dump_state()` lifecycle/native_writer row, each of the three
+lifecycle operations can opt into `{"native":"writer-lifecycle-v1"}`.
+This mapping reads the installed CLI, joins OPEN with the same node's runtime
+writer and every member's admitted epoch/incarnation, and rechecks the ROOT
+cut. A changed cut or unavailable runtime proof never reports OPEN. Shutdown
+uses the actual CLOSED writers and final checkpoints; the original stop
+judge still checks process exit. The mapping neither changes database bytes
+nor supplies expected writer identities as evidence.
+
 `operations` maps each name below to either:
 
 - `{"node": "argument", "sql": "..."}` (or a fixed numeric node). The SQL
