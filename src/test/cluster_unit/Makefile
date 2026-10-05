@@ -4474,7 +4474,7 @@ cluster_qvotec_poll_test.o: cluster_qvotec_poll_test.c $(top_srcdir)/src/backend
 
 cluster_qvotec_io_test.o: $(top_srcdir)/src/backend/cluster/cluster_voting_disk_io.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Dfdatasync=cluster_qvotec_test_fdatasync \
-		-Dpwrite=cluster_qvotec_test_pwrite -c $< -o $@
+		-Dpwrite=cluster_qvotec_test_pwrite -Dpread=cluster_qvotec_test_pread -c $< -o $@
 
 # Retain the actual functions reached by the voting fixture, not unrelated
 # startup-directory and postmaster entry points from the same source file.
