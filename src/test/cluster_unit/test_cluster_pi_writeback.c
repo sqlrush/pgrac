@@ -2045,8 +2045,9 @@ int
 main(void)
 {
 	printf("# sizeof_WritebackShared=%zu\n", sizeof(WritebackShared));
-	UT_PLAN(72);
+	UT_PLAN(73);
 	UT_RUN(writeback_v2_structure_scheduler_checks_local_work_without_wal_pins);
+	UT_RUN(writeback_v2_structure_scheduler_counts_invalid_completion_and_continues);
 	UT_RUN(writeback_v2_structure_scheduler_collects_all_original_page_acks);
 	UT_RUN(writeback_v2_structure_scheduler_refuses_unproved_pages_and_partial_acks);
 	UT_RUN(writeback_v2_structure_scheduler_yields_or_cancels_without_clearing_ko);
