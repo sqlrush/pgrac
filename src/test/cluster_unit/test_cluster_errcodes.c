@@ -126,6 +126,7 @@ UT_TEST(test_class_55_first_last)
 {
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_PCM_STATE_INVALID, MAKE_SQLSTATE('5', '5', 'R', '0', '1'));
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_BLOCK_MISSING_TEMPORARY, MAKE_SQLSTATE('5', '5', 'R', '0', '6'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_SHARED_PARAMETER_FIXED, MAKE_SQLSTATE('5', '5', 'R', '0', '7'));
 }
 
 UT_TEST(test_class_57_first_last)
@@ -269,8 +270,8 @@ UT_TEST(test_per_class_anchors)
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_CF_TERMINAL_UNRESOLVED, 5), 'O');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SMART_FUSION_DEP_LOST, 4), '9');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SMART_FUSION_DEP_LOST, 5), 'P');
-	/* Class 55 has 6 entries: 55R01..55R06 */
-	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_BLOCK_MISSING_TEMPORARY, 5), '6');
+	/* Class 55 has 7 entries: 55R01..55R07 */
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SHARED_PARAMETER_FIXED, 5), '7');
 	/* Class 57 keeps operator-intervention cluster codes 57R02..57R07. */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_ADG_STANDBY_UNRESOLVABLE, 5), '7');
 	/* Class 58 has 17 entries: 58R01..58R17. */
