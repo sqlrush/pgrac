@@ -62,6 +62,7 @@
 #include "storage/ipc.h"
 #include "storage/md.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_guc.h"		/* PGRAC: cluster_enabled */
 #include "cluster/cluster_cr_pool.h"			/* PGRAC: spec-5.51 CR pool epoch bump */
 #include "cluster/cluster_inject.h"			/* PGRAC: spec-5.53 D2b skip-bump fault */
@@ -518,6 +519,13 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 	 * drop them without bothering to write the contents.
 	 */
 	DropRelationsAllBuffers(rels, nrels);
+#ifdef USE_PGRAC_CLUSTER
+	/* The committed continuation may execute only after these exact local
+	 * buffers are gone. Aborted/unobserved work cannot become ready here. */
+	for (i = 0; i < nrels; i++)
+		if (rels[i]->smgr_which == CLUSTER_SMGR_SMGRSW_INDEX)
+			cluster_ko_shared_native_drop_buffers_released_v2(rels[i]->smgr_rlocator.locator);
+#endif
 
 	/*
 	 * create an array which contains all relations to be dropped, and close
@@ -632,6 +640,16 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 	{
 		int			which = rels[i]->smgr_which;
 
+#ifdef USE_PGRAC_CLUSTER
+		/* The irreversible shared COMMIT already transferred this exact
+		 * DROP to its original checkpointer owner. Local buffers, handles
+		 * and invalidations above still retire here; per-fork deletion may
+		 * not race that owner or bypass its retained failure. */
+		if (which == CLUSTER_SMGR_SMGRSW_INDEX && !isRedo
+			&& !RelFileLocatorBackendIsTemp(rlocators[i])
+			&& cluster_ko_shared_native_drop_deferred_v2(rlocators[i].locator))
+			continue;
+#endif
 		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
 			smgrsw[which].smgr_unlink(rlocators[i], forknum, isRedo);
 	}

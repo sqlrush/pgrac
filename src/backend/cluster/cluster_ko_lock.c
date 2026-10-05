@@ -165,6 +165,8 @@ typedef struct ClusterKoShared {
 	int native_dsa_tranche;
 	dsa_pointer native_incoming;
 	dsa_pointer native_ready;
+	dsa_pointer native_failed; /* Retained evidence; never re-enters execution. */
+	bool native_recovery_required;
 	uint64 native_waiting;
 } ClusterKoShared;
 
@@ -174,6 +176,8 @@ static dsa_area *ko_native_area;
 
 typedef struct ClusterKoNativeContinuation {
 	dsa_pointer next;
+	bool buffers_released;
+	bool recovery_required;
 	ClusterKoSharedContext context;
 } ClusterKoNativeContinuation;
 
@@ -189,6 +193,8 @@ struct ClusterKoCompletionV2 {
 	bool drop_observed;
 	bool postcommit;
 	bool native_handed_off;
+	bool native_buffers_released;
+	dsa_pointer native_unready;
 	/* Native DDL keeps its verified barrier in the original ResourceOwner,
 	 * releasing the transport slot before the next relation's barrier. */
 	bool barrier_private;
@@ -303,7 +309,8 @@ cluster_ko_shmem_init(void)
 								   ko_state->native_dsa_tranche, NULL);
 		dsa_pin(area);
 		dsa_detach(area);
-		ko_state->native_incoming = ko_state->native_ready = InvalidDsaPointer;
+		ko_state->native_incoming = ko_state->native_ready = ko_state->native_failed = InvalidDsaPointer;
+		ko_state->native_recovery_required = false;
 		ko_state->native_waiting = 0;
 		pg_atomic_init_u64(&ko_state->flush_count, 0);
 		pg_atomic_init_u64(&ko_state->ack_received_count, 0);
@@ -786,9 +793,29 @@ ko_native_release_reservation(ClusterKoCompletionV2 *completion)
 	}
 }
 
+/* Only the original producer can abandon its still-unready continuation.
+ * Published work is never cancelled by a transaction or ResourceOwner exit. */
+static void
+ko_native_abandon_unready(ClusterKoCompletionV2 *completion)
+{
+	ClusterKoNativeContinuation *work;
+	if (!DsaPointerIsValid(completion->native_unready))
+		return;
+	work = dsa_get_address(ko_native_area, completion->native_unready);
+	SpinLockAcquire(&ko_state->shared_lock);
+	if (work->context.pid == completion->pid && work->context.serial == completion->serial
+		&& !work->buffers_released) {
+		work->recovery_required = true;
+		ko_state->native_recovery_required = true;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	completion->native_unready = InvalidDsaPointer;
+}
+
 static void
 ko_completion_cancel(ClusterKoCompletionV2 *completion)
 {
+	ko_native_abandon_unready(completion);
 	ko_native_release_reservation(completion);
 	if (ko_state != NULL && completion->slot < CLUSTER_KO_SHARED_CAPACITY) {
 		ClusterKoSharedContext *entry;
@@ -849,7 +876,8 @@ ko_shared_xact_event(XactEvent event, void *arg pg_attribute_unused())
 	 * real native COMMIT event enters the pending-delete lifetime. */
 	for (ClusterKoCompletionV2 *completion = ko_completions; completion != NULL;
 		 completion = completion->next)
-		if (completion->pid == MyProcPid && completion->native_transaction)
+		if (completion->pid == MyProcPid && completion->native_transaction
+			&& !completion->native_handed_off)
 			completion->postcommit = event == XACT_EVENT_COMMIT && completion->space_observed
 				&& !completion->native_pending && completion->owner == TopTransactionResourceOwner
 				&& CurrentResourceOwner == TopTransactionResourceOwner
@@ -877,10 +905,11 @@ ko_shared_resource_release(ResourceReleasePhase phase, bool commit,
 				continue;
 			}
 			/* Native pending deletes run after all ResourceOwner phases.
-			 * Keep only a prepared structural observation with this same
-			 * top transaction until its explicit postcommit tail cleanup. */
+			 * Retain the same committed owner's deletion suppression even
+			 * when its shared continuation requires recovery. An incomplete
+			 * observation must not re-enable unqualified physical deletion. */
 			if (commit && top && completion->native_transaction && completion->postcommit
-				&& completion->space_observed
+				&& (completion->space_observed || completion->native_handed_off)
 				&& !completion->native_pending && completion->owner == TopTransactionResourceOwner
 				&& CurTransactionResourceOwner == TopTransactionResourceOwner) {
 				link = &completion->next;
@@ -1165,37 +1194,53 @@ cluster_ko_shared_structure_handoff_v2(ClusterKoCompletionV2 **completion)
  * the entire original scope before doing anything. Preallocation makes this
  * postcommit transfer independent of active-slot capacity and allocator I/O. */
 static bool
-ko_native_publish(ClusterKoCompletionV2 *owned)
+ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 {
 	ClusterKoNativeContinuation *work;
 	ClusterSpaceStructureChange change;
+	bool qualified;
 
-	if (ko_state == NULL || (MyBackendType != B_BACKEND && MyBackendType != B_AUTOVAC_WORKER)
+	if (ko_state == NULL || (MyBackendType != B_BACKEND && MyBackendType != B_AUTOVAC_WORKER
+							&& MyBackendType != B_BG_WORKER)
 		|| CritSectionCount != 0 || CurrentResourceOwner == NULL
-		|| CurrentResourceOwner != TopTransactionResourceOwner
+		|| TopTransactionResourceOwner == NULL
+		|| (!from_commit_tail && CurrentResourceOwner != TopTransactionResourceOwner)
 		|| CurTransactionResourceOwner != TopTransactionResourceOwner)
 		return false;
-	if (owned == NULL || owned->pid != MyProcPid || owned->owner != CurrentResourceOwner
+	if (owned == NULL || owned->pid != MyProcPid || owned->owner != TopTransactionResourceOwner
 		|| !owned->native_transaction || !owned->barrier_private || owned->native_pending
-		|| owned->native_handed_off || !owned->postcommit || !owned->space_observed
+		|| owned->native_handed_off || !owned->postcommit
 		|| owned->serial == 0 || owned->native_reserved == NULL
-		|| !DsaPointerIsValid(owned->native_allocation)
-		|| !cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure), &change)
-		|| (change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
-			&& (change.identity.action != CLUSTER_SPACE_WAL_TRUNCATE || !owned->truncate_observed)))
+		|| !DsaPointerIsValid(owned->native_allocation))
+		return false;
+	qualified = owned->space_observed
+		&& cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure), &change)
+		&& (change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE
+			|| (change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE && owned->truncate_observed));
+	if (!from_commit_tail && (!qualified
+		|| (change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE
+			&& !owned->drop_observed && !owned->native_buffers_released)))
 		return false;
 	work = owned->native_reserved;
 	memset(&work->context, 0, sizeof(work->context));
-	work->context.used = work->context.complete = work->context.structure_owned = true;
+	work->context.used = work->context.complete = true;
+	work->context.structure_owned = qualified;
+	work->recovery_required = !qualified;
+	work->buffers_released = qualified && (change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE
+		|| owned->drop_observed || owned->native_buffers_released);
 	work->context.structure_drop_pending
-		= change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE && !owned->drop_observed;
+		= qualified && change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE && !owned->drop_observed;
 	work->context.pid = owned->pid;
 	work->context.serial = owned->serial;
 	work->context.request = owned->barrier_request;
 	memcpy(work->context.peer_boots, owned->barrier_boots, sizeof(owned->barrier_boots));
 	work->context.terminal = owned->terminal;
 	memcpy(work->context.structure, owned->structure, sizeof(owned->structure));
+	if (!work->buffers_released)
+		owned->native_unready = owned->native_allocation;
 	SpinLockAcquire(&ko_state->shared_lock);
+	if (work->recovery_required)
+		ko_state->native_recovery_required = true;
 	work->next = ko_state->native_incoming;
 	ko_state->native_incoming = owned->native_allocation;
 	ko_state->native_waiting++;
@@ -1215,7 +1260,7 @@ cluster_ko_shared_native_handoff_v2(ClusterKoCompletionV2 **completion)
 		return false;
 	link = ko_completion_link(*completion);
 	owned = *link;
-	if (!ko_native_publish(owned))
+	if (!ko_native_publish(owned, false))
 		return false;
 	*link = owned->next;
 	pfree(owned);
@@ -1238,8 +1283,42 @@ cluster_ko_shared_native_commit_v2(void)
 		/* A claimed SPACE change must have saved its actual record and
 		 * preallocated continuation before this irreversible point. */
 		owned->postcommit = true;
-		if (!ko_native_publish(owned))
+		if (!ko_native_publish(owned, true))
 			elog(PANIC, "committed shared structural change lost its original completion owner");
+	}
+}
+
+/* Called at the native all-buffers-retired boundary, before storage cleanup.
+ * The still-unready allocation cannot be freed by the checkpointer. Marking
+ * it ready and surrendering the producer pointer share the original lock. */
+void
+cluster_ko_shared_native_drop_buffers_released_v2(RelFileLocator locator)
+{
+	if (ko_state == NULL || TopTransactionResourceOwner == NULL
+		|| CurTransactionResourceOwner != TopTransactionResourceOwner || CritSectionCount != 0)
+		return;
+	for (ClusterKoCompletionV2 *owned = ko_completions; owned != NULL; owned = owned->next) {
+		ClusterSpaceStructureChange change;
+		ClusterKoNativeContinuation *work;
+
+		if (owned->pid != MyProcPid || owned->owner != TopTransactionResourceOwner
+			|| !owned->native_transaction || owned->native_pending || !owned->postcommit
+			|| !owned->space_observed || !RelFileLocatorEquals(owned->terminal.identity.locator, locator)
+			|| !cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure), &change)
+			|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE)
+			continue;
+		owned->native_buffers_released = true;
+		if (!DsaPointerIsValid(owned->native_unready))
+			continue;
+		work = dsa_get_address(ko_native_area, owned->native_unready);
+		SpinLockAcquire(&ko_state->shared_lock);
+		if (work->context.pid == owned->pid && work->context.serial == owned->serial
+			&& memcmp(&work->context.terminal, &owned->terminal, sizeof(owned->terminal)) == 0
+			&& memcmp(work->context.structure, owned->structure, sizeof(owned->structure)) == 0) {
+			owned->native_unready = InvalidDsaPointer;
+			work->buffers_released = true;
+		}
+		SpinLockRelease(&ko_state->shared_lock);
 	}
 }
 
@@ -1252,10 +1331,10 @@ cluster_ko_shared_native_drop_deferred_v2(RelFileLocator locator)
 		ClusterSpaceStructureChange change;
 
 		if (owned->pid == MyProcPid && owned->native_handed_off
-			&& RelFileLocatorEquals(owned->terminal.identity.locator, locator)
-			&& cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure),
-												  &change)
-			&& change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE)
+			&& RelFileLocatorEquals(owned->barrier_request.key.locator, locator)
+			&& (!owned->space_observed
+				|| (cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure), &change)
+					&& change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE)))
 			return true;
 	}
 	return false;
@@ -1264,7 +1343,7 @@ cluster_ko_shared_native_drop_deferred_v2(RelFileLocator locator)
 static void
 ko_native_deferred(const ClusterKoSharedContext *context, uint64 *reported, const char *stage)
 {
-	if (!context->used || !context->structure_owned || context->serial == 0
+	if (!context->used || context->serial == 0
 		|| (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0)
 		return;
 	KO_BUMP(failclosed_count);
@@ -1290,6 +1369,7 @@ cluster_ko_shared_native_promote_v2(void)
 	ClusterWalSourceRef current;
 	int slot = -1;
 	bool moved = false;
+	bool failed, buffers_released;
 
 	if (ko_state == NULL || MyBackendType != B_CHECKPOINTER || CurrentResourceOwner == NULL
 		|| CritSectionCount != 0 || !cluster_enabled || !cluster_shared_config)
@@ -1311,11 +1391,37 @@ cluster_ko_shared_native_promote_v2(void)
 	if (!DsaPointerIsValid(selected))
 		return CLUSTER_KO_STRUCTURE_RELEASED;
 	work = dsa_get_address(ko_native_attach(), selected);
+	SpinLockAcquire(&ko_state->shared_lock);
 	before = work->context;
-	if (!ko_shared_origin_current(&before) || !cluster_wal_thread_current_v2_ref(&current)
+	failed = work->recovery_required;
+	buffers_released = work->buffers_released;
+	SpinLockRelease(&ko_state->shared_lock);
+	if (failed || !ko_shared_origin_current(&before) || !cluster_wal_thread_current_v2_ref(&current)
 		|| memcmp(&current, &before.terminal.source, sizeof(current)) != 0) {
-		ko_native_deferred(&before, &ko_native_report_serial, "PROMOTION_CUT");
+		SpinLockAcquire(&ko_state->shared_lock);
+		if (ko_state->native_ready == selected && ko_state->native_waiting != 0) {
+			ko_state->native_ready = work->next;
+			work->next = ko_state->native_failed;
+			ko_state->native_failed = selected;
+			work->recovery_required = true;
+			ko_state->native_recovery_required = true;
+			ko_state->native_waiting--;
+		}
+		SpinLockRelease(&ko_state->shared_lock);
+		ko_native_deferred(&before, &ko_native_report_serial, failed ? "PRODUCER_INCOMPLETE" : "PROMOTION_CUT");
 		return CLUSTER_KO_STRUCTURE_INVALID;
+	}
+	if (!buffers_released) {
+		/* Let the rest of this finite batch advance while the original
+		 * producer completes its local buffer cleanup. No storage may run. */
+		SpinLockAcquire(&ko_state->shared_lock);
+		if (ko_state->native_ready == selected) {
+			ko_state->native_ready = work->next;
+			work->next = ko_state->native_incoming;
+			ko_state->native_incoming = selected;
+		}
+		SpinLockRelease(&ko_state->shared_lock);
+		return CLUSTER_KO_STRUCTURE_PENDING;
 	}
 	SpinLockAcquire(&ko_state->shared_lock);
 	if (ko_state->native_ready == selected && !ko_state->contexts[slot].used
@@ -1899,12 +2005,12 @@ void
 cluster_ko_shared_postcommit_cleanup_v2(void)
 {
 	ClusterKoCompletionV2 **link = &ko_completions;
-	if (CurrentResourceOwner == NULL || CurrentResourceOwner != TopTransactionResourceOwner
+	if (TopTransactionResourceOwner == NULL
 		|| CurTransactionResourceOwner != TopTransactionResourceOwner)
 		return;
 	while (*link != NULL) {
 		ClusterKoCompletionV2 *completion = *link;
-		if (completion->pid == MyProcPid && completion->owner == CurrentResourceOwner
+		if (completion->pid == MyProcPid && completion->owner == TopTransactionResourceOwner
 			&& completion->native_transaction && completion->postcommit) {
 			ko_completion_cancel(completion);
 			*link = completion->next;
@@ -2040,6 +2146,7 @@ ko_shared_backend_exit(int code, Datum arg)
 	while (ko_completions != NULL) {
 		ClusterKoCompletionV2 *completion = ko_completions;
 		ko_completions = completion->next;
+		ko_native_abandon_unready(completion);
 		ko_native_release_reservation(completion);
 		pfree(completion);
 	}
@@ -2097,6 +2204,9 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 		|| ko_state->send_head >= CLUSTER_KO_SHARED_CAPACITY) {
 		result = CLUSTER_NORMAL_STOP_INVALID;
 		why = "KO_SHARED_QUEUE_INVALID";
+	} else if (ko_state->native_recovery_required || DsaPointerIsValid(ko_state->native_failed)) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		why = "KO_SHARED_COMMITTED_RECOVERY_REQUIRED";
 	} else if (ko_state->native_waiting != 0 || DsaPointerIsValid(ko_state->native_incoming)
 			   || DsaPointerIsValid(ko_state->native_ready)) {
 		result = CLUSTER_NORMAL_STOP_PENDING;

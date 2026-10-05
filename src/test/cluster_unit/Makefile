@@ -2190,8 +2190,9 @@ test_cluster_page_data.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Ma
 	     END { if (n != 1 || emit) exit 1 }' $< > $@
 
 test_cluster_page_flush.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
-	awk '/^FlushBuffer\(/ { print "static void"; emit=1; n++ } \
-	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@
+	awk 'BEGIN { print "static void FlushBufferWithAttempt(BufferDesc *, SMgrRelation, IOObject, IOContext, volatile bool *);" } \
+	     /^FlushBuffer\(/ || /^FlushBufferWithAttempt\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@
 
 test_cluster_block_redeclare_scan.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^cluster_bufmgr_redeclare_scan_chunk\(/ { print "int"; emit=1; n++ } \
@@ -4336,7 +4337,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_pcm_s_prepare.inc
 	rm -f test_cluster_pcm_page_identity.inc test_cluster_pcm_page_identity.inc.tmp
 	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
-	rm -f test_cluster_ko_postcommit.inc
+	rm -f test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc
 	rm -f test_cluster_space_extend.inc test_cluster_space_extend_finish.inc
 	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc
 	rm -f test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc
@@ -5883,6 +5884,18 @@ test_cluster_ko_postcommit.inc: $(top_srcdir)/src/backend/access/transam/xact.c 
 	     emit { print } /^}/ { inside=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_ko_drop_buffers.inc: $(top_srcdir)/src/backend/storage/smgr/smgr.c Makefile
+	awk '/^smgrdounlinkall\(/ { inside=1 } \
+	     inside && /DropRelationsAllBuffers\(rels, nrels\);/ { emit=1; found++ } \
+	     emit { print } emit && /^#endif/ { emit=0; inside=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ko_unlink.inc: $(top_srcdir)/src/backend/storage/smgr/smgr.c Makefile
+	awk '/^smgrdounlinkall\(/ { print "static void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_ko_checkpointer.inc: $(top_srcdir)/src/backend/postmaster/checkpointer.c Makefile
 	awk '/^\t\tpi_pending = cluster_ko_shared_native_poll_v2\(\);/ { emit=1; found++ } \
 	     emit { print } \
@@ -5895,7 +5908,7 @@ test_cluster_ko_writeback_codec.o: $(top_srcdir)/src/backend/cluster/cluster_pi_
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
 		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_ko.h
@@ -5906,7 +5919,7 @@ test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_abandon.h test_clus
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Actual original KO owner and storage consumer; syscall faults use real files.
-test_cluster_drop_work: test_cluster_drop_work.c test_cluster_ko_abandon.h test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test_cluster_ko_checkpointer.inc unit_test.h \
+test_cluster_drop_work: test_cluster_drop_work.c test_cluster_ko_abandon.h test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test_cluster_ko_drop_buffers.inc test_cluster_ko_unlink.inc test_cluster_ko_checkpointer.inc unit_test.h \
 		$(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_smgr.c \

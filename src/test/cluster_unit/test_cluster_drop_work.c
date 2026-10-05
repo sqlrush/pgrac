@@ -380,8 +380,11 @@ work_setup_impl(const char *name, bool native, bool stale)
 		MyBackendType = B_CHECKPOINTER;
 		if (stale) {
 			UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
-			UT_ASSERT_EQ(storage.native_waiting, 1);
+			UT_ASSERT_EQ(storage.native_waiting, 0);
 			current_epoch--;
+			UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_RELEASED);
+			work_slot = 0;
+			return true;
 		}
 		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
 		work_slot = 0;
@@ -446,6 +449,23 @@ UT_TEST(test_native_commit_and_real_smgr_defer_io_to_original_work)
 				return;
 			/* The backend has handed off without doing pathname I/O. */
 			UT_ASSERT(ko_completions == NULL);
+			if (stale) {
+				const char *reason;
+				bool completed = false;
+				uint32 cursor = 0;
+				struct stat st;
+				UT_ASSERT(!cluster_smgr_drop_work_poll(&cursor, &completed));
+				UT_ASSERT(!completed && !storage.contexts[0].used);
+				UT_ASSERT_EQ(opens + truncates + main_syncs + dir_syncs + unlinks + closes, 0);
+				for (unsigned f = 0; f <= MAX_FORKNUM; f++) {
+					UT_ASSERT(stat(work_paths[f], &st) == 0);
+					UT_ASSERT_EQ(st.st_size, BLCKSZ);
+				}
+				UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_INVALID);
+				UT_ASSERT_EQ(native_allocated, 1);
+				native_fixture_shared_memory_end();
+				continue;
+			}
 			if (!failed) {
 				UT_ASSERT(poll_work());
 				assert_finished();
@@ -711,7 +731,7 @@ UT_TEST(test_work_scan_completes_next_item_after_first_io_failure)
 	UT_ASSERT(cluster_space_structure_wal_encode(&change, wal, sizeof(wal)));
 	UT_ASSERT(cluster_ko_shared_observe_space_v2(owner, &terminal, wal, sizeof(wal)));
 	xact_callback(XACT_EVENT_COMMIT, NULL);
-	UT_ASSERT(cluster_ko_shared_native_handoff_v2(&owner));
+	UT_ASSERT(native_handoff_after_buffers(&owner));
 	MyBackendType = B_CHECKPOINTER;
 	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
 	prepare_files(&change);

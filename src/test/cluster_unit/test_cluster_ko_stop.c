@@ -2619,15 +2619,94 @@ AtEOXact_ClusterRelmapPublish(void)
 void
 ResourceOwnerRelease(ResourceOwner owner, ResourceReleasePhase phase, bool commit, bool top)
 {
-	UT_ASSERT(owner == TopTransactionResourceOwner && owner == CurrentResourceOwner);
+	ResourceOwner saved = CurrentResourceOwner;
+	UT_ASSERT(owner == TopTransactionResourceOwner);
+	CurrentResourceOwner = owner;
 	UT_ASSERT(commit && top);
 	postcommit_phases++;
 	resource_callback(phase, commit, top, NULL);
+	CurrentResourceOwner = saved;
 }
 void AtEOXact_Buffers(bool commit) { UT_ASSERT(commit); }
 void AtEOXact_RelationCache(bool commit) { UT_ASSERT(commit); }
 void AtEOXact_Inval(bool commit) { UT_ASSERT(commit); }
 void AtEOXact_MultiXact(void) {}
+static bool postcommit_buffer_error;
+static void
+native_drop_buffers(RelFileLocator locator)
+{
+	SMgrRelationData rel;
+	SMgrRelation rels[1] = { &rel };
+	int i, nrels = 1;
+	memset(&rel, 0, sizeof(rel));
+	rel.smgr_which = CLUSTER_SMGR_SMGRSW_INDEX;
+	rel.smgr_rlocator.locator = locator;
+#define DropRelationsAllBuffers(rels, nrels) do { if (postcommit_buffer_error) pg_re_throw(); } while (0)
+#include "test_cluster_ko_drop_buffers.inc"
+#undef DropRelationsAllBuffers
+}
+/* Execute the whole native caller, including the final per-fork branch.
+ * Cache/descriptor effects are boundaries; every physical unlink is counted. */
+static unsigned native_fork_unlinks, native_fork_closes, native_smgr_invalidations;
+static void
+native_close_fork(SMgrRelation rel, ForkNumber forknum)
+{
+	UT_ASSERT(forknum >= 0 && forknum <= MAX_FORKNUM);
+	native_fork_closes++;
+}
+static void
+native_unlink_fork(RelFileLocatorBackend locator, ForkNumber forknum, bool redo)
+{
+	UT_ASSERT(forknum >= 0 && forknum <= MAX_FORKNUM);
+	native_fork_unlinks++;
+}
+static const struct {
+	void (*smgr_close)(SMgrRelation, ForkNumber);
+	void (*smgr_unlink)(RelFileLocatorBackend, ForkNumber, bool);
+} native_smgrsw[] = {
+	{ native_close_fork, native_unlink_fork },
+	{ native_close_fork, native_unlink_fork }
+};
+#define smgrdounlinkall native_smgr_unlink_all
+#define smgrsw native_smgrsw
+#define palloc malloc
+#define pfree free
+#define DropRelationsAllBuffers(rels, nrels) do { if (postcommit_buffer_error) pg_re_throw(); } while (0)
+#define CacheInvalidateSmgr(locator) ((void) (locator), native_smgr_invalidations++)
+#define cluster_smgr_invalidate_unlink_pending(locator) ((void) (locator))
+#define cluster_cr_pool_rel_generation_enabled() false
+#define cluster_cr_pool_unlink_locator(locator) ((void) (locator))
+#define cluster_cr_pool_bump_epoch() ((void) 0)
+#include "test_cluster_ko_unlink.inc"
+#undef smgrdounlinkall
+#undef smgrsw
+#undef palloc
+#undef pfree
+#undef DropRelationsAllBuffers
+#undef CacheInvalidateSmgr
+#undef cluster_smgr_invalidate_unlink_pending
+#undef cluster_cr_pool_rel_generation_enabled
+#undef cluster_cr_pool_unlink_locator
+#undef cluster_cr_pool_bump_epoch
+
+static void
+native_pending_unlink(RelFileLocator locator)
+{
+	SMgrRelationData rel = {0};
+	SMgrRelation rels[1] = { &rel };
+	rel.smgr_which = CLUSTER_SMGR_SMGRSW_INDEX;
+	rel.smgr_rlocator.locator = locator;
+	rel.smgr_rlocator.backend = InvalidBackendId;
+	native_smgr_unlink_all(rels, 1, false);
+}
+
+static bool
+native_handoff_after_buffers(ClusterKoCompletionV2 **owner)
+{
+	native_drop_buffers((*owner)->barrier_request.key.locator);
+	return cluster_ko_shared_native_handoff_v2(owner);
+}
+
 void
 smgrDoPendingDeletes(bool commit)
 {
@@ -2656,6 +2735,13 @@ smgrDoPendingDeletes(bool commit)
 		UT_ASSERT_EQ(cluster_ko_shared_native_drop_deferred_v2(postcommit_binding.identity.locator),
 					 postcommit_drop);
 		UT_ASSERT(!cluster_ko_shared_observe_drop_v2(postcommit_owner));
+	}
+	if (native_commit_active && postcommit_drop) {
+		if (postcommit_native_count == 1)
+			native_pending_unlink(postcommit_binding.identity.locator);
+		else
+			for (ClusterKoCompletionV2 *owned = ko_completions; owned != NULL; owned = owned->next)
+				native_pending_unlink(owned->barrier_request.key.locator);
 	}
 	if (postcommit_storage_consumer != NULL)
 		UT_ASSERT(postcommit_storage_consumer(postcommit_binding.identity.locator));
@@ -2702,10 +2788,11 @@ prepare_postcommit(bool drop)
 	postcommit_owner = prepare_native_structure(drop, &postcommit_binding, postcommit_wal);
 	postcommit_drop = drop;
 	postcommit_error = postcommit_scope_changed = false;
-	postcommit_callback_error = false;
+	postcommit_callback_error = postcommit_buffer_error = false;
 	postcommit_native_count = 1;
 	postcommit_storage_consumer = NULL;
 	postcommit_deletes = postcommit_phases = 0;
+	native_fork_unlinks = native_fork_closes = native_smgr_invalidations = 0;
 	UT_ASSERT(cluster_ko_shared_observe_space_v2(postcommit_owner, &postcommit_binding,
 		postcommit_wal, sizeof(postcommit_wal)));
 }
@@ -2773,6 +2860,237 @@ UT_TEST(test_native_postcommit_error_and_exit_do_not_leave_a_completion)
 	}
 }
 
+/* End this isolated shared-memory fixture after checking failure retention.
+ * This is not a product retirement path or a recovery success witness. */
+static void
+native_fixture_shared_memory_end(void)
+{
+	CurrentResourceOwner = CurTransactionResourceOwner = TopTransactionResourceOwner;
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT_EQ(completion_allocations, 0);
+	for (unsigned i = 0; i < lengthof(native_allocations); i++)
+		if (native_allocations[i] != NULL) {
+			free(native_allocations[i]);
+			native_allocations[i] = NULL;
+		}
+	native_allocated = 0;
+}
+
+UT_TEST(test_native_commit_accepts_portal_and_background_transaction_owner)
+{
+	for (unsigned actor = 0; actor < 2; actor++) {
+		volatile bool caught = false;
+		prepare_postcommit(false);
+		UT_ASSERT(cluster_ko_shared_observe_truncate_v2(postcommit_owner));
+		native_commit_active = true;
+		CurrentResourceOwner = actor == 0 ? (ResourceOwner)3 : TopTransactionResourceOwner;
+		MyBackendType = actor == 0 ? B_BACKEND : B_BG_WORKER;
+		expecting_error = true;
+		PG_TRY();
+		{
+			run_native_postcommit();
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		expecting_error = false;
+		UT_ASSERT(!caught);
+		UT_ASSERT_EQ(storage.native_waiting, 1);
+		UT_ASSERT_EQ(completion_allocations, 0);
+		CurrentResourceOwner = TopTransactionResourceOwner;
+		MyBackendType = B_CHECKPOINTER;
+		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
+		native_fixture_shared_memory_end();
+	}
+}
+
+UT_TEST(test_native_commit_missing_observation_retains_recovery_instead_of_panicking)
+{
+	const char *reason;
+	volatile bool caught = false;
+	prepare_postcommit(true);
+	/* No observation was delivered before the irreversible COMMIT. */
+	postcommit_owner->space_observed = false;
+	memset(&postcommit_owner->terminal, 0, sizeof(postcommit_owner->terminal));
+	memset(postcommit_owner->structure, 0, sizeof(postcommit_owner->structure));
+	native_commit_active = expecting_error = true;
+	PG_TRY();
+	{
+		run_native_postcommit();
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	expecting_error = false;
+	UT_ASSERT(!caught);
+	UT_ASSERT_EQ(postcommit_deletes, 1);
+	UT_ASSERT_EQ(native_fork_unlinks, 0);
+	UT_ASSERT_EQ(native_fork_closes, MAX_FORKNUM + 1);
+	UT_ASSERT_EQ(native_smgr_invalidations, 1);
+	UT_ASSERT_EQ(completion_allocations, 0);
+	UT_ASSERT_EQ(native_allocated, 1);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(strcmp(reason, "KO_SHARED_COMMITTED_RECOVERY_REQUIRED") == 0);
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
+	UT_ASSERT(!storage.contexts[0].used);
+	native_fixture_shared_memory_end();
+}
+
+UT_TEST(test_native_committed_drop_suppresses_real_per_fork_tail)
+{
+	prepare_postcommit(true);
+	native_commit_active = true;
+	run_native_postcommit();
+	UT_ASSERT_EQ(native_fork_unlinks, 0);
+	UT_ASSERT_EQ(native_fork_closes, MAX_FORKNUM + 1);
+	UT_ASSERT_EQ(native_smgr_invalidations, 1);
+	UT_ASSERT_EQ(completion_allocations, 0);
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
+	UT_ASSERT(storage.contexts[0].structure_drop_pending);
+	native_fixture_shared_memory_end();
+}
+
+UT_TEST(test_native_drop_suppression_does_not_change_other_storage_paths)
+{
+	SMgrRelationData rel = {0};
+	SMgrRelation rels[1] = { &rel };
+	prepare_postcommit(true);
+	native_commit_active = true;
+	cluster_ko_shared_native_commit_v2();
+	rel.smgr_which = CLUSTER_SMGR_SMGRSW_INDEX;
+	rel.smgr_rlocator.locator = postcommit_binding.identity.locator;
+	rel.smgr_rlocator.backend = InvalidBackendId;
+	native_smgr_unlink_all(rels, 1, true); /* Recovery has its original owner. */
+	rel.smgr_which = 0;
+	native_smgr_unlink_all(rels, 1, false);
+	rel.smgr_which = CLUSTER_SMGR_SMGRSW_INDEX;
+	rel.smgr_rlocator.locator.relNumber++;
+	native_smgr_unlink_all(rels, 1, false);
+	UT_ASSERT_EQ(native_fork_unlinks, 3 * (MAX_FORKNUM + 1));
+	UT_ASSERT_EQ(native_fork_closes, 3 * (MAX_FORKNUM + 1));
+	UT_ASSERT_EQ(native_smgr_invalidations, 3);
+	native_fixture_shared_memory_end();
+}
+
+UT_TEST(test_native_stale_head_leaves_execution_but_keeps_failure_visible)
+{
+	const char *reason;
+	prepare_postcommit(false);
+	UT_ASSERT(cluster_ko_shared_observe_truncate_v2(postcommit_owner));
+	native_commit_active = true;
+	cluster_ko_shared_native_commit_v2();
+	current_epoch++;
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
+	UT_ASSERT_EQ(storage.native_waiting, 0);
+	UT_ASSERT_EQ(native_allocated, 1);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(strcmp(reason, "KO_SHARED_COMMITTED_RECOVERY_REQUIRED") == 0);
+	current_epoch--;
+	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_RELEASED);
+	UT_ASSERT(!storage.contexts[0].used);
+	native_fixture_shared_memory_end();
+}
+
+UT_TEST(test_native_stale_head_does_not_hide_later_current_work)
+{
+	ClusterKoCompletionV2 *next = NULL;
+	ClusterSpaceStructureChange change;
+	ClusterPageWalBindingV1 binding;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	const char *reason;
+	prepare_postcommit(false);
+	UT_ASSERT(cluster_ko_shared_observe_truncate_v2(postcommit_owner));
+	UT_ASSERT(cluster_space_structure_wal_decode(postcommit_wal, sizeof(postcommit_wal), &change));
+	current_epoch++;
+	multiple_barriers = true;
+	allocated_batch = last_shared_request.batch_id;
+	space_identity.key.locator.relNumber = 199;
+	cluster_ko_flush_and_wait_ack(space_identity.key.locator, RELPERSISTENCE_PERMANENT);
+	UT_ASSERT(cluster_ko_shared_claim_v2(&space_identity.key, space_identity.incarnation, &next));
+	binding = postcommit_binding;
+	binding.identity.locator = space_identity.key.locator;
+	change.identity.expected.key.locator = change.identity.result.key.locator = binding.identity.locator;
+	change.reservation.before.identity.key.locator = change.reservation.result.identity.key.locator
+		= binding.identity.locator;
+	UT_ASSERT(cluster_space_structure_wal_encode(&change, wal, sizeof(wal)));
+	UT_ASSERT(cluster_ko_shared_observe_space_v2(next, &binding, wal, sizeof(wal)));
+	UT_ASSERT(cluster_ko_shared_observe_truncate_v2(next));
+	native_commit_active = true;
+	cluster_ko_shared_native_commit_v2();
+	cluster_ko_shared_postcommit_cleanup_v2();
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
+	UT_ASSERT_EQ(storage.native_waiting, 1);
+	UT_ASSERT_EQ(fixture_log_events, 1);
+	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
+	UT_ASSERT_EQ(storage.contexts[0].terminal.identity.locator.relNumber, 199);
+	UT_ASSERT_EQ(storage.native_waiting, 0);
+	UT_ASSERT_EQ(native_allocated, 1);
+	UT_ASSERT_EQ(fixture_log_events, 1);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_INVALID);
+	native_fixture_shared_memory_end();
+}
+
+UT_TEST(test_native_drop_buffer_gate_rejects_early_wrong_owner_and_failed_cleanup)
+{
+	volatile bool caught = false;
+	RelFileLocator wrong;
+	prepare_postcommit(true);
+	native_commit_active = true;
+	native_drop_buffers(postcommit_binding.identity.locator); /* Before real COMMIT. */
+	cluster_ko_shared_native_commit_v2();
+	CurTransactionResourceOwner = (ResourceOwner)2;
+	native_drop_buffers(postcommit_binding.identity.locator);
+	CurTransactionResourceOwner = TopTransactionResourceOwner;
+	wrong = postcommit_binding.identity.locator;
+	wrong.relNumber++;
+	native_drop_buffers(wrong);
+	postcommit_buffer_error = true;
+	PG_TRY();
+	{
+		native_drop_buffers(postcommit_binding.identity.locator);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	postcommit_buffer_error = false;
+	UT_ASSERT(caught);
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PENDING);
+	UT_ASSERT(!storage.contexts[0].used);
+	UT_ASSERT_EQ(native_allocated, 1);
+	native_fixture_shared_memory_end();
+}
+
+UT_TEST(test_native_drop_waits_for_original_local_buffer_cleanup)
+{
+	prepare_postcommit(true);
+	native_commit_active = true;
+	cluster_ko_shared_native_commit_v2();
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PENDING);
+	UT_ASSERT_EQ(storage.native_waiting, 1);
+	UT_ASSERT(!storage.contexts[0].used);
+	UT_ASSERT_EQ(flush_count + sync_count + drop_count, 0);
+	if (!ut_current_failed) {
+		MyBackendType = B_BACKEND;
+		run_native_postcommit();
+		MyBackendType = B_CHECKPOINTER;
+		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
+		UT_ASSERT(storage.contexts[0].structure_drop_pending);
+	}
+	native_fixture_shared_memory_end();
+}
+
 UT_TEST(test_native_commit_transfers_before_callbacks_and_local_cleanup)
 {
 	for (unsigned drop = 0; drop < 2; drop++) {
@@ -2821,9 +3139,10 @@ UT_TEST(test_native_commit_callback_error_cannot_cancel_shared_responsibility)
 		UT_ASSERT_EQ(completion_allocations, 0);
 		UT_ASSERT_EQ(storage.native_waiting, 1);
 		MyBackendType = B_CHECKPOINTER;
-		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
-		UT_ASSERT(storage.contexts[0].structure_drop_pending);
-		UT_ASSERT_EQ(native_allocated, 0);
+		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
+		UT_ASSERT(!storage.contexts[0].used);
+		UT_ASSERT_EQ(native_allocated, 1);
+		native_fixture_shared_memory_end();
 	}
 }
 
@@ -2839,12 +3158,12 @@ UT_TEST(test_native_commit_keeps_old_cut_without_executing_it)
 		UT_ASSERT_EQ(storage.native_waiting, 1);
 		MyBackendType = B_CHECKPOINTER;
 		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
-		UT_ASSERT_EQ(storage.native_waiting, 1);
+		UT_ASSERT_EQ(storage.native_waiting, 0);
 		current_epoch = last_shared_request.epoch;
-		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
-		UT_ASSERT(memcmp(storage.contexts[0].structure, postcommit_wal, sizeof(postcommit_wal))
-				  == 0);
-		UT_ASSERT_EQ(native_allocated, 0);
+		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_RELEASED);
+		UT_ASSERT(!storage.contexts[0].used);
+		UT_ASSERT_EQ(native_allocated, 1);
+		native_fixture_shared_memory_end();
 	}
 }
 
@@ -3811,7 +4130,7 @@ UT_TEST(test_native_committed_seventy_two_owners_survive_full_background_region)
 			} else {
 				xact_callback(XACT_EVENT_COMMIT, NULL);
 				for (unsigned i = 0; i < lengthof(owners); i++) {
-					UT_ASSERT(cluster_ko_shared_native_handoff_v2(&owners[i]));
+					UT_ASSERT(native_handoff_after_buffers(&owners[i]));
 					UT_ASSERT(owners[i] == NULL);
 				}
 			}
@@ -3849,7 +4168,7 @@ UT_TEST(test_native_committed_seventy_two_owners_survive_full_background_region)
 					if (!drop)
 						UT_ASSERT(cluster_ko_shared_observe_truncate_v2(arrival));
 					xact_callback(XACT_EVENT_COMMIT, NULL);
-					UT_ASSERT(cluster_ko_shared_native_handoff_v2(&arrival));
+					UT_ASSERT(native_handoff_after_buffers(&arrival));
 					MyBackendType = B_CHECKPOINTER;
 				}
 				UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
@@ -3981,17 +4300,20 @@ UT_TEST(test_native_continuation_retains_stale_commit_but_cannot_serve_it)
 	xact_callback(XACT_EVENT_COMMIT, NULL);
 	current_epoch++;
 	old = owner;
-	UT_ASSERT(cluster_ko_shared_native_handoff_v2(&owner));
+	UT_ASSERT(native_handoff_after_buffers(&owner));
 	UT_ASSERT(owner == NULL);
 	UT_ASSERT(!cluster_ko_shared_native_handoff_v2(&old));
 	MyBackendType = B_CHECKPOINTER;
 	for (unsigned attempt = 0; attempt < 3; attempt++) {
-		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
-		UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(),
+			 attempt == 0 ? CLUSTER_KO_STRUCTURE_INVALID : CLUSTER_KO_STRUCTURE_RELEASED);
+		UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_INVALID);
 		UT_ASSERT(!storage.contexts[0].used);
 	}
 	current_epoch--;
-	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
+	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_RELEASED);
+	UT_ASSERT_EQ(native_allocated, 1);
+	native_fixture_shared_memory_end();
 }
 
 
@@ -4004,7 +4326,7 @@ prepare_promoted_drop(ClusterPageWalBindingV1 *binding, uint8 *wal)
 	if (!cluster_ko_shared_observe_space_v2(owner, binding, wal, CLUSTER_SPACE_STRUCTURE_WAL_BYTES))
 		abort();
 	xact_callback(XACT_EVENT_COMMIT, NULL);
-	if (!cluster_ko_shared_native_handoff_v2(&owner))
+	if (!native_handoff_after_buffers(&owner))
 		abort();
 	MyBackendType = B_CHECKPOINTER;
 	if (cluster_ko_shared_native_promote_v2() != CLUSTER_KO_STRUCTURE_PROGRESS)
@@ -4188,7 +4510,7 @@ UT_TEST(test_drop_work_bounded_scan_continues_after_a_retained_storage_failure)
 	UT_ASSERT(cluster_space_structure_wal_encode(&change, wal, sizeof(wal)));
 	UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &next, wal, sizeof(wal)));
 	xact_callback(XACT_EVENT_COMMIT, NULL);
-	UT_ASSERT(cluster_ko_shared_native_handoff_v2(&completion));
+	UT_ASSERT(native_handoff_after_buffers(&completion));
 	MyBackendType = B_CHECKPOINTER;
 	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
 	UT_ASSERT(!cluster_ko_shared_drop_work_begin_v2(&cursor, 0, &one));
@@ -4215,7 +4537,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(100);
+	UT_PLAN(108);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
@@ -4278,6 +4600,14 @@ main(void)
 	UT_RUN(test_native_postcommit_retains_exact_observation_until_pending_deletes_return);
 	UT_RUN(test_native_postcommit_refuses_drift_but_always_cleans_original_local_owner);
 	UT_RUN(test_native_postcommit_error_and_exit_do_not_leave_a_completion);
+	UT_RUN(test_native_commit_accepts_portal_and_background_transaction_owner);
+	UT_RUN(test_native_commit_missing_observation_retains_recovery_instead_of_panicking);
+	UT_RUN(test_native_committed_drop_suppresses_real_per_fork_tail);
+	UT_RUN(test_native_drop_suppression_does_not_change_other_storage_paths);
+	UT_RUN(test_native_stale_head_leaves_execution_but_keeps_failure_visible);
+	UT_RUN(test_native_stale_head_does_not_hide_later_current_work);
+	UT_RUN(test_native_drop_buffer_gate_rejects_early_wrong_owner_and_failed_cleanup);
+	UT_RUN(test_native_drop_waits_for_original_local_buffer_cleanup);
 	UT_RUN(test_native_commit_transfers_before_callbacks_and_local_cleanup);
 	UT_RUN(test_native_commit_callback_error_cannot_cancel_shared_responsibility);
 	UT_RUN(test_native_commit_keeps_old_cut_without_executing_it);
