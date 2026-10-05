@@ -1,29 +1,32 @@
 #-------------------------------------------------------------------------
 #
 # 435_s08_main_vm_handover_2node.pl
-#    Two members of a fresh shared cluster hand MAIN and VM pages back and
-#    forth; no committed write may be lost, before or after a normal
-#    stop and same-DATA restart.  The legs hold whether a page is written
-#    before it is handed over or carried as a past image afterwards, so
-#    they apply unchanged with and without that write.
+#    In a fresh four-member shared cluster, two writers (node0 and node1)
+#    hand MAIN and VM pages back and forth; no committed write may be
+#    lost, before or after a normal stop and same-DATA restart, and every
+#    member reads the committed state.  The legs hold whether a page is
+#    written before it is handed over or carried as a past image
+#    afterwards, so they apply unchanged with and without that write.
+#    This is a functional regression, not a performance load; node2 and
+#    node3 only read.
 #
-#      L1   real handover: alternating members update rows of the same
-#           heap pages and their primary-key leaf; both members read the
-#           expected rows after every batch
+#      L1   real handover: the two writers alternately update rows of the
+#           same heap pages and their primary-key leaf; every member reads
+#           the expected rows after every batch
 #      L2   re-dirtied after handover: the same page is updated by one
-#           member, then the other, then the first again, with no
+#           writer, then the other, then the first again, with no
 #           checkpoint in between
-#      L3   VM handover: VACUUM on one member sets all-visible bits, an
+#      L3   VM handover: VACUUM on one writer sets all-visible bits, an
 #           update on the other clears one; index-only and sequential
-#           scans agree on both members after every exchange
-#      L4   handover during checkpoint: both members checkpoint
+#           scans agree on every member after every exchange
+#      L4   handover during checkpoint: both writers checkpoint
 #           repeatedly while the pages keep changing hands
 #      L5   delayed and lost receipts: the requester's completion notice
 #           to the master is held back (sleep) or dropped (skip) while
 #           the pages keep changing hands
-#      L6   normal stop and same-DATA restart: both members read exactly
+#      L6   normal stop and same-DATA restart: every member reads exactly
 #           the committed rows and agreeing scans, and a cross-member
-#           update after restart is visible to the other member
+#           update after restart is visible to every member
 #
 # IDENTIFICATION
 #    src/test/cluster_tap/t/435_s08_main_vm_handover_2node.pl
@@ -47,6 +50,7 @@ use Test::More;
 
 use constant ROWS => 96;
 use constant ROUNDS => 40;
+use constant WRITERS => 2;	# node0 and node1; the other members only read
 
 my $cluster;
 my @nodes;
@@ -119,7 +123,7 @@ sub same_page_ids
 	return grep { exists $expected{$_} } ($id, $id + 1, $id + 2);
 }
 
-$cluster = PostgreSQL::Test::ClusterPRE2->new_cluster('s08_handover', nodes => 2,
+$cluster = PostgreSQL::Test::ClusterPRE2->new_cluster('s08_handover', nodes => 4,
 	blackbox => 1, extra_conf => ['autovacuum = off']);
 $cluster->start_cluster;
 @nodes = $cluster->nodes;
@@ -166,10 +170,10 @@ for my $cycle (1 .. 6)
 }
 check_rows('L3');
 
-# L4: both members checkpoint while the pages keep changing hands.
+# L4: both writers checkpoint while the pages keep changing hands.
 {
 	my @checkpointers;
-	for my $i (0 .. $#nodes)
+	for my $i (0 .. WRITERS - 1)
 	{
 		my $script = join('', map { "CHECKPOINT;\nSELECT pg_sleep(0.05);\n" } 1 .. 20);
 		my ($out, $err) = ('', '');
@@ -221,8 +225,11 @@ is(rows_text(), $before, 'L6 committed model unchanged across the restart');
 check_rows('L6 after restart');
 check_scans('L6 after restart');
 update_on(1, 2, 9);
-is(sql($nodes[0], 'SELECT v FROM s08_main WHERE id = 2'), $expected{2},
-	'L6 a cross-member update after restart is visible');
+for my $i (0 .. $#nodes)
+{
+	is(sql($nodes[$i], 'SELECT v FROM s08_main WHERE id = 2'), $expected{2},
+		"L6 node$i sees a cross-member update after restart");
+}
 $cluster->stop_cluster;
 
 done_testing();

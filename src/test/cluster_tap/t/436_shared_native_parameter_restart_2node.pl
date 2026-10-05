@@ -2,13 +2,14 @@
 #
 # 436_shared_native_parameter_restart_2node.pl
 #    A shared cluster cannot change a parameter that its control file
-#    records at creation.  ALTER SYSTEM refuses these parameters with
+#    records at creation.  The cluster is a fresh four-member cohort; every
+#    assertion covers every member.  ALTER SYSTEM refuses these parameters with
 #    55R07; a start whose value differs anyway (here from each member's own
 #    configuration file) is refused with 55R07 before its first durable
 #    write, and restoring the value lets the cluster start again.
 #
 #      L1   ALTER SYSTEM SET/RESET max_connections is refused with 55R07 on
-#           both members and changes nothing; another common parameter is
+#           every member and changes nothing; another common parameter is
 #           still accepted
 #      L2   with a recorded parameter changed in every member's own
 #           configuration, the start is refused with 55R07, no member
@@ -73,7 +74,7 @@ sub durable_state
 	return \%digest;
 }
 
-$cluster = PostgreSQL::Test::ClusterPRE2->new_cluster('shared_native_param', nodes => 2,
+$cluster = PostgreSQL::Test::ClusterPRE2->new_cluster('shared_native_param', nodes => 4,
 	blackbox => 1, extra_conf => ['autovacuum = off']);
 $cluster->start_cluster;
 @nodes = $cluster->nodes;

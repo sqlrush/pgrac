@@ -2,17 +2,21 @@
 #
 # 437_shared_eviction_rewrite_latency_2node.pl
 #    Exclusive-grant latency for a page that is rewritten right after the
-#    member holding it evicted it, with every checkpointer idle and while
-#    the other member runs a spread checkpoint.  The readings go to
-#    t437_readings.jsonl in the test log directory; the test fails when a
-#    rewrite ends in an error or a committed update is lost.
+#    writer holding it evicted it, with every checkpointer idle and while
+#    the other writer runs a spread checkpoint.  The cluster is a fresh
+#    four-member cohort with two writers (node0 and node1); node2 and node3
+#    only read.  This is a functional regression, not a performance load.
+#    The readings go to t437_readings.jsonl in the test log directory; the
+#    test fails when a rewrite ends in an error or a committed update is
+#    lost.  A target page may be mastered by any member; every member's
+#    checkpointer state is recorded with each reading.
 #
-#      L1   idle: X handover between members (baseline), then eviction by
-#           buffer pressure and an immediate rewrite on the evicting member
-#      L2   spread checkpoint on the other member: eviction and immediate
+#      L1   idle: X handover between the writers (baseline), then eviction
+#           by buffer pressure and an immediate rewrite on the evictor
+#      L2   spread checkpoint on the other writer: eviction and immediate
 #           rewrite while that checkpointer is in its write-delay phase
 #      L3   no rewrite ends in an error, the eviction path was exercised in
-#           both legs, and both members read every committed update
+#           both legs, and every member reads every committed update
 #
 # IDENTIFICATION
 #    src/test/cluster_tap/t/437_shared_eviction_rewrite_latency_2node.pl
@@ -138,7 +142,7 @@ sub summary
 		$at->(0.5), $at->(0.99), $values[-1]);
 }
 
-$cluster = PostgreSQL::Test::ClusterPRE2->new_cluster('evict_rewrite', nodes => 2,
+$cluster = PostgreSQL::Test::ClusterPRE2->new_cluster('evict_rewrite', nodes => 4,
 	blackbox => 1, extra_conf => ['autovacuum = off', 'shared_buffers = 4MB',
 		'log_checkpoints = on', 'checkpoint_timeout = 300s', 'max_wal_size = 8GB',
 		'checkpoint_completion_target = 0.9']);
@@ -202,7 +206,7 @@ for my $evictor (0 .. 1)
 	}
 }
 
-# L2: the other member runs a spread checkpoint while the evictor floods
+# L2: the other writer runs a spread checkpoint while the evictor floods
 # and rewrites.  The flood also cleans the evictor's own checkpoint, so
 # each round uses one evictor.
 for my $round (1 .. CKPT_ROUNDS)
@@ -264,7 +268,7 @@ for my $leg ('idle', 'checkpoint')
 			map { $_->{evict_retire_ms} // () } @mine)) if $leg eq 'idle';
 	ok((grep { $_->{pi_pending_after_flood} > 0 } @mine) > 0,
 		"L3 $leg: an eviction left a past image pending before the rewrite");
-	ok(@spread > 0, "L3 $leg: a rewrite ran during the other member's spread checkpoint")
+	ok(@spread > 0, "L3 $leg: a rewrite ran during the other writer's spread checkpoint")
 	  if $leg eq 'checkpoint';
 	is(scalar(@errors), 0, "L3 $leg: no rewrite ended in an error")
 	  or diag(join("\n", map { "$_->{table}: $_->{rewrite}{error}" } @errors));
@@ -272,7 +276,7 @@ for my $leg ('idle', 'checkpoint')
 for my $k (1 .. TARGETS)
 {
 	my $table = "t437_target$k";
-	for my $i (0 .. 1)
+	for my $i (0 .. $#nodes)
 	{
 		is(sql($nodes[$i], "SELECT v FROM $table WHERE id = 1"), $updates{$table},
 			"L3 node$i reads every committed update of $table");
