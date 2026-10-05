@@ -69,13 +69,17 @@
 #include "port/pg_crc32c.h"
 #include "storage/block.h"
 #include "storage/fd.h"
+#include "storage/sync.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_space_identity.h"
+#include "cluster/cluster_space_reservation.h"
 #include "cluster/storage/cluster_shared_fs.h"
 
 
@@ -648,6 +652,297 @@ done:
 	pfree(parent);
 	errno = durable ? 0 : saved_errno;
 	return durable;
+}
+
+/* Original checkpointer work owns these raw descriptors across ERROR cleanup.
+ * No pointer into a transaction/checkpointer scratch context is retained. */
+typedef struct SharedFsDropWorkFork {
+	int fd;
+	bool absent;
+	bool removed;
+	struct stat identity;
+	char name[64];
+} SharedFsDropWorkFork;
+
+typedef struct SharedFsDropWorkState {
+	bool initialized;
+	bool directory_bound;
+	bool truncated;
+	bool main_synced;
+	bool directory_synced;
+	bool closing;
+	bool durable;
+	bool failed;
+	int directory;
+	uint32 forget_next;
+	uint32 open_next;
+	uint32 unlink_next;
+	uint32 close_next;
+	struct stat directory_identity;
+	ClusterSpaceIdentity identity;
+	uint64 token;
+	uint8 identity_bytes[CLUSTER_SPACE_IDENTITY_BYTES];
+	char parent[MAXPGPATH];
+	SharedFsDropWorkFork forks[MAX_FORKNUM + 1];
+} SharedFsDropWorkState;
+
+Size
+cluster_shared_fs_sharedfs_drop_work_size(void)
+{
+	return sizeof(SharedFsDropWorkState);
+}
+
+/* A known namespace/identity contradiction cannot be retried as new work. */
+static bool
+sharedfs_drop_work_invalid(SharedFsDropWorkState *state)
+{
+	state->failed = true;
+	errno = ESTALE;
+	return false;
+}
+
+static bool
+sharedfs_drop_work_namespace(const ClusterKoDropWorkV2 *work, SharedFsDropWorkState *state)
+{
+	struct stat current;
+	PGIOAlignedBlock page;
+	ClusterSpaceIdentity actual;
+	uint8 bytes[CLUSTER_SPACE_IDENTITY_BYTES];
+	uint64 token;
+	ssize_t nread;
+
+	if (!cluster_ko_shared_drop_work_revalidate_v2(work) || lstat(state->parent, &current) != 0)
+		return false;
+	if (!S_ISDIR(current.st_mode) || !sharedfs_drop_same_file(&state->directory_identity, &current))
+		return sharedfs_drop_work_invalid(state);
+	if (!cluster_ko_shared_drop_work_revalidate_v2(work) || fstat(state->directory, &current) != 0)
+		return false;
+	if (!sharedfs_drop_same_file(&state->directory_identity, &current))
+		return sharedfs_drop_work_invalid(state);
+	for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++) {
+		SharedFsDropWorkFork *f = &state->forks[fork];
+		int result;
+
+		if (!cluster_ko_shared_drop_work_revalidate_v2(work))
+			return false;
+		result = fstatat(state->directory, f->name, &current, AT_SYMLINK_NOFOLLOW);
+		if (f->absent || f->removed) {
+			if (result == 0)
+				return sharedfs_drop_work_invalid(state);
+			if (errno != ENOENT)
+				return false;
+		} else {
+			if (result != 0)
+				return errno == ENOENT ? sharedfs_drop_work_invalid(state) : false;
+			if (!S_ISREG(current.st_mode) || current.st_nlink != 1
+				|| !sharedfs_drop_same_file(&f->identity, &current)
+				|| (fork == MAIN_FORKNUM && state->truncated && current.st_size != 0))
+				return sharedfs_drop_work_invalid(state);
+		}
+		if (f->absent)
+			continue;
+		if (!cluster_ko_shared_drop_work_revalidate_v2(work) || fstat(f->fd, &current) != 0)
+			return false;
+		if (!sharedfs_drop_same_file(&f->identity, &current)
+			|| current.st_nlink != (f->removed ? 0 : 1)
+			|| (fork == MAIN_FORKNUM && state->truncated && current.st_size != 0))
+			return sharedfs_drop_work_invalid(state);
+	}
+	if (!cluster_ko_shared_drop_work_revalidate_v2(work))
+		return false;
+	nread = pread(state->forks[SPACE_FORKNUM].fd, page.data, BLCKSZ, 0);
+	if (nread < 0)
+		return false; /* Including EINTR: the original owner supplies the next tick. */
+	if (nread != BLCKSZ
+		|| !cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
+											   &state->identity.key, &actual, &token)
+		|| token != state->token || !cluster_space_identity_encode(&actual, bytes, sizeof(bytes))
+		|| memcmp(bytes, state->identity_bytes, sizeof(bytes)) != 0)
+		return sharedfs_drop_work_invalid(state);
+	return true;
+}
+
+/* One bounded attempt on the original state. False never clears responsibility;
+ * after all I/O and closes succeed, future attempts perform no pathname I/O. */
+bool
+cluster_shared_fs_sharedfs_drop_work(ClusterKoDropWorkV2 *work)
+{
+	SharedFsDropWorkState *state;
+	ClusterPageWalBindingV1 terminal;
+	ClusterSpaceStructureChange change;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	uint8 identity_bytes[CLUSTER_SPACE_IDENTITY_BYTES];
+
+	state = cluster_ko_shared_drop_work_state_v2(work, sizeof(*state));
+	if (state == NULL || state->failed || !enableFsync
+		|| !cluster_ko_shared_drop_work_read_v2(work, &terminal, wal, sizeof(wal))
+		|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &change)
+		|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
+		|| !RelFileLocatorEquals(change.identity.result.key.locator, terminal.identity.locator)
+		|| change.identity.result.key.system_identifier != terminal.identity.system_identifier
+		|| change.identity.result.key.database_incarnation
+			   != terminal.source.claim.database_incarnation
+		|| memcmp(change.identity.result.key.storage_uuid, terminal.identity.storage_uuid, 16) != 0
+		|| memcmp(change.identity.result.incarnation, terminal.version.segment_incarnation, 16) != 0
+		|| change.identity.result_token != terminal.version.mutation_token
+		|| !cluster_space_identity_encode(&change.identity.result, identity_bytes,
+										  sizeof(identity_bytes)))
+		return false;
+	if (!state->initialized) {
+		for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++) {
+			char *path
+				= cluster_shared_fs_sharedfs_relpath(change.identity.result.key.locator, fork);
+			char *name = strrchr(path, '/');
+			Size parent_bytes = name == NULL ? 0 : name - path;
+			bool fits = name != NULL && parent_bytes > 0 && parent_bytes < sizeof(state->parent)
+						&& strlen(name + 1) < sizeof(state->forks[fork].name);
+
+			if (fits) {
+				memcpy(state->parent, path, parent_bytes);
+				state->parent[parent_bytes] = '\0';
+				strcpy(state->forks[fork].name, name + 1);
+			}
+			pfree(path);
+			if (!fits) {
+				errno = ENAMETOOLONG;
+				return false;
+			}
+			state->forks[fork].fd = -1;
+		}
+		state->directory = -1;
+		state->forget_next = state->unlink_next = MAIN_FORKNUM + 1;
+		state->identity = change.identity.result;
+		state->token = change.identity.result_token;
+		memcpy(state->identity_bytes, identity_bytes, sizeof(identity_bytes));
+		state->initialized = true;
+	} else if (state->token != change.identity.result_token
+			   || memcmp(state->identity_bytes, identity_bytes, sizeof(identity_bytes)) != 0)
+		return sharedfs_drop_work_invalid(state);
+	if (state->durable)
+		return true;
+
+	/* Forget only auxiliary sync requests; MAIN is never queued for reclaim. */
+	for (; state->forget_next <= MAX_FORKNUM; state->forget_next++) {
+		FileTag tag;
+
+		memset(&tag, 0, sizeof(tag));
+		tag.handler = SYNC_HANDLER_CLUSTER_SHARED;
+		tag.rlocator = state->identity.key.locator;
+		tag.forknum = state->forget_next;
+		if (!cluster_ko_shared_drop_work_revalidate_v2(work)
+			|| !RegisterSyncRequest(&tag, SYNC_FORGET_REQUEST, true))
+			return false;
+	}
+	if (!state->closing) {
+		if (state->directory < 0) {
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work) || !AcquireExternalFD())
+				return false;
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work)) {
+				ReleaseExternalFD();
+				return false;
+			}
+			state->directory = open(state->parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | PG_BINARY);
+			if (state->directory < 0) {
+				ReleaseExternalFD();
+				return false;
+			}
+		}
+		if (!state->directory_bound) {
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work)
+				|| fstat(state->directory, &state->directory_identity) != 0)
+				return false;
+			if (!S_ISDIR(state->directory_identity.st_mode))
+				return sharedfs_drop_work_invalid(state);
+			state->directory_bound = true;
+		}
+		for (; state->open_next <= MAX_FORKNUM; state->open_next++) {
+			SharedFsDropWorkFork *f = &state->forks[state->open_next];
+
+			if (f->fd < 0) {
+				if (!cluster_ko_shared_drop_work_revalidate_v2(work) || !AcquireExternalFD())
+					return false;
+				if (!cluster_ko_shared_drop_work_revalidate_v2(work)) {
+					ReleaseExternalFD();
+					return false;
+				}
+				f->fd = openat(state->directory, f->name,
+							   (state->open_next == MAIN_FORKNUM ? O_RDWR : O_RDONLY) | O_NOFOLLOW
+								   | O_NONBLOCK | PG_BINARY);
+				if (f->fd < 0) {
+					int error = errno;
+
+					ReleaseExternalFD();
+					if (error != ENOENT || state->open_next == MAIN_FORKNUM
+						|| state->open_next == SPACE_FORKNUM) {
+						errno = error;
+						return false;
+					}
+					f->absent = true;
+					continue;
+				}
+			}
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work) || fstat(f->fd, &f->identity) != 0)
+				return false;
+			if (!S_ISREG(f->identity.st_mode) || f->identity.st_nlink != 1)
+				return sharedfs_drop_work_invalid(state);
+		}
+		if (!sharedfs_drop_work_namespace(work, state))
+			return false;
+		if (!state->truncated) {
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work)
+				|| ftruncate(state->forks[MAIN_FORKNUM].fd, 0) != 0)
+				return false;
+			state->truncated = true;
+		}
+		if (!state->main_synced) {
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work)
+				|| pg_fsync(state->forks[MAIN_FORKNUM].fd) != 0)
+				return false;
+			state->main_synced = true;
+		}
+		for (; state->unlink_next <= MAX_FORKNUM; state->unlink_next++) {
+			SharedFsDropWorkFork *f = &state->forks[state->unlink_next];
+
+			if (f->absent)
+				continue;
+			if (!sharedfs_drop_work_namespace(work, state)
+				|| !cluster_ko_shared_drop_work_revalidate_v2(work)
+				|| unlinkat(state->directory, f->name, 0) != 0)
+				return false;
+			f->removed = true;
+		}
+		if (!state->directory_synced) {
+			if (!sharedfs_drop_work_namespace(work, state)
+				|| !cluster_ko_shared_drop_work_revalidate_v2(work)
+				|| pg_fsync(state->directory) != 0)
+				return false;
+			state->directory_synced = true;
+		}
+		if (!sharedfs_drop_work_namespace(work, state))
+			return false;
+		state->closing = true;
+	}
+	for (; state->close_next <= MAX_FORKNUM + 1; state->close_next++) {
+		int *fd = state->close_next <= MAX_FORKNUM ? &state->forks[state->close_next].fd
+												   : &state->directory;
+		int result;
+
+		if (*fd < 0)
+			continue;
+		if (!cluster_ko_shared_drop_work_revalidate_v2(work))
+			return false;
+		result = close(*fd);
+		*fd = -1;
+		/* close failure has platform-dependent descriptor ownership. Never
+		 * close that number again or turn an uncertain close into success. */
+		if (result != 0) {
+			state->failed = true;
+			return false;
+		}
+		ReleaseExternalFD();
+	}
+	state->durable = true;
+	return true;
 }
 
 

@@ -186,20 +186,23 @@ UT_TEST(test_normal_actual_prepare_uses_all_original_clean_inputs)
 	}
 }
 
-UT_TEST(test_normal_actual_postjobs_skip_only_classified_normal_target)
+UT_TEST(test_normal_actual_postjobs_exclude_shared_legacy_page_rollback)
 {
-	int state;
-	for (state = 1; state <= 3; state++) {
-		ut_normal_start_setup();
-		startup_boundary_reset();
-		pg_atomic_write_u32(&NormalStartCompletion->state, state);
-		startup_actual_postjobs();
-		UT_ASSERT_EQ(startup_resolve_calls, state == 3 ? 0 : 1);
-		UT_ASSERT_EQ(startup_old_scn_calls, state == 3 ? 0 : 1);
-		UT_ASSERT_EQ(startup_rollback_calls, state == 3 ? 0 : 1);
-		UT_ASSERT_EQ(startup_backup_calls, 1);
-		test_gate_reset();
-	}
+	for (int shared = 0; shared < 2; shared++)
+		for (int state = 1; state <= 3; state++) {
+			ut_normal_start_setup();
+			startup_boundary_reset();
+			cluster_shared_config = shared != 0;
+			pg_atomic_write_u32(&NormalStartCompletion->state, state);
+			startup_actual_postjobs();
+			UT_ASSERT_EQ(startup_resolve_calls, state == 3 ? 0 : 1);
+			UT_ASSERT_EQ(startup_old_scn_calls, state == 3 ? 0 : 1);
+			/* The shared page-version contract never enters this WAL-free
+		 * DELETE cleanout, including SOURCE_ZERO and EXISTING_OTHER. */
+			UT_ASSERT_EQ(startup_rollback_calls, shared || state == 3 ? 0 : 1);
+			UT_ASSERT_EQ(startup_backup_calls, 1);
+			test_gate_reset();
+		}
 }
 
 UT_TEST(test_normal_actual_finish_requires_cf_and_hw_and_keeps_disk_history)

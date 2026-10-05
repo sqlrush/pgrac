@@ -7656,7 +7656,11 @@ StartupXLOG(void)
 	 * fail-closed (MVCC-invisible + vacuum reclaim).  Best-effort cleanout;
 	 * correctness never depends on it.
 	 */
-	if (cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
+	/* Shared recovery uses the typed PAGE/SIDE/undo owners. This optional
+	 * legacy DELETE cleanout is WAL-free and has no page-version edge;
+	 * it must remain unreachable even after typed cold startup is enabled. */
+	if (!cluster_shared_config
+		&& cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
 		cluster_tt_recovery_physical_rollback();
 #endif
 

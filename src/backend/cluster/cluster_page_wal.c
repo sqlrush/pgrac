@@ -614,6 +614,22 @@ cluster_page_wal_capture_native_v1(Buffer buffer, const RfPageVersionEdgeEntryV1
 }
 
 ClusterPageWalCaptureResultV1
+cluster_page_wal_capture_published_v1(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
+									  uint64 result_token, XLogRecPtr end)
+{
+	XLogRecord record;
+	XLogRecPtr start;
+
+	/* The WAL owner, not a PageLSN guess, supplies the exact successful
+	 * record. Another insertion or an unfinished insertion invalidates it. */
+	if (buffer <= 0 || buffer > NBuffers || !XLogGetLastInsertRecord(end, &start, &record)
+		|| PageGetLSN(BufferGetPage(buffer)) != end)
+		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
+	return cluster_page_wal_capture_native_v1(buffer, edge, result_token, start, end, record.xl_crc,
+											  record.xl_rmid, record.xl_info);
+}
+
+ClusterPageWalCaptureResultV1
 cluster_page_wal_capture_space_v1(Buffer buffer, const ClusterSpaceIdentityKey *key,
 								XLogRecPtr end)
 {

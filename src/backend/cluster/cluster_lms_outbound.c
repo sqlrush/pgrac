@@ -88,7 +88,8 @@ typedef struct ClusterLmsOutboundSlot {
 	uint64 local_slot_cookie;
 	uint64 local_own_generation;
 	uint64 local_reservation_token;
-	/* Qualification of an unadmitted local request, never a wire proof. */
+	/* Qualification of an unadmitted frame/request, never a wire proof. */
+	uint64 frame_epoch;
 	uint64 request_membership_generation;
 	uint64 request_stream_generation;
 	uint8 payload[PGRAC_LMS_OUTBOUND_PAYLOAD_MAX];
@@ -96,7 +97,7 @@ typedef struct ClusterLmsOutboundSlot {
 
 StaticAssertDecl(PGRAC_LMS_OUTBOUND_PAYLOAD_MAX >= RESOURCE_X_PROOF_V1_BYTES,
 				 "LMS outbound slot must hold a Resource-X proof ACK");
-StaticAssertDecl(sizeof(ClusterLmsOutboundSlot) == 400,
+StaticAssertDecl(sizeof(ClusterLmsOutboundSlot) == 408,
 				 "LMS outbound slot capability guard layout changed");
 
 typedef struct ClusterLmsZeroBlockReplyWire {
@@ -226,6 +227,8 @@ lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id
 	ClusterLmsOutboundState *ring;
 	LWLock *lock;
 	ClusterLmsOutboundSlot *slot;
+	bool block_request = false;
+	uint64 frame_epoch = 0;
 	uint64 membership_generation = 0;
 	uint64 stream_generation = 0;
 
@@ -261,7 +264,23 @@ lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id
 			if (!cluster_membership_cut_generation_current(membership_generation)
 				|| request.epoch != cluster_epoch_get_current())
 				return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
+			block_request = true;
 		}
+	}
+	/* A plain DATA payload is wrapped only at send time. Keep its original
+	 * execution cut here so a reconnect cannot restamp a retained old frame
+	 * with a later epoch. INITIAL epoch zero is valid within the same cut. */
+	if (!block_request && cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1) {
+		frame_epoch = cluster_epoch_get_current();
+		membership_generation = cluster_membership_cut_generation();
+		if (membership_generation == 0)
+			return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
+		if (dest_node_id < CLUSTER_MAX_NODES)
+			stream_generation
+				= cluster_ic_tier1_resource_x_stream_generation((int32)dest_node_id, worker_id);
+		if (!cluster_membership_cut_generation_current(membership_generation)
+			|| frame_epoch != cluster_epoch_get_current())
+			return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
 	}
 
 	ring = OB_RING(worker_id);
@@ -275,8 +294,9 @@ lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id
 	slot = &ring->ring[ring->head];
 	slot->dest_node_id = dest_node_id;
 	slot->msg_type = msg_type;
-	slot->kind = membership_generation == 0 ? (uint8)CLUSTER_LMS_OUTBOUND_FRAME
-											: (uint8)CLUSTER_LMS_OUTBOUND_BLOCK_REQUEST;
+	slot->kind = block_request ? (uint8)CLUSTER_LMS_OUTBOUND_BLOCK_REQUEST
+							  : (uint8)CLUSTER_LMS_OUTBOUND_FRAME;
+	slot->frame_epoch = frame_epoch;
 	slot->request_membership_generation = membership_generation;
 	slot->request_stream_generation = stream_generation;
 	slot->payload_len = payload_len;
@@ -938,6 +958,29 @@ cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(int worker_id, uint32 de
  * old boot, including a request that never had a DATA stream. These checks
  * qualify a send only; all original serving and receive-side gates remain. */
 static bool
+lms_outbound_frame_current(ClusterLmsOutboundSlot *slot, int worker)
+{
+	uint64 stream;
+
+	if (!cluster_shared_config || cluster_interconnect_tier != CLUSTER_IC_TIER_1)
+		return true;
+	if (slot->dest_node_id >= CLUSTER_MAX_NODES
+		|| slot->frame_epoch != cluster_epoch_get_current()
+		|| !cluster_membership_cut_generation_current(slot->request_membership_generation))
+		return false;
+	stream = cluster_ic_tier1_resource_x_stream_generation((int32)slot->dest_node_id, worker);
+	if ((slot->request_stream_generation != 0 && slot->request_stream_generation != stream)
+		|| slot->frame_epoch != cluster_epoch_get_current()
+		|| !cluster_membership_cut_generation_current(slot->request_membership_generation))
+		return false;
+	/* An unbound first connection may become usable; an observed connection
+	 * loss or replacement may not inherit the old queue entry. */
+	if (stream != 0)
+		slot->request_stream_generation = stream;
+	return true;
+}
+
+static bool
 lms_outbound_block_request_current(ClusterLmsOutboundSlot *slot, int worker, bool *wait_peer)
 {
 	GcsBlockRequestPayload request;
@@ -1217,6 +1260,9 @@ cluster_lms_outbound_drain_send(int worker_id)
 				goto handle_send_result;
 			}
 		}
+		if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_FRAME
+			&& !lms_outbound_frame_current(&slot, worker_id))
+			continue;
 
 		/* A peer that refused a frame this batch keeps its later frames
 		 * queued BEHIND the refused one (per-peer order). */

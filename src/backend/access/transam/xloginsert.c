@@ -788,8 +788,9 @@ XLogInsert(RmgrId rmid, uint8 info)
 			if (edge->block_id >= max_registered_block_id)
 				elog(PANIC, "versioned WAL lost its registered buffer");
 			rb = &registered_buffers[edge->block_id];
-			/* Original private bulk/copy owners retain their own WAL+DATA
-			 * obligations; they are never fabricated as resident buffers. */
+			/* Private bulk/copy owners retain their WAL+DATA obligations.
+			 * A private-WAL/resident publisher binds after installing its
+			 * real bytes, through capture_published, still under content-X. */
 			if (!rb->in_use)
 				elog(PANIC, "versioned WAL lost its registered page");
 			if (rb->page_version_buffer == InvalidBuffer || BufferIsLocal(rb->page_version_buffer))

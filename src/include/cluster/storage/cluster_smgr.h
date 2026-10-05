@@ -96,6 +96,12 @@
 extern void cluster_smgr_init(void);
 extern void cluster_smgr_shutdown(void);
 
+/* Checkpointer: start each bounded scan with cursor=0. True selects one
+ * original work and advances cursor, even when its attempt fails. completed
+ * reports only physical completion accepted by that work, not PI/WAL/MAIN
+ * reclamation. False leaves outputs unchanged; retry on the owner's tick. */
+extern bool cluster_smgr_drop_work_poll(uint32 *cursor, bool *completed);
+
 
 /* ----------
  * smgrsw[] dispatch decision

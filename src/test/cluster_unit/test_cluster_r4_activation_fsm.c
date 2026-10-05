@@ -11399,7 +11399,7 @@ main(void)
 	UT_RUN(test_normal_start_confirmed_new_root_permanently_rejects_old_completion);
 	UT_RUN(test_normal_actual_own_wal_capture_not_peer_control);
 	UT_RUN(test_normal_actual_prepare_uses_all_original_clean_inputs);
-	UT_RUN(test_normal_actual_postjobs_skip_only_classified_normal_target);
+	UT_RUN(test_normal_actual_postjobs_exclude_shared_legacy_page_rollback);
 	UT_RUN(test_normal_actual_finish_requires_cf_and_hw_and_keeps_disk_history);
 	UT_RUN(test_normal_actual_finish_failure_is_fatal_not_ready);
 	UT_RUN(test_01_feature_bit_is_one);

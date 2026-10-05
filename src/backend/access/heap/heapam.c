@@ -111,6 +111,7 @@
 #include "cluster/cluster_itl_touch.h"	/* xact-local touch list */
 #include "cluster/cluster_scn.h"		/* cluster_scn_advance / SCN */
 #include "cluster/cluster_space_storage.h" /* PGRAC: native page-version WAL */
+#include "cluster/cluster_page_wal.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "storage/buf_internals.h"	/* GetBufferDescriptor */
 /* PGRAC (spec-3.4b D5): real UBA encode + xact-local TT binding. */
@@ -13293,8 +13294,12 @@ l_pgrac_reacquire:
 	}
 	else
 	{
-		/* Set a hint that the old page could use prune/defrag */
-		PageSetFull(page);
+		/* Shared pages publish this hint with the final UPDATE version,
+		 * after every authority check and retryable preparation. */
+#ifdef USE_PGRAC_CLUSTER
+		if (!cluster_page_versioned)
+#endif
+			PageSetFull(page);
 	}
 
 	/*
@@ -14475,6 +14480,8 @@ l_pgrac_reacquire:
 	{
 		if (!rf_page_producer_stamp_v1(&cluster_page_versions))
 			elog(PANIC, "heap update page version changed after receipt APPLY");
+		if (newbuf != buffer)
+			PageSetFull(page);
 		if (vm_locked)
 			MarkBufferDirty(vmbuffer);
 		if (vm_locked_new && (!vm_locked || vmbuffer_new != vmbuffer))
@@ -19146,6 +19153,7 @@ heap_inplace_update_and_unlock(Relation relation,
 		&& relation->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
 		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1;
 	RfPageProducerBatchV1 cluster_page_versions;
+	XLogRecPtr cluster_page_recptr = InvalidXLogRecPtr;
 #endif
 
 	Assert(ItemPointerEquals(&oldtup->t_self, &tuple->t_self));
@@ -19268,6 +19276,9 @@ heap_inplace_update_and_unlock(Relation relation,
 		recptr = XLogInsert(RM_HEAP_ID, XLOG_HEAP_INPLACE);
 
 		PageSetLSN(page, recptr);
+#ifdef USE_PGRAC_CLUSTER
+		cluster_page_recptr = recptr;
+#endif
 	}
 
 	memcpy(dst, src, newlen);
@@ -19279,6 +19290,21 @@ heap_inplace_update_and_unlock(Relation relation,
 #endif
 
 	MarkBufferDirty(buffer);
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_page_versioned)
+	{
+		ClusterPageWalCaptureResultV1 capture;
+
+		/* WAL precedes visible catalog bytes; bind only after the actual
+		 * tuple and token are published, before releasing this owner. */
+		capture = cluster_page_wal_capture_published_v1(buffer, &cluster_page_versions.entries[0],
+													 cluster_page_versions.result_token, cluster_page_recptr);
+		if (capture == CLUSTER_PAGE_WAL_INVARIANT_BROKEN
+			|| (capture == CLUSTER_PAGE_WAL_UNATTRIBUTED
+				&& !cluster_page_wal_forget_v1(buffer)))
+			elog(PANIC, "inplace update lost its resident native WAL owner");
+	}
+#endif
 
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 

@@ -647,6 +647,25 @@ cluster_smgr_unlink_committed_drop(RelFileLocator locator)
 	return handled;
 }
 
+/* One selected work per call; a failed physical attempt still advances the
+ * original cursor so it cannot starve other retained DROP obligations. */
+bool
+cluster_smgr_drop_work_poll(uint32 *cursor, bool *completed)
+{
+	ClusterKoDropWorkV2 *work = NULL;
+	const ClusterSharedFsOps *ops = cluster_shared_fs_get_active_ops();
+
+	if (cursor == NULL || completed == NULL || !cluster_shared_config || ops == NULL
+		|| ops->id != CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
+		|| !cluster_ko_shared_drop_work_begin_v2(
+			cursor, cluster_shared_fs_sharedfs_drop_work_size(), &work))
+		return false;
+	*completed = false;
+	if (cluster_shared_fs_sharedfs_drop_work(work))
+		*completed = cluster_ko_shared_drop_work_finish_v2(&work);
+	return true;
+}
+
 void
 cluster_smgr_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
