@@ -111,6 +111,9 @@ BufferDescPadded *BufferDescriptors = descriptors;
 static bool truncate_owner, drop_owner, deleted_all, expecting_error;
 static int reported_level;
 static unsigned relation_flushes, fork_syncs, invalidations, random_calls;
+static unsigned base_buffer_invalidations;
+static bool fail_base_invalidation, low_binding_resident;
+static int fail_base_sync = -1;
 static unsigned shrink_syncs;
 static int fail_shrink_sync = -1;
 static unsigned space_flushes, space_syncs;
@@ -1016,6 +1019,24 @@ FlushRelationBuffers(Relation rel)
 	relation_flushes++;
 }
 void
+DropRelationBuffers(SMgrRelation rel, ForkNumber *forks, int count, BlockNumber *first)
+{
+	UT_ASSERT(truncate_owner && !drop_owner && rel == &storage);
+	UT_ASSERT_EQ(count, 2);
+	UT_ASSERT_EQ(forks[0], MAIN_FORKNUM);
+	UT_ASSERT_EQ(forks[1], VISIBILITYMAP_FORKNUM);
+	UT_ASSERT_EQ(first[0] | first[1], 0);
+	UT_ASSERT_EQ(relation_flushes, 1);
+	UT_ASSERT_EQ(fork_syncs, auxiliary_forks ? 4 : 2);
+	UT_ASSERT_EQ(locked | pinned | CritSectionCount | MyProc->delayChkptFlags, 0);
+	UT_ASSERT_EQ(wal_calls + dirty_calls + truncate_calls, 0);
+	UT_ASSERT_EQ(random_calls, 1); /* Only the original CREATE UUID. */
+	base_buffer_invalidations++;
+	if (fail_base_invalidation)
+		pg_re_throw();
+	low_binding_resident = false;
+}
+void
 FlushOneBuffer(Buffer buffer)
 {
 	UT_ASSERT(truncate_owner && buffer >= 1 && buffer <= 2);
@@ -1122,8 +1143,11 @@ smgrimmedsync(SMgrRelation rel, ForkNumber fork)
 		shrink_syncs++;
 		if ((int)fork == fail_shrink_sync)
 			pg_re_throw();
-	} else
+	} else {
 		UT_ASSERT_EQ(locked, 0);
+		if ((int)fork == fail_base_sync)
+			pg_re_throw();
+	}
 	fork_syncs++;
 }
 bool
@@ -1166,6 +1190,9 @@ reset(void)
 	truncate_owner = drop_owner = deleted_all = expecting_error = false;
 	reported_level = 0;
 	relation_flushes = fork_syncs = invalidations = random_calls = 0;
+	base_buffer_invalidations = 0;
+	fail_base_invalidation = low_binding_resident = false;
+	fail_base_sync = -1;
 	shrink_syncs = 0;
 	fail_shrink_sync = -1;
 	space_flushes = space_syncs = 0;
@@ -2147,6 +2174,54 @@ UT_TEST(test_native_truncate_logs_pair_after_durable_base_before_publish)
 	FreeFakeRelcacheEntry(rel);
 }
 
+UT_TEST(test_native_truncate_drains_surviving_origin_bindings_before_new_incarnation)
+{
+	for (unsigned auxiliary = 0; auxiliary < 2; auxiliary++) {
+		Relation rel = native_truncate_relation();
+		auxiliary_forks = auxiliary != 0;
+		low_binding_resident = true;
+		RelationTruncate(rel, 4);
+		UT_ASSERT_EQ(base_buffer_invalidations, 1);
+		UT_ASSERT(!low_binding_resident);
+		UT_ASSERT_EQ(main_blocks, 4);
+		UT_ASSERT_EQ(truncate_observations, 1);
+		UT_ASSERT_EQ(locked | pinned | CritSectionCount, 0);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_native_truncate_failed_origin_drain_refuses_before_structural_change)
+{
+	for (int stage = 0; stage < 5; stage++) {
+		Relation rel = native_truncate_relation();
+		PGAlignedBlock before[2];
+		volatile bool caught = false;
+		auxiliary_forks = low_binding_resident = true;
+		/* The four base forks, then the actual buffer invalidation. */
+		fail_base_sync = stage < 3 ? stage : stage == 3 ? SPACE_FORKNUM : -1;
+		fail_base_invalidation = stage == 4;
+		memcpy(before, pages, sizeof(before));
+		PG_TRY();
+		{
+			RelationTruncate(rel, 4);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(base_buffer_invalidations, stage == 4 ? 1 : 0);
+		UT_ASSERT(low_binding_resident);
+		UT_ASSERT_EQ(wal_calls + dirty_calls + truncate_calls, 0);
+		UT_ASSERT_EQ(random_calls, 1);
+		UT_ASSERT_EQ(locked | pinned | CritSectionCount | MyProc->delayChkptFlags, 0);
+		UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+		UT_ASSERT_EQ(main_blocks, 10);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
 UT_TEST(test_native_truncate_bad_pair_refuses_before_physical_change)
 {
 	Relation rel = native_truncate_relation();
@@ -2366,6 +2441,7 @@ UT_TEST(test_native_truncate_without_shared_space_keeps_original_sync_policy)
 		RelationTruncate(rel, 4);
 		UT_ASSERT_EQ(wal_info, XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
 		UT_ASSERT_EQ(shrink_syncs + fork_syncs + relation_flushes, 0);
+		UT_ASSERT_EQ(base_buffer_invalidations, 0);
 		UT_ASSERT_EQ(truncate_calls, 1);
 		UT_ASSERT_EQ(flush_calls, 1);
 		UT_ASSERT_EQ(main_blocks, 4);
@@ -3149,7 +3225,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(64);
+	UT_PLAN(66);
 	UT_RUN(test_maintenance_identity_uses_current_owner_without_backend_id);
 	UT_RUN(test_maintenance_identity_retry_keeps_work_and_releases_pin);
 	UT_RUN(test_maintenance_identity_preserves_namespace_and_live_page_checks);
@@ -3197,6 +3273,8 @@ main(void)
 	UT_RUN(test_private_owner_requires_exact_range_and_releases_hw);
 	UT_RUN(test_private_owner_releases_hw_on_wal_flush_error);
 	UT_RUN(test_native_truncate_logs_pair_after_durable_base_before_publish);
+	UT_RUN(test_native_truncate_drains_surviving_origin_bindings_before_new_incarnation);
+	UT_RUN(test_native_truncate_failed_origin_drain_refuses_before_structural_change);
 	UT_RUN(test_truncate_lost_original_ko_refuses_before_structural_change);
 	UT_RUN(test_drop_missing_or_replaced_original_ko_refuses_before_structural_change);
 	UT_RUN(test_native_truncate_bad_pair_refuses_before_physical_change);

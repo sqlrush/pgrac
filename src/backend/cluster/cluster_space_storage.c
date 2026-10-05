@@ -877,6 +877,17 @@ cluster_space_truncate_prepare(Relation rel, BlockNumber nblocks)
 		if (smgrexists(smgr, fork))
 			smgrimmedsync(smgr, fork);
 	}
+	/* End the origin's old MAIN/VM carriers, including surviving low
+	 * blocks, before changing the incarnation. A clean cached-X still has
+	 * its latest WAL binding and could otherwise create old PI on a later
+	 * handoff. The original eviction keeps any logical PI responsibility;
+	 * failure leaves the structural pages and files unchanged. */
+	{
+		ForkNumber forks[] = { MAIN_FORKNUM, VISIBILITYMAP_FORKNUM };
+		BlockNumber first[] = { 0, 0 };
+		smgr = smgropen(expected.locator, InvalidBackendId);
+		DropRelationBuffers(smgr, forks, lengthof(forks), first);
+	}
 	state = space_structure_prepare(&expected, CLUSTER_SPACE_WAL_TRUNCATE, nblocks);
 	if (state != NULL)
 		state->base_synced = true;
