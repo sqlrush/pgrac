@@ -697,14 +697,6 @@ cluster_shared_fs_sharedfs_drop_work_size(void)
 	return sizeof(SharedFsDropWorkState);
 }
 
-bool
-cluster_shared_fs_sharedfs_drop_work_failed(const ClusterKoDropWorkV2 *work)
-{
-	const SharedFsDropWorkState *state = cluster_ko_shared_drop_work_state_v2(work, sizeof(*state));
-
-	return state != NULL && state->failed;
-}
-
 /* The original owner may dispose its descriptors after losing the execution
  * cut. Abandon never clears shared WAL/structure responsibility or completes
  * the work. An uncertain close must not later close a reused descriptor. */
@@ -842,16 +834,14 @@ sharedfs_drop_work_namespace(const ClusterKoDropWorkV2 *work, SharedFsDropWorkSt
 
 /* One bounded attempt on the original state. False never clears responsibility;
  * after all I/O and closes succeed, future attempts perform no pathname I/O. */
-bool
-cluster_shared_fs_sharedfs_drop_work(ClusterKoDropWorkV2 *work)
+static bool
+sharedfs_drop_work_attempt(ClusterKoDropWorkV2 *work, SharedFsDropWorkState *state)
 {
-	SharedFsDropWorkState *state;
 	ClusterPageWalBindingV1 terminal;
 	ClusterSpaceStructureChange change;
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	uint8 identity_bytes[CLUSTER_SPACE_IDENTITY_BYTES];
 
-	state = cluster_ko_shared_drop_work_state_v2(work, sizeof(*state));
 	if (state == NULL || state->failed || !enableFsync
 		|| !cluster_ko_shared_drop_work_read_v2(work, &terminal, wal, sizeof(wal))
 		|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &change)
@@ -1039,6 +1029,27 @@ cluster_shared_fs_sharedfs_drop_work(ClusterKoDropWorkV2 *work)
 	}
 	state->durable = true;
 	return true;
+}
+
+bool
+cluster_shared_fs_sharedfs_drop_work(ClusterKoDropWorkV2 *work, bool *failed)
+{
+	SharedFsDropWorkState *state;
+	bool completed;
+
+	if (failed == NULL)
+		return false;
+	*failed = false;
+	state = cluster_ko_shared_drop_work_state_v2(work, sizeof(*state));
+	if (state == NULL)
+		return false;
+	completed = sharedfs_drop_work_attempt(work, state);
+	/* This original state was authenticated before the attempt. Once an I/O
+	 * failure is known, a subsequent unavailable execution cut cannot hide
+	 * it from the original owner's cleanup-only abandon boundary. This is
+	 * never new permission to mutate storage or finish the obligation. */
+	*failed = state->failed;
+	return completed;
 }
 
 

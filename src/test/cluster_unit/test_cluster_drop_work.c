@@ -480,7 +480,8 @@ UT_TEST(test_failed_sync_abandons_original_fds_and_requires_recovery)
 		uint32 cursor;
 		bool completed = true;
 		unsigned io;
-		if (!work_setup(directory ? "abandon_directory" : "abandon_main")) return;
+		if (!work_setup(directory ? "abandon_directory" : "abandon_main"))
+			return;
 		baseline = descriptor_count();
 		work_fault = directory ? WORK_DIR_SYNC : WORK_MAIN_SYNC;
 		UT_ASSERT(!poll_work());
@@ -506,7 +507,8 @@ UT_TEST(test_replaced_cut_cleanup_closes_each_original_fd_once)
 	bool completed = true;
 	unsigned io;
 	int baseline;
-	if (!work_setup("abandon_cut")) return;
+	if (!work_setup("abandon_cut"))
+		return;
 	baseline = descriptor_count();
 	work_fault = WORK_PARTIAL;
 	UT_ASSERT(!poll_work());
@@ -528,13 +530,14 @@ UT_TEST(test_replaced_cut_cleanup_closes_each_original_fd_once)
 
 UT_TEST(test_known_failure_is_not_hidden_by_unavailable_formation)
 {
-	const enum WorkFault faults[] = {WORK_MAIN_SYNC, WORK_DIR_SYNC, WORK_CLOSE};
+	const enum WorkFault faults[] = { WORK_MAIN_SYNC, WORK_DIR_SYNC, WORK_CLOSE };
 	for (unsigned failure = 0; failure < lengthof(faults); failure++) {
 		char name[64];
 		unsigned io;
 		int baseline;
 		snprintf(name, sizeof(name), "failed_then_unknown_%u", failure);
-		if (!work_setup(name)) return;
+		if (!work_setup(name))
+			return;
 		baseline = descriptor_count();
 		work_fault = faults[failure];
 		work_unknown_on_failure = true;
@@ -564,8 +567,8 @@ append_promoted_work(void)
 	ClusterPageWalBindingV1 terminal = storage.contexts[work_slot].terminal;
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 
-	UT_ASSERT(cluster_space_structure_wal_decode(storage.contexts[work_slot].structure,
-												 sizeof(wal), &change));
+	UT_ASSERT(cluster_space_structure_wal_decode(storage.contexts[work_slot].structure, sizeof(wal),
+												 &change));
 	MyBackendType = B_BACKEND;
 	multiple_barriers = true;
 	allocated_batch = last_shared_request.batch_id;
@@ -595,14 +598,15 @@ append_promoted_work(void)
 static void
 full_work_table_cleanup(bool healthy)
 {
-	ClusterKoDropWorkV2 *works[CLUSTER_KO_SHARED_CAPACITY] = {0};
+	ClusterKoDropWorkV2 *works[CLUSTER_KO_SHARED_CAPACITY] = { 0 };
 	ClusterKoSharedContext retained[CLUSTER_KO_SHARED_CAPACITY];
 	uint32 slots[CLUSTER_KO_SHARED_CAPACITY], cursor;
 	unsigned held, completed_count = 0;
 	int baseline;
 	const unsigned retired = CLUSTER_KO_SHARED_CAPACITY - (healthy ? 1 : 0);
 
-	if (!work_setup(healthy ? "full_healthy" : "full_replaced")) return;
+	if (!work_setup(healthy ? "full_healthy" : "full_replaced"))
+		return;
 	baseline = descriptor_count();
 	slots[0] = work_slot;
 	for (unsigned i = 1; i < CLUSTER_KO_SHARED_CAPACITY; i++)
@@ -611,11 +615,13 @@ full_work_table_cleanup(bool healthy)
 	external_fd_limit = 8 * (MAX_FORKNUM + 2);
 	work_fault = WORK_AUX;
 	for (unsigned i = 0; i < retired; i++) {
+		bool failed = true;
 		cursor = slots[i];
 		UT_ASSERT(cluster_ko_shared_drop_work_begin_v2(
 			&cursor, cluster_shared_fs_sharedfs_drop_work_size(), &works[i]));
 		unlinks = main_syncs = 0;
-		UT_ASSERT(!cluster_shared_fs_sharedfs_drop_work(works[i]));
+		UT_ASSERT(!cluster_shared_fs_sharedfs_drop_work(works[i], &failed));
+		UT_ASSERT(!failed);
 		retained[i] = storage.contexts[slots[i]];
 	}
 	held = external_fds;
@@ -626,7 +632,8 @@ full_work_table_cleanup(bool healthy)
 		 * All positive handoffs and the final healthy work remain native. */
 		for (unsigned i = 0; i < retired; i++)
 			UT_ASSERT(cluster_ko_shared_drop_work_abandon_v2(
-				works[i], cluster_shared_fs_sharedfs_drop_work_size()) != NULL);
+						  works[i], cluster_shared_fs_sharedfs_drop_work_size())
+					  != NULL);
 	} else
 		current_epoch++;
 	work_fault = WORK_OK;
@@ -683,7 +690,8 @@ UT_TEST(test_unknown_cut_and_wrong_owner_cannot_dispose_retryable_fds)
 	uint64 epoch, boot;
 	ResourceOwner owner;
 	unsigned io;
-	if (!work_setup("cleanup_polarity")) return;
+	if (!work_setup("cleanup_polarity"))
+		return;
 	work_fault = WORK_PARTIAL;
 	UT_ASSERT(!poll_work());
 	epoch = current_epoch;

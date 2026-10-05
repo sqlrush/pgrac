@@ -660,6 +660,7 @@ cluster_smgr_drop_work_poll(uint32 *cursor, bool *completed)
 	static uint32 abandon_cursor;
 	ClusterKoDropWorkV2 *work = NULL;
 	const ClusterSharedFsOps *ops = cluster_shared_fs_get_active_ops();
+	bool failed;
 
 	if (cursor == NULL || completed == NULL || !cluster_shared_config || ops == NULL
 		|| ops->id != CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS)
@@ -677,9 +678,9 @@ cluster_smgr_drop_work_poll(uint32 *cursor, bool *completed)
 											  &work))
 		return false;
 	*completed = false;
-	if (cluster_shared_fs_sharedfs_drop_work(work))
+	if (cluster_shared_fs_sharedfs_drop_work(work, &failed))
 		*completed = cluster_ko_shared_drop_work_finish_v2(&work);
-	else if (cluster_shared_fs_sharedfs_drop_work_failed(work))
+	else if (failed)
 		cluster_shared_fs_sharedfs_drop_work_abandon(work);
 	return true;
 }

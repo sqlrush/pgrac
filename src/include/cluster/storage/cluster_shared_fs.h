@@ -372,8 +372,8 @@ extern bool cluster_shared_fs_sharedfs_drop_durable(const struct ClusterSpaceIde
  * A successful physical attempt keeps MAIN and grants no reuse authority. */
 struct ClusterKoDropWorkV2;
 extern Size cluster_shared_fs_sharedfs_drop_work_size(void);
-extern bool cluster_shared_fs_sharedfs_drop_work(struct ClusterKoDropWorkV2 *work);
-extern bool cluster_shared_fs_sharedfs_drop_work_failed(const struct ClusterKoDropWorkV2 *work);
+/* A known failed attempt permits only original-owner cleanup, never finish. */
+extern bool cluster_shared_fs_sharedfs_drop_work(struct ClusterKoDropWorkV2 *work, bool *failed);
 extern void cluster_shared_fs_sharedfs_drop_work_abandon(struct ClusterKoDropWorkV2 *work);
 
 /*
