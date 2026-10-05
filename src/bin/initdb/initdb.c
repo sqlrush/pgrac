@@ -3399,8 +3399,8 @@ pgrac_hw_check_entries(int fd, const char *allowed)
 	if (copy < 0 || (dir = fdopendir(copy)) == NULL)
 		pg_fatal("HW_ROOT_IO: cannot enumerate shared directory: %m");
 	rewinddir(dir);
-	errno = 0;
-	while ((entry = readdir(dir)) != NULL) {
+	/* A successful readdir may leave errno set; reset it before each call. */
+	while (errno = 0, (entry = readdir(dir)) != NULL) {
 		if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0
 			&& (allowed == NULL || strcmp(entry->d_name, allowed) != 0))
 			pg_fatal("HW_ROOT_NOT_EMPTY: unexpected shared directory entry \"%s\"", entry->d_name);
@@ -4210,8 +4210,7 @@ pgrac_wal_state_check_root_entries(const char *thread_name, bool allow_registry)
 	if (dir == NULL)
 		pg_fatal("could not open pgrac WAL state root \"%s\": %m", pgrac_wal_state_root);
 
-	errno = 0;
-	while ((entry = readdir(dir)) != NULL)
+	while (errno = 0, (entry = readdir(dir)) != NULL)
 	{
 		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0
 			|| strcmp(entry->d_name, thread_name) == 0

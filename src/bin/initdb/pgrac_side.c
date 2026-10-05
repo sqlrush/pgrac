@@ -92,8 +92,7 @@ collect(int dirs[7], SideFile *files, unsigned *count)
 		if (fd < 0) return false;
 		stream = fdopendir(fd);
 		if (stream == NULL) { close(fd); return false; }
-		errno = 0;
-		while ((entry = readdir(stream)) != NULL)
+		while (errno = 0, (entry = readdir(stream)) != NULL)
 		{
 			SideFile *file;
 			if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)

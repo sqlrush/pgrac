@@ -83,8 +83,7 @@ database_set_exact(int base)
 	if (fd < 0) return false;
 	stream = fdopendir(fd);
 	if (stream == NULL) { close(fd); return false; }
-	errno = 0;
-	while ((entry = readdir(stream)) != NULL)
+	while (errno = 0, (entry = readdir(stream)) != NULL)
 	{
 		bool recognized = false;
 		if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
