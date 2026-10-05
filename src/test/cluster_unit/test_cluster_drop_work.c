@@ -507,6 +507,167 @@ UT_TEST(test_replaced_cut_cleanup_closes_each_original_fd_once)
 	assert_recovery_required();
 }
 
+/* Populate each slot through the original backend handoff and promotion. */
+static uint32
+append_promoted_work(void)
+{
+	ClusterKoCompletionV2 *owner = NULL;
+	ClusterSpaceStructureChange change;
+	ClusterPageWalBindingV1 terminal = storage.contexts[work_slot].terminal;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+
+	UT_ASSERT(cluster_space_structure_wal_decode(storage.contexts[work_slot].structure,
+												 sizeof(wal), &change));
+	MyBackendType = B_BACKEND;
+	multiple_barriers = true;
+	allocated_batch = last_shared_request.batch_id;
+	space_identity.key.locator.relNumber++;
+	cluster_ko_flush_and_wait_ack(space_identity.key.locator, RELPERSISTENCE_PERMANENT);
+	UT_ASSERT(cluster_ko_shared_claim_v2(&space_identity.key, space_identity.incarnation, &owner));
+	change.identity.expected.key.locator = change.identity.result.key.locator
+		= space_identity.key.locator;
+	change.reservation.before.identity.key.locator = change.reservation.result.identity.key.locator
+		= space_identity.key.locator;
+	terminal.identity.locator = space_identity.key.locator;
+	UT_ASSERT(cluster_space_structure_wal_encode(&change, wal, sizeof(wal)));
+	UT_ASSERT(cluster_ko_shared_observe_space_v2(owner, &terminal, wal, sizeof(wal)));
+	xact_callback(XACT_EVENT_COMMIT, NULL);
+	UT_ASSERT(cluster_ko_shared_native_handoff_v2(&owner));
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
+	prepare_files(&change);
+	for (uint32 slot = 0; slot < CLUSTER_KO_SHARED_CAPACITY; slot++)
+		if (storage.contexts[slot].structure_drop_pending
+			&& RelFileLocatorEquals(storage.contexts[slot].terminal.identity.locator,
+									space_identity.key.locator))
+			return slot;
+	abort();
+}
+
+static void
+full_work_table_cleanup(bool healthy)
+{
+	ClusterKoDropWorkV2 *works[CLUSTER_KO_SHARED_CAPACITY] = {0};
+	ClusterKoSharedContext retained[CLUSTER_KO_SHARED_CAPACITY];
+	uint32 slots[CLUSTER_KO_SHARED_CAPACITY], cursor;
+	unsigned held, completed_count = 0;
+	int baseline;
+	const unsigned retired = CLUSTER_KO_SHARED_CAPACITY - (healthy ? 1 : 0);
+
+	if (!work_setup(healthy ? "full_healthy" : "full_replaced")) return;
+	baseline = descriptor_count();
+	slots[0] = work_slot;
+	for (unsigned i = 1; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+		slots[i] = append_promoted_work();
+	/* Model ExternalFD pressure without changing the process/OS fd limit. */
+	external_fd_limit = 8 * (MAX_FORKNUM + 2);
+	work_fault = WORK_AUX;
+	for (unsigned i = 0; i < retired; i++) {
+		cursor = slots[i];
+		UT_ASSERT(cluster_ko_shared_drop_work_begin_v2(
+			&cursor, cluster_shared_fs_sharedfs_drop_work_size(), &works[i]));
+		unlinks = main_syncs = 0;
+		UT_ASSERT(!cluster_shared_fs_sharedfs_drop_work(works[i]));
+		retained[i] = storage.contexts[slots[i]];
+	}
+	held = external_fds;
+	UT_ASSERT_EQ(held, external_fd_limit);
+	UT_ASSERT_EQ(descriptor_count(), baseline + held);
+	if (healthy) {
+		/* The original owner may abandon, but that API does not close fds.
+		 * All positive handoffs and the final healthy work remain native. */
+		for (unsigned i = 0; i < retired; i++)
+			UT_ASSERT(cluster_ko_shared_drop_work_abandon_v2(
+				works[i], cluster_shared_fs_sharedfs_drop_work_size()) != NULL);
+	} else
+		current_epoch++;
+	work_fault = WORK_OK;
+	opens = truncates = main_syncs = dir_syncs = unlinks = closes = 0;
+	cursor = 0;
+	for (unsigned tick = 0; tick <= CLUSTER_KO_SHARED_CAPACITY; tick++) {
+		bool completed = true;
+		unsigned old_closes = closes;
+		uint32 old_cursor = cursor;
+		if (cluster_smgr_drop_work_poll(&cursor, &completed)) {
+			UT_ASSERT(healthy);
+			UT_ASSERT_EQ(cursor, slots[retired] + 1);
+			completed_count += completed ? 1 : 0;
+		} else {
+			UT_ASSERT_EQ(cursor, old_cursor);
+			UT_ASSERT(completed);
+			cursor = 0; /* Original native caller's wrap, not the cleanup cursor. */
+		}
+		UT_ASSERT(closes - old_closes <= 2 * (MAX_FORKNUM + 2));
+	}
+	UT_ASSERT_EQ(completed_count, healthy ? 1 : 0);
+	UT_ASSERT_EQ(external_fds, 0);
+	UT_ASSERT_EQ(descriptor_count(), baseline);
+	UT_ASSERT_EQ(closes, held + (healthy ? MAX_FORKNUM + 2 : 0));
+	UT_ASSERT_EQ(opens, healthy ? MAX_FORKNUM + 2 : 0);
+	UT_ASSERT_EQ(truncates, healthy ? 1 : 0);
+	UT_ASSERT_EQ(main_syncs, healthy ? 1 : 0);
+	UT_ASSERT_EQ(dir_syncs, healthy ? 1 : 0);
+	UT_ASSERT_EQ(unlinks, healthy ? MAX_FORKNUM : 0);
+	for (unsigned i = 0; i < retired; i++) {
+		retained[i].structure_drop_failed = true;
+		UT_ASSERT(memcmp(&retained[i], &storage.contexts[slots[i]], sizeof(retained[i])) == 0);
+		UT_ASSERT(!cluster_ko_shared_drop_work_finish_v2(&works[i]));
+	}
+	if (healthy)
+		UT_ASSERT(!storage.contexts[slots[retired]].structure_drop_pending);
+	else
+		current_epoch--;
+	assert_recovery_required();
+}
+
+UT_TEST(test_full_replaced_work_table_returns_descriptor_credits)
+{
+	full_work_table_cleanup(false);
+}
+
+UT_TEST(test_abandoned_work_scan_does_not_starve_healthy_work)
+{
+	full_work_table_cleanup(true);
+}
+
+UT_TEST(test_unknown_cut_and_wrong_owner_cannot_dispose_retryable_fds)
+{
+	uint64 epoch, boot;
+	ResourceOwner owner;
+	unsigned io;
+	if (!work_setup("cleanup_polarity")) return;
+	work_fault = WORK_PARTIAL;
+	UT_ASSERT(!poll_work());
+	epoch = current_epoch;
+	boot = formation.membership.last_admitted_incarnation[0];
+	owner = CurrentResourceOwner;
+	io = opens + truncates + main_syncs + dir_syncs + unlinks;
+	for (unsigned unknown = 0; unknown < 4; unknown++) {
+		capture_ok = unknown != 0;
+		current_epoch = unknown == 1 ? 0 : unknown == 3 ? epoch + 1 : epoch;
+		formation.membership.last_admitted_incarnation[0] = unknown == 2 ? 0 : boot;
+		CurrentResourceOwner = unknown == 3 ? (ResourceOwner)2 : owner;
+		for (unsigned tick = 0; tick <= CLUSTER_KO_SHARED_CAPACITY; tick++) {
+			uint32 cursor = work_slot;
+			bool completed = true;
+			UT_ASSERT(!cluster_smgr_drop_work_poll(&cursor, &completed));
+			UT_ASSERT_EQ(cursor, work_slot);
+			UT_ASSERT(completed);
+		}
+		UT_ASSERT_EQ(closes, 0);
+		UT_ASSERT_EQ(external_fds, MAX_FORKNUM + 2);
+		UT_ASSERT_EQ(opens + truncates + main_syncs + dir_syncs + unlinks, io);
+		UT_ASSERT(!storage.contexts[work_slot].structure_drop_failed);
+	}
+	capture_ok = true;
+	current_epoch = epoch;
+	formation.membership.last_admitted_incarnation[0] = boot;
+	CurrentResourceOwner = owner;
+	work_fault = WORK_OK;
+	UT_ASSERT(poll_work());
+	assert_finished();
+}
+
 UT_TEST(test_native_commit_and_real_smgr_defer_io_to_original_work)
 {
 	for (unsigned stale = 0; stale < 2; stale++)
@@ -959,9 +1120,12 @@ UT_TEST(test_work_executor_process_exit_does_not_redo_partial_io)
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(27);
 	UT_RUN(test_failed_sync_abandons_original_fds_and_requires_recovery);
 	UT_RUN(test_replaced_cut_cleanup_closes_each_original_fd_once);
+	UT_RUN(test_full_replaced_work_table_returns_descriptor_credits);
+	UT_RUN(test_abandoned_work_scan_does_not_starve_healthy_work);
+	UT_RUN(test_unknown_cut_and_wrong_owner_cannot_dispose_retryable_fds);
 	UT_RUN(test_native_commit_and_real_smgr_defer_io_to_original_work);
 	UT_RUN(test_native_checkpointer_poll_has_bounded_visible_failure_and_retry);
 	printf("# retained storage state: %zu bytes per original work\n",
