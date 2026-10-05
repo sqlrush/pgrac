@@ -5,6 +5,7 @@
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -506,6 +507,20 @@ page_wal_first_capture(int buf_id, const ClusterPageWalBindingV1 *value, uint16 
 	pg_atomic_write_u64(&first_lsns[buf_id], value->record_start);
 }
 
+/*
+ * A record this capture cannot attribute (no current writer, or no source
+ * slot) still made the page dirty.  Publish its LSN as an unattributed first
+ * record unless the page already has one, so the floor cannot pass it; an
+ * existing first record is never raised.
+ */
+static void
+page_wal_first_mark_unattributed(int buf_id, XLogRecPtr start)
+{
+	if (firsts[buf_id].source_flags != 0 || pg_atomic_read_u64(&first_lsns[buf_id]) != 0)
+		return;
+	pg_atomic_write_u64(&first_lsns[buf_id], start);
+}
+
 static ClusterPageWalCaptureResultV1
 page_wal_capture_native(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
 						uint64 result_token, XLogRecPtr start, XLogRecPtr end,
@@ -543,8 +558,10 @@ page_wal_capture_native(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
 	if (!rf_page_version_present_v1(&value.version) || PageIsNew(page)
 		|| ((PageHeader)page)->pd_block_scn != result_token)
 		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
-	if (!cluster_wal_thread_current_v2_ref(&value.source))
+	if (!cluster_wal_thread_current_v2_ref(&value.source)) {
+		page_wal_first_mark_unattributed(buffer - 1, start);
 		return CLUSTER_PAGE_WAL_UNATTRIBUTED;
+	}
 	if (value.source.claim.database_incarnation == 0 || value.source.timeline == 0
 		|| value.source.claim.identity.origin_thread_id == 0
 		|| value.source.claim.identity.origin_thread_id > PGRAC_PAGE_LSN_ORIGIN_MAX + 1)
@@ -583,8 +600,10 @@ page_wal_capture_native(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
 		source = old_source; /* ordinary same-writer hot path needs no pool lock */
 	else {
 		source = page_wal_source_acquire(&value.source);
-		if (source == 0)
+		if (source == 0) {
+			page_wal_first_mark_unattributed(buffer - 1, start);
 			return CLUSTER_PAGE_WAL_UNATTRIBUTED;
+		}
 		if (!page_wal_source_release(old_source)) {
 			(void)page_wal_source_release(source);
 			return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
@@ -742,8 +761,11 @@ cluster_page_wal_first_observe_locked_v1(BufferDesc *buf, ClusterPageWalRefV1 *o
 		return CLUSTER_PAGE_WAL_FIRST_INVALID;
 	if (!page_wal_first_present_locked(buf))
 		return CLUSTER_PAGE_WAL_FIRST_ABSENT;
-	if (firsts[buf->buf_id].source_flags == 0)
+	if (firsts[buf->buf_id].source_flags == 0) {
+		/* Only the LSN of an unattributed first record is known. */
+		out->start = pg_atomic_read_u64(&first_lsns[buf->buf_id]);
 		return CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED;
+	}
 	*out = firsts[buf->buf_id];
 	return CLUSTER_PAGE_WAL_FIRST_PRESENT;
 }
@@ -767,19 +789,28 @@ cluster_page_wal_first_clear_written_locked_v1(BufferDesc *buf, const ClusterPag
 											   uint64 written_token)
 {
 	uint32 state;
-	if (observed == NULL || !page_wal_first_present_locked(buf)
-		|| memcmp(&firsts[buf->buf_id], observed, sizeof(*observed)) != 0)
+	bool unattributed;
+	if (observed == NULL || !page_wal_first_present_locked(buf))
+		return false;
+	/* An unattributed first record is known by its LSN alone; it was
+	 * observed before this write began, so the write includes it. */
+	unattributed = observed->source_flags == 0;
+	if (unattributed ? firsts[buf->buf_id].source_flags != 0 || observed->start == InvalidXLogRecPtr
+						   || pg_atomic_read_u64(&first_lsns[buf->buf_id]) != observed->start
+					 : memcmp(&firsts[buf->buf_id], observed, sizeof(*observed)) != 0)
 		return false;
 	state = pg_atomic_read_u32(&buf->state);
 	/* A page still (or again) dirty, invalid, or written below its first
-	 * record keeps it; a conservative keep only delays the floor. */
+	 * record (in SCN total order) keeps it; a conservative keep only delays
+	 * the floor. */
 	if ((state & (BM_VALID | BM_TAG_VALID)) != (BM_VALID | BM_TAG_VALID)
 		|| (state & (BM_DIRTY | BM_JUST_DIRTIED | BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0
-		|| observed->source_flags == 0 || written_token < observed->token)
+		|| (!unattributed && scn_total_cmp(written_token, observed->token) < 0))
 		return false;
 	pg_atomic_write_u64(&first_lsns[buf->buf_id], 0);
 	pg_write_barrier();
-	if (!page_wal_source_release(firsts[buf->buf_id].source_flags & PAGE_WAL_SOURCE_MASK))
+	if (!unattributed
+		&& !page_wal_source_release(firsts[buf->buf_id].source_flags & PAGE_WAL_SOURCE_MASK))
 		elog(PANIC, "page WAL first record lost its source owner");
 	memset(&firsts[buf->buf_id], 0, sizeof(PageWalSlot));
 	return true;

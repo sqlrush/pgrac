@@ -179,7 +179,9 @@ cluster_page_wal_first_retain_locked_v1(struct BufferDesc *buf, ClusterPageWalRe
 /* The write owner, after TerminateBufferIO(true) and still under content
  * SHARE: clears the first record observed before the write only when the
  * page is clean now, the slot is unchanged and the written version covers
- * it.  False keeps it (re-dirtied, drifted or failed). */
+ * it in SCN total order.  An unattributed first record (observed with only
+ * its LSN) is cleared when it is still that LSN.  False keeps it
+ * (re-dirtied, drifted or failed). */
 extern bool cluster_page_wal_first_clear_written_locked_v1(struct BufferDesc *buf,
 														   const ClusterPageWalRefV1 *observed,
 														   uint64 written_token);

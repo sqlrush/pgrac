@@ -193,6 +193,17 @@ XLogFlush(XLogRecPtr lsn)
 	if (flush_changes_source)
 		writer.claim.claim_sha256[1]++;
 }
+/* SCN total order: local part, then node id (cluster_scn.o is not linked;
+ * the production comparator is tested in test_cluster_scn). */
+int
+scn_total_cmp(SCN a, SCN b)
+{
+	if (scn_local(a) != scn_local(b))
+		return scn_local(a) < scn_local(b) ? -1 : 1;
+	if (scn_node_id(a) != scn_node_id(b))
+		return scn_node_id(a) < scn_node_id(b) ? -1 : 1;
+	return 0;
+}
 bool
 cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 {
@@ -823,6 +834,20 @@ drop_first(int index)
 	pg_atomic_fetch_and_u32(&buf->state, ~BM_LOCKED);
 }
 
+/* A22 review: end an unattributed first record as a clean write would. */
+static void
+end_unattributed_first(int index)
+{
+	BufferDesc *buf = &many_descriptors[index].bufferdesc;
+	ClusterPageWalRefV1 first;
+	pg_atomic_fetch_and_u32(&buf->state, ~(BM_DIRTY | BM_JUST_DIRTIED));
+	pg_atomic_fetch_or_u32(&buf->state, BM_LOCKED);
+	UT_ASSERT_EQ(cluster_page_wal_first_observe_locked_v1(buf, &first),
+				 CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED);
+	UT_ASSERT(cluster_page_wal_first_clear_written_locked_v1(buf, &first, 80));
+	pg_atomic_fetch_and_u32(&buf->state, ~BM_LOCKED);
+}
+
 static void
 bounded_claim_pool_and_t2_reservation_release(void)
 {
@@ -849,7 +874,9 @@ bounded_claim_pool_and_t2_reservation_release(void)
 	cluster_page_wal_release_install_v1(&prepared); /* failed/duplicate T2 */
 	UT_ASSERT_EQ(capture_many(256, 501), CLUSTER_PAGE_WAL_CAPTURED);
 	UT_ASSERT(cluster_page_wal_forget_v1(257));
-	drop_first(256);
+	/* Its first capture had no source slot: the unattributed first record
+	 * stays (holding no source) until a clean write ends it. */
+	end_unattributed_first(256);
 	UT_ASSERT(cluster_page_wal_prepare_install_v1(258, &carrier, many_pages[257].data, &prepared));
 	UT_ASSERT(cluster_page_wal_publish_install_v1(258, &prepared));
 	UT_ASSERT_EQ(prepared.source_slot, 0);
@@ -1062,6 +1089,123 @@ first_record_of_another_writer_is_foreign(void)
 	UT_ASSERT_EQ(floor.floor, 0x120);
 	UT_ASSERT_EQ(floor.foreign, 0);
 	writer = original;
+}
+
+/*
+ * A22 review: a capture that cannot attribute its record (no current writer,
+ * or the source pool is full) still leaves the page dirty with a record the
+ * floor must not pass.  The first record becomes an unattributed marker at
+ * its LSN; an existing first record is neither raised nor replaced, and a
+ * later attributed capture does not replace the marker.
+ */
+static void
+first_record_unattributed_capture_keeps_the_lower(void)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		ClusterPageWalRefV1 first;
+		ClusterPageWalDirtyFloorV1 floor;
+
+		reset();
+		if (variant == 2)
+			UT_ASSERT(capture_at(80, 0x120, 0x200));
+		selected = false; /* no current writer */
+		UT_ASSERT(!capture_at(variant == 2 ? 81 : 80, variant == 2 ? 0x220 : 0x120,
+							  variant == 2 ? 0x300 : 0x200));
+		selected = true;
+		if (variant == 3)
+			UT_ASSERT(capture_at(81, 0x220, 0x300));
+		floor = writer_floor();
+		UT_ASSERT_EQ(floor.dirty, 1);
+		if (variant == 2) {
+			UT_ASSERT_EQ(floor.floor, 0x120);
+			UT_ASSERT_EQ(floor.unattributed, 0);
+			UT_ASSERT_EQ(observe_first(&first), CLUSTER_PAGE_WAL_FIRST_PRESENT);
+			UT_ASSERT_EQ(first.start, 0x120);
+		} else {
+			UT_ASSERT_EQ(floor.floor, 0);
+			UT_ASSERT_EQ(floor.unattributed, 1);
+			UT_ASSERT_EQ(observe_first(&first), CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED);
+			UT_ASSERT_EQ(first.start, 0x120);
+			UT_ASSERT_EQ(first.source_flags, 0);
+		}
+		if (ut_current_failed)
+			printf("# unattributed variant %d\n", variant);
+	}
+}
+
+/* The same with the source pool full on the first capture. */
+static void
+first_record_pool_full_keeps_the_lower(void)
+{
+	ClusterPageWalDirtyFloorV1 floor;
+	ClusterPageWalRefV1 first;
+	BufferDesc *buf;
+
+	reset_many();
+	for (int i = 0; i < 256; i++)
+		UT_ASSERT_EQ(capture_many(i, i + 1), CLUSTER_PAGE_WAL_CAPTURED);
+	UT_ASSERT_EQ(capture_many(256, 500), CLUSTER_PAGE_WAL_UNATTRIBUTED);
+	UT_ASSERT(cluster_page_wal_dirty_floor_v1(&writer, &floor));
+	UT_ASSERT_EQ(floor.dirty, 257);
+	UT_ASSERT_EQ(floor.unattributed, 1);
+	buf = &many_descriptors[256].bufferdesc;
+	pg_atomic_fetch_or_u32(&buf->state, BM_LOCKED);
+	UT_ASSERT_EQ(cluster_page_wal_first_observe_locked_v1(buf, &first),
+				 CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED);
+	pg_atomic_fetch_and_u32(&buf->state, ~BM_LOCKED);
+	UT_ASSERT_EQ(first.start, 0x120);
+}
+
+/*
+ * A22 review: whether a write covers the first record is decided in SCN
+ * total order (local part, then node), never by the raw integer: a write
+ * of (node 1, 99) does not cover a first record of (node 0, 100), and a
+ * write of (node 0, 100) covers a first record of (node 1, 99).
+ */
+static void
+first_record_clear_uses_scn_total_order(void)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		ClusterPageWalRefV1 first;
+		SCN first_token = variant < 2 ? scn_encode(0, 100) : scn_encode(1, 99);
+		SCN written = variant == 0	 ? scn_encode(1, 99)
+					  : variant == 1 ? scn_encode(0, 100)
+					  : variant == 2 ? scn_encode(0, 100)
+									 : scn_encode(1, 98);
+		bool covers = variant == 1 || variant == 2;
+
+		reset();
+		UT_ASSERT(capture_at(first_token, 0x120, 0x200));
+		UT_ASSERT_EQ(observe_first(&first), CLUSTER_PAGE_WAL_FIRST_PRESENT);
+		UT_ASSERT_EQ(clear_written(&first, written, 0), covers);
+		UT_ASSERT_EQ(writer_floor().dirty, covers ? 0 : 1);
+		if (ut_current_failed)
+			printf("# scn order variant %d\n", variant);
+	}
+}
+
+/* An unattributed marker observed before a clean write is ended by it, like
+ * an attributed first record; a still-dirty page or another marker keeps it. */
+static void
+first_record_unattributed_marker_ends_with_its_clean_write(void)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		ClusterPageWalRefV1 first;
+
+		reset();
+		selected = false;
+		UT_ASSERT(!capture_at(80, 0x120, 0x200));
+		selected = true;
+		UT_ASSERT_EQ(observe_first(&first), CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED);
+		if (variant == 2)
+			first.start++;
+		UT_ASSERT_EQ(clear_written(&first, 80, variant == 1 ? BM_DIRTY : 0), variant == 0);
+		UT_ASSERT_EQ(writer_floor().dirty, variant == 0 ? 0 : 1);
+		if (variant == 0)
+			UT_ASSERT_EQ(observe_first(&first), CLUSTER_PAGE_WAL_FIRST_ABSENT);
+		if (ut_current_failed)
+			printf("# unattributed clear variant %d\n", variant);
+	}
 }
 
 static void
@@ -1449,6 +1593,10 @@ main(void)
 	UT_RUN(first_record_survives_forget_and_install_not_reuse);
 	UT_RUN(first_record_retain_and_handover);
 	UT_RUN(first_record_of_another_writer_is_foreign);
+	UT_RUN(first_record_unattributed_capture_keeps_the_lower);
+	UT_RUN(first_record_pool_full_keeps_the_lower);
+	UT_RUN(first_record_clear_uses_scn_total_order);
+	UT_RUN(first_record_unattributed_marker_ends_with_its_clean_write);
 	UT_RUN(pi_snapshot_requires_frozen_header_owner);
 	UT_RUN(eviction_snapshot_requires_exact_clean_revoke);
 	UT_RUN(detached_reference_survives_descriptor_reuse);

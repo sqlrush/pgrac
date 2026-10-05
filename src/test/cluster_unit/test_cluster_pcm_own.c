@@ -135,7 +135,8 @@ cluster_page_wal_first_observe_locked_v1(BufferDesc *buf, ClusterPageWalRefV1 *o
 		out->start = transition_first_binding.record_start;
 		out->token = transition_first_binding.version.mutation_token;
 		out->source_flags = 1;
-	}
+	} else if (transition_first_state == CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED)
+		out->start = transition_first_binding.record_start; /* the LSN alone */
 	return transition_first_state;
 }
 bool
@@ -2633,13 +2634,14 @@ UT_TEST(test_r_a22_real_flush_clears_first_record_after_its_write)
 	static BufferDesc buf;
 	static ClusterPcmOwnEntry entry;
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
-	for (int variant = 0; variant < 3; variant++) {
+	for (int variant = 0; variant < 4; variant++) {
 		volatile bool caught = false;
 		drop_fixture(&buf, &entry, true);
 		transition_real_flush = true;
 		transition_flush_error = variant == 2;
-		transition_first_state
-			= variant == 1 ? CLUSTER_PAGE_WAL_FIRST_ABSENT : CLUSTER_PAGE_WAL_FIRST_PRESENT;
+		transition_first_state = variant == 1	? CLUSTER_PAGE_WAL_FIRST_ABSENT
+								 : variant == 3 ? CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED
+												: CLUSTER_PAGE_WAL_FIRST_PRESENT;
 		transition_first_binding.record_start = UINT64_C(0x11000);
 		transition_content_held = true;
 		transition_pin_count = 1;
@@ -2658,8 +2660,9 @@ UT_TEST(test_r_a22_real_flush_clears_first_record_after_its_write)
 		transition_content_held = false;
 		transition_unpin(&buf);
 		UT_ASSERT_EQ(caught, variant == 2);
-		UT_ASSERT_EQ(transition_first_clears, variant == 0);
-		if (variant == 0)
+		/* An unattributed first record also ends with a clean write. */
+		UT_ASSERT_EQ(transition_first_clears, variant == 0 || variant == 3);
+		if (variant == 0 || variant == 3)
 			UT_ASSERT_EQ(transition_first_clear_token, 123);
 		transition_flush_error = false;
 		drop_fixture_done(saved);
@@ -3699,9 +3702,9 @@ UT_TEST(test_real_gcs_wal_recheck_yields_without_exporting_an_image)
  * record yields no image. */
 UT_TEST(test_r_a22_copy_samples_first_record_with_its_image)
 {
-	static const int expected_certifications[] = { 1, 2, 2, 4, 0 };
+	static const int expected_certifications[] = { 1, 2, 2, 4, 2, 1 };
 
-	for (int variant = 0; variant < 5; variant++) {
+	for (int variant = 0; variant < 6; variant++) {
 		BufferDesc buf;
 		ClusterPcmOwnEntry entry;
 		ClusterPcmOwnSnapshot ignored;
@@ -3712,9 +3715,9 @@ UT_TEST(test_r_a22_copy_samples_first_record_with_its_image)
 		ClusterPageWalRefV1 first;
 		XLogRecPtr copied_lsn = 0xdead;
 		bool copied;
-		bool ok = variant <= 2;
+		bool ok = variant <= 2 || variant == 5;
 
-		transition_fixture(&buf, &entry, &ignored, variant == 2);
+		transition_fixture(&buf, &entry, &ignored, variant == 2 || variant == 5);
 		transition_copy_active = true;
 		cluster_shared_config = true;
 		buf.pcm_state = PCM_STATE_X;
@@ -3725,9 +3728,9 @@ UT_TEST(test_r_a22_copy_samples_first_record_with_its_image)
 		transition_first_binding.record_start = 0x100;
 		transition_first_binding.record_end = 0x110;
 		transition_first_state = variant == 0	? CLUSTER_PAGE_WAL_FIRST_ABSENT
-								 : variant == 4 ? CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED
+								 : variant >= 4 ? CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED
 												: CLUSTER_PAGE_WAL_FIRST_PRESENT;
-		transition_flush_clears_first = variant == 2;
+		transition_flush_clears_first = variant == 2 || variant == 5;
 		transition_first_drifts = variant == 3;
 		memset(&first, 0xa5, sizeof(first));
 		copied = cluster_bufmgr_copy_block_for_gcs(buf.tag, &copied_lsn, output.data, &refusal,
@@ -3740,10 +3743,12 @@ UT_TEST(test_r_a22_copy_samples_first_record_with_its_image)
 		UT_ASSERT_EQ(first.source_flags, variant == 1 ? 1 : 0);
 		if (variant == 1)
 			UT_ASSERT_EQ(first.start, 0x100);
-		UT_ASSERT_EQ(transition_flush_count, variant == 2);
+		UT_ASSERT_EQ(transition_flush_count, variant == 2 || variant == 5);
 		/* Certifying flushes: the latest record, plus the first record when
 		 * present, in one attempt; the drifting first record spends both
-		 * attempts; the unattributable one is refused before any. */
+		 * attempts.  An unattributable first record cannot be carried: on a
+		 * clean page it is refused after both attempts, on a dirty page this
+		 * attempt's own clean write ends it (A22 review). */
 		UT_ASSERT_EQ(transition_wal_calls, expected_certifications[variant]);
 		UT_ASSERT_EQ(transition_pin_count, 0);
 		UT_ASSERT(!transition_content_held && !transition_mapping_held);
