@@ -610,23 +610,20 @@ cluster_smgr_unlink_committed_drop(RelFileLocator locator)
 				&& change.identity.result_token == terminal.version.mutation_token) {
 				ForkNumber f;
 
-				/* MAIN remains occupied until the original checkpoint cycle. */
+				/* Physical durability alone cannot release the MAIN reservation.
+				 * Structural retirement and closed recovery windows must also
+				 * be established by the original owner before reuse. */
 				for (f = MAIN_FORKNUM + 1; f <= MAX_FORKNUM; f++)
 					cluster_smgr_forget_fsync(locator, f);
 				if (cluster_shared_fs_sharedfs_drop_durable(&change.identity.result,
 						change.identity.result_token)
-					&& cluster_ko_shared_observe_drop_v2(completion)) {
-					FileTag tag;
-
-					cluster_smgr_init_filetag(&tag, locator, MAIN_FORKNUM);
-					RegisterSyncRequest(&tag, SYNC_UNLINK_REQUEST, true);
+					&& cluster_ko_shared_observe_drop_v2(completion))
 					completed = true;
-				}
 			}
 			if (!completed)
 				ereport(WARNING,
 						(errmsg("could not establish the durable shared DROP result"),
-						 errdetail("Relation %u/%u/%u retains its original cleanup responsibility and MAIN reservation.",
+						 errdetail("Relation %u/%u/%u has no qualified physical completion or relfilenumber reuse result.",
 								   locator.spcOid, locator.dbOid, locator.relNumber)));
 		}
 	}
@@ -908,6 +905,15 @@ cluster_smgr_unlinkfiletag(const FileTag *ftag, char *path)
 
 	snprintf(path, MAXPGPATH, "cluster_shared:%u/%u/%u fork %d", ftag->rlocator.spcOid,
 			 ftag->rlocator.dbOid, ftag->rlocator.relNumber, ftag->forknum);
+	/* A checkpoint FileTag identifies only a pathname. It cannot establish
+	 * that PI structural responsibility is retired or every relevant recovery
+	 * window is durably closed, and must never remove a shared MAIN name.
+	 * SyncPostCheckpoint discards this best-effort entry even on error; this
+	 * refusal therefore grants no retry ownership or completion evidence. */
+	if (ftag->forknum == MAIN_FORKNUM && (cluster_shared_config || cluster_shared_catalog)) {
+		errno = EAGAIN;
+		return -1;
+	}
 	/* The vtable reports errors by throwing. SyncPostCheckpoint expects an
 	 * errno result so it can warn and retire this best-effort cleanup entry. */
 	PG_TRY();
