@@ -353,6 +353,27 @@ UT_TEST(test_work_success_keeps_main_and_structure_obligation)
 	UT_ASSERT_EQ(dir_syncs, 1);
 }
 
+UT_TEST(test_work_absent_auxiliary_forks_are_not_unlink_completions)
+{
+	int fds;
+	struct stat st;
+	if (!work_setup("absent_aux"))
+		return;
+	for (ForkNumber f = FSM_FORKNUM; f <= INIT_FORKNUM; f++)
+		UT_ASSERT_EQ(unlink(work_paths[f]), 0);
+	fds = descriptor_count();
+	UT_ASSERT(poll_work());
+	UT_ASSERT_EQ(stat(work_paths[MAIN_FORKNUM], &st), 0);
+	UT_ASSERT_EQ(st.st_size, 0);
+	UT_ASSERT_EQ(unlinks, 1);
+	UT_ASSERT_EQ(per_fork_unlinks[SPACE_FORKNUM], 1);
+	UT_ASSERT_EQ(closes, 3);
+	UT_ASSERT_EQ(descriptor_count(), fds);
+	UT_ASSERT_EQ(external_fds, 0);
+	UT_ASSERT(!storage.contexts[work_slot].structure_drop_pending);
+	UT_ASSERT(storage.contexts[work_slot].structure_owned);
+}
+
 static void
 retry_fault(enum WorkFault fault, const char *name)
 {
@@ -629,10 +650,11 @@ UT_TEST(test_work_executor_process_exit_does_not_redo_partial_io)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 	printf("# retained storage state: %zu bytes per original work\n",
 		   cluster_shared_fs_sharedfs_drop_work_size());
 	UT_RUN(test_work_success_keeps_main_and_structure_obligation);
+	UT_RUN(test_work_absent_auxiliary_forks_are_not_unlink_completions);
 	UT_RUN(test_work_truncate_retry);
 	UT_RUN(test_work_main_fsync_retry);
 	UT_RUN(test_work_aux_unlink_retry);
