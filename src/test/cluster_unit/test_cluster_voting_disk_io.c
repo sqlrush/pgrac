@@ -890,10 +890,80 @@ UT_TEST(test_storage_loss_rejects_every_write_and_preserves_raw_history)
 	free(path);
 }
 
+/* Batch reads must retain the scalar reader's per-slot refusal polarity,
+ * including a bad undeclared slot between healthy neighbors. */
+UT_TEST(test_batch_slots_validate_every_header_and_crc)
+{
+	char *path = make_temp_path("batch");
+	int fd = cluster_voting_disk_open(path, true);
+	ClusterVotingSlot slots[CLUSTER_MAX_NODES];
+	ClusterVotingDiskIoState states[CLUSTER_MAX_NODES];
+	UT_ASSERT(fd >= 0);
+	for (int fault = 0; fault < 5; ++fault) {
+		ClusterVotingSlot bad;
+		UT_ASSERT_EQ(cluster_voting_disk_format(fd, CLUSTER_MAX_NODES, 0), CLUSTER_VOTING_DISK_IO_OK);
+		UT_ASSERT_EQ(cluster_voting_disk_read_slot(fd, 0, 71, &bad), CLUSTER_VOTING_DISK_IO_OK);
+		if (fault == 0) bad.magic++;
+		if (fault == 1) bad.version++;
+		if (fault == 2) bad.node_id++;
+		if (fault == 3) bad.disk_index++;
+		bad.crc32c = cluster_voting_disk_compute_crc32c(&bad);
+		if (fault == 4) bad.crc32c++;
+		UT_ASSERT_EQ(pwrite(fd, &bad, sizeof(bad), CLUSTER_VOTING_SLOT_OFFSET(71)), sizeof(bad));
+		cluster_voting_disk_read_slots(fd, 0, 0, CLUSTER_MAX_NODES, slots, states);
+		for (int node = 0; node < CLUSTER_MAX_NODES; ++node)
+			UT_ASSERT_EQ(states[node], node != 71 ? CLUSTER_VOTING_DISK_IO_OK
+				: fault == 4 ? CLUSTER_VOTING_DISK_IO_TORN : CLUSTER_VOTING_DISK_IO_FAILED);
+	}
+	cluster_voting_disk_close(fd);
+	unlink(path);
+	free(path);
+}
+
+UT_TEST(test_batch_short_io_bounds_and_raw_regions)
+{
+	char *path = make_temp_path("batch_raw");
+	int fd = cluster_voting_disk_open(path, true);
+	ClusterVotingSlot slots[2];
+	ClusterVotingDiskIoState states[2];
+	uint8 raw[2 * CLUSTER_VOTING_SLOT_BYTES], observed[sizeof(raw)];
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(cluster_voting_disk_format(fd, CLUSTER_MAX_NODES, 0), CLUSTER_VOTING_DISK_IO_OK);
+	cluster_voting_disk_read_slots(fd, 0, CLUSTER_MAX_NODES - 1, 2, slots, states);
+	UT_ASSERT_EQ(states[0], CLUSTER_VOTING_DISK_IO_FAILED);
+	UT_ASSERT_EQ(states[1], CLUSTER_VOTING_DISK_IO_FAILED);
+	cluster_voting_disk_read_slots(-1, 0, 0, 2, slots, states);
+	UT_ASSERT_EQ(states[0], CLUSTER_VOTING_DISK_IO_NOT_TRIED);
+	UT_ASSERT_EQ(states[1], CLUSTER_VOTING_DISK_IO_NOT_TRIED);
+	UT_ASSERT_EQ(ftruncate(fd, 2 * CLUSTER_VOTING_SLOT_BYTES - 1), 0);
+	cluster_voting_disk_read_slots(fd, 0, 0, 2, slots, states);
+	UT_ASSERT_EQ(states[0], CLUSTER_VOTING_DISK_IO_FAILED);
+	UT_ASSERT_EQ(states[1], CLUSTER_VOTING_DISK_IO_FAILED);
+	for (int region = 0; region < 2; ++region) {
+		off_t offset = region == 0 ? CLUSTER_VOTING_JOIN_SLOT_OFFSET(126)
+			: CLUSTER_VOTING_FORMATION_SLOT_OFFSET(126);
+		ClusterVotingDiskIoState (*read_range)(int, uint32, uint32, void *)
+			= region == 0 ? cluster_voting_disk_read_join_slots : cluster_voting_disk_read_formation_slots;
+		memset(raw, region + 1, sizeof(raw));
+		UT_ASSERT_EQ(pwrite(fd, raw, sizeof(raw), offset), sizeof(raw));
+		UT_ASSERT_EQ(read_range(fd, 126, 2, observed), CLUSTER_VOTING_DISK_IO_OK);
+		UT_ASSERT_EQ(memcmp(raw, observed, sizeof(raw)), 0);
+		UT_ASSERT_EQ(read_range(fd, 127, 2, observed), CLUSTER_VOTING_DISK_IO_FAILED);
+		UT_ASSERT_EQ(read_range(fd, UINT32_MAX, 2, observed), CLUSTER_VOTING_DISK_IO_FAILED);
+		UT_ASSERT_EQ(read_range(fd, 126, 0, observed), CLUSTER_VOTING_DISK_IO_FAILED);
+		UT_ASSERT_EQ(read_range(fd, 126, 2, NULL), CLUSTER_VOTING_DISK_IO_FAILED);
+		UT_ASSERT_EQ(ftruncate(fd, offset + sizeof(raw) - 1), 0);
+		UT_ASSERT_EQ(read_range(fd, 126, 2, observed), CLUSTER_VOTING_DISK_IO_FAILED);
+	}
+	cluster_voting_disk_close(fd);
+	unlink(path);
+	free(path);
+}
+
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(25);
 	UT_RUN(test_io_1_round_trip);
 	UT_RUN(test_io_2_crc_mismatch_returns_torn);
 	UT_RUN(test_io_3_magic_mismatch_failed);
@@ -917,6 +987,8 @@ main(void)
 	UT_RUN(test_io_21_offset_raw_slot_distinguishes_short_and_io_failure);
 	UT_RUN(test_io_22_pgrd_authority_bounds_nonlinux_development_file);
 	UT_RUN(test_storage_loss_rejects_every_write_and_preserves_raw_history);
+	UT_RUN(test_batch_slots_validate_every_header_and_crc);
+	UT_RUN(test_batch_short_io_bounds_and_raw_regions);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

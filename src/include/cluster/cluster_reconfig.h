@@ -838,6 +838,7 @@ extern void cluster_reconfig_formation_qvotec_note_max_generation(uint64 generat
 extern bool cluster_reconfig_formation_needs_disk_snapshot(void);
 extern void cluster_reconfig_formation_qvotec_publish_disk_snapshot(
 	const ClusterFormationDiskSnapshot *snapshot);
+extern bool cluster_reconfig_read_formation_fence_snapshot(ClusterFenceAuthorityProof *out);
 extern void
 cluster_reconfig_formation_qvotec_publish_observed(const ClusterFormationCommitMarker *marker,
 												   const uint64 *incarnation_by_node);

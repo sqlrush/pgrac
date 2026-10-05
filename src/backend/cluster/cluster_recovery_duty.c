@@ -12,6 +12,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_semantic_activation.h" /* R4 cutover ACK proof (G3) */
@@ -24,6 +25,7 @@
 #include "common/sha2.h"
 #include "portability/instr_time.h"
 #include "storage/latch.h"
+#include "storage/proc.h"
 #include "miscadmin.h" /* MyLatch / CHECK_FOR_INTERRUPTS */
 #include "utils/timestamp.h"
 #include "utils/wait_event.h" /* WAIT_EVENT_CHECKPOINTER_MAIN */
@@ -1322,6 +1324,8 @@ formation_witness_build_wait_internal(uint16 origin_thread, bool opening_new_dut
 	ClusterFormationWitnessResult last = CLUSTER_FORMATION_WITNESS_UNSTABLE;
 	uint64 start_us;
 	uint64 deadline_us;
+	bool published_proof = cluster_shared_config && MyProc == NULL
+		&& mode == CLUSTER_FORMATION_WITNESS_MODE_RECOVERY_CONTROL;
 
 	formation_diagnostic_reset(origin_thread);
 	if (out == NULL || *out != NULL || origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES
@@ -1352,7 +1356,12 @@ formation_witness_build_wait_internal(uint16 origin_thread, bool opening_new_dut
 			return formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE,
 											   "snapshot.first");
 		formation_diagnostic_snapshot(&f1, origin_thread);
-		read_result = cluster_write_fence_read_durable_authority(&authority);
+		/* The postmaster cannot turn its 1ms wait into competing voting I/O.
+		 * Only QVOTEC refreshes this proof, under the unchanged disk judge. */
+		read_result = published_proof
+			? (cluster_reconfig_read_formation_fence_snapshot(&authority)
+				? CLUSTER_FENCE_AUTHORITY_OK : CLUSTER_FENCE_AUTHORITY_NO_MAJORITY)
+			: cluster_write_fence_read_durable_authority(&authority);
 		formation_last_diagnostic.fence_result = read_result;
 		formation_last_diagnostic.fence_captured = read_result == CLUSTER_FENCE_AUTHORITY_OK;
 		formation_last_diagnostic.fence_agree = authority.agree_disk_count;
@@ -1381,7 +1390,16 @@ formation_witness_build_wait_internal(uint16 origin_thread, bool opening_new_dut
 				if (now_us == 0)
 					return formation_diagnostic_result(
 						CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE, "clock");
-				if (!cluster_write_fence_authority_cache_publish_if_unchanged(
+				if (published_proof) {
+					ClusterFenceAuthorityCacheResult cached
+						= cluster_write_fence_revalidate_cached_nowait(&authority.marker, now_us);
+					if (cached != CLUSTER_FENCE_CACHE_MATCH
+						|| cluster_write_fence_authority_cache_sequence() != proof_sequence) {
+						last = formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_UNSTABLE,
+							"fence.cache_revalidate");
+						goto retry;
+					}
+				} else if (!cluster_write_fence_authority_cache_publish_if_unchanged(
 						&authority.marker, now_us, proof_sequence)) {
 					last = formation_diagnostic_result(CLUSTER_FORMATION_WITNESS_UNSTABLE,
 													   "fence.cache_publish");

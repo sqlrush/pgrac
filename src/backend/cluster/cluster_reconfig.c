@@ -8838,8 +8838,9 @@ cluster_reconfig_observed_formation_read(ClusterFormationCommitMarker *marker, u
 /* PGRAC: accepted cold membership is CONTROL, not serving. All callers hold
  * the reconfig lock; no I/O or secondary lock occurs in these predicates.
  * Author: SqlRush <sqlrush@gmail.com> */
-/* The disk owner invalidates before I/O. A stalled or replaced owner cannot
- * leave reusable admission evidence. No reader performs disk I/O here.
+/* A replacement read preserves the last complete sample; its timestamp and
+ * owner never change on a read. Failure invalidates, expiry/owner drift deny.
+ * No reader performs disk I/O here.
  * Author: SqlRush <sqlrush@gmail.com> */
 bool
 cluster_reconfig_formation_needs_disk_snapshot(void)
@@ -8848,7 +8849,11 @@ cluster_reconfig_formation_needs_disk_snapshot(void)
 	if (ReconfigShmem == NULL || !cluster_shared_config)
 		return false;
 	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
-	needed = ReconfigShmem->startup_formation.formation_generation == 0;
+	/* CONTROL may precede completion of phase3. Keep its fence proof fresh
+	 * throughout startup, including an LMS wait after formation is accepted. */
+	needed = ReconfigShmem->startup_formation.formation_generation == 0
+		|| cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
+		|| cluster_current_phase() == CLUSTER_PHASE_4_NORMAL;
 	LWLockRelease(&ReconfigShmem->lock);
 	return needed;
 }
@@ -8880,6 +8885,38 @@ cluster_reconfig_formation_disk_snapshot_current(void)
 		&& now - s->sampled_at_us < lease && s->self_incarnation != 0
 		&& s->self_incarnation == cluster_qvotec_get_self_incarnation()
 		&& cluster_qvotec_in_quorum();
+}
+
+/* QVOTEC's original majority proof, for the postmaster's phase3 consumer.
+ * The consumer must also revalidate the exact tuple against the 5s fence
+ * cache; neither reading nor copying this sample renews it.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_reconfig_read_formation_fence_snapshot(ClusterFenceAuthorityProof *out)
+{
+	bool valid;
+	const ClusterFenceAuthorityProof *proof;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (ReconfigShmem == NULL || !cluster_shared_config)
+		return false;
+	if (MyProc == NULL) {
+		if (!LWLockConditionalAcquire(&ReconfigShmem->lock, LW_SHARED))
+			return false;
+	} else
+		LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	proof = &ReconfigShmem->formation_disk_snapshot.fence;
+	valid = cluster_reconfig_formation_disk_snapshot_current()
+		&& proof->total_disk_count > 0 && proof->total_disk_count <= CLUSTER_MAX_VOTING_DISKS
+		&& proof->agree_disk_count <= proof->total_disk_count
+		&& proof->agree_disk_count > proof->total_disk_count / 2
+		&& cluster_fence_marker_valid_v1(&proof->marker);
+	if (valid)
+		*out = *proof;
+	LWLockRelease(&ReconfigShmem->lock);
+	return valid;
 }
 
 static bool
@@ -10439,6 +10476,13 @@ void
 cluster_reconfig_formation_qvotec_publish_disk_snapshot(
 	const ClusterFormationDiskSnapshot *snapshot pg_attribute_unused())
 {}
+bool
+cluster_reconfig_read_formation_fence_snapshot(ClusterFenceAuthorityProof *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
 void
 cluster_reconfig_formation_qvotec_note_max_generation(uint64 generation pg_attribute_unused())
 {}

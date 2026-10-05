@@ -19,6 +19,14 @@ int cluster_node_id = 0;
 bool cluster_storage_quorum_allows_node(int node);
 bool cluster_storage_quorum_allows_node(int node) { return node == 0; }
 
+#include "utils/memutils.h"
+MemoryContext TopMemoryContext;
+void *MemoryContextAllocZero(MemoryContext context, Size size)
+{
+	(void)context;
+	return calloc(1, size);
+}
+
 #include "test_cluster_formation_restart.inc"
 
 static int fds[3];

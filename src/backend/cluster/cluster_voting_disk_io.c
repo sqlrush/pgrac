@@ -321,6 +321,73 @@ cluster_voting_disk_read_slot(int fd, int expected_disk_index, uint32 node_id,
 	return CLUSTER_VOTING_DISK_IO_OK;
 }
 
+/* A batch is a transport optimization, not a vote or a commit proof. The
+ * caller still validates raw marker payloads and applies its original quorum.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterVotingDiskIoState
+voting_disk_read_range(int fd, off_t offset, uint32 count, void *out)
+{
+	char aligned[CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	size_t bytes;
+	ssize_t nread;
+	if (fd < 0)
+		return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+	if (out == NULL || count == 0 || count > CLUSTER_MAX_NODES)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	bytes = (size_t)count * CLUSTER_VOTING_SLOT_BYTES;
+	voting_disk_io_arm_timeout();
+	nread = pread(fd, aligned, bytes, offset);
+	voting_disk_io_disarm_timeout();
+	if (nread != (ssize_t)bytes)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	memcpy(out, aligned, bytes);
+	return CLUSTER_VOTING_DISK_IO_OK;
+}
+
+void
+cluster_voting_disk_read_slots(int fd, int expected_disk_index, uint32 first_node,
+	uint32 count, ClusterVotingSlot *out, ClusterVotingDiskIoState *states)
+{
+	ClusterVotingDiskIoState rc;
+	/* A bounded output must be unambiguously failed even for bad arguments. */
+	if (states != NULL && count <= CLUSTER_MAX_NODES)
+		for (uint32 i = 0; i < count; ++i)
+			states[i] = CLUSTER_VOTING_DISK_IO_FAILED;
+	if (out == NULL || states == NULL || first_node >= CLUSTER_MAX_NODES
+		|| count == 0 || count > CLUSTER_MAX_NODES - first_node)
+		return;
+	memset(out, 0, (size_t)count * sizeof(*out));
+	rc = voting_disk_read_range(fd, CLUSTER_VOTING_SLOT_OFFSET(first_node), count, out);
+	for (uint32 i = 0; i < count; ++i) {
+		ClusterVotingSlot *slot = &out[i];
+		states[i] = rc;
+		if (rc != CLUSTER_VOTING_DISK_IO_OK)
+			continue;
+		if (slot->crc32c != cluster_voting_disk_compute_crc32c(slot))
+			states[i] = CLUSTER_VOTING_DISK_IO_TORN;
+		else if (slot->magic != CLUSTER_VOTING_SLOT_MAGIC
+			|| slot->version != CLUSTER_VOTING_SLOT_VERSION || slot->node_id != first_node + i
+			|| (expected_disk_index >= 0 && slot->disk_index != (uint32)expected_disk_index))
+			states[i] = CLUSTER_VOTING_DISK_IO_FAILED;
+	}
+}
+
+ClusterVotingDiskIoState
+cluster_voting_disk_read_join_slots(int fd, uint32 first_node, uint32 count, void *out_slots)
+{
+	if (first_node >= CLUSTER_MAX_NODES || count == 0 || count > CLUSTER_MAX_NODES - first_node)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	return voting_disk_read_range(fd, CLUSTER_VOTING_JOIN_SLOT_OFFSET(first_node), count, out_slots);
+}
+
+ClusterVotingDiskIoState
+cluster_voting_disk_read_formation_slots(int fd, uint32 first_node, uint32 count, void *out_slots)
+{
+	if (first_node >= CLUSTER_MAX_NODES || count == 0 || count > CLUSTER_MAX_NODES - first_node)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	return voting_disk_read_range(fd, CLUSTER_VOTING_FORMATION_SLOT_OFFSET(first_node), count, out_slots);
+}
+
 
 /* ============================================================
  * cluster_voting_disk_write_slot

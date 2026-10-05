@@ -32,6 +32,7 @@ static ClusterFenceAuthorityReadResult durable_result;
 static bool cache_publish_ok;
 static ClusterFenceAuthorityCacheResult cache_result;
 static uint64 cache_sequence;
+static bool cache_drift_on_revalidation;
 
 bool cluster_shared_config;
 struct PGPROC *MyProc;
@@ -199,6 +200,8 @@ cluster_write_fence_revalidate_cached_nowait(const ClusterFenceMarker *expected,
 {
 	(void)expected;
 	(void)now_us;
+	if (cache_drift_on_revalidation)
+		cache_sequence += 2;
 	return cache_result;
 }
 
@@ -369,6 +372,7 @@ build_ready_fixture(void)
 	cache_publish_ok = true;
 	cache_result = CLUSTER_FENCE_CACHE_MATCH;
 	cache_sequence = 2;
+	cache_drift_on_revalidation = false;
 	cluster_shared_config = false;
 	MyProc = NULL;
 	durable_reads = reader_publications = qvotec_proof_reads = 0;
@@ -647,22 +651,29 @@ build_initial_postmaster_fixture(void)
 
 UT_TEST(test_shared_postmaster_uses_published_proof_without_disk_or_renewal)
 {
-	ClusterFormationWitnessV1 *witness = NULL;
-	build_initial_postmaster_fixture();
-	cluster_shared_config = true;
-	UT_ASSERT_EQ(cluster_formation_witness_build_recovery_control_wait(1, 10, &witness),
-				 CLUSTER_FORMATION_WITNESS_READY);
-	UT_ASSERT_NOT_NULL(witness);
-	UT_ASSERT_EQ(durable_reads, 0);
-	UT_ASSERT_EQ(reader_publications, 0);
-	UT_ASSERT(qvotec_proof_reads > 0);
-	cluster_formation_witness_destroy(&witness);
-	cluster_shared_config = false;
+	for (int cold = 0; cold < 2; ++cold) {
+		ClusterFormationWitnessV1 *witness = NULL;
+		build_initial_postmaster_fixture();
+		if (cold) {
+			snapshots[0].local_epoch = 5;
+			snapshots[0].startup_formation_generation = 4;
+			snapshots[1] = snapshots[0];
+			durable_proof.marker.fence_epoch = 5;
+		}
+		UT_ASSERT_EQ(cluster_formation_witness_build_recovery_control_wait(1, 10, &witness),
+			CLUSTER_FORMATION_WITNESS_READY);
+		UT_ASSERT_NOT_NULL(witness);
+		UT_ASSERT_EQ(durable_reads, 0);
+		UT_ASSERT_EQ(reader_publications, 0);
+		UT_ASSERT(qvotec_proof_reads > 0);
+		cluster_formation_witness_destroy(&witness);
+		cluster_shared_config = false;
+	}
 }
 
 UT_TEST(test_shared_postmaster_missing_or_expired_proof_has_no_io_fallback)
 {
-	for (int fault = 0; fault < 3; fault++) {
+	for (int fault = 0; fault < 7; fault++) {
 		ClusterFormationWitnessV1 *witness = NULL;
 		build_initial_postmaster_fixture();
 		cluster_shared_config = true;
@@ -670,8 +681,16 @@ UT_TEST(test_shared_postmaster_missing_or_expired_proof_has_no_io_fallback)
 			qvotec_proof_available = false;
 		else if (fault == 1)
 			cache_result = CLUSTER_FENCE_CACHE_EXPIRED;
-		else
+		else if (fault == 2)
 			cache_result = CLUSTER_FENCE_CACHE_STALE;
+		else if (fault == 3)
+			cache_drift_on_revalidation = true;
+		else if (fault == 4)
+			durable_proof.agree_disk_count = 1;
+		else if (fault == 5)
+			cache_result = CLUSTER_FENCE_CACHE_INVALID;
+		else
+			cache_result = CLUSTER_FENCE_CACHE_UNAVAILABLE;
 		UT_ASSERT(cluster_formation_witness_build_recovery_control_wait(1, 1, &witness)
 				  != CLUSTER_FORMATION_WITNESS_READY);
 		UT_ASSERT_NULL(witness);

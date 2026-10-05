@@ -683,6 +683,8 @@ volatile sig_atomic_t cluster_reconfig_start_pending = 0;
 volatile sig_atomic_t InterruptPending = 0;
 
 /* Mocked CSSD / QVOTEC / conf state — tests override via globals. */
+static ClusterStartupPhase ut_snapshot_startup_phase = CLUSTER_PHASE_RUNNING;
+ClusterStartupPhase cluster_current_phase(void) { return ut_snapshot_startup_phase; }
 static bool ut_in_quorum_value = false;
 static int ut_qvotec_status = CLUSTER_QVOTEC_READY;
 static uint64 ut_self_incarnation_first = UINT64_C(77);
@@ -7116,6 +7118,55 @@ pre2_initial_restore(void)
 	cluster_reconfig_test_reset_cold_formation();
 }
 
+UT_TEST(test_pre2_published_fence_snapshot_is_readonly_and_bound_to_owner)
+{
+	for (int fault = 0; fault < 11; ++fault) {
+		ClusterReconfigState *state = pre2_initial_fixture();
+		ClusterFenceAuthorityProof proof = { 0 };
+		uint64 sampled;
+		pre2_publish_disk_snapshot();
+		sampled = state->formation_disk_snapshot.sampled_at_us;
+		if (fault == 1) state->formation_disk_snapshot.complete = false;
+		if (fault == 2) state->formation_disk_snapshot.sampled_at_us -= UINT64_C(10000000);
+		if (fault == 3) state->formation_disk_snapshot.self_incarnation++;
+		if (fault == 4) state->formation_disk_snapshot.fence.agree_disk_count = 1;
+		if (fault == 5) state->formation_disk_snapshot.fence.marker.version++;
+		if (fault == 6) ut_in_quorum_value = false;
+		if (fault == 7) ut_lwlock_conditional_result = false;
+		if (fault == 8) state->formation_disk_snapshot.sampled_at_us++;
+		if (fault == 9) cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
+		if (fault == 10) state->formation_disk_snapshot.fence.agree_disk_count = 4;
+		MyProc = NULL;
+		ut_lwlock_blocking_calls = 0;
+		UT_ASSERT_EQ(cluster_reconfig_read_formation_fence_snapshot(&proof), fault == 0);
+		UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
+		if (fault == 0) {
+			UT_ASSERT_EQ(memcmp(&proof, &ut_formation_authority, sizeof(proof)), 0);
+			UT_ASSERT_EQ(state->formation_disk_snapshot.sampled_at_us, sampled);
+		} else {
+			ClusterFenceAuthorityProof zero = { 0 };
+			UT_ASSERT_EQ(memcmp(&proof, &zero, sizeof(proof)), 0);
+		}
+		ut_lwlock_conditional_result = true;
+		pre2_initial_restore();
+	}
+}
+
+UT_TEST(test_pre2_control_keeps_disk_proof_refresh_until_startup_finishes)
+{
+	ClusterReconfigState *state = pre2_initial_fixture();
+	state->startup_formation.formation_generation = 2;
+	ut_snapshot_startup_phase = CLUSTER_PHASE_3_RECOVERY;
+	UT_ASSERT(cluster_reconfig_formation_needs_disk_snapshot());
+	ut_snapshot_startup_phase = CLUSTER_PHASE_4_NORMAL;
+	UT_ASSERT(cluster_reconfig_formation_needs_disk_snapshot());
+	ut_snapshot_startup_phase = CLUSTER_PHASE_RUNNING;
+	UT_ASSERT(!cluster_reconfig_formation_needs_disk_snapshot());
+	state->startup_formation.formation_generation = 0;
+	UT_ASSERT(cluster_reconfig_formation_needs_disk_snapshot());
+	pre2_initial_restore();
+}
+
 UT_TEST(test_pre2_initial_lmon_produces_nonzero_control_only_after_fence_and_pgfm)
 {
 	ClusterReconfigState *state = pre2_initial_fixture();
@@ -8071,7 +8122,7 @@ UT_TEST(test_membership_cut_generation_uses_original_shmem_owner)
 int
 main(void)
 {
-	UT_PLAN(150);
+	UT_PLAN(152);
 	UT_RUN(test_stop_membership_terminal_peer_is_not_online_admission);
 	UT_RUN(test_stop_membership_preserves_all_nonliveness_requirements);
 	UT_RUN(test_stop_reconfig_shared_owners);
@@ -8258,6 +8309,8 @@ main(void)
 	UT_RUN(test_pre2_restart_window_reopen_keeps_one_generation_and_slow_peers);
 	UT_RUN(test_pre2_reboot_uses_new_incarnations_and_next_durable_generation);
 	UT_RUN(test_pre2_restart_snapshot_expiry_owner_drift_and_unknown_io_stay_closed);
+	UT_RUN(test_pre2_published_fence_snapshot_is_readonly_and_bound_to_owner);
+	UT_RUN(test_pre2_control_keeps_disk_proof_refresh_until_startup_finishes);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
