@@ -63,6 +63,8 @@ static unsigned held_count;
 static bool stop_poll_in_completion;
 static bool stop_new_work_allowed = true;
 static unsigned stop_new_work_calls;
+static bool worker_pid_lock_busy;
+static unsigned postmaster_pid_reads, conditional_pid_reads;
 
 void
 hash_seq_init(HASH_SEQ_STATUS *scan, HTAB *table)
@@ -138,9 +140,25 @@ GetCurrentTimestamp(void)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	if (!IsUnderPostmaster) {
+		postmaster_pid_reads++;
+		/* Detect the forbidden postmaster queue before reading protected bytes. */
+		UT_ASSERT(!worker_pid_lock_busy);
+	}
 	if (held_count >= lengthof(held_locks) || LWLockHeldByMe(lock))
 		abort();
 	UT_ASSERT(mode == LW_SHARED || mode == LW_EXCLUSIVE);
+	held_locks[held_count++] = lock;
+	return true;
+}
+bool
+LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
+{
+	conditional_pid_reads++;
+	UT_ASSERT(mode == LW_SHARED);
+	if (worker_pid_lock_busy)
+		return false;
+	UT_ASSERT(held_count < lengthof(held_locks) && !LWLockHeldByMe(lock));
 	held_locks[held_count++] = lock;
 	return true;
 }
@@ -349,6 +367,9 @@ cluster_grd_convert_grant_by_backend(const ClusterResId *id, int32 node, uint32 
 static void
 reset(void)
 {
+	IsUnderPostmaster = true;
+	worker_pid_lock_busy = false;
+	postmaster_pid_reads = conditional_pid_reads = 0;
 	UT_ASSERT_EQ(held_count, 0);
 	stop_new_work_allowed = true;
 	stop_new_work_calls = 0;
@@ -1105,10 +1126,54 @@ UT_TEST(control_namespaces_have_no_native_probe_continuation)
 	UT_ASSERT(cluster_lms_native_probe_required(&resid, ExclusiveLock));
 }
 
+UT_TEST(postmaster_serving_request_survives_contended_optional_wake)
+{
+	reset();
+	IsUnderPostmaster = false;
+	pg_atomic_write_u32(&state.lms_state, CLUSTER_LMS_STARTING);
+	pg_atomic_init_u64(&state.recovery_ready_generation, 7);
+	pg_atomic_init_u64(&state.serving_requested_generation, 0);
+	state.worker_pids[0] = MyProcPid;
+	worker_pid_lock_busy = true;
+	UT_ASSERT(cluster_lms_request_serving());
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state.serving_requested_generation), 7);
+	UT_ASSERT_EQ(postmaster_pid_reads, 0);
+	UT_ASSERT_EQ(conditional_pid_reads, 1);
+	UT_ASSERT_EQ(held_count, 0);
+	worker_pid_lock_busy = false;
+	UT_ASSERT_EQ(cluster_lms_get_worker_pid(0), MyProcPid);
+	UT_ASSERT_EQ(held_count, 0);
+	pg_atomic_write_u64(&state.recovery_ready_generation, 6);
+	pg_atomic_write_u64(&state.serving_requested_generation, 0);
+	UT_ASSERT(!cluster_lms_request_serving());
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state.serving_requested_generation), 0);
+	UT_ASSERT_EQ(conditional_pid_reads, 2);
+}
+
+UT_TEST(worker_pid_read_retains_child_locking_and_absence)
+{
+	reset();
+	state.worker_pids[0] = 42;
+	UT_ASSERT_EQ(cluster_lms_get_worker_pid(0), 42);
+	UT_ASSERT_EQ(conditional_pid_reads, 0);
+	UT_ASSERT_EQ(held_count, 0);
+	IsUnderPostmaster = false;
+	worker_pid_lock_busy = true;
+	UT_ASSERT_EQ(cluster_lms_get_worker_pid(0), 0);
+	UT_ASSERT_EQ(postmaster_pid_reads, 0);
+	UT_ASSERT_EQ(conditional_pid_reads, 1);
+	UT_ASSERT_EQ(cluster_lms_get_worker_pid(-1), 0);
+	UT_ASSERT_EQ(cluster_lms_get_worker_pid(CLUSTER_LMS_MAX_WORKERS), 0);
+	cluster_lms_state = NULL;
+	UT_ASSERT_EQ(cluster_lms_get_worker_pid(0), 0);
+	UT_ASSERT_EQ(conditional_pid_reads, 1);
+	IsUnderPostmaster = true;
+}
+
 int
 main(void)
 {
-	printf("1..35\n");
+	printf("1..37\n");
 	UT_RUN(async_origin_generation_is_not_receiver_authority);
 	UT_RUN(async_changed_receiver_cut_cannot_grant);
 	UT_RUN(async_dispatch_keeps_the_original_admitted_cut);
@@ -1144,6 +1209,8 @@ main(void)
 	UT_RUN(native_grant_release_cycles_do_not_fill_the_receipt_table);
 	UT_RUN(ordered_control_retirement_removes_pending_and_complete_exact_receipts);
 	UT_RUN(control_namespaces_have_no_native_probe_continuation);
+	UT_RUN(postmaster_serving_request_survives_contended_optional_wake);
+	UT_RUN(worker_pid_read_retains_child_locking_and_absence);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

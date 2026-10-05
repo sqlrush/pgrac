@@ -210,11 +210,15 @@ cluster_stats_wait_for_ready(int timeout_ms)
 	 * 100ms granularity is limiting.
 	 */
 	while (waited_ms < timeout_ms) {
-		ClusterStatsStatus status;
+		ClusterStatsStatus status = CLUSTER_STATS_NOT_STARTED;
 
-		LWLockAcquire(&cluster_stats_state->lwlock, LW_SHARED);
-		status = cluster_stats_state->status;
-		LWLockRelease(&cluster_stats_state->lwlock);
+		/* Postmaster has no PGPROC and cannot join an LWLock wait queue.
+		 * A busy publisher is still pending within the original startup budget;
+		 * never consume its protected READY value without the lock. */
+		if (LWLockConditionalAcquire(&cluster_stats_state->lwlock, LW_SHARED)) {
+			status = cluster_stats_state->status;
+			LWLockRelease(&cluster_stats_state->lwlock);
+		}
 
 		if (status == CLUSTER_STATS_READY)
 			return true;

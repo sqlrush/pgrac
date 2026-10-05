@@ -1467,7 +1467,14 @@ cluster_lms_get_worker_pid(int worker_id)
 
 	if (cluster_lms_state == NULL || worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
 		return 0;
-	LWLockAcquire(&cluster_lms_state->lwlock, LW_SHARED);
+	/* Postmaster's optional serving wake cannot queue without a PGPROC.
+	 * Its generation request is already published; the LMS idle tick also
+	 * observes it when this PID snapshot is temporarily unavailable. */
+	if (!IsUnderPostmaster) {
+		if (!LWLockConditionalAcquire(&cluster_lms_state->lwlock, LW_SHARED))
+			return 0;
+	} else
+		LWLockAcquire(&cluster_lms_state->lwlock, LW_SHARED);
 	pid = cluster_lms_state->worker_pids[worker_id];
 	LWLockRelease(&cluster_lms_state->lwlock);
 	return pid;

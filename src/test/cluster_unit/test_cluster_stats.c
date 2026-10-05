@@ -84,6 +84,10 @@ static int stats_test_startup_waits = 0;
 static int stats_test_ready_waits = 0;
 static int stats_test_retry_waits = 0;
 static int stats_test_wait_logs = 0;
+static ClusterStatsSharedState *stats_test_shared;
+static bool stats_test_lock_busy;
+static unsigned stats_test_blocking_reads, stats_test_conditional_reads;
+static unsigned stats_test_poll_sleeps, stats_test_unlock_after;
 static void stats_test_complete_native_wait(void);
 
 void
@@ -163,7 +167,19 @@ LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
+	if (!IsUnderPostmaster) {
+		stats_test_blocking_reads++;
+		if (stats_test_lock_busy)
+			longjmp(stats_main_exit, 1); /* native no-PGPROC queue refusal */
+	}
 	return true;
+}
+bool
+LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode)
+{
+	UT_ASSERT_EQ(mode, LW_SHARED);
+	stats_test_conditional_reads++;
+	return !stats_test_lock_busy;
 }
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
@@ -175,6 +191,7 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 	static char fake_shmem[4096];
 
 	memset(fake_shmem, 0, sizeof(fake_shmem));
+	stats_test_shared = (ClusterStatsSharedState *)fake_shmem;
 	if (foundPtr != NULL)
 		*foundPtr = false;
 	return fake_shmem;
@@ -266,7 +283,11 @@ ProcessInterrupts(void)
 
 void
 pg_usleep(long microsec pg_attribute_unused())
-{}
+{
+	stats_test_poll_sleeps++;
+	if (stats_test_unlock_after && stats_test_poll_sleeps == stats_test_unlock_after)
+		stats_test_lock_busy = false;
+}
 
 /* Drive the real Stats main through startup wait, READY and normal exit. */
 struct Latch *MyLatch = NULL;
@@ -458,6 +479,9 @@ cluster_wal_state_update_own(const ClusterWalStateUpdate *update, ClusterWalStat
 static void
 reset_stats_lifecycle_fixture(void)
 {
+	stats_test_lock_busy = false;
+	stats_test_blocking_reads = stats_test_conditional_reads = 0;
+	stats_test_poll_sleeps = stats_test_unlock_after = 0;
 	ConfigReloadPending = false;
 	ShutdownRequestPending = false;
 	stats_main_exit_code = -1;
@@ -755,10 +779,45 @@ UT_TEST(test_rf_a1_w4_failure_increments_existing_counter)
  * Test runner
  * ============================================================ */
 
+UT_TEST(postmaster_ready_wait_never_queues_without_pgproc)
+{
+	reset_stats_lifecycle_fixture();
+	IsUnderPostmaster = false;
+	stats_test_shared->status = CLUSTER_STATS_READY;
+	stats_test_lock_busy = true;
+	stats_test_unlock_after = 2;
+	if (setjmp(stats_main_exit) == 0)
+		UT_ASSERT(cluster_stats_wait_for_ready(500));
+	else
+		UT_ASSERT(false); /* old function enters the native wait queue */
+	UT_ASSERT_EQ(stats_test_blocking_reads, 0);
+	UT_ASSERT_EQ(stats_test_conditional_reads, 3);
+	UT_ASSERT_EQ(stats_test_poll_sleeps, 2);
+}
+
+UT_TEST(postmaster_ready_wait_cannot_consume_busy_or_terminal_status)
+{
+	reset_stats_lifecycle_fixture();
+	IsUnderPostmaster = false;
+	stats_test_shared->status = CLUSTER_STATS_READY;
+	stats_test_lock_busy = true;
+	if (setjmp(stats_main_exit) == 0)
+		UT_ASSERT(!cluster_stats_wait_for_ready(200));
+	else
+		UT_ASSERT(false);
+	UT_ASSERT_EQ(stats_test_blocking_reads, 0);
+	UT_ASSERT_EQ(stats_test_conditional_reads, 2);
+	UT_ASSERT_EQ(stats_test_poll_sleeps, 2);
+	stats_test_lock_busy = false;
+	stats_test_shared->status = CLUSTER_STATS_EXITED;
+	UT_ASSERT(!cluster_stats_wait_for_ready(200));
+	UT_ASSERT_EQ(stats_test_poll_sleeps, 2);
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(17);
 	UT_RUN(test_stats_status_enum_values_frozen);
 	UT_RUN(test_stats_shared_state_size_under_4kb);
 	UT_RUN(test_stats_status_to_string_lookup);
@@ -774,6 +833,8 @@ main(void)
 	UT_RUN(test_shared_stats_retries_transient_writer_proof_before_ready);
 	UT_RUN(test_shared_stats_wait_is_cancellable_and_never_hides_identity_error);
 	UT_RUN(test_shared_stats_never_infers_writer_while_recovery_is_running);
+	UT_RUN(postmaster_ready_wait_never_queues_without_pgproc);
+	UT_RUN(postmaster_ready_wait_cannot_consume_busy_or_terminal_status);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
