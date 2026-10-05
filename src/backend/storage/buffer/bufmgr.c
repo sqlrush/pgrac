@@ -1303,19 +1303,6 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 					result = RESOURCE_X_BUFFER_T2_INSTALLED;
 			}
 
-			/* A transferred current image may never have reached DATA. The
-			 * receiver becomes its writeback owner at the same T2 publication
-			 * as the native WAL binding, without inventing a first own record.
-			 * A duplicate activation may follow a completed write: do not
-			 * re-dirty it. Guarded/older peers may conservatively send a page
-			 * already on DATA; an extra dirty obligation is harmless. */
-			if (result == RESOURCE_X_BUFFER_T2_INSTALLED && cluster_shared_config
-				&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
-				&& lookup_tag.spcOid != UNDOTABLESPACE_OID
-				&& (lookup_tag.forkNum == MAIN_FORKNUM || lookup_tag.forkNum == VISIBILITYMAP_FORKNUM)
-				&& (prepared_wal.binding.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) != 0
-				&& cluster_page_wal_binding_shape_v1(&prepared_wal.binding))
-				buf_state |= BM_DIRTY | BM_JUST_DIRTIED;
 
 			if (result == RESOURCE_X_BUFFER_T2_INSTALLED
 				|| result == RESOURCE_X_BUFFER_ALREADY_INSTALLED)
@@ -1422,23 +1409,43 @@ cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
 		result = RESOURCE_X_BUFFER_BUSY;
 	else
 	{
-		own_result = cluster_pcm_own_resource_x_activation_clear_exact(
-			buf->buf_id, live.generation, live.reservation_token,
-			ref->acquisition_generation);
-		if (own_result == CLUSTER_PCM_OWN_OK)
-		{
-			cluster_pcm_own_snapshot_locked(buf, &live);
-			out_proof->ownership_generation = live.generation;
-			out_proof->writer_activation_token = live.writer_activation_token;
-			out_proof->resource_x_activation_generation
-				= live.resource_x_activation_generation;
-			result = RESOURCE_X_BUFFER_T2_INSTALLED;
-		}
+		ClusterPageWalBindingV1 wal;
+		bool deferred_data = cluster_shared_config
+			&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
+			&& lookup_tag.spcOid != UNDOTABLESPACE_OID
+			&& (lookup_tag.forkNum == MAIN_FORKNUM || lookup_tag.forkNum == VISIBILITYMAP_FORKNUM);
+
+		/* T2 installs fenced bytes. Only this original T3 success can make
+		 * the receiver a dirty writeback owner. Keep the header/content locks
+		 * across opening the fence and setting dirty, without inventing a
+		 * first local WAL record or re-dirtying a repeated completed T3. */
+		if (deferred_data
+			&& (!cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal)
+				|| (wal.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+				|| !cluster_page_wal_binding_shape_v1(&wal)))
+			result = RESOURCE_X_BUFFER_CORRUPT;
 		else
-			result = own_result == CLUSTER_PCM_OWN_BUSY ? RESOURCE_X_BUFFER_BUSY
-				: own_result == CLUSTER_PCM_OWN_NOT_READY ? RESOURCE_X_BUFFER_ABSENT
-				: own_result == CLUSTER_PCM_OWN_CORRUPT ? RESOURCE_X_BUFFER_CORRUPT
-				: RESOURCE_X_BUFFER_STALE;
+		{
+			own_result = cluster_pcm_own_resource_x_activation_clear_exact(
+				buf->buf_id, live.generation, live.reservation_token,
+				ref->acquisition_generation);
+			if (own_result == CLUSTER_PCM_OWN_OK)
+			{
+				if (deferred_data)
+					buf_state |= BM_DIRTY | BM_JUST_DIRTIED;
+				cluster_pcm_own_snapshot_locked(buf, &live);
+				out_proof->ownership_generation = live.generation;
+				out_proof->writer_activation_token = live.writer_activation_token;
+				out_proof->resource_x_activation_generation
+					= live.resource_x_activation_generation;
+				result = RESOURCE_X_BUFFER_T2_INSTALLED;
+			}
+			else
+				result = own_result == CLUSTER_PCM_OWN_BUSY ? RESOURCE_X_BUFFER_BUSY
+					: own_result == CLUSTER_PCM_OWN_NOT_READY ? RESOURCE_X_BUFFER_ABSENT
+					: own_result == CLUSTER_PCM_OWN_CORRUPT ? RESOURCE_X_BUFFER_CORRUPT
+					: RESOURCE_X_BUFFER_STALE;
+		}
 	}
 	UnlockBufHdr(buf, buf_state);
 
@@ -19544,6 +19551,13 @@ cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(BufferDesc *buf,
 		result = CLUSTER_PCM_OWN_STALE;
 	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
 		result = CLUSTER_PCM_OWN_CORRUPT;
+	else if (finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_BUSY) {
+		if (out_refusal != NULL) {
+			out_refusal->reason = CLUSTER_PCM_OWN_FINISH_REFUSAL_VM_FSM_PINNED;
+			out_refusal->shared_refcount = shared_refcount;
+		}
+		result = CLUSTER_PCM_OWN_BUSY;
+	}
 	/* Dirty DROP requires the original PENDING first plus the receiving
 	 * dirty-install protocol, not just equal LSNs or a wire copy. */
 	else if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0
@@ -19559,12 +19573,7 @@ cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(BufferDesc *buf,
 			out_refusal->live_flags = flags;
 			out_refusal->live_token = live_token;
 		}
-		if (finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_BUSY) {
-			if (out_refusal != NULL)
-				out_refusal->reason = CLUSTER_PCM_OWN_FINISH_REFUSAL_VM_FSM_PINNED;
-			result = CLUSTER_PCM_OWN_BUSY;
-		}
-		else if (finish_mode != CLUSTER_PCM_X_REVOKE_FINISH_DROP)
+		if (finish_mode != CLUSTER_PCM_X_REVOKE_FINISH_DROP)
 			result = CLUSTER_PCM_OWN_CORRUPT;
 		else if ((buf_state & BM_IO_IN_PROGRESS) != 0) {
 			if (out_refusal != NULL)
