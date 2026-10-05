@@ -18,6 +18,8 @@
 #include "storage/standbydefs.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_native_startup.h"
+#include "cluster/cluster_xid_stripe.h"
+#include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 
 #ifdef RF_SIDE_ONLINE_TESTING
@@ -689,6 +691,34 @@ side_native_standby_valid(const uint8 *data, uint32 length, uint8 info)
 	}
 }
 
+/* Stripe knowledge belongs to its native owner, not a PCM page. JOIN is
+ * emitted by the joining source; RETIRE is emitted by the removal coordinator
+ * and can name another slot. Neither shape alone authorizes replay. */
+static bool
+side_native_stripe_valid(const uint8 *data, uint32 length, uint8 info,
+						 const RfPageOnlineRecordIdentityV1 *identity)
+{
+	if (info == XLOG_CLUSTER_XID_STRIPE_JOIN) {
+		xl_cluster_xid_stripe_join join;
+		Size fields_end = offsetof(xl_cluster_xid_stripe_join, slot) + sizeof(join.slot);
+		if (length != sizeof(join)
+			|| side_bytes_nonzero(data + fields_end, sizeof(join) - fields_end))
+			return false;
+		memcpy(&join, data, sizeof(join));
+		return join.activated_floor_full != 0 && join.stride_mode_epoch != 0
+			   && join.slot >= 0 && join.slot < CLUSTER_XID_STRIDE
+			   && identity->record.origin_thread == (uint16)(join.slot + 1);
+	}
+	if (info == XLOG_CLUSTER_XID_STRIPE_RETIRE) {
+		xl_cluster_xid_stripe_retire retire;
+		if (length != sizeof(retire))
+			return false;
+		memcpy(&retire, data, sizeof(retire));
+		return retire.slot >= 0 && retire.slot < CLUSTER_XID_STRIDE;
+	}
+	return false;
+}
+
 /* Native control records retain their exact payload and source identity.
  * They are not PAGE work, but dropping them would lose checkpoint/capacity/
  * OID/recovery/cache obligations. The native control consumer must close them. */
@@ -703,6 +733,8 @@ side_native_control_valid(XLogReaderState *reader, const RfPageOnlineRecordIdent
 		return false;
 	if (XLogRecGetRmid(reader) == RM_STANDBY_ID)
 		return side_native_standby_valid(data, length, info);
+	if (XLogRecGetRmid(reader) == RM_CLUSTER_XID_STRIPE_ID)
+		return side_native_stripe_valid(data, length, info, identity);
 	if (XLogRecGetRmid(reader) != RM_XLOG_ID)
 		return false;
 	switch (info) {
@@ -803,8 +835,10 @@ side_decode_record(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *recor
 	memset(candidate, 0, sizeof(*candidate));
 	*payload = NULL;
 	if (record_plan->route.record_owner == RF_ROUTE_OWNER_SIDE_TYPED) {
-		if ((record_plan->route.rmid == RM_XLOG_ID || record_plan->route.rmid == RM_STANDBY_ID)
-			&& record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD) {
+		if (((record_plan->route.rmid == RM_XLOG_ID || record_plan->route.rmid == RM_STANDBY_ID)
+			 && record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD)
+			|| (record_plan->route.rmid == RM_CLUSTER_XID_STRIPE_ID
+				&& record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_XID_STRIPE_SHMEM)) {
 			if (!side_native_control_valid(record_plan->source_record, identity))
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 			candidate->kind = RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL;

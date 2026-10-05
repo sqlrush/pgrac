@@ -23,7 +23,7 @@ typedef enum RfSideOnlineOperationKindV1 {
 	RF_SIDE_ONLINE_OPERATION_UNDO = 2,
 	RF_SIDE_ONLINE_OPERATION_PROJECTION = 3,
 	RF_SIDE_ONLINE_OPERATION_SPACE = 4,
-	/* Original RM_XLOG / RM_STANDBY payload. Retained as an obligation,
+	/* Original RM_XLOG / RM_STANDBY / RM_CLUSTER_XID_STRIPE payload. Retained as an obligation,
 	 * never inferred to be a no-op or projection. Execution (including
 	 * standby invalidation/reset) needs the original native control owner. */
 	RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL = 5

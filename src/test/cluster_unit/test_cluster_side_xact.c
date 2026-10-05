@@ -27,6 +27,7 @@
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_tt_2pc.h"
 #include "cluster/cluster_xid_stripe.h"
+#include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/standbydefs.h"
 
@@ -3922,6 +3923,121 @@ UT_TEST(test_native_control_is_owned_input_and_not_replay_permission)
 	}
 }
 
+static bool
+stripe_unexpected_space(void *arg, const RfSideSpaceContributionV1 *space)
+{
+	unsigned *calls = arg;
+	(void)space;
+	(*calls)++;
+	return false;
+}
+
+UT_TEST(test_stripe_records_retain_exact_control_obligation_without_pcm_target)
+{
+	for (unsigned which = 0; which < 2; which++) {
+		RfSideOnlinePlanV1 *plan = space_online_plan(200);
+		xl_cluster_xid_stripe_join join = { 0 };
+		xl_cluster_xid_stripe_retire retire = { 9 };
+		FakeXactRecord fake;
+		uint8 uuid[16];
+		const void *payload = which == 0 ? (const void *)&join : (const void *)&retire;
+		uint32 length = which == 0 ? sizeof(join) : sizeof(retire);
+		uint8 info = which == 0 ? XLOG_CLUSTER_XID_STRIPE_JOIN : XLOG_CLUSTER_XID_STRIPE_RETIRE;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+		RfSideOnlineOperationV1 operation;
+		RfSideContributionOwnersV1 owners = { 0 };
+		RfContributorStreamCutV1 cut = { 0 };
+		RfSideOnlineApplyOpsV1 ops = { 0 };
+		ApplyCapture capture = { 0 };
+		unsigned space_calls = 0;
+
+		join.activated_floor_full = 4195104;
+		join.stride_mode_epoch = 7;
+		join.slot = 2;
+		memset(uuid, 0x44, sizeof(uuid));
+		make_projection_record(&fake, RM_CLUSTER_XID_STRIPE_ID, info, payload, length);
+		identity = make_identity(&fake, uuid);
+		fake.u.decoded.max_block_id = -1;
+		record = make_projection_record_plan(&fake);
+		UT_ASSERT_EQ(rf_opcode_route_lookup_v1(RM_CLUSTER_XID_STRIPE_ID, info, false, true,
+											 &record.route), RF_OPCODE_ROUTE_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		cut.failed_thread = 3;
+		cut.timeline_id = 7;
+		cut.origin_owner_incarnation = 9;
+		cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+		cut.scan_begin_inclusive = 100;
+		cut.scan_end_exclusive = 200;
+		UT_ASSERT_EQ(rf_side_record_census_v1(&record, &identity, &cut, 42,
+										   stripe_unexpected_space, &space_calls, &owners),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(owners.owners, RF_SIDE_CONTRIBUTION_NATIVE_CONTROL);
+		UT_ASSERT_EQ(owners.space_locator_count, 0);
+		UT_ASSERT_EQ(space_calls, 0);
+		memset(fake.data, 0xa5, length);
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 1);
+		if (rf_side_online_plan_operation_v1(plan, 0, &operation)) {
+			UT_ASSERT_EQ(operation.kind, RF_SIDE_ONLINE_OPERATION_NATIVE_CONTROL);
+			UT_ASSERT_EQ(operation.identity.record.rmid, RM_CLUSTER_XID_STRIPE_ID);
+			UT_ASSERT_EQ(operation.owned_payload_length, length);
+			UT_ASSERT_EQ(memcmp(operation.owned_payload, payload, length), 0);
+		} else
+			UT_ASSERT(false);
+		/* A retained control obligation is not authority to replay stripe
+		 * state through a projection or TT callback. */
+		ops.arg = &capture;
+		ops.begin_protected_set = capture_begin;
+		ops.end_protected_set = capture_end;
+		ops.preflight_projection = accept_preflight;
+		ops.apply_projection = capture_apply_projection;
+		UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &ops), RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT);
+		UT_ASSERT_EQ(capture.begin_count + capture.projection_count, 0);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_stripe_malformed_or_wrong_source_cannot_seal)
+{
+	for (unsigned fault = 0; fault < 11; fault++) {
+		RfSideOnlinePlanV1 *plan = space_online_plan(200);
+		xl_cluster_xid_stripe_join join = { 0 };
+		xl_cluster_xid_stripe_retire retire = { 9 };
+		uint8 payload[sizeof(join) + 1] = { 0 }, uuid[16];
+		uint8 info = fault >= 8 ? XLOG_CLUSTER_XID_STRIPE_RETIRE : XLOG_CLUSTER_XID_STRIPE_JOIN;
+		uint32 length = fault >= 8 ? sizeof(retire) : sizeof(join);
+		FakeXactRecord fake;
+		RfPageOnlineRecordIdentityV1 identity;
+		RfDetachedRecordPlanV1 record;
+
+		join.activated_floor_full = fault == 2 ? 0 : 4195104;
+		join.stride_mode_epoch = fault == 3 ? 0 : 7;
+		join.slot = fault == 4 ? -1 : fault == 5 ? CLUSTER_XID_STRIDE : fault == 6 ? 3 : 2;
+		retire.slot = fault == 8 ? -1 : fault == 9 ? CLUSTER_XID_STRIDE : 9;
+		memcpy(payload, fault >= 8 ? (const void *)&retire : (const void *)&join, length);
+		if (fault == 0 || fault == 10)
+			length--;
+		if (fault == 1)
+			length++;
+		if (fault == 7)
+			payload[offsetof(xl_cluster_xid_stripe_join, slot) + sizeof(int32)] = 1;
+		memset(uuid, 0x44, sizeof(uuid));
+		make_projection_record(&fake, RM_CLUSTER_XID_STRIPE_ID, info, payload, length);
+		identity = make_identity(&fake, uuid);
+		fake.u.decoded.max_block_id = -1;
+		record = make_projection_record_plan(&fake);
+		UT_ASSERT_EQ(rf_opcode_route_lookup_v1(RM_CLUSTER_XID_STRIPE_ID, info, false, true,
+											 &record.route), RF_OPCODE_ROUTE_OK);
+		UT_ASSERT_NE(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+					 RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 0);
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
 UT_TEST(test_native_control_rejects_bad_shape_and_identity)
 {
 	for (unsigned fault = 0; fault < 9; fault++) {
@@ -4788,7 +4904,7 @@ UT_TEST(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_ga
 int
 main(void)
 {
-	UT_PLAN(69);
+	UT_PLAN(71);
 	UT_RUN(test_space_incarnation_end_requires_an_actual_later_space0_contribution);
 	UT_RUN(test_space_incarnation_end_rejects_old_uuid_reappearance_and_retained_gaps);
 	UT_RUN(test_space_retained_ancestry_create_and_independent_page_terminal);
@@ -4803,6 +4919,8 @@ main(void)
 	UT_RUN(test_standby_invalid_counts_shapes_and_sources_never_seal);
 	UT_RUN(test_space_contribution_census_includes_history_and_every_drop_page);
 	UT_RUN(test_native_control_is_owned_input_and_not_replay_permission);
+	UT_RUN(test_stripe_records_retain_exact_control_obligation_without_pcm_target);
+	UT_RUN(test_stripe_malformed_or_wrong_source_cannot_seal);
 	UT_RUN(test_native_controls_use_original_online_owner_before_any_side_effect);
 	UT_RUN(test_native_control_error_or_expiry_releases_original_scope);
 	UT_RUN(test_native_control_rejects_bad_shape_and_identity);
