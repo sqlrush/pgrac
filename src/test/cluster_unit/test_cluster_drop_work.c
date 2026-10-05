@@ -583,7 +583,7 @@ append_promoted_work(void)
 	UT_ASSERT(cluster_space_structure_wal_encode(&change, wal, sizeof(wal)));
 	UT_ASSERT(cluster_ko_shared_observe_space_v2(owner, &terminal, wal, sizeof(wal)));
 	xact_callback(XACT_EVENT_COMMIT, NULL);
-	UT_ASSERT(cluster_ko_shared_native_handoff_v2(&owner));
+	UT_ASSERT(native_handoff_after_buffers(&owner));
 	MyBackendType = B_CHECKPOINTER;
 	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
 	prepare_files(&change);
