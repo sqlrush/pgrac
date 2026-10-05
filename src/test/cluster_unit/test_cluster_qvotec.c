@@ -2390,11 +2390,19 @@ static unsigned slow_read_count;
 static unsigned slow_region_count[3];
 static unsigned slow_hidden_count;
 static bool slow_observe_snapshot;
+static int must_be_revoked_fd = -1;
+static unsigned revocation_checks;
+static unsigned revocation_violations;
 
 ssize_t cluster_qvotec_test_pread(int fd, void *buf, size_t size, off_t offset);
 ssize_t
 cluster_qvotec_test_pread(int fd, void *buf, size_t size, off_t offset)
 {
+	if (fd == must_be_revoked_fd) {
+		revocation_checks++;
+		if (formation_snapshot_observed.complete)
+			revocation_violations++;
+	}
 	if (slow_read_us != 0) {
 		slow_read_count++;
 		if (slow_observe_snapshot && !formation_snapshot_observed.complete)
@@ -2623,6 +2631,24 @@ UT_TEST(test_completed_formation_snapshot_is_revoked_on_actual_failure)
 		formation_snapshot_requested = false;
 		fence_poll_close(&set);
 	}
+}
+
+UT_TEST(test_known_bad_slot_revokes_before_the_next_disk_read)
+{
+	PgsaDiskSet set;
+	ClusterFenceMarker marker;
+	uint8 corrupt = 0xff;
+	UT_ASSERT(slow_formation_fixture(&set, &marker));
+	UT_ASSERT_EQ(pwrite(set.fds[0], &corrupt, 1, CLUSTER_VOTING_SLOT_OFFSET(71) + 100), 1);
+	must_be_revoked_fd = set.fds[1];
+	revocation_checks = revocation_violations = 0;
+	cluster_qvotec_test_poll_once(set.fds, PGSA_TEST_DISKS, 901);
+	must_be_revoked_fd = -1;
+	UT_ASSERT(revocation_checks > 0);
+	UT_ASSERT_EQ(revocation_violations, 0);
+	UT_ASSERT(!formation_snapshot_observed.complete);
+	formation_snapshot_requested = false;
+	fence_poll_close(&set);
 }
 
 UT_TEST(test_poll_renews_real_majority_across_two_expiry_periods)
@@ -4613,7 +4639,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(89);
+	UT_PLAN(90);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -4696,6 +4722,7 @@ main(void)
 	UT_RUN(test_slow_poll_keeps_completed_formation_snapshot_visible);
 	UT_RUN(test_slow_poll_reads_contiguous_voting_regions);
 	UT_RUN(test_completed_formation_snapshot_is_revoked_on_actual_failure);
+	UT_RUN(test_known_bad_slot_revokes_before_the_next_disk_read);
 	UT_RUN(test_poll_renews_real_majority_across_two_expiry_periods);
 	UT_RUN(test_poll_uses_fence_consumer_clock_when_quorum_clock_differs);
 	UT_RUN(test_poll_cannot_republish_invalidated_or_replaced_scan);
