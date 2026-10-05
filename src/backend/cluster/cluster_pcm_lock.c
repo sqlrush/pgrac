@@ -20108,6 +20108,94 @@ cluster_pcm_lock_resource_x_holder_pair_replay_exact(const ResourceXAssertion *a
 													   authenticated_master_session, true);
 }
 
+bool
+cluster_pcm_lock_resource_x_holder_pair_wal_retained_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
+	uint64 source_generation, ResourceXSourceWalRetainedV1 *out)
+{
+	ResourceXSourceWalRetainedV1 value = { 0 };
+	ResourceXDecodedFrame status, image;
+	ClusterPcmResourceXMasterState *state;
+	PcmEntryRef entry_ref;
+	PcmEntryAcquireResult acquire_result;
+	struct GrdEntry *entry;
+	const uint8 *fence;
+	uint64 self_boot;
+	bool matched = false;
+
+	if (!cluster_enabled || !cluster_shared_config || ClusterPcm == NULL || block == NULL
+		|| out == NULL || block->kind != RESOURCE_X_WIRE_BLOCK_TO_N
+		|| !resource_x_assertion_valid(&block->common.logical_assertion)
+		|| block->common.observed_mode != PCM_STATE_X || block->common.target_mode != PCM_STATE_N
+		|| block->common.action_node != cluster_node_id
+		|| cluster_node_id < 0 || cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| authenticated_master_node < 0 || authenticated_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| block->common.assertion_sequence == 0 || block->common.assertion_sequence == UINT64_MAX
+		|| block->common.master_session_incarnation == 0
+		|| source_generation == 0 || source_generation == UINT64_MAX)
+		return false;
+	self_boot = cluster_qvotec_get_self_incarnation();
+	if (self_boot == 0
+		|| !pcm_entry_ref_acquire(&block->common.logical_assertion.resource, false, &entry_ref,
+								  &acquire_result))
+		return false;
+	entry = entry_ref.entry;
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	state = pcm_resource_x_master_state_for_entry(entry);
+	if (state == NULL || state->holder_status.valid != RESOURCE_X_HOLDER_PAIR_PENDING
+		|| state->holder_image.valid != RESOURCE_X_HOLDER_PAIR_PENDING
+		|| state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
+		|| state->holder_image_intent.state != RESOURCE_X_INTENT_SLOT_EMPTY
+		|| pcm_resource_x_holder_pair_drain_domain_locked(
+			   &entry->tag, state, authenticated_master_node, block->common.master_session_incarnation,
+			   &block->common.logical_assertion, block->common.assertion_sequence)
+			   != RESOURCE_X_APPLY_NOT_FOUND
+		|| pcm_resource_x_holder_pair_decode_locked(state, &status, &image) != RESOURCE_X_APPLY_APPLIED)
+		goto retained_wal_done;
+	fence = image.body.image_envelope.source_fence;
+	if (!resource_x_assertion_equal(&block->common.logical_assertion, &status.common.logical_assertion)
+		|| status.common.assertion_sequence != block->common.assertion_sequence
+		|| status.common.resource_formation != block->common.resource_formation
+		|| status.common.resource_formation != pg_atomic_read_u64(&ClusterPcm->resource_x_gate_formation)
+		|| status.common.master_session_incarnation != block->common.master_session_incarnation
+		|| status.common.base_authority_generation != block->common.base_authority_generation
+		|| status.common.action_node != cluster_node_id || status.common.observed_mode != PCM_STATE_X
+		|| state->holder_status.destination_node != (uint32)authenticated_master_node
+		|| fence[0] != 0 || fence[1] != 0 || fence[2] != 0 || fence[3] != (uint8)cluster_node_id
+		|| pcm_resource_x_source_fence_get_u64(fence + 4) != self_boot
+		|| pcm_resource_x_source_fence_get_u64(fence + 20) != source_generation
+		|| fence[28] != PCM_STATE_X || fence[29] != 1
+		|| image.body.image_envelope.source_carrier_generation != source_generation + 1)
+		goto retained_wal_done;
+	value.latest = image.body.image_envelope.page_wal;
+	if (!cluster_page_wal_binding_shape_v1(&value.latest)
+		|| (value.latest.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+		|| !RelFileLocatorEquals(value.latest.identity.locator, BufTagGetRelFileLocator(&entry->tag))
+		|| value.latest.identity.forknum != entry->tag.forkNum
+		|| value.latest.identity.blockno != entry->tag.blockNum)
+		goto retained_wal_done;
+	if (state->holder_pi_first.source_flags != 0
+		&& (!cluster_page_wal_ref_read_v1(&state->holder_pi_first, value.latest.identity.locator,
+										value.latest.identity.forknum, value.latest.identity.blockno,
+										&value.first)
+			|| !cluster_page_wal_binding_shape_v1(&value.first)
+			|| (value.first.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+			|| !rf_page_identity_equal_v1(&value.latest.identity, &value.first.identity)
+			|| value.latest.source.claim.database_incarnation != value.first.source.claim.database_incarnation
+			|| memcmp(value.latest.version.segment_incarnation, value.first.version.segment_incarnation, 16) != 0
+			|| (pcm_local_pi_source_equal(&value.latest.source, &value.first.source)
+				&& value.first.record_start > value.latest.record_start)))
+		goto retained_wal_done;
+	value.source_generation = source_generation;
+	value.page_checksum = image.body.image_envelope.page_checksum;
+	*out = value;
+	matched = true;
+retained_wal_done:
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&entry_ref);
+	return matched;
+}
+
 /* Classify one retained former-holder pair under the resource entry lock.
  * APPLIED means an exact, current, undrained predecessor exists and must
  * settle before a local kind-9 round may be created.  NOT_FOUND means there

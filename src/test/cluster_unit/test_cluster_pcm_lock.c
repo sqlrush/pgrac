@@ -21428,6 +21428,88 @@ r_a22_holder_pair_fixture(BufferTag tag, ClusterPageWalBindingV1 *binding,
 	first->record_end = binding->record_start;
 }
 
+UT_TEST(test_s08_finish_observes_only_the_exact_unpublished_pair)
+{
+	for (int variant = 0; variant < 15; variant++) {
+		BufferTag tag = make_tag(6640 + variant);
+		ClusterPageWalBindingV1 binding, first;
+		ClusterPageWalRefV1 ref = { 0 };
+		ClusterPcmLocalPiFloorV1 before, after;
+		ResourceXDecodedFrame block, image, status, wrong;
+		ResourceXSourceWalRetainedV1 observed, sentinel;
+		uint64 source_generation;
+		int32 master = 1;
+		bool matches = variant <= 1;
+
+		r_a22_holder_pair_fixture(tag, &binding, &first, &block, &status, &image);
+		/* This new consumer requires an actual local boot, unlike the old
+		 * transport-only fixture's opaque 0x5a fence prefix. */
+		memset(image.body.image_envelope.source_fence, 0, 4);
+		put_resource_x_test_u64(image.body.image_envelope.source_fence + 4, ut_master_session);
+		if (variant == 13)
+			image.body.image_envelope.source_fence[3] = 1;
+		if (variant == 14)
+			put_resource_x_test_u64(image.body.image_envelope.source_fence + 4, ut_master_session - 1);
+		canonicalize_resource_x_test_image(&image);
+		memcpy(status.body.blocked_to_n.source_fence, image.body.image_envelope.source_fence,
+			   sizeof(status.body.blocked_to_n.source_fence));
+		status.body.blocked_to_n.source_proof_crc32c = image.common.semantic_crc32c;
+		source_generation = image.body.image_envelope.source_carrier_generation - 1;
+		memset(&observed, 0xa5, sizeof(observed));
+		sentinel = observed;
+		UT_ASSERT(!cluster_pcm_lock_resource_x_holder_pair_wal_retained_exact(
+			&block, master, source_generation, &observed));
+		UT_ASSERT_EQ(memcmp(&observed, &sentinel, sizeof(observed)), 0);
+		if (variant != 1)
+			UT_ASSERT(cluster_page_wal_ref_retain_v1(&first, &ref));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_source_exact(
+						 &block, 1, &status, &image, &ref), RESOURCE_X_APPLY_APPLIED);
+		wrong = block;
+		switch (variant) {
+		case 0: case 1: break;
+		case 2: source_generation++; break;
+		case 3: master = 2; break;
+		case 4: wrong.common.assertion_sequence++; break;
+		case 5: wrong.common.master_session_incarnation++; break;
+		case 6: wrong.common.resource_formation++; break;
+		case 7: wrong.common.logical_assertion.resource.blockNum++; break;
+		case 8: cluster_shared_config = false; break;
+		case 9:
+			UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_publish_exact(
+				&block.common.logical_assertion, block.common.assertion_sequence, 1,
+				block.common.master_session_incarnation), RESOURCE_X_APPLY_APPLIED);
+			break;
+		case 10: source_generation = UINT64_MAX; break;
+		case 11: source_generation = 0; break;
+		case 12: wrong.common.observed_mode = PCM_STATE_S; break;
+		}
+		/* The census has a shared-only contract, including the nonshared
+		 * negative for this read-only entry point. */
+		cluster_shared_config = true;
+		UT_ASSERT(cluster_pcm_local_pi_floor_v1(&binding.source, &before));
+		if (variant == 8)
+			cluster_shared_config = false;
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_wal_retained_exact(
+			&wrong, master, source_generation, &observed), matches);
+		cluster_shared_config = true;
+		UT_ASSERT(cluster_pcm_local_pi_floor_v1(&binding.source, &after));
+		UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+		if (matches) {
+			UT_ASSERT(cluster_page_wal_same_mutation_v1(&observed.latest, &binding));
+			UT_ASSERT_EQ(observed.source_generation, source_generation);
+			UT_ASSERT_EQ(observed.page_checksum, image.body.image_envelope.page_checksum);
+			if (variant == 0)
+				UT_ASSERT(cluster_page_wal_same_mutation_v1(&observed.first, &first));
+			else
+				UT_ASSERT_EQ(observed.first.record_start, 0);
+		} else
+			UT_ASSERT_EQ(memcmp(&observed, &sentinel, sizeof(observed)), 0);
+		local_pi_writer_ready = cluster_shared_config = false;
+		if (ut_current_failed)
+			printf("# source finish retained proof variant %d\n", variant);
+	}
+}
+
 UT_TEST(test_shared_remote_holder_mirror_keeps_only_original_pi_owners)
 {
 	for (int variant = 0; variant < 3; variant++) {
@@ -22982,7 +23064,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(353);
+	UT_PLAN(354);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
@@ -23303,6 +23385,7 @@ main(void)
 	UT_RUN(test_local_pi_is_owned_before_source_pair_becomes_sendable);
 	UT_RUN(test_shared_remote_holder_mirror_keeps_only_original_pi_owners);
 	UT_RUN(test_r_a22_holder_pair_carries_first_record_to_local_pi);
+	UT_RUN(test_s08_finish_observes_only_the_exact_unpublished_pair);
 	UT_RUN(test_r_a22_unpublishable_first_record_stays_pending);
 	UT_RUN(test_r_a22_pending_first_record_survives_reconfiguration);
 	UT_RUN(test_s08_redirtied_handover_keeps_first_until_exact_receipt);

@@ -3777,7 +3777,8 @@ extern const char *cluster_bufmgr_gcs_copy_refusal_name(ClusterBufmgrGcsCopyRefu
 extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
 											  ClusterBufmgrGcsCopyRefusal *out_refusal,
 											  ClusterPageWalBindingV1 *out_wal,
-											  ClusterPageWalRefV1 *out_first);
+											  ClusterPageWalRefV1 *out_first,
+	uint32 peer_capabilities);
 extern bool cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag, SCN expected_page_scn,
 												XLogRecPtr *page_lsn_out, SCN *page_scn_out,
 												char *dst,
@@ -4565,7 +4566,8 @@ extern ResourceXApplyResult cluster_gcs_resource_x_target_acquire_reobserve_exac
 extern ResourceXApplyResult cluster_gcs_resource_x_target_evict_prepare_exact(
 	const BufferTag *tag, const ClusterPcmOwnSnapshot *exact_x, uint64 r4_record_generation,
 	uint64 reservation_token, const ClusterPageWalBindingV1 *wal,
-	ResourceXTargetEvictionPlan *plan_out);
+	ResourceXTargetEvictionPlan *plan_out,
+	const ClusterPageWalBindingV1 *first);
 extern void cluster_gcs_resource_x_target_evict_release_refs(ResourceXTargetEvictionPlan *plan);
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_evict_publish_exact(ResourceXTargetEvictionPlan *plan,
