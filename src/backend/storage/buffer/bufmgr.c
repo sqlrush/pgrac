@@ -9186,6 +9186,7 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	uint64		resource_x_activation_generation;
 	ClusterPageWalBindingV1 observed_wal, certified_wal;
 	ClusterPageWalRefV1 first_before;
+	ClusterPageWalFirstResultV1 first_state;
 	bool		first_observed = false;
 	uint64		written_token = 0;
 
@@ -9424,8 +9425,9 @@ FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	if (recovery == NULL && cluster_shared_config)
 	{
 		buf_state = LockBufHdr(buf);
-		first_observed = cluster_page_wal_first_observe_locked_v1(buf, &first_before)
-			== CLUSTER_PAGE_WAL_FIRST_PRESENT;
+		first_state = cluster_page_wal_first_observe_locked_v1(buf, &first_before);
+		first_observed = first_state == CLUSTER_PAGE_WAL_FIRST_PRESENT
+						 || first_state == CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED;
 		UnlockBufHdr(buf, buf_state);
 	}
 #endif
@@ -15564,12 +15566,13 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 				UnlockBufHdr(buf, buf_state);
 				/* The descriptor still references it under this content lock. */
 				if ((first_state != CLUSTER_PAGE_WAL_FIRST_ABSENT
-					 && first_state != CLUSTER_PAGE_WAL_FIRST_PRESENT)
+					 && first_state != CLUSTER_PAGE_WAL_FIRST_PRESENT
+					 && !(first_state == CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED
+						  && (buf_state & BM_DIRTY) != 0))
 					|| (first_state == CLUSTER_PAGE_WAL_FIRST_PRESENT
-						&& !cluster_page_wal_ref_read_v1(&first_seen,
-														 BufTagGetRelFileLocator(&buf->tag),
-														 buf->tag.forkNum, buf->tag.blockNum,
-														 &first_wal))) {
+						&& !cluster_page_wal_ref_read_v1(
+							&first_seen, BufTagGetRelFileLocator(&buf->tag), buf->tag.forkNum,
+							buf->tag.blockNum, &first_wal))) {
 					if (out_refusal != NULL)
 						*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID;
 					LWLockRelease(content_lock);
@@ -15724,7 +15727,7 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 						? first_state != CLUSTER_PAGE_WAL_FIRST_PRESENT
 							  || memcmp(&first_now, &first_seen, sizeof(first_now)) != 0
 						: first_state_now != CLUSTER_PAGE_WAL_FIRST_ABSENT
-							  || (first_state == CLUSTER_PAGE_WAL_FIRST_PRESENT && !flushed_here))
+							  || (first_state != CLUSTER_PAGE_WAL_FIRST_ABSENT && !flushed_here))
 					storage_current = false;
 				if (!storage_current || has_wal != latest_has_wal
 					|| (has_wal && !cluster_page_wal_same_mutation_v1(&wal, &latest_wal))) {

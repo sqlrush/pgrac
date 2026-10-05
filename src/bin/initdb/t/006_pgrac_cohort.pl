@@ -15,7 +15,7 @@ my $storage = '0123456789abcdef0123456789abcdef';
 
 sub request
 {
-	my ($name, $mask) = @_;
+	my ($name, $mask, $overrides) = @_;
 	my %values = (
 		'cluster.controlfile_shared_authority' => 'on',
 		'cluster.enabled' => 'on', 'cluster.merged_recovery' => 'on',
@@ -26,6 +26,16 @@ sub request
 		'cluster.smgr_user_relations' => 'on',
 		'cluster.undo_tablespace_path' => "$temp/$name-undo",
 		'cluster.wal_threads_dir' => "$temp/$name-wal");
+	# C's four-VM profile must be the real native creator's profile too.
+	# Every origin and the immutable common image must carry these values.
+	if ($name eq 'valid')
+	{
+		@values{qw(max_connections max_worker_processes max_wal_senders
+			max_prepared_transactions max_locks_per_transaction wal_level
+			wal_log_hints track_commit_timestamp)} =
+			(256, 12, 5, 0, 128, 'replica', 'on', 'off');
+	}
+	@values{keys %$overrides} = values %$overrides if $overrides;
 	my $text = "\@authority_uuid=123456789abc4ef0923456789abcdef0\n"
 		. sprintf("\@configured_0=%016x\n\@configured_1=0000000000000000\n", $mask)
 		. "\@database_incarnation=1\n\@format=1\n\@generation=1\n"
@@ -62,6 +72,35 @@ BAIL_OUT('cohort not created') unless -f "$temp/valid-caches/node_3/global/pg_co
 like($out, qr/shared startup remains closed/,
 	'creation publication does not claim shared OPEN');
 ok(-f "$temp/valid-data/global/pgrac_control_root", 'complete creator publishes ROOT last');
+
+# These failures reach the real early native child; no standalone creator
+# may apply a different namespace's parameters or extend its configured set.
+my $original_root = slurp_file("$temp/valid-data/global/pgrac_control_root");
+for my $bad ('wrong-system', 'unconfigured-origin', 'native-override')
+{
+	my @args = ('initdb', '-D', "$temp/$bad-local", '-X', "$temp/$bad-wal",
+		'-k', '-A', 'trust', '--no-locale', '--no-clean',
+		'--pgrac-initdb-thread=' . ($bad eq 'unconfigured-origin' ? 5 : 2),
+		'--pgrac-initdb-system-identifier=' . ($bad eq 'wrong-system' ? '7584383251700000002' : $sysid),
+		"--pgrac-initdb-shared-config=$temp/valid.conf");
+	push @args, '-c', 'max_connections=300' if $bad eq 'native-override';
+	command_fails_like(\@args, qr/INITDB_(?:CONFIG_CREATE|WAL_OVERRIDE):/,
+		"$bad refuses the actual native creation entry");
+	ok(!-e "$temp/$bad-local/global/pg_control", "$bad creates no native control");
+	is(slurp_file("$temp/valid-data/global/pgrac_control_root"), $original_root,
+		"$bad cannot change an existing ROOT");
+}
+
+input('minimal', request('minimal', 1, {wal_level => 'minimal', max_wal_senders => '0'}));
+command_ok([options('minimal')], 'native creation uses the requested WAL mode');
+command_like(['pg_controldata', "$temp/minimal-caches/node_0"],
+	qr/wal_level setting:\s+minimal\b/, 'native WAL mode is not patched after creation');
+
+input('unsupported-mode', request('unsupported-mode', 1, {track_commit_timestamp => 'on'}));
+command_fails_like([options('unsupported-mode')], qr/INITDB_CONFIG_CREATE:/,
+	'unsupported native mode still refuses before creation');
+ok(!-e "$temp/unsupported-mode-caches" && !-e "$temp/unsupported-mode-data",
+	'unsupported native mode creates no native or shared target');
 for my $name ('pgrac_oid_authority', 'pgrac_catalog_authority',
 	'pgrac_xid_authority', 'pgrac_xid_authority.bak',
 	'pgrac_xid_prehistory', 'pgrac_xid_prehistory.bak')
@@ -104,6 +143,13 @@ for my $node (0 .. 3)
 		'actual native control reads');
 	like($ctl, qr/Database system identifier:\s+$sysid\b/, 'common native system identity');
 	like($ctl, qr/Database cluster state:\s+shut down/, 'actual native child exited');
+	for my $setting (['max_connections', 256], ['max_worker_processes', 12],
+		['max_wal_senders', 5], ['max_prepared_xacts', 0], ['max_locks_per_xact', 128],
+		['wal_level', 'replica'], ['wal_log_hints', 'on'], ['track_commit_timestamp', 'off'])
+	{
+		like($ctl, qr/\Q$setting->[0]\E setting:\s+\Q$setting->[1]\E\b/,
+			"origin $node native $setting->[0] matches the canonical creation request");
+	}
 	my ($checkpoint) = $ctl =~ /Latest checkpoint location:\s+([0-9A-F]+\/[0-9A-F]+)/;
 	my $record;
 	ok(IPC::Run::run(['pg_waldump', '-p', $wal, '-s', $checkpoint, '-n', '1'],
@@ -258,6 +304,8 @@ if (@controls == 1)
 	copy($controls[0], "$temp/common-read/global/pg_control") or die "copy: $!";
 	command_like(['pg_controldata', "$temp/common-read"], qr/Database system identifier:\s+$sysid\b/,
 		'original native reader validates the common image');
+	command_like(['pg_controldata', "$temp/common-read"], qr/max_connections setting:\s+256\b/,
+		'ROOT common image binds the requested native capacity');
 }
 if (@catalogs == 1)
 {

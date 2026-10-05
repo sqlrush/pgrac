@@ -501,8 +501,11 @@ page_wal_first_capture(int buf_id, const ClusterPageWalBindingV1 *value, uint16 
 	if (firsts[buf_id].source_flags != 0 || pg_atomic_read_u64(&first_lsns[buf_id]) != 0)
 		return;
 	first.flags = 0;
-	if (page_wal_source_retain_index(source))
-		page_wal_slot_encode(&firsts[buf_id], &first, source);
+	/* Even without a source reference, remember the original page version
+	 * so its own successful write can discharge this exact obligation. */
+	if (!page_wal_source_retain_index(source))
+		source = 0;
+	page_wal_slot_encode(&firsts[buf_id], &first, source);
 	pg_write_barrier();
 	pg_atomic_write_u64(&first_lsns[buf_id], value->record_start);
 }
@@ -545,6 +548,10 @@ page_wal_capture_native(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
 		|| ((PageHeader)page)->pd_block_scn != result_token)
 		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
 	value.record_start = start;
+	value.record_end = end;
+	value.record_crc = crc;
+	value.rmid = rmid;
+	value.info = info;
 	if (!cluster_wal_thread_current_v2_ref(&value.source)) {
 		/* The record exists even when its source cannot be attributed.
 		 * Keep that first obligation across native binding cleanup. */
@@ -574,10 +581,6 @@ page_wal_capture_native(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
 	value.identity.blockno = buf->tag.blockNum;
 	if (!rf_page_identity_valid_v1(&value.identity))
 		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
-	value.record_end = end;
-	value.record_crc = crc;
-	value.rmid = rmid;
-	value.info = info;
 	/* This exact successful record owns the new version. Native callers set
 	 * PageLSN after XLogInsert returns, still under this content lock. */
 	old_source = bindings[buffer - 1].source_flags & PAGE_WAL_SOURCE_MASK;
@@ -749,9 +752,9 @@ cluster_page_wal_first_observe_locked_v1(BufferDesc *buf, ClusterPageWalRefV1 *o
 		return CLUSTER_PAGE_WAL_FIRST_INVALID;
 	if (!page_wal_first_present_locked(buf))
 		return CLUSTER_PAGE_WAL_FIRST_ABSENT;
+	*out = firsts[buf->buf_id];
 	if (firsts[buf->buf_id].source_flags == 0)
 		return CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED;
-	*out = firsts[buf->buf_id];
 	return CLUSTER_PAGE_WAL_FIRST_PRESENT;
 }
 
@@ -775,6 +778,8 @@ cluster_page_wal_first_clear_written_locked_v1(BufferDesc *buf, const ClusterPag
 {
 	uint32 state;
 	if (observed == NULL || !page_wal_first_present_locked(buf)
+		|| observed->start == InvalidXLogRecPtr
+		|| pg_atomic_read_u64(&first_lsns[buf->buf_id]) != observed->start
 		|| memcmp(&firsts[buf->buf_id], observed, sizeof(*observed)) != 0)
 		return false;
 	state = pg_atomic_read_u32(&buf->state);
@@ -782,7 +787,7 @@ cluster_page_wal_first_clear_written_locked_v1(BufferDesc *buf, const ClusterPag
 	 * record keeps it; a conservative keep only delays the floor. */
 	if ((state & (BM_VALID | BM_TAG_VALID)) != (BM_VALID | BM_TAG_VALID)
 		|| (state & (BM_DIRTY | BM_JUST_DIRTIED | BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0
-		|| observed->source_flags == 0 || !SCN_VALID(written_token)
+		|| !SCN_VALID(observed->token) || !SCN_VALID(written_token)
 		|| scn_total_cmp(written_token, observed->token) < 0)
 		return false;
 	pg_atomic_write_u64(&first_lsns[buf->buf_id], 0);

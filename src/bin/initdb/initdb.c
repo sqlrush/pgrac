@@ -3595,10 +3595,10 @@ pgrac_native_validate_options(void)
 			pg_fatal("INITDB_COHORT_OPTIONS: complete new cohort requires config, checksums and full sync without native or legacy overrides");
 		return;
 	}
-	if (pgrac_native_config_path != NULL
-		&& (pgrac_native_base_path == NULL || pgrac_native_sysid == 0))
-		pg_fatal("INITDB_CONFIG_OPTIONS: original shared base and explicit common system identity "
-				 "required");
+	if (pgrac_native_config_path != NULL && (pgrac_native_thread < 1 || pgrac_native_sysid == 0))
+		pg_fatal(
+			"INITDB_CONFIG_OPTIONS: original native writer and explicit common system identity "
+			"required");
 	if (pgrac_native_base_path != NULL || pgrac_native_storage_uuid != NULL
 		|| pgrac_native_database_incarnation != 0)
 	{
@@ -3946,15 +3946,17 @@ pgrac_native_child_begin(bool bootstrap)
 			context.base_device = base_st.st_dev;
 			context.base_inode = base_st.st_ino;
 			memcpy(context.storage_uuid, pgrac_native_storage_bytes, sizeof(context.storage_uuid));
-			if (pgrac_native_config.fd >= 3) {
-				context.config = pgrac_native_config;
-				pgrac_native_config_child_fd = fcntl(pgrac_native_config.fd, F_DUPFD, 3);
-				if (pgrac_native_config_child_fd < 3)
-					pg_fatal(
-						"INITDB_CONFIG_CONTEXT: cannot pass original configuration request: %m");
-				context.config.fd = pgrac_native_config_child_fd;
-			}
 		}
+	}
+	/* Every original native child needs the same recovery parameters before
+	 * sizing/control initialization. Shared-base publication remains founder
+	 * post-bootstrap only, independently bound by base_fd above. */
+	if (pgrac_native_config.fd >= 3) {
+		context.config = pgrac_native_config;
+		pgrac_native_config_child_fd = fcntl(pgrac_native_config.fd, F_DUPFD, 3);
+		if (pgrac_native_config_child_fd < 3)
+			pg_fatal("INITDB_CONFIG_CONTEXT: cannot pass original configuration request: %m");
+		context.config.fd = pgrac_native_config_child_fd;
 	}
 	if (pipe(descriptors) != 0)
 		pg_fatal("INITDB_WAL_CONTEXT: cannot create original child pipe: %m");

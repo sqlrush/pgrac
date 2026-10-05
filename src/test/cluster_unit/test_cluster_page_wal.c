@@ -991,6 +991,56 @@ UT_TEST(first_full_pool_is_an_unattributed_obligation)
 	drop_first(0);
 	UT_ASSERT_EQ(capture_many(256, 501), CLUSTER_PAGE_WAL_CAPTURED);
 	UT_ASSERT_EQ(writer_floor().unattributed, 1);
+	pg_atomic_fetch_and_u32(&buf->state, ~(BM_DIRTY | BM_JUST_DIRTIED));
+	pg_atomic_fetch_or_u32(&buf->state, BM_LOCKED);
+	UT_ASSERT(cluster_page_wal_first_clear_written_locked_v1(buf, &first, 80));
+	pg_atomic_fetch_and_u32(&buf->state, ~BM_LOCKED);
+	UT_ASSERT_EQ(writer_floor().unattributed, 0);
+}
+
+UT_TEST(unattributed_first_ends_only_with_its_exact_clean_write)
+{
+	for (unsigned variant = 0; variant < 9; variant++) {
+		ClusterPageWalRefV1 first, supplied;
+		uint32 bad_state = variant == 1	  ? BM_DIRTY
+						   : variant == 2 ? BM_JUST_DIRTIED
+						   : variant == 3 ? BM_IO_IN_PROGRESS
+						   : variant == 4 ? BM_IO_ERROR
+										  : 0;
+
+		reset();
+		selected = false;
+		UT_ASSERT_EQ(
+			cluster_page_wal_capture_native_v1(1, &edge, 80, 0x120, 0x200, 0x9192, RM_HEAP_ID, 0),
+			CLUSTER_PAGE_WAL_UNATTRIBUTED);
+		UT_ASSERT(cluster_page_wal_forget_v1(1));
+		UT_ASSERT_EQ(observe_first(&first), CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED);
+		UT_ASSERT_EQ(first.source_flags, 0);
+		UT_ASSERT_EQ(first.start, 0x120);
+		UT_ASSERT_EQ(first.token, 80);
+		supplied = first;
+		if (variant == 6)
+			supplied.start++;
+		if (variant == 7)
+			memset(&supplied, 0, sizeof(supplied));
+		if (variant == 8) {
+			pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_LOCKED);
+			cluster_page_wal_reset_reuse_locked(&desc.bufferdesc);
+			pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_LOCKED);
+			edge.result_incarnation[0]++;
+			UT_ASSERT_EQ(cluster_page_wal_capture_native_v1(1, &edge, 80, 0x120, 0x200, 0x9192,
+															RM_HEAP_ID, 0),
+						 CLUSTER_PAGE_WAL_UNATTRIBUTED);
+		}
+		UT_ASSERT_EQ(clear_written(&supplied, variant == 5 ? 79 : 80, bad_state), variant == 0);
+		UT_ASSERT_EQ(writer_floor().unattributed, variant == 0 ? 0 : 1);
+		if (variant == 0) {
+			UT_ASSERT_EQ(observe_first(&first), CLUSTER_PAGE_WAL_FIRST_ABSENT);
+			selected = true;
+			UT_ASSERT(capture_at(81, 0x220, 0x300));
+			UT_ASSERT_EQ(writer_floor().floor, 0x220);
+		}
+	}
 }
 
 UT_TEST(later_capture_failure_keeps_the_earlier_first_record)
@@ -1519,7 +1569,7 @@ UT_TEST(space_capture_unavailable_source_is_not_mutation_failure)
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(39);
 	UT_RUN(space_native_record_and_both_component_sources);
 	UT_RUN(space_advance_is_only_block_one_of_live_identity);
 	UT_RUN(native_last_record_expires_on_construction_reset_and_other_insert);
@@ -1554,6 +1604,7 @@ main(void)
 	UT_RUN(first_record_of_another_writer_is_foreign);
 	UT_RUN(first_unavailable_source_is_an_unattributed_obligation);
 	UT_RUN(first_full_pool_is_an_unattributed_obligation);
+	UT_RUN(unattributed_first_ends_only_with_its_exact_clean_write);
 	UT_RUN(later_capture_failure_keeps_the_earlier_first_record);
 	UT_RUN(first_record_write_coverage_uses_scn_total_order);
 	UT_RUN(pi_snapshot_requires_frozen_header_owner);

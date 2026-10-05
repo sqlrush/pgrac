@@ -502,10 +502,11 @@ run_origin(const char *initdb, const PgracInitdbCohortContext *request,
 	args[count++] = "--no-instructions"; args[count++] = "--no-clean";
 	args[count++] = local; args[count++] = host; args[count++] = segment;
 	args[count++] = thread; args[count++] = system;
+	args[count++] = configuration;
 	if (node == 0)
 	{
 		args[count++] = base; args[count++] = storage;
-		args[count++] = incarnation; args[count++] = configuration;
+		args[count++] = incarnation;
 	}
 	args[count] = NULL;
 	Assert(count < lengthof(args));

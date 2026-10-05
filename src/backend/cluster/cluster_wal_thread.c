@@ -55,6 +55,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_initdb_config.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_state.h" /* spec-4.2 ensure() */
 #include "cluster/cluster_wal_thread.h"
@@ -309,7 +310,7 @@ cluster_wal_thread_initdb_accept(bool bootstrap)
 		if (context.config.fd == 0) {
 			if (memcmp(&context.config, &empty, sizeof(empty)) != 0)
 				ereport(FATAL, (errmsg("INITDB_CONFIG_CONTEXT: incomplete creation request")));
-		} else if (bootstrap || context.base_fd < 3 || context.config.fd < 3
+		} else if (context.system_identifier == 0 || context.config.fd < 3
 				   || context.config.fd == context.base_fd || context.config.bytes == 0
 				   || context.config.bytes > PGRAC_INITDB_CONFIG_MAX_BYTES || any == 0
 				   || fstat(context.config.fd, &config_st) != 0 || !S_ISREG(config_st.st_mode)
@@ -321,6 +322,8 @@ cluster_wal_thread_initdb_accept(bool bootstrap)
 			ereport(FATAL,
 					(errmsg("INITDB_CONFIG_CONTEXT: invalid original configuration request")));
 	}
+	if (context.config.fd != 0)
+		cluster_initdb_config_apply_native(&context);
 	initdb_wal_context = context;
 }
 
