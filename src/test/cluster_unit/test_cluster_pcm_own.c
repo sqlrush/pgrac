@@ -3752,6 +3752,77 @@ UT_TEST(test_r_a22_copy_samples_first_record_with_its_image)
 	}
 }
 
+/*
+ * S08 handover invariant for the source copy, with or without the write
+ * before handover: a dirty MAIN or VM page whose first own record since
+ * clean is present is either written (clean, first record cleared, nothing
+ * carried) or carries that record to the caller (still dirty, record kept
+ * on the descriptor until the receiver holds it).  Never neither: that
+ * would hand a page over while its responsibility vanished.  A clean page
+ * owes nothing.  The shipped bytes are always the current page.
+ */
+UT_TEST(test_s08_copy_writes_or_carries_the_first_record)
+{
+	static const ForkNumber forks[] = { MAIN_FORKNUM, VISIBILITYMAP_FORKNUM };
+
+	for (int fork = 0; fork < lengthof(forks); fork++)
+		for (int dirty = 0; dirty < 2; dirty++) {
+			BufferDesc buf;
+			ClusterPcmOwnEntry entry;
+			ClusterPcmOwnSnapshot ignored;
+			ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+			ClusterBufmgrGcsCopyRefusal refusal;
+			PGIOAlignedBlock output;
+			ClusterPageWalBindingV1 copied_wal;
+			ClusterPageWalRefV1 first;
+			XLogRecPtr copied_lsn = 0xdead;
+			bool copied, written, carried;
+			uint32 state;
+
+			transition_fixture(&buf, &entry, &ignored, dirty);
+			buf.tag.forkNum = forks[fork];
+			transition_copy_active = true;
+			cluster_shared_config = true;
+			buf.pcm_state = PCM_STATE_X;
+			buf.buffer_type = BUF_TYPE_XCUR;
+			pg_atomic_write_u32(&entry.flags, 0);
+			transition_page_wal.record_start = 0x120;
+			transition_first_binding = transition_page_wal;
+			transition_first_binding.record_start = 0x100;
+			transition_first_binding.record_end = 0x110;
+			transition_first_state
+				= dirty ? CLUSTER_PAGE_WAL_FIRST_PRESENT : CLUSTER_PAGE_WAL_FIRST_ABSENT;
+			transition_flush_clears_first = true;
+			memset(&first, 0xa5, sizeof(first));
+			memset(output.data, 0x5a, BLCKSZ);
+			copied = cluster_bufmgr_copy_block_for_gcs(buf.tag, &copied_lsn, output.data, &refusal,
+													   &copied_wal, &first);
+			cluster_shared_config = false;
+			ClusterPcmOwnArray = saved;
+			state = pg_atomic_read_u32(&buf.state);
+			written = transition_flush_count == 1 && (state & BM_DIRTY) == 0
+					  && transition_first_state == CLUSTER_PAGE_WAL_FIRST_ABSENT;
+			carried = first.source_flags != 0 && first.start == 0x100 && (state & BM_DIRTY) != 0
+					  && transition_first_state == CLUSTER_PAGE_WAL_FIRST_PRESENT;
+			UT_ASSERT(copied);
+			UT_ASSERT_EQ(refusal, CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE);
+			UT_ASSERT_EQ(memcmp(output.data, transition_page.data, BLCKSZ), 0);
+			if (dirty) {
+				UT_ASSERT(written != carried);
+				if (written)
+					UT_ASSERT_EQ(first.source_flags, 0);
+			} else {
+				UT_ASSERT(!written && !carried);
+				UT_ASSERT_EQ(transition_flush_count, 0);
+				UT_ASSERT_EQ(first.source_flags, 0);
+			}
+			UT_ASSERT_EQ(transition_pin_count, 0);
+			UT_ASSERT(!transition_content_held && !transition_mapping_held);
+			if (ut_current_failed)
+				printf("# s08 copy fork %d dirty %d\n", (int)forks[fork], dirty);
+		}
+}
+
 UT_TEST(test_real_gcs_exact_source_recheck_and_error_cleanup)
 {
 	for (int scenario = 0; scenario < 5; scenario++) {
@@ -9079,6 +9150,7 @@ main(void)
 	UT_RUN(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only);
 	UT_RUN(test_real_gcs_wal_recheck_yields_without_exporting_an_image);
 	UT_RUN(test_r_a22_copy_samples_first_record_with_its_image);
+	UT_RUN(test_s08_copy_writes_or_carries_the_first_record);
 	UT_RUN(test_real_gcs_exact_source_recheck_and_error_cleanup);
 	UT_RUN(test_real_s_source_owns_wal_certification_cleanup);
 	UT_RUN(test_real_gcs_wal_recheck_preserves_invalid_image_and_io_refusals);
