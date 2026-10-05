@@ -211,6 +211,7 @@ TESTS += test_cluster_cr_native_origin test_cluster_cr_mvcc_origin
 TESTS += test_cluster_pcm_aux_consumer test_cluster_pcm_aux_reobserve test_cluster_resource_x_terminal_ingress
 TESTS += test_cluster_pcm_aux_mutation test_cluster_heap_extend_current
 TESTS += test_cluster_cr_inline_stop
+TESTS += test_cluster_sync_error
 
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
 
@@ -2241,15 +2242,15 @@ test_cluster_page_data_scn.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c 
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 2) exit 1 }' $< > $@
 
 test_cluster_page_data: test_cluster_page_data.c
-test_cluster_page_data test_cluster_pi_writeback: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
-test_cluster_page_data: $(CLUSTER_KO_O)
+test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error: PI_WRITEBACK_CODEC_OBJS = $(CLUSTER_KO_O)
+test_cluster_page_data test_cluster_sync_error: $(CLUSTER_KO_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback_v2.inc $(CLUSTER_KO_O)
 test_cluster_pi_writeback: test_cluster_pi_writeback.c test_cluster_page_data.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_rebuild.c \
 		$(top_srcdir)/src/include/cluster/cluster_pi_rebuild.h \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c \
 		$(top_srcdir)/src/backend/cluster/cluster_pi_data_wire.h
-test_cluster_page_data test_cluster_pi_writeback: unit_test.h test_cluster_page_data.inc test_cluster_page_data_scn.inc \
+test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error: unit_test.h test_cluster_page_data.inc test_cluster_page_data_scn.inc \
 		test_cluster_block_redeclare_scan.inc \
 		$(top_srcdir)/src/include/cluster/cluster_pi_write.h \
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h $(CLUSTER_WAL_CLAIM_O) \
@@ -2270,6 +2271,34 @@ test_cluster_page_data test_cluster_pi_writeback: unit_test.h test_cluster_page_
 		$(top_builddir)/src/common/libpgcommon_srv.a $(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lcrypto $(filter -llz4 -lzstd,$(LIBS)) -lm -o $@
+
+# Keep the native sync policy and the exact queue-full/provider boundaries.
+test_cluster_data_sync_policy.inc: $(top_srcdir)/src/backend/storage/file/fd.c Makefile
+	awk 'BEGIN { print "bool data_sync_retry = false;" } \
+	     /^data_sync_elevel\(/ { print "int"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@
+
+test_cluster_sync_providers.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_shared_fs_local.c \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_shared_fs_sharedfs.c \
+		$(top_srcdir)/src/backend/cluster/storage/cluster_shared_fs_block_device.c Makefile
+	awk '/^cluster_shared_fs_(local|sharedfs|block_device)_immedsync\(/ { print "static void"; emit=1; n++ } \
+	     /^cluster_shared_fs_(local|sharedfs|block_device)_barrier_sync\(/ { print "static int"; emit=1; n++ } \
+	     /^cluster_shared_fs_(local|sharedfs)_write\(/ || /^raw_device_sync\(/ { print "static int"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 9 || emit) exit 1 }' $(filter %.c,$^) > $@
+
+test_cluster_sync_dispatch.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_shared_fs.c Makefile
+	awk '/^cluster_shared_fs_(write|barrier_sync)\(/ { print "int"; emit=1; n++ } \
+	     /^cluster_shared_fs_immedsync\(/ { print "void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@
+
+test_cluster_sync_smgr.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_smgr.c Makefile
+	awk '/^cluster_smgr_(init_filetag|register_dirty)\(/ { print "static void"; emit=1; n++ } \
+	     /^cluster_smgr_write\(/ { print "void"; emit=1; n++ } \
+	     emit { print } emit && /^}/ { emit=0 } END { if (n != 3 || emit) exit 1 }' $< > $@
+
+test_cluster_sync_error: test_cluster_sync_error.c test_cluster_page_data.c \
+		test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc
+test_cluster_shared_fs test_cluster_smgr test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_shared_fs_drop: test_cluster_data_sync_policy.inc
 
 test_cluster_space_recovery: test_cluster_space_recovery.c unit_test.h test_cluster_space_recovery_flush.inc \
 		test_cluster_space_recovery_product.o test_cluster_space_storage_product.o $(CLUSTER_HW_O) $(CLUSTER_UNIT_CRYPTOHASH_O) \
@@ -3823,7 +3852,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-$(filter-out test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_sync_error test_cluster_initdb_wal test_cluster_initdb_base test_cluster_initdb_side test_cluster_initdb_relmap test_cluster_initdb_config test_cluster_initdb_origin test_cluster_initdb_common test_cluster_initdb_tree test_cluster_initdb_cohort test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # The wire behavior is inline; an updated decoder must rebuild this binary.

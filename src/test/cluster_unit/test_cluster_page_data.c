@@ -129,6 +129,8 @@ cluster_grd_block_redeclare_state_v1(BufferTag tag, uint64 epoch, uint64 *hash)
 }
 static bool stale_sync, redirty_sync, checksums = true;
 static bool zero_disk, late_fence;
+/* A storage-boundary fixture may drive the original smgr/provider chain. */
+static void (*storage_write_hook)(SMgrRelation, ForkNumber, BlockNumber, const void *, bool);
 static bool storage_read, storage_cut_current = true, storage_cut_changed, storage_space_changed;
 static bool remote_data_ready;
 static ClusterPageWalBindingV1 remote_data_binding;
@@ -709,6 +711,10 @@ smgropen(RelFileLocator r, BackendId b)
 void
 smgrwrite(SMgrRelation r, ForkNumber f, BlockNumber b, const void *data, bool skip)
 {
+	if (storage_write_hook != NULL) {
+		storage_write_hook(r, f, b, data, skip);
+		return;
+	}
 	UT_ASSERT(locks[0] && locks[data_slot] && wal_flushes);
 	UT_ASSERT_EQ(f, target.identity.forknum);
 	UT_ASSERT_EQ(b, target.identity.blockno);
@@ -819,12 +825,14 @@ shared_buffer_write_error_callback(void *arg)
 #define BufferIsPinned(buf) (pins[(buf) - 1] != 0)
 #define pgstat_prepare_io_time() ((instr_time){ 0 })
 #define pgstat_count_io_op_time(a, b, c, d, e) ((void)(d))
+#ifndef PGRAC_TEST_SYNC_ERROR
 #undef ereport
 #define ereport(level, rest)                                                                       \
 	do {                                                                                           \
 		InterruptHoldoffCount = 0;                                                                 \
 		pg_re_throw();                                                                             \
 	} while (0)
+#endif
 #include "test_cluster_space_recovery_flush.inc"
 #include "test_cluster_page_flush.inc"
 #include "test_cluster_page_data_scn.inc"
