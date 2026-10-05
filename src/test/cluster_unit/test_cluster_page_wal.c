@@ -358,6 +358,37 @@ current_binding(void)
 	return result;
 }
 static void
+output_snapshot_retains_exact_failed_output_binding(void)
+{
+	for (int variant = 0; variant < 9; variant++) {
+		ClusterPageWalBindingV1 original, observed;
+		uint32 before;
+
+		reset();
+		UT_ASSERT(capture());
+		PageSetLSNPreserveOrigin(page.data, 0x200);
+		original = current_binding();
+		pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_ERROR);
+		switch (variant) {
+		case 1: pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_IN_PROGRESS); break;
+		case 2: pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_DIRTY); break;
+		case 3: pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_VALID); break;
+		case 4: locked = false; break;
+		case 5: ((PageHeader)page.data)->pd_block_scn++; break;
+		case 6: PageSetLSNPreserveOrigin(page.data, 0x201); break;
+		case 7: UT_ASSERT(cluster_page_wal_forget_v1(1)); break;
+		case 8: pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_TAG_VALID); break;
+		}
+		before = pg_atomic_read_u32(&desc.bufferdesc.state);
+		UT_ASSERT(!cluster_page_wal_snapshot_v1(1, &observed));
+		UT_ASSERT_EQ(cluster_page_wal_output_snapshot_v1(1, &observed), variant < 2);
+		if (variant < 2)
+			UT_ASSERT(cluster_page_wal_same_mutation_v1(&original, &observed));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&desc.bufferdesc.state), before);
+	}
+}
+
+static void
 resident_binding_memory_budget(void)
 {
 	Size one, many;
@@ -1642,7 +1673,8 @@ UT_TEST(space_capture_unavailable_source_is_not_mutation_failure)
 int
 main(void)
 {
-	UT_PLAN(41);
+	UT_PLAN(42);
+	UT_RUN(output_snapshot_retains_exact_failed_output_binding);
 	UT_RUN(private_record_resident_publication_uses_native_last_insert);
 	UT_RUN(private_record_publication_rejects_expired_record_or_changed_owner);
 	UT_RUN(space_native_record_and_both_component_sources);

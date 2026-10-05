@@ -51,6 +51,13 @@ volatile uint32 CritSectionCount, InterruptHoldoffCount;
 int cluster_node_id = 0, NBuffers = 2, NLocBuffer;
 bool cluster_enabled = true, cluster_shared_config = true, cluster_shared_catalog = true;
 bool cluster_smart_fusion, cluster_past_image;
+#ifndef PGRAC_TEST_REAL_PI_WRITEBACK
+uint32
+cluster_ic_local_capability_word(void)
+{
+	return PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+}
+#endif
 ResourceOwner CurrentResourceOwner = (void *)1;
 BackendType MyBackendType = B_BG_WRITER;
 MemoryContext TopMemoryContext = (void *)1;
@@ -1233,7 +1240,8 @@ foreign_certified_image_uses_original_wal(void)
 static void
 ordinary_flush_uses_original_source(void)
 {
-	for (int scenario = 0; scenario < 4; scenario++) {
+	for (int failed_output = 0; failed_output < 2; failed_output++)
+	for (int scenario = 0; scenario < 4 + failed_output; scenario++) {
 		ClusterPageWalBindingV1 certified, original;
 		ClusterPageWalInstallV1 prepared = { 0 };
 		volatile bool threw = false;
@@ -1260,6 +1268,13 @@ ordinary_flush_uses_original_source(void)
 		 * page. Its ordinary ResourceOwner error cleanup is a fixture here. */
 		pins[1] = 1;
 		locks[0] = locks[1] = true;
+		if (failed_output)
+			pg_atomic_fetch_or_u32(&descriptors[1].bufferdesc.state, BM_IO_ERROR);
+		if (scenario == 4) {
+			source_capture = true;
+			UT_ASSERT(cluster_page_wal_forget_v1(2));
+			source_capture = false;
+		}
 		PG_TRY();
 		{
 			FlushBuffer(&descriptors[1].bufferdesc, &relation, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
@@ -1273,9 +1288,9 @@ ordinary_flush_uses_original_source(void)
 		PG_END_TRY();
 		locks[0] = locks[1] = false;
 		pins[1] = 0;
-		UT_ASSERT_EQ(threw, scenario == 3);
+		UT_ASSERT_EQ(threw, scenario >= 3);
 		UT_ASSERT_EQ(wal_flushes, 1); /* Foreign cases only flushed at A. */
-		UT_ASSERT_EQ(writes, scenario == 3 ? 0 : 1);
+		UT_ASSERT_EQ(writes, scenario >= 3 ? 0 : 1);
 		clean();
 	}
 }

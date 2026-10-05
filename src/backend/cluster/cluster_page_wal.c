@@ -257,8 +257,8 @@ cluster_page_wal_same_mutation_v1(const ClusterPageWalBindingV1 *a,
 	return memcmp(&left, &right, sizeof(left)) == 0;
 }
 
-bool
-cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
+static bool
+page_wal_snapshot(Buffer buffer, ClusterPageWalBindingV1 *out, bool output)
 {
 	BufferDesc *buf;
 	ClusterPageWalBindingV1 value;
@@ -271,7 +271,8 @@ cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
 	state = pg_atomic_read_u32(&buf->state);
 	if ((state & (BM_VALID | BM_TAG_VALID | BM_PERMANENT))
 			!= (BM_VALID | BM_TAG_VALID | BM_PERMANENT)
-		|| (state & BM_IO_ERROR) != 0 || !page_wal_expand(buf, &value)
+		|| ((state & BM_IO_ERROR) != 0 && (!output || (state & BM_DIRTY) == 0))
+		|| !page_wal_expand(buf, &value)
 		|| !cluster_page_wal_binding_matches_v1(&value, BufTagGetRelFileLocator(&buf->tag),
 												buf->tag.forkNum, buf->tag.blockNum,
 												BufferGetPage(buffer)))
@@ -279,6 +280,21 @@ cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
 	*out = value;
 	return true;
 }
+
+bool
+cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
+{
+	return page_wal_snapshot(buffer, out, false);
+}
+
+bool
+cluster_page_wal_output_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
+{
+	/* Output failure does not invalidate dirty page bytes or their source.
+	 * This read grants no I/O authority and does not acknowledge the error. */
+	return page_wal_snapshot(buffer, out, true);
+}
+
 bool
 cluster_page_wal_pi_snapshot_locked_v1(BufferDesc *buf, ClusterPageWalBindingV1 *out)
 {
