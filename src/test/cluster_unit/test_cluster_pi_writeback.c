@@ -813,6 +813,101 @@ wb_elog(int level, const char *format, ...)
  * page_data; a returned transport ACK here is not a physical-disposal test. */
 static bool wb_structural_fact_ready;
 static ClusterPiWritebackFactV2 wb_structural_fact;
+static bool wb_structure_schedule, wb_structure_proof_ok, wb_structure_local_ok;
+static unsigned wb_structure_local_acks, wb_structure_imports, wb_structure_completions;
+/* Scheduler-only opaque-owner seams. The PAGE suite separately verifies
+ * real sealed ancestry, physical disposal and local/remote ACK lifetimes. */
+static bool
+wb_structure_next_for_schedule(uint32 *cursor, uint64 *serial, ClusterPageWalBindingV1 *terminal)
+{
+	if (!wb_structure_schedule || *cursor > 7)
+		return false;
+	*cursor = 8;
+	*serial = 19;
+	*terminal = wb_structural_fact.proof.structural.terminal.binding;
+	return true;
+}
+static bool
+wb_structure_receipt_for_schedule(uint32 slot, uint64 serial, const RfPageIdentityV1 *page,
+								  const ClusterThreadRecoveryFabricPlanV1 *plan,
+								  ClusterPageStructuralReceiptV2 **out)
+{
+	BufferTag tag;
+	InitBufferTag(&tag, &page->locator, page->forknum, page->blockno);
+	UT_ASSERT(wb_inputs_pinned[0] && cluster_node_id == 0);
+	if (!wb_structure_proof_ok || slot != 7 || serial != 19 || (const void *)plan != wb_page_plan
+		|| !BufferTagsEqual(&tag, &wb_storage_cut.resource))
+		return false;
+	*out = (void *)73;
+	return true;
+}
+static bool
+wb_structure_proof_for_schedule(const ClusterPageStructuralReceiptV2 *receipt,
+								ClusterPcmPiWriteCutV1 *x, ClusterPcmPiStorageCutV1 *s)
+{
+	if (!wb_structure_proof_ok || receipt != (void *)73)
+		return false;
+	*x = wb_structural_fact.proof.structural.terminal.write_cut;
+	*s = wb_structural_fact.proof.structural.terminal.storage_cut;
+	return true;
+}
+static bool
+wb_structure_local_ack_for_schedule(const ClusterPageStructuralReceiptV2 *receipt,
+									ClusterWalInputsV1 *inputs, ClusterPiStructuralAckV2 **out)
+{
+	if (receipt != (void *)73)
+		return cluster_bufmgr_ack_pi_at_structure_v2(receipt, inputs, out);
+	UT_ASSERT(cluster_node_id == 0 && wb_inputs_pinned[0] && inputs == (void *)1);
+	if (!wb_structure_local_ok || !wb_structure_proof_ok || receipt != (void *)73)
+		return false;
+	wb_structure_local_acks++;
+	*out = (void *)91;
+	return true;
+}
+static bool
+wb_structure_import_for_schedule(const ClusterPiWritebackJobV1 *job, uint32 index,
+								 const ClusterPageStructuralReceiptV2 *receipt,
+								 ClusterWalInputsV1 *inputs, ClusterPiStructuralAckV2 **out)
+{
+	ClusterWalWriterToken peer;
+	UT_ASSERT(cluster_node_id == 0 && wb_inputs_pinned[0] && inputs == (void *)1);
+	if (!wb_structure_proof_ok
+		|| !cluster_pi_writeback_structural_ack_read_v2(job, index, receipt, &peer)
+		|| peer.ref.claim.identity.origin_node_id != 1)
+		return false;
+	wb_structure_imports++;
+	*out = (void *)92;
+	return true;
+}
+static bool
+wb_structure_complete_for_schedule(const ClusterPageStructuralReceiptV2 *receipt,
+								   const ClusterPiStructuralAckV2 *const *acks, uint32 count,
+								   uint32 *holders)
+{
+	UT_ASSERT(cluster_node_id == 0 && wb_inputs_pinned[0]);
+	if (!wb_structure_proof_ok || receipt != (void *)73 || count != 2 || acks[0] != (void *)91
+		|| acks[1] != (void *)92)
+		return false;
+	wb_structure_completions++;
+	*holders = 3;
+	return true;
+}
+static void
+wb_structure_receipt_free_for_schedule(ClusterPageStructuralReceiptV2 **receipt)
+{
+	if (*receipt == (void *)73)
+		*receipt = NULL;
+	else
+		cluster_page_structural_receipt_free_v2(receipt);
+}
+static void
+wb_structure_ack_free_for_schedule(ClusterPiStructuralAckV2 **ack)
+{
+	if (*ack == (void *)91 || *ack == (void *)92)
+		*ack = NULL;
+	else
+		cluster_page_structural_pi_ack_free_v2(ack);
+}
 static bool
 wb_structural_fact_for_transport(const ClusterPageStructuralReceiptV2 *receipt, int32 peer,
 								 ClusterPiWritebackFactV2 *out)
@@ -829,10 +924,26 @@ static bool wb_offer_complete_for_transport(uint32 slot, uint64 serial,
 											const ClusterPiWritebackJobV1 *job);
 #define cluster_ko_shared_structure_offer_next_v2 wb_offer_read_for_transport
 #define cluster_ko_shared_structure_offer_complete_v2 wb_offer_complete_for_transport
+#define cluster_ko_shared_structure_next_v2 wb_structure_next_for_schedule
+#define cluster_page_structural_from_ko_v2 wb_structure_receipt_for_schedule
+#define cluster_page_structural_pi_proof_v2 wb_structure_proof_for_schedule
+#define cluster_bufmgr_ack_pi_at_structure_v2 wb_structure_local_ack_for_schedule
+#define cluster_page_structural_pi_ack_import_v2 wb_structure_import_for_schedule
+#define cluster_pcm_lock_pi_structural_complete_v2 wb_structure_complete_for_schedule
+#define cluster_page_structural_receipt_free_v2 wb_structure_receipt_free_for_schedule
+#define cluster_page_structural_pi_ack_free_v2 wb_structure_ack_free_for_schedule
 #include "../../backend/cluster/cluster_pi_writeback.c"
 #undef cluster_page_structural_pi_fact_v2
 #undef cluster_ko_shared_structure_offer_next_v2
 #undef cluster_ko_shared_structure_offer_complete_v2
+#undef cluster_ko_shared_structure_next_v2
+#undef cluster_page_structural_from_ko_v2
+#undef cluster_page_structural_pi_proof_v2
+#undef cluster_bufmgr_ack_pi_at_structure_v2
+#undef cluster_page_structural_pi_ack_import_v2
+#undef cluster_pcm_lock_pi_structural_complete_v2
+#undef cluster_page_structural_receipt_free_v2
+#undef cluster_page_structural_pi_ack_free_v2
 #include "../../backend/cluster/cluster_pi_rebuild.c"
 #undef palloc0
 
@@ -875,9 +986,15 @@ wb_setup(void)
 	wb_offer_present = false;
 	wb_offer_accepted = 0;
 	wb_offer_complete_calls = 0;
+	wb_structure_schedule = false;
+	wb_structure_proof_ok = wb_structure_local_ok = true;
+	wb_structure_local_acks = wb_structure_imports = wb_structure_completions = 0;
 	memset(wb_offer_scan, 0, sizeof(wb_offer_scan));
 	wb_offer_peer = 0;
-	wb_offer_turn = true;
+	wb_batch_turn = WB_BATCH_STRUCTURE;
+	wb_structure_scan = 0;
+	memset(wb_structure_page_scan, 0, sizeof(wb_structure_page_scan));
+	memset(wb_structure_serials, 0, sizeof(wb_structure_serials));
 	wb_page_plan = prepare_storage_observation(wb_sources, &wb_storage_cut);
 	wb_storage_cut.master_session_incarnation = 9;
 	UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&target, &wb_storage_cut, wb_page_plan,
@@ -1913,7 +2030,10 @@ int
 main(void)
 {
 	printf("# sizeof_WritebackShared=%zu\n", sizeof(WritebackShared));
-	UT_PLAN(68);
+	UT_PLAN(71);
+	UT_RUN(writeback_v2_structure_scheduler_collects_all_original_page_acks);
+	UT_RUN(writeback_v2_structure_scheduler_refuses_unproved_pages_and_partial_acks);
+	UT_RUN(writeback_v2_structure_scheduler_yields_or_cancels_without_clearing_ko);
 	UT_RUN(writeback_v2_checkpointer_dispatches_offer_without_data);
 	UT_RUN(writeback_v2_checkpointer_preserves_offer_on_refusal_and_stop);
 	UT_RUN(writeback_v2_checkpointer_empty_ack_keeps_offer_and_yields_to_data);

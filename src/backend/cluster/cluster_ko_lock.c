@@ -107,7 +107,7 @@
  * ============================================================ */
 
 #define CLUSTER_KO_INBOUND_CAPACITY 64
-#define CLUSTER_KO_SHARED_CAPACITY 64
+#define CLUSTER_KO_SHARED_CAPACITY CLUSTER_KO_SHARED_CONTEXT_LIMIT_V2
 #define CLUSTER_KO_SHARED_NODE_LIMIT 16
 
 typedef struct ClusterKoSharedContext {
@@ -1104,6 +1104,25 @@ cluster_ko_shared_structure_observation_v2(uint32 slot, uint64 serial,
 	*terminal = context.terminal;
 	memcpy(wal, context.structure, sizeof(context.structure));
 	return true;
+}
+
+bool
+cluster_ko_shared_structure_next_v2(uint32 *cursor, uint64 *serial,
+									ClusterPageWalBindingV1 *terminal)
+{
+	if (cursor == NULL || serial == NULL || terminal == NULL
+		|| *cursor >= CLUSTER_KO_SHARED_CAPACITY)
+		return false;
+	for (uint32 i = *cursor; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
+		ClusterKoSharedContext context;
+		if (!ko_shared_structure_snapshot(i, &context))
+			continue;
+		*cursor = i + 1;
+		*serial = context.serial;
+		*terminal = context.terminal;
+		return true;
+	}
+	return false;
 }
 
 bool
