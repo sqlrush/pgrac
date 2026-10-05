@@ -2274,7 +2274,7 @@ test_cluster_page_data test_cluster_pi_writeback test_cluster_sync_error: unit_t
 
 # Keep the native sync policy and the exact queue-full/provider boundaries.
 test_cluster_data_sync_policy.inc: $(top_srcdir)/src/backend/storage/file/fd.c Makefile
-	awk 'BEGIN { print "bool data_sync_retry = false;" } \
+	awk 'BEGIN { print "#include \"storage/fd.h\"\nbool data_sync_retry = false;" } \
 	     /^data_sync_elevel\(/ { print "int"; emit=1; n++ } \
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1 || emit) exit 1 }' $< > $@
 
@@ -4346,6 +4346,8 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_data_sync_policy.inc test_cluster_sync_providers.inc \
+		test_cluster_sync_dispatch.inc test_cluster_sync_smgr.inc
 	rm -f test_cluster_tt_rollback_entry.inc
 	rm -f test_cluster_tt_terminal_route.inc test_cluster_tt_terminal_route.inc.tmp
 	rm -f test_cluster_typed_redo_reader.inc test_cluster_typed_redo_fpi.inc test_cluster_cold_init_native.inc

@@ -2,7 +2,8 @@
 # Author: SqlRush <sqlrush@gmail.com>
 test_pgrac_shared_config = shared_module('test_pgrac_shared_config',
   files('test_pgrac_shared_config.c',
-        'test_pgrac_wal_history_native.c'),
+        'test_pgrac_wal_history_native.c',
+        'test_pgrac_storage_sync.c'),
   kwargs: pg_test_mod_args,
 )
 test_install_libs += test_pgrac_shared_config
@@ -21,5 +22,6 @@ tests += {
                     't/014_process_inheritance.pl', 't/015_parallel_inheritance.pl',
                     't/017_selection_memory.pl', 't/018_native_delivery.pl',
                     't/023_transaction_delivery.pl', 't/025_common_use.pl',
-                    't/031_shared_alter_system.pl', 't/032_shared_index_scope.pl']},
+                    't/031_shared_alter_system.pl', 't/032_shared_index_scope.pl',
+                    't/101_storage_sync_error.pl']},
 }
