@@ -3788,6 +3788,47 @@ cluster_qvotec_get_status(void)
 	return 0;
 }
 
+/* Later link-only boundaries of the same objects (startup refresh, phase-3/4
+ * reports, startup activation poll, lifecycle dump row): the debug unit never
+ * runs them, so each returns the neutral unavailable/false value. */
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_control_observe.h"
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+volatile uint32 CritSectionCount = 0;
+
+bool
+cluster_cf_held(LOCKMODE mode pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_formation_witness_last_diagnostic_v1(ClusterFormationWitnessDiagnosticV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+
+const char *
+cluster_qvotec_get_quorum_state_name(void)
+{
+	return "unavailable";
+}
+
+bool
+cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refusal)
+{
+	if (refusal != NULL)
+		memset(refusal, 0, sizeof(*refusal));
+	return false;
+}
+
+char *
+cluster_control_observe_writer_json(void)
+{
+	return NULL; /* the lifecycle row reports "unavailable" */
+}
+
 uint64
 cluster_membership_get_last_admitted_incarnation(int32 node_id pg_attribute_unused())
 {
