@@ -895,9 +895,14 @@ cluster_shared_fs_sharedfs_drop_work(ClusterKoDropWorkV2 *work)
 			state->truncated = true;
 		}
 		if (!state->main_synced) {
-			if (!cluster_ko_shared_drop_work_revalidate_v2(work)
-				|| pg_fsync(state->forks[MAIN_FORKNUM].fd) != 0)
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work))
 				return false;
+			if (pg_fsync(state->forks[MAIN_FORKNUM].fd) != 0) {
+				/* The OS may have discarded dirty bytes. A later successful
+				 * fsync is not proof; retain the original WAL obligation. */
+				state->failed = true;
+				return false;
+			}
 			state->main_synced = true;
 		}
 		for (; state->unlink_next <= MAX_FORKNUM; state->unlink_next++) {
@@ -913,9 +918,12 @@ cluster_shared_fs_sharedfs_drop_work(ClusterKoDropWorkV2 *work)
 		}
 		if (!state->directory_synced) {
 			if (!sharedfs_drop_work_namespace(work, state)
-				|| !cluster_ko_shared_drop_work_revalidate_v2(work)
-				|| pg_fsync(state->directory) != 0)
+				|| !cluster_ko_shared_drop_work_revalidate_v2(work))
 				return false;
+			if (pg_fsync(state->directory) != 0) {
+				state->failed = true;
+				return false;
+			}
 			state->directory_synced = true;
 		}
 		if (!sharedfs_drop_work_namespace(work, state))
