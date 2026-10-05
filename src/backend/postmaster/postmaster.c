@@ -1342,7 +1342,18 @@ PostmasterMain(int argc, char *argv[])
 
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_shared_config)
+	{
 		checkPostmasterGucCombinations();
+
+		/*
+		 * PGRAC: refuse a change to a parameter that the root-selected control
+		 * file recorded at creation before shared memory and any cluster
+		 * startup work, so that a refused start writes no voting disk,
+		 * formation, ROOT, WAL or control file.  Author: SqlRush
+		 * <sqlrush@gmail.com>
+		 */
+		ClusterRequireRecordedParameters();
+	}
 #endif
 
 	/*

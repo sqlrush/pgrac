@@ -146,10 +146,11 @@
  *	Modified by: SqlRush <sqlrush@gmail.com>
  *
  *	What changed:
- *	  - StartupXLOG(): with cluster.shared_config, a parameter that differs
- *	    from the value the shared control file recorded at creation is
- *	    refused with FATAL naming each change, before the first durable
- *	    startup write.
+ *	  - ClusterRequireRecordedParameters(): with cluster.shared_config, a
+ *	    parameter that differs from the value the shared control file
+ *	    recorded at creation is refused with FATAL naming each change.
+ *	    PostmasterMain calls it before any cluster startup work; StartupXLOG
+ *	    repeats it before its first durable write.
  *	  - XLogReportParameters(): the same refusal keeps the UpdateControlFile
  *	    PANIC unreachable.
  *
@@ -863,7 +864,6 @@ static void UpdateControlFile(void);
 static void UpdateFullPageWritesInternal(bool allow_cluster_disable);
 #ifdef USE_PGRAC_CLUSTER
 static bool ClusterWalStateConfigured(void);
-static void ClusterRequireRecordedParameters(void);
 static bool ClusterWalRetentionE1Cutoff(
 	ClusterWalRetentionE1Context *context, XLogRecPtr redo,
 	XLogRecPtr endptr, XLogRecPtr slotsMinReqLSN,
@@ -6502,9 +6502,9 @@ StartupXLOG(void)
 		cluster_control_bootstrap_native_inputs_require(DataDir);
 
 	/* PGRAC: a parameter the shared control file recorded at creation must
-	 * not have changed.  Refuse before writer selection, ROOT, WAL or control
-	 * file writes, so that a refused start leaves no new writer generation.
-	 * Author: SqlRush <sqlrush@gmail.com> */
+	 * not have changed.  The postmaster already refused such a start; this
+	 * covers standalone backends, before writer selection, ROOT, WAL or
+	 * control file writes.  Author: SqlRush <sqlrush@gmail.com> */
 	if (cluster_shared_config)
 		ClusterRequireRecordedParameters();
 
@@ -10526,11 +10526,17 @@ ClusterWalLevelName(int level)
 /*
  * PGRAC (shared native parameters): the shared control file records these
  * parameters when the cluster is created, and no typed purpose can update
- * them afterwards.  StartupXLOG calls this before its first durable write
- * (writer selection, ROOT, WAL or control file); a changed value ends the
- * start with FATAL naming each change.  Returns when nothing changed.
+ * them afterwards.  A changed value ends the start with FATAL naming each
+ * change; returns when nothing changed.
+ *
+ * PostmasterMain calls this once the root-selected control file is
+ * installed, before shared memory and any cluster startup work, so that a
+ * refused start writes no voting disk, formation, ROOT, WAL or control
+ * file.  StartupXLOG repeats it before its first durable write for
+ * standalone backends, and XLogReportParameters keeps the native
+ * UpdateControlFile PANIC unreachable.
  */
-static void
+void
 ClusterRequireRecordedParameters(void)
 {
 	StringInfoData changed;

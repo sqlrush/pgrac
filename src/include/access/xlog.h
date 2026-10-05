@@ -239,6 +239,10 @@ extern void XLogValidateControlFile(const struct ControlFileData *control);
 /* PGRAC: early process-local initialization, not serving/recovery admission. */
 extern void XLogInstallBootstrapControlFile(const struct ControlFileData *control, bool reset);
 extern void XLogCompleteBootstrapControlFile(void);
+#ifdef USE_PGRAC_CLUSTER
+/* Refuse a change to a parameter the shared control file recorded at creation. */
+extern void ClusterRequireRecordedParameters(void);
+#endif
 extern WalLevel GetActiveWalLevelOnStandby(void);
 extern void StartupXLOG(void);
 extern void ShutdownXLOG(int code, Datum arg);

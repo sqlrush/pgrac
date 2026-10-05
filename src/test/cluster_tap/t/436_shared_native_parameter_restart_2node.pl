@@ -12,9 +12,10 @@
 #           every member and changes nothing; another common parameter is
 #           still accepted
 #      L2   with a recorded parameter changed in every member's own
-#           configuration, the start is refused with 55R07, no member
-#           reaches readiness or PANICs, and the control files, the control
-#           ROOT and every WAL file are byte-for-byte unchanged
+#           configuration, every postmaster refuses with 55R07 before any
+#           cluster startup phase (so no voting disk or formation write),
+#           no member reaches readiness or PANICs, and the control files,
+#           the control ROOT and every WAL file are byte-for-byte unchanged
 #      L3   with the value restored, the cluster starts and serves SQL
 #
 # IDENTIFICATION
@@ -139,13 +140,15 @@ for my $i (0 .. $#nodes)
 	unlike($log, qr/PANIC:/, "L2 node$i has no PANIC");
 	unlike($log, qr/database system is ready to accept connections/,
 		"L2 node$i does not reach readiness");
+	unlike($log, qr/cluster startup: phase0_base -> phase1_cluster|qvotec:/,
+		"L2 node$i refuses before any cluster startup phase");
 	next unless $log =~ /FATAL:.*shared cluster parameters recorded at creation cannot be changed/;
 	$refused++;
 	like($log, qr/PGRAC_REASON=NATIVE_PARAMETER_CHANGE \Q$name=$changed (created with $recorded)\E\./,
 		"L2 node$i names the change and its creation value");
 	like($log, qr/HINT:.*creation values/, "L2 node$i says how to recover");
 }
-ok($refused >= 1, 'L2 the start ends with the recorded-parameter refusal');
+is($refused, scalar(@nodes), 'L2 every member refuses the recorded-parameter change');
 my $after = durable_state();
 is_deeply([sort keys %$after], [sort keys %$before], 'L2 no WAL or control file was created or removed');
 for my $file (sort keys %$before)

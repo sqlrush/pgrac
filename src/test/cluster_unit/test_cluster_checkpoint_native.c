@@ -1286,7 +1286,7 @@ cluster_control_bootstrap_native_inputs_require(const char *pgdata pg_attribute_
  * before any other startup control step; refused, nothing else runs. */
 static unsigned parameter_checks;
 static bool parameters_changed;
-static void
+void
 ClusterRequireRecordedParameters(void)
 {
 	UT_ASSERT_EQ(parameter_checks + 1, input_checks);

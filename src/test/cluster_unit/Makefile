@@ -5869,8 +5869,22 @@ test_cluster_shared_parameters_order.inc: $(top_srcdir)/src/backend/access/trans
 		END { n = split("require seal select recovery fpw report", k, " "); \
 			for (i = 1; i <= n; i++) printf "#define STARTUP_LINE_%s %d\n", toupper(k[i]), line[k[i]] + 0 }' $< > $@
 
+# PGRAC: where PostmasterMain refuses, relative to the root-selected control
+# file and the first cluster startup work.
+test_cluster_shared_parameters_postmaster.inc: $(top_srcdir)/src/backend/postmaster/postmaster.c Makefile
+	@awk '/^PostmasterMain\(/ { fn=1 } \
+		fn && /^}/ { exit } \
+		function at(name) { if (!(name in line)) line[name] = NR } \
+		fn && /LocalProcessControlFile\(false\);/ { at("control") } \
+		fn && /ClusterRequireRecordedParameters\(\);/ { at("require") } \
+		fn && /process_shared_preload_libraries\(\);/ { at("preload") } \
+		fn && /CreateSharedMemoryAndSemaphores\(\);/ { at("shmem") } \
+		END { n = split("control require preload shmem", k, " "); \
+			for (i = 1; i <= n; i++) printf "#define POSTMASTER_LINE_%s %d\n", toupper(k[i]), line[k[i]] + 0 }' $< > $@
+
 test_cluster_shared_parameters: test_cluster_shared_parameters.c test_cluster_shared_parameters.inc \
-		test_cluster_shared_parameters_order.inc unit_test.h cluster_unit_port_stubs.o
+		test_cluster_shared_parameters_order.inc test_cluster_shared_parameters_postmaster.inc \
+		unit_test.h cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # PGRAC: shared ALTER SYSTEM with its policy table, from cluster_shared_config_guc.c.

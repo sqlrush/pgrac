@@ -3,9 +3,9 @@
  * test_cluster_shared_parameters.c
  *	  The parameters pg_control records, against a shared control file.
  *
- *	  Runs the real ClusterRequireRecordedParameters (called by StartupXLOG
- *	  before its first durable write) and XLogReportParameters, extracted
- *	  from xlog.c.  With cluster.shared_config a changed parameter ends the
+ *	  Runs the real ClusterRequireRecordedParameters (called by PostmasterMain
+ *	  before any cluster startup work, and by StartupXLOG for standalone
+ *	  backends) and XLogReportParameters, extracted from xlog.c.  With cluster.shared_config a changed parameter ends the
  *	  start with FATAL 55R07 naming every change, before the parameter-change
  *	  record and without reaching UpdateControlFile; unchanged parameters
  *	  return; without shared configuration the native update is unchanged.
@@ -199,6 +199,7 @@ errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused()
 #endif
 #include "test_cluster_shared_parameters.inc"
 #include "test_cluster_shared_parameters_order.inc"
+#include "test_cluster_shared_parameters_postmaster.inc"
 
 static void
 reset(bool shared)
@@ -368,10 +369,21 @@ UT_TEST(startup_refuses_before_its_first_durable_write)
 	UT_ASSERT(STARTUP_LINE_REPORT > STARTUP_LINE_FPW);
 }
 
+/* The postmaster refuses with the root-selected control file installed and
+ * before shared memory, the cluster startup phases or any voting-disk,
+ * formation, ROOT, WAL or control-file write. */
+UT_TEST(postmaster_refuses_before_any_cluster_startup)
+{
+	UT_ASSERT(POSTMASTER_LINE_CONTROL > 0);
+	UT_ASSERT(POSTMASTER_LINE_REQUIRE > POSTMASTER_LINE_CONTROL);
+	UT_ASSERT(POSTMASTER_LINE_PRELOAD > POSTMASTER_LINE_REQUIRE);
+	UT_ASSERT(POSTMASTER_LINE_SHMEM > POSTMASTER_LINE_REQUIRE);
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(shared_unchanged_parameters_write_nothing);
 	UT_RUN(shared_changed_parameter_is_refused_before_any_write);
 	UT_RUN(shared_refusal_names_every_changed_parameter);
@@ -379,6 +391,7 @@ main(void)
 	UT_RUN(startup_check_returns_when_nothing_changed);
 	UT_RUN(startup_check_refuses_each_parameter_alone);
 	UT_RUN(startup_refuses_before_its_first_durable_write);
+	UT_RUN(postmaster_refuses_before_any_cluster_startup);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
