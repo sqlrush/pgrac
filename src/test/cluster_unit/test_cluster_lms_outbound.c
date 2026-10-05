@@ -125,6 +125,7 @@ static uint64 ut_request_epoch = 7;
 static uint64 ut_member_cut = 2;
 static uint64 ut_data_stream[CLUSTER_MAX_NODES];
 static int ut_absent_member = -1;
+static int ut_stream_sample_drift;
 
 uint64
 cluster_epoch_get_current(void)
@@ -161,6 +162,11 @@ cluster_ic_tier1_resource_x_stream_generation(int32 peer, int channel)
 {
 	UT_ASSERT(channel >= 0 && channel < CLUSTER_LMS_MAX_WORKERS);
 	UT_ASSERT(peer >= 0 && peer < CLUSTER_MAX_NODES);
+	if (ut_stream_sample_drift == 1)
+		ut_request_epoch++;
+	else if (ut_stream_sample_drift == 2)
+		ut_member_cut += 2;
+	ut_stream_sample_drift = 0;
 	return ut_data_stream[peer];
 }
 static uint32 ut_peer_capabilities[CLUSTER_MAX_NODES];
@@ -847,6 +853,7 @@ ut_reset_log(void)
 	ut_request_epoch = 7;
 	ut_member_cut = 2;
 	ut_absent_member = -1;
+	ut_stream_sample_drift = 0;
 	for (int node = 0; node < CLUSTER_MAX_NODES; node++)
 		ut_data_stream[node] = 11;
 	ut_sent_n = 0;
@@ -2483,10 +2490,128 @@ UT_TEST(test_first_read_reserves_return_capacity_during_concurrent_refill)
 	UT_ASSERT_EQ(ut_count_marker(0x81), 1);
 }
 
+UT_TEST(test_plain_frame_down_epoch_change_clears_stop_debt_without_send)
+{
+	int worker;
+	uint32 slot;
+	const char *reason;
+
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	ut_data_stream[UT_PEER_X] = 0;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	UT_ASSERT(ut_enqueue_marker(1, UT_PEER_X, 0xa1));
+	for (int attempt = 0; attempt < 3; attempt++) {
+		UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+		UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 1);
+	}
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+		CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(reason, "OUTBOUND_FRAME_PENDING") == 0);
+	ut_sent_n = 0;
+	ut_request_epoch++;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+		CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_plain_frame_retained_copy_rejects_member_and_stream_changes)
+{
+	for (int drift = 0; drift < 4; drift++) {
+		ut_captured_region->init_fn();
+		ut_reset_log();
+		ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+		UT_ASSERT(ut_enqueue_marker(1, UT_PEER_X, 0xa2));
+		UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+		UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 1);
+		ut_sent_n = 0;
+		if (drift == 0)
+			ut_member_cut += 2;
+		else if (drift == 1)
+			ut_data_stream[UT_PEER_X] = 0;
+		else if (drift == 2)
+			ut_data_stream[UT_PEER_X]++;
+		else
+			ut_member_cut = 0;
+		ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+		UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+		UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+		UT_ASSERT_EQ(ut_sent_n, 0);
+	}
+}
+
+UT_TEST(test_plain_frame_initial_hello_wait_keeps_order_and_transfers_once)
+{
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	ut_request_epoch = 0; /* A legitimate original INITIAL execution. */
+	ut_data_stream[UT_PEER_X] = 0;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	ut_peer_rc[UT_PEER_Y] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT(ut_enqueue_marker(1, UT_PEER_X, 0xa3));
+	UT_ASSERT(ut_enqueue_marker(1, UT_PEER_Y, 0xa4));
+	UT_ASSERT(ut_enqueue_marker(1, UT_PEER_X, 0xa5));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 2);
+	ut_sent_n = 0;
+	ut_data_stream[UT_PEER_X] = 11;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_WOULD_BLOCK;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 2);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+	UT_ASSERT_EQ(ut_sent_n, 2);
+	UT_ASSERT_EQ(ut_sent_log[0].marker, 0xa3);
+	UT_ASSERT_EQ(ut_sent_log[1].marker, 0xa5);
+	ut_request_epoch++;
+	ut_data_stream[UT_PEER_X]++;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+	UT_ASSERT_EQ(ut_sent_n, 2);
+}
+
+UT_TEST(test_plain_frame_unknown_cut_has_no_delayed_send_qualification)
+{
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	ut_member_cut = 0;
+	UT_ASSERT(!ut_enqueue_marker(1, UT_PEER_X, 0xa6));
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+}
+
+UT_TEST(test_plain_frame_enqueue_rechecks_cut_around_stream_sample)
+{
+	for (int drift = 1; drift <= 2; drift++) {
+		ut_captured_region->init_fn();
+		ut_reset_log();
+		ut_stream_sample_drift = drift;
+		UT_ASSERT(!ut_enqueue_marker(1, UT_PEER_X, 0xa7));
+		UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+		UT_ASSERT_EQ(ut_sent_n, 0);
+	}
+}
+
+UT_TEST(test_plain_frame_old_head_does_not_block_new_cut_frame)
+{
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	UT_ASSERT(ut_enqueue_marker(1, UT_PEER_X, 0xa8));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+	ut_sent_n = 0;
+	ut_member_cut += 2;
+	UT_ASSERT(ut_enqueue_marker(1, UT_PEER_X, 0xa9));
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	UT_ASSERT_EQ(ut_sent_log[0].marker, 0xa9);
+}
+
 int
 main(void)
 {
-	UT_PLAN(52);
+	UT_PLAN(58);
 
 	UT_RUN(test_normal_stop_missing_outbound_is_not_empty);
 	UT_RUN(test_ring_shmem_init);
@@ -2540,6 +2665,12 @@ main(void)
 	UT_RUN(test_first_read_real_send_failure_is_not_reclassified_as_peer_wait);
 	UT_RUN(test_first_read_unknown_membership_cannot_create_retained_qualification);
 	UT_RUN(test_first_read_reserves_return_capacity_during_concurrent_refill);
+	UT_RUN(test_plain_frame_down_epoch_change_clears_stop_debt_without_send);
+	UT_RUN(test_plain_frame_retained_copy_rejects_member_and_stream_changes);
+	UT_RUN(test_plain_frame_initial_hello_wait_keeps_order_and_transfers_once);
+	UT_RUN(test_plain_frame_unknown_cut_has_no_delayed_send_qualification);
+	UT_RUN(test_plain_frame_enqueue_rechecks_cut_around_stream_sample);
+	UT_RUN(test_plain_frame_old_head_does_not_block_new_cut_frame);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
