@@ -73,6 +73,7 @@
 #include "cluster/cluster_hw_lease.h"	/* spec-6.12d — per-node HW space leases */
 #include "cluster/cluster_extend_gate.h" /* spec-5.7 §3.1d — liveness engage gate */
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_ic.h"
 #include "cluster/cluster_sf_dep.h"		/* spec-6.2 Smart Fusion DBWR brake */
 #include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D3/D4 — read probe + relkind hint */
 #include "cluster/cluster_itl.h"	/* spec-6.12a — quiescent check for X->S downgrade */
@@ -15425,10 +15426,54 @@ cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag, SCN expected_page_scn,
 	return true;
 }
 
+/* The original Resource-X copy owner retains the descriptor's first record
+ * until its existing PENDING/PI consumer takes it. This is only a copy
+ * qualification, never a DATA receipt or permission to retire that record.
+ * Caller holds content-X and the descriptor header lock.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+cluster_bufmgr_gcs_copy_defer_data(BufferDesc *buf, uint32 state, Page page,
+								 const ClusterPageWalBindingV1 *wal,
+								 bool received,
+								 ClusterPageWalFirstResultV1 first_state,
+								 const ClusterPageWalBindingV1 *first)
+{
+	if ((state & BM_PERMANENT) == 0 || buf->pcm_state != PCM_STATE_X
+		|| buf->buffer_type != BUF_TYPE_XCUR || buf->tag.spcOid == UNDOTABLESPACE_OID
+		|| (buf->tag.forkNum != MAIN_FORKNUM && buf->tag.forkNum != VISIBILITYMAP_FORKNUM)
+		|| PageIsUndoSegmentHeader(page) || PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+		|| (wal->flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+		|| !rf_page_identity_valid_v1(&wal->identity)
+		|| !cluster_page_wal_binding_matches_v1(wal, BufTagGetRelFileLocator(&buf->tag),
+												  buf->tag.forkNum, buf->tag.blockNum, page))
+		return false;
+	/* An unmodified received image has no first own record. The latest
+	 * binding still travels with it; the original writer's PI stays owed. */
+	if (first_state == CLUSTER_PAGE_WAL_FIRST_ABSENT)
+		return received;
+	if (first_state != CLUSTER_PAGE_WAL_FIRST_PRESENT
+		|| !cluster_page_wal_binding_shape_v1(first)
+		|| (first->flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+		|| !rf_page_identity_equal_v1(&first->identity, &wal->identity)
+		|| first->source.claim.database_incarnation != wal->source.claim.database_incarnation
+		|| memcmp(first->version.segment_incarnation, wal->version.segment_incarnation, 16) != 0
+		|| scn_total_cmp(first->version.mutation_token, wal->version.mutation_token) > 0)
+		return false;
+	/* LSN ordering is meaningful only within exactly the same WAL source. */
+	if (memcmp(&first->source.claim.identity, &wal->source.claim.identity,
+			   sizeof(wal->source.claim.identity)) == 0
+		&& memcmp(first->source.claim.claim_sha256, wal->source.claim.claim_sha256, 32) == 0
+		&& first->source.timeline == wal->source.timeline
+		&& first->record_start > wal->record_start)
+		return false;
+	return true;
+}
+
 /*
- * Copy the 8KB block bytes for `tag` into *dst, flushing WAL up to the
- * page's LSN before reading the bytes (HC82 I-WAL-before-ship), then making
- * any dirty source current in shared storage before it may be retired.  Sets
+ * Copy the 8KB block bytes for `tag` into *dst after certifying durability
+ * in the page's native WAL source (HC82 I-WAL-before-ship).
+ * Qualified MAIN/VM keeps its dirty obligation for the original PI owner;
+ * other sources must first become current in shared storage. Sets
  * *out_page_lsn to the page LSN observed at the second-stable revalidation.
  *
  * Returns false on a non-resident or non-current image, either conditional
@@ -15456,6 +15501,7 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	int buf_id;
 	BufferDesc *buf;
 	LWLock *content_lock;
+	LWLockMode copy_lock_mode = LW_SHARED;
 	XLogRecPtr first_lsn;
 	XLogRecPtr second_lsn;
 	int retries;
@@ -15477,6 +15523,8 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	ClusterPageWalFirstResultV1 first_state = CLUSTER_PAGE_WAL_FIRST_ABSENT;
 	ClusterPageWalFirstResultV1 first_state_now;
 	bool flushed_here;
+	bool defer_data;
+	uint32 copy_forbidden;
 
 	if (out_wal != NULL)
 		memset(out_wal, 0, sizeof(*out_wal));
@@ -15493,6 +15541,16 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 			*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INVALID_ARGUMENT;
 		return false;
 	}
+	/* The capability remains unadvertised until the complete PI retirement
+	 * chain is active. Legacy callers without both carriers keep their DATA
+	 * guard. Use the same conditional acquisitions in exclusive mode so
+	 * hint writers cannot race a qualified dirty memcpy. No WAL wait is
+	 * performed while this lock is held. */
+	if (cluster_shared_config && out_wal != NULL && out_first != NULL
+		&& (tag.forkNum == MAIN_FORKNUM || tag.forkNum == VISIBILITYMAP_FORKNUM)
+		&& tag.spcOid != UNDOTABLESPACE_OID
+		&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0)
+		copy_lock_mode = LW_EXCLUSIVE;
 
 	hashcode = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hashcode);
@@ -15545,9 +15603,9 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	PG_TRY();
 	{
 		for (retries = 0; retries < 2; retries++) {
-			/* Read page_lsn under content_lock SHARED.  Never park a GCS DATA
+			/* Read page_lsn under the content lock. Never park a GCS DATA
 		 * worker behind a backend that may itself be waiting for this worker. */
-			if (!LWLockConditionalAcquire(content_lock, LW_SHARED)) {
+			if (!LWLockConditionalAcquire(content_lock, copy_lock_mode)) {
 				if (out_refusal != NULL)
 					*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST;
 				break;
@@ -15609,12 +15667,12 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 			}
 
 			/*
-		 * Reacquire content_lock SHARED and revalidate that the page LSN has
+		 * Reacquire the content lock and revalidate that the page LSN has
 		 * not advanced past first_lsn AND the buffer tag still matches.
 		 * Either signals concurrent mutation that would break HC82's "ship
 		 * the bytes that I just flushed WAL for" contract.
 		 */
-			if (!LWLockConditionalAcquire(content_lock, LW_SHARED)) {
+			if (!LWLockConditionalAcquire(content_lock, copy_lock_mode)) {
 				if (out_refusal != NULL)
 					*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND;
 				break;
@@ -15629,7 +15687,9 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 				needs_flush
 					= current
 					  && (buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0;
-				storage_current = current && (buf_state & BM_IO_ERROR) == 0;
+				storage_current = current
+					&& (buf_state & (BM_IO_ERROR
+						| (copy_lock_mode == LW_EXCLUSIVE ? BM_IO_IN_PROGRESS : 0))) == 0;
 
 				UnlockBufHdr(buf, buf_state);
 				if (!storage_current) {
@@ -15666,10 +15726,36 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 				&& (!has_wal || cluster_page_wal_same_mutation_v1(&wal, &latest_wal))) {
 				uint32 buf_state;
 
+				defer_data = false;
+				if (copy_lock_mode == LW_EXCLUSIVE) {
+					buf_state = LockBufHdr(buf);
+					first_state_now = cluster_page_wal_first_observe_locked_v1(buf, &first_now);
+					storage_current = first_state_now == first_state
+						&& (first_state == CLUSTER_PAGE_WAL_FIRST_ABSENT
+							|| memcmp(&first_now, &first_seen, sizeof(first_now)) == 0);
+					if (storage_current && has_wal)
+						defer_data = cluster_bufmgr_gcs_copy_defer_data(
+							buf, buf_state, page, &wal,
+							(latest_wal.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) != 0,
+							first_state, &first_wal);
+					UnlockBufHdr(buf, buf_state);
+					if (!storage_current) {
+						if (out_refusal != NULL)
+							*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_WAL_RECHECK_CHANGED;
+						LWLockRelease(content_lock);
+						content_locked = false;
+						continue;
+					}
+				}
+				copy_forbidden = BM_IO_ERROR | BM_IO_IN_PROGRESS;
+				if (!defer_data)
+					copy_forbidden |= BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED;
+
 				/* A queue handoff may retire this descriptor immediately after
-			 * copying it.  Make the shared-storage fallback at least as current
-			 * as the shipped image before publishing that handoff watermark. */
-				if (needs_flush) {
+			 * copying it. Qualified MAIN/VM retains its first and dirty state
+			 * for the original PI handover; every other class still requires
+			 * the shared-storage fallback to cover the shipped image. */
+				if (needs_flush && !defer_data) {
 					Assert(!cluster_pcm_x_finish_retain_flush_active);
 					Assert(!cluster_pcm_x_finish_retain_flush_io_active);
 					Assert(!cluster_pcm_x_finish_retain_flush_error_context_pushed);
@@ -15689,10 +15775,7 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 				storage_current = BufferTagsEqual(&buf->tag, &tag)
 								  && cluster_bufmgr_pcm_current_image_locked(buf, buf_state)
 								  && PageGetLSN(page) == second_lsn
-								  && (buf_state
-									  & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED
-										 | BM_IO_ERROR | BM_IO_IN_PROGRESS))
-										 == 0;
+								  && (buf_state & copy_forbidden) == 0;
 				UnlockBufHdr(buf, buf_state);
 				if (!storage_current) {
 					if (out_refusal != NULL)
@@ -15707,16 +15790,17 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 					= cluster_shared_config
 					  && cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &latest_wal);
 
-				/* Hint-bit dirties may occur under a shared content lock.  Do not
-			 * certify a copy if one raced the memcpy after the first clean check. */
+				/* The legacy shared-lock copy still rejects hint-bit dirties.
+			 * The qualified copy holds content-X and preserves dirty bits. */
 				buf_state = LockBufHdr(buf);
 				storage_current = BufferTagsEqual(&buf->tag, &tag)
 								  && cluster_bufmgr_pcm_current_image_locked(buf, buf_state)
 								  && PageGetLSN(page) == second_lsn
-								  && (buf_state
-									  & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED
-										 | BM_IO_ERROR | BM_IO_IN_PROGRESS))
-										 == 0;
+								  && (buf_state & copy_forbidden) == 0
+								  && (!defer_data
+									  || cluster_page_wal_binding_matches_v1(&wal,
+										  BufTagGetRelFileLocator(&tag), tag.forkNum, tag.blockNum,
+										  (Page)dst));
 				first_state_now = out_first != NULL && cluster_shared_config
 									  ? cluster_page_wal_first_observe_locked_v1(buf, &first_now)
 									  : CLUSTER_PAGE_WAL_FIRST_ABSENT;

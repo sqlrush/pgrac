@@ -4334,6 +4334,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_page_wal_image.inc
 	rm -f test_cluster_page_flush.inc
 	rm -f test_cluster_pcm_s_prepare.inc
+	rm -f test_cluster_pcm_page_identity.inc test_cluster_pcm_page_identity.inc.tmp
 	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
 	rm -f test_cluster_ko_postcommit.inc
 	rm -f test_cluster_space_extend.inc test_cluster_space_extend_finish.inc
@@ -5023,6 +5024,7 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     /^cluster_pcm_own_bump_locked\(/ { print "static inline ClusterPcmOwnResult"; emit=1; bump++ } \
 	     /^cluster_pcm_own_eviction_commit_locked\(/ { print "static ClusterPcmOwnResult"; emit=1; evict++ } \
 	     /^cluster_bufmgr_pcm_current_image_locked\(/ { print "static inline bool"; emit=1; shape++ } \
+	     /^cluster_bufmgr_gcs_copy_defer_data\(/ { print "static bool"; emit=1; defer_data++ } \
 	     /^cluster_bufmgr_copy_block_for_gcs\(/ { print "bool"; emit=1; wal_copy++ } \
 	     /^cluster_bufmgr_pcm_direct_init_known_new_locked\(/ { print "static bool"; emit=1; known_new++ } \
 	     /^cluster_bufmgr_pcm_own_snapshot_by_tag\(/ { print "ClusterPcmOwnResult"; emit=1; ordinary_lookup++ } \
@@ -5050,7 +5052,7 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     /^cluster_bufmgr_pcm_own_reclaim_read_image_for_delivery_exact\(/ { print "ClusterPcmOwnResult"; emit=1; read_delivery++ } \
 	     /^cluster_pcm_own_abort_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; grant_abort++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (s_candidate != 1 || retained_candidate != 1 || storage_candidate != 1 || predecessor_observe != 1 || read_reclaim != 1 || read_delivery != 1) exit 1 } \
+	     END { if (defer_data != 1 || s_candidate != 1 || retained_candidate != 1 || storage_candidate != 1 || predecessor_observe != 1 || read_reclaim != 1 || read_delivery != 1) exit 1 } \
 	     END { if (ordinary_snapshot != 1 || n_candidate != 1 || bump_failure != 1 || bump != 1 || evict != 1 || shape != 1 || wal_copy != 1 || known_new != 1 || ordinary_lookup != 1 || direct_lookup != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || held_valid != 1 || held_validate != 1 || held_adopt != 1 || held_finish != 1 || held_abandon != 1 || drop != 1 || finish != 1 || delivery_begin != 1 || delivery_snapshot != 1 || delivery_release != 1 || normal_reserve != 1 || delivery_reserve != 1 || read_publish != 1 || read_clear != 1 || read_release != 1 || grant_abort != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
@@ -5204,7 +5206,17 @@ test_cluster_bufmgr_stop: test_cluster_bufmgr_stop.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_PCM_OWN_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
+test_cluster_pcm_page_identity.inc: $(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c \
+		$(top_srcdir)/src/backend/cluster/cluster_scn.c Makefile
+	awk '/^bytes_nonzero\(/ { print "static bool"; emit=1; bytes++ } \
+	     /^rf_page_identity_(valid|equal)_v1\(/ { print "bool"; emit=1; identity++ } \
+	     /^scn_(time|total)_cmp\(/ { print "int"; emit=1; scn++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (bytes != 1 || identity != 2 || scn != 2 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
+		test_cluster_pcm_page_identity.inc \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_pcm_transition_owner.inc \
 		test_cluster_pcm_flush_owner.inc \
 		test_cluster_pcm_gcs_drop.inc test_cluster_pcm_downgrade.inc test_cluster_pcm_eviction_gate.inc \
