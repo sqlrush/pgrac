@@ -4567,6 +4567,14 @@ test_cluster_voting_disk_io: test_cluster_voting_disk_io.c unit_test.h \
 # spec-2.6 Sprint A Step 2 D4: cluster_quorum_decision.o standalone test.
 # Pure logic — no shmem, no I/O, no logging.  Synthetic slot matrix
 # tests majority math + collision direction (Q6 v0.2 newer-self-FATAL).
+# Original process-local diagnostic context for the bootstrap publication slice.
+test_cluster_qvotec_initial_trace.inc: $(top_srcdir)/src/backend/cluster/cluster_qvotec.c Makefile
+	awk '/^static struct \{/ { capture=1 } \
+	     capture { body=body $$0 "\n" } \
+	     capture && /^}.*;/ { if ($$0 == "} qvotec_initial_trace;") { printf "%s", body; found++ } capture=0; body="" } \
+	     END { if (found != 1 || capture) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_qvotec_bootstrap_publish.inc: $(top_srcdir)/src/backend/cluster/cluster_qvotec.c Makefile
 	awk '/cluster_reconfig_bootstrap_publish_begin\(\);/ { emit=1; begin++ } \
 	     emit { print } /cluster_reconfig_bootstrap_publish_end\(\);/ { emit=0; end++ } \
@@ -4574,7 +4582,7 @@ test_cluster_qvotec_bootstrap_publish.inc: $(top_srcdir)/src/backend/cluster/clu
 	mv $@.tmp $@
 
 test_cluster_quorum_decision: test_cluster_quorum_decision.c unit_test.h \
-		test_cluster_qvotec_bootstrap_publish.inc \
+		test_cluster_qvotec_bootstrap_publish.inc test_cluster_qvotec_initial_trace.inc \
 		$(CLUSTER_VERSION_O) $(CLUSTER_QUORUM_DECISION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_QUORUM_DECISION_O) -o $@
