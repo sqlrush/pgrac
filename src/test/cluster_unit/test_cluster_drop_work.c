@@ -510,20 +510,53 @@ retry_fault(enum WorkFault fault, const char *name)
 		retry_fault(fault, #name);                                                                 \
 	}
 RETRY_TEST(test_work_truncate_retry, WORK_TRUNCATE)
-RETRY_TEST(test_work_main_fsync_retry, WORK_MAIN_SYNC)
 RETRY_TEST(test_work_aux_unlink_retry, WORK_AUX)
 RETRY_TEST(test_work_partial_aux_retry, WORK_PARTIAL)
-RETRY_TEST(test_work_directory_sync_after_space_unlink_retry, WORK_DIR_SYNC)
+
+static void
+sync_failure_requires_recovery(enum WorkFault fault, const char *name)
+{
+	unsigned old_unlinks, old_syncs;
+	if (!work_setup(name))
+		return;
+	work_fault = fault;
+	UT_ASSERT(!poll_work());
+	UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+	old_unlinks = unlinks;
+	old_syncs = main_syncs + dir_syncs;
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	/* The OS may discard dirty data on the first fsync error. A later
+	 * successful fsync cannot authorize completion of this work. */
+	work_fault = WORK_OK;
+	for (unsigned retry = 0; retry < 3; retry++) {
+		UT_ASSERT(!poll_work());
+		UT_ASSERT_EQ(main_syncs + dir_syncs, old_syncs);
+		UT_ASSERT_EQ(unlinks, old_unlinks);
+		UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+		UT_ASSERT(storage.contexts[work_slot].structure_owned);
+		UT_ASSERT_EQ(truncates, 1);
+	}
+}
+
+UT_TEST(test_work_main_fsync_failure_requires_recovery)
+{
+	sync_failure_requires_recovery(WORK_MAIN_SYNC, "main_sync_failure");
+}
+
+UT_TEST(test_work_directory_sync_failure_requires_recovery)
+{
+	sync_failure_requires_recovery(WORK_DIR_SYNC, "directory_sync_failure");
+}
 
 UT_TEST(test_work_permanent_failure_is_bounded_and_keeps_responsibility)
 {
 	if (!work_setup("permanent"))
 		return;
-	work_fault = WORK_MAIN_SYNC;
+	work_fault = WORK_TRUNCATE;
 	for (unsigned n = 1; n <= 3; n++) {
 		UT_ASSERT(!poll_work());
-		UT_ASSERT_EQ(main_syncs, n);
-		UT_ASSERT_EQ(truncates, 1);
+		UT_ASSERT_EQ(main_syncs, 0);
+		UT_ASSERT_EQ(truncates, n);
 		UT_ASSERT_EQ(unlinks, 0);
 		UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
 	}
@@ -765,10 +798,10 @@ main(void)
 	UT_RUN(test_work_success_keeps_main_and_structure_obligation);
 	UT_RUN(test_work_absent_auxiliary_forks_are_not_unlink_completions);
 	UT_RUN(test_work_truncate_retry);
-	UT_RUN(test_work_main_fsync_retry);
+	UT_RUN(test_work_main_fsync_failure_requires_recovery);
 	UT_RUN(test_work_aux_unlink_retry);
 	UT_RUN(test_work_partial_aux_retry);
-	UT_RUN(test_work_directory_sync_after_space_unlink_retry);
+	UT_RUN(test_work_directory_sync_failure_requires_recovery);
 	UT_RUN(test_work_permanent_failure_is_bounded_and_keeps_responsibility);
 	UT_RUN(test_work_finish_retry_never_reopens_or_repeats_io);
 	UT_RUN(test_work_retry_rejects_replacement_aux_without_unlinking_it);
