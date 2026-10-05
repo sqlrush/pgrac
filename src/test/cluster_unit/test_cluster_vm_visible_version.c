@@ -27,6 +27,7 @@
 #include "access/xloginsert.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_wal_thread.h"
@@ -62,7 +63,7 @@ static unsigned edge_count, inserts, dirty[2], registered[2], lock_calls;
 static TransactionId expected_cutoff;
 static int nonpermanent_buffer;
 static uint8 register_flags[2];
-static bool begun, expecting_error, checksums;
+static bool begun, expecting_error, checksums, repairing;
 static jmp_buf error_jump;
 
 void
@@ -198,7 +199,8 @@ void
 MarkBufferDirty(Buffer buffer)
 {
 	UT_ASSERT(buffer == 1 || buffer == 2);
-	UT_ASSERT(CritSectionCount > 0);
+	if (cluster_shared_config || !repairing)
+		UT_ASSERT(CritSectionCount > 0);
 	dirty[buffer - 1]++;
 }
 void
@@ -238,13 +240,14 @@ XLogInsert(RmgrId rmgr, uint8 info)
 	UT_ASSERT(begun && dirty[1] > 0);
 	if (cluster_shared_config)
 		UT_ASSERT(dirty[0] > 0);
-	UT_ASSERT_EQ(rmgr, RM_HEAP2_ID);
-	UT_ASSERT_EQ(info, XLOG_HEAP2_VISIBLE);
+	UT_ASSERT_EQ(rmgr, repairing ? RM_XLOG_ID : RM_HEAP2_ID);
+	UT_ASSERT_EQ(info, repairing ? XLOG_FPI : XLOG_HEAP2_VISIBLE);
 	begun = false;
 	inserts++;
 	return UINT64_C(0x9000);
 }
 
+#include "test_cluster_vm_repair_clear.inc"
 #include "test_cluster_vm_visible_log.inc"
 static void
 run_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr, Buffer vmBuf,
@@ -262,6 +265,7 @@ run_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr, Bu
 	memset(edges, 0, sizeof(edges));
 	memset(dirty, 0, sizeof(dirty));
 	memset(registered, 0, sizeof(registered));
+	memset(register_flags, 0, sizeof(register_flags));
 	BufferBlocks = pages[0].data;
 	cluster_shared_config = shared;
 	CritSectionCount = 0;
@@ -269,7 +273,7 @@ run_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr, Bu
 	lock_calls = 0;
 	expected_cutoff = 70;
 	nonpermanent_buffer = 0;
-	begun = expecting_error = InRecovery = wal_log_hints = checksums = false;
+	begun = expecting_error = InRecovery = wal_log_hints = checksums = repairing = false;
 	next_token = 100;
 	edge_token = 0;
 	relation.rd_rel = &relform;
@@ -427,6 +431,94 @@ UT_TEST(test_recovery_uses_record_lsn_without_runtime_identity_or_wal)
 	UT_ASSERT_EQ(PageGetLSN(pages[1].data), UINT64_C(0x8000));
 	UT_ASSERT(memcmp(before[0].data, pages[0].data, BLCKSZ) == 0);
 }
+#include "test_cluster_vm_repair_versioned.inc"
+
+static void
+run_actual_visibility_repair(bool lpdead)
+{
+	struct {
+		Relation rel;
+		const char *relname;
+		bool versioned;
+		ClusterSpaceIdentity identity;
+	} state, *vacrel = &state;
+	Buffer buf pg_attribute_unused() = 1, vmbuffer = 2;
+	BlockNumber blkno = 0;
+	Page page pg_attribute_unused() = pages[0].data;
+
+	state.rel = &relation;
+	state.relname = "visibility_repair";
+	state.versioned = cluster_shared_config;
+	state.identity = identity;
+	repairing = true;
+	if (lpdead) {
+#include "test_cluster_vm_repair_lpdead.inc"
+	} else {
+#include "test_cluster_vm_repair_missing_heap.inc"
+	}
+	repairing = false;
+}
+
+UT_TEST(test_actual_vacuum_repairs_version_both_pages)
+{
+	for (int lpdead = 0; lpdead < 2; lpdead++) {
+		reset(true, lpdead != 0, VISIBILITYMAP_VALID_BITS);
+		run_actual_visibility_repair(lpdead != 0);
+		UT_ASSERT_EQ(inserts, 1);
+		UT_ASSERT_EQ(edge_count, 2);
+		UT_ASSERT_EQ(next_token, 101);
+		UT_ASSERT_EQ(edges[0].before.mutation_token, 30);
+		UT_ASSERT_EQ(edges[1].before.mutation_token, 20);
+		UT_ASSERT_EQ(edges[0].block_id, 0);
+		UT_ASSERT_EQ(edges[1].block_id, 1);
+		UT_ASSERT_EQ(registered[0] + registered[1], 2);
+		UT_ASSERT((register_flags[0] & REGBUF_FORCE_IMAGE) != 0);
+		UT_ASSERT((register_flags[1] & REGBUF_FORCE_IMAGE) != 0);
+		UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 101);
+		UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 101);
+		UT_ASSERT_EQ(PageGetLSN(pages[0].data), UINT64_C(0x9000));
+		UT_ASSERT_EQ(PageGetLSN(pages[1].data), UINT64_C(0x9000));
+		UT_ASSERT(!PageIsAllVisible(pages[0].data));
+		UT_ASSERT_EQ(*PageGetContents(pages[1].data), 0);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+	}
+}
+
+UT_TEST(test_actual_vacuum_repair_refuses_before_modification)
+{
+	for (int lpdead = 0; lpdead < 2; lpdead++) {
+		volatile bool caught = false;
+		reset(true, lpdead != 0, VISIBILITYMAP_VALID_BITS);
+		nonpermanent_buffer = 2;
+		expecting_error = true;
+		if (setjmp(error_jump) == 0)
+			run_actual_visibility_repair(lpdead != 0);
+		else
+			caught = true;
+		expecting_error = repairing = false;
+		UT_ASSERT(caught);
+		UT_ASSERT(memcmp(pages, before, sizeof(pages)) == 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT_EQ(inserts + edge_count + dirty[0] + dirty[1], 0);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+	}
+}
+
+UT_TEST(test_nonshared_vacuum_repairs_keep_original_behavior)
+{
+	for (int lpdead = 0; lpdead < 2; lpdead++) {
+		reset(false, lpdead != 0, VISIBILITYMAP_VALID_BITS);
+		run_actual_visibility_repair(lpdead != 0);
+		UT_ASSERT_EQ(inserts + edge_count, 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT_EQ(dirty[0], lpdead);
+		UT_ASSERT_EQ(dirty[1], 1);
+		UT_ASSERT(!PageIsAllVisible(pages[0].data));
+		UT_ASSERT_EQ(*PageGetContents(pages[1].data), 0);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+	}
+}
+
 UT_TEST(test_actual_empty_vacuum_does_not_acquire_vm_in_critical)
 {
 	struct {
@@ -454,7 +546,7 @@ UT_TEST(test_actual_empty_vacuum_does_not_acquire_vm_in_critical)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(11);
 	UT_RUN(test_visible_exact_two_page_batch);
 	UT_RUN(test_no_change_allocates_no_version);
 	UT_RUN(test_nonshared_preserves_native_hint_lsn_rules);
@@ -463,6 +555,9 @@ main(void)
 	UT_RUN(test_bad_component_refuses_before_either_page_changes);
 	UT_RUN(test_recovery_uses_record_lsn_without_runtime_identity_or_wal);
 	UT_RUN(test_actual_empty_vacuum_does_not_acquire_vm_in_critical);
+	UT_RUN(test_actual_vacuum_repairs_version_both_pages);
+	UT_RUN(test_actual_vacuum_repair_refuses_before_modification);
+	UT_RUN(test_nonshared_vacuum_repairs_keep_original_behavior);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

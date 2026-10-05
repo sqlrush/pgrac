@@ -1747,7 +1747,32 @@ test_cluster_vm_visible_empty.inc: $(top_srcdir)/src/backend/access/heap/vacuuml
 	     emit { print } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_vm_repair_versioned.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_clear_visibility_versioned\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_repair_clear.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	awk '/^visibilitymap_clear(_locked)?\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_repair_missing_heap.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/elog\(WARNING, "page is not marked all-visible/ { emit=1; found++ } \
+	     emit && /^\t\t}/ { emit=0; done++ } emit { print } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_repair_lpdead.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/elog\(WARNING, "page containing LP_DEAD/ { emit=1; found++ } \
+	     emit && /^\t\t}/ { emit=0; done++ } emit { print } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_vm_visible_version: test_cluster_vm_visible_version.c unit_test.h \
+		test_cluster_vm_repair_versioned.inc \
+		test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc \
+		test_cluster_vm_repair_lpdead.inc \
 		test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc \
 		test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc \
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
@@ -4324,6 +4349,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_multi_version.inc test_cluster_heap_multi_capture.inc
 	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc
 	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc
+	rm -f test_cluster_vm_repair_versioned.inc
+	rm -f test_cluster_vm_repair_clear.inc test_cluster_vm_repair_missing_heap.inc test_cluster_vm_repair_lpdead.inc
 	rm -f test_cluster_btree_build_writer.inc test_cluster_btree_build_state.inc \
 		test_cluster_btree_build_finish.inc
 	rm -f test_cluster_btree_leaf_meta.inc test_cluster_btree_leaf_vacuum.inc test_cluster_btree_leaf_delete.inc test_cluster_btree_leaf_dedup.inc test_cluster_btree_leaf_cycle.inc
@@ -4387,6 +4414,7 @@ clean distclean maintainer-clean:
 		test_cluster_resource_x_source_final_gate.inc \
 		test_cluster_resource_x_source_entry_gate.inc \
 		test_cluster_resource_x_source_prepare_gate.inc \
+		test_cluster_resource_x_source_first_cleanup.inc \
 		test_cluster_resource_x_retained_wait_gate.inc \
 		test_cluster_resource_x_predecessor_wait_gate.inc \
 		test_cluster_resource_x_dispatch_observation.inc \
@@ -4472,9 +4500,10 @@ cluster_qvotec_poll_test.o: cluster_qvotec_poll_test.c $(top_srcdir)/src/backend
 		-DQVOTEC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_qvotec.c"' \
 		-c $< -o $@
 
-cluster_qvotec_io_test.o: $(top_srcdir)/src/backend/cluster/cluster_voting_disk_io.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -Dfdatasync=cluster_qvotec_test_fdatasync \
-		-Dpwrite=cluster_qvotec_test_pwrite -c $< -o $@
+cluster_qvotec_io_test.o: cluster_qvotec_io_test.c $(top_srcdir)/src/backend/cluster/cluster_voting_disk_io.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DVOTING_DISK_IO_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_voting_disk_io.c"' \
+		-c $< -o $@
 
 # Retain the actual functions reached by the voting fixture, not unrelated
 # startup-directory and postmaster entry points from the same source file.
@@ -4487,7 +4516,7 @@ test_cluster_storage_quorum_product.o: $(top_srcdir)/src/backend/cluster/cluster
 
 test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
 		cluster_unit_no_normal_stop.h \
-		$(CLUSTER_VERSION_O) cluster_qvotec_poll_test.o \
+		$(CLUSTER_VERSION_O) cluster_qvotec_poll_test.o $(CLUSTER_QUORUM_DECISION_O) \
 		$(CLUSTER_NODE_REMOVE_POLICY_O) \
 		$(CLUSTER_EPOCH_BALLOT_O) $(CLUSTER_REPLACEMENT_REQUEST_O) \
 		$(CLUSTER_MEMBERSHIP_O) \
@@ -4501,7 +4530,7 @@ test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
 		-DSEMANTIC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_semantic_activation.c"' \
 		-DSEMANTIC_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_semantic_activation.h"' \
 		-DCLUSTER_MAKEFILE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/Makefile"' $< \
-		$(CLUSTER_VERSION_O) cluster_qvotec_poll_test.o \
+		$(CLUSTER_VERSION_O) cluster_qvotec_poll_test.o $(CLUSTER_QUORUM_DECISION_O) \
 		$(CLUSTER_NODE_REMOVE_POLICY_O) \
 		$(CLUSTER_EPOCH_BALLOT_O) $(CLUSTER_REPLACEMENT_REQUEST_O) \
 		$(CLUSTER_MEMBERSHIP_O) \
@@ -4567,6 +4596,14 @@ test_cluster_voting_disk_io: test_cluster_voting_disk_io.c unit_test.h \
 # spec-2.6 Sprint A Step 2 D4: cluster_quorum_decision.o standalone test.
 # Pure logic — no shmem, no I/O, no logging.  Synthetic slot matrix
 # tests majority math + collision direction (Q6 v0.2 newer-self-FATAL).
+# Original process-local diagnostic context for the bootstrap publication slice.
+test_cluster_qvotec_initial_trace.inc: $(top_srcdir)/src/backend/cluster/cluster_qvotec.c Makefile
+	awk '/^static struct \{/ { capture=1 } \
+	     capture { body=body $$0 "\n" } \
+	     capture && /^}.*;/ { if ($$0 == "} qvotec_initial_trace;") { printf "%s", body; found++ } capture=0; body="" } \
+	     END { if (found != 1 || capture) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_qvotec_bootstrap_publish.inc: $(top_srcdir)/src/backend/cluster/cluster_qvotec.c Makefile
 	awk '/cluster_reconfig_bootstrap_publish_begin\(\);/ { emit=1; begin++ } \
 	     emit { print } /cluster_reconfig_bootstrap_publish_end\(\);/ { emit=0; end++ } \
@@ -4574,7 +4611,7 @@ test_cluster_qvotec_bootstrap_publish.inc: $(top_srcdir)/src/backend/cluster/clu
 	mv $@.tmp $@
 
 test_cluster_quorum_decision: test_cluster_quorum_decision.c unit_test.h \
-		test_cluster_qvotec_bootstrap_publish.inc \
+		test_cluster_qvotec_bootstrap_publish.inc test_cluster_qvotec_initial_trace.inc \
 		$(CLUSTER_VERSION_O) $(CLUSTER_QUORUM_DECISION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_QUORUM_DECISION_O) -o $@
@@ -6068,6 +6105,13 @@ test_cluster_resource_x_source_entry_gate.inc: $(top_srcdir)/src/backend/cluster
 	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_resource_x_source_first_cleanup.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/failure_stage = "source-copy";/ { print "\tif (!semantic_retained) {"; emit=1; begin++ } \
+	     emit && /if \(result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE\) \{/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_resource_x_source_prepare_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/failure_stage = "source-gate-recheck";/ { emit=1; begin++ } \
 	     emit && /memset\(&source_prepare_refusal, 0,/ { emit=0; end++ } \
@@ -6108,6 +6152,7 @@ test_cluster_resource_x_terminal_ingress: test_cluster_resource_x_terminal_ingre
 		test_cluster_resource_x_source_final_gate.inc \
 		test_cluster_resource_x_source_entry_gate.inc \
 		test_cluster_resource_x_source_prepare_gate.inc \
+		test_cluster_resource_x_source_first_cleanup.inc \
 		test_cluster_resource_x_retained_wait_gate.inc \
 		test_cluster_resource_x_predecessor_wait_gate.inc \
 		test_cluster_resource_x_dispatch_observation.inc \

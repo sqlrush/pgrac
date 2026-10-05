@@ -814,6 +814,17 @@ wb_elog(int level, const char *format, ...)
 static bool wb_structural_fact_ready;
 static ClusterPiWritebackFactV2 wb_structural_fact;
 static bool wb_structure_schedule, wb_structure_proof_ok, wb_structure_local_ok;
+static ClusterKoStructurePollV2 wb_structure_finish_result;
+static unsigned wb_structure_finish_calls;
+static ClusterKoStructurePollV2
+wb_structure_finish_for_schedule(uint32 slot, uint64 serial)
+{
+	UT_ASSERT_EQ(slot, 7);
+	UT_ASSERT_EQ(serial, 19);
+	wb_structure_finish_calls++;
+	return wb_structure_finish_result;
+}
+
 static unsigned wb_structure_local_acks, wb_structure_imports, wb_structure_completions;
 /* Scheduler-only opaque-owner seams. The PAGE suite separately verifies
  * real sealed ancestry, physical disposal and local/remote ACK lifetimes. */
@@ -925,6 +936,7 @@ static bool wb_offer_complete_for_transport(uint32 slot, uint64 serial,
 #define cluster_ko_shared_structure_offer_next_v2 wb_offer_read_for_transport
 #define cluster_ko_shared_structure_offer_complete_v2 wb_offer_complete_for_transport
 #define cluster_ko_shared_structure_next_v2 wb_structure_next_for_schedule
+#define cluster_ko_shared_structure_finish_local_v2 wb_structure_finish_for_schedule
 #define cluster_page_structural_from_ko_v2 wb_structure_receipt_for_schedule
 #define cluster_page_structural_pi_proof_v2 wb_structure_proof_for_schedule
 #define cluster_bufmgr_ack_pi_at_structure_v2 wb_structure_local_ack_for_schedule
@@ -937,6 +949,7 @@ static bool wb_offer_complete_for_transport(uint32 slot, uint64 serial,
 #undef cluster_ko_shared_structure_offer_next_v2
 #undef cluster_ko_shared_structure_offer_complete_v2
 #undef cluster_ko_shared_structure_next_v2
+#undef cluster_ko_shared_structure_finish_local_v2
 #undef cluster_page_structural_from_ko_v2
 #undef cluster_page_structural_pi_proof_v2
 #undef cluster_bufmgr_ack_pi_at_structure_v2
@@ -987,6 +1000,8 @@ wb_setup(void)
 	wb_offer_accepted = 0;
 	wb_offer_complete_calls = 0;
 	wb_structure_schedule = false;
+	wb_structure_finish_result = CLUSTER_KO_STRUCTURE_PENDING;
+	wb_structure_finish_calls = 0;
 	wb_structure_proof_ok = wb_structure_local_ok = true;
 	wb_structure_local_acks = wb_structure_imports = wb_structure_completions = 0;
 	memset(wb_offer_scan, 0, sizeof(wb_offer_scan));
@@ -2030,7 +2045,8 @@ int
 main(void)
 {
 	printf("# sizeof_WritebackShared=%zu\n", sizeof(WritebackShared));
-	UT_PLAN(71);
+	UT_PLAN(72);
+	UT_RUN(writeback_v2_structure_scheduler_checks_local_work_without_wal_pins);
 	UT_RUN(writeback_v2_structure_scheduler_collects_all_original_page_acks);
 	UT_RUN(writeback_v2_structure_scheduler_refuses_unproved_pages_and_partial_acks);
 	UT_RUN(writeback_v2_structure_scheduler_yields_or_cancels_without_clearing_ko);

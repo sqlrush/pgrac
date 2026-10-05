@@ -447,12 +447,17 @@ capture_bootstrap_quorum(bool in_quorum)
 	bootstrap_capture.in_quorum = in_quorum;
 }
 
+#include "test_cluster_qvotec_initial_trace.inc"
+
 static void
 publish_bootstrap_fixture(ClusterVotingSlot *qvotec_slot_matrix,
 						  const ClusterVotingDiskIoState *io_states, uint64 now_us,
 						  uint64 heartbeat_timeout_us)
 {
 	const int qvotec_n_disks = N_DISKS;
+	/* This slice exercises bootstrap publication, not the optional INITIAL
+	 * diagnostic. Supply its original context without a new authority. */
+	const bool formation_scan = false;
 	ClusterQuorumDecision decision;
 	uint32 node;
 	int i;
@@ -465,7 +470,9 @@ publish_bootstrap_fixture(ClusterVotingSlot *qvotec_slot_matrix,
 #define cluster_reconfig_record_observed_slot capture_bootstrap_slot
 #define cluster_reconfig_record_observed_fresh_alive capture_bootstrap_fresh
 #define cluster_reconfig_bootstrap_publish_in_quorum capture_bootstrap_quorum
+#define cluster_conf_lookup_node(node) ((const ClusterNodeInfo *)NULL)
 #include "test_cluster_qvotec_bootstrap_publish.inc"
+#undef cluster_conf_lookup_node
 #undef cluster_reconfig_bootstrap_publish_begin
 #undef cluster_reconfig_bootstrap_publish_end
 #undef cluster_reconfig_record_observed_slot

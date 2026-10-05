@@ -5,9 +5,13 @@
 
 extern ClusterVotingDiskIoState cluster_qvotec_test_poll_read_slot(int fd, uint32 disk,
 																uint32 node, ClusterVotingSlot *out);
+extern void cluster_qvotec_test_poll_read_slots(int fd, int disk, uint32 first,
+	uint32 count, ClusterVotingSlot *out, ClusterVotingDiskIoState *states);
 #define cluster_voting_disk_read_slot cluster_qvotec_test_poll_read_slot
+#define cluster_voting_disk_read_slots cluster_qvotec_test_poll_read_slots
 #include QVOTEC_SOURCE_PATH
 #undef cluster_voting_disk_read_slot
+#undef cluster_voting_disk_read_slots
 
 extern void cluster_qvotec_test_poll_once(const int *fds, int n_disks, uint64 incarnation);
 extern void cluster_qvotec_test_register_wakeup(void);

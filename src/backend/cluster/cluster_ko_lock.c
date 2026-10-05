@@ -89,6 +89,7 @@
 #include "utils/timestamp.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "utils/dsa.h"
 #include "utils/wait_event.h"
 
 /* PG core doesn't define USECS_PER_MSEC;  define locally (mirror cluster_sinval.c). */
@@ -114,7 +115,10 @@ typedef struct ClusterKoSharedContext {
 	bool used;
 	bool complete;
 	bool structure_owned;
+	bool structure_drop_pending;
 	uint16 structure_peers_accepted;
+	uint32 structure_scan;
+	uint64 structure_scan_freeze;
 	int32 pid;
 	uint64 serial;
 	ClusterKoSharedMessageV2 request;
@@ -154,10 +158,22 @@ typedef struct ClusterKoShared {
 	ClusterKoSharedMessageV2 send[CLUSTER_KO_SHARED_CAPACITY];
 	uint64 context_serial;
 	ClusterKoSharedContext contexts[CLUSTER_KO_SHARED_CAPACITY];
+	/* Preallocated native continuations belong to this same KO owner.
+	 * One finite ready batch is drained before adopting newly committed work. */
+	int native_dsa_tranche;
+	dsa_pointer native_incoming;
+	dsa_pointer native_ready;
+	uint64 native_waiting;
 } ClusterKoShared;
 
 static ClusterKoShared *ko_state = NULL;
 static bool ko_exit_registered;
+static dsa_area *ko_native_area;
+
+typedef struct ClusterKoNativeContinuation {
+	dsa_pointer next;
+	ClusterKoSharedContext context;
+} ClusterKoNativeContinuation;
 
 struct ClusterKoCompletionV2 {
 	ResourceOwner owner;
@@ -173,6 +189,8 @@ struct ClusterKoCompletionV2 {
 	/* Native DDL keeps its verified barrier in the original ResourceOwner,
 	 * releasing the transport slot before the next relation's barrier. */
 	bool barrier_private;
+	dsa_pointer native_allocation;
+	ClusterKoNativeContinuation *native_reserved;
 	ClusterKoSharedMessageV2 barrier_request;
 	uint64 barrier_boots[CLUSTER_KO_SHARED_NODE_LIMIT];
 	ClusterPageWalBindingV1 terminal;
@@ -182,6 +200,7 @@ struct ClusterKoCompletionV2 {
 
 static ClusterKoCompletionV2 *ko_completions;
 static bool ko_resource_registered;
+static void ko_shared_backend_exit(int code, Datum arg);
 
 ClusterNormalStopPollResult
 cluster_ko_normal_stop_poll(uint32 *slot_out, const char **reason_out)
@@ -232,10 +251,22 @@ done:
 	return result;
 }
 
+static Size
+ko_native_area_size(void)
+{
+	return MAXALIGN(Max(dsa_minimum_size(), 64 * 1024));
+}
+
+static void *
+ko_native_area_memory(void)
+{
+	return (char *)ko_state + MAXALIGN(sizeof(ClusterKoShared));
+}
+
 Size
 cluster_ko_shmem_size(void)
 {
-	return MAXALIGN(sizeof(ClusterKoShared));
+	return add_size(MAXALIGN(sizeof(ClusterKoShared)), ko_native_area_size());
 }
 
 void
@@ -243,9 +274,19 @@ cluster_ko_shmem_init(void)
 {
 	bool found;
 
-	ko_state = (ClusterKoShared *)ShmemInitStruct("pgrac cluster ko",
-												  MAXALIGN(sizeof(ClusterKoShared)), &found);
+	ko_state
+		= (ClusterKoShared *)ShmemInitStruct("pgrac cluster ko", cluster_ko_shmem_size(), &found);
 	if (!IsUnderPostmaster) {
+		dsa_area *area;
+
+		ko_state->native_dsa_tranche = LWLockNewTrancheId();
+		LWLockRegisterTranche(ko_state->native_dsa_tranche, "ClusterKoNativeOwner");
+		area = dsa_create_in_place(ko_native_area_memory(), ko_native_area_size(),
+								   ko_state->native_dsa_tranche, NULL);
+		dsa_pin(area);
+		dsa_detach(area);
+		ko_state->native_incoming = ko_state->native_ready = InvalidDsaPointer;
+		ko_state->native_waiting = 0;
 		pg_atomic_init_u64(&ko_state->flush_count, 0);
 		pg_atomic_init_u64(&ko_state->ack_received_count, 0);
 		pg_atomic_init_u64(&ko_state->failclosed_count, 0);
@@ -680,9 +721,57 @@ ko_completion_link(const ClusterKoCompletionV2 *completion)
 	return link;
 }
 
+/* PG's standard DSA lifetime, like pgstat's in-place area: mapping is local
+ * to the backend, but a committed allocation outlives that backend. Never
+ * attach, allocate, free or map a segment while holding the KO spinlock.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static dsa_area *
+ko_native_attach(void)
+{
+	if (ko_native_area == NULL) {
+		MemoryContext oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+
+		/* The checkpointer may attach without ever initiating a barrier. */
+		if (!ko_exit_registered) {
+			before_shmem_exit(ko_shared_backend_exit, (Datum)0);
+			ko_exit_registered = true;
+		}
+		LWLockRegisterTranche(ko_state->native_dsa_tranche, "ClusterKoNativeOwner");
+		ko_native_area = dsa_attach_in_place(ko_native_area_memory(), NULL);
+		dsa_pin_mapping(ko_native_area);
+		MemoryContextSwitchTo(oldcontext);
+	}
+	return ko_native_area;
+}
+
+static bool
+ko_native_reserve(ClusterKoCompletionV2 *completion)
+{
+	dsa_area *area = ko_native_attach();
+
+	Assert(!DsaPointerIsValid(completion->native_allocation));
+	completion->native_allocation = dsa_allocate_extended(area, sizeof(ClusterKoNativeContinuation),
+														  DSA_ALLOC_ZERO | DSA_ALLOC_NO_OOM);
+	if (!DsaPointerIsValid(completion->native_allocation))
+		return false;
+	completion->native_reserved = dsa_get_address(area, completion->native_allocation);
+	return true;
+}
+
+static void
+ko_native_release_reservation(ClusterKoCompletionV2 *completion)
+{
+	if (DsaPointerIsValid(completion->native_allocation)) {
+		dsa_free(ko_native_area, completion->native_allocation);
+		completion->native_allocation = InvalidDsaPointer;
+		completion->native_reserved = NULL;
+	}
+}
+
 static void
 ko_completion_cancel(ClusterKoCompletionV2 *completion)
 {
+	ko_native_release_reservation(completion);
 	if (ko_state != NULL && completion->slot < CLUSTER_KO_SHARED_CAPACITY) {
 		ClusterKoSharedContext *entry;
 		SpinLockAcquire(&ko_state->shared_lock);
@@ -1046,9 +1135,115 @@ cluster_ko_shared_structure_handoff_v2(ClusterKoCompletionV2 **completion)
 	/* From this point even an exit before local cleanup must preserve the
 	 * original shared obligation. There is no caller-supplied cancel token. */
 	*link = owned->next;
+	ko_native_release_reservation(owned);
 	pfree(owned);
 	*completion = NULL;
 	return true;
+}
+
+/* Retain the original committed proof even if its cut has since gone stale.
+ * Retention is not authority to execute: the background consumer must recheck
+ * the entire original scope before doing anything. Preallocation makes this
+ * postcommit transfer independent of active-slot capacity and allocator I/O. */
+bool
+cluster_ko_shared_native_handoff_v2(ClusterKoCompletionV2 **completion)
+{
+	ClusterKoCompletionV2 **link, *owned;
+	ClusterKoNativeContinuation *work;
+	ClusterSpaceStructureChange change;
+
+	if (ko_state == NULL || completion == NULL || *completion == NULL
+		|| (MyBackendType != B_BACKEND && MyBackendType != B_AUTOVAC_WORKER)
+		|| CritSectionCount != 0 || CurrentResourceOwner == NULL
+		|| CurrentResourceOwner != TopTransactionResourceOwner
+		|| CurTransactionResourceOwner != TopTransactionResourceOwner)
+		return false;
+	link = ko_completion_link(*completion);
+	owned = *link;
+	if (owned == NULL || owned->pid != MyProcPid || owned->owner != CurrentResourceOwner
+		|| !owned->native_transaction || !owned->barrier_private || owned->native_pending
+		|| !owned->postcommit || !owned->space_observed || owned->serial == 0
+		|| owned->native_reserved == NULL || !DsaPointerIsValid(owned->native_allocation)
+		|| !cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure), &change)
+		|| (change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
+			&& (change.identity.action != CLUSTER_SPACE_WAL_TRUNCATE || !owned->truncate_observed)))
+		return false;
+	work = owned->native_reserved;
+	memset(&work->context, 0, sizeof(work->context));
+	work->context.used = work->context.complete = work->context.structure_owned = true;
+	work->context.structure_drop_pending
+		= change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE && !owned->drop_observed;
+	work->context.pid = owned->pid;
+	work->context.serial = owned->serial;
+	work->context.request = owned->barrier_request;
+	memcpy(work->context.peer_boots, owned->barrier_boots, sizeof(owned->barrier_boots));
+	work->context.terminal = owned->terminal;
+	memcpy(work->context.structure, owned->structure, sizeof(owned->structure));
+	SpinLockAcquire(&ko_state->shared_lock);
+	work->next = ko_state->native_incoming;
+	ko_state->native_incoming = owned->native_allocation;
+	ko_state->native_waiting++;
+	SpinLockRelease(&ko_state->shared_lock);
+	owned->native_allocation = InvalidDsaPointer;
+	owned->native_reserved = NULL;
+	*link = owned->next;
+	pfree(owned);
+	*completion = NULL;
+	return true;
+}
+
+/* One original checkpointer step. New arrivals never preempt the finite
+ * ready batch. A full active region, stale proof or lost cut retains all
+ * bytes. Moving a DROP without effect cannot expose a structural receipt. */
+ClusterKoStructurePollV2
+cluster_ko_shared_native_promote_v2(void)
+{
+	dsa_pointer selected;
+	ClusterKoNativeContinuation *work;
+	ClusterKoSharedContext before;
+	ClusterWalSourceRef current;
+	int slot = -1;
+	bool moved = false;
+
+	if (ko_state == NULL || MyBackendType != B_CHECKPOINTER || CurrentResourceOwner == NULL
+		|| CritSectionCount != 0 || !cluster_enabled || !cluster_shared_config)
+		return CLUSTER_KO_STRUCTURE_INVALID;
+	SpinLockAcquire(&ko_state->shared_lock);
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+		if (!ko_state->contexts[i].used) {
+			slot = i;
+			break;
+		}
+	if (slot >= 0 && !DsaPointerIsValid(ko_state->native_ready)) {
+		ko_state->native_ready = ko_state->native_incoming;
+		ko_state->native_incoming = InvalidDsaPointer;
+	}
+	selected = ko_state->native_ready;
+	SpinLockRelease(&ko_state->shared_lock);
+	if (slot < 0)
+		return CLUSTER_KO_STRUCTURE_PENDING;
+	if (!DsaPointerIsValid(selected))
+		return CLUSTER_KO_STRUCTURE_RELEASED;
+	work = dsa_get_address(ko_native_attach(), selected);
+	before = work->context;
+	if (!ko_shared_origin_current(&before) || !cluster_wal_thread_current_v2_ref(&current)
+		|| memcmp(&current, &before.terminal.source, sizeof(current)) != 0)
+		return CLUSTER_KO_STRUCTURE_INVALID;
+	SpinLockAcquire(&ko_state->shared_lock);
+	if (ko_state->native_ready == selected && !ko_state->contexts[slot].used
+		&& ko_state->context_serial != UINT64_MAX && ko_state->native_waiting != 0
+		&& memcmp(&work->context, &before, sizeof(before)) == 0) {
+		ko_state->contexts[slot] = before;
+		ko_state->contexts[slot].serial = ++ko_state->context_serial;
+		ko_state->native_ready = work->next;
+		ko_state->native_waiting--;
+		moved = true;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	if (!moved)
+		return CLUSTER_KO_STRUCTURE_PENDING;
+	dsa_free(ko_native_area, selected);
+	return CLUSTER_KO_STRUCTURE_PROGRESS;
 }
 
 static bool
@@ -1137,7 +1332,8 @@ ko_shared_structure_snapshot(uint32 slot, ClusterKoSharedContext *out)
 	SpinLockAcquire(&ko_state->shared_lock);
 	context = ko_state->contexts[slot];
 	SpinLockRelease(&ko_state->shared_lock);
-	if (!context.used || !context.complete || !context.structure_owned || context.serial == 0
+	if (!context.used || !context.complete || !context.structure_owned
+		|| context.structure_drop_pending || context.serial == 0
 		|| (context.request.origin_node == cluster_node_id
 				? (!ko_shared_origin_current(&context)
 				   || !cluster_wal_thread_current_v2_ref(&current)
@@ -1189,6 +1385,66 @@ cluster_ko_shared_structure_peer_v2(uint32 slot, uint64 serial, int32 peer,
 	return out != NULL && serial != 0 && ko_shared_structure_snapshot(slot, &context)
 		   && context.serial == serial
 		   && cluster_ko_shared_peer_projection_v2(&context.request, peer, out);
+}
+
+ClusterKoStructurePollV2
+cluster_ko_shared_structure_finish_local_v2(uint32 slot, uint64 serial)
+{
+	ClusterKoSharedContext before, current;
+	ResourceXGateSnapshot gate, after;
+	ClusterPcmPiRelationScanV2 scanned;
+	ClusterKoStructurePollV2 result = CLUSTER_KO_STRUCTURE_INVALID;
+	uint32 cursor;
+	uint16 expected = 0;
+	bool reset;
+
+	if (serial == 0 || MyBackendType != B_CHECKPOINTER
+		|| !ko_shared_structure_snapshot(slot, &before) || before.serial != serial
+		|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate) || gate.phase != RESOURCE_X_GATE_OPEN
+		|| gate.formation != before.request.epoch)
+		return result;
+	if (before.request.origin_node == cluster_node_id) {
+		for (unsigned peer = 0; peer < CLUSTER_KO_SHARED_NODE_LIMIT; peer++)
+			if (peer != cluster_node_id && before.peer_boots[peer] != 0)
+				expected |= (uint16)(1u << peer);
+		if ((before.structure_peers_accepted & ~expected) != 0)
+			return result;
+		if (before.structure_peers_accepted != expected)
+			return CLUSTER_KO_STRUCTURE_PENDING;
+	}
+	cursor = before.structure_scan;
+	reset = cursor != 0 && before.structure_scan_freeze != gate.freeze_generation;
+	if (reset) {
+		cursor = 0;
+		scanned = CLUSTER_PCM_PI_RELATION_MORE;
+	} else {
+		/* No KO lock, CF pin or remote wait spans the directory observer.
+		 * The original barrier has ended all old buffer producers. */
+		scanned = cluster_pcm_lock_pi_relation_scan_v2(before.request.key.locator,
+													   before.request.epoch, 128, &cursor);
+	}
+	if (scanned == CLUSTER_PCM_PI_RELATION_INVALID || (!reset && cursor < before.structure_scan)
+		|| !ko_shared_structure_snapshot(slot, &current)
+		|| memcmp(&before, &current, sizeof(before)) != 0
+		|| !cluster_pcm_lock_resource_x_gate_snapshot(&after)
+		|| memcmp(&gate, &after, sizeof(gate)) != 0)
+		return result;
+	SpinLockAcquire(&ko_state->shared_lock);
+	if (memcmp(&ko_state->contexts[slot], &before, sizeof(before)) == 0) {
+		if (scanned == CLUSTER_PCM_PI_RELATION_EMPTY) {
+			/* Every remaining peer has its own original owner. This removes
+			 * only completed local work, never a PI, file or retained WAL. */
+			memset(&ko_state->contexts[slot], 0, sizeof(before));
+			result = CLUSTER_KO_STRUCTURE_RELEASED;
+		} else {
+			ko_state->contexts[slot].structure_scan = cursor;
+			ko_state->contexts[slot].structure_scan_freeze = gate.freeze_generation;
+			result = scanned == CLUSTER_PCM_PI_RELATION_PENDING ? CLUSTER_KO_STRUCTURE_PENDING
+																: CLUSTER_KO_STRUCTURE_PROGRESS;
+		}
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return result;
 }
 
 bool
@@ -1432,7 +1688,13 @@ ko_shared_backend_exit(int code, Datum arg)
 	while (ko_completions != NULL) {
 		ClusterKoCompletionV2 *completion = ko_completions;
 		ko_completions = completion->next;
+		ko_native_release_reservation(completion);
 		pfree(completion);
+	}
+	if (ko_native_area != NULL) {
+		dsa_detach(ko_native_area);
+		dsa_release_in_place(ko_native_area_memory());
+		ko_native_area = NULL;
 	}
 }
 
@@ -1483,6 +1745,10 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 		|| ko_state->send_head >= CLUSTER_KO_SHARED_CAPACITY) {
 		result = CLUSTER_NORMAL_STOP_INVALID;
 		why = "KO_SHARED_QUEUE_INVALID";
+	} else if (ko_state->native_waiting != 0 || DsaPointerIsValid(ko_state->native_incoming)
+			   || DsaPointerIsValid(ko_state->native_ready)) {
+		result = CLUSTER_NORMAL_STOP_PENDING;
+		why = "KO_SHARED_COMMITTED_OWNED";
 	} else if (ko_state->send_count != 0) {
 		result = CLUSTER_NORMAL_STOP_PENDING;
 		why = "KO_SHARED_SEND_PENDING";
@@ -1865,6 +2131,12 @@ cluster_ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence)
 		if (!ko_native_barrier_to_owner(completion))
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
 							errmsg("could not preserve the completed shared object flush proof")));
+		/* Allocation and mapping finish before the caller can lock or modify
+		 * SPACE. A later committed handoff cannot fail just because 64 other
+		 * relation results are still being processed. */
+		if (!ko_native_reserve(completion))
+			ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
+							errmsg("could not reserve the shared structural completion owner")));
 		completion->native_pending = true;
 		return;
 	}

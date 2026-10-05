@@ -900,20 +900,6 @@ cluster_mrp_qvotec_complete_apply_lease_request(
 	ClusterMrpApplyLeaseSubmitResult result pg_attribute_unused(),
 	const ClusterAdgApplyMasterLeaseQuorum *winner pg_attribute_unused())
 {}
-ClusterQvotecQuorumState
-decide_quorum_view(const ClusterVotingSlot *slots pg_attribute_unused(),
-				   const ClusterVotingDiskIoState *io_states pg_attribute_unused(),
-				   uint32 n_disks pg_attribute_unused(), uint32 n_max_nodes pg_attribute_unused(),
-				   uint32 self_node_id pg_attribute_unused(),
-				   uint64 self_incarnation pg_attribute_unused(),
-				   uint64 now_us pg_attribute_unused(),
-				   uint64 heartbeat_timeout_us pg_attribute_unused(),
-				   ClusterQuorumDecision *out pg_attribute_unused())
-{
-	memset(out, 0, sizeof(*out));
-	out->quorum_state = CLUSTER_QVOTEC_QUORUM_LOST;
-	return CLUSTER_QVOTEC_QUORUM_LOST;
-}
 ClusterPgstatCounter *
 cluster_pgstat_lookup(const char *name pg_attribute_unused())
 {
@@ -1087,15 +1073,23 @@ cluster_reconfig_record_observed_fresh_alive(int32 node_id pg_attribute_unused()
  * reconfig.o is not linked into this binary — stub the B′ surfaces like
  * the other reconfig symbols.  The formation-marker tests live in
  * test_cluster_formation_marker / test_cluster_reconfig. */
+static bool formation_snapshot_requested;
+static ClusterFormationDiskSnapshot formation_snapshot_observed;
+
 bool
 cluster_reconfig_formation_needs_disk_snapshot(void)
 {
-	return false;
+	return formation_snapshot_requested;
 }
 void
 cluster_reconfig_formation_qvotec_publish_disk_snapshot(
-	const ClusterFormationDiskSnapshot *snapshot pg_attribute_unused())
-{}
+	const ClusterFormationDiskSnapshot *snapshot)
+{
+	if (snapshot != NULL)
+		formation_snapshot_observed = *snapshot;
+	else
+		memset(&formation_snapshot_observed, 0, sizeof(formation_snapshot_observed));
+}
 bool
 cluster_reconfig_formation_qvotec_poll_pending(
 	ClusterFormationMarkerSubmitRequest *out pg_attribute_unused())
@@ -2375,17 +2369,54 @@ pgsa_disk_set_close(PgsaDiskSet *set)
 
 /* Exercise the real poll and disk codec. Only the clock, one read completion,
  * and the cache publication boundary are controlled; selection is production. */
+/* Delay the actual voting-file syscall, including raw marker regions.
+ * No delay or observer is installed in the product binary. */
+static unsigned slow_read_us;
+static unsigned slow_read_count;
+static unsigned slow_region_count[3];
+static unsigned slow_hidden_count;
+static bool slow_observe_snapshot;
+static int must_be_revoked_fd = -1;
+static unsigned revocation_checks;
+static unsigned revocation_violations;
+
+ssize_t cluster_qvotec_test_pread(int fd, void *buf, size_t size, off_t offset);
+ssize_t
+cluster_qvotec_test_pread(int fd, void *buf, size_t size, off_t offset)
+{
+	if (fd == must_be_revoked_fd) {
+		revocation_checks++;
+		if (formation_snapshot_observed.complete)
+			revocation_violations++;
+	}
+	if (slow_read_us != 0) {
+		slow_read_count++;
+		if (slow_observe_snapshot && !formation_snapshot_observed.complete)
+			slow_hidden_count++;
+		if (offset < CLUSTER_VOTING_SLOT_OFFSET(CLUSTER_MAX_NODES))
+			slow_region_count[0]++;
+		else if (offset >= CLUSTER_VOTING_JOIN_SLOT_OFFSET(0)
+				 && offset < CLUSTER_VOTING_JOIN_SLOT_OFFSET(CLUSTER_MAX_NODES))
+			slow_region_count[1]++;
+		else if (offset >= CLUSTER_VOTING_FORMATION_SLOT_OFFSET(0)
+				 && offset < CLUSTER_VOTING_FORMATION_SLOT_OFFSET(CLUSTER_MAX_NODES))
+			slow_region_count[2]++;
+		usleep(slow_read_us);
+		mock_now += slow_read_us;
+		fence_mock_monotonic_us += slow_read_us;
+	}
+	return pread(fd, buf, size, offset);
+}
+
 static int fence_read_action;
 static char fence_poll_config[PGSA_TEST_DISKS * MAXPGPATH];
 static ClusterFenceMarker fence_replacement;
 extern ClusterVotingDiskIoState cluster_qvotec_test_poll_read_slot(int fd, uint32 disk,
 																uint32 node, ClusterVotingSlot *out);
 
-ClusterVotingDiskIoState
-cluster_qvotec_test_poll_read_slot(int fd, uint32 disk, uint32 node, ClusterVotingSlot *out)
+static ClusterVotingDiskIoState
+fence_poll_after_read(uint32 disk, uint32 node, ClusterVotingDiskIoState rc)
 {
-	ClusterVotingDiskIoState rc = cluster_voting_disk_read_slot(fd, disk, node, out);
-
 	if (disk == 0 && node == 1) {
 		int action = fence_read_action;
 
@@ -2401,6 +2432,23 @@ cluster_qvotec_test_poll_read_slot(int fd, uint32 disk, uint32 node, ClusterVoti
 			return CLUSTER_VOTING_DISK_IO_FAILED;
 	}
 	return rc;
+}
+
+ClusterVotingDiskIoState
+cluster_qvotec_test_poll_read_slot(int fd, uint32 disk, uint32 node, ClusterVotingSlot *out)
+{
+	return fence_poll_after_read(disk, node, cluster_voting_disk_read_slot(fd, disk, node, out));
+}
+
+void cluster_qvotec_test_poll_read_slots(int fd, int disk, uint32 first, uint32 count,
+	ClusterVotingSlot *out, ClusterVotingDiskIoState *states);
+void
+cluster_qvotec_test_poll_read_slots(int fd, int disk, uint32 first, uint32 count,
+	ClusterVotingSlot *out, ClusterVotingDiskIoState *states)
+{
+	cluster_voting_disk_read_slots(fd, disk, first, count, out, states);
+	for (uint32 i = 0; i < count; ++i)
+		states[i] = fence_poll_after_read(disk, first + i, states[i]);
 }
 
 static void
@@ -2480,6 +2528,113 @@ fence_poll_cached(const ClusterFenceMarker *expected)
 		fence_cache_sequence, fence_cache_valid, &fence_cache_marker, fence_cache_sampled_us,
 		fence_cache_sampled_us + CLUSTER_FENCE_AUTHORITY_CACHE_MAX_AGE_US,
 		fence_mock_monotonic_us);
+}
+
+static bool
+slow_formation_fixture(PgsaDiskSet *set, ClusterFenceMarker *marker)
+{
+	if (!fence_poll_fixture(set, marker))
+		return false;
+	for (int d = 0; d < PGSA_TEST_DISKS; d++)
+		if (ftruncate(set->fds[d], CLUSTER_VOTING_PGRD_FILE_BYTES_MIN) != 0)
+			return false;
+	formation_snapshot_requested = true;
+	memset(&formation_snapshot_observed, 0, sizeof(formation_snapshot_observed));
+	cluster_qvotec_test_poll_once(set->fds, PGSA_TEST_DISKS, 901);
+	return formation_snapshot_observed.complete;
+}
+
+static void
+slow_formation_run(const PgsaDiskSet *set)
+{
+	struct timespec start, end;
+	uint64 elapsed_us;
+	slow_read_count = slow_hidden_count = 0;
+	memset(slow_region_count, 0, sizeof(slow_region_count));
+	slow_read_us = 2000;
+	slow_observe_snapshot = true;
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	cluster_qvotec_test_poll_once(set->fds, PGSA_TEST_DISKS, 901);
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	elapsed_us = (uint64)(end.tv_sec - start.tv_sec) * UINT64_C(1000000)
+		+ (end.tv_nsec - start.tv_nsec) / 1000;
+	slow_read_us = 0;
+	slow_observe_snapshot = false;
+	printf("# slow poll: delay_us=2000 reads=%u regions=%u/%u/%u hidden=%u elapsed_us=%llu\n",
+		slow_read_count, slow_region_count[0], slow_region_count[1], slow_region_count[2],
+		slow_hidden_count, (unsigned long long)elapsed_us);
+}
+
+UT_TEST(test_slow_poll_keeps_completed_formation_snapshot_visible)
+{
+	PgsaDiskSet set;
+	ClusterFenceMarker marker;
+	UT_ASSERT(slow_formation_fixture(&set, &marker));
+	slow_formation_run(&set);
+	UT_ASSERT(slow_read_count > 0);
+	UT_ASSERT_EQ(slow_hidden_count, 0);
+	UT_ASSERT(formation_snapshot_observed.complete);
+	formation_snapshot_requested = false;
+	fence_poll_close(&set);
+}
+
+UT_TEST(test_slow_poll_reads_contiguous_voting_regions)
+{
+	PgsaDiskSet set;
+	ClusterFenceMarker marker;
+	UT_ASSERT(slow_formation_fixture(&set, &marker));
+	slow_formation_run(&set);
+	/* Three full regions on three disks, plus the original exact self
+	 * JCMK and replacement observations (six individual reads). */
+	UT_ASSERT_EQ(slow_region_count[0], PGSA_TEST_DISKS);
+	UT_ASSERT(slow_region_count[1] <= 3 * PGSA_TEST_DISKS);
+	UT_ASSERT_EQ(slow_region_count[2], PGSA_TEST_DISKS);
+	UT_ASSERT(slow_read_count <= 5 * PGSA_TEST_DISKS);
+	formation_snapshot_requested = false;
+	fence_poll_close(&set);
+}
+
+UT_TEST(test_completed_formation_snapshot_is_revoked_on_actual_failure)
+{
+	for (int fault = 0; fault < 4; ++fault) {
+		PgsaDiskSet set;
+		ClusterFenceMarker marker;
+		int poll_fds[PGSA_TEST_DISKS];
+		UT_ASSERT(slow_formation_fixture(&set, &marker));
+		memcpy(poll_fds, set.fds, sizeof(poll_fds));
+		if (fault == 0) {
+			uint8 corrupt = 0xff;
+			UT_ASSERT_EQ(pwrite(set.fds[1], &corrupt, 1, CLUSTER_VOTING_SLOT_OFFSET(71) + 100), 1);
+		}
+		if (fault == 1)
+			UT_ASSERT_EQ(ftruncate(set.fds[1], CLUSTER_VOTING_FORMATION_SLOT_OFFSET(CLUSTER_MAX_NODES) - 1), 0);
+		if (fault == 2)
+			poll_fds[1] = poll_fds[2] = -1;
+		if (fault == 3)
+			cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
+		cluster_qvotec_test_poll_once(poll_fds, PGSA_TEST_DISKS, 901);
+		UT_ASSERT(!formation_snapshot_observed.complete);
+		formation_snapshot_requested = false;
+		fence_poll_close(&set);
+	}
+}
+
+UT_TEST(test_known_bad_slot_revokes_before_the_next_disk_read)
+{
+	PgsaDiskSet set;
+	ClusterFenceMarker marker;
+	uint8 corrupt = 0xff;
+	UT_ASSERT(slow_formation_fixture(&set, &marker));
+	UT_ASSERT_EQ(pwrite(set.fds[0], &corrupt, 1, CLUSTER_VOTING_SLOT_OFFSET(71) + 100), 1);
+	must_be_revoked_fd = set.fds[1];
+	revocation_checks = revocation_violations = 0;
+	cluster_qvotec_test_poll_once(set.fds, PGSA_TEST_DISKS, 901);
+	must_be_revoked_fd = -1;
+	UT_ASSERT(revocation_checks > 0);
+	UT_ASSERT_EQ(revocation_violations, 0);
+	UT_ASSERT(!formation_snapshot_observed.complete);
+	formation_snapshot_requested = false;
+	fence_poll_close(&set);
 }
 
 UT_TEST(test_poll_renews_real_majority_across_two_expiry_periods)
@@ -4470,7 +4625,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(86);
+	UT_PLAN(90);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -4550,6 +4705,10 @@ main(void)
 	UT_RUN(test_normal_stop_wrong_incarnation_and_uncommitted_protocol_do_not_clear);
 	UT_RUN(test_normal_stop_marker_preservation_and_replacement_hold);
 	UT_RUN(test_normal_stop_no_config_generation_overflow_and_legacy_boundary);
+	UT_RUN(test_slow_poll_keeps_completed_formation_snapshot_visible);
+	UT_RUN(test_slow_poll_reads_contiguous_voting_regions);
+	UT_RUN(test_completed_formation_snapshot_is_revoked_on_actual_failure);
+	UT_RUN(test_known_bad_slot_revokes_before_the_next_disk_read);
 	UT_RUN(test_poll_renews_real_majority_across_two_expiry_periods);
 	UT_RUN(test_poll_uses_fence_consumer_clock_when_quorum_clock_differs);
 	UT_RUN(test_poll_cannot_republish_invalidated_or_replaced_scan);

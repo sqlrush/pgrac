@@ -281,6 +281,29 @@ extern bool cluster_ko_shared_structure_observation_v2(uint32 slot, uint64 seria
  * Refusal leaves every output and every shared obligation unchanged. */
 extern bool cluster_ko_shared_structure_next_v2(uint32 *cursor, uint64 *serial,
 												struct ClusterPageWalBindingV1 *terminal);
+typedef enum ClusterKoStructurePollV2 {
+	CLUSTER_KO_STRUCTURE_INVALID,
+	CLUSTER_KO_STRUCTURE_PENDING,
+	CLUSTER_KO_STRUCTURE_PROGRESS,
+	CLUSTER_KO_STRUCTURE_RELEASED
+} ClusterKoStructurePollV2;
+/* Native COMMIT tail only. Uses the continuation reserved before the original
+ * SPACE modification; consumes the private handle without allocation, I/O or
+ * an active-slot wait. An undurable DROP is retained but cannot emit receipts.
+ * Stale committed proof is retained, never made current by this transfer.
+ * Native callers remain unactivated until the original physical owner and
+ * postcommit cleanup are connected in the same delivery. */
+extern bool cluster_ko_shared_native_handoff_v2(ClusterKoCompletionV2 **completion);
+/* One original checkpointer step into the existing bounded active region.
+ * INVALID/stale and PENDING/full retain all work. RELEASED means no pending
+ * native continuation, not completion of active work, PI or recovery windows. */
+extern ClusterKoStructurePollV2 cluster_ko_shared_native_promote_v2(void);
+/* End only this node's original background work, after its complete local
+ * responsibility scan and, for an origin, all peer ownership handoffs.
+ * Other accepted owners retain their own work. No global retirement or
+ * WAL/locator reclamation certificate is produced. */
+extern ClusterKoStructurePollV2 cluster_ko_shared_structure_finish_local_v2(uint32 slot,
+																			uint64 serial);
 /* Bounded read-only background scan, starting at *cursor (initially zero).
  * On success cursor becomes selected slot + 1 and serial identifies that
  * original slot lifetime. Only an actual remote peer gets a wire offer.
