@@ -34,6 +34,7 @@ StaticAssertDecl(CLUSTER_KO_SHARED_V2_BYTES == 160, "structural receipt KO layou
 StaticAssertDecl(CLUSTER_PI_WRITEBACK_MAX_BYTES_V2 == 22960, "bounded v2 writeback frame");
 
 #define WB_RETRY_US INT64CONST(100000)
+#define WB_OFFER_QUANTUM_US (10 * WB_RETRY_US)
 enum { WB_EMPTY, WB_QUEUED, WB_RUNNING, WB_REPLIED };
 
 typedef struct WritebackShared {
@@ -108,6 +109,11 @@ typedef struct WritebackBatch {
 	pid_t pid;
 	uint64 epoch;
 	ClusterWalSourceRef local;
+	bool structure_offer;
+	bool offer_completed;
+	TimestampTz offer_started;
+	uint32 offer_slot, offer_peer;
+	uint64 offer_serial;
 	uint32 count, data_index, peer_index, group_count, source_count;
 	BufferTag tags[CLUSTER_PI_WRITEBACK_MAX];
 	ClusterPcmPiWriteCutV1 write_cuts[CLUSTER_PI_WRITEBACK_MAX];
@@ -129,6 +135,8 @@ static ClusterPiWritebackJobV1 *wb_active;
 static ClusterPiWritebackNoticeV1 *wb_notice;
 static WritebackBatch *wb_batch;
 static uint32 wb_scan_cursor;
+static uint32 wb_offer_scan[RESOURCE_X_PROTOCOL_NODE_LIMIT], wb_offer_peer;
+static bool wb_offer_turn = true;
 static bool wb_callbacks;
 static TimestampTz wb_last_send;
 static uint64 wb_sent_revision, wb_sent_inbound;
@@ -1810,6 +1818,48 @@ wb_batch_current(void)
 		   && memcmp(&local, &wb_batch->local, sizeof(local)) == 0;
 }
 
+static void
+wb_batch_allocate(const ClusterWalSourceRef *local)
+{
+	wb_batch = palloc0(sizeof(*wb_batch));
+	wb_batch->owner = CurrentResourceOwner;
+	wb_batch->pid = getpid();
+	wb_batch->local = *local;
+	wb_batch->epoch = cluster_epoch_get_current();
+}
+
+static bool
+wb_batch_offer_start(const ClusterWalSourceRef *local)
+{
+	if ((cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0)
+		return false;
+	for (uint32 n = 0; n < RESOURCE_X_PROTOCOL_NODE_LIMIT; n++) {
+		ClusterPiWritebackFactV2 fact;
+		uint64 serial;
+		uint32 peer = wb_offer_peer++ % RESOURCE_X_PROTOCOL_NODE_LIMIT;
+
+		if (peer == cluster_node_id || cluster_membership_get_state(peer) != CLUSTER_MEMBER_MEMBER)
+			continue;
+		if (!cluster_ko_shared_structure_offer_next_v2(&wb_offer_scan[peer], peer, &serial,
+													   &fact)) {
+			/* Wrap on the next pass; never scan a second full slot range in
+			 * one tick or let a retained failed peer monopolize the batch. */
+			wb_offer_scan[peer] = 0;
+			continue;
+		}
+		wb_batch_allocate(local);
+		wb_batch->structure_offer = true;
+		wb_batch->offer_started = GetCurrentTimestamp();
+		wb_batch->offer_slot = wb_offer_scan[peer] - 1;
+		wb_batch->offer_serial = serial;
+		wb_batch->offer_peer = peer;
+		InitBufferTag(&wb_batch->tags[0], &fact.proof.structural.terminal.binding.identity.locator,
+					  SPACE_FORKNUM, 0);
+		return true;
+	}
+	return false;
+}
+
 static bool
 wb_batch_start(void)
 {
@@ -1823,14 +1873,17 @@ wb_batch_start(void)
 		|| local.claim.identity.origin_node_id != cluster_node_id
 		|| local.claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation())
 		return false;
+	if (wb_offer_turn && wb_batch_offer_start(&local))
+		goto selected;
 	count = cluster_pcm_lock_pi_candidates_v1(&wb_scan_cursor, 128, tags, CLUSTER_PI_WRITEBACK_MAX);
-	if (count == 0 || count > CLUSTER_PI_WRITEBACK_MAX)
+	if (count > CLUSTER_PI_WRITEBACK_MAX)
 		return false;
-	wb_batch = palloc0(sizeof(*wb_batch));
-	wb_batch->owner = CurrentResourceOwner;
-	wb_batch->pid = getpid();
-	wb_batch->local = local;
-	wb_batch->epoch = cluster_epoch_get_current();
+	if (count == 0) {
+		if (!wb_offer_turn && wb_batch_offer_start(&local))
+			goto selected;
+		return false;
+	}
+	wb_batch_allocate(&local);
 	for (uint32 i = 0; i < count; i++) {
 		uint32 next = wb_batch->count;
 		if (!cluster_pcm_lock_pi_write_snapshot_v1(tags[i], &wb_batch->write_cuts[next])
@@ -1842,8 +1895,12 @@ wb_batch_start(void)
 	if (wb_batch->count == 0) {
 		pfree(wb_batch);
 		wb_batch = NULL;
+		if (!wb_offer_turn && wb_batch_offer_start(&local))
+			goto selected;
 		return false;
 	}
+selected:
+	wb_offer_turn = !wb_batch->structure_offer;
 	SpinLockAcquire(&wb_shared->lock);
 	wb_shared->checkpointer_pid = MyProcPid;
 	SpinLockRelease(&wb_shared->lock);
@@ -1968,7 +2025,7 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 											 wb_batch->local.claim.identity.system_identifier,
 											 &wb_batch->inputs);
 		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
-			return true;
+			goto wait;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			goto done;
 	}
@@ -1977,6 +2034,25 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 		goto wait;
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
+	if (wb_batch->structure_offer) {
+		/* The input scope qualifies the peer's original OPEN claim only.
+		 * No WAL census or page plan is needed for relation acceptance. */
+		if (wb_batch->physical_job == NULL) {
+			ClusterWalSourceRef peer;
+			if (!wb_batch_peer(wb_batch->offer_peer, &peer))
+				goto done;
+			result = cluster_pi_writeback_structure_offer_begin_v2(
+				wb_batch->offer_slot, wb_batch->offer_serial, &peer, &wb_batch->physical_job);
+			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
+				goto done;
+			goto wait;
+		}
+		if (cluster_wal_inputs_revalidate_v1(wb_batch->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			wb_batch->offer_completed = cluster_ko_shared_structure_offer_complete_v2(
+				wb_batch->offer_slot, wb_batch->offer_serial, wb_batch->physical_job);
+		goto done;
+	}
 	if (wb_batch->plan == NULL) {
 		uint64 records;
 		RfPageProofDetailV1 detail;
@@ -2114,10 +2190,22 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 	}
 	goto done;
 wait:
+	if (wb_batch->structure_offer) {
+		TimestampTz now = GetCurrentTimestamp();
+		if (now < wb_batch->offer_started || now - wb_batch->offer_started >= WB_OFFER_QUANTUM_US) {
+			/* Yield only this attempt. The original KO slot remains pending,
+			 * and the next batch scans DATA before retrying relation offers. */
+			cluster_pi_writeback_checkpointer_release_v1();
+			return true;
+		}
+	}
 	if (wb_batch->inputs == NULL
 		|| cluster_wal_inputs_suspend_v1(wb_batch->inputs) == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return true;
 done:
+	if (wb_batch->structure_offer && !wb_batch->offer_completed)
+		wb_rejected(CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER, &wb_batch->tags[0], wb_batch->offer_peer,
+					wb_batch->epoch, wb_batch->local.claim.identity.origin_owner_incarnation);
 	cluster_pi_writeback_checkpointer_release_v1();
 	return true;
 }

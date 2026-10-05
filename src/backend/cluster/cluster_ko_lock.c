@@ -114,6 +114,7 @@ typedef struct ClusterKoSharedContext {
 	bool used;
 	bool complete;
 	bool structure_owned;
+	uint16 structure_peers_accepted;
 	int32 pid;
 	uint64 serial;
 	ClusterKoSharedMessageV2 request;
@@ -1129,7 +1130,8 @@ cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer, uint64 *se
 		ClusterPiStructuralFactV2 *s = &value.proof.structural;
 
 		if (!ko_shared_structure_snapshot(i, &context)
-			|| context.request.origin_node != cluster_node_id || context.peer_boots[peer] == 0)
+			|| context.request.origin_node != cluster_node_id || context.peer_boots[peer] == 0
+			|| (context.structure_peers_accepted & (1u << peer)) != 0)
 			continue;
 		s->ko = context.request;
 		s->ko.peer_node = peer;
@@ -1153,6 +1155,36 @@ cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer, uint64 *se
 		return true;
 	}
 	return false;
+}
+
+/* A transport ACK only says that the original remote background owner now
+ * retains this relation result. Keep the local KO and all page obligations. */
+bool
+cluster_ko_shared_structure_offer_complete_v2(uint32 slot, uint64 serial,
+											  const ClusterPiWritebackJobV1 *job)
+{
+	ClusterKoSharedContext before;
+	ClusterWalWriterToken peer;
+	int32 node;
+	bool accepted = false;
+
+	if (serial == 0 || !ko_shared_structure_snapshot(slot, &before) || before.serial != serial
+		|| before.request.origin_node != cluster_node_id
+		|| !cluster_pi_writeback_structure_offer_ack_v2(job, slot, serial, &peer))
+		return false;
+	node = peer.ref.claim.identity.origin_node_id;
+	if (node < 0 || node >= CLUSTER_KO_SHARED_NODE_LIMIT || node == cluster_node_id
+		|| peer.epoch != before.request.epoch || peer.startup_first_lsn != 0
+		|| peer.ref.claim.identity.origin_owner_incarnation != before.peer_boots[node]
+		|| before.peer_boots[node] == 0)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	if (memcmp(&ko_state->contexts[slot], &before, sizeof(before)) == 0) {
+		ko_state->contexts[slot].structure_peers_accepted |= (uint16)(1u << node);
+		accepted = true;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	return accepted;
 }
 
 bool

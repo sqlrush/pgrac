@@ -17,9 +17,13 @@
 #include "utils/relcache.h"
 static bool ko_offer_notice_fixture(const ClusterPiWritebackNoticeV1 *, uint32, uint64 *,
 									ClusterPiWritebackFactV2 *);
+static bool ko_offer_ack_fixture(const ClusterPiWritebackJobV1 *, uint32, uint64,
+								 ClusterWalWriterToken *);
 #define cluster_pi_writeback_structure_offer_read_v2 ko_offer_notice_fixture
+#define cluster_pi_writeback_structure_offer_ack_v2 ko_offer_ack_fixture
 #include "../../backend/cluster/cluster_ko_lock.c"
 #undef cluster_pi_writeback_structure_offer_read_v2
+#undef cluster_pi_writeback_structure_offer_ack_v2
 #undef printf
 #include "unit_test.h"
 
@@ -74,6 +78,24 @@ static ClusterKoSharedMessageV2 last_shared_request, last_shared_ack;
 static ClusterPiWritebackFactV2 offered_structure;
 static bool offer_notice_live;
 static const ClusterPiWritebackNoticeV1 *offer_notice = (const ClusterPiWritebackNoticeV1 *)9;
+static const ClusterPiWritebackJobV1 *offer_job = (const ClusterPiWritebackJobV1 *)11;
+static ClusterWalWriterToken offered_peer;
+static bool offer_ack_live, offer_ack_drift;
+static uint32 offer_ack_slot;
+static uint64 offer_ack_serial;
+/* The exact opaque transport ACK is the boundary here; the writeback suite
+ * verifies that the real singleton job cannot mint it from an empty reply. */
+static bool
+ko_offer_ack_fixture(const ClusterPiWritebackJobV1 *job, uint32 slot, uint64 serial,
+					 ClusterWalWriterToken *out)
+{
+	if (!offer_ack_live || job != offer_job || slot != offer_ack_slot || serial != offer_ack_serial)
+		return false;
+	if (offer_ack_drift)
+		storage.contexts[slot].serial++;
+	*out = offered_peer;
+	return true;
+}
 /* The authenticated WB notice is this unit's explicit input boundary. Its
  * runtime identity checks execute in the writeback unit; no raw public fact
  * is accepted by the KO owner. */
@@ -2020,6 +2042,86 @@ UT_TEST(test_structure_handoff_refuses_uncommitted_incomplete_and_wrong_owner)
 	UT_ASSERT(!cluster_ko_shared_structure_handoff_v2(NULL));
 }
 
+UT_TEST(test_structure_offer_ack_only_advances_original_peer_progress)
+{
+	ClusterPageWalBindingV1 binding;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	ClusterKoCompletionV2 *completion = prepare_native_structure(false, &binding, wal);
+	ClusterPiWritebackFactV2 fact;
+	const char *reason;
+	uint32 cursor = 0;
+	uint64 serial;
+
+	offer_ack_slot = completion->slot;
+	offer_ack_serial = completion->serial;
+	UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
+	UT_ASSERT(cluster_ko_shared_observe_truncate_v2(completion));
+	xact_callback(XACT_EVENT_COMMIT, NULL);
+	UT_ASSERT(cluster_ko_shared_structure_handoff_v2(&completion));
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT(cluster_ko_shared_structure_offer_next_v2(&cursor, 1, &serial, &fact));
+	memset(&offered_peer, 0, sizeof(offered_peer));
+	offered_peer.ref = writer;
+	offered_peer.ref.claim.identity.origin_node_id = 1;
+	offered_peer.ref.claim.identity.origin_thread_id = 2;
+	offered_peer.ref.claim.identity.origin_owner_incarnation = fact.proof.structural.ko.peer_boot;
+	offered_peer.epoch = current_epoch;
+	offer_ack_live = true;
+	offer_ack_drift = false;
+	UT_ASSERT(cluster_ko_shared_structure_offer_complete_v2(offer_ack_slot, serial, offer_job));
+	cursor = 0;
+	UT_ASSERT(!cluster_ko_shared_structure_offer_next_v2(&cursor, 1, &serial, &fact));
+	UT_ASSERT(storage.contexts[offer_ack_slot].used
+			  && storage.contexts[offer_ack_slot].structure_owned);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(cluster_ko_shared_structure_observation_v2(offer_ack_slot, offer_ack_serial, &binding,
+														 wal, sizeof(wal)));
+}
+
+UT_TEST(test_structure_offer_ack_refuses_wrong_scope_and_concurrent_slot_reuse)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		ClusterPageWalBindingV1 binding;
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+		ClusterKoCompletionV2 *completion = prepare_native_structure(false, &binding, wal);
+		ClusterKoSharedContext before;
+
+		offer_ack_slot = completion->slot;
+		offer_ack_serial = completion->serial;
+		UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &binding, wal, sizeof(wal)));
+		UT_ASSERT(cluster_ko_shared_observe_truncate_v2(completion));
+		xact_callback(XACT_EVENT_COMMIT, NULL);
+		UT_ASSERT(cluster_ko_shared_structure_handoff_v2(&completion));
+		MyBackendType = B_CHECKPOINTER;
+		memset(&offered_peer, 0, sizeof(offered_peer));
+		offered_peer.ref = writer;
+		offered_peer.ref.claim.identity.origin_node_id = 1;
+		offered_peer.ref.claim.identity.origin_thread_id = 2;
+		offered_peer.ref.claim.identity.origin_owner_incarnation = 22;
+		offered_peer.epoch = current_epoch;
+		offer_ack_live = fault != 0;
+		offer_ack_drift = fault == 6;
+		if (fault == 1)
+			offered_peer.ref.claim.identity.origin_node_id = 0;
+		if (fault == 2)
+			offered_peer.ref.claim.identity.origin_node_id = 16;
+		if (fault == 3)
+			offered_peer.ref.claim.identity.origin_owner_incarnation++;
+		if (fault == 4)
+			offered_peer.epoch++;
+		if (fault == 5)
+			offer_ack_serial++;
+		if (fault == 7)
+			MyBackendType = B_BACKEND;
+		before = storage.contexts[offer_ack_slot];
+		UT_ASSERT(!cluster_ko_shared_structure_offer_complete_v2(offer_ack_slot, offer_ack_serial,
+																 offer_job));
+		if (fault == 6)
+			before.serial++;
+		UT_ASSERT_EQ(memcmp(&before, &storage.contexts[offer_ack_slot], sizeof(before)), 0);
+	}
+}
+
 UT_TEST(test_structure_background_scan_preserves_stale_responsibility)
 {
 	for (unsigned fault = 0; fault < 14; fault++) {
@@ -2874,7 +2976,7 @@ int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(71);
+	UT_PLAN(73);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
@@ -2922,6 +3024,8 @@ main(void)
 	UT_RUN(test_native_relation_offer_requires_real_commit_and_original_effect);
 	UT_RUN(test_native_relation_offer_refuses_drop_missing_effect_and_changed_scope);
 	UT_RUN(test_structure_handoff_consumes_original_handle_without_new_work);
+	UT_RUN(test_structure_offer_ack_only_advances_original_peer_progress);
+	UT_RUN(test_structure_offer_ack_refuses_wrong_scope_and_concurrent_slot_reuse);
 	UT_RUN(test_structure_handoff_refuses_uncommitted_incomplete_and_wrong_owner);
 	UT_RUN(test_structure_background_scan_preserves_stale_responsibility);
 	UT_RUN(test_structure_handoff_uses_reserved_slot_even_at_capacity);

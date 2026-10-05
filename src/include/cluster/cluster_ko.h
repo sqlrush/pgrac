@@ -279,6 +279,13 @@ extern bool cluster_ko_shared_structure_observation_v2(uint32 slot, uint64 seria
  * acknowledgement, PI retirement or GC authority is returned here. */
 extern bool cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer,
 	uint64 *serial, struct ClusterPiWritebackFactV2 *out);
+struct ClusterPiWritebackJobV1;
+/* Record only a peer's acceptance from the original completed opaque job.
+ * The exact shared slot remains owned; this is neither per-page retirement
+ * nor permission to release a KO slot, retained WAL or a locator. */
+extern bool
+cluster_ko_shared_structure_offer_complete_v2(uint32 slot, uint64 serial,
+											  const struct ClusterPiWritebackJobV1 *job);
 /* Reproject an original request inside its unchanged member/boot cut for a
  * background recipient. Sending back to the origin retains the original
  * origin -> master request, never a self request. This only returns wire

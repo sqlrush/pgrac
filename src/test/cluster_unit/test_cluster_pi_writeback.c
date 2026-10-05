@@ -33,6 +33,12 @@ static uint64 wb_boots[3] = { 9, 9, 9 };
 static uint64 wb_membership_generation = 2;
 static uint32 wb_local_caps, wb_peer_caps, wb_cap_generation;
 static bool wb_cap_available, wb_ko_current;
+static bool wb_offer_present;
+static uint32 wb_offer_slot;
+static uint64 wb_offer_serial;
+static uint16 wb_offer_accepted;
+static unsigned wb_offer_complete_calls;
+static ClusterPiWritebackFactV2 wb_offer_observed;
 static int wb_cap_samples, wb_cap_drift, wb_route;
 static bool wb_quorum = true, wb_stop, wb_input_current = true, wb_input_wait;
 static ClusterWalSourceRef wb_sources[3];
@@ -819,10 +825,14 @@ wb_structural_fact_for_transport(const ClusterPageStructuralReceiptV2 *receipt, 
 #define cluster_page_structural_pi_fact_v2 wb_structural_fact_for_transport
 static bool wb_offer_read_for_transport(uint32 *cursor, int32 peer, uint64 *serial,
 										ClusterPiWritebackFactV2 *out);
+static bool wb_offer_complete_for_transport(uint32 slot, uint64 serial,
+											const ClusterPiWritebackJobV1 *job);
 #define cluster_ko_shared_structure_offer_next_v2 wb_offer_read_for_transport
+#define cluster_ko_shared_structure_offer_complete_v2 wb_offer_complete_for_transport
 #include "../../backend/cluster/cluster_pi_writeback.c"
 #undef cluster_page_structural_pi_fact_v2
 #undef cluster_ko_shared_structure_offer_next_v2
+#undef cluster_ko_shared_structure_offer_complete_v2
 #include "../../backend/cluster/cluster_pi_rebuild.c"
 #undef palloc0
 
@@ -862,6 +872,12 @@ wb_setup(void)
 	wb_resume_wait = false;
 	wb_master_completions = 0;
 	wb_candidates = false;
+	wb_offer_present = false;
+	wb_offer_accepted = 0;
+	wb_offer_complete_calls = 0;
+	memset(wb_offer_scan, 0, sizeof(wb_offer_scan));
+	wb_offer_peer = 0;
+	wb_offer_turn = true;
 	wb_page_plan = prepare_storage_observation(wb_sources, &wb_storage_cut);
 	wb_storage_cut.master_session_incarnation = 9;
 	UT_ASSERT(cluster_bufmgr_observe_pi_storage_v1(&target, &wb_storage_cut, wb_page_plan,
@@ -1897,7 +1913,13 @@ int
 main(void)
 {
 	printf("# sizeof_WritebackShared=%zu\n", sizeof(WritebackShared));
-	UT_PLAN(62);
+	UT_PLAN(68);
+	UT_RUN(writeback_v2_checkpointer_dispatches_offer_without_data);
+	UT_RUN(writeback_v2_checkpointer_preserves_offer_on_refusal_and_stop);
+	UT_RUN(writeback_v2_checkpointer_empty_ack_keeps_offer_and_yields_to_data);
+	UT_RUN(writeback_v2_checkpointer_pending_offer_yields_without_clearing_obligation);
+	UT_RUN(writeback_v2_checkpointer_offer_input_wait_yields_to_data);
+	UT_RUN(writeback_v2_checkpointer_owner_error_preserves_original_offer);
 	UT_RUN(writeback_v2_original_offer_job_reaches_remote_acceptance);
 	UT_RUN(writeback_v2_offer_refuses_missing_changed_or_reused_slot);
 	UT_RUN(writeback_v2_offer_late_ack_cannot_survive_original_owner_or_slot_change);
