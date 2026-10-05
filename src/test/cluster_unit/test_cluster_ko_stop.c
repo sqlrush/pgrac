@@ -268,7 +268,8 @@ ErrorContextCallback *error_context_stack;
 void *
 MemoryContextAllocZero(MemoryContext context, Size size)
 {
-	Assert(context == TopTransactionContext);
+	Assert(context == TopTransactionContext || context == TopMemoryContext);
+	Assert(SpinLockFree(&storage.shared_lock));
 	completion_allocations++;
 	return calloc(1, size);
 }
@@ -3773,11 +3774,226 @@ UT_TEST(test_native_continuation_retains_stale_commit_but_cannot_serve_it)
 	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
 }
 
+
+/* The storage consumer is an explicit boundary here. Its real fd/fsync
+ * failure matrix remains in the storage owner's tests before activation. */
+static uint32
+prepare_promoted_drop(ClusterPageWalBindingV1 *binding, uint8 *wal)
+{
+	ClusterKoCompletionV2 *owner = prepare_native_structure(true, binding, wal);
+	if (!cluster_ko_shared_observe_space_v2(owner, binding, wal, CLUSTER_SPACE_STRUCTURE_WAL_BYTES))
+		abort();
+	xact_callback(XACT_EVENT_COMMIT, NULL);
+	if (!cluster_ko_shared_native_handoff_v2(&owner))
+		abort();
+	MyBackendType = B_CHECKPOINTER;
+	if (cluster_ko_shared_native_promote_v2() != CLUSTER_KO_STRUCTURE_PROGRESS)
+		abort();
+	for (uint32 i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+		if (storage.contexts[i].used && storage.contexts[i].structure_drop_pending)
+			return i;
+	abort();
+}
+
+UT_TEST(test_drop_work_preserves_same_storage_state_until_exact_finish)
+{
+	ClusterPageWalBindingV1 terminal, observed;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], readback[sizeof(wal)];
+	uint32 slot = prepare_promoted_drop(&terminal, wal), cursor = slot;
+	ClusterKoDropWorkV2 *work = NULL, *again = NULL;
+	uint64 *state;
+	const char *reason;
+	uint64 serial = storage.contexts[slot].serial;
+	UT_ASSERT(cluster_ko_shared_drop_work_begin_v2(&cursor, 4 * sizeof(uint64), &work));
+	UT_ASSERT_EQ(cursor, slot + 1);
+	state = cluster_ko_shared_drop_work_state_v2(work, 4 * sizeof(uint64));
+	UT_ASSERT(state != NULL);
+	UT_ASSERT_EQ(state[0], 0);
+	state[0] = 7;
+	state[1] = 810; /* Original fd/stage carrier, not an effect. */
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	UT_ASSERT(cluster_ko_shared_drop_work_revalidate_v2(work));
+	UT_ASSERT(cluster_ko_shared_drop_work_read_v2(work, &observed, readback, sizeof(readback)));
+	UT_ASSERT(memcmp(&observed, &terminal, sizeof(terminal)) == 0);
+	UT_ASSERT(memcmp(wal, readback, sizeof(wal)) == 0);
+	UT_ASSERT(!cluster_ko_shared_structure_observation_v2(slot, serial, &observed, readback,
+														  sizeof(readback)));
+	cursor = slot;
+	UT_ASSERT(cluster_ko_shared_drop_work_begin_v2(&cursor, 4 * sizeof(uint64), &again));
+	UT_ASSERT(again == work);
+	UT_ASSERT(cluster_ko_shared_drop_work_state_v2(again, 4 * sizeof(uint64)) == state);
+	UT_ASSERT_EQ(state[1], 810);
+	UT_ASSERT(cluster_ko_shared_drop_work_state_v2(work, sizeof(uint64)) == NULL);
+	/* Only the original durable storage-success branch may call this API. */
+	UT_ASSERT(cluster_ko_shared_drop_work_finish_v2(&work));
+	UT_ASSERT(work == NULL);
+	UT_ASSERT(!cluster_ko_shared_drop_work_finish_v2(&again));
+	UT_ASSERT(cluster_ko_shared_structure_observation_v2(slot, serial, &observed, readback,
+														 sizeof(readback)));
+	UT_ASSERT(storage.contexts[slot].used && storage.contexts[slot].structure_owned);
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(completion_allocations, 0);
+}
+
+UT_TEST(test_drop_work_rejects_owner_and_full_cut_drift_without_losing_progress)
+{
+	for (unsigned bad = 0; bad < 12; bad++) {
+		ClusterPageWalBindingV1 terminal, observed, sentinel;
+		uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], readback[sizeof(wal)];
+		uint32 slot = prepare_promoted_drop(&terminal, wal), cursor = slot;
+		ClusterKoDropWorkV2 *work = NULL, *saved;
+		ClusterKoSharedContext before;
+		ClusterWalSourceRef source = writer;
+		uint64 epoch = current_epoch;
+		int pid = MyProcPid;
+		ResourceOwner owner = CurrentResourceOwner;
+		UT_ASSERT(cluster_ko_shared_drop_work_begin_v2(&cursor, 16, &work));
+		before = storage.contexts[slot];
+		saved = work;
+		switch (bad) {
+		case 0:
+			CurrentResourceOwner = (ResourceOwner)2;
+			break;
+		case 1:
+			MyProcPid++;
+			break;
+		case 2:
+			MyBackendType = B_BG_WRITER;
+			break;
+		case 3:
+			CritSectionCount = 1;
+			break;
+		case 4:
+			current_epoch++;
+			break;
+		case 5:
+			writer.claim.identity.origin_owner_incarnation++;
+			break;
+		case 6:
+			writer.claim.database_incarnation++;
+			break;
+		case 7:
+			storage.contexts[slot].serial++;
+			break;
+		case 8:
+			storage.contexts[slot].structure_drop_pending = false;
+			break;
+		case 9:
+			storage.contexts[slot].drop_executor_pid++;
+			break;
+		case 10:
+			storage.contexts[slot].terminal.record_start++;
+			break;
+		case 11:
+			storage.contexts[slot].request.members[0] ^= 4;
+			break;
+		}
+		memset(&observed, 0xa5, sizeof(observed));
+		sentinel = observed;
+		memset(readback, 0xa5, sizeof(readback));
+		UT_ASSERT(
+			!cluster_ko_shared_drop_work_read_v2(work, &observed, readback, sizeof(readback)));
+		UT_ASSERT(memcmp(&observed, &sentinel, sizeof(observed)) == 0);
+		for (Size i = 0; i < sizeof(readback); i++)
+			UT_ASSERT_EQ(readback[i], 0xa5);
+		UT_ASSERT(!cluster_ko_shared_drop_work_finish_v2(&work));
+		UT_ASSERT(work == saved);
+		MyProcPid = pid;
+		MyBackendType = B_CHECKPOINTER;
+		CurrentResourceOwner = owner;
+		CritSectionCount = 0;
+		current_epoch = epoch;
+		writer = source;
+		storage.contexts[slot] = before;
+		UT_ASSERT(cluster_ko_shared_drop_work_finish_v2(&work));
+		UT_ASSERT_EQ(completion_allocations, 0);
+	}
+}
+
+UT_TEST(test_drop_work_exit_and_slot_reuse_never_adopt_unknown_physical_progress)
+{
+	ClusterPageWalBindingV1 terminal;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	uint32 slot = prepare_promoted_drop(&terminal, wal), cursor = slot;
+	ClusterKoDropWorkV2 *work = NULL, *other = NULL, copy, *fake;
+	ClusterKoSharedContext before;
+	int pid = MyProcPid;
+	UT_ASSERT(cluster_ko_shared_drop_work_begin_v2(&cursor, 16, &work));
+	before = storage.contexts[slot];
+	copy = *work;
+	fake = &copy;
+	UT_ASSERT(!cluster_ko_shared_drop_work_finish_v2(&fake));
+	MyProcPid++;
+	cursor = slot;
+	UT_ASSERT(!cluster_ko_shared_drop_work_begin_v2(&cursor, 16, &other));
+	UT_ASSERT_EQ(cursor, slot);
+	UT_ASSERT(other == NULL);
+	MyProcPid = pid;
+	exit_callback(0, (Datum)0);
+	UT_ASSERT_EQ(completion_allocations, 0);
+	UT_ASSERT(memcmp(&before, &storage.contexts[slot], sizeof(before)) == 0);
+	MyProcPid++;
+	cursor = slot;
+	UT_ASSERT(!cluster_ko_shared_drop_work_begin_v2(&cursor, 16, &other));
+	UT_ASSERT(!cluster_ko_shared_drop_work_finish_v2(&work));
+	UT_ASSERT(storage.contexts[slot].structure_drop_pending);
+	MyProcPid = pid;
+}
+
+
+UT_TEST(test_drop_work_bounded_scan_continues_after_a_retained_storage_failure)
+{
+	ClusterPageWalBindingV1 terminal, next;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	uint32 first = prepare_promoted_drop(&terminal, wal), cursor = first;
+	ClusterKoCompletionV2 *completion = NULL;
+	ClusterKoDropWorkV2 *one = NULL, *two = NULL;
+	ClusterSpaceStructureChange change;
+	uint64 *state;
+	uint32 second;
+	UT_ASSERT(cluster_space_structure_wal_decode(wal, sizeof(wal), &change));
+	MyBackendType = B_BACKEND;
+	multiple_barriers = true;
+	allocated_batch = last_shared_request.batch_id;
+	space_identity.key.locator.relNumber++;
+	cluster_ko_flush_and_wait_ack(space_identity.key.locator, RELPERSISTENCE_PERMANENT);
+	UT_ASSERT(
+		cluster_ko_shared_claim_v2(&space_identity.key, space_identity.incarnation, &completion));
+	change.identity.expected.key.locator = change.identity.result.key.locator
+		= space_identity.key.locator;
+	change.reservation.before.identity.key.locator = change.reservation.result.identity.key.locator
+		= space_identity.key.locator;
+	next = terminal;
+	next.identity.locator = space_identity.key.locator;
+	UT_ASSERT(cluster_space_structure_wal_encode(&change, wal, sizeof(wal)));
+	UT_ASSERT(cluster_ko_shared_observe_space_v2(completion, &next, wal, sizeof(wal)));
+	xact_callback(XACT_EVENT_COMMIT, NULL);
+	UT_ASSERT(cluster_ko_shared_native_handoff_v2(&completion));
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
+	UT_ASSERT(!cluster_ko_shared_drop_work_begin_v2(&cursor, 0, &one));
+	UT_ASSERT(!cluster_ko_shared_drop_work_begin_v2(&cursor, MaxAllocSize, &one));
+	UT_ASSERT_EQ(cursor, first);
+	UT_ASSERT(cluster_ko_shared_drop_work_begin_v2(&cursor, 16, &one));
+	state = cluster_ko_shared_drop_work_state_v2(one, 16);
+	UT_ASSERT(state != NULL);
+	state[0] = 314; /* Retained first I/O failure: do not call finish. */
+	UT_ASSERT(cluster_ko_shared_drop_work_begin_v2(&cursor, 16, &two));
+	second = cursor - 1;
+	UT_ASSERT(second != first && two != one);
+	UT_ASSERT(cluster_ko_shared_drop_work_finish_v2(&two));
+	UT_ASSERT(storage.contexts[first].structure_drop_pending);
+	UT_ASSERT(!storage.contexts[second].structure_drop_pending);
+	UT_ASSERT_EQ(state[0], 314);
+	UT_ASSERT(cluster_ko_shared_drop_work_finish_v2(&one));
+	UT_ASSERT_EQ(completion_allocations, 0);
+}
+
 int
 main(void)
 {
 	printf("# sizeof_ClusterKoShared=%zu\n", sizeof(ClusterKoShared));
-	UT_PLAN(87);
+	UT_PLAN(91);
 	UT_RUN(test_only_actual_consumer_can_observe);
 	UT_RUN(test_real_admission_flush_drop_ack_order);
 	UT_RUN(test_origin_barrier_discards_lease_even_without_remote_work);
@@ -3865,6 +4081,10 @@ main(void)
 	UT_RUN(test_native_continuation_retains_stale_commit_but_cannot_serve_it);
 	UT_RUN(test_native_continuation_allocation_failure_precedes_space_and_cleans_owner);
 	UT_RUN(test_native_autovacuum_truncate_keeps_its_committed_continuation);
+	UT_RUN(test_drop_work_preserves_same_storage_state_until_exact_finish);
+	UT_RUN(test_drop_work_rejects_owner_and_full_cut_drift_without_losing_progress);
+	UT_RUN(test_drop_work_exit_and_slot_reuse_never_adopt_unknown_physical_progress);
+	UT_RUN(test_drop_work_bounded_scan_continues_after_a_retained_storage_failure);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
