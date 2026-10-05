@@ -657,17 +657,30 @@ cluster_smgr_unlink_committed_drop(RelFileLocator locator)
 bool
 cluster_smgr_drop_work_poll(uint32 *cursor, bool *completed)
 {
+	static uint32 abandon_cursor;
 	ClusterKoDropWorkV2 *work = NULL;
 	const ClusterSharedFsOps *ops = cluster_shared_fs_get_active_ops();
 
 	if (cursor == NULL || completed == NULL || !cluster_shared_config || ops == NULL
-		|| ops->id != CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
-		|| !cluster_ko_shared_drop_work_begin_v2(
-			cursor, cluster_shared_fs_sharedfs_drop_work_size(), &work))
+		|| ops->id != CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS)
+		return false;
+	/* One independently selected cleanup per tick, even when the execution cut
+	 * is no longer available. Unknown/transient admission is not abandonment.
+	 * Never report cleanup as physical cursor progress to the native caller. */
+	if (cluster_ko_shared_drop_work_abandon_next_v2(
+			&abandon_cursor, cluster_shared_fs_sharedfs_drop_work_size(), &work)) {
+		cluster_shared_fs_sharedfs_drop_work_abandon(work);
+		work = NULL;
+	} else
+		abandon_cursor = 0;
+	if (!cluster_ko_shared_drop_work_begin_v2(cursor, cluster_shared_fs_sharedfs_drop_work_size(),
+											  &work))
 		return false;
 	*completed = false;
 	if (cluster_shared_fs_sharedfs_drop_work(work))
 		*completed = cluster_ko_shared_drop_work_finish_v2(&work);
+	else if (cluster_shared_fs_sharedfs_drop_work_failed(work))
+		cluster_shared_fs_sharedfs_drop_work_abandon(work);
 	return true;
 }
 

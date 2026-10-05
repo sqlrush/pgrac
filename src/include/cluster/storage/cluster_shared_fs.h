@@ -373,6 +373,8 @@ extern bool cluster_shared_fs_sharedfs_drop_durable(const struct ClusterSpaceIde
 struct ClusterKoDropWorkV2;
 extern Size cluster_shared_fs_sharedfs_drop_work_size(void);
 extern bool cluster_shared_fs_sharedfs_drop_work(struct ClusterKoDropWorkV2 *work);
+extern bool cluster_shared_fs_sharedfs_drop_work_failed(const struct ClusterKoDropWorkV2 *work);
+extern void cluster_shared_fs_sharedfs_drop_work_abandon(struct ClusterKoDropWorkV2 *work);
 
 /*
  * Length of the shared-storage uuid recorded in the cross-node sentinel:

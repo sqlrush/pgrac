@@ -697,6 +697,45 @@ cluster_shared_fs_sharedfs_drop_work_size(void)
 	return sizeof(SharedFsDropWorkState);
 }
 
+bool
+cluster_shared_fs_sharedfs_drop_work_failed(const ClusterKoDropWorkV2 *work)
+{
+	const SharedFsDropWorkState *state = cluster_ko_shared_drop_work_state_v2(work, sizeof(*state));
+
+	return state != NULL && state->failed;
+}
+
+/* The original owner may dispose its descriptors after losing the execution
+ * cut. Abandon never clears shared WAL/structure responsibility or completes
+ * the work. An uncertain close must not later close a reused descriptor. */
+void
+cluster_shared_fs_sharedfs_drop_work_abandon(ClusterKoDropWorkV2 *work)
+{
+	SharedFsDropWorkState *state = cluster_ko_shared_drop_work_abandon_v2(work, sizeof(*state));
+	int saved_errno = errno;
+
+	if (state == NULL || !state->initialized)
+		return;
+	state->failed = true;
+	for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++) {
+		int fd = state->forks[fork].fd;
+
+		if (fd < 0)
+			continue;
+		state->forks[fork].fd = -1;
+		(void)close(fd);
+		ReleaseExternalFD();
+	}
+	if (state->directory >= 0) {
+		int fd = state->directory;
+
+		state->directory = -1;
+		(void)close(fd);
+		ReleaseExternalFD();
+	}
+	errno = saved_errno;
+}
+
 /* A known namespace/identity contradiction cannot be retried as new work. */
 static bool
 sharedfs_drop_work_invalid(SharedFsDropWorkState *state)

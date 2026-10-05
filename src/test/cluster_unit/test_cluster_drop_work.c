@@ -413,6 +413,17 @@ poll_work(void)
 }
 
 static void
+assert_work_not_selected(void)
+{
+	uint32 cursor = work_slot;
+	bool completed = true;
+
+	UT_ASSERT(!cluster_smgr_drop_work_poll(&cursor, &completed));
+	UT_ASSERT_EQ(cursor, work_slot);
+	UT_ASSERT(completed);
+}
+
+static void
 assert_finished(void)
 {
 	struct stat st;
@@ -590,7 +601,7 @@ full_work_table_cleanup(bool healthy)
 		uint32 old_cursor = cursor;
 		if (cluster_smgr_drop_work_poll(&cursor, &completed)) {
 			UT_ASSERT(healthy);
-			UT_ASSERT_EQ(cursor, slots[retired] + 1);
+			UT_ASSERT_EQ(cursor, healthy ? slots[retired] + 1 : old_cursor);
 			completed_count += completed ? 1 : 0;
 		} else {
 			UT_ASSERT_EQ(cursor, old_cursor);
@@ -709,12 +720,14 @@ UT_TEST(test_native_commit_and_real_smgr_defer_io_to_original_work)
 				/* A later successful fsync cannot replace bytes the OS may
 				 * have discarded. Native continuation must retain recovery. */
 				for (unsigned retry = 0; retry < 3; retry++) {
-					UT_ASSERT(!poll_work());
+					assert_work_not_selected();
 					UT_ASSERT(memcmp(&retained, &storage.contexts[work_slot],
 									 sizeof(retained)) == 0);
 					UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
-					UT_ASSERT_EQ(closes, 0);
+					UT_ASSERT_EQ(closes, MAX_FORKNUM + 2);
+					UT_ASSERT_EQ(external_fds, 0);
 				}
+				assert_recovery_required();
 			}
 			UT_ASSERT_EQ(truncates, 1);
 			UT_ASSERT_EQ(main_syncs, 1);
@@ -831,13 +844,16 @@ sync_failure_requires_recovery(enum WorkFault fault, const char *name)
 	 * successful fsync cannot authorize completion of this work. */
 	work_fault = WORK_OK;
 	for (unsigned retry = 0; retry < 3; retry++) {
-		UT_ASSERT(!poll_work());
+		assert_work_not_selected();
 		UT_ASSERT_EQ(main_syncs + dir_syncs, old_syncs);
 		UT_ASSERT_EQ(unlinks, old_unlinks);
 		UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
 		UT_ASSERT(storage.contexts[work_slot].structure_owned);
 		UT_ASSERT_EQ(truncates, 1);
 	}
+	UT_ASSERT_EQ(closes, MAX_FORKNUM + 2);
+	UT_ASSERT_EQ(external_fds, 0);
+	assert_recovery_required();
 }
 
 UT_TEST(test_work_main_fsync_failure_requires_recovery)
@@ -1003,10 +1019,18 @@ cut_fault(enum WorkFault fault, const char *name)
 	UT_ASSERT_EQ(main_syncs, old_syncs);
 	UT_ASSERT_EQ(unlinks, old_unlinks);
 	UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
-	/* Test cleanup restores the fixture's read-side refusal, never disk state. */
+	/* Positive replacement disposes the original descriptors in a bounded
+	 * cleanup scan. Even a restored fixture cut cannot authorize fresh I/O. */
+	for (unsigned tick = 0; tick <= CLUSTER_KO_SHARED_CAPACITY; tick++)
+		assert_work_not_selected();
+	UT_ASSERT_EQ(closes, MAX_FORKNUM + 2);
+	UT_ASSERT_EQ(external_fds, 0);
 	current_epoch--;
 	work_fault = WORK_OK;
-	UT_ASSERT(poll_work());
+	assert_work_not_selected();
+	UT_ASSERT_EQ(main_syncs, old_syncs);
+	UT_ASSERT_EQ(unlinks, old_unlinks);
+	assert_recovery_required();
 }
 #define CUT_TEST(name, fault)                                                                      \
 	UT_TEST(name)                                                                                  \
@@ -1060,17 +1084,22 @@ UT_TEST(test_work_nfs_refused_before_first_mutation)
 UT_TEST(test_work_close_error_never_finishes_or_retries_unknown_descriptor)
 {
 	unsigned old_closes;
+	int baseline;
 	if (!work_setup("unknown_close"))
 		return;
+	baseline = descriptor_count();
 	work_fault = WORK_CLOSE;
 	UT_ASSERT(!poll_work());
-	UT_ASSERT_EQ(external_fds, MAX_FORKNUM + 1);
+	UT_ASSERT_EQ(external_fds, 0);
+	UT_ASSERT_EQ(closes, MAX_FORKNUM + 2);
+	UT_ASSERT_EQ(descriptor_count(), baseline);
 	old_closes = closes;
 	work_fault = WORK_OK;
-	UT_ASSERT(!poll_work());
+	assert_work_not_selected();
 	UT_ASSERT_EQ(closes, old_closes);
 	UT_ASSERT_EQ(truncates, 1);
 	UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+	assert_recovery_required();
 }
 
 UT_TEST(test_work_executor_process_exit_does_not_redo_partial_io)
