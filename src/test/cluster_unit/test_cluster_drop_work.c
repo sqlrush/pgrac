@@ -436,22 +436,40 @@ UT_TEST(test_work_success_keeps_main_and_structure_obligation)
 
 UT_TEST(test_native_commit_and_real_smgr_defer_io_to_original_work)
 {
-	for (unsigned stale = 0; stale < 2; stale++) {
-		if (!work_setup_impl(stale ? "native_stale" : "native_commit", true, stale))
-			return;
-		work_fault = WORK_DIR_SYNC;
-		UT_ASSERT(!poll_work());
-		UT_ASSERT_EQ(unlinks, MAX_FORKNUM);
-		UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
-		/* The original backend handle is gone; only retained work may retry. */
-		UT_ASSERT(ko_completions == NULL);
-		work_fault = WORK_OK;
-		UT_ASSERT(poll_work());
-		assert_finished();
-		UT_ASSERT_EQ(truncates, 1);
-		UT_ASSERT_EQ(unlinks, MAX_FORKNUM);
-		UT_ASSERT_EQ(dir_syncs, 2);
-	}
+	for (unsigned stale = 0; stale < 2; stale++)
+		for (unsigned failed = 0; failed < 2; failed++) {
+			char name[64];
+			ClusterKoSharedContext retained;
+
+			snprintf(name, sizeof(name), "native_commit_%u_%u", stale, failed);
+			if (!work_setup_impl(name, true, stale))
+				return;
+			/* The backend has handed off without doing pathname I/O. */
+			UT_ASSERT(ko_completions == NULL);
+			if (!failed) {
+				UT_ASSERT(poll_work());
+				assert_finished();
+			} else {
+				work_fault = WORK_DIR_SYNC;
+				UT_ASSERT(!poll_work());
+				retained = storage.contexts[work_slot];
+				resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+				work_fault = WORK_OK;
+				/* A later successful fsync cannot replace bytes the OS may
+				 * have discarded. Native continuation must retain recovery. */
+				for (unsigned retry = 0; retry < 3; retry++) {
+					UT_ASSERT(!poll_work());
+					UT_ASSERT(memcmp(&retained, &storage.contexts[work_slot],
+									 sizeof(retained)) == 0);
+					UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+					UT_ASSERT_EQ(closes, 0);
+				}
+			}
+			UT_ASSERT_EQ(truncates, 1);
+			UT_ASSERT_EQ(main_syncs, 1);
+			UT_ASSERT_EQ(unlinks, MAX_FORKNUM);
+			UT_ASSERT_EQ(dir_syncs, 1);
+		}
 }
 
 UT_TEST(test_native_checkpointer_poll_has_bounded_visible_failure_and_retry)
@@ -467,17 +485,19 @@ UT_TEST(test_native_checkpointer_poll_has_bounded_visible_failure_and_retry)
 	UT_ASSERT(!run_native_checkpointer());
 	UT_ASSERT_EQ(opens + truncates + main_syncs + dir_syncs + unlinks + closes, 0);
 	native_commit_active = true;
-	work_fault = WORK_DIR_SYNC;
+	/* A failed unlink which left the same original inode can be retried.
+	 * Unlike fsync failure, it does not lose a prior durability guarantee. */
+	work_fault = WORK_AUX;
 	failures = cluster_ko_failclosed_count();
 	UT_ASSERT(!run_native_checkpointer());
-	UT_ASSERT_EQ(dir_syncs, 1);
+	UT_ASSERT_EQ(unlinks, 1);
 	UT_ASSERT_EQ(cluster_ko_failclosed_count(), failures + 1);
 	UT_ASSERT_EQ(fixture_log_events, 1);
 	/* A failed item advances the cursor; there is no retry loop this tick. */
 	UT_ASSERT(!run_native_checkpointer());
-	UT_ASSERT_EQ(dir_syncs, 1);
+	UT_ASSERT_EQ(unlinks, 1);
 	UT_ASSERT(!run_native_checkpointer());
-	UT_ASSERT_EQ(dir_syncs, 2);
+	UT_ASSERT_EQ(unlinks, 2);
 	UT_ASSERT_EQ(cluster_ko_failclosed_count(), failures + 2);
 	UT_ASSERT_EQ(fixture_log_events, 1);
 	work_fault = WORK_OK;
@@ -485,8 +505,9 @@ UT_TEST(test_native_checkpointer_poll_has_bounded_visible_failure_and_retry)
 	UT_ASSERT(run_native_checkpointer());
 	assert_finished();
 	UT_ASSERT_EQ(truncates, 1);
-	UT_ASSERT_EQ(unlinks, MAX_FORKNUM);
-	UT_ASSERT_EQ(dir_syncs, 3);
+	UT_ASSERT_EQ(main_syncs, 1);
+	UT_ASSERT_EQ(unlinks, MAX_FORKNUM + 2);
+	UT_ASSERT_EQ(dir_syncs, 1);
 	ko_drop_poll_boundary = NULL;
 }
 
