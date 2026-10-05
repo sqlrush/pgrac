@@ -583,6 +583,11 @@ cluster_smgr_unlink_committed_drop(RelFileLocator locator)
 	const uint32 save_crit_section = CritSectionCount;
 	volatile bool handled = false;
 
+	/* The original COMMIT tail transferred the work before any callback.
+	 * Only that original checkpointer work may start physical removal. */
+	if (cluster_ko_shared_native_drop_deferred_v2(locator))
+		return true;
+
 	PG_TRY();
 	{
 		ClusterKoCompletionV2 *completion = NULL;

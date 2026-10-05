@@ -2929,6 +2929,9 @@ CommitTransaction(void)
 	ProcArrayEndTransaction(MyProc, latestXid);
 
 #ifdef USE_PGRAC_CLUSTER
+	/* Preserve committed structural work before any postcommit callback. */
+	if (!is_parallel_worker)
+		cluster_ko_shared_native_commit_v2();
 
 	/*
 	 * spec-6.14 D5 (INV-14-8): publish any staged relmap authority pending
@@ -3002,9 +3005,8 @@ CommitTransaction(void)
 	 */
 	smgrDoPendingDeletes(true);
 #ifdef USE_PGRAC_CLUSTER
-	/* Native KO observations span the actual postcommit storage owner. The
-	 * return above is not a durability receipt; cancel the local handles
-	 * before their original transaction context is destroyed. */
+	/* Pending deletes may have handed physical work to the checkpointer.
+	 * This return is not durability; dispose only of the local handles. */
 	cluster_ko_shared_postcommit_cleanup_v2();
 #endif
 

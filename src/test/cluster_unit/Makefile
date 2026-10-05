@@ -5859,9 +5859,16 @@ test_cluster_rdma_stop_disabled: test_cluster_rdma_stop.c test_cluster_rdma_stop
 
 test_cluster_ko_postcommit.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
 	awk '/^CommitTransaction\(/ { inside=1 } \
-	     inside && /^\tCallXactCallbacks\(is_parallel_worker \? XACT_EVENT_PARALLEL_COMMIT/ { emit=1; found++ } \
+	     inside && /^\tProcArrayEndTransaction\(MyProc, latestXid\);/ { emit=1; found++; next } \
 	     emit && /^\tAtCommit_Notify\(\);/ { emit=0; inside=0; done++ } \
 	     emit { print } /^}/ { inside=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ko_checkpointer.inc: $(top_srcdir)/src/backend/postmaster/checkpointer.c Makefile
+	awk '/^\t\tpi_pending = cluster_ko_shared_native_poll_v2\(\);/ { emit=1; found++ } \
+	     emit { print } \
+	     emit && /cluster_pi_writeback_checkpointer_tick_v1\(\) \|\| pi_pending;/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_ko_writeback_codec.o: $(top_srcdir)/src/backend/cluster/cluster_pi_writeback.c \
@@ -5869,7 +5876,7 @@ test_cluster_ko_writeback_codec.o: $(top_srcdir)/src/backend/cluster/cluster_pi_
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_postcommit.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
 		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_ko.h
@@ -5880,7 +5887,7 @@ test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_postcommit.inc unit
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Actual original KO owner and storage consumer; syscall faults use real files.
-test_cluster_drop_work: test_cluster_drop_work.c test_cluster_ko_stop.c test_cluster_ko_postcommit.inc unit_test.h \
+test_cluster_drop_work: test_cluster_drop_work.c test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test_cluster_ko_checkpointer.inc unit_test.h \
 		$(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_smgr.c \

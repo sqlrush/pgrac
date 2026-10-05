@@ -187,6 +187,7 @@ struct ClusterKoCompletionV2 {
 	bool truncate_observed;
 	bool drop_observed;
 	bool postcommit;
+	bool native_handed_off;
 	/* Native DDL keeps its verified barrier in the original ResourceOwner,
 	 * releasing the transport slot before the next relation's barrier. */
 	bool barrier_private;
@@ -213,6 +214,9 @@ struct ClusterKoDropWorkV2 {
 	ClusterKoSharedContext context;
 };
 static ClusterKoDropWorkV2 *ko_drop_work[CLUSTER_KO_SHARED_CAPACITY];
+static uint32 ko_drop_scan;
+static uint64 ko_native_report_serial;
+static uint64 ko_drop_report_serial[CLUSTER_KO_SHARED_CAPACITY];
 
 ClusterNormalStopPollResult
 cluster_ko_normal_stop_poll(uint32 *slot_out, const char **reason_out)
@@ -893,8 +897,9 @@ ko_completion_snapshot(const ClusterKoCompletionV2 *completion, ClusterKoSharedC
 {
 	bool valid;
 	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
-	if (owned == NULL || owned->pid != MyProcPid || !ko_completion_owner_current(owned)
-		|| CurrentResourceOwner == NULL || CritSectionCount != 0 || ko_state == NULL)
+	if (owned == NULL || owned->native_handed_off || owned->pid != MyProcPid
+		|| !ko_completion_owner_current(owned) || CurrentResourceOwner == NULL
+		|| CritSectionCount != 0 || ko_state == NULL)
 		return false;
 	if (owned->barrier_private) {
 		if (!owned->native_transaction || owned->slot != CLUSTER_KO_SHARED_CAPACITY
@@ -1157,25 +1162,22 @@ cluster_ko_shared_structure_handoff_v2(ClusterKoCompletionV2 **completion)
  * Retention is not authority to execute: the background consumer must recheck
  * the entire original scope before doing anything. Preallocation makes this
  * postcommit transfer independent of active-slot capacity and allocator I/O. */
-bool
-cluster_ko_shared_native_handoff_v2(ClusterKoCompletionV2 **completion)
+static bool
+ko_native_publish(ClusterKoCompletionV2 *owned)
 {
-	ClusterKoCompletionV2 **link, *owned;
 	ClusterKoNativeContinuation *work;
 	ClusterSpaceStructureChange change;
 
-	if (ko_state == NULL || completion == NULL || *completion == NULL
-		|| (MyBackendType != B_BACKEND && MyBackendType != B_AUTOVAC_WORKER)
+	if (ko_state == NULL || (MyBackendType != B_BACKEND && MyBackendType != B_AUTOVAC_WORKER)
 		|| CritSectionCount != 0 || CurrentResourceOwner == NULL
 		|| CurrentResourceOwner != TopTransactionResourceOwner
 		|| CurTransactionResourceOwner != TopTransactionResourceOwner)
 		return false;
-	link = ko_completion_link(*completion);
-	owned = *link;
 	if (owned == NULL || owned->pid != MyProcPid || owned->owner != CurrentResourceOwner
 		|| !owned->native_transaction || !owned->barrier_private || owned->native_pending
-		|| !owned->postcommit || !owned->space_observed || owned->serial == 0
-		|| owned->native_reserved == NULL || !DsaPointerIsValid(owned->native_allocation)
+		|| owned->native_handed_off || !owned->postcommit || !owned->space_observed
+		|| owned->serial == 0 || owned->native_reserved == NULL
+		|| !DsaPointerIsValid(owned->native_allocation)
 		|| !cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure), &change)
 		|| (change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
 			&& (change.identity.action != CLUSTER_SPACE_WAL_TRUNCATE || !owned->truncate_observed)))
@@ -1198,10 +1200,80 @@ cluster_ko_shared_native_handoff_v2(ClusterKoCompletionV2 **completion)
 	SpinLockRelease(&ko_state->shared_lock);
 	owned->native_allocation = InvalidDsaPointer;
 	owned->native_reserved = NULL;
+	owned->native_handed_off = true;
+	return true;
+}
+
+bool
+cluster_ko_shared_native_handoff_v2(ClusterKoCompletionV2 **completion)
+{
+	ClusterKoCompletionV2 **link, *owned;
+
+	if (completion == NULL || *completion == NULL)
+		return false;
+	link = ko_completion_link(*completion);
+	owned = *link;
+	if (!ko_native_publish(owned))
+		return false;
 	*link = owned->next;
 	pfree(owned);
 	*completion = NULL;
 	return true;
+}
+
+/* Called only by the native irreversible COMMIT tail, before any callback
+ * may fail. Keep the original local handle until pending-delete cleanup;
+ * its shared continuation no longer belongs to transaction cleanup. */
+void
+cluster_ko_shared_native_commit_v2(void)
+{
+	if (!cluster_enabled || !cluster_shared_config
+		|| (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0)
+		return;
+	for (ClusterKoCompletionV2 *owned = ko_completions; owned != NULL; owned = owned->next) {
+		if (!owned->native_transaction || owned->native_pending || owned->native_handed_off)
+			continue;
+		/* A claimed SPACE change must have saved its actual record and
+		 * preallocated continuation before this irreversible point. */
+		owned->postcommit = true;
+		if (!ko_native_publish(owned))
+			elog(PANIC, "committed shared structural change lost its original completion owner");
+	}
+}
+
+/* Retained work suppresses the old backend pathname operation, even after
+ * the live cut changes. This observation grants no physical I/O or receipt. */
+bool
+cluster_ko_shared_native_drop_deferred_v2(RelFileLocator locator)
+{
+	for (ClusterKoCompletionV2 *owned = ko_completions; owned != NULL; owned = owned->next) {
+		ClusterSpaceStructureChange change;
+
+		if (owned->pid == MyProcPid && owned->native_handed_off
+			&& RelFileLocatorEquals(owned->terminal.identity.locator, locator)
+			&& cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure),
+												  &change)
+			&& change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE)
+			return true;
+	}
+	return false;
+}
+
+static void
+ko_native_deferred(const ClusterKoSharedContext *context, uint64 *reported, const char *stage)
+{
+	if (!context->used || !context->structure_owned || context->serial == 0
+		|| (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0)
+		return;
+	KO_BUMP(failclosed_count);
+	if (*reported != context->serial) {
+		*reported = context->serial;
+		elog(LOG,
+			 "PGRAC_FAMILY=KO action=STRUCTURE_DEFERRED stage=%s "
+			 "resource=%u/%u/%u serial=" UINT64_FORMAT " epoch=" UINT64_FORMAT,
+			 stage, context->request.key.locator.spcOid, context->request.key.locator.dbOid,
+			 context->request.key.locator.relNumber, context->serial, context->request.epoch);
+	}
 }
 
 /* One original checkpointer step. New arrivals never preempt the finite
@@ -1239,8 +1311,10 @@ cluster_ko_shared_native_promote_v2(void)
 	work = dsa_get_address(ko_native_attach(), selected);
 	before = work->context;
 	if (!ko_shared_origin_current(&before) || !cluster_wal_thread_current_v2_ref(&current)
-		|| memcmp(&current, &before.terminal.source, sizeof(current)) != 0)
+		|| memcmp(&current, &before.terminal.source, sizeof(current)) != 0) {
+		ko_native_deferred(&before, &ko_native_report_serial, "PROMOTION_CUT");
 		return CLUSTER_KO_STRUCTURE_INVALID;
+	}
 	SpinLockAcquire(&ko_state->shared_lock);
 	if (ko_state->native_ready == selected && !ko_state->contexts[slot].used
 		&& ko_state->context_serial != UINT64_MAX && ko_state->native_waiting != 0
@@ -1256,6 +1330,35 @@ cluster_ko_shared_native_promote_v2(void)
 		return CLUSTER_KO_STRUCTURE_PENDING;
 	dsa_free(ko_native_area, selected);
 	return CLUSTER_KO_STRUCTURE_PROGRESS;
+}
+
+bool
+cluster_ko_shared_native_poll_v2(void)
+{
+	bool progress, completed = false;
+
+	if (ko_state == NULL || !cluster_enabled || !cluster_shared_config
+		|| MyBackendType != B_CHECKPOINTER || CurrentResourceOwner == NULL || CritSectionCount != 0
+		|| (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0)
+		return false;
+	progress = cluster_ko_shared_native_promote_v2() == CLUSTER_KO_STRUCTURE_PROGRESS;
+	/* No WAL input, content/entry lock or remote wait spans physical work.
+	 * A failing item still advances this cursor; wrapping waits another tick. */
+	if (cluster_smgr_drop_work_poll(&ko_drop_scan, &completed)) {
+		if (!completed) {
+			ClusterKoSharedContext context;
+			uint32 slot = ko_drop_scan - 1;
+
+			Assert(ko_drop_scan > 0 && ko_drop_scan <= CLUSTER_KO_SHARED_CAPACITY);
+			SpinLockAcquire(&ko_state->shared_lock);
+			context = ko_state->contexts[slot];
+			SpinLockRelease(&ko_state->shared_lock);
+			ko_native_deferred(&context, &ko_drop_report_serial[slot], "DROP_WORK");
+		}
+		progress |= completed;
+	} else
+		ko_drop_scan = 0;
+	return progress;
 }
 
 static bool
@@ -1327,14 +1430,19 @@ cluster_ko_shared_drop_work_begin_v2(uint32 *cursor, Size storage_bytes, Cluster
 
 		if (work != NULL) {
 			if (work->storage_bytes != storage_bytes
-				|| !cluster_ko_shared_drop_work_revalidate_v2(work))
+				|| !cluster_ko_shared_drop_work_revalidate_v2(work)) {
+				ko_native_deferred(&work->context, &ko_drop_report_serial[slot], "DROP_CUT");
 				continue;
+			}
 		} else {
 			SpinLockAcquire(&ko_state->shared_lock);
 			before = ko_state->contexts[slot];
 			SpinLockRelease(&ko_state->shared_lock);
-			if (before.drop_executor_pid != 0 || !ko_drop_context_current(&before))
+			if (before.drop_executor_pid != 0 || !ko_drop_context_current(&before)) {
+				if (before.structure_drop_pending)
+					ko_native_deferred(&before, &ko_drop_report_serial[slot], "DROP_OWNER");
 				continue;
+			}
 			if (!ko_exit_registered) {
 				before_shmem_exit(ko_shared_backend_exit, (Datum)0);
 				ko_exit_registered = true;
@@ -1712,9 +1820,9 @@ cluster_ko_shared_pending_drop_v2(RelFileLocator locator, ClusterKoCompletionV2 
 	return true;
 }
 
-/* This is still the original backend/transaction owner. A pending-delete
- * return does not certify its physical effects, and no background ownership
- * is created here. Keep this cleanup independent of now-stale cluster scope. */
+/* A pending-delete return does not certify physical effects. Published native
+ * continuations are independent of these local handles; cancel releases only
+ * a reservation that was never handed off. Do not require a still-live cut. */
 void
 cluster_ko_shared_postcommit_cleanup_v2(void)
 {

@@ -294,10 +294,20 @@ typedef enum ClusterKoStructurePollV2 {
  * Native callers remain unactivated until the original physical owner and
  * postcommit cleanup are connected in the same delivery. */
 extern bool cluster_ko_shared_native_handoff_v2(ClusterKoCompletionV2 **completion);
+/* Native irreversible COMMIT only, before callbacks and resource cleanup.
+ * Transfer preallocated work while retaining the original pending-delete
+ * handle. Disabled until the full structural protocol is advertised. */
+extern void cluster_ko_shared_native_commit_v2(void);
+/* True suppresses the backend's obsolete pathname operation, even with a
+ * now-stale cut. It conveys no physical completion or reuse permission. */
+extern bool cluster_ko_shared_native_drop_deferred_v2(RelFileLocator locator);
 /* One original checkpointer step into the existing bounded active region.
  * INVALID/stale and PENDING/full retain all work. RELEASED means no pending
  * native continuation, not completion of active work, PI or recovery windows. */
 extern ClusterKoStructurePollV2 cluster_ko_shared_native_promote_v2(void);
+/* One checkpointer tick: at most one promotion and one physical attempt.
+ * True is actual progress, not permission to ignore any remaining work. */
+extern bool cluster_ko_shared_native_poll_v2(void);
 /* Original checkpointer only. One process-bound work item for an already
  * committed, promoted DROP. The bounded cursor skips other active work.
  * storage_bytes reserves the storage consumer's fixed fd/inode/stage carrier

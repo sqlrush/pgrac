@@ -50,6 +50,7 @@
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_shared_config.h" /* PGRAC: idle common-value retry */
 #include "cluster/cluster_pi_writeback.h"
+#include "cluster/cluster_ko.h"
 #include "../cluster/cluster_control_root_private.h"
 #endif
 #include "libpq/pqsignal.h"
@@ -422,7 +423,9 @@ CheckpointerMain(void)
 		 * control cleanup. Author: SqlRush <sqlrush@gmail.com> */
 		cluster_cf_retirement_poll();
 		cluster_lock_owners_service_poll();
-		pi_pending = cluster_pi_writeback_checkpointer_tick_v1();
+		pi_pending = cluster_ko_shared_native_poll_v2();
+		AbsorbSyncRequests();
+		pi_pending = cluster_pi_writeback_checkpointer_tick_v1() || pi_pending;
 #endif
 
 		/*

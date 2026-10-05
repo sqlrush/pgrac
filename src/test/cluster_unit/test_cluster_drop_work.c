@@ -29,6 +29,28 @@ cluster_shared_fs_get_active_ops(void)
 {
 	return &drop_ops;
 }
+/* The native caller must return at the retained-work boundary. Falling into
+ * its old synchronous ERROR recovery is a fixture failure, never success. */
+ErrorData *
+CopyErrorData(void)
+{
+	abort();
+}
+void
+FlushErrorState(void)
+{
+	abort();
+}
+void
+ThrowErrorData(ErrorData *error pg_attribute_unused())
+{
+	abort();
+}
+void
+FreeErrorData(ErrorData *error pg_attribute_unused())
+{
+	abort();
+}
 int
 errcode_for_file_access(void)
 {
@@ -276,7 +298,7 @@ prepare_files(const ClusterSpaceStructureChange *change)
 }
 
 static bool
-work_setup(const char *name)
+work_setup_impl(const char *name, bool native, bool stale)
 {
 	ClusterPageWalBindingV1 binding;
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
@@ -296,7 +318,12 @@ work_setup(const char *name)
 	if (exit_callback != NULL)
 		exit_callback(0, (Datum)0);
 	external_fds = 0;
-	work_slot = prepare_promoted_drop(&binding, wal);
+	if (native) {
+		prepare_postcommit(true);
+		binding = postcommit_binding;
+		memcpy(wal, postcommit_wal, sizeof(wal));
+	} else
+		work_slot = prepare_promoted_drop(&binding, wal);
 	if (!cluster_space_structure_wal_decode(wal, sizeof(wal), &change))
 		abort();
 	snprintf(work_root, sizeof(work_root), "/tmp/pgrac_drop_work_%d_%s", (int)getpid(), name);
@@ -311,7 +338,31 @@ work_setup(const char *name)
 	forgets = truncates = main_syncs = dir_syncs = unlinks = closes = opens = 0;
 	memset(per_fork_unlinks, 0, sizeof(per_fork_unlinks));
 	enableFsync = true;
+	if (native) {
+		native_commit_active = true;
+		postcommit_scope_changed = stale;
+		postcommit_storage_consumer = cluster_smgr_unlink_committed_drop;
+		run_native_postcommit();
+		postcommit_storage_consumer = NULL;
+		UT_ASSERT_EQ(opens + truncates + main_syncs + dir_syncs + unlinks + closes, 0);
+		UT_ASSERT_EQ(storage.native_waiting, 1);
+		UT_ASSERT_EQ(completion_allocations, 0);
+		MyBackendType = B_CHECKPOINTER;
+		if (stale) {
+			UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
+			UT_ASSERT_EQ(storage.native_waiting, 1);
+			current_epoch--;
+		}
+		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
+		work_slot = 0;
+	}
 	return true;
+}
+
+static bool
+work_setup(const char *name)
+{
+	return work_setup_impl(name, false, false);
 }
 
 static bool
@@ -351,6 +402,62 @@ UT_TEST(test_work_success_keeps_main_and_structure_obligation)
 	UT_ASSERT_EQ(truncates, 1);
 	UT_ASSERT_EQ(main_syncs, 1);
 	UT_ASSERT_EQ(dir_syncs, 1);
+}
+
+UT_TEST(test_native_commit_and_real_smgr_defer_io_to_original_work)
+{
+	for (unsigned stale = 0; stale < 2; stale++) {
+		if (!work_setup_impl(stale ? "native_stale" : "native_commit", true, stale))
+			return;
+		work_fault = WORK_DIR_SYNC;
+		UT_ASSERT(!poll_work());
+		UT_ASSERT_EQ(unlinks, MAX_FORKNUM);
+		UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+		/* The original backend handle is gone; only retained work may retry. */
+		UT_ASSERT(ko_completions == NULL);
+		work_fault = WORK_OK;
+		UT_ASSERT(poll_work());
+		assert_finished();
+		UT_ASSERT_EQ(truncates, 1);
+		UT_ASSERT_EQ(unlinks, MAX_FORKNUM);
+		UT_ASSERT_EQ(dir_syncs, 2);
+	}
+}
+
+UT_TEST(test_native_checkpointer_poll_has_bounded_visible_failure_and_retry)
+{
+	uint64 failures;
+	if (!work_setup_impl("native_poll", true, false))
+		return;
+	ko_drop_poll_boundary = cluster_smgr_drop_work_poll;
+	MyBackendType = B_BACKEND;
+	UT_ASSERT(!run_native_checkpointer());
+	MyBackendType = B_CHECKPOINTER;
+	native_commit_active = false;
+	UT_ASSERT(!run_native_checkpointer());
+	UT_ASSERT_EQ(opens + truncates + main_syncs + dir_syncs + unlinks + closes, 0);
+	native_commit_active = true;
+	work_fault = WORK_DIR_SYNC;
+	failures = cluster_ko_failclosed_count();
+	UT_ASSERT(!run_native_checkpointer());
+	UT_ASSERT_EQ(dir_syncs, 1);
+	UT_ASSERT_EQ(cluster_ko_failclosed_count(), failures + 1);
+	UT_ASSERT_EQ(fixture_log_events, 1);
+	/* A failed item advances the cursor; there is no retry loop this tick. */
+	UT_ASSERT(!run_native_checkpointer());
+	UT_ASSERT_EQ(dir_syncs, 1);
+	UT_ASSERT(!run_native_checkpointer());
+	UT_ASSERT_EQ(dir_syncs, 2);
+	UT_ASSERT_EQ(cluster_ko_failclosed_count(), failures + 2);
+	UT_ASSERT_EQ(fixture_log_events, 1);
+	work_fault = WORK_OK;
+	UT_ASSERT(!run_native_checkpointer());
+	UT_ASSERT(run_native_checkpointer());
+	assert_finished();
+	UT_ASSERT_EQ(truncates, 1);
+	UT_ASSERT_EQ(unlinks, MAX_FORKNUM);
+	UT_ASSERT_EQ(dir_syncs, 3);
+	ko_drop_poll_boundary = NULL;
 }
 
 UT_TEST(test_work_absent_auxiliary_forks_are_not_unlink_completions)
@@ -650,7 +757,9 @@ UT_TEST(test_work_executor_process_exit_does_not_redo_partial_io)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(20);
+	UT_RUN(test_native_commit_and_real_smgr_defer_io_to_original_work);
+	UT_RUN(test_native_checkpointer_poll_has_bounded_visible_failure_and_retry);
 	printf("# retained storage state: %zu bytes per original work\n",
 		   cluster_shared_fs_sharedfs_drop_work_size());
 	UT_RUN(test_work_success_keeps_main_and_structure_obligation);

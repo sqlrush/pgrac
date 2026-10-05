@@ -180,6 +180,11 @@ bool cluster_ko_shared_pending_drop_v2(RelFileLocator locator, ClusterKoCompleti
 	*out = (ClusterKoCompletionV2 *)&owner_storage;
 	return true;
 }
+bool
+cluster_ko_shared_native_drop_deferred_v2(RelFileLocator locator pg_attribute_unused())
+{
+	return false;
+}
 bool cluster_ko_shared_space_observation_v2(const ClusterKoCompletionV2 *completion,
 	struct ClusterPageWalBindingV1 *terminal, void *bytes, Size length)
 {
