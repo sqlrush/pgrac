@@ -2191,6 +2191,7 @@ test_cluster_page_data.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Ma
 	     emit && /^#endif/ { print; emit=0 } emit { print } \
 	     END { if (n != 1 || emit) exit 1 }' $< > $@
 
+# PGRAC: FlushBuffer wraps FlushBufferWithAttempt; declare and extract both.
 test_cluster_page_flush.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk 'BEGIN { print "static void FlushBufferWithAttempt(BufferDesc *, SMgrRelation, IOObject, IOContext, volatile bool *);" } \
 	     /^FlushBuffer\(/ || /^FlushBufferWithAttempt\(/ { print "static void"; emit=1; n++ } \

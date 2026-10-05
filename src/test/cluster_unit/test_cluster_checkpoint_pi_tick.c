@@ -221,15 +221,32 @@ UT_TEST(checkpoint_guts_releases_between_write_and_sync)
 	UT_ASSERT(GUTS_LINE_SYNC > GUTS_LINE_UNDO);
 }
 
+UT_TEST(clock_rollback_restarts_the_interval_without_stalling)
+{
+	reset(true);
+	CheckpointWriteDelay(CHECKPOINT_IMMEDIATE, 0.1);
+	UT_ASSERT_EQ(ticks, 1);
+	advance_ms(-10000);
+	CheckpointWriteDelay(CHECKPOINT_IMMEDIATE, 0.2);
+	UT_ASSERT_EQ(ticks, 2);
+	advance_ms(CLUSTER_CHECKPOINT_PI_TICK_MS - 1);
+	CheckpointWriteDelay(CHECKPOINT_IMMEDIATE, 0.3);
+	UT_ASSERT_EQ(ticks, 2);
+	advance_ms(1);
+	CheckpointWriteDelay(CHECKPOINT_IMMEDIATE, 0.4);
+	UT_ASSERT_EQ(ticks, 3);
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(6);
 	UT_RUN(write_phase_on_schedule_ticks_at_the_rate_limit);
 	UT_RUN(behind_schedule_and_immediate_writes_still_tick);
 	UT_RUN(shutdown_and_end_of_recovery_never_tick);
 	UT_RUN(native_and_non_checkpointer_never_tick);
 	UT_RUN(checkpoint_guts_releases_between_write_and_sync);
+	UT_RUN(clock_rollback_restarts_the_interval_without_stalling);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

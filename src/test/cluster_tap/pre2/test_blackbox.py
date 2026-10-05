@@ -66,6 +66,17 @@ class BlackBoxTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.driver(profile).describe()
 
+    def test_native_lifecycle_mapping_is_explicit_and_limited(self):
+        profile = self.profile()
+        profile['operations']['open_observation'] = {'native': 'writer-lifecycle-v1'}
+        self.driver(profile).validate()
+        for name, entry in [('recovery_observation', {'native': 'writer-lifecycle-v1'}),
+                            ('open_observation', {'native': 'writer-lifecycle-v0'}),
+                            ('open_observation', {'native': 'writer-lifecycle-v1', 'phase': 'OPEN'})]:
+            profile['operations'] = {name: entry}
+            with self.assertRaises(ValueError):
+                self.driver(profile).validate()
+
     def test_existing_data_rejected_before_mutation(self):
         (self.root / "node0").mkdir()
         (self.root / "node0/PG_VERSION").write_text("18\n")

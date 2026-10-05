@@ -142,6 +142,17 @@ cluster_page_wal_output_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
 {
 	return transition_wal_snapshot(buffer, out, true);
 }
+bool
+cluster_page_wal_install_matches_v1(Buffer buffer, const ClusterPageWalBindingV1 *expected)
+{
+	static const ClusterPageWalBindingV1 zero = { 0 };
+	ClusterPageWalBindingV1 installed;
+	UT_ASSERT(transition_content_held);
+	if (memcmp(expected, &zero, sizeof(zero)) == 0)
+		return memcmp(&transition_page_wal, &zero, sizeof(zero)) == 0;
+	return transition_wal_snapshot(buffer, &installed, false)
+		&& memcmp(&installed, expected, sizeof(installed)) == 0;
+}
 /* D S09 R-A22: the descriptor's first own record since the page was clean.
  * The stubs check the ordering contract: a receiver holds it before the
  * descriptor releases it; a write clears it only after its I/O ended. */
@@ -4332,11 +4343,12 @@ UT_TEST(test_s08_received_current_carries_dirty_responsibility_without_own_first
 	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
 
 	for (int fork = 0; fork < 2; fork++)
-		for (int variant = 0; variant < 5; variant++) {
+		for (int variant = 0; variant < 12; variant++) {
 			BufferDesc buf;
 			ClusterPcmOwnEntry entry;
 			ResourceXAcquisitionRef ref = { 0 };
 			ResourceXCurrentImage image = { 0 };
+			bool remote_image = variant != 9 && variant != 11;
 			ResourceXBufferInstallProof installed;
 			ResourceXBufferActivationProof activated;
 			PGIOAlignedBlock carrier;
@@ -4368,9 +4380,10 @@ UT_TEST(test_s08_received_current_carries_dirty_responsibility_without_own_first
 			if (variant == 2) memset(&image.page_wal, 0, sizeof(image.page_wal));
 			if (variant == 3) image.page_checksum++;
 			if (variant == 4) transition_wal_prepare_ok = false;
+			if (variant == 9 || variant == 10) image.page_wal.flags = 0;
 			before = pg_atomic_read_u32(&buf.state);
 			UT_ASSERT_EQ(cluster_bufmgr_pcm_own_activate_x_by_tag(&ref, &image, &installed),
-				variant < 3 ? RESOURCE_X_BUFFER_T2_INSTALLED : RESOURCE_X_BUFFER_CORRUPT);
+				variant == 3 || variant == 4 ? RESOURCE_X_BUFFER_CORRUPT : RESOURCE_X_BUFFER_T2_INSTALLED);
 			/* T2 bytes are fenced: checkpoint/replacement must see clean. */
 			UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), before);
 			UT_ASSERT_EQ(transition_first_state, CLUSTER_PAGE_WAL_FIRST_ABSENT);
@@ -4400,31 +4413,42 @@ UT_TEST(test_s08_received_current_carries_dirty_responsibility_without_own_first
 				/* A delayed or failed apply/T3 retains only the source's
 				 * existing obligation; it cannot poison receiver checkpoints. */
 				transition_content_busy = true;
-				UT_ASSERT_EQ(cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(&ref, &activated),
+				UT_ASSERT_EQ(cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(&ref, &image.page_wal, remote_image, &activated),
 					RESOURCE_X_BUFFER_BUSY);
 				UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), before);
 				transition_content_busy = false;
 				UT_ASSERT_EQ(cluster_bufmgr_pcm_own_activate_x_by_tag(&ref, &image, &installed),
 					RESOURCE_X_BUFFER_ALREADY_INSTALLED);
 				UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), before);
-				UT_ASSERT_EQ(cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(&ref, &activated),
+				UT_ASSERT_EQ(cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(&ref, &image.page_wal, remote_image, &activated),
 					RESOURCE_X_BUFFER_T2_INSTALLED);
 				UT_ASSERT_EQ(activated.writer_activation_token, 0);
 				UT_ASSERT_EQ(activated.resource_x_activation_generation, 0);
 				UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), before | BM_DIRTY | BM_JUST_DIRTIED);
 				/* Duplicate T3 after a completed write must not re-dirty. */
 				pg_atomic_write_u32(&buf.state, before);
-				UT_ASSERT_EQ(cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(&ref, &activated),
+				UT_ASSERT_EQ(cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(&ref, &image.page_wal, remote_image, &activated),
 					RESOURCE_X_BUFFER_STALE);
 				UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), before);
 				UT_ASSERT_EQ(transition_wal_publishes, 1);
-			} else if (variant == 1) {
-				UT_ASSERT_EQ(cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(&ref, &activated),
+			} else if (variant == 1 || !remote_image) {
+				UT_ASSERT_EQ(cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(&ref, &image.page_wal, remote_image, &activated),
 					RESOURCE_X_BUFFER_T2_INSTALLED);
 				UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), before);
 			} else if (variant == 2) {
-				UT_ASSERT_EQ(cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(&ref, &activated),
-					RESOURCE_X_BUFFER_CORRUPT);
+				UT_ASSERT_EQ(cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(&ref, &image.page_wal, remote_image, &activated),
+					RESOURCE_X_BUFFER_T2_INSTALLED);
+				UT_ASSERT_EQ(cluster_pcm_own_writer_activation_token_get(0), 0);
+				UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_generation_get(0), 0);
+				UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), before);
+			} else if (variant >= 5) {
+				/* A failed snapshot must not erase the original T2 promise. */
+				if (variant == 5) memset(&transition_page_wal, 0, sizeof(transition_page_wal));
+				if (variant == 6) transition_page_wal.source.claim.claim_sha256[1]++;
+				if (variant == 7) transition_page_wal.flags = 0;
+				if (variant == 8) memset(&image.page_wal, 0, sizeof(image.page_wal));
+				UT_ASSERT_EQ(cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
+					&ref, &image.page_wal, remote_image, &activated), RESOURCE_X_BUFFER_CORRUPT);
 				UT_ASSERT_EQ(cluster_pcm_own_writer_activation_token_get(0), 1);
 				UT_ASSERT_EQ(cluster_pcm_own_resource_x_activation_generation_get(0), 1);
 				UT_ASSERT_EQ(pg_atomic_read_u32(&buf.state), before);
@@ -5356,8 +5380,11 @@ UT_TEST(test_real_remote_image_t2_t3_use_image_proof_not_page_is_new)
 						 RESOURCE_X_BUFFER_CORRUPT);
 			UT_ASSERT_EQ(transition_wal_publishes, 1);
 			UT_ASSERT_EQ(transition_page_wal.source.claim.claim_sha256[0], 0);
+			UT_ASSERT_EQ(cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
+				&ref, &image.page_wal, true, &activated), RESOURCE_X_BUFFER_CORRUPT);
+			image.page_wal.source.claim.claim_sha256[0]--;
 			UT_ASSERT_EQ(
-				cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(&ref, &activated),
+				cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(&ref, &image.page_wal, true, &activated),
 				RESOURCE_X_BUFFER_T2_INSTALLED);
 			UT_ASSERT_EQ(activated.ownership_generation, 1);
 			UT_ASSERT_EQ(activated.writer_activation_token, 0);

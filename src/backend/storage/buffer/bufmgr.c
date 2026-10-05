@@ -1167,7 +1167,6 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 	PGAlignedBlock verified;
 	PGAlignedBlock previous;
 	ClusterPageWalInstallV1 prepared_wal = { 0 };
-	ClusterPageWalBindingV1 installed_wal = { 0 };
 	BufferDesc *buf;
 	BufferTag lookup_tag;
 	ClusterPcmOwnSnapshot expected;
@@ -1266,15 +1265,12 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 			page = (Page) BufHdrGetBlock(buf);
 			if (live.resource_x_activation_generation == ref->acquisition_generation)
 			{
-				if (cluster_shared_config)
-					(void)cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf),
-													   &installed_wal);
 				if (cluster_gcs_block_compute_checksum((const char *)page) != image_checksum
 					|| PageGetLSN(page) != image->page_lsn
 					|| ((PageHeader)page)->pd_block_scn != image->page_scn
 					|| (cluster_shared_config
-						&& memcmp(&installed_wal, &prepared_wal.binding, sizeof(installed_wal))
-							   != 0))
+						&& !cluster_page_wal_install_matches_v1(
+							BufferDescriptorGetBuffer(buf), &prepared_wal.binding)))
 					result = RESOURCE_X_BUFFER_CORRUPT;
 				else
 					result = RESOURCE_X_BUFFER_ALREADY_INSTALLED;
@@ -1330,7 +1326,8 @@ PGRAC_PCM_X_FENCE_TERMINAL_OWNER(T3_CLEAR, ref,
 	cluster_pcm_x_resource_x_t3_snapshot_exact)
 ResourceXBufferActivationResult
 cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
-	const ResourceXAcquisitionRef *ref, ResourceXBufferActivationProof *out_proof)
+	const ResourceXAcquisitionRef *ref, const ClusterPageWalBindingV1 *expected_wal,
+	bool remote_image, ResourceXBufferActivationProof *out_proof)
 {
 	BufferDesc *buf;
 	BufferTag lookup_tag;
@@ -1346,7 +1343,7 @@ cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
 
 	if (out_proof != NULL)
 		memset(out_proof, 0, sizeof(*out_proof));
-	if (ref == NULL || out_proof == NULL || ref->formation == 0
+	if (ref == NULL || expected_wal == NULL || out_proof == NULL || ref->formation == 0
 		|| ref->acquisition_generation == 0)
 		return RESOURCE_X_BUFFER_CORRUPT;
 	if (ClusterPcmOwnArray == NULL)
@@ -1409,20 +1406,24 @@ cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
 		result = RESOURCE_X_BUFFER_BUSY;
 	else
 	{
-		ClusterPageWalBindingV1 wal;
-		bool deferred_data = cluster_shared_config
+		static const ClusterPageWalBindingV1 zero = { 0 };
+		bool deferred_data = cluster_shared_config && remote_image
 			&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
 			&& lookup_tag.spcOid != UNDOTABLESPACE_OID
-			&& (lookup_tag.forkNum == MAIN_FORKNUM || lookup_tag.forkNum == VISIBILITYMAP_FORKNUM);
+			&& (lookup_tag.forkNum == MAIN_FORKNUM || lookup_tag.forkNum == VISIBILITYMAP_FORKNUM)
+			&& memcmp(expected_wal, &zero, sizeof(zero)) != 0;
 
 		/* T2 installs fenced bytes. Only this original T3 success can make
 		 * the receiver a dirty writeback owner. Keep the header/content locks
 		 * across opening the fence and setting dirty, without inventing a
-		 * first local WAL record or re-dirtying a repeated completed T3. */
-		if (deferred_data
-			&& (!cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal)
-				|| (wal.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
-				|| !cluster_page_wal_binding_shape_v1(&wal)))
+		 * first local WAL record or re-dirtying a repeated completed T3.
+		 * Storage and local-image grants retain their original dirty state;
+		 * the latter can still carry this writer's unflushed local record. */
+		if ((cluster_shared_config
+			 && !cluster_page_wal_install_matches_v1(BufferDescriptorGetBuffer(buf), expected_wal))
+			|| (deferred_data
+				&& ((expected_wal->flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+					|| !cluster_page_wal_binding_shape_v1(expected_wal))))
 			result = RESOURCE_X_BUFFER_CORRUPT;
 		else
 		{

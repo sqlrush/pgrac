@@ -90,7 +90,10 @@ class BlackBox:
         if not ((seeds == 1 and cohorts == 0) or
                 (seeds == 0 and cohorts == 1 and len(profile["initialize"]) == 1)):
             raise ValueError("one and only one fresh cluster creator is required")
-        for entry in profile.get("operations", {}).values():
+        from native_lifecycle import ENTRY, OPERATIONS
+        for op, entry in profile.get("operations", {}).items():
+            if op in OPERATIONS and entry == ENTRY:
+                continue
             if set(entry) == {"node", "sql"} and isinstance(entry["sql"], str) and entry["sql"].strip():
                 continue
             if set(entry) == {"tool", "argv"} and entry["tool"] in ("pgrac", "pgrac-ctl"):
@@ -177,6 +180,9 @@ class BlackBox:
 
     def observe(self, op, args):
         entry = self.profile["operations"][op]
+        from native_lifecycle import ENTRY, observe
+        if entry == ENTRY:
+            return observe(self, op, args)
         if "sql" in entry:
             node_id = args.get("node", 0) if entry["node"] == "argument" else entry["node"]
             if type(node_id) is not int or not 0 <= node_id < len(self.layout["nodes"]):

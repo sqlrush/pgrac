@@ -753,6 +753,61 @@ flush_certification_is_source_exact(void)
 	UT_ASSERT(PageSetLSNOrigin(page.data, 1));
 	UT_ASSERT_EQ(current_binding().flags, 0);
 }
+
+static void
+installed_carrier_matches_explicit_absence_not_snapshot_failure(void)
+{
+	for (int absent = 0; absent < 2; absent++)
+		for (int variant = 0; variant < 10; variant++) {
+			ClusterPageWalBindingV1 expected, zero = { 0 };
+			void *before;
+			uint32 state;
+
+			reset();
+			UT_ASSERT(capture());
+			PageSetLSNPreserveOrigin(page.data, 0x200);
+			expected = current_binding();
+			if (absent) {
+				UT_ASSERT(cluster_page_wal_forget_v1(1));
+				expected = zero;
+			}
+			switch (variant) {
+			case 1: locked = false; break;
+			case 2: exclusive = false; break;
+			case 3: pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_ERROR); break;
+			case 4: pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_IN_PROGRESS); break;
+			case 5: pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_VALID); break;
+			case 6: pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_TAG_VALID); break;
+			case 7: expected.source.claim.claim_sha256[0]++; break;
+			case 8: expected.flags ^= CLUSTER_PAGE_WAL_NATIVE_FLUSHED; break;
+			case 9:
+				if (absent) UT_ASSERT(capture());
+				else UT_ASSERT(cluster_page_wal_forget_v1(1));
+				break;
+			}
+			before = malloc(shared_bytes);
+			UT_ASSERT(before != NULL);
+			if (before == NULL) return;
+			memcpy(before, shared_memory, shared_bytes);
+			state = pg_atomic_read_u32(&desc.bufferdesc.state);
+			UT_ASSERT_EQ(cluster_page_wal_install_matches_v1(1, &expected), variant == 0);
+			UT_ASSERT_EQ(pg_atomic_read_u32(&desc.bufferdesc.state), state);
+			UT_ASSERT_EQ(memcmp(before, shared_memory, shared_bytes), 0);
+			free(before);
+		}
+	{
+		ClusterPageWalBindingV1 zero = { 0 }, observed;
+		reset();
+		UT_ASSERT(capture());
+		PageSetLSNPreserveOrigin(page.data, 0x200);
+		((PageHeader)page.data)->pd_block_scn++;
+		UT_ASSERT(!cluster_page_wal_snapshot_v1(1, &observed));
+		UT_ASSERT(!cluster_page_wal_install_matches_v1(1, &zero));
+		UT_ASSERT(!cluster_page_wal_install_matches_v1(0, &zero));
+		UT_ASSERT(!cluster_page_wal_install_matches_v1(2, &zero));
+		UT_ASSERT(!cluster_page_wal_install_matches_v1(1, NULL));
+	}
+}
 static void
 flush_refusal_never_certifies(void)
 {
@@ -1673,7 +1728,8 @@ UT_TEST(space_capture_unavailable_source_is_not_mutation_failure)
 int
 main(void)
 {
-	UT_PLAN(42);
+	UT_PLAN(43);
+	UT_RUN(installed_carrier_matches_explicit_absence_not_snapshot_failure);
 	UT_RUN(output_snapshot_retains_exact_failed_output_binding);
 	UT_RUN(private_record_resident_publication_uses_native_last_insert);
 	UT_RUN(private_record_publication_rejects_expired_record_or_changed_owner);

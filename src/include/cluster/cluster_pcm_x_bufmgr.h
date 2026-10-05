@@ -804,7 +804,8 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 										 const ResourceXCurrentImage *image,
 										 ResourceXBufferInstallProof *out_proof);
 extern ResourceXBufferActivationResult cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
-	const ResourceXAcquisitionRef *ref, ResourceXBufferActivationProof *out_proof);
+	const ResourceXAcquisitionRef *ref, const ClusterPageWalBindingV1 *expected_wal,
+	bool remote_image, ResourceXBufferActivationProof *out_proof);
 /* Exact known-new TARGET adaptation.  These calls bind/clear only the
  * Resource-X sidecar around an already committed local X reservation; they
  * never install durable-storage bytes into the direct-init descriptor. */

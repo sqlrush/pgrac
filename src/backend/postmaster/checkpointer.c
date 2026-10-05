@@ -986,7 +986,8 @@ ClusterCheckpointWritePiTick(int flags)
 		|| (flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY)) != 0)
 		return;
 	now = GetCurrentTimestamp();
-	if (last_tick != 0
+	/* A clock correction must not suspend PI retirement until it catches up. */
+	if (last_tick != 0 && now >= last_tick
 		&& !TimestampDifferenceExceeds(last_tick, now, CLUSTER_CHECKPOINT_PI_TICK_MS))
 		return;
 	last_tick = now;
