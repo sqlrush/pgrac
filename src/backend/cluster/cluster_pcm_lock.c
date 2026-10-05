@@ -10534,8 +10534,14 @@ cluster_pcm_local_pi_floor_v1(const ClusterWalSourceRef *source, ClusterPcmLocal
 				value.pending++;
 				if (value.floor == InvalidXLogRecPtr || pending.record_start < value.floor)
 					value.floor = pending.record_start;
-			} else
+			} else {
+				/* Until publication supplies the full responsibility, a
+				 * foreign first cannot exclude this source's earlier changes.
+				 * Match a foreign dirty-buffer first: keep the published lower,
+				 * never compare the foreign LSN with this source's positions. */
 				value.foreign++;
+				value.unbounded++;
+			}
 		}
 		if (local.first.record_start == InvalidXLogRecPtr)
 			continue;

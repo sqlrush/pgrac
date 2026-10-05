@@ -177,18 +177,20 @@ extern bool cluster_pcm_local_pi_snapshot_v1(BufferTag tag, ClusterPcmLocalPiSna
 
 /* Local PI responsibilities as seen by one WAL source. A responsibility is
  * bounded when its first binding is the source's record; unbounded when
- * only its latest binding is (an earlier own record may lie in between). */
+ * only its latest binding is (an earlier own record may lie in between), or
+ * an unpublished holder pair has a foreign first and cannot bound this source. */
 typedef struct ClusterPcmLocalPiFloorV1 {
 	XLogRecPtr floor; /* least bounded first record_start, or Invalid */
 	uint64 bounded;
 	uint64 unbounded;
-	uint64 foreign;	 /* neither binding is the source's */
+	uint64 foreign;	 /* foreign responsibility or PENDING first */
 	uint64 examined; /* live directory entries examined */
 	uint64 pending;	 /* PENDING holder-pair first records of the source (R-A22) */
 } ClusterPcmLocalPiFloorV1;
 
 /* Read-only scan of the local directory, one entry lock at a time; takes no
- * pin. PENDING holder-pair first records count as bounded (and pending).
+ * pin. Own PENDING first records count as bounded (and pending); foreign
+ * PENDING first records count as unbounded (and foreign) until publication.
  * Counts every responsibility unretired when the call starts and still
  * unretired when its entry is examined; one first recorded after the call
  * starts may be missed and must be bounded by the caller. False (output

@@ -21732,6 +21732,50 @@ local_pi_floor_foreign(ClusterWalSourceRef source)
 	return source;
 }
 
+/* A foreign first in an unpublished pair cannot bound this source's
+ * contributions. Keep its published lower until the original receiver
+ * owns the full first/last responsibility, as for a dirty foreign first. */
+UT_TEST(test_r_a22_foreign_pending_first_keeps_the_own_lower)
+{
+	BufferTag tag = make_tag(961);
+	ClusterPageWalBindingV1 binding, first;
+	ClusterPcmLocalPiFloorV1 floor;
+	ClusterPcmLocalPiSnapshotV1 local;
+	ClusterPageWalRefV1 ref = { 0 };
+	ResourceXDecodedFrame block, image, status;
+
+	r_a22_holder_pair_fixture(tag, &binding, &first, &block, &status, &image);
+	first.source = local_pi_floor_foreign(binding.source);
+	UT_ASSERT(cluster_page_wal_ref_retain_v1(&first, &ref));
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_block_to_n_source_exact(&block, 1, &status, &image, &ref),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(ref.source_flags, 0);
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&binding.source, &floor));
+	UT_ASSERT_EQ(floor.unbounded, 1);
+	UT_ASSERT_EQ(floor.foreign, 1);
+	UT_ASSERT_EQ(floor.bounded, 0);
+	UT_ASSERT_EQ(floor.floor, InvalidXLogRecPtr);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &local));
+	UT_ASSERT_EQ(local.first.record_start, InvalidXLogRecPtr);
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&first.source, &floor));
+	UT_ASSERT_EQ(floor.unbounded, 0);
+	UT_ASSERT_EQ(floor.bounded, 1);
+	UT_ASSERT_EQ(floor.pending, 1);
+	UT_ASSERT_EQ(floor.floor, first.record_start);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_publish_exact(
+					 &block.common.logical_assertion, block.common.assertion_sequence, 1,
+					 block.common.master_session_incarnation),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &local));
+	UT_ASSERT(cluster_page_wal_same_mutation_v1(&local.first, &first));
+	UT_ASSERT(cluster_page_wal_same_mutation_v1(&local.last, &binding));
+	UT_ASSERT(cluster_pcm_local_pi_floor_v1(&binding.source, &floor));
+	UT_ASSERT_EQ(floor.unbounded, 1);
+	UT_ASSERT_EQ(floor.pending, 0);
+	local_pi_writer_ready = cluster_shared_config = false;
+}
+
 UT_TEST(test_local_pi_floor_of_an_empty_directory)
 {
 	BufferTag tag = make_tag(930);
@@ -22549,7 +22593,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(345);
+	UT_PLAN(346);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
@@ -22874,6 +22918,7 @@ main(void)
 	UT_RUN(test_local_pi_read_only_carrier_does_not_create_writer_responsibility);
 	UT_RUN(test_local_pi_redeclare_does_not_need_resident_buffer_or_current_authority);
 	UT_RUN(test_local_pi_redeclare_busy_or_unknown_scope_keeps_original_cursor);
+	UT_RUN(test_r_a22_foreign_pending_first_keeps_the_own_lower);
 	UT_RUN(test_local_pi_floor_of_an_empty_directory);
 	UT_RUN(test_local_pi_floor_is_the_least_first_record_of_the_source);
 	UT_RUN(test_local_pi_floor_classifies_responsibilities_of_other_sources);
