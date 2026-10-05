@@ -168,6 +168,11 @@ typedef struct ClusterPcmLocalPiSnapshotV1 {
  * This can add responsibility, never grant or retire it. Failed retain
  * leaves the previous responsibility intact and the handoff must retry. */
 extern bool cluster_pcm_local_pi_record_v1(BufferTag tag, const ClusterPageWalBindingV1 *binding);
+/* D S09 R-A22: the producer also hands over the first own record since the
+ * page was clean (NULL = binding); the responsibility keeps the earliest. */
+extern bool cluster_pcm_local_pi_record_first_v1(BufferTag tag,
+												 const ClusterPageWalBindingV1 *first,
+												 const ClusterPageWalBindingV1 *binding);
 extern bool cluster_pcm_local_pi_snapshot_v1(BufferTag tag, ClusterPcmLocalPiSnapshotV1 *out);
 
 /* Local PI responsibilities as seen by one WAL source. A responsibility is
@@ -179,10 +184,12 @@ typedef struct ClusterPcmLocalPiFloorV1 {
 	uint64 unbounded;
 	uint64 foreign;	 /* neither binding is the source's */
 	uint64 examined; /* live directory entries examined */
+	uint64 pending;	 /* PENDING holder-pair first records of the source (R-A22) */
 } ClusterPcmLocalPiFloorV1;
 
 /* Read-only scan of the local directory, one entry lock at a time; takes no
- * pin. Counts every responsibility unretired when the call starts and still
+ * pin. PENDING holder-pair first records count as bounded (and pending).
+ * Counts every responsibility unretired when the call starts and still
  * unretired when its entry is examined; one first recorded after the call
  * starts may be missed and must be bounded by the caller. False (output
  * zeroed) when the directory is not ready or an entry is inconsistent. */

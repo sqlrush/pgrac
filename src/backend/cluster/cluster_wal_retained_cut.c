@@ -4,9 +4,10 @@
  *	  Per-thread physical retention lower from one census of the complete
  *	  retained WAL input (S07).
  *
- *	  Each selected source has a completion position.  The current writer
- *	  of an OPEN or RECOVERY_REQUIRED root completes at its same-token
- *	  native redo; a RECOVERY_COMPLETE or CLOSED generation completes at its
+ *	  Each selected source has a completion position.  This thread's
+ *	  current writer completes at its same-token native redo (bounded as
+ *	  below), another OPEN or RECOVERY_REQUIRED thread at its published
+ *	  lower; a RECOVERY_COMPLETE or CLOSED generation completes at its
  *	  validated tail; a checkpoint-less initializer terminal completes at
  *	  its first record, so all of it stays an obligation.  A record ending
  *	  at or before its source's completion is history, the rest are
@@ -43,7 +44,23 @@
  *	  after the checkpoint completed; a responsibility recorded later with an
  *	  earlier first record names a version that checkpoint already wrote.
  *	  One whose first record is another source's but whose latest is this
- *	  thread's cannot be bounded, and keeps the published lower.
+ *	  thread's cannot be bounded, and keeps the published lower.  A PENDING
+ *	  holder pair's first record counts the same way (R-A22).
+ *
+ *	  Likewise for every buffer's first own record since it was last clean
+ *	  (R-A22: the low RBA of a page this checkpoint did not write, such as a
+ *	  retained transfer image).  The buffers are read before the directory,
+ *	  so a first record moving from a buffer to a PENDING pair or a local PI
+ *	  is seen at least once.  A write clears its buffer's first record before
+ *	  that write is fsynced, so the census also takes a snapshot made after
+ *	  the checkpoint chose its redo point and before its sync barrier
+ *	  (cluster_wal_retained_cut_before_sync_v1).  A buffer whose first record
+ *	  cannot be attributed, or is another source's, keeps the published lower.
+ *
+ *	  Another thread that is OPEN or RECOVERY_REQUIRED completes at its own
+ *	  published lower, not its native redo: only that thread's census, which
+ *	  includes its PIs and buffers, can show its later records complete
+ *	  (R-A22 point 3).
  *
  *	  Nothing here publishes or retires WAL.  The ROOT owner publishes the
  *	  bound only if the ROOT is unchanged since the census
@@ -409,25 +426,41 @@ retained_record(XLogReaderState *record, const ClusterWalSourceRef *source,
 }
 
 /* Completion of each selected input; see the file header. */
+/* Lower this thread's completion to at, recording why. */
+static void
+retained_complete_by(RetainedSource *source, XLogRecPtr at, ClusterWalRetainedPinV1 pin)
+{
+	if (at < source->completion) {
+		source->completion = source->bound = at;
+		source->pin = pin;
+	}
+}
+
 /* Complete this thread no later than its unretired local PI responsibilities
- * (R-A19).  One that cannot be bounded completes it at the published lower:
- * every retained record of this thread stays an obligation. */
+ * (R-A19) and its buffers' first own records (R-A22).  One that cannot be
+ * bounded completes it at the published lower: every retained record of this
+ * thread stays an obligation. */
 static bool
-retained_local_pi(RetainedCutWork *work, const ClusterWalInputV1 *item)
+retained_own_floors(RetainedCutWork *work, const ClusterWalInputV1 *item)
 {
 	RetainedSource *source = &work->sources[work->self];
-	XLogRecPtr floor = work->local_pi.floor;
+	XLogRecPtr published = item->checkpoint.checkpoint_lower_lsn;
 
-	if (work->local_pi.unbounded != 0)
-		floor = item->checkpoint.checkpoint_lower_lsn;
-	else if (work->local_pi.bounded == 0)
-		return true;
-	if (floor == InvalidXLogRecPtr)
-		return false;
-	if (floor < source->completion) {
-		source->completion = source->bound = floor;
-		source->pin = CLUSTER_WAL_RETAINED_PIN_LOCAL_PI;
+	if (work->local_pi.unbounded != 0) {
+		if (published == InvalidXLogRecPtr)
+			return false;
+		retained_complete_by(source, published, CLUSTER_WAL_RETAINED_PIN_LOCAL_PI);
+	} else if (work->local_pi.bounded != 0) {
+		if (work->local_pi.floor == InvalidXLogRecPtr)
+			return false;
+		retained_complete_by(source, work->local_pi.floor, CLUSTER_WAL_RETAINED_PIN_LOCAL_PI);
 	}
+	if (work->dirty.unattributed != 0 || work->dirty.foreign != 0) {
+		if (published == InvalidXLogRecPtr)
+			return false;
+		retained_complete_by(source, published, CLUSTER_WAL_RETAINED_PIN_DIRTY_BUFFER);
+	} else if (work->dirty.floor != InvalidXLogRecPtr)
+		retained_complete_by(source, work->dirty.floor, CLUSTER_WAL_RETAINED_PIN_DIRTY_BUFFER);
 	return true;
 }
 
@@ -452,7 +485,7 @@ retained_sources(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluste
 			return false;
 		else if (item->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
 				 || item->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED)
-			source->completion = item->native_redo;
+			source->completion = item->native_redo; /* another thread's: see below */
 		else if (item->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
 				 || item->checkpoint.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED)
 			source->completion = item->checkpoint.validated_tail_lsn_exclusive;
@@ -476,7 +509,23 @@ retained_sources(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluste
 		}
 	}
 	work->nsources = count;
-	return work->self >= 0 && retained_local_pi(work, cluster_wal_inputs_at_v1(inputs, work->self));
+	if (work->self < 0)
+		return false;
+	/* R-A22 point 3: another live thread completes at its published lower. */
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterWalInputV1 *item = cluster_wal_inputs_at_v1(inputs, i);
+		RetainedSource *source = &work->sources[i];
+
+		if ((int32)i == work->self || item->kind != CLUSTER_WAL_INPUT_CHECKPOINT
+			|| (item->checkpoint.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+				&& item->checkpoint.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED))
+			continue;
+		if (item->checkpoint.checkpoint_lower_lsn == InvalidXLogRecPtr)
+			return false;
+		source->completion = source->bound
+			= Min(item->checkpoint.checkpoint_lower_lsn, item->native_redo);
+	}
+	return retained_own_floors(work, cluster_wal_inputs_at_v1(inputs, work->self));
 }
 
 /* Lower the bound of source to at, recording why. */
@@ -573,7 +622,12 @@ retained_census(RetainedCutWork *work, ClusterWalInputsV1 *inputs, const Cluster
 	out->local_pi_floor = work->local_pi.floor;
 	out->local_pi_bounded = work->local_pi.bounded;
 	out->local_pi_unbounded = work->local_pi.unbounded;
-	retained_prunable(work, inputs, out);
+	out->local_pi_pending = work->local_pi.pending;
+	out->dirty_floor = work->dirty.floor;
+	out->dirty_buffers = work->dirty.dirty;
+	out->dirty_foreign = work->dirty.foreign;
+	out->dirty_unattributed = work->dirty.unattributed;
+	retained_unneeded(work, inputs, out);
 	if (out->pin == CLUSTER_WAL_RETAINED_PIN_STRUCTURE)
 		retained_structure_pins++;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -593,6 +647,46 @@ retained_work_release(RetainedCutWork *work, ClusterWalInputsV1 **inputs)
 	cluster_wal_inputs_release_v1(inputs);
 }
 
+/* The pre-sync snapshot of this checkpoint (checkpointer-local). */
+static bool retained_presync_valid = false;
+static ClusterPageWalDirtyFloorV1 retained_presync;
+static ClusterWalSourceRef retained_presync_source;
+
+void
+cluster_wal_retained_cut_before_sync_v1(XLogRecPtr redo)
+{
+	ClusterWalSourceRef self;
+
+	retained_presync_valid = false;
+	if (!AmCheckpointerProcess() || !cluster_enabled || !cluster_shared_config
+		|| redo == InvalidXLogRecPtr || !cluster_wal_thread_current_v2_ref(&self)
+		|| !cluster_page_wal_dirty_floor_v1(&self, &retained_presync))
+		return;
+	retained_presync_source = self;
+	retained_presync_valid = true;
+}
+
+/* Fold this checkpoint's pre-sync snapshot of the same writer into a scan;
+ * either one alone may miss a page the other saw. */
+static void
+retained_dirty_merge_presync(ClusterPageWalDirtyFloorV1 *dirty)
+{
+	ClusterWalSourceRef self;
+
+	if (!retained_presync_valid || !cluster_wal_thread_current_v2_ref(&self)
+		|| memcmp(&self, &retained_presync_source, sizeof(self)) != 0) {
+		retained_presync_valid = false;
+		return;
+	}
+	retained_presync_valid = false;
+	dirty->dirty += retained_presync.dirty;
+	dirty->foreign += retained_presync.foreign;
+	dirty->unattributed += retained_presync.unattributed;
+	if (retained_presync.floor != InvalidXLogRecPtr
+		&& (dirty->floor == InvalidXLogRecPtr || retained_presync.floor < dirty->floor))
+		dirty->floor = retained_presync.floor;
+}
+
 ClusterControlRootResult
 cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self, ClusterWalRetainedCutV1 *out,
 									RfPageProofDetailV1 *detail)
@@ -609,11 +703,14 @@ cluster_wal_retained_cut_compute_v1(const ClusterWalSourceRef *self, ClusterWalR
 		|| !cluster_wal_claim_v2_ref_valid(&self->claim))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	work = palloc0(sizeof(*work));
-	/* Before selecting the input: the directory scan waits on entry locks. */
-	if (!cluster_pcm_local_pi_floor_v1(self, &work->local_pi)) {
+	/* Before selecting the input: the directory scan waits on entry locks.
+	 * Buffers first, then the directory (see the file header). */
+	if (!cluster_page_wal_dirty_floor_v1(self, &work->dirty)
+		|| !cluster_pcm_local_pi_floor_v1(self, &work->local_pi)) {
 		pfree(work);
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	}
+	retained_dirty_merge_presync(&work->dirty);
 	result = cluster_wal_inputs_begin_v1(self->claim.identity.storage_uuid,
 										 self->claim.identity.system_identifier, &inputs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
@@ -664,6 +761,15 @@ retained_report(ClusterControlRootResult result, RfPageProofDetailV1 detail,
 						   "held " UINT64_FORMAT " times since start.",
 						   LSN_FORMAT_ARGS(cut->lower), LSN_FORMAT_ARGS(cut->native_redo),
 						   retained_structure_pins)));
+	else if (pin == CLUSTER_WAL_RETAINED_PIN_DIRTY_BUFFER)
+		ereport(LOG,
+				(errmsg("cluster WAL retention lower held by a buffer's unwritten modification"),
+				 errdetail("Lower %X/%X, native redo %X/%X, earliest first record %X/%X: "
+						   "%u buffers owe a first record (%u of another source, %u "
+						   "unattributed); their WAL stays until the pages are written.",
+						   LSN_FORMAT_ARGS(cut->lower), LSN_FORMAT_ARGS(cut->native_redo),
+						   LSN_FORMAT_ARGS(cut->dirty_floor), cut->dirty_buffers,
+						   cut->dirty_foreign, cut->dirty_unattributed)));
 	else if (pin == CLUSTER_WAL_RETAINED_PIN_LOCAL_PI)
 		ereport(LOG, (errmsg("cluster WAL retention lower held by a local PI responsibility"),
 					  errdetail("Lower %X/%X, native redo %X/%X, earliest responsibility %X/%X: "
@@ -696,15 +802,18 @@ retained_report_readings(const ClusterWalRetainedCutV1 *cut, ClusterControlRootR
 				LSN_FORMAT_ARGS(result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ? cut->lower
 																		  : cut->old_lower),
 				LSN_FORMAT_ARGS(cut->native_redo)),
-		 errdetail("result %d, %llu records, %llu history edges, %llu needed, spool %llu "
-				   "bytes, census %lld ms, publication %lld ms, local PI floor %X/%X "
-				   "(%llu bounded, %llu unbounded), %u older generations deletable.",
-				   (int)result, (unsigned long long)cut->records,
-				   (unsigned long long)cut->history_edges, (unsigned long long)cut->retained_edges,
-				   (unsigned long long)cut->spool_bytes, (long long)(census_us / 1000),
-				   (long long)(publication_us / 1000), LSN_FORMAT_ARGS(cut->local_pi_floor),
-				   (unsigned long long)cut->local_pi_bounded,
-				   (unsigned long long)cut->local_pi_unbounded, cut->prunable_generations)));
+		 errdetail(
+			 "result %d, %llu records, %llu history edges, %llu needed, spool %llu "
+			 "bytes, census %lld ms, publication %lld ms, local PI floor %X/%X "
+			 "(%llu bounded, %llu unbounded, %llu pending), dirty floor %X/%X (%u "
+			 "buffers, %u foreign, %u unattributed), %u older generations unneeded.",
+			 (int)result, (unsigned long long)cut->records, (unsigned long long)cut->history_edges,
+			 (unsigned long long)cut->retained_edges, (unsigned long long)cut->spool_bytes,
+			 (long long)(census_us / 1000), (long long)(publication_us / 1000),
+			 LSN_FORMAT_ARGS(cut->local_pi_floor), (unsigned long long)cut->local_pi_bounded,
+			 (unsigned long long)cut->local_pi_unbounded, (unsigned long long)cut->local_pi_pending,
+			 LSN_FORMAT_ARGS(cut->dirty_floor), cut->dirty_buffers, cut->dirty_foreign,
+			 cut->dirty_unattributed, cut->unneeded_generations)));
 }
 
 void

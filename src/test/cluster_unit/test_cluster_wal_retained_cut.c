@@ -457,6 +457,25 @@ cluster_control_root_v3_retained_lower_publish(const ClusterControlRootIdentity 
 	return publish_result;
 }
 
+/* ---- buffers' first records (R-A22) ---- */
+static bool dirty_ok;
+static ClusterPageWalDirtyFloorV1 dirty;
+static int dirty_calls, scan_sequence, dirty_scanned_at, local_pi_scanned_at;
+
+bool
+cluster_page_wal_dirty_floor_v1(const ClusterWalSourceRef *source, ClusterPageWalDirtyFloorV1 *out)
+{
+	UT_ASSERT(memcmp(source, &self_ref, sizeof(*source)) == 0);
+	dirty_calls++;
+	dirty_scanned_at = ++scan_sequence;
+	UT_ASSERT_EQ(scopes_open, 0);
+	memset(out, 0, sizeof(*out));
+	if (!dirty_ok)
+		return false;
+	*out = dirty;
+	return true;
+}
+
 /* ---- local PI directory ---- */
 static bool local_pi_ok;
 static ClusterPcmLocalPiFloorV1 local_pi;
@@ -467,6 +486,7 @@ cluster_pcm_local_pi_floor_v1(const ClusterWalSourceRef *source, ClusterPcmLocal
 {
 	UT_ASSERT(memcmp(source, &self_ref, sizeof(*source)) == 0);
 	local_pi_calls++;
+	local_pi_scanned_at = ++scan_sequence;
 	local_pi_scopes_at_call = scopes_open;
 	memset(out, 0, sizeof(*out));
 	if (!local_pi_ok)
@@ -482,6 +502,10 @@ reset(void)
 	local_pi_ok = true;
 	memset(&local_pi, 0, sizeof(local_pi));
 	local_pi_calls = 0;
+	dirty_ok = true;
+	memset(&dirty, 0, sizeof(dirty));
+	dirty_calls = scan_sequence = dirty_scanned_at = local_pi_scanned_at = 0;
+	retained_presync_valid = false;
 	local_pi_scopes_at_call = -1;
 	memset(items, 0, sizeof(items));
 	memset(records, 0, sizeof(records));
@@ -566,7 +590,7 @@ compute(ClusterWalRetainedCutV1 *cut, RfPageProofDetailV1 *detail)
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(24);
 	UT_RUN(test_retained_cut_moves_to_native_redo_without_obligations);
 	UT_RUN(test_retained_cut_peer_obligation_keeps_successors_on_its_page);
 	UT_RUN(test_retained_cut_hot_page_releases_predecessors);
@@ -583,11 +607,15 @@ main(void)
 	UT_RUN(test_retained_cut_driver_publishes_only_an_advance);
 	UT_RUN(test_retained_cut_local_pi_floor_holds_this_thread);
 	UT_RUN(test_retained_cut_local_pi_floor_unavailable_refuses);
+	UT_RUN(test_r_a22_dirty_floor_holds_this_thread);
+	UT_RUN(test_r_a22_presync_snapshot_is_merged_once);
+	UT_RUN(test_r_a22_peer_completion_is_its_published_lower);
 	UT_RUN(test_retained_cut_side_tt_slots_are_keyed);
 	UT_RUN(test_retained_cut_side_undo_blocks_are_keyed);
 	UT_RUN(test_retained_cut_side_prepared_transactions_are_keyed);
 	UT_RUN(test_retained_cut_side_unkeyed_records_are_kept_by_class);
-	UT_RUN(test_retained_cut_older_generation_deletable_only_when_proven);
+	UT_RUN(test_retained_cut_older_generation_unneeded_only_when_no_obligation);
+	UT_RUN(test_r_a20_cross_thread_publish_seq_proves_no_restart);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

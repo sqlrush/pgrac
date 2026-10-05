@@ -9630,10 +9630,42 @@ cluster_reconfig_cold_formation_tick_locked(const ClusterFenceAuthorityProof *pr
 void
 cluster_reconfig_cold_formation_tick(void)
 {
+	static uint64 last_trace_us;
+	static uint64 trace_ticks_seen;
+	static uint64 trace_complete_seen;
+	ClusterFormationDiskSnapshot trace_disk;
+	uint64 trace_now = 0, trace_seq = 0, trace_seq_after = 0;
+	uint64 trace_fresh[2] = { 0, 0 }, trace_known[2] = { 0, 0 };
+	uint64 trace_ticks = 0, trace_boot = 0, trace_req = 0, trace_done = 0;
+	bool trace = false, trace_staged = false, trace_acked = false;
 	bool drive = false;
 	if (ReconfigShmem == NULL)
 		return;
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (cluster_shared_config && cluster_epoch_get_current() == 0) {
+		trace_ticks_seen++;
+		if (ReconfigShmem->formation_disk_snapshot.complete)
+			trace_complete_seen++;
+		trace_now = (uint64)GetCurrentTimestamp();
+		trace = trace_now < last_trace_us || trace_now - last_trace_us >= UINT64_C(5000000);
+		if (trace) {
+			trace_disk = ReconfigShmem->formation_disk_snapshot;
+			trace_boot = cluster_qvotec_get_self_incarnation();
+			trace_seq = pg_atomic_read_u64(&ReconfigShmem->observed_bootstrap_seq);
+			pg_read_barrier();
+			for (int node = 0; node < CLUSTER_MAX_NODES; ++node) {
+				uint64 bit = UINT64_C(1) << (node % 64);
+				if (cluster_conf_lookup_node(node) == NULL)
+					continue;
+				if (pg_atomic_read_u64(&ReconfigShmem->observed_generation[node]) != 0)
+					trace_known[node / 64] |= bit;
+				if (pg_atomic_read_u64(&ReconfigShmem->observed_fresh_alive[node]) != 0)
+					trace_fresh[node / 64] |= bit;
+			}
+			pg_read_barrier();
+			trace_seq_after = pg_atomic_read_u64(&ReconfigShmem->observed_bootstrap_seq);
+		}
+	}
 	for (int i = 0; i < CLUSTER_MAX_NODES; ++i)
 		if (cluster_conf_lookup_node(i) != NULL
 			&& cluster_membership_get_state(i) == CLUSTER_MEMBER_ABSENT)
@@ -9642,7 +9674,38 @@ cluster_reconfig_cold_formation_tick(void)
 		cluster_reconfig_shared_cold_formation_tick_locked();
 	else if (drive)
 		cluster_reconfig_cold_formation_tick_locked(NULL);
+	if (trace) {
+		trace_ticks = cold_formation_state.observe_ticks;
+		trace_staged = cold_formation_state.initial_staged;
+		trace_acked = cold_formation_state.initial_fence_acked;
+		trace_req = pg_atomic_read_u64(&ReconfigShmem->formation_marker_request_seq);
+		trace_done = pg_atomic_read_u64(&ReconfigShmem->formation_marker_completion_seq);
+	}
 	LWLockRelease(&ReconfigShmem->lock);
+	/* Diagnostic copies never enter an admission predicate. Output only after
+	 * releasing Reconfig, without disk reads or wakeups. */
+	if (trace) {
+		last_trace_us = trace_now;
+		ereport(
+			LOG,
+			(errmsg_internal("cluster INITIAL formation consumer diagnostic"),
+			 errdetail("node=%d now_pg_us=%llu snapshot_complete=%u sampled_pg_us=%llu "
+					   "snapshot_boot=%llu self_boot=%llu max_epoch=%llu max_generation=%llu "
+					   "bootstrap_seq=%llu/%llu known=%016llx/%016llx fresh=%016llx/%016llx "
+					   "observe_ticks=%llu staged=%u fence_acked=%u marker_seq=%llu/%llu "
+					   "ticks_seen=%llu complete_seen=%llu",
+					   cluster_node_id, (unsigned long long)trace_now,
+					   (unsigned)trace_disk.complete, (unsigned long long)trace_disk.sampled_at_us,
+					   (unsigned long long)trace_disk.self_incarnation,
+					   (unsigned long long)trace_boot, (unsigned long long)trace_disk.max_epoch,
+					   (unsigned long long)trace_disk.max_generation, (unsigned long long)trace_seq,
+					   (unsigned long long)trace_seq_after, (unsigned long long)trace_known[0],
+					   (unsigned long long)trace_known[1], (unsigned long long)trace_fresh[0],
+					   (unsigned long long)trace_fresh[1], (unsigned long long)trace_ticks,
+					   (unsigned)trace_staged, (unsigned)trace_acked, (unsigned long long)trace_req,
+					   (unsigned long long)trace_done, (unsigned long long)trace_ticks_seen,
+					   (unsigned long long)trace_complete_seen)));
+	}
 	if (cluster_shared_config)
 		cluster_reconfig_startup_formation_progress();
 }

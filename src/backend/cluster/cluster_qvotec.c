@@ -204,6 +204,59 @@ StaticAssertDecl(offsetof(ClusterQvotecShmem, diagnostic_cycle_started_us) == 80
 static ClusterQvotecShmem *QvotecShmem = NULL;
 static int qvotec_shutdown_configured_disks(void);
 
+/* Process-local observation only. Report the completed prior poll; reading
+ * or logging this state never refreshes its timestamp or grants authority.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static struct {
+	uint64 sampled_at_us;
+	uint64 published_at_us;
+	uint64 oldest_heartbeat_us;
+	uint64 newest_heartbeat_us;
+	uint64 declared[2];
+	uint64 known[2];
+	uint64 fresh[2];
+	uint64 max_epoch;
+	uint64 max_generation;
+	bool complete;
+	bool all_slots_read;
+	uint32 quorum_state;
+} qvotec_initial_trace;
+
+static void
+qvotec_initial_trace_previous_poll(void)
+{
+	static uint64 last_log_us;
+	uint64 now = (uint64)GetCurrentTimestamp();
+
+	if (qvotec_initial_trace.sampled_at_us == 0 || cluster_epoch_get_current() != 0
+		|| (now >= last_log_us && now - last_log_us < UINT64_C(5000000)))
+		return;
+	last_log_us = now;
+	ereport(
+		LOG,
+		(errmsg_internal("cluster INITIAL formation producer diagnostic"),
+		 errdetail(
+			 "node=%d next_poll_pg_us=%llu sampled_pg_us=%llu published_pg_us=%llu "
+			 "complete=%u all_slots_read=%u quorum=%u max_epoch=%llu max_generation=%llu "
+			 "declared=%016llx/%016llx known=%016llx/%016llx fresh=%016llx/%016llx "
+			 "oldest_heartbeat_pg_us=%llu newest_heartbeat_pg_us=%llu heartbeat_budget_us=%llu",
+			 cluster_node_id, (unsigned long long)now,
+			 (unsigned long long)qvotec_initial_trace.sampled_at_us,
+			 (unsigned long long)qvotec_initial_trace.published_at_us,
+			 (unsigned)qvotec_initial_trace.complete, (unsigned)qvotec_initial_trace.all_slots_read,
+			 qvotec_initial_trace.quorum_state, (unsigned long long)qvotec_initial_trace.max_epoch,
+			 (unsigned long long)qvotec_initial_trace.max_generation,
+			 (unsigned long long)qvotec_initial_trace.declared[0],
+			 (unsigned long long)qvotec_initial_trace.declared[1],
+			 (unsigned long long)qvotec_initial_trace.known[0],
+			 (unsigned long long)qvotec_initial_trace.known[1],
+			 (unsigned long long)qvotec_initial_trace.fresh[0],
+			 (unsigned long long)qvotec_initial_trace.fresh[1],
+			 (unsigned long long)qvotec_initial_trace.oldest_heartbeat_us,
+			 (unsigned long long)qvotec_initial_trace.newest_heartbeat_us,
+			 (unsigned long long)cluster_quorum_poll_interval_ms * 2000ULL)));
+}
+
 /* Read-only evidence, not a quorum state machine or permission to renew. */
 typedef enum QvotecDiagnosticPhase {
 	QVOTEC_DIAG_UNKNOWN,
@@ -3116,6 +3169,10 @@ qvotec_poll_once(void)
 
 	/* An in-progress read is not a failed proof. Readers keep the previous
 	 * exact sample under its original freshness/owner checks until replacement. */
+	if (formation_scan) {
+		qvotec_initial_trace_previous_poll();
+		memset(&qvotec_initial_trace, 0, sizeof(qvotec_initial_trace));
+	}
 	cluster_storage_quorum_refresh(cluster_storage_quorum_now_us(),
 								   (uint64)cluster_quorum_poll_interval_ms * 30 * 1000ULL);
 
@@ -4085,7 +4142,7 @@ qvotec_poll_once(void)
 	 * is cleared (fail-closed: no marker, no admission). */
 	if (cluster_shared_config) {
 		if (formation_scan) {
-			ClusterFormationDiskSnapshot snapshot;
+			ClusterFormationDiskSnapshot snapshot = { 0 };
 			ClusterFormationCommitMarker marker;
 			uint64 incarnations[CLUSTER_MAX_NODES];
 			uint8 image[CLUSTER_VOTING_SLOT_BYTES];
@@ -4099,6 +4156,13 @@ qvotec_poll_once(void)
 			else
 				cluster_reconfig_formation_qvotec_clear_observed();
 			cluster_reconfig_formation_qvotec_publish_disk_snapshot(complete ? &snapshot : NULL);
+			qvotec_initial_trace.sampled_at_us = now_us;
+			qvotec_initial_trace.published_at_us = (uint64)GetCurrentTimestamp();
+			qvotec_initial_trace.complete = complete;
+			qvotec_initial_trace.all_slots_read = all_slots_read;
+			qvotec_initial_trace.quorum_state = (uint32)decision.quorum_state;
+			qvotec_initial_trace.max_epoch = snapshot.max_epoch;
+			qvotec_initial_trace.max_generation = snapshot.max_generation;
 		}
 	} else
 	{
@@ -4196,6 +4260,22 @@ qvotec_poll_once(void)
 							&& (now_us <= best_slot->heartbeat_ts_us
 								|| now_us - best_slot->heartbeat_ts_us <= heartbeat_timeout_us)));
 			cluster_reconfig_record_observed_fresh_alive((int32)node, fresh);
+			if (formation_scan && cluster_conf_lookup_node((int32)node) != NULL) {
+				uint64 bit = UINT64_C(1) << (node % 64);
+				qvotec_initial_trace.declared[node / 64] |= bit;
+				if (best_gen != 0)
+					qvotec_initial_trace.known[node / 64] |= bit;
+				if (fresh)
+					qvotec_initial_trace.fresh[node / 64] |= bit;
+				if (best_slot != NULL) {
+					uint64 stamp = best_slot->heartbeat_ts_us;
+					if (qvotec_initial_trace.oldest_heartbeat_us == 0
+						|| stamp < qvotec_initial_trace.oldest_heartbeat_us)
+						qvotec_initial_trace.oldest_heartbeat_us = stamp;
+					qvotec_initial_trace.newest_heartbeat_us
+						= Max(qvotec_initial_trace.newest_heartbeat_us, stamp);
+				}
+			}
 		}
 		cluster_reconfig_bootstrap_publish_in_quorum(decision.quorum_state
 													 == CLUSTER_QVOTEC_QUORUM_OK);
