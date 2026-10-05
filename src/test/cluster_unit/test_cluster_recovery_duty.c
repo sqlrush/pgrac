@@ -30,6 +30,16 @@
 
 UT_DEFINE_GLOBALS();
 
+/* Postmaster-only shared startup is covered by test_cluster_formation_witness. */
+bool cluster_shared_config;
+struct PGPROC *MyProc;
+bool
+cluster_reconfig_read_formation_fence_snapshot(ClusterFenceAuthorityProof *out)
+{
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+
 static ClusterControlRootResult ut_root_lookup_result;
 static ClusterControlRootResult ut_root_publish_result;
 static ClusterRecoveryOwnerImportResult ut_owner_read_result;
