@@ -2774,11 +2774,11 @@ test_cluster_side_xact: test_cluster_side_xact.c unit_test.h test_cluster_undo_h
 CLUSTER_SIDE_ONLINE_OWNER_O = test_cluster_side_online_owner_product.o
 # The DATA integration uses the actual immutable fabric and typed SIDE
 # planner. The writeback scheduling fixture keeps its explicit input boundary.
-test_cluster_page_data: PAGE_DATA_SPACE_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
+test_cluster_page_data test_cluster_sync_error: PAGE_DATA_SPACE_OBJS = $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)
-test_cluster_page_data: $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
+test_cluster_page_data test_cluster_sync_error: $(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(CLUSTER_SIDE_XACT_O) $(SIDE_XACT_XACTDESC_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \
 		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_REMOTE_XACT_IDENTITY_O)

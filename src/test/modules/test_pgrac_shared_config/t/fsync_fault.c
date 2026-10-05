@@ -1,6 +1,9 @@
 /* Process-local syscall fault for a single disposable relation inode.
  * No fault is armed until the control file contains the exact pathname.
  * Author: SqlRush <sqlrush@gmail.com> */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
 #include <sys/stat.h>
 #include <dlfcn.h>
 #include <errno.h>
