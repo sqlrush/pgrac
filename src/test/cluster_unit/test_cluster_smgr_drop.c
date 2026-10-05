@@ -332,12 +332,13 @@ UT_TEST(test_committed_drop_reports_only_after_exact_physical_result)
 	UT_ASSERT_EQ(owner_reads, 1);
 	UT_ASSERT_EQ(physical_calls, 1);
 	UT_ASSERT_EQ(setter_calls, 1);
-	UT_ASSERT_EQ(unlink_requests, 1);
+	UT_ASSERT_EQ(unlink_requests, 0);
 	UT_ASSERT_EQ(legacy_unlinks + legacy_truncates, 0);
 	UT_ASSERT_EQ(warnings, 0);
 	UT_ASSERT(strstr(trace, "B") != NULL && strrchr(trace, 'C') != NULL
 		&& strstr(trace, "B") > strrchr(trace, 'C'));
-	UT_ASSERT(strstr(trace, "PSU") != NULL);
+	UT_ASSERT(strstr(trace, "PS") != NULL);
+	UT_ASSERT(strchr(trace, 'U') == NULL);
 	UT_ASSERT(cluster_smgr_relations == NULL);
 }
 
@@ -441,10 +442,52 @@ UT_TEST(test_redo_temp_nonshared_and_partial_remain_original_paths)
 	}
 }
 
+UT_TEST(test_shared_checkpoint_tag_cannot_release_main_reservation)
+{
+	/* FileTag carries neither structural retirement nor a closed recovery
+	 * window. A delayed checkpoint cannot establish either qualification. */
+	for (unsigned mode = 1; mode <= 3; mode++) {
+		FileTag tag;
+		char path[MAXPGPATH];
+
+		reset_drop(true);
+		cluster_shared_config = (mode & 1) != 0;
+		cluster_shared_catalog = (mode & 2) != 0;
+		cluster_smgr_init_filetag(&tag, locator().locator, MAIN_FORKNUM);
+		path[0] = '\0';
+		errno = 0;
+		UT_ASSERT_EQ(cluster_smgr_unlinkfiletag(&tag, path), -1);
+		UT_ASSERT_EQ(errno, EAGAIN);
+		UT_ASSERT(path[0] != '\0');
+		UT_ASSERT_EQ(legacy_unlinks + legacy_truncates, 0);
+		UT_ASSERT_EQ(physical_calls + setter_calls + unlink_requests, 0);
+		UT_ASSERT_EQ(InterruptHoldoffCount, 2);
+		UT_ASSERT_EQ(QueryCancelHoldoffCount, 1);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+	}
+}
+
+UT_TEST(test_nonshared_and_aux_checkpoint_tags_keep_original_cleanup)
+{
+	for (ForkNumber forknum = MAIN_FORKNUM; forknum <= MAX_FORKNUM; forknum++) {
+		FileTag tag;
+		char path[MAXPGPATH];
+
+		reset_drop(true);
+		if (forknum == MAIN_FORKNUM)
+			cluster_shared_catalog = cluster_shared_config = false;
+		cluster_smgr_init_filetag(&tag, locator().locator, forknum);
+		UT_ASSERT_EQ(cluster_smgr_unlinkfiletag(&tag, path), 0);
+		UT_ASSERT_EQ(legacy_unlinks, 1);
+		UT_ASSERT_EQ(legacy_truncates + physical_calls + setter_calls, 0);
+		UT_ASSERT_EQ(warnings, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(9);
 	UT_RUN(test_committed_drop_reports_only_after_exact_physical_result);
 	UT_RUN(test_failed_physical_drop_never_reports_or_falls_back);
 	UT_RUN(test_rejected_owner_result_keeps_main_reserved);
@@ -452,6 +495,8 @@ main(void)
 	UT_RUN(test_postcommit_error_keeps_holdoffs_and_never_reports_completion);
 	UT_RUN(test_no_committed_owner_retains_original_abort_cleanup);
 	UT_RUN(test_redo_temp_nonshared_and_partial_remain_original_paths);
+	UT_RUN(test_shared_checkpoint_tag_cannot_release_main_reservation);
+	UT_RUN(test_nonshared_and_aux_checkpoint_tags_keep_original_cleanup);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
