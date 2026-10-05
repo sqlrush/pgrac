@@ -11,6 +11,11 @@ int drop_owner_fixture_main(void);
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/vfs.h>
+#elif defined(__APPLE__)
+#include <sys/mount.h>
+#endif
 #include <sys/wait.h>
 #include <unistd.h>
 #include "cluster/storage/cluster_shared_fs.h"
@@ -124,6 +129,8 @@ enum WorkFault {
 	WORK_PARTIAL,
 	WORK_DIR_SYNC,
 	WORK_UNLINK_UNKNOWN,
+	WORK_UNLINK_RENAMED,
+	WORK_NFS,
 	WORK_CLOSE,
 	WORK_FINISH,
 	WORK_CUT_AFTER_TRUNCATE,
@@ -219,6 +226,11 @@ work_unlink(int dir, const char *name, int flags)
 		errno = EIO;
 		return -1;
 	}
+	if (work_fault == WORK_UNLINK_RENAMED) {
+		UT_ASSERT_EQ(renameat(dir, name, dir, "still-linked-original"), 0);
+		errno = EIO;
+		return -1;
+	}
 	result = unlinkat(dir, name, flags);
 	if (work_fault == WORK_UNLINK_UNKNOWN) {
 		errno = EIO;
@@ -248,6 +260,23 @@ work_close(int fd)
 	return result;
 }
 
+#if defined(__linux__) || defined(__APPLE__)
+static int
+work_statfs(int fd, struct statfs *out)
+{
+	int result = fstatfs(fd, out);
+	if (result == 0 && work_fault == WORK_NFS) {
+#ifdef __linux__
+		out->f_type = 0x6969;
+#else
+		strcpy(out->f_fstypename, "nfs");
+#endif
+	}
+	return result;
+}
+#endif
+
+#define fstatfs(fd, out) work_statfs(fd, out)
 #define ftruncate work_truncate
 #define pg_fsync work_sync
 #define unlinkat work_unlink
@@ -255,6 +284,7 @@ work_close(int fd)
 #define openat(dir, name, flags) work_openat(dir, name, flags)
 #define close(fd) work_close(fd)
 #include "../../backend/cluster/storage/cluster_shared_fs_sharedfs.c"
+#undef fstatfs
 #undef close
 #undef openat
 #undef open
@@ -715,16 +745,43 @@ CUT_TEST(test_work_cut_checked_before_main_sync, WORK_CUT_AFTER_TRUNCATE)
 CUT_TEST(test_work_cut_checked_before_aux_unlink, WORK_CUT_AFTER_SYNC)
 CUT_TEST(test_work_cut_checked_between_aux_unlinks, WORK_CUT_AFTER_UNLINK)
 
-UT_TEST(test_work_ambiguous_unlink_never_treats_enoent_as_its_success)
+UT_TEST(test_work_ambiguous_unlink_uses_original_unlinked_inode)
 {
 	if (!work_setup("unknown_unlink"))
 		return;
 	work_fault = WORK_UNLINK_UNKNOWN;
 	UT_ASSERT(!poll_work());
 	work_fault = WORK_OK;
+	UT_ASSERT(poll_work());
+	assert_finished();
+	UT_ASSERT_EQ(per_fork_unlinks[FSM_FORKNUM], 1);
+	UT_ASSERT_EQ(unlinks, MAX_FORKNUM);
+	UT_ASSERT_EQ(truncates, 1);
+}
+
+UT_TEST(test_work_enoent_with_linked_original_never_finishes)
+{
+	if (!work_setup("renamed_original"))
+		return;
+	work_fault = WORK_UNLINK_RENAMED;
 	UT_ASSERT(!poll_work());
-	UT_ASSERT_EQ(unlinks, 1);
-	UT_ASSERT_EQ(dir_syncs, 0);
+	work_fault = WORK_OK;
+	UT_ASSERT(!poll_work());
+	UT_ASSERT_EQ(per_fork_unlinks[FSM_FORKNUM], 1);
+	UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+}
+
+UT_TEST(test_work_nfs_refused_before_first_mutation)
+{
+	struct stat st;
+	if (!work_setup("nfs"))
+		return;
+	work_fault = WORK_NFS;
+	UT_ASSERT(!poll_work());
+	UT_ASSERT_EQ(errno, ENOTSUP);
+	UT_ASSERT_EQ(truncates + main_syncs + unlinks + dir_syncs, 0);
+	UT_ASSERT_EQ(stat(work_paths[MAIN_FORKNUM], &st), 0);
+	UT_ASSERT_EQ(st.st_size, BLCKSZ);
 	UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
 }
 
@@ -735,6 +792,7 @@ UT_TEST(test_work_close_error_never_finishes_or_retries_unknown_descriptor)
 		return;
 	work_fault = WORK_CLOSE;
 	UT_ASSERT(!poll_work());
+	UT_ASSERT_EQ(external_fds, MAX_FORKNUM + 1);
 	old_closes = closes;
 	work_fault = WORK_OK;
 	UT_ASSERT(!poll_work());
@@ -790,7 +848,7 @@ UT_TEST(test_work_executor_process_exit_does_not_redo_partial_io)
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(22);
 	UT_RUN(test_native_commit_and_real_smgr_defer_io_to_original_work);
 	UT_RUN(test_native_checkpointer_poll_has_bounded_visible_failure_and_retry);
 	printf("# retained storage state: %zu bytes per original work\n",
@@ -810,7 +868,9 @@ main(void)
 	UT_RUN(test_work_cut_checked_before_main_sync);
 	UT_RUN(test_work_cut_checked_before_aux_unlink);
 	UT_RUN(test_work_cut_checked_between_aux_unlinks);
-	UT_RUN(test_work_ambiguous_unlink_never_treats_enoent_as_its_success);
+	UT_RUN(test_work_ambiguous_unlink_uses_original_unlinked_inode);
+	UT_RUN(test_work_enoent_with_linked_original_never_finishes);
+	UT_RUN(test_work_nfs_refused_before_first_mutation);
 	UT_RUN(test_work_close_error_never_finishes_or_retries_unknown_descriptor);
 	UT_RUN(test_work_executor_process_exit_does_not_redo_partial_io);
 	UT_DONE();
