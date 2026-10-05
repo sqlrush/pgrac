@@ -368,6 +368,12 @@ struct ClusterSpaceIdentity;
 extern bool cluster_shared_fs_sharedfs_drop_durable(const struct ClusterSpaceIdentity *identity,
 												  uint64 mutation_token);
 
+/* Retained physical progress is allocated only inside the original KO work.
+ * A successful physical attempt keeps MAIN and grants no reuse authority. */
+struct ClusterKoDropWorkV2;
+extern Size cluster_shared_fs_sharedfs_drop_work_size(void);
+extern bool cluster_shared_fs_sharedfs_drop_work(struct ClusterKoDropWorkV2 *work);
+
 /*
  * Length of the shared-storage uuid recorded in the cross-node sentinel:
  * 32 lowercase hex characters plus a NUL.  Public so other cluster modules

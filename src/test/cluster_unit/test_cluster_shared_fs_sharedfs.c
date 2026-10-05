@@ -73,6 +73,15 @@
 #undef strerror_r
 
 #include "unit_test.h"
+#include "test_cluster_drop_work_unavailable.h"
+#include "storage/sync.h"
+
+bool
+RegisterSyncRequest(const FileTag *tag pg_attribute_unused(),
+					SyncRequestType type pg_attribute_unused(), bool retry pg_attribute_unused())
+{
+	return false;
+}
 
 
 /* ----------

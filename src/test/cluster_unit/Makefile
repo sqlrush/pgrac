@@ -4087,7 +4087,7 @@ test_cluster_ges_handoff: test_cluster_ges_handoff.c unit_test.h \
 # GetRelationPath) because the unit test only takes addresses and reads
 # static vtable contents.  End-to-end runtime behaviour is verified by
 # cluster_tap t/018_shared_fs.pl.
-test_cluster_shared_fs: test_cluster_shared_fs.c unit_test.h \
+test_cluster_shared_fs: test_cluster_shared_fs.c test_cluster_drop_work_unavailable.h unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SHARED_FS_O) \
 		$(CLUSTER_SHARED_FS_STUB_O) $(CLUSTER_SHARED_FS_LOCAL_O) \
 		$(CLUSTER_SHARED_FS_SHAREDFS_O) $(CLUSTER_SHARED_CATALOG_O) $(top_builddir)/src/common/libpgcommon_srv.a
@@ -4100,14 +4100,14 @@ test_cluster_shared_fs: test_cluster_shared_fs.c unit_test.h \
 # spec-4.5a D12: runtime unit for the shared_fs backend + shared-root
 # sentinel.  Links ONLY cluster_shared_fs_sharedfs.o with functional
 # stubs (real open/pread/pwrite/software-crc32c), no server needed.
-test_cluster_shared_fs_sharedfs: test_cluster_shared_fs_sharedfs.c unit_test.h \
+test_cluster_shared_fs_sharedfs: test_cluster_shared_fs_sharedfs.c test_cluster_drop_work_unavailable.h unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SHARED_FS_SHAREDFS_O) $(top_builddir)/src/common/libpgcommon_srv.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SHARED_FS_SHAREDFS_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Exact DROP physical result; real backend and codec, injected POSIX faults.
-test_cluster_shared_fs_drop: test_cluster_shared_fs_drop.c test_cluster_shared_fs_sharedfs.c unit_test.h \
+test_cluster_shared_fs_drop: test_cluster_shared_fs_drop.c test_cluster_drop_work_unavailable.h test_cluster_shared_fs_sharedfs.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_shared_fs_sharedfs.c $(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) \
@@ -4137,7 +4137,7 @@ test_cluster_raw_device_capacity: test_cluster_raw_device_capacity.c unit_test.h
 # dispatch).  End-to-end runtime behaviour (PG 219 GUC=on) is
 # verified by cluster_tap t/019_smgr_cluster.pl + make check
 # --temp-config.
-test_cluster_smgr: test_cluster_smgr.c unit_test.h \
+test_cluster_smgr: test_cluster_smgr.c test_cluster_drop_work_unavailable.h unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SMGR_O) \
 		$(CLUSTER_SHARED_FS_O) $(CLUSTER_SHARED_FS_STUB_O) \
 		$(CLUSTER_SHARED_FS_LOCAL_O) \
