@@ -147,7 +147,7 @@ UT_TEST(test_io_2_crc_mismatch_returns_torn)
 	int fd;
 	ClusterVotingSlot slot;
 	ClusterVotingDiskIoState rc;
-	uint8 garbage = 0xFF;
+	uint8 sector[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
 
 	fd = cluster_voting_disk_open(path, /*create*/ true);
 	UT_ASSERT(fd >= 0);
@@ -167,8 +167,10 @@ UT_TEST(test_io_2_crc_mismatch_returns_torn)
 
 	/* Corrupt one byte in the middle of slot 1's data area to simulate
 	 * a torn write — CRC should now mismatch. */
-	(void)pwrite(fd, &garbage, 1, /* offset */ 1 * 512 + 100);
-	(void)fsync(fd);
+	UT_ASSERT_EQ(pread(fd, sector, sizeof(sector), CLUSTER_VOTING_SLOT_OFFSET(1)), sizeof(sector));
+	sector[100] ^= 0xff;
+	UT_ASSERT_EQ(pwrite(fd, sector, sizeof(sector), CLUSTER_VOTING_SLOT_OFFSET(1)), sizeof(sector));
+	UT_ASSERT_EQ(fsync(fd), 0);
 
 	rc = cluster_voting_disk_read_slot(fd, /*expected_disk_index*/ 0, 1, &slot);
 	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_TORN);
@@ -219,7 +221,7 @@ UT_TEST(test_io_4_node_id_mismatch_failed)
 {
 	char *path = make_temp_path("nid");
 	int fd;
-	ClusterVotingSlot slot;
+	ClusterVotingSlot slot __attribute__((aligned(512)));
 	ClusterVotingDiskIoState rc;
 
 	fd = cluster_voting_disk_open(path, /*create*/ true);
@@ -479,7 +481,7 @@ UT_TEST(test_io_12_raw_tail_write_lazily_extends_old_file)
 	char *path = make_temp_path("raw_tail_write");
 	uint8 prior[CLUSTER_VOTING_SLOT_BYTES];
 	uint8 in[CLUSTER_VOTING_SLOT_BYTES];
-	uint8 out[CLUSTER_VOTING_SLOT_BYTES];
+	uint8 out[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
 	struct stat st;
 	int fd;
 	int setup_fd;
@@ -842,8 +844,8 @@ UT_TEST(test_storage_loss_rejects_every_write_and_preserves_raw_history)
 	slot.flags = CLUSTER_VOTING_SLOT_FLAG_ALIVE;
 	slot.generation = 8;
 	UT_ASSERT_EQ(cluster_voting_disk_write_slot(fd, &slot), CLUSTER_VOTING_DISK_IO_OK);
-	before = malloc(size);
-	after = malloc(size);
+	UT_ASSERT_EQ(posix_memalign((void **)&before, 512, size), 0);
+	UT_ASSERT_EQ(posix_memalign((void **)&after, 512, size), 0);
 	UT_ASSERT_EQ(pread(fd, before, size, 0), size);
 	memset(payload, 0x5a, sizeof(payload));
 	storage_permitted = false;
