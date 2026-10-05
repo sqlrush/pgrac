@@ -120,6 +120,7 @@ typedef struct ClusterKoSharedContext {
 	uint32 structure_scan;
 	uint64 structure_scan_freeze;
 	int32 pid;
+	int32 drop_executor_pid;
 	uint64 serial;
 	ClusterKoSharedMessageV2 request;
 	uint64 peer_boots[CLUSTER_KO_SHARED_NODE_LIMIT];
@@ -201,6 +202,17 @@ struct ClusterKoCompletionV2 {
 static ClusterKoCompletionV2 *ko_completions;
 static bool ko_resource_registered;
 static void ko_shared_backend_exit(int code, Datum arg);
+
+/* Process-local storage state belongs to the original active KO context.
+ * It survives a checkpointer ERROR, but can never migrate to another process. */
+struct ClusterKoDropWorkV2 {
+	ResourceOwner owner;
+	int32 pid;
+	uint32 slot;
+	Size storage_bytes;
+	ClusterKoSharedContext context;
+};
+static ClusterKoDropWorkV2 *ko_drop_work[CLUSTER_KO_SHARED_CAPACITY];
 
 ClusterNormalStopPollResult
 cluster_ko_normal_stop_poll(uint32 *slot_out, const char **reason_out)
@@ -1247,6 +1259,159 @@ cluster_ko_shared_native_promote_v2(void)
 }
 
 static bool
+ko_drop_context_current(const ClusterKoSharedContext *context)
+{
+	ClusterSpaceStructureChange change;
+	ClusterWalSourceRef current;
+
+	return context->used && context->complete && context->structure_owned
+		   && context->structure_drop_pending && context->serial != 0
+		   && context->request.origin_node == cluster_node_id
+		   && cluster_space_structure_wal_decode(context->structure, sizeof(context->structure),
+												 &change)
+		   && change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE
+		   && cluster_page_wal_binding_shape_v1(&context->terminal)
+		   && context->terminal.flags == CLUSTER_PAGE_WAL_NATIVE_FLUSHED
+		   && ko_shared_origin_current(context) && cluster_wal_thread_current_v2_ref(&current)
+		   && memcmp(&current, &context->terminal.source, sizeof(current)) == 0;
+}
+
+static bool
+ko_drop_actor_current(void)
+{
+	return ko_state != NULL && cluster_enabled && cluster_shared_config
+		   && MyBackendType == B_CHECKPOINTER && MyProcPid > 0 && CurrentResourceOwner != NULL
+		   && CritSectionCount == 0;
+}
+
+bool
+cluster_ko_shared_drop_work_revalidate_v2(const ClusterKoDropWorkV2 *work)
+{
+	ClusterKoSharedContext current;
+	bool exact;
+	uint32 slot;
+
+	if (work == NULL || !ko_drop_actor_current())
+		return false;
+	/* Authenticate pointer membership before dereferencing caller memory. */
+	for (slot = 0; slot < CLUSTER_KO_SHARED_CAPACITY; slot++)
+		if (ko_drop_work[slot] == work)
+			break;
+	if (slot == CLUSTER_KO_SHARED_CAPACITY || work->slot != slot || work->pid != MyProcPid
+		|| work->owner != CurrentResourceOwner)
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	current = ko_state->contexts[slot];
+	SpinLockRelease(&ko_state->shared_lock);
+	if (current.drop_executor_pid != MyProcPid
+		|| memcmp(&current, &work->context, sizeof(current)) != 0
+		|| !ko_drop_context_current(&current))
+		return false;
+	SpinLockAcquire(&ko_state->shared_lock);
+	exact = memcmp(&current, &ko_state->contexts[slot], sizeof(current)) == 0;
+	SpinLockRelease(&ko_state->shared_lock);
+	return exact;
+}
+
+bool
+cluster_ko_shared_drop_work_begin_v2(uint32 *cursor, Size storage_bytes, ClusterKoDropWorkV2 **out)
+{
+	if (!ko_drop_actor_current() || cursor == NULL || *cursor >= CLUSTER_KO_SHARED_CAPACITY
+		|| out == NULL || *out != NULL || storage_bytes == 0
+		|| storage_bytes > MaxAllocSize - MAXALIGN(sizeof(ClusterKoDropWorkV2)))
+		return false;
+	for (uint32 slot = *cursor; slot < CLUSTER_KO_SHARED_CAPACITY; slot++) {
+		ClusterKoDropWorkV2 *work = ko_drop_work[slot];
+		ClusterKoSharedContext before;
+		bool claimed = false;
+
+		if (work != NULL) {
+			if (work->storage_bytes != storage_bytes
+				|| !cluster_ko_shared_drop_work_revalidate_v2(work))
+				continue;
+		} else {
+			SpinLockAcquire(&ko_state->shared_lock);
+			before = ko_state->contexts[slot];
+			SpinLockRelease(&ko_state->shared_lock);
+			if (before.drop_executor_pid != 0 || !ko_drop_context_current(&before))
+				continue;
+			if (!ko_exit_registered) {
+				before_shmem_exit(ko_shared_backend_exit, (Datum)0);
+				ko_exit_registered = true;
+			}
+			work = MemoryContextAllocZero(TopMemoryContext,
+										  add_size(MAXALIGN(sizeof(*work)), storage_bytes));
+			work->owner = CurrentResourceOwner;
+			work->pid = MyProcPid;
+			work->slot = slot;
+			work->storage_bytes = storage_bytes;
+			work->context = before;
+			work->context.drop_executor_pid = MyProcPid;
+			SpinLockAcquire(&ko_state->shared_lock);
+			if (memcmp(&before, &ko_state->contexts[slot], sizeof(before)) == 0) {
+				ko_state->contexts[slot].drop_executor_pid = MyProcPid;
+				ko_drop_work[slot] = work;
+				claimed = true;
+			}
+			SpinLockRelease(&ko_state->shared_lock);
+			if (!claimed) {
+				pfree(work);
+				continue;
+			}
+		}
+		*out = work;
+		*cursor = slot + 1;
+		return true;
+	}
+	return false;
+}
+
+void *
+cluster_ko_shared_drop_work_state_v2(const ClusterKoDropWorkV2 *work, Size storage_bytes)
+{
+	if (!cluster_ko_shared_drop_work_revalidate_v2(work) || work->storage_bytes != storage_bytes)
+		return NULL;
+	return (char *)work + MAXALIGN(sizeof(*work));
+}
+
+bool
+cluster_ko_shared_drop_work_read_v2(const ClusterKoDropWorkV2 *work,
+									struct ClusterPageWalBindingV1 *terminal, void *wal,
+									Size wal_length)
+{
+	if (terminal == NULL || wal == NULL || wal_length != CLUSTER_SPACE_STRUCTURE_WAL_BYTES
+		|| !cluster_ko_shared_drop_work_revalidate_v2(work))
+		return false;
+	*terminal = work->context.terminal;
+	memcpy(wal, work->context.structure, wal_length);
+	return true;
+}
+
+bool
+cluster_ko_shared_drop_work_finish_v2(ClusterKoDropWorkV2 **work)
+{
+	ClusterKoDropWorkV2 *owned;
+	bool finished = false;
+
+	if (work == NULL || !cluster_ko_shared_drop_work_revalidate_v2(*work))
+		return false;
+	owned = *work;
+	SpinLockAcquire(&ko_state->shared_lock);
+	if (memcmp(&ko_state->contexts[owned->slot], &owned->context, sizeof(owned->context)) == 0) {
+		ko_state->contexts[owned->slot].structure_drop_pending = false;
+		ko_state->contexts[owned->slot].drop_executor_pid = 0;
+		ko_drop_work[owned->slot] = NULL;
+		finished = true;
+	}
+	SpinLockRelease(&ko_state->shared_lock);
+	if (!finished)
+		return false;
+	pfree(owned);
+	*work = NULL;
+	return true;
+}
+
+static bool
 ko_shared_import_current(const ClusterKoSharedContext *context)
 {
 	ClusterKoSharedMessageV2 current = context->request;
@@ -1684,6 +1849,13 @@ ko_shared_backend_exit(int code, Datum arg)
 	SpinLockRelease(&ko_state->shared_lock);
 	for (unsigned i = 0; i < count; i++)
 		cluster_sinval_ack_wait_remove(batches[i]);
+	for (unsigned i = 0; i < CLUSTER_KO_SHARED_CAPACITY; i++)
+		if (ko_drop_work[i] != NULL && ko_drop_work[i]->pid == MyProcPid) {
+			/* Do not clear the shared executor or effect state: any partial
+			 * physical operation belongs to the original recovery obligation. */
+			pfree(ko_drop_work[i]);
+			ko_drop_work[i] = NULL;
+		}
 	/* Exit owns all this process's ResourceOwners, not just its current one. */
 	while (ko_completions != NULL) {
 		ClusterKoCompletionV2 *completion = ko_completions;

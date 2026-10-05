@@ -298,6 +298,31 @@ extern bool cluster_ko_shared_native_handoff_v2(ClusterKoCompletionV2 **completi
  * INVALID/stale and PENDING/full retain all work. RELEASED means no pending
  * native continuation, not completion of active work, PI or recovery windows. */
 extern ClusterKoStructurePollV2 cluster_ko_shared_native_promote_v2(void);
+/* Original checkpointer only. One process-bound work item for an already
+ * committed, promoted DROP. The bounded cursor skips other active work.
+ * storage_bytes reserves the storage consumer's fixed fd/inode/stage carrier
+ * before its first I/O; retries must request the same size. Neither begin nor
+ * state creates a physical completion. Failed calls preserve all outputs. */
+typedef struct ClusterKoDropWorkV2 ClusterKoDropWorkV2;
+extern bool cluster_ko_shared_drop_work_begin_v2(uint32 *cursor, Size storage_bytes,
+												 ClusterKoDropWorkV2 **out);
+extern void *cluster_ko_shared_drop_work_state_v2(const ClusterKoDropWorkV2 *work,
+												  Size storage_bytes);
+extern bool cluster_ko_shared_drop_work_read_v2(const ClusterKoDropWorkV2 *work,
+												struct ClusterPageWalBindingV1 *terminal, void *wal,
+												Size wal_length);
+/* Revalidate immediately before each physical step. State survives a failed
+ * step and ordinary ResourceOwner cleanup; a different executor cannot adopt
+ * unknown partial I/O. Process loss remains the retained-WAL recovery owner's
+ * responsibility, never a reason to treat a missing path as completed. */
+extern bool cluster_ko_shared_drop_work_revalidate_v2(const ClusterKoDropWorkV2 *work);
+/* Only the original storage consumer's durable-success branch may call this:
+ * MAIN reservation, auxiliary removals and directory sync must be complete,
+ * exact identities checked, and successful physical resources closed. A
+ * failed call keeps that same result carrier for retry, without repeating
+ * pathname operations. Success consumes the work, admits the original
+ * structural PI consumer, and grants no MAIN/WAL reclamation authority. */
+extern bool cluster_ko_shared_drop_work_finish_v2(ClusterKoDropWorkV2 **work);
 /* End only this node's original background work, after its complete local
  * responsibility scan and, for an origin, all peer ownership handoffs.
  * Other accepted owners retain their own work. No global retirement or
