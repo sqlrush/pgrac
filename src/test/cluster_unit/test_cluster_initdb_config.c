@@ -16,12 +16,14 @@ enum Fault {
 	NONE,
 	WRITE_FAIL,
 	FILE_SYNC,
+	STAGING_SYNC,
 	DIRECTORY_SYNC,
 	ROOT_SYNC,
 	CORRUPT,
 	SHORT_READ,
 	EXTRA_BYTE,
 	REPLACED,
+	STAGING_REPLACED,
 	CLOSE_FAIL,
 	PARTIAL_IO,
 	OCCUPIED
@@ -65,11 +67,16 @@ test_pread(int fd, void *data, size_t size, off_t off)
 static int
 test_fsync(int fd)
 {
-	struct stat st;
+	struct stat st, staging_st;
+	bool is_staging;
 	syncs++;
 	UT_ASSERT(fstat(fd, &st) == 0);
+	is_staging = S_ISDIR(st.st_mode)
+		&& fstatat(parent, "config_images/.staging", &staging_st, AT_SYMLINK_NOFOLLOW) == 0
+		&& st.st_dev == staging_st.st_dev && st.st_ino == staging_st.st_ino;
 	if ((fault == FILE_SYNC && fd == target)
-		|| (fault == DIRECTORY_SYNC && S_ISDIR(st.st_mode) && fd != parent)
+		|| (fault == STAGING_SYNC && is_staging)
+		|| (fault == DIRECTORY_SYNC && S_ISDIR(st.st_mode) && fd != parent && !is_staging)
 		|| (fault == ROOT_SYNC && fd == parent)) {
 		errno = EIO;
 		return -1;
@@ -84,6 +91,11 @@ test_fsync(int fd)
 		UT_ASSERT(rename(path, old) == 0);
 		replacement = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
 		UT_ASSERT(replacement >= 0 && close(replacement) == 0);
+	}
+	if (fault == STAGING_REPLACED && is_staging) {
+		UT_ASSERT(renameat(parent, "config_images/.staging", parent,
+						   "config_images/old-staging") == 0);
+		UT_ASSERT(mkdirat(parent, "config_images/.staging", 0700) == 0);
 	}
 	return fsync(fd);
 }
@@ -188,7 +200,7 @@ run_case(enum Fault injection)
 		target = -1;
 		if (setjmp(refused) == 0) {
 			cluster_initdb_config_create(config, parent);
-			UT_ASSERT(success && writes > 0 && reads >= 3 && syncs == 3);
+			UT_ASSERT(success && writes > 0 && reads >= 3 && syncs == 4);
 		} else {
 			UT_ASSERT(!success && strstr(reason, "INITDB_CONFIG_CREATE:") != NULL);
 			if (injection == OCCUPIED)
@@ -205,6 +217,12 @@ run_case(enum Fault injection)
 	UT_ASSERT(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 	images = openat(parent, "config_images", O_RDONLY | O_DIRECTORY);
 	UT_ASSERT(images >= 0);
+	if (success) {
+		struct stat staging_st = { 0 };
+		UT_ASSERT(fstatat(images, ".staging", &staging_st, AT_SYMLINK_NOFOLLOW) == 0);
+		UT_ASSERT(S_ISDIR(staging_st.st_mode) && staging_st.st_uid == geteuid()
+				  && (staging_st.st_mode & 0022) == 0);
+	}
 	if (success || injection == OCCUPIED) {
 		char bytes[8204];
 		int fd = openat(images, object, O_RDONLY);
@@ -220,6 +238,8 @@ run_case(enum Fault injection)
 	}
 	unlinkat(images, object, 0);
 	unlinkat(images, "old", 0);
+	unlinkat(images, ".staging", AT_REMOVEDIR);
+	unlinkat(images, "old-staging", AT_REMOVEDIR);
 	UT_ASSERT(close(images) == 0 && unlinkat(parent, "config_images", AT_REMOVEDIR) == 0);
 	UT_ASSERT(close(parent) == 0 && rmdir(directory) == 0);
 }
@@ -243,6 +263,14 @@ UT_TEST(file_sync_failure_never_reaches_readback)
 UT_TEST(directory_sync_failure_refuses)
 {
 	run_case(DIRECTORY_SYNC);
+}
+UT_TEST(staging_sync_failure_refuses)
+{
+	run_case(STAGING_SYNC);
+}
+UT_TEST(replaced_staging_name_refuses)
+{
+	run_case(STAGING_REPLACED);
 }
 UT_TEST(parent_sync_failure_refuses)
 {
@@ -276,12 +304,14 @@ UT_TEST(existing_object_is_unchanged)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
 	UT_RUN(real_persistence_and_exact_readback);
 	UT_RUN(partial_io_and_eintr_preserve_all_bytes);
 	UT_RUN(write_failure_never_reaches_sync);
 	UT_RUN(file_sync_failure_never_reaches_readback);
 	UT_RUN(directory_sync_failure_refuses);
+	UT_RUN(staging_sync_failure_refuses);
+	UT_RUN(replaced_staging_name_refuses);
 	UT_RUN(parent_sync_failure_refuses);
 	UT_RUN(corrupt_readback_refuses);
 	UT_RUN(short_readback_refuses);

@@ -318,9 +318,9 @@ cluster_initdb_config_create(ClusterInitdbConfig *config, int global_fd)
 {
 	static const char hex[] = "0123456789abcdef";
 	char name[72], readback[8192], extra;
-	struct stat held, named, dir_st;
+	struct stat held, named, dir_st, staging_st;
 	Size used = 0;
-	int dir, fd;
+	int dir, staging, fd;
 	ssize_t n;
 	if (config == NULL)
 		return;
@@ -329,6 +329,15 @@ cluster_initdb_config_create(ClusterInitdbConfig *config, int global_fd)
 	dir = openat(global_fd, "config_images", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 	if (dir < 0 || fstat(dir, &dir_st) != 0 || !S_ISDIR(dir_st.st_mode))
 		config_refuse("cannot bind the new configuration directory");
+	/* The original creator also owns the future publisher's private workspace.
+	 * Readers and ALTER SYSTEM must never repair a missing namespace. Persist
+	 * this empty directory before the cohort owner can publish ROOT-last. */
+	if (mkdirat(dir, ".staging", pg_dir_create_mode) != 0)
+		config_refuse("cannot exclusively create the configuration staging directory");
+	staging = openat(dir, ".staging", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (staging < 0 || fstat(staging, &staging_st) != 0 || !S_ISDIR(staging_st.st_mode)
+		|| staging_st.st_uid != geteuid() || (staging_st.st_mode & 0022) != 0)
+		config_refuse("cannot bind the new configuration staging directory");
 	name[0] = '1';
 	name[1] = '-';
 	for (int i = 0; i < 32; i++) {
@@ -367,7 +376,11 @@ cluster_initdb_config_create(ClusterInitdbConfig *config, int global_fd)
 	if (n != 0 || fstatat(dir, name, &named, AT_SYMLINK_NOFOLLOW) != 0
 		|| named.st_dev != held.st_dev || named.st_ino != held.st_ino
 		|| named.st_mode != held.st_mode || named.st_nlink != 1 || named.st_size != held.st_size
-		|| close(fd) != 0 || fsync(dir) != 0
+		|| close(fd) != 0 || fsync(staging) != 0
+		|| fstatat(dir, ".staging", &named, AT_SYMLINK_NOFOLLOW) != 0
+		|| named.st_dev != staging_st.st_dev || named.st_ino != staging_st.st_ino
+		|| named.st_mode != staging_st.st_mode || named.st_uid != staging_st.st_uid
+		|| close(staging) != 0 || fsync(dir) != 0
 		|| fstatat(global_fd, "config_images", &named, AT_SYMLINK_NOFOLLOW) != 0
 		|| named.st_dev != dir_st.st_dev || named.st_ino != dir_st.st_ino || !S_ISDIR(named.st_mode)
 		|| close(dir) != 0 || fsync(global_fd) != 0)
