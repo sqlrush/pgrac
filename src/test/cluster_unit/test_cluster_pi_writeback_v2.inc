@@ -1687,6 +1687,37 @@ UT_TEST(writeback_v2_structure_scheduler_checks_local_work_without_wal_pins)
 	}
 }
 
+/* A local completion that cannot be finished now (INVALID: gate or context
+ * changed, or the scan could not run) is counted, and the relation's page
+ * batch still proceeds with its own exact proofs. */
+UT_TEST(writeback_v2_structure_scheduler_counts_invalid_completion_and_continues)
+{
+	for (unsigned state = CLUSTER_KO_STRUCTURE_INVALID; state <= CLUSTER_KO_STRUCTURE_PROGRESS;
+		 state++) {
+		ClusterPageDataReceiptV1 *receipt = wb_setup();
+		ClusterPiWritebackRejectionsV1 rejected;
+		wb_structure_schedule_setup(receipt, MAIN_FORKNUM);
+		wb_structure_finish_result = (ClusterKoStructurePollV2)state;
+		UT_ASSERT(cluster_pi_writeback_checkpointer_tick_v1());
+		UT_ASSERT_EQ(wb_structure_finish_calls, 1);
+		UT_ASSERT(wb_active != NULL && wb_active->version == 2);
+		if (wb_active != NULL && wb_active->version == 2)
+			UT_ASSERT_EQ(wb_active->requested_v2.facts[0].kind, CLUSTER_PI_WRITEBACK_STRUCTURAL_V2);
+		UT_ASSERT_EQ(wb_structure_local_acks, 1);
+		UT_ASSERT(!wb_inputs_pinned[0]);
+		UT_ASSERT(cluster_pi_writeback_rejections_v1(&rejected));
+		UT_ASSERT_EQ(rejected.attempts[CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER],
+					 state == CLUSTER_KO_STRUCTURE_INVALID);
+		if (ut_current_failed)
+			printf("# invalid completion state %u\n", state);
+		wb_select(0, B_CHECKPOINTER);
+		cluster_pi_writeback_checkpointer_release_v1();
+		cluster_page_data_receipt_free_v1(&receipt);
+		rf_page_online_plan_destroy_v1(&wb_page_plan);
+		clean();
+	}
+}
+
 UT_TEST(writeback_v2_structure_scheduler_collects_all_original_page_acks)
 {
 	for (unsigned vm = 0; vm < 3; vm++) {

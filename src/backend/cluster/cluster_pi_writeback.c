@@ -1899,12 +1899,14 @@ wb_batch_structure_start(const ClusterWalSourceRef *local)
 		wb_structure_progress = true;
 	if (ended == CLUSTER_KO_STRUCTURE_RELEASED)
 		return false;
+	/* PGRAC: an unfinished local completion (gate or context changed, or
+	 * the directory scan could not run) is counted; the relation's pages
+	 * still retire under their own exact proofs below. */
 	if (ended == CLUSTER_KO_STRUCTURE_INVALID) {
 		BufferTag tag;
 		InitBufferTag(&tag, &terminal.identity.locator, MAIN_FORKNUM, 0);
 		wb_rejected(CLUSTER_PI_WRITEBACK_STRUCTURE_OWNER, &tag, cluster_node_id,
 					cluster_epoch_get_current(), local->claim.identity.origin_owner_incarnation);
-		return false;
 	}
 	if (wb_structure_serials[slot] != serial) {
 		wb_structure_page_scan[slot] = 0;
