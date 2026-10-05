@@ -4387,6 +4387,7 @@ clean distclean maintainer-clean:
 		test_cluster_resource_x_source_final_gate.inc \
 		test_cluster_resource_x_source_entry_gate.inc \
 		test_cluster_resource_x_source_prepare_gate.inc \
+		test_cluster_resource_x_source_first_cleanup.inc \
 		test_cluster_resource_x_retained_wait_gate.inc \
 		test_cluster_resource_x_predecessor_wait_gate.inc \
 		test_cluster_resource_x_dispatch_observation.inc \
@@ -6068,6 +6069,13 @@ test_cluster_resource_x_source_entry_gate.inc: $(top_srcdir)/src/backend/cluster
 	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_resource_x_source_first_cleanup.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/failure_stage = "source-copy";/ { print "\tif (!semantic_retained) {"; emit=1; begin++ } \
+	     emit && /if \(result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE\) \{/ { emit=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_resource_x_source_prepare_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/failure_stage = "source-gate-recheck";/ { emit=1; begin++ } \
 	     emit && /memset\(&source_prepare_refusal, 0,/ { emit=0; end++ } \
@@ -6108,6 +6116,7 @@ test_cluster_resource_x_terminal_ingress: test_cluster_resource_x_terminal_ingre
 		test_cluster_resource_x_source_final_gate.inc \
 		test_cluster_resource_x_source_entry_gate.inc \
 		test_cluster_resource_x_source_prepare_gate.inc \
+		test_cluster_resource_x_source_first_cleanup.inc \
 		test_cluster_resource_x_retained_wait_gate.inc \
 		test_cluster_resource_x_predecessor_wait_gate.inc \
 		test_cluster_resource_x_dispatch_observation.inc \

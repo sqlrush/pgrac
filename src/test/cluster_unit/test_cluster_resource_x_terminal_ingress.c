@@ -9,6 +9,7 @@
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "miscadmin.h"
 #include "storage/proc.h"
@@ -1516,6 +1517,128 @@ UT_TEST(test_actual_peer_observation_gap_keeps_delivery_and_ingress_owned)
 	reset_delivery_fixture();
 }
 
+/* Actual copy/frame/PENDING glue; boundary doubles account for references,
+ * while test_cluster_pcm_lock exercises the real first-reference move. */
+static int first_error_step, first_private_refs, first_pending_refs, first_releases;
+
+static bool
+first_capture_fixture(ClusterPageWalRefV1 *first)
+{
+	first->source_flags = 1;
+	first_private_refs++;
+	return true;
+}
+
+static bool
+first_frame_fixture(void)
+{
+	if (first_error_step == 1)
+		pg_re_throw();
+	return first_error_step != 4;
+}
+
+static ResourceXApplyResult
+first_pair_fixture(ClusterPageWalRefV1 *first)
+{
+	if (first_error_step == 2)
+		pg_re_throw();
+	if (first_error_step == 5)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (first != NULL && first->source_flags != 0) {
+		first_private_refs--;
+		first_pending_refs++;
+		memset(first, 0, sizeof(*first));
+	}
+	if (first_error_step == 3)
+		pg_re_throw();
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
+static bool
+first_release_fixture(ClusterPageWalRefV1 *first)
+{
+	if (first->source_flags != 0) {
+		first_private_refs--;
+		first_releases++;
+		memset(first, 0, sizeof(*first));
+	}
+	return true;
+}
+
+static ResourceXApplyResult
+run_actual_source_first_cleanup(int route, bool semantic_retained)
+{
+	volatile ClusterPageWalRefV1 page_first = { 0 };
+	PGAlignedBlock aligned_page = { { 0 } };
+	uint64 page_scn pg_attribute_unused();
+	bool shared_s_source = route == 3;
+	bool finish_required = true;
+	bool tagless_target_x = route == 1 || route == 2;
+	bool target_x_drop = route == 1, target_x_retain = route == 2;
+	ResourceXApplyResult result, failure_result;
+	const char *failure_stage pg_attribute_unused();
+
+#define cluster_bufmgr_copy_block_for_gcs(tag, lsn, page, refusal, wal, first)                     \
+	first_capture_fixture((ClusterPageWalRefV1 *)(first))
+#define gcs_block_pcm_x_resource_x_build_source_frames(...) first_frame_fixture()
+#define cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(...) first_pair_fixture(NULL)
+#define cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(a, b, c, d, e, f, first)        \
+	first_pair_fixture((ClusterPageWalRefV1 *)(first))
+#define cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(a, b, c, d, e, f, first)    \
+	first_pair_fixture((ClusterPageWalRefV1 *)(first))
+#define cluster_pcm_lock_resource_x_block_to_n_source_exact(a, b, c, d, first)                     \
+	first_pair_fixture((ClusterPageWalRefV1 *)(first))
+#define cluster_page_wal_ref_release_v1(first) first_release_fixture((ClusterPageWalRefV1 *)(first))
+#include "test_cluster_resource_x_source_first_cleanup.inc"
+	return result;
+pre_retained_failure:
+	(void)cluster_page_wal_ref_release_v1(&page_first);
+	return failure_result;
+#undef cluster_bufmgr_copy_block_for_gcs
+#undef gcs_block_pcm_x_resource_x_build_source_frames
+#undef cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact
+#undef cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact
+#undef cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact
+#undef cluster_pcm_lock_resource_x_block_to_n_source_exact
+#undef cluster_page_wal_ref_release_v1
+}
+
+UT_TEST(test_actual_source_first_ref_is_released_across_errors)
+{
+	for (int route = 0; route < 4; route++) {
+		for (int step = 0; step < 6; step++) {
+			volatile bool caught = false;
+			ResourceXApplyResult result = RESOURCE_X_APPLY_INVALID;
+			bool moved = route != 3 && (step == 0 || step == 3);
+
+			first_error_step = step;
+			first_private_refs = first_pending_refs = first_releases = 0;
+			PG_TRY();
+			{
+				result = run_actual_source_first_cleanup(route, false);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			UT_ASSERT_EQ(caught, step >= 1 && step <= 3);
+			UT_ASSERT_EQ(first_private_refs, 0);
+			UT_ASSERT_EQ(first_pending_refs, moved ? 1 : 0);
+			UT_ASSERT_EQ(first_releases, route != 3 && !moved ? 1 : 0);
+			if (!caught)
+				UT_ASSERT_EQ(result, step == 0	 ? RESOURCE_X_APPLY_APPLIED
+									 : step == 4 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+												 : RESOURCE_X_APPLY_BAD_STATE);
+			if (ut_current_failed)
+				printf("# source first cleanup route=%d step=%d\n", route, step);
+		}
+	}
+	first_error_step = first_private_refs = first_pending_refs = first_releases = 0;
+	UT_ASSERT_EQ(run_actual_source_first_cleanup(0, true), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(first_private_refs + first_pending_refs + first_releases, 0);
+}
+
 static ResourceXApplyResult
 run_actual_source_final_gate(bool semantic_retained)
 {
@@ -2304,7 +2427,7 @@ UT_TEST(test_actual_failed_round_observation_retries_only_exact_predecessor_shap
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(26);
 	UT_RUN(test_actual_terminal_ingress_keeps_master_and_physical_source_distinct);
 	UT_RUN(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission);
 	UT_RUN(test_actual_fused_admission_notifies_ready_resource_without_registry_tick);
@@ -2316,6 +2439,7 @@ main(void)
 	UT_RUN(test_actual_terminal_gate_rejects_proved_identity_or_admission_change);
 	UT_RUN(test_actual_delivery_observation_gap_retains_owner_then_finishes);
 	UT_RUN(test_actual_image_ingress_yields_before_join_and_after_t3);
+	UT_RUN(test_actual_source_first_ref_is_released_across_errors);
 	UT_RUN(test_actual_source_gate_never_rolls_back_armed_pair_for_sample_gap);
 	UT_RUN(test_actual_source_before_mutation_waits_without_exporting_session);
 	UT_RUN(test_actual_foreground_retained_and_predecessor_wait_reobserve_without_fuse);
