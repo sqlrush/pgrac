@@ -16,6 +16,11 @@ extern const ClusterSharedConfigRef *cluster_initdb_config_reference(const Clust
 extern const char *cluster_initdb_config_path(const ClusterInitdbConfig *config, unsigned index);
 extern void cluster_initdb_config_free(ClusterInitdbConfig *config);
 
+/* Original native bootstrap/post-bootstrap only, before native control and
+ * shared-memory sizing. Consumes the bound request's eight native parameters;
+ * it does not enable the shared profile or create/publish any shared object. */
+extern void cluster_initdb_config_apply_native(const PgracInitdbWalContext *context);
+
 /* Only the original successful post-bootstrap shared-base creator calls
  * these. Prepare precedes every shared mutation; create takes that creator's
  * held new global directory. No CF bypass for runtime publication is exposed.

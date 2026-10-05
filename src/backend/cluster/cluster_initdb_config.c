@@ -11,6 +11,8 @@
 #include "common/cryptohash.h"
 #include "common/file_perm.h"
 #include "miscadmin.h"
+#include "utils/guc.h"
+#include "utils/resowner.h"
 
 StaticAssertDecl(PGRAC_INITDB_CONFIG_MAX_BYTES == CLUSTER_SHARED_CONFIG_MAX_BYTES,
 				 "creation uses the existing configuration size bound");
@@ -198,6 +200,81 @@ cluster_initdb_config_free(ClusterInitdbConfig *config)
 {
 	pfree(config->bytes);
 	pfree(config);
+}
+
+/* Author: SqlRush <sqlrush@gmail.com>
+ * Apply the original creation request before either native child sizes shared
+ * memory or creates/reads control. All origins use their own real native WAL;
+ * neither a reader nor a post-creation pg_control patch can supply this fact.
+ */
+static void
+config_apply_native(const PgracInitdbWalContext *context)
+{
+	static const char *const names[] = { "max_connections",
+										 "max_worker_processes",
+										 "max_wal_senders",
+										 "max_prepared_transactions",
+										 "max_locks_per_transaction",
+										 "wal_level",
+										 "wal_log_hints",
+										 "track_commit_timestamp" };
+	ClusterInitdbConfig *config;
+	char value[CLUSTER_SHARED_CONFIG_MAX_VALUE + 1];
+	unsigned node;
+
+	if (context == NULL || IsUnderPostmaster || context->system_identifier == 0
+		|| context->thread_id == 0 || context->thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
+		|| (context->phase != PGRAC_INITDB_WAL_BOOTSTRAP
+			&& context->phase != PGRAC_INITDB_WAL_POSTBOOTSTRAP))
+		config_refuse("native parameters require the original native child");
+	process_cluster_gucs();
+	config = cluster_initdb_config_preflight(&context->config);
+	node = context->thread_id - 1;
+	if (config->ref.identity.system_identifier != context->system_identifier
+		|| !(config->ref.identity.configured[node / 64] & (UINT64CONST(1) << (node % 64))))
+		config_refuse("native parameters belong to a different creation origin");
+	for (unsigned i = 0; i < lengthof(names); i++) {
+		ClusterControlRootResult result = cluster_shared_config_lookup(
+			config->bytes, config->len, &config->ref, CLUSTER_SHARED_CONFIG_COMMON, names[i], value,
+			sizeof(value));
+		if (result == CLUSTER_CONTROL_ROOT_ABSENT)
+			continue; /* The ordinary native default remains authoritative. */
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			config_refuse("native parameter could not be read from its bound request");
+		SetConfigOption(names[i], value, PGC_POSTMASTER, PGC_S_ARGV);
+	}
+	cluster_initdb_config_free(config);
+}
+
+void
+cluster_initdb_config_apply_native(const PgracInitdbWalContext *context)
+{
+	ResourceOwner saved = CurrentResourceOwner;
+	ResourceOwner owner = ResourceOwnerCreate(saved, "original native creation parameters");
+	bool top_level = saved == NULL;
+
+	/* Both native children run before InitPostgres. In particular OpenSSL
+	 * hashing must have an original owner even when no transaction exists. */
+	CurrentResourceOwner = owner;
+	PG_TRY();
+	{
+		config_apply_native(context);
+	}
+	PG_CATCH();
+	{
+		ResourceOwnerRelease(owner, RESOURCE_RELEASE_BEFORE_LOCKS, false, top_level);
+		ResourceOwnerRelease(owner, RESOURCE_RELEASE_LOCKS, false, top_level);
+		ResourceOwnerRelease(owner, RESOURCE_RELEASE_AFTER_LOCKS, false, top_level);
+		CurrentResourceOwner = saved;
+		ResourceOwnerDelete(owner);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	ResourceOwnerRelease(owner, RESOURCE_RELEASE_BEFORE_LOCKS, true, top_level);
+	ResourceOwnerRelease(owner, RESOURCE_RELEASE_LOCKS, true, top_level);
+	ResourceOwnerRelease(owner, RESOURCE_RELEASE_AFTER_LOCKS, true, top_level);
+	CurrentResourceOwner = saved;
+	ResourceOwnerDelete(owner);
 }
 
 ClusterInitdbConfig *
