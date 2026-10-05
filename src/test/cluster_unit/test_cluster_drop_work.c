@@ -141,6 +141,7 @@ enum WorkFault {
 	WORK_CUT_AFTER_UNLINK
 };
 static enum WorkFault work_fault;
+static bool work_unknown_on_failure;
 static unsigned truncates, main_syncs, dir_syncs, unlinks, closes, opens;
 static unsigned per_fork_unlinks[MAX_FORKNUM + 1];
 static char work_root[MAXPGPATH], work_parent[MAXPGPATH];
@@ -197,6 +198,8 @@ work_sync(int fd)
 	if (S_ISDIR(st.st_mode)) {
 		dir_syncs++;
 		if (work_fault == WORK_DIR_SYNC) {
+			if (work_unknown_on_failure)
+				capture_ok = false;
 			errno = EIO;
 			return -1;
 		}
@@ -205,6 +208,8 @@ work_sync(int fd)
 		UT_ASSERT_EQ(st.st_size, 0);
 		UT_ASSERT_EQ(unlinks, 0);
 		if (work_fault == WORK_MAIN_SYNC) {
+			if (work_unknown_on_failure)
+				capture_ok = false;
 			errno = EIO;
 			return -1;
 		}
@@ -257,6 +262,8 @@ work_close(int fd)
 	if (work_fault == WORK_FINISH && S_ISDIR(st.st_mode))
 		generation_race = true;
 	if (work_fault == WORK_CLOSE) {
+		if (work_unknown_on_failure)
+			capture_ok = false;
 		errno = EIO;
 		return -1;
 	}
@@ -369,6 +376,7 @@ work_setup_impl(const char *name, bool native, bool stale)
 	cluster_shared_data_dir = work_root;
 	prepare_files(&change);
 	work_fault = WORK_OK;
+	work_unknown_on_failure = false;
 	forgets = truncates = main_syncs = dir_syncs = unlinks = closes = opens = 0;
 	memset(per_fork_unlinks, 0, sizeof(per_fork_unlinks));
 	enableFsync = true;
@@ -516,6 +524,35 @@ UT_TEST(test_replaced_cut_cleanup_closes_each_original_fd_once)
 	UT_ASSERT_EQ(opens + truncates + main_syncs + dir_syncs + unlinks, io);
 	current_epoch--;
 	assert_recovery_required();
+}
+
+UT_TEST(test_known_failure_is_not_hidden_by_unavailable_formation)
+{
+	const enum WorkFault faults[] = {WORK_MAIN_SYNC, WORK_DIR_SYNC, WORK_CLOSE};
+	for (unsigned failure = 0; failure < lengthof(faults); failure++) {
+		char name[64];
+		unsigned io;
+		int baseline;
+		snprintf(name, sizeof(name), "failed_then_unknown_%u", failure);
+		if (!work_setup(name)) return;
+		baseline = descriptor_count();
+		work_fault = faults[failure];
+		work_unknown_on_failure = true;
+		UT_ASSERT(!poll_work());
+		UT_ASSERT(!capture_ok);
+		UT_ASSERT_EQ(external_fds, 0);
+		UT_ASSERT_EQ(descriptor_count(), baseline);
+		UT_ASSERT_EQ(closes, MAX_FORKNUM + 2);
+		assert_recovery_required();
+		io = opens + truncates + main_syncs + dir_syncs + unlinks + closes;
+		work_fault = WORK_OK;
+		for (unsigned tick = 0; tick <= CLUSTER_KO_SHARED_CAPACITY; tick++)
+			assert_work_not_selected();
+		capture_ok = true;
+		assert_work_not_selected();
+		UT_ASSERT_EQ(opens + truncates + main_syncs + dir_syncs + unlinks + closes, io);
+		assert_recovery_required();
+	}
 }
 
 /* Populate each slot through the original backend handoff and promotion. */
@@ -1149,9 +1186,10 @@ UT_TEST(test_work_executor_process_exit_does_not_redo_partial_io)
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(28);
 	UT_RUN(test_failed_sync_abandons_original_fds_and_requires_recovery);
 	UT_RUN(test_replaced_cut_cleanup_closes_each_original_fd_once);
+	UT_RUN(test_known_failure_is_not_hidden_by_unavailable_formation);
 	UT_RUN(test_full_replaced_work_table_returns_descriptor_credits);
 	UT_RUN(test_abandoned_work_scan_does_not_starve_healthy_work);
 	UT_RUN(test_unknown_cut_and_wrong_owner_cannot_dispose_retryable_fds);
