@@ -96,10 +96,13 @@ GetRelationPath(Oid db, Oid spc, RelFileNumber number, int backend, ForkNumber f
 
 static unsigned forgets;
 static unsigned external_fds;
+static unsigned external_fd_limit = 1024;
 static bool work_fds[1024];
 bool
 AcquireExternalFD(void)
 {
+	if (external_fds >= external_fd_limit)
+		return false;
 	external_fds++;
 	return true;
 }
@@ -348,6 +351,7 @@ work_setup_impl(const char *name, bool native, bool stale)
 	if (exit_callback != NULL)
 		exit_callback(0, (Datum)0);
 	external_fds = 0;
+	external_fd_limit = 1024;
 	if (native) {
 		prepare_postcommit(true);
 		binding = postcommit_binding;
@@ -435,6 +439,72 @@ UT_TEST(test_work_success_keeps_main_and_structure_obligation)
 	UT_ASSERT_EQ(truncates, 1);
 	UT_ASSERT_EQ(main_syncs, 1);
 	UT_ASSERT_EQ(dir_syncs, 1);
+}
+
+static void
+assert_recovery_required(void)
+{
+	const char *reason = NULL;
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(reason != NULL && strcmp(reason, "KO_SHARED_DROP_RECOVERY_REQUIRED") == 0);
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+	UT_ASSERT(storage.contexts[work_slot].structure_owned);
+	UT_ASSERT_EQ(storage.contexts[work_slot].drop_executor_pid, MyProcPid);
+}
+
+UT_TEST(test_failed_sync_abandons_original_fds_and_requires_recovery)
+{
+	for (unsigned directory = 0; directory < 2; directory++) {
+		int baseline;
+		uint32 cursor;
+		bool completed = true;
+		unsigned io;
+		if (!work_setup(directory ? "abandon_directory" : "abandon_main")) return;
+		baseline = descriptor_count();
+		work_fault = directory ? WORK_DIR_SYNC : WORK_MAIN_SYNC;
+		UT_ASSERT(!poll_work());
+		UT_ASSERT_EQ(external_fds, 0);
+		UT_ASSERT_EQ(descriptor_count(), baseline);
+		UT_ASSERT_EQ(closes, MAX_FORKNUM + 2);
+		assert_recovery_required();
+		io = opens + truncates + main_syncs + dir_syncs + unlinks + closes;
+		work_fault = WORK_OK;
+		for (unsigned tick = 0; tick < 3; tick++) {
+			cursor = work_slot;
+			UT_ASSERT(!cluster_smgr_drop_work_poll(&cursor, &completed));
+			UT_ASSERT_EQ(cursor, work_slot);
+			UT_ASSERT(completed);
+			UT_ASSERT_EQ(opens + truncates + main_syncs + dir_syncs + unlinks + closes, io);
+		}
+	}
+}
+
+UT_TEST(test_replaced_cut_cleanup_closes_each_original_fd_once)
+{
+	uint32 cursor;
+	bool completed = true;
+	unsigned io;
+	int baseline;
+	if (!work_setup("abandon_cut")) return;
+	baseline = descriptor_count();
+	work_fault = WORK_PARTIAL;
+	UT_ASSERT(!poll_work());
+	UT_ASSERT_EQ(external_fds, MAX_FORKNUM + 2);
+	current_epoch++;
+	io = opens + truncates + main_syncs + dir_syncs + unlinks;
+	for (unsigned tick = 0; tick <= CLUSTER_KO_SHARED_CAPACITY; tick++) {
+		cursor = work_slot;
+		UT_ASSERT(!cluster_smgr_drop_work_poll(&cursor, &completed));
+		UT_ASSERT(completed);
+	}
+	UT_ASSERT_EQ(external_fds, 0);
+	UT_ASSERT_EQ(descriptor_count(), baseline);
+	UT_ASSERT_EQ(closes, MAX_FORKNUM + 2);
+	UT_ASSERT_EQ(opens + truncates + main_syncs + dir_syncs + unlinks, io);
+	current_epoch--;
+	assert_recovery_required();
 }
 
 UT_TEST(test_native_commit_and_real_smgr_defer_io_to_original_work)
@@ -889,7 +959,9 @@ UT_TEST(test_work_executor_process_exit_does_not_redo_partial_io)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(24);
+	UT_RUN(test_failed_sync_abandons_original_fds_and_requires_recovery);
+	UT_RUN(test_replaced_cut_cleanup_closes_each_original_fd_once);
 	UT_RUN(test_native_commit_and_real_smgr_defer_io_to_original_work);
 	UT_RUN(test_native_checkpointer_poll_has_bounded_visible_failure_and_retry);
 	printf("# retained storage state: %zu bytes per original work\n",
