@@ -18,6 +18,9 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "cluster/cluster_tt_slot.h"
+#include "cluster/cluster_page_producer.h"
+#include "access/xloginsert.h"
+#include "miscadmin.h"
 #include "cluster/cluster_tt_local.h"
 #include "cluster/cluster_undo_record.h"
 #include "cluster/cluster_undo_record_api.h"
@@ -36,7 +39,11 @@ static ClusterUndoRecordPrepareReceipt *outer;
 static bool content_locked, route_enabled;
 static uint64 test_now_us;
 static int preparation_phases;
-static PGAlignedBlock current_page;
+static PGAlignedBlock current_page, hint_new_page;
+volatile uint32 CritSectionCount;
+static bool hint_identity_refused;
+static unsigned hint_wal_calls;
+static bool hint_cross_page;
 char *BufferBlocks = current_page.data;
 Block *LocalBufferBlockPointers;
 int cluster_undo_record_inline_max_bytes = 128;
@@ -61,6 +68,11 @@ errcode(int code)
 }
 int
 errmsg(const char *fmt, ...)
+{
+	return 0;
+}
+int
+errmsg_internal(const char *fmt, ...)
 {
 	return 0;
 }
@@ -532,10 +544,151 @@ UT_TEST(real_update_child_rebind_refusal_cannot_fall_back)
 	}
 }
 
+/* Only replica-identity work is injected here. The hint selection and
+ * final stamp below are extracted unchanged from the real heap_update. */
+static HeapTuple
+hint_extract_identity(Relation relation, HeapTuple tuple, bool key, bool *copied)
+{
+	if (hint_identity_refused)
+		elog(ERROR, "fixture replica identity authority refusal");
+	return NULL;
+}
+static void
+hint_select(bool versioned, bool cross_page)
+{
+	Page page = current_page.data;
+	Buffer buffer = 1, newbuf = cross_page ? 2 : 1;
+	bool cluster_page_versioned = versioned;
+	bool use_hot_update, summarized_update, old_key_copied = false;
+	bool id_has_external = false;
+	Relation relation = NULL;
+	HeapTupleData oldtup = { 0 };
+	HeapTuple old_key_tuple;
+	Bitmapset *modified_attrs = NULL, *hot_attrs = NULL, *sum_attrs = NULL, *id_attrs = NULL;
+#define bms_overlap(a, b) ((void)(a), (void)(b), false)
+#define ExtractReplicaIdentity hint_extract_identity
+#include "test_cluster_heap_update_hint_select.inc"
+#undef ExtractReplicaIdentity
+#undef bms_overlap
+	(void)use_hot_update;
+	(void)summarized_update;
+	(void)old_key_tuple;
+	(void)cluster_page_versioned;
+}
+static void
+hint_stamp(RfPageProducerBatchV1 *batch)
+{
+	RfPageProducerBatchV1 cluster_page_versions = *batch;
+	bool cluster_page_versioned = true, vm_locked = false, vm_locked_new = false;
+	Buffer buffer = 1, newbuf = hint_cross_page ? 2 : 1;
+	Buffer vmbuffer = InvalidBuffer, vmbuffer_new = InvalidBuffer;
+	Page page = current_page.data;
+	START_CRIT_SECTION();
+#include "test_cluster_heap_update_hint_stamp.inc"
+	UT_ASSERT(rf_page_producer_register_wal_v1(&cluster_page_versions));
+	END_CRIT_SECTION();
+	(void)page;
+	(void)buffer;
+	(void)newbuf;
+}
+SCN
+cluster_scn_advance(void)
+{
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	return 40;
+}
+void
+MarkBufferDirty(Buffer buffer)
+{
+	abort(); /* these two cases do not own a VM page */
+}
+void
+XLogRegisterPageVersionEdge(uint64 token, const RfPageVersionEdgeEntryV1 *entries, uint8 count)
+{
+	UT_ASSERT_EQ(CritSectionCount, 1);
+	UT_ASSERT_EQ(token, 40);
+	UT_ASSERT_EQ(count, hint_cross_page ? 2 : 1);
+	UT_ASSERT_EQ(entries[hint_cross_page ? 1 : 0].before.mutation_token, 20);
+	UT_ASSERT_EQ(((PageHeader)current_page.data)->pd_block_scn, 40);
+	UT_ASSERT_EQ(PageIsFull(current_page.data), hint_cross_page);
+	hint_wal_calls++;
+}
+static void
+hint_reset(void)
+{
+	PageHeader old, next;
+	memset(&current_page, 0, sizeof(current_page));
+	memset(&hint_new_page, 0, sizeof(hint_new_page));
+	old = (PageHeader)current_page.data;
+	next = (PageHeader)hint_new_page.data;
+	old->pd_pagesize_version = next->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	old->pd_lower = next->pd_lower = SizeOfPageHeaderData;
+	old->pd_upper = old->pd_special = next->pd_upper = next->pd_special = BLCKSZ;
+	old->pd_block_scn = 20;
+	next->pd_block_scn = 30;
+	hint_identity_refused = false;
+	hint_wal_calls = 0;
+	CritSectionCount = 0;
+}
+UT_TEST(shared_update_hint_waits_across_refusal_and_abandoned_pass)
+{
+	for (int refusal = 0; refusal < 2; refusal++) {
+		PGAlignedBlock before;
+		volatile bool caught = false;
+		hint_reset();
+		before = current_page;
+		hint_identity_refused = refusal != 0;
+		PG_TRY();
+		{
+			hint_select(true, true);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, refusal != 0);
+		/* Returning for another pass, or ERROR, cannot publish this hint. */
+		UT_ASSERT(memcmp(&before, &current_page, BLCKSZ) == 0);
+		UT_ASSERT_EQ(hint_wal_calls, 0);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+	}
+	/* Original nonshared PG keeps its early advisory hint behavior. */
+	hint_reset();
+	hint_select(false, true);
+	UT_ASSERT(PageIsFull(current_page.data));
+	UT_ASSERT_EQ(((PageHeader)current_page.data)->pd_block_scn, 20);
+}
+UT_TEST(shared_update_hint_and_version_publish_in_one_final_batch)
+{
+	for (unsigned cross = 0; cross < 2; cross++) {
+		RfPageProducerComponentV1 components[2] = { { 0 } };
+		RfPageProducerBatchV1 batch;
+		hint_reset();
+		hint_cross_page = cross;
+		hint_select(true, cross);
+		UT_ASSERT(!PageIsFull(current_page.data));
+		for (unsigned i = 0; i < (cross ? 2 : 1); i++) {
+			components[i].block_id = components[i].component_ordinal = i;
+			components[i].page_class = RF_PAGE_CLASS_ORDINARY;
+			components[i].before_kind = RF_PAGE_STATE_PRESENT;
+			components[i].segment_incarnation[0] = 4;
+			components[i].page = cross && i == 0 ? hint_new_page.data : current_page.data;
+		}
+		UT_ASSERT(rf_page_producer_prepare_v1(components, cross ? 2 : 1, &batch));
+		hint_stamp(&batch);
+		UT_ASSERT_EQ(hint_wal_calls, 1);
+		UT_ASSERT_EQ(PageIsFull(current_page.data), cross != 0);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(18);
+	UT_RUN(shared_update_hint_waits_across_refusal_and_abandoned_pass);
+	UT_RUN(shared_update_hint_and_version_publish_in_one_final_batch);
 	UT_RUN(resume_never_replaces_a_live_receipt_or_renews_without_a_handoff);
 	UT_RUN(real_update_child_rebind_refusal_cannot_fall_back);
 	UT_RUN(real_toast_return_uses_the_completed_handoff_boundary);

@@ -13294,8 +13294,12 @@ l_pgrac_reacquire:
 	}
 	else
 	{
-		/* Set a hint that the old page could use prune/defrag */
-		PageSetFull(page);
+		/* Shared pages publish this hint with the final UPDATE version,
+		 * after every authority check and retryable preparation. */
+#ifdef USE_PGRAC_CLUSTER
+		if (!cluster_page_versioned)
+#endif
+			PageSetFull(page);
 	}
 
 	/*
@@ -14476,6 +14480,8 @@ l_pgrac_reacquire:
 	{
 		if (!rf_page_producer_stamp_v1(&cluster_page_versions))
 			elog(PANIC, "heap update page version changed after receipt APPLY");
+		if (newbuf != buffer)
+			PageSetFull(page);
 		if (vm_locked)
 			MarkBufferDirty(vmbuffer);
 		if (vm_locked_new && (!vm_locked || vmbuffer_new != vmbuffer))

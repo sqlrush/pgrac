@@ -7161,8 +7161,27 @@ test_cluster_heap_update_child_retry.inc: $(top_srcdir)/src/backend/access/heap/
 	     emit { print } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_heap_update_temp_lock: test_cluster_heap_update_temp_lock.c unit_test.h test_cluster_heap_update_temp_lock.inc test_cluster_heap_update_temp_consumer.inc test_cluster_heap_lock_return_receipt.inc test_cluster_heap_update_successor_header.inc test_cluster_heap_update_toast_resume.inc test_cluster_heap_update_child_retry.inc
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+# Execute the actual UPDATE hint decision and its final page-version stamp.
+test_cluster_heap_update_hint_select.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { in_update=1 } \
+	     in_update && /^[[:space:]]use_hot_update = false;/ { emit=1; found++ } \
+	     emit { print } emit && /&old_key_copied\);/ { emit=0; done++ } \
+	     /^}/ { in_update=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_update_hint_stamp.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { in_update=1 } \
+	     in_update && /^\tif \(cluster_page_versioned\)$$/ { collect=1; chunk="" } \
+	     collect { chunk=chunk $$0 "\n" } \
+	     collect && /^\t}$$/ { collect=0; if (chunk ~ /heap update page version changed after receipt APPLY/) { printf "%s", chunk; found++ } } \
+	     /^}/ { in_update=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_update_temp_lock: test_cluster_heap_update_temp_lock.c unit_test.h test_cluster_heap_update_temp_lock.inc test_cluster_heap_update_temp_consumer.inc test_cluster_heap_lock_return_receipt.inc test_cluster_heap_update_successor_header.inc test_cluster_heap_update_toast_resume.inc test_cluster_heap_update_child_retry.inc \
+		test_cluster_heap_update_hint_select.inc test_cluster_heap_update_hint_stamp.inc \
+		test_cluster_space_producer_product.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_producer_product.o \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \
 		cluster_snapshot_test_stubs.h \
