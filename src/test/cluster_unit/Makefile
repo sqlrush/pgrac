@@ -60,7 +60,7 @@ TESTS = test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_dro
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
         test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
-        test_cluster_bufmgr_stop test_cluster_allocation_stop test_cluster_hw_cold test_cluster_hw_initdb test_cluster_shared_parameters test_cluster_shared_config_alter test_cluster_native_wal_stop test_cluster_checkpointer_stop test_cluster_postmaster_stop test_cluster_xnode_profile test_cluster_adg \
+        test_cluster_bufmgr_stop test_cluster_allocation_stop test_cluster_hw_cold test_cluster_hw_initdb test_cluster_shared_parameters test_cluster_shared_config_alter test_cluster_checkpoint_pi_tick test_cluster_native_wal_stop test_cluster_checkpointer_stop test_cluster_postmaster_stop test_cluster_xnode_profile test_cluster_adg \
         test_cluster_xnode_lever test_cluster_ges_handoff \
         test_cluster_reverse_key test_cluster_hw_lease test_cluster_pi_shadow \
         test_cluster_wait_events test_cluster_errcodes test_cluster_guc \
@@ -476,7 +476,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
 # PGRAC: real configuration object tests have their own link rule.
 # Author: SqlRush <sqlrush@gmail.com>
 SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_shared_parameters test_cluster_shared_config_alter,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_shared_parameters test_cluster_shared_config_alter test_cluster_checkpoint_pi_tick,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_driver,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_service_observe,$(SIMPLE_TESTS))
@@ -5880,6 +5880,31 @@ test_cluster_shared_config_alter.inc: $(top_srcdir)/src/backend/cluster/cluster_
 
 test_cluster_shared_config_alter: test_cluster_shared_config_alter.c test_cluster_shared_config_alter.inc \
 		unit_test.h cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+# PGRAC: the real CheckpointWriteDelay and its PI tick helper, from checkpointer.c.
+test_cluster_checkpoint_pi_tick.inc: $(top_srcdir)/src/backend/postmaster/checkpointer.c Makefile
+	@awk '/^#define WRITES_PER_ABSORB/ { print } \
+		/^#define CLUSTER_CHECKPOINT_PI_TICK_MS/ { print; tick_ms++ } \
+		/^ClusterCheckpointWritePiTick\(/ { print "static void"; emit=1; helper++ } \
+		/^CheckpointWriteDelay\(/ { print "void"; emit=1; delay++ } \
+		emit { print } emit && /^}/ { emit=0 } \
+		END { if (helper != 1 || delay != 1 || tick_ms != 1) exit 1 }' $< > $@
+
+# PGRAC: where CheckPointGuts releases the PI batch relative to the write and sync phases.
+test_cluster_checkpoint_pi_order.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	@awk '/^CheckPointGuts\(/ { fn=1 } \
+		fn && /^}/ { exit } \
+		function at(name) { if (!(name in line)) line[name] = NR } \
+		fn && /CheckPointBuffers\(flags\);/ { at("buffers") } \
+		fn && /cluster_pi_writeback_checkpointer_release_v1\(\);/ { at("release") } \
+		fn && /cluster_undo_buf_flush_all\(/ { at("undo") } \
+		fn && /ProcessSyncRequests\(\);/ { at("sync") } \
+		END { n = split("buffers release undo sync", k, " "); \
+			for (i = 1; i <= n; i++) printf "#define GUTS_LINE_%s %d\n", toupper(k[i]), line[k[i]] + 0 }' $< > $@
+
+test_cluster_checkpoint_pi_tick: test_cluster_checkpoint_pi_tick.c test_cluster_checkpoint_pi_tick.inc \
+		test_cluster_checkpoint_pi_order.inc unit_test.h cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_hw_init_tail.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile

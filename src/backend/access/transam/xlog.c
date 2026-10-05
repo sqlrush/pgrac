@@ -275,6 +275,7 @@
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_config_members.h"
+#include "cluster/cluster_pi_writeback.h" /* PGRAC: write-phase PI batch release */
 #include "../../cluster/cluster_control_root_private.h"
 #include "../../cluster/cluster_control_bootstrap_private.h"
 #endif
@@ -9830,6 +9831,15 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	CheckPointBuffers(flags);
 
 #ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: the shared PI writeback batch may run during the write phase
+	 * (CheckpointWriteDelay).  Release it here, before the sync phase and
+	 * this checkpoint's own ROOT/WAL operations.  Author: SqlRush
+	 * <sqlrush@gmail.com>
+	 */
+	if (MyBackendType == B_CHECKPOINTER)
+		cluster_pi_writeback_checkpointer_release_v1();
+
 	/*
 	 * PGRAC: spec-3.18 D2b — flush the undo buffer pool's write-back dirty
 	 * blocks (XLogFlush their protecting LSN, then write-through + fsync) so

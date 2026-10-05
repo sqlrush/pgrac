@@ -959,6 +959,41 @@ ImmediateCheckpointRequested(void)
 	return false;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: interval of the shared PI writeback batch during the write phase. */
+#define CLUSTER_CHECKPOINT_PI_TICK_MS 100
+
+/*
+ * ClusterCheckpointWritePiTick -- advance the shared PI writeback batch
+ *		while this checkpoint writes its buffers.
+ *
+ * A storage-sourced exclusive grant waits for the past images that the
+ * batch retires; between loop iterations of CheckpointerMain alone it would
+ * stall for the whole spread checkpoint.  CheckPointGuts releases the batch
+ * when the write phase ends, so it never spans the sync phase or the
+ * checkpoint's own ROOT/WAL operations.  Shutdown and end-of-recovery
+ * checkpoints keep their own cut.
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+ClusterCheckpointWritePiTick(int flags)
+{
+	static TimestampTz last_tick = 0;
+	TimestampTz now;
+
+	if (!cluster_enabled || !cluster_shared_config || ShutdownRequestPending
+		|| (flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY)) != 0)
+		return;
+	now = GetCurrentTimestamp();
+	if (last_tick != 0
+		&& !TimestampDifferenceExceeds(last_tick, now, CLUSTER_CHECKPOINT_PI_TICK_MS))
+		return;
+	last_tick = now;
+	(void) cluster_pi_writeback_checkpointer_tick_v1();
+}
+#endif
+
 /*
  * CheckpointWriteDelay -- control rate of checkpoint
  *
@@ -971,6 +1006,12 @@ ImmediateCheckpointRequested(void)
  *
  * 'progress' is an estimate of how much of the work has been done, as a
  * fraction between 0.0 meaning none, and 1.0 meaning all done.
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: with cluster.shared_config the shared PI writeback batch
+ * advances here too (ClusterCheckpointWritePiTick).
+ * Why: otherwise past images wait for the whole checkpoint to retire, and so
+ * does every storage-sourced exclusive grant behind them.
  */
 void
 CheckpointWriteDelay(int flags, double progress)
@@ -1027,6 +1068,11 @@ CheckpointWriteDelay(int flags, double progress)
 		AbsorbSyncRequests();
 		absorb_counter = WRITES_PER_ABSORB;
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: keep retiring past images during the write phase. */
+	ClusterCheckpointWritePiTick(flags);
+#endif
 
 	/* Check for barrier events. */
 	if (ProcSignalBarrierPending)
