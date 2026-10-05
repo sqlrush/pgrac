@@ -19859,9 +19859,13 @@ pcm_resource_x_block_to_n_source_exact_internal(
 	/* A self-master holder shares this GRD entry with the authority state.
 	 * Its BufferDesc revoke supplies the local nonwritable fence; preserve
 	 * master X until the retained BLOCKED_TO_N is authenticated and applied.
-	 * A remote-master holder owns only its local mirror and may retire it now. */
+	 * A remote-master holder owns only its local mirror and may retire it now.
+	 * Shared PI ownership remains in the retained pair and then local PI;
+	 * only the authenticated master records the departing holder's bitmap. */
 	if (authenticated_master_node != cluster_node_id && local_grd_source)
-		cluster_pcm_transition_apply(entry, PCM_TRANS_X_TO_N_DOWNGRADE, cluster_node_id);
+		cluster_pcm_transition_apply(
+			entry, cluster_shared_config ? PCM_TRANS_X_TO_N_RELEASE : PCM_TRANS_X_TO_N_DOWNGRADE,
+			cluster_node_id);
 	broadcast = true;
 	LWLockRelease(&entry->entry_lock.lock);
 	if (broadcast)

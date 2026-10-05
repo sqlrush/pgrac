@@ -21308,6 +21308,68 @@ r_a22_holder_pair_fixture(BufferTag tag, ClusterPageWalBindingV1 *binding,
 	first->record_end = binding->record_start;
 }
 
+UT_TEST(test_shared_remote_holder_mirror_keeps_only_original_pi_owners)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		BufferTag tag = make_tag(6540 + variant);
+		ClusterPageWalBindingV1 binding, first;
+		ClusterPcmLocalPiSnapshotV1 local;
+		ClusterPcmLocalPiFloorV1 floor;
+		ClusterPageWalRefV1 ref = { 0 };
+		ResourceXDecodedFrame block, image, status;
+		struct StopPcmEntryLayout *entry;
+		uint32 existing = variant == 1 ? 1u << 2 : 0;
+		const ClusterPageDataReceiptV1 *receipt = (const void *)&pi_receipt_fixture;
+
+		r_a22_holder_pair_fixture(tag, &binding, &first, &block, &status, &image);
+		entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+		UT_ASSERT_NOT_NULL(entry);
+		pg_atomic_write_u32(&entry->pi_holders_bitmap, existing);
+		if (variant == 2)
+			cluster_shared_config = false; /* Preserve the original nonshared transition. */
+		else
+			UT_ASSERT(cluster_page_wal_ref_retain_v1(&first, &ref));
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_to_n_source_exact(
+						 &block, 1, &status, &image, variant == 2 ? NULL : &ref),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(cluster_pcm_lock_query(tag), PCM_LOCK_MODE_N);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap),
+					 variant == 2 ? existing | 1u : existing);
+		if (variant == 2)
+			continue;
+		UT_ASSERT_EQ(ref.source_flags, 0);
+		UT_ASSERT(cluster_pcm_local_pi_floor_v1(&binding.source, &floor));
+		UT_ASSERT_EQ(floor.pending, 1);
+		UT_ASSERT_EQ(floor.floor, first.record_start);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_holder_pair_publish_exact(
+						 &block.common.logical_assertion, block.common.assertion_sequence, 1,
+						 block.common.master_session_incarnation),
+					 RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &local));
+		UT_ASSERT(cluster_page_wal_same_mutation_v1(&local.first, &first));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), existing);
+		pi_receipt_valid = true;
+		pi_storage_receipt_valid = false;
+		memset(&pi_receipt_cut, 0, sizeof(pi_receipt_cut));
+		pi_ack_cut = pi_receipt_cut;
+		pi_ack_available = 0;
+		pi_ack_imported = 0;
+		local_pi_covered = true;
+		UT_ASSERT(!cluster_pcm_local_pi_retire_v1(&local, receipt, NULL, NULL, 0, pi_acks[0]));
+		UT_ASSERT(cluster_pcm_local_pi_floor_v1(&binding.source, &floor));
+		UT_ASSERT_EQ(floor.floor, first.record_start);
+		pi_ack_available = 1;
+		UT_ASSERT(cluster_pcm_local_pi_retire_v1(&local, receipt, NULL, NULL, 0, pi_acks[0]));
+		UT_ASSERT(cluster_pcm_local_pi_snapshot_v1(tag, &local));
+		UT_ASSERT_EQ(local.first.record_start, 0);
+		UT_ASSERT_EQ(local.last.record_start, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pi_holders_bitmap), existing);
+		UT_ASSERT(cluster_pcm_local_pi_floor_v1(&binding.source, &floor));
+		UT_ASSERT_EQ(floor.bounded, 0);
+	}
+	local_pi_writer_ready = cluster_shared_config = false;
+}
+
 UT_TEST(test_r_a22_holder_pair_carries_first_record_to_local_pi)
 {
 	BufferTag tag = make_tag(956);
@@ -22800,7 +22862,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(346);
+	UT_PLAN(351);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
@@ -23117,6 +23179,7 @@ main(void)
 	UT_RUN(test_local_structural_retirement_preserves_concurrent_responsibility);
 	UT_RUN(test_local_pi_alone_prevents_directory_reclamation);
 	UT_RUN(test_local_pi_is_owned_before_source_pair_becomes_sendable);
+	UT_RUN(test_shared_remote_holder_mirror_keeps_only_original_pi_owners);
 	UT_RUN(test_r_a22_holder_pair_carries_first_record_to_local_pi);
 	UT_RUN(test_r_a22_unpublishable_first_record_stays_pending);
 	UT_RUN(test_r_a22_pending_first_record_survives_reconfiguration);
