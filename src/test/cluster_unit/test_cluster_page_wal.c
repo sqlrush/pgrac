@@ -17,6 +17,7 @@
 #include "cluster/cluster_page_anchor_cache.h"
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -61,6 +62,7 @@ ProcessingMode Mode = NormalProcessing;
 
 #include "test_cluster_pcm_checksum_owner.inc"
 #include "test_cluster_page_wal_image.inc"
+#include "test_cluster_page_data_scn.inc"
 
 /* Real pre-grant caller; ownership checks are controlled boundaries so all
  * of its early exits must release the actual source-pool preparation. */
@@ -849,7 +851,14 @@ bounded_claim_pool_and_t2_reservation_release(void)
 	cluster_page_wal_release_install_v1(&prepared); /* failed/duplicate T2 */
 	UT_ASSERT_EQ(capture_many(256, 501), CLUSTER_PAGE_WAL_CAPTURED);
 	UT_ASSERT(cluster_page_wal_forget_v1(257));
-	drop_first(256);
+	/* Its first insertion lacked a source. A later attributed insertion
+	 * cannot make it transferable; only ending the residency releases it. */
+	pg_atomic_fetch_or_u32(&many_descriptors[256].bufferdesc.state, BM_LOCKED);
+	UT_ASSERT_EQ(cluster_page_wal_first_observe_locked_v1(&many_descriptors[256].bufferdesc,
+														  &(ClusterPageWalRefV1){ 0 }),
+				 CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED);
+	cluster_page_wal_reset_reuse_locked(&many_descriptors[256].bufferdesc);
+	pg_atomic_fetch_and_u32(&many_descriptors[256].bufferdesc.state, ~BM_LOCKED);
 	UT_ASSERT(cluster_page_wal_prepare_install_v1(258, &carrier, many_pages[257].data, &prepared));
 	UT_ASSERT(cluster_page_wal_publish_install_v1(258, &prepared));
 	UT_ASSERT_EQ(prepared.source_slot, 0);
@@ -939,6 +948,98 @@ clear_written(const ClusterPageWalRefV1 *observed, uint64 written, uint32 extra_
 	cleared = cluster_page_wal_first_clear_written_locked_v1(&desc.bufferdesc, observed, written);
 	pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~(BM_LOCKED | extra_state));
 	return cleared;
+}
+
+/* A successful WAL insertion without source attribution still owes redo. */
+UT_TEST(first_unavailable_source_is_an_unattributed_obligation)
+{
+	for (unsigned vm = 0; vm < 2; vm++) {
+		ClusterPageWalRefV1 first;
+		reset();
+		desc.bufferdesc.tag.forkNum = vm ? VISIBILITYMAP_FORKNUM : MAIN_FORKNUM;
+		selected = false;
+		UT_ASSERT_EQ(
+			cluster_page_wal_capture_native_v1(1, &edge, 80, 0x120, 0x200, 0x9192, RM_HEAP_ID, 0),
+			CLUSTER_PAGE_WAL_UNATTRIBUTED);
+		UT_ASSERT(cluster_page_wal_forget_v1(1)); /* Original native refusal cleanup. */
+		UT_ASSERT_EQ(observe_first(&first), CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED);
+		UT_ASSERT_EQ(writer_floor().dirty, 1);
+		UT_ASSERT_EQ(writer_floor().unattributed, 1);
+		selected = true;
+		UT_ASSERT(capture_at(81, 0x220, 0x300));
+		UT_ASSERT_EQ(observe_first(&first), CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED);
+		UT_ASSERT_EQ(writer_floor().unattributed, 1); /* Later attribution cannot erase it. */
+	}
+}
+
+UT_TEST(first_full_pool_is_an_unattributed_obligation)
+{
+	ClusterPageWalRefV1 first;
+	BufferDesc *buf;
+	reset_many();
+	for (int i = 0; i < 256; i++)
+		UT_ASSERT_EQ(capture_many(i, i + 1), CLUSTER_PAGE_WAL_CAPTURED);
+	UT_ASSERT_EQ(capture_many(256, 500), CLUSTER_PAGE_WAL_UNATTRIBUTED);
+	buf = &many_descriptors[256].bufferdesc;
+	pg_atomic_fetch_or_u32(&buf->state, BM_LOCKED);
+	UT_ASSERT_EQ(cluster_page_wal_first_observe_locked_v1(buf, &first),
+				 CLUSTER_PAGE_WAL_FIRST_UNATTRIBUTED);
+	pg_atomic_fetch_and_u32(&buf->state, ~BM_LOCKED);
+	UT_ASSERT_EQ(writer_floor().dirty, 257);
+	UT_ASSERT_EQ(writer_floor().unattributed, 1);
+	UT_ASSERT(cluster_page_wal_forget_v1(1));
+	drop_first(0);
+	UT_ASSERT_EQ(capture_many(256, 501), CLUSTER_PAGE_WAL_CAPTURED);
+	UT_ASSERT_EQ(writer_floor().unattributed, 1);
+}
+
+UT_TEST(later_capture_failure_keeps_the_earlier_first_record)
+{
+	for (unsigned full = 0; full < 2; full++) {
+		ClusterPageWalRefV1 before, after;
+		ClusterPageWalDirtyFloorV1 floor;
+		ClusterWalSourceRef original;
+		BufferDesc *buf;
+		reset_many();
+		UT_ASSERT_EQ(capture_many(0, 1), CLUSTER_PAGE_WAL_CAPTURED);
+		original = writer;
+		buf = &many_descriptors[0].bufferdesc;
+		pg_atomic_fetch_or_u32(&buf->state, BM_LOCKED);
+		UT_ASSERT_EQ(cluster_page_wal_first_observe_locked_v1(buf, &before),
+					 CLUSTER_PAGE_WAL_FIRST_PRESENT);
+		pg_atomic_fetch_and_u32(&buf->state, ~BM_LOCKED);
+		if (full)
+			for (int i = 1; i < 256; i++)
+				UT_ASSERT_EQ(capture_many(i, i + 1), CLUSTER_PAGE_WAL_CAPTURED);
+		else
+			selected = false;
+		writer.claim.identity.origin_owner_incarnation = 999;
+		UT_ASSERT_EQ(
+			cluster_page_wal_capture_native_v1(1, &edge, 80, 0x220, 0x300, 0x9192, RM_HEAP_ID, 0),
+			CLUSTER_PAGE_WAL_UNATTRIBUTED);
+		UT_ASSERT(cluster_page_wal_forget_v1(1));
+		pg_atomic_fetch_or_u32(&buf->state, BM_LOCKED);
+		UT_ASSERT_EQ(cluster_page_wal_first_observe_locked_v1(buf, &after),
+					 CLUSTER_PAGE_WAL_FIRST_PRESENT);
+		pg_atomic_fetch_and_u32(&buf->state, ~BM_LOCKED);
+		UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+		UT_ASSERT(cluster_page_wal_dirty_floor_v1(&original, &floor));
+		UT_ASSERT_EQ(floor.floor, 0x120);
+	}
+}
+
+UT_TEST(first_record_write_coverage_uses_scn_total_order)
+{
+	for (unsigned newer = 0; newer < 2; newer++) {
+		ClusterPageWalRefV1 first;
+		SCN original = scn_encode(newer ? 1 : 0, 100);
+		SCN written = scn_encode(newer ? 0 : 1, newer ? 101 : 99);
+		reset();
+		UT_ASSERT(capture_at(original, 0x120, 0x200));
+		UT_ASSERT_EQ(observe_first(&first), CLUSTER_PAGE_WAL_FIRST_PRESENT);
+		UT_ASSERT_EQ(clear_written(&first, written, 0), newer != 0);
+		UT_ASSERT_EQ(writer_floor().dirty, newer ? 0 : 1);
+	}
 }
 
 /* r1 then r2 without a write: the first record (and the floor) stays r1. */
@@ -1411,12 +1512,14 @@ UT_TEST(space_capture_unavailable_source_is_not_mutation_failure)
 		CLUSTER_PAGE_WAL_UNATTRIBUTED);
 	UT_ASSERT(cluster_page_wal_forget_v1(1));
 	UT_ASSERT(!cluster_page_wal_snapshot_v1(1, &value));
+	UT_ASSERT_EQ(writer_floor().dirty, 1);
+	UT_ASSERT_EQ(writer_floor().unattributed, 1);
 }
 
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(38);
 	UT_RUN(space_native_record_and_both_component_sources);
 	UT_RUN(space_advance_is_only_block_one_of_live_identity);
 	UT_RUN(native_last_record_expires_on_construction_reset_and_other_insert);
@@ -1449,6 +1552,10 @@ main(void)
 	UT_RUN(first_record_survives_forget_and_install_not_reuse);
 	UT_RUN(first_record_retain_and_handover);
 	UT_RUN(first_record_of_another_writer_is_foreign);
+	UT_RUN(first_unavailable_source_is_an_unattributed_obligation);
+	UT_RUN(first_full_pool_is_an_unattributed_obligation);
+	UT_RUN(later_capture_failure_keeps_the_earlier_first_record);
+	UT_RUN(first_record_write_coverage_uses_scn_total_order);
 	UT_RUN(pi_snapshot_requires_frozen_header_owner);
 	UT_RUN(eviction_snapshot_requires_exact_clean_revoke);
 	UT_RUN(detached_reference_survives_descriptor_reuse);

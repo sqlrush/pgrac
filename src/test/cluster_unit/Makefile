@@ -2194,7 +2194,7 @@ test_cluster_page_wal_pregrant.inc: $(top_srcdir)/src/backend/cluster/cluster_gc
 	     emit { print } emit && /^}/ { emit=0 } END { if (n != 1) exit 1 }' $< > $@
 
 test_cluster_page_wal: test_cluster_page_wal.c unit_test.h test_cluster_page_wal_insert.inc \
-		test_cluster_page_wal_pregrant.inc \
+		test_cluster_page_wal_pregrant.inc test_cluster_page_data_scn.inc \
 		test_cluster_page_wal_image.inc test_cluster_pcm_checksum_owner.inc \
 		$(top_builddir)/src/backend/storage/lmgr/s_lock.o \
 		test_cluster_page_wal_product.o test_cluster_page_data_stable.o \

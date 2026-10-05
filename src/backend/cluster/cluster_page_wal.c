@@ -5,6 +5,7 @@
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -543,8 +544,13 @@ page_wal_capture_native(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
 	if (!rf_page_version_present_v1(&value.version) || PageIsNew(page)
 		|| ((PageHeader)page)->pd_block_scn != result_token)
 		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
-	if (!cluster_wal_thread_current_v2_ref(&value.source))
+	value.record_start = start;
+	if (!cluster_wal_thread_current_v2_ref(&value.source)) {
+		/* The record exists even when its source cannot be attributed.
+		 * Keep that first obligation across native binding cleanup. */
+		page_wal_first_capture(buffer - 1, &value, 0);
 		return CLUSTER_PAGE_WAL_UNATTRIBUTED;
+	}
 	if (value.source.claim.database_incarnation == 0 || value.source.timeline == 0
 		|| value.source.claim.identity.origin_thread_id == 0
 		|| value.source.claim.identity.origin_thread_id > PGRAC_PAGE_LSN_ORIGIN_MAX + 1)
@@ -568,7 +574,6 @@ page_wal_capture_native(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
 	value.identity.blockno = buf->tag.blockNum;
 	if (!rf_page_identity_valid_v1(&value.identity))
 		return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
-	value.record_start = start;
 	value.record_end = end;
 	value.record_crc = crc;
 	value.rmid = rmid;
@@ -583,8 +588,10 @@ page_wal_capture_native(Buffer buffer, const RfPageVersionEdgeEntryV1 *edge,
 		source = old_source; /* ordinary same-writer hot path needs no pool lock */
 	else {
 		source = page_wal_source_acquire(&value.source);
-		if (source == 0)
+		if (source == 0) {
+			page_wal_first_capture(buffer - 1, &value, 0);
 			return CLUSTER_PAGE_WAL_UNATTRIBUTED;
+		}
 		if (!page_wal_source_release(old_source)) {
 			(void)page_wal_source_release(source);
 			return CLUSTER_PAGE_WAL_INVARIANT_BROKEN;
@@ -775,7 +782,8 @@ cluster_page_wal_first_clear_written_locked_v1(BufferDesc *buf, const ClusterPag
 	 * record keeps it; a conservative keep only delays the floor. */
 	if ((state & (BM_VALID | BM_TAG_VALID)) != (BM_VALID | BM_TAG_VALID)
 		|| (state & (BM_DIRTY | BM_JUST_DIRTIED | BM_IO_IN_PROGRESS | BM_IO_ERROR)) != 0
-		|| observed->source_flags == 0 || written_token < observed->token)
+		|| observed->source_flags == 0 || !SCN_VALID(written_token)
+		|| scn_total_cmp(written_token, observed->token) < 0)
 		return false;
 	pg_atomic_write_u64(&first_lsns[buf->buf_id], 0);
 	pg_write_barrier();
