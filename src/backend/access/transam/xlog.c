@@ -140,6 +140,21 @@
  *	  The ROOT lower otherwise keeps every retained segment of the thread
  *	  forever; cleanup can only use a lower that the complete retained
  *	  input proves and that is already published.
+ *
+ * PGRAC MODIFICATIONS (shared native parameters)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ *	What changed:
+ *	  - XLogReportParameters(): with cluster.shared_config, a parameter that
+ *	    differs from the value the shared control file recorded at creation
+ *	    is refused with FATAL naming each change, instead of reaching the
+ *	    UpdateControlFile PANIC.
+ *
+ *	Why:
+ *	  The shared configuration delivers these as restart-pending changes,
+ *	  but no typed purpose can update the shared control file after
+ *	  creation.
  */
 
 #include "postgres.h"
@@ -10464,9 +10479,82 @@ XLogRestorePoint(const char *rpName)
 	return RecPtr;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Append "name=current (created with recorded)" for one changed parameter. */
+static void
+ClusterRecordedParameterChange(StringInfo buf, const char *name, const char *current,
+							   const char *recorded)
+{
+	if (strcmp(current, recorded) == 0)
+		return;
+	appendStringInfo(buf, "%s%s=%s (created with %s)", buf->len > 0 ? ", " : "", name,
+					 current, recorded);
+}
+
+/* Defined with the WAL record descriptions (xlogdesc.c), as guc_tables.c uses it. */
+extern const struct config_enum_entry wal_level_options[];
+
+static const char *
+ClusterWalLevelName(int level)
+{
+	for (const struct config_enum_entry *e = wal_level_options; e->name != NULL; e++)
+		if (e->val == level)
+			return e->name;
+	return "unknown";
+}
+
+/*
+ * PGRAC (shared native parameters): the shared control file records these
+ * parameters when the cluster is created, and no typed purpose can update
+ * them afterwards.  A shared configuration change that reached this start is
+ * refused here, before any WAL is written and outside critical sections,
+ * instead of in the UpdateControlFile PANIC.
+ */
+static void
+ClusterRefuseRecordedParameterChange(void)
+{
+	StringInfoData changed;
+
+	initStringInfo(&changed);
+	ClusterRecordedParameterChange(&changed, "wal_level", ClusterWalLevelName(wal_level),
+								   ClusterWalLevelName(ControlFile->wal_level));
+	ClusterRecordedParameterChange(&changed, "wal_log_hints", wal_log_hints ? "on" : "off",
+								   ControlFile->wal_log_hints ? "on" : "off");
+	ClusterRecordedParameterChange(&changed, "max_connections", psprintf("%d", MaxConnections),
+								   psprintf("%d", ControlFile->MaxConnections));
+	ClusterRecordedParameterChange(&changed, "max_worker_processes",
+								   psprintf("%d", max_worker_processes),
+								   psprintf("%d", ControlFile->max_worker_processes));
+	ClusterRecordedParameterChange(&changed, "max_wal_senders", psprintf("%d", max_wal_senders),
+								   psprintf("%d", ControlFile->max_wal_senders));
+	ClusterRecordedParameterChange(&changed, "max_prepared_transactions",
+								   psprintf("%d", max_prepared_xacts),
+								   psprintf("%d", ControlFile->max_prepared_xacts));
+	ClusterRecordedParameterChange(&changed, "max_locks_per_transaction",
+								   psprintf("%d", max_locks_per_xact),
+								   psprintf("%d", ControlFile->max_locks_per_xact));
+	ClusterRecordedParameterChange(&changed, "track_commit_timestamp",
+								   track_commit_timestamp ? "on" : "off",
+								   ControlFile->track_commit_timestamp ? "on" : "off");
+	ereport(FATAL,
+			(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+			 errmsg("shared cluster parameters recorded at creation cannot be changed"),
+			 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=NATIVE_PARAMETER_CHANGE %s.",
+					   changed.data),
+			 errhint("Restore the creation values listed above, with ALTER SYSTEM on a running "
+					 "instance or in the shared configuration, then start this instance again.")));
+}
+#endif
+
 /*
  * Check if any of the GUC parameters that are critical for hot standby
  * have changed, and update the value in pg_control file if necessary.
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: with cluster.shared_config a changed value is refused with
+ * FATAL before the parameter-change record.
+ * Why: the shared control file cannot record the change (see
+ * ClusterRefuseRecordedParameterChange).
  */
 static void
 XLogReportParameters(void)
@@ -10480,6 +10568,11 @@ XLogReportParameters(void)
 		max_locks_per_xact != ControlFile->max_locks_per_xact ||
 		track_commit_timestamp != ControlFile->track_commit_timestamp)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_shared_config)
+			ClusterRefuseRecordedParameterChange();
+#endif
+
 		/*
 		 * The change in number of backend slots doesn't need to be WAL-logged
 		 * if archiving is not enabled, as you can't start archive recovery

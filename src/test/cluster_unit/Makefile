@@ -60,7 +60,7 @@ TESTS = test_cluster_drop_work test_cluster_smgr_drop test_cluster_shared_fs_dro
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
         test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_catalog_inval test_cluster_storage_quorum test_cluster_storage_corosync test_cluster_storage_sql_route test_cluster_storage_backend test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
-        test_cluster_bufmgr_stop test_cluster_allocation_stop test_cluster_hw_cold test_cluster_hw_initdb test_cluster_native_wal_stop test_cluster_checkpointer_stop test_cluster_postmaster_stop test_cluster_xnode_profile test_cluster_adg \
+        test_cluster_bufmgr_stop test_cluster_allocation_stop test_cluster_hw_cold test_cluster_hw_initdb test_cluster_shared_parameters test_cluster_native_wal_stop test_cluster_checkpointer_stop test_cluster_postmaster_stop test_cluster_xnode_profile test_cluster_adg \
         test_cluster_xnode_lever test_cluster_ges_handoff \
         test_cluster_reverse_key test_cluster_hw_lease test_cluster_pi_shadow \
         test_cluster_wait_events test_cluster_errcodes test_cluster_guc \
@@ -476,6 +476,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
 # PGRAC: real configuration object tests have their own link rule.
 # Author: SqlRush <sqlrush@gmail.com>
 SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_shared_parameters,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_driver,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_service_observe,$(SIMPLE_TESTS))
@@ -5843,6 +5844,17 @@ test_cluster_hw_initdb: test_cluster_hw_initdb.c test_cluster_hw_initdb_sync_tai
 		$(top_srcdir)/src/backend/access/transam/xlogreader.c \
 		$(LDFLAGS) $(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+# PGRAC: the real XLogReportParameters and its shared-mode refusal, from xlog.c.
+test_cluster_shared_parameters.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	@awk 'prev ~ /^#ifdef USE_PGRAC_CLUSTER$$/ && /^\/\* Append "name=current/ { print prev; copy=1 } \
+		copy { print; n++ } copy && /^XLogReportParameters\(void\)/ { xrp=1 } \
+		xrp && /^}/ { done=1; exit } { prev=$$0 } \
+		END { if (!done || n < 40) exit 1 }' $< > $@
+
+test_cluster_shared_parameters: test_cluster_shared_parameters.c test_cluster_shared_parameters.inc unit_test.h \
+		cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_hw_init_tail.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
 	@awk '/^InitWalRecovery\(/ { fn=1 } \
