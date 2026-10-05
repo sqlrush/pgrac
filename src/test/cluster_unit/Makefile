@@ -5881,7 +5881,7 @@ test_cluster_ko_writeback_codec.o: $(top_srcdir)/src/backend/cluster/cluster_pi_
 		$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
+test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_abandon.h test_cluster_ko_postcommit.inc test_cluster_ko_checkpointer.inc unit_test.h $(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) \
 		test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/include/cluster/cluster_ko.h
@@ -5892,7 +5892,7 @@ test_cluster_ko_stop: test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # Actual original KO owner and storage consumer; syscall faults use real files.
-test_cluster_drop_work: test_cluster_drop_work.c test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test_cluster_ko_checkpointer.inc unit_test.h \
+test_cluster_drop_work: test_cluster_drop_work.c test_cluster_ko_abandon.h test_cluster_ko_stop.c test_cluster_ko_postcommit.inc test_cluster_ko_checkpointer.inc unit_test.h \
 		$(CLUSTER_HW_LEASE_O) $(CLUSTER_KO_O) test_cluster_ko_writeback_codec.o $(CLUSTER_WAL_CLAIM_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ko_lock.c \
 		$(top_srcdir)/src/backend/cluster/storage/cluster_smgr.c \

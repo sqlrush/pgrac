@@ -211,6 +211,7 @@ struct ClusterKoDropWorkV2 {
 	int32 pid;
 	uint32 slot;
 	Size storage_bytes;
+	bool abandoned;
 	ClusterKoSharedContext context;
 };
 static ClusterKoDropWorkV2 *ko_drop_work[CLUSTER_KO_SHARED_CAPACITY];
@@ -1387,6 +1388,22 @@ ko_drop_actor_current(void)
 		   && CritSectionCount == 0;
 }
 
+static bool
+ko_drop_work_owned(const ClusterKoDropWorkV2 *work)
+{
+	uint32 slot;
+
+	if (work == NULL || MyBackendType != B_CHECKPOINTER || MyProcPid <= 0
+		|| CurrentResourceOwner == NULL || CritSectionCount != 0)
+		return false;
+	/* Authenticate pointer membership before dereferencing caller memory. */
+	for (slot = 0; slot < CLUSTER_KO_SHARED_CAPACITY; slot++)
+		if (ko_drop_work[slot] == work)
+			break;
+	return slot < CLUSTER_KO_SHARED_CAPACITY && work->slot == slot && work->pid == MyProcPid
+		   && work->owner == CurrentResourceOwner;
+}
+
 bool
 cluster_ko_shared_drop_work_revalidate_v2(const ClusterKoDropWorkV2 *work)
 {
@@ -1394,15 +1411,9 @@ cluster_ko_shared_drop_work_revalidate_v2(const ClusterKoDropWorkV2 *work)
 	bool exact;
 	uint32 slot;
 
-	if (work == NULL || !ko_drop_actor_current())
+	if (!ko_drop_actor_current() || !ko_drop_work_owned(work) || work->abandoned)
 		return false;
-	/* Authenticate pointer membership before dereferencing caller memory. */
-	for (slot = 0; slot < CLUSTER_KO_SHARED_CAPACITY; slot++)
-		if (ko_drop_work[slot] == work)
-			break;
-	if (slot == CLUSTER_KO_SHARED_CAPACITY || work->slot != slot || work->pid != MyProcPid
-		|| work->owner != CurrentResourceOwner)
-		return false;
+	slot = work->slot;
 	SpinLockAcquire(&ko_state->shared_lock);
 	current = ko_state->contexts[slot];
 	SpinLockRelease(&ko_state->shared_lock);
@@ -1414,6 +1425,55 @@ cluster_ko_shared_drop_work_revalidate_v2(const ClusterKoDropWorkV2 *work)
 	exact = memcmp(&current, &ko_state->contexts[slot], sizeof(current)) == 0;
 	SpinLockRelease(&ko_state->shared_lock);
 	return exact;
+}
+
+void *
+cluster_ko_shared_drop_work_abandon_v2(ClusterKoDropWorkV2 *work, Size storage_bytes)
+{
+	if (!ko_drop_work_owned(work) || work->storage_bytes != storage_bytes)
+		return NULL;
+	/* Local resource cleanup only. Keep the shared obligation and original
+	 * executor stamp; neither a restored cut nor another process may resume. */
+	work->abandoned = true;
+	return (char *)work + MAXALIGN(sizeof(*work));
+}
+
+bool
+cluster_ko_shared_drop_work_abandon_next_v2(uint32 *cursor, Size storage_bytes,
+											ClusterKoDropWorkV2 **out)
+{
+	if (cursor == NULL || *cursor >= CLUSTER_KO_SHARED_CAPACITY || out == NULL || *out != NULL
+		|| storage_bytes == 0)
+		return false;
+	for (uint32 slot = *cursor; slot < CLUSTER_KO_SHARED_CAPACITY; slot++) {
+		ClusterKoDropWorkV2 *work = ko_drop_work[slot];
+		ClusterKoSharedContext current;
+		uint64 epoch, boot;
+
+		if (!ko_drop_work_owned(work) || work->storage_bytes != storage_bytes)
+			continue;
+		if (!work->abandoned) {
+			if (ko_state == NULL)
+				continue;
+			SpinLockAcquire(&ko_state->shared_lock);
+			current = ko_state->contexts[slot];
+			SpinLockRelease(&ko_state->shared_lock);
+			epoch = cluster_epoch_get_current();
+			boot = cluster_qvotec_get_self_incarnation();
+			/* Require a positive replacement, not a transient admission or
+			 * unavailable-witness result from the normal revalidation. */
+			if (memcmp(&current, &work->context, sizeof(current)) == 0
+				&& (epoch == 0 || epoch == work->context.request.epoch)
+				&& (boot == 0 || boot == work->context.request.origin_boot))
+				continue;
+		}
+		if (cluster_ko_shared_drop_work_abandon_v2(work, storage_bytes) == NULL)
+			continue;
+		*out = work;
+		*cursor = slot + 1;
+		return true;
+	}
+	return false;
 }
 
 bool

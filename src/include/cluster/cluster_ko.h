@@ -326,6 +326,18 @@ extern bool cluster_ko_shared_drop_work_read_v2(const ClusterKoDropWorkV2 *work,
  * unknown partial I/O. Process loss remains the retained-WAL recovery owner's
  * responsibility, never a reason to treat a missing path as completed. */
 extern bool cluster_ko_shared_drop_work_revalidate_v2(const ClusterKoDropWorkV2 *work);
+/* Irreversible cleanup-only access for the original PID/ResourceOwner, even
+ * after its cut is lost. The caller may close only the already retained raw
+ * resources; no pathname operation, sync or physical-success publication.
+ * The local state and shared pending/executor remain retained for recovery.
+ * An abandoned work can never read, revalidate or finish again. */
+extern void *cluster_ko_shared_drop_work_abandon_v2(ClusterKoDropWorkV2 *work, Size storage_bytes);
+/* One original work whose context/epoch/boot was positively replaced, or
+ * which is already abandoned. Transient admission failure does not qualify.
+ * Success abandons the work and advances the bounded cursor. Refusal leaves
+ * outputs unchanged; use abandon_v2 to access its cleanup-only carrier. */
+extern bool cluster_ko_shared_drop_work_abandon_next_v2(uint32 *cursor, Size storage_bytes,
+														ClusterKoDropWorkV2 **out);
 /* Only the original storage consumer's durable-success branch may call this:
  * MAIN reservation, auxiliary removals and directory sync must be complete,
  * exact identities checked, and successful physical resources closed. A
