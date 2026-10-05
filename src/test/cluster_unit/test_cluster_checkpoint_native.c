@@ -1282,6 +1282,18 @@ cluster_control_bootstrap_native_inputs_require(const char *pgdata pg_attribute_
 	if (!input_qualified)
 		siglongjmp(error_boundary, 1);
 }
+/* PGRAC: the recorded-parameter check runs after the input check and
+ * before any other startup control step; refused, nothing else runs. */
+static unsigned parameter_checks;
+static bool parameters_changed;
+static void
+ClusterRequireRecordedParameters(void)
+{
+	UT_ASSERT_EQ(parameter_checks + 1, input_checks);
+	parameter_checks++;
+	if (parameters_changed)
+		siglongjmp(error_boundary, 1);
+}
 static void
 cluster_cf_phase2_verify_or_fail(const char *pgdata pg_attribute_unused())
 {
@@ -1320,15 +1332,25 @@ UT_TEST(shared_startup_does_not_adopt_legacy_control_authority)
 {
 	cluster_shared_config = cluster_enabled = cluster_controlfile_shared_authority = true;
 	input_qualified = true;
-	input_checks = legacy_probes = legacy_windows = legacy_anchors = 0;
+	parameters_changed = false;
+	input_checks = legacy_probes = legacy_windows = legacy_anchors = parameter_checks = 0;
 	UT_ASSERT(startup_control_site());
 	UT_ASSERT_EQ(input_checks, 1);
+	UT_ASSERT_EQ(parameter_checks, 1);
 	UT_ASSERT_EQ(legacy_probes, 0);
 	UT_ASSERT_EQ(legacy_windows, 0);
 	UT_ASSERT_EQ(legacy_anchors, 0);
-	input_qualified = false;
+	parameters_changed = true;
 	UT_ASSERT(!startup_control_site());
 	UT_ASSERT_EQ(input_checks, 2);
+	UT_ASSERT_EQ(parameter_checks, 2);
+	UT_ASSERT_EQ(legacy_probes + legacy_windows + legacy_anchors, 0);
+	parameters_changed = false;
+	input_qualified = false;
+	input_checks = parameter_checks = 0;
+	UT_ASSERT(!startup_control_site());
+	UT_ASSERT_EQ(input_checks, 1);
+	UT_ASSERT_EQ(parameter_checks, 0);
 	UT_ASSERT_EQ(legacy_probes + legacy_windows + legacy_anchors, 0);
 }
 
@@ -1336,9 +1358,10 @@ UT_TEST(legacy_startup_keeps_its_control_authority_path)
 {
 	cluster_shared_config = false;
 	cluster_enabled = cluster_controlfile_shared_authority = true;
-	input_checks = legacy_probes = legacy_windows = legacy_anchors = 0;
+	input_checks = legacy_probes = legacy_windows = legacy_anchors = parameter_checks = 0;
 	UT_ASSERT(startup_control_site());
 	UT_ASSERT_EQ(input_checks, 0);
+	UT_ASSERT_EQ(parameter_checks, 0);
 	UT_ASSERT_EQ(legacy_probes, 1);
 	UT_ASSERT_EQ(legacy_windows, 1);
 	UT_ASSERT_EQ(legacy_anchors, 1);
