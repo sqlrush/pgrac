@@ -441,6 +441,12 @@ cluster_configuration_read_transport_is_current(const ClusterResId *resid pg_att
 	return false; /* An HW reconstruction is never the initial configuration mount. */
 }
 bool
+cluster_startup_control_transport_is_current(const ClusterResId *resid pg_attribute_unused(),
+											 LOCKMODE mode pg_attribute_unused())
+{
+	return false; /* Nor does it serve a peer's sealed Startup CONTROL. */
+}
+bool
 cluster_recovery_authority_resid_mode_allowed(const ClusterResId *r, LOCKMODE m)
 {
 	(void)r;
