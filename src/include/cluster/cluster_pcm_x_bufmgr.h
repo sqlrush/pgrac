@@ -330,7 +330,8 @@ typedef enum ClusterPcmOwnFinishRefusalReason {
 	CLUSTER_PCM_OWN_FINISH_REFUSAL_VM_FSM_PINNED,
 	CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS,
 	CLUSTER_PCM_OWN_FINISH_REFUSAL_LIVE_FLAGS,
-	CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK
+	CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK,
+	CLUSTER_PCM_OWN_FINISH_REFUSAL_DATA_IO_RETRY
 } ClusterPcmOwnFinishRefusalReason;
 
 typedef struct ClusterPcmOwnFinishRefusal {
@@ -916,7 +917,8 @@ cluster_bufmgr_pcm_own_try_drain_drop_x_revoke(BufferDesc *buf,
 											   const ClusterPcmOwnSnapshot *expected_revoking);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
 	ClusterPcmOwnHeldXRevoke *held, XLogRecPtr expected_lsn, ClusterPcmOwnSnapshot *out_retained,
-	ClusterPcmOwnFinishRefusal *out_refusal);
+	ClusterPcmOwnFinishRefusal *out_refusal,
+	const ResourceXSourceWalRetainedV1 *retained_wal);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(ClusterPcmOwnHeldXRevoke *held);
 
@@ -951,7 +953,8 @@ cluster_bufmgr_pcm_own_abort_s_revoke(BufferDesc *buf,
 									  const ClusterPcmOwnSnapshot *expected_revoking);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_revoke_retain(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking, XLogRecPtr expected_lsn,
-	ClusterPcmOwnSnapshot *out_retained, ClusterPcmOwnFinishRefusal *out_refusal);
+	ClusterPcmOwnSnapshot *out_retained, ClusterPcmOwnFinishRefusal *out_refusal,
+	const ResourceXSourceWalRetainedV1 *retained_wal);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(
 	const BufferTag *tag, uint64 source_generation, bool *release_applied_out);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,

@@ -1828,6 +1828,19 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_pair_publish_need
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_pair_publish_exact(
 	const ResourceXAssertion *assertion, uint64 assertion_sequence, int32 authenticated_master_node,
 	uint64 authenticated_master_session);
+/* Process-local observation of the immutable, unpublished source copy.
+ * No owned references, DATA durability or grant authority. The original
+ * source-finish owner must revalidate its REVOKING descriptor and exact
+ * bytes before using this, and must never reuse it for another episode. */
+typedef struct ResourceXSourceWalRetainedV1 {
+	ClusterPageWalBindingV1 latest;
+	ClusterPageWalBindingV1 first; /* zero when no first own record was handed over */
+	uint64 source_generation;
+	uint32 page_checksum;
+} ResourceXSourceWalRetainedV1;
+extern bool cluster_pcm_lock_resource_x_holder_pair_wal_retained_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
+	uint64 source_generation, ResourceXSourceWalRetainedV1 *out);
 /* Replay only a published, undrained immutable pair. Occupied physical slots
  * are validated and left untouched; an empty pair is rearmed atomically. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_pair_replay_exact(

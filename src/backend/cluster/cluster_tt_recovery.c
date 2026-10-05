@@ -479,6 +479,10 @@ cluster_tt_recovery_physical_rollback(void)
 	PGAlignedBlock blockbuf;
 	int reverted = 0;
 
+	if (cluster_shared_config)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("legacy physical TT rollback is not supported in shared mode"),
+						errhint("Shared recovery requires the typed undo recovery owner.")));
 	if (!cluster_enabled || !cluster_tt_recovery_resolve_active)
 		return 0;
 	if (cluster_node_id < 0)

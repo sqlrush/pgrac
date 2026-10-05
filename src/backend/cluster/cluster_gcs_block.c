@@ -1658,7 +1658,7 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
 					tag, out_page_lsn, (char *)scratch, out_sf_dep_vec);
 			else
 				copied = cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, (char *)scratch,
-														   out_copy_refusal, NULL, NULL);
+														   out_copy_refusal, NULL, NULL, 0);
 			if (!copied) {
 				if (smart_fusion_reply && out_copy_refusal != NULL)
 					*out_copy_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_SMART_FUSION_UNCLASSIFIED;
@@ -1693,7 +1693,7 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
 			*out_sf_dep_valid = true;
 		gcs_block_note_scratch_copy();
 	} else if (!cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, copy_buf, out_copy_refusal,
-												  NULL, NULL))
+												  NULL, NULL, 0))
 		return false;
 	else
 		gcs_block_note_scratch_copy();
@@ -9966,6 +9966,8 @@ gcs_block_resource_x_source_finish_owned(
 	MemoryContext error_context = CurrentMemoryContext;
 	ClusterPcmOwnFinishRefusal finish_refusal;
 	ClusterPcmOwnSnapshot retained;
+	ResourceXSourceWalRetainedV1 retained_wal;
+	const ResourceXSourceWalRetainedV1 *wal_proof = NULL;
 	ResourceXDecodedFrame status;
 	ResourceXDecodedFrame fault_image;
 	ResourceXApplyResult status_result;
@@ -9978,14 +9980,23 @@ gcs_block_resource_x_source_finish_owned(
 	memset(&retained, 0, sizeof(retained));
 	PG_TRY();
 	{
+		/* Read the original PENDING owner before taking any buffer locks.
+		 * Physical finish rechecks the descriptor, bytes and first itself. */
+		if (cluster_shared_config
+			&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
+			&& cluster_pcm_lock_resource_x_holder_pair_wal_retained_exact(
+				block, authenticated_master_node, revoking.generation, &retained_wal)
+			&& retained_wal.page_checksum == image->body.image_envelope.page_checksum
+			&& cluster_page_wal_same_mutation_v1(&retained_wal.latest, &image->body.image_envelope.page_wal))
+			wal_proof = &retained_wal;
 		if (held_x_revoke_active) {
 			finish_result = cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
-				&held_x_revoke, page_lsn, &retained, &finish_refusal);
+				&held_x_revoke, page_lsn, &retained, &finish_refusal, wal_proof);
 			if (finish_result == CLUSTER_PCM_OWN_OK)
 				held_x_revoke_active = false;
 		} else
 			finish_result = cluster_bufmgr_pcm_own_finish_revoke_retain(buf, &revoking, page_lsn,
-																		&retained, &finish_refusal);
+																		&retained, &finish_refusal, wal_proof);
 	}
 	PG_CATCH();
 	{
@@ -10039,12 +10050,13 @@ gcs_block_resource_x_source_finish_owned(
 	PG_END_TRY();
 	if (finish_result != CLUSTER_PCM_OWN_OK || retained.pcm_state != (uint8)PCM_STATE_N
 		|| retained.generation != image->body.image_envelope.source_carrier_generation) {
-		/* Only a proved, pre-mutation busy cause may hand the continuous
+		/* Only a proved, reversible refusal may hand the continuous
 		 * service pin to the exact shared owner. No callback cleanup may run
 		 * after APPLIED: a winning LMS claim can already own its release. */
 		if (finish_result == CLUSTER_PCM_OWN_BUSY
 			&& (finish_refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK
 				|| finish_refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS
+				|| finish_refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_DATA_IO_RETRY
 				|| (!tagless_target_x
 					&& finish_refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_VM_FSM_PINNED))) {
 			if (held_x_revoke_active && target_revoke_owner_held
@@ -10580,10 +10592,23 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 	}
 	if (!semantic_retained) {
 		failure_stage = "source-copy";
+		/* Both the receiving current holder and the original master must
+		 * understand the complete PI obligation. Missing capability keeps
+		 * the existing DATA guard; these are local HELLO observations. */
+		if ((capability_word & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0) {
+			uint32 master_capabilities = cluster_ic_local_capability_word();
+			uint32 master_connection = 0;
+
+			if (resource_master_node != cluster_node_id
+				&& !cluster_sf_peer_capability_word_sample(resource_master_node,
+					PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2, &master_capabilities, &master_connection))
+				master_capabilities = 0;
+			capability_word &= master_capabilities;
+		}
 		if (!shared_s_source
 			&& !cluster_bufmgr_copy_block_for_gcs(block->common.logical_assertion.resource,
 												  &page_lsn, aligned_page.data, NULL, &page_wal,
-												  (ClusterPageWalRefV1 *)&page_first)) {
+												  (ClusterPageWalRefV1 *)&page_first, capability_word)) {
 			failure_result = RESOURCE_X_APPLY_BAD_STATE;
 			goto pre_retained_failure;
 		}
@@ -15875,7 +15900,8 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 												  uint64 r4_record_generation,
 												  uint64 reservation_token,
 												  const ClusterPageWalBindingV1 *wal,
-												  ResourceXTargetEvictionPlan *plan_out)
+												  ResourceXTargetEvictionPlan *plan_out,
+												  const ClusterPageWalBindingV1 *first)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
@@ -15897,7 +15923,8 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 
 	if (plan_out != NULL)
 		memset(plan_out, 0, sizeof(*plan_out));
-	if (tag == NULL || exact_x == NULL || plan_out == NULL || !BufferTagsEqual(tag, &exact_x->tag)
+	if ((first != NULL && wal == NULL) || tag == NULL || exact_x == NULL || plan_out == NULL
+		|| !BufferTagsEqual(tag, &exact_x->tag)
 		|| exact_x->pcm_state != (uint8)PCM_STATE_X || exact_x->flags != PCM_OWN_FLAG_REVOKING
 		|| exact_x->generation == 0 || exact_x->generation == UINT64_MAX || reservation_token == 0
 		|| reservation_token == UINT64_MAX || exact_x->reservation_token != reservation_token
@@ -15936,16 +15963,26 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 			result = gcs_block_resource_x_target_peer_result_exact(&admission, master_node,
 																   sender_connection_generation);
 		if (result == RESOURCE_X_APPLY_APPLIED && wal != NULL) {
-			ClusterPageWalBindingV1 flushed;
+			ClusterPageWalBindingV1 flushed, flushed_first;
+			BufferTag first_tag;
 			BufferTag wal_tag;
+
+			if (first == NULL)
+				first = wal;
+			InitBufferTag(&first_tag, &first->identity.locator, first->identity.forknum,
+				first->identity.blockno);
 
 			InitBufferTag(&wal_tag, &wal->identity.locator, wal->identity.forknum,
 						  wal->identity.blockno);
 			/* Native WAL confirmation may wait. No buffer or entry lock is held,
 			 * and the original descriptor remains X+REVOKING throughout. */
 			if (!cluster_shared_config || !BufferTagsEqual(tag, &wal_tag)
+				|| !BufferTagsEqual(tag, &first_tag)
+				|| wal->source.claim.database_incarnation != first->source.claim.database_incarnation
+				|| memcmp(wal->version.segment_incarnation, first->version.segment_incarnation, 16) != 0
 				|| !cluster_page_wal_flush_source_v1(wal, &flushed)
-				|| !cluster_page_wal_ref_retain_v1(&flushed, &plan_out->pi_refs[0])
+				|| !cluster_page_wal_flush_source_v1(first, &flushed_first)
+				|| !cluster_page_wal_ref_retain_v1(&flushed_first, &plan_out->pi_refs[0])
 				|| !cluster_page_wal_ref_retain_v1(&flushed, &plan_out->pi_refs[1]))
 				result = RESOURCE_X_APPLY_BAD_STATE;
 		}

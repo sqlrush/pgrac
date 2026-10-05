@@ -11,6 +11,11 @@ int drop_owner_fixture_main(void);
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/vfs.h>
+#elif defined(__APPLE__)
+#include <sys/mount.h>
+#endif
 #include <sys/wait.h>
 #include <unistd.h>
 #include "cluster/storage/cluster_shared_fs.h"
@@ -28,6 +33,28 @@ const ClusterSharedFsOps *
 cluster_shared_fs_get_active_ops(void)
 {
 	return &drop_ops;
+}
+/* The native caller must return at the retained-work boundary. Falling into
+ * its old synchronous ERROR recovery is a fixture failure, never success. */
+ErrorData *
+CopyErrorData(void)
+{
+	abort();
+}
+void
+FlushErrorState(void)
+{
+	abort();
+}
+void
+ThrowErrorData(ErrorData *error pg_attribute_unused())
+{
+	abort();
+}
+void
+FreeErrorData(ErrorData *error pg_attribute_unused())
+{
+	abort();
 }
 int
 errcode_for_file_access(void)
@@ -102,6 +129,8 @@ enum WorkFault {
 	WORK_PARTIAL,
 	WORK_DIR_SYNC,
 	WORK_UNLINK_UNKNOWN,
+	WORK_UNLINK_RENAMED,
+	WORK_NFS,
 	WORK_CLOSE,
 	WORK_FINISH,
 	WORK_CUT_AFTER_TRUNCATE,
@@ -197,6 +226,11 @@ work_unlink(int dir, const char *name, int flags)
 		errno = EIO;
 		return -1;
 	}
+	if (work_fault == WORK_UNLINK_RENAMED) {
+		UT_ASSERT_EQ(renameat(dir, name, dir, "still-linked-original"), 0);
+		errno = EIO;
+		return -1;
+	}
 	result = unlinkat(dir, name, flags);
 	if (work_fault == WORK_UNLINK_UNKNOWN) {
 		errno = EIO;
@@ -226,6 +260,23 @@ work_close(int fd)
 	return result;
 }
 
+#if defined(__linux__) || defined(__APPLE__)
+static int
+work_statfs(int fd, struct statfs *out)
+{
+	int result = fstatfs(fd, out);
+	if (result == 0 && work_fault == WORK_NFS) {
+#ifdef __linux__
+		out->f_type = 0x6969;
+#else
+		strcpy(out->f_fstypename, "nfs");
+#endif
+	}
+	return result;
+}
+#endif
+
+#define fstatfs(fd, out) work_statfs(fd, out)
 #define ftruncate work_truncate
 #define pg_fsync work_sync
 #define unlinkat work_unlink
@@ -233,6 +284,7 @@ work_close(int fd)
 #define openat(dir, name, flags) work_openat(dir, name, flags)
 #define close(fd) work_close(fd)
 #include "../../backend/cluster/storage/cluster_shared_fs_sharedfs.c"
+#undef fstatfs
 #undef close
 #undef openat
 #undef open
@@ -276,7 +328,7 @@ prepare_files(const ClusterSpaceStructureChange *change)
 }
 
 static bool
-work_setup(const char *name)
+work_setup_impl(const char *name, bool native, bool stale)
 {
 	ClusterPageWalBindingV1 binding;
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
@@ -296,7 +348,12 @@ work_setup(const char *name)
 	if (exit_callback != NULL)
 		exit_callback(0, (Datum)0);
 	external_fds = 0;
-	work_slot = prepare_promoted_drop(&binding, wal);
+	if (native) {
+		prepare_postcommit(true);
+		binding = postcommit_binding;
+		memcpy(wal, postcommit_wal, sizeof(wal));
+	} else
+		work_slot = prepare_promoted_drop(&binding, wal);
 	if (!cluster_space_structure_wal_decode(wal, sizeof(wal), &change))
 		abort();
 	snprintf(work_root, sizeof(work_root), "/tmp/pgrac_drop_work_%d_%s", (int)getpid(), name);
@@ -311,7 +368,31 @@ work_setup(const char *name)
 	forgets = truncates = main_syncs = dir_syncs = unlinks = closes = opens = 0;
 	memset(per_fork_unlinks, 0, sizeof(per_fork_unlinks));
 	enableFsync = true;
+	if (native) {
+		native_commit_active = true;
+		postcommit_scope_changed = stale;
+		postcommit_storage_consumer = cluster_smgr_unlink_committed_drop;
+		run_native_postcommit();
+		postcommit_storage_consumer = NULL;
+		UT_ASSERT_EQ(opens + truncates + main_syncs + dir_syncs + unlinks + closes, 0);
+		UT_ASSERT_EQ(storage.native_waiting, 1);
+		UT_ASSERT_EQ(completion_allocations, 0);
+		MyBackendType = B_CHECKPOINTER;
+		if (stale) {
+			UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_INVALID);
+			UT_ASSERT_EQ(storage.native_waiting, 1);
+			current_epoch--;
+		}
+		UT_ASSERT_EQ(cluster_ko_shared_native_promote_v2(), CLUSTER_KO_STRUCTURE_PROGRESS);
+		work_slot = 0;
+	}
 	return true;
+}
+
+static bool
+work_setup(const char *name)
+{
+	return work_setup_impl(name, false, false);
 }
 
 static bool
@@ -351,6 +432,83 @@ UT_TEST(test_work_success_keeps_main_and_structure_obligation)
 	UT_ASSERT_EQ(truncates, 1);
 	UT_ASSERT_EQ(main_syncs, 1);
 	UT_ASSERT_EQ(dir_syncs, 1);
+}
+
+UT_TEST(test_native_commit_and_real_smgr_defer_io_to_original_work)
+{
+	for (unsigned stale = 0; stale < 2; stale++)
+		for (unsigned failed = 0; failed < 2; failed++) {
+			char name[64];
+			ClusterKoSharedContext retained;
+
+			snprintf(name, sizeof(name), "native_commit_%u_%u", stale, failed);
+			if (!work_setup_impl(name, true, stale))
+				return;
+			/* The backend has handed off without doing pathname I/O. */
+			UT_ASSERT(ko_completions == NULL);
+			if (!failed) {
+				UT_ASSERT(poll_work());
+				assert_finished();
+			} else {
+				work_fault = WORK_DIR_SYNC;
+				UT_ASSERT(!poll_work());
+				retained = storage.contexts[work_slot];
+				resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+				work_fault = WORK_OK;
+				/* A later successful fsync cannot replace bytes the OS may
+				 * have discarded. Native continuation must retain recovery. */
+				for (unsigned retry = 0; retry < 3; retry++) {
+					UT_ASSERT(!poll_work());
+					UT_ASSERT(memcmp(&retained, &storage.contexts[work_slot],
+									 sizeof(retained)) == 0);
+					UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+					UT_ASSERT_EQ(closes, 0);
+				}
+			}
+			UT_ASSERT_EQ(truncates, 1);
+			UT_ASSERT_EQ(main_syncs, 1);
+			UT_ASSERT_EQ(unlinks, MAX_FORKNUM);
+			UT_ASSERT_EQ(dir_syncs, 1);
+		}
+}
+
+UT_TEST(test_native_checkpointer_poll_has_bounded_visible_failure_and_retry)
+{
+	uint64 failures;
+	if (!work_setup_impl("native_poll", true, false))
+		return;
+	ko_drop_poll_boundary = cluster_smgr_drop_work_poll;
+	MyBackendType = B_BACKEND;
+	UT_ASSERT(!run_native_checkpointer());
+	MyBackendType = B_CHECKPOINTER;
+	native_commit_active = false;
+	UT_ASSERT(!run_native_checkpointer());
+	UT_ASSERT_EQ(opens + truncates + main_syncs + dir_syncs + unlinks + closes, 0);
+	native_commit_active = true;
+	/* A failed unlink which left the same original inode can be retried.
+	 * Unlike fsync failure, it does not lose a prior durability guarantee. */
+	work_fault = WORK_AUX;
+	failures = cluster_ko_failclosed_count();
+	UT_ASSERT(!run_native_checkpointer());
+	UT_ASSERT_EQ(unlinks, 1);
+	UT_ASSERT_EQ(cluster_ko_failclosed_count(), failures + 1);
+	UT_ASSERT_EQ(fixture_log_events, 1);
+	/* A failed item advances the cursor; there is no retry loop this tick. */
+	UT_ASSERT(!run_native_checkpointer());
+	UT_ASSERT_EQ(unlinks, 1);
+	UT_ASSERT(!run_native_checkpointer());
+	UT_ASSERT_EQ(unlinks, 2);
+	UT_ASSERT_EQ(cluster_ko_failclosed_count(), failures + 2);
+	UT_ASSERT_EQ(fixture_log_events, 1);
+	work_fault = WORK_OK;
+	UT_ASSERT(!run_native_checkpointer());
+	UT_ASSERT(run_native_checkpointer());
+	assert_finished();
+	UT_ASSERT_EQ(truncates, 1);
+	UT_ASSERT_EQ(main_syncs, 1);
+	UT_ASSERT_EQ(unlinks, MAX_FORKNUM + 2);
+	UT_ASSERT_EQ(dir_syncs, 1);
+	ko_drop_poll_boundary = NULL;
 }
 
 UT_TEST(test_work_absent_auxiliary_forks_are_not_unlink_completions)
@@ -403,20 +561,53 @@ retry_fault(enum WorkFault fault, const char *name)
 		retry_fault(fault, #name);                                                                 \
 	}
 RETRY_TEST(test_work_truncate_retry, WORK_TRUNCATE)
-RETRY_TEST(test_work_main_fsync_retry, WORK_MAIN_SYNC)
 RETRY_TEST(test_work_aux_unlink_retry, WORK_AUX)
 RETRY_TEST(test_work_partial_aux_retry, WORK_PARTIAL)
-RETRY_TEST(test_work_directory_sync_after_space_unlink_retry, WORK_DIR_SYNC)
+
+static void
+sync_failure_requires_recovery(enum WorkFault fault, const char *name)
+{
+	unsigned old_unlinks, old_syncs;
+	if (!work_setup(name))
+		return;
+	work_fault = fault;
+	UT_ASSERT(!poll_work());
+	UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+	old_unlinks = unlinks;
+	old_syncs = main_syncs + dir_syncs;
+	resource_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, true, NULL);
+	/* The OS may discard dirty data on the first fsync error. A later
+	 * successful fsync cannot authorize completion of this work. */
+	work_fault = WORK_OK;
+	for (unsigned retry = 0; retry < 3; retry++) {
+		UT_ASSERT(!poll_work());
+		UT_ASSERT_EQ(main_syncs + dir_syncs, old_syncs);
+		UT_ASSERT_EQ(unlinks, old_unlinks);
+		UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+		UT_ASSERT(storage.contexts[work_slot].structure_owned);
+		UT_ASSERT_EQ(truncates, 1);
+	}
+}
+
+UT_TEST(test_work_main_fsync_failure_requires_recovery)
+{
+	sync_failure_requires_recovery(WORK_MAIN_SYNC, "main_sync_failure");
+}
+
+UT_TEST(test_work_directory_sync_failure_requires_recovery)
+{
+	sync_failure_requires_recovery(WORK_DIR_SYNC, "directory_sync_failure");
+}
 
 UT_TEST(test_work_permanent_failure_is_bounded_and_keeps_responsibility)
 {
 	if (!work_setup("permanent"))
 		return;
-	work_fault = WORK_MAIN_SYNC;
+	work_fault = WORK_TRUNCATE;
 	for (unsigned n = 1; n <= 3; n++) {
 		UT_ASSERT(!poll_work());
-		UT_ASSERT_EQ(main_syncs, n);
-		UT_ASSERT_EQ(truncates, 1);
+		UT_ASSERT_EQ(main_syncs, 0);
+		UT_ASSERT_EQ(truncates, n);
 		UT_ASSERT_EQ(unlinks, 0);
 		UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
 	}
@@ -575,16 +766,43 @@ CUT_TEST(test_work_cut_checked_before_main_sync, WORK_CUT_AFTER_TRUNCATE)
 CUT_TEST(test_work_cut_checked_before_aux_unlink, WORK_CUT_AFTER_SYNC)
 CUT_TEST(test_work_cut_checked_between_aux_unlinks, WORK_CUT_AFTER_UNLINK)
 
-UT_TEST(test_work_ambiguous_unlink_never_treats_enoent_as_its_success)
+UT_TEST(test_work_ambiguous_unlink_uses_original_unlinked_inode)
 {
 	if (!work_setup("unknown_unlink"))
 		return;
 	work_fault = WORK_UNLINK_UNKNOWN;
 	UT_ASSERT(!poll_work());
 	work_fault = WORK_OK;
+	UT_ASSERT(poll_work());
+	assert_finished();
+	UT_ASSERT_EQ(per_fork_unlinks[FSM_FORKNUM], 1);
+	UT_ASSERT_EQ(unlinks, MAX_FORKNUM);
+	UT_ASSERT_EQ(truncates, 1);
+}
+
+UT_TEST(test_work_enoent_with_linked_original_never_finishes)
+{
+	if (!work_setup("renamed_original"))
+		return;
+	work_fault = WORK_UNLINK_RENAMED;
 	UT_ASSERT(!poll_work());
-	UT_ASSERT_EQ(unlinks, 1);
-	UT_ASSERT_EQ(dir_syncs, 0);
+	work_fault = WORK_OK;
+	UT_ASSERT(!poll_work());
+	UT_ASSERT_EQ(per_fork_unlinks[FSM_FORKNUM], 1);
+	UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
+}
+
+UT_TEST(test_work_nfs_refused_before_first_mutation)
+{
+	struct stat st;
+	if (!work_setup("nfs"))
+		return;
+	work_fault = WORK_NFS;
+	UT_ASSERT(!poll_work());
+	UT_ASSERT_EQ(errno, ENOTSUP);
+	UT_ASSERT_EQ(truncates + main_syncs + unlinks + dir_syncs, 0);
+	UT_ASSERT_EQ(stat(work_paths[MAIN_FORKNUM], &st), 0);
+	UT_ASSERT_EQ(st.st_size, BLCKSZ);
 	UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
 }
 
@@ -595,6 +813,7 @@ UT_TEST(test_work_close_error_never_finishes_or_retries_unknown_descriptor)
 		return;
 	work_fault = WORK_CLOSE;
 	UT_ASSERT(!poll_work());
+	UT_ASSERT_EQ(external_fds, MAX_FORKNUM + 1);
 	old_closes = closes;
 	work_fault = WORK_OK;
 	UT_ASSERT(!poll_work());
@@ -650,16 +869,18 @@ UT_TEST(test_work_executor_process_exit_does_not_redo_partial_io)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(22);
+	UT_RUN(test_native_commit_and_real_smgr_defer_io_to_original_work);
+	UT_RUN(test_native_checkpointer_poll_has_bounded_visible_failure_and_retry);
 	printf("# retained storage state: %zu bytes per original work\n",
 		   cluster_shared_fs_sharedfs_drop_work_size());
 	UT_RUN(test_work_success_keeps_main_and_structure_obligation);
 	UT_RUN(test_work_absent_auxiliary_forks_are_not_unlink_completions);
 	UT_RUN(test_work_truncate_retry);
-	UT_RUN(test_work_main_fsync_retry);
+	UT_RUN(test_work_main_fsync_failure_requires_recovery);
 	UT_RUN(test_work_aux_unlink_retry);
 	UT_RUN(test_work_partial_aux_retry);
-	UT_RUN(test_work_directory_sync_after_space_unlink_retry);
+	UT_RUN(test_work_directory_sync_failure_requires_recovery);
 	UT_RUN(test_work_permanent_failure_is_bounded_and_keeps_responsibility);
 	UT_RUN(test_work_finish_retry_never_reopens_or_repeats_io);
 	UT_RUN(test_work_retry_rejects_replacement_aux_without_unlinking_it);
@@ -668,7 +889,9 @@ main(void)
 	UT_RUN(test_work_cut_checked_before_main_sync);
 	UT_RUN(test_work_cut_checked_before_aux_unlink);
 	UT_RUN(test_work_cut_checked_between_aux_unlinks);
-	UT_RUN(test_work_ambiguous_unlink_never_treats_enoent_as_its_success);
+	UT_RUN(test_work_ambiguous_unlink_uses_original_unlinked_inode);
+	UT_RUN(test_work_enoent_with_linked_original_never_finishes);
+	UT_RUN(test_work_nfs_refused_before_first_mutation);
 	UT_RUN(test_work_close_error_never_finishes_or_retries_unknown_descriptor);
 	UT_RUN(test_work_executor_process_exit_does_not_redo_partial_io);
 	UT_DONE();

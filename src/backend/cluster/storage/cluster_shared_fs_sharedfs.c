@@ -24,7 +24,7 @@
  *	  Non-properties (AD-004, like the local backend): this is a
  *	  passthrough over PG's fd.c VFD layer on a shared mount.  No SCSI-3
  *	  PR, no fence, no 1GB segment splitting, no stripe, no
- *	  redundancy -- the shared filesystem / block layer (NFS, GFS2, OCFS2,
+ *	  redundancy -- the shared filesystem / block layer (GFS2, OCFS2,
  *	  multi-attach + cluster FS, NVMe-oF) provides the cross-node
  *	  coherence.  pgrac does not self-build a volume manager.
  *	  Relation forks honor debug_io_direct=data through PG's VFD layer;
@@ -61,6 +61,11 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/vfs.h>
+#elif defined(__APPLE__)
+#include <sys/mount.h>
+#endif
 #include <unistd.h>
 
 #include "common/file_perm.h"
@@ -701,6 +706,28 @@ sharedfs_drop_work_invalid(SharedFsDropWorkState *state)
 	return false;
 }
 
+/* Retained DROP requires unlink of an open inode, without NFS silly rename. */
+static bool
+sharedfs_drop_work_unlink_supported(int fd)
+{
+#if defined(__linux__) || defined(__APPLE__)
+	struct statfs filesystem;
+
+	if (fstatfs(fd, &filesystem) != 0)
+		return false;
+#ifdef __linux__
+	if (filesystem.f_type != 0x6969) /* NFS_SUPER_MAGIC */
+#else
+	if (strcmp(filesystem.f_fstypename, "nfs") != 0)
+#endif
+		return true;
+#else
+	(void)fd;
+#endif
+	errno = ENOTSUP;
+	return false;
+}
+
 static bool
 sharedfs_drop_work_namespace(const ClusterKoDropWorkV2 *work, SharedFsDropWorkState *state)
 {
@@ -731,9 +758,21 @@ sharedfs_drop_work_namespace(const ClusterKoDropWorkV2 *work, SharedFsDropWorkSt
 				return sharedfs_drop_work_invalid(state);
 			if (errno != ENOENT)
 				return false;
+		} else if (result != 0) {
+			if (errno != ENOENT)
+				return false;
+			/* A lost unlink result can be resolved only with the original
+			 * still-open inode. A bare absent name or a renamed inode is
+			 * not a successful deletion. MAIN must always remain present. */
+			if (fork == MAIN_FORKNUM)
+				return sharedfs_drop_work_invalid(state);
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work)
+				|| fstat(f->fd, &current) != 0)
+				return false;
+			if (!sharedfs_drop_same_file(&f->identity, &current) || current.st_nlink != 0)
+				return sharedfs_drop_work_invalid(state);
+			f->removed = true;
 		} else {
-			if (result != 0)
-				return errno == ENOENT ? sharedfs_drop_work_invalid(state) : false;
 			if (!S_ISREG(current.st_mode) || current.st_nlink != 1
 				|| !sharedfs_drop_same_file(&f->identity, &current)
 				|| (fork == MAIN_FORKNUM && state->truncated && current.st_size != 0))
@@ -853,6 +892,13 @@ cluster_shared_fs_sharedfs_drop_work(ClusterKoDropWorkV2 *work)
 				return false;
 			if (!S_ISDIR(state->directory_identity.st_mode))
 				return sharedfs_drop_work_invalid(state);
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work))
+				return false;
+			if (!sharedfs_drop_work_unlink_supported(state->directory)) {
+				if (errno == ENOTSUP)
+					state->failed = true;
+				return false;
+			}
 			state->directory_bound = true;
 		}
 		for (; state->open_next <= MAX_FORKNUM; state->open_next++) {
@@ -895,27 +941,38 @@ cluster_shared_fs_sharedfs_drop_work(ClusterKoDropWorkV2 *work)
 			state->truncated = true;
 		}
 		if (!state->main_synced) {
-			if (!cluster_ko_shared_drop_work_revalidate_v2(work)
-				|| pg_fsync(state->forks[MAIN_FORKNUM].fd) != 0)
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work))
 				return false;
+			if (pg_fsync(state->forks[MAIN_FORKNUM].fd) != 0) {
+				/* The OS may have discarded dirty bytes. A later successful
+				 * fsync is not proof; retain the original WAL obligation. */
+				state->failed = true;
+				return false;
+			}
 			state->main_synced = true;
 		}
 		for (; state->unlink_next <= MAX_FORKNUM; state->unlink_next++) {
 			SharedFsDropWorkFork *f = &state->forks[state->unlink_next];
 
-			if (f->absent)
+			if (f->absent || f->removed)
 				continue;
-			if (!sharedfs_drop_work_namespace(work, state)
-				|| !cluster_ko_shared_drop_work_revalidate_v2(work)
+			if (!sharedfs_drop_work_namespace(work, state))
+				return false;
+			if (f->removed)
+				continue;
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work)
 				|| unlinkat(state->directory, f->name, 0) != 0)
 				return false;
 			f->removed = true;
 		}
 		if (!state->directory_synced) {
 			if (!sharedfs_drop_work_namespace(work, state)
-				|| !cluster_ko_shared_drop_work_revalidate_v2(work)
-				|| pg_fsync(state->directory) != 0)
+				|| !cluster_ko_shared_drop_work_revalidate_v2(work))
 				return false;
+			if (pg_fsync(state->directory) != 0) {
+				state->failed = true;
+				return false;
+			}
 			state->directory_synced = true;
 		}
 		if (!sharedfs_drop_work_namespace(work, state))
@@ -933,13 +990,13 @@ cluster_shared_fs_sharedfs_drop_work(ClusterKoDropWorkV2 *work)
 			return false;
 		result = close(*fd);
 		*fd = -1;
+		ReleaseExternalFD();
 		/* close failure has platform-dependent descriptor ownership. Never
 		 * close that number again or turn an uncertain close into success. */
 		if (result != 0) {
 			state->failed = true;
 			return false;
 		}
-		ReleaseExternalFD();
 	}
 	state->durable = true;
 	return true;

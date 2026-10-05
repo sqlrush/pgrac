@@ -45,3 +45,8 @@ ReleaseExternalFD(void)
 {
 	abort();
 }
+bool
+cluster_ko_shared_native_drop_deferred_v2(RelFileLocator locator pg_attribute_unused())
+{
+	return false;
+}

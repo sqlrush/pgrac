@@ -73,6 +73,7 @@
 #include "cluster/cluster_hw_lease.h"	/* spec-6.12d — per-node HW space leases */
 #include "cluster/cluster_extend_gate.h" /* spec-5.7 §3.1d — liveness engage gate */
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_ic.h"
 #include "cluster/cluster_sf_dep.h"		/* spec-6.2 Smart Fusion DBWR brake */
 #include "cluster/cluster_xnode_profile.h"	/* spec-5.59 D3/D4 — read probe + relkind hint */
 #include "cluster/cluster_itl.h"	/* spec-6.12a — quiescent check for X->S downgrade */
@@ -138,6 +139,8 @@ static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
 						IOObject io_object, IOContext io_context);
 struct ClusterSpaceRecoveryBatchV1;
 struct ClusterPageWalBindingV1;
+static void FlushBufferWithAttempt(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+								   IOContext io_context, volatile bool *write_attempted);
 static void FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 									IOContext io_context,
 									const struct ClusterSpaceRecoveryBatchV1 *recovery,
@@ -1299,6 +1302,20 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 				else
 					result = RESOURCE_X_BUFFER_T2_INSTALLED;
 			}
+
+			/* A transferred current image may never have reached DATA. The
+			 * receiver becomes its writeback owner at the same T2 publication
+			 * as the native WAL binding, without inventing a first own record.
+			 * A duplicate activation may follow a completed write: do not
+			 * re-dirty it. Guarded/older peers may conservatively send a page
+			 * already on DATA; an extra dirty obligation is harmless. */
+			if (result == RESOURCE_X_BUFFER_T2_INSTALLED && cluster_shared_config
+				&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
+				&& lookup_tag.spcOid != UNDOTABLESPACE_OID
+				&& (lookup_tag.forkNum == MAIN_FORKNUM || lookup_tag.forkNum == VISIBILITYMAP_FORKNUM)
+				&& (prepared_wal.binding.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) != 0
+				&& cluster_page_wal_binding_shape_v1(&prepared_wal.binding))
+				buf_state |= BM_DIRTY | BM_JUST_DIRTIED;
 
 			if (result == RESOURCE_X_BUFFER_T2_INSTALLED
 				|| result == RESOURCE_X_BUFFER_ALREADY_INSTALLED)
@@ -6035,7 +6052,9 @@ cluster_bufmgr_resource_x_target_evict_locked(
 	/* The object is allocated off-lock in B. A volatile pointer preserves its
 	 * identity across ERROR; the allocated ref moves survive longjmp. */
 	ResourceXTargetEvictionPlan *volatile plan = NULL;
-	ClusterPageWalBindingV1 wal = { 0 };
+	ClusterPageWalBindingV1 wal = { 0 }, first_wal = { 0 };
+	ClusterPageWalRefV1 first_ref = { 0 };
+	ClusterPageWalFirstResultV1 first_result = CLUSTER_PAGE_WAL_FIRST_ABSENT;
 	ClusterPageWalCaptureResultV1 wal_result = CLUSTER_PAGE_WAL_UNATTRIBUTED;
 	ResourceXApplyResult prepare_result;
 	ResourceXApplyResult publish_result;
@@ -6094,6 +6113,16 @@ cluster_bufmgr_resource_x_target_evict_locked(
 															"TARGET cached-X WAL capture");
 		}
 	}
+	if (cluster_shared_config && wal_result == CLUSTER_PAGE_WAL_CAPTURED) {
+		/* REVOKING, no I/O and only the eviction pin make these bytes
+		 * quiescent. Keep a value copy while the original descriptor still
+		 * owns its reference; PREPARE takes its own before local N. */
+		first_result = cluster_page_wal_first_observe_locked_v1(buf, &first_ref);
+		if (first_result == CLUSTER_PAGE_WAL_FIRST_PRESENT
+			&& !cluster_page_wal_ref_read_v1(&first_ref, BufTagGetRelFileLocator(tag),
+				tag->forkNum, tag->blockNum, &first_wal))
+			first_result = CLUSTER_PAGE_WAL_FIRST_INVALID;
+	}
 	UnlockBufHdr(buf, buf_state);
 	LWLockRelease(partition_lock);
 
@@ -6108,9 +6137,14 @@ cluster_bufmgr_resource_x_target_evict_locked(
 			ReservePrivateRefCountEntry();
 		}
 		plan = palloc0(sizeof(*plan));
-		prepare_result = cluster_gcs_resource_x_target_evict_prepare_exact(
-			tag, &revoking, r4_record_generation, reservation_token,
-			wal_result == CLUSTER_PAGE_WAL_CAPTURED ? &wal : NULL, plan);
+		if (first_result == CLUSTER_PAGE_WAL_FIRST_ABSENT
+			|| first_result == CLUSTER_PAGE_WAL_FIRST_PRESENT)
+			prepare_result = cluster_gcs_resource_x_target_evict_prepare_exact(
+				tag, &revoking, r4_record_generation, reservation_token,
+				wal_result == CLUSTER_PAGE_WAL_CAPTURED ? &wal : NULL, plan,
+				first_result == CLUSTER_PAGE_WAL_FIRST_PRESENT ? &first_wal : NULL);
+		else
+			prepare_result = RESOURCE_X_APPLY_BAD_STATE;
 	}
 	PG_CATCH();
 	{
@@ -6178,10 +6212,16 @@ cluster_bufmgr_resource_x_target_evict_locked(
 					  && plan->owner.reservation_token == reservation_token;
 	if (precommit_exact && cluster_shared_config) {
 		ClusterPageWalBindingV1 observed;
+		ClusterPageWalRefV1 observed_first;
+		ClusterPageWalFirstResultV1 observed_first_result;
 		ClusterPageWalCaptureResultV1 observed_result
 			= cluster_page_wal_eviction_snapshot_locked_v1(buf, &revoking, expected_refcount,
 														   &observed);
+		observed_first_result = cluster_page_wal_first_observe_locked_v1(buf, &observed_first);
 		precommit_exact = observed_result == wal_result
+			&& observed_first_result == first_result
+			&& (first_result == CLUSTER_PAGE_WAL_FIRST_ABSENT
+				|| memcmp(&observed_first, &first_ref, sizeof(first_ref)) == 0)
 						  && (wal_result == CLUSTER_PAGE_WAL_UNATTRIBUTED
 							  || cluster_page_wal_same_mutation_v1(&wal, &observed));
 	}
@@ -9151,6 +9191,15 @@ static void
 FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 			IOContext io_context)
 {
+	FlushBufferWithAttempt(buf, reln, io_object, io_context, NULL);
+}
+
+/* Keep the ordinary source selection identical for a caller observing its
+ * own write attempt. The output does not grant recovery authority. */
+static void
+FlushBufferWithAttempt(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+					   IOContext io_context, volatile bool *write_attempted)
+{
 #ifdef USE_PGRAC_CLUSTER
 	ClusterPageWalBindingV1 wal;
 
@@ -9159,11 +9208,11 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * including certified foreign images, without a local-LSN comparison. */
 	if (cluster_enabled && cluster_shared_config && !RecoveryInProgress()
 		&& cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal)) {
-		FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, &wal, NULL);
+		FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, &wal, write_attempted);
 		return;
 	}
 #endif
-	FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, NULL, NULL);
+	FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, NULL, write_attempted);
 }
 
 /* Original write path with an optional retained SPACE recovery owner or
@@ -15425,10 +15474,54 @@ cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag, SCN expected_page_scn,
 	return true;
 }
 
+/* The original Resource-X copy owner retains the descriptor's first record
+ * until its existing PENDING/PI consumer takes it. This is only a copy
+ * qualification, never a DATA receipt or permission to retire that record.
+ * Caller holds content-X and the descriptor header lock.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+cluster_bufmgr_gcs_copy_defer_data(BufferDesc *buf, uint32 state, Page page,
+								 const ClusterPageWalBindingV1 *wal,
+								 bool received,
+								 ClusterPageWalFirstResultV1 first_state,
+								 const ClusterPageWalBindingV1 *first)
+{
+	if ((state & BM_PERMANENT) == 0 || buf->pcm_state != PCM_STATE_X
+		|| buf->buffer_type != BUF_TYPE_XCUR || buf->tag.spcOid == UNDOTABLESPACE_OID
+		|| (buf->tag.forkNum != MAIN_FORKNUM && buf->tag.forkNum != VISIBILITYMAP_FORKNUM)
+		|| PageIsUndoSegmentHeader(page) || PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+		|| (wal->flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+		|| !rf_page_identity_valid_v1(&wal->identity)
+		|| !cluster_page_wal_binding_matches_v1(wal, BufTagGetRelFileLocator(&buf->tag),
+												  buf->tag.forkNum, buf->tag.blockNum, page))
+		return false;
+	/* An unmodified received image has no first own record. The latest
+	 * binding still travels with it; the original writer's PI stays owed. */
+	if (first_state == CLUSTER_PAGE_WAL_FIRST_ABSENT)
+		return received;
+	if (first_state != CLUSTER_PAGE_WAL_FIRST_PRESENT
+		|| !cluster_page_wal_binding_shape_v1(first)
+		|| (first->flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
+		|| !rf_page_identity_equal_v1(&first->identity, &wal->identity)
+		|| first->source.claim.database_incarnation != wal->source.claim.database_incarnation
+		|| memcmp(first->version.segment_incarnation, wal->version.segment_incarnation, 16) != 0
+		|| scn_total_cmp(first->version.mutation_token, wal->version.mutation_token) > 0)
+		return false;
+	/* LSN ordering is meaningful only within exactly the same WAL source. */
+	if (memcmp(&first->source.claim.identity, &wal->source.claim.identity,
+			   sizeof(wal->source.claim.identity)) == 0
+		&& memcmp(first->source.claim.claim_sha256, wal->source.claim.claim_sha256, 32) == 0
+		&& first->source.timeline == wal->source.timeline
+		&& first->record_start > wal->record_start)
+		return false;
+	return true;
+}
+
 /*
- * Copy the 8KB block bytes for `tag` into *dst, flushing WAL up to the
- * page's LSN before reading the bytes (HC82 I-WAL-before-ship), then making
- * any dirty source current in shared storage before it may be retired.  Sets
+ * Copy the 8KB block bytes for `tag` into *dst after certifying durability
+ * in the page's native WAL source (HC82 I-WAL-before-ship).
+ * Qualified MAIN/VM keeps its dirty obligation for the original PI owner;
+ * other sources must first become current in shared storage. Sets
  * *out_page_lsn to the page LSN observed at the second-stable revalidation.
  *
  * Returns false on a non-resident or non-current image, either conditional
@@ -15449,13 +15542,15 @@ cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag, SCN expected_page_scn,
 bool
 cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
 								  ClusterBufmgrGcsCopyRefusal *out_refusal,
-								  ClusterPageWalBindingV1 *out_wal, ClusterPageWalRefV1 *out_first)
+								  ClusterPageWalBindingV1 *out_wal, ClusterPageWalRefV1 *out_first,
+								  uint32 peer_capabilities)
 {
 	uint32 hashcode;
 	LWLock *partition_lock;
 	int buf_id;
 	BufferDesc *buf;
 	LWLock *content_lock;
+	LWLockMode copy_lock_mode = LW_SHARED;
 	XLogRecPtr first_lsn;
 	XLogRecPtr second_lsn;
 	int retries;
@@ -15477,6 +15572,8 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	ClusterPageWalFirstResultV1 first_state = CLUSTER_PAGE_WAL_FIRST_ABSENT;
 	ClusterPageWalFirstResultV1 first_state_now;
 	bool flushed_here;
+	bool defer_data;
+	uint32 copy_forbidden;
 
 	if (out_wal != NULL)
 		memset(out_wal, 0, sizeof(*out_wal));
@@ -15493,6 +15590,19 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 			*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INVALID_ARGUMENT;
 		return false;
 	}
+	/* The capability remains unadvertised until the complete PI retirement
+	 * chain is active. Legacy callers without both carriers keep their DATA
+	 * guard. Use the same conditional acquisitions in exclusive mode so
+	 * hint writers cannot race a qualified dirty memcpy. Native source WAL
+	 * certification runs between the two acquisitions. The unqualified DATA
+	 * fallback can still perform its original local WAL wait under the lock.
+	 * peer_capabilities comes from the original owner's exact HELLO sample. */
+	if (cluster_shared_config && out_wal != NULL && out_first != NULL
+		&& (tag.forkNum == MAIN_FORKNUM || tag.forkNum == VISIBILITYMAP_FORKNUM)
+		&& tag.spcOid != UNDOTABLESPACE_OID
+		&& (peer_capabilities & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
+		&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0)
+		copy_lock_mode = LW_EXCLUSIVE;
 
 	hashcode = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hashcode);
@@ -15545,9 +15655,9 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	PG_TRY();
 	{
 		for (retries = 0; retries < 2; retries++) {
-			/* Read page_lsn under content_lock SHARED.  Never park a GCS DATA
+			/* Read page_lsn under the content lock. Never park a GCS DATA
 		 * worker behind a backend that may itself be waiting for this worker. */
-			if (!LWLockConditionalAcquire(content_lock, LW_SHARED)) {
+			if (!LWLockConditionalAcquire(content_lock, copy_lock_mode)) {
 				if (out_refusal != NULL)
 					*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST;
 				break;
@@ -15609,12 +15719,12 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 			}
 
 			/*
-		 * Reacquire content_lock SHARED and revalidate that the page LSN has
+		 * Reacquire the content lock and revalidate that the page LSN has
 		 * not advanced past first_lsn AND the buffer tag still matches.
 		 * Either signals concurrent mutation that would break HC82's "ship
 		 * the bytes that I just flushed WAL for" contract.
 		 */
-			if (!LWLockConditionalAcquire(content_lock, LW_SHARED)) {
+			if (!LWLockConditionalAcquire(content_lock, copy_lock_mode)) {
 				if (out_refusal != NULL)
 					*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND;
 				break;
@@ -15629,7 +15739,9 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 				needs_flush
 					= current
 					  && (buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0;
-				storage_current = current && (buf_state & BM_IO_ERROR) == 0;
+				storage_current = current
+					&& (buf_state & (BM_IO_ERROR
+						| (copy_lock_mode == LW_EXCLUSIVE ? BM_IO_IN_PROGRESS : 0))) == 0;
 
 				UnlockBufHdr(buf, buf_state);
 				if (!storage_current) {
@@ -15666,10 +15778,36 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 				&& (!has_wal || cluster_page_wal_same_mutation_v1(&wal, &latest_wal))) {
 				uint32 buf_state;
 
+				defer_data = false;
+				if (copy_lock_mode == LW_EXCLUSIVE) {
+					buf_state = LockBufHdr(buf);
+					first_state_now = cluster_page_wal_first_observe_locked_v1(buf, &first_now);
+					storage_current = first_state_now == first_state
+						&& (first_state == CLUSTER_PAGE_WAL_FIRST_ABSENT
+							|| memcmp(&first_now, &first_seen, sizeof(first_now)) == 0);
+					if (storage_current && has_wal)
+						defer_data = cluster_bufmgr_gcs_copy_defer_data(
+							buf, buf_state, page, &wal,
+							(latest_wal.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) != 0,
+							first_state, &first_wal);
+					UnlockBufHdr(buf, buf_state);
+					if (!storage_current) {
+						if (out_refusal != NULL)
+							*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_WAL_RECHECK_CHANGED;
+						LWLockRelease(content_lock);
+						content_locked = false;
+						continue;
+					}
+				}
+				copy_forbidden = BM_IO_ERROR | BM_IO_IN_PROGRESS;
+				if (!defer_data)
+					copy_forbidden |= BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED;
+
 				/* A queue handoff may retire this descriptor immediately after
-			 * copying it.  Make the shared-storage fallback at least as current
-			 * as the shipped image before publishing that handoff watermark. */
-				if (needs_flush) {
+			 * copying it. Qualified MAIN/VM retains its first and dirty state
+			 * for the original PI handover; every other class still requires
+			 * the shared-storage fallback to cover the shipped image. */
+				if (needs_flush && !defer_data) {
 					Assert(!cluster_pcm_x_finish_retain_flush_active);
 					Assert(!cluster_pcm_x_finish_retain_flush_io_active);
 					Assert(!cluster_pcm_x_finish_retain_flush_error_context_pushed);
@@ -15689,10 +15827,7 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 				storage_current = BufferTagsEqual(&buf->tag, &tag)
 								  && cluster_bufmgr_pcm_current_image_locked(buf, buf_state)
 								  && PageGetLSN(page) == second_lsn
-								  && (buf_state
-									  & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED
-										 | BM_IO_ERROR | BM_IO_IN_PROGRESS))
-										 == 0;
+								  && (buf_state & copy_forbidden) == 0;
 				UnlockBufHdr(buf, buf_state);
 				if (!storage_current) {
 					if (out_refusal != NULL)
@@ -15707,16 +15842,17 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 					= cluster_shared_config
 					  && cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &latest_wal);
 
-				/* Hint-bit dirties may occur under a shared content lock.  Do not
-			 * certify a copy if one raced the memcpy after the first clean check. */
+				/* The legacy shared-lock copy still rejects hint-bit dirties.
+			 * The qualified copy holds content-X and preserves dirty bits. */
 				buf_state = LockBufHdr(buf);
 				storage_current = BufferTagsEqual(&buf->tag, &tag)
 								  && cluster_bufmgr_pcm_current_image_locked(buf, buf_state)
 								  && PageGetLSN(page) == second_lsn
-								  && (buf_state
-									  & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED
-										 | BM_IO_ERROR | BM_IO_IN_PROGRESS))
-										 == 0;
+								  && (buf_state & copy_forbidden) == 0
+								  && (!defer_data
+									  || cluster_page_wal_binding_matches_v1(&wal,
+										  BufTagGetRelFileLocator(&tag), tag.forkNum, tag.blockNum,
+										  (Page)dst));
 				first_state_now = out_first != NULL && cluster_shared_config
 									  ? cluster_page_wal_first_observe_locked_v1(buf, &first_now)
 									  : CLUSTER_PAGE_WAL_FIRST_ABSENT;
@@ -17488,7 +17624,7 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
-		(void)cluster_bufmgr_copy_block_for_gcs(tag, &written_lsn, scratch.data, NULL, NULL, NULL);
+		(void)cluster_bufmgr_copy_block_for_gcs(tag, &written_lsn, scratch.data, NULL, NULL, NULL, 0);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
 
@@ -18009,7 +18145,7 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 
 		UnlockBufHdr(buf, buf_state);
 		LWLockRelease(partition_lock);
-		(void)cluster_bufmgr_copy_block_for_gcs(tag, &written_lsn, scratch.data, NULL, NULL, NULL);
+		(void)cluster_bufmgr_copy_block_for_gcs(tag, &written_lsn, scratch.data, NULL, NULL, NULL, 0);
 		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
 
@@ -19271,7 +19407,8 @@ ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
 	ClusterPcmOwnHeldXRevoke *held, XLogRecPtr expected_lsn,
 	ClusterPcmOwnSnapshot *out_retained,
-	ClusterPcmOwnFinishRefusal *out_refusal)
+	ClusterPcmOwnFinishRefusal *out_refusal,
+	const ResourceXSourceWalRetainedV1 *retained_wal)
 {
 	BufferDesc *buf;
 	ClusterPcmOwnResult result;
@@ -19280,7 +19417,7 @@ cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
 		return CLUSTER_PCM_OWN_INVALID;
 	buf = GetBufferDescriptor(held->buffer_id);
 	result = cluster_bufmgr_pcm_own_finish_revoke_retain(
-		buf, &held->revoking, expected_lsn, out_retained, out_refusal);
+		buf, &held->revoking, expected_lsn, out_retained, out_refusal, retained_wal);
 	if (result != CLUSTER_PCM_OWN_OK)
 		return result;
 	cluster_bufmgr_unpin_for_gcs(buf);
@@ -19314,6 +19451,38 @@ cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(
 	return result;
 }
 
+/* Match the unpublished pair to the still-owned source bytes. This is an
+ * observation of the original PENDING owner, not a DATA receipt. Caller
+ * holds content-X and the header lock; no entry lock or I/O is needed. */
+static bool
+cluster_bufmgr_revoke_wal_retained_locked(BufferDesc *buf, uint32 state,
+	const ClusterPcmOwnSnapshot *expected, const ResourceXSourceWalRetainedV1 *proof,
+	ClusterPageWalRefV1 *first_ref)
+{
+	ClusterPageWalBindingV1 latest, first = { 0 };
+	ClusterPageWalFirstResultV1 first_state;
+	Page page = (Page)BufHdrGetBlock(buf);
+
+	if (!cluster_shared_config || proof == NULL
+		|| (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0
+		|| proof->source_generation != expected->generation
+		|| (state & (BM_IO_ERROR | BM_IO_IN_PROGRESS)) != 0
+		|| !cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &latest)
+		|| !cluster_page_wal_same_mutation_v1(&latest, &proof->latest)
+		|| cluster_gcs_block_compute_checksum((const char *)page) != proof->page_checksum)
+		return false;
+	first_state = cluster_page_wal_first_observe_locked_v1(buf, first_ref);
+	if (first_state == CLUSTER_PAGE_WAL_FIRST_PRESENT) {
+		if (!cluster_page_wal_ref_read_v1(first_ref, BufTagGetRelFileLocator(&buf->tag),
+			buf->tag.forkNum, buf->tag.blockNum, &first)
+			|| !cluster_page_wal_same_mutation_v1(&first, &proof->first))
+			return false;
+	} else if (proof->first.record_start != 0)
+		return false;
+	return cluster_bufmgr_gcs_copy_defer_data(buf, state, page, &proof->latest,
+		(latest.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) != 0, first_state, &proof->first);
+}
+
 /* Commit a staged VM/FSM source without leaving a BM_VALID mapping behind.
  * The exclusive mapping lock closes the lookup-to-pin window around the
  * zero-refcount proof.  The immutable A-record already owns the copied bytes,
@@ -19324,7 +19493,8 @@ cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(BufferDesc *buf,
 												   const ClusterPcmOwnSnapshot *expected_revoking,
 												   XLogRecPtr expected_lsn,
 												   ClusterPcmOwnSnapshot *out_finished,
-												   ClusterPcmOwnFinishRefusal *out_refusal)
+												   ClusterPcmOwnFinishRefusal *out_refusal,
+												   const ResourceXSourceWalRetainedV1 *retained_wal)
 {
 	ClusterPcmXRevokeFinishMode finish_mode;
 	ClusterPcmOwnResult live_result;
@@ -19338,6 +19508,9 @@ cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(BufferDesc *buf,
 	uint32 shared_refcount;
 	uint32 buf_state;
 	int mapped_buf_id;
+	bool content_locked = false;
+	LWLock *content_lock = BufferDescriptorGetContentLock(buf);
+	ClusterPageWalRefV1 first_ref;
 
 	hashcode = BufTableHashCode(&tag);
 	partition_lock = BufMappingPartitionLock(hashcode);
@@ -19349,6 +19522,20 @@ cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(BufferDesc *buf,
 	}
 
 	buf_state = LockBufHdr(buf);
+	/* Mapping-X plus zero pins excludes a new byte user. Never wait for
+	 * content-X here: a current holder could be waiting on our DATA worker. */
+	if (retained_wal != NULL && BUF_STATE_GET_REFCOUNT(buf_state) == 0
+		&& (buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0) {
+		UnlockBufHdr(buf, buf_state);
+		if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
+			if (out_refusal != NULL)
+				out_refusal->reason = CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK;
+			LWLockRelease(partition_lock);
+			return CLUSTER_PCM_OWN_BUSY;
+		}
+		content_locked = true;
+		buf_state = LockBufHdr(buf);
+	}
 	shared_refcount = BUF_STATE_GET_REFCOUNT(buf_state);
 	finish_mode = cluster_pcm_x_revoke_finish_mode(&tag, shared_refcount);
 	if (!BufferTagsEqual(&buf->tag, &tag) || (buf_state & BM_VALID) == 0
@@ -19356,6 +19543,12 @@ cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(BufferDesc *buf,
 		|| buf->pcm_state != expected_revoking->pcm_state)
 		result = CLUSTER_PCM_OWN_STALE;
 	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
+		result = CLUSTER_PCM_OWN_CORRUPT;
+	/* Dirty DROP requires the original PENDING first plus the receiving
+	 * dirty-install protocol, not just equal LSNs or a wire copy. */
+	else if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0
+		&& (!content_locked || !cluster_bufmgr_revoke_wal_retained_locked(
+			buf, buf_state, expected_revoking, retained_wal, &first_ref)))
 		result = CLUSTER_PCM_OWN_CORRUPT;
 	else {
 		live_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
@@ -19402,6 +19595,8 @@ cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(BufferDesc *buf,
 													 &committed_generation);
 	if (result != CLUSTER_PCM_OWN_OK) {
 		UnlockBufHdr(buf, buf_state);
+		if (content_locked)
+			LWLockRelease(content_lock);
 		LWLockRelease(partition_lock);
 		return result;
 	}
@@ -19413,6 +19608,10 @@ cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(BufferDesc *buf,
 	/* Historical transition proof immediately before unmapping, not a
 	 * current-image admission snapshot after InvalidateBufferCommitTailLocked. */
 	cluster_pcm_own_snapshot_locked(buf, out_finished);
+	/* PENDING already holds first; the original unmap tail releases only
+	 * the descriptor's reference. No pin can enter before it completes. */
+	if (content_locked)
+		LWLockRelease(content_lock);
 	InvalidateBufferCommitTailLocked(buf, &tag, hashcode, partition_lock, buf_state,
 									 (uint8)PCM_STATE_N, false);
 	return CLUSTER_PCM_OWN_OK;
@@ -19434,7 +19633,8 @@ ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_finish_revoke_retain(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking,
 	XLogRecPtr expected_lsn, ClusterPcmOwnSnapshot *out_retained,
-	ClusterPcmOwnFinishRefusal *out_refusal)
+	ClusterPcmOwnFinishRefusal *out_refusal,
+	const ResourceXSourceWalRetainedV1 *retained_wal)
 {
 	ClusterPcmOwnResult live_result;
 	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_OK;
@@ -19451,10 +19651,15 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 	bool		source_is_x;
 	bool		needs_flush = false;
 	bool forced_test_flush = false;
+	bool defer_data = false;
+	ClusterPageWalRefV1 first_ref = { 0 };
 #ifdef ENABLE_INJECTION
 	bool finish_fault_armed = false;
 	bool log_non_target_finish = false;
 #endif
+	volatile bool write_attempted = false;
+	volatile uint32 write_checksum = 0;
+	MemoryContext error_context = CurrentMemoryContext;
 	volatile bool content_locked = false;
 	volatile bool caller_pinned = false;
 	ClusterPcmXRevokeFinishMode finish_mode;
@@ -19480,7 +19685,7 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 		return CLUSTER_PCM_OWN_INVALID;
 	if (finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_DROP)
 		return cluster_bufmgr_pcm_own_finish_revoke_drop_unpinned(buf, expected_revoking,
-																  expected_lsn, out_retained, out_refusal);
+																  expected_lsn, out_retained, out_refusal, retained_wal);
 	if (finish_mode != CLUSTER_PCM_X_REVOKE_FINISH_RETAIN)
 		return CLUSTER_PCM_OWN_INVALID;
 	Assert(finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_RETAIN);
@@ -19575,6 +19780,9 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 			if (forced_test_flush)
 				buf_state |= BM_DIRTY | BM_JUST_DIRTIED;
 			needs_flush = (buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0;
+			if (needs_flush && !forced_test_flush)
+				defer_data = cluster_bufmgr_revoke_wal_retained_locked(
+					buf, buf_state, expected_revoking, retained_wal, &first_ref);
 		}
 		UnlockBufHdr(buf, buf_state);
 
@@ -19587,12 +19795,14 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 			 */
 			if (needs_flush && !caller_pinned)
 				result = CLUSTER_PCM_OWN_CORRUPT;
-			else if (needs_flush) {
+			else if (needs_flush && !defer_data) {
 				cluster_pcm_x_finish_retain_flush_active = true;
 #ifdef ENABLE_INJECTION
 				cluster_pcm_x_finish_retain_flush_fault_active = forced_test_flush;
 #endif
-				FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+				write_checksum = cluster_gcs_block_compute_checksum((const char *)BufHdrGetBlock(buf));
+				FlushBufferWithAttempt(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+									   &write_attempted);
 #ifdef ENABLE_INJECTION
 				cluster_pcm_x_finish_retain_flush_fault_active = false;
 #endif
@@ -19620,7 +19830,8 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 					}
 					result = CLUSTER_PCM_OWN_BUSY;
 				}
-				else if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0)
+				else if (!defer_data
+					&& (buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0)
 					result = CLUSTER_PCM_OWN_BUSY;
 				else if (PageGetLSN((Page)BufHdrGetBlock(buf)) != expected_lsn)
 					result = CLUSTER_PCM_OWN_STALE;
@@ -19643,6 +19854,9 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 				if (result == CLUSTER_PCM_OWN_OK) {
 					buf->pcm_state = (uint8)PCM_STATE_N;
 					buf->buffer_type = (uint8)BUF_TYPE_PI;
+					if (defer_data && first_ref.source_flags != 0
+						&& !cluster_page_wal_first_handover_locked_v1(buf, &first_ref))
+						elog(PANIC, "retained source lost its exact first WAL reference");
 					buf_state &= ~(BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR);
 					cluster_pcm_own_snapshot_post_state_locked(buf, buf_state, out_retained);
 				}
@@ -19655,6 +19869,12 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 	}
 	PG_CATCH();
 	{
+		bool retry_write = write_attempted && cluster_shared_config
+			&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
+			&& cluster_pcm_x_finish_retain_flush_io_active && caller_pinned
+			&& content_locked && LWLockHeldByMe(content_lock)
+			&& out_refusal != NULL && geterrcode() == ERRCODE_IO_ERROR;
+
 		/* elog(ERROR) resets InterruptHoldoffCount before longjmp, but a
 		 * still-held LWLock retains its ownership entry.  Recreate that lock's
 		 * interrupt hold only on the exact release path; LWLockRelease consumes
@@ -19674,18 +19894,44 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 			cluster_pcm_x_finish_retain_flush_error_context_pushed = false;
 			cluster_pcm_x_finish_retain_flush_error_context_previous = NULL;
 		}
-		if (content_locked && LWLockHeldByMe(content_lock)) {
+		if (content_locked && LWLockHeldByMe(content_lock))
 			HOLD_INTERRUPTS();
-			LWLockRelease(content_lock);
-		}
 		if (cluster_pcm_x_finish_retain_flush_io_active)
 		{
 			cluster_pcm_x_finish_retain_flush_io_active = false;
 			AbortBufferIO(BufferDescriptorGetBuffer(buf));
 		}
+		if (retry_write) {
+			/* This call owned the failed output I/O throughout content-X.
+			 * Keep dirty/checkpoint/first and the exact source reservation;
+			 * only its own retryable error marker may be acknowledged. */
+			buf_state = LockBufHdr(buf);
+			retry_write = cluster_pcm_own_fence_matches_locked(buf, expected_revoking)
+				&& cluster_bufmgr_pcm_current_image_locked(buf, buf_state)
+				&& (buf_state & (BM_VALID | BM_DIRTY | BM_IO_ERROR | BM_IO_IN_PROGRESS))
+					== (BM_VALID | BM_DIRTY | BM_IO_ERROR)
+				&& PageGetLSN((Page)BufHdrGetBlock(buf)) == expected_lsn
+				&& cluster_gcs_block_compute_checksum((const char *)BufHdrGetBlock(buf))
+					== write_checksum;
+			if (retry_write) {
+				buf_state &= ~BM_IO_ERROR;
+				out_refusal->reason = CLUSTER_PCM_OWN_FINISH_REFUSAL_DATA_IO_RETRY;
+			}
+			UnlockBufHdr(buf, buf_state);
+		}
+		if (content_locked && LWLockHeldByMe(content_lock))
+			LWLockRelease(content_lock);
+		content_locked = false;
 		if (caller_pinned)
 			cluster_bufmgr_unpin_for_gcs(buf);
-		PG_RE_THROW();
+		caller_pinned = false;
+		if (!retry_write)
+			PG_RE_THROW();
+		MemoryContextSwitchTo(error_context);
+		FlushErrorState();
+		elog(LOG, "Resource-X DATA write failed with IO_ERROR; retaining exact source for retry: %u/%u/%u/%d/%u",
+			 tag.spcOid, tag.dbOid, tag.relNumber, (int)tag.forkNum, tag.blockNum);
+		result = CLUSTER_PCM_OWN_BUSY;
 	}
 	PG_END_TRY();
 

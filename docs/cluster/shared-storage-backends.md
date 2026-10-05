@@ -14,6 +14,11 @@ and synchronization errors remain errors; there is no buffered fallback.
 Direct I/O does not replace `fsync`, WAL ordering, or storage qualification.
 Small shared-root control files retain their existing I/O behavior.
 
+NFS is not supported for PRE2 shared-mode data files. Use the qualified cluster
+filesystem. On Linux and macOS, retained DROP cleanup detects NFS before its
+first file modification and leaves the DROP obligation pending. Other platforms
+without this filesystem check also refuse this cleanup operation.
+
 Extension still writes an aligned zero block under the existing extension
 rules. The backend does not preallocate pages or advance logical EOF ahead of
 those writes. Direct I/O bypasses buffered prefetch/writeback requests, so

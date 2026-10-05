@@ -1520,6 +1520,18 @@ UT_TEST(test_actual_peer_observation_gap_keeps_delivery_and_ingress_owned)
 /* Actual copy/frame/PENDING glue; boundary doubles account for references,
  * while test_cluster_pcm_lock exercises the real first-reference move. */
 static int first_error_step, first_private_refs, first_pending_refs, first_releases;
+static uint32 first_requester_caps, first_master_caps, first_copied_caps;
+static bool first_master_sample_ok;
+
+static bool
+first_master_capability_sample(int32 node, uint32 required, uint32 *word, uint32 *generation)
+{
+	UT_ASSERT_EQ(node, cluster_node_id + 1);
+	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2);
+	*word = first_master_caps;
+	*generation = 71;
+	return first_master_sample_ok;
+}
 
 static bool
 first_capture_fixture(ClusterPageWalRefV1 *first)
@@ -1577,9 +1589,12 @@ run_actual_source_first_cleanup(int route, bool semantic_retained)
 	bool target_x_drop = route == 1, target_x_retain = route == 2;
 	ResourceXApplyResult result, failure_result;
 	const char *failure_stage pg_attribute_unused();
+	uint32 capability_word = first_requester_caps;
+	int32 resource_master_node = cluster_node_id + 1;
 
-#define cluster_bufmgr_copy_block_for_gcs(tag, lsn, page, refusal, wal, first)                     \
-	first_capture_fixture((ClusterPageWalRefV1 *)(first))
+#define cluster_bufmgr_copy_block_for_gcs(tag, lsn, page, refusal, wal, first, peer_caps)                     \
+	(first_copied_caps = (peer_caps), first_capture_fixture((ClusterPageWalRefV1 *)(first)))
+#define cluster_sf_peer_capability_word_sample first_master_capability_sample
 #define gcs_block_pcm_x_resource_x_build_source_frames(...) first_frame_fixture()
 #define cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(...) first_pair_fixture(NULL)
 #define cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(a, b, c, d, e, f, first)        \
@@ -1595,6 +1610,7 @@ pre_retained_failure:
 	(void)cluster_page_wal_ref_release_v1(&page_first);
 	return failure_result;
 #undef cluster_bufmgr_copy_block_for_gcs
+#undef cluster_sf_peer_capability_word_sample
 #undef gcs_block_pcm_x_resource_x_build_source_frames
 #undef cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact
 #undef cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact
@@ -1637,6 +1653,22 @@ UT_TEST(test_actual_source_first_ref_is_released_across_errors)
 	first_error_step = first_private_refs = first_pending_refs = first_releases = 0;
 	UT_ASSERT_EQ(run_actual_source_first_cleanup(0, true), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(first_private_refs + first_pending_refs + first_releases, 0);
+}
+
+UT_TEST(test_actual_source_copy_requires_requester_and_master_pi_capability)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		first_requester_caps = variant == 1 ? 0 : PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		first_master_caps = variant == 2 ? 0 : PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		first_master_sample_ok = variant != 3;
+		first_copied_caps = UINT32_MAX;
+		first_error_step = first_private_refs = first_pending_refs = first_releases = 0;
+		UT_ASSERT_EQ(run_actual_source_first_cleanup(1, false), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(first_copied_caps, variant == 0 ? PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2 : 0);
+		UT_ASSERT_EQ(first_private_refs, 0);
+		UT_ASSERT_EQ(first_pending_refs, 1);
+	}
+	first_requester_caps = first_master_caps = 0;
 }
 
 static ResourceXApplyResult
@@ -1939,12 +1971,13 @@ static ResourceXApplyResult evict_abort_result, evict_commit_result;
 
 static int evict_refs, evict_retains, evict_pi_records, evict_wal_case;
 static bool evict_requires_pi;
+static XLogRecPtr evict_first_end;
 
 bool
 cluster_page_wal_flush_source_v1(const ClusterPageWalBindingV1 *wal, ClusterPageWalBindingV1 *out)
 {
 	UT_ASSERT_EQ(evict_claims, 0);
-	UT_ASSERT_EQ(wal->record_end, 200);
+	UT_ASSERT(wal->record_end == 200 || (evict_first_end != 0 && wal->record_end == evict_first_end));
 	if (evict_wal_case == 1)
 		return false;
 	*out = *wal;
@@ -1961,6 +1994,7 @@ cluster_page_wal_ref_retain_v1(const ClusterPageWalBindingV1 *wal, ClusterPageWa
 	if (evict_wal_case == 2 && evict_retains == 2)
 		return false;
 	out->source_flags = 1;
+	out->start = wal->record_start;
 	evict_refs++;
 	return true;
 }
@@ -2217,7 +2251,7 @@ UT_TEST(test_actual_eviction_prepare_pending_proves_exact_reversible_cleanup)
 		if (leg == 2)
 			evict_abort_result = RESOURCE_X_APPLY_STALE;
 		UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_prepare_exact(&exact.tag, &exact, 77, 9,
-																	   NULL, &plan),
+																	   NULL, &plan, NULL),
 					 leg == 2 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED : RESOURCE_X_APPLY_BAD_STATE);
 		UT_ASSERT(!plan.prepared);
 		UT_ASSERT_EQ(evict_aborts, leg == 0 ? 0 : 1);
@@ -2252,7 +2286,7 @@ UT_TEST(test_eviction_reserves_before_n_and_registers_before_release)
 		PG_TRY();
 		{
 			prepared = cluster_gcs_resource_x_target_evict_prepare_exact(&exact.tag, &exact, 77, 9,
-																		 &wal, plan);
+																		 &wal, plan, NULL);
 		}
 		PG_CATCH();
 		{
@@ -2290,6 +2324,46 @@ UT_TEST(test_eviction_reserves_before_n_and_registers_before_release)
 		UT_ASSERT_EQ(evict_refs, 0);
 	}
 	cluster_shared_config = evict_requires_pi = false;
+}
+
+UT_TEST(test_eviction_retains_first_separately_from_latest)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		ResourceXTargetEvictionPlan plan;
+		ClusterPcmOwnSnapshot exact = { 0 };
+		ClusterPageWalBindingV1 wal = { 0 }, first;
+
+		evict_fixture(&plan);
+		cluster_shared_config = true;
+		exact.tag = plan.tag;
+		exact.generation = 7;
+		exact.reservation_token = 9;
+		exact.flags = PCM_OWN_FLAG_REVOKING;
+		exact.pcm_state = PCM_STATE_X;
+		wal.identity.locator = BufTagGetRelFileLocator(&exact.tag);
+		wal.identity.forknum = exact.tag.forkNum;
+		wal.identity.blockno = exact.tag.blockNum;
+		wal.record_start = 150;
+		wal.record_end = 200;
+		wal.version.segment_incarnation[0] = 13;
+		first = wal;
+		first.record_start = variant == 1 ? 450 : 50;
+		first.record_end = evict_first_end = variant == 1 ? 500 : 100;
+		if (variant == 1) first.source.claim.identity.origin_thread_id = 2;
+		if (variant == 2) first.identity.blockno++;
+		UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_prepare_exact(
+			&exact.tag, &exact, 77, 9, &wal, &plan, &first),
+			variant == 2 ? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_APPLIED);
+		if (variant != 2) {
+			UT_ASSERT_EQ(plan.pi_refs[0].start, first.record_start);
+			UT_ASSERT_EQ(plan.pi_refs[1].start, wal.record_start);
+			UT_ASSERT_EQ(evict_refs, 2);
+			UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_abort_exact(&plan), RESOURCE_X_APPLY_APPLIED);
+		}
+		UT_ASSERT_EQ(evict_refs, 0);
+	}
+	evict_first_end = 0;
+	cluster_shared_config = false;
 }
 
 static ClusterPcmOwnSnapshot failed_round_live;
@@ -2427,7 +2501,7 @@ UT_TEST(test_actual_failed_round_observation_retries_only_exact_predecessor_shap
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(28);
 	UT_RUN(test_actual_terminal_ingress_keeps_master_and_physical_source_distinct);
 	UT_RUN(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission);
 	UT_RUN(test_actual_fused_admission_notifies_ready_resource_without_registry_tick);
@@ -2440,6 +2514,7 @@ main(void)
 	UT_RUN(test_actual_delivery_observation_gap_retains_owner_then_finishes);
 	UT_RUN(test_actual_image_ingress_yields_before_join_and_after_t3);
 	UT_RUN(test_actual_source_first_ref_is_released_across_errors);
+	UT_RUN(test_actual_source_copy_requires_requester_and_master_pi_capability);
 	UT_RUN(test_actual_source_gate_never_rolls_back_armed_pair_for_sample_gap);
 	UT_RUN(test_actual_source_before_mutation_waits_without_exporting_session);
 	UT_RUN(test_actual_foreground_retained_and_predecessor_wait_reobserve_without_fuse);
@@ -2453,6 +2528,7 @@ main(void)
 	UT_RUN(test_actual_eviction_hard_refusal_and_capacity_have_distinct_retry_cause);
 	UT_RUN(test_actual_eviction_prepare_pending_proves_exact_reversible_cleanup);
 	UT_RUN(test_eviction_reserves_before_n_and_registers_before_release);
+	UT_RUN(test_eviction_retains_first_separately_from_latest);
 	UT_RUN(test_actual_failed_round_observation_retries_only_exact_predecessor_shape);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

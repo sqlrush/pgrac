@@ -294,10 +294,20 @@ typedef enum ClusterKoStructurePollV2 {
  * Native callers remain unactivated until the original physical owner and
  * postcommit cleanup are connected in the same delivery. */
 extern bool cluster_ko_shared_native_handoff_v2(ClusterKoCompletionV2 **completion);
+/* Native irreversible COMMIT only, before callbacks and resource cleanup.
+ * Transfer preallocated work while retaining the original pending-delete
+ * handle. Disabled until the full structural protocol is advertised. */
+extern void cluster_ko_shared_native_commit_v2(void);
+/* True suppresses the backend's obsolete pathname operation, even with a
+ * now-stale cut. It conveys no physical completion or reuse permission. */
+extern bool cluster_ko_shared_native_drop_deferred_v2(RelFileLocator locator);
 /* One original checkpointer step into the existing bounded active region.
  * INVALID/stale and PENDING/full retain all work. RELEASED means no pending
  * native continuation, not completion of active work, PI or recovery windows. */
 extern ClusterKoStructurePollV2 cluster_ko_shared_native_promote_v2(void);
+/* One checkpointer tick: at most one promotion and one physical attempt.
+ * True is actual progress, not permission to ignore any remaining work. */
+extern bool cluster_ko_shared_native_poll_v2(void);
 /* Original checkpointer only. One process-bound work item for an already
  * committed, promoted DROP. The bounded cursor skips other active work.
  * storage_bytes reserves the storage consumer's fixed fd/inode/stage carrier
@@ -316,6 +326,20 @@ extern bool cluster_ko_shared_drop_work_read_v2(const ClusterKoDropWorkV2 *work,
  * unknown partial I/O. Process loss remains the retained-WAL recovery owner's
  * responsibility, never a reason to treat a missing path as completed. */
 extern bool cluster_ko_shared_drop_work_revalidate_v2(const ClusterKoDropWorkV2 *work);
+/* Irreversible cleanup-only access for the original PID/ResourceOwner, even
+ * after its cut is lost. The caller may close only the already retained raw
+ * resources; no pathname operation, sync or physical-success publication.
+ * The local state and shared pending/executor remain retained for recovery.
+ * An exact unchanged shared context receives only a negative diagnostic:
+ * normal-stop must fail for recovery instead of waiting for impossible work.
+ * An abandoned work can never read, revalidate or finish again. */
+extern void *cluster_ko_shared_drop_work_abandon_v2(ClusterKoDropWorkV2 *work, Size storage_bytes);
+/* One original work whose context/epoch/boot was positively replaced, or
+ * which is already abandoned. Transient admission failure does not qualify.
+ * Success abandons the work and advances the bounded cursor. Refusal leaves
+ * outputs unchanged; use abandon_v2 to access its cleanup-only carrier. */
+extern bool cluster_ko_shared_drop_work_abandon_next_v2(uint32 *cursor, Size storage_bytes,
+														ClusterKoDropWorkV2 **out);
 /* Only the original storage consumer's durable-success branch may call this:
  * MAIN reservation, auxiliary removals and directory sync must be complete,
  * exact identities checked, and successful physical resources closed. A
