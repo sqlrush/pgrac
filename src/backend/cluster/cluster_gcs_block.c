@@ -10050,12 +10050,13 @@ gcs_block_resource_x_source_finish_owned(
 	PG_END_TRY();
 	if (finish_result != CLUSTER_PCM_OWN_OK || retained.pcm_state != (uint8)PCM_STATE_N
 		|| retained.generation != image->body.image_envelope.source_carrier_generation) {
-		/* Only a proved, pre-mutation busy cause may hand the continuous
+		/* Only a proved, reversible refusal may hand the continuous
 		 * service pin to the exact shared owner. No callback cleanup may run
 		 * after APPLIED: a winning LMS claim can already own its release. */
 		if (finish_result == CLUSTER_PCM_OWN_BUSY
 			&& (finish_refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK
 				|| finish_refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS
+				|| finish_refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_DATA_IO_RETRY
 				|| (!tagless_target_x
 					&& finish_refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_VM_FSM_PINNED))) {
 			if (held_x_revoke_active && target_revoke_owner_held

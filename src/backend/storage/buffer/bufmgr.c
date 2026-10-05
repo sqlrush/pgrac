@@ -139,6 +139,8 @@ static void FlushBuffer(BufferDesc *buf, SMgrRelation reln,
 						IOObject io_object, IOContext io_context);
 struct ClusterSpaceRecoveryBatchV1;
 struct ClusterPageWalBindingV1;
+static void FlushBufferWithAttempt(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+								   IOContext io_context, volatile bool *write_attempted);
 static void FlushBufferWithRecovery(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 									IOContext io_context,
 									const struct ClusterSpaceRecoveryBatchV1 *recovery,
@@ -9189,6 +9191,15 @@ static void
 FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 			IOContext io_context)
 {
+	FlushBufferWithAttempt(buf, reln, io_object, io_context, NULL);
+}
+
+/* Keep the ordinary source selection identical for a caller observing its
+ * own write attempt. The output does not grant recovery authority. */
+static void
+FlushBufferWithAttempt(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
+					   IOContext io_context, volatile bool *write_attempted)
+{
 #ifdef USE_PGRAC_CLUSTER
 	ClusterPageWalBindingV1 wal;
 
@@ -9197,11 +9208,11 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 	 * including certified foreign images, without a local-LSN comparison. */
 	if (cluster_enabled && cluster_shared_config && !RecoveryInProgress()
 		&& cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf), &wal)) {
-		FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, &wal, NULL);
+		FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, &wal, write_attempted);
 		return;
 	}
 #endif
-	FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, NULL, NULL);
+	FlushBufferWithRecovery(buf, reln, io_object, io_context, NULL, NULL, NULL, write_attempted);
 }
 
 /* Original write path with an optional retained SPACE recovery owner or
@@ -19646,6 +19657,9 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 	bool finish_fault_armed = false;
 	bool log_non_target_finish = false;
 #endif
+	volatile bool write_attempted = false;
+	volatile uint32 write_checksum = 0;
+	MemoryContext error_context = CurrentMemoryContext;
 	volatile bool content_locked = false;
 	volatile bool caller_pinned = false;
 	ClusterPcmXRevokeFinishMode finish_mode;
@@ -19786,7 +19800,9 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 #ifdef ENABLE_INJECTION
 				cluster_pcm_x_finish_retain_flush_fault_active = forced_test_flush;
 #endif
-				FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+				write_checksum = cluster_gcs_block_compute_checksum((const char *)BufHdrGetBlock(buf));
+				FlushBufferWithAttempt(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL,
+									   &write_attempted);
 #ifdef ENABLE_INJECTION
 				cluster_pcm_x_finish_retain_flush_fault_active = false;
 #endif
@@ -19853,6 +19869,12 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 	}
 	PG_CATCH();
 	{
+		bool retry_write = write_attempted && cluster_shared_config
+			&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
+			&& cluster_pcm_x_finish_retain_flush_io_active && caller_pinned
+			&& content_locked && LWLockHeldByMe(content_lock)
+			&& out_refusal != NULL && geterrcode() == ERRCODE_IO_ERROR;
+
 		/* elog(ERROR) resets InterruptHoldoffCount before longjmp, but a
 		 * still-held LWLock retains its ownership entry.  Recreate that lock's
 		 * interrupt hold only on the exact release path; LWLockRelease consumes
@@ -19872,18 +19894,44 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 			cluster_pcm_x_finish_retain_flush_error_context_pushed = false;
 			cluster_pcm_x_finish_retain_flush_error_context_previous = NULL;
 		}
-		if (content_locked && LWLockHeldByMe(content_lock)) {
+		if (content_locked && LWLockHeldByMe(content_lock))
 			HOLD_INTERRUPTS();
-			LWLockRelease(content_lock);
-		}
 		if (cluster_pcm_x_finish_retain_flush_io_active)
 		{
 			cluster_pcm_x_finish_retain_flush_io_active = false;
 			AbortBufferIO(BufferDescriptorGetBuffer(buf));
 		}
+		if (retry_write) {
+			/* This call owned the failed output I/O throughout content-X.
+			 * Keep dirty/checkpoint/first and the exact source reservation;
+			 * only its own retryable error marker may be acknowledged. */
+			buf_state = LockBufHdr(buf);
+			retry_write = cluster_pcm_own_fence_matches_locked(buf, expected_revoking)
+				&& cluster_bufmgr_pcm_current_image_locked(buf, buf_state)
+				&& (buf_state & (BM_VALID | BM_DIRTY | BM_IO_ERROR | BM_IO_IN_PROGRESS))
+					== (BM_VALID | BM_DIRTY | BM_IO_ERROR)
+				&& PageGetLSN((Page)BufHdrGetBlock(buf)) == expected_lsn
+				&& cluster_gcs_block_compute_checksum((const char *)BufHdrGetBlock(buf))
+					== write_checksum;
+			if (retry_write) {
+				buf_state &= ~BM_IO_ERROR;
+				out_refusal->reason = CLUSTER_PCM_OWN_FINISH_REFUSAL_DATA_IO_RETRY;
+			}
+			UnlockBufHdr(buf, buf_state);
+		}
+		if (content_locked && LWLockHeldByMe(content_lock))
+			LWLockRelease(content_lock);
+		content_locked = false;
 		if (caller_pinned)
 			cluster_bufmgr_unpin_for_gcs(buf);
-		PG_RE_THROW();
+		caller_pinned = false;
+		if (!retry_write)
+			PG_RE_THROW();
+		MemoryContextSwitchTo(error_context);
+		FlushErrorState();
+		elog(LOG, "Resource-X DATA write failed with IO_ERROR; retaining exact source for retry: %u/%u/%u/%d/%u",
+			 tag.spcOid, tag.dbOid, tag.relNumber, (int)tag.forkNum, tag.blockNum);
+		result = CLUSTER_PCM_OWN_BUSY;
 	}
 	PG_END_TRY();
 

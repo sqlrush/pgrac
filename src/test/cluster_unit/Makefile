@@ -5074,12 +5074,13 @@ test_cluster_pcm_s_prepare.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.
 
 test_cluster_pcm_flush_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^FlushBuffer\(/ { print "static void"; emit=1; flush++ } \
+	     /^FlushBufferWithAttempt\(/ { print "static void"; emit=1; attempt++ } \
 	     /^FlushBufferWithRecovery\(/ { print "static void"; emit=1; recovery++ } \
 	     /^StartBufferIO\(/ { print "static bool"; emit=1; start++ } \
 	     /^TerminateBufferIO\(/ { print "static void"; emit=1; finish++ } \
 	     /^AbortBufferIO\(/ { print "static void"; emit=1; abort_io++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (flush != 1 || recovery != 1 || start != 1 || finish != 1 || abort_io != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (flush != 1 || attempt != 1 || recovery != 1 || start != 1 || finish != 1 || abort_io != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # Real local/remote S-cache prepare and ownership transitions.
