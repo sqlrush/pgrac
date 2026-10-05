@@ -474,7 +474,7 @@ cluster_shared_fs_sharedfs_immedsync(ClusterSharedFsHandle *handle)
 	Assert(handle != NULL && handle->opened);
 
 	if (FileSync(handle->vfd, WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
-		ereport(ERROR, (errcode_for_file_access(),
+		ereport(data_sync_elevel(ERROR), (errcode_for_file_access(),
 						errmsg("cluster_shared_fs.shared_fs: could not fsync: %m")));
 }
 

@@ -1364,7 +1364,7 @@ cluster_shared_fs_block_device_immedsync(ClusterSharedFsHandle *handle)
 {
 	(void)handle;
 	if (raw_device_sync(WAIT_EVENT_CLUSTER_BLOCK_DEVICE_SYNC) < 0)
-		ereport(ERROR,
+		ereport(data_sync_elevel(ERROR),
 				(errcode_for_file_access(), errmsg("could not barrier-sync raw block device: %m")));
 }
 
