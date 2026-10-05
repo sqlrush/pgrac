@@ -86,6 +86,27 @@ static const struct {
 	{ "default_text_search_config", POLICY_COMMON | POLICY_STRING }
 };
 
+/* The parameters pg_control records at creation (XLOG_PARAMETER_CHANGE).
+ * A shared cluster cannot change them; StartupXLOG refuses a differing
+ * value as the backstop. */
+static const char *const config_recorded_parameters[] = { "wal_level",
+														  "wal_log_hints",
+														  "max_connections",
+														  "max_worker_processes",
+														  "max_wal_senders",
+														  "max_prepared_transactions",
+														  "max_locks_per_transaction",
+														  "track_commit_timestamp" };
+
+static bool
+config_recorded_parameter(const char *name)
+{
+	for (size_t i = 0; i < lengthof(config_recorded_parameters); ++i)
+		if (strcmp(name, config_recorded_parameters[i]) == 0)
+			return true;
+	return false;
+}
+
 static unsigned
 config_policy_flags(const char *name)
 {
@@ -110,16 +131,23 @@ cluster_shared_config_alter_system(const char *name, const char *value)
 	if (name == NULL)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("shared ALTER SYSTEM RESET ALL is not supported")));
+	canonical = pstrdup(name);
+	for (char *p = canonical; *p != '\0'; ++p)
+		if (*p >= 'A' && *p <= 'Z')
+			*p += 'a' - 'A';
+	if (config_recorded_parameter(canonical))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_SHARED_PARAMETER_FIXED),
+				 errmsg("parameter \"%s\" cannot be changed in a shared cluster", canonical),
+				 errdetail("PGRAC_FAMILY=SHARED_CONFIG PGRAC_REASON=RECORDED_PARAMETER"),
+				 errhint("The shared control file records this parameter when the cluster is "
+						 "created; keep that value.")));
 	/* A nested caller cannot retire somebody else's CF request. In particular
 	 * do not turn this precondition into an endless LOCK_UNAVAILABLE retry. */
 	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						errmsg("shared configuration publication requires an idle CF owner"),
 						errdetail("PGRAC_REASON=CONFIG_PUBLICATION_CF_BUSY")));
-	canonical = pstrdup(name);
-	for (char *p = canonical; *p != '\0'; ++p)
-		if (*p >= 'A' && *p <= 'Z')
-			*p += 'a' - 'A';
 	change.name = canonical;
 	change.value = value == NULL ? NULL : pg_server_to_any(value, strlen(value), PG_UTF8);
 	change.node_id = (config_policy_flags(canonical) & POLICY_INSTANCE)

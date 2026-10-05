@@ -146,15 +146,17 @@
  *	Modified by: SqlRush <sqlrush@gmail.com>
  *
  *	What changed:
- *	  - XLogReportParameters(): with cluster.shared_config, a parameter that
- *	    differs from the value the shared control file recorded at creation
- *	    is refused with FATAL naming each change, instead of reaching the
- *	    UpdateControlFile PANIC.
+ *	  - StartupXLOG(): with cluster.shared_config, a parameter that differs
+ *	    from the value the shared control file recorded at creation is
+ *	    refused with FATAL naming each change, before the first durable
+ *	    startup write.
+ *	  - XLogReportParameters(): the same refusal keeps the UpdateControlFile
+ *	    PANIC unreachable.
  *
  *	Why:
- *	  The shared configuration delivers these as restart-pending changes,
- *	  but no typed purpose can update the shared control file after
- *	  creation.
+ *	  No typed purpose can update the shared control file after creation,
+ *	  and a start refused after writer selection would leave a new writer
+ *	  generation behind.
  */
 
 #include "postgres.h"
@@ -860,6 +862,7 @@ static void UpdateControlFile(void);
 static void UpdateFullPageWritesInternal(bool allow_cluster_disable);
 #ifdef USE_PGRAC_CLUSTER
 static bool ClusterWalStateConfigured(void);
+static void ClusterRequireRecordedParameters(void);
 static bool ClusterWalRetentionE1Cutoff(
 	ClusterWalRetentionE1Context *context, XLogRecPtr redo,
 	XLogRecPtr endptr, XLogRecPtr slotsMinReqLSN,
@@ -6497,6 +6500,13 @@ StartupXLOG(void)
 	if (cluster_shared_config)
 		cluster_control_bootstrap_native_inputs_require(DataDir);
 
+	/* PGRAC: a parameter the shared control file recorded at creation must
+	 * not have changed.  Refuse before writer selection, ROOT, WAL or control
+	 * file writes, so that a refused start leaves no new writer generation.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config)
+		ClusterRequireRecordedParameters();
+
 	/*
 	 * PGRAC: spec-5.6 increment (iii) T6 Phase-2.  Before the bootstrap role
 	 * gate reads the storage contract, a multi-node node that has not yet
@@ -10506,12 +10516,12 @@ ClusterWalLevelName(int level)
 /*
  * PGRAC (shared native parameters): the shared control file records these
  * parameters when the cluster is created, and no typed purpose can update
- * them afterwards.  A shared configuration change that reached this start is
- * refused here, before any WAL is written and outside critical sections,
- * instead of in the UpdateControlFile PANIC.
+ * them afterwards.  StartupXLOG calls this before its first durable write
+ * (writer selection, ROOT, WAL or control file); a changed value ends the
+ * start with FATAL naming each change.  Returns when nothing changed.
  */
 static void
-ClusterRefuseRecordedParameterChange(void)
+ClusterRequireRecordedParameters(void)
 {
 	StringInfoData changed;
 
@@ -10536,13 +10546,18 @@ ClusterRefuseRecordedParameterChange(void)
 	ClusterRecordedParameterChange(&changed, "track_commit_timestamp",
 								   track_commit_timestamp ? "on" : "off",
 								   ControlFile->track_commit_timestamp ? "on" : "off");
+	if (changed.len == 0)
+	{
+		pfree(changed.data);
+		return;
+	}
 	ereport(FATAL,
-			(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+			(errcode(ERRCODE_CLUSTER_SHARED_PARAMETER_FIXED),
 			 errmsg("shared cluster parameters recorded at creation cannot be changed"),
 			 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=NATIVE_PARAMETER_CHANGE %s.",
 					   changed.data),
-			 errhint("Restore the creation values listed above, with ALTER SYSTEM on a running "
-					 "instance or in the shared configuration, then start this instance again.")));
+			 errhint("Set the parameters listed above back to their creation values in this "
+					 "instance's configuration, then start it again.")));
 }
 #endif
 
@@ -10553,8 +10568,9 @@ ClusterRefuseRecordedParameterChange(void)
  * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
  * What changed: with cluster.shared_config a changed value is refused with
  * FATAL before the parameter-change record.
- * Why: the shared control file cannot record the change (see
- * ClusterRefuseRecordedParameterChange).
+ * Why: the shared control file cannot record the change.  StartupXLOG
+ * already refused it before any durable write (see
+ * ClusterRequireRecordedParameters); this keeps the PANIC unreachable.
  */
 static void
 XLogReportParameters(void)
@@ -10570,7 +10586,7 @@ XLogReportParameters(void)
 	{
 #ifdef USE_PGRAC_CLUSTER
 		if (cluster_shared_config)
-			ClusterRefuseRecordedParameterChange();
+			ClusterRequireRecordedParameters();
 #endif
 
 		/*
