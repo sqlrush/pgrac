@@ -9221,7 +9221,12 @@ FlushBufferWithAttempt(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 			return;
 		}
 		if ((pg_atomic_read_u32(&buf->state) & BM_IO_ERROR) != 0
-			&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0)
+			&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
+			&& (!cluster_page_wal_output_binding_absent_v1(BufferDescriptorGetBuffer(buf))
+				|| (cluster_storage_mode_enabled()
+					&& (buf->tag.forkNum == MAIN_FORKNUM
+						|| buf->tag.forkNum == VISIBILITYMAP_FORKNUM)
+					&& !cluster_pcm_lock_pi_obligations_absent_v1(buf->tag))))
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("cannot retry DATA output without its exact WAL source"),
 							errhint("Retry through the current page owner.")));

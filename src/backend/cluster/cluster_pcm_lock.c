@@ -10307,6 +10307,42 @@ cluster_pcm_local_pi_record_v1(BufferTag tag, const ClusterPageWalBindingV1 *bin
 }
 
 bool
+cluster_pcm_lock_pi_obligations_absent_v1(BufferTag tag)
+{
+	static const ClusterPageWalRefV1 empty;
+	struct GrdEntry *entry;
+	ClusterPcmResourceXMasterState *state;
+	bool found, absent = false;
+
+	if (!cluster_shared_config || ClusterPcm == NULL || cluster_pcm_htab == NULL
+		|| cluster_pcm_resource_x_slots == NULL || cluster_pcm_resource_x_master_states == NULL
+		|| pcm_grd_effective <= 0
+		|| (tag.forkNum != MAIN_FORKNUM && tag.forkNum != VISIBILITYMAP_FORKNUM)
+		|| !LWLockConditionalAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED))
+		return false;
+	entry = hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (!found)
+		absent = true;
+	else if (entry != NULL && LWLockConditionalAcquire(&entry->entry_lock.lock, LW_SHARED)) {
+		/* The directory lock excludes reuse; neither conditional acquire
+		 * waits behind an owner which could need the caller's content lock. */
+		state = pcm_resource_x_master_state_for_entry(entry);
+		absent = pg_atomic_read_u32(&entry->lifecycle) == PCM_ENTRY_LIVE
+			&& BufferTagsEqual(&entry->tag, &tag) && state != NULL
+			&& entry->local_pi_revision != UINT64_MAX
+			&& pg_atomic_read_u32(&entry->pi_holders_bitmap) == 0
+			&& entry->pi_watermark_lsn == InvalidXLogRecPtr
+			&& entry->pi_watermark_scn == InvalidScn
+			&& memcmp(&entry->local_pi_first, &empty, sizeof(empty)) == 0
+			&& memcmp(&entry->local_pi_last, &empty, sizeof(empty)) == 0
+			&& memcmp(&state->holder_pi_first, &empty, sizeof(empty)) == 0;
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	return absent;
+}
+
+bool
 cluster_pcm_local_pi_snapshot_v1(BufferTag tag, ClusterPcmLocalPiSnapshotV1 *out)
 {
 	ClusterPcmLocalPiSnapshotV1 value = { 0 };

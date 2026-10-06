@@ -213,6 +213,9 @@ extern bool cluster_page_wal_dirty_floor_v1(const ClusterWalSourceRef *source,
 extern bool cluster_page_wal_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out);
 /* Original output owner only: a failed dirty output retains its binding. */
 extern bool cluster_page_wal_output_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out);
+/* Exact empty latest slot under the output owner's existing content lock.
+ * A failed snapshot is not evidence of absence. No PI or I/O permission. */
+extern bool cluster_page_wal_output_binding_absent_v1(Buffer buffer);
 
 /* Strict frozen PI projection under the descriptor header lock. No pin or
  * content lock is borrowed; !BM_VALID/PI/N/no-I/O excludes byte mutation.

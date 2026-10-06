@@ -296,6 +296,24 @@ cluster_page_wal_output_snapshot_v1(Buffer buffer, ClusterPageWalBindingV1 *out)
 }
 
 bool
+cluster_page_wal_output_binding_absent_v1(Buffer buffer)
+{
+	static const PageWalSlot empty;
+	BufferDesc *buf;
+	uint32 state;
+
+	if (bindings == NULL || buffer <= 0 || buffer > NBuffers)
+		return false;
+	buf = GetBufferDescriptor(buffer - 1);
+	if (!LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+		return false;
+	state = pg_atomic_read_u32(&buf->state);
+	return (state & (BM_VALID | BM_TAG_VALID | BM_DIRTY))
+			   == (BM_VALID | BM_TAG_VALID | BM_DIRTY)
+		   && memcmp(&bindings[buf->buf_id], &empty, sizeof(empty)) == 0;
+}
+
+bool
 cluster_page_wal_pi_snapshot_locked_v1(BufferDesc *buf, ClusterPageWalBindingV1 *out)
 {
 	ClusterPageWalBindingV1 value;

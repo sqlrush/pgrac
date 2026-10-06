@@ -174,6 +174,10 @@ extern bool cluster_pcm_local_pi_record_first_v1(BufferTag tag,
 												 const ClusterPageWalBindingV1 *first,
 												 const ClusterPageWalBindingV1 *binding);
 extern bool cluster_pcm_local_pi_snapshot_v1(BufferTag tag, ClusterPcmLocalPiSnapshotV1 *out);
+/* Output retry only: nonblocking, read-only absence of this node's directory
+ * PI obligations. Unknown/busy is false; this cannot retire PI, establish
+ * remote absence, or authorize a write without the original buffer owner. */
+extern bool cluster_pcm_lock_pi_obligations_absent_v1(BufferTag tag);
 
 /* Local PI responsibilities as seen by one WAL source. A responsibility is
  * bounded when its first binding is the source's record; unbounded when

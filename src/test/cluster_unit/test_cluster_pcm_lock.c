@@ -21163,6 +21163,48 @@ UT_TEST(test_local_pi_keeps_first_and_latest_across_master_changes)
 	cluster_shared_config = false;
 }
 
+UT_TEST(test_output_retry_pi_absence_is_read_only_and_nonblocking)
+{
+	BufferTag tag = make_tag(939);
+	ClusterPageWalBindingV1 binding = local_pi_setup(tag);
+	PcmEntryRef ref;
+	PcmEntryAcquireResult acquired;
+	struct StopPcmEntryLayout *entry;
+
+	UT_ASSERT(cluster_pcm_lock_pi_obligations_absent_v1(tag));
+	UT_ASSERT(pcm_entry_ref_acquire(&tag, true, &ref, &acquired));
+	pcm_entry_ref_release(&ref);
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT(entry != NULL);
+	if (entry == NULL)
+		return;
+	for (int variant = 0; variant < 9; variant++) {
+		struct StopPcmEntryLayout before;
+		if (variant == 1) pg_atomic_write_u32(&entry->pi_holders_bitmap, 2);
+		if (variant == 2) entry->pi_watermark_lsn = 91;
+		if (variant == 3) entry->pi_watermark_scn = 92;
+		if (variant == 4) entry->local_pi_first.token = 93; /* malformed is not absent */
+		if (variant == 5) entry->local_pi_last.token = 94;
+		if (variant == 6) entry->local_pi_revision = UINT64_MAX;
+		if (variant == 7) pg_atomic_write_u32(&entry->lifecycle, PCM_ENTRY_QUIESCING);
+		if (variant == 8) fake_lwlock_conditional_fail_once = true;
+		before = *entry;
+		UT_ASSERT_EQ(cluster_pcm_lock_pi_obligations_absent_v1(tag), variant == 0);
+		UT_ASSERT_EQ(memcmp(&before, entry, sizeof(before)), 0);
+		UT_ASSERT_EQ(fake_lwlock_depth, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&entry->pin_count), 0);
+		pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
+		entry->pi_watermark_lsn = entry->pi_watermark_scn = 0;
+		entry->local_pi_first.token = entry->local_pi_last.token = 0;
+		entry->local_pi_revision = 0;
+		pg_atomic_write_u32(&entry->lifecycle, PCM_ENTRY_LIVE);
+	}
+	UT_ASSERT(cluster_pcm_local_pi_record_v1(tag, &binding));
+	UT_ASSERT(!cluster_pcm_lock_pi_obligations_absent_v1(tag));
+	local_pi_writer_ready = cluster_shared_config = false;
+	UT_ASSERT(!cluster_pcm_lock_pi_obligations_absent_v1(make_tag(940)));
+}
+
 UT_TEST(test_local_pi_rejects_unqualified_replacement_without_losing_anchors)
 {
 	for (unsigned variant = 0; variant < 6; variant++) {
@@ -23064,7 +23106,7 @@ int
 main(void)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	UT_PLAN(354);
+	UT_PLAN(355);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
@@ -23378,6 +23420,7 @@ main(void)
 	UT_RUN(test_stop_seal_keeps_original_identity_validation_first);
 	UT_RUN(test_stop_seal_service_new_round_but_not_existing_round_or_backend);
 	UT_RUN(test_local_pi_keeps_first_and_latest_across_master_changes);
+	UT_RUN(test_output_retry_pi_absence_is_read_only_and_nonblocking);
 	UT_RUN(test_local_pi_rejects_unqualified_replacement_without_losing_anchors);
 	UT_RUN(test_local_pi_retirement_requires_exact_responsibility_and_physical_ack);
 	UT_RUN(test_local_structural_retirement_preserves_concurrent_responsibility);

@@ -403,6 +403,41 @@ resident_binding_memory_budget(void)
 	UT_ASSERT(many <= (Size)104 * NBuffers + 65536);
 	NBuffers = 1;
 }
+
+static void
+failed_output_distinguishes_empty_latest_from_invalid_binding(void)
+{
+	for (int variant = 0; variant < 8; variant++) {
+		ClusterPageWalBindingV1 observed;
+		uint32 before;
+		reset();
+		if (variant == 1 || variant == 2 || variant == 3) {
+			UT_ASSERT(capture());
+			PageSetLSNPreserveOrigin(page.data, 0x200);
+		}
+		if (variant == 2)
+			((PageHeader)page.data)->pd_block_scn++;
+		if (variant == 3)
+			UT_ASSERT(cluster_page_wal_forget_v1(1));
+		if (variant == 4)
+			locked = false;
+		if (variant == 5)
+			pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_VALID);
+		if (variant == 6)
+			pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_DIRTY);
+		if (variant == 7)
+			exclusive = false; /* the normal output owner holds content SHARE */
+		pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_ERROR);
+		before = pg_atomic_read_u32(&desc.bufferdesc.state);
+		UT_ASSERT_EQ(cluster_page_wal_output_binding_absent_v1(1),
+			variant == 0 || variant == 3 || variant == 7);
+		if (variant == 2)
+			UT_ASSERT(!cluster_page_wal_output_snapshot_v1(1, &observed));
+		UT_ASSERT(!cluster_page_wal_output_binding_absent_v1(0));
+		UT_ASSERT(!cluster_page_wal_output_binding_absent_v1(NBuffers + 1));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&desc.bufferdesc.state), before);
+	}
+}
 static void
 native_insert_source(void)
 {
@@ -1728,9 +1763,10 @@ UT_TEST(space_capture_unavailable_source_is_not_mutation_failure)
 int
 main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(44);
 	UT_RUN(installed_carrier_matches_explicit_absence_not_snapshot_failure);
 	UT_RUN(output_snapshot_retains_exact_failed_output_binding);
+	UT_RUN(failed_output_distinguishes_empty_latest_from_invalid_binding);
 	UT_RUN(private_record_resident_publication_uses_native_last_insert);
 	UT_RUN(private_record_publication_rejects_expired_record_or_changed_owner);
 	UT_RUN(space_native_record_and_both_component_sources);
