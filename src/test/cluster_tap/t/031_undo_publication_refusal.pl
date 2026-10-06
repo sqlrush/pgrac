@@ -23,8 +23,11 @@ use Test::More;
 
 # PRE2 native OPEN requires the full fixed four-member cohort. Only node0 and
 # node1 perform SQL work; the original refusal assertions and budget are unchanged.
+# Use the product's 30-second CF deadline during native formation. The cohort
+# helper's one-second diagnostic override is unrelated to UNDO error cleanup.
 my $cluster = PostgreSQL::Test::ClusterPRE2->new_cluster('undo_refusal',
-	nodes => 4, blackbox => 1, extra_conf => [ 'autovacuum = off' ]);
+	nodes => 4, blackbox => 1,
+	extra_conf => [ 'autovacuum = off', 'cluster.cf_enqueue_timeout_ms = 30000' ]);
 # This checks the real selected ROOT, formation, PGSA/R4 and every member's
 # current writer before any SQL mutation. No SOURCE_ZERO or fabricated token.
 $cluster->start_cluster;

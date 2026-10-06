@@ -198,7 +198,8 @@ jobs:
     needs: validate
     if: needs.validate.outputs.code_changed == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 12
+    # Full unit compilation precedes the unchanged 20-minute native controller.
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -444,7 +445,8 @@ jobs:
     needs: validate
     if: needs.validate.outputs.code_changed == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    # Keep the complete scan-build set within the job's infrastructure budget.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4

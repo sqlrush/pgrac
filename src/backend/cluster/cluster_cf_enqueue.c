@@ -34,6 +34,7 @@
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_clean_leave.h" /* RF-ROOT P6: leaver write-refusal gate */
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_ges.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_lock_owner.h"
@@ -129,6 +130,7 @@ cf_lock(LOCKMODE mode, bool cooperative, const void *caller)
 	ClusterLockAcquireResult r;
 	CfHoldState *slot = cf_slot(mode);
 	ClusterLockAcquireRequest *req = &slot->owner.request;
+	const ClusterGesTimeoutDetail *timeout;
 	bool resume;
 
 	/* Several duties share an auxiliary process. Only the initiating duty
@@ -263,15 +265,24 @@ acquire:
 		if (slot->owner.state == CLUSTER_LOCK_OWNER_EMPTY)
 			memset(slot, 0, sizeof(*slot));
 		cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
+		timeout = r == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT ? cluster_ges_timeout_detail_get() : NULL;
 		ereport(
 			LOG,
 			(errmsg("cluster CF acquire failed (mode %d, result %d)", (int)mode, (int)r),
 			 errdetail("PGRAC_FAMILY=CF_ACQUIRE request=" UINT64_FORMAT " epoch=" UINT64_FORMAT
-					   " master_generation=" UINT64_FORMAT " owner_state=%d registration=%s",
+					   " master_generation=" UINT64_FORMAT " owner_state=%d registration=%s"
+					   " timeout_source=%d timeout_master=%d elapsed_ms=%ld attempts=%d "
+					   "conflicts=%d timeout_ms=%d",
 					   req->request_id, req->holder.cluster_epoch, req->master_gen_snapshot,
 					   (int)slot->owner.state,
 					   req->registration_failure_reason != NULL ? req->registration_failure_reason
-																: "UNREPORTED")));
+																: "UNREPORTED",
+					   timeout != NULL ? (int)timeout->source : 0,
+					   timeout != NULL ? timeout->master_node : -1,
+					   timeout != NULL ? timeout->elapsed_ms : 0L,
+					   timeout != NULL ? timeout->attempts : 0,
+					   timeout != NULL ? timeout->conflict_holders : -1,
+					   timeout != NULL ? timeout->timeout_ms : 0)));
 		return false;
 	}
 }

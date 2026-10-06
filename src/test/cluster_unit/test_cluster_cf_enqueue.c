@@ -40,6 +40,7 @@
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_ges.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_lmon.h"
@@ -114,10 +115,20 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 bool IsUnderPostmaster = false;
 int MyProcPid = 0;
 
+static bool g_capture_log;
+static char g_log_detail[1024];
+static ClusterGesTimeoutDetail g_timeout_detail;
+
+const ClusterGesTimeoutDetail *
+cluster_ges_timeout_detail_get(void)
+{
+	return &g_timeout_detail;
+}
+
 bool
 errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
 {
-	return false;
+	return g_capture_log;
 }
 
 void
@@ -132,9 +143,13 @@ errmsg(const char *fmt pg_attribute_unused(), ...)
 }
 
 int
-errdetail(const char *fmt pg_attribute_unused(), ...)
+errdetail(const char *fmt, ...)
 {
-	return 0; /* errstart keeps the standalone fixture's LOG path disabled. */
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(g_log_detail, sizeof(g_log_detail), fmt, args);
+	va_end(args);
+	return 0;
 }
 
 bool
@@ -1032,8 +1047,16 @@ UT_TEST(test_lock_failclosed_timeout)
 {
 	g_seven_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
 	g_s6_count = 0;
+	g_timeout_detail
+		= (ClusterGesTimeoutDetail){ CLUSTER_GES_TSRC_MASTER_REJECT_TIMEOUT, 2, 137, 3, 1, 30000 };
+	g_log_detail[0] = '\0';
+	g_capture_log = true;
 
 	UT_ASSERT(!cluster_cf_lock(ExclusiveLock));
+	g_capture_log = false;
+	UT_ASSERT(strstr(g_log_detail,
+					 "timeout_master=2 elapsed_ms=137 attempts=3 conflicts=1 timeout_ms=30000")
+			  != NULL);
 	cluster_cf_unlock(ExclusiveLock); /* not held -> no-op */
 
 	UT_ASSERT_EQ(g_s6_count, 0);
