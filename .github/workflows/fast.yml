@@ -272,12 +272,24 @@ jobs:
             --output "$RUNNER_TEMP/pgrac-native-smoke" --vendor / \
             --uid "$(id -u)" --gid "$(id -g)" --commit "$GITHUB_SHA"
 
+      - name: Archive native smoke evidence
+        if: always()
+        run: |
+          # NSS databases belong to root. Archive after fixture cleanup so
+          # upload-artifact need not traverse privileged directories.
+          if [ -d "$RUNNER_TEMP/pgrac-native-smoke" ]; then
+            sudo tar --exclude='*/nssdb' --exclude='*/authkey' \
+              -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/pgrac-native-smoke.tar.gz" \
+              -- pgrac-native-smoke
+            sudo chmod 0644 "$RUNNER_TEMP/pgrac-native-smoke.tar.gz"
+          fi
+
       - name: Upload native smoke evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: linux-native-smoke
-          path: ${{ runner.temp }}/pgrac-native-smoke/
+          path: ${{ runner.temp }}/pgrac-native-smoke.tar.gz
           if-no-files-found: ignore
           retention-days: 7
 
