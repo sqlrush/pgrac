@@ -20,8 +20,13 @@
  */
 #include "postgres.h"
 #include "utils/guc_tables.h"
+#include <time.h>
+static uint64 fixture_now = 1000000;
+static int fixture_clock_gettime(clockid_t id, struct timespec *out);
+#define clock_gettime fixture_clock_gettime
 #include "../../backend/cluster/cluster_storage_quorum_corosync.c"
 #include "../../backend/cluster/cluster_storage_quorum.c"
+#undef clock_gettime
 #undef printf
 #include "unit_test.h"
 
@@ -37,10 +42,21 @@ static StorageCorosyncModel callbacks;
 static int quorate, notified_quorate, finalize_count, track_count;
 static bool notify_enabled, api_failed, changed_after_notify;
 static bool tracking_enabled;
+static unsigned missing_notifications, dispatch_count, poll_dispatch_count;
+static bool pair_on_second_dispatch, remove_peer, remove_self, negative_then_ready;
 static unsigned notification_mismatch;
 static int failing_api_step;
 static const char *bad_key;
 static struct config_generic shared_settings[2];
+
+static int
+fixture_clock_gettime(clockid_t id, struct timespec *out)
+{
+	Assert(id == CLOCK_MONOTONIC);
+	out->tv_sec = fixture_now / 1000000;
+	out->tv_nsec = (fixture_now % 1000000) * 1000;
+	return 0;
+}
 
 struct config_generic *
 find_option(const char *name, bool create_placeholders, bool skip_errors, int elevel)
@@ -99,6 +115,7 @@ fixture_track(uint64 handle, unsigned int flags)
 {
 	Assert(handle == 123 && (flags & 1) != 0);
 	track_count++;
+	poll_dispatch_count = 0;
 	if (api_failed)
 		return 2;
 	/* The upstream service rejects a second trackstart after CHANGES. */
@@ -124,12 +141,18 @@ fixture_dispatch(uint64 handle, int flags)
 	StorageCorosyncRing ring = { 11, 8 };
 	uint32 members[] = { 11, 12 };
 
+	dispatch_count++;
+	poll_dispatch_count++;
 	Assert(handle == 123 && flags == STORAGE_CS_DISPATCH_ALL);
 	if (failing_api_step == CLUSTER_STORAGE_PROVIDER_DISPATCH)
 		return 4;
 	if (notify_enabled) {
 		StorageCorosyncRing member_ring = ring;
-		uint32 member_count = 2;
+		uint32 member_count = remove_peer || remove_self ? 1 : 2;
+		uint32 quorum_count = member_count;
+
+		if (remove_self)
+			ring.node = member_ring.node = members[0] = 12;
 
 		if (notification_mismatch & 1)
 			member_ring.sequence++;
@@ -137,8 +160,14 @@ fixture_dispatch(uint64 handle, int flags)
 			member_count = 1;
 		if (notification_mismatch & 4)
 			member_ring.node = 13;
-		callbacks.members_notify(handle, member_ring, member_count, members, 0, NULL, 0, NULL);
-		callbacks.quorum_notify(handle, notified_quorate, ring, 2, members);
+		if (!(missing_notifications & 1)
+			&& (!pair_on_second_dispatch || poll_dispatch_count == 1))
+			callbacks.members_notify(handle, member_ring, member_count, members, 0, NULL, 0, NULL);
+		if (negative_then_ready)
+			callbacks.quorum_notify(handle, 0, ring, quorum_count, members);
+		if (!(missing_notifications & 2)
+			&& (!pair_on_second_dispatch || poll_dispatch_count == 2))
+			callbacks.quorum_notify(handle, notified_quorate, ring, quorum_count, members);
 	}
 	if (changed_after_notify) {
 		ring.sequence++;
@@ -206,6 +235,9 @@ reset_fixture(void)
 	quorate = notified_quorate = 1;
 	notify_enabled = true;
 	tracking_enabled = false;
+	missing_notifications = dispatch_count = poll_dispatch_count = 0;
+	pair_on_second_dispatch = remove_peer = remove_self = negative_then_ready = false;
+	fixture_now = 1000000;
 	api_failed = changed_after_notify = false;
 	notification_mismatch = 0;
 	failing_api_step = 0;
@@ -416,10 +448,123 @@ UT_TEST(test_provider_notification_refusal_detail_is_exact)
 				 CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_PROFILE, 0));
 }
 
+
+UT_TEST(test_pending_pair_preserves_only_the_original_unexpired_view)
+{
+	unsigned missing;
+
+	for (missing = 1; missing <= 3; missing++) {
+		ClusterStorageQuorumState state;
+		ClusterStorageQuorumView before, after;
+
+		reset_fixture();
+		cluster_storage_quorum_attach(&state, true);
+		cluster_storage_quorum_refresh(fixture_now, 100);
+		UT_ASSERT(cluster_storage_quorum_snapshot(&before));
+		missing_notifications = missing;
+		fixture_now += 50;
+		cluster_storage_quorum_refresh(fixture_now, 100);
+		UT_ASSERT(cluster_storage_quorum_allows_members(3, 0));
+		UT_ASSERT(cluster_storage_quorum_snapshot(&after));
+		UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+		UT_ASSERT_EQ(poll_dispatch_count, 2);
+		fixture_now = before.expires_us;
+		UT_ASSERT(!cluster_storage_quorum_allows_node(0));
+		cluster_storage_quorum_refresh(fixture_now, 100);
+		UT_ASSERT(!cluster_storage_quorum_allows_node(0));
+		cluster_storage_quorum_attach(NULL, false);
+	}
+}
+
+UT_TEST(test_ring_skew_does_not_revoke_or_renew_unchanged_members)
+{
+	ClusterStorageQuorumState state;
+	ClusterStorageQuorumView before, after;
+
+	reset_fixture();
+	cluster_storage_quorum_attach(&state, true);
+	cluster_storage_quorum_refresh(fixture_now, 100);
+	UT_ASSERT(cluster_storage_quorum_snapshot(&before));
+	notification_mismatch = 1;
+	fixture_now++;
+	cluster_storage_quorum_refresh(fixture_now, 100);
+	UT_ASSERT(cluster_storage_quorum_allows_members(3, 0));
+	UT_ASSERT(cluster_storage_quorum_snapshot(&after));
+	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	UT_ASSERT_EQ(poll_dispatch_count, 2);
+	fixture_now = before.expires_us;
+	UT_ASSERT(!cluster_storage_quorum_allows_node(1));
+	notification_mismatch = 0;
+	cluster_storage_quorum_refresh(fixture_now, 100);
+	UT_ASSERT(cluster_storage_quorum_allows_members(3, 0));
+	cluster_storage_quorum_attach(NULL, false);
+}
+
+UT_TEST(test_current_pair_can_finish_on_one_bounded_second_dispatch)
+{
+	ClusterStorageQuorumState state;
+
+	reset_fixture();
+	pair_on_second_dispatch = true;
+	cluster_storage_quorum_attach(&state, true);
+	cluster_storage_quorum_refresh(fixture_now, 100);
+	UT_ASSERT(cluster_storage_quorum_allows_members(3, 0));
+	UT_ASSERT_EQ(track_count, 1);
+	UT_ASSERT_EQ(dispatch_count, 2);
+	cluster_storage_quorum_attach(NULL, false);
+}
+
+UT_TEST(test_actual_member_change_and_negative_evidence_revoke_immediately)
+{
+	unsigned scenario;
+
+	for (scenario = 0; scenario < 7; scenario++) {
+		ClusterStorageQuorumState state;
+
+		reset_fixture();
+		cluster_storage_quorum_attach(&state, true);
+		cluster_storage_quorum_refresh(fixture_now, 100);
+		UT_ASSERT(cluster_storage_quorum_allows_members(3, 0));
+		switch (scenario) {
+			case 0: remove_peer = true; break;
+			case 1: remove_peer = true; missing_notifications = 2; break;
+			case 2: remove_self = true; missing_notifications = 2; break;
+			case 3: quorate = 0; missing_notifications = 3; break;
+			case 4: notification_mismatch = 4; break;
+			case 5: negative_then_ready = true; break;
+			case 6: bad_key = "totem.cluster_name"; break;
+		}
+		fixture_now++;
+		cluster_storage_quorum_refresh(fixture_now, 100);
+		UT_ASSERT(!cluster_storage_quorum_allows_node(1));
+		UT_ASSERT(!cluster_storage_quorum_allows_members(3, 0));
+		if (scenario == 0)
+			UT_ASSERT(cluster_storage_quorum_allows_node(0));
+		else
+			UT_ASSERT(!cluster_storage_quorum_allows_node(0));
+		/* An incomplete later poll cannot undo any revoked membership. */
+		missing_notifications = 3;
+		remove_peer = remove_self = negative_then_ready = false;
+		notification_mismatch = 0;
+		quorate = 1;
+		bad_key = NULL;
+		fixture_now++;
+		cluster_storage_quorum_refresh(fixture_now, 100);
+		UT_ASSERT(!cluster_storage_quorum_allows_node(1));
+		if (scenario != 0)
+			UT_ASSERT(!cluster_storage_quorum_allows_node(0));
+		cluster_storage_quorum_attach(NULL, false);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(13);
+	UT_RUN(test_pending_pair_preserves_only_the_original_unexpired_view);
+	UT_RUN(test_ring_skew_does_not_revoke_or_renew_unchanged_members);
+	UT_RUN(test_current_pair_can_finish_on_one_bounded_second_dispatch);
+	UT_RUN(test_actual_member_change_and_negative_evidence_revoke_immediately);
 	UT_RUN(test_exact_profile_and_current_component);
 	UT_RUN(test_cached_callback_cannot_renew_current_permission);
 	UT_RUN(test_loss_disconnects_without_retaining_success);
