@@ -220,7 +220,6 @@ cluster_ko_shared_structure_peer_v2(uint32 slot, uint64 serial, int32 peer,
 	return true;
 }
 
-#ifndef PGRAC_TEST_REAL_PI_WRITEBACK
 bool
 cluster_pcm_lock_pi_obligations_absent_v1(BufferTag tag pg_attribute_unused())
 {
@@ -229,6 +228,7 @@ cluster_pcm_lock_pi_obligations_absent_v1(BufferTag tag pg_attribute_unused())
 	return false;
 }
 
+#ifndef PGRAC_TEST_REAL_PI_WRITEBACK
 bool
 cluster_pcm_lock_pi_write_snapshot_v1(BufferTag tag, ClusterPcmPiWriteCutV1 *out)
 {
