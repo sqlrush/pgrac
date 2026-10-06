@@ -307,10 +307,39 @@ UT_TEST(test_provider_failure_detail_travels_with_the_rejected_generation)
 	UT_ASSERT_EQ(check.result, CLUSTER_STORAGE_CHECK_PROVIDER);
 }
 
+UT_TEST(test_incomplete_never_retains_invalid_or_expired_evidence)
+{
+	unsigned scenario;
+
+	for (scenario = 0; scenario < 8; scenario++) {
+		uint64 start = 101;
+		uint64 duration = 50;
+
+		ready();
+		fake_monotonic = 101;
+		switch (scenario) {
+			case 0: fake_monotonic = 150; break;
+			case 1: fake_monotonic = 99; break;
+			case 2: start = 0; break;
+			case 3: duration = 0; break;
+			case 4: start = UINT64_MAX - 5; break;
+			case 5: pg_atomic_write_u64(&test_state.generation, UINT64_MAX); break;
+			case 6: pg_atomic_write_u32(&test_state.reason, CLUSTER_STORAGE_QUORUM_NOT_QUORATE); break;
+			case 7: pg_atomic_write_u64(&test_state.members[0], 2); break;
+		}
+		memset(&supplied, 0, sizeof(supplied));
+		supplied.reason = CLUSTER_STORAGE_QUORUM_INCOMPLETE;
+		cluster_storage_quorum_refresh(start, duration);
+		UT_ASSERT(!cluster_storage_quorum_allows_node(0));
+		UT_ASSERT_EQ(pg_atomic_read_u64(&test_state.members[0]), 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
+	UT_RUN(test_incomplete_never_retains_invalid_or_expired_evidence);
 	UT_RUN(test_mapping_rejects_aliases_missing_slots_and_overflow);
 	UT_RUN(test_provider_component_requires_exact_mapping_and_local_identity);
 	UT_RUN(test_current_component_gates_self_peers_and_candidate_as_one_snapshot);

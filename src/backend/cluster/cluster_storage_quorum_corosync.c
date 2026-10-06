@@ -70,6 +70,29 @@ static uint32 storage_local_id;
 static uint32 storage_node_map[CLUSTER_MAX_NODES];
 static ClusterStorageQuorumView storage_notified;
 static ClusterStorageQuorumView storage_members_notified;
+static ClusterStorageQuorumReason storage_notification_failure;
+static bool storage_members_seen;
+static uint64 storage_observed_members[2];
+
+/* Do not erase a negative callback with a later positive one in this poll.
+ * The intersection is revocation evidence only, never a complete component. */
+static void
+storage_observe_notification(const ClusterStorageQuorumView *view)
+{
+	if (view->reason != CLUSTER_STORAGE_QUORUM_READY) {
+		if (storage_notification_failure != CLUSTER_STORAGE_QUORUM_NOT_QUORATE)
+			storage_notification_failure = view->reason;
+		return;
+	}
+	if (!storage_members_seen) {
+		memcpy(storage_observed_members, view->members, sizeof(storage_observed_members));
+		storage_members_seen = true;
+	} else {
+		storage_observed_members[0] &= view->members[0];
+		storage_observed_members[1] &= view->members[1];
+	}
+}
+
 
 static void
 storage_quorum_notify(uint64 handle, uint32 quorate, StorageCorosyncRing ring, uint32 count,
@@ -80,6 +103,7 @@ storage_quorum_notify(uint64 handle, uint32 quorate, StorageCorosyncRing ring, u
 	(void)cluster_storage_quorum_decode_component(&storage_notified, ring.node, ring.sequence,
 												  quorate, members, count, storage_local_id,
 												  cluster_node_id, storage_node_map);
+	storage_observe_notification(&storage_notified);
 }
 
 /* Keep both notifications: during a provider sync the membership view can
@@ -96,6 +120,7 @@ storage_members_notify(uint64 handle, StorageCorosyncRing ring, uint32 count, co
 	(void)cluster_storage_quorum_decode_component(
 		&storage_members_notified, ring.node, ring.sequence, 1, members, count, storage_local_id,
 		cluster_node_id, storage_node_map);
+	storage_observe_notification(&storage_members_notified);
 }
 
 static bool
@@ -257,7 +282,7 @@ storage_disconnect(void)
 /*
  * cluster_storage_corosync_sample -- Read current storage eligibility.
  * Inputs: local, immutable database profile and Corosync service state.
- * Returns: a complete observation, or an explicit ineligible reason in out.
+ * Returns: a complete observation, an incomplete pair, or a negative result.
  * Side Effects: QVOTEC-only local library IPC; never changes votes or services.
  * Author: SqlRush <sqlrush@gmail.com>
  */
@@ -266,6 +291,7 @@ cluster_storage_corosync_sample(ClusterStorageQuorumView *out)
 {
 	int quorate = 0;
 	int result;
+	int attempt;
 
 	memset(out, 0, sizeof(*out));
 	out->provider_diagnostic
@@ -304,6 +330,9 @@ cluster_storage_corosync_sample(ClusterStorageQuorumView *out)
 	 * return CS_ERR_EXIST. Every poll must obtain its own complete sample. */
 	memset(&storage_notified, 0, sizeof(storage_notified));
 	memset(&storage_members_notified, 0, sizeof(storage_members_notified));
+	storage_notification_failure = CLUSTER_STORAGE_QUORUM_UNAVAILABLE;
+	storage_members_seen = false;
+	memset(storage_observed_members, 0, sizeof(storage_observed_members));
 	result = storage_api.trackstart(storage_quorum_handle, STORAGE_CS_TRACK_CURRENT);
 	out->provider_diagnostic
 		= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_TRACK_CURRENT, result);
@@ -314,41 +343,55 @@ cluster_storage_corosync_sample(ClusterStorageQuorumView *out)
 		= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_GETQUORATE, result);
 	if (result != STORAGE_CS_OK)
 		goto failed;
-	result = storage_api.dispatch(storage_quorum_handle, STORAGE_CS_DISPATCH_ALL);
-	out->provider_diagnostic
-		= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_DISPATCH, result);
-	if (result != STORAGE_CS_OK)
-		goto failed;
-	if (quorate != 1 || storage_notified.reason == CLUSTER_STORAGE_QUORUM_NOT_QUORATE) {
-		out->reason = CLUSTER_STORAGE_QUORUM_NOT_QUORATE;
+	/* ALL is nonblocking. A second dispatch can finish a pair split across
+	 * deliveries; it does not retrack, wait, or renew an incomplete sample. */
+	for (attempt = 0; attempt < 2; attempt++) {
+		result = storage_api.dispatch(storage_quorum_handle, STORAGE_CS_DISPATCH_ALL);
 		out->provider_diagnostic
-			= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_NOT_QUORATE, 0);
-		return;
-	}
-	if (storage_notified.reason == CLUSTER_STORAGE_QUORUM_UNAVAILABLE
-		|| storage_members_notified.reason == CLUSTER_STORAGE_QUORUM_UNAVAILABLE) {
+			= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_DISPATCH, result);
+		if (result != STORAGE_CS_OK)
+			goto failed;
+		if (quorate != 1 || storage_notification_failure == CLUSTER_STORAGE_QUORUM_NOT_QUORATE) {
+			out->reason = CLUSTER_STORAGE_QUORUM_NOT_QUORATE;
+			out->provider_diagnostic
+				= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_NOT_QUORATE, 0);
+			return;
+		}
+		if (storage_notification_failure == CLUSTER_STORAGE_QUORUM_CONFIGURATION) {
+			out->reason = CLUSTER_STORAGE_QUORUM_CONFIGURATION;
+			out->provider_diagnostic = CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
+				CLUSTER_STORAGE_PROVIDER_NOTIFICATION_INVALID, 0);
+			return;
+		}
+		if (storage_notified.reason != CLUSTER_STORAGE_QUORUM_READY
+			|| storage_members_notified.reason != CLUSTER_STORAGE_QUORUM_READY) {
+			out->provider_diagnostic = CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
+				CLUSTER_STORAGE_PROVIDER_NOTIFICATION_MISSING, 0);
+			continue;
+		}
+		if (storage_notified.ring_node != storage_members_notified.ring_node
+			|| storage_notified.ring_sequence != storage_members_notified.ring_sequence
+			|| memcmp(storage_notified.members, storage_members_notified.members,
+					  sizeof(storage_notified.members)) != 0) {
+			out->provider_diagnostic = CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
+				CLUSTER_STORAGE_PROVIDER_NOTIFICATION_MISMATCH, 0);
+			continue;
+		}
+		if (memcmp(storage_observed_members, storage_notified.members,
+				   sizeof(storage_observed_members)) != 0) {
+			/* A later pair cannot hide a removal observed earlier in this poll. */
+			out->reason = CLUSTER_STORAGE_QUORUM_CONFIGURATION;
+			out->provider_diagnostic = CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
+				CLUSTER_STORAGE_PROVIDER_NOTIFICATION_MISMATCH, 0);
+			return;
+		}
+		*out = storage_notified;
 		out->provider_diagnostic
-			= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_NOTIFICATION_MISSING, 0);
+			= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_READY, STORAGE_CS_OK);
 		return;
 	}
-	if (storage_notified.reason != CLUSTER_STORAGE_QUORUM_READY
-		|| storage_members_notified.reason != CLUSTER_STORAGE_QUORUM_READY) {
-		out->provider_diagnostic
-			= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_NOTIFICATION_INVALID, 0);
-		return;
-	}
-	if (storage_notified.ring_node != storage_members_notified.ring_node
-		|| storage_notified.ring_sequence != storage_members_notified.ring_sequence
-		|| memcmp(storage_notified.members, storage_members_notified.members,
-				  sizeof(storage_notified.members))
-			   != 0) {
-		out->provider_diagnostic = CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
-			CLUSTER_STORAGE_PROVIDER_NOTIFICATION_MISMATCH, 0);
-		return;
-	}
-	*out = storage_notified;
-	out->provider_diagnostic
-		= CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_READY, STORAGE_CS_OK);
+	out->reason = CLUSTER_STORAGE_QUORUM_INCOMPLETE;
+	memcpy(out->members, storage_observed_members, sizeof(out->members));
 	return;
 failed:
 	storage_disconnect();

@@ -26,7 +26,9 @@ typedef enum ClusterStorageQuorumReason {
 	CLUSTER_STORAGE_QUORUM_UNAVAILABLE = 0,
 	CLUSTER_STORAGE_QUORUM_CONFIGURATION,
 	CLUSTER_STORAGE_QUORUM_NOT_QUORATE,
-	CLUSTER_STORAGE_QUORUM_READY
+	CLUSTER_STORAGE_QUORUM_READY,
+	/* A provider poll with no complete pair, never new eligibility. */
+	CLUSTER_STORAGE_QUORUM_INCOMPLETE
 } ClusterStorageQuorumReason;
 
 /* Observation only: zero return code means that no API result was sampled. */
@@ -54,6 +56,8 @@ typedef struct ClusterStorageQuorumView {
 	ClusterStorageQuorumReason reason;
 	uint32 ring_node;
 	uint64 ring_sequence;
+	/* INCOMPLETE: intersection of valid notifications, zero if none arrived.
+	 * Those bits can revoke an old observation, but cannot authorize one. */
 	uint64 members[2];
 	uint64 sampled_us;
 	uint64 expires_us;

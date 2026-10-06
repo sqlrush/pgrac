@@ -25,6 +25,8 @@
 #include <time.h>
 
 static ClusterStorageQuorumState *storage_state;
+static ClusterStorageCheckResult storage_view_result(const ClusterStorageQuorumView *view,
+													uint64 now);
 
 /* This observation expires within one OS boot, independent of wall-clock
  * corrections. It is never persisted or reused after postmaster restart. */
@@ -167,7 +169,7 @@ cluster_storage_quorum_attach(ClusterStorageQuorumState *state, bool initialize)
 /*
  * cluster_storage_quorum_refresh -- Publish a new observation from QVOTEC.
  * Inputs: cycle start and the existing database observation lease duration.
- * Returns: void; failure publishes an empty, ineligible view.
+ * Returns: void; incomplete notifications cannot renew a prior observation.
  * Side Effects: calls the storage provider; atomically replaces the shared view.
  * No observer calls this function and no disk ALIVE evidence is discarded.
  */
@@ -185,6 +187,21 @@ cluster_storage_quorum_refresh(uint64 now_us, uint64 duration_us)
 	if (now_us == 0 || duration_us == 0 || now_us > UINT64_MAX - duration_us
 		|| generation == UINT64_MAX)
 		view.reason = CLUSTER_STORAGE_QUORUM_UNAVAILABLE;
+	if (view.reason == CLUSTER_STORAGE_QUORUM_INCOMPLETE) {
+		ClusterStorageQuorumView current;
+
+		/* No new authority: retain the exact original expiry and generation.
+		 * A valid partial membership can still prove removal immediately.
+		 * API/configuration failures and explicit loss never enter this path. */
+		if (cluster_storage_quorum_snapshot(&current)
+			&& storage_view_result(&current, cluster_storage_quorum_now_us())
+				   == CLUSTER_STORAGE_CHECK_ALLOWED
+			&& now_us >= current.sampled_us && now_us < current.expires_us
+			&& ((view.members[0] == 0 && view.members[1] == 0)
+				|| ((current.members[0] & ~view.members[0]) == 0
+					&& (current.members[1] & ~view.members[1]) == 0)))
+			return;
+	}
 	if (view.reason != CLUSTER_STORAGE_QUORUM_READY) {
 		view.members[0] = view.members[1] = 0;
 		view.ring_sequence = 0;

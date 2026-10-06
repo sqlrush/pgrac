@@ -274,7 +274,7 @@ UT_TEST(test_cached_callback_cannot_renew_current_permission)
 	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_READY);
 	notify_enabled = false;
 	cluster_storage_corosync_sample(&view);
-	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_UNAVAILABLE);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_INCOMPLETE);
 	UT_ASSERT_EQ(view.members[0], 0);
 }
 
@@ -310,8 +310,8 @@ UT_TEST(test_both_quorum_observations_and_matching_ring_are_required)
 	notified_quorate = 1;
 	changed_after_notify = true;
 	cluster_storage_corosync_sample(&view);
-	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_UNAVAILABLE);
-	UT_ASSERT_EQ(view.members[0], 0);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_INCOMPLETE);
+	UT_ASSERT_EQ(view.members[0], 1);
 }
 
 UT_TEST(test_configuration_failure_revokes_previously_valid_observation)
@@ -377,11 +377,20 @@ UT_TEST(test_old_quorum_after_new_nodelist_cannot_renew_permission)
 		UT_ASSERT(cluster_storage_quorum_allows_node(1));
 		notification_mismatch = mismatch;
 		cluster_storage_corosync_sample(&view);
-		UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_UNAVAILABLE);
-		UT_ASSERT_EQ(view.members[0], 0);
+		UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_INCOMPLETE);
+		UT_ASSERT_EQ(view.members[0], (mismatch & 2) ? 1 : 3);
 		cluster_storage_quorum_refresh(cluster_storage_quorum_now_us(), 1000000);
-		UT_ASSERT(!cluster_storage_quorum_allows_node(0));
-		UT_ASSERT(!cluster_storage_quorum_allows_node(1));
+		if (mismatch == 1) {
+			/* Same membership, unfinished ring pair: no renewal. */
+			UT_ASSERT(cluster_storage_quorum_allows_node(0));
+			UT_ASSERT(cluster_storage_quorum_allows_node(1));
+			fixture_now += 1000000;
+			UT_ASSERT(!cluster_storage_quorum_allows_node(0));
+			UT_ASSERT(!cluster_storage_quorum_allows_node(1));
+		} else {
+			UT_ASSERT(!cluster_storage_quorum_allows_node(0));
+			UT_ASSERT(!cluster_storage_quorum_allows_node(1));
+		}
 	}
 	notification_mismatch = 0;
 	cluster_storage_quorum_refresh(cluster_storage_quorum_now_us(), 1000000);
@@ -426,18 +435,18 @@ UT_TEST(test_provider_notification_refusal_detail_is_exact)
 	reset_fixture();
 	notify_enabled = false;
 	cluster_storage_corosync_sample(&view);
-	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_UNAVAILABLE);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_INCOMPLETE);
 	UT_ASSERT_EQ(view.provider_diagnostic, CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
 											   CLUSTER_STORAGE_PROVIDER_NOTIFICATION_MISSING, 0));
 	notify_enabled = true;
 	notification_mismatch = 1;
 	cluster_storage_corosync_sample(&view);
-	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_UNAVAILABLE);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_INCOMPLETE);
 	UT_ASSERT_EQ(view.provider_diagnostic, CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
 											   CLUSTER_STORAGE_PROVIDER_NOTIFICATION_MISMATCH, 0));
 	notification_mismatch = 4;
 	cluster_storage_corosync_sample(&view);
-	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_UNAVAILABLE);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_CONFIGURATION);
 	UT_ASSERT_EQ(view.provider_diagnostic, CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
 											   CLUSTER_STORAGE_PROVIDER_NOTIFICATION_INVALID, 0));
 	notification_mismatch = 0;
