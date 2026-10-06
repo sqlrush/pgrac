@@ -341,6 +341,7 @@ OBJS = \
 	cluster_views.o \
 	cluster_wal_claim.o \
 	cluster_wal_inputs.o \
+	cluster_pi_contribution_stream.o \
 	cluster_wal_cut.o \
 	cluster_pi_data.o \
 	cluster_pi_writeback.o \
