@@ -256,6 +256,19 @@ cluster_authority_clear_matching_internal(const ClusterAuthorityBindingLocal *bi
 		cleared = true;
 	}
 	LWLockRelease(&cluster_phase_state->lwlock);
+	/* Report the actual one-time identity retirement, outside its lock.
+	 * The later LMS sample is diagnostic, never the reason for this clear. */
+	if (cleared && !preserve_handoff_identity && cluster_shared_config)
+		ereport(LOG,
+				(errmsg("cluster authority binding cleared"),
+				 errdetail("PGRAC_FAMILY=AUTHORITY_CLEAR caller=%s backend_type=%d "
+						   "old_readiness=%d origin_thread=%u boot=" UINT64_FORMAT
+						   " lms_generation=" UINT64_FORMAT " formation_epoch=" UINT64_FORMAT
+						   " lms_ready_after_clear=%d",
+						   caller != NULL ? caller : "UNREPORTED", (int)MyBackendType,
+						   (int)binding->state, (unsigned)binding->origin_thread,
+						   binding->boot_incarnation, binding->lms_generation,
+						   binding->formation.local_epoch, cluster_lms_is_ready())));
 	return cleared;
 }
 

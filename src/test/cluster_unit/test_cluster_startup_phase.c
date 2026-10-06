@@ -156,12 +156,17 @@ static jmp_buf phase4_fatal_jump;
 static bool phase4_capture_fatal = false;
 static int phase4_last_elevel = 0;
 static char phase4_last_error[512];
+static bool capture_authority_clear;
+static int authority_clear_logs;
+static bool authority_clear_under_lock;
+static char authority_clear_detail[1024];
+static unsigned phase_lwlock_depth;
 
 bool
 errstart(int e, const char *d pg_attribute_unused())
 {
 	phase4_last_elevel = e;
-	return phase4_capture_fatal;
+	return phase4_capture_fatal || capture_authority_clear;
 }
 
 /* Runtime boundary: distinguish the HW worker from the native startup owner. */
@@ -176,7 +181,7 @@ bool
 errstart_cold(int e, const char *d pg_attribute_unused())
 {
 	phase4_last_elevel = e;
-	return phase4_capture_fatal;
+	return phase4_capture_fatal || capture_authority_clear;
 }
 void
 errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
@@ -207,8 +212,16 @@ errmsg_internal(const char *f pg_attribute_unused(), ...)
 	return 0;
 }
 int
-errdetail(const char *f pg_attribute_unused(), ...)
+errdetail(const char *f, ...)
 {
+	if (capture_authority_clear && strstr(f, "PGRAC_FAMILY=AUTHORITY_CLEAR") != NULL) {
+		va_list ap;
+		va_start(ap, f);
+		vsnprintf(authority_clear_detail, sizeof(authority_clear_detail), f, ap);
+		va_end(ap);
+		authority_clear_logs++;
+		authority_clear_under_lock |= phase_lwlock_depth != 0;
+	}
 	return 0;
 }
 int
@@ -305,6 +318,7 @@ bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
 	phase_lwlock_blocking_calls++;
+	phase_lwlock_depth++;
 	return true;
 }
 
@@ -312,12 +326,17 @@ bool
 LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
 	phase_lwlock_conditional_calls++;
+	if (phase_lwlock_conditional_result)
+		phase_lwlock_depth++;
 	return phase_lwlock_conditional_result;
 }
 
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+{
+	if (phase_lwlock_depth != 0)
+		phase_lwlock_depth--;
+}
 
 void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
@@ -1557,6 +1576,34 @@ UT_TEST(test_rf_a2_serving_does_not_consume_recovery_duty_cache)
 	UT_ASSERT_EQ((int)cluster_authority_readiness_get(), (int)CLUSTER_AUTHORITY_SERVING_READY);
 }
 
+UT_TEST(test_authority_clear_reports_original_identity_once_outside_lock)
+{
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_run_phase4_sequence();
+	UT_ASSERT(cluster_serving_ready_is_current());
+	cluster_shared_config = true;
+	phase_lwlock_depth = 0;
+	authority_clear_logs = 0;
+	authority_clear_under_lock = false;
+	capture_authority_clear = true;
+	/* Diagnostic only: the existing refusal and destructive clear remain. */
+	phase4_test_in_quorum = false;
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_OFF);
+	UT_ASSERT_EQ(authority_clear_logs, 1);
+	UT_ASSERT(strstr(authority_clear_detail, "caller=serving_ready_stale") != NULL);
+	UT_ASSERT(strstr(authority_clear_detail, "lms_generation=7") != NULL);
+	UT_ASSERT(strstr(authority_clear_detail, "formation_epoch=1") != NULL);
+	UT_ASSERT(strstr(authority_clear_detail, "lms_ready_after_clear=1") != NULL);
+	UT_ASSERT(!authority_clear_under_lock);
+	phase4_test_in_quorum = true;
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	UT_ASSERT_EQ(authority_clear_logs, 1);
+	capture_authority_clear = false;
+	reset_phase_service_fixture(true);
+}
+
 
 UT_TEST(test_rf_a2_serving_rebinds_only_after_lmon_closes_recovery)
 {
@@ -2606,7 +2653,8 @@ UT_TEST(test_nonshared_phase4_keeps_original_activation_entry)
 int
 main(void)
 {
-	UT_PLAN(53);
+	UT_PLAN(54);
+	UT_RUN(test_authority_clear_reports_original_identity_once_outside_lock);
 	UT_RUN(test_slow_startup_control_crosses_remote_master_phase4);
 	UT_RUN(test_phase4_startup_control_keeps_identity_and_namespace_refusals);
 	UT_RUN(test_shared_phase4_waits_for_actual_semantic_open);
