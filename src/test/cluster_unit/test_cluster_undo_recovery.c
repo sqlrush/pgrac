@@ -2,6 +2,7 @@
  * test_cluster_undo_recovery.c
  *    Original recovery authority and canonical UNDO path qualification.
  *-------------------------------------------------------------------------
+ * Author: SqlRush <sqlrush@gmail.com>
  */
 #include "postgres.h"
 #include "access/xlog.h"
@@ -45,7 +46,11 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 	abort();
 }
 
-uint64 GetSystemIdentifier(void) { return system_id; }
+uint64
+GetSystemIdentifier(void)
+{
+	return system_id;
+}
 
 bool
 cluster_shared_fs_get_protected_set_identity(ClusterProtectedSetIdentityV1 *out)
@@ -65,7 +70,7 @@ cluster_thread_recovery_authority_revalidate_nowait_v1(const ClusterThreadRecove
 
 bool
 rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *p, uint64 sysid,
-	const uint8 uuid[16], const RfContributorStreamCutV1 *cut)
+									  const uint8 uuid[16], const RfContributorStreamCutV1 *cut)
 {
 	UT_ASSERT(p == plan);
 	return source_ok && sysid == 123 && memcmp(uuid, storage_uuid, 16) == 0
@@ -86,16 +91,21 @@ cluster_shared_fs_undo_path_resolve(uint8 owner, uint32 segment, char *path, siz
 }
 
 bool
-rf_side_online_plan_multixact_page_retired_v1(const RfSideOnlinePlanV1 *p,
-	uint32 origin_thread, XLogRecPtr source_lsn, XLogRecPtr source_end_lsn, bool members, uint32 page)
+rf_side_online_plan_multixact_page_retired_v1(const RfSideOnlinePlanV1 *p, uint32 origin_thread,
+											  XLogRecPtr source_lsn, XLogRecPtr source_end_lsn,
+											  bool members, uint32 page)
 {
-	return p == plan && origin_thread == 3 && source_lsn == 100 && source_end_lsn == 200
-		&& members && page == 0;
+	return p == plan && origin_thread == 3 && source_lsn == 100 && source_end_lsn == 200 && members
+		   && page == 0;
 }
 
 #undef ereport
-#define ereport(level_, rest_) \
-	do { if (expect_failure) longjmp(failure_jump, 1); abort(); } while (0)
+#define ereport(level_, rest_)                                                                     \
+	do {                                                                                           \
+		if (expect_failure)                                                                        \
+			longjmp(failure_jump, 1);                                                              \
+		abort();                                                                                   \
+	} while (0)
 #include "test_cluster_undo_path_native.inc"
 
 static int cached_fd = -1;
@@ -110,7 +120,8 @@ static int
 fixture_open(const char *path, int flags)
 {
 	opened_shared = strcmp(path, "/shared/pg_undo/instance_2/seg_513.dat") == 0;
-	UT_ASSERT(opened_shared || strcmp(path, "/recoverer/local/pg_undo/instance_2/seg_513.dat") == 0);
+	UT_ASSERT(opened_shared
+			  || strcmp(path, "/recoverer/local/pg_undo/instance_2/seg_513.dat") == 0);
 	fd_opens++;
 	return 42;
 }
@@ -127,8 +138,10 @@ static int
 fixture_fsync(int fd)
 {
 	UT_ASSERT_EQ(fd, 42);
-	if (opened_shared) shared_syncs++;
-	else local_syncs++;
+	if (opened_shared)
+		shared_syncs++;
+	else
+		local_syncs++;
 	return 0;
 }
 
@@ -199,48 +212,61 @@ reset_authority(void)
 
 UT_TEST(test_original_resolver_reaches_only_scoped_canonical_origin)
 {
-	ClusterUndoRecoveryScopeV1 scope = {0};
+	ClusterUndoRecoveryScopeV1 scope = { 0 };
 	char path[MAXPGPATH];
 
 	reset_authority();
-	UT_ASSERT_EQ(cluster_undo_path_resolve(cluster_undo_recovery_intent_for_owner(3),
-		3, 513, path, sizeof(path)), 0);
+	UT_ASSERT_EQ(cluster_undo_path_resolve(cluster_undo_recovery_intent_for_owner(3), 3, 513, path,
+										   sizeof(path)),
+				 0);
 	UT_ASSERT(strcmp(path, "/recoverer/local/pg_undo/instance_2/seg_513.dat") == 0);
 	if (!cluster_undo_recovery_scope_enter_v1(&scope, &authority, plan)) {
 		UT_ASSERT(false);
 		return;
 	}
 	UT_ASSERT_EQ(cluster_undo_recovery_intent_for_owner(3), CLUSTER_UNDO_PATH_RECOVERY_SHARED);
-	UT_ASSERT_EQ(cluster_undo_path_resolve(cluster_undo_recovery_intent_for_owner(3),
-		3, 513, path, sizeof(path)), 0);
+	UT_ASSERT_EQ(cluster_undo_path_resolve(cluster_undo_recovery_intent_for_owner(3), 3, 513, path,
+										   sizeof(path)),
+				 0);
 	UT_ASSERT(strcmp(path, "/shared/pg_undo/instance_2/seg_513.dat") == 0);
-	UT_ASSERT_EQ(cluster_undo_path_resolve(cluster_undo_recovery_intent_for_owner(2),
-		2, 257, path, sizeof(path)), -1);
-	UT_ASSERT_EQ(cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED,
-		3, 1, path, sizeof(path)), -1);
+	UT_ASSERT_EQ(cluster_undo_path_resolve(cluster_undo_recovery_intent_for_owner(2), 2, 257, path,
+										   sizeof(path)),
+				 -1);
+	UT_ASSERT_EQ(
+		cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, 3, 1, path, sizeof(path)), -1);
 	UT_ASSERT_EQ(path_calls, 1);
 	cluster_undo_recovery_scope_leave_v1(&scope);
 	UT_ASSERT_EQ(cluster_undo_recovery_intent_for_owner(3), CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL);
-	UT_ASSERT_EQ(cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED,
-		3, 513, path, sizeof(path)), -1);
+	UT_ASSERT_EQ(
+		cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, 3, 513, path, sizeof(path)),
+		-1);
 }
 
 UT_TEST(test_scope_rejects_missing_or_non_mutation_authority)
 {
 	for (int fault = 0; fault < 12; fault++) {
-		ClusterUndoRecoveryScopeV1 scope = {0};
+		ClusterUndoRecoveryScopeV1 scope = { 0 };
 
 		reset_authority();
-		if (fault < 5) authority_result = (ClusterThreadRecoveryAuthorityResultV1)(fault + 1);
-		if (fault == 5) serial.mode = CLUSTER_RECOVERY_SERIAL_INPUT_SEAL;
-		if (fault == 6) serial.mode = CLUSTER_RECOVERY_SERIAL_INITIALIZER;
-		if (fault == 7) source_ok = false;
-		if (fault == 8) storage_ok = false;
-		if (fault == 9) system_id++;
-		if (fault == 10) ClusterConfShmem->node_count = 1;
-		if (fault == 11) cluster_undo_gcs_coherence = false;
+		if (fault < 5)
+			authority_result = (ClusterThreadRecoveryAuthorityResultV1)(fault + 1);
+		if (fault == 5)
+			serial.mode = CLUSTER_RECOVERY_SERIAL_INPUT_SEAL;
+		if (fault == 6)
+			serial.mode = CLUSTER_RECOVERY_SERIAL_INITIALIZER;
+		if (fault == 7)
+			source_ok = false;
+		if (fault == 8)
+			storage_ok = false;
+		if (fault == 9)
+			system_id++;
+		if (fault == 10)
+			ClusterConfShmem->node_count = 1;
+		if (fault == 11)
+			cluster_undo_gcs_coherence = false;
 		UT_ASSERT(!cluster_undo_recovery_scope_enter_v1(&scope, &authority, plan));
-		UT_ASSERT_EQ(cluster_undo_recovery_intent_for_owner(3), CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL);
+		UT_ASSERT_EQ(cluster_undo_recovery_intent_for_owner(3),
+					 CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL);
 		UT_ASSERT_EQ(path_calls, 0);
 		cluster_undo_recovery_scope_leave_v1(&scope);
 	}
@@ -249,7 +275,7 @@ UT_TEST(test_scope_rejects_missing_or_non_mutation_authority)
 UT_TEST(test_stale_scope_never_falls_back_to_local_path)
 {
 	for (int fault = 0; fault < 8; fault++) {
-		ClusterUndoRecoveryScopeV1 scope = {0}, other = {0};
+		ClusterUndoRecoveryScopeV1 scope = { 0 }, other = { 0 };
 		char path[MAXPGPATH];
 
 		reset_authority();
@@ -263,18 +289,27 @@ UT_TEST(test_stale_scope_never_falls_back_to_local_path)
 		UT_ASSERT(!cluster_undo_recovery_origin_authorized_v1(-1));
 		UT_ASSERT(!cluster_undo_recovery_origin_authorized_v1(128));
 		cluster_undo_recovery_scope_leave_v1(&other);
-		if (fault == 0) authority_result = CLUSTER_THREAD_AUTHORITY_FENCE_STALE;
-		if (fault == 1) duty.root_lineage_seq++;
-		if (fault == 2) token.root_lineage_seq++;
-		if (fault == 3) storage_uuid[0] ^= 1;
-		if (fault == 4) root.validated_tail_lsn_exclusive++;
-		if (fault == 5) serial.mode = CLUSTER_RECOVERY_SERIAL_INPUT_SEAL;
-		if (fault == 6) source_ok = false;
-		if (fault == 7) cluster_undo_gcs_coherence = false;
+		if (fault == 0)
+			authority_result = CLUSTER_THREAD_AUTHORITY_FENCE_STALE;
+		if (fault == 1)
+			duty.root_lineage_seq++;
+		if (fault == 2)
+			token.root_lineage_seq++;
+		if (fault == 3)
+			storage_uuid[0] ^= 1;
+		if (fault == 4)
+			root.validated_tail_lsn_exclusive++;
+		if (fault == 5)
+			serial.mode = CLUSTER_RECOVERY_SERIAL_INPUT_SEAL;
+		if (fault == 6)
+			source_ok = false;
+		if (fault == 7)
+			cluster_undo_gcs_coherence = false;
 		UT_ASSERT(!cluster_undo_recovery_origin_authorized_v1(2));
 		strlcpy(path, "unchanged", sizeof(path));
-		UT_ASSERT_EQ(cluster_undo_path_resolve(cluster_undo_recovery_intent_for_owner(3),
-			3, 513, path, sizeof(path)), -1);
+		UT_ASSERT_EQ(cluster_undo_path_resolve(cluster_undo_recovery_intent_for_owner(3), 3, 513,
+											   path, sizeof(path)),
+					 -1);
 		UT_ASSERT(strcmp(path, "unchanged") == 0);
 		UT_ASSERT_EQ(path_calls, 0);
 		cluster_undo_recovery_scope_leave_v1(&scope);
@@ -283,7 +318,7 @@ UT_TEST(test_stale_scope_never_falls_back_to_local_path)
 
 UT_TEST(test_cached_native_fd_rechecks_recovery_authority)
 {
-	ClusterUndoRecoveryScopeV1 scope = {0};
+	ClusterUndoRecoveryScopeV1 scope = { 0 };
 
 	reset_authority();
 	if (!cluster_undo_recovery_scope_enter_v1(&scope, &authority, plan)) {
@@ -303,7 +338,7 @@ UT_TEST(test_cached_native_fd_rechecks_recovery_authority)
 
 UT_TEST(test_native_directory_creation_uses_same_qualified_namespace)
 {
-	ClusterUndoRecoveryScopeV1 scope = {0};
+	ClusterUndoRecoveryScopeV1 scope = { 0 };
 
 	reset_authority();
 	if (!cluster_undo_recovery_scope_enter_v1(&scope, &authority, plan)) {
@@ -325,7 +360,7 @@ UT_TEST(test_native_directory_creation_uses_same_qualified_namespace)
 
 UT_TEST(test_native_fsync_closes_only_the_canonical_write_obligation)
 {
-	ClusterUndoRecoveryScopeV1 scope = {0};
+	ClusterUndoRecoveryScopeV1 scope = { 0 };
 
 	reset_authority();
 	if (!cluster_undo_recovery_scope_enter_v1(&scope, &authority, plan)) {
@@ -345,7 +380,7 @@ UT_TEST(test_native_fsync_closes_only_the_canonical_write_obligation)
 
 UT_TEST(test_multixact_retirement_evidence_requires_current_original_scope)
 {
-	ClusterUndoRecoveryScopeV1 scope = {0};
+	ClusterUndoRecoveryScopeV1 scope = { 0 };
 
 	reset_authority();
 	UT_ASSERT(!cluster_undo_recovery_multixact_page_retired_v1(2, 100, 200, true, 0));

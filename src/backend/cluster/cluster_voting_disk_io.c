@@ -345,16 +345,16 @@ voting_disk_read_range(int fd, off_t offset, uint32 count, void *out)
 }
 
 void
-cluster_voting_disk_read_slots(int fd, int expected_disk_index, uint32 first_node,
-	uint32 count, ClusterVotingSlot *out, ClusterVotingDiskIoState *states)
+cluster_voting_disk_read_slots(int fd, int expected_disk_index, uint32 first_node, uint32 count,
+							   ClusterVotingSlot *out, ClusterVotingDiskIoState *states)
 {
 	ClusterVotingDiskIoState rc;
 	/* A bounded output must be unambiguously failed even for bad arguments. */
 	if (states != NULL && count <= CLUSTER_MAX_NODES)
 		for (uint32 i = 0; i < count; ++i)
 			states[i] = CLUSTER_VOTING_DISK_IO_FAILED;
-	if (out == NULL || states == NULL || first_node >= CLUSTER_MAX_NODES
-		|| count == 0 || count > CLUSTER_MAX_NODES - first_node)
+	if (out == NULL || states == NULL || first_node >= CLUSTER_MAX_NODES || count == 0
+		|| count > CLUSTER_MAX_NODES - first_node)
 		return;
 	memset(out, 0, (size_t)count * sizeof(*out));
 	rc = voting_disk_read_range(fd, CLUSTER_VOTING_SLOT_OFFSET(first_node), count, out);
@@ -366,8 +366,8 @@ cluster_voting_disk_read_slots(int fd, int expected_disk_index, uint32 first_nod
 		if (slot->crc32c != cluster_voting_disk_compute_crc32c(slot))
 			states[i] = CLUSTER_VOTING_DISK_IO_TORN;
 		else if (slot->magic != CLUSTER_VOTING_SLOT_MAGIC
-			|| slot->version != CLUSTER_VOTING_SLOT_VERSION || slot->node_id != first_node + i
-			|| (expected_disk_index >= 0 && slot->disk_index != (uint32)expected_disk_index))
+				 || slot->version != CLUSTER_VOTING_SLOT_VERSION || slot->node_id != first_node + i
+				 || (expected_disk_index >= 0 && slot->disk_index != (uint32)expected_disk_index))
 			states[i] = CLUSTER_VOTING_DISK_IO_FAILED;
 	}
 }
@@ -377,7 +377,8 @@ cluster_voting_disk_read_join_slots(int fd, uint32 first_node, uint32 count, voi
 {
 	if (first_node >= CLUSTER_MAX_NODES || count == 0 || count > CLUSTER_MAX_NODES - first_node)
 		return CLUSTER_VOTING_DISK_IO_FAILED;
-	return voting_disk_read_range(fd, CLUSTER_VOTING_JOIN_SLOT_OFFSET(first_node), count, out_slots);
+	return voting_disk_read_range(fd, CLUSTER_VOTING_JOIN_SLOT_OFFSET(first_node), count,
+								  out_slots);
 }
 
 ClusterVotingDiskIoState
@@ -385,7 +386,8 @@ cluster_voting_disk_read_formation_slots(int fd, uint32 first_node, uint32 count
 {
 	if (first_node >= CLUSTER_MAX_NODES || count == 0 || count > CLUSTER_MAX_NODES - first_node)
 		return CLUSTER_VOTING_DISK_IO_FAILED;
-	return voting_disk_read_range(fd, CLUSTER_VOTING_FORMATION_SLOT_OFFSET(first_node), count, out_slots);
+	return voting_disk_read_range(fd, CLUSTER_VOTING_FORMATION_SLOT_OFFSET(first_node), count,
+								  out_slots);
 }
 
 

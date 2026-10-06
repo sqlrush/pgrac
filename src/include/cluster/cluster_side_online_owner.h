@@ -36,8 +36,9 @@ extern bool
 rf_side_online_production_owner_init_v1(RfSideOnlineProductionOwnerV1 *owner, void *authority_arg,
 										RfSideOnlineFreshAuthorityV1 revalidate_authority,
 										uint32 cluster_epoch, bool failed_origin_redo_retained);
-extern bool rf_side_online_production_bind_undo_v1(RfSideOnlineProductionOwnerV1 *owner,
-	const ClusterThreadRecoveryAuthorityV1 *authority);
+extern bool
+rf_side_online_production_bind_undo_v1(RfSideOnlineProductionOwnerV1 *owner,
+									   const ClusterThreadRecoveryAuthorityV1 *authority);
 extern RfPageProofDetailV1
 rf_side_online_production_preflight_v1(const RfSideOnlinePlanV1 *plan,
 									   RfSideOnlineProductionOwnerV1 *owner);

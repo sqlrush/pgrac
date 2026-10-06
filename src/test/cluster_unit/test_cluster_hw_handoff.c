@@ -641,11 +641,13 @@ void
 cluster_grd_outbound_enqueue_cleanup_release(uint32 destination, const void *payload, uint16 length)
 {
 	char command = 'R';
-	if ((relation_case || cf_case || hw_local_case) && master_child < 0 && destination == (uint32)cluster_node_id) {
+	if ((relation_case || cf_case || hw_local_case) && master_child < 0
+		&& destination == (uint32)cluster_node_id) {
 		HW_CHECK(length == sizeof(local_cleanup_release));
 		HW_CHECK(((const GesRequestPayload *)payload)->opcode == GES_REQ_OPCODE_RELEASE);
 		HW_CHECK(((const GesRequestPayload *)payload)->holder_request_id_lo == 201
-			|| (hw_local_case && ((const GesRequestPayload *)payload)->holder_request_id_lo == 202));
+				 || (hw_local_case
+					 && ((const GesRequestPayload *)payload)->holder_request_id_lo == 202));
 		local_cleanup_release = *(const GesRequestPayload *)payload;
 		cleanup_sent++;
 		return; /* Keep it owned until the test drives the real local drain. */
@@ -1660,8 +1662,7 @@ hw_local_competitors(ClusterLockAcquireRequest *a, ClusterLockAcquireRequest *b)
 {
 	fault = HW_NORMAL;
 	setup_case(a, false);
-	UT_ASSERT_EQ(cluster_grd_cancel_reservation_by_id(&a->resid, &a->holder),
-				 CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_cancel_reservation_by_id(&a->resid, &a->holder), CLUSTER_GRD_ENTRY_OK);
 	cluster_node_id = 3;
 	MyProc->pgprocno = 21;
 	a->holder.node_id = 3;
@@ -1753,7 +1754,8 @@ UT_TEST(hw_local_cancel_after_grant_keeps_exact_cleanup_owner)
 	hw_dispatch_reserved(&a, cluster_lock_acquire_s3_partition_reservation(&a));
 	UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&a), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
 	MyProc->pgprocno = 22;
-	UT_ASSERT_EQ(cluster_lock_acquire_s3_partition_reservation(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(cluster_lock_acquire_s3_partition_reservation(&b),
+				 CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
 	hw_release_on_wait = &a;
 	hw_error_after_wait_release = true;
 	PG_TRY();

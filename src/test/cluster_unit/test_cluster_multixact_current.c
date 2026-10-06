@@ -498,9 +498,10 @@ cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid, Cluste
 													   bool *precommit_retry_out)
 {
 	if (precommit_retry_out != NULL)
-		*precommit_retry_out = TransactionIdIsNormal(test_runtime_local_terminal_xid)
-			&& TransactionIdEquals(xid, test_runtime_local_terminal_xid)
-			&& test_runtime_local_terminal_status == CLUSTER_TT_STATUS_IN_PROGRESS;
+		*precommit_retry_out
+			= TransactionIdIsNormal(test_runtime_local_terminal_xid)
+			  && TransactionIdEquals(xid, test_runtime_local_terminal_xid)
+			  && test_runtime_local_terminal_status == CLUSTER_TT_STATUS_IN_PROGRESS;
 	test_runtime_local_terminal_calls++;
 	UT_ASSERT_NOT_NULL(key);
 	UT_ASSERT_NOT_NULL(result);
@@ -532,8 +533,7 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 	const ClusterTxLocator *locator, TimestampTz deadline pg_attribute_unused(),
 	ClusterTTStatusKey *key, ClusterTTStatusResult *result, uint32 *ctrc_grant_out,
 	uint32 *participant_capability_generation_out, ClusterCtrcTxnKeyV1 *ctrc_key_out,
-	ClusterTxLocator *canonical_locator_out, bool *cross_segment_out,
-	bool *precommit_retry_out)
+	ClusterTxLocator *canonical_locator_out, bool *cross_segment_out, bool *precommit_retry_out)
 {
 	uint32 data_segment;
 	uint32 block_no;
@@ -542,9 +542,10 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 
 	test_runtime_updater_calls++;
 	if (precommit_retry_out != NULL) {
-		*precommit_retry_out = TransactionIdIsNormal(test_runtime_local_terminal_xid)
-			&& TransactionIdEquals(locator->xid, test_runtime_local_terminal_xid)
-			&& test_runtime_local_terminal_status == CLUSTER_TT_STATUS_IN_PROGRESS;
+		*precommit_retry_out
+			= TransactionIdIsNormal(test_runtime_local_terminal_xid)
+			  && TransactionIdEquals(locator->xid, test_runtime_local_terminal_xid)
+			  && test_runtime_local_terminal_status == CLUSTER_TT_STATUS_IN_PROGRESS;
 		if (*precommit_retry_out)
 			return false;
 	}
@@ -1614,9 +1615,9 @@ UT_TEST(test_current_mx_local_updater_precommit_scrubs_batch)
 	test_runtime_local_terminal_xid = 103;
 	test_runtime_local_terminal_status = CLUSTER_TT_STATUS_IN_PROGRESS;
 	test_runtime_updater_calls = 0;
-	observed = cluster_multixact_current_members_resolve_until(
-		&key, members, lengthof(members), hash, &challenge, proofs, &updater,
-		capabilities, &deadline);
+	observed = cluster_multixact_current_members_resolve_until(&key, members, lengthof(members),
+															   hash, &challenge, proofs, &updater,
+															   capabilities, &deadline);
 	/* Restore the fixture even while this regression is RED. */
 	test_runtime_target_owner_enabled = false;
 	test_runtime_target_owner_active_xid = InvalidTransactionId;
@@ -1657,30 +1658,34 @@ UT_TEST(test_current_mx_local_updater_retry_preserves_deadline)
 		deadline = 0;
 		test_runtime_now = UINT64_C(1000000);
 		test_runtime_local_terminal_status = CLUSTER_TT_STATUS_IN_PROGRESS;
-		UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(
-			&key, &member, 1, hash, &challenge, &proof, &updater, &capability, &deadline),
-			CMX_RESOLVE_RETRY);
+		UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(&key, &member, 1, hash,
+																	 &challenge, &proof, &updater,
+																	 &capability, &deadline),
+					 CMX_RESOLVE_RETRY);
 		UT_ASSERT_EQ(deadline, (TimestampTz)UINT64_C(2000000));
 		test_runtime_now += UINT64_C(500000);
 		cluster_gcs_reply_timeout_ms = 5000;
-		UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(
-			&key, &member, 1, hash, &challenge, &proof, &updater, &capability, &deadline),
-			CMX_RESOLVE_RETRY);
+		UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(&key, &member, 1, hash,
+																	 &challenge, &proof, &updater,
+																	 &capability, &deadline),
+					 CMX_RESOLVE_RETRY);
 		UT_ASSERT_EQ(deadline, (TimestampTz)UINT64_C(2000000));
 		cluster_gcs_reply_timeout_ms = 1000;
 		if (terminal < 2) {
-			test_runtime_local_terminal_status = terminal == 0
-				? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_ABORTED;
-			UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(
-				&key, &member, 1, hash, &challenge, &proof, &updater, &capability, &deadline),
+			test_runtime_local_terminal_status
+				= terminal == 0 ? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_ABORTED;
+			UT_ASSERT_EQ(
+				cluster_multixact_current_members_resolve_until(
+					&key, &member, 1, hash, &challenge, &proof, &updater, &capability, &deadline),
 				CMX_RESOLVE_OK);
 			UT_ASSERT_EQ(proof.state, terminal == 0 ? CCM_COMMITTED : CCM_ABORTED);
 			UT_ASSERT_EQ(updater.verdict, CUCP_MATCH);
 		} else {
 			test_runtime_now = deadline;
 			test_runtime_updater_calls = 0;
-			UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(
-				&key, &member, 1, hash, &challenge, &proof, &updater, &capability, &deadline),
+			UT_ASSERT_EQ(
+				cluster_multixact_current_members_resolve_until(
+					&key, &member, 1, hash, &challenge, &proof, &updater, &capability, &deadline),
 				CMX_RESOLVE_TIMEOUT);
 			UT_ASSERT_EQ(test_runtime_updater_calls, 0);
 			UT_ASSERT_EQ(proof.state, CCM_UNKNOWN);
@@ -1790,9 +1795,9 @@ UT_TEST(test_current_multixact_local_precommit_scrubs_batch_and_keeps_deadline)
 	test_runtime_target_owner_active_xid = members[0].xid;
 	test_runtime_local_terminal_xid = members[1].xid;
 	test_runtime_local_terminal_status = CLUSTER_TT_STATUS_IN_PROGRESS;
-	observed = cluster_multixact_current_members_resolve_until(
-		&key, members, lengthof(members), hash, NULL, proofs, &updater_proof, capabilities,
-		&deadline);
+	observed = cluster_multixact_current_members_resolve_until(&key, members, lengthof(members),
+															   hash, NULL, proofs, &updater_proof,
+															   capabilities, &deadline);
 	/* Restore fixture inputs before asserting the intentional RED. */
 	test_runtime_target_owner_enabled = false;
 	test_runtime_target_owner_active_xid = InvalidTransactionId;
@@ -1833,23 +1838,30 @@ UT_TEST(test_current_multixact_precommit_retry_respects_original_deadline)
 		deadline = 0;
 		test_runtime_now = UINT64_C(1000000);
 		test_runtime_local_terminal_status = CLUSTER_TT_STATUS_IN_PROGRESS;
-		UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(&key, members, 2, hash,
-			NULL, proofs, &updater, capabilities, &deadline), CMX_RESOLVE_RETRY);
+		UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(
+						 &key, members, 2, hash, NULL, proofs, &updater, capabilities, &deadline),
+					 CMX_RESOLVE_RETRY);
 		UT_ASSERT_EQ(deadline, (TimestampTz)UINT64_C(2000000));
 		test_runtime_now += UINT64_C(500000);
-		UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(&key, members, 2, hash,
-			NULL, proofs, &updater, capabilities, &deadline), CMX_RESOLVE_RETRY);
+		UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(
+						 &key, members, 2, hash, NULL, proofs, &updater, capabilities, &deadline),
+					 CMX_RESOLVE_RETRY);
 		UT_ASSERT_EQ(deadline, (TimestampTz)UINT64_C(2000000));
 		if (pass < 2) {
-			test_runtime_local_terminal_status = pass == 0 ? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_ABORTED;
+			test_runtime_local_terminal_status
+				= pass == 0 ? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_ABORTED;
 			UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(&key, members, 2, hash,
-				NULL, proofs, &updater, capabilities, &deadline), CMX_RESOLVE_OK);
+																		 NULL, proofs, &updater,
+																		 capabilities, &deadline),
+						 CMX_RESOLVE_OK);
 			UT_ASSERT_EQ(proofs[1].state, pass == 0 ? CCM_COMMITTED : CCM_ABORTED);
 			UT_ASSERT_EQ(ClusterCurrentMemberProofGetCtrcGrant(&proofs[1]), 0);
 		} else {
 			test_runtime_now = deadline;
 			UT_ASSERT_EQ(cluster_multixact_current_members_resolve_until(&key, members, 2, hash,
-				NULL, proofs, &updater, capabilities, &deadline), CMX_RESOLVE_TIMEOUT);
+																		 NULL, proofs, &updater,
+																		 capabilities, &deadline),
+						 CMX_RESOLVE_TIMEOUT);
 			UT_ASSERT_EQ(proofs[0].state, CCM_UNKNOWN);
 			UT_ASSERT_EQ(proofs[1].state, CCM_UNKNOWN);
 		}

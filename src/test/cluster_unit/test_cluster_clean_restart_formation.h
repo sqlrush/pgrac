@@ -28,9 +28,8 @@ cluster_wal_startup_clean_input_v1(ClusterWalStartupCleanInputV1 *out)
 bool
 cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected, uint64 epoch)
 {
-	return test_clean_installed && test_first_writer_installed
-		&& epoch == test_first_writer_epoch
-		&& memcmp(expected, &test_first_writer, sizeof(*expected)) == 0;
+	return test_clean_installed && test_first_writer_installed && epoch == test_first_writer_epoch
+		   && memcmp(expected, &test_first_writer, sizeof(*expected)) == 0;
 }
 
 static void
@@ -68,7 +67,7 @@ test_clean_formation_bind(void)
 	test_clean_input.successor.config_generation = 1;
 	test_clean_input.successor.claim_generation = 2;
 	UT_ASSERT_EQ(cluster_wal_claim_v2_encode(&test_clean_input.successor, encoded),
-		CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	id->thread_claim_crc32c = semantic_activation_read_u32_le(encoded + 104);
 	test_clean_input.formation_epoch = 2;
 	test_clean_input.config_generation = 1;
@@ -99,7 +98,7 @@ test_clean_install(void)
 	uint8 encoded[CLUSTER_WAL_CLAIM_V2_BYTES];
 	pg_cryptohash_ctx *hash;
 	UT_ASSERT_EQ(cluster_wal_claim_v2_encode(&test_clean_input.successor, encoded),
-		CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	memset(&test_first_writer, 0, sizeof(test_first_writer));
 	test_first_writer.claim.identity = test_clean_input.successor.identity;
 	test_first_writer.claim.database_incarnation = test_clean_input.successor.database_incarnation;
@@ -169,18 +168,42 @@ UT_TEST(test_clean_formation_bridge_contradictions_fail_before_loading)
 	for (int fault = 0; fault < 12; fault++) {
 		test_clean_formation_input();
 		switch (fault) {
-			case 0: test_clean_input.formation_epoch++; break;
-			case 1: test_clean_input.predecessor.system_identifier++; break;
-			case 2: test_clean_input.successor.identity.origin_owner_incarnation++; break;
-			case 3: test_clean_input.checkpoint_lsn++; break;
-			case 4: memset(test_clean_input.exit_evidence_sha256, 0, 32); break;
-			case 5: memset(test_clean_input.predecessor_root_sha256, 0, 32); break;
-			case 6: test_clean_input.successor.config_generation++; break;
-			case 7: test_clean_input.operation_generation = 0; break;
-			case 8: test_membership_snapshot_lo = 7; break;
-			case 9: test_serving_formation = 0; break;
-			case 10: test_last_admitted_incarnation++; break;
-			case 11: test_clean_input.predecessor.origin_owner_incarnation = test_qvotec_self_incarnation; break;
+		case 0:
+			test_clean_input.formation_epoch++;
+			break;
+		case 1:
+			test_clean_input.predecessor.system_identifier++;
+			break;
+		case 2:
+			test_clean_input.successor.identity.origin_owner_incarnation++;
+			break;
+		case 3:
+			test_clean_input.checkpoint_lsn++;
+			break;
+		case 4:
+			memset(test_clean_input.exit_evidence_sha256, 0, 32);
+			break;
+		case 5:
+			memset(test_clean_input.predecessor_root_sha256, 0, 32);
+			break;
+		case 6:
+			test_clean_input.successor.config_generation++;
+			break;
+		case 7:
+			test_clean_input.operation_generation = 0;
+			break;
+		case 8:
+			test_membership_snapshot_lo = 7;
+			break;
+		case 9:
+			test_serving_formation = 0;
+			break;
+		case 10:
+			test_last_admitted_incarnation++;
+			break;
+		case 11:
+			test_clean_input.predecessor.origin_owner_incarnation = test_qvotec_self_incarnation;
+			break;
 		}
 		UT_ASSERT(!cluster_semantic_normal_start_prepare(true, 0, &failure));
 		UT_ASSERT_EQ(cluster_semantic_normal_start_state(), CLUSTER_NORMAL_START_FAILED);
@@ -200,16 +223,28 @@ UT_TEST(test_clean_formation_actual_loader_requires_exact_installed_claim)
 		UT_ASSERT(cluster_semantic_normal_start_prepare(true, 0, &failure));
 		test_clean_install();
 		switch (fault) {
-			case 0: test_first_writer_installed = false; break;
-			case 1: test_clean_installed = false; break;
-			case 2: test_first_writer.claim.claim_sha256[0] ^= 1; break;
-			case 3: test_first_writer_epoch++; break;
-			case 4: test_first_writer.timeline++; break;
-			case 5: test_remote_admitted_incarnations[2]++; break;
+		case 0:
+			test_first_writer_installed = false;
+			break;
+		case 1:
+			test_clean_installed = false;
+			break;
+		case 2:
+			test_first_writer.claim.claim_sha256[0] ^= 1;
+			break;
+		case 3:
+			test_first_writer_epoch++;
+			break;
+		case 4:
+			test_first_writer.timeline++;
+			break;
+		case 5:
+			test_remote_admitted_incarnations[2]++;
+			break;
 		}
 		UT_ASSERT_EQ(cluster_semantic_normal_start_finish(&failure), fault == -1);
-		UT_ASSERT_EQ(cluster_semantic_normal_start_state(), fault == -1
-			? CLUSTER_NORMAL_START_TARGET_READY : CLUSTER_NORMAL_START_FAILED);
+		UT_ASSERT_EQ(cluster_semantic_normal_start_state(),
+					 fault == -1 ? CLUSTER_NORMAL_START_TARGET_READY : CLUSTER_NORMAL_START_FAILED);
 		UT_ASSERT_EQ(cold_read_count[255], fault == -1 ? 1 : 0);
 		UT_ASSERT(!semantic_activation_restart.local_ready);
 		cluster_shared_config = false;
@@ -303,13 +338,16 @@ UT_TEST(test_clean_formation_all_nodes_reach_current_open_without_rewriting_pgsa
 		ClusterSemanticActivationRecord old;
 		uint64 epoch = UINT64_MAX;
 		uint64 nonce = test_clean_round_begin(node);
-		UT_ASSERT(cluster_semantic_activation_record_decode(NormalStartCompletion->pgsa, &old, NULL));
+		UT_ASSERT(
+			cluster_semantic_activation_record_decode(NormalStartCompletion->pgsa, &old, NULL));
 		UT_ASSERT_EQ(old.transition_epoch, 1);
-		UT_ASSERT(cluster_semantic_normal_stop_current_epoch(&old, NormalStartCompletion->pgrd, &epoch)
+		UT_ASSERT(
+			cluster_semantic_normal_stop_current_epoch(&old, NormalStartCompletion->pgrd, &epoch)
 			!= CLUSTER_NORMAL_STOP_READY);
 		UT_ASSERT_EQ(epoch, 0);
 		test_clean_round_finish(nonce);
-		UT_ASSERT_EQ(cluster_semantic_normal_stop_current_epoch(&old, NormalStartCompletion->pgrd, &epoch),
+		UT_ASSERT_EQ(
+			cluster_semantic_normal_stop_current_epoch(&old, NormalStartCompletion->pgrd, &epoch),
 			CLUSTER_NORMAL_STOP_READY);
 		UT_ASSERT_EQ(epoch, 2);
 		UT_ASSERT_EQ(memcmp(NormalStartCompletion->pgsa, test_r4fsm_bootstrap_bytes, 512), 0);
@@ -326,20 +364,42 @@ UT_TEST(test_clean_formation_current_epoch_refuses_changed_bridge_and_carriers)
 		uint64 epoch = UINT64_MAX;
 		uint64 nonce = test_clean_round_begin(1);
 		test_clean_round_finish(nonce);
-		UT_ASSERT(cluster_semantic_activation_record_decode(NormalStartCompletion->pgsa, &old, NULL));
+		UT_ASSERT(
+			cluster_semantic_activation_record_decode(NormalStartCompletion->pgsa, &old, NULL));
 		switch (fault) {
-			case 0: SemanticActivationAckTable->restart_binding[0] ^= 1; break;
-			case 1: NormalStartCompletion->clean_input.predecessor_root_sha256[0] ^= 1; break;
-			case 2: NormalStartCompletion->clean_input.exit_evidence_sha256[0] ^= 1; break;
-			case 3: test_first_writer.claim.claim_sha256[0] ^= 1; break;
-			case 4: test_clean_installed = false; break;
-			case 5: test_current_epoch++; break;
-			case 6: test_serving_formation++; break;
-			case 7: test_remote_admitted_incarnations[3]++; break;
-			case 8: SemanticActivationAckTable->observed_members_lo &= ~8; break;
-			case 9: old.transition_epoch = 2; break;
+		case 0:
+			SemanticActivationAckTable->restart_binding[0] ^= 1;
+			break;
+		case 1:
+			NormalStartCompletion->clean_input.predecessor_root_sha256[0] ^= 1;
+			break;
+		case 2:
+			NormalStartCompletion->clean_input.exit_evidence_sha256[0] ^= 1;
+			break;
+		case 3:
+			test_first_writer.claim.claim_sha256[0] ^= 1;
+			break;
+		case 4:
+			test_clean_installed = false;
+			break;
+		case 5:
+			test_current_epoch++;
+			break;
+		case 6:
+			test_serving_formation++;
+			break;
+		case 7:
+			test_remote_admitted_incarnations[3]++;
+			break;
+		case 8:
+			SemanticActivationAckTable->observed_members_lo &= ~8;
+			break;
+		case 9:
+			old.transition_epoch = 2;
+			break;
 		}
-		UT_ASSERT(cluster_semantic_normal_stop_current_epoch(&old, NormalStartCompletion->pgrd, &epoch)
+		UT_ASSERT(
+			cluster_semantic_normal_stop_current_epoch(&old, NormalStartCompletion->pgrd, &epoch)
 			!= CLUSTER_NORMAL_STOP_READY);
 		UT_ASSERT_EQ(epoch, 0);
 		ut_cold_cleanup();
@@ -430,17 +490,18 @@ UT_TEST(test_clean_formation_stop_terminal_receipt_is_not_partial_open)
 	test_terminal_peer_open = old;
 	memcpy(test_terminal_peer_root, NormalStartCompletion->pgrd, 512);
 	test_terminal_peer_record_enabled = test_terminal_peer_eligible = true;
-	test_terminal_peer_record = (ClusterSfPeerCap){ .valid = true,
-		.bits = test_peer_capability_word, .generation = 19 };
+	test_terminal_peer_record
+		= (ClusterSfPeerCap){ .valid = true, .bits = test_peer_capability_word, .generation = 19 };
 	UT_ASSERT(cluster_sf_peer_cap_invalidate_gen(&test_terminal_peer_record, 19));
 	test_stop_not_fresh_peer = 3;
-	UT_ASSERT_EQ(cluster_semantic_normal_stop_current_epoch(&old, NormalStartCompletion->pgrd, &epoch),
+	UT_ASSERT_EQ(
+		cluster_semantic_normal_stop_current_epoch(&old, NormalStartCompletion->pgrd, &epoch),
 		CLUSTER_NORMAL_STOP_READY);
 	UT_ASSERT_EQ(epoch, 2);
 	test_terminal_peer_eligible = false;
 	epoch = UINT64_MAX;
 	UT_ASSERT(cluster_semantic_normal_stop_current_epoch(&old, NormalStartCompletion->pgrd, &epoch)
-		!= CLUSTER_NORMAL_STOP_READY);
+			  != CLUSTER_NORMAL_STOP_READY);
 	UT_ASSERT_EQ(epoch, 0);
 	test_terminal_peer_record_enabled = test_terminal_peer_eligible = false;
 	ut_cold_cleanup();

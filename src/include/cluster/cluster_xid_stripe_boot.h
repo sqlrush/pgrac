@@ -201,7 +201,8 @@ extern bool cluster_xid_stripe_submit_retire(int32 target_node, uint64 owner_inc
  * ranges. This grants neither visibility nor permission to reuse an XID.
  * On missing/conflicting evidence leave *out_incarnation unchanged. */
 extern bool cluster_xid_stripe_lookup_incarnation_fds(const int *fds, int n_disks,
-	FullTransactionId xid, uint64 *out_incarnation);
+													  FullTransactionId xid,
+													  uint64 *out_incarnation);
 
 /* qvotec self-incarnation accessor (the canonical durable identity
  * seed this boot presents; consumed by the D5c slot claim). */

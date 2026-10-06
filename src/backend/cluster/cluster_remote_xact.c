@@ -64,7 +64,7 @@
 #include "cluster/cluster_terminal_authority.h" /* spec-6.2 authority substrate */
 #include "cluster/cluster_tt_durable.h"			/* durable wrap cross-check (G6 P1 #2) */
 #include "cluster/cluster_undo_recovery.h"
-#include "cluster/storage/cluster_undo_xlog.h"	/* redo_stamp_slot (G6) */
+#include "cluster/storage/cluster_undo_xlog.h" /* redo_stamp_slot (G6) */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -136,7 +136,7 @@ remote_xact_ctl(int origin_node)
 	if (origin_node < 0 || origin_node >= 128)
 		return NULL;
 	return cluster_shared_config ? &ClusterRemoteXactOriginCtlData[origin_node]
-		: &ClusterRemoteXactCtlData;
+								 : &ClusterRemoteXactCtlData;
 }
 
 static bool
@@ -150,8 +150,7 @@ static bool
 remote_xact_origin_writer_permitted(int origin_node)
 {
 	return remote_xact_writer_permitted()
-		&& (!cluster_shared_config
-			|| cluster_undo_recovery_origin_authorized_v1(origin_node));
+		   && (!cluster_shared_config || cluster_undo_recovery_origin_authorized_v1(origin_node));
 }
 
 
@@ -170,7 +169,7 @@ remote_xact_directory_ready(SlruCtl ctl, int origin_node, bool write)
 {
 	char origin[32];
 	char expected[MAXPGPATH];
-	int dirs[4] = {-1, -1, -1, -1};
+	int dirs[4] = { -1, -1, -1, -1 };
 	struct stat st, routed;
 	bool ok = false;
 	int length;
@@ -178,7 +177,7 @@ remote_xact_directory_ready(SlruCtl ctl, int origin_node, bool write)
 	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] != '/')
 		return false;
 	length = snprintf(expected, sizeof(expected), "%s/native_side/origin_%d/%s",
-		cluster_shared_data_dir, origin_node, CLUSTER_REMOTE_XACT_DIR_V2);
+					  cluster_shared_data_dir, origin_node, CLUSTER_REMOTE_XACT_DIR_V2);
 	if (length < 0 || length >= sizeof(expected) || strcmp(expected, ctl->Dir) != 0)
 		return false;
 	snprintf(origin, sizeof(origin), "origin_%d", origin_node);
@@ -192,13 +191,13 @@ remote_xact_directory_ready(SlruCtl ctl, int origin_node, bool write)
 	if (dirs[2] < 0)
 		goto done;
 	for (int i = 0; i < 3; i++)
-		if (fstat(dirs[i], &st) != 0 || !S_ISDIR(st.st_mode)
-			|| st.st_uid != geteuid() || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+		if (fstat(dirs[i], &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid()
+			|| (st.st_mode & (S_IWGRP | S_IWOTH)) != 0)
 			goto done;
 	if (write && !remote_xact_origin_writer_permitted(origin_node))
 		goto done;
 	dirs[3] = openat(dirs[2], CLUSTER_REMOTE_XACT_DIR_V2,
-		O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+					 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 	if (dirs[3] < 0 && errno == ENOENT) {
 		if (!write) {
 			ok = true; /* The verified origin exists, but has no projection yet. */
@@ -208,12 +207,11 @@ remote_xact_directory_ready(SlruCtl ctl, int origin_node, bool write)
 			&& errno != EEXIST)
 			goto done;
 		dirs[3] = openat(dirs[2], CLUSTER_REMOTE_XACT_DIR_V2,
-			O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+						 O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 	}
-	if (dirs[3] < 0 || fstat(dirs[3], &st) != 0 || !S_ISDIR(st.st_mode)
-		|| st.st_uid != geteuid() || (st.st_mode & (S_IWGRP | S_IWOTH)) != 0
-		|| lstat(ctl->Dir, &routed) != 0 || !S_ISDIR(routed.st_mode)
-		|| st.st_dev != routed.st_dev || st.st_ino != routed.st_ino)
+	if (dirs[3] < 0 || fstat(dirs[3], &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid()
+		|| (st.st_mode & (S_IWGRP | S_IWOTH)) != 0 || lstat(ctl->Dir, &routed) != 0
+		|| !S_ISDIR(routed.st_mode) || st.st_dev != routed.st_dev || st.st_ino != routed.st_ino)
 		goto done;
 	/* Repeat this even after an interrupted creation whose directory survived. */
 	if (write && (!remote_xact_origin_writer_permitted(origin_node) || pg_fsync(dirs[2]) != 0))
@@ -287,7 +285,7 @@ Size
 cluster_remote_xact_shmem_size(void)
 {
 	return add_size(mul_size(SimpleLruShmemSize(CLUSTER_REMOTE_XACT_BUFFERS, 0),
-							cluster_shared_config ? 128 : 1),
+							 cluster_shared_config ? 128 : 1),
 					MAXALIGN(sizeof(ClusterRemoteXactShared)));
 }
 
@@ -320,8 +318,8 @@ cluster_remote_xact_shmem_init(void)
 		 * the first segment write fails with ENOENT on the directory itself
 		 * (SlruInternalWritePage O_CREAT creates the FILE, not the DIR).
 		 */
-		if (!cluster_shared_config
-			&& MakePGDirectory(CLUSTER_REMOTE_XACT_DIR_V2) < 0 && errno != EEXIST)
+		if (!cluster_shared_config && MakePGDirectory(CLUSTER_REMOTE_XACT_DIR_V2) < 0
+			&& errno != EEXIST)
 			ereport(FATAL,
 					(errcode_for_file_access(),
 					 errmsg("could not create directory \"%s\": %m", CLUSTER_REMOTE_XACT_DIR_V2)));
@@ -339,9 +337,11 @@ cluster_remote_xact_shmem_init(void)
 			int length;
 
 			if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] != '/')
-				ereport(FATAL, (errmsg("shared remote transaction store requires an absolute shared root")));
+				ereport(
+					FATAL,
+					(errmsg("shared remote transaction store requires an absolute shared root")));
 			length = snprintf(dir, sizeof(dir), "%s/native_side/origin_%d/%s",
-				cluster_shared_data_dir, origin, CLUSTER_REMOTE_XACT_DIR_V2);
+							  cluster_shared_data_dir, origin, CLUSTER_REMOTE_XACT_DIR_V2);
 			if (length < 0 || length >= sizeof(dir) - 16)
 				ereport(FATAL, (errmsg("shared remote transaction directory path is too long")));
 			snprintf(name, sizeof(name), "ClusterRemoteXact origin %d", origin);
@@ -351,8 +351,8 @@ cluster_remote_xact_shmem_init(void)
 			strlcpy(name, "ClusterRemoteXact", sizeof(name));
 		}
 		ctl->PagePrecedes = remote_xact_page_precedes;
-		SimpleLruInit(ctl, name, CLUSTER_REMOTE_XACT_BUFFERS, 0, &locks[origin].lock,
-			dir, RemoteXactShared->buffer_tranche_id, SYNC_HANDLER_NONE);
+		SimpleLruInit(ctl, name, CLUSTER_REMOTE_XACT_BUFFERS, 0, &locks[origin].lock, dir,
+					  RemoteXactShared->buffer_tranche_id, SYNC_HANDLER_NONE);
 	}
 }
 
@@ -411,7 +411,8 @@ remote_xact_force_durable(int pageno)
 	 * force the exact segment synchronously before returning to the caller.
 	 */
 	if (cluster_shared_config
-		&& !remote_xact_origin_writer_permitted((uint32)pageno >> CLUSTER_REMOTE_XACT_ORIGIN_PAGE_SHIFT))
+		&& !remote_xact_origin_writer_permitted((uint32)pageno
+												>> CLUSTER_REMOTE_XACT_ORIGIN_PAGE_SHIFT))
 		ereport(ERROR, (errmsg("remote transaction recovery authority expired before write")));
 	SimpleLruWriteAll(ctl, true);
 	memset(&tag, 0, sizeof(tag));
@@ -440,8 +441,9 @@ remote_xact_mutation_from_transition(ClusterRemoteXactEntryTransitionV2 transiti
 }
 
 static ClusterRemoteXactMutationV2
-cluster_remote_xact_store_prepared_v2_active(int origin_node, TransactionId xid,
-									  const uint8 digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES])
+cluster_remote_xact_store_prepared_v2_active(
+	int origin_node, TransactionId xid,
+	const uint8 digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES])
 {
 	SlruCtl ctl = remote_xact_ctl(origin_node);
 	ClusterRemoteXactEntryV2 *entry;
@@ -450,8 +452,9 @@ cluster_remote_xact_store_prepared_v2_active(int origin_node, TransactionId xid,
 	int pageno;
 	int slotno;
 
-	if (RemoteXactShared == NULL || !remote_xact_origin_writer_permitted(origin_node) || origin_node < 0
-		|| origin_node >= (1 << 7) || !TransactionIdIsNormal(xid) || digest == NULL)
+	if (RemoteXactShared == NULL || !remote_xact_origin_writer_permitted(origin_node)
+		|| origin_node < 0 || origin_node >= (1 << 7) || !TransactionIdIsNormal(xid)
+		|| digest == NULL)
 		return CLUSTER_REMOTE_XACT_MUTATION_INVALID;
 	pageno = cluster_remote_xact_pageno(origin_node, xid);
 	slotno = remote_xact_open_page(origin_node, xid, true, true);
@@ -473,7 +476,7 @@ ClusterRemoteXactMutationV2
 cluster_remote_xact_store_prepared_v2(int origin_node, TransactionId xid,
 									  const uint8 digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES])
 {
-	volatile RemoteXactAccessV1 access = {0};
+	volatile RemoteXactAccessV1 access = { 0 };
 	ClusterRemoteXactMutationV2 result = CLUSTER_REMOTE_XACT_MUTATION_INVALID;
 
 	if (!TransactionIdIsNormal(xid) || digest == NULL)
@@ -507,8 +510,8 @@ cluster_remote_xact_store_terminal_v2_active(
 	int pageno;
 	int slotno;
 
-	if (RemoteXactShared == NULL || !remote_xact_origin_writer_permitted(origin_node) || origin_node < 0
-		|| origin_node >= (1 << 7) || !TransactionIdIsNormal(xid)
+	if (RemoteXactShared == NULL || !remote_xact_origin_writer_permitted(origin_node)
+		|| origin_node < 0 || origin_node >= (1 << 7) || !TransactionIdIsNormal(xid)
 		|| (require_prepared && expected_prepare_digest == NULL)
 		|| !cluster_remote_xact_entry_encode_terminal_v2(&candidate, outcome, commit_scn,
 														 commit_timestamp, wrap_valid, wrap))
@@ -538,20 +541,22 @@ cluster_remote_xact_store_terminal_v2(
 	ClusterRemoteXactOutcome outcome, SCN commit_scn, TimestampTz commit_timestamp, bool wrap_valid,
 	uint16 wrap)
 {
-	volatile RemoteXactAccessV1 access = {0};
+	volatile RemoteXactAccessV1 access = { 0 };
 	ClusterRemoteXactMutationV2 result = CLUSTER_REMOTE_XACT_MUTATION_INVALID;
 
 	ClusterRemoteXactEntryV2 candidate;
 
 	if (!TransactionIdIsNormal(xid) || (require_prepared && expected_prepare_digest == NULL)
 		|| !cluster_remote_xact_entry_encode_terminal_v2(&candidate, outcome, commit_scn,
-			commit_timestamp, wrap_valid, wrap))
+														 commit_timestamp, wrap_valid, wrap))
 		return result;
 
 	PG_TRY();
 	{
 		if (remote_xact_access_begin(&access, origin_node, true))
-			result = cluster_remote_xact_store_terminal_v2_active(origin_node, xid, require_prepared, expected_prepare_digest, outcome, commit_scn, commit_timestamp, wrap_valid, wrap);
+			result = cluster_remote_xact_store_terminal_v2_active(
+				origin_node, xid, require_prepared, expected_prepare_digest, outcome, commit_scn,
+				commit_timestamp, wrap_valid, wrap);
 	}
 	PG_FINALLY();
 	{
@@ -562,8 +567,9 @@ cluster_remote_xact_store_terminal_v2(
 }
 
 static bool
-cluster_remote_xact_pending_matches_v2_active(int origin_node, TransactionId xid,
-									   const uint8 digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES])
+cluster_remote_xact_pending_matches_v2_active(
+	int origin_node, TransactionId xid,
+	const uint8 digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES])
 {
 	SlruCtl ctl = remote_xact_ctl(origin_node);
 	const ClusterRemoteXactEntryV2 *entry;
@@ -590,7 +596,7 @@ bool
 cluster_remote_xact_pending_matches_v2(int origin_node, TransactionId xid,
 									   const uint8 digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES])
 {
-	volatile RemoteXactAccessV1 access = {0};
+	volatile RemoteXactAccessV1 access = { 0 };
 	bool result = false;
 
 	PG_TRY();
@@ -627,8 +633,7 @@ cluster_remote_xact_range_empty_v2_active(int origin_node, TransactionId first_x
 
 		if (slotno >= 0) {
 			const ClusterRemoteXactEntryV2 *entries
-				= (const ClusterRemoteXactEntryV2 *)
-					  ctl->shared->page_buffer[slotno];
+				= (const ClusterRemoteXactEntryV2 *)ctl->shared->page_buffer[slotno];
 			uint32 i;
 
 			for (i = 0; i < page_count; i++)
@@ -646,7 +651,7 @@ cluster_remote_xact_range_empty_v2_active(int origin_node, TransactionId first_x
 bool
 cluster_remote_xact_range_empty_v2(int origin_node, TransactionId first_xid, uint32 count)
 {
-	volatile RemoteXactAccessV1 access = {0};
+	volatile RemoteXactAccessV1 access = { 0 };
 	bool result = false;
 
 	PG_TRY();
@@ -747,7 +752,7 @@ cluster_remote_xact_reset_range_v2_active(int origin_node, TransactionId first_x
 bool
 cluster_remote_xact_reset_range_v2(int origin_node, TransactionId first_xid, uint32 count)
 {
-	volatile RemoteXactAccessV1 access = {0};
+	volatile RemoteXactAccessV1 access = { 0 };
 	bool result = false;
 
 	if (!cluster_remote_xact_reset_range_valid_v2(origin_node, first_xid, count))
@@ -786,7 +791,8 @@ remote_xact_truncate_origin_callback(SlruCtl ctl, char *filename, int segpage, v
 		|| last >= context->cutoff_page)
 		return false;
 	if (cluster_shared_config
-		&& !remote_xact_origin_writer_permitted((uint32)segpage >> CLUSTER_REMOTE_XACT_ORIGIN_PAGE_SHIFT))
+		&& !remote_xact_origin_writer_permitted((uint32)segpage
+												>> CLUSTER_REMOTE_XACT_ORIGIN_PAGE_SHIFT))
 		ereport(ERROR, (errmsg("remote transaction authority expired before truncation")));
 	SlruDeleteSegment(ctl, segpage / SLRU_PAGES_PER_SEGMENT);
 	context->deleted = true;
@@ -801,8 +807,8 @@ cluster_remote_xact_truncate_before_v2_active(int origin_node, TransactionId old
 	SlruCtl ctl = remote_xact_ctl(origin_node);
 	RemoteXactTruncateContextV2 context;
 
-	if (RemoteXactShared == NULL || !remote_xact_origin_writer_permitted(origin_node) || origin_node < 0
-		|| origin_node >= (1 << 7) || !TransactionIdIsNormal(oldest_xid))
+	if (RemoteXactShared == NULL || !remote_xact_origin_writer_permitted(origin_node)
+		|| origin_node < 0 || origin_node >= (1 << 7) || !TransactionIdIsNormal(oldest_xid))
 		return false;
 	memset(&context, 0, sizeof(context));
 	context.origin_first_page = cluster_remote_xact_pageno(origin_node, 0);
@@ -819,7 +825,7 @@ cluster_remote_xact_truncate_before_v2_active(int origin_node, TransactionId old
 bool
 cluster_remote_xact_truncate_before_v2(int origin_node, TransactionId oldest_xid)
 {
-	volatile RemoteXactAccessV1 access = {0};
+	volatile RemoteXactAccessV1 access = { 0 };
 	bool result = false;
 
 	if (!TransactionIdIsNormal(oldest_xid))
@@ -1025,7 +1031,7 @@ cluster_remote_outcome_durable_checked(int origin_node, TransactionId xid, SCN *
  */
 static ClusterRemoteXactOutcome
 cluster_remote_commit_outcome_ex_active(int origin_node, TransactionId xid, SCN *commit_scn,
-								 uint16 *out_wrap, bool *out_wrap_valid)
+										uint16 *out_wrap, bool *out_wrap_valid)
 {
 	SlruCtl ctl = remote_xact_ctl(origin_node);
 	int slotno;
@@ -1082,17 +1088,21 @@ ClusterRemoteXactOutcome
 cluster_remote_commit_outcome_ex(int origin_node, TransactionId xid, SCN *commit_scn,
 								 uint16 *out_wrap, bool *out_wrap_valid)
 {
-	volatile RemoteXactAccessV1 access = {0};
+	volatile RemoteXactAccessV1 access = { 0 };
 	ClusterRemoteXactOutcome result = CLUSTER_REMOTE_XACT_INDOUBT;
 
-	if (commit_scn != NULL) *commit_scn = InvalidScn;
-	if (out_wrap != NULL) *out_wrap = 0;
-	if (out_wrap_valid != NULL) *out_wrap_valid = false;
+	if (commit_scn != NULL)
+		*commit_scn = InvalidScn;
+	if (out_wrap != NULL)
+		*out_wrap = 0;
+	if (out_wrap_valid != NULL)
+		*out_wrap_valid = false;
 
 	PG_TRY();
 	{
 		if (remote_xact_access_begin(&access, origin_node, false))
-			result = cluster_remote_commit_outcome_ex_active(origin_node, xid, commit_scn, out_wrap, out_wrap_valid);
+			result = cluster_remote_commit_outcome_ex_active(origin_node, xid, commit_scn, out_wrap,
+															 out_wrap_valid);
 	}
 	PG_FINALLY();
 	{
@@ -1103,7 +1113,8 @@ cluster_remote_commit_outcome_ex(int origin_node, TransactionId xid, SCN *commit
 }
 
 static bool
-cluster_remote_commit_timestamp_active(int origin_node, TransactionId xid, TimestampTz *commit_timestamp)
+cluster_remote_commit_timestamp_active(int origin_node, TransactionId xid,
+									   TimestampTz *commit_timestamp)
 {
 	SlruCtl ctl = remote_xact_ctl(origin_node);
 	const ClusterRemoteXactEntryV2 *entry;
@@ -1136,10 +1147,11 @@ cluster_remote_commit_timestamp_active(int origin_node, TransactionId xid, Times
 bool
 cluster_remote_commit_timestamp(int origin_node, TransactionId xid, TimestampTz *commit_timestamp)
 {
-	volatile RemoteXactAccessV1 access = {0};
+	volatile RemoteXactAccessV1 access = { 0 };
 	bool result = false;
 
-	if (commit_timestamp != NULL) *commit_timestamp = 0;
+	if (commit_timestamp != NULL)
+		*commit_timestamp = 0;
 
 	PG_TRY();
 	{
@@ -1167,7 +1179,7 @@ cluster_remote_xact_flush(void)
 		/* Shared mutation APIs are synchronous and leave no queued writes.
 		 * A bulk flush must never write a stale recovery owner's cache. */
 		for (int origin = 0; origin < 128; origin++) {
-			volatile RemoteXactAccessV1 access = {0};
+			volatile RemoteXactAccessV1 access = { 0 };
 			SlruCtl ctl = remote_xact_ctl(origin);
 
 			if (ctl->shared == NULL)
@@ -1182,7 +1194,8 @@ cluster_remote_xact_flush(void)
 				for (int slot = 0; slot < ctl->shared->num_slots; slot++)
 					if (ctl->shared->page_status[slot] != SLRU_PAGE_EMPTY
 						|| ctl->shared->page_dirty[slot])
-						ereport(ERROR, (errmsg("shared remote transaction cache has pending work")));
+						ereport(ERROR,
+								(errmsg("shared remote transaction cache has pending work")));
 				LWLockRelease(ctl->shared->ControlLock);
 			}
 			PG_FINALLY();

@@ -100,8 +100,13 @@ int cluster_cssd_heartbeat_interval_ms = 1000, cluster_cssd_dead_deadband_factor
 static unsigned self_seal_calls;
 static ClusterControlRootResult self_seal_returns[4];
 
-TimestampTz GetCurrentTimestamp(void) { return 10000000; }
-bool TimestampDifferenceExceeds(TimestampTz start, TimestampTz end, int msec)
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return 10000000;
+}
+bool
+TimestampDifferenceExceeds(TimestampTz start, TimestampTz end, int msec)
 {
 	return end - start >= (int64)msec * 1000;
 }
@@ -110,7 +115,8 @@ bool TimestampDifferenceExceeds(TimestampTz start, TimestampTz end, int msec)
  * durable tail and refusal semantics have independent ROOT/QVOTEC tests. */
 ClusterControlRootResult
 cluster_control_root_v3_self_seal_v1(const ClusterWalSourceRef *restart, uint64 min_dead_us,
-	ClusterControlRootSnapshot *out, ClusterControlRootReadToken *token)
+									 ClusterControlRootSnapshot *out,
+									 ClusterControlRootReadToken *token)
 {
 	UT_ASSERT(cf_mode == NoLock && !local_lock && CritSectionCount == 0);
 	UT_ASSERT_EQ(memcmp(restart, &ref, sizeof(ref)), 0);
@@ -370,7 +376,7 @@ cluster_control_root_v3_shutdown_checkpoint_publish(const ClusterControlRootIden
 
 bool
 cluster_wal_writer_startup_matches(const ClusterControlRootIdentity *self, const uint8 uuid[16],
-									XLogRecPtr first)
+								   XLogRecPtr first)
 {
 	return startup_binding_ok && fence_ok && provider_ok && !prebump
 		   && epoch == clusterStartupWriter.formation_epoch
@@ -386,17 +392,20 @@ cluster_wal_writer_begin(TimeLineID timeline, ClusterWalWriterToken *writer)
 	writer->ref = ref;
 	writer->epoch = epoch;
 	return startup_binding_ok && fence_ok && timeline == clusterStartupWriter.timeline
-		? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			   : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 }
 
 ClusterControlRootResult
 cluster_wal_writer_check(const ClusterWalWriterToken *writer)
 {
 	return writer->epoch == epoch && startup_binding_ok && fence_ok
-		? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			   : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 }
 
-bool RequestStartupSync(void)
+bool
+RequestStartupSync(void)
 {
 	UT_ASSERT_EQ(cf_mode, NoLock);
 	UT_ASSERT(!local_lock);
@@ -508,7 +517,7 @@ cluster_control_root_v3_startup_route_writer(const ClusterControlRootIdentity *s
 
 ClusterControlRootResult
 cluster_wal_writer_startup_prepare(const ClusterControlRootIdentity *self, const uint8 uuid[16],
-									XLogRecPtr *first)
+								   XLogRecPtr *first)
 {
 	UT_ASSERT(cf_mode == NoLock && !local_lock && CritSectionCount == 0);
 	UT_ASSERT(!clusterStartupWriterBound && route_calls == 1);
@@ -959,13 +968,27 @@ UT_TEST(startup_file_sync_rechecks_original_writer_and_keeps_native_owner)
 		startup_sync_ok = true;
 		startup_sync_change_epoch = false;
 		switch (fault) {
-		case 1: clusterStartupWriterBound = false; break;
-		case 2: clusterStartupWriterInstalled = true; break;
-		case 3: startup_binding_ok = false; break;
-		case 4: startup_sync_ok = false; break;
-		case 5: startup_sync_change_epoch = true; break;
-		case 6: cf_mode = ExclusiveLock; break;
-		case 7: local_lock = true; break;
+		case 1:
+			clusterStartupWriterBound = false;
+			break;
+		case 2:
+			clusterStartupWriterInstalled = true;
+			break;
+		case 3:
+			startup_binding_ok = false;
+			break;
+		case 4:
+			startup_sync_ok = false;
+			break;
+		case 5:
+			startup_sync_change_epoch = true;
+			break;
+		case 6:
+			cf_mode = ExclusiveLock;
+			break;
+		case 7:
+			local_lock = true;
+			break;
 		}
 		UT_ASSERT_EQ(ClusterStartupFileSync(), fault == 0);
 		UT_ASSERT_EQ(startup_sync_calls, fault == 0 || fault == 4 || fault == 5 ? 1 : 0);
@@ -1591,7 +1614,7 @@ UT_TEST(legacy_startup_does_not_select_shared_initializer)
 
 UT_TEST(shared_crash_startup_uses_original_self_seal_before_native_directory)
 {
-	DBState crashed[] = {DB_IN_PRODUCTION, DB_SHUTDOWNING, DB_IN_CRASH_RECOVERY};
+	DBState crashed[] = { DB_IN_PRODUCTION, DB_SHUTDOWNING, DB_IN_CRASH_RECOVERY };
 	for (unsigned i = 0; i < lengthof(crashed); i++) {
 		writer_begin_fixture();
 		current.state = crashed[i];
@@ -1622,7 +1645,8 @@ UT_TEST(shared_crash_refusal_or_cancel_never_reaches_native_mutation)
 			mount_result = CLUSTER_CONFIG_MOUNT_MISMATCH;
 		UT_ASSERT(!startup_first_native_site());
 		UT_ASSERT_EQ(self_seal_calls, fault < 2 ? 1 : 0);
-		UT_ASSERT_EQ(startup_directory_calls | advance_calls | route_calls | bind_calls | native_writes, 0);
+		UT_ASSERT_EQ(
+			startup_directory_calls | advance_calls | route_calls | bind_calls | native_writes, 0);
 		UT_ASSERT(!clusterStartupWriterSelected && !clusterStartupWriterBound);
 		UT_ASSERT_EQ(cf_mode, NoLock);
 	}
@@ -1730,7 +1754,9 @@ static struct {
 	XLogCtlInsert Insert;
 	int info_lck;
 	TimeLineID InsertTimeLineID;
-	struct { XLogRecPtr Write, Flush; } LogwrtResult;
+	struct {
+		XLogRecPtr Write, Flush;
+	} LogwrtResult;
 } reserve_ctl, *XLogCtl = &reserve_ctl;
 #define SpinLockAcquire(l) ((void)(l))
 #define SpinLockRelease(l) ((void)(l))
@@ -1748,19 +1774,45 @@ UT_TEST(native_startup_flush_requires_bound_owner_and_exact_timeline)
 		reserve_ctl.InsertTimeLineID = timeline;
 		reserve_ctl.LogwrtResult.Flush = end;
 		switch (fault) {
-		case 1: reserve_ctl.LogwrtResult.Flush--; break;
-		case 2: clusterStartupWriterBound = false; break;
-		case 3: clusterStartupWriterInstalled = true; break;
-		case 4: MyBackendType = B_BACKEND; break;
-		case 5: cluster_enabled = false; break;
-		case 6: cluster_shared_config = false; break;
-		case 7: enableFsync = false; break;
-		case 8: ShutdownRequestPending = true; break;
-		case 9: clusterStartupWriter.timeline++; break;
-		case 10: reserve_ctl.InsertTimeLineID++; break;
-		case 11: end = InvalidXLogRecPtr; break;
-		case 12: timeline = 0; break;
-		case 13: reserve_ctl.LogwrtResult.Flush++; break;
+		case 1:
+			reserve_ctl.LogwrtResult.Flush--;
+			break;
+		case 2:
+			clusterStartupWriterBound = false;
+			break;
+		case 3:
+			clusterStartupWriterInstalled = true;
+			break;
+		case 4:
+			MyBackendType = B_BACKEND;
+			break;
+		case 5:
+			cluster_enabled = false;
+			break;
+		case 6:
+			cluster_shared_config = false;
+			break;
+		case 7:
+			enableFsync = false;
+			break;
+		case 8:
+			ShutdownRequestPending = true;
+			break;
+		case 9:
+			clusterStartupWriter.timeline++;
+			break;
+		case 10:
+			reserve_ctl.InsertTimeLineID++;
+			break;
+		case 11:
+			end = InvalidXLogRecPtr;
+			break;
+		case 12:
+			timeline = 0;
+			break;
+		case 13:
+			reserve_ctl.LogwrtResult.Flush++;
+			break;
 		}
 		UT_ASSERT_EQ(ClusterXLogStartupFlushCovers(end, timeline), fault == 0 || fault == 13);
 	}

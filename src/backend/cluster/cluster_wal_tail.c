@@ -253,8 +253,7 @@ wal_tail_has_same_page_successor(const WalTailWork *work, size_t offset)
 	if (work->page_bytes - offset < SizeOfXLogRecord)
 		return false;
 	memcpy(&failed, page + offset, SizeOfXLogRecord);
-	if (failed.xl_tot_len < SizeOfXLogRecord
-		|| failed.xl_tot_len > work->page_bytes - offset)
+	if (failed.xl_tot_len < SizeOfXLogRecord || failed.xl_tot_len > work->page_bytes - offset)
 		return false;
 	successor = MAXALIGN(offset + failed.xl_tot_len);
 	if (successor > work->page_bytes || work->page_bytes - successor < SizeOfXLogRecord)
@@ -334,7 +333,7 @@ static ClusterControlRootResult
 wal_tail_successor_pages(WalTailWork *work, XLogSegNo number, off_t start, off_t size)
 {
 	for (off_t offset = start; offset < size; offset += XLOG_BLCKSZ) {
-		XLogLongPageHeaderData header;
+		XLogLongPageHeaderData header = { 0 };
 		size_t wanted = offset == 0 ? SizeOfXLogLongPHD : SizeOfXLogShortPHD;
 		size_t used = 0;
 		XLogRecPtr page = number * work->reader->segcxt.ws_segsize + offset;
@@ -414,11 +413,10 @@ wal_tail_no_written_successor(WalTailWork *work, XLogRecPtr lower)
 		if (work->suffix_fd < 0 || fstat(work->suffix_fd, &before) != 0
 			|| !wal_tail_owned(&before, false) || before.st_size > work->reader->segcxt.ws_segsize)
 			return CLUSTER_CONTROL_ROOT_IO_ERROR;
-		start = number == last_segment
-					? XLogSegmentOffset(Max(lower, work->last_page_requested),
-										work->reader->segcxt.ws_segsize)
-						  + XLOG_BLCKSZ
-					: 0;
+		start = number == last_segment ? XLogSegmentOffset(Max(lower, work->last_page_requested),
+														   work->reader->segcxt.ws_segsize)
+											 + XLOG_BLCKSZ
+									   : 0;
 		/* lower can be a record address; begin strictly after its page. */
 		start -= start % XLOG_BLCKSZ;
 		result = wal_tail_successor_pages(work, number, start, before.st_size);
@@ -572,7 +570,7 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 	char thread[32], generation[48];
 	const char *parts[] = { thread, generation };
 	ClusterWalThreadClaimV2 claim;
-	XLogRecord *record;
+	const XLogRecord *record;
 	char *error = NULL;
 	bool checkpoint_seen = work->checkpoint_start == 0;
 	struct stat st;
@@ -894,8 +892,8 @@ wal_tail_observe_common(const char *wal_root, const ClusterWalSourceRef *ref, in
 }
 
 ClusterControlRootResult
-cluster_wal_tail_observe(const char *wal_root, const ClusterWalSourceRef *ref,
-						 int segment_size, XLogRecPtr scan_lower, XLogRecPtr minimum_end,
+cluster_wal_tail_observe(const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
+						 XLogRecPtr scan_lower, XLogRecPtr minimum_end,
 						 ClusterWalTailObservation *out)
 {
 	return wal_tail_observe_common(wal_root, ref, segment_size, scan_lower, minimum_end, 0, 0, out,
@@ -903,9 +901,8 @@ cluster_wal_tail_observe(const char *wal_root, const ClusterWalSourceRef *ref,
 }
 
 ClusterControlRootResult
-cluster_wal_startup_observe(const char *wal_root, const ClusterWalSourceRef *ref,
-							int segment_size, XLogRecPtr first_segment,
-							ClusterWalStartupObservation *out)
+cluster_wal_startup_observe(const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
+							XLogRecPtr first_segment, ClusterWalStartupObservation *out)
 {
 	return cluster_wal_startup_visit_v1(wal_root, ref, segment_size, first_segment, NULL, NULL,
 										out);
@@ -929,9 +926,8 @@ cluster_wal_startup_visit_v1(const char *wal_root, const ClusterWalSourceRef *re
 }
 
 ClusterControlRootResult
-cluster_wal_startup_sync(const char *wal_root, const ClusterWalSourceRef *ref,
-						 int segment_size, XLogRecPtr first_segment,
-						 ClusterWalStartupObservation *out)
+cluster_wal_startup_sync(const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
+						 XLogRecPtr first_segment, ClusterWalStartupObservation *out)
 {
 	ClusterWalTailObservation tail;
 	XLogRecPtr lower;
@@ -969,7 +965,7 @@ wal_tail_visit_exact(const char *wal_root, const ClusterWalSourceRef *ref, int s
 					 ClusterWalRecordVisitor visitor, void *arg, ClusterWalTailObservation *out,
 					 bool recovery_only)
 {
-	ClusterControlRootSnapshot expected;
+	ClusterControlRootSnapshot expected = { 0 };
 	const uint32 flags
 		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
 		  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
@@ -1082,7 +1078,6 @@ cluster_wal_prefix_identity_recheck(const char *wal_root, const ClusterWalSource
 {
 	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
 	char thread[32], generation[48];
-	const char *parts[] = { thread, generation };
 	volatile int dirs[3] = { -1, -1, -1 };
 	struct stat st;
 	volatile ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -1097,6 +1092,7 @@ cluster_wal_prefix_identity_recheck(const char *wal_root, const ClusterWalSource
 	/* Raw directory descriptors must also close when a cancellation unwinds. */
 	PG_TRY();
 	{
+		const char *parts[] = { thread, generation };
 		dirs[0] = open(wal_root, flags);
 		for (size_t i = 0; result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && i < lengthof(dirs); ++i) {
 			if (i > 0)

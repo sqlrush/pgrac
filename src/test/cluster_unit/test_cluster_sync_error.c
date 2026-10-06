@@ -21,7 +21,9 @@ struct ClusterSharedFsHandle {
 	File vfd;
 	bool opened;
 };
-typedef struct ClusterSmgrRelationState { int unused; } ClusterSmgrRelationState;
+typedef struct ClusterSmgrRelationState {
+	int unused;
+} ClusterSmgrRelationState;
 static ClusterSmgrRelationState relation_state;
 static ClusterSharedFsHandle native_handle;
 static ClusterSharedFsOps ops;
@@ -44,24 +46,53 @@ first_unchanged(void)
 	ClusterPageWalFirstResultV1 result = cluster_page_wal_first_observe_locked_v1(buf, &current);
 	UnlockBufHdr(buf, state);
 	return result == CLUSTER_PAGE_WAL_FIRST_PRESENT
-		&& memcmp(&current, &first_before, sizeof(current)) == 0;
+		   && memcmp(&current, &first_before, sizeof(current)) == 0;
 }
 
-bool errstart(int level, const char *domain pg_attribute_unused())
+bool
+errstart(int level, const char *domain pg_attribute_unused())
 {
 	reported_level = level;
 	return level >= ERROR;
 }
-bool errstart_cold(int level, const char *domain) { return errstart(level, domain); }
-int errcode(int code pg_attribute_unused()) { return 0; }
-int errcode_for_file_access(void) { return 0; }
-int errmsg(const char *fmt pg_attribute_unused(), ...) { return 0; }
-int errmsg_internal(const char *fmt pg_attribute_unused(), ...) { return 0; }
-int errdetail(const char *fmt pg_attribute_unused(), ...) { return 0; }
-int errhint(const char *fmt pg_attribute_unused(), ...) { return 0; }
+bool
+errstart_cold(int level, const char *domain)
+{
+	return errstart(level, domain);
+}
+int
+errcode(int code pg_attribute_unused())
+{
+	return 0;
+}
+int
+errcode_for_file_access(void)
+{
+	return 0;
+}
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errhint(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
 void
 errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
-	const char *fn pg_attribute_unused())
+		  const char *fn pg_attribute_unused())
 {
 	observed->level = reported_level;
 	observed->first_unchanged = first_unchanged();
@@ -74,7 +105,7 @@ errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
 
 int
 FileWrite(File fd, const void *data, size_t amount, off_t offset,
-	uint32 event pg_attribute_unused())
+		  uint32 event pg_attribute_unused())
 {
 	if (fail_write) {
 		errno = EIO;
@@ -93,7 +124,11 @@ pg_fsync(int fd)
 	}
 	return fsync(fd);
 }
-int FileSync(File fd, uint32 event pg_attribute_unused()) { return pg_fsync(fd); }
+int
+FileSync(File fd, uint32 event pg_attribute_unused())
+{
+	return pg_fsync(fd);
+}
 
 bool
 RegisterSyncRequest(const FileTag *tag, SyncRequestType type, bool retry)
@@ -106,8 +141,12 @@ RegisterSyncRequest(const FileTag *tag, SyncRequestType type, bool retry)
 	observed->queued++;
 	return queue_accepts;
 }
-void cluster_write_fence_reject_if_fenced(const char *op pg_attribute_unused()) {}
-void cluster_mrp_standby_shared_write_gate(const char *op pg_attribute_unused()) {}
+void
+cluster_write_fence_reject_if_fenced(const char *op pg_attribute_unused())
+{}
+void
+cluster_mrp_standby_shared_write_gate(const char *op pg_attribute_unused())
+{}
 static ClusterSmgrRelationState *
 cluster_smgr_state_lookup(SMgrRelation r, bool create)
 {
@@ -142,10 +181,12 @@ setup(int provider)
 	ops.write = provider == 1 ? cluster_shared_fs_sharedfs_write : cluster_shared_fs_local_write;
 	/* Raw layout/data placement is not under test here; its complete provider
 	 * is exercised separately by test_cluster_shared_fs_block_device. */
-	ops.immedsync = provider == 0 ? cluster_shared_fs_local_immedsync
-		: provider == 1 ? cluster_shared_fs_sharedfs_immedsync : cluster_shared_fs_block_device_immedsync;
-	ops.barrier_sync = provider == 0 ? cluster_shared_fs_local_barrier_sync
-		: provider == 1 ? cluster_shared_fs_sharedfs_barrier_sync : cluster_shared_fs_block_device_barrier_sync;
+	ops.immedsync = provider == 0	? cluster_shared_fs_local_immedsync
+					: provider == 1 ? cluster_shared_fs_sharedfs_immedsync
+									: cluster_shared_fs_block_device_immedsync;
+	ops.barrier_sync = provider == 0   ? cluster_shared_fs_local_barrier_sync
+					   : provider == 1 ? cluster_shared_fs_sharedfs_barrier_sync
+									   : cluster_shared_fs_block_device_barrier_sync;
 	storage_write_hook = cluster_smgr_write;
 	queue_accepts = fail_sync = fail_write = data_sync_retry = false;
 	buf = &descriptors[1].bufferdesc;
@@ -153,7 +194,7 @@ setup(int provider)
 	locks[0] = locks[1] = true;
 	state = LockBufHdr(buf);
 	UT_ASSERT_EQ(cluster_page_wal_first_observe_locked_v1(buf, &first_before),
-		CLUSTER_PAGE_WAL_FIRST_PRESENT);
+				 CLUSTER_PAGE_WAL_FIRST_PRESENT);
 	UnlockBufHdr(buf, state);
 }
 
@@ -239,8 +280,7 @@ UT_TEST(write_error_remains_error_and_sync_retry_uses_native_policy)
 int
 main(void)
 {
-	observed = mmap(NULL, sizeof(*observed), PROT_READ | PROT_WRITE,
-		MAP_SHARED | MAP_ANON, -1, 0);
+	observed = mmap(NULL, sizeof(*observed), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	if (observed == MAP_FAILED)
 		return 2;
 	UT_PLAN(3);

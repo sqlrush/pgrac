@@ -918,8 +918,7 @@ cluster_bufmgr_pcm_own_try_drain_drop_x_revoke(BufferDesc *buf,
 											   const ClusterPcmOwnSnapshot *expected_revoking);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
 	ClusterPcmOwnHeldXRevoke *held, XLogRecPtr expected_lsn, ClusterPcmOwnSnapshot *out_retained,
-	ClusterPcmOwnFinishRefusal *out_refusal,
-	const ResourceXSourceWalRetainedV1 *retained_wal);
+	ClusterPcmOwnFinishRefusal *out_refusal, const ResourceXSourceWalRetainedV1 *retained_wal);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(ClusterPcmOwnHeldXRevoke *held);
 

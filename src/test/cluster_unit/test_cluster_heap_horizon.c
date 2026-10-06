@@ -72,14 +72,20 @@ UT_TEST(missing_or_invalid_authority_preserves_output)
 	for (unsigned fault = 0; fault < 7; fault++) {
 		TransactionId cutoff = 1234;
 		setup_horizon();
-		if (fault == 0) activation_available = false;
-		if (fault == 1) activation_floor = 0;
-		if (fault == 2) activation_epoch = 0;
-		if (fault == 3) activation_generation = 0;
-		if (fault == 4) cluster_xid_striping = false;
-		if (fault == 5) stub_next_full = InvalidFullTransactionId;
-		UT_ASSERT(!cluster_heap_freeze_cutoff_v1(fault == 6 ? FrozenTransactionId : 4195120,
-			&cutoff));
+		if (fault == 0)
+			activation_available = false;
+		if (fault == 1)
+			activation_floor = 0;
+		if (fault == 2)
+			activation_epoch = 0;
+		if (fault == 3)
+			activation_generation = 0;
+		if (fault == 4)
+			cluster_xid_striping = false;
+		if (fault == 5)
+			stub_next_full = InvalidFullTransactionId;
+		UT_ASSERT(
+			!cluster_heap_freeze_cutoff_v1(fault == 6 ? FrozenTransactionId : 4195120, &cutoff));
 		UT_ASSERT_EQ(cutoff, 1234);
 	}
 	UT_ASSERT(!cluster_heap_freeze_cutoff_v1(4195120, NULL));
@@ -90,12 +96,12 @@ UT_TEST(full_xid_window_cannot_alias_old_activation)
 	TransactionId cutoff = 1234;
 	setup_horizon();
 	stub_next_full = FullTransactionIdFromU64(activation_floor + UINT64_C(0x80000000));
-	UT_ASSERT(!cluster_heap_freeze_cutoff_v1((uint32)U64FromFullTransactionId(stub_next_full),
-		&cutoff));
+	UT_ASSERT(
+		!cluster_heap_freeze_cutoff_v1((uint32)U64FromFullTransactionId(stub_next_full), &cutoff));
 	UT_ASSERT_EQ(cutoff, 1234);
 	activation_floor = U64FromFullTransactionId(stub_next_full) + UINT64_C(0x80000000);
-	UT_ASSERT(!cluster_heap_freeze_cutoff_v1((uint32)U64FromFullTransactionId(stub_next_full),
-		&cutoff));
+	UT_ASSERT(
+		!cluster_heap_freeze_cutoff_v1((uint32)U64FromFullTransactionId(stub_next_full), &cutoff));
 	UT_ASSERT_EQ(cutoff, 1234);
 }
 

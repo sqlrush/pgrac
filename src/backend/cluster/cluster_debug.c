@@ -1447,13 +1447,14 @@ dump_grd_recovery(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "grd_recovery", "pi_rebuild_plan_blocked",
 			 fmt_int64((int64)c.pi_rebuild_plan_blocked));
 	if (cluster_pi_writeback_rejections_v1(&wb)) {
-		static const char *const keys[]
-			= { "pi_writeback_data_proof_rejected", "pi_writeback_local_ack_rejected",
-				"pi_writeback_remote_ack_rejected", "pi_writeback_master_cut_rejected",
-				"pi_writeback_peer_physical_rejected", "pi_writeback_recovery_proof_rejected",
-				"pi_writeback_structure_owner_rejected", "pi_writeback_contribution_plan_rejected" };
+		static const char *const keys[] = {
+			"pi_writeback_data_proof_rejected",		 "pi_writeback_local_ack_rejected",
+			"pi_writeback_remote_ack_rejected",		 "pi_writeback_master_cut_rejected",
+			"pi_writeback_peer_physical_rejected",	 "pi_writeback_recovery_proof_rejected",
+			"pi_writeback_structure_owner_rejected", "pi_writeback_contribution_plan_rejected"
+		};
 		StaticAssertDecl(lengthof(keys) == CLUSTER_PI_WRITEBACK_REJECTION_COUNT,
-						"every PI rejection requires a dump key");
+						 "every PI rejection requires a dump key");
 		for (unsigned i = 0; i < lengthof(keys); i++)
 			emit_row(rsinfo, "grd_recovery", keys[i], psprintf(UINT64_FORMAT, wb.attempts[i]));
 		emit_row(rsinfo, "grd_recovery", "pi_writeback_rejection_logs",

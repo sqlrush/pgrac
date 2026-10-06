@@ -35,36 +35,84 @@ static uint32 next_mxid;
 static unsigned xid_reads, mxid_reads, wal_records, wal_begins;
 static xl_cluster_xid_stripe_join wal_payload;
 
-bool RecoveryInProgress(void) { return recovery; }
-bool XLogInsertAllowed(void) { return wal_allowed; }
-FullTransactionId ReadNextFullTransactionId(void)
+bool
+RecoveryInProgress(void)
+{
+	return recovery;
+}
+bool
+XLogInsertAllowed(void)
+{
+	return wal_allowed;
+}
+FullTransactionId
+ReadNextFullTransactionId(void)
 {
 	xid_reads++;
 	return FullTransactionIdFromU64(next_xid);
 }
-MultiXactId ReadNextMultiXactId(void) { mxid_reads++; return next_mxid; }
-bool LWLockAcquire(LWLock *lock, LWLockMode mode) { return true; }
-void LWLockRelease(LWLock *lock) {}
-void XLogBeginInsert(void) { wal_begins++; }
-void XLogRegisterData(char *data, uint32 len)
+MultiXactId
+ReadNextMultiXactId(void)
+{
+	mxid_reads++;
+	return next_mxid;
+}
+bool
+LWLockAcquire(LWLock *lock, LWLockMode mode)
+{
+	return true;
+}
+void
+LWLockRelease(LWLock *lock)
+{}
+void
+XLogBeginInsert(void)
+{
+	wal_begins++;
+}
+void
+XLogRegisterData(char *data, uint32 len)
 {
 	UT_ASSERT_EQ(len, sizeof(wal_payload));
 	memcpy(&wal_payload, data, len);
 }
-XLogRecPtr XLogInsert(RmgrId rmid, uint8 info)
+XLogRecPtr
+XLogInsert(RmgrId rmid, uint8 info)
 {
 	UT_ASSERT_EQ(rmid, RM_CLUSTER_XID_STRIPE_ID);
 	UT_ASSERT_EQ(info, XLOG_CLUSTER_XID_STRIPE_JOIN);
 	wal_records++;
 	return UINT64_C(8192);
 }
-void ExceptionalCondition(const char *condition, const char *file, int line) { abort(); }
+void
+ExceptionalCondition(const char *condition, const char *file, int line)
+{
+	abort();
+}
 #undef errstart
 #undef errstart_cold
-bool errstart(int level, const char *domain) { if (level >= ERROR) abort(); return false; }
-bool errstart_cold(int level, const char *domain) { return errstart(level, domain); }
-int errmsg(const char *fmt, ...) { return 0; }
-void errfinish(const char *file, int line, const char *func) { abort(); }
+bool
+errstart(int level, const char *domain)
+{
+	if (level >= ERROR)
+		abort();
+	return false;
+}
+bool
+errstart_cold(int level, const char *domain)
+{
+	return errstart(level, domain);
+}
+int
+errmsg(const char *fmt, ...)
+{
+	return 0;
+}
+void
+errfinish(const char *file, int line, const char *func)
+{
+	abort();
+}
 
 #include "test_cluster_xid_stripe_boot.inc"
 
@@ -87,8 +135,8 @@ reset_boot(void)
 UT_TEST(test_recovery_holds_every_activation_state_without_side_effects)
 {
 	reset_boot();
-	for (int state = CLUSTER_XID_STRIPE_DISK_UNKNOWN;
-		 state <= CLUSTER_XID_STRIPE_DISK_CORRUPT; state++) {
+	for (int state = CLUSTER_XID_STRIPE_DISK_UNKNOWN; state <= CLUSTER_XID_STRIPE_DISK_CORRUPT;
+		 state++) {
 		boot.disk_state = state;
 		boot.slot_state = CLUSTER_XID_STRIPE_SLOT_MINE;
 		UT_ASSERT_EQ(cluster_xid_stripe_join_progress(true), STRIPE_JOIN_WAIT_EVIDENCE);

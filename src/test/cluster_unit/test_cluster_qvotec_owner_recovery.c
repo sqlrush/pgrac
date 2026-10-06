@@ -1,5 +1,8 @@
 /* Reuse the real voting-disk fixture and product objects, without changing
- * the original suite or adding another product entry point. */
+ * the original suite or adding another product entry point.
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
 int qvotec_base_suite_main(void);
 #define main qvotec_base_suite_main
 #include "test_cluster_qvotec.c"

@@ -712,10 +712,10 @@ cluster_tt_durable_bind_preflight_exact(uint8 instance, uint32 segment_id,
 		return CLUSTER_TT_ACTIVE_CORRUPT;
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(instance), segment_id, instance,
-									  0, first.data)
-		|| !cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(instance), segment_id,
-										 instance, 0, second.data)) {
+	if (!cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(instance), segment_id,
+									  instance, 0, first.data)
+		|| !cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(instance),
+										 segment_id, instance, 0, second.data)) {
 		cluster_tt_durable_io_wait_end();
 		return CLUSTER_TT_ACTIVE_CONFLICT;
 	}
@@ -753,10 +753,10 @@ cluster_tt_durable_abort_preflight_exact(uint8 instance, uint32 segment_id,
 		|| wrap == TT_WRAP_INVALID || instance != tt_owner_instance_for_segment(segment_id))
 		return CLUSTER_TT_TERMINAL_CORRUPT;
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(instance), segment_id, instance,
-									  0, first.data)
-		|| !cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(instance), segment_id,
-										 instance, 0, second.data)) {
+	if (!cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(instance), segment_id,
+									  instance, 0, first.data)
+		|| !cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(instance),
+										 segment_id, instance, 0, second.data)) {
 		cluster_tt_durable_io_wait_end();
 		return CLUSTER_TT_TERMINAL_CONFLICT;
 	}
@@ -1491,8 +1491,8 @@ cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, Transaction
 
 	cluster_tt_durable_io_wait_start();
 
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner), segment_id,
-											 owner, off, (char *)&slot, sizeof(slot))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
+											 segment_id, owner, off, (char *)&slot, sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster durable TT: cannot read slot %u of undo segment %u",
@@ -1506,8 +1506,9 @@ cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, Transaction
 	slot.commit_scn = InvalidScn;
 	slot.first_undo_block = InvalidUbaVal; /* spec-4.8 D7-A (P1#1): cleared; 0x90 re-attaches */
 
-	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_recovery_intent_for_owner(owner), segment_id,
-											  owner, off, (const char *)&slot, sizeof(slot))) {
+	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
+											  segment_id, owner, off, (const char *)&slot,
+											  sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster durable TT: cannot write slot %u of undo segment %u",
@@ -1533,8 +1534,8 @@ cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, Transactio
 	off = tt_slot_file_offset(slot_offset);
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner), segment_id,
-											 owner, off, (char *)&slot, sizeof(slot))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
+											 segment_id, owner, off, (char *)&slot, sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		cluster_tt_durable_count_lookup(false);
 		return false; /* segment absent / I/O -> miss (caller fail-closes) */
@@ -1575,8 +1576,9 @@ cluster_tt_slot_durable_lookup_committed_stable(uint32 segment_id, uint16 slot_o
 	off = tt_slot_file_offset(slot_offset);
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner), segment_id,
-											 owner, off, (char *)&first, sizeof(first))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
+											 segment_id, owner, off, (char *)&first,
+											 sizeof(first))) {
 		cluster_tt_durable_io_wait_end();
 		return false;
 	}
@@ -1594,8 +1596,9 @@ cluster_tt_slot_durable_lookup_committed_stable(uint32 segment_id, uint16 slot_o
 	}
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner), segment_id,
-											 owner, off, (char *)&second, sizeof(second))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
+											 segment_id, owner, off, (char *)&second,
+											 sizeof(second))) {
 		cluster_tt_durable_io_wait_end();
 		cluster_tt_durable_count_lookup(false);
 		return false;
@@ -1637,8 +1640,9 @@ cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
 	off = tt_slot_file_offset(slot_offset);
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner), segment_id,
-											 owner, off, (char *)&first, sizeof(first))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
+											 segment_id, owner, off, (char *)&first,
+											 sizeof(first))) {
 		cluster_tt_durable_io_wait_end();
 		cluster_tt_durable_count_lookup(false);
 		return false;
@@ -1649,8 +1653,9 @@ cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
 		return false;
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner), segment_id,
-											 owner, off, (char *)&second, sizeof(second))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
+											 segment_id, owner, off, (char *)&second,
+											 sizeof(second))) {
 		cluster_tt_durable_io_wait_end();
 		return false;
 	}
@@ -1694,8 +1699,9 @@ cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id, uint16 slo
 				(errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid typed TT abort redo identity")));
 	off = tt_slot_file_offset(slot_offset);
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(instance), segment_id,
-											 instance, off, (char *)&slot, sizeof(slot))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(instance),
+											 segment_id, instance, off, (char *)&slot,
+											 sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cannot read TT slot %u of undo segment %u for abort redo",
@@ -1719,8 +1725,9 @@ cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id, uint16 slo
 	slot.flags = TT_FLAGS_RESERVED;
 	slot.commit_scn = InvalidScn;
 	slot.first_undo_block = InvalidUbaVal;
-	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_recovery_intent_for_owner(instance), segment_id,
-											  instance, off, (const char *)&slot, sizeof(slot))
+	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_recovery_intent_for_owner(instance),
+											  segment_id, instance, off, (const char *)&slot,
+											  sizeof(slot))
 		|| !cluster_undo_smgr_fsync_segment_file(segment_id, instance)) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -1748,8 +1755,8 @@ cluster_tt_durable_redo_abort_slot_exact(uint8 instance, uint32 segment_id,
 		ereport(PANIC,
 				(errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid exact TT abort redo identity")));
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(instance), segment_id, instance,
-									  0, block.data)) {
+	if (!cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(instance), segment_id,
+									  instance, 0, block.data)) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cannot read undo segment %u for exact abort redo", segment_id)));
@@ -1784,9 +1791,9 @@ cluster_tt_durable_redo_abort_slot_exact(uint8 instance, uint32 segment_id,
 	successor.flags = TT_FLAGS_RESERVED;
 	successor.commit_scn = InvalidScn;
 	successor.first_undo_block = InvalidUbaVal;
-	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_recovery_intent_for_owner(instance), segment_id,
-											  instance, tt_slot_file_offset(slot_offset),
-											  (const char *)&successor, sizeof(successor))
+	if (!cluster_undo_smgr_write_header_bytes(
+			cluster_undo_recovery_intent_for_owner(instance), segment_id, instance,
+			tt_slot_file_offset(slot_offset), (const char *)&successor, sizeof(successor))
 		|| !cluster_undo_smgr_fsync_segment_file(segment_id, instance)) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -1811,8 +1818,9 @@ cluster_tt_durable_redo_set_head_slot(uint8 instance, uint32 segment_id, uint16 
 						errmsg("invalid typed TT set-head redo identity")));
 	off = tt_slot_file_offset(slot_offset);
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(instance), segment_id,
-											 instance, off, (char *)&slot, sizeof(slot))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(instance),
+											 segment_id, instance, off, (char *)&slot,
+											 sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cannot read TT slot %u of undo segment %u for set-head redo",
@@ -1825,8 +1833,9 @@ cluster_tt_durable_redo_set_head_slot(uint8 instance, uint32 segment_id, uint16 
 		return;
 	}
 	slot.first_undo_block = first_undo_block;
-	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_recovery_intent_for_owner(instance), segment_id,
-											  instance, off, (const char *)&slot, sizeof(slot))
+	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_recovery_intent_for_owner(instance),
+											  segment_id, instance, off, (const char *)&slot,
+											  sizeof(slot))
 		|| !cluster_undo_smgr_fsync_segment_file(segment_id, instance)) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC,
@@ -2223,8 +2232,8 @@ cluster_undo_segment_tt_header_scan_pass(uint32 segment_id, uint8 owner_instance
 
 	/* Whole-block read mirrors the by-xid scan shape (one smgr surface). */
 	cluster_undo_cleaner_scan_wait_start();
-	if (!cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(owner_instance), segment_id,
-									  owner_instance, 0, block.data)) {
+	if (!cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(owner_instance),
+									  segment_id, owner_instance, 0, block.data)) {
 		cluster_undo_cleaner_scan_wait_end();
 		return false; /* absent / I/O: caller counts and moves on */
 	}

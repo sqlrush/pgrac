@@ -46,7 +46,7 @@
 #include "utils/guc.h"
 #include "libpq/pqcomm.h"
 
-#include "cluster/cluster_block_recovery.h"		 /* spec-4.10 D1 online block recovery GUCs */
+#include "cluster/cluster_block_recovery.h" /* spec-4.10 D1 online block recovery GUCs */
 #include "cluster/cluster_cold_recovery.h"
 #include "cluster/cluster_external_fence.h"		 /* STOP-04 external fence GUC defaults */
 #include "cluster/cluster_thread_recovery.h"	 /* spec-4.11 D1 online thread recovery GUCs */
@@ -3402,11 +3402,10 @@ cluster_init_guc(void)
 		"cluster.object_reuse_flush_enabled",
 		gettext_noop(
 			"Flush a relation's buffers on every peer before its storage is removed or truncated."),
-		gettext_noop(
-			"The shared profile always requires this barrier. Otherwise, off skips it: "
-			"a peer's stale dirty buffers could be written "
-			"back after the file is unlinked, recreating the file or corrupting a reused "
-			"relfilenode in a multi-node cluster."),
+		gettext_noop("The shared profile always requires this barrier. Otherwise, off skips it: "
+					 "a peer's stale dirty buffers could be written "
+					 "back after the file is unlinked, recreating the file or corrupting a reused "
+					 "relfilenode in a multi-node cluster."),
 		&cluster_object_reuse_flush_enabled, true, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/* spec-2.5 D9: 3 NEW CSSD GUCs (PGC_POSTMASTER per spec §2.3 — applied

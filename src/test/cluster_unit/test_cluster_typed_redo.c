@@ -27,11 +27,11 @@ static bool locked, exists = true, space_ok = true, verdict_ok = true;
 static bool cold_write_allowed;
 volatile uint32 CritSectionCount;
 static ClusterColdRedoBlockV1 verdict;
-static ClusterSpaceIdentity space;
-static PGAlignedBlock data, image;
+static ClusterSpaceIdentity fixture_space;
+static PGAlignedBlock data, fixture_image;
 static XLogReaderState reader;
 static DecodedXLogRecord *decoded;
-static RelFileLocator locator = { 1663, 1, 42 };
+static RelFileLocator fixture_locator = { 1663, 1, 42 };
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -82,9 +82,9 @@ bool
 cluster_space_relation_read_redo_identity(RelFileLocator loc, ClusterSpaceIdentity *out)
 {
 	UT_ASSERT(!locked);
-	UT_ASSERT(RelFileLocatorEquals(loc, locator));
+	UT_ASSERT(RelFileLocatorEquals(loc, fixture_locator));
 	space_reads++;
-	*out = space;
+	*out = fixture_space;
 	return space_ok;
 }
 bool
@@ -93,7 +93,7 @@ XLogRecGetBlockTagExtended(XLogReaderState *r, uint8 block, RelFileLocator *loc,
 {
 	if (r != &reader || block != 0)
 		return false;
-	*loc = locator;
+	*loc = fixture_locator;
 	*forknum = MAIN_FORKNUM;
 	*blkno = 3;
 	if (prefetch)
@@ -104,7 +104,7 @@ void
 BufferGetTag(Buffer buffer, RelFileLocator *loc, ForkNumber *forknum, BlockNumber *blkno)
 {
 	UT_ASSERT_EQ(buffer, 1);
-	*loc = locator;
+	*loc = fixture_locator;
 	*forknum = MAIN_FORKNUM;
 	*blkno = 3;
 }
@@ -150,7 +150,7 @@ bool
 RestoreBlockImage(XLogReaderState *record, uint8 block, char *page)
 {
 	restored++;
-	memcpy(page, image.data, BLCKSZ);
+	memcpy(page, fixture_image.data, BLCKSZ);
 	return true;
 }
 #include "../../backend/cluster/cluster_page_cold_redo.c"
@@ -181,8 +181,8 @@ reset(void)
 	locked = false;
 	exists = space_ok = verdict_ok = true;
 	cluster_recmerge_window_active = false;
-	memset(&space, 0, sizeof(space));
-	space.incarnation[0] = 8;
+	memset(&fixture_space, 0, sizeof(fixture_space));
+	fixture_space.incarnation[0] = 8;
 	memset(&verdict, 0, sizeof(verdict));
 	verdict.action = CLUSTER_COLD_REDO_APPLY;
 	verdict.expected_kind = CLUSTER_COLD_DATA_PRESENT;
@@ -194,8 +194,8 @@ reset(void)
 	((PageHeader)data.data)->pd_upper = BLCKSZ;
 	((PageHeader)data.data)->pd_block_scn = 90;
 	PageSetLSN((Page)data.data, 0x9000);
-	image = data;
-	((PageHeader)image.data)->pd_block_scn = 7;
+	fixture_image = data;
+	((PageHeader)fixture_image.data)->pd_block_scn = 7;
 	memset(&reader, 0, sizeof(reader));
 	memset(decoded, 0, offsetof(DecodedXLogRecord, blocks) + sizeof(DecodedBkpBlock));
 	reader.record = decoded;
@@ -206,7 +206,7 @@ reset(void)
 	decoded->header.xl_crc = 9;
 	decoded->max_block_id = 0;
 	decoded->blocks[0].in_use = true;
-	decoded->blocks[0].rlocator = locator;
+	decoded->blocks[0].rlocator = fixture_locator;
 	decoded->blocks[0].blkno = 3;
 	decoded->blocks[0].forknum = MAIN_FORKNUM;
 }
@@ -251,7 +251,7 @@ UT_TEST(expected_token_incarnation_and_completion_must_match)
 {
 	Buffer buffer;
 	reset();
-	space.incarnation[0]++;
+	fixture_space.incarnation[0]++;
 	EXPECT_REFUSED(cluster_page_cold_redo_begin_v1(&reader));
 	UT_ASSERT_EQ(reads, 0);
 	reset();
@@ -276,7 +276,7 @@ UT_TEST(full_image_checks_result_before_restoring_target)
 	cluster_page_cold_redo_end_v1(&reader);
 	reset();
 	decoded->blocks[0].has_image = decoded->blocks[0].apply_image = true;
-	((PageHeader)image.data)->pd_block_scn = 6;
+	((PageHeader)fixture_image.data)->pd_block_scn = 6;
 	cluster_page_cold_redo_begin_v1(&reader);
 	EXPECT_REFUSED(XLogReadBufferForRedoExtended(&reader, 0, RBM_NORMAL, false, &buffer));
 	UT_ASSERT_EQ(reads, 0);

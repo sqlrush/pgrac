@@ -21,8 +21,8 @@ cluster_heap_freeze_cutoff_v1(TransactionId proposed, TransactionId *out)
 		return true;
 	}
 	if (!cluster_enabled || !cluster_xid_striping || !TransactionIdIsNormal(proposed)
-		|| !cluster_xid_stripe_get_activation(&floor, &epoch, &generation)
-		|| floor == 0 || epoch == 0 || generation == 0)
+		|| !cluster_xid_stripe_get_activation(&floor, &epoch, &generation) || floor == 0
+		|| epoch == 0 || generation == 0)
 		return false;
 	next_full = ReadNextFullTransactionId();
 	next = U64FromFullTransactionId(next_full);

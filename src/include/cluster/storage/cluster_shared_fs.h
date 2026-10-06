@@ -366,7 +366,7 @@ extern const ClusterSharedFsOps cluster_shared_fs_sharedfs_ops;
  * Author: SqlRush <sqlrush@gmail.com> */
 struct ClusterSpaceIdentity;
 extern bool cluster_shared_fs_sharedfs_drop_durable(const struct ClusterSpaceIdentity *identity,
-												  uint64 mutation_token);
+													uint64 mutation_token);
 
 /* Retained physical progress is allocated only inside the original KO work.
  * A successful physical attempt keeps MAIN and grants no reuse authority. */

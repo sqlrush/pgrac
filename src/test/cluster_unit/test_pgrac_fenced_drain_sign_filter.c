@@ -99,6 +99,8 @@ run(const uint8 *input, size_t length, char *key, int argc, int expected_rc, uin
 	char *argv[] = { "sign-filter", key, NULL };
 	size_t size;
 	UT_ASSERT(in != NULL && out != NULL);
+	if (in == NULL || out == NULL)
+		abort();
 	UT_ASSERT_EQ(fwrite(input, 1, length, in), length);
 	rewind(in);
 	UT_ASSERT_EQ(pgrac_fenced_drain_sign_filter(argc, argv, in, out), expected_rc);
@@ -221,6 +223,8 @@ UT_TEST(test_stream_errors_never_report_success)
 	size_t length = fixture(input, 4, key, hex, &identity);
 	FILE *in = tmpfile(), *out = fopen("/dev/null", "r"), *bad_input = fopen("/dev/null", "w");
 	UT_ASSERT(in != NULL && out != NULL && bad_input != NULL);
+	if (in == NULL || out == NULL || bad_input == NULL)
+		abort();
 	UT_ASSERT_EQ(fwrite(input, 1, length, in), length);
 	rewind(in);
 	UT_ASSERT_EQ(pgrac_fenced_drain_sign_filter(2, argv, in, out), 77);
@@ -239,6 +243,8 @@ run_descriptor(const uint8 *input, size_t length, char *hex, int fd, int expecte
 	uint8 result[PGRAC_DRAIN_FRAME_MAX_BYTES + 1] = { 0 };
 	size_t size;
 	UT_ASSERT(in != NULL && out != NULL);
+	if (in == NULL || out == NULL)
+		abort();
 	snprintf(descriptor, sizeof(descriptor), "%d", fd);
 	UT_ASSERT_EQ(fwrite(input + 32, 1, length - 32, in), length - 32);
 	rewind(in);

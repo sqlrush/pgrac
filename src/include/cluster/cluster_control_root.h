@@ -63,8 +63,7 @@
 	 | PGRAC_CONTROL_ROOT_FEATURE_CONSERVATIVE_COMMIT_SCN_V1                                       \
 	 | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1                                        \
 	 | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_SERIAL_V1                                               \
-	 | PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1                                               \
-	 | PGRAC_CONTROL_ROOT_FEATURE_SPACE_IDENTITY_V1                                               \
+	 | PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1 | PGRAC_CONTROL_ROOT_FEATURE_SPACE_IDENTITY_V1 \
 	 | PGRAC_CONTROL_ROOT_FEATURE_SPACE_RESERVATION_V1)
 
 typedef enum ClusterControlRootLifecycle {
@@ -295,9 +294,10 @@ typedef struct ClusterControlRootFileToken {
  * Cancel retires only this duty; neither call grants SQL admission by itself.
  * Author: SqlRush <sqlrush@gmail.com> */
 struct ClusterSemanticActivationRecord;
-extern ClusterControlRootResult cluster_control_root_v3_serving_poll(
-	const struct ClusterSemanticActivationRecord *open, const uint8 *root_descriptor,
-	ClusterControlRootFileToken *out);
+extern ClusterControlRootResult
+cluster_control_root_v3_serving_poll(const struct ClusterSemanticActivationRecord *open,
+									 const uint8 *root_descriptor,
+									 ClusterControlRootFileToken *out);
 extern void cluster_control_root_v3_serving_cancel(void);
 
 /* PGRAC: checkpoint-less initialization is a separate recovery subject, not

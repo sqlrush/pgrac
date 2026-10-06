@@ -516,7 +516,7 @@ XLogRegisterData(char *data, uint32 length)
 }
 XLogRedoAction
 XLogReadBufferForRedoExtended(XLogReaderState *record, uint8 block_id, ReadBufferMode mode,
-							 bool cleanup_lock, Buffer *buffer)
+							  bool cleanup_lock, Buffer *buffer)
 {
 	UT_ASSERT(replaying && record == &reader && block_id == 0 && !locked);
 	UT_ASSERT(mode == RBM_ZERO_AND_LOCK && !cleanup_lock);
@@ -1214,14 +1214,14 @@ UT_TEST(test_shared_fresh_sequence_refuses_legacy_xmax_repair)
 
 		reset(false);
 		cluster_shared_config = shared;
-		(void) cluster_seq_version_identity(&relation_data, &captured);
-		header = (HeapTupleHeader) PageGetItem(page_data.data, PageGetItemId(page_data.data, 1));
+		(void)cluster_seq_version_identity(&relation_data, &captured);
+		header = (HeapTupleHeader)PageGetItem(page_data.data, PageGetItemId(page_data.data, 1));
 		HeapTupleHeaderSetXmax(header, 77);
 		before = page_data;
 		hint_calls = 0;
 		error_expected = shared;
 		if (setjmp(error_jump) == 0) {
-			(void) read_seq_tuple(&relation_data, &buffer, &out);
+			(void)read_seq_tuple(&relation_data, &buffer, &out);
 			UT_ASSERT(!shared);
 		}
 		error_expected = false;

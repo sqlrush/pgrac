@@ -477,8 +477,7 @@ UT_TEST(test_full_batch_and_final_partial_batch_preserve_each_page)
 	for (unsigned i = 0; i < 40; i++) {
 		UT_ASSERT_EQ(PageGetLSN(pages[i].data), 101 + i);
 		UT_ASSERT_EQ(((PageHeader)pages[i].data)->pd_block_scn, 201 + i);
-		UT_ASSERT_EQ(((PageHeader)pages[i].data)->pd_checksum,
-					 pg_checksum_page(pages[i].data, i));
+		UT_ASSERT_EQ(((PageHeader)pages[i].data)->pd_checksum, pg_checksum_page(pages[i].data, i));
 	}
 }
 
@@ -520,7 +519,8 @@ UT_TEST(test_bulk_refuses_before_wal_or_data_without_reservation)
 
 		reset(true);
 		fail_reserve = variant == 0;
-		if (variant == 1) reserved = 1;
+		if (variant == 1)
+			reserved = 1;
 		saved = source;
 		expecting_error = true;
 		if (setjmp(error_jump) == 0) {

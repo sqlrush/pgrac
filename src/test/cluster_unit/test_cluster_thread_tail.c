@@ -357,8 +357,7 @@ fd_count(void)
 static WalTestRecord
 base_record(void)
 {
-	WalTestRecord p
-		= record_write(generation, wal_segment_size + SizeOfXLogLongPHD, 0, 24);
+	WalTestRecord p = record_write(generation, wal_segment_size + SizeOfXLogLongPHD, 0, 24);
 	prefix_write(p);
 	return p;
 }
@@ -459,7 +458,7 @@ UT_TEST(full_size_segment_partial_last_record_is_native_eof)
 		ClusterWalStartupObservation startup;
 		char path[MAXPGPATH];
 		struct stat st;
-		char zeros[256] = {0};
+		char zeros[256] = { 0 };
 		size_t prefix = copied == 0 ? 0 : copied == 1 ? 5 : 103;
 		XLogRecPtr incomplete;
 		fixture();
@@ -474,8 +473,9 @@ UT_TEST(full_size_segment_partial_last_record_is_native_eof)
 		UT_ASSERT_EQ(out.complete_end, p.exclusive_end);
 		UT_ASSERT_EQ(out.records, 1);
 		UT_ASSERT_EQ(cluster_wal_tail_observe_checkpoint(scratch, &ref, wal_segment_size,
-			p.record_start, p.exclusive_end, p.record_start, p.record_crc, &out),
-			CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+														 p.record_start, p.exclusive_end,
+														 p.record_start, p.record_crc, &out),
+					 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 		UT_ASSERT_EQ(startup_observe(&startup), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 		UT_ASSERT_EQ(startup.tail.complete_end, p.exclusive_end);
 		UT_ASSERT_EQ(startup.tail.records, 1);
@@ -483,7 +483,7 @@ UT_TEST(full_size_segment_partial_last_record_is_native_eof)
 		 * even though native end-of-log heuristics alone cannot tell. */
 		UT_ASSERT_EQ(observe(partial.exclusive_end, &out), CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
 		(void)record_write(generation, wal_segment_size + XLOG_BLCKSZ + SizeOfXLogShortPHD,
-						 partial.record_start, 40);
+						   partial.record_start, 40);
 		UT_ASSERT_EQ(observe(p.exclusive_end, &out), CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
 		UT_ASSERT_EQ(startup_observe(&startup), CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
 	}
@@ -592,11 +592,13 @@ UT_TEST(selected_record_crc_and_start_must_match)
 	fixture();
 	p = base_record();
 	UT_ASSERT_EQ(cluster_wal_tail_observe_checkpoint(scratch, &ref, wal_segment_size,
-		p.record_start, p.exclusive_end, p.record_start, p.record_crc ^ 1, &out),
-		CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
+													 p.record_start, p.exclusive_end,
+													 p.record_start, p.record_crc ^ 1, &out),
+				 CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
 	UT_ASSERT_EQ(cluster_wal_tail_observe_checkpoint(scratch, &ref, wal_segment_size,
-		p.record_start, p.exclusive_end, p.record_start + 8, p.record_crc, &out),
-		CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
+													 p.record_start, p.exclusive_end,
+													 p.record_start + 8, p.record_crc, &out),
+				 CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
 }
 
 UT_TEST(previous_record_link_is_verified)
@@ -1296,15 +1298,14 @@ UT_TEST(startup_preserves_physical_failure_and_cancellation_boundaries)
 			segment_path(first.record_start, path);
 			UT_ASSERT_EQ(unlink(path), 0);
 			(void)record_write(generation, 3 * wal_segment_size + SizeOfXLogLongPHD,
-				first.record_start, 24);
+							   first.record_start, 24);
 		} else if (fault == 1) {
 			uint8 damaged = 0x73;
 			overwrite(first.record_start + SizeOfXLogRecord + 2, &damaged, 1);
 			/* Without a known successor this can be the first torn insert. */
 			(void)record_write(generation, wal_segment_size + XLOG_BLCKSZ + SizeOfXLogShortPHD,
-							 first.record_start, 24);
-		}
-		else if (fault == 2) {
+							   first.record_start, 24);
+		} else if (fault == 2) {
 			changed_prefix = record_write(generation, first.exclusive_end, first.record_start, 40);
 			changed_prefix.sequence = first.sequence + 1;
 			read_action = 2;
@@ -1705,9 +1706,10 @@ UT_TEST(prefix_identity_recheck_preserves_cancel_and_close_cleanup)
 		int before = fd_count();
 
 		UT_ASSERT_EQ(cluster_wal_checkpoint_prefix_observe_identity(
-			scratch, &ref, wal_segment_size, root.checkpoint_lower_lsn,
-			root.validated_tail_lsn_exclusive, root.tail_last_record_lsn,
-			root.tail_last_record_crc32c, &tail, &identity), 0);
+						 scratch, &ref, wal_segment_size, root.checkpoint_lower_lsn,
+						 root.validated_tail_lsn_exclusive, root.tail_last_record_lsn,
+						 root.tail_last_record_crc32c, &tail, &identity),
+					 0);
 		UT_ASSERT(identity != NULL);
 		UT_ASSERT_EQ(fd_count(), before);
 		InterruptPending = fault == 1;
@@ -1718,7 +1720,7 @@ UT_TEST(prefix_identity_recheck_preserves_cancel_and_close_cleanup)
 				= cluster_wal_prefix_identity_recheck(scratch, &ref, identity);
 			UT_ASSERT(fault != 1);
 			UT_ASSERT_EQ(result, fault == 2 ? CLUSTER_CONTROL_ROOT_IO_ERROR
-										 : CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+											: CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 		}
 		PG_CATCH();
 		{

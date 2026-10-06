@@ -464,6 +464,9 @@ static ClusterInjectPoint cluster_injection_registry[] = {
 	 *	  counter delta (L408), never a native CLOG answer.
 	 */
 	{ .name = "cluster-undo-authority-block0-prove" },
+	/* Refuse a live owner's first publication after its authority recheck,
+	 * before INIT WAL or the final pathname. Existing segments never hit it. */
+	{ .name = "cluster-undo-first-publication-deny" },
 	/*
 	 * spec-5.22d Hardening — dead-owner authority durable-segment ENUMERATION
 	 * fault injection.
@@ -1539,7 +1542,8 @@ cluster_injection_assign_hook(const char *newval, void *extra)
 	for (int i = 0; i < CLUSTER_INJECTION_COUNT; i++) {
 		if (seen[i])
 			continue;
-		if (pg_atomic_read_u32(&cluster_injection_registry[i].armed_type) == CLUSTER_FAULT_WARNING) {
+		if (pg_atomic_read_u32(&cluster_injection_registry[i].armed_type)
+			== CLUSTER_FAULT_WARNING) {
 			cluster_injection_arm_internal(&cluster_injection_registry[i], CLUSTER_FAULT_NONE, 0);
 		}
 	}

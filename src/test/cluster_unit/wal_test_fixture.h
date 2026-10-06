@@ -12,8 +12,8 @@ typedef struct WalTestRecord {
 } WalTestRecord;
 #define WAL_TEST_OBSOLETE_BYTES 256
 static inline void
-wal_test_obsolete_bytes(const ClusterWalSourceRef *source,
-						const WalTestRecord *record, uint8 bytes[WAL_TEST_OBSOLETE_BYTES])
+wal_test_obsolete_bytes(const ClusterWalSourceRef *source, const WalTestRecord *record,
+						uint8 bytes[WAL_TEST_OBSOLETE_BYTES])
 {
 	memset(bytes, 0x6d, WAL_TEST_OBSOLETE_BYTES);
 	memcpy(bytes, "PGWP", 4);

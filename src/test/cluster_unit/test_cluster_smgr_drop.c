@@ -78,78 +78,133 @@ raise_error(void)
 	siglongjmp(*PG_exception_stack, 1);
 }
 
-bool errstart(int level, const char *domain pg_attribute_unused())
+bool
+errstart(int level, const char *domain pg_attribute_unused())
 {
 	error_level = level;
 	return true;
 }
-bool errstart_cold(int level, const char *domain)
+bool
+errstart_cold(int level, const char *domain)
 {
 	return errstart(level, domain);
 }
-void errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
-	const char *function pg_attribute_unused())
+void
+errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
+		  const char *function pg_attribute_unused())
 {
 	if (error_level >= ERROR)
 		raise_error();
 	if (error_level == WARNING)
 		warnings++;
 }
-int errcode(int value pg_attribute_unused()) { return 0; }
-int errcode_for_file_access(void) { return 0; }
-int errmsg(const char *format pg_attribute_unused(), ...) { return 0; }
-int errmsg_internal(const char *format pg_attribute_unused(), ...) { return 0; }
-int errdetail(const char *format pg_attribute_unused(), ...) { return 0; }
-int errhint(const char *format pg_attribute_unused(), ...) { return 0; }
-ErrorData *CopyErrorData(void) { return &copied_error; }
-void FlushErrorState(void) {}
-void ThrowErrorData(ErrorData *error)
+int
+errcode(int value pg_attribute_unused())
+{
+	return 0;
+}
+int
+errcode_for_file_access(void)
+{
+	return 0;
+}
+int
+errmsg(const char *format pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errmsg_internal(const char *format pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errdetail(const char *format pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errhint(const char *format pg_attribute_unused(), ...)
+{
+	return 0;
+}
+ErrorData *
+CopyErrorData(void)
+{
+	return &copied_error;
+}
+void
+FlushErrorState(void)
+{}
+void
+ThrowErrorData(ErrorData *error)
 {
 	if (error->elevel != WARNING)
 		abort();
 	warnings++;
 }
-void FreeErrorData(ErrorData *error pg_attribute_unused()) {}
-void pg_re_throw(void)
+void
+FreeErrorData(ErrorData *error pg_attribute_unused())
+{}
+void
+pg_re_throw(void)
 {
 	rethrows++;
 	raise_error();
 	abort();
 }
-void ExceptionalCondition(const char *condition pg_attribute_unused(),
-	const char *file pg_attribute_unused(), int line pg_attribute_unused())
+void
+ExceptionalCondition(const char *condition pg_attribute_unused(),
+					 const char *file pg_attribute_unused(), int line pg_attribute_unused())
 {
 	abort();
 }
 
-void cluster_write_fence_reject_if_fenced(const char *op pg_attribute_unused()) {}
-void cluster_mrp_standby_shared_write_gate(const char *op pg_attribute_unused()) {}
+void
+cluster_write_fence_reject_if_fenced(const char *op pg_attribute_unused())
+{}
+void
+cluster_mrp_standby_shared_write_gate(const char *op pg_attribute_unused())
+{}
 
-const ClusterSharedFsOps *cluster_shared_fs_get_active_ops(void) { return &active_ops; }
-bool cluster_shared_fs_exists(RelFileLocator locator pg_attribute_unused(),
-	ForkNumber forknum pg_attribute_unused()) { return true; }
-void cluster_shared_fs_open_existing(RelFileLocator locator pg_attribute_unused(),
-	ForkNumber forknum pg_attribute_unused(), ClusterSharedFsHandle **out)
+const ClusterSharedFsOps *
+cluster_shared_fs_get_active_ops(void)
+{
+	return &active_ops;
+}
+bool
+cluster_shared_fs_exists(RelFileLocator locator pg_attribute_unused(),
+						 ForkNumber forknum pg_attribute_unused())
+{
+	return true;
+}
+void
+cluster_shared_fs_open_existing(RelFileLocator locator pg_attribute_unused(),
+								ForkNumber forknum pg_attribute_unused(),
+								ClusterSharedFsHandle **out)
 {
 	*out = (ClusterSharedFsHandle *)&owner_storage;
 }
-void cluster_shared_fs_close(ClusterSharedFsHandle *handle pg_attribute_unused())
+void
+cluster_shared_fs_close(ClusterSharedFsHandle *handle pg_attribute_unused())
 {
 	closed_handles++;
 	event('C');
 }
-void cluster_shared_fs_truncate(ClusterSharedFsHandle *handle pg_attribute_unused(),
-	BlockNumber blocks)
+void
+cluster_shared_fs_truncate(ClusterSharedFsHandle *handle pg_attribute_unused(), BlockNumber blocks)
 {
 	UT_ASSERT_EQ(blocks, 0);
 	legacy_truncates++;
 }
-void cluster_shared_fs_unlink(RelFileLocator locator pg_attribute_unused(),
-	ForkNumber forknum pg_attribute_unused())
+void
+cluster_shared_fs_unlink(RelFileLocator locator pg_attribute_unused(),
+						 ForkNumber forknum pg_attribute_unused())
 {
 	legacy_unlinks++;
 }
-bool RegisterSyncRequest(const FileTag *tag, SyncRequestType type, bool retry)
+bool
+RegisterSyncRequest(const FileTag *tag, SyncRequestType type, bool retry)
 {
 	UT_ASSERT(retry);
 	UT_ASSERT_EQ(tag->handler, SYNC_HANDLER_CLUSTER_SHARED);
@@ -167,7 +222,8 @@ bool RegisterSyncRequest(const FileTag *tag, SyncRequestType type, bool retry)
 	return true;
 }
 
-bool cluster_ko_shared_pending_drop_v2(RelFileLocator locator, ClusterKoCompletionV2 **out)
+bool
+cluster_ko_shared_pending_drop_v2(RelFileLocator locator, ClusterKoCompletionV2 **out)
 {
 	owner_reads++;
 	UT_ASSERT(*out == NULL);
@@ -185,8 +241,10 @@ cluster_ko_shared_native_drop_deferred_v2(RelFileLocator locator pg_attribute_un
 {
 	return false;
 }
-bool cluster_ko_shared_space_observation_v2(const ClusterKoCompletionV2 *completion,
-	struct ClusterPageWalBindingV1 *terminal, void *bytes, Size length)
+bool
+cluster_ko_shared_space_observation_v2(const ClusterKoCompletionV2 *completion,
+									   struct ClusterPageWalBindingV1 *terminal, void *bytes,
+									   Size length)
 {
 	UT_ASSERT(completion == (ClusterKoCompletionV2 *)&owner_storage);
 	UT_ASSERT_EQ(length, sizeof(wal));
@@ -199,7 +257,8 @@ bool cluster_ko_shared_space_observation_v2(const ClusterKoCompletionV2 *complet
 	memcpy(bytes, wal, sizeof(wal));
 	return true;
 }
-bool cluster_shared_fs_sharedfs_drop_durable(const ClusterSpaceIdentity *identity, uint64 token)
+bool
+cluster_shared_fs_sharedfs_drop_durable(const ClusterSpaceIdentity *identity, uint64 token)
 {
 	physical_calls++;
 	UT_ASSERT(memcmp(identity, &change.identity.result, sizeof(*identity)) == 0);
@@ -213,7 +272,8 @@ bool cluster_shared_fs_sharedfs_drop_durable(const ClusterSpaceIdentity *identit
 	primitive_finished = physical_ok;
 	return physical_ok;
 }
-bool cluster_ko_shared_observe_drop_v2(ClusterKoCompletionV2 *completion)
+bool
+cluster_ko_shared_observe_drop_v2(ClusterKoCompletionV2 *completion)
 {
 	setter_calls++;
 	UT_ASSERT(completion == (ClusterKoCompletionV2 *)&owner_storage);
@@ -228,8 +288,9 @@ bool cluster_ko_shared_observe_drop_v2(ClusterKoCompletionV2 *completion)
 #include "../../backend/cluster/storage/cluster_smgr.c"
 
 static ClusterSmgrRelationState open_state;
-void *hash_search(HTAB *table pg_attribute_unused(), const void *key pg_attribute_unused(),
-	HASHACTION action, bool *found)
+void *
+hash_search(HTAB *table pg_attribute_unused(), const void *key pg_attribute_unused(),
+			HASHACTION action, bool *found)
 {
 	if (found != NULL)
 		*found = true;
@@ -248,7 +309,7 @@ reset_drop(bool tombstone)
 	change.identity.expected.key.system_identifier = 7;
 	change.identity.expected.key.database_incarnation = 9;
 	memset(change.identity.expected.key.storage_uuid, 0xa7, 16);
-	change.identity.expected.key.locator = (RelFileLocator){DEFAULTTABLESPACE_OID, 5, 16384};
+	change.identity.expected.key.locator = (RelFileLocator){ DEFAULTTABLESPACE_OID, 5, 16384 };
 	memset(change.identity.expected.incarnation, 0x31, 16);
 	change.identity.expected.sequence = 1;
 	change.identity.expected.operation = 10;
@@ -263,7 +324,8 @@ reset_drop(bool tombstone)
 		change.identity.result.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
 	else
 		change.identity.result.incarnation[0]++;
-	change.reservation.action = tombstone ? CLUSTER_SPACE_RESERVATION_TOMBSTONE : CLUSTER_SPACE_RESERVATION_RESET;
+	change.reservation.action
+		= tombstone ? CLUSTER_SPACE_RESERVATION_TOMBSTONE : CLUSTER_SPACE_RESERVATION_RESET;
 	change.reservation.before.identity = change.identity.expected;
 	change.reservation.before.next_block = 8;
 	change.reservation.before_token = 10;
@@ -305,7 +367,7 @@ reset_drop(bool tombstone)
 static RelFileLocatorBackend
 locator(void)
 {
-	return (RelFileLocatorBackend){change.identity.expected.key.locator, InvalidBackendId};
+	return (RelFileLocatorBackend){ change.identity.expected.key.locator, InvalidBackendId };
 }
 
 static void
@@ -341,7 +403,7 @@ UT_TEST(test_committed_drop_reports_only_after_exact_physical_result)
 	UT_ASSERT_EQ(legacy_unlinks + legacy_truncates, 0);
 	UT_ASSERT_EQ(warnings, 0);
 	UT_ASSERT(strstr(trace, "B") != NULL && strrchr(trace, 'C') != NULL
-		&& strstr(trace, "B") > strrchr(trace, 'C'));
+			  && strstr(trace, "B") > strrchr(trace, 'C'));
 	UT_ASSERT(strstr(trace, "PS") != NULL);
 	UT_ASSERT(strchr(trace, 'U') == NULL);
 	UT_ASSERT(cluster_smgr_relations == NULL);
@@ -376,16 +438,35 @@ UT_TEST(test_unproven_drop_input_never_starts_physical_removal)
 	for (unsigned fault = 0; fault < 10; fault++) {
 		reset_drop(fault != 2);
 		switch (fault) {
-		case 0: observation_ok = false; break;
-		case 1: wal[0] ^= 1; break;
-		case 2: break; /* A valid TRUNCATE is not a DROP. */
-		case 3: binding.identity.locator.relNumber++; break;
-		case 4: binding.identity.system_identifier++; break;
-		case 5: binding.identity.storage_uuid[0]++; break;
-		case 6: binding.source.claim.database_incarnation++; break;
-		case 7: binding.version.segment_incarnation[0]++; break;
-		case 8: binding.version.mutation_token++; break;
-		case 9: active_ops.id = CLUSTER_SHARED_FS_BACKEND_LOCAL; break;
+		case 0:
+			observation_ok = false;
+			break;
+		case 1:
+			wal[0] ^= 1;
+			break;
+		case 2:
+			break; /* A valid TRUNCATE is not a DROP. */
+		case 3:
+			binding.identity.locator.relNumber++;
+			break;
+		case 4:
+			binding.identity.system_identifier++;
+			break;
+		case 5:
+			binding.identity.storage_uuid[0]++;
+			break;
+		case 6:
+			binding.source.claim.database_incarnation++;
+			break;
+		case 7:
+			binding.version.segment_incarnation[0]++;
+			break;
+		case 8:
+			binding.version.mutation_token++;
+			break;
+		case 9:
+			active_ops.id = CLUSTER_SHARED_FS_BACKEND_LOCAL;
+			break;
 		}
 		run_unlink(locator(), InvalidForkNumber, false);
 		UT_ASSERT_EQ(physical_calls + setter_calls + unlink_requests, 0);
@@ -437,8 +518,7 @@ UT_TEST(test_redo_temp_nonshared_and_partial_remain_original_paths)
 			target.backend = 7;
 		if (mode == 4)
 			IsBinaryUpgrade = true;
-		run_unlink(target, mode == 3 ? VISIBILITYMAP_FORKNUM : InvalidForkNumber,
-			mode == 1);
+		run_unlink(target, mode == 3 ? VISIBILITYMAP_FORKNUM : InvalidForkNumber, mode == 1);
 		UT_ASSERT_EQ(owner_reads + physical_calls + setter_calls, 0);
 		UT_ASSERT_EQ(legacy_truncates, mode <= 1 ? 1 : 0);
 		UT_ASSERT_EQ(legacy_unlinks, mode == 3 ? 1 : MAX_FORKNUM + (mode >= 2 ? 1 : 0));

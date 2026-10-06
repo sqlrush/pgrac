@@ -21,13 +21,17 @@ test_pwrite(int fd, const void *data, size_t size, off_t off)
 {
 	++writes;
 	written_fd = fd;
-	if (fault == WRITE_FAIL) { errno = ENOSPC; return -1; }
+	if (fault == WRITE_FAIL) {
+		errno = ENOSPC;
+		return -1;
+	}
 	return pwrite(fd, data, size, off);
 }
 static ssize_t
 test_pread(int fd, void *data, size_t size, off_t off)
 {
-	if (fault == SHORT_READ && fd == written_fd) return 0;
+	if (fault == SHORT_READ && fd == written_fd)
+		return 0;
 	return pread(fd, data, size, off);
 }
 static int
@@ -35,12 +39,13 @@ test_fsync(int fd)
 {
 	struct stat st;
 	UT_ASSERT(fstat(fd, &st) == 0);
-	if (S_ISREG(st.st_mode))
-	{
+	if (S_ISREG(st.st_mode)) {
 		++file_syncs;
-		if (fault == SYNC_FAIL) { errno = EIO; return -1; }
-		if (fault == CORRUPT)
-		{
+		if (fault == SYNC_FAIL) {
+			errno = EIO;
+			return -1;
+		}
+		if (fault == CORRUPT) {
 			char byte = 'X';
 			UT_ASSERT(pwrite(fd, &byte, 1, 77) == 1);
 		}
@@ -61,7 +66,9 @@ prepare(void)
 {
 	int dirs[7];
 	PGAlignedBlock page;
-	fault = NONE; writes = file_syncs = 0; written_fd = -1;
+	fault = NONE;
+	writes = file_syncs = 0;
+	written_fd = -1;
 	memset(page.data, 'a', BLCKSZ);
 	strlcpy(root, "/tmp/pgrac-initdb-side-XXXXXX", sizeof(root));
 	UT_ASSERT(mkdtemp(root) != NULL);
@@ -71,18 +78,17 @@ prepare(void)
 	dirs[0] = source_fd = open_directory(root_fd, "source");
 	shared_fd = open_directory(root_fd, "shared");
 	UT_ASSERT(source_fd >= 0 && shared_fd >= 0);
-	for (unsigned i = 0; i < lengthof(directories); ++i)
-	{
+	for (unsigned i = 0; i < lengthof(directories); ++i) {
 		UT_ASSERT(mkdirat(dirs[parents[i]], directories[i], 0700) == 0);
 		dirs[i + 1] = open_directory(dirs[parents[i]], directories[i]);
 		UT_ASSERT(dirs[i + 1] >= 0);
-		if (i != 2 && i != 3)
-		{
+		if (i != 2 && i != 3) {
 			int fd = openat(dirs[i + 1], "0000", O_CREAT | O_EXCL | O_WRONLY, 0600);
 			UT_ASSERT(fd >= 0 && write(fd, page.data, BLCKSZ) == BLCKSZ && close(fd) == 0);
 		}
 	}
-	for (unsigned i = 1; i < lengthof(dirs); ++i) close(dirs[i]);
+	for (unsigned i = 1; i < lengthof(dirs); ++i)
+		close(dirs[i]);
 }
 
 /* Only the tree made by this fixture; lstat never follows a test alias. */
@@ -92,30 +98,33 @@ remove_contents(int fd)
 	DIR *dir = fdopendir(openat(fd, ".", O_RDONLY | O_DIRECTORY));
 	struct dirent *entry;
 	UT_ASSERT(dir != NULL);
-	while ((entry = readdir(dir)) != NULL)
-	{
+	while ((entry = readdir(dir)) != NULL) {
 		struct stat st;
-		if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+		if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
+			continue;
 		UT_ASSERT(fstatat(fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) == 0);
-		if (S_ISDIR(st.st_mode))
-		{
+		if (S_ISDIR(st.st_mode)) {
 			int child = openat(fd, entry->d_name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
 			UT_ASSERT(child >= 0);
 			remove_contents(child);
 			UT_ASSERT(close(child) == 0 && unlinkat(fd, entry->d_name, AT_REMOVEDIR) == 0);
-		}
-		else UT_ASSERT(unlinkat(fd, entry->d_name, 0) == 0);
+		} else
+			UT_ASSERT(unlinkat(fd, entry->d_name, 0) == 0);
 	}
 	UT_ASSERT(closedir(dir) == 0);
 }
-static void cleanup(void)
+static void
+cleanup(void)
 {
 	UT_ASSERT(fcntl(source_fd, F_GETFD) >= 0 && fcntl(shared_fd, F_GETFD) >= 0);
-	close(source_fd); close(shared_fd);
-	remove_contents(root_fd); close(root_fd);
+	close(source_fd);
+	close(shared_fd);
+	remove_contents(root_fd);
+	close(root_fd);
 	UT_ASSERT(rmdir(root) == 0);
 }
-static bool target_absent(void)
+static bool
+target_absent(void)
 {
 	struct stat st;
 	return fstatat(shared_fd, "native_side", &st, AT_SYMLINK_NOFOLLOW) != 0 && errno == ENOENT;
@@ -157,7 +166,7 @@ UT_TEST(source_partial_page_refuses_before_mutation)
 }
 UT_TEST(unsupported_commit_ts_input_refuses)
 {
-	PGAlignedBlock page = {0};
+	PGAlignedBlock page = { 0 };
 	int fd;
 	prepare();
 	fd = openat(source_fd, "pg_commit_ts/0000", O_WRONLY | O_CREAT | O_EXCL, 0600);
@@ -165,18 +174,33 @@ UT_TEST(unsupported_commit_ts_input_refuses)
 	UT_ASSERT(!pgrac_initdb_side_create(source_fd, shared_fd) && target_absent() && writes == 0);
 	cleanup();
 }
-static void io_failure(enum Fault value)
+static void
+io_failure(enum Fault value)
 {
-	prepare(); fault = value;
+	prepare();
+	fault = value;
 	UT_ASSERT(!pgrac_initdb_side_create(source_fd, shared_fd));
 	UT_ASSERT(writes > 0);
-	if (value != WRITE_FAIL) UT_ASSERT(file_syncs > 0);
+	if (value != WRITE_FAIL)
+		UT_ASSERT(file_syncs > 0);
 	cleanup();
 }
-UT_TEST(write_failure_refuses) { io_failure(WRITE_FAIL); }
-UT_TEST(fsync_failure_refuses) { io_failure(SYNC_FAIL); }
-UT_TEST(changed_readback_refuses) { io_failure(CORRUPT); }
-UT_TEST(short_readback_refuses) { io_failure(SHORT_READ); }
+UT_TEST(write_failure_refuses)
+{
+	io_failure(WRITE_FAIL);
+}
+UT_TEST(fsync_failure_refuses)
+{
+	io_failure(SYNC_FAIL);
+}
+UT_TEST(changed_readback_refuses)
+{
+	io_failure(CORRUPT);
+}
+UT_TEST(short_readback_refuses)
+{
+	io_failure(SHORT_READ);
+}
 
 UT_TEST(peer_copies_its_own_original_source)
 {
@@ -221,15 +245,18 @@ UT_TEST(peer_failed_write_cannot_be_adopted)
 	UT_ASSERT(pgrac_initdb_side_create(source_fd, shared_fd));
 	native = open_directory(shared_fd, "native_side");
 	UT_ASSERT(native >= 0);
-	writes = 0; fault = SYNC_FAIL;
+	writes = 0;
+	fault = SYNC_FAIL;
 	UT_ASSERT(!pgrac_initdb_side_origin_create(source_fd, native, 1) && writes > 0);
-	writes = 0; fault = NONE;
+	writes = 0;
+	fault = NONE;
 	UT_ASSERT(!pgrac_initdb_side_origin_create(source_fd, native, 1) && writes == 0);
 	UT_ASSERT(close(native) == 0);
 	cleanup();
 }
 
-int main(int argc, char **argv)
+int
+main(int argc, char **argv)
 {
 	pg_logging_init(argv[0]);
 	UT_PLAN(12);

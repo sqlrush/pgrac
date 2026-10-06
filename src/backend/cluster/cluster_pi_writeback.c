@@ -172,14 +172,14 @@ cluster_pi_writeback_rejections_v1(ClusterPiWritebackRejectionsV1 *out)
  * observation authorizes retirement or removes the page from later scans. */
 static void
 wb_rejected_detail(ClusterPiWritebackRejectionV1 reason, const BufferTag *tag, int32 peer,
-	uint64 epoch, uint64 boot, uint32 result, uint32 detail)
+				   uint64 epoch, uint64 boot, uint32 result, uint32 detail)
 {
 	static const char *const names[]
-		= { "DATA_PROOF",	 "LOCAL_ACK",	   "REMOTE_ACK",	 "MASTER_CUT",
+		= { "DATA_PROOF",	 "LOCAL_ACK",	   "REMOTE_ACK",	  "MASTER_CUT",
 			"PEER_PHYSICAL", "RECOVERY_PROOF", "STRUCTURE_OWNER", "CONTRIBUTION_PLAN" };
 	bool log;
 	StaticAssertDecl(lengthof(names) == CLUSTER_PI_WRITEBACK_REJECTION_COUNT,
-					"every PI rejection requires a diagnostic name");
+					 "every PI rejection requires a diagnostic name");
 	if (wb_shared == NULL || tag == NULL || (uint32)reason >= CLUSTER_PI_WRITEBACK_REJECTION_COUNT)
 		return;
 	SpinLockAcquire(&wb_shared->lock);
@@ -220,12 +220,12 @@ wb_rejected(ClusterPiWritebackRejectionV1 reason, const BufferTag *tag, int32 pe
  * its typed detail rather than confusing it with an unready flush cut.
  * This observation neither retries nor retires any responsibility. */
 static void
-wb_plan_rejected(ClusterControlRootResult result, RfPageProofDetailV1 detail,
-	const BufferTag *tag, int32 peer, uint64 epoch, uint64 boot)
+wb_plan_rejected(ClusterControlRootResult result, RfPageProofDetailV1 detail, const BufferTag *tag,
+				 int32 peer, uint64 epoch, uint64 boot)
 {
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY && detail != RF_PAGE_PROOF_DETAIL_OK)
-		wb_rejected_detail(CLUSTER_PI_WRITEBACK_CONTRIBUTION_PLAN, tag, peer, epoch, boot,
-						   result, detail);
+		wb_rejected_detail(CLUSTER_PI_WRITEBACK_CONTRIBUTION_PLAN, tag, peer, epoch, boot, result,
+						   detail);
 }
 
 static void
@@ -508,7 +508,7 @@ wb_v2_fact_bytes(const ClusterPiWritebackFactV2 *fact)
 	if (fact->kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2)
 		return CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_BYTES_V2;
 	return fact->kind == CLUSTER_PI_WRITEBACK_DATA_V2 ? CLUSTER_PI_WRITEBACK_DATA_BYTES_V2
-		: CLUSTER_PI_WRITEBACK_STRUCTURAL_BYTES_V2;
+													  : CLUSTER_PI_WRITEBACK_STRUCTURAL_BYTES_V2;
 }
 
 static bool
@@ -524,11 +524,11 @@ wb_v2_structural_valid(const ClusterPiStructuralFactV2 *s, bool offer)
 	const BufferTag *tag = wb_tag(f);
 	uint8 structure[CLUSTER_SPACE_STRUCTURE_WAL_BYTES], ko_bytes[CLUSTER_KO_SHARED_V2_BYTES];
 	uint32 flags = CLUSTER_PI_STRUCTURAL_WAL_FLUSHED | CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK
-		| CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED | CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE;
+				   | CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED | CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE;
 
 	if (!cluster_page_wal_binding_shape_v1(b) || !cluster_wal_claim_v2_ref_valid(&b->source.claim)
-		|| b->flags != CLUSTER_PAGE_WAL_NATIVE_FLUSHED
-		|| b->identity.forknum != SPACE_FORKNUM || b->identity.blockno != 0
+		|| b->flags != CLUSTER_PAGE_WAL_NATIVE_FLUSHED || b->identity.forknum != SPACE_FORKNUM
+		|| b->identity.blockno != 0
 		|| !cluster_space_structure_wal_encode(&s->change, structure, sizeof(structure))
 		|| !cluster_ko_shared_encode_v2(ko, ko_bytes, sizeof(ko_bytes))
 		|| ko->verb != CLUSTER_KO_SHARED_REQUEST)
@@ -551,48 +551,56 @@ wb_v2_structural_valid(const ClusterPiStructuralFactV2 *s, bool offer)
 		if (memcmp(&f->write_cut, &no_x, sizeof(no_x)) != 0
 			|| memcmp(&f->storage_cut, &no_storage, sizeof(no_storage)) != 0)
 			return false;
-	} else if (!((cluster_pcm_pi_write_cut_valid_v1(&f->write_cut) && f->write_cut.pi_holders_bitmap != 0
-			  && memcmp(&f->storage_cut, &no_storage, sizeof(no_storage)) == 0)
-			 || (cluster_pcm_pi_storage_cut_valid_v1(&f->storage_cut) && f->storage_cut.pi_holders_bitmap != 0
-				 && memcmp(&f->write_cut, &no_x, sizeof(no_x)) == 0)))
+	} else if (!((cluster_pcm_pi_write_cut_valid_v1(&f->write_cut)
+				  && f->write_cut.pi_holders_bitmap != 0
+				  && memcmp(&f->storage_cut, &no_storage, sizeof(no_storage)) == 0)
+				 || (cluster_pcm_pi_storage_cut_valid_v1(&f->storage_cut)
+					 && f->storage_cut.pi_holders_bitmap != 0
+					 && memcmp(&f->write_cut, &no_x, sizeof(no_x)) == 0)))
 		return false;
 	return key->system_identifier == b->identity.system_identifier
-		&& key->database_incarnation == b->source.claim.database_incarnation
-		&& memcmp(key->storage_uuid, b->identity.storage_uuid, 16) == 0
-		&& RelFileLocatorEquals(key->locator, b->identity.locator)
-		&& b->version.mutation_token == change->result_token
-		&& memcmp(b->version.segment_incarnation, change->result.incarnation, 16) == 0
-		&& ko->key.system_identifier == key->system_identifier
-		&& ko->key.database_incarnation == key->database_incarnation
-		&& memcmp(ko->key.storage_uuid, key->storage_uuid, 16) == 0
-		&& RelFileLocatorEquals(ko->key.locator, key->locator)
-		&& memcmp(ko->incarnation, change->expected.incarnation, 16) == 0
-		&& ko->origin_node == b->source.claim.identity.origin_node_id
-		&& ko->origin_boot == b->source.claim.identity.origin_owner_incarnation
-		&& (offer || (tag->spcOid == key->locator.spcOid && tag->dbOid == key->locator.dbOid
-		&& tag->relNumber == key->locator.relNumber
-		&& (tag->forkNum == MAIN_FORKNUM || tag->forkNum == VISIBILITYMAP_FORKNUM
-			|| (tag->forkNum == SPACE_FORKNUM && tag->blockNum < 2))));
+		   && key->database_incarnation == b->source.claim.database_incarnation
+		   && memcmp(key->storage_uuid, b->identity.storage_uuid, 16) == 0
+		   && RelFileLocatorEquals(key->locator, b->identity.locator)
+		   && b->version.mutation_token == change->result_token
+		   && memcmp(b->version.segment_incarnation, change->result.incarnation, 16) == 0
+		   && ko->key.system_identifier == key->system_identifier
+		   && ko->key.database_incarnation == key->database_incarnation
+		   && memcmp(ko->key.storage_uuid, key->storage_uuid, 16) == 0
+		   && RelFileLocatorEquals(ko->key.locator, key->locator)
+		   && memcmp(ko->incarnation, change->expected.incarnation, 16) == 0
+		   && ko->origin_node == b->source.claim.identity.origin_node_id
+		   && ko->origin_boot == b->source.claim.identity.origin_owner_incarnation
+		   && (offer
+			   || (tag->spcOid == key->locator.spcOid && tag->dbOid == key->locator.dbOid
+				   && tag->relNumber == key->locator.relNumber
+				   && (tag->forkNum == MAIN_FORKNUM || tag->forkNum == VISIBILITYMAP_FORKNUM
+					   || (tag->forkNum == SPACE_FORKNUM && tag->blockNum < 2))));
 }
 
 static bool
 wb_v2_message_valid(const ClusterPiWritebackMessageV2 *m)
 {
-	ClusterPiWritebackMessageV1 header = {0};
+	ClusterPiWritebackMessageV1 header = { 0 };
 	int32 peer;
 	if (m == NULL || (m->verb != CLUSTER_PI_WRITEBACK_NOTIFY && m->verb != CLUSTER_PI_WRITEBACK_ACK)
-		|| m->count > CLUSTER_PI_WRITEBACK_MAX || (m->count == 0 && m->verb != CLUSTER_PI_WRITEBACK_ACK))
+		|| m->count > CLUSTER_PI_WRITEBACK_MAX
+		|| (m->count == 0 && m->verb != CLUSTER_PI_WRITEBACK_ACK))
 		return false;
 	/* Reuse the unchanged header/claim rules, without constructing a DATA fact. */
 	header.verb = CLUSTER_PI_WRITEBACK_ACK;
-	header.nonce = m->nonce; header.epoch = m->epoch; header.peer = m->peer;
-	if (!wb_message_valid(&header)) return false;
+	header.nonce = m->nonce;
+	header.epoch = m->epoch;
+	header.peer = m->peer;
+	if (!wb_message_valid(&header))
+		return false;
 	peer = m->peer.claim.identity.origin_node_id;
 	for (uint32 i = 0; i < m->count; i++) {
 		const ClusterPiWritebackFactV2 *fact = &m->facts[i];
 		const ClusterPiDataFactV1 *f = wb_v2_page(fact);
 		bool offer = fact->kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2;
-		if (f == NULL) return false;
+		if (f == NULL)
+			return false;
 		if (offer != (m->facts[0].kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2))
 			return false;
 		if (offer) {
@@ -609,13 +617,15 @@ wb_v2_message_valid(const ClusterPiWritebackMessageV2 *m)
 			 * through the page-holder tests or accept duplicate relations as
 			 * separate acknowledgements of the same source obligation. */
 			for (uint32 j = 0; j < i; j++)
-				if (RelFileLocatorEquals(f->binding.identity.locator,
+				if (RelFileLocatorEquals(
+						f->binding.identity.locator,
 						m->facts[j].proof.structural.terminal.binding.identity.locator))
 					return false;
 			continue;
 		}
 		if (fact->kind == CLUSTER_PI_WRITEBACK_DATA_V2) {
-			if (!wb_fact_valid(f)) return false;
+			if (!wb_fact_valid(f))
+				return false;
 		} else {
 			const ClusterKoSharedMessageV2 *ko = &fact->proof.structural.ko;
 			int32 master = wb_master(f);
@@ -639,7 +649,8 @@ wb_v2_message_valid(const ClusterPiWritebackMessageV2 *m)
 			|| !wb_namespace(&f->binding.source, &m->peer))
 			return false;
 		for (uint32 j = 0; j < i; j++)
-			if (BufferTagsEqual(wb_tag(f), wb_tag(wb_v2_page(&m->facts[j])))) return false;
+			if (BufferTagsEqual(wb_tag(f), wb_tag(wb_v2_page(&m->facts[j]))))
+				return false;
 	}
 	return true;
 }
@@ -658,8 +669,10 @@ wb_v2_fact_encode(uint8 *p, const ClusterPiWritebackFactV2 *fact)
 		const ClusterPiStructuralFactV2 *s = &fact->proof.structural;
 		pi_data_put(p + 8, s->durability_flags, 4);
 		pi_data_binding_encode(p + 16, &f->binding);
-		if (!cluster_space_structure_wal_encode(&s->change, p + 248, CLUSTER_SPACE_STRUCTURE_WAL_BYTES)
-			|| !cluster_ko_shared_encode_v2(&s->ko, p + 904, CLUSTER_KO_SHARED_V2_BYTES)) return false;
+		if (!cluster_space_structure_wal_encode(&s->change, p + 248,
+												CLUSTER_SPACE_STRUCTURE_WAL_BYTES)
+			|| !cluster_ko_shared_encode_v2(&s->ko, p + 904, CLUSTER_KO_SHARED_V2_BYTES))
+			return false;
 		if (fact->kind == CLUSTER_PI_WRITEBACK_STRUCTURAL_V2) {
 			pi_data_cut_encode(p + 1064, &f->write_cut);
 			wb_storage_encode(p + 1192, &f->storage_cut);
@@ -672,15 +685,17 @@ bool
 cluster_pi_writeback_encode_v2(const ClusterPiWritebackMessageV2 *m, uint8 *bytes, Size capacity,
 							   Size *length)
 {
-	uint8 encoded[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2] = {0}, source[232] = {0};
-	ClusterPageWalBindingV1 peer = {0};
+	uint8 encoded[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2] = { 0 }, source[232] = { 0 };
+	ClusterPageWalBindingV1 peer = { 0 };
 	Size n = CLUSTER_PI_WRITEBACK_HEADER_BYTES;
 	if (bytes == NULL || length == NULL || pi_data_overlap(m, sizeof(*m), bytes, capacity)
 		|| pi_data_overlap(length, sizeof(*length), bytes, capacity)
 		|| pi_data_overlap(length, sizeof(*length), m, sizeof(*m)) || !wb_v2_message_valid(m))
 		return false;
-	for (uint32 i = 0; i < m->count; i++) n += wb_v2_fact_bytes(&m->facts[i]);
-	if (capacity < n) return false;
+	for (uint32 i = 0; i < m->count; i++)
+		n += wb_v2_fact_bytes(&m->facts[i]);
+	if (capacity < n)
+		return false;
 	memcpy(encoded, "PPWB", 4);
 	pi_data_put(encoded + 4, 2, 2);
 	pi_data_put(encoded + 6, CLUSTER_PI_WRITEBACK_HEADER_BYTES, 2);
@@ -693,7 +708,8 @@ cluster_pi_writeback_encode_v2(const ClusterPiWritebackMessageV2 *m, uint8 *byte
 	memcpy(encoded + 32, source, 136);
 	n = CLUSTER_PI_WRITEBACK_HEADER_BYTES;
 	for (uint32 i = 0; i < m->count; i++) {
-		if (!wb_v2_fact_encode(encoded + n, &m->facts[i])) return false;
+		if (!wb_v2_fact_encode(encoded + n, &m->facts[i]))
+			return false;
 		n += wb_v2_fact_bytes(&m->facts[i]);
 	}
 	memcpy(bytes, encoded, n);
@@ -705,57 +721,70 @@ bool
 cluster_pi_writeback_decode_v2(const void *data, Size length, ClusterPiWritebackMessageV2 *out)
 {
 	const uint8 *bytes = data;
-	ClusterPiWritebackMessageV2 m = {0};
-	ClusterPageWalBindingV1 peer = {0};
-	uint8 source[232] = {0};
+	ClusterPiWritebackMessageV2 m = { 0 };
+	ClusterPageWalBindingV1 peer = { 0 };
+	uint8 source[232] = { 0 };
 	Size at = CLUSTER_PI_WRITEBACK_HEADER_BYTES;
 	if (bytes == NULL || out == NULL || pi_data_overlap(data, length, out, sizeof(*out))
 		|| length < at || length > CLUSTER_PI_WRITEBACK_MAX_BYTES_V2
 		|| memcmp(bytes, "PPWB", 4) != 0 || pi_data_get(bytes + 4, 2) != 2
-		|| pi_data_get(bytes + 6, 2) != CLUSTER_PI_WRITEBACK_HEADER_BYTES || pi_data_get(bytes + 168, 8))
+		|| pi_data_get(bytes + 6, 2) != CLUSTER_PI_WRITEBACK_HEADER_BYTES
+		|| pi_data_get(bytes + 168, 8))
 		return false;
-	m.verb = pi_data_get(bytes + 8, 4); m.count = pi_data_get(bytes + 12, 4);
-	m.nonce = pi_data_get(bytes + 16, 8); m.epoch = pi_data_get(bytes + 24, 8);
-	if (m.count > CLUSTER_PI_WRITEBACK_MAX) return false;
+	m.verb = pi_data_get(bytes + 8, 4);
+	m.count = pi_data_get(bytes + 12, 4);
+	m.nonce = pi_data_get(bytes + 16, 8);
+	m.epoch = pi_data_get(bytes + 24, 8);
+	if (m.count > CLUSTER_PI_WRITEBACK_MAX)
+		return false;
 	memcpy(source, bytes + 32, 136);
-	if (!pi_data_binding_decode(source, &peer)) return false;
+	if (!pi_data_binding_decode(source, &peer))
+		return false;
 	m.peer = peer.source;
 	for (uint32 i = 0; i < m.count; i++) {
 		ClusterPiWritebackFactV2 *fact = &m.facts[i];
 		const uint8 *p = bytes + at;
 		Size n;
-		if (length - at < 8 || pi_data_get(p + 2, 2)) return false;
+		if (length - at < 8 || pi_data_get(p + 2, 2))
+			return false;
 		fact->kind = pi_data_get(p, 2);
-		if (wb_v2_page(fact) == NULL) return false;
+		if (wb_v2_page(fact) == NULL)
+			return false;
 		n = wb_v2_fact_bytes(fact);
-		if (n > length - at || pi_data_get(p + 4, 4) != n) return false;
+		if (n > length - at || pi_data_get(p + 4, 4) != n)
+			return false;
 		if (fact->kind == CLUSTER_PI_WRITEBACK_DATA_V2) {
 			ClusterPiDataFactV1 *f = &fact->proof.data;
 			if (!pi_data_binding_decode(p + 8, &f->binding)
-				|| !wb_storage_decode(p + 368, &f->storage_cut)) return false;
+				|| !wb_storage_decode(p + 368, &f->storage_cut))
+				return false;
 			pi_data_cut_decode(p + 240, &f->write_cut);
 		} else {
 			ClusterPiStructuralFactV2 *s = &fact->proof.structural;
 			ClusterPiDataFactV1 *f = &s->terminal;
 			s->durability_flags = pi_data_get(p + 8, 4);
 			if (pi_data_get(p + 12, 4) || !pi_data_binding_decode(p + 16, &f->binding)
-				|| !cluster_space_structure_wal_decode(p + 248, CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &s->change)
-				|| !cluster_ko_shared_decode_v2(p + 904, CLUSTER_KO_SHARED_V2_BYTES, &s->ko)) return false;
+				|| !cluster_space_structure_wal_decode(p + 248, CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+													   &s->change)
+				|| !cluster_ko_shared_decode_v2(p + 904, CLUSTER_KO_SHARED_V2_BYTES, &s->ko))
+				return false;
 			if (fact->kind == CLUSTER_PI_WRITEBACK_STRUCTURAL_V2) {
-				if (!wb_storage_decode(p + 1192, &f->storage_cut)) return false;
+				if (!wb_storage_decode(p + 1192, &f->storage_cut))
+					return false;
 				pi_data_cut_decode(p + 1064, &f->write_cut);
 			}
 		}
 		at += n;
 	}
-	if (at != length || !wb_v2_message_valid(&m)) return false;
+	if (at != length || !wb_v2_message_valid(&m))
+		return false;
 	*out = m;
 	return true;
 }
 
 bool
 cluster_pi_writeback_ack_matches_v2(const ClusterPiWritebackMessageV2 *request,
-								  const ClusterPiWritebackMessageV2 *ack)
+									const ClusterPiWritebackMessageV2 *ack)
 {
 	uint8 original[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2], reply[CLUSTER_PI_WRITEBACK_MAX_BYTES_V2];
 	Size original_length, reply_length, at = CLUSTER_PI_WRITEBACK_HEADER_BYTES;
@@ -772,9 +801,11 @@ cluster_pi_writeback_ack_matches_v2(const ClusterPiWritebackMessageV2 *request,
 			Size candidate = pi_data_get(original + found + 4, 4);
 			matched = candidate == n && memcmp(original + found, reply + at, n) == 0;
 			found += candidate;
-			if (matched) break;
+			if (matched)
+				break;
 		}
-		if (!matched) return false;
+		if (!matched)
+			return false;
 		at += n;
 	}
 	return true;
@@ -861,7 +892,7 @@ wb_current(const ClusterPiWritebackMessageV1 *m, bool master)
 
 static bool
 wb_v2_fact_current(const ClusterPiWritebackFactV2 *fact, const ClusterWalSourceRef *peer,
-	uint64 epoch, bool sending)
+				   uint64 epoch, bool sending)
 {
 	const ClusterPiStructuralFactV2 *s;
 	const ClusterPiDataFactV1 *page;
@@ -876,16 +907,16 @@ wb_v2_fact_current(const ClusterPiWritebackFactV2 *fact, const ClusterWalSourceR
 	offer = fact->kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2;
 	origin = offer ? s->ko.origin_node : wb_master(page);
 	origin_boot = offer ? s->ko.origin_boot : wb_master_boot(page);
-	return origin >= 0 && origin < RESOURCE_X_PROTOCOL_NODE_LIMIT
-		&& recipient >= 0 && recipient < RESOURCE_X_PROTOCOL_NODE_LIMIT
-		&& origin != recipient && cluster_node_id == (sending ? origin : recipient)
-		&& cluster_membership_get_state(origin) == CLUSTER_MEMBER_MEMBER
-		&& cluster_membership_get_last_admitted_incarnation(origin) == origin_boot
-		&& cluster_membership_get_state(recipient) == CLUSTER_MEMBER_MEMBER
-		&& cluster_membership_get_last_admitted_incarnation(recipient) == recipient_boot
-		&& cluster_qvotec_get_self_incarnation() == (sending ? origin_boot : recipient_boot)
-		&& cluster_ko_shared_cut_current_v2(&s->ko)
-		&& (offer || cluster_gcs_lookup_master(*wb_tag(page)) == origin);
+	return origin >= 0 && origin < RESOURCE_X_PROTOCOL_NODE_LIMIT && recipient >= 0
+		   && recipient < RESOURCE_X_PROTOCOL_NODE_LIMIT && origin != recipient
+		   && cluster_node_id == (sending ? origin : recipient)
+		   && cluster_membership_get_state(origin) == CLUSTER_MEMBER_MEMBER
+		   && cluster_membership_get_last_admitted_incarnation(origin) == origin_boot
+		   && cluster_membership_get_state(recipient) == CLUSTER_MEMBER_MEMBER
+		   && cluster_membership_get_last_admitted_incarnation(recipient) == recipient_boot
+		   && cluster_qvotec_get_self_incarnation() == (sending ? origin_boot : recipient_boot)
+		   && cluster_ko_shared_cut_current_v2(&s->ko)
+		   && (offer || cluster_gcs_lookup_master(*wb_tag(page)) == origin);
 }
 
 bool
@@ -896,10 +927,9 @@ cluster_pi_writeback_request_current_v2(const ClusterPiWritebackMessageV2 *m, bo
 	uint32 word, connection, after_word, after_connection;
 	int32 remote;
 
-	if (!wb_v2_message_valid(m) || m->verb != CLUSTER_PI_WRITEBACK_NOTIFY
-		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
-		|| cluster_normal_stop_requested() || !cluster_qvotec_in_quorum()
-		|| cluster_reconfig_has_pending_prebump_stage()
+	if (!wb_v2_message_valid(m) || m->verb != CLUSTER_PI_WRITEBACK_NOTIFY || !cluster_enabled
+		|| !cluster_shared_config || RecoveryInProgress() || cluster_normal_stop_requested()
+		|| !cluster_qvotec_in_quorum() || cluster_reconfig_has_pending_prebump_stage()
 		|| cluster_epoch_get_current() != m->epoch
 		|| (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0)
 		return false;
@@ -909,26 +939,26 @@ cluster_pi_writeback_request_current_v2(const ClusterPiWritebackMessageV2 *m, bo
 		|| before.claim.identity.origin_node_id != cluster_node_id
 		|| before.claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation()
 		|| GetSystemIdentifier() != m->peer.claim.identity.system_identifier
-		|| !wb_namespace(&before, &m->peer)
-		|| (!sending && !wb_source_covered(&before, &m->peer)))
+		|| !wb_namespace(&before, &m->peer) || (!sending && !wb_source_covered(&before, &m->peer)))
 		return false;
 	for (uint32 i = 0; i < m->count; i++)
 		if (!wb_v2_fact_current(&m->facts[i], &m->peer, m->epoch, sending))
 			return false;
 	remote = sending ? m->peer.claim.identity.origin_node_id
-		: m->facts[0].kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2
-			? m->facts[0].proof.structural.ko.origin_node : wb_master(wb_v2_page(&m->facts[0]));
+			 : m->facts[0].kind == CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2
+				 ? m->facts[0].proof.structural.ko.origin_node
+				 : wb_master(wb_v2_page(&m->facts[0]));
 	if (remote == cluster_node_id
 		|| !cluster_sf_peer_capability_word_sample(remote, PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2,
-			&word, &connection) || connection == 0
-		|| (word & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0)
+												   &word, &connection)
+		|| connection == 0 || (word & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) == 0)
 		return false;
 	return cluster_sf_peer_capability_word_sample(remote, PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2,
-			&after_word, &after_connection)
-		&& after_word == word && after_connection == connection
-		&& cluster_wal_thread_current_v2_ref(&after)
-		&& memcmp(&before, &after, sizeof(before)) == 0
-		&& cluster_membership_cut_generation_current(generation);
+												  &after_word, &after_connection)
+		   && after_word == word && after_connection == connection
+		   && cluster_wal_thread_current_v2_ref(&after)
+		   && memcmp(&before, &after, sizeof(before)) == 0
+		   && cluster_membership_cut_generation_current(generation);
 }
 
 static bool
@@ -1745,9 +1775,9 @@ cluster_pi_writeback_bgwriter_tick_v1(void)
 		result = cluster_wal_inputs_contributions_v1(wb_notice->inputs, true, &wb_notice->plan,
 													 &records, &detail);
 		wb_plan_rejected(result, detail,
-			wb_tag(v2 ? wb_v2_page(&request_v2.facts[0]) : &request.facts[0]),
-			peer->claim.identity.origin_node_id, epoch,
-			peer->claim.identity.origin_owner_incarnation);
+						 wb_tag(v2 ? wb_v2_page(&request_v2.facts[0]) : &request.facts[0]),
+						 peer->claim.identity.origin_node_id, epoch,
+						 peer->claim.identity.origin_owner_incarnation);
 		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
 			goto wait;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -2113,7 +2143,7 @@ wb_batch_structure_pages(void)
 		result = cluster_wal_inputs_contributions_v1(wb_batch->inputs, true, &wb_batch->plan,
 													 &records, &detail);
 		wb_plan_rejected(result, detail, &wb_batch->tags[0], cluster_node_id, wb_batch->epoch,
-			wb_batch->local.claim.identity.origin_owner_incarnation);
+						 wb_batch->local.claim.identity.origin_owner_incarnation);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 		for (uint32 i = 0; i < wb_batch->count; i++) {
@@ -2296,7 +2326,7 @@ cluster_pi_writeback_checkpointer_tick_v1(void)
 		result = cluster_wal_inputs_contributions_v1(wb_batch->inputs, true, &wb_batch->plan,
 													 &records, &detail);
 		wb_plan_rejected(result, detail, &wb_batch->tags[0], cluster_node_id, wb_batch->epoch,
-			wb_batch->local.claim.identity.origin_owner_incarnation);
+						 wb_batch->local.claim.identity.origin_owner_incarnation);
 		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
 			goto wait;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY

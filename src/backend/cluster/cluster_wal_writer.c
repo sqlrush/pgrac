@@ -63,8 +63,7 @@ cluster_wal_writer_check(const ClusterWalWriterToken *work)
 	fresh.epoch = work->epoch;
 
 	if (!cluster_enabled || !cluster_shared_config || !enableFsync
-		|| cluster_node_id != id->origin_node_id
-		|| id->system_identifier != GetSystemIdentifier()
+		|| cluster_node_id != id->origin_node_id || id->system_identifier != GetSystemIdentifier()
 		|| cluster_qvotec_get_self_incarnation() != id->origin_owner_incarnation
 		|| cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER
 		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
@@ -271,7 +270,7 @@ cluster_wal_writer_ready(TimeLineID timeline)
 
 ClusterControlRootResult
 cluster_wal_writer_startup_prepare(const ClusterControlRootIdentity *self,
-									const uint8 operation_uuid[16], XLogRecPtr *first_segment)
+								   const uint8 operation_uuid[16], XLogRecPtr *first_segment)
 {
 	ClusterWalStartupImage op, after;
 	pg_cryptohash_ctx *hash;
@@ -321,9 +320,8 @@ cluster_wal_writer_startup_prepare(const ClusterControlRootIdentity *self,
 	hash = pg_cryptohash_create(PG_SHA256);
 	if (hash == NULL)
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	hashed = pg_cryptohash_init(hash) == 0
-		&& pg_cryptohash_update(hash, claim, sizeof(claim)) == 0
-		&& pg_cryptohash_final(hash, work.ref.claim.claim_sha256, 32) == 0;
+	hashed = pg_cryptohash_init(hash) == 0 && pg_cryptohash_update(hash, claim, sizeof(claim)) == 0
+			 && pg_cryptohash_final(hash, work.ref.claim.claim_sha256, 32) == 0;
 	pg_cryptohash_free(hash);
 	if (!hashed)
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
@@ -356,7 +354,7 @@ cluster_wal_writer_startup_prepare(const ClusterControlRootIdentity *self,
 
 bool
 cluster_wal_writer_startup_matches(const ClusterControlRootIdentity *self,
-									const uint8 operation_uuid[16], XLogRecPtr first_segment)
+								   const uint8 operation_uuid[16], XLogRecPtr first_segment)
 {
 	ClusterWalWriterToken work = { 0 };
 	work.epoch = cluster_epoch_get_current();

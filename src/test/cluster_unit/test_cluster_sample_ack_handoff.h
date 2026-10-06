@@ -7,7 +7,7 @@ test_sample_barrier_observation_gap(bool second_read)
 	ClusterSemanticActivationAckWireV1 request;
 	ClusterSemanticActivationAckWireV1 ack;
 	ClusterSemanticActivationAckTableV1 complete;
-	ClusterICEnvelope envelope = {0};
+	ClusterICEnvelope envelope = { 0 };
 	uint8 payload[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
 
 	test_first_open_barrier_setup(&request, &complete);
@@ -34,26 +34,23 @@ test_sample_barrier_observation_gap(bool second_read)
 	else
 		test_membership_snapshot_valid = false;
 	cluster_semantic_activation_lmon_tick();
-	UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(
-		&semantic_activation_ack_local_ingress), 1);
-	UT_ASSERT_EQ(SemanticActivationAckTable->stage,
-		CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(&semantic_activation_ack_local_ingress),
+				 1);
+	UT_ASSERT_EQ(SemanticActivationAckTable->stage, CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
 	UT_ASSERT_EQ(SemanticActivationAckTable->observed_members_lo, 11);
 	UT_ASSERT(semantic_activation_ack_local_request_ahead.valid);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->active_bits), 0);
 	test_membership_snapshot_valid = true;
 	test_membership_snapshot_fail_at_call = 0;
 	cluster_semantic_activation_lmon_tick();
-	UT_ASSERT_EQ(SemanticActivationAckTable->stage,
-		CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
+	UT_ASSERT_EQ(SemanticActivationAckTable->stage, CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
 	UT_ASSERT(!semantic_activation_ack_local_request_ahead.valid);
-	UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(
-		&semantic_activation_ack_local_ingress), 0);
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(&semantic_activation_ack_local_ingress),
+				 0);
 	/* A late duplicate of the previous stage cannot erase the new stage. */
 	test_first_open_deliver(&ack, 2);
 	test_first_open_deliver(&request, 0);
-	UT_ASSERT_EQ(SemanticActivationAckTable->stage,
-		CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
+	UT_ASSERT_EQ(SemanticActivationAckTable->stage, CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->active_bits), 0);
 	test_first_open_finish();
 }
@@ -88,8 +85,7 @@ UT_TEST(test_sample_fanout_finishes_before_barrier_replaces_owner)
 	semantic_activation_ack_lmon_send_pending();
 	UT_ASSERT_EQ(semantic_activation_ack_local_pending_send.pending_members_lo, 4);
 	test_first_open_deliver(&barrier, 0);
-	UT_ASSERT_EQ(SemanticActivationAckTable->stage,
-		CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
+	UT_ASSERT_EQ(SemanticActivationAckTable->stage, CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
 	UT_ASSERT_EQ(SemanticActivationAckTable->observed_members_lo, 15);
 	UT_ASSERT(semantic_activation_ack_local_request_ahead.valid);
 	UT_ASSERT(!semantic_activation_ack_local_pending_send.invalidated);
@@ -102,8 +98,7 @@ UT_TEST(test_sample_fanout_finishes_before_barrier_replaces_owner)
 	UT_ASSERT_EQ(sent.stage, CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
 	UT_ASSERT_EQ(semantic_activation_ack_local_pending_send.pending_members_lo, 0);
 	cluster_semantic_activation_lmon_tick();
-	UT_ASSERT_EQ(SemanticActivationAckTable->stage,
-		CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
+	UT_ASSERT_EQ(SemanticActivationAckTable->stage, CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
 	UT_ASSERT(!semantic_activation_ack_local_request_ahead.valid);
 	UT_ASSERT(!semantic_activation_ack_local_pending_send.invalidated);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->active_bits), 0);
@@ -118,7 +113,7 @@ UT_TEST(test_sample_observable_drift_still_invalidates_retained_proof)
 		ClusterSemanticActivationAckWireV1 request;
 		ClusterSemanticActivationAckWireV1 ack;
 		ClusterSemanticActivationAckTableV1 complete;
-		ClusterICEnvelope envelope = {0};
+		ClusterICEnvelope envelope = { 0 };
 		uint8 payload[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
 
 		test_first_open_barrier_setup(&request, &complete);
@@ -141,12 +136,24 @@ UT_TEST(test_sample_observable_drift_still_invalidates_retained_proof)
 		cluster_semantic_activation_ack_handler(&envelope, payload);
 		test_membership_snapshot_valid = false;
 		switch (drift) {
-		case 0: test_current_epoch++; break;
-		case 1: test_remote_admitted_incarnations[1]++; break;
-		case 2: test_peer_capability_generation++; break;
-		case 3: test_last_admitted_incarnation++; break;
-		case 4: test_peer_capability_word ^= PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1; break;
-		case 5: test_terminal_nonmember = 1; break;
+		case 0:
+			test_current_epoch++;
+			break;
+		case 1:
+			test_remote_admitted_incarnations[1]++;
+			break;
+		case 2:
+			test_peer_capability_generation++;
+			break;
+		case 3:
+			test_last_admitted_incarnation++;
+			break;
+		case 4:
+			test_peer_capability_word ^= PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+			break;
+		case 5:
+			test_terminal_nonmember = 1;
+			break;
 		case 6:
 		case 7:
 			test_observed_slot_valid[1] = true;
@@ -181,12 +188,12 @@ UT_TEST(test_barrier_waits_for_both_late_peer_samples_in_either_order)
 		test_first_open_barrier_setup(&request, &complete);
 		SemanticActivationAckTable->observed_members_lo = 9;
 		memset(&SemanticActivationAckTable->observed[1], 0,
-			sizeof(SemanticActivationAckTable->observed[1]));
+			   sizeof(SemanticActivationAckTable->observed[1]));
 		test_first_open_deliver(&request, 0);
 		test_first_open_deliver(&request, 0);
 		UT_ASSERT(semantic_activation_ack_local_request_ahead.valid);
 		UT_ASSERT_EQ(SemanticActivationAckTable->stage,
-			CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
+					 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
 		UT_ASSERT_EQ(SemanticActivationAckTable->observed_members_lo, 9);
 		for (i = 0; i < 2; i++) {
 			int peer = order == 0 ? i + 1 : 2 - i;
@@ -204,24 +211,24 @@ UT_TEST(test_barrier_waits_for_both_late_peer_samples_in_either_order)
 			if (i == 0) {
 				UT_ASSERT(semantic_activation_ack_local_request_ahead.valid);
 				UT_ASSERT_EQ(SemanticActivationAckTable->stage,
-					CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
+							 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
 				test_membership_snapshot_valid = false;
 				cluster_semantic_activation_lmon_tick();
 				UT_ASSERT_EQ(SemanticActivationAckTable->observed_members_lo,
-					UINT64_C(9) | (UINT64_C(1) << peer));
+							 UINT64_C(9) | (UINT64_C(1) << peer));
 				test_membership_snapshot_valid = true;
 				test_first_open_deliver(&ack[i], peer);
 			}
 		}
 		UT_ASSERT(!semantic_activation_ack_local_request_ahead.valid);
 		UT_ASSERT_EQ(SemanticActivationAckTable->stage,
-			CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
+					 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
 		UT_ASSERT_EQ(SemanticActivationAckTable->capability_sample_digest,
-			request.capability_sample_digest);
+					 request.capability_sample_digest);
 		for (i = 1; i >= 0; i--)
 			test_first_open_deliver(&ack[i], ack[i].member_node);
 		UT_ASSERT_EQ(SemanticActivationAckTable->stage,
-			CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
+					 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
 		UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->active_bits), 0);
 		test_first_open_finish();
 	}

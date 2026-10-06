@@ -1020,7 +1020,8 @@ extern void ExceptionalCondition(const char *conditionName,
 			MEMSET_LOOP_LIMIT != 0) \
 		{ \
 			long *_start = (long *) _vstart; \
-			long *_stop = (long *) ((char *) _start + _len); \
+			/* PGRAC: the loop boundary is read-only. */ \
+			const long *_stop = (const long *) ((char *) _start + _len); \
 			while (_start < _stop) \
 				*_start++ = 0; \
 		} \

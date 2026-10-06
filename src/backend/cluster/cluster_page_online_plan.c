@@ -470,9 +470,8 @@ rf_page_online_plan_create_v1(const RfPageOnlinePlanRequestV1 *request,
 }
 
 static RfPageProofDetailV1
-apply_ordered_record(RfPageOnlinePlanV1 *plan,
-								   const RfDetachedRecordPlanV1 *record_plan,
-								   const RfPageOnlineRecordIdentityV1 *identity)
+apply_ordered_record(RfPageOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *record_plan,
+					 const RfPageOnlineRecordIdentityV1 *identity)
 {
 	RfPageOnlinePendingV1 *pending;
 	uint32 page_count = 0;
@@ -731,8 +730,9 @@ rf_page_online_plan_queue_record_v1(RfPageOnlinePlanV1 *plan,
 				&& component->owner != RF_DETACHED_COMPONENT_SIDE_TYPED))
 			return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
 	}
-	fixed_bytes = MAXALIGN(sizeof(*queued)) + MAXALIGN(sizeof(*decoded)
-		+ (Size)(source->max_block_id + 1) * sizeof(DecodedBkpBlock));
+	fixed_bytes
+		= MAXALIGN(sizeof(*queued))
+		  + MAXALIGN(sizeof(*decoded) + (Size)(source->max_block_id + 1) * sizeof(DecodedBkpBlock));
 	bytes = fixed_bytes + MAXALIGN((Size)source->main_data_len);
 	for (i = 0; i <= source->max_block_id; i++) {
 		const DecodedBkpBlock *block = &source->blocks[i];
@@ -755,8 +755,8 @@ rf_page_online_plan_queue_record_v1(RfPageOnlinePlanV1 *plan,
 		return RF_PAGE_PROOF_DETAIL_OOM;
 	}
 	decoded = (DecodedXLogRecord *)((char *)queued + MAXALIGN(sizeof(*queued)));
-	memcpy(decoded, source, sizeof(*decoded)
-		   + (Size)(source->max_block_id + 1) * sizeof(DecodedBkpBlock));
+	memcpy(decoded, source,
+		   sizeof(*decoded) + (Size)(source->max_block_id + 1) * sizeof(DecodedBkpBlock));
 	decoded->next = NULL;
 	decoded->oversized = false;
 	decoded->size = bytes - MAXALIGN(sizeof(*queued));
@@ -779,7 +779,8 @@ rf_page_online_plan_queue_record_v1(RfPageOnlinePlanV1 *plan,
 		} else
 			block->data_len = block->data_bufsz = 0;
 		if (block->has_image)
-			block->bkp_image = copy_record_bytes(&next, source->blocks[i].bkp_image, block->bimg_len);
+			block->bkp_image
+				= copy_record_bytes(&next, source->blocks[i].bkp_image, block->bimg_len);
 		else {
 			block->apply_image = false;
 			block->bimg_len = block->hole_offset = block->hole_length = 0;
@@ -808,13 +809,13 @@ rf_page_online_plan_queue_record_v1(RfPageOnlinePlanV1 *plan,
 static bool
 same_block(const DecodedBkpBlock *left, const DecodedBkpBlock *right)
 {
-	return RelFileLocatorEquals(left->rlocator, right->rlocator)
-		&& left->forknum == right->forknum && left->blkno == right->blkno;
+	return RelFileLocatorEquals(left->rlocator, right->rlocator) && left->forknum == right->forknum
+		   && left->blkno == right->blkno;
 }
 
 static bool
-queued_predecessor_exists(const RfPageOnlinePlanV1 *plan,
-						  const DecodedBkpBlock *block, const RfPageVersionV1 *before)
+queued_predecessor_exists(const RfPageOnlinePlanV1 *plan, const DecodedBkpBlock *block,
+						  const RfPageVersionV1 *before)
 {
 	const RfPageQueuedRecordV1 *record;
 	uint32 i;
@@ -841,12 +842,13 @@ queued_record_ready(const RfPageOnlinePlanV1 *plan, const RfPageQueuedRecordV1 *
 	uint32 i;
 
 	for (prior = plan->queue_head; prior != record; prior = prior->next)
-		if (!prior->applied && prior->identity.participant_index == record->identity.participant_index)
+		if (!prior->applied
+			&& prior->identity.participant_index == record->identity.participant_index)
 			return false;
 	for (i = 0; i < record->plan.component_count; i++) {
 		const RfDetachedComponentPlanV1 *component = &record->plan.components[i];
 		const DecodedBkpBlock *block;
-		RfPageIdentityV1 identity = {0};
+		RfPageIdentityV1 identity = { 0 };
 		RfPageOnlineTargetV1 *target;
 
 		if (component->owner != RF_DETACHED_COMPONENT_PAGE_CODEC)

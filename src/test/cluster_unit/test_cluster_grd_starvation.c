@@ -966,7 +966,7 @@ cluster_control_request_census(uint64 epoch pg_attribute_unused(), uint64 *versi
 }
 bool
 cluster_control_request_census_unchanged(uint64 epoch pg_attribute_unused(),
-									   uint64 version pg_attribute_unused())
+										 uint64 version pg_attribute_unused())
 {
 	return false;
 }

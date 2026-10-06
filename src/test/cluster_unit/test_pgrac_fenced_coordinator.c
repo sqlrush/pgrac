@@ -242,12 +242,12 @@ scan_owned_journal(int fd, PgracFencedJournalReconcileState *pending,
 {
 	uint8 frame[PGRAC_FENCED_JOURNAL_MAX_RECORD_BYTES];
 	PgracFencedJournalRecordV1 record;
-	size_t length;
 	off_t offset = 0;
 	uint32 count = 0;
 
 	pgrac_fenced_journal_reconcile_state_init(pending);
 	while (pread(fd, frame, 16, offset) == 16) {
+		size_t length;
 		length = pgrac_fenced_journal_frame_size(frame, 16);
 		UT_ASSERT(length > 0 && length <= sizeof(frame));
 		if (length == 0 || length > sizeof(frame))
@@ -384,7 +384,7 @@ UT_TEST(test_owned_joiners_share_one_proof_without_new_obligations)
 	PgracFencedProviderOpsV1 ops;
 	PgracFencedCoordinatorV1 coordinator;
 	PgracExternalFenceProtocolRequestV1 requests[2];
-	PgracExternalFenceProtocolResponseV1 responses[2];
+	PgracExternalFenceProtocolResponseV1 responses[2] = { 0 };
 	bool received[2] = { false, false };
 	int sockets[2][2], fd, loops;
 	char path[64];

@@ -72,14 +72,12 @@ cluster_control_root_v3_serving_cancel(void)
  * and publication-before-notification is tested by the FSM fixture. */
 void
 cluster_lmon_marker_complete_wakeup(void)
-{
-}
+{}
 
 /* No QVOTEC owner is registered in this codec/mailbox fixture. */
 void
 cluster_qvotec_wakeup(void)
-{
-}
+{}
 
 bool
 RecoveryInProgress(void)

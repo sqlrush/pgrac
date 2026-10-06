@@ -7,6 +7,8 @@
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * PGRAC MODIFICATIONS: honor qualified redo buffer initialization results.
+ *
  * IDENTIFICATION
  *			 src/backend/access/gin/ginxlog.c
  *-------------------------------------------------------------------------
@@ -44,8 +46,8 @@ static void
 ginRedoCreatePTree(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	ginxlogCreatePostingTree *data = (ginxlogCreatePostingTree *) XLogRecGetData(record);
-	char	   *ptr;
+	const ginxlogCreatePostingTree *data = (ginxlogCreatePostingTree *) XLogRecGetData(record);
+	const char	   *ptr;
 	Buffer		buffer;
 	Page		page;
 
@@ -533,7 +535,7 @@ static void
 ginRedoUpdateMetapage(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	ginxlogUpdateMeta *data = (ginxlogUpdateMeta *) XLogRecGetData(record);
+	const ginxlogUpdateMeta *data = (ginxlogUpdateMeta *) XLogRecGetData(record);
 	Buffer		metabuffer;
 	Page		metapage;
 	Buffer		buffer;
@@ -564,7 +566,6 @@ ginRedoUpdateMetapage(XLogReaderState *record)
 			Page		page = BufferGetPage(buffer);
 			OffsetNumber off;
 			int			i;
-			Size		tupsize;
 			char	   *payload;
 			IndexTuple	tuples;
 			Size		totaltupsize;
@@ -579,6 +580,8 @@ ginRedoUpdateMetapage(XLogReaderState *record)
 
 			for (i = 0; i < data->ntuples; i++)
 			{
+				Size		tupsize;
+
 				tupsize = IndexTupleSize(tuples);
 
 				if (PageAddItem(page, (Item) tuples, tupsize, off,
@@ -630,13 +633,11 @@ static void
 ginRedoInsertListPage(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	ginxlogInsertListPage *data = (ginxlogInsertListPage *) XLogRecGetData(record);
+	const ginxlogInsertListPage *data = (ginxlogInsertListPage *) XLogRecGetData(record);
 	Buffer		buffer;
 	Page		page;
-	OffsetNumber l,
-				off = FirstOffsetNumber;
-	int			i,
-				tupsize;
+	OffsetNumber off = FirstOffsetNumber;
+	int			i;
 	char	   *payload;
 	IndexTuple	tuples;
 	Size		totaltupsize;
@@ -668,6 +669,9 @@ ginRedoInsertListPage(XLogReaderState *record)
 	tuples = (IndexTuple) payload;
 	for (i = 0; i < data->ntuples; i++)
 	{
+		OffsetNumber l;
+		int			tupsize;
+
 		tupsize = IndexTupleSize(tuples);
 
 		l = PageAddItem(page, (Item) tuples, tupsize, off, false, false);
@@ -690,7 +694,7 @@ static void
 ginRedoDeleteListPages(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	ginxlogDeleteListPages *data = (ginxlogDeleteListPages *) XLogRecGetData(record);
+	const ginxlogDeleteListPages *data = (ginxlogDeleteListPages *) XLogRecGetData(record);
 	Buffer		metabuffer;
 	Page		metapage;
 	int			i;
@@ -725,10 +729,11 @@ ginRedoDeleteListPages(XLogReaderState *record)
 	for (i = 0; i < data->ndeleted; i++)
 	{
 		Buffer		buffer;
-		Page		page;
 
 		if (XLogReadBufferForRedoExtended(record, i + 1, RBM_ZERO_AND_LOCK, false, &buffer)
 			== BLK_NEEDS_REDO) {
+			Page		page;
+
 			page = BufferGetPage(buffer);
 			GinInitBuffer(buffer, GIN_DELETED);
 

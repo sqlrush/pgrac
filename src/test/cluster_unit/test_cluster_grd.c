@@ -60,7 +60,7 @@
 #include "cluster/cluster_pi_rebuild.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_external_fence.h"
-#include "cluster/cluster_hw.h"			/* spec-4.6a HW remaster watchdog stubs */
+#include "cluster/cluster_hw.h" /* spec-4.6a HW remaster watchdog stubs */
 #include "cluster/cluster_hw_snapshot.h"
 #include "cluster/cluster_lmd.h"		/* spec-5.8 D1b — WFG vertex + submit/cancel edge */
 #include "cluster/cluster_undo_resid.h" /* spec-5.22a D1-5 — undo-class hash-route guard */
@@ -306,8 +306,9 @@ static uint32 ut_routing_dead_mask;
 int /* ClusterCssdPeerState */
 cluster_cssd_get_peer_state(int32 peer_id)
 {
-	return peer_id == ut_cssd_dead_node || (ut_real_gcs_routing && peer_id >= 0 && peer_id < 32
-				   && (ut_routing_dead_mask & (1u << peer_id)))
+	return peer_id == ut_cssd_dead_node
+				   || (ut_real_gcs_routing && peer_id >= 0 && peer_id < 32
+					   && (ut_routing_dead_mask & (1u << peer_id)))
 			   ? CSSD_PEER_DEAD
 			   : CSSD_PEER_ALIVE;
 }

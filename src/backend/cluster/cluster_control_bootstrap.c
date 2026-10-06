@@ -110,7 +110,7 @@ cluster_control_bootstrap_root_bound(const PgracControlBinding *binding,
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (binding->lineage_kind == PGRAC_CONTROL_LINEAGE_CREATION_V1) {
 		uint64 required = PGRAC_CONTROL_ROOT_FEATURE_SPACE_IDENTITY_V1
-			| PGRAC_CONTROL_ROOT_FEATURE_SPACE_RESERVATION_V1;
+						  | PGRAC_CONTROL_ROOT_FEATURE_SPACE_RESERVATION_V1;
 		if ((header->target_feature_bitmap & required) != required)
 			return CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED;
 	}

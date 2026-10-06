@@ -109,12 +109,13 @@ extern RfPageProofDetailV1 rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
 /* The physical source owner supplies this after the entire scan and root
  * revalidation, never by copying a provisional SPACE payload's namespace. */
 extern bool rf_side_online_plan_bind_database_v1(RfSideOnlinePlanV1 *plan,
-												uint64 database_incarnation);
+												 uint64 database_incarnation);
 /* Match the sealed, physically observed source, including its exact cut. */
 /* A legacy zero-generation cut never selects an explicit generation. */
 extern bool rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan,
-	uint64 system_identifier, const uint8 storage_uuid[16],
-	const RfContributorStreamCutV1 *cut);
+												  uint64 system_identifier,
+												  const uint8 storage_uuid[16],
+												  const RfContributorStreamCutV1 *cut);
 /* UINT32_MAX for an invalid or unsealed plan. */
 extern uint32 rf_side_online_plan_participant_count_v1(const RfSideOnlinePlanV1 *plan);
 /* The physical lower alone must not authorize replay of retained history. */
@@ -123,19 +124,21 @@ extern bool rf_side_online_plan_replay_start_matches_v1(const RfSideOnlinePlanV1
 														uint64 database_incarnation,
 														XLogRecPtr native_redo);
 extern bool rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
-	const RfSideXactOperationV1 *operation);
+												   const RfSideXactOperationV1 *operation);
 /* Only later native TRUNCATE in this exact sealed source can justify an
  * absent CREATE page. No visibility or mutation authority is returned. */
 extern bool rf_side_online_plan_multixact_page_retired_v1(const RfSideOnlinePlanV1 *plan,
-	uint32 origin_thread, XLogRecPtr source_lsn, XLogRecPtr source_end_lsn,
-	bool members, uint32 page);
+														  uint32 origin_thread,
+														  XLogRecPtr source_lsn,
+														  XLogRecPtr source_end_lsn, bool members,
+														  uint32 page);
 /* Private preparation only, under the caller's independently protected target
  * read. Returned order contains SIDE operation indices for every exact input
  * on this locator; it does not retire any structural or durability obligation. */
 extern RfPageProofDetailV1 rf_side_online_plan_prepare_space_v1(
 	const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKey *expected,
-	const void *identity_page, const void *reservation_page, uint32 *order,
-	uint32 capacity, uint32 *out_count, ClusterSpaceRecoveryImage *out);
+	const void *identity_page, const void *reservation_page, uint32 *order, uint32 capacity,
+	uint32 *out_count, ClusterSpaceRecoveryImage *out);
 /* through is a position in the complete returned order, not a SIDE operation
  * index. Later proven target components retain their bytes and no WAL source. */
 extern RfPageProofDetailV1 rf_side_online_plan_prepare_space_through_v1(
@@ -153,17 +156,20 @@ typedef struct RfSideUndoHeaderImageV1 {
 typedef RfSideUndoHeaderImageV1 RfSideUndoBlockImageV1;
 /* Physical replay starts at a source FPI in each segment incarnation, never
  * at an inferred DATA LSN. Installation remains the original owner's duty. */
-extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_block_v1(
-	const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 segment_id,
-	uint32 block_no, RfSideUndoBlockImageV1 *out);
+extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan,
+																	 uint8 instance,
+																	 uint32 segment_id,
+																	 uint32 block_no,
+																	 RfSideUndoBlockImageV1 *out);
 
 /* Evolve a private segment header through its source-ordered lifecycle and
  * TT records, including folded XACT COMMIT. The target read, physical UNDO
  * blocks, installation and durability remain separate protected obligations.
  * No output change on refusal. UINT32_MAX source means no byte change. */
-extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_header_v1(
-	const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 segment_id,
-	const char *base, RfSideUndoHeaderImageV1 *out);
+extern RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
+										   uint32 segment_id, const char *base,
+										   RfSideUndoHeaderImageV1 *out);
 extern uint32 rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan);
 typedef struct RfSideSpaceContributionV1 {
 	ClusterSpaceIdentity result;
@@ -215,8 +221,9 @@ extern bool rf_side_online_plan_space_contribution_v1(const RfSideOnlinePlanV1 *
  * separately bind both indices to full original claims and record identities;
  * this query alone grants no durability, physical disposal or WAL retirement. */
 extern bool rf_side_online_plan_space_covers_v1(const RfSideOnlinePlanV1 *plan,
-	const ClusterSpaceIdentityKey *key, BlockNumber block, uint32 ancestor_operation,
-	uint32 completed_operation, bool *terminal);
+												const ClusterSpaceIdentityKey *key,
+												BlockNumber block, uint32 ancestor_operation,
+												uint32 completed_operation, bool *terminal);
 
 typedef struct RfSideSpaceTerminalV1 {
 	uint32 operation;
@@ -227,7 +234,8 @@ typedef struct RfSideSpaceTerminalV1 {
  * retained ancestry proof. No source/durability authority; refusal preserves
  * output, including when no retained operation contributes to this block. */
 extern bool rf_side_online_plan_space_terminal_v1(const RfSideOnlinePlanV1 *plan,
-	const ClusterSpaceIdentityKey *key, BlockNumber block, RfSideSpaceTerminalV1 *out);
+												  const ClusterSpaceIdentityKey *key,
+												  BlockNumber block, RfSideSpaceTerminalV1 *out);
 
 typedef struct RfSideSpaceIncarnationEndV1 {
 	uint32 operation;
@@ -243,8 +251,10 @@ typedef struct RfSideSpaceIncarnationEndV1 {
  * completion, surviving base, lifecycle isolation and the exact source/master
  * cut. No I/O or authority is granted. Refusal preserves output. */
 extern bool rf_side_online_plan_space_incarnation_end_v1(const RfSideOnlinePlanV1 *plan,
-	const ClusterSpaceIdentityKey *key, const uint8 incarnation[16], uint32 completed_operation,
-	RfSideSpaceIncarnationEndV1 *out);
+														 const ClusterSpaceIdentityKey *key,
+														 const uint8 incarnation[16],
+														 uint32 completed_operation,
+														 RfSideSpaceIncarnationEndV1 *out);
 
 /* One decoded record, no retained operation array or payload allocation.
  * Reuses the replay decoder but returns only provisional contribution owners.

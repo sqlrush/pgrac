@@ -3,10 +3,11 @@
 #include "postgres.h"
 #include "cluster/cluster_voting_disk_io.h"
 
-extern ClusterVotingDiskIoState cluster_qvotec_test_poll_read_slot(int fd, uint32 disk,
-																uint32 node, ClusterVotingSlot *out);
-extern void cluster_qvotec_test_poll_read_slots(int fd, int disk, uint32 first,
-	uint32 count, ClusterVotingSlot *out, ClusterVotingDiskIoState *states);
+extern ClusterVotingDiskIoState cluster_qvotec_test_poll_read_slot(int fd, uint32 disk, uint32 node,
+																   ClusterVotingSlot *out);
+extern void cluster_qvotec_test_poll_read_slots(int fd, int disk, uint32 first, uint32 count,
+												ClusterVotingSlot *out,
+												ClusterVotingDiskIoState *states);
 #define cluster_voting_disk_read_slot cluster_qvotec_test_poll_read_slot
 #define cluster_voting_disk_read_slots cluster_qvotec_test_poll_read_slots
 #include QVOTEC_SOURCE_PATH
@@ -31,8 +32,8 @@ cluster_qvotec_test_poll_once(const int *fds, int n_disks, uint64 incarnation)
 		qvotec_fds[i] = fds[i];
 	qvotec_self_incarnation = incarnation;
 	if (qvotec_slot_matrix == NULL)
-		qvotec_slot_matrix = calloc(CLUSTER_MAX_VOTING_DISKS * CLUSTER_MAX_NODES,
-								   sizeof(ClusterVotingSlot));
+		qvotec_slot_matrix
+			= calloc(CLUSTER_MAX_VOTING_DISKS * CLUSTER_MAX_NODES, sizeof(ClusterVotingSlot));
 	Assert(qvotec_slot_matrix != NULL);
 	qvotec_poll_once();
 }

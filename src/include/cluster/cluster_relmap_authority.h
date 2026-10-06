@@ -98,14 +98,12 @@ typedef struct ClusterRelmapAuthorityHeader {
 } ClusterRelmapAuthorityHeader;
 
 /* Fixed slot widths are independent of the inner image_size. */
-#define CLUSTER_RELMAP_AUTHORITY_FILE_SIZE \
+#define CLUSTER_RELMAP_AUTHORITY_FILE_SIZE                                                         \
 	((int)(sizeof(ClusterRelmapAuthorityHeader) + 2 * CLUSTER_RELMAP_IMAGE_MAX))
 #define CLUSTER_RELMAP_COMMITTED_OFFSET ((int)sizeof(ClusterRelmapAuthorityHeader))
-#define CLUSTER_RELMAP_PENDING_OFFSET \
-	(CLUSTER_RELMAP_COMMITTED_OFFSET + CLUSTER_RELMAP_IMAGE_MAX)
+#define CLUSTER_RELMAP_PENDING_OFFSET (CLUSTER_RELMAP_COMMITTED_OFFSET + CLUSTER_RELMAP_IMAGE_MAX)
 
-typedef enum ClusterRelmapInitResult
-{
+typedef enum ClusterRelmapInitResult {
 	CLUSTER_RELMAP_INIT_OK = 0,
 	CLUSTER_RELMAP_INIT_INVALID_ARGUMENT,
 	CLUSTER_RELMAP_INIT_INVALID_LENGTH,
@@ -135,8 +133,9 @@ typedef enum ClusterRelmapInitResult
  * Input and output may be unaligned.  No fallback, repair or partial image.
  */
 extern ClusterRelmapInitResult cluster_relmap_authority_init_image(bool shared_map, Oid dbid,
-																 const void *native_map, size_t native_len,
-																 void *output, size_t output_len);
+																   const void *native_map,
+																   size_t native_len, void *output,
+																   size_t output_len);
 
 /*
  * ClusterRelmapOwner -- the pending owner identity a writer stamps.

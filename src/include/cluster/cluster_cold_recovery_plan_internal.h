@@ -372,7 +372,7 @@ extern bool cold_plan_space_shrink_pending(const ClusterColdPlanV1 *plan,
 										   const ColdComponent *component);
 extern bool cold_plan_space_created_here(const ClusterColdPlanV1 *plan,
 										 const ColdComponent *component);
-extern void cold_plan_space_retire_inferred(ClusterColdPlanV1 *plan, const uint32 *group,
+extern void cold_plan_space_retire_inferred(const ClusterColdPlanV1 *plan, const uint32 *group,
 											uint32 count);
 
 /* History, or written before a TRUNCATE of its relation: never replayed. */

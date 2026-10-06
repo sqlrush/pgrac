@@ -318,14 +318,30 @@ UT_TEST(test_incomplete_never_retains_invalid_or_expired_evidence)
 		ready();
 		fake_monotonic = 101;
 		switch (scenario) {
-			case 0: fake_monotonic = 150; break;
-			case 1: fake_monotonic = 99; break;
-			case 2: start = 0; break;
-			case 3: duration = 0; break;
-			case 4: start = UINT64_MAX - 5; break;
-			case 5: pg_atomic_write_u64(&test_state.generation, UINT64_MAX); break;
-			case 6: pg_atomic_write_u32(&test_state.reason, CLUSTER_STORAGE_QUORUM_NOT_QUORATE); break;
-			case 7: pg_atomic_write_u64(&test_state.members[0], 2); break;
+		case 0:
+			fake_monotonic = 150;
+			break;
+		case 1:
+			fake_monotonic = 99;
+			break;
+		case 2:
+			start = 0;
+			break;
+		case 3:
+			duration = 0;
+			break;
+		case 4:
+			start = UINT64_MAX - 5;
+			break;
+		case 5:
+			pg_atomic_write_u64(&test_state.generation, UINT64_MAX);
+			break;
+		case 6:
+			pg_atomic_write_u32(&test_state.reason, CLUSTER_STORAGE_QUORUM_NOT_QUORATE);
+			break;
+		case 7:
+			pg_atomic_write_u64(&test_state.members[0], 2);
+			break;
 		}
 		memset(&supplied, 0, sizeof(supplied));
 		supplied.reason = CLUSTER_STORAGE_QUORUM_INCOMPLETE;

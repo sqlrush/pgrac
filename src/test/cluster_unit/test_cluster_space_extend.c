@@ -43,13 +43,30 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 void
 pg_re_throw(void)
 {
-	if (PG_exception_stack != NULL) siglongjmp(*PG_exception_stack, 1);
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	abort();
 }
-bool RecoveryInProgress(void) { return false; }
-ClusterExtendEngage cluster_extend_liveness_engage(bool wait) { return CLUSTER_EXTEND_ENGAGE_NATIVE; }
-bool cluster_hw_lease_active(void) { return false; }
-int cluster_smgr_which_for(RelFileLocator tag, BackendId backend) { return 1; }
+bool
+RecoveryInProgress(void)
+{
+	return false;
+}
+ClusterExtendEngage
+cluster_extend_liveness_engage(bool wait)
+{
+	return CLUSTER_EXTEND_ENGAGE_NATIVE;
+}
+bool
+cluster_hw_lease_active(void)
+{
+	return false;
+}
+int
+cluster_smgr_which_for(RelFileLocator tag, BackendId backend)
+{
+	return 1;
+}
 SMgrRelation
 smgropen(RelFileLocator tag, BackendId backend)
 {
@@ -57,7 +74,11 @@ smgropen(RelFileLocator tag, BackendId backend)
 	UT_ASSERT_EQ(backend, InvalidBackendId);
 	return retired ? &reopened : &storage;
 }
-void smgrsetowner(SMgrRelation *owner, SMgrRelation rel) { *owner = rel; }
+void
+smgrsetowner(SMgrRelation *owner, SMgrRelation rel)
+{
+	*owner = rel;
+}
 BlockNumber
 smgrnblocks(SMgrRelation rel, ForkNumber fork)
 {
@@ -70,7 +91,8 @@ cluster_space_relation_read_identity(RelFileLocator tag, ClusterSpaceIdentity *o
 {
 	UT_ASSERT(!hw_held && !local_lock && victims == 0);
 	identity_reads++;
-	if (missing_identity) return false;
+	if (missing_identity)
+		return false;
 	*out = identity;
 	retired = true;
 	relation.rd_smgr = NULL;
@@ -92,7 +114,8 @@ cluster_hw_lock(const ClusterResId *resid, HwLock *lock)
 	UT_ASSERT(memcmp(resid, &expected, sizeof(expected)) == 0);
 	UT_ASSERT(!hw_held && !local_lock);
 	memset(lock, 0, sizeof(*lock));
-	if (refuse_hw) return false;
+	if (refuse_hw)
+		return false;
 	lock->held = lock->coordinated = hw_held = true;
 	return true;
 }
@@ -103,26 +126,41 @@ cluster_hw_unlock(HwLock *lock)
 	lock->held = hw_held = false;
 }
 BlockNumber
-cluster_space_reserve(const ClusterSpaceIdentity *id, const HwLock *lock, uint32 want, uint32 *granted)
+cluster_space_reserve(const ClusterSpaceIdentity *id, const HwLock *lock, uint32 want,
+					  uint32 *granted)
 {
 	UT_ASSERT(hw_held && lock->held && id->sequence == identity.sequence);
 	UT_ASSERT_EQ(want, 2);
 	UT_ASSERT_EQ(size_reads, 0);
-	if (throw_grant) pg_re_throw();
-	if (refuse_grant) { *granted = 0; return InvalidBlockNumber; }
+	if (throw_grant)
+		pg_re_throw();
+	if (refuse_grant) {
+		*granted = 0;
+		return InvalidBlockNumber;
+	}
 	reservations++;
 	*granted = want;
 	return 200;
 }
 BlockNumber
-cluster_hw_allocate(RelFileLocator tag, ForkNumber fork, uint32 want, BlockNumber seed, uint32 *granted)
+cluster_hw_allocate(RelFileLocator tag, ForkNumber fork, uint32 want, BlockNumber seed,
+					uint32 *granted)
 {
 	legacy_allocations++;
 	*granted = want;
 	return 500;
 }
-static Buffer fixture_victim(void) { return ++victims; }
-static void fixture_unlock(void) { UT_ASSERT(local_lock); local_lock = false; }
+static Buffer
+fixture_victim(void)
+{
+	return ++victims;
+}
+static void
+fixture_unlock(void)
+{
+	UT_ASSERT(local_lock);
+	local_lock = false;
+}
 #define IOContextForStrategy(strategy) IOCONTEXT_NORMAL
 #define LimitAdditionalPins(count) ((void)0)
 #define GetVictimBuffer(strategy, context) fixture_victim()
@@ -146,7 +184,7 @@ reset(void)
 	memset(&form, 0, sizeof(form));
 	memset(&storage, 0, sizeof(storage));
 	memset(&identity, 0, sizeof(identity));
-	identity.key.locator = (RelFileLocator){1663, 5, 17000};
+	identity.key.locator = (RelFileLocator){ 1663, 5, 17000 };
 	identity.sequence = 1;
 	relation.rd_locator = storage.smgr_rlocator.locator = identity.key.locator;
 	storage.smgr_rlocator.backend = InvalidBackendId;
@@ -155,9 +193,11 @@ reset(void)
 	relation.rd_rel = &form;
 	form.relpersistence = RELPERSISTENCE_PERMANENT;
 	form.relkind = RELKIND_RELATION;
-	for (int i = 0; i < 2; i++) descriptors[i].bufferdesc.buf_id = i;
+	for (int i = 0; i < 2; i++)
+		descriptors[i].bufferdesc.buf_id = i;
 	cluster_shared_config = true;
-	hw_held = local_lock = retired = missing_identity = refuse_hw = refuse_grant = throw_grant = false;
+	hw_held = local_lock = retired = missing_identity = refuse_hw = refuse_grant = throw_grant
+		= false;
 	victims = unpins = identity_reads = reservations = legacy_allocations = size_reads = 0;
 }
 
@@ -167,10 +207,11 @@ extend(bool private, ForkNumber fork)
 	Buffer buffers[2];
 	uint32 extended;
 	BufferManagerRelation bmr = { .rel = private ? NULL : &relation,
-		.smgr = &storage, .relpersistence = RELPERSISTENCE_PERMANENT };
+								  .smgr = &storage,
+								  .relpersistence = RELPERSISTENCE_PERMANENT };
 
-	return ExtendBufferedRelShared(bmr, fork, NULL, EB_SKIP_EXTENSION_LOCK, 2,
-		InvalidBlockNumber, buffers, &extended);
+	return ExtendBufferedRelShared(bmr, fork, NULL, EB_SKIP_EXTENSION_LOCK, 2, InvalidBlockNumber,
+								   buffers, &extended);
 }
 
 UT_TEST(test_single_live_and_private_callers_use_canonical_reservations)
@@ -188,7 +229,8 @@ UT_TEST(test_nonshared_and_auxiliary_keep_native_extension)
 {
 	for (int variant = 0; variant < 2; variant++) {
 		reset();
-		if (variant == 0) cluster_shared_config = false;
+		if (variant == 0)
+			cluster_shared_config = false;
 		UT_ASSERT_EQ(extend(false, variant ? VISIBILITYMAP_FORKNUM : MAIN_FORKNUM), 9);
 		UT_ASSERT_EQ(identity_reads + reservations + legacy_allocations, 0);
 		UT_ASSERT_EQ(size_reads, 1);
@@ -203,8 +245,15 @@ UT_TEST(test_refusals_do_not_fall_back_to_file_size)
 		missing_identity = variant == 0;
 		refuse_hw = variant == 1;
 		refuse_grant = variant == 2;
-		PG_TRY(); { (void)extend(true, MAIN_FORKNUM); }
-		PG_CATCH(); { caught = true; } PG_END_TRY();
+		PG_TRY();
+		{
+			(void)extend(true, MAIN_FORKNUM);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
 		UT_ASSERT(caught);
 		UT_ASSERT_EQ(reservations + size_reads + legacy_allocations, 0);
 		UT_ASSERT_EQ(victims, unpins);
@@ -217,8 +266,15 @@ UT_TEST(test_reservation_error_releases_hw)
 
 	reset();
 	throw_grant = true;
-	PG_TRY(); { (void)extend(false, MAIN_FORKNUM); }
-	PG_CATCH(); { caught = true; } PG_END_TRY();
+	PG_TRY();
+	{
+		(void)extend(false, MAIN_FORKNUM);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
 	UT_ASSERT(caught);
 	UT_ASSERT(!hw_held);
 	UT_ASSERT_EQ(reservations + size_reads + legacy_allocations, 0);

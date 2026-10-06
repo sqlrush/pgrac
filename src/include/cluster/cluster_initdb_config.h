@@ -12,7 +12,8 @@ typedef struct ClusterInitdbConfig ClusterInitdbConfig;
  * exists. No writes and no root/formation/serving authority. Paths 0/1/2
  * are DATA/WAL/UNDO from the same fully validated canonical request. */
 extern ClusterInitdbConfig *cluster_initdb_config_preflight(const PgracInitdbConfigContext *source);
-extern const ClusterSharedConfigRef *cluster_initdb_config_reference(const ClusterInitdbConfig *config);
+extern const ClusterSharedConfigRef *
+cluster_initdb_config_reference(const ClusterInitdbConfig *config);
 extern const char *cluster_initdb_config_path(const ClusterInitdbConfig *config, unsigned index);
 extern void cluster_initdb_config_free(ClusterInitdbConfig *config);
 

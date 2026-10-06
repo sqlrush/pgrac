@@ -158,7 +158,7 @@ drop_setup(const char *tag, bool optional_init)
 	drop_identity.key.system_identifier = 71;
 	drop_identity.key.database_incarnation = 13;
 	memset(drop_identity.key.storage_uuid, 0x21, 16);
-	drop_identity.key.locator = (RelFileLocator){1663, 5, 16384};
+	drop_identity.key.locator = (RelFileLocator){ 1663, 5, 16384 };
 	memset(drop_identity.incarnation, 0x31, 16);
 	drop_identity.sequence = 2;
 	drop_identity.operation = 8;
@@ -207,19 +207,20 @@ UT_TEST(test_drop_absent_optional_is_not_a_failed_unlink)
 	UT_ASSERT_EQ(drop_directory_syncs, 1);
 }
 
-#define FAULT_TEST(name, fault) \
-	UT_TEST(name) { \
-		int descriptors; \
-		drop_setup(#name, fault != DROP_NEW_OPTIONAL); \
-		descriptors = drop_descriptor_count(); \
-		drop_fault = fault; \
-		UT_ASSERT(!cluster_shared_fs_sharedfs_drop_durable(&drop_identity, 17)); \
-		UT_ASSERT(drop_truncates == 1); \
-		UT_ASSERT_EQ(drop_descriptor_count(), descriptors); \
-		if (fault == DROP_PARTIAL) { \
-			UT_ASSERT(access(drop_paths[FSM_FORKNUM], F_OK) < 0); \
-			UT_ASSERT_EQ(access(drop_paths[VISIBILITYMAP_FORKNUM], F_OK), 0); \
-		} \
+#define FAULT_TEST(name, fault)                                                                    \
+	UT_TEST(name)                                                                                  \
+	{                                                                                              \
+		int descriptors;                                                                           \
+		drop_setup(#name, fault != DROP_NEW_OPTIONAL);                                             \
+		descriptors = drop_descriptor_count();                                                     \
+		drop_fault = fault;                                                                        \
+		UT_ASSERT(!cluster_shared_fs_sharedfs_drop_durable(&drop_identity, 17));                   \
+		UT_ASSERT(drop_truncates == 1);                                                            \
+		UT_ASSERT_EQ(drop_descriptor_count(), descriptors);                                        \
+		if (fault == DROP_PARTIAL) {                                                               \
+			UT_ASSERT(access(drop_paths[FSM_FORKNUM], F_OK) < 0);                                  \
+			UT_ASSERT_EQ(access(drop_paths[VISIBILITYMAP_FORKNUM], F_OK), 0);                      \
+		}                                                                                          \
 	}
 FAULT_TEST(test_drop_truncate_failure, DROP_TRUNCATE)
 FAULT_TEST(test_drop_main_sync_failure, DROP_MAIN_SYNC)

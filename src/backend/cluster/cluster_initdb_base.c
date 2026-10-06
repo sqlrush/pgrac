@@ -31,16 +31,14 @@
 #define BASE_MAX_DIRS 64
 #define BASE_MAX_FILES 16384
 
-typedef struct BaseDirectory
-{
+typedef struct BaseDirectory {
 	int source;
 	int target;
 	Oid database;
 	char name[16];
 } BaseDirectory;
 
-typedef struct BaseFile
-{
+typedef struct BaseFile {
 	uint32 directory;
 	RelFileNumber relation;
 	ForkNumber fork;
@@ -50,8 +48,7 @@ typedef struct BaseFile
 	struct stat identity;
 } BaseFile;
 
-typedef struct BaseCreate
-{
+typedef struct BaseCreate {
 	const PgracInitdbWalContext *context;
 	BaseDirectory dirs[BASE_MAX_DIRS];
 	uint32 ndirs;
@@ -59,8 +56,8 @@ typedef struct BaseCreate
 	uint32 nfiles;
 } BaseCreate;
 
-static void pg_attribute_noreturn()
-base_refuse(const char *reason)
+static void
+pg_attribute_noreturn() base_refuse(const char *reason)
 {
 	ereport(FATAL, (errmsg("INITDB_BASE_CREATE: %s", reason)));
 	pg_unreachable();
@@ -69,10 +66,9 @@ base_refuse(const char *reason)
 static bool
 same_inode(const struct stat *a, const struct stat *b)
 {
-	return a->st_dev == b->st_dev && a->st_ino == b->st_ino
-		&& a->st_size == b->st_size && a->st_mode == b->st_mode
-		&& a->st_nlink == b->st_nlink && a->st_uid == b->st_uid
-		&& a->st_mtime == b->st_mtime && a->st_ctime == b->st_ctime;
+	return a->st_dev == b->st_dev && a->st_ino == b->st_ino && a->st_size == b->st_size
+		   && a->st_mode == b->st_mode && a->st_nlink == b->st_nlink && a->st_uid == b->st_uid
+		   && a->st_mtime == b->st_mtime && a->st_ctime == b->st_ctime;
 }
 
 static int
@@ -81,8 +77,8 @@ open_directory(int parent, const char *name)
 	struct stat st;
 	int fd = openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 
-	if (fd < 0 || fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode)
-		|| st.st_uid != geteuid() || (st.st_mode & 0022) != 0)
+	if (fd < 0 || fstat(fd, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid()
+		|| (st.st_mode & 0022) != 0)
 		base_refuse("directory identity or ownership is invalid");
 	return fd;
 }
@@ -103,7 +99,7 @@ static void
 require_empty(int fd)
 {
 	DIR *dir = directory_stream(fd);
-	struct dirent *entry;
+	const struct dirent *entry;
 
 	errno = 0;
 	while ((entry = readdir(dir)) != NULL)
@@ -124,7 +120,7 @@ number(const char *text, char **end)
 	value = strtoul(text, end, 10);
 	if (errno != 0 || value > UINT32_MAX)
 		base_refuse("numeric source name is out of range");
-	return (uint32) value;
+	return (uint32)value;
 }
 
 static void
@@ -134,20 +130,17 @@ file_name(const char *name, BaseFile *file)
 
 	file->relation = number(name, &end);
 	file->fork = MAIN_FORKNUM;
-	if (strncmp(end, "_fsm", 4) == 0)
-	{
+	if (strncmp(end, "_fsm", 4) == 0) {
 		file->fork = FSM_FORKNUM;
 		end += 4;
-	}
-	else if (strncmp(end, "_vm", 3) == 0)
-	{
+	} else if (strncmp(end, "_vm", 3) == 0) {
 		file->fork = VISIBILITYMAP_FORKNUM;
 		end += 3;
 	}
 	if (*end == '.')
 		file->segment = number(end + 1, &end);
 	if (*end != '\0' || strlen(name) >= sizeof(file->name)
-		|| (uint64) file->segment * RELSEG_SIZE >= InvalidBlockNumber)
+		|| (uint64)file->segment * RELSEG_SIZE >= InvalidBlockNumber)
 		base_refuse("unsupported relation source filename");
 	strlcpy(file->name, name, sizeof(file->name));
 }
@@ -170,14 +163,15 @@ static void
 source_read(const BaseFile *file, int fd, BlockNumber index, PGAlignedBlock *page)
 {
 	ssize_t n;
-	BlockNumber block = (uint64) file->segment * RELSEG_SIZE + index;
+	BlockNumber block = (uint64)file->segment * RELSEG_SIZE + index;
 
-	do { n = pread(fd, page->data, BLCKSZ, (off_t) index * BLCKSZ); }
-	while (n < 0 && errno == EINTR);
+	do {
+		n = pread(fd, page->data, BLCKSZ, (off_t)index * BLCKSZ);
+	} while (n < 0 && errno == EINTR);
 	if (n != BLCKSZ || !PageIsVerifiedExtended(page->data, block, 0)
-		|| (((PageHeader) page->data)->pd_flags & (PD_SPACE_METADATA | PD_UNDO_SEG_HEADER)) != 0
-		|| (file->fork != FSM_FORKNUM && (PageIsNew(page->data)
-			|| ((PageHeader) page->data)->pd_block_scn != 0)))
+		|| (((PageHeader)page->data)->pd_flags & (PD_SPACE_METADATA | PD_UNDO_SEG_HEADER)) != 0
+		|| (file->fork != FSM_FORKNUM
+			&& (PageIsNew(page->data) || ((PageHeader)page->data)->pd_block_scn != 0)))
 		base_refuse("original source page is not a complete native initialization page");
 }
 
@@ -187,10 +181,9 @@ source_close(BaseCreate *create, const BaseFile *file, int fd)
 	struct stat held, named;
 
 	if (fstat(fd, &held) != 0
-		|| fstatat(create->dirs[file->directory].source, file->name,
-			&named, AT_SYMLINK_NOFOLLOW) != 0
-		|| !same_inode(&held, &named) || !same_inode(&held, &file->identity)
-		|| close(fd) != 0)
+		|| fstatat(create->dirs[file->directory].source, file->name, &named, AT_SYMLINK_NOFOLLOW)
+			   != 0
+		|| !same_inode(&held, &named) || !same_inode(&held, &file->identity) || close(fd) != 0)
 		base_refuse("original source changed during readback");
 }
 
@@ -199,7 +192,7 @@ collect_directory(BaseCreate *create, int fd, Oid database, const char *name)
 {
 	BaseDirectory *directory;
 	DIR *dir;
-	struct dirent *entry;
+	const struct dirent *entry;
 	uint32 index = create->ndirs++;
 
 	if (index >= BASE_MAX_DIRS)
@@ -210,8 +203,7 @@ collect_directory(BaseCreate *create, int fd, Oid database, const char *name)
 	strlcpy(directory->name, name, sizeof(directory->name));
 	dir = directory_stream(fd);
 	errno = 0;
-	while ((entry = readdir(dir)) != NULL)
-	{
+	while ((entry = readdir(dir)) != NULL) {
 		BaseFile *file;
 		int source;
 		PGAlignedBlock page;
@@ -244,7 +236,9 @@ static int
 file_order(const void *left, const void *right)
 {
 	const BaseFile *a = left, *b = right;
-#define CMP_FIELD(field) if (a->field != b->field) return a->field < b->field ? -1 : 1
+#define CMP_FIELD(field)                                                                           \
+	if (a->field != b->field)                                                                      \
+	return a->field < b->field ? -1 : 1
 	CMP_FIELD(directory);
 	CMP_FIELD(relation);
 	CMP_FIELD(fork);
@@ -262,18 +256,15 @@ relation_end(BaseCreate *create, uint32 start, BlockNumber *blocks)
 
 	if (first->fork != MAIN_FORKNUM || first->segment != 0)
 		base_refuse("relation has no original MAIN file");
-	while (end < create->nfiles)
-	{
+	while (end < create->nfiles) {
 		const BaseFile *file = &create->files[end];
 		if (file->directory != first->directory || file->relation != first->relation)
 			break;
-		if (end == start || file->fork != create->files[end - 1].fork)
-		{
+		if (end == start || file->fork != create->files[end - 1].fork) {
 			if (file->segment != 0)
 				base_refuse("fork has no first segment");
-		}
-		else if (file->segment != create->files[end - 1].segment + 1
-			|| create->files[end - 1].blocks != RELSEG_SIZE)
+		} else if (file->segment != create->files[end - 1].segment + 1
+				   || create->files[end - 1].blocks != RELSEG_SIZE)
 			base_refuse("relation source segment gap or short predecessor");
 		if (file->fork == MAIN_FORKNUM)
 			main_blocks += file->blocks;
@@ -281,20 +272,18 @@ relation_end(BaseCreate *create, uint32 start, BlockNumber *blocks)
 	}
 	if (main_blocks >= InvalidBlockNumber)
 		base_refuse("initialization relation exceeds the block address space");
-	*blocks = (BlockNumber) main_blocks;
+	*blocks = (BlockNumber)main_blocks;
 	return end;
 }
 
 static void
 write_page(int fd, BlockNumber block, Page page)
 {
-	ssize_t n;
 	size_t done = 0;
 
 	PageSetChecksumInplace(page, block);
-	while (done < BLCKSZ)
-	{
-		n = pwrite(fd, page + done, BLCKSZ - done, (off_t) block * BLCKSZ + done);
+	while (done < BLCKSZ) {
+		ssize_t n = pwrite(fd, page + done, BLCKSZ - done, (off_t)block * BLCKSZ + done);
 		if (n < 0 && errno == EINTR)
 			continue;
 		if (n <= 0)
@@ -306,8 +295,7 @@ write_page(int fd, BlockNumber block, Page page)
 static void
 stamp(Page page, XLogRecPtr lsn)
 {
-	if (!PageIsNew(page))
-	{
+	if (!PageIsNew(page)) {
 		PageSetLSNPreserveOrigin(page, lsn);
 		if (!PageSetLSNOrigin(page, 0))
 			base_refuse("invalid founder page origin");
@@ -325,7 +313,7 @@ new_digest(void)
 
 static void
 sync_readback_close(int parent, const char *name, int fd, BlockNumber blocks,
-	pg_cryptohash_ctx *written)
+					pg_cryptohash_ctx *written)
 {
 	pg_cryptohash_ctx *actual = new_digest();
 	uint8 expected_hash[32], actual_hash[32];
@@ -334,22 +322,20 @@ sync_readback_close(int parent, const char *name, int fd, BlockNumber blocks,
 
 	if (fsync(fd) != 0)
 		base_refuse("cannot persist original target file");
-	for (BlockNumber i = 0; i < blocks; ++i)
-	{
+	for (BlockNumber i = 0; i < blocks; ++i) {
 		ssize_t n;
-		do { n = pread(fd, page.data, BLCKSZ, (off_t) i * BLCKSZ); }
-		while (n < 0 && errno == EINTR);
-		if (n != BLCKSZ || pg_cryptohash_update(actual, (uint8 *) page.data, BLCKSZ) < 0)
+		do {
+			n = pread(fd, page.data, BLCKSZ, (off_t)i * BLCKSZ);
+		} while (n < 0 && errno == EINTR);
+		if (n != BLCKSZ || pg_cryptohash_update(actual, (uint8 *)page.data, BLCKSZ) < 0)
 			base_refuse("cannot read persisted original target");
 	}
 	if (pg_cryptohash_final(written, expected_hash, sizeof(expected_hash)) < 0
 		|| pg_cryptohash_final(actual, actual_hash, sizeof(actual_hash)) < 0
-		|| memcmp(expected_hash, actual_hash, sizeof(expected_hash)) != 0
-		|| fstat(fd, &held) != 0 || fstatat(parent, name, &named, AT_SYMLINK_NOFOLLOW) != 0
-		|| !same_inode(&held, &named) || !S_ISREG(held.st_mode)
-		|| held.st_uid != geteuid() || held.st_nlink != 1
-		|| held.st_size != (off_t) blocks * BLCKSZ || (held.st_mode & 0022) != 0
-		|| close(fd) != 0)
+		|| memcmp(expected_hash, actual_hash, sizeof(expected_hash)) != 0 || fstat(fd, &held) != 0
+		|| fstatat(parent, name, &named, AT_SYMLINK_NOFOLLOW) != 0 || !same_inode(&held, &named)
+		|| !S_ISREG(held.st_mode) || held.st_uid != geteuid() || held.st_nlink != 1
+		|| held.st_size != (off_t)blocks * BLCKSZ || (held.st_mode & 0022) != 0 || close(fd) != 0)
 		base_refuse("persisted original target bytes or identity changed");
 	pg_cryptohash_free(actual);
 	pg_cryptohash_free(written);
@@ -361,20 +347,19 @@ sync_directory_close(int parent, const char *name, int fd)
 	struct stat held, named;
 
 	if (fsync(fd) != 0 || fstat(fd, &held) != 0
-		|| fstatat(parent, name, &named, AT_SYMLINK_NOFOLLOW) != 0
-		|| !same_inode(&held, &named) || !S_ISDIR(held.st_mode)
-		|| held.st_uid != geteuid() || (held.st_mode & 0022) != 0 || close(fd) != 0)
+		|| fstatat(parent, name, &named, AT_SYMLINK_NOFOLLOW) != 0 || !same_inode(&held, &named)
+		|| !S_ISDIR(held.st_mode) || held.st_uid != geteuid() || (held.st_mode & 0022) != 0
+		|| close(fd) != 0)
 		base_refuse("persisted original directory identity changed");
 }
 
 static void
-create_space(BaseCreate *create, uint32 start, BlockNumber blocks,
-	ClusterSpaceIdentity *identity)
+create_space(BaseCreate *create, uint32 start, BlockNumber blocks, ClusterSpaceIdentity *identity)
 {
 	BaseFile *first = &create->files[start];
-	ClusterSpaceStructureChange structure = {0};
-	ClusterSpaceReservationChange advance = {0};
-	PGAlignedBlock pages[2] = {0};
+	ClusterSpaceStructureChange structure = { 0 };
+	ClusterSpaceReservationChange advance = { 0 };
+	PGAlignedBlock pages[2] = { 0 };
 	uint8 bytes[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	uint8 apply;
 	char name[40];
@@ -388,7 +373,8 @@ create_space(BaseCreate *create, uint32 start, BlockNumber blocks,
 	identity->key.system_identifier = create->context->system_identifier;
 	identity->key.database_incarnation = create->context->database_incarnation;
 	memcpy(identity->key.storage_uuid, create->context->storage_uuid, 16);
-	identity->key.locator.spcOid = first->directory == 0 ? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID;
+	identity->key.locator.spcOid
+		= first->directory == 0 ? GLOBALTABLESPACE_OID : DEFAULTTABLESPACE_OID;
 	identity->key.locator.dbOid = create->dirs[first->directory].database;
 	identity->key.locator.relNumber = first->relation;
 	identity->sequence = 1;
@@ -401,43 +387,44 @@ create_space(BaseCreate *create, uint32 start, BlockNumber blocks,
 	structure.reservation.result.identity = *identity;
 	structure.reservation.result_token = structure.identity.result_token;
 	if (!cluster_space_structure_wal_encode(&structure, bytes, sizeof(bytes))
-		|| cluster_space_structure_apply(&structure, &identity->key,
-			pages[0].data, pages[1].data, BLCKSZ, &apply) != CLUSTER_SPACE_IDENTITY_APPLY || apply != 3)
+		|| cluster_space_structure_apply(&structure, &identity->key, pages[0].data, pages[1].data,
+										 BLCKSZ, &apply)
+			   != CLUSTER_SPACE_IDENTITY_APPLY
+		|| apply != 3)
 		base_refuse("cannot prepare original SPACE creation");
 	snprintf(name, sizeof(name), "%u_space", first->relation);
 	fd = openat(create->dirs[first->directory].target, name,
-		O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, pg_file_create_mode);
+				O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, pg_file_create_mode);
 	if (fd < 0)
 		base_refuse("SPACE target already exists or cannot be created");
 	XLogBeginInsert();
-	XLogRegisterData((char *) bytes, sizeof(bytes));
+	XLogRegisterData((char *)bytes, sizeof(bytes));
 	lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE);
 	XLogFlush(lsn);
-	for (int i = 0; i < 2; ++i)
-	{
+	for (int i = 0; i < 2; ++i) {
 		stamp(pages[i].data, lsn);
 		write_page(fd, i, pages[i].data);
 	}
-	if (blocks != 0)
-	{
+	if (blocks != 0) {
 		advance.action = CLUSTER_SPACE_RESERVATION_ADVANCE;
 		advance.before = advance.result = structure.reservation.result;
 		advance.before_token = structure.reservation.result_token;
 		advance.result_token = rf_page_mutation_token_next();
 		advance.granted = advance.result.next_block = blocks;
-		if (!cluster_space_reservation_wal_encode(&advance, bytes, CLUSTER_SPACE_RESERVATION_WAL_BYTES)
+		if (!cluster_space_reservation_wal_encode(&advance, bytes,
+												  CLUSTER_SPACE_RESERVATION_WAL_BYTES)
 			|| cluster_space_reservation_apply(&advance, &identity->key, pages[1].data, BLCKSZ)
-				!= CLUSTER_SPACE_IDENTITY_APPLY)
+				   != CLUSTER_SPACE_IDENTITY_APPLY)
 			base_refuse("cannot prepare original SPACE reservation");
 		XLogBeginInsert();
-		XLogRegisterData((char *) bytes, CLUSTER_SPACE_RESERVATION_WAL_BYTES);
+		XLogRegisterData((char *)bytes, CLUSTER_SPACE_RESERVATION_WAL_BYTES);
 		lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION | XLR_SPECIAL_REL_UPDATE);
 		XLogFlush(lsn);
 		stamp(pages[1].data, lsn);
 		write_page(fd, 1, pages[1].data);
 	}
 	written = new_digest();
-	if (pg_cryptohash_update(written, (uint8 *) pages, sizeof(pages)) < 0)
+	if (pg_cryptohash_update(written, (uint8 *)pages, sizeof(pages)) < 0)
 		base_refuse("cannot bind original SPACE bytes");
 	sync_readback_close(create->dirs[first->directory].target, name, fd, 2, written);
 }
@@ -448,27 +435,23 @@ copy_file(BaseCreate *create, const BaseFile *file, const ClusterSpaceIdentity *
 	RelFileLocator locator = identity->key.locator;
 	int source = source_open(create, file);
 	int target = openat(create->dirs[file->directory].target, file->name,
-		O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, pg_file_create_mode);
+						O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, pg_file_create_mode);
 	pg_cryptohash_ctx *written = new_digest();
 
 	if (target < 0)
 		base_refuse("DATA target already exists or cannot be created");
-	for (BlockNumber i = 0; i < file->blocks; ++i)
-	{
-		PGAlignedBlock before = {0}, page;
-		RfPageProducerComponentV1 component = {0};
+	for (BlockNumber i = 0; i < file->blocks; ++i) {
+		PGAlignedBlock before = { 0 }, page;
+		RfPageProducerComponentV1 component = { 0 };
 		RfPageProducerBatchV1 batch;
-		BlockNumber block = (uint64) file->segment * RELSEG_SIZE + i;
+		BlockNumber block = (uint64)file->segment * RELSEG_SIZE + i;
 		XLogRecPtr lsn;
 
 		source_read(file, source, i, &page);
-		if (file->fork == FSM_FORKNUM)
-		{
+		if (file->fork == FSM_FORKNUM) {
 			component.page_class = RF_PAGE_CLASS_REBUILDABLE_FSM;
 			component.before_kind = RF_PAGE_STATE_REBUILDABLE;
-		}
-		else
-		{
+		} else {
 			component.page_class = RF_PAGE_CLASS_ORDINARY;
 			component.before_kind = RF_PAGE_STATE_ABSENT;
 			component.page = before.data;
@@ -489,19 +472,20 @@ copy_file(BaseCreate *create, const BaseFile *file, const ClusterSpaceIdentity *
 		/* Checksum uses the logical block, while this descriptor is one
 		 * relation segment.  Do not confuse the two offsets. */
 		PageSetChecksumInplace(before.data, block);
-		if (pg_cryptohash_update(written, (uint8 *) before.data, BLCKSZ) < 0)
+		if (pg_cryptohash_update(written, (uint8 *)before.data, BLCKSZ) < 0)
 			base_refuse("cannot bind original DATA bytes");
 		{
 			ssize_t n;
-			do { n = pwrite(target, before.data, BLCKSZ, (off_t) i * BLCKSZ); }
-			while (n < 0 && errno == EINTR);
+			do {
+				n = pwrite(target, before.data, BLCKSZ, (off_t)i * BLCKSZ);
+			} while (n < 0 && errno == EINTR);
 			if (n != BLCKSZ)
 				base_refuse("could not write complete original DATA page");
 		}
 	}
 	source_close(create, file, source);
-	sync_readback_close(create->dirs[file->directory].target, file->name, target,
-		file->blocks, written);
+	sync_readback_close(create->dirs[file->directory].target, file->name, target, file->blocks,
+						written);
 }
 
 void
@@ -513,7 +497,7 @@ cluster_initdb_base_create(int exit_code)
 	struct stat data_st, target_st;
 	int source, base, target_base;
 	DIR *dir;
-	struct dirent *entry;
+	const struct dirent *entry;
 
 	if (context == NULL || context->base_fd == 0)
 		return;
@@ -523,8 +507,10 @@ cluster_initdb_base_create(int exit_code)
 		base_refuse("only the successful original founder can create shared DATA");
 	source = open_directory(AT_FDCWD, ".");
 	if (fstat(source, &data_st) != 0 || fstat(context->base_fd, &target_st) != 0
-		|| (uint64) data_st.st_dev != context->data_device || (uint64) data_st.st_ino != context->data_inode
-		|| (uint64) target_st.st_dev != context->base_device || (uint64) target_st.st_ino != context->base_inode)
+		|| (uint64)data_st.st_dev != context->data_device
+		|| (uint64)data_st.st_ino != context->data_inode
+		|| (uint64)target_st.st_dev != context->base_device
+		|| (uint64)target_st.st_ino != context->base_inode)
 		base_refuse("original source or target identity changed");
 	require_empty(context->base_fd);
 	config = cluster_initdb_config_prepare(context);
@@ -538,8 +524,7 @@ cluster_initdb_base_create(int exit_code)
 	base = open_directory(source, "base");
 	dir = directory_stream(base);
 	errno = 0;
-	while ((entry = readdir(dir)) != NULL)
-	{
+	while ((entry = readdir(dir)) != NULL) {
 		char *end;
 		Oid database;
 		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
@@ -555,8 +540,7 @@ cluster_initdb_base_create(int exit_code)
 	if (create->nfiles == 0 || create->ndirs < 2)
 		base_refuse("original database has no catalog base");
 	qsort(create->files, create->nfiles, sizeof(BaseFile), file_order);
-	for (uint32 i = 0; i < create->nfiles;)
-	{
+	for (uint32 i = 0; i < create->nfiles;) {
 		BlockNumber blocks;
 		i = relation_end(create, i, &blocks);
 	}
@@ -568,26 +552,23 @@ cluster_initdb_base_create(int exit_code)
 		base_refuse("cannot exclusively create shared base directories");
 	create->dirs[0].target = open_directory(context->base_fd, "global");
 	target_base = open_directory(context->base_fd, "base");
-	for (uint32 i = 1; i < create->ndirs; ++i)
-	{
+	for (uint32 i = 1; i < create->ndirs; ++i) {
 		if (mkdirat(target_base, create->dirs[i].name, pg_dir_create_mode) != 0)
 			base_refuse("cannot exclusively create shared database directory");
 		create->dirs[i].target = open_directory(target_base, create->dirs[i].name);
 	}
-	for (uint32 i = 0; i < create->nfiles;)
-	{
+	for (uint32 i = 0; i < create->nfiles;) {
 		BlockNumber blocks;
-		ClusterSpaceIdentity identity = {0};
+		ClusterSpaceIdentity identity = { 0 };
 		uint32 end = relation_end(create, i, &blocks);
 		create_space(create, i, blocks, &identity);
 		for (; i < end; ++i)
 			copy_file(create, &create->files[i], &identity);
 	}
 	cluster_initdb_config_create(config, create->dirs[0].target);
-	for (uint32 i = 0; i < create->ndirs; ++i)
-	{
-		sync_directory_close(i == 0 ? context->base_fd : target_base,
-			create->dirs[i].name, create->dirs[i].target);
+	for (uint32 i = 0; i < create->ndirs; ++i) {
+		sync_directory_close(i == 0 ? context->base_fd : target_base, create->dirs[i].name,
+							 create->dirs[i].target);
 		if (close(create->dirs[i].source) != 0)
 			base_refuse("cannot close original source directory");
 	}

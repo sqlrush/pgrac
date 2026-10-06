@@ -56,9 +56,8 @@ cluster_thread_recovery_record_census_v1(XLogReaderState *record, const ClusterW
  * authority must borrow the same held retention set; observed generation
  * claims must name one database. This creates no mutation authority. */
 extern RfPageProofDetailV1 cluster_thread_recovery_fabric_scan_roots_v1(
-	const struct ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count,
-	bool space_active, ClusterThreadRecoveryFabricPlanV1 **out_plan,
-	uint64 *out_record_count);
+	const struct ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count, bool space_active,
+	ClusterThreadRecoveryFabricPlanV1 **out_plan, uint64 *out_record_count);
 
 extern RfPageProofDetailV1 cluster_thread_recovery_fabric_plan_create_v1(
 	const ClusterThreadRecoveryFabricPlanRequestV1 *request,
@@ -67,8 +66,8 @@ extern RfPageProofDetailV1 cluster_thread_recovery_fabric_plan_feed_record_v1(
 	ClusterThreadRecoveryFabricPlanV1 *plan, XLogReaderState *record, uint16 participant_index);
 extern RfPageProofDetailV1
 cluster_thread_recovery_fabric_plan_seal_v1(ClusterThreadRecoveryFabricPlanV1 *plan);
-extern bool cluster_thread_recovery_fabric_bind_database_v1(
-	ClusterThreadRecoveryFabricPlanV1 *plan, uint64 database_incarnation);
+extern bool cluster_thread_recovery_fabric_bind_database_v1(ClusterThreadRecoveryFabricPlanV1 *plan,
+															uint64 database_incarnation);
 extern const RfPageOnlinePlanV1 *
 cluster_thread_recovery_fabric_page_plan_v1(const ClusterThreadRecoveryFabricPlanV1 *plan);
 extern const RfSideOnlinePlanV1 *

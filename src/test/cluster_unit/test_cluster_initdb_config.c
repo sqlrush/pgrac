@@ -32,13 +32,13 @@ static enum Fault fault;
 static jmp_buf refused;
 static bool expect_error;
 static unsigned writes, syncs, reads;
-static int target = -1, parent = -1;
+static int fixture_target = -1, parent = -1;
 static char directory[MAXPGPATH], reason[256], object[72];
 
 static ssize_t
 test_pwrite(int fd, const void *data, size_t size, off_t off)
 {
-	target = fd;
+	fixture_target = fd;
 	writes++;
 	if (fault == WRITE_FAIL) {
 		errno = ENOSPC;
@@ -55,7 +55,7 @@ static ssize_t
 test_pread(int fd, void *data, size_t size, off_t off)
 {
 	reads++;
-	if (fd == target && fault == SHORT_READ)
+	if (fd == fixture_target && fault == SHORT_READ)
 		return 0;
 	if (fault == PARTIAL_IO && reads == 1) {
 		errno = EINTR;
@@ -72,18 +72,17 @@ test_fsync(int fd)
 	syncs++;
 	UT_ASSERT(fstat(fd, &st) == 0);
 	is_staging = S_ISDIR(st.st_mode)
-		&& fstatat(parent, "config_images/.staging", &staging_st, AT_SYMLINK_NOFOLLOW) == 0
-		&& st.st_dev == staging_st.st_dev && st.st_ino == staging_st.st_ino;
-	if ((fault == FILE_SYNC && fd == target)
-		|| (fault == STAGING_SYNC && is_staging)
+				 && fstatat(parent, "config_images/.staging", &staging_st, AT_SYMLINK_NOFOLLOW) == 0
+				 && st.st_dev == staging_st.st_dev && st.st_ino == staging_st.st_ino;
+	if ((fault == FILE_SYNC && fd == fixture_target) || (fault == STAGING_SYNC && is_staging)
 		|| (fault == DIRECTORY_SYNC && S_ISDIR(st.st_mode) && fd != parent && !is_staging)
 		|| (fault == ROOT_SYNC && fd == parent)) {
 		errno = EIO;
 		return -1;
 	}
-	if (fd == target && (fault == CORRUPT || fault == EXTRA_BYTE))
+	if (fd == fixture_target && (fault == CORRUPT || fault == EXTRA_BYTE))
 		UT_ASSERT(pwrite(fd, "X", 1, fault == CORRUPT ? 99 : st.st_size) == 1);
-	if (fd == target && fault == REPLACED) {
+	if (fd == fixture_target && fault == REPLACED) {
 		char path[MAXPGPATH], old[MAXPGPATH];
 		int replacement;
 		snprintf(path, sizeof(path), "%s/config_images/%s", directory, object);
@@ -93,8 +92,8 @@ test_fsync(int fd)
 		UT_ASSERT(replacement >= 0 && close(replacement) == 0);
 	}
 	if (fault == STAGING_REPLACED && is_staging) {
-		UT_ASSERT(renameat(parent, "config_images/.staging", parent,
-						   "config_images/old-staging") == 0);
+		UT_ASSERT(renameat(parent, "config_images/.staging", parent, "config_images/old-staging")
+				  == 0);
 		UT_ASSERT(mkdirat(parent, "config_images/.staging", 0700) == 0);
 	}
 	return fsync(fd);
@@ -104,7 +103,7 @@ static int
 test_close(int fd)
 {
 	int result = close(fd);
-	if (fd == target && fault == CLOSE_FAIL) {
+	if (fd == fixture_target && fault == CLOSE_FAIL) {
 		errno = EIO;
 		return -1;
 	}
@@ -189,15 +188,19 @@ run_case(enum Fault injection)
 	if (child == 0) {
 		ClusterInitdbConfig *config = calloc(1, sizeof(*config));
 		UT_ASSERT(config != NULL);
+		if (config == NULL)
+			_exit(1);
 		config->ref.sha256[0] = 0xaa;
 		config->len = 8203;
 		config->bytes = malloc(config->len);
 		UT_ASSERT(config->bytes != NULL);
+		if (config->bytes == NULL)
+			_exit(1);
 		memset(config->bytes, 'a', config->len);
 		fault = injection;
 		expect_error = !success;
 		writes = reads = syncs = 0;
-		target = -1;
+		fixture_target = -1;
 		if (setjmp(refused) == 0) {
 			cluster_initdb_config_create(config, parent);
 			UT_ASSERT(success && writes > 0 && reads >= 3 && syncs == 4);

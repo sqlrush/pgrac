@@ -1682,7 +1682,7 @@ UT_TEST(full_tuple_undo_copy_does_not_resurrect_terminal_lock)
 	HeapTupleHeader tuple = append_plain_lock_tuple(page, 700);
 	ClusterItlSlotData *slot = slot_at(page, 0);
 	UndoRecordHeader header = { 0 };
-	char payload[128] pg_attribute_aligned(MAXIMUM_ALIGNOF);
+	pg_attribute_aligned(MAXIMUM_ALIGNOF) char payload[128];
 	int leg;
 
 	slot->flags = ITL_FLAG_LOCK_ONLY_COMMITTED;

@@ -382,10 +382,48 @@ UT_TEST(test_inject_armed_count_clamps_at_zero)
 }
 
 
+UT_TEST(test_first_publication_deny_registry_dispatches_only_its_skip)
+{
+	const char *point = "cluster-undo-first-publication-deny";
+	uint64 before = 0;
+	uint64 after = 0;
+	bool found = false;
+
+	cluster_injection_assign_hook("", NULL);
+	for (int i = 0; i < cluster_injection_get_count(); i++) {
+		const char *name;
+		ClusterInjectFaultType type;
+		uint64 hits;
+		UT_ASSERT(cluster_injection_get_state_at(i, &name, &type, &hits));
+		if (strcmp(name, point) == 0) {
+			before = hits;
+			found = true;
+		}
+	}
+	UT_ASSERT(found);
+	cluster_injection_assign_hook("cluster-undo-first-publication-deny:skip", NULL);
+	UT_ASSERT(cluster_injection_is_armed(point));
+	cluster_injection_run(point);
+	UT_ASSERT(!cluster_injection_should_skip("cluster-undo-authority-block0-prove"));
+	UT_ASSERT(cluster_injection_should_skip(point));
+	UT_ASSERT(!cluster_injection_should_skip(point));
+	for (int i = 0; i < cluster_injection_get_count(); i++) {
+		const char *name;
+		ClusterInjectFaultType type;
+		uint64 hits;
+		UT_ASSERT(cluster_injection_get_state_at(i, &name, &type, &hits));
+		if (strcmp(name, point) == 0)
+			after = hits;
+	}
+	UT_ASSERT_EQ(after, before + 1);
+	cluster_injection_assign_hook("cluster-undo-first-publication-deny:none", NULL);
+	UT_ASSERT(!cluster_injection_is_armed(point));
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_inject_count_compile_constant);
 	UT_RUN(test_inject_arm_unknown_is_safe);
 	UT_RUN(test_inject_initial_disarmed);
@@ -398,6 +436,7 @@ main(void)
 	UT_RUN(test_inject_get_state_srf_linkable);
 	UT_RUN(test_inject_run_disarmed_repeat_no_dispatch);
 	UT_RUN(test_inject_armed_count_clamps_at_zero);
+	UT_RUN(test_first_publication_deny_registry_dispatches_only_its_skip);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -1,3 +1,4 @@
+# Author: SqlRush <sqlrush@gmail.com>
 # Harness unit only: in-memory observations, no DATA, server, or acceptance.
 use strict;
 use warnings;

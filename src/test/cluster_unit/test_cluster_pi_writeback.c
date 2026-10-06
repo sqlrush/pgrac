@@ -112,23 +112,27 @@ rf_side_online_plan_contribution_owners_v1(const RfSideOnlinePlanV1 *plan, uint3
  * scheduling fixture must never fabricate typed SPACE disposal authority. */
 bool
 rf_side_online_plan_space_covers_v1(const RfSideOnlinePlanV1 *plan,
-	const ClusterSpaceIdentityKey *key, BlockNumber block, uint32 ancestor_operation,
-	uint32 completed_operation, bool *terminal)
+									const ClusterSpaceIdentityKey *key, BlockNumber block,
+									uint32 ancestor_operation, uint32 completed_operation,
+									bool *terminal)
 {
 	return false;
 }
 
 bool
 rf_side_online_plan_space_terminal_v1(const RfSideOnlinePlanV1 *plan,
-	const ClusterSpaceIdentityKey *key, BlockNumber block, RfSideSpaceTerminalV1 *out)
+									  const ClusterSpaceIdentityKey *key, BlockNumber block,
+									  RfSideSpaceTerminalV1 *out)
 {
 	return false;
 }
 
 bool
 rf_side_online_plan_space_incarnation_end_v1(const RfSideOnlinePlanV1 *plan,
-	const ClusterSpaceIdentityKey *key, const uint8 incarnation[16], uint32 completed_operation,
-	RfSideSpaceIncarnationEndV1 *out)
+											 const ClusterSpaceIdentityKey *key,
+											 const uint8 incarnation[16],
+											 uint32 completed_operation,
+											 RfSideSpaceIncarnationEndV1 *out)
 {
 	/* Structural ancestry executes against the real SIDE planner in page_data.
 	 * This transport fixture cannot fabricate a structural completion. */
@@ -411,7 +415,7 @@ cluster_ic_local_capability_word(void)
 }
 bool
 cluster_sf_peer_capability_word_sample(int32 peer, uint32 required, uint32 *word,
-	uint32 *generation)
+									   uint32 *generation)
 {
 	UT_ASSERT(peer >= 0 && peer < 3 && peer != cluster_node_id);
 	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2);
@@ -621,11 +625,10 @@ cluster_wal_inputs_recovered_prefix_v1(ClusterWalInputsV1 *inputs,
 
 bool
 cluster_wal_inputs_recovered_owner_v1(ClusterWalInputsV1 *inputs, int32 node,
-									ClusterWalSourceRef *out)
+									  ClusterWalSourceRef *out)
 {
 	XLogRecPtr end;
-	if (node < 0 || node >= 3 || !wb_inputs_pinned[cluster_node_id]
-		|| !wb_inputs[node].current
+	if (node < 0 || node >= 3 || !wb_inputs_pinned[cluster_node_id] || !wb_inputs[node].current
 		|| wb_inputs[node].checkpoint.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
 		|| !cluster_wal_inputs_recovered_prefix_v1(inputs, &wb_inputs[node].source, &end))
 		return false;
@@ -1648,7 +1651,7 @@ UT_TEST(writeback_plan_rejection_is_visible_without_discharging_pi)
 		UT_ASSERT(cluster_pi_writeback_rejections_v1(&observed));
 		UT_ASSERT_EQ(observed.attempts[CLUSTER_PI_WRITEBACK_CONTRIBUTION_PLAN], 2);
 		UT_ASSERT_EQ(observed.last_plan_result, waiting ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
-			: CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+														: CLUSTER_CONTROL_ROOT_RANGE_INVALID);
 		UT_ASSERT_EQ(observed.last_plan_detail, RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
 		cluster_pi_writeback_checkpointer_release_v1();
 		cluster_page_data_receipt_free_v1(&data);

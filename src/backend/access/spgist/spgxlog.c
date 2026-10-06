@@ -7,6 +7,8 @@
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * PGRAC MODIFICATIONS: honor qualified redo buffer initialization results.
+ *
  * IDENTIFICATION
  *			 src/backend/access/spgist/spgxlog.c
  *
@@ -177,7 +179,7 @@ spgRedoMoveLeafs(XLogReaderState *record)
 	spgxlogMoveLeafs *xldata = (spgxlogMoveLeafs *) ptr;
 	SpGistState state;
 	OffsetNumber *toDelete;
-	OffsetNumber *toInsert;
+	const OffsetNumber *toInsert;
 	int			nInsert;
 	Buffer		buffer;
 	Page		page;
@@ -287,13 +289,12 @@ spgRedoAddNode(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
 	char	   *ptr = XLogRecGetData(record);
-	spgxlogAddNode *xldata = (spgxlogAddNode *) ptr;
+	const spgxlogAddNode *xldata = (spgxlogAddNode *) ptr;
 	char	   *innerTuple;
 	SpGistInnerTupleData innerTupleHdr;
 	SpGistState state;
 	Buffer		buffer;
 	Page		page;
-	XLogRedoAction action;
 
 	ptr += sizeof(spgxlogAddNode);
 	innerTuple = ptr;
@@ -327,6 +328,7 @@ spgRedoAddNode(XLogReaderState *record)
 	{
 		BlockNumber blkno;
 		BlockNumber blknoNew;
+		XLogRedoAction action;
 
 		XLogRecGetBlockTag(record, 0, NULL, NULL, &blkno);
 		XLogRecGetBlockTag(record, 1, NULL, NULL, &blknoNew);
@@ -455,14 +457,13 @@ spgRedoSplitTuple(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
 	char	   *ptr = XLogRecGetData(record);
-	spgxlogSplitTuple *xldata = (spgxlogSplitTuple *) ptr;
+	const spgxlogSplitTuple *xldata = (spgxlogSplitTuple *) ptr;
 	char	   *prefixTuple;
 	SpGistInnerTupleData prefixTupleHdr;
 	char	   *postfixTuple;
 	SpGistInnerTupleData postfixTupleHdr;
 	Buffer		buffer;
 	Page		page;
-	XLogRedoAction action;
 
 	ptr += sizeof(spgxlogSplitTuple);
 	prefixTuple = ptr;
@@ -482,6 +483,8 @@ spgRedoSplitTuple(XLogReaderState *record)
 	/* insert postfix tuple first to avoid dangling link */
 	if (!xldata->postfixBlkSame)
 	{
+		XLogRedoAction action;
+
 		if (xldata->newPage)
 		{
 			action = XLogReadBufferForRedoExtended(record, 1, RBM_ZERO_AND_LOCK, false, &buffer);
@@ -539,7 +542,7 @@ spgRedoPickSplit(XLogReaderState *record)
 	SpGistInnerTupleData innerTupleHdr;
 	SpGistState state;
 	OffsetNumber *toDelete;
-	OffsetNumber *toInsert;
+	const OffsetNumber *toInsert;
 	uint8	   *leafPageSelect;
 	Buffer		srcBuffer;
 	Buffer		destBuffer;

@@ -3969,13 +3969,13 @@ cluster_record_apply_class(XLogReaderState *r)
 
 		if (info == XLOG_SMGR_CREATE)
 		{
-			xl_smgr_create *xlrec = (xl_smgr_create *) XLogRecGetData(r);
+			const xl_smgr_create *xlrec = (const xl_smgr_create *) XLogRecGetData(r);
 
 			first_shared = (cluster_smgr_which_for(xlrec->rlocator, InvalidBackendId) == 1);
 		}
 		else if (info == XLOG_SMGR_TRUNCATE)
 		{
-			xl_smgr_truncate *xlrec = (xl_smgr_truncate *) XLogRecGetData(r);
+			const xl_smgr_truncate *xlrec = (const xl_smgr_truncate *) XLogRecGetData(r);
 
 			first_shared = (cluster_smgr_which_for(xlrec->rlocator, InvalidBackendId) == 1);
 		}

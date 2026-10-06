@@ -748,7 +748,8 @@ UT_TEST(test_native_commit_and_real_smgr_defer_io_to_original_work)
 					UT_ASSERT(stat(work_paths[f], &st) == 0);
 					UT_ASSERT_EQ(st.st_size, BLCKSZ);
 				}
-				UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason), CLUSTER_NORMAL_STOP_INVALID);
+				UT_ASSERT_EQ(cluster_ko_shared_normal_stop_poll_v2(&reason),
+							 CLUSTER_NORMAL_STOP_INVALID);
 				UT_ASSERT_EQ(native_allocated, 1);
 				native_fixture_shared_memory_end();
 				continue;
@@ -766,8 +767,8 @@ UT_TEST(test_native_commit_and_real_smgr_defer_io_to_original_work)
 				 * have discarded. Native continuation must retain recovery. */
 				for (unsigned retry = 0; retry < 3; retry++) {
 					assert_work_not_selected();
-					UT_ASSERT(memcmp(&retained, &storage.contexts[work_slot],
-									 sizeof(retained)) == 0);
+					UT_ASSERT(memcmp(&retained, &storage.contexts[work_slot], sizeof(retained))
+							  == 0);
 					UT_ASSERT(storage.contexts[work_slot].structure_drop_pending);
 					UT_ASSERT_EQ(closes, MAX_FORKNUM + 2);
 					UT_ASSERT_EQ(external_fds, 0);

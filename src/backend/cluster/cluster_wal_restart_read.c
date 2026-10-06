@@ -100,8 +100,8 @@ done:
 
 /* No allocator, ereport or other error-throwing backend call with FDs open. */
 static ClusterControlRootResult
-restart_open_selected(const char *wal_root, const ClusterWalSourceRef *input,
-					  XLogSegNo segno, int segsize, const uint8 *claim, int *fd_out)
+restart_open_selected(const char *wal_root, const ClusterWalSourceRef *input, XLogSegNo segno,
+					  int segsize, const uint8 *claim, int *fd_out)
 {
 	const int dirflags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
 	int dirs[3] = { -1, -1, -1 }, fd = -1;

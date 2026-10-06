@@ -60,8 +60,6 @@ storage_backend_require_eligibility(void)
 void
 cluster_storage_quorum_check_sql(void)
 {
-	int period_ms;
-
 	if (!cluster_shared_config)
 		return;
 	storage_backend_require_eligibility();
@@ -70,7 +68,7 @@ cluster_storage_quorum_check_sql(void)
 	if (storage_backend_timeout == MAX_TIMEOUTS)
 		storage_backend_timeout = RegisterTimeout(USER_TIMEOUT, storage_backend_timeout_handler);
 	if (!get_timeout_active(storage_backend_timeout)) {
-		period_ms = Max(1, Min(cluster_quorum_poll_interval_ms, 1000));
+		int period_ms = Max(1, Min(cluster_quorum_poll_interval_ms, 1000));
 		enable_timeout_every(storage_backend_timeout,
 							 TimestampTzPlusMilliseconds(GetCurrentTimestamp(), period_ms),
 							 period_ms);

@@ -165,8 +165,7 @@ static PgracInitdbWalContext initdb_wal_context;
  * any normal XID.  Post-bootstrap SQL necessarily advances it.  A valid pipe
  * must not turn a completed database into initdb or change its WAL thread. */
 static bool
-initdb_bootstrap_wal_matches(const ControlFileData *control,
-							 const PgracInitdbWalContext *context)
+initdb_bootstrap_wal_matches(const ControlFileData *control, const PgracInitdbWalContext *context)
 {
 	XLogLongPageHeaderData header;
 	const TimeLineID bootstrap_tli = 1; /* BootStrapXLOG's original timeline */
@@ -177,7 +176,7 @@ initdb_bootstrap_wal_matches(const ControlFileData *control,
 	bool valid;
 
 	if (!IsValidWalSegSize(control->xlog_seg_size)
-		|| control->checkPoint < (XLogRecPtr) control->xlog_seg_size + SizeOfXLogLongPHD
+		|| control->checkPoint < (XLogRecPtr)control->xlog_seg_size + SizeOfXLogLongPHD
 		|| control->checkPointCopy.redo != control->checkPoint
 		|| U64FromFullTransactionId(control->checkPointCopy.nextXid) != FirstNormalTransactionId
 		|| control->checkPointCopy.ThisTimeLineID != bootstrap_tli)
@@ -186,17 +185,19 @@ initdb_bootstrap_wal_matches(const ControlFileData *control,
 	fd = BasicOpenFile(path, O_RDONLY | PG_BINARY | O_NOFOLLOW);
 	if (fd < 0)
 		return false;
-	do { n = read(fd, &header, sizeof(header)); } while (n < 0 && errno == EINTR);
-	valid = n == sizeof(header) && fstat(fd, &st) == 0
-		&& S_ISREG(st.st_mode) && st.st_nlink == 1 && st.st_uid == geteuid()
-		&& st.st_size == control->xlog_seg_size
-		&& header.std.xlp_magic == XLOG_PAGE_MAGIC && header.std.xlp_info == XLP_LONG_HEADER
-		&& header.std.xlp_tli == bootstrap_tli
-		&& header.std.xlp_pageaddr == control->xlog_seg_size && header.std.xlp_rem_len == 0
-		&& header.std.xlp_thread_id == context->thread_id
-		&& header.std.xlp_cluster_flags == XLP_CLUSTER_FLAGS_RESERVED
-		&& header.xlp_sysid == context->system_identifier
-		&& header.xlp_seg_size == control->xlog_seg_size && header.xlp_xlog_blcksz == XLOG_BLCKSZ;
+	do {
+		n = read(fd, &header, sizeof(header));
+	} while (n < 0 && errno == EINTR);
+	valid = n == sizeof(header) && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 1
+			&& st.st_uid == geteuid() && st.st_size == control->xlog_seg_size
+			&& header.std.xlp_magic == XLOG_PAGE_MAGIC && header.std.xlp_info == XLP_LONG_HEADER
+			&& header.std.xlp_tli == bootstrap_tli
+			&& header.std.xlp_pageaddr == control->xlog_seg_size && header.std.xlp_rem_len == 0
+			&& header.std.xlp_thread_id == context->thread_id
+			&& header.std.xlp_cluster_flags == XLP_CLUSTER_FLAGS_RESERVED
+			&& header.xlp_sysid == context->system_identifier
+			&& header.xlp_seg_size == control->xlog_seg_size
+			&& header.xlp_xlog_blcksz == XLOG_BLCKSZ;
 	if (close(fd) != 0)
 		valid = false;
 	return valid;
@@ -222,45 +223,42 @@ cluster_wal_thread_initdb_accept(bool bootstrap)
 		return;
 	errno = 0;
 	fd = strtol(value, &end, 10);
-	if (IsUnderPostmaster || initdb_wal_context.thread_id != 0
-		|| value[0] < '0' || value[0] > '9' || *end != '\0' || errno != 0
-		|| fd < 3 || fd > INT_MAX || fstat((int) fd, &pipe_st) != 0
+	if (IsUnderPostmaster || initdb_wal_context.thread_id != 0 || value[0] < '0' || value[0] > '9'
+		|| *end != '\0' || errno != 0 || fd < 3 || fd > INT_MAX || fstat((int)fd, &pipe_st) != 0
 		|| !S_ISFIFO(pipe_st.st_mode) || pipe_st.st_uid != geteuid())
 		ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: invalid original-creator pipe")));
 	/* Never wait for an untrusted or unfinished context producer. */
-	if (fcntl((int) fd, F_SETFL, O_NONBLOCK) < 0)
+	if (fcntl((int)fd, F_SETFL, O_NONBLOCK) < 0)
 		ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: cannot read creator pipe: %m")));
-	while (got < sizeof(context))
-	{
-		n = read((int) fd, (char *) &context + got, sizeof(context) - got);
+	while (got < sizeof(context)) {
+		n = read((int)fd, (char *)&context + got, sizeof(context) - got);
 		if (n < 0 && errno == EINTR)
 			continue;
 		if (n <= 0)
 			ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: incomplete creator pipe")));
 		got += n;
 	}
-	do { n = read((int) fd, &extra, 1); } while (n < 0 && errno == EINTR);
-	if (n != 0 || close((int) fd) != 0 || unsetenv(PGRAC_INITDB_WAL_CONTEXT_ENV) != 0)
+	do {
+		n = read((int)fd, &extra, 1);
+	} while (n < 0 && errno == EINTR);
+	if (n != 0 || close((int)fd) != 0 || unsetenv(PGRAC_INITDB_WAL_CONTEXT_ENV) != 0)
 		ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: creator pipe is not exactly closed")));
-	if (context.magic != PGRAC_INITDB_WAL_CONTEXT_MAGIC
-		|| context.thread_id == 0 || context.thread_id > CLUSTER_WAL_THREAD_MAX
-		|| context.phase != (bootstrap ? PGRAC_INITDB_WAL_BOOTSTRAP : PGRAC_INITDB_WAL_POSTBOOTSTRAP)
-		|| stat(".", &data_st) != 0 || stat(XLOGDIR, &wal_st) != 0
-		|| !S_ISDIR(data_st.st_mode) || !S_ISDIR(wal_st.st_mode)
-		|| data_st.st_uid != geteuid() || wal_st.st_uid != geteuid()
+	if (context.magic != PGRAC_INITDB_WAL_CONTEXT_MAGIC || context.thread_id == 0
+		|| context.thread_id > CLUSTER_WAL_THREAD_MAX
+		|| context.phase
+			   != (bootstrap ? PGRAC_INITDB_WAL_BOOTSTRAP : PGRAC_INITDB_WAL_POSTBOOTSTRAP)
+		|| stat(".", &data_st) != 0 || stat(XLOGDIR, &wal_st) != 0 || !S_ISDIR(data_st.st_mode)
+		|| !S_ISDIR(wal_st.st_mode) || data_st.st_uid != geteuid() || wal_st.st_uid != geteuid()
 		|| (data_st.st_mode & 0022) != 0 || (wal_st.st_mode & 0022) != 0
-		|| (uint64) data_st.st_dev != context.data_device
-		|| (uint64) data_st.st_ino != context.data_inode
-		|| (uint64) wal_st.st_dev != context.wal_device
-		|| (uint64) wal_st.st_ino != context.wal_inode)
+		|| (uint64)data_st.st_dev != context.data_device
+		|| (uint64)data_st.st_ino != context.data_inode
+		|| (uint64)wal_st.st_dev != context.wal_device
+		|| (uint64)wal_st.st_ino != context.wal_inode)
 		ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: creator directory or phase changed")));
-	if (bootstrap)
-	{
+	if (bootstrap) {
 		if (lstat(XLOG_CONTROL_FILE, &control_st) == 0 || errno != ENOENT)
 			ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: bootstrap control already exists")));
-	}
-	else
-	{
+	} else {
 		ControlFileData *control;
 		bool crc_ok;
 		bool valid;
@@ -270,12 +268,12 @@ cluster_wal_thread_initdb_accept(bool bootstrap)
 			ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: invalid bootstrap control file")));
 		control = get_controlfile(DataDir, &crc_ok);
 		valid = crc_ok && context.system_identifier != 0
-			&& control->system_identifier == context.system_identifier
-			&& control->pg_control_version == PG_CONTROL_VERSION
-			&& control->catalog_version_no == CATALOG_VERSION_NO
-			&& control->state == DB_SHUTDOWNED
-			&& control->data_checksum_version == PG_DATA_CHECKSUM_VERSION
-			&& initdb_bootstrap_wal_matches(control, &context);
+				&& control->system_identifier == context.system_identifier
+				&& control->pg_control_version == PG_CONTROL_VERSION
+				&& control->catalog_version_no == CATALOG_VERSION_NO
+				&& control->state == DB_SHUTDOWNED
+				&& control->data_checksum_version == PG_DATA_CHECKSUM_VERSION
+				&& initdb_bootstrap_wal_matches(control, &context);
 		pfree(control);
 		if (!valid)
 			ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: bootstrap control identity changed")));
@@ -287,19 +285,20 @@ cluster_wal_thread_initdb_accept(bool bootstrap)
 			any |= context.storage_uuid[i];
 		if (context.reserved != 0
 			|| (context.base_fd == 0
-				? (context.database_incarnation != 0 || context.base_device != 0
-					|| context.base_inode != 0 || any != 0)
-				: (bootstrap || context.thread_id != 1 || context.base_fd < 3
-					|| context.database_incarnation == 0 || any == 0
-					|| fstat(context.base_fd, &base_st) != 0 || !S_ISDIR(base_st.st_mode)
-					|| base_st.st_uid != geteuid() || (base_st.st_mode & 0022) != 0
-					|| (uint64) base_st.st_dev != context.base_device
-					|| (uint64) base_st.st_ino != context.base_inode
-					|| (base_st.st_dev == data_st.st_dev && base_st.st_ino == data_st.st_ino)
-					|| (base_st.st_dev == wal_st.st_dev && base_st.st_ino == wal_st.st_ino))))
+					? (context.database_incarnation != 0 || context.base_device != 0
+					   || context.base_inode != 0 || any != 0)
+					: (bootstrap || context.thread_id != 1 || context.base_fd < 3
+					   || context.database_incarnation == 0 || any == 0
+					   || fstat(context.base_fd, &base_st) != 0 || !S_ISDIR(base_st.st_mode)
+					   || base_st.st_uid != geteuid() || (base_st.st_mode & 0022) != 0
+					   || (uint64)base_st.st_dev != context.base_device
+					   || (uint64)base_st.st_ino != context.base_inode
+					   || (base_st.st_dev == data_st.st_dev && base_st.st_ino == data_st.st_ino)
+					   || (base_st.st_dev == wal_st.st_dev && base_st.st_ino == wal_st.st_ino))))
 			ereport(FATAL, (errmsg("INITDB_BASE_CONTEXT: invalid original founder target")));
 		if (context.base_fd != 0 && fcntl(context.base_fd, F_SETFD, FD_CLOEXEC) != 0)
-			ereport(FATAL, (errmsg("INITDB_BASE_CONTEXT: cannot isolate original target descriptor")));
+			ereport(FATAL,
+					(errmsg("INITDB_BASE_CONTEXT: cannot isolate original target descriptor")));
 	}
 	{
 		static const PgracInitdbConfigContext empty = { 0 };
@@ -529,10 +528,10 @@ cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
 	if (installed.claim.identity.origin_node_id != cluster_node_id
 		|| installed.claim.identity.origin_thread_id != cluster_wal_thread_id()
 		|| !cluster_wal_writer_startup_matches(&installed.claim.identity, expected->operation_uuid,
-												expected->first_segment_lsn))
+											   expected->first_segment_lsn))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	initialized_epoch = expected->input_kind == CLUSTER_WAL_STARTUP_INITIALIZED
-							? expected->formation_epoch : 0;
+	initialized_epoch
+		= expected->input_kind == CLUSTER_WAL_STARTUP_INITIALIZED ? expected->formation_epoch : 0;
 	clean_epoch = expected->input_kind == CLUSTER_WAL_STARTUP_CLEAN ? expected->formation_epoch : 0;
 	if (!pg_atomic_compare_exchange_u32(&cluster_wal_thread_shmem->writer_ref_state, &state, 1)) {
 		if (state != 2)

@@ -243,8 +243,8 @@ ges_readiness_allows_protocol_request(uint32 opcode, const ClusterResId *resid, 
 	if (!cluster_recovery_authority_is_current())
 		return false;
 	if (opcode == GES_REQ_OPCODE_REQUEST
-		|| (cluster_shared_config && opcode == GES_REQ_OPCODE_REQUEST_NOWAIT
-			&& resid != NULL && resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE && mode == ShareLock))
+		|| (cluster_shared_config && opcode == GES_REQ_OPCODE_REQUEST_NOWAIT && resid != NULL
+			&& resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE && mode == ShareLock))
 		return cluster_recovery_authority_resid_mode_allowed(resid, mode);
 	if (opcode == GES_REQ_OPCODE_RELEASE)
 		return ges_recovery_release_resid_allowed(resid);

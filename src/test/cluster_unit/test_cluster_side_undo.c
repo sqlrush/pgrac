@@ -646,9 +646,9 @@ UT_TEST(test_overlapping_undo_record_and_slot_ranges_refuse)
 {
 	FakeRecord fr;
 	ClusterUndoDecoded out;
-	xl_undo_block_write single = {0};
-	xl_undo_block_write_multi multi = {0};
-	char payload[sizeof(multi) + UNDO_BLOCK_HDR_PREFIX_LEN + 32 + 16] = {0};
+	xl_undo_block_write single = { 0 };
+	xl_undo_block_write_multi multi = { 0 };
+	char payload[sizeof(multi) + UNDO_BLOCK_HDR_PREFIX_LEN + 32 + 16] = { 0 };
 	XLogReaderState *record;
 
 	single.instance = multi.instance = 1;
@@ -664,8 +664,9 @@ UT_TEST(test_overlapping_undo_record_and_slot_ranges_refuse)
 							 + sizeof(UndoSlotDirEntry));
 	UT_ASSERT(!cluster_undo_decode(record, &out));
 	memcpy(payload, &multi, sizeof(multi));
-	record = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE_MULTI, payload,
-						 sizeof(multi) + UNDO_BLOCK_HDR_PREFIX_LEN + multi.rec_len + multi.slot_len);
+	record
+		= make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE_MULTI, payload,
+					  sizeof(multi) + UNDO_BLOCK_HDR_PREFIX_LEN + multi.rec_len + multi.slot_len);
 	UT_ASSERT(!cluster_undo_decode(record, &out));
 }
 

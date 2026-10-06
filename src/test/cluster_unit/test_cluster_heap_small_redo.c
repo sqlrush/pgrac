@@ -494,13 +494,15 @@ UT_TEST(test_bad_shapes_do_not_modify_output)
 			reset(RM_HEAP_ID, XLOG_HEAP_LOCK, 3);
 			((xl_heap_itl_delta_v3 *)(main_data.data + SizeOfHeapLock
 									  + offsetof(xl_heap_itl_delta_block, deltas)))
-				->undo_segment_head = uba_encode(1, 3, 4, 65535);
+				->undo_segment_head
+				= uba_encode(1, 3, 4, 65535);
 			break;
 		case 13:
 			reset(RM_HEAP_ID, XLOG_HEAP_LOCK, 3);
 			((xl_heap_itl_delta_v3 *)(main_data.data + SizeOfHeapLock
 									  + offsetof(xl_heap_itl_delta_block, deltas)))
-				->slot_idx = 8;
+				->slot_idx
+				= 8;
 			break;
 		case 14:
 			reset(RM_HEAP_ID, XLOG_HEAP_LOCK, 3);
@@ -637,7 +639,8 @@ UT_TEST(test_delete_variants_match_native)
 					rec->flags |= XLH_DELETE_ITL_DELTA;
 					((xl_heap_itl_delta *)(main_data.data + SizeOfHeapDelete
 										   + offsetof(xl_heap_itl_delta_block, deltas)))
-						->flags_after = ITL_FLAG_ACTIVE;
+						->flags_after
+						= ITL_FLAG_ACTIVE;
 				}
 				PageSetAllVisible(original.data);
 				native_page = detached_page = original;
@@ -682,7 +685,8 @@ UT_TEST(test_insert_delete_bad_shapes_do_not_modify_output)
 		case 4:
 			((xl_heap_itl_delta_v3 *)(main_data.data + SizeOfHeapInsert
 									  + offsetof(xl_heap_itl_delta_block, deltas)))
-				->slot_idx = 8;
+				->slot_idx
+				= 8;
 			break;
 		case 5:
 			((xl_heap_itl_delta_block *)(main_data.data + SizeOfHeapInsert))->format_version = 4;
@@ -957,7 +961,8 @@ UT_TEST(test_update_bad_shapes_do_not_modify_output)
 		case 14:
 			((xl_heap_itl_delta_v3 *)(main_data.data + SizeOfHeapUpdate
 									  + offsetof(xl_heap_itl_delta_block, deltas)))
-				->slot_idx = 8;
+				->slot_idx
+				= 8;
 			break;
 		case 15:
 			decoded->header.xl_info |= XLOG_HEAP_INIT_PAGE;

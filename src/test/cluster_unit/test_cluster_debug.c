@@ -49,7 +49,7 @@
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_terminal_ref_census.h"
-#include "cluster/cluster_grd.h"		  /* ClusterGrdRecoveryCounters */
+#include "cluster/cluster_grd.h" /* ClusterGrdRecoveryCounters */
 #include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */

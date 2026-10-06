@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# Author: SqlRush <sqlrush@gmail.com>
 # Requires A S11/S12/S16 plus certified terminal-I/O failure and two real
 # recoverers on nodes 0/1. Named cuts are adapter operations, not fake DONE.
 # RECOVERY_COMPLETE must exclude every executor and deny stale DATA writes.

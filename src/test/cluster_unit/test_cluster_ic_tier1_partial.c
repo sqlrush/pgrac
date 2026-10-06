@@ -813,8 +813,7 @@ UT_TEST(test_unconnected_declared_peer_keeps_frame_with_caller)
 	static const char frame[] = "caller-owned before connect";
 	ClusterICPlane plane;
 
-	strlcpy(ut_peer_info.data_addr, ut_peer_info.interconnect_addr,
-			sizeof(ut_peer_info.data_addr));
+	strlcpy(ut_peer_info.data_addr, ut_peer_info.interconnect_addr, sizeof(ut_peer_info.data_addr));
 	for (plane = CLUSTER_IC_PLANE_CONTROL; plane <= CLUSTER_IC_PLANE_DATA; plane++) {
 		uint64 refused;
 		int state;
@@ -1606,8 +1605,10 @@ UT_TEST(test_terminal_sessions_bind_control_and_all_data_channels)
 		pg_atomic_write_u32(&data[ch]->close_requested, 0);
 		pg_atomic_write_u64(&data[ch]->resource_x_stream_generation, 41 + ch);
 	}
-	cap_generation = (uint32)pg_atomic_read_u64(&Tier1Shmem->peers[UT_PEER_ID].resource_x_stream_generation);
-	UT_ASSERT(cluster_ic_tier1_terminal_peer_sessions(UT_PEER_ID, ut_epoch, cap_generation, 2, &got));
+	cap_generation
+		= (uint32)pg_atomic_read_u64(&Tier1Shmem->peers[UT_PEER_ID].resource_x_stream_generation);
+	UT_ASSERT(
+		cluster_ic_tier1_terminal_peer_sessions(UT_PEER_ID, ut_epoch, cap_generation, 2, &got));
 	UT_ASSERT(got.control_stream_generation != 0);
 	UT_ASSERT_EQ(got.data_channels, 2);
 	UT_ASSERT_EQ(got.data_stream_generation[0], 41);
@@ -1620,34 +1621,59 @@ UT_TEST(test_terminal_sessions_bind_control_and_all_data_channels)
 		pg_atomic_write_u32(&data[1]->close_requested, 0);
 		cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 		switch (fault) {
-		case 0: data[1]->state = CLUSTER_IC_PEER_CONNECTING; break;
-		case 1: data[1]->conn_epoch++; break;
-		case 2: serial = 0; break;
-		case 3: serial = UINT64_MAX; break;
-		case 4: pg_atomic_write_u32(&data[1]->close_requested, 1); break;
-		case 5: cluster_interconnect_tier = CLUSTER_IC_TIER_2; break;
-		case 6: cap_generation++; break;
-		case 7: pg_atomic_write_u32(&Tier1Shmem->peers[UT_PEER_ID].close_requested, 1); break;
+		case 0:
+			data[1]->state = CLUSTER_IC_PEER_CONNECTING;
+			break;
+		case 1:
+			data[1]->conn_epoch++;
+			break;
+		case 2:
+			serial = 0;
+			break;
+		case 3:
+			serial = UINT64_MAX;
+			break;
+		case 4:
+			pg_atomic_write_u32(&data[1]->close_requested, 1);
+			break;
+		case 5:
+			cluster_interconnect_tier = CLUSTER_IC_TIER_2;
+			break;
+		case 6:
+			cap_generation++;
+			break;
+		case 7:
+			pg_atomic_write_u32(&Tier1Shmem->peers[UT_PEER_ID].close_requested, 1);
+			break;
 		}
 		pg_atomic_write_u64(&data[1]->resource_x_stream_generation, serial);
 		memset(&got, 0xa5, sizeof(got));
-		UT_ASSERT(!cluster_ic_tier1_terminal_peer_sessions(UT_PEER_ID, ut_epoch, cap_generation, 2, &got));
+		UT_ASSERT(!cluster_ic_tier1_terminal_peer_sessions(UT_PEER_ID, ut_epoch, cap_generation, 2,
+														   &got));
 		UT_ASSERT(memcmp(&got, &empty, sizeof(got)) == 0);
-		cap_generation = (uint32)pg_atomic_read_u64(&Tier1Shmem->peers[UT_PEER_ID].resource_x_stream_generation);
+		cap_generation = (uint32)pg_atomic_read_u64(
+			&Tier1Shmem->peers[UT_PEER_ID].resource_x_stream_generation);
 		pg_atomic_write_u32(&Tier1Shmem->peers[UT_PEER_ID].close_requested, 0);
 	}
 	cluster_interconnect_tier = CLUSTER_IC_TIER_1;
-	UT_ASSERT(!cluster_ic_tier1_terminal_peer_sessions(cluster_node_id, ut_epoch, cap_generation, 2, &got));
-	UT_ASSERT(!cluster_ic_tier1_terminal_peer_sessions(UT_PEER_ID, ut_epoch, cap_generation, 0, &got));
-	UT_ASSERT(!cluster_ic_tier1_terminal_peer_sessions(UT_PEER_ID, ut_epoch, cap_generation, 9, &got));
+	UT_ASSERT(!cluster_ic_tier1_terminal_peer_sessions(cluster_node_id, ut_epoch, cap_generation, 2,
+													   &got));
+	UT_ASSERT(
+		!cluster_ic_tier1_terminal_peer_sessions(UT_PEER_ID, ut_epoch, cap_generation, 0, &got));
+	UT_ASSERT(
+		!cluster_ic_tier1_terminal_peer_sessions(UT_PEER_ID, ut_epoch, cap_generation, 9, &got));
 	UT_ASSERT(!cluster_ic_tier1_terminal_peer_sessions(UT_PEER_ID, ut_epoch, 0, 2, &got));
 	cluster_ic_tier1_close_peer(UT_PEER_ID, NULL);
-	UT_ASSERT(!cluster_ic_tier1_terminal_peer_sessions(UT_PEER_ID, ut_epoch, cap_generation, 2, &got));
+	UT_ASSERT(
+		!cluster_ic_tier1_terminal_peer_sessions(UT_PEER_ID, ut_epoch, cap_generation, 2, &got));
 	close(ut_rx_fd);
 	ut_reconnect_peer();
-	UT_ASSERT(!cluster_ic_tier1_terminal_peer_sessions(UT_PEER_ID, ut_epoch, cap_generation, 2, &got));
-	cap_generation = (uint32)pg_atomic_read_u64(&Tier1Shmem->peers[UT_PEER_ID].resource_x_stream_generation);
-	UT_ASSERT(cluster_ic_tier1_terminal_peer_sessions(UT_PEER_ID, ut_epoch, cap_generation, 2, &got));
+	UT_ASSERT(
+		!cluster_ic_tier1_terminal_peer_sessions(UT_PEER_ID, ut_epoch, cap_generation, 2, &got));
+	cap_generation
+		= (uint32)pg_atomic_read_u64(&Tier1Shmem->peers[UT_PEER_ID].resource_x_stream_generation);
+	UT_ASSERT(
+		cluster_ic_tier1_terminal_peer_sessions(UT_PEER_ID, ut_epoch, cap_generation, 2, &got));
 	UT_ASSERT(got.control_stream_generation > saved.control_stream_generation);
 	for (int ch = 0; ch < 2; ch++)
 		memcpy(data[ch], &originals[ch], sizeof(originals[ch]));

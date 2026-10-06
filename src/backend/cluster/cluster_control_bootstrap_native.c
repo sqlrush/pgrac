@@ -204,14 +204,14 @@ cluster_control_bootstrap_prepare(const char *pgdata, const char *shared_root, c
 static bool
 bootstrap_catalog_context_valid(void)
 {
-	return !IsUnderPostmaster && bootstrap_prepared_valid && cluster_shared_config && cluster_enabled
-		&& cluster_node_id == (int)bootstrap_prepared.applied.node_id
-		&& cluster_shared_data_dir != NULL && cluster_wal_threads_dir != NULL
-		&& cluster_undo_tablespace_path != NULL
-		&& strcmp(cluster_shared_data_dir, bootstrap_paths[1]) == 0
-		&& strcmp(cluster_wal_threads_dir, bootstrap_paths[2]) == 0
-		&& strcmp(cluster_undo_tablespace_path, bootstrap_paths[3]) == 0
-		&& GetSystemIdentifier() == bootstrap_prepared.snapshot.binding.system_identifier;
+	return !IsUnderPostmaster && bootstrap_prepared_valid && cluster_shared_config
+		   && cluster_enabled && cluster_node_id == (int)bootstrap_prepared.applied.node_id
+		   && cluster_shared_data_dir != NULL && cluster_wal_threads_dir != NULL
+		   && cluster_undo_tablespace_path != NULL
+		   && strcmp(cluster_shared_data_dir, bootstrap_paths[1]) == 0
+		   && strcmp(cluster_wal_threads_dir, bootstrap_paths[2]) == 0
+		   && strcmp(cluster_undo_tablespace_path, bootstrap_paths[3]) == 0
+		   && GetSystemIdentifier() == bootstrap_prepared.snapshot.binding.system_identifier;
 }
 
 static bool
@@ -229,7 +229,7 @@ bootstrap_catalog_read(ClusterCatalogStartupInput *out, void *arg)
 	PG_TRY();
 	{
 		ok = cluster_control_catalog_read(bootstrap_paths[0], bootstrap_paths[1],
-			&bootstrap_prepared.snapshot, &source->read, out);
+										  &bootstrap_prepared.snapshot, &source->read, out);
 	}
 	PG_CATCH();
 	{
@@ -249,7 +249,8 @@ bootstrap_catalog_current(void *arg)
 {
 	BootstrapCatalogSource *source = arg;
 	return bootstrap_catalog_context_valid() && source->owner != NULL
-		&& CurrentResourceOwner == source->owner && cluster_control_catalog_current(source->read);
+		   && CurrentResourceOwner == source->owner
+		   && cluster_control_catalog_current(source->read);
 }
 
 static void
@@ -266,22 +267,21 @@ bootstrap_catalog_release(void *arg)
 void
 cluster_control_bootstrap_catalog_prepare(const char *pgdata)
 {
-	ClusterCatalogStartupSource source = {bootstrap_catalog_read, bootstrap_catalog_current,
-		bootstrap_catalog_release, &bootstrap_catalog};
+	ClusterCatalogStartupSource source = { bootstrap_catalog_read, bootstrap_catalog_current,
+										   bootstrap_catalog_release, &bootstrap_catalog };
 
 	bootstrap_catalog_release(&bootstrap_catalog);
 	(void)cluster_catalog_startup_set_source(NULL);
 	if (pgdata == NULL || strcmp(pgdata, bootstrap_paths[0]) != 0
 		|| !bootstrap_catalog_context_valid() || !cluster_catalog_startup_set_source(&source))
 		ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-			errmsg("catalog startup has no exact ROOT bootstrap preparation")));
+						errmsg("catalog startup has no exact ROOT bootstrap preparation")));
 }
 
 void
 cluster_control_bootstrap_wal_recheck(const char *pgdata, ClusterWalSourceRef *out)
 {
 	ClusterControlBootstrapObservation *fresh;
-	ClusterControlRootResult result;
 	ResourceOwner saved_owner = CurrentResourceOwner;
 	MemoryContext saved_context = CurrentMemoryContext;
 	ResourceOwner owner;
@@ -303,8 +303,8 @@ cluster_control_bootstrap_wal_recheck(const char *pgdata, ClusterWalSourceRef *o
 	CurrentResourceOwner = owner;
 	PG_TRY();
 	{
-		result = cluster_control_bootstrap_read(pgdata, bootstrap_paths[1], bootstrap_paths[2],
-												cluster_node_id, fresh);
+		ClusterControlRootResult result = cluster_control_bootstrap_read(
+			pgdata, bootstrap_paths[1], bootstrap_paths[2], cluster_node_id, fresh);
 		if (result != 0
 			|| fresh->snapshot.root_sequence != bootstrap_prepared.snapshot.root_sequence
 			|| memcmp(fresh->snapshot.root_sha256, bootstrap_prepared.snapshot.root_sha256, 32) != 0

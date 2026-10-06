@@ -561,6 +561,8 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 	 */
 	if (!shared->page_dirty[slotno] ||
 		shared->page_status[slotno] != SLRU_PAGE_VALID ||
+		/* SimpleLruWaitIO releases the lock; another backend can replace this page. */
+		// cppcheck-suppress knownConditionTrueFalse
 		shared->page_number[slotno] != pageno)
 		return;
 
@@ -765,7 +767,6 @@ SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata)
 	int			segno = pageno / SLRU_PAGES_PER_SEGMENT;
 	int			rpageno = pageno % SLRU_PAGES_PER_SEGMENT;
 	off_t		offset = rpageno * BLCKSZ;
-	char		path[MAXPGPATH];
 	int			fd = -1;
 
 	/* update the stats counter of written pages */
@@ -832,6 +833,7 @@ SlruPhysicalWritePage(SlruCtl ctl, int pageno, int slotno, SlruWriteAll fdata)
 
 	if (fd < 0)
 	{
+		char path[MAXPGPATH];
 		/*
 		 * If the file doesn't already exist, we should create it.  It is
 		 * possible for this to need to happen when writing a page that's not

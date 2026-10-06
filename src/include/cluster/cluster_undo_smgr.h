@@ -104,14 +104,17 @@ typedef struct ClusterUndoSmgrRecoveryFileV1 {
 } ClusterUndoSmgrRecoveryFileV1;
 
 extern bool cluster_undo_smgr_recovery_probe_v1(uint32 segment, uint8 instance,
-	ClusterUndoSmgrRecoveryFileV1 *file, char block0[BLCKSZ]);
-extern bool cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 instance,
-	uint32 block, const ClusterUndoSmgrRecoveryFileV1 *expected, char out[BLCKSZ]);
+												ClusterUndoSmgrRecoveryFileV1 *file,
+												char block0[BLCKSZ]);
+extern bool cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 instance, uint32 block,
+													 const ClusterUndoSmgrRecoveryFileV1 *expected,
+													 char out[BLCKSZ]);
 /* Only a source-proved INIT/REUSE owner may call materialize. It preserves all
  * existing bytes through the target size and does not publish a new header. */
 extern bool cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
-	const ClusterUndoSmgrRecoveryFileV1 *expected, const char block0[BLCKSZ],
-	const char final_header[BLCKSZ]);
+													  const ClusterUndoSmgrRecoveryFileV1 *expected,
+													  const char block0[BLCKSZ],
+													  const char final_header[BLCKSZ]);
 
 
 /*

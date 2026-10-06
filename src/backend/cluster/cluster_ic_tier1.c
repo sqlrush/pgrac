@@ -3259,8 +3259,8 @@ cluster_ic_tier1_resource_x_stream_generation(int32 peer, int channel)
  * here must correspond to that same producer record. No diagnostics renew it.
  * Author: SqlRush <sqlrush@gmail.com> */
 static uint64
-tier1_terminal_stream_sample(int32 peer, ClusterICPlane plane, int channel,
-							uint64 epoch, uint32 control_capability_generation)
+tier1_terminal_stream_sample(int32 peer, ClusterICPlane plane, int channel, uint64 epoch,
+							 uint32 control_capability_generation)
 {
 	ClusterICTier1Shmem *shared = Tier1ShmemSlots[tier1_slot_of(plane, channel)];
 	const ClusterICPeerStateShmem *state;
@@ -3283,8 +3283,8 @@ tier1_terminal_stream_sample(int32 peer, ClusterICPlane plane, int channel,
 
 bool
 cluster_ic_tier1_terminal_peer_sessions(int32 peer, uint64 epoch,
-									  uint32 control_capability_generation, int data_channels,
-									  ClusterICTerminalPeerSessions *out)
+										uint32 control_capability_generation, int data_channels,
+										ClusterICTerminalPeerSessions *out)
 {
 	ClusterICTerminalPeerSessions candidate;
 	int channel;
@@ -3292,8 +3292,8 @@ cluster_ic_tier1_terminal_peer_sessions(int32 peer, uint64 epoch,
 	memset(&candidate, 0, sizeof(candidate));
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
-	if (out == NULL || cluster_interconnect_tier != CLUSTER_IC_TIER_1
-		|| peer < 0 || peer >= CLUSTER_MAX_NODES || peer == cluster_node_id
+	if (out == NULL || cluster_interconnect_tier != CLUSTER_IC_TIER_1 || peer < 0
+		|| peer >= CLUSTER_MAX_NODES || peer == cluster_node_id
 		|| control_capability_generation == 0 || data_channels < 1
 		|| data_channels > CLUSTER_IC_TIER1_DATA_CHANNELS || cluster_epoch_get_current() != epoch)
 		return false;
@@ -3303,17 +3303,18 @@ cluster_ic_tier1_terminal_peer_sessions(int32 peer, uint64 epoch,
 		return false;
 	candidate.data_channels = (uint32)data_channels;
 	for (channel = 0; channel < data_channels; channel++) {
-		candidate.data_stream_generation[channel] = tier1_terminal_stream_sample(
-			peer, CLUSTER_IC_PLANE_DATA, channel, epoch, 0);
+		candidate.data_stream_generation[channel]
+			= tier1_terminal_stream_sample(peer, CLUSTER_IC_PLANE_DATA, channel, epoch, 0);
 		if (candidate.data_stream_generation[channel] == 0)
 			return false;
 	}
 	for (channel = 0; channel < data_channels; channel++)
-		if (candidate.data_stream_generation[channel] != tier1_terminal_stream_sample(
-				peer, CLUSTER_IC_PLANE_DATA, channel, epoch, 0))
+		if (candidate.data_stream_generation[channel]
+			!= tier1_terminal_stream_sample(peer, CLUSTER_IC_PLANE_DATA, channel, epoch, 0))
 			return false;
-	if (candidate.control_stream_generation != tier1_terminal_stream_sample(
-			peer, CLUSTER_IC_PLANE_CONTROL, 0, epoch, control_capability_generation)
+	if (candidate.control_stream_generation
+			!= tier1_terminal_stream_sample(peer, CLUSTER_IC_PLANE_CONTROL, 0, epoch,
+											control_capability_generation)
 		|| cluster_epoch_get_current() != epoch)
 		return false;
 	*out = candidate;

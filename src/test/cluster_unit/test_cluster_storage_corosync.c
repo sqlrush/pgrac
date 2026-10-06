@@ -39,7 +39,7 @@ static ClusterConf conf;
 ClusterConf *ClusterConfShmem = &conf;
 static ClusterNodeInfo nodes[2];
 static StorageCorosyncModel callbacks;
-static int quorate, notified_quorate, finalize_count, track_count;
+static int observed_quorate, notified_quorate, finalize_count, track_count;
 static bool notify_enabled, api_failed, changed_after_notify;
 static bool tracking_enabled;
 static unsigned missing_notifications, dispatch_count, poll_dispatch_count;
@@ -82,7 +82,9 @@ cluster_conf_lookup_node(int32 node_id)
 	return node_id >= 0 && node_id < 2 ? &nodes[node_id] : NULL;
 }
 
+/* Public Corosync initialize ABI requires a mutable void * context. */
 static int
+// cppcheck-suppress constParameterCallback
 fixture_initialize(uint64 *handle, int model, const void *data, uint32 *type, void *context)
 {
 	Assert(model == 1 && context == NULL);
@@ -131,7 +133,7 @@ fixture_quorate(uint64 handle, int *out)
 	Assert(handle == 123);
 	if (failing_api_step == CLUSTER_STORAGE_PROVIDER_GETQUORATE)
 		return 3;
-	*out = quorate;
+	*out = observed_quorate;
 	return STORAGE_CS_OK;
 }
 
@@ -160,13 +162,11 @@ fixture_dispatch(uint64 handle, int flags)
 			member_count = 1;
 		if (notification_mismatch & 4)
 			member_ring.node = 13;
-		if (!(missing_notifications & 1)
-			&& (!pair_on_second_dispatch || poll_dispatch_count == 1))
+		if (!(missing_notifications & 1) && (!pair_on_second_dispatch || poll_dispatch_count == 1))
 			callbacks.members_notify(handle, member_ring, member_count, members, 0, NULL, 0, NULL);
 		if (negative_then_ready)
 			callbacks.quorum_notify(handle, 0, ring, quorum_count, members);
-		if (!(missing_notifications & 2)
-			&& (!pair_on_second_dispatch || poll_dispatch_count == 2))
+		if (!(missing_notifications & 2) && (!pair_on_second_dispatch || poll_dispatch_count == 2))
 			callbacks.quorum_notify(handle, notified_quorate, ring, quorum_count, members);
 	}
 	if (changed_after_notify) {
@@ -232,7 +232,7 @@ reset_fixture(void)
 	memset(&storage_notified, 0, sizeof(storage_notified));
 	cluster_storage_quorum_nodes = "0:11,1:12";
 	cluster_storage_quorum_cluster = "quorum-fixture";
-	quorate = notified_quorate = 1;
+	observed_quorate = notified_quorate = 1;
 	notify_enabled = true;
 	tracking_enabled = false;
 	missing_notifications = dispatch_count = poll_dispatch_count = 0;
@@ -300,10 +300,10 @@ UT_TEST(test_both_quorum_observations_and_matching_ring_are_required)
 	ClusterStorageQuorumView view;
 
 	reset_fixture();
-	quorate = 0;
+	observed_quorate = 0;
 	cluster_storage_corosync_sample(&view);
 	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_NOT_QUORATE);
-	quorate = 1;
+	observed_quorate = 1;
 	notified_quorate = 0;
 	cluster_storage_corosync_sample(&view);
 	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_NOT_QUORATE);
@@ -535,13 +535,30 @@ UT_TEST(test_actual_member_change_and_negative_evidence_revoke_immediately)
 		cluster_storage_quorum_refresh(fixture_now, 100);
 		UT_ASSERT(cluster_storage_quorum_allows_members(3, 0));
 		switch (scenario) {
-			case 0: remove_peer = true; break;
-			case 1: remove_peer = true; missing_notifications = 2; break;
-			case 2: remove_self = true; missing_notifications = 2; break;
-			case 3: quorate = 0; missing_notifications = 3; break;
-			case 4: notification_mismatch = 4; break;
-			case 5: negative_then_ready = true; break;
-			case 6: bad_key = "totem.cluster_name"; break;
+		case 0:
+			remove_peer = true;
+			break;
+		case 1:
+			remove_peer = true;
+			missing_notifications = 2;
+			break;
+		case 2:
+			remove_self = true;
+			missing_notifications = 2;
+			break;
+		case 3:
+			observed_quorate = 0;
+			missing_notifications = 3;
+			break;
+		case 4:
+			notification_mismatch = 4;
+			break;
+		case 5:
+			negative_then_ready = true;
+			break;
+		case 6:
+			bad_key = "totem.cluster_name";
+			break;
 		}
 		fixture_now++;
 		cluster_storage_quorum_refresh(fixture_now, 100);
@@ -555,7 +572,7 @@ UT_TEST(test_actual_member_change_and_negative_evidence_revoke_immediately)
 		missing_notifications = 3;
 		remove_peer = remove_self = negative_then_ready = false;
 		notification_mismatch = 0;
-		quorate = 1;
+		observed_quorate = 1;
 		bad_key = NULL;
 		fixture_now++;
 		cluster_storage_quorum_refresh(fixture_now, 100);

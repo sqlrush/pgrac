@@ -353,13 +353,12 @@ cluster_space_hint_begin(Buffer buffer, RfPageProducerBatchV1 *batch)
 	BufferGetTag(buffer, &locator, &forknum, &block);
 	if (cluster_smgr_which_for(locator, InvalidBackendId) != 1 || forknum == FSM_FORKNUM)
 		return CLUSTER_SPACE_HINT_NATIVE;
-	if ((forknum != MAIN_FORKNUM && forknum != VISIBILITYMAP_FORKNUM)
-		|| RecoveryInProgress() || CritSectionCount != 0
+	if ((forknum != MAIN_FORKNUM && forknum != VISIBILITYMAP_FORKNUM) || RecoveryInProgress()
+		|| CritSectionCount != 0
 		|| !LWLockHeldByMeInMode(BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)),
-							   LW_EXCLUSIVE)
+								 LW_EXCLUSIVE)
 		|| !cluster_bufmgr_pcm_x_content_holder_write_permitted(GetBufferDescriptor(buffer - 1))
-		|| space_identity_cache == NULL
-		|| !space_namespace(locator, false, &expected, NULL))
+		|| space_identity_cache == NULL || !space_namespace(locator, false, &expected, NULL))
 		return CLUSTER_SPACE_HINT_SKIPPED;
 
 	/* The relation owner filled this cache before taking content locks and
@@ -386,9 +385,8 @@ cluster_space_hint_finish(Buffer buffer, bool standard, const RfPageProducerBatc
 {
 	XLogRecPtr lsn;
 
-	if (CritSectionCount == 0 || batch == NULL || !batch->stamped
-		|| batch->entry_count != 1 || batch->entries[0].block_id != 0
-		|| batch->ordinary_pages[0] != BufferGetPage(buffer))
+	if (CritSectionCount == 0 || batch == NULL || !batch->stamped || batch->entry_count != 1
+		|| batch->entries[0].block_id != 0 || batch->ordinary_pages[0] != BufferGetPage(buffer))
 		elog(PANIC, "shared hint has no exact prepared page version");
 	MarkBufferDirty(buffer);
 	XLogBeginInsert();
@@ -598,13 +596,13 @@ cluster_space_init_vm_buffer_wal(const ClusterSpaceIdentity *identity, Buffer de
 bool
 cluster_space_relation_create(RelFileLocator locator)
 {
-	ClusterSpaceStructureChange change = {0};
+	ClusterSpaceStructureChange change = { 0 };
 	ClusterSpaceWalChange *identity = &change.identity;
 	PGAlignedBlock result[2];
 	uint8 bytes[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 	uint8 apply_mask;
 	SMgrRelation rel;
-	Buffer buffers[2] = {InvalidBuffer, InvalidBuffer};
+	Buffer buffers[2] = { InvalidBuffer, InvalidBuffer };
 	XLogRecPtr lsn;
 	bool success = false;
 
@@ -632,14 +630,16 @@ cluster_space_relation_create(RelFileLocator locator)
 		return false;
 	smgrcreate(rel, SPACE_FORKNUM, false);
 	for (int i = 0; i < 2; i++) {
-		buffers[i] = ReadBufferWithoutRelcache(locator, SPACE_FORKNUM, P_NEW,
-											 RBM_ZERO_AND_LOCK, NULL, true);
+		buffers[i] = ReadBufferWithoutRelcache(locator, SPACE_FORKNUM, P_NEW, RBM_ZERO_AND_LOCK,
+											   NULL, true);
 		if (BufferGetBlockNumber(buffers[i]) != i)
 			goto done;
 		memcpy(result[i].data, BufferGetPage(buffers[i]), BLCKSZ);
 	}
 	if (cluster_space_structure_apply(&change, &identity->result.key, result[0].data,
-			result[1].data, BLCKSZ, &apply_mask) != CLUSTER_SPACE_IDENTITY_APPLY || apply_mask != 3)
+									  result[1].data, BLCKSZ, &apply_mask)
+			!= CLUSTER_SPACE_IDENTITY_APPLY
+		|| apply_mask != 3)
 		goto done;
 	XLogBeginInsert();
 	START_CRIT_SECTION();
@@ -663,12 +663,12 @@ done:
 }
 
 BlockNumber
-cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock *lock,
-					  uint32 want, uint32 *granted)
+cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock *lock, uint32 want,
+					  uint32 *granted)
 {
 	ClusterSpaceIdentityKey expected;
 	ClusterSpaceIdentity checked;
-	ClusterSpaceReservationChange change = {0};
+	ClusterSpaceReservationChange change = { 0 };
 	ClusterResId resid;
 	PGAlignedBlock result;
 	uint8 expected_identity[CLUSTER_SPACE_IDENTITY_BYTES];
@@ -685,7 +685,8 @@ cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock 
 		|| lock->req.lockmode != ExclusiveLock || want == 0 || RecoveryInProgress()
 		|| !space_namespace(identity->key.locator, false, &expected, NULL)
 		|| !cluster_space_identity_encode(identity, expected_identity, sizeof(expected_identity))
-		|| !cluster_space_identity_decode(expected_identity, sizeof(expected_identity), &expected, &checked)
+		|| !cluster_space_identity_decode(expected_identity, sizeof(expected_identity), &expected,
+										  &checked)
 		|| checked.state != CLUSTER_SPACE_IDENTITY_LIVE)
 		return InvalidBlockNumber;
 	cluster_hw_resid_encode(expected.locator, MAIN_FORKNUM, &resid);
@@ -696,19 +697,21 @@ cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock 
 	 * protects the canonical bytes. No separate master counter or raw-DATA
 	 * channel can grant space. A missing/unformatted target never seeds zero. */
 	buffer = ReadBufferWithoutRelcache(expected.locator, SPACE_FORKNUM,
-		CLUSTER_SPACE_RESERVATION_BLOCK, RBM_NORMAL, NULL, true);
+									   CLUSTER_SPACE_RESERVATION_BLOCK, RBM_NORMAL, NULL, true);
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 	if (BufferIsLocal(buffer) || BufferGetBlockNumber(buffer) != CLUSTER_SPACE_RESERVATION_BLOCK
 		|| !cluster_bufmgr_pcm_x_content_holder_write_permitted(GetBufferDescriptor(buffer - 1))
 		|| !cluster_space_reservation_page_decode(BufferGetPage(buffer), BLCKSZ, SPACE_FORKNUM,
-			CLUSTER_SPACE_RESERVATION_BLOCK, &expected, &change.before, &change.before_token)
-		|| !cluster_space_identity_encode(&change.before.identity, before_identity, sizeof(before_identity))
+												  CLUSTER_SPACE_RESERVATION_BLOCK, &expected,
+												  &change.before, &change.before_token)
+		|| !cluster_space_identity_encode(&change.before.identity, before_identity,
+										  sizeof(before_identity))
 		|| memcmp(before_identity, expected_identity, sizeof(before_identity)) != 0)
 		goto done;
 	change.action = CLUSTER_SPACE_RESERVATION_ADVANCE;
 	change.result = change.before;
-	change.first_block = cluster_hw_alloc_segment(change.before.next_block, want,
-		&change.granted, &change.result.next_block);
+	change.first_block = cluster_hw_alloc_segment(change.before.next_block, want, &change.granted,
+												  &change.result.next_block);
 	if (change.granted == 0)
 		goto done;
 	change.result_token = rf_page_mutation_token_next();
@@ -786,7 +789,7 @@ struct ClusterSpaceDropState {
 };
 
 StaticAssertDecl(XACT_SPACE_DROP_RECORD_BYTES == CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
-	"native COMMIT and SPACE structural formats must agree");
+				 "native COMMIT and SPACE structural formats must agree");
 
 static void
 space_truncate_release(ClusterSpaceTruncateState *state)
@@ -798,11 +801,11 @@ space_truncate_release(ClusterSpaceTruncateState *state)
 }
 
 static ClusterSpaceTruncateState *
-space_structure_prepare(const ClusterSpaceIdentityKey *expected,
-						ClusterSpaceWalAction action, BlockNumber nblocks)
+space_structure_prepare(const ClusterSpaceIdentityKey *expected, ClusterSpaceWalAction action,
+						BlockNumber nblocks)
 {
 	ClusterSpaceTruncateState *state;
-	ClusterSpaceStructureChange change = {0};
+	ClusterSpaceStructureChange change = { 0 };
 	ClusterSpaceWalChange *identity = &change.identity;
 	ClusterSpaceReservationChange *reservation = &change.reservation;
 	SMgrRelation smgr;
@@ -815,7 +818,7 @@ space_structure_prepare(const ClusterSpaceIdentityKey *expected,
 	state = palloc0(sizeof(*state));
 	for (int i = 0; i < 2; i++) {
 		state->buffers[i] = ReadBufferWithoutRelcache(expected->locator, SPACE_FORKNUM, i,
-			RBM_NORMAL, NULL, true);
+													  RBM_NORMAL, NULL, true);
 		LockBuffer(state->buffers[i], BUFFER_LOCK_EXCLUSIVE);
 		if (BufferIsLocal(state->buffers[i]) || BufferGetBlockNumber(state->buffers[i]) != i
 			|| !cluster_bufmgr_pcm_x_content_holder_write_permitted(
@@ -824,9 +827,10 @@ space_structure_prepare(const ClusterSpaceIdentityKey *expected,
 		memcpy(state->result[i].data, BufferGetPage(state->buffers[i]), BLCKSZ);
 	}
 	if (!cluster_space_identity_page_decode(state->result[0].data, BLCKSZ, SPACE_FORKNUM, 0,
-			expected, &identity->expected, &identity->before_token)
+											expected, &identity->expected, &identity->before_token)
 		|| !cluster_space_reservation_page_decode(state->result[1].data, BLCKSZ, SPACE_FORKNUM, 1,
-			expected, &reservation->before, &reservation->before_token)
+												  expected, &reservation->before,
+												  &reservation->before_token)
 		|| identity->expected.state != CLUSTER_SPACE_IDENTITY_LIVE
 		|| identity->expected.sequence == UINT64_MAX
 		|| (action == CLUSTER_SPACE_WAL_TRUNCATE && nblocks > reservation->before.next_block))
@@ -835,7 +839,7 @@ space_structure_prepare(const ClusterSpaceIdentityKey *expected,
 	 * locked. Its ResourceOwner retains the completion through transaction
 	 * exit; preparing a replacement page does not prove durable completion. */
 	if (!cluster_ko_shared_claim_v2(expected, identity->expected.incarnation,
-								  &state->ko_completion))
+									&state->ko_completion))
 		goto refused;
 	identity->action = action;
 	identity->nblocks = nblocks;
@@ -848,15 +852,17 @@ space_structure_prepare(const ClusterSpaceIdentityKey *expected,
 		identity->result.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
 	identity->result.operation = identity->result_token = rf_page_mutation_token_next();
 	reservation->action = action == CLUSTER_SPACE_WAL_TRUNCATE
-		? CLUSTER_SPACE_RESERVATION_RESET : CLUSTER_SPACE_RESERVATION_TOMBSTONE;
+							  ? CLUSTER_SPACE_RESERVATION_RESET
+							  : CLUSTER_SPACE_RESERVATION_TOMBSTONE;
 	reservation->result.identity = identity->result;
 	reservation->first_block = action == CLUSTER_SPACE_WAL_TRUNCATE ? nblocks : 0;
-	reservation->result.next_block = action == CLUSTER_SPACE_WAL_TRUNCATE
-		? nblocks : reservation->before.next_block;
+	reservation->result.next_block
+		= action == CLUSTER_SPACE_WAL_TRUNCATE ? nblocks : reservation->before.next_block;
 	reservation->result_token = identity->result_token;
 	if (!cluster_space_structure_wal_encode(&change, state->wal, sizeof(state->wal))
 		|| cluster_space_structure_apply(&change, expected, state->result[0].data,
-			state->result[1].data, BLCKSZ, &apply_mask) != CLUSTER_SPACE_IDENTITY_APPLY
+										 state->result[1].data, BLCKSZ, &apply_mask)
+			   != CLUSTER_SPACE_IDENTITY_APPLY
 		|| apply_mask != 3)
 		goto refused;
 	state->token = identity->result_token;
@@ -873,8 +879,8 @@ cluster_space_truncate_prepare(Relation rel, BlockNumber nblocks)
 	ClusterSpaceTruncateState *state;
 	SMgrRelation smgr;
 
-	if (rel == NULL || RecoveryInProgress() || !RelationIsPermanent(rel)
-		|| !RelationNeedsWAL(rel) || nblocks == InvalidBlockNumber
+	if (rel == NULL || RecoveryInProgress() || !RelationIsPermanent(rel) || !RelationNeedsWAL(rel)
+		|| nblocks == InvalidBlockNumber
 		|| !space_namespace(rel->rd_locator, false, &expected, NULL))
 		return NULL;
 	smgr = smgropen(expected.locator, InvalidBackendId);
@@ -985,13 +991,12 @@ space_structure_observe(ClusterSpaceTruncateState *state)
 	if (!cluster_space_structure_wal_decode(state->wal, sizeof(state->wal), &change))
 		elog(PANIC, "SPACE observation lost its original structural record");
 	if (!cluster_page_wal_read_v1(state->buffers[0], &change.identity.result, &before)
-		|| before.record_end != state->lsn
-		|| !cluster_page_wal_flush_source_v1(&before, &certified)
+		|| before.record_end != state->lsn || !cluster_page_wal_flush_source_v1(&before, &certified)
 		|| !cluster_page_wal_read_v1(state->buffers[0], &change.identity.result, &after)
 		|| memcmp(&before, &after, sizeof(before)) != 0)
 		return;
-	if (cluster_ko_shared_observe_space_v2(state->ko_completion, &certified,
-			state->wal, sizeof(state->wal))
+	if (cluster_ko_shared_observe_space_v2(state->ko_completion, &certified, state->wal,
+										   sizeof(state->wal))
 		&& change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE && state->base_synced
 		&& state->truncate_published)
 		(void)cluster_ko_shared_observe_truncate_v2(state->ko_completion);
@@ -1015,11 +1020,12 @@ cluster_space_truncate_finish(ClusterSpaceTruncateState *state, Relation rel)
 		smgrimmedsync(smgr, SPACE_FORKNUM);
 		for (int i = 0; i < 2; i++)
 			if (!space_structure_readback(smgr, state->buffers[i], i))
-				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-								errmsg("truncated SPACE page does not match its durable write"),
-								errdetail("Relation %u/%u/%u, SPACE block %d.", rel->rd_locator.spcOid,
-										  rel->rd_locator.dbOid, rel->rd_locator.relNumber, i),
-								errhint("Check the storage device before restarting the instance.")));
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("truncated SPACE page does not match its durable write"),
+						 errdetail("Relation %u/%u/%u, SPACE block %d.", rel->rd_locator.spcOid,
+								   rel->rd_locator.dbOid, rel->rd_locator.relNumber, i),
+						 errhint("Check the storage device before restarting the instance.")));
 		space_structure_observe(state);
 	}
 	PG_CATCH();
@@ -1063,8 +1069,8 @@ cluster_space_drop_prepare(const RelFileLocator *locators, int count)
 	RelFileLocator *sorted;
 
 	if (!cluster_shared_config || RecoveryInProgress() || count <= 0 || locators == NULL
-		|| (Size)count > (MaxAllocSize - sizeof(*state))
-			/ (sizeof(*sorted) + sizeof(*state->entries))
+		|| (Size)count
+			   > (MaxAllocSize - sizeof(*state)) / (sizeof(*sorted) + sizeof(*state->entries))
 		|| (Size)count > (MaxAllocSize - sizeof(uint32)) / CLUSTER_SPACE_STRUCTURE_WAL_BYTES)
 		return NULL;
 	state = palloc0(sizeof(*state) + (Size)count * sizeof(*state->entries));
@@ -1080,8 +1086,7 @@ cluster_space_drop_prepare(const RelFileLocator *locators, int count)
 			continue;
 		if (!space_namespace(sorted[i], false, &expected, NULL))
 			goto refused;
-		entry = space_structure_prepare(&expected, CLUSTER_SPACE_WAL_TOMBSTONE,
-			InvalidBlockNumber);
+		entry = space_structure_prepare(&expected, CLUSTER_SPACE_WAL_TOMBSTONE, InvalidBlockNumber);
 		if (entry == NULL)
 			goto refused;
 		state->entries[state->count++] = entry;
@@ -1094,7 +1099,7 @@ cluster_space_drop_prepare(const RelFileLocator *locators, int count)
 		memcpy(state->wal, &n, sizeof(n));
 		for (int i = 0; i < state->count; i++)
 			memcpy(state->wal + sizeof(n) + (Size)i * CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
-				state->entries[i]->wal, CLUSTER_SPACE_STRUCTURE_WAL_BYTES);
+				   state->entries[i]->wal, CLUSTER_SPACE_STRUCTURE_WAL_BYTES);
 	}
 	pfree(sorted);
 	return state;
@@ -1160,12 +1165,13 @@ cluster_space_drop_finish(ClusterSpaceDropState *state)
 				smgrimmedsync(smgr, SPACE_FORKNUM);
 				for (int j = 0; j < 2; j++)
 					if (!space_structure_readback(smgr, entry->buffers[j], j))
-						ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-										errmsg("deleted SPACE page does not match its durable write"),
-										errdetail("Relation %u/%u/%u, SPACE block %d.",
-												  change.identity.result.key.locator.spcOid,
-												  change.identity.result.key.locator.dbOid,
-												  change.identity.result.key.locator.relNumber, j)));
+						ereport(ERROR,
+								(errcode(ERRCODE_DATA_CORRUPTED),
+								 errmsg("deleted SPACE page does not match its durable write"),
+								 errdetail("Relation %u/%u/%u, SPACE block %d.",
+										   change.identity.result.key.locator.spcOid,
+										   change.identity.result.key.locator.dbOid,
+										   change.identity.result.key.locator.relNumber, j)));
 				space_structure_observe(entry);
 			}
 		}
@@ -1173,11 +1179,12 @@ cluster_space_drop_finish(ClusterSpaceDropState *state)
 		{
 			/* ERROR cleanup would pretend this committed transaction aborted
 			 * and expose its cached tombstone without the durable anchor. */
-			ereport(PANIC, (errcode(ERRCODE_IO_ERROR),
-							errmsg("could not durably publish committed relation deletion"),
-							errdetail("The original SPACE owners remain held before file removal."),
-							errhint("Restore storage availability and restart the instance to recover "
-									"the committed deletion.")));
+			ereport(PANIC,
+					(errcode(ERRCODE_IO_ERROR),
+					 errmsg("could not durably publish committed relation deletion"),
+					 errdetail("The original SPACE owners remain held before file removal."),
+					 errhint("Restore storage availability and restart the instance to recover "
+							 "the committed deletion.")));
 		}
 		PG_END_TRY();
 	}
@@ -1197,12 +1204,12 @@ space_drop_prepare_replay(const ClusterSpaceStructureChange *change,
 	ClusterSpaceTruncateState *entry = palloc0(sizeof(*entry));
 	ClusterSpaceRecoveryImage prepared;
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
-	ClusterSpaceRecoveryInput input = {wal, sizeof(wal)};
+	ClusterSpaceRecoveryInput input = { wal, sizeof(wal) };
 	uint32 order;
 
 	for (int i = 0; i < 2; i++) {
 		entry->buffers[i] = ReadBufferWithoutRelcache(expected->locator, SPACE_FORKNUM, i,
-			RBM_NORMAL, NULL, true);
+													  RBM_NORMAL, NULL, true);
 		LockBuffer(entry->buffers[i], BUFFER_LOCK_EXCLUSIVE);
 		if (BufferIsLocal(entry->buffers[i]) || BufferGetBlockNumber(entry->buffers[i]) != i
 			|| !cluster_bufmgr_pcm_x_content_holder_write_permitted(
@@ -1211,8 +1218,8 @@ space_drop_prepare_replay(const ClusterSpaceStructureChange *change,
 		memcpy(entry->result[i].data, BufferGetPage(entry->buffers[i]), BLCKSZ);
 	}
 	if (!cluster_space_structure_wal_encode(change, wal, sizeof(wal))
-		|| !cluster_space_recovery_prepare(&input, 1, expected,
-			entry->result[0].data, entry->result[1].data, &order, &prepared))
+		|| !cluster_space_recovery_prepare(&input, 1, expected, entry->result[0].data,
+										   entry->result[1].data, &order, &prepared))
 		goto refused;
 	memcpy(entry->result, prepared.pages, sizeof(entry->result));
 	entry->token = change->identity.result_token;
@@ -1238,13 +1245,14 @@ cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid)
 		|| XLogRecGetXid(record) != xid || XLogRecHasAnyBlockRefs(record)
 		|| XLogRecPtrIsInvalid(record->ReadRecPtr) || record->EndRecPtr <= record->ReadRecPtr
 		|| !ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
-			XLogRecGetDataLen(record), &parsed))
+							  XLogRecGetDataLen(record), &parsed))
 		return false;
 	count = parsed.nrels;
 	if (count == 0)
 		return parsed.nspace_drops == 0;
-	if (cluster_recmerge_apply_foreign || (Size)count > (MaxAllocSize - sizeof(*state))
-		/ (sizeof(*sorted) + sizeof(*state->entries)))
+	if (cluster_recmerge_apply_foreign
+		|| (Size)count
+			   > (MaxAllocSize - sizeof(*state)) / (sizeof(*sorted) + sizeof(*state->entries)))
 		return false;
 	state = palloc0(sizeof(*state) + (Size)count * sizeof(*state->entries));
 	sorted = palloc((Size)count * sizeof(*sorted));
@@ -1265,8 +1273,8 @@ cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid)
 			|| record->system_identifier != expected.system_identifier)
 			goto refused;
 		if (consumed >= parsed.nspace_drops
-			|| !cluster_space_structure_wal_decode(parsed.space_drops
-				+ (Size)consumed * CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+			|| !cluster_space_structure_wal_decode(
+				parsed.space_drops + (Size)consumed * CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
 				CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &change)
 			|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
 			|| !space_identity_key_matches(&expected, &change.identity.result.key))
@@ -1335,16 +1343,17 @@ space_reservation_redo(XLogReaderState *record)
 	ClusterSpaceIdentity checked;
 	uint8 identity[CLUSTER_SPACE_IDENTITY_BYTES];
 	ClusterSpaceRecoveryImage prepared;
-	ClusterSpaceRecoveryInput input = {XLogRecGetData(record), XLogRecGetDataLen(record)};
+	ClusterSpaceRecoveryInput input = { XLogRecGetData(record), XLogRecGetDataLen(record) };
 	uint32 order;
 	SMgrRelation rel;
 	Buffer buffer, identity_buffer;
 	uint16 local_thread;
 	bool success = false;
 
-	if (!RecoveryInProgress() || cluster_recmerge_apply_foreign
-		|| XLogRecHasAnyBlockRefs(record) || XLogRecPtrIsInvalid(record->EndRecPtr)
-		|| !cluster_space_reservation_wal_decode(XLogRecGetData(record), XLogRecGetDataLen(record), &change)
+	if (!RecoveryInProgress() || cluster_recmerge_apply_foreign || XLogRecHasAnyBlockRefs(record)
+		|| XLogRecPtrIsInvalid(record->EndRecPtr)
+		|| !cluster_space_reservation_wal_decode(XLogRecGetData(record), XLogRecGetDataLen(record),
+												 &change)
 		|| change.action != CLUSTER_SPACE_RESERVATION_ADVANCE
 		|| !space_namespace(change.result.identity.key.locator, true, &expected, &local_thread)
 		|| local_thread == 0 || record->cluster_expected_thread_id != local_thread
@@ -1357,18 +1366,19 @@ space_reservation_redo(XLogReaderState *record)
 	/* Keep the independently versioned identity stable while checking and
 	 * installing its reservation. Recovery follows the same block lock order
 	 * as structural owners, but never mutates block zero for ADVANCE. */
-	identity_buffer = ReadBufferWithoutRelcache(expected.locator, SPACE_FORKNUM, 0,
-		RBM_NORMAL, NULL, true);
+	identity_buffer
+		= ReadBufferWithoutRelcache(expected.locator, SPACE_FORKNUM, 0, RBM_NORMAL, NULL, true);
 	LockBuffer(identity_buffer, BUFFER_LOCK_SHARE);
 	buffer = ReadBufferWithoutRelcache(expected.locator, SPACE_FORKNUM,
-		CLUSTER_SPACE_RESERVATION_BLOCK, RBM_NORMAL, NULL, true);
+									   CLUSTER_SPACE_RESERVATION_BLOCK, RBM_NORMAL, NULL, true);
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 	if (BufferIsLocal(identity_buffer) || BufferGetBlockNumber(identity_buffer) != 0
 		|| BufferIsLocal(buffer) || BufferGetBlockNumber(buffer) != CLUSTER_SPACE_RESERVATION_BLOCK
 		|| !cluster_bufmgr_pcm_x_content_holder_write_permitted(GetBufferDescriptor(buffer - 1)))
 		goto done;
 	if (!cluster_space_recovery_prepare(&input, 1, &expected, BufferGetPage(identity_buffer),
-		BufferGetPage(buffer), &order, &prepared) || (prepared.apply_mask & 1) != 0)
+										BufferGetPage(buffer), &order, &prepared)
+		|| (prepared.apply_mask & 1) != 0)
 		goto done;
 	if (prepared.apply_mask & 2) {
 		START_CRIT_SECTION();
@@ -1393,12 +1403,12 @@ cluster_space_relation_redo(XLogReaderState *record)
 	ClusterSpaceRecoveryInput input;
 	ClusterSpaceRecoveryImage prepared;
 	uint32 order;
-	PGAlignedBlock result[2] = {{0}};
-	PGAlignedBlock zero = {0};
+	PGAlignedBlock result[2] = { { 0 } };
+	PGAlignedBlock zero = { 0 };
 	uint8 check[CLUSTER_SPACE_IDENTITY_BYTES];
 	SMgrRelation rel;
 	BlockNumber blocks;
-	Buffer buffers[2] = {InvalidBuffer, InvalidBuffer};
+	Buffer buffers[2] = { InvalidBuffer, InvalidBuffer };
 	uint16 local_thread;
 	uint8 apply_mask;
 	bool exists, success = false;
@@ -1410,7 +1420,8 @@ cluster_space_relation_redo(XLogReaderState *record)
 		|| XLogRecGetRmid(record) != RM_SMGR_ID
 		|| (XLogRecGetInfo(record) & ~XLR_INFO_MASK) != XLOG_SMGR_SPACE_IDENTITY
 		|| XLogRecHasAnyBlockRefs(record) || XLogRecPtrIsInvalid(record->EndRecPtr)
-		|| !cluster_space_structure_wal_decode(XLogRecGetData(record), XLogRecGetDataLen(record), &change)
+		|| !cluster_space_structure_wal_decode(XLogRecGetData(record), XLogRecGetDataLen(record),
+											   &change)
 		|| !space_namespace(identity->result.key.locator, true, &expected, &local_thread))
 		return false;
 	/* Independently selected namespace, not the untrusted WAL payload. */
@@ -1438,16 +1449,16 @@ cluster_space_relation_redo(XLogReaderState *record)
 	 * Missing CREATE components are private zero predecessors until the
 	 * complete structural record passes. Lock pages in block order. */
 	for (BlockNumber i = 0; i < blocks; i++) {
-		buffers[i] = ReadBufferWithoutRelcache(expected.locator, SPACE_FORKNUM, i,
-											 RBM_NORMAL, NULL, true);
+		buffers[i]
+			= ReadBufferWithoutRelcache(expected.locator, SPACE_FORKNUM, i, RBM_NORMAL, NULL, true);
 		LockBuffer(buffers[i], BUFFER_LOCK_EXCLUSIVE);
 		if (BufferGetBlockNumber(buffers[i]) != i)
 			goto done;
 		memcpy(result[i].data, BufferGetPage(buffers[i]), BLCKSZ);
 	}
-	input = (ClusterSpaceRecoveryInput){XLogRecGetData(record), XLogRecGetDataLen(record)};
+	input = (ClusterSpaceRecoveryInput){ XLogRecGetData(record), XLogRecGetDataLen(record) };
 	if (!cluster_space_recovery_prepare(&input, 1, &expected, result[0].data, result[1].data,
-		&order, &prepared))
+										&order, &prepared))
 		goto done;
 	apply_mask = prepared.apply_mask;
 	memcpy(result, prepared.pages, sizeof(result));
@@ -1455,7 +1466,7 @@ cluster_space_relation_redo(XLogReaderState *record)
 		smgrcreate(rel, SPACE_FORKNUM, true);
 	for (BlockNumber i = blocks; i < 2; i++) {
 		buffers[i] = ReadBufferWithoutRelcache(expected.locator, SPACE_FORKNUM, P_NEW,
-											 RBM_ZERO_AND_LOCK, NULL, true);
+											   RBM_ZERO_AND_LOCK, NULL, true);
 		if (BufferGetBlockNumber(buffers[i]) != i
 			|| memcmp(BufferGetPage(buffers[i]), zero.data, BLCKSZ) != 0)
 			goto done;

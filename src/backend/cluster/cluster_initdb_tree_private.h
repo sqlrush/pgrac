@@ -5,8 +5,7 @@
 
 #include "c.h"
 
-typedef struct ClusterInitdbTree
-{
+typedef struct ClusterInitdbTree {
 	uint8 content[32];
 	uint8 identity[32];
 } ClusterInitdbTree;

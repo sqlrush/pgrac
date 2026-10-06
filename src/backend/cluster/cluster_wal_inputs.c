@@ -135,15 +135,15 @@ cluster_wal_inputs_recovered_prefix_v1(ClusterWalInputsV1 *inputs,
 
 bool
 cluster_wal_inputs_recovered_owner_v1(ClusterWalInputsV1 *inputs, int32 node,
-									ClusterWalSourceRef *out)
+									  ClusterWalSourceRef *out)
 {
 	const ClusterWalInputV1 *current = NULL;
 	bool seen[CLUSTER_WAL_INPUTS_MAX] = { false };
 	uint32 count = 0;
 	XLogRecPtr end;
-	const uint32 closed_flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
-		| CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
-		| CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+	const uint32 closed_flags
+		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+		  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -171,8 +171,7 @@ cluster_wal_inputs_recovered_owner_v1(ClusterWalInputsV1 *inputs, int32 node,
 			current = item;
 		}
 	}
-	if (current == NULL
-		|| !cluster_wal_inputs_recovered_prefix_v1(inputs, &current->source, &end))
+	if (current == NULL || !cluster_wal_inputs_recovered_prefix_v1(inputs, &current->source, &end))
 		return false;
 	for (uint32 i = 0; i < inputs->count; i++) {
 		const ClusterWalInputV1 *item = &inputs->items[i];
@@ -186,7 +185,7 @@ cluster_wal_inputs_recovered_owner_v1(ClusterWalInputsV1 *inputs, int32 node,
 				   > current->source.claim.identity.root_lineage_seq)
 			return false;
 		offset = current->source.claim.identity.root_lineage_seq
-			- item->source.claim.identity.root_lineage_seq;
+				 - item->source.claim.identity.root_lineage_seq;
 		if (offset >= count || seen[offset])
 			return false;
 		seen[offset] = true;

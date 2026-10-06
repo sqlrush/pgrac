@@ -536,14 +536,12 @@ UndoSegmentBitmap_first_free_block(const uint8 *bitmap, uint32 blocks_per_segmen
  * Caller supplies a complete aligned block; this predicate grants no I/O or
  * recovery authority and does not require a fresh allocation template. */
 static inline bool
-UndoSegmentHeader_identity_matches(const char *blockbuf, uint32 segment_id,
-								  uint8 owner_instance)
+UndoSegmentHeader_identity_matches(const char *blockbuf, uint32 segment_id, uint8 owner_instance)
 {
 	PageHeader ph = (PageHeader)blockbuf;
 	const UndoSegmentHeaderData *hdr = (const UndoSegmentHeaderData *)blockbuf;
 
-	if ((ph->pd_flags & PD_UNDO_SEG_HEADER) == 0
-		|| PageGetPageSize((Page)blockbuf) != BLCKSZ
+	if ((ph->pd_flags & PD_UNDO_SEG_HEADER) == 0 || PageGetPageSize((Page)blockbuf) != BLCKSZ
 		|| PageGetPageLayoutVersion((Page)blockbuf) != PG_PAGE_LAYOUT_VERSION
 		|| hdr->segment_id != segment_id || hdr->segment_size_bytes != UNDO_SEGMENT_SIZE_BYTES
 		|| hdr->owner_instance != owner_instance || hdr->tt_slots_count != TT_SLOTS_PER_SEGMENT)

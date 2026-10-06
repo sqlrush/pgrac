@@ -661,7 +661,7 @@ UT_TEST(test_shared_postmaster_uses_published_proof_without_disk_or_renewal)
 			durable_proof.marker.fence_epoch = 5;
 		}
 		UT_ASSERT_EQ(cluster_formation_witness_build_recovery_control_wait(1, 10, &witness),
-			CLUSTER_FORMATION_WITNESS_READY);
+					 CLUSTER_FORMATION_WITNESS_READY);
 		UT_ASSERT_NOT_NULL(witness);
 		UT_ASSERT_EQ(durable_reads, 0);
 		UT_ASSERT_EQ(reader_publications, 0);

@@ -186,9 +186,10 @@ typedef struct ClusterICTerminalPeerSessions {
 	uint64 data_stream_generation[CLUSTER_IC_TIER1_DATA_CHANNELS];
 	uint32 data_channels;
 } ClusterICTerminalPeerSessions;
-extern bool cluster_ic_tier1_terminal_peer_sessions(
-	int32 peer, uint64 epoch, uint32 control_capability_generation, int data_channels,
-	ClusterICTerminalPeerSessions *out);
+extern bool cluster_ic_tier1_terminal_peer_sessions(int32 peer, uint64 epoch,
+													uint32 control_capability_generation,
+													int data_channels,
+													ClusterICTerminalPeerSessions *out);
 
 
 extern int cluster_ic_tier1_my_n_workers(void);

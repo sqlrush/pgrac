@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# Author: SqlRush <sqlrush@gmail.com>
 # Requires A S11/S12 fresh initialization/atomic activation, S16 OPEN, S17
 # checkpoint + exact CLOSED writer observation, S18 same-DATA restart.
 use strict;

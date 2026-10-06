@@ -102,7 +102,10 @@ typedef struct TestSemanticSourceCloseStorage {
 static TestSemanticSourceCloseStorage test_semantic_source_close;
 static TestSemanticBit22SeamStorage test_semantic_bit22_seam;
 static pg_atomic_uint32 test_semantic_clean_start;
-static union { pg_atomic_uint64 align; uint8 bytes[1568]; } test_normal_start_completion;
+static union {
+	pg_atomic_uint64 align;
+	uint8 bytes[1568];
+} test_normal_start_completion;
 static TestSemanticShmemStorage test_serving_completion;
 static bool test_serving_found;
 static bool test_serving_formation_valid;
@@ -191,7 +194,7 @@ cluster_wal_writer_ready(TimeLineID timeline)
 	Assert(IsUnderPostmaster);
 	++test_first_live_checks;
 	return timeline == test_first_writer.timeline ? test_first_live_result
-													 : CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+												  : CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 }
 static int test_stop_not_fresh_peer = -1;
 static bool test_stop_storage_quorum = true;
@@ -349,7 +352,8 @@ void *
 ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 {
 	if (strcmp(name, "pgrac semantic ROOT serving completion") == 0) {
-		if (size > sizeof(test_serving_completion)) abort();
+		if (size > sizeof(test_serving_completion))
+			abort();
 		*foundPtr = test_serving_found;
 		return test_serving_completion.bytes;
 	}
@@ -669,7 +673,7 @@ cluster_sf_peer_capability_record_snapshot(int32 peer_id, ClusterSfPeerCap *out)
 	}
 	test_peer_capability_sample_calls[peer_id]++;
 	out->valid = test_peer_capability_word_sample_ok && peer_id != test_capability_missing_peer
-		&& (test_capability_missing_bitmap & (UINT64_C(1) << peer_id)) == 0;
+				 && (test_capability_missing_bitmap & (UINT64_C(1) << peer_id)) == 0;
 	out->bits = test_peer_capability_word;
 	out->generation = test_peer_capability_generation;
 	return true;
@@ -822,7 +826,8 @@ test_stop_observation_current(const ClusterSemanticActivationRecord *open, const
 		candidate.admitted_incarnation[node]
 			= cluster_membership_get_last_admitted_incarnation(node);
 	return cluster_reconfig_r4_membership_observations_current(&candidate, true, open, root, -1)
-		   && cluster_reconfig_r4_membership_observations_current(&candidate, false, open, root, -1);
+		   && cluster_reconfig_r4_membership_observations_current(&candidate, false, open, root,
+																  -1);
 }
 
 /* Real coherent membership acquisition is tested in test_cluster_reconfig.
@@ -842,24 +847,50 @@ cluster_reconfig_terminal_peer_membership(int32 peer, ClusterR4MembershipSnapsho
 	candidate.admitted_members_hi = test_membership_snapshot_hi;
 	candidate.local_self_boot_incarnation = cluster_qvotec_get_self_incarnation();
 	for (int node = 0; node < 4; node++)
-		candidate.admitted_incarnation[node] = cluster_membership_get_last_admitted_incarnation(node);
+		candidate.admitted_incarnation[node]
+			= cluster_membership_get_last_admitted_incarnation(node);
 	if (!cluster_reconfig_r4_membership_observations_current(&candidate, true, NULL, NULL, peer)
-		|| !cluster_reconfig_r4_membership_observations_current(&candidate, false, NULL, NULL, peer))
+		|| !cluster_reconfig_r4_membership_observations_current(&candidate, false, NULL, NULL,
+																peer))
 		return false;
 	*out = candidate;
 	return true;
 }
-uint64 cluster_membership_cut_generation(void) { return test_terminal_membership_cut; }
-bool cluster_membership_cut_generation_current(uint64 cut)
-{ return cut != 0 && cut == test_terminal_membership_cut; }
-bool cluster_write_fence_allowed(void) { return !test_terminal_fenced; }
-bool cluster_reconfig_has_pending_prebump_stage(void) { return test_terminal_prebump; }
-bool cluster_reconfig_join_in_progress(void) { return test_terminal_join; }
-bool cluster_normal_stop_requested(void) { return test_terminal_stop; }
+uint64
+cluster_membership_cut_generation(void)
+{
+	return test_terminal_membership_cut;
+}
+bool
+cluster_membership_cut_generation_current(uint64 cut)
+{
+	return cut != 0 && cut == test_terminal_membership_cut;
+}
+bool
+cluster_write_fence_allowed(void)
+{
+	return !test_terminal_fenced;
+}
+bool
+cluster_reconfig_has_pending_prebump_stage(void)
+{
+	return test_terminal_prebump;
+}
+bool
+cluster_reconfig_join_in_progress(void)
+{
+	return test_terminal_join;
+}
+bool
+cluster_normal_stop_requested(void)
+{
+	return test_terminal_stop;
+}
 static bool test_clean_admitted = true;
 
 bool
-cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread, ClusterFormationSnapshotV1 *out)
+cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
+											   ClusterFormationSnapshotV1 *out)
 {
 	memset(out, 0, sizeof(*out));
 	if (!test_serving_formation_valid || origin_thread != cluster_node_id + 1)
@@ -868,35 +899,45 @@ cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread, ClusterForm
 	out->local_epoch = test_current_epoch;
 	out->self_join_admitted = test_clean_admitted ? 1 : 0;
 	for (int node = 0; node < 4; node++) {
-		out->membership.membership_state[node] = (test_membership_snapshot_lo & (UINT64_C(1) << node))
-			? CLUSTER_MEMBER_MEMBER : CLUSTER_MEMBER_ABSENT;
-		out->membership.last_admitted_incarnation[node] = cluster_membership_get_last_admitted_incarnation(node);
+		out->membership.membership_state[node]
+			= (test_membership_snapshot_lo & (UINT64_C(1) << node)) ? CLUSTER_MEMBER_MEMBER
+																	: CLUSTER_MEMBER_ABSENT;
+		out->membership.last_admitted_incarnation[node]
+			= cluster_membership_get_last_admitted_incarnation(node);
 	}
 	return true;
 }
 ClusterControlRootResult
-cluster_control_root_v3_serving_poll(const ClusterSemanticActivationRecord *open,
-	const uint8 *root, ClusterControlRootFileToken *out)
+cluster_control_root_v3_serving_poll(const ClusterSemanticActivationRecord *open, const uint8 *root,
+									 ClusterControlRootFileToken *out)
 {
 	test_serving_calls++;
 	test_serving_open = *open;
 	memcpy(test_serving_root, root, sizeof(test_serving_root));
 	memset(out, 0, sizeof(*out));
-	if (test_serving_hook != NULL) test_serving_hook();
-	if (test_serving_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) *out = test_serving_token;
+	if (test_serving_hook != NULL)
+		test_serving_hook();
+	if (test_serving_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = test_serving_token;
 	return test_serving_result;
 }
-void cluster_control_root_v3_serving_cancel(void) { test_serving_cancels++; }
+void
+cluster_control_root_v3_serving_cancel(void)
+{
+	test_serving_cancels++;
+}
 bool
 cluster_ic_tier1_terminal_peer_sessions(int32 peer, uint64 epoch, uint32 cap, int channels,
-									  ClusterICTerminalPeerSessions *out)
+										ClusterICTerminalPeerSessions *out)
 {
 	memset(out, 0, sizeof(*out));
 	test_terminal_session_calls++;
-	if (test_terminal_session_calls == test_terminal_session_hook_at && test_terminal_session_hook != NULL)
+	if (test_terminal_session_calls == test_terminal_session_hook_at
+		&& test_terminal_session_hook != NULL)
 		test_terminal_session_hook();
 	if (!test_terminal_sessions_ok || peer < 0 || peer >= 4 || epoch != test_current_epoch
-		|| cap != test_peer_capability_generation || channels != (int)test_terminal_sessions.data_channels)
+		|| cap != test_peer_capability_generation
+		|| channels != (int)test_terminal_sessions.data_channels)
 		return false;
 	*out = test_terminal_sessions;
 	return true;
@@ -3147,8 +3188,9 @@ test_member_early_sample_ack(int observation_gap)
 	if (observation_gap >= 4) {
 		/* The original stage-ahead owner keeps the exact frame while the
 		 * local gate catches up; no row exists before the exact request. */
-		UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(
-			&semantic_activation_ack_local_ingress), UINT32_C(0));
+		UT_ASSERT_EQ(
+			semantic_activation_ack_ingress_pending(&semantic_activation_ack_local_ingress),
+			UINT32_C(0));
 		UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(1));
 		UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
 		UT_ASSERT_EQ(table.observed_members_lo, UINT64_C(0));
@@ -3161,8 +3203,9 @@ test_member_early_sample_ack(int observation_gap)
 		cluster_semantic_activation_lmon_tick();
 	}
 	if (observation_gap == 1 || observation_gap == 2) {
-		UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(
-			&semantic_activation_ack_local_ingress), UINT32_C(1));
+		UT_ASSERT_EQ(
+			semantic_activation_ack_ingress_pending(&semantic_activation_ack_local_ingress),
+			UINT32_C(1));
 		UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(0));
 		UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
 		UT_ASSERT_EQ(table.expected_members_lo, UINT64_C(0));
@@ -3193,21 +3236,30 @@ test_member_early_sample_ack(int observation_gap)
 	message.target_feature_bitmap = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
 	message.admitted_members_lo = UINT64_C(0x0f);
 	switch (observation_gap) {
-	case 7: message.round_nonce++; break;
-	case 8: message.record_generation++; break;
+	case 7:
+		message.round_nonce++;
+		break;
+	case 8:
+		message.record_generation++;
+		break;
 	case 9:
 		test_current_epoch++;
 		message.transition_epoch = test_current_epoch;
 		envelope.epoch = test_current_epoch;
 		test_gate_publish(8, 0, 0, test_current_epoch, false);
 		break;
-	case 10: test_terminal_nonmember = 1; break;
-	case 11: test_remote_admitted_incarnations[1]++; break;
+	case 10:
+		test_terminal_nonmember = 1;
+		break;
+	case 11:
+		test_remote_admitted_incarnations[1]++;
+		break;
 	case 12:
 		test_peer_capability_generation++;
 		test_capability_missing_peer = 1; /* old peer generation no longer matches */
 		break;
-	default: break;
+	default:
+		break;
 	}
 	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
 	envelope.source_node_id = 0;
@@ -5783,18 +5835,22 @@ UT_TEST(test_local_admission_observation_tracks_actual_auxiliary_lifetime)
 {
 	AuxProcType roles[] = { LmsProcess, LmsWorker1Process, UndoCleanerProcess, LmonProcess };
 	for (size_t role = 0; role < lengthof(roles); role++)
-		for (int side = CLUSTER_SEMANTIC_SOURCE_SIDE; side <= CLUSTER_SEMANTIC_TARGET_SIDE; side++) {
+		for (int side = CLUSTER_SEMANTIC_SOURCE_SIDE; side <= CLUSTER_SEMANTIC_TARGET_SIDE;
+			 side++) {
 			ClusterSemanticAdmissionToken first, second;
 			test_gate_reset();
 			MyAuxProcType = roles[role];
-			test_gate_publish(2, side == CLUSTER_SEMANTIC_TARGET_SIDE
-								 ? CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1 : 0,
-							  17, test_current_epoch, false);
+			test_gate_publish(
+				2,
+				side == CLUSTER_SEMANTIC_TARGET_SIDE ? CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1 : 0,
+				17, test_current_epoch, false);
 			UT_ASSERT(!cluster_semantic_activation_backend_has_admission());
 			UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
-														   side, &first), CLUSTER_SEMANTIC_ADMISSION_OK);
+														   side, &first),
+						 CLUSTER_SEMANTIC_ADMISSION_OK);
 			UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
-														   side, &second), CLUSTER_SEMANTIC_ADMISSION_OK);
+														   side, &second),
+						 CLUSTER_SEMANTIC_ADMISSION_OK);
 			UT_ASSERT(cluster_semantic_activation_backend_has_admission());
 			test_current_epoch++;
 			UT_ASSERT(!cluster_semantic_activation_recheck(&first));
@@ -9699,17 +9755,20 @@ UT_TEST(test_clean_restart_missing_fanout_peer_retries_before_open)
 		UT_ASSERT_EQ(SemanticActivationAckTable->observed_members_lo, 15);
 		cluster_semantic_activation_lmon_tick();
 		(void)ut_a142_complete_open_read(0);
-		UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation), RESOURCE_X_WRITER_CLOSED);
+		UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation),
+					 RESOURCE_X_WRITER_CLOSED);
 		test_resource_x_cutover_digest_valid = true;
 		test_resource_x_cutover_digest = 99;
 		test_resource_x_cutover_token.old_formation = 1;
 		test_resource_x_cutover_token.new_formation = 2;
 		test_resource_x_cutover_token.freeze_generation = 1;
 		cluster_semantic_activation_lmon_tick();
-		UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation), RESOURCE_X_WRITER_CLOSED);
+		UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation),
+					 RESOURCE_X_WRITER_CLOSED);
 		test_resource_x_cutover_thawed = true;
 		cluster_semantic_activation_lmon_tick();
-		UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation), RESOURCE_X_WRITER_TARGET);
+		UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation),
+					 RESOURCE_X_WRITER_TARGET);
 		UT_ASSERT_EQ(generation, 6);
 		UT_ASSERT(semantic_activation_restart.opened);
 
@@ -9722,8 +9781,10 @@ UT_TEST(test_clean_restart_missing_fanout_peer_retries_before_open)
 			read.request_seq, CLUSTER_SEMANTIC_ACTIVATION_OK, false, bytes));
 		UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&open, root, incarnations, &reason),
 					 CLUSTER_NORMAL_STOP_READY);
-		if (shared) ut_cold_cleanup();
-		else test_gate_reset();
+		if (shared)
+			ut_cold_cleanup();
+		else
+			test_gate_reset();
 	}
 }
 
@@ -9968,9 +10029,10 @@ UT_TEST(test_restart_final_record_contradiction_retains_first_diagnostic)
 
 UT_TEST(test_restart_invalidation_keeps_first_reason_through_normal_stop)
 {
-	const char *expected[] = { "SEMANTIC_ACK_CAPABILITY_INVALID",
-		"SEMANTIC_RESTART_READY_IDENTITY_INVALID", "SEMANTIC_RESTART_READY_IDENTITY_INVALID",
-		"SEMANTIC_ACK_SEND_FAILED", "SEMANTIC_ACK_PEER_IDENTITY_INVALID" };
+	const char *expected[]
+		= { "SEMANTIC_ACK_CAPABILITY_INVALID", "SEMANTIC_RESTART_READY_IDENTITY_INVALID",
+			"SEMANTIC_RESTART_READY_IDENTITY_INVALID", "SEMANTIC_ACK_SEND_FAILED",
+			"SEMANTIC_ACK_PEER_IDENTITY_INVALID" };
 	for (int fault = 0; fault < 5; fault++) {
 		const char *domain, *reason;
 		uint64 key;
@@ -9979,11 +10041,21 @@ UT_TEST(test_restart_invalidation_keeps_first_reason_through_normal_stop)
 		ut_s17_waiting_ack();
 		test_capability_missing_bitmap = 0;
 		switch (fault) {
-		case 0: test_peer_capability_word &= ~PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1; break;
-		case 1: NormalStartCompletion->boot_incarnation++; break;
-		case 2: NormalStartCompletion->pgrd[511] ^= 1; break;
-		case 3: test_send_results[1] = CLUSTER_IC_SEND_HARD_ERROR; break;
-		case 4: ut_a142_frame(0, true, 23, UINT64_C(0x999)); break;
+		case 0:
+			test_peer_capability_word &= ~PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+			break;
+		case 1:
+			NormalStartCompletion->boot_incarnation++;
+			break;
+		case 2:
+			NormalStartCompletion->pgrd[511] ^= 1;
+			break;
+		case 3:
+			test_send_results[1] = CLUSTER_IC_SEND_HARD_ERROR;
+			break;
+		case 4:
+			ut_a142_frame(0, true, 23, UINT64_C(0x999));
+			break;
 		}
 		cluster_semantic_activation_lmon_tick();
 		UT_ASSERT(semantic_activation_restart.failed);

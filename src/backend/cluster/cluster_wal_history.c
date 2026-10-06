@@ -299,8 +299,7 @@ cluster_wal_startup_empty_locked(const ControlRootImage *root, uint32 node, bool
 			fds[i] = open(names[i], flags);
 		else
 			fds[i] = startup_empty_dir(fds[parents[i]], names[i],
-									   create && (i == 2 || i == 3 || i == 8 || i == 9),
-									   &created);
+									   create && (i == 2 || i == 3 || i == 8 || i == 9), &created);
 		if (fds[i] < 0) {
 			result = errno == ENOENT ? CLUSTER_CONTROL_ROOT_ABSENT : CLUSTER_CONTROL_ROOT_IO_ERROR;
 			/* PGRAC: only a not-yet-created target generation is waitable
@@ -321,8 +320,8 @@ cluster_wal_startup_empty_locked(const ControlRootImage *root, uint32 node, bool
 										sizeof(claim), create && created, sync);
 			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 				goto done;
-			if (!startup_empty_entries(fds[2], CLUSTER_WAL_THREAD_CLAIM_FILENAME,
-									   "archive_status", NULL)) {
+			if (!startup_empty_entries(fds[2], CLUSTER_WAL_THREAD_CLAIM_FILENAME, "archive_status",
+									   NULL)) {
 				result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 				goto done;
 			}

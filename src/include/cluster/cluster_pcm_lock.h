@@ -111,8 +111,8 @@ static inline bool
 cluster_pcm_legacy_transition_allowed(bool shared, PcmLockTransition transition)
 {
 	return !shared || transition == PCM_TRANS_N_TO_S || transition == PCM_TRANS_X_TO_S_DOWNGRADE
-		|| transition == PCM_TRANS_X_TO_N_DOWNGRADE || transition == PCM_TRANS_X_TO_N_RELEASE
-		|| transition == PCM_TRANS_S_TO_N_INVALIDATE || transition == PCM_TRANS_S_TO_N_RELEASE;
+		   || transition == PCM_TRANS_X_TO_N_DOWNGRADE || transition == PCM_TRANS_X_TO_N_RELEASE
+		   || transition == PCM_TRANS_S_TO_N_INVALIDATE || transition == PCM_TRANS_S_TO_N_RELEASE;
 }
 #define PCM_TRANSITION_COUNT 9
 
@@ -1839,8 +1839,8 @@ typedef struct ResourceXSourceWalRetainedV1 {
 	uint32 page_checksum;
 } ResourceXSourceWalRetainedV1;
 extern bool cluster_pcm_lock_resource_x_holder_pair_wal_retained_exact(
-	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
-	uint64 source_generation, ResourceXSourceWalRetainedV1 *out);
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node, uint64 source_generation,
+	ResourceXSourceWalRetainedV1 *out);
 /* Replay only a published, undrained immutable pair. Occupied physical slots
  * are validated and left untouched; an empty pair is rearmed atomically. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_pair_replay_exact(

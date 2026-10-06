@@ -366,8 +366,8 @@ queue_record(RfPageOnlinePlanV1 *plan, FakeRecord *record, uint16 participant)
 static RfPageOnlinePlanV1 *
 three_stream_plan(void)
 {
-	RfContributorStreamCutV1 cuts[3] = {{0}};
-	RfPageOnlinePlanRequestV1 request = {0};
+	RfContributorStreamCutV1 cuts[3] = { { 0 } };
+	RfPageOnlinePlanRequestV1 request = { 0 };
 	RfPageOnlinePlanV1 *plan = NULL;
 	int i;
 	for (i = 0; i < 3; i++) {

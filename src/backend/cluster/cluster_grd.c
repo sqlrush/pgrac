@@ -3119,8 +3119,7 @@ cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out)
 		return;
 	out->local_pi_redeclare_cursor
 		= pg_atomic_read_u32(&cluster_grd_state->local_pi_redeclare_cursor);
-	out->block_redeclare_retries
-		= pg_atomic_read_u64(&cluster_grd_state->block_redeclare_retries);
+	out->block_redeclare_retries = pg_atomic_read_u64(&cluster_grd_state->block_redeclare_retries);
 	out->local_pi_redeclare_retries
 		= pg_atomic_read_u64(&cluster_grd_state->local_pi_redeclare_retries);
 	out->remaster_started = pg_atomic_read_u64(&cluster_grd_state->remaster_started_count);
@@ -4353,7 +4352,8 @@ publish_progress:
 	 * the exact private episode/generation and completion state. */
 	if (cluster_grd_state != NULL) {
 		pg_atomic_write_u32(&cluster_grd_state->block_redeclare_cursor, grd_block_redeclare_cursor);
-		pg_atomic_write_u32(&cluster_grd_state->local_pi_redeclare_cursor, grd_local_pi_redeclare_cursor);
+		pg_atomic_write_u32(&cluster_grd_state->local_pi_redeclare_cursor,
+							grd_local_pi_redeclare_cursor);
 		pg_atomic_write_u64(&cluster_grd_state->block_redeclare_epoch, grd_block_redeclare_epoch);
 		pg_atomic_write_u32(&cluster_grd_state->block_redeclare_done, grd_block_redeclare_done);
 	}
@@ -4380,19 +4380,24 @@ grd_block_redeclare_scan_complete(uint64 episode_epoch)
 int
 cluster_grd_recovery_block_redeclare_cursor(void)
 {
-	return cluster_grd_state != NULL ? (int)pg_atomic_read_u32(&cluster_grd_state->block_redeclare_cursor) : 0;
+	return cluster_grd_state != NULL
+			   ? (int)pg_atomic_read_u32(&cluster_grd_state->block_redeclare_cursor)
+			   : 0;
 }
 
 uint64
 cluster_grd_recovery_block_redeclare_epoch(void)
 {
-	return cluster_grd_state != NULL ? pg_atomic_read_u64(&cluster_grd_state->block_redeclare_epoch) : 0;
+	return cluster_grd_state != NULL ? pg_atomic_read_u64(&cluster_grd_state->block_redeclare_epoch)
+									 : 0;
 }
 
 bool
 cluster_grd_recovery_block_redeclare_done(void)
 {
-	return cluster_grd_state != NULL ? pg_atomic_read_u32(&cluster_grd_state->block_redeclare_done) != 0 : 0;
+	return cluster_grd_state != NULL
+			   ? pg_atomic_read_u32(&cluster_grd_state->block_redeclare_done) != 0
+			   : 0;
 }
 
 void

@@ -977,7 +977,7 @@ UT_TEST(test_copy_reserves_before_data_and_reopens_after_current_read)
 		invalidate_on_reserve = true;
 		if (buffered)
 			RelationCopyStorageUsingBuffer(source.smgr_rlocator.locator,
-				destination.smgr_rlocator.locator, MAIN_FORKNUM, true);
+										   destination.smgr_rlocator.locator, MAIN_FORKNUM, true);
 		else
 			RelationCopyStorage(&source, &destination, MAIN_FORKNUM, RELPERSISTENCE_PERMANENT);
 		UT_ASSERT_EQ(reservations, 1);
@@ -995,7 +995,8 @@ UT_TEST(test_copy_refuses_before_any_zero_fill_or_wal_without_reservation)
 		if (setjmp(error_jump) == 0) {
 			if (buffered)
 				RelationCopyStorageUsingBuffer(source.smgr_rlocator.locator,
-					destination.smgr_rlocator.locator, MAIN_FORKNUM, true);
+											   destination.smgr_rlocator.locator, MAIN_FORKNUM,
+											   true);
 			else
 				RelationCopyStorage(&source, &destination, MAIN_FORKNUM, RELPERSISTENCE_PERMANENT);
 			UT_ASSERT(false);

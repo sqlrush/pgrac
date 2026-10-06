@@ -7,6 +7,8 @@
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * PGRAC MODIFICATIONS: honor qualified redo buffer initialization results.
+ *
  * IDENTIFICATION
  *	  src/backend/access/hash/hash_xlog.c
  *
@@ -34,7 +36,7 @@ hash_xlog_init_meta_page(XLogReaderState *record)
 	Buffer		metabuf;
 	ForkNumber	forknum;
 
-	xl_hash_init_meta_page *xlrec = (xl_hash_init_meta_page *) XLogRecGetData(record);
+	const xl_hash_init_meta_page *xlrec = (xl_hash_init_meta_page *) XLogRecGetData(record);
 
 	/* create the index' metapage */
 	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &metabuf)
@@ -75,10 +77,9 @@ hash_xlog_init_bitmap_page(XLogReaderState *record)
 	Buffer		metabuf;
 	Page		page;
 	HashMetaPage metap;
-	uint32		num_buckets;
 	ForkNumber	forknum;
 
-	xl_hash_init_bitmap_page *xlrec = (xl_hash_init_bitmap_page *) XLogRecGetData(record);
+	const xl_hash_init_bitmap_page *xlrec = (xl_hash_init_bitmap_page *) XLogRecGetData(record);
 
 	/*
 	 * Initialize bitmap page
@@ -105,6 +106,8 @@ hash_xlog_init_bitmap_page(XLogReaderState *record)
 	/* add the new bitmap page to the metapage's list of bitmaps */
 	if (XLogReadBufferForRedo(record, 1, &metabuf) == BLK_NEEDS_REDO)
 	{
+		uint32		num_buckets;
+
 		/*
 		 * Note: in normal operation, we'd update the metapage while still
 		 * holding lock on the bitmap page.  But during replay it's not
@@ -184,7 +187,7 @@ static void
 hash_xlog_add_ovfl_page(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	xl_hash_add_ovfl_page *xlrec = (xl_hash_add_ovfl_page *) XLogRecGetData(record);
+	const xl_hash_add_ovfl_page *xlrec = (xl_hash_add_ovfl_page *) XLogRecGetData(record);
 	Buffer		leftbuf;
 	Buffer		ovflbuf;
 	Buffer		metabuf;
@@ -192,8 +195,6 @@ hash_xlog_add_ovfl_page(XLogReaderState *record)
 	BlockNumber rightblk;
 	BlockNumber newmapblk = InvalidBlockNumber;
 	Page		ovflpage;
-	HashPageOpaque ovflopaque;
-	uint32	   *num_bucket;
 	char	   *data;
 	Size		datalen PG_USED_FOR_ASSERTS_ONLY;
 	bool		new_bmpage = false;
@@ -203,6 +204,9 @@ hash_xlog_add_ovfl_page(XLogReaderState *record)
 
 	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &ovflbuf)
 		== BLK_NEEDS_REDO) {
+		HashPageOpaque ovflopaque;
+		const uint32 *num_bucket;
+
 		Assert(BufferIsValid(ovflbuf));
 
 		data = XLogRecGetBlockData(record, 0, &datalen);
@@ -250,7 +254,7 @@ hash_xlog_add_ovfl_page(XLogReaderState *record)
 		{
 			Page		mappage = (Page) BufferGetPage(mapbuffer);
 			uint32	   *freep = NULL;
-			uint32	   *bitmap_page_bit;
+			const uint32	   *bitmap_page_bit;
 
 			freep = HashPageGetBitmap(mappage);
 
@@ -289,7 +293,7 @@ hash_xlog_add_ovfl_page(XLogReaderState *record)
 	{
 		HashMetaPage metap;
 		Page		page;
-		uint32	   *firstfree_ovflpage;
+		const uint32	   *firstfree_ovflpage;
 
 		data = XLogRecGetBlockData(record, 4, &datalen);
 		firstfree_ovflpage = (uint32 *) data;
@@ -326,12 +330,11 @@ static void
 hash_xlog_split_allocate_page(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	xl_hash_split_allocate_page *xlrec = (xl_hash_split_allocate_page *) XLogRecGetData(record);
+	const xl_hash_split_allocate_page *xlrec = (xl_hash_split_allocate_page *) XLogRecGetData(record);
 	Buffer		oldbuf;
 	Buffer		newbuf;
 	Buffer		metabuf;
 	Size		datalen PG_USED_FOR_ASSERTS_ONLY;
-	char	   *data;
 	XLogRedoAction action;
 
 	/*
@@ -391,6 +394,7 @@ hash_xlog_split_allocate_page(XLogReaderState *record)
 	{
 		Page		page;
 		HashMetaPage metap;
+		char	   *data;
 
 		page = BufferGetPage(metabuf);
 		metap = HashPageGetMeta(page);
@@ -401,7 +405,7 @@ hash_xlog_split_allocate_page(XLogReaderState *record)
 		if (xlrec->flags & XLH_SPLIT_META_UPDATE_MASKS)
 		{
 			uint32		lowmask;
-			uint32	   *highmask;
+			const uint32	   *highmask;
 
 			/* extract low and high masks. */
 			memcpy(&lowmask, data, sizeof(uint32));
@@ -417,7 +421,7 @@ hash_xlog_split_allocate_page(XLogReaderState *record)
 		if (xlrec->flags & XLH_SPLIT_META_UPDATE_SPLITPOINT)
 		{
 			uint32		ovflpoint;
-			uint32	   *ovflpages;
+			const uint32	   *ovflpages;
 
 			/* extract information of overflow pages. */
 			memcpy(&ovflpoint, data, sizeof(uint32));

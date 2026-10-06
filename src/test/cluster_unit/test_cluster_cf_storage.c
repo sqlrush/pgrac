@@ -870,7 +870,8 @@ UT_TEST(test_bootstrap_role)
 void
 cluster_control_bootstrap_catalog_prepare(const char *pgdata)
 {
-	if (pgdata != NULL) abort();
+	if (pgdata != NULL)
+		abort();
 	ereport(FATAL, (errmsg("catalog startup has no exact ROOT bootstrap preparation")));
 }
 

@@ -250,8 +250,8 @@ extern void rf_page_stable_base_proof_destroy_v1(RfPageStableBaseProofV1 **proof
 /* Exact ancestor membership in the proof's immutable, fully checked chain.
  * This is not authority: the caller must hold and revalidate the bound owners. */
 extern bool rf_page_stable_base_proof_covers_version_v1(const RfPageStableBaseProofV1 *proof,
-														 const RfPageIdentityV1 *identity,
-														 const RfPageVersionV1 *version);
+														const RfPageIdentityV1 *identity,
+														const RfPageVersionV1 *version);
 
 #ifdef USE_CLUSTER_UNIT
 

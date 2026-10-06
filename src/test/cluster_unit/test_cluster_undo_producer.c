@@ -86,8 +86,12 @@ GetRedoRecPtr(void)
 }
 
 #undef ereport
-#define ereport(level_, rest_) \
-	do { if (expect_panic) longjmp(panic_jump, 1); abort(); } while (0)
+#define ereport(level_, rest_)                                                                     \
+	do {                                                                                           \
+		if (expect_panic)                                                                          \
+			longjmp(panic_jump, 1);                                                                \
+		abort();                                                                                   \
+	} while (0)
 #include "test_cluster_undo_producer_owner.inc"
 
 /* Execute the actual native block writer; only path and physical I/O are
@@ -181,9 +185,9 @@ decode_emitted(bool accepted)
 		char bytes[BLCKSZ + 512];
 	} wire;
 	XLogRecord *header = (XLogRecord *)wire.bytes;
-	XLogReaderState reader = {0};
+	XLogReaderState reader = { 0 };
 	DecodedXLogRecord *decoded;
-	ClusterUndoDecoded result = {0};
+	ClusterUndoDecoded result = { 0 };
 	char error_buffer[1024];
 	char *error = NULL;
 	char *p = wire.bytes + SizeOfXLogRecord;
@@ -276,7 +280,7 @@ UT_TEST(test_tt_producer_identity_and_polarity)
 
 UT_TEST(test_ctrc_release_producer_certificate)
 {
-	xl_undo_tt_slot_ctrc_release_v1 certificate = {0};
+	xl_undo_tt_slot_ctrc_release_v1 certificate = { 0 };
 	ClusterUndoDecoded out;
 
 	certificate.segment_id = 513;
@@ -316,14 +320,9 @@ check_block_producer(bool multi)
 		bool fpw;
 		XLogRecPtr before;
 		bool fpi;
-	} cases[] = {
-		{false, false, 900, true},
-		{true, true, 0, true},
-		{true, true, 99, true},
-		{true, true, 100, true},
-		{true, true, 101, false},
-		{true, false, 99, false}
-	};
+	} cases[]
+		= { { false, false, 900, true }, { true, true, 0, true },	 { true, true, 99, true },
+			{ true, true, 100, true },	 { true, true, 101, false }, { true, false, 99, false } };
 	uint16 rec_off = sizeof(UndoBlockHeader), rec_len = 73;
 	uint16 slot_len = (multi ? 2 : 1) * sizeof(UndoSlotDirEntry);
 	uint16 slot_off = BLCKSZ - slot_len;
@@ -339,14 +338,14 @@ check_block_producer(bool multi)
 		writeback = cases[i].writeback;
 		full_page_writes = cases[i].fpw;
 		if (multi)
-			cluster_undo_emit_block_write_multi(3, 513, 2, image, cases[i].before,
-											  rec_off, rec_len, slot_off, slot_len);
+			cluster_undo_emit_block_write_multi(3, 513, 2, image, cases[i].before, rec_off, rec_len,
+												slot_off, slot_len);
 		else
-			cluster_undo_emit_block_write(3, 513, 2, image, cases[i].before,
-										rec_off, rec_len, slot_off);
+			cluster_undo_emit_block_write(3, 513, 2, image, cases[i].before, rec_off, rec_len,
+										  slot_off);
 		out = decode_emitted(true);
-		UT_ASSERT_EQ(out.kind, multi ? CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI
-									: CLUSTER_UNDO_KIND_BLOCK_WRITE);
+		UT_ASSERT_EQ(out.kind,
+					 multi ? CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI : CLUSTER_UNDO_KIND_BLOCK_WRITE);
 		UT_ASSERT_EQ(out.has_fpi, cases[i].fpi);
 		UT_ASSERT_EQ(out.block_no, 2);
 		body = payload + out.payload_offset;
@@ -372,9 +371,9 @@ check_block_producer(bool multi)
 			memcpy(expected.data + slot_off, image + slot_off, slot_len);
 		}
 		((UndoBlockHeader *)expected.data)->block_lsn = 0x900;
-		UT_ASSERT(cluster_undo_prepare_block_v1(&out,
-			(const uint8 *)payload + out.payload_offset, out.payload_length,
-			0x900, out.has_fpi ? NULL : base.data, prepared.data));
+		UT_ASSERT(cluster_undo_prepare_block_v1(&out, (const uint8 *)payload + out.payload_offset,
+												out.payload_length, 0x900,
+												out.has_fpi ? NULL : base.data, prepared.data));
 		UT_ASSERT(memcmp(prepared.data, expected.data, BLCKSZ) == 0);
 	}
 }
@@ -394,7 +393,7 @@ UT_TEST(test_unowned_segment_and_hwm_do_not_gain_authority)
 	ClusterUndoDecoded out;
 	cluster_undo_emit_tt_slot_commit(2, 513, 4, 7, 801, 901);
 	(void)decode_emitted(false);
-	cluster_hw_emit_reserve((RelFileLocator){1, 2, 10}, MAIN_FORKNUM, 128, 16);
+	cluster_hw_emit_reserve((RelFileLocator){ 1, 2, 10 }, MAIN_FORKNUM, 128, 16);
 	out = decode_emitted(false);
 	UT_ASSERT_EQ(out.kind, CLUSTER_UNDO_KIND_HW_RESERVE);
 	UT_ASSERT_EQ(out.block_no, 128);
@@ -408,8 +407,8 @@ UT_TEST(test_private_block_preparation_refusal_is_atomic)
 	memset(image.data, 0x4d, BLCKSZ);
 	writeback = full_page_writes = true;
 	checkpoint_redo = 100;
-	cluster_undo_emit_block_write_multi(3, 513, 2, image.data, 101,
-									  sizeof(UndoBlockHeader), 73, BLCKSZ - 16, 16);
+	cluster_undo_emit_block_write_multi(3, 513, 2, image.data, 101, sizeof(UndoBlockHeader), 73,
+										BLCKSZ - 16, 16);
 	decoded = decode_emitted(true);
 	for (int variant = 0; variant < 5; variant++) {
 		ClusterUndoDecoded bad = decoded;
@@ -420,14 +419,19 @@ UT_TEST(test_private_block_preparation_refusal_is_atomic)
 		memset(output.data, 0x5c, BLCKSZ);
 		((UndoBlockHeader *)output.data)->block_lsn = 13;
 		base = output.data;
-		if (variant == 0) base = NULL;
-		if (variant == 1) ((UndoBlockHeader *)output.data)->block_lsn = 0;
-		if (variant == 2) length--;
-		if (variant == 3) bad.slot_off = bad.rec_off + bad.rec_len - 1;
-		if (variant == 4) end = 0;
+		if (variant == 0)
+			base = NULL;
+		if (variant == 1)
+			((UndoBlockHeader *)output.data)->block_lsn = 0;
+		if (variant == 2)
+			length--;
+		if (variant == 3)
+			bad.slot_off = bad.rec_off + bad.rec_len - 1;
+		if (variant == 4)
+			end = 0;
 		before = output;
-		UT_ASSERT(!cluster_undo_prepare_block_v1(&bad,
-			(const uint8 *)payload + bad.payload_offset, length, end, base, output.data));
+		UT_ASSERT(!cluster_undo_prepare_block_v1(&bad, (const uint8 *)payload + bad.payload_offset,
+												 length, end, base, output.data));
 		UT_ASSERT(memcmp(output.data, before.data, BLCKSZ) == 0);
 	}
 }
@@ -442,8 +446,8 @@ UT_TEST(test_native_block_writer_uses_typed_preparation_before_write_and_sync)
 	checkpoint_redo = 100;
 	for (int variant = 0; variant < 3; variant++) {
 		const uint8 *body;
-		cluster_undo_emit_block_write_multi(3, 513, 2, image.data,
-			variant == 0 ? 0 : 101, sizeof(UndoBlockHeader), 73, BLCKSZ - 16, 16);
+		cluster_undo_emit_block_write_multi(3, 513, 2, image.data, variant == 0 ? 0 : 101,
+											sizeof(UndoBlockHeader), 73, BLCKSZ - 16, 16);
 		decoded = decode_emitted(true);
 		body = (const uint8 *)payload + decoded.payload_offset;
 		memset(native_disk.data, 0x5c, BLCKSZ);
@@ -451,8 +455,8 @@ UT_TEST(test_native_block_writer_uses_typed_preparation_before_write_and_sync)
 		expected = native_disk;
 		native_reads = native_writes = native_syncs = native_closes = native_applies = 0;
 		if (variant != 2) {
-			UT_ASSERT(cluster_undo_prepare_block_v1(&decoded, body, decoded.payload_length,
-												  0x900, native_disk.data, expected.data));
+			UT_ASSERT(cluster_undo_prepare_block_v1(&decoded, body, decoded.payload_length, 0x900,
+													native_disk.data, expected.data));
 			cluster_undo_redo_block_write(&decoded, body, 0x900);
 			UT_ASSERT_EQ(native_reads, variant == 0 ? 0 : 1);
 			UT_ASSERT_EQ(native_writes, 1);

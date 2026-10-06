@@ -1906,12 +1906,9 @@ UT_TEST(test_resource_x_intent_pump_drives_local_delivery_without_wire_or_busy_s
 
 UT_TEST(test_resource_x_intent_pump_reschedules_every_exhausted_last_result)
 {
-	ResourceXIntentProbeResult results[] = {
-		RESOURCE_X_INTENT_PROBE_DELIVERY,
-		RESOURCE_X_INTENT_PROBE_SOURCE_FINISH,
-		RESOURCE_X_INTENT_PROBE_FOUND,
-		RESOURCE_X_INTENT_PROBE_MORE
-	};
+	ResourceXIntentProbeResult results[]
+		= { RESOURCE_X_INTENT_PROBE_DELIVERY, RESOURCE_X_INTENT_PROBE_SOURCE_FINISH,
+			RESOURCE_X_INTENT_PROBE_FOUND, RESOURCE_X_INTENT_PROBE_MORE };
 	int i;
 
 	for (i = 0; i < lengthof(results); i++) {
@@ -1953,11 +1950,9 @@ UT_TEST(test_resource_x_intent_pump_reschedules_every_exhausted_last_result)
 
 UT_TEST(test_resource_x_intent_pump_stops_after_a_terminal_scan)
 {
-	ResourceXIntentProbeResult results[] = {
-		RESOURCE_X_INTENT_PROBE_IDLE,
-		RESOURCE_X_INTENT_PROBE_COMPLETE,
-		RESOURCE_X_INTENT_PROBE_CORRUPT
-	};
+	ResourceXIntentProbeResult results[]
+		= { RESOURCE_X_INTENT_PROBE_IDLE, RESOURCE_X_INTENT_PROBE_COMPLETE,
+			RESOURCE_X_INTENT_PROBE_CORRUPT };
 	int i;
 
 	for (i = 0; i < lengthof(results); i++) {
@@ -2506,7 +2501,7 @@ UT_TEST(test_plain_frame_down_epoch_change_clears_stop_debt_without_send)
 		UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 1);
 	}
 	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
-		CLUSTER_NORMAL_STOP_PENDING);
+				 CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT(strcmp(reason, "OUTBOUND_FRAME_PENDING") == 0);
 	ut_sent_n = 0;
 	ut_request_epoch++;
@@ -2514,7 +2509,7 @@ UT_TEST(test_plain_frame_down_epoch_change_clears_stop_debt_without_send)
 	UT_ASSERT_EQ(ut_sent_n, 0);
 	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
 	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
-		CLUSTER_NORMAL_STOP_READY);
+				 CLUSTER_NORMAL_STOP_READY);
 }
 
 UT_TEST(test_plain_frame_retained_copy_rejects_member_and_stream_changes)

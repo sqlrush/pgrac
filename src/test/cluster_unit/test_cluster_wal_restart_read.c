@@ -115,7 +115,7 @@ cluster_control_bootstrap_wal_route(const char *pgdata pg_attribute_unused(),
 
 bool
 cluster_wal_writer_startup_matches(const ClusterControlRootIdentity *self, const uint8 uuid[16],
-									XLogRecPtr first)
+								   XLogRecPtr first)
 {
 	return startup_binding && uuid[0] == 0x27 && first == 2 * wal_segment_size
 		   && memcmp(self, &installed_writer.claim.identity, sizeof(*self)) == 0;

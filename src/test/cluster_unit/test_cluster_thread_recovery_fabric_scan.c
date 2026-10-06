@@ -91,8 +91,9 @@ cluster_thread_recovery_authority_revalidate_nowait_v1(
 {
 	authority_revalidations++;
 	return authority != NULL && authority_current
-		&& authority->duty->origin_thread_id != stale_origin ? CLUSTER_THREAD_AUTHORITY_OK
-												  : CLUSTER_THREAD_AUTHORITY_ROOT_STALE;
+				   && authority->duty->origin_thread_id != stale_origin
+			   ? CLUSTER_THREAD_AUTHORITY_OK
+			   : CLUSTER_THREAD_AUTHORITY_ROOT_STALE;
 }
 
 bool
@@ -101,7 +102,7 @@ cluster_thread_recovery_authority_covers_window_v1(
 	XLogRecPtr scan_end)
 {
 	return authority != NULL && dead_thread == authority->duty->origin_thread_id
-		&& scan_begin == 0x100 && scan_end == 0x200;
+		   && scan_begin == 0x100 && scan_end == 0x200;
 }
 
 XLogReaderState *
@@ -251,7 +252,7 @@ cluster_thread_recovery_fabric_plan_seal_v1(ClusterThreadRecoveryFabricPlanV1 *p
 
 bool
 cluster_thread_recovery_fabric_bind_database_v1(ClusterThreadRecoveryFabricPlanV1 *plan,
-	uint64 database_incarnation)
+												uint64 database_incarnation)
 {
 	UT_ASSERT(plan == (ClusterThreadRecoveryFabricPlanV1 *)&fabric_object);
 	UT_ASSERT_EQ(plan_feed_count, 2 * expected_participants);
@@ -313,7 +314,7 @@ init_case(ClusterThreadRecoveryAuthorityV1 *authority)
 
 static void
 init_two(ClusterThreadRecoveryAuthorityV1 authorities[2], ClusterRecoveryDutyKey duties[2],
-	ClusterControlRootSnapshot roots[2], ClusterControlRootReadToken tokens[2])
+		 ClusterControlRootSnapshot roots[2], ClusterControlRootReadToken tokens[2])
 {
 	init_case(&authorities[0]);
 	duties[0] = *authorities[0].duty;
@@ -345,8 +346,9 @@ UT_TEST(test_multi_source_seals_one_plan_after_every_original_cut)
 	uint64 records = 99;
 
 	init_two(authorities, duties, roots, tokens);
-	UT_ASSERT_EQ(cluster_thread_recovery_fabric_scan_roots_v1(authorities, 2, false, &plan,
-		&records), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(
+		cluster_thread_recovery_fabric_scan_roots_v1(authorities, 2, false, &plan, &records),
+		RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT(plan != NULL && records == 4);
 	UT_ASSERT_EQ(plan_create_count, 1);
 	UT_ASSERT_EQ(plan_seal_count, 1);
@@ -372,8 +374,9 @@ UT_TEST(test_multi_source_late_refusal_discards_earlier_source_too)
 		exact_source_fault = fault;
 		PG_TRY();
 		{
-			UT_ASSERT(cluster_thread_recovery_fabric_scan_roots_v1(authorities, 2, false,
-				&plan, &records) != RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT(
+				cluster_thread_recovery_fabric_scan_roots_v1(authorities, 2, false, &plan, &records)
+				!= RF_PAGE_PROOF_DETAIL_OK);
 		}
 		PG_CATCH();
 		{
@@ -399,13 +402,21 @@ UT_TEST(test_multi_source_wrong_cut_namespace_or_pin_refuses_before_scan)
 		uint64 records = 99;
 
 		init_two(authorities, duties, roots, tokens);
-		if (fault == 1) duties[1].system_identifier++;
-		if (fault == 2) duties[1].storage_uuid[0]++;
-		if (fault == 3) authorities[1].retention_pin = (ClusterWalRetentionPin *)&fabric_object;
-		if (fault == 4) roots[1].tail_tli++;
-		if (fault == 5) { duties[1].origin_thread_id = 2; roots[1].identity = duties[1]; }
-		UT_ASSERT(cluster_thread_recovery_fabric_scan_roots_v1(authorities, 2, false,
-			&plan, &records) != RF_PAGE_PROOF_DETAIL_OK);
+		if (fault == 1)
+			duties[1].system_identifier++;
+		if (fault == 2)
+			duties[1].storage_uuid[0]++;
+		if (fault == 3)
+			authorities[1].retention_pin = (ClusterWalRetentionPin *)&fabric_object;
+		if (fault == 4)
+			roots[1].tail_tli++;
+		if (fault == 5) {
+			duties[1].origin_thread_id = 2;
+			roots[1].identity = duties[1];
+		}
+		UT_ASSERT(
+			cluster_thread_recovery_fabric_scan_roots_v1(authorities, 2, false, &plan, &records)
+			!= RF_PAGE_PROOF_DETAIL_OK);
 		UT_ASSERT(plan == NULL && records == 0);
 		UT_ASSERT_EQ(exact_source_count, 0);
 		UT_ASSERT_EQ(plan_create_count, 0);
@@ -446,8 +457,9 @@ UT_TEST(test_multi_source_rechecks_every_owner_after_seal)
 
 	init_two(authorities, duties, roots, tokens);
 	expire_during_seal = true;
-	UT_ASSERT_EQ(cluster_thread_recovery_fabric_scan_roots_v1(authorities, 2, false,
-		&plan, &records), RF_PAGE_PROOF_DETAIL_ROOT_STALE);
+	UT_ASSERT_EQ(
+		cluster_thread_recovery_fabric_scan_roots_v1(authorities, 2, false, &plan, &records),
+		RF_PAGE_PROOF_DETAIL_ROOT_STALE);
 	UT_ASSERT(plan == NULL && records == 0);
 	UT_ASSERT_EQ(plan_seal_count, 1);
 	UT_ASSERT_EQ(plan_destroy_count, 1);
@@ -487,8 +499,9 @@ UT_TEST(test_shared_source_failure_discards_every_provisional_record)
 		{
 			RfPageProofDetailV1 detail = cluster_thread_recovery_fabric_scan_root_v1(
 				2, 0x100, 0x200, &authority, false, &plan, &records);
-			UT_ASSERT_EQ(detail, fault == 1 ? RF_PAGE_PROOF_DETAIL_ROOT_STALE
-				: fault == 4 ? RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH : RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+			UT_ASSERT_EQ(detail, fault == 1	  ? RF_PAGE_PROOF_DETAIL_ROOT_STALE
+								 : fault == 4 ? RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH
+											  : RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
 		}
 		PG_CATCH();
 		{

@@ -132,7 +132,7 @@ input_shrink(ClusterColdPlanV1 *plan, const World *w, uint32 e)
 				return in.shrink_forks;
 		}
 	}
-	UT_ASSERT(false && "no such SPACE input");
+	UT_ASSERT(false); /* No such SPACE input. */
 	return 0;
 }
 
@@ -149,7 +149,7 @@ event_step(ClusterColdPlanV1 *plan, const World *w, uint32 e)
 			return step;
 	}
 	memset(&step, 0, sizeof(step));
-	UT_ASSERT(false && "no step for the event");
+	UT_ASSERT(false); /* No step for the event. */
 	return step;
 }
 

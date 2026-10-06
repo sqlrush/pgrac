@@ -72,7 +72,7 @@ callback_matches_durable_event(uint16 kind)
 		return false;
 	count = read_journal_records(fd, records, lengthof(records));
 	(void)close(fd);
-	return actual != NULL && count != 0 && actual->record_kind == kind
+	return count != 0 && actual->record_kind == kind
 		   && pgrac_fenced_journal_frame_encode(actual, observed, sizeof(observed), &observed_len)
 		   && pgrac_fenced_journal_frame_encode(&records[count - 1], durable, sizeof(durable),
 												&durable_len)
@@ -246,11 +246,11 @@ read_journal_records(int fd, PgracFencedJournalRecordV1 *records, size_t maximum
 {
 	uint8 frame[PGRAC_FENCED_JOURNAL_MAX_RECORD_BYTES];
 	size_t count = 0;
-	size_t length;
 	ssize_t got;
 
 	UT_ASSERT_EQ(lseek(fd, 0, SEEK_SET), 0);
 	while (count < maximum) {
+		size_t length;
 		do {
 			got = read(fd, frame, PGRAC_FENCED_JOURNAL_RECORD_BYTES);
 		} while (got < 0 && errno == EINTR);

@@ -206,7 +206,8 @@ get_segment_fd(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 
 	/* A cached descriptor carries no recovery authority. */
 	if (intent == CLUSTER_UNDO_PATH_RECOVERY_SHARED) {
-		if (cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path)) != 0) {
+		if (cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path))
+			!= 0) {
 			fd_cache_close();
 			return -1;
 		}
@@ -262,10 +263,10 @@ undo_recovery_file_stat(int fd, ClusterUndoSmgrRecoveryFileV1 *file)
 
 static bool
 undo_recovery_file_same(const ClusterUndoSmgrRecoveryFileV1 *a,
-	const ClusterUndoSmgrRecoveryFileV1 *b)
+						const ClusterUndoSmgrRecoveryFileV1 *b)
 {
-	return a->exists == b->exists && a->device == b->device
-		&& a->inode == b->inode && a->size == b->size;
+	return a->exists == b->exists && a->device == b->device && a->inode == b->inode
+		   && a->size == b->size;
 }
 
 static bool
@@ -283,17 +284,19 @@ undo_recovery_read(int fd, uint64 size, uint32 block, char out[BLCKSZ])
 
 bool
 cluster_undo_smgr_recovery_probe_v1(uint32 segment, uint8 instance,
-	ClusterUndoSmgrRecoveryFileV1 *file, char block0[BLCKSZ])
+									ClusterUndoSmgrRecoveryFileV1 *file, char block0[BLCKSZ])
 {
-	ClusterUndoSmgrRecoveryFileV1 observed = {0};
-	PGAlignedBlock page = {0};
+	ClusterUndoSmgrRecoveryFileV1 observed = { 0 };
+	PGAlignedBlock page = { 0 };
 	char path[MAXPGPATH];
 	int flags = O_RDONLY | PG_BINARY;
 	int fd;
 	bool ok;
 
-	if (file == NULL || block0 == NULL || cluster_undo_path_resolve(
-		CLUSTER_UNDO_PATH_RECOVERY_SHARED, instance, segment, path, sizeof(path)) != 0)
+	if (file == NULL || block0 == NULL
+		|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, instance, segment, path,
+									 sizeof(path))
+			   != 0)
 		return false;
 #ifdef O_NOFOLLOW
 	flags |= O_NOFOLLOW;
@@ -304,7 +307,7 @@ cluster_undo_smgr_recovery_probe_v1(uint32 segment, uint8 instance,
 			return false;
 	} else {
 		ok = undo_recovery_file_stat(fd, &observed)
-			&& undo_recovery_read(fd, observed.size, 0, page.data);
+			 && undo_recovery_read(fd, observed.size, 0, page.data);
 		if (close(fd) != 0)
 			ok = false;
 		if (!ok)
@@ -316,8 +319,9 @@ cluster_undo_smgr_recovery_probe_v1(uint32 segment, uint8 instance,
 }
 
 bool
-cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 instance,
-	uint32 block, const ClusterUndoSmgrRecoveryFileV1 *expected, char out[BLCKSZ])
+cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 instance, uint32 block,
+										 const ClusterUndoSmgrRecoveryFileV1 *expected,
+										 char out[BLCKSZ])
 {
 	ClusterUndoSmgrRecoveryFileV1 observed;
 	PGAlignedBlock page;
@@ -327,8 +331,9 @@ cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 instance,
 	bool ok;
 
 	if (expected == NULL || out == NULL || block >= UNDO_BLOCKS_PER_SEGMENT
-		|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED,
-			instance, segment, path, sizeof(path)) != 0)
+		|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, instance, segment, path,
+									 sizeof(path))
+			   != 0)
 		return false;
 #ifdef O_NOFOLLOW
 	flags |= O_NOFOLLOW;
@@ -341,7 +346,7 @@ cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 instance,
 		return true;
 	}
 	ok = undo_recovery_file_stat(fd, &observed) && undo_recovery_file_same(expected, &observed)
-		&& undo_recovery_read(fd, observed.size, block, page.data);
+		 && undo_recovery_read(fd, observed.size, block, page.data);
 	if (close(fd) != 0)
 		ok = false;
 	if (ok)
@@ -351,8 +356,9 @@ cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 instance,
 
 bool
 cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
-	const ClusterUndoSmgrRecoveryFileV1 *expected, const char block0[BLCKSZ],
-	const char final_header[BLCKSZ])
+										  const ClusterUndoSmgrRecoveryFileV1 *expected,
+										  const char block0[BLCKSZ],
+										  const char final_header[BLCKSZ])
 {
 	ClusterUndoSmgrRecoveryFileV1 observed;
 	PGAlignedBlock page;
@@ -363,8 +369,9 @@ cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
 
 	if (expected == NULL || block0 == NULL || final_header == NULL
 		|| !cluster_undo_segment_header_identity_ok(final_header, segment, instance)
-		|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED,
-			instance, segment, path, sizeof(path)) != 0)
+		|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, instance, segment, path,
+									 sizeof(path))
+			   != 0)
 		return false;
 	fd_cache_close();
 	strlcpy(parent, path, sizeof(parent));
@@ -379,8 +386,10 @@ cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
 #ifdef O_NOFOLLOW
 	flags |= O_NOFOLLOW;
 #endif
-	if (cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED,
-		instance, segment, checked, sizeof(checked)) != 0 || strcmp(path, checked) != 0)
+	if (cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, instance, segment, checked,
+								  sizeof(checked))
+			!= 0
+		|| strcmp(path, checked) != 0)
 		return false;
 	fd = BasicOpenFile(path, flags);
 	if (fd < 0)
@@ -388,11 +397,13 @@ cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
 	ok = undo_recovery_file_stat(fd, &observed);
 	if (ok && expected->exists)
 		ok = undo_recovery_file_same(expected, &observed)
-			&& undo_recovery_read(fd, observed.size, 0, page.data)
-			&& memcmp(page.data, block0, BLCKSZ) == 0;
+			 && undo_recovery_read(fd, observed.size, 0, page.data)
+			 && memcmp(page.data, block0, BLCKSZ) == 0;
 	if (ok)
-		ok = cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED,
-			instance, segment, checked, sizeof(checked)) == 0 && strcmp(path, checked) == 0;
+		ok = cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, instance, segment,
+									   checked, sizeof(checked))
+				 == 0
+			 && strcmp(path, checked) == 0;
 	if (ok)
 		ok = ftruncate(fd, UNDO_SEGMENT_SIZE_BYTES) == 0 && pg_fsync(fd) == 0;
 	if (close(fd) != 0)
@@ -1058,7 +1069,8 @@ cluster_undo_smgr_fsync_segment_file(uint32 segment_id, uint8 owner_instance)
 {
 	int fd;
 
-	fd = get_segment_fd(cluster_undo_recovery_intent_for_owner(owner_instance), segment_id, owner_instance);
+	fd = get_segment_fd(cluster_undo_recovery_intent_for_owner(owner_instance), segment_id,
+						owner_instance);
 	if (fd < 0)
 		return false;
 

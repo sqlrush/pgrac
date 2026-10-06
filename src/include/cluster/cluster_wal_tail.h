@@ -88,11 +88,9 @@ typedef struct ClusterWalStartupObservation {
  * Caller owns immutable, nonaliasing input plus retention/isolation and root
  * revalidation; provisional bootstrap reads grant none of those permissions.
  * Author: SqlRush <sqlrush@gmail.com> */
-extern ClusterControlRootResult cluster_wal_startup_observe(const char *wal_root,
-															const ClusterWalSourceRef *ref,
-															int segment_size,
-															XLogRecPtr first_segment,
-															ClusterWalStartupObservation *out);
+extern ClusterControlRootResult
+cluster_wal_startup_observe(const char *wal_root, const ClusterWalSourceRef *ref, int segment_size,
+							XLogRecPtr first_segment, ClusterWalStartupObservation *out);
 
 /* Same full startup classification, with provisional read-only callbacks.
  * The selected terminal must be compared to the final observation by its

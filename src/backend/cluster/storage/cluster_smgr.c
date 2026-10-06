@@ -65,7 +65,7 @@
 #include "cluster/cluster_mrp.h" /* spec-6.4 INV-ADG5 — standby write gate */
 #include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_shmem.h"
-#include "cluster/cluster_sinval.h"		 /* spec-5.2 D1: relsize inval broadcast */
+#include "cluster/cluster_sinval.h" /* spec-5.2 D1: relsize inval broadcast */
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_write_fence.h" /* spec-4.12 D5 — hot write-path fence gate */
 #include "cluster/storage/cluster_shared_fs.h"
@@ -429,10 +429,9 @@ cluster_smgr_create(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	if (cluster_shared_catalog && !isRedo && forknum == MAIN_FORKNUM
 		&& state->fork_handles[forknum] != NULL) {
 		errno = EEXIST;
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not create shared relation %u: file already open",
-						state->rlocator.locator.relNumber)));
+		ereport(ERROR, (errcode_for_file_access(),
+						errmsg("could not create shared relation %u: file already open",
+							   state->rlocator.locator.relNumber)));
 	}
 
 	/*
@@ -600,18 +599,22 @@ cluster_smgr_unlink_committed_drop(RelFileLocator locator)
 			bool completed = false;
 
 			handled = true;
-			if (completion != NULL && ops != NULL
-				&& ops->id == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
+			if (completion != NULL && ops != NULL && ops->id == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
 				&& cluster_ko_shared_space_observation_v2(completion, &terminal, wal, sizeof(wal))
 				&& cluster_space_structure_wal_decode(wal, sizeof(wal), &change)
 				&& change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE
 				&& RelFileLocatorEquals(change.identity.result.key.locator, locator)
 				&& RelFileLocatorEquals(terminal.identity.locator, locator)
-				&& change.identity.result.key.system_identifier == terminal.identity.system_identifier
+				&& change.identity.result.key.system_identifier
+					   == terminal.identity.system_identifier
 				&& change.identity.result.key.database_incarnation
-					== terminal.source.claim.database_incarnation
-				&& memcmp(change.identity.result.key.storage_uuid, terminal.identity.storage_uuid, 16) == 0
-				&& memcmp(change.identity.result.incarnation, terminal.version.segment_incarnation, 16) == 0
+					   == terminal.source.claim.database_incarnation
+				&& memcmp(change.identity.result.key.storage_uuid, terminal.identity.storage_uuid,
+						  16)
+					   == 0
+				&& memcmp(change.identity.result.incarnation, terminal.version.segment_incarnation,
+						  16)
+					   == 0
 				&& change.identity.result_token == terminal.version.mutation_token) {
 				ForkNumber f;
 
@@ -621,15 +624,15 @@ cluster_smgr_unlink_committed_drop(RelFileLocator locator)
 				for (f = MAIN_FORKNUM + 1; f <= MAX_FORKNUM; f++)
 					cluster_smgr_forget_fsync(locator, f);
 				if (cluster_shared_fs_sharedfs_drop_durable(&change.identity.result,
-						change.identity.result_token)
+															change.identity.result_token)
 					&& cluster_ko_shared_observe_drop_v2(completion))
 					completed = true;
 			}
 			if (!completed)
-				ereport(WARNING,
-						(errmsg("could not establish the durable shared DROP result"),
-						 errdetail("Relation %u/%u/%u has no qualified physical completion or relfilenumber reuse result.",
-								   locator.spcOid, locator.dbOid, locator.relNumber)));
+				ereport(WARNING, (errmsg("could not establish the durable shared DROP result"),
+								  errdetail("Relation %u/%u/%u has no qualified physical "
+											"completion or relfilenumber reuse result.",
+											locator.spcOid, locator.dbOid, locator.relNumber)));
 		}
 	}
 	PG_CATCH();

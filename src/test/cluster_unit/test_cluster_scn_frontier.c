@@ -81,8 +81,16 @@
 bool IsUnderPostmaster = false;
 MemoryContext TopMemoryContext;
 /* No original initdb creator in this runtime fixture. */
-const struct PgracInitdbWalContext *cluster_wal_thread_initdb_context(void) { return NULL; }
-void *MemoryContextAllocZero(MemoryContext context, Size size) { abort(); }
+const struct PgracInitdbWalContext *
+cluster_wal_thread_initdb_context(void)
+{
+	return NULL;
+}
+void *
+MemoryContextAllocZero(MemoryContext context, Size size)
+{
+	abort();
+}
 
 static unsigned test_scn_lock_depth;
 

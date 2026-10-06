@@ -40,9 +40,8 @@ static bool
 undo_delta_ranges_valid(uint16 rec_off, uint16 rec_len, uint16 slot_off, uint16 slot_len)
 {
 	return rec_off >= sizeof(UndoBlockHeader) && rec_len != 0
-		   && (uint32)rec_off + rec_len <= slot_off
-		   && slot_len != 0 && slot_len % sizeof(UndoSlotDirEntry) == 0
-		   && (uint32)slot_off + slot_len <= BLCKSZ;
+		   && (uint32)rec_off + rec_len <= slot_off && slot_len != 0
+		   && slot_len % sizeof(UndoSlotDirEntry) == 0 && (uint32)slot_off + slot_len <= BLCKSZ;
 }
 
 static ClusterUndoDecodedKind
@@ -255,7 +254,8 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 			uint32 expected = UNDO_BLOCK_HDR_PREFIX_LEN + rec.rec_len + sizeof(UndoSlotDirEntry);
 
 			if (!undo_delta_ranges_valid(rec.rec_off, rec.rec_len, rec.slot_off,
-									 sizeof(UndoSlotDirEntry)) || body_len != expected)
+										 sizeof(UndoSlotDirEntry))
+				|| body_len != expected)
 				return false;
 		}
 		out->instance = rec.instance;
@@ -449,20 +449,20 @@ cluster_undo_preflight(const ClusterUndoDecoded *decoded)
  * those facts. Keep the native nonzero delta-base interlock and make refusal
  * leave the caller's output untouched, including in-place preparation. */
 bool
-cluster_undo_prepare_block_v1(const ClusterUndoDecoded *decoded,
-							  const uint8 *payload, Size payload_length,
-							  XLogRecPtr replay_end, const char *base, char *out)
+cluster_undo_prepare_block_v1(const ClusterUndoDecoded *decoded, const uint8 *payload,
+							  Size payload_length, XLogRecPtr replay_end, const char *base,
+							  char *out)
 {
 	PGAlignedBlock prepared;
 	bool multi;
 	uint16 slot_length;
 
-	if (decoded == NULL || payload == NULL || out == NULL
-		|| XLogRecPtrIsInvalid(replay_end) || !cluster_undo_preflight(decoded)
+	if (decoded == NULL || payload == NULL || out == NULL || XLogRecPtrIsInvalid(replay_end)
+		|| !cluster_undo_preflight(decoded)
 		|| (decoded->kind != CLUSTER_UNDO_KIND_BLOCK_WRITE
 			&& decoded->kind != CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
-		|| decoded->kind != cluster_undo_kind_for_opcode(decoded->opcode)
-		|| !decoded->has_payload || payload_length != decoded->payload_length)
+		|| decoded->kind != cluster_undo_kind_for_opcode(decoded->opcode) || !decoded->has_payload
+		|| payload_length != decoded->payload_length)
 		return false;
 	multi = decoded->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI;
 	slot_length = multi ? decoded->slot_len : sizeof(UndoSlotDirEntry);
@@ -475,8 +475,8 @@ cluster_undo_prepare_block_v1(const ClusterUndoDecoded *decoded,
 		UndoBlockHeader header;
 
 		if (base == NULL || decoded->slot_len != slot_length
-			|| !undo_delta_ranges_valid(decoded->rec_off, decoded->rec_len,
-									   decoded->slot_off, slot_length)
+			|| !undo_delta_ranges_valid(decoded->rec_off, decoded->rec_len, decoded->slot_off,
+										slot_length)
 			|| payload_length != UNDO_BLOCK_HDR_PREFIX_LEN + decoded->rec_len + slot_length)
 			return false;
 		memcpy(&header, base, sizeof(header));
@@ -495,7 +495,7 @@ cluster_undo_prepare_block_v1(const ClusterUndoDecoded *decoded,
 }
 
 static bool cluster_undo_ctrc_release_from_decoded(const ClusterUndoDecoded *decoded,
-													 xl_undo_tt_slot_ctrc_release_v1 *record);
+												   xl_undo_tt_slot_ctrc_release_v1 *record);
 
 /* Work only on the caller's private header. The native transition tables
  * remain the single source of generation/slot decisions. */
@@ -511,8 +511,8 @@ undo_prepare_tt_slot(const ClusterUndoDecoded *decoded, UndoSegmentHeaderData *h
 	switch (decoded->kind) {
 	case CLUSTER_UNDO_KIND_TT_BIND: {
 		ClusterTTActiveTransitionDecision decision = cluster_tt_active_transition_decide(
-			slot, header->wrap_count, decoded->expected_generation, decoded->xid,
-			decoded->wrap, true);
+			slot, header->wrap_count, decoded->expected_generation, decoded->xid, decoded->wrap,
+			true);
 
 		if (decision == CLUSTER_TT_ACTIVE_STALE)
 			return CLUSTER_UNDO_HEADER_SKIP_STALE;
@@ -532,8 +532,8 @@ undo_prepare_tt_slot(const ClusterUndoDecoded *decoded, UndoSegmentHeaderData *h
 		if (decoded->kind == CLUSTER_UNDO_KIND_TT_ABORT
 			&& decoded->format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION) {
 			ClusterTTTerminalTransitionDecision decision = cluster_tt_terminal_transition_decide(
-				slot, header->wrap_count, decoded->expected_generation, decoded->xid,
-				decoded->wrap, TT_SLOT_ABORTED, InvalidScn);
+				slot, header->wrap_count, decoded->expected_generation, decoded->xid, decoded->wrap,
+				TT_SLOT_ABORTED, InvalidScn);
 
 			if (decision == CLUSTER_TT_TERMINAL_STALE)
 				return CLUSTER_UNDO_HEADER_SKIP_STALE;
@@ -552,11 +552,11 @@ undo_prepare_tt_slot(const ClusterUndoDecoded *decoded, UndoSegmentHeaderData *h
 		}
 		slot->xid = decoded->xid;
 		slot->wrap = decoded->wrap;
-		slot->status = decoded->kind == CLUSTER_UNDO_KIND_TT_COMMIT
-			? TT_SLOT_COMMITTED : TT_SLOT_ABORTED;
+		slot->status
+			= decoded->kind == CLUSTER_UNDO_KIND_TT_COMMIT ? TT_SLOT_COMMITTED : TT_SLOT_ABORTED;
 		slot->flags = TT_FLAGS_RESERVED;
-		slot->commit_scn = decoded->kind == CLUSTER_UNDO_KIND_TT_COMMIT
-			? decoded->commit_scn : InvalidScn;
+		slot->commit_scn
+			= decoded->kind == CLUSTER_UNDO_KIND_TT_COMMIT ? decoded->commit_scn : InvalidScn;
 		slot->first_undo_block = invalid_head;
 		break;
 	case CLUSTER_UNDO_KIND_TT_SET_HEAD:
@@ -584,8 +584,8 @@ undo_prepare_tt_slot(const ClusterUndoDecoded *decoded, UndoSegmentHeaderData *h
 	default:
 		return CLUSTER_UNDO_HEADER_BLOCKED;
 	}
-	return memcmp(slot, &before, sizeof(before)) == 0
-		? CLUSTER_UNDO_HEADER_ALREADY : CLUSTER_UNDO_HEADER_APPLY;
+	return memcmp(slot, &before, sizeof(before)) == 0 ? CLUSTER_UNDO_HEADER_ALREADY
+													  : CLUSTER_UNDO_HEADER_APPLY;
 }
 
 ClusterUndoHeaderPrepareResultV1
@@ -606,7 +606,7 @@ cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *p
 														decoded->instance);
 	}
 	if (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_RECYCLE) {
-		xl_undo_segment_recycle record = {0};
+		xl_undo_segment_recycle record = { 0 };
 		ClusterUndoSegRecycleRedo decision;
 
 		if (!base_valid || decoded->has_payload || decoded->has_fpi || payload_length != 0)
@@ -628,19 +628,20 @@ cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *p
 			return CLUSTER_UNDO_HEADER_BLOCKED;
 		memcpy(prepared.data, payload, BLCKSZ);
 		if (!UndoSegmentHeader_identity_matches(prepared.data, decoded->segment_id,
-												   decoded->instance)
+												decoded->instance)
 			|| header->segment_state != SEGMENT_ALLOCATED
-			|| header->wrap_count != (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
-										 ? 0 : decoded->new_generation))
+			|| header->wrap_count
+				   != (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT ? 0
+																	   : decoded->new_generation))
 			return CLUSTER_UNDO_HEADER_BLOCKED;
 		if (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE) {
-			xl_undo_segment_reuse record = {0};
+			xl_undo_segment_reuse record = { 0 };
 			ClusterUndoSegReuseRedo decision;
 
 			record.old_generation = decoded->expected_generation;
 			record.new_generation = decoded->new_generation;
-			decision = cluster_undo_segment_reuse_redo_decide(base_valid,
-								base_valid ? before->wrap_count : 0, &record);
+			decision = cluster_undo_segment_reuse_redo_decide(
+				base_valid, base_valid ? before->wrap_count : 0, &record);
 			if (decision == CLUSTER_SEGREUSE_REDO_SKIP_STALE)
 				return CLUSTER_UNDO_HEADER_SKIP_STALE;
 			if (decision != CLUSTER_SEGREUSE_REDO_APPLY)
@@ -663,8 +664,8 @@ cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *p
 
 ClusterUndoHeaderPrepareResultV1
 cluster_undo_prepare_commit_v1(uint8 instance, uint32 segment_id, uint32 generation,
-	uint16 slot_offset, uint16 wrap, TransactionId xid, SCN commit_scn,
-	const char *base, char *out)
+							   uint16 slot_offset, uint16 wrap, TransactionId xid, SCN commit_scn,
+							   const char *base, char *out)
 {
 	PGAlignedBlock prepared;
 	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)prepared.data;
@@ -672,8 +673,7 @@ cluster_undo_prepare_commit_v1(uint8 instance, uint32 segment_id, uint32 generat
 	ClusterTTTerminalTransitionDecision decision;
 	static const UBA invalid_head = InvalidUba_init;
 
-	if (base == NULL || out == NULL || instance == 0 || instance > 128
-		|| segment_id == 0
+	if (base == NULL || out == NULL || instance == 0 || instance > 128 || segment_id == 0
 		|| ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 != instance
 		|| generation == UINT32_MAX || slot_offset >= TT_SLOTS_PER_SEGMENT
 		|| wrap == TT_WRAP_INVALID || !TransactionIdIsNormal(xid) || !SCN_VALID(commit_scn))
@@ -682,8 +682,8 @@ cluster_undo_prepare_commit_v1(uint8 instance, uint32 segment_id, uint32 generat
 	if (!UndoSegmentHeader_identity_matches(prepared.data, segment_id, instance))
 		return CLUSTER_UNDO_HEADER_BLOCKED;
 	slot = &header->tt_slots[slot_offset];
-	decision = cluster_tt_terminal_transition_decide(slot, header->wrap_count,
-		generation, xid, wrap, TT_SLOT_COMMITTED, commit_scn);
+	decision = cluster_tt_terminal_transition_decide(slot, header->wrap_count, generation, xid,
+													 wrap, TT_SLOT_COMMITTED, commit_scn);
 	if (decision == CLUSTER_TT_TERMINAL_STALE)
 		return CLUSTER_UNDO_HEADER_SKIP_STALE;
 	if (decision == CLUSTER_TT_TERMINAL_IDEMPOTENT)
@@ -785,9 +785,8 @@ cluster_undo_preflight_tt_target_v1(const ClusterUndoDecoded *decoded)
 ClusterUndoTargetPreflightV1
 cluster_undo_preflight_legacy_slot_v1(const ClusterUndoDecoded *decoded, const TTSlot *slot)
 {
-	if (!cluster_undo_preflight(decoded) || slot == NULL
-		|| slot->status > TT_SLOT_RECYCLABLE || slot->xid != decoded->xid
-		|| slot->wrap != decoded->wrap)
+	if (!cluster_undo_preflight(decoded) || slot == NULL || slot->status > TT_SLOT_RECYCLABLE
+		|| slot->xid != decoded->xid || slot->wrap != decoded->wrap)
 		return CLUSTER_UNDO_TARGET_BLOCKED;
 	switch (decoded->kind) {
 	case CLUSTER_UNDO_KIND_TT_COMMIT:

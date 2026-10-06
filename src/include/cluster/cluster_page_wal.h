@@ -247,6 +247,6 @@ extern void cluster_page_wal_release_install_v1(ClusterPageWalInstallV1 *prepare
  * with that acquisition's original carrier, including explicit absence.
  * A failed snapshot is never evidence that the sidecar is empty. */
 extern bool cluster_page_wal_install_matches_v1(Buffer buffer,
-											 const ClusterPageWalBindingV1 *expected);
+												const ClusterPageWalBindingV1 *expected);
 
 #endif

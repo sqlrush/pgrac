@@ -17,11 +17,16 @@ UT_DEFINE_GLOBALS();
 bool cluster_shared_config = false;
 int cluster_node_id = 0;
 bool cluster_storage_quorum_allows_node(int node);
-bool cluster_storage_quorum_allows_node(int node) { return node == 0; }
+bool
+cluster_storage_quorum_allows_node(int node)
+{
+	return node == 0;
+}
 
 #include "utils/memutils.h"
 MemoryContext TopMemoryContext;
-void *MemoryContextAllocZero(MemoryContext context, Size size)
+void *
+MemoryContextAllocZero(MemoryContext context, Size size)
 {
 	(void)context;
 	return calloc(1, size);
@@ -45,12 +50,15 @@ fixture(void)
 		snprintf(paths[d], sizeof(paths[d]), "/tmp/p3b-formation-%ld-%d-XXXXXX", (long)getpid(), d);
 		fds[d] = mkstemp(paths[d]);
 		UT_ASSERT(fds[d] >= 0);
-		UT_ASSERT_EQ(cluster_voting_disk_format(fds[d], CLUSTER_MAX_NODES, d), CLUSTER_VOTING_DISK_IO_OK);
+		UT_ASSERT_EQ(cluster_voting_disk_format(fds[d], CLUSTER_MAX_NODES, d),
+					 CLUSTER_VOTING_DISK_IO_OK);
 		UT_ASSERT_EQ(ftruncate(fds[d], CLUSTER_VOTING_PGRD_FILE_BYTES_MIN), 0);
 		UT_ASSERT_EQ(fdatasync(fds[d]), 0);
-		UT_ASSERT_EQ(cluster_voting_disk_read_slot(fds[d], d, 0, &matrix[d * CLUSTER_MAX_NODES]), CLUSTER_VOTING_DISK_IO_OK);
+		UT_ASSERT_EQ(cluster_voting_disk_read_slot(fds[d], d, 0, &matrix[d * CLUSTER_MAX_NODES]),
+					 CLUSTER_VOTING_DISK_IO_OK);
 		cluster_fence_marker_pack(matrix[d * CLUSTER_MAX_NODES]._reserved1, &fence);
-		UT_ASSERT_EQ(cluster_voting_disk_write_slot(fds[d], &matrix[d * CLUSTER_MAX_NODES]), CLUSTER_VOTING_DISK_IO_OK);
+		UT_ASSERT_EQ(cluster_voting_disk_write_slot(fds[d], &matrix[d * CLUSTER_MAX_NODES]),
+					 CLUSTER_VOTING_DISK_IO_OK);
 	}
 }
 
@@ -92,7 +100,8 @@ write_formation(int d, int node, uint64 generation, uint64 epoch, uint64 nonce)
 	m.admitted_nodes[0] = 3;
 	m.n_admitted = 2;
 	UT_ASSERT(cluster_formation_marker_encode(&m, incs, bytes));
-	UT_ASSERT_EQ(cluster_voting_disk_write_formation_slot(fds[d], node, bytes), CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(cluster_voting_disk_write_formation_slot(fds[d], node, bytes),
+				 CLUSTER_VOTING_DISK_IO_OK);
 }
 
 static bool
@@ -242,7 +251,8 @@ UT_TEST(unknown_predecessor_fence_cannot_be_erased_by_heartbeat)
 	UT_ASSERT(!qvotec_formation_prior_fence_valid(&slot));
 }
 
-int main(void)
+int
+main(void)
 {
 	UT_PLAN(8);
 	UT_RUN(fresh_disk_has_only_real_epoch_zero_majority);

@@ -541,7 +541,8 @@ UT_TEST(shared_nowait_keeps_transport_and_retirement_budget)
 	convert.convert_old_request_id = request.request_id;
 	convert.timeout_ms = 1; /* Existing manual conversion producers. */
 	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
-	UT_ASSERT_EQ(walr_request_convert_actual(&convert, 0, &cleanup), CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
+	UT_ASSERT_EQ(walr_request_convert_actual(&convert, 0, &cleanup),
+				 CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
 	UT_ASSERT(!cleanup && convert.dontwait);
 	UT_ASSERT_EQ(convert.timeout_ms, 0);
 	UT_ASSERT(acknowledge_retirements());

@@ -99,16 +99,19 @@ static bool native_apply_ok, native_verify_ok;
 static unsigned native_apply_calls, native_verify_calls;
 
 bool cluster_multixact_native_recovery_apply(int origin,
-	const ClusterSideProjectionOperationV1 *operation, const uint8 *payload, uint32 length,
-	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn);
+											 const ClusterSideProjectionOperationV1 *operation,
+											 const uint8 *payload, uint32 length,
+											 XLogRecPtr source_lsn, XLogRecPtr source_end_lsn);
 bool cluster_multixact_native_recovery_verify(int origin,
-	const ClusterSideProjectionOperationV1 *operation, const uint8 *payload, uint32 length,
-	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn);
+											  const ClusterSideProjectionOperationV1 *operation,
+											  const uint8 *payload, uint32 length,
+											  XLogRecPtr source_lsn, XLogRecPtr source_end_lsn);
 
 bool
 cluster_multixact_native_recovery_apply(int origin,
-	const ClusterSideProjectionOperationV1 *operation, const uint8 *payload, uint32 length,
-	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+										const ClusterSideProjectionOperationV1 *operation,
+										const uint8 *payload, uint32 length, XLogRecPtr source_lsn,
+										XLogRecPtr source_end_lsn)
 {
 	UT_ASSERT_EQ(origin, 0);
 	UT_ASSERT(operation != NULL);
@@ -121,8 +124,9 @@ cluster_multixact_native_recovery_apply(int origin,
 
 bool
 cluster_multixact_native_recovery_verify(int origin,
-	const ClusterSideProjectionOperationV1 *operation, const uint8 *payload, uint32 length,
-	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+										 const ClusterSideProjectionOperationV1 *operation,
+										 const uint8 *payload, uint32 length, XLogRecPtr source_lsn,
+										 XLogRecPtr source_end_lsn)
 {
 	UT_ASSERT_EQ(origin, 0);
 	UT_ASSERT(operation != NULL);
@@ -837,8 +841,8 @@ UT_TEST(t11_remote_visibility_follows_current_semantic_side)
 
 UT_TEST(t12_shared_projection_requires_native_persistence_and_postread)
 {
-	ClusterSideProjectionOperationV1 op = {0};
-	MultiXactMember member = {800, MultiXactStatusForShare};
+	ClusterSideProjectionOperationV1 op = { 0 };
+	MultiXactMember member = { 800, MultiXactStatusForShare };
 	int hashes;
 
 	op.kind = CLUSTER_SIDE_PROJECTION_MULTIXACT;
@@ -851,40 +855,39 @@ UT_TEST(t12_shared_projection_requires_native_persistence_and_postread)
 	native_apply_calls = native_verify_calls = 0;
 	native_apply_ok = native_verify_ok = false;
 	hashes = fake_hash_search_count;
-	UT_ASSERT(!cluster_multixact_recovery_projection_apply(NULL, 0, 19, &op,
-		(const uint8 *)&member, sizeof(member), 100, 200));
+	UT_ASSERT(!cluster_multixact_recovery_projection_apply(NULL, 0, 19, &op, (const uint8 *)&member,
+														   sizeof(member), 100, 200));
 	UT_ASSERT_EQ(native_apply_calls, 1);
 	UT_ASSERT_EQ(fake_hash_search_count, hashes);
 	native_apply_ok = true;
-	UT_ASSERT(cluster_multixact_recovery_projection_apply(NULL, 0, 19, &op,
-		(const uint8 *)&member, sizeof(member), 100, 200));
-	UT_ASSERT(!cluster_multixact_recovery_projection_verify(NULL, 0, 19, &op,
-		(const uint8 *)&member, sizeof(member), 100, 200));
+	UT_ASSERT(cluster_multixact_recovery_projection_apply(NULL, 0, 19, &op, (const uint8 *)&member,
+														  sizeof(member), 100, 200));
+	UT_ASSERT(!cluster_multixact_recovery_projection_verify(
+		NULL, 0, 19, &op, (const uint8 *)&member, sizeof(member), 100, 200));
 	UT_ASSERT_EQ(native_verify_calls, 1);
 	native_verify_ok = true;
-	UT_ASSERT(cluster_multixact_recovery_projection_verify(NULL, 0, 19, &op,
-		(const uint8 *)&member, sizeof(member), 100, 200));
+	UT_ASSERT(cluster_multixact_recovery_projection_verify(NULL, 0, 19, &op, (const uint8 *)&member,
+														   sizeof(member), 100, 200));
 	cluster_shared_config = false;
 }
 
 UT_TEST(t13_shared_zero_and_truncate_cannot_only_purge_overlay)
 {
-	ClusterSideProjectionOperationV1 op = {0};
+	ClusterSideProjectionOperationV1 op = { 0 };
 
 	cluster_shared_config = true;
 	native_apply_ok = native_verify_ok = false;
 	for (int i = 0; i < 2; i++) {
 		op.kind = CLUSTER_SIDE_PROJECTION_MULTIXACT;
 		op.action = i == 0 ? CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE
-			: CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE;
-		op.normalized_info = i == 0 ? XLOG_MULTIXACT_ZERO_MEM_PAGE
-			: XLOG_MULTIXACT_TRUNCATE_ID;
+						   : CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE;
+		op.normalized_info = i == 0 ? XLOG_MULTIXACT_ZERO_MEM_PAGE : XLOG_MULTIXACT_TRUNCATE_ID;
 		native_apply_calls = native_verify_calls = 0;
-		UT_ASSERT(!cluster_multixact_recovery_projection_apply(NULL, 0, 19, &op,
-			NULL, 0, 201, 202));
+		UT_ASSERT(
+			!cluster_multixact_recovery_projection_apply(NULL, 0, 19, &op, NULL, 0, 201, 202));
 		UT_ASSERT_EQ(native_apply_calls, 1);
-		UT_ASSERT(!cluster_multixact_recovery_projection_verify(NULL, 0, 19, &op,
-			NULL, 0, 201, 202));
+		UT_ASSERT(
+			!cluster_multixact_recovery_projection_verify(NULL, 0, 19, &op, NULL, 0, 201, 202));
 		UT_ASSERT_EQ(native_verify_calls, 1);
 	}
 	cluster_shared_config = false;

@@ -90,16 +90,16 @@ cluster_write_fence_allowed(void)
 }
 
 bool
-cluster_reconfig_capture_formation_snapshot_v1(
-	uint16 origin_thread pg_attribute_unused(),
-	ClusterFormationSnapshotV1 *out pg_attribute_unused())
+cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread pg_attribute_unused(),
+											   ClusterFormationSnapshotV1 *out
+												   pg_attribute_unused())
 {
 	abort();
 }
 
 bool
 cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *ref pg_attribute_unused(),
-	uint64 epoch pg_attribute_unused())
+											  uint64 epoch pg_attribute_unused())
 {
 	abort();
 }
@@ -752,9 +752,21 @@ BufferIsPermanent(Buffer buffer pg_attribute_unused())
 
 /* This fixture supplies SPACE through its existing pre-lock I/O seam. The
  * backend cache/hint producer is exercised by test_cluster_space_cache. */
-void hash_seq_init(HASH_SEQ_STATUS *scan, HTAB *table) { abort(); }
-void *hash_seq_search(HASH_SEQ_STATUS *scan) { abort(); }
-void hash_seq_term(HASH_SEQ_STATUS *scan) { abort(); }
+void
+hash_seq_init(HASH_SEQ_STATUS *scan, HTAB *table)
+{
+	abort();
+}
+void *
+hash_seq_search(HASH_SEQ_STATUS *scan)
+{
+	abort();
+}
+void
+hash_seq_term(HASH_SEQ_STATUS *scan)
+{
+	abort();
+}
 bool
 LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
 {

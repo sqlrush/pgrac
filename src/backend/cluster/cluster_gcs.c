@@ -876,7 +876,7 @@ cluster_gcs_handle_request_envelope(const ClusterICEnvelope *env, const void *pa
 	}
 
 	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config,
-											 (PcmLockTransition)req->transition_id)) {
+											   (PcmLockTransition)req->transition_id)) {
 		gcs_send_reply(req->sender_node, req->request_id, req->transition_id,
 					   GCS_REPLY_DENIED_VALIDATOR_REJECT);
 		return;
@@ -920,7 +920,7 @@ cluster_gcs_handle_reply_envelope(const ClusterICEnvelope *env, const void *payl
 	pg_atomic_fetch_add_u64(&ClusterGcs->decode_payload_bytes, sizeof(*reply));
 
 	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config,
-											 (PcmLockTransition)reply->transition_id)
+											   (PcmLockTransition)reply->transition_id)
 		|| !gcs_mark_slot_reply(env, reply)) {
 		/* HC74: unknown request_id = stale/late reply; local drop. */
 		pg_atomic_fetch_add_u64(&ClusterGcs->reply_late_drop_count, 1);

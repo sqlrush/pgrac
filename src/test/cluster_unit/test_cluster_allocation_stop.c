@@ -711,7 +711,7 @@ UT_TEST(hw_local_backend_and_existing_reply_keep_original_paths)
 
 UT_TEST(shared_profile_cannot_publish_legacy_counter_reservations)
 {
-	HwAllocRequest req = {0};
+	HwAllocRequest req = { 0 };
 	HwAllocReply reply;
 
 	reset_fixture();

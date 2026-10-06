@@ -237,8 +237,8 @@ rf_page_storage_install_execute_v1(const RfPageStorageInstallRequestV1 *request,
 			RfPageVersionV1 observed = component->expected_result;
 
 			observed.mutation_token = token;
-			if (authority->covers_version(authority->arg, &component->page_identity,
-									  &observed, &component->expected_result)) {
+			if (authority->covers_version(authority->arg, &component->page_identity, &observed,
+										  &component->expected_result)) {
 				write_required[i] = true;
 				continue;
 			}
@@ -441,12 +441,12 @@ page_smgr_authority_release(void *arg)
 
 static bool
 page_smgr_authority_covers_version(void *arg, const RfPageIdentityV1 *identity,
-								  const RfPageVersionV1 *version, const RfPageVersionV1 *result)
+								   const RfPageVersionV1 *version, const RfPageVersionV1 *result)
 {
 	RfPageSmgrAuthorityContextV1 *context = (RfPageSmgrAuthorityContextV1 *)arg;
 
 	return context->promoted && context->delegate->covers_version != NULL
-		&& context->delegate->covers_version(context->delegate->arg, identity, version, result);
+		   && context->delegate->covers_version(context->delegate->arg, identity, version, result);
 }
 
 RfPageProofDetailV1

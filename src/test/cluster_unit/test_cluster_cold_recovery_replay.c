@@ -664,22 +664,21 @@ UT_TEST(test_unscheduled_record_handling)
 {
 	ClusterColdRecordV1 record;
 	ClusterColdComponentV1 c = component(0, 1, 2, false);
-	ClusterColdSpaceOpV1 ops[2];
+	ClusterColdSpaceOpV1 record_ops[2];
 	uint8 kinds[3]
 		= { CLUSTER_COLD_SPACE_CREATE, CLUSTER_COLD_SPACE_TRUNCATE, CLUSTER_COLD_SPACE_ADVANCE };
 	int i;
 
 	memset(&record, 0, sizeof(record));
-	memset(ops, 0, sizeof(ops));
+	memset(record_ops, 0, sizeof(record_ops));
 	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_NATIVE);
 	record.space_count = 1;
-	record.space_ops = ops;
+	record.space_ops = record_ops;
 	for (i = 0; i < 3; i++) {
-		ops[0].kind = kinds[i];
+		record_ops[0].kind = kinds[i];
 		UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP);
 	}
-	ops[0].kind = CLUSTER_COLD_SPACE_ADVANCE;
-	ops[1].kind = CLUSTER_COLD_SPACE_DROP;
+	record_ops[1].kind = CLUSTER_COLD_SPACE_DROP;
 	record.space_count = 2;
 	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
 	record.space_count = 0;
@@ -707,7 +706,7 @@ UT_TEST(test_unscheduled_record_handling)
 	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
 	record.record_flags = CLUSTER_COLD_RECORD_FOREIGN_CONTROL;
 	record.space_count = 1;
-	record.space_ops = ops;
+	record.space_ops = record_ops;
 	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(&record), CLUSTER_COLD_UNSCHEDULED_REFUSE);
 	UT_ASSERT_EQ(cluster_cold_unscheduled_v1(NULL), CLUSTER_COLD_UNSCHEDULED_REFUSE);
 }

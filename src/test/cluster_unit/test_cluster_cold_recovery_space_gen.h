@@ -337,7 +337,7 @@ gen_event(World *w, uint32 e)
 	for (tries = 0; tries < 64; tries++) {
 		uint32 pick = rng(24);
 		int r = (int)rng(w->rels);
-		Rel *rel = &w->rel[r];
+		const Rel *rel = &w->rel[r];
 
 		if (!rel->alive) {
 			if (!rel->dropped && rel->incarnations == 0 && pick < 12) {

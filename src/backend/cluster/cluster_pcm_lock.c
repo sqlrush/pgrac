@@ -10328,14 +10328,14 @@ cluster_pcm_lock_pi_obligations_absent_v1(BufferTag tag)
 		 * waits behind an owner which could need the caller's content lock. */
 		state = pcm_resource_x_master_state_for_entry(entry);
 		absent = pg_atomic_read_u32(&entry->lifecycle) == PCM_ENTRY_LIVE
-			&& BufferTagsEqual(&entry->tag, &tag) && state != NULL
-			&& entry->local_pi_revision != UINT64_MAX
-			&& pg_atomic_read_u32(&entry->pi_holders_bitmap) == 0
-			&& entry->pi_watermark_lsn == InvalidXLogRecPtr
-			&& entry->pi_watermark_scn == InvalidScn
-			&& memcmp(&entry->local_pi_first, &empty, sizeof(empty)) == 0
-			&& memcmp(&entry->local_pi_last, &empty, sizeof(empty)) == 0
-			&& memcmp(&state->holder_pi_first, &empty, sizeof(empty)) == 0;
+				 && BufferTagsEqual(&entry->tag, &tag) && state != NULL
+				 && entry->local_pi_revision != UINT64_MAX
+				 && pg_atomic_read_u32(&entry->pi_holders_bitmap) == 0
+				 && entry->pi_watermark_lsn == InvalidXLogRecPtr
+				 && entry->pi_watermark_scn == InvalidScn
+				 && memcmp(&entry->local_pi_first, &empty, sizeof(empty)) == 0
+				 && memcmp(&entry->local_pi_last, &empty, sizeof(empty)) == 0
+				 && memcmp(&state->holder_pi_first, &empty, sizeof(empty)) == 0;
 		LWLockRelease(&entry->entry_lock.lock);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
@@ -10399,7 +10399,8 @@ cluster_pcm_local_pi_retire_v1(const ClusterPcmLocalPiSnapshotV1 *local,
 
 bool
 cluster_pcm_local_pi_retire_structural_v2(const ClusterPcmLocalPiSnapshotV1 *local,
-	const ClusterPageStructuralReceiptV2 *receipt, const ClusterPiStructuralAckV2 *ack)
+										  const ClusterPageStructuralReceiptV2 *receipt,
+										  const ClusterPiStructuralAckV2 *ack)
 {
 	ClusterPcmLocalPiSnapshotV1 current;
 	PcmEntryRef ref;
@@ -10412,11 +10413,12 @@ cluster_pcm_local_pi_retire_structural_v2(const ClusterPcmLocalPiSnapshotV1 *loc
 		return false;
 	if (!pcm_entry_ref_acquire(&local->resource, false, &ref, &acquired))
 		return acquired == PCM_ENTRY_ACQUIRE_NOT_FOUND && local->binding_generation == 0
-			&& local->revision == 0 && local->first.record_start == 0 && local->last.record_start == 0;
+			   && local->revision == 0 && local->first.record_start == 0
+			   && local->last.record_start == 0;
 	pcm_entry_lock_exclusive(ref.entry);
 	result = pcm_local_pi_snapshot_locked(ref.entry, &current)
-		&& memcmp(&current, local, sizeof(current)) == 0
-		&& ref.entry->local_pi_revision < UINT64_MAX - 1;
+			 && memcmp(&current, local, sizeof(current)) == 0
+			 && ref.entry->local_pi_revision < UINT64_MAX - 1;
 	if (result)
 		pcm_local_pi_release_locked(ref.entry);
 	LWLockRelease(&ref.entry->entry_lock.lock);
@@ -11006,12 +11008,13 @@ cluster_pcm_lock_pi_storage_complete_v1(const ClusterPageDataReceiptV1 *receipt,
 
 bool
 cluster_pcm_lock_pi_structural_complete_v2(const ClusterPageStructuralReceiptV2 *receipt,
-	const ClusterPiStructuralAckV2 *const *acks, uint32 ack_count, uint32 *holders_out)
+										   const ClusterPiStructuralAckV2 *const *acks,
+										   uint32 ack_count, uint32 *holders_out)
 {
-	ClusterPcmPiWriteCutV1 x = {0}, current_x;
-	ClusterPcmPiStorageCutV1 s = {0}, current_s;
-	const ClusterPcmPiWriteCutV1 no_x = {0};
-	const ClusterPcmPiStorageCutV1 no_s = {0};
+	ClusterPcmPiWriteCutV1 x = { 0 }, current_x;
+	ClusterPcmPiStorageCutV1 s = { 0 }, current_s;
+	const ClusterPcmPiWriteCutV1 no_x = { 0 };
+	const ClusterPcmPiStorageCutV1 no_s = { 0 };
 	BufferTag tag;
 	struct GrdEntry *entry;
 	uint32 expected, confirmed = 0;
@@ -11049,8 +11052,8 @@ cluster_pcm_lock_pi_structural_complete_v2(const ClusterPageStructuralReceiptV2 
 	for (uint32 i = 0; i < ack_count; i++) {
 		int32 node;
 		uint32 bit;
-		if (!cluster_page_structural_pi_ack_read_v2(acks[i], receipt, &node)
-			|| node < 0 || node >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
+		if (!cluster_page_structural_pi_ack_read_v2(acks[i], receipt, &node) || node < 0
+			|| node >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
 			return false;
 		bit = (uint32)1u << node;
 		if ((expected & bit) == 0 || (confirmed & bit) != 0)
@@ -11068,11 +11071,10 @@ cluster_pcm_lock_pi_structural_complete_v2(const ClusterPageStructuralReceiptV2 
 		 * retire a subset or reuse an old receipt for a later handoff. */
 		if (cluster_gcs_lookup_master(tag) == cluster_node_id
 			&& master_boot == cluster_qvotec_get_self_incarnation()
-			&& (write_cut
-				? pcm_pi_write_snapshot_locked(entry, &current_x)
-					&& memcmp(&x, &current_x, sizeof(x)) == 0
-				: pcm_pi_storage_snapshot_locked(entry, &current_s)
-					&& memcmp(&s, &current_s, sizeof(s)) == 0)) {
+			&& (write_cut ? pcm_pi_write_snapshot_locked(entry, &current_x)
+								&& memcmp(&x, &current_x, sizeof(x)) == 0
+						  : pcm_pi_storage_snapshot_locked(entry, &current_s)
+								&& memcmp(&s, &current_s, sizeof(s)) == 0)) {
 			pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
 			entry->pi_watermark_lsn = InvalidXLogRecPtr;
 			entry->pi_watermark_scn = InvalidScn;
@@ -20145,9 +20147,10 @@ cluster_pcm_lock_resource_x_holder_pair_replay_exact(const ResourceXAssertion *a
 }
 
 bool
-cluster_pcm_lock_resource_x_holder_pair_wal_retained_exact(
-	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
-	uint64 source_generation, ResourceXSourceWalRetainedV1 *out)
+cluster_pcm_lock_resource_x_holder_pair_wal_retained_exact(const ResourceXDecodedFrame *block,
+														   int32 authenticated_master_node,
+														   uint64 source_generation,
+														   ResourceXSourceWalRetainedV1 *out)
 {
 	ResourceXSourceWalRetainedV1 value = { 0 };
 	ResourceXDecodedFrame status, image;
@@ -20163,12 +20166,12 @@ cluster_pcm_lock_resource_x_holder_pair_wal_retained_exact(
 		|| out == NULL || block->kind != RESOURCE_X_WIRE_BLOCK_TO_N
 		|| !resource_x_assertion_valid(&block->common.logical_assertion)
 		|| block->common.observed_mode != PCM_STATE_X || block->common.target_mode != PCM_STATE_N
-		|| block->common.action_node != cluster_node_id
-		|| cluster_node_id < 0 || cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-		|| authenticated_master_node < 0 || authenticated_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| block->common.action_node != cluster_node_id || cluster_node_id < 0
+		|| cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT || authenticated_master_node < 0
+		|| authenticated_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| block->common.assertion_sequence == 0 || block->common.assertion_sequence == UINT64_MAX
-		|| block->common.master_session_incarnation == 0
-		|| source_generation == 0 || source_generation == UINT64_MAX)
+		|| block->common.master_session_incarnation == 0 || source_generation == 0
+		|| source_generation == UINT64_MAX)
 		return false;
 	self_boot = cluster_qvotec_get_self_incarnation();
 	if (self_boot == 0
@@ -20183,19 +20186,24 @@ cluster_pcm_lock_resource_x_holder_pair_wal_retained_exact(
 		|| state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
 		|| state->holder_image_intent.state != RESOURCE_X_INTENT_SLOT_EMPTY
 		|| pcm_resource_x_holder_pair_drain_domain_locked(
-			   &entry->tag, state, authenticated_master_node, block->common.master_session_incarnation,
-			   &block->common.logical_assertion, block->common.assertion_sequence)
+			   &entry->tag, state, authenticated_master_node,
+			   block->common.master_session_incarnation, &block->common.logical_assertion,
+			   block->common.assertion_sequence)
 			   != RESOURCE_X_APPLY_NOT_FOUND
-		|| pcm_resource_x_holder_pair_decode_locked(state, &status, &image) != RESOURCE_X_APPLY_APPLIED)
+		|| pcm_resource_x_holder_pair_decode_locked(state, &status, &image)
+			   != RESOURCE_X_APPLY_APPLIED)
 		goto retained_wal_done;
 	fence = image.body.image_envelope.source_fence;
-	if (!resource_x_assertion_equal(&block->common.logical_assertion, &status.common.logical_assertion)
+	if (!resource_x_assertion_equal(&block->common.logical_assertion,
+									&status.common.logical_assertion)
 		|| status.common.assertion_sequence != block->common.assertion_sequence
 		|| status.common.resource_formation != block->common.resource_formation
-		|| status.common.resource_formation != pg_atomic_read_u64(&ClusterPcm->resource_x_gate_formation)
+		|| status.common.resource_formation
+			   != pg_atomic_read_u64(&ClusterPcm->resource_x_gate_formation)
 		|| status.common.master_session_incarnation != block->common.master_session_incarnation
 		|| status.common.base_authority_generation != block->common.base_authority_generation
-		|| status.common.action_node != cluster_node_id || status.common.observed_mode != PCM_STATE_X
+		|| status.common.action_node != cluster_node_id
+		|| status.common.observed_mode != PCM_STATE_X
 		|| state->holder_status.destination_node != (uint32)authenticated_master_node
 		|| fence[0] != 0 || fence[1] != 0 || fence[2] != 0 || fence[3] != (uint8)cluster_node_id
 		|| pcm_resource_x_source_fence_get_u64(fence + 4) != self_boot
@@ -20206,19 +20214,23 @@ cluster_pcm_lock_resource_x_holder_pair_wal_retained_exact(
 	value.latest = image.body.image_envelope.page_wal;
 	if (!cluster_page_wal_binding_shape_v1(&value.latest)
 		|| (value.latest.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
-		|| !RelFileLocatorEquals(value.latest.identity.locator, BufTagGetRelFileLocator(&entry->tag))
+		|| !RelFileLocatorEquals(value.latest.identity.locator,
+								 BufTagGetRelFileLocator(&entry->tag))
 		|| value.latest.identity.forknum != entry->tag.forkNum
 		|| value.latest.identity.blockno != entry->tag.blockNum)
 		goto retained_wal_done;
 	if (state->holder_pi_first.source_flags != 0
 		&& (!cluster_page_wal_ref_read_v1(&state->holder_pi_first, value.latest.identity.locator,
-										value.latest.identity.forknum, value.latest.identity.blockno,
-										&value.first)
+										  value.latest.identity.forknum,
+										  value.latest.identity.blockno, &value.first)
 			|| !cluster_page_wal_binding_shape_v1(&value.first)
 			|| (value.first.flags & CLUSTER_PAGE_WAL_NATIVE_FLUSHED) == 0
 			|| !rf_page_identity_equal_v1(&value.latest.identity, &value.first.identity)
-			|| value.latest.source.claim.database_incarnation != value.first.source.claim.database_incarnation
-			|| memcmp(value.latest.version.segment_incarnation, value.first.version.segment_incarnation, 16) != 0
+			|| value.latest.source.claim.database_incarnation
+				   != value.first.source.claim.database_incarnation
+			|| memcmp(value.latest.version.segment_incarnation,
+					  value.first.version.segment_incarnation, 16)
+				   != 0
 			|| (pcm_local_pi_source_equal(&value.latest.source, &value.first.source)
 				&& value.first.record_start > value.latest.record_start)))
 		goto retained_wal_done;

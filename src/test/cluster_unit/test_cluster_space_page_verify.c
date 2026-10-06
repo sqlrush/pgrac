@@ -147,17 +147,17 @@ UT_TEST(test_fork_bound_read_rejects_swapped_page_types)
 UT_TEST(test_reservation_page_has_its_own_block_and_integrity)
 {
 	PGAlignedBlock page;
-	ClusterSpaceReservation reservation = {0};
-	ClusterSpaceIdentityKey key = {0};
+	ClusterSpaceReservation reservation = { 0 };
+	ClusterSpaceIdentityKey key = { 0 };
 	uint64 token;
 
 	checksums = false;
 	make_page(&page);
 	key.system_identifier = key.database_incarnation = 1;
 	key.storage_uuid[0] = 1;
-	key.locator = (RelFileLocator){DEFAULTTABLESPACE_OID, 5, 16384};
-	UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
-		&key, &reservation.identity, &token));
+	key.locator = (RelFileLocator){ DEFAULTTABLESPACE_OID, 5, 16384 };
+	UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0, &key,
+												 &reservation.identity, &token));
 	reservation.next_block = 11;
 	UT_ASSERT(cluster_space_reservation_page_encode(&reservation, 9, page.data, BLCKSZ));
 	UT_ASSERT(PageIsVerifiedForFork(page.data, SPACE_FORKNUM, 1, 0));

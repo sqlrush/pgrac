@@ -129,6 +129,8 @@ UT_TEST(test_same_storage_different_wal_voting_and_alternate_route)
 	UT_ASSERT(changed_digest(&set));
 	fixture(&set, routes);
 	routes[4] = routes[0];
+	/* set.routes aliases routes; changed_digest hashes the added route endpoint. */
+	// cppcheck-suppress unreadVariable
 	routes[4].endpoint = text_field("10.0.0.11:3260");
 	set.route_count = 5;
 	UT_ASSERT(changed_digest(&set));
@@ -237,6 +239,8 @@ UT_TEST(test_missing_roles_and_duplicates_are_rejected)
 	set.route_count = 5;
 	UT_ASSERT(rejected_and_cleared(&set));
 	fixture(&set, routes);
+	/* rejected_and_cleared validates these role bits through set.routes. */
+	// cppcheck-suppress unreadVariable
 	routes[0].roles |= UINT32_C(16);
 	UT_ASSERT(rejected_and_cleared(&set));
 }
@@ -338,6 +342,8 @@ UT_TEST(test_explicit_lengths_and_total_size_bound)
 	UT_ASSERT(memcmp(digest, golden, sizeof(digest)) == 0);
 	routes[0].credential_ref.length = 7;
 	UT_ASSERT(rejected_and_cleared(&set) == false);
+	/* Both credential values are read through set.routes by the digest assertions. */
+	// cppcheck-suppress redundantAssignment
 	routes[0].credential_ref.data = "cred-1\0";
 	UT_ASSERT(rejected_and_cleared(&set));
 	fixture(&set, routes);
@@ -345,6 +351,8 @@ UT_TEST(test_explicit_lengths_and_total_size_bound)
 	routes[0].credential_ref.data = text;
 	routes[0].credential_ref.length = 1024;
 	UT_ASSERT(changed_digest(&set));
+	/* Both the 1024-byte and over-limit values are validated through set.routes. */
+	// cppcheck-suppress redundantAssignment
 	routes[0].credential_ref.length = 1025;
 	UT_ASSERT(rejected_and_cleared(&set));
 	fixture(&set, routes);
@@ -478,6 +486,8 @@ UT_TEST(test_max_routes_and_exact_preimage_limit)
 		UT_ASSERT(pgrac_protected_set_v2_decode(bytes, written, &decoded));
 		UT_ASSERT(pgrac_external_fence_protected_set_digest_v2(&decoded.set, digest));
 	}
+	/* The aggregate-size rejection consumes this route through set.routes. */
+	// cppcheck-suppress unreadVariable
 	routes[42].credential_ref.length++;
 	UT_ASSERT(rejected_and_cleared(&set));
 	UT_ASSERT(!pgrac_protected_set_v2_encode(&set, bytes, sizeof(bytes), &written));
@@ -644,7 +654,7 @@ UT_TEST(test_small_order_and_noncanonical_key_matrix)
 	for (size_t n = 0; n < lengthof(small_order) + 19; ++n) {
 		if (n < lengthof(small_order)) {
 			for (size_t i = 0; i < 32; ++i) {
-				char hex[3] = { small_order[n][2 * i], small_order[n][2 * i + 1], 0 };
+				const char hex[3] = { small_order[n][2 * i], small_order[n][2 * i + 1], 0 };
 				key[i] = strtoul(hex, NULL, 16);
 			}
 		} else {

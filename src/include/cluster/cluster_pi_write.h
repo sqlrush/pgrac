@@ -100,9 +100,10 @@ extern bool cluster_bufmgr_observe_pi_storage_v1(const ClusterPageDataTargetV1 *
  * is its own identity: exact master N/S cut plus typed read/fsync/read needs
  * no resident current image. SPACE1 retains the original SPACE0 identity-S.
  * Neither path writes DATA or acquires X. Plan lifetime follows bind_plan. */
-extern bool cluster_bufmgr_observe_pi_space_storage_v1(const ClusterSpaceIdentityKey *key,
-	const ClusterPcmPiStorageCutV1 *cut, const struct ClusterThreadRecoveryFabricPlanV1 *plan,
-	const ClusterWalSourceRef *sources, uint32 source_count, ClusterPageDataReceiptV1 **out);
+extern bool cluster_bufmgr_observe_pi_space_storage_v1(
+	const ClusterSpaceIdentityKey *key, const ClusterPcmPiStorageCutV1 *cut,
+	const struct ClusterThreadRecoveryFabricPlanV1 *plan, const ClusterWalSourceRef *sources,
+	uint32 source_count, ClusterPageDataReceiptV1 **out);
 extern bool cluster_page_data_pi_storage_proof_v1(const ClusterPageDataReceiptV1 *receipt,
 												  const RfPageOnlinePlanV1 *plan,
 												  const ClusterWalSourceRef *sources,
@@ -137,15 +138,17 @@ struct ClusterPiWritebackFactV2;
  * No buffer/storage I/O or PI retirement occurs; actual consumption still
  * requires the original input pins, physical acknowledgements and exact CAS. */
 extern bool cluster_page_structural_from_ko_v2(uint32 slot, uint64 serial,
-	const RfPageIdentityV1 *page, const struct ClusterThreadRecoveryFabricPlanV1 *plan,
-	ClusterPageStructuralReceiptV2 **out);
+											   const RfPageIdentityV1 *page,
+											   const struct ClusterThreadRecoveryFabricPlanV1 *plan,
+											   ClusterPageStructuralReceiptV2 **out);
 /* Process/ResourceOwner-local. Each read rechecks the original shared owner
  * and master cut. Exactly one output cut is populated; refusal preserves
  * both. Export is only for a real original peer, never raw flags as proof. */
 extern bool cluster_page_structural_pi_proof_v2(const ClusterPageStructuralReceiptV2 *receipt,
-	ClusterPcmPiWriteCutV1 *write_cut, ClusterPcmPiStorageCutV1 *storage_cut);
+												ClusterPcmPiWriteCutV1 *write_cut,
+												ClusterPcmPiStorageCutV1 *storage_cut);
 extern bool cluster_page_structural_pi_fact_v2(const ClusterPageStructuralReceiptV2 *receipt,
-	int32 peer, struct ClusterPiWritebackFactV2 *out);
+											   int32 peer, struct ClusterPiWritebackFactV2 *out);
 extern void cluster_page_structural_receipt_free_v2(ClusterPageStructuralReceiptV2 **receipt);
 
 /* Local physical consumption of the original committed structural result.
@@ -212,18 +215,22 @@ extern bool cluster_pcm_local_pi_retire_v1(const ClusterPcmLocalPiSnapshotV1 *lo
 										   const ClusterWalSourceRef *sources, uint32 source_count,
 										   const ClusterPiPhysicalAckV1 *ack);
 
-extern bool cluster_page_structural_covers_local_pi_v2(const ClusterPageStructuralReceiptV2 *receipt,
-	const ClusterPcmLocalPiSnapshotV1 *local);
+extern bool
+cluster_page_structural_covers_local_pi_v2(const ClusterPageStructuralReceiptV2 *receipt,
+										   const ClusterPcmLocalPiSnapshotV1 *local);
 extern bool cluster_pcm_local_pi_retire_structural_v2(const ClusterPcmLocalPiSnapshotV1 *local,
-	const ClusterPageStructuralReceiptV2 *receipt, const ClusterPiStructuralAckV2 *ack);
+													  const ClusterPageStructuralReceiptV2 *receipt,
+													  const ClusterPiStructuralAckV2 *ack);
 /* Exact local boot only, under the original complete retained input scope.
  * The caller keeps both inputs and receipt/plan alive through ACK consumption.
  * Every logical endpoint must be an ancestor, followed by physical disposal
  * and the original local-entry revision CAS. No remote or master retirement. */
 extern bool cluster_bufmgr_ack_pi_at_structure_v2(const ClusterPageStructuralReceiptV2 *receipt,
-	ClusterWalInputsV1 *inputs, ClusterPiStructuralAckV2 **out);
+												  ClusterWalInputsV1 *inputs,
+												  ClusterPiStructuralAckV2 **out);
 extern bool cluster_page_structural_pi_ack_read_v2(const ClusterPiStructuralAckV2 *ack,
-	const ClusterPageStructuralReceiptV2 *receipt, int32 *out_node);
+												   const ClusterPageStructuralReceiptV2 *receipt,
+												   int32 *out_node);
 extern void cluster_page_structural_pi_ack_free_v2(ClusterPiStructuralAckV2 **ack);
 
 /* Actual local physical completion, qualified for the original writer/boot.
@@ -246,10 +253,12 @@ extern bool cluster_bufmgr_ack_pi_at_data_v1(const ClusterPageDataReceiptV1 *rec
  * borrows inputs, which must stay alive until the acknowledgement is freed;
  * suspension, ROOT/membership change or a different owner prevents use.
  * It cannot be exported as a physical acknowledgement or authorize WAL GC. */
-extern bool cluster_bufmgr_ack_recovered_pi_at_data_v1(
-	const ClusterPageDataReceiptV1 *receipt, const RfPageOnlinePlanV1 *plan,
-	const ClusterWalSourceRef *sources, uint32 source_count, ClusterWalInputsV1 *inputs,
-	int32 node, ClusterPiPhysicalAckV1 **out);
+extern bool cluster_bufmgr_ack_recovered_pi_at_data_v1(const ClusterPageDataReceiptV1 *receipt,
+													   const RfPageOnlinePlanV1 *plan,
+													   const ClusterWalSourceRef *sources,
+													   uint32 source_count,
+													   ClusterWalInputsV1 *inputs, int32 node,
+													   ClusterPiPhysicalAckV1 **out);
 extern bool cluster_page_data_pi_ack_read_v1(const ClusterPiPhysicalAckV1 *ack,
 											 const ClusterPageDataReceiptV1 *receipt,
 											 int32 *out_node);
@@ -367,7 +376,9 @@ extern bool cluster_pcm_lock_pi_storage_complete_v1(const ClusterPageDataReceipt
  * holder before taking directory locks, then compare the entire X or N/S
  * master cut under entry X. Refusal zeroes holders_out without changing
  * the directory. The caller retains the receipt and all ACK/input scopes. */
-extern bool cluster_pcm_lock_pi_structural_complete_v2(const ClusterPageStructuralReceiptV2 *receipt,
-	const ClusterPiStructuralAckV2 *const *acks, uint32 ack_count, uint32 *holders_out);
+extern bool
+cluster_pcm_lock_pi_structural_complete_v2(const ClusterPageStructuralReceiptV2 *receipt,
+										   const ClusterPiStructuralAckV2 *const *acks,
+										   uint32 ack_count, uint32 *holders_out);
 #endif
 #endif /* CLUSTER_PI_WRITE_H */

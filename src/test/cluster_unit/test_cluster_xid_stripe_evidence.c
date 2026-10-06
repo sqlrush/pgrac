@@ -198,7 +198,8 @@ cluster_voting_disk_write_stripe_slot_ex(int fd, uint32 node, const void *bytes,
 		if (++source_sync_writes > allowed_source_sync_writes)
 			return CLUSTER_VOTING_DISK_IO_FAILED;
 		if (pwrite(fd, bytes, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_STRIPE_SLOT_OFFSET(node))
-				!= CLUSTER_VOTING_SLOT_BYTES || fsync(fd) != 0)
+				!= CLUSTER_VOTING_SLOT_BYTES
+			|| fsync(fd) != 0)
 			abort();
 		return CLUSTER_VOTING_DISK_IO_OK;
 	}
@@ -214,8 +215,9 @@ cluster_voting_disk_read_raw_slot_at(int fd, off_t offset, void *bytes)
 			return CLUSTER_VOTING_DISK_RAW_READ_IO_FAILED;
 	n = pread(fd, bytes, CLUSTER_VOTING_SLOT_BYTES, offset);
 	return n == CLUSTER_VOTING_SLOT_BYTES ? CLUSTER_VOTING_DISK_RAW_READ_FULL
-		: n == 0 ? CLUSTER_VOTING_DISK_RAW_READ_CLEAN_EOF
-		: n > 0 ? CLUSTER_VOTING_DISK_RAW_READ_SHORT : CLUSTER_VOTING_DISK_RAW_READ_IO_FAILED;
+		   : n == 0						  ? CLUSTER_VOTING_DISK_RAW_READ_CLEAN_EOF
+		   : n > 0						  ? CLUSTER_VOTING_DISK_RAW_READ_SHORT
+										  : CLUSTER_VOTING_DISK_RAW_READ_IO_FAILED;
 }
 
 ClusterVotingDiskIoState
@@ -508,7 +510,8 @@ UT_TEST(repeated_generations_keep_durable_history_before_new_grants)
 		reset_lease();
 		history_writes = 0;
 		stripe_lease_tick(disks, 3, 2052);
-		UT_ASSERT_EQ(stripe_read_slot_all(disks, 3, 4, &current, STRIPE_READ_UPDATE), STRIPE_READ_VALID);
+		UT_ASSERT_EQ(stripe_read_slot_all(disks, 3, 4, &current, STRIPE_READ_UPDATE),
+					 STRIPE_READ_VALID);
 		UT_ASSERT_EQ(current.history_generation, generation);
 		UT_ASSERT_EQ(pread(disks[0], again, sizeof(again), offset), sizeof(again));
 		memcpy(&archived, again, sizeof(archived));
@@ -554,17 +557,17 @@ UT_TEST(history_majority_precedes_activation_and_preserves_old_mapping)
 	allowed_history_writes = 2;
 	stripe_lease_tick(disks, 3, 2052);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&lease.floor_full), old_limit);
-	UT_ASSERT(cluster_xid_stripe_lookup_incarnation_fds(disks, 3,
-		FullTransactionIdFromU64(2052), &resolved));
+	UT_ASSERT(cluster_xid_stripe_lookup_incarnation_fds(disks, 3, FullTransactionIdFromU64(2052),
+														&resolved));
 	UT_ASSERT_EQ(resolved, old_incarnation);
-	UT_ASSERT(cluster_xid_stripe_lookup_incarnation_fds(disks, 3,
-		FullTransactionIdFromU64(old_limit), &resolved));
+	UT_ASSERT(cluster_xid_stripe_lookup_incarnation_fds(
+		disks, 3, FullTransactionIdFromU64(old_limit), &resolved));
 	UT_ASSERT_EQ(resolved, incarnation);
 	/* The exact predecessor is bound by current quorum evidence. One
 	 * durable copy plus a readable lagging replica still supplies that image. */
 	read_errors = 1;
-	UT_ASSERT(cluster_xid_stripe_lookup_incarnation_fds(disks, 3,
-		FullTransactionIdFromU64(old_limit - 16), &resolved));
+	UT_ASSERT(cluster_xid_stripe_lookup_incarnation_fds(
+		disks, 3, FullTransactionIdFromU64(old_limit - 16), &resolved));
 	UT_ASSERT_EQ(resolved, old_incarnation);
 	read_errors = 0;
 	UT_ASSERT_EQ(pread(disks[0], bytes, sizeof(bytes), offset), sizeof(bytes));
@@ -574,8 +577,8 @@ UT_TEST(history_majority_precedes_activation_and_preserves_old_mapping)
 	memcpy(bytes, &history, sizeof(history));
 	UT_ASSERT_EQ(pwrite(disks[0], bytes, sizeof(bytes), offset), sizeof(bytes));
 	resolved = 999;
-	UT_ASSERT(!cluster_xid_stripe_lookup_incarnation_fds(disks, 3,
-		FullTransactionIdFromU64(2052), &resolved));
+	UT_ASSERT(!cluster_xid_stripe_lookup_incarnation_fds(disks, 3, FullTransactionIdFromU64(2052),
+														 &resolved));
 	UT_ASSERT_EQ(resolved, 999);
 }
 
@@ -626,7 +629,8 @@ UT_TEST(partial_archive_freezes_herding_image_until_activation)
 	reset_rows();
 	UT_ASSERT_EQ(read_rows(&current, false), STRIPE_READ_VALID);
 	stripe_lease_tick(disks, 3, 2052);
-	UT_ASSERT_EQ(stripe_read_slot_all(disks, 3, 4, &previous, STRIPE_READ_UPDATE), STRIPE_READ_VALID);
+	UT_ASSERT_EQ(stripe_read_slot_all(disks, 3, 4, &previous, STRIPE_READ_UPDATE),
+				 STRIPE_READ_VALID);
 	ceiling = previous.issued_limit_full;
 	reset_lease();
 	local_next = ceiling + 16;
@@ -641,7 +645,8 @@ UT_TEST(partial_archive_freezes_herding_image_until_activation)
 	cluster_xid_stripe_herding_tick(disks, 3);
 	UT_ASSERT_EQ(writes, 0);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&lease.limit_full), 0);
-	UT_ASSERT_EQ(stripe_read_slot_all(disks, 3, 4, &current, STRIPE_READ_UPDATE), STRIPE_READ_VALID);
+	UT_ASSERT_EQ(stripe_read_slot_all(disks, 3, 4, &current, STRIPE_READ_UPDATE),
+				 STRIPE_READ_VALID);
 	UT_ASSERT_EQ(memcmp(&current, &previous, sizeof(current)), 0);
 	/* A second owner resumes the exact archive and burns the prior ceiling. */
 	reset_lease();
@@ -667,18 +672,19 @@ UT_TEST(partial_current_after_archive_is_burned_after_restart)
 	allowed_writes = 1;
 	cluster_xid_stripe_herding_tick(disks, 3);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&lease.limit_full), 0);
-	UT_ASSERT_EQ(stripe_read_slot_all(disks, 3, 4, &current, STRIPE_READ_UPDATE), STRIPE_READ_VALID);
+	UT_ASSERT_EQ(stripe_read_slot_all(disks, 3, 4, &current, STRIPE_READ_UPDATE),
+				 STRIPE_READ_VALID);
 	UT_ASSERT_EQ(current.lease_floor_full, ceiling);
 	ceiling = current.issued_limit_full;
 	reset_lease();
 	history_writes = 0;
 	cluster_xid_stripe_herding_tick(disks, 3);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&lease.floor_full), ceiling);
-	UT_ASSERT(cluster_xid_stripe_lookup_incarnation_fds(disks, 3,
-		FullTransactionIdFromU64(2052), &resolved));
+	UT_ASSERT(cluster_xid_stripe_lookup_incarnation_fds(disks, 3, FullTransactionIdFromU64(2052),
+														&resolved));
 	UT_ASSERT_EQ(resolved, first_incarnation);
-	UT_ASSERT(cluster_xid_stripe_lookup_incarnation_fds(disks, 3,
-		FullTransactionIdFromU64(ceiling - 16), &resolved));
+	UT_ASSERT(cluster_xid_stripe_lookup_incarnation_fds(
+		disks, 3, FullTransactionIdFromU64(ceiling - 16), &resolved));
 	UT_ASSERT_EQ(resolved, abandoned_incarnation);
 }
 
@@ -691,14 +697,16 @@ UT_TEST(archived_source_survives_loss_of_its_original_newest_copy)
 	reset_rows();
 	UT_ASSERT_EQ(read_rows(&current, false), STRIPE_READ_VALID);
 	stripe_lease_tick(disks, 3, 2052);
-	UT_ASSERT_EQ(stripe_read_slot_all(disks, 3, 4, &current, STRIPE_READ_UPDATE), STRIPE_READ_VALID);
+	UT_ASSERT_EQ(stripe_read_slot_all(disks, 3, 4, &current, STRIPE_READ_UPDATE),
+				 STRIPE_READ_VALID);
 	ceiling = current.issued_limit_full;
 	/* A legal tracking update reached only D0 before the old owner died. */
 	current.next_xid_hwm_full += 16;
 	current.generation++;
 	cluster_xid_stripe_slot_record_compute_crc(&current);
 	memcpy(bytes, &current, sizeof(current));
-	UT_ASSERT_EQ(pwrite(disks[0], bytes, sizeof(bytes), CLUSTER_VOTING_STRIPE_SLOT_OFFSET(4)), sizeof(bytes));
+	UT_ASSERT_EQ(pwrite(disks[0], bytes, sizeof(bytes), CLUSTER_VOTING_STRIPE_SLOT_OFFSET(4)),
+				 sizeof(bytes));
 	reset_lease();
 	history_write_errors = 1;
 	allowed_writes = 0;

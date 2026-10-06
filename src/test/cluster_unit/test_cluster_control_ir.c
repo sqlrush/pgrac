@@ -27,8 +27,8 @@ static bool pin_acquire_uncertain;
 static int pin_fixture;
 
 ClusterWalPinResult
-cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *requests,
-								  uint16 count, ClusterWalRetentionPin **out)
+cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *requests, uint16 count,
+								  ClusterWalRetentionPin **out)
 {
 	unsigned i;
 
@@ -53,8 +53,7 @@ cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *req
 }
 
 ClusterWalPinResult
-cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin,
-								   ClusterRecoverySerialGuard *serial)
+cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin, ClusterRecoverySerialGuard *serial)
 {
 	UT_ASSERT(pin == (ClusterWalRetentionPin *)&pin_fixture);
 	UT_ASSERT(serial->held);
@@ -64,8 +63,7 @@ cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin,
 }
 
 ClusterWalPinResult
-cluster_wal_retention_pin_bind_set(ClusterWalRetentionPin *pin,
-								   ClusterRecoverySerialGuardSet *set)
+cluster_wal_retention_pin_bind_set(ClusterWalRetentionPin *pin, ClusterRecoverySerialGuardSet *set)
 {
 	unsigned i;
 
@@ -79,7 +77,8 @@ ClusterWalPinResult
 cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin)
 {
 	return pin == (ClusterWalRetentionPin *)&pin_fixture && pin_bound && pin_current
-			   ? CLUSTER_WAL_PIN_OK : CLUSTER_WAL_PIN_STALE;
+			   ? CLUSTER_WAL_PIN_OK
+			   : CLUSTER_WAL_PIN_STALE;
 }
 
 ClusterWalrReleaseResult

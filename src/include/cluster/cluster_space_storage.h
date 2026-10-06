@@ -74,8 +74,7 @@ extern bool cluster_space_cold_install_v1(const ClusterSpaceIdentityKey *key,
  * existing reliable invalidation barrier before releasing lifecycle locks. */
 extern bool cluster_space_relation_get_identity(Relation relation, ClusterSpaceIdentity *out);
 
-typedef enum ClusterSpaceHintResult
-{
+typedef enum ClusterSpaceHintResult {
 	CLUSTER_SPACE_HINT_NATIVE,
 	CLUSTER_SPACE_HINT_SKIPPED,
 	CLUSTER_SPACE_HINT_VERSIONED
@@ -89,10 +88,9 @@ typedef enum ClusterSpaceHintResult
  * the content lock. SKIPPED leaves everything untouched: optional hints may
  * return, but required transaction normalization must refuse the operation.
  * NATIVE keeps the original nonshared/rebuildable hint path. */
-extern ClusterSpaceHintResult cluster_space_hint_begin(Buffer buffer,
-													RfPageProducerBatchV1 *batch);
+extern ClusterSpaceHintResult cluster_space_hint_begin(Buffer buffer, RfPageProducerBatchV1 *batch);
 extern void cluster_space_hint_finish(Buffer buffer, bool standard,
-									 const RfPageProducerBatchV1 *batch);
+									  const RfPageProducerBatchV1 *batch);
 
 /* Memory-only single-component capture for native owners whose WAL batch can
  * span relations. Same locked-buffer/identity contract as prepare below, but
@@ -164,8 +162,8 @@ extern BlockNumber cluster_space_reserve(const ClusterSpaceIdentity *identity,
 /* Original unpublished build/copy owner only, under its lifecycle lock.
  * Acquire HW(X) and reserve exactly the requested next range. A mismatched
  * grant is consumed but refused; it never licenses overwriting prior blocks. */
-extern bool cluster_space_reserve_exact(const ClusterSpaceIdentity *identity,
-									   BlockNumber first, uint32 count);
+extern bool cluster_space_reserve_exact(const ClusterSpaceIdentity *identity, BlockNumber first,
+										uint32 count);
 
 typedef struct ClusterSpaceTruncateState ClusterSpaceTruncateState;
 

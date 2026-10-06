@@ -295,7 +295,7 @@ lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id
 	slot->dest_node_id = dest_node_id;
 	slot->msg_type = msg_type;
 	slot->kind = block_request ? (uint8)CLUSTER_LMS_OUTBOUND_BLOCK_REQUEST
-							  : (uint8)CLUSTER_LMS_OUTBOUND_FRAME;
+							   : (uint8)CLUSTER_LMS_OUTBOUND_FRAME;
 	slot->frame_epoch = frame_epoch;
 	slot->request_membership_generation = membership_generation;
 	slot->request_stream_generation = stream_generation;
@@ -964,8 +964,7 @@ lms_outbound_frame_current(ClusterLmsOutboundSlot *slot, int worker)
 
 	if (!cluster_shared_config || cluster_interconnect_tier != CLUSTER_IC_TIER_1)
 		return true;
-	if (slot->dest_node_id >= CLUSTER_MAX_NODES
-		|| slot->frame_epoch != cluster_epoch_get_current()
+	if (slot->dest_node_id >= CLUSTER_MAX_NODES || slot->frame_epoch != cluster_epoch_get_current()
 		|| !cluster_membership_cut_generation_current(slot->request_membership_generation))
 		return false;
 	stream = cluster_ic_tier1_resource_x_stream_generation((int32)slot->dest_node_id, worker);

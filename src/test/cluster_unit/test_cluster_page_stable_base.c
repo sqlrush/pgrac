@@ -769,15 +769,14 @@ UT_TEST(test_stable_proof_covers_exact_ancestors_before_nearest_anchor)
 	RfPageIdentityV1 wrong;
 
 	graph_init(&fixture);
-	set_edge(&fixture.edges[1], &fixture.identity, RF_PAGE_STATE_PRESENT, &first, &middle,
-			 0, 2, 0);
+	set_edge(&fixture.edges[1], &fixture.identity, RF_PAGE_STATE_PRESENT, &first, &middle, 0, 2, 0);
 	set_edge(&fixture.edges[2], &fixture.identity, RF_PAGE_STATE_PRESENT, &middle, &last,
 			 RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE, 3, 0);
 	fixture.request.expected_result = last;
 	graph_recount(&fixture, 1, 3);
 	proof_request(&fixture, &request);
 	UT_ASSERT_EQ(rf_page_stable_base_proof_build_bound_v1(&request, fixture.chain,
-													 lengthof(fixture.chain), &proof),
+														  lengthof(fixture.chain), &proof),
 				 RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT(proof != NULL);
 	UT_ASSERT(rf_page_stable_base_proof_covers_version_v1(proof, &fixture.identity, &first));

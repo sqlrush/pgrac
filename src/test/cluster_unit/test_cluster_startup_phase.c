@@ -459,7 +459,7 @@ cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refus
 	/* Original postmaster caller must remain off every backend wait edge. */
 	Assert(!IsUnderPostmaster && MyProc == NULL && !phase_test_cf_held);
 	return phase_test_semantic_ready_after > 0
-		&& phase_test_semantic_poll_calls >= phase_test_semantic_ready_after;
+		   && phase_test_semantic_poll_calls >= phase_test_semantic_ready_after;
 }
 static ReconfigEvent phase_test_protocol_event;
 static uint32 phase_test_protocol_state = GRD_RECOVERY_IDLE;
@@ -689,7 +689,8 @@ cluster_formation_witness_copy_classification_v1(
 	snapshot->membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
 	snapshot->membership.last_admitted_incarnation[0] = phase_test_last_admitted_incarnation;
 	snapshot->local_epoch = phase_test_formation_epoch;
-	snapshot->reserved[0] = phase_test_witness_control ? CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL : 0;
+	snapshot->reserved[0]
+		= phase_test_witness_control ? CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL : 0;
 	return true;
 }
 
@@ -1935,9 +1936,10 @@ UT_TEST(test_native_initializer_walr_share_nowait_reaches_all_startup_gates)
 	UT_ASSERT(ges_readiness_allows_early_opcode(grant.request_opcode));
 	UT_ASSERT(cluster_recovery_authority_request_allowed(&req.resid, req.lockmode, true));
 	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
-	UT_ASSERT(ges_readiness_allows_local_origin(grant.request_opcode, &req.resid, req.lockmode,
-												NoLock));
-	UT_ASSERT(ges_readiness_allows_protocol_request(grant.request_opcode, &req.resid, req.lockmode));
+	UT_ASSERT(
+		ges_readiness_allows_local_origin(grant.request_opcode, &req.resid, req.lockmode, NoLock));
+	UT_ASSERT(
+		ges_readiness_allows_protocol_request(grant.request_opcode, &req.resid, req.lockmode));
 	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid));
 	UT_ASSERT(ges_readiness_allows_local_release_origin(&req.resid));
 	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &req.resid, NoLock));
@@ -1975,7 +1977,7 @@ UT_TEST(test_native_initializer_walr_share_cannot_borrow_another_role_or_generat
 	phase_test_grd_authority_ok = false;
 	UT_ASSERT(!cluster_recovery_authority_request_allowed(&req.resid, ShareLock, true));
 	UT_ASSERT(!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST_NOWAIT, &req.resid,
-														ShareLock));
+													 ShareLock));
 	MyProc = NULL;
 	IsUnderPostmaster = false;
 	reset_phase_service_fixture(true);
@@ -2587,8 +2589,7 @@ UT_TEST(test_shared_phase4_waits_for_actual_semantic_open)
 	if (setjmp(phase4_fatal_jump) == 0) {
 		cluster_run_phase4_sequence();
 		cluster_finalize_startup_running();
-	}
-	else
+	} else
 		caught_fatal = true;
 	phase4_capture_fatal = false;
 	if (caught_fatal)
@@ -2619,8 +2620,7 @@ UT_TEST(test_shared_phase4_cannot_publish_running_without_semantic_open)
 	if (setjmp(phase4_fatal_jump) == 0) {
 		cluster_run_phase4_sequence();
 		cluster_finalize_startup_running();
-	}
-	else
+	} else
 		caught_fatal = true;
 	phase4_capture_fatal = false;
 	cluster_phase4_timeout = saved_timeout;

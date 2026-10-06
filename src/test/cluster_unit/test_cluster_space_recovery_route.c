@@ -52,7 +52,8 @@ XLogRecGetBlockTagExtended(XLogReaderState *record, uint8 id, RelFileLocator *ta
 	(void)forknum;
 	(void)block;
 	(void)prefetch;
-	*tag = locator;
+	if (tag != NULL)
+		*tag = locator;
 	return true;
 }
 
@@ -64,7 +65,7 @@ static void
 record_init(XLogReaderState *reader, DecodedXLogRecord *decoded, uint8 *bytes)
 {
 	ClusterSpaceWalChange change;
-	ClusterSpaceStructureChange pair = {0};
+	ClusterSpaceStructureChange pair = { 0 };
 
 	memset(&change, 0, sizeof(change));
 	change.action = CLUSTER_SPACE_WAL_CREATE;
@@ -128,6 +129,8 @@ UT_TEST(test_invalid_typed_record_is_not_local_or_shared)
 	UT_ASSERT_EQ(cluster_record_apply_class(&reader), CLUSTER_RECMERGE_UNCLASSIFIABLE);
 	UT_ASSERT_EQ(routes, 0);
 	record_init(&reader, &decoded, bytes);
+	/* The native classifier decodes these bytes through reader.record->main_data. */
+	// cppcheck-suppress unreadVariable
 	bytes[CLUSTER_SPACE_WAL_BYTES + 208 + 16] ^= 1;
 	UT_ASSERT_EQ(cluster_record_apply_class(&reader), CLUSTER_RECMERGE_UNCLASSIFIABLE);
 	UT_ASSERT_EQ(routes, 0);
@@ -173,6 +176,8 @@ UT_TEST(test_reservation_opcode_routes_only_complete_advance)
 	UT_ASSERT_EQ(routes, 2);
 	decoded.main_data_len = 24;
 	UT_ASSERT_EQ(cluster_record_apply_class(&reader), CLUSTER_RECMERGE_UNCLASSIFIABLE);
+	/* The intervening native classifier consumed the short length through reader.record. */
+	// cppcheck-suppress redundantAssignment
 	decoded.main_data_len = CLUSTER_SPACE_RESERVATION_WAL_BYTES;
 	decoded.max_block_id = 0;
 	UT_ASSERT_EQ(cluster_record_apply_class(&reader), CLUSTER_RECMERGE_UNCLASSIFIABLE);

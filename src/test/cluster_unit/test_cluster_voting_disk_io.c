@@ -903,19 +903,26 @@ UT_TEST(test_batch_slots_validate_every_header_and_crc)
 	UT_ASSERT(fd >= 0);
 	for (int fault = 0; fault < 5; ++fault) {
 		ClusterVotingSlot bad __attribute__((aligned(512)));
-		UT_ASSERT_EQ(cluster_voting_disk_format(fd, CLUSTER_MAX_NODES, 0), CLUSTER_VOTING_DISK_IO_OK);
+		UT_ASSERT_EQ(cluster_voting_disk_format(fd, CLUSTER_MAX_NODES, 0),
+					 CLUSTER_VOTING_DISK_IO_OK);
 		UT_ASSERT_EQ(cluster_voting_disk_read_slot(fd, 0, 71, &bad), CLUSTER_VOTING_DISK_IO_OK);
-		if (fault == 0) bad.magic++;
-		if (fault == 1) bad.version++;
-		if (fault == 2) bad.node_id++;
-		if (fault == 3) bad.disk_index++;
+		if (fault == 0)
+			bad.magic++;
+		if (fault == 1)
+			bad.version++;
+		if (fault == 2)
+			bad.node_id++;
+		if (fault == 3)
+			bad.disk_index++;
 		bad.crc32c = cluster_voting_disk_compute_crc32c(&bad);
-		if (fault == 4) bad.crc32c++;
+		if (fault == 4)
+			bad.crc32c++;
 		UT_ASSERT_EQ(pwrite(fd, &bad, sizeof(bad), CLUSTER_VOTING_SLOT_OFFSET(71)), sizeof(bad));
 		cluster_voting_disk_read_slots(fd, 0, 0, CLUSTER_MAX_NODES, slots, states);
 		for (int node = 0; node < CLUSTER_MAX_NODES; ++node)
-			UT_ASSERT_EQ(states[node], node != 71 ? CLUSTER_VOTING_DISK_IO_OK
-				: fault == 4 ? CLUSTER_VOTING_DISK_IO_TORN : CLUSTER_VOTING_DISK_IO_FAILED);
+			UT_ASSERT_EQ(states[node], node != 71	? CLUSTER_VOTING_DISK_IO_OK
+									   : fault == 4 ? CLUSTER_VOTING_DISK_IO_TORN
+													: CLUSTER_VOTING_DISK_IO_FAILED);
 	}
 	cluster_voting_disk_close(fd);
 	unlink(path);
@@ -944,9 +951,10 @@ UT_TEST(test_batch_short_io_bounds_and_raw_regions)
 	UT_ASSERT_EQ(states[1], CLUSTER_VOTING_DISK_IO_FAILED);
 	for (int region = 0; region < 2; ++region) {
 		off_t offset = region == 0 ? CLUSTER_VOTING_JOIN_SLOT_OFFSET(126)
-			: CLUSTER_VOTING_FORMATION_SLOT_OFFSET(126);
+								   : CLUSTER_VOTING_FORMATION_SLOT_OFFSET(126);
 		ClusterVotingDiskIoState (*read_range)(int, uint32, uint32, void *)
-			= region == 0 ? cluster_voting_disk_read_join_slots : cluster_voting_disk_read_formation_slots;
+			= region == 0 ? cluster_voting_disk_read_join_slots
+						  : cluster_voting_disk_read_formation_slots;
 		memset(raw, region + 1, sizeof(raw));
 		UT_ASSERT_EQ(pwrite(fd, raw, sizeof(raw), offset), sizeof(raw));
 		UT_ASSERT_EQ(read_range(fd, 126, 2, observed), CLUSTER_VOTING_DISK_IO_OK);

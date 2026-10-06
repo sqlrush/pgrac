@@ -68,7 +68,11 @@ LWLockRelease(LWLock *lock)
 		abort();
 }
 
-void pg_re_throw(void) { abort(); }
+void
+pg_re_throw(void)
+{
+	abort();
+}
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
 {
@@ -169,7 +173,11 @@ cluster_undo_try_mark_record_segment_committed_owned(uint32 seg, uint8 owner, SC
 		abort();
 }
 
-SCN cluster_scn_current(void) { return 100; }
+SCN
+cluster_scn_current(void)
+{
+	return 100;
+}
 
 bool
 cluster_undo_segment_mark_active(uint32 seg, uint8 owner)
@@ -240,7 +248,7 @@ assert_claimed(const ClusterUndoExtent *ext, uint32 seg, uint32 first)
 
 UT_TEST(test_cold_full_segment_claims_existing_successor)
 {
-	ClusterUndoExtent ext = {0};
+	ClusterUndoExtent ext = { 0 };
 	reset_fixture(true);
 	UT_ASSERT_EQ(claim_undo_extent(&ext, 1, 1, 100), CLAIM_OK);
 	assert_claimed(&ext, 2, 1);
@@ -251,7 +259,7 @@ UT_TEST(test_cold_full_segment_claims_existing_successor)
 
 UT_TEST(test_cold_full_segment_provisions_once)
 {
-	ClusterUndoExtent ext = {0};
+	ClusterUndoExtent ext = { 0 };
 	reset_fixture(true);
 	plan.needs_provision = true;
 	UT_ASSERT_EQ(claim_undo_extent(&ext, 1, 1, 100), CLAIM_OK);
@@ -262,7 +270,7 @@ UT_TEST(test_cold_full_segment_provisions_once)
 
 UT_TEST(test_cold_full_segment_reuses_exact_candidate_once)
 {
-	ClusterUndoExtent ext = {0};
+	ClusterUndoExtent ext = { 0 };
 	reset_fixture(true);
 	plan.needs_reuse = true;
 	UT_ASSERT_EQ(claim_undo_extent(&ext, 1, 1, 100), CLAIM_OK);
@@ -273,7 +281,7 @@ UT_TEST(test_cold_full_segment_reuses_exact_candidate_once)
 
 UT_TEST(test_warm_full_segment_still_rolls)
 {
-	ClusterUndoExtent ext = {0};
+	ClusterUndoExtent ext = { 0 };
 	reset_fixture(false);
 	UT_ASSERT_EQ(claim_undo_extent(&ext, 1, 1, 100), CLAIM_OK);
 	assert_claimed(&ext, 2, 1);
@@ -281,7 +289,7 @@ UT_TEST(test_warm_full_segment_still_rolls)
 
 UT_TEST(test_cold_partial_segment_resumes_bitmap_without_resetting_tail)
 {
-	ClusterUndoExtent ext = {0};
+	ClusterUndoExtent ext = { 0 };
 	reset_fixture(true);
 	first_free = 5;
 	UT_ASSERT_EQ(claim_undo_extent(&ext, 1, 1, 100), CLAIM_OK);
@@ -292,7 +300,7 @@ UT_TEST(test_cold_partial_segment_resumes_bitmap_without_resetting_tail)
 
 UT_TEST(test_changed_cursor_after_provision_recomputes_from_winner)
 {
-	ClusterUndoExtent ext = {0};
+	ClusterUndoExtent ext = { 0 };
 	reset_fixture(true);
 	plan.needs_provision = drift_on_provision = true;
 	UT_ASSERT_EQ(claim_undo_extent(&ext, 1, 1, 100), CLAIM_OK);
@@ -304,7 +312,7 @@ UT_TEST(test_changed_cursor_after_provision_recomputes_from_winner)
 UT_TEST(test_changed_cursor_during_seal_never_publishes_successor)
 {
 	for (int cold = 0; cold <= 1; cold++) {
-		ClusterUndoExtent ext = {0};
+		ClusterUndoExtent ext = { 0 };
 		reset_fixture(cold);
 		drift_on_seal = true;
 		UT_ASSERT_EQ(claim_undo_extent(&ext, 1, 1, 100), CLAIM_IO_FAIL);
@@ -318,15 +326,14 @@ UT_TEST(test_changed_cursor_during_seal_never_publishes_successor)
 UT_TEST(test_generation_or_io_failure_remains_closed)
 {
 	for (int fault = 0; fault < 4; fault++) {
-		ClusterUndoExtent ext = {0};
+		ClusterUndoExtent ext = { 0 };
 		reset_fixture(true);
 		plan.needs_provision = (fault == 0);
 		generation_mismatch = (fault == 0);
 		plan.needs_reuse = (fault == 1);
 		mutation_ok = (fault == 0 || fault == 3);
 		drift_on_range = (fault == 3);
-		UT_ASSERT_EQ(claim_undo_extent(&ext, 1, 1, 100),
-					 fault < 2 ? CLAIM_FS_FAIL : CLAIM_IO_FAIL);
+		UT_ASSERT_EQ(claim_undo_extent(&ext, 1, 1, 100), fault < 2 ? CLAIM_FS_FAIL : CLAIM_IO_FAIL);
 		UT_ASSERT_EQ(state.active_segment_id, 0);
 		UT_ASSERT_EQ(pg_atomic_read_u64(&state.extent_claim_count), 0);
 		UT_ASSERT(!cursor_locked && !lifecycle_locked);
@@ -336,12 +343,11 @@ UT_TEST(test_generation_or_io_failure_remains_closed)
 UT_TEST(test_failed_selection_does_not_bind_cursor)
 {
 	for (int hard_cap = 0; hard_cap <= 1; hard_cap++) {
-		ClusterUndoExtent ext = {0};
+		ClusterUndoExtent ext = { 0 };
 		reset_fixture(true);
 		select_ok = false;
 		plan.at_hard_cap = hard_cap;
-		UT_ASSERT_EQ(claim_undo_extent(&ext, 1, 1, 100),
-					 hard_cap ? CLAIM_HARD_CAP : CLAIM_FS_FAIL);
+		UT_ASSERT_EQ(claim_undo_extent(&ext, 1, 1, 100), hard_cap ? CLAIM_HARD_CAP : CLAIM_FS_FAIL);
 		UT_ASSERT_EQ(state.active_segment_id, 0);
 		UT_ASSERT_EQ(ranges, 0);
 		UT_ASSERT(!cursor_locked && !lifecycle_locked);

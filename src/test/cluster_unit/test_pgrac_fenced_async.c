@@ -30,6 +30,7 @@ UT_DEFINE_GLOBALS();
 #include "data/pgrac_fence_map_v2_fixture.h"
 
 static volatile uint32 *actuation_entries;
+static long actuation_pause_ns;
 
 static PgracFencedProviderResult
 test_resolve(const PgracFencedTargetV1 *configured, PgracFencedTargetV1 *resolved,
@@ -53,6 +54,10 @@ concurrent_actuate(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns,
 	(void)__sync_add_and_fetch(actuation_entries, 1);
 	while (*actuation_entries < 2 && loops++ < 500)
 		(void)nanosleep(&pause, NULL);
+	if (actuation_pause_ns > 0) {
+		pause.tv_nsec = actuation_pause_ns;
+		(void)nanosleep(&pause, NULL);
+	}
 	return *actuation_entries >= 2 ? PGRAC_FENCED_PROVIDER_OK : PGRAC_FENCED_PROVIDER_UNKNOWN;
 }
 
@@ -163,7 +168,8 @@ journal_record_count(int fd)
 	return (size_t)st.st_size / PGRAC_FENCED_JOURNAL_RECORD_BYTES;
 }
 
-UT_TEST(test_two_targets_execute_concurrently_with_parent_serial_journal)
+static void
+run_two_targets(long pause_ns)
 {
 	PgracFencedOperationContextV1 context;
 	PgracFencedJournalScanState journal_state;
@@ -183,7 +189,9 @@ UT_TEST(test_two_targets_execute_concurrently_with_parent_serial_journal)
 	int journal_fd;
 	int completed = 0;
 	int attempts = 0;
+	uint64_t deadline;
 
+	actuation_pause_ns = pause_ns;
 	journal_fd = open_context(&context, &journal_state, &config, &ops, path, false);
 	if (journal_fd < 0)
 		return;
@@ -205,16 +213,21 @@ UT_TEST(test_two_targets_execute_concurrently_with_parent_serial_journal)
 												   deadline_after_ms(2000), &first));
 	UT_ASSERT(pgrac_fenced_async_start_preaccepted(&context, &second_request, &second_prepared,
 												   deadline_after_ms(2000), &second));
+	deadline = deadline_after_ms(2000);
 	memset(&first_response, 0, sizeof(first_response));
 	memset(&second_response, 0, sizeof(second_response));
-	while (completed < 2 && attempts++ < 100) {
+	while (completed < 2 && attempts++ < 100 && deadline_after_ms(0) < deadline) {
+		int ready;
 		descriptors[0].fd = pgrac_fenced_async_fd(&first);
 		descriptors[0].events = descriptors[0].fd >= 0 ? POLLIN : 0;
 		descriptors[0].revents = 0;
 		descriptors[1].fd = pgrac_fenced_async_fd(&second);
 		descriptors[1].events = descriptors[1].fd >= 0 ? POLLIN : 0;
 		descriptors[1].revents = 0;
-		UT_ASSERT(poll(descriptors, 2, 100) > 0);
+		ready = poll(descriptors, 2, 100);
+		UT_ASSERT(ready >= 0);
+		if (ready < 0)
+			break;
 		if (descriptors[0].revents != 0) {
 			bool ok = pgrac_fenced_async_service(&context, &first, &event, &first_response);
 
@@ -249,6 +262,18 @@ UT_TEST(test_two_targets_execute_concurrently_with_parent_serial_journal)
 	UT_ASSERT_EQ(munmap((void *)actuation_entries, sizeof(*actuation_entries)), 0);
 	(void)close(journal_fd);
 	(void)unlink(path);
+}
+
+UT_TEST(test_two_targets_execute_concurrently_with_parent_serial_journal)
+{
+	run_two_targets(0);
+}
+
+UT_TEST(test_two_targets_can_wait_between_parent_poll_ticks)
+{
+	/* A healthy callback may exceed one 100ms service tick, still far
+	 * inside its unchanged two-second operation budget. */
+	run_two_targets(150000000);
 }
 
 /* A real provider child opens the actual parent journal before its action. */
@@ -468,8 +493,9 @@ UT_TEST(test_v2_late_completion_cannot_replace_parent_durable_proof)
 int
 main(void)
 {
-	UT_PLAN(3);
+	UT_PLAN(4);
 	UT_RUN(test_two_targets_execute_concurrently_with_parent_serial_journal);
+	UT_RUN(test_two_targets_can_wait_between_parent_poll_ticks);
 	UT_RUN(test_v2_parent_binds_worker_and_rejects_replaced_attempt_before_append);
 	UT_RUN(test_v2_late_completion_cannot_replace_parent_durable_proof);
 	UT_DONE();

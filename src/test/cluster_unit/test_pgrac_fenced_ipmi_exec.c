@@ -10,6 +10,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -24,10 +26,115 @@
 UT_DEFINE_GLOBALS();
 
 int fexecve(int fd, char *const argv[], char *const envp[]);
+int fixture_ipmi_setpgid(pid_t pid, pid_t pgid);
+pid_t fixture_ipmi_getpgid(pid_t pid);
+pid_t fixture_ipmi_getsid(pid_t pid);
 
 static const char password_path[]
 	= "/etc/pgrac/credentials/ipmi-00112233445566778899aabbccddeeff.password";
 static int descendant_pid_fd = -1;
+
+typedef enum GroupFault {
+	GROUP_NONE,
+	GROUP_PARENT_EXACT,
+	GROUP_CHILD_EXACT,
+	GROUP_PARENT_EXITED,
+	GROUP_PARENT_UNOBSERVABLE,
+	GROUP_PARENT_MISMATCH,
+	GROUP_CHILD_MISMATCH,
+	SESSION_PARENT_MISMATCH,
+	SESSION_CHILD_MISMATCH,
+	GROUP_PARENT_IO_ERROR,
+	GROUP_CHILD_IO_ERROR
+} GroupFault;
+
+static GroupFault group_fault;
+static pid_t fixture_parent;
+static volatile uint32 *command_release;
+static uint64 command_deadline;
+
+static bool
+group_fault_in_child(void)
+{
+	return group_fault == GROUP_CHILD_EXACT || group_fault == GROUP_CHILD_MISMATCH
+		   || group_fault == SESSION_CHILD_MISMATCH || group_fault == GROUP_CHILD_IO_ERROR;
+}
+
+static bool
+group_fault_here(void)
+{
+	return group_fault != GROUP_NONE && (getpid() != fixture_parent) == group_fault_in_child();
+}
+
+int
+fixture_ipmi_setpgid(pid_t pid, pid_t pgid)
+{
+	int rc = setpgid(pid, pgid);
+	int saved_errno = errno;
+
+	if (pid > 0 && group_fault == GROUP_PARENT_EXITED) {
+		struct timespec now;
+		struct timespec pause = { 0, 1000000 };
+		siginfo_t info;
+
+		*command_release = 1;
+		for (;;) {
+			memset(&info, 0, sizeof(info));
+			if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOWAIT | WNOHANG) != 0
+				|| info.si_pid == pid)
+				break;
+			if (clock_gettime(CLOCK_MONOTONIC, &now) != 0
+				|| (uint64)now.tv_sec * UINT64_C(1000000000) + (uint64)now.tv_nsec
+					   >= command_deadline)
+				break;
+			(void)nanosleep(&pause, NULL);
+		}
+		errno = EPERM;
+		return -1;
+	}
+
+	if (pid > 0 && group_fault_in_child())
+		*command_release = 1;
+	if (group_fault_here()
+		&& (rc == 0 || (saved_errno == EPERM && getpgid(pid) == (pid == 0 ? getpid() : pid)))) {
+		/* Keep the real group; inject only the redundant syscall's result. */
+		errno = group_fault == GROUP_PARENT_IO_ERROR || group_fault == GROUP_CHILD_IO_ERROR ? EIO
+																							: EPERM;
+		return -1;
+	}
+	errno = saved_errno;
+	return rc;
+}
+
+pid_t
+fixture_ipmi_getpgid(pid_t pid)
+{
+	pid_t group = getpgid(pid);
+
+	if (group_fault_here() && group_fault == GROUP_PARENT_UNOBSERVABLE) {
+		errno = ESRCH;
+		return -1;
+	}
+
+	if (group_fault_here()
+		&& (group_fault == GROUP_PARENT_MISMATCH || group_fault == GROUP_CHILD_MISMATCH))
+		return group < 0 ? group : group + 1;
+	return group;
+}
+
+pid_t
+fixture_ipmi_getsid(pid_t pid)
+{
+	pid_t session = getsid(pid);
+
+	/* The pre-fork session sample (pid 0) is always genuine. */
+	if (pid > 0 && group_fault_here()) {
+		*command_release = 1;
+		if (group_fault == SESSION_PARENT_MISMATCH || group_fault == SESSION_CHILD_MISMATCH)
+			return session < 0 ? session : session + 1;
+	}
+	return session;
+}
 
 typedef struct ProcessTreePids {
 	pid_t worker;
@@ -52,6 +159,16 @@ fexecve(int fd, char *const argv[], char *const envp[])
 {
 	static const char guid[] = " 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f\n";
 	static const char status[] = "Chassis Power is off\n";
+
+	while (command_release != NULL && *command_release == 0) {
+		struct timespec now;
+		struct timespec pause = { 0, 1000000 };
+
+		if (clock_gettime(CLOCK_MONOTONIC, &now) != 0
+			|| (uint64)now.tv_sec * UINT64_C(1000000000) + (uint64)now.tv_nsec >= command_deadline)
+			_exit(93);
+		(void)nanosleep(&pause, NULL);
+	}
 
 	if (fd < 0 || argv == NULL || !exec_environment_exact(envp) || strcmp(argv[0], "ipmitool") != 0
 		|| argv[16] != NULL)
@@ -226,7 +343,8 @@ run_command(const char *username, PgracFencedIpmiCommand command, uint64 timeout
 	UT_ASSERT(fd >= 0);
 	if (fd < 0)
 		return false;
-	ok = pgrac_fenced_ipmi_command_run_fd(fd, &invocation, deadline_after_ms(timeout_ms), output);
+	command_deadline = deadline_after_ms(timeout_ms);
+	ok = pgrac_fenced_ipmi_command_run_fd(fd, &invocation, command_deadline, output);
 	(void)close(fd);
 	return ok;
 }
@@ -312,6 +430,80 @@ UT_TEST(test_runner_preserves_nonzero_and_stderr_for_strict_parser)
 	UT_ASSERT(!pgrac_fenced_ipmi_action_result_validate(output.exit_code, output.stdout_bytes,
 														output.stdout_len, output.stderr_bytes,
 														output.stderr_len));
+}
+
+static void
+check_command_group(GroupFault injected, bool accepted)
+{
+	PgracFencedIpmiCommandOutputV1 output;
+	bool ok;
+
+	command_release = mmap(NULL, sizeof(*command_release), PROT_READ | PROT_WRITE,
+						   MAP_SHARED | MAP_ANON, -1, 0);
+	UT_ASSERT(command_release != MAP_FAILED);
+	if (command_release == MAP_FAILED) {
+		command_release = NULL;
+		return;
+	}
+	*command_release = 0;
+	fixture_parent = getpid();
+	group_fault = injected;
+	ok = run_command("fail", PGRAC_FENCED_IPMI_COMMAND_OFF, 1000, &output);
+	if (accepted) {
+		UT_ASSERT(ok);
+		UT_ASSERT_EQ(output.exit_code, 7);
+	} else if (group_fault_in_child()) {
+		UT_ASSERT(ok);
+		UT_ASSERT_EQ(output.exit_code, 125);
+	} else {
+		UT_ASSERT(!ok);
+		UT_ASSERT_EQ(output.exit_code, -1);
+	}
+	/* A nonzero command result must never be promoted to a successful action. */
+	UT_ASSERT(!pgrac_fenced_ipmi_action_result_validate(output.exit_code, output.stdout_bytes,
+														output.stdout_len, output.stderr_bytes,
+														output.stderr_len));
+	group_fault = GROUP_NONE;
+	UT_ASSERT_EQ(munmap((void *)command_release, sizeof(*command_release)), 0);
+	command_release = NULL;
+}
+
+UT_TEST(test_command_parent_exact_group_survives_redundant_eperm)
+{
+	check_command_group(GROUP_PARENT_EXACT, true);
+}
+
+UT_TEST(test_command_child_exact_group_survives_redundant_eperm)
+{
+	check_command_group(GROUP_CHILD_EXACT, true);
+}
+
+UT_TEST(test_command_completed_before_parent_group_call_preserves_output)
+{
+	check_command_group(GROUP_PARENT_EXITED, true);
+}
+
+UT_TEST(test_command_unobservable_live_group_stays_rejected)
+{
+	check_command_group(GROUP_PARENT_UNOBSERVABLE, false);
+}
+
+UT_TEST(test_command_group_mismatch_stays_rejected)
+{
+	check_command_group(GROUP_PARENT_MISMATCH, false);
+	check_command_group(GROUP_CHILD_MISMATCH, false);
+}
+
+UT_TEST(test_command_session_mismatch_stays_rejected)
+{
+	check_command_group(SESSION_PARENT_MISMATCH, false);
+	check_command_group(SESSION_CHILD_MISMATCH, false);
+}
+
+UT_TEST(test_command_other_group_errors_stay_rejected)
+{
+	check_command_group(GROUP_PARENT_IO_ERROR, false);
+	check_command_group(GROUP_CHILD_IO_ERROR, false);
 }
 
 UT_TEST(test_runner_rejects_overflow_and_deadline)
@@ -505,9 +697,16 @@ UT_TEST(test_prevalidated_execution_rehashes_each_command)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(15);
 	UT_RUN(test_runner_uses_fexecve_and_sanitized_environment);
 	UT_RUN(test_runner_preserves_nonzero_and_stderr_for_strict_parser);
+	UT_RUN(test_command_parent_exact_group_survives_redundant_eperm);
+	UT_RUN(test_command_child_exact_group_survives_redundant_eperm);
+	UT_RUN(test_command_completed_before_parent_group_call_preserves_output);
+	UT_RUN(test_command_unobservable_live_group_stays_rejected);
+	UT_RUN(test_command_group_mismatch_stays_rejected);
+	UT_RUN(test_command_session_mismatch_stays_rejected);
+	UT_RUN(test_command_other_group_errors_stay_rejected);
 	UT_RUN(test_runner_rejects_overflow_and_deadline);
 	UT_RUN(test_runner_deadline_drains_descendant_process_group);
 	UT_RUN(test_provider_deadline_owns_nested_command_descendants);

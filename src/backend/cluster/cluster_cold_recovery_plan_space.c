@@ -191,7 +191,7 @@ space_structural(ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag)
  * handed to the SPACE owner nor a step.
  */
 static void
-space_covered(ClusterColdPlanV1 *plan)
+space_covered(const ClusterColdPlanV1 *plan)
 {
 	uint32 i;
 
@@ -288,7 +288,7 @@ space_segments(ClusterColdPlanV1 *plan)
  * it in history, proves the fork's file was synced after the shrink.
  */
 static void
-space_shrink_pending(ClusterColdPlanV1 *plan)
+space_shrink_pending(const ClusterColdPlanV1 *plan)
 {
 	uint32 i;
 
@@ -369,7 +369,8 @@ space_relation_check(ClusterColdPlanV1 *plan, uint32 *slice, uint32 count, uint3
  * steps so they are scheduled in that order.
  */
 static void
-space_relation_number(ClusterColdPlanV1 *plan, uint32 relation, const uint32 *slice, uint32 count)
+space_relation_number(const ClusterColdPlanV1 *plan, uint32 relation, const uint32 *slice,
+					  uint32 count)
 {
 	uint32 previous_step = CLUSTER_COLD_NO_INDEX;
 	uint32 i;
@@ -449,10 +450,10 @@ cold_plan_space_seal(ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag)
 		space_covered(plan);
 		detail = space_segments(plan);
 	}
-	if (detail == CLUSTER_COLD_OK)
+	if (detail == CLUSTER_COLD_OK) {
 		space_shrink_pending(plan);
-	if (detail == CLUSTER_COLD_OK)
 		detail = space_inputs(plan, diag);
+	}
 	return detail;
 }
 
@@ -465,6 +466,8 @@ cold_plan_space_release(ClusterColdPlanV1 *plan)
 
 	for (i = 0; i < lengthof(arrays); i++)
 		if (*arrays[i] != NULL) {
+			/* Function call through cold_free/pfree, not a shadow declaration. */
+			// cppcheck-suppress shadowVariable
 			cold_free(*arrays[i]);
 			*arrays[i] = NULL;
 		}
@@ -610,7 +613,7 @@ cold_plan_space_created_here(const ClusterColdPlanV1 *plan, const ColdComponent 
  * that block: changes to it in the earlier incarnations are irrelevant.
  */
 void
-cold_plan_space_retire_inferred(ClusterColdPlanV1 *plan, const uint32 *group, uint32 count)
+cold_plan_space_retire_inferred(const ClusterColdPlanV1 *plan, const uint32 *group, uint32 count)
 {
 	const ColdRelation *relation;
 	uint32 i;

@@ -541,7 +541,7 @@ replace_token(char **lines, const char *token, const char *replacement)
 
 	for (int i = 0; lines[i]; i++)
 	{
-		char	   *where;
+		const char *where;
 		char	   *newline;
 		int			pre;
 
@@ -883,7 +883,7 @@ cleanup_directories_atexit(void)
 static char *
 get_id(void)
 {
-	const char *username;
+	const char *current_username;
 
 #ifndef WIN32
 	if (geteuid() == 0)			/* 0 is root's uid */
@@ -894,9 +894,9 @@ get_id(void)
 	}
 #endif
 
-	username = get_user_name_or_exit(progname);
+	current_username = get_user_name_or_exit(progname);
 
-	return pg_strdup(username);
+	return pg_strdup(current_username);
 }
 
 static char *
@@ -914,10 +914,9 @@ encodingid_to_string(int enc)
 static int
 get_encoding_id(const char *encoding_name)
 {
-	int			enc;
-
 	if (encoding_name && *encoding_name)
 	{
+		int enc;
 		if ((enc = pg_valid_server_encoding(encoding_name)) >= 0)
 			return enc;
 	}
@@ -1005,8 +1004,7 @@ static const char *
 find_matching_ts_config(const char *lc_type)
 {
 	int			i;
-	char	   *langname,
-			   *ptr;
+	char	   *langname;
 
 	/*
 	 * Convert lc_ctype to a language name by stripping everything after an
@@ -1023,7 +1021,7 @@ find_matching_ts_config(const char *lc_type)
 		langname = pg_strdup("");
 	else
 	{
-		ptr = langname = pg_strdup(lc_type);
+		char *ptr = langname = pg_strdup(lc_type);
 		while (*ptr &&
 			   *ptr != '_' && *ptr != '-' && *ptr != '.' && *ptr != '@')
 			ptr++;
@@ -1113,14 +1111,14 @@ write_version_file(const char *extrapath)
 static void
 set_null_conf(void)
 {
-	FILE	   *conf_file;
+	FILE	   *empty_conf_file;
 	char	   *path;
 
 	path = psprintf("%s/postgresql.conf", pg_data);
-	conf_file = fopen(path, PG_BINARY_W);
-	if (conf_file == NULL)
+	empty_conf_file = fopen(path, PG_BINARY_W);
+	if (empty_conf_file == NULL)
 		pg_fatal("could not open file \"%s\" for writing: %m", path);
-	if (fclose(conf_file))
+	if (fclose(empty_conf_file))
 		pg_fatal("could not write file \"%s\": %m", path);
 	free(path);
 }
@@ -1202,7 +1200,6 @@ test_config_settings(void)
 	const int	connslen = sizeof(trial_conns) / sizeof(int);
 	const int	bufslen = sizeof(trial_bufs) / sizeof(int);
 	int			i,
-				test_conns,
 				test_buffs,
 				ok_buffers = 0;
 
@@ -1224,7 +1221,7 @@ test_config_settings(void)
 
 	for (i = 0; i < connslen; i++)
 	{
-		test_conns = trial_conns[i];
+		int test_conns = trial_conns[i];
 		test_buffs = MIN_BUFS_FOR_CONNS(test_conns);
 
 		if (test_specific_config_settings(test_conns, test_buffs))
@@ -1545,6 +1542,8 @@ setup_config(void)
 		hints.ai_addr = NULL;
 		hints.ai_next = NULL;
 
+		/* WSAStartup can set err on Windows; the POSIX path keeps zero. */
+		// cppcheck-suppress knownConditionTrueFalse
 		if (err != 0 ||
 			getaddrinfo("::1", NULL, &hints, &gai_result) != 0)
 		{
@@ -2202,9 +2201,9 @@ locale_date_order(const char *locale)
 {
 	struct tm	testtime;
 	char		buf[128];
-	char	   *posD;
-	char	   *posM;
-	char	   *posY;
+	const char *posD;
+	const char *posM;
+	const char *posY;
 	save_locale_t save;
 	size_t		res;
 	int			result;
@@ -2260,7 +2259,7 @@ static void
 check_locale_name(int category, const char *locale, char **canonname)
 {
 	save_locale_t save;
-	char	   *res;
+	const char *res;
 
 	/* Don't let Windows' non-ASCII locale names in. */
 	if (locale && !pg_is_ascii(locale))
@@ -2676,7 +2675,7 @@ check_need_password(const char *authmethodlocal, const char *authmethodhost)
 void
 setup_pgdata(void)
 {
-	char	   *pgdata_get_env;
+	const char *pgdata_get_env;
 
 	if (!pg_data)
 	{
@@ -3610,7 +3609,7 @@ pgrac_native_validate_options(void)
 			pg_fatal("INITDB_BASE_OPTIONS: founder thread 1, new target and complete namespace required");
 		for (int i = 0; i < 16; ++i)
 		{
-			char pair[3] = {pgrac_native_storage_uuid[2 * i], pgrac_native_storage_uuid[2 * i + 1], 0};
+			const char pair[3] = {pgrac_native_storage_uuid[2 * i], pgrac_native_storage_uuid[2 * i + 1], 0};
 			pgrac_native_storage_bytes[i] = (uint8) strtoul(pair, NULL, 16);
 			any |= pgrac_native_storage_bytes[i];
 		}

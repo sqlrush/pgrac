@@ -683,14 +683,17 @@ heap_delta_array_extent(const char *data, Size available, Size *extent)
 static ClusterBlkApplyResult
 apply_heap_update(XLogReaderState *record, uint8 block_id, char *page, bool hot_update)
 {
-	PGAlignedBlock scratch, tuple_space;
+	PGAlignedBlock scratch;
+	/* The tuple alias initializes exactly tuple_length bytes before PageAddItem. */
+	// cppcheck-suppress unassignedVariable
+	PGAlignedBlock tuple_space;
 	xl_heap_update rec;
 	const char *main_data = XLogRecGetData(record);
 	Size main_length = XLogRecGetDataLen(record), used = SizeOfHeapUpdate;
 	const DecodedBkpBlock *new_block, *old_block;
 	bool cross = XLogRecHasBlockRef(record, 1);
 	bool init = (XLogRecGetInfo(record) & XLOG_HEAP_INIT_PAGE) != 0;
-	const char *new_delta = NULL, *old_delta = NULL, *delta;
+	const char *new_delta = NULL, *old_delta = NULL;
 	Size new_extent = 0, old_extent = 0, consumed;
 	HeapTupleHeader old_tuple = NULL;
 	Size old_length = 0;
@@ -732,7 +735,7 @@ apply_heap_update(XLogReaderState *record, uint8 block_id, char *page, bool hot_
 				return CLUSTER_BLKAPPLY_FAILED;
 			used += old_extent;
 		}
-		delta = block_id == 1 ? old_delta : new_delta;
+		const char *delta = block_id == 1 ? old_delta : new_delta;
 		if (!heap_delta_array_valid(scratch.data, delta, block_id == 1 ? old_extent : new_extent,
 									ITL_FLAG_ACTIVE, true, &consumed))
 			return CLUSTER_BLKAPPLY_FAILED;

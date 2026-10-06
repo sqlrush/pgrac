@@ -474,8 +474,9 @@ cluster_shared_fs_sharedfs_immedsync(ClusterSharedFsHandle *handle)
 	Assert(handle != NULL && handle->opened);
 
 	if (FileSync(handle->vfd, WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
-		ereport(data_sync_elevel(ERROR), (errcode_for_file_access(),
-						errmsg("cluster_shared_fs.shared_fs: could not fsync: %m")));
+		ereport(data_sync_elevel(ERROR),
+				(errcode_for_file_access(),
+				 errmsg("cluster_shared_fs.shared_fs: could not fsync: %m")));
 }
 
 
@@ -509,7 +510,7 @@ sharedfs_drop_same_file(const struct stat *left, const struct stat *right)
 
 static bool
 sharedfs_drop_space_matches(int fd, const ClusterSpaceIdentity *expected,
-						   const uint8 *expected_bytes, uint64 expected_token)
+							const uint8 *expected_bytes, uint64 expected_token)
 {
 	PGIOAlignedBlock page;
 	ClusterSpaceIdentity actual;
@@ -522,7 +523,7 @@ sharedfs_drop_space_matches(int fd, const ClusterSpaceIdentity *expected,
 	} while (nread < 0 && errno == EINTR);
 	return nread == BLCKSZ
 		   && cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
-											 &expected->key, &actual, &token)
+												 &expected->key, &actual, &token)
 		   && token == expected_token
 		   && cluster_space_identity_encode(&actual, bytes, sizeof(bytes))
 		   && memcmp(bytes, expected_bytes, sizeof(bytes)) == 0;
@@ -542,8 +543,7 @@ sharedfs_drop_namespace_matches(int directory, const char *path, const struct st
 		const SharedFsDropFork *f = &forks[fork];
 
 		if (f->fd < 0 || f->removed) {
-			if (fstatat(directory, f->name, &current, AT_SYMLINK_NOFOLLOW) == 0
-				|| errno != ENOENT)
+			if (fstatat(directory, f->name, &current, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
 				return false;
 			if (f->fd >= 0 && (fstat(f->fd, &current) != 0 || current.st_nlink != 0))
 				return false;
@@ -564,8 +564,7 @@ sharedfs_drop_namespace_matches(int directory, const char *path, const struct st
  * This metadata operation does not change the data-fork O_DIRECT contract.
  * Author: SqlRush <sqlrush@gmail.com> */
 bool
-cluster_shared_fs_sharedfs_drop_durable(const ClusterSpaceIdentity *identity,
-									  uint64 mutation_token)
+cluster_shared_fs_sharedfs_drop_durable(const ClusterSpaceIdentity *identity, uint64 mutation_token)
 {
 	SharedFsDropFork forks[MAX_FORKNUM + 1];
 	char *paths[MAX_FORKNUM + 1];
@@ -616,7 +615,7 @@ cluster_shared_fs_sharedfs_drop_durable(const ClusterSpaceIdentity *identity,
 	}
 	if (!sharedfs_drop_namespace_matches(directory, parent, &parent_identity, forks, false)
 		|| !sharedfs_drop_space_matches(forks[SPACE_FORKNUM].fd, identity, expected_bytes,
-									   mutation_token))
+										mutation_token))
 		goto done;
 	if (ftruncate(forks[MAIN_FORKNUM].fd, 0) != 0 || pg_fsync(forks[MAIN_FORKNUM].fd) != 0)
 		goto done;
@@ -626,7 +625,7 @@ cluster_shared_fs_sharedfs_drop_durable(const ClusterSpaceIdentity *identity,
 
 		if (!sharedfs_drop_namespace_matches(directory, parent, &parent_identity, forks, true)
 			|| !sharedfs_drop_space_matches(forks[SPACE_FORKNUM].fd, identity, expected_bytes,
-										   mutation_token))
+											mutation_token))
 			goto done;
 		if (f->fd < 0)
 			continue; /* absent before mutation, never an unlink success */
@@ -637,7 +636,7 @@ cluster_shared_fs_sharedfs_drop_durable(const ClusterSpaceIdentity *identity,
 	if (pg_fsync(directory) != 0
 		|| !sharedfs_drop_namespace_matches(directory, parent, &parent_identity, forks, true)
 		|| !sharedfs_drop_space_matches(forks[SPACE_FORKNUM].fd, identity, expected_bytes,
-									   mutation_token))
+										mutation_token))
 		goto done;
 	durable = true;
 
@@ -797,8 +796,7 @@ sharedfs_drop_work_namespace(const ClusterKoDropWorkV2 *work, SharedFsDropWorkSt
 			 * not a successful deletion. MAIN must always remain present. */
 			if (fork == MAIN_FORKNUM)
 				return sharedfs_drop_work_invalid(state);
-			if (!cluster_ko_shared_drop_work_revalidate_v2(work)
-				|| fstat(f->fd, &current) != 0)
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work) || fstat(f->fd, &current) != 0)
 				return false;
 			if (!sharedfs_drop_same_file(&f->identity, &current) || current.st_nlink != 0)
 				return sharedfs_drop_work_invalid(state);
@@ -1204,7 +1202,8 @@ cluster_shared_fs_sentinel_attach(void)
 	bool found = false;
 	uint32 i;
 	char preset[CLUSTER_SHARED_UUID_LEN];
-	bool have_preset = cluster_shared_storage_uuid != NULL && cluster_shared_storage_uuid[0] != '\0';
+	bool have_preset
+		= cluster_shared_storage_uuid != NULL && cluster_shared_storage_uuid[0] != '\0';
 
 	if (have_preset && !sharedfs_preset_uuid(cluster_shared_storage_uuid, preset))
 		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),

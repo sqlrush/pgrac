@@ -35,6 +35,11 @@ endif
 CLUSTER_UNIT_PORT_LIBS = $(top_builddir)/src/port/libpgport_srv.a cluster_unit_port_stubs.o
 CLUSTER_UNIT_CLANG ?= $(if $(strip $(CLANG)),$(CLANG),clang)
 
+# Analyze the same extracted product bodies that the standalone tests compile.
+# Derive the list from their recipes, so adding a test cannot silently leave its
+# include empty in CI. This target generates inputs only, never test results.
+CLUSTER_ANALYSIS_INPUTS = $(shell sed -n 's/^\([A-Za-z0-9_]*\.inc\):.*/\1/p' $(srcdir)/Makefile)
+
 # Standalone fixtures have no ResourceOwner. Use PostgreSQL's actual frontend
 # hash provider with the same configured algorithm, not a fake digest or the
 # full frontend archive (which would override the fixture's memory allocator).
@@ -117,7 +122,7 @@ TESTS = test_cluster_pi_contribution_stream test_cluster_drop_work test_cluster_
 		test_pgrac_fenced_rejoin_async \
 		test_pgrac_fenced_rejoin_coordinator \
 		test_pgrac_fenced_session \
-		test_pgrac_fenced_schedule test_pgrac_fenced_async \
+		test_pgrac_fenced_schedule test_pgrac_fenced_async test_pgrac_fenced_process_group \
 		test_pgrac_fenced_coordinator \
 		test_pgrac_fenced_ipmi test_pgrac_fenced_ipmi_exec \
 		test_pgrac_fenced_ctl \
@@ -415,7 +420,7 @@ SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_rejoin_async \
 		test_pgrac_fenced_rejoin_coordinator \
 		test_pgrac_fenced_session \
-		test_pgrac_fenced_schedule test_pgrac_fenced_async \
+		test_pgrac_fenced_schedule test_pgrac_fenced_async test_pgrac_fenced_process_group \
 		test_pgrac_fenced_coordinator \
 		test_pgrac_fenced_ipmi test_pgrac_fenced_ipmi_exec \
 		test_pgrac_fenced_ctl,$(SIMPLE_TESTS))
@@ -2025,7 +2030,7 @@ test_cluster_vm_redo_consumers.inc: $(top_srcdir)/src/backend/access/heap/heapam
 	       name=$$0; sub(/\(.*/, "", name); sub(/^heap_xlog_/, "", name); inside=1 } \
 	     inside && /^\tif .*xlrec->flags & XLH_.*ALL_(VISIBLE|FROZEN)_CLEARED/ { \
 	       count++; emit=1; print "static void vm_consumer_" count "(XLogReaderState *record) {"; \
-	       print "xl_heap_" name " *xlrec = (xl_heap_" name " *) XLogRecGetData(record);"; \
+	       print "const xl_heap_" name " *xlrec = (const xl_heap_" name " *) XLogRecGetData(record);"; \
 	       if (name !~ /^lock/) { \
 	         print "RelFileLocator target_locator, rlocator; BlockNumber blkno, oldblk, newblk;"; \
 	         print "XLogRecGetBlockTag(record, 0, &target_locator, NULL, &blkno); rlocator=target_locator; newblk=blkno;"; \
@@ -3288,6 +3293,15 @@ test_pgrac_fenced_provider: test_pgrac_fenced_provider.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
 
+test_pgrac_fenced_process_group: test_pgrac_fenced_process_group.c unit_test.h \
+        $(top_srcdir)/src/bin/pgrac_fenced/pgrac_fenced_provider.c \
+        $(PGRAC_FENCED_IPMI_O) $(PGRAC_FENCED_JOURNAL_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_IPMI_O) $(PGRAC_FENCED_JOURNAL_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
+
 PGRAC_FENCED_OPERATION_O = \
 	$(PGRAC_FENCED_CONFIG_O) \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_operation.o \
@@ -3400,8 +3414,10 @@ test_pgrac_fenced_ipmi: test_pgrac_fenced_ipmi.c unit_test.h \
 PGRAC_FENCED_IPMI_FEXECVE_O = pgrac_fenced_ipmi_fexecve.o
 $(PGRAC_FENCED_IPMI_FEXECVE_O): \
 		$(top_srcdir)/src/bin/pgrac_fenced/pgrac_fenced_ipmi.c \
-		$(top_srcdir)/src/bin/pgrac_fenced/pgrac_fenced_ipmi.h
+		$(top_srcdir)/src/bin/pgrac_fenced/pgrac_fenced_ipmi.h Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DHAVE_FEXECVE \
+		-Dsetpgid=fixture_ipmi_setpgid -Dgetpgid=fixture_ipmi_getpgid \
+		-Dgetsid=fixture_ipmi_getsid \
 		-I$(top_srcdir)/src/bin/pgrac_fenced -c $< -o $@
 
 test_pgrac_fenced_ipmi_exec: test_pgrac_fenced_ipmi_exec.c unit_test.h \
@@ -8589,3 +8605,7 @@ test_cluster_initdb_catalog: test_cluster_initdb_catalog.c unit_test.h \
 # Exact private bootstrap observation layout shared by backend and fixture.
 $(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o: \
 	$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_private.h
+
+.PHONY: generated-analysis-inputs
+generated-analysis-inputs: $(CLUSTER_ANALYSIS_INPUTS)
+	@for input in $(CLUSTER_ANALYSIS_INPUTS); do test -s "$$input" || exit 1; done

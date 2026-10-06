@@ -325,12 +325,12 @@ ok(defined $postgres_bin && -x $postgres_bin,
 
 
 # ============================================================
-# §M  error injection 187 注入点 + 7 fault types (6 tests)
+# §M  error injection 188 注入点 + 7 fault types (6 tests)
 # ============================================================
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-	'187', 'M1 187 injection points including the CTRC stage barrier');
+	'188', 'M1 188 injection points including the first UNDO publication denial');
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(name, ',' ORDER BY name) FROM pg_stat_cluster_injections WHERE name LIKE 'cluster-init-%'}),
@@ -360,8 +360,8 @@ ok( $node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT key) FROM pg_cluster_state
 		   WHERE category='inject' AND (key LIKE '%.fault_type' OR key LIKE '%.hits')}
-	) eq '374',
-	'M5 inject category has 187×2 = 374 sub-keys (.fault_type + .hits)');
+	) eq '376',
+	'M5 inject category has 188×2 = 376 sub-keys (.fault_type + .hits)');
 
 is($node->get_cluster_state_value('inject', 'armed_count'),
 	'0', 'M6 inject.armed_count starts at 0 in fresh backend');
@@ -396,7 +396,7 @@ ok($node->safe_psql('postgres',
 my @state_categories = (qw(
 	advisory block_format buffer_format catalog cf cluster_cssd cluster_stats
 	conf cr cr_coord cr_pool ctrc diag dl gcs gcs_recovery ges grd grd_recovery
-	guc hang hw ic inject ir ko lck lmd lmon lms multixact_current normal_start
+	guc hang hw ic inject ir ko lck lifecycle lmd lmon lms multixact_current normal_start
 	pcm pgstat phase r4 reconfig reconfig_join reconfig_touched recovery
 	resolver_cache scn sequence shared_fs shmem sinval smart_fusion ts tt_2pc
 	tt_recovery tt_status tt_status_hint undo undo_cleaner update_trace update_trace_event
@@ -407,7 +407,7 @@ is($node->safe_psql('postgres',
 		q{SELECT string_agg(DISTINCT category COLLATE "C", ','
 		                   ORDER BY category COLLATE "C") FROM pg_cluster_state}),
 	join(',', sort @state_categories),
-	'O2 pg_cluster_state has all 70 categories, including normal start, cleaner workers and tracing');
+	'O2 pg_cluster_state has all 71 categories, including lifecycle, normal start, cleaner workers and tracing');
 
 is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE value IS NULL}),

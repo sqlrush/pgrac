@@ -370,14 +370,30 @@ output_snapshot_retains_exact_failed_output_binding(void)
 		original = current_binding();
 		pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_ERROR);
 		switch (variant) {
-		case 1: pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_IN_PROGRESS); break;
-		case 2: pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_DIRTY); break;
-		case 3: pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_VALID); break;
-		case 4: locked = false; break;
-		case 5: ((PageHeader)page.data)->pd_block_scn++; break;
-		case 6: PageSetLSNPreserveOrigin(page.data, 0x201); break;
-		case 7: UT_ASSERT(cluster_page_wal_forget_v1(1)); break;
-		case 8: pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_TAG_VALID); break;
+		case 1:
+			pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_IN_PROGRESS);
+			break;
+		case 2:
+			pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_DIRTY);
+			break;
+		case 3:
+			pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_VALID);
+			break;
+		case 4:
+			locked = false;
+			break;
+		case 5:
+			((PageHeader)page.data)->pd_block_scn++;
+			break;
+		case 6:
+			PageSetLSNPreserveOrigin(page.data, 0x201);
+			break;
+		case 7:
+			UT_ASSERT(cluster_page_wal_forget_v1(1));
+			break;
+		case 8:
+			pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_TAG_VALID);
+			break;
 		}
 		before = pg_atomic_read_u32(&desc.bufferdesc.state);
 		UT_ASSERT(!cluster_page_wal_snapshot_v1(1, &observed));
@@ -430,7 +446,7 @@ failed_output_distinguishes_empty_latest_from_invalid_binding(void)
 		pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_ERROR);
 		before = pg_atomic_read_u32(&desc.bufferdesc.state);
 		UT_ASSERT_EQ(cluster_page_wal_output_binding_absent_v1(1),
-			variant == 0 || variant == 3 || variant == 7);
+					 variant == 0 || variant == 3 || variant == 7);
 		if (variant == 2)
 			UT_ASSERT(!cluster_page_wal_output_snapshot_v1(1, &observed));
 		UT_ASSERT(!cluster_page_wal_output_binding_absent_v1(0));
@@ -807,22 +823,41 @@ installed_carrier_matches_explicit_absence_not_snapshot_failure(void)
 				expected = zero;
 			}
 			switch (variant) {
-			case 1: locked = false; break;
-			case 2: exclusive = false; break;
-			case 3: pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_ERROR); break;
-			case 4: pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_IN_PROGRESS); break;
-			case 5: pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_VALID); break;
-			case 6: pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_TAG_VALID); break;
-			case 7: expected.source.claim.claim_sha256[0]++; break;
-			case 8: expected.flags ^= CLUSTER_PAGE_WAL_NATIVE_FLUSHED; break;
+			case 1:
+				locked = false;
+				break;
+			case 2:
+				exclusive = false;
+				break;
+			case 3:
+				pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_ERROR);
+				break;
+			case 4:
+				pg_atomic_fetch_or_u32(&desc.bufferdesc.state, BM_IO_IN_PROGRESS);
+				break;
+			case 5:
+				pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_VALID);
+				break;
+			case 6:
+				pg_atomic_fetch_and_u32(&desc.bufferdesc.state, ~BM_TAG_VALID);
+				break;
+			case 7:
+				expected.source.claim.claim_sha256[0]++;
+				break;
+			case 8:
+				expected.flags ^= CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+				break;
 			case 9:
-				if (absent) UT_ASSERT(capture());
-				else UT_ASSERT(cluster_page_wal_forget_v1(1));
+				if (absent)
+					UT_ASSERT(capture());
+				else
+					UT_ASSERT(cluster_page_wal_forget_v1(1));
 				break;
 			}
 			before = malloc(shared_bytes);
 			UT_ASSERT(before != NULL);
-			if (before == NULL) return;
+			if (before == NULL)
+				return;
 			memcpy(before, shared_memory, shared_bytes);
 			state = pg_atomic_read_u32(&desc.bufferdesc.state);
 			UT_ASSERT_EQ(cluster_page_wal_install_matches_v1(1, &expected), variant == 0);
@@ -1565,9 +1600,9 @@ UT_TEST(space_native_record_and_both_component_sources)
 			ClusterPageWalBindingV1 value;
 			ClusterPageWalRefV1 retained = { 0 };
 			space_insert(block, action ? RM_XACT_ID : RM_SMGR_ID,
-				action ? XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO
-					   : XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE,
-				action != 0);
+						 action ? XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO
+								: XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE,
+						 action != 0);
 			UT_ASSERT_EQ(assemble_calls, 2);
 			UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &space.key, 0x200),
 						 CLUSTER_PAGE_WAL_CAPTURED);
@@ -1583,8 +1618,8 @@ UT_TEST(space_native_record_and_both_component_sources)
 			UT_ASSERT(memcmp(value.version.segment_incarnation, space.incarnation, 16) == 0);
 			UT_ASSERT(cluster_page_wal_ref_retain_v1(&value, &retained));
 			UT_ASSERT(cluster_page_wal_forget_v1(1));
-			UT_ASSERT(cluster_page_wal_ref_read_v1(&retained, space.key.locator,
-				SPACE_FORKNUM, block, &value));
+			UT_ASSERT(cluster_page_wal_ref_read_v1(&retained, space.key.locator, SPACE_FORKNUM,
+												   block, &value));
 			UT_ASSERT(cluster_page_wal_ref_release_v1(&retained));
 		}
 	}
@@ -1595,11 +1630,11 @@ UT_TEST(space_advance_is_only_block_one_of_live_identity)
 	for (unsigned block = 0; block < 2; block++) {
 		space_insert(block, RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION, false);
 		UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &space.key, 0x200),
-			block ? CLUSTER_PAGE_WAL_CAPTURED : CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
+					 block ? CLUSTER_PAGE_WAL_CAPTURED : CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
 	}
 	space_insert(1, RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION, true);
 	UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &space.key, 0x200),
-		CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
+				 CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
 }
 
 UT_TEST(native_last_record_expires_on_construction_reset_and_other_insert)
@@ -1704,26 +1739,46 @@ UT_TEST(space_capture_rejects_wrong_record_key_page_and_owner)
 		space_insert(0, RM_SMGR_ID, XLOG_SMGR_SPACE_IDENTITY, false);
 		key = space.key;
 		switch (fault) {
-			case 0: record.xl_rmid = RM_XLOG_ID; break;
-			case 1: desc.bufferdesc.tag.blockNum = 2; break;
-			case 2: key.locator.spcOid++; break;
-			case 3: writer.claim.database_incarnation++; break;
-			case 4: writer.claim.identity.storage_uuid[1]++; break;
-			case 5: permitted = false; break;
-			case 6: exclusive = false; break;
-			case 7: PageSetLSNPreserveOrigin(page.data, 0x199); break;
-			case 8: ((PageHeader)page.data)->pd_block_scn = 0; break;
-			case 9: UT_ASSERT(PageSetLSNOrigin(page.data, 1)); break;
+		case 0:
+			record.xl_rmid = RM_XLOG_ID;
+			break;
+		case 1:
+			desc.bufferdesc.tag.blockNum = 2;
+			break;
+		case 2:
+			key.locator.spcOid++;
+			break;
+		case 3:
+			writer.claim.database_incarnation++;
+			break;
+		case 4:
+			writer.claim.identity.storage_uuid[1]++;
+			break;
+		case 5:
+			permitted = false;
+			break;
+		case 6:
+			exclusive = false;
+			break;
+		case 7:
+			PageSetLSNPreserveOrigin(page.data, 0x199);
+			break;
+		case 8:
+			((PageHeader)page.data)->pd_block_scn = 0;
+			break;
+		case 9:
+			UT_ASSERT(PageSetLSNOrigin(page.data, 1));
+			break;
 		}
 		UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &key, 0x200),
-			CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
+					 CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
 	}
 	space_insert(0, RM_XACT_ID, XLOG_XACT_COMMIT, false);
 	UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &space.key, 0x200),
-		CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
+				 CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
 	space_insert(0, RM_XACT_ID, XLOG_XACT_ABORT, true);
 	UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &space.key, 0x200),
-		CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
+				 CLUSTER_PAGE_WAL_INVARIANT_BROKEN);
 }
 
 UT_TEST(space_carrier_retains_flushed_original_source_after_transfer)
@@ -1732,7 +1787,7 @@ UT_TEST(space_carrier_retains_flushed_original_source_after_transfer)
 	ClusterPageWalInstallV1 install = { 0 };
 	space_insert(1, RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION, false);
 	UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &space.key, 0x200),
-		CLUSTER_PAGE_WAL_CAPTURED);
+				 CLUSTER_PAGE_WAL_CAPTURED);
 	UT_ASSERT(cluster_page_wal_snapshot_v1(1, &native));
 	UT_ASSERT(cluster_page_wal_forget_v1(1));
 	writer.claim.identity.origin_node_id = 1;
@@ -1753,7 +1808,7 @@ UT_TEST(space_capture_unavailable_source_is_not_mutation_failure)
 	space_insert(1, RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION, false);
 	selected = false;
 	UT_ASSERT_EQ(cluster_page_wal_capture_space_v1(1, &space.key, 0x200),
-		CLUSTER_PAGE_WAL_UNATTRIBUTED);
+				 CLUSTER_PAGE_WAL_UNATTRIBUTED);
 	UT_ASSERT(cluster_page_wal_forget_v1(1));
 	UT_ASSERT(!cluster_page_wal_snapshot_v1(1, &value));
 	UT_ASSERT_EQ(writer_floor().dirty, 1);

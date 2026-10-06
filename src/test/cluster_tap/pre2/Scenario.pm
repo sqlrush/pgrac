@@ -1,3 +1,4 @@
+# Author: SqlRush <sqlrush@gmail.com>
 # Common failure handling for the PRE2 black-box scenarios. No skip paths.
 package Scenario;
 use strict;

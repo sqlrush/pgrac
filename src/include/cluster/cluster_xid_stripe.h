@@ -188,7 +188,7 @@ typedef struct ClusterXidStripeSlotRecord {
 	 * no previous nonempty lease; the sequence is never recycled. */
 	uint64 history_generation;
 	uint32 history_crc32c; /* exact predecessor record, covered by this CRC */
-	uint32 crc32c; /* CRC32C over all preceding fields */
+	uint32 crc32c;		   /* CRC32C over all preceding fields */
 } ClusterXidStripeSlotRecord;
 
 #define CLUSTER_PGXA_MAGIC 0x50475841 /* "PGXA" */

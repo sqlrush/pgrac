@@ -14,8 +14,8 @@ static unsigned rollback_reads, rollback_chains;
 struct TTRevertExpect;
 
 static bool
-rollback_read(ClusterUndoPathIntent intent, uint32 segment, uint8 owner,
-			  BlockNumber block, void *buffer)
+rollback_read(ClusterUndoPathIntent intent, uint32 segment, uint8 owner, BlockNumber block,
+			  void *buffer)
 {
 	rollback_reads++;
 	return false;

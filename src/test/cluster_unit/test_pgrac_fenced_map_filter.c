@@ -189,6 +189,8 @@ UT_TEST(test_output_io_error_is_not_success)
 	FILE *output = tmpfile();
 
 	UT_ASSERT(input != NULL && output != NULL);
+	if (input == NULL || output == NULL)
+		abort();
 	UT_ASSERT_EQ(fwrite(fixture, 1, fixture_length, input), fixture_length);
 	rewind(input);
 	UT_ASSERT_EQ(close(fileno(output)), 0);
@@ -203,6 +205,8 @@ UT_TEST(test_input_io_error_is_not_empty_valid_map)
 	FILE *output = tmpfile();
 
 	UT_ASSERT(input != NULL && output != NULL);
+	if (input == NULL || output == NULL)
+		abort();
 	UT_ASSERT_EQ(close(fileno(input)), 0);
 	UT_ASSERT_EQ(pgrac_fenced_map_filter(6, arguments, input, output), 77);
 	UT_ASSERT_EQ(ftell(output), 0);

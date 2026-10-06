@@ -11,6 +11,7 @@
 
 #include "postgres.h"
 
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -177,6 +178,11 @@ static int fake_before_exit_count;
 static bool fake_smgr_exit_registered;
 
 static int event_sequence;
+int cluster_injection_armed_count;
+static bool first_publication_skip;
+static bool first_publication_throws;
+static int first_publication_hits;
+static int first_publication_event;
 static int reserve_event;
 static int reserve_calls;
 static int insert_event;
@@ -1083,6 +1089,23 @@ test_root(void)
 	return root;
 }
 
+void
+cluster_injection_run(const char *name)
+{
+	UT_ASSERT_EQ(strcmp(name, "cluster-undo-first-publication-deny"), 0);
+	first_publication_hits++;
+	first_publication_event = ++event_sequence;
+	if (first_publication_throws)
+		siglongjmp(*PG_exception_stack, 1);
+}
+
+bool
+cluster_injection_should_skip(const char *name)
+{
+	UT_ASSERT_EQ(strcmp(name, "cluster-undo-first-publication-deny"), 0);
+	return cluster_injection_armed_count > 0 && first_publication_skip;
+}
+
 static void
 reset_fixture(void)
 {
@@ -1136,6 +1159,9 @@ reset_fixture(void)
 	fake_provision_generation = (ClusterUndoBlock0Generation){ true, 4 };
 	fake_provision_creator = false;
 	fake_init_invalidates_authority = fake_publish_throws = false;
+	cluster_injection_armed_count = 0;
+	first_publication_skip = first_publication_throws = false;
+	first_publication_hits = first_publication_event = 0;
 	init_wal_calls = provision_publish_calls = 0;
 	init_wal_event = provision_publish_event = 0;
 	memset(fake_pin_page, 0x6b, sizeof(fake_pin_page));
@@ -1853,6 +1879,110 @@ UT_TEST(test_first_provision_owns_current_and_unpublished_frame_before_wal)
 		UT_ASSERT(provision_publish_event < unpin_event);
 		UT_ASSERT(unpin_event < local_release_event);
 	}
+}
+
+UT_TEST(test_first_publication_deny_preserves_private_bytes_and_can_retry)
+{
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	char before[BLCKSZ];
+	int side;
+
+	for (side = 0; side < 2; side++) {
+		reset_fixture();
+		fake_master = cluster_node_id;
+		fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+		fake_modifier_side
+			= side == 0 ? CLUSTER_SEMANTIC_SOURCE_SIDE : CLUSTER_SEMANTIC_TARGET_SIDE;
+		fake_sample_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+		fake_provision_creator = true;
+		cluster_injection_armed_count = 1;
+		first_publication_skip = true;
+		memcpy(before, fake_pin_page, sizeof(before));
+		for (int attempt = 1; attempt <= 2; attempt++) {
+			UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_provision(&key, 1000),
+						 CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+			UT_ASSERT_EQ(first_publication_hits, attempt);
+			UT_ASSERT_EQ(init_wal_calls, 0);
+			UT_ASSERT_EQ(provision_publish_calls, 0);
+			UT_ASSERT_EQ(memcmp(before, fake_pin_page, sizeof(before)), 0);
+			UT_ASSERT_EQ(provision_abort_calls, attempt);
+			UT_ASSERT_EQ(local_release_calls, attempt);
+			UT_ASSERT_EQ(semantic_leave_calls, attempt);
+			UT_ASSERT_EQ(unpin_calls, 0);
+			UT_ASSERT(final_root_resolve_event < first_publication_event);
+			UT_ASSERT(first_publication_event < provision_abort_event);
+			UT_ASSERT(provision_abort_event < local_release_event);
+			UT_ASSERT(local_release_event < semantic_leave_event);
+		}
+		cluster_injection_armed_count = 0;
+		first_publication_skip = false;
+		UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_provision(&key, 1000),
+					 CLUSTER_UNDO_BLOCK0_OK);
+		UT_ASSERT_EQ(first_publication_hits, 2);
+		UT_ASSERT_EQ(init_wal_calls, 1);
+		UT_ASSERT_EQ(provision_publish_calls, 1);
+		UT_ASSERT_EQ(provision_abort_calls, 2);
+		UT_ASSERT_EQ(local_release_calls, 3);
+		UT_ASSERT_EQ(semantic_leave_calls, 3);
+	}
+}
+
+UT_TEST(test_first_publication_deny_does_not_intercept_existing_or_rejected_owners)
+{
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	int cause;
+
+	for (cause = 0; cause < 4; cause++) {
+		reset_fixture();
+		fake_master = cluster_node_id;
+		fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+		fake_sample_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+		cluster_injection_armed_count = 1;
+		first_publication_skip = true;
+		fake_provision_creator = cause != 0;
+		if (cause == 1)
+			fake_root_resolve_success_limit = 1;
+		else if (cause == 2)
+			fake_admission_result = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+		else if (cause == 3)
+			fake_sample_invalidates_authority = true;
+		UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_provision(&key, 1000),
+					 cause == 0 ? CLUSTER_UNDO_BLOCK0_OK : CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+		UT_ASSERT_EQ(first_publication_hits, 0);
+		UT_ASSERT_EQ(init_wal_calls, 0);
+		UT_ASSERT_EQ(provision_publish_calls, 0);
+	}
+}
+
+UT_TEST(test_first_publication_injected_error_uses_original_owner_cleanup)
+{
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	volatile bool caught = false;
+
+	reset_fixture();
+	fake_master = cluster_node_id;
+	fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+	fake_sample_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	fake_provision_creator = true;
+	cluster_injection_armed_count = 1;
+	first_publication_throws = true;
+	PG_TRY();
+	{
+		(void)cluster_undo_block0_current_live_owner_provision(&key, 1000);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(first_publication_hits, 1);
+	UT_ASSERT_EQ(init_wal_calls, 0);
+	UT_ASSERT_EQ(provision_publish_calls, 0);
+	UT_ASSERT_EQ(provision_abort_calls, 1);
+	UT_ASSERT_EQ(semantic_leave_calls, 1);
+	UT_ASSERT(first_publication_event < provision_abort_event);
+	UT_ASSERT(provision_abort_event < semantic_leave_event);
 }
 
 UT_TEST(test_first_provision_existing_image_is_never_reinitialized)
@@ -3735,7 +3865,10 @@ UT_TEST(test_readiness_denial_names_first_false_gate_without_side_effects)
 int
 main(void)
 {
-	UT_PLAN(89);
+	UT_PLAN(92);
+	UT_RUN(test_first_publication_deny_preserves_private_bytes_and_can_retry);
+	UT_RUN(test_first_publication_deny_does_not_intercept_existing_or_rejected_owners);
+	UT_RUN(test_first_publication_injected_error_uses_original_owner_cleanup);
 	UT_RUN(test_first_provision_owns_current_and_unpublished_frame_before_wal);
 	UT_RUN(test_first_provision_existing_image_is_never_reinitialized);
 	UT_RUN(test_first_provision_refusal_preserves_final_path_and_releases_owner);

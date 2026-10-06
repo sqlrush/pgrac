@@ -799,14 +799,15 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 		admission = cluster_semantic_activation_modifier_enter(
 			cluster_tt_local_writable_admission(), &modifier_token);
 		if (admission != CLUSTER_SEMANTIC_ADMISSION_OK)
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("cannot publish canonical ACTIVE without writable semantic admission")));
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("cannot publish canonical ACTIVE without writable semantic admission")));
 
 		PG_TRY();
 		{
-			reserved = cluster_tt_local_reserve_binding(top_xid, &segment_id, &slot_offset,
-														 &tt_slot_id);
+			reserved
+				= cluster_tt_local_reserve_binding(top_xid, &segment_id, &slot_offset, &tt_slot_id);
 			if (reserved) {
 				(void)tt_slot_id;
 				idx = cluster_tt_local_find_binding(top_xid);
@@ -814,10 +815,12 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 				binding = &cluster_tt_local_bindings[idx];
 				if (binding->publish_state != CLUSTER_CANONICAL_TXN_RESERVED
 					|| binding->terminal_state != CLUSTER_TT_LOCAL_TERMINAL_NONE
-					|| !XLogRecPtrIsInvalid(binding->active_lsn) || binding->active_alias_segments != NULL
-					|| binding->active_alias_count != 0 || binding->active_alias_capacity != 0)
-					ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-									errmsg("canonical ACTIVE reservation has prior publication effects")));
+					|| !XLogRecPtrIsInvalid(binding->active_lsn)
+					|| binding->active_alias_segments != NULL || binding->active_alias_count != 0
+					|| binding->active_alias_capacity != 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("canonical ACTIVE reservation has prior publication effects")));
 
 				/* The exact candidate was captured under the allocation lock.  Do not
 				 * require an unlocked rescan of a CURRENT index which may have moved.
@@ -831,15 +834,16 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 				publication_started = true;
 				binding->publish_state = CLUSTER_CANONICAL_TXN_PUBLISHING;
 				cluster_tt_local_modifier_recheck_or_error(&modifier_token);
-				active_lsn = cluster_tt_slot_durable_publish_active(&expected_owner, &modifier_token,
-																	&segment_generation, &successor);
+				active_lsn = cluster_tt_slot_durable_publish_active(
+					&expected_owner, &modifier_token, &segment_generation, &successor);
 				cluster_tt_local_modifier_recheck_or_error(&modifier_token);
 				if (XLogRecPtrIsInvalid(active_lsn)) {
 					memset(&zero_slot, 0, sizeof(zero_slot));
 					if (segment_generation != UINT32_MAX
 						|| memcmp(&successor, &zero_slot, sizeof(successor)) != 0)
-						ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-										errmsg("canonical ACTIVE retry returned publication effects")));
+						ereport(ERROR,
+								(errcode(ERRCODE_DATA_CORRUPTED),
+								 errmsg("canonical ACTIVE retry returned publication effects")));
 					/* A normal return certifies that this invocation never reserved
 					 * CTRC or started BIND.  ERROR paths never reach this transition. */
 					binding->publish_state = CLUSTER_CANONICAL_TXN_RESERVED;
@@ -849,9 +853,10 @@ cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
 						|| successor.xid != top_xid || successor.wrap != binding->wrap
 						|| successor.flags != TT_FLAGS_RESERVED || SCN_VALID(successor.commit_scn)
 						|| !UBA_is_invalid(successor.first_undo_block))
-						ereport(ERROR,
-								(errcode(ERRCODE_DATA_CORRUPTED),
-								 errmsg("canonical ACTIVE publisher returned an invalid successor")));
+						ereport(
+							ERROR,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("canonical ACTIVE publisher returned an invalid successor")));
 
 					binding->segment_generation = segment_generation;
 					binding->active_lsn = active_lsn;

@@ -2,6 +2,7 @@
  * cluster_undo_recovery.c
  *    Canonical UNDO access within the original failed-origin recovery scope.
  *-------------------------------------------------------------------------
+ * Author: SqlRush <sqlrush@gmail.com>
  */
 #include "postgres.h"
 
@@ -40,14 +41,15 @@ undo_scope_current(const ClusterUndoRecoveryScopeV1 *scope)
 		|| memcmp(storage.storage_uuid, scope->duty.storage_uuid, 16) != 0)
 		return false;
 	return rf_side_online_plan_source_matches_v1(scope->plan, scope->duty.system_identifier,
-		scope->duty.storage_uuid, &scope->cut);
+												 scope->duty.storage_uuid, &scope->cut);
 }
 
 bool
 cluster_undo_recovery_scope_enter_v1(ClusterUndoRecoveryScopeV1 *scope,
-	const ClusterThreadRecoveryAuthorityV1 *authority, const RfSideOnlinePlanV1 *plan)
+									 const ClusterThreadRecoveryAuthorityV1 *authority,
+									 const RfSideOnlinePlanV1 *plan)
 {
-	ClusterUndoRecoveryScopeV1 candidate = {0};
+	ClusterUndoRecoveryScopeV1 candidate = { 0 };
 
 	if (active_scope != NULL || scope == NULL || authority == NULL || plan == NULL
 		|| authority->duty == NULL || authority->root_token == NULL
@@ -90,15 +92,15 @@ cluster_undo_recovery_intent_for_owner(uint8 owner)
 	/* Keep an expired or mismatched active request on the qualified path so
 	 * its resolver refuses instead of silently materializing a local copy. */
 	return active_scope != NULL ? CLUSTER_UNDO_PATH_RECOVERY_SHARED
-		: cluster_undo_intent_for_owner(owner);
+								: cluster_undo_intent_for_owner(owner);
 }
 
 bool
 cluster_undo_recovery_origin_authorized_v1(int origin_node)
 {
 	return origin_node >= 0 && origin_node < 128 && active_scope != NULL
-		&& active_scope->duty.origin_thread_id == origin_node + 1
-		&& undo_scope_current(active_scope);
+		   && active_scope->duty.origin_thread_id == origin_node + 1
+		   && undo_scope_current(active_scope);
 }
 
 int
@@ -117,11 +119,12 @@ cluster_undo_recovery_path_resolve_v1(uint8 owner, uint32 segment, char *path, s
 }
 
 bool
-cluster_undo_recovery_multixact_page_retired_v1(int origin_node,
-	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn, bool members, uint32 page)
+cluster_undo_recovery_multixact_page_retired_v1(int origin_node, XLogRecPtr source_lsn,
+												XLogRecPtr source_end_lsn, bool members,
+												uint32 page)
 {
 	return cluster_undo_recovery_origin_authorized_v1(origin_node)
-		&& rf_side_online_plan_multixact_page_retired_v1(active_scope->plan,
-			origin_node + 1, source_lsn, source_end_lsn, members, page);
+		   && rf_side_online_plan_multixact_page_retired_v1(
+			   active_scope->plan, origin_node + 1, source_lsn, source_end_lsn, members, page);
 }
 #endif

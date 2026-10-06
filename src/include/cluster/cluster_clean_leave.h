@@ -769,8 +769,8 @@ extern ClusterNormalStopPollResult cluster_lmd_probe_normal_stop_poll(uint64 *pr
 extern ClusterNormalStopPollResult
 cluster_clean_leave_normal_stop_local_poll(int *peer_out, const char **reason_out);
 /* Online original LMON observation; never initiates or acknowledges shutdown. */
-extern ClusterNormalStopPollResult
-cluster_clean_leave_service_poll(int *peer_out, const char **reason_out);
+extern ClusterNormalStopPollResult cluster_clean_leave_service_poll(int *peer_out,
+																	const char **reason_out);
 extern ClusterNormalStopPollResult cluster_sf_dep_normal_stop_poll(bool post_checkpoint,
 																   int *slot_out, int *origin_out,
 																   const char **reason_out);

@@ -197,7 +197,7 @@ static ClusterWalStartupImage test_startup_operation;
 
 bool
 cluster_wal_writer_startup_matches(const ClusterControlRootIdentity *self,
-									const uint8 operation_uuid[16], XLogRecPtr first_segment)
+								   const uint8 operation_uuid[16], XLogRecPtr first_segment)
 {
 	return test_startup_bound && MyBackendType == B_STARTUP
 		   && cluster_control_root_identity_equal(self, &test_startup_operation.claim.identity)
@@ -824,8 +824,7 @@ pg_fsync(int fd)
 	}
 	if (test_startup_sync_hook != NULL)
 		test_startup_sync_hook();
-	if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)
-		&& st.st_size == CLUSTER_WAL_CLAIM_V2_BYTES)
+	if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == CLUSTER_WAL_CLAIM_V2_BYTES)
 		test_startup_claim_syncs++;
 	if (test_history_fail_sync != 0 && ++test_history_sync_count == test_history_fail_sync) {
 		errno = EIO;
@@ -6366,8 +6365,7 @@ v2_checkpoint_prefix_write(void)
 	strlcpy(directory, test_checkpoint_prefix_path, sizeof(directory));
 	*strrchr(directory, '/') = '\0';
 	UT_ASSERT(mkdir(directory, 0700) == 0 || errno == EEXIST);
-	wal_test_obsolete_bytes(&test_checkpoint_prefix_ref,
-												   &test_checkpoint_prefix, bytes);
+	wal_test_obsolete_bytes(&test_checkpoint_prefix_ref, &test_checkpoint_prefix, bytes);
 	write_all_or_abort(test_checkpoint_prefix_path, bytes, sizeof(bytes));
 }
 
@@ -6525,8 +6523,7 @@ v2_checkpoint_wal_record(const ClusterControlRootIdentity *self, ControlFileData
 	test_flush = test_checkpoint_end;
 	test_insert = test_checkpoint_end;
 	test_checkpoint_prefix
-		= (WalTestRecord){ 11, test_checkpoint_end, candidate->checkPoint,
-									 test_checkpoint_crc };
+		= (WalTestRecord){ 11, test_checkpoint_end, candidate->checkPoint, test_checkpoint_crc };
 	v2_checkpoint_prefix_write();
 }
 
@@ -6534,8 +6531,8 @@ v2_checkpoint_wal_record(const ClusterControlRootIdentity *self, ControlFileData
  * but only five body bytes copied by its inserter.  This is deliberately not
  * a short read or a substituted XLogReader result. */
 static void
-v2_incomplete_wal_tail(const ClusterControlRootIdentity *self, TimeLineID tli,
-					   uint32 segment_size, XLogRecPtr start, XLogRecPtr previous)
+v2_incomplete_wal_tail(const ClusterControlRootIdentity *self, TimeLineID tli, uint32 segment_size,
+					   XLogRecPtr start, XLogRecPtr previous)
 {
 	uint8 page[XLOG_BLCKSZ], body[66];
 	XLogRecord record = { 0 };
@@ -7122,13 +7119,11 @@ v2_wal_append_noop(const ClusterWalSourceRef *source, XLogRecPtr previous, XLogR
 	COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
 	FIN_CRC32C(record.xl_crc);
 	memcpy(bytes, &record, SizeOfXLogRecord);
-	v2_checkpoint_wal_path(&source->claim.identity, at,
-						  source->timeline, path);
+	v2_checkpoint_wal_path(&source->claim.identity, at, source->timeline, path);
 	UT_ASSERT(at % XLOG_BLCKSZ + sizeof(bytes) < XLOG_BLCKSZ);
 	fd = open(path, O_WRONLY);
 	UT_ASSERT(fd >= 0);
-	UT_ASSERT_EQ(pwrite(fd, bytes, sizeof(bytes), at % wal_segment_size),
-				 sizeof(bytes));
+	UT_ASSERT_EQ(pwrite(fd, bytes, sizeof(bytes), at % wal_segment_size), sizeof(bytes));
 	UT_ASSERT_EQ(close(fd), 0);
 }
 
@@ -7302,15 +7297,18 @@ v2_checkpoint_native_input_race(void)
 	char path[MAXPGPATH];
 	test_checkpoint_x_hook = NULL;
 	v2_checkpoint_wal_path(&test_checkpoint_prefix_ref.claim.identity,
-		test_checkpoint_prefix.record_start, test_checkpoint_prefix_ref.timeline, path);
+						   test_checkpoint_prefix.record_start, test_checkpoint_prefix_ref.timeline,
+						   path);
 	if (test_native_input_race == 0)
 		UT_ASSERT_EQ(truncate(path, 12), 0);
 	else if (test_native_input_race == 1) {
 		uint8 damaged = 0x73;
 		int fd = open(path, O_WRONLY);
 		UT_ASSERT(fd >= 0);
-		UT_ASSERT_EQ(pwrite(fd, &damaged, 1,
-			(test_checkpoint_prefix.record_start + SizeOfXLogRecord + 2) % wal_segment_size), 1);
+		UT_ASSERT_EQ(
+			pwrite(fd, &damaged, 1,
+				   (test_checkpoint_prefix.record_start + SizeOfXLogRecord + 2) % wal_segment_size),
+			1);
 		UT_ASSERT_EQ(close(fd), 0);
 	} else if (test_native_input_race == 2) {
 		v2_claim_path(&test_checkpoint_prefix_ref.claim.identity, path);
@@ -7928,7 +7926,7 @@ UT_TEST(test_v2_stop_observation_rechecks_root_and_pinned_wal)
 			= cluster_control_root_v2_shutdown_observe(&test_checkpoint_prefix_ref, &out, &token);
 		/* Native re-read rejects missing or foreign replacement WAL before
 		 * the final pinned-path check. */
-		UT_ASSERT_EQ(result, fault == 0   ? CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+		UT_ASSERT_EQ(result, fault == 0	  ? CLUSTER_CONTROL_ROOT_CAS_CONFLICT
 							 : fault == 2 ? CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC
 							 : fault == 3 ? CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH
 										  : CLUSTER_CONTROL_ROOT_STALE_TOKEN);
@@ -8750,8 +8748,9 @@ UT_TEST(test_v3_target_creates_only_exact_empty_successor)
 		ref.timeline = op.timeline;
 		sha256_bytes(encoded, sizeof(encoded), ref.claim.claim_sha256);
 		UT_ASSERT_EQ(cluster_wal_claim_v2_read(cluster_wal_threads_dir, &ref.claim, &claim), 0);
-		UT_ASSERT_EQ(cluster_wal_startup_observe(cluster_wal_threads_dir, &ref,
-			op.segment_size, op.first_segment_lsn, &input), 0);
+		UT_ASSERT_EQ(cluster_wal_startup_observe(cluster_wal_threads_dir, &ref, op.segment_size,
+												 op.first_segment_lsn, &input),
+					 0);
 		UT_ASSERT_EQ(input.tail.records, 0);
 		UT_ASSERT_EQ(input.tail.complete_end, 0);
 		UT_ASSERT_EQ(cluster_control_root_v3_startup_prepare_target(&op.claim.identity,
@@ -8886,7 +8885,9 @@ UT_TEST(test_v3_native_driver_missing_selected_or_partial_namespace_is_not_wait)
 			v3_target_path(path, &peer, "/" CLUSTER_WAL_THREAD_CLAIM_FILENAME);
 			break;
 		case 1:
-			snprintf(path, sizeof(path), "%s/global/anchor_images/thread_4/generation_" UINT64_FORMAT "/.staging", test_root, peer.claim.identity.origin_owner_incarnation);
+			snprintf(path, sizeof(path),
+					 "%s/global/anchor_images/thread_4/generation_" UINT64_FORMAT "/.staging",
+					 test_root, peer.claim.identity.origin_owner_incarnation);
 			break;
 		case 2:
 			v3_target_path(path, &peer, "/archive_status");
@@ -9495,7 +9496,7 @@ UT_TEST(test_v3_startup_route_refuses_unsafe_or_nonempty_namespaces)
 			UT_ASSERT_EQ(symlink(moved, path), 0);
 		} else {
 			v2_checkpoint_wal_path(&op.predecessor.snapshot.identity, op.input_record_start,
-					op.input_timeline, path);
+								   op.input_timeline, path);
 			write_all_or_abort(path, "bad", 3);
 		}
 		UT_ASSERT(cluster_control_root_v3_startup_route_writer(&op.claim.identity,
@@ -10172,9 +10173,11 @@ UT_TEST(test_v3_startup_install_requires_actual_old_and_new_files)
 			if (fault == 1)
 				v2_claim_path(&op.claim.identity, path);
 			if (fault == 2)
-				v2_checkpoint_wal_path(&op.predecessor.snapshot.identity, op.input_record_start, op.input_timeline, path);
+				v2_checkpoint_wal_path(&op.predecessor.snapshot.identity, op.input_record_start,
+									   op.input_timeline, path);
 			if (fault == 3)
-				v2_checkpoint_wal_path(&op.claim.identity, op.successor.snapshot.tail_last_record_lsn, op.timeline,
+				v2_checkpoint_wal_path(&op.claim.identity,
+									   op.successor.snapshot.tail_last_record_lsn, op.timeline,
 									   path);
 			if (fault >= 4 && fault <= 5) {
 				const ClusterWalHistoryRecord *r = fault == 4 ? &op.predecessor : &op.successor;
@@ -11922,7 +11925,7 @@ UT_TEST(test_runtime_pending_native_inspection_uses_selected_origin_and_sealed_h
 			UT_ASSERT_EQ(symlink("../pg_xact/0000", path), 0);
 		} else if (fault == 6) {
 			v2_incomplete_wal_tail(&op.claim.identity, op.timeline, op.segment_size,
-							   op.first_segment_lsn + SizeOfXLogLongPHD, 0);
+								   op.first_segment_lsn + SizeOfXLogLongPHD, 0);
 		}
 		memset(&out, 0xa5, sizeof(out));
 		if (fault == 0 || fault == 6) {
@@ -12294,8 +12297,8 @@ UT_TEST(test_runtime_pending_owner_reads_actual_empty_and_checkpoint_wal)
 			/* INITIALIZING does not claim this first checkpoint completed.
 			 * A later initialized page is the positive missing-input proof. */
 			v2_incomplete_wal_tail(&op.claim.identity, op.timeline, op.segment_size,
-							   op.first_segment_lsn + XLOG_BLCKSZ + SizeOfXLogShortPHD,
-							   op.first_segment_lsn + SizeOfXLogLongPHD);
+								   op.first_segment_lsn + XLOG_BLCKSZ + SizeOfXLogShortPHD,
+								   op.first_segment_lsn + SizeOfXLogLongPHD);
 		}
 		if (scenario == 2) {
 			UT_ASSERT(cluster_control_root_v3_initializer_observe(
@@ -13175,8 +13178,7 @@ UT_TEST(test_v2_failure_tail_requires_real_selected_input)
 			char claim[MAXPGPATH];
 			v2_claim_path(&request.duty, claim);
 			UT_ASSERT_EQ(unlink(claim), 0);
-		}
-		else if (i == 1)
+		} else if (i == 1)
 			UT_ASSERT_EQ(unlink(wal), 0);
 		else if (i == 2) {
 			/* Cut record payload, not the padding up to its aligned EndRecPtr. */
@@ -13191,7 +13193,9 @@ UT_TEST(test_v2_failure_tail_requires_real_selected_input)
 			int fd = open(wal, O_WRONLY);
 			UT_ASSERT(fd >= 0);
 			UT_ASSERT_EQ(pwrite(fd, &damaged, 1,
-				(test_checkpoint_prefix.record_start + SizeOfXLogRecord + 2) % wal_segment_size), 1);
+								(test_checkpoint_prefix.record_start + SizeOfXLogRecord + 2)
+									% wal_segment_size),
+						 1);
 			UT_ASSERT_EQ(close(fd), 0);
 		}
 		result = cluster_control_root_v2_failure_tail_publish(&request, &out, &token);
@@ -16875,8 +16879,8 @@ UT_TEST(test_history_produced_file_reaches_actual_bootstrap_consumer)
  */
 static void
 v2_close_history_fixture_sequenced(uint8 before[66048], ClusterPhase1FullStopPlan *plan,
-						 ClusterWalHistoryImage *history, ClusterWalHistoryStage *stage,
-						 uint32 count, bool sequenced)
+								   ClusterWalHistoryImage *history, ClusterWalHistoryStage *stage,
+								   uint32 count, bool sequenced)
 {
 	ControlRootImage root, old;
 	ClusterRecoveryAnchorV2 anchor;
@@ -16997,10 +17001,10 @@ UT_TEST(test_v2_normal_close_rechecks_closed_peer_persistent_tail)
 	/* Later complete WAL prevents a global clean fold of a closed peer. */
 	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
 	read_all_or_abort(path, primary, sizeof(primary));
-	UT_ASSERT_EQ(cluster_control_root_v2_decode(primary, sizeof(primary), v2_storage,
-		TEST_SYSID, &root), 0);
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_decode(primary, sizeof(primary), v2_storage, TEST_SYSID, &root), 0);
 	v2_wal_append_noop(&test_checkpoint_prefix_ref, root.records[0].tail_last_record_lsn,
-		root.records[0].validated_tail_lsn_exclusive);
+					   root.records[0].validated_tail_lsn_exclusive);
 	cluster_node_id = 1;
 	test_own_thread = 2;
 	test_self_incarnation = test_membership_incarnation
@@ -17137,7 +17141,7 @@ UT_TEST(test_v2_normal_close_refuses_missing_or_nonterminal_history)
 			UT_ASSERT_EQ(unlink(path), 0);
 		} else if (fault < 6) {
 			v2_checkpoint_wal_path(&old->snapshot.identity, old->snapshot.tail_last_record_lsn,
-				old->snapshot.tail_tli, path);
+								   old->snapshot.tail_tli, path);
 			if (fault == 3)
 				UT_ASSERT_EQ(unlink(path), 0);
 			else if (fault == 4) {
@@ -17145,11 +17149,13 @@ UT_TEST(test_v2_normal_close_refuses_missing_or_nonterminal_history)
 				int fd = open(path, O_WRONLY);
 				UT_ASSERT(fd >= 0);
 				UT_ASSERT_EQ(pwrite(fd, &damaged, 1,
-					(old->snapshot.tail_last_record_lsn + SizeOfXLogRecord + 2) % wal_segment_size), 1);
+									(old->snapshot.tail_last_record_lsn + SizeOfXLogRecord + 2)
+										% wal_segment_size),
+							 1);
 				UT_ASSERT_EQ(close(fd), 0);
 			} else
 				v2_wal_append_noop(&ref, old->snapshot.tail_last_record_lsn,
-					old->snapshot.validated_tail_lsn_exclusive);
+								   old->snapshot.validated_tail_lsn_exclusive);
 		} else {
 			ControlRootImage root;
 			uint8 uuid[16] = { 0 };
@@ -17393,16 +17399,18 @@ UT_TEST(test_creation_pair_rejects_older_backup_from_other_domain)
 	put_u64_le(bytes + 180, 0);
 	v2_checksums(bytes);
 	v2_write_roots(bytes);
-	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID,
-		&root, &out, &token), 0);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &token),
+		0);
 	/* Even an older, otherwise identical valid backup cannot change domains. */
 	put_u64_le(bytes + 64, 0x0d);
 	put_u64_le(bytes + 16, root.header.file_txn_seq - 1);
 	v2_checksums(bytes);
 	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_BAK_REL_PATH);
 	write_all_or_abort(path, bytes, sizeof(bytes));
-	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID,
-		&root, &out, &token), CLUSTER_CONTROL_ROOT_COPY_DIVERGENT);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &token),
+		CLUSTER_CONTROL_ROOT_COPY_DIVERGENT);
 	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
 }
 
@@ -17536,7 +17544,6 @@ bootstrap_pending_fixture(BootstrapFixture *f, uint32 phase, char paths[3][MAXPG
 		operation.successor.refs = next.refs[127];
 		operation.successor.publisher_node = next.publisher_node[127];
 		operation.successor.publisher_incarnation = next.publisher_incarnation[127];
-
 	}
 	path_for(temp, sizeof(temp), "global/wal_startup");
 	UT_ASSERT(mkdir(temp, 0700) == 0 || errno == EEXIST);
@@ -17973,7 +17980,8 @@ UT_TEST(test_terminal_selected_reader_and_bootstrap_refuse_incomplete_evidence)
 			UT_ASSERT_EQ(unlink(paths[1]), 0);
 		else if (fault == 1) {
 			v2_checkpoint_wal_path(&terminal.initialization.claim.identity,
-				terminal.initialization.first_segment_lsn, terminal.initialization.timeline, path);
+								   terminal.initialization.first_segment_lsn,
+								   terminal.initialization.timeline, path);
 			UT_ASSERT_EQ(unlink(path), 0);
 		} else if (fault == 2) {
 			uint8 page[XLOG_BLCKSZ];
@@ -18044,7 +18052,8 @@ UT_TEST(test_bootstrap_v3_pending_is_never_missing_from_capacity)
 		ControlRootImage root;
 		ClusterWalStartupImage pending;
 		UT_ASSERT_EQ(cluster_control_root_v3_decode(f.before, sizeof(f.before), v2_storage,
-													 TEST_SYSID, &root), 0);
+													TEST_SYSID, &root),
+					 0);
 		test_cf_grant = true;
 		test_cf_mode = ShareLock;
 		UT_ASSERT_EQ(cluster_wal_startup_read_locked(&root, 127, &pending), 0);
@@ -18055,7 +18064,8 @@ UT_TEST(test_bootstrap_v3_pending_is_never_missing_from_capacity)
 	}
 	/* Discovery includes another origin's pending capacity without inferring
 	 * EMPTY or reading a flush sidefile. Its runtime owner checks native WAL. */
-	UT_ASSERT_EQ(cluster_control_bootstrap_read(bootstrap_local, test_root, test_wal_root, 0, &out), 0);
+	UT_ASSERT_EQ(cluster_control_bootstrap_read(bootstrap_local, test_root, test_wal_root, 0, &out),
+				 0);
 	UT_ASSERT_EQ(out.required.pending_sources, 1);
 	UT_ASSERT(!out.snapshot.pending_wal_valid);
 	pfree(out.config_bytes);
@@ -18876,13 +18886,11 @@ UT_TEST(test_v3_failure_publication_retains_old_authority_and_no_fallback)
 		}
 		if (fault == 2)
 			test_failure_admissions = false;
-		else if (fault == 3)
-			{
+		else if (fault == 3) {
 			char path[MAXPGPATH];
 			v2_claim_path(&test_checkpoint_prefix_ref.claim.identity, path);
 			UT_ASSERT_EQ(unlink(path), 0);
-		}
-		else if (fault == 4)
+		} else if (fault == 4)
 			request.expected_root_token.file_txn_seq++;
 		else if (fault == 5)
 			test_self_incarnation = request.duty.origin_owner_incarnation;
@@ -20790,7 +20798,8 @@ UT_TEST(test_wal_inputs_recovered_prefix_requires_exact_terminal_and_source)
 				UT_ASSERT(v2_zero(&recovered, sizeof(recovered)));
 			else
 				UT_ASSERT(memcmp(&recovered, &cluster_wal_inputs_at_v1(inputs, 1)->source,
-							 sizeof(recovered)) == 0);
+								 sizeof(recovered))
+						  == 0);
 			UT_ASSERT(!cluster_wal_inputs_recovered_owner_v1(inputs, 0, &recovered));
 			UT_ASSERT(v2_zero(&recovered, sizeof(recovered)));
 			UT_ASSERT(!cluster_wal_inputs_recovered_owner_v1(inputs, 1, &recovered));
@@ -20873,13 +20882,13 @@ UT_TEST(test_wal_inputs_recovered_owner_requires_installed_contiguous_history)
 		ClusterControlRootSnapshot *s;
 		v2_close_history_fixture_sequenced(bytes, &plan, &history, &stage, 2, fault != 2);
 		root_fixture_version3(bytes);
-		UT_ASSERT_EQ(cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID,
-													 &root), 0);
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root), 0);
 		s = &root.records[0];
 		s->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
 		s->lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE;
 		s->root_flags |= CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID
-			| CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID;
+						 | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID;
 		s->recovered_tli = s->tail_tli;
 		s->recovered_through_lsn_exclusive = s->validated_tail_lsn_exclusive;
 		s->recovered_last_record_lsn = s->tail_last_record_lsn;

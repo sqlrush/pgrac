@@ -317,7 +317,7 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
  * suite. Here it is the explicit authority seam for the real retention .o. */
 ClusterControlRootResult
 cluster_control_root_v3_read_retention_current(const ClusterControlRootIdentity *self,
-																				ClusterControlRootSnapshot *out,
+											   ClusterControlRootSnapshot *out,
 											   ClusterControlRootReadToken *token)
 {
 	memset(out, 0, sizeof(*out));
@@ -331,8 +331,8 @@ cluster_control_root_v3_read_retention_current(const ClusterControlRootIdentity 
 }
 
 ClusterControlRootResult
-cluster_control_root_v3_terminal_history_blocked(const ClusterControlRootIdentity *expected_identity,
-																		 bool *out_blocked)
+cluster_control_root_v3_terminal_history_blocked(
+	const ClusterControlRootIdentity *expected_identity, bool *out_blocked)
 {
 	(void)expected_identity;
 	if (out_blocked != NULL)
@@ -755,11 +755,11 @@ UT_TEST(test_v2_reuse_terminal_history_blocks_until_consumer_closes)
 	fake_terminal_history_blocked = true;
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &f.request, &needs, &reason),
-					 CLUSTER_WAL_GUARD_BLOCKED);
+				 CLUSTER_WAL_GUARD_BLOCKED);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_ROOT_REQUIRED);
 	UT_ASSERT_NULL(needs);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
-					 CLUSTER_WALR_RELEASE_NOT_HELD);
+				 CLUSTER_WALR_RELEASE_NOT_HELD);
 	UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_UNCHANGED);
 	v2_reuse_fixture_cleanup(&f);
 }

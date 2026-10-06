@@ -44,7 +44,7 @@
 #include "cluster/cluster_scn.h"	  /* SCN */
 #include "cluster/cluster_itl_slot.h" /* UBA */
 #include "cluster/cluster_tt_slot.h"
-#include "storage/itemptr.h"		  /* TransactionId */
+#include "storage/itemptr.h" /* TransactionId */
 
 typedef enum ClusterUndoDecodedKind {
 	CLUSTER_UNDO_KIND_SEGMENT_INIT = 0,
@@ -124,9 +124,9 @@ extern bool cluster_undo_preflight(const ClusterUndoDecoded *decoded);
  * source/target generation, isolation and durability; this is not authority.
  * Delta needs a nonzero-LSN base. No output change on refusal; base may equal
  * out. The returned block still requires the caller's write/fsync/post-read. */
-extern bool cluster_undo_prepare_block_v1(const ClusterUndoDecoded *decoded,
-										 const uint8 *payload, Size payload_length,
-										 XLogRecPtr replay_end, const char *base, char *out);
+extern bool cluster_undo_prepare_block_v1(const ClusterUndoDecoded *decoded, const uint8 *payload,
+										  Size payload_length, XLogRecPtr replay_end,
+										  const char *base, char *out);
 
 typedef enum ClusterUndoHeaderPrepareResultV1 {
 	CLUSTER_UNDO_HEADER_BLOCKED = 0,
@@ -147,9 +147,10 @@ cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *p
 
 /* The ordinary XACT COMMIT's folded exact TT delta uses the same native
  * generation/terminal decision. Only APPLY changes out. */
-extern ClusterUndoHeaderPrepareResultV1 cluster_undo_prepare_commit_v1(
-	uint8 instance, uint32 segment_id, uint32 generation, uint16 slot_offset,
-	uint16 wrap, TransactionId xid, SCN commit_scn, const char *base, char *out);
+extern ClusterUndoHeaderPrepareResultV1
+cluster_undo_prepare_commit_v1(uint8 instance, uint32 segment_id, uint32 generation,
+							   uint16 slot_offset, uint16 wrap, TransactionId xid, SCN commit_scn,
+							   const char *base, char *out);
 
 typedef enum ClusterUndoApplyResultV1 {
 	CLUSTER_UNDO_APPLY_OK = 0,

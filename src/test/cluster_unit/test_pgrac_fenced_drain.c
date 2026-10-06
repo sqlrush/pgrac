@@ -83,6 +83,8 @@ UT_TEST(test_complete_exact_set_and_reordered_evidence)
 	UT_ASSERT_EQ(out.io_drain_state, PGRAC_FENCED_IO_DRAIN_DRAINED);
 	UT_ASSERT(memcmp(out.observed_target_uuid, expected.guest_uuid, 16) == 0);
 	routes[0].ordinal = 3;
+	/* observed.routes aliases routes; drain_verify reads every ordinal. */
+	// cppcheck-suppress unreadVariable
 	routes[3].ordinal = 0;
 	UT_ASSERT_EQ(pgrac_fenced_drain_verify(&expected, &observed, &out), PGRAC_DRAIN_PROVEN);
 }
@@ -145,6 +147,8 @@ UT_TEST(test_empty_duplicate_missing_extra_and_unmapped_routes)
 	observed.route_count = 4;
 	routes[3].ordinal = 2;
 	expect_failure(&expected, &observed, PGRAC_DRAIN_MALFORMED);
+	/* The duplicate and unmapped ordinals reach expect_failure via observed.routes. */
+	// cppcheck-suppress [redundantAssignment,unreadVariable]
 	routes[3].ordinal = 4;
 	expect_failure(&expected, &observed, PGRAC_DRAIN_MALFORMED);
 	observed.routes = NULL;
@@ -164,7 +168,9 @@ UT_TEST(test_off_and_empty_sessions_do_not_substitute_for_drain)
 		expect_failure(&expected, &observed, PGRAC_DRAIN_INCOMPLETE);
 	}
 	fixture(&expected, &observed, routes);
+	/* expect_failure passes observed.routes to the real completion verifier. */
 	routes[2].completed
+		// cppcheck-suppress unreadVariable
 		= PGRAC_DRAIN_DENY_DURABLE | PGRAC_DRAIN_ADMISSION_DISABLED | PGRAC_DRAIN_SESSION_STOPPED;
 	expect_failure(&expected, &observed, PGRAC_DRAIN_INCOMPLETE);
 	observed.completed &= ~PGRAC_DRAIN_INVENTORY_COMPLETE;
@@ -191,6 +197,8 @@ UT_TEST(test_target_state_inventory_and_on_exclusion)
 	observed.completed = PGRAC_DRAIN_GLOBAL_COMPLETE | 4;
 	expect_failure(&expected, &observed, PGRAC_DRAIN_MALFORMED);
 	observed.completed = PGRAC_DRAIN_GLOBAL_COMPLETE;
+	/* The real drain verifier consumes this invalid route through observed.routes. */
+	// cppcheck-suppress unreadVariable
 	routes[1].completed |= 32;
 	expect_failure(&expected, &observed, PGRAC_DRAIN_MALFORMED);
 }

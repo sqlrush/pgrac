@@ -242,12 +242,13 @@ extern void cluster_voting_disk_io_set_timeout_ms(int timeout_ms);
  *	  CLUSTER_VOTING_DISK_IO_NOT_TRIED  caller set fd<0 (programming error)
  */
 /* Bounded contiguous reads preserve every slot's original validation. */
-extern void cluster_voting_disk_read_slots(int fd, int expected_disk_index,
-	uint32 first_node, uint32 count, ClusterVotingSlot *out, ClusterVotingDiskIoState *states);
-extern ClusterVotingDiskIoState cluster_voting_disk_read_join_slots(int fd,
-	uint32 first_node, uint32 count, void *out_slots);
-extern ClusterVotingDiskIoState cluster_voting_disk_read_formation_slots(int fd,
-	uint32 first_node, uint32 count, void *out_slots);
+extern void cluster_voting_disk_read_slots(int fd, int expected_disk_index, uint32 first_node,
+										   uint32 count, ClusterVotingSlot *out,
+										   ClusterVotingDiskIoState *states);
+extern ClusterVotingDiskIoState cluster_voting_disk_read_join_slots(int fd, uint32 first_node,
+																	uint32 count, void *out_slots);
+extern ClusterVotingDiskIoState
+cluster_voting_disk_read_formation_slots(int fd, uint32 first_node, uint32 count, void *out_slots);
 
 extern ClusterVotingDiskIoState cluster_voting_disk_read_slot(int fd, int expected_disk_index,
 															  uint32 node_id,

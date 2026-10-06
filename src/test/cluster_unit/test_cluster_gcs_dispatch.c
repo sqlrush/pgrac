@@ -974,8 +974,8 @@ run_holder_registration(uint8 final_status, PcmLockTransition transition_id, boo
 	{
 		ClusterICEnvelope env = { 0 };
 		GcsRequestPayload req = { 0 };
-		const PcmLockTransition denied[] = { PCM_TRANS_N_TO_X, PCM_TRANS_S_TO_X_UPGRADE,
-			PCM_TRANS_S_TO_X_CLEANOUT };
+		const PcmLockTransition denied[]
+			= { PCM_TRANS_N_TO_X, PCM_TRANS_S_TO_X_UPGRADE, PCM_TRANS_S_TO_X_CLEANOUT };
 
 		reset_control_fixture();
 		cluster_shared_config = true;

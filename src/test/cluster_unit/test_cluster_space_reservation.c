@@ -18,12 +18,12 @@ UT_DEFINE_GLOBALS();
 static ClusterSpaceReservation
 state(void)
 {
-	ClusterSpaceReservation s = {0};
+	ClusterSpaceReservation s = { 0 };
 
 	s.identity.key.system_identifier = 7;
 	s.identity.key.database_incarnation = 9;
 	memset(s.identity.key.storage_uuid, 0xa7, 16);
-	s.identity.key.locator = (RelFileLocator){DEFAULTTABLESPACE_OID, 5, 16384};
+	s.identity.key.locator = (RelFileLocator){ DEFAULTTABLESPACE_OID, 5, 16384 };
 	memset(s.identity.incarnation, 0x31, 16);
 	s.identity.sequence = 1;
 	s.identity.operation = 123;
@@ -34,7 +34,7 @@ state(void)
 static ClusterSpaceReservationChange
 advance(void)
 {
-	ClusterSpaceReservationChange c = {0};
+	ClusterSpaceReservationChange c = { 0 };
 
 	c.action = CLUSTER_SPACE_RESERVATION_ADVANCE;
 	c.before = state();
@@ -62,12 +62,12 @@ repair_crc(uint8 *bytes)
 
 UT_TEST(test_literal_unaligned_payload_and_wal)
 {
-	ClusterSpaceReservation s = state(), out = {0};
-	ClusterSpaceReservationChange c = advance(), decoded = {0};
-	uint8 bytes[CLUSTER_SPACE_RESERVATION_BYTES + 1] = {0};
-	uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES + 1] = {0};
+	ClusterSpaceReservation s = state(), out = { 0 };
+	ClusterSpaceReservationChange c = advance(), decoded = { 0 };
+	uint8 bytes[CLUSTER_SPACE_RESERVATION_BYTES + 1] = { 0 };
+	uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES + 1] = { 0 };
 	uint8 *p = bytes + 1;
-	const uint8 prefix[] = {'P', 'S', 'R', '1', 1, 0, 160, 0, 2, 0, 0, 0};
+	const uint8 prefix[] = { 'P', 'S', 'R', '1', 1, 0, 160, 0, 2, 0, 0, 0 };
 
 	s.next_block = 0x12345678;
 	UT_ASSERT(cluster_space_reservation_encode(&s, p, sizeof(bytes) - 1));
@@ -91,9 +91,9 @@ UT_TEST(test_literal_unaligned_payload_and_wal)
 UT_TEST(test_crc_reserved_namespace_and_refusal_atomicity)
 {
 	ClusterSpaceReservation s = state(), out, sentinel;
-	uint8 valid[CLUSTER_SPACE_RESERVATION_BYTES] = {0}, broken[CLUSTER_SPACE_RESERVATION_BYTES];
+	uint8 valid[CLUSTER_SPACE_RESERVATION_BYTES] = { 0 }, broken[CLUSTER_SPACE_RESERVATION_BYTES];
 	ClusterSpaceIdentityKey wrong;
-	const int offsets[] = {8, 12, 20, 152};
+	const int offsets[] = { 8, 12, 20, 152 };
 
 	memset(&sentinel, 0xa5, sizeof(sentinel));
 	UT_ASSERT(cluster_space_reservation_encode(&s, valid, sizeof(valid)));
@@ -125,8 +125,8 @@ UT_TEST(test_crc_reserved_namespace_and_refusal_atomicity)
 
 UT_TEST(test_exact_page_class_and_header)
 {
-	ClusterSpaceReservation s = state(), out = {0};
-	PGAlignedBlock page = {0}, bad;
+	ClusterSpaceReservation s = state(), out = { 0 };
+	PGAlignedBlock page = { 0 }, bad;
 	uint64 token = 99;
 
 	UT_ASSERT(cluster_space_reservation_page_encode(&s, 201, page.data, BLCKSZ));
@@ -134,12 +134,12 @@ UT_TEST(test_exact_page_class_and_header)
 	UT_ASSERT(cluster_space_reservation_page_valid(page.data, BLCKSZ));
 	UT_ASSERT(!cluster_space_identity_page_valid(page.data, BLCKSZ));
 	UT_ASSERT(cluster_space_reservation_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 1,
-		&s.identity.key, &out, &token));
+													&s.identity.key, &out, &token));
 	UT_ASSERT_EQ(token, 201);
 	UT_ASSERT(!cluster_space_reservation_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
-		&s.identity.key, &out, &token));
+													 &s.identity.key, &out, &token));
 	UT_ASSERT(!cluster_space_reservation_page_decode(page.data, BLCKSZ, MAIN_FORKNUM, 1,
-		&s.identity.key, &out, &token));
+													 &s.identity.key, &out, &token));
 	bad = page;
 	bad.data[BLCKSZ - 1] = 1;
 	UT_ASSERT(!cluster_space_reservation_page_valid(bad.data, BLCKSZ));
@@ -152,8 +152,8 @@ UT_TEST(test_exact_page_class_and_header)
 
 UT_TEST(test_init_advance_and_exact_idempotence)
 {
-	ClusterSpaceReservationChange c = {0};
-	ClusterSpaceReservation out = {0};
+	ClusterSpaceReservationChange c = { 0 };
+	ClusterSpaceReservation out = { 0 };
 	PGAlignedBlock page, saved;
 	uint64 token = 0;
 
@@ -162,22 +162,22 @@ UT_TEST(test_init_advance_and_exact_idempotence)
 	c.result_token = 17;
 	memset(page.data, 0, BLCKSZ);
 	UT_ASSERT_EQ(cluster_space_reservation_apply(&c, &c.result.identity.key, page.data, BLCKSZ),
-		CLUSTER_SPACE_IDENTITY_APPLY);
+				 CLUSTER_SPACE_IDENTITY_APPLY);
 	saved = page;
 	UT_ASSERT_EQ(cluster_space_reservation_apply(&c, &c.result.identity.key, page.data, BLCKSZ),
-		CLUSTER_SPACE_IDENTITY_ALREADY);
+				 CLUSTER_SPACE_IDENTITY_ALREADY);
 	UT_ASSERT(memcmp(page.data, saved.data, BLCKSZ) == 0);
 	c = advance();
 	UT_ASSERT(cluster_space_reservation_page_encode(&c.before, c.before_token, page.data, BLCKSZ));
 	UT_ASSERT_EQ(cluster_space_reservation_apply(&c, &c.result.identity.key, page.data, BLCKSZ),
-		CLUSTER_SPACE_IDENTITY_APPLY);
+				 CLUSTER_SPACE_IDENTITY_APPLY);
 	UT_ASSERT(cluster_space_reservation_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 1,
-		&c.result.identity.key, &out, &token));
+													&c.result.identity.key, &out, &token));
 	UT_ASSERT_EQ(token, c.result_token);
 	UT_ASSERT_EQ(out.next_block, 18);
 	saved = page;
 	UT_ASSERT_EQ(cluster_space_reservation_apply(&c, &c.result.identity.key, page.data, BLCKSZ),
-		CLUSTER_SPACE_IDENTITY_ALREADY);
+				 CLUSTER_SPACE_IDENTITY_ALREADY);
 	UT_ASSERT(memcmp(page.data, saved.data, BLCKSZ) == 0);
 }
 
@@ -185,29 +185,36 @@ UT_TEST(test_same_token_wrong_bytes_and_numeric_larger_are_not_proof)
 {
 	ClusterSpaceReservationChange c = advance();
 	ClusterSpaceReservation bad;
-	PGAlignedBlock page = {0}, saved;
+	PGAlignedBlock page = { 0 }, saved;
 
 	for (int variant = 0; variant < 4; variant++) {
 		uint64 token = c.result_token;
 
 		bad = c.result;
-		if (variant == 0) bad.next_block++;
-		if (variant == 1) bad.identity.incarnation[0]++;
-		if (variant == 2) token = 9000;
-		if (variant == 3) { bad = c.before; bad.next_block--; token = c.before_token; }
+		if (variant == 0)
+			bad.next_block++;
+		if (variant == 1)
+			bad.identity.incarnation[0]++;
+		if (variant == 2)
+			token = 9000;
+		if (variant == 3) {
+			bad = c.before;
+			bad.next_block--;
+			token = c.before_token;
+		}
 		UT_ASSERT(cluster_space_reservation_page_encode(&bad, token, page.data, BLCKSZ));
 		saved = page;
 		UT_ASSERT_EQ(cluster_space_reservation_apply(&c, &c.result.identity.key, page.data, BLCKSZ),
-			CLUSTER_SPACE_IDENTITY_MISMATCH);
+					 CLUSTER_SPACE_IDENTITY_MISMATCH);
 		UT_ASSERT(memcmp(page.data, saved.data, BLCKSZ) == 0);
 	}
 }
 
 UT_TEST(test_exhaustion_overflow_and_structural_identity)
 {
-	ClusterSpaceReservationChange c = advance(), decoded = {0};
-	uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES] = {0};
-	PGAlignedBlock page = {0};
+	ClusterSpaceReservationChange c = advance(), decoded = { 0 };
+	uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES] = { 0 };
+	PGAlignedBlock page = { 0 };
 
 	c.before.next_block = c.first_block = MaxBlockNumber;
 	c.granted = 1;
@@ -226,7 +233,7 @@ UT_TEST(test_exhaustion_overflow_and_structural_identity)
 	memset(c.result.identity.incarnation, 0x42, 16);
 	UT_ASSERT(cluster_space_reservation_page_encode(&c.before, c.before_token, page.data, BLCKSZ));
 	UT_ASSERT_EQ(cluster_space_reservation_apply(&c, &c.result.identity.key, page.data, BLCKSZ),
-		CLUSTER_SPACE_IDENTITY_APPLY);
+				 CLUSTER_SPACE_IDENTITY_APPLY);
 	memcpy(c.result.identity.incarnation, c.before.identity.incarnation, 16);
 	UT_ASSERT(!cluster_space_reservation_wal_encode(&c, wal, sizeof(wal)));
 	c = advance();
@@ -238,7 +245,7 @@ UT_TEST(test_exhaustion_overflow_and_structural_identity)
 	c.result.identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
 	UT_ASSERT(cluster_space_reservation_page_encode(&c.before, c.before_token, page.data, BLCKSZ));
 	UT_ASSERT_EQ(cluster_space_reservation_apply(&c, &c.result.identity.key, page.data, BLCKSZ),
-		CLUSTER_SPACE_IDENTITY_APPLY);
+				 CLUSTER_SPACE_IDENTITY_APPLY);
 	c = advance();
 	c.before.identity.state = c.result.identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
 	UT_ASSERT(!cluster_space_reservation_wal_encode(&c, wal, sizeof(wal)));
@@ -248,10 +255,10 @@ UT_TEST(test_wal_and_page_refusals_preserve_outputs)
 {
 	ClusterSpaceReservationChange c = advance(), out, sentinel;
 	ClusterSpaceReservation decoded, saved;
-	uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES] = {0};
+	uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES] = { 0 };
 	uint8 broken[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
-	const unsigned offsets[] = {0, 4, 6, 8, 12, 16, 20, 40, 48, 207, 208, 367};
-	PGAlignedBlock page = {0};
+	const unsigned offsets[] = { 0, 4, 6, 8, 12, 16, 20, 40, 48, 207, 208, 367 };
+	PGAlignedBlock page = { 0 };
 	uint64 token = 99;
 
 	memset(&sentinel, 0xa5, sizeof(sentinel));
@@ -268,7 +275,7 @@ UT_TEST(test_wal_and_page_refusals_preserve_outputs)
 	page.data[BLCKSZ - 1] = 1;
 	decoded = saved;
 	UT_ASSERT(!cluster_space_reservation_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 1,
-		&c.before.identity.key, &decoded, &token));
+													 &c.before.identity.key, &decoded, &token));
 	UT_ASSERT(memcmp(&decoded, &saved, sizeof(decoded)) == 0);
 	UT_ASSERT_EQ(token, 99);
 	memset(&c, 0, sizeof(c));
@@ -285,13 +292,14 @@ UT_TEST(test_wal_and_page_refusals_preserve_outputs)
 static ClusterSpaceStructureChange
 structure(bool create)
 {
-	ClusterSpaceStructureChange c = {0};
+	ClusterSpaceStructureChange c = { 0 };
 
 	c.identity.action = create ? CLUSTER_SPACE_WAL_CREATE : CLUSTER_SPACE_WAL_TRUNCATE;
 	c.identity.nblocks = create ? InvalidBlockNumber : 4;
 	c.identity.result = state().identity;
 	c.identity.result_token = 211;
-	c.reservation.action = create ? CLUSTER_SPACE_RESERVATION_INIT : CLUSTER_SPACE_RESERVATION_RESET;
+	c.reservation.action
+		= create ? CLUSTER_SPACE_RESERVATION_INIT : CLUSTER_SPACE_RESERVATION_RESET;
 	c.reservation.result_token = 211;
 	if (!create) {
 		c.identity.expected = c.identity.result;
@@ -310,8 +318,8 @@ structure(bool create)
 
 UT_TEST(test_structural_record_binds_both_identities_and_actions)
 {
-	ClusterSpaceStructureChange c = structure(true), out = {0};
-	uint8 bytes[CLUSTER_SPACE_STRUCTURE_WAL_BYTES] = {0};
+	ClusterSpaceStructureChange c = structure(true), out = { 0 };
+	uint8 bytes[CLUSTER_SPACE_STRUCTURE_WAL_BYTES] = { 0 };
 	uint8 saved[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 
 	UT_ASSERT(cluster_space_structure_wal_encode(&c, bytes, sizeof(bytes)));
@@ -329,7 +337,7 @@ UT_TEST(test_structural_record_binds_both_identities_and_actions)
 	c.reservation.result.identity.incarnation[1]++;
 	/* Both subrecords are independently valid; their combined identity is not. */
 	UT_ASSERT(cluster_space_reservation_wal_encode(&c.reservation, bytes + CLUSTER_SPACE_WAL_BYTES,
-		CLUSTER_SPACE_RESERVATION_WAL_BYTES));
+												   CLUSTER_SPACE_RESERVATION_WAL_BYTES));
 	memset(&out, 0xa5, sizeof(out));
 	c = out;
 	UT_ASSERT(!cluster_space_structure_wal_decode(bytes, sizeof(bytes), &out));
@@ -342,45 +350,53 @@ UT_TEST(test_structural_record_binds_both_identities_and_actions)
 UT_TEST(test_structural_preflight_never_partially_changes_outputs)
 {
 	ClusterSpaceStructureChange c = structure(false);
-	PGAlignedBlock pages[2] = {{0}}, saved[2];
+	PGAlignedBlock pages[2] = { { 0 } }, saved[2];
 	uint8 mask = 55;
 
 	UT_ASSERT(cluster_space_identity_page_encode(&c.identity.expected, c.identity.before_token,
-		pages[0].data, BLCKSZ));
-	UT_ASSERT(cluster_space_reservation_page_encode(&c.reservation.before, 123, pages[1].data, BLCKSZ));
+												 pages[0].data, BLCKSZ));
+	UT_ASSERT(
+		cluster_space_reservation_page_encode(&c.reservation.before, 123, pages[1].data, BLCKSZ));
 	memcpy(saved, pages, sizeof(pages));
 	UT_ASSERT_EQ(cluster_space_structure_apply(&c, &c.identity.result.key, pages[0].data,
-		pages[1].data, BLCKSZ, &mask), CLUSTER_SPACE_IDENTITY_MISMATCH);
+											   pages[1].data, BLCKSZ, &mask),
+				 CLUSTER_SPACE_IDENTITY_MISMATCH);
 	UT_ASSERT(memcmp(saved, pages, sizeof(pages)) == 0);
 	UT_ASSERT_EQ(mask, 55);
 	UT_ASSERT_EQ(cluster_space_structure_apply(&c, &c.identity.result.key, pages[0].data,
-		pages[0].data, BLCKSZ, &mask), CLUSTER_SPACE_IDENTITY_INVALID);
+											   pages[0].data, BLCKSZ, &mask),
+				 CLUSTER_SPACE_IDENTITY_INVALID);
 	UT_ASSERT(memcmp(saved, pages, sizeof(pages)) == 0);
 }
 
 UT_TEST(test_structural_partial_restart_and_init)
 {
 	ClusterSpaceStructureChange c = structure(true);
-	PGAlignedBlock pages[2] = {{0}};
+	PGAlignedBlock pages[2] = { { 0 } };
 	uint8 mask = 0;
 
 	UT_ASSERT_EQ(cluster_space_structure_apply(&c, &c.identity.result.key, pages[0].data,
-		pages[1].data, BLCKSZ, &mask), CLUSTER_SPACE_IDENTITY_APPLY);
+											   pages[1].data, BLCKSZ, &mask),
+				 CLUSTER_SPACE_IDENTITY_APPLY);
 	UT_ASSERT_EQ(mask, 3);
 	UT_ASSERT_EQ(cluster_space_structure_apply(&c, &c.identity.result.key, pages[0].data,
-		pages[1].data, BLCKSZ, &mask), CLUSTER_SPACE_IDENTITY_ALREADY);
+											   pages[1].data, BLCKSZ, &mask),
+				 CLUSTER_SPACE_IDENTITY_ALREADY);
 	UT_ASSERT_EQ(mask, 0);
 	c = structure(false);
 	for (unsigned installed = 0; installed < 4; installed++) {
 		UT_ASSERT(cluster_space_identity_page_encode(
 			installed & 1 ? &c.identity.result : &c.identity.expected,
-			installed & 1 ? c.identity.result_token : c.identity.before_token, pages[0].data, BLCKSZ));
+			installed & 1 ? c.identity.result_token : c.identity.before_token, pages[0].data,
+			BLCKSZ));
 		UT_ASSERT(cluster_space_reservation_page_encode(
 			installed & 2 ? &c.reservation.result : &c.reservation.before,
-			installed & 2 ? c.reservation.result_token : c.reservation.before_token, pages[1].data, BLCKSZ));
+			installed & 2 ? c.reservation.result_token : c.reservation.before_token, pages[1].data,
+			BLCKSZ));
 		UT_ASSERT_EQ(cluster_space_structure_apply(&c, &c.identity.result.key, pages[0].data,
-			pages[1].data, BLCKSZ, &mask),
-			installed == 3 ? CLUSTER_SPACE_IDENTITY_ALREADY : CLUSTER_SPACE_IDENTITY_APPLY);
+												   pages[1].data, BLCKSZ, &mask),
+					 installed == 3 ? CLUSTER_SPACE_IDENTITY_ALREADY
+									: CLUSTER_SPACE_IDENTITY_APPLY);
 		UT_ASSERT_EQ(mask, 3 ^ installed);
 	}
 }
@@ -396,9 +412,9 @@ typedef struct RecoveryFixture {
 static void
 recovery_fixture(RecoveryFixture *f)
 {
-	const uint64 tokens[] = {901, 80, 1200, 55, 12};
+	const uint64 tokens[] = { 901, 80, 1200, 55, 12 };
 	uint64 identity_token = 0;
-	const uint32 permutation[] = {2, 4, 1, 3, 0};
+	const uint32 permutation[] = { 2, 4, 1, 3, 0 };
 
 	memset(f, 0, sizeof(*f));
 	for (uint32 i = 0; i < 5; i++) {
@@ -450,7 +466,7 @@ recovery_fixture(RecoveryFixture *f)
 			len = CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
 			if (!cluster_space_structure_wal_encode(&both, f->wal[i], len)
 				|| !cluster_space_identity_page_encode(&id->result, identity_token,
-					f->pages[i + 1][0].data, BLCKSZ))
+													   f->pages[i + 1][0].data, BLCKSZ))
 				abort();
 		} else {
 			len = CLUSTER_SPACE_RESERVATION_WAL_BYTES;
@@ -458,27 +474,27 @@ recovery_fixture(RecoveryFixture *f)
 				abort();
 		}
 		if (!cluster_space_reservation_page_encode(&c->result, c->result_token,
-			f->pages[i + 1][1].data, BLCKSZ))
+												   f->pages[i + 1][1].data, BLCKSZ))
 			abort();
 		for (uint32 j = 0; j < 5; j++)
 			if (permutation[j] == i)
-				f->input[j] = (ClusterSpaceRecoveryInput){f->wal[i], len};
+				f->input[j] = (ClusterSpaceRecoveryInput){ f->wal[i], len };
 	}
 }
 
 UT_TEST(test_recovery_closed_chain_and_independent_partial_pages)
 {
 	RecoveryFixture f;
-	const uint32 expected_order[] = {4, 2, 0, 3, 1};
-	ClusterSpaceRecoveryImage out = {0};
-	uint32 order[5] = {0};
+	const uint32 expected_order[] = { 4, 2, 0, 3, 1 };
+	ClusterSpaceRecoveryImage out = { 0 };
+	uint32 order[5] = { 0 };
 
 	recovery_fixture(&f);
 	for (int id = 0; id < 6; id++)
 		for (int reservation = 0; reservation < 6; reservation++) {
-			UT_ASSERT(cluster_space_recovery_prepare(f.input, 5,
-				&f.changes[0].result.identity.key, f.pages[id][0].data,
-				f.pages[reservation][1].data, order, &out));
+			UT_ASSERT(cluster_space_recovery_prepare(f.input, 5, &f.changes[0].result.identity.key,
+													 f.pages[id][0].data,
+													 f.pages[reservation][1].data, order, &out));
 			UT_ASSERT(memcmp(order, expected_order, sizeof(order)) == 0);
 			UT_ASSERT(memcmp(out.pages, f.pages[5], sizeof(out.pages)) == 0);
 			UT_ASSERT_EQ(out.apply_mask, (id == 5 ? 0 : 1) | (reservation == 5 ? 0 : 2));
@@ -501,21 +517,30 @@ UT_TEST(test_recovery_missing_duplicate_fork_and_cycle_refuse)
 		uint32 count = 5;
 
 		recovery_fixture(&f);
-		if (variant == 0) { f.input[0] = f.input[4]; count = 4; } /* missing RESET */
-		if (variant == 1) f.input[0] = f.input[1]; /* duplicate */
+		if (variant == 0) {
+			f.input[0] = f.input[4];
+			count = 4;
+		} /* missing RESET */
+		if (variant == 1)
+			f.input[0] = f.input[1]; /* duplicate */
 		if (variant >= 2) {
 			extra = f.changes[1];
-			if (variant == 2) extra.result_token = 999; /* same before: fork */
-			if (variant == 3) { extra.before_token = 12; extra.result_token = 901; } /* cycle */
-			if (variant == 4) extra.result_token = 1200; /* same result: merge */
+			if (variant == 2)
+				extra.result_token = 999; /* same before: fork */
+			if (variant == 3) {
+				extra.before_token = 12;
+				extra.result_token = 901;
+			} /* cycle */
+			if (variant == 4)
+				extra.result_token = 1200; /* same result: merge */
 			UT_ASSERT(cluster_space_reservation_wal_encode(&extra, wal, sizeof(wal)));
-			f.input[4] = (ClusterSpaceRecoveryInput){wal, sizeof(wal)};
+			f.input[4] = (ClusterSpaceRecoveryInput){ wal, sizeof(wal) };
 		}
 		out = saved;
 		memcpy(order, saved_order, sizeof(order));
-		UT_ASSERT(!cluster_space_recovery_prepare(f.input, count,
-			&f.changes[0].result.identity.key, f.pages[1][0].data,
-			f.pages[1][1].data, order, &out));
+		UT_ASSERT(!cluster_space_recovery_prepare(f.input, count, &f.changes[0].result.identity.key,
+												  f.pages[1][0].data, f.pages[1][1].data, order,
+												  &out));
 		UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
 		UT_ASSERT(memcmp(order, saved_order, sizeof(order)) == 0);
 	}
@@ -538,22 +563,27 @@ UT_TEST(test_recovery_unknown_target_and_namespace_preserve_outputs)
 		key = f.changes[0].result.identity.key;
 		memcpy(target, f.pages[3], sizeof(target));
 		wrong = f.changes[2].result;
-		if (variant == 0) key.database_incarnation++;
-		if (variant == 1) ((PageHeader)target[1].data)->pd_block_scn = UINT64_MAX;
+		if (variant == 0)
+			key.database_incarnation++;
+		if (variant == 1)
+			((PageHeader)target[1].data)->pd_block_scn = UINT64_MAX;
 		if (variant == 2) {
 			wrong.next_block++;
 			UT_ASSERT(cluster_space_reservation_page_encode(&wrong, 1200, target[1].data, BLCKSZ));
 		}
 		if (variant == 3) {
 			wrong.identity.operation++;
-			UT_ASSERT(cluster_space_identity_page_encode(&wrong.identity, 1200, target[0].data, BLCKSZ));
+			UT_ASSERT(
+				cluster_space_identity_page_encode(&wrong.identity, 1200, target[0].data, BLCKSZ));
 		}
-		if (variant == 4) target[1].data[BLCKSZ - 1] = 1;
-		if (variant == 5) f.wal[1][8] = CLUSTER_SPACE_RESERVATION_INIT;
+		if (variant == 4)
+			target[1].data[BLCKSZ - 1] = 1;
+		if (variant == 5)
+			f.wal[1][8] = CLUSTER_SPACE_RESERVATION_INIT;
 		out = saved;
 		memcpy(order, saved_order, sizeof(order));
-		UT_ASSERT(!cluster_space_recovery_prepare(f.input, 5, &key,
-			target[0].data, target[1].data, order, &out));
+		UT_ASSERT(!cluster_space_recovery_prepare(f.input, 5, &key, target[0].data, target[1].data,
+												  order, &out));
 		UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
 		UT_ASSERT(memcmp(order, saved_order, sizeof(order)) == 0);
 	}
@@ -571,18 +601,17 @@ UT_TEST(test_recovery_advance_suffix_preserves_unchanged_identity)
 	((PageHeader)identity.data)->pd_block_scn = 8001;
 	PageXLogRecPtrSet(((PageHeader)identity.data)->pd_lsn, UINT64_C(0x9000));
 	for (int target = 1; target <= 2; target++) {
-		UT_ASSERT(cluster_space_recovery_prepare(&f.input[2], 1,
-			&f.changes[0].result.identity.key, identity.data,
-			f.pages[target][1].data, order, &out));
+		UT_ASSERT(cluster_space_recovery_prepare(&f.input[2], 1, &f.changes[0].result.identity.key,
+												 identity.data, f.pages[target][1].data, order,
+												 &out));
 		UT_ASSERT(memcmp(out.pages[0].data, identity.data, BLCKSZ) == 0);
 		UT_ASSERT(memcmp(out.pages[1].data, f.pages[2][1].data, BLCKSZ) == 0);
 		UT_ASSERT_EQ(out.source_index[0], UINT32_MAX);
 		UT_ASSERT_EQ(out.source_index[1], 0);
 		UT_ASSERT_EQ(out.apply_mask, target == 2 ? 0 : 2);
 	}
-	UT_ASSERT(!cluster_space_recovery_prepare(&f.input[2], 1,
-		&f.changes[0].result.identity.key, f.pages[3][0].data,
-		f.pages[1][1].data, order, &out));
+	UT_ASSERT(!cluster_space_recovery_prepare(&f.input[2], 1, &f.changes[0].result.identity.key,
+											  f.pages[3][0].data, f.pages[1][1].data, order, &out));
 }
 
 UT_TEST(test_recovery_requires_both_typed_before_chains)
@@ -598,14 +627,14 @@ UT_TEST(test_recovery_requires_both_typed_before_chains)
 	wrong.identity.before_token = 777;
 	UT_ASSERT(cluster_space_structure_wal_encode(&wrong, f.wal[2], sizeof(f.wal[2])));
 	UT_ASSERT(!cluster_space_recovery_prepare(f.input, 5, &wrong.identity.result.key,
-		f.pages[1][0].data, f.pages[1][1].data, order, &out));
+											  f.pages[1][0].data, f.pages[1][1].data, order, &out));
 	recovery_fixture(&f);
 	wrong.identity = f.identities[2];
 	wrong.reservation = f.changes[2];
 	wrong.reservation.before.next_block++;
 	UT_ASSERT(cluster_space_structure_wal_encode(&wrong, f.wal[2], sizeof(f.wal[2])));
 	UT_ASSERT(!cluster_space_recovery_prepare(f.input, 5, &wrong.identity.result.key,
-		f.pages[1][0].data, f.pages[1][1].data, order, &out));
+											  f.pages[1][0].data, f.pages[1][1].data, order, &out));
 }
 
 UT_TEST(test_source_order_never_needs_or_certifies_target_pages)

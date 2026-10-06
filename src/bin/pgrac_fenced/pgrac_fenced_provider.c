@@ -458,6 +458,17 @@ execution_config_matches(const PgracFencedProviderOpsV1 *ops, const PgracFencedT
 		   && memcmp(record->intent.protected_set_digest, node->protected_set_digest, 32) == 0;
 }
 
+/* Both sides establish the group to close the fork scheduling race.  A
+ * redundant setpgid can report EPERM on Darwin even after the other side
+ * established it.  Accept only the exact group in the pre-fork session;
+ * the result frame, exit status and group cleanup are still checked below.
+ */
+static bool
+worker_group_already_exact(pid_t pid, pid_t session)
+{
+	return session > 0 && getpgid(pid) == pid && getsid(pid) == session;
+}
+
 static PgracFencedProviderWorkerResult
 run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only, uint32 call_type,
 		   bool turn_on, const PgracFencedTargetV1 *target,
@@ -474,17 +485,22 @@ run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only, uint32 cal
 	bool group_clean;
 	pid_t pid;
 	pid_t waited;
+	pid_t session;
 
 	if (message == NULL)
 		return PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE;
 	memset(message, 0, sizeof(*message));
 	message->provider_result = PGRAC_FENCED_PROVIDER_UNAVAILABLE;
+	session = getsid(0);
 	if (!pgrac_fenced_provider_ops_valid(ops, allow_test_only) || !target_valid(target)
 		|| !execution_record_matches(ops, call_type, turn_on, target, record)
 		|| !execution_config_matches(ops, target, record, config, config_digest)
 		|| (call_type != PGRAC_FENCED_WORKER_ACTUATE && call_type != PGRAC_FENCED_WORKER_READBACK
 			&& call_type != PGRAC_FENCED_WORKER_RESOLVE)
-		|| !monotonic_now_ns(&now) || now >= deadline_mono_ns || !process_group_owner_prepare()
+		|| session <= 0 || !monotonic_now_ns(&now) || now >= deadline_mono_ns
+		/* Linux prctl can fail; the non-Linux implementation has no such setup. */
+		// cppcheck-suppress knownConditionTrueFalse
+		|| !process_group_owner_prepare()
 		|| pipe(pipe_fds) != 0)
 		return PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE;
 	(void) fcntl(pipe_fds[0], F_SETFD, FD_CLOEXEC);
@@ -504,7 +520,8 @@ run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only, uint32 cal
 		PgracFencedJournalRecordV1 child_record;
 
 		(void) close(pipe_fds[0]);
-		if (setpgid(0, 0) != 0)
+		if (setpgid(0, 0) != 0
+			&& !(errno == EPERM && worker_group_already_exact(getpid(), session)))
 			_exit(125);
 		memset(&child_message, 0, sizeof(child_message));
 		memset(&child_resolved, 0, sizeof(child_resolved));
@@ -558,7 +575,8 @@ run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only, uint32 cal
 	}
 	(void) close(pipe_fds[1]);
 	pipe_fds[1] = -1;
-	if (setpgid(pid, pid) != 0 && errno != EACCES && errno != ESRCH)
+	if (setpgid(pid, pid) != 0 && errno != EACCES && errno != ESRCH
+		&& !(errno == EPERM && worker_group_already_exact(pid, session)))
 	{
 		(void) close(pipe_fds[0]);
 		(void) wait_worker_exit(pid, false);
@@ -758,11 +776,8 @@ pgrac_fenced_provider_worker_readback_retry_owned(
 	const uint8 config_digest[32], uint64_t deadline_mono_ns, PgracFencedProviderResult *result,
 	PgracFencedReadbackV1 *readback)
 {
-	PgracFencedProviderWorkerResult worker_result;
 	struct timespec delay;
 	uint64_t delay_ms = 100;
-	uint64_t delay_ns;
-	uint64_t remaining_ns;
 	uint64_t now;
 
 	if (result == NULL || readback == NULL)
@@ -770,6 +785,10 @@ pgrac_fenced_provider_worker_readback_retry_owned(
 														   config, config_digest, deadline_mono_ns,
 														   result, readback);
 	for (;;) {
+		PgracFencedProviderWorkerResult worker_result;
+		uint64_t delay_ns;
+		uint64_t remaining_ns;
+
 		worker_result = pgrac_fenced_provider_worker_readback_owned(
 			ops, allow_test_only, target, record, config, config_digest, deadline_mono_ns, result,
 			readback);

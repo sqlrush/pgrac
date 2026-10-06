@@ -547,9 +547,8 @@ cluster_undo_horizon_read_admission_enforce(SCN read_scn)
 		= UndoHorizonShmem == NULL ? 0 : pg_atomic_read_u64(&UndoHorizonShmem->self_admitted_epoch);
 	if (admitted == 0)
 		refuse_reason = "self admission epoch is not published";
-	else if (cluster_snapshot_read_evidence_v1(read_scn, &snap, &retained_floor,
-											 &refuse_reason) &&
-			 snap->read_epoch < admitted - 1)
+	else if (cluster_snapshot_read_evidence_v1(read_scn, &snap, &retained_floor, &refuse_reason)
+			 && snap->read_epoch < admitted - 1)
 		refuse_reason = "snapshot epoch predates self admission epoch";
 
 	if (refuse_reason != NULL) {
@@ -565,8 +564,8 @@ cluster_undo_horizon_read_admission_enforce(SCN read_scn)
 						   " snapshot=%p retained_floor=" UINT64_FORMAT,
 						   refuse_reason, admitted == 0 ? 0 : admitted - 1,
 						   snap == NULL ? 0 : snap->read_epoch, cluster_epoch_get_current(),
-						   (uint64)read_scn, snap == NULL ? 0 : (uint64)snap->read_scn,
-						   snap, (uint64)retained_floor),
+						   (uint64)read_scn, snap == NULL ? 0 : (uint64)snap->read_scn, snap,
+						   (uint64)retained_floor),
 				 errhint("Take a new snapshot (new statement or transaction) after the "
 						 "join completed and retry.")));
 	}

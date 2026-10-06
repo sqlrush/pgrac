@@ -20,7 +20,7 @@ int pg_dir_create_mode = S_IRWXU;
 static int allowed_origin;
 static unsigned syncs;
 static bool sync_fail;
-static char root[MAXPGPATH], native[MAXPGPATH], origin[MAXPGPATH], leaf[MAXPGPATH];
+static char root[MAXPGPATH], native[MAXPGPATH], origin_dir[MAXPGPATH], leaf[MAXPGPATH];
 static SlruCtlData control;
 
 void
@@ -60,9 +60,9 @@ setup(void)
 	strlcpy(root, created, sizeof(root));
 	/* A canonical route longer than the old 64-byte SLRU field. */
 	snprintf(native, sizeof(native), "%s/native_side", root);
-	snprintf(origin, sizeof(origin), "%s/origin_127", native);
-	snprintf(leaf, sizeof(leaf), "%s/pg_xact_remote_v2", origin);
-	if (mkdir(native, 0700) != 0 || mkdir(origin, 0700) != 0)
+	snprintf(origin_dir, sizeof(origin_dir), "%s/origin_127", native);
+	snprintf(leaf, sizeof(leaf), "%s/pg_xact_remote_v2", origin_dir);
+	if (mkdir(native, 0700) != 0 || mkdir(origin_dir, 0700) != 0)
 		abort();
 	memset(&control, 0, sizeof(control));
 	strlcpy(control.Dir, leaf, sizeof(control.Dir));
@@ -83,7 +83,7 @@ cleanup(void)
 		else
 			UT_ASSERT_EQ(rmdir(leaf), 0);
 	}
-	UT_ASSERT_EQ(rmdir(origin), 0);
+	UT_ASSERT_EQ(rmdir(origin_dir), 0);
 	UT_ASSERT_EQ(rmdir(native), 0);
 	UT_ASSERT_EQ(rmdir(root), 0);
 }
@@ -128,7 +128,7 @@ UT_TEST(path_origin_and_symlink_mismatch_never_redirect)
 	setup();
 	allowed_origin = 127;
 	UT_ASSERT(!remote_xact_directory_ready(&control, 1, true));
-	UT_ASSERT_EQ(symlink(origin, leaf), 0);
+	UT_ASSERT_EQ(symlink(origin_dir, leaf), 0);
 	UT_ASSERT(!remote_xact_directory_ready(&control, 127, true));
 	UT_ASSERT(!remote_xact_directory_ready(&control, 127, false));
 	UT_ASSERT_EQ(syncs, 0);
@@ -139,14 +139,14 @@ UT_TEST(missing_or_writable_native_origin_is_not_adopted)
 {
 	setup();
 	allowed_origin = 127;
-	UT_ASSERT_EQ(chmod(origin, 0770), 0);
+	UT_ASSERT_EQ(chmod(origin_dir, 0770), 0);
 	UT_ASSERT(!remote_xact_directory_ready(&control, 127, true));
 	UT_ASSERT_EQ(syncs, 0);
-	UT_ASSERT_EQ(chmod(origin, 0700), 0);
-	UT_ASSERT_EQ(rmdir(origin), 0);
+	UT_ASSERT_EQ(chmod(origin_dir, 0700), 0);
+	UT_ASSERT_EQ(rmdir(origin_dir), 0);
 	UT_ASSERT(!remote_xact_directory_ready(&control, 127, true));
 	UT_ASSERT_EQ(syncs, 0);
-	UT_ASSERT_EQ(mkdir(origin, 0700), 0);
+	UT_ASSERT_EQ(mkdir(origin_dir, 0700), 0);
 	cleanup();
 }
 

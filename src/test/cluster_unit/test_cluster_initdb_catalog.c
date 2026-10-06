@@ -17,30 +17,42 @@ static ControlFileData control;
 static ClusterCatalogInitialInput input;
 static uint8 clog_bytes[BLCKSZ];
 static unsigned io_fault;
-static const char *const names[] = {
-	"pgrac_oid_authority", "pgrac_catalog_authority",
-	"pgrac_xid_authority", "pgrac_xid_authority.bak",
-	"pgrac_xid_prehistory", "pgrac_xid_prehistory.bak"
-};
+static const char *const names[]
+	= { "pgrac_oid_authority",	   "pgrac_catalog_authority", "pgrac_xid_authority",
+		"pgrac_xid_authority.bak", "pgrac_xid_prehistory",	  "pgrac_xid_prehistory.bak" };
 
-void ExceptionalCondition(const char *condition, const char *file, int line) { abort(); }
+void
+ExceptionalCondition(const char *condition, const char *file, int line)
+{
+	abort();
+}
 
-static ssize_t test_pread(int fd, void *bytes, size_t length, off_t offset)
+static ssize_t
+test_pread(int fd, void *bytes, size_t length, off_t offset)
 {
 	ssize_t result;
-	if (io_fault == 1) { errno = EIO; return -1; }
-	if (io_fault == 2) return 0;
+	if (io_fault == 1) {
+		errno = EIO;
+		return -1;
+	}
+	if (io_fault == 2)
+		return 0;
 	result = pread(fd, bytes, length, offset);
 	if (io_fault == 3) {
 		int writer = openat(clogdir, "0000", O_WRONLY);
-		if (writer < 0 || pwrite(writer, "X", 1, 0) != 1 || close(writer) != 0) abort();
+		if (writer < 0 || pwrite(writer, "X", 1, 0) != 1 || close(writer) != 0)
+			abort();
 		io_fault = 0;
 	}
 	return result;
 }
-static int test_fsync(int fd)
+static int
+test_fsync(int fd)
 {
-	if (io_fault == 4) { errno = EIO; return -1; }
+	if (io_fault == 4) {
+		errno = EIO;
+		return -1;
+	}
 	return fsync(fd);
 }
 #define pread test_pread
@@ -50,12 +62,14 @@ static int test_fsync(int fd)
 #undef pread
 #undef fsync
 
-static void put(int directory, const char *name, const void *bytes, Size length)
+static void
+put(int directory, const char *name, const void *bytes, Size length)
 {
 	int fd = openat(directory, name, O_WRONLY | O_CREAT | O_EXCL, 0600);
 	UT_ASSERT(fd >= 0 && write(fd, bytes, length) == length && close(fd) == 0);
 }
-static void prepare(void)
+static void
+prepare(void)
 {
 	char temp[] = "/tmp/pgrac-init-catalog-XXXXXX";
 	UT_ASSERT(mkdtemp(temp) != NULL);
@@ -93,20 +107,25 @@ static void prepare(void)
 	put(clogdir, "0000", clog_bytes, sizeof(clog_bytes));
 	io_fault = 0;
 }
-static void cleanup(void)
+static void
+cleanup(void)
 {
 	io_fault = 0;
-	for (unsigned i = 0; i < lengthof(names); i++) (void)unlinkat(global, names[i], 0);
+	for (unsigned i = 0; i < lengthof(names); i++)
+		(void)unlinkat(global, names[i], 0);
 	for (unsigned i = 0; i < 8; i++) {
-		char name[8]; snprintf(name, sizeof(name), "%04X", i);
+		char name[8];
+		snprintf(name, sizeof(name), "%04X", i);
 		(void)unlinkat(clogdir, name, 0);
 	}
 	(void)unlinkat(clogdir, "old", 0);
 	UT_ASSERT(close(clogdir) == 0 && close(global) == 0);
-	UT_ASSERT(unlinkat(base, "clog", AT_REMOVEDIR) == 0 && unlinkat(base, "global", AT_REMOVEDIR) == 0);
+	UT_ASSERT(unlinkat(base, "clog", AT_REMOVEDIR) == 0
+			  && unlinkat(base, "global", AT_REMOVEDIR) == 0);
 	UT_ASSERT(close(base) == 0 && rmdir(path) == 0);
 }
-static void absent(void)
+static void
+absent(void)
 {
 	struct stat st;
 	for (unsigned i = 0; i < lengthof(names); i++)
@@ -127,7 +146,8 @@ UT_TEST(original_files_are_exclusive_and_exact)
 		Size required = cluster_catalog_initial_image_size(kind, &input);
 		uint8 *expected = calloc(1, required);
 		struct stat st;
-		UT_ASSERT(expected != NULL && cluster_catalog_initial_image(kind, &input, expected, required));
+		UT_ASSERT(expected != NULL
+				  && cluster_catalog_initial_image(kind, &input, expected, required));
 		UT_ASSERT(fstatat(global, names[i], &st, AT_SYMLINK_NOFOLLOW) == 0);
 		UT_ASSERT(cluster_initdb_object_recheck(global, names[i], expected, required, &st));
 		free(expected);
@@ -140,66 +160,83 @@ UT_TEST(invalid_native_input_creates_nothing)
 	prepare();
 	control.crc++;
 	UT_ASSERT(!cluster_initdb_catalog_create(global, &input));
-	absent(); cleanup();
-	prepare(); clog_bytes[1] = 0xff;
+	absent();
+	cleanup();
+	prepare();
+	clog_bytes[1] = 0xff;
 	UT_ASSERT(!cluster_initdb_catalog_create(global, &input));
-	absent(); cleanup();
+	absent();
+	cleanup();
 }
 UT_TEST(any_occupied_target_prevents_all_publication)
 {
-	prepare(); put(global, names[5], "keep", 4);
+	prepare();
+	put(global, names[5], "keep", 4);
 	UT_ASSERT(!cluster_initdb_catalog_create(global, &input));
 	for (unsigned i = 0; i < 5; i++) {
 		struct stat st;
 		UT_ASSERT(fstatat(global, names[i], &st, 0) != 0 && errno == ENOENT);
 	}
 	{
-		int fd = openat(global, names[5], O_RDONLY); char bytes[5] = {0};
-		UT_ASSERT(fd >= 0 && read(fd, bytes, 5) == 4 && memcmp(bytes, "keep", 4) == 0 && close(fd) == 0);
+		int fd = openat(global, names[5], O_RDONLY);
+		char bytes[5] = { 0 };
+		UT_ASSERT(fd >= 0 && read(fd, bytes, 5) == 4 && memcmp(bytes, "keep", 4) == 0
+				  && close(fd) == 0);
 	}
 	cleanup();
 }
 UT_TEST(source_alias_or_unsafe_file_is_refused)
 {
 	for (unsigned fault = 0; fault < 4; fault++) {
-		uint8 *bytes = NULL; Size length = 99;
+		uint8 *bytes = NULL;
+		Size length = 99;
 		prepare();
 		UT_ASSERT(renameat(clogdir, "0000", clogdir, "old") == 0);
-		if (fault == 0) UT_ASSERT(symlinkat("old", clogdir, "0000") == 0);
-		if (fault == 1) UT_ASSERT(linkat(clogdir, "old", clogdir, "0000", 0) == 0);
-		if (fault == 2) UT_ASSERT(mkfifoat(clogdir, "0000", 0600) == 0);
+		if (fault == 0)
+			UT_ASSERT(symlinkat("old", clogdir, "0000") == 0);
+		if (fault == 1)
+			UT_ASSERT(linkat(clogdir, "old", clogdir, "0000", 0) == 0);
+		if (fault == 2)
+			UT_ASSERT(mkfifoat(clogdir, "0000", 0600) == 0);
 		if (fault == 3) {
 			UT_ASSERT(renameat(clogdir, "old", clogdir, "0000") == 0);
 			UT_ASSERT(fchmodat(clogdir, "0000", 0666, 0) == 0);
 		}
 		UT_ASSERT(!cluster_initdb_catalog_read_clog(clogdir, 750, &bytes, &length));
 		UT_ASSERT(bytes == NULL && length == 0);
-		absent(); cleanup();
+		absent();
+		cleanup();
 	}
 }
 UT_TEST(read_failure_and_changed_source_clear_result)
 {
 	for (unsigned fault = 1; fault <= 3; fault++) {
-		uint8 *bytes = NULL; Size length = 99;
-		prepare(); io_fault = fault;
+		uint8 *bytes = NULL;
+		Size length = 99;
+		prepare();
+		io_fault = fault;
 		UT_ASSERT(!cluster_initdb_catalog_read_clog(clogdir, 750, &bytes, &length));
 		UT_ASSERT(bytes == NULL && length == 0);
-		absent(); cleanup();
+		absent();
+		cleanup();
 	}
 }
 UT_TEST(exact_page_range_is_required)
 {
-	uint8 *bytes = NULL; Size length = 0;
+	uint8 *bytes = NULL;
+	Size length = 0;
 	prepare();
 	UT_ASSERT(!cluster_initdb_catalog_read_clog(clogdir, 2, &bytes, &length));
-	UT_ASSERT(!cluster_initdb_catalog_read_clog(clogdir, CLUSTER_XID_PREHISTORY_MAX_XID + 1, &bytes, &length));
+	UT_ASSERT(!cluster_initdb_catalog_read_clog(clogdir, CLUSTER_XID_PREHISTORY_MAX_XID + 1, &bytes,
+												&length));
 	UT_ASSERT(!cluster_initdb_catalog_read_clog(clogdir, BLCKSZ * 4 + 1, &bytes, &length));
 	UT_ASSERT(bytes == NULL && length == 0);
 	cleanup();
 }
 UT_TEST(durable_write_failure_does_not_claim_success)
 {
-	prepare(); io_fault = 4;
+	prepare();
+	io_fault = 4;
 	UT_ASSERT(!cluster_initdb_catalog_create(global, &input));
 	io_fault = 0;
 	UT_ASSERT(!cluster_initdb_catalog_create(global, &input));
@@ -207,33 +244,42 @@ UT_TEST(durable_write_failure_does_not_claim_success)
 }
 UT_TEST(maximum_native_range_crosses_real_segments)
 {
-	uint8 *bytes = NULL; Size length = 0;
+	uint8 *bytes = NULL;
+	Size length = 0;
 	uint8 *segment = calloc(32, BLCKSZ);
 	prepare();
 	UT_ASSERT(segment != NULL && unlinkat(clogdir, "0000", 0) == 0);
 	for (unsigned i = 0; i < 8; i++) {
-		char name[8]; snprintf(name, sizeof(name), "%04X", i);
-		memset(segment, 0x55, 32 * BLCKSZ); segment[0] = (i % 2) ? 0xaa : 0x55;
+		char name[8];
+		snprintf(name, sizeof(name), "%04X", i);
+		memset(segment, 0x55, 32 * BLCKSZ);
+		segment[0] = (i % 2) ? 0xaa : 0x55;
 		put(clogdir, name, segment, 32 * BLCKSZ);
 	}
-	UT_ASSERT(cluster_initdb_catalog_read_clog(clogdir, CLUSTER_XID_PREHISTORY_MAX_XID, &bytes, &length));
+	UT_ASSERT(
+		cluster_initdb_catalog_read_clog(clogdir, CLUSTER_XID_PREHISTORY_MAX_XID, &bytes, &length));
 	UT_ASSERT(length == CLUSTER_XID_PREHISTORY_MAX_XID / 4);
-	for (unsigned i = 0; i < 8; i++) UT_ASSERT(bytes[i * 32 * BLCKSZ] == ((i % 2) ? 0xaa : 0x55));
+	for (unsigned i = 0; i < 8; i++)
+		UT_ASSERT(bytes[i * 32 * BLCKSZ] == ((i % 2) ? 0xaa : 0x55));
 	/* Exercise the actual bounded writer with the largest prehistory object. */
 	control.checkPointCopy.nextXid = FullTransactionIdFromU64(CLUSTER_XID_PREHISTORY_MAX_XID);
 	INIT_CRC32C(control.crc);
 	COMP_CRC32C(control.crc, &control, offsetof(ControlFileData, crc));
 	FIN_CRC32C(control.crc);
-	input.native_clog = bytes; input.native_clog_length = length;
+	input.native_clog = bytes;
+	input.native_clog_length = length;
 	UT_ASSERT(cluster_initdb_catalog_create(global, &input));
 	{
 		struct stat st;
 		UT_ASSERT(fstatat(global, names[4], &st, 0) == 0);
 		UT_ASSERT(st.st_size == length + sizeof(ClusterXidPrehistoryHeader));
 	}
-	free(bytes); free(segment); cleanup();
+	free(bytes);
+	free(segment);
+	cleanup();
 }
-int main(void)
+int
+main(void)
 {
 	UT_PLAN(8);
 	UT_RUN(original_files_are_exclusive_and_exact);
@@ -244,5 +290,6 @@ int main(void)
 	UT_RUN(exact_page_range_is_required);
 	UT_RUN(durable_write_failure_does_not_claim_success);
 	UT_RUN(maximum_native_range_crosses_real_segments);
-	UT_DONE(); return ut_failed_count ? 1 : 0;
+	UT_DONE();
+	return ut_failed_count ? 1 : 0;
 }

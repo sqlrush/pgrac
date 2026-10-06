@@ -162,7 +162,7 @@ bool
 LWLockHeldByMe(LWLock *lock)
 {
 	return lock == &fixture_lock ? lock_depth != 0
-		: lock == &fixture_access_lock && access_lock_depth != 0;
+								 : lock == &fixture_access_lock && access_lock_depth != 0;
 }
 bool
 SimpleLruDoesPhysicalPageExist(SlruCtl ctl, int pageno)
@@ -177,7 +177,7 @@ SimpleLruDoesPhysicalPageExist(SlruCtl ctl, int pageno)
 			return false;
 		}
 		exists = fstat(fd, &st) == 0
-			&& st.st_size >= (off_t)((pageno % SLRU_PAGES_PER_SEGMENT) + 1) * BLCKSZ;
+				 && st.st_size >= (off_t)((pageno % SLRU_PAGES_PER_SEGMENT) + 1) * BLCKSZ;
 		UT_ASSERT_EQ(close(fd), 0);
 		return exists;
 	}
@@ -202,8 +202,9 @@ SimpleLruReadPage(SlruCtl ctl, int pageno, bool write_ok, TransactionId xid)
 	if (fixture_files && fixture_status[0] == SLRU_PAGE_EMPTY) {
 		int fd = fixture_segment_open(ctl, pageno / SLRU_PAGES_PER_SEGMENT, O_RDONLY);
 		UT_ASSERT(fd >= 0);
-		UT_ASSERT_EQ(pread(fd, fixture_page.data, BLCKSZ,
-			(off_t)(pageno % SLRU_PAGES_PER_SEGMENT) * BLCKSZ), BLCKSZ);
+		UT_ASSERT_EQ(
+			pread(fd, fixture_page.data, BLCKSZ, (off_t)(pageno % SLRU_PAGES_PER_SEGMENT) * BLCKSZ),
+			BLCKSZ);
 		UT_ASSERT_EQ(close(fd), 0);
 		fixture_status[0] = SLRU_PAGE_VALID;
 		fixture_number[0] = pageno;
@@ -227,8 +228,9 @@ SimpleLruWriteAll(SlruCtl ctl, bool allow_redirtied)
 		int page = fixture_number[0];
 		int fd = fixture_segment_open(ctl, page / SLRU_PAGES_PER_SEGMENT, O_RDWR | O_CREAT);
 		UT_ASSERT(fd >= 0);
-		UT_ASSERT_EQ(pwrite(fd, fixture_page.data, BLCKSZ,
-			(off_t)(page % SLRU_PAGES_PER_SEGMENT) * BLCKSZ), BLCKSZ);
+		UT_ASSERT_EQ(
+			pwrite(fd, fixture_page.data, BLCKSZ, (off_t)(page % SLRU_PAGES_PER_SEGMENT) * BLCKSZ),
+			BLCKSZ);
 		UT_ASSERT_EQ(close(fd), 0);
 	}
 	fixture_disk = fixture_page;
@@ -315,8 +317,7 @@ reset_fixture(void)
 	memset(ClusterRemoteXactOriginCtlData, 0, sizeof(ClusterRemoteXactOriginCtlData));
 	ClusterRemoteXactOriginCtlData[1].shared = &fixture_shared;
 	RemoteXactAccessLocks[1] = &fixture_access_lock;
-	strcpy(ClusterRemoteXactOriginCtlData[1].Dir,
-		"/shared/native_side/origin_1/pg_xact_remote_v2");
+	strcpy(ClusterRemoteXactOriginCtlData[1].Dir, "/shared/native_side/origin_1/pg_xact_remote_v2");
 	RemoteXactShared = &fixture_stats;
 	pg_atomic_init_u64(&fixture_stats.outcome_indoubt_count, 0);
 	remote_xact_online_writer_depth_v = 0;
@@ -508,12 +509,12 @@ UT_TEST(shared_projection_writer_requires_original_origin_authority)
 	cluster_remote_xact_online_writer_push();
 	before = fixture_page;
 	UT_ASSERT_EQ(cluster_remote_xact_store_prepared_v2(1, 1000, digest),
-		CLUSTER_REMOTE_XACT_MUTATION_INVALID);
+				 CLUSTER_REMOTE_XACT_MUTATION_INVALID);
 	assert_no_effect(&before);
 	fixture_authorized_origin = 2;
 	UT_ASSERT_EQ(cluster_remote_xact_store_terminal_v2(
-		1, 1000, false, NULL, CLUSTER_REMOTE_XACT_COMMITTED, 123, 456, true, 2),
-		CLUSTER_REMOTE_XACT_MUTATION_INVALID);
+					 1, 1000, false, NULL, CLUSTER_REMOTE_XACT_COMMITTED, 123, 456, true, 2),
+				 CLUSTER_REMOTE_XACT_MUTATION_INVALID);
 	UT_ASSERT(!cluster_remote_xact_reset_range_v2(1, 1000, 1));
 	UT_ASSERT(!cluster_remote_xact_truncate_before_v2(1, 16384));
 	assert_no_effect(&before);
@@ -527,7 +528,7 @@ UT_TEST(projection_durability_uses_selected_slru_directory)
 	fixture_startup = true;
 	strcpy(ClusterRemoteXactCtl->Dir, "/shared/native_side/origin_1/pg_xact_remote_v2");
 	UT_ASSERT_EQ(cluster_remote_xact_store_prepared_v2(1, 1000, digest),
-		CLUSTER_REMOTE_XACT_MUTATION_STORED);
+				 CLUSTER_REMOTE_XACT_MUTATION_STORED);
 	UT_ASSERT_EQ(syncs, 1);
 	UT_ASSERT_EQ(dirsyncs, 1);
 }
@@ -541,7 +542,7 @@ UT_TEST(shared_projection_routes_to_original_origin_control)
 	fixture_authorized_origin = 1;
 	fixture_expected_ctl = &ClusterRemoteXactOriginCtlData[1];
 	UT_ASSERT_EQ(cluster_remote_xact_store_prepared_v2(1, 1000, digest),
-		CLUSTER_REMOTE_XACT_MUTATION_STORED);
+				 CLUSTER_REMOTE_XACT_MUTATION_STORED);
 	UT_ASSERT_EQ(syncs, 1);
 	UT_ASSERT_EQ(dirsyncs, 1);
 }
@@ -581,7 +582,7 @@ UT_TEST(shared_projection_sync_error_clears_cache_and_access_lock)
 	UT_ASSERT(!fixture_dirty[0]);
 	sync_error = 0;
 	UT_ASSERT_EQ(cluster_remote_xact_store_prepared_v2(1, 1000, digest),
-		CLUSTER_REMOTE_XACT_MUTATION_UNCHANGED);
+				 CLUSTER_REMOTE_XACT_MUTATION_UNCHANGED);
 }
 
 UT_TEST(shared_invalid_arguments_and_revoked_owner_have_no_directory_effect)
@@ -592,16 +593,16 @@ UT_TEST(shared_invalid_arguments_and_revoked_owner_have_no_directory_effect)
 	fixture_authorized_origin = 1;
 	fixture_expected_ctl = &ClusterRemoteXactOriginCtlData[1];
 	UT_ASSERT_EQ(cluster_remote_xact_store_prepared_v2(1, 1000, NULL),
-		CLUSTER_REMOTE_XACT_MUTATION_INVALID);
+				 CLUSTER_REMOTE_XACT_MUTATION_INVALID);
 	UT_ASSERT_EQ(cluster_remote_xact_store_terminal_v2(
-		1, 1000, false, NULL, CLUSTER_REMOTE_XACT_COMMITTED, InvalidScn, 456, true, 2),
-		CLUSTER_REMOTE_XACT_MUTATION_INVALID);
+					 1, 1000, false, NULL, CLUSTER_REMOTE_XACT_COMMITTED, InvalidScn, 456, true, 2),
+				 CLUSTER_REMOTE_XACT_MUTATION_INVALID);
 	UT_ASSERT(!cluster_remote_xact_reset_range_v2(1, 1000, 0));
 	UT_ASSERT(!cluster_remote_xact_truncate_before_v2(1, InvalidTransactionId));
 	UT_ASSERT_EQ(directory_checks, 0);
 	fixture_revoke_on_lock = true;
 	UT_ASSERT_EQ(cluster_remote_xact_store_prepared_v2(1, 1000, digest),
-		CLUSTER_REMOTE_XACT_MUTATION_INVALID);
+				 CLUSTER_REMOTE_XACT_MUTATION_INVALID);
 	UT_ASSERT_EQ(directory_checks, 0);
 	UT_ASSERT_EQ(writes + syncs + dirsyncs, 0);
 	UT_ASSERT_EQ(lock_depth + access_lock_depth, 0);
@@ -630,8 +631,8 @@ UT_TEST(shared_origin_projection_survives_writer_exit_and_local_directory_change
 	fixture_files = cluster_shared_config = true;
 	fixture_expected_ctl = &ClusterRemoteXactOriginCtlData[1];
 	cluster_shared_data_dir = root;
-	snprintf(fixture_expected_ctl->Dir, sizeof(fixture_expected_ctl->Dir),
-		"%s/pg_xact_remote_v2", origin);
+	snprintf(fixture_expected_ctl->Dir, sizeof(fixture_expected_ctl->Dir), "%s/pg_xact_remote_v2",
+			 origin);
 	fflush(NULL);
 	writer = fork();
 	if (writer == 0) {
@@ -651,7 +652,7 @@ UT_TEST(shared_origin_projection_survives_writer_exit_and_local_directory_change
 	fixture_number[0] = cluster_remote_xact_pageno(1, 1000);
 	memset(fixture_page.data, 0xAA, BLCKSZ);
 	UT_ASSERT_EQ(cluster_remote_commit_outcome_ex(1, 1000, &scn, &wrap, &wrap_valid),
-		CLUSTER_REMOTE_XACT_COMMITTED);
+				 CLUSTER_REMOTE_XACT_COMMITTED);
 	UT_ASSERT_EQ(scn, 123);
 	UT_ASSERT(wrap_valid && wrap == 2);
 	UT_ASSERT(cluster_remote_commit_timestamp(1, 1000, &timestamp));
@@ -659,19 +660,19 @@ UT_TEST(shared_origin_projection_survives_writer_exit_and_local_directory_change
 	UT_ASSERT_EQ(physical_reads, 2);
 	UT_ASSERT_EQ(writes + syncs + dirsyncs, 0);
 	UT_ASSERT_EQ(cluster_remote_commit_outcome_ex(2, 1000, &scn, &wrap, &wrap_valid),
-		CLUSTER_REMOTE_XACT_INDOUBT);
+				 CLUSTER_REMOTE_XACT_INDOUBT);
 	UT_ASSERT_EQ(scn, InvalidScn);
 	fixture_startup = true;
 	fixture_authorized_origin = 1;
 	UT_ASSERT(cluster_remote_xact_reset_range_v2(1, 1000, 1));
 	UT_ASSERT_EQ(cluster_remote_commit_outcome_ex(1, 1000, &scn, NULL, NULL),
-		CLUSTER_REMOTE_XACT_INDOUBT);
+				 CLUSTER_REMOTE_XACT_INDOUBT);
 	UT_ASSERT_EQ(cluster_remote_xact_store_terminal_v2(
-		1, 1000, false, NULL, CLUSTER_REMOTE_XACT_COMMITTED, 124, 457, true, 3),
-		CLUSTER_REMOTE_XACT_MUTATION_STORED);
+					 1, 1000, false, NULL, CLUSTER_REMOTE_XACT_COMMITTED, 124, 457, true, 3),
+				 CLUSTER_REMOTE_XACT_MUTATION_STORED);
 	UT_ASSERT(cluster_remote_xact_truncate_before_v2(1, 16384));
 	UT_ASSERT_EQ(cluster_remote_commit_outcome_ex(1, 1000, &scn, NULL, NULL),
-		CLUSTER_REMOTE_XACT_INDOUBT);
+				 CLUSTER_REMOTE_XACT_INDOUBT);
 	cluster_remote_xact_flush();
 	UT_ASSERT_EQ(lock_depth + access_lock_depth, 0);
 	UT_ASSERT_EQ(fchdir(cwd_fd), 0);

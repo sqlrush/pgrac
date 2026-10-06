@@ -344,8 +344,7 @@ current_mx_local_member_sample_exact(TransactionId xid, ClusterTTStatusKey *key,
 	result->status = CLUSTER_TT_STATUS_UNKNOWN;
 	result->commit_scn = InvalidScn;
 	*ctrc_grant = 0;
-	if (cluster_runtime_visibility_local_terminal_lookup_exact(xid, key, result,
-															 &precommit_retry)
+	if (cluster_runtime_visibility_local_terminal_lookup_exact(xid, key, result, &precommit_retry)
 		&& (result->status == CLUSTER_TT_STATUS_COMMITTED
 			|| result->status == CLUSTER_TT_STATUS_ABORTED))
 		return CMX_RESOLVE_OK;

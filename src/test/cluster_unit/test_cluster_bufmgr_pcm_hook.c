@@ -97,15 +97,16 @@ cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
 }
 bool
 cluster_page_wal_ref_retain_v1(const ClusterPageWalBindingV1 *binding pg_attribute_unused(),
-								 ClusterPageWalRefV1 *out pg_attribute_unused())
+							   ClusterPageWalRefV1 *out pg_attribute_unused())
 {
 	return false;
 }
 bool
 cluster_page_wal_ref_read_v1(const ClusterPageWalRefV1 *ref pg_attribute_unused(),
-							   RelFileLocator locator pg_attribute_unused(),
-							   ForkNumber forknum pg_attribute_unused(),
-							   BlockNumber blockno pg_attribute_unused(), ClusterPageWalBindingV1 *out)
+							 RelFileLocator locator pg_attribute_unused(),
+							 ForkNumber forknum pg_attribute_unused(),
+							 BlockNumber blockno pg_attribute_unused(),
+							 ClusterPageWalBindingV1 *out)
 {
 	memset(out, 0, sizeof(*out));
 	return false;
@@ -114,12 +115,12 @@ bool
 cluster_page_wal_ref_release_v1(ClusterPageWalRefV1 *ref)
 {
 	/* Zero carries no reference. A live reference would require the real pool. */
-	ClusterPageWalRefV1 empty = {0};
+	ClusterPageWalRefV1 empty = { 0 };
 	return ref != NULL && memcmp(ref, &empty, sizeof(empty)) == 0;
 }
 bool
 cluster_page_wal_same_mutation_v1(const ClusterPageWalBindingV1 *a pg_attribute_unused(),
-									const ClusterPageWalBindingV1 *b pg_attribute_unused())
+								  const ClusterPageWalBindingV1 *b pg_attribute_unused())
 {
 	return false;
 }
@@ -133,10 +134,10 @@ cluster_page_data_covers_local_pi_v1(const ClusterPageDataReceiptV1 *receipt pg_
 	return false;
 }
 bool
-cluster_page_structural_pi_proof_v2(
-	const ClusterPageStructuralReceiptV2 *receipt pg_attribute_unused(),
-	ClusterPcmPiWriteCutV1 *x pg_attribute_unused(),
-	ClusterPcmPiStorageCutV1 *s pg_attribute_unused())
+cluster_page_structural_pi_proof_v2(const ClusterPageStructuralReceiptV2 *receipt
+										pg_attribute_unused(),
+									ClusterPcmPiWriteCutV1 *x pg_attribute_unused(),
+									ClusterPcmPiStorageCutV1 *s pg_attribute_unused())
 {
 	/* This buffer/PCM fixture has no completed structural owner. */
 	return false;
@@ -149,7 +150,8 @@ cluster_page_structural_covers_local_pi_v2(
 	return false;
 }
 bool
-cluster_page_structural_pi_ack_read_v2(const ClusterPiStructuralAckV2 *ack pg_attribute_unused(),
+cluster_page_structural_pi_ack_read_v2(
+	const ClusterPiStructuralAckV2 *ack pg_attribute_unused(),
 	const ClusterPageStructuralReceiptV2 *receipt pg_attribute_unused(), int32 *out_node)
 {
 	if (out_node != NULL)
@@ -158,13 +160,14 @@ cluster_page_structural_pi_ack_read_v2(const ClusterPiStructuralAckV2 *ack pg_at
 }
 uint64
 cluster_ic_tier1_resource_x_stream_generation(int32 peer pg_attribute_unused(),
-											   int channel pg_attribute_unused())
+											  int channel pg_attribute_unused())
 {
 	return 0;
 }
 bool
 cluster_sf_peer_capability_word_sample(int32 peer pg_attribute_unused(),
-									  uint32 required pg_attribute_unused(), uint32 *cap, uint32 *generation)
+									   uint32 required pg_attribute_unused(), uint32 *cap,
+									   uint32 *generation)
 {
 	*cap = *generation = 0;
 	return false;

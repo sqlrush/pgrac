@@ -137,8 +137,8 @@ cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *o)
 bool
 cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *o, uint64 selected_epoch)
 {
-	return have_ref && initialized_writer_epoch != 0
-		   && selected_epoch == initialized_writer_epoch && memcmp(o, &ref, sizeof(ref)) == 0;
+	return have_ref && initialized_writer_epoch != 0 && selected_epoch == initialized_writer_epoch
+		   && memcmp(o, &ref, sizeof(ref)) == 0;
 }
 bool
 cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *o)
@@ -765,7 +765,7 @@ native_caller_case(bool background, bool lag, bool hang, bool lock_race)
 		UT_ASSERT_EQ(CritSectionCount, 0);
 		UT_ASSERT_EQ(native_ctl.LogwrtResult.Flush, b.exclusive_end);
 		UT_ASSERT((lag || lock_race) ? native_waits > 0 : native_writes > 1);
-		}
+	}
 	refresh_on_wait = true;
 	lag_on_lock = lag_every_lock = false;
 	CritSectionCount = 1;
@@ -840,19 +840,45 @@ UT_TEST(test_runtime_refuses_lost_writer_before_and_after_device_io)
 		fixture();
 		fence_epoch_lag = prebump = true;
 		switch (fault) {
-		case 0: self_fenced = true; break;
-		case 1: fence_expired = true; break;
-		case 2: incarnation++; break;
-		case 3: active = false; break;
-		case 4: member = false; break;
-		case 5: fence = false; break;
-		case 6: have_ref = false; break;
-		case 7: enableFsync = false; break;
-		case 8: cluster_enabled = false; break;
-		case 9: cluster_shared_config = false; break;
-		case 10: ref.claim.identity.root_lineage_seq++; break;
-		case 11: ref.timeline++; break;
-		case 12: cluster_node_id++; break;
+		case 0:
+			self_fenced = true;
+			break;
+		case 1:
+			fence_expired = true;
+			break;
+		case 2:
+			incarnation++;
+			break;
+		case 3:
+			active = false;
+			break;
+		case 4:
+			member = false;
+			break;
+		case 5:
+			fence = false;
+			break;
+		case 6:
+			have_ref = false;
+			break;
+		case 7:
+			enableFsync = false;
+			break;
+		case 8:
+			cluster_enabled = false;
+			break;
+		case 9:
+			cluster_shared_config = false;
+			break;
+		case 10:
+			ref.claim.identity.root_lineage_seq++;
+			break;
+		case 11:
+			ref.timeline++;
+			break;
+		case 12:
+			cluster_node_id++;
+			break;
 		}
 		result = cluster_wal_writer_check(&writer);
 		UT_ASSERT(result != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
@@ -874,7 +900,7 @@ UT_TEST(test_native_device_or_postflush_authority_failure_never_acknowledges)
 		if (sigsetjmp(native_error, 1) == 0) {
 			if (fault == 0) {
 				device_failure = true;
-				(void)XLogWrite((NativeResult){256, 256}, 1, false);
+				(void)XLogWrite((NativeResult){ 256, 256 }, 1, false);
 			} else {
 				self_fenced = true;
 				(void)native_flush_tail(1);
@@ -892,12 +918,13 @@ UT_TEST(test_startup_binds_only_revalidated_actual_empty_owner)
 	XLogRecPtr start;
 	startup_fixture();
 	have_ref = false;
-	UT_ASSERT_EQ(cluster_wal_writer_startup_prepare(&ref.claim.identity,
-		startup_op.operation_uuid, &start), 0);
+	UT_ASSERT_EQ(
+		cluster_wal_writer_startup_prepare(&ref.claim.identity, startup_op.operation_uuid, &start),
+		0);
 	UT_ASSERT_EQ(start, wal_segment_size);
 	UT_ASSERT_EQ(startup_reads, 2);
-	UT_ASSERT(cluster_wal_writer_startup_matches(&ref.claim.identity,
-		startup_op.operation_uuid, start));
+	UT_ASSERT(
+		cluster_wal_writer_startup_matches(&ref.claim.identity, startup_op.operation_uuid, start));
 	UT_ASSERT_EQ(cluster_wal_writer_begin(1, &writer), 0);
 	UT_ASSERT_EQ(cluster_wal_writer_check(&writer), 0);
 	MyBackendType = B_BACKEND;
@@ -914,25 +941,58 @@ UT_TEST(test_startup_rejects_changed_selection_route_or_owner)
 		XLogRecPtr start = 123;
 		startup_fixture();
 		switch (fault) {
-		case 0: CritSectionCount = 1; break;
-		case 1: MyBackendType = B_BACKEND; break;
-		case 2: ShutdownRequestPending = true; break;
-		case 3: held = true; break;
-		case 4: startup_op.phase = CLUSTER_WAL_STARTUP_RESERVED; break;
-		case 5: startup_op.first_segment_lsn++; break;
-		case 6: startup_op.segment_size++; break;
-		case 7: restart_ref.claim.identity.origin_owner_incarnation++; break;
-		case 8: restart_ref.claim.claim_sha256[0]++; break;
-		case 9: restart_ref.timeline++; break;
-		case 10: startup_selection = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID; break;
-		case 11: route_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN; break;
-		case 12: startup_changed = true; break;
-		case 13: fence_expired = true; break;
-		case 14: startup_op.formation_epoch++; break;
-		case 15: self_fenced = true; break;
+		case 0:
+			CritSectionCount = 1;
+			break;
+		case 1:
+			MyBackendType = B_BACKEND;
+			break;
+		case 2:
+			ShutdownRequestPending = true;
+			break;
+		case 3:
+			held = true;
+			break;
+		case 4:
+			startup_op.phase = CLUSTER_WAL_STARTUP_RESERVED;
+			break;
+		case 5:
+			startup_op.first_segment_lsn++;
+			break;
+		case 6:
+			startup_op.segment_size++;
+			break;
+		case 7:
+			restart_ref.claim.identity.origin_owner_incarnation++;
+			break;
+		case 8:
+			restart_ref.claim.claim_sha256[0]++;
+			break;
+		case 9:
+			restart_ref.timeline++;
+			break;
+		case 10:
+			startup_selection = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+			break;
+		case 11:
+			route_result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			break;
+		case 12:
+			startup_changed = true;
+			break;
+		case 13:
+			fence_expired = true;
+			break;
+		case 14:
+			startup_op.formation_epoch++;
+			break;
+		case 15:
+			self_fenced = true;
+			break;
 		}
-		UT_ASSERT(cluster_wal_writer_startup_prepare(&ref.claim.identity,
-			startup_op.operation_uuid, &start) != 0);
+		UT_ASSERT(cluster_wal_writer_startup_prepare(&ref.claim.identity, startup_op.operation_uuid,
+													 &start)
+				  != 0);
 		UT_ASSERT_EQ(start, 0);
 		UT_ASSERT(!writer_startup.valid);
 	}
@@ -970,8 +1030,9 @@ UT_TEST(test_initialized_writer_requires_selected_input_and_installed_same_epoch
 	startup_op.input_kind = CLUSTER_WAL_STARTUP_INITIALIZED;
 	active = false;
 	have_ref = false;
-	UT_ASSERT_EQ(cluster_wal_writer_startup_prepare(&ref.claim.identity,
-		startup_op.operation_uuid, &start), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(
+		cluster_wal_writer_startup_prepare(&ref.claim.identity, startup_op.operation_uuid, &start),
+		CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	UT_ASSERT_EQ(cluster_wal_writer_begin(1, &writer), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	MyBackendType = B_BACKEND;
 	UT_ASSERT_NE(cluster_wal_writer_begin(1, &writer), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
@@ -997,24 +1058,43 @@ UT_TEST(test_initialized_writer_keeps_runtime_fence_and_exact_owner_refusals)
 				= kind == 0 ? CLUSTER_WAL_STARTUP_INITIALIZED : CLUSTER_WAL_STARTUP_CLEAN;
 			active = false;
 			switch (fault) {
-			case 0: startup_selection = CLUSTER_CONTROL_ROOT_STALE_TOKEN; break;
+			case 0:
+				startup_selection = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+				break;
 			case 1:
 				startup_op.input_kind = 3;
 				break;
-			case 2: startup_op.input_kind = CLUSTER_WAL_STARTUP_RECOVERED; break;
-		case 3: startup_op.formation_epoch++; break;
-		case 4: self_fenced = true; break;
-		case 5: fence = false; break;
-		case 6: fence_expired = true; break;
-		case 7: incarnation++; break;
-		case 8: member = false; break;
-		case 9: startup_changed = true; break;
+			case 2:
+				startup_op.input_kind = CLUSTER_WAL_STARTUP_RECOVERED;
+				break;
+			case 3:
+				startup_op.formation_epoch++;
+				break;
+			case 4:
+				self_fenced = true;
+				break;
+			case 5:
+				fence = false;
+				break;
+			case 6:
+				fence_expired = true;
+				break;
+			case 7:
+				incarnation++;
+				break;
+			case 8:
+				member = false;
+				break;
+			case 9:
+				startup_changed = true;
+				break;
+			}
+			UT_ASSERT_NE(cluster_wal_writer_startup_prepare(&ref.claim.identity,
+															startup_op.operation_uuid, &start),
+						 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+			UT_ASSERT_EQ(start, 0);
+			UT_ASSERT(!writer_startup.valid);
 		}
-		UT_ASSERT_NE(cluster_wal_writer_startup_prepare(&ref.claim.identity,
-			startup_op.operation_uuid, &start), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
-		UT_ASSERT_EQ(start, 0);
-		UT_ASSERT(!writer_startup.valid);
-	}
 }
 
 UT_TEST(test_background_flush_snapshot_preserves_native_byte_boundary)

@@ -253,7 +253,7 @@ cluster_ko_normal_stop_poll(uint32 *slot_out, const char **reason_out)
 	reason = "EMPTY";
 	for (uint32 i = head; i != tail; i = (i + 1) % CLUSTER_KO_INBOUND_CAPACITY) {
 		const ClusterKoInboundSlot *item = &ko_state->inbound[i];
-		if (item->batch_id == 0 || item->epoch == 0 || item->source_node < 0
+		if (item->batch_id == 0 || (item->shared && item->epoch == 0) || item->source_node < 0
 			|| item->source_node >= CLUSTER_MAX_NODES || item->spc_oid == InvalidOid
 			|| item->rel_number == InvalidRelFileNumber) {
 			result = CLUSTER_NORMAL_STOP_INVALID;
@@ -309,7 +309,8 @@ cluster_ko_shmem_init(void)
 								   ko_state->native_dsa_tranche, NULL);
 		dsa_pin(area);
 		dsa_detach(area);
-		ko_state->native_incoming = ko_state->native_ready = ko_state->native_failed = InvalidDsaPointer;
+		ko_state->native_incoming = ko_state->native_ready = ko_state->native_failed
+			= InvalidDsaPointer;
 		ko_state->native_recovery_required = false;
 		ko_state->native_waiting = 0;
 		pg_atomic_init_u64(&ko_state->flush_count, 0);
@@ -489,13 +490,13 @@ ko_cut_u64(uint8 **cursor, uint64 value)
 }
 
 static bool
-ko_shared_members(ClusterKoSharedMessageV2 *message,
-				  uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], uint64 *generation)
+ko_shared_members(ClusterKoSharedMessageV2 *message, uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT],
+				  uint64 *generation)
 {
 	static const char domain[] = "PGRAC-KO-MEMBERS-V2";
 	ClusterFormationSnapshotV1 snapshot;
 	ClusterKoSharedMessageV2 result = *message;
-	uint64 sampled[CLUSTER_KO_SHARED_NODE_LIMIT] = {0};
+	uint64 sampled[CLUSTER_KO_SHARED_NODE_LIMIT] = { 0 };
 	uint64 before = cluster_membership_cut_generation();
 	uint8 preimage[sizeof(domain) - 1 + 16 + CLUSTER_MAX_NODES * 9 + 64];
 	uint8 *p = preimage;
@@ -503,13 +504,12 @@ ko_shared_members(ClusterKoSharedMessageV2 *message,
 	bool ok;
 
 	StaticAssertStmt(CLUSTER_MAX_NODES == CLUSTER_KO_SHARED_MEMBER_BYTES * 8,
-		"KO must cover the complete member table");
+					 "KO must cover the complete member table");
 	if (before == 0 || cluster_node_id < 0 || cluster_node_id >= CLUSTER_KO_SHARED_NODE_LIMIT
 		|| !cluster_reconfig_capture_formation_snapshot_v1((uint16)(cluster_node_id + 1), &snapshot)
-		|| !cluster_membership_cut_generation_current(before)
-		|| snapshot.local_epoch == 0 || snapshot.local_epoch == UINT64_MAX
-		|| snapshot.prebump_sync_active != 0 || snapshot.self_join_failed
-		|| snapshot.reserved[0] != 0 || snapshot.reserved[1] != 0)
+		|| !cluster_membership_cut_generation_current(before) || snapshot.local_epoch == 0
+		|| snapshot.local_epoch == UINT64_MAX || snapshot.prebump_sync_active != 0
+		|| snapshot.self_join_failed || snapshot.reserved[0] != 0 || snapshot.reserved[1] != 0)
 		return false;
 	result.epoch = snapshot.local_epoch;
 	memset(result.members, 0, sizeof(result.members));
@@ -528,7 +528,9 @@ ko_shared_members(ClusterKoSharedMessageV2 *message,
 		if (state == CLUSTER_MEMBER_MEMBER) {
 			if (n >= CLUSTER_KO_SHARED_NODE_LIMIT || boot == 0 || boot == UINT64_MAX
 				|| ((snapshot.excluded_bitmap[n / 8] | snapshot.removed_bitmap[n / 8]
-					 | snapshot.clean_departed_bitmap[n / 8]) & bit) != 0)
+					 | snapshot.clean_departed_bitmap[n / 8])
+					& bit)
+					   != 0)
 				return false;
 			result.members[n / 8] |= bit;
 			sampled[n] = boot;
@@ -536,17 +538,21 @@ ko_shared_members(ClusterKoSharedMessageV2 *message,
 		*p++ = state;
 		ko_cut_u64(&p, boot);
 	}
-	memcpy(p, snapshot.pending_join_bitmap, 16); p += 16;
-	memcpy(p, snapshot.clean_departed_bitmap, 16); p += 16;
-	memcpy(p, snapshot.removed_bitmap, 16); p += 16;
-	memcpy(p, snapshot.excluded_bitmap, 16); p += 16;
+	memcpy(p, snapshot.pending_join_bitmap, 16);
+	p += 16;
+	memcpy(p, snapshot.clean_departed_bitmap, 16);
+	p += 16;
+	memcpy(p, snapshot.removed_bitmap, 16);
+	p += 16;
+	memcpy(p, snapshot.excluded_bitmap, 16);
+	p += 16;
 	Assert(p == preimage + sizeof(preimage));
 	hash = pg_cryptohash_create(PG_SHA256);
 	if (hash == NULL)
 		return false;
 	ok = pg_cryptohash_init(hash) >= 0
-		&& pg_cryptohash_update(hash, preimage, sizeof(preimage)) >= 0
-		&& pg_cryptohash_final(hash, result.member_digest, sizeof(result.member_digest)) >= 0;
+		 && pg_cryptohash_update(hash, preimage, sizeof(preimage)) >= 0
+		 && pg_cryptohash_final(hash, result.member_digest, sizeof(result.member_digest)) >= 0;
 	pg_cryptohash_free(hash);
 	if (!ok || !cluster_membership_cut_generation_current(before)
 		|| snapshot.local_epoch != cluster_epoch_get_current())
@@ -580,8 +586,7 @@ cluster_ko_shared_cut_current_v2(const ClusterKoSharedMessageV2 *request)
 		|| memcmp(before.claim.identity.storage_uuid, request->key.storage_uuid, 16) != 0)
 		return false;
 	current = *request;
-	if (!ko_shared_members(&current, boots, &generation)
-		|| boots[cluster_node_id] == 0
+	if (!ko_shared_members(&current, boots, &generation) || boots[cluster_node_id] == 0
 		|| boots[cluster_node_id] != before.claim.identity.origin_owner_incarnation)
 		return false;
 	current.origin_boot = boots[request->origin_node];
@@ -595,8 +600,8 @@ cluster_ko_shared_cut_current_v2(const ClusterKoSharedMessageV2 *request)
 		if (endpoints[i] == cluster_node_id)
 			continue;
 		if (!cluster_sf_peer_capability_word_sample(endpoints[i], PGRAC_IC_HELLO_CAP_KO_SHARED_V2,
-				&capability[i], &connection[i]) || connection[i] == 0
-			|| (capability[i] & PGRAC_IC_HELLO_CAP_KO_SHARED_V2) == 0)
+													&capability[i], &connection[i])
+			|| connection[i] == 0 || (capability[i] & PGRAC_IC_HELLO_CAP_KO_SHARED_V2) == 0)
 			return false;
 	}
 	/* A decoded relation result is still untrusted. In particular, one
@@ -606,12 +611,12 @@ cluster_ko_shared_cut_current_v2(const ClusterKoSharedMessageV2 *request)
 		if (endpoints[i] == cluster_node_id)
 			continue;
 		if (!cluster_sf_peer_capability_word_sample(endpoints[i], PGRAC_IC_HELLO_CAP_KO_SHARED_V2,
-				&word, &sampled) || word != capability[i] || sampled != connection[i])
+													&word, &sampled)
+			|| word != capability[i] || sampled != connection[i])
 			return false;
 	}
-	return cluster_wal_thread_current_v2_ref(&after)
-		&& memcmp(&before, &after, sizeof(before)) == 0
-		&& cluster_membership_cut_generation_current(generation);
+	return cluster_wal_thread_current_v2_ref(&after) && memcmp(&before, &after, sizeof(before)) == 0
+		   && cluster_membership_cut_generation_current(generation);
 }
 
 static bool
@@ -640,11 +645,10 @@ ko_shared_control_current(const ClusterKoSharedMessageV2 *message)
 	current.peer_boot = boots[message->peer_node];
 	other = cluster_node_id == message->origin_node ? message->peer_node : message->origin_node;
 	return cluster_sf_peer_capability_word_sample(other, PGRAC_IC_HELLO_CAP_KO_SHARED_V2,
-			&capabilities, &capability_generation)
-		&& capability_generation != 0
-		&& cluster_membership_cut_generation_current(generation)
-		&& cluster_ko_shared_encode_v2(&current, observed, sizeof(observed))
-		&& memcmp(expected, observed, sizeof(expected)) == 0;
+												  &capabilities, &capability_generation)
+		   && capability_generation != 0 && cluster_membership_cut_generation_current(generation)
+		   && cluster_ko_shared_encode_v2(&current, observed, sizeof(observed))
+		   && memcmp(expected, observed, sizeof(expected)) == 0;
 }
 
 static bool
@@ -653,17 +657,17 @@ ko_shared_space_current(const ClusterKoSharedMessageV2 *message)
 	ClusterSpaceIdentity identity;
 
 	return cluster_space_relation_read_identity(message->key.locator, &identity)
-		&& identity.state == CLUSTER_SPACE_IDENTITY_LIVE
-		&& identity.key.system_identifier == message->key.system_identifier
-		&& identity.key.database_incarnation == message->key.database_incarnation
-		&& RelFileLocatorEquals(identity.key.locator, message->key.locator)
-		&& memcmp(identity.key.storage_uuid, message->key.storage_uuid, 16) == 0
-		&& memcmp(identity.incarnation, message->incarnation, 16) == 0;
+		   && identity.state == CLUSTER_SPACE_IDENTITY_LIVE
+		   && identity.key.system_identifier == message->key.system_identifier
+		   && identity.key.database_incarnation == message->key.database_incarnation
+		   && RelFileLocatorEquals(identity.key.locator, message->key.locator)
+		   && memcmp(identity.key.storage_uuid, message->key.storage_uuid, 16) == 0
+		   && memcmp(identity.incarnation, message->incarnation, 16) == 0;
 }
 
 bool
-cluster_ko_shared_peer_projection_v2(const ClusterKoSharedMessageV2 *request,
-	int32 peer, ClusterKoSharedMessageV2 *out)
+cluster_ko_shared_peer_projection_v2(const ClusterKoSharedMessageV2 *request, int32 peer,
+									 ClusterKoSharedMessageV2 *out)
 {
 	ClusterKoSharedMessageV2 current, projected;
 	ClusterWalSourceRef writer_before, writer_after;
@@ -672,8 +676,8 @@ cluster_ko_shared_peer_projection_v2(const ClusterKoSharedMessageV2 *request,
 	uint8 original[CLUSTER_KO_SHARED_V2_BYTES], observed[sizeof(original)];
 
 	if (request == NULL || out == NULL || peer < 0 || peer >= CLUSTER_KO_SHARED_NODE_LIMIT
-		|| peer == cluster_node_id || request->verb != CLUSTER_KO_SHARED_REQUEST
-		|| !cluster_enabled || !cluster_shared_config || RecoveryInProgress()
+		|| peer == cluster_node_id || request->verb != CLUSTER_KO_SHARED_REQUEST || !cluster_enabled
+		|| !cluster_shared_config || RecoveryInProgress()
 		|| (MyBackendType != B_BG_WRITER && MyBackendType != B_CHECKPOINTER)
 		|| CurrentResourceOwner == NULL || CritSectionCount != 0)
 		return false;
@@ -682,15 +686,13 @@ cluster_ko_shared_peer_projection_v2(const ClusterKoSharedMessageV2 *request,
 		|| !ko_shared_control_current(request))
 		return false;
 	current = *request;
-	if (!ko_shared_members(&current, boots, &sampled_generation)
-		|| sampled_generation != generation || boots[peer] == 0
-		|| !cluster_ko_shared_encode_v2(request, original, sizeof(original))
+	if (!ko_shared_members(&current, boots, &sampled_generation) || sampled_generation != generation
+		|| boots[peer] == 0 || !cluster_ko_shared_encode_v2(request, original, sizeof(original))
 		|| !cluster_ko_shared_encode_v2(&current, observed, sizeof(observed))
 		|| memcmp(original, observed, sizeof(original)) != 0
 		|| !cluster_sf_peer_capability_word_sample(peer, PGRAC_IC_HELLO_CAP_KO_SHARED_V2,
-			&capabilities, &capability_generation)
-		|| capability_generation == 0
-		|| (capabilities & PGRAC_IC_HELLO_CAP_KO_SHARED_V2) == 0)
+												   &capabilities, &capability_generation)
+		|| capability_generation == 0 || (capabilities & PGRAC_IC_HELLO_CAP_KO_SHARED_V2) == 0)
 		return false;
 	projected = *request;
 	/* An origin recipient verifies the same original request that the
@@ -720,20 +722,18 @@ ko_shared_origin_current(const ClusterKoSharedContext *context)
 	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], generation;
 
 	return cluster_enabled && cluster_shared_config && !RecoveryInProgress()
-		&& cluster_node_id == m->origin_node
-		&& cluster_wal_thread_current_v2_ref(&ref)
-		&& ref.claim.identity.origin_node_id == m->origin_node
-		&& ref.claim.identity.origin_owner_incarnation == m->origin_boot
-		&& ref.claim.identity.system_identifier == m->key.system_identifier
-		&& ref.claim.database_incarnation == m->key.database_incarnation
-		&& memcmp(ref.claim.identity.storage_uuid, m->key.storage_uuid, 16) == 0
-		&& ko_shared_members(&current, boots, &generation)
-		&& boots[cluster_node_id] == m->origin_boot
-		&& current.epoch == m->epoch
-		&& memcmp(current.members, m->members, sizeof(m->members)) == 0
-		&& memcmp(current.member_digest, m->member_digest, sizeof(m->member_digest)) == 0
-		&& memcmp(boots, context->peer_boots, sizeof(boots)) == 0
-		&& cluster_membership_cut_generation_current(generation);
+		   && cluster_node_id == m->origin_node && cluster_wal_thread_current_v2_ref(&ref)
+		   && ref.claim.identity.origin_node_id == m->origin_node
+		   && ref.claim.identity.origin_owner_incarnation == m->origin_boot
+		   && ref.claim.identity.system_identifier == m->key.system_identifier
+		   && ref.claim.database_incarnation == m->key.database_incarnation
+		   && memcmp(ref.claim.identity.storage_uuid, m->key.storage_uuid, 16) == 0
+		   && ko_shared_members(&current, boots, &generation)
+		   && boots[cluster_node_id] == m->origin_boot && current.epoch == m->epoch
+		   && memcmp(current.members, m->members, sizeof(m->members)) == 0
+		   && memcmp(current.member_digest, m->member_digest, sizeof(m->member_digest)) == 0
+		   && memcmp(boots, context->peer_boots, sizeof(boots)) == 0
+		   && cluster_membership_cut_generation_current(generation);
 }
 
 /* Test pointer membership before dereferencing an opaque caller handle. */
@@ -845,8 +845,7 @@ static bool
 ko_completion_owner_current(const ClusterKoCompletionV2 *completion)
 {
 	if (completion->native_transaction)
-		return completion->owner == CurTransactionResourceOwner
-			&& ko_native_transaction_current();
+		return completion->owner == CurTransactionResourceOwner && ko_native_transaction_current();
 	return CurrentResourceOwner != NULL && completion->owner == CurrentResourceOwner;
 }
 
@@ -879,14 +878,15 @@ ko_shared_xact_event(XactEvent event, void *arg pg_attribute_unused())
 		if (completion->pid == MyProcPid && completion->native_transaction
 			&& !completion->native_handed_off)
 			completion->postcommit = event == XACT_EVENT_COMMIT && completion->space_observed
-				&& !completion->native_pending && completion->owner == TopTransactionResourceOwner
-				&& CurrentResourceOwner == TopTransactionResourceOwner
-				&& CurTransactionResourceOwner == TopTransactionResourceOwner;
+									 && !completion->native_pending
+									 && completion->owner == TopTransactionResourceOwner
+									 && CurrentResourceOwner == TopTransactionResourceOwner
+									 && CurTransactionResourceOwner == TopTransactionResourceOwner;
 }
 
 static void
-ko_shared_resource_release(ResourceReleasePhase phase, bool commit,
-	bool top, void *arg pg_attribute_unused())
+ko_shared_resource_release(ResourceReleasePhase phase, bool commit, bool top,
+						   void *arg pg_attribute_unused())
 {
 	ClusterKoCompletionV2 **link = &ko_completions;
 	ResourceOwner parent;
@@ -948,8 +948,8 @@ ko_completion_snapshot(const ClusterKoCompletionV2 *completion, ClusterKoSharedC
 		return false;
 	SpinLockAcquire(&ko_state->shared_lock);
 	*out = ko_state->contexts[owned->slot];
-	valid = out->used && out->complete && !out->structure_owned
-		&& out->pid == owned->pid && out->serial == owned->serial;
+	valid = out->used && out->complete && !out->structure_owned && out->pid == owned->pid
+			&& out->serial == owned->serial;
 	SpinLockRelease(&ko_state->shared_lock);
 	return valid && ko_shared_origin_current(out);
 }
@@ -980,20 +980,21 @@ ko_native_barrier_to_owner(ClusterKoCompletionV2 *completion)
 
 bool
 cluster_ko_shared_covers_v2(const ClusterKoCompletionV2 *completion,
-	const ClusterSpaceIdentityKey *key, const uint8 incarnation[16])
+							const ClusterSpaceIdentityKey *key, const uint8 incarnation[16])
 {
 	ClusterKoSharedContext context;
 	return key != NULL && incarnation != NULL && ko_completion_snapshot(completion, &context)
-		&& context.request.key.system_identifier == key->system_identifier
-		&& context.request.key.database_incarnation == key->database_incarnation
-		&& memcmp(context.request.key.storage_uuid, key->storage_uuid, 16) == 0
-		&& RelFileLocatorEquals(context.request.key.locator, key->locator)
-		&& memcmp(context.request.incarnation, incarnation, 16) == 0;
+		   && context.request.key.system_identifier == key->system_identifier
+		   && context.request.key.database_incarnation == key->database_incarnation
+		   && memcmp(context.request.key.storage_uuid, key->storage_uuid, 16) == 0
+		   && RelFileLocatorEquals(context.request.key.locator, key->locator)
+		   && memcmp(context.request.incarnation, incarnation, 16) == 0;
 }
 
 bool
 cluster_ko_shared_observe_space_v2(ClusterKoCompletionV2 *completion,
-	const struct ClusterPageWalBindingV1 *terminal, const void *wal, Size wal_length)
+								   const struct ClusterPageWalBindingV1 *terminal, const void *wal,
+								   Size wal_length)
 {
 	ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
 	ClusterSpaceStructureChange change;
@@ -1013,7 +1014,8 @@ cluster_ko_shared_observe_space_v2(ClusterKoCompletionV2 *completion,
 		|| memcmp(key->storage_uuid, terminal->identity.storage_uuid, 16) != 0
 		|| !RelFileLocatorEquals(key->locator, terminal->identity.locator)
 		|| change.identity.result_token != terminal->version.mutation_token
-		|| memcmp(change.identity.result.incarnation, terminal->version.segment_incarnation, 16) != 0)
+		|| memcmp(change.identity.result.incarnation, terminal->version.segment_incarnation, 16)
+			   != 0)
 		return false;
 	if (change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE) {
 		if (terminal->rmid != RM_SMGR_ID
@@ -1026,7 +1028,7 @@ cluster_ko_shared_observe_space_v2(ClusterKoCompletionV2 *completion,
 	} else
 		return false;
 	if (!cluster_ko_shared_covers_v2(owned, &change.identity.expected.key,
-								   change.identity.expected.incarnation))
+									 change.identity.expected.incarnation))
 		return false;
 	owned->terminal = *terminal;
 	memcpy(owned->structure, wal, sizeof(owned->structure));
@@ -1036,7 +1038,8 @@ cluster_ko_shared_observe_space_v2(ClusterKoCompletionV2 *completion,
 
 bool
 cluster_ko_shared_space_observation_v2(const ClusterKoCompletionV2 *completion,
-	struct ClusterPageWalBindingV1 *terminal, void *wal, Size wal_length)
+									   struct ClusterPageWalBindingV1 *terminal, void *wal,
+									   Size wal_length)
 {
 	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
 	ClusterKoSharedContext context;
@@ -1073,12 +1076,13 @@ cluster_ko_shared_observe_truncate_v2(ClusterKoCompletionV2 *completion)
 
 bool
 cluster_ko_shared_truncate_observation_v2(const ClusterKoCompletionV2 *completion,
-	struct ClusterPageWalBindingV1 *terminal, void *wal, Size wal_length)
+										  struct ClusterPageWalBindingV1 *terminal, void *wal,
+										  Size wal_length)
 {
 	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
 
 	return owned != NULL && owned->truncate_observed
-		&& cluster_ko_shared_space_observation_v2(owned, terminal, wal, wal_length);
+		   && cluster_ko_shared_space_observation_v2(owned, terminal, wal, wal_length);
 }
 
 bool
@@ -1103,33 +1107,32 @@ cluster_ko_shared_observe_drop_v2(ClusterKoCompletionV2 *completion)
 
 static bool
 ko_structure_effect_observation(const ClusterKoCompletionV2 *completion,
-	ClusterPageWalBindingV1 *terminal, void *wal, Size wal_length)
+								ClusterPageWalBindingV1 *terminal, void *wal, Size wal_length)
 {
 	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
 
 	return owned != NULL && (owned->truncate_observed || owned->drop_observed)
-		&& cluster_ko_shared_space_observation_v2(owned, terminal, wal, wal_length);
+		   && cluster_ko_shared_space_observation_v2(owned, terminal, wal, wal_length);
 }
 
 bool
-cluster_ko_shared_structure_offer_v2(const ClusterKoCompletionV2 *completion,
-	int32 peer, struct ClusterPiWritebackFactV2 *out)
+cluster_ko_shared_structure_offer_v2(const ClusterKoCompletionV2 *completion, int32 peer,
+									 struct ClusterPiWritebackFactV2 *out)
 {
 	const ClusterKoCompletionV2 *owned = *ko_completion_link(completion);
-	ClusterPiWritebackFactV2 value = {0};
+	ClusterPiWritebackFactV2 value = { 0 };
 	ClusterPiStructuralFactV2 *s = &value.proof.structural;
 	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 
 	if (out == NULL || owned == NULL || !owned->postcommit
-		|| !ko_structure_effect_observation(owned, &s->terminal.binding,
-			wal, sizeof(wal))
+		|| !ko_structure_effect_observation(owned, &s->terminal.binding, wal, sizeof(wal))
 		|| !cluster_ko_shared_read_v2(owned, peer, &s->ko)
 		|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &s->change))
 		return false;
 	value.kind = CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2;
-	s->durability_flags = CLUSTER_PI_STRUCTURAL_WAL_FLUSHED
-		| CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK | CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED
-		| CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE;
+	s->durability_flags
+		= CLUSTER_PI_STRUCTURAL_WAL_FLUSHED | CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK
+		  | CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED | CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE;
 	if (s->change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE)
 		s->durability_flags |= CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
 	/* This value has no page/master cut. It can only transfer the completed
@@ -1200,8 +1203,9 @@ ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 	ClusterSpaceStructureChange change;
 	bool qualified;
 
-	if (ko_state == NULL || (MyBackendType != B_BACKEND && MyBackendType != B_AUTOVAC_WORKER
-							&& MyBackendType != B_BG_WORKER)
+	if (ko_state == NULL
+		|| (MyBackendType != B_BACKEND && MyBackendType != B_AUTOVAC_WORKER
+			&& MyBackendType != B_BG_WORKER)
 		|| CritSectionCount != 0 || CurrentResourceOwner == NULL
 		|| TopTransactionResourceOwner == NULL
 		|| (!from_commit_tail && CurrentResourceOwner != TopTransactionResourceOwner)
@@ -1209,27 +1213,31 @@ ko_native_publish(ClusterKoCompletionV2 *owned, bool from_commit_tail)
 		return false;
 	if (owned == NULL || owned->pid != MyProcPid || owned->owner != TopTransactionResourceOwner
 		|| !owned->native_transaction || !owned->barrier_private || owned->native_pending
-		|| owned->native_handed_off || !owned->postcommit
-		|| owned->serial == 0 || owned->native_reserved == NULL
-		|| !DsaPointerIsValid(owned->native_allocation))
+		|| owned->native_handed_off || !owned->postcommit || owned->serial == 0
+		|| owned->native_reserved == NULL || !DsaPointerIsValid(owned->native_allocation))
 		return false;
-	qualified = owned->space_observed
-		&& cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure), &change)
-		&& (change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE
-			|| (change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE && owned->truncate_observed));
-	if (!from_commit_tail && (!qualified
-		|| (change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE
-			&& !owned->drop_observed && !owned->native_buffers_released)))
+	qualified
+		= owned->space_observed
+		  && cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure), &change)
+		  && (change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE
+			  || (change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE
+				  && owned->truncate_observed));
+	if (!from_commit_tail
+		&& (!qualified
+			|| (change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE && !owned->drop_observed
+				&& !owned->native_buffers_released)))
 		return false;
 	work = owned->native_reserved;
 	memset(&work->context, 0, sizeof(work->context));
 	work->context.used = work->context.complete = true;
 	work->context.structure_owned = qualified;
 	work->recovery_required = !qualified;
-	work->buffers_released = qualified && (change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE
-		|| owned->drop_observed || owned->native_buffers_released);
-	work->context.structure_drop_pending
-		= qualified && change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE && !owned->drop_observed;
+	work->buffers_released = qualified
+							 && (change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE
+								 || owned->drop_observed || owned->native_buffers_released);
+	work->context.structure_drop_pending = qualified
+										   && change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE
+										   && !owned->drop_observed;
 	work->context.pid = owned->pid;
 	work->context.serial = owned->serial;
 	work->context.request = owned->barrier_request;
@@ -1303,8 +1311,10 @@ cluster_ko_shared_native_drop_buffers_released_v2(RelFileLocator locator)
 
 		if (owned->pid != MyProcPid || owned->owner != TopTransactionResourceOwner
 			|| !owned->native_transaction || owned->native_pending || !owned->postcommit
-			|| !owned->space_observed || !RelFileLocatorEquals(owned->terminal.identity.locator, locator)
-			|| !cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure), &change)
+			|| !owned->space_observed
+			|| !RelFileLocatorEquals(owned->terminal.identity.locator, locator)
+			|| !cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure),
+												   &change)
 			|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE)
 			continue;
 		owned->native_buffers_released = true;
@@ -1333,7 +1343,8 @@ cluster_ko_shared_native_drop_deferred_v2(RelFileLocator locator)
 		if (owned->pid == MyProcPid && owned->native_handed_off
 			&& RelFileLocatorEquals(owned->barrier_request.key.locator, locator)
 			&& (!owned->space_observed
-				|| (cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure), &change)
+				|| (cluster_space_structure_wal_decode(owned->structure, sizeof(owned->structure),
+													   &change)
 					&& change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE)))
 			return true;
 	}
@@ -1408,7 +1419,8 @@ cluster_ko_shared_native_promote_v2(void)
 			ko_state->native_waiting--;
 		}
 		SpinLockRelease(&ko_state->shared_lock);
-		ko_native_deferred(&before, &ko_native_report_serial, failed ? "PRODUCER_INCOMPLETE" : "PROMOTION_CUT");
+		ko_native_deferred(&before, &ko_native_report_serial,
+						   failed ? "PRODUCER_INCOMPLETE" : "PROMOTION_CUT");
 		return CLUSTER_KO_STRUCTURE_INVALID;
 	}
 	if (!buffers_released) {
@@ -1477,8 +1489,7 @@ ko_drop_context_current(const ClusterKoSharedContext *context)
 
 	return context->used && context->complete && context->structure_owned
 		   && context->structure_drop_pending && !context->structure_drop_failed
-		   && context->serial != 0
-		   && context->request.origin_node == cluster_node_id
+		   && context->serial != 0 && context->request.origin_node == cluster_node_id
 		   && cluster_space_structure_wal_decode(context->structure, sizeof(context->structure),
 												 &change)
 		   && change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE
@@ -1547,8 +1558,7 @@ cluster_ko_shared_drop_work_abandon_v2(ClusterKoDropWorkV2 *work, Size storage_b
 	work->abandoned = true;
 	if (ko_state != NULL) {
 		SpinLockAcquire(&ko_state->shared_lock);
-		if (memcmp(&ko_state->contexts[work->slot], &work->context,
-				   sizeof(work->context)) == 0)
+		if (memcmp(&ko_state->contexts[work->slot], &work->context, sizeof(work->context)) == 0)
 			ko_state->contexts[work->slot].structure_drop_failed = true;
 		SpinLockRelease(&ko_state->shared_lock);
 	}
@@ -1797,7 +1807,8 @@ ko_shared_structure_snapshot(uint32 slot, ClusterKoSharedContext *out)
 
 bool
 cluster_ko_shared_structure_observation_v2(uint32 slot, uint64 serial,
-	struct ClusterPageWalBindingV1 *terminal, void *wal, Size wal_length)
+										   struct ClusterPageWalBindingV1 *terminal, void *wal,
+										   Size wal_length)
 {
 	ClusterKoSharedContext context;
 	if (serial == 0 || terminal == NULL || wal == NULL
@@ -1900,15 +1911,14 @@ cluster_ko_shared_structure_finish_local_v2(uint32 slot, uint64 serial)
 
 bool
 cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer, uint64 *serial,
-	struct ClusterPiWritebackFactV2 *out)
+										  struct ClusterPiWritebackFactV2 *out)
 {
-	if (cursor == NULL || serial == NULL || out == NULL
-		|| *cursor >= CLUSTER_KO_SHARED_CAPACITY || peer < 0
-		|| peer >= CLUSTER_KO_SHARED_NODE_LIMIT || peer == cluster_node_id)
+	if (cursor == NULL || serial == NULL || out == NULL || *cursor >= CLUSTER_KO_SHARED_CAPACITY
+		|| peer < 0 || peer >= CLUSTER_KO_SHARED_NODE_LIMIT || peer == cluster_node_id)
 		return false;
 	for (uint32 i = *cursor; i < CLUSTER_KO_SHARED_CAPACITY; i++) {
 		ClusterKoSharedContext context;
-		ClusterPiWritebackFactV2 value = {0};
+		ClusterPiWritebackFactV2 value = { 0 };
 		ClusterPiStructuralFactV2 *s = &value.proof.structural;
 
 		if (!ko_shared_structure_snapshot(i, &context)
@@ -1920,15 +1930,15 @@ cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer, uint64 *se
 		s->ko.peer_boot = context.peer_boots[peer];
 		if (!ko_shared_control_current(&s->ko)
 			|| !cluster_space_structure_wal_decode(context.structure, sizeof(context.structure),
-				&s->change)
+												   &s->change)
 			|| (s->change.identity.action != CLUSTER_SPACE_WAL_TRUNCATE
 				&& s->change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE))
 			continue;
 		value.kind = CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_V2;
 		s->terminal.binding = context.terminal;
-		s->durability_flags = CLUSTER_PI_STRUCTURAL_WAL_FLUSHED
-			| CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK | CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED
-			| CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE;
+		s->durability_flags
+			= CLUSTER_PI_STRUCTURAL_WAL_FLUSHED | CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK
+			  | CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED | CLUSTER_PI_STRUCTURAL_EFFECT_DURABLE;
 		if (s->change.identity.action == CLUSTER_SPACE_WAL_TRUNCATE)
 			s->durability_flags |= CLUSTER_PI_STRUCTURAL_BASE_DURABLE;
 		*out = value;
@@ -2024,8 +2034,8 @@ cluster_ko_shared_postcommit_cleanup_v2(void)
  * Keep the ResourceOwner throughout; taking it does not complete the DDL or
  * convey COMMIT/durability. Ambiguous repeated barriers are not authority. */
 bool
-cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key,
-	const uint8 incarnation[16], ClusterKoCompletionV2 **out)
+cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key, const uint8 incarnation[16],
+						   ClusterKoCompletionV2 **out)
 {
 	ClusterKoCompletionV2 *candidate = NULL;
 	if (out == NULL || *out != NULL || key == NULL || incarnation == NULL)
@@ -2048,13 +2058,12 @@ cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key,
 
 bool
 cluster_ko_shared_read_v2(const ClusterKoCompletionV2 *completion, int32 peer,
-	ClusterKoSharedMessageV2 *out)
+						  ClusterKoSharedMessageV2 *out)
 {
 	ClusterKoSharedContext context;
 	ClusterKoSharedMessageV2 request;
-	if (out == NULL || peer < 0 || peer >= CLUSTER_KO_SHARED_NODE_LIMIT
-		|| peer == cluster_node_id || !ko_completion_snapshot(completion, &context)
-		|| context.peer_boots[peer] == 0)
+	if (out == NULL || peer < 0 || peer >= CLUSTER_KO_SHARED_NODE_LIMIT || peer == cluster_node_id
+		|| !ko_completion_snapshot(completion, &context) || context.peer_boots[peer] == 0)
 		return false;
 	request = context.request;
 	request.peer_node = peer;
@@ -2182,7 +2191,8 @@ cluster_ko_lmon_tick_v2(void)
 		if (ko_shared_request_owned(&message) && ko_shared_control_current(&message)
 			&& cluster_ko_shared_encode_v2(&message, bytes, sizeof(bytes)))
 			(void)cluster_ic_send_envelope(
-				message.verb == CLUSTER_KO_SHARED_REQUEST ? PGRAC_IC_MSG_KO_FLUSH : PGRAC_IC_MSG_KO_FLUSH_ACK,
+				message.verb == CLUSTER_KO_SHARED_REQUEST ? PGRAC_IC_MSG_KO_FLUSH
+														  : PGRAC_IC_MSG_KO_FLUSH_ACK,
 				message.verb == CLUSTER_KO_SHARED_REQUEST ? message.peer_node : message.origin_node,
 				bytes, sizeof(bytes));
 	}
@@ -2225,8 +2235,8 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 		} else if (ko_state->contexts[i].used && result == CLUSTER_NORMAL_STOP_READY) {
 			result = CLUSTER_NORMAL_STOP_PENDING;
 			why = ko_state->contexts[i].structure_owned ? "KO_SHARED_STRUCTURE_OWNED"
-				: ko_state->contexts[i].complete ? "KO_SHARED_COMPLETION_OWNED"
-				: "KO_SHARED_BARRIER_PENDING";
+				  : ko_state->contexts[i].complete		? "KO_SHARED_COMPLETION_OWNED"
+														: "KO_SHARED_BARRIER_PENDING";
 		}
 	}
 	SpinLockRelease(&ko_state->shared_lock);
@@ -2237,7 +2247,7 @@ cluster_ko_shared_normal_stop_poll_v2(const char **reason)
 
 static bool
 ko_shared_prepare_request(RelFileLocator locator, ClusterKoSharedMessageV2 *request,
-	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], uint32 *mask)
+						  uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], uint32 *mask)
 {
 	ClusterSpaceIdentity identity;
 	ClusterWalSourceRef ref;
@@ -2247,8 +2257,7 @@ ko_shared_prepare_request(RelFileLocator locator, ClusterKoSharedMessageV2 *requ
 		|| ref.claim.identity.origin_node_id != cluster_node_id
 		|| !cluster_space_relation_read_identity(locator, &identity)
 		|| identity.state != CLUSTER_SPACE_IDENTITY_LIVE
-		|| !ko_shared_members(request, boots, &generation)
-		|| boots[cluster_node_id] == 0
+		|| !ko_shared_members(request, boots, &generation) || boots[cluster_node_id] == 0
 		|| boots[cluster_node_id] != ref.claim.identity.origin_owner_incarnation
 		|| identity.key.system_identifier != ref.claim.identity.system_identifier
 		|| identity.key.database_incarnation != ref.claim.database_incarnation
@@ -2277,7 +2286,8 @@ ko_shared_prepare_request(RelFileLocator locator, ClusterKoSharedMessageV2 *requ
 
 static int
 ko_shared_reserve(const ClusterKoSharedMessageV2 *request,
-	const uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], ClusterKoCompletionV2 *completion)
+				  const uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT],
+				  ClusterKoCompletionV2 *completion)
 {
 	int context = -1;
 	if (!ko_exit_registered) {
@@ -2308,7 +2318,7 @@ ko_shared_reserve(const ClusterKoSharedMessageV2 *request,
 
 static bool
 ko_shared_wait_for_acks(ClusterKoSharedMessageV2 *request, uint32 mask,
-	const uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], TimestampTz deadline)
+						const uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT], TimestampTz deadline)
 {
 	ResetLatch(MyLatch);
 	KO_BUMP(flush_count);
@@ -2330,8 +2340,8 @@ ko_shared_wait_for_acks(ClusterKoSharedMessageV2 *request, uint32 mask,
 		if (now >= deadline)
 			break;
 		events = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-			(deadline - now + USECS_PER_MSEC - 1) / USECS_PER_MSEC,
-			WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT);
+						   (deadline - now + USECS_PER_MSEC - 1) / USECS_PER_MSEC,
+						   WAIT_EVENT_CLUSTER_OBJECT_FLUSH_WAIT);
 		ResetLatch(MyLatch);
 		if (events & WL_POSTMASTER_DEATH)
 			break;
@@ -2342,7 +2352,7 @@ ko_shared_wait_for_acks(ClusterKoSharedMessageV2 *request, uint32 mask,
 static bool
 ko_run_shared_barrier_impl(RelFileLocator locator, ClusterKoCompletionV2 *completion)
 {
-	ClusterKoSharedMessageV2 request = {0};
+	ClusterKoSharedMessageV2 request = { 0 };
 	uint64 boots[CLUSTER_KO_SHARED_NODE_LIMIT];
 	uint64 batch_id;
 	uint32 mask;
@@ -2366,11 +2376,12 @@ ko_run_shared_barrier_impl(RelFileLocator locator, ClusterKoCompletionV2 *comple
 	PG_TRY();
 	{
 		if (mask == 0) {
-			ClusterKoSharedContext scope = {0};
+			ClusterKoSharedContext scope = { 0 };
 			scope.request = request;
 			memcpy(scope.peer_boots, boots, sizeof(boots));
 			ok = ko_shared_origin_current(&scope) && ko_shared_space_current(&request);
-			if (ok) KO_BUMP(native_count);
+			if (ok)
+				KO_BUMP(native_count);
 		} else
 			begun = cluster_sinval_ack_wait_begin(request.batch_id, mask, deadline);
 		if (begun)
@@ -2454,7 +2465,9 @@ ko_run_barrier(RelFileLocator rloc, uint32 alive_mask)
 		long timeout_ms;
 		int rc;
 
-		if (hdr.epoch == 0 || hdr.epoch != cluster_epoch_get_current())
+		/* Legacy non-shared INITIAL uses epoch zero. Equality still binds
+		 * the whole barrier; shared requests use the nonzero v2 cut above. */
+		if ((cluster_shared_config && hdr.epoch == 0) || hdr.epoch != cluster_epoch_get_current())
 			break;
 		if (cluster_sinval_ack_wait_is_complete(batch_id)) {
 			/* The ACK lookup can overlap a reconfiguration. */
@@ -2552,7 +2565,8 @@ ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence, ClusterKoComplet
 		uint32 alive_mask = 0;
 
 		if (cluster_shared_config)
-			ok = completion != NULL ? ko_run_shared_barrier_impl(rloc, completion) : ko_run_shared_barrier(rloc);
+			ok = completion != NULL ? ko_run_shared_barrier_impl(rloc, completion)
+									: ko_run_shared_barrier(rloc);
 		else {
 			alive_mask = cluster_sinval_compute_alive_peer_mask();
 			if (alive_mask == 0) {
@@ -2685,8 +2699,8 @@ void
 cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *payload)
 {
 	const KoFlushHeader *hdr = (const KoFlushHeader *)payload;
-	KoFlushHeader legacy = {0};
-	ClusterKoSharedMessageV2 qualified = {0};
+	KoFlushHeader legacy = { 0 };
+	ClusterKoSharedMessageV2 qualified = { 0 };
 	uint32 head, tail, next;
 	bool shared = cluster_shared_config;
 
@@ -2694,8 +2708,7 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 		return;
 	if (shared) {
 		if (!cluster_ko_shared_decode_v2(payload, env->payload_length, &qualified)
-			|| qualified.verb != CLUSTER_KO_SHARED_REQUEST
-			|| qualified.peer_node != cluster_node_id
+			|| qualified.verb != CLUSTER_KO_SHARED_REQUEST || qualified.peer_node != cluster_node_id
 			|| qualified.origin_node != env->source_node_id
 			|| !ko_shared_control_current(&qualified))
 			return;
@@ -2708,7 +2721,7 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 		hdr = &legacy;
 	} else if (env->payload_length != (uint32)sizeof(KoFlushHeader))
 		return;
-	if (hdr->epoch == 0 || hdr->epoch != cluster_epoch_get_current())
+	if ((shared && hdr->epoch == 0) || hdr->epoch != cluster_epoch_get_current())
 		return; /* No request from another configuration can drain here. */
 	if (hdr->source_node < 0 || hdr->source_node >= CLUSTER_MAX_NODES
 		|| env->source_node_id != (uint32)hdr->source_node
@@ -2792,7 +2805,9 @@ cluster_ko_flush_ack_handler(const ClusterICEnvelope *env, const void *payload)
 		|| env->source_node_id != (uint32)hdr->acker_node
 		|| cluster_conf_lookup_node(hdr->acker_node) == NULL)
 		return;
-	if (hdr->epoch == 0 || hdr->epoch != cluster_epoch_get_current())
+	/* This is the legacy non-shared ACK branch; INITIAL is a real epoch.
+	 * Shared v2 ACKs retain their separate nonzero exact-cut validation. */
+	if (hdr->epoch != cluster_epoch_get_current())
 		return;
 	if (hdr->status != (uint16)KO_FLUSH_ACK_DONE)
 		return; /* KO-M6: only an apply-after-drop DONE fulfils the barrier */
@@ -2837,10 +2852,11 @@ cluster_ko_drain_inbound_and_apply(void)
 		rloc.spcOid = (Oid)slot.spc_oid;
 		rloc.dbOid = (Oid)slot.db_oid;
 		rloc.relNumber = (RelFileNumber)slot.rel_number;
-		if (slot.epoch == 0 || slot.epoch != cluster_epoch_get_current()
+		if ((slot.shared && slot.epoch == 0) || slot.epoch != cluster_epoch_get_current()
 			|| slot.shared != cluster_shared_config
-			|| (slot.shared && (!ko_shared_control_current(&slot.qualified)
-				|| !ko_shared_space_current(&slot.qualified))))
+			|| (slot.shared
+				&& (!ko_shared_control_current(&slot.qualified)
+					|| !ko_shared_space_current(&slot.qualified))))
 			goto next;
 		/* A peer may publish DONE only after its own bounded CTRC journal is
 		 * drained.  No ACK makes the enqueuer fail closed without extending

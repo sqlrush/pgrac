@@ -2689,24 +2689,55 @@ UT_TEST(test_pre2_stop_cohort_projection_does_not_admit_reconfiguration_debt)
 		identity_formation.startup_formation_generation = 2;
 		identity_formation.applied.new_epoch = identity_formation.local_epoch;
 		switch (bad) {
-		case 0: identity_formation.startup_formation_generation = 0; break;
-		case 1: identity_formation.startup_formation_generation = UINT64_MAX; break;
-		case 2: identity_formation.applied.new_epoch--; break;
-		case 3: identity_formation.applied.new_epoch++; break;
-		case 4: identity_formation.applied.event_id = 1; break;
-		case 5: identity_formation.applied.event_seq = 1; break;
-		case 6: identity_formation.applied.old_epoch = 1; break;
-		case 7: identity_formation.applied.reconfig_kind = RECONFIG_KIND_CLEAN_LEAVE; break;
-		case 8: identity_formation.applied.reconfig_kind = RECONFIG_KIND_FAIL_STOP; break;
-		case 9: identity_formation.applied.reconfig_kind = RECONFIG_KIND_JOIN_COMMITTED; break;
-		case 10: identity_formation.applied.dead_bitmap[0] = 1; break;
-		case 11: identity_formation.applied.join_bitmap[0] = 1; break;
-		case 12: identity_formation.applied.observer_role = CLUSTER_RECONFIG_OBSERVER_SURVIVOR; break;
-		case 13: identity_formation.applied.cssd_dead_generation = 1; break;
-		case 14: cluster_shared_config = false; break;
+		case 0:
+			identity_formation.startup_formation_generation = 0;
+			break;
+		case 1:
+			identity_formation.startup_formation_generation = UINT64_MAX;
+			break;
+		case 2:
+			identity_formation.applied.new_epoch--;
+			break;
+		case 3:
+			identity_formation.applied.new_epoch++;
+			break;
+		case 4:
+			identity_formation.applied.event_id = 1;
+			break;
+		case 5:
+			identity_formation.applied.event_seq = 1;
+			break;
+		case 6:
+			identity_formation.applied.old_epoch = 1;
+			break;
+		case 7:
+			identity_formation.applied.reconfig_kind = RECONFIG_KIND_CLEAN_LEAVE;
+			break;
+		case 8:
+			identity_formation.applied.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+			break;
+		case 9:
+			identity_formation.applied.reconfig_kind = RECONFIG_KIND_JOIN_COMMITTED;
+			break;
+		case 10:
+			identity_formation.applied.dead_bitmap[0] = 1;
+			break;
+		case 11:
+			identity_formation.applied.join_bitmap[0] = 1;
+			break;
+		case 12:
+			identity_formation.applied.observer_role = CLUSTER_RECONFIG_OBSERVER_SURVIVOR;
+			break;
+		case 13:
+			identity_formation.applied.cssd_dead_generation = 1;
+			break;
+		case 14:
+			cluster_shared_config = false;
+			break;
 		}
 		UT_ASSERT_EQ(cl_full_stop_capture_formation_only(false, identity_open.transition_epoch,
-													   &out, &reason), CLUSTER_NORMAL_STOP_INVALID);
+														 &out, &reason),
+					 CLUSTER_NORMAL_STOP_INVALID);
 		UT_ASSERT(strcmp(reason, "NORMAL_STOP_FORMATION_APPLIED_EVENT") == 0);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->identity_published), 0);
 	}

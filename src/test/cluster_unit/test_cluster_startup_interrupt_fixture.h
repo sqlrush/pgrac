@@ -14,12 +14,24 @@ static sigjmp_buf startup_fixture_exit;
 static bool startup_fixture_armed;
 static int startup_fixture_exit_code;
 static void (*startup_fixture_exit_hook)(void);
-static void StartupRereadConfig(void) {}
-static void WakeupRecovery(void) {}
-static bool PostmasterIsAlive(void) { return true; }
-static void ProcessProcSignalBarrier(void) {}
+static void
+StartupRereadConfig(void)
+{}
+static void
+WakeupRecovery(void)
+{}
+static bool
+PostmasterIsAlive(void)
+{
+	return true;
+}
+static void
+ProcessProcSignalBarrier(void)
+{}
 void ProcessLogMemoryContextInterrupt(void);
-void ProcessLogMemoryContextInterrupt(void) {}
+void
+ProcessLogMemoryContextInterrupt(void)
+{}
 static void startup_fixture_proc_exit(int code) pg_attribute_noreturn();
 static void
 startup_fixture_proc_exit(int code)
@@ -32,7 +44,8 @@ startup_fixture_proc_exit(int code)
 		startup_fixture_exit_hook();
 	siglongjmp(startup_fixture_exit, 1);
 }
-static void startup_fixture_stderr(const char *fmt pg_attribute_unused(), ...)
+static void
+startup_fixture_stderr(const char *fmt pg_attribute_unused(), ...)
 {
 	abort();
 }

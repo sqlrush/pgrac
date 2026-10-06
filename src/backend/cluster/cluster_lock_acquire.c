@@ -666,10 +666,10 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 	if (req->hw_grant.key.request_id != 0) {
 		ClusterGesHwGrant *grant = &((ClusterLockAcquireRequest *)req)->hw_grant;
 		volatile bool promoted = false;
-		bool mode_aware = cluster_lock_acquire_is_relation_request(req)
-						  || cluster_lock_acquire_is_cf_request(req)
-						  || (cluster_lock_acquire_is_hw_request(req)
-							  && grant->master == cluster_node_id);
+		bool mode_aware
+			= cluster_lock_acquire_is_relation_request(req)
+			  || cluster_lock_acquire_is_cf_request(req)
+			  || (cluster_lock_acquire_is_hw_request(req) && grant->master == cluster_node_id);
 
 		if (grant->consumed) {
 			mut->registration_failure_reason = "GRANT_ALREADY_CONSUMED";

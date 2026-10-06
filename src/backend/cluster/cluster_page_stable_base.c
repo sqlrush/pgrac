@@ -852,8 +852,8 @@ rf_page_stable_base_proof_destroy_v1(RfPageStableBaseProofV1 **proof_pointer)
 
 bool
 rf_page_stable_base_proof_covers_version_v1(const RfPageStableBaseProofV1 *proof,
-											 const RfPageIdentityV1 *identity,
-											 const RfPageVersionV1 *version)
+											const RfPageIdentityV1 *identity,
+											const RfPageVersionV1 *version)
 {
 	const RfContributorVectorV1 *vector;
 	uint32 i;

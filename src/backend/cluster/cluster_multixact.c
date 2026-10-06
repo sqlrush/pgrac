@@ -707,8 +707,10 @@ cluster_multixact_recovery_projection_apply(void *arg, int origin_slot, uint32 c
 			|| !cluster_multixact_projection_build_members(cluster_epoch, native_members,
 														   operation->member_count, members, wraps))
 			return false;
-		if (cluster_shared_config && !cluster_multixact_native_recovery_apply(
-				origin_slot, operation, owned_payload, owned_payload_length, source_lsn, source_end_lsn))
+		if (cluster_shared_config
+			&& !cluster_multixact_native_recovery_apply(origin_slot, operation, owned_payload,
+														owned_payload_length, source_lsn,
+														source_end_lsn))
 			return false;
 		memset(&key, 0, sizeof(key));
 		key.origin_node_id = (uint16)origin_slot;
@@ -725,8 +727,10 @@ cluster_multixact_recovery_projection_apply(void *arg, int origin_slot, uint32 c
 		HASH_SEQ_STATUS sequence;
 		ClusterMultiXactOverlayEntry *entry;
 
-		if (cluster_shared_config && !cluster_multixact_native_recovery_apply(
-				origin_slot, operation, owned_payload, owned_payload_length, source_lsn, source_end_lsn))
+		if (cluster_shared_config
+			&& !cluster_multixact_native_recovery_apply(origin_slot, operation, owned_payload,
+														owned_payload_length, source_lsn,
+														source_end_lsn))
 			return false;
 		LWLockAcquire(ClusterMultiXactLock, LW_EXCLUSIVE);
 		hash_seq_init(&sequence, ClusterMultiXactHTAB);
@@ -752,8 +756,10 @@ cluster_multixact_recovery_projection_verify(void *arg, int origin_slot, uint32 
 		|| origin_slot >= (1 << 7) || cluster_epoch == 0
 		|| cluster_epoch != (uint32)cluster_epoch_get_current())
 		return false;
-	if (cluster_shared_config && !cluster_multixact_native_recovery_verify(
-			origin_slot, operation, owned_payload, owned_payload_length, source_lsn, source_end_lsn))
+	if (cluster_shared_config
+		&& !cluster_multixact_native_recovery_verify(origin_slot, operation, owned_payload,
+													 owned_payload_length, source_lsn,
+													 source_end_lsn))
 		return false;
 	if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_CREATE) {
 		ClusterMultiXactKey key;

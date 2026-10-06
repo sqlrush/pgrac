@@ -1123,8 +1123,7 @@ read_startup_maxima(const ClusterWalStartupObservation *input,
 
 static ClusterControlRootResult
 read_initializing_capacity(BootstrapReadWork *work, const char *wal_root,
-						   const ClusterWalSourceRef *ref,
-						   ClusterControlRecoveryCapacity *required)
+						   const ClusterWalSourceRef *ref, ClusterControlRecoveryCapacity *required)
 {
 	ClusterWalStartupObservation input;
 	ClusterControlRootResult result;

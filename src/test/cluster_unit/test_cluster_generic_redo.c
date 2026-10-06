@@ -151,6 +151,8 @@ void
 BufferGetTag(Buffer buffer, RelFileLocator *locator, ForkNumber *forknum, BlockNumber *blockno)
 {
 	UT_ASSERT(buffer >= 1 && buffer <= 4);
+	if (buffer < 1 || buffer > 4)
+		abort();
 	*locator = decoded->blocks[buffer - 1].rlocator;
 	*forknum = MAIN_FORKNUM;
 	*blockno = buffer - 1;

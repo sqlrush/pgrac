@@ -2031,8 +2031,7 @@ wal_reuse_current_v2_root(const ClusterWalReuseGuardRequest *request, ClusterWal
 	{
 		bool terminal_blocked = false;
 		ClusterControlRootResult terminal_result
-			= cluster_control_root_v3_terminal_history_blocked(&request->duty,
-																						 &terminal_blocked);
+			= cluster_control_root_v3_terminal_history_blocked(&request->duty, &terminal_blocked);
 		if (!control_root_read_ready(terminal_result)) {
 			*out_reason = CLUSTER_WAL_DENY_ROOT_UNAVAILABLE;
 			return CLUSTER_WAL_GUARD_BLOCKED;

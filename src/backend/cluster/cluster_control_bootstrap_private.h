@@ -108,9 +108,9 @@ cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, cons
 /* Read-only route/input check. pg_wal may be a symlink, but must resolve to the
  * exact owned no-follow generation selected by ref. Does not certify WAL bytes
  * or grant writer admission, and never creates a missing claim or prefix. */
-extern ClusterControlRootResult
-cluster_control_bootstrap_wal_route(const char *pgdata, const char *wal_root,
-									const ClusterWalSourceRef *ref);
+extern ClusterControlRootResult cluster_control_bootstrap_wal_route(const char *pgdata,
+																	const char *wal_root,
+																	const ClusterWalSourceRef *ref);
 /* Before native startup, an interrupted initialization may have durably
  * exchanged pg_wal while the predecessor remains the immutable read input.
  * Select by pinned directory identity, not validation-error fallback. */
@@ -143,9 +143,10 @@ cluster_control_native_side_observe(const char *shared_root, uint32 node_id,
 /* Qualified recovery executor only: fsync the same actual cursor files and
  * directories, then revalidate the observation. Caller owns exact isolation,
  * WALR/IR and selected-root revalidation. Does not publish a terminal. */
-extern ClusterControlRootResult
-cluster_control_native_side_sync(const char *shared_root, uint32 node_id,
-	const ControlFileData *input, ClusterNativeSideObservation *out);
+extern ClusterControlRootResult cluster_control_native_side_sync(const char *shared_root,
+																 uint32 node_id,
+																 const ControlFileData *input,
+																 ClusterNativeSideObservation *out);
 
 /* Read-only rejection of native startup inputs whose recovery/cleanup is not
  * supported in this mode. Never removes backup, replication or prepared state.
@@ -171,8 +172,7 @@ extern void cluster_control_bootstrap_prepare(const char *pgdata, const char *sh
 /* Postmaster's actual WAL-thread initialization must reobserve the successful
  * early preparation before putting this read-only reference in shared memory.
  * FATAL when unprepared, changed, misrouted or called from a child. */
-extern void cluster_control_bootstrap_wal_recheck(const char *pgdata,
-												  ClusterWalSourceRef *out);
+extern void cluster_control_bootstrap_wal_recheck(const char *pgdata, ClusterWalSourceRef *out);
 
 /* Register only the same postmaster's qualified early observation with the
  * read-only catalog consumer. No migration, input creation or serving grant. */

@@ -88,25 +88,21 @@ ko_shared_get(const uint8 *bytes, unsigned count)
 static bool
 ko_shared_valid(const ClusterKoSharedMessageV2 *m)
 {
-	if (m == NULL || m->batch_id == 0 || m->batch_id == UINT64_MAX
-		|| m->epoch == 0 || m->epoch == UINT64_MAX
-		|| m->origin_boot == 0 || m->origin_boot == UINT64_MAX
-		|| m->peer_boot == 0 || m->peer_boot == UINT64_MAX
-		|| m->key.system_identifier == 0 || m->key.database_incarnation == 0
-		|| !ko_shared_nonzero(m->key.storage_uuid, 16)
-		|| !ko_shared_nonzero(m->incarnation, 16)
-		|| m->key.locator.spcOid == InvalidOid
+	if (m == NULL || m->batch_id == 0 || m->batch_id == UINT64_MAX || m->epoch == 0
+		|| m->epoch == UINT64_MAX || m->origin_boot == 0 || m->origin_boot == UINT64_MAX
+		|| m->peer_boot == 0 || m->peer_boot == UINT64_MAX || m->key.system_identifier == 0
+		|| m->key.database_incarnation == 0 || !ko_shared_nonzero(m->key.storage_uuid, 16)
+		|| !ko_shared_nonzero(m->incarnation, 16) || m->key.locator.spcOid == InvalidOid
 		|| m->key.locator.relNumber == InvalidRelFileNumber
 		|| m->origin_node >= CLUSTER_KO_SHARED_MEMBER_BYTES * 8
-		|| m->peer_node >= CLUSTER_KO_SHARED_MEMBER_BYTES * 8
-		|| m->origin_node == m->peer_node
+		|| m->peer_node >= CLUSTER_KO_SHARED_MEMBER_BYTES * 8 || m->origin_node == m->peer_node
 		|| (m->members[m->origin_node / 8] & (1u << (m->origin_node % 8))) == 0
 		|| (m->members[m->peer_node / 8] & (1u << (m->peer_node % 8))) == 0
 		|| !ko_shared_nonzero(m->member_digest, sizeof(m->member_digest)))
 		return false;
 	return (m->verb == CLUSTER_KO_SHARED_REQUEST && m->status == CLUSTER_KO_SHARED_REQUEST_STATUS)
-		|| (m->verb == CLUSTER_KO_SHARED_ACK
-			&& (m->status == CLUSTER_KO_SHARED_DONE || m->status == CLUSTER_KO_SHARED_FAILED));
+		   || (m->verb == CLUSTER_KO_SHARED_ACK
+			   && (m->status == CLUSTER_KO_SHARED_DONE || m->status == CLUSTER_KO_SHARED_FAILED));
 }
 
 bool
@@ -145,11 +141,11 @@ bool
 cluster_ko_shared_decode_v2(const void *data, size_t length, ClusterKoSharedMessageV2 *out)
 {
 	const uint8 *bytes = data;
-	ClusterKoSharedMessageV2 m = {0};
+	ClusterKoSharedMessageV2 m = { 0 };
 
 	if (bytes == NULL || out == NULL || length != CLUSTER_KO_SHARED_V2_BYTES
-		|| ko_shared_overlap(bytes, length, out, sizeof(*out))
-		|| memcmp(bytes, "PKO2", 4) != 0 || ko_shared_get(bytes + 4, 2) != 2
+		|| ko_shared_overlap(bytes, length, out, sizeof(*out)) || memcmp(bytes, "PKO2", 4) != 0
+		|| ko_shared_get(bytes + 4, 2) != 2
 		|| ko_shared_get(bytes + 6, 2) != CLUSTER_KO_SHARED_V2_BYTES
 		|| ko_shared_get(bytes + 12, 4) != 0)
 		return false;
@@ -178,7 +174,7 @@ cluster_ko_shared_decode_v2(const void *data, size_t length, ClusterKoSharedMess
 
 bool
 cluster_ko_shared_ack_matches_v2(const ClusterKoSharedMessageV2 *request,
-							   const ClusterKoSharedMessageV2 *ack)
+								 const ClusterKoSharedMessageV2 *ack)
 {
 	ClusterKoSharedMessageV2 normalized;
 	uint8 expected[CLUSTER_KO_SHARED_V2_BYTES], observed[CLUSTER_KO_SHARED_V2_BYTES];
@@ -191,7 +187,7 @@ cluster_ko_shared_ack_matches_v2(const ClusterKoSharedMessageV2 *request,
 	normalized.verb = CLUSTER_KO_SHARED_REQUEST;
 	normalized.status = CLUSTER_KO_SHARED_REQUEST_STATUS;
 	return cluster_ko_shared_encode_v2(request, expected, sizeof(expected))
-		&& cluster_ko_shared_encode_v2(&normalized, observed, sizeof(observed))
-		&& memcmp(expected, observed, sizeof(expected)) == 0;
+		   && cluster_ko_shared_encode_v2(&normalized, observed, sizeof(observed))
+		   && memcmp(expected, observed, sizeof(expected)) == 0;
 }
 #endif

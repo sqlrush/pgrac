@@ -77,8 +77,8 @@ cluster_scn_recovery_replay_observe(SCN scn pg_attribute_unused())
 }
 
 RfPageProofDetailV1
-rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan,
-	uint8 instance, uint32 segment, uint32 block, RfSideUndoBlockImageV1 *out)
+rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
+										  uint32 segment, uint32 block, RfSideUndoBlockImageV1 *out)
 {
 	UT_ASSERT(false); /* This fixture contains TT records only. */
 	return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
@@ -87,21 +87,23 @@ rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan,
 /* Immutable-planner boundary; the real planner's source/slot proof is covered
  * by test_cluster_side_xact. This fixture supplies one predetermined result. */
 RfPageProofDetailV1
-rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan,
-	uint8 instance, uint32 segment, const char *base, RfSideUndoHeaderImageV1 *out)
+rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan, uint8 instance,
+										   uint32 segment, const char *base,
+										   RfSideUndoHeaderImageV1 *out)
 {
 	TTSlot *slot;
 
 	UT_ASSERT(plan != NULL && instance == 3 && segment == 513);
-	if (capture.bad_commit) return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	if (capture.bad_commit)
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	memset(out, 0, sizeof(*out));
 	memcpy(out->page.data, base, BLCKSZ);
 	slot = &((UndoSegmentHeaderData *)out->page.data)->tt_slots[4];
 	memset(slot, 0, sizeof(*slot));
 	slot->xid = 802;
 	slot->wrap = 7;
-	slot->status = capture.legacy_terminal == XLOG_UNDO_TT_SLOT_ABORT
-		? TT_SLOT_ABORTED : TT_SLOT_COMMITTED;
+	slot->status
+		= capture.legacy_terminal == XLOG_UNDO_TT_SLOT_ABORT ? TT_SLOT_ABORTED : TT_SLOT_COMMITTED;
 	slot->commit_scn = slot->status == TT_SLOT_COMMITTED ? 999 : InvalidScn;
 	out->operation_count = 2;
 	out->source_index = 1;
@@ -110,7 +112,7 @@ rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan,
 
 bool
 rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
-	const RfSideXactOperationV1 *operation)
+									   const RfSideXactOperationV1 *operation)
 {
 	return plan != NULL && operation->kind == RF_SIDE_XACT_COMMIT && operation->has_tt_delta;
 }
@@ -123,11 +125,13 @@ rf_side_online_plan_scratch_available_v1(const RfSideOnlinePlanV1 *plan)
 
 bool
 cluster_undo_recovery_scope_enter_v1(ClusterUndoRecoveryScopeV1 *scope,
-	const ClusterThreadRecoveryAuthorityV1 *authority, const RfSideOnlinePlanV1 *plan)
+									 const ClusterThreadRecoveryAuthorityV1 *authority,
+									 const RfSideOnlinePlanV1 *plan)
 {
 	UT_ASSERT(authority == &canonical_authority);
 	UT_ASSERT(plan != NULL && active_scope == NULL);
-	if (capture.scope_denied) return false;
+	if (capture.scope_denied)
+		return false;
 	capture.scope_enters++;
 	active_scope = scope;
 	return true;
@@ -143,8 +147,8 @@ cluster_undo_recovery_scope_leave_v1(ClusterUndoRecoveryScopeV1 *scope)
 }
 
 bool
-cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment,
-	uint8 owner, uint32 block, char *out)
+cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment, uint8 owner,
+							 uint32 block, char *out)
 {
 	UT_ASSERT_EQ(intent, CLUSTER_UNDO_PATH_RECOVERY_SHARED);
 	UT_ASSERT(active_scope != NULL);
@@ -153,20 +157,22 @@ cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment,
 	UT_ASSERT_EQ(block, 0);
 	capture.target_reads++;
 	memcpy(out, canonical_header.data, BLCKSZ);
-	if (capture.post_read_mismatch && capture.header_writes != 0) out[128] ^= 1;
+	if (capture.post_read_mismatch && capture.header_writes != 0)
+		out[128] ^= 1;
 	return true;
 }
 
 bool
-cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment,
-	uint8 instance, uint32 block, const char *data, bool sync)
+cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment, uint8 instance,
+							  uint32 block, const char *data, bool sync)
 {
 	UT_ASSERT_EQ(intent, CLUSTER_UNDO_PATH_RECOVERY_SHARED);
 	UT_ASSERT(active_scope != NULL && segment == 513 && instance == 3 && block == 0 && sync);
 	/* All target checks must precede even the first canonical write. */
 	UT_ASSERT_EQ(capture.projection_preflights, 1);
 	capture.header_writes++;
-	if (capture.write_failure) return false;
+	if (capture.write_failure)
+		return false;
 	memcpy(canonical_header.data, data, BLCKSZ);
 	capture.header_syncs++;
 	return true;
@@ -182,17 +188,19 @@ cluster_undo_smgr_fsync_segment_file(uint32 segment, uint8 instance)
 
 bool
 cluster_undo_smgr_recovery_probe_v1(uint32 segment, uint8 instance,
-	ClusterUndoSmgrRecoveryFileV1 *file, char out[BLCKSZ])
+									ClusterUndoSmgrRecoveryFileV1 *file, char out[BLCKSZ])
 {
 	memset(file, 0, sizeof(*file));
 	file->exists = true;
 	file->size = UNDO_SEGMENT_SIZE_BYTES;
-	return cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RECOVERY_SHARED, segment, instance, 0, out);
+	return cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RECOVERY_SHARED, segment, instance, 0,
+										out);
 }
 
 bool
 cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 instance, uint32 block,
-	const ClusterUndoSmgrRecoveryFileV1 *file, char out[BLCKSZ])
+										 const ClusterUndoSmgrRecoveryFileV1 *file,
+										 char out[BLCKSZ])
 {
 	UT_ASSERT(false);
 	return false;
@@ -200,17 +208,19 @@ cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 instance, uint32 
 
 bool
 cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
-	const ClusterUndoSmgrRecoveryFileV1 *file, const char base[BLCKSZ], const char final[BLCKSZ])
+										  const ClusterUndoSmgrRecoveryFileV1 *file,
+										  const char base[BLCKSZ], const char final[BLCKSZ])
 {
 	UT_ASSERT(false);
 	return false;
 }
 
 RfSideXactApplyResultV1
-rf_side_xact_apply_covered_commit_v1(const RfSideXactOperationV1 *operation,
-	void *arg, bool (*verify)(void *, const RfSideXactOperationV1 *))
+rf_side_xact_apply_covered_commit_v1(const RfSideXactOperationV1 *operation, void *arg,
+									 bool (*verify)(void *, const RfSideXactOperationV1 *))
 {
-	if (!verify(arg, operation)) return RF_SIDE_XACT_APPLY_BLOCKED;
+	if (!verify(arg, operation))
+		return RF_SIDE_XACT_APPLY_BLOCKED;
 	UT_ASSERT_EQ(capture.header_syncs, 1);
 	capture.covered_commits++;
 	return RF_SIDE_XACT_APPLY_OK;
@@ -359,11 +369,12 @@ make_operations(RfSideOnlineOperationV1 operations[3])
 			operations[1].undo = *undo;
 			operations[1].undo.opcode = capture.legacy_terminal;
 			operations[1].undo.kind = capture.legacy_terminal == XLOG_UNDO_TT_SLOT_COMMIT
-				? CLUSTER_UNDO_KIND_TT_COMMIT : CLUSTER_UNDO_KIND_TT_ABORT;
+										  ? CLUSTER_UNDO_KIND_TT_COMMIT
+										  : CLUSTER_UNDO_KIND_TT_ABORT;
 			operations[1].undo.format_version = 0;
 			operations[1].undo.xid = capture.bad_commit ? 803 : 802;
-			operations[1].undo.commit_scn = capture.legacy_terminal == XLOG_UNDO_TT_SLOT_COMMIT
-				? 999 : InvalidScn;
+			operations[1].undo.commit_scn
+				= capture.legacy_terminal == XLOG_UNDO_TT_SLOT_COMMIT ? 999 : InvalidScn;
 		}
 	}
 }
@@ -380,9 +391,11 @@ rf_side_online_plan_preflight_v1(const RfSideOnlinePlanV1 *plan, const RfSideOnl
 	if (!ops->begin_protected_set(ops->arg))
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	for (i = 0; i < 3; i++) {
-		bool accepted = operations[i].kind == RF_SIDE_ONLINE_OPERATION_XACT ? ops->preflight_xact(ops->arg, &operations[i])
-						: operations[i].kind == RF_SIDE_ONLINE_OPERATION_UNDO ? ops->preflight_undo(ops->arg, &operations[i])
-								 : ops->preflight_projection(ops->arg, &operations[i]);
+		bool accepted = operations[i].kind == RF_SIDE_ONLINE_OPERATION_XACT
+							? ops->preflight_xact(ops->arg, &operations[i])
+						: operations[i].kind == RF_SIDE_ONLINE_OPERATION_UNDO
+							? ops->preflight_undo(ops->arg, &operations[i])
+							: ops->preflight_projection(ops->arg, &operations[i]);
 
 		if (!accepted) {
 			ops->end_protected_set(ops->arg, false);
@@ -407,9 +420,11 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan, const RfSideOnlineA
 	if (!ops->begin_protected_set(ops->arg))
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	for (i = 0; i < 3; i++) {
-		bool accepted = operations[i].kind == RF_SIDE_ONLINE_OPERATION_XACT ? ops->preflight_xact(ops->arg, &operations[i])
-						: operations[i].kind == RF_SIDE_ONLINE_OPERATION_UNDO ? ops->preflight_undo(ops->arg, &operations[i])
-								 : ops->preflight_projection(ops->arg, &operations[i]);
+		bool accepted = operations[i].kind == RF_SIDE_ONLINE_OPERATION_XACT
+							? ops->preflight_xact(ops->arg, &operations[i])
+						: operations[i].kind == RF_SIDE_ONLINE_OPERATION_UNDO
+							? ops->preflight_undo(ops->arg, &operations[i])
+							: ops->preflight_projection(ops->arg, &operations[i]);
 
 		if (!accepted) {
 			ops->end_protected_set(ops->arg, false);
@@ -417,9 +432,11 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan, const RfSideOnlineA
 		}
 	}
 	for (i = 0; i < 3; i++) {
-		bool applied = operations[i].kind == RF_SIDE_ONLINE_OPERATION_XACT ? ops->apply_xact(ops->arg, &operations[i])
-					   : operations[i].kind == RF_SIDE_ONLINE_OPERATION_UNDO ? ops->apply_undo(ops->arg, &operations[i])
-								: ops->apply_projection(ops->arg, &operations[i]);
+		bool applied = operations[i].kind == RF_SIDE_ONLINE_OPERATION_XACT
+						   ? ops->apply_xact(ops->arg, &operations[i])
+					   : operations[i].kind == RF_SIDE_ONLINE_OPERATION_UNDO
+						   ? ops->apply_undo(ops->arg, &operations[i])
+						   : ops->apply_projection(ops->arg, &operations[i]);
 
 		if (!applied) {
 			ops->end_protected_set(ops->arg, false);
@@ -560,19 +577,22 @@ UT_TEST(test_canonical_owner_evolves_private_header_before_any_apply)
 		cluster_undo_segment_make_header_bytes(513, 3, canonical_header.data);
 		saved = canonical_header;
 		UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &canonical_authority,
-			canonical_fresh, 19, true));
+														  canonical_fresh, 19, true));
 		UT_ASSERT(rf_side_online_production_bind_undo_v1(&owner, &canonical_authority));
 		UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner),
-			fault == 0 ? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+					 fault == 0 ? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
 		UT_ASSERT_EQ(capture.xact_applies + capture.undo_applies, 0);
 		UT_ASSERT_EQ(capture.header_writes, fault == 0 ? 1 : 0);
 		UT_ASSERT_EQ(capture.scope_enters, fault == 3 ? 0 : 1);
 		UT_ASSERT_EQ(capture.scope_leaves, capture.scope_enters);
-		if (fault == 0) UT_ASSERT(capture.target_reads >= 3);
-		else UT_ASSERT_EQ(capture.target_reads, fault == 1 ? 1 : 0);
+		if (fault == 0)
+			UT_ASSERT(capture.target_reads >= 3);
+		else
+			UT_ASSERT_EQ(capture.target_reads, fault == 1 ? 1 : 0);
 		UT_ASSERT(active_scope == NULL && owner.undo_headers == NULL);
 		UT_ASSERT_EQ(capture.pushes, capture.pops);
-		if (fault != 0) UT_ASSERT(memcmp(canonical_header.data, saved.data, BLCKSZ) == 0);
+		if (fault != 0)
+			UT_ASSERT(memcmp(canonical_header.data, saved.data, BLCKSZ) == 0);
 	}
 }
 
@@ -588,8 +608,8 @@ UT_TEST(test_canonical_owner_error_releases_qualified_scope_and_headers)
 	capture.scratch_budget = RF_SIDE_ONLINE_PLAN_MAX_BYTES;
 	capture.authority_throw_after_pop = true;
 	cluster_undo_segment_make_header_bytes(513, 3, canonical_header.data);
-	UT_ASSERT(rf_side_online_production_owner_init_v1(owner, &canonical_authority,
-		canonical_fresh, 19, true));
+	UT_ASSERT(rf_side_online_production_owner_init_v1(owner, &canonical_authority, canonical_fresh,
+													  19, true));
 	UT_ASSERT(rf_side_online_production_bind_undo_v1(owner, &canonical_authority));
 	PG_TRY();
 	{
@@ -611,7 +631,7 @@ UT_TEST(test_canonical_owner_error_releases_qualified_scope_and_headers)
 
 UT_TEST(test_legacy_terminal_preflight_preserves_exact_apply_admission)
 {
-	const uint16 opcodes[] = {XLOG_UNDO_TT_SLOT_COMMIT, XLOG_UNDO_TT_SLOT_ABORT};
+	const uint16 opcodes[] = { XLOG_UNDO_TT_SLOT_COMMIT, XLOG_UNDO_TT_SLOT_ABORT };
 
 	for (unsigned i = 0; i < lengthof(opcodes); i++)
 		for (int wrong_xid = 0; wrong_xid < 2; wrong_xid++) {
@@ -626,10 +646,11 @@ UT_TEST(test_legacy_terminal_preflight_preserves_exact_apply_admission)
 			capture.scratch_budget = RF_SIDE_ONLINE_PLAN_MAX_BYTES;
 			cluster_undo_segment_make_header_bytes(513, 3, canonical_header.data);
 			UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &canonical_authority,
-				canonical_fresh, 19, true));
+															  canonical_fresh, 19, true));
 			UT_ASSERT(rf_side_online_production_bind_undo_v1(&owner, &canonical_authority));
-			UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner), wrong_xid
-				? RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE : RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner),
+						 wrong_xid ? RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE
+								   : RF_PAGE_PROOF_DETAIL_OK);
 			UT_ASSERT_EQ(capture.undo_applies, 0);
 			UT_ASSERT_EQ(capture.header_writes, wrong_xid ? 0 : 1);
 			UT_ASSERT_EQ(capture.projection_applies, wrong_xid ? 0 : 1);
@@ -651,10 +672,10 @@ UT_TEST(test_canonical_header_install_precedes_covered_commit_and_is_repeatable)
 		capture.post_read_mismatch = failure == 2;
 		cluster_undo_segment_make_header_bytes(513, 3, canonical_header.data);
 		UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &canonical_authority,
-			canonical_fresh, 19, true));
+														  canonical_fresh, 19, true));
 		UT_ASSERT(rf_side_online_production_bind_undo_v1(&owner, &canonical_authority));
-		UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner), failure == 0
-			? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner),
+					 failure == 0 ? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
 		UT_ASSERT_EQ(capture.header_writes, 1);
 		UT_ASSERT_EQ(capture.covered_commits, failure == 0 ? 1 : 0);
 		UT_ASSERT_EQ(capture.undo_applies + capture.xact_applies, 0);

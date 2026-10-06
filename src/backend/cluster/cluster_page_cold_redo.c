@@ -136,7 +136,7 @@ bool
 cluster_page_cold_redo_vm_image_applied_v1(XLogReaderState *record, uint8 block_id)
 {
 	ClusterColdRedoBlockV1 decision;
-	ColdRedoTarget *target = cold_redo_target(record, block_id, &decision);
+	const ColdRedoTarget *target = cold_redo_target(record, block_id, &decision);
 
 	if (decision.action != CLUSTER_COLD_REDO_APPLY || target->forknum != VISIBILITYMAP_FORKNUM
 		|| (target->read && (!target->dirtied || !target->image)))
@@ -300,7 +300,7 @@ cluster_page_cold_redo_end_v1(XLogReaderState *record)
 	if (!cold_redo_record_matches(record))
 		cold_redo_refuse(record, -1);
 	for (uint8 i = 0; i <= XLR_MAX_BLOCK_ID; i++) {
-		ColdRedoTarget *target = &cold_redo.targets[i];
+		const ColdRedoTarget *target = &cold_redo.targets[i];
 		ClusterColdRedoBlockV1 decision;
 		if (!target->present)
 			continue;

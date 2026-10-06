@@ -272,15 +272,13 @@ data_incarnation_fits(const ClusterColdPlanV1 *plan, const ColdComponent *compon
  * never a redo base.  Anything else is refused.
  */
 static ClusterColdDetailV1
-page_header_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
+page_header_position(const ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 					 const ClusterColdDataV1 *data, int64 *position, bool *stale,
 					 ClusterColdDiagV1 *diag)
 {
 	const ColdComponent *first = cold_component(plan, chain[0]);
 	bool new_start = first->before_kind != RF_PAGE_STATE_PRESENT;
 	bool fits = data_incarnation_fits(plan, first, data);
-	uint32 matches = 0;
-	uint32 i;
 
 	*stale = false;
 	*position = -1;
@@ -300,7 +298,8 @@ page_header_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 		if (data->kind != CLUSTER_COLD_DATA_UNFORMATTED || fits)
 			return CLUSTER_COLD_OK;
 	} else {
-		for (i = 0; i < count; i++) {
+		uint32 matches = 0;
+		for (uint32 i = 0; i < count; i++) {
 			const ColdComponent *component = cold_component(plan, chain[i]);
 
 			if (component->result_token == data->version.mutation_token
@@ -331,7 +330,7 @@ page_header_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 
 /* DATA cannot be a redo base: rebuild from the earliest replayable anchor. */
 static ClusterColdDetailV1
-page_rebuild_from_anchor(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
+page_rebuild_from_anchor(const ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 						 const ClusterColdDataV1 *data, ClusterColdDetailV1 missing,
 						 uint32 diag_index, int64 *covered, ClusterColdDiagV1 *diag)
 {
@@ -357,7 +356,7 @@ page_rebuild_from_anchor(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 co
  * whose header alone placed it.
  */
 static ClusterColdDetailV1
-page_data_position(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
+page_data_position(const ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 				   const ClusterColdDataV1 *data, int64 *covered, bool *exact, int64 *position,
 				   ClusterColdDiagV1 *diag)
 {
@@ -414,7 +413,7 @@ apply_verdict(uint16 edge_flags)
 }
 
 static ClusterColdDetailV1
-page_assign_verdicts(ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
+page_assign_verdicts(const ClusterColdPlanV1 *plan, const uint32 *chain, uint32 count,
 					 const ClusterColdDataV1 *data, int64 covered, bool exact, int64 position,
 					 ClusterColdDiagV1 *diag)
 {
@@ -538,6 +537,8 @@ work_free(ClusterColdPlanV1 *plan, ColdSealWork *work)
 
 	for (i = 0; i < lengthof(arrays); i++)
 		if (*arrays[i] != NULL) {
+			/* Function call through cold_free/pfree, not a shadow declaration. */
+			// cppcheck-suppress shadowVariable
 			cold_free(*arrays[i]);
 			*arrays[i] = NULL;
 		}

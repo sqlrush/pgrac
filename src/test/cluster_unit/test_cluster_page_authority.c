@@ -131,12 +131,12 @@ cluster_recovery_duty_key_compare_for_claim(const ClusterRecoveryDutyKey *expect
 
 bool
 rf_page_stable_base_proof_covers_version_v1(const RfPageStableBaseProofV1 *proof,
-											 const RfPageIdentityV1 *identity,
-											 const RfPageVersionV1 *version)
+											const RfPageIdentityV1 *identity,
+											const RfPageVersionV1 *version)
 {
 	return proof == (const RfPageStableBaseProofV1 *)&stable_proof_objects[0]
-		&& identity->blockno == 1 && version->mutation_token == 55
-		&& version->segment_incarnation[0] == 7;
+		   && identity->blockno == 1 && version->mutation_token == 55
+		   && version->segment_incarnation[0] == 7;
 }
 
 ClusterRecoverySerialRevalidateResult
@@ -508,24 +508,24 @@ UT_TEST(test_install_adapter_runs_promote_publish_release)
 	ancestor = targets[0].expected_result;
 	ancestor.mutation_token = 55;
 	UT_ASSERT(adapter.ops.covers_version != NULL);
-	UT_ASSERT(!adapter.ops.covers_version(adapter.ops.arg, &targets[0].page_identity,
-										 &ancestor, &targets[0].expected_result));
+	UT_ASSERT(!adapter.ops.covers_version(adapter.ops.arg, &targets[0].page_identity, &ancestor,
+										  &targets[0].expected_result));
 	UT_ASSERT(adapter.ops.validate_identity(adapter.ops.arg, &targets[0].page_identity,
 											targets[0].expected_result.segment_incarnation));
 	UT_ASSERT(adapter.ops.promote(adapter.ops.arg));
-	UT_ASSERT(adapter.ops.covers_version(adapter.ops.arg, &targets[0].page_identity,
-										&ancestor, &targets[0].expected_result));
+	UT_ASSERT(adapter.ops.covers_version(adapter.ops.arg, &targets[0].page_identity, &ancestor,
+										 &targets[0].expected_result));
 	pin_current = false;
-	UT_ASSERT(!adapter.ops.covers_version(adapter.ops.arg, &targets[0].page_identity,
-										 &ancestor, &targets[0].expected_result));
+	UT_ASSERT(!adapter.ops.covers_version(adapter.ops.arg, &targets[0].page_identity, &ancestor,
+										  &targets[0].expected_result));
 	pin_current = true;
-	UT_ASSERT(!adapter.ops.covers_version(adapter.ops.arg, &targets[0].page_identity,
-										 &ancestor, &ancestor));
+	UT_ASSERT(!adapter.ops.covers_version(adapter.ops.arg, &targets[0].page_identity, &ancestor,
+										  &ancestor));
 	UT_ASSERT(adapter.ops.publish(adapter.ops.arg));
 	UT_ASSERT(adapter.ops.release(adapter.ops.arg));
 	UT_ASSERT(adapter.guard == NULL && adapter.proof_published);
-	UT_ASSERT(!adapter.ops.covers_version(adapter.ops.arg, &targets[0].page_identity,
-										 &ancestor, &targets[0].expected_result));
+	UT_ASSERT(!adapter.ops.covers_version(adapter.ops.arg, &targets[0].page_identity, &ancestor,
+										  &targets[0].expected_result));
 	rf_page_authority_preflight_destroy_v1(&preflight);
 }
 

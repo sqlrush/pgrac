@@ -39,6 +39,19 @@
 
 UT_DEFINE_GLOBALS();
 
+#ifdef USE_ASSERT_CHECKING
+/* Preserve assertion failure while allowing directives inside the native call
+ * argument: the standalone analyzer cannot expand those as macro arguments. */
+static void
+fixture_assert(bool condition)
+{
+	if (!condition)
+		ExceptionalCondition("native VM assertion", __FILE__, __LINE__);
+}
+#undef Assert
+#define Assert fixture_assert
+#endif
+
 #define MAPSIZE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData))
 #define HEAPBLOCKS_PER_PAGE (MAPSIZE * 4)
 #define HEAPBLK_TO_MAPBLOCK(x) ((x) / HEAPBLOCKS_PER_PAGE)
@@ -348,8 +361,7 @@ UT_TEST(test_versioned_visible_keeps_heap_full_page_protection)
 			reset(true, false, 0);
 			wal_log_hints = hints;
 			checksums = checksum;
-			run_set(&relation, 0, 1, InvalidXLogRecPtr, 2, 70,
-					VISIBILITYMAP_VALID_BITS, &identity);
+			run_set(&relation, 0, 1, InvalidXLogRecPtr, 2, 70, VISIBILITYMAP_VALID_BITS, &identity);
 			/* Advancing this LSN must not suppress checkpoint-first FPI. */
 			UT_ASSERT_EQ(PageGetLSN(pages[0].data), UINT64_C(0x9000));
 			UT_ASSERT_EQ(register_flags[1], REGBUF_STANDARD);
@@ -526,7 +538,12 @@ UT_TEST(test_actual_empty_vacuum_does_not_acquire_vm_in_critical)
 		bool versioned;
 		ClusterSpaceIdentity identity;
 	} state, *vacrel = &state;
-	Buffer buf = 1, vmbuffer = 2;
+	/* Native caller locals bind the extracted branch, not a new fixture scope. */
+	// cppcheck-suppress variableScope
+	Buffer buf = 1;
+	// cppcheck-suppress variableScope
+	Buffer vmbuffer = 2;
+	// cppcheck-suppress variableScope
 	BlockNumber blkno = 0;
 	Page page = pages[0].data;
 

@@ -476,8 +476,8 @@ adapter_promote(void *arg)
 }
 
 static bool
-adapter_covers_version(void *arg, const RfPageIdentityV1 *identity,
-					   const RfPageVersionV1 *version, const RfPageVersionV1 *result)
+adapter_covers_version(void *arg, const RfPageIdentityV1 *identity, const RfPageVersionV1 *version,
+					   const RfPageVersionV1 *result)
 {
 	RfPageInstallAuthorityAdapterV1 *adapter = (RfPageInstallAuthorityAdapterV1 *)arg;
 	uint32 i;
@@ -491,10 +491,10 @@ adapter_covers_version(void *arg, const RfPageIdentityV1 *identity,
 
 		if (authority_identity_equal(identity, &target->page_identity)
 			&& result->mutation_token == target->expected_result.mutation_token
-			&& memcmp(result->segment_incarnation,
-					  target->expected_result.segment_incarnation, 16) == 0)
+			&& memcmp(result->segment_incarnation, target->expected_result.segment_incarnation, 16)
+				   == 0)
 			return rf_page_stable_base_proof_covers_version_v1(target->stable_base, identity,
-																 version);
+															   version);
 	}
 	return false;
 }

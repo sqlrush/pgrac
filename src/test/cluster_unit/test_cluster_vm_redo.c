@@ -102,6 +102,8 @@ bool
 cluster_space_relation_get_identity(Relation rel, ClusterSpaceIdentity *out)
 {
 	(void)out;
+	/* Recovery is fixed true in this fixture; the contract includes it. */
+	// cppcheck-suppress knownConditionTrueFalse
 	if (RelationGetRelid(rel) != InvalidOid || rel->rd_isvalid || !RecoveryInProgress())
 		abort();
 	runtime_reads++;
@@ -113,6 +115,8 @@ cluster_space_relation_get_identity(Relation rel, ClusterSpaceIdentity *out)
 bool
 cluster_space_relation_read_redo_identity(RelFileLocator loc, ClusterSpaceIdentity *out)
 {
+	/* Recovery is fixed true in this fixture; the contract includes it. */
+	// cppcheck-suppress knownConditionTrueFalse
 	if (!RecoveryInProgress() || !RelFileLocatorEquals(loc, locator) || pins[0] || pins[1])
 		abort();
 	restart_reads++;

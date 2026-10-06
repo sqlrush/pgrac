@@ -996,8 +996,8 @@ cluster_undo_segment_file_exists(uint8 owner_instance, uint32 segment_id)
 
 	if (owner_instance < 1 || owner_instance > UNDO_OWNER_INSTANCE_MAX)
 		return false;
-	if (cluster_undo_path_resolve(cluster_undo_recovery_intent_for_owner(owner_instance), owner_instance,
-								  segment_id, path, sizeof(path))
+	if (cluster_undo_path_resolve(cluster_undo_recovery_intent_for_owner(owner_instance),
+								  owner_instance, segment_id, path, sizeof(path))
 		!= 0)
 		return false;
 	return access(path, F_OK) == 0;

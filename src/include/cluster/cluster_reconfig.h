@@ -967,7 +967,7 @@ extern bool cluster_reconfig_lmon_snapshot_r4_membership(ClusterR4MembershipSnap
 /* Read-only terminal inquiry: only this remote MEMBER may lack freshness.
  * This is not an online liveness/admission or block-owner projection. */
 extern bool cluster_reconfig_terminal_peer_membership(int32 peer_node_id,
-														ClusterR4MembershipSnapshot *out);
+													  ClusterR4MembershipSnapshot *out);
 /* Formation-LMON-only coherent MEMBER/epoch sample for PGSA reconstruction. */
 extern bool cluster_reconfig_lmon_snapshot_admitted_membership(uint64 *out_members_lo,
 															   uint64 *out_members_hi,

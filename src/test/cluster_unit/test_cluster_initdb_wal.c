@@ -40,7 +40,7 @@ static void
 prepare(bool crossing, bool other_rmid)
 {
 	char record_bytes[SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort + sizeof(CheckPoint)];
-	XLogRecord record = {0};
+	XLogRecord record = { 0 };
 	XLogLongPageHeader header = (XLogLongPageHeader)pages[0].data;
 	unsigned offset = crossing ? XLOG_BLCKSZ - 16 : SizeOfXLogLongPHD;
 
@@ -74,18 +74,17 @@ prepare(bool crossing, bool other_rmid)
 	record.xl_info = XLOG_CHECKPOINT_SHUTDOWN;
 	record.xl_scn = UINT64_C(87345);
 	memcpy(record_bytes, &record, SizeOfXLogRecord);
-	record_bytes[SizeOfXLogRecord] = (char) XLR_BLOCK_ID_DATA_SHORT;
+	record_bytes[SizeOfXLogRecord] = (char)XLR_BLOCK_ID_DATA_SHORT;
 	record_bytes[SizeOfXLogRecord + 1] = sizeof(CheckPoint);
 	memcpy(record_bytes + SizeOfXLogRecord + SizeOfXLogRecordDataHeaderShort,
-		&control.checkPointCopy, sizeof(CheckPoint));
+		   &control.checkPointCopy, sizeof(CheckPoint));
 	INIT_CRC32C(record.xl_crc);
 	COMP_CRC32C(record.xl_crc, record_bytes + SizeOfXLogRecord,
-		sizeof(record_bytes) - SizeOfXLogRecord);
+				sizeof(record_bytes) - SizeOfXLogRecord);
 	COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
 	FIN_CRC32C(record.xl_crc);
 	memcpy(record_bytes, &record, SizeOfXLogRecord);
-	if (crossing)
-	{
+	if (crossing) {
 		XLogPageHeader continuation = (XLogPageHeader)pages[1].data;
 		continuation->xlp_magic = XLOG_PAGE_MAGIC;
 		continuation->xlp_info = XLP_FIRST_IS_CONTRECORD;
@@ -96,10 +95,8 @@ prepare(bool crossing, bool other_rmid)
 		memcpy(pages[0].data + offset, record_bytes, 16);
 		memcpy(pages[1].data + SizeOfXLogShortPHD, record_bytes + 16, sizeof(record_bytes) - 16);
 		expected_end = control.xlog_seg_size + XLOG_BLCKSZ + SizeOfXLogShortPHD
-			+ MAXALIGN(sizeof(record_bytes) - 16);
-	}
-	else
-	{
+					   + MAXALIGN(sizeof(record_bytes) - 16);
+	} else {
 		memcpy(pages[0].data + offset, record_bytes, sizeof(record_bytes));
 		expected_end = control.checkPoint + MAXALIGN(sizeof(record_bytes));
 	}
@@ -110,7 +107,7 @@ prepare(bool crossing, bool other_rmid)
 static void
 refused(void)
 {
-	PgracInitdbWalObservation out, zero = {0};
+	PgracInitdbWalObservation out, zero = { 0 };
 	memset(&out, 0xA5, sizeof(out));
 	UT_ASSERT(!pgrac_initdb_wal_observe(directory_fd, &control, 7, &out));
 	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
@@ -137,8 +134,7 @@ UT_TEST(native_checkpoint_spans_pages)
 
 UT_TEST(wrong_thread_including_legacy_refuses)
 {
-	for (int thread = 0; thread <= 8; thread += 8)
-	{
+	for (int thread = 0; thread <= 8; thread += 8) {
 		prepare(false, false);
 		((XLogPageHeader)pages[0].data)->xlp_thread_id = thread;
 		save_pages();

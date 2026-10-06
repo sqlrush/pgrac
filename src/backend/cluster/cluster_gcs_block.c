@@ -9987,7 +9987,8 @@ gcs_block_resource_x_source_finish_owned(
 			&& cluster_pcm_lock_resource_x_holder_pair_wal_retained_exact(
 				block, authenticated_master_node, revoking.generation, &retained_wal)
 			&& retained_wal.page_checksum == image->body.image_envelope.page_checksum
-			&& cluster_page_wal_same_mutation_v1(&retained_wal.latest, &image->body.image_envelope.page_wal))
+			&& cluster_page_wal_same_mutation_v1(&retained_wal.latest,
+												 &image->body.image_envelope.page_wal))
 			wal_proof = &retained_wal;
 		if (held_x_revoke_active) {
 			finish_result = cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
@@ -9995,8 +9996,8 @@ gcs_block_resource_x_source_finish_owned(
 			if (finish_result == CLUSTER_PCM_OWN_OK)
 				held_x_revoke_active = false;
 		} else
-			finish_result = cluster_bufmgr_pcm_own_finish_revoke_retain(buf, &revoking, page_lsn,
-																		&retained, &finish_refusal, wal_proof);
+			finish_result = cluster_bufmgr_pcm_own_finish_revoke_retain(
+				buf, &revoking, page_lsn, &retained, &finish_refusal, wal_proof);
 	}
 	PG_CATCH();
 	{
@@ -10600,15 +10601,16 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 			uint32 master_connection = 0;
 
 			if (resource_master_node != cluster_node_id
-				&& !cluster_sf_peer_capability_word_sample(resource_master_node,
-					PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2, &master_capabilities, &master_connection))
+				&& !cluster_sf_peer_capability_word_sample(
+					resource_master_node, PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2, &master_capabilities,
+					&master_connection))
 				master_capabilities = 0;
 			capability_word &= master_capabilities;
 		}
 		if (!shared_s_source
-			&& !cluster_bufmgr_copy_block_for_gcs(block->common.logical_assertion.resource,
-												  &page_lsn, aligned_page.data, NULL, &page_wal,
-												  (ClusterPageWalRefV1 *)&page_first, capability_word)) {
+			&& !cluster_bufmgr_copy_block_for_gcs(
+				block->common.logical_assertion.resource, &page_lsn, aligned_page.data, NULL,
+				&page_wal, (ClusterPageWalRefV1 *)&page_first, capability_word)) {
 			failure_result = RESOURCE_X_APPLY_BAD_STATE;
 			goto pre_retained_failure;
 		}
@@ -15895,13 +15897,10 @@ cluster_gcs_resource_x_target_evict_release_refs(ResourceXTargetEvictionPlan *pl
  * exact X+REVOKING residency.  Entry-local EVICTING is lifecycle ownership,
  * never authority; every failure before local commit drops it exactly. */
 ResourceXApplyResult
-cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
-												  const ClusterPcmOwnSnapshot *exact_x,
-												  uint64 r4_record_generation,
-												  uint64 reservation_token,
-												  const ClusterPageWalBindingV1 *wal,
-												  ResourceXTargetEvictionPlan *plan_out,
-												  const ClusterPageWalBindingV1 *first)
+cluster_gcs_resource_x_target_evict_prepare_exact(
+	const BufferTag *tag, const ClusterPcmOwnSnapshot *exact_x, uint64 r4_record_generation,
+	uint64 reservation_token, const ClusterPageWalBindingV1 *wal,
+	ResourceXTargetEvictionPlan *plan_out, const ClusterPageWalBindingV1 *first)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
@@ -15924,9 +15923,9 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 	if (plan_out != NULL)
 		memset(plan_out, 0, sizeof(*plan_out));
 	if ((first != NULL && wal == NULL) || tag == NULL || exact_x == NULL || plan_out == NULL
-		|| !BufferTagsEqual(tag, &exact_x->tag)
-		|| exact_x->pcm_state != (uint8)PCM_STATE_X || exact_x->flags != PCM_OWN_FLAG_REVOKING
-		|| exact_x->generation == 0 || exact_x->generation == UINT64_MAX || reservation_token == 0
+		|| !BufferTagsEqual(tag, &exact_x->tag) || exact_x->pcm_state != (uint8)PCM_STATE_X
+		|| exact_x->flags != PCM_OWN_FLAG_REVOKING || exact_x->generation == 0
+		|| exact_x->generation == UINT64_MAX || reservation_token == 0
 		|| reservation_token == UINT64_MAX || exact_x->reservation_token != reservation_token
 		|| exact_x->writer_activation_token != 0 || exact_x->resource_x_activation_generation != 0
 		|| r4_record_generation == 0 || r4_record_generation == UINT64_MAX || MyProc == NULL)
@@ -15970,7 +15969,7 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 			if (first == NULL)
 				first = wal;
 			InitBufferTag(&first_tag, &first->identity.locator, first->identity.forknum,
-				first->identity.blockno);
+						  first->identity.blockno);
 
 			InitBufferTag(&wal_tag, &wal->identity.locator, wal->identity.forknum,
 						  wal->identity.blockno);
@@ -15978,8 +15977,10 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 			 * and the original descriptor remains X+REVOKING throughout. */
 			if (!cluster_shared_config || !BufferTagsEqual(tag, &wal_tag)
 				|| !BufferTagsEqual(tag, &first_tag)
-				|| wal->source.claim.database_incarnation != first->source.claim.database_incarnation
-				|| memcmp(wal->version.segment_incarnation, first->version.segment_incarnation, 16) != 0
+				|| wal->source.claim.database_incarnation
+					   != first->source.claim.database_incarnation
+				|| memcmp(wal->version.segment_incarnation, first->version.segment_incarnation, 16)
+					   != 0
 				|| !cluster_page_wal_flush_source_v1(wal, &flushed)
 				|| !cluster_page_wal_flush_source_v1(first, &flushed_first)
 				|| !cluster_page_wal_ref_retain_v1(&flushed_first, &plan_out->pi_refs[0])
@@ -16478,7 +16479,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	req = (const GcsBlockRequestPayload *)payload;
 	/* Reject before dedup, image copy or pending-X authority changes. */
 	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config,
-											 (PcmLockTransition)req->transition_id)) {
+											   (PcmLockTransition)req->transition_id)) {
 		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
 							 InvalidXLogRecPtr, NULL);
 		return;
@@ -19824,7 +19825,8 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	 */
 	if (cluster_shared_config
 		&& (GcsBlockForwardPayloadIsXTransfer(fwd)
-			|| !cluster_pcm_legacy_transition_allowed(true, (PcmLockTransition)fwd->transition_id))) {
+			|| !cluster_pcm_legacy_transition_allowed(true,
+													  (PcmLockTransition)fwd->transition_id))) {
 		gcs_block_forward_reply_immediate_deny(fwd);
 		return;
 	}

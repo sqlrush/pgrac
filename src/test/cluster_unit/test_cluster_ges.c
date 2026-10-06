@@ -1332,7 +1332,9 @@ PGPROC *MyProc;
 #include "storage/condition_variable.h"
 void
 ConditionVariablePrepareToSleep(ConditionVariable *cv pg_attribute_unused())
-{ stub_cv_sleeping = true; }
+{
+	stub_cv_sleeping = true;
+}
 /* HW consumes the real reply table in test_cluster_hw_handoff. */
 GesReplyWaitPollResult
 cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key, GesReplyWaitVerdict *verdict)
@@ -3275,15 +3277,16 @@ UT_TEST(test_startup_shutdown_at_actual_ges_wait_boundaries)
 			if (sigsetjmp(startup_fixture_exit, 1) == 0) {
 				if (leg == 0)
 					(void)cluster_ges_send_request_nowait_and_wait(&resid, ShareLock, &holder,
-																	 holder.request_id, 0, 0);
+																   holder.request_id, 0, 0);
 				else if (leg == 1)
-					(void)cluster_ges_send_convert_nowait_and_wait(&resid, ExclusiveLock, ShareLock,
-																		 &holder, holder.request_id, 10030, 0, 0);
+					(void)cluster_ges_send_convert_nowait_and_wait(
+						&resid, ExclusiveLock, ShareLock, &holder, holder.request_id, 10030, 0, 0);
 				else if (leg == 2)
-					(void)cluster_ges_send_convert_and_wait(&resid, ShareLock, ExclusiveLock, &holder,
-																  holder.request_id, 0);
+					(void)cluster_ges_send_convert_and_wait(&resid, ShareLock, ExclusiveLock,
+															&holder, holder.request_id, 0);
 				else
-					(void)cluster_ges_send_release_and_wait(&resid, &holder, holder.request_id, 0, 0);
+					(void)cluster_ges_send_release_and_wait(&resid, &holder, holder.request_id, 0,
+															0);
 			} else
 				exited = true;
 			UT_ASSERT(exited);

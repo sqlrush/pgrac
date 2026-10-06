@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# Author: SqlRush <sqlrush@gmail.com>
 # Requires A S11/S12/S16 and exact target-block holder / ship observations.
 # Global counters, a one-shot image, or the legacy phantom table are insufficient.
 use strict;

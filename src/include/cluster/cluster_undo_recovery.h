@@ -2,6 +2,7 @@
  * cluster_undo_recovery.h
  *    Qualified canonical UNDO paths for the original recovery owner.
  *-------------------------------------------------------------------------
+ * Author: SqlRush <sqlrush@gmail.com>
  */
 #ifndef CLUSTER_UNDO_RECOVERY_H
 #define CLUSTER_UNDO_RECOVERY_H
@@ -19,14 +20,16 @@ typedef struct ClusterUndoRecoveryScopeV1 {
 } ClusterUndoRecoveryScopeV1;
 
 extern bool cluster_undo_recovery_scope_enter_v1(ClusterUndoRecoveryScopeV1 *scope,
-	const ClusterThreadRecoveryAuthorityV1 *authority, const RfSideOnlinePlanV1 *plan);
+												 const ClusterThreadRecoveryAuthorityV1 *authority,
+												 const RfSideOnlinePlanV1 *plan);
 extern void cluster_undo_recovery_scope_leave_v1(ClusterUndoRecoveryScopeV1 *scope);
 /* The SIDE projection shares this original sealed-source recovery scope. */
 extern bool cluster_undo_recovery_origin_authorized_v1(int origin_node);
-extern bool cluster_undo_recovery_multixact_page_retired_v1(int origin_node,
-	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn, bool members, uint32 page);
+extern bool cluster_undo_recovery_multixact_page_retired_v1(int origin_node, XLogRecPtr source_lsn,
+															XLogRecPtr source_end_lsn, bool members,
+															uint32 page);
 extern ClusterUndoPathIntent cluster_undo_recovery_intent_for_owner(uint8 owner);
-extern int cluster_undo_recovery_path_resolve_v1(uint8 owner, uint32 segment,
-	char *path, size_t size);
+extern int cluster_undo_recovery_path_resolve_v1(uint8 owner, uint32 segment, char *path,
+												 size_t size);
 
 #endif

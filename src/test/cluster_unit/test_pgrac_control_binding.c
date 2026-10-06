@@ -142,11 +142,12 @@ UT_TEST(test_creation_literal_is_distinct_from_open_lineage)
 
 UT_TEST(test_creation_rejects_version_tag_and_origin_corruption)
 {
-	static const struct { size_t offset; uint8 value; } invalid[] = {
-		{4, 2}, {4, 4}, {12, 0}, {12, 2}, {13, 1},
-		{216, 0}, {216, 2}, {217, 1}, {224, 1}, {231, 1},
-		{72, 1}, {151, 1}, {232, 1}, {252, 1}
-	};
+	static const struct {
+		size_t offset;
+		uint8 value;
+	} invalid[]
+		= { { 4, 2 },	{ 4, 4 },	{ 12, 0 },	{ 12, 2 }, { 13, 1 },  { 216, 0 }, { 216, 2 },
+			{ 217, 1 }, { 224, 1 }, { 231, 1 }, { 72, 1 }, { 151, 1 }, { 232, 1 }, { 252, 1 } };
 	uint8 bytes[256];
 
 	for (size_t i = 0; i < lengthof(invalid); i++) {
@@ -178,11 +179,16 @@ UT_TEST(test_creation_encoder_refuses_fabricated_epoch_or_generation)
 		binding.lineage_kind = PGRAC_CONTROL_LINEAGE_CREATION_V1;
 		binding.migration_prepare_generation = 1;
 		binding.migration_transition_epoch = 0;
-		if (i == 0) binding.migration_prepare_generation = 0;
-		if (i == 1) binding.migration_prepare_generation = 2;
-		if (i == 2) binding.migration_transition_epoch = 1;
-		if (i == 3) binding.lineage_kind = 2;
-		if (i == 4) binding.lineage_kind = PGRAC_CONTROL_LINEAGE_MIGRATION_V1;
+		if (i == 0)
+			binding.migration_prepare_generation = 0;
+		if (i == 1)
+			binding.migration_prepare_generation = 2;
+		if (i == 2)
+			binding.migration_transition_epoch = 1;
+		if (i == 3)
+			binding.lineage_kind = 2;
+		if (i == 4)
+			binding.lineage_kind = PGRAC_CONTROL_LINEAGE_MIGRATION_V1;
 		memset(bytes, 0xa5, sizeof(bytes));
 		UT_ASSERT(!pgrac_control_binding_encode(&binding, bytes, sizeof(bytes)));
 		UT_ASSERT(all_zero(bytes, sizeof(bytes)));
@@ -287,7 +293,8 @@ UT_TEST(test_crc_valid_invalid_fields)
 
 UT_TEST(test_encoder_refuses_incomplete_identity)
 {
-#define FIELD(name) { offsetof(PgracControlBinding, name), sizeof(binding.name) }
+#define FIELD(name) /* Required field byte range. */                                               \
+	{ offsetof(PgracControlBinding, name), sizeof(binding.name) }
 	PgracControlBinding binding;
 	static const struct {
 		size_t offset;

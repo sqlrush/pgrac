@@ -758,7 +758,8 @@ cluster_runtime_visibility_physical_locator_sample_held(
 			  && exact_slot.status == TT_SLOT_ACTIVE && exact_slot.commit_scn == InvalidScn;
 	if (precommit_retry_out != NULL)
 		*precommit_retry_out = outcome == CLUSTER_TX_IN_PROGRESS
-			&& exact_slot.status == TT_SLOT_COMMITTED && SCN_VALID(exact_slot.commit_scn);
+							   && exact_slot.status == TT_SLOT_COMMITTED
+							   && SCN_VALID(exact_slot.commit_scn);
 	return true;
 }
 
@@ -2078,8 +2079,7 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 	const ClusterTxLocator *locator, TimestampTz deadline, ClusterTTStatusKey *key_out,
 	ClusterTTStatusResult *result_out, uint32 *ctrc_grant_out,
 	uint32 *participant_capability_generation_out, ClusterCtrcTxnKeyV1 *ctrc_key_out,
-	ClusterTxLocator *canonical_locator_out, bool *cross_segment_out,
-	bool *precommit_retry_out)
+	ClusterTxLocator *canonical_locator_out, bool *cross_segment_out, bool *precommit_retry_out)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterUndoBlock0LogicalKey data_logical;

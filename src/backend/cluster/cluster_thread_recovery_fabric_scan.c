@@ -26,8 +26,7 @@ typedef struct FabricVisitWork {
 } FabricVisitWork;
 
 static bool
-fabric_scan_authorities_current(const ClusterThreadRecoveryAuthorityV1 *authorities,
-	uint32 count)
+fabric_scan_authorities_current(const ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count)
 {
 	uint32 i;
 
@@ -51,7 +50,7 @@ fabric_visit_record(XLogReaderState *reader, void *arg)
 		return false;
 	}
 	work->detail = cluster_thread_recovery_fabric_plan_feed_record_v1(work->plan, reader,
-		work->participant_index);
+																	  work->participant_index);
 	if (work->detail != RF_PAGE_PROOF_DETAIL_OK)
 		return false;
 	work->records++;
@@ -78,10 +77,10 @@ fabric_scan_root_exact(uint16 dead_thread, XLogRecPtr scan_begin, XLogRecPtr sca
 }
 
 RfPageProofDetailV1
-cluster_thread_recovery_fabric_scan_roots_v1(
-	const ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count,
-	bool space_active, ClusterThreadRecoveryFabricPlanV1 **out_plan,
-	uint64 *out_record_count)
+cluster_thread_recovery_fabric_scan_roots_v1(const ClusterThreadRecoveryAuthorityV1 *authorities,
+											 uint32 count, bool space_active,
+											 ClusterThreadRecoveryFabricPlanV1 **out_plan,
+											 uint64 *out_record_count)
 {
 	ClusterThreadRecoveryFabricPlanRequestV1 request = { 0 };
 	ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
@@ -107,17 +106,20 @@ cluster_thread_recovery_fabric_scan_roots_v1(
 
 		if (authority->duty == NULL || root == NULL || authority->root_token == NULL
 			|| !fabric_scan_root_exact(authority->duty->origin_thread_id,
-				root->checkpoint_lower_lsn, root->validated_tail_lsn_exclusive, authority)
+									   root->checkpoint_lower_lsn,
+									   root->validated_tail_lsn_exclusive, authority)
 			|| cluster_thread_recovery_authority_revalidate_nowait_v1(authority)
 				   != CLUSTER_THREAD_AUTHORITY_OK)
 			return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
-		if (i > 0 && (authority->duty->origin_thread_id <= authorities[i - 1].duty->origin_thread_id
-			|| authority->duty->system_identifier != authorities[0].duty->system_identifier
-			|| memcmp(authority->duty->storage_uuid, authorities[0].duty->storage_uuid, 16) != 0))
+		if (i > 0
+			&& (authority->duty->origin_thread_id <= authorities[i - 1].duty->origin_thread_id
+				|| authority->duty->system_identifier != authorities[0].duty->system_identifier
+				|| memcmp(authority->duty->storage_uuid, authorities[0].duty->storage_uuid, 16)
+					   != 0))
 			return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 		if (authority->retention_pin != authorities[0].retention_pin
-			|| !cluster_thread_recovery_authority_covers_window_v1(authority,
-				authority->duty->origin_thread_id, root->checkpoint_lower_lsn,
+			|| !cluster_thread_recovery_authority_covers_window_v1(
+				authority, authority->duty->origin_thread_id, root->checkpoint_lower_lsn,
 				root->validated_tail_lsn_exclusive))
 			return RF_PAGE_PROOF_DETAIL_RETENTION_STALE;
 		cuts[i].failed_thread = authority->duty->origin_thread_id;
@@ -153,16 +155,17 @@ cluster_thread_recovery_fabric_scan_roots_v1(
 	{
 		for (i = 0; i < count; i++) {
 			const ClusterThreadRecoveryAuthorityV1 *authority = &authorities[i];
-			FabricVisitWork visit = { authorities, count, (uint16)i, plan,
-				RF_PAGE_PROOF_DETAIL_OK, 0 };
+			FabricVisitWork visit
+				= { authorities, count, (uint16)i, plan, RF_PAGE_PROOF_DETAIL_OK, 0 };
 			ClusterWalTailObservation observed;
 			ClusterControlRootResult source;
 
 			source = cluster_control_root_recovery_visit(authority->root_snapshot,
-				authority->root_token, fabric_visit_record, &visit, &observed);
+														 authority->root_token, fabric_visit_record,
+														 &visit, &observed);
 			if (source != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
-				detail = visit.detail == RF_PAGE_PROOF_DETAIL_OK
-					? RF_PAGE_PROOF_DETAIL_SOURCE_GAP : visit.detail;
+				detail = visit.detail == RF_PAGE_PROOF_DETAIL_OK ? RF_PAGE_PROOF_DETAIL_SOURCE_GAP
+																 : visit.detail;
 				break;
 			}
 			if (visit.records == 0 || visit.records != observed.records
@@ -171,7 +174,8 @@ cluster_thread_recovery_fabric_scan_roots_v1(
 				break;
 			}
 			if (observed.database_incarnation == 0
-				|| (database_incarnation != 0 && database_incarnation != observed.database_incarnation)) {
+				|| (database_incarnation != 0
+					&& database_incarnation != observed.database_incarnation)) {
 				detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 				break;
 			}
@@ -240,8 +244,8 @@ cluster_thread_recovery_fabric_scan_root_v1(uint16 dead_thread, XLogRecPtr scan_
 			authority, dead_thread, scan_begin_inclusive, scan_end_exclusive))
 		return RF_PAGE_PROOF_DETAIL_RETENTION_STALE;
 	if (cluster_shared_config)
-		return cluster_thread_recovery_fabric_scan_roots_v1(authority, 1, space_active,
-			out_plan, out_record_count);
+		return cluster_thread_recovery_fabric_scan_roots_v1(authority, 1, space_active, out_plan,
+															out_record_count);
 
 	memset(&cut, 0, sizeof(cut));
 	cut.failed_thread = dead_thread;

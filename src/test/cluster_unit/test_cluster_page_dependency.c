@@ -62,8 +62,8 @@ typedef struct RecordFixture {
 } RecordFixture;
 
 static void
-record_init(RecordFixture *fixture, uint64 before, uint64 result, bool image,
-			OffsetNumber offset, uint8 value)
+record_init(RecordFixture *fixture, uint64 before, uint64 result, bool image, OffsetNumber offset,
+			uint8 value)
 {
 	DecodedXLogRecord *record;
 	DecodedBkpBlock *block;
@@ -87,7 +87,7 @@ record_init(RecordFixture *fixture, uint64 before, uint64 result, bool image,
 	record->page_version_edge.result_token = result;
 	block = &record->blocks[0];
 	block->in_use = true;
-	block->rlocator = (RelFileLocator){1, 2, 10};
+	block->rlocator = (RelFileLocator){ 1, 2, 10 };
 	block->forknum = MAIN_FORKNUM;
 	block->blkno = 4;
 	block->has_image = block->apply_image = image;
@@ -130,8 +130,8 @@ ClusterThreadRecoveryAuthorityResultV1
 cluster_thread_recovery_authority_revalidate_nowait_v1(
 	const ClusterThreadRecoveryAuthorityV1 *authority)
 {
-	return authority != NULL && authority->duty != NULL
-		? CLUSTER_THREAD_AUTHORITY_OK : CLUSTER_THREAD_AUTHORITY_INVALID;
+	return authority != NULL && authority->duty != NULL ? CLUSTER_THREAD_AUTHORITY_OK
+														: CLUSTER_THREAD_AUTHORITY_INVALID;
 }
 
 bool
@@ -139,8 +139,8 @@ cluster_thread_recovery_authority_covers_window_v1(
 	const ClusterThreadRecoveryAuthorityV1 *authority, uint16 thread, XLogRecPtr begin,
 	XLogRecPtr end)
 {
-	return authority != NULL && authority->duty->origin_thread_id == thread
-		&& begin == 0x100 && end == 0x200;
+	return authority != NULL && authority->duty->origin_thread_id == thread && begin == 0x100
+		   && end == 0x200;
 }
 
 XLogReaderState *
@@ -172,8 +172,9 @@ cluster_control_root_recovery_source_v1(const ClusterControlRootSnapshot *root,
 
 ClusterControlRootResult
 cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *root,
-	const ClusterControlRootReadToken *token, ClusterWalRecordVisitor visitor, void *arg,
-	ClusterWalTailObservation *out)
+									const ClusterControlRootReadToken *token,
+									ClusterWalRecordVisitor visitor, void *arg,
+									ClusterWalTailObservation *out)
 {
 	RecordFixture fixture;
 	uint16 thread = root->identity.origin_thread_id;
@@ -218,8 +219,7 @@ cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *root,
 }
 
 RfPageProofDetailV1
-rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request,
-	RfSideOnlinePlanV1 **out)
+rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request, RfSideOnlinePlanV1 **out)
 {
 	UT_ASSERT_EQ(request->participant_count, 3);
 	*out = (RfSideOnlinePlanV1 *)&empty_side_plan;
@@ -227,8 +227,8 @@ rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request,
 }
 
 RfPageProofDetailV1
-rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
-	const RfDetachedRecordPlanV1 *record, const RfPageOnlineRecordIdentityV1 *identity)
+rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *record,
+								   const RfPageOnlineRecordIdentityV1 *identity)
 {
 	UT_ASSERT(plan == (RfSideOnlinePlanV1 *)&empty_side_plan);
 	UT_ASSERT_EQ(record->route.record_owner, RF_ROUTE_OWNER_PAGE_CODEC);
@@ -264,7 +264,8 @@ rf_side_record_census_v1(const RfDetachedRecordPlanV1 *record pg_attribute_unuse
 						 const RfContributorStreamCutV1 *cut pg_attribute_unused(),
 						 uint64 incarnation pg_attribute_unused(),
 						 RfSideCensusSpaceVisitorV1 visit pg_attribute_unused(),
-						 void *arg pg_attribute_unused(), RfSideContributionOwnersV1 *out pg_attribute_unused())
+						 void *arg pg_attribute_unused(),
+						 RfSideContributionOwnersV1 *out pg_attribute_unused())
 {
 	abort();
 }
@@ -326,8 +327,10 @@ UT_TEST(test_original_root_scanner_resolves_reverse_three_origin_native_page_cha
 		UT_ASSERT_EQ(source.claim.max_config_generation, 5);
 		UT_ASSERT_EQ(source.timeline, i + 1);
 	}
-	UT_ASSERT(rf_page_online_plan_target_v1(cluster_thread_recovery_fabric_page_plan_v1(plan), 0, &view));
-	if (rf_page_online_plan_target_v1(cluster_thread_recovery_fabric_page_plan_v1(plan), 0, &view)) {
+	UT_ASSERT(
+		rf_page_online_plan_target_v1(cluster_thread_recovery_fabric_page_plan_v1(plan), 0, &view));
+	if (rf_page_online_plan_target_v1(cluster_thread_recovery_fabric_page_plan_v1(plan), 0,
+									  &view)) {
 		UT_ASSERT_EQ(view.expected_before.mutation_token, 10);
 		UT_ASSERT_EQ(view.expected_result.mutation_token, 7);
 		UT_ASSERT_EQ(view.contributors->edge_count, 3);
@@ -354,7 +357,8 @@ UT_TEST(test_original_root_scanner_refuses_missing_source_or_version_dependency)
 		uint64 records = 99;
 
 		UT_ASSERT_EQ(scan_three_roots(&plan, &records), source_failure == 1
-			? RF_PAGE_PROOF_DETAIL_SOURCE_GAP : RF_PAGE_PROOF_DETAIL_EDGE_GAP);
+															? RF_PAGE_PROOF_DETAIL_SOURCE_GAP
+															: RF_PAGE_PROOF_DETAIL_EDGE_GAP);
 		UT_ASSERT(plan == NULL && records == 0);
 		UT_ASSERT_EQ(source_visits, source_failure == 1 ? 2 : 3);
 	}
@@ -364,8 +368,8 @@ UT_TEST(test_original_root_scanner_refuses_missing_source_or_version_dependency)
 static RfPageOnlinePlanV1 *
 make_plan_redo(uint32 participants, XLogRecPtr end, const XLogRecPtr *redo)
 {
-	RfContributorStreamCutV1 cuts[3] = {{0}};
-	RfPageOnlinePlanRequestV1 request = {0};
+	RfContributorStreamCutV1 cuts[3] = { { 0 } };
+	RfPageOnlinePlanRequestV1 request = { 0 };
 	RfPageOnlinePlanV1 *plan = NULL;
 	uint32 i;
 	for (i = 0; i < participants; i++) {
@@ -401,7 +405,7 @@ static RfPageProofDetailV1
 enqueue_origin(RfPageOnlinePlanV1 *plan, RecordFixture *fixture, uint16 participant, uint16 origin)
 {
 	RfDetachedRecordPlanV1 detached;
-	RfPageOnlineRecordIdentityV1 id = {0};
+	RfPageOnlineRecordIdentityV1 id = { 0 };
 	RfPageProofDetailV1 detail;
 	DecodedXLogRecord *record = fixture->reader.record;
 
@@ -604,7 +608,7 @@ UT_TEST(test_native_delta_decode_ignores_absent_image_fields)
 	RecordFixture fixture;
 	PGAlignedBlock wire;
 	DecodedXLogRecord *decoded;
-	XLogRecordBlockHeader block_header = {0};
+	XLogRecordBlockHeader block_header = { 0 };
 	XLogRecord *record = (XLogRecord *)wire.data;
 	RfPageOnlineTargetViewV1 target;
 	Size edge_bytes, size;
@@ -617,8 +621,9 @@ UT_TEST(test_native_delta_decode_ignores_absent_image_fields)
 	memset(&wire, 0, sizeof(wire));
 	*record = fixture.decoded.record.header;
 	next = wire.data + SizeOfXLogRecord;
-	UT_ASSERT(XLogEncodePageVersionEdgeV1((uint8 *)next, BLCKSZ - SizeOfXLogRecord,
-		7, fixture.decoded.record.page_version_edge.entries, 1, &edge_bytes));
+	UT_ASSERT(XLogEncodePageVersionEdgeV1((uint8 *)next, BLCKSZ - SizeOfXLogRecord, 7,
+										  fixture.decoded.record.page_version_edge.entries, 1,
+										  &edge_bytes));
 	next += edge_bytes;
 	block_header.id = 0;
 	block_header.fork_flags = MAIN_FORKNUM | BKPBLOCK_HAS_DATA;

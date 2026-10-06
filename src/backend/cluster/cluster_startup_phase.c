@@ -66,7 +66,7 @@
 #include "cluster/cluster_epoch.h"	/* cluster_epoch_get_current (RF-ROOT P6 diag) */
 #include "cluster/cluster_guc.h"	/* cluster_phase{1..4}_timeout (D2 F2) */
 #include "cluster/cluster_grd.h"
-#include "cluster/cluster_stats.h"	/* cluster_stats_start / wait_for_ready (1.14 Sprint A) */
+#include "cluster/cluster_stats.h" /* cluster_stats_start / wait_for_ready (1.14 Sprint A) */
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_lck.h"	/* cluster_lck_start / wait_for_ready (1.12 Sprint A) */
@@ -259,16 +259,15 @@ cluster_authority_clear_matching_internal(const ClusterAuthorityBindingLocal *bi
 	/* Report the actual one-time identity retirement, outside its lock.
 	 * The later LMS sample is diagnostic, never the reason for this clear. */
 	if (cleared && !preserve_handoff_identity && cluster_shared_config)
-		ereport(LOG,
-				(errmsg("cluster authority binding cleared"),
-				 errdetail("PGRAC_FAMILY=AUTHORITY_CLEAR caller=%s backend_type=%d "
-						   "old_readiness=%d origin_thread=%u boot=" UINT64_FORMAT
-						   " lms_generation=" UINT64_FORMAT " formation_epoch=" UINT64_FORMAT
-						   " lms_ready_after_clear=%d",
-						   caller != NULL ? caller : "UNREPORTED", (int)MyBackendType,
-						   (int)binding->state, (unsigned)binding->origin_thread,
-						   binding->boot_incarnation, binding->lms_generation,
-						   binding->formation.local_epoch, cluster_lms_is_ready())));
+		ereport(LOG, (errmsg("cluster authority binding cleared"),
+					  errdetail("PGRAC_FAMILY=AUTHORITY_CLEAR caller=%s backend_type=%d "
+								"old_readiness=%d origin_thread=%u boot=" UINT64_FORMAT
+								" lms_generation=" UINT64_FORMAT " formation_epoch=" UINT64_FORMAT
+								" lms_ready_after_clear=%d",
+								caller != NULL ? caller : "UNREPORTED", (int)MyBackendType,
+								(int)binding->state, (unsigned)binding->origin_thread,
+								binding->boot_incarnation, binding->lms_generation,
+								binding->formation.local_epoch, cluster_lms_is_ready())));
 	return cleared;
 }
 
@@ -420,7 +419,8 @@ cluster_serving_generation_current(const ClusterAuthorityBindingLocal *binding)
 static bool
 cluster_authority_binding_components_current_internal(const ClusterAuthorityBindingLocal *binding,
 													  bool serving, bool require_seal,
-													  bool require_member, bool refresh_identity_only)
+													  bool require_member,
+													  bool refresh_identity_only)
 {
 	ClusterFormationWitnessResult formation_result;
 
@@ -441,14 +441,16 @@ cluster_authority_binding_components_current_internal(const ClusterAuthorityBind
 	formation_result = cluster_formation_classification_revalidate_nowait(
 		binding->origin_thread, &binding->authority, &binding->formation);
 	return formation_result == CLUSTER_FORMATION_WITNESS_READY
-		   || (refresh_identity_only && formation_result == CLUSTER_FORMATION_WITNESS_CACHE_EXPIRED);
+		   || (refresh_identity_only
+			   && formation_result == CLUSTER_FORMATION_WITNESS_CACHE_EXPIRED);
 }
 
 static bool
 cluster_authority_binding_components_current(const ClusterAuthorityBindingLocal *binding,
 											 bool serving)
 {
-	return cluster_authority_binding_components_current_internal(binding, serving, true, true, false);
+	return cluster_authority_binding_components_current_internal(binding, serving, true, true,
+																 false);
 }
 
 static bool
@@ -792,7 +794,8 @@ cluster_recovery_authority_is_current(void)
 		/* Expiry grants nothing, but is not loss of the immutable generation.
 		 * Preserve only that identity so the original startup owner can obtain
 		 * a new exact witness. Real component/formation drift still clears it. */
-		if (!cluster_authority_binding_components_current_internal(&binding, false, true, true, true))
+		if (!cluster_authority_binding_components_current_internal(&binding, false, true, true,
+																   true))
 			cluster_authority_clear_matching(&binding, "recovery_authority_stale");
 	}
 	return current;
@@ -824,14 +827,16 @@ cluster_authority_startup_refresh_recovery(int timeout_ms)
 	/* No phase/CF lock spans this real majority read. It renews evidence for
 	 * this same boot, never creates formation or swaps a stale binding. */
 	result = cluster_formation_witness_build_recovery_control_wait(binding.origin_thread,
-																	 timeout_ms, &witness);
+																   timeout_ms, &witness);
 	if (result == CLUSTER_FORMATION_WITNESS_READY) {
-		if (!cluster_formation_witness_copy_classification_v1(witness, &origin, &authority, &formation))
+		if (!cluster_formation_witness_copy_classification_v1(witness, &origin, &authority,
+															  &formation))
 			result = CLUSTER_FORMATION_WITNESS_CORRUPT;
 		else if (origin != binding.origin_thread
 				 || authority.agree_disk_count != binding.authority.agree_disk_count
 				 || authority.total_disk_count != binding.authority.total_disk_count
-				 || !cluster_fence_marker_semantic_equal(&authority.marker, &binding.authority.marker)
+				 || !cluster_fence_marker_semantic_equal(&authority.marker,
+														 &binding.authority.marker)
 				 /* Both operands are copied RECOVERY_CONTROL classifications.
 				  * The live-snapshot matcher deliberately rejects that shape. */
 				 || memcmp(&binding.formation, &formation, sizeof(formation)) != 0)
@@ -1085,9 +1090,8 @@ cluster_recovery_authority_resid_mode_allowed(const ClusterResId *resid, LOCKMOD
 			   && resid->field4 == 0 && resid->lockmethodid == DEFAULT_LOCKMETHOD;
 	if (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE)
 		return (mode == ExclusiveLock || (cluster_shared_config && mode == ShareLock))
-			   && resid->field1 > 0
-			   && resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS && resid->field2 == 0
-			   && resid->field3 == 0 && resid->field4 == 0
+			   && resid->field1 > 0 && resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS
+			   && resid->field2 == 0 && resid->field3 == 0 && resid->field4 == 0
 			   && resid->lockmethodid == DEFAULT_LOCKMETHOD;
 	return false;
 }
@@ -2621,7 +2625,8 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 				break;
 			now = GetCurrentTimestamp();
 			if (now >= next_report || now >= phase4_deadline) {
-				elog(LOG, "cluster phase 4: waiting for semantic OPEN "
+				elog(LOG,
+					 "cluster phase 4: waiting for semantic OPEN "
 					 "(result=%d feature=%llu generation=%llu epoch=%llu)",
 					 (int)refusal.result, (unsigned long long)refusal.feature_bit,
 					 (unsigned long long)refusal.expected_generation,
@@ -2632,8 +2637,9 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 				cluster_authority_readiness_clear();
 				fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
 				fail_ctx->errmsg = "cluster phase 4: semantic OPEN proof is unavailable";
-				fail_ctx->errhint = "Inspect the last activation result and original LMON/QVOTEC "
-					"diagnostics. Both PGSA TARGET and current Resource-X OPEN are required.";
+				fail_ctx->errhint
+					= "Inspect the last activation result and original LMON/QVOTEC "
+					  "diagnostics. Both PGSA TARGET and current Resource-X OPEN are required.";
 				return PHASE_RUN_FATAL;
 			}
 			pg_usleep(20000L);

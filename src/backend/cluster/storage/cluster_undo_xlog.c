@@ -116,7 +116,8 @@ ensure_undo_instance_subdir(uint8 owner_instance)
 		get_parent_directory(path);
 		if (pg_mkdir_p(path, pg_dir_create_mode) != 0 && errno != EEXIST)
 			ereport(PANIC, (errcode_for_file_access(),
-				errmsg("could not create canonical undo recovery directory \"%s\": %m", path)));
+							errmsg("could not create canonical undo recovery directory \"%s\": %m",
+								   path)));
 		return;
 	}
 
@@ -127,8 +128,7 @@ ensure_undo_instance_subdir(uint8 owner_instance)
 	 * foreign owner (dead-origin materialization) stays on the local DataDir
 	 * (裁决 A), so only own redo under coherence takes the shared branch.
 	 */
-	if (cluster_undo_path_uses_shared_root(intent,
-										   cluster_peer_mode_enabled(),
+	if (cluster_undo_path_uses_shared_root(intent, cluster_peer_mode_enabled(),
 										   cluster_undo_gcs_coherence)) {
 		if (cluster_shared_fs_undo_instance_dir_resolve(owner_instance, path, sizeof(path)) != 0)
 			ereport(PANIC, (errmsg("undo shared instance subdir unresolved: owner_instance=%u "
@@ -753,20 +753,24 @@ cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *p
 	int fd;
 	ssize_t written;
 
-	if (cluster_undo_prepare_header_v1(decoded, payload, decoded->payload_length,
-									 NULL, prepared.data) != CLUSTER_UNDO_HEADER_APPLY)
+	if (cluster_undo_prepare_header_v1(decoded, payload, decoded->payload_length, NULL,
+									   prepared.data)
+		!= CLUSTER_UNDO_HEADER_APPLY)
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid typed undo segment initialization image")));
 	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(decoded->instance),
-								decoded->instance, decoded->segment_id, path, sizeof(path)) != 0)
-		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u",
-								decoded->instance, decoded->segment_id)));
+								decoded->instance, decoded->segment_id, path, sizeof(path))
+		!= 0)
+		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", decoded->instance,
+							   decoded->segment_id)));
 
 	/* Step 1: ensure parent instance subdir exists (idempotent on EEXIST). */
 	ensure_undo_instance_subdir(decoded->instance);
 
 	/* Step 2: open the segment file, creating if missing. */
 	fd = BasicOpenFile(path, O_CREAT | O_RDWR | PG_BINARY);
+	/* The standalone native-header fixture supplies a fixed valid fd. */
+	// cppcheck-suppress knownConditionTrueFalse
 	if (fd < 0)
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not open or create undo segment file \"%s\": %m", path)));
@@ -855,9 +859,9 @@ cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id, uint32 segm
 	char path[MAXPGPATH];
 	int fd;
 	PGAlignedBlock blockbuf, prepared;
-	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)blockbuf.data;
+	const UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)blockbuf.data;
 	TTSlot successor;
-	ClusterUndoDecoded decoded = {0};
+	ClusterUndoDecoded decoded = { 0 };
 	ClusterUndoHeaderPrepareResultV1 decision;
 	uint32 offset;
 	ssize_t nread;
@@ -868,14 +872,16 @@ cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id, uint32 segm
 		|| (uint8)(((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1) != instance)
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid canonical TT ACTIVE identity during redo")));
-	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(instance), instance, segment_id, path,
-								sizeof(path))
+	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(instance), instance,
+								segment_id, path, sizeof(path))
 		!= 0)
 		ereport(PANIC, (errmsg("undo segment path too long for TT ACTIVE redo: instance=%u seg=%u",
 							   instance, segment_id)));
 
 	/* A BIND delta cannot reconstruct a missing segment header/generation. */
 	fd = cluster_undo_redo_open_segment(instance, segment_id, path, false);
+	/* The standalone native-header fixture supplies a fixed valid fd. */
+	// cppcheck-suppress knownConditionTrueFalse
 	if (fd < 0)
 		ereport(PANIC,
 				(errcode_for_file_access(),
@@ -1008,8 +1014,8 @@ cluster_tt_durable_redo_stamp_slot(uint8 instance, uint32 segment_id, uint16 slo
 		ereport(PANIC, (errmsg("TT slot commit redo: slot_offset %u out of range (max %d)",
 							   slot_offset, TT_SLOTS_PER_SEGMENT - 1)));
 
-	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(instance), instance, segment_id, path,
-								sizeof(path))
+	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(instance), instance,
+								segment_id, path, sizeof(path))
 		!= 0)
 		ereport(PANIC,
 				(errmsg("undo segment path too long: instance=%u seg=%u", instance, segment_id)));
@@ -1018,6 +1024,8 @@ cluster_tt_durable_redo_stamp_slot(uint8 instance, uint32 segment_id, uint16 slo
 	 * the first post-checkpoint touch of a segment whose INIT predates the
 	 * merge window.  The RMW below overwrites only the slot. */
 	fd = cluster_undo_redo_open_segment(instance, segment_id, path, true);
+	/* The standalone native-header fixture supplies a fixed valid fd. */
+	// cppcheck-suppress knownConditionTrueFalse
 	if (fd < 0)
 		ereport(
 			PANIC,
@@ -1106,7 +1114,7 @@ cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
 	char path[MAXPGPATH];
 	int fd;
 	PGAlignedBlock blockbuf;
-	UndoSegmentHeaderData *header;
+	const UndoSegmentHeaderData *header;
 	ClusterUndoHeaderPrepareResultV1 decision;
 	ssize_t nread;
 
@@ -1115,13 +1123,15 @@ cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
 		|| !TransactionIdIsNormal(xid) || !SCN_VALID(commit_scn))
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid exact canonical TT commit redo identity")));
-	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(instance), instance, segment_id, path,
-								sizeof(path))
+	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(instance), instance,
+								segment_id, path, sizeof(path))
 		!= 0)
 		ereport(PANIC,
 				(errmsg("undo segment path too long: instance=%u seg=%u", instance, segment_id)));
 
 	fd = cluster_undo_redo_open_segment(instance, segment_id, path, false);
+	/* The standalone native-header fixture supplies a fixed valid fd. */
+	// cppcheck-suppress knownConditionTrueFalse
 	if (fd < 0)
 		ereport(
 			PANIC,
@@ -1145,8 +1155,8 @@ cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("undo segment \"%s\" has conflicting exact TT commit header", path)));
 	}
-	decision = cluster_undo_prepare_commit_v1(instance, segment_id, segment_generation,
-		slot_offset, wrap, xid, commit_scn, blockbuf.data, blockbuf.data);
+	decision = cluster_undo_prepare_commit_v1(instance, segment_id, segment_generation, slot_offset,
+											  wrap, xid, commit_scn, blockbuf.data, blockbuf.data);
 	if (decision == CLUSTER_UNDO_HEADER_SKIP_STALE || decision == CLUSTER_UNDO_HEADER_ALREADY) {
 		/* Stale, or a byte-identical exact replay: the present bytes may be
 		 * only in a crashed run's page cache -- make them durable. */
@@ -1311,10 +1321,13 @@ cluster_undo_redo_segment_recycle(const ClusterUndoDecoded *decoded)
 	ssize_t nread;
 
 	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(decoded->instance),
-								decoded->instance, decoded->segment_id, path, sizeof(path)) != 0)
-		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u",
-								decoded->instance, decoded->segment_id)));
+								decoded->instance, decoded->segment_id, path, sizeof(path))
+		!= 0)
+		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", decoded->instance,
+							   decoded->segment_id)));
 	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
+	/* The standalone native-header fixture supplies a fixed valid fd. */
+	// cppcheck-suppress knownConditionTrueFalse
 	if (fd < 0)
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not open undo segment \"%s\" for recycle redo: %m", path)));
@@ -1326,15 +1339,14 @@ cluster_undo_redo_segment_recycle(const ClusterUndoDecoded *decoded)
 		errno = save_errno;
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not read undo segment header \"%s\": read %zd of %d bytes",
-								path, nread, BLCKSZ)));
+							   path, nread, BLCKSZ)));
 	}
-	decision = cluster_undo_prepare_header_v1(decoded, NULL, 0,
-											 blockbuf.data, blockbuf.data);
+	decision = cluster_undo_prepare_header_v1(decoded, NULL, 0, blockbuf.data, blockbuf.data);
 	if (decision == CLUSTER_UNDO_HEADER_BLOCKED) {
 		close(fd);
-		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("undo segment \"%s\" has invalid identity or recycle predecessor",
-								path)));
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("undo segment \"%s\" has invalid identity or recycle predecessor", path)));
 	}
 	if (decision == CLUSTER_UNDO_HEADER_APPLY) {
 		ssize_t written = pg_pwrite(fd, blockbuf.data, BLCKSZ, 0);
@@ -1346,7 +1358,7 @@ cluster_undo_redo_segment_recycle(const ClusterUndoDecoded *decoded)
 			errno = save_errno;
 			ereport(PANIC, (errcode_for_file_access(),
 							errmsg("could not durably write undo segment \"%s\" recycle state: %m",
-									path)));
+								   path)));
 		}
 	}
 	if (close(fd) != 0)
@@ -1377,23 +1389,28 @@ cluster_undo_redo_segment_reuse(const ClusterUndoDecoded *decoded, const uint8 *
 	ssize_t nread;
 
 	/* Validate immutable source bytes before creating a directory or file. */
-	if (cluster_undo_prepare_header_v1(decoded, payload, decoded->payload_length,
-									 NULL, prepared.data) != CLUSTER_UNDO_HEADER_APPLY)
+	if (cluster_undo_prepare_header_v1(decoded, payload, decoded->payload_length, NULL,
+									   prepared.data)
+		!= CLUSTER_UNDO_HEADER_APPLY)
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid typed undo segment reuse image")));
 	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(decoded->instance),
-								decoded->instance, decoded->segment_id, path, sizeof(path)) != 0)
-		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u",
-								decoded->instance, decoded->segment_id)));
+								decoded->instance, decoded->segment_id, path, sizeof(path))
+		!= 0)
+		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", decoded->instance,
+							   decoded->segment_id)));
 	ensure_undo_instance_subdir(decoded->instance);
 	fd = BasicOpenFile(path, O_RDWR | O_CREAT | PG_BINARY);
+	/* The standalone native-header fixture supplies a fixed valid fd. */
+	// cppcheck-suppress knownConditionTrueFalse
 	if (fd < 0)
 		ereport(PANIC, (errcode_for_file_access(),
 						errmsg("could not open undo segment \"%s\" for reuse redo: %m", path)));
 
 	nread = pg_pread(fd, blockbuf.data, BLCKSZ, 0);
-	decision = cluster_undo_prepare_header_v1(decoded, payload, decoded->payload_length,
-						nread == BLCKSZ ? blockbuf.data : NULL, prepared.data);
+	decision
+		= cluster_undo_prepare_header_v1(decoded, payload, decoded->payload_length,
+										 nread == BLCKSZ ? blockbuf.data : NULL, prepared.data);
 	if (decision == CLUSTER_UNDO_HEADER_BLOCKED) {
 		close(fd);
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -1416,9 +1433,9 @@ cluster_undo_redo_segment_reuse(const ClusterUndoDecoded *decoded, const uint8 *
 
 			close(fd);
 			errno = save_errno;
-			ereport(PANIC, (errcode_for_file_access(),
-							errmsg("could not durably write undo segment \"%s\" reuse image: %m",
-									path)));
+			ereport(PANIC,
+					(errcode_for_file_access(),
+					 errmsg("could not durably write undo segment \"%s\" reuse image: %m", path)));
 		}
 	}
 	if (close(fd) != 0)
@@ -1445,8 +1462,8 @@ cluster_undo_redo_segment_reuse(const ClusterUndoDecoded *decoded, const uint8 *
  * responsible for durability.
  */
 static void
-cluster_undo_redo_block_write(const ClusterUndoDecoded *decoded,
-							const uint8 *payload, XLogRecPtr replay_end)
+cluster_undo_redo_block_write(const ClusterUndoDecoded *decoded, const uint8 *payload,
+							  XLogRecPtr replay_end)
 {
 	char path[MAXPGPATH];
 	PGAlignedBlock blockbuf;
@@ -1455,18 +1472,19 @@ cluster_undo_redo_block_write(const ClusterUndoDecoded *decoded,
 
 	/* An invalid decoded FPI shape cannot cause a file to be created. */
 	if (decoded->has_fpi
-		&& !cluster_undo_prepare_block_v1(decoded, payload, decoded->payload_length,
-										replay_end, NULL, blockbuf.data))
+		&& !cluster_undo_prepare_block_v1(decoded, payload, decoded->payload_length, replay_end,
+										  NULL, blockbuf.data))
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid typed undo full-image operation")));
 
 	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(decoded->instance),
-								decoded->instance, decoded->segment_id, path, sizeof(path)) != 0)
-		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u",
-							   decoded->instance, decoded->segment_id)));
+								decoded->instance, decoded->segment_id, path, sizeof(path))
+		!= 0)
+		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", decoded->instance,
+							   decoded->segment_id)));
 
 	fd = cluster_undo_redo_open_segment(decoded->instance, decoded->segment_id, path,
-									   decoded->has_fpi);
+										decoded->has_fpi);
 	if (fd < 0)
 		ereport(PANIC,
 				(errcode_for_file_access(),
@@ -1474,19 +1492,18 @@ cluster_undo_redo_block_write(const ClusterUndoDecoded *decoded,
 				 errhint("A delta requires the preceding durable undo block image.")));
 
 	if (!decoded->has_fpi) {
-		ssize_t nread = pg_pread(fd, blockbuf.data, BLCKSZ,
-								(off_t)decoded->block_no * BLCKSZ);
+		ssize_t nread = pg_pread(fd, blockbuf.data, BLCKSZ, (off_t)decoded->block_no * BLCKSZ);
 		if (nread != BLCKSZ) {
 			int save_errno = errno;
 			close(fd);
 			errno = save_errno;
-			ereport(PANIC,
-					(errcode_for_file_access(),
-					 errmsg("could not read undo block %u of \"%s\" for delta redo: "
-							"read %zd of %d bytes", decoded->block_no, path, nread, BLCKSZ)));
+			ereport(PANIC, (errcode_for_file_access(),
+							errmsg("could not read undo block %u of \"%s\" for delta redo: "
+								   "read %zd of %d bytes",
+								   decoded->block_no, path, nread, BLCKSZ)));
 		}
-		if (!cluster_undo_prepare_block_v1(decoded, payload, decoded->payload_length,
-										   replay_end, blockbuf.data, blockbuf.data)) {
+		if (!cluster_undo_prepare_block_v1(decoded, payload, decoded->payload_length, replay_end,
+										   blockbuf.data, blockbuf.data)) {
 			close(fd);
 			ereport(PANIC,
 					(errcode(ERRCODE_DATA_CORRUPTED),
@@ -1500,10 +1517,9 @@ cluster_undo_redo_block_write(const ClusterUndoDecoded *decoded,
 		int save_errno = errno;
 		close(fd);
 		errno = save_errno;
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not write undo block %u of \"%s\": wrote %zd of %d bytes",
-						decoded->block_no, path, written, BLCKSZ)));
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not write undo block %u of \"%s\": wrote %zd of %d bytes",
+							   decoded->block_no, path, written, BLCKSZ)));
 	}
 	if (pg_fsync(fd) != 0) {
 		int save_errno = errno;
@@ -1564,8 +1580,8 @@ cluster_undo_redo(XLogReaderState *record)
 
 	switch (info) {
 	case XLOG_UNDO_SEGMENT_INIT:
-		cluster_undo_redo_segment_init(&decoded,
-			(const uint8 *)XLogRecGetData(record) + decoded.payload_offset);
+		cluster_undo_redo_segment_init(&decoded, (const uint8 *)XLogRecGetData(record)
+													 + decoded.payload_offset);
 		break;
 	case XLOG_UNDO_TT_SLOT_BIND:
 		cluster_tt_durable_redo_bind_slot(decoded.instance, decoded.segment_id,
@@ -1582,13 +1598,14 @@ cluster_undo_redo(XLogReaderState *record)
 		cluster_undo_redo_segment_recycle(&decoded);
 		break;
 	case XLOG_UNDO_SEGMENT_REUSE:
-		cluster_undo_redo_segment_reuse(&decoded,
-			(const uint8 *)XLogRecGetData(record) + decoded.payload_offset);
+		cluster_undo_redo_segment_reuse(&decoded, (const uint8 *)XLogRecGetData(record)
+													  + decoded.payload_offset);
 		break;
 	case XLOG_UNDO_BLOCK_WRITE:
 	case XLOG_UNDO_BLOCK_WRITE_MULTI:
-		cluster_undo_redo_block_write(&decoded,
-			(const uint8 *)XLogRecGetData(record) + decoded.payload_offset, record->EndRecPtr);
+		cluster_undo_redo_block_write(
+			&decoded, (const uint8 *)XLogRecGetData(record) + decoded.payload_offset,
+			record->EndRecPtr);
 		break;
 	case XLOG_UNDO_TT_SLOT_SET_HEAD:
 		cluster_undo_redo_tt_slot_set_head(&decoded);

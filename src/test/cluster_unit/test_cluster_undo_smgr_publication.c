@@ -153,7 +153,10 @@ test_product_pwrite(int fd, const void *buf, size_t nbytes, off_t offset)
 static ssize_t
 test_product_pread(int fd, void *buf, size_t nbytes, off_t offset)
 {
-	if (pread_forced_error) { errno = EIO; return -1; }
+	if (pread_forced_error) {
+		errno = EIO;
+		return -1;
+	}
 	return pread(fd, buf, nbytes, offset);
 }
 
@@ -888,7 +891,8 @@ UT_TEST(test_recovery_file_short_tail_and_errors_are_distinct)
 	UT_ASSERT(cluster_undo_smgr_recovery_read_block_v1(1, 1, 1, &file, after.data));
 	memset(saved.data, 0, BLCKSZ);
 	UT_ASSERT(memcmp(after.data, saved.data, BLCKSZ) == 0);
-	memset(saved.data, 0x7b, BLCKSZ); after = saved;
+	memset(saved.data, 0x7b, BLCKSZ);
+	after = saved;
 	pread_forced_error = true;
 	UT_ASSERT(!cluster_undo_smgr_recovery_probe_v1(1, 1, &observed, after.data));
 	UT_ASSERT(memcmp(after.data, saved.data, BLCKSZ) == 0);
@@ -899,7 +903,8 @@ UT_TEST(test_recovery_file_short_tail_and_errors_are_distinct)
 	UT_ASSERT(!cluster_undo_smgr_recovery_probe_v1(1, 1, &observed, after.data));
 	basic_open_forced_error = false;
 	/* Mutating even one observed header byte invalidates the full-image write. */
-	fd = open(path, O_RDWR); UT_ASSERT(fd >= 0);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
 	UT_ASSERT_EQ(pwrite(fd, saved.data, 1, 100), 1);
 	UT_ASSERT_EQ(close(fd), 0);
 	UT_ASSERT(!cluster_undo_smgr_recovery_materialize_v1(1, 1, &file, before.data, header.data));
@@ -919,18 +924,22 @@ UT_TEST(test_recovery_file_requires_all_durability_barriers_and_preserves_bytes)
 		resolve_final(path);
 		make_page(header.data, 0xa5);
 		write_segment_file(path, header.data, BLCKSZ + 17);
-		fd = open(path, O_RDWR); UT_ASSERT(fd >= 0);
+		fd = open(path, O_RDWR);
+		UT_ASSERT(fd >= 0);
 		UT_ASSERT_EQ(pwrite(fd, "kept", 4, BLCKSZ + 1), 4);
 		UT_ASSERT_EQ(close(fd), 0);
 		UT_ASSERT(cluster_undo_smgr_recovery_probe_v1(1, 1, &file, before.data));
-		fsync_calls = 0; fsync_fail_on_call = failure;
-		UT_ASSERT(!cluster_undo_smgr_recovery_materialize_v1(1, 1, &file, before.data, header.data));
+		fsync_calls = 0;
+		fsync_fail_on_call = failure;
+		UT_ASSERT(
+			!cluster_undo_smgr_recovery_materialize_v1(1, 1, &file, before.data, header.data));
 		fsync_fail_on_call = 0;
 		UT_ASSERT(cluster_undo_smgr_recovery_probe_v1(1, 1, &changed, after.data));
 		UT_ASSERT_EQ(changed.size, UNDO_SEGMENT_SIZE_BYTES);
 		UT_ASSERT(memcmp(after.data, before.data, BLCKSZ) == 0);
 		fsync_calls = 0;
-		UT_ASSERT(cluster_undo_smgr_recovery_materialize_v1(1, 1, &changed, after.data, header.data));
+		UT_ASSERT(
+			cluster_undo_smgr_recovery_materialize_v1(1, 1, &changed, after.data, header.data));
 		UT_ASSERT_EQ(fsync_calls, 3);
 		UT_ASSERT(cluster_undo_smgr_recovery_read_block_v1(1, 1, 1, &changed, after.data));
 		UT_ASSERT(memcmp(after.data + 1, "kept", 4) == 0);

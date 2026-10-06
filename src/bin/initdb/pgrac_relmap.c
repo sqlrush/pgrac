@@ -76,7 +76,7 @@ database_set_exact(int base)
 {
 	int fd = openat(base, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
 	DIR *stream;
-	struct dirent *entry;
+	const struct dirent *entry;
 	unsigned found = 0;
 	bool ok = true;
 

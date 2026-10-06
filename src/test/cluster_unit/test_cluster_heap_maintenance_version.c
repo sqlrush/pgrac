@@ -206,8 +206,8 @@ XLogRegisterBuffer(uint8 id, Buffer buffer, uint8 flags)
 	UT_ASSERT(begun);
 	UT_ASSERT_EQ(id, 0);
 	UT_ASSERT_EQ(buffer, 1);
-	UT_ASSERT_EQ(flags, REGBUF_STANDARD
-		| (expected_info == XLOG_FPI_FOR_HINT ? REGBUF_FORCE_IMAGE : 0));
+	UT_ASSERT_EQ(flags,
+				 REGBUF_STANDARD | (expected_info == XLOG_FPI_FOR_HINT ? REGBUF_FORCE_IMAGE : 0));
 	memcpy(wal_image.data, current_page.data, BLCKSZ);
 }
 void
@@ -436,7 +436,7 @@ UT_TEST(test_prune_hint_only_versions_actual_change)
 	check_publication(true);
 	UT_ASSERT_EQ(hints, 0);
 	UT_ASSERT(!PageIsFull(current_page.data));
-	UT_ASSERT_EQ(((PageHeader) current_page.data)->pd_prune_xid, InvalidTransactionId);
+	UT_ASSERT_EQ(((PageHeader)current_page.data)->pd_prune_xid, InvalidTransactionId);
 	for (int i = 1; i <= 3; i++)
 		UT_ASSERT(ItemIdIsNormal(PageGetItemId(current_page.data, i)));
 }

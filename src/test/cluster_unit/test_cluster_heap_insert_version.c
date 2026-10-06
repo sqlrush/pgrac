@@ -1188,13 +1188,12 @@ UT_TEST(test_vm_clear_skip_requires_qualified_current_observation)
 {
 	for (int mode = 0; mode < 4; mode++) {
 		prepare_update(true, false, 1, true);
-		pages[1].data[SizeOfPageHeaderData] = mode == 0
-			? VISIBILITYMAP_VALID_BITS : VISIBILITYMAP_ALL_VISIBLE;
+		pages[1].data[SizeOfPageHeaderData]
+			= mode == 0 ? VISIBILITYMAP_VALID_BITS : VISIBILITYMAP_ALL_VISIBLE;
 		vm_locks = vm_shares = 0;
 		vm_share_refused = mode == 2;
 		vm_refresh_frozen = mode == 3;
-		UT_ASSERT_EQ(cluster_heap_lock_vm_needs_clear(&relation_data, blocks[0], 2),
-					 mode != 1);
+		UT_ASSERT_EQ(cluster_heap_lock_vm_needs_clear(&relation_data, blocks[0], 2), mode != 1);
 		UT_ASSERT_EQ(vm_shares, mode == 0 ? 0 : 1);
 		UT_ASSERT_EQ(vm_locks, 0);
 		UT_ASSERT(!dirty[1]);

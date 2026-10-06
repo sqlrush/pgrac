@@ -26,7 +26,7 @@
 
 static ClusterStorageQuorumState *storage_state;
 static ClusterStorageCheckResult storage_view_result(const ClusterStorageQuorumView *view,
-													uint64 now);
+													 uint64 now);
 
 /* This observation expires within one OS boot, independent of wall-clock
  * corrections. It is never persisted or reused after postmaster restart. */

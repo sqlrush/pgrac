@@ -25,7 +25,7 @@ char *BufferBlocks;
 Block *LocalBufferBlockPointers;
 bool cluster_shared_config = true, cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
-static PGAlignedBlock pages[BLOCKS], payload[BLOCKS], main_data;
+static PGAlignedBlock pages[BLOCKS], wal_payload[BLOCKS], main_data;
 static XLogReaderState reader;
 static DecodedXLogRecord *decoded;
 static bool locks[BLOCKS];
@@ -95,18 +95,24 @@ BlockNumber
 BufferGetBlockNumber(Buffer b)
 {
 	UT_ASSERT(b > 0 && b <= BLOCKS && locks[b - 1]);
+	if (b <= 0 || b > BLOCKS || !locks[b - 1])
+		abort();
 	return decoded->blocks[b - 1].blkno;
 }
 void
 MarkBufferDirty(Buffer b)
 {
 	UT_ASSERT(b > 0 && b <= BLOCKS && locks[b - 1]);
+	if (b <= 0 || b > BLOCKS || !locks[b - 1])
+		abort();
 	dirties[b - 1]++;
 }
 void
 UnlockReleaseBuffer(Buffer b)
 {
 	UT_ASSERT(b > 0 && b <= BLOCKS && locks[b - 1]);
+	if (b <= 0 || b > BLOCKS || !locks[b - 1])
+		abort();
 	locks[b - 1] = false;
 }
 void
@@ -118,7 +124,7 @@ bool
 XLogRecGetBlockTagExtended(XLogReaderState *r, uint8 id, RelFileLocator *loc, ForkNumber *fork,
 						   BlockNumber *block, Buffer *prefetch)
 {
-	DecodedBkpBlock *b;
+	const DecodedBkpBlock *b;
 	if (!XLogRecHasBlockRef(r, id))
 		return false;
 	b = XLogRecGetBlock(r, id);
@@ -160,7 +166,7 @@ reset(void)
 	memset(&reader, 0, sizeof(reader));
 	memset(&main_data, 0, sizeof(main_data));
 	memset(pages, 0, sizeof(pages));
-	memset(payload, 0, sizeof(payload));
+	memset(wal_payload, 0, sizeof(wal_payload));
 	memset(locks, 0, sizeof(locks));
 	memset(reads, 0, sizeof(reads));
 	memset(dirties, 0, sizeof(dirties));
@@ -175,7 +181,7 @@ reset(void)
 		b->rlocator = (RelFileLocator){ 1663, 5, 900 };
 		b->blkno = 100 + i;
 		b->forknum = MAIN_FORKNUM;
-		b->data = payload[i].data;
+		b->data = wal_payload[i].data;
 		b->has_data = true;
 		PageInit(pages[i].data, BLCKSZ, 0);
 	}
@@ -199,7 +205,7 @@ inner(char *out, bool node)
 	return t->size;
 }
 static void
-parent(int id)
+fixture_parent(int id)
 {
 	PGAlignedBlock tuple;
 	Size n = inner(tuple.data, true);
@@ -243,7 +249,7 @@ prepare(int kind)
 			_hash_pageinit(pages[i].data, BLCKSZ);
 			decoded->blocks[i].data_len = sizeof(uint32);
 		}
-		*(uint32 *)payload[4].data = 7;
+		*(uint32 *)wal_payload[4].data = 7;
 		break;
 	}
 	case 3: {
@@ -340,7 +346,7 @@ prepare(int kind)
 		block(0, false);
 		SpGistInitPage(pages[0].data, SPGIST_LEAF);
 		block(1, true);
-		parent(2);
+		fixture_parent(2);
 		break;
 	}
 	case 14: {
@@ -350,7 +356,7 @@ prepare(int kind)
 		r->parentBlk = -1;
 		r->stateSrc.isBuild = true;
 		inner(main_data.data + sizeof(*r), false);
-		parent(0);
+		fixture_parent(0);
 		block(1, true);
 		break;
 	}
@@ -361,7 +367,7 @@ prepare(int kind)
 		r->offnumPrefix = r->offnumPostfix = 1;
 		n = inner(main_data.data + sizeof(*r), false);
 		inner(main_data.data + sizeof(*r) + n, false);
-		parent(0);
+		fixture_parent(0);
 		block(1, true);
 		break;
 	}
@@ -373,7 +379,7 @@ prepare(int kind)
 		inner(main_data.data + SizeOfSpgxlogPickSplit, false);
 		for (int i = 0; i < 3; i++)
 			block(i, true);
-		parent(3);
+		fixture_parent(3);
 		break;
 	}
 	case 17: {

@@ -1592,7 +1592,7 @@ run_actual_source_first_cleanup(int route, bool semantic_retained)
 	uint32 capability_word = first_requester_caps;
 	int32 resource_master_node = cluster_node_id + 1;
 
-#define cluster_bufmgr_copy_block_for_gcs(tag, lsn, page, refusal, wal, first, peer_caps)                     \
+#define cluster_bufmgr_copy_block_for_gcs(tag, lsn, page, refusal, wal, first, peer_caps)          \
 	(first_copied_caps = (peer_caps), first_capture_fixture((ClusterPageWalRefV1 *)(first)))
 #define cluster_sf_peer_capability_word_sample first_master_capability_sample
 #define gcs_block_pcm_x_resource_x_build_source_frames(...) first_frame_fixture()
@@ -1977,7 +1977,8 @@ bool
 cluster_page_wal_flush_source_v1(const ClusterPageWalBindingV1 *wal, ClusterPageWalBindingV1 *out)
 {
 	UT_ASSERT_EQ(evict_claims, 0);
-	UT_ASSERT(wal->record_end == 200 || (evict_first_end != 0 && wal->record_end == evict_first_end));
+	UT_ASSERT(wal->record_end == 200
+			  || (evict_first_end != 0 && wal->record_end == evict_first_end));
 	if (evict_wal_case == 1)
 		return false;
 	*out = *wal;
@@ -2349,16 +2350,19 @@ UT_TEST(test_eviction_retains_first_separately_from_latest)
 		first = wal;
 		first.record_start = variant == 1 ? 450 : 50;
 		first.record_end = evict_first_end = variant == 1 ? 500 : 100;
-		if (variant == 1) first.source.claim.identity.origin_thread_id = 2;
-		if (variant == 2) first.identity.blockno++;
-		UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_prepare_exact(
-			&exact.tag, &exact, 77, 9, &wal, &plan, &first),
-			variant == 2 ? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_APPLIED);
+		if (variant == 1)
+			first.source.claim.identity.origin_thread_id = 2;
+		if (variant == 2)
+			first.identity.blockno++;
+		UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_prepare_exact(&exact.tag, &exact, 77, 9,
+																	   &wal, &plan, &first),
+					 variant == 2 ? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_APPLIED);
 		if (variant != 2) {
 			UT_ASSERT_EQ(plan.pi_refs[0].start, first.record_start);
 			UT_ASSERT_EQ(plan.pi_refs[1].start, wal.record_start);
 			UT_ASSERT_EQ(evict_refs, 2);
-			UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_abort_exact(&plan), RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_abort_exact(&plan),
+						 RESOURCE_X_APPLY_APPLIED);
 		}
 		UT_ASSERT_EQ(evict_refs, 0);
 	}

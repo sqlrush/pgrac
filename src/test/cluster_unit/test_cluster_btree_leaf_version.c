@@ -237,7 +237,7 @@ XLogRegisterBuffer(uint8 id, Buffer buffer, uint8 flags)
 	UT_ASSERT_EQ(flags, expected_info == XLOG_BTREE_META_CLEANUP
 							? REGBUF_WILL_INIT | REGBUF_STANDARD
 							: REGBUF_STANDARD
-							  | (expected_info == XLOG_FPI_FOR_HINT ? REGBUF_FORCE_IMAGE : 0));
+								  | (expected_info == XLOG_FPI_FOR_HINT ? REGBUF_FORCE_IMAGE : 0));
 	memcpy(wal_image.data, current_page.data, BLCKSZ);
 }
 void
@@ -304,8 +304,7 @@ run_meta(Relation rel, BlockNumber num_delpages)
 								  const ClusterSpaceIdentity *identity pg_attribute_unused())
 #include "test_cluster_btree_leaf_dedup.inc"
 
-XLogRecPtr
-BufferGetLSNAtomic(Buffer buffer)
+				XLogRecPtr BufferGetLSNAtomic(Buffer buffer)
 {
 	UT_ASSERT_EQ(buffer, 1);
 	return PageGetLSN(current_page.data);
@@ -317,10 +316,10 @@ run_unique_hint(bool neighbor)
 {
 	Relation rel pg_attribute_unused() = &relation_data;
 	Buffer nbuf = neighbor ? 1 : InvalidBuffer;
-	BTInsertStateData state = {0}, *insertstate = &state;
+	BTInsertStateData state = { 0 }, *insertstate = &state;
 	Page page pg_attribute_unused() = current_page.data;
 	ItemId curitemid = PageGetItemId(page, 1);
-	IndexTuple curitup = (IndexTuple) PageGetItem(page, curitemid);
+	IndexTuple curitup = (IndexTuple)PageGetItem(page, curitemid);
 	BTPageOpaque opaque = BTPageGetOpaque(page);
 	bool all_dead = true, inposting = false, prevalldead = false;
 	int curposti = 0;
@@ -337,7 +336,7 @@ run_cycle(BTCycleId cycleid, const ClusterSpaceIdentity *identity)
 	Buffer buf = 1;
 	Page page pg_attribute_unused() = current_page.data;
 	BTPageOpaque opaque = BTPageGetOpaque(page);
-	BTVacState state = {0}, *vstate = &state;
+	BTVacState state = { 0 }, *vstate = &state;
 	int nhtidsdead = 0;
 
 	vstate->cycleid = cycleid;
@@ -346,7 +345,8 @@ run_cycle(BTCycleId cycleid, const ClusterSpaceIdentity *identity)
 #include "test_cluster_btree_leaf_cycle.inc"
 }
 
-				static void reset(uint8 info, bool shared)
+static void
+reset(uint8 info, bool shared)
 {
 	IndexTupleData tuple[2];
 	BTPageOpaque opaque;
@@ -654,7 +654,7 @@ UT_TEST(test_unique_hint_versions_x_and_preserves_neighbor_read_image)
 UT_TEST(test_read_scan_hint_clears_scan_state_without_shared_mutation)
 {
 	for (int shared = 0; shared < 2; shared++) {
-		IndexScanDescData scan = {0};
+		IndexScanDescData scan = { 0 };
 		BTScanOpaque so = calloc(1, sizeof(BTScanOpaqueData));
 		int killed = 0;
 		reset(XLOG_FPI_FOR_HINT, shared);

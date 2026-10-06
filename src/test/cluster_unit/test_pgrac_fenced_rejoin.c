@@ -53,14 +53,14 @@ trace_target_owner(const char *call)
 	if (target_command_fd >= 0) {
 		PgracFencedTargetV1 target;
 		PgracFencedTargetCommand action;
-		uint8 boot[16], challenge[16];
+		uint8 command_boot[16], challenge[16];
 		char command[PGRAC_TARGET_COMMAND_MAX_BYTES];
 		size_t length;
 		memset(&target, 0, sizeof(target));
 		memcpy(target.target_uuid, record->intent.target_uuid, 16);
 		target.victim_node_id = request->old_node_id;
 		target.mapping_generation = record->mapping_generation;
-		memset(boot, 0xcc, 16);
+		memset(command_boot, 0xcc, 16);
 		memset(challenge, 0xdd, 16);
 		if (strcmp(call, "off") == 0)
 			action = PGRAC_TARGET_REJOIN_PREPARE_REVOKE;
@@ -72,8 +72,8 @@ trace_target_owner(const char *call)
 			action = PGRAC_TARGET_REJOIN_COMPLETE_OFF;
 		else
 			action = PGRAC_TARGET_REJOIN_RUNNING;
-		if (!pgrac_fenced_target_command_encode(action, record, &target, boot, challenge,
-											  command, sizeof(command), &length)
+		if (!pgrac_fenced_target_command_encode(action, record, &target, command_boot, challenge,
+												command, sizeof(command), &length)
 			|| write(target_command_fd, command, length) != (ssize_t)length)
 			return false;
 	}
@@ -125,7 +125,7 @@ callback_matches_durable_event(void)
 		return false;
 	count = read_records(fd, records, lengthof(records));
 	(void)close(fd);
-	return actual != NULL && count != 0
+	return count != 0
 		   && pgrac_fenced_journal_frame_encode(actual, observed, sizeof(observed), &observed_len)
 		   && pgrac_fenced_journal_frame_encode(&records[count - 1], durable, sizeof(durable),
 												&durable_len)
@@ -350,11 +350,11 @@ read_records(int fd, PgracFencedJournalRecordV1 *records, size_t maximum)
 {
 	uint8 frame[PGRAC_FENCED_JOURNAL_MAX_RECORD_BYTES];
 	size_t count = 0;
-	size_t length;
 	ssize_t got;
 
 	UT_ASSERT_EQ(lseek(fd, 0, SEEK_SET), 0);
 	while (count < maximum) {
+		size_t length;
 		do {
 			got = read(fd, frame, 16);
 		} while (got < 0 && errno == EINTR);

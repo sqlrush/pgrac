@@ -375,13 +375,13 @@ UT_TEST(test_native_initdb_consumer)
 {
 	RelMapFile native;
 	RelMapFile consumed;
-	char image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE] = {0};
+	char image[CLUSTER_RELMAP_AUTHORITY_FILE_SIZE] = { 0 };
 	char comparison[sizeof(image)];
 	char path[MAXPGPATH];
 	char dbpath[64];
 	char root[] = "/tmp/pgrac_relmap_native_XXXXXX";
 	char *saved_root = cluster_shared_data_dir;
-	ClusterRelmapOwner empty_owner = {0};
+	ClusterRelmapOwner empty_owner = { 0 };
 	bool shared = native_dbid == InvalidOid;
 	int fd;
 	char extra;
@@ -394,8 +394,10 @@ UT_TEST(test_native_initdb_consumer)
 	UT_ASSERT_EQ(read(fd, &extra, 1), 0);
 	UT_ASSERT_EQ(close(fd), 0);
 	UT_ASSERT_EQ(cluster_relmap_authority_init_image(shared, native_dbid, &native, sizeof(native),
-		image, sizeof(image)), CLUSTER_RELMAP_INIT_OK);
-	UT_ASSERT_EQ(cluster_relmap_authority_classify(image, sizeof(image)), CLUSTER_RELMAP_AUTHORITY_VALID);
+													 image, sizeof(image)),
+				 CLUSTER_RELMAP_INIT_OK);
+	UT_ASSERT_EQ(cluster_relmap_authority_classify(image, sizeof(image)),
+				 CLUSTER_RELMAP_AUTHORITY_VALID);
 	UT_ASSERT_NOT_NULL(mkdtemp(root));
 	cluster_shared_data_dir = root;
 	snprintf(path, sizeof(path), "%s/global", root);
@@ -404,8 +406,7 @@ UT_TEST(test_native_initdb_consumer)
 	UT_ASSERT_EQ(mkdir(path, 0700), 0);
 	if (shared)
 		snprintf(dbpath, sizeof(dbpath), "global");
-	else
-	{
+	else {
 		snprintf(dbpath, sizeof(dbpath), "base/%u", native_dbid);
 		snprintf(path, sizeof(path), "%s/%s", root, dbpath);
 		UT_ASSERT_EQ(mkdir(path, 0700), 0);
@@ -428,7 +429,8 @@ UT_TEST(test_native_initdb_consumer)
 	UT_ASSERT_EQ(memcmp(&native, &consumed, sizeof(native)), 0);
 	/* Same bytes as the existing pending -> publish writer, including padding. */
 	UT_ASSERT_EQ(unlink(path), 0);
-	cluster_relmap_authority_write_pending(shared, native_dbid, (char *)&native, sizeof(native), 1, &empty_owner);
+	cluster_relmap_authority_write_pending(shared, native_dbid, (char *)&native, sizeof(native), 1,
+										   &empty_owner);
 	cluster_relmap_authority_publish(shared, native_dbid, 1);
 	fd = open(path, O_RDONLY | PG_BINARY);
 	UT_ASSERT(fd >= 0);
@@ -438,8 +440,7 @@ UT_TEST(test_native_initdb_consumer)
 	UT_ASSERT_EQ(unlink(path), 0);
 	strlcat(path, ".bak", sizeof(path));
 	UT_ASSERT_EQ(unlink(path), 0);
-	if (!shared)
-	{
+	if (!shared) {
 		snprintf(path, sizeof(path), "%s/%s", root, dbpath);
 		UT_ASSERT_EQ(rmdir(path), 0);
 	}
@@ -454,8 +455,7 @@ UT_TEST(test_native_initdb_consumer)
 int
 main(int argc, char **argv)
 {
-	if (argc != 1 && (argc != 3 || strcmp(argv[1], "--native-init") != 0))
-	{
+	if (argc != 1 && (argc != 3 || strcmp(argv[1], "--native-init") != 0)) {
 		fprintf(stderr, "usage: %s [--native-init fresh-initdb-directory]\n", argv[0]);
 		return 1;
 	}
@@ -467,13 +467,11 @@ main(int argc, char **argv)
 	UT_RUN(test_corrupt_primary_falls_back_to_bak);
 	UT_RUN(test_discard_pending_keeps_committed);
 	UT_RUN(test_discard_pending_generation_mismatch_noop);
-	if (argc == 3)
-	{
-		const Oid dbids[] = {0, 4, 1, 5};
-		const char *paths[] = {"global", "base/4", "base/1", "base/5"};
+	if (argc == 3) {
+		const Oid dbids[] = { 0, 4, 1, 5 };
+		const char *paths[] = { "global", "base/4", "base/1", "base/5" };
 		native_root = argv[2];
-		for (int i = 0; i < 4; ++i)
-		{
+		for (int i = 0; i < 4; ++i) {
 			native_dbid = dbids[i];
 			native_relative_path = paths[i];
 			UT_RUN(test_native_initdb_consumer);

@@ -398,8 +398,8 @@ cluster_cr_server_current_mx_build_proof_page(
 {
 	static const ClusterCurrentMxProofReplyPage empty_page;
 	ClusterMxResolveResult built = test_actual_current_mx_build_proof_page(
-		source_node_id, request, result, requester_capability_generation, proofs,
-		proof_count, updater_proof, page);
+		source_node_id, request, result, requester_capability_generation, proofs, proof_count,
+		updater_proof, page);
 
 	if (mx_origin_sample_enabled) {
 		UT_ASSERT_EQ(mx_origin_guard_held, 0);
@@ -529,7 +529,8 @@ cluster_multixact_current_resolve_origin_member_proof(
 		return false;
 	memset(proof, 0, sizeof(*proof));
 	proof->state = initial_result->status == CLUSTER_TT_STATUS_IN_PROGRESS ? CCM_ACTIVE
-		: initial_result->status == CLUSTER_TT_STATUS_COMMITTED ? CCM_COMMITTED : CCM_ABORTED;
+				   : initial_result->status == CLUSTER_TT_STATUS_COMMITTED ? CCM_COMMITTED
+																		   : CCM_ABORTED;
 	return true;
 }
 
@@ -586,8 +587,8 @@ cluster_runtime_visibility_origin_plan_canonical_physical(
 	ClusterTTSlotPhysicalLocator *locator_out pg_attribute_unused(),
 	bool *same_segment_out pg_attribute_unused())
 {
-	if (mx_origin_sample_enabled && plan != NULL && plan->opaque[0] == 1
-		&& locator_out != NULL && same_segment_out != NULL) {
+	if (mx_origin_sample_enabled && plan != NULL && plan->opaque[0] == 1 && locator_out != NULL
+		&& same_segment_out != NULL) {
 		ClusterTxLocator data;
 
 		memcpy(&data, plan->opaque + 8, sizeof(data));
@@ -610,8 +611,7 @@ cluster_runtime_visibility_physical_locator_sample_held(
 	const ClusterUndoBlock0ResolvedRoot *root pg_attribute_unused(),
 	ClusterTTStatusKey *key_out pg_attribute_unused(),
 	ClusterTTStatusResult *result_out pg_attribute_unused(),
-	bool *ctrc_physical_active_out pg_attribute_unused(),
-	bool *precommit_retry_out)
+	bool *ctrc_physical_active_out pg_attribute_unused(), bool *precommit_retry_out)
 {
 	if (!mx_origin_sample_enabled)
 		return false;
@@ -626,10 +626,11 @@ cluster_runtime_visibility_physical_locator_sample_held(
 	result_out->status = mx_origin_sample_status;
 	result_out->status_epoch = key_out->cluster_epoch;
 	result_out->authoritative = mx_origin_sample_status != CLUSTER_TT_STATUS_UNKNOWN;
-	result_out->commit_scn = mx_origin_sample_status == CLUSTER_TT_STATUS_COMMITTED ? 101 : InvalidScn;
+	result_out->commit_scn
+		= mx_origin_sample_status == CLUSTER_TT_STATUS_COMMITTED ? 101 : InvalidScn;
 	*ctrc_physical_active_out = mx_origin_physical_active;
-	*precommit_retry_out = mx_origin_precommit_sample
-		&& mx_origin_sample_status == CLUSTER_TT_STATUS_IN_PROGRESS;
+	*precommit_retry_out
+		= mx_origin_precommit_sample && mx_origin_sample_status == CLUSTER_TT_STATUS_IN_PROGRESS;
 	return result_out->authoritative;
 }
 
@@ -2133,7 +2134,7 @@ cluster_undo_block0_current_release_poll(ClusterUndoBlock0CurrentGuard *guard pg
 			return CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
 		mx_origin_guard_held--;
 		return mx_origin_release_failed ? CLUSTER_UNDO_BLOCK0_CURRENT_FAILED
-			: CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
+										: CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
 	}
 	return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 }
@@ -2172,9 +2173,9 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 {
 	route_seam.candidate_resolve_calls++;
 	if (mx_origin_sample_enabled && expected_generation == NULL
-		&& mode == CLUSTER_TX_RESOLVE_VISIBILITY && locator != NULL
-		&& admission != NULL && admission->entered && guard != NULL && root != NULL
-		&& root->root_id == UINT64_C(0x8000) && plan != NULL) {
+		&& mode == CLUSTER_TX_RESOLVE_VISIBILITY && locator != NULL && admission != NULL
+		&& admission->entered && guard != NULL && root != NULL && root->root_id == UINT64_C(0x8000)
+		&& plan != NULL) {
 		memset(plan, 0, sizeof(*plan));
 		plan->opaque[0] = 1;
 		memcpy(plan->opaque + 8, locator, sizeof(*locator));
@@ -3751,7 +3752,7 @@ init_current_mx_origin_request(ClusterCurrentMxProofForwardV2 *request, ClusterI
 	request->trailer.body.asks[0].xid = (TransactionId)503;
 	request->trailer.body.asks[0].member_status = MultiXactStatusForShare;
 	*env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE, UT_MASTER_NODE,
-							  sizeof(*request));
+							   sizeof(*request));
 }
 
 UT_TEST(test_current_mx_precommit_origin_releases_before_retry)
@@ -3827,7 +3828,8 @@ UT_TEST(test_current_mx_updater_precommit_final_release_failure_is_unknown)
 		UT_ASSERT_EQ(mx_origin_reply_calls, 1);
 		UT_ASSERT_EQ(mx_origin_reply_count, 0);
 		UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
-		UT_ASSERT_EQ(mx_origin_reply_result, variant == 0 ? CMX_RESOLVE_RETRY : CMX_RESOLVE_UNKNOWN);
+		UT_ASSERT_EQ(mx_origin_reply_result,
+					 variant == 0 ? CMX_RESOLVE_RETRY : CMX_RESOLVE_UNKNOWN);
 	}
 	mx_origin_sample_enabled = false;
 	cluster_node_id = saved_node_id;
@@ -3846,13 +3848,30 @@ UT_TEST(test_current_mx_origin_retry_keeps_unknown_release_and_deadline_fences)
 		mx_origin_sample_enabled = true;
 		mx_origin_sample_status = CLUSTER_TT_STATUS_IN_PROGRESS;
 		switch (variant) {
-		case 0: mx_origin_precommit_sample = false; break; /* malformed ACTIVE */
-		case 1: mx_origin_sample_status = CLUSTER_TT_STATUS_UNKNOWN; break;
-		case 2: mx_origin_release_failed = true; break;
-		case 3: case 4: case 5: mx_origin_release_pending = true; break;
-		case 6: mx_origin_physical_active = true; mx_origin_precommit_sample = false; break;
-		case 7: mx_origin_sample_status = CLUSTER_TT_STATUS_COMMITTED; break;
-		case 8: mx_origin_sample_status = CLUSTER_TT_STATUS_ABORTED; break;
+		case 0:
+			mx_origin_precommit_sample = false;
+			break; /* malformed ACTIVE */
+		case 1:
+			mx_origin_sample_status = CLUSTER_TT_STATUS_UNKNOWN;
+			break;
+		case 2:
+			mx_origin_release_failed = true;
+			break;
+		case 3:
+		case 4:
+		case 5:
+			mx_origin_release_pending = true;
+			break;
+		case 6:
+			mx_origin_physical_active = true;
+			mx_origin_precommit_sample = false;
+			break;
+		case 7:
+			mx_origin_sample_status = CLUSTER_TT_STATUS_COMMITTED;
+			break;
+		case 8:
+			mx_origin_sample_status = CLUSTER_TT_STATUS_ABORTED;
+			break;
 		}
 		init_current_mx_origin_request(&request, &env);
 		UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
@@ -3875,7 +3894,8 @@ UT_TEST(test_current_mx_origin_retry_keeps_unknown_release_and_deadline_fences)
 			UT_ASSERT_EQ(mx_origin_reply_calls, 0);
 		else {
 			UT_ASSERT(mx_origin_reply_calls > 0);
-			UT_ASSERT_EQ(mx_origin_reply_result, variant >= 7 ? CMX_RESOLVE_OK : CMX_RESOLVE_UNKNOWN);
+			UT_ASSERT_EQ(mx_origin_reply_result,
+						 variant >= 7 ? CMX_RESOLVE_OK : CMX_RESOLVE_UNKNOWN);
 			UT_ASSERT_EQ(mx_origin_reply_count, variant >= 7 ? 1 : 0);
 		}
 	}

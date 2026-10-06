@@ -408,7 +408,7 @@ AppendInvalidationMessageSubGroup(InvalidationMsgsGroup *dest, InvalidationMsgsG
 	do {                                                                                           \
 		int n = NumMessagesInSubGroup(group, subgroup);                                            \
 		if (n > 0) {                                                                               \
-			SharedInvalidationMessage *msgs                                                        \
+			const SharedInvalidationMessage *msgs                                                        \
 				= &InvalMessageArrays[subgroup].msgs[(group)->firstmsg[subgroup]];                 \
 			codeFragment;                                                                          \
 		}                                                                                          \
@@ -480,6 +480,8 @@ AddRelcacheInvalidationMessage(InvalidationMsgsGroup *group, Oid dbId, Oid relId
 	 * it will never change. InvalidOid for relId means all relations so we
 	 * don't need to add individual ones when it is present.
 	 */
+	/* The shared iteration macro also invokes mutable invalidation callbacks. */
+	// cppcheck-suppress constVariablePointer
 	ProcessMessageSubGroup(group, RelCacheMsgs,
 						   if (msg->rc.id == SHAREDINVALRELCACHE_ID
 							   && (msg->rc.relId == relId || msg->rc.relId == InvalidOid)) return);
@@ -506,6 +508,8 @@ AddSnapshotInvalidationMessage(InvalidationMsgsGroup *group, Oid dbId, Oid relId
 
 	/* Don't add a duplicate item */
 	/* We assume dbId need not be checked because it will never change */
+	/* The shared iteration macro also invokes mutable invalidation callbacks. */
+	// cppcheck-suppress constVariablePointer
 	ProcessMessageSubGroup(
 		group, RelCacheMsgs,
 		if (msg->sn.id == SHAREDINVALSNAPSHOT_ID && msg->sn.relId == relId) return);
@@ -983,7 +987,7 @@ xactGetCommittedInvalidationMessages(SharedInvalidationMessage **msgs, bool *Rel
  * before and after we send the SI messages. See AtEOXact_Inval()
  */
 void
-ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs, int nmsgs,
+ProcessCommittedInvalidationMessages(const SharedInvalidationMessage *msgs, int nmsgs,
 									 bool RelcacheInitFileInval, Oid dbid, Oid tsid)
 {
 	if (nmsgs <= 0)

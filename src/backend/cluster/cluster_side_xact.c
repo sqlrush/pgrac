@@ -260,8 +260,8 @@ side_xact_completion_shape_valid(XLogReaderState *record, bool commit)
 static bool
 side_xact_no_commit_effects(const xl_xact_parsed_commit *parsed)
 {
-	return parsed->nsubxacts == 0 && parsed->nrels == 0 && parsed->nstats == 0
-		   && parsed->nmsgs == 0 && parsed->nspace_drops == 0;
+	return parsed->nsubxacts == 0 && parsed->nrels == 0 && parsed->nstats == 0 && parsed->nmsgs == 0
+		   && parsed->nspace_drops == 0;
 }
 
 /* This validates source membership, not the right to unlink any target.
@@ -269,7 +269,7 @@ side_xact_no_commit_effects(const xl_xact_parsed_commit *parsed)
 static bool
 side_xact_space_drops_valid(const xl_xact_parsed_commit *parsed, uint64 system_identifier)
 {
-	RelFileLocator previous = {0};
+	RelFileLocator previous = { 0 };
 
 	if (parsed->nspace_drops == 0 || parsed->nrels <= 0
 		|| parsed->nspace_drops > (uint32)parsed->nrels || parsed->space_drops == NULL)
@@ -280,14 +280,18 @@ side_xact_space_drops_valid(const xl_xact_parsed_commit *parsed, uint64 system_i
 		bool found = false;
 
 		if (!cluster_space_structure_wal_decode(parsed->space_drops
-			+ (Size)i * CLUSTER_SPACE_STRUCTURE_WAL_BYTES, CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &drop)
+													+ (Size)i * CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+												CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &drop)
 			|| drop.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
 			|| drop.identity.result.key.system_identifier != system_identifier)
 			return false;
 		locator = drop.identity.result.key.locator;
-		if (i != 0 && (locator.spcOid < previous.spcOid
-			|| (locator.spcOid == previous.spcOid && (locator.dbOid < previous.dbOid
-				|| (locator.dbOid == previous.dbOid && locator.relNumber <= previous.relNumber)))))
+		if (i != 0
+			&& (locator.spcOid < previous.spcOid
+				|| (locator.spcOid == previous.spcOid
+					&& (locator.dbOid < previous.dbOid
+						|| (locator.dbOid == previous.dbOid
+							&& locator.relNumber <= previous.relNumber)))))
 			return false;
 		for (int j = 0; j < parsed->nrels; j++) {
 			RelFileLocator member;
@@ -464,13 +468,14 @@ rf_side_xact_structural_preflight_v1(const RfSideXactOperationV1 *operation)
 	if (operation->space_drop_count != 0) {
 		if (operation->kind != RF_SIDE_XACT_COMMIT
 			|| (operation->xinfo & XACT_XINFO_HAS_SPACE_DROP) == 0
-			|| operation->space_drop_offset < MinSizeOfXactCommit + sizeof(xl_xact_xinfo) + sizeof(uint32)
+			|| operation->space_drop_offset
+				   < MinSizeOfXactCommit + sizeof(xl_xact_xinfo) + sizeof(uint32)
 			|| operation->space_drop_offset > operation->completion_payload_length
 			|| (uint64)operation->space_drop_count * CLUSTER_SPACE_STRUCTURE_WAL_BYTES
-				!= operation->completion_payload_length - operation->space_drop_offset)
+				   != operation->completion_payload_length - operation->space_drop_offset)
 			return false;
 	} else if (operation->completion_payload_length != 0 || operation->space_drop_offset != 0
-		|| (operation->xinfo & XACT_XINFO_HAS_SPACE_DROP) != 0)
+			   || (operation->xinfo & XACT_XINFO_HAS_SPACE_DROP) != 0)
 		return false;
 	for (i = 0; i < sizeof(operation->prepare_binding); i++)
 		binding_seen |= operation->prepare_binding[i];
@@ -549,13 +554,12 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier, uint16
 		if (!side_xact_completion_shape_valid(record, true) || !TransactionIdIsNormal(xid))
 			return false;
 		if (!ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
-			XLogRecGetDataLen(record), &parsed))
+							   XLogRecGetDataLen(record), &parsed))
 			return false;
 		if ((!side_xact_no_commit_effects(&parsed)
-				&& !side_xact_space_drops_valid(&parsed, system_identifier))
-			|| (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0
-			|| !SCN_VALID(parsed.scn) || side_xact_commit_timestamp(&parsed) == 0
-			|| !parsed.has_tt_commit
+			 && !side_xact_space_drops_valid(&parsed, system_identifier))
+			|| (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0 || !SCN_VALID(parsed.scn)
+			|| side_xact_commit_timestamp(&parsed) == 0 || !parsed.has_tt_commit
 			|| !side_xact_tt_delta_valid(&parsed.tt_commit, origin_thread, xid, parsed.scn))
 			return false;
 		candidate.kind = RF_SIDE_XACT_COMMIT;
@@ -618,7 +622,7 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier, uint16
 		if (!side_xact_completion_shape_valid(record, true))
 			return false;
 		if (!ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
-			XLogRecGetDataLen(record), &parsed))
+							   XLogRecGetDataLen(record), &parsed))
 			return false;
 		xid = parsed.twophase_xid;
 		if (!TransactionIdIsNormal(xid) || !side_xact_no_commit_effects(&parsed)
@@ -716,7 +720,8 @@ side_xact_apply_commit_v1(const RfSideXactOperationV1 *operation)
 		operation->tt_delta.wrap, operation->tt_delta.xid, operation->tt_delta.commit_scn);
 	if (cluster_tt_slot_durable_resolve_by_xid_origin(
 			operation->origin_thread - 1, operation->xid, operation->tt_delta.wrap, &durable_scn,
-			&durable_segment, &durable_slot, &durable_wrap) != CLUSTER_TT_DURABLE_RESOLVED_SCN
+			&durable_segment, &durable_slot, &durable_wrap)
+			!= CLUSTER_TT_DURABLE_RESOLVED_SCN
 		|| durable_scn != operation->terminal_scn
 		|| durable_segment != operation->tt_delta.segment_id
 		|| durable_slot != operation->tt_delta.slot_offset
@@ -726,8 +731,8 @@ side_xact_apply_commit_v1(const RfSideXactOperationV1 *operation)
 }
 
 RfSideXactApplyResultV1
-rf_side_xact_apply_covered_commit_v1(const RfSideXactOperationV1 *operation,
-	void *arg, RfSideXactVerifyCommitCoverageV1 verify)
+rf_side_xact_apply_covered_commit_v1(const RfSideXactOperationV1 *operation, void *arg,
+									 RfSideXactVerifyCommitCoverageV1 verify)
 {
 	if (operation == NULL || operation->kind != RF_SIDE_XACT_COMMIT || verify == NULL
 		|| rf_side_xact_target_preflight_owned_v1(operation, NULL, 0) != RF_SIDE_XACT_APPLY_OK

@@ -35,8 +35,14 @@ typedef struct StorageCorosyncRing {
 } StorageCorosyncRing;
 
 typedef struct StorageCorosyncModel {
+	/* Corosync consumes this field through its public opaque model ABI. */
+	// cppcheck-suppress unusedStructMember
 	int model;
+	/* Corosync registers and invokes this ABI callback. */
+	// cppcheck-suppress unusedStructMember
 	void (*quorum_notify)(uint64, uint32, StorageCorosyncRing, uint32, const uint32 *);
+	/* Corosync registers and invokes this ABI callback. */
+	// cppcheck-suppress unusedStructMember
 	void (*members_notify)(uint64, StorageCorosyncRing, uint32, const uint32 *, uint32,
 						   const uint32 *, uint32, const uint32 *);
 } StorageCorosyncModel;
@@ -201,7 +207,7 @@ storage_absent_or_number(const char *key, uint32 expected, bool allow_value)
 static bool
 storage_setting_is_shared(const char *name)
 {
-	struct config_generic *record = find_option(name, false, true, DEBUG1);
+	const struct config_generic *record = find_option(name, false, true, DEBUG1);
 
 	/* Necessary source provenance, not a configuration-generation receipt.
 	 * Existing shared-config admission still owns the applied image proof. */
@@ -372,13 +378,15 @@ cluster_storage_corosync_sample(ClusterStorageQuorumView *out)
 		if (storage_notified.ring_node != storage_members_notified.ring_node
 			|| storage_notified.ring_sequence != storage_members_notified.ring_sequence
 			|| memcmp(storage_notified.members, storage_members_notified.members,
-					  sizeof(storage_notified.members)) != 0) {
+					  sizeof(storage_notified.members))
+				   != 0) {
 			out->provider_diagnostic = CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
 				CLUSTER_STORAGE_PROVIDER_NOTIFICATION_MISMATCH, 0);
 			continue;
 		}
 		if (memcmp(storage_observed_members, storage_notified.members,
-				   sizeof(storage_observed_members)) != 0) {
+				   sizeof(storage_observed_members))
+			!= 0) {
 			/* A later pair cannot hide a removal observed earlier in this poll. */
 			out->reason = CLUSTER_STORAGE_QUORUM_CONFIGURATION;
 			out->provider_diagnostic = CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(

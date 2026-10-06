@@ -854,12 +854,9 @@ UT_TEST(test_sentinel_uuid_from_shared_configuration)
 
 UT_TEST(test_sentinel_uuid_refusal_preserves_identity)
 {
-	static const char *bad[] = {
-		"0123456789abc-def-0123-456789abcdef",
-		"01234567_89ab-cdef-0123-456789abcdef",
-		"00000000-0000-0000-0000-000000000000",
-		"11234567-89ab-cdef-0123-456789abcdef"
-	};
+	static const char *bad[]
+		= { "0123456789abc-def-0123-456789abcdef", "01234567_89ab-cdef-0123-456789abcdef",
+			"00000000-0000-0000-0000-000000000000", "11234567-89ab-cdef-0123-456789abcdef" };
 	MirrorSharedControl before, after;
 
 	for (unsigned i = 0; i < lengthof(bad); i++) {

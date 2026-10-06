@@ -42,8 +42,9 @@ typedef struct ClusterPiWritebackMessageV1 {
 #define CLUSTER_PI_WRITEBACK_DATA_BYTES_V2 600
 #define CLUSTER_PI_WRITEBACK_STRUCTURAL_BYTES_V2 1424
 #define CLUSTER_PI_WRITEBACK_STRUCTURE_OFFER_BYTES_V2 1064
-#define CLUSTER_PI_WRITEBACK_MAX_BYTES_V2 \
-	(CLUSTER_PI_WRITEBACK_HEADER_BYTES + CLUSTER_PI_WRITEBACK_MAX * CLUSTER_PI_WRITEBACK_STRUCTURAL_BYTES_V2)
+#define CLUSTER_PI_WRITEBACK_MAX_BYTES_V2                                                          \
+	(CLUSTER_PI_WRITEBACK_HEADER_BYTES                                                             \
+	 + CLUSTER_PI_WRITEBACK_MAX * CLUSTER_PI_WRITEBACK_STRUCTURAL_BYTES_V2)
 #define CLUSTER_PI_STRUCTURAL_WAL_FLUSHED UINT32_C(1)
 #define CLUSTER_PI_STRUCTURAL_SPACE_SYNC_READBACK UINT32_C(2)
 #define CLUSTER_PI_STRUCTURAL_KO_ALL_ACKED UINT32_C(4)
@@ -80,18 +81,18 @@ typedef struct ClusterPiWritebackMessageV2 {
 /* Explicit kind/length, canonical bytes and exact ordered ACK subset.
  * Every refusal preserves outputs, including length. No runtime v2 ingress
  * or PI retirement authority is installed by these representation helpers. */
-extern bool cluster_pi_writeback_encode_v2(const ClusterPiWritebackMessageV2 *message,
-	uint8 *bytes, Size capacity, Size *length);
+extern bool cluster_pi_writeback_encode_v2(const ClusterPiWritebackMessageV2 *message, uint8 *bytes,
+										   Size capacity, Size *length);
 extern bool cluster_pi_writeback_decode_v2(const void *bytes, Size length,
-	ClusterPiWritebackMessageV2 *out);
+										   ClusterPiWritebackMessageV2 *out);
 extern bool cluster_pi_writeback_ack_matches_v2(const ClusterPiWritebackMessageV2 *request,
-	const ClusterPiWritebackMessageV2 *ack);
+												const ClusterPiWritebackMessageV2 *ack);
 /* Current transport identities only; sending selects the original origin
  * for relation offers and the actual page master otherwise. Not an opaque
  * notice, completion or disposal proof. ACKs require their original request.
  * Requires the separate v2 capability, which is not yet advertised. */
 extern bool cluster_pi_writeback_request_current_v2(const ClusterPiWritebackMessageV2 *request,
-	bool sending);
+													bool sending);
 
 typedef struct ClusterPiWritebackNoticeV1 ClusterPiWritebackNoticeV1;
 typedef struct ClusterPiWritebackJobV1 ClusterPiWritebackJobV1;

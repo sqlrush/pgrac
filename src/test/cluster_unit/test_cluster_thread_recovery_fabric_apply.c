@@ -362,7 +362,7 @@ rf_side_online_production_owner_init_v1(RfSideOnlineProductionOwnerV1 *owner, vo
 
 bool
 rf_side_online_production_bind_undo_v1(RfSideOnlineProductionOwnerV1 *owner,
-	const ClusterThreadRecoveryAuthorityV1 *authority)
+									   const ClusterThreadRecoveryAuthorityV1 *authority)
 {
 	UT_ASSERT(owner->authority_arg == authority);
 	owner->undo_authority = authority;

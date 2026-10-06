@@ -34,14 +34,27 @@ static bool cv_waiting;
 static int exit_code;
 static int test_kill(pid_t pid, int sig);
 static void test_proc_exit(int code) pg_attribute_noreturn();
-static void StartupRereadConfig(void) {}
-static void WakeupRecovery(void) {}
-static bool PostmasterIsAlive(void) { return true; }
-static void ProcessProcSignalBarrier(void) {}
-static void ProcessLogMemoryContextInterrupt(void) {}
-static void test_write_stderr_signal_safe(const char *fmt, ...)
+static void
+StartupRereadConfig(void)
+{}
+static void
+WakeupRecovery(void)
+{}
+static bool
+PostmasterIsAlive(void)
 {
-	(void) fmt;
+	return true;
+}
+static void
+ProcessProcSignalBarrier(void)
+{}
+static void
+ProcessLogMemoryContextInterrupt(void)
+{}
+static void
+test_write_stderr_signal_safe(const char *fmt, ...)
+{
+	(void)fmt;
 	abort();
 }
 
@@ -55,29 +68,51 @@ static void test_write_stderr_signal_safe(const char *fmt, ...)
 #undef exit
 #undef proc_exit
 
-void ExceptionalCondition(const char *condition, const char *file, int line)
+void
+ExceptionalCondition(const char *condition, const char *file, int line)
 {
 	fprintf(stderr, "%s:%d: %s\n", file, line, condition);
 	abort();
 }
 
-bool RecoveryInProgress(void) { return recovering; }
-void ProcessSyncRequests(void)
+bool
+RecoveryInProgress(void)
+{
+	return recovering;
+}
+void
+ProcessSyncRequests(void)
 {
 	sync_calls++;
 	if (sync_error)
 		siglongjmp(sync_failure, 1);
 }
-void ConditionVariablePrepareToSleep(ConditionVariable *cv) { (void)cv; cv_waiting = true; }
-bool ConditionVariableCancelSleep(void) { cv_waiting = false; return false; }
-void ConditionVariableBroadcast(ConditionVariable *cv) { (void)cv; broadcasts++; }
+void
+ConditionVariablePrepareToSleep(ConditionVariable *cv)
+{
+	(void)cv;
+	cv_waiting = true;
+}
+bool
+ConditionVariableCancelSleep(void)
+{
+	cv_waiting = false;
+	return false;
+}
+void
+ConditionVariableBroadcast(ConditionVariable *cv)
+{
+	(void)cv;
+	broadcasts++;
+}
 
 #define kill test_kill
 #include "test_cluster_startup_sync.inc"
 #undef kill
 static CheckpointerShmemStruct shared;
 
-static void test_proc_exit(int code)
+static void
+test_proc_exit(int code)
 {
 	exit_code = code;
 	UT_ASSERT(SpinLockFree(&shared.ckpt_lck));
@@ -86,14 +121,16 @@ static void test_proc_exit(int code)
 	siglongjmp(startup_exit, 1);
 }
 
-static int test_kill(pid_t pid, int sig)
+static int
+test_kill(pid_t pid, int sig)
 {
 	UT_ASSERT_EQ(pid, 202);
 	UT_ASSERT_EQ(sig, SIGINT);
 	return fault == 1 ? -1 : 0;
 }
 
-bool ConditionVariableTimedSleep(ConditionVariable *cv, long timeout, uint32 event)
+bool
+ConditionVariableTimedSleep(ConditionVariable *cv, long timeout, uint32 event)
 {
 	(void)cv;
 	UT_ASSERT_EQ(timeout, 100);
@@ -132,7 +169,8 @@ bool ConditionVariableTimedSleep(ConditionVariable *cv, long timeout, uint32 eve
 	return false;
 }
 
-static void fixture(void)
+static void
+fixture(void)
 {
 	memset(&shared, 0, sizeof(shared));
 	SpinLockInit(&shared.ckpt_lck);
@@ -189,15 +227,33 @@ UT_TEST(wrong_role_phase_or_busy_request_cannot_publish)
 	for (unsigned f = 0; f < 9; f++) {
 		fixture();
 		switch (f) {
-		case 0: MyBackendType = B_BACKEND; break;
-		case 1: MyAuxProcType = CheckpointerProcess; break;
-		case 2: IsUnderPostmaster = false; break;
-		case 3: cluster_shared_config = false; break;
-		case 4: recovering = false; break;
-		case 5: ShutdownRequestPending = true; break;
-		case 6: shared.checkpointer_pid = 0; break;
-		case 7: shared.startup_sync_state = STARTUP_SYNC_REQUESTED; break;
-		case 8: shared.startup_sync_request = UINT64_MAX; break;
+		case 0:
+			MyBackendType = B_BACKEND;
+			break;
+		case 1:
+			MyAuxProcType = CheckpointerProcess;
+			break;
+		case 2:
+			IsUnderPostmaster = false;
+			break;
+		case 3:
+			cluster_shared_config = false;
+			break;
+		case 4:
+			recovering = false;
+			break;
+		case 5:
+			ShutdownRequestPending = true;
+			break;
+		case 6:
+			shared.checkpointer_pid = 0;
+			break;
+		case 7:
+			shared.startup_sync_state = STARTUP_SYNC_REQUESTED;
+			break;
+		case 8:
+			shared.startup_sync_request = UINT64_MAX;
+			break;
 		}
 		UT_ASSERT(!RequestStartupSync());
 		UT_ASSERT_EQ(sync_calls | sleeps, 0);
@@ -237,7 +293,7 @@ UT_TEST(real_startup_shutdown_is_consumed_before_publish_wait_or_success)
 		if (boundary == 0)
 			StartupProcShutdownHandler(SIGTERM);
 		if (sigsetjmp(startup_exit, 1) == 0) {
-			(void) RequestStartupSync();
+			(void)RequestStartupSync();
 			UT_ASSERT(false);
 		}
 		UT_ASSERT_EQ(exit_code, 1);
@@ -250,7 +306,8 @@ UT_TEST(real_startup_shutdown_is_consumed_before_publish_wait_or_success)
 	}
 }
 
-int main(void)
+int
+main(void)
 {
 	UT_PLAN(6);
 	UT_RUN(sync_completion_is_not_checkpoint_completion);

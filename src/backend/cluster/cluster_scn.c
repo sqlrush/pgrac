@@ -430,15 +430,13 @@ cluster_scn_initdb_base_begin(void)
 {
 	const PgracInitdbWalContext *context = cluster_wal_thread_initdb_context();
 
-	if (IsUnderPostmaster || context == NULL || context->base_fd < 3
-		|| context->thread_id != 1 || context->phase != PGRAC_INITDB_WAL_POSTBOOTSTRAP
-		|| initdb_base_scn_active)
+	if (IsUnderPostmaster || context == NULL || context->base_fd < 3 || context->thread_id != 1
+		|| context->phase != PGRAC_INITDB_WAL_POSTBOOTSTRAP || initdb_base_scn_active)
 		return false;
 	/* Bootstrap has no cluster shared-memory region. The original standalone
 	 * creator uses the same allocator/state initialization in private memory;
 	 * it never attaches this state to an admitted instance. */
-	if (cluster_scn_state == NULL)
-	{
+	if (cluster_scn_state == NULL) {
 		cluster_scn_state = MemoryContextAllocZero(TopMemoryContext, sizeof(*cluster_scn_state));
 		scn_initialize_state(-1);
 	}

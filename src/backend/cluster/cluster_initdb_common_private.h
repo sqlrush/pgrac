@@ -6,8 +6,7 @@
 #include "catalog/pg_control.h"
 #include "cluster/cluster_shared_config.h"
 
-typedef struct ClusterInitdbCommon
-{
+typedef struct ClusterInitdbCommon {
 	uint8 control[PG_CONTROL_FILE_SIZE];
 	uint8 control_sha256[32];
 	uint8 catalog[512];
@@ -20,8 +19,9 @@ typedef struct ClusterInitdbCommon
  * Require the complete original configured cohort and common-field agreement.
  * No cross-namespace MAX or serving/recovery conclusion. Failure clears a
  * distinct out; overlapping inputs/outputs are refused without modification. */
-extern bool cluster_initdb_common_build(const ClusterSharedConfigRef *config,
-	const ControlFileData *const sources[CLUSTER_CONTROL_ROOT_RECORD_COUNT],
-	ClusterInitdbCommon *out);
+extern bool
+cluster_initdb_common_build(const ClusterSharedConfigRef *config,
+							const ControlFileData *const sources[CLUSTER_CONTROL_ROOT_RECORD_COUNT],
+							ClusterInitdbCommon *out);
 
 #endif

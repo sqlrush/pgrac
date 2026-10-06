@@ -29,35 +29,74 @@ static ClusterMembershipState self_member = CLUSTER_MEMBER_MEMBER;
 static bool peer_capable = true;
 static int error_code;
 
-ClusterMembershipState cluster_membership_get_state(int node)
+ClusterMembershipState
+cluster_membership_get_state(int node)
 {
 	return node == cluster_node_id ? self_member : CLUSTER_MEMBER_MEMBER;
 }
-uint64 cluster_epoch_get_current(void) { return 7; }
-const ClusterNodeInfo *cluster_conf_lookup_node(int node)
+uint64
+cluster_epoch_get_current(void)
+{
+	return 7;
+}
+const ClusterNodeInfo *
+cluster_conf_lookup_node(int node)
 {
 	static ClusterNodeInfo peer;
 	return node == 0 ? &peer : NULL;
 }
-bool cluster_sf_peer_supports_undo_horizon(int node) { return peer_capable; }
-bool errstart(int elevel, const char *domain) { return elevel >= ERROR; }
-bool errstart_cold(int elevel, const char *domain) { return errstart(elevel, domain); }
-int errcode(int code) { error_code = code; return 0; }
-int errmsg(const char *fmt,...) { return 0; }
-int errdetail(const char *fmt,...) { return 0; }
-int errhint(const char *fmt,...) { return 0; }
-void errfinish(const char *file, int line, const char *func) { pg_re_throw(); }
+bool
+cluster_sf_peer_supports_undo_horizon(int node)
+{
+	return peer_capable;
+}
+bool
+errstart(int elevel, const char *domain)
+{
+	return elevel >= ERROR;
+}
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+int
+errcode(int code)
+{
+	error_code = code;
+	return 0;
+}
+int
+errmsg(const char *fmt, ...)
+{
+	return 0;
+}
+int
+errdetail(const char *fmt, ...)
+{
+	return 0;
+}
+int
+errhint(const char *fmt, ...)
+{
+	return 0;
+}
+void
+errfinish(const char *file, int line, const char *func)
+{
+	pg_re_throw();
+}
 
 /* Native xid ordering; snapshot lifetime and retention are not stubbed. */
-bool TransactionIdPrecedes(TransactionId a, TransactionId b)
+bool
+TransactionIdPrecedes(TransactionId a, TransactionId b)
 {
-	return !TransactionIdIsNormal(a) || !TransactionIdIsNormal(b) ?
-		a < b : (int32) (a - b) < 0;
+	return !TransactionIdIsNormal(a) || !TransactionIdIsNormal(b) ? a < b : (int32)(a - b) < 0;
 }
-bool TransactionIdFollows(TransactionId a, TransactionId b)
+bool
+TransactionIdFollows(TransactionId a, TransactionId b)
 {
-	return !TransactionIdIsNormal(a) || !TransactionIdIsNormal(b) ?
-		a > b : (int32) (a - b) > 0;
+	return !TransactionIdIsNormal(a) || !TransactionIdIsNormal(b) ? a > b : (int32)(a - b) > 0;
 }
 
 void
@@ -71,16 +110,37 @@ MemoryContextAlloc(MemoryContext context, Size size)
 {
 	return calloc(1, size);
 }
-void *palloc(Size size) { return MemoryContextAlloc(CurrentMemoryContext, size); }
+void *
+palloc(Size size)
+{
+	return MemoryContextAlloc(CurrentMemoryContext, size);
+}
 void
 pfree(void *p)
 {
 	free(p);
 }
-void ResourceOwnerEnlargeSnapshots(ResourceOwner owner) { Assert(owner != NULL); }
-void ResourceOwnerRememberSnapshot(ResourceOwner owner, Snapshot snapshot) { remembered++; }
-void ResourceOwnerForgetSnapshot(ResourceOwner owner, Snapshot snapshot) { Assert(remembered); remembered--; }
-int GetCurrentTransactionNestLevel(void) { return 1; }
+void
+ResourceOwnerEnlargeSnapshots(ResourceOwner owner)
+{
+	Assert(owner != NULL);
+}
+void
+ResourceOwnerRememberSnapshot(ResourceOwner owner, Snapshot snapshot)
+{
+	remembered++;
+}
+void
+ResourceOwnerForgetSnapshot(ResourceOwner owner, Snapshot snapshot)
+{
+	Assert(remembered);
+	remembered--;
+}
+int
+GetCurrentTransactionNestLevel(void)
+{
+	return 1;
+}
 int
 scn_time_cmp(SCN a, SCN b)
 {
@@ -96,7 +156,7 @@ pg_re_throw(void)
 static Snapshot
 registered(SCN scn)
 {
-	SnapshotData value = {0};
+	SnapshotData value = { 0 };
 	value.snapshot_type = SNAPSHOT_MVCC;
 	value.xmin = 10;
 	value.xmax = 20;
@@ -156,7 +216,7 @@ UT_TEST(evaluated_registered_snapshot_overrides_an_unrelated_active_snapshot)
 
 UT_TEST(forged_reference_counts_do_not_establish_liveness)
 {
-	SnapshotData fake = {0};
+	SnapshotData fake = { 0 };
 	Snapshot keep = registered(50);
 	ClusterSnapshotReadScopeV1 scope;
 	fake = *keep;
@@ -186,13 +246,27 @@ UT_TEST(snapshot_identity_and_retention_cannot_drift_during_evaluation)
 		ClusterSnapshotReadScopeV1 scope;
 		cluster_snapshot_read_enter_v1(&scope, s);
 		switch (fault) {
-		case 0: s->read_scn++; break;
-		case 1: s->read_epoch++; break;
-		case 2: s->cluster_source = SNAPSHOT_SOURCE_LOCAL; break;
-		case 3: pg_atomic_write_u64(&proc.cluster_read_scn_atomic, 0); break;
-		case 4: pg_atomic_write_u64(&proc.cluster_read_scn_atomic, 101); break;
-		case 5: CurrentResourceOwner = (ResourceOwner)2; break;
-		case 6: s->snapshot_type = SNAPSHOT_SELF; break;
+		case 0:
+			s->read_scn++;
+			break;
+		case 1:
+			s->read_epoch++;
+			break;
+		case 2:
+			s->cluster_source = SNAPSHOT_SOURCE_LOCAL;
+			break;
+		case 3:
+			pg_atomic_write_u64(&proc.cluster_read_scn_atomic, 0);
+			break;
+		case 4:
+			pg_atomic_write_u64(&proc.cluster_read_scn_atomic, 101);
+			break;
+		case 5:
+			CurrentResourceOwner = (ResourceOwner)2;
+			break;
+		case 6:
+			s->snapshot_type = SNAPSHOT_SELF;
+			break;
 		}
 		UT_ASSERT(!evidence(100, s));
 		CurrentResourceOwner = (ResourceOwner)1;
@@ -267,7 +341,7 @@ admission_rejected(SCN scn)
 	error_code = 0;
 	PG_TRY();
 	{
-		(void) cluster_undo_horizon_read_admission_enforce(scn);
+		(void)cluster_undo_horizon_read_admission_enforce(scn);
 	}
 	PG_CATCH();
 	{

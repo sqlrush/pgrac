@@ -371,9 +371,10 @@ typedef struct ClusterSemanticTerminalPeerSnapshot {
 
 /* Caller holds the same entered R4 TARGET token across the original C1b
  * request and current(). Capture failure clears out. Neither call publishes. */
-extern bool cluster_semantic_activation_terminal_peer_capture(
-	const ClusterSemanticAdmissionToken *admission, int32 peer_node_id,
-	uint32 required_hello_caps, ClusterSemanticTerminalPeerSnapshot *out);
+extern bool
+cluster_semantic_activation_terminal_peer_capture(const ClusterSemanticAdmissionToken *admission,
+												  int32 peer_node_id, uint32 required_hello_caps,
+												  ClusterSemanticTerminalPeerSnapshot *out);
 extern bool cluster_semantic_activation_terminal_peer_current(
 	const ClusterSemanticAdmissionToken *admission,
 	const ClusterSemanticTerminalPeerSnapshot *expected);
@@ -477,8 +478,7 @@ extern void cluster_semantic_activation_lmon_tick(void);
  * Never publishes admission. True requires actual PGSA/Resource-X OPEN and
  * the original LMON's completed ROOT publication for the same live cut.
  * Only the installed never-served writer may request first activation. */
-extern bool
-cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refusal);
+extern bool cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refusal);
 /* RF-ROOT P7 G3: the R4 cutover coordinator proof reads the ACK table's
  * COMPLETE state bound to the exact round identity (transition epoch,
  * prepare generation, the expected/observed member sets, the source/target

@@ -44,7 +44,7 @@ static LWLockPadded locks[128];
 LWLockPadded *MainLWLockArray = locks;
 static uint32 wait_event;
 uint32 *my_wait_event_info = &wait_event;
-static SlruSharedData shared;
+static SlruSharedData fixture_shared;
 static char page[BLCKSZ];
 static char *buffers[] = { page };
 static unsigned queue_calls, sync_calls, write_calls;
@@ -110,10 +110,10 @@ fixture_lru_init(SlruCtl ctl, const char *name, int slots, int lsn_groups, LWLoc
 	UT_ASSERT_EQ(slots, NUM_SUBTRANS_BUFFERS);
 	UT_ASSERT_EQ(lsn_groups, 0);
 	UT_ASSERT(lock == SubtransSLRULock && tranche == LWTRANCHE_SUBTRANS_BUFFER);
-	ctl->shared = &shared;
+	ctl->shared = &fixture_shared;
 	ctl->sync_handler = handler;
 	strlcpy(ctl->Dir, dir, sizeof(ctl->Dir));
-	shared.page_buffer = buffers;
+	fixture_shared.page_buffer = buffers;
 }
 
 int
@@ -172,7 +172,7 @@ static void
 reset_fixture(bool clustered)
 {
 	UT_ASSERT_EQ(transient_fds, 0);
-	memset(&shared, 0, sizeof(shared));
+	memset(&fixture_shared, 0, sizeof(fixture_shared));
 	memset(page, 0x52, sizeof(page));
 	memset(&queued, 0, sizeof(queued));
 	cluster_shared_config = clustered;

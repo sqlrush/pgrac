@@ -675,8 +675,8 @@ UT_TEST(test_full_history_batch_without_reclaim_yields)
 			undo_cleaner_worker = 0;
 			test_gc_complete = true;
 			test_inventory_max = 9;
-			test_recycle_result = retained ? CLUSTER_SEG_RECYCLE_RETAINED
-									  : CLUSTER_SEG_RECYCLE_ALREADY;
+			test_recycle_result
+				= retained ? CLUSTER_SEG_RECYCLE_RETAINED : CLUSTER_SEG_RECYCLE_ALREADY;
 			test_ctrc_progress = test_maintenance_cut = false;
 			for (int pass = 0; pass < 3; pass++) {
 				UT_ASSERT(!undo_cleaner_run_pass(&remaining));

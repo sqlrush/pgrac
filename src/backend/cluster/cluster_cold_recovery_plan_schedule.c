@@ -236,6 +236,8 @@ cold_plan_schedule(ClusterColdPlanV1 *plan, ClusterColdDiagV1 *diag)
 	detail = schedule_run(plan, &work, diag);
 	for (i = 0; i < lengthof(arrays); i++)
 		if (*arrays[i] != NULL)
+			/* Function call through cold_free/pfree, not a shadow declaration. */
+			// cppcheck-suppress shadowVariable
 			cold_free(*arrays[i]);
 	cold_plan_release(plan, work.bytes);
 	return detail;

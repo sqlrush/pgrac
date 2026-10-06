@@ -1,3 +1,4 @@
+# Author: SqlRush <sqlrush@gmail.com>
 # Harness-only test. A missing fresh initializer must not invoke a legacy one.
 use strict;
 use warnings;

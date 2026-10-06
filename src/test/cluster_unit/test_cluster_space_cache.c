@@ -246,10 +246,23 @@ errdetail(const char *fmt, ...)
 {
 	return 0;
 }
-bool errstart(int level, const char *domain) { return level >= ERROR; }
-bool errstart_cold(int level, const char *domain) { return errstart(level, domain); }
-int errmsg_internal(const char *fmt, ...) { return 0; }
-void errfinish(const char *file, int line, const char *func)
+bool
+errstart(int level, const char *domain)
+{
+	return level >= ERROR;
+}
+bool
+errstart_cold(int level, const char *domain)
+{
+	return errstart(level, domain);
+}
+int
+errmsg_internal(const char *fmt, ...)
+{
+	return 0;
+}
+void
+errfinish(const char *file, int line, const char *func)
 {
 	if (!expected_error)
 		abort();
@@ -285,9 +298,9 @@ cluster_semantic_activation_recheck_r4_terminal_census(const ClusterSemanticAdmi
  * lock-order fixture. Slot and tuple publication here is production code. */
 static ClusterHeapItlTerminalBatchApplyResult
 terminal_census_publish(Buffer buffer, const ClusterHeapItlTerminalCensus *census,
-						 const uint8 *terminal_flags)
+						const uint8 *terminal_flags)
 {
-	ClusterHeapItlTerminalBatchApplyResult result = {CLUSTER_HEAP_ITL_BATCH_REFUSED, 0, 0};
+	ClusterHeapItlTerminalBatchApplyResult result = { CLUSTER_HEAP_ITL_BATCH_REFUSED, 0, 0 };
 	RfPageProducerBatchV1 hint_batch pg_attribute_unused();
 	ClusterSpaceHintResult hint_result pg_attribute_unused() = CLUSTER_SPACE_HINT_NATIVE;
 	bool tuple_refs_changed = false;
@@ -798,13 +811,13 @@ hint_setup(bool cache)
 	HeapTupleHeader tuple;
 	setup();
 	if (cache)
-		(void) insert_identity(&relation_data);
+		(void)insert_identity(&relation_data);
 	PageInitHeapPage(page.data, BLCKSZ, 0);
-	((PageHeader) page.data)->pd_block_scn = 20;
-	tuple = (HeapTupleHeader) (page.data + MAXALIGN(SizeOfPageHeaderData));
+	((PageHeader)page.data)->pd_block_scn = 20;
+	tuple = (HeapTupleHeader)(page.data + MAXALIGN(SizeOfPageHeaderData));
 	HeapTupleHeaderSetXmin(tuple, 77);
 	HeapTupleHeaderSetXmax(tuple, 78);
-	((PageHeader) page.data)->pd_lower += MAXALIGN(SizeofHeapTupleHeader);
+	((PageHeader)page.data)->pd_lower += MAXALIGN(SizeofHeapTupleHeader);
 	hint_before = page;
 	hint_calls = dirty_calls = wal_calls = version_edges = 0;
 	next_token = 100;
@@ -866,12 +879,23 @@ UT_TEST(test_hint_refusal_has_no_io_or_mutation)
 	for (int bad = 0; bad < 6; bad++) {
 		HeapTupleHeader tuple = hint_setup(bad != 0);
 		switch (bad) {
-		case 0: break;
-		case 1: invalidate(invalidate_arg, relation_data.rd_id); break;
-		case 2: ref.claim.database_incarnation++; break;
-		case 3: writer_allowed = false; break;
-		case 4: recovering = true; break;
-		case 5: CritSectionCount = 1; break;
+		case 0:
+			break;
+		case 1:
+			invalidate(invalidate_arg, relation_data.rd_id);
+			break;
+		case 2:
+			ref.claim.database_incarnation++;
+			break;
+		case 3:
+			writer_allowed = false;
+			break;
+		case 4:
+			recovering = true;
+			break;
+		case 5:
+			CritSectionCount = 1;
+			break;
 		}
 		SetHintBits(tuple, 1, HEAP_XMIN_COMMITTED, InvalidTransactionId);
 		UT_ASSERT(memcmp(hint_before.data, page.data, BLCKSZ) == 0);
@@ -888,16 +912,26 @@ UT_TEST(test_hint_rejects_dirty_gate_difference_before_critical_section)
 		BufferDesc *desc = GetBufferDescriptor(0);
 
 		switch (bad) {
-		case 0: desc->pcm_state = PCM_STATE_N; break;
-		case 1: desc->pcm_state = PCM_STATE_S; break;
-		case 2: hint_writer_token = 1; break;
-		case 3: hint_activation_generation = 1; break;
-		case 4: hint_own_flags = PCM_OWN_FLAG_GRANT_PENDING; break;
+		case 0:
+			desc->pcm_state = PCM_STATE_N;
+			break;
+		case 1:
+			desc->pcm_state = PCM_STATE_S;
+			break;
+		case 2:
+			hint_writer_token = 1;
+			break;
+		case 3:
+			hint_activation_generation = 1;
+			break;
+		case 4:
+			hint_own_flags = PCM_OWN_FLAG_GRANT_PENDING;
+			break;
 		}
 		UT_ASSERT(cluster_bufmgr_block_write_permitted(1));
-		UT_ASSERT(!cluster_pcm_x_content_holder_mutation_allowed(
-			true, true, false, desc->pcm_state, hint_own_flags,
-			hint_writer_token, hint_activation_generation));
+		UT_ASSERT(!cluster_pcm_x_content_holder_mutation_allowed(true, true, false, desc->pcm_state,
+																 hint_own_flags, hint_writer_token,
+																 hint_activation_generation));
 		SetHintBits(tuple, 1, HEAP_XMIN_COMMITTED, InvalidTransactionId);
 		UT_ASSERT(memcmp(hint_before.data, page.data, BLCKSZ) == 0);
 		UT_ASSERT_EQ(hint_calls + dirty_calls + wal_calls + version_edges, 0);
@@ -979,15 +1013,18 @@ UT_TEST(test_lazy_cleanout_versions_only_qualified_exclusive_hint)
 	for (int bad = 0; bad < 5; bad++) {
 		ClusterItlSlotData *slot;
 		bool stamped;
-		(void) hint_setup(bad != 1);
+		(void)hint_setup(bad != 1);
 		content_x = false;
 		slot = &ClusterPageGetItlSlots(page.data)[0];
 		slot->flags = ITL_FLAG_ACTIVE;
 		slot->xid = 77;
 		slot->commit_scn = InvalidScn;
-		if (bad == 2) lazy_lock_available = false;
-		if (bad == 3) slot->xid++;
-		if (bad == 4) writer_allowed = false;
+		if (bad == 2)
+			lazy_lock_available = false;
+		if (bad == 3)
+			slot->xid++;
+		if (bad == 4)
+			writer_allowed = false;
 		hint_before = page;
 		stamped = cluster_itl_cleanout_lazy(1, 0, 77, 80);
 		UT_ASSERT_EQ(stamped, bad == 0);
@@ -1007,22 +1044,22 @@ UT_TEST(test_lazy_cleanout_versions_only_qualified_exclusive_hint)
 UT_TEST(test_terminal_census_preserves_required_cleanup_and_versions_it)
 {
 	for (int missing = 0; missing < 2; missing++) {
-		ClusterHeapItlTerminalCensus census = {0};
+		ClusterHeapItlTerminalCensus census = { 0 };
 		ClusterHeapItlTerminalBatchApplyResult result;
-		uint8 terminal_flags[CLUSTER_ITL_INITRANS_DEFAULT] = {ITL_FLAG_LOCK_ONLY_COMMITTED};
+		uint8 terminal_flags[CLUSTER_ITL_INITRANS_DEFAULT] = { ITL_FLAG_LOCK_ONLY_COMMITTED };
 		ClusterItlSlotData *slot;
 		HeapTupleHeader tuple;
 		PGAlignedBlock tuple_bytes;
 
-		(void) hint_setup(!missing);
+		(void)hint_setup(!missing);
 		PageInitHeapPage(page.data, BLCKSZ, 0);
-		((PageHeader) page.data)->pd_block_scn = 20;
+		((PageHeader)page.data)->pd_block_scn = 20;
 		memset(&tuple_bytes, 0, sizeof(tuple_bytes));
-		tuple = (HeapTupleHeader) tuple_bytes.data;
+		tuple = (HeapTupleHeader)tuple_bytes.data;
 		tuple->t_hoff = MAXALIGN(SizeofHeapTupleHeader);
 		tuple->t_infomask = HEAP_XMIN_COMMITTED | HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_KEYSHR_LOCK;
 		HeapTupleHeaderSetXmax(tuple, 77);
-		UT_ASSERT_EQ(PageAddItem(page.data, (Item) tuple, 64, 1, false, true), 1);
+		UT_ASSERT_EQ(PageAddItem(page.data, (Item)tuple, 64, 1, false, true), 1);
 		slot = &ClusterPageGetItlSlots(page.data)[0];
 		slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
 		slot->xid = 77;
@@ -1042,14 +1079,14 @@ UT_TEST(test_terminal_census_preserves_required_cleanup_and_versions_it)
 			UT_ASSERT_EQ(result.kind, CLUSTER_HEAP_ITL_BATCH_STALE_CURRENT_X);
 			UT_ASSERT_EQ(result.stamped_count, 1);
 			UT_ASSERT_EQ(slot->flags, ITL_FLAG_LOCK_ONLY_COMMITTED);
-			tuple = (HeapTupleHeader) PageGetItem(page.data, PageGetItemId(page.data, 1));
+			tuple = (HeapTupleHeader)PageGetItem(page.data, PageGetItemId(page.data, 1));
 			UT_ASSERT(tuple->t_infomask & HEAP_XMAX_INVALID);
 		}
 	}
 }
 UT_TEST(test_fsm_hint_uses_explicit_rebuildable_component)
 {
-	(void) hint_setup(false);
+	(void)hint_setup(false);
 	hint_fork = FSM_FORKNUM;
 	native_hint_fpi = true;
 	content_x = false;
@@ -1066,12 +1103,12 @@ UT_TEST(test_fsm_hint_uses_explicit_rebuildable_component)
 }
 UT_TEST(test_unprepared_shared_hint_cannot_emit_native_fpi)
 {
-	(void) hint_setup(true);
+	(void)hint_setup(true);
 	native_hint_fpi = true;
 	MyProc->delayChkptFlags = DELAY_CHKPT_START;
 	expected_error = true;
 	if (setjmp(error_jump) == 0) {
-		(void) XLogSaveBufferForHint(1, false);
+		(void)XLogSaveBufferForHint(1, false);
 		UT_ASSERT(false);
 	}
 	expected_error = false;
@@ -1081,7 +1118,7 @@ UT_TEST(test_unprepared_shared_hint_cannot_emit_native_fpi)
 UT_TEST(test_fsm_truncate_fpi_keeps_rebuildable_class)
 {
 	for (int shared = 0; shared < 2; shared++) {
-		(void) hint_setup(false);
+		(void)hint_setup(false);
 		cluster_shared_config = shared;
 		hint_fork = FSM_FORKNUM;
 		expected_xlog_info = XLOG_FPI;

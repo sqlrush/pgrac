@@ -560,12 +560,12 @@ cluster_reconfig_normal_stop_poll(const char **domain_out, uint64 *key_out, cons
 	/* Admission deliberately retains arbiter_submitted/seq as boot evidence.
 	 * The marker's ACK alone is insufficient, but successful original admission
 	 * ends that private responsibility without erasing the retained evidence. */
-	reconfig_stop_note(
-		&out,
-		!cold_formation_state.admission_done
-			&& (cold_formation_state.arbiter_submitted || cold_formation_state.observe_passed
-				|| cold_formation_state.initial_staged),
-		false, "COLD_FORMATION", cold_formation_state.arbiter_seq);
+	reconfig_stop_note(&out,
+					   !cold_formation_state.admission_done
+						   && (cold_formation_state.arbiter_submitted
+							   || cold_formation_state.observe_passed
+							   || cold_formation_state.initial_staged),
+					   false, "COLD_FORMATION", cold_formation_state.arbiter_seq);
 	reconfig_stop_note(&out,
 					   offpath_fast_rejoin_active_local || fast_rejoin_control.active
 						   || join_commit_stage.external_rejoin_consumed
@@ -6532,9 +6532,9 @@ cluster_reconfig_lmon_tick(void)
 			/* PGRAC: exact internal MEMBER stays non-serving through startup.
 			 * Author: SqlRush <sqlrush@gmail.com> */
 			cluster_membership_set_state(self_id, CLUSTER_MEMBER_MEMBER);
-		}
-		else if (cluster_shared_config && !cold_formation_state.admission_done
-				 && !ReconfigShmem->self_join_admitted && ReconfigShmem->last_applied.event_id == 0) {
+		} else if (cluster_shared_config && !cold_formation_state.admission_done
+				   && !ReconfigShmem->self_join_admitted
+				   && ReconfigShmem->last_applied.event_id == 0) {
 			cluster_membership_set_state(self_id, CLUSTER_MEMBER_JOINING);
 		}
 		/* AD-023 recovery-control formation: joiner_self_tick may have
@@ -6542,8 +6542,7 @@ cluster_reconfig_lmon_tick(void)
 		 * is still HOLD.  Preserve only that same retryable, write-closed
 		 * identity; the process-local bootstrap decision remains unlatched. */
 		else if (!cluster_shared_config && cluster_online_join && !joiner_gate_decided
-				 && !ReconfigShmem->self_join_admitted
-				 && !ReconfigShmem->self_join_failed
+				 && !ReconfigShmem->self_join_admitted && !ReconfigShmem->self_join_failed
 				 && cluster_epoch_get_current() == CLUSTER_EPOCH_INITIAL
 				 && cluster_reconfig_bootstrap_quorum_at_initial()
 				 && cluster_membership_get_state(self_id) == CLUSTER_MEMBER_MEMBER
@@ -7851,8 +7850,7 @@ out:
 static bool
 cluster_reconfig_r4_membership_observations_current(
 	ClusterR4MembershipSnapshot *candidate, bool freeze_generations,
-	const ClusterSemanticActivationRecord *stop_record, const uint8 *stop_root,
-	int32 terminal_peer)
+	const ClusterSemanticActivationRecord *stop_record, const uint8 *stop_root, int32 terminal_peer)
 {
 	int node;
 
@@ -7915,7 +7913,7 @@ cluster_reconfig_lmon_snapshot_r4_membership_internal(
 		return false;
 
 	if (!(terminal_peer >= 0 ? LWLockConditionalAcquire(&ReconfigShmem->lock, LW_SHARED)
-						 : cluster_reconfig_handoff_lock_acquire(LW_SHARED)))
+							 : cluster_reconfig_handoff_lock_acquire(LW_SHARED)))
 		return false;
 	candidate.formation_epoch = cluster_epoch_get_current();
 	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
@@ -7946,7 +7944,7 @@ cluster_reconfig_lmon_snapshot_r4_membership_internal(
 		return false;
 
 	if (!(terminal_peer >= 0 ? LWLockConditionalAcquire(&ReconfigShmem->lock, LW_SHARED)
-						 : cluster_reconfig_handoff_lock_acquire(LW_SHARED)))
+							 : cluster_reconfig_handoff_lock_acquire(LW_SHARED)))
 		return false;
 	if (cluster_epoch_get_current() != candidate.formation_epoch)
 		exact = false;
@@ -7988,7 +7986,7 @@ cluster_reconfig_terminal_peer_membership(int32 peer_node_id, ClusterR4Membershi
 	if (out == NULL || cut == 0 || peer_node_id < 0 || peer_node_id >= CLUSTER_MAX_NODES
 		|| peer_node_id == cluster_node_id
 		|| !cluster_reconfig_lmon_snapshot_r4_membership_internal(&candidate, NULL, NULL,
-																	peer_node_id)
+																  peer_node_id)
 		|| candidate.admitted_incarnation[peer_node_id] == 0
 		|| !cluster_membership_cut_generation_current(cut))
 		return false;
@@ -8852,8 +8850,8 @@ cluster_reconfig_formation_needs_disk_snapshot(void)
 	/* CONTROL may precede completion of phase3. Keep its fence proof fresh
 	 * throughout startup, including an LMS wait after formation is accepted. */
 	needed = ReconfigShmem->startup_formation.formation_generation == 0
-		|| cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
-		|| cluster_current_phase() == CLUSTER_PHASE_4_NORMAL;
+			 || cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
+			 || cluster_current_phase() == CLUSTER_PHASE_4_NORMAL;
 	LWLockRelease(&ReconfigShmem->lock);
 	return needed;
 }
@@ -8880,11 +8878,11 @@ cluster_reconfig_formation_disk_snapshot_current(void)
 	uint64 now = (uint64)GetCurrentTimestamp();
 	uint64 lease = (uint64)cluster_quorum_poll_interval_ms * 30 * 1000;
 
-	return cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON
-		&& s->complete && s->sampled_at_us > 0 && now >= s->sampled_at_us
-		&& now - s->sampled_at_us < lease && s->self_incarnation != 0
-		&& s->self_incarnation == cluster_qvotec_get_self_incarnation()
-		&& cluster_qvotec_in_quorum();
+	return cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON && s->complete
+		   && s->sampled_at_us > 0 && now >= s->sampled_at_us && now - s->sampled_at_us < lease
+		   && s->self_incarnation != 0
+		   && s->self_incarnation == cluster_qvotec_get_self_incarnation()
+		   && cluster_qvotec_in_quorum();
 }
 
 /* QVOTEC's original majority proof, for the postmaster's phase3 consumer.
@@ -8908,11 +8906,11 @@ cluster_reconfig_read_formation_fence_snapshot(ClusterFenceAuthorityProof *out)
 	} else
 		LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
 	proof = &ReconfigShmem->formation_disk_snapshot.fence;
-	valid = cluster_reconfig_formation_disk_snapshot_current()
-		&& proof->total_disk_count > 0 && proof->total_disk_count <= CLUSTER_MAX_VOTING_DISKS
-		&& proof->agree_disk_count <= proof->total_disk_count
-		&& proof->agree_disk_count > proof->total_disk_count / 2
-		&& cluster_fence_marker_valid_v1(&proof->marker);
+	valid = cluster_reconfig_formation_disk_snapshot_current() && proof->total_disk_count > 0
+			&& proof->total_disk_count <= CLUSTER_MAX_VOTING_DISKS
+			&& proof->agree_disk_count <= proof->total_disk_count
+			&& proof->agree_disk_count > proof->total_disk_count / 2
+			&& cluster_fence_marker_valid_v1(&proof->marker);
 	if (valid)
 		*out = *proof;
 	LWLockRelease(&ReconfigShmem->lock);
@@ -8921,16 +8919,17 @@ cluster_reconfig_read_formation_fence_snapshot(ClusterFenceAuthorityProof *out)
 
 static bool
 cluster_reconfig_startup_cohort_valid_at_epoch(const ClusterFormationCommitMarker *marker,
-									  const uint64 *incarnations, bool published, uint64 epoch)
+											   const uint64 *incarnations, bool published,
+											   uint64 epoch)
 {
 	int first = -1;
 	int count = 0;
 	uint64 storage_members[2] = { 0, 0 };
 
 	if (!cluster_shared_config || marker->formation_generation == 0 || marker->commit_nonce == 0
-		|| marker->formation_epoch <= CLUSTER_EPOCH_INITIAL
-		|| marker->formation_epoch != epoch || cluster_node_id < 0
-		|| cluster_node_id >= CLUSTER_MAX_NODES || cluster_qvotec_get_self_incarnation() == 0
+		|| marker->formation_epoch <= CLUSTER_EPOCH_INITIAL || marker->formation_epoch != epoch
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| cluster_qvotec_get_self_incarnation() == 0
 		|| incarnations[cluster_node_id] != cluster_qvotec_get_self_incarnation()
 		|| !cluster_qvotec_in_quorum() || ReconfigShmem->self_join_failed
 		|| pg_atomic_read_u32(&ReconfigShmem->prebump_sync_active) != 0
@@ -8975,7 +8974,7 @@ cluster_reconfig_startup_cohort_valid(const ClusterFormationCommitMarker *marker
 									  const uint64 *incarnations, bool published)
 {
 	return cluster_reconfig_startup_cohort_valid_at_epoch(marker, incarnations, published,
-														cluster_epoch_get_current());
+														  cluster_epoch_get_current());
 }
 
 /* Match the entire boot tuple in one QVOTEC publication. A peer already in
@@ -8983,13 +8982,13 @@ cluster_reconfig_startup_cohort_valid(const ClusterFormationCommitMarker *marker
  * This predicate never performs I/O. Author: SqlRush <sqlrush@gmail.com> */
 static bool
 cluster_reconfig_cold_formation_boots_current(const ClusterFormationCommitMarker *marker,
-												 const uint64 *incarnations)
+											  const uint64 *incarnations)
 {
 	uint64 seq = pg_atomic_read_u64(&ReconfigShmem->observed_bootstrap_seq);
 	bool valid = true;
 
-	if ((seq & 1) != 0 || !cluster_qvotec_in_quorum()
-		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+	if ((seq & 1) != 0 || !cluster_qvotec_in_quorum() || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES)
 		return false;
 	pg_read_barrier();
 	if (!pg_atomic_read_u64(&ReconfigShmem->bootstrap_in_quorum))
@@ -9007,7 +9006,7 @@ cluster_reconfig_cold_formation_boots_current(const ClusterFormationCommitMarker
 	}
 	pg_read_barrier();
 	return valid && seq == pg_atomic_read_u64(&ReconfigShmem->observed_bootstrap_seq)
-		&& incarnations[cluster_node_id] == cluster_qvotec_get_self_incarnation();
+		   && incarnations[cluster_node_id] == cluster_qvotec_get_self_incarnation();
 }
 
 static bool
@@ -9042,8 +9041,8 @@ cluster_reconfig_startup_fence_current(const ClusterFenceMarker *expected)
 	INSTR_TIME_SET_CURRENT(now);
 	ns = INSTR_TIME_GET_NANOSEC(now);
 	return ns > 0 && cluster_write_fence_allowed()
-		&& cluster_write_fence_revalidate_cached_nowait(expected, (uint64)ns / 1000)
-			== CLUSTER_FENCE_CACHE_MATCH;
+		   && cluster_write_fence_revalidate_cached_nowait(expected, (uint64)ns / 1000)
+				  == CLUSTER_FENCE_CACHE_MATCH;
 }
 
 static void
@@ -9217,10 +9216,9 @@ cluster_reconfig_cold_formation_admit(const ClusterFormationCommitMarker *marker
 			|| !cluster_reconfig_cold_formation_boots_current(marker, incarnation_by_node))
 			return;
 		if (epoch == CLUSTER_EPOCH_INITIAL) {
-			if (marker->formation_epoch <= epoch
-				|| ReconfigShmem->last_applied.event_id != 0
-				|| !cluster_reconfig_startup_cohort_valid_at_epoch(
-					marker, incarnation_by_node, false, marker->formation_epoch))
+			if (marker->formation_epoch <= epoch || ReconfigShmem->last_applied.event_id != 0
+				|| !cluster_reconfig_startup_cohort_valid_at_epoch(marker, incarnation_by_node,
+																   false, marker->formation_epoch))
 				return;
 			/* Both original durable authorities precede adoption. No I/O, WAL
 			 * or serving permission is hidden in this monotonic update. */
@@ -9377,7 +9375,8 @@ cluster_reconfig_shared_cold_formation_tick_locked(void)
 		if (arbiter != cluster_node_id || disk->max_epoch == UINT64_MAX
 			|| disk->max_generation == UINT64_MAX || cold_formation_commit_nonce == UINT64_MAX
 			|| ReconfigShmem->last_applied.event_id != 0
-			|| !cluster_reconfig_formation_fence_exact(&disk->fence, disk->fence.marker.fence_epoch))
+			|| !cluster_reconfig_formation_fence_exact(&disk->fence,
+													   disk->fence.marker.fence_epoch))
 			return;
 		memset(&marker, 0, sizeof(marker));
 		memset(incarnations, 0, sizeof(incarnations));
@@ -9394,11 +9393,12 @@ cluster_reconfig_shared_cold_formation_tick_locked(void)
 				continue;
 			marker.admitted_nodes[node / 8] |= (uint8)(1u << (node % 8));
 			marker.n_admitted++;
-			incarnations[node] = node == cluster_node_id ? marker.arbiter_incarnation
-				: cluster_reconfig_cold_formation_observed_incarnation(node);
+			incarnations[node] = node == cluster_node_id
+									 ? marker.arbiter_incarnation
+									 : cluster_reconfig_cold_formation_observed_incarnation(node);
 		}
-		if (!cluster_reconfig_startup_cohort_valid_at_epoch(
-				&marker, incarnations, false, marker.formation_epoch)
+		if (!cluster_reconfig_startup_cohort_valid_at_epoch(&marker, incarnations, false,
+															marker.formation_epoch)
 			|| !cluster_reconfig_cold_formation_boots_current(&marker, incarnations)
 			|| !cluster_formation_marker_encode(&marker, incarnations, bytes))
 			return;
@@ -9412,19 +9412,21 @@ cluster_reconfig_shared_cold_formation_tick_locked(void)
 	if (disk->max_epoch > marker.formation_epoch
 		|| disk->max_generation > marker.formation_generation
 		|| !cluster_reconfig_cold_formation_boots_current(&marker, incarnations)
-		|| !cluster_reconfig_startup_cohort_valid_at_epoch(
-			&marker, incarnations, false, marker.formation_epoch))
+		|| !cluster_reconfig_startup_cohort_valid_at_epoch(&marker, incarnations, false,
+														   marker.formation_epoch))
 		return;
 	cluster_fence_marker_build_baseline(&baseline, marker.formation_epoch, empty, 0, 0,
-									   CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
+										CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
 	if (!cold_formation_state.initial_fence_acked) {
 		if (!cluster_marker_async_is_submitted(&cold_formation_state.initial_fence)) {
-			(void)cluster_write_fence_submit_marker_async(&cold_formation_state.initial_fence,
-				&baseline, CLUSTER_MARKER_KIND_FORMATION_BASELINE, cluster_node_id, GetCurrentTimestamp());
+			(void)cluster_write_fence_submit_marker_async(
+				&cold_formation_state.initial_fence, &baseline,
+				CLUSTER_MARKER_KIND_FORMATION_BASELINE, cluster_node_id, GetCurrentTimestamp());
 			return;
 		}
 		if (cluster_write_fence_poll_marker_async(&cold_formation_state.initial_fence,
-				GetCurrentTimestamp(), &result, NULL) != CLUSTER_MARKER_POLL_ACKED
+												  GetCurrentTimestamp(), &result, NULL)
+				!= CLUSTER_MARKER_POLL_ACKED
 			|| result != CLUSTER_FENCE_MARKER_SUBMIT_ACK)
 			return;
 		cold_formation_state.initial_fence_acked = true;
@@ -9449,9 +9451,9 @@ cluster_reconfig_shared_cold_formation_tick_locked(void)
 		= pg_atomic_read_u64(&ReconfigShmem->formation_marker_request_seq);
 	cold_formation_state.arbiter_submitted = true;
 	ereport(LOG, (errmsg("cluster membership: node %d cold-formation arbiter "
-		"submitted formation marker (generation %llu, epoch %llu, members %u)",
-		cluster_node_id, (unsigned long long)marker.formation_generation,
-		(unsigned long long)marker.formation_epoch, (unsigned)marker.n_admitted)));
+						 "submitted formation marker (generation %llu, epoch %llu, members %u)",
+						 cluster_node_id, (unsigned long long)marker.formation_generation,
+						 (unsigned long long)marker.formation_epoch, (unsigned)marker.n_admitted)));
 }
 
 /*

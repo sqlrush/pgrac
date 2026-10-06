@@ -63,7 +63,7 @@
 
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
 #include "port/atomics.h"
-#include "port/pg_crc32c.h"		  /* join-commit marker integrity */
+#include "port/pg_crc32c.h" /* join-commit marker integrity */
 
 /* Exact administrative request. Generation comes from the formation owner,
  * never a client timestamp. These host values are not a wire/disk image.

@@ -5,6 +5,8 @@
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * PGRAC MODIFICATIONS: honor qualified redo buffer initialization results.
+ *
  * IDENTIFICATION
  *	  src/backend/access/brin/brin_xlog.c
  */
@@ -24,7 +26,7 @@ static void
 brin_xlog_createidx(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	xl_brin_createidx *xlrec = (xl_brin_createidx *) XLogRecGetData(record);
+	const xl_brin_createidx *xlrec = (xl_brin_createidx *) XLogRecGetData(record);
 	Buffer		buf;
 	Page		page;
 
@@ -50,7 +52,7 @@ brin_xlog_createidx(XLogReaderState *record)
  */
 static void
 brin_xlog_insert_update(XLogReaderState *record,
-						xl_brin_insert *xlrec)
+						const xl_brin_insert *xlrec)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
 	Buffer		buffer;
@@ -215,10 +217,9 @@ static void
 brin_xlog_revmap_extend(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	xl_brin_revmap_extend *xlrec;
+	const xl_brin_revmap_extend *xlrec;
 	Buffer		metabuf;
 	Buffer		buf;
-	Page		page;
 	BlockNumber targetBlk;
 	XLogRedoAction action;
 
@@ -262,6 +263,8 @@ brin_xlog_revmap_extend(XLogReaderState *record)
 
 	if (XLogReadBufferForRedoExtended(record, 1, RBM_ZERO_AND_LOCK, false, &buf)
 		== BLK_NEEDS_REDO) {
+		Page		page;
+
 		page = (Page)BufferGetPage(buf);
 		brin_page_init(page, BRIN_PAGETYPE_REVMAP);
 

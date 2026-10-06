@@ -66,8 +66,8 @@ class BlackBox:
     def validate(self):
         profile = self.profile
         if not profile or not profile.get("initialize"):
-            raise Dependency("A S11/S12: supported fresh PRE2 member initialization and atomic "
-                             "format activation are absent (PGRAC_PRE2_ENTRY_FILE); "
+            raise Dependency("A S11/S12: qualified native PRE2 cohort fixture entry is not "
+                             "configured (PGRAC_PRE2_ENTRY_FILE); "
                              "legacy backup-based --cluster-join is not a replacement")
         if profile.get("version") != 1:
             raise ValueError("unsupported test entry file version")
