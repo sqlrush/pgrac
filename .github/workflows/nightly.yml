@@ -24,7 +24,7 @@ jobs:
 
   linux-pg-regress:
     name: Linux PG 219 regression
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -69,6 +69,30 @@ jobs:
 
       - name: Run PG regression tests (219 tests)
         run: make check
+
+      - name: Install native quorum fixture dependencies
+        run: |
+          sudo systemctl mask --runtime corosync.service corosync-qdevice.service corosync-qnetd.service
+          sudo apt-get install -y --no-install-recommends corosync corosync-qdevice corosync-qnetd libnss3-tools iproute2
+          sudo modprobe loop
+
+      - name: Run native four-member undo refusal TAP
+        run: |
+          # This Linux-only quorum test remains mandatory in nightly.
+          # The macOS job executes the other five members of the same set.
+          sudo python3 -B scripts/ci/run_native_smoke.py \
+            --source "$GITHUB_WORKSPACE" --install "$HOME/pgrac-install" \
+            --output "$RUNNER_TEMP/pgrac-native-smoke" --vendor / \
+            --uid "$(id -u)" --gid "$(id -g)" --commit "$GITHUB_SHA"
+
+      - name: Upload native smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-native-smoke
+          path: ${{ runner.temp }}/pgrac-native-smoke/
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload regression diffs on failure
         if: failure()
@@ -138,7 +162,7 @@ jobs:
         run: |
           make -j$(sysctl -n hw.ncpu) -C src/test/cluster_unit check
           make -C src/test/cluster_regress check
-          SMOKE="$(python3 scripts/ci/mvp_ci.py --smoke)"
+          SMOKE="$(python3 scripts/ci/mvp_ci.py --smoke-local)"
           make -C src/test/cluster_tap check PROVE_TESTS="$SMOKE"
 
       - name: Upload regression diffs on failure

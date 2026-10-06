@@ -61,7 +61,7 @@ jobs:
   # ====================================================================
   validate:
     name: Validate (comment headers + format + tidy + commit msg)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       code_changed: ${{ steps.changes.outputs.code_changed }}
@@ -158,7 +158,9 @@ jobs:
         run: python3 scripts/ci/test_scan_build.py
 
       - name: Check MVP release evidence contract
-        run: python3 scripts/ci/test_mvp_ci.py
+        run: |
+          python3 scripts/ci/test_mvp_ci.py
+          python3 -B scripts/ci/test_native_smoke.py
 
       - name: Check deployment preflight safety contract
         run: python3 -B -m unittest discover -s scripts/deploy/pre1/tests -v
@@ -195,7 +197,7 @@ jobs:
     name: Linux enable-cluster (unit + regress + smoke TAP)
     needs: validate
     if: needs.validate.outputs.code_changed == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 12
     steps:
       - name: Checkout
@@ -251,12 +253,33 @@ jobs:
 
       - name: Run current MVP smoke TAP subset
         run: |
-          # Scope is explicit, shared with macOS, and validated before use.
-          # Former mixed 2PC/recovery/raw-device deployment cases still run
-          # unchanged in legacy-extended.yml; no failure is converted to PASS.
-          SMOKE="$(python3 scripts/ci/mvp_ci.py --smoke)"
+          # The same six-case selection is split by its real environment.
+          # 031 uses the native four-member quorum in the following step.
+          SMOKE="$(python3 scripts/ci/mvp_ci.py --smoke-local)"
           make -C src/test/cluster_tap check \
             PROVE_TESTS="$SMOKE"
+
+      - name: Install native quorum fixture dependencies
+        run: |
+          sudo systemctl mask --runtime corosync.service corosync-qdevice.service corosync-qnetd.service
+          sudo apt-get install -y --no-install-recommends corosync corosync-qdevice corosync-qnetd libnss3-tools iproute2
+          sudo modprobe loop
+
+      - name: Run native four-member undo refusal TAP
+        run: |
+          sudo python3 -B scripts/ci/run_native_smoke.py \
+            --source "$GITHUB_WORKSPACE" --install "$HOME/pgrac-install" \
+            --output "$RUNNER_TEMP/pgrac-native-smoke" --vendor / \
+            --uid "$(id -u)" --gid "$(id -g)" --commit "$GITHUB_SHA"
+
+      - name: Upload native smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-native-smoke
+          path: ${{ runner.temp }}/pgrac-native-smoke/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload regression diffs on failure
         if: failure()
@@ -285,7 +308,7 @@ jobs:
     name: Linux --disable-cluster regression
     needs: validate
     if: needs.validate.outputs.code_changed == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -408,7 +431,7 @@ jobs:
     name: Security (cppcheck + scan-build)
     needs: validate
     if: needs.validate.outputs.code_changed == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 8
     steps:
       - name: Checkout

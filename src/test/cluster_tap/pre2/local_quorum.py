@@ -12,11 +12,20 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import signal
 import subprocess
 import sys
 import time
+
+
+def native_library_dir(vendor):
+    triplet = {'aarch64': 'aarch64-linux-gnu', 'arm64': 'aarch64-linux-gnu',
+               'x86_64': 'x86_64-linux-gnu'}.get(platform.machine())
+    if triplet is None:
+        raise ValueError('unsupported local quorum host architecture')
+    return Path(vendor) / 'usr/lib' / triplet
 
 
 def qualified_status(quorum, device, count):
@@ -39,7 +48,7 @@ class LocalQuorum:
         self.bridge_created = False
         self.owned_root = False
         self.lock = None
-        self.env = dict(os.environ, LD_LIBRARY_PATH=str(self.vendor/'usr/lib/aarch64-linux-gnu'),
+        self.env = dict(os.environ, LD_LIBRARY_PATH=str(native_library_dir(self.vendor)),
                         PATH=f'{self.vendor}/usr/sbin:{self.vendor}/usr/bin:' + os.environ['PATH'])
 
     def run(self, argv, check=True, **kwargs):
@@ -80,7 +89,8 @@ class LocalQuorum:
         self.run(['ip', 'addr', 'add', '10.231.109.254/24', 'dev', self.tag])
         self.run(['ip', 'link', 'set', self.tag, 'up'])
         # Empty mount points in this development VM, never system configuration.
-        for path in ('/etc/corosync', '/var/lib/corosync', '/usr/lib/aarch64-linux-gnu/kronosnet'):
+        for path in ('/etc/corosync', '/var/lib/corosync',
+                     native_library_dir('/') / 'kronosnet'):
             Path(path).mkdir(exist_ok=True)
         for index in range(self.count + 1):
             node = self.root/f'ns{index}'
@@ -232,8 +242,8 @@ def hold(directory, vendor):
                           ('state', '/var/lib/corosync'), ('shm', '/dev/shm')]:
         run('mount', '--bind', str(directory/child), target)
     os.chmod('/dev/shm', 0o1777)
-    run('mount', '--bind', str(vendor/'usr/lib/aarch64-linux-gnu/kronosnet'),
-        '/usr/lib/aarch64-linux-gnu/kronosnet')
+    run('mount', '--bind', str(native_library_dir(vendor)/'kronosnet'),
+        str(native_library_dir('/')/'kronosnet'))
     (directory/'pid').write_text(str(os.getpid()))
     signal.signal(signal.SIGTERM, lambda *args: sys.exit(0))
     while True:

@@ -15,7 +15,7 @@ import uuid
 
 from blackbox import BlackBox
 from cohort import request, discovery, topology
-from local_quorum import qualified_status
+from local_quorum import native_library_dir, qualified_status
 
 
 def entry_profile(handles, formatter, votes):
@@ -76,7 +76,7 @@ class CohortEntry(BlackBox):
         if database:
             command += ['setpriv', '--reuid', str(self.handles['uid']), '--regid',
                         str(self.handles['gid']), '--init-groups']
-        return command + ['env', 'LD_LIBRARY_PATH='+str(self.vendor/'usr/lib/aarch64-linux-gnu')+':'+str(self.bindir.parent/'lib'),
+        return command + ['env', 'LD_LIBRARY_PATH='+str(native_library_dir(self.vendor))+':'+str(self.bindir.parent/'lib'),
                           *argv]
 
     def run_product(self, argv, **kwargs):
@@ -84,7 +84,7 @@ class CohortEntry(BlackBox):
         node = self.command_node(tool, argv[1:])
         env = kwargs.setdefault('env', dict(os.environ))
         env['PGUSER'] = pwd.getpwuid(self.handles['uid']).pw_name
-        env['LD_LIBRARY_PATH'] = str(self.vendor/'usr/lib/aarch64-linux-gnu')+':'+str(self.bindir.parent/'lib')
+        env['LD_LIBRARY_PATH'] = str(native_library_dir(self.vendor))+':'+str(self.bindir.parent/'lib')
         if node is not None:
             argv = self.namespace_command(node, argv)
         return self.transport(argv, **kwargs)
