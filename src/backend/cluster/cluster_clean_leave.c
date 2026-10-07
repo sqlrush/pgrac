@@ -2659,6 +2659,7 @@ cluster_normal_stop_durable_close_owned(const ClusterPhase1FullStopPlan *plan)
 
 static ClusterNormalStopPollResult
 cl_normal_stop_durable_close(const ClusterPhase1FullStopPlan *plan,
+							 const ClusterPhase1FullStopPlan *current_observation,
 							 ClusterNormalStopModuleObservation *observation)
 {
 	ClusterControlRootResult published;
@@ -2671,10 +2672,10 @@ cl_normal_stop_durable_close(const ClusterPhase1FullStopPlan *plan,
 	}
 	observation->module = "CONTROL_ROOT";
 	observation->reason = "NORMAL_STOP_DURABLE_CLOSE_PENDING";
-	/* The original stack plan may still carry its pre-checkpoint phase.
-	 * Refresh only the selected-root observation; retain its exact attempt,
-	 * deadline and original member binding, never fabricate a successor. */
-	observed = cl_normal_stop_identity_poll(true, &current, NULL);
+	/* The stack plan may still carry its pre-checkpoint phase. Consume this
+	 * poll's completed root observation, with live identity revalidation;
+	 * preserve the original attempt, deadline and member binding. */
+	observed = cl_normal_stop_identity_recheck(true, current_observation, &current, NULL);
 	if (observed != CLUSTER_NORMAL_STOP_READY)
 		return observed;
 	if (current.epoch != plan->epoch || current.own_wal_started_at != plan->own_wal_started_at
@@ -2714,6 +2715,8 @@ cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
 							   ClusterNormalStopModuleObservation *observation)
 {
 	ClusterNormalStopModuleObservation ignored;
+	ClusterPhase1FullStopPlan observed;
+	const ClusterPhase1FullStopPlan *current_observation = NULL;
 	ClusterNormalStopPollResult result;
 	bool armed, valid, wake = false;
 	uint32 expected, peers;
@@ -2735,7 +2738,16 @@ cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
 	LWLockRelease(&cl_state->lock);
 	if (!valid)
 		return CLUSTER_NORMAL_STOP_INVALID;
-	result = cl_normal_stop_modules_poll(true, armed, observation, NULL);
+	if (cluster_shared_config) {
+		/* A second async CF read would restart control work just drained by
+		 * the owner census. Keep one completed observation on this stack;
+		 * each consumer still rechecks the live formation/semantic identity. */
+		result = cl_normal_stop_identity_poll(true, &observed, &observation->reason);
+		if (result != CLUSTER_NORMAL_STOP_READY)
+			return result;
+		current_observation = &observed;
+	}
+	result = cl_normal_stop_modules_poll(true, armed, observation, current_observation);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
 	if (!armed) {
@@ -2756,7 +2768,7 @@ cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
 			return result;
 		/* Recheck actual identity and every original strict owner after the
 		 * mutation. A partial discard can never sign a final close. */
-		result = cluster_normal_stop_modules_poll(true, observation);
+		result = cl_normal_stop_modules_poll(true, true, observation, current_observation);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return result;
 		if (cluster_shared_config) {
@@ -2770,12 +2782,12 @@ cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
 			LWLockRelease(&cl_state->lock);
 			if (!idle)
 				return CLUSTER_NORMAL_STOP_PENDING;
-			result = cl_normal_stop_durable_close(plan, observation);
+			result = cl_normal_stop_durable_close(plan, current_observation, observation);
 			if (result != CLUSTER_NORMAL_STOP_READY)
 				return result;
 			/* The actual publication's locks must have retired; independently
 			 * recensus its control/transport effects before final RELEASE. */
-			result = cluster_normal_stop_modules_poll(true, observation);
+			result = cl_normal_stop_modules_poll(true, true, observation, current_observation);
 			if (result != CLUSTER_NORMAL_STOP_READY)
 				return result;
 		}

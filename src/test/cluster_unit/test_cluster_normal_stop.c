@@ -2278,6 +2278,7 @@ static int identity_pre2_change;
 static bool durable_close_all = true;
 static unsigned durable_close_calls;
 static ClusterControlRootResult durable_close_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+static unsigned durable_close_post_fault;
 
 /* Root-file/WAL publication is tested by the real root program. This
  * boundary makes the real controller prove that it waits for that result. */
@@ -2291,6 +2292,16 @@ cluster_control_root_v3_normal_stop_close(const ClusterPhase1FullStopPlan *plan,
 	*all_closed = durable_close_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && durable_close_all;
 	if (durable_close_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		identity_pre2_phase[cluster_node_id] = CLUSTER_CONTROL_ROOT_STOP_CLOSED;
+	if (durable_close_post_fault == 1)
+		module_results[8] = CLUSTER_NORMAL_STOP_PENDING;
+	else if (durable_close_post_fault == 2)
+		module_results[8] = CLUSTER_NORMAL_STOP_INVALID;
+	else if (durable_close_post_fault == 3)
+		identity_root[80] ^= 1;
+	else if (durable_close_post_fault == 4)
+		identity_formation.membership.last_admitted_incarnation[1]++;
+	else if (durable_close_post_fault == 5)
+		identity_formation.local_epoch++;
 	return durable_close_result;
 }
 
@@ -5599,6 +5610,82 @@ UT_TEST(test_pre2_release_waits_for_durable_global_close)
 	cluster_shared_config = false;
 }
 
+UT_TEST(test_pre2_close_consumes_one_async_observation_per_poll)
+{
+	for (int self = 0; self < 4; self++) {
+		ClusterPhase1FullStopPlan plan;
+		unsigned retire_calls;
+		uint64 nonce, deadline;
+		UT_ASSERT(pre2_declared_to_post_barrier(15, self, &plan));
+		identity_pre2_reads = 0;
+		identity_pre2_alternate_pending = true;
+		durable_close_calls = 0;
+		retire_calls = module_pi_retire_calls;
+		nonce = plan.attempt_nonce;
+		deadline = plan.absolute_deadline_us;
+		/* Every new remote CF read first returns PENDING. Its completion
+		 * belongs to this controller poll, including the publication cut. */
+		UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(identity_pre2_reads, 1);
+		UT_ASSERT_EQ(module_pi_retire_calls, retire_calls);
+		UT_ASSERT_EQ(durable_close_calls, 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 0);
+		UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(identity_pre2_reads, 2);
+		UT_ASSERT_EQ(durable_close_calls, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 1);
+		UT_ASSERT_EQ(plan.attempt_nonce, nonce);
+		UT_ASSERT_EQ(plan.absolute_deadline_us, deadline);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+		UT_ASSERT(!cluster_normal_stop_protocol_closed());
+		UT_ASSERT(!cluster_normal_stop_qvotec_cleared());
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pre2_close_does_not_restart_drained_observation_work)
+{
+	ClusterPhase1FullStopPlan plan;
+	unsigned reads;
+	UT_ASSERT(pre2_declared_to_post_barrier(15, 2, &plan));
+	reads = identity_pre2_reads;
+	durable_close_calls = 0;
+	identity_read_dispatch_lmon = true;
+	UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(identity_pre2_reads, reads + 1);
+	UT_ASSERT_EQ(durable_close_calls, 1);
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_active_mask), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 1);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pre2_close_recensuses_publication_debt_and_identity)
+{
+	for (unsigned fault = 1; fault <= 5; fault++) {
+		ClusterPhase1FullStopPlan plan;
+		UT_ASSERT(pre2_declared_to_post_barrier(15, 0, &plan));
+		durable_close_post_fault = fault;
+		durable_close_calls = 0;
+		UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL),
+					 fault == 1 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT_EQ(durable_close_calls, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 1);
+		UT_ASSERT(!cluster_normal_stop_protocol_closed());
+		UT_ASSERT(!cluster_normal_stop_qvotec_cleared());
+		UT_ASSERT(!cluster_normal_stop_durable_close_owned(&plan));
+		durable_close_post_fault = 0;
+		if (fault == 1) {
+			module_results[8] = CLUSTER_NORMAL_STOP_READY;
+			UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+			UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 1);
+		}
+	}
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_pre2_durable_close_failure_preserves_terminal_gates)
 {
 	const ClusterControlRootResult outcomes[]
@@ -5737,7 +5824,7 @@ UT_TEST(test_pre2_pair_rejects_nondeclared_release_reply_even_after_seal)
 int
 main(void)
 {
-	UT_PLAN(141);
+	UT_PLAN(144);
 	UT_RUN(test_actual_cleaner_pending_stop_retries_before_recycle_interval);
 	UT_RUN(test_actual_cleaner_without_stop_preserves_idle_cadence);
 	UT_RUN(test_pre2_stop_clean_restart_binds_current_epoch_and_original_record);
@@ -5875,6 +5962,9 @@ main(void)
 	UT_RUN(test_pre2_stop_identity_uses_declared_members_not_slot_capacity);
 	UT_RUN(test_pre2_declared_pair_full_close_requires_last_real_receipt);
 	UT_RUN(test_pre2_release_waits_for_durable_global_close);
+	UT_RUN(test_pre2_close_consumes_one_async_observation_per_poll);
+	UT_RUN(test_pre2_close_does_not_restart_drained_observation_work);
+	UT_RUN(test_pre2_close_recensuses_publication_debt_and_identity);
 	UT_RUN(test_pre2_durable_close_failure_preserves_terminal_gates);
 	UT_RUN(test_pre2_pair_release_never_shrinks_or_rebinds_members);
 	UT_RUN(test_pre2_pair_rejects_nondeclared_release_reply_even_after_seal);
