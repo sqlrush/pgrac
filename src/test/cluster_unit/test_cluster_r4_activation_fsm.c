@@ -11428,7 +11428,10 @@ static void test_serving_finish_root(void);
 int
 main(void)
 {
-	UT_PLAN(383);
+	UT_PLAN(386);
+	UT_RUN(test_member_commit_gap_before_all_peer_receipts);
+	UT_RUN(test_member_commit_request_waits_for_real_predecessor_receipts);
+	UT_RUN(test_member_commit_request_rejects_old_or_changed_identity);
 	UT_RUN(test_member_commit_read_preserves_carrier_during_observation_gap);
 	UT_RUN(test_member_commit_resumes_original_read_after_observation_gap);
 	UT_RUN(test_member_commit_retention_rejects_observable_contradictions);

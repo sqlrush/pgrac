@@ -27,14 +27,14 @@ test_commit_carrier_deliver(const ClusterSemanticActivationAckWireV1 *message, i
 }
 
 static void
-test_commit_carrier_setup(ClusterSemanticActivationAckWireV1 *request)
+test_commit_carrier_prepare_member(ClusterSemanticActivationAckWireV1 *request, int member)
 {
 	ClusterSemanticActivationAckTableV1 *table;
 	const uint32 caps = CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
 						| PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
 
 	test_gate_reset();
-	cluster_node_id = 1;
+	cluster_node_id = member;
 	test_current_epoch = test_membership_snapshot_epoch = 1;
 	test_membership_snapshot_valid = true;
 	test_membership_snapshot_lo = 15;
@@ -85,6 +85,15 @@ test_commit_carrier_setup(ClusterSemanticActivationAckWireV1 *request)
 	request->target_feature_bitmap = table->target_feature_bitmap;
 	request->admitted_members_lo = 15;
 	request->capability_sample_digest = table->capability_sample_digest;
+}
+
+static void
+test_commit_carrier_setup(ClusterSemanticActivationAckWireV1 *request)
+{
+	ClusterSemanticActivationAckTableV1 *table;
+
+	test_commit_carrier_prepare_member(request, 1);
+	table = SemanticActivationAckTable;
 	test_commit_carrier_deliver(request, 0);
 	cluster_semantic_activation_lmon_tick();
 	UT_ASSERT_EQ(table->stage, CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED);
@@ -185,6 +194,137 @@ test_commit_carrier_apply_proof(void)
 	test_resource_x_cutover_token.new_formation = 18;
 	test_resource_x_cutover_token.freeze_generation = 1;
 	test_resource_x_cutover_digest = UINT64_C(0xa55a9911);
+}
+
+/* No member number is special: a missing observation after accepting the
+ * REQUEST must not discard the three later genuine peer receipts. */
+UT_TEST(test_member_commit_gap_before_all_peer_receipts)
+{
+	for (int member = 1; member < 4; member++) {
+		ClusterSemanticActivationAckWireV1 request;
+		uint64 read_seq;
+
+		test_commit_carrier_prepare_member(&request, member);
+		test_commit_carrier_deliver(&request, 0);
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT_EQ(SemanticActivationAckTable->stage,
+					 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED);
+		read_seq = semantic_activation_lmon_record_read_seq;
+		UT_ASSERT_NE(read_seq, 0);
+		UT_ASSERT_EQ(SemanticActivationAckTable->observed_members_lo, 0);
+		test_membership_snapshot_valid = false;
+		cluster_semantic_activation_lmon_tick();
+		test_membership_snapshot_valid = true;
+		for (int peer = 0; peer < 4; peer++) {
+			ClusterSemanticActivationAckWireV1 ack = request;
+
+			if (peer == member)
+				continue;
+			ack.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK;
+			ack.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK;
+			ack.member_node = peer;
+			ack.boot_id = ack.admitted_incarnation = test_remote_admitted_incarnations[peer];
+			ack.capability_word = test_peer_capability_word;
+			test_commit_carrier_deliver(&ack, peer);
+			cluster_semantic_activation_lmon_tick();
+		}
+		UT_ASSERT_EQ(SemanticActivationAckTable->expected_members_lo, 15);
+		UT_ASSERT_EQ(SemanticActivationAckTable->observed_members_lo,
+					 UINT64_C(15) & ~(UINT64_C(1) << member));
+		UT_ASSERT_EQ(semantic_activation_lmon_record_read_seq, read_seq);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->record_generation), 4);
+		for (int peer = 0; peer < 4; peer++)
+			UT_ASSERT_EQ(test_send_calls[peer], 0);
+
+		test_commit_carrier_complete_read(&request, 0);
+		test_commit_carrier_apply_proof();
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT_EQ(SemanticActivationAckTable->observed_members_lo, 15);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->record_generation), 5);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&SemanticActivationShmem->transition_closed), 1);
+		for (int peer = 0; peer < 4; peer++)
+			UT_ASSERT_EQ(test_send_calls[peer], peer == member ? 0 : 1);
+	}
+	test_gate_reset();
+}
+
+UT_TEST(test_member_commit_request_waits_for_real_predecessor_receipts)
+{
+	ClusterSemanticActivationAckWireV1 request;
+
+	test_commit_carrier_prepare_member(&request, 2);
+	SemanticActivationAckTable->flags = CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID;
+	SemanticActivationAckTable->observed_members_lo = 5;
+	memset(&SemanticActivationAckTable->observed[1], 0,
+		   sizeof(SemanticActivationAckTable->observed[1]));
+	memset(&SemanticActivationAckTable->observed[3], 0,
+		   sizeof(SemanticActivationAckTable->observed[3]));
+	test_commit_carrier_deliver(&request, 0);
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT(semantic_activation_ack_local_request_ahead.valid);
+	UT_ASSERT_EQ(semantic_activation_lmon_record_read_seq, 0);
+	UT_ASSERT_EQ(SemanticActivationAckTable->stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED);
+	test_commit_carrier_deliver(&request, 0); /* one retained owner for duplicates */
+	test_membership_snapshot_valid = false;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT(semantic_activation_ack_local_request_ahead.valid);
+	test_membership_snapshot_valid = true;
+	for (int peer = 1; peer <= 3; peer += 2) {
+		ClusterSemanticActivationAckWireV1 ack = request;
+
+		ack.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK;
+		ack.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED;
+		ack.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK;
+		ack.member_node = peer;
+		ack.record_generation = 4;
+		ack.boot_id = ack.admitted_incarnation = test_remote_admitted_incarnations[peer];
+		ack.capability_word = test_peer_capability_word;
+		test_commit_carrier_deliver(&ack, peer);
+		cluster_semantic_activation_lmon_tick();
+		if (peer == 1) {
+			UT_ASSERT(semantic_activation_ack_local_request_ahead.valid);
+			UT_ASSERT_EQ(SemanticActivationAckTable->stage,
+						 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED);
+		}
+	}
+	UT_ASSERT(!semantic_activation_ack_local_request_ahead.valid);
+	UT_ASSERT_EQ(SemanticActivationAckTable->stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED);
+	UT_ASSERT_NE(semantic_activation_lmon_record_read_seq, 0);
+	UT_ASSERT_EQ(SemanticActivationAckTable->observed_members_lo, 0);
+	for (int peer = 0; peer < 4; peer++)
+		UT_ASSERT_EQ(test_send_calls[peer], 0);
+	test_gate_reset();
+}
+
+UT_TEST(test_member_commit_request_rejects_old_or_changed_identity)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		ClusterSemanticActivationAckWireV1 request;
+
+		test_commit_carrier_prepare_member(&request, 2);
+		if (fault == 0)
+			request.round_nonce--;
+		else if (fault == 1)
+			request.transition_epoch++;
+		else if (fault == 2)
+			request.record_generation++;
+		test_commit_carrier_deliver(&request, 0);
+		if (fault == 3)
+			test_peer_capability_generation++;
+		else if (fault == 4)
+			test_remote_admitted_incarnations[0]++;
+		else if (fault == 5)
+			test_local_capability_word = 0;
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT(!semantic_activation_ack_local_request_ahead.valid);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationShmem->record_generation), 4);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&SemanticActivationShmem->transition_closed), 1);
+		for (int peer = 0; peer < 4; peer++)
+			UT_ASSERT_EQ(test_send_calls[peer], 0);
+	}
+	test_gate_reset();
 }
 
 UT_TEST(test_member_commit_resumes_original_read_after_observation_gap)
