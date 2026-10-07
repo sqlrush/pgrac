@@ -465,96 +465,9 @@ cluster_vis_log_freshref_unproven(TransactionId raw_xid, const ClusterUndoTTSlot
 }
 
 
-/*
- * Classify a freshly-read ITL ref into LOCAL / REMOTE / STALE and, when
- * REMOTE, resolve its status.  spec-3.14 R10 exact-key discipline:
- *	  tt_slot_id == 0           -> placeholder (spec-3.1) -> NONE-equiv:
- *	                               treated as no evidence by caller.
- *	  origin == self            -> LOCAL (PG CLOG resolves), even when
- *	                               local_xid no longer matches because a
- *	                               local hot-page slot was recycled.
- *	  origin != self &&
- *	  local_xid != raw_xid      -> remote slot recycled to another owner ->
- *	                               STALE_OR_AMBIGUOUS (caller 53R97).
- *	  origin != self            -> REMOTE (overlay resolve).
- */
-static void
-classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr anchor_lsn,
-				  SCN read_scn, const ClusterTxLocator *exact_locator, ClusterVisResolve *out)
+static bool
+cluster_vis_resolve_native_prehistory(TransactionId raw_xid, ClusterVisResolve *out)
 {
-	if (out == NULL || ref == NULL)
-		return;
-
-	out->ref = *ref;
-
-	if (ref->tt_slot_id == 0) {
-		/* spec-3.1 placeholder slot: not authoritative evidence. */
-		out->evidence = CLUSTER_VIS_EVIDENCE_NONE;
-		return;
-	}
-
-	/*
-	 * On an ADG standby the replayed page's ITL slot can carry the commit
-	 * evidence before the overlay / durable-TT paths can resolve the xid.
-	 * The page itself is the authority, but only for an exact, terminal ITL
-	 * binding: the slot must still belong to this tuple-side xid and must
-	 * carry a committed cached SCN.  ACTIVE, ABORTED, invalid-SCN, and
-	 * recycled slots continue through the ordinary local/remote fail-closed
-	 * paths below.
-	 *
-	 * spec-6.4 F3: additionally cross-check the local CLOG (replayed from
-	 * the same WAL stream) instead of trusting page provenance alone.
-	 * Reads only run on the Apply Master, whose pg_xact is current through
-	 * its read point, so a committed xid confirms here; anything else falls
-	 * through to the fail-closed paths.
-	 */
-	if (cluster_enable_adg && cluster_dg_role == CLUSTER_DG_ROLE_STANDBY && RecoveryInProgress()
-		&& ref->local_xid == raw_xid && ref->has_cached_status && SCN_VALID(ref->cached_commit_scn)
-		&& TransactionIdDidCommit(raw_xid)) {
-		out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
-		out->status = CLUSTER_TT_STATUS_COMMITTED;
-		out->commit_scn = ref->cached_commit_scn;
-		return;
-	}
-
-	if ((int32)ref->origin_node_id == cluster_node_id) {
-		/*
-		 * Own-instance evidence is deliberately routed to PG-native CLOG.
-		 * ITL data slots are only an 8-slot page cache and are normally
-		 * recycled on local hot pages; treating a local_xid mismatch here as
-		 * remote-unknown would make ordinary local UPDATE/DELETE/SELECT fail
-		 * closed.  Remote safety still depends on an explicit remote-origin
-		 * ref, which is checked below.
-		 *
-		 * PGRAC: spec-6.15 D7 — that single-writer-era shortcut is only sound
-		 * for the xids the value space cannot prove foreign.  On a
-		 * bidirectionally-written page OUR xact recycles a slot whose previous
-		 * occupant was the PEER's xid: the slot's current owner proves nothing
-		 * about raw_xid's origin, and routing a provably-foreign xid to
-		 * PG-native CLOG is the same trust-the-ref false-resolve D4 closed in
-		 * the remote direction (false-abort of a committed foreign deleter /
-		 * false-invisible of a committed foreign inserter).  Derive from the
-		 * value instead and fall through to the remote machinery; below the
-		 * floor / striping off keeps the pre-striping LOCAL routing.
-		 */
-		if (ref->local_xid == raw_xid || !cluster_xid_provably_foreign(raw_xid)) {
-			out->evidence = CLUSTER_VIS_EVIDENCE_LOCAL;
-			return;
-		}
-		/* Stamp the DERIVED peer (INV-TP1/TP2): the ref names ourselves. */
-		cluster_touched_peers_stamp(cluster_xid_origin_slot(raw_xid), CLUSTER_TOUCH_VISIBILITY);
-	} else {
-		/*
-		 * spec-5.14 D2 class 4: past the self-check this is a genuine
-		 * remote-origin ITL ref — the visibility verdict (whether via
-		 * resolve_from_remote_ref or the STALE wrap-checked remote authority
-		 * below) now depends on that peer's volatile TT / undo state.  Stamp
-		 * conservatively so a fail-stop of the origin aborts this transaction
-		 * (INV-TP1/TP2).  Read-only; resolve logic unchanged.
-		 */
-		cluster_touched_peers_stamp((int32)ref->origin_node_id, CLUSTER_TOUCH_VISIBILITY);
-	}
-
 	/*
 	 * PGRAC (GCS-race round-2 RC-E): native-prehistory gate.  An ITL ref,
 	 * whether still bound or recycled, does not create TT authority for a
@@ -660,11 +573,107 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 		cluster_cr_native_prehistory_reader_unlock();
 
 		if (prehistory_resolved)
-			return;
+			return true;
 		/* Latch down under the lock (wrap barrier fired), not provable,
 		 * or CLOG truncated below raw_xid: no trustworthy native bytes
 		 * -- fail closed below. */
 	}
+
+	return false;
+}
+
+/*
+ * Classify a freshly-read ITL ref into LOCAL / REMOTE / STALE and, when
+ * REMOTE, resolve its status.  spec-3.14 R10 exact-key discipline:
+ *	  tt_slot_id == 0           -> placeholder (spec-3.1) -> NONE-equiv:
+ *	                               treated as no evidence by caller.
+ *	  origin == self            -> LOCAL (PG CLOG resolves), even when
+ *	                               local_xid no longer matches because a
+ *	                               local hot-page slot was recycled.
+ *	  origin != self &&
+ *	  local_xid != raw_xid      -> remote slot recycled to another owner ->
+ *	                               STALE_OR_AMBIGUOUS (caller 53R97).
+ *	  origin != self            -> REMOTE (overlay resolve).
+ */
+static void
+classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr anchor_lsn,
+				  SCN read_scn, const ClusterTxLocator *exact_locator, ClusterVisResolve *out)
+{
+	if (out == NULL || ref == NULL)
+		return;
+
+	out->ref = *ref;
+
+	if (ref->tt_slot_id == 0) {
+		/* spec-3.1 placeholder slot: not authoritative evidence. */
+		out->evidence = CLUSTER_VIS_EVIDENCE_NONE;
+		return;
+	}
+
+	/*
+	 * On an ADG standby the replayed page's ITL slot can carry the commit
+	 * evidence before the overlay / durable-TT paths can resolve the xid.
+	 * The page itself is the authority, but only for an exact, terminal ITL
+	 * binding: the slot must still belong to this tuple-side xid and must
+	 * carry a committed cached SCN.  ACTIVE, ABORTED, invalid-SCN, and
+	 * recycled slots continue through the ordinary local/remote fail-closed
+	 * paths below.
+	 *
+	 * spec-6.4 F3: additionally cross-check the local CLOG (replayed from
+	 * the same WAL stream) instead of trusting page provenance alone.
+	 * Reads only run on the Apply Master, whose pg_xact is current through
+	 * its read point, so a committed xid confirms here; anything else falls
+	 * through to the fail-closed paths.
+	 */
+	if (cluster_enable_adg && cluster_dg_role == CLUSTER_DG_ROLE_STANDBY && RecoveryInProgress()
+		&& ref->local_xid == raw_xid && ref->has_cached_status && SCN_VALID(ref->cached_commit_scn)
+		&& TransactionIdDidCommit(raw_xid)) {
+		out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+		out->status = CLUSTER_TT_STATUS_COMMITTED;
+		out->commit_scn = ref->cached_commit_scn;
+		return;
+	}
+
+	if ((int32)ref->origin_node_id == cluster_node_id) {
+		/*
+		 * Own-instance evidence is deliberately routed to PG-native CLOG.
+		 * ITL data slots are only an 8-slot page cache and are normally
+		 * recycled on local hot pages; treating a local_xid mismatch here as
+		 * remote-unknown would make ordinary local UPDATE/DELETE/SELECT fail
+		 * closed.  Remote safety still depends on an explicit remote-origin
+		 * ref, which is checked below.
+		 *
+		 * PGRAC: spec-6.15 D7 — that single-writer-era shortcut is only sound
+		 * for the xids the value space cannot prove foreign.  On a
+		 * bidirectionally-written page OUR xact recycles a slot whose previous
+		 * occupant was the PEER's xid: the slot's current owner proves nothing
+		 * about raw_xid's origin, and routing a provably-foreign xid to
+		 * PG-native CLOG is the same trust-the-ref false-resolve D4 closed in
+		 * the remote direction (false-abort of a committed foreign deleter /
+		 * false-invisible of a committed foreign inserter).  Derive from the
+		 * value instead and fall through to the remote machinery; below the
+		 * floor / striping off keeps the pre-striping LOCAL routing.
+		 */
+		if (ref->local_xid == raw_xid || !cluster_xid_provably_foreign(raw_xid)) {
+			out->evidence = CLUSTER_VIS_EVIDENCE_LOCAL;
+			return;
+		}
+		/* Stamp the DERIVED peer (INV-TP1/TP2): the ref names ourselves. */
+		cluster_touched_peers_stamp(cluster_xid_origin_slot(raw_xid), CLUSTER_TOUCH_VISIBILITY);
+	} else {
+		/*
+		 * spec-5.14 D2 class 4: past the self-check this is a genuine
+		 * remote-origin ITL ref — the visibility verdict (whether via
+		 * resolve_from_remote_ref or the STALE wrap-checked remote authority
+		 * below) now depends on that peer's volatile TT / undo state.  Stamp
+		 * conservatively so a fail-stop of the origin aborts this transaction
+		 * (INV-TP1/TP2).  Read-only; resolve logic unchanged.
+		 */
+		cluster_touched_peers_stamp((int32)ref->origin_node_id, CLUSTER_TOUCH_VISIBILITY);
+	}
+
+	if (cluster_vis_resolve_native_prehistory(raw_xid, out))
+		return;
 
 	if (ref->local_xid != raw_xid) {
 		/*
@@ -1120,6 +1129,27 @@ cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionI
 											&locator, &unused_row_wait)
 		|| locator.xid != ref.local_xid)
 		return;
+
+	/* A valid DATA ref, even a recycled one, cannot supply a TT identity
+	 * for a native-era creator. Consume the same sealed, wrap-drained and
+	 * truncation-protected proof as the live resolver. Its SCN remains a
+	 * read-only bound, never a page stamp or an exact memo entry. */
+	{
+		uint64 epoch = cluster_epoch_get_current();
+		ClusterVisResolve native = *out;
+
+		if (cluster_vis_resolve_native_prehistory(raw_xid, &native)) {
+			out->ref = ref;
+			out->diagnostic_reason = "NATIVE_PREHISTORY_EPOCH_CHANGED";
+			if (epoch <= UINT32_MAX && ref.cluster_epoch == (uint32)epoch
+				&& cluster_epoch_get_current() == epoch) {
+				*out = native;
+				out->ref = ref;
+				out->diagnostic_reason = "NATIVE_PREHISTORY_PROVEN";
+			}
+			return;
+		}
+	}
 
 	if (ref.local_xid != raw_xid) {
 		uint64 epoch = cluster_epoch_get_current();

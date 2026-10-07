@@ -7436,12 +7436,23 @@ test_cluster_r4_itl_capacity: test_cluster_r4_itl_capacity.c test_cluster_r4_loc
 # alternatives are fixture traps and must remain unreachable.
 CLUSTER_R4_SCRATCH_RESOLVER_TEST_O = test_cluster_r4_scratch_resolver_product.o
 
+# Run the unchanged production widening and coverage predicates in the
+# resolver fixture; only the adopted CLOG and lock boundaries are scripted.
+test_cluster_native_prehistory_proof.inc: \
+		$(top_srcdir)/src/backend/cluster/cluster_xid_stripe.c \
+		$(top_srcdir)/src/backend/cluster/cluster_xid_prehistory.c
+	awk '/^cluster_xid_widen\(/ { print "FullTransactionId"; emit=1; n++ } \
+	     /^cluster_xid_native_prehistory_provable_full\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 2) exit 1 }' $^ > $@.tmp
+	mv $@.tmp $@
+
 # Exact production gate body; the receiving fixture traps construction and
 # links the real MVCC caller/ref resolver for the NOT_APPLICABLE continuation.
 test_cluster_cr_mvcc_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_cr.c
 	(echo 'ClusterCrVerdict'; sed -n '/^cluster_cr_satisfies_mvcc(HeapTuple/,/^static ClusterCrVerdict/p' $< | sed '$$d') > $@
 
 test_cluster_cr_mvcc_origin: test_cluster_cr_mvcc_origin.c test_cluster_cr_mvcc_gate.inc \
+		test_cluster_native_prehistory_proof.inc \
 		cluster_snapshot_test_stubs.h \
 		test_cluster_r4_scratch_resolver.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_uba.c \
@@ -7461,6 +7472,7 @@ $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O): \
 		-DCLUSTER_CTRC_UNIT_TEST=1 -c $< -o $@
 
 test_cluster_r4_scratch_resolver: test_cluster_r4_scratch_resolver.c unit_test.h \
+		test_cluster_native_prehistory_proof.inc \
 		cluster_snapshot_test_stubs.h \
 		$(top_srcdir)/src/backend/cluster/cluster_tt_status_hint.c \
 		$(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) \
