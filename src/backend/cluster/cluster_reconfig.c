@@ -806,30 +806,14 @@ cluster_reconfig_get_last_event(ReconfigEvent *out)
 	LWLockRelease(&ReconfigShmem->lock);
 }
 
-bool
-cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
-											   ClusterFormationSnapshotV1 *out)
+/* Copy identity only while the original owner lock is held. Qualification
+ * belongs to the caller's admission observation. Author: SqlRush <sqlrush@gmail.com> */
+static void
+cluster_reconfig_capture_formation_locked(int32 origin_node, ClusterFormationSnapshotV1 *out)
 {
 	const ReconfigEvent *src;
-	int32 origin_node;
 	int i;
 
-	if (out == NULL || origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES
-		|| ReconfigShmem == NULL)
-		return false;
-	origin_node = (int32)origin_thread - 1;
-	memset(out, 0, sizeof(*out));
-	/* A1: Postmaster drives phase 3 before StartupProcess exists, so it has
-	 * no PGPROC with which LWLockAcquire could queue.  Preserve blocking
-	 * snapshot semantics for ordinary processes; the no-PGPROC caller may
-	 * only take an immediately available shared lock and lets the existing
-	 * phase-3 deadline loop retry contention. */
-	if (MyProc == NULL) {
-		if (!LWLockConditionalAcquire(&ReconfigShmem->lock, LW_SHARED)) {
-			return false;
-		}
-	} else
-		LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
 	src = &ReconfigShmem->last_applied;
 	out->applied.event_id = src->event_id;
 	out->applied.coordinator_node_id = src->coordinator_node_id;
@@ -855,6 +839,31 @@ cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
 	out->self_join_admitted = ReconfigShmem->self_join_admitted;
 	out->self_join_failed = ReconfigShmem->self_join_failed;
 	out->local_epoch = cluster_epoch_get_current();
+}
+
+bool
+cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
+											   ClusterFormationSnapshotV1 *out)
+{
+	int32 origin_node;
+
+	if (out == NULL || origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES
+		|| ReconfigShmem == NULL)
+		return false;
+	origin_node = (int32)origin_thread - 1;
+	memset(out, 0, sizeof(*out));
+	/* A1: Postmaster drives phase 3 before StartupProcess exists, so it has
+	 * no PGPROC with which LWLockAcquire could queue.  Preserve blocking
+	 * snapshot semantics for ordinary processes; the no-PGPROC caller may
+	 * only take an immediately available shared lock and lets the existing
+	 * phase-3 deadline loop retry contention. */
+	if (MyProc == NULL) {
+		if (!LWLockConditionalAcquire(&ReconfigShmem->lock, LW_SHARED)) {
+			return false;
+		}
+	} else
+		LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	cluster_reconfig_capture_formation_locked(origin_node, out);
 	if (cluster_reconfig_startup_formation_current_locked())
 		out->startup_formation_generation = ReconfigShmem->startup_formation.formation_generation;
 	LWLockRelease(&ReconfigShmem->lock);
@@ -8917,37 +8926,58 @@ cluster_reconfig_read_formation_fence_snapshot(ClusterFenceAuthorityProof *out)
 	return valid;
 }
 
-static bool
-cluster_reconfig_startup_cohort_valid_at_epoch(const ClusterFormationCommitMarker *marker,
-											   const uint64 *incarnations, bool published,
-											   uint64 epoch)
+/* The accepted cohort's identity does not depend on a second qualification
+ * observation. Return a stable diagnostic name, never an authority grant.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static const char *
+cluster_reconfig_startup_cohort_identity_at_epoch(const ClusterFormationCommitMarker *marker,
+												  const uint64 *incarnations, bool published,
+												  uint64 epoch, uint64 storage_members[2])
 {
 	int first = -1;
 	int count = 0;
-	uint64 storage_members[2] = { 0, 0 };
 
-	if (!cluster_shared_config || marker->formation_generation == 0 || marker->commit_nonce == 0
-		|| marker->formation_epoch <= CLUSTER_EPOCH_INITIAL || marker->formation_epoch != epoch
-		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
-		|| cluster_qvotec_get_self_incarnation() == 0
-		|| incarnations[cluster_node_id] != cluster_qvotec_get_self_incarnation()
-		|| !cluster_qvotec_in_quorum() || ReconfigShmem->self_join_failed
-		|| pg_atomic_read_u32(&ReconfigShmem->prebump_sync_active) != 0
-		|| (ReconfigShmem->last_applied.reconfig_kind != RECONFIG_KIND_NONE
-			&& ReconfigShmem->last_applied.reconfig_kind != RECONFIG_KIND_CLEAN_LEAVE)
-		|| ReconfigShmem->last_applied.new_epoch > marker->formation_epoch
-		|| cluster_reconfig_has_replacement_episode(&ReconfigShmem->replacement_episode))
-		return false;
-	for (int b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; ++b)
-		if (ReconfigShmem->pending_join_bitmap[b] || ReconfigShmem->removed_bitmap[b]
-			|| ReconfigShmem->last_applied.dead_bitmap[b]
-			|| ReconfigShmem->last_applied.join_bitmap[b])
-			return false;
+	storage_members[0] = storage_members[1] = 0;
+	if (!cluster_shared_config)
+		return "formation.not_shared";
+	if (marker->formation_generation == 0)
+		return "formation.generation";
+	if (marker->commit_nonce == 0)
+		return "formation.nonce";
+	if (marker->formation_epoch <= CLUSTER_EPOCH_INITIAL || marker->formation_epoch != epoch)
+		return "formation.epoch";
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		return "formation.self_node";
+	if (cluster_qvotec_get_self_incarnation() == 0
+		|| incarnations[cluster_node_id] != cluster_qvotec_get_self_incarnation())
+		return "formation.self_incarnation";
+	if (ReconfigShmem->self_join_failed)
+		return "formation.self_failed";
+	if (pg_atomic_read_u32(&ReconfigShmem->prebump_sync_active) != 0)
+		return "formation.prebump";
+	if (ReconfigShmem->last_applied.reconfig_kind != RECONFIG_KIND_NONE
+		&& ReconfigShmem->last_applied.reconfig_kind != RECONFIG_KIND_CLEAN_LEAVE)
+		return "formation.applied_kind";
+	if (ReconfigShmem->last_applied.new_epoch > marker->formation_epoch)
+		return "formation.applied_epoch";
+	if (cluster_reconfig_has_replacement_episode(&ReconfigShmem->replacement_episode))
+		return "formation.replacement";
+	for (int b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; ++b) {
+		if (ReconfigShmem->pending_join_bitmap[b])
+			return "formation.pending_join";
+		if (ReconfigShmem->removed_bitmap[b])
+			return "formation.removed";
+		if (ReconfigShmem->last_applied.dead_bitmap[b])
+			return "formation.applied_dead";
+		if (ReconfigShmem->last_applied.join_bitmap[b])
+			return "formation.applied_join";
+	}
 	for (int i = 0; i < CLUSTER_MAX_NODES; ++i) {
 		bool declared = cluster_conf_lookup_node(i) != NULL;
 		bool included = (marker->admitted_nodes[i / 8] & (uint8)(1u << (i % 8))) != 0;
+
 		if (declared != included || included != (incarnations[i] != 0))
-			return false;
+			return "formation.declared_cohort";
 		if (!declared)
 			continue;
 		storage_members[i / 64] |= UINT64_C(1) << (i % 64);
@@ -8958,15 +8988,139 @@ cluster_reconfig_startup_cohort_valid_at_epoch(const ClusterFormationCommitMarke
 			|| cluster_membership_get_state(i) == CLUSTER_MEMBER_DEAD
 			|| cluster_membership_get_state(i) == CLUSTER_MEMBER_REJECTED
 			|| cluster_membership_get_last_admitted_incarnation(i) > incarnations[i])
-			return false;
+			return "formation.member_identity";
 		if (published
 			&& (cluster_membership_get_state(i) != CLUSTER_MEMBER_MEMBER
 				|| cluster_membership_get_last_admitted_incarnation(i) != incarnations[i]))
-			return false;
+			return "formation.member_admission";
 	}
-	return first >= 0 && count == marker->n_admitted && marker->arbiter_node == (uint64)first
-		   && marker->arbiter_incarnation == incarnations[first]
+	if (first < 0 || count != marker->n_admitted)
+		return "formation.member_count";
+	if (marker->arbiter_node != (uint64)first || marker->arbiter_incarnation != incarnations[first])
+		return "formation.arbiter";
+	return NULL;
+}
+
+static bool
+cluster_reconfig_startup_cohort_valid_at_epoch(const ClusterFormationCommitMarker *marker,
+											   const uint64 *incarnations, bool published,
+											   uint64 epoch)
+{
+	uint64 storage_members[2];
+
+	return cluster_reconfig_startup_cohort_identity_at_epoch(marker, incarnations, published, epoch,
+															 storage_members)
+			   == NULL
+		   && cluster_qvotec_in_quorum()
 		   && cluster_storage_quorum_allows_members(storage_members[0], storage_members[1]);
+}
+
+/* Classify only the supplied original observation; do not renew or resample
+ * any part of it. A known loss takes precedence over lock contention.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterServingFormationResult
+cluster_reconfig_serving_admission_result(const ClusterQvotecAdmissionCheck *admission,
+										  const char **predicate)
+{
+	*predicate = "admission.refused";
+	if (admission->quorum_state != CLUSTER_QVOTEC_QUORUM_OK)
+		return CLUSTER_SERVING_FORMATION_REFUSED;
+	if (admission->result == CLUSTER_QVOTEC_ADMISSION_STORAGE
+		&& admission->storage.result == CLUSTER_STORAGE_CHECK_UNSTABLE
+		&& (admission->storage.snapshot_stop == CLUSTER_STORAGE_SNAPSHOT_DEADLINE
+			|| admission->storage.snapshot_stop == CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT)) {
+		*predicate = "storage.observation_pending";
+		return CLUSTER_SERVING_FORMATION_PENDING;
+	}
+	if (admission->result != CLUSTER_QVOTEC_ADMISSION_ALLOWED)
+		return CLUSTER_SERVING_FORMATION_REFUSED;
+	if (admission->storage.result != CLUSTER_STORAGE_CHECK_ALLOWED || !admission->storage.stable
+		|| admission->storage.view.reason != CLUSTER_STORAGE_QUORUM_READY
+		|| admission->storage.self_node != cluster_node_id
+		|| admission->storage.target_node != cluster_node_id) {
+		*predicate = "admission.observation_invalid";
+		return CLUSTER_SERVING_FORMATION_REFUSED;
+	}
+	if (admission->continuity_pending) {
+		*predicate = "admission.publication_pending";
+		return CLUSTER_SERVING_FORMATION_PENDING;
+	}
+	if (!admission->continuity_valid || admission->continuity.quorum_generation == 0
+		|| admission->continuity.quorum_generation == UINT64_MAX
+		|| admission->continuity.storage_generation == 0
+		|| admission->continuity.storage_generation == UINT64_MAX
+		|| admission->continuity.storage_generation != admission->storage.view.loss_generation) {
+		*predicate = "admission.continuity_lost";
+		return CLUSTER_SERVING_FORMATION_REFUSED;
+	}
+	*predicate = "formation.current";
+	return CLUSTER_SERVING_FORMATION_CURRENT;
+}
+
+ClusterServingFormationResult
+cluster_reconfig_capture_serving_formation_v1(uint16 origin_thread,
+											  const ClusterQvotecAdmissionCheck *admission,
+											  ClusterFormationSnapshotV1 *out, bool *snapshot_valid,
+											  const char **predicate)
+{
+	ClusterServingFormationResult result;
+	const ClusterFormationCommitMarker *marker;
+	const char *identity;
+	uint64 storage_members[2];
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (snapshot_valid != NULL)
+		*snapshot_valid = false;
+	if (predicate != NULL)
+		*predicate = "formation.input_invalid";
+	if (out == NULL || snapshot_valid == NULL || predicate == NULL || admission == NULL
+		|| origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES)
+		return CLUSTER_SERVING_FORMATION_REFUSED;
+	if (ReconfigShmem == NULL || !cluster_shared_config) {
+		*predicate = "formation.unavailable";
+		return CLUSTER_SERVING_FORMATION_REFUSED;
+	}
+	result = cluster_reconfig_serving_admission_result(admission, predicate);
+	if (result == CLUSTER_SERVING_FORMATION_REFUSED)
+		return result;
+	/* This entry is also consumed by transport owners; never queue for the
+	 * reconfig lock while retaining another owner. */
+	if (!LWLockConditionalAcquire(&ReconfigShmem->lock, LW_SHARED)) {
+		*predicate = "formation.lock_busy";
+		return CLUSTER_SERVING_FORMATION_PENDING;
+	}
+	cluster_reconfig_capture_formation_locked((int32)origin_thread - 1, out);
+	marker = &ReconfigShmem->startup_formation;
+	identity = cluster_reconfig_startup_cohort_identity_at_epoch(
+		marker, ReconfigShmem->startup_formation_incarnations, true, out->local_epoch,
+		storage_members);
+	if (identity == NULL
+		&& (marker->magic != CLUSTER_FORMATION_MARKER_MAGIC
+			|| marker->version != CLUSTER_FORMATION_MARKER_VERSION
+			|| marker->phase != CLUSTER_FORMATION_MARKER_PHASE_COMMITTED
+			|| marker->formation_generation == UINT64_MAX))
+		identity = "formation.marker_invalid";
+	if (identity == NULL && (!out->self_join_admitted || out->victim_incarnation == 0))
+		identity = "formation.origin_not_admitted";
+	if (identity == NULL)
+		out->startup_formation_generation = marker->formation_generation;
+	LWLockRelease(&ReconfigShmem->lock);
+	if (identity != NULL || out->local_epoch != cluster_epoch_get_current()) {
+		*predicate = identity != NULL ? identity : "formation.epoch_changed";
+		memset(out, 0, sizeof(*out));
+		return CLUSTER_SERVING_FORMATION_REFUSED;
+	}
+	*snapshot_valid = true;
+	/* A stable member exclusion remains a refusal even when the separate
+	 * QVOTEC publication overlapped. An unfinished storage view grants nothing. */
+	if (admission->storage.stable && admission->storage.result == CLUSTER_STORAGE_CHECK_ALLOWED
+		&& ((storage_members[0] & ~admission->storage.view.members[0]) != 0
+			|| (storage_members[1] & ~admission->storage.view.members[1]) != 0)) {
+		*predicate = "formation.storage_members";
+		return CLUSTER_SERVING_FORMATION_REFUSED;
+	}
+	return result;
 }
 
 static bool
@@ -10335,6 +10489,21 @@ cluster_get_membership(PG_FUNCTION_ARGS)
 
 
 #else /* !USE_PGRAC_CLUSTER */
+
+ClusterServingFormationResult
+cluster_reconfig_capture_serving_formation_v1(
+	uint16 origin_thread pg_attribute_unused(),
+	const struct ClusterQvotecAdmissionCheck *admission pg_attribute_unused(),
+	ClusterFormationSnapshotV1 *out, bool *snapshot_valid, const char **predicate)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (snapshot_valid != NULL)
+		*snapshot_valid = false;
+	if (predicate != NULL)
+		*predicate = "formation.cluster_disabled";
+	return CLUSTER_SERVING_FORMATION_REFUSED;
+}
 
 /*
  * Disable-cluster stubs.  Same symbol surface so envelope receive
