@@ -91,11 +91,16 @@ UT_TEST(test_counter_never_changes_verdict)
 	 * counter, so every verdict must be identical. */
 	{
 		int i;
-		pg_atomic_uint64 *fields = (pg_atomic_uint64 *)&ut_stats;
-		int nfields = sizeof(ClusterSideStats) / sizeof(pg_atomic_uint64);
+		pg_atomic_uint64 *fields[]
+			= { &ut_stats.route_applies,		 &ut_stats.route_noops,
+				&ut_stats.route_blocked,		 &ut_stats.domain_tt_undo,
+				&ut_stats.domain_projection,	 &ut_stats.domain_storage,
+				&ut_stats.blocked_unknown_class, &ut_stats.blocked_authority,
+				&ut_stats.rebuild_events,		 &ut_stats.durability_events };
+		int nfields = lengthof(fields);
 
 		for (i = 0; i < nfields; i++)
-			pg_atomic_write_u64(&fields[i], UINT64_MAX / 2);
+			pg_atomic_write_u64(fields[i], UINT64_MAX / 2);
 	}
 
 	UT_ASSERT(cluster_side_route_lookup(10 /* RM_HEAP_ID */, 0x10, &row));

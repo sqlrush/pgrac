@@ -57,6 +57,7 @@
 
 #include "cluster/cluster_elog.h" /* cluster_phase legacy mirror (HC2) */
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_config_members.h"
 #include "cluster/cluster_hw_remaster.h" /* contract: worker CF(S) admission */
 #include "cluster/cluster_cf_phase2.h"	 /* RF-ROOT P6: storage contract verify */
 #include "cluster/cluster_cssd.h"		 /* cluster_cssd_start / wait_for_ready (2.5 Sprint A) */
@@ -65,7 +66,8 @@
 #include "cluster/cluster_epoch.h"	/* cluster_epoch_get_current (RF-ROOT P6 diag) */
 #include "cluster/cluster_guc.h"	/* cluster_phase{1..4}_timeout (D2 F2) */
 #include "cluster/cluster_grd.h"
-#include "cluster/cluster_stats.h"	/* cluster_stats_start / wait_for_ready (1.14 Sprint A) */
+#include "cluster/cluster_stats.h" /* cluster_stats_start / wait_for_ready (1.14 Sprint A) */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_lck.h"	/* cluster_lck_start / wait_for_ready (1.12 Sprint A) */
 #include "cluster/cluster_lms.h"	/* cluster_lms_start / wait_for_ready (spec-2.18 Sprint A) */
@@ -254,6 +256,18 @@ cluster_authority_clear_matching_internal(const ClusterAuthorityBindingLocal *bi
 		cleared = true;
 	}
 	LWLockRelease(&cluster_phase_state->lwlock);
+	/* Report the actual one-time identity retirement, outside its lock.
+	 * The later LMS sample is diagnostic, never the reason for this clear. */
+	if (cleared && !preserve_handoff_identity && cluster_shared_config)
+		ereport(LOG, (errmsg("cluster authority binding cleared"),
+					  errdetail("PGRAC_FAMILY=AUTHORITY_CLEAR caller=%s backend_type=%d "
+								"old_readiness=%d origin_thread=%u boot=" UINT64_FORMAT
+								" lms_generation=" UINT64_FORMAT " formation_epoch=" UINT64_FORMAT
+								" lms_ready_after_clear=%d",
+								caller != NULL ? caller : "UNREPORTED", (int)MyBackendType,
+								(int)binding->state, (unsigned)binding->origin_thread,
+								binding->boot_incarnation, binding->lms_generation,
+								binding->formation.local_epoch, cluster_lms_is_ready())));
 	return cleared;
 }
 
@@ -405,8 +419,11 @@ cluster_serving_generation_current(const ClusterAuthorityBindingLocal *binding)
 static bool
 cluster_authority_binding_components_current_internal(const ClusterAuthorityBindingLocal *binding,
 													  bool serving, bool require_seal,
-													  bool require_member)
+													  bool require_member,
+													  bool refresh_identity_only)
 {
+	ClusterFormationWitnessResult formation_result;
+
 	if (binding == NULL || binding->boot_incarnation == 0 || binding->lms_generation == 0
 		|| cluster_cssd_get_status() != CLUSTER_CSSD_READY
 		|| cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY || !cluster_qvotec_in_quorum()
@@ -415,22 +432,25 @@ cluster_authority_binding_components_current_internal(const ClusterAuthorityBind
 			   != binding->boot_incarnation
 		|| cluster_lms_get_lms_restart_generation() != binding->lms_generation
 		|| (require_member && !cluster_membership_is_member(cluster_node_id))
-		|| (serving ? !cluster_serving_formation_current(binding)
-					: cluster_formation_classification_revalidate_nowait(
-						  binding->origin_thread, &binding->authority, &binding->formation)
-						  != CLUSTER_FORMATION_WITNESS_READY)
 		|| (require_seal
 			&& !cluster_grd_recovery_authority_is_current(binding->boot_incarnation,
 														  binding->lms_generation)))
 		return false;
-	return true;
+	if (serving)
+		return cluster_serving_formation_current(binding);
+	formation_result = cluster_formation_classification_revalidate_nowait(
+		binding->origin_thread, &binding->authority, &binding->formation);
+	return formation_result == CLUSTER_FORMATION_WITNESS_READY
+		   || (refresh_identity_only
+			   && formation_result == CLUSTER_FORMATION_WITNESS_CACHE_EXPIRED);
 }
 
 static bool
 cluster_authority_binding_components_current(const ClusterAuthorityBindingLocal *binding,
 											 bool serving)
 {
-	return cluster_authority_binding_components_current_internal(binding, serving, true, true);
+	return cluster_authority_binding_components_current_internal(binding, serving, true, true,
+																 false);
 }
 
 static bool
@@ -582,6 +602,67 @@ cluster_authority_readiness_publish_recovery(uint64 lms_generation)
 	return valid;
 }
 
+/* PGRAC: a retained survivor may reconstruct existing GES holders before
+ * its new serving seal exists. This proof is for REDECLARE/DONE only, never
+ * for CF/DATA acquisition, recovery writes or clearing the DATA barrier.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+cluster_survivor_recovery_transport_current(const ClusterAuthorityBindingLocal *binding)
+{
+	ReconfigEvent first = { 0 };
+	ReconfigEvent event = { 0 };
+	ClusterAuthorityBindingLocal after;
+	uint64 generation = 0;
+	uint64 episode_epoch = 0;
+	int pass;
+
+	if (!cluster_shared_config || !cluster_enabled || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES)
+		return false;
+	for (pass = 0; pass < 2; pass++) {
+		uint32 state = cluster_grd_recovery_state_value();
+		uint64 current_generation = cluster_grd_redeclare_generation();
+		uint64 accepted_epoch = cluster_grd_recovery_episode_epoch_value();
+		uint64 hash;
+		bool any_dead = false;
+		int i;
+
+		if (!cluster_serving_generation_current(binding)
+			|| !cluster_membership_is_member(cluster_node_id)
+			|| !cluster_reconfig_self_join_admitted()
+			|| cluster_reconfig_has_pending_prebump_stage()
+			|| cluster_grd_join_remaster_in_progress()
+			|| (state != GRD_RECOVERY_WAIT_BARRIER && state != GRD_RECOVERY_WAIT_CLUSTER)
+			|| current_generation == 0)
+			return false;
+		cluster_reconfig_get_last_event(&event);
+		for (i = 0; i < lengthof(event.dead_bitmap); i++)
+			any_dead |= event.dead_bitmap[i] != 0;
+		hash = cluster_grd_dead_bitmap_hash(event.dead_bitmap);
+		if (!any_dead || event.reconfig_kind != RECONFIG_KIND_FAIL_STOP || event.event_id == 0
+			|| event.new_epoch == 0 || accepted_epoch == 0 || event.new_epoch > accepted_epoch
+			|| hash == 0
+			|| (event.dead_bitmap[cluster_node_id / 8] & (1u << (cluster_node_id % 8))) != 0
+			|| cluster_epoch_get_current() != accepted_epoch
+			|| cluster_grd_recovery_last_event_id() != event.event_id
+			|| cluster_grd_recovery_event_bitmap_hash_value() != hash)
+			return false;
+		if (pass == 0) {
+			first = event;
+			generation = current_generation;
+			episode_epoch = accepted_epoch;
+		} else if (first.event_id != event.event_id || first.new_epoch != event.new_epoch
+				   || generation != current_generation || episode_epoch != accepted_epoch
+				   || memcmp(first.dead_bitmap, event.dead_bitmap, sizeof(first.dead_bitmap)) != 0)
+			return false;
+	}
+	return cluster_authority_binding_copy(&after) && after.state == CLUSTER_AUTHORITY_SERVING_READY
+		   && after.origin_thread == binding->origin_thread
+		   && after.boot_incarnation == binding->boot_incarnation
+		   && after.lms_generation == binding->lms_generation
+		   && cluster_serving_generation_current(&after);
+}
+
 bool
 cluster_recovery_transport_is_current(void)
 {
@@ -590,6 +671,8 @@ cluster_recovery_transport_is_current(void)
 
 	if (!cluster_authority_binding_copy(&binding))
 		return false;
+	if (binding.state == CLUSTER_AUTHORITY_SERVING_READY)
+		return cluster_survivor_recovery_transport_current(&binding);
 	if (binding.state == CLUSTER_AUTHORITY_RECOVERY_READY)
 		return cluster_recovery_authority_is_current();
 	if (binding.state != CLUSTER_AUTHORITY_STARTING)
@@ -708,10 +791,88 @@ cluster_recovery_authority_is_current(void)
 		 * stranded phase 4 with an OFF binding that nothing re-binds
 		 * (begin() is phase-3 gated), guaranteeing the phase4
 		 * serving-publication timeout. */
-		if (!cluster_authority_binding_components_current(&binding, false))
+		/* Expiry grants nothing, but is not loss of the immutable generation.
+		 * Preserve only that identity so the original startup owner can obtain
+		 * a new exact witness. Real component/formation drift still clears it. */
+		if (!cluster_authority_binding_components_current_internal(&binding, false, true, true,
+																   true))
 			cluster_authority_clear_matching(&binding, "recovery_authority_stale");
 	}
 	return current;
+}
+
+ClusterFormationWitnessResult
+cluster_authority_startup_refresh_recovery(int timeout_ms)
+{
+	ClusterAuthorityBindingLocal binding;
+	ClusterFormationWitnessV1 *witness = NULL;
+	ClusterFenceAuthorityProof authority;
+	ClusterFormationSnapshotV1 formation;
+	ClusterFormationWitnessResult result;
+	uint16 origin = 0;
+
+	if (!cluster_shared_config || !IsUnderPostmaster || MyBackendType != B_STARTUP
+		|| !AmStartupProcess() || MyProc == NULL || CritSectionCount != 0
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| cluster_current_phase() != CLUSTER_PHASE_3_RECOVERY || timeout_ms < 1
+		|| !cluster_authority_binding_copy(&binding)
+		|| binding.state != CLUSTER_AUTHORITY_RECOVERY_READY)
+		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+	if (cluster_recovery_authority_is_current())
+		return CLUSTER_FORMATION_WITNESS_READY;
+	if (!cluster_authority_binding_components_current_internal(&binding, false, true, true, true)
+		|| !cluster_lms_is_recovery_ready())
+		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+
+	/* No phase/CF lock spans this real majority read. It renews evidence for
+	 * this same boot, never creates formation or swaps a stale binding. */
+	result = cluster_formation_witness_build_recovery_control_wait(binding.origin_thread,
+																   timeout_ms, &witness);
+	if (result == CLUSTER_FORMATION_WITNESS_READY) {
+		if (!cluster_formation_witness_copy_classification_v1(witness, &origin, &authority,
+															  &formation))
+			result = CLUSTER_FORMATION_WITNESS_CORRUPT;
+		else if (origin != binding.origin_thread
+				 || authority.agree_disk_count != binding.authority.agree_disk_count
+				 || authority.total_disk_count != binding.authority.total_disk_count
+				 || !cluster_fence_marker_semantic_equal(&authority.marker,
+														 &binding.authority.marker)
+				 /* Both operands are copied RECOVERY_CONTROL classifications.
+				  * The live-snapshot matcher deliberately rejects that shape. */
+				 || memcmp(&binding.formation, &formation, sizeof(formation)) != 0)
+			result = CLUSTER_FORMATION_WITNESS_UNSTABLE;
+		if (result != CLUSTER_FORMATION_WITNESS_READY)
+			cluster_authority_clear_matching(&binding, "startup_refresh_changed");
+	}
+	cluster_formation_witness_destroy(&witness);
+	if (result == CLUSTER_FORMATION_WITNESS_READY && !cluster_recovery_authority_is_current())
+		result = CLUSTER_FORMATION_WITNESS_UNSTABLE;
+	return result;
+}
+
+/* A master can finish its local Startup before a peer finishes installing.
+ * Keep that peer's sealed CONTROL protocol available through phase 4. This
+ * does not authorize a local requester, DATA, or a components-only binding.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_startup_control_transport_is_current(const ClusterResId *resid, LOCKMODE mode)
+{
+	ClusterAuthorityBindingLocal binding;
+	ClusterStartupPhase phase = cluster_current_phase();
+
+	return cluster_shared_config && cluster_recovery_authority_resid_mode_allowed(resid, mode)
+		   && (phase == CLUSTER_PHASE_3_RECOVERY || phase == CLUSTER_PHASE_4_NORMAL)
+		   && cluster_authority_binding_copy(&binding)
+		   && binding.state == CLUSTER_AUTHORITY_RECOVERY_READY
+		   && cluster_authority_binding_components_current(&binding, false)
+		   && cluster_lms_is_recovery_ready();
+}
+
+bool
+cluster_configuration_read_transport_is_current(const ClusterResId *resid, LOCKMODE mode)
+{
+	return resid != NULL && resid->type == CLUSTER_CF_RESID_TYPE && mode == ShareLock
+		   && cluster_startup_control_transport_is_current(resid, mode);
 }
 
 bool
@@ -732,6 +893,13 @@ cluster_authority_readiness_publish_serving(void)
 	if (!cluster_authority_binding_copy(&binding)
 		|| binding.state != CLUSTER_AUTHORITY_RECOVERY_READY
 		|| cluster_current_phase() != CLUSTER_PHASE_4_NORMAL)
+		return false;
+	/* PGRAC: actual common boot values, not a published/pending generation.
+	 * Missing evidence waits without destroying the valid recovery binding.
+	 * This is initial admission only; an online pending value never evicts
+	 * an already serving instance. */
+	if (cluster_shared_config
+		&& cluster_config_members_mount_status() != CLUSTER_CONFIG_MOUNT_MATCH)
 		return false;
 	/* Validate every generation component while service is still unpublished. */
 	cssd_ready = cluster_cssd_get_status() == CLUSTER_CSSD_READY;
@@ -917,12 +1085,13 @@ cluster_recovery_authority_resid_mode_allowed(const ClusterResId *resid, LOCKMOD
 	if (resid == NULL)
 		return false;
 	if (resid->type == CLUSTER_CF_RESID_TYPE)
-		return mode == ShareLock && resid->field1 == 0 && resid->field2 == 0 && resid->field3 == 0
+		return (mode == ShareLock || (cluster_shared_config && mode == ExclusiveLock))
+			   && resid->field1 == 0 && resid->field2 == 0 && resid->field3 == 0
 			   && resid->field4 == 0 && resid->lockmethodid == DEFAULT_LOCKMETHOD;
 	if (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE)
-		return mode == ExclusiveLock && resid->field1 > 0
-			   && resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS && resid->field2 == 0
-			   && resid->field3 == 0 && resid->field4 == 0
+		return (mode == ExclusiveLock || (cluster_shared_config && mode == ShareLock))
+			   && resid->field1 > 0 && resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS
+			   && resid->field2 == 0 && resid->field3 == 0 && resid->field4 == 0
 			   && resid->lockmethodid == DEFAULT_LOCKMETHOD;
 	return false;
 }
@@ -931,6 +1100,43 @@ bool
 cluster_recovery_authority_request_allowed(const ClusterResId *resid, LOCKMODE mode,
 										   bool startup_process)
 {
+	/* PRE2: neither the startup components-only path nor the HW recovery
+	 * role can bypass an unfinished common control census. After the exact
+	 * failure barrier, only CF-S/WALR-X/IR-X gain recovery transport access. */
+	if (!cluster_grd_control_acquire_allowed(resid, mode))
+		return false;
+	/* The original initializer reads its selected input under WALR-S. Unlike
+	 * the old WALR-X recovery surface, this new acquisition requires the real
+	 * startup backend and the completed control seal, not just components. */
+	if (resid != NULL && resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE && mode == ShareLock)
+		return cluster_shared_config && startup_process && IsUnderPostmaster
+			   && MyBackendType == B_STARTUP && MyProc != NULL
+			   && !cluster_hw_remaster_worker_active()
+			   && cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
+			   && cluster_recovery_authority_resid_mode_allowed(resid, mode)
+			   && cluster_recovery_authority_is_current();
+	/* PGRAC: the successor initializer publishes under real CF-X before
+	 * ordinary service. Components-only transport is insufficient for a new
+	 * exclusive holder, and the HW worker must retain its CF-S-only surface.
+	 * This lock admission does not authorize any particular root mutation:
+	 * the startup publisher still proves its exact operation and owner.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (resid != NULL && resid->type == CLUSTER_CF_RESID_TYPE && mode == ExclusiveLock)
+		return cluster_shared_config && startup_process && !cluster_hw_remaster_worker_active()
+			   && cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
+			   && cluster_recovery_authority_resid_mode_allowed(resid, mode)
+			   && cluster_recovery_authority_is_current();
+	/* PGRAC: the original LMON must read the selected configuration before
+	 * StartupXLOG can prove compatible static values. It has a real PGPROC
+	 * and the same CF acquisition/retirement path, unlike the postmaster.
+	 * Require the existing sealed recovery authority, not just components;
+	 * this admits only singleton CF-S and never root mutation or DATA.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (IsUnderPostmaster && MyBackendType == B_LMON && MyProc != NULL
+		&& cluster_configuration_read_transport_is_current(resid, mode))
+		return true;
+	if (cluster_grd_control_recovery_ready(resid, mode))
+		return cluster_recovery_transport_is_current();
 	/*
 	 * RF-ROOT P6 (clean-reopen / THREAD_OPEN): the recovery-time lock
 	 * admission accepts the components-only transport proof too.  The
@@ -1435,6 +1641,43 @@ phase_2_handler(PhaseRunFailContext *fail_ctx)
 }
 
 
+static void
+cluster_phase3_report_formation(ClusterFormationWitnessResult result)
+{
+	ClusterFormationWitnessDiagnosticV1 sample = { 0 };
+	static const char *names[] = { "READY",
+								   "BAD_ARGUMENT",
+								   "UNSTABLE",
+								   "MARKER_UNPROVEN",
+								   "ORIGIN_NOT_EXCLUDED",
+								   "OWNER_MISMATCH",
+								   "FULL_OUTAGE_UNRECOVERED",
+								   "CAPABILITY_UNAVAILABLE",
+								   "IO_FAILED",
+								   "CORRUPT",
+								   "CACHE_EXPIRED" };
+
+	if (!cluster_formation_witness_last_diagnostic_v1(&sample))
+		sample.predicate = "not_sampled";
+	else if (sample.result != result)
+		sample.predicate = "witness.copy_or_revalidate";
+	ereport(
+		LOG,
+		(errmsg("cluster phase 3: recovery-control witness result=%u (%s), predicate=%s",
+				(uint32)result, (unsigned)result < lengthof(names) ? names[result] : "UNKNOWN",
+				sample.predicate),
+		 errdetail("origin_node=%d origin_thread=%u snapshot=%d formation_epoch=" UINT64_FORMAT
+				   " formation_generation=" UINT64_FORMAT
+				   " member_state=%u admitted_floor=" UINT64_FORMAT
+				   " missing_floor_node=%d fence_result=%u fence_proven=%d fence_majority=%u/%u "
+				   "fence_epoch=" UINT64_FORMAT,
+				   sample.origin_thread == 0 ? -1 : (int)sample.origin_thread - 1,
+				   sample.origin_thread, sample.snapshot_captured, sample.formation_epoch,
+				   sample.formation_generation, sample.origin_member_state, sample.admitted_floor,
+				   sample.missing_floor_node, (uint32)sample.fence_result, sample.fence_captured,
+				   sample.fence_agree, sample.fence_total, sample.fence_epoch)));
+}
+
 static bool
 cluster_phase3_wait_for_live_formation(TimestampTz deadline, bool allow_join_readonly,
 									   ClusterFormationWitnessResult *out_result,
@@ -1444,6 +1687,7 @@ cluster_phase3_wait_for_live_formation(TimestampTz deadline, bool allow_join_rea
 {
 	ClusterFormationWitnessResult result = CLUSTER_FORMATION_WITNESS_UNSTABLE;
 	uint16 thread_id = cluster_wal_thread_id();
+	TimestampTz next_report = 0;
 
 	if (thread_id == XLP_THREAD_ID_LEGACY) {
 		if (out_result != NULL)
@@ -1485,12 +1729,17 @@ cluster_phase3_wait_for_live_formation(TimestampTz deadline, bool allow_join_rea
 				result = cluster_formation_witness_revalidate_nowait(witness);
 			cluster_formation_witness_destroy(&witness);
 			if (result == CLUSTER_FORMATION_WITNESS_READY) {
+				cluster_phase3_report_formation(result);
 				if (out_result != NULL)
 					*out_result = result;
 				return true;
 			}
 		}
 		cluster_formation_witness_destroy(&witness);
+		if (GetCurrentTimestamp() >= next_report) {
+			cluster_phase3_report_formation(result);
+			next_report = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 5000);
+		}
 
 		/* OWNER_MISMATCH is transient here while LMON publishes the exact
 		 * admitted-incarnation floor.  CAPABILITY_UNAVAILABLE is also transient
@@ -1509,6 +1758,7 @@ cluster_phase3_wait_for_live_formation(TimestampTz deadline, bool allow_join_rea
 
 	if (out_result != NULL)
 		*out_result = result;
+	cluster_phase3_report_formation(result);
 	return false;
 }
 
@@ -1604,10 +1854,9 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 	 * contract, while the StartupXLOG-side verify runs in the startup
 	 * process — which this postmaster phase machine does not fork until
 	 * phase 3 completes, so the startup verify can never precede the
-	 * formation wait.  Postmaster context has the loaded topology, so the
-	 * fresh nonce+ack rendezvous runs here; the StartupXLOG call remains
-	 * (idempotent — a second fresh rendezvous re-confirms and rewrites
-	 * the same CROSSNODE_VERIFIED state).
+	 * formation wait. Postmaster context has the loaded topology, so the
+	 * fresh nonce+ack rendezvous runs here. Canonical StartupXLOG consumes
+	 * this qualified contract; only legacy startup repeats the rendezvous.
 	 */
 	if (cluster_phase4_wal_state_configured())
 		cluster_cf_phase2_verify_or_fail(DataDir);
@@ -1667,6 +1916,8 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 	}
 
 establish_recovery_authority:
+	if (cluster_phase4_wal_state_configured())
+		elog(LOG, "cluster phase 3: recovery quorum established; checking live formation witness");
 	if (cluster_phase4_wal_state_configured()
 		&& !cluster_phase3_wait_for_live_formation(phase3_recovery_deadline, !resume_join_readonly,
 												   &formation_result, &formation_origin_thread,
@@ -2002,9 +2253,15 @@ cluster_phase4_wal_state_configured(void)
 static bool
 cluster_phase4_wait_for_quorum(TimestampTz deadline)
 {
+	TimestampTz next_report = 0;
 	for (;;) {
 		if (cluster_qvotec_in_quorum())
 			return true;
+		if (GetCurrentTimestamp() >= next_report) {
+			elog(LOG, "cluster startup: waiting for recovery quorum, state=%s",
+				 cluster_qvotec_get_quorum_state_name());
+			next_report = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 5000);
+		}
 		if (GetCurrentTimestamp() >= deadline)
 			return false;
 		pg_usleep(100000L);
@@ -2352,6 +2609,42 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 	if (registry_configured
 		&& cluster_phase4_start_stats(fail_ctx, phase4_deadline, &stats_pid) == PHASE_RUN_FATAL)
 		return PHASE_RUN_FATAL;
+
+	if (cluster_shared_config) {
+		ClusterSemanticActivationRefusal refusal;
+		TimestampTz next_report = 0;
+
+		/* SQL connection startup already needs Resource-X. The original
+		 * postmaster requests activation asynchronously, under the existing
+		 * phase budget; LMON/QVOTEC still own all proof and gate publication. */
+		for (;;) {
+			TimestampTz now;
+
+			if (cluster_semantic_activation_startup_poll(&refusal)
+				&& cluster_serving_ready_is_current())
+				break;
+			now = GetCurrentTimestamp();
+			if (now >= next_report || now >= phase4_deadline) {
+				elog(LOG,
+					 "cluster phase 4: waiting for semantic OPEN "
+					 "(result=%d feature=%llu generation=%llu epoch=%llu)",
+					 (int)refusal.result, (unsigned long long)refusal.feature_bit,
+					 (unsigned long long)refusal.expected_generation,
+					 (unsigned long long)cluster_epoch_get_current());
+				next_report = TimestampTzPlusMilliseconds(now, 5000);
+			}
+			if (now >= phase4_deadline) {
+				cluster_authority_readiness_clear();
+				fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+				fail_ctx->errmsg = "cluster phase 4: semantic OPEN proof is unavailable";
+				fail_ctx->errhint
+					= "Inspect the last activation result and original LMON/QVOTEC "
+					  "diagnostics. Both PGSA TARGET and current Resource-X OPEN are required.";
+				return PHASE_RUN_FATAL;
+			}
+			pg_usleep(20000L);
+		}
+	}
 
 	if (registry_configured)
 		elog(DEBUG1,

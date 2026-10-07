@@ -23,10 +23,12 @@
  *
  *	  Non-properties (AD-004, like the local backend): this is a
  *	  passthrough over PG's fd.c VFD layer on a shared mount.  No SCSI-3
- *	  PR, no fence, no O_DIRECT, no 1GB segment splitting, no stripe, no
- *	  redundancy -- the shared filesystem / block layer (NFS, GFS2, OCFS2,
+ *	  PR, no fence, no 1GB segment splitting, no stripe, no
+ *	  redundancy -- the shared filesystem / block layer (GFS2, OCFS2,
  *	  multi-attach + cluster FS, NVMe-oF) provides the cross-node
  *	  coherence.  pgrac does not self-build a volume manager.
+ *	  Relation forks honor debug_io_direct=data through PG's VFD layer;
+ *	  this bypasses data caching but does not replace the fsync barrier.
  *
  *	  Production deployment additionally needs cross-node agreement on the
  *	  relfilenode <-> table mapping (feature #11 catalog coordination),
@@ -59,6 +61,11 @@
 #include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/vfs.h>
+#elif defined(__APPLE__)
+#include <sys/mount.h>
+#endif
 #include <unistd.h>
 
 #include "common/file_perm.h"
@@ -67,19 +74,25 @@
 #include "port/pg_crc32c.h"
 #include "storage/block.h"
 #include "storage/fd.h"
+#include "storage/sync.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/cluster_page_wal.h"
+#include "cluster/cluster_space_identity.h"
+#include "cluster/cluster_space_reservation.h"
 #include "cluster/storage/cluster_shared_fs.h"
 
 
 #ifdef USE_PGRAC_CLUSTER
 
 static const ClusterSharedFsCaps cluster_shared_fs_sharedfs_caps = {
-	.supports_odirect = false,
+	.supports_odirect = PG_O_DIRECT != 0 && BLCKSZ % PG_IO_ALIGN_SIZE == 0,
+	/* The backend aligns unaligned callers internally. */
 	.required_io_alignment = 0,
 	.supports_scsi3_pr = false,
 	.durability_class = CLUSTER_DURABILITY_BUFFERED,
@@ -102,6 +115,25 @@ struct ClusterSharedFsHandle {
 	File vfd;
 	bool opened;
 };
+
+/* PG keeps this startup-only flag with the VFD, including eviction/reopen.
+ * Unsupported direct I/O is an error, never a buffered fallback. */
+static int
+cluster_shared_fs_sharedfs_open_flags(void)
+{
+	int flags = O_RDWR | PG_BINARY;
+
+	if (io_direct_flags & IO_DIRECT_DATA) {
+		if (!cluster_shared_fs_sharedfs_caps.supports_odirect)
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cluster_fs direct I/O is not supported with this platform or block size"),
+				 errhint("Use a platform and block size supported by debug_io_direct=data.")));
+		flags |= PG_O_DIRECT;
+	}
+	return flags;
+}
 
 
 /*
@@ -210,7 +242,7 @@ cluster_shared_fs_sharedfs_open_existing(RelFileLocator rlocator, ForkNumber for
 
 	path = cluster_shared_fs_sharedfs_relpath(rlocator, forknum);
 
-	vfd = PathNameOpenFile(path, O_RDWR | PG_BINARY);
+	vfd = PathNameOpenFile(path, cluster_shared_fs_sharedfs_open_flags());
 	if (vfd < 0)
 		ereport(
 			ERROR,
@@ -257,11 +289,15 @@ cluster_shared_fs_sharedfs_create(RelFileLocator rlocator, ForkNumber forknum, b
 	 * relation.  Adopting the existing file is the point of a shared-data
 	 * backend; per-relation creation ownership needs the cluster catalog
 	 * protocol (feature #11), not file-level O_EXCL.  isRedo keeps the
-	 * same open-existing behaviour.
+	 * same open-existing behaviour.  With the single shared catalog, however,
+	 * each new relation has one creator: an existing main fork is a candidate
+	 * collision, never evidence that this CREATE owns the file.  Preserve
+	 * auxiliary-fork creation and the legacy per-node-catalog profile.
 	 */
-	vfd = PathNameOpenFile(path, O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
-	if (vfd < 0 && errno == EEXIST) {
-		vfd = PathNameOpenFile(path, O_RDWR | PG_BINARY);
+	vfd = PathNameOpenFile(path, cluster_shared_fs_sharedfs_open_flags() | O_CREAT | O_EXCL);
+	if (vfd < 0 && errno == EEXIST
+		&& (isRedo || !cluster_shared_catalog || forknum != MAIN_FORKNUM)) {
+		vfd = PathNameOpenFile(path, cluster_shared_fs_sharedfs_open_flags());
 		if (vfd >= 0 && !isRedo)
 			elog(DEBUG1, "cluster_shared_fs.shared_fs: adopting existing shared file \"%s\"", path);
 	}
@@ -303,11 +339,15 @@ cluster_shared_fs_sharedfs_read(ClusterSharedFsHandle *handle, BlockNumber block
 {
 	off_t offset;
 	int nbytes;
+	PGIOAlignedBlock bounce;
+	char *buffer = buf;
 
 	Assert(handle != NULL && handle->opened);
 
+	if ((io_direct_flags & IO_DIRECT_DATA) && (uintptr_t)buf % PG_IO_ALIGN_SIZE != 0)
+		buffer = bounce.data;
 	offset = (off_t)blocknum * BLCKSZ;
-	nbytes = FileRead(handle->vfd, buf, BLCKSZ, offset, WAIT_EVENT_DATA_FILE_READ);
+	nbytes = FileRead(handle->vfd, buffer, BLCKSZ, offset, WAIT_EVENT_DATA_FILE_READ);
 
 	if (nbytes < 0)
 		ereport(ERROR,
@@ -319,6 +359,9 @@ cluster_shared_fs_sharedfs_read(ClusterSharedFsHandle *handle, BlockNumber block
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("cluster_shared_fs.shared_fs: short read of block %u (got %d, expected %d)",
 						blocknum, nbytes, BLCKSZ)));
+	/* A partial/error read must not publish the bounce buffer to the caller. */
+	if (buffer != buf)
+		memcpy(buf, buffer, BLCKSZ);
 	return nbytes;
 }
 
@@ -329,11 +372,17 @@ cluster_shared_fs_sharedfs_write(ClusterSharedFsHandle *handle, BlockNumber bloc
 {
 	off_t offset;
 	int nbytes;
+	PGIOAlignedBlock bounce;
+	const char *buffer = buf;
 
 	Assert(handle != NULL && handle->opened);
 
+	if ((io_direct_flags & IO_DIRECT_DATA) && (uintptr_t)buf % PG_IO_ALIGN_SIZE != 0) {
+		memcpy(bounce.data, buf, BLCKSZ);
+		buffer = bounce.data;
+	}
 	offset = (off_t)blocknum * BLCKSZ;
-	nbytes = FileWrite(handle->vfd, buf, BLCKSZ, offset, WAIT_EVENT_DATA_FILE_WRITE);
+	nbytes = FileWrite(handle->vfd, buffer, BLCKSZ, offset, WAIT_EVENT_DATA_FILE_WRITE);
 
 	if (nbytes < 0)
 		ereport(ERROR,
@@ -354,10 +403,10 @@ static void
 cluster_shared_fs_sharedfs_extend(ClusterSharedFsHandle *handle, BlockNumber blocknum)
 {
 	/* Zero-fill the new tail block; mirrors mdextend(). */
-	char zerobuf[BLCKSZ];
+	PGIOAlignedBlock zerobuf;
 
-	memset(zerobuf, 0, sizeof(zerobuf));
-	cluster_shared_fs_sharedfs_write(handle, blocknum, zerobuf);
+	memset(zerobuf.data, 0, BLCKSZ);
+	cluster_shared_fs_sharedfs_write(handle, blocknum, zerobuf.data);
 }
 
 
@@ -425,8 +474,9 @@ cluster_shared_fs_sharedfs_immedsync(ClusterSharedFsHandle *handle)
 	Assert(handle != NULL && handle->opened);
 
 	if (FileSync(handle->vfd, WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC) < 0)
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("cluster_shared_fs.shared_fs: could not fsync: %m")));
+		ereport(data_sync_elevel(ERROR),
+				(errcode_for_file_access(),
+				 errmsg("cluster_shared_fs.shared_fs: could not fsync: %m")));
 }
 
 
@@ -435,11 +485,569 @@ cluster_shared_fs_sharedfs_unlink(RelFileLocator rlocator, ForkNumber forknum)
 {
 	char *path = cluster_shared_fs_sharedfs_relpath(rlocator, forknum);
 
+	/* Auxiliary post-commit cleanup cannot abort. MAIN keeps the existing
+	 * checkpointer failure contract; any retained fork excludes the locator. */
 	if (unlink(path) < 0 && errno != ENOENT)
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("cluster_shared_fs.shared_fs: could not unlink \"%s\": %m", path)));
+		ereport(forknum == MAIN_FORKNUM ? ERROR : WARNING,
+				(errcode_for_file_access(),
+				 errmsg("cluster_shared_fs.shared_fs: could not unlink \"%s\": %m", path)));
 
 	pfree(path);
+}
+
+typedef struct SharedFsDropFork {
+	int fd;
+	const char *name;
+	struct stat identity;
+	bool removed;
+} SharedFsDropFork;
+
+static bool
+sharedfs_drop_same_file(const struct stat *left, const struct stat *right)
+{
+	return left->st_dev == right->st_dev && left->st_ino == right->st_ino;
+}
+
+static bool
+sharedfs_drop_space_matches(int fd, const ClusterSpaceIdentity *expected,
+							const uint8 *expected_bytes, uint64 expected_token)
+{
+	PGIOAlignedBlock page;
+	ClusterSpaceIdentity actual;
+	uint8 bytes[CLUSTER_SPACE_IDENTITY_BYTES];
+	uint64 token;
+	ssize_t nread;
+
+	do {
+		nread = pread(fd, page.data, BLCKSZ, 0);
+	} while (nread < 0 && errno == EINTR);
+	return nread == BLCKSZ
+		   && cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
+												 &expected->key, &actual, &token)
+		   && token == expected_token
+		   && cluster_space_identity_encode(&actual, bytes, sizeof(bytes))
+		   && memcmp(bytes, expected_bytes, sizeof(bytes)) == 0;
+}
+
+static bool
+sharedfs_drop_namespace_matches(int directory, const char *path, const struct stat *original,
+								const SharedFsDropFork *forks, bool main_zero)
+{
+	struct stat current;
+	ForkNumber fork;
+
+	if (lstat(path, &current) != 0 || !S_ISDIR(current.st_mode)
+		|| !sharedfs_drop_same_file(original, &current))
+		return false;
+	for (fork = 0; fork <= MAX_FORKNUM; fork++) {
+		const SharedFsDropFork *f = &forks[fork];
+
+		if (f->fd < 0 || f->removed) {
+			if (fstatat(directory, f->name, &current, AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT)
+				return false;
+			if (f->fd >= 0 && (fstat(f->fd, &current) != 0 || current.st_nlink != 0))
+				return false;
+		} else if (fstatat(directory, f->name, &current, AT_SYMLINK_NOFOLLOW) != 0
+				   || !S_ISREG(current.st_mode) || current.st_nlink != 1
+				   || !sharedfs_drop_same_file(&f->identity, &current)
+				   || (main_zero && fork == MAIN_FORKNUM && current.st_size != 0))
+			return false;
+	}
+	return true;
+}
+
+/* The original KO owner excludes other qualified writers throughout this
+ * operation. Keep every original inode open and recheck its namespace; a
+ * later ENOENT, replacement, or error is not this DROP's durability result.
+ * Allocation precedes all descriptor acquisition. I/O failures return false
+ * without ERROR, so the postcommit caller can preserve its holdoff counters.
+ * This metadata operation does not change the data-fork O_DIRECT contract.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_shared_fs_sharedfs_drop_durable(const ClusterSpaceIdentity *identity, uint64 mutation_token)
+{
+	SharedFsDropFork forks[MAX_FORKNUM + 1];
+	char *paths[MAX_FORKNUM + 1];
+	char *parent;
+	char *separator;
+	struct stat parent_identity;
+	uint8 expected_bytes[CLUSTER_SPACE_IDENTITY_BYTES];
+	int directory = -1;
+	int saved_errno;
+	bool durable = false;
+	ForkNumber fork;
+
+	if (!enableFsync || identity == NULL || mutation_token == 0
+		|| identity->state != CLUSTER_SPACE_IDENTITY_TOMBSTONED
+		|| !cluster_space_identity_encode(identity, expected_bytes, sizeof(expected_bytes))) {
+		errno = EINVAL;
+		return false;
+	}
+	memset(forks, 0, sizeof(forks));
+	for (fork = 0; fork <= MAX_FORKNUM; fork++) {
+		paths[fork] = cluster_shared_fs_sharedfs_relpath(identity->key.locator, fork);
+		forks[fork].fd = -1;
+		forks[fork].name = strrchr(paths[fork], '/') + 1;
+	}
+	parent = pstrdup(paths[MAIN_FORKNUM]);
+	separator = strrchr(parent, '/');
+	*separator = '\0';
+
+	/* No creation/adoption, symlink final components, or blocking special files.
+	 * The bounded raw descriptors are closed on every following exit. */
+	directory = open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | PG_BINARY);
+	if (directory < 0 || fstat(directory, &parent_identity) != 0)
+		goto done;
+	for (fork = 0; fork <= MAX_FORKNUM; fork++) {
+		SharedFsDropFork *f = &forks[fork];
+
+		f->fd = openat(directory, f->name,
+					   (fork == MAIN_FORKNUM ? O_RDWR : O_RDONLY) | O_NOFOLLOW | O_NONBLOCK
+						   | PG_BINARY);
+		if (f->fd < 0) {
+			if (errno == ENOENT && fork != MAIN_FORKNUM && fork != SPACE_FORKNUM)
+				continue;
+			goto done;
+		}
+		if (fstat(f->fd, &f->identity) != 0 || !S_ISREG(f->identity.st_mode)
+			|| f->identity.st_nlink != 1)
+			goto done;
+	}
+	if (!sharedfs_drop_namespace_matches(directory, parent, &parent_identity, forks, false)
+		|| !sharedfs_drop_space_matches(forks[SPACE_FORKNUM].fd, identity, expected_bytes,
+										mutation_token))
+		goto done;
+	if (ftruncate(forks[MAIN_FORKNUM].fd, 0) != 0 || pg_fsync(forks[MAIN_FORKNUM].fd) != 0)
+		goto done;
+
+	for (fork = 1; fork <= MAX_FORKNUM; fork++) {
+		SharedFsDropFork *f = &forks[fork];
+
+		if (!sharedfs_drop_namespace_matches(directory, parent, &parent_identity, forks, true)
+			|| !sharedfs_drop_space_matches(forks[SPACE_FORKNUM].fd, identity, expected_bytes,
+											mutation_token))
+			goto done;
+		if (f->fd < 0)
+			continue; /* absent before mutation, never an unlink success */
+		if (unlinkat(directory, f->name, 0) != 0)
+			goto done;
+		f->removed = true;
+	}
+	if (pg_fsync(directory) != 0
+		|| !sharedfs_drop_namespace_matches(directory, parent, &parent_identity, forks, true)
+		|| !sharedfs_drop_space_matches(forks[SPACE_FORKNUM].fd, identity, expected_bytes,
+										mutation_token))
+		goto done;
+	durable = true;
+
+done:
+	saved_errno = errno != 0 ? errno : EIO;
+	for (fork = 0; fork <= MAX_FORKNUM; fork++) {
+		if (forks[fork].fd >= 0 && close(forks[fork].fd) != 0) {
+			durable = false;
+			saved_errno = errno;
+		}
+		pfree(paths[fork]);
+	}
+	if (directory >= 0 && close(directory) != 0) {
+		durable = false;
+		saved_errno = errno;
+	}
+	pfree(parent);
+	errno = durable ? 0 : saved_errno;
+	return durable;
+}
+
+/* Original checkpointer work owns these raw descriptors across ERROR cleanup.
+ * No pointer into a transaction/checkpointer scratch context is retained. */
+typedef struct SharedFsDropWorkFork {
+	int fd;
+	bool absent;
+	bool removed;
+	struct stat identity;
+	char name[64];
+} SharedFsDropWorkFork;
+
+typedef struct SharedFsDropWorkState {
+	bool initialized;
+	bool directory_bound;
+	bool truncated;
+	bool main_synced;
+	bool directory_synced;
+	bool closing;
+	bool durable;
+	bool failed;
+	int directory;
+	uint32 forget_next;
+	uint32 open_next;
+	uint32 unlink_next;
+	uint32 close_next;
+	struct stat directory_identity;
+	ClusterSpaceIdentity identity;
+	uint64 token;
+	uint8 identity_bytes[CLUSTER_SPACE_IDENTITY_BYTES];
+	char parent[MAXPGPATH];
+	SharedFsDropWorkFork forks[MAX_FORKNUM + 1];
+} SharedFsDropWorkState;
+
+Size
+cluster_shared_fs_sharedfs_drop_work_size(void)
+{
+	return sizeof(SharedFsDropWorkState);
+}
+
+/* The original owner may dispose its descriptors after losing the execution
+ * cut. Abandon never clears shared WAL/structure responsibility or completes
+ * the work. An uncertain close must not later close a reused descriptor. */
+void
+cluster_shared_fs_sharedfs_drop_work_abandon(ClusterKoDropWorkV2 *work)
+{
+	SharedFsDropWorkState *state = cluster_ko_shared_drop_work_abandon_v2(work, sizeof(*state));
+	int saved_errno = errno;
+
+	if (state == NULL || !state->initialized)
+		return;
+	state->failed = true;
+	for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++) {
+		int fd = state->forks[fork].fd;
+
+		if (fd < 0)
+			continue;
+		state->forks[fork].fd = -1;
+		(void)close(fd);
+		ReleaseExternalFD();
+	}
+	if (state->directory >= 0) {
+		int fd = state->directory;
+
+		state->directory = -1;
+		(void)close(fd);
+		ReleaseExternalFD();
+	}
+	errno = saved_errno;
+}
+
+/* A known namespace/identity contradiction cannot be retried as new work. */
+static bool
+sharedfs_drop_work_invalid(SharedFsDropWorkState *state)
+{
+	state->failed = true;
+	errno = ESTALE;
+	return false;
+}
+
+/* Retained DROP requires unlink of an open inode, without NFS silly rename. */
+static bool
+sharedfs_drop_work_unlink_supported(int fd)
+{
+#if defined(__linux__) || defined(__APPLE__)
+	struct statfs filesystem;
+
+	if (fstatfs(fd, &filesystem) != 0)
+		return false;
+#ifdef __linux__
+	if (filesystem.f_type != 0x6969) /* NFS_SUPER_MAGIC */
+#else
+	if (strcmp(filesystem.f_fstypename, "nfs") != 0)
+#endif
+		return true;
+#else
+	(void)fd;
+#endif
+	errno = ENOTSUP;
+	return false;
+}
+
+static bool
+sharedfs_drop_work_namespace(const ClusterKoDropWorkV2 *work, SharedFsDropWorkState *state)
+{
+	struct stat current;
+	PGIOAlignedBlock page;
+	ClusterSpaceIdentity actual;
+	uint8 bytes[CLUSTER_SPACE_IDENTITY_BYTES];
+	uint64 token;
+	ssize_t nread;
+
+	if (!cluster_ko_shared_drop_work_revalidate_v2(work) || lstat(state->parent, &current) != 0)
+		return false;
+	if (!S_ISDIR(current.st_mode) || !sharedfs_drop_same_file(&state->directory_identity, &current))
+		return sharedfs_drop_work_invalid(state);
+	if (!cluster_ko_shared_drop_work_revalidate_v2(work) || fstat(state->directory, &current) != 0)
+		return false;
+	if (!sharedfs_drop_same_file(&state->directory_identity, &current))
+		return sharedfs_drop_work_invalid(state);
+	for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++) {
+		SharedFsDropWorkFork *f = &state->forks[fork];
+		int result;
+
+		if (!cluster_ko_shared_drop_work_revalidate_v2(work))
+			return false;
+		result = fstatat(state->directory, f->name, &current, AT_SYMLINK_NOFOLLOW);
+		if (f->absent || f->removed) {
+			if (result == 0)
+				return sharedfs_drop_work_invalid(state);
+			if (errno != ENOENT)
+				return false;
+		} else if (result != 0) {
+			if (errno != ENOENT)
+				return false;
+			/* A lost unlink result can be resolved only with the original
+			 * still-open inode. A bare absent name or a renamed inode is
+			 * not a successful deletion. MAIN must always remain present. */
+			if (fork == MAIN_FORKNUM)
+				return sharedfs_drop_work_invalid(state);
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work) || fstat(f->fd, &current) != 0)
+				return false;
+			if (!sharedfs_drop_same_file(&f->identity, &current) || current.st_nlink != 0)
+				return sharedfs_drop_work_invalid(state);
+			f->removed = true;
+		} else {
+			if (!S_ISREG(current.st_mode) || current.st_nlink != 1
+				|| !sharedfs_drop_same_file(&f->identity, &current)
+				|| (fork == MAIN_FORKNUM && state->truncated && current.st_size != 0))
+				return sharedfs_drop_work_invalid(state);
+		}
+		if (f->absent)
+			continue;
+		if (!cluster_ko_shared_drop_work_revalidate_v2(work) || fstat(f->fd, &current) != 0)
+			return false;
+		if (!sharedfs_drop_same_file(&f->identity, &current)
+			|| current.st_nlink != (f->removed ? 0 : 1)
+			|| (fork == MAIN_FORKNUM && state->truncated && current.st_size != 0))
+			return sharedfs_drop_work_invalid(state);
+	}
+	if (!cluster_ko_shared_drop_work_revalidate_v2(work))
+		return false;
+	nread = pread(state->forks[SPACE_FORKNUM].fd, page.data, BLCKSZ, 0);
+	if (nread < 0)
+		return false; /* Including EINTR: the original owner supplies the next tick. */
+	if (nread != BLCKSZ
+		|| !cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
+											   &state->identity.key, &actual, &token)
+		|| token != state->token || !cluster_space_identity_encode(&actual, bytes, sizeof(bytes))
+		|| memcmp(bytes, state->identity_bytes, sizeof(bytes)) != 0)
+		return sharedfs_drop_work_invalid(state);
+	return true;
+}
+
+/* One bounded attempt on the original state. False never clears responsibility;
+ * after all I/O and closes succeed, future attempts perform no pathname I/O. */
+static bool
+sharedfs_drop_work_attempt(ClusterKoDropWorkV2 *work, SharedFsDropWorkState *state)
+{
+	ClusterPageWalBindingV1 terminal;
+	ClusterSpaceStructureChange change;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	uint8 identity_bytes[CLUSTER_SPACE_IDENTITY_BYTES];
+
+	if (state == NULL || state->failed || !enableFsync
+		|| !cluster_ko_shared_drop_work_read_v2(work, &terminal, wal, sizeof(wal))
+		|| !cluster_space_structure_wal_decode(wal, sizeof(wal), &change)
+		|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
+		|| !RelFileLocatorEquals(change.identity.result.key.locator, terminal.identity.locator)
+		|| change.identity.result.key.system_identifier != terminal.identity.system_identifier
+		|| change.identity.result.key.database_incarnation
+			   != terminal.source.claim.database_incarnation
+		|| memcmp(change.identity.result.key.storage_uuid, terminal.identity.storage_uuid, 16) != 0
+		|| memcmp(change.identity.result.incarnation, terminal.version.segment_incarnation, 16) != 0
+		|| change.identity.result_token != terminal.version.mutation_token
+		|| !cluster_space_identity_encode(&change.identity.result, identity_bytes,
+										  sizeof(identity_bytes)))
+		return false;
+	if (!state->initialized) {
+		for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++) {
+			char *path
+				= cluster_shared_fs_sharedfs_relpath(change.identity.result.key.locator, fork);
+			char *name = strrchr(path, '/');
+			Size parent_bytes = name == NULL ? 0 : name - path;
+			bool fits = name != NULL && parent_bytes > 0 && parent_bytes < sizeof(state->parent)
+						&& strlen(name + 1) < sizeof(state->forks[fork].name);
+
+			if (fits) {
+				memcpy(state->parent, path, parent_bytes);
+				state->parent[parent_bytes] = '\0';
+				strcpy(state->forks[fork].name, name + 1);
+			}
+			pfree(path);
+			if (!fits) {
+				errno = ENAMETOOLONG;
+				return false;
+			}
+			state->forks[fork].fd = -1;
+		}
+		state->directory = -1;
+		state->forget_next = state->unlink_next = MAIN_FORKNUM + 1;
+		state->identity = change.identity.result;
+		state->token = change.identity.result_token;
+		memcpy(state->identity_bytes, identity_bytes, sizeof(identity_bytes));
+		state->initialized = true;
+	} else if (state->token != change.identity.result_token
+			   || memcmp(state->identity_bytes, identity_bytes, sizeof(identity_bytes)) != 0)
+		return sharedfs_drop_work_invalid(state);
+	if (state->durable)
+		return true;
+
+	/* Forget only auxiliary sync requests; MAIN is never queued for reclaim. */
+	for (; state->forget_next <= MAX_FORKNUM; state->forget_next++) {
+		FileTag tag;
+
+		memset(&tag, 0, sizeof(tag));
+		tag.handler = SYNC_HANDLER_CLUSTER_SHARED;
+		tag.rlocator = state->identity.key.locator;
+		tag.forknum = state->forget_next;
+		if (!cluster_ko_shared_drop_work_revalidate_v2(work)
+			|| !RegisterSyncRequest(&tag, SYNC_FORGET_REQUEST, true))
+			return false;
+	}
+	if (!state->closing) {
+		if (state->directory < 0) {
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work) || !AcquireExternalFD())
+				return false;
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work)) {
+				ReleaseExternalFD();
+				return false;
+			}
+			state->directory = open(state->parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | PG_BINARY);
+			if (state->directory < 0) {
+				ReleaseExternalFD();
+				return false;
+			}
+		}
+		if (!state->directory_bound) {
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work)
+				|| fstat(state->directory, &state->directory_identity) != 0)
+				return false;
+			if (!S_ISDIR(state->directory_identity.st_mode))
+				return sharedfs_drop_work_invalid(state);
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work))
+				return false;
+			if (!sharedfs_drop_work_unlink_supported(state->directory)) {
+				if (errno == ENOTSUP)
+					state->failed = true;
+				return false;
+			}
+			state->directory_bound = true;
+		}
+		for (; state->open_next <= MAX_FORKNUM; state->open_next++) {
+			SharedFsDropWorkFork *f = &state->forks[state->open_next];
+
+			if (f->fd < 0) {
+				if (!cluster_ko_shared_drop_work_revalidate_v2(work) || !AcquireExternalFD())
+					return false;
+				if (!cluster_ko_shared_drop_work_revalidate_v2(work)) {
+					ReleaseExternalFD();
+					return false;
+				}
+				f->fd = openat(state->directory, f->name,
+							   (state->open_next == MAIN_FORKNUM ? O_RDWR : O_RDONLY) | O_NOFOLLOW
+								   | O_NONBLOCK | PG_BINARY);
+				if (f->fd < 0) {
+					int error = errno;
+
+					ReleaseExternalFD();
+					if (error != ENOENT || state->open_next == MAIN_FORKNUM
+						|| state->open_next == SPACE_FORKNUM) {
+						errno = error;
+						return false;
+					}
+					f->absent = true;
+					continue;
+				}
+			}
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work) || fstat(f->fd, &f->identity) != 0)
+				return false;
+			if (!S_ISREG(f->identity.st_mode) || f->identity.st_nlink != 1)
+				return sharedfs_drop_work_invalid(state);
+		}
+		if (!sharedfs_drop_work_namespace(work, state))
+			return false;
+		if (!state->truncated) {
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work)
+				|| ftruncate(state->forks[MAIN_FORKNUM].fd, 0) != 0)
+				return false;
+			state->truncated = true;
+		}
+		if (!state->main_synced) {
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work))
+				return false;
+			if (pg_fsync(state->forks[MAIN_FORKNUM].fd) != 0) {
+				/* The OS may have discarded dirty bytes. A later successful
+				 * fsync is not proof; retain the original WAL obligation. */
+				state->failed = true;
+				return false;
+			}
+			state->main_synced = true;
+		}
+		for (; state->unlink_next <= MAX_FORKNUM; state->unlink_next++) {
+			SharedFsDropWorkFork *f = &state->forks[state->unlink_next];
+
+			if (f->absent || f->removed)
+				continue;
+			if (!sharedfs_drop_work_namespace(work, state))
+				return false;
+			if (f->removed)
+				continue;
+			if (!cluster_ko_shared_drop_work_revalidate_v2(work)
+				|| unlinkat(state->directory, f->name, 0) != 0)
+				return false;
+			f->removed = true;
+		}
+		if (!state->directory_synced) {
+			if (!sharedfs_drop_work_namespace(work, state)
+				|| !cluster_ko_shared_drop_work_revalidate_v2(work))
+				return false;
+			if (pg_fsync(state->directory) != 0) {
+				state->failed = true;
+				return false;
+			}
+			state->directory_synced = true;
+		}
+		if (!sharedfs_drop_work_namespace(work, state))
+			return false;
+		state->closing = true;
+	}
+	for (; state->close_next <= MAX_FORKNUM + 1; state->close_next++) {
+		int *fd = state->close_next <= MAX_FORKNUM ? &state->forks[state->close_next].fd
+												   : &state->directory;
+		int result;
+
+		if (*fd < 0)
+			continue;
+		if (!cluster_ko_shared_drop_work_revalidate_v2(work))
+			return false;
+		result = close(*fd);
+		*fd = -1;
+		ReleaseExternalFD();
+		/* close failure has platform-dependent descriptor ownership. Never
+		 * close that number again or turn an uncertain close into success. */
+		if (result != 0) {
+			state->failed = true;
+			return false;
+		}
+	}
+	state->durable = true;
+	return true;
+}
+
+bool
+cluster_shared_fs_sharedfs_drop_work(ClusterKoDropWorkV2 *work, bool *failed)
+{
+	SharedFsDropWorkState *state;
+	bool completed;
+
+	if (failed == NULL)
+		return false;
+	*failed = false;
+	state = cluster_ko_shared_drop_work_state_v2(work, sizeof(*state));
+	if (state == NULL)
+		return false;
+	completed = sharedfs_drop_work_attempt(work, state);
+	/* This original state was authenticated before the attempt. Once an I/O
+	 * failure is known, a subsequent unavailable execution cut cannot hide
+	 * it from the original owner's cleanup-only abandon boundary. This is
+	 * never new permission to mutate storage or finish the obligation. */
+	*failed = state->failed;
+	return completed;
 }
 
 
@@ -553,6 +1161,33 @@ cluster_shared_fs_sentinel_read(int fd, PgracSharedControl *out, const char **re
 	return true;
 }
 
+/* The configuration spelling may contain UUID separators; the existing
+ * sentinel and storage identity accessors always use 32 lowercase digits. */
+static bool
+sharedfs_preset_uuid(const char *text, char out[CLUSTER_SHARED_UUID_LEN])
+{
+	size_t len = strlen(text);
+	size_t used = 0;
+	bool nonzero = false;
+
+	if (len != 32 && len != 36)
+		return false;
+	for (size_t i = 0; i < len; i++) {
+		char ch = text[i];
+		if (len == 36 && (i == 8 || i == 13 || i == 18 || i == 23)) {
+			if (ch != '-')
+				return false;
+			continue;
+		}
+		if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) || used >= 32)
+			return false;
+		out[used++] = ch;
+		nonzero |= ch != '0';
+	}
+	out[used] = '\0';
+	return used == 32 && nonzero;
+}
+
 /*
  * cluster_shared_fs_sentinel_attach -- record this node in the shared-root
  *	participant set (postmaster-once; see the init callback).
@@ -566,6 +1201,13 @@ cluster_shared_fs_sentinel_attach(void)
 	const char *reason = NULL;
 	bool found = false;
 	uint32 i;
+	char preset[CLUSTER_SHARED_UUID_LEN];
+	bool have_preset
+		= cluster_shared_storage_uuid != NULL && cluster_shared_storage_uuid[0] != '\0';
+
+	if (have_preset && !sharedfs_preset_uuid(cluster_shared_storage_uuid, preset))
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster.shared_storage_uuid is not a valid storage UUID")));
 
 	fd = OpenTransientFile(path, O_RDWR | PG_BINARY);
 	if (fd < 0 && errno == ENOENT)
@@ -590,15 +1232,14 @@ cluster_shared_fs_sentinel_attach(void)
 		memset(&ctl, 0, sizeof(ctl));
 		ctl.magic = PGRAC_SHARED_CONTROL_MAGIC;
 		ctl.layout_version = PGRAC_SHARED_CONTROL_VERSION;
-		if (cluster_shared_storage_uuid != NULL && cluster_shared_storage_uuid[0] != '\0')
-			strlcpy(ctl.storage_uuid, cluster_shared_storage_uuid, sizeof(ctl.storage_uuid));
+		if (have_preset)
+			strlcpy(ctl.storage_uuid, preset, sizeof(ctl.storage_uuid));
 		else
 			cluster_shared_fs_sentinel_gen_uuid(ctl.storage_uuid);
 	}
 
 	/* An external preset uuid must match the recorded identity. */
-	if (cluster_shared_storage_uuid != NULL && cluster_shared_storage_uuid[0] != '\0'
-		&& strcmp(ctl.storage_uuid, cluster_shared_storage_uuid) != 0)
+	if (have_preset && strcmp(ctl.storage_uuid, preset) != 0)
 		ereport(
 			FATAL,
 			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -724,6 +1365,9 @@ cluster_shared_fs_get_storage_uuid(char *out, size_t outlen)
 static void
 cluster_shared_fs_sharedfs_init(void)
 {
+	/* Validate before any sentinel mutation; ordinary PG GUC checks do this
+	 * too, but backend activation must not silently bypass that contract. */
+	(void)cluster_shared_fs_sharedfs_open_flags();
 	if (!IsUnderPostmaster)
 		cluster_shared_fs_sentinel_attach();
 }
@@ -756,7 +1400,7 @@ cluster_shared_fs_sharedfs_prefetch(ClusterSharedFsHandle *handle, BlockNumber b
 {
 	off_t offset;
 
-	if (handle == NULL || !handle->opened)
+	if (handle == NULL || !handle->opened || (io_direct_flags & IO_DIRECT_DATA))
 		return false;
 
 	offset = (off_t)blocknum * BLCKSZ;
@@ -770,7 +1414,7 @@ cluster_shared_fs_sharedfs_writeback(ClusterSharedFsHandle *handle, BlockNumber 
 	off_t offset;
 	off_t nbytes;
 
-	if (handle == NULL || !handle->opened || nblocks == 0)
+	if (handle == NULL || !handle->opened || nblocks == 0 || (io_direct_flags & IO_DIRECT_DATA))
 		return;
 
 	offset = (off_t)blocknum * BLCKSZ;

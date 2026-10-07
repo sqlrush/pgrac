@@ -311,6 +311,11 @@ cluster_lmd_probe_collect_receive(const GesDeadlockReportHeader *report, Size re
 
 	report_edges
 		= (const ClusterLmdWaitEdge *)(((const char *)report) + sizeof(GesDeadlockReportHeader));
+	for (uint32 i = 0; i < nedges; i++) {
+		if (report_edges[i].waiter.lock_group_procno_plus_one > PG_INT32_MAX
+			|| report_edges[i].blocker.lock_group_procno_plus_one > PG_INT32_MAX)
+			return false;
+	}
 
 	LWLockAcquire(&cluster_lmd_probe->lock, LW_EXCLUSIVE);
 

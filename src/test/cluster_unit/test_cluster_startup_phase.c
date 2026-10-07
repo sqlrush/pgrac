@@ -48,13 +48,19 @@
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_grd.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_config_members.h"
+#include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_ges.h"
 #include "cluster/cluster_wal_retention.h"
 #include "storage/proc.h"
+#include "utils/wait_event.h"
 
 #undef printf
 #undef fprintf
@@ -123,6 +129,15 @@ cluster_injection_run(const char *name pg_attribute_unused())
 /* miscadmin: HC1 Assert reads IsUnderPostmaster. */
 bool IsUnderPostmaster = false;
 PGPROC *MyProc = NULL;
+BackendType MyBackendType = B_INVALID;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+volatile uint32 CritSectionCount;
+static bool phase_test_cf_held;
+bool
+cluster_cf_held(LOCKMODE mode pg_attribute_unused())
+{
+	return phase_test_cf_held;
+}
 
 /* cluster_phase legacy mirror (HC2 derived).  Real backend gets it from
  * cluster_elog.o; the unit test provides a local writable storage so
@@ -130,10 +145,9 @@ PGPROC *MyProc = NULL;
 const char *cluster_phase = "pre_init";
 
 void
-ExceptionalCondition(const char *conditionName pg_attribute_unused(),
-					 const char *fileName pg_attribute_unused(),
-					 int lineNumber pg_attribute_unused())
+ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
 {
+	fprintf(stderr, "assertion failed: %s (%s:%d)\n", conditionName, fileName, lineNumber);
 	abort();
 }
 
@@ -141,27 +155,33 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 static jmp_buf phase4_fatal_jump;
 static bool phase4_capture_fatal = false;
 static int phase4_last_elevel = 0;
+static char phase4_last_error[512];
+static bool capture_authority_clear;
+static int authority_clear_logs;
+static bool authority_clear_under_lock;
+static char authority_clear_detail[1024];
+static unsigned phase_lwlock_depth;
 
 bool
 errstart(int e, const char *d pg_attribute_unused())
 {
 	phase4_last_elevel = e;
-	return phase4_capture_fatal;
+	return phase4_capture_fatal || capture_authority_clear;
 }
 
-/* Stage 8 contract (verified implementation): worker identity for the recovery
- * lock-admission gate — this binary never runs inside the hw-remaster
- * bgworker, so the worker window is always closed here. */
+/* Runtime boundary: distinguish the HW worker from the native startup owner. */
+static bool phase_test_hw_worker = false;
+
 bool
 cluster_hw_remaster_worker_active(void)
 {
-	return false;
+	return phase_test_hw_worker;
 }
 bool
 errstart_cold(int e, const char *d pg_attribute_unused())
 {
 	phase4_last_elevel = e;
-	return phase4_capture_fatal;
+	return phase4_capture_fatal || capture_authority_clear;
 }
 void
 errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
@@ -176,8 +196,14 @@ errcode(int s pg_attribute_unused())
 	return 0;
 }
 int
-errmsg(const char *f pg_attribute_unused(), ...)
+errmsg(const char *f, ...)
 {
+	if (phase4_capture_fatal && phase4_last_elevel >= ERROR) {
+		va_list ap;
+		va_start(ap, f);
+		vsnprintf(phase4_last_error, sizeof(phase4_last_error), f, ap);
+		va_end(ap);
+	}
 	return 0;
 }
 int
@@ -186,8 +212,16 @@ errmsg_internal(const char *f pg_attribute_unused(), ...)
 	return 0;
 }
 int
-errdetail(const char *f pg_attribute_unused(), ...)
+errdetail(const char *f, ...)
 {
+	if (capture_authority_clear && strstr(f, "PGRAC_FAMILY=AUTHORITY_CLEAR") != NULL) {
+		va_list ap;
+		va_start(ap, f);
+		vsnprintf(authority_clear_detail, sizeof(authority_clear_detail), f, ap);
+		va_end(ap);
+		authority_clear_logs++;
+		authority_clear_under_lock |= phase_lwlock_depth != 0;
+	}
 	return 0;
 }
 int
@@ -284,6 +318,7 @@ bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
 	phase_lwlock_blocking_calls++;
+	phase_lwlock_depth++;
 	return true;
 }
 
@@ -291,12 +326,17 @@ bool
 LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
 	phase_lwlock_conditional_calls++;
+	if (phase_lwlock_conditional_result)
+		phase_lwlock_depth++;
 	return phase_lwlock_conditional_result;
 }
 
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+{
+	if (phase_lwlock_depth != 0)
+		phase_lwlock_depth--;
+}
 
 void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
@@ -358,6 +398,12 @@ cluster_write_fence_startup_self_check(void)
 static char phase4_events[512];
 static int phase4_event_count = 0;
 static bool phase4_test_in_quorum = true;
+static ClusterConfigMountResult test_mount_result;
+ClusterConfigMountResult
+cluster_config_members_mount_status(void)
+{
+	return test_mount_result;
+}
 static int phase4_quorum_check_calls = 0;
 static ClusterCssdStatus phase_test_cssd_status = CLUSTER_CSSD_DOWN;
 static ClusterQvotecStatus phase_test_qvotec_status = CLUSTER_QVOTEC_DOWN;
@@ -369,6 +415,9 @@ static ClusterFormationWitnessResult phase_test_formation_result = CLUSTER_FORMA
 static int phase_test_formation_unavailable_attempts = 0;
 static int64 phase_test_formation_unavailable_advance_us = 0;
 static bool phase_test_classification_current = true;
+static bool phase_test_fence_cache_expired = false;
+static bool phase_test_fresh_marker_changed = false;
+static bool phase_test_witness_control = false;
 static bool phase_test_grd_authority_ok = true;
 static bool phase_test_lms_recovery_ready_ok = true;
 static uint64 phase_test_lms_generation = 7;
@@ -397,6 +446,29 @@ static ClusterMembershipState phase_test_nonmember_state = CLUSTER_MEMBER_JOININ
 static bool phase_test_self_join_admitted = false;
 static uint64 phase_test_episode_epoch = 0;
 static bool phase_test_join_remaster = false;
+bool cluster_shared_config = false;
+static int phase_test_semantic_poll_calls;
+static int phase_test_semantic_ready_after;
+
+bool
+cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refusal)
+{
+	phase_test_semantic_poll_calls++;
+	memset(refusal, 0, sizeof(*refusal));
+	refusal->result = CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED;
+	/* Original postmaster caller must remain off every backend wait edge. */
+	Assert(!IsUnderPostmaster && MyProc == NULL && !phase_test_cf_held);
+	return phase_test_semantic_ready_after > 0
+		   && phase_test_semantic_poll_calls >= phase_test_semantic_ready_after;
+}
+static ReconfigEvent phase_test_protocol_event;
+static uint32 phase_test_protocol_state = GRD_RECOVERY_IDLE;
+static uint64 phase_test_protocol_event_id;
+static uint64 phase_test_protocol_hash;
+static uint64 phase_test_protocol_generation;
+static bool phase_test_protocol_prebump;
+static bool phase_test_protocol_drift;
+static int phase_test_protocol_event_reads;
 /* RF-ROOT P6 (contract-verify-early): the phase-3 handler passes DataDir to
  * the verify stub; the pure unit harness has no data directory. */
 char *DataDir = NULL;
@@ -536,15 +608,31 @@ cluster_wal_thread_id(void)
 	return 1;
 }
 
+const char *
+cluster_qvotec_get_quorum_state_name(void)
+{
+	return "FIXTURE";
+}
+bool
+cluster_formation_witness_last_diagnostic_v1(ClusterFormationWitnessDiagnosticV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->predicate = "fixture";
+	return true;
+}
+
 ClusterFormationWitnessResult
 cluster_formation_witness_build_live_wait(uint16 origin_thread pg_attribute_unused(),
 										  int timeout_ms pg_attribute_unused(),
 										  ClusterFormationWitnessV1 **out)
 {
 	phase_test_live_formation_calls++;
+	phase_test_witness_control = false;
 	record_phase4_event('F');
-	if (phase_test_live_refreshes_classification)
+	if (phase_test_live_refreshes_classification) {
 		phase_test_classification_current = true;
+		phase_test_fence_cache_expired = false;
+	}
 	if (phase_test_formation_unavailable_attempts > 0) {
 		phase_test_formation_unavailable_attempts--;
 		phase4_test_now += phase_test_formation_unavailable_advance_us;
@@ -563,7 +651,12 @@ cluster_formation_witness_build_recovery_control_wait(uint16 origin_thread pg_at
 													  ClusterFormationWitnessV1 **out)
 {
 	phase_test_recovery_control_formation_calls++;
+	phase_test_witness_control = true;
 	record_phase4_event('F');
+	if (phase_test_live_refreshes_classification) {
+		phase_test_classification_current = true;
+		phase_test_fence_cache_expired = false;
+	}
 	if (phase_test_formation_unavailable_attempts > 0) {
 		phase_test_formation_unavailable_attempts--;
 		phase4_test_now += phase_test_formation_unavailable_advance_us;
@@ -590,10 +683,14 @@ cluster_formation_witness_copy_classification_v1(
 	record_phase4_event('X');
 	memset(authority, 0, sizeof(*authority));
 	memset(snapshot, 0, sizeof(*snapshot));
+	if (phase_test_fresh_marker_changed)
+		authority->marker.fence_epoch++;
 	*origin_thread = 1;
 	snapshot->membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
 	snapshot->membership.last_admitted_incarnation[0] = phase_test_last_admitted_incarnation;
-	snapshot->reserved[0] = phase_test_formation_epoch;
+	snapshot->local_epoch = phase_test_formation_epoch;
+	snapshot->reserved[0]
+		= phase_test_witness_control ? CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL : 0;
 	return true;
 }
 
@@ -611,18 +708,15 @@ cluster_formation_classification_revalidate_nowait(
 	const ClusterFenceAuthorityProof *authority pg_attribute_unused(),
 	const ClusterFormationSnapshotV1 *snapshot pg_attribute_unused())
 {
-	return phase_test_classification_current && snapshot->reserved[0] == phase_test_formation_epoch
+	if (phase_test_classification_current && snapshot->local_epoch == phase_test_formation_epoch
+		&& phase_test_fence_cache_expired)
+		return CLUSTER_FORMATION_WITNESS_CACHE_EXPIRED;
+	return phase_test_classification_current && snapshot->local_epoch == phase_test_formation_epoch
 			   ? CLUSTER_FORMATION_WITNESS_READY
 			   : CLUSTER_FORMATION_WITNESS_UNSTABLE;
 }
 
-bool
-cluster_formation_snapshot_matches_v1(const ClusterFormationSnapshotV1 *expected,
-									  const ClusterFormationSnapshotV1 *observed)
-{
-	return expected != NULL && observed != NULL
-		   && memcmp(expected, observed, sizeof(*expected)) == 0;
-}
+#include "test_cluster_startup_snapshot_native.inc"
 
 bool
 cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
@@ -633,7 +727,7 @@ cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
 	memset(snapshot, 0, sizeof(*snapshot));
 	snapshot->membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
 	snapshot->membership.last_admitted_incarnation[0] = phase_test_last_admitted_incarnation;
-	snapshot->reserved[0] = phase_test_formation_epoch;
+	snapshot->local_epoch = phase_test_formation_epoch;
 	return true;
 }
 
@@ -679,12 +773,33 @@ cluster_grd_recovery_authority_is_current(uint64 boot_incarnation, uint64 lms_ge
 		   && lms_generation == phase_test_lms_generation;
 }
 
+/* PGRAC: this startup consumer fixture has no real control census. Preserve
+ * the legacy admission, but never invent a shared-config control grant here.
+ * The actual GRD census is exercised by its separate production-object tests.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool phase_test_control_acquire_ready = false;
+
+bool
+cluster_grd_control_acquire_allowed(const ClusterResId *resid pg_attribute_unused(),
+									LOCKMODE mode pg_attribute_unused())
+{
+	return !cluster_shared_config || phase_test_control_acquire_ready;
+}
+
+bool
+cluster_grd_control_recovery_ready(const ClusterResId *resid pg_attribute_unused(),
+								   LOCKMODE mode pg_attribute_unused())
+{
+	return false;
+}
+
 bool
 cluster_grd_serving_authority_rebind_lmon(const ClusterFormationSnapshotV1 *formation,
 										  uint64 boot_incarnation, uint64 lms_generation)
 {
 	return phase_test_grd_authority_ok && formation != NULL
-		   && formation->reserved[0] == phase_test_formation_epoch && boot_incarnation == 11
+		   && formation->local_epoch == phase_test_formation_epoch && boot_incarnation == 11
 		   && lms_generation == phase_test_lms_generation;
 }
 
@@ -696,7 +811,7 @@ cluster_grd_serving_authority_rebind_leaver(const ClusterFormationSnapshotV1 *fo
 											uint64 boot_incarnation, uint64 lms_generation)
 {
 	return phase_test_grd_authority_ok && formation != NULL
-		   && formation->reserved[0] == phase_test_formation_epoch && boot_incarnation == 11
+		   && formation->local_epoch == phase_test_formation_epoch && boot_incarnation == 11
 		   && lms_generation == phase_test_lms_generation;
 }
 
@@ -749,6 +864,51 @@ bool
 cluster_grd_join_remaster_in_progress(void)
 {
 	return phase_test_join_remaster;
+}
+
+/* Real readiness consumer, substituted shared GRD/event observations. */
+uint32
+cluster_grd_recovery_state_value(void)
+{
+	return phase_test_protocol_state;
+}
+
+uint64
+cluster_grd_recovery_last_event_id(void)
+{
+	return phase_test_protocol_event_id;
+}
+
+uint64
+cluster_grd_recovery_event_bitmap_hash_value(void)
+{
+	return phase_test_protocol_hash;
+}
+
+uint64
+cluster_grd_redeclare_generation(void)
+{
+	return phase_test_protocol_generation;
+}
+
+uint64
+cluster_grd_dead_bitmap_hash(const uint8 *bitmap)
+{
+	return bitmap[0] == 2 ? UINT64_C(0x5511) : UINT64_C(0x6611);
+}
+
+bool
+cluster_reconfig_has_pending_prebump_stage(void)
+{
+	return phase_test_protocol_prebump;
+}
+
+void
+cluster_reconfig_get_last_event(ReconfigEvent *out)
+{
+	*out = phase_test_protocol_event;
+	if (phase_test_protocol_drift && ++phase_test_protocol_event_reads > 1)
+		out->event_id++;
 }
 
 /* RF-ROOT P6 (contract-verify-early + THREAD_OPEN wiring): unit stubs for the
@@ -839,10 +999,20 @@ cluster_lms_is_ready(void)
 static void
 reset_phase_service_fixture(bool formed_registry)
 {
+	phase_test_semantic_poll_calls = 0;
+	phase_test_semantic_ready_after = 1;
+	MyBackendType = B_INVALID;
+	MyAuxProcType = NotAnAuxProcess;
+	phase_test_fence_cache_expired = false;
+	phase_test_fresh_marker_changed = false;
+	phase_test_witness_control = false;
+	phase_test_cf_held = false;
+	CritSectionCount = 0;
 	phase4_event_count = 0;
 	phase4_events[0] = '\0';
 	phase4_test_now = 0;
 	phase4_test_in_quorum = true;
+	test_mount_result = CLUSTER_CONFIG_MOUNT_UNPROVEN;
 	phase4_quorum_check_calls = 0;
 	phase_test_cssd_status = CLUSTER_CSSD_DOWN;
 	phase_test_qvotec_status = CLUSTER_QVOTEC_DOWN;
@@ -878,6 +1048,19 @@ reset_phase_service_fixture(bool formed_registry)
 	phase_test_membership_member = true;
 	phase_test_nonmember_state = CLUSTER_MEMBER_JOINING;
 	phase_test_self_join_admitted = true;
+	cluster_shared_config = false;
+	phase_test_control_acquire_ready = false;
+	phase_test_hw_worker = false;
+	memset(&phase_test_protocol_event, 0, sizeof(phase_test_protocol_event));
+	phase_test_protocol_state = GRD_RECOVERY_IDLE;
+	phase_test_protocol_event_id = 0;
+	phase_test_protocol_hash = 0;
+	phase_test_protocol_generation = 0;
+	phase_test_protocol_prebump = false;
+	phase_test_protocol_drift = false;
+	phase_test_protocol_event_reads = 0;
+	phase_test_episode_epoch = 0;
+	phase_test_join_remaster = false;
 	cluster_enabled = true;
 	cluster_wal_threads_dir = formed_registry ? "/rf-a1/formed" : NULL;
 	cluster_phase_shmem_init();
@@ -1394,6 +1577,34 @@ UT_TEST(test_rf_a2_serving_does_not_consume_recovery_duty_cache)
 	UT_ASSERT_EQ((int)cluster_authority_readiness_get(), (int)CLUSTER_AUTHORITY_SERVING_READY);
 }
 
+UT_TEST(test_authority_clear_reports_original_identity_once_outside_lock)
+{
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_run_phase4_sequence();
+	UT_ASSERT(cluster_serving_ready_is_current());
+	cluster_shared_config = true;
+	phase_lwlock_depth = 0;
+	authority_clear_logs = 0;
+	authority_clear_under_lock = false;
+	capture_authority_clear = true;
+	/* Diagnostic only: the existing refusal and destructive clear remain. */
+	phase4_test_in_quorum = false;
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_OFF);
+	UT_ASSERT_EQ(authority_clear_logs, 1);
+	UT_ASSERT(strstr(authority_clear_detail, "caller=serving_ready_stale") != NULL);
+	UT_ASSERT(strstr(authority_clear_detail, "lms_generation=7") != NULL);
+	UT_ASSERT(strstr(authority_clear_detail, "formation_epoch=1") != NULL);
+	UT_ASSERT(strstr(authority_clear_detail, "lms_ready_after_clear=1") != NULL);
+	UT_ASSERT(!authority_clear_under_lock);
+	phase4_test_in_quorum = true;
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	UT_ASSERT_EQ(authority_clear_logs, 1);
+	capture_authority_clear = false;
+	reset_phase_service_fixture(true);
+}
+
 
 UT_TEST(test_rf_a2_serving_rebinds_only_after_lmon_closes_recovery)
 {
@@ -1406,6 +1617,183 @@ UT_TEST(test_rf_a2_serving_rebinds_only_after_lmon_closes_recovery)
 	UT_ASSERT_EQ((int)cluster_authority_readiness_get(), (int)CLUSTER_AUTHORITY_SERVING_READY);
 	UT_ASSERT(cluster_authority_serving_rebind_lmon());
 	UT_ASSERT(cluster_serving_ready_is_current());
+}
+
+static void
+setup_survivor_protocol_fixture(void)
+{
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_run_phase4_sequence();
+	UT_ASSERT(cluster_serving_ready_is_current());
+	cluster_shared_config = true;
+	phase_test_formation_epoch = 2;
+	phase_test_episode_epoch = 2;
+	phase_test_grd_authority_ok = false;
+	phase_test_protocol_event.event_id = 91;
+	phase_test_protocol_event.new_epoch = 2;
+	phase_test_protocol_event.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	phase_test_protocol_event.dead_bitmap[0] = 2;
+	phase_test_protocol_event_id = 91;
+	phase_test_protocol_hash = UINT64_C(0x5511);
+	phase_test_protocol_generation = 7;
+	phase_test_protocol_state = GRD_RECOVERY_WAIT_BARRIER;
+}
+
+/* Break caught: waiting for the serving seal drops the very REDECLARE
+ * messages that rebuild it. This is not permission to acquire CF or DATA. */
+UT_TEST(test_pre2_survivor_reconstruction_precedes_serving)
+{
+	ClusterResId cf = { 0 };
+
+	setup_survivor_protocol_fixture();
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	UT_ASSERT(cluster_recovery_transport_is_current());
+	phase_test_protocol_state = GRD_RECOVERY_WAIT_CLUSTER;
+	UT_ASSERT(cluster_recovery_transport_is_current());
+	UT_ASSERT(!cluster_recovery_transport_components_current());
+	UT_ASSERT(!cluster_recovery_authority_is_current());
+	cf.type = CLUSTER_CF_RESID_TYPE;
+	cf.lockmethodid = DEFAULT_LOCKMETHOD;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ShareLock, true));
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_SERVING_READY);
+}
+
+UT_TEST(test_pre2_survivor_reconstruction_rejects_wrong_episode)
+{
+	int variant;
+
+	for (variant = 0; variant < 12; variant++) {
+		setup_survivor_protocol_fixture();
+		UT_ASSERT(cluster_recovery_transport_is_current());
+		switch (variant) {
+		case 0:
+			phase_test_protocol_event_id++;
+			break;
+		case 1:
+			phase_test_protocol_event.new_epoch++;
+			break;
+		case 2:
+			phase_test_episode_epoch++;
+			break;
+		case 3:
+			phase_test_protocol_hash++;
+			break;
+		case 4:
+			phase_test_protocol_state = GRD_RECOVERY_IDLE;
+			break;
+		case 5:
+			phase_test_protocol_state = GRD_RECOVERY_WAIT_EPOCH;
+			break;
+		case 6:
+			phase_test_protocol_event.reconfig_kind = RECONFIG_KIND_JOIN_COMMITTED;
+			break;
+		case 7:
+			phase_test_protocol_event.dead_bitmap[0] = 3;
+			break;
+		case 8:
+			phase_test_protocol_prebump = true;
+			break;
+		case 9:
+			phase_test_protocol_generation = 0;
+			break;
+		case 10:
+			phase_test_protocol_event.event_id = 0;
+			break;
+		case 11:
+			phase_test_protocol_event.dead_bitmap[0] = 0;
+			phase_test_protocol_hash = UINT64_C(0x6611);
+			break;
+		}
+		UT_ASSERT(!cluster_recovery_transport_is_current());
+	}
+}
+
+/* The non-coordinator records E before learning the coordinator's E+1.
+ * Requiring that old observation to be rewritten strands valid survivors. */
+UT_TEST(test_pre2_survivor_reconstruction_accepts_prebump_observation)
+{
+	setup_survivor_protocol_fixture();
+	phase_test_protocol_event.old_epoch = 1;
+	phase_test_protocol_event.new_epoch = 1;
+	phase_test_protocol_event.observer_role = CLUSTER_RECONFIG_OBSERVER_SURVIVOR;
+	UT_ASSERT(cluster_recovery_transport_is_current());
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	UT_ASSERT(!cluster_recovery_transport_components_current());
+	phase_test_protocol_state = GRD_RECOVERY_WAIT_CLUSTER;
+	UT_ASSERT(cluster_recovery_transport_is_current());
+	phase_test_protocol_event.new_epoch = 0;
+	UT_ASSERT(!cluster_recovery_transport_is_current());
+}
+
+UT_TEST(test_pre2_survivor_reconstruction_rejects_component_loss)
+{
+	int variant;
+
+	for (variant = 0; variant < 9; variant++) {
+		setup_survivor_protocol_fixture();
+		UT_ASSERT(cluster_recovery_transport_is_current());
+		switch (variant) {
+		case 0:
+			cluster_shared_config = false;
+			break;
+		case 1:
+			phase4_test_in_quorum = false;
+			break;
+		case 2:
+			phase_test_lms_generation++;
+			break;
+		case 3:
+			phase_test_last_admitted_incarnation++;
+			break;
+		case 4:
+			phase_test_membership_member = false;
+			break;
+		case 5:
+			phase_test_self_join_admitted = false;
+			break;
+		case 6:
+			phase_test_cssd_status = CLUSTER_CSSD_DOWN;
+			break;
+		case 7:
+			phase_test_qvotec_status = CLUSTER_QVOTEC_DOWN;
+			break;
+		case 8:
+			phase_test_join_remaster = true;
+			break;
+		}
+		UT_ASSERT(!cluster_recovery_transport_is_current());
+	}
+}
+
+UT_TEST(test_pre2_survivor_reconstruction_rechecks_event)
+{
+	setup_survivor_protocol_fixture();
+	UT_ASSERT(cluster_recovery_transport_is_current());
+	phase_test_protocol_drift = true;
+	phase_test_protocol_event_reads = 0;
+	UT_ASSERT(!cluster_recovery_transport_is_current());
+}
+
+/* Real serving publisher, with the member observation as an explicit boundary.
+ * No full-cluster startup certification is inferred from this test. */
+UT_TEST(test_static_common_blocks_serving_without_destroying_recovery)
+{
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_RECOVERY_READY);
+	test_mount_result = CLUSTER_CONFIG_MOUNT_UNPROVEN;
+	UT_ASSERT(!cluster_authority_readiness_publish_serving());
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_RECOVERY_READY);
+	test_mount_result = CLUSTER_CONFIG_MOUNT_MISMATCH;
+	UT_ASSERT(!cluster_authority_readiness_publish_serving());
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_RECOVERY_READY);
+	test_mount_result = CLUSTER_CONFIG_MOUNT_MATCH;
+	UT_ASSERT(cluster_authority_readiness_publish_serving());
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_SERVING_READY);
+	reset_phase_service_fixture(true);
 }
 
 UT_TEST(test_rf_a1_readiness_is_monotone_and_generation_bound)
@@ -1440,6 +1828,418 @@ UT_TEST(test_rf_a1_readiness_is_monotone_and_generation_bound)
 	UT_ASSERT(cluster_authority_readiness_managed());
 }
 
+/* PGRAC: real readiness predicates at the explicit GRD/runtime boundary;
+ * this is not a certificate for cold-formation or native startup.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_pre2_startup_cf_x_needs_sealed_owner)
+{
+	ClusterResId cf = { 0 };
+
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cf.type = CLUSTER_CF_RESID_TYPE;
+	cf.lockmethodid = DEFAULT_LOCKMETHOD;
+	UT_ASSERT(!cluster_recovery_authority_resid_mode_allowed(&cf, ExclusiveLock));
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	cluster_shared_config = true;
+	phase_test_control_acquire_ready = true;
+	UT_ASSERT(cluster_recovery_authority_resid_mode_allowed(&cf, ExclusiveLock));
+	UT_ASSERT(cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, false));
+	phase_test_hw_worker = true;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, false));
+	phase_test_hw_worker = false;
+	cf.field1 = 1;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	cf.field1 = 0;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, AccessExclusiveLock, true));
+	phase_test_control_acquire_ready = false;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	reset_phase_service_fixture(true);
+}
+
+UT_TEST(test_config_lmon_can_read_before_startup_and_cannot_write)
+{
+	ClusterResId cf = { .type = CLUSTER_CF_RESID_TYPE, .lockmethodid = DEFAULT_LOCKMETHOD };
+	ClusterResId wal = { .type = CLUSTER_WAL_RETENTION_RESID_TYPE,
+						 .field1 = 1,
+						 .lockmethodid = DEFAULT_LOCKMETHOD };
+	static PGPROC lmon_proc;
+
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_shared_config = true;
+	phase_test_control_acquire_ready = true;
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	MyProc = &lmon_proc;
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	UT_ASSERT(cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, false));
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&wal, ExclusiveLock, false));
+	cf.field1 = 1;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
+	cf.field1 = 0;
+	MyBackendType = B_BACKEND;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
+	MyBackendType = B_LMON;
+	MyProc = NULL;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
+	MyProc = &lmon_proc;
+	phase_test_control_acquire_ready = false;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
+	phase_test_control_acquire_ready = true;
+	IsUnderPostmaster = false;
+	cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
+	IsUnderPostmaster = true;
+	UT_ASSERT(cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
+	phase_test_lms_generation++;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
+	MyProc = NULL;
+	IsUnderPostmaster = false;
+	reset_phase_service_fixture(true);
+}
+
+static pg_atomic_uint64 stub_s1_entry_count;
+static void
+ensure_counter_initialized(void)
+{
+	pg_atomic_init_u64(&stub_s1_entry_count, 0);
+}
+
+#include "test_cluster_config_s1_native.inc"
+#include "test_cluster_config_ges_native.inc"
+#include "test_cluster_startup_walr_native.inc"
+
+/* Real retention request bytes and real S1/GES gates; no grant or native
+ * acquisition is inferred from these boundary tests. */
+UT_TEST(test_native_initializer_walr_share_nowait_reaches_all_startup_gates)
+{
+	ClusterLockAcquireRequest req;
+	ClusterGrdGrantIdentity grant = { 0 };
+	static PGPROC startup_proc;
+
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_shared_config = true;
+	phase_test_control_acquire_ready = true;
+	IsUnderPostmaster = true;
+	MyBackendType = B_STARTUP;
+	MyAuxProcType = StartupProcess;
+	MyProc = &startup_proc;
+	UT_ASSERT(walr_share_request_init(1, &req));
+	UT_ASSERT_EQ(req.lockmode, ShareLock);
+	UT_ASSERT(req.dontwait);
+	grant.mode = req.lockmode;
+	grant.request_opcode = GES_REQ_OPCODE_REQUEST_NOWAIT;
+	UT_ASSERT(ges_readiness_allows_early_opcode(grant.request_opcode));
+	UT_ASSERT(cluster_recovery_authority_request_allowed(&req.resid, req.lockmode, true));
+	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT(
+		ges_readiness_allows_local_origin(grant.request_opcode, &req.resid, req.lockmode, NoLock));
+	UT_ASSERT(
+		ges_readiness_allows_protocol_request(grant.request_opcode, &req.resid, req.lockmode));
+	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid));
+	UT_ASSERT(ges_readiness_allows_local_release_origin(&req.resid));
+	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &req.resid, NoLock));
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	MyProc = NULL;
+	IsUnderPostmaster = false;
+	reset_phase_service_fixture(true);
+}
+
+UT_TEST(test_native_initializer_walr_share_cannot_borrow_another_role_or_generation)
+{
+	ClusterLockAcquireRequest req;
+	static PGPROC startup_proc;
+
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_shared_config = true;
+	phase_test_control_acquire_ready = true;
+	IsUnderPostmaster = true;
+	MyBackendType = B_STARTUP;
+	MyAuxProcType = StartupProcess;
+	MyProc = &startup_proc;
+	UT_ASSERT(walr_share_request_init(1, &req));
+	UT_ASSERT(cluster_recovery_authority_request_allowed(&req.resid, ShareLock, true));
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&req.resid, ShareLock, false));
+	MyProc = NULL;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&req.resid, ShareLock, true));
+	MyProc = &startup_proc;
+	phase_test_hw_worker = true;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&req.resid, ShareLock, true));
+	phase_test_hw_worker = false;
+	req.resid.field2 = 1;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&req.resid, ShareLock, true));
+	req.resid.field2 = 0;
+	phase_test_grd_authority_ok = false;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&req.resid, ShareLock, true));
+	UT_ASSERT(!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST_NOWAIT, &req.resid,
+													 ShareLock));
+	MyProc = NULL;
+	IsUnderPostmaster = false;
+	reset_phase_service_fixture(true);
+}
+
+/* A remote master can finish its local Startup while another cohort member
+ * is still installing. These are the real protocol predicates, not a grant
+ * fixture. Local startup admission remains phase-3-only. */
+UT_TEST(test_slow_startup_control_crosses_remote_master_phase4)
+{
+	for (int kind = 0; kind < 4; kind++) {
+		ClusterResId resid = { .lockmethodid = DEFAULT_LOCKMETHOD };
+		ClusterGrdGrantIdentity grant = { 0 };
+		static PGPROC startup_proc;
+		uint32 opcode = kind == 2 ? GES_REQ_OPCODE_REQUEST_NOWAIT : GES_REQ_OPCODE_REQUEST;
+		LOCKMODE mode = kind % 2 == 0 ? ShareLock : ExclusiveLock;
+
+		reset_phase_service_fixture(true);
+		cluster_run_startup_sequence();
+		cluster_shared_config = true;
+		phase_test_control_acquire_ready = true;
+		resid.type = kind < 2 ? CLUSTER_CF_RESID_TYPE : CLUSTER_WAL_RETENTION_RESID_TYPE;
+		resid.field1 = kind < 2 ? 0 : 4;
+		IsUnderPostmaster = true;
+		MyBackendType = B_STARTUP;
+		MyAuxProcType = StartupProcess;
+		MyProc = &startup_proc;
+		UT_ASSERT(cluster_recovery_authority_request_allowed(&resid, mode, true));
+		grant.mode = mode;
+		grant.request_opcode = opcode;
+		UT_ASSERT(ges_readiness_allows_protocol_request(opcode, &resid, mode));
+		UT_ASSERT(ges_readiness_allows_grant(&grant, &resid));
+		IsUnderPostmaster = false;
+		cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
+		IsUnderPostmaster = true;
+		UT_ASSERT(!cluster_recovery_authority_request_allowed(&resid, mode, true));
+		MyBackendType = B_LMON;
+		MyAuxProcType = NotAnAuxProcess;
+		UT_ASSERT(ges_readiness_allows_early_opcode(opcode));
+		UT_ASSERT(ges_readiness_allows_protocol_request(opcode, &resid, mode));
+		UT_ASSERT(ges_readiness_allows_grant(&grant, &resid));
+		UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &resid, NoLock));
+		UT_ASSERT(!cluster_serving_ready_is_current());
+		UT_ASSERT(!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_CONVERT, &resid, mode));
+		UT_ASSERT(!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REDECLARE, &resid, mode));
+		if (ut_current_failed)
+			printf("# startup control kind %d\n", kind);
+		MyProc = NULL;
+		IsUnderPostmaster = false;
+	}
+	reset_phase_service_fixture(true);
+}
+
+UT_TEST(test_phase4_startup_control_keeps_identity_and_namespace_refusals)
+{
+	for (int variant = 0; variant < 13; variant++) {
+		ClusterResId resid = { .type = CLUSTER_WAL_RETENTION_RESID_TYPE,
+							   .field1 = 4,
+							   .lockmethodid = DEFAULT_LOCKMETHOD };
+		ClusterGrdGrantIdentity grant
+			= { .mode = ShareLock, .request_opcode = GES_REQ_OPCODE_REQUEST_NOWAIT };
+		reset_phase_service_fixture(true);
+		cluster_run_startup_sequence();
+		cluster_shared_config = true;
+		phase_test_control_acquire_ready = true;
+		cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
+		switch (variant) {
+		case 0:
+			phase_test_fence_cache_expired = true;
+			break;
+		case 1:
+			phase_test_lms_generation++;
+			break;
+		case 2:
+			phase_test_grd_authority_ok = false;
+			break;
+		case 3:
+			phase_test_classification_current = false;
+			break;
+		case 4:
+			phase_test_membership_member = false;
+			break;
+		case 5:
+			phase4_test_in_quorum = false;
+			break;
+		case 6:
+			phase_test_last_admitted_incarnation++;
+			break;
+		case 7:
+			phase_test_lms_recovery_ready_ok = false;
+			break;
+		case 8:
+			phase_test_control_acquire_ready = false;
+			break;
+		case 9:
+			resid.field2 = 1;
+			break;
+		case 10:
+			resid.type = LOCKTAG_RELATION;
+			break;
+		case 11:
+			grant.mode = AccessExclusiveLock;
+			break;
+		case 12:
+			cluster_shared_config = false;
+			break;
+		}
+		UT_ASSERT(!ges_readiness_allows_protocol_request(grant.request_opcode, &resid, grant.mode));
+		UT_ASSERT(!ges_readiness_allows_grant(&grant, &resid));
+		UT_ASSERT(!cluster_serving_ready_is_current());
+		if (ut_current_failed)
+			printf("# startup control refusal %d\n", variant);
+	}
+	reset_phase_service_fixture(true);
+}
+
+UT_TEST(test_expired_cache_refuses_control_without_destroying_refresh_identity)
+{
+	ClusterResId cf = { .type = CLUSTER_CF_RESID_TYPE, .lockmethodid = DEFAULT_LOCKMETHOD };
+
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_shared_config = true;
+	phase_test_control_acquire_ready = true;
+	phase_test_fence_cache_expired = true;
+	UT_ASSERT(!cluster_recovery_authority_is_current());
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_RECOVERY_READY);
+	UT_ASSERT(!cluster_configuration_read_transport_is_current(&cf, ShareLock));
+	UT_ASSERT(!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &cf, ShareLock));
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	phase_test_lms_generation++;
+	UT_ASSERT(!cluster_recovery_authority_is_current());
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_OFF);
+	reset_phase_service_fixture(true);
+}
+
+UT_TEST(test_startup_refresh_requires_exact_owner_and_fresh_unchanged_proof)
+{
+	static PGPROC startup_proc;
+
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_shared_config = true;
+	phase_test_control_acquire_ready = true;
+	IsUnderPostmaster = true;
+	MyBackendType = B_STARTUP;
+	MyAuxProcType = StartupProcess;
+	MyProc = &startup_proc;
+	phase_test_fence_cache_expired = true;
+	phase_test_live_refreshes_classification = true;
+	UT_ASSERT_EQ(cluster_authority_startup_refresh_recovery(100), CLUSTER_FORMATION_WITNESS_READY);
+	UT_ASSERT(cluster_recovery_authority_is_current());
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	phase_test_fence_cache_expired = true;
+	MyBackendType = B_LMON;
+	MyAuxProcType = NotAnAuxProcess;
+	UT_ASSERT_NE(cluster_authority_startup_refresh_recovery(100), CLUSTER_FORMATION_WITNESS_READY);
+	MyBackendType = B_STARTUP;
+	MyAuxProcType = StartupProcess;
+	MyProc = NULL;
+	UT_ASSERT_NE(cluster_authority_startup_refresh_recovery(100), CLUSTER_FORMATION_WITNESS_READY);
+	MyProc = &startup_proc;
+	phase_test_fresh_marker_changed = true;
+	phase_test_cf_held = true;
+	UT_ASSERT_NE(cluster_authority_startup_refresh_recovery(100), CLUSTER_FORMATION_WITNESS_READY);
+	phase_test_cf_held = false;
+	CritSectionCount = 1;
+	UT_ASSERT_NE(cluster_authority_startup_refresh_recovery(100), CLUSTER_FORMATION_WITNESS_READY);
+	CritSectionCount = 0;
+	UT_ASSERT_NE(cluster_authority_startup_refresh_recovery(100), CLUSTER_FORMATION_WITNESS_READY);
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_OFF);
+	MyProc = NULL;
+	IsUnderPostmaster = false;
+	reset_phase_service_fixture(true);
+}
+
+UT_TEST(test_config_read_crosses_real_s1_and_ges_admission_before_serving)
+{
+	ClusterLockAcquireRequest req = { 0 };
+	ClusterGrdGrantIdentity grant = { 0 };
+	static PGPROC lmon_proc;
+
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_shared_config = true;
+	phase_test_control_acquire_ready = true;
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	MyProc = &lmon_proc;
+	req.resid.type = CLUSTER_CF_RESID_TYPE;
+	req.resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	req.lockmode = ShareLock;
+	grant.mode = ShareLock;
+	grant.request_opcode = GES_REQ_OPCODE_REQUEST;
+	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT(
+		ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock, NoLock));
+	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock));
+	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid));
+	UT_ASSERT(ges_readiness_allows_local_release_origin(&req.resid));
+	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &req.resid, NoLock));
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	req.lockmode = ExclusiveLock;
+	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
+	UT_ASSERT(!ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ExclusiveLock,
+												 NoLock));
+	IsUnderPostmaster = false;
+	cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
+	IsUnderPostmaster = true;
+	req.lockmode = ShareLock;
+	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT(
+		ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock, NoLock));
+	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock));
+	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid));
+	UT_ASSERT(ges_readiness_allows_local_release_origin(&req.resid));
+	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &req.resid, NoLock));
+	/* Local LMON still cannot request CF-X, but the master must finish a
+	 * remote Startup's original CF-X protocol after its own phase change. */
+	req.lockmode = ExclusiveLock;
+	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
+	UT_ASSERT(!ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ExclusiveLock,
+												 NoLock));
+	UT_ASSERT(
+		ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &req.resid, ExclusiveLock));
+	grant.mode = ExclusiveLock;
+	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid));
+	MyProc = NULL;
+	IsUnderPostmaster = false;
+	reset_phase_service_fixture(true);
+}
+
+UT_TEST(test_pre2_startup_cf_x_cannot_use_components_only)
+{
+	ClusterResId cf = { 0 };
+	ClusterFenceAuthorityProof authority = { 0 };
+	ClusterFormationSnapshotV1 formation = { 0 };
+
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_shared_config = true;
+	phase_test_control_acquire_ready = true;
+	cf.type = CLUSTER_CF_RESID_TYPE;
+	cf.lockmethodid = DEFAULT_LOCKMETHOD;
+	cluster_authority_readiness_clear();
+	formation.membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
+	formation.membership.last_admitted_incarnation[0] = 11;
+	formation.local_epoch = phase_test_formation_epoch;
+	UT_ASSERT(cluster_authority_readiness_begin(1, &authority, &formation));
+	UT_ASSERT(cluster_authority_readiness_bind_recovery_generation(phase_test_lms_generation));
+	UT_ASSERT(cluster_recovery_transport_components_current());
+	UT_ASSERT(!cluster_recovery_authority_is_current());
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	UT_ASSERT(cluster_recovery_authority_request_allowed(&cf, ShareLock, true));
+	UT_ASSERT(cluster_authority_readiness_publish_recovery(phase_test_lms_generation));
+	UT_ASSERT(cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	phase_test_grd_authority_ok = false;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_OFF);
+	reset_phase_service_fixture(true);
+}
+
 UT_TEST(test_rf_a1_transport_stale_clear_skips_mid_bind_gen_zero)
 {
 	ClusterFenceAuthorityProof authority;
@@ -1463,7 +2263,7 @@ UT_TEST(test_rf_a1_transport_stale_clear_skips_mid_bind_gen_zero)
 	memset(&formation, 0, sizeof(formation));
 	formation.membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
 	formation.membership.last_admitted_incarnation[0] = 11;
-	formation.reserved[0] = phase_test_formation_epoch;
+	formation.local_epoch = phase_test_formation_epoch;
 	UT_ASSERT(cluster_authority_readiness_begin(1, &authority, &formation));
 	UT_ASSERT_EQ((int)cluster_authority_readiness_get(), (int)CLUSTER_AUTHORITY_STARTING);
 
@@ -1772,6 +2572,80 @@ UT_TEST(test_join_readonly_rebuild_binds_generation_once_per_iteration)
 }
 
 
+UT_TEST(test_shared_phase4_waits_for_actual_semantic_open)
+{
+	bool caught_fatal = false;
+
+	reset_phase_service_fixture(true);
+	phase_lwlock_conditional_result = true;
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	cluster_run_startup_sequence();
+	cluster_shared_config = true;
+	test_mount_result = CLUSTER_CONFIG_MOUNT_MATCH;
+	phase_test_control_acquire_ready = true;
+	phase_test_semantic_ready_after = 3;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0) {
+		cluster_run_phase4_sequence();
+		cluster_finalize_startup_running();
+	} else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	if (caught_fatal)
+		printf("# unexpected phase4 refusal: %s\n", phase4_last_error);
+	UT_ASSERT(!caught_fatal);
+	UT_ASSERT_EQ(phase_test_semantic_poll_calls, 3);
+	UT_ASSERT_EQ(cluster_current_phase(), CLUSTER_PHASE_RUNNING);
+	UT_ASSERT(phase4_test_now >= 40000);
+	reset_phase_service_fixture(true);
+}
+
+UT_TEST(test_shared_phase4_cannot_publish_running_without_semantic_open)
+{
+	bool caught_fatal = false;
+	int saved_timeout = cluster_phase4_timeout;
+
+	reset_phase_service_fixture(true);
+	phase_lwlock_conditional_result = true;
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	cluster_run_startup_sequence();
+	cluster_shared_config = true;
+	test_mount_result = CLUSTER_CONFIG_MOUNT_MATCH;
+	phase_test_control_acquire_ready = true;
+	phase_test_semantic_ready_after = 0;
+	cluster_phase4_timeout = 1;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0) {
+		cluster_run_phase4_sequence();
+		cluster_finalize_startup_running();
+	} else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	cluster_phase4_timeout = saved_timeout;
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT(phase_test_semantic_poll_calls > 1);
+	UT_ASSERT_EQ(cluster_current_phase(), CLUSTER_PHASE_4_NORMAL);
+	UT_ASSERT(phase4_test_now <= INT64CONST(1000000));
+	reset_phase_service_fixture(true);
+}
+
+UT_TEST(test_nonshared_phase4_keeps_original_activation_entry)
+{
+	reset_phase_service_fixture(true);
+	phase_lwlock_conditional_result = true;
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	cluster_run_startup_sequence();
+	phase_test_semantic_ready_after = 0;
+	cluster_run_phase4_sequence();
+	cluster_finalize_startup_running();
+	UT_ASSERT_EQ(phase_test_semantic_poll_calls, 0);
+	UT_ASSERT_EQ(cluster_current_phase(), CLUSTER_PHASE_RUNNING);
+	reset_phase_service_fixture(true);
+}
+
 /* ============================================================
  * Test runner
  * ============================================================ */
@@ -1779,7 +2653,18 @@ UT_TEST(test_join_readonly_rebuild_binds_generation_once_per_iteration)
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(54);
+	UT_RUN(test_authority_clear_reports_original_identity_once_outside_lock);
+	UT_RUN(test_slow_startup_control_crosses_remote_master_phase4);
+	UT_RUN(test_phase4_startup_control_keeps_identity_and_namespace_refusals);
+	UT_RUN(test_shared_phase4_waits_for_actual_semantic_open);
+	UT_RUN(test_shared_phase4_cannot_publish_running_without_semantic_open);
+	UT_RUN(test_nonshared_phase4_keeps_original_activation_entry);
+	UT_RUN(test_startup_refresh_requires_exact_owner_and_fresh_unchanged_proof);
+	UT_RUN(test_native_initializer_walr_share_nowait_reaches_all_startup_gates);
+	UT_RUN(test_native_initializer_walr_share_cannot_borrow_another_role_or_generation);
+	UT_RUN(test_expired_cache_refuses_control_without_destroying_refresh_identity);
+	UT_RUN(test_static_common_blocks_serving_without_destroying_recovery);
 	UT_RUN(test_phase_enum_values_frozen);
 	UT_RUN(test_phase_last_is_shutdown);
 	UT_RUN(test_phase_history_ring_size_is_eight);
@@ -1800,8 +2685,17 @@ main(void)
 	UT_RUN(test_rf_a1_phase4_refreshes_expired_recovery_proof_before_serving);
 	UT_RUN(test_rf_a2_serving_does_not_consume_recovery_duty_cache);
 	UT_RUN(test_rf_a2_serving_rebinds_only_after_lmon_closes_recovery);
+	UT_RUN(test_pre2_survivor_reconstruction_precedes_serving);
+	UT_RUN(test_pre2_survivor_reconstruction_rejects_wrong_episode);
+	UT_RUN(test_pre2_survivor_reconstruction_accepts_prebump_observation);
+	UT_RUN(test_pre2_survivor_reconstruction_rejects_component_loss);
+	UT_RUN(test_pre2_survivor_reconstruction_rechecks_event);
 	UT_RUN(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster);
 	UT_RUN(test_rf_a1_readiness_is_monotone_and_generation_bound);
+	UT_RUN(test_pre2_startup_cf_x_needs_sealed_owner);
+	UT_RUN(test_config_lmon_can_read_before_startup_and_cannot_write);
+	UT_RUN(test_config_read_crosses_real_s1_and_ges_admission_before_serving);
+	UT_RUN(test_pre2_startup_cf_x_cannot_use_components_only);
 	UT_RUN(test_rf_a1_transport_stale_clear_skips_mid_bind_gen_zero);
 	UT_RUN(test_rf_a1_missing_authoritative_grd_stops_before_recovery);
 	UT_RUN(test_rf_a1_refreshes_formation_if_proof_expires_during_lms_start);

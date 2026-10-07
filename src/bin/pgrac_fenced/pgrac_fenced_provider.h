@@ -16,6 +16,8 @@
 #define PGRAC_FENCED_PROVIDER_ID_UNAVAILABLE UINT16_C(0)
 #define PGRAC_FENCED_PROVIDER_ID_TEST_ONLY UINT16_C(1)
 #define PGRAC_FENCED_PROVIDER_ID_IPMI_LANPLUS_V1 UINT16_C(0x0100)
+#define PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1 UINT16_C(0x0101)
+#define PGRAC_FENCED_PROVIDER_NAME_PACEMAKER_LIBVIRT_V1 "pacemaker-libvirt-v1"
 #define PGRAC_FENCED_PROVIDER_NAME_IPMI_LANPLUS_V1 "ipmi-lanplus-v1"
 
 typedef enum PgracFencedProviderResult
@@ -129,6 +131,31 @@ extern PgracFencedProviderTerminal pgrac_fenced_provider_classify_rejoin_on(
 	PgracFencedProviderResult result, const uint8 expected_target_uuid[16],
 	const PgracFencedReadbackV1 *readback);
 extern uint64_t pgrac_fenced_provider_callback_deadline_mono_ns(void);
+/* PGRAC: internal fork-local context; the v1 callback ABI remains unchanged. */
+struct PgracFencedJournalRecordV1;
+struct PgracFencedConfigV1;
+extern const struct PgracFencedJournalRecordV1 *pgrac_fenced_provider_callback_record(void);
+extern const struct PgracFencedConfigV1 *pgrac_fenced_provider_callback_config(void);
+extern PgracFencedProviderWorkerResult pgrac_fenced_provider_worker_actuate_owned(
+	const PgracFencedProviderOpsV1 *ops, bool allow_test_only, bool turn_on,
+	const PgracFencedTargetV1 *target, const struct PgracFencedJournalRecordV1 *record,
+	const struct PgracFencedConfigV1 *config, const uint8 config_digest[32],
+	uint64_t deadline_mono_ns, PgracFencedProviderResult *result, int32 *native_status);
+extern PgracFencedProviderWorkerResult pgrac_fenced_provider_worker_readback_owned(
+	const PgracFencedProviderOpsV1 *ops, bool allow_test_only, const PgracFencedTargetV1 *target,
+	const struct PgracFencedJournalRecordV1 *record, const struct PgracFencedConfigV1 *config,
+	const uint8 config_digest[32], uint64_t deadline_mono_ns, PgracFencedProviderResult *result,
+	PgracFencedReadbackV1 *readback);
+extern PgracFencedProviderWorkerResult pgrac_fenced_provider_worker_readback_retry_owned(
+	const PgracFencedProviderOpsV1 *ops, bool allow_test_only, const PgracFencedTargetV1 *target,
+	const struct PgracFencedJournalRecordV1 *record, const struct PgracFencedConfigV1 *config,
+	const uint8 config_digest[32], uint64_t deadline_mono_ns, PgracFencedProviderResult *result,
+	PgracFencedReadbackV1 *readback);
+extern PgracFencedProviderWorkerResult pgrac_fenced_provider_worker_resolve_configured(
+	const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
+	const PgracFencedTargetV1 *configured, const struct PgracFencedConfigV1 *config,
+	const uint8 config_digest[32], uint64_t deadline_mono_ns, PgracFencedProviderResult *result,
+	PgracFencedTargetV1 *resolved, int32 *native_status);
 extern PgracFencedProviderWorkerResult pgrac_fenced_provider_worker_resolve(
 	const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
 	const PgracFencedTargetV1 *configured, uint64_t deadline_mono_ns,

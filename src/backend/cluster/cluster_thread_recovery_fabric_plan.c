@@ -8,6 +8,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "cluster/cluster_thread_recovery_fabric.h"
+#include "cluster/cluster_wal_claim.h"
 
 #ifdef USE_CLUSTER_UNIT
 #define fabric_alloc0(size_) calloc(1, (size_))
@@ -52,13 +53,13 @@ fabric_preflight_side_component(void *arg, const RfOpcodeRouteV1 *route,
 								const RfPageVersionEdgeEntryV1 *edge, const DecodedBkpBlock *block)
 {
 	(void)arg;
-	return route != NULL && route->record_owner == RF_ROUTE_OWNER_PAGE_CODEC && edge != NULL
-				   && block != NULL
-				   && (edge->page_class == RF_PAGE_CLASS_ROUTED_HEADER
-					   || edge->page_class == RF_PAGE_CLASS_ROUTED_SIDE
-					   || edge->page_class == RF_PAGE_CLASS_ROUTED_SPACE)
-			   ? RF_PAGE_PROOF_DETAIL_OK
-			   : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	(void)route;
+	(void)edge;
+	(void)block;
+	/* The SIDE plan owns independent typed records, not routed components
+	 * inside PAGE records. A class label alone cannot discharge that page's
+	 * obligation. Refuse before either lane can omit it from a sealed plan. */
+	return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 }
 
 static RfPageProofDetailV1
@@ -71,6 +72,88 @@ fabric_preflight_rebuildable_component(void *arg, const RfOpcodeRouteV1 *route,
 				   && block != NULL && edge->page_class == RF_PAGE_CLASS_REBUILDABLE_FSM
 			   ? RF_PAGE_PROOF_DETAIL_OK
 			   : RF_PAGE_PROOF_DETAIL_CLASS_UNKNOWN;
+}
+
+typedef struct FabricCensusVisitor {
+	ClusterRecoveryContributionVisitorV1 visitor;
+	void *arg;
+} FabricCensusVisitor;
+
+static bool
+fabric_census_space(void *arg, const RfSideSpaceContributionV1 *space)
+{
+	FabricCensusVisitor *emit = arg;
+	for (uint8 block = 0; block < 2; block++)
+		if ((space->page_mask & (1u << block))
+			&& !emit->visitor(emit->arg, &space->result.key.locator, SPACE_FORKNUM, block,
+							  space->result_token[block]))
+			return false;
+	return true;
+}
+
+RfPageProofDetailV1
+cluster_thread_recovery_record_census_v1(XLogReaderState *record, const ClusterWalSourceRef *source,
+										 const RfContributorStreamCutV1 *cut,
+										 ClusterRecoveryContributionVisitorV1 visitor, void *arg)
+{
+	RfDetachedOwnerOpsV1 ops = { 0 };
+	RfDetachedRecordPlanV1 plan;
+	RfPageOnlineRecordIdentityV1 identity = { 0 };
+	RfSideContributionOwnersV1 owners;
+	FabricCensusVisitor emit = { visitor, arg };
+	RfPageProofDetailV1 detail;
+	const DecodedXLogRecord *decoded;
+
+	if (record == NULL || record->record == NULL || source == NULL || cut == NULL || visitor == NULL
+		|| !cluster_wal_claim_v2_ref_valid(&source->claim)
+		|| source->claim.identity.origin_owner_incarnation == 0
+		|| source->claim.identity.origin_owner_incarnation != cut->origin_owner_incarnation
+		|| source->claim.identity.origin_thread_id != cut->failed_thread
+		|| source->claim.identity.origin_node_id != (int32)cut->failed_thread - 1
+		|| cut->failed_thread == 0 || cut->failed_thread > PGRAC_PAGE_LSN_ORIGIN_MAX + 1
+		|| source->timeline != cut->timeline_id || source->timeline == 0)
+		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+	ops.preflight_side_record = fabric_preflight_side_record;
+	ops.preflight_side_component = fabric_preflight_side_component;
+	ops.preflight_rebuildable_component = fabric_preflight_rebuildable_component;
+	detail = rf_page_detached_preflight_v1(record, true, &ops, &plan);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		return detail;
+	decoded = record->record;
+	identity.record.system_identifier = source->claim.identity.system_identifier;
+	memcpy(identity.record.storage_uuid, source->claim.identity.storage_uuid, 16);
+	identity.record.origin_thread = cut->failed_thread;
+	identity.record.timeline_id = cut->timeline_id;
+	identity.record.read_rec_ptr = record->ReadRecPtr;
+	identity.record.end_rec_ptr = record->EndRecPtr;
+	identity.record.record_crc = (uint32)decoded->header.xl_crc;
+	identity.record.rmid = decoded->header.xl_rmid;
+	identity.record.info = decoded->header.xl_info;
+	/* This validates PAGE identities too, and maps every non-PCM effect to
+	 * its typed owner without retaining that owner's replay operation. */
+	detail = rf_side_record_census_v1(&plan, &identity, cut, source->claim.database_incarnation,
+									  fabric_census_space, &emit, &owners);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		return detail;
+	for (uint32 i = 0; i < plan.component_count; i++) {
+		const RfDetachedComponentPlanV1 *component = &plan.components[i];
+		const DecodedBkpBlock *block = &decoded->blocks[component->block_id];
+		RfPageIdentityV1 page = { 0 };
+		page.system_identifier = source->claim.identity.system_identifier;
+		memcpy(page.storage_uuid, source->claim.identity.storage_uuid, 16);
+		page.locator = block->rlocator;
+		page.forknum = block->forknum;
+		page.blockno = block->blkno;
+		if (component->owner == RF_DETACHED_COMPONENT_REBUILDABLE)
+			continue;
+		if (component->owner != RF_DETACHED_COMPONENT_PAGE_CODEC
+			|| component->page_class != RF_PAGE_CLASS_ORDINARY || !rf_page_identity_valid_v1(&page)
+			|| plan.result_token == 0)
+			return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+		if (!visitor(arg, &block->rlocator, block->forknum, block->blkno, plan.result_token))
+			return RF_PAGE_PROOF_DETAIL_WOULD_BLOCK;
+	}
+	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
 static void
@@ -123,7 +206,12 @@ cluster_thread_recovery_fabric_plan_create_v1(
 	page_request.participant_count = request->participant_count;
 	page_request.retention_binding_cookie = request->retention_binding_cookie;
 	page_request.memory_budget = request->page_memory_budget;
+	page_request.redo_starts = request->redo_starts;
 	detail = rf_page_online_plan_create_v1(&page_request, &plan->page_plan);
+	if (detail == RF_PAGE_PROOF_DETAIL_OK && request->sources != NULL
+		&& !rf_page_online_plan_bind_sources_v1(plan->page_plan, request->sources,
+												request->participant_count))
+		detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 	if (detail != RF_PAGE_PROOF_DETAIL_OK) {
 		fabric_plan_free(plan);
 		return detail;
@@ -134,6 +222,7 @@ cluster_thread_recovery_fabric_plan_create_v1(
 	side_request.physical_cuts = plan->physical_cuts;
 	side_request.participant_count = request->participant_count;
 	side_request.memory_budget = request->side_memory_budget;
+	side_request.redo_starts = request->redo_starts;
 	detail = rf_side_online_plan_create_v1(&side_request, &plan->side_plan);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK) {
 		fabric_plan_free(plan);
@@ -184,7 +273,7 @@ cluster_thread_recovery_fabric_plan_feed_record_v1(ClusterThreadRecoveryFabricPl
 	identity.record.rmid = decoded->header.xl_rmid;
 	identity.record.info = decoded->header.xl_info;
 	identity.participant_index = participant_index;
-	detail = rf_page_online_plan_feed_record_v1(plan->page_plan, &record_plan, &identity);
+	detail = rf_page_online_plan_queue_record_v1(plan->page_plan, &record_plan, &identity);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		goto fail;
 	detail = rf_side_online_plan_feed_record_v1(plan->side_plan, &record_plan, &identity);
@@ -196,6 +285,15 @@ cluster_thread_recovery_fabric_plan_feed_record_v1(ClusterThreadRecoveryFabricPl
 fail:
 	plan->failed = true;
 	return detail;
+}
+
+bool
+cluster_thread_recovery_fabric_bind_database_v1(ClusterThreadRecoveryFabricPlanV1 *plan,
+												uint64 database_incarnation)
+{
+	return plan != NULL && plan->magic == CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_MAGIC && !plan->sealed
+		   && !plan->failed
+		   && rf_side_online_plan_bind_database_v1(plan->side_plan, database_incarnation);
 }
 
 RfPageProofDetailV1

@@ -46,6 +46,7 @@
  *	  - _bt_build_callback: byte-reverse the leading key when building a
  *	    reverse-key index over existing heap tuples.
  *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave f)
+ *	  - Shared bulk-build FPI records carry exact SPACE/page versions.
  *
  *-------------------------------------------------------------------------
  */
@@ -58,6 +59,9 @@
 #include "access/table.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_reverse_key.h" /* PGRAC: spec-6.12f validate */
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_space_storage.h"
+#include "cluster/storage/cluster_smgr.h"
 #endif
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -266,6 +270,19 @@ typedef struct BTWriteState
 	BlockNumber btws_pages_alloced; /* # pages allocated */
 	BlockNumber btws_pages_written; /* # pages written out */
 	Page		btws_zeropage;	/* workspace for filling zeroes */
+#ifdef USE_PGRAC_CLUSTER
+	bool		versioned;
+	ClusterSpaceIdentity identity;	/* PGRAC: copied before page construction */
+	BlockNumber reserved_blocks;	/* exclusive bound granted to this build */
+	/* PGRAC: bounded private pages, not an alternate shared buffer cache. */
+	struct
+	{
+		Page		page;
+		BlockNumber blkno;
+	} pending[32];
+	unsigned	pending_count;
+	XLogRecPtr pending_lsn;
+#endif
 } BTWriteState;
 
 
@@ -590,11 +607,25 @@ _bt_leafbuild(BTSpool *btspool, BTSpool *btspool2)
 	/* _bt_mkscankey() won't set allequalimage without metapage */
 	wstate.inskey->allequalimage = _bt_allequalimage(wstate.index, true);
 	wstate.btws_use_wal = RelationNeedsWAL(wstate.index);
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: one cached identity value for the native new-index writer. */
+	wstate.versioned = cluster_shared_config && RelationIsPermanent(wstate.index)
+		&& cluster_smgr_which_for(wstate.index->rd_locator, InvalidBackendId) == 1;
+	if (wstate.versioned
+		&& (!wstate.btws_use_wal
+			|| !cluster_space_relation_get_identity(wstate.index, &wstate.identity)))
+		elog(ERROR, "shared btree build requires a live SPACE identity");
+#endif
 
 	/* reserve the metapage */
 	wstate.btws_pages_alloced = BTREE_METAPAGE + 1;
 	wstate.btws_pages_written = 0;
 	wstate.btws_zeropage = NULL;	/* until needed */
+#ifdef USE_PGRAC_CLUSTER
+	wstate.pending_count = 0;
+	wstate.pending_lsn = InvalidXLogRecPtr;
+	wstate.reserved_blocks = 0;
+#endif
 
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE,
 								 PROGRESS_BTREE_PHASE_LEAF_LOAD);
@@ -674,18 +705,12 @@ _bt_blnewpage(uint32 level)
 }
 
 /*
- * emit a completed btree page, and release the working storage.
+ * Write a completed btree page and release its working storage.  PGRAC's
+ * versioned caller has already flushed the WAL covering this page.
  */
 static void
-_bt_blwritepage(BTWriteState *wstate, Page page, BlockNumber blkno)
+_bt_blwritepage_data(BTWriteState *wstate, Page page, BlockNumber blkno)
 {
-	/* XLOG stuff */
-	if (wstate->btws_use_wal)
-	{
-		/* We use the XLOG_FPI record type for this */
-		log_newpage(&wstate->index->rd_locator, MAIN_FORKNUM, blkno, page, true);
-	}
-
 	/*
 	 * If we have to write pages nonsequentially, fill in the space with
 	 * zeroes until we come back and overwrite.  This is not logically
@@ -727,6 +752,86 @@ _bt_blwritepage(BTWriteState *wstate, Page page, BlockNumber blkno)
 	}
 
 	pfree(page);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: one WAL-before-DATA fence for each bounded batch. */
+static void
+_bt_blflushpages(BTWriteState *wstate)
+{
+	if (wstate->pending_count == 0)
+		return;
+
+	Assert(wstate->versioned && wstate->btws_use_wal);
+	Assert(wstate->pending_lsn != InvalidXLogRecPtr);
+	XLogFlush(wstate->pending_lsn);
+	for (unsigned i = 0; i < wstate->pending_count; i++)
+		_bt_blwritepage_data(wstate, wstate->pending[i].page,
+							 wstate->pending[i].blkno);
+	wstate->pending_count = 0;
+	wstate->pending_lsn = InvalidXLogRecPtr;
+}
+#endif
+
+/* Emit a completed page; the writer takes ownership of its workspace. */
+static void
+_bt_blwritepage(BTWriteState *wstate, Page page, BlockNumber blkno)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (wstate->versioned)
+	{
+		PGAlignedBlock before;
+		const void *zero_before = NULL;
+		XLogRecPtr recptr;
+
+		Assert(wstate->btws_use_wal);
+		/* Reserve before emitting any page version. The unpublished build
+		 * owns these ranges under its original lifecycle lock. A bounded
+		 * batch also covers out-of-order zero fills; unused reservations
+		 * stay consumed and are never inferred from physical file size. */
+		if (blkno == InvalidBlockNumber)
+			elog(ERROR, "invalid shared btree build block number");
+		if (blkno >= wstate->reserved_blocks)
+		{
+			uint32 want = Max((uint32)lengthof(wstate->pending),
+							  blkno - wstate->reserved_blocks + 1);
+
+			want = Min(want, InvalidBlockNumber - wstate->reserved_blocks);
+			if (!cluster_space_reserve_exact(&wstate->identity, wstate->reserved_blocks, want))
+				elog(ERROR, "cannot reserve shared btree build block range");
+			wstate->reserved_blocks += want;
+		}
+		/*
+		 * Parent and metapage backfills must inspect real predecessor bytes.
+		 * Finish earlier writes before reading a gap or revisiting a block;
+		 * never treat a planned zero fill as an already existing zero page.
+		 */
+		if (wstate->pending_count > 0 &&
+			blkno <= wstate->pending[wstate->pending_count - 1].blkno)
+			_bt_blflushpages(wstate);
+		if (blkno < wstate->btws_pages_written)
+		{
+			smgrread(RelationGetSmgr(wstate->index), MAIN_FORKNUM,
+					 blkno, before.data);
+			zero_before = before.data;
+		}
+		if (!cluster_space_btree_build_page_wal(&wstate->identity, blkno, page,
+												  zero_before, &recptr))
+			elog(ERROR, "shared btree build cannot capture exact new page version");
+		Assert(wstate->pending_count < lengthof(wstate->pending));
+		wstate->pending[wstate->pending_count].page = page;
+		wstate->pending[wstate->pending_count++].blkno = blkno;
+		wstate->pending_lsn = recptr;
+		if (wstate->pending_count == lengthof(wstate->pending))
+			_bt_blflushpages(wstate);
+		return;
+	}
+#endif
+
+	/* Native nonshared builds retain their original write order. */
+	if (wstate->btws_use_wal)
+		log_newpage(&wstate->index->rd_locator, MAIN_FORKNUM, blkno, page, true);
+	_bt_blwritepage_data(wstate, page, blkno);
 }
 
 /*
@@ -1199,7 +1304,7 @@ _bt_uppershutdown(BTWriteState *wstate, BTPageState *state)
 		 */
 		_bt_slideleft(s->btps_page);
 		_bt_blwritepage(wstate, s->btps_page, s->btps_blkno);
-		s->btps_page = NULL;	/* writepage freed the workspace */
+		s->btps_page = NULL;	/* writepage owns the workspace */
 	}
 
 	/*
@@ -1458,6 +1563,10 @@ _bt_load(BTWriteState *wstate, BTSpool *btspool, BTSpool *btspool2)
 
 	/* Close down final pages and write the metapage */
 	_bt_uppershutdown(wstate, state);
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: finish the partial batch before the native DATA fsync below. */
+	_bt_blflushpages(wstate);
+#endif
 
 	/*
 	 * When we WAL-logged index pages, we must nonetheless fsync index files.

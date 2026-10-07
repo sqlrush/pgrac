@@ -10,6 +10,11 @@
  * IDENTIFICATION
  *	  src/backend/storage/lmgr/proc.c
  *
+ * PGRAC MODIFICATIONS: register actual configuration outcomes for native
+ * process lifetimes, including auxiliaries outside ProcSignal; retire only
+ * at real native cleanup. No configuration admission is implied.
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 /*
@@ -39,6 +44,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_grd.h" /* spec-2.17 D28c — cluster_grd_alloc_generation */
 #include "cluster/cluster_guc.h" /* spec-2.17 — cluster_enabled */
+#include "cluster/cluster_shared_config.h" /* native family lifetime reset */
 #endif
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -165,6 +171,11 @@ InitProcGlobal(void)
 				j;
 	bool		found;
 	uint32		TotalProcs = MaxBackends + NUM_AUXILIARY_PROCS + max_prepared_xacts;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: a native new-shmem lifetime must not reuse the PM's old mapping. */
+	cluster_shared_config_delivery_new_shmem();
+#endif
 
 	/* Create the ProcGlobal shared structure */
 	ProcGlobal = (PROC_HDR *)
@@ -491,20 +502,14 @@ InitProcess(void)
 	 */
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_enabled && MyProc != NULL) {
-		MyProc->cluster_grd_generation = cluster_grd_alloc_generation();
-		MyProc->cluster_grd_bast_pending = false;
 		/* spec-4.6 D3 — seed the rebind-barrier ack with the CURRENT
 		 * redeclare generation:  a backend born after the broadcast has
 		 * no stale-epoch grants and must not block the barrier.  The
 		 * registered-grant count restarts at zero with the fresh proc. */
-		pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked,
-							cluster_grd_redeclare_generation());
 		/* P0-1: seed the ack epoch with the locked episode epoch so a
 		 * backend born mid-episode does not fail the barrier's epoch
 		 * check (it holds no stale grants either way). */
-		pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked_epoch,
-							cluster_grd_redeclare_episode_epoch());
-		pg_atomic_write_u32(&MyProc->cluster_grd_registered_count, 0);
+		cluster_grd_proc_initialize(MyProc);
 		/* spec-5.8 D1d — clear any wait-state left active by a predecessor
 		 * that reused this proc slot;  wait_seq is preserved (monotonic ABA
 		 * guard), so a stale victim tuple can never re-match. */
@@ -600,6 +605,14 @@ InitAuxiliaryProcess(void)
 		SpinLockRelease(ProcStructLock);
 		elog(FATAL, "all AuxiliaryProcs are in use");
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC MODIFICATIONS by SqlRush <sqlrush@gmail.com>:
+	 * Reset a reused auxiliary owner's GRD registration BEFORE publishing
+	 * its PID to the recovery census. No locks or allocations in this reset. */
+	if (cluster_enabled)
+		cluster_grd_proc_initialize(auxproc);
+#endif
 
 	/* Mark auxiliary proc as in use by me */
 	/* use volatile pointer to prevent code rearrangement */

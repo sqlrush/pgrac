@@ -21,6 +21,9 @@
     "t/200_stage2_acceptance_capability.pl",
     "t/332_block_device_backend.pl"
   ],
+  "native_smoke_tests": [
+    "t/031_undo_publication_refusal.pl"
+  ],
   "historical_workflow": "legacy-extended.yml",
   "historical_fast_tests": {
     "t/226_stage3_mvcc_acceptance_capability.pl": "Mixed legacy capability fixture including positive prepared transactions and immediate-stop recovery.",

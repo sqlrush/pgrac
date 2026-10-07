@@ -24,6 +24,7 @@ int ctrc_cleaner_original_main(void);
 #include "../../backend/cluster/cluster_uba.c"
 
 int NLocBuffer = 0;
+bool cluster_shared_config;
 
 int
 scn_time_cmp(SCN a, SCN b)
@@ -38,6 +39,8 @@ static ClusterCtrcParticipantEntry reuse_participant;
 static ClusterSfDepVec reuse_dependencies;
 static unsigned reuse_pins, reuse_xlocks, reuse_locks, reuse_enters, reuse_leaves;
 static unsigned reuse_wal_starts, reuse_wal_finishes, reuse_wal_aborts;
+static unsigned reuse_space_reads;
+static bool reuse_space_available = true;
 static unsigned reuse_rechecks, reuse_fail_recheck, reuse_fail_lock;
 static bool reuse_terminal_ok, reuse_tag_ok, reuse_exists;
 static bool reuse_dependency_drift;
@@ -354,18 +357,37 @@ cluster_sf_dep_vec_for_ship(Buffer buffer, ClusterSfDepVec *out)
 }
 
 static GenericXLogState *
-reuse_xlog_start(bool logged)
+reuse_xlog_start(bool logged, GenericXLogInternalOwner owner)
 {
 	Assert(logged && reuse_xlocks == 1);
+	UT_ASSERT_EQ(owner, GENERIC_XLOG_CTRC_ITL);
 	reuse_wal_starts++;
 	memcpy(&reuse_image, &reuse_page, sizeof(reuse_page));
 	return (GenericXLogState *)&reuse_image;
 }
 
+static bool
+reuse_space_identity(RelFileLocator locator, ClusterSpaceIdentity *out)
+{
+	UT_ASSERT_EQ(reuse_xlocks, 0);
+	UT_ASSERT_EQ(reuse_pins, 0);
+	reuse_space_reads++;
+	memset(out, 0, sizeof(*out));
+	out->key.locator = locator;
+	out->state = CLUSTER_SPACE_IDENTITY_LIVE;
+	out->incarnation[0] = 77;
+	return reuse_space_available;
+}
+
 static Page
-reuse_xlog_register(GenericXLogState *state, Buffer buffer, int flags)
+reuse_xlog_register(GenericXLogState *state, Buffer buffer, int flags,
+					const ClusterSpaceIdentity *identity)
 {
 	Assert(state == (GenericXLogState *)&reuse_image && buffer == 1 && flags == 0);
+	if (cluster_shared_config) {
+		UT_ASSERT_EQ(identity->incarnation[0], 77);
+		UT_ASSERT_EQ(reuse_space_reads, 1);
+	}
 	return (Page)reuse_image.data;
 }
 
@@ -399,8 +421,9 @@ reuse_xlog_abort(GenericXLogState *state)
 #define LockBuffer reuse_unlock
 #define ReleaseBuffer reuse_release
 #define UnlockReleaseBuffer reuse_unlock_release
-#define GenericXLogStartLogged reuse_xlog_start
-#define GenericXLogRegisterBuffer reuse_xlog_register
+#define GenericXLogStartInternal reuse_xlog_start
+#define cluster_space_relation_read_maintenance_identity reuse_space_identity
+#define GenericXLogRegisterBufferVersioned reuse_xlog_register
 #define GenericXLogFinish reuse_xlog_finish
 #define GenericXLogAbort reuse_xlog_abort
 #define ctrc_cleaner_note_itl_retained reuse_note_itl_retained
@@ -419,8 +442,9 @@ reuse_xlog_abort(GenericXLogState *state)
 #undef LockBuffer
 #undef ReleaseBuffer
 #undef UnlockReleaseBuffer
-#undef GenericXLogStartLogged
-#undef GenericXLogRegisterBuffer
+#undef GenericXLogStartInternal
+#undef cluster_space_relation_read_maintenance_identity
+#undef GenericXLogRegisterBufferVersioned
 #undef GenericXLogFinish
 #undef GenericXLogAbort
 
@@ -1973,10 +1997,40 @@ UT_TEST(test_aborted_history_final_guard_rejects_change_after_second_current)
 	}
 }
 
+UT_TEST(test_shared_cleaner_gets_identity_before_page_locks)
+{
+	reuse_setup(false);
+	cluster_shared_config = true;
+	reuse_space_reads = 0;
+	UT_ASSERT(reuse_run());
+	UT_ASSERT_EQ(reuse_space_reads, 1);
+	UT_ASSERT_EQ(reuse_wal_finishes, 1);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_shared_cleaner_missing_identity_retains_receipt_without_mutation)
+{
+	PGAlignedBlock original;
+
+	reuse_setup(false);
+	original = reuse_page;
+	cluster_shared_config = true;
+	reuse_space_available = false;
+	UT_ASSERT(!reuse_run());
+	UT_ASSERT_EQ(reuse_handle.receipt->state, CTRC_RECEIPT_APPLIED);
+	UT_ASSERT_EQ(reuse_wal_starts, 0);
+	UT_ASSERT_EQ(reuse_xlocks, 0);
+	UT_ASSERT_EQ(reuse_pins, 0);
+	UT_ASSERT_EQ(reuse_enters, reuse_leaves);
+	UT_ASSERT(memcmp(&original, &reuse_page, sizeof(original)) == 0);
+	cluster_shared_config = false;
+	reuse_space_available = true;
+}
+
 int
 main(void)
 {
-	UT_PLAN(47);
+	UT_PLAN(49);
 	UT_RUN(test_aborted_history_final_guard_rejects_change_after_second_current);
 	UT_RUN(test_aborted_history_retires_only_with_all_three_proofs_without_floor);
 	UT_RUN(test_aborted_history_never_uses_absence_of_live_owner_as_abort_proof);
@@ -2021,6 +2075,8 @@ main(void)
 	UT_RUN(test_final_shared_identity_and_durability_can_still_refuse);
 	UT_RUN(test_data_and_mx_receipts_do_not_gain_the_absence_path);
 	UT_RUN(test_retained_reason_is_reported_after_page_release);
+	UT_RUN(test_shared_cleaner_gets_identity_before_page_locks);
+	UT_RUN(test_shared_cleaner_missing_identity_retains_receipt_without_mutation);
 	free(CtrcShared);
 	CtrcShared = NULL;
 	UT_DONE();

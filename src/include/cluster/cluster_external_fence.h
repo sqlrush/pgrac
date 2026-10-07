@@ -378,6 +378,10 @@ cluster_external_fence_rejoin_revalidate_root(PgracExternalFenceRejoinOpV1 *op,
 extern bool cluster_external_fence_rejoin_consume_nowait(
 	PgracExternalFenceRejoinOpV1 *op, const ClusterReconfigRejoinPendingSnapshotV1 *current_pending,
 	const ClusterJoinCommitMarker *committed_candidate, PgracExternalFenceDenyReason *reason);
+/* Membership revalidates the terminal but cannot retire restart dependencies.
+ * RECONFIG_WAIT leaves it selected for the serving successor's checkpoint. */
+extern ClusterControlRootResult cluster_external_fence_rejoin_consume_terminal_history(
+	PgracExternalFenceRejoinOpV1 *op, int32 candidate_node, uint64 candidate_incarnation);
 extern const PgracExternalFenceRejoinBindingV1 *
 cluster_external_fence_rejoin_binding(const PgracExternalFenceRejoinOpV1 *op);
 extern void cluster_external_fence_rejoin_release(PgracExternalFenceRejoinOpV1 **op);

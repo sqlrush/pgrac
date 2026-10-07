@@ -233,6 +233,104 @@ UT_TEST(unclassified_cannot_allocate_or_publish_empty_checkpoint)
 	UT_ASSERT(cold_checkpoint_rejected(4096));
 	UT_ASSERT_EQ(cold_writes, 0);
 }
+
+UT_TEST(shared_space_startup_does_not_load_or_admit_legacy_cache)
+{
+	const char *reason = NULL;
+	BlockNumber first = 999;
+	unsigned reads;
+
+	cold_setup();
+	/* This would be rejected as a normal restart snapshot. Its contents
+	 * must never become a second authority for canonical SPACE. */
+	cold_snapshot(CLUSTER_HW_SNAPSHOT_ADOPTION, 123, GetSystemIdentifier(), 1);
+	reads = cold_reads;
+	cluster_shared_config = true;
+	UT_ASSERT(cluster_hw_startup_prepare(false, true, 4096, &reason));
+	UT_ASSERT(!cluster_hw_authority_active());
+	UT_ASSERT(reason == NULL);
+	UT_ASSERT_EQ(cluster_hw_cold_boot_mode(), CLUSTER_HW_BOOT_CANONICAL_SPACE);
+	UT_ASSERT(cluster_hw_startup_complete(&reason));
+	UT_ASSERT_EQ(cluster_hw_cold_boot_state(), CLUSTER_HW_COLD);
+	UT_ASSERT_EQ(cold_reads, reads);
+	UT_ASSERT_EQ(cold_advance(20000, 0, &first), CLUSTER_HW_NOT_READY);
+	UT_ASSERT_EQ(first, 999);
+	/* Even old in-memory READY bytes cannot select the previous allocator. */
+	pg_atomic_write_u32(&hw_state->cold_boot_mode, CLUSTER_HW_BOOT_NORMAL_SELF);
+	pg_atomic_write_u32(&hw_state->cold_boot_state, CLUSTER_HW_READY);
+	UT_ASSERT_EQ(cold_advance(21000, 123, &first), CLUSTER_HW_NOT_READY);
+	UT_ASSERT_EQ(first, 999);
+	UT_ASSERT(!cluster_hw_startup_complete(&reason));
+	LWLockAcquire(&hw_state->lwlock, LW_SHARED);
+	UT_ASSERT_EQ(hash_get_num_entries(hw_htab), 0);
+	LWLockRelease(&hw_state->lwlock);
+}
+
+UT_TEST(shared_space_checkpoint_and_recovery_have_no_snapshot_io)
+{
+	const char *reason = NULL;
+	unsigned reads, writes;
+
+	cold_setup();
+	cold_snapshot(CLUSTER_HW_SNAPSHOT_ADOPTION, 123, GetSystemIdentifier(), 1);
+	reads = cold_reads;
+	writes = cold_writes;
+	cluster_shared_config = true;
+	UT_ASSERT(cluster_hw_startup_prepare(true, false, 4096, &reason));
+	cluster_hw_snapshot_recovery_load();
+	UT_ASSERT(!cold_checkpoint_rejected(8192));
+	cluster_hw_snapshot_adoption_write();
+	UT_ASSERT_EQ(cold_reads, reads);
+	UT_ASSERT_EQ(cold_writes, writes);
+	UT_ASSERT_EQ(cluster_hw_cold_boot_state(), CLUSTER_HW_COLD);
+	LWLockAcquire(&hw_state->lwlock, LW_SHARED);
+	UT_ASSERT_EQ(hash_get_num_entries(hw_htab), 0);
+	LWLockRelease(&hw_state->lwlock);
+}
+
+UT_TEST(shared_space_native_startup_keeps_role_and_checkpoint_prerequisites)
+{
+	const char *reason = NULL;
+	volatile bool caught = false;
+
+	cold_setup();
+	cluster_shared_config = true;
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT(!cluster_hw_startup_prepare(false, true, 4096, &reason));
+	MyAuxProcType = StartupProcess;
+	UT_ASSERT(!cluster_hw_startup_prepare(false, false, 4096, &reason));
+	UT_ASSERT_EQ(cold_reads + cold_writes, 0);
+	cold_setup();
+	cluster_shared_config = true;
+	UT_ASSERT(!cluster_hw_startup_prepare(false, true, InvalidXLogRecPtr, &reason));
+	cluster_shared_data_dir = NULL;
+	UT_ASSERT(!cluster_hw_startup_prepare(false, true, 4096, &reason));
+	{
+		ClusterHwShared *saved = hw_state;
+		hw_state = NULL;
+		UT_ASSERT(!cluster_hw_startup_prepare(false, true, 4096, &reason));
+		hw_state = saved;
+	}
+	cold_setup();
+	cluster_shared_config = true;
+	PG_TRY();
+	{
+		actual_init_tail(true, false, false, false, 4096);
+		actual_checkpoint_call(8192);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		while (held_lock != NULL)
+			LWLockRelease(held_lock);
+	}
+	PG_END_TRY();
+	UT_ASSERT(!caught);
+	UT_ASSERT_EQ(cluster_hw_cold_boot_mode(), CLUSTER_HW_BOOT_CANONICAL_SPACE);
+	UT_ASSERT(cluster_hw_startup_complete(&reason));
+	UT_ASSERT_EQ(cold_reads + cold_writes, 0);
+	UT_ASSERT_EQ(cluster_hw_cold_boot_state(), CLUSTER_HW_COLD);
+}
 UT_TEST(normal_load_precedes_ready_and_first_allocation_uses_durable_hwm)
 {
 	const char *reason = NULL;
@@ -330,6 +428,54 @@ UT_TEST(recovery_keeps_original_load_and_state_contract)
 	reads = cold_writes;
 	cluster_hw_snapshot_checkpoint_write(8192);
 	UT_ASSERT_EQ(cold_writes, reads);
+}
+/* D S09 R-A15: a single-node root-backed crash recovery rebuilds its own
+ * checkpoint snapshot before the tail, so its checkpoints keep the snapshot
+ * bound to their redo and the next clean boot loads it.  Without the exact
+ * snapshot, recovery still starts and nothing is rewritten. */
+UT_TEST(single_node_recovery_rebuilds_and_keeps_the_snapshot_current)
+{
+	const char *reason = NULL;
+	ClusterHwSnapshotHeader hdr = { 0 };
+	ClusterHwSnapshotEntry entries[3] = { { 0 } };
+	ClusterResId tail = cold_key(20001);
+	unsigned writes;
+
+	for (unsigned leg = 0; leg < 3; leg++) {
+		cold_setup();
+		fixture_node_count = 1;
+		if (leg != 2)
+			cold_snapshot(CLUSTER_HW_SNAPSHOT_CHECKPOINT, leg == 0 ? 4096 : 2048,
+						  GetSystemIdentifier(), 2);
+		else { /* no snapshot at all */
+			char path[MAXPGPATH];
+
+			UT_ASSERT(cluster_hw_snapshot_path(7, path, sizeof(path)));
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		UT_ASSERT(cluster_hw_startup_prepare(true, false, 4096, &reason));
+		UT_ASSERT(reason == NULL);
+		UT_ASSERT_EQ(cluster_hw_cold_boot_mode(), CLUSTER_HW_BOOT_EXISTING_RECOVERY);
+		UT_ASSERT_EQ(cluster_hw_cold_boot_state(),
+					 leg == 0 ? CLUSTER_HW_REBUILT : CLUSTER_HW_FAILED);
+		cluster_hw_apply_hwm(&tail, 250); /* HW_RESERVE redo after the redo point */
+		UT_ASSERT(cluster_hw_startup_complete(&reason));
+		writes = cold_writes;
+		UT_ASSERT(!cold_checkpoint_rejected(8192));
+		UT_ASSERT_EQ(cold_writes, writes + (leg == 0 ? 1 : 0));
+		UT_ASSERT_EQ(
+			cluster_hw_snapshot_normal_read(7, GetSystemIdentifier(), 8192, &hdr, entries, 3),
+			leg == 0 ? CLUSTER_HW_NORMAL_READ_VALID
+					 : (leg == 1 ? CLUSTER_HW_NORMAL_READ_LSN : CLUSTER_HW_NORMAL_READ_MISSING));
+		if (leg == 0) { /* max(snapshot, tail) */
+			UT_ASSERT_EQ(hdr.n_entries, 2);
+			UT_ASSERT_EQ(entries[0].next_hwm, 100);
+			UT_ASSERT_EQ(entries[1].next_hwm, 250);
+		}
+		if (ut_current_failed)
+			printf("# recovery snapshot leg %u\n", leg);
+	}
+	fixture_node_count = 4;
 }
 UT_TEST(normal_has_no_partial_success_when_shared_table_cannot_hold_the_file)
 {
@@ -444,13 +590,17 @@ main(void)
 {
 	if (mkdtemp(cold_root) == NULL)
 		return 2;
-	UT_PLAN(12);
+	UT_PLAN(16);
+	UT_RUN(shared_space_startup_does_not_load_or_admit_legacy_cache);
+	UT_RUN(shared_space_checkpoint_and_recovery_have_no_snapshot_io);
+	UT_RUN(shared_space_native_startup_keeps_role_and_checkpoint_prerequisites);
 	UT_RUN(unclassified_cannot_allocate_or_publish_empty_checkpoint);
 	UT_RUN(normal_load_precedes_ready_and_first_allocation_uses_durable_hwm);
 	UT_RUN(normal_rebuilt_allows_closing_checkpoint_but_not_service);
 	UT_RUN(normal_read_failure_is_sticky_and_never_becomes_recovery);
 	UT_RUN(seed_metadata_is_maintained_without_enabling_single_node_allocation);
 	UT_RUN(recovery_keeps_original_load_and_state_contract);
+	UT_RUN(single_node_recovery_rebuilds_and_keeps_the_snapshot_current);
 	UT_RUN(normal_has_no_partial_success_when_shared_table_cannot_hold_the_file);
 	UT_RUN(startup_role_classification_and_no_metadata_are_distinct);
 	UT_RUN(actual_wal_tail_uses_own_decoded_checkpoint_and_recovery_decision);

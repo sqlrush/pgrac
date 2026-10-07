@@ -1374,6 +1374,7 @@ claim_retry_locked:
 		/* Segment full / corrupt bitmap -> select fresh or exact reuse. */
 		ClusterUndoSegmentExtendPlan extend_plan;
 		uint32 old_seg = seg;
+		uint32 previous_active_segment = UndoRecordShared->active_segment_id;
 		uint32 new_seg;
 		uint32 reused = 0;
 		bool selected = false;
@@ -1432,9 +1433,10 @@ claim_retry_locked:
 			pgstat_report_wait_end();
 			LWLockAcquire(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE);
 
-			/* A competing record claim may have installed the winner while
-			 * XCUR was in flight.  Recompute from its current segment. */
-			if (UndoRecordShared->active_segment_id != old_seg)
+			/* Compare the actual cursor, which can still be zero on a cold
+			 * claim even though old_seg names its on-disk candidate.  A changed
+			 * cursor requires recomputing from the installed winner. */
+			if (UndoRecordShared->active_segment_id != previous_active_segment)
 				goto claim_retry_locked;
 			if (cluster_undo_segment_read_state(new_seg, owner_instance) == (uint8)SEGMENT_ACTIVE)
 				goto claim_retry_locked;
@@ -1478,7 +1480,7 @@ claim_retry_locked:
 			}
 			PG_END_TRY();
 			LWLockAcquire(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE);
-			if (UndoRecordShared->active_segment_id != old_seg) {
+			if (UndoRecordShared->active_segment_id != previous_active_segment) {
 				LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 				LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 				return CLAIM_IO_FAIL;

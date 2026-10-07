@@ -30,6 +30,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_service_observe.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ko.h" /* cluster_ko_drain_inbound_and_apply (spec-5.7 D6) */
 #include "cluster/cluster_sinval.h"
@@ -61,26 +62,20 @@
 static ClusterNormalStopPollResult
 SinvalBcastNormalStopPoll(void)
 {
-	ClusterNormalStopPollResult sinval, ko;
-	const char *domain, *sinval_reason, *ko_reason;
-	uint64 key;
-	uint32 slot;
+	ClusterServiceObservation observation;
+	ClusterNormalStopPollResult result;
 
 	if (!cluster_normal_stop_requested())
 		return CLUSTER_NORMAL_STOP_READY;
-	sinval = cluster_sinval_normal_stop_poll(&domain, &key, &sinval_reason);
-	ko = cluster_ko_normal_stop_poll(&slot, &ko_reason);
-	if (sinval == CLUSTER_NORMAL_STOP_INVALID || ko == CLUSTER_NORMAL_STOP_INVALID) {
+	result = cluster_service_normal_stop_observe(&observation);
+	if (result == CLUSTER_NORMAL_STOP_INVALID) {
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
-		ereport(LOG, (errmsg("normal stop SI owner observation is invalid"),
-					  errdetail("sinval=%d domain=%s key=" UINT64_FORMAT
-								" reason=%s; ko=%d slot=%u reason=%s",
-								sinval, domain, key, sinval_reason, ko, slot, ko_reason)));
-		return CLUSTER_NORMAL_STOP_INVALID;
+		ereport(LOG,
+				(errmsg("normal stop SI owner observation is invalid"),
+				 errdetail("domain=%s key=" UINT64_FORMAT " slot=%d reason=%s", observation.domain,
+						   observation.key, observation.slot, observation.reason)));
 	}
-	return sinval == CLUSTER_NORMAL_STOP_READY && ko == CLUSTER_NORMAL_STOP_READY
-			   ? CLUSTER_NORMAL_STOP_READY
-			   : CLUSTER_NORMAL_STOP_PENDING;
+	return result;
 }
 
 static bool

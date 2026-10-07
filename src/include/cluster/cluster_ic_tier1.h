@@ -111,6 +111,7 @@ typedef struct ClusterICPeerStateShmem {
 	 * stream.  Written and read by the owning plane's process only.
 	 */
 	uint64 conn_epoch;
+	pg_atomic_uint64 resource_x_stream_generation;
 } ClusterICPeerStateShmem;
 
 /*
@@ -175,6 +176,22 @@ extern ClusterICPlane cluster_ic_tier1_my_plane(void);
 #define CLUSTER_IC_TIER1_DATA_CHANNELS 8
 extern void cluster_ic_tier1_set_my_data_channel(int channel, int n_workers);
 extern int cluster_ic_tier1_my_data_channel(void);
+/* Shared local lifetime observation, not a wire identity or authority. */
+extern uint64 cluster_ic_tier1_resource_x_stream_generation(int32 peer, int channel);
+
+/* Stack-only local lifetimes for a retained terminal-proof request. Every
+ * configured DATA channel is bound because the inquiry API has no block tag. */
+typedef struct ClusterICTerminalPeerSessions {
+	uint64 control_stream_generation;
+	uint64 data_stream_generation[CLUSTER_IC_TIER1_DATA_CHANNELS];
+	uint32 data_channels;
+} ClusterICTerminalPeerSessions;
+extern bool cluster_ic_tier1_terminal_peer_sessions(int32 peer, uint64 epoch,
+													uint32 control_capability_generation,
+													int data_channels,
+													ClusterICTerminalPeerSessions *out);
+
+
 extern int cluster_ic_tier1_my_n_workers(void);
 
 /* PGRAC: spec-7.2 D3 — dispatch plane-gate drop counter (per plane). */
@@ -386,6 +403,31 @@ extern int cluster_ic_tier1_get_listener_fd(void);
  * was bound).
  */
 extern int cluster_ic_tier1_get_peer_fd(int32 peer_id);
+
+/* Actual native byte-stream lifetime, private to the capturing process.
+ * Not serializable, transferable, a FIFO-prefix ACK or configuration/DATA
+ * permission. A future channel cut must separately retain its native owner,
+ * exact members and accepted-prefix evidence. No fd/clock/diagnostic counter
+ * substitutes for this serial. Exhaustion yields no stamp, never wraparound.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct ClusterICTier1Stream {
+	uint64 serial;
+	uint64 epoch;
+	int32 owner_pid;
+	int32 peer;
+	int32 plane;
+	int32 channel;
+} ClusterICTier1Stream;
+extern bool cluster_ic_tier1_stream_capture(int32 peer, ClusterICTier1Stream *out);
+extern bool cluster_ic_tier1_stream_current(const ClusterICTier1Stream *stream);
+
+/* Process-local completion owner, copied with the DATA tail/FIFO; no wire fields. */
+struct ResourceXIntentSlot;
+extern ClusterICSendResult
+cluster_ic_tier1_send_resource_x_intent(uint8 msg_type, int32 dest_node_id, const void *payload,
+										uint32 payload_len,
+										const struct ResourceXIntentSlot *intent);
 
 /*
  * Hardening v1.0.1 F3: listener metadata accessors -- read from shmem

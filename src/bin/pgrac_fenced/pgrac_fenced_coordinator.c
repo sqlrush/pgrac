@@ -9,6 +9,7 @@
 
 #include <poll.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "pgrac_fenced_coordinator.h"
@@ -51,6 +52,21 @@ rejoin_target_reserved(const PgracFencedCoordinatorV1 *coordinator,
 {
 	return coordinator != NULL && target_uuid != NULL &&
 		rejoin_target_slot(coordinator, target_uuid) >= 0;
+}
+
+static bool
+target_has_owned_work(const PgracFencedCoordinatorV1 *coordinator,
+					  const uint8 target_uuid[16])
+{
+	uint32 i;
+
+	for (i = 0; i < PGRAC_FENCED_MAX_OPERATIONS; i++)
+	{
+		if (coordinator->operations[i].owned_pending &&
+			memcmp(coordinator->operations[i].prepared.target.target_uuid, target_uuid, 16) == 0)
+			return true;
+	}
+	return false;
 }
 
 static void
@@ -104,15 +120,34 @@ static bool coordinator_start_ticket(
 	const PgracFencedScheduleTicketV1 *ticket);
 
 static bool
+coordinator_cancel_waiter(PgracFencedCoordinatorV1 *coordinator,
+						  PgracFencedCoordinatorClientV1 *client,
+						  uint32 reason, PgracExternalFenceProtocolResponseV1 *response)
+{
+	if (!coordinator->schedule.caller_independent)
+		return pgrac_fenced_operation_cancel_preaccepted(coordinator->context,
+			&client->request, &client->prepared, reason, response);
+	/* The caller owns only this connection, never the durable OFF operation. */
+	capacity_response(coordinator, &client->request, response);
+	response->deny_reason = reason;
+	if (reason == 11)
+		response->provider_result = PGRAC_FENCED_PROVIDER_UNKNOWN;
+	return true;
+}
+
+static bool
 coordinator_release_ticket(PgracFencedCoordinatorV1 *coordinator,
 				   const PgracFencedScheduleTicketV1 *ticket)
 {
 	PgracFencedScheduleTicketV1 started;
+	uint32 slot = ticket->slot;
 
 	if (!pgrac_fenced_schedule_release(&coordinator->schedule, ticket,
 			&started))
 		return false;
-	return started.serial == 0 || coordinator_start_ticket(coordinator,
+	memset(&coordinator->operations[slot], 0, sizeof(coordinator->operations[slot]));
+	coordinator->operations[slot].worker.fd = -1;
+	return coordinator->quiescing || started.serial == 0 || coordinator_start_ticket(coordinator,
 		&started);
 }
 
@@ -135,10 +170,59 @@ coordinator_release_empty_reserved_ticket(
 	if (!snapshot.active || snapshot.client_count != 0)
 		return true;
 	if (ticket->slot >= PGRAC_FENCED_MAX_OPERATIONS ||
+		coordinator->operations[ticket->slot].owned_pending ||
 		coordinator->operations[ticket->slot].worker_active)
 		return true;
 	return pgrac_fenced_schedule_release(&coordinator->schedule, ticket,
 		&started);
+}
+
+static bool
+owned_attempt_deadline(uint32 timeout_ms, uint64 *deadline)
+{
+	struct timespec now;
+	uint64 duration = (uint64) timeout_ms * UINT64_C(1000000);
+	uint64 stamp;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 || now.tv_sec < 0)
+		return false;
+	stamp = (uint64) now.tv_sec * UINT64_C(1000000000) + (uint64) now.tv_nsec;
+	if (stamp == 0 || UINT64_MAX - stamp < duration)
+		return false;
+	*deadline = stamp + duration;
+	return true;
+}
+
+static bool
+coordinator_start_owned(PgracFencedCoordinatorV1 *coordinator,
+						PgracFencedCoordinatorOperationV1 *operation,
+						const PgracFencedScheduleTicketV1 *ticket)
+{
+	PgracExternalFenceProtocolResponseV1 response;
+	PgracFencedScheduleSnapshotV1 snapshot;
+	PgracFencedJournalRecordV1 previous;
+	uint64 deadline;
+
+	if (operation->worker_active || !operation->owned_pending ||
+		operation->ticket.serial != ticket->serial ||
+		!pgrac_fenced_schedule_snapshot(&coordinator->schedule, ticket, &snapshot) ||
+		!snapshot.active || !owned_attempt_deadline(operation->request.timeout_ms, &deadline))
+		return false;
+	if (operation->retry_required)
+	{
+		previous = operation->worker.last_record.intent.kind == PGRAC_FENCED_JOURNAL_INTENT_ACQUIRE ?
+			operation->worker.last_record : operation->prepared.accepted_record;
+		if (pgrac_fenced_operation_resume_acquire(coordinator->context, &previous,
+				deadline, &operation->prepared, &response) != PGRAC_FENCED_OPERATION_READY)
+			return false;
+	}
+	if (!pgrac_fenced_async_start_preaccepted(coordinator->context,
+			&operation->request, &operation->prepared, deadline, &operation->worker))
+		return false;
+	operation->retry_required = false;
+	operation->worker_active = true;
+	return pgrac_fenced_schedule_set_state(&coordinator->schedule, ticket,
+		PGRAC_FENCED_STATE_RESOLVING);
 }
 
 static bool
@@ -151,6 +235,10 @@ coordinator_start_ticket(PgracFencedCoordinatorV1 *coordinator,
 	uint32 count;
 	int owner_id;
 
+	if (coordinator->schedule.caller_independent)
+		return ticket != NULL && ticket->serial != 0 &&
+			ticket->slot < PGRAC_FENCED_MAX_OPERATIONS &&
+			coordinator_start_owned(coordinator, &coordinator->operations[ticket->slot], ticket);
 	if (ticket == NULL || ticket->serial == 0 ||
 		ticket->slot >= PGRAC_FENCED_MAX_OPERATIONS ||
 		!pgrac_fenced_schedule_copy_clients(&coordinator->schedule, ticket,
@@ -186,7 +274,9 @@ pgrac_fenced_coordinator_init(PgracFencedCoordinatorV1 *coordinator,
 		return false;
 	memset(coordinator, 0, sizeof(*coordinator));
 	coordinator->context = context;
-	if (!pgrac_fenced_schedule_init(&coordinator->schedule))
+	if (!(context->config->format_version == 2 ?
+		pgrac_fenced_schedule_init_owned(&coordinator->schedule) :
+		pgrac_fenced_schedule_init(&coordinator->schedule)))
 		return false;
 	for (i = 0; i < PGRAC_FENCED_MAX_CLIENTS; i++)
 		coordinator->clients[i].fd = -1;
@@ -209,7 +299,7 @@ coordinator_submit_request(PgracFencedCoordinatorV1 *coordinator,
 
 	if (client->state != PGRAC_FENCED_COORDINATOR_CLIENT_INGRESS)
 		return false;
-	if (pgrac_fenced_schedule_operation_count(
+	if (!coordinator->schedule.caller_independent && pgrac_fenced_schedule_operation_count(
 			&coordinator->schedule) >= PGRAC_FENCED_MAX_OPERATIONS)
 	{
 		capacity_response(coordinator, &client->request, &response);
@@ -218,9 +308,11 @@ coordinator_submit_request(PgracFencedCoordinatorV1 *coordinator,
 		client_clear(coordinator, slot);
 		return true;
 	}
-	accepted = pgrac_fenced_operation_accept(coordinator->context,
-		&client->request,
-		operation_deadline, &prepared, &response);
+	accepted = coordinator->schedule.caller_independent ?
+		pgrac_fenced_operation_prepare(coordinator->context, &client->request,
+			operation_deadline, &prepared, &response) :
+		pgrac_fenced_operation_accept(coordinator->context, &client->request,
+			operation_deadline, &prepared, &response);
 	if (accepted == PGRAC_FENCED_OPERATION_ERROR)
 	{
 		client_clear(coordinator, slot);
@@ -235,8 +327,8 @@ coordinator_submit_request(PgracFencedCoordinatorV1 *coordinator,
 	}
 	if (rejoin_target_reserved(coordinator, prepared.target.target_uuid))
 	{
-		if (!pgrac_fenced_operation_cancel_preaccepted(coordinator->context,
-				&client->request, &prepared, 19, &response))
+		client->prepared = prepared;
+		if (!coordinator_cancel_waiter(coordinator, client, 19, &response))
 			return false;
 		(void) pgrac_fenced_session_send_response(client->fd, &response,
 			operation_deadline);
@@ -258,10 +350,93 @@ coordinator_submit_request(PgracFencedCoordinatorV1 *coordinator,
 	client->deadline_mono_ns = operation_deadline;
 	client->ticket = ticket;
 	client->prepared = prepared;
+	if (coordinator->schedule.caller_independent && scheduled != PGRAC_FENCED_SCHEDULE_JOIN)
+	{
+		PgracFencedCoordinatorOperationV1 *operation = &coordinator->operations[ticket.slot];
+
+		/* Allocation precedes durable acceptance; joiners add no obligation. */
+		memset(operation, 0, sizeof(*operation));
+		operation->worker.fd = -1;
+		operation->owner_client_id = -1;
+		operation->ticket = ticket;
+		operation->request = client->request;
+		if (pgrac_fenced_operation_accept(coordinator->context, &operation->request,
+				operation_deadline, &operation->prepared, &response) != PGRAC_FENCED_OPERATION_READY)
+			return false;
+		operation->owned_pending = true;
+	}
 	if (scheduled == PGRAC_FENCED_SCHEDULE_START &&
 		!coordinator_start_ticket(coordinator, &ticket))
 		return false;
 	return true;
+}
+
+bool
+pgrac_fenced_coordinator_restore(PgracFencedCoordinatorV1 *coordinator,
+	PgracFencedJournalReconcileState *pending)
+{
+	uint32 i;
+
+	if (coordinator == NULL || pending == NULL || coordinator->context == NULL ||
+		coordinator->client_count != 0 || coordinator->schedule.operation_count != 0 ||
+		!pgrac_fenced_operation_reconcile_startup(coordinator->context, pending))
+		return false;
+	for (;;)
+	{
+		PgracFencedJournalReconcileEntry *entry = NULL;
+		PgracFencedPreparedAcquireV1 prepared;
+		PgracExternalFenceProtocolResponseV1 response;
+		PgracFencedScheduleTicketV1 ticket;
+		PgracFencedCoordinatorOperationV1 *operation;
+		uint64 deadline;
+
+		for (i = 0; i < PGRAC_FENCED_JOURNAL_MAX_PENDING_OPERATIONS; i++)
+		{
+			PgracFencedJournalReconcileEntry *candidate = &pending->pending[i];
+
+			if (candidate->used && candidate->last_record.intent.kind == PGRAC_FENCED_JOURNAL_INTENT_ACQUIRE &&
+				(entry == NULL || candidate->first_seq < entry->first_seq))
+				entry = candidate;
+		}
+		if (entry == NULL)
+			return true;
+		if (!coordinator->schedule.caller_independent || entry->first_seq == 0 ||
+			!owned_attempt_deadline(entry->last_record.intent.request.acquire.timeout_ms, &deadline) ||
+			pgrac_fenced_operation_prepare(coordinator->context, &entry->last_record.intent.request.acquire,
+				deadline, &prepared, &response) != PGRAC_FENCED_OPERATION_READY ||
+			pgrac_fenced_schedule_submit(&coordinator->schedule, -1, prepared.target.target_uuid,
+				prepared.binding_digest, 0, &ticket) == PGRAC_FENCED_SCHEDULE_DENY)
+			return false;
+		operation = &coordinator->operations[ticket.slot];
+		operation->ticket = ticket;
+		operation->owner_client_id = -1;
+		operation->request = entry->last_record.intent.request.acquire;
+		operation->prepared = prepared;
+		operation->prepared.accepted_record = entry->last_record;
+		operation->owned_pending = true;
+		operation->retry_required = true;
+		/* Transfer inventory to the one queue; service starts only after restore. */
+		memset(entry, 0, sizeof(*entry));
+		pending->pending_count--;
+	}
+}
+
+bool
+pgrac_fenced_coordinator_prepare_mapping_reload(PgracFencedCoordinatorV1 *coordinator,
+	const PgracFencedConfigV1 *config, const PgracFencedProviderOpsV1 *provider,
+	const uint8 semantic_config_digest[PGRAC_FENCED_CONFIG_DIGEST_BYTES])
+{
+	uint32 i;
+
+	if (coordinator == NULL || coordinator->context == NULL)
+		return false;
+	for (i = 0; i < PGRAC_FENCED_MAX_OPERATIONS; i++)
+	{
+		if (coordinator->operations[i].owned_pending)
+			return false;
+	}
+	return pgrac_fenced_operation_prepare_mapping_reload(coordinator->context, config,
+		provider, semantic_config_digest);
 }
 
 bool
@@ -307,6 +482,76 @@ pgrac_fenced_coordinator_accept_fd(PgracFencedCoordinatorV1 *coordinator,
 	}
 	return coordinator_submit_request(coordinator, (uint32) slot,
 		operation_deadline);
+}
+
+static bool
+coordinator_send_owned_result(PgracFencedCoordinatorV1 *coordinator,
+							  PgracFencedCoordinatorOperationV1 *operation,
+							  const PgracExternalFenceProtocolResponseV1 *source)
+{
+	PgracFencedScheduledClientV1 scheduled[PGRAC_FENCED_MAX_CLIENTS];
+	PgracFencedScheduleTicketV1 ignored;
+	PgracExternalFenceProtocolResponseV1 response;
+	uint8 digest[32];
+	uint64 now;
+	uint32 count, i;
+
+	/* Async has already bound this proof to the parent's durable last record. */
+	if (source->verdict != 1 ||
+		!pgrac_external_fence_binding_digest_v1(&source->binding, digest) ||
+		memcmp(digest, operation->prepared.binding_digest, 32) != 0 ||
+		!owned_attempt_deadline(0, &now))
+		return false;
+	if (!pgrac_fenced_schedule_set_state(&coordinator->schedule, &operation->ticket,
+			PGRAC_FENCED_STATE_PROVEN_DURABLE) ||
+		!pgrac_fenced_schedule_copy_clients(&coordinator->schedule,
+			&operation->ticket, scheduled, lengthof(scheduled), &count))
+		return false;
+	operation->owned_pending = false;
+	for (i = 0; i < count; i++)
+	{
+		int id = scheduled[i].client_id;
+		PgracFencedCoordinatorClientV1 *client;
+		bool positive, sent;
+
+		if (id < 0 || id >= PGRAC_FENCED_MAX_CLIENTS)
+			return false;
+		client = &coordinator->clients[id];
+		if (client->state != PGRAC_FENCED_COORDINATOR_CLIENT_WAITING ||
+			client->ticket.serial != operation->ticket.serial ||
+			client->ticket.slot != operation->ticket.slot ||
+			memcmp(client->prepared.binding_digest, digest, 32) != 0)
+			return false;
+		positive = now < source->fresh_until_mono_ns && now < client->deadline_mono_ns &&
+			source->verified_mono_ns >= client->prepared.accepted_mono_ns &&
+			!rejoin_target_reserved(coordinator, operation->prepared.target.target_uuid);
+		if (positive)
+		{
+			response = *source;
+			memcpy(response.request_nonce, client->request.request_nonce, 16);
+			response.fresh_until_mono_ns = Min(response.fresh_until_mono_ns, client->deadline_mono_ns);
+		}
+		else if (!coordinator_cancel_waiter(coordinator, client, 19, &response))
+			return false;
+		sent = pgrac_fenced_session_send_response(client->fd, &response, client->deadline_mono_ns);
+		if (positive && sent)
+		{
+			client->state = PGRAC_FENCED_COORDINATOR_CLIENT_RETAINED;
+			client->response = response;
+		}
+		else
+		{
+			if (positive && !pgrac_fenced_operation_invalidate(coordinator->context, &response, 16))
+				return false;
+			if (!pgrac_fenced_schedule_cancel_client(&coordinator->schedule, id, &ignored))
+				return false;
+			client_clear(coordinator, (uint32) id);
+		}
+	}
+	if (!pgrac_fenced_schedule_copy_clients(&coordinator->schedule,
+			&operation->ticket, scheduled, lengthof(scheduled), &count))
+		return false;
+	return count != 0 || coordinator_release_ticket(coordinator, &operation->ticket);
 }
 
 static bool
@@ -448,6 +693,19 @@ coordinator_service_worker(PgracFencedCoordinatorV1 *coordinator,
 	}
 	if (event != PGRAC_FENCED_ASYNC_COMPLETE)
 		return true;
+	if (coordinator->schedule.caller_independent)
+	{
+		operation->worker_active = false;
+		if (response.verdict == 1)
+			return coordinator_send_owned_result(coordinator, operation, &response);
+		/* UNKNOWN is an attempt outcome, not the lifetime of owned work. */
+		if (response.verdict == 2 || response.deny_reason == 1 || response.deny_reason == 4 ||
+			response.deny_reason == 8 || response.deny_reason == 12 || response.deny_reason == 17 ||
+			response.provider_result == PGRAC_FENCED_PROVIDER_CONFIG_ERROR)
+			return false;
+		operation->retry_required = true;
+		return true;
+	}
 	completed = *operation;
 	memset(operation, 0, sizeof(*operation));
 	operation->worker.fd = -1;
@@ -521,18 +779,14 @@ coordinator_service_clients(PgracFencedCoordinatorV1 *coordinator,
 		{
 			if (now_mono_ns >= client->deadline_mono_ns)
 			{
-				if (!pgrac_fenced_operation_cancel_preaccepted(
-						coordinator->context, &client->request,
-						&client->prepared, 11, &response))
+				if (!coordinator_cancel_waiter(coordinator, client, 11, &response))
 					return false;
 				(void) pgrac_fenced_session_send_response(client->fd,
 					&response, now_mono_ns + UINT64_C(100000000));
 			}
 			else if (waiting_client_event(client->fd))
 			{
-				if (!pgrac_fenced_operation_cancel_preaccepted(
-						coordinator->context, &client->request,
-						&client->prepared, 16, &response))
+				if (!coordinator_cancel_waiter(coordinator, client, 16, &response))
 					return false;
 			}
 			else
@@ -547,6 +801,7 @@ coordinator_service_clients(PgracFencedCoordinatorV1 *coordinator,
 		if (pgrac_fenced_schedule_snapshot(&coordinator->schedule,
 				&client->ticket, &snapshot) && snapshot.active &&
 			snapshot.client_count == 0 &&
+			!coordinator->operations[client->ticket.slot].owned_pending &&
 			!coordinator->operations[client->ticket.slot].worker_active &&
 			!coordinator_release_ticket(coordinator, &client->ticket))
 			return false;
@@ -566,6 +821,12 @@ pgrac_fenced_coordinator_service(PgracFencedCoordinatorV1 *coordinator,
 		return false;
 	for (i = 0; i < PGRAC_FENCED_MAX_OPERATIONS; i++)
 	{
+		PgracFencedCoordinatorOperationV1 *operation = &coordinator->operations[i];
+
+		if (!coordinator->quiescing && operation->owned_pending && operation->retry_required &&
+			coordinator->schedule.operations[i].active && !operation->worker_active &&
+			!coordinator_start_ticket(coordinator, &operation->ticket))
+			return false;
 		if (!coordinator_service_worker(coordinator, i))
 			return false;
 	}
@@ -616,9 +877,7 @@ pgrac_fenced_coordinator_quiesce(PgracFencedCoordinatorV1 *coordinator,
 		}
 		else if (client->state == PGRAC_FENCED_COORDINATOR_CLIENT_WAITING)
 		{
-			if (!pgrac_fenced_operation_cancel_preaccepted(
-					coordinator->context, &client->request, &client->prepared,
-					deny_reason, &response))
+			if (!coordinator_cancel_waiter(coordinator, client, deny_reason, &response))
 				ok = false;
 			else
 				(void) pgrac_fenced_session_send_response(client->fd,
@@ -658,9 +917,7 @@ pgrac_fenced_coordinator_shutdown(PgracFencedCoordinatorV1 *coordinator,
 		}
 		else if (client->state == PGRAC_FENCED_COORDINATOR_CLIENT_WAITING)
 		{
-			if (!pgrac_fenced_operation_cancel_preaccepted(
-					coordinator->context, &client->request, &client->prepared,
-					deny_reason, &response))
+			if (!coordinator_cancel_waiter(coordinator, client, deny_reason, &response))
 				ok = false;
 			else
 				(void) pgrac_fenced_session_send_response(client->fd,
@@ -730,7 +987,7 @@ pgrac_fenced_coordinator_rejoin_acquire_target(
 			client_has_active_worker(coordinator, client))
 			active = true;
 	}
-	return active ? PGRAC_FENCED_REJOIN_TARGET_WAITING :
+	return active || target_has_owned_work(coordinator, target_uuid) ? PGRAC_FENCED_REJOIN_TARGET_WAITING :
 		PGRAC_FENCED_REJOIN_TARGET_READY;
 }
 
@@ -780,9 +1037,7 @@ pgrac_fenced_coordinator_rejoin_invalidate_target(
 			}
 			else
 			{
-				if (!pgrac_fenced_operation_cancel_preaccepted(
-						coordinator->context, &client->request,
-						&client->prepared, deny_reason, &response))
+				if (!coordinator_cancel_waiter(coordinator, client, deny_reason, &response))
 					return PGRAC_FENCED_REJOIN_TARGET_ERROR;
 				(void) pgrac_fenced_session_send_response(client->fd,
 					&response, client->deadline_mono_ns);
@@ -800,7 +1055,7 @@ pgrac_fenced_coordinator_rejoin_invalidate_target(
 		if (!changed)
 			break;
 	}
-	return active ? PGRAC_FENCED_REJOIN_TARGET_WAITING :
+	return active || target_has_owned_work(coordinator, target_uuid) ? PGRAC_FENCED_REJOIN_TARGET_WAITING :
 		PGRAC_FENCED_REJOIN_TARGET_READY;
 }
 

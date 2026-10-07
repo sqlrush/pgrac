@@ -104,6 +104,16 @@ typedef enum PcmLockTransition {
 	PCM_TRANS_S_TO_N_RELEASE = 8,	 /* local release */
 	PCM_TRANS_S_TO_X_CLEANOUT = 9	 /* AD-006 ITL cleanout */
 } PcmLockTransition;
+
+/* Shared X grants belong exclusively to Resource-X.  Existing read
+ * downgrades and holder departures remain legal on their original owners. */
+static inline bool
+cluster_pcm_legacy_transition_allowed(bool shared, PcmLockTransition transition)
+{
+	return !shared || transition == PCM_TRANS_N_TO_S || transition == PCM_TRANS_X_TO_S_DOWNGRADE
+		   || transition == PCM_TRANS_X_TO_N_DOWNGRADE || transition == PCM_TRANS_X_TO_N_RELEASE
+		   || transition == PCM_TRANS_S_TO_N_INVALIDATE || transition == PCM_TRANS_S_TO_N_RELEASE;
+}
 #define PCM_TRANSITION_COUNT 9
 
 /* Exact master-side apply verdict.  PENDING_X is distinct from a structural
@@ -307,6 +317,8 @@ extern bool cluster_pcm_rx_requester_wait_snapshot(const BufferTag *tag,
 	X(PCM_RX_RESERVATION_WAIT, "active_reservation_same_claim_wait_count")                         \
 	X(PCM_RX_RESERVATION_CONFLICT, "active_reservation_conflict_count")                            \
 	X(PCM_RX_RESERVATION_MALFORMED, "active_reservation_malformed_count")                          \
+	X(PCM_RX_POTENTIAL_LOSS, "request_potential_loss_count")                                       \
+	X(PCM_RX_RESEND, "request_resend_count")                                                       \
 	X(PCM_RX_DISPATCH, "head_transport_dispatch_count")                                            \
 	X(PCM_RX_FOLLOWER_DUPLICATE_ENQUEUE, "follower_duplicate_transport_enqueue_count")             \
 	X(PCM_RX_SEMANTIC_PROGRESS, "semantic_progress_count")                                         \
@@ -759,7 +771,8 @@ typedef enum ResourceXIntentResult {
 	RESOURCE_X_INTENT_STAGED = 1,
 	RESOURCE_X_INTENT_NOT_ADMITTED = 2,
 	RESOURCE_X_INTENT_HARD_REARMED = 3,
-	RESOURCE_X_INTENT_STALE = 4
+	RESOURCE_X_INTENT_STALE = 4,
+	RESOURCE_X_INTENT_NOT_DUE = 5
 } ResourceXIntentResult;
 
 typedef enum ResourceXIntentProbeResult {
@@ -770,7 +783,8 @@ typedef enum ResourceXIntentProbeResult {
 	RESOURCE_X_INTENT_PROBE_CORRUPT = 4,
 	/* Local work only: never encoded as a wire intent. */
 	RESOURCE_X_INTENT_PROBE_DELIVERY = 5,
-	RESOURCE_X_INTENT_PROBE_SOURCE_FINISH = 6
+	RESOURCE_X_INTENT_PROBE_SOURCE_FINISH = 6,
+	RESOURCE_X_INTENT_PROBE_SOURCE_SETTLEMENT = 7
 } ResourceXIntentProbeResult;
 
 typedef enum ResourceXIntentState {
@@ -786,7 +800,8 @@ typedef enum ResourceXIntentOwnerKind {
 	RESOURCE_X_INTENT_OWNER_HOLDER_STATUS = 3,
 	RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE = 4,
 	RESOURCE_X_INTENT_OWNER_REQUESTER_SETTLEMENT = 5,
-	RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE = 6
+	RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE = 6,
+	RESOURCE_X_INTENT_OWNER_REQUESTER_SEND = 7 /* Transport only; no authority. */
 } ResourceXIntentOwnerKind;
 
 /* This handle is meaningful only together with its resource-scoped owner
@@ -806,6 +821,8 @@ typedef struct ResourceXIntentSlot {
 	uint64 authority_generation;
 	uint64 first_armed_us;
 	uint64 last_attempt_us;
+	uint64 send_episode;
+	uint64 last_send_us;
 	uint32 destination_node;
 	uint16 payload_bytes;
 	uint8 kind;
@@ -815,8 +832,8 @@ typedef struct ResourceXIntentSlot {
 
 StaticAssertDecl(sizeof(ResourceXIntentBodyHandle) == 40,
 				 "ResourceXIntentBodyHandle layout must remain 40 bytes");
-StaticAssertDecl(sizeof(ResourceXIntentSlot) == 80,
-				 "ResourceXIntentSlot layout must remain 80 bytes");
+StaticAssertDecl(sizeof(ResourceXIntentSlot) == 96,
+				 "ResourceXIntentSlot local descriptor layout must remain 96 bytes");
 
 typedef enum ResourceXReclaimResult {
 	RESOURCE_X_RECLAIM_NONE = 1,
@@ -1697,6 +1714,11 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_target_evict_prepare_exa
 	ResourceXLocalOwnerHandle *handle_out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_target_evict_abort_exact(const ResourceXLocalOwnerHandle *handle);
+/* Consume only pre-reserved source references after local N and before the
+ * original RELEASE_X can be sent. The exact EVICTING owner remains live. */
+struct ResourceXTargetEvictionPlan;
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_target_evict_record_pi_exact(struct ResourceXTargetEvictionPlan *plan);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_target_evict_commit_exact(
 	const ResourceXDecodedFrame *release, int32 current_master_node, uint64 r4_record_generation,
 	uint64 cached_ownership_generation, const ResourceXLocalOwnerHandle *handle);
@@ -1772,17 +1794,25 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_round_note_x_t
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_block_to_n_exact(const ResourceXDecodedFrame *block,
 											 int32 authenticated_master_node);
+/* holder_first (D S09 R-A22): the X source's owned reference to the first own
+ * record since the page was clean, sampled with its copy (zero = none), or
+ * NULL when this call did not copy again (replay).  A new PENDING pair takes
+ * it (zeroing the caller's); otherwise the caller still owns it.  It is a
+ * process-local argument, never part of a frame or the wire. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_source_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
-	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope);
+	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope,
+	struct ClusterPageWalRefV1 *holder_first);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
 	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope,
-	const struct ClusterPcmOwnSnapshot *revoking, const ResourceXLocalOwnerHandle *owner);
+	const struct ClusterPcmOwnSnapshot *revoking, const ResourceXLocalOwnerHandle *owner,
+	struct ClusterPageWalRefV1 *holder_first);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
 	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope,
-	const struct ClusterPcmOwnSnapshot *revoking, const ResourceXLocalOwnerHandle *owner);
+	const struct ClusterPcmOwnSnapshot *revoking, const ResourceXLocalOwnerHandle *owner,
+	struct ClusterPageWalRefV1 *holder_first);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
 	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope,
@@ -1798,6 +1828,19 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_pair_publish_need
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_pair_publish_exact(
 	const ResourceXAssertion *assertion, uint64 assertion_sequence, int32 authenticated_master_node,
 	uint64 authenticated_master_session);
+/* Process-local observation of the immutable, unpublished source copy.
+ * No owned references, DATA durability or grant authority. The original
+ * source-finish owner must revalidate its REVOKING descriptor and exact
+ * bytes before using this, and must never reuse it for another episode. */
+typedef struct ResourceXSourceWalRetainedV1 {
+	ClusterPageWalBindingV1 latest;
+	ClusterPageWalBindingV1 first; /* zero when no first own record was handed over */
+	uint64 source_generation;
+	uint32 page_checksum;
+} ResourceXSourceWalRetainedV1;
+extern bool cluster_pcm_lock_resource_x_holder_pair_wal_retained_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node, uint64 source_generation,
+	ResourceXSourceWalRetainedV1 *out);
 /* Replay only a published, undrained immutable pair. Occupied physical slots
  * are validated and left untouched; an empty pair is rearmed atomically. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_pair_replay_exact(
@@ -1971,6 +2014,19 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_settlement_prepar
 	const ResourceXDecodedFrame *settlement, int32 authenticated_master_node,
 	ResourceXSourceSettlementPlan *plan_out,
 	ResourceXSourceSettlementCommitObservation *observation_out);
+/* Bounded receiver continuation; this is scheduling ownership, never authority. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_settlement_receive_begin_exact(
+	const ResourceXDecodedFrame *settlement, int32 master, uint32 peer_generation,
+	ResourceXSourceSettlementPlan *plan, ResourceXSourceSettlementCommitObservation *observation,
+	uint64 *claim);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_settlement_busy_exact(
+	const ResourceXDecodedFrame *busy, int32 source, int channel, uint64 stream_generation);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_settlement_receive_snapshot_exact(
+	const ResourceXAcquisitionRef *ref, ResourceXDecodedFrame *settlement, int32 *master,
+	uint32 *peer_generation);
+extern bool cluster_pcm_lock_resource_x_source_settlement_receive_end_exact(
+	const ResourceXAssertion *assertion, uint64 claim, const ResourceXDecodedFrame *ack);
+
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_settlement_commit_exact(
 	const ResourceXDecodedFrame *settlement, int32 authenticated_master_node,
 	const ResourceXSourceSettlementPlan *plan,
@@ -2038,17 +2094,33 @@ cluster_pcm_lock_resource_x_outbound_intent_not_admitted_exact(const ResourceXIn
 extern ResourceXIntentResult
 cluster_pcm_lock_resource_x_outbound_intent_stage_exact(const ResourceXIntentSlot *expected,
 														uint64 now_us);
+extern ResourceXIntentResult cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(
+	const ResourceXIntentSlot *expected, uint64 now_us, ResourceXIntentSlot *staged_out);
 extern ResourceXIntentResult
 cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(const ResourceXIntentSlot *expected,
 															 uint64 now_us);
 extern bool
 cluster_pcm_lock_resource_x_outbound_intent_complete_exact(const ResourceXIntentSlot *expected);
+extern ResourceXIntentResult
+cluster_pcm_lock_resource_x_requester_send_begin_exact(const ResourceXDecodedFrame *frame,
+													   int32 master, uint32 frame_count,
+													   uint64 now_us, ResourceXIntentSlot *out);
+extern bool
+cluster_pcm_lock_resource_x_requester_send_current_exact(const ResourceXIntentSlot *ticket);
+extern bool
+cluster_pcm_lock_resource_x_requester_send_complete_exact(const ResourceXIntentSlot *ticket,
+														  bool sent, uint64 now_us);
+
+extern bool
+cluster_pcm_lock_resource_x_outbound_transport_complete_exact(const ResourceXIntentSlot *expected,
+															  bool sent, uint64 now_us);
 extern ResourceXIntentProbeResult
 cluster_pcm_lock_resource_x_ready_intent_probe_exact(const BufferTag *tag, uint32 *owner_cursor,
 													 ResourceXIntentSlot *slot_out);
 extern ResourceXIntentProbeResult cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
 	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out, uint16 payload_capacity,
 	uint32 *examined_out);
+extern long cluster_pcm_lock_resource_x_outbound_wait_timeout(long idle_timeout_ms);
 extern ResourceXIntentProbeResult cluster_pcm_lock_resource_x_outbound_work_probe_exact(
 	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out, uint16 payload_capacity,
 	uint32 *examined_out, ResourceXAcquisitionRef *delivery_out);
@@ -2410,7 +2482,9 @@ extern bool cluster_pcm_lock_pi_watermark_retire_if_durable(BufferTag tag,
 															XLogRecPtr written_page_lsn);
 
 /* ============================================================
- * PGRAC: spec-6.12h D-h2 — PI-holder discard protocol (master side).
+ * PGRAC: spec-6.12h D-h2 — legacy PI-holder discard protocol (master side).
+ * These numeric retirement APIs refuse canonical shared mode. Its opaque
+ * page versions require qualified DATA completion, not SCN/LSN ordering.
  *
  *   cluster_pcm_pi_discard_covered:  the PURE coverage judge.  A durable
  *     write of the block's CURRENT copy proves every Past Image obsolete

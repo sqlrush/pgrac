@@ -15,12 +15,26 @@
 #include "postgres.h"
 #include "cluster/cluster_update_trace.h"
 #include "cluster/cluster_xnode_profile.h"
+#include "cluster/cluster_storage_quorum.h"
 
 /* Profiling-aware product objects can link without a diagnostic backend.
  * Dedicated trace tests override these defaults with the real collector. */
 bool cluster_update_trace_enabled __attribute__((weak)) = false;
 bool cluster_xnode_profile_enabled __attribute__((weak)) = false;
 ClusterXnodeProfileShared *ClusterXnodeProfileCtl __attribute__((weak)) = NULL;
+
+/* PageSetLSN reads the static shared-storage profile. Legacy standalone
+ * fixtures default to off; shared-profile tests supply their own value. */
+bool cluster_shared_config __attribute__((weak)) = false;
+int cluster_node_id __attribute__((weak)) = -1;
+
+/* Legacy fixtures run the native profile. A shared voting-I/O fixture must
+ * provide its actual eligibility boundary, never silently grant authority. */
+bool __attribute__((weak))
+cluster_storage_quorum_allows_node(int node_id pg_attribute_unused())
+{
+	abort();
+}
 
 void __attribute__((weak))
 cluster_update_trace_event_at(const ClusterUpdateTraceEvent *event pg_attribute_unused(),
@@ -75,6 +89,20 @@ errstart_cold(int elevel, const char *domain)
 
 int __attribute__((weak))
 errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	abort();
+}
+
+/* Native page helpers can report corruption. Standalone tests must provide
+ * an explicit boundary to exercise it, never turn it into a warning/pass. */
+int __attribute__((weak))
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	abort();
+}
+
+int __attribute__((weak))
+errcode(int sqlerrcode pg_attribute_unused())
 {
 	abort();
 }

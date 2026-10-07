@@ -66,8 +66,7 @@
  *	      CollisionDetectionState)
  *	    - 512-byte ClusterVotingSlot disk-resident layout (with
  *	      generation counter + CRC32C for torn-write detection)
- *	    - 448-byte ClusterQvotecShmem (128-byte lease state plus the
- *	      spec-5.15A §2.1A.4 320-byte local SPSC mailbox)
+ *	    - 448-byte lease/mailbox prefix plus a bounded prior-exit observation
  *	    - 7 lifecycle / dump key accessors (per F11)
  *	    - cluster_qvotec_in_quorum() backend hot-path helper
  *	    - cluster_freeze_writes_set / _thaw_writes_set / _currently_frozen
@@ -112,6 +111,7 @@
 #include "port/atomics.h"
 #include "storage/lwlock.h"
 
+#include "cluster/cluster_storage_quorum.h"
 #include "cluster/cluster_conf.h"				 /* CLUSTER_MAX_NODES */
 #include "cluster/cluster_semantic_activation.h" /* record types */
 
@@ -146,7 +146,11 @@
 /* spec-5.15A §2.1A.4 frozen local QVOTEC mailbox ABI. */
 #define CLUSTER_QVOTEC_SHMEM_PREFIX_BYTES 128
 #define CLUSTER_QVOTEC_MAILBOX_BYTES 320
-#define CLUSTER_QVOTEC_SHMEM_BYTES 448
+#define CLUSTER_QVOTEC_SHMEM_PRIOR_OFFSET 448
+#define CLUSTER_QVOTEC_SHMEM_STORAGE_OFFSET (448 + 8 + 16 + 512 * CLUSTER_MAX_VOTING_DISKS)
+#define CLUSTER_QVOTEC_SHMEM_BYTES                                                                 \
+	(CLUSTER_QVOTEC_SHMEM_STORAGE_OFFSET + CLUSTER_STORAGE_QUORUM_STATE_BYTES                      \
+	 + 4 * sizeof(pg_atomic_uint64))
 #define CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES 128
 #define CLUSTER_QVOTEC_BALLOT_BYTES 32
 #define CLUSTER_QVOTEC_CONFIGURED_DISK_MASK UINT8_C(0x7f)
@@ -361,6 +365,19 @@ typedef struct ClusterVotingSlot {
 	uint32 crc32c;
 } ClusterVotingSlot;
 
+/* PGRAC: actual pre-heartbeat observations, not restart permission. This
+ * volatile copy is bound to its observing boot; callers still need exact
+ * root/close, provider, formation and reservation qualification.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterQvotecPriorExitObservation {
+	uint64 observing_incarnation;
+	uint32 node_id;
+	uint32 n_disks;
+	ClusterVotingSlot slots[CLUSTER_MAX_VOTING_DISKS];
+} ClusterQvotecPriorExitObservation;
+StaticAssertDecl(sizeof(ClusterQvotecPriorExitObservation) == 16 + 512 * CLUSTER_MAX_VOTING_DISKS,
+				 "prior-exit observation has no uninitialized padding");
+
 #ifdef USE_PGRAC_CLUSTER
 StaticAssertDecl(sizeof(ClusterVotingSlot) == 512, "ClusterVotingSlot must be exactly 512 bytes");
 StaticAssertDecl(offsetof(ClusterVotingSlot, magic) == 0,
@@ -391,7 +408,7 @@ StaticAssertDecl(offsetof(ClusterVotingSlot, crc32c) == 508,
  *
  *	Mirrors cluster_epoch / cluster_diag / cluster_cssd pattern;
  *	registered from cluster_shmem.c (D9).  ClusterQvotecShmem layout
- *	is private to cluster_qvotec.c and exactly 448 bytes.
+ *	is private to cluster_qvotec.c; its original448-byte prefix stays fixed.
  * ---------- */
 extern Size cluster_qvotec_shmem_size(void);
 extern void cluster_qvotec_shmem_init(void);
@@ -419,6 +436,8 @@ typedef struct ClusterQvotecObservation {
 } ClusterQvotecObservation;
 
 extern void cluster_qvotec_observe(ClusterQvotecObservation *out);
+/* Passive bounded copy; never waits for the poll owner or reads a disk. */
+extern void cluster_qvotec_diagnostic_format(char *out, size_t size);
 
 /*
  * spec-5.15A §2.1A.4 local SPSC handoff.  LMON is the sole submit/poll-
@@ -501,6 +520,20 @@ extern bool cluster_qvotec_in_quorum(void);
 /* Shape A (crash-rejoin re-declare barrier): prior-incarnation self-slot
  * carried ALIVE at startup => this boot follows an UNCLEAN death. */
 extern bool cluster_qvotec_prior_unclean_death(void);
+/* All configured slots must prove the exact old incarnation was closed.
+ * Never infer this from !prior_unclean_death, a clock or new ALIVE slots.
+ * Refusal clears output; no input may alias that output. */
+extern bool cluster_qvotec_prior_exit_observe(uint32 node_id, uint64 prior_incarnation,
+											  uint64 observing_incarnation,
+											  ClusterQvotecPriorExitObservation *out);
+/* PGRAC (S9P2-05): every configured slot names exactly the old incarnation
+ * and its last heartbeat is older than max(min_dead_us, the write lease) at
+ * now_us.  Evidence for this node's own founder self-seal, never admission.
+ * Refusal clears output; no input may alias that output. */
+extern bool cluster_qvotec_prior_death_observe(uint32 node_id, uint64 prior_incarnation,
+											   uint64 observing_incarnation, uint64 now_us,
+											   uint64 min_dead_us,
+											   ClusterQvotecPriorExitObservation *out);
 
 
 /* ----------
@@ -525,6 +558,9 @@ extern bool cluster_writes_currently_frozen(void);
  * fork() under AuxProcType QvotecProcess (D7 — Step 3).
  * ---------- */
 extern void ClusterQvotecMain(void) pg_attribute_noreturn();
+
+/* Notify the current registered owner after publishing work; no authority. */
+extern void cluster_qvotec_wakeup(void);
 
 
 /* ----------

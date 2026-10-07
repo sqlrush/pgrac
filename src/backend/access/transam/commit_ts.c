@@ -28,6 +28,10 @@
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h" /* PGRAC: retained per-origin startup state */
+#include "cluster/cluster_native_startup.h"
+#endif
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
@@ -64,6 +68,11 @@ typedef struct CommitTimestampEntry
 
 #define COMMIT_TS_XACTS_PER_PAGE \
 	(BLCKSZ / SizeOfCommitTimestampEntry)
+
+#ifdef USE_PGRAC_CLUSTER
+StaticAssertDecl(COMMIT_TS_XACTS_PER_PAGE == CLUSTER_NATIVE_COMMIT_TS_PER_PAGE,
+				 "native commit timestamp inspection geometry");
+#endif
 
 #define TransactionIdToCTsPage(xid) \
 	((xid) / (TransactionId) COMMIT_TS_XACTS_PER_PAGE)
@@ -620,6 +629,13 @@ CompleteCommitTsInitialization(void)
 void
 CommitTsParameterChange(bool newvalue, bool oldvalue)
 {
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: historical enablement is unsupported, not a record to skip. */
+	if (cluster_shared_config && (newvalue || oldvalue))
+		ereport(FATAL, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared recovery cannot apply commit timestamp history"),
+						errdetail("PGRAC_FAMILY=SHARED_RECOVERY PGRAC_REASON=COMMIT_TS_UNSUPPORTED")));
+#endif
 	/*
 	 * If the commit_ts module is disabled in this server and we get word from
 	 * the primary server that it is enabled there, activate it so that we can
@@ -670,6 +686,15 @@ ActivateCommitTs(void)
 	 */
 	if (IsBootstrapProcessingMode())
 		return;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: optional native timestamps are not part of shared recovery.
+	 * Reject before touching SLRU state, including already active history. */
+	if (cluster_shared_config)
+		ereport(FATAL, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared configuration requires track_commit_timestamp=off"),
+						errdetail("PGRAC_FAMILY=SHARED_RECOVERY PGRAC_REASON=COMMIT_TS_UNSUPPORTED")));
+#endif
 
 	/* If we've done this already, there's nothing to do */
 	LWLockAcquire(CommitTsLock, LW_EXCLUSIVE);
@@ -760,6 +785,12 @@ DeactivateCommitTs(void)
 	ShmemVariableCache->newestCommitTsXid = InvalidTransactionId;
 
 	LWLockRelease(CommitTsLock);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: disabling answers does not retire retained recovery input. */
+	if (cluster_shared_config)
+		return;
+#endif
 
 	/*
 	 * Remove *all* files.  This is necessary so that there are no leftover
@@ -974,6 +1005,14 @@ void
 commit_ts_redo(XLogReaderState *record)
 {
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: off in the new configuration cannot erase historical obligations. */
+	if (cluster_shared_config)
+		ereport(FATAL, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared recovery cannot apply commit timestamp history"),
+						errdetail("PGRAC_FAMILY=SHARED_RECOVERY PGRAC_REASON=COMMIT_TS_UNSUPPORTED")));
+#endif
 
 	/* Backup blocks are not used in commit_ts records */
 	Assert(!XLogRecHasAnyBlockRefs(record));

@@ -120,6 +120,16 @@ UT_TEST(test_route_unknown_default_blocked)
 	UT_ASSERT_EQ((int)cluster_side_route_verdict(NULL), (int)CLUSTER_SIDE_ROUTE_VERDICT_BLOCKED);
 }
 
+UT_TEST(test_space_identity_routes_to_storage_not_page_or_noop)
+{
+	ClusterSideRouteRow row;
+
+	UT_ASSERT(cluster_side_route_lookup(RM_SMGR_ID,
+										XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE, &row));
+	UT_ASSERT_EQ(row.kind, CLUSTER_SIDE_ROUTE_STORAGE);
+	UT_ASSERT_EQ(cluster_side_route_verdict(&row), CLUSTER_SIDE_ROUTE_VERDICT_APPLY);
+}
+
 UT_TEST(test_route_verdict_pure_cold_online_agree)
 {
 	ClusterSideRouteRow row;
@@ -147,7 +157,7 @@ UT_TEST(test_route_consumes_the_exhaustive_manifest)
 	bool active;
 	size_t i;
 
-	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 138);
+	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 140);
 	for (i = 0; i < rf_opcode_route_manifest_count_v1(); i++) {
 		UT_ASSERT(rf_opcode_route_manifest_entry_v1(i, &route, &active));
 		UT_ASSERT(cluster_side_route_lookup(route.rmid, route.normalized_info, &side));
@@ -174,10 +184,11 @@ UT_TEST(test_route_consumes_the_exhaustive_manifest)
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(5);
 
 	UT_RUN(test_route_matrix_named_rows);
 	UT_RUN(test_route_unknown_default_blocked);
+	UT_RUN(test_space_identity_routes_to_storage_not_page_or_noop);
 	UT_RUN(test_route_verdict_pure_cold_online_agree);
 	UT_RUN(test_route_consumes_the_exhaustive_manifest);
 

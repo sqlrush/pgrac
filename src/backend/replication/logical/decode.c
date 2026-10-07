@@ -225,7 +225,9 @@ xact_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 				bool		two_phase = false;
 
 				xlrec = (xl_xact_commit *) XLogRecGetData(r);
-				ParseCommitRecord(XLogRecGetInfo(buf->record), xlrec, &parsed);
+				if (!ParseCommitRecord(XLogRecGetInfo(buf->record), xlrec,
+					XLogRecGetDataLen(buf->record), &parsed))
+					elog(ERROR, "logical decoding: invalid commit payload");
 
 				if (!TransactionIdIsValid(parsed.twophase_xid))
 					xid = XLogRecGetXid(r);

@@ -62,8 +62,8 @@ $node->start;
 # immediately like the phase-gated siblings).
 # ----------
 ok($node->poll_query_until('postgres',
-		q{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'undo cleaner'}),
-   'L1 undo cleaner aux process visible in pg_stat_activity (ServerLoop spawn)');
+		q{SELECT count(*) = 8 FROM pg_stat_activity WHERE backend_type = 'undo cleaner'}),
+   'L1 all eight undo cleaner workers are visible (ServerLoop spawn)');
 
 
 # ----------
@@ -111,7 +111,9 @@ my $sql_pid = $node->safe_psql('postgres',
 	q{SELECT value FROM pg_cluster_state
 	   WHERE category = 'undo_cleaner' AND key = 'undo_cleaner_pid'});
 my $live_pid = $node->safe_psql('postgres',
-	q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'undo cleaner'});
+	q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'undo cleaner'
+	   AND pid = (SELECT value::int FROM pg_cluster_state
+	              WHERE category = 'undo.cleaner.worker.0' AND key = 'pid')});
 is($sql_pid, $live_pid, 'L5 pg_cluster_state pid agrees with pg_stat_activity pid');
 
 
@@ -163,18 +165,19 @@ $node_b->append_conf('postgresql.conf', "restart_after_crash = on\n");
 $node_b->start;
 
 ok($node_b->poll_query_until('postgres',
-		q{SELECT count(*) = 1 FROM pg_stat_activity WHERE backend_type = 'undo cleaner'}),
-   'L9 cleaner up on crashloop node');
+		q{SELECT count(*) = 8 FROM pg_stat_activity WHERE backend_type = 'undo cleaner'}),
+   'L9 all eight cleaners are up on crashloop node');
 my $pid_initial = $node_b->safe_psql('postgres',
-	q{SELECT pid FROM pg_stat_activity WHERE backend_type = 'undo cleaner'});
-ok($pid_initial =~ /^\d+$/, 'L9 captured initial cleaner pid');
+	q{SELECT min(pid) FROM pg_stat_activity WHERE backend_type = 'undo cleaner'});
+ok($pid_initial =~ /^\d+$/ && $pid_initial > 1, 'L9 captured one live cleaner pid')
+	or BAIL_OUT('no valid cleaner process to crash');
 
 kill 'KILL', $pid_initial;
 
 # Crash recovery cycles the whole instance (aux crash => HandleChildCrash),
 # then ServerLoop respawns the cleaner with a fresh pid.
 ok($node_b->poll_query_until('postgres',
-		qq{SELECT count(*) = 1 FROM pg_stat_activity
+		qq{SELECT count(*) = 8 FROM pg_stat_activity
 		    WHERE backend_type = 'undo cleaner' AND pid <> $pid_initial}),
    'L9 cleaner respawned with a NEW pid after kill -9 + crash recovery');
 ok($node_b->poll_query_until('postgres',

@@ -16,7 +16,9 @@ static ClusterTTSlotShmem allocator_storage;
 static int lock_depth;
 static int modifier_enters;
 static int modifier_leaves;
+static bool modifier_refused;
 static int rollovers_on_enter;
+static bool first_recheck_pending;
 static bool cold_fixture;
 static bool cold_capacity_refused;
 static uint32 cold_successor;
@@ -87,12 +89,6 @@ cluster_tt_slot_recyclable(uint8 status pg_attribute_unused(), SCN commit_scn pg
 	return false; /* This fixture allocates only fresh FREE slots. */
 }
 
-int
-errhint(const char *fmt pg_attribute_unused(), ...)
-{
-	return 0;
-}
-
 ClusterJoinGateVerdict
 cluster_reconfig_self_join_gate_verdict(void)
 {
@@ -135,13 +131,28 @@ cluster_semantic_activation_modifier_enter(bool writable, ClusterSemanticAdmissi
 {
 	UT_ASSERT(writable);
 	modifier_enters++;
+	if (modifier_refused) {
+		memset(token, 0, sizeof(*token));
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+	}
+	first_recheck_pending = true;
+	*token = target_modifier_token();
+	return CLUSTER_SEMANTIC_ADMISSION_OK;
+}
+
+/* The allocator now runs under admission. Keep the interleaving at the
+ * first post-allocation check, before the actual durable publisher executes. */
+static void
+active_owner_first_recheck(void)
+{
+	if (!first_recheck_pending)
+		return;
+	first_recheck_pending = false;
 	if (rollovers_on_enter > 0) {
 		rollovers_on_enter--;
 		roll_current_once();
 	}
 	select_physical_fixture(cluster_tt_slot_current_segment(0));
-	*token = target_modifier_token();
-	return CLUSTER_SEMANTIC_ADMISSION_OK;
 }
 
 void
@@ -245,12 +256,15 @@ reset_active_owner(void)
 	memset(&allocator_storage, 0, sizeof(allocator_storage));
 	ClusterTTSlotShm = &allocator_storage;
 	lock_depth = modifier_enters = modifier_leaves = rollovers_on_enter = 0;
+	modifier_refused = false;
+	first_recheck_pending = false;
 	cold_fixture = cold_capacity_refused = false;
 	cold_selection_calls = 0;
 	cold_successor = 2;
 	memset(&cold_old_slot, 0, sizeof(cold_old_slot));
 	cluster_tt_slot_rollover(0, 1, NULL);
 	reset_current_write_mock();
+	g_modifier_recheck_hook = active_owner_first_recheck;
 	select_physical_fixture(1);
 }
 
@@ -343,6 +357,53 @@ UT_TEST(test_cold_full_pool_refuses_before_binding_or_bind_wal)
 	UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 0);
 	UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
 	UT_ASSERT_EQ(g_bind_emit_calls, 0);
+}
+
+UT_TEST(test_modifier_refusal_precedes_allocation_and_leaves_abort_without_effects)
+{
+	for (int cold = 0; cold < 2; cold++) {
+		ClusterCanonicalTxnBinding result;
+		ClusterTTSlotShmem before;
+		volatile bool caught = false;
+		volatile bool abort_failed = false;
+
+		reset_active_owner();
+		if (cold) {
+			memset(&allocator_storage, 0, sizeof(allocator_storage));
+			cold_fixture = true;
+		}
+		before = allocator_storage;
+		modifier_refused = true;
+		PG_TRY();
+		{
+			(void)cluster_tt_local_prepare_canonical_active(100, &result);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(last_ereport_errcode, ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS);
+		UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
+		UT_ASSERT_EQ(memcmp(&allocator_storage, &before, sizeof(before)), 0);
+		UT_ASSERT_EQ(cold_selection_calls, 0);
+		UT_ASSERT_EQ(g_bind_emit_calls, 0);
+		UT_ASSERT_EQ(g_ctrc_reserve_calls, 0);
+		UT_ASSERT_EQ(g_current_acquire_calls, 0);
+		UT_ASSERT_EQ(modifier_enters, 1);
+		UT_ASSERT_EQ(modifier_leaves, 0);
+		PG_TRY();
+		{
+			UT_ASSERT(!cluster_tt_local_preabort_durable_finish(100));
+		}
+		PG_CATCH();
+		{
+			abort_failed = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(!abort_failed);
+	}
 }
 
 UT_TEST(test_real_allocator_rolls_after_reserve_before_observation)
@@ -520,7 +581,8 @@ UT_TEST(test_real_local_postbind_error_stays_failed_without_reallocation)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
+	UT_RUN(test_modifier_refusal_precedes_allocation_and_leaves_abort_without_effects);
 	UT_RUN(test_cold_allocator_preserves_occupied_durable_base);
 	UT_RUN(test_cold_fresh_database_uses_same_publication_path);
 	UT_RUN(test_cold_full_pool_refuses_before_binding_or_bind_wal);

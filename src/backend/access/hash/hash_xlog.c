@@ -7,6 +7,8 @@
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * PGRAC MODIFICATIONS: honor qualified redo buffer initialization results.
+ *
  * IDENTIFICATION
  *	  src/backend/access/hash/hash_xlog.c
  *
@@ -34,10 +36,15 @@ hash_xlog_init_meta_page(XLogReaderState *record)
 	Buffer		metabuf;
 	ForkNumber	forknum;
 
-	xl_hash_init_meta_page *xlrec = (xl_hash_init_meta_page *) XLogRecGetData(record);
+	const xl_hash_init_meta_page *xlrec = (xl_hash_init_meta_page *) XLogRecGetData(record);
 
 	/* create the index' metapage */
-	metabuf = XLogInitBufferForRedo(record, 0);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &metabuf)
+		!= BLK_NEEDS_REDO) {
+		if (BufferIsValid(metabuf))
+			UnlockReleaseBuffer(metabuf);
+		return;
+	}
 	Assert(BufferIsValid(metabuf));
 	_hash_init_metabuffer(metabuf, xlrec->num_tuples, xlrec->procid,
 						  xlrec->ffactor, true);
@@ -70,33 +77,37 @@ hash_xlog_init_bitmap_page(XLogReaderState *record)
 	Buffer		metabuf;
 	Page		page;
 	HashMetaPage metap;
-	uint32		num_buckets;
 	ForkNumber	forknum;
 
-	xl_hash_init_bitmap_page *xlrec = (xl_hash_init_bitmap_page *) XLogRecGetData(record);
+	const xl_hash_init_bitmap_page *xlrec = (xl_hash_init_bitmap_page *) XLogRecGetData(record);
 
 	/*
 	 * Initialize bitmap page
 	 */
-	bitmapbuf = XLogInitBufferForRedo(record, 0);
-	_hash_initbitmapbuffer(bitmapbuf, xlrec->bmsize, true);
-	PageSetLSN(BufferGetPage(bitmapbuf), lsn);
-	MarkBufferDirty(bitmapbuf);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &bitmapbuf)
+		== BLK_NEEDS_REDO) {
+		_hash_initbitmapbuffer(bitmapbuf, xlrec->bmsize, true);
+		PageSetLSN(BufferGetPage(bitmapbuf), lsn);
+		MarkBufferDirty(bitmapbuf);
 
-	/*
-	 * Force the on-disk state of init forks to always be in sync with the
-	 * state in shared buffers.  See XLogReadBufferForRedoExtended.  We need
-	 * special handling for init forks as create index operations don't log a
-	 * full page image of the metapage.
-	 */
-	XLogRecGetBlockTag(record, 0, NULL, &forknum, NULL);
-	if (forknum == INIT_FORKNUM)
-		FlushOneBuffer(bitmapbuf);
-	UnlockReleaseBuffer(bitmapbuf);
+		/*
+		 * Force the on-disk state of init forks to always be in sync with the
+		 * state in shared buffers.  See XLogReadBufferForRedoExtended.  We need
+		 * special handling for init forks as create index operations don't log a
+		 * full page image of the metapage.
+		 */
+		XLogRecGetBlockTag(record, 0, NULL, &forknum, NULL);
+		if (forknum == INIT_FORKNUM)
+			FlushOneBuffer(bitmapbuf);
+	}
+	if (BufferIsValid(bitmapbuf))
+		UnlockReleaseBuffer(bitmapbuf);
 
 	/* add the new bitmap page to the metapage's list of bitmaps */
 	if (XLogReadBufferForRedo(record, 1, &metabuf) == BLK_NEEDS_REDO)
 	{
+		uint32		num_buckets;
+
 		/*
 		 * Note: in normal operation, we'd update the metapage while still
 		 * holding lock on the bitmap page.  But during replay it's not
@@ -176,7 +187,7 @@ static void
 hash_xlog_add_ovfl_page(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	xl_hash_add_ovfl_page *xlrec = (xl_hash_add_ovfl_page *) XLogRecGetData(record);
+	const xl_hash_add_ovfl_page *xlrec = (xl_hash_add_ovfl_page *) XLogRecGetData(record);
 	Buffer		leftbuf;
 	Buffer		ovflbuf;
 	Buffer		metabuf;
@@ -184,8 +195,6 @@ hash_xlog_add_ovfl_page(XLogReaderState *record)
 	BlockNumber rightblk;
 	BlockNumber newmapblk = InvalidBlockNumber;
 	Page		ovflpage;
-	HashPageOpaque ovflopaque;
-	uint32	   *num_bucket;
 	char	   *data;
 	Size		datalen PG_USED_FOR_ASSERTS_ONLY;
 	bool		new_bmpage = false;
@@ -193,21 +202,25 @@ hash_xlog_add_ovfl_page(XLogReaderState *record)
 	XLogRecGetBlockTag(record, 0, NULL, NULL, &rightblk);
 	XLogRecGetBlockTag(record, 1, NULL, NULL, &leftblk);
 
-	ovflbuf = XLogInitBufferForRedo(record, 0);
-	Assert(BufferIsValid(ovflbuf));
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &ovflbuf)
+		== BLK_NEEDS_REDO) {
+		HashPageOpaque ovflopaque;
+		const uint32 *num_bucket;
 
-	data = XLogRecGetBlockData(record, 0, &datalen);
-	num_bucket = (uint32 *) data;
-	Assert(datalen == sizeof(uint32));
-	_hash_initbuf(ovflbuf, InvalidBlockNumber, *num_bucket, LH_OVERFLOW_PAGE,
-				  true);
-	/* update backlink */
-	ovflpage = BufferGetPage(ovflbuf);
-	ovflopaque = HashPageGetOpaque(ovflpage);
-	ovflopaque->hasho_prevblkno = leftblk;
+		Assert(BufferIsValid(ovflbuf));
 
-	PageSetLSN(ovflpage, lsn);
-	MarkBufferDirty(ovflbuf);
+		data = XLogRecGetBlockData(record, 0, &datalen);
+		num_bucket = (uint32 *)data;
+		Assert(datalen == sizeof(uint32));
+		_hash_initbuf(ovflbuf, InvalidBlockNumber, *num_bucket, LH_OVERFLOW_PAGE, true);
+		/* update backlink */
+		ovflpage = BufferGetPage(ovflbuf);
+		ovflopaque = HashPageGetOpaque(ovflpage);
+		ovflopaque->hasho_prevblkno = leftblk;
+
+		PageSetLSN(ovflpage, lsn);
+		MarkBufferDirty(ovflbuf);
+	}
 
 	if (XLogReadBufferForRedo(record, 1, &leftbuf) == BLK_NEEDS_REDO)
 	{
@@ -224,7 +237,8 @@ hash_xlog_add_ovfl_page(XLogReaderState *record)
 
 	if (BufferIsValid(leftbuf))
 		UnlockReleaseBuffer(leftbuf);
-	UnlockReleaseBuffer(ovflbuf);
+	if (BufferIsValid(ovflbuf))
+		UnlockReleaseBuffer(ovflbuf);
 
 	/*
 	 * Note: in normal operation, we'd update the bitmap and meta page while
@@ -240,7 +254,7 @@ hash_xlog_add_ovfl_page(XLogReaderState *record)
 		{
 			Page		mappage = (Page) BufferGetPage(mapbuffer);
 			uint32	   *freep = NULL;
-			uint32	   *bitmap_page_bit;
+			const uint32	   *bitmap_page_bit;
 
 			freep = HashPageGetBitmap(mappage);
 
@@ -260,24 +274,26 @@ hash_xlog_add_ovfl_page(XLogReaderState *record)
 	{
 		Buffer		newmapbuf;
 
-		newmapbuf = XLogInitBufferForRedo(record, 3);
-
-		_hash_initbitmapbuffer(newmapbuf, xlrec->bmsize, true);
-
 		new_bmpage = true;
-		newmapblk = BufferGetBlockNumber(newmapbuf);
+		XLogRecGetBlockTag(record, 3, NULL, NULL, &newmapblk);
 
-		MarkBufferDirty(newmapbuf);
-		PageSetLSN(BufferGetPage(newmapbuf), lsn);
+		if (XLogReadBufferForRedoExtended(record, 3, RBM_ZERO_AND_LOCK, false, &newmapbuf)
+			== BLK_NEEDS_REDO) {
+			_hash_initbitmapbuffer(newmapbuf, xlrec->bmsize, true);
 
-		UnlockReleaseBuffer(newmapbuf);
+			MarkBufferDirty(newmapbuf);
+			PageSetLSN(BufferGetPage(newmapbuf), lsn);
+		}
+
+		if (BufferIsValid(newmapbuf))
+			UnlockReleaseBuffer(newmapbuf);
 	}
 
 	if (XLogReadBufferForRedo(record, 4, &metabuf) == BLK_NEEDS_REDO)
 	{
 		HashMetaPage metap;
 		Page		page;
-		uint32	   *firstfree_ovflpage;
+		const uint32	   *firstfree_ovflpage;
 
 		data = XLogRecGetBlockData(record, 4, &datalen);
 		firstfree_ovflpage = (uint32 *) data;
@@ -314,12 +330,11 @@ static void
 hash_xlog_split_allocate_page(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	xl_hash_split_allocate_page *xlrec = (xl_hash_split_allocate_page *) XLogRecGetData(record);
+	const xl_hash_split_allocate_page *xlrec = (xl_hash_split_allocate_page *) XLogRecGetData(record);
 	Buffer		oldbuf;
 	Buffer		newbuf;
 	Buffer		metabuf;
 	Size		datalen PG_USED_FOR_ASSERTS_ONLY;
-	char	   *data;
 	XLogRedoAction action;
 
 	/*
@@ -351,12 +366,12 @@ hash_xlog_split_allocate_page(XLogReaderState *record)
 	}
 
 	/* replay the record for new bucket */
-	XLogReadBufferForRedoExtended(record, 1, RBM_ZERO_AND_CLEANUP_LOCK, true,
-								  &newbuf);
-	_hash_initbuf(newbuf, xlrec->new_bucket, xlrec->new_bucket,
-				  xlrec->new_bucket_flag, true);
-	MarkBufferDirty(newbuf);
-	PageSetLSN(BufferGetPage(newbuf), lsn);
+	if (XLogReadBufferForRedoExtended(record, 1, RBM_ZERO_AND_CLEANUP_LOCK, true, &newbuf)
+		== BLK_NEEDS_REDO) {
+		_hash_initbuf(newbuf, xlrec->new_bucket, xlrec->new_bucket, xlrec->new_bucket_flag, true);
+		MarkBufferDirty(newbuf);
+		PageSetLSN(BufferGetPage(newbuf), lsn);
+	}
 
 	/*
 	 * We can release the lock on old bucket early as well but doing here to
@@ -379,6 +394,7 @@ hash_xlog_split_allocate_page(XLogReaderState *record)
 	{
 		Page		page;
 		HashMetaPage metap;
+		char	   *data;
 
 		page = BufferGetPage(metabuf);
 		metap = HashPageGetMeta(page);
@@ -389,7 +405,7 @@ hash_xlog_split_allocate_page(XLogReaderState *record)
 		if (xlrec->flags & XLH_SPLIT_META_UPDATE_MASKS)
 		{
 			uint32		lowmask;
-			uint32	   *highmask;
+			const uint32	   *highmask;
 
 			/* extract low and high masks. */
 			memcpy(&lowmask, data, sizeof(uint32));
@@ -405,7 +421,7 @@ hash_xlog_split_allocate_page(XLogReaderState *record)
 		if (xlrec->flags & XLH_SPLIT_META_UPDATE_SPLITPOINT)
 		{
 			uint32		ovflpoint;
-			uint32	   *ovflpages;
+			const uint32	   *ovflpages;
 
 			/* extract information of overflow pages. */
 			memcpy(&ovflpoint, data, sizeof(uint32));
@@ -739,7 +755,8 @@ hash_xlog_squeeze_page(XLogReaderState *record)
 		MarkBufferDirty(ovflbuf);
 	}
 	if (BufferIsValid(ovflbuf))
-		UnlockReleaseBuffer(ovflbuf);
+		if (BufferIsValid(ovflbuf))
+			UnlockReleaseBuffer(ovflbuf);
 
 	/* replay the record for page previous to the freed overflow page */
 	if (!xldata->is_prev_bucket_same_wrt &&

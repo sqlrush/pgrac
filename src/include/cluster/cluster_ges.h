@@ -325,13 +325,13 @@ typedef enum GesRequestOpcode {
 	 * dedicated opcode carries old_request_id in holder_request_id and
 	 * old_mode in current_mode so the master can run the strict inverse of
 	 * the convert (cluster_grd_entry_rollback_convert) — restore, not delete.
-	 * Reuses the 64B GesRequestPayload (per-opcode field semantics differ;
+	 * Reuses GesRequestPayload (per-opcode field semantics differ;
 	 * lockmode locates the upgraded slot).
 	 */
 	GES_REQ_OPCODE_CONVERT_ROLLBACK = 14,
 	/*
 	 * spec-5.5 D5 (Q11) — conditional (NOWAIT) acquire for try-locks
-	 * (pg_try_advisory_lock).  Same 64B GesRequestPayload + REQUEST field
+	 * (pg_try_advisory_lock).  Same GesRequestPayload + REQUEST field
 	 * semantics; the ONLY behavioural difference is at the master: a conflict
 	 * is rejected immediately with GES_REJECT_REASON_LOCK_CONFLICT and does
 	 * NOT enqueue a waiter or fan out a BAST (non-enqueuing conditional grant).
@@ -455,7 +455,7 @@ struct ClusterGrdHolderId;
  *     [ 8, 32)  holder_id       24 bytes   (ClusterGrdHolderId)
  *     [32, 48)  resid           16 bytes   (ClusterResId)
  *
- *   Total: 64 bytes (spec-5.3 D2 ABI bump from 56B — adds current_mode at
+ *   Total: 80 bytes (PRE2 group tail at 72; wait_seq at 64; current_mode at
  *   offset 56; spec-2.27 D2 / HC49 had bumped 48B->56B for the
  *   shard_master_generation dedup field).  Aligned to 8.
  *
@@ -516,11 +516,16 @@ typedef struct GesRequestPayload {
 	 * and the cross-node cancel echoes it for D5 ABA revalidate.  0 for
 	 * non-waiter opcodes. */
 	uint64 wait_seq;
+	uint32 lock_group_procno_plus_one; /* 0: independent; else PG group leader + 1 */
+	uint32 _group_pad0;				   /* must be zero */
 } GesRequestPayload;
 
-StaticAssertDecl(sizeof(GesRequestPayload) == 72,
-				 "GesRequestPayload wire ABI 72-byte lock (spec-5.3 D2 56->64; spec-5.8 D1c "
-				 "waiter_xid in tail pad; spec-5.8 D1e +8 wait_seq -> 72)");
+StaticAssertDecl(sizeof(GesRequestPayload) == 80,
+				 "GesRequestPayload wire ABI: 80 bytes, homogeneous PRE2 only");
+StaticAssertDecl(offsetof(GesRequestPayload, lock_group_procno_plus_one) == 72,
+				 "GES parallel lock group tail offset");
+
+extern uint32 cluster_ges_current_lock_group(const struct ClusterGrdHolderId *holder);
 
 /* Backend-local HW/relation REQUEST handoff.  Historical type name retained;
  * never a shared entry pointer, a new authority, or a wire payload. */
@@ -534,6 +539,52 @@ typedef struct ClusterGesHwGrant {
 	bool local_promoted;
 	bool consumed;
 } ClusterGesHwGrant;
+
+/* Process-owned reconstruction exchange, never a fresh lock grant. Keep the
+ * attempt alive until its holder is consumed or exactly retired. */
+typedef enum ClusterGesRedeclareResult {
+	CLUSTER_GES_REDECLARE_PENDING = 0,
+	CLUSTER_GES_REDECLARE_CONFIRMED,
+	CLUSTER_GES_REDECLARE_REJECTED,
+	CLUSTER_GES_REDECLARE_CUT_CHANGED,
+	CLUSTER_GES_REDECLARE_INVALID
+} ClusterGesRedeclareResult;
+
+typedef struct ClusterGesRedeclareAttempt {
+	GesReplyWaitKey key;
+	GesRequestPayload request;
+	int32 master;
+	uint64 master_generation;
+	TimestampTz next_send_at;
+	uint32 retry_ms;
+	uint32 reject_reason;
+	bool initialized;
+	bool wait_registered;
+	bool sent;
+	bool confirmed;
+	bool rejected;
+	bool invalid;
+} ClusterGesRedeclareAttempt;
+
+/* Ordinary acquisition uses the same local exchange bookkeeping, never
+ * the REDECLARE opcode/authority. Owned by a nonblocking CF caller. */
+typedef struct ClusterGesAcquireAttempt {
+	ClusterGesRedeclareAttempt exchange;
+} ClusterGesAcquireAttempt;
+
+typedef enum ClusterGesAcquireResult {
+	CLUSTER_GES_ACQUIRE_PENDING = 0,
+	CLUSTER_GES_ACQUIRE_GRANTED,
+	CLUSTER_GES_ACQUIRE_REJECTED,
+	CLUSTER_GES_ACQUIRE_CUT_CHANGED,
+	CLUSTER_GES_ACQUIRE_INVALID
+} ClusterGesAcquireResult;
+
+extern ClusterGesAcquireResult cluster_ges_cf_request_poll(ClusterGesAcquireAttempt *attempt,
+														   const struct ClusterResId *resid,
+														   uint32 mode,
+														   const struct ClusterGrdHolderId *holder,
+														   ClusterGesHwGrant *grant);
 
 /*
  * GES reply payload (variant on GES_REPLY msg_type=5).
@@ -581,9 +632,11 @@ StaticAssertDecl(sizeof(GesReplyPayload) == 52,
  *	  等 GES_REPLY(GRANT / REJECT)→ 返回 reject_reason(0=GRANT)。
  *	  timeout_ms 0 表示 dontwait(立即 ConditionalLock 语义)。
  *
- *	cluster_ges_send_release_and_wait():S6 normal release 调用,
- *	  send GES_RELEASE → bounded ACK wait(no retransmit;spec-2.23 BAST
- *	  配套补 retry/retransmit)。返回 0 = ACK OK,non-zero = timeout/error。
+ *	cluster_ges_send_release_and_wait(): S6 exact release. A local master
+ *	  executes the real release/drain; a remote master must return GRANT
+ *	  under the same epoch/route/readiness. Unknown routing cannot confirm.
+ *	  Existing retry/deadline policy is unchanged. ERROR drops only the
+ *	  reply waiter; the caller still owns the holder's cleanup obligation.
  *
  *	返回 0 即成功;非 0 = GesRejectReason 枚举(timeout / conflict /
  *	  deadlock_pending / cancel)。
@@ -620,6 +673,15 @@ extern bool cluster_ges_relation_grant_is_current(const ClusterGesHwGrant *grant
 												  const struct ClusterResId *resid,
 												  const struct ClusterGrdHolderId *holder,
 												  uint64 request_id, uint32 mode, bool dontwait);
+/* Canonical CF-S/X owns the same exact acquisition provenance through S5/S7. */
+extern uint32 cluster_ges_send_cf_request_and_wait(const struct ClusterResId *resid, uint32 mode,
+												   const struct ClusterGrdHolderId *holder,
+												   uint64 request_id, int timeout_ms,
+												   uint32 wait_event, ClusterGesHwGrant *grant);
+extern bool cluster_ges_cf_grant_is_current(const ClusterGesHwGrant *grant,
+											const struct ClusterResId *resid,
+											const struct ClusterGrdHolderId *holder,
+											uint64 request_id, uint32 mode);
 
 /*
  * spec-5.5 D5 — conditional (NOWAIT) acquire for try-locks.  Returns
@@ -652,7 +714,9 @@ extern uint32 cluster_ges_send_release_and_wait(const struct ClusterResId *resid
  * this node, drain + grant + WAKE queued waiters (mirror of the remote
  * GES_RELEASE handler);  release_and_drain removes the holder, so the caller
  * must NOT also call cluster_grd_release_holder_by_id on this path.  Returns
- * GES_REJECT_REASON_NONE only for an exact, stable local-master release.
+ * GES_REJECT_REASON_NONE only for an exact, stable local-master release or
+ * confirmed absence. An absent holder drains no waiters; unavailable authority
+ * is not absence. Recovery-only release also leaves ordinary waiters frozen.
  */
 extern uint32 cluster_ges_release_and_drain_local(const struct ClusterResId *resid,
 												  const struct ClusterGrdHolderId *holder);
@@ -664,6 +728,13 @@ extern uint32 cluster_ges_release_and_drain_local(const struct ClusterResId *res
 extern uint32 cluster_ges_send_redeclare_and_wait(const struct ClusterResId *resid, uint32 lockmode,
 												  const struct ClusterGrdHolderId *new_holder,
 												  uint64 request_id);
+
+/* One cooperative step, with no CV sleep and no replacement request identity.
+ * Zero-initialize once. PENDING/CUT_CHANGED never discharge ownership. Only
+ * CONFIRMED permits the caller to publish the supplied current holder. */
+extern ClusterGesRedeclareResult
+cluster_ges_redeclare_poll(ClusterGesRedeclareAttempt *attempt, const struct ClusterResId *resid,
+						   uint32 lockmode, const struct ClusterGrdHolderId *new_holder);
 
 /* spec-5.3 D2/D3 — send opcode-2 CONVERT (same-backend upgrade) to the
  * resource's master (local master goes through the in-process work queue,

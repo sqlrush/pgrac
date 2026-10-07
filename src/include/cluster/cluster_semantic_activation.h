@@ -24,11 +24,11 @@
 #define CLUSTER_SEMANTIC_R11_RESOURCE_X_SOURCE_AVAILABLE false
 #define CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES 512
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_MAGIC UINT32_C(0x314B4341)
-#define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_VERSION UINT16_C(1)
-#define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES 120
+#define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_VERSION UINT16_C(2)
+#define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES 152
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_TUPLE_BYTES 64
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY 256
-#define CLUSTER_SEMANTIC_ACTIVATION_ACK_TABLE_BYTES 16496
+#define CLUSTER_SEMANTIC_ACTIVATION_ACK_TABLE_BYTES 16528
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS UINT32_C(0x0071B000)
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID UINT32_C(1)
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE UINT32_C(2)
@@ -74,6 +74,8 @@ typedef struct ClusterSemanticActivationAckWireV1 {
 	uint64 boot_id;
 	uint64 admitted_incarnation;
 	uint32 capability_word;
+	/* Zero for ordinary activation; exact common CLEAN input/new boot binding. */
+	uint8 restart_binding[PG_SHA256_DIGEST_LENGTH];
 } ClusterSemanticActivationAckWireV1;
 
 typedef enum ClusterSemanticAdmissionSide {
@@ -352,6 +354,31 @@ extern bool cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_cen
 extern bool cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
 	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent, uint32 owner_instance,
 	uint32 segment_id, ClusterUndoBlock0ResolvedRoot *out);
+/* Stack-only evidence for one terminal inquiry. It grants no owner liveness,
+ * block/writer authority or visibility. Retain verbatim until current(). */
+#define CLUSTER_SEMANTIC_TERMINAL_DATA_CHANNELS 8
+typedef struct ClusterSemanticTerminalPeerSnapshot {
+	uint64 record_generation, formation_epoch, admission_publication_seq;
+	uint64 membership_cut_generation, ack_publication_seq, local_boot_incarnation;
+	uint64 peer_boot_id, peer_admitted_incarnation;
+	uint64 peer_control_generation, peer_capability_generation;
+	uint64 peer_control_stream_generation;
+	uint64 peer_data_generation[CLUSTER_SEMANTIC_TERMINAL_DATA_CHANNELS];
+	uint32 peer_data_channels;
+	int32 peer_node_id;
+	uint32 required_hello_caps;
+} ClusterSemanticTerminalPeerSnapshot;
+
+/* Caller holds the same entered R4 TARGET token across the original C1b
+ * request and current(). Capture failure clears out. Neither call publishes. */
+extern bool
+cluster_semantic_activation_terminal_peer_capture(const ClusterSemanticAdmissionToken *admission,
+												  int32 peer_node_id, uint32 required_hello_caps,
+												  ClusterSemanticTerminalPeerSnapshot *out);
+extern bool cluster_semantic_activation_terminal_peer_current(
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterSemanticTerminalPeerSnapshot *expected);
+
 extern bool cluster_semantic_activation_peer_open_matches(
 	const ClusterSemanticAdmissionToken *token, int32 authenticated_peer_node_id,
 	uint32 required_hello_caps, uint32 sampled_capability_generation);
@@ -447,6 +474,11 @@ extern bool cluster_semantic_activation_qvotec_complete_undo_root_descriptor_rea
 extern void cluster_semantic_activation_ack_handler(const ClusterICEnvelope *env,
 													const void *payload);
 extern void cluster_semantic_activation_lmon_tick(void);
+/* Original phase4 postmaster requester; bounded memory reads/mailbox work only.
+ * Never publishes admission. True requires actual PGSA/Resource-X OPEN and
+ * the original LMON's completed ROOT publication for the same live cut.
+ * Only the installed never-served writer may request first activation. */
+extern bool cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refusal);
 /* RF-ROOT P7 G3: the R4 cutover coordinator proof reads the ACK table's
  * COMPLETE state bound to the exact round identity (transition epoch,
  * prepare generation, the expected/observed member sets, the source/target

@@ -53,6 +53,7 @@
 #include "storage/latch.h"
 #include "storage/md.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "access/subtrans.h"
 #include "cluster/storage/cluster_smgr.h"
 #endif
 #include "utils/hsearch.h"
@@ -121,34 +122,24 @@ typedef struct SyncOps
  */
 static const SyncOps syncsw[] = {
 	/* magnetic disk */
-	[SYNC_HANDLER_MD] = {
-		.sync_syncfiletag = mdsyncfiletag,
-		.sync_unlinkfiletag = mdunlinkfiletag,
-		.sync_filetagmatches = mdfiletagmatches
-	},
+	[SYNC_HANDLER_MD] = { .sync_syncfiletag = mdsyncfiletag,
+						  .sync_unlinkfiletag = mdunlinkfiletag,
+						  .sync_filetagmatches = mdfiletagmatches },
 	/* pg_xact */
-	[SYNC_HANDLER_CLOG] = {
-		.sync_syncfiletag = clogsyncfiletag
-	},
+	[SYNC_HANDLER_CLOG] = { .sync_syncfiletag = clogsyncfiletag },
 	/* pg_commit_ts */
-	[SYNC_HANDLER_COMMIT_TS] = {
-		.sync_syncfiletag = committssyncfiletag
-	},
+	[SYNC_HANDLER_COMMIT_TS] = { .sync_syncfiletag = committssyncfiletag },
 	/* pg_multixact/offsets */
-	[SYNC_HANDLER_MULTIXACT_OFFSET] = {
-		.sync_syncfiletag = multixactoffsetssyncfiletag
-	},
+	[SYNC_HANDLER_MULTIXACT_OFFSET] = { .sync_syncfiletag = multixactoffsetssyncfiletag },
 	/* pg_multixact/members */
-	[SYNC_HANDLER_MULTIXACT_MEMBER] = {
-		.sync_syncfiletag = multixactmemberssyncfiletag
-	},
+	[SYNC_HANDLER_MULTIXACT_MEMBER] = { .sync_syncfiletag = multixactmemberssyncfiletag },
 #ifdef USE_PGRAC_CLUSTER
 	/* pgrac cluster shared-storage relation files */
-	[SYNC_HANDLER_CLUSTER_SHARED] = {
-		.sync_syncfiletag = cluster_smgr_syncfiletag,
-		.sync_unlinkfiletag = cluster_smgr_unlinkfiletag,
-		.sync_filetagmatches = cluster_smgr_filetagmatches
-	}
+	[SYNC_HANDLER_CLUSTER_SHARED] = { .sync_syncfiletag = cluster_smgr_syncfiletag,
+									  .sync_unlinkfiletag = cluster_smgr_unlinkfiletag,
+									  .sync_filetagmatches = cluster_smgr_filetagmatches },
+	/* PGRAC: shared-origin SUBTRANS survives a clean restart. Author: SqlRush. */
+	[SYNC_HANDLER_CLUSTER_SUBTRANS] = { .sync_syncfiletag = subtranssyncfiletag }
 #endif
 };
 

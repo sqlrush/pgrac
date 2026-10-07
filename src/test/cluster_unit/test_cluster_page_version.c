@@ -402,6 +402,26 @@ UT_TEST(test_classifier_remaining_rows_closed)
 	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_UNKNOWN);
 }
 
+UT_TEST(test_space_never_enters_generic_page_replay)
+{
+	ClusterPageClassifyInput in = ut_classify_input();
+
+	in.rmid = 9;
+	in.opcode = 0x20; /* Registered by the ordinary-page test. */
+	in.forknum = SPACE_FORKNUM;
+	UT_ASSERT_EQ(cluster_page_classify(&in), CLUSTER_PAGE_CLASS_UNKNOWN);
+	in.has_full_page_image = true;
+	UT_ASSERT_EQ(cluster_page_classify(&in), CLUSTER_PAGE_CLASS_UNKNOWN);
+	in.has_full_page_image = false;
+	in.header_owner = CLUSTER_PAGE_HEADER_OWNER_SIDE;
+	UT_ASSERT_EQ(cluster_page_classify(&in), CLUSTER_PAGE_CLASS_HEADER);
+	in.header_owner = CLUSTER_PAGE_HEADER_OWNER_ROOT;
+	UT_ASSERT_EQ(cluster_page_classify(&in), CLUSTER_PAGE_CLASS_UNKNOWN);
+	in.header_owner = CLUSTER_PAGE_HEADER_OWNER_SIDE;
+	in.relation_is_temp = true;
+	UT_ASSERT_EQ(cluster_page_classify(&in), CLUSTER_PAGE_CLASS_UNKNOWN);
+}
+
 UT_TEST(test_known_opcode_registry_fail_closed)
 {
 	uint8 rmid = 200;
@@ -421,7 +441,7 @@ UT_TEST(test_known_opcode_registry_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
 
 	UT_RUN(test_pu01_invalid_scn_normal_page_blocked);
 	UT_RUN(test_pu02_expected_before_exact_match_applies);
@@ -436,6 +456,7 @@ main(void)
 	UT_RUN(test_pu14_header_routes_to_typed_owner);
 	UT_RUN(test_pu17_will_init_without_rule_blocked);
 	UT_RUN(test_classifier_remaining_rows_closed);
+	UT_RUN(test_space_never_enters_generic_page_replay);
 	UT_RUN(test_known_opcode_registry_fail_closed);
 
 	UT_DONE();

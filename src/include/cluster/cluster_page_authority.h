@@ -57,6 +57,8 @@ typedef struct RfPageAuthorityBatchRequestV1 {
 	const ClusterControlRootReadToken *root_tokens;
 	uint32 participant_count;
 	uint32 flags;
+	/* When non-NULL, the legacy singular owner fields above must be NULL. */
+	const struct ClusterThreadRecoveryAuthorityV1 *source_authorities;
 } RfPageAuthorityBatchRequestV1;
 
 typedef struct RfPageAuthorityPreflightV1 RfPageAuthorityPreflightV1;

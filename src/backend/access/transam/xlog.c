@@ -104,6 +104,60 @@
  *	Why:
  *	  Cold crash recovery must be serialized cluster-wide under the
  *	  spec-5.6 rendezvous-forced concurrent boots (INV-D9-R).
+ *
+ * PGRAC MODIFICATIONS (S9P2-05 founder self-seal)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-s9p2-05-instance-and-cluster-recovery.md
+ *
+ *	What changed:
+ *	  - StartupXLOG(): with cluster.shared_config, a start whose own
+ *	    thread crashed (in production, shutting down or in crash
+ *	    recovery) first seals this node's crashed generation
+ *	    (ClusterStartupCrashSeal) instead of selecting a clean successor;
+ *	    every other start is unchanged.
+ *
+ *	Why:
+ *	  After every instance failed, the founder must recover its own
+ *	  previous generation like any other; its input is sealed on the
+ *	  self-seal evidence (newer admitted incarnation, old incarnation dead
+ *	  on the voting disks, exact restart input), never by guesswork.
+ *
+ * PGRAC MODIFICATIONS (S07 retention lower)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	Spec: spec-s9p2-03-shared-wal-and-checkpoint.md
+ *
+ *	What changed:
+ *	  - CreateCheckPoint(): after an online checkpoint's ROOT is published
+ *	    and before WAL cleanup, cluster_wal_retained_cut_after_checkpoint_v1
+ *	    may move the ROOT physical retention lower forward.
+ *	  - CreateCheckPoint(): before CheckPointGuts, an online checkpoint
+ *	    snapshots the buffers' first own records for that census
+ *	    (cluster_wal_retained_cut_before_sync_v1).
+ *
+ *	Why:
+ *	  The ROOT lower otherwise keeps every retained segment of the thread
+ *	  forever; cleanup can only use a lower that the complete retained
+ *	  input proves and that is already published.
+ *
+ * PGRAC MODIFICATIONS (shared native parameters)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *
+ *	What changed:
+ *	  - ClusterRequireRecordedParameters(): with cluster.shared_config, a
+ *	    parameter that differs from the value the shared control file
+ *	    recorded at creation is refused with FATAL naming each change.
+ *	    PostmasterMain calls it before any cluster startup work; StartupXLOG
+ *	    repeats it before its first durable write.
+ *	  - XLogReportParameters(): the same refusal keeps the UpdateControlFile
+ *	    PANIC unreachable.
+ *
+ *	Why:
+ *	  No typed purpose can update the shared control file after creation,
+ *	  and a start refused after writer selection would leave a new writer
+ *	  generation behind.
  */
 
 #include "postgres.h"
@@ -189,12 +243,16 @@
 #include "cluster/cluster_scn.h" /* PGRAC: xl_scn stamp (spec-4.5) */
 #include "cluster/cluster_wal_state.h" /* PGRAC: checkpoint redo / fpw sticky (spec-4.5) */
 #include "cluster/cluster_wal_retention.h" /* PGRAC: STOP-05 guarded WAL reuse */
+#include "cluster/cluster_wal_retained_cut.h" /* PGRAC: S07 retention lower */
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_initdb_base.h"
+#include "cluster/cluster_wal_writer.h" /* PGRAC: durable group-flush promise */
 #include "cluster/cluster_backup.h" /* PGRAC: spec-6.5 durable backup WAL pin */
 #include "cluster/cluster_tt_durable.h" /* PGRAC: spec-4.8 D1 crash-left ACTIVE resolution */
 #include "cluster/cluster_cf_authority.h" /* PGRAC: spec-5.6 shared pg_control authority write */
 #include "cluster/cluster_cf_stats.h" /* PGRAC: RF-B OWNER -> EOR phase */
 #include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-6.14 D9 amend recovery-claim release */
+#include "cluster/cluster_page_cold_redo.h"
 #include "cluster/cluster_relmap_arb.h" /* PGRAC: spec-6.14 D5 relmap pending arbitration */
 #include "cluster/cluster_cf_enqueue.h" /* PGRAC: spec-5.6 CF X write-permission gate */
 #include "cluster/cluster_cf_phase2.h" /* PGRAC: spec-5.6 T6 cross-node verify */
@@ -213,6 +271,14 @@
 #include "cluster/cluster_write_fence.h" /* PGRAC: RF-ROOT P6 checkpoint fence deferral */
 #include "cluster/cluster_lms.h" /* PGRAC: spec-5.6 GES-ready boundary for CF X */
 #include "cluster/cluster_recovery_duty.h" /* PGRAC: RF-ROOT P7 G1a canonical checkpoint advance */
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_external_fence.h"
+#include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_config_members.h"
+#include "cluster/cluster_pi_writeback.h" /* PGRAC: write-phase PI batch release */
+#include "../../cluster/cluster_control_root_private.h"
+#include "../../cluster/cluster_control_bootstrap_private.h"
 #endif
 
 extern uint32 bootstrap_data_checksum_version;
@@ -676,6 +742,15 @@ static WALInsertLockPadded *WALInsertLocks = NULL;
  */
 static ControlFileData *ControlFile = NULL;
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: process-local native initialization owner; never a serving grant.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterWalStartupImage clusterStartupWriter;
+static bool clusterStartupWriterSelected;
+static bool clusterStartupWriterBound;
+static bool clusterStartupWriterInstalled;
+#endif
+
 /*
  * Calculate the amount of space left on the page after 'endptr'. Beware
  * multiple evaluation!
@@ -762,7 +837,10 @@ static XLogRecPtr XLogGetReplicationSlotMinimumLSN(void);
 
 static void AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli,
 								  bool opportunistic);
-static void XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible);
+static bool XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible);
+#ifdef USE_PGRAC_CLUSTER
+static void ClusterWALWaitForWriter(TimeLineID tli, TimestampTz *wait_started);
+#endif
 static bool InstallXLogFileSegment(XLogSegNo *segno, char *tmppath,
 								   bool find_free, XLogSegNo max_segno,
 								   TimeLineID tli);
@@ -993,7 +1071,7 @@ XLogInsertRecord(XLogRecData *rdata,
 		 */
 		rechdr->xl_scn = (cluster_wal_thread_id() != XLP_THREAD_ID_LEGACY)
 			? (uint64) cluster_scn_current()
-			: 0;
+			: (uint64) cluster_scn_initdb_base_current();
 #endif
 
 		/*
@@ -1227,6 +1305,17 @@ ReserveXLogInsertLocation(int size, XLogRecPtr *StartPos, XLogRecPtr *EndPos,
 	*StartPos = XLogBytePosToRecPtr(startbytepos);
 	*EndPos = XLogBytePosToEndRecPtr(endbytepos);
 	*PrevPtr = XLogBytePosToRecPtr(prevbytepos);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: usable position zero normally maps to a long-page header,
+	 * not InvalidXLogRecPtr. Only the first record of this exact independent
+	 * initializer has no predecessor; subsequent and legacy links stay native.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config && MyBackendType == B_STARTUP && clusterStartupWriterBound
+		&& !clusterStartupWriterInstalled && prevbytepos == 0
+		&& *StartPos == clusterStartupWriter.first_segment_lsn + SizeOfXLogLongPHD)
+		*PrevPtr = InvalidXLogRecPtr;
+#endif
 
 	/*
 	 * Check that the conversions between "usable byte positions" and
@@ -1932,6 +2021,9 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 	XLogRecPtr	NewPageBeginPtr;
 	XLogPageHeader NewPage;
 	int			npages pg_attribute_unused() = 0;
+#ifdef USE_PGRAC_CLUSTER
+	TimestampTz publish_wait_started = 0;
+#endif
 
 	LWLockAcquire(WALBufMappingLock, LW_EXCLUSIVE);
 
@@ -1981,6 +2073,9 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 
 				WaitXLogInsertionsToFinish(OldPageRqstPtr);
 
+#ifdef USE_PGRAC_CLUSTER
+				ClusterWALWaitForWriter(tli, &publish_wait_started);
+#endif
 				LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
 
 				LogwrtResult = XLogCtl->LogwrtResult;
@@ -1995,7 +2090,12 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 					TRACE_POSTGRESQL_WAL_BUFFER_WRITE_DIRTY_START();
 					WriteRqst.Write = OldPageRqstPtr;
 					WriteRqst.Flush = 0;
-					XLogWrite(WriteRqst, tli, false);
+					if (!XLogWrite(WriteRqst, tli, false)) {
+#ifdef USE_PGRAC_CLUSTER
+						if (publish_wait_started == 0)
+							publish_wait_started = GetCurrentTimestamp();
+#endif
+					}
 					LWLockRelease(WALWriteLock);
 					PendingWalStats.wal_buffers_full++;
 					TRACE_POSTGRESQL_WAL_BUFFER_WRITE_DIRTY_DONE();
@@ -2237,6 +2337,49 @@ XLogCheckpointNeeded(XLogSegNo new_segno)
 	return false;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: only a healthy same-writer reconfiguration is waitable. This never
+ * authorizes I/O; XLogWrite rechecks before I/O and after fsync.
+ * Callers may already be in a native outer critical section (commit or WAL
+ * insertion), which cannot be unwound as a query ERROR. Do not hold the WAL
+ * write/mapping lock while QVOTEC catches up. The existing checkpoint's ten
+ * second hang envelope is retained across retries, not renewed by each race.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+ClusterWALWaitForWriter(TimeLineID tli, TimestampTz *wait_started)
+{
+	if (!cluster_enabled || !cluster_shared_config)
+		return;
+	Assert(!LWLockHeldByMeInMode(WALWriteLock, LW_EXCLUSIVE));
+	Assert(!LWLockHeldByMeInMode(WALBufMappingLock, LW_EXCLUSIVE));
+	for (;;) {
+		ClusterControlRootResult result = cluster_wal_writer_ready(tli);
+		TimestampTz now;
+
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
+			ereport(PANIC,
+					(errmsg("native WAL flush lost writer authority"),
+					 errdetail(
+						 "PGRAC_FAMILY=WAL_THREAD PGRAC_REASON=FLUSH_AUTHORITY_UNPROVEN result=%d",
+						 (int)result)));
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && *wait_started == 0)
+			return;
+		now = GetCurrentTimestamp();
+		if (*wait_started == 0)
+			*wait_started = now;
+		if (TimestampDifferenceExceeds(*wait_started, now, 10000))
+			ereport(PANIC, (errmsg("native WAL flush reconfiguration wait did not complete"),
+							errdetail("PGRAC_FAMILY=WAL_THREAD PGRAC_REASON=FLUSH_RECONFIG_HANG")));
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return;
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+						WAIT_EVENT_RECONFIG_FENCE_WAIT);
+		ResetLatch(MyLatch);
+	}
+}
+#endif
+
 /*
  * Write and/or fsync the log at least as far as WriteRqst indicates.
  *
@@ -2248,10 +2391,17 @@ XLogCheckpointNeeded(XLogSegNo new_segno)
  * Must be called with WALWriteLock held. WaitXLogInsertionsToFinish(WriteRqst)
  * must be called before grabbing the lock, to make sure the data is ready to
  * write.
+ *
+ * PGRAC: false means reconfiguration deferred completion. Written bytes may
+ * advance Write, but Flush stays at its independently proven old frontier.
  */
-static void
+static bool
 XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 {
+	bool completed = true;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterWalWriterToken writer;
+#endif
 	bool		ispartialpage;
 	bool		last_iteration;
 	bool		finishing_seg;
@@ -2267,6 +2417,21 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 	 * Update local LogwrtResult (caller probably did this already, but...)
 	 */
 	LogwrtResult = XLogCtl->LogwrtResult;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled && cluster_shared_config) {
+		ClusterControlRootResult result = cluster_wal_writer_begin(tli, &writer);
+
+		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
+			return false;
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			ereport(PANIC,
+					(errmsg("native WAL write lost writer authority"),
+					 errdetail(
+						 "PGRAC_FAMILY=WAL_THREAD PGRAC_REASON=FLUSH_AUTHORITY_UNPROVEN result=%d",
+						 (int)result)));
+	}
+#endif
 
 	/*
 	 * Since successive pages in the xlog cache are consecutively allocated,
@@ -2518,6 +2683,27 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 		LogwrtResult.Flush = LogwrtResult.Write;
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	/* Preserve the exact writer across device I/O. A healthy epoch race
+	 * defers completion to the caller after releasing the WAL locks.
+	 * Native Flush retains its physical byte position, including partial
+	 * records; recovery independently decodes complete records.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_enabled && cluster_shared_config &&
+		LogwrtResult.Flush > XLogCtl->LogwrtResult.Flush)
+	{
+		ClusterControlRootResult result = cluster_wal_writer_check(&writer);
+		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT) {
+			LogwrtResult.Flush = XLogCtl->LogwrtResult.Flush;
+			completed = false;
+		} else if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			ereport(PANIC,
+					(errmsg("native WAL flush lost writer authority"),
+					 errdetail("PGRAC_FAMILY=WAL_THREAD PGRAC_REASON=FLUSH_AUTHORITY_UNPROVEN result=%d",
+							   (int) result)));
+	}
+#endif
+
 	/*
 	 * Update shared-memory status
 	 *
@@ -2534,6 +2720,7 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 			XLogCtl->LogwrtRqst.Flush = LogwrtResult.Flush;
 		SpinLockRelease(&XLogCtl->info_lck);
 	}
+	return completed;
 }
 
 /*
@@ -2702,6 +2889,9 @@ XLogFlush(XLogRecPtr record)
 	XLogRecPtr	WriteRqstPtr;
 	XLogwrtRqst WriteRqst;
 	TimeLineID	insertTLI = XLogCtl->InsertTimeLineID;
+#ifdef USE_PGRAC_CLUSTER
+	TimestampTz publish_wait_started = 0;
+#endif
 
 	/*
 	 * During REDO, we are reading not writing WAL.  Therefore, instead of
@@ -2728,6 +2918,9 @@ XLogFlush(XLogRecPtr record)
 			 LSN_FORMAT_ARGS(LogwrtResult.Flush));
 #endif
 
+#ifdef USE_PGRAC_CLUSTER
+	ClusterWALWaitForWriter(insertTLI, &publish_wait_started);
+#endif
 	START_CRIT_SECTION();
 
 	/*
@@ -2760,6 +2953,9 @@ XLogFlush(XLogRecPtr record)
 		if (record <= LogwrtResult.Flush)
 			break;
 
+#ifdef USE_PGRAC_CLUSTER
+		ClusterWALWaitForWriter(insertTLI, &publish_wait_started);
+#endif
 		/*
 		 * Before actually performing the write, wait for all in-flight
 		 * insertions to the pages we're about to write to finish.
@@ -2822,7 +3018,14 @@ XLogFlush(XLogRecPtr record)
 		WriteRqst.Write = insertpos;
 		WriteRqst.Flush = insertpos;
 
-		XLogWrite(WriteRqst, insertTLI, false);
+		if (!XLogWrite(WriteRqst, insertTLI, false)) {
+			LWLockRelease(WALWriteLock);
+#ifdef USE_PGRAC_CLUSTER
+			if (publish_wait_started == 0)
+				publish_wait_started = GetCurrentTimestamp();
+#endif
+			continue;
+		}
 
 		LWLockRelease(WALWriteLock);
 		/* done */
@@ -2895,6 +3098,9 @@ XLogBackgroundFlush(void)
 	TimestampTz now;
 	int			flushbytes;
 	TimeLineID	insertTLI;
+#ifdef USE_PGRAC_CLUSTER
+	TimestampTz publish_wait_started = 0;
+#endif
 
 	/* XLOG doesn't need flushing during recovery */
 	if (RecoveryInProgress())
@@ -2987,20 +3193,28 @@ XLogBackgroundFlush(void)
 			 LSN_FORMAT_ARGS(LogwrtResult.Flush));
 #endif
 
-	START_CRIT_SECTION();
+	for (;;) {
+		bool completed = true;
 
-	/* now wait for any in-progress insertions to finish and get write lock */
-	WaitXLogInsertionsToFinish(WriteRqst.Write);
-	LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
-	LogwrtResult = XLogCtl->LogwrtResult;
-	if (WriteRqst.Write > LogwrtResult.Write ||
-		WriteRqst.Flush > LogwrtResult.Flush)
-	{
-		XLogWrite(WriteRqst, insertTLI, flexible);
+#ifdef USE_PGRAC_CLUSTER
+		ClusterWALWaitForWriter(insertTLI, &publish_wait_started);
+#endif
+		START_CRIT_SECTION();
+		/* now wait for in-progress insertions to finish and get write lock */
+		WaitXLogInsertionsToFinish(WriteRqst.Write);
+		LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
+		LogwrtResult = XLogCtl->LogwrtResult;
+		if (WriteRqst.Write > LogwrtResult.Write || WriteRqst.Flush > LogwrtResult.Flush)
+			completed = XLogWrite(WriteRqst, insertTLI, flexible);
+		LWLockRelease(WALWriteLock);
+		END_CRIT_SECTION();
+		if (completed)
+			break;
+#ifdef USE_PGRAC_CLUSTER
+		if (publish_wait_started == 0)
+			publish_wait_started = GetCurrentTimestamp();
+#endif
 	}
-	LWLockRelease(WALWriteLock);
-
-	END_CRIT_SECTION();
 
 	/* wake up walsenders now that we've released heavily contended locks */
 	WalSndWakeupProcessRequests(true, !RecoveryInProgress());
@@ -3732,6 +3946,13 @@ RemoveOldXlogFiles(XLogSegNo segno, XLogRecPtr lastredoptr, XLogRecPtr endptr,
 	XLogSegNo	endlogSegNo;
 	XLogSegNo	recycleSegNo;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* The bounded original creation has not published its first ROOT or
+	 * retention cut. Keep its own native initialization and typed base WAL. */
+	if (cluster_wal_thread_initdb_stamp() != 0)
+		return;
+#endif
+
 	/* Initialize info about where to try to recycle to */
 	XLByteToSeg(endptr, endlogSegNo, wal_segment_size);
 	recycleSegNo = XLOGfileslop(lastredoptr);
@@ -4432,6 +4653,7 @@ ValidateXLOGDirectoryStructure(void)
 {
 	char		path[MAXPGPATH];
 	struct stat stat_buf;
+	int status;
 
 	/* Check for pg_wal; if it doesn't exist, error out */
 	if (stat(XLOGDIR, &stat_buf) != 0 ||
@@ -4442,16 +4664,27 @@ ValidateXLOGDirectoryStructure(void)
 
 	/* Check for archive_status */
 	snprintf(path, MAXPGPATH, XLOGDIR "/archive_status");
-	if (stat(path, &stat_buf) == 0)
-	{
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: pg_wal still names the sealed predecessor at this point.
+	 * Missing or redirected children are not authority to repair that input.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config)
+		status = lstat(path, &stat_buf);
+	else
+#endif
+		status = stat(path, &stat_buf);
+	if (status == 0) {
 		/* Check for weird cases where it exists but isn't a directory */
 		if (!S_ISDIR(stat_buf.st_mode))
 			ereport(FATAL,
 					(errmsg("required WAL directory \"%s\" does not exist",
 							path)));
-	}
-	else
-	{
+	} else {
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_shared_config)
+			ereport(FATAL,
+					(errmsg("sealed WAL input directory \"%s\" is missing or unreadable", path)));
+#endif
 		ereport(LOG,
 				(errmsg("creating missing WAL directory \"%s\"", path)));
 		if (MakePGDirectory(path) < 0)
@@ -4626,43 +4859,22 @@ WriteControlFile(void)
 						XLOG_CONTROL_FILE)));
 }
 
-static void
-ReadControlFile(void)
+/*
+ * PGRAC: validate an already-selected native control image without I/O or
+ * changing ControlFile, WAL geometry or GUCs. Root/thread selection and startup
+ * admission are separate obligations; format compatibility is not authority.
+ * The native file reader uses the same checks below.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+void
+XLogValidateControlFile(const ControlFileData *control)
 {
-	pg_crc32c	crc;
-	int			fd;
-	static char wal_segsz_str[20];
-	int			r;
+	pg_crc32c crc;
+	int segment_size;
 
-	/*
-	 * Read data...
-	 */
-	fd = BasicOpenFile(XLOG_CONTROL_FILE,
-					   O_RDWR | PG_BINARY);
-	if (fd < 0)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not open file \"%s\": %m",
-						XLOG_CONTROL_FILE)));
-
-	pgstat_report_wait_start(WAIT_EVENT_CONTROL_FILE_READ);
-	r = read(fd, ControlFile, sizeof(ControlFileData));
-	if (r != sizeof(ControlFileData))
-	{
-		if (r < 0)
-			ereport(PANIC,
-					(errcode_for_file_access(),
-					 errmsg("could not read file \"%s\": %m",
-							XLOG_CONTROL_FILE)));
-		else
-			ereport(PANIC,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("could not read file \"%s\": read %d of %zu",
-							XLOG_CONTROL_FILE, r, sizeof(ControlFileData))));
-	}
-	pgstat_report_wait_end();
-
-	close(fd);
+	if (control == NULL)
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("control image is required")));
 
 	/*
 	 * Check for expected pg_control format version.  If this is wrong, the
@@ -4671,117 +4883,137 @@ ReadControlFile(void)
 	 * enlightening than complaining about wrong CRC.
 	 */
 
-	if (ControlFile->pg_control_version != PG_CONTROL_VERSION && ControlFile->pg_control_version % 65536 == 0 && ControlFile->pg_control_version / 65536 != 0)
-		ereport(FATAL,
-				(errmsg("database files are incompatible with server"),
-				 errdetail("The database cluster was initialized with PG_CONTROL_VERSION %d (0x%08x),"
-						   " but the server was compiled with PG_CONTROL_VERSION %d (0x%08x).",
-						   ControlFile->pg_control_version, ControlFile->pg_control_version,
-						   PG_CONTROL_VERSION, PG_CONTROL_VERSION),
-				 errhint("This could be a problem of mismatched byte ordering.  It looks like you need to initdb.")));
+	if (control->pg_control_version != PG_CONTROL_VERSION
+		&& control->pg_control_version % 65536 == 0 && control->pg_control_version / 65536 != 0)
+		ereport(
+			FATAL,
+			(errmsg("database files are incompatible with server"),
+			 errdetail("The database cluster was initialized with PG_CONTROL_VERSION %d (0x%08x),"
+					   " but the server was compiled with PG_CONTROL_VERSION %d (0x%08x).",
+					   control->pg_control_version, control->pg_control_version, PG_CONTROL_VERSION,
+					   PG_CONTROL_VERSION),
+			 errhint("This could be a problem of mismatched byte ordering.  It looks like you need "
+					 "to initdb.")));
 
-	if (ControlFile->pg_control_version != PG_CONTROL_VERSION)
-		ereport(FATAL,
-				(errmsg("database files are incompatible with server"),
-				 errdetail("The database cluster was initialized with PG_CONTROL_VERSION %d,"
-						   " but the server was compiled with PG_CONTROL_VERSION %d.",
-						   ControlFile->pg_control_version, PG_CONTROL_VERSION),
-				 errhint("It looks like you need to initdb.")));
+	if (control->pg_control_version != PG_CONTROL_VERSION)
+		ereport(FATAL, (errmsg("database files are incompatible with server"),
+						errdetail("The database cluster was initialized with PG_CONTROL_VERSION %d,"
+								  " but the server was compiled with PG_CONTROL_VERSION %d.",
+								  control->pg_control_version, PG_CONTROL_VERSION),
+						errhint("It looks like you need to initdb.")));
 
 	/* Now check the CRC. */
 	INIT_CRC32C(crc);
-	COMP_CRC32C(crc,
-				(char *) ControlFile,
-				offsetof(ControlFileData, crc));
+	COMP_CRC32C(crc, (const char *)control, offsetof(ControlFileData, crc));
 	FIN_CRC32C(crc);
 
-	if (!EQ_CRC32C(crc, ControlFile->crc))
+	if (!EQ_CRC32C(crc, control->crc))
 		ereport(FATAL,
 				(errmsg("incorrect checksum in control file")));
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: shared recovery needs a checksum-qualified DATA base.  Check
+	 * the selected image before any bootstrap/recovery writes; a compatibility
+	 * projection must not supply this prerequisite for a different ROOT.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	if (cluster_shared_config && control->data_checksum_version != PG_DATA_CHECKSUM_VERSION)
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cluster.shared_config requires data checksums"),
+				 errdetail("The selected control file has data checksum version %u; this server requires version %u.",
+						   control->data_checksum_version, PG_DATA_CHECKSUM_VERSION),
+				 errhint("Initialize a new data directory with initdb -k (--data-checksums), or with "
+						 "pgrac-init, which enables them by default. Preserve the original data directory.")));
+
+	/* PGRAC: no PRE1 physical import into the shared PRE2 format. Test only
+	 * after native version/CRC validation; a corrupt image is not an old one.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	if ((cluster_shared_config || cluster_shared_catalog)
+		&& control->catalog_version_no == 202609120)
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("PRE1 data directory is not supported by PRE2 shared mode"),
+				 errhint("Preserve the original directory. Initialize a new database with "
+						 "this version and reload the data; in-place migration is not supported.")));
+#endif
 
 	/*
 	 * Do compatibility checking immediately.  If the database isn't
 	 * compatible with the backend executable, we want to abort before we can
 	 * possibly do any damage.
 	 */
-	if (ControlFile->catalog_version_no != CATALOG_VERSION_NO)
-		ereport(FATAL,
-				(errmsg("database files are incompatible with server"),
-				 errdetail("The database cluster was initialized with CATALOG_VERSION_NO %d,"
-						   " but the server was compiled with CATALOG_VERSION_NO %d.",
-						   ControlFile->catalog_version_no, CATALOG_VERSION_NO),
-				 errhint("It looks like you need to initdb.")));
-	if (ControlFile->maxAlign != MAXIMUM_ALIGNOF)
-		ereport(FATAL,
-				(errmsg("database files are incompatible with server"),
-				 errdetail("The database cluster was initialized with MAXALIGN %d,"
-						   " but the server was compiled with MAXALIGN %d.",
-						   ControlFile->maxAlign, MAXIMUM_ALIGNOF),
-				 errhint("It looks like you need to initdb.")));
-	if (ControlFile->floatFormat != FLOATFORMAT_VALUE)
+	if (control->catalog_version_no != CATALOG_VERSION_NO)
+		ereport(FATAL, (errmsg("database files are incompatible with server"),
+						errdetail("The database cluster was initialized with CATALOG_VERSION_NO %d,"
+								  " but the server was compiled with CATALOG_VERSION_NO %d.",
+								  control->catalog_version_no, CATALOG_VERSION_NO),
+						errhint("It looks like you need to initdb.")));
+	if (control->maxAlign != MAXIMUM_ALIGNOF)
+		ereport(FATAL, (errmsg("database files are incompatible with server"),
+						errdetail("The database cluster was initialized with MAXALIGN %d,"
+								  " but the server was compiled with MAXALIGN %d.",
+								  control->maxAlign, MAXIMUM_ALIGNOF),
+						errhint("It looks like you need to initdb.")));
+	if (control->floatFormat != FLOATFORMAT_VALUE)
 		ereport(FATAL,
 				(errmsg("database files are incompatible with server"),
 				 errdetail("The database cluster appears to use a different floating-point number format than the server executable."),
 				 errhint("It looks like you need to initdb.")));
-	if (ControlFile->blcksz != BLCKSZ)
-		ereport(FATAL,
-				(errmsg("database files are incompatible with server"),
-				 errdetail("The database cluster was initialized with BLCKSZ %d,"
-						   " but the server was compiled with BLCKSZ %d.",
-						   ControlFile->blcksz, BLCKSZ),
-				 errhint("It looks like you need to recompile or initdb.")));
-	if (ControlFile->relseg_size != RELSEG_SIZE)
-		ereport(FATAL,
-				(errmsg("database files are incompatible with server"),
-				 errdetail("The database cluster was initialized with RELSEG_SIZE %d,"
-						   " but the server was compiled with RELSEG_SIZE %d.",
-						   ControlFile->relseg_size, RELSEG_SIZE),
-				 errhint("It looks like you need to recompile or initdb.")));
-	if (ControlFile->xlog_blcksz != XLOG_BLCKSZ)
-		ereport(FATAL,
-				(errmsg("database files are incompatible with server"),
-				 errdetail("The database cluster was initialized with XLOG_BLCKSZ %d,"
-						   " but the server was compiled with XLOG_BLCKSZ %d.",
-						   ControlFile->xlog_blcksz, XLOG_BLCKSZ),
-				 errhint("It looks like you need to recompile or initdb.")));
-	if (ControlFile->nameDataLen != NAMEDATALEN)
-		ereport(FATAL,
-				(errmsg("database files are incompatible with server"),
-				 errdetail("The database cluster was initialized with NAMEDATALEN %d,"
-						   " but the server was compiled with NAMEDATALEN %d.",
-						   ControlFile->nameDataLen, NAMEDATALEN),
-				 errhint("It looks like you need to recompile or initdb.")));
-	if (ControlFile->indexMaxKeys != INDEX_MAX_KEYS)
-		ereport(FATAL,
-				(errmsg("database files are incompatible with server"),
-				 errdetail("The database cluster was initialized with INDEX_MAX_KEYS %d,"
-						   " but the server was compiled with INDEX_MAX_KEYS %d.",
-						   ControlFile->indexMaxKeys, INDEX_MAX_KEYS),
-				 errhint("It looks like you need to recompile or initdb.")));
-	if (ControlFile->toast_max_chunk_size != TOAST_MAX_CHUNK_SIZE)
+	if (control->blcksz != BLCKSZ)
+		ereport(FATAL, (errmsg("database files are incompatible with server"),
+						errdetail("The database cluster was initialized with BLCKSZ %d,"
+								  " but the server was compiled with BLCKSZ %d.",
+								  control->blcksz, BLCKSZ),
+						errhint("It looks like you need to recompile or initdb.")));
+	if (control->relseg_size != RELSEG_SIZE)
+		ereport(FATAL, (errmsg("database files are incompatible with server"),
+						errdetail("The database cluster was initialized with RELSEG_SIZE %d,"
+								  " but the server was compiled with RELSEG_SIZE %d.",
+								  control->relseg_size, RELSEG_SIZE),
+						errhint("It looks like you need to recompile or initdb.")));
+	if (control->xlog_blcksz != XLOG_BLCKSZ)
+		ereport(FATAL, (errmsg("database files are incompatible with server"),
+						errdetail("The database cluster was initialized with XLOG_BLCKSZ %d,"
+								  " but the server was compiled with XLOG_BLCKSZ %d.",
+								  control->xlog_blcksz, XLOG_BLCKSZ),
+						errhint("It looks like you need to recompile or initdb.")));
+	if (control->nameDataLen != NAMEDATALEN)
+		ereport(FATAL, (errmsg("database files are incompatible with server"),
+						errdetail("The database cluster was initialized with NAMEDATALEN %d,"
+								  " but the server was compiled with NAMEDATALEN %d.",
+								  control->nameDataLen, NAMEDATALEN),
+						errhint("It looks like you need to recompile or initdb.")));
+	if (control->indexMaxKeys != INDEX_MAX_KEYS)
+		ereport(FATAL, (errmsg("database files are incompatible with server"),
+						errdetail("The database cluster was initialized with INDEX_MAX_KEYS %d,"
+								  " but the server was compiled with INDEX_MAX_KEYS %d.",
+								  control->indexMaxKeys, INDEX_MAX_KEYS),
+						errhint("It looks like you need to recompile or initdb.")));
+	if (control->toast_max_chunk_size != TOAST_MAX_CHUNK_SIZE)
 		ereport(FATAL,
 				(errmsg("database files are incompatible with server"),
 				 errdetail("The database cluster was initialized with TOAST_MAX_CHUNK_SIZE %d,"
 						   " but the server was compiled with TOAST_MAX_CHUNK_SIZE %d.",
-						   ControlFile->toast_max_chunk_size, (int) TOAST_MAX_CHUNK_SIZE),
+						   control->toast_max_chunk_size, (int)TOAST_MAX_CHUNK_SIZE),
 				 errhint("It looks like you need to recompile or initdb.")));
-	if (ControlFile->loblksize != LOBLKSIZE)
-		ereport(FATAL,
-				(errmsg("database files are incompatible with server"),
-				 errdetail("The database cluster was initialized with LOBLKSIZE %d,"
-						   " but the server was compiled with LOBLKSIZE %d.",
-						   ControlFile->loblksize, (int) LOBLKSIZE),
-				 errhint("It looks like you need to recompile or initdb.")));
+	if (control->loblksize != LOBLKSIZE)
+		ereport(FATAL, (errmsg("database files are incompatible with server"),
+						errdetail("The database cluster was initialized with LOBLKSIZE %d,"
+								  " but the server was compiled with LOBLKSIZE %d.",
+								  control->loblksize, (int)LOBLKSIZE),
+						errhint("It looks like you need to recompile or initdb.")));
 
 #ifdef USE_FLOAT8_BYVAL
-	if (ControlFile->float8ByVal != true)
+	if (control->float8ByVal != true)
 		ereport(FATAL,
 				(errmsg("database files are incompatible with server"),
 				 errdetail("The database cluster was initialized without USE_FLOAT8_BYVAL"
 						   " but the server was compiled with USE_FLOAT8_BYVAL."),
 				 errhint("It looks like you need to recompile or initdb.")));
 #else
-	if (ControlFile->float8ByVal != false)
+	if (control->float8ByVal != false)
 		ereport(FATAL,
 				(errmsg("database files are incompatible with server"),
 				 errdetail("The database cluster was initialized with USE_FLOAT8_BYVAL"
@@ -4789,26 +5021,43 @@ ReadControlFile(void)
 				 errhint("It looks like you need to recompile or initdb.")));
 #endif
 
-	wal_segment_size = ControlFile->xlog_seg_size;
+	segment_size = control->xlog_seg_size;
 
-	if (!IsValidWalSegSize(wal_segment_size))
+	if (!IsValidWalSegSize(segment_size))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg_plural("WAL segment size must be a power of two between 1 MB and 1 GB, but the control file specifies %d byte",
-									  "WAL segment size must be a power of two between 1 MB and 1 GB, but the control file specifies %d bytes",
-									  wal_segment_size,
-									  wal_segment_size)));
+						errmsg_plural("WAL segment size must be a power of two between 1 MB and 1 "
+									  "GB, but the control file specifies %d byte",
+									  "WAL segment size must be a power of two between 1 MB and 1 "
+									  "GB, but the control file specifies %d bytes",
+									  segment_size, segment_size)));
+}
+
+/* PGRAC: share native initialization without selecting a control file.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+SetControlFileWalSegmentSize(void)
+{
+	static char wal_segsz_str[20];
+
+	wal_segment_size = ControlFile->xlog_seg_size;
 
 	snprintf(wal_segsz_str, sizeof(wal_segsz_str), "%d", wal_segment_size);
 	SetConfigOption("wal_segment_size", wal_segsz_str, PGC_INTERNAL,
 					PGC_S_DYNAMIC_DEFAULT);
+}
+
+static void
+CompleteControlFileParameters(int elevel)
+{
 
 	/* check and update variables dependent on wal_segment_size */
 	if (ConvertToXSegs(min_wal_size_mb, wal_segment_size) < 2)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+		ereport(elevel, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("\"min_wal_size\" must be at least twice \"wal_segment_size\"")));
 
 	if (ConvertToXSegs(max_wal_size_mb, wal_segment_size) < 2)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+		ereport(elevel, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("\"max_wal_size\" must be at least twice \"wal_segment_size\"")));
 
 	UsableBytesInSegment =
@@ -4822,6 +5071,90 @@ ReadControlFile(void)
 					PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
 }
 
+/* PGRAC: root selection/qualification belongs to the caller. This pair only
+ * initializes process-local native state before shmem sizing. The intermediate
+ * state is not usable: configuration application must finish, or this process
+ * must exit. No compatibility file read/write or serving proof is involved.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool bootstrap_control_parameters_pending = false;
+
+static void
+CheckControlFileEarlyStartup(void)
+{
+	if (IsUnderPostmaster || IsBootstrapProcessingMode() ||
+		process_shared_preload_libraries_done)
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("native control initialization requires early startup")));
+}
+
+void
+XLogInstallBootstrapControlFile(const ControlFileData *control, bool reset)
+{
+	ControlFileData *selected;
+
+	CheckControlFileEarlyStartup();
+	if (bootstrap_control_parameters_pending || (!reset && ControlFile != NULL))
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("native control initialization is already in progress")));
+	XLogValidateControlFile(control);
+	if (control->data_checksum_version != 0 &&
+		control->data_checksum_version != PG_DATA_CHECKSUM_VERSION)
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("unsupported PRE2 data checksum version")));
+	selected = palloc(sizeof(*selected));
+	memcpy(selected, control, sizeof(*selected));
+	/* On reset the old pointer can refer to detached shared memory. */
+	ControlFile = selected;
+	bootstrap_control_parameters_pending = true;
+	SetControlFileWalSegmentSize();
+}
+
+void
+XLogCompleteBootstrapControlFile(void)
+{
+	CheckControlFileEarlyStartup();
+	if (!bootstrap_control_parameters_pending || ControlFile == NULL)
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("native selected control is not installed")));
+	CompleteControlFileParameters(FATAL);
+	bootstrap_control_parameters_pending = false;
+}
+
+static void
+ReadControlFile(void)
+{
+	int fd;
+	int r;
+
+	fd = BasicOpenFile(XLOG_CONTROL_FILE, O_RDWR | PG_BINARY);
+	if (fd < 0)
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not open file \"%s\": %m", XLOG_CONTROL_FILE)));
+
+	pgstat_report_wait_start(WAIT_EVENT_CONTROL_FILE_READ);
+	r = read(fd, ControlFile, sizeof(ControlFileData));
+	if (r != sizeof(ControlFileData)) {
+		if (r < 0)
+			ereport(PANIC, (errcode_for_file_access(),
+							errmsg("could not read file \"%s\": %m", XLOG_CONTROL_FILE)));
+		else
+			ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("could not read file \"%s\": read %d of %zu", XLOG_CONTROL_FILE,
+								   r, sizeof(ControlFileData))));
+	}
+	pgstat_report_wait_end();
+	close(fd);
+
+	XLogValidateControlFile(ControlFile);
+	SetControlFileWalSegmentSize();
+	CompleteControlFileParameters(ERROR);
+}
+
 /*
  * Utility wrapper to update the control file.  Note that the control
  * file gets flushed.
@@ -4830,6 +5163,12 @@ static void
 UpdateControlFile(void)
 {
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: neither native writes nor a legacy bring-up skip can complete
+	 * an unclassified root-v3 lifecycle/configuration publication. */
+	if (cluster_shared_config)
+		ereport(PANIC,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("root-v3 control update requires its native purpose adapter")));
 
 	/*
 	 * PGRAC: spec-5.6 Db3 + increment (ii).  In shared-authority mode the
@@ -5215,6 +5554,47 @@ show_in_hot_standby(void)
 void
 LocalProcessControlFile(bool reset)
 {
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: decide the control authority before reading a compatibility
+	 * projection. Runtime CF/GES is unavailable before shmem sizing. Only the
+	 * initial postmaster may prepare process-local state from the exact root;
+	 * the later startup/admission guard remains mandatory and unchanged.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	process_cluster_gucs();
+	if (cluster_shared_config || cluster_shared_catalog) {
+		PgracControlBinding binding;
+
+		/* PGRAC: PRE1 has no independent binding. Diagnose only that route;
+		 * a bound database must not read a stale/missing/FIFO compatibility
+		 * projection. Its selected root control is validated separately.
+		 * Invalid/unsafe bindings remain for the exact reader to refuse.
+		 * Author: SqlRush <sqlrush@gmail.com>
+		 */
+		if (pgrac_control_binding_read(DataDir, &binding) == PGRAC_CONTROL_BINDING_MISSING) {
+			ControlFileData *local;
+			bool crc_ok;
+
+			local = get_controlfile(DataDir, &crc_ok);
+			XLogValidateControlFile(local);
+			pfree(local);
+		}
+	}
+	if (cluster_shared_config) {
+		ClusterControlBootstrapPrepared prepared;
+
+		if (reset || !IsPostmasterEnvironment || IsUnderPostmaster || IsBootstrapProcessingMode()
+			|| process_shared_preload_libraries_done)
+			ereport(FATAL, (errmsg("PRE2 shared-control startup is not yet available"),
+							errhint("This entry requires its qualified root-bound startup path; "
+									"the local control projection is not an authority.")));
+		cluster_control_bootstrap_prepare(DataDir, cluster_shared_data_dir, cluster_wal_threads_dir,
+										  cluster_undo_tablespace_path, (uint32)cluster_node_id,
+										  false, &prepared);
+		return; /* Never replace root-selected control with the projection. */
+	}
+#endif
 	Assert(reset || ControlFile == NULL);
 	ControlFile = palloc(sizeof(ControlFileData));
 	ReadControlFile();
@@ -5421,10 +5801,19 @@ BootStrapXLOG(void)
 	 * determine the initialization time of the installation, which could
 	 * perhaps be useful sometimes.
 	 */
-	gettimeofday(&tv, NULL);
-	sysidentifier = ((uint64) tv.tv_sec) << 32;
-	sysidentifier |= ((uint64) tv.tv_usec) << 12;
-	sysidentifier |= getpid() & 0xFFF;
+	sysidentifier = 0;
+#ifdef USE_PGRAC_CLUSTER
+	/* A common identity is consumed only by this original bootstrap call,
+	 * before any control or WAL file exists.  It is never a control rewrite. */
+	sysidentifier = cluster_wal_thread_initdb_system_identifier();
+#endif
+	if (sysidentifier == 0)
+	{
+		gettimeofday(&tv, NULL);
+		sysidentifier = ((uint64) tv.tv_sec) << 32;
+		sysidentifier |= ((uint64) tv.tv_usec) << 12;
+		sysidentifier |= getpid() & 0xFFF;
+	}
 
 	/* page buffer must be aligned suitably for O_DIRECT */
 	buffer = (char *) palloc(XLOG_BLCKSZ + XLOG_BLCKSZ);
@@ -5471,12 +5860,15 @@ BootStrapXLOG(void)
 	page->xlp_tli = BootstrapTimeLineID;
 	page->xlp_pageaddr = wal_segment_size;
 	/*
-	 * PGRAC (spec-1.19): Stage 1 placeholder cluster fields.  initdb
-	 * runs this once; no critical section, no inject hook (Stage 1 only
-	 * AdvanceXLInsertBuffer's site fires the cluster-wal-page-init-
-	 * thread-id injection).  Mirrors AdvanceXLInsertBuffer write.
+	 * Ordinary initdb retains thread zero.  An original native writer stamps
+	 * its explicit thread from birth, consistently with subsequent pages in
+	 * AdvanceXLInsertBuffer.  This does not install an online writer identity.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	page->xlp_thread_id = cluster_wal_thread_initdb_stamp();
+#else
 	page->xlp_thread_id = XLP_THREAD_ID_LEGACY;
+#endif
 	page->xlp_cluster_flags = XLP_CLUSTER_FLAGS_RESERVED;
 	longpage = (XLogLongPageHeader) page;
 	longpage->xlp_sysid = sysidentifier;
@@ -5786,6 +6178,287 @@ CheckRequiredParameterValues(void)
 	}
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: wait outside native WAL/CF critical sections for the original LMON
+ * to compare actual static parent values. An object merely being published
+ * proves neither application nor compatibility. No age can grant admission.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+ClusterStartupConfigurationRequire(void)
+{
+	ClusterFormationWitnessResult last_proof = CLUSTER_FORMATION_WITNESS_READY;
+
+	for (;;) {
+		ClusterConfigMountResult result;
+		ClusterFormationWitnessResult proof;
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		ResetLatch(MyLatch);
+		/* The finite phase-3 witness may expire before configuration or native
+		 * writer installation finishes. Renew it here under the actual startup
+		 * owner, outside CF/WAL critical sections; LMON performs no disk read. */
+		proof = cluster_authority_startup_refresh_recovery(100);
+		if (proof != last_proof) {
+			ereport(LOG, (errmsg("native startup control proof changed"),
+						 errdetail("PGRAC_FAMILY=STARTUP_CONTROL operation=config_mount "
+								   "witness_result=%d readiness=%d", (int)proof,
+								   (int)cluster_authority_readiness_get())));
+			last_proof = proof;
+		}
+		result = proof == CLUSTER_FORMATION_WITNESS_READY
+					 ? cluster_config_members_mount_status() : CLUSTER_CONFIG_MOUNT_UNPROVEN;
+		if (result == CLUSTER_CONFIG_MOUNT_MATCH)
+			return;
+		if (result == CLUSTER_CONFIG_MOUNT_MISMATCH)
+			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("shared configuration is incompatible with mounted members"),
+							errdetail("PGRAC_REASON=CONFIG_COMMON_MISMATCH")));
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+						WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+	}
+}
+
+/* PGRAC: select durable initialization ownership before native side effects.
+ * This does not switch pg_wal: old input must remain readable until native
+ * recovery has finished. No SQL admission is granted by either step.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+ClusterStartupWriterSelect(void)
+{
+	ClusterWalSourceRef restart;
+	ClusterWalStartupImage selected;
+	ClusterControlRootResult result;
+
+	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || clusterStartupWriterSelected
+		|| clusterStartupWriterBound || clusterStartupWriterInstalled || CritSectionCount != 0
+		|| ShutdownRequestPending || InRecovery || ArchiveRecoveryRequested
+		|| ControlFile->state != DB_SHUTDOWNED || LWLockHeldByMe(ControlFileLock)
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| !cluster_wal_thread_restart_v2_ref(&restart))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native clean startup has no exact immutable input")));
+	for (;;) {
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		ClusterStartupConfigurationRequire();
+		result = cluster_control_root_v3_startup_advance_clean(&restart, &selected);
+		if (result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+			&& result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+			&& result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
+			break;
+		/* The original attempt dropped CF/WALR. Lock contention or a
+		 * pending collective exit witness grants no side effects. A missing
+		 * peer target is not permission to reduce the startup cohort. */
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+						WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+		ResetLatch(MyLatch);
+	}
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		ereport(
+			FATAL,
+			(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+			 errmsg("could not select the native successor initialization"),
+			 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_COHORT_UNPROVEN result=%d",
+					   (int)result)));
+	if (selected.phase != CLUSTER_WAL_STARTUP_INITIALIZING
+		|| (selected.input_kind != CLUSTER_WAL_STARTUP_CLEAN
+			&& selected.input_kind != CLUSTER_WAL_STARTUP_INITIALIZED)
+		|| selected.segment_size != wal_segment_size || !IsValidWalSegSize(wal_segment_size)
+		|| selected.first_segment_lsn == 0 || selected.first_segment_lsn % wal_segment_size != 0
+		|| selected.first_segment_lsn < selected.sealed_input_end
+		|| selected.first_segment_lsn > UINT64_MAX - wal_segment_size
+		|| selected.sealed_input_end != selected.input_record_end
+		|| selected.timeline != selected.input_timeline
+		|| ControlFile->checkPoint != selected.predecessor.snapshot.tail_last_record_lsn
+		|| selected.predecessor.snapshot.checkpoint_lower_lsn == InvalidXLogRecPtr
+		|| selected.predecessor.snapshot.checkpoint_lower_lsn > ControlFile->checkPoint
+		|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native startup contradicts its selected clean input")));
+	clusterStartupWriter = selected;
+	clusterStartupWriterSelected = true;
+}
+
+/* PGRAC: semantic normal-start must consume the original CLEAN selection,
+ * before native WAL binding, instead of guessing from an old OPEN record.
+ * Reuse the ROOT owner's exact selected-operation/formation/fence checks;
+ * this observation creates no writer or serving authority.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterControlRootResult
+cluster_wal_startup_clean_input_v1(ClusterWalStartupCleanInputV1 *out)
+{
+	ClusterWalStartupImage observed;
+	ClusterWalStartupCleanInputV1 image = { 0 };
+	ClusterControlRootResult result;
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || !clusterStartupWriterSelected
+		|| clusterStartupWriterBound || clusterStartupWriterInstalled || CritSectionCount != 0
+		|| ShutdownRequestPending || InRecovery || ArchiveRecoveryRequested
+		|| ControlFile->state != DB_SHUTDOWNED || LWLockHeldByMe(ControlFileLock)
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| clusterStartupWriter.input_kind != CLUSTER_WAL_STARTUP_CLEAN
+		|| clusterStartupWriter.phase != CLUSTER_WAL_STARTUP_INITIALIZING)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = cluster_control_root_v3_startup_read_writer(
+		&clusterStartupWriter.claim.identity, clusterStartupWriter.operation_uuid, &observed);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(&observed, &clusterStartupWriter, sizeof(observed)) != 0
+		|| ControlFile->checkPoint != observed.input_record_start
+		|| ControlFile->checkPointCopy.ThisTimeLineID != observed.input_timeline)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	image.predecessor = observed.predecessor.snapshot.identity;
+	memcpy(image.predecessor_claim_sha256, observed.predecessor.refs.claim_sha256, 32);
+	image.successor = observed.claim;
+	image.formation_epoch = observed.formation_epoch;
+	image.config_generation = observed.config_generation;
+	image.predecessor_root_sequence = observed.predecessor_file_sequence;
+	memcpy(image.predecessor_root_sha256, observed.predecessor_file_sha256, 32);
+	memcpy(image.exit_evidence_sha256, observed.predecessor_evidence_sha256, 32);
+	memcpy(image.operation_uuid, observed.operation_uuid, 16);
+	image.operation_generation = observed.generation;
+	image.checkpoint_lsn = observed.input_record_start;
+	image.checkpoint_end = observed.input_record_end;
+	image.checkpoint_crc32c = observed.input_record_crc;
+	image.timeline = observed.input_timeline;
+	*out = image;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+/*
+ * PGRAC (S9P2-05): this node's own thread did not shut down cleanly.  Seal
+ * its crashed generation (OPEN, or sealed without its tail) on the self-seal
+ * evidence before recovery reads it; a generation already sealed is taken as
+ * it is.  Evidence that is not there yet -- the quorum or this boot's
+ * membership still forming, the old incarnation's last heartbeat not yet past
+ * the death threshold and its write lease -- is waited for; a contradiction
+ * stops startup.  Recovery itself, completion and the successor writer come
+ * later.  Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+ClusterStartupCrashSeal(void)
+{
+	ClusterWalSourceRef restart;
+	ClusterControlRootSnapshot sealed;
+	ClusterControlRootReadToken token;
+	ClusterControlRootResult result;
+	uint64		min_dead_us = (uint64) cluster_cssd_dead_deadband_factor *
+		(uint64) cluster_cssd_heartbeat_interval_ms * 1000;
+	TimestampTz last_report = 0;
+
+	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || CritSectionCount != 0
+		|| ShutdownRequestPending || InRecovery || ArchiveRecoveryRequested
+		|| ControlFile->state == DB_SHUTDOWNED || LWLockHeldByMe(ControlFileLock)
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| !cluster_wal_thread_restart_v2_ref(&restart))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("crashed shared startup has no exact immutable input")));
+	for (;;) {
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		ClusterStartupConfigurationRequire();
+		result = cluster_control_root_v3_self_seal_v1(&restart, min_dead_us, &sealed, &token);
+		if (result != CLUSTER_CONTROL_ROOT_STALE_TOKEN
+			&& result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+			&& result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+			&& result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
+			break;
+		if (TimestampDifferenceExceeds(last_report, GetCurrentTimestamp(), 10000)) {
+			ereport(LOG,
+					(errmsg("waiting to seal this node's crashed generation (result %d)",
+							(int) result),
+					 errdetail("The quorum must admit this boot as a member and the old "
+							   "incarnation's last voting-disk heartbeat must be older than its "
+							   "death threshold and write lease.")));
+			last_report = GetCurrentTimestamp();
+		}
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 100,
+						 WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+		ResetLatch(MyLatch);
+	}
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("could not seal this node's crashed generation"),
+				 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=SELF_SEAL_REFUSED result=%d",
+						   (int) result),
+				 errhint("Preserve this node's WAL and the voting disks; do not clear them to "
+						 "force a start.")));
+	ereport(LOG,
+			(errmsg("sealed this node's crashed generation (thread %u, validated tail %X/%X)",
+					(unsigned) sealed.identity.origin_thread_id,
+					LSN_FORMAT_ARGS(sealed.validated_tail_lsn_exclusive))));
+}
+
+/* PGRAC: after FinishWalRecovery, revalidate the selected initializer and
+ * bind its independent successor stream before native WAL writes.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static XLogRecPtr
+ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
+{
+	ClusterWalStartupImage selected, routed;
+	ClusterControlRootResult result;
+	XLogRecPtr first = InvalidXLogRecPtr;
+	const char *operation = "route";
+
+	if (input == NULL || MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || !clusterStartupWriterSelected
+		|| clusterStartupWriterBound || clusterStartupWriterInstalled || CritSectionCount != 0
+		|| ShutdownRequestPending || InRecovery || ArchiveRecoveryRequested
+		|| input->standby_signal_file_found || input->recovery_signal_file_found
+		|| input->abortedRecPtr != InvalidXLogRecPtr
+		|| input->missingContrecPtr != InvalidXLogRecPtr || ControlFile->state != DB_SHUTDOWNED
+		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
+		|| cluster_cf_held(ExclusiveLock))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native clean startup has no selected initialization owner")));
+	ClusterStartupConfigurationRequire();
+	selected = clusterStartupWriter;
+	if (input->endOfLog != selected.sealed_input_end || input->endOfLog != selected.input_record_end
+		|| input->lastRec != selected.input_record_start
+		|| input->lastRecTLI != selected.input_timeline
+		|| input->endOfLogTLI != selected.input_timeline
+		|| ControlFile->checkPoint != selected.predecessor.snapshot.tail_last_record_lsn
+		|| selected.predecessor.snapshot.checkpoint_lower_lsn == InvalidXLogRecPtr
+		|| selected.predecessor.snapshot.checkpoint_lower_lsn > ControlFile->checkPoint
+		|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native recovery result contradicts its selected clean input")));
+	result = cluster_control_root_v3_startup_read_writer(&selected.claim.identity,
+														 selected.operation_uuid, &routed);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| memcmp(&routed, &selected, sizeof(selected)) != 0)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native initialization owner changed before WAL binding")));
+	result = cluster_control_root_v3_startup_route_writer(&selected.claim.identity,
+														  selected.operation_uuid, &routed);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& memcmp(&routed, &selected, sizeof(selected)) != 0)
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		operation = "prepare";
+		result = cluster_wal_writer_startup_prepare(&selected.claim.identity,
+													 selected.operation_uuid, &first);
+	}
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || first != selected.first_segment_lsn)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("could not bind the native successor WAL stream"),
+				 errdetail(
+					 "PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_WAL_ROUTE_UNPROVEN operation=%s result=%d",
+					 operation, (int)result)));
+	clusterStartupWriter = selected;
+	clusterStartupWriterBound = true;
+	return first;
+}
+#endif
+
 /*
  * This must be called ONCE during postmaster or standalone-backend startup
  */
@@ -5822,6 +6495,19 @@ StartupXLOG(void)
 
 #ifdef USE_PGRAC_CLUSTER
 
+	/* PGRAC: shared startup must reject unsupported native recovery/cleanup
+	 * inputs before any startup mutation, including the old bootstrap path.
+	 * Early postmaster observation is not authority and may have aged. */
+	if (cluster_shared_config)
+		cluster_control_bootstrap_native_inputs_require(DataDir);
+
+	/* PGRAC: a parameter the shared control file recorded at creation must
+	 * not have changed.  The postmaster already refused such a start; this
+	 * covers standalone backends, before writer selection, ROOT, WAL or
+	 * control file writes.  Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config)
+		ClusterRequireRecordedParameters();
+
 	/*
 	 * PGRAC: spec-5.6 increment (iii) T6 Phase-2.  Before the bootstrap role
 	 * gate reads the storage contract, a multi-node node that has not yet
@@ -5831,7 +6517,10 @@ StartupXLOG(void)
 	 * Never throws: on failure it leaves the contract unverified so the role
 	 * gate below fails closed rather than risk a split-brain authority write.
 	 */
-	cluster_cf_phase2_verify_or_fail(DataDir);
+	/* Canonical startup already qualified storage in the postmaster. Do not
+	 * run the legacy recovery-role rendezvous again in this child. */
+	if (!cluster_shared_config)
+		cluster_cf_phase2_verify_or_fail(DataDir);
 
 	/*
 	 * PGRAC: spec-5.6 Db5.  Recovery below writes the shared control-file
@@ -5843,7 +6532,10 @@ StartupXLOG(void)
 	 * closed until the storage is cross-node verified (split-brain guard).
 	 * No-op unless cluster.controlfile_shared_authority is on.
 	 */
-	cluster_cf_enter_bootstrap_window_or_fail();
+	/* ROOT selection and CF ownership, not a boot-local OWNER/JOIN_READONLY
+	 * window, serialize all canonical startup writes. */
+	if (!cluster_shared_config)
+		cluster_cf_enter_bootstrap_window_or_fail();
 
 	/*
 	 * PGRAC (spec-5.6a D3): load this node's per-node recovery anchor.  Under
@@ -5865,7 +6557,7 @@ StartupXLOG(void)
 	 * cluster.node_id before its final single-era shutdown, so its anchor
 	 * exists when it first boots as a cluster member.
 	 */
-	if (cluster_controlfile_shared_authority && cluster_enabled)
+	if (!cluster_shared_config && cluster_controlfile_shared_authority && cluster_enabled)
 	{
 		struct stat st;
 		bool		have_label = (stat(BACKUP_LABEL_FILE, &st) == 0);
@@ -6031,6 +6723,18 @@ StartupXLOG(void)
 #ifdef XLOG_REPLAY_DELAY
 	if (ControlFile->state != DB_SHUTDOWNED)
 		pg_usleep(60000000L);
+#endif
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: native startup can change side files before it emits any WAL.
+	 * First make that work belong to the exact recoverable initializer.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config
+		&& (ControlFile->state == DB_IN_PRODUCTION || ControlFile->state == DB_SHUTDOWNING
+			|| ControlFile->state == DB_IN_CRASH_RECOVERY))
+		ClusterStartupCrashSeal();
+	else if (cluster_shared_config)
+		ClusterStartupWriterSelect();
 #endif
 
 	/*
@@ -6294,7 +6998,24 @@ StartupXLOG(void)
 		 * backup history file.
 		 *
 		 * No need to hold ControlFileLock yet, we aren't up far enough.
+		 *
+		 * PGRAC: self-sealing the crashed input does not publish a typed
+		 * recovery-start control purpose or select a RECOVERED successor.
+		 * Until that owner is wired, reject here outside critical sections;
+		 * never send this known unsupported purpose to the unclassified
+		 * UpdateControlFile PANIC, nor reinterpret it as clean startup.
 		 */
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_shared_config)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					 errmsg("shared crash recovery startup control purpose is not available"),
+					 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=COLD_START_PURPOSE_PENDING "
+							   "native_state=%d checkpoint=%X/%X",
+							   (int) ControlFile->state, LSN_FORMAT_ARGS(ControlFile->checkPoint)),
+					 errhint("Preserve the sealed WAL and ROOT. Shared crash restart requires "
+							 "typed recovery completion and its recovered successor.")));
+#endif
 		UpdateControlFile();
 
 		/*
@@ -6542,6 +7263,12 @@ StartupXLOG(void)
 	 * Allow ordinary WAL segment creation before possibly switching to a new
 	 * timeline, which creates a new segment, and after the last ReadRecord().
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: FinishWalRecovery consumed the old stream. Every following
+	 * native WAL byte, including preallocation, belongs to the bound successor. */
+	if (cluster_shared_config)
+		EndOfLog = ClusterStartupWriterBegin(endOfRecoveryInfo);
+#endif
 	SetInstallXLogFileSegmentActive();
 
 	/*
@@ -6630,6 +7357,11 @@ StartupXLOG(void)
 	 */
 	Insert = &XLogCtl->Insert;
 	Insert->PrevBytePos = XLogRecPtrToBytePos(endOfRecoveryInfo->lastRec);
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: never link the independent writer to the predecessor stream. */
+	if (cluster_shared_config)
+		Insert->PrevBytePos = 0;
+#endif
 	Insert->CurrBytePos = XLogRecPtrToBytePos(EndOfLog);
 
 	/*
@@ -6768,6 +7500,13 @@ StartupXLOG(void)
 		promoted = PerformRecoveryXLogAction();
 
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: a clean predecessor does not contain a checkpoint of the NEW
+	 * stream. Execute the real native EOR machinery before INSTALL/admission. */
+	if (cluster_shared_config)
+		CreateCheckPoint(CHECKPOINT_END_OF_RECOVERY | CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE);
+#endif
+
+#ifdef USE_PGRAC_CLUSTER
 	/*
 	 * RF-B: the synchronous delegated EOR request must have completed the
 	 * INSTALLED -> ACTIVE -> DONE handoff before recovery ownership is released.
@@ -6856,6 +7595,14 @@ StartupXLOG(void)
 	 * there are no race conditions concerning visibility of other recent
 	 * updates to shared memory.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: the typed checkpoint installed the actual root-selected OPEN
+	 * writer. This only finishes native startup memory; phase4 still gates SQL. */
+	if (cluster_shared_config
+		&& (!clusterStartupWriterInstalled || ControlFile->state != DB_IN_PRODUCTION))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native startup has no installed successor checkpoint")));
+#endif
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->state = DB_IN_PRODUCTION;
 
@@ -6863,7 +7610,11 @@ StartupXLOG(void)
 	XLogCtl->SharedRecoveryState = RECOVERY_STATE_DONE;
 	SpinLockRelease(&XLogCtl->info_lck);
 
-	UpdateControlFile();
+	/* PGRAC: root INSTALL already published this state; no untyped writer. */
+#ifdef USE_PGRAC_CLUSTER
+	if (!cluster_shared_config)
+#endif
+		UpdateControlFile();
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
@@ -6882,7 +7633,7 @@ StartupXLOG(void)
 	 * yet admitted and this process writes none here), so a crash in the
 	 * residual two-file window loses no replayable work.
 	 */
-	if (cluster_controlfile_shared_authority && cluster_node_id >= 0)
+	if (!cluster_shared_config && cluster_controlfile_shared_authority && cluster_node_id >= 0)
 		cluster_recovery_anchor_refresh_state(ControlFile->system_identifier,
 											  (uint32) DB_IN_PRODUCTION);
 #endif
@@ -6931,7 +7682,11 @@ StartupXLOG(void)
 	 * fail-closed (MVCC-invisible + vacuum reclaim).  Best-effort cleanout;
 	 * correctness never depends on it.
 	 */
-	if (cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
+	/* Shared recovery uses the typed PAGE/SIDE/undo owners. This optional
+	 * legacy DELETE cleanout is WAL-free and has no page-version edge;
+	 * it must remain unreachable even after typed cold startup is enabled. */
+	if (!cluster_shared_config
+		&& cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
 		cluster_tt_recovery_physical_rollback();
 #endif
 
@@ -7321,6 +8076,27 @@ GetFlushRecPtr(TimeLineID *insertTLI)
 	return LogwrtResult.Flush;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* EOR writes native WAL before SharedRecoveryState becomes DONE. Keep the
+ * general GetFlushRecPtr contract intact and expose only the bound startup
+ * writer's exact timeline here. Callers separately revalidate root/ownership.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+ClusterXLogStartupFlushCovers(XLogRecPtr end, TimeLineID timeline)
+{
+	XLogRecPtr flushed;
+	if (MyBackendType != B_STARTUP || !cluster_enabled || !cluster_shared_config
+		|| !enableFsync || !clusterStartupWriterBound || clusterStartupWriterInstalled
+		|| ShutdownRequestPending || end == InvalidXLogRecPtr || timeline == 0
+		|| clusterStartupWriter.timeline != timeline || XLogCtl->InsertTimeLineID != timeline)
+		return false;
+	SpinLockAcquire(&XLogCtl->info_lck);
+	flushed = XLogCtl->LogwrtResult.Flush;
+	SpinLockRelease(&XLogCtl->info_lck);
+	return flushed >= end;
+}
+#endif
+
 /*
  * GetWALInsertionTimeLine -- Returns the current timeline of a system that
  * is not in recovery.
@@ -7428,6 +8204,9 @@ ShutdownXLOG(int code, Datum arg)
 		if (XLogArchivingActive())
 			RequestXLogSwitch(false);
 
+#ifdef USE_PGRAC_CLUSTER
+		cluster_initdb_base_create(code);
+#endif
 		CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE);
 	}
 }
@@ -7668,6 +8447,293 @@ update_checkpoint_display(int flags, bool restartpoint, bool reset)
 }
 
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: purpose-bound native checkpoint adapter. Author: SqlRush <sqlrush@gmail.com> */
+static bool
+ClusterStartupFileSync(void)
+{
+	ClusterWalWriterToken writer;
+	return MyBackendType == B_STARTUP && AmStartupProcess() && cluster_shared_config
+		&& clusterStartupWriterBound && !clusterStartupWriterInstalled
+		&& !LWLockHeldByMe(ControlFileLock) && !cluster_cf_held(ShareLock)
+		&& !cluster_cf_held(ExclusiveLock)
+		&& cluster_wal_writer_begin(clusterStartupWriter.timeline, &writer)
+			== CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& RequestStartupSync()
+		&& cluster_wal_writer_check(&writer) == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static void
+ClusterStartupCheckpointPrepare(int flags, ControlFileData *selected)
+{
+	memset(selected, 0, sizeof(*selected));
+	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || !clusterStartupWriterBound
+		|| clusterStartupWriterInstalled || CritSectionCount != 0 || ShutdownRequestPending
+		|| (flags & CHECKPOINT_END_OF_RECOVERY) == 0 || (flags & CHECKPOINT_IS_SHUTDOWN) != 0
+		|| clusterStartupWriter.phase != CLUSTER_WAL_STARTUP_INITIALIZING
+		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
+		|| cluster_cf_held(ExclusiveLock)
+		|| !cluster_wal_writer_startup_matches(&clusterStartupWriter.claim.identity,
+											   clusterStartupWriter.operation_uuid,
+											   clusterStartupWriter.first_segment_lsn)
+		|| ControlFile->state != DB_SHUTDOWNED
+		|| ControlFile->system_identifier != clusterStartupWriter.claim.identity.system_identifier
+		|| ControlFile->checkPoint != clusterStartupWriter.predecessor.snapshot.tail_last_record_lsn
+		|| clusterStartupWriter.predecessor.snapshot.checkpoint_lower_lsn == InvalidXLogRecPtr
+		|| clusterStartupWriter.predecessor.snapshot.checkpoint_lower_lsn > ControlFile->checkPoint
+		|| ControlFile->checkPointCopy.ThisTimeLineID != clusterStartupWriter.timeline
+		|| ControlFile->minRecoveryPoint != 0 || ControlFile->minRecoveryPointTLI != 0
+		|| ControlFile->backupStartPoint != 0 || ControlFile->backupEndPoint != 0
+		|| ControlFile->backupEndRequired)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native successor checkpoint requires its bound initializer")));
+	/* Sole startup executor, before checkpointer/SQL admission. This copy is
+	 * input only; the actual checkpoint verifier will re-read the predecessor. */
+	*selected = *ControlFile;
+}
+
+static void
+ClusterStartupCheckpointPublish(const ControlFileData *candidate, XLogRecPtr end)
+{
+	ClusterWalStartupImage durable;
+	ClusterControlRootResult result;
+	ControlRootImage *root;
+	ClusterControlRootFileToken token;
+	ControlFileData selected;
+	bool durable_selected = false;
+	uint32 node = clusterStartupWriter.claim.identity.origin_node_id;
+
+	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || !clusterStartupWriterBound
+		|| clusterStartupWriterInstalled || CritSectionCount != 0 || ShutdownRequestPending
+		|| node >= CLUSTER_MAX_NODES || candidate->state != DB_SHUTDOWNED
+		|| candidate->checkPoint < clusterStartupWriter.first_segment_lsn
+		|| end <= candidate->checkPoint || LWLockHeldByMe(ControlFileLock)
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native successor publication requires its bound initializer")));
+	/* CAS competition alone is retryable. Each API drops its CF/WALR holds;
+	 * uncertain I/O/release and changed identity never become an owned wait. */
+	for (;;) {
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		if (ShutdownRequestPending
+			|| !cluster_wal_writer_startup_matches(&clusterStartupWriter.claim.identity,
+													clusterStartupWriter.operation_uuid,
+													clusterStartupWriter.first_segment_lsn))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+							errmsg("native successor publication lost its initialization owner")));
+		if (!durable_selected) {
+			result = cluster_control_root_v3_startup_checkpoint(
+				&clusterStartupWriter.claim.identity, clusterStartupWriter.operation_uuid,
+				candidate, end, &durable);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				durable_selected = true; /* Actual DURABLE selected; INSTALL still required. */
+		} else
+			result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_thread_install_startup(&durable);
+		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
+			break;
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+						WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+		ResetLatch(MyLatch);
+	}
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("could not install the native successor checkpoint"),
+				 errdetail(
+					 "PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_CHECKPOINT_UNPROVEN result=%d",
+					 (int)result)));
+	/* Runtime CF reads require serving and cannot be used here. Read the exact
+	 * installed thread through the private non-serving projection, then release
+	 * CF before changing native memory. Root installation remains durable even
+	 * if this final observation fails; a replacement must use recovery. */
+	root = palloc(sizeof(*root));
+	if (!cluster_cf_lock(ShareLock)) {
+		pfree(root);
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("could not read the installed native successor")));
+	}
+	PG_TRY();
+	{
+		result = cluster_cf_held_is_clusterwide(ShareLock)
+					 ? cluster_control_root_v3_read_thread_locked(
+						   &clusterStartupWriter.claim.identity, root, &selected, &token)
+					 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	}
+	PG_CATCH();
+	{
+		(void)cluster_cf_unlock_confirmed(ShareLock);
+		pfree(root);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED)
+		result = CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& (!root->present[node] || root->startup[node].generation != 0
+			|| root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+			|| root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+			|| root->header.v2.serving[0] != 0 || root->header.v2.serving[1] != 0
+			|| root->records[node].lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+			|| memcmp(&root->records[node].identity, &clusterStartupWriter.claim.identity,
+					  sizeof(clusterStartupWriter.claim.identity))
+				   != 0
+			|| selected.state != DB_IN_PRODUCTION || selected.checkPoint != candidate->checkPoint
+			|| selected.system_identifier != clusterStartupWriter.claim.identity.system_identifier
+			|| selected.checkPointCopy.ThisTimeLineID != clusterStartupWriter.timeline
+			|| !cluster_wal_writer_startup_matches(&clusterStartupWriter.claim.identity,
+													clusterStartupWriter.operation_uuid,
+													clusterStartupWriter.first_segment_lsn)))
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	pfree(root);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+			 errmsg("installed native successor view is unproven"),
+			 errdetail(
+				 "PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_INSTALL_VIEW_UNPROVEN result=%d",
+				 (int)result)));
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	*ControlFile = selected;
+	LWLockRelease(ControlFileLock);
+	clusterStartupWriterInstalled = true;
+}
+
+static void
+ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
+{
+	ClusterWalSourceRef ref;
+	bool readable;
+	uint64 epoch = cluster_epoch_get_current();
+
+	if (MyBackendType == B_STARTUP && (flags & CHECKPOINT_END_OF_RECOVERY) != 0) {
+		ClusterStartupCheckpointPrepare(flags, selected);
+		return;
+	}
+
+	memset(selected, 0, sizeof(*selected));
+	if (!AmCheckpointerProcess() || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || CritSectionCount != 0
+		|| (flags & CHECKPOINT_END_OF_RECOVERY) != 0
+		|| ((flags & CHECKPOINT_IS_SHUTDOWN) != 0 && !ShutdownRequestPending)
+		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
+		|| cluster_cf_held(ExclusiveLock) || epoch == 0
+		|| !cluster_wal_thread_current_v2_ref(&ref)
+		/* Use the same exact, original-epoch CLEAN or INITIALIZED qualification
+		 * as native WAL I/O. RECOVERED inputs cannot borrow either fact.
+		 * Author: SqlRush <sqlrush@gmail.com> */
+		|| (!cluster_external_fence_runtime_active()
+			&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+			&& !cluster_wal_thread_clean_writer_matches(&ref, epoch)))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("root-v3 checkpoint requires its admitted native owner")));
+	if (!cluster_cf_lock(ShareLock))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("could not acquire control-root read authority for checkpoint")));
+	PG_TRY();
+	{
+		readable = cluster_cf_held_is_clusterwide(ShareLock)
+			&& cluster_cf_authority_read(selected);
+	}
+	PG_CATCH();
+	{
+		(void) cluster_cf_unlock_confirmed(ShareLock);
+		memset(selected, 0, sizeof(*selected));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED || !readable
+		|| selected->state != DB_IN_PRODUCTION
+		|| selected->system_identifier != ref.claim.identity.system_identifier
+		|| selected->checkPointCopy.ThisTimeLineID != ref.timeline
+		|| selected->minRecoveryPoint != InvalidXLogRecPtr || selected->minRecoveryPointTLI != 0
+		|| selected->backupStartPoint != 0 || selected->backupEndPoint != 0
+		|| selected->backupEndRequired || cluster_epoch_get_current() != epoch
+		|| (!cluster_external_fence_runtime_active()
+			&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+			&& !cluster_wal_thread_clean_writer_matches(&ref, epoch))) {
+		memset(selected, 0, sizeof(*selected));
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("root-v3 checkpoint input or read-authority release is unproven")));
+	}
+}
+
+static void
+ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
+{
+	ClusterWalSourceRef ref;
+	ControlFileData selected;
+	ClusterControlRootSnapshot published;
+	ClusterControlRootFileToken token;
+	ClusterControlRootResult result;
+	uint64 epoch = cluster_epoch_get_current();
+
+	if (MyBackendType == B_STARTUP) {
+		ClusterStartupCheckpointPublish(candidate, end);
+		return;
+	}
+
+	if (!AmCheckpointerProcess() || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || CritSectionCount != 0
+		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
+		|| cluster_cf_held(ExclusiveLock) || epoch == 0
+		|| (candidate->state != DB_IN_PRODUCTION && candidate->state != DB_SHUTDOWNED)
+		|| (candidate->state == DB_SHUTDOWNED && !ShutdownRequestPending)
+		|| !cluster_wal_thread_current_v2_ref(&ref))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("root-v3 checkpoint publication requires its native owner")));
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+		if (cluster_epoch_get_current() != epoch || cluster_reconfig_has_pending_prebump_stage()
+			|| (!cluster_external_fence_runtime_active()
+				&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
+				&& !cluster_wal_thread_clean_writer_matches(&ref, epoch))
+			|| !cluster_serving_ready_is_current() || !cluster_write_fence_allowed())
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					 errmsg("checkpoint authority changed before control-root publication")));
+		/* PGRAC: the native shutdown record needs its distinct WAL verifier.
+		 * This publishes evidence only, not CLOSED or a serving-set change.
+		 * A pending shutdown signal alone cannot reclassify an online candidate.
+		 * Author: SqlRush <sqlrush@gmail.com> */
+		if (candidate->state == DB_SHUTDOWNED)
+			result = cluster_control_root_v3_shutdown_checkpoint_publish(
+				&ref.claim.identity, candidate, end, &published, &token, &selected);
+		else
+			result = cluster_control_root_v3_checkpoint_publish(&ref.claim.identity, candidate, end,
+																&published, &token, &selected);
+		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
+			break;
+		/* A peer won the whole-file CAS. All CF/WALR holds and own staging
+		 * are released before this interruptible owner wait and reobservation.
+		 * STALE identity/namespace and uncertain I/O are not this retry class. */
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 20, WAIT_EVENT_CHECKPOINTER_MAIN);
+		ResetLatch(MyLatch);
+	}
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("could not publish the native checkpoint in the control root"),
+				 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=CHECKPOINT_UNPROVEN result=%d",
+						   (int) result)));
+	/* No native projection or WAL cleanup precedes the durable root result.
+	 * A later lifecycle change does not roll back that durable fact. */
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	*ControlFile = selected;
+	LWLockRelease(ControlFileLock);
+}
+#endif
+
 /*
  * Perform a checkpoint --- either during shutdown, or on-the-fly
  *
@@ -7713,9 +8779,11 @@ CreateCheckPoint(int flags)
 	int			nvxids;
 	int			oldXLogAllowed = 0;
 	XLogRecPtr	slotsMinReqLSN;
+	ControlFileData *checkpoint_control = ControlFile;
 #ifdef USE_PGRAC_CLUSTER
 	bool		cf_x_taken = false; /* PGRAC: spec-5.6 Dc1 — held CF X to release */
 	bool		fpw_off_transition = false; /* RF-ROOT P7 G1a-2: W5b FPW-off happened this checkpoint */
+	ControlFileData v3_checkpoint;
 #endif
 
 	/*
@@ -7732,6 +8800,20 @@ CreateCheckPoint(int flags)
 		elog(ERROR, "can't create a checkpoint during recovery");
 
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: select only this thread before any checkpoint mutation. Native
+	 * shutdown has a distinct evidence publisher; startup/EOR and parameter
+	 * transitions still need their separate owner. No CF skip grants permission. */
+	if (cluster_shared_config)
+	{
+		ClusterCheckpointV3Prepare(flags, &v3_checkpoint);
+		if (fullPageWrites != Insert->fullPageWrites)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					 errmsg("root-v3 full-page-write transition requires configuration publication")));
+		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+		*ControlFile = v3_checkpoint;
+		LWLockRelease(ControlFileLock);
+	}
 	/*
 	 * RF-B CONSUME: after the EOR sanity check and before checkpoint I/O,
 	 * freshly recheck the shared authority identity.  The identity read completes
@@ -7817,13 +8899,13 @@ CreateCheckPoint(int flags)
 	 * unless the authority is enabled.  The exact one-node EOR owner bypasses
 	 * CF X using its distinct local permission; all later checkpoints use CF X.
 	 */
-	if (cluster_controlfile_shared_authority && !cluster_cf_in_bootstrap_window()
+	if (!cluster_shared_config && cluster_controlfile_shared_authority && !cluster_cf_in_bootstrap_window()
 		&& cluster_cf_owner_eor_local_active())
 	{
 		/* OWNER EOR neither takes CF X nor inherits a stale write-skip. */
 		cluster_cf_set_write_skip(false);
 	}
-	else if (cluster_controlfile_shared_authority && !cluster_cf_in_bootstrap_window())
+	else if (!cluster_shared_config && cluster_controlfile_shared_authority && !cluster_cf_in_bootstrap_window())
 	{
 		/*
 		 * A multi-node node still in its JOIN_READONLY bring-up window (Phase-2
@@ -7901,7 +8983,7 @@ CreateCheckPoint(int flags)
 	 * verifying its outer CF(X), but before entering the checkpoint critical
 	 * section.  The helper borrows that hold and never reacquires it.
 	 */
-	if ((flags & CHECKPOINT_END_OF_RECOVERY) == 0)
+	if (!cluster_shared_config && (flags & CHECKPOINT_END_OF_RECOVERY) == 0)
 		fpw_off_transition = UpdateFullPageWritesForCheckpoint();
 #endif
 
@@ -7912,10 +8994,19 @@ CreateCheckPoint(int flags)
 
 	if (shutdown)
 	{
-		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
-		ControlFile->state = DB_SHUTDOWNING;
-		UpdateControlFile();
-		LWLockRelease(ControlFileLock);
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: root-v3 remains OPEN until its exact close owner finishes.
+		 * Do not enter the legacy writer or expose SHUTDOWNING as authority.
+		 * The private final candidate goes through the shutdown WAL verifier.
+		 * Author: SqlRush <sqlrush@gmail.com> */
+		if (!cluster_shared_config)
+#endif
+		{
+			LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+			ControlFile->state = DB_SHUTDOWNING;
+			UpdateControlFile();
+			LWLockRelease(ControlFileLock);
+		}
 	}
 
 	/* Begin filling in the checkpoint WAL record */
@@ -8144,6 +9235,15 @@ CreateCheckPoint(int flags)
 	}
 	pfree(vxids);
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC (S07 R-A22): snapshot the buffers' first own records before the
+	 * sync barrier, so a page this checkpoint does not write but someone
+	 * writes after the barrier is still counted by its census.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config && !shutdown)
+		cluster_wal_retained_cut_before_sync_v1(checkPoint.redo);
+#endif
+
 	CheckPointGuts(checkPoint.redo, flags);
 
 	vxids = GetVirtualXIDsDelayingChkpt(&nvxids, DELAY_CHKPT_COMPLETE);
@@ -8241,13 +9341,21 @@ CreateCheckPoint(int flags)
 	 * Update the control file.
 	 */
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: native candidate is private until the root publisher succeeds. */
+	if (cluster_shared_config)
+	{
+		v3_checkpoint = *ControlFile;
+		checkpoint_control = &v3_checkpoint;
+	}
+#endif
 	if (shutdown)
-		ControlFile->state = DB_SHUTDOWNED;
-	ControlFile->checkPoint = ProcLastRecPtr;
-	ControlFile->checkPointCopy = checkPoint;
+		checkpoint_control->state = DB_SHUTDOWNED;
+	checkpoint_control->checkPoint = ProcLastRecPtr;
+	checkpoint_control->checkPointCopy = checkPoint;
 	/* crash recovery should always recover to the end of WAL */
-	ControlFile->minRecoveryPoint = InvalidXLogRecPtr;
-	ControlFile->minRecoveryPointTLI = 0;
+	checkpoint_control->minRecoveryPoint = InvalidXLogRecPtr;
+	checkpoint_control->minRecoveryPointTLI = 0;
 
 	/*
 	 * Persist unloggedLSN value. It's reset on crash recovery, so this goes
@@ -8255,10 +9363,21 @@ CreateCheckPoint(int flags)
 	 * for debugging purposes.
 	 */
 	SpinLockAcquire(&XLogCtl->ulsn_lck);
-	ControlFile->unloggedLSN = XLogCtl->unloggedLSN;
+	checkpoint_control->unloggedLSN = XLogCtl->unloggedLSN;
 	SpinLockRelease(&XLogCtl->ulsn_lck);
 
-	UpdateControlFile();
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config)
+	{
+		checkpoint_control->time = (pg_time_t) time(NULL);
+		INIT_CRC32C(checkpoint_control->crc);
+		COMP_CRC32C(checkpoint_control->crc, checkpoint_control,
+					 offsetof(ControlFileData, crc));
+		FIN_CRC32C(checkpoint_control->crc);
+	}
+	else
+#endif
+		UpdateControlFile();
 	LWLockRelease(ControlFileLock);
 
 #ifdef USE_PGRAC_CLUSTER
@@ -8276,7 +9395,7 @@ CreateCheckPoint(int flags)
 	 * gate: the anchor is a per-node file and must keep advancing even
 	 * while this node's shared-authority writes are suppressed.
 	 */
-	if (cluster_controlfile_shared_authority && cluster_node_id >= 0)
+	if (!cluster_shared_config && cluster_controlfile_shared_authority && cluster_node_id >= 0)
 		cluster_recovery_anchor_publish_checkpoint(ProcLastRecPtr, &checkPoint,
 												   ControlFile->system_identifier,
 												   shutdown ? (uint32) DB_SHUTDOWNED :
@@ -8296,6 +9415,18 @@ CreateCheckPoint(int flags)
 	END_CRIT_SECTION();
 
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: root publication precedes every post-checkpoint cleanup. No
+	 * outer CF, native content lock or critical section encloses this wait. */
+	if (cluster_shared_config)
+		ClusterCheckpointV3Publish(&v3_checkpoint, recptr);
+
+	/* PGRAC (S07): with this checkpoint's ROOT published, move the physical
+	 * retention lower forward when the complete retained input allows it.
+	 * The WAL cleanup below reads only the published ROOT.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config && !shutdown)
+		cluster_wal_retained_cut_after_checkpoint_v1();
+
 	/*
 	 * RF A1 W5a: only a non-EOR checkpoint advertises its now-durable redo
 	 * start.  This is outside the checkpoint critical section and before all
@@ -8303,7 +9434,7 @@ CreateCheckPoint(int flags)
 	 * held.  Failure leaves the prior conservative advert intact and does not
 	 * fail the PostgreSQL checkpoint.
 	 */
-	if ((flags & CHECKPOINT_END_OF_RECOVERY) == 0)
+	if (!cluster_shared_config && (flags & CHECKPOINT_END_OF_RECOVERY) == 0)
 		ClusterWalStatePublishCheckpointRedo(checkPoint.redo);
 
 	/*
@@ -8435,7 +9566,7 @@ CreateCheckPoint(int flags)
 	 * canonical, and its WAL-read/CF interactions inside the recovery
 	 * window stall the phase-3 barrier (observed t243 bail).
 	 */
-	if (ClusterWalStateConfigured()
+	if (!cluster_shared_config && ClusterWalStateConfigured()
 		&& (flags & CHECKPOINT_END_OF_RECOVERY) == 0)
 	{
 		uint32		ckpt_record_crc = ClusterCheckpointRecordCrc32(recptr);
@@ -8510,7 +9641,13 @@ CreateCheckPoint(int flags)
 	 * in subtrans.c).  During recovery, though, we mustn't do this because
 	 * StartupSUBTRANS hasn't been called yet.
 	 */
-	if (!RecoveryInProgress())
+	/* PGRAC: the first successor checkpoint cannot retire predecessor side
+	 * history. Its retention remains pinned across the non-serving INSTALL. */
+	if (!RecoveryInProgress()
+#ifdef USE_PGRAC_CLUSTER
+		&& !(cluster_shared_config && (flags & CHECKPOINT_END_OF_RECOVERY) != 0)
+#endif
+	)
 		TruncateSUBTRANS(GetOldestTransactionIdConsideredRunning());
 
 	/* Real work is done; log and update stats. */
@@ -8695,6 +9832,15 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
+	 * PGRAC: the shared PI writeback batch may run during the write phase
+	 * (CheckpointWriteDelay).  Release it here, before the sync phase and
+	 * this checkpoint's own ROOT/WAL operations.  Author: SqlRush
+	 * <sqlrush@gmail.com>
+	 */
+	if (MyBackendType == B_CHECKPOINTER)
+		cluster_pi_writeback_checkpointer_release_v1();
+
+	/*
 	 * PGRAC: spec-3.18 D2b — flush the undo buffer pool's write-back dirty
 	 * blocks (XLogFlush their protecting LSN, then write-through + fsync) so
 	 * undo data is durable as of this checkpoint.  This is the phase-2 flush
@@ -8722,7 +9868,13 @@ CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 	{
 		uint64		pi_note_presync_seq = cluster_gcs_block_pi_note_presync_snapshot();
 
-		ProcessSyncRequests();
+		if (cluster_shared_config && MyBackendType == B_STARTUP) {
+			if (!ClusterStartupFileSync())
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						 errmsg("native startup file synchronization is unproven")));
+		} else
+			ProcessSyncRequests();
 		cluster_gcs_block_pi_note_confirm(pi_note_presync_seq);
 	}
 #else
@@ -9347,9 +10499,94 @@ XLogRestorePoint(const char *rpName)
 	return RecPtr;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Append "name=current (created with recorded)" for one changed parameter. */
+static void
+ClusterRecordedParameterChange(StringInfo buf, const char *name, const char *current,
+							   const char *recorded)
+{
+	if (strcmp(current, recorded) == 0)
+		return;
+	appendStringInfo(buf, "%s%s=%s (created with %s)", buf->len > 0 ? ", " : "", name,
+					 current, recorded);
+}
+
+/* Defined with the WAL record descriptions (xlogdesc.c), as guc_tables.c uses it. */
+extern const struct config_enum_entry wal_level_options[];
+
+static const char *
+ClusterWalLevelName(int level)
+{
+	for (const struct config_enum_entry *e = wal_level_options; e->name != NULL; e++)
+		if (e->val == level)
+			return e->name;
+	return "unknown";
+}
+
+/*
+ * PGRAC (shared native parameters): the shared control file records these
+ * parameters when the cluster is created, and no typed purpose can update
+ * them afterwards.  A changed value ends the start with FATAL naming each
+ * change; returns when nothing changed.
+ *
+ * PostmasterMain calls this once the root-selected control file is
+ * installed, before shared memory and any cluster startup work, so that a
+ * refused start writes no voting disk, formation, ROOT, WAL or control
+ * file.  StartupXLOG repeats it before its first durable write for
+ * standalone backends, and XLogReportParameters keeps the native
+ * UpdateControlFile PANIC unreachable.
+ */
+void
+ClusterRequireRecordedParameters(void)
+{
+	StringInfoData changed;
+
+	initStringInfo(&changed);
+	ClusterRecordedParameterChange(&changed, "wal_level", ClusterWalLevelName(wal_level),
+								   ClusterWalLevelName(ControlFile->wal_level));
+	ClusterRecordedParameterChange(&changed, "wal_log_hints", wal_log_hints ? "on" : "off",
+								   ControlFile->wal_log_hints ? "on" : "off");
+	ClusterRecordedParameterChange(&changed, "max_connections", psprintf("%d", MaxConnections),
+								   psprintf("%d", ControlFile->MaxConnections));
+	ClusterRecordedParameterChange(&changed, "max_worker_processes",
+								   psprintf("%d", max_worker_processes),
+								   psprintf("%d", ControlFile->max_worker_processes));
+	ClusterRecordedParameterChange(&changed, "max_wal_senders", psprintf("%d", max_wal_senders),
+								   psprintf("%d", ControlFile->max_wal_senders));
+	ClusterRecordedParameterChange(&changed, "max_prepared_transactions",
+								   psprintf("%d", max_prepared_xacts),
+								   psprintf("%d", ControlFile->max_prepared_xacts));
+	ClusterRecordedParameterChange(&changed, "max_locks_per_transaction",
+								   psprintf("%d", max_locks_per_xact),
+								   psprintf("%d", ControlFile->max_locks_per_xact));
+	ClusterRecordedParameterChange(&changed, "track_commit_timestamp",
+								   track_commit_timestamp ? "on" : "off",
+								   ControlFile->track_commit_timestamp ? "on" : "off");
+	if (changed.len == 0)
+	{
+		pfree(changed.data);
+		return;
+	}
+	ereport(FATAL,
+			(errcode(ERRCODE_CLUSTER_SHARED_PARAMETER_FIXED),
+			 errmsg("shared cluster parameters recorded at creation cannot be changed"),
+			 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=NATIVE_PARAMETER_CHANGE %s.",
+					   changed.data),
+			 errhint("Set the parameters listed above back to their creation values in this "
+					 "instance's configuration, then start it again.")));
+}
+#endif
+
 /*
  * Check if any of the GUC parameters that are critical for hot standby
  * have changed, and update the value in pg_control file if necessary.
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: with cluster.shared_config a changed value is refused with
+ * FATAL before the parameter-change record.
+ * Why: the shared control file cannot record the change.  StartupXLOG
+ * already refused it before any durable write (see
+ * ClusterRequireRecordedParameters); this keeps the PANIC unreachable.
  */
 static void
 XLogReportParameters(void)
@@ -9363,6 +10600,11 @@ XLogReportParameters(void)
 		max_locks_per_xact != ControlFile->max_locks_per_xact ||
 		track_commit_timestamp != ControlFile->track_commit_timestamp)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_shared_config)
+			ClusterRequireRecordedParameters();
+#endif
+
 		/*
 		 * The change in number of backend slots doesn't need to be WAL-logged
 		 * if archiving is not enabled, as you can't start archive recovery
@@ -9872,6 +11114,7 @@ xlog_redo(XLogReaderState *record)
 		for (uint8 block_id = 0; block_id <= XLogRecMaxBlockId(record); block_id++)
 		{
 			Buffer		buffer;
+			XLogRedoAction action;
 
 			if (!XLogRecHasBlockImage(record, block_id))
 			{
@@ -9880,8 +11123,19 @@ xlog_redo(XLogReaderState *record)
 				continue;
 			}
 
-			if (XLogReadBufferForRedo(record, block_id, &buffer) != BLK_RESTORED)
-				elog(ERROR, "unexpected XLogReadBufferForRedo result when restoring backup block");
+			action = XLogReadBufferForRedo(record, block_id, &buffer);
+#ifdef USE_PGRAC_CLUSTER
+			/* Exact cold SKIP returns no pin and must not open DATA. */
+			if (cluster_page_cold_redo_active_v1 && action == BLK_NOTFOUND
+				&& !BufferIsValid(buffer))
+				continue;
+#endif
+			if (action != BLK_RESTORED || !BufferIsValid(buffer))
+				ereport(
+					ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg(
+						 "unexpected XLogReadBufferForRedo result when restoring backup block")));
 			UnlockReleaseBuffer(buffer);
 		}
 	}

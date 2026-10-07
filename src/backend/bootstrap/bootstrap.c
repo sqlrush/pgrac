@@ -29,6 +29,9 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "common/link-canary.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_wal_thread.h"
+#endif
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -317,6 +320,11 @@ BootstrapModeMain(int argc, char *argv[], bool check_only)
 	ChangeToDataDir();
 
 	CreateDataDirLockFile(false);
+
+#ifdef USE_PGRAC_CLUSTER
+	if (!check_only)
+		cluster_wal_thread_initdb_accept(true);
+#endif
 
 	SetProcessingMode(BootstrapProcessing);
 	IgnoreSystemIndexes = true;

@@ -121,10 +121,13 @@ cluster_recovery_record_class(RmgrId rmid, bool has_block_ref, bool first_block_
 			 * pre-arm these fell through to U and 53RA3'd the merge.) */
 			return CLUSTER_RECMERGE_GLOBAL;
 		case RM_XLOG_ID:
-		case RM_RELMAP_ID:
-			/* XLOG housekeeping (checkpoint/fpw/...) + relmap are
-			 * node-local on a foreign stream. */
+			/* XLOG housekeeping (checkpoint/fpw/...) is node-local. */
 			return CLUSTER_RECMERGE_LOCAL;
+		case RM_RELMAP_ID:
+			/* A foreign relation-map update can change shared catalog
+			 * routing. Until its shared owner is available it must block
+			 * recovery, never disappear as local housekeeping. */
+			return CLUSTER_RECMERGE_UNCLASSIFIABLE;
 		case RM_SMGR_ID:
 			/* smgr create/truncate name their relfile in the payload;
 			 * the caller resolves its routing through the same smgr
@@ -480,7 +483,22 @@ typedef enum ClusterMergeEngage {
 	CLUSTER_MERGE_NO_NO_CANDIDATES,	 /* nothing crashed to merge in         */
 	CLUSTER_MERGE_NO_NOT_COLD,		 /* a foreign node is ALIVE (warm = 4.6) */
 	CLUSTER_MERGE_ENGAGE,			 /* gate passed below; do merged replay */
+	CLUSTER_MERGE_REFUSE_UNSHARED,	 /* multi-generation cold crash, unshared */
 } ClusterMergeEngage;
+
+/*
+ * PRE2 recovers a cold crash that needs several WAL threads merged only
+ * through the shared profile's typed plan.  The unshared profile refuses it
+ * before any fence, claim or replay action; the SCN-ordered legacy merge can
+ * restore one thread's older full-page image over a newer page another
+ * thread already made durable.  Single-stream recovery is unaffected.
+ */
+static inline ClusterMergeEngage
+cluster_recovery_merge_profile_gate(ClusterMergeEngage engage, bool shared_config)
+{
+	return engage == CLUSTER_MERGE_ENGAGE && !shared_config ? CLUSTER_MERGE_REFUSE_UNSHARED
+															: engage;
+}
 
 /* RF-ROOT P4 cold caller contract.  The sole readonly producer freezes the
  * canonical replay/proof-origin sets and owns every formation/NeedSet/
@@ -492,12 +510,47 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo
 										  ClusterRecoveryFencePlan **out_plan);
 extern bool cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFencePlan *plan);
 extern bool cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan);
-extern bool cluster_recovery_merge_fence_plan_copy_replay(const ClusterRecoveryFencePlan *plan,
-														  uint64 out_bitmap[2],
-														  XLogRecPtr *out_start);
 extern bool cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan);
+extern uint16 cluster_recovery_merge_fence_plan_origin_count(const ClusterRecoveryFencePlan *plan);
+struct ClusterControlRootSnapshot;
+struct ClusterControlRootReadToken;
+extern bool cluster_recovery_merge_fence_plan_origin(const ClusterRecoveryFencePlan *plan,
+													 uint16 index, uint16 *origin_thread,
+													 struct ClusterControlRootSnapshot *root,
+													 struct ClusterControlRootReadToken *token);
+struct ClusterThreadRecoveryAuthorityV1;
+extern bool
+cluster_recovery_merge_fence_plan_authority(ClusterRecoveryFencePlan *plan, uint16 origin_thread,
+											struct ClusterThreadRecoveryAuthorityV1 *out);
 extern bool cluster_recovery_merge_fence_plan_release_serial(ClusterRecoveryFencePlan *plan);
 extern void cluster_recovery_merge_fence_plan_destroy(ClusterRecoveryFencePlan **plan);
+
+/*
+ * PGRAC (S9P2-05): after typed cold replay, publish every fenced origin
+ * recovered through the exclusive handoff the online recovery worker uses:
+ * each origin's terminal patch is built while the serial set is held, the
+ * retention pin is sealed, the serial set (IR) is released with
+ * confirmation, then each root is compare-and-swapped to RECOVERY_COMPLETE
+ * through the sealed pin, and the pin is released.  The caller has proven
+ * every origin's pass-2 cut and made the replayed changes durable.  On a
+ * failure nothing further is published; *failed_thread / *failed_detail
+ * name the origin and the callee's result.  Author: SqlRush
+ * <sqlrush@gmail.com>
+ */
+typedef enum ClusterRecoveryFenceCompleteV1 {
+	CLUSTER_RECOVERY_FENCE_COMPLETE_OK = 0,
+	CLUSTER_RECOVERY_FENCE_COMPLETE_INVALID = 1,   /* not a committed, held plan */
+	CLUSTER_RECOVERY_FENCE_COMPLETE_AUTHORITY = 2, /* an origin's authority is stale */
+	CLUSTER_RECOVERY_FENCE_COMPLETE_PATCH = 3,	   /* its root cannot take the terminal */
+	CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_SEAL = 4,
+	CLUSTER_RECOVERY_FENCE_COMPLETE_IR_RELEASE = 5, /* release not confirmed */
+	CLUSTER_RECOVERY_FENCE_COMPLETE_FINALIZE = 6,
+	CLUSTER_RECOVERY_FENCE_COMPLETE_PIN_RELEASE = 7
+} ClusterRecoveryFenceCompleteV1;
+
+extern ClusterRecoveryFenceCompleteV1
+cluster_recovery_merge_fence_plan_complete_v1(ClusterRecoveryFencePlan *plan, uint16 *failed_thread,
+											  int *failed_detail);
 
 /* Sole-merger claim lifecycle (spec-6.14 D9 amend; see the pure core
  * above).  acquire_blocking runs in PerformWalRecovery BEFORE the engage

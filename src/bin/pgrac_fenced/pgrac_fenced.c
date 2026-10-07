@@ -128,7 +128,7 @@ read_root_config(PgracFencedConfigV1 *config,
 		used += (size_t) got;
 	}
 	if (fstat(fd, &after) != 0 || !same_config_identity(&before, &after) ||
-		pgrac_fenced_config_parse_v1(bytes, used, config) !=
+		pgrac_fenced_config_parse(bytes, used, config) !=
 			PGRAC_FENCED_CONFIG_OK ||
 		!pgrac_fenced_config_digest_v1(bytes, used, digest))
 		goto done;
@@ -266,7 +266,7 @@ open_active_journal(const PgracFencedConfigV1 *config,
 			O_RDONLY | O_APPEND | O_NOFOLLOW);
 		if (sealed_fd < 0 || fstat(sealed_fd, &active_stat) != 0 ||
 			!pgrac_fenced_journal_file_stat_secure(&active_stat) ||
-			(uint64) active_stat.st_size != PGRAC_FENCED_JOURNAL_SEGMENT_BYTES ||
+			(uint64) active_stat.st_size < PGRAC_FENCED_JOURNAL_MIN_SEALED_BYTES ||
 			!pgrac_fenced_journal_load_sealed_reconcile_fd(sealed_fd, state,
 				&last_record, &have_last_record, reconcile) ||
 			!have_last_record ||
@@ -295,7 +295,7 @@ open_active_journal(const PgracFencedConfigV1 *config,
 		  memcmp(last_record.semantic_config_digest, config_digest,
 			  PGRAC_FENCED_CONFIG_DIGEST_BYTES) == 0)))
 		goto fail;
-	if (state->segment_record_count == PGRAC_FENCED_JOURNAL_SEGMENT_RECORDS)
+	if (!pgrac_fenced_journal_has_room(state, PGRAC_FENCED_JOURNAL_RECORD_BYTES))
 	{
 		if (!pgrac_fenced_journal_rotate_at(fd, &journal_fd, count, state,
 				sealed_name, sizeof(sealed_name)))
@@ -782,7 +782,10 @@ main(int argc, char **argv)
 			&reconcile) ||
 		!pgrac_fenced_coordinator_init(&coordinator, &operation_context) ||
 		!pgrac_fenced_rejoin_coordinator_init(&rejoin_coordinator,
-			&operation_context, &coordinator))
+			&operation_context, &coordinator) ||
+		!pgrac_fenced_coordinator_restore(&coordinator, &reconcile) ||
+		!pgrac_fenced_rejoin_coordinator_restore(&rejoin_coordinator, &reconcile) ||
+		reconcile.pending_count != 0)
 	{
 		fprintf(stderr, "pgrac-fenced secure runtime bootstrap failed\n");
 		goto done;
@@ -847,7 +850,7 @@ main(int argc, char **argv)
 		if (candidate_provider == NULL || candidate_provider != provider ||
 			!pgrac_fenced_provider_ops_valid(candidate_provider, false) ||
 			candidate_provider->abi_version != candidate_config->provider_abi ||
-			!pgrac_fenced_operation_prepare_mapping_reload(&operation_context,
+			!pgrac_fenced_coordinator_prepare_mapping_reload(&coordinator,
 				candidate_config, candidate_provider, candidate_digest) ||
 			!pgrac_fenced_rejoin_coordinator_shutdown(&rejoin_coordinator) ||
 			!pgrac_fenced_coordinator_shutdown(&coordinator, 17))

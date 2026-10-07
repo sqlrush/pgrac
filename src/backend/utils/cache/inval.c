@@ -139,27 +139,11 @@
  *
  * Modified by: SqlRush <sqlrush@gmail.com>
  *
- * What changed:
- *	  In AtEOXact_Inval(true) the SendSharedInvalidMessages callback passed
- *	  to ProcessInvalidationMessagesMulti is wrapped by
- *	  cluster_aware_send_shared_invalid_messages.  The wrapper invokes the
- *	  PG-native SendSharedInvalidMessages first (preserves local SI
- *	  semantics) and then cluster_sinval_enqueue_and_wait_ack to propagate
- *	  the same batch cluster-wide (peer_enqueued ack/barrier).
- *
- * Why:
- *	  Without this hook, DDL committed on one cluster node leaves
- *	  catalog/relcache state stale on all other nodes — silent correctness
- *	  failure for any cross-node read or planner reuse.  See
- *	  pgrac specs/spec-2.39-sinval-ddl-commit-hook-ack-barrier.md (FROZEN
- *	  v0.3) Q1 ★ A + Hardening v1.0.1 L172 (LMON-mediated outbound).
- *
- *	  COMMIT PREPARED path in twophase.c receives the same wrapper
- *	  treatment (separate PGRAC MODIFICATIONS block in that file).
- *
- *	  Inbound apply path in cluster_sinval_bcast.c MUST continue to call
- *	  SendSharedInvalidMessages directly (NOT the wrapper) to avoid
- *	  re-broadcast echo loop (HC132).
+ * The precommit hook captures the admitted membership and forces commit
+ * durability. AtEOXact_Inval installs native SI first, releases the local
+ * init-file lock, then publishes the same messages through LMON and waits
+ * for the exact receiver incarnations before transaction locks are released.
+ * Inbound SI insertion bypasses this wrapper to avoid rebroadcast loops.
  */
 #include "cluster/cluster_sinval.h"
 #include "cluster/cluster_conf.h"
@@ -169,13 +153,15 @@
 static void
 cluster_aware_send_shared_invalid_messages(const SharedInvalidationMessage *msgs, int n)
 {
-	/* Always apply locally first (PG-native semantics unchanged). */
-	SendSharedInvalidMessages(msgs, n);
-
-	/* Cluster propagation — only when cluster_enabled and we actually have
-	 * messages.  enqueue_and_wait_ack handles GUC ack_mode=none fast path. */
+	/* PGRAC: a durable commit cannot shed its locks with unacknowledged
+	 * catalog invalidation. The shared publication owner retains and retries. */
 	if (cluster_peer_mode_enabled() && n > 0)
-		(void)cluster_sinval_enqueue_and_wait_ack(msgs, n);
+	{
+		ClusterSinvalAckResult result = cluster_sinval_enqueue_and_wait_ack(msgs, n);
+
+		if (cluster_shared_catalog && result != CLUSTER_SINVAL_ACK_DONE)
+			ereport(PANIC, (errmsg("committed catalog invalidation was not acknowledged")));
+	}
 }
 #endif
 
@@ -422,7 +408,7 @@ AppendInvalidationMessageSubGroup(InvalidationMsgsGroup *dest, InvalidationMsgsG
 	do {                                                                                           \
 		int n = NumMessagesInSubGroup(group, subgroup);                                            \
 		if (n > 0) {                                                                               \
-			SharedInvalidationMessage *msgs                                                        \
+			const SharedInvalidationMessage *msgs                                                        \
 				= &InvalMessageArrays[subgroup].msgs[(group)->firstmsg[subgroup]];                 \
 			codeFragment;                                                                          \
 		}                                                                                          \
@@ -494,6 +480,8 @@ AddRelcacheInvalidationMessage(InvalidationMsgsGroup *group, Oid dbId, Oid relId
 	 * it will never change. InvalidOid for relId means all relations so we
 	 * don't need to add individual ones when it is present.
 	 */
+	/* The shared iteration macro also invokes mutable invalidation callbacks. */
+	// cppcheck-suppress constVariablePointer
 	ProcessMessageSubGroup(group, RelCacheMsgs,
 						   if (msg->rc.id == SHAREDINVALRELCACHE_ID
 							   && (msg->rc.relId == relId || msg->rc.relId == InvalidOid)) return);
@@ -520,6 +508,8 @@ AddSnapshotInvalidationMessage(InvalidationMsgsGroup *group, Oid dbId, Oid relId
 
 	/* Don't add a duplicate item */
 	/* We assume dbId need not be checked because it will never change */
+	/* The shared iteration macro also invokes mutable invalidation callbacks. */
+	// cppcheck-suppress constVariablePointer
 	ProcessMessageSubGroup(
 		group, RelCacheMsgs,
 		if (msg->sn.id == SHAREDINVALSNAPSHOT_ID && msg->sn.relId == relId) return);
@@ -997,7 +987,7 @@ xactGetCommittedInvalidationMessages(SharedInvalidationMessage **msgs, bool *Rel
  * before and after we send the SI messages. See AtEOXact_Inval()
  */
 void
-ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs, int nmsgs,
+ProcessCommittedInvalidationMessages(const SharedInvalidationMessage *msgs, int nmsgs,
 									 bool RelcacheInitFileInval, Oid dbid, Oid tsid)
 {
 	if (nmsgs <= 0)
@@ -1033,6 +1023,23 @@ ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs, int nmsgs,
 		RelationCacheInitFilePostInvalidate();
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: capture the admitted cohort before commit becomes irreversible.
+ * Catalog rows use the original durable transaction outcome. Author: SqlRush. */
+void
+PreCommit_ClusterInval(void)
+{
+	cluster_sinval_clear_commit();
+	if (cluster_shared_catalog && cluster_peer_mode_enabled() && transInvalInfo != NULL
+		&& (NumMessagesInGroup(&transInvalInfo->PriorCmdInvalidMsgs) > 0
+			|| NumMessagesInGroup(&transInvalInfo->ii.CurrentCmdInvalidMsgs) > 0))
+	{
+		cluster_sinval_prepare_commit();
+		ForceSyncCommit();
+	}
+}
+#endif
+
 /*
  * AtEOXact_Inval
  *		Process queued-up invalidation messages at end of main transaction.
@@ -1062,6 +1069,11 @@ AtEOXact_Inval(bool isCommit)
 {
 	inplaceInvalInfo = NULL;
 
+#ifdef USE_PGRAC_CLUSTER
+	if (!isCommit || transInvalInfo == NULL)
+		cluster_sinval_clear_commit();
+#endif
+
 	/* Quick exit if no transactional messages */
 	if (transInvalInfo == NULL)
 		return;
@@ -1070,6 +1082,11 @@ AtEOXact_Inval(bool isCommit)
 	Assert(transInvalInfo->my_level == 1 && transInvalInfo->parent == NULL);
 
 	if (isCommit) {
+#ifdef USE_PGRAC_CLUSTER
+		/* Shared catalog commit is durable; cleanup errors enter recovery. */
+		if (cluster_shared_catalog && cluster_peer_mode_enabled())
+			START_CRIT_SECTION();
+#endif
 		/*
 		 * Relcache init file invalidation requires processing both before and
 		 * after we send the SI messages.  However, we need not do anything
@@ -1082,17 +1099,18 @@ AtEOXact_Inval(bool isCommit)
 								   &transInvalInfo->ii.CurrentCmdInvalidMsgs);
 
 		ProcessInvalidationMessagesMulti(&transInvalInfo->PriorCmdInvalidMsgs,
-#ifdef USE_PGRAC_CLUSTER
-										 /* PGRAC: spec-2.39 D1 — cluster-aware wrapper
-										  * (preserves PG-local SI semantics + adds
-										  * cluster_sinval_enqueue_and_wait_ack call). */
-										 cluster_aware_send_shared_invalid_messages);
-#else
-										 SendSharedInvalidMessages);
-#endif
+										SendSharedInvalidMessages);
 
 		if (transInvalInfo->ii.RelcacheInitFileInval)
 			RelationCacheInitFilePostInvalidate();
+#ifdef USE_PGRAC_CLUSTER
+		/* Never wait for peers while holding the local RelCacheInitLock:
+		* their broadcasters may be serving a simultaneous publication. */
+		ProcessInvalidationMessagesMulti(&transInvalInfo->PriorCmdInvalidMsgs,
+										cluster_aware_send_shared_invalid_messages);
+		if (cluster_shared_catalog && cluster_peer_mode_enabled())
+			END_CRIT_SECTION();
+#endif
 	} else {
 		ProcessInvalidationMessages(&transInvalInfo->PriorCmdInvalidMsgs,
 									LocalExecuteInvalidationMessage);
@@ -1100,6 +1118,9 @@ AtEOXact_Inval(bool isCommit)
 
 	/* Need not free anything explicitly */
 	transInvalInfo = NULL;
+#ifdef USE_PGRAC_CLUSTER
+	cluster_sinval_clear_commit();
+#endif
 }
 
 /*

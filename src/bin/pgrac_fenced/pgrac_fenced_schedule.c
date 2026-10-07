@@ -162,6 +162,29 @@ pgrac_fenced_schedule_init(PgracFencedScheduleV1 *schedule)
 	return true;
 }
 
+bool
+pgrac_fenced_schedule_init_owned(PgracFencedScheduleV1 *schedule)
+{
+	if (!pgrac_fenced_schedule_init(schedule))
+		return false;
+	schedule->caller_independent = true;
+	return true;
+}
+
+static void
+join_operation(PgracFencedScheduleV1 *schedule, uint32 slot, int client_id,
+			   uint64 deadline_mono_ns, PgracFencedScheduleTicketV1 *ticket)
+{
+	PgracFencedScheduledOperationV1 *operation = &schedule->operations[slot];
+
+	operation->clients[operation->client_count].client_id = client_id;
+	operation->clients[operation->client_count].deadline_mono_ns = deadline_mono_ns;
+	operation->client_count++;
+	schedule->client_count++;
+	ticket->slot = slot;
+	ticket->serial = operation->serial;
+}
+
 PgracFencedScheduleResult
 pgrac_fenced_schedule_submit(PgracFencedScheduleV1 *schedule,
 						 int client_id, const uint8 target_uuid[16],
@@ -178,12 +201,14 @@ pgrac_fenced_schedule_submit(PgracFencedScheduleV1 *schedule,
 	if (ticket == NULL)
 		return PGRAC_FENCED_SCHEDULE_DENY;
 	ticket_clear(ticket);
-	if (schedule == NULL || client_id < 0 || target_uuid == NULL ||
-		binding_digest == NULL || deadline_mono_ns == 0 ||
+	if (schedule == NULL || client_id < -1 || target_uuid == NULL ||
+		binding_digest == NULL ||
+		(client_id == -1 && (!schedule->caller_independent || deadline_mono_ns != 0)) ||
+		(client_id >= 0 && deadline_mono_ns == 0) ||
 		!bytes_nonzero(target_uuid, 16) ||
 		!bytes_nonzero(binding_digest, 32) ||
-		schedule->client_count >= PGRAC_FENCED_MAX_CLIENTS ||
-		client_present(schedule, client_id))
+		(client_id >= 0 && (schedule->client_count >= PGRAC_FENCED_MAX_CLIENTS ||
+		 client_present(schedule, client_id))))
 		return PGRAC_FENCED_SCHEDULE_DENY;
 	for (i = 0; i < PGRAC_FENCED_MAX_OPERATIONS; i++)
 	{
@@ -196,19 +221,29 @@ pgrac_fenced_schedule_submit(PgracFencedScheduleV1 *schedule,
 		active = operation;
 		active_slot = i;
 	}
-	if (active != NULL && state_joinable(active->state) &&
+	if (client_id >= 0 && active != NULL && state_joinable(active->state) &&
 		memcmp(active->binding_digest, binding_digest, 32) == 0)
 	{
 		if (active->client_count >= PGRAC_FENCED_MAX_CLIENTS)
 			return PGRAC_FENCED_SCHEDULE_DENY;
-		active->clients[active->client_count].client_id = client_id;
-		active->clients[active->client_count].deadline_mono_ns =
-			deadline_mono_ns;
-		active->client_count++;
-		schedule->client_count++;
-		ticket->slot = active_slot;
-		ticket->serial = active->serial;
+		join_operation(schedule, active_slot, client_id, deadline_mono_ns, ticket);
 		return PGRAC_FENCED_SCHEDULE_JOIN;
+	}
+	if (schedule->caller_independent && client_id >= 0)
+	{
+		/* A live waiter may join queued work; replayed UUIDs never coalesce. */
+		for (i = 0; i < PGRAC_FENCED_MAX_OPERATIONS; i++)
+		{
+			operation = &schedule->operations[i];
+			if (operation->used && !operation->active &&
+				operation->state == PGRAC_FENCED_STATE_QUEUED &&
+				memcmp(operation->target_uuid, target_uuid, 16) == 0 &&
+				memcmp(operation->binding_digest, binding_digest, 32) == 0)
+			{
+				join_operation(schedule, i, client_id, deadline_mono_ns, ticket);
+				return PGRAC_FENCED_SCHEDULE_JOIN;
+			}
+		}
 	}
 	if (!allocate_operation(schedule, &slot) || schedule->next_serial == 0 ||
 		schedule->next_queue_order == 0)
@@ -221,15 +256,13 @@ pgrac_fenced_schedule_submit(PgracFencedScheduleV1 *schedule,
 		PGRAC_FENCED_STATE_QUEUED;
 	memcpy(operation->target_uuid, target_uuid, 16);
 	memcpy(operation->binding_digest, binding_digest, 32);
-	operation->deadline_mono_ns = deadline_mono_ns;
+	operation->deadline_mono_ns = schedule->caller_independent ? 0 : deadline_mono_ns;
 	operation->serial = schedule->next_serial++;
 	if (!operation->active)
 		operation->queue_order = schedule->next_queue_order++;
-	operation->clients[0].client_id = client_id;
-	operation->clients[0].deadline_mono_ns = deadline_mono_ns;
-	operation->client_count = 1;
 	schedule->operation_count++;
-	schedule->client_count++;
+	if (client_id >= 0)
+		join_operation(schedule, slot, client_id, deadline_mono_ns, ticket);
 	if (operation->active)
 		schedule->active_count++;
 	ticket->slot = slot;
@@ -323,7 +356,8 @@ pgrac_fenced_schedule_cancel_client(PgracFencedScheduleV1 *schedule,
 			memset(&operation->clients[operation->client_count], 0,
 				sizeof(operation->clients[0]));
 			schedule->client_count--;
-			if (operation->client_count == 0 && !operation->active)
+			if (operation->client_count == 0 && !operation->active &&
+				!schedule->caller_independent)
 			{
 				schedule->operation_count--;
 				memset(operation, 0, sizeof(*operation));

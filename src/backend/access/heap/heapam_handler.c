@@ -52,6 +52,9 @@
 #include "utils/rel.h"
 
 #include "heapam_r4_private.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_heap_horizon.h"
+#endif
 
 static void reform_and_rewrite_tuple(HeapTuple tuple,
 									 Relation OldHeap, Relation NewHeap,
@@ -907,6 +910,16 @@ heapam_relation_set_new_filelocator(Relation rel,
 	 * will do.
 	 */
 	*freezeXid = RecentXmin;
+#ifdef USE_PGRAC_CLUSTER
+	/* A newly created permanent table is transaction-local until commit, but
+	 * its freeze metadata must already cover future writers on every stripe. */
+	if (persistence == RELPERSISTENCE_PERMANENT
+		&& !cluster_heap_freeze_cutoff_v1(*freezeXid, freezeXid))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("shared heap freeze boundary is not established"),
+				 errhint("Check cluster XID stripe activation and the retained XID window before retrying.")));
+#endif
 
 	/*
 	 * Similarly, initialize the minimum Multixact to the first value that
@@ -980,6 +993,11 @@ heapam_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 	for (ForkNumber forkNum = MAIN_FORKNUM + 1;
 		 forkNum <= MAX_FORKNUM; forkNum++)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: creation owns the destination's new persistent identity. */
+		if (forkNum == SPACE_FORKNUM)
+			continue;
+#endif
 		if (smgrexists(RelationGetSmgr(rel), forkNum))
 		{
 			smgrcreate(dstrel, forkNum, false);

@@ -54,6 +54,9 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_service_observe.h"
+#include "cluster/cluster_lock_owner.h"
 
 #include <signal.h>
 #include <sys/resource.h> /* PGRAC: spec-7.3 D8 setpriority (cluster.lms_nice) */
@@ -74,6 +77,7 @@
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_tier1.h" /* CLUSTER_IC_TIER1_DATA_CHANNELS (spec-7.3 D3) */
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_startup_phase.h"
@@ -999,67 +1003,28 @@ ClusterNormalStopPollResult
 cluster_lms_normal_stop_idle(void)
 {
 	static TimestampTz last_pending_log;
-	ClusterNormalStopPollResult aggregate = CLUSTER_NORMAL_STOP_READY;
-	const char *first_reason = "NONE";
-	const char *first_domain = "NONE";
-	int first_slot = -1;
+	ClusterNormalStopPollResult aggregate;
+	ClusterServiceObservation observation;
 
 	if (!cluster_normal_stop_requested())
 		return CLUSTER_NORMAL_STOP_READY;
-	/* Every poll runs in the real owner outside a work bracket/leave lock.
-	 * Do not let an earlier PENDING hide a later malformed responsibility. */
-	for (int module = 0; module < 5; module++) {
-		ClusterNormalStopPollResult result;
-		const char *reason = "NONE";
-		const char *domain = "NONE";
-		int slot = -1;
-		int worker = -1;
-		uint32 position = 0;
-
-		switch (module) {
-		case 0:
-			domain = "CR";
-			result = cluster_cr_server_normal_stop_poll(&slot, &reason);
-			break;
-		case 1:
-			domain = "NATIVE_PROBE";
-			result = cluster_lms_native_probe_normal_stop_poll(&slot, &reason);
-			break;
-		case 2:
-			domain = "GCS_LOCAL";
-			result = cluster_gcs_block_normal_stop_local_poll(&slot, &reason);
-			break;
-		case 3:
-			domain = "OUTBOUND";
-			result = cluster_lms_outbound_normal_stop_poll(&worker, &position, &reason);
-			slot = worker;
-			break;
-		default:
-			result = cluster_ic_normal_stop_poll(&domain, &slot, &position, &reason);
-			break;
-		}
-		if ((result == CLUSTER_NORMAL_STOP_INVALID && aggregate != CLUSTER_NORMAL_STOP_INVALID)
-			|| (result == CLUSTER_NORMAL_STOP_PENDING && aggregate == CLUSTER_NORMAL_STOP_READY)) {
-			aggregate = result;
-			first_reason = reason;
-			first_domain = domain;
-			first_slot = slot;
-		}
-	}
+	/* PGRAC: original module observations are also usable online, without
+	 * borrowing this wrapper's stop-request shortcut or one-way seal. */
+	aggregate = cluster_service_normal_stop_observe(&observation);
 	if (aggregate == CLUSTER_NORMAL_STOP_PENDING) {
 		TimestampTz now = GetCurrentTimestamp();
 		if (last_pending_log == 0 || now - last_pending_log >= INT64CONST(1000000)) {
 			last_pending_log = now;
 			ereport(LOG, (errmsg_internal("LMS normal-stop responsibility pending"),
 						  errdetail("aux=%d domain=%s slot=%d reason=%s", (int)MyAuxProcType,
-									first_domain, first_slot, first_reason)));
+									observation.domain, observation.slot, observation.reason)));
 		}
 	}
 	if (aggregate == CLUSTER_NORMAL_STOP_INVALID) {
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
-		ereport(LOG,
-				(errmsg_internal("LMS normal-stop responsibility invalid"),
-				 errdetail("domain=%s slot=%d reason=%s", first_domain, first_slot, first_reason)));
+		ereport(LOG, (errmsg_internal("LMS normal-stop responsibility invalid"),
+					  errdetail("domain=%s slot=%d reason=%s", observation.domain, observation.slot,
+								observation.reason)));
 	}
 	return cluster_normal_stop_service_idle(aggregate);
 }
@@ -1230,6 +1195,10 @@ LmsMain(void)
 		PG_TRY();
 		{
 			pg_atomic_fetch_add_u64(&cluster_lms_state->lms_drain_empty_count, 1);
+			/* PGRAC: exact control cleanup/reconstruction is nonblocking.
+			 * Author: SqlRush <sqlrush@gmail.com> */
+			cluster_cf_retirement_poll();
+			cluster_lock_owners_service_poll();
 			cluster_lms_native_probe_retry_tick();
 			/* PGRAC: spec-6.12b — construct parked CR-server requests (every
 		 * failure becomes a DENIED result; LMS never exits over a serve). */
@@ -1295,6 +1264,8 @@ LmsMain(void)
 			ereport(FATAL, (errmsg_internal("LMS failed normal-stop responsibility check")));
 		/* DATA tick owns separate management/dispatch brackets. Neither
 		 * its WaitEventSetWait nor this fallback may retain our active bit. */
+		lms_wait_timeout_ms
+			= cluster_pcm_lock_resource_x_outbound_wait_timeout(lms_wait_timeout_ms);
 		if (cluster_lms_data_plane_enabled())
 			cluster_lms_data_plane_tick(lms_wait_timeout_ms);
 		else {
@@ -1438,6 +1409,8 @@ LmsWorkerMain(int worker_id)
 			ereport(FATAL, (errmsg_internal("LMS worker cannot enter normal-stop work segment")));
 		PG_TRY();
 		{
+			cluster_cf_retirement_poll();
+			cluster_lock_owners_service_poll();
 			if (cluster_lms_data_plane_enabled()) {
 				/* Current-MX proof requests are sharded by request identity.  The
 			 * origin FSM is process-local, so every DATA worker must advance
@@ -1494,7 +1467,14 @@ cluster_lms_get_worker_pid(int worker_id)
 
 	if (cluster_lms_state == NULL || worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
 		return 0;
-	LWLockAcquire(&cluster_lms_state->lwlock, LW_SHARED);
+	/* Postmaster's optional serving wake cannot queue without a PGPROC.
+	 * Its generation request is already published; the LMS idle tick also
+	 * observes it when this PID snapshot is temporarily unavailable. */
+	if (!IsUnderPostmaster) {
+		if (!LWLockConditionalAcquire(&cluster_lms_state->lwlock, LW_SHARED))
+			return 0;
+	} else
+		LWLockAcquire(&cluster_lms_state->lwlock, LW_SHARED);
 	pid = cluster_lms_state->worker_pids[worker_id];
 	LWLockRelease(&cluster_lms_state->lwlock);
 	return pid;
@@ -1997,16 +1977,33 @@ native_probe_wake(void)
 }
 
 static bool
-native_probe_authority_current(const ClusterLmsNativeLockProbeSlot *work)
+native_probe_cut_current(const ClusterLmsNativeLockProbeSlot *work)
 {
-	LOCKMODE mode;
+	uint64 generation;
+	int32 master;
 
 	if (work->requester.cluster_epoch != cluster_epoch_get_current())
 		return false;
 	if (!work->grant_on_clear)
 		return true; /* The synchronous caller can still own an S3 reservation. */
-	if (work->shard_master_generation_lo != (uint32)cluster_lms_get_shard_master_generation())
+	master = cluster_grd_lookup_master_gen(&work->resid, &generation);
+	return master == cluster_node_id && work->receiver_generation_lo != 0
+		   && generation
+				  == (((work->requester.cluster_epoch & 0xffffffffu) << 32)
+					  | (uint64)work->receiver_generation_lo)
+		   && cluster_grd_shard_phase(cluster_grd_shard_for_resource(&work->resid))
+				  == GRD_SHARD_NORMAL;
+}
+
+static bool
+native_probe_authority_current(const ClusterLmsNativeLockProbeSlot *work)
+{
+	LOCKMODE mode;
+
+	if (!native_probe_cut_current(work))
 		return false;
+	if (!work->grant_on_clear)
+		return true;
 	if (work->request_opcode == GES_REQ_OPCODE_CONVERT)
 		return true; /* Original precise old-mode locator is checked at commit. */
 	return cluster_grd_holder_mode_by_id(&work->resid, &work->requester, &mode)
@@ -2296,9 +2293,7 @@ native_probe_aggregate(uint32 slot_idx, uint64 probe_id)
 		if (!native_probe_authority_current(&work)) {
 			/* Exact REQUEST holder removed by S7/release: never resurrect it.
 			 * A real epoch/generation change still gets a correlated refusal. */
-			if (work.requester.cluster_epoch != cluster_epoch_get_current()
-				|| work.shard_master_generation_lo
-					   != (uint32)cluster_lms_get_shard_master_generation()) {
+			if (!native_probe_cut_current(&work)) {
 				if (work.request_opcode != GES_REQ_OPCODE_CONVERT)
 					(void)cluster_grd_release_holder_by_id(&work.resid, &work.requester);
 				native_probe_send_reject_reply(&work, GES_REJECT_REASON_SHARD_FROZEN);
@@ -2490,7 +2485,7 @@ bool
 cluster_lms_native_probe_schedule_grant(const ClusterResId *resid, LOCKMODE lockmode,
 										const ClusterGrdHolderId *requester, int32 source_node_id,
 										uint32 request_opcode, uint64 shard_master_generation,
-										LOCKMODE convert_current_mode)
+										uint64 receiver_generation, LOCKMODE convert_current_mode)
 {
 	ClusterLmsNativeLockProbeSlot work;
 	uint32 slot_idx;
@@ -2506,7 +2501,9 @@ cluster_lms_native_probe_schedule_grant(const ClusterResId *resid, LOCKMODE lock
 	memset(&work, 0, sizeof(work));
 	cluster_grd_resid_decode(resid, &work.locktag);
 	work.lockmode = lockmode;
-	work.origin_node_id = cluster_node_id;
+	/* Preserve the drain's original receiver cut across async fanout. The
+	 * sender's generation remains solely dedup/conversion provenance. */
+	work.receiver_generation_lo = (uint32)receiver_generation;
 	work.requester_procno = requester->procno;
 	work.requester = *requester;
 	work.resid = *resid;
@@ -2539,7 +2536,6 @@ cluster_lms_native_probe_wait_clear(const ClusterResId *resid, LOCKMODE lockmode
 	memset(&work, 0, sizeof(work));
 	cluster_grd_resid_decode(resid, &work.locktag);
 	work.lockmode = lockmode;
-	work.origin_node_id = cluster_node_id;
 	work.requester_procno = requester->procno;
 	work.requester = *requester;
 	work.resid = *resid;

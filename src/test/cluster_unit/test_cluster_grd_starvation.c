@@ -49,6 +49,9 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "miscadmin.h"
+
+BackendType MyBackendType = B_LMON;
 
 #include <signal.h>
 #include <stdlib.h>
@@ -68,6 +71,7 @@
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 (L238) — gate_unfreeze proto */
 #include "port/atomics.h"
 #include "storage/lock.h"
+#include "storage/proc.h"
 #include "storage/s_lock.h"
 #include "utils/hsearch.h"
 
@@ -330,19 +334,58 @@ cluster_gcs_lookup_master_static(BufferTag tag pg_attribute_unused())
 {
 	return 0;
 }
+/* This grant-queue fixture has no shared membership owner or formation.
+ * It must never qualify the completed JOIN memo. */
+uint64
+cluster_membership_cut_generation(void)
+{
+	return 0;
+}
+
+bool
+cluster_membership_cut_generation_current(uint64 expected pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread pg_attribute_unused(),
+											   ClusterFormationSnapshotV1 *out
+												   pg_attribute_unused())
+{
+	return false;
+}
+
+void
+cluster_reconfig_snapshot_removed_bitmap(uint8 *out)
+{
+	memset(out, 0, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+}
+
+int
+cluster_pcm_local_pi_redeclare_scan_chunk(int start, int max_scan pg_attribute_unused(),
+										  uint64 epoch pg_attribute_unused(),
+										  ClusterGcsRedeclareCallback cb pg_attribute_unused(),
+										  void *arg pg_attribute_unused())
+{
+	return start; /* The queue fixture owns no local PI entries. */
+}
+
 bool
 cluster_membership_is_member(int32 node_id pg_attribute_unused())
 {
 	return true;
 }
-void
+bool
 cluster_gcs_block_send_redeclare(BufferTag tag pg_attribute_unused(),
 								 uint8 held_mode pg_attribute_unused(),
 								 XLogRecPtr page_lsn pg_attribute_unused(),
 								 SCN page_scn pg_attribute_unused(),
 								 uint64 cluster_epoch pg_attribute_unused(),
 								 int master_node pg_attribute_unused())
-{}
+{
+	return true;
+}
 /* spec-4.7 D2/D7 (P0 fix) — controllable scan: fake_scan_nbuffers == 0 (default)
  * means "no buffers → instant done" (the no-op other tests expect);  a test
  * raises it to model a multi-tick scan so grd_block_redeclare_scan_complete
@@ -863,12 +906,14 @@ ut_wfg_waiter_wait_seq(int32 node, uint32 procno, uint64 epoch, uint64 rid)
 /* PG runtime stubs needed by D8 cluster_grd_sweep_local_stale_procnos. */
 LWLockPadded *MainLWLockArray = NULL;
 int MaxBackends = 100;
-typedef struct PROC_HDR_STUB {
-	void *allProcs;
-	int allProcCount;
-} PROC_HDR_STUB;
-static PROC_HDR_STUB stub_proc_global = { NULL, 0 };
-void *ProcGlobal = &stub_proc_global;
+static PGPROC stub_proc_slots[1];
+static PROC_HDR stub_proc_global = { .allProcs = stub_proc_slots, .allProcCount = 1 };
+PROC_HDR *ProcGlobal = &stub_proc_global;
+void
+SetLatch(Latch *latch)
+{
+	latch->is_set = true;
+}
 void *
 palloc0(Size sz)
 {
@@ -907,6 +952,29 @@ set_mock_declared(int count, const int32 *nodes)
 
 
 /* spec-5.10 D7 GUC stubs (defined in cluster_guc.c in the backend build). */
+/* From B's audited fixture update: recovery is outside this fairness test.
+ * Unexpected use stays closed instead of fabricating an empty census. */
+bool cluster_shared_catalog = false;
+bool cluster_control_request_census(uint64 epoch, uint64 *version);
+bool cluster_control_request_census_unchanged(uint64 epoch, uint64 version);
+bool cluster_sinval_reconfig_reset_ready(uint64 epoch);
+bool
+cluster_control_request_census(uint64 epoch pg_attribute_unused(), uint64 *version)
+{
+	*version = 0;
+	return false;
+}
+bool
+cluster_control_request_census_unchanged(uint64 epoch pg_attribute_unused(),
+										 uint64 version pg_attribute_unused())
+{
+	return false;
+}
+bool
+cluster_sinval_reconfig_reset_ready(uint64 epoch pg_attribute_unused())
+{
+	return false;
+}
 int cluster_ges_starvation_max_skips = 8;
 
 /* spec-6.12e1 — handoff-verifier stubs (cluster_grd.o's release_and_drain

@@ -22,6 +22,8 @@
 #define CLUSTER_CONTROL_ROOT_FORMAT_R14_BOUND_V1 UINT64_C(0x04)
 #define CLUSTER_CONTROL_ROOT_FORMAT_MIGRATION_BINDING_V1 UINT64_C(0x08)
 #define CLUSTER_CONTROL_ROOT_FORMAT_FLAGS_V1 UINT64_C(0x0d)
+#define CLUSTER_CONTROL_ROOT_FORMAT_CREATION_BINDING_V1 UINT64_C(0x10)
+#define CLUSTER_CONTROL_ROOT_FORMAT_CREATION_FLAGS_V1 UINT64_C(0x15)
 
 #define CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID UINT32_C(0x00000001)
 #define CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID UINT32_C(0x00000004)
@@ -49,6 +51,8 @@
 #define PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1 (UINT64_C(1) << 22)
 #define PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_SERIAL_V1 (UINT64_C(1) << 23)
 #define PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1 (UINT64_C(1) << 24)
+#define PGRAC_CONTROL_ROOT_FEATURE_SPACE_IDENTITY_V1 (UINT64_C(1) << 25)
+#define PGRAC_CONTROL_ROOT_FEATURE_SPACE_RESERVATION_V1 (UINT64_C(1) << 26)
 /* Bit 0 is the already-frozen R4 synchronous-CR semantic feature.  Keep the
  * complete root-v1 known set public so every reader rejects the same unknown
  * bits; inclusion here is understanding, not activation. */
@@ -59,7 +63,8 @@
 	 | PGRAC_CONTROL_ROOT_FEATURE_CONSERVATIVE_COMMIT_SCN_V1                                       \
 	 | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1                                        \
 	 | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_SERIAL_V1                                               \
-	 | PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1)
+	 | PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1 | PGRAC_CONTROL_ROOT_FEATURE_SPACE_IDENTITY_V1 \
+	 | PGRAC_CONTROL_ROOT_FEATURE_SPACE_RESERVATION_V1)
 
 typedef enum ClusterControlRootLifecycle {
 	CLUSTER_CONTROL_ROOT_LIFECYCLE_UNUSED = 0,
@@ -74,6 +79,18 @@ typedef enum ClusterControlRootActivationState {
 	CLUSTER_CONTROL_ROOT_ACTIVATION_PREPARED = 1,
 	CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE = 2
 } ClusterControlRootActivationState;
+
+/* PGRAC: root-v2 database state encoding; decoding is not admission.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef enum ClusterControlRootDatabaseState {
+	CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED = 1,
+	CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING = 2,
+	CLUSTER_CONTROL_ROOT_DATABASE_OPEN = 3,
+	CLUSTER_CONTROL_ROOT_DATABASE_CLOSING = 4,
+	CLUSTER_CONTROL_ROOT_DATABASE_CLOSED = 5
+	/* Value 6 was cold-import rollback; deliberately not reused. */
+} ClusterControlRootDatabaseState;
 
 typedef enum ClusterControlRootCheckpointSource {
 	CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1 = 1,
@@ -148,6 +165,21 @@ typedef struct ClusterControlRootReadToken {
 	uint32 root_flags;
 } ClusterControlRootReadToken;
 
+/* PGRAC PRE2: a typed terminal is a durable, root-selected proof that the
+ * failed initializer was closed without becoming a serving writer.  It is a
+ * rejoin input only; it never changes the root lifecycle or grants serving
+ * authority.  The proof is deliberately fixed-size so callers bind it into
+ * their existing rejoin digest without changing the provider/wire ABI. */
+typedef struct ClusterControlRootRejoinTerminalProofV1 {
+	uint64 failed_incarnation;
+	uint64 terminal_generation;
+	uint8 terminal_sha256[PG_SHA256_DIGEST_LENGTH];
+	uint8 operation_uuid[16];
+} ClusterControlRootRejoinTerminalProofV1;
+
+StaticAssertDecl(sizeof(ClusterControlRootRejoinTerminalProofV1) == 64,
+				 "rejoin terminal proof ABI");
+
 typedef struct ClusterControlRootPatch {
 	uint64 mask;
 	uint32 expected_lifecycle;
@@ -207,7 +239,11 @@ typedef enum ClusterControlRootResult {
 	CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED = 24,
 	CLUSTER_CONTROL_ROOT_HASH_MISMATCH = 25,
 	CLUSTER_CONTROL_ROOT_MIGRATION_ROUND_MISMATCH = 26,
-	CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN = 27
+	CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN = 27,
+	/* Native group-flush only: no ACK; release WALWriteLock before waiting. */
+	CLUSTER_CONTROL_ROOT_RECONFIG_WAIT = 28,
+	/* Valid historical input that this shared recovery profile cannot consume. */
+	CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED = 29
 } ClusterControlRootResult;
 
 typedef struct ClusterControlRootMigrationImage {
@@ -247,6 +283,69 @@ typedef struct ClusterControlRootFileToken {
 	uint64 system_identifier;
 	uint8 image_sha256[32];
 } ClusterControlRootFileToken;
+
+/* PGRAC: original LMON consumes the durable PGSA OPEN and its exact PGRD
+ * (CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES bytes). The live OPEN_APPLIED/formation
+ * owners are rechecked here; caller bytes alone never authorize publication.
+ * Coordinator publishes installed fixed-cohort writers MOUNTED -> OPEN;
+ * members only observe that publication. Only OK_PRIMARY returns a token,
+ * after durable readback and confirmed release of this duty's CF owner.
+ * LOCK_UNAVAILABLE/RECONFIG_WAIT require a later tick, not a blocking wait.
+ * Cancel retires only this duty; neither call grants SQL admission by itself.
+ * Author: SqlRush <sqlrush@gmail.com> */
+struct ClusterSemanticActivationRecord;
+extern ClusterControlRootResult
+cluster_control_root_v3_serving_poll(const struct ClusterSemanticActivationRecord *open,
+									 const uint8 *root_descriptor,
+									 ClusterControlRootFileToken *out);
+extern void cluster_control_root_v3_serving_cancel(void);
+
+/* PGRAC: checkpoint-less initialization is a separate recovery subject, not
+ * a checkpoint-bearing root record. These value-owned observations confer no
+ * isolation, WAL retention, replay or publication authority.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef enum ClusterControlRecoverySubjectKind {
+	CLUSTER_CONTROL_RECOVERY_CURRENT_CHECKPOINT = 0,
+	CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER = 1
+} ClusterControlRecoverySubjectKind;
+
+typedef struct ClusterControlPendingToken {
+	ClusterControlRootFileToken file;
+	uint64 generation;
+	uint8 sha256[32];
+	uint8 operation_uuid[16];
+} ClusterControlPendingToken;
+
+typedef struct ClusterControlRecoverySubject {
+	ClusterControlRecoverySubjectKind kind;
+	ClusterRecoveryDutyKey duty;
+	ClusterControlRootSnapshot current;
+	ClusterControlRootReadToken current_token;
+	ClusterControlPendingToken pending;
+} ClusterControlRecoverySubject;
+
+/* Syntax/identity only; callers must re-read the selected files and acquire
+ * their existing isolation and lock owners before acting on this token. */
+static inline bool
+cluster_control_pending_token_matches(const ClusterControlPendingToken *token,
+									  const ClusterRecoveryDutyKey *duty)
+{
+	uint8 file_hash = 0, object_hash = 0, operation = 0;
+	if (token == NULL || duty == NULL)
+		return false;
+	for (unsigned i = 0; i < 32; i++) {
+		file_hash |= token->file.image_sha256[i];
+		object_hash |= token->sha256[i];
+	}
+	for (unsigned i = 0; i < 16; i++)
+		operation |= token->operation_uuid[i];
+	return file_hash != 0 && object_hash != 0 && operation != 0 && token->generation != 0
+		   && token->file.file_txn_seq != 0 && token->file.format_version == 3
+		   && token->file.record_count == 128
+		   && token->file.activation_state == CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		   && token->file.system_identifier == duty->system_identifier
+		   && memcmp(token->file.authority_uuid, duty->authority_uuid, 16) == 0;
+}
 
 StaticAssertDecl(sizeof(ClusterControlRootIdentity) == 80, "ClusterControlRootIdentity ABI");
 StaticAssertDecl(offsetof(ClusterControlRootIdentity, system_identifier) == 0,
@@ -461,6 +560,37 @@ cluster_control_root_read_canonical_dead_origin(uint16 origin_thread_id,
 extern ClusterControlRootResult cluster_control_root_lookup_owner_by_node_runtime(
 	int32 old_node_id, ClusterControlRootIdentity *out_identity,
 	ClusterControlRootSnapshot *out_snapshot, ClusterControlRootReadToken *out_token);
+/* Validate a failed initializer's typed terminal against the exact current
+ * root cut supplied by the caller.  This accepts no lifecycle shortcut: the
+ * selected terminal must be present in the current root's retained union,
+ * match the failed identity/incarnation, and have no pending replacement for
+ * that origin.  Output is cleared on every refusal. */
+extern ClusterControlRootResult cluster_control_root_v3_validate_rejoin_terminal(
+	/* expected_identity is the current root namespace; failed_incarnation is
+	 * the distinct initializer claim selected from retained terminal history. */
+	const ClusterControlRootIdentity *expected_identity, uint64 failed_incarnation,
+	const ClusterControlRootSnapshot *expected_snapshot,
+	const ClusterControlRootReadToken *expected_token,
+	ClusterControlRootRejoinTerminalProofV1 *out_proof);
+/* A terminal remains a retention input until a consumer explicitly proves
+ * closure.  The current PRE2 consumer is intentionally conservative: any
+ * selected terminal blocks destructive reuse, and no reservation/install path
+ * may prune it. */
+extern ClusterControlRootResult cluster_control_root_v3_terminal_history_blocked(
+	const ClusterControlRootIdentity *expected_identity, bool *out_blocked);
+/* Revalidate the provider-mediated rejoin terminal after membership commit.
+ * This boundary cannot discharge restart dependencies: an exact proof returns
+ * RECONFIG_WAIT with consumed=false. The serving successor's later checkpoint
+ * transfers those dependencies and retires the reference atomically. */
+extern ClusterControlRootResult cluster_control_root_v3_consume_rejoin_terminal(
+	const ClusterControlRootIdentity *expected_identity, uint64 candidate_incarnation,
+	const ClusterControlRootSnapshot *expected_snapshot,
+	const ClusterControlRootReadToken *expected_token,
+	const ClusterControlRootRejoinTerminalProofV1 *proof, bool *out_consumed);
+extern ClusterControlRootResult
+cluster_control_root_read_recovery_subject(uint16 origin_thread,
+										   const ClusterControlRootIdentity *expected,
+										   ClusterControlRecoverySubject *out);
 extern ClusterControlRootResult cluster_control_root_compare_and_publish(
 	const ClusterControlRootReadToken *expected_token, const ClusterControlRootPatch *patch,
 	ClusterControlRootPublishReason reason, ClusterControlRootSnapshot *out_snapshot,

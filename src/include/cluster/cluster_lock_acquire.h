@@ -205,6 +205,9 @@ typedef struct ClusterLockAcquireRequest {
 	ClusterGesHwGrant hw_grant;
 	/* Backend-local static typed reason, captured at the failed S5 predicate. */
 	const char *registration_failure_reason;
+	/* PRE2 manual-control owner: process-local stable identity, never a
+	 * pointer into a copyable guard or the wire. Author: SqlRush. */
+	uint64 control_owner_id;
 } ClusterLockAcquireRequest;
 
 /* Error owner around the complete PG-native acquisition body.  The callback
@@ -426,9 +429,9 @@ cluster_lock_should_globalize(const LOCKTAG *locktag, LOCKMODE lockmode, bool se
 		 * relfile (lost write).  Catalog reads (< RowExclusive) and non-mapped
 		 * low-mode writes stay native -- read consistency comes from the relmap
 		 * two-phase + CF page coherency, not a heavyweight lock (spec §3.2).
-		 * User relations (oid >= FirstNormalObjectId) skip this branch and take
-		 * the stock HC23/HC24/HC25 path below, so the OLTP hot path is
-		 * unchanged (off mode short-circuits on the first bool).
+		 * User relations in shared-catalog mode also globalize their reader
+		 * and DML modes below: otherwise a new native reader could enter
+		 * after a remote DDL probe and miss the exclusive-lock conflict.
 		 */
 		if (cluster_shared_catalog && locktag->locktag_field2 < FirstNormalObjectId) {
 			if (lockmode >= ShareUpdateExclusiveLock)
@@ -440,7 +443,7 @@ cluster_lock_should_globalize(const LOCKTAG *locktag, LOCKMODE lockmode, bool se
 		/* HC23 OLTP fast-path:  AccessShare / RowShare / RowExclusive go
 			 * PG-native.  ShareUpdateExclusiveLock (=5) is the lowest mode
 			 * routed through cluster. */
-		if (lockmode < ShareUpdateExclusiveLock)
+		if (!cluster_shared_catalog && lockmode < ShareUpdateExclusiveLock)
 			return false;
 		/* HC24 system-catalog bootstrap-safe (off mode):  pg_class etc oids
 			 * < FirstNormalObjectId never enter cluster gate.  On-mode catalog
@@ -452,15 +455,14 @@ cluster_lock_should_globalize(const LOCKTAG *locktag, LOCKMODE lockmode, bool se
 		return cluster_relation_is_persistent_or_unlogged(locktag->locktag_field2);
 
 	case LOCKTAG_OBJECT:
-		/* HC26 mirror HC23 — only >= SUEX modes go cluster. */
-		if (lockmode < ShareUpdateExclusiveLock)
-			return false;
-		/* spec-6.14 D7:  under shared_catalog, catalog objects (objoid <
-			 * FirstNormalObjectId) are shared, so the HC27 boundary is removed
-			 * -- catalog-object DDL at >= SUEX globalizes like a user object
-			 * (user objects already pass HC27 unchanged). */
+		/* Schema and role references take AccessShareLock. These must
+		 * conflict with a remote DROP's AccessExclusiveLock even for
+		 * built-in object OIDs. Author: SqlRush <sqlrush@gmail.com> */
 		if (cluster_shared_catalog)
 			return true;
+		/* Non-shared mode retains its original DDL-only gate. */
+		if (lockmode < ShareUpdateExclusiveLock)
+			return false;
 		/* HC27 objoid >= FirstNormal (off mode) — classoid is always system
 			 * catalog oid (pg_proc / pg_type etc).  Filter on objoid (field3). */
 		if (locktag->locktag_field3 < FirstNormalObjectId)

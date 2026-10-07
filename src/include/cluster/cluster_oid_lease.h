@@ -64,14 +64,14 @@
 
 /*
  * ClusterOidAuthorityHeader -- the on-disk shared OID authority image.  A
- * single monotonically-advancing high-water mark; a node's lease is
- * [old high-water, old high-water + lease_size) and the file is bumped to the
- * new high-water under the cross-node X lock before the lease is handed out.
+ * single next-candidate pointer; a node's lease is capped at the top of the
+ * OID space and the pointer then wraps to FirstNormalObjectId.  The file is
+ * advanced under the cross-node X lock before the lease is handed out.
  */
 typedef struct ClusterOidAuthorityHeader {
 	uint32 magic;	 /* CLUSTER_OID_AUTHORITY_MAGIC             */
 	uint32 version;	 /* CLUSTER_OID_AUTHORITY_VERSION           */
-	Oid next_oid;	 /* cluster-wide next unallocated OID       */
+	Oid next_oid;	 /* next candidate; zero = legacy cycle end */
 	uint32 reserved; /* pad / future use; zero                  */
 	pg_crc32c crc;	 /* CRC of all preceding bytes              */
 } ClusterOidAuthorityHeader;
@@ -83,7 +83,9 @@ typedef enum ClusterOidAuthorityValidity {
 	CLUSTER_OID_AUTHORITY_VALID = 0,
 	CLUSTER_OID_AUTHORITY_INVALID_SHORT,
 	CLUSTER_OID_AUTHORITY_INVALID_MAGIC,
-	CLUSTER_OID_AUTHORITY_INVALID_CRC
+	CLUSTER_OID_AUTHORITY_INVALID_CRC,
+	CLUSTER_OID_AUTHORITY_INVALID_VERSION,
+	CLUSTER_OID_AUTHORITY_INVALID_STATE
 } ClusterOidAuthorityValidity;
 
 /*
@@ -102,7 +104,9 @@ typedef struct ClusterOidLease {
  * cluster_oid_resid_encode -- build the singleton OID-authority resource id
  *	(all map fields zero; the type byte places it in the OID namespace).
  */
+#ifndef FRONTEND
 extern void cluster_oid_resid_encode(ClusterResId *dst);
+#endif
 
 /*
  * cluster_oid_authority_classify -- pure validity check of an authority image
@@ -111,9 +115,8 @@ extern void cluster_oid_resid_encode(ClusterResId *dst);
 extern ClusterOidAuthorityValidity cluster_oid_authority_classify(const char *buf, size_t len);
 
 /*
- * cluster_oid_lease_normalize_start -- force an authority high-water up to
- *	FirstNormalObjectId when it has wrapped below the reserved range (mirrors
- *	the wraparound handling in the stock GetNewObjectId).  Pure.
+ * cluster_oid_lease_normalize_start -- normalize only a new seed's starting
+ *	OID above the reserved range.  Never apply to a running authority.  Pure.
  */
 extern Oid cluster_oid_lease_normalize_start(Oid start);
 
@@ -130,12 +133,13 @@ extern Oid cluster_oid_lease_consume(ClusterOidLease *lease);
  * cluster_oid_lease_carve -- pure refill math.  Given the current authority
  *	high-water hw and a lease size, produce the node's new lease block
  *	[*out_start, *out_end) and the value *out_new_authority to durably write
- *	back.  hw is first normalized up past the reserved range.  When the block
- *	would overflow the 32-bit OID space it is capped so it never hands out a
- *	reserved OID, and the authority is reset to FirstNormalObjectId for the
- *	next refill.  Leases carved from monotonically-advancing hw values are
- *	pairwise disjoint (spec-6.14 §3.3).  *out_end == 0 means the block runs to
- *	the top of the OID space (exclusive end wraps to 0).
+ *	back.  The final block is capped at the top of the OID space and writes
+ *	FirstNormalObjectId as the next cycle's start.  A validated legacy zero
+ *	authority likewise starts a new cycle.  Other reserved hw or a zero size
+ *	returns an empty [0,0) lease.  *out_end == 0 on a nonempty lease means the
+ *	exclusive end is the top of the OID space.  Candidates can repeat across
+ *	cycles, including ones held in another node's old lease; callers must
+ *	still check catalog uniqueness and file conflicts.
  */
 extern void cluster_oid_lease_carve(Oid hw, uint32 lease_size, Oid *out_start, Oid *out_end,
 									Oid *out_new_authority);
@@ -144,8 +148,8 @@ extern void cluster_oid_lease_carve(Oid hw, uint32 lease_size, Oid *out_start, O
 
 /*
  * cluster_oid_authority_read -- read the shared OID high-water.  Returns true
- *	and sets *next_oid on success; returns false (fail-closed) when neither
- *	the primary nor the .bak image is trustworthy.  Never ereports.
+ *	and sets *next_oid on success; returns false when the primary is not
+ *	trustworthy.  The older .bak is never an allocation fallback.  Never ereports.
  */
 extern bool cluster_oid_authority_read(Oid *next_oid);
 
@@ -170,10 +174,8 @@ extern void cluster_oid_authority_write(Oid next_oid);
  *	does not already exist (D2 seed node).  A join node whose authority already
  *	exists is a no-op (returns false).  Returns true when it seeded.  Idempotent
  *	for the normal seed-then-join bring-up (a designated seed node comes up
- *	first).  Never lowers an existing high-water.  NB: treats an unreadable
- *	authority like an absent one -- callers that must not re-seed over a
- *	corrupt-but-present authority guard with cluster_oid_authority_present()
- *	first (the catalog bootstrap does; spec-6.14 §3.6 fail-closed).
+ *	first).  Never lowers an existing high-water.  An unreadable existing
+ *	authority raises an error even if a caller's earlier read succeeded.
  */
 extern bool cluster_oid_authority_seed_if_absent(Oid initial_next_oid);
 
@@ -184,7 +186,7 @@ extern void cluster_oid_lease_shmem_init(void);
 extern void cluster_oid_lease_shmem_register(void);
 
 /*
- * cluster_oid_lease_get_next -- allocate one cluster-wide-unique OID from this
+ * cluster_oid_lease_get_next -- allocate one OID candidate from this
  *	node's lease, refilling from the shared authority (cross-node X lock) when
  *	exhausted.  Fail-closed 53RB when the authority is unavailable; never
  *	falls back to the node-local counter.  Called from GetNewObjectId under

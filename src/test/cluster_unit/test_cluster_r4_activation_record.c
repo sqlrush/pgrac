@@ -12,6 +12,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_lmon.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "port/pg_crc32c.h"
 #include "storage/shmem.h"
@@ -21,6 +22,62 @@
 
 int cluster_node_id = 0;
 bool cluster_enabled = true;
+
+/* This codec fixture has no postmaster, formation, or ROOT serving owner.
+ * Linux retains the whole LMON call graph; reaching one of these is a bug. */
+bool IsUnderPostmaster = false;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+uint64
+cluster_membership_cut_generation(void)
+{
+	abort();
+}
+bool
+cluster_normal_stop_requested(void)
+{
+	abort();
+}
+bool
+cluster_write_fence_allowed(void)
+{
+	abort();
+}
+bool
+cluster_reconfig_has_pending_prebump_stage(void)
+{
+	abort();
+}
+bool
+cluster_reconfig_capture_formation_snapshot_v1(
+	uint16 thread pg_attribute_unused(), ClusterFormationSnapshotV1 *out pg_attribute_unused())
+{
+	abort();
+}
+ClusterControlRootResult
+cluster_control_root_v3_serving_poll(
+	const ClusterSemanticActivationRecord *open pg_attribute_unused(),
+	const uint8 descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] pg_attribute_unused(),
+	ClusterControlRootFileToken *out pg_attribute_unused())
+{
+	abort();
+}
+void
+cluster_control_root_v3_serving_cancel(void)
+{
+	abort();
+}
+
+/* This codec/mailbox fixture has no running LMON.  Match the original
+ * notification's NULL-latch behavior; completion authority is tested below
+ * and publication-before-notification is tested by the FSM fixture. */
+void
+cluster_lmon_marker_complete_wakeup(void)
+{}
+
+/* No QVOTEC owner is registered in this codec/mailbox fixture. */
+void
+cluster_qvotec_wakeup(void)
+{}
 
 bool
 RecoveryInProgress(void)
@@ -1018,13 +1075,13 @@ UT_TEST(test_51_ack_sample_request_has_exact_wire_bytes)
 	UT_ASSERT_EQ(PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1, 65);
 	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1, UINT32_C(0x00008000));
 	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS, UINT32_C(0x0071B000));
-	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES, 120);
+	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES, 152);
 	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, bytes));
 	UT_ASSERT_EQ(bytes[0], 0x41);
 	UT_ASSERT_EQ(bytes[1], 0x43);
 	UT_ASSERT_EQ(bytes[2], 0x4b);
 	UT_ASSERT_EQ(bytes[3], 0x31);
-	UT_ASSERT_EQ(read_u16_le(bytes + 4), UINT16_C(1));
+	UT_ASSERT_EQ(read_u16_le(bytes + 4), UINT16_C(2));
 	UT_ASSERT_EQ(bytes[6], 1);
 	UT_ASSERT_EQ(bytes[7], 1);
 	UT_ASSERT_EQ(read_u32_le(bytes + 8), UINT32_C(0));
@@ -1049,7 +1106,7 @@ UT_TEST(test_51_ack_sample_request_has_exact_wire_bytes)
 UT_TEST(test_52_ack_wire_decodes_hand_written_little_endian_bytes)
 {
 	static const uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES]
-		= { 0x41, 0x43, 0x4b, 0x31, 0x01, 0x00, 0x02, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+		= { 0x41, 0x43, 0x4b, 0x31, 0x02, 0x00, 0x02, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x08, 0x07, 0x06, 0x05,
 			0x04, 0x03, 0x02, 0x01, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11, 0x28, 0x27,
 			0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31,
@@ -1131,7 +1188,7 @@ UT_TEST(test_54_ack_wire_rejects_wrong_magic_and_version)
 	memset(&output, 0xa5, sizeof(output));
 	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
 	bytes[0] ^= 0x01;
-	bytes[4] = 2;
+	bytes[4] = 1;
 	memset(&output, 0xa5, sizeof(output));
 	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
 }
@@ -1389,7 +1446,7 @@ UT_TEST(test_61_ack_wire_encoder_rejects_invalid_host_shape)
 UT_TEST(test_62_ack_tuple_and_table_have_exact_frozen_layout)
 {
 	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_TUPLE_BYTES, 64);
-	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_TABLE_BYTES, 16496);
+	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_TABLE_BYTES, 16528);
 	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID, UINT32_C(1));
 	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE, UINT32_C(2));
 	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_OPEN_PROOF, UINT32_C(4));
@@ -1404,7 +1461,7 @@ UT_TEST(test_62_ack_tuple_and_table_have_exact_frozen_layout)
 	UT_ASSERT_EQ(offsetof(SemanticActivationAckTuple, transition_epoch), 48);
 	UT_ASSERT_EQ(offsetof(SemanticActivationAckTuple, record_generation), 56);
 
-	UT_ASSERT_EQ(sizeof(ClusterSemanticActivationAckTableV1), 16496);
+	UT_ASSERT_EQ(sizeof(ClusterSemanticActivationAckTableV1), 16528);
 	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, publication_seq), 0);
 	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, stage), 8);
 	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, flags), 12);
@@ -1423,6 +1480,7 @@ UT_TEST(test_62_ack_tuple_and_table_have_exact_frozen_layout)
 	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, capability_sample_digest), 104);
 	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, expected), 112);
 	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, observed), 8304);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, restart_binding), 16496);
 }
 
 UT_TEST(test_63_ack_tuple_encoder_is_exact_and_clears_reserved_gaps)
@@ -1468,7 +1526,8 @@ UT_TEST(test_64_shmem_size_includes_exact_ack_table)
 					 * BARRIER. */
 					+ MAXALIGN(sizeof(ClusterR4Bit22SourceCloseShmem))
 					+ MAXALIGN(sizeof(pg_atomic_uint32)) /* local clean-start observation */
-					+ MAXALIGN(sizeof(ClusterNormalStartCompletion));
+					+ MAXALIGN(sizeof(ClusterNormalStartCompletion))
+					+ MAXALIGN(sizeof(SemanticServingCompletion));
 
 	UT_ASSERT_EQ(cluster_semantic_activation_shmem_size(), expected);
 }
@@ -1556,14 +1615,14 @@ UT_TEST(test_66_ack_table_publish_advances_even_and_refuses_bad_sequence)
 UT_TEST(test_67_ack_ingress_handoff_has_exact_frozen_layout)
 {
 	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY, 256);
-	UT_ASSERT_EQ(sizeof(ClusterSemanticActivationAckWireV1), 120);
-	UT_ASSERT_EQ(sizeof(SemanticActivationAckIngressItem), 136);
+	UT_ASSERT_EQ(sizeof(ClusterSemanticActivationAckWireV1), 152);
+	UT_ASSERT_EQ(sizeof(SemanticActivationAckIngressItem), 168);
 	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngressItem, message), 0);
-	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngressItem, authenticated_source_node_id), 120);
-	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngressItem, local_receiver_node_id), 124);
-	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngressItem, sampled_capability_word), 128);
-	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngressItem, sampled_capability_generation), 132);
-	UT_ASSERT_EQ(sizeof(SemanticActivationAckIngress), 34832);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngressItem, authenticated_source_node_id), 152);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngressItem, local_receiver_node_id), 156);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngressItem, sampled_capability_word), 160);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngressItem, sampled_capability_generation), 164);
+	UT_ASSERT_EQ(sizeof(SemanticActivationAckIngress), 43024);
 	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngress, producer_seq), 0);
 	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngress, consumer_seq), 8);
 	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngress, items), 16);

@@ -40,11 +40,13 @@
  */
 #include "postgres.h"
 
+#include <setjmp.h>
 #include <stddef.h>
 #include <string.h>
 
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
+#include "cluster/cluster_storage_quorum.h"
 
 #undef printf
 #undef fprintf
@@ -79,6 +81,13 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
  * monotonic-incarnation cases (U1-U5) reach the floor compare.
  */
 static bool test_in_quorum = true;
+static int storage_excluded_node = -1;
+
+bool
+cluster_storage_quorum_allows_node(int node_id)
+{
+	return node_id != storage_excluded_node;
+}
 
 bool
 cluster_qvotec_in_quorum(void)
@@ -86,10 +95,25 @@ cluster_qvotec_in_quorum(void)
 	return test_in_quorum;
 }
 
-/* cluster_membership.c invalidates this backend-local cache after a commit. */
+static pg_atomic_uint64 cut_generation;
+static ClusterMembershipTable cut_table;
+static bool inspect_write;
+static bool interrupt_write;
+static int inspected_writes;
+static jmp_buf interrupted;
+
+void cluster_write_fence_authority_cache_invalidate(void);
 void
 cluster_write_fence_authority_cache_invalidate(void)
-{}
+{
+	if (inspect_write) {
+		UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+		inspected_writes++;
+	}
+	if (interrupt_write)
+		longjmp(interrupted, 1);
+}
+
 
 /*
  * A file-static backing table for the marker-seed tests (U10/U13/U15).  They
@@ -154,6 +178,16 @@ UT_TEST(test_vet_fresh_above_accept)
 {
 	cluster_membership_record_admitted(3, 5);
 	UT_ASSERT_EQ(cluster_membership_vet_joiner(3, 6, 1), CLUSTER_JOIN_ACCEPT);
+}
+
+UT_TEST(test_vet_joiner_must_belong_to_storage_component)
+{
+	cluster_membership_record_admitted(22, 5);
+	storage_excluded_node = 22;
+	UT_ASSERT_EQ(cluster_membership_vet_joiner(22, 6, 1), CLUSTER_JOIN_REJECT_QUORUM);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(22), 5);
+	storage_excluded_node = -1;
+	UT_ASSERT_EQ(cluster_membership_vet_joiner(22, 6, 1), CLUSTER_JOIN_ACCEPT);
 }
 
 /* ======================================================================
@@ -756,11 +790,314 @@ UT_TEST(test_replacement_marker_v3_phase_bases_and_floors)
 	UT_ASSERT_EQ((int)ready, (int)UINT32_C(0xA5A5A5A5));
 }
 
+static void
+cut_reset(void)
+{
+	memset(&cut_table, 0, sizeof(cut_table));
+	pg_atomic_init_u64(&cut_generation, 2);
+	cluster_membership_attach(&cut_table);
+	cluster_membership_attach_cut_generation(&cut_generation);
+	inspect_write = false;
+	interrupt_write = false;
+	inspected_writes = 0;
+}
+
+UT_TEST(cut_missing_owner_never_qualifies)
+{
+	cluster_membership_attach(NULL);
+	cluster_membership_attach_cut_generation(NULL);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+	UT_ASSERT(!cluster_membership_cut_generation_current(0));
+	UT_ASSERT(!cluster_membership_cut_generation_current(2));
+	cluster_membership_record_admitted(3, 91);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(3), 91);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+}
+
+UT_TEST(cut_boot_and_member_changes_invalidate_same_epoch)
+{
+	uint64 before;
+	cut_reset();
+	inspect_write = true;
+	before = cluster_membership_cut_generation();
+	cluster_membership_record_admitted(3, 10);
+	UT_ASSERT(!cluster_membership_cut_generation_current(before));
+	UT_ASSERT(cluster_membership_cut_generation() > before);
+	before = cluster_membership_cut_generation();
+	cluster_membership_set_state(3, CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT(!cluster_membership_cut_generation_current(before));
+	before = cluster_membership_cut_generation();
+	cluster_membership_record_admitted(3, 11);
+	UT_ASSERT(!cluster_membership_cut_generation_current(before));
+	before = cluster_membership_cut_generation();
+	cluster_membership_set_state(3, CLUSTER_MEMBER_DEAD);
+	UT_ASSERT(!cluster_membership_cut_generation_current(before));
+	UT_ASSERT_EQ(inspected_writes, 4);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(3), 11);
+	UT_ASSERT_EQ(cluster_membership_get_state(3), CLUSTER_MEMBER_DEAD);
+}
+
+UT_TEST(cut_noops_do_not_retire_stable_cut)
+{
+	uint64 before;
+	cut_reset();
+	cluster_membership_record_admitted(3, 11);
+	cluster_membership_set_state(3, CLUSTER_MEMBER_MEMBER);
+	before = cluster_membership_cut_generation();
+	cluster_membership_record_admitted(3, 10);
+	cluster_membership_record_admitted(3, 11);
+	cluster_membership_set_state(3, CLUSTER_MEMBER_MEMBER);
+	cluster_membership_set_state(-1, CLUSTER_MEMBER_DEAD);
+	cluster_membership_record_admitted(CLUSTER_MAX_NODES, 12);
+	UT_ASSERT(cluster_membership_cut_generation_current(before));
+	/* O(1) generation API only; this does not claim A's ready-cache test. */
+	for (int i = 0; i < 1000000; i++)
+		UT_ASSERT(cluster_membership_cut_generation_current(before));
+}
+
+UT_TEST(cut_removed_and_durable_seed_cover_both_fields)
+{
+	uint64 before;
+	ClusterJoinCommitMarker marker = { 0 };
+	cut_reset();
+	inspect_write = true;
+	cluster_membership_record_admitted(3, 10);
+	cluster_membership_set_state(3, CLUSTER_MEMBER_MEMBER);
+	before = cluster_membership_cut_generation();
+	cluster_membership_shrink_to_removed(3, 12);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), before + 2);
+	UT_ASSERT(!cluster_membership_cut_generation_current(before));
+	UT_ASSERT_EQ(cluster_membership_get_state(3), CLUSTER_MEMBER_REMOVED);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(3), 12);
+	before = cluster_membership_cut_generation();
+	cluster_membership_shrink_to_removed(3, 11);
+	UT_ASSERT(cluster_membership_cut_generation_current(before));
+	marker.magic = CLUSTER_JCMK_MAGIC;
+	marker.version = CLUSTER_JCMK_VERSION;
+	marker.node_id = 4;
+	marker.phase = CLUSTER_JCMK_PHASE_COMMITTED;
+	marker.admitted_incarnation = 19;
+	cluster_join_marker_compute_crc(&marker);
+	UT_ASSERT(cluster_membership_seed_apply_marker(&marker));
+	UT_ASSERT(!cluster_membership_cut_generation_current(before));
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(4), 19);
+	UT_ASSERT_EQ(inspected_writes, 4);
+}
+
+UT_TEST(cut_interrupted_writer_never_reopens_old_cache)
+{
+	uint64 before;
+	cut_reset();
+	before = cluster_membership_cut_generation();
+	inspect_write = true;
+	interrupt_write = true;
+	if (setjmp(interrupted) == 0)
+		cluster_membership_record_admitted(3, 10);
+	interrupt_write = false;
+	UT_ASSERT_EQ(inspected_writes, 1);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(3), 0);
+	UT_ASSERT(!cluster_membership_cut_generation_current(before));
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+	/* A new mutator must not convert an interrupted odd sequence to ready. */
+	cluster_membership_record_admitted(3, 11);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(3), 11);
+}
+
+UT_TEST(cut_wrap_and_reattach_fail_closed)
+{
+	cut_reset();
+	pg_atomic_write_u64(&cut_generation, UINT64_MAX - 1);
+	cluster_membership_record_admitted(3, 10);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+	cluster_membership_set_state(3, CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+	cluster_membership_attach(&cut_table);
+	cluster_membership_attach_cut_generation(&cut_generation);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&cut_generation), UINT64_MAX);
+	/* An uninitialized owner cannot supply a stable cache token either. */
+	pg_atomic_write_u64(&cut_generation, 0);
+	cluster_membership_set_state(3, CLUSTER_MEMBER_DEAD);
+	UT_ASSERT_EQ(cluster_membership_cut_generation(), 0);
+}
+
+static ClusterMembershipRequest
+operation_request(void)
+{
+	ClusterMembershipRequest r = { 0 };
+
+	r.expected_formation = 91;
+	r.operation_generation = 17;
+	r.expected_old_incarnation = UINT64CONST(0x100000012);
+	r.reserved_new_incarnation = r.expected_old_incarnation + 1;
+	r.target_node = 4;
+	r.operation_kind = CLUSTER_MEMBERSHIP_REJOIN;
+	r.guest_uuid[0] = 1;
+	r.guest_uuid[15] = 9;
+	return r;
+}
+
+UT_TEST(test_operation_identity_rejects_missing_and_unknown)
+{
+	ClusterMembershipRequest r = operation_request(), bad;
+
+	UT_ASSERT(cluster_membership_request_valid(&r));
+	UT_ASSERT(!cluster_membership_request_valid(NULL));
+	for (int field = 0; field < 9; field++) {
+		bad = r;
+		switch (field) {
+		case 0:
+			bad.expected_formation = 0;
+			break;
+		case 1:
+			bad.operation_generation = 0;
+			break;
+		case 2:
+			bad.expected_old_incarnation = 0;
+			break;
+		case 3:
+			bad.reserved_new_incarnation = bad.expected_old_incarnation;
+			break;
+		case 4:
+			bad.target_node = -1;
+			break;
+		case 5:
+			bad.target_node = CLUSTER_MAX_NODES;
+			break;
+		case 6:
+			bad.operation_kind = 0;
+			break;
+		case 7:
+			bad.operation_kind = CLUSTER_MEMBERSHIP_REJOIN + 1;
+			break;
+		case 8:
+			memset(bad.guest_uuid, 0, sizeof(bad.guest_uuid));
+			break;
+		}
+		UT_ASSERT(!cluster_membership_request_valid(&bad));
+	}
+	r.operation_kind = CLUSTER_MEMBERSHIP_LEAVE;
+	UT_ASSERT(!cluster_membership_request_valid(&r));
+	r.reserved_new_incarnation = 0;
+	UT_ASSERT(cluster_membership_request_valid(&r));
+	r.operation_kind = CLUSTER_MEMBERSHIP_REMOVE;
+	UT_ASSERT(cluster_membership_request_valid(&r));
+}
+
+UT_TEST(test_operation_conflicting_key_has_zero_side_effect)
+{
+	ClusterMembershipRequest r = operation_request(), changed;
+	ClusterMembershipOperation op = { 0 }, saved;
+
+	UT_ASSERT_EQ(cluster_membership_operation_reserve(&op, &r, 91, 17),
+				 CLUSTER_MEMBERSHIP_REQUEST_ACCEPTED);
+	saved = op;
+	for (int field = 0; field < 7; field++) {
+		changed = r;
+		switch (field) {
+		case 0:
+			changed.expected_formation++;
+			break;
+		case 1:
+			changed.operation_generation++;
+			break;
+		case 2:
+			changed.expected_old_incarnation--;
+			break;
+		case 3:
+			changed.reserved_new_incarnation++;
+			break;
+		case 4:
+			changed.target_node++;
+			break;
+		case 5:
+			changed.operation_kind = CLUSTER_MEMBERSHIP_REMOVE;
+			changed.reserved_new_incarnation = 0;
+			break;
+		case 6:
+			changed.guest_uuid[7]++;
+			break;
+		}
+		UT_ASSERT(!cluster_membership_request_same(&r, &changed));
+		UT_ASSERT_EQ(cluster_membership_operation_reserve(&op, &changed, 91, 17),
+					 CLUSTER_MEMBERSHIP_REQUEST_CONFLICT);
+		UT_ASSERT(memcmp(&op, &saved, sizeof(op)) == 0);
+	}
+}
+
+UT_TEST(test_operation_exact_retry_survives_formation_change)
+{
+	ClusterMembershipRequest r = operation_request();
+	ClusterMembershipOperation op = { 0 }, saved;
+
+	UT_ASSERT_EQ(cluster_membership_operation_reserve(&op, &r, 91, 17),
+				 CLUSTER_MEMBERSHIP_REQUEST_ACCEPTED);
+	UT_ASSERT(cluster_membership_operation_advance(&op, &r, CLUSTER_MEMBERSHIP_OP_RESERVED,
+												   CLUSTER_MEMBERSHIP_OP_RUNNING));
+	saved = op;
+	UT_ASSERT_EQ(cluster_membership_operation_reserve(&op, &r, 92, 18),
+				 CLUSTER_MEMBERSHIP_REQUEST_RETRY);
+	UT_ASSERT(memcmp(&op, &saved, sizeof(op)) == 0);
+	/* Caller loss has no lifecycle edge; a published operation cannot abort
+	 * as unpublished or skip the exact terminal observation. */
+	UT_ASSERT(!cluster_membership_operation_advance(&op, &r, CLUSTER_MEMBERSHIP_OP_RUNNING,
+													CLUSTER_MEMBERSHIP_OP_CANCELLED_UNPUBLISHED));
+	UT_ASSERT(!cluster_membership_operation_advance(&op, &r, CLUSTER_MEMBERSHIP_OP_RESERVED,
+													CLUSTER_MEMBERSHIP_OP_FINISHED));
+}
+
+UT_TEST(test_operation_stale_terminal_cannot_release_new_request)
+{
+	ClusterMembershipRequest r = operation_request(), newer;
+	ClusterMembershipOperation op = { 0 }, saved;
+
+	UT_ASSERT_EQ(cluster_membership_operation_reserve(&op, &r, 91, 17),
+				 CLUSTER_MEMBERSHIP_REQUEST_ACCEPTED);
+	UT_ASSERT(cluster_membership_operation_advance(&op, &r, CLUSTER_MEMBERSHIP_OP_RESERVED,
+												   CLUSTER_MEMBERSHIP_OP_RUNNING));
+	UT_ASSERT(cluster_membership_operation_advance(&op, &r, CLUSTER_MEMBERSHIP_OP_RUNNING,
+												   CLUSTER_MEMBERSHIP_OP_FINISHED));
+	UT_ASSERT_EQ(cluster_membership_operation_reserve(&op, &r, 92, 18),
+				 CLUSTER_MEMBERSHIP_REQUEST_RETRY);
+	newer = r;
+	newer.expected_formation = 92;
+	newer.operation_generation++;
+	UT_ASSERT_EQ(cluster_membership_operation_reserve(&op, &newer, 92, 18),
+				 CLUSTER_MEMBERSHIP_REQUEST_ACCEPTED);
+	saved = op;
+	UT_ASSERT(!cluster_membership_operation_advance(&op, &r, CLUSTER_MEMBERSHIP_OP_RESERVED,
+													CLUSTER_MEMBERSHIP_OP_CANCELLED_UNPUBLISHED));
+	UT_ASSERT(memcmp(&op, &saved, sizeof(op)) == 0);
+}
+
+UT_TEST(test_operation_authority_generation_and_phase_are_required)
+{
+	ClusterMembershipRequest r = operation_request();
+	ClusterMembershipOperation op = { 0 }, saved;
+
+	UT_ASSERT_EQ(cluster_membership_operation_reserve(&op, &r, 90, 17),
+				 CLUSTER_MEMBERSHIP_REQUEST_STALE);
+	UT_ASSERT_EQ(cluster_membership_operation_reserve(&op, &r, 91, 18),
+				 CLUSTER_MEMBERSHIP_REQUEST_STALE);
+	UT_ASSERT_EQ(op.phase, CLUSTER_MEMBERSHIP_OP_EMPTY);
+	UT_ASSERT_EQ(cluster_membership_operation_reserve(&op, &r, 91, 17),
+				 CLUSTER_MEMBERSHIP_REQUEST_ACCEPTED);
+	UT_ASSERT(cluster_membership_operation_advance(&op, &r, CLUSTER_MEMBERSHIP_OP_RESERVED,
+												   CLUSTER_MEMBERSHIP_OP_CANCELLED_UNPUBLISHED));
+	op.phase = (ClusterMembershipOperationPhase)99;
+	saved = op;
+	UT_ASSERT_EQ(cluster_membership_operation_reserve(&op, &r, 91, 17),
+				 CLUSTER_MEMBERSHIP_REQUEST_INVALID);
+	UT_ASSERT(memcmp(&op, &saved, sizeof(op)) == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(34);
 	UT_RUN(test_vet_fresh_above_accept);
+	UT_RUN(test_vet_joiner_must_belong_to_storage_component);
 	UT_RUN(test_vet_equal_reject_stale);
 	UT_RUN(test_vet_below_reject_stale);
 	UT_RUN(test_vet_node_id_out_of_range_failclosed);
@@ -782,6 +1119,17 @@ main(void)
 	UT_RUN(test_replacement_marker_v3_phase_and_integrity_gates);
 	UT_RUN(test_replacement_marker_v3_same_image_majority);
 	UT_RUN(test_replacement_marker_v3_phase_bases_and_floors);
+	UT_RUN(cut_missing_owner_never_qualifies);
+	UT_RUN(cut_boot_and_member_changes_invalidate_same_epoch);
+	UT_RUN(cut_noops_do_not_retire_stable_cut);
+	UT_RUN(cut_removed_and_durable_seed_cover_both_fields);
+	UT_RUN(cut_interrupted_writer_never_reopens_old_cache);
+	UT_RUN(cut_wrap_and_reattach_fail_closed);
+	UT_RUN(test_operation_identity_rejects_missing_and_unknown);
+	UT_RUN(test_operation_conflicting_key_has_zero_side_effect);
+	UT_RUN(test_operation_exact_retry_survives_formation_change);
+	UT_RUN(test_operation_stale_terminal_cannot_release_new_request);
+	UT_RUN(test_operation_authority_generation_and_phase_are_required);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

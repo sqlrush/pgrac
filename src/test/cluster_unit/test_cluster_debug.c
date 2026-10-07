@@ -41,6 +41,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "miscadmin.h"
 #include "cluster/cluster_update_trace.h"
 
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b catalog counter stubs */
@@ -48,7 +49,8 @@
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_terminal_ref_census.h"
-#include "cluster/cluster_grd.h"		  /* ClusterGrdRecoveryCounters */
+#include "cluster/cluster_grd.h" /* ClusterGrdRecoveryCounters */
+#include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
 #include "cluster/cluster_lmd.h"
@@ -93,6 +95,7 @@ static int captured_pi_retire_accessor_calls;
 /* Link-only startup/config stubs.  cluster_startup_phase.o is part of this
  * standalone binary, while the owning GUC/LMS/qvotec objects are not. */
 bool cluster_controlfile_shared_authority = false;
+BackendType MyBackendType = B_BACKEND;
 bool cluster_lms_enabled = false;
 char *cluster_wal_threads_dir = NULL;
 
@@ -507,6 +510,8 @@ cluster_ctrc_stat_name(ClusterCtrcStatId stat)
 		[CTRC_STAT_PENDING_OBSERVED_AGE_MS] = "pending_observed_age_ms",
 		[CTRC_STAT_OBSERVED_AT_US] = "observed_at_monotonic_us",
 		[CTRC_STAT_OBSERVATION_AGE_MS] = "observation_age_ms",
+		[CTRC_STAT_RECEIPT_PREPARE_REFUSED] = "receipt_prepare_refused_count",
+		[CTRC_STAT_RECEIPT_NAMESPACE_REFUSED] = "receipt_namespace_refused_count",
 	};
 
 	return stat >= 0 && stat < CTRC_STAT_COUNT ? names[stat] : NULL;
@@ -2710,6 +2715,26 @@ cluster_cr_r4_event_count(uint32 event pg_attribute_unused())
  * accessors (cluster_wal_thread.c / cluster_wal_state.c) are not linked
  * here; stub everything dump_wal_thread reads (L104). */
 #include "cluster/cluster_wal_state.h"
+#include "cluster/cluster_wal_thread.h"
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
+{
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+bool
+cluster_wal_thread_checkpoint_sample_v1(ClusterWalThreadCheckpointSampleV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+XLogRecPtr
+GetFlushRecPtr(TimeLineID *timeline)
+{
+	if (timeline != NULL)
+		*timeline = 0;
+	return InvalidXLogRecPtr;
+}
 bool
 cluster_wal_state_registry_ready(void)
 {
@@ -3635,6 +3660,7 @@ int cluster_phase3_timeout = 600;
 int cluster_phase4_timeout = 30;
 /* Spec-1.11 Sprint B: cluster_startup_phase.c references cluster_enabled */
 bool cluster_enabled = true;
+bool cluster_shared_config = false;
 /* Spec-2.1 D1: cluster_startup_phase.c + cluster_conf.c reference allow_single_node */
 bool cluster_allow_single_node = true;
 /* spec-2.6 Q7 validator: cluster_startup_phase.c reads cluster_voting_disks */
@@ -3654,6 +3680,28 @@ char *cluster_voting_disks = NULL;
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_config_members.h"
+
+/* Link-only admission boundaries. Counter/dump tests must not admit service. */
+ClusterConfigMountResult
+cluster_config_members_mount_status(void)
+{
+	abort();
+}
+
+bool
+cluster_grd_control_acquire_allowed(const ClusterResId *resid pg_attribute_unused(),
+									LOCKMODE mode pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_grd_control_recovery_ready(const ClusterResId *resid pg_attribute_unused(),
+								   LOCKMODE mode pg_attribute_unused())
+{
+	abort();
+}
 
 PGPROC *MyProc = NULL;
 
@@ -3742,6 +3790,47 @@ cluster_qvotec_get_status(void)
 	return 0;
 }
 
+/* Later link-only boundaries of the same objects (startup refresh, phase-3/4
+ * reports, startup activation poll, lifecycle dump row): the debug unit never
+ * runs them, so each returns the neutral unavailable/false value. */
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_control_observe.h"
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+volatile uint32 CritSectionCount = 0;
+
+bool
+cluster_cf_held(LOCKMODE mode pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_formation_witness_last_diagnostic_v1(ClusterFormationWitnessDiagnosticV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+
+const char *
+cluster_qvotec_get_quorum_state_name(void)
+{
+	return "unavailable";
+}
+
+bool
+cluster_semantic_activation_startup_poll(ClusterSemanticActivationRefusal *refusal)
+{
+	if (refusal != NULL)
+		memset(refusal, 0, sizeof(*refusal));
+	return false;
+}
+
+char *
+cluster_control_observe_writer_json(void)
+{
+	return NULL; /* the lifecycle row reports "unavailable" */
+}
+
 uint64
 cluster_membership_get_last_admitted_incarnation(int32 node_id pg_attribute_unused())
 {
@@ -3785,6 +3874,37 @@ cluster_grd_serving_authority_rebind_leaver(
 
 bool
 cluster_grd_join_remaster_in_progress(void)
+{
+	return false;
+}
+
+/* PGRAC: inert recovery-transport observations for this dump-only binary. */
+uint64
+cluster_grd_redeclare_generation(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_recovery_event_bitmap_hash_value(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_dead_bitmap_hash(const uint8 *bitmap pg_attribute_unused())
+{
+	return 0;
+}
+
+void
+cluster_reconfig_get_last_event(ReconfigEvent *out)
+{
+	memset(out, 0, sizeof(*out));
+}
+
+bool
+cluster_reconfig_has_pending_prebump_stage(void)
 {
 	return false;
 }
@@ -4786,6 +4906,16 @@ cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out)
 	memset(out, 0, sizeof(*out));
 }
 
+bool
+cluster_pi_writeback_rejections_v1(ClusterPiWritebackRejectionsV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	for (unsigned i = 0; i < CLUSTER_PI_WRITEBACK_REJECTION_COUNT; i++)
+		out->attempts[i] = i + 11;
+	out->log_events = 2;
+	return true;
+}
+
 /* Shape A stub: dump_grd_recovery emits the crash-rejoin fence counter. */
 uint64
 cluster_grd_offpath_crash_rejoin_fenced_count(void)
@@ -5056,6 +5186,13 @@ UT_TEST(test_debug_dump_exposes_exact_resource_x_owner_state)
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_gate_formation"), "17");
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_writer_path"), "target");
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_writer_r4_generation"), "19");
+	UT_ASSERT_STR_EQ(captured_dump_value("grd_recovery", "pi_writeback_data_proof_rejected"), "11");
+	UT_ASSERT_STR_EQ(captured_dump_value("grd_recovery", "pi_writeback_local_ack_rejected"), "12");
+	UT_ASSERT_STR_EQ(captured_dump_value("grd_recovery", "pi_writeback_remote_ack_rejected"), "13");
+	UT_ASSERT_STR_EQ(captured_dump_value("grd_recovery", "pi_writeback_master_cut_rejected"), "14");
+	UT_ASSERT_STR_EQ(captured_dump_value("grd_recovery", "pi_writeback_peer_physical_rejected"),
+					 "15");
+	UT_ASSERT_STR_EQ(captured_dump_value("grd_recovery", "pi_writeback_rejection_logs"), "2");
 }
 
 UT_TEST(test_debug_dump_normal_completion_never_fabricates_unready_proof)

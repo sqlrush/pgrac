@@ -3797,7 +3797,8 @@ cr_serve_slot_impl(ClusterLmsCrSlot *slot)
 		CLUSTER_INJECTION_POINT("cluster-lms-cr-construct");
 		if (!cluster_injection_should_skip("cluster-lms-cr-construct")
 			&& cluster_crossnode_cr_data_plane
-			&& cluster_bufmgr_copy_block_for_gcs(slot->tag, &page_lsn, cur_copy.data, NULL)) {
+			&& cluster_bufmgr_copy_block_for_gcs(slot->tag, &page_lsn, cur_copy.data, NULL, NULL,
+												 NULL, 0)) {
 			PG_TRY();
 			{
 				cluster_cr_construct_page_for_server(cur_copy.data, slot->read_scn, slot->tag,

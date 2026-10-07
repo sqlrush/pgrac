@@ -9,7 +9,7 @@
 #
 #	  L1  ClusterPair startup baseline (both postmasters healthy)
 #	  L2  fresh baseline:  9 NEW reliability counters all 0 on both nodes
-#	  L3  pg_cluster_state.gcs has 121 keys (PCM-X queue observability +3)
+#	  L3  pg_cluster_state.gcs has 117 keys (current registry)
 #	  L4  2 NEW wait events registered (ClusterGCSBlockRetransmitWait +
 #	       ClusterGCSBlockEpochStaleRetry)
 #	  L5  CLUSTER_WAIT_EVENTS_COUNT = 120 (spec-7.2 +2)
@@ -111,18 +111,18 @@ for my $node ($pair->node0, $pair->node1)
 
 
 # ============================================================
-# L3: pg_cluster_state.gcs category has 121 keys (PCM-X queue observability +3).
+# L3: pg_cluster_state.gcs category has 117 keys (current registry).
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '121',
-   'L3 node0 pg_cluster_state.gcs category has 121 keys (PCM-X queue observability +3)');
+   '117',
+   'L3 node0 pg_cluster_state.gcs category has 117 keys (current registry)');
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '121',
-   'L3 node1 pg_cluster_state.gcs category has 121 keys (PCM-X queue observability +3)');
+   '117',
+   'L3 node1 pg_cluster_state.gcs category has 117 keys (current registry)');
 
 
 # ============================================================

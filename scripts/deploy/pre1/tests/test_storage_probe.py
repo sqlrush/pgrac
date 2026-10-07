@@ -4,6 +4,7 @@ Author: SqlRush <sqlrush@gmail.com>
 """
 
 import json
+import errno
 import os
 from pathlib import Path
 import selectors
@@ -139,6 +140,51 @@ class StorageProbeTests(unittest.TestCase):
         self.run_case("unlink")
         self.release(reader)
         self.assertFalse((self.root / "data").exists())
+
+    def test_link_installs_exact_inode_and_repeated_install_never_overwrites(self):
+        self.run_case("write", "--sequence", "7")
+        source = self.root / "data"
+        saved = source.read_bytes()
+        self.run_case("link-install", "--sequence", "7")
+        target = self.root / "next"
+        self.assertEqual(source.stat().st_ino, target.stat().st_ino)
+        self.assertEqual(source.stat().st_nlink, 2)
+        events = self.run_case("link-install", "--sequence", "7", rc=4)
+        self.assertEqual(events[-1]["syscall"], "linkat")
+        self.assertEqual(events[-1]["errno"], errno.EEXIST)
+        self.run_case("link-read", "--sequence", "7")
+        self.assertEqual(source.read_bytes(), saved)
+        self.assertEqual(target.read_bytes(), saved)
+
+    def test_link_collision_preserves_a_different_destination(self):
+        self.run_case("write", "--sequence", "7")
+        source = self.root / "data"
+        target = self.root / "next"
+        target.write_bytes(b"existing destination must survive")
+        before = (source.stat().st_ino, source.read_bytes(),
+                  target.stat().st_ino, target.read_bytes())
+        events = self.run_case("link-install", "--sequence", "7", rc=4)
+        self.assertEqual(events[-1]["errno"], errno.EEXIST)
+        self.assertEqual(before, (source.stat().st_ino, source.read_bytes(),
+                                 target.stat().st_ino, target.read_bytes()))
+        self.run_case("link-read", "--sequence", "7", rc=1)
+
+    def test_link_wrong_source_version_never_installs(self):
+        self.run_case("write", "--sequence", "7")
+        self.run_case("link-install", "--sequence", "8", rc=1)
+        self.assertFalse((self.root / "next").exists())
+
+    def test_link_rejects_external_alias_before_changing_inode(self):
+        self.run_case("write", "--sequence", "7")
+        source = self.root / "data"
+        external = Path(self.temp.name) / "external"
+        os.link(source, external)
+        before = (external.stat().st_nlink, external.stat().st_ctime_ns,
+                  external.read_bytes())
+        self.run_case("link-install", "--sequence", "7", rc=1)
+        self.assertFalse((self.root / "next").exists())
+        self.assertEqual(before, (external.stat().st_nlink, external.stat().st_ctime_ns,
+                                  external.read_bytes()))
 
     def test_missing_or_wrong_marker_never_writes(self):
         (self.root / ".pre1-manifest").write_text("wrong")

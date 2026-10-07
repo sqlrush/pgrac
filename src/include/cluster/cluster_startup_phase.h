@@ -318,9 +318,18 @@ extern bool cluster_authority_readiness_bind_recovery_generation(uint64 lms_gene
 extern bool cluster_authority_readiness_publish_recovery(uint64 lms_generation);
 extern bool cluster_authority_readiness_publish_serving(void);
 extern void cluster_authority_readiness_clear(void);
+/* Protocol-only: also accepts a retained PRE2 survivor in the exact current
+ * failure-rebuild episode. Never use this predicate to admit acquisitions. */
 extern bool cluster_recovery_transport_is_current(void);
 extern bool cluster_recovery_transport_components_current(void); /* RF-ROOT P6 */
 extern bool cluster_recovery_authority_is_current(void);
+/* Actual StartupProcess only, outside CF/critical sections. Re-read the same
+ * bound control proof; never create a binding or publish ordinary service. */
+extern ClusterFormationWitnessResult cluster_authority_startup_refresh_recovery(int timeout_ms);
+/* Only singleton CF-S, including the pre-SERVING phase-4 handoff. */
+extern bool cluster_configuration_read_transport_is_current(const ClusterResId *resid,
+															LOCKMODE mode);
+extern bool cluster_startup_control_transport_is_current(const ClusterResId *resid, LOCKMODE mode);
 extern bool cluster_serving_ready_is_current(void);
 extern bool cluster_authority_serving_rebind_lmon(void);
 /* RF-ROOT P6 (L5 shutdown handoff): the committed LEAVER's serving rebind

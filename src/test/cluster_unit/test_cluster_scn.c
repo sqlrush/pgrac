@@ -49,6 +49,8 @@
 #include "cluster/cluster_ic_envelope.h" /* spec-2.9 D4:  ClusterICEnvelope + PGRAC_IC_MSG_BOC_BROADCAST */
 #include "cluster/cluster_ic_router.h" /* spec-2.9 D4: ClusterICFanoutResult */
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_wal_thread.h"
+#include "utils/memutils.h"
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D2 stub — profiling gate */
 #include "port/atomics.h"
 #include "storage/lwlock.h"
@@ -77,6 +79,19 @@
  */
 
 bool IsUnderPostmaster = false;
+MemoryContext TopMemoryContext;
+/* No original initdb creator in this runtime fixture. */
+const struct PgracInitdbWalContext *
+cluster_wal_thread_initdb_context(void)
+{
+	return NULL;
+}
+void *
+MemoryContextAllocZero(MemoryContext context, Size size)
+{
+	abort();
+}
+
 
 /* spec-5.59 D2 stubs: cluster_scn.o now carries GUC-gated profiling probes
  * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o
@@ -1122,10 +1137,17 @@ UT_TEST(test_spec29_boc_broadcast_msg_type_enum_value)
 }
 
 
+UT_TEST(test_unadmitted_scn_does_not_create_initdb_authority)
+{
+	UT_ASSERT(cluster_scn_initdb_base_current() == InvalidScn);
+	UT_ASSERT(!cluster_scn_initdb_base_begin());
+}
+
 int
 main(void)
 {
-	UT_PLAN(49);
+	UT_PLAN(50);
+	UT_RUN(test_unadmitted_scn_does_not_create_initdb_authority);
 
 	/* Stage 1.4 stub (5) */
 	UT_RUN(test_scn_typedef_size_is_8_bytes);

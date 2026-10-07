@@ -622,7 +622,8 @@ bool
 cluster_runtime_visibility_physical_locator_sample_held(
 	const ClusterTTSlotPhysicalLocator *locator, const ClusterSemanticAdmissionToken *admission,
 	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
-	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out, bool *ctrc_physical_active_out)
+	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out, bool *ctrc_physical_active_out,
+	bool *precommit_retry_out)
 {
 	ClusterUndoBlock0Generation generation = { false, 0 };
 	ClusterUndoBlock0Generation final_generation = { false, 0 };
@@ -654,6 +655,8 @@ cluster_runtime_visibility_physical_locator_sample_held(
 	}
 	if (ctrc_physical_active_out != NULL)
 		*ctrc_physical_active_out = false;
+	if (precommit_retry_out != NULL)
+		*precommit_retry_out = false;
 	memset(&final_root, 0, sizeof(final_root));
 	memset(&current_owner, 0, sizeof(current_owner));
 	memset(&final_owner, 0, sizeof(final_owner));
@@ -753,6 +756,10 @@ cluster_runtime_visibility_physical_locator_sample_held(
 		*ctrc_physical_active_out
 			= exact_slot.xid == locator->xid && exact_slot.wrap == locator->wrap
 			  && exact_slot.status == TT_SLOT_ACTIVE && exact_slot.commit_scn == InvalidScn;
+	if (precommit_retry_out != NULL)
+		*precommit_retry_out = outcome == CLUSTER_TX_IN_PROGRESS
+							   && exact_slot.status == TT_SLOT_COMMITTED
+							   && SCN_VALID(exact_slot.commit_scn);
 	return true;
 }
 
@@ -1163,7 +1170,8 @@ cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(
 bool
 cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid,
 													   ClusterTTStatusKey *key_out,
-													   ClusterTTStatusResult *result_out)
+													   ClusterTTStatusResult *result_out,
+													   bool *precommit_retry_out)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterUndoBlock0LogicalKey logical;
@@ -1178,8 +1186,11 @@ cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid,
 	uint16 slot_wrap = TT_WRAP_INVALID;
 	uint64 epoch;
 	bool sampled = false;
+	bool precommit_retry = false;
 	bool physical_active = false;
 
+	if (precommit_retry_out != NULL)
+		*precommit_retry_out = false;
 	if (key_out != NULL)
 		MemSet(key_out, 0, sizeof(*key_out));
 	if (result_out != NULL) {
@@ -1232,7 +1243,8 @@ cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid,
 														 &current_result)
 			== CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
 			sampled = cluster_runtime_visibility_physical_locator_sample_held(
-				&locator, &admission, &guard, &root, key_out, result_out, &physical_active);
+				&locator, &admission, &guard, &root, key_out, result_out, &physical_active,
+				&precommit_retry);
 		if (sampled
 			&& (physical_active
 				|| (result_out->status != CLUSTER_TT_STATUS_COMMITTED
@@ -1243,17 +1255,20 @@ cluster_runtime_visibility_local_terminal_lookup_exact(TransactionId xid,
 				!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
 				cluster_undo_block0_current_cancel(&guard);
 				sampled = false;
+				precommit_retry = false;
 			}
 			cleanup.active = false;
 		}
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
 								PointerGetDatum(&cleanup));
-	if (sampled
+	if ((sampled || precommit_retry)
 		&& (cluster_epoch_get_current() != epoch
 			|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY,
-															 &admission)))
+															 &admission))) {
 		sampled = false;
+		precommit_retry = false;
+	}
 
 done:
 	if (admission.entered)
@@ -1264,6 +1279,8 @@ done:
 		result_out->status = CLUSTER_TT_STATUS_UNKNOWN;
 		result_out->commit_scn = InvalidScn;
 	}
+	if (precommit_retry_out != NULL)
+		*precommit_retry_out = precommit_retry;
 	return sampled;
 }
 
@@ -2062,7 +2079,7 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 	const ClusterTxLocator *locator, TimestampTz deadline, ClusterTTStatusKey *key_out,
 	ClusterTTStatusResult *result_out, uint32 *ctrc_grant_out,
 	uint32 *participant_capability_generation_out, ClusterCtrcTxnKeyV1 *ctrc_key_out,
-	ClusterTxLocator *canonical_locator_out, bool *cross_segment_out)
+	ClusterTxLocator *canonical_locator_out, bool *cross_segment_out, bool *precommit_retry_out)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterUndoBlock0LogicalKey data_logical;
@@ -2098,8 +2115,11 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 	bool same_segment = false;
 	bool physical_active = false;
 	bool sampled = false;
+	bool precommit_retry = false;
 	bool entered = false;
 
+	if (precommit_retry_out != NULL)
+		*precommit_retry_out = false;
 	if (key_out != NULL)
 		memset(key_out, 0, sizeof(*key_out));
 	if (result_out != NULL) {
@@ -2205,7 +2225,11 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 
 		if (!cluster_runtime_visibility_physical_locator_sample_held(
 				&physical, &admission, &guard, &phase_root, &sampled_key, &sampled_result,
-				&physical_active))
+				&physical_active, &precommit_retry))
+			goto protected_done;
+		/* This observation cannot authorize a member or updater proof.  Let
+		 * cleanup release SCUR before the caller can retry the whole batch. */
+		if (precommit_retry)
 			goto protected_done;
 		if (sampled_result.status == CLUSTER_TT_STATUS_IN_PROGRESS) {
 			owner.segment_id = physical.segment_id;
@@ -2283,6 +2307,7 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 				!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
 				cluster_undo_block0_current_cancel(&guard);
 				sampled = false;
+				precommit_retry = false;
 			}
 			cleanup.active = false;
 		}
@@ -2290,17 +2315,21 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 	PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
 								PointerGetDatum(&cleanup));
 
-	if (sampled
+	if ((sampled || precommit_retry)
 		&& (cluster_epoch_get_current() != epoch
 			|| !cluster_runtime_visibility_admission_current(CLUSTER_TX_RESOLVE_VISIBILITY,
 															 &admission)
 			|| (grant != 0
-				&& !cluster_ctrc_origin_grant_publishable(&ctrc_key, &participant, grant))))
+				&& !cluster_ctrc_origin_grant_publishable(&ctrc_key, &participant, grant)))) {
 		sampled = false;
+		precommit_retry = false;
+	}
 
 done:
 	if (entered)
 		cluster_semantic_activation_leave(&admission);
+	if (precommit_retry_out != NULL)
+		*precommit_retry_out = precommit_retry;
 	if (!sampled)
 		return false;
 	*key_out = sampled_key;
@@ -3744,6 +3773,60 @@ cluster_undo_verdict_resolve_internal(int origin_node, uint32 undo_segment_id,
 			break; /* live owner: unchanged CP3 + CP5 path below */
 		case CLUSTER_UNDO_AUTHORITY_SERVE_FAIL_CLOSED:
 		default:
+			/* A temporarily stale MEMBER remains UNKNOWN, not OWNER_LIVE.
+			 * An exact admitted peer/session can permit a terminal inquiry,
+			 * without a CP3 block0 grant or borrowing survivor authority. */
+			if (freshref_pair && route.status == CLUSTER_UNDO_AUTHORITY_UNKNOWN
+				&& route.reason == CLUSTER_UNDO_ROUTE_MEMBER_OBSERVATION_STALE
+				&& route.reconfig_epoch == (uint64)ref_epoch) {
+				ClusterSemanticAdmissionToken admission;
+				ClusterSemanticTerminalPeerSnapshot peer;
+				volatile bool resolved = false;
+				const uint32 caps = PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+									| PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
+									| PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
+									| PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1;
+
+				if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+													  CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
+					== CLUSTER_SEMANTIC_ADMISSION_OK) {
+					PG_TRY();
+					{
+						if (admission.formation_epoch == route.reconfig_epoch
+							&& cluster_epoch_get_current() == route.reconfig_epoch
+							&& cluster_semantic_activation_terminal_peer_capture(
+								&admission, origin_node, caps, &peer)
+							&& rtvis_try_origin_verdict(
+								origin_node, undo_segment_id, raw_xid, expected_tt_slot_id,
+								ref_epoch, freshref_pair_scn, freshref_pair_scn, read_scn, true,
+								&committed, &in_progress, &commit_scn, &is_bound)
+							&& committed && !in_progress && !is_bound
+							&& commit_scn == freshref_pair_scn
+							&& cluster_semantic_activation_terminal_peer_current(&admission,
+																				 &peer)) {
+							ClusterUndoServeRoute after
+								= cluster_undo_serve_authority(&rid, ref_epoch);
+
+							/* The original transport/proof guard has returned, while
+							 * this admission is still held. Recovered freshness is
+							 * harmless; any new route or epoch is not. */
+							resolved = cluster_epoch_get_current() == (uint64)ref_epoch
+									   && ((after.status == CLUSTER_UNDO_AUTHORITY_UNKNOWN
+											&& after.reason
+												   == CLUSTER_UNDO_ROUTE_MEMBER_OBSERVATION_STALE)
+										   || (after.status == CLUSTER_UNDO_AUTHORITY_OWNER_LIVE
+											   && after.destination_node == origin_node));
+						}
+					}
+					PG_FINALLY();
+					{
+						cluster_semantic_activation_leave(&admission);
+					}
+					PG_END_TRY();
+				}
+				if (resolved)
+					return cluster_undo_verdict_from_resolve(true, true, freshref_pair_scn, false);
+			}
 			/*
 			 * Owner liveness unproven / no derivable authority: fail
 			 * closed, NEVER the native CLOG/hint path (Rule 8.A).

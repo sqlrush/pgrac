@@ -360,7 +360,8 @@ UT_TEST(test_unsupported_delta_leaves_output_untouched)
 	PGAlignedBlock output;
 	PGAlignedBlock before;
 	XLogReaderState *state
-		= make_page_record(&record, RM_BTREE_ID, 0, RF_PAGE_CLASS_ORDINARY, MAIN_FORKNUM, false);
+		= make_page_record(&record, RM_GIN_ID, 0x20, RF_PAGE_CLASS_ORDINARY, MAIN_FORKNUM, false);
+	/* GIN/INSERT stays unsupported; retained btree now has a real codec. */
 
 	memset(old_page.data, 0, BLCKSZ);
 	((PageHeader)old_page.data)->pd_lower = SizeOfPageHeaderData;

@@ -26,4 +26,11 @@ extern void CheckPointSUBTRANS(void);
 extern void ExtendSUBTRANS(TransactionId newestXact);
 extern void TruncateSUBTRANS(TransactionId oldestXact);
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: retained shared-origin parentage joins native checkpoint fsync.
+ * Author: SqlRush <sqlrush@gmail.com> */
+struct FileTag;
+extern int subtranssyncfiletag(const struct FileTag *ftag, char *path);
+#endif
+
 #endif							/* SUBTRANS_H */

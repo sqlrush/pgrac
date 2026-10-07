@@ -67,6 +67,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_write_fence.h"
 
 
@@ -209,11 +210,15 @@ cluster_stats_wait_for_ready(int timeout_ms)
 	 * 100ms granularity is limiting.
 	 */
 	while (waited_ms < timeout_ms) {
-		ClusterStatsStatus status;
+		ClusterStatsStatus status = CLUSTER_STATS_NOT_STARTED;
 
-		LWLockAcquire(&cluster_stats_state->lwlock, LW_SHARED);
-		status = cluster_stats_state->status;
-		LWLockRelease(&cluster_stats_state->lwlock);
+		/* Postmaster has no PGPROC and cannot join an LWLock wait queue.
+		 * A busy publisher is still pending within the original startup budget;
+		 * never consume its protected READY value without the lock. */
+		if (LWLockConditionalAcquire(&cluster_stats_state->lwlock, LW_SHARED)) {
+			status = cluster_stats_state->status;
+			LWLockRelease(&cluster_stats_state->lwlock);
+		}
 
 		if (status == CLUSTER_STATS_READY)
 			return true;
@@ -453,11 +458,65 @@ stats_fill_wal_state_update(ClusterWalStateUpdateKind kind, int64 started_at,
 }
 
 
+/* Shared lifecycle belongs to ROOT INSTALL and the original native writer.
+ * Stats observes that completed handoff; it must not recreate a flat registry
+ * or publish a second ACTIVE/checkpoint. The normal serving gates remain in
+ * the original phase-4 owner. A respawn uses the same exact writer check. */
+static void
+stats_validate_native_writer(void)
+{
+	bool logged_wait = false;
+
+	for (;;) {
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+
+		/* Reset before observing stop/reload flags, so their wakeup cannot
+		 * be lost between the proof check and the wait. No authority is held. */
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+		if (ShutdownRequestPending || stats_shutdown_requested())
+			return;
+		if (ConfigReloadPending) {
+			ConfigReloadPending = false;
+			ProcessConfigFile(PGC_SIGHUP);
+		}
+		if (!RecoveryInProgress())
+			result = cluster_wal_writer_ready(GetWALInsertionTimeLine());
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return;
+		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+			|| result == CLUSTER_CONTROL_ROOT_STALE_TOKEN) {
+			/* QVOTEC may be renewing the current writer's lease. Remain
+			 * SPAWNING and obtain a new exact proof on the next tick; never
+			 * turn the unqualified observation into READY or a new producer. */
+			if (!logged_wait) {
+				ereport(LOG,
+						(errmsg("Cluster Stats is waiting for the installed native WAL writer"),
+						 errdetail("The original native-writer check returned result %d; "
+								   "Stats remains outside READY admission.",
+								   (int)result)));
+				logged_wait = true;
+			}
+			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							cluster_cluster_stats_main_loop_interval,
+							WAIT_EVENT_CLUSTER_BGPROC_CLUSTER_STATS_MAIN_LOOP);
+			continue;
+		}
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+				 errmsg("Cluster Stats could not validate the installed native WAL writer"),
+				 errdetail("The original native-writer check returned result %d.", (int)result),
+				 errhint("Preserve the ROOT-selected claim and startup evidence; Stats cannot "
+						 "create or repair writer admission.")));
+	}
+}
+
 /*
- * Initial phase-4 Stats owns W2 because AuxiliaryProcessMain has already
+ * Non-shared initial phase-4 Stats owns W2 because AuxiliaryProcessMain has already
  * assigned its PGPROC.  A RUNNING respawn only validates the previously
  * published ACTIVE slot; it never repeats W2 or the forced checkpoint.
- * The return value suppresses W4 for the existing self-fenced terminal.
+ * The return value suppresses legacy W4 in shared mode and for the existing
+ * self-fenced terminal.
  */
 static bool
 stats_prepare_incarnation(void)
@@ -469,7 +528,7 @@ stats_prepare_incarnation(void)
 		ClusterWalStateUpdateResult result;
 		int64 started_at;
 
-		if (!stats_wal_state_configured())
+		if (!cluster_shared_config && !stats_wal_state_configured())
 			return false;
 
 		if (cluster_write_fence_startup_self_check()) {
@@ -481,6 +540,10 @@ stats_prepare_incarnation(void)
 							   "ACTIVE, the startup checkpoint, and telemetry are skipped."),
 					 errhint("Recover only through the controlled rejoin or cold-admin "
 							 "procedure; never clear a live-cluster fence marker manually.")));
+			return true;
+		}
+		if (cluster_shared_config) {
+			stats_validate_native_writer();
 			return true;
 		}
 
@@ -525,6 +588,10 @@ stats_prepare_incarnation(void)
 		ClusterWalStateSlot slot;
 		ClusterWalSlotVerdict verdict;
 
+		if (cluster_shared_config) {
+			stats_validate_native_writer();
+			return true;
+		}
 		if (!stats_wal_state_configured())
 			return false;
 		memset(&slot, 0, sizeof(slot));
@@ -559,7 +626,7 @@ stats_refresh_wal_state(void)
 	ClusterWalStateUpdate update;
 	ClusterWalStateUpdateResult result;
 
-	if (!stats_wal_state_configured())
+	if (cluster_shared_config || !stats_wal_state_configured())
 		return;
 	stats_fill_wal_state_update(CLUSTER_WAL_STATE_UPDATE_TELEMETRY, 0, &update);
 	result = cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL);
@@ -625,6 +692,8 @@ ClusterStatsMain(void)
 	/* Publish SPAWNING (records pid + spawned_at). */
 	stats_publish_status(CLUSTER_STATS_SPAWNING);
 	suppress_wal_telemetry = stats_prepare_incarnation();
+	if (ShutdownRequestPending || stats_shutdown_requested())
+		goto shutdown;
 
 	/* Sprint B inject: ready-publish (test slow startup / phase 1 wait timeout). */
 	CLUSTER_INJECTION_POINT("cluster-stats-ready-publish");
@@ -674,6 +743,7 @@ ClusterStatsMain(void)
 			ResetLatch(MyLatch);
 	}
 
+shutdown:
 	/* Sprint B inject: shutdown-pre (test cleanup-time fault). */
 	CLUSTER_INJECTION_POINT("cluster-stats-shutdown-pre");
 

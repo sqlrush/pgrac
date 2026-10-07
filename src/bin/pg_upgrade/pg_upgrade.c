@@ -45,6 +45,7 @@
 #endif
 
 #include "catalog/pg_class_d.h"
+#include "common/controldata_utils.h"
 #include "common/file_perm.h"
 #include "common/logging.h"
 #include "common/restricted_token.h"
@@ -98,6 +99,13 @@ main(int argc, char **argv)
 
 	adjust_data_dir(&old_cluster);
 	adjust_data_dir(&new_cluster);
+
+	/* PGRAC: inspect resolved directories before output creation, either server
+	 * startup or native control/WAL replacement, including --check mode.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	reject_pgrac_legacy_operation(old_cluster.pgdata);
+	reject_pgrac_legacy_operation(new_cluster.pgdata);
 
 	/*
 	 * Set mask based on PGDATA permissions, needed for the creation of the

@@ -75,6 +75,16 @@
  *	Spec: spec-1.16-local-scn-maintenance.md (commit/abort SCN advance)
  *	Spec: spec-1.18-wal-record-xl-scn.md (forward SCN to Record*Prepared)
  *
+ *	What changed (F-D-31, Spec: spec-s9p2-05-instance-and-cluster-recovery.md):
+ *	  - The cluster TT prefinish only stages the prepared bindings.  Their
+ *	    standalone TT WAL is inserted inside RecordTransactionCommitPrepared /
+ *	    RecordTransactionAbortPrepared just before the record, the stamps are
+ *	    written after the record is flushed and before pg_xact, and the
+ *	    allocator, overlay and hint follow in FinishPreparedTransaction once
+ *	    the gxact is no longer valid (cluster_tt_twophase_postfinish).
+ *	  - RecordTransactionAbortPrepared delays checkpoints from the staged TT
+ *	    record insert until its stamps are written, as the commit side does.
+ *
  *	What changed (spec-1.16 v0.2):
  *	  - FinishPreparedTransaction(): hooks cluster_scn_advance_for_commit
  *	    / _for_abort BEFORE RecordTransactionCommitPrepared /
@@ -2320,10 +2330,10 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 		final_scn = cluster_scn_advance_for_abort();
 
 		/*
-		 * PGRAC (spec-3.15 D5, C-P6): durably resolve this prepared xact's
-		 * cluster TT state BEFORE the prepared commit/abort WAL record.
-		 * Commit: per-binding 0x30 (+ overlay COMMITTED).  Abort: per-binding
-		 * 0x31 abort-clear (+ overlay ABORTED).  bufptr already points at the
+		 * PGRAC (spec-3.15 D5, C-P6; F-D-31): prove and stage this prepared
+		 * xact's cluster TT bindings BEFORE the prepared commit/abort record;
+		 * nothing is emitted or written until the record path (see
+		 * cluster_tt_twophase_emit_staged).  bufptr already points at the
 		 * on-disk 2PC records (sliced above).
 		 */
 		ProcessClusterTTPrefinish(bufptr, xid, final_scn, isCommit);
@@ -2361,6 +2371,12 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 	 * (We assume it's safe to do this without taking TwoPhaseStateLock.)
 	 */
 	gxact->valid = false;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: F-D-31 -- the record and its TT stamps are durable and the xact
+	 * no longer runs: publish allocator, overlay and hint. */
+	cluster_tt_twophase_postfinish(xid);
+#endif
 
 	/*
 	 * We have to remove any files that were supposed to be dropped. For
@@ -2472,12 +2488,12 @@ FinishPreparedTransaction(const char *gid, bool isCommit)
 
 #ifdef USE_PGRAC_CLUSTER
 /*
- * PGRAC (spec-3.15 D5, C-P6): walk the on-disk 2PC records and run the
- * cluster TT prefinish for each TWOPHASE_RM_CLUSTER_TT_ID payload.
+ * PGRAC (spec-3.15 D5, C-P6; F-D-31): walk the on-disk 2PC records and stage
+ * the cluster TT finish for each TWOPHASE_RM_CLUSTER_TT_ID payload.
  * Same traversal shape as ProcessRecords below, but it runs BEFORE
  * RecordTransactionCommitPrepared/AbortPrepared (the post callbacks
  * are too late and carry no final_scn -- C-P7), and a failure here is
- * safe: the xact is still prepared and retryable.
+ * safe: nothing was emitted or written and the xact is still prepared.
  */
 static void
 ProcessClusterTTPrefinish(char *bufptr, TransactionId xid, SCN final_scn, bool isCommit)
@@ -3139,6 +3155,12 @@ RecordTransactionCommitPrepared(TransactionId xid, int nchildren, TransactionId 
 	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: F-D-31 -- the staged TT commit WAL goes just before the record,
+	 * in the WAL order the typed recovery consumers replay. */
+	cluster_tt_twophase_emit_staged(xid);
+#endif
+
 	/*
 	 * Emit the XLOG commit record. Note that we mark 2PC commits as
 	 * potentially having AccessExclusiveLocks since we don't know whether or
@@ -3152,7 +3174,7 @@ RecordTransactionCommitPrepared(TransactionId xid, int nchildren, TransactionId 
 								 ninvalmsgs, invalmsgs, initfileinval,
 								 MyXactFlags | XACT_FLAGS_ACQUIREDACCESSEXCLUSIVELOCK, xid, gid,
 								 commit_scn,	/* PGRAC: spec-1.18 */
-								 NULL);			/* PGRAC: spec-3.18 D4.1: 2PC keeps standalone 0x30 */
+								 NULL, NULL, 0); /* 2PC retains its original owner. */
 
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: spec-7.4 D1 -- record the commit-record LSN on the durable
@@ -3189,6 +3211,12 @@ RecordTransactionCommitPrepared(TransactionId xid, int nchildren, TransactionId 
 
 	/* Flush XLOG to disk */
 	XLogFlush(recptr);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: F-D-31 -- the TT stamps follow their flushed record and precede
+	 * pg_xact, while checkpoints still wait for us. */
+	cluster_tt_twophase_apply_staged(xid, recptr);
+#endif
 
 	/* Mark the transaction committed in pg_xact */
 	TransactionIdCommitTree(xid, nchildren, children);
@@ -3233,6 +3261,9 @@ RecordTransactionAbortPrepared(TransactionId xid, int nchildren, TransactionId *
 {
 	XLogRecPtr recptr;
 	bool replorigin;
+#ifdef USE_PGRAC_CLUSTER
+	bool tt_abort_staged;
+#endif
 
 	/*
 	 * Are we using the replication origins feature?  Or, in other words, are
@@ -3249,6 +3280,21 @@ RecordTransactionAbortPrepared(TransactionId xid, int nchildren, TransactionId *
 		elog(PANIC, "cannot abort transaction %u, it was already committed", xid);
 
 	START_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: F-D-31 -- the staged TT abort WAL goes just before the record.
+	 * Like a commit, checkpoints wait from that insert until the stamps are
+	 * written (cluster_undo_smgr.h); native aborts keep PG's behavior.
+	 */
+	tt_abort_staged = cluster_tt_twophase_has_staged(xid);
+	if (tt_abort_staged)
+	{
+		Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
+		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	}
+	cluster_tt_twophase_emit_staged(xid);
+#endif
 
 	/*
 	 * Emit the XLOG commit record. Note that we mark 2PC aborts as
@@ -3269,6 +3315,13 @@ RecordTransactionAbortPrepared(TransactionId xid, int nchildren, TransactionId *
 
 	/* Always flush, since we're about to remove the 2PC state file */
 	XLogFlush(recptr);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: F-D-31 -- the ABORTED stamps follow their flushed record. */
+	cluster_tt_twophase_apply_staged(xid, recptr);
+	if (tt_abort_staged)
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+#endif
 
 	/*
 	 * Mark the transaction aborted in clog.  This is not absolutely necessary

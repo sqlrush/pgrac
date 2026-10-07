@@ -24,6 +24,12 @@
 extern void RemoveObjects(DropStmt *stmt);
 
 /* commands/indexcmds.c */
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: shared-mode index scope before native side effects.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern void CheckClusterIndexSupport(Node *statement);
+extern void CheckClusterIndexAccessMethod(Oid accessMethodId);
+#endif
 extern ObjectAddress DefineIndex(Oid relationId,
 								 IndexStmt *stmt,
 								 Oid indexRelationId,

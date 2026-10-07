@@ -62,7 +62,65 @@
 #include "c.h"
 
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
-#include "port/pg_crc32c.h"		  /* join-commit marker integrity */
+#include "port/atomics.h"
+#include "port/pg_crc32c.h" /* join-commit marker integrity */
+
+/* Exact administrative request. Generation comes from the formation owner,
+ * never a client timestamp. These host values are not a wire/disk image.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef enum ClusterMembershipOperationKind {
+	CLUSTER_MEMBERSHIP_LEAVE = 1,
+	CLUSTER_MEMBERSHIP_REMOVE,
+	CLUSTER_MEMBERSHIP_REJOIN
+} ClusterMembershipOperationKind;
+
+typedef struct ClusterMembershipRequest {
+	uint64 expected_formation;
+	uint64 operation_generation;
+	uint64 expected_old_incarnation;
+	uint64 reserved_new_incarnation;
+	int32 target_node;
+	uint32 operation_kind;
+	uint8 guest_uuid[16];
+} ClusterMembershipRequest;
+
+typedef enum ClusterMembershipOperationPhase {
+	CLUSTER_MEMBERSHIP_OP_EMPTY,
+	CLUSTER_MEMBERSHIP_OP_RESERVED,
+	CLUSTER_MEMBERSHIP_OP_RUNNING,
+	CLUSTER_MEMBERSHIP_OP_FINISHED,
+	CLUSTER_MEMBERSHIP_OP_CANCELLED_UNPUBLISHED
+} ClusterMembershipOperationPhase;
+
+typedef struct ClusterMembershipOperation {
+	ClusterMembershipRequest request;
+	ClusterMembershipOperationPhase phase;
+} ClusterMembershipOperation;
+
+typedef enum ClusterMembershipRequestResult {
+	CLUSTER_MEMBERSHIP_REQUEST_ACCEPTED,
+	CLUSTER_MEMBERSHIP_REQUEST_RETRY,
+	CLUSTER_MEMBERSHIP_REQUEST_CONFLICT,
+	CLUSTER_MEMBERSHIP_REQUEST_STALE,
+	CLUSTER_MEMBERSHIP_REQUEST_INVALID
+} ClusterMembershipRequestResult;
+
+extern bool cluster_membership_request_valid(const ClusterMembershipRequest *request);
+extern bool cluster_membership_request_same(const ClusterMembershipRequest *a,
+											const ClusterMembershipRequest *b);
+/* Owner bookkeeping only, under the reconfig lock. The caller must obtain
+ * formation/generation from durable authority and validate all admission
+ * prerequisites; these functions neither choose a coordinator nor grant I/O. */
+extern ClusterMembershipRequestResult
+cluster_membership_operation_reserve(ClusterMembershipOperation *operation,
+									 const ClusterMembershipRequest *request,
+									 uint64 current_formation, uint64 next_generation);
+/* Called only after the corresponding FSM proves this exact phase. No PID,
+ * elapsed-time or caller cancellation can retire a published operation. */
+extern bool cluster_membership_operation_advance(ClusterMembershipOperation *operation,
+												 const ClusterMembershipRequest *request,
+												 ClusterMembershipOperationPhase expected,
+												 ClusterMembershipOperationPhase next);
 
 /*
  * Verdict of cluster_membership_vet_joiner.  ACCEPT is the only value that
@@ -134,6 +192,18 @@ typedef struct ClusterMembershipTable {
  * The caller owns the reconfig LWLock discipline for mutations.
  */
 extern void cluster_membership_attach(ClusterMembershipTable *table);
+
+/* Attach only to the current Reconfig shared owner after attaching its table.
+ * The owner initializes the generation to 2 exactly once. Reattachment must
+ * never reset it. All mutators retain their existing Reconfig writer lock.
+ * A zero token means missing owner, active/interrupted writer or exhaustion.
+ * An exact cut must still be sampled under the Reconfig read lock, with the
+ * generation checked before and after. A cache may use these O(1) accessors
+ * only while its other authority/epoch identities remain qualified. */
+extern void cluster_membership_attach_cut_generation(pg_atomic_uint64 *generation);
+extern uint64 cluster_membership_cut_generation(void);
+extern bool cluster_membership_cut_generation_current(uint64 expected);
+
 
 /*
  * INV-J7 bring-up durable seed.  Rebuilds last_admitted_incarnation[] from the

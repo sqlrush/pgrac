@@ -7,6 +7,8 @@
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * PGRAC MODIFICATIONS: document the retained PG parameter type for analysis.
+ *
  * IDENTIFICATION
  *			src/backend/access/spgist/spgdoinsert.c
  *
@@ -130,6 +132,9 @@ cmpOffsetNumbers(const void *a, const void *b)
  */
 void
 spgPageIndexMultiDelete(SpGistState *state, Page page,
+						/* PGRAC: retain the PG API in spgist_private.h; this
+						 * input is copied to sortednos before sorting. */
+						/* cppcheck-suppress constParameterPointer */
 						OffsetNumber *itemnos, int nitems,
 						int firststate, int reststate,
 						BlockNumber blkno, OffsetNumber offnum)

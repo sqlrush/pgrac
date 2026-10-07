@@ -19,7 +19,9 @@ typedef enum PgracFencedRejoinAsyncAction
 	PGRAC_FENCED_REJOIN_ASYNC_ADMIN_PREPARE = 1,
 	PGRAC_FENCED_REJOIN_ASYNC_CLAIM_NEXT = 2,
 	PGRAC_FENCED_REJOIN_ASYNC_AUTHORIZE_ON = 3,
-	PGRAC_FENCED_REJOIN_ASYNC_REFRESH_ON = 4
+	PGRAC_FENCED_REJOIN_ASYNC_REFRESH_ON = 4,
+	/* PGRAC: internal owner work, not a PFRJ client opcode. */
+	PGRAC_FENCED_REJOIN_ASYNC_CLEANUP = 5
 } PgracFencedRejoinAsyncAction;
 
 typedef enum PgracFencedRejoinAsyncEvent
@@ -37,6 +39,15 @@ typedef struct PgracFencedRejoinAsyncWorkerV1
 	int wait_status;
 	PgracFencedRejoinAsyncAction action;
 	bool active;
+	/* PGRAC: parent-owned snapshot, never taken from a completion message. */
+	bool owned;
+	uint32 operation_slot;
+	uint32 operation_count;
+	uint64 proof_generation;
+	PgracExternalFenceProtocolRejoinFrameV1 request;
+	PgracFencedRejoinOperationV1 before;
+	PgracFencedJournalRecordV1 identity;
+	PgracFencedJournalRecordV1 last_record;
 } PgracFencedRejoinAsyncWorkerV1;
 
 extern bool pgrac_fenced_rejoin_async_start(

@@ -32,10 +32,12 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_recovery.h"
 
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "miscadmin.h"
+#include "storage/proc.h"
 #include "utils/elog.h"
 #include "utils/timestamp.h"
 
@@ -152,6 +154,10 @@ cluster_tt_active_transition_decide(const TTSlot *predecessor, uint32 disk_gener
 	if (!terminal_shape)
 		return CLUSTER_TT_ACTIVE_CORRUPT;
 	if (predecessor->wrap > wrap)
+		return CLUSTER_TT_ACTIVE_STALE;
+	/* The same entity already went terminal: the binding is older than the
+	 * slot (redo started below a stamp that is already durable). */
+	if (predecessor->wrap == wrap && predecessor->xid == xid)
 		return CLUSTER_TT_ACTIVE_STALE;
 	if (predecessor->wrap >= TT_WRAP_MAX || wrap != (uint16)(predecessor->wrap + 1))
 		return CLUSTER_TT_ACTIVE_CONFLICT;
@@ -706,10 +712,10 @@ cluster_tt_durable_bind_preflight_exact(uint8 instance, uint32 segment_id,
 		return CLUSTER_TT_ACTIVE_CORRUPT;
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(instance), segment_id, instance,
-									  0, first.data)
-		|| !cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(instance), segment_id,
-										 instance, 0, second.data)) {
+	if (!cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(instance), segment_id,
+									  instance, 0, first.data)
+		|| !cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(instance),
+										 segment_id, instance, 0, second.data)) {
 		cluster_tt_durable_io_wait_end();
 		return CLUSTER_TT_ACTIVE_CONFLICT;
 	}
@@ -747,10 +753,10 @@ cluster_tt_durable_abort_preflight_exact(uint8 instance, uint32 segment_id,
 		|| wrap == TT_WRAP_INVALID || instance != tt_owner_instance_for_segment(segment_id))
 		return CLUSTER_TT_TERMINAL_CORRUPT;
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(instance), segment_id, instance,
-									  0, first.data)
-		|| !cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(instance), segment_id,
-										 instance, 0, second.data)) {
+	if (!cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(instance), segment_id,
+									  instance, 0, first.data)
+		|| !cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(instance),
+										 segment_id, instance, 0, second.data)) {
 		cluster_tt_durable_io_wait_end();
 		return CLUSTER_TT_TERMINAL_CONFLICT;
 	}
@@ -783,7 +789,7 @@ cluster_tt_durable_ctrc_release_preflight_exact(const xl_undo_tt_slot_ctrc_relea
 	if (!cluster_undo_tt_ctrc_release_valid(record)
 		|| record->owner_instance != tt_owner_instance_for_segment(record->segment_id))
 		return CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_CONFLICT;
-	intent = cluster_undo_intent_for_owner(record->owner_instance);
+	intent = cluster_undo_recovery_intent_for_owner(record->owner_instance);
 	cluster_tt_durable_io_wait_start();
 	if (!cluster_undo_smgr_read_block(intent, record->segment_id, record->owner_instance, 0,
 									  first.data)
@@ -821,7 +827,7 @@ cluster_tt_durable_redo_ctrc_release_slot_exact(const xl_undo_tt_slot_ctrc_relea
 		|| record->owner_instance != tt_owner_instance_for_segment(record->segment_id))
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid exact TT CTRC release identity")));
-	intent = cluster_undo_intent_for_owner(record->owner_instance);
+	intent = cluster_undo_recovery_intent_for_owner(record->owner_instance);
 	cluster_tt_durable_io_wait_start();
 	if (!cluster_undo_smgr_read_block(intent, record->segment_id, record->owner_instance, 0,
 									  block.data)) {
@@ -922,100 +928,174 @@ cluster_tt_durable_classify(int xid_matches, bool match_has_valid_scn, bool scan
 static const UBA InvalidUbaVal = InvalidUba_init;
 
 /*
- * tt_slot_write_committed -- the per-slot 32B targeted RMW shared by the
- * WAL-emitting durable commit (2PC, standalone 0x30) and the spec-3.18 D4.1
- * fold path (no 0x30; the delta rides the commit record).  Read the slot
- * (preserve flags), stamp COMMITTED + commit_scn, clear first_undo_block, write
- * 32B back.  Lock-free -- this xact is the sole owner of this slot (spec-3.11
- * §2.2).  NOT fsync'd (C10): durability comes from the WAL flush of whichever
- * record carries the delta; a crash before that flush leaves neither durable.
+ * Two-phase finish (F-D-31): a prepared transaction's TT bindings are proved
+ * and staged before the COMMIT/ROLLBACK PREPARED record, their standalone WAL
+ * (0x30, or 0x31 and 0x90) is inserted just before that record inside its
+ * critical section, and the 32-byte successors are written once the record is
+ * flushed, before pg_xact.  So neither the WAL nor the data file can show a
+ * terminal state ahead of the record that decides it, and a finish that fails
+ * before its record leaves nothing behind.  The binding's slot is the prepared
+ * transaction's own (pinned by the prepared-slot map), so no other writer
+ * changes it in between.
  *
- * spec-4.8ab D3 durability-ordering contract:  the TT slot WAL is emitted
- * BEFORE this byte-targeted write (cluster_tt_slot_durable_commit emits the 0x30
- * first; the fold path inserts the commit-record delta first), and this write is
- * NOT fsync'd.  So the commit_scn evidence is durable only via that WAL flush +
- * redo re-stamp -- the on-disk block-0 bytes are never authoritative ahead of
- * their WAL.  TT slots live in undo block 0, which is NOT poolable, so the
- * checkpoint-writeback boundary (spec-4.8ab D1, cluster_undo_buf.c) does not
- * cover them:  data blocks are flushed WAL-before-data by the pool, block 0 is
- * WAL-redo-only here.  The two durability domains are disjoint by design.
+ * spec-4.8ab D3 durability: the write is NOT fsync'd for this node's own
+ * runtime undo -- redo re-stamps it from the WAL until a checkpoint passes the
+ * record, and that checkpoint fsyncs it (cluster_undo_buf_flush_all); a
+ * recovery-scoped path is fsynced by the write itself.
  *
- * spec-4.8 D7-A (P1#1): clearing first_undo_block here (and in durable_abort +
- * both redo APPLY paths) keeps the D7 physical-rollback invariant -- an ABORTED
- * slot carries a non-invalid chain head ONLY if XLOG_UNDO_TT_SLOT_SET_HEAD (0x90)
- * re-attached one for the slot's current (xid, wrap).  Otherwise a recycled slot
- * would inherit a prior owner's stale head and D7 would walk a foreign chain.
+ * spec-4.8 D7-A (P1#1): a COMMITTED successor clears first_undo_block; an
+ * ABORTED successor carries the head captured at PREPARE (also emitted as
+ * 0x90) so D7 physical rollback can walk it, or none.
  */
-static void
-tt_slot_write_committed(uint32 segment_id, uint8 owner, uint16 slot_offset, TransactionId xid,
-						uint16 wrap, SCN commit_scn, TTSlot *successor_out)
+void
+cluster_tt_slot_durable_prepared_stage(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+									   uint16 wrap, bool commit, SCN commit_scn, UBA head,
+									   ClusterTTPreparedStage *stage)
 {
-	uint32 off = tt_slot_file_offset(slot_offset);
+	uint8 owner = tt_owner_instance_for_segment(segment_id);
+	ClusterUndoPathIntent intent = cluster_undo_recovery_intent_for_owner(owner);
 	TTSlot slot;
+	bool read_ok;
+
+	memset(stage, 0, sizeof(*stage));
+	stage->fd = -1;
+	if (slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(xid)
+		|| wrap == TT_WRAP_INVALID || (commit ? !SCN_VALID(commit_scn) : SCN_VALID(commit_scn)))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid TT binding of prepared transaction %u", xid)));
 
 	cluster_tt_durable_io_wait_start();
-
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
-											 owner, off, (char *)&slot, sizeof(slot))) {
-		cluster_tt_durable_io_wait_end();
+	read_ok = cluster_undo_smgr_read_header_bytes(
+		intent, segment_id, owner, tt_slot_file_offset(slot_offset), (char *)&slot, sizeof(slot));
+	cluster_tt_durable_io_wait_end();
+	if (!read_ok)
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster durable TT: cannot read slot %u of undo segment %u",
 							   slot_offset, segment_id)));
-	}
+	/* An earlier finish that failed before its record never wrote the slot,
+	 * but older software did: a terminal state of the same entity is
+	 * superseded by the decision now being recorded. */
+	if (slot.xid != xid || slot.wrap != wrap
+		|| (slot.status != TT_SLOT_ACTIVE && slot.status != TT_SLOT_COMMITTED
+			&& slot.status != TT_SLOT_ABORTED))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("TT slot %u of undo segment %u no longer names prepared transaction %u",
+						slot_offset, segment_id, xid),
+				 errdetail("slot xid=%u wrap=%u status=%u, binding wrap=%u", slot.xid, slot.wrap,
+						   slot.status, wrap),
+				 errhint("The prepared transaction stays prepared; inspect the undo segment "
+						 "before finishing it.")));
 
-	slot.xid = xid;
-	slot.wrap = wrap;
-	slot.status = (uint8)TT_SLOT_COMMITTED;
-	slot.flags = TT_FLAGS_RESERVED;
-	slot.commit_scn = commit_scn;
-	slot.first_undo_block = InvalidUbaVal; /* spec-4.8 D7-A (P1#1): no stale head */
-
-	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
-											  owner, off, (const char *)&slot, sizeof(slot))) {
-		cluster_tt_durable_io_wait_end();
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("cluster durable TT: cannot write slot %u of undo segment %u",
-							   slot_offset, segment_id)));
-	}
-
-	cluster_tt_durable_io_wait_end();
-	cluster_tt_durable_count_commit();
-	if (successor_out != NULL)
-		*successor_out = slot;
+	stage->segment_id = segment_id;
+	stage->slot_offset = slot_offset;
+	stage->owner = owner;
+	stage->intent = (uint8)intent;
+	stage->successor.xid = xid;
+	stage->successor.wrap = wrap;
+	stage->successor.status = commit ? TT_SLOT_COMMITTED : TT_SLOT_ABORTED;
+	stage->successor.flags = TT_FLAGS_RESERVED;
+	stage->successor.commit_scn = commit_scn;
+	stage->successor.first_undo_block = commit ? InvalidUbaVal : head;
+	stage->emit_head = !commit && !UBA_is_invalid(head);
+	stage->fd = cluster_undo_smgr_header_writer_open(intent, segment_id, owner);
+	if (stage->fd < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("cannot open TT block zero of undo segment %u for prepared transaction %u",
+						segment_id, xid),
+				 errhint("The prepared transaction stays prepared; retry is safe.")));
 }
 
+/* Critical-section safe: insert the staged binding's standalone TT WAL. */
 void
-cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset, TransactionId xid,
-							   uint16 wrap, SCN commit_scn)
+cluster_tt_slot_durable_prepared_emit(const ClusterTTPreparedStage *stage)
 {
-	uint8 owner = tt_owner_instance_for_segment(segment_id);
+	const TTSlot *successor = &stage->successor;
 
-	Assert(slot_offset < TT_SLOTS_PER_SEGMENT);
-	Assert(TransactionIdIsValid(xid));
-	Assert(SCN_VALID(commit_scn));
-
-	/*
-	 * spec-3.11 C1: standalone XLOG_UNDO_TT_SLOT_COMMIT (0x30) BEFORE the
-	 * commit record (caller is the 2PC COMMIT PREPARED durable hook).  The
-	 * commit record's XLogFlush / group commit makes it durable; the data-file
-	 * write below is NOT fsync'd (C10) -- a crash before the commit record
-	 * means neither is durable; after, redo replays this WAL.
-	 *
-	 * spec-3.18 D4.1: only the 2PC path still emits 0x30; normal commits fold
-	 * the equivalent delta into the commit record via
-	 * cluster_tt_slot_durable_commit_writeonly() (no 0x30).  Leaving 2PC on the
-	 * standalone record keeps PREPARE/COMMIT PREPARED untouched (user boundary).
-	 */
-	(void)cluster_undo_emit_tt_slot_commit(owner, segment_id, slot_offset, wrap, xid, commit_scn);
-
-	tt_slot_write_committed(segment_id, owner, slot_offset, xid, wrap, commit_scn, NULL);
+	if (successor->status == TT_SLOT_COMMITTED) {
+		(void)cluster_undo_emit_tt_slot_commit(stage->owner, stage->segment_id, stage->slot_offset,
+											   successor->wrap, successor->xid,
+											   successor->commit_scn);
+		return;
+	}
+	(void)cluster_undo_emit_tt_slot_abort(stage->owner, stage->segment_id, stage->slot_offset,
+										  successor->wrap, successor->xid);
+	if (stage->emit_head)
+		(void)cluster_undo_emit_tt_slot_set_head(stage->owner, stage->segment_id,
+												 stage->slot_offset, successor->wrap,
+												 successor->xid, successor->first_undo_block);
 }
 
+/* Critical-section safe: write the staged successor; PANIC on failure (the
+ * record is durable and redo restamps the slot). */
+void
+cluster_tt_slot_durable_prepared_apply(ClusterTTPreparedStage *stage)
+{
+	if (!cluster_undo_smgr_header_writer_write(
+			stage->fd, (ClusterUndoPathIntent)stage->intent, stage->segment_id, stage->owner,
+			tt_slot_file_offset(stage->slot_offset), (const char *)&stage->successor,
+			sizeof(stage->successor)))
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not write TT slot %u of undo segment %u for prepared transaction "
+						"%u: %m",
+						stage->slot_offset, stage->segment_id, stage->successor.xid)));
+	if (stage->successor.status == TT_SLOT_COMMITTED)
+		cluster_tt_durable_count_commit();
+}
+
+/* Never throws: drop the staged binding's descriptor. */
+void
+cluster_tt_slot_durable_prepared_release(ClusterTTPreparedStage *stage)
+{
+	cluster_undo_smgr_header_writer_close(stage->fd);
+	stage->fd = -1;
+}
+
+/*
+ * A normal commit's TT stamp between its precommit proof and its commit
+ * record flush (F-D-29).  The proof runs under block-zero current authority
+ * against the exact canonical ACTIVE predecessor; the stamp itself reaches
+ * neither the undo file nor the resident copy until
+ * cluster_tt_slot_durable_commit_apply(), so no writer of block zero can make
+ * it durable ahead of the commit record.  The reservation keeps the resident
+ * frame from being evicted; only this transaction may change its own slot.
+ */
+typedef struct TTCommitStage {
+	bool armed;
+	uint8 owner;
+	uint16 slot_offset;
+	uint32 segment_id;
+	ClusterUndoBlock0Generation generation;
+	ClusterUndoPathIntent intent;
+	int fd;
+	TTSlot predecessor;
+	TTSlot successor;
+	ClusterUndoBlock0Pin pin;
+} TTCommitStage;
+
+static TTCommitStage tt_commit_stage = { .fd = -1, .pin = { .slot = -1 } };
+
+static void
+tt_commit_stage_clear(TTCommitStage *stage)
+{
+	cluster_undo_smgr_header_writer_close(stage->fd);
+	memset(stage, 0, sizeof(*stage));
+	stage->fd = -1;
+	stage->pin.slot = -1;
+}
+
+/*
+ * stage == NULL applies (apply_transition) or only verifies the transition
+ * under the current authority.  stage != NULL verifies a COMMITTED transition
+ * and keeps it staged without writing; see TTCommitStage.
+ */
 static uint8
 tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uint16 slot_offset,
 							   TransactionId xid, uint16 wrap, uint8 terminal_status,
 							   SCN terminal_scn, bool apply_transition,
-							   const ClusterSemanticAdmissionToken *admission,
+							   const ClusterSemanticAdmissionToken *admission, TTCommitStage *stage,
 							   TTSlot *successor_out)
 {
 	uint8 owner = tt_owner_instance_for_segment(segment_id);
@@ -1025,7 +1105,8 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 	ClusterUndoBlock0ResolvedRoot final_root;
 	ClusterUndoBlock0Generation generation = { false, 0 };
 	ClusterUndoBlock0CurrentGuard guard = { 0 };
-	ClusterUndoBlock0Pin pin;
+	ClusterUndoBlock0Pin local_pin;
+	ClusterUndoBlock0Pin *pin = stage != NULL ? &stage->pin : &local_pin;
 	ClusterUndoBlock0CurrentStep step;
 	ClusterUndoBlock0Result result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	ClusterUndoBlock0Result current_failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
@@ -1047,6 +1128,8 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 	if (admission == NULL || successor_out == NULL || !admission->entered
 		|| segment_generation == UINT32_MAX
 		|| (terminal_status != TT_SLOT_COMMITTED && terminal_status != TT_SLOT_ABORTED)
+		|| (stage != NULL
+			&& (stage->armed || apply_transition || terminal_status != TT_SLOT_COMMITTED))
 		|| (admission->side != CLUSTER_SEMANTIC_SOURCE_SIDE
 			&& admission->side != CLUSTER_SEMANTIC_TARGET_SIDE)
 		|| cluster_node_id < 0 || owner != (uint8)(cluster_node_id + 1))
@@ -1065,8 +1148,8 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 	expected_owner.commit_scn = InvalidScn;
 	memset(&root, 0, sizeof(root));
 	memset(&final_root, 0, sizeof(final_root));
-	memset(&pin, 0, sizeof(pin));
-	pin.slot = -1;
+	memset(pin, 0, sizeof(*pin));
+	pin->slot = -1;
 	target_side = admission->side == CLUSTER_SEMANTIC_TARGET_SIDE;
 	root_available
 		= target_side ? cluster_semantic_activation_resolve_shared_undo_root(
@@ -1099,14 +1182,13 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 	current_active = true;
 
 	/*
-	 * spec-3.18 D4.1 (normal commit): write the 32B slot WITHOUT emitting a
-	 * standalone 0x30.  The caller (cluster_tt_local_precommit_durable_finish)
-	 * folds an equivalent xl_xact_tt_commit delta into the commit record, whose
-	 * flush makes both the delta and CLOG durable atomically (one record, no
-	 * intermediate stamped-but-uncommitted window).  Redo re-stamps via
-	 * cluster_tt_durable_redo_stamp_slot() from xact_redo_commit instead of the
-	 * 0x30 redo.  Returns the owner instance so the caller can fill the delta's
-	 * path-resolution field.
+	 * spec-3.18 D4.1 (normal commit): no standalone 0x30.  The caller
+	 * (cluster_tt_local_precommit_durable_finish) folds an equivalent
+	 * xl_xact_tt_commit delta into the commit record and redo re-stamps via
+	 * cluster_tt_durable_redo_stamp_slot() from xact_redo_commit.  The commit
+	 * path only stages here; the 32B slot is written after the commit record
+	 * is flushed (cluster_tt_slot_durable_commit_apply).  Returns the owner
+	 * instance so the caller can fill the delta's path-resolution field.
 	 */
 	PG_TRY();
 	{
@@ -1134,7 +1216,7 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 			|| generation.value != segment_generation)
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
 							errmsg("cannot commit a transaction: canonical generation changed")));
-		result = cluster_undo_block0_current_pin_exclusive(&guard, &root, &generation, &pin,
+		result = cluster_undo_block0_current_pin_exclusive(&guard, &root, &generation, pin,
 														   (char **)&resident_header);
 		if (result != CLUSTER_UNDO_BLOCK0_OK || resident_header == NULL)
 			ereport(
@@ -1220,14 +1302,36 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
 							errmsg("canonical TT commit authority drifted after transition")));
 
+		if (stage != NULL) {
+			stage->fd = cluster_undo_smgr_header_writer_open(root.intent, segment_id, owner);
+			if (stage->fd < 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("cannot open canonical TT block zero of undo segment %u for commit",
+								segment_id),
+						 errhint("The transaction was refused before its commit record; retry "
+								 "is safe.")));
+			cluster_undo_block0_pin_downgrade(pin);
+			pin_held = false;
+			stage->owner = owner;
+			stage->slot_offset = slot_offset;
+			stage->segment_id = segment_id;
+			stage->generation = generation;
+			stage->intent = root.intent;
+			stage->predecessor = disk_header->tt_slots[slot_offset];
+			stage->successor = successor;
+			stage->armed = true;
+		}
 		*successor_out = successor;
 	}
 	PG_FINALLY();
 	{
 		if (pin_held) {
-			cluster_undo_block0_unpin(&pin);
+			cluster_undo_block0_unpin(pin);
 			pin_held = false;
 		}
+		if (stage != NULL && !stage->armed)
+			tt_commit_stage_clear(stage);
 		if (current_active) {
 			/* This is the existing no-wait owned-resource release path.  In
 			 * particular, after successor publication it stages reliable remote
@@ -1242,19 +1346,87 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uin
 }
 
 uint8
-cluster_tt_slot_durable_commit_writeonly(uint32 segment_id, uint32 segment_generation,
-										 uint16 slot_offset, TransactionId xid, uint16 wrap,
-										 SCN commit_scn,
-										 const ClusterSemanticAdmissionToken *admission,
-										 TTSlot *successor_out)
+cluster_tt_slot_durable_commit_stage(uint32 segment_id, uint32 segment_generation,
+									 uint16 slot_offset, TransactionId xid, uint16 wrap,
+									 SCN commit_scn, const ClusterSemanticAdmissionToken *admission,
+									 TTSlot *successor_out)
 {
-	uint8 owner;
+	if (tt_commit_stage.armed)
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("a canonical TT commit stamp is already staged")));
+	return tt_slot_durable_terminal_exact(segment_id, segment_generation, slot_offset, xid, wrap,
+										  TT_SLOT_COMMITTED, commit_scn, false, admission,
+										  &tt_commit_stage, successor_out);
+}
 
-	owner = tt_slot_durable_terminal_exact(segment_id, segment_generation, slot_offset, xid, wrap,
-										   TT_SLOT_COMMITTED, commit_scn, true, admission,
-										   successor_out);
+bool
+cluster_tt_slot_durable_commit_staged(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+									  uint16 wrap)
+{
+	const TTCommitStage *stage = &tt_commit_stage;
+
+	return stage->armed && stage->segment_id == segment_id && stage->slot_offset == slot_offset
+		   && stage->successor.xid == xid && stage->successor.wrap == wrap;
+}
+
+/*
+ * Write the staged stamp once its commit record is durable.  The caller is in
+ * the commit critical section, after its own XLogFlush, before pg_xact is
+ * updated and while it still delays checkpoints: no checkpoint can complete
+ * with a redo pointer past the commit record before this write is recorded
+ * for that checkpoint's fsync.  Every failure is a PANIC; the commit record is
+ * durable and redo restamps the slot.
+ */
+void
+cluster_tt_slot_durable_commit_apply(XLogRecPtr commit_end)
+{
+	TTCommitStage *stage = &tt_commit_stage;
+	UndoSegmentHeaderData *resident;
+	char *page = NULL;
+
+	if (!stage->armed)
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("no canonical TT commit stamp is staged for this commit record")));
+	if (XLogRecPtrIsInvalid(commit_end) || GetFlushRecPtr(NULL) < commit_end)
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("canonical TT commit stamp would precede its commit record"),
+						errdetail("commit_end=%X/%X", LSN_FORMAT_ARGS(commit_end))));
+	if (cluster_undo_block0_lock_content(&stage->pin, &stage->generation,
+										 CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &page)
+			!= CLUSTER_UNDO_BLOCK0_OK
+		|| page == NULL)
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("staged canonical TT block zero of undo segment %u is gone",
+							   stage->segment_id)));
+	resident = (UndoSegmentHeaderData *)page;
+	if (resident->wrap_count != stage->generation.value
+		|| memcmp(&resident->tt_slots[stage->slot_offset], &stage->predecessor, sizeof(TTSlot))
+			   != 0)
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("staged canonical TT predecessor of undo segment %u slot %u "
+							   "changed before its commit stamp",
+							   stage->segment_id, stage->slot_offset)));
+	if (!cluster_undo_smgr_header_writer_write(stage->fd, stage->intent, stage->segment_id,
+											   stage->owner,
+											   tt_slot_file_offset(stage->slot_offset),
+											   (const char *)&stage->successor, sizeof(TTSlot)))
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not write canonical TT commit stamp of undo segment %u: %m",
+							   stage->segment_id)));
+	memcpy(&resident->tt_slots[stage->slot_offset], &stage->successor, sizeof(TTSlot));
+	cluster_undo_block0_unpin(&stage->pin);
+	tt_commit_stage_clear(stage);
 	cluster_tt_durable_count_commit();
-	return owner;
+}
+
+/* The commit failed before its record: nothing was written, so just let go. */
+void
+cluster_tt_slot_durable_commit_unstage(void)
+{
+	if (!tt_commit_stage.armed)
+		return;
+	cluster_undo_block0_release_reservation(&tt_commit_stage.pin);
+	tt_commit_stage_clear(&tt_commit_stage);
 }
 
 XLogRecPtr
@@ -1268,23 +1440,39 @@ cluster_tt_slot_durable_abort_exact(uint32 segment_id, uint32 segment_generation
 	uint8 owner;
 
 	owner = tt_slot_durable_terminal_exact(segment_id, segment_generation, slot_offset, xid, wrap,
-										   TT_SLOT_ABORTED, InvalidScn, false, admission,
+										   TT_SLOT_ABORTED, InvalidScn, false, admission, NULL,
 										   &prepared_successor);
-	abort_lsn = cluster_undo_emit_tt_slot_abort_exact(owner, segment_id, segment_generation,
-													  slot_offset, wrap, xid);
-	XLogFlush(abort_lsn);
-	(void)tt_slot_durable_terminal_exact(segment_id, segment_generation, slot_offset, xid, wrap,
-										 TT_SLOT_ABORTED, InvalidScn, true, admission,
-										 successor_out);
+
+	/*
+	 * The record is inserted outside the block-zero content lock: from its
+	 * insert until the stamp is written and noted, checkpoints wait
+	 * (cluster_undo_smgr.h), or one whose redo point passed the record could
+	 * sync headers before the write.
+	 */
+	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) == 0);
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	PG_TRY();
+	{
+		abort_lsn = cluster_undo_emit_tt_slot_abort_exact(owner, segment_id, segment_generation,
+														  slot_offset, wrap, xid);
+		XLogFlush(abort_lsn);
+		(void)tt_slot_durable_terminal_exact(segment_id, segment_generation, slot_offset, xid, wrap,
+											 TT_SLOT_ABORTED, InvalidScn, true, admission, NULL,
+											 successor_out);
+	}
+	PG_FINALLY();
+	{
+		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+	}
+	PG_END_TRY();
 	return abort_lsn;
 }
 
 
 /*
- * cluster_tt_slot_durable_abort -- spec-3.15 D5 (ROLLBACK PREPARED).
+ * cluster_tt_slot_durable_abort -- spec-3.15 D5 (crash-left ACTIVE resolution).
  *
- *	Mirror of durable_commit: WAL 0x31 first (the prepared-abort record's
- *	flush carries it, C10), then the 32B targeted RMW stamping
+ *	WAL 0x31 first, then the 32B targeted RMW stamping
  *	TT_SLOT_ABORTED with xid/wrap preserved and commit_scn cleared (V-2:
  *	identity must survive so by-exact-key lookups resolve ABORTED instead
  *	of missing into 53R97).
@@ -1303,8 +1491,8 @@ cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, Transaction
 
 	cluster_tt_durable_io_wait_start();
 
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
-											 owner, off, (char *)&slot, sizeof(slot))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
+											 segment_id, owner, off, (char *)&slot, sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster durable TT: cannot read slot %u of undo segment %u",
@@ -1318,65 +1506,13 @@ cluster_tt_slot_durable_abort(uint32 segment_id, uint16 slot_offset, Transaction
 	slot.commit_scn = InvalidScn;
 	slot.first_undo_block = InvalidUbaVal; /* spec-4.8 D7-A (P1#1): cleared; 0x90 re-attaches */
 
-	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
-											  owner, off, (const char *)&slot, sizeof(slot))) {
+	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
+											  segment_id, owner, off, (const char *)&slot,
+											  sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cluster durable TT: cannot write slot %u of undo segment %u",
 							   slot_offset, segment_id)));
-	}
-
-	cluster_tt_durable_io_wait_end();
-}
-
-
-/*
- * cluster_tt_slot_durable_set_head -- spec-4.8 D7-A.
- *
- *	Durably stamp the undo-chain head (TTSlot.first_undo_block) onto the slot,
- *	gated by the slot still owning (xid, wrap).  WAL 0x90 first (the prepared-
- *	abort flush carries it, C10), then the 32B targeted RMW.  Does NOT touch
- *	slot.status (the paired 0x60 abort already set ABORTED + xid + wrap, so the
- *	identity gate matches here).  A slot recycled to a different owner since the
- *	abort is left untouched (规则 8.A: never stamp another xact's slot).  Called
- *	from the ROLLBACK PREPARED prefinish abort path with the head captured into
- *	the 2PC record at PREPARE, so D7 physical rollback can walk it.
- */
-void
-cluster_tt_slot_durable_set_head(uint32 segment_id, uint16 slot_offset, TransactionId xid,
-								 uint16 wrap, UBA first_undo_block)
-{
-	uint8 owner = tt_owner_instance_for_segment(segment_id);
-	uint32 off = tt_slot_file_offset(slot_offset);
-	TTSlot slot;
-
-	Assert(slot_offset < TT_SLOTS_PER_SEGMENT);
-	Assert(TransactionIdIsValid(xid));
-
-	(void)cluster_undo_emit_tt_slot_set_head(owner, segment_id, slot_offset, wrap, xid,
-											 first_undo_block);
-
-	cluster_tt_durable_io_wait_start();
-
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
-											 owner, off, (char *)&slot, sizeof(slot))) {
-		cluster_tt_durable_io_wait_end();
-		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("cluster durable TT: cannot read slot %u of undo segment %u",
-							   slot_offset, segment_id)));
-	}
-
-	/* Identity gate (规则 8.A): only stamp the head if the slot still owns this
-	 * (xid, wrap); a recycled slot belongs to a newer owner -> leave untouched. */
-	if (slot.xid == xid && slot.wrap == wrap) {
-		slot.first_undo_block = first_undo_block;
-		if (!cluster_undo_smgr_write_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
-												  owner, off, (const char *)&slot, sizeof(slot))) {
-			cluster_tt_durable_io_wait_end();
-			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-							errmsg("cluster durable TT: cannot write slot %u of undo segment %u",
-								   slot_offset, segment_id)));
-		}
 	}
 
 	cluster_tt_durable_io_wait_end();
@@ -1398,8 +1534,8 @@ cluster_tt_slot_durable_lookup(uint32 segment_id, uint16 slot_offset, Transactio
 	off = tt_slot_file_offset(slot_offset);
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
-											 owner, off, (char *)&slot, sizeof(slot))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
+											 segment_id, owner, off, (char *)&slot, sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		cluster_tt_durable_count_lookup(false);
 		return false; /* segment absent / I/O -> miss (caller fail-closes) */
@@ -1440,8 +1576,9 @@ cluster_tt_slot_durable_lookup_committed_stable(uint32 segment_id, uint16 slot_o
 	off = tt_slot_file_offset(slot_offset);
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
-											 owner, off, (char *)&first, sizeof(first))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
+											 segment_id, owner, off, (char *)&first,
+											 sizeof(first))) {
 		cluster_tt_durable_io_wait_end();
 		return false;
 	}
@@ -1459,8 +1596,9 @@ cluster_tt_slot_durable_lookup_committed_stable(uint32 segment_id, uint16 slot_o
 	}
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
-											 owner, off, (char *)&second, sizeof(second))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
+											 segment_id, owner, off, (char *)&second,
+											 sizeof(second))) {
 		cluster_tt_durable_io_wait_end();
 		cluster_tt_durable_count_lookup(false);
 		return false;
@@ -1502,8 +1640,9 @@ cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
 	off = tt_slot_file_offset(slot_offset);
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
-											 owner, off, (char *)&first, sizeof(first))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
+											 segment_id, owner, off, (char *)&first,
+											 sizeof(first))) {
 		cluster_tt_durable_io_wait_end();
 		cluster_tt_durable_count_lookup(false);
 		return false;
@@ -1514,8 +1653,9 @@ cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
 		return false;
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
-											 owner, off, (char *)&second, sizeof(second))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(owner),
+											 segment_id, owner, off, (char *)&second,
+											 sizeof(second))) {
 		cluster_tt_durable_io_wait_end();
 		return false;
 	}
@@ -1529,6 +1669,20 @@ cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
 	return true;
 }
 
+
+/* A replayed record whose effect or a newer state the slot already shows:
+ * see cluster_undo_smgr_header_unchanged_durable. */
+static void
+tt_redo_present_durable(uint8 instance, uint32 segment_id)
+{
+	if (!cluster_undo_smgr_header_unchanged_durable(
+			cluster_undo_recovery_intent_for_owner(instance), segment_id, instance)) {
+		cluster_tt_durable_io_wait_end();
+		ereport(PANIC,
+				(errcode_for_file_access(),
+				 errmsg("could not make undo segment %u durable in TT redo: %m", segment_id)));
+	}
+}
 
 void
 cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id, uint16 slot_offset,
@@ -1545,8 +1699,9 @@ cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id, uint16 slo
 				(errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid typed TT abort redo identity")));
 	off = tt_slot_file_offset(slot_offset);
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(instance), segment_id,
-											 instance, off, (char *)&slot, sizeof(slot))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(instance),
+											 segment_id, instance, off, (char *)&slot,
+											 sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cannot read TT slot %u of undo segment %u for abort redo",
@@ -1559,6 +1714,7 @@ cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id, uint16 slo
 						errmsg("invalid TT status %u in typed abort redo", slot.status)));
 	}
 	if (decision == CLUSTER_TT_REDO_SKIP) {
+		tt_redo_present_durable(instance, segment_id);
 		cluster_tt_durable_io_wait_end();
 		cluster_vis_bump_recovery_undo_redo_skips();
 		return;
@@ -1569,8 +1725,9 @@ cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id, uint16 slo
 	slot.flags = TT_FLAGS_RESERVED;
 	slot.commit_scn = InvalidScn;
 	slot.first_undo_block = InvalidUbaVal;
-	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_intent_for_owner(instance), segment_id,
-											  instance, off, (const char *)&slot, sizeof(slot))
+	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_recovery_intent_for_owner(instance),
+											  segment_id, instance, off, (const char *)&slot,
+											  sizeof(slot))
 		|| !cluster_undo_smgr_fsync_segment_file(segment_id, instance)) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -1598,8 +1755,8 @@ cluster_tt_durable_redo_abort_slot_exact(uint8 instance, uint32 segment_id,
 		ereport(PANIC,
 				(errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid exact TT abort redo identity")));
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(instance), segment_id, instance,
-									  0, block.data)) {
+	if (!cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(instance), segment_id,
+									  instance, 0, block.data)) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cannot read undo segment %u for exact abort redo", segment_id)));
@@ -1614,11 +1771,13 @@ cluster_tt_durable_redo_abort_slot_exact(uint8 instance, uint32 segment_id,
 													 header->wrap_count, segment_generation, xid,
 													 wrap, TT_SLOT_ABORTED, InvalidScn);
 	if (decision == CLUSTER_TT_TERMINAL_STALE) {
+		tt_redo_present_durable(instance, segment_id);
 		cluster_tt_durable_io_wait_end();
 		cluster_vis_bump_recovery_undo_redo_skips();
 		return;
 	}
 	if (decision == CLUSTER_TT_TERMINAL_IDEMPOTENT) {
+		tt_redo_present_durable(instance, segment_id);
 		cluster_tt_durable_io_wait_end();
 		return;
 	}
@@ -1632,9 +1791,9 @@ cluster_tt_durable_redo_abort_slot_exact(uint8 instance, uint32 segment_id,
 	successor.flags = TT_FLAGS_RESERVED;
 	successor.commit_scn = InvalidScn;
 	successor.first_undo_block = InvalidUbaVal;
-	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_intent_for_owner(instance), segment_id,
-											  instance, tt_slot_file_offset(slot_offset),
-											  (const char *)&successor, sizeof(successor))
+	if (!cluster_undo_smgr_write_header_bytes(
+			cluster_undo_recovery_intent_for_owner(instance), segment_id, instance,
+			tt_slot_file_offset(slot_offset), (const char *)&successor, sizeof(successor))
 		|| !cluster_undo_smgr_fsync_segment_file(segment_id, instance)) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -1659,21 +1818,24 @@ cluster_tt_durable_redo_set_head_slot(uint8 instance, uint32 segment_id, uint16 
 						errmsg("invalid typed TT set-head redo identity")));
 	off = tt_slot_file_offset(slot_offset);
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(instance), segment_id,
-											 instance, off, (char *)&slot, sizeof(slot))) {
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_recovery_intent_for_owner(instance),
+											 segment_id, instance, off, (char *)&slot,
+											 sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("cannot read TT slot %u of undo segment %u for set-head redo",
 							   slot_offset, segment_id)));
 	}
 	if (slot.status != TT_SLOT_ABORTED || slot.xid != xid || slot.wrap != wrap) {
+		tt_redo_present_durable(instance, segment_id);
 		cluster_tt_durable_io_wait_end();
 		cluster_vis_bump_recovery_undo_redo_skips();
 		return;
 	}
 	slot.first_undo_block = first_undo_block;
-	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_intent_for_owner(instance), segment_id,
-											  instance, off, (const char *)&slot, sizeof(slot))
+	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_recovery_intent_for_owner(instance),
+											  segment_id, instance, off, (const char *)&slot,
+											  sizeof(slot))
 		|| !cluster_undo_smgr_fsync_segment_file(segment_id, instance)) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC,
@@ -1828,7 +1990,7 @@ cluster_tt_recovery_classify_revert(bool is_delete_record, bool record_xid_abort
 static bool
 durable_scan_read_header(uint8 owner, uint32 segment_id, char block[BLCKSZ], bool *scan_complete)
 {
-	ClusterUndoPathIntent intent = cluster_undo_intent_for_owner(owner);
+	ClusterUndoPathIntent intent = cluster_undo_recovery_intent_for_owner(owner);
 
 	if (cluster_undo_smgr_read_block(intent, segment_id, owner, 0, block))
 		return true;
@@ -2070,8 +2232,8 @@ cluster_undo_segment_tt_header_scan_pass(uint32 segment_id, uint8 owner_instance
 
 	/* Whole-block read mirrors the by-xid scan shape (one smgr surface). */
 	cluster_undo_cleaner_scan_wait_start();
-	if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner_instance), segment_id,
-									  owner_instance, 0, block.data)) {
+	if (!cluster_undo_smgr_read_block(cluster_undo_recovery_intent_for_owner(owner_instance),
+									  segment_id, owner_instance, 0, block.data)) {
 		cluster_undo_cleaner_scan_wait_end();
 		return false; /* absent / I/O: caller counts and moves on */
 	}

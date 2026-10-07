@@ -9,9 +9,12 @@
 #include "postgres.h"
 
 #include "access/xlogreader.h"
+#include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_external_fence.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_page_stable_base.h"
 #include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_wal_retention.h"
 
 #ifdef USE_CLUSTER_UNIT
@@ -38,6 +41,8 @@ struct RfPageStableBaseProofV1 {
 	ClusterWalRetentionPin *retention_pin;
 	const RfPagePinnedSourceV1 *source;
 	const RfContributorVectorV1 *contributors;
+	const ClusterThreadRecoveryAuthorityV1 *source_authorities;
+	ClusterThreadRecoveryAuthorityV1 *source_owners;
 };
 
 static bool
@@ -56,7 +61,10 @@ rf_page_identity_valid_v1(const RfPageIdentityV1 *identity)
 {
 	return identity != NULL && identity->system_identifier != 0
 		   && bytes_nonzero(identity->storage_uuid, sizeof(identity->storage_uuid))
-		   && identity->locator.spcOid != InvalidOid && identity->locator.dbOid != InvalidOid
+		   && identity->locator.spcOid != InvalidOid
+		   && (identity->locator.spcOid == GLOBALTABLESPACE_OID
+				   ? identity->locator.dbOid == InvalidOid
+				   : identity->locator.dbOid != InvalidOid)
 		   && identity->locator.relNumber != InvalidRelFileNumber
 		   && identity->blockno != InvalidBlockNumber && identity->reserved_zero == 0;
 }
@@ -273,12 +281,10 @@ validate_request(const RfPageStableGraphRequestV1 *request)
 		bool empty = (cut->flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0;
 
 		if (cut->failed_thread == 0 || cut->timeline_id == 0
+			|| cut->origin_owner_incarnation == UINT64_MAX
 			|| (cut->flags & ~RF_CONTRIBUTOR_CUT_KNOWN_MASK) != 0
 			|| (cut->flags & RF_CONTRIBUTOR_CUT_COMPLETE) == 0
-			|| (i > 0
-				&& (vector->cuts[i - 1].failed_thread > cut->failed_thread
-					|| (vector->cuts[i - 1].failed_thread == cut->failed_thread
-						&& vector->cuts[i - 1].timeline_id >= cut->timeline_id)))) {
+			|| (i > 0 && !rf_contributor_cut_precedes_v1(&vector->cuts[i - 1], cut))) {
 			detail = RF_PAGE_PROOF_DETAIL_PARTICIPANT_MISSING;
 			goto done;
 		}
@@ -400,7 +406,8 @@ rf_page_stable_base_select_v1(const RfPageStableGraphRequestV1 *request, uint32 
 
 			if (edge_is_duplicate_of_prior(vector, j))
 				continue;
-			if (record_identity_equal(&left->record_identity, &right->record_identity)
+			if (left->participant_index == right->participant_index
+				&& record_identity_equal(&left->record_identity, &right->record_identity)
 				&& !edge_exact_equal(left, right)) {
 				detail = RF_PAGE_PROOF_DETAIL_ANCHOR_AMBIGUOUS;
 				goto fail;
@@ -546,6 +553,9 @@ stable_owners_revalidate(const RfPageStableBaseProofRequestV1 *request, bool bou
 		if (!bytes_nonzero(token->authority_uuid, sizeof(token->authority_uuid))
 			|| token->origin_thread_id != contributors->cuts[i].failed_thread
 			|| token->origin_thread_id != duty->origin_thread_id
+			|| (cluster_shared_config && contributors->cuts[i].origin_owner_incarnation == 0)
+			|| (contributors->cuts[i].origin_owner_incarnation != 0
+				&& contributors->cuts[i].origin_owner_incarnation != duty->origin_owner_incarnation)
 			|| token->root_lineage_seq != duty->root_lineage_seq
 			|| memcmp(token->authority_uuid, duty->authority_uuid, 16) != 0
 			|| token->root_lineage_seq == 0 || token->reserved20 != 0 || token->reserved32 != 0)
@@ -570,6 +580,163 @@ stable_owners_revalidate(const RfPageStableBaseProofRequestV1 *request, bool bou
 		!= CLUSTER_WAL_PIN_OK)
 		return RF_PAGE_PROOF_DETAIL_RETENTION_STALE;
 	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+static RfPageProofDetailV1
+source_owners_revalidate(const RfPageIdentityV1 *identity,
+						 const RfContributorVectorV1 *contributors,
+						 const ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count)
+{
+	if (identity == NULL || authorities == NULL || count == 0
+		|| count > RF_PAGE_STABLE_MAX_PARTICIPANTS || contributors == NULL
+		|| contributors->cuts == NULL || contributors->participant_count != count)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterThreadRecoveryAuthorityV1 *a = &authorities[i];
+		const ClusterControlRootSnapshot *root = a->root_snapshot;
+		const RfContributorStreamCutV1 *cut = &contributors->cuts[i];
+		ClusterThreadRecoveryAuthorityResultV1 verdict;
+
+		verdict = cluster_thread_recovery_authority_revalidate_nowait_v1(a);
+		if (verdict == CLUSTER_THREAD_AUTHORITY_PIN_STALE)
+			return RF_PAGE_PROOF_DETAIL_RETENTION_STALE;
+		if (verdict == CLUSTER_THREAD_AUTHORITY_FENCE_STALE
+			|| verdict == CLUSTER_THREAD_AUTHORITY_SERIAL_STALE)
+			return RF_PAGE_PROOF_DETAIL_FENCE_STALE;
+		if (verdict != CLUSTER_THREAD_AUTHORITY_OK)
+			return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+		if (a->retention_pin != authorities[0].retention_pin)
+			return RF_PAGE_PROOF_DETAIL_RETENTION_STALE;
+		if (a->duty->system_identifier != identity->system_identifier
+			|| memcmp(a->duty->storage_uuid, identity->storage_uuid, 16) != 0
+			|| cut->failed_thread != a->duty->origin_thread_id
+			|| (cluster_shared_config && cut->origin_owner_incarnation == 0)
+			|| (cut->origin_owner_incarnation != 0
+				&& cut->origin_owner_incarnation != a->duty->origin_owner_incarnation)
+			|| (i > 0 && cut->failed_thread <= contributors->cuts[i - 1].failed_thread))
+			return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+		/* These are per-target projections of the physically closed cuts.
+		 * An origin without an edge still has its original full authority. */
+		if (root->checkpoint_tli == 0 || root->checkpoint_tli != root->tail_tli
+			|| cut->timeline_id != root->checkpoint_tli
+			|| root->checkpoint_lower_lsn == InvalidXLogRecPtr
+			|| root->validated_tail_lsn_exclusive <= root->checkpoint_lower_lsn
+			|| cut->scan_begin_inclusive < root->checkpoint_lower_lsn
+			|| cut->scan_end_exclusive > root->validated_tail_lsn_exclusive
+			|| cut->scan_end_exclusive < cut->scan_begin_inclusive)
+			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+	}
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+RfPageProofDetailV1
+rf_page_stable_base_proof_build_sources_v1(const RfPageStableGraphRequestV1 *graph,
+										   const ClusterThreadRecoveryAuthorityV1 *authorities,
+										   uint32 count, uint32 *chain_indices,
+										   uint32 chain_capacity,
+										   RfPageStableBaseProofV1 **out_proof)
+{
+	RfPageStableBaseProofV1 *proof;
+	RfPageStableGraphRequestV1 verified;
+	RfPageStableSelectionV1 selection;
+	RfPageProofDetailV1 detail;
+
+	if (out_proof == NULL)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	*out_proof = NULL;
+	if (graph == NULL || graph->participant_count != count)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	detail
+		= source_owners_revalidate(&graph->page_identity, graph->contributors, authorities, count);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		return detail;
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterThreadRecoveryAuthorityV1 *a = &authorities[i];
+		const ClusterControlRootSnapshot *original = a->root_snapshot;
+		ClusterControlRootSnapshot current;
+		ClusterControlRootResult status;
+
+		/* This I/O belongs to preflight, before PAGE guards are promoted. */
+		status = cluster_control_root_revalidate(a->root_token, a->duty, &current);
+		if ((status != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			 && status != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+			|| memcmp(&current.identity, a->duty, sizeof(current.identity)) != 0
+			|| current.lifecycle != original->lifecycle
+			|| current.root_flags != original->root_flags
+			|| current.checkpoint_tli != original->checkpoint_tli
+			|| current.tail_tli != original->tail_tli
+			|| current.checkpoint_lower_lsn != original->checkpoint_lower_lsn
+			|| current.validated_tail_lsn_exclusive != original->validated_tail_lsn_exclusive)
+			return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+	}
+	verified = *graph;
+	verified.root_current = verified.duty_current = verified.fence_current = true;
+	verified.retention_current = true;
+	verified.retention_binding_cookie = verified.current_retention_binding_cookie = 1;
+	detail = rf_page_stable_base_select_v1(&verified, chain_indices, chain_capacity, &selection);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		return detail;
+	proof = (RfPageStableBaseProofV1 *)stable_alloc0(1, sizeof(*proof));
+	if (proof == NULL)
+		return RF_PAGE_PROOF_DETAIL_OOM;
+	proof->source_owners
+		= (ClusterThreadRecoveryAuthorityV1 *)stable_alloc0(count, sizeof(*authorities));
+	if (proof->source_owners == NULL) {
+		stable_free(proof);
+		return RF_PAGE_PROOF_DETAIL_OOM;
+	}
+	memcpy(proof->source_owners, authorities, count * sizeof(*authorities));
+	proof->magic = RF_PAGE_STABLE_PROOF_MAGIC;
+	proof->participant_count = count;
+	proof->page_identity = graph->page_identity;
+	proof->expected_result = graph->expected_result;
+	proof->selection = selection;
+	proof->source_authorities = authorities;
+	proof->retention_pin = authorities[0].retention_pin;
+	proof->source = graph->source;
+	proof->contributors = graph->contributors;
+	/* The graph walk and its allocations cannot extend an expired grant. */
+	detail
+		= source_owners_revalidate(&proof->page_identity, proof->contributors, authorities, count);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK) {
+		rf_page_stable_base_proof_destroy_v1(&proof);
+		return detail;
+	}
+	*out_proof = proof;
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+bool
+rf_page_stable_base_proof_matches_sources_v1(const RfPageStableBaseProofV1 *proof,
+											 const RfPageIdentityV1 *page_identity,
+											 const RfPageVersionV1 *expected_result,
+											 const ClusterThreadRecoveryAuthorityV1 *authorities,
+											 uint32 count, const RfPagePinnedSourceV1 *source,
+											 const RfContributorVectorV1 *contributors)
+{
+	if (proof == NULL || proof->magic != RF_PAGE_STABLE_PROOF_MAGIC || proof->source_owners == NULL
+		|| proof->source_authorities != authorities || proof->participant_count != count
+		|| count == 0 || count > RF_PAGE_STABLE_MAX_PARTICIPANTS
+		|| !rf_page_identity_equal_v1(&proof->page_identity, page_identity)
+		|| !rf_page_version_equal_v1(&proof->expected_result, expected_result)
+		|| !rf_page_version_equal_v1(&proof->selection.terminal_version, expected_result)
+		|| proof->source != source || proof->contributors != contributors)
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		const ClusterThreadRecoveryAuthorityV1 *original = &proof->source_owners[i];
+		const ClusterThreadRecoveryAuthorityV1 *current = &authorities[i];
+
+		if (original->duty != current->duty || original->root_snapshot != current->root_snapshot
+			|| original->root_token != current->root_token
+			|| original->formation != current->formation
+			|| original->fence_need_set != current->fence_need_set
+			|| original->fence_admission_set != current->fence_admission_set
+			|| original->retention_pin != current->retention_pin
+			|| original->serial_guard != current->serial_guard)
+			return false;
+	}
+	return source_owners_revalidate(page_identity, contributors, authorities, count)
+		   == RF_PAGE_PROOF_DETAIL_OK;
 }
 
 static RfPageProofDetailV1
@@ -655,7 +822,7 @@ rf_page_stable_base_proof_matches_v1(
 	const RfContributorVectorV1 *contributors, uint32 participant_count)
 {
 	return proof != NULL && proof->magic == RF_PAGE_STABLE_PROOF_MAGIC && participant_count != 0
-		   && proof->participant_count == participant_count
+		   && proof->source_authorities == NULL && proof->participant_count == participant_count
 		   && rf_page_identity_equal_v1(&proof->page_identity, page_identity)
 		   && rf_page_version_equal_v1(&proof->expected_result, expected_result)
 		   && rf_page_version_equal_v1(&proof->selection.terminal_version, expected_result)
@@ -677,8 +844,45 @@ rf_page_stable_base_proof_destroy_v1(RfPageStableBaseProofV1 **proof_pointer)
 	if (proof->magic != RF_PAGE_STABLE_PROOF_MAGIC)
 		return;
 	proof->magic = 0;
+	if (proof->source_owners != NULL)
+		stable_free(proof->source_owners);
 	stable_free(proof);
 	*proof_pointer = NULL;
+}
+
+bool
+rf_page_stable_base_proof_covers_version_v1(const RfPageStableBaseProofV1 *proof,
+											const RfPageIdentityV1 *identity,
+											const RfPageVersionV1 *version)
+{
+	const RfContributorVectorV1 *vector;
+	uint32 i;
+
+	if (proof == NULL || proof->magic != RF_PAGE_STABLE_PROOF_MAGIC
+		|| !rf_page_identity_equal_v1(&proof->page_identity, identity)
+		|| !rf_page_version_present_v1(version)
+		|| memcmp(version->segment_incarnation, proof->expected_result.segment_incarnation, 16) != 0
+		|| rf_page_version_equal_v1(version, &proof->expected_result))
+		return false;
+	vector = proof->contributors;
+	if (vector == NULL || vector->edges == NULL || vector->edge_count == 0
+		|| vector->edge_count > RF_PAGE_STABLE_MAX_EDGES)
+		return false;
+	/* Proof construction rejected every branch, cycle and off-chain edge,
+	 * including ancestors preceding the nearest full-image anchor. */
+	for (i = 0; i < vector->edge_count; i++) {
+		const RfPageStableEdgeInputV1 *edge = &vector->edges[i];
+		RfPageVersionV1 result;
+
+		if (!rf_page_identity_equal_v1(&edge->page_identity, identity))
+			return false;
+		edge_result_version(edge, &result);
+		if (rf_page_version_equal_v1(version, &result)
+			|| (edge->edge.before_kind == RF_PAGE_STATE_PRESENT
+				&& rf_page_version_equal_v1(version, &edge->edge.before)))
+			return true;
+	}
+	return false;
 }
 
 #ifdef USE_CLUSTER_UNIT

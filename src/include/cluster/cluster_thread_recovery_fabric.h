@@ -16,6 +16,10 @@ typedef struct ClusterThreadRecoveryFabricPlanRequestV1 {
 	uint64 system_identifier;
 	uint8 storage_uuid[16];
 	const RfContributorStreamCutV1 *physical_cuts;
+	/* Optional for pure graphs; shared ROOT scanners supply every full claim. */
+	const ClusterWalSourceRef *sources;
+	/* Native redo starts from the same exact ROOT-selected source/anchor. */
+	const XLogRecPtr *redo_starts;
 	uint32 participant_count;
 	uint64 retention_binding_cookie;
 	Size page_memory_budget;
@@ -37,6 +41,24 @@ typedef struct ClusterThreadRecoveryFabricApplyResultV1 {
 
 struct ClusterThreadRecoveryAuthorityV1;
 
+/* One-record contribution census, never an ancestry/replay/retirement proof.
+ * The physical input owner must qualify the entire stream and ROOT afterward.
+ * Callbacks may only retain provisional additions. */
+typedef bool (*ClusterRecoveryContributionVisitorV1)(void *arg, const RelFileLocator *locator,
+													 ForkNumber forknum, BlockNumber blockno,
+													 uint64 token);
+extern RfPageProofDetailV1
+cluster_thread_recovery_record_census_v1(XLogReaderState *record, const ClusterWalSourceRef *source,
+										 const RfContributorStreamCutV1 *cut,
+										 ClusterRecoveryContributionVisitorV1 visitor, void *arg);
+
+/* Collect all exact original cuts before resolving PAGE dependencies. Every
+ * authority must borrow the same held retention set; observed generation
+ * claims must name one database. This creates no mutation authority. */
+extern RfPageProofDetailV1 cluster_thread_recovery_fabric_scan_roots_v1(
+	const struct ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count, bool space_active,
+	ClusterThreadRecoveryFabricPlanV1 **out_plan, uint64 *out_record_count);
+
 extern RfPageProofDetailV1 cluster_thread_recovery_fabric_plan_create_v1(
 	const ClusterThreadRecoveryFabricPlanRequestV1 *request,
 	ClusterThreadRecoveryFabricPlanV1 **out_plan);
@@ -44,6 +66,8 @@ extern RfPageProofDetailV1 cluster_thread_recovery_fabric_plan_feed_record_v1(
 	ClusterThreadRecoveryFabricPlanV1 *plan, XLogReaderState *record, uint16 participant_index);
 extern RfPageProofDetailV1
 cluster_thread_recovery_fabric_plan_seal_v1(ClusterThreadRecoveryFabricPlanV1 *plan);
+extern bool cluster_thread_recovery_fabric_bind_database_v1(ClusterThreadRecoveryFabricPlanV1 *plan,
+															uint64 database_incarnation);
 extern const RfPageOnlinePlanV1 *
 cluster_thread_recovery_fabric_page_plan_v1(const ClusterThreadRecoveryFabricPlanV1 *plan);
 extern const RfSideOnlinePlanV1 *
@@ -64,9 +88,16 @@ extern RfPageProofDetailV1
 cluster_thread_recovery_fabric_apply_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
 										const struct ClusterThreadRecoveryAuthorityV1 *authority,
 										ClusterThreadRecoveryFabricApplyResultV1 *result);
+extern RfPageProofDetailV1 cluster_thread_recovery_fabric_apply_sources_v1(
+	const ClusterThreadRecoveryFabricPlanV1 *plan,
+	const struct ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count,
+	ClusterThreadRecoveryFabricApplyResultV1 *result);
 extern RfPageProofDetailV1 cluster_thread_recovery_fabric_execute_root_v1(
 	uint16 dead_thread, XLogRecPtr scan_begin_inclusive, XLogRecPtr scan_end_exclusive,
 	const struct ClusterThreadRecoveryAuthorityV1 *authority, bool space_active,
+	ClusterThreadRecoveryFabricApplyResultV1 *result, uint64 *out_record_count);
+extern RfPageProofDetailV1 cluster_thread_recovery_fabric_execute_sources_v1(
+	const struct ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count, bool space_active,
 	ClusterThreadRecoveryFabricApplyResultV1 *result, uint64 *out_record_count);
 extern void
 cluster_thread_recovery_fabric_plan_destroy_v1(ClusterThreadRecoveryFabricPlanV1 **plan);

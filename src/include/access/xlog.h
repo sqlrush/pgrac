@@ -231,6 +231,18 @@ extern void XLOGShmemInit(void);
 extern void BootStrapXLOG(void);
 extern void InitializeWalConsistencyChecking(void);
 extern void LocalProcessControlFile(bool reset);
+/* PGRAC: shared control images use native checks without rereading pg_control.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+struct ControlFileData;
+extern void XLogValidateControlFile(const struct ControlFileData *control);
+/* PGRAC: early process-local initialization, not serving/recovery admission. */
+extern void XLogInstallBootstrapControlFile(const struct ControlFileData *control, bool reset);
+extern void XLogCompleteBootstrapControlFile(void);
+#ifdef USE_PGRAC_CLUSTER
+/* Refuse a change to a parameter the shared control file recorded at creation. */
+extern void ClusterRequireRecordedParameters(void);
+#endif
 extern WalLevel GetActiveWalLevelOnStandby(void);
 extern void StartupXLOG(void);
 extern void ShutdownXLOG(int code, Datum arg);
@@ -248,6 +260,10 @@ extern void GetFullPageWriteInfo(XLogRecPtr *RedoRecPtr_p, bool *doPageWrites_p)
 extern XLogRecPtr GetRedoRecPtr(void);
 extern XLogRecPtr GetInsertRecPtr(void);
 extern XLogRecPtr GetFlushRecPtr(TimeLineID *insertTLI);
+#ifdef USE_PGRAC_CLUSTER
+/* Bound startup EOR only; this observes native fsync, not writer admission. */
+extern bool ClusterXLogStartupFlushCovers(XLogRecPtr end, TimeLineID timeline);
+#endif
 extern TimeLineID GetWALInsertionTimeLine(void);
 extern XLogRecPtr GetLastImportantRecPtr(void);
 

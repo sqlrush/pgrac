@@ -57,8 +57,30 @@ typedef enum ClusterFormationWitnessResult {
 	CLUSTER_FORMATION_WITNESS_FULL_OUTAGE_UNRECOVERED = 6,
 	CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE = 7,
 	CLUSTER_FORMATION_WITNESS_IO_FAILED = 8,
-	CLUSTER_FORMATION_WITNESS_CORRUPT = 9
+	CLUSTER_FORMATION_WITNESS_CORRUPT = 9,
+	/* No permission. The immutable identity may be retained for a fresh read. */
+	CLUSTER_FORMATION_WITNESS_CACHE_EXPIRED = 10
 } ClusterFormationWitnessResult;
+
+/* Process-local last builder sample only. It grants no formation, membership,
+ * fence or serving authority and does not refresh any evidence. */
+typedef struct ClusterFormationWitnessDiagnosticV1 {
+	ClusterFormationWitnessResult result;
+	ClusterFenceAuthorityReadResult fence_result;
+	uint16 origin_thread;
+	bool snapshot_captured;
+	bool fence_captured;
+	uint8 origin_member_state;
+	uint64 formation_epoch;
+	uint64 formation_generation;
+	uint64 admitted_floor;
+	uint64 fence_epoch;
+	uint32 fence_agree;
+	uint32 fence_total;
+	int32 missing_floor_node;
+	const char *predicate;
+} ClusterFormationWitnessDiagnosticV1;
+extern bool cluster_formation_witness_last_diagnostic_v1(ClusterFormationWitnessDiagnosticV1 *out);
 
 /* Internal canonical snapshot captured under the reconfig lock. */
 typedef struct ClusterFormationSnapshotV1 {
@@ -74,6 +96,10 @@ typedef struct ClusterFormationSnapshotV1 {
 	uint8 self_join_admitted;
 	uint8 self_join_failed;
 	uint8 reserved[2];
+	/* PGRAC: nonzero only for an exact accepted cold-start cohort. Derived
+	 * under the reconfig lock, not a serving/physical-recovery grant.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	uint64 startup_formation_generation;
 } ClusterFormationSnapshotV1;
 
 /* AD-023 recovery-control classification tag.  Captured runtime snapshots
@@ -83,11 +109,14 @@ typedef struct ClusterFormationSnapshotV1 {
 
 StaticAssertDecl(sizeof(ClusterRecoveryDutyDigest) == 32, "ClusterRecoveryDutyDigest ABI");
 
-/* Shared pure validity predicate for every consumer of the exact duty key.
- * Keeping this beside the canonical encoder prevents compact resource ids
- * from accepting an identity that the durable/root layer would reject. */
+/* PGRAC: key syntax is not physical claim proof. V2 stores the CRC of its
+ * generation claim, not the reconstructed legacy 40-byte claim. Its exact
+ * on-disk bytes/hash remain mandatory at the canonical root read boundary.
+ * Explicit profile selection keeps the old API/negative behavior intact.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
 static inline bool
-cluster_recovery_duty_key_valid_v1(const ClusterRecoveryDutyKey *key)
+cluster_recovery_duty_key_valid_for_claim(const ClusterRecoveryDutyKey *key, bool claim_v2)
 {
 	ClusterWalThreadClaim claim;
 	bool storage_nonzero = false;
@@ -106,13 +135,30 @@ cluster_recovery_duty_key_valid_v1(const ClusterRecoveryDutyKey *key)
 		|| key->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT || key->origin_node_id < 0
 		|| key->origin_node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT
 		|| key->origin_thread_id != (uint16)(key->origin_node_id + 1) || key->reserved42 != 0
-		|| key->thread_claim_created_at == 0 || key->thread_claim_crc32c == 0
+		|| key->thread_claim_created_at == 0 || (!claim_v2 && key->thread_claim_crc32c == 0)
 		|| key->reserved60 != 0 || key->origin_owner_incarnation == 0 || key->root_lineage_seq == 0)
 		return false;
+	if (claim_v2)
+		return key->thread_claim_created_at > 0;
 	cluster_wal_thread_claim_fill(&claim, key->origin_thread_id, key->origin_node_id,
 								  key->thread_claim_created_at);
 	return key->thread_claim_crc32c == claim.crc;
 }
+
+static inline bool
+cluster_recovery_duty_key_valid_v1(const ClusterRecoveryDutyKey *key)
+{
+	return cluster_recovery_duty_key_valid_for_claim(key, false);
+}
+
+extern bool
+cluster_recovery_duty_key_encode_for_claim(const ClusterRecoveryDutyKey *key, bool claim_v2,
+										   uint8 out[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES]);
+extern ClusterRecoveryDutyCompare
+cluster_recovery_duty_key_compare_for_claim(const ClusterRecoveryDutyKey *expected,
+											const ClusterRecoveryDutyKey *observed, bool claim_v2);
+extern bool cluster_recovery_duty_digest_for_claim(const ClusterRecoveryDutyKey *key, bool claim_v2,
+												   ClusterRecoveryDutyDigest *out);
 
 extern bool cluster_recovery_duty_key_encode_v1(const ClusterRecoveryDutyKey *key,
 												uint8 out[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES]);

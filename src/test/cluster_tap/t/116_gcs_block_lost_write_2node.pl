@@ -20,7 +20,7 @@
 #	  L7  SQLSTATE 53R93 ERRCODE_CLUSTER_LOST_WRITE_DETECTED literal-
 #	      encodable in PG SQL (catalog 形式 verification)
 #	  L8  GUC switch back to 'error' SHOW returns 'error'
-#	  L9  pg_cluster_state.gcs category has 121 keys (PCM-X queue observability +3)
+#	  L9  pg_cluster_state.gcs category has 117 keys (current registry)
 #	  L10 Reply status enum value 12 (DENIED_LOST_WRITE) is新增的
 #	      最大 value (baseline workload must not trigger lost-write)
 #	  L11 spec-2.41 D / P1-C — behavioral lost-write inject: a
@@ -108,8 +108,8 @@ is($pair->node0->safe_psql('postgres',
 is($pair->node0->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '121',
-   'L2 pg_cluster_state.gcs category has 121 keys (PCM-X queue observability +3)');
+   '117',
+   'L2 pg_cluster_state.gcs category has 117 keys (current registry)');
 
 
 # ============================================================
@@ -199,8 +199,8 @@ is($pair->node0->safe_psql('postgres',
 is($pair->node1->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='gcs'}),
-   '121',
-   'L9 node1 pg_cluster_state.gcs has 121 keys (PCM-X queue observability +3)');
+   '117',
+   'L9 node1 pg_cluster_state.gcs has 117 keys (current registry)');
 
 
 # ============================================================

@@ -36,6 +36,8 @@
 
 #include "access/twophase.h"
 #include "access/twophase_rmgr.h"
+#include "access/xact.h" /* RegisterXactCallback (two-phase finish stage) */
+#include "access/xlog.h" /* GetFlushRecPtr (two-phase finish stamps) */
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_itl_touch.h" /* PostPrepare touch-list drop (V-2) */
@@ -47,8 +49,8 @@
 #include "cluster/cluster_tt_slot.h"			/* protected-slot map (D6/V-4) */
 #include "cluster/cluster_tt_status.h"			/* SUBCOMMITTED overlay rebuild */
 #include "cluster/cluster_undo_record_api.h"	/* full undo teardown (PostPrepare) */
-#include "cluster/cluster_tt_durable.h"			/* durable 0x30 commit (prefinish) */
-#include "cluster/cluster_tt_status_hint.h"		/* cross-node hint emit (prefinish) */
+#include "cluster/cluster_tt_durable.h"			/* staged two-phase TT finish */
+#include "cluster/cluster_tt_status_hint.h"		/* cross-node hint emit (postfinish) */
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
 
 static bool
@@ -416,7 +418,56 @@ cluster_tt_twophase_modifier_recheck_or_error(const ClusterSemanticAdmissionToke
 
 
 /*
- * cluster_tt_twophase_prefinish -- spec-3.15 D5 (C-P6 resolve-before-WAL).
+ * The two-phase finish of one prepared transaction (F-D-31).  The prefinish
+ * proves and stages every binding before the COMMIT/ROLLBACK PREPARED record
+ * and keeps the modifier admission; the record path emits the staged TT WAL
+ * just before the record and writes the stamps after flushing it; the
+ * postfinish publishes the allocator, overlay and hint and releases the stage.
+ * Nothing that shows the terminal state can precede the record that decides
+ * it, and a finish that fails before its record leaves nothing behind.
+ */
+typedef struct TT2PCFinishStage {
+	bool armed;
+	bool is_commit;
+	TransactionId xid;
+	SCN final_scn;
+	uint16 nbindings;
+	ClusterSemanticAdmissionToken admission;
+	ClusterTT2PCBinding bindings[CLUSTER_TT_2PC_MAX_BINDINGS];
+	ClusterTTPreparedStage slots[CLUSTER_TT_2PC_MAX_BINDINGS];
+} TT2PCFinishStage;
+
+static TT2PCFinishStage tt_2pc_stage;
+static bool tt_2pc_abort_callback_registered = false;
+
+/* Never throws: release every staged descriptor and the admission. */
+static void
+tt_2pc_stage_release(void)
+{
+	for (uint16 i = 0; i < tt_2pc_stage.nbindings; i++)
+		cluster_tt_slot_durable_prepared_release(&tt_2pc_stage.slots[i]);
+	cluster_semantic_activation_leave(&tt_2pc_stage.admission);
+	tt_2pc_stage.armed = false;
+	tt_2pc_stage.nbindings = 0;
+}
+
+/*
+ * A transaction that ends abnormally between the prefinish and the postfinish
+ * -- an ERROR after the stage, or after the record -- must not keep the stage
+ * and its modifier admission for the rest of the backend's life.  Durable
+ * state needs nothing here: before the record nothing was emitted or written;
+ * after it the stamps are written and only the allocator, overlay and hint,
+ * which fall back to the durable slot, are skipped.
+ */
+static void
+tt_2pc_abort_callback(XactEvent event, void *arg pg_attribute_unused())
+{
+	if ((event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT) && tt_2pc_stage.armed)
+		tt_2pc_stage_release();
+}
+
+/*
+ * cluster_tt_twophase_prefinish -- spec-3.15 D5 (C-P6), F-D-31.
  *
  *	Runs inside FinishPreparedTransaction AFTER final_scn is produced
  *	and BEFORE RecordTransactionCommitPrepared/AbortPrepared.  The
@@ -424,32 +475,34 @@ cluster_tt_twophase_modifier_recheck_or_error(const ClusterSemanticAdmissionToke
  *	may be another backend or a restarted instance), so everything is
  *	driven from the 2PC record.
  *
- *	Commit: per-binding durable 0x30 commit (same primitive as the
- *	single-machine pre-commit hook, spec-3.11 C1/C10: no independent
- *	fsync -- the prepared-commit WAL flush carries the 0x30 record) plus
- *	the COMMITTED overlay install + cross-node hint.  Sub-links need no
- *	explicit resolve: the spec-3.5 lazy parent-follow reads the parent's
- *	terminal state.
+ *	Proves each binding's terminal successor (commit: COMMITTED +
+ *	final_scn; abort: ABORTED + the undo-chain head captured at PREPARE,
+ *	spec-4.8 D7-A) and stages it; writes nothing.  Sub-links need no explicit
+ *	resolve: the spec-3.5 lazy parent-follow reads the parent's terminal state.
  *
- *	Abort: per-binding durable 0x60 abort-clear (step 7) plus the
- *	ABORTED overlay install + hint.
- *
- *	Failure anywhere here is safe (C-P6): the transaction is still
- *	prepared and the command can be retried.
+ *	Failure here is safe (C-P6): the transaction is still prepared, nothing
+ *	was emitted or written, and the command can be retried.
  */
 void
 cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, const void *recdata,
 							  uint32 len)
 {
 	ClusterTT2PCParsed p;
-	ClusterSemanticAdmissionToken modifier_token;
 	ClusterSemanticAdmissionResult admission;
 	uint16 i;
 
 	Assert(cluster_node_id >= 0);
+	if (tt_2pc_stage.armed)
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("a prepared transaction finish is already staged")));
+	if (!tt_2pc_abort_callback_registered) {
+		RegisterXactCallback(tt_2pc_abort_callback, NULL);
+		tt_2pc_abort_callback_registered = true;
+	}
 
+	memset(&tt_2pc_stage, 0, sizeof(tt_2pc_stage));
 	admission = cluster_semantic_activation_modifier_enter(cluster_tt_twophase_writable_admission(),
-														   &modifier_token);
+														   &tt_2pc_stage.admission);
 	if (admission != CLUSTER_SEMANTIC_ADMISSION_OK)
 		ereport(
 			ERROR,
@@ -461,6 +514,9 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 	PG_TRY();
 	{
 		parse_or_corrupt(xid, recdata, len, &p);
+		if (p.nbindings > CLUSTER_TT_2PC_MAX_BINDINGS)
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("too many TT bindings for prepared transaction %u", xid)));
 
 		if (is_commit)
 			cluster_vis_bump_twopc_prefinish_commits();
@@ -469,6 +525,96 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 
 		for (i = 0; i < p.nbindings; i++) {
 			const ClusterTT2PCBinding *b = &p.bindings[i];
+			uint16 origin_node_id;
+
+			if (!cluster_tt_2pc_binding_origin_node(b, &origin_node_id))
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("invalid TT binding segment %u for prepared transaction %u",
+									   b->undo_segment_id, xid)));
+			cluster_tt_twophase_modifier_recheck_or_error(&tt_2pc_stage.admission);
+			tt_2pc_stage.bindings[i] = *b;
+			tt_2pc_stage.nbindings = i + 1;
+			cluster_tt_slot_durable_prepared_stage(
+				b->undo_segment_id, b->slot_offset, b->xid, b->wrap, is_commit,
+				is_commit ? final_scn : InvalidScn,
+				(!is_commit && p.heads != NULL) ? p.heads[i] : (UBA)InvalidUba_init,
+				&tt_2pc_stage.slots[i]);
+		}
+	}
+	PG_CATCH();
+	{
+		tt_2pc_stage_release();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	tt_2pc_stage.xid = xid;
+	tt_2pc_stage.final_scn = final_scn;
+	tt_2pc_stage.is_commit = is_commit;
+	tt_2pc_stage.armed = true;
+}
+
+/* Whether this transaction's finish has a live stage (critical-section safe). */
+bool
+cluster_tt_twophase_has_staged(TransactionId xid)
+{
+	return tt_2pc_stage.armed && tt_2pc_stage.xid == xid;
+}
+
+/*
+ * Inside the COMMIT/ROLLBACK PREPARED critical section, just before its
+ * record: insert the staged bindings' TT WAL.  A transaction without cluster
+ * TT state stages nothing and this is a no-op.
+ */
+void
+cluster_tt_twophase_emit_staged(TransactionId xid)
+{
+	if (!tt_2pc_stage.armed)
+		return;
+	if (tt_2pc_stage.xid != xid)
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("staged prepared finish belongs to transaction %u, not %u",
+							   tt_2pc_stage.xid, xid)));
+	for (uint16 i = 0; i < tt_2pc_stage.nbindings; i++)
+		cluster_tt_slot_durable_prepared_emit(&tt_2pc_stage.slots[i]);
+}
+
+/*
+ * Inside the same critical section, after the record ending at record_end is
+ * flushed and before pg_xact: write the staged successors.  The caller delays
+ * checkpoints from the TT record insert until this returns.
+ */
+void
+cluster_tt_twophase_apply_staged(TransactionId xid, XLogRecPtr record_end)
+{
+	if (!tt_2pc_stage.armed)
+		return;
+	if (tt_2pc_stage.xid != xid || XLogRecPtrIsInvalid(record_end)
+		|| GetFlushRecPtr(NULL) < record_end)
+		ereport(PANIC,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("prepared transaction %u TT stamps would precede their record", xid)));
+	for (uint16 i = 0; i < tt_2pc_stage.nbindings; i++)
+		cluster_tt_slot_durable_prepared_apply(&tt_2pc_stage.slots[i]);
+}
+
+/*
+ * After the record and its stamps, once the prepared transaction is no longer
+ * running: publish the allocator transition, the local overlay and the
+ * cross-node hint of each binding, then release the stage.
+ */
+void
+cluster_tt_twophase_postfinish(TransactionId xid)
+{
+	if (!tt_2pc_stage.armed)
+		return;
+	Assert(tt_2pc_stage.xid == xid);
+	PG_TRY();
+	{
+		for (uint16 i = 0; i < tt_2pc_stage.nbindings; i++) {
+			const ClusterTT2PCBinding *b = &tt_2pc_stage.bindings[i];
+			ClusterTTStatus status
+				= tt_2pc_stage.is_commit ? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_ABORTED;
+			SCN commit_scn = tt_2pc_stage.is_commit ? tt_2pc_stage.final_scn : InvalidScn;
 			ClusterTTStatusKey key;
 			ClusterTTStatusSourceRequest source_request;
 			ClusterTTStatusSourceResult source_result;
@@ -476,9 +622,7 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 			uint16 origin_node_id;
 
 			if (!cluster_tt_2pc_binding_origin_node(b, &origin_node_id))
-				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-								errmsg("invalid TT binding segment %u for prepared transaction %u",
-									   b->undo_segment_id, xid)));
+				continue; /* proved by the prefinish */
 			memset(&key, 0, sizeof(key));
 			key.origin_node_id = origin_node_id;
 			key.undo_segment_id = (uint16)b->undo_segment_id;
@@ -486,60 +630,28 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 			key.cluster_epoch = b->cluster_epoch;
 			key.local_xid = b->xid;
 
-			if (is_commit) {
-				cluster_tt_twophase_modifier_recheck_or_error(&modifier_token);
-				cluster_tt_slot_durable_commit(b->undo_segment_id, b->slot_offset, b->xid, b->wrap,
-											   final_scn);
+			if (tt_2pc_stage.is_commit)
 				cluster_tt_slot_mark_committed(b->undo_segment_id, b->slot_offset, b->xid,
-											   final_scn);
-				memset(&source_request, 0, sizeof(source_request));
-				source_request.key = &key;
-				source_request.status = CLUSTER_TT_STATUS_COMMITTED;
-				source_request.commit_scn = final_scn;
-				(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL,
-														&source_request, &source_result);
-				memset(&hint_request, 0, sizeof(hint_request));
-				hint_request.key = &key;
-				hint_request.status = CLUSTER_TT_STATUS_COMMITTED;
-				hint_request.commit_scn = final_scn;
-				(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT,
-															 &hint_request);
-			} else {
-				cluster_tt_twophase_modifier_recheck_or_error(&modifier_token);
-				cluster_tt_slot_durable_abort(b->undo_segment_id, b->slot_offset, b->xid, b->wrap);
-				/*
-				 * spec-4.8 D7-A: persist this binding's undo-chain head (captured
-				 * into the v2 2PC record at PREPARE) durably onto the now-ABORTED
-				 * slot, so D7 physical rollback can walk the chain after a crash-
-				 * restart.  Emit order matters: durable_abort above stamped the
-				 * slot's xid/wrap, so set_head's identity gate matches at redo.  A
-				 * v1 record / a binding with no undo (heads NULL or InvalidUba) is a
-				 * no-op -> D7 fails closed for it (MVCC invisible + vacuum, I10).
-				 */
-				if (p.heads != NULL && !UBA_is_invalid(p.heads[i])) {
-					cluster_tt_twophase_modifier_recheck_or_error(&modifier_token);
-					cluster_tt_slot_durable_set_head(b->undo_segment_id, b->slot_offset, b->xid,
-													 b->wrap, p.heads[i]);
-				}
+											   commit_scn);
+			else
 				cluster_tt_slot_mark_aborted(b->undo_segment_id, b->slot_offset, b->xid);
-				memset(&source_request, 0, sizeof(source_request));
-				source_request.key = &key;
-				source_request.status = CLUSTER_TT_STATUS_ABORTED;
-				source_request.commit_scn = InvalidScn;
-				(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL,
-														&source_request, &source_result);
-				memset(&hint_request, 0, sizeof(hint_request));
-				hint_request.key = &key;
-				hint_request.status = CLUSTER_TT_STATUS_ABORTED;
-				hint_request.commit_scn = InvalidScn;
-				(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT,
-															 &hint_request);
-			}
+			memset(&source_request, 0, sizeof(source_request));
+			source_request.key = &key;
+			source_request.status = status;
+			source_request.commit_scn = commit_scn;
+			(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL,
+													&source_request, &source_result);
+			memset(&hint_request, 0, sizeof(hint_request));
+			hint_request.key = &key;
+			hint_request.status = status;
+			hint_request.commit_scn = commit_scn;
+			(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT,
+														 &hint_request);
 		}
 	}
 	PG_FINALLY();
 	{
-		cluster_semantic_activation_leave(&modifier_token);
+		tt_2pc_stage_release();
 	}
 	PG_END_TRY();
 }

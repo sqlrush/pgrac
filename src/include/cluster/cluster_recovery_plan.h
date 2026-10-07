@@ -144,6 +144,14 @@ cluster_recovery_classify_slot(ClusterWalSlotVerdict v, const ClusterWalStateSlo
  * peer is classified CRASHED_CANDIDATE at most 2 checkpoint intervals later,
  * and the NOT_COLD fallback never depends on this verdict.  Fail-closed:
  * every unclassifiable state lands UNKNOWN.
+ *
+ * PGRAC (S9P2-05): a generation already sealed for recovery
+ * (RECOVERY_REQUIRED) still needs replay however recent its publication —
+ * the seal itself, or a recoverer that failed after it, refreshed it — so it
+ * is a crash candidate; a recovered one (RECOVERY_COMPLETE) needs none.
+ * Classifying either UNKNOWN stopped a cold restart after a failed cold
+ * recovery for good, or, with no other candidate, let startup pass a sealed
+ * generation by on its own stream.
  */
 static inline ClusterRecoveryThreadVerdict
 cluster_recovery_classify_root_slot(ClusterControlRootResult root_result,
@@ -161,8 +169,11 @@ cluster_recovery_classify_root_slot(ClusterControlRootResult root_result,
 		 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		|| snapshot->identity.origin_node_id != (int32)tid - 1)
 		return CLUSTER_RECOVERY_THREAD_UNKNOWN;
-	if (snapshot->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED)
+	if (snapshot->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+		|| snapshot->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)
 		return CLUSTER_RECOVERY_THREAD_CLEAN;
+	if (snapshot->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED)
+		return CLUSTER_RECOVERY_THREAD_CRASHED_CANDIDATE;
 	if (snapshot->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
 		return CLUSTER_RECOVERY_THREAD_UNKNOWN;
 	threshold_us = (int64)Max(checkpoint_timeout_sec * 2, 60) * INT64CONST(1000000);

@@ -687,6 +687,21 @@ cluster_undo_path_uses_shared_root(ClusterUndoPathIntent intent pg_attribute_unu
 	return false;
 }
 
+/* This local encode/decode fixture never enters a qualified recovery scope. */
+ClusterUndoPathIntent
+cluster_undo_recovery_intent_for_owner(uint8 owner)
+{
+	return cluster_undo_intent_for_owner(owner);
+}
+int
+cluster_undo_recovery_path_resolve_v1(uint8 owner pg_attribute_unused(),
+									  uint32 segment pg_attribute_unused(), char *path, size_t size)
+{
+	if (path != NULL && size > 0)
+		path[0] = '\0';
+	return -1;
+}
+
 int
 cluster_shared_fs_undo_path_resolve(uint8 owner_instance pg_attribute_unused(),
 									uint32 segment_id pg_attribute_unused(),
@@ -3582,7 +3597,7 @@ UT_TEST(test_a148_undo_stop_does_not_confuse_extent_and_cursor_cache_with_writer
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(71);
+	UT_PLAN(74);
 	UT_RUN(test_a148_undo_stop_original_active_writer_requires_original_commit_release);
 	UT_RUN(test_a148_undo_stop_all_slots_and_late_invalid_do_not_clear_debt);
 	UT_RUN(test_a148_undo_stop_does_not_confuse_extent_and_cursor_cache_with_writer);

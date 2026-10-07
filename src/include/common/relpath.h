@@ -50,7 +50,11 @@ typedef enum ForkNumber
 	MAIN_FORKNUM = 0,
 	FSM_FORKNUM,
 	VISIBILITYMAP_FORKNUM,
-	INIT_FORKNUM
+	INIT_FORKNUM,
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: persistent relation metadata, distinct from all data forks. */
+	SPACE_FORKNUM
+#endif
 
 	/*
 	 * NOTE: if you add a new fork, change MAX_FORKNUM and possibly
@@ -59,9 +63,14 @@ typedef enum ForkNumber
 	 */
 } ForkNumber;
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: keep native non-cluster fork numbering and paths unchanged. */
+#define MAX_FORKNUM		SPACE_FORKNUM
+#define FORKNAMECHARS	5
+#else
 #define MAX_FORKNUM		INIT_FORKNUM
-
 #define FORKNAMECHARS	4		/* max chars for a fork name */
+#endif
 
 extern PGDLLIMPORT const char *const forkNames[];
 

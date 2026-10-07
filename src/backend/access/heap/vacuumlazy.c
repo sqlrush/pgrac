@@ -65,6 +65,14 @@
 #include "utils/pg_rusage.h"
 #include "utils/timestamp.h"
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: native maintenance retains pre-lock relation version identity. */
+#include "catalog/pg_control.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_space_storage.h"
+#include "cluster/storage/cluster_smgr.h"
+#endif
+
 
 /*
  * Space/time tradeoff parameters: do these need to be user-tunable?
@@ -144,6 +152,10 @@ typedef struct LVRelState
 	Relation	rel;
 	Relation   *indrels;
 	int			nindexes;
+#ifdef USE_PGRAC_CLUSTER
+	bool		versioned;
+	ClusterSpaceIdentity identity;
+#endif
 
 	/* Buffer access strategy and parallel vacuum state */
 	BufferAccessStrategy bstrategy;
@@ -364,6 +376,15 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 
 	/* Set up high level stuff about rel and its indexes */
 	vacrel->rel = rel;
+#ifdef USE_PGRAC_CLUSTER
+	/* Copy before any heap content lock; the relation lifecycle lock stays held. */
+	vacrel->versioned = cluster_shared_config
+		&& rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
+	if (vacrel->versioned && (!RelationNeedsWAL(rel)
+		|| !cluster_space_relation_get_identity(rel, &vacrel->identity)))
+		elog(ERROR, "PGRAC shared VACUUM requires exact SPACE identity");
+#endif
 	vac_open_indexes(vacrel->rel, RowExclusiveLock, &vacrel->nindexes,
 					 &vacrel->indrels);
 	vacrel->bstrategy = bstrategy;
@@ -783,6 +804,46 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 	}
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Repair the original heap/VM inconsistency with one ordinary two-page
+ * versioned FPI. The caller holds heap-X and its pre-lock SPACE identity;
+ * acquire VM-X and capture both predecessors before changing either page.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+lazy_clear_visibility_versioned(Relation rel, const ClusterSpaceIdentity *identity, Buffer heapbuf,
+								BlockNumber heapblk, Buffer vmbuf)
+{
+	Buffer buffers[2] = { vmbuf, heapbuf };
+	const uint8 ids[2] = { 0, 1 };
+	RfPageProducerBatchV1 versions;
+	XLogRecPtr recptr;
+
+	Assert(CritSectionCount == 0);
+	if (!BufferIsValid(vmbuf) || !visibilitymap_pin_ok(heapblk, vmbuf))
+		elog(ERROR, "shared visibility repair requires the exact VM buffer");
+	LockBuffer(vmbuf, BUFFER_LOCK_EXCLUSIVE);
+	if (!cluster_space_prepare_buffer_versions(identity, buffers, ids, 2, &versions))
+		elog(ERROR, "shared visibility repair cannot capture exact page versions");
+	START_CRIT_SECTION();
+	if (!rf_page_producer_stamp_v1(&versions))
+		elog(PANIC, "shared visibility repair page versions changed before mutation");
+	PageClearAllVisible(BufferGetPage(heapbuf));
+	(void)visibilitymap_clear_locked(rel, heapblk, vmbuf, VISIBILITYMAP_VALID_BITS);
+	MarkBufferDirty(heapbuf);
+	MarkBufferDirty(vmbuf);
+	XLogBeginInsert();
+	XLogRegisterBuffer(0, vmbuf, REGBUF_FORCE_IMAGE);
+	XLogRegisterBuffer(1, heapbuf, REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
+	if (!rf_page_producer_register_wal_v1(&versions))
+		elog(PANIC, "shared visibility repair cannot register page versions");
+	recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
+	PageSetLSN(BufferGetPage(heapbuf), recptr);
+	PageSetLSN(BufferGetPage(vmbuf), recptr);
+	END_CRIT_SECTION();
+	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
+}
+#endif
+
 /*
  *	lazy_scan_heap() -- workhorse function for VACUUM
  *
@@ -819,6 +880,7 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
  *		which makes index processing very inefficient when memory is in short
  *		supply.
  */
+
 static void
 lazy_scan_heap(LVRelState *vacrel)
 {
@@ -1109,11 +1171,21 @@ lazy_scan_heap(LVRelState *vacrel)
 			 * may be logged.  Given that this situation should only happen in
 			 * rare cases after a crash, it is not worth optimizing.
 			 */
-			PageSetAllVisible(page);
-			MarkBufferDirty(buf);
+#ifdef USE_PGRAC_CLUSTER
+			/* PGRAC: shared publication owns both visible bits and versions. */
+			if (!vacrel->versioned)
+#endif
+			{
+				PageSetAllVisible(page);
+				MarkBufferDirty(buf);
+			}
 			visibilitymap_set(vacrel->rel, blkno, buf, InvalidXLogRecPtr,
 							  vmbuffer, prunestate.visibility_cutoff_xid,
-							  flags);
+							  flags
+#ifdef USE_PGRAC_CLUSTER
+							  , vacrel->versioned ? &vacrel->identity : NULL
+#endif
+							  );
 		}
 
 		/*
@@ -1127,8 +1199,13 @@ lazy_scan_heap(LVRelState *vacrel)
 		{
 			elog(WARNING, "page is not marked all-visible but visibility map bit is set in relation \"%s\" page %u",
 				 vacrel->relname, blkno);
-			visibilitymap_clear(vacrel->rel, blkno, vmbuffer,
-								VISIBILITYMAP_VALID_BITS);
+#ifdef USE_PGRAC_CLUSTER
+			if (vacrel->versioned)
+				lazy_clear_visibility_versioned(vacrel->rel, &vacrel->identity, buf, blkno,
+												vmbuffer);
+			else
+#endif
+				visibilitymap_clear(vacrel->rel, blkno, vmbuffer, VISIBILITYMAP_VALID_BITS);
 		}
 
 		/*
@@ -1150,10 +1227,17 @@ lazy_scan_heap(LVRelState *vacrel)
 		{
 			elog(WARNING, "page containing LP_DEAD items is marked as all-visible in relation \"%s\" page %u",
 				 vacrel->relname, blkno);
-			PageClearAllVisible(page);
-			MarkBufferDirty(buf);
-			visibilitymap_clear(vacrel->rel, blkno, vmbuffer,
-								VISIBILITYMAP_VALID_BITS);
+#ifdef USE_PGRAC_CLUSTER
+			if (vacrel->versioned)
+				lazy_clear_visibility_versioned(vacrel->rel, &vacrel->identity, buf, blkno,
+												vmbuffer);
+			else
+#endif
+			{
+				PageClearAllVisible(page);
+				MarkBufferDirty(buf);
+				visibilitymap_clear(vacrel->rel, blkno, vmbuffer, VISIBILITYMAP_VALID_BITS);
+			}
 		}
 
 		/*
@@ -1170,7 +1254,11 @@ lazy_scan_heap(LVRelState *vacrel)
 			 * page-level PD_ALL_VISIBLE bit being set, since it might have
 			 * become stale -- even when all_visible is set in prunestate
 			 */
-			if (!PageIsAllVisible(page))
+			if (!PageIsAllVisible(page)
+#ifdef USE_PGRAC_CLUSTER
+				&& !vacrel->versioned
+#endif
+				)
 			{
 				PageSetAllVisible(page);
 				MarkBufferDirty(buf);
@@ -1187,7 +1275,11 @@ lazy_scan_heap(LVRelState *vacrel)
 			visibilitymap_set(vacrel->rel, blkno, buf, InvalidXLogRecPtr,
 							  vmbuffer, InvalidTransactionId,
 							  VISIBILITYMAP_ALL_VISIBLE |
-							  VISIBILITYMAP_ALL_FROZEN);
+							  VISIBILITYMAP_ALL_FROZEN
+#ifdef USE_PGRAC_CLUSTER
+							  , vacrel->versioned ? &vacrel->identity : NULL
+#endif
+							  );
 		}
 
 		/*
@@ -1470,29 +1562,46 @@ lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 		 */
 		if (!PageIsAllVisible(page))
 		{
-			START_CRIT_SECTION();
+#ifdef USE_PGRAC_CLUSTER
+			/* PGRAC: shared initialization already has its own version/WAL.
+			 * Acquire the VM lock outside critical; the setter publishes the
+			 * two visible bits and exact versions in one native record. */
+			if (vacrel->versioned)
+				visibilitymap_set(vacrel->rel, blkno, buf, InvalidXLogRecPtr,
+								  vmbuffer, InvalidTransactionId,
+								  VISIBILITYMAP_ALL_VISIBLE | VISIBILITYMAP_ALL_FROZEN,
+								  &vacrel->identity);
+			else
+#endif
+			{
+				START_CRIT_SECTION();
 
-			/* mark buffer dirty before writing a WAL record */
-			MarkBufferDirty(buf);
+				/* mark buffer dirty before writing a WAL record */
+				MarkBufferDirty(buf);
 
-			/*
-			 * It's possible that another backend has extended the heap,
-			 * initialized the page, and then failed to WAL-log the page due
-			 * to an ERROR.  Since heap extension is not WAL-logged, recovery
-			 * might try to replay our record setting the page all-visible and
-			 * find that the page isn't initialized, which will cause a PANIC.
-			 * To prevent that, check whether the page has been previously
-			 * WAL-logged, and if not, do that now.
-			 */
-			if (RelationNeedsWAL(vacrel->rel) &&
-				PageGetLSN(page) == InvalidXLogRecPtr)
-				log_newpage_buffer(buf, true);
+				/*
+				 * It's possible that another backend has extended the heap,
+				 * initialized the page, and then failed to WAL-log the page due
+				 * to an ERROR.  Since heap extension is not WAL-logged, recovery
+				 * might try to replay our record setting the page all-visible and
+				 * find that the page isn't initialized, which will cause a PANIC.
+				 * To prevent that, check whether the page has been previously
+				 * WAL-logged, and if not, do that now.
+				 */
+				if (RelationNeedsWAL(vacrel->rel) &&
+					PageGetLSN(page) == InvalidXLogRecPtr)
+					log_newpage_buffer(buf, true);
 
-			PageSetAllVisible(page);
-			visibilitymap_set(vacrel->rel, blkno, buf, InvalidXLogRecPtr,
-							  vmbuffer, InvalidTransactionId,
-							  VISIBILITYMAP_ALL_VISIBLE | VISIBILITYMAP_ALL_FROZEN);
-			END_CRIT_SECTION();
+				PageSetAllVisible(page);
+				visibilitymap_set(vacrel->rel, blkno, buf, InvalidXLogRecPtr,
+								  vmbuffer, InvalidTransactionId,
+								  VISIBILITYMAP_ALL_VISIBLE | VISIBILITYMAP_ALL_FROZEN
+#ifdef USE_PGRAC_CLUSTER
+								  , NULL
+#endif
+								  );
+				END_CRIT_SECTION();
+			}
 		}
 
 		freespace = PageGetHeapFreeSpace(page);
@@ -1584,7 +1693,11 @@ retry:
 	tuples_deleted = heap_page_prune(rel, buf, vacrel->cutoffs.OldestXmin,
 									 vacrel->vistest,
 									 InvalidTransactionId, 0, &nnewlpdead,
-									 &vacrel->offnum);
+									 &vacrel->offnum
+#ifdef USE_PGRAC_CLUSTER
+									 , vacrel->versioned ? &vacrel->identity : NULL
+#endif
+									 );
 
 	/*
 	 * Now scan the page to collect LP_DEAD items and check for tuples
@@ -1849,7 +1962,11 @@ retry:
 			/* Execute all freeze plans for page as a single atomic action */
 			heap_freeze_execute_prepared(vacrel->rel, buf,
 										 snapshotConflictHorizon,
-										 frozen, tuples_frozen);
+										 frozen, tuples_frozen
+#ifdef USE_PGRAC_CLUSTER
+										 , vacrel->versioned ? &vacrel->identity : NULL
+#endif
+										 );
 		}
 	}
 	else
@@ -2504,6 +2621,9 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 	TransactionId visibility_cutoff_xid;
 	bool		all_frozen;
 	LVSavedErrInfo saved_err_info;
+#ifdef USE_PGRAC_CLUSTER
+	RfPageProducerBatchV1 version_batch;
+#endif
 
 	Assert(vacrel->nindexes == 0 || vacrel->do_index_vacuuming);
 
@@ -2514,7 +2634,24 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 							 VACUUM_ERRCB_PHASE_VACUUM_HEAP, blkno,
 							 InvalidOffsetNumber);
 
+#ifdef USE_PGRAC_CLUSTER
+	if (vacrel->versioned)
+	{
+		const uint8 block_id = 0;
+
+		if (!RelationNeedsWAL(vacrel->rel)
+			|| !RelFileLocatorEquals(vacrel->identity.key.locator, vacrel->rel->rd_locator)
+			|| !cluster_space_prepare_buffer_versions(&vacrel->identity, &buffer,
+				&block_id, 1, &version_batch))
+			elog(ERROR, "PGRAC shared heap vacuum requires exact SPACE identity");
+	}
+#endif
+
 	START_CRIT_SECTION();
+#ifdef USE_PGRAC_CLUSTER
+	if (vacrel->versioned && !rf_page_producer_stamp_v1(&version_batch))
+		elog(PANIC, "PGRAC shared heap vacuum version changed before mutation");
+#endif
 
 	for (; index < dead_items->num_items; index++)
 	{
@@ -2555,6 +2692,10 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 		XLogRegisterData((char *) &xlrec, SizeOfHeapVacuum);
 
 		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+#ifdef USE_PGRAC_CLUSTER
+		if (vacrel->versioned && !rf_page_producer_register_wal_v1(&version_batch))
+			elog(PANIC, "PGRAC shared heap vacuum cannot register page version");
+#endif
 		XLogRegisterBufData(0, (char *) unused, nunused * sizeof(OffsetNumber));
 
 		recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_VACUUM);
@@ -2588,9 +2729,16 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 			flags |= VISIBILITYMAP_ALL_FROZEN;
 		}
 
-		PageSetAllVisible(page);
+#ifdef USE_PGRAC_CLUSTER
+		if (!vacrel->versioned)
+#endif
+			PageSetAllVisible(page);
 		visibilitymap_set(vacrel->rel, blkno, buffer, InvalidXLogRecPtr,
-						  vmbuffer, visibility_cutoff_xid, flags);
+						  vmbuffer, visibility_cutoff_xid, flags
+#ifdef USE_PGRAC_CLUSTER
+						  , vacrel->versioned ? &vacrel->identity : NULL
+#endif
+						  );
 	}
 
 	/* Revert to the previous phase information for error traceback */

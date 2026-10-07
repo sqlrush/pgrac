@@ -10,11 +10,24 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_page_authority.h"
 #include "cluster/cluster_side_online_owner.h"
+#include "cluster/cluster_space_recovery.h"
 #include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_thread_recovery_fabric.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+bool cluster_shared_config = true;
+static uint64 cut_generation = 19;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack == NULL)
+		abort();
+	siglongjmp(*PG_exception_stack, 1);
+}
 
 void
 ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
@@ -34,6 +47,16 @@ static RfPagePinnedSourceV1 sources[2];
 static RfPageStableGraphRequestV1 graphs[2];
 static RfPageOnlineTargetViewV1 targets[2];
 static int target_count;
+
+static uint32
+active_target_count(void)
+{
+	uint32 count = 0;
+	for (int i = 0; i < target_count; i++)
+		if (!targets[i].history_only)
+			count++;
+	return count;
+}
 static int step;
 static int proof_step;
 static int page_preflight_step;
@@ -44,6 +67,76 @@ static int side_apply_step;
 static bool side_preflight_ok;
 static bool authority_current;
 static bool retained_coverage_current;
+static uint32 participant_count;
+static uint32 side_preflight_calls, side_apply_calls;
+static uint16 refuse_thread, stale_thread;
+static bool stale_after_page, stale_after_side;
+static int throw_at;
+static unsigned live_proofs, live_preflights, live_preopens;
+static char space_object;
+static bool space_present, space_preflight_ok, space_apply_ok;
+static unsigned live_space;
+static int space_preflight_step, space_apply_step;
+static void throw_if(int stage);
+
+uint32
+rf_side_online_plan_space_target_count_v1(const RfSideOnlinePlanV1 *plan)
+{
+	return space_present ? 1 : 0;
+}
+bool
+cluster_space_recovery_preflight_v1(const ClusterThreadRecoveryFabricPlanV1 *plan,
+									const ClusterThreadRecoveryAuthorityV1 *authority, uint32 count,
+									ClusterSpaceRecoveryBatchV1 **out)
+{
+	UT_ASSERT(plan == (const void *)&fabric_object && count == participant_count);
+	*out = NULL;
+	space_preflight_step = ++step;
+	if (!space_preflight_ok)
+		return false;
+	*out = (void *)&space_object;
+	live_space++;
+	return true;
+}
+bool
+cluster_space_recovery_apply_v1(ClusterSpaceRecoveryBatchV1 *batch)
+{
+	UT_ASSERT(batch == (void *)&space_object);
+	space_apply_step = ++step;
+	throw_if(7);
+	return space_apply_ok;
+}
+void
+cluster_space_recovery_destroy_v1(ClusterSpaceRecoveryBatchV1 **batch)
+{
+	if (*batch) {
+		UT_ASSERT(*batch == (void *)&space_object);
+		live_space--;
+		*batch = NULL;
+	}
+}
+Size
+cluster_space_recovery_scratch_held_v1(const ClusterSpaceRecoveryBatchV1 *batch)
+{
+	return 8192;
+}
+bool
+cluster_space_recovery_preflight_operation_v1(void *arg, const RfSideOnlineOperationV1 *op)
+{
+	return true;
+}
+bool
+cluster_space_recovery_applied_operation_v1(void *arg, const RfSideOnlineOperationV1 *op)
+{
+	return true;
+}
+
+static void
+throw_if(int stage)
+{
+	if (throw_at == stage)
+		pg_re_throw();
+}
 
 const RfPageOnlinePlanV1 *
 cluster_thread_recovery_fabric_page_plan_v1(const ClusterThreadRecoveryFabricPlanV1 *plan)
@@ -64,7 +157,8 @@ cluster_thread_recovery_fabric_side_plan_v1(const ClusterThreadRecoveryFabricPla
 uint32
 cluster_thread_recovery_fabric_participant_count_v1(const ClusterThreadRecoveryFabricPlanV1 *plan)
 {
-	return plan == (const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object ? 1 : 0;
+	return plan == (const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object ? participant_count
+																			 : 0;
 }
 
 bool
@@ -80,11 +174,12 @@ bool
 cluster_thread_recovery_fabric_cut_v1(const ClusterThreadRecoveryFabricPlanV1 *plan, uint32 index,
 									  RfContributorStreamCutV1 *out_cut)
 {
-	if (plan != (const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object || index != 0
-		|| out_cut == NULL)
+	if (plan != (const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object
+		|| index >= participant_count || out_cut == NULL)
 		return false;
 	memset(out_cut, 0, sizeof(*out_cut));
-	out_cut->failed_thread = 2;
+	out_cut->failed_thread = index + 2;
+	out_cut->origin_owner_incarnation = cut_generation;
 	out_cut->flags = RF_CONTRIBUTOR_CUT_COMPLETE;
 	out_cut->timeline_id = 7;
 	out_cut->scan_begin_inclusive = 0x100;
@@ -109,8 +204,9 @@ rf_page_online_plan_target_v1(const RfPageOnlinePlanV1 *plan, uint32 index,
 }
 
 uint32
-rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan)
+rf_side_online_plan_origin_operation_count_v1(const RfSideOnlinePlanV1 *plan, uint16 origin)
 {
+	UT_ASSERT_EQ(origin, 0);
 	return plan == (const RfSideOnlinePlanV1 *)&side_plan_object ? 3 : 0;
 }
 
@@ -118,8 +214,10 @@ ClusterThreadRecoveryAuthorityResultV1
 cluster_thread_recovery_authority_revalidate_nowait_v1(
 	const ClusterThreadRecoveryAuthorityV1 *authority)
 {
-	return authority != NULL && authority_current ? CLUSTER_THREAD_AUTHORITY_OK
-												  : CLUSTER_THREAD_AUTHORITY_ROOT_STALE;
+	return authority != NULL && authority_current
+				   && authority->duty->origin_thread_id != stale_thread
+			   ? CLUSTER_THREAD_AUTHORITY_OK
+			   : CLUSTER_THREAD_AUTHORITY_ROOT_STALE;
 }
 
 bool
@@ -127,7 +225,8 @@ cluster_thread_recovery_authority_covers_window_v1(
 	const ClusterThreadRecoveryAuthorityV1 *authority, uint16 dead_tid, XLogRecPtr scan_lower,
 	XLogRecPtr scan_upper)
 {
-	return authority != NULL && retained_coverage_current && dead_tid == 2 && scan_lower == 0x100
+	return authority != NULL && retained_coverage_current
+		   && dead_tid == authority->duty->origin_thread_id && scan_lower == 0x100
 		   && scan_upper == 0x200;
 }
 
@@ -138,24 +237,30 @@ cluster_epoch_get_current(void)
 }
 
 RfPageProofDetailV1
-rf_page_stable_base_proof_build_bound_v1(const RfPageStableBaseProofRequestV1 *request,
-										 uint32 *chain_indices, uint32 chain_capacity,
-										 RfPageStableBaseProofV1 **out_proof)
+rf_page_stable_base_proof_build_sources_v1(const RfPageStableGraphRequestV1 *graph,
+										   const ClusterThreadRecoveryAuthorityV1 *authorities,
+										   uint32 count, uint32 *chain_indices,
+										   uint32 chain_capacity,
+										   RfPageStableBaseProofV1 **out_proof)
 {
 	int index;
 
-	UT_ASSERT(request != NULL && request->graph != NULL && chain_indices != NULL
-			  && chain_capacity != 0);
-	index = request->graph == &graphs[0] ? 0 : (request->graph == &graphs[1] ? 1 : -1);
+	UT_ASSERT(graph != NULL && chain_indices != NULL && chain_capacity != 0 && authorities != NULL
+			  && authorities->duty->origin_thread_id == 2 && count == participant_count);
+	index = graph == &graphs[0] ? 0 : (graph == &graphs[1] ? 1 : -1);
 	UT_ASSERT(index >= 0);
 	*out_proof = (RfPageStableBaseProofV1 *)&proof_objects[index];
+	live_proofs++;
 	proof_step = ++step;
+	throw_if(1);
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
 void
 rf_page_stable_base_proof_destroy_v1(RfPageStableBaseProofV1 **proof)
 {
+	UT_ASSERT(*proof != NULL && live_proofs > 0);
+	live_proofs--;
 	*proof = NULL;
 }
 
@@ -164,20 +269,27 @@ rf_page_authority_batch_preflight_wait_v1(const RfPageAuthorityBatchRequestV1 *r
 										  int timeout_ms,
 										  RfPageAuthorityPreflightV1 **out_preflight)
 {
-	UT_ASSERT(request != NULL && request->target_count == (uint32)target_count
+	UT_ASSERT(request != NULL && request->target_count == active_target_count()
 			  && timeout_ms == 1000);
-	if (target_count == 2) {
+	UT_ASSERT(request->source_authorities != NULL && request->participant_count == participant_count
+			  && request->formation == NULL && request->duties == NULL
+			  && request->retention_pin == NULL);
+	if (active_target_count() == 2) {
 		UT_ASSERT(request->targets[0].contributors == &contributors[0]);
 		UT_ASSERT(request->targets[1].contributors == &contributors[1]);
 	}
 	page_preflight_step = ++step;
 	*out_preflight = (RfPageAuthorityPreflightV1 *)&preflight_object;
+	live_preflights++;
+	throw_if(2);
 	return RF_PAGE_AUTHORITY_OK;
 }
 
 void
 rf_page_authority_preflight_destroy_v1(RfPageAuthorityPreflightV1 **preflight)
 {
+	UT_ASSERT(*preflight != NULL && live_preflights > 0);
+	live_preflights--;
 	*preflight = NULL;
 }
 
@@ -197,16 +309,20 @@ RfPageProofDetailV1
 rf_page_storage_smgr_preopen_v1(const RfPageStorageInstallRequestV1 *request,
 								RfPageSmgrPreopenV1 **out_preopen)
 {
-	UT_ASSERT(request != NULL && request->component_count == (uint32)target_count
+	UT_ASSERT(request != NULL && request->component_count == active_target_count()
 			  && request->storage == NULL);
 	preopen_step = ++step;
 	*out_preopen = (RfPageSmgrPreopenV1 *)&preopen_object;
+	live_preopens++;
+	throw_if(3);
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
 void
 rf_page_storage_smgr_preopen_destroy_v1(RfPageSmgrPreopenV1 **preopen)
 {
+	UT_ASSERT(*preopen != NULL && live_preopens > 0);
+	live_preopens--;
 	*preopen = NULL;
 }
 
@@ -218,6 +334,9 @@ rf_page_storage_install_smgr_preopened_v1(const RfPageStorageInstallRequestV1 *r
 	UT_ASSERT(request != NULL && preopen == (RfPageSmgrPreopenV1 *)&preopen_object
 			  && side_preflight_step != 0 && side_preflight_step < step + 1);
 	page_install_step = ++step;
+	throw_if(5);
+	if (stale_after_page)
+		stale_thread = 2;
 	memset(proof, 0, sizeof(*proof));
 	proof->component_count = request->component_count;
 	proof->write_count = request->component_count;
@@ -237,6 +356,16 @@ rf_side_online_production_owner_init_v1(RfSideOnlineProductionOwnerV1 *owner, vo
 			  && revalidate_authority(authority_arg) && cluster_epoch == 9
 			  && failed_origin_redo_retained);
 	memset(owner, 0, sizeof(*owner));
+	owner->authority_arg = authority_arg;
+	return true;
+}
+
+bool
+rf_side_online_production_bind_undo_v1(RfSideOnlineProductionOwnerV1 *owner,
+									   const ClusterThreadRecoveryAuthorityV1 *authority)
+{
+	UT_ASSERT(owner->authority_arg == authority);
+	owner->undo_authority = authority;
 	return true;
 }
 
@@ -245,8 +374,18 @@ rf_side_online_production_preflight_v1(const RfSideOnlinePlanV1 *plan,
 									   RfSideOnlineProductionOwnerV1 *owner)
 {
 	UT_ASSERT(plan == (const RfSideOnlinePlanV1 *)&side_plan_object && owner != NULL);
+	UT_ASSERT(owner->undo_authority != NULL && owner->undo_authority == owner->authority_arg);
+	if (space_present) {
+		UT_ASSERT(owner->space_arg == (void *)&space_object && space_preflight_step > 0);
+		UT_ASSERT(owner->preflight_space == cluster_space_recovery_preflight_operation_v1);
+		UT_ASSERT_EQ(owner->borrowed_scratch_bytes, 8192);
+	}
 	side_preflight_step = ++step;
-	return side_preflight_ok ? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	side_preflight_calls++;
+	throw_if(4);
+	return side_preflight_ok && owner->undo_authority->duty->origin_thread_id != refuse_thread
+			   ? RF_PAGE_PROOF_DETAIL_OK
+			   : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 }
 
 RfPageProofDetailV1
@@ -255,6 +394,13 @@ rf_side_online_production_apply_v1(const RfSideOnlinePlanV1 *plan,
 {
 	UT_ASSERT(plan == (const RfSideOnlinePlanV1 *)&side_plan_object && owner != NULL);
 	side_apply_step = ++step;
+	if (space_present)
+		UT_ASSERT(space_apply_step > 0
+				  && owner->apply_space == cluster_space_recovery_applied_operation_v1);
+	side_apply_calls++;
+	throw_if(6);
+	if (stale_after_side)
+		stale_thread = 2;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
@@ -273,6 +419,7 @@ init_case(ClusterThreadRecoveryAuthorityV1 *authority)
 	duty.system_identifier = 99;
 	memset(duty.storage_uuid, 3, 16);
 	duty.origin_thread_id = 2;
+	duty.origin_owner_incarnation = 19;
 	root.identity = duty;
 	root.checkpoint_tli = 7;
 	root.tail_tli = 7;
@@ -314,6 +461,143 @@ init_case(ClusterThreadRecoveryAuthorityV1 *authority)
 	side_preflight_ok = true;
 	authority_current = true;
 	retained_coverage_current = true;
+	participant_count = 1;
+	side_preflight_calls = side_apply_calls = 0;
+	refuse_thread = stale_thread = 0;
+	stale_after_page = stale_after_side = false;
+	throw_at = 0;
+	live_proofs = live_preflights = live_preopens = 0;
+	space_present = false;
+	space_preflight_ok = space_apply_ok = true;
+	live_space = 0;
+	space_preflight_step = space_apply_step = 0;
+	cut_generation = 19;
+	cluster_shared_config = true;
+}
+
+typedef struct FabricSources {
+	ClusterThreadRecoveryAuthorityV1 authorities[3];
+	ClusterRecoveryDutyKey duties[3];
+	ClusterControlRootSnapshot roots[3];
+	ClusterControlRootReadToken tokens[3];
+	ClusterRecoverySerialGuard serials[3];
+} FabricSources;
+
+static void
+init_sources(FabricSources *f)
+{
+	memset(f, 0, sizeof(*f));
+	init_case(&f->authorities[0]);
+	for (uint32 i = 0; i < 3; i++) {
+		f->authorities[i] = f->authorities[0];
+		f->duties[i] = *f->authorities[0].duty;
+		f->duties[i].origin_thread_id = i + 2;
+		f->roots[i] = *f->authorities[0].root_snapshot;
+		f->roots[i].identity = f->duties[i];
+		f->authorities[i].duty = &f->duties[i];
+		f->authorities[i].root_snapshot = &f->roots[i];
+		f->authorities[i].root_token = &f->tokens[i];
+		f->authorities[i].serial_guard = &f->serials[i];
+	}
+	participant_count = 3;
+}
+
+UT_TEST(test_shared_fabric_rejects_unspecified_writer_generation)
+{
+	for (int shared = 0; shared < 2; shared++) {
+		FabricSources f;
+		ClusterThreadRecoveryFabricApplyResultV1 result;
+		RfPageProofDetailV1 detail;
+		init_sources(&f);
+		cluster_shared_config = shared;
+		cut_generation = 0;
+		detail = cluster_thread_recovery_fabric_apply_sources_v1(
+			(const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object, f.authorities, 3, &result);
+		UT_ASSERT_EQ(detail == RF_PAGE_PROOF_DETAIL_OK, !shared);
+		if (shared) {
+			UT_ASSERT_EQ(proof_step, 0);
+			UT_ASSERT_EQ(side_preflight_calls, 0);
+			UT_ASSERT_EQ(page_install_step, 0);
+		}
+	}
+	cluster_shared_config = true;
+}
+
+UT_TEST(test_multi_source_fabric_preflights_every_origin_before_page_and_side)
+{
+	FabricSources f;
+	ClusterThreadRecoveryFabricApplyResultV1 result;
+
+	init_sources(&f);
+	UT_ASSERT_EQ(
+		cluster_thread_recovery_fabric_apply_sources_v1(
+			(const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object, f.authorities, 3, &result),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(side_preflight_calls, 3);
+	UT_ASSERT_EQ(side_apply_calls, 3);
+	UT_ASSERT(side_preflight_step < page_install_step && page_install_step < side_apply_step);
+	UT_ASSERT(result.side_apply_complete && result.page_durability_complete);
+}
+
+UT_TEST(test_multi_source_fabric_late_preflight_refusal_leaves_all_targets_untouched)
+{
+	FabricSources f;
+	ClusterThreadRecoveryFabricApplyResultV1 result;
+
+	init_sources(&f);
+	refuse_thread = 4;
+	UT_ASSERT_EQ(
+		cluster_thread_recovery_fabric_apply_sources_v1(
+			(const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object, f.authorities, 3, &result),
+		RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+	UT_ASSERT_EQ(side_preflight_calls, 3);
+	UT_ASSERT_EQ(page_install_step, 0);
+	UT_ASSERT_EQ(side_apply_calls, 0);
+	UT_ASSERT(!result.side_apply_complete);
+}
+
+UT_TEST(test_multi_source_fabric_rechecks_prior_sources_between_owners)
+{
+	FabricSources f;
+	ClusterThreadRecoveryFabricApplyResultV1 result;
+
+	for (int side = 0; side < 2; side++) {
+		init_sources(&f);
+		stale_after_page = !side;
+		stale_after_side = side;
+		UT_ASSERT_EQ(cluster_thread_recovery_fabric_apply_sources_v1(
+						 (const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object, f.authorities,
+						 3, &result),
+					 RF_PAGE_PROOF_DETAIL_ROOT_STALE);
+		UT_ASSERT_EQ(side_preflight_calls, 3);
+		UT_ASSERT_EQ(side_apply_calls, side);
+		UT_ASSERT(!result.side_apply_complete);
+	}
+}
+
+UT_TEST(test_multi_source_fabric_rejects_missing_duplicate_or_unretained_origin)
+{
+	FabricSources f;
+	ClusterThreadRecoveryFabricApplyResultV1 result;
+
+	for (int fault = 0; fault < 5; fault++) {
+		init_sources(&f);
+		if (fault == 1)
+			f.duties[2].origin_thread_id = 3;
+		if (fault == 2)
+			f.roots[2].validated_tail_lsn_exclusive++;
+		if (fault == 3)
+			f.authorities[2].retention_pin = (ClusterWalRetentionPin *)&f;
+		if (fault == 4)
+			f.duties[2].storage_uuid[0]++;
+		UT_ASSERT(cluster_thread_recovery_fabric_apply_sources_v1(
+					  (const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object, f.authorities,
+					  fault == 0 ? 2 : 3, &result)
+				  != RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(proof_step, 0);
+		UT_ASSERT_EQ(side_preflight_calls, 0);
+		UT_ASSERT_EQ(page_install_step, 0);
+	}
 }
 
 UT_TEST(test_all_page_and_side_targets_preflight_before_first_mutation)
@@ -368,6 +652,43 @@ UT_TEST(test_side_only_plan_skips_page_authority_and_install)
 	UT_ASSERT(result.side_apply_complete);
 }
 
+UT_TEST(test_history_only_pages_never_reach_storage_or_mutation_authority)
+{
+	ClusterThreadRecoveryAuthorityV1 authority;
+	ClusterThreadRecoveryFabricApplyResultV1 result;
+	init_case(&authority);
+	for (int i = 0; i < target_count; i++)
+		targets[i].history_only = true;
+	UT_ASSERT_EQ(
+		cluster_thread_recovery_fabric_apply_v1(
+			(const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object, &authority, &result),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(result.page_target_count, 0);
+	UT_ASSERT_EQ(proof_step, 0);
+	UT_ASSERT_EQ(page_preflight_step, 0);
+	UT_ASSERT_EQ(preopen_step, 0);
+	UT_ASSERT_EQ(page_install_step, 0);
+	UT_ASSERT(result.side_apply_complete);
+}
+
+UT_TEST(test_mixed_history_pages_install_only_active_targets)
+{
+	for (int historical = 0; historical < 2; historical++) {
+		ClusterThreadRecoveryAuthorityV1 authority;
+		ClusterThreadRecoveryFabricApplyResultV1 result;
+		init_case(&authority);
+		targets[historical].history_only = true;
+		UT_ASSERT_EQ(
+			cluster_thread_recovery_fabric_apply_v1(
+				(const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object, &authority, &result),
+			RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(result.page_target_count, 1);
+		UT_ASSERT_EQ(result.page_write_count, 1);
+		UT_ASSERT_EQ(live_proofs + live_preflights + live_preopens, 0);
+		UT_ASSERT(result.side_apply_complete);
+	}
+}
+
 UT_TEST(test_retained_cut_mismatch_blocks_before_any_target_preflight)
 {
 	ClusterThreadRecoveryAuthorityV1 authority;
@@ -386,14 +707,90 @@ UT_TEST(test_retained_cut_mismatch_blocks_before_any_target_preflight)
 	UT_ASSERT_EQ(side_apply_step, 0);
 }
 
+UT_TEST(test_error_at_every_owned_stage_releases_all_fabric_state)
+{
+	for (int stage = 1; stage <= 6; stage++) {
+		ClusterThreadRecoveryAuthorityV1 authority;
+		ClusterThreadRecoveryFabricApplyResultV1 result, zero = { 0 };
+		volatile bool caught = false;
+
+		init_case(&authority);
+		throw_at = stage;
+		memset(&result, 0xa5, sizeof(result));
+		PG_TRY();
+		{
+			(void)cluster_thread_recovery_fabric_apply_v1(
+				(const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object, &authority, &result);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(live_proofs, 0);
+		UT_ASSERT_EQ(live_preflights, 0);
+		UT_ASSERT_EQ(live_preopens, 0);
+		UT_ASSERT(memcmp(&result, &zero, sizeof(result)) == 0);
+	}
+}
+
+UT_TEST(test_space_owner_precedes_page_install_and_unwinds)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		ClusterThreadRecoveryAuthorityV1 authority;
+		ClusterThreadRecoveryFabricApplyResultV1 result;
+		volatile bool caught = false;
+		RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
+		init_case(&authority);
+		space_present = true;
+		if (variant == 1)
+			space_preflight_ok = false;
+		if (variant == 2)
+			space_apply_ok = false;
+		if (variant == 3)
+			throw_at = 7;
+		PG_TRY();
+		{
+			detail = cluster_thread_recovery_fabric_apply_v1(
+				(const ClusterThreadRecoveryFabricPlanV1 *)&fabric_object, &authority, &result);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, variant == 3);
+		UT_ASSERT_EQ(live_space, 0);
+		UT_ASSERT_EQ(live_proofs + live_preflights + live_preopens, 0);
+		if (variant == 0) {
+			UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT(space_preflight_step < side_preflight_step
+					  && side_preflight_step < space_apply_step);
+			UT_ASSERT(space_apply_step < page_install_step && page_install_step < side_apply_step);
+		} else
+			UT_ASSERT(page_install_step == 0 && side_apply_step == 0
+					  && !result.side_apply_complete);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(13);
+	UT_RUN(test_shared_fabric_rejects_unspecified_writer_generation);
+	UT_RUN(test_space_owner_precedes_page_install_and_unwinds);
+	UT_RUN(test_error_at_every_owned_stage_releases_all_fabric_state);
+	UT_RUN(test_multi_source_fabric_preflights_every_origin_before_page_and_side);
+	UT_RUN(test_multi_source_fabric_late_preflight_refusal_leaves_all_targets_untouched);
+	UT_RUN(test_multi_source_fabric_rechecks_prior_sources_between_owners);
+	UT_RUN(test_multi_source_fabric_rejects_missing_duplicate_or_unretained_origin);
 	UT_RUN(test_all_page_and_side_targets_preflight_before_first_mutation);
 	UT_RUN(test_side_preflight_failure_leaves_page_unmodified);
 	UT_RUN(test_side_only_plan_skips_page_authority_and_install);
 	UT_RUN(test_retained_cut_mismatch_blocks_before_any_target_preflight);
+	UT_RUN(test_history_only_pages_never_reach_storage_or_mutation_authority);
+	UT_RUN(test_mixed_history_pages_install_only_active_targets);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

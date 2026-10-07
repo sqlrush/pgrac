@@ -11,6 +11,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_resource_x_node_wire.h"
 #include "port/pg_crc32c.h"
+#include "storage/bufpage.h"
 
 #include "unit_test.h"
 
@@ -159,23 +160,24 @@ UT_TEST(test_authority_grant_layout_is_exact)
 
 UT_TEST(test_image_envelope_layout_is_exact)
 {
-	UT_ASSERT_EQ(sizeof(ResourceXImageEnvelopeV1), 8520);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, request_tail), 96);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, conversion_base_generation), 116);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, source_fence), 124);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, source_carrier_generation), 158);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, requester_target_generation), 166);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, page_scn_lsn), 174);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, dependency_count), 182);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, dependencies), 184);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, dependency_vector_crc32c), 312);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, page_checksum), 316);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, image_length), 320);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, source_disposition), 324);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, proof_kind), 325);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, image_flags), 326);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, page_bytes), 328);
-	UT_ASSERT_EQ(sizeof(((ResourceXImageEnvelopeV1 *)0)->page_bytes), BLCKSZ);
+	UT_ASSERT_EQ(sizeof(ResourceXImageEnvelopeV2), 8752);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, page_wal), 8520);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, request_tail), 96);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, conversion_base_generation), 116);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, source_fence), 124);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, source_carrier_generation), 158);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, requester_target_generation), 166);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, page_scn_lsn), 174);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, dependency_count), 182);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, dependencies), 184);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, dependency_vector_crc32c), 312);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, page_checksum), 316);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, image_length), 320);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, source_disposition), 324);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, proof_kind), 325);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, image_flags), 326);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV2, page_bytes), 328);
+	UT_ASSERT_EQ(sizeof(((ResourceXImageEnvelopeV2 *)0)->page_bytes), BLCKSZ);
 }
 
 UT_TEST(test_install_settlement_layout_is_exact)
@@ -507,7 +509,7 @@ UT_TEST(test_shared_s_carrier_proof_and_image_round_trip_preserve_mode)
 	ResourceXDecodedFrame image = make_typed_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE);
 	ResourceXDecodedFrame decoded;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint8 bytes[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 bytes[RESOURCE_X_IMAGE_V2_BYTES];
 	uint16 encoded_len = 0;
 
 	proof.common.observed_mode = PCM_STATE_S;
@@ -523,7 +525,7 @@ UT_TEST(test_shared_s_carrier_proof_and_image_round_trip_preserve_mode)
 	image.common.observed_mode = PCM_STATE_S;
 	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &image, bytes,
 											 sizeof(bytes), &encoded_len, &reject));
-	UT_ASSERT_EQ(encoded_len, RESOURCE_X_IMAGE_V1_BYTES);
+	UT_ASSERT_EQ(encoded_len, RESOURCE_X_IMAGE_V2_BYTES);
 	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, encoded_len,
 											 &decoded, &reject));
 	UT_ASSERT_EQ(decoded.common.observed_mode, PCM_STATE_S);
@@ -847,12 +849,12 @@ UT_TEST(test_image_envelope_round_trip_preserves_exact_page)
 	ResourceXDecodedFrame frame = make_typed_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE);
 	ResourceXDecodedFrame decoded;
 	ResourceXWireReject reject;
-	uint8 bytes[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 bytes[RESOURCE_X_IMAGE_V2_BYTES];
 	uint16 len;
 
 	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, bytes,
 											 sizeof(bytes), &len, &reject));
-	UT_ASSERT_EQ(len, RESOURCE_X_IMAGE_V1_BYTES);
+	UT_ASSERT_EQ(len, RESOURCE_X_IMAGE_V2_BYTES);
 	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
 											 &reject));
 	UT_ASSERT_EQ(decoded.body.image_envelope.image_length, RESOURCE_X_PAGE_BYTES);
@@ -861,10 +863,166 @@ UT_TEST(test_image_envelope_round_trip_preserves_exact_page)
 			  == 0);
 }
 
+static ResourceXDecodedFrame
+make_wal_image(void)
+{
+	ResourceXDecodedFrame frame = make_typed_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE);
+	ClusterPageWalBindingV1 *wal = &frame.body.image_envelope.page_wal;
+	BufferTag *tag = &frame.common.logical_assertion.resource;
+	PGAlignedBlock page;
+	memset(&page, 0, sizeof(page));
+	((PageHeader)page.data)->pd_lower = SizeOfPageHeaderData;
+	((PageHeader)page.data)->pd_upper = BLCKSZ;
+	((PageHeader)page.data)->pd_special = BLCKSZ;
+	((PageHeader)page.data)->pd_block_scn = 41;
+	PageSetLSNPreserveOrigin(page.data, 0x800);
+	UT_ASSERT(PageSetLSNOrigin(page.data, 1));
+	memcpy(frame.body.image_envelope.page_bytes, page.data, BLCKSZ);
+	frame.body.image_envelope.page_scn_lsn = 41;
+	frame.body.image_envelope.image_flags = RESOURCE_X_IMAGE_HAS_WAL;
+	tag->forkNum = MAIN_FORKNUM;
+	wal->source.claim.identity.system_identifier = 17;
+	wal->source.claim.identity.storage_uuid[0] = 3;
+	wal->source.claim.identity.authority_uuid[0] = 5;
+	wal->source.claim.identity.origin_thread_id = 2;
+	wal->source.claim.identity.origin_node_id = 1;
+	wal->source.claim.identity.thread_claim_created_at = 100;
+	wal->source.claim.identity.thread_claim_crc32c = 0x1234;
+	wal->source.claim.identity.origin_owner_incarnation = 4;
+	wal->source.claim.identity.root_lineage_seq = 7;
+	wal->source.claim.database_incarnation = 9;
+	wal->source.claim.max_config_generation = 11;
+	wal->source.claim.claim_sha256[0] = 13;
+	wal->source.timeline = 2;
+	wal->identity.system_identifier = 17;
+	wal->identity.storage_uuid[0] = 3;
+	wal->identity.locator = BufTagGetRelFileLocator(tag);
+	wal->identity.forknum = tag->forkNum;
+	wal->identity.blockno = tag->blockNum;
+	wal->version.segment_incarnation[0] = 19;
+	wal->version.mutation_token = 41;
+	wal->record_start = 0x600;
+	wal->record_end = 0x800;
+	wal->record_crc = 0x11223344;
+	wal->rmid = 10;
+	wal->info = 0x12;
+	wal->flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	return frame;
+}
+
+UT_TEST(test_image_preserves_full_native_source_and_rejects_legacy)
+{
+	ResourceXDecodedFrame frame = make_wal_image(), decoded;
+	ResourceXWireReject reject;
+	uint8 bytes[RESOURCE_X_IMAGE_V2_BYTES];
+	uint16 len = 0;
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, bytes,
+											 sizeof(bytes), &len, &reject));
+	UT_ASSERT_EQ(len, 8752);
+	UT_ASSERT_EQ(bytes[0], 2);
+	UT_ASSERT_EQ(bytes[8520 + 224], 0x11);
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											 &reject));
+	UT_ASSERT_EQ(memcmp(&decoded.body.image_envelope.page_wal, &frame.body.image_envelope.page_wal,
+						sizeof(ClusterPageWalBindingV1)),
+				 0);
+	frame.body.image_envelope.page_wal.flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, bytes,
+											 sizeof(bytes), &len, &reject));
+	UT_ASSERT_EQ(bytes[8520 + 230], 0);
+	UT_ASSERT_EQ(bytes[8520 + 231], CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											 &reject));
+	UT_ASSERT_EQ(decoded.body.image_envelope.page_wal.flags, CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
+	memset(&decoded, 0x59, sizeof(decoded));
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, 8520, &decoded,
+											  &reject));
+	bytes[0] = 1;
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											  &reject));
+	UT_ASSERT_EQ(((uint8 *)&decoded)[0], 0x59);
+}
+
+UT_TEST(test_image_source_conflicts_refuse_before_output)
+{
+	for (int i = 0; i < 13; i++) {
+		ResourceXDecodedFrame frame = make_wal_image();
+		ClusterPageWalBindingV1 *wal = &frame.body.image_envelope.page_wal;
+		ResourceXWireReject reject;
+		uint8 bytes[RESOURCE_X_IMAGE_V2_BYTES];
+		uint16 len = 91;
+		switch (i) {
+		case 0:
+			wal->record_end++;
+			break;
+		case 1:
+			wal->version.mutation_token++;
+			break;
+		case 2:
+			wal->source.claim.identity.origin_thread_id++;
+			break;
+		case 3:
+			wal->identity.locator.relNumber++;
+			break;
+		case 4:
+			wal->identity.storage_uuid[0]++;
+			break;
+		case 5:
+			memset(wal->version.segment_incarnation, 0, 16);
+			break;
+		case 6:
+			memset(wal->source.claim.claim_sha256, 0, 32);
+			break;
+		case 7:
+			wal->flags = 2;
+			break;
+		case 8:
+			wal->source.claim.identity.reserved60 = 1;
+			break;
+		case 9:
+			frame.body.image_envelope.image_flags = 0;
+			break;
+		case 10:
+			frame.body.image_envelope.image_flags = 2;
+			break;
+		case 11:
+			wal->record_start = wal->record_end;
+			break;
+		case 12:
+			wal->flags = 0;
+			break;
+		}
+		memset(bytes, 0x59, sizeof(bytes));
+		UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, bytes,
+												  sizeof(bytes), &len, &reject));
+		UT_ASSERT_EQ(bytes[0], 0x59);
+		UT_ASSERT_EQ(len, 91);
+	}
+}
+
+UT_TEST(test_image_wal_corruption_rejected_with_valid_wire_crc)
+{
+	const int offsets[] = { 8520 + 132, 8520 + 180, 8520 + 208, 8520 + 40, 326, 8520 + 231 };
+	for (int i = 0; i < lengthof(offsets); i++) {
+		ResourceXDecodedFrame frame = make_wal_image(), decoded;
+		ResourceXWireReject reject;
+		uint8 bytes[RESOURCE_X_IMAGE_V2_BYTES];
+		uint16 len = 0;
+		UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, bytes,
+												 sizeof(bytes), &len, &reject));
+		bytes[offsets[i]] = offsets[i] == 8520 + 231 ? 0 : 1;
+		test_reseal(bytes, len);
+		memset(&decoded, 0x59, sizeof(decoded));
+		UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len,
+												  &decoded, &reject));
+		UT_ASSERT_EQ(((uint8 *)&decoded)[0], 0x59);
+	}
+}
+
 UT_TEST(test_delegated_block_and_image_keep_exact_wire_layout)
 {
 	ResourceXWireKind kinds[] = { RESOURCE_X_WIRE_BLOCK_TO_N, RESOURCE_X_WIRE_IMAGE_ENVELOPE };
-	uint8 bytes[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 bytes[RESOURCE_X_IMAGE_V2_BYTES];
 	Size i;
 
 	for (i = 0; i < lengthof(kinds); i++) {
@@ -883,7 +1041,7 @@ UT_TEST(test_delegated_block_and_image_keep_exact_wire_layout)
 			frame.common.action_node = frame.common.logical_assertion.requester_node;
 		frame.common.authority_generation = frame.common.base_authority_generation + 2;
 		UT_ASSERT(cluster_resource_x_wire_encode(msg, &frame, bytes, sizeof(bytes), &len, &reject));
-		UT_ASSERT_EQ(len, i == 0 ? RESOURCE_X_CONTROL_V1_BYTES : RESOURCE_X_IMAGE_V1_BYTES);
+		UT_ASSERT_EQ(len, i == 0 ? RESOURCE_X_CONTROL_V1_BYTES : RESOURCE_X_IMAGE_V2_BYTES);
 		UT_ASSERT(cluster_resource_x_wire_decode(msg, bytes, len, &decoded, &reject));
 		UT_ASSERT_EQ(decoded.common.flags, UINT8_C(0x04));
 		UT_ASSERT_EQ(decoded.common.authority_generation, frame.common.authority_generation);
@@ -899,7 +1057,7 @@ UT_TEST(test_delegation_flag_never_grants_other_kind_or_nonsource)
 {
 	ResourceXDecodedFrame frame;
 	ResourceXWireReject reject;
-	uint8 bytes[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 bytes[RESOURCE_X_IMAGE_V2_BYTES];
 	uint16 len;
 
 	frame = make_control_frame(RESOURCE_X_WIRE_BLOCK_TO_N);
@@ -923,7 +1081,7 @@ UT_TEST(test_delegation_generations_rejected_even_with_valid_crc)
 	ResourceXDecodedFrame frame = make_typed_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE);
 	ResourceXDecodedFrame decoded;
 	ResourceXWireReject reject;
-	uint8 bytes[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 bytes[RESOURCE_X_IMAGE_V2_BYTES];
 	uint16 len;
 	uint64 finals[] = { 0, frame.common.base_authority_generation, UINT64_MAX };
 	Size i;
@@ -949,7 +1107,7 @@ UT_TEST(test_typed_body_validation_is_fail_closed)
 {
 	ResourceXDecodedFrame frame;
 	ResourceXWireReject reject;
-	uint8 bytes[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 bytes[RESOURCE_X_IMAGE_V2_BYTES];
 	uint16 len;
 
 	frame = make_typed_frame(RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION);
@@ -1091,8 +1249,11 @@ UT_TEST(test_resource_x_capability_has_complete_collision_census)
 {
 	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1, UINT32_C(0x00020000));
 	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1, UINT32_C(0x00400000));
-	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_DEFINED_COUNT, 21);
-	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_DEFINED_MASK, UINT32_C(0x007BBFFF));
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3, UINT32_C(0x00800000));
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_KO_SHARED_V2, UINT32_C(0x01000000));
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2, UINT32_C(0x02000000));
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_DEFINED_COUNT, 24);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_DEFINED_MASK, UINT32_C(0x03FBBFFF));
 	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_DEFINED_SUM, PGRAC_IC_HELLO_CAP_DEFINED_MASK);
 	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_DEFINED_MASK & UINT32_C(0x00044000), 0);
 }
@@ -1100,7 +1261,7 @@ UT_TEST(test_resource_x_capability_has_complete_collision_census)
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(33);
 	UT_RUN(test_wire_kind_and_proof_domains_are_closed);
 	UT_RUN(test_reused_message_numbers_remain_exact);
 	UT_RUN(test_common_wire_layout_is_exact);
@@ -1123,6 +1284,9 @@ main(void)
 	UT_RUN(test_short_typed_frames_round_trip);
 	UT_RUN(test_proof_typed_frames_round_trip);
 	UT_RUN(test_image_envelope_round_trip_preserves_exact_page);
+	UT_RUN(test_image_preserves_full_native_source_and_rejects_legacy);
+	UT_RUN(test_image_source_conflicts_refuse_before_output);
+	UT_RUN(test_image_wal_corruption_rejected_with_valid_wire_crc);
 	UT_RUN(test_delegated_block_and_image_keep_exact_wire_layout);
 	UT_RUN(test_delegation_flag_never_grants_other_kind_or_nonsource);
 	UT_RUN(test_delegation_generations_rejected_even_with_valid_crc);

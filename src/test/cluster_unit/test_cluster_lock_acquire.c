@@ -51,12 +51,23 @@
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_lock_owner.h"
+#include "cluster/cluster_control_request.h"
+#include "cluster/cluster_shmem.h"
 #include "cluster/cluster_native_lock_probe.h" /* spec-5.3 same-lock-group helper */
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_wal_retention.h"
 #include "miscadmin.h"
+#include "catalog/pg_class.h"
+#include "access/htup_details.h"
 #include "port/atomics.h"
 #include "storage/lock.h"
+#include "storage/proc.h"
+#include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+#include "utils/memutils.h"
+#include "utils/syscache.h"
 
 /* Drop PG's port.h printf override; unit_test.h uses stdlib printf. */
 #ifdef vprintf
@@ -70,6 +81,104 @@
 #endif
 
 #include "unit_test.h"
+
+/* PGRAC: bind the real registry used by the new owner; keep unrelated
+ * transport and PG allocation explicit boundaries of this legacy suite.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool cluster_shared_config;
+BackendType MyBackendType = B_BACKEND;
+int cluster_ges_request_timeout_ms = 60000;
+MemoryContext TopMemoryContext = (MemoryContext)1;
+void *
+MemoryContextAllocZero(MemoryContext context pg_attribute_unused(), Size size)
+{
+	return calloc(1, size);
+}
+void
+pfree(void *ptr)
+{
+	free(ptr);
+}
+void
+before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(),
+				  Datum arg pg_attribute_unused())
+{}
+void
+cluster_lmon_wakeup(void)
+{}
+static LWLock *control_held_lock;
+void *
+ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *found)
+{
+	*found = false;
+	return calloc(1, size);
+}
+void
+cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
+{}
+int
+LWLockNewTrancheId(void)
+{
+	return 201;
+}
+void
+LWLockInitialize(LWLock *lock, int id)
+{
+	lock->tranche = id;
+}
+void
+LWLockRegisterTranche(int id pg_attribute_unused(), const char *name pg_attribute_unused())
+{}
+bool
+LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
+{
+	Assert(control_held_lock == NULL);
+	control_held_lock = lock;
+	return true;
+}
+void
+LWLockRelease(LWLock *lock)
+{
+	Assert(control_held_lock == lock);
+	control_held_lock = NULL;
+}
+bool
+cluster_grd_control_acquire_allowed(const ClusterResId *resid pg_attribute_unused(),
+									LOCKMODE mode pg_attribute_unused())
+{
+	return true;
+}
+bool
+cluster_grd_control_recovery_ready(const ClusterResId *resid pg_attribute_unused(),
+								   LOCKMODE mode pg_attribute_unused())
+{
+	return false;
+}
+bool
+cluster_grd_control_rebuild_frozen(uint64 epoch pg_attribute_unused(),
+								   uint64 gen pg_attribute_unused())
+{
+	return false;
+}
+int
+cluster_grd_retire_request_and_drain(const ClusterResId *resid pg_attribute_unused(),
+									 const ClusterGrdHolderId *holder pg_attribute_unused(),
+									 uint64 previous pg_attribute_unused(),
+									 LOCKMODE mode pg_attribute_unused(),
+									 ClusterGrdGrantIdentity *granted pg_attribute_unused(),
+									 int max pg_attribute_unused())
+{
+	abort();
+}
+ClusterGesAcquireResult
+cluster_ges_cf_request_poll(ClusterGesAcquireAttempt *attempt pg_attribute_unused(),
+							const ClusterResId *resid pg_attribute_unused(),
+							uint32 mode pg_attribute_unused(),
+							const ClusterGrdHolderId *holder pg_attribute_unused(),
+							ClusterGesHwGrant *grant pg_attribute_unused())
+{
+	abort();
+}
 
 
 /* ============================================================
@@ -174,6 +283,23 @@ pg_re_throw(void)
 	abort(); /* never reached — the stub wait never throws */
 }
 
+void
+FlushErrorState(void)
+{}
+
+ClusterGesRedeclareResult
+cluster_ges_redeclare_poll(ClusterGesRedeclareAttempt *attempt pg_attribute_unused(),
+						   const ClusterResId *resid pg_attribute_unused(),
+						   uint32 mode pg_attribute_unused(),
+						   const ClusterGrdHolderId *holder pg_attribute_unused())
+{
+	return CLUSTER_GES_REDECLARE_CONFIRMED;
+}
+
+void
+cluster_ges_reply_wait_delete(const GesReplyWaitKey *key pg_attribute_unused())
+{}
+
 uint64
 cluster_lmd_wait_state_publish(ClusterLmdProcWaitState *ws pg_attribute_unused(),
 							   uint8 kind pg_attribute_unused(),
@@ -227,10 +353,7 @@ GetTopTransactionIdIfAny(void)
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_grd.h"
 
-struct PGPROC {
-	int pgprocno;
-};
-struct PGPROC *MyProc = NULL;
+PGPROC *MyProc = NULL;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 
 int cluster_node_id = 0;
@@ -280,16 +403,27 @@ GetCurrentTimestamp(void)
 	return 0;
 }
 
+/* Controlled enumeration feeds the real owner walker and native PGPROC. */
+static uint64 stub_redeclare_epoch = 1;
+static uint64 stub_redeclare_generation;
+static LOCALLOCK stub_redeclare_locks[2];
+static bool stub_redeclare_hash_available;
+static int stub_redeclare_lock_count;
+static int stub_redeclare_lock_cursor;
+typedef enum RedeclareWalkDrift {
+	REDECLARE_WALK_STABLE,
+	REDECLARE_WALK_EPOCH_CHANGED,
+	REDECLARE_WALK_GENERATION_CHANGED,
+	REDECLARE_WALK_COUNT_CHANGED
+} RedeclareWalkDrift;
+static RedeclareWalkDrift stub_redeclare_drift;
+
 uint64
 cluster_epoch_get_current(void)
 {
-	return 1;
+	return stub_redeclare_epoch;
 }
 
-/* spec-4.6 D3 stubs — the cooperative redeclare walker is inert in the
- * standalone fixture:  cluster_grd_redeclare_generation() == 0 makes
- * cluster_grd_redeclare_all_registered early-return, so the hash_seq /
- * LocalLockHash symbols are link-only and never reached at runtime. */
 bool cluster_enabled = false;
 
 /* spec-4.6 D4 stubs — the freeze gate consults the shard phase (NORMAL
@@ -328,7 +462,7 @@ ProcessInterrupts(void)
 uint64
 cluster_grd_redeclare_generation(void)
 {
-	return 0;
+	return stub_redeclare_generation;
 }
 
 /* spec-4.6 L11/L14 stub:  redeclare-skip sticky probe.  Standalone
@@ -359,31 +493,72 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid pg_attribute
 	return CLUSTER_GRD_ENTRY_OK;
 }
 
+uint32
+cluster_ges_current_lock_group(const ClusterGrdHolderId *holder pg_attribute_unused())
+{
+	return 0; /* This fixture has no parallel group; GRD/GES tests cover it. */
+}
+
+ClusterGrdEntryResult
+cluster_grd_entry_rebind_or_insert_holder_group(const ClusterResId *resid,
+												const ClusterGrdHolderId *holder, int32 source,
+												int mode, uint32 group pg_attribute_unused())
+{
+	return cluster_grd_entry_rebind_or_insert_holder(resid, holder, source, mode);
+}
+
+
 HTAB *
 GetLockMethodLocalHash(void)
 {
-	return NULL;
+	/* The opaque hash token is only passed back to hash_seq_init below. */
+	return stub_redeclare_hash_available ? (HTAB *)stub_redeclare_locks : NULL;
 }
 
 void
 hash_seq_init(HASH_SEQ_STATUS *status pg_attribute_unused(), HTAB *hashp pg_attribute_unused())
-{}
+{
+	stub_redeclare_lock_cursor = 0;
+}
 
 void *
 hash_seq_search(HASH_SEQ_STATUS *status pg_attribute_unused())
 {
+	if (stub_redeclare_lock_cursor < stub_redeclare_lock_count)
+		return &stub_redeclare_locks[stub_redeclare_lock_cursor++];
+	/* Change the observed cut after enumeration, before the real ACK write. */
+	if (stub_redeclare_drift == REDECLARE_WALK_EPOCH_CHANGED)
+		stub_redeclare_epoch++;
+	else if (stub_redeclare_drift == REDECLARE_WALK_GENERATION_CHANGED)
+		stub_redeclare_generation++;
+	else if (stub_redeclare_drift == REDECLARE_WALK_COUNT_CHANGED)
+		pg_atomic_fetch_add_u32(&MyProc->cluster_grd_registered_count, 1);
+	stub_redeclare_drift = REDECLARE_WALK_STABLE;
 	return NULL;
 }
 
 /* spec-2.25 D8 R10 stub audit — SearchSysCache1 / ReleaseSysCache pulled
  * in by cluster_relation_is_persistent_or_unlogged.  Standalone test does
  * not exercise the helper directly;  null-safe stubs satisfy link. */
-struct HeapTupleData;
-typedef struct HeapTupleData *HeapTuple;
+static HeapTupleData temp_tuple;
+static union {
+	uint64 alignment;
+	char data[MAXALIGN(SizeofHeapTupleHeader) + sizeof(FormData_pg_class)];
+} temp_storage;
+static Oid temp_oid;
 
 HeapTuple
 SearchSysCache1(int cache_id pg_attribute_unused(), Datum key1 pg_attribute_unused())
 {
+	if (temp_oid != InvalidOid && DatumGetObjectId(key1) == temp_oid) {
+		Form_pg_class form;
+		memset(&temp_storage, 0, sizeof(temp_storage));
+		temp_tuple.t_data = (HeapTupleHeader)temp_storage.data;
+		temp_tuple.t_data->t_hoff = MAXALIGN(SizeofHeapTupleHeader);
+		form = (Form_pg_class)GETSTRUCT(&temp_tuple);
+		form->relpersistence = RELPERSISTENCE_TEMP;
+		return &temp_tuple;
+	}
 	return NULL;
 }
 
@@ -407,6 +582,13 @@ cluster_grd_shard_for_resource(const ClusterResId *resid pg_attribute_unused())
 int32
 cluster_grd_lookup_master(const ClusterResId *resid pg_attribute_unused())
 {
+	return stub_master_node;
+}
+
+int32
+cluster_grd_lookup_master_gen(const ClusterResId *resid pg_attribute_unused(), uint64 *generation)
+{
+	*generation = 1;
 	return stub_master_node;
 }
 
@@ -460,6 +642,7 @@ errcode(int s pg_attribute_unused())
  * and the process-context symbols the fixture does not otherwise stub. */
 bool IsUnderPostmaster = false;
 int MyProcPid = 0;
+#include "test_cluster_startup_interrupt_fixture.h"
 
 bool
 cluster_grd_join_remaster_in_progress(void)
@@ -496,6 +679,8 @@ cluster_grd_try_reserve(const ClusterResId *resid pg_attribute_unused(),
 	return stub_reserve_result;
 }
 
+static ClusterGrdEntryResult owner_promote_result = CLUSTER_GRD_ENTRY_NOT_FOUND;
+
 ClusterGrdEntryResult
 cluster_grd_revalidate_and_promote(const ClusterResId *resid pg_attribute_unused(),
 								   const ClusterGrdHolderId *holder pg_attribute_unused(),
@@ -503,7 +688,7 @@ cluster_grd_revalidate_and_promote(const ClusterResId *resid pg_attribute_unused
 								   uint64 gen_snapshot pg_attribute_unused())
 {
 	stub_revalidate_calls++;
-	return CLUSTER_GRD_ENTRY_NOT_FOUND;
+	return owner_promote_result;
 }
 
 ClusterGrdEntryResult
@@ -612,12 +797,36 @@ cluster_ges_relation_grant_is_current(const ClusterGesHwGrant *grant pg_attribut
 	return false;
 }
 
+uint32
+cluster_ges_send_cf_request_and_wait(const ClusterResId *resid pg_attribute_unused(),
+									 uint32 mode pg_attribute_unused(),
+									 const ClusterGrdHolderId *holder pg_attribute_unused(),
+									 uint64 request_id pg_attribute_unused(),
+									 int timeout_ms pg_attribute_unused(),
+									 uint32 wait_event pg_attribute_unused(),
+									 ClusterGesHwGrant *grant pg_attribute_unused())
+{
+	/* Reject mapping only; the actual exchange is in test_cluster_hw_handoff. */
+	return stub_ges_reject_reason;
+}
+
+bool
+cluster_ges_cf_grant_is_current(const ClusterGesHwGrant *grant pg_attribute_unused(),
+								const ClusterResId *resid pg_attribute_unused(),
+								const ClusterGrdHolderId *holder pg_attribute_unused(),
+								uint64 request_id pg_attribute_unused(),
+								uint32 mode pg_attribute_unused())
+{
+	/* Census fixture controls the grant boundary, not its wire proof. */
+	return owner_promote_result == CLUSTER_GRD_ENTRY_OK;
+}
+
 ClusterGrdEntryResult
 cluster_grd_confirm_local_grant_exact(const ClusterResId *resid pg_attribute_unused(),
 									  const ClusterGrdHolderId *holder pg_attribute_unused(),
 									  LOCKMODE mode pg_attribute_unused())
 {
-	abort();
+	return owner_promote_result;
 }
 
 ClusterGrdEntryResult
@@ -1131,7 +1340,7 @@ UT_TEST(test_ul_session_advisory_globalize_gate)
 
 /* spec-6.14 D7 — under cluster.shared_catalog the catalog OID boundary (HC24/
  * HC27) is removed: catalog DDL and mapped-relation writes globalize, catalog
- * reads stay native, and user relations are unaffected.  The SearchSysCache1
+ * reads stay native; user relation readers participate in the DDL lock.  The SearchSysCache1
  * stub returns NULL, so cluster_relation_is_mapped fails safe to true. */
 UT_TEST(test_shared_catalog_relation_gate)
 {
@@ -1165,14 +1374,42 @@ UT_TEST(test_shared_catalog_relation_gate)
 	UT_ASSERT_EQ(cluster_lock_should_globalize(&cat, ShareUpdateExclusiveLock, false), true);
 	UT_ASSERT_EQ(cluster_lock_should_globalize(&cat, AccessExclusiveLock, false), true);
 
-	/* User relations are unchanged in ON mode: OLTP hot path (< SUEX) native,
-	 * DDL globalizes. */
-	UT_ASSERT_EQ(cluster_lock_should_globalize(&usr, RowExclusiveLock, false), false);
+	/* Readers and writers must both conflict with remote DROP/ALTER. */
+	UT_ASSERT(cluster_lock_should_globalize(&usr, AccessShareLock, false));
+	UT_ASSERT(cluster_lock_should_globalize(&usr, RowShareLock, false));
+	UT_ASSERT(cluster_lock_should_globalize(&usr, RowExclusiveLock, false));
 	UT_ASSERT_EQ(cluster_lock_should_globalize(&usr, AccessExclusiveLock, false), true);
 
-	cluster_shared_catalog = false; /* restore */
+	temp_oid = usr.locktag_field2;
+	UT_ASSERT(!cluster_lock_should_globalize(&usr, AccessShareLock, false));
+	UT_ASSERT(!cluster_lock_should_globalize(&usr, AccessExclusiveLock, false));
+	temp_oid = InvalidOid;
+	cluster_shared_catalog = false;
+	UT_ASSERT(!cluster_lock_should_globalize(&usr, AccessShareLock, false));
+	UT_ASSERT(!cluster_lock_should_globalize(&usr, RowExclusiveLock, false));
 }
 
+
+/* Schema and role references must hold the same distributed object lock
+ * that DROP takes exclusively, including built-in object OIDs. */
+UT_TEST(test_shared_object_references_conflict_with_remote_drop)
+{
+	LOCKTAG object;
+	Oid ids[] = { 10, FirstNormalObjectId + 1 };
+
+	for (unsigned i = 0; i < lengthof(ids); i++)
+		for (int shared = 0; shared <= 1; shared++)
+			for (LOCKMODE mode = AccessShareLock; mode <= AccessExclusiveLock; mode++) {
+				SET_LOCKTAG_OBJECT(object, 1, 2615, ids[i], 0);
+				cluster_shared_catalog = shared;
+				UT_ASSERT_EQ(cluster_lock_should_globalize(&object, mode, false),
+							 shared || (i == 1 && mode >= ShareUpdateExclusiveLock));
+				SET_LOCKTAG_OBJECT(object, InvalidOid, 1260, ids[i], 0);
+				UT_ASSERT_EQ(cluster_lock_should_globalize(&object, mode, false),
+							 shared || (i == 1 && mode >= ShareUpdateExclusiveLock));
+			}
+	cluster_shared_catalog = false;
+}
 
 /* ============================================================
  * spec-5.5 U6 — try-lock (NOWAIT) S4 reject mapping (D5).
@@ -1281,6 +1518,7 @@ UT_TEST(test_cf_s4_dead_master_native_is_nonaffirmative)
 
 	memset(&req, 0, sizeof(req));
 	req.resid.type = CLUSTER_CF_RESID_TYPE;
+	req.op = CLUSTER_LOCK_OP_REQUEST;
 	req.lockmode = ExclusiveLock;
 	stub_ges_reject_reason = GES_REJECT_REASON_MASTER_DEAD_NATIVE;
 	result = cluster_lock_acquire_s4_remote_request_wait(&req);
@@ -1365,13 +1603,200 @@ UT_TEST(test_s5_not_found_benign_narrow)
 }
 
 
+/* Each fixture starts at accepted epoch 11, reconstruction generation 7. */
+static void
+setup_redeclare_walk(PGPROC *proc, uint32 registered_count, int visible_count)
+{
+	int i;
+
+	memset(proc, 0, sizeof(*proc));
+	pg_atomic_init_u32(&proc->cluster_grd_registered_count, registered_count);
+	pg_atomic_init_u64(&proc->cluster_grd_redeclare_acked, 0);
+	pg_atomic_init_u64(&proc->cluster_grd_redeclare_acked_epoch, 0);
+	MyProc = proc;
+	cluster_enabled = true;
+	stub_redeclare_epoch = 11;
+	stub_redeclare_generation = 7;
+	stub_redeclare_hash_available = true;
+	stub_redeclare_lock_count = visible_count;
+	stub_redeclare_drift = REDECLARE_WALK_STABLE;
+	memset(stub_redeclare_locks, 0, sizeof(stub_redeclare_locks));
+	for (i = 0; i < visible_count; i++) {
+		ClusterGrdHolderId holder = { 0 };
+		LOCALLOCK *lock = &stub_redeclare_locks[i];
+
+		holder.node_id = 0;
+		holder.procno = 3;
+		holder.cluster_epoch = 11;
+		holder.request_id = 91 + i;
+		lock->cluster_registered = true;
+		lock->nLocks = 1;
+		lock->tag.mode = ShareLock;
+		lock->cluster_request_id = holder.request_id;
+		memcpy(lock->cluster_holder_raw, &holder, sizeof(holder));
+	}
+}
+
+static void
+reset_redeclare_walk(void)
+{
+	MyProc = NULL;
+	cluster_enabled = false;
+	stub_redeclare_epoch = 1;
+	stub_redeclare_generation = 0;
+	stub_redeclare_hash_available = false;
+	stub_redeclare_lock_count = 0;
+	stub_redeclare_drift = REDECLARE_WALK_STABLE;
+}
+
+UT_TEST(test_redeclare_walk_requires_complete_registered_census)
+{
+	const struct {
+		uint32 registered_count;
+		int visible_count;
+		bool hash_available;
+		bool want_ack;
+	} cases[] = { { 0, 0, false, true }, { 1, 0, false, false }, { 1, 0, true, false },
+				  { 1, 1, true, true },	 { 2, 1, true, false },	 { 2, 2, true, true } };
+	PGPROC proc;
+	size_t i;
+
+	for (i = 0; i < lengthof(cases); i++) {
+		setup_redeclare_walk(&proc, cases[i].registered_count, cases[i].visible_count);
+		stub_redeclare_hash_available = cases[i].hash_available;
+		cluster_grd_redeclare_all_registered();
+		UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked),
+					 cases[i].want_ack ? 7 : 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked_epoch),
+					 cases[i].want_ack ? 11 : 0);
+	}
+	reset_redeclare_walk();
+}
+
+UT_TEST(test_redeclare_walk_does_not_count_unregistered_records)
+{
+	PGPROC proc;
+
+	setup_redeclare_walk(&proc, 2, 2);
+	stub_redeclare_locks[1].cluster_registered = false;
+	cluster_grd_redeclare_all_registered();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked_epoch), 0);
+	reset_redeclare_walk();
+}
+
+UT_TEST(test_redeclare_walk_requires_stable_cut)
+{
+	PGPROC proc;
+	RedeclareWalkDrift drift;
+
+	for (drift = REDECLARE_WALK_EPOCH_CHANGED; drift <= REDECLARE_WALK_COUNT_CHANGED; drift++) {
+		setup_redeclare_walk(&proc, 1, 1);
+		stub_redeclare_drift = drift;
+		cluster_grd_redeclare_all_registered();
+		UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked_epoch), 0);
+	}
+	reset_redeclare_walk();
+}
+
+UT_TEST(test_redeclare_walk_cached_ack_requires_exact_epoch)
+{
+	PGPROC proc;
+
+	setup_redeclare_walk(&proc, 0, 0);
+	pg_atomic_write_u64(&proc.cluster_grd_redeclare_acked, 7);
+	pg_atomic_write_u64(&proc.cluster_grd_redeclare_acked_epoch, 10);
+	cluster_grd_redeclare_all_registered();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked), 7);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked_epoch), 11);
+	reset_redeclare_walk();
+}
+
+UT_TEST(test_redeclare_walk_release_in_flight_keeps_old_identity)
+{
+	PGPROC proc;
+	ClusterGrdHolderId holder;
+
+	setup_redeclare_walk(&proc, 1, 1);
+	memcpy(&holder, stub_redeclare_locks[0].cluster_holder_raw, sizeof(holder));
+	holder.cluster_epoch = 10;
+	memcpy(stub_redeclare_locks[0].cluster_holder_raw, &holder, sizeof(holder));
+	stub_redeclare_locks[0].nLocks = 0;
+	cluster_grd_redeclare_all_registered();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked), 7);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked_epoch), 11);
+	UT_ASSERT_EQ(memcmp(stub_redeclare_locks[0].cluster_holder_raw, &holder, sizeof(holder)), 0);
+	UT_ASSERT_EQ(stub_redeclare_locks[0].cluster_request_id, 91);
+	reset_redeclare_walk();
+}
+
+UT_TEST(test_redeclare_walk_includes_actual_private_owner)
+{
+	PGPROC proc;
+	ClusterLockOwner owner;
+
+	setup_redeclare_walk(&proc, 1, 1);
+	memset(&owner, 0, sizeof(owner));
+	owner.request.resid.type = CLUSTER_CF_RESID_TYPE;
+	owner.request.op = CLUSTER_LOCK_OP_REQUEST;
+	owner.request.lockmode = ShareLock;
+	owner.request.holder.node_id = cluster_node_id;
+	owner.request.holder.procno = proc.pgprocno;
+	owner.request.holder.cluster_epoch = 11;
+	owner.request.holder.request_id = owner.request.request_id = 92;
+	/* Controlled S4 proof boundary for the census-only test. Actual proof
+	 * production, validation and private installation run in handoff tests. */
+	owner.request.hw_grant.key.request_id = 92;
+	owner.request.hw_grant.master = cluster_node_id;
+	owner_promote_result = CLUSTER_GRD_ENTRY_OK;
+	UT_ASSERT(cluster_lock_owner_install(&owner));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&proc.cluster_grd_registered_count), 2);
+	cluster_grd_redeclare_all_registered();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked), 7);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked_epoch), 11);
+	stub_master_node = cluster_node_id;
+	stub_local_release_result = GES_REJECT_REASON_NONE;
+	UT_ASSERT(cluster_lock_owner_release(&owner));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&proc.cluster_grd_registered_count), 1);
+	owner_promote_result = CLUSTER_GRD_ENTRY_NOT_FOUND;
+	stub_master_node = -1;
+	reset_redeclare_walk();
+}
+
+/* Auxiliary WALR local USERLOCKs are not registered GES holders. The
+ * production walker must skip them even when their local bytes predate the
+ * cut; an empty native hash is also valid, not a reason to sleep on LMON.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_auxiliary_native_walr_does_not_redeclare_or_wait)
+{
+	PGPROC proc;
+	LOCKTAG tag = { 0 };
+	BackendType saved = MyBackendType;
+
+	tag.locktag_type = LOCKTAG_USERLOCK;
+	tag.locktag_lockmethodid = DEFAULT_LOCKMETHOD;
+	UT_ASSERT(!cluster_lock_should_globalize(&tag, ShareLock, false));
+	UT_ASSERT(!cluster_lock_should_globalize(&tag, ExclusiveLock, false));
+	UT_ASSERT(!cluster_lock_should_globalize(&tag, ShareLock, true));
+	setup_redeclare_walk(&proc, 0, 1);
+	MyBackendType = B_LMON;
+	stub_redeclare_locks[0].tag.lock = tag;
+	stub_redeclare_locks[0].cluster_registered = false;
+	cluster_grd_redeclare_all_registered();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked), 7);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked_epoch), 11);
+	MyBackendType = saved;
+	reset_redeclare_walk();
+}
+
 UT_DEFINE_GLOBALS();
 
 
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(18);
+	UT_PLAN(26);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
@@ -1383,6 +1808,7 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_7step_s4_master_reject_default_deny);
 	UT_RUN(test_7step_transaction_should_globalize_gate);
 	UT_RUN(test_shared_catalog_relation_gate);
+	UT_RUN(test_shared_object_references_conflict_with_remote_drop);
 	UT_RUN(test_7step_transaction_locktag_path_routes_through_cluster);
 	UT_RUN(test_7step_transaction_locktag_release_path_safe);
 	UT_RUN(test_ul_session_advisory_globalize_gate);
@@ -1391,6 +1817,13 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_cf_s4_dead_master_native_is_nonaffirmative);
 	UT_RUN(test_native_probe_same_lock_group_exempt);
 	UT_RUN(test_s5_not_found_benign_narrow);
+	UT_RUN(test_redeclare_walk_requires_complete_registered_census);
+	UT_RUN(test_redeclare_walk_does_not_count_unregistered_records);
+	UT_RUN(test_redeclare_walk_requires_stable_cut);
+	UT_RUN(test_redeclare_walk_cached_ack_requires_exact_epoch);
+	UT_RUN(test_redeclare_walk_release_in_flight_keeps_old_identity);
+	UT_RUN(test_redeclare_walk_includes_actual_private_owner);
+	UT_RUN(test_auxiliary_native_walr_does_not_redeclare_or_wait);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

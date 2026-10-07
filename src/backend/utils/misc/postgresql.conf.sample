@@ -841,6 +841,8 @@
 					# (must match a [node.N] section in
 					# pgrac.conf when allow_single_node=off).
 					# (change requires restart)
+#cluster.cold_recovery_plan_memory = 4GB	# typed cold recovery plan budget
+					# (change requires restart)
 #cluster.allow_single_node = on		# Stage 2.1 backward-compat:
 					# on  = pgrac.conf absent OR zero
 					#       [node.N] sections falls back

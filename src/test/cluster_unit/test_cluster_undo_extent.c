@@ -192,6 +192,7 @@ UT_TEST(test_residual_reusable_active_segment_only)
 int
 main(void)
 {
+	UT_PLAN(6);
 	UT_RUN(test_extent_sequential_no_overlap);
 	UT_RUN(test_extent_degenerate_one_block);
 	UT_RUN(test_extent_boundary_clamp);
@@ -199,4 +200,5 @@ main(void)
 	UT_RUN(test_extent_fresh_block_init);
 	UT_RUN(test_residual_reusable_active_segment_only); /* spec-4.12a Hardening v1.0.1 */
 	UT_DONE();
+	return ut_failed_count != 0 ? 1 : 0;
 }

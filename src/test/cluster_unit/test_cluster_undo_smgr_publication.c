@@ -41,6 +41,7 @@ static bool basic_open_forced_error = false;
 static int fsync_calls = 0;
 static int fsync_fail_on_call = 0;
 static bool pwrite_forced_error = false;
+static bool pread_forced_error = false;
 static int product_close_calls = 0;
 static int product_close_fail_on_call = 0;
 static bool free_dir_forced_error = false;
@@ -149,6 +150,16 @@ test_product_pwrite(int fd, const void *buf, size_t nbytes, off_t offset)
 	return pwrite(fd, buf, nbytes, offset);
 }
 
+static ssize_t
+test_product_pread(int fd, void *buf, size_t nbytes, off_t offset)
+{
+	if (pread_forced_error) {
+		errno = EIO;
+		return -1;
+	}
+	return pread(fd, buf, nbytes, offset);
+}
+
 static int
 test_product_close(int fd)
 {
@@ -183,10 +194,13 @@ cluster_undo_segment_header_identity_ok(const char *blockbuf,
 
 #undef pg_pwrite
 #define pg_pwrite test_product_pwrite
+#undef pg_pread
+#define pg_pread test_product_pread
 #define close test_product_close
 #include "../../backend/cluster/storage/cluster_undo_smgr.c"
 #undef close
 #undef pg_pwrite
+#undef pg_pread
 
 static void
 resolve_final(char path[MAXPGPATH])
@@ -834,6 +848,105 @@ UT_TEST(test_root_descriptor_mirror_write_failure_cleans_owned_temp)
 	UT_ASSERT_EQ(count_root_descriptor_temps(), 0);
 }
 
+UT_TEST(test_recovery_file_materializes_absent_without_publishing_header)
+{
+	char original_dir[MAXPGPATH], path[MAXPGPATH];
+	PGAlignedBlock header, before, after;
+	ClusterUndoSmgrRecoveryFileV1 file, materialized;
+
+	strlcpy(original_dir, publication_dir, sizeof(original_dir));
+	strlcat(publication_dir, "/instance_1", sizeof(publication_dir));
+	resolve_final(path);
+	make_page(header.data, 0xa5);
+	UT_ASSERT(cluster_undo_smgr_recovery_probe_v1(1, 1, &file, before.data));
+	UT_ASSERT(!file.exists);
+	UT_ASSERT(cluster_undo_smgr_recovery_read_block_v1(1, 1, 9, &file, after.data));
+	UT_ASSERT(memcmp(before.data, after.data, BLCKSZ) == 0);
+	UT_ASSERT(access(publication_dir, F_OK) != 0 && errno == ENOENT);
+	fsync_calls = 0;
+	UT_ASSERT(cluster_undo_smgr_recovery_materialize_v1(1, 1, &file, before.data, header.data));
+	UT_ASSERT_EQ(fsync_calls, 3);
+	UT_ASSERT(cluster_undo_smgr_recovery_probe_v1(1, 1, &materialized, after.data));
+	UT_ASSERT(materialized.exists && materialized.size == UNDO_SEGMENT_SIZE_BYTES);
+	UT_ASSERT(memcmp(before.data, after.data, BLCKSZ) == 0);
+	/* A raced-in file never satisfies the old absent observation. */
+	UT_ASSERT(!cluster_undo_smgr_recovery_materialize_v1(1, 1, &file, before.data, header.data));
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_EQ(rmdir(publication_dir), 0);
+	strlcpy(publication_dir, original_dir, sizeof(publication_dir));
+}
+
+UT_TEST(test_recovery_file_short_tail_and_errors_are_distinct)
+{
+	char path[MAXPGPATH];
+	PGAlignedBlock header, before, after, saved;
+	ClusterUndoSmgrRecoveryFileV1 file, observed;
+	int fd;
+
+	resolve_final(path);
+	make_page(header.data, 0xa5);
+	write_segment_file(path, header.data, BLCKSZ + 17);
+	UT_ASSERT(cluster_undo_smgr_recovery_probe_v1(1, 1, &file, before.data));
+	UT_ASSERT(file.exists && file.size == BLCKSZ + 17);
+	UT_ASSERT(cluster_undo_smgr_recovery_read_block_v1(1, 1, 1, &file, after.data));
+	memset(saved.data, 0, BLCKSZ);
+	UT_ASSERT(memcmp(after.data, saved.data, BLCKSZ) == 0);
+	memset(saved.data, 0x7b, BLCKSZ);
+	after = saved;
+	pread_forced_error = true;
+	UT_ASSERT(!cluster_undo_smgr_recovery_probe_v1(1, 1, &observed, after.data));
+	UT_ASSERT(memcmp(after.data, saved.data, BLCKSZ) == 0);
+	UT_ASSERT(!cluster_undo_smgr_recovery_read_block_v1(1, 1, 1, &file, after.data));
+	UT_ASSERT(memcmp(after.data, saved.data, BLCKSZ) == 0);
+	pread_forced_error = false;
+	basic_open_forced_error = true;
+	UT_ASSERT(!cluster_undo_smgr_recovery_probe_v1(1, 1, &observed, after.data));
+	basic_open_forced_error = false;
+	/* Mutating even one observed header byte invalidates the full-image write. */
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(pwrite(fd, saved.data, 1, 100), 1);
+	UT_ASSERT_EQ(close(fd), 0);
+	UT_ASSERT(!cluster_undo_smgr_recovery_materialize_v1(1, 1, &file, before.data, header.data));
+	UT_ASSERT(cluster_undo_smgr_recovery_probe_v1(1, 1, &observed, after.data));
+	UT_ASSERT_EQ(observed.size, BLCKSZ + 17);
+	UT_ASSERT_EQ(unlink(path), 0);
+}
+
+UT_TEST(test_recovery_file_requires_all_durability_barriers_and_preserves_bytes)
+{
+	for (int failure = 1; failure <= 3; failure++) {
+		char path[MAXPGPATH];
+		PGAlignedBlock header, before, after;
+		ClusterUndoSmgrRecoveryFileV1 file, changed;
+		int fd;
+
+		resolve_final(path);
+		make_page(header.data, 0xa5);
+		write_segment_file(path, header.data, BLCKSZ + 17);
+		fd = open(path, O_RDWR);
+		UT_ASSERT(fd >= 0);
+		UT_ASSERT_EQ(pwrite(fd, "kept", 4, BLCKSZ + 1), 4);
+		UT_ASSERT_EQ(close(fd), 0);
+		UT_ASSERT(cluster_undo_smgr_recovery_probe_v1(1, 1, &file, before.data));
+		fsync_calls = 0;
+		fsync_fail_on_call = failure;
+		UT_ASSERT(
+			!cluster_undo_smgr_recovery_materialize_v1(1, 1, &file, before.data, header.data));
+		fsync_fail_on_call = 0;
+		UT_ASSERT(cluster_undo_smgr_recovery_probe_v1(1, 1, &changed, after.data));
+		UT_ASSERT_EQ(changed.size, UNDO_SEGMENT_SIZE_BYTES);
+		UT_ASSERT(memcmp(after.data, before.data, BLCKSZ) == 0);
+		fsync_calls = 0;
+		UT_ASSERT(
+			cluster_undo_smgr_recovery_materialize_v1(1, 1, &changed, after.data, header.data));
+		UT_ASSERT_EQ(fsync_calls, 3);
+		UT_ASSERT(cluster_undo_smgr_recovery_read_block_v1(1, 1, 1, &changed, after.data));
+		UT_ASSERT(memcmp(after.data + 1, "kept", 4) == 0);
+		UT_ASSERT_EQ(unlink(path), 0);
+	}
+}
+
 int
 main(void)
 {
@@ -841,7 +954,10 @@ main(void)
 
 	UT_ASSERT_NOT_NULL(mkdtemp(template));
 	strlcpy(publication_dir, template, sizeof(publication_dir));
-	UT_PLAN(26);
+	UT_PLAN(29);
+	UT_RUN(test_recovery_file_materializes_absent_without_publishing_header);
+	UT_RUN(test_recovery_file_short_tail_and_errors_are_distinct);
+	UT_RUN(test_recovery_file_requires_all_durability_barriers_and_preserves_bytes);
 	UT_RUN(test_probe_distinguishes_absent_and_preserves_output);
 	UT_RUN(test_probe_accepts_only_exact_full_identity);
 	UT_RUN(test_probe_classifies_short_or_wrong_identity_as_invalid);

@@ -1730,6 +1730,9 @@ GRANT SELECT ON pg_cluster_node_removal_state TO PUBLIC;
 -- REVOKE EXECUTE FROM PUBLIC for defense-in-depth (L7).
 REVOKE ALL ON FUNCTION pg_cluster_remove_node(int) FROM PUBLIC;
 
+-- Exact membership commands are administrative, including precheck and status.
+REVOKE ALL ON FUNCTION pg_cluster_membership_command(text, jsonb) FROM PUBLIC;
+
 -- PGRAC: ADG physical standby / read-only service status (spec-6.4).
 --   Local view surfaces the standby apply/read floor for this node.  Global
 --   view keeps the same row shape and is local-only until cross-node fanout is

@@ -2,6 +2,7 @@
  *
  * pruneheap.c
  *	  heap page pruning and HOT-chain management code
+ *    PGRAC: preserve exact shared-page versions in native prune WAL.
  *
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -28,17 +29,20 @@
 #include "utils/rel.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_undo_retention.h"
 #include "cluster/cluster_undo_verdict.h"
 #include "cluster/cluster_xid_stripe.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "storage/buf_internals.h"
 #endif
 
@@ -110,7 +114,11 @@ static int heap_page_prune_internal(Relation relation, Buffer buffer,
 								   TransactionId oldest_xmin, GlobalVisState *vistest,
 								   TransactionId old_snap_xmin, TimestampTz old_snap_ts,
 								   int *nnewlpdead, OffsetNumber *off_loc,
-								   const bool *proved_dead);
+								   const bool *proved_dead
+#ifdef USE_PGRAC_CLUSTER
+								   , const ClusterSpaceIdentity *identity
+#endif
+								   );
 
 #ifdef USE_PGRAC_CLUSTER
 static bool
@@ -282,6 +290,8 @@ cluster_heap_prune_pcm(Buffer buffer, ClusterPcmOwnSnapshot *pcm)
 static void
 cluster_heap_page_prune_opt(Relation relation, Buffer buffer)
 {
+	ClusterSpaceIdentity identity;
+	bool versioned;
 	ClusterSemanticAdmissionToken admission;
 	ClusterUndoHorizonFloor floor;
 	ClusterPcmOwnSnapshot captured_pcm;
@@ -319,6 +329,12 @@ cluster_heap_page_prune_opt(Relation relation, Buffer buffer)
 	minfree = Max(RelationGetTargetPageFreeSpace(relation, HEAP_DEFAULT_FILLFACTOR),
 				  BLCKSZ / 10);
 	if (!PageIsFull(live) && PageGetHeapFreeSpace(live) >= minfree)
+		return;
+	/* SPACE cache misses may read a different buffer: resolve before cleanup. */
+	versioned = cluster_shared_config
+		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1;
+	if (versioned && (!RelationNeedsWAL(relation)
+		|| !cluster_space_relation_get_identity(relation, &identity)))
 		return;
 	memset(&admission, 0, sizeof(admission));
 	if (cluster_semantic_activation_enter_r4_terminal_census(&admission)
@@ -417,7 +433,8 @@ cluster_heap_page_prune_opt(Relation relation, Buffer buffer)
 				|| cluster_undo_horizon_epoch_fence_tripped(epoch))
 				break;
 			ndeleted = heap_page_prune_internal(relation, buffer, InvalidTransactionId,
-				NULL, InvalidTransactionId, 0, &nnewlpdead, NULL, proved_dead);
+				NULL, InvalidTransactionId, 0, &nnewlpdead, NULL, proved_dead,
+				versioned ? &identity : NULL);
 			if (ndeleted > nnewlpdead)
 				pgstat_update_heap_dead_tuples(relation, ndeleted - nnewlpdead);
 		} while (false);
@@ -454,6 +471,10 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 	TransactionId limited_xmin = InvalidTransactionId;
 	TimestampTz limited_ts = 0;
 	Size		minfree;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceIdentity identity;
+	bool		versioned = false;
+#endif
 
 	/*
 	 * We can't write WAL in recovery mode, so there's no point trying to
@@ -540,6 +561,14 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 
 	if (PageIsFull(page) || PageGetHeapFreeSpace(page) < minfree)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		versioned = cluster_shared_config
+			&& relation->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+			&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1;
+		if (versioned && (!RelationNeedsWAL(relation)
+			|| !cluster_space_relation_get_identity(relation, &identity)))
+			return;
+#endif
 		/* OK, try to get exclusive buffer lock */
 		if (!ConditionalLockBufferForCleanup(buffer))
 			return;
@@ -556,7 +585,11 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
 
 			ndeleted = heap_page_prune(relation, buffer, InvalidTransactionId,
 									   vistest, limited_xmin,
-									   limited_ts, &nnewlpdead, NULL);
+									   limited_ts, &nnewlpdead, NULL
+#ifdef USE_PGRAC_CLUSTER
+									   , versioned ? &identity : NULL
+#endif
+									   );
 
 			/*
 			 * Report the number of tuples reclaimed to pgstats.  This is
@@ -621,17 +654,29 @@ heap_page_prune(Relation relation, Buffer buffer,
 				TransactionId old_snap_xmin,
 				TimestampTz old_snap_ts,
 				int *nnewlpdead,
-				OffsetNumber *off_loc)
+				OffsetNumber *off_loc
+#ifdef USE_PGRAC_CLUSTER
+				, const ClusterSpaceIdentity *identity
+#endif
+				)
 {
 	return heap_page_prune_internal(relation, buffer, oldest_xmin, vistest,
-		old_snap_xmin, old_snap_ts, nnewlpdead, off_loc, NULL);
+		old_snap_xmin, old_snap_ts, nnewlpdead, off_loc, NULL
+#ifdef USE_PGRAC_CLUSTER
+		, identity
+#endif
+		);
 }
 
 static int
 heap_page_prune_internal(Relation relation, Buffer buffer,
 						 TransactionId oldest_xmin, GlobalVisState *vistest,
 						 TransactionId old_snap_xmin, TimestampTz old_snap_ts,
-						 int *nnewlpdead, OffsetNumber *off_loc, const bool *proved_dead)
+						 int *nnewlpdead, OffsetNumber *off_loc, const bool *proved_dead
+#ifdef USE_PGRAC_CLUSTER
+						 , const ClusterSpaceIdentity *identity
+#endif
+						 )
 {
 	int			ndeleted = 0;
 	Page		page = BufferGetPage(buffer);
@@ -640,6 +685,12 @@ heap_page_prune_internal(Relation relation, Buffer buffer,
 				maxoff;
 	PruneState	prstate;
 	HeapTupleData tup;
+#ifdef USE_PGRAC_CLUSTER
+	RfPageProducerBatchV1 version_batch;
+	bool		versioned = cluster_shared_config
+		&& relation->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1;
+#endif
 
 	/*
 	 * Our strategy is to scan the page and make lists of items to change,
@@ -772,11 +823,29 @@ heap_page_prune_internal(Relation relation, Buffer buffer,
 	}
 
 	/* Any error while applying the changes is critical */
+#ifdef USE_PGRAC_CLUSTER
+	/* Both logical pruning and a physical hint image need an exact before. */
+	if (versioned && (prstate.nredirected > 0 || prstate.ndead > 0 || prstate.nunused > 0
+		|| ((PageHeader) page)->pd_prune_xid != prstate.new_prune_xid || PageIsFull(page)))
+	{
+		const uint8 block_id = 0;
+
+		if (!RelationNeedsWAL(relation) || identity == NULL
+			|| !RelFileLocatorEquals(identity->key.locator, relation->rd_locator)
+			|| !cluster_space_prepare_buffer_versions(identity, &buffer, &block_id, 1,
+				&version_batch))
+			elog(ERROR, "PGRAC shared heap prune requires exact SPACE identity");
+	}
+#endif
 	START_CRIT_SECTION();
 
 	/* Have we found any prunable items? */
 	if (prstate.nredirected > 0 || prstate.ndead > 0 || prstate.nunused > 0)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_stamp_v1(&version_batch))
+			elog(PANIC, "PGRAC shared heap prune version changed before mutation");
+#endif
 		/*
 		 * Apply the planned item changes, then repair page fragmentation, and
 		 * update the page's hint bit about whether it has free line pointers.
@@ -818,6 +887,10 @@ heap_page_prune_internal(Relation relation, Buffer buffer,
 			XLogRegisterData((char *) &xlrec, SizeOfHeapPrune);
 
 			XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+#ifdef USE_PGRAC_CLUSTER
+			if (versioned && !rf_page_producer_register_wal_v1(&version_batch))
+				elog(PANIC, "PGRAC shared heap prune cannot register page version");
+#endif
 
 			/*
 			 * The OffsetNumber arrays are not actually in the buffer, but we
@@ -847,7 +920,8 @@ heap_page_prune_internal(Relation relation, Buffer buffer,
 		/*
 		 * If we didn't prune anything, but have found a new value for the
 		 * pd_prune_xid field, update it and mark the buffer dirty. This is
-		 * treated as a non-WAL-logged hint.
+		 * normally treated as a non-WAL-logged hint. Shared permanent pages
+		 * publish the physical hint image with their exact page version.
 		 *
 		 * Also clear the "page is full" flag if it is set, since there's no
 		 * point in repeating the prune/defrag process until something else
@@ -856,8 +930,27 @@ heap_page_prune_internal(Relation relation, Buffer buffer,
 		if (((PageHeader) page)->pd_prune_xid != prstate.new_prune_xid ||
 			PageIsFull(page))
 		{
+#ifdef USE_PGRAC_CLUSTER
+			if (versioned && !rf_page_producer_stamp_v1(&version_batch))
+				elog(PANIC, "PGRAC shared heap prune hint version changed before mutation");
+#endif
 			((PageHeader) page)->pd_prune_xid = prstate.new_prune_xid;
 			PageClearFull(page);
+#ifdef USE_PGRAC_CLUSTER
+			if (versioned)
+			{
+				XLogRecPtr recptr;
+
+				MarkBufferDirty(buffer);
+				XLogBeginInsert();
+				XLogRegisterBuffer(0, buffer, REGBUF_STANDARD | REGBUF_FORCE_IMAGE);
+				if (!rf_page_producer_register_wal_v1(&version_batch))
+					elog(PANIC, "PGRAC shared heap prune hint cannot register page version");
+				recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI_FOR_HINT);
+				PageSetLSN(page, recptr);
+			}
+			else
+#endif
 			MarkBufferDirtyHint(buffer, true);
 		}
 	}

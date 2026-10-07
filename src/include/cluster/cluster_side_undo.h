@@ -43,7 +43,8 @@
 #include "access/xlogreader.h"
 #include "cluster/cluster_scn.h"	  /* SCN */
 #include "cluster/cluster_itl_slot.h" /* UBA */
-#include "storage/itemptr.h"		  /* TransactionId */
+#include "cluster/cluster_tt_slot.h"
+#include "storage/itemptr.h" /* TransactionId */
 
 typedef enum ClusterUndoDecodedKind {
 	CLUSTER_UNDO_KIND_SEGMENT_INIT = 0,
@@ -119,6 +120,38 @@ extern bool cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out
  */
 extern bool cluster_undo_preflight(const ClusterUndoDecoded *decoded);
 
+/* Prepare one typed data block from owned immutable payload. Caller proves
+ * source/target generation, isolation and durability; this is not authority.
+ * Delta needs a nonzero-LSN base. No output change on refusal; base may equal
+ * out. The returned block still requires the caller's write/fsync/post-read. */
+extern bool cluster_undo_prepare_block_v1(const ClusterUndoDecoded *decoded, const uint8 *payload,
+										  Size payload_length, XLogRecPtr replay_end,
+										  const char *base, char *out);
+
+typedef enum ClusterUndoHeaderPrepareResultV1 {
+	CLUSTER_UNDO_HEADER_BLOCKED = 0,
+	CLUSTER_UNDO_HEADER_APPLY,
+	CLUSTER_UNDO_HEADER_SKIP_STALE,
+	CLUSTER_UNDO_HEADER_ALREADY
+} ClusterUndoHeaderPrepareResultV1;
+
+/* Native lifecycle/TT preparation, not recovery authority. INIT/REUSE validate
+ * header identity, allocated state and generation; RECYCLE needs a valid base.
+ * Native generation decisions are preserved, including REUSE's torn-header
+ * repair. TT records use the existing exact generation/slot transition tables
+ * and preserve all unrelated header bytes. Only APPLY changes out; base and
+ * out may alias. ALREADY is a byte-identical TT result, not a stale generation. */
+extern ClusterUndoHeaderPrepareResultV1
+cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *payload,
+							   Size payload_length, const char *base, char *out);
+
+/* The ordinary XACT COMMIT's folded exact TT delta uses the same native
+ * generation/terminal decision. Only APPLY changes out. */
+extern ClusterUndoHeaderPrepareResultV1
+cluster_undo_prepare_commit_v1(uint8 instance, uint32 segment_id, uint32 generation,
+							   uint16 slot_offset, uint16 wrap, TransactionId xid, SCN commit_scn,
+							   const char *base, char *out);
+
 typedef enum ClusterUndoApplyResultV1 {
 	CLUSTER_UNDO_APPLY_OK = 0,
 	CLUSTER_UNDO_APPLY_BLOCKED = 1,
@@ -130,6 +163,10 @@ typedef enum ClusterUndoTargetPreflightV1 {
 	CLUSTER_UNDO_TARGET_PROVED_NOOP = 1,
 	CLUSTER_UNDO_TARGET_BLOCKED = 2
 } ClusterUndoTargetPreflightV1;
+
+/* The legacy terminal/set-head admission shared by virtual and durable slots. */
+extern ClusterUndoTargetPreflightV1
+cluster_undo_preflight_legacy_slot_v1(const ClusterUndoDecoded *decoded, const TTSlot *slot);
 
 /* Classify the exact durable TT target without mutating it. */
 extern ClusterUndoTargetPreflightV1

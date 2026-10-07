@@ -36,6 +36,17 @@ typedef struct RfPageOnlineTargetV1 {
 	PGAlignedBlock canonical;
 } RfPageOnlineTargetV1;
 
+typedef struct RfPageQueuedRecordV1 {
+	struct RfPageQueuedRecordV1 *next;
+	RfDetachedRecordPlanV1 plan;
+	RfPageOnlineRecordIdentityV1 identity;
+	XLogReaderState reader;
+	bool applied;
+	/* RestoreBlockImage reports errors through the reader's 1000-byte
+	 * diagnostic boundary; it never owns this allocation. */
+	char error[1024];
+} RfPageQueuedRecordV1;
+
 struct RfPageOnlinePlanV1 {
 	uint32 magic;
 	bool sealed;
@@ -49,9 +60,16 @@ struct RfPageOnlinePlanV1 {
 	Size memory_used;
 	uint64 retention_binding_cookie;
 	RfContributorStreamCutV1 *physical_cuts;
+	XLogRecPtr *redo_starts;
+	ClusterWalSourceRef *sources;
 	XLogRecPtr *last_record_end;
 	bool *participant_seen;
 	RfPageOnlineTargetV1 **targets;
+	RfPageQueuedRecordV1 *queue_head;
+	RfPageQueuedRecordV1 *queue_tail;
+	uint32 queued_count;
+	bool queue_failed;
+	bool ordered_feed_started;
 };
 
 typedef struct RfPageOnlinePendingV1 {
@@ -146,6 +164,7 @@ target_create(RfPageOnlinePlanV1 *plan, const RfPageIdentityV1 *identity)
 		return NULL;
 	}
 	target->view.page_identity = *identity;
+	target->view.history_only = true;
 	for (i = 0; i < plan->participant_count; i++) {
 		target->cuts[i] = plan->physical_cuts[i];
 		target->cuts[i].flags = RF_CONTRIBUTOR_CUT_COMPLETE | RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY;
@@ -286,8 +305,9 @@ record_identity_validate(RfPageOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 
 		|| identity->participant_index >= plan->participant_count
 		|| record->system_identifier != plan->system_identifier
 		|| memcmp(record->storage_uuid, plan->storage_uuid, 16) != 0 || record->origin_thread == 0
-		|| record->timeline_id == 0 || record->read_rec_ptr == InvalidXLogRecPtr
-		|| record->end_rec_ptr == InvalidXLogRecPtr || record->read_rec_ptr >= record->end_rec_ptr
+		|| record->origin_thread > PGRAC_PAGE_LSN_ORIGIN_MAX + 1 || record->timeline_id == 0
+		|| record->read_rec_ptr == InvalidXLogRecPtr || record->end_rec_ptr == InvalidXLogRecPtr
+		|| record->read_rec_ptr >= record->end_rec_ptr
 		|| reader->system_identifier != record->system_identifier
 		|| reader->ReadRecPtr != record->read_rec_ptr || reader->EndRecPtr != record->end_rec_ptr
 		|| decoded->lsn != record->read_rec_ptr || decoded->next_lsn != record->end_rec_ptr
@@ -300,10 +320,67 @@ record_identity_validate(RfPageOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 
 	if ((cut->flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0
 		|| record->read_rec_ptr < cut->scan_begin_inclusive
 		|| record->end_rec_ptr > cut->scan_end_exclusive
+		|| (record->read_rec_ptr < plan->redo_starts[identity->participant_index]
+			&& record->end_rec_ptr > plan->redo_starts[identity->participant_index])
 		|| (plan->participant_seen[identity->participant_index]
 			&& record->read_rec_ptr < plan->last_record_end[identity->participant_index]))
 		return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+bool
+rf_page_online_plan_bind_sources_v1(RfPageOnlinePlanV1 *plan, const ClusterWalSourceRef *sources,
+									uint32 participant_count)
+{
+	Size bytes;
+	ClusterWalSourceRef *bound;
+
+	if (plan == NULL || plan->magic != RF_PAGE_ONLINE_PLAN_MAGIC || plan->sealed
+		|| plan->queue_failed || plan->sources != NULL || sources == NULL
+		|| participant_count != plan->participant_count || participant_count == 0
+		|| participant_count > RF_PAGE_STABLE_MAX_PARTICIPANTS || plan->queue_head != NULL
+		|| plan->queued_count != 0 || plan->ordered_feed_started || plan->target_count != 0)
+		return false;
+	for (uint32 i = 0; i < participant_count; i++) {
+		const ClusterWalThreadClaimRefV2 *claim = &sources[i].claim;
+		const ClusterControlRootIdentity *id = &claim->identity;
+		const RfContributorStreamCutV1 *cut = &plan->physical_cuts[i];
+
+		if (plan->participant_seen[i] || id->system_identifier != plan->system_identifier
+			|| memcmp(id->storage_uuid, plan->storage_uuid, 16) != 0
+			|| id->origin_thread_id != cut->failed_thread
+			|| cut->origin_owner_incarnation != id->origin_owner_incarnation
+			|| id->origin_thread_id > PGRAC_PAGE_LSN_ORIGIN_MAX + 1
+			|| id->origin_node_id != (int32)id->origin_thread_id - 1 || id->reserved42 != 0
+			|| id->reserved60 != 0 || id->thread_claim_created_at <= 0
+			|| id->origin_owner_incarnation == 0 || id->root_lineage_seq == 0
+			|| !bytes_nonzero(id->authority_uuid, 16) || claim->database_incarnation == 0
+			|| claim->database_incarnation != sources[0].claim.database_incarnation
+			|| claim->max_config_generation == 0 || !bytes_nonzero(claim->claim_sha256, 32)
+			|| sources[i].timeline != cut->timeline_id)
+			return false;
+	}
+	bytes = (Size)participant_count * sizeof(*bound);
+	if (bytes > plan->memory_budget || plan->memory_used > plan->memory_budget - bytes)
+		return false;
+	bound = (ClusterWalSourceRef *)online_alloc0(bytes);
+	if (bound == NULL)
+		return false;
+	memcpy(bound, sources, bytes);
+	plan->sources = bound;
+	plan->memory_used += bytes;
+	return true;
+}
+
+bool
+rf_page_online_plan_source_v1(const RfPageOnlinePlanV1 *plan, uint32 participant_index,
+							  ClusterWalSourceRef *out)
+{
+	if (plan == NULL || plan->magic != RF_PAGE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| plan->sources == NULL || participant_index >= plan->participant_count || out == NULL)
+		return false;
+	*out = plan->sources[participant_index];
+	return true;
 }
 
 RfPageProofDetailV1
@@ -332,16 +409,27 @@ rf_page_online_plan_create_v1(const RfPageOnlinePlanRequestV1 *request,
 		bool empty = (cut->flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0;
 
 		if (cut->failed_thread == 0 || cut->timeline_id == 0
+			|| cut->origin_owner_incarnation == UINT64_MAX
 			|| (cut->flags & RF_CONTRIBUTOR_CUT_COMPLETE) == 0
 			|| (cut->flags & ~RF_CONTRIBUTOR_CUT_KNOWN_MASK) != 0
 			|| (empty && cut->scan_begin_inclusive != cut->scan_end_exclusive)
 			|| (!empty && cut->scan_begin_inclusive >= cut->scan_end_exclusive)
-			|| (i > 0 && request->physical_cuts[i - 1].failed_thread >= cut->failed_thread))
+			|| (i > 0
+				&& (!rf_contributor_cut_precedes_v1(&request->physical_cuts[i - 1], cut)
+					|| (request->physical_cuts[i - 1].failed_thread == cut->failed_thread
+						&& (cut->origin_owner_incarnation == 0
+							|| request->physical_cuts[i - 1].origin_owner_incarnation
+								   == cut->origin_owner_incarnation)))))
 			return RF_PAGE_PROOF_DETAIL_PARTICIPANT_MISSING;
+		if (request->redo_starts != NULL
+			&& (request->redo_starts[i] < cut->scan_begin_inclusive
+				|| request->redo_starts[i] > cut->scan_end_exclusive))
+			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
 	}
 	arrays_size = (Size)request->participant_count
 				  * (sizeof(*plan->physical_cuts) + sizeof(*plan->last_record_end)
 					 + sizeof(*plan->participant_seen));
+	arrays_size += (Size)request->participant_count * sizeof(*plan->redo_starts);
 	if (sizeof(*plan) > budget - Min(budget, arrays_size))
 		return RF_PAGE_PROOF_DETAIL_CAPACITY;
 	plan = (RfPageOnlinePlanV1 *)online_alloc0(sizeof(*plan));
@@ -357,15 +445,21 @@ rf_page_online_plan_create_v1(const RfPageOnlinePlanRequestV1 *request,
 																	* sizeof(*plan->physical_cuts));
 	plan->last_record_end = (XLogRecPtr *)online_alloc0((Size)request->participant_count
 														* sizeof(*plan->last_record_end));
+	plan->redo_starts = (XLogRecPtr *)online_alloc0((Size)request->participant_count
+													* sizeof(*plan->redo_starts));
 	plan->participant_seen
 		= (bool *)online_alloc0((Size)request->participant_count * sizeof(*plan->participant_seen));
 	if (plan->physical_cuts == NULL || plan->last_record_end == NULL
-		|| plan->participant_seen == NULL) {
+		|| plan->participant_seen == NULL || plan->redo_starts == NULL) {
 		rf_page_online_plan_destroy_v1(&plan);
 		return RF_PAGE_PROOF_DETAIL_OOM;
 	}
 	memcpy(plan->physical_cuts, request->physical_cuts,
 		   (Size)request->participant_count * sizeof(*plan->physical_cuts));
+	for (i = 0; i < request->participant_count; i++)
+		plan->redo_starts[i] = request->redo_starts != NULL
+								   ? request->redo_starts[i]
+								   : request->physical_cuts[i].scan_begin_inclusive;
 	plan->magic = RF_PAGE_ONLINE_PLAN_MAGIC;
 	plan->system_identifier = request->system_identifier;
 	memcpy(plan->storage_uuid, request->storage_uuid, 16);
@@ -375,10 +469,9 @@ rf_page_online_plan_create_v1(const RfPageOnlinePlanRequestV1 *request,
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
-RfPageProofDetailV1
-rf_page_online_plan_feed_record_v1(RfPageOnlinePlanV1 *plan,
-								   const RfDetachedRecordPlanV1 *record_plan,
-								   const RfPageOnlineRecordIdentityV1 *identity)
+static RfPageProofDetailV1
+apply_ordered_record(RfPageOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *record_plan,
+					 const RfPageOnlineRecordIdentityV1 *identity)
 {
 	RfPageOnlinePendingV1 *pending;
 	uint32 page_count = 0;
@@ -462,6 +555,26 @@ rf_page_online_plan_feed_record_v1(RfPageOnlinePlanV1 *plan,
 			}
 			old_page = item->target->canonical.data;
 		}
+		/* A closed contribution chain can never revisit a version. An
+		 * image does not make such an alias safe for later DATA receipts. */
+		if (rf_page_version_equal_v1(&component->before, &component->result)
+			|| (!item->new_target
+				&& rf_page_version_equal_v1(&item->target->view.expected_before,
+											&component->result))) {
+			detail = RF_PAGE_PROOF_DETAIL_EDGE_CYCLE;
+			goto fail;
+		}
+		for (j = 0; j < item->target->edge_count; j++) {
+			const RfPageStableEdgeInputV1 *previous = &item->target->edges[j];
+
+			if (previous->result_token == component->result.mutation_token
+				&& memcmp(previous->edge.result_incarnation, component->result.segment_incarnation,
+						  16)
+					   == 0) {
+				detail = RF_PAGE_PROOF_DETAIL_EDGE_CYCLE;
+				goto fail;
+			}
+		}
 		detail = rf_page_detached_apply_v1(record_plan, i, old_page, item->canonical.data);
 		if (detail != RF_PAGE_PROOF_DETAIL_OK)
 			goto fail;
@@ -469,6 +582,13 @@ rf_page_online_plan_feed_record_v1(RfPageOnlinePlanV1 *plan,
 			|| ((PageHeader)item->canonical.data)->pd_block_scn
 				   != component->result.mutation_token) {
 			detail = RF_PAGE_PROOF_DETAIL_IMAGE_INTEGRITY_FAILED;
+			goto fail;
+		}
+		/* Detached PG redo may run in a merged window and stamp the local
+		 * process's coordinate. Canonical bytes retain their exact source. */
+		PageSetLSNPreserveOrigin(item->canonical.data, identity->record.end_rec_ptr);
+		if (!PageSetLSNOrigin(item->canonical.data, identity->record.origin_thread - 1)) {
+			detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 			goto fail;
 		}
 		item->edge.page_identity = page_identity;
@@ -515,6 +635,8 @@ rf_page_online_plan_feed_record_v1(RfPageOnlinePlanV1 *plan,
 			item->new_target = false;
 		}
 		target->edges[target->edge_count++] = item->edge;
+		if (identity->record.end_rec_ptr > plan->redo_starts[identity->participant_index])
+			target->view.history_only = false;
 		target->view.expected_result.segment_incarnation[0] = 0;
 		memcpy(target->view.expected_result.segment_incarnation, item->edge.edge.result_incarnation,
 			   16);
@@ -544,12 +666,311 @@ fail:
 }
 
 RfPageProofDetailV1
+rf_page_online_plan_feed_record_v1(RfPageOnlinePlanV1 *plan,
+								   const RfDetachedRecordPlanV1 *record_plan,
+								   const RfPageOnlineRecordIdentityV1 *identity)
+{
+	RfPageProofDetailV1 detail;
+
+	if (plan == NULL || plan->queue_head != NULL || plan->queue_failed)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	detail = apply_ordered_record(plan, record_plan, identity);
+	if (detail == RF_PAGE_PROOF_DETAIL_OK)
+		plan->ordered_feed_started = true;
+	return detail;
+}
+
+static char *
+copy_record_bytes(char **next, const char *source, Size length)
+{
+	char *result;
+
+	if (length == 0)
+		return NULL;
+	result = *next;
+	memcpy(result, source, length);
+	*next += MAXALIGN(length);
+	return result;
+}
+
+RfPageProofDetailV1
+rf_page_online_plan_queue_record_v1(RfPageOnlinePlanV1 *plan,
+									const RfDetachedRecordPlanV1 *record_plan,
+									const RfPageOnlineRecordIdentityV1 *identity)
+{
+	const DecodedXLogRecord *source;
+	DecodedXLogRecord *decoded;
+	RfPageQueuedRecordV1 *queued;
+	RfPageProofDetailV1 detail;
+	Size fixed_bytes;
+	Size bytes;
+	char *next;
+	int i;
+
+	if (plan == NULL || plan->magic != RF_PAGE_ONLINE_PLAN_MAGIC || plan->sealed
+		|| plan->queue_failed || plan->ordered_feed_started
+		|| plan->queued_count >= RF_PAGE_STABLE_MAX_EDGES)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	detail = record_identity_validate(plan, record_plan, identity);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		return detail;
+	source = record_plan->source_record->record;
+	if (source->max_block_id < -1 || source->max_block_id > XLR_MAX_BLOCK_ID
+		|| record_plan->component_count > RF_PAGE_STABLE_MAX_COMPONENTS
+		|| source->main_data_len > plan->memory_budget
+		|| (source->main_data_len != 0 && source->main_data == NULL))
+		return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+	for (i = 0; i < (int)record_plan->component_count; i++) {
+		const RfDetachedComponentPlanV1 *component = &record_plan->components[i];
+
+		if (component->block_id > source->max_block_id
+			|| !source->blocks[component->block_id].in_use
+			|| (component->owner != RF_DETACHED_COMPONENT_PAGE_CODEC
+				&& component->owner != RF_DETACHED_COMPONENT_REBUILDABLE
+				&& component->owner != RF_DETACHED_COMPONENT_SIDE_TYPED))
+			return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+	}
+	fixed_bytes
+		= MAXALIGN(sizeof(*queued))
+		  + MAXALIGN(sizeof(*decoded) + (Size)(source->max_block_id + 1) * sizeof(DecodedBkpBlock));
+	bytes = fixed_bytes + MAXALIGN((Size)source->main_data_len);
+	for (i = 0; i <= source->max_block_id; i++) {
+		const DecodedBkpBlock *block = &source->blocks[i];
+
+		if (!block->in_use)
+			continue;
+		if ((block->has_data && block->data_len != 0 && block->data == NULL)
+			|| (block->has_image && block->bimg_len != 0 && block->bkp_image == NULL))
+			return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
+		if (block->has_data)
+			bytes += MAXALIGN((Size)block->data_len);
+		if (block->has_image)
+			bytes += MAXALIGN((Size)block->bimg_len);
+	}
+	if (!plan_reserve(plan, bytes))
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	queued = (RfPageQueuedRecordV1 *)online_alloc0(bytes);
+	if (queued == NULL) {
+		plan->memory_used -= bytes;
+		return RF_PAGE_PROOF_DETAIL_OOM;
+	}
+	decoded = (DecodedXLogRecord *)((char *)queued + MAXALIGN(sizeof(*queued)));
+	memcpy(decoded, source,
+		   sizeof(*decoded) + (Size)(source->max_block_id + 1) * sizeof(DecodedBkpBlock));
+	decoded->next = NULL;
+	decoded->oversized = false;
+	decoded->size = bytes - MAXALIGN(sizeof(*queued));
+	next = (char *)queued + fixed_bytes;
+	decoded->main_data = copy_record_bytes(&next, source->main_data, source->main_data_len);
+	for (i = 0; i <= source->max_block_id; i++) {
+		DecodedBkpBlock *block = &decoded->blocks[i];
+
+		block->prefetch_buffer = InvalidBuffer;
+		block->data = block->bkp_image = NULL;
+		if (!block->in_use) {
+			memset(block, 0, sizeof(*block));
+			continue;
+		}
+		/* Native decode storage is reused; absent payload fields need not
+		 * be initialized. Never read an absent pointer or carry it forward. */
+		if (block->has_data) {
+			block->data = copy_record_bytes(&next, source->blocks[i].data, block->data_len);
+			block->data_bufsz = block->data_len;
+		} else
+			block->data_len = block->data_bufsz = 0;
+		if (block->has_image)
+			block->bkp_image
+				= copy_record_bytes(&next, source->blocks[i].bkp_image, block->bimg_len);
+		else {
+			block->apply_image = false;
+			block->bimg_len = block->hole_offset = block->hole_length = 0;
+			block->bimg_info = 0;
+		}
+	}
+	queued->reader.system_identifier = record_plan->source_record->system_identifier;
+	queued->reader.ReadRecPtr = record_plan->source_record->ReadRecPtr;
+	queued->reader.EndRecPtr = record_plan->source_record->EndRecPtr;
+	queued->reader.record = decoded;
+	queued->reader.errormsg_buf = queued->error;
+	queued->plan = *record_plan;
+	queued->plan.source_record = &queued->reader;
+	queued->identity = *identity;
+	if (plan->queue_tail == NULL)
+		plan->queue_head = queued;
+	else
+		plan->queue_tail->next = queued;
+	plan->queue_tail = queued;
+	plan->queued_count++;
+	plan->participant_seen[identity->participant_index] = true;
+	plan->last_record_end[identity->participant_index] = identity->record.end_rec_ptr;
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+static bool
+same_block(const DecodedBkpBlock *left, const DecodedBkpBlock *right)
+{
+	return RelFileLocatorEquals(left->rlocator, right->rlocator) && left->forknum == right->forknum
+		   && left->blkno == right->blkno;
+}
+
+static bool
+queued_predecessor_exists(const RfPageOnlinePlanV1 *plan, const DecodedBkpBlock *block,
+						  const RfPageVersionV1 *before)
+{
+	const RfPageQueuedRecordV1 *record;
+	uint32 i;
+
+	for (record = plan->queue_head; record != NULL; record = record->next)
+		for (i = 0; i < record->plan.component_count; i++) {
+			const RfDetachedComponentPlanV1 *component = &record->plan.components[i];
+
+			if (component->owner == RF_DETACHED_COMPONENT_PAGE_CODEC
+				&& rf_page_version_equal_v1(&component->result, before)
+				&& same_block(block, &record->reader.record->blocks[component->block_id]))
+				return true;
+		}
+	return false;
+}
+
+/* No arrival/SCN/foreign LSN order is a PageVersion dependency. Full images
+ * wait too when their predecessor belongs to the closed input. */
+static bool
+queued_record_ready(const RfPageOnlinePlanV1 *plan, const RfPageQueuedRecordV1 *record,
+					RfPageProofDetailV1 *blocked)
+{
+	const RfPageQueuedRecordV1 *prior;
+	uint32 i;
+
+	for (prior = plan->queue_head; prior != record; prior = prior->next)
+		if (!prior->applied
+			&& prior->identity.participant_index == record->identity.participant_index)
+			return false;
+	for (i = 0; i < record->plan.component_count; i++) {
+		const RfDetachedComponentPlanV1 *component = &record->plan.components[i];
+		const DecodedBkpBlock *block;
+		RfPageIdentityV1 identity = { 0 };
+		RfPageOnlineTargetV1 *target;
+
+		if (component->owner != RF_DETACHED_COMPONENT_PAGE_CODEC)
+			continue;
+		block = &record->reader.record->blocks[component->block_id];
+		identity.system_identifier = plan->system_identifier;
+		memcpy(identity.storage_uuid, plan->storage_uuid, 16);
+		identity.locator = block->rlocator;
+		identity.forknum = block->forknum;
+		identity.blockno = block->blkno;
+		target = find_target(plan, &identity);
+		if (target != NULL) {
+			if (component->before_kind != RF_PAGE_STATE_PRESENT
+				|| !rf_page_version_equal_v1(&target->view.expected_result, &component->before))
+				return false;
+		} else {
+			if (component->before_kind == RF_PAGE_STATE_PRESENT
+				&& queued_predecessor_exists(plan, block, &component->before))
+				return false;
+			if (!anchor_flags(component->edge_flags)) {
+				*blocked = RF_PAGE_PROOF_DETAIL_ANCHOR_MISSING;
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+static RfPageProofDetailV1
+drain_queued_records(RfPageOnlinePlanV1 *plan)
+{
+	uint32 remaining = plan->queued_count;
+	uint32 i;
+
+	/* The complete physical cuts are verified before resetting arrival
+	 * counters to track application in participant-local order. */
+	for (i = 0; i < plan->participant_count; i++) {
+		bool empty = (plan->physical_cuts[i].flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0;
+
+		if (empty != !plan->participant_seen[i]
+			|| (!empty && plan->last_record_end[i] != plan->physical_cuts[i].scan_end_exclusive))
+			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+	}
+	/* The closed input, not arrival order, decides which retained history
+	 * needs a DATA base. Keep every ancestor/successor of an active page
+	 * incarnation; a completed generation at a reused address is unrelated.
+	 * An unrelated completed page may have only a delta in this retained
+	 * interval; it must not become a new reconstruction or write duty. */
+	for (RfPageQueuedRecordV1 *record = plan->queue_head; record != NULL; record = record->next) {
+		uint32 kept = 0;
+		if (record->identity.record.end_rec_ptr
+			> plan->redo_starts[record->identity.participant_index])
+			continue;
+		for (uint32 c = 0; c < record->plan.component_count; c++) {
+			const RfDetachedComponentPlanV1 *component = &record->plan.components[c];
+			bool needed = component->owner != RF_DETACHED_COMPONENT_PAGE_CODEC;
+			for (const RfPageQueuedRecordV1 *active = plan->queue_head; !needed && active != NULL;
+				 active = active->next) {
+				if (active->identity.record.end_rec_ptr
+					<= plan->redo_starts[active->identity.participant_index])
+					continue;
+				for (uint32 a = 0; a < active->plan.component_count; a++) {
+					const RfDetachedComponentPlanV1 *other = &active->plan.components[a];
+					if (other->owner == RF_DETACHED_COMPONENT_PAGE_CODEC
+						&& memcmp(component->result.segment_incarnation,
+								  other->result.segment_incarnation, 16)
+							   == 0
+						&& same_block(&record->reader.record->blocks[component->block_id],
+									  &active->reader.record->blocks[other->block_id])) {
+						needed = true;
+						break;
+					}
+				}
+			}
+			if (needed)
+				record->plan.components[kept++] = *component;
+		}
+		record->plan.component_count = kept;
+	}
+	memset(plan->participant_seen, 0, plan->participant_count * sizeof(*plan->participant_seen));
+	memset(plan->last_record_end, 0, plan->participant_count * sizeof(*plan->last_record_end));
+	while (remaining != 0) {
+		RfPageQueuedRecordV1 *record;
+		bool progress = false;
+		RfPageProofDetailV1 blocked = RF_PAGE_PROOF_DETAIL_EDGE_GAP;
+
+		for (record = plan->queue_head; record != NULL; record = record->next) {
+			RfPageProofDetailV1 detail;
+
+			if (record->applied || !queued_record_ready(plan, record, &blocked))
+				continue;
+			detail = apply_ordered_record(plan, &record->plan, &record->identity);
+			if (detail != RF_PAGE_PROOF_DETAIL_OK) {
+				plan->queue_failed = true;
+				return detail;
+			}
+			record->applied = true;
+			remaining--;
+			progress = true;
+		}
+		if (!progress) {
+			plan->queue_failed = true;
+			return blocked;
+		}
+	}
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+RfPageProofDetailV1
 rf_page_online_plan_seal_v1(RfPageOnlinePlanV1 *plan)
 {
 	uint32 i;
 
-	if (plan == NULL || plan->magic != RF_PAGE_ONLINE_PLAN_MAGIC || plan->sealed)
+	if (plan == NULL || plan->magic != RF_PAGE_ONLINE_PLAN_MAGIC || plan->sealed
+		|| plan->queue_failed)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (plan->queue_head != NULL) {
+		RfPageProofDetailV1 detail = drain_queued_records(plan);
+
+		if (detail != RF_PAGE_PROOF_DETAIL_OK)
+			return detail;
+	}
 	for (i = 0; i < plan->participant_count; i++) {
 		bool empty = (plan->physical_cuts[i].flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0;
 
@@ -608,6 +1029,141 @@ rf_page_online_plan_target_v1(const RfPageOnlinePlanV1 *plan, uint32 index,
 	return true;
 }
 
+bool
+rf_page_online_plan_page_prefix_v1(const RfPageOnlinePlanV1 *plan,
+								   const RfPageDataCoverageV1 *coverage, uint32 coverage_count,
+								   RfPageContributionPrefixV1 *prefixes, uint32 participant_count)
+{
+	RfPageContributionPrefixV1 candidate[RF_PAGE_STABLE_MAX_PARTICIPANTS] = { { 0 } };
+	uint32 next_coverage = 0;
+
+	if (plan == NULL || plan->magic != RF_PAGE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| prefixes == NULL || participant_count != plan->participant_count
+		|| participant_count == 0 || participant_count > RF_PAGE_STABLE_MAX_PARTICIPANTS
+		|| coverage_count > plan->target_count || (coverage_count != 0 && coverage == NULL))
+		return false;
+	for (uint32 i = 0; i < coverage_count; i++)
+		if (!rf_page_identity_valid_v1(&coverage[i].page_identity)
+			|| !rf_page_version_present_v1(&coverage[i].version)
+			|| (i > 0
+				&& identity_compare(&coverage[i - 1].page_identity, &coverage[i].page_identity)
+					   >= 0))
+			return false;
+	for (uint32 i = 0; i < participant_count; i++) {
+		candidate[i].origin_thread = plan->physical_cuts[i].failed_thread;
+		candidate[i].timeline = plan->physical_cuts[i].timeline_id;
+		candidate[i].first_uncovered_lsn = plan->physical_cuts[i].scan_end_exclusive;
+		candidate[i].origin_owner_incarnation = plan->physical_cuts[i].origin_owner_incarnation;
+	}
+	for (uint32 i = 0; i < plan->target_count; i++) {
+		const RfPageOnlineTargetV1 *target = plan->targets[i];
+		uint32 covered_edges = 0;
+
+		if (next_coverage < coverage_count) {
+			const RfPageDataCoverageV1 *observed = &coverage[next_coverage];
+			int cmp = identity_compare(&observed->page_identity, &target->view.page_identity);
+
+			if (cmp < 0)
+				return false; /* Completion for an object outside this closed input. */
+			if (cmp == 0) {
+				bool found = target->view.before_kind == RF_PAGE_STATE_PRESENT
+							 && rf_page_version_equal_v1(&observed->version,
+														 &target->view.expected_before);
+
+				for (uint32 j = 0; j < target->edge_count; j++) {
+					const RfPageStableEdgeInputV1 *edge = &target->edges[j];
+
+					if (observed->version.mutation_token == edge->result_token
+						&& memcmp(observed->version.segment_incarnation,
+								  edge->edge.result_incarnation, 16)
+							   == 0) {
+						if (found)
+							return false;
+						found = true;
+						covered_edges = j + 1;
+					}
+				}
+				if (!found)
+					return false;
+				next_coverage++;
+			}
+		}
+		/* Keep the first unresolved record in each ORIGINAL stream. Taking
+		 * the max acknowledged LSN would jump over another page's hole or
+		 * an uncompleted component of the very same multi-page record. */
+		for (uint32 j = covered_edges; j < target->edge_count; j++) {
+			const RfPageStableEdgeInputV1 *edge = &target->edges[j];
+			RfPageContributionPrefixV1 *prefix = &candidate[edge->participant_index];
+
+			prefix->first_uncovered_lsn
+				= Min(prefix->first_uncovered_lsn, edge->record_identity.read_rec_ptr);
+		}
+	}
+	if (next_coverage != coverage_count)
+		return false;
+	memcpy(prefixes, candidate, participant_count * sizeof(*prefixes));
+	return true;
+}
+
+bool
+rf_page_online_plan_dependency_prefix_v1(const RfPageOnlinePlanV1 *plan,
+										 const RfPageContributionPrefixV1 *checkpoints,
+										 uint32 participant_count,
+										 RfPageContributionPrefixV1 *retained)
+{
+	RfPageContributionPrefixV1 candidate[RF_PAGE_STABLE_MAX_PARTICIPANTS] = { { 0 } };
+
+	if (plan == NULL || plan->magic != RF_PAGE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| checkpoints == NULL || retained == NULL || participant_count != plan->participant_count
+		|| participant_count == 0 || participant_count > RF_PAGE_STABLE_MAX_PARTICIPANTS)
+		return false;
+	for (uint32 i = 0; i < participant_count; i++) {
+		const RfContributorStreamCutV1 *cut = &plan->physical_cuts[i];
+		const RfPageContributionPrefixV1 *checkpoint = &checkpoints[i];
+
+		if (checkpoint->origin_thread != cut->failed_thread
+			|| checkpoint->origin_owner_incarnation != cut->origin_owner_incarnation
+			|| checkpoint->timeline != cut->timeline_id || checkpoint->reserved_zero != 0
+			|| checkpoint->first_uncovered_lsn < cut->scan_begin_inclusive
+			|| checkpoint->first_uncovered_lsn > cut->scan_end_exclusive)
+			return false;
+		candidate[i] = *checkpoint;
+	}
+	for (uint32 i = 0; i < plan->target_count; i++) {
+		const RfPageOnlineTargetV1 *target = plan->targets[i];
+		bool needed = false;
+
+		for (uint32 j = 0; j < target->edge_count; j++) {
+			const RfPageStableEdgeInputV1 *edge = &target->edges[j];
+			XLogRecPtr checkpoint;
+
+			if (edge->participant_index >= participant_count)
+				return false;
+			checkpoint = checkpoints[edge->participant_index].first_uncovered_lsn;
+			if (checkpoint > edge->record_identity.read_rec_ptr
+				&& checkpoint < edge->record_identity.end_rec_ptr)
+				return false;
+			if (checkpoint < edge->record_identity.end_rec_ptr)
+				needed = true;
+		}
+		if (!needed)
+			continue;
+		/* Keep both ancestors needed to reconstruct a base and successors
+		 * needed to prove that a later DATA version covers this obligation.
+		 * Use the original checkpoint inputs above, never candidate: retained
+		 * history is not a newly uncovered obligation on another page. */
+		for (uint32 j = 0; j < target->edge_count; j++) {
+			const RfPageStableEdgeInputV1 *edge = &target->edges[j];
+			RfPageContributionPrefixV1 *prefix = &candidate[edge->participant_index];
+
+			prefix->first_uncovered_lsn
+				= Min(prefix->first_uncovered_lsn, edge->record_identity.read_rec_ptr);
+		}
+	}
+	memcpy(retained, candidate, participant_count * sizeof(*retained));
+	return true;
+}
+
 void
 rf_page_online_plan_destroy_v1(RfPageOnlinePlanV1 **plan_pointer)
 {
@@ -616,6 +1172,12 @@ rf_page_online_plan_destroy_v1(RfPageOnlinePlanV1 **plan_pointer)
 	if (plan_pointer == NULL || *plan_pointer == NULL)
 		return;
 	plan = *plan_pointer;
+	while (plan->queue_head != NULL) {
+		RfPageQueuedRecordV1 *record = plan->queue_head;
+
+		plan->queue_head = record->next;
+		online_free(record);
+	}
 	if (plan->magic == RF_PAGE_ONLINE_PLAN_MAGIC) {
 		uint32 i;
 
@@ -628,8 +1190,12 @@ rf_page_online_plan_destroy_v1(RfPageOnlinePlanV1 **plan_pointer)
 		online_free(plan->participant_seen);
 	if (plan->last_record_end != NULL)
 		online_free(plan->last_record_end);
+	if (plan->redo_starts != NULL)
+		online_free(plan->redo_starts);
 	if (plan->physical_cuts != NULL)
 		online_free(plan->physical_cuts);
+	if (plan->sources != NULL)
+		online_free(plan->sources);
 	plan->magic = 0;
 	online_free(plan);
 	*plan_pointer = NULL;

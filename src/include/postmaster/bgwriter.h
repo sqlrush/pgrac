@@ -31,6 +31,10 @@ extern void BackgroundWriterMain(void) pg_attribute_noreturn();
 extern void CheckpointerMain(void) pg_attribute_noreturn();
 
 extern void RequestCheckpoint(int flags);
+#ifdef USE_PGRAC_CLUSTER
+/* Actual startup file-sync completion, not a checkpoint or writer grant. */
+extern bool RequestStartupSync(void);
+#endif
 extern void CheckpointWriteDelay(int flags, double progress);
 
 extern bool ForwardSyncRequest(const FileTag *ftag, SyncRequestType type);

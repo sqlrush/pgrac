@@ -32,8 +32,8 @@
  *
  *	  Shmem region "pgrac wal thread" exists so the dump accessors work
  *	  under EXEC_BACKEND too (children do not inherit postmaster globals
- *	  there); it carries one counter and a small identity mirror written
- *	  once by the postmaster before any child is forked.
+ *	  there). Restart input is written once by the postmaster. In PRE2 the
+ *	  distinct writer is published once by the qualified startup executor.
  *
  *-------------------------------------------------------------------------
  */
@@ -43,19 +43,31 @@
 
 #include <sys/stat.h>
 #include <unistd.h>
+#include <limits.h>
+#include <fcntl.h>
 
 #include "access/xlog_internal.h" /* XLOGDIR */
+#include "access/transam.h"
+#include "catalog/catversion.h"
+#include "common/controldata_utils.h"
+#include "common/pgrac_initdb_wal.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_initdb_config.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_state.h" /* spec-4.2 ensure() */
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_writer.h"
+#include "cluster_control_bootstrap_private.h"
+#include "cluster_control_root_private.h"
 #include "miscadmin.h" /* IsUnderPostmaster, DataDir */
 #include "port/atomics.h"
 #include "storage/fd.h" /* BasicOpenFile, pg_fsync */
+#include "storage/bufpage.h"
 #include "storage/shmem.h"
+#include "storage/spin.h"
 #include "utils/timestamp.h" /* GetCurrentTimestamp */
 #include "utils/wait_event.h"
 
@@ -67,22 +79,28 @@ typedef struct ClusterWalThreadShmemData {
 	pg_atomic_uint64 page_stamp_count; /* real-id stamps since startup */
 
 	/*
-	 * Identity mirror for the cluster_debug dump accessors.  Written
-	 * exactly once by cluster_wal_thread_init() in the postmaster
-	 * (before any child exists), read-only afterwards -- so plain
-	 * fields are race-free by construction.
+	 * Routing facts and restart input are immutable after postmaster setup.
+	 * The writer reference is separate: 0=unpublished, 1=copying, 2=ready.
+	 * Only the actual initializer publishes it, once, after root INSTALL.
 	 */
 	uint16 thread_id;	  /* cluster_wal_thread_id() at startup */
 	uint8 dir_configured; /* cluster.wal_threads_dir != '' */
 	uint8 dir_validated;  /* routing validation passed */
 	uint8 claim_created;  /* this boot created the claim file */
 	uint8 _pad[3];
+	ClusterWalSourceRef v2_ref;
+	pg_atomic_uint32 writer_ref_state;
+	ClusterWalSourceRef restart_ref;
+	bool restart_ref_valid;
 
 	/* spec-4.2 D5: WAL-state registry refresh-failure counter (bumped by
 	 * cluster_stats on best-effort refresh failures, read by the dump
 	 * SRF in any backend). */
 	pg_atomic_uint64 wal_state_refresh_fail_count;
-	char _reserved[8]; /* remaining headroom */
+	slock_t checkpoint_sample_lock;
+	ClusterWalThreadCheckpointSampleV1 checkpoint_sample;
+	uint64 initialized_writer_epoch; /* zero unless installed from never-served input */
+	uint64 clean_writer_epoch;		 /* zero unless installed from collective CLEAN exit */
 } ClusterWalThreadShmemData;
 
 static ClusterWalThreadShmemData *cluster_wal_thread_shmem = NULL;
@@ -107,8 +125,17 @@ cluster_wal_thread_shmem_init(void)
 		cluster_wal_thread_shmem->dir_validated = 0;
 		cluster_wal_thread_shmem->claim_created = 0;
 		memset(cluster_wal_thread_shmem->_pad, 0, sizeof(cluster_wal_thread_shmem->_pad));
+		memset(&cluster_wal_thread_shmem->v2_ref, 0, sizeof(cluster_wal_thread_shmem->v2_ref));
+		pg_atomic_init_u32(&cluster_wal_thread_shmem->writer_ref_state, 0);
+		memset(&cluster_wal_thread_shmem->restart_ref, 0,
+			   sizeof(cluster_wal_thread_shmem->restart_ref));
+		cluster_wal_thread_shmem->restart_ref_valid = false;
 		pg_atomic_init_u64(&cluster_wal_thread_shmem->wal_state_refresh_fail_count, 0);
-		memset(cluster_wal_thread_shmem->_reserved, 0, sizeof(cluster_wal_thread_shmem->_reserved));
+		SpinLockInit(&cluster_wal_thread_shmem->checkpoint_sample_lock);
+		memset(&cluster_wal_thread_shmem->checkpoint_sample, 0,
+			   sizeof(cluster_wal_thread_shmem->checkpoint_sample));
+		cluster_wal_thread_shmem->initialized_writer_epoch = 0;
+		cluster_wal_thread_shmem->clean_writer_epoch = 0;
 	}
 }
 
@@ -132,6 +159,191 @@ cluster_wal_thread_shmem_register(void)
  * ----------------------------------------------------------------
  */
 
+static PgracInitdbWalContext initdb_wal_context;
+
+/* BKI bootstrap finishes with a real shutdown checkpoint, but has not allocated
+ * any normal XID.  Post-bootstrap SQL necessarily advances it.  A valid pipe
+ * must not turn a completed database into initdb or change its WAL thread. */
+static bool
+initdb_bootstrap_wal_matches(const ControlFileData *control, const PgracInitdbWalContext *context)
+{
+	XLogLongPageHeaderData header;
+	const TimeLineID bootstrap_tli = 1; /* BootStrapXLOG's original timeline */
+	struct stat st;
+	char path[MAXPGPATH];
+	int fd;
+	ssize_t n;
+	bool valid;
+
+	if (!IsValidWalSegSize(control->xlog_seg_size)
+		|| control->checkPoint < (XLogRecPtr)control->xlog_seg_size + SizeOfXLogLongPHD
+		|| control->checkPointCopy.redo != control->checkPoint
+		|| U64FromFullTransactionId(control->checkPointCopy.nextXid) != FirstNormalTransactionId
+		|| control->checkPointCopy.ThisTimeLineID != bootstrap_tli)
+		return false;
+	XLogFilePath(path, bootstrap_tli, 1, control->xlog_seg_size);
+	fd = BasicOpenFile(path, O_RDONLY | PG_BINARY | O_NOFOLLOW);
+	if (fd < 0)
+		return false;
+	do {
+		n = read(fd, &header, sizeof(header));
+	} while (n < 0 && errno == EINTR);
+	valid = n == sizeof(header) && fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_nlink == 1
+			&& st.st_uid == geteuid() && st.st_size == control->xlog_seg_size
+			&& header.std.xlp_magic == XLOG_PAGE_MAGIC && header.std.xlp_info == XLP_LONG_HEADER
+			&& header.std.xlp_tli == bootstrap_tli
+			&& header.std.xlp_pageaddr == control->xlog_seg_size && header.std.xlp_rem_len == 0
+			&& header.std.xlp_thread_id == context->thread_id
+			&& header.std.xlp_cluster_flags == XLP_CLUSTER_FLAGS_RESERVED
+			&& header.xlp_sysid == context->system_identifier
+			&& header.xlp_seg_size == control->xlog_seg_size
+			&& header.xlp_xlog_blcksz == XLOG_BLCKSZ;
+	if (close(fd) != 0)
+		valid = false;
+	return valid;
+}
+
+/* The original frontend has already created and pinned these two new
+ * directories.  Consume its one-shot pipe before native control/WAL writes.
+ * This accepts no path, checkpoint, claim or authority supplied by a GUC.
+ */
+void
+cluster_wal_thread_initdb_accept(bool bootstrap)
+{
+	const char *value = getenv(PGRAC_INITDB_WAL_CONTEXT_ENV);
+	PgracInitdbWalContext context;
+	struct stat pipe_st, data_st, wal_st, control_st;
+	char *end;
+	long fd;
+	size_t got = 0;
+	char extra;
+	ssize_t n;
+
+	if (value == NULL)
+		return;
+	errno = 0;
+	fd = strtol(value, &end, 10);
+	if (IsUnderPostmaster || initdb_wal_context.thread_id != 0 || value[0] < '0' || value[0] > '9'
+		|| *end != '\0' || errno != 0 || fd < 3 || fd > INT_MAX || fstat((int)fd, &pipe_st) != 0
+		|| !S_ISFIFO(pipe_st.st_mode) || pipe_st.st_uid != geteuid())
+		ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: invalid original-creator pipe")));
+	/* Never wait for an untrusted or unfinished context producer. */
+	if (fcntl((int)fd, F_SETFL, O_NONBLOCK) < 0)
+		ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: cannot read creator pipe: %m")));
+	while (got < sizeof(context)) {
+		n = read((int)fd, (char *)&context + got, sizeof(context) - got);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: incomplete creator pipe")));
+		got += n;
+	}
+	do {
+		n = read((int)fd, &extra, 1);
+	} while (n < 0 && errno == EINTR);
+	if (n != 0 || close((int)fd) != 0 || unsetenv(PGRAC_INITDB_WAL_CONTEXT_ENV) != 0)
+		ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: creator pipe is not exactly closed")));
+	if (context.magic != PGRAC_INITDB_WAL_CONTEXT_MAGIC || context.thread_id == 0
+		|| context.thread_id > CLUSTER_WAL_THREAD_MAX
+		|| context.phase
+			   != (bootstrap ? PGRAC_INITDB_WAL_BOOTSTRAP : PGRAC_INITDB_WAL_POSTBOOTSTRAP)
+		|| stat(".", &data_st) != 0 || stat(XLOGDIR, &wal_st) != 0 || !S_ISDIR(data_st.st_mode)
+		|| !S_ISDIR(wal_st.st_mode) || data_st.st_uid != geteuid() || wal_st.st_uid != geteuid()
+		|| (data_st.st_mode & 0022) != 0 || (wal_st.st_mode & 0022) != 0
+		|| (uint64)data_st.st_dev != context.data_device
+		|| (uint64)data_st.st_ino != context.data_inode
+		|| (uint64)wal_st.st_dev != context.wal_device
+		|| (uint64)wal_st.st_ino != context.wal_inode)
+		ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: creator directory or phase changed")));
+	if (bootstrap) {
+		if (lstat(XLOG_CONTROL_FILE, &control_st) == 0 || errno != ENOENT)
+			ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: bootstrap control already exists")));
+	} else {
+		ControlFileData *control;
+		bool crc_ok;
+		bool valid;
+
+		if (lstat(XLOG_CONTROL_FILE, &control_st) != 0 || !S_ISREG(control_st.st_mode)
+			|| control_st.st_nlink != 1 || control_st.st_uid != geteuid())
+			ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: invalid bootstrap control file")));
+		control = get_controlfile(DataDir, &crc_ok);
+		valid = crc_ok && context.system_identifier != 0
+				&& control->system_identifier == context.system_identifier
+				&& control->pg_control_version == PG_CONTROL_VERSION
+				&& control->catalog_version_no == CATALOG_VERSION_NO
+				&& control->state == DB_SHUTDOWNED
+				&& control->data_checksum_version == PG_DATA_CHECKSUM_VERSION
+				&& initdb_bootstrap_wal_matches(control, &context);
+		pfree(control);
+		if (!valid)
+			ereport(FATAL, (errmsg("INITDB_WAL_CONTEXT: bootstrap control identity changed")));
+	}
+	{
+		struct stat base_st;
+		uint8 any = 0;
+		for (int i = 0; i < sizeof(context.storage_uuid); ++i)
+			any |= context.storage_uuid[i];
+		if (context.reserved != 0
+			|| (context.base_fd == 0
+					? (context.database_incarnation != 0 || context.base_device != 0
+					   || context.base_inode != 0 || any != 0)
+					: (bootstrap || context.thread_id != 1 || context.base_fd < 3
+					   || context.database_incarnation == 0 || any == 0
+					   || fstat(context.base_fd, &base_st) != 0 || !S_ISDIR(base_st.st_mode)
+					   || base_st.st_uid != geteuid() || (base_st.st_mode & 0022) != 0
+					   || (uint64)base_st.st_dev != context.base_device
+					   || (uint64)base_st.st_ino != context.base_inode
+					   || (base_st.st_dev == data_st.st_dev && base_st.st_ino == data_st.st_ino)
+					   || (base_st.st_dev == wal_st.st_dev && base_st.st_ino == wal_st.st_ino))))
+			ereport(FATAL, (errmsg("INITDB_BASE_CONTEXT: invalid original founder target")));
+		if (context.base_fd != 0 && fcntl(context.base_fd, F_SETFD, FD_CLOEXEC) != 0)
+			ereport(FATAL,
+					(errmsg("INITDB_BASE_CONTEXT: cannot isolate original target descriptor")));
+	}
+	{
+		static const PgracInitdbConfigContext empty = { 0 };
+		struct stat config_st;
+		uint8 any = 0;
+		for (int i = 0; i < sizeof(context.config.sha256); i++)
+			any |= context.config.sha256[i];
+		if (context.config.fd == 0) {
+			if (memcmp(&context.config, &empty, sizeof(empty)) != 0)
+				ereport(FATAL, (errmsg("INITDB_CONFIG_CONTEXT: incomplete creation request")));
+		} else if (context.system_identifier == 0 || context.config.fd < 3
+				   || context.config.fd == context.base_fd || context.config.bytes == 0
+				   || context.config.bytes > PGRAC_INITDB_CONFIG_MAX_BYTES || any == 0
+				   || fstat(context.config.fd, &config_st) != 0 || !S_ISREG(config_st.st_mode)
+				   || config_st.st_uid != geteuid() || (config_st.st_mode & 0022) != 0
+				   || config_st.st_nlink != 1 || config_st.st_size != context.config.bytes
+				   || (uint64)config_st.st_dev != context.config.device
+				   || (uint64)config_st.st_ino != context.config.inode
+				   || fcntl(context.config.fd, F_SETFD, FD_CLOEXEC) != 0)
+			ereport(FATAL,
+					(errmsg("INITDB_CONFIG_CONTEXT: invalid original configuration request")));
+	}
+	if (context.config.fd != 0)
+		cluster_initdb_config_apply_native(&context);
+	initdb_wal_context = context;
+}
+
+const PgracInitdbWalContext *
+cluster_wal_thread_initdb_context(void)
+{
+	return initdb_wal_context.thread_id == 0 ? NULL : &initdb_wal_context;
+}
+
+uint64
+cluster_wal_thread_initdb_system_identifier(void)
+{
+	return initdb_wal_context.system_identifier;
+}
+
+uint16
+cluster_wal_thread_initdb_stamp(void)
+{
+	return initdb_wal_context.thread_id;
+}
+
 uint16
 cluster_wal_thread_id(void)
 {
@@ -142,6 +354,12 @@ uint16
 cluster_wal_thread_stamp(void)
 {
 	uint16 tid = cluster_wal_thread_id();
+
+	/* Initial DATA/catalog creation is still native standalone processing.
+	 * Its page stamp must not install an online identity or call the SCN/GCS
+	 * path merely to identify the original writer's WAL. */
+	if (initdb_wal_context.thread_id != 0)
+		return initdb_wal_context.thread_id;
 
 	/*
 	 * nofail + critical-section-safe: one conditional atomic add, no
@@ -184,6 +402,156 @@ bool
 cluster_wal_thread_dir_validated(void)
 {
 	return cluster_wal_thread_shmem != NULL && cluster_wal_thread_shmem->dir_validated != 0;
+}
+
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
+{
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_enabled || !cluster_shared_config || cluster_wal_thread_shmem == NULL
+		|| !cluster_wal_thread_shmem->dir_validated
+		|| pg_atomic_read_u32(&cluster_wal_thread_shmem->writer_ref_state) != 2)
+		return false;
+	pg_read_barrier();
+	*out = cluster_wal_thread_shmem->v2_ref;
+	if (out->claim.identity.origin_node_id != cluster_node_id
+		|| out->claim.identity.origin_thread_id != cluster_wal_thread_id()) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	return true;
+}
+
+bool
+cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *expected, uint64 epoch)
+{
+	ClusterWalSourceRef current;
+	/* The current-ref read supplies the READY acquire barrier for both fields.
+	 * This fact never replaces the caller's live membership/write-fence checks. */
+	return expected != NULL && epoch != 0 && cluster_wal_thread_current_v2_ref(&current)
+		   && cluster_wal_thread_shmem->initialized_writer_epoch == epoch
+		   && memcmp(expected, &current, sizeof(current)) == 0;
+}
+
+bool
+cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected, uint64 epoch)
+{
+	ClusterWalSourceRef current;
+	/* The same READY acquire barrier publishes this qualification only with
+	 * the exact installed source. It never stands in for a live write fence. */
+	return expected != NULL && epoch != 0 && cluster_wal_thread_current_v2_ref(&current)
+		   && cluster_wal_thread_shmem->clean_writer_epoch == epoch
+		   && memcmp(expected, &current, sizeof(current)) == 0;
+}
+
+bool
+cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
+{
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_enabled || !cluster_shared_config || cluster_wal_thread_shmem == NULL
+		|| !cluster_wal_thread_shmem->restart_ref_valid || !cluster_wal_thread_shmem->dir_validated
+		|| cluster_wal_thread_shmem->restart_ref.claim.identity.origin_node_id != cluster_node_id
+		|| cluster_wal_thread_shmem->restart_ref.claim.identity.origin_thread_id
+			   != cluster_wal_thread_id())
+		return false;
+	*out = cluster_wal_thread_shmem->restart_ref;
+	return true;
+}
+
+void
+cluster_wal_thread_checkpoint_observed_v1(const ClusterControlRootSnapshot *record,
+										  XLogRecPtr native_redo)
+{
+	ClusterWalSourceRef ref;
+	ClusterWalThreadCheckpointSampleV1 sample;
+
+	/* Best-effort observation only. Never change the publisher's result or
+	 * infer a floor from an unbound writer, another boot, or scalar LSNs. */
+	if (MyBackendType != B_CHECKPOINTER || record == NULL
+		|| !cluster_wal_thread_current_v2_ref(&ref)
+		|| memcmp(&record->identity, &ref.claim.identity, sizeof(record->identity)) != 0
+		|| record->root_publish_seq == 0 || record->checkpoint_tli != ref.timeline
+		|| record->tail_tli != ref.timeline || record->checkpoint_lower_lsn == InvalidXLogRecPtr
+		|| record->checkpoint_lower_lsn > native_redo || native_redo > record->tail_last_record_lsn
+		|| record->tail_last_record_lsn >= record->validated_tail_lsn_exclusive)
+		return;
+	memset(&sample, 0, sizeof(sample));
+	sample.root_publish_seq = record->root_publish_seq;
+	sample.retained_lower = record->checkpoint_lower_lsn;
+	sample.native_redo = native_redo;
+	sample.validated_tail = record->validated_tail_lsn_exclusive;
+	sample.published_at_usec = record->published_at_usec;
+	SpinLockAcquire(&cluster_wal_thread_shmem->checkpoint_sample_lock);
+	if (sample.root_publish_seq > cluster_wal_thread_shmem->checkpoint_sample.root_publish_seq)
+		cluster_wal_thread_shmem->checkpoint_sample = sample;
+	SpinLockRelease(&cluster_wal_thread_shmem->checkpoint_sample_lock);
+}
+
+bool
+cluster_wal_thread_checkpoint_sample_v1(ClusterWalThreadCheckpointSampleV1 *out)
+{
+	ClusterWalSourceRef ref;
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_wal_thread_current_v2_ref(&ref))
+		return false;
+	SpinLockAcquire(&cluster_wal_thread_shmem->checkpoint_sample_lock);
+	*out = cluster_wal_thread_shmem->checkpoint_sample;
+	SpinLockRelease(&cluster_wal_thread_shmem->checkpoint_sample_lock);
+	return out->root_publish_seq != 0;
+}
+
+ClusterControlRootResult
+cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
+{
+	ClusterWalSourceRef installed;
+	ClusterControlRootResult result;
+	uint32 state = 0;
+	uint64 initialized_epoch, clean_epoch;
+	if (expected == NULL || !cluster_enabled || !cluster_shared_config
+		|| cluster_wal_thread_shmem == NULL || !cluster_wal_thread_shmem->restart_ref_valid
+		|| !cluster_wal_thread_shmem->dir_validated)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	/* No caller flag stands in for the actual selected writer and its
+	 * durability. This call also qualifies an uncertain same-process retry. */
+	result = cluster_control_root_v3_startup_install_writer(expected, &installed);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_control_bootstrap_wal_route(DataDir, cluster_wal_threads_dir, &installed);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (installed.claim.identity.origin_node_id != cluster_node_id
+		|| installed.claim.identity.origin_thread_id != cluster_wal_thread_id()
+		|| !cluster_wal_writer_startup_matches(&installed.claim.identity, expected->operation_uuid,
+											   expected->first_segment_lsn))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	initialized_epoch
+		= expected->input_kind == CLUSTER_WAL_STARTUP_INITIALIZED ? expected->formation_epoch : 0;
+	clean_epoch = expected->input_kind == CLUSTER_WAL_STARTUP_CLEAN ? expected->formation_epoch : 0;
+	if (!pg_atomic_compare_exchange_u32(&cluster_wal_thread_shmem->writer_ref_state, &state, 1)) {
+		if (state != 2)
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		pg_read_barrier();
+		return memcmp(&installed, &cluster_wal_thread_shmem->v2_ref, sizeof(installed)) == 0
+					   && initialized_epoch == cluster_wal_thread_shmem->initialized_writer_epoch
+					   && clean_epoch == cluster_wal_thread_shmem->clean_writer_epoch
+				   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				   : CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	}
+	/* No I/O, allocation or error-capable work inside the once-only copy.
+	 * Readers inspect READY then use an acquire barrier; bytes never change
+	 * afterwards. The immutable predecessor mirror is never touched here. */
+	cluster_wal_thread_shmem->v2_ref = installed;
+	cluster_wal_thread_shmem->initialized_writer_epoch = initialized_epoch;
+	cluster_wal_thread_shmem->clean_writer_epoch = clean_epoch;
+	pg_write_barrier();
+	pg_atomic_write_u32(&cluster_wal_thread_shmem->writer_ref_state, 2);
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 bool
@@ -386,6 +754,9 @@ cluster_wal_thread_init(void)
 		cluster_wal_thread_shmem->thread_id = tid;
 		cluster_wal_thread_shmem->dir_configured = dir_set ? 1 : 0;
 	}
+	if (cluster_shared_config && !dir_set)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_THREAD_ROUTING_MISMATCH),
+						errmsg("PRE2 shared configuration requires an exact WAL root")));
 
 	if (!dir_set) {
 		if (cluster_shared_catalog && cluster_conf_has_peers())
@@ -417,6 +788,22 @@ cluster_wal_thread_init(void)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_THREAD_ROUTING_MISMATCH),
 						errmsg("cluster.wal_threads_dir is set but cluster.node_id is not"),
 						errhint("Set cluster.node_id to this node's identifier (0..127).")));
+
+	/* PRE2 never falls back to the v1 claim/create or legacy registry path.
+	 * Preparation and reobservation remain read-only namespace checks. The
+	 * subsequent physical/fence/recovery/serving gates still own admission. */
+	if (cluster_shared_config) {
+		ClusterWalSourceRef ref;
+		if (cluster_wal_thread_shmem == NULL)
+			ereport(FATAL, (errmsg("shared WAL identity state is not initialized")));
+		/* All actual DataDir reads/crypto stay in the adapter's temporary owner;
+		 * the early postmaster has no transaction ResourceOwner to borrow. */
+		cluster_control_bootstrap_wal_recheck(DataDir, &ref);
+		cluster_wal_thread_shmem->restart_ref = ref;
+		cluster_wal_thread_shmem->dir_validated = 1;
+		cluster_wal_thread_shmem->restart_ref_valid = true;
+		return;
+	}
 
 	CLUSTER_INJECTION_POINT("cluster-wal-thread-validate-pre");
 

@@ -64,14 +64,18 @@ bm_set(uint8 *bm, int32 node)
  *	ABSENT / JOINING / REJECTED owners are neither fresh nor dead-decided,
  *	so decide() fails closed (UNKNOWN) -- we never guess a node dead.
  */
-ClusterUndoAuthorityStatus
-cluster_undo_serve_authority_lookup(int32 owner_node, uint64 reconfig_epoch, int32 *out_authority)
+static ClusterUndoAuthorityStatus
+cluster_undo_serve_authority_lookup_internal(int32 owner_node, uint64 reconfig_epoch,
+											 int32 *out_authority, ClusterUndoRouteReason *reason)
 {
 	ClusterUndoAuthorityInput in;
 	ClusterUndoAuthorityDecision out;
 	int32 node;
+	bool owner_member_stale = false;
 
 	*out_authority = -1;
+	if (reason != NULL)
+		*reason = CLUSTER_UNDO_ROUTE_REASON_NONE;
 
 	memset(&in, 0, sizeof(in));
 	in.owner_node = owner_node;
@@ -86,6 +90,8 @@ cluster_undo_serve_authority_lookup(int32 owner_node, uint64 reconfig_epoch, int
 			bm_set(in.declared, node);
 			if (cluster_reconfig_get_observed_fresh_alive(node))
 				bm_set(in.alive_fresh, node);
+			else if (node == owner_node)
+				owner_member_stale = true;
 			break;
 		case CLUSTER_MEMBER_DEAD:
 		case CLUSTER_MEMBER_REMOVED:
@@ -107,7 +113,21 @@ cluster_undo_serve_authority_lookup(int32 owner_node, uint64 reconfig_epoch, int
 	(void)cluster_undo_authority_decide(&in, &out);
 	if (out.status == CLUSTER_UNDO_AUTHORITY_OK)
 		*out_authority = out.authority_node;
+	/* Preserve UNKNOWN and destination -1. This only records why this
+	 * particular sample could not prove liveness; A's independent current
+	 * peer snapshot must still qualify any terminal inquiry. */
+	if (reason != NULL && out.status == CLUSTER_UNDO_AUTHORITY_UNKNOWN && owner_member_stale
+		&& in.request_epoch == in.snapshot_epoch
+		&& cluster_epoch_get_current() == in.snapshot_epoch)
+		*reason = CLUSTER_UNDO_ROUTE_MEMBER_OBSERVATION_STALE;
 	return out.status;
+}
+
+ClusterUndoAuthorityStatus
+cluster_undo_serve_authority_lookup(int32 owner_node, uint64 reconfig_epoch, int32 *out_authority)
+{
+	return cluster_undo_serve_authority_lookup_internal(owner_node, reconfig_epoch, out_authority,
+														NULL);
 }
 
 /*
@@ -126,9 +146,14 @@ cluster_undo_serve_authority(const ClusterResId *undo_resid, uint64 reconfig_epo
 	int32 owner_node = cluster_undo_resid_master(undo_resid);
 	int32 authority_node = -1;
 	ClusterUndoAuthorityStatus st;
+	ClusterUndoRouteReason reason;
+	ClusterUndoServeRoute route;
 
-	st = cluster_undo_serve_authority_lookup(owner_node, reconfig_epoch, &authority_node);
-	return cluster_undo_route_decide(owner_node, reconfig_epoch, st, authority_node);
+	st = cluster_undo_serve_authority_lookup_internal(owner_node, reconfig_epoch, &authority_node,
+													  &reason);
+	route = cluster_undo_route_decide(owner_node, reconfig_epoch, st, authority_node);
+	route.reason = reason;
+	return route;
 }
 
 /*

@@ -23,6 +23,7 @@
 
 #include "../../common/sha2_int.h"
 
+#include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/storage/cluster_undo_alloc.h"
@@ -46,6 +47,7 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_mxid_stripe.h"
@@ -79,7 +81,7 @@
 #endif
 
 #define CLUSTER_CTRC_SHMEM_MAGIC UINT32_C(0x43545243)
-#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(10)
+#define CLUSTER_CTRC_SHMEM_VERSION UINT32_C(11)
 #ifndef CLUSTER_CTRC_TEST_TABLE_VISIT
 #define CLUSTER_CTRC_TEST_TABLE_VISIT(kind) ((void)0)
 #endif
@@ -146,6 +148,8 @@ static const char *const ctrc_stat_names[CTRC_STAT_COUNT] = {
 	[CTRC_STAT_PENDING_OBSERVED_AGE_MS] = "pending_observed_age_ms",
 	[CTRC_STAT_OBSERVED_AT_US] = "observed_at_monotonic_us",
 	[CTRC_STAT_OBSERVATION_AGE_MS] = "observation_age_ms",
+	[CTRC_STAT_RECEIPT_PREPARE_REFUSED] = "receipt_prepare_refused_count",
+	[CTRC_STAT_RECEIPT_NAMESPACE_REFUSED] = "receipt_namespace_refused_count",
 };
 
 static const char *const ctrc_cleaner_reason_names[CTRC_CLEANER_REASON_COUNT] = {
@@ -877,12 +881,21 @@ ctrc_target_predecessor_version_valid(const ClusterCtrcTargetV1 *target)
 		   && SCN_VALID(target->predecessor_page_scn);
 }
 
+/* Match RelationInitPhysicalAddr: only global relations have database zero.
+ * This is a physical namespace check, not transaction or reuse authority. */
+static bool
+ctrc_relation_namespace_valid(uint32 spc_oid, uint32 db_oid, uint32 rel_number)
+{
+	return spc_oid != InvalidOid && rel_number != InvalidOid
+		   && ((spc_oid == GLOBALTABLESPACE_OID) == (db_oid == InvalidOid));
+}
+
 static bool
 ctrc_target_pending_itl_valid(const ClusterCtrcTargetV1 *target)
 {
 	return target != NULL && target->kind == CTRC_TARGET_PAGE_PENDING_ITL_SLOT
-		   && target->spc_oid != InvalidOid && target->db_oid != InvalidOid
-		   && target->rel_number != InvalidOid && target->block_number != InvalidBlockNumber
+		   && ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number)
+		   && target->block_number != InvalidBlockNumber
 		   && ctrc_target_predecessor_version_valid(target)
 		   && target->publication_own_generation != 0 && target->relation_persistence != 0
 		   && target->page_operation_kind != 0 && target->itl_slot_index == 0
@@ -939,8 +952,8 @@ static bool
 ctrc_target_exact_itl_valid(const ClusterCtrcTxnKeyV1 *key, const ClusterCtrcTargetV1 *target)
 {
 	return key != NULL && target != NULL && target->kind == CTRC_TARGET_EXACT_ITL_SLOT
-		   && target->spc_oid != InvalidOid && target->db_oid != InvalidOid
-		   && target->rel_number != InvalidOid && target->block_number != InvalidBlockNumber
+		   && ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number)
+		   && target->block_number != InvalidBlockNumber
 		   && ctrc_target_predecessor_version_valid(target)
 		   && target->publication_own_generation != 0 && target->relation_persistence != 0
 		   && target->page_operation_kind != 0 && TransactionIdIsValid(target->itl_xid)
@@ -1054,8 +1067,8 @@ ctrc_target_pending_offnum_valid(const ClusterCtrcPublicationIdV1 *publication,
 								 const ClusterCtrcTargetV1 *target)
 {
 	return publication != NULL && target != NULL && target->kind == CTRC_TARGET_PAGE_PENDING_OFFNUM
-		   && target->spc_oid != InvalidOid && target->db_oid != InvalidOid
-		   && target->rel_number != InvalidOid && target->block_number != InvalidBlockNumber
+		   && ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number)
+		   && target->block_number != InvalidBlockNumber
 		   && ctrc_target_predecessor_version_valid(target)
 		   && target->publication_own_generation != 0 && target->relation_persistence != 0
 		   && target->page_operation_kind == 0 && target->itl_slot_index == 0
@@ -1087,8 +1100,8 @@ ctrc_target_exact_tid_valid(const ClusterCtrcPublicationIdV1 *publication,
 	if (publication == NULL || target == NULL)
 		return false;
 	hot_edge = publication->reference_kind == CTRC_REF_HOT_FOLLOW_EDGE;
-	return target->kind == CTRC_TARGET_EXACT_TID && target->spc_oid != InvalidOid
-		   && target->db_oid != InvalidOid && target->rel_number != InvalidOid
+	return target->kind == CTRC_TARGET_EXACT_TID
+		   && ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number)
 		   && target->block_number != InvalidBlockNumber
 		   && ctrc_target_predecessor_version_valid(target)
 		   && target->publication_own_generation != 0 && target->relation_persistence != 0
@@ -2364,15 +2377,21 @@ cluster_ctrc_shmem_ready(void)
 	return false;
 }
 
+/* Standalone tests observe counters without claiming any shared readiness. */
+static uint64 ctrc_test_stats[CTRC_STAT_COUNT];
+
 uint64
-cluster_ctrc_stat_get(ClusterCtrcStatId stat pg_attribute_unused())
+cluster_ctrc_stat_get(ClusterCtrcStatId stat)
 {
-	return 0;
+	return stat >= 0 && stat < CTRC_STAT_COUNT ? ctrc_test_stats[stat] : 0;
 }
 
 void
-cluster_ctrc_stat_bump(ClusterCtrcStatId stat pg_attribute_unused())
-{}
+cluster_ctrc_stat_bump(ClusterCtrcStatId stat)
+{
+	if (stat >= 0 && stat < CTRC_STAT_COUNT)
+		ctrc_test_stats[stat]++;
+}
 
 ClusterCtrcCleanerReason
 cluster_ctrc_cleaner_reason_get(void)
@@ -5104,6 +5123,15 @@ ctrc_receipt_prepare_locators_valid_locked(const ClusterCtrcTxnKeyV1 *key,
 }
 #endif
 
+static ClusterCtrcPrepareResult
+ctrc_receipt_prepare_refused(bool invalid_namespace)
+{
+	cluster_ctrc_stat_bump(CTRC_STAT_RECEIPT_PREPARE_REFUSED);
+	if (invalid_namespace)
+		cluster_ctrc_stat_bump(CTRC_STAT_RECEIPT_NAMESPACE_REFUSED);
+	return CLUSTER_CTRC_PREPARE_REFUSED;
+}
+
 ClusterCtrcPrepareResult
 cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 									const ClusterCtrcParticipantIdentity *identity,
@@ -5119,15 +5147,22 @@ cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 	uint64 participant_index;
 	uint64 receipt_index = UINT64_MAX;
 	uint64 journal_sequence;
+#endif
 
 	if (handle != NULL)
 		MemSet(handle, 0, sizeof(*handle));
+	/* Report this exact input predicate before any journal or participant
+	 * mutation. Unknown transaction/owner state remains a separate refusal. */
+	if (target != NULL
+		&& !ctrc_relation_namespace_valid(target->spc_oid, target->db_oid, target->rel_number))
+		return ctrc_receipt_prepare_refused(true);
+#ifndef CLUSTER_CTRC_UNIT_TEST
 	if (handle == NULL || identity == NULL || publication == NULL || target == NULL
 		|| cluster_node_id < 0 || identity->node_id != (uint16)cluster_node_id
 		|| !cluster_ctrc_shmem_ready()
 		|| !ctrc_participant_index(key, identity->node_id, &participant_index)
 		|| !ctrc_allocate_journal_sequence(&journal_sequence))
-		return CLUSTER_CTRC_PREPARE_REFUSED;
+		return ctrc_receipt_prepare_refused(false);
 
 	participant = &ctrc_participant_entries()[participant_index];
 	receipts = ctrc_receipt_entries();
@@ -5166,6 +5201,8 @@ cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 		cluster_ctrc_stat_bump(CTRC_STAT_RECEIPT_PREPARED);
 	else if (result == CLUSTER_CTRC_PREPARE_CAPACITY)
 		cluster_ctrc_stat_bump(CTRC_STAT_RECEIPT_CAPACITY_REFUSED);
+	else if (result == CLUSTER_CTRC_PREPARE_REFUSED)
+		return ctrc_receipt_prepare_refused(false);
 	return result;
 #else
 	(void)key;
@@ -5173,9 +5210,7 @@ cluster_ctrc_receipt_prepare_shared(const ClusterCtrcTxnKeyV1 *key,
 	(void)grant_generation;
 	(void)publication;
 	(void)target;
-	if (handle != NULL)
-		MemSet(handle, 0, sizeof(*handle));
-	return CLUSTER_CTRC_PREPARE_REFUSED;
+	return ctrc_receipt_prepare_refused(false);
 #endif
 }
 
@@ -6477,7 +6512,8 @@ cluster_ctrc_relation_removal_ready_from_snapshot(const ClusterCtrcReceipt *rece
 {
 	Size i;
 
-	if ((receipt_count != 0 && receipts == NULL) || spc_oid == 0 || db_oid == 0 || rel_number == 0)
+	if ((receipt_count != 0 && receipts == NULL)
+		|| !ctrc_relation_namespace_valid(spc_oid, db_oid, rel_number))
 		return false;
 	for (i = 0; i < receipt_count; i++) {
 		const ClusterCtrcReceipt *receipt = &receipts[i];
@@ -7934,6 +7970,7 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 	ClusterCtrcCleanResult clean_result;
 	ClusterMxDescribeResult describe_result = CMX_DESC_UNKNOWN;
 	ClusterMxResolveResult resolve_result = CMX_RESOLVE_UNKNOWN;
+	ClusterSpaceIdentity space_identity = { 0 };
 	RelFileLocator locator;
 	SMgrRelation smgr;
 	GenericXLogState *xlog_state;
@@ -7976,6 +8013,13 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 	locator.spcOid = receipt->target.spc_oid;
 	locator.dbOid = receipt->target.db_oid;
 	locator.relNumber = receipt->target.rel_number;
+	/* No heap content lock is held here. The APPLIED receipt and exact
+	 * target rechecks remain mandatory; SPACE lookup is not an authority. */
+	if (cluster_shared_config
+		&& !cluster_space_relation_read_maintenance_identity(locator, &space_identity)) {
+		cluster_semantic_activation_leave(&admission);
+		return false;
+	}
 	smgr = smgropen(locator, InvalidBackendId);
 	if (!smgrexists(smgr, (ForkNumber)receipt->target.fork_number)
 		|| smgrnblocks(smgr, (ForkNumber)receipt->target.fork_number)
@@ -8167,8 +8211,8 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 		cluster_semantic_activation_leave(&admission);
 		return false;
 	}
-	xlog_state = GenericXLogStartLogged(receipt->target.needs_wal);
-	image = GenericXLogRegisterBuffer(xlog_state, buffer, 0);
+	xlog_state = GenericXLogStartInternal(receipt->target.needs_wal, GENERIC_XLOG_CTRC_MX);
+	image = GenericXLogRegisterBufferVersioned(xlog_state, buffer, 0, &space_identity);
 	image_item = PageGetItemId(image, (OffsetNumber)receipt->target.offset_number);
 	if (!ItemIdIsNormal(image_item) || ItemIdGetLength(image_item) < SizeofHeapTupleHeader) {
 		GenericXLogAbort(xlog_state);
@@ -8317,6 +8361,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	ClusterCtrcDurability durability;
 	ClusterSfDepVec first_dependencies;
 	ClusterSfDepVec final_dependencies;
+	ClusterSpaceIdentity space_identity = { 0 };
 	RelFileLocator locator;
 	SMgrRelation smgr;
 	GenericXLogState *xlog_state;
@@ -8366,6 +8411,11 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	locator.spcOid = receipt->target.spc_oid;
 	locator.dbOid = receipt->target.db_oid;
 	locator.relNumber = receipt->target.rel_number;
+	if (cluster_shared_config
+		&& !cluster_space_relation_read_maintenance_identity(locator, &space_identity)) {
+		cluster_semantic_activation_leave(&admission);
+		return false;
+	}
 	smgr = smgropen(locator, InvalidBackendId);
 	if (!smgrexists(smgr, (ForkNumber)receipt->target.fork_number)
 		|| smgrnblocks(smgr, (ForkNumber)receipt->target.fork_number)
@@ -8535,8 +8585,8 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 			return false;
 		goto itl_discharge;
 	}
-	xlog_state = GenericXLogStartLogged(receipt->target.needs_wal);
-	image = GenericXLogRegisterBuffer(xlog_state, buffer, 0);
+	xlog_state = GenericXLogStartInternal(receipt->target.needs_wal, GENERIC_XLOG_CTRC_ITL);
+	image = GenericXLogRegisterBufferVersioned(xlog_state, buffer, 0, &space_identity);
 	apply_result = cluster_ctrc_itl_cleanout_slot(
 		&receipt->key, &receipt->target, terminal_status, commit_scn,
 		&ClusterPageGetItlSlots(image)[receipt->target.itl_slot_index]);

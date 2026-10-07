@@ -59,6 +59,7 @@
 #undef strerror_r
 
 #include "unit_test.h"
+#include "test_cluster_data_sync_policy.inc"
 
 UT_DEFINE_GLOBALS();
 

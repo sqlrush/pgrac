@@ -12369,6 +12369,12 @@
   proargnames => '{node_id,declared,state,presented_incarnation,last_admitted_incarnation,admitted_epoch,removed,removed_epoch}',
   prosrc => 'cluster_get_membership' },
 
+{ oid => '8977', descr => 'precheck, execute or inspect an exact membership request',
+  proname => 'pg_cluster_membership_command', proisstrict => 'f',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'jsonb', proargtypes => 'text jsonb',
+  prosrc => 'pg_cluster_membership_command' },
+
 
 # spec-2.14 D7 (2026-05-13) -- pg_cluster_grd_shards SRF (oid 8921).
 # Returns 4096 rows describing GRD shard → master_node_id routing and

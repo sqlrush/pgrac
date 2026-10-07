@@ -128,7 +128,8 @@ pgrac_fenced_journal_sealed_name_parse(
 	cursor = name + sizeof(prefix) - 1;
 	if (!parse_sequence(&cursor, '-', &first) ||
 		!parse_sequence(&cursor, '.', &last) || last < first ||
-		last - first != PGRAC_FENCED_JOURNAL_SEGMENT_RECORDS - 1 ||
+		last - first < PGRAC_FENCED_JOURNAL_MIN_SEALED_RECORDS - 1 ||
+		last - first > PGRAC_FENCED_JOURNAL_SEGMENT_RECORDS - 1 ||
 		strlen(cursor) != sizeof(parsed_digest) * 2 + sizeof(suffix) - 1)
 		return false;
 	for (i = 0; i < sizeof(parsed_digest); i++)
@@ -207,22 +208,25 @@ load_journal_segment_fd(
 		goto done;
 	if (reconcile != NULL)
 	{
-		for (offset = 0; offset < state->valid_bytes;
-			 offset += PGRAC_FENCED_JOURNAL_RECORD_BYTES)
+		for (offset = 0; offset < state->valid_bytes;)
 		{
 			PgracFencedJournalRecordV1 replayed;
+			size_t frame_len = pgrac_fenced_journal_frame_size(bytes + offset,
+				state->valid_bytes - offset);
 
-			if (!pgrac_fenced_journal_record_decode(bytes + offset,
-					PGRAC_FENCED_JOURNAL_RECORD_BYTES, &replayed) ||
+			if (frame_len == 0 || frame_len > state->valid_bytes - offset ||
+				!pgrac_fenced_journal_record_decode(bytes + offset, frame_len, &replayed) ||
 				!pgrac_fenced_journal_reconcile_observe(reconcile, &replayed))
 				goto done;
+			offset += frame_len;
 		}
 	}
 	if (state->valid_bytes > 0)
 	{
-		if (!pgrac_fenced_journal_record_decode(
-				bytes + state->valid_bytes - PGRAC_FENCED_JOURNAL_RECORD_BYTES,
-				PGRAC_FENCED_JOURNAL_RECORD_BYTES, last_record))
+		if (state->last_record_bytes == 0 || state->last_record_bytes > state->valid_bytes ||
+			!pgrac_fenced_journal_record_decode(
+				bytes + state->valid_bytes - state->last_record_bytes,
+				state->last_record_bytes, last_record))
 			goto done;
 		*have_last_record = true;
 	}

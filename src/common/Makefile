@@ -50,7 +50,13 @@ OBJS_COMMON = \
 	archive.o \
 	base64.o \
 	checksum_helper.o \
+	cluster_catalog_init.o \
+	cluster_catalog_manifest.o \
+	cluster_catalog_verify.o \
 	cluster_hw_snapshot_codec.o \
+	cluster_relmap_init.o \
+	cluster_space_identity.o \
+	cluster_space_reservation.o \
 	cluster_undo_segment_init.o \
 	compression.o \
 	config_info.o \
@@ -69,7 +75,10 @@ OBJS_COMMON = \
 	link-canary.o \
 	md5_common.o \
 	percentrepl.o \
+	pgrac_control_binding.o \
 	pgrac_external_fence_protocol.o \
+	pgrac_fence_map.o \
+	pgrac_protected_set.o \
 	pg_get_line.o \
 	pg_lzcompress.o \
 	pg_prng.o \

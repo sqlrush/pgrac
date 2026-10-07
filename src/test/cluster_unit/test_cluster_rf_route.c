@@ -12,6 +12,7 @@
 #include "cluster/cluster_rf_route.h"
 #include "access/xact.h"
 #include "access/xlogrecord.h"
+#include "catalog/storage_xlog.h"
 #define TEST_HAVE_CLUSTER_RF_ROUTE 1
 #endif
 #endif
@@ -83,16 +84,16 @@ find_manifest_route(uint8 rmid, uint8 normalized_info, RfOpcodeRouteV1 *route, b
 UT_TEST(test_route_abi_and_counts)
 {
 	UT_ASSERT_EQ(sizeof(RfOpcodeRouteV1), 8);
-	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 138);
-	UT_ASSERT_EQ(rf_opcode_route_manifest_live_count_v1(), 138);
+	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 140);
+	UT_ASSERT_EQ(rf_opcode_route_manifest_live_count_v1(), 140);
 }
 
 UT_TEST(test_route_canonical_key_stream)
 {
 	static const uint8 expected[PG_SHA256_DIGEST_LENGTH]
-		= { 0x65, 0xb6, 0xc7, 0x28, 0xec, 0xb5, 0xe4, 0xb4, 0x84, 0x07, 0xbb,
-			0xb4, 0x96, 0x5b, 0x3e, 0xf4, 0x68, 0x79, 0x25, 0x55, 0xc6, 0x07,
-			0xed, 0x5f, 0xcc, 0x32, 0x06, 0xae, 0xec, 0x40, 0xe8, 0xbe };
+		= { 0x52, 0x19, 0x05, 0xe7, 0x02, 0xcc, 0x62, 0x90, 0xd3, 0xca, 0x14,
+			0x16, 0x8e, 0xa1, 0x97, 0xa3, 0x59, 0x79, 0x2b, 0x93, 0x28, 0x6d,
+			0xea, 0x8a, 0xb7, 0x22, 0xb2, 0x24, 0x78, 0xa0, 0x40, 0x37 };
 	char stream[1024];
 	uint8 digest[PG_SHA256_DIGEST_LENGTH];
 	RfOpcodeRouteV1 route;
@@ -114,7 +115,7 @@ UT_TEST(test_route_canonical_key_stream)
 		used += pg_snprintf(stream + used, sizeof(stream) - used, "%03u:%02X\n", route.rmid,
 							route.normalized_info);
 	}
-	UT_ASSERT_EQ(used, 966);
+	UT_ASSERT_EQ(used, 980);
 	sha256_bytes((const uint8 *)stream, used, digest);
 	if (memcmp(digest, expected, sizeof(expected)) != 0) {
 		size_t j;
@@ -155,6 +156,26 @@ UT_TEST(test_route_xact_flags_are_exact)
 				 RF_OPCODE_ROUTE_FLAG_ILLEGAL);
 	UT_ASSERT_EQ(rf_opcode_route_lookup_v1(RM_XACT_ID, 0xB0, false, false, &route),
 				 RF_OPCODE_ROUTE_OK);
+}
+
+UT_TEST(test_space_identity_has_only_a_typed_storage_owner)
+{
+	RfOpcodeRouteV1 route;
+	RfOpcodeRouteV1 saved;
+
+	memset(&route, 0, sizeof(route));
+	UT_ASSERT_EQ(rf_opcode_route_lookup_v1(RM_SMGR_ID,
+										   XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE, false,
+										   false, &route),
+				 RF_OPCODE_ROUTE_OK);
+	UT_ASSERT_EQ(route.record_owner, RF_ROUTE_OWNER_SIDE_TYPED);
+	UT_ASSERT_EQ(route.codec_id, RF_ROUTE_CODEC_SIDE_STANDARD);
+	UT_ASSERT_EQ(route.block_policy, RF_ROUTE_BLOCKS_FORBIDDEN);
+	saved = route;
+	UT_ASSERT_EQ(
+		rf_opcode_route_lookup_v1(RM_SMGR_ID, XLOG_SMGR_SPACE_IDENTITY, true, false, &route),
+		RF_OPCODE_ROUTE_BLOCK_SHAPE_INVALID);
+	UT_ASSERT(memcmp(&route, &saved, sizeof(route)) == 0);
 }
 
 UT_TEST(test_route_ctrc_release_is_active_typed_side_record)
@@ -228,7 +249,7 @@ UT_TEST(test_every_manifest_row_has_one_total_route)
 	}
 
 	UT_ASSERT_EQ(page_count, 77);
-	UT_ASSERT_EQ(side_count, 60);
+	UT_ASSERT_EQ(side_count, 62);
 	UT_ASSERT_EQ(logical_count, 1);
 }
 
@@ -333,11 +354,12 @@ UT_TEST(test_route_failures_leave_output_untouched)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_route_abi_and_counts);
 	UT_RUN(test_route_canonical_key_stream);
 	UT_RUN(test_route_page_and_side_block_policies);
 	UT_RUN(test_route_xact_flags_are_exact);
+	UT_RUN(test_space_identity_has_only_a_typed_storage_owner);
 	UT_RUN(test_route_ctrc_release_is_active_typed_side_record);
 	UT_RUN(test_route_cluster_owners_are_not_family_defaults);
 	UT_RUN(test_every_manifest_row_has_one_total_route);

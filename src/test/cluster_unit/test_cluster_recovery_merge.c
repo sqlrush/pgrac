@@ -233,7 +233,7 @@ UT_TEST(test_class_local_noblock)
 	UT_ASSERT_EQ((int)cluster_recovery_record_class(RM_XLOG_ID, false, false, true),
 				 (int)CLUSTER_RECMERGE_LOCAL);
 	UT_ASSERT_EQ((int)cluster_recovery_record_class(RM_RELMAP_ID, false, false, true),
-				 (int)CLUSTER_RECMERGE_LOCAL);
+				 (int)CLUSTER_RECMERGE_UNCLASSIFIABLE);
 }
 
 UT_TEST(test_class_unclassifiable_noblock)

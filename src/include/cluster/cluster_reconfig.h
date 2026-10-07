@@ -102,6 +102,21 @@ typedef enum ClusterReplacementCommittedClosedPublishResultV1 {
  */
 #define CLUSTER_RECONFIG_DEAD_BITMAP_BYTES 16
 
+#include "cluster/cluster_write_fence.h"
+
+/* QVOTEC-only disk observation; memory, never a persistent authority.
+ * sampled_at_us is the beginning of the scan, not the end of a slow I/O.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterFormationDiskSnapshot {
+	uint64 sampled_at_us;
+	uint64 self_incarnation;
+	uint64 max_epoch;
+	uint64 max_generation;
+	ClusterFenceAuthorityProof fence;
+	bool complete;
+} ClusterFormationDiskSnapshot;
+
+
 /*
  * spec-5.14 D6 — number of touched_peers ingress classes (mirrors
  * CLUSTER_TOUCH_KIND_COUNT in cluster_touched_peers.h; kept as a plain
@@ -315,6 +330,7 @@ typedef struct ClusterReconfigState {
 	 * (INV-J7 floor / INV-J8 decision SSOT).
 	 */
 	ClusterMembershipTable membership;
+	pg_atomic_uint64 membership_cut_generation;
 
 	/*
 	 * spec-5.15 D4 — pending-join set: declared peers currently in the
@@ -484,14 +500,18 @@ typedef struct ClusterReconfigState {
 	 *     generation qvotec found across region 7 at startup (0 = none);
 	 *     the arbiter writes max+1 (monotonic takeover rule).
 	 *   observed_formation_marker_* — this node's OWN region-7 slot,
-	 *     re-read by qvotec each poll; valid=1 only when the slot carries
+	 *     re-read by qvotec each poll; generation!=0 only when the slot carries
 	 *     a CRC-valid COMMITTED marker (generation/epoch/arbiter identity
 	 *     + the per-member incarnation table).  The cold-formation
 	 *     admission consumes it (exact incarnation -> record_admitted ->
-	 *     MEMBER).  The table is written by qvotec before valid flips to 1
-	 *     and re-read after (torn-free pairing with the generation latch).
+	 *     MEMBER).  The single publisher brackets all fields with an odd/even
+	 *     sequence; admission requires the same even sequence on both reads.
 	 */
 	pg_atomic_uint64 formation_marker_max_generation;
+	/* PGRAC: single-QVOTEC publication sequence prevents mixed observations.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	pg_atomic_uint64 observed_formation_marker_seq;
+	pg_atomic_uint64 observed_formation_marker_nonce;
 	pg_atomic_uint64 observed_formation_marker_generation; /* 0 = none */
 	pg_atomic_uint64 observed_formation_marker_epoch;
 	pg_atomic_uint64 observed_formation_marker_arbiter_node;
@@ -504,13 +524,20 @@ typedef struct ClusterReconfigState {
 	 * metadata may be published, but it does not open self_join_admitted.
 	 */
 	ClusterReplacementEpisode replacement_episode;
+	/* PGRAC: accepted durable formation, recovery CONTROL only until native
+	 * INSTALL and stripe completion. Protected by lock, never disk authority.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	ClusterFormationDiskSnapshot formation_disk_snapshot;
+	ClusterFormationCommitMarker startup_formation;
+	ClusterFenceMarker startup_expected_fence;
+	uint64 startup_formation_incarnations[CLUSTER_MAX_NODES];
 } ClusterReconfigState;
 
-/* RF-ROOT P9 verification (cold-formation): +16 bytes = the bootstrap
- * publication seqlock (observed_bootstrap_seq) + the same-round in-quorum
- * snapshot (bootstrap_in_quorum). */
-StaticAssertDecl(sizeof(ClusterReconfigState) == 12640,
-				 "cluster reconfig state must remain exactly 12,640 bytes");
+/* PGRAC: includes the observation sequence and exact startup cohort binding;
+ * the allocator uses sizeof, and all processes require the same build.
+ * Author: SqlRush <sqlrush@gmail.com> */
+StaticAssertDecl(sizeof(ClusterReconfigState) == 13936,
+				 "cluster reconfig state must remain exactly 13,936 bytes");
 
 
 /* ============================================================
@@ -808,6 +835,10 @@ extern bool
 cluster_reconfig_formation_qvotec_poll_pending(ClusterFormationMarkerSubmitRequest *out);
 extern void cluster_reconfig_formation_qvotec_complete(bool success);
 extern void cluster_reconfig_formation_qvotec_note_max_generation(uint64 generation);
+extern bool cluster_reconfig_formation_needs_disk_snapshot(void);
+extern void cluster_reconfig_formation_qvotec_publish_disk_snapshot(
+	const ClusterFormationDiskSnapshot *snapshot);
+extern bool cluster_reconfig_read_formation_fence_snapshot(ClusterFenceAuthorityProof *out);
 extern void
 cluster_reconfig_formation_qvotec_publish_observed(const ClusterFormationCommitMarker *marker,
 												   const uint64 *incarnation_by_node);
@@ -862,7 +893,9 @@ extern bool cluster_reconfig_join_in_progress(void);
  * adopt the admitted epoch (may jump >16) AND set self MEMBER, THEN open the
  * write gate (gate-open guard = adopt && state==MEMBER — P1-r5 half-publish).
  */
-extern void cluster_reconfig_note_self_admitted(uint64 admitted_epoch);
+struct ClusterFenceMarker;
+extern void cluster_reconfig_note_self_admitted(uint64 admitted_epoch,
+												const struct ClusterFenceMarker *marker);
 extern bool cluster_reconfig_self_join_admitted(void); /* RF-ROOT P6 */
 /* Approved epoch-0 late-founder bridge.  This is a read-only conjunction of
  * current QVOTEC peer identity, exact admitted membership, and the already-
@@ -931,6 +964,10 @@ typedef struct ClusterR4MembershipSnapshot {
 extern bool
 cluster_reconfig_snapshot_initial_clean_formation(ClusterInitialCleanFormationSnapshot *out);
 extern bool cluster_reconfig_lmon_snapshot_r4_membership(ClusterR4MembershipSnapshot *out);
+/* Read-only terminal inquiry: only this remote MEMBER may lack freshness.
+ * This is not an online liveness/admission or block-owner projection. */
+extern bool cluster_reconfig_terminal_peer_membership(int32 peer_node_id,
+													  ClusterR4MembershipSnapshot *out);
 /* Formation-LMON-only coherent MEMBER/epoch sample for PGSA reconstruction. */
 extern bool cluster_reconfig_lmon_snapshot_admitted_membership(uint64 *out_members_lo,
 															   uint64 *out_members_hi,

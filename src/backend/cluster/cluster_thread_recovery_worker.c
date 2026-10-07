@@ -53,6 +53,7 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "utils/memutils.h"
+#include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -66,6 +67,7 @@
 #include "cluster/cluster_semantic_activation.h" /* bit22 cutover latch (contract §B) */
 #include "cluster/cluster_thread_recovery.h"	 /* slot helpers + replay_one + gates          */
 #include "cluster/cluster_thread_recovery_authority.h"
+#include "cluster_control_root_private.h"
 #include "cluster/storage/cluster_shared_fs.h" /* shared backend (scope)                    */
 
 /*
@@ -82,8 +84,9 @@ thread_recovery_worker_run(const ClusterThreadRecLaunchEligibility *eligibility)
 	PgracExternalFenceAdmissionSetV1 *admissions = NULL;
 	ClusterControlRootSnapshot root_snapshot;
 	ClusterControlRootReadToken root_token;
+	ClusterControlRecoverySubject pending_subject;
 	ClusterRecoverySerialRequest serial_request;
-	ClusterRecoverySerialGuard serial_guard;
+	ClusterRecoverySerialGuard *serial_guard;
 	ClusterWalRetentionInterval pin_interval;
 	ClusterWalRetentionPinThreadRequest pin_request;
 	ClusterWalRetentionPin *retention_pin = NULL;
@@ -102,18 +105,21 @@ thread_recovery_worker_run(const ClusterThreadRecLaunchEligibility *eligibility)
 	uint64 launch_epoch;
 	uint16 dead_tid;
 	bool slot_read;
+	bool pending;
+	bool completion_attempted = false;
 	int fence_timeout_ms;
 
 	fence_timeout_ms = cluster_external_fence_acquire_timeout_ms;
 	if (eligibility == NULL)
 		return CLUSTER_THREADREC_DEFERRED;
 	dead_tid = eligibility->origin_thread;
+	pending = eligibility->subject_kind == CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER;
 
 	/* The launch must have marked the slot REPLAYING; anything else means this
 	 * spawn raced a reset or a newer launch -> moot (do not touch the slot). */
 	slot_read = cluster_thread_recovery_replay_read(dead_tid, &state, &launch_epoch);
-	if (!cluster_thread_recovery_worker_start_valid(eligibility, dead_tid, slot_read, state,
-													launch_epoch))
+	if (!cluster_thread_recovery_worker_start_valid_for_claim(
+			eligibility, dead_tid, slot_read, state, launch_epoch, cluster_shared_config))
 		return CLUSTER_THREADREC_DEFERRED;
 
 	/* L235 BEFORE: a stale launch epoch means the reconfig episode advanced past
@@ -122,6 +128,21 @@ thread_recovery_worker_run(const ClusterThreadRecLaunchEligibility *eligibility)
 	if (cluster_thread_recovery_replay_epoch_aborts(launch_epoch,
 													cluster_grd_redeclare_episode_epoch()))
 		return CLUSTER_THREADREC_NOT_APPLICABLE;
+
+	/* PGRAC: bgw_extra carries a root seal, not authority. Re-read the full
+	 * pending operation before asking the provider to isolate its exact W1.
+	 * W0's checkpoint must never be copied into that recovery identity.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (pending) {
+		root_result = cluster_control_root_read_recovery_subject(dead_tid, &eligibility->duty,
+																 &pending_subject);
+		if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			|| pending_subject.kind != CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER
+			|| memcmp(pending_subject.pending.file.image_sha256, eligibility->selected_root_sha256,
+					  32)
+				   != 0)
+			return CLUSTER_THREADREC_DEFERRED;
+	}
 
 	/* All waitable evidence is obtained before IR.  The current provider-0
 	 * package deterministically stops at NeedSet/admit with BLOCKED and performs
@@ -160,21 +181,62 @@ thread_recovery_worker_run(const ClusterThreadRecLaunchEligibility *eligibility)
 		return CLUSTER_THREADREC_DEFERRED;
 	}
 
-	root_result = cluster_control_root_read_canonical(
-		eligibility->duty.origin_thread_id, &eligibility->duty, CLUSTER_CONTROL_ROOT_READ_STRONG,
-		&root_snapshot, &root_token);
-	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-		|| root_snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
-		|| memcmp(&root_snapshot.identity, &eligibility->duty, sizeof(eligibility->duty)) != 0) {
-		cluster_external_fence_admission_set_release(&admissions);
-		cluster_external_fence_need_set_release(&needs);
-		cluster_formation_witness_destroy(&formation);
-		return CLUSTER_THREADREC_DEFERRED;
+	if (!pending) {
+		root_result = cluster_control_root_read_canonical(
+			eligibility->duty.origin_thread_id, &eligibility->duty,
+			CLUSTER_CONTROL_ROOT_READ_STRONG, &root_snapshot, &root_token);
+		/* PGRAC: seal the failed writer's input before acquiring replay owners.
+	 * The input publisher holds its own WALR/IR/CF and returns only after
+	 * confirmed release. Never promote that input-only guard into replay.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+		if (cluster_shared_config && root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& memcmp(&root_snapshot.identity, &eligibility->duty, sizeof(eligibility->duty))
+				   == 0) {
+			memset(&serial_request, 0, sizeof(serial_request));
+			serial_request.mode = CLUSTER_RECOVERY_SERIAL_INPUT_SEAL;
+			serial_request.duty = eligibility->duty;
+			serial_request.expected_root_token = root_token;
+			serial_request.formation = formation;
+			serial_request.fence_need_set = needs;
+			serial_request.fence_admission_set = admissions;
+			serial_request.acquire_timeout_ms = fence_timeout_ms;
+			serial_request.release_timeout_ms = fence_timeout_ms;
+			if (root_snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
+				root_result = cluster_control_root_v3_failure_open_publish(
+					&serial_request, &root_snapshot, &root_token);
+				serial_request.expected_root_token = root_token;
+			}
+			if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& root_snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+				&& (root_snapshot.root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) == 0)
+				root_result = cluster_control_root_v3_failure_tail_publish(
+					&serial_request, &root_snapshot, &root_token);
+			if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				root_result = cluster_control_root_read_canonical(
+					eligibility->duty.origin_thread_id, &eligibility->duty,
+					CLUSTER_CONTROL_ROOT_READ_STRONG, &root_snapshot, &root_token);
+		}
+		if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+			|| root_snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+			|| memcmp(&root_snapshot.identity, &eligibility->duty, sizeof(eligibility->duty))
+				   != 0) {
+			cluster_external_fence_admission_set_release(&admissions);
+			cluster_external_fence_need_set_release(&needs);
+			cluster_formation_witness_destroy(&formation);
+			return CLUSTER_THREADREC_DEFERRED;
+		}
 	}
-	if (!cluster_thread_recovery_pin_request_build_v1(dead_tid, &eligibility->duty, &root_snapshot,
-													  &root_token, formation, needs, admissions,
-													  &pin_interval, &pin_request)) {
+	if (pending) {
+		memset(&pin_request, 0, sizeof(pin_request));
+		pin_request.duty = eligibility->duty;
+		pin_request.pending = pending_subject.pending;
+		pin_request.formation = formation;
+		pin_request.needs = needs;
+		pin_request.admissions = admissions;
+	} else if (!cluster_thread_recovery_pin_request_build_v1(
+				   dead_tid, &eligibility->duty, &root_snapshot, &root_token, formation, needs,
+				   admissions, &pin_interval, &pin_request)) {
 		cluster_external_fence_admission_set_release(&admissions);
 		cluster_external_fence_need_set_release(&needs);
 		cluster_formation_witness_destroy(&formation);
@@ -194,19 +256,29 @@ thread_recovery_worker_run(const ClusterThreadRecLaunchEligibility *eligibility)
 				   : CLUSTER_THREADREC_BLOCKED;
 	}
 	memset(&serial_request, 0, sizeof(serial_request));
-	serial_request.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+	serial_request.mode
+		= pending ? CLUSTER_RECOVERY_SERIAL_INITIALIZER : CLUSTER_RECOVERY_SERIAL_ONLINE;
 	serial_request.duty = eligibility->duty;
-	serial_request.expected_root_token = root_token;
+	if (pending)
+		serial_request.pending = pending_subject.pending;
+	else
+		serial_request.expected_root_token = root_token;
 	serial_request.formation = formation;
 	serial_request.fence_need_set = needs;
 	serial_request.fence_admission_set = admissions;
 	serial_request.acquire_timeout_ms = fence_timeout_ms;
 	serial_request.release_timeout_ms = fence_timeout_ms;
-	serial_result = cluster_recovery_serial_acquire(&serial_request, &serial_guard);
+	/* The post-IR publisher can ERROR after mutating the guard. Keep the
+	 * original guard stable across longjmp and until its bound pin is gone. */
+	serial_guard = palloc0(sizeof(*serial_guard));
+	serial_result = cluster_recovery_serial_acquire(&serial_request, serial_guard);
 	if (serial_result != CLUSTER_RECOVERY_SERIAL_GRANTED) {
+		if (serial_guard->held || serial_guard->release_uncertain)
+			return CLUSTER_THREADREC_BLOCKED;
 		walr_release_result = cluster_wal_retention_pin_release(&retention_pin);
 		if (walr_release_result != CLUSTER_WALR_RELEASE_CONFIRMED)
 			return CLUSTER_THREADREC_BLOCKED;
+		pfree(serial_guard);
 		cluster_external_fence_admission_set_release(&admissions);
 		cluster_external_fence_need_set_release(&needs);
 		cluster_formation_witness_destroy(&formation);
@@ -214,13 +286,16 @@ thread_recovery_worker_run(const ClusterThreadRecLaunchEligibility *eligibility)
 				   ? CLUSTER_THREADREC_BLOCKED
 				   : CLUSTER_THREADREC_DEFERRED;
 	}
-	pin_result = cluster_wal_retention_pin_bind_one(retention_pin, &serial_guard);
+	pin_result = cluster_wal_retention_pin_bind_one(retention_pin, serial_guard);
 	if (pin_result != CLUSTER_WAL_PIN_OK) {
-		release_result = cluster_recovery_serial_release(&serial_guard);
+		release_result = cluster_recovery_serial_release(serial_guard);
+		if (release_result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
+			return CLUSTER_THREADREC_BLOCKED;
 		walr_release_result = cluster_wal_retention_pin_release(&retention_pin);
 		if (release_result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED
 			|| walr_release_result != CLUSTER_WALR_RELEASE_CONFIRMED)
 			return CLUSTER_THREADREC_BLOCKED;
+		pfree(serial_guard);
 		cluster_external_fence_admission_set_release(&admissions);
 		cluster_external_fence_need_set_release(&needs);
 		cluster_formation_witness_destroy(&formation);
@@ -235,22 +310,75 @@ thread_recovery_worker_run(const ClusterThreadRecLaunchEligibility *eligibility)
 	authority.fence_need_set = needs;
 	authority.fence_admission_set = admissions;
 	authority.retention_pin = retention_pin;
-	authority.serial_guard = &serial_guard;
-	if (cluster_thread_recovery_authority_revalidate_nowait_v1(&authority)
-		!= CLUSTER_THREAD_AUTHORITY_OK) {
+	authority.serial_guard = serial_guard;
+	if (!pending
+		&& cluster_thread_recovery_authority_revalidate_nowait_v1(&authority)
+			   != CLUSTER_THREAD_AUTHORITY_OK) {
 		cluster_write_fence_note_external_mutation_gate_blocked();
 		result = CLUSTER_THREADREC_DEFERRED;
 	} else {
 		PG_TRY();
 		{
-			result = cluster_thread_recovery_replay_one(dead_tid, launch_epoch, &authority);
+			if (pending) {
+				root_result
+					= cluster_control_root_v3_initializer_finish(serial_guard, retention_pin);
+				/* Only actual durable terminal publication means done. A real
+				 * checkpoint must continue through ordinary recovery promotion. */
+				if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+					result = CLUSTER_THREADREC_DONE;
+				else
+					result = root_result == CLUSTER_CONTROL_ROOT_STALE_TOKEN
+									 || root_result == CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+									 || root_result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+									 || root_result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+								 ? CLUSTER_THREADREC_DEFERRED
+								 : CLUSTER_THREADREC_BLOCKED;
+			} else {
+				result = cluster_thread_recovery_replay_one(dead_tid, launch_epoch, &authority);
+				if (cluster_shared_config && result == CLUSTER_THREADREC_DONE) {
+					ClusterControlRootPatch complete;
+					ClusterControlRootSnapshot published;
+					ClusterThreadRecoveryRootFinalizeResultV1 finalized;
+
+					completion_attempted = true;
+					/* DATA/SIDE completion alone is not canonical closure. Build
+					 * the exact terminal while IR is held, then use the original
+					 * sealed WALR owner across confirmed IR release and ROOT I/O. */
+					if (cluster_thread_recovery_authority_revalidate_nowait_v1(&authority)
+							!= CLUSTER_THREAD_AUTHORITY_OK
+						|| !cluster_thread_recovery_root_complete_patch_build_v1(
+							&authority, root_snapshot.validated_tail_lsn_exclusive, &complete)
+						|| cluster_wal_retention_pin_seal_for_root_publish(retention_pin)
+							   != CLUSTER_WAL_PIN_OK)
+						result = CLUSTER_THREADREC_BLOCKED;
+					else if (cluster_recovery_serial_release(serial_guard)
+							 != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
+						result = CLUSTER_THREADREC_BLOCKED;
+					else {
+						finalized = cluster_thread_recovery_root_finalize_after_ir_v1(
+							&authority, &complete, &published);
+						result
+							= finalized == CLUSTER_THREAD_ROOT_FINALIZE_OK
+									  || finalized == CLUSTER_THREAD_ROOT_FINALIZE_ALREADY_COMPLETE
+								  ? CLUSTER_THREADREC_DONE
+							  : finalized == CLUSTER_THREAD_ROOT_FINALIZE_RETRY
+								  ? CLUSTER_THREADREC_DEFERRED
+								  : CLUSTER_THREADREC_BLOCKED;
+					}
+				}
+			}
 		}
 		PG_CATCH();
 		{
-			release_result = cluster_recovery_serial_release(&serial_guard);
-			walr_release_result = cluster_wal_retention_pin_release(&retention_pin);
+			release_result = !serial_guard->held && !serial_guard->release_uncertain
+								 ? CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED
+								 : cluster_recovery_serial_release(serial_guard);
+			walr_release_result = release_result == CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED
+									  ? cluster_wal_retention_pin_release(&retention_pin)
+									  : CLUSTER_WALR_RELEASE_UNCONFIRMED;
 			if (release_result == CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED
 				&& walr_release_result == CLUSTER_WALR_RELEASE_CONFIRMED) {
+				pfree(serial_guard);
 				cluster_external_fence_admission_set_release(&admissions);
 				cluster_external_fence_need_set_release(&needs);
 				cluster_formation_witness_destroy(&formation);
@@ -260,16 +388,22 @@ thread_recovery_worker_run(const ClusterThreadRecLaunchEligibility *eligibility)
 		PG_END_TRY();
 	}
 
-	/* IR and WAL retention stay held through replay_one's publish.  A stale
-	 * final bundle forbids DONE even if replay completed. */
-	if (cluster_thread_recovery_authority_revalidate_nowait_v1(&authority)
-		!= CLUSTER_THREAD_AUTHORITY_OK)
+	/* A finalizer already consumed its sealed proof after confirmed IR
+	 * release. Other paths still hold the original replay authority here. */
+	if (!pending && !completion_attempted
+		&& cluster_thread_recovery_authority_revalidate_nowait_v1(&authority)
+			   != CLUSTER_THREAD_AUTHORITY_OK)
 		result = CLUSTER_THREADREC_BLOCKED;
-	release_result = cluster_recovery_serial_release(&serial_guard);
+	release_result = !serial_guard->held && !serial_guard->release_uncertain
+						 ? CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED
+						 : cluster_recovery_serial_release(serial_guard);
+	if (release_result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
+		return CLUSTER_THREADREC_BLOCKED;
 	walr_release_result = cluster_wal_retention_pin_release(&retention_pin);
 	if (release_result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED
 		|| walr_release_result != CLUSTER_WALR_RELEASE_CONFIRMED)
 		return CLUSTER_THREADREC_BLOCKED;
+	pfree(serial_guard);
 	cluster_external_fence_admission_set_release(&admissions);
 	cluster_external_fence_need_set_release(&needs);
 	cluster_formation_witness_destroy(&formation);
@@ -304,9 +438,15 @@ cluster_thread_recovery_worker_main(Datum main_arg)
 		return;
 	memcpy(&eligibility, MyBgworkerEntry->bgw_extra, sizeof(eligibility));
 	slot_read = cluster_thread_recovery_replay_read((uint16)dead_tid, &state, &launch_epoch);
-	if (!cluster_thread_recovery_worker_start_valid(&eligibility, (uint16)dead_tid, slot_read,
-													state, launch_epoch))
+	if (!cluster_thread_recovery_worker_start_valid_for_claim(
+			&eligibility, (uint16)dead_tid, slot_read, state, launch_epoch, cluster_shared_config))
 		return;
+
+	/* PGRAC: SHMEM-only workers do not enter InitPostgres, which normally
+	 * establishes this lifetime. WAL retention and replay resources must have
+	 * an owner before any acquisition; the native helper installs exit cleanup.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	CreateAuxProcessResourceOwner();
 
 	/* Cleanup authority on every controlled exit; scheduler state is reaped only
 	 * by the LMON owner after exact BGWH_STOPPED evidence. */
@@ -359,9 +499,9 @@ static bool
 thread_recovery_eligibility_valid(const ClusterThreadRecLaunchEligibility *eligibility)
 {
 	return eligibility != NULL
-		   && cluster_thread_recovery_worker_start_valid(eligibility, eligibility->origin_thread,
-														 true, CLUSTER_THREADREC_REPLAY_REPLAYING,
-														 eligibility->attempt_stamp);
+		   && cluster_thread_recovery_worker_start_valid_for_claim(
+			   eligibility, eligibility->origin_thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING,
+			   eligibility->attempt_stamp, cluster_shared_config);
 }
 
 static bool
@@ -474,9 +614,12 @@ thread_recovery_launch_one(const ClusterThreadRecLaunchEligibility *eligibility)
 	 * pinned fields and never re-acquires CF(S) inside the episode
 	 * (follow-up item 2).  The launch attempt stamp is the projection's
 	 * episode identity.  A pin failure leaves the projection absent ->
-	 * the worker fails closed (window derivation BLOCKED).
+	 * the worker fails closed (window derivation BLOCKED).  PRE2 shared
+	 * config instead seals the input in the worker and consumes its held
+	 * WALR/IR authority.  A second LMON CF read can be pending and predates
+	 * that sealing, so it is not the PRE2 worker's replay authority.
 	 */
-	if (cluster_r4_bit22_cutover_active()) {
+	if (!cluster_shared_config && cluster_r4_bit22_cutover_active()) {
 		(void)cluster_thread_recovery_pin_projection(dead_tid, eligibility->attempt_stamp);
 	}
 	if (register_one_worker(eligibility, &owned->handle)) {

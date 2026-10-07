@@ -536,7 +536,7 @@ UT_TEST(test_mvcc_frozen_xmin_bypasses_remote_resolve_but_keeps_xmax_gate)
 	mvcc = strstr(source, "if (cluster_enabled && BufferIsValid(buffer)");
 	frozen = mvcc == NULL
 				 ? NULL
-				 : strstr(mvcc, "if (!cluster_vis_xmin_needs_resolution(tuple->t_infomask))");
+				 : strstr(mvcc, "if (!cluster_vis_xmin_needs_resolution(tuple->t_infomask)\n");
 	xmax_gate
 		= frozen == NULL
 			  ? NULL
@@ -553,7 +553,9 @@ UT_TEST(test_mvcc_frozen_xmin_bypasses_remote_resolve_but_keeps_xmax_gate)
 	free(source);
 }
 
-/* Spec 8.4A I18/I19: the normal commit-stamp is a live block0 modifier. */
+/* Spec 8.4A I18/I19: the normal commit-stamp is a live block0 modifier.  It
+ * is staged under the admission, which stays held until the stamp is applied
+ * after the commit record flush, and released on every error (F-D-29). */
 UT_TEST(test_normal_commit_stamp_is_modifier_gated_and_error_safe)
 {
 	char *source = read_source(TT_LOCAL_SOURCE_PATH);
@@ -564,23 +566,42 @@ UT_TEST(test_normal_commit_stamp_is_modifier_gated_and_error_safe)
 	const char *try_block;
 	const char *recheck;
 	const char *durable;
-	const char *finally_block;
+	const char *catch_block;
+	const char *unstage;
 	const char *leave;
+	const char *rethrow;
+	const char *keep;
+	const char *apply_start;
+	const char *apply;
+	const char *apply_leave;
 
 	if (source == NULL)
 		return;
 	start = strstr(source, "\ncluster_tt_local_precommit_durable_finish(");
-	end = start == NULL ? NULL : strstr(start, "\n}\n\nvoid\ncluster_tt_local_record_commit(");
+	end = start == NULL ? NULL : strstr(start, "\n}\n");
 	published = start == NULL
 					? NULL
 					: strstr(start, "cluster_tt_local_get_published_binding(xid, &binding)");
 	enter = start == NULL ? NULL : strstr(start, "cluster_semantic_activation_modifier_enter(");
 	try_block = start == NULL ? NULL : strstr(start, "PG_TRY();");
 	recheck = start == NULL ? NULL : strstr(start, "cluster_tt_local_modifier_recheck_or_error(");
-	durable = recheck == NULL ? NULL : strstr(recheck, "cluster_tt_slot_durable_commit_writeonly(");
-	finally_block = start == NULL ? NULL : strstr(start, "PG_FINALLY();");
-	leave = finally_block == NULL ? NULL
-								  : strstr(finally_block, "cluster_semantic_activation_leave(");
+	durable = recheck == NULL ? NULL : strstr(recheck, "cluster_tt_slot_durable_commit_stage(");
+	catch_block = start == NULL ? NULL : strstr(start, "PG_CATCH();");
+	unstage = catch_block == NULL
+				  ? NULL
+				  : strstr(catch_block, "cluster_tt_slot_durable_commit_unstage();");
+	leave = catch_block == NULL
+				? NULL
+				: strstr(catch_block, "cluster_semantic_activation_leave(&modifier_token);");
+	rethrow = catch_block == NULL ? NULL : strstr(catch_block, "PG_RE_THROW();");
+	keep = rethrow == NULL ? NULL
+						   : strstr(rethrow, "cluster_tt_local_commit_admission = modifier_token;");
+	apply_start = strstr(source, "\ncluster_tt_local_commit_durable_apply(");
+	apply
+		= apply_start == NULL ? NULL : strstr(apply_start, "cluster_tt_slot_durable_commit_apply(");
+	apply_leave = apply == NULL ? NULL
+								: strstr(apply, "cluster_semantic_activation_leave("
+												"&cluster_tt_local_commit_admission);");
 
 	UT_ASSERT_NOT_NULL(start);
 	UT_ASSERT_NOT_NULL(end);
@@ -589,13 +610,19 @@ UT_TEST(test_normal_commit_stamp_is_modifier_gated_and_error_safe)
 	UT_ASSERT_NOT_NULL(try_block);
 	UT_ASSERT_NOT_NULL(recheck);
 	UT_ASSERT_NOT_NULL(durable);
-	UT_ASSERT_NOT_NULL(finally_block);
+	UT_ASSERT_NOT_NULL(catch_block);
+	UT_ASSERT_NOT_NULL(unstage);
 	UT_ASSERT_NOT_NULL(leave);
+	UT_ASSERT_NOT_NULL(rethrow);
+	UT_ASSERT_NOT_NULL(keep);
+	UT_ASSERT_NOT_NULL(apply);
+	UT_ASSERT_NOT_NULL(apply_leave);
 	if (start != NULL && end != NULL && published != NULL && enter != NULL && try_block != NULL
-		&& recheck != NULL && durable != NULL && finally_block != NULL && leave != NULL)
+		&& recheck != NULL && durable != NULL && catch_block != NULL && unstage != NULL
+		&& leave != NULL && rethrow != NULL && keep != NULL)
 		UT_ASSERT(start < published && published < enter && enter < try_block && try_block < recheck
-				  && recheck < durable && durable < finally_block && finally_block < leave
-				  && leave < end);
+				  && recheck < durable && durable < catch_block && catch_block < unstage
+				  && unstage < leave && leave < rethrow && rethrow < keep && keep < end);
 	free(source);
 }
 
@@ -827,6 +854,7 @@ UT_TEST(test_writer_proof_entry_excludes_native_inplace_and_keyshare_shortcuts)
 int
 main(void)
 {
+	UT_PLAN(24);
 	UT_RUN(test_t1_undo_tt_slot_ref_sizeof_32);
 	UT_RUN(test_t2_ref_field_offsets);
 	UT_RUN(test_t3_placeholder_ref_sentinel);

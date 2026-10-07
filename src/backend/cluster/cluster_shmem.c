@@ -87,7 +87,8 @@
 #include "cluster/cluster_ges.h"		   /* cluster_ges_shmem_register (spec-2.13) */
 #include "cluster/cluster_advisory.h"	   /* cluster_advisory_shmem_register (spec-5.5 D8) */
 #include "cluster/cluster_pcm_own.h"	   /* cluster_pcm_own_shmem_register (ownership-gen wave) */
-#include "cluster/cluster_cf_stats.h"	   /* cluster_cf_stats_shmem_register (spec-5.6 Dc4) */
+#include "cluster/cluster_page_wal.h"
+#include "cluster/cluster_cf_stats.h"		/* cluster_cf_stats_shmem_register (spec-5.6 Dc4) */
 #include "cluster/cluster_ges_reply_wait.h" /* cluster_ges_reply_wait_shmem_register (spec-2.23 D1) */
 #include "cluster/cluster_grd.h"			/* cluster_grd_shmem_register (spec-2.14) */
 #include "cluster/cluster_grd_pending.h"	/* cluster_grd_pending_shmem_register (spec-2.16 D3) */
@@ -98,10 +99,11 @@
 #include "cluster/cluster_block_recovery.h" /* cluster_block_recovery_shmem_register (spec-4.10 D6) */
 #include "cluster/cluster_grd_outbound.h"	/* cluster_grd_outbound_shmem_register (spec-2.16 D4) */
 #include "cluster/cluster_grd_work_queue.h" /* cluster_grd_work_queue_shmem_register (spec-2.16 D5) */
-#include "cluster/cluster_stats.h"			/* cluster_stats_shmem_register (1.14 Sprint A) */
-#include "cluster/cluster_lmon.h"			/* cluster_lmon_shmem_register (1.11 Sprint A) */
-#include "cluster/cluster_gcs.h"			/* cluster_gcs_module_init (spec-2.32 D2) */
-#include "cluster/cluster_gcs_block.h"		/* cluster_gcs_block_module_init (spec-2.33 D3) */
+#include "cluster/cluster_control_request.h"
+#include "cluster/cluster_stats.h"			 /* cluster_stats_shmem_register (1.14 Sprint A) */
+#include "cluster/cluster_lmon.h"			 /* cluster_lmon_shmem_register (1.11 Sprint A) */
+#include "cluster/cluster_gcs.h"			 /* cluster_gcs_module_init (spec-2.32 D2) */
+#include "cluster/cluster_gcs_block.h"		 /* cluster_gcs_block_module_init (spec-2.33 D3) */
 #include "cluster/cluster_gcs_block_dedup.h" /* cluster_gcs_block_dedup_module_init (spec-2.34 D2) */
 #include "cluster/cluster_pcm_lock.h"		 /* cluster_pcm_lock_module_init (stage 1.7) */
 #include "cluster/cluster_sinval.h"			 /* cluster_sinval_module_init (spec-2.38 D2/D3) */
@@ -695,6 +697,8 @@ cluster_init_shmem_module(void)
 	 * flags (NBuffers entries, indexed by buf_id; atomics only, lock-free). */
 	if (cluster_shmem_lookup_region("pgrac cluster pcm ownership") == NULL)
 		cluster_pcm_own_shmem_register();
+	if (cluster_shmem_lookup_region("pgrac page WAL binding") == NULL)
+		cluster_page_wal_shmem_register();
 
 	/* spec-5.6 Dc4: register cluster_cf_stats shmem region (CF shared-
 	 * authority observability counters; 5 atomic uint64; lock-free). */
@@ -725,6 +729,8 @@ cluster_init_shmem_module(void)
 		cluster_grd_outbound_shmem_register();
 	if (cluster_shmem_lookup_region("pgrac cluster grd work queue") == NULL)
 		cluster_grd_work_queue_shmem_register();
+	if (cluster_shmem_lookup_region("pgrac control requests") == NULL)
+		cluster_control_request_shmem_register();
 	/* PGRAC: spec-7.2 D4 — DATA-plane outbound ring (Q6-B twin). */
 	if (cluster_shmem_lookup_region("pgrac cluster lms data outbound") == NULL)
 		cluster_lms_outbound_shmem_register();

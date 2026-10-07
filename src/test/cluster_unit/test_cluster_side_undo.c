@@ -642,10 +642,38 @@ UT_TEST(test_typed_ctrc_release_requires_exact_terminal_generation_and_post_read
 	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation), CLUSTER_UNDO_TARGET_PROVED_NOOP);
 }
 
+UT_TEST(test_overlapping_undo_record_and_slot_ranges_refuse)
+{
+	FakeRecord fr;
+	ClusterUndoDecoded out;
+	xl_undo_block_write single = { 0 };
+	xl_undo_block_write_multi multi = { 0 };
+	char payload[sizeof(multi) + UNDO_BLOCK_HDR_PREFIX_LEN + 32 + 16] = { 0 };
+	XLogReaderState *record;
+
+	single.instance = multi.instance = 1;
+	single.segment_id = multi.segment_id = 7;
+	single.block_no = multi.block_no = 2;
+	single.rec_off = multi.rec_off = sizeof(UndoBlockHeader);
+	single.rec_len = multi.rec_len = 32;
+	single.slot_off = multi.slot_off = sizeof(UndoBlockHeader) + 24;
+	multi.slot_len = 2 * sizeof(UndoSlotDirEntry);
+	memcpy(payload, &single, sizeof(single));
+	record = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE, payload,
+						 sizeof(single) + UNDO_BLOCK_HDR_PREFIX_LEN + single.rec_len
+							 + sizeof(UndoSlotDirEntry));
+	UT_ASSERT(!cluster_undo_decode(record, &out));
+	memcpy(payload, &multi, sizeof(multi));
+	record
+		= make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE_MULTI, payload,
+					  sizeof(multi) + UNDO_BLOCK_HDR_PREFIX_LEN + multi.rec_len + multi.slot_len);
+	UT_ASSERT(!cluster_undo_decode(record, &out));
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 
 	UT_RUN(test_decode_tt_commit_fields);
 	UT_RUN(test_decode_tt_bind_exact_shape_and_reserved_bytes);
@@ -657,6 +685,7 @@ main(void)
 	UT_RUN(test_typed_tt_bind_applies_only_exact_generation_and_predecessor);
 	UT_RUN(test_typed_exact_abort_requires_same_active_predecessor);
 	UT_RUN(test_typed_ctrc_release_requires_exact_terminal_generation_and_post_read);
+	UT_RUN(test_overlapping_undo_record_and_slot_ranges_refuse);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

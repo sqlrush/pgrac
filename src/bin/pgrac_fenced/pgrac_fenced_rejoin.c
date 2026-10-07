@@ -20,6 +20,7 @@
 #define PGRAC_FENCED_DENY_DAEMON_UNAVAILABLE UINT32_C(10)
 #define PGRAC_FENCED_DENY_TIMEOUT UINT32_C(11)
 #define PGRAC_FENCED_DENY_JOURNAL UINT32_C(12)
+#define PGRAC_FENCED_DENY_REJOIN_INVALIDATED UINT32_C(19)
 #define PGRAC_FENCED_DENY_REJOIN_OFFER_MISMATCH UINT32_C(23)
 #define PGRAC_FENCED_DENY_IO_NOT_DRAINED UINT32_C(30)
 
@@ -157,9 +158,10 @@ resolve_exact(PgracFencedOperationContextV1 *context,
 	memset(resolved, 0, sizeof(*resolved));
 	*provider_result = PGRAC_FENCED_PROVIDER_UNAVAILABLE;
 	*native_status = 0;
-	worker_result = pgrac_fenced_provider_worker_resolve(context->provider,
-		context->allow_test_only, configured, deadline_mono_ns,
-		provider_result, resolved, native_status);
+	worker_result = pgrac_fenced_provider_worker_resolve_configured(
+		context->provider, context->allow_test_only, configured, context->config,
+		context->semantic_config_digest, deadline_mono_ns, provider_result, resolved,
+		native_status);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 	{
 		*provider_result = worker_result ==
@@ -270,9 +272,8 @@ build_rejoin_binding(const PgracFencedOperationContextV1 *context,
 		operation->admin_request.candidate_incarnation;
 	binding->target_mapping_generation =
 		context->config->mapping_generation;
-	if (!pgrac_external_fence_protected_set_digest_v1(
-			context->config->storage_backend_id,
-			context->config->storage_uuid, binding->protected_set_digest))
+	if (!pgrac_fenced_config_protected_set_digest(context->config,
+			operation->admin_request.old_node_id, binding->protected_set_digest))
 		return false;
 	binding->predicate_id = 2;
 	binding->predicate_version = 1;
@@ -298,6 +299,73 @@ bound_request_matches(const PgracFencedRejoinOperationV1 *operation,
 			operation->admin_request.candidate_incarnation;
 }
 
+/* PGRAC: validate before append; only the journal assigns the actual sequence. */
+static bool
+append_owned_record(PgracFencedOperationContextV1 *context,
+					PgracFencedRejoinOperationV1 *operation,
+					PgracFencedJournalRecordV1 *record)
+{
+	PgracFencedJournalRecordV1 check;
+	const PgracFencedJournalRecordV1 *previous = NULL;
+
+	if (context->config->format_version != 2)
+		return pgrac_fenced_operation_append_journal(context, record);
+	memcpy(record->operation_id, operation->operation_id, 16);
+	if (record->intent.kind == PGRAC_FENCED_JOURNAL_INTENT_NONE)
+		record->intent = operation->last_record.intent;
+	if (operation->last_record.seq != 0)
+		previous = &operation->last_record;
+	if (previous != NULL && previous->seq == UINT64_MAX)
+		return false;
+	check = *record;
+	check.seq = previous == NULL ? 1 : previous->seq + 1;
+	if (!pgrac_fenced_journal_intent_continues(previous, &check) ||
+		!pgrac_fenced_operation_append_journal(context, record))
+		return false;
+	operation->last_record = *record;
+	return true;
+}
+
+static bool
+begin_owned_phase(PgracFencedOperationContextV1 *context,
+				  PgracFencedRejoinOperationV1 *operation,
+				  const PgracExternalFenceProtocolRejoinFrameV1 *request)
+{
+	PgracFencedJournalRecordV1 record;
+	PgracExternalFenceProtocolRejoinBindingV1 binding;
+	uint64 now;
+
+	if (context->config->format_version != 2)
+		return true;
+	if (operation->last_record.intent.attempt == UINT64_MAX ||
+		!monotonic_now_ns(&now))
+		return false;
+	record_base(context, PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED,
+		operation->operation_id, now, &record);
+	if (!build_rejoin_binding(context, operation, request->rejoin_gate_digest,
+			&binding, record.binding_digest))
+		return false;
+	record.provider_result = PGRAC_FENCED_PROVIDER_PENDING;
+	record.intent.kind = PGRAC_FENCED_JOURNAL_INTENT_REJOIN;
+	record.intent.attempt = operation->last_record.intent.attempt + 1;
+	record.intent.system_identifier = binding.system_identifier;
+	memcpy(record.intent.target_uuid, operation->target.target_uuid, 16);
+	memcpy(record.intent.protected_set_digest, binding.protected_set_digest, 32);
+	record.intent.request.rejoin = *request;
+	return append_owned_record(context, operation, &record);
+}
+
+static void
+release_terminal_operation(PgracFencedRejoinContextV1 *context,
+						 PgracFencedRejoinOperationV1 *operation)
+{
+	if (context->operation_context->config->format_version == 2 &&
+		!pgrac_fenced_journal_rejoin_terminal(&operation->last_record))
+		return;
+	memset(operation, 0, sizeof(*operation));
+	context->operation_count--;
+}
+
 bool
 pgrac_fenced_rejoin_init(PgracFencedRejoinContextV1 *context,
 				 PgracFencedOperationContextV1 *operation_context)
@@ -308,6 +376,166 @@ pgrac_fenced_rejoin_init(PgracFencedRejoinContextV1 *context,
 	memset(context, 0, sizeof(*context));
 	context->operation_context = operation_context;
 	return true;
+}
+
+bool
+pgrac_fenced_rejoin_restore(PgracFencedRejoinContextV1 *context,
+	PgracFencedJournalReconcileState *pending)
+{
+	bool seen[PGRAC_FENCED_MAX_NODES] = { false };
+	uint32 count = 0;
+	uint32 i;
+
+	if (context == NULL || pending == NULL || context->operation_context == NULL ||
+		context->operation_count != 0 ||
+		!pgrac_fenced_operation_reconcile_startup(context->operation_context, pending))
+		return false;
+	/* PGRAC: validate every original identity before attaching any owner. */
+	for (i = 0; i < PGRAC_FENCED_JOURNAL_MAX_PENDING_OPERATIONS; i++)
+	{
+		const PgracFencedJournalReconcileEntry *entry = &pending->pending[i];
+		const PgracFencedJournalRecordV1 *first = &entry->first_record;
+		const PgracFencedJournalRecordV1 *last = &entry->last_record;
+		int32 node;
+
+		if (!entry->used || last->intent.kind != PGRAC_FENCED_JOURNAL_INTENT_REJOIN)
+			continue;
+		node = last->intent.request.rejoin.old_node_id;
+		if (context->operation_context->config->format_version != 2 ||
+			!pgrac_fenced_journal_intent_continues(NULL, first) ||
+			first->intent.kind != PGRAC_FENCED_JOURNAL_INTENT_REJOIN ||
+			first->record_kind != PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED ||
+			first->intent.request.rejoin.opcode != PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE ||
+			first->intent.attempt != 1 || first->seq == 0 || first->seq != entry->first_seq ||
+			first->seq > last->seq || first->intent.attempt > last->intent.attempt ||
+			first->provider_id != last->provider_id ||
+			first->provider_abi_version != last->provider_abi_version ||
+			first->mapping_generation != last->mapping_generation ||
+			memcmp(first->operation_id, last->operation_id, 16) != 0 ||
+			memcmp(first->semantic_config_digest, last->semantic_config_digest, 32) != 0 ||
+			memcmp(first->intent.target_uuid, last->intent.target_uuid, 16) != 0 ||
+			first->intent.system_identifier != last->intent.system_identifier ||
+			memcmp(first->intent.protected_set_digest, last->intent.protected_set_digest, 32) != 0 ||
+			first->intent.request.rejoin.old_node_id != node ||
+			first->intent.request.rejoin.old_incarnation != last->intent.request.rejoin.old_incarnation ||
+			first->intent.request.rejoin.candidate_incarnation != last->intent.request.rejoin.candidate_incarnation ||
+			pgrac_fenced_journal_rejoin_terminal(last) ||
+			node < 0 || node >= PGRAC_FENCED_MAX_NODES || seen[node] ||
+			++count > PGRAC_FENCED_REJOIN_MAX_OPERATIONS)
+			return false;
+		seen[node] = true;
+	}
+	for (i = 0; i < PGRAC_FENCED_JOURNAL_MAX_PENDING_OPERATIONS; i++)
+	{
+		PgracFencedJournalReconcileEntry *entry = &pending->pending[i];
+		PgracFencedRejoinOperationV1 *operation;
+
+		if (!entry->used || entry->last_record.intent.kind != PGRAC_FENCED_JOURNAL_INTENT_REJOIN)
+			continue;
+		operation = &context->operations[context->operation_count++];
+		operation->state = entry->last_record.intent.request.rejoin.opcode ==
+			PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE ? PGRAC_FENCED_REJOIN_OPERATION_OFFERED :
+			PGRAC_FENCED_REJOIN_OPERATION_CLEANUP_REQUIRED;
+		operation->admin_request = entry->first_record.intent.request.rejoin;
+		memcpy(operation->operation_id, entry->last_record.operation_id, 16);
+		configured_target(context->operation_context, operation->admin_request.old_node_id,
+			&operation->target);
+		operation->last_record = entry->last_record;
+		/* No offer/ON/READY evidence crosses daemon boots; service has not started. */
+		memset(entry, 0, sizeof(*entry));
+		pending->pending_count--;
+	}
+	return true;
+}
+
+bool
+pgrac_fenced_rejoin_cleanup(PgracFencedRejoinContextV1 *context,
+	const uint8 operation_id[16], uint64 deadline_mono_ns)
+{
+	PgracFencedRejoinOperationV1 *operation = find_operation(context, operation_id);
+	PgracFencedOperationContextV1 *owner;
+	PgracFencedTargetV1 resolved;
+	PgracFencedJournalRecordV1 record;
+	PgracFencedReadbackV1 readback;
+	PgracFencedProviderResult result;
+	PgracFencedProviderWorkerResult worker_result;
+	PgracFencedProviderTerminal terminal;
+	uint64 now;
+	uint64 generation = 0;
+	int32 native_status;
+
+	if (operation == NULL || context->operation_context == NULL ||
+		operation->state != PGRAC_FENCED_REJOIN_OPERATION_CLEANUP_REQUIRED ||
+		pgrac_fenced_journal_rejoin_terminal(&operation->last_record) ||
+		deadline_mono_ns == 0)
+		return false;
+	owner = context->operation_context;
+	if (!owner->available || owner->config->format_version != 2 ||
+		operation->last_record.intent.kind != PGRAC_FENCED_JOURNAL_INTENT_REJOIN ||
+		(operation->last_record.intent.request.rejoin.opcode != PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON &&
+		 operation->last_record.intent.request.rejoin.opcode != PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON) ||
+		!monotonic_now_ns(&now) || now >= deadline_mono_ns ||
+		!begin_owned_phase(owner, operation, &operation->last_record.intent.request.rejoin))
+		return false;
+	/* PGRAC: same durable ON intent owns compensating OFF; never invent a caller. */
+	if (!resolve_exact(owner, &operation->target, deadline_mono_ns, &resolved,
+			&result, &native_status) || !monotonic_now_ns(&now) || now >= deadline_mono_ns)
+		return true;
+	operation->target = resolved;
+	record_base(owner, PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED, operation_id, now, &record);
+	memcpy(record.binding_digest, operation->last_record.binding_digest, 32);
+	record.provider_result = PGRAC_FENCED_PROVIDER_PENDING;
+	record.target_state = PGRAC_FENCED_TARGET_OFF;
+	if (!append_owned_record(owner, operation, &record))
+		return false;
+	worker_result = pgrac_fenced_provider_worker_actuate_owned(
+		owner->provider, owner->allow_test_only, false, &operation->target, &operation->last_record,
+		owner->config, owner->semantic_config_digest, deadline_mono_ns, &result, &native_status);
+	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
+		result = worker_result == PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?
+			PGRAC_FENCED_PROVIDER_UNAVAILABLE : PGRAC_FENCED_PROVIDER_UNKNOWN;
+	if (!monotonic_now_ns(&now))
+		now = deadline_mono_ns;
+	record.record_kind = PGRAC_FENCED_JOURNAL_KIND_ACTUATION_RESULT;
+	record.event_mono_ns = now;
+	record.provider_result = result;
+	record.provider_native_status = native_status;
+	if (!append_owned_record(owner, operation, &record))
+		return false;
+	memset(&readback, 0, sizeof(readback));
+	worker_result = pgrac_fenced_provider_worker_readback_retry_owned(
+		owner->provider, owner->allow_test_only, &operation->target, &operation->last_record,
+		owner->config, owner->semantic_config_digest, deadline_mono_ns, &result, &readback);
+	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
+	{
+		memset(&readback, 0, sizeof(readback));
+		result = worker_result == PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?
+			PGRAC_FENCED_PROVIDER_UNAVAILABLE : PGRAC_FENCED_PROVIDER_UNKNOWN;
+	}
+	if (!monotonic_now_ns(&now))
+		now = deadline_mono_ns;
+	terminal = pgrac_fenced_provider_classify_recovery(result, operation->target.target_uuid, &readback);
+	record_base(owner, PGRAC_FENCED_JOURNAL_KIND_READBACK_RESULT, operation_id, now, &record);
+	memcpy(record.binding_digest, operation->last_record.binding_digest, 32);
+	record.provider_result = result;
+	record.provider_native_status = readback.native_status;
+	record.target_state = readback.state;
+	record.io_drain_state = readback.io_drain_state;
+	record.deny_reason = provider_deny(result, now >= deadline_mono_ns);
+	if (now < deadline_mono_ns && terminal == PGRAC_FENCED_PROVIDER_TERMINAL_PROVEN &&
+		UINT64_MAX - now >= PGRAC_FENCED_REJOIN_FRESHNESS_NS &&
+		pgrac_fenced_operation_reserve_proof_generation(owner, &generation) &&
+		pgrac_external_fence_target_state_digest_v1(operation->target.target_uuid,
+			PGRAC_FENCED_TARGET_OFF, PGRAC_FENCED_IO_DRAIN_DRAINED,
+			owner->config->mapping_generation, generation, record.target_state_digest))
+	{
+		record.record_kind = PGRAC_FENCED_JOURNAL_KIND_RECONCILED;
+		record.deny_reason = 0;
+		record.proof_generation = generation;
+		record.fresh_until_mono_ns = now + PGRAC_FENCED_REJOIN_FRESHNESS_NS;
+	}
+	/* Only this exact fresh OFF/drain proof releases the owned obligation. */
+	return append_owned_record(owner, operation, &record);
 }
 
 bool
@@ -409,7 +637,9 @@ pgrac_fenced_rejoin_admin_prepare(PgracFencedRejoinContextV1 *context,
 		PGRAC_FENCED_JOURNAL_KIND_REENABLE_REQUESTED,
 		request->transport_nonce, now, &record);
 	record.provider_result = PGRAC_FENCED_PROVIDER_OK;
-	if (!pgrac_fenced_operation_append_journal(operation_context, &record))
+	if (operation_context->config->format_version == 2 ?
+		!begin_owned_phase(operation_context, operation, request) :
+		!pgrac_fenced_operation_append_journal(operation_context, &record))
 	{
 		memset(operation, 0, sizeof(*operation));
 		negative_response(request, NULL, operation_id,
@@ -457,6 +687,7 @@ claim_candidate(PgracFencedRejoinContextV1 *context)
 
 static bool
 append_readback_result(PgracFencedOperationContextV1 *context,
+				   PgracFencedRejoinOperationV1 *operation,
 				   const uint8 operation_id[16],
 				   const uint8 binding_digest[32],
 				   PgracFencedProviderResult provider_result,
@@ -485,7 +716,7 @@ append_readback_result(PgracFencedOperationContextV1 *context,
 		memcpy(record->target_state_digest, target_digest,
 			   sizeof(record->target_state_digest));
 	}
-	return pgrac_fenced_operation_append_journal(context, record);
+	return append_owned_record(context, operation, record);
 }
 
 bool
@@ -531,6 +762,16 @@ pgrac_fenced_rejoin_claim(PgracFencedRejoinContextV1 *context,
 		return true;
 	}
 	operation->state = PGRAC_FENCED_REJOIN_OPERATION_CLAIMED;
+	if (operation_context->config->format_version == 2 &&
+		memcmp(operation->last_record.daemon_boot_id, operation_context->daemon_boot_id, 16) != 0 &&
+		!begin_owned_phase(operation_context, operation, &operation->admin_request))
+	{
+		operation->state = PGRAC_FENCED_REJOIN_OPERATION_OFFERED;
+		negative_response(request, operation, NULL,
+			PGRAC_EXTERNAL_FENCE_REJOIN_LMON_OFFER,
+			PGRAC_FENCED_REJOIN_STATUS_UNAVAILABLE, PGRAC_FENCED_DENY_JOURNAL, response);
+		return true;
+	}
 	provider_result = PGRAC_FENCED_PROVIDER_UNAVAILABLE;
 	if (!build_rejoin_binding(operation_context, operation, NULL,
 			&binding, binding_digest) ||
@@ -548,9 +789,11 @@ pgrac_fenced_rejoin_claim(PgracFencedRejoinContextV1 *context,
 	}
 	operation->target = resolved;
 	memset(&readback, 0, sizeof(readback));
-	worker_result = pgrac_fenced_provider_worker_readback_retry(
-		operation_context->provider, operation_context->allow_test_only,
-		&operation->target, deadline_mono_ns, &provider_result, &readback);
+	worker_result = pgrac_fenced_provider_worker_readback_retry_owned(
+		operation_context->provider, operation_context->allow_test_only, &operation->target,
+		operation_context->config->format_version == 2 ? &operation->last_record : NULL,
+		operation_context->config, operation_context->semantic_config_digest, deadline_mono_ns,
+		&provider_result, &readback);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 		provider_result = worker_result ==
 			PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?
@@ -612,7 +855,7 @@ pgrac_fenced_rejoin_claim(PgracFencedRejoinContextV1 *context,
 			}
 		}
 	}
-	if (!append_readback_result(operation_context,
+	if (!append_readback_result(operation_context, operation,
 			request->transport_nonce, binding_digest, provider_result,
 			worker_result == PGRAC_FENCED_PROVIDER_WORKER_OK ? &readback : NULL,
 			deny_reason, now, proof_generation, fresh_until, target_digest,
@@ -660,6 +903,7 @@ pgrac_fenced_rejoin_claim(PgracFencedRejoinContextV1 *context,
 
 static bool
 append_actuation_record(PgracFencedOperationContextV1 *context,
+					PgracFencedRejoinOperationV1 *operation,
 					uint16 kind, const uint8 operation_id[16],
 					const uint8 binding_digest[32],
 					PgracFencedProviderResult result, int32 native_status,
@@ -670,11 +914,12 @@ append_actuation_record(PgracFencedOperationContextV1 *context,
 		   sizeof(record->binding_digest));
 	record->provider_result = (uint32) result;
 	record->provider_native_status = native_status;
-	return pgrac_fenced_operation_append_journal(context, record);
+	return append_owned_record(context, operation, record);
 }
 
 static bool
 append_reenable_result(PgracFencedOperationContextV1 *context,
+				   PgracFencedRejoinOperationV1 *operation,
 				   const uint8 operation_id[16],
 				   const uint8 binding_digest[32],
 				   PgracFencedProviderResult provider_result,
@@ -703,7 +948,7 @@ append_reenable_result(PgracFencedOperationContextV1 *context,
 		memcpy(record->target_state_digest, target_digest,
 			   sizeof(record->target_state_digest));
 	}
-	return pgrac_fenced_operation_append_journal(context, record);
+	return append_owned_record(context, operation, record);
 }
 
 static bool
@@ -781,6 +1026,14 @@ pgrac_fenced_rejoin_authorize_on(PgracFencedRejoinContextV1 *context,
 	operation_context = context->operation_context;
 	provider_result = PGRAC_FENCED_PROVIDER_UNAVAILABLE;
 	now = 0;
+	if (!begin_owned_phase(operation_context, operation, request))
+	{
+		negative_response(request, operation, NULL,
+			PGRAC_EXTERNAL_FENCE_REJOIN_LMON_ON_RESULT,
+			PGRAC_FENCED_REJOIN_STATUS_UNAVAILABLE,
+			PGRAC_FENCED_DENY_JOURNAL, response);
+		return true;
+	}
 	if (!build_rejoin_binding(operation_context, operation,
 			request->rejoin_gate_digest, &binding, binding_digest) ||
 		memcmp(binding.protected_set_digest,
@@ -794,12 +1047,11 @@ pgrac_fenced_rejoin_authorize_on(PgracFencedRejoinContextV1 *context,
 			PGRAC_EXTERNAL_FENCE_REJOIN_LMON_ON_RESULT,
 			provider_status(provider_result, now >= deadline_mono_ns),
 			provider_deny(provider_result, now >= deadline_mono_ns), response);
-		memset(operation, 0, sizeof(*operation));
-		context->operation_count--;
+		release_terminal_operation(context, operation);
 		return true;
 	}
 	operation->target = resolved;
-	if (!append_actuation_record(operation_context,
+	if (!append_actuation_record(operation_context, operation,
 			PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED,
 			request->transport_nonce, binding_digest,
 			PGRAC_FENCED_PROVIDER_PENDING, 0, now, &record))
@@ -810,16 +1062,18 @@ pgrac_fenced_rejoin_authorize_on(PgracFencedRejoinContextV1 *context,
 			PGRAC_FENCED_DENY_JOURNAL, response);
 		return true;
 	}
-	worker_result = pgrac_fenced_provider_worker_actuate(
-		operation_context->provider, operation_context->allow_test_only, true,
-		&operation->target, deadline_mono_ns, &provider_result, &native_status);
+	worker_result = pgrac_fenced_provider_worker_actuate_owned(
+		operation_context->provider, operation_context->allow_test_only, true, &operation->target,
+		operation_context->config->format_version == 2 ? &operation->last_record : NULL,
+		operation_context->config, operation_context->semantic_config_digest, deadline_mono_ns,
+		&provider_result, &native_status);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 		provider_result = worker_result ==
 			PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?
 			PGRAC_FENCED_PROVIDER_UNAVAILABLE : PGRAC_FENCED_PROVIDER_UNKNOWN;
 	if (!monotonic_now_ns(&now))
 		now = deadline_mono_ns;
-	if (!append_actuation_record(operation_context,
+	if (!append_actuation_record(operation_context, operation,
 			PGRAC_FENCED_JOURNAL_KIND_ACTUATION_RESULT,
 			request->transport_nonce, binding_digest, provider_result,
 			native_status, now, &record))
@@ -831,9 +1085,11 @@ pgrac_fenced_rejoin_authorize_on(PgracFencedRejoinContextV1 *context,
 		return true;
 	}
 	memset(&readback, 0, sizeof(readback));
-	worker_result = pgrac_fenced_provider_worker_readback_retry(
-		operation_context->provider, operation_context->allow_test_only,
-		&operation->target, deadline_mono_ns, &provider_result, &readback);
+	worker_result = pgrac_fenced_provider_worker_readback_retry_owned(
+		operation_context->provider, operation_context->allow_test_only, &operation->target,
+		operation_context->config->format_version == 2 ? &operation->last_record : NULL,
+		operation_context->config, operation_context->semantic_config_digest, deadline_mono_ns,
+		&provider_result, &readback);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 		provider_result = worker_result ==
 			PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?
@@ -887,7 +1143,7 @@ pgrac_fenced_rejoin_authorize_on(PgracFencedRejoinContextV1 *context,
 		status = PGRAC_FENCED_REJOIN_STATUS_UNAVAILABLE;
 		deny_reason = PGRAC_FENCED_DENY_DAEMON_UNAVAILABLE;
 	}
-	if (!append_reenable_result(operation_context, request->transport_nonce,
+	if (!append_reenable_result(operation_context, operation, request->transport_nonce,
 			binding_digest, provider_result,
 			worker_result == PGRAC_FENCED_PROVIDER_WORKER_OK ? &readback : NULL,
 			deny_reason, now, fresh_until, proof_generation, target_digest,
@@ -902,8 +1158,7 @@ pgrac_fenced_rejoin_authorize_on(PgracFencedRejoinContextV1 *context,
 		negative_response(request, operation, NULL,
 			PGRAC_EXTERNAL_FENCE_REJOIN_LMON_ON_RESULT, status, deny_reason,
 			response);
-		memset(operation, 0, sizeof(*operation));
-		context->operation_count--;
+		release_terminal_operation(context, operation);
 		return true;
 	}
 	(void) build_positive_result(operation_context, operation, request,
@@ -954,9 +1209,27 @@ pgrac_fenced_rejoin_refresh_on(PgracFencedRejoinContextV1 *context,
 		return false;
 	operation_context = context->operation_context;
 	provider_result = PGRAC_FENCED_PROVIDER_UNAVAILABLE;
+	/* PGRAC: a terminal UUID cannot start another durable phase after retirement. */
+	if (operation_context->config->format_version == 2 &&
+		pgrac_fenced_journal_rejoin_terminal(&operation->last_record))
+	{
+		negative_response(request, operation, NULL,
+			PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_RESULT,
+			PGRAC_FENCED_REJOIN_STATUS_STALE,
+			PGRAC_FENCED_DENY_REJOIN_INVALIDATED, response);
+		return true;
+	}
 	if (!build_rejoin_binding(operation_context, operation,
 			request->rejoin_gate_digest, &binding, binding_digest))
 		return false;
+	if (!begin_owned_phase(operation_context, operation, request))
+	{
+		negative_response(request, operation, NULL,
+			PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_RESULT,
+			PGRAC_FENCED_REJOIN_STATUS_UNAVAILABLE,
+			PGRAC_FENCED_DENY_JOURNAL, response);
+		return true;
+	}
 	if (!resolve_exact(operation_context, &operation->target,
 			deadline_mono_ns, &resolved, &provider_result, &native_status))
 	{
@@ -965,7 +1238,7 @@ pgrac_fenced_rejoin_refresh_on(PgracFencedRejoinContextV1 *context,
 		status = provider_status(provider_result, now >= deadline_mono_ns);
 		deny_reason = provider_deny(provider_result,
 			now >= deadline_mono_ns);
-		if (!append_reenable_result(operation_context,
+		if (!append_reenable_result(operation_context, operation,
 				request->transport_nonce, binding_digest, provider_result, NULL,
 				deny_reason, now, 0, 0, target_digest, &record))
 		{
@@ -975,15 +1248,16 @@ pgrac_fenced_rejoin_refresh_on(PgracFencedRejoinContextV1 *context,
 		negative_response(request, operation, NULL,
 			PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_RESULT, status,
 			deny_reason, response);
-		memset(operation, 0, sizeof(*operation));
-		context->operation_count--;
+		release_terminal_operation(context, operation);
 		return true;
 	}
 	operation->target = resolved;
 	memset(&readback, 0, sizeof(readback));
-	worker_result = pgrac_fenced_provider_worker_readback_retry(
-		operation_context->provider, operation_context->allow_test_only,
-		&operation->target, deadline_mono_ns, &provider_result, &readback);
+	worker_result = pgrac_fenced_provider_worker_readback_retry_owned(
+		operation_context->provider, operation_context->allow_test_only, &operation->target,
+		operation_context->config->format_version == 2 ? &operation->last_record : NULL,
+		operation_context->config, operation_context->semantic_config_digest, deadline_mono_ns,
+		&provider_result, &readback);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 		provider_result = worker_result ==
 			PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?
@@ -1036,7 +1310,7 @@ pgrac_fenced_rejoin_refresh_on(PgracFencedRejoinContextV1 *context,
 		status = PGRAC_FENCED_REJOIN_STATUS_UNAVAILABLE;
 		deny_reason = PGRAC_FENCED_DENY_DAEMON_UNAVAILABLE;
 	}
-	if (!append_reenable_result(operation_context, request->transport_nonce,
+	if (!append_reenable_result(operation_context, operation, request->transport_nonce,
 			binding_digest, provider_result,
 			worker_result == PGRAC_FENCED_PROVIDER_WORKER_OK ? &readback : NULL,
 			deny_reason, now, fresh_until, proof_generation, target_digest,
@@ -1051,8 +1325,7 @@ pgrac_fenced_rejoin_refresh_on(PgracFencedRejoinContextV1 *context,
 		negative_response(request, operation, NULL,
 			PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_RESULT, status,
 			deny_reason, response);
-		memset(operation, 0, sizeof(*operation));
-		context->operation_count--;
+		release_terminal_operation(context, operation);
 		return true;
 	}
 	(void) build_positive_result(operation_context, operation, request,
@@ -1068,16 +1341,26 @@ bool
 pgrac_fenced_rejoin_cancel(PgracFencedRejoinContextV1 *context,
 			   const PgracExternalFenceProtocolRejoinFrameV1 *request)
 {
-	PgracFencedRejoinOperationV1 *operation;
-
 	if (context == NULL || !request_codec_valid(request,
 			PGRAC_EXTERNAL_FENCE_REJOIN_LMON_CANCEL))
 		return false;
-	operation = find_operation(context, request->operation_id);
+	return pgrac_fenced_rejoin_detach(context, request->operation_id);
+}
+
+bool
+pgrac_fenced_rejoin_detach(PgracFencedRejoinContextV1 *context,
+	const uint8 operation_id[16])
+{
+	PgracFencedRejoinOperationV1 *operation = find_operation(context, operation_id);
+
 	if (operation == NULL)
 		return false;
-	memset(operation, 0, sizeof(*operation));
-	context->operation_count--;
+	if (operation->last_record.intent.kind == PGRAC_FENCED_JOURNAL_INTENT_REJOIN &&
+		!pgrac_fenced_journal_rejoin_terminal(&operation->last_record))
+		operation->state = operation->last_record.intent.request.rejoin.opcode ==
+			PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE ? PGRAC_FENCED_REJOIN_OPERATION_OFFERED :
+			PGRAC_FENCED_REJOIN_OPERATION_CLEANUP_REQUIRED;
+	release_terminal_operation(context, operation);
 	return true;
 }
 

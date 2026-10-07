@@ -31,6 +31,8 @@
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_control_retire.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "../../backend/cluster/cluster_grd_work_queue.c"
 #include "../../backend/cluster/cluster_grd_outbound.c"
 
@@ -45,6 +47,15 @@ int cluster_lms_workers = 1;
 int cluster_lmon_main_loop_interval = 1000;
 int MaxBackends = 200;
 int cluster_node_id = 0;
+bool cluster_shared_config = false;
+
+static uint64 ut_routing_generation;
+
+uint64
+cluster_lms_get_shard_master_generation(void)
+{
+	return ut_routing_generation;
+}
 
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
@@ -138,6 +149,21 @@ LWLockHeldByMe(LWLock *lock)
 {
 	return ut_held_lock == lock;
 }
+
+int
+LWLockNewTrancheId(void)
+{
+	return 300;
+}
+void
+LWLockInitialize(LWLock *lock, int tranche)
+{
+	memset(lock, 0, sizeof(*lock));
+	lock->tranche = tranche;
+}
+void
+LWLockRegisterTranche(int tranche pg_attribute_unused(), const char *name pg_attribute_unused())
+{}
 
 static uint64 ut_cleanup_deferred;
 static uint64 ut_reply_deferred;
@@ -495,11 +521,111 @@ UT_TEST(test_normal_stop_outbound_geometry_cannot_fake_empty)
 	LWLockRelease(cluster_grd_outbound_lock);
 }
 
+/* Break caught: queue delay must retain the receiver's enqueue cut, while
+ * never rewriting the sender's independent retry/dedup token.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_work_queue_retains_receiver_cut_and_original_payload)
+{
+	ClusterGrdWorkItem item;
+	GesRequestPayload request = ut_release(201);
+
+	ut_reset_state();
+	request.shard_master_generation_lo = 47;
+	ut_routing_generation = UINT64_C(0x200000009);
+	UT_ASSERT(cluster_grd_work_queue_enqueue(1, &request, sizeof(request)));
+	ut_routing_generation = UINT64_C(0x20000000a);
+	UT_ASSERT(cluster_grd_work_queue_dequeue(&item));
+	UT_ASSERT_EQ(item.routing_generation, UINT64_C(0x200000009));
+	UT_ASSERT_EQ(item.source_node_id, 1);
+	UT_ASSERT_EQ(item.payload_len, sizeof(request));
+	UT_ASSERT(memcmp(item.payload, &request, sizeof(request)) == 0);
+}
+
+/* Real shared registry + actual final-send loop. The transport return code
+ * models admission only, never a terminal request acknowledgement.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_abandoned_control_request_cannot_escape_retry_ring)
+{
+	ClusterControlRequestKey key = { 0 };
+	ClusterControlRequestHandle handle;
+	ClusterControlRequestOwner owner;
+	GesRequestPayload request = ut_release(2201);
+
+	ut_reset_state();
+	cluster_control_request_shmem_init();
+	cluster_shared_config = true;
+	key.resid.type = CLUSTER_CF_RESID_TYPE;
+	key.resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	key.holder.node_id = 0;
+	key.holder.procno = 17;
+	key.holder.cluster_epoch = 9;
+	key.holder.request_id = 2201;
+	UT_ASSERT(cluster_control_request_owner_init(17, 617, &owner));
+	UT_ASSERT(cluster_control_request_register(&key, ShareLock, &owner, 0, NoLock, &handle));
+	request.opcode = GES_REQ_OPCODE_REQUEST;
+	request.lockmode = ShareLock;
+	request.holder_cluster_epoch_lo = 9;
+	memcpy(request.resid, &key.resid, sizeof(key.resid));
+	UT_ASSERT(cluster_grd_outbound_enqueue_backend_request(1, &request, sizeof(request)));
+	ut_send_result = CLUSTER_IC_SEND_NOT_ADMITTED;
+	UT_ASSERT_EQ(cluster_grd_outbound_lmon_drain_send(), 0);
+	UT_ASSERT_EQ(ut_send_count, 1);
+	UT_ASSERT_EQ(cluster_grd_outbound_ring_depth(), 1);
+	UT_ASSERT(cluster_control_request_abandon(&handle, &owner));
+	ut_send_result = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(cluster_grd_outbound_lmon_drain_send(), 0);
+	UT_ASSERT_EQ(ut_send_count, 1);
+	UT_ASSERT_EQ(cluster_grd_outbound_ring_depth(), 0);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_forgotten_control_identity_is_not_send_permission)
+{
+	ClusterControlRequestKey key = { 0 };
+	ClusterControlRequestHandle handle;
+	ClusterControlRequestOwner owner;
+	ClusterControlRequestCut cut = { 9, 4, 1 };
+	ClusterControlRetireMessage ack;
+	uint64 driver;
+	GesRequestPayload request = ut_release(2301), decoy = ut_release(2302);
+
+	ut_reset_state();
+	cluster_control_request_shmem_init();
+	cluster_shared_config = true;
+	key.resid.type = CLUSTER_CF_RESID_TYPE;
+	key.resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	key.holder.node_id = 0;
+	key.holder.procno = 17;
+	key.holder.cluster_epoch = 9;
+	key.holder.request_id = 2301;
+	UT_ASSERT(cluster_control_request_owner_init(17, 617, &owner));
+	UT_ASSERT(cluster_control_request_register(&key, ShareLock, &owner, 0, NoLock, &handle));
+	request.opcode = GES_REQ_OPCODE_REDECLARE;
+	request.lockmode = ShareLock;
+	request.holder_cluster_epoch_lo = 9;
+	memcpy(request.resid, &key.resid, sizeof(key.resid));
+	UT_ASSERT(cluster_grd_outbound_enqueue_backend_request(1, &request, sizeof(request)));
+	UT_ASSERT(cluster_control_request_abandon(&handle, &owner));
+	driver = cluster_control_request_driver_start();
+	UT_ASSERT(cluster_control_request_claim(&handle, driver, &cut, &ack));
+	ack.verb = CLUSTER_CONTROL_RETIRED;
+	UT_ASSERT(cluster_control_request_ack(&ack, 1, driver, &cut));
+	UT_ASSERT(cluster_control_request_forget(&handle, &owner, &cut));
+	/* Ordinary cleanup is unaffected, even for the same peer. */
+	cluster_grd_outbound_enqueue_cleanup_release(1, &decoy, sizeof(decoy));
+	UT_ASSERT_EQ(cluster_grd_outbound_lmon_drain_send(), 1);
+	UT_ASSERT_EQ(ut_send_count, 1);
+	UT_ASSERT_EQ(ut_release_seen_count, 1);
+	UT_ASSERT_EQ(ut_release_seen[0], 2302);
+	UT_ASSERT_EQ(cluster_grd_outbound_ring_depth(), 0);
+	cluster_shared_config = false;
+}
+
 int
 main(void)
 {
 	cluster_grd_outbound_shmem_register();
-	UT_PLAN(8);
+	UT_PLAN(11);
 
 	UT_RUN(test_normal_stop_required_queues_uninitialized);
 	UT_RUN(test_cleanup_retry_queue_never_overwrites_oldest);
@@ -509,6 +635,9 @@ main(void)
 	UT_RUN(test_normal_stop_all_three_outbound_queues);
 	UT_RUN(test_normal_stop_work_queue_exact_shape_and_lock);
 	UT_RUN(test_normal_stop_outbound_geometry_cannot_fake_empty);
+	UT_RUN(test_work_queue_retains_receiver_cut_and_original_payload);
+	UT_RUN(test_abandoned_control_request_cannot_escape_retry_ring);
+	UT_RUN(test_forgotten_control_identity_is_not_send_permission);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

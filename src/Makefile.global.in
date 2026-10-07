@@ -197,6 +197,10 @@ with_system_tzdata = @with_system_tzdata@
 with_uuid	= @with_uuid@
 with_zlib	= @with_zlib@
 with_rdma	= @with_rdma@
+# PGRAC: optional privileged frontend dependency, never a postgres/libpq library.
+with_pacemaker = @with_pacemaker@
+PACEMAKER_CFLAGS = @PACEMAKER_CFLAGS@
+PACEMAKER_LIBS = @PACEMAKER_LIBS@
 enable_rpath	= @enable_rpath@
 enable_nls	= @enable_nls@
 enable_debug	= @enable_debug@

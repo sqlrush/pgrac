@@ -57,7 +57,7 @@
 #include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_undo_retention.h"
 #include "storage/shmem.h"
-#include "utils/snapmgr.h" /* ActiveSnapshotSet / GetActiveSnapshot (D5-8) */
+#include "utils/snapmgr.h" /* Actual snapshot lifetime and retention evidence. */
 #include "utils/timestamp.h"
 
 /*
@@ -508,11 +508,9 @@ cluster_undo_horizon_note_self_member(void)
  *	    cluster is capable (S3.3 matrix).  Returns false; the caller keeps
  *	    its existing UNKNOWN/53R97 fail-closed shape (LOG-once here).
  *
- *	The epoch is read from the ACTIVE snapshot (crossnode resolution runs
- *	under the snapshot being evaluated; catalog snapshots are forced LOCAL
- *	and never reach these paths).  Any shape we cannot prove -- no active
- *	snapshot, or its read_scn disagreeing with the resolver's -- refuses
- *	conservatively (never "assume admissible").
+ *	The evaluator supplies the actual snapshot, whose native Active or
+ *	Registered lifetime must cover the read. Terminal callers without an
+ *	evaluation scope retain their original ActiveSnapshot boundary.
  *
  *	Rejoin residual note (S3.0 (3)): a joiner adopts its admitted epoch off
  *	the voting disk (cluster_epoch_adopt_admitted), which carries no SCN
@@ -526,7 +524,8 @@ bool
 cluster_undo_horizon_read_admission_enforce(SCN read_scn)
 {
 	uint64 admitted;
-	Snapshot snap;
+	Snapshot snap = NULL;
+	SCN retained_floor = InvalidScn;
 	const char *refuse_reason = NULL;
 	int pi;
 
@@ -546,15 +545,11 @@ cluster_undo_horizon_read_admission_enforce(SCN read_scn)
 	/* biased store: 0 = never admitted, N+1 = admitted at epoch N */
 	admitted
 		= UndoHorizonShmem == NULL ? 0 : pg_atomic_read_u64(&UndoHorizonShmem->self_admitted_epoch);
-	snap = ActiveSnapshotSet() ? GetActiveSnapshot() : NULL;
 	if (admitted == 0)
 		refuse_reason = "self admission epoch is not published";
-	else if (snap == NULL)
-		refuse_reason = "no active snapshot";
-	else if (snap->read_epoch < admitted - 1)
+	else if (cluster_snapshot_read_evidence_v1(read_scn, &snap, &retained_floor, &refuse_reason)
+			 && snap->read_epoch < admitted - 1)
 		refuse_reason = "snapshot epoch predates self admission epoch";
-	else if (SCN_VALID(read_scn) && SCN_VALID(snap->read_scn) && snap->read_scn != read_scn)
-		refuse_reason = "resolver read SCN does not match the active snapshot";
 
 	if (refuse_reason != NULL) {
 		if (UndoHorizonShmem != NULL)
@@ -565,10 +560,12 @@ cluster_undo_horizon_read_admission_enforce(SCN read_scn)
 						"cluster admission"),
 				 errdetail("reason=%s admitted_epoch=" UINT64_FORMAT
 						   " snapshot_epoch=" UINT64_FORMAT " current_epoch=" UINT64_FORMAT
-						   " resolver_read_scn=" UINT64_FORMAT " snapshot_read_scn=" UINT64_FORMAT,
+						   " resolver_read_scn=" UINT64_FORMAT " snapshot_read_scn=" UINT64_FORMAT
+						   " snapshot=%p retained_floor=" UINT64_FORMAT,
 						   refuse_reason, admitted == 0 ? 0 : admitted - 1,
 						   snap == NULL ? 0 : snap->read_epoch, cluster_epoch_get_current(),
-						   (uint64)read_scn, snap == NULL ? 0 : (uint64)snap->read_scn),
+						   (uint64)read_scn, snap == NULL ? 0 : (uint64)snap->read_scn, snap,
+						   (uint64)retained_floor),
 				 errhint("Take a new snapshot (new statement or transaction) after the "
 						 "join completed and retry.")));
 	}

@@ -7,6 +7,7 @@
 #define CLUSTER_SIDE_ONLINE_OWNER_H
 
 #include "cluster/cluster_side_online_plan.h"
+#include "cluster/cluster_undo_recovery.h"
 
 #define CLUSTER_SIDE_ONLINE_OWNER_INTERFACE_V1 1
 
@@ -16,6 +17,16 @@ typedef struct RfSideOnlineProductionOwnerV1 {
 	void *authority_arg;
 	RfSideOnlineFreshAuthorityV1 revalidate_authority;
 	RfSideOnlineProjectionOwnerV1 projection;
+	const ClusterThreadRecoveryAuthorityV1 *undo_authority;
+	const RfSideOnlinePlanV1 *protected_plan;
+	ClusterUndoRecoveryScopeV1 undo_scope;
+	void *undo_headers;
+	Size undo_bytes_remaining;
+	/* Borrowed whole-source SPACE owner; released by the enclosing fabric. */
+	void *space_arg;
+	RfSideOnlineSpaceV1 preflight_space;
+	RfSideOnlineSpaceV1 apply_space;
+	Size borrowed_scratch_bytes;
 	bool protected_set_active;
 	bool protected_set_complete;
 	uint8 reserved2[6];
@@ -25,6 +36,9 @@ extern bool
 rf_side_online_production_owner_init_v1(RfSideOnlineProductionOwnerV1 *owner, void *authority_arg,
 										RfSideOnlineFreshAuthorityV1 revalidate_authority,
 										uint32 cluster_epoch, bool failed_origin_redo_retained);
+extern bool
+rf_side_online_production_bind_undo_v1(RfSideOnlineProductionOwnerV1 *owner,
+									   const ClusterThreadRecoveryAuthorityV1 *authority);
 extern RfPageProofDetailV1
 rf_side_online_production_preflight_v1(const RfSideOnlinePlanV1 *plan,
 									   RfSideOnlineProductionOwnerV1 *owner);

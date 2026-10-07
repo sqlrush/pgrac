@@ -170,9 +170,25 @@ $node->safe_psql('postgres', 'TRUNCATE t1');
 is($node->safe_psql('postgres', 'SELECT count(*) FROM t1'),
 	'0', 'L5 TRUNCATE empties the table');
 
+# TRUNCATE changed the filenode. Exercise DROP on the current file, with
+# real VM/FSM forks, and check the checkpoint-delayed MAIN reservation.
+$node->safe_psql('postgres', q{
+	INSERT INTO t1 SELECT g, 'row-' || g FROM generate_series(1, 10000) g;
+});
+$node->safe_psql('postgres', 'VACUUM t1');
+my $drop_filenode = $node->safe_psql('postgres',
+	"SELECT pg_relation_filenode('t1'::regclass)");
+my $drop_path = "$datadir/base/$dboid/$drop_filenode";
+ok(-s $drop_path && -s "${drop_path}_vm" && -s "${drop_path}_fsm",
+	'L5 DROP fixture has nonempty MAIN, VM and FSM files');
 $node->safe_psql('postgres', 'DROP TABLE t1');
-ok(! -e "$datadir/base/$dboid/$relnode_t1",
-	'L5 DROP TABLE removes the underlying file');
+ok(-e $drop_path && -s $drop_path == 0,
+	'L5 DROP TABLE retains an empty MAIN tombstone before checkpoint');
+ok(! -e "${drop_path}_vm" && ! -e "${drop_path}_fsm",
+	'L5 DROP TABLE removes VM and FSM forks');
+$node->safe_psql('postgres', 'CHECKPOINT');
+ok(! -e $drop_path && ! -e "$datadir/base/$dboid/$relnode_t1",
+	'L5 checkpoint retires DROP and TRUNCATE MAIN tombstones');
 
 
 # ----------

@@ -49,6 +49,8 @@
 #include "cluster/cluster_cssd.h" /* PGRAC_IC_MSG_CSSD_HEARTBEAT */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_membership.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_gcs_reqid.h"
 #include "cluster/cluster_grd_outbound.h"
@@ -101,6 +103,9 @@ static TimestampTz fake_clock;
 static int fake_error_level;
 static bool fake_control_active;
 static bool fake_master_apply = true;
+static int fake_master_apply_calls;
+static int fake_pending_clear_calls;
+static int fake_observed_reply;
 static bool fake_drop_reply;
 static bool fake_bad_reply_identity;
 static bool fake_send_refused;
@@ -379,6 +384,7 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 			cluster_gcs_handle_request_envelope(&env, payload);
 		cluster_node_id = sender;
 	} else if (msg_type == PGRAC_IC_MSG_GCS_REPLY) {
+		fake_observed_reply = ((const GcsReplyPayload *)payload)->status;
 		UT_ASSERT_EQ(payload_len, sizeof(GcsReplyPayload));
 		cluster_gcs_handle_reply_envelope(&env, payload);
 	} else
@@ -428,6 +434,7 @@ cluster_pcm_lock_apply_gcs_transition(BufferTag tag pg_attribute_unused(),
 									  PcmLockTransition trans pg_attribute_unused(),
 									  int holder_node_id pg_attribute_unused())
 {
+	fake_master_apply_calls++;
 	return fake_master_apply;
 }
 
@@ -439,6 +446,7 @@ bool
 cluster_pcm_lock_clear_pending_x_if(BufferTag tag pg_attribute_unused(),
 									int32 expected_requester pg_attribute_unused())
 {
+	fake_pending_clear_calls++;
 	return false;
 }
 
@@ -551,6 +559,14 @@ UT_TEST(test_gcs_reply_status_enum_count_is_4)
  * L6: cluster_gcs_lookup_master symbol linkable.
  * ----------
  */
+/* Admission is a boundary here; test_cluster_grd exercises the real
+ * routing bodies with changing JOIN membership. */
+bool
+cluster_membership_is_member(int32 node_id)
+{
+	return cluster_conf_lookup_node(node_id) != NULL;
+}
+
 UT_TEST(test_gcs_lookup_master_symbol_linkable)
 {
 	UT_ASSERT_NOT_NULL((void *)cluster_gcs_lookup_master);
@@ -852,6 +868,9 @@ run_holder_registration(uint8 final_status, PcmLockTransition transition_id, boo
 	static void reset_control_fixture(void)
 	{
 		cluster_node_id = 0;
+		cluster_shared_config = false;
+		fake_master_apply_calls = fake_pending_clear_calls = 0;
+		fake_observed_reply = -1;
 		MyBackendType = B_LMON;
 		fake_control_active = true;
 		fake_master_apply = true;
@@ -951,9 +970,42 @@ run_holder_registration(uint8 final_status, PcmLockTransition transition_id, boo
 		}
 	}
 
+	UT_TEST(test_shared_control_rejects_old_x_before_apply_or_pending_cleanup)
+	{
+		ClusterICEnvelope env = { 0 };
+		GcsRequestPayload req = { 0 };
+		const PcmLockTransition denied[]
+			= { PCM_TRANS_N_TO_X, PCM_TRANS_S_TO_X_UPGRADE, PCM_TRANS_S_TO_X_CLEANOUT };
+
+		reset_control_fixture();
+		cluster_shared_config = true;
+		req.request_id = 99;
+		req.epoch = cluster_epoch_get_current();
+		req.sender_node = 1;
+		env.source_node_id = 1;
+		env.payload_length = sizeof(req);
+		for (int i = 0; i < lengthof(denied); i++) {
+			req.transition_id = denied[i];
+			cluster_gcs_handle_request_envelope(&env, &req);
+			UT_ASSERT_EQ(fake_observed_reply, GCS_REPLY_DENIED_VALIDATOR_REJECT);
+			UT_ASSERT_EQ(fake_master_apply_calls + fake_pending_clear_calls, 0);
+			UT_ASSERT(!cluster_gcs_send_transition_nowait(req.tag, denied[i], 1));
+			UT_ASSERT(!cluster_gcs_try_send_transition_and_wait(req.tag, denied[i], 1));
+			UT_ASSERT_EQ(fake_last_request_id, 0);
+			UT_ASSERT_EQ(cluster_gcs_get_outstanding_count(), 0);
+		}
+		UT_ASSERT(cluster_gcs_try_send_transition_and_wait(req.tag, PCM_TRANS_N_TO_S, 1));
+		UT_ASSERT_EQ(fake_master_apply_calls, 1);
+		UT_ASSERT(cluster_gcs_try_send_transition_and_wait(req.tag, PCM_TRANS_S_TO_N_RELEASE, 1));
+		UT_ASSERT_EQ(fake_master_apply_calls, 2);
+		UT_ASSERT(cluster_gcs_try_send_transition_and_wait(req.tag, PCM_TRANS_X_TO_S_DOWNGRADE, 1));
+		UT_ASSERT_EQ(fake_master_apply_calls, 3);
+		cluster_shared_config = false;
+	}
+
 	int main(void)
 	{
-		UT_PLAN(22);
+		UT_PLAN(23);
 		UT_RUN(test_gcs_msg_type_enum_values_no_collision);
 		UT_RUN(test_gcs_payload_sizes_locked);
 		UT_RUN(test_gcs_payload_field_offsets);
@@ -976,6 +1028,7 @@ run_holder_registration(uint8 final_status, PcmLockTransition transition_id, boo
 		UT_RUN(test_gcs_reply_identity_is_exact_across_backends);
 		UT_RUN(test_forwarded_s_registration_refusal_reenters_without_grant);
 		UT_RUN(test_forwarded_registration_hard_failures_never_become_retry);
+		UT_RUN(test_shared_control_rejects_old_x_before_apply_or_pending_cleanup);
 		free(fake_shmem);
 		UT_DONE();
 		return ut_failed_count == 0 ? 0 : 1;

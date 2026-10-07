@@ -9,6 +9,8 @@
  * distinct outcomes, and every byte of the five-field key participates in
  * correlation.
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -137,6 +139,13 @@ static uint32 fake_cv_wait_event;
 static bool fake_delivery_during_sleep;
 static bool fake_error_during_sleep;
 static int fake_cv_broadcast_calls;
+static bool fake_consume_on_unlock;
+static bool fake_recycle_on_unlock;
+static GesReplyWaitKey fake_consuming_key;
+static GesReplyWaitKey fake_recycled_key;
+static GesReplyWaitKey fake_notified_key;
+static GesReplyWaitVerdict fake_consumed_verdict;
+static GesReplyWaitPollResult fake_consumed_result;
 static union {
 	uint64 force_align;
 	char data[4096];
@@ -258,6 +267,14 @@ LWLockRelease(LWLock *lock pg_attribute_unused())
 	fake_lock_depth = 0;
 	fake_held_lock = NULL;
 	fake_lock_releases++;
+	if (fake_consume_on_unlock) {
+		/* Run the other process at the first possible unlocked instant. */
+		fake_consume_on_unlock = false;
+		fake_consumed_result
+			= cluster_ges_reply_wait_poll_consume(&fake_consuming_key, &fake_consumed_verdict);
+		if (fake_recycle_on_unlock)
+			UT_ASSERT_NOT_NULL(cluster_ges_reply_wait_insert(&fake_recycled_key, 0));
+	}
 }
 bool
 LWLockHeldByMe(LWLock *lock)
@@ -272,9 +289,13 @@ ConditionVariableInit(ConditionVariable *cv)
 }
 
 void
-ConditionVariableBroadcast(ConditionVariable *cv pg_attribute_unused())
+ConditionVariableBroadcast(ConditionVariable *cv)
 {
-	Assert(fake_lock_depth == 0);
+	GesReplyWaitEntry *entry = (GesReplyWaitEntry *)((char *)cv - offsetof(GesReplyWaitEntry, cv));
+
+	/* The native operation uses the CV's storage; its owner must still live.
+	 * It can be called under the table LWLock, like native CV enrollment. */
+	fake_notified_key = entry->key;
 	fake_cv_broadcast_calls++;
 }
 
@@ -365,6 +386,11 @@ reset_reply_wait_with_cap(int max_entries)
 	fake_delivery_during_sleep = false;
 	fake_error_during_sleep = false;
 	fake_cv_broadcast_calls = 0;
+	fake_consume_on_unlock = false;
+	fake_recycle_on_unlock = false;
+	memset(&fake_notified_key, 0, sizeof(fake_notified_key));
+	memset(&fake_consumed_verdict, 0, sizeof(fake_consumed_verdict));
+	fake_consumed_result = GES_REPLY_WAIT_POLL_MISSING;
 	cluster_ges_reply_wait_max_entries = max_entries;
 	cluster_ges_reply_wait_shmem_init();
 	IsUnderPostmaster = under_postmaster;
@@ -417,6 +443,41 @@ UT_TEST(test_poll_delivered_copies_complete_verdict_then_consumes)
 	UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 0);
 	UT_ASSERT_NULL(cluster_ges_reply_wait_lookup(&key));
 	UT_ASSERT_EQ(fake_lock_acquires, fake_lock_releases);
+}
+
+UT_TEST(test_delivery_notifies_owner_before_consumer_recycles_entry)
+{
+	GesReplyWaitKey key = make_key(81, 1, 3, GES_REQ_OPCODE_REDECLARE, 201);
+	GesReplyWaitKey decoy = make_key(82, 1, 3, GES_REQ_OPCODE_REDECLARE, 201);
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		uint32 opcode = i < 2 ? GES_REPLY_OPCODE_GRANT : GES_REPLY_OPCODE_REJECT;
+		uint32 reason = i < 2 ? GES_REJECT_REASON_NONE : GES_REJECT_REASON_WORK_QUEUE_FULL;
+		GesReplyWaitVerdict verdict = { 0, 0 };
+
+		reset_reply_wait();
+		UT_ASSERT_NOT_NULL(cluster_ges_reply_wait_insert(&key, 0));
+		fake_consuming_key = key;
+		fake_recycled_key = decoy;
+		fake_recycle_on_unlock = (i % 2) != 0;
+		fake_consume_on_unlock = true;
+		UT_ASSERT_EQ(cluster_ges_reply_wait_deliver(&key, opcode, reason), GES_REPLY_DELIVER_WOKE);
+		UT_ASSERT_EQ(fake_consumed_result, GES_REPLY_WAIT_POLL_DELIVERED);
+		UT_ASSERT_EQ(fake_consumed_verdict.reply_opcode, opcode);
+		UT_ASSERT_EQ(fake_consumed_verdict.reject_reason, reason);
+		UT_ASSERT_EQ(fake_cv_broadcast_calls, 1);
+		UT_ASSERT_EQ(memcmp(&fake_notified_key, &key, sizeof(key)), 0);
+		UT_ASSERT_NULL(cluster_ges_reply_wait_lookup(&key));
+		UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), i % 2);
+		if (fake_recycle_on_unlock) {
+			UT_ASSERT_EQ(cluster_ges_reply_wait_poll_consume(&decoy, &verdict),
+						 GES_REPLY_WAIT_POLL_PENDING);
+			UT_ASSERT_EQ(verdict.reply_opcode, 0);
+			UT_ASSERT_EQ(verdict.reject_reason, 0);
+		}
+		UT_ASSERT_EQ(fake_lock_acquires, fake_lock_releases);
+	}
 }
 
 UT_TEST(test_poll_abandoned_is_explicit_and_preserves_tombstone)
@@ -693,10 +754,11 @@ UT_TEST(test_normal_stop_late_bad_key_and_held_original_lock)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(test_normal_stop_missing_then_actual_empty_table);
 	UT_RUN(test_poll_pending_keeps_exact_entry);
 	UT_RUN(test_poll_delivered_copies_complete_verdict_then_consumes);
+	UT_RUN(test_delivery_notifies_owner_before_consumer_recycles_entry);
 	UT_RUN(test_poll_abandoned_is_explicit_and_preserves_tombstone);
 	UT_RUN(test_poll_missing_is_explicit_without_output_mutation);
 	UT_RUN(test_poll_matches_all_five_key_fields);

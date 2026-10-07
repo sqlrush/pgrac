@@ -29,6 +29,7 @@
 #include "catalog/pg_control.h"
 #include "common/controldata_utils.h"
 #include "common/file_perm.h"
+#include "common/pgrac_control_binding.h"
 #ifdef FRONTEND
 #include "common/logging.h"
 #endif
@@ -37,6 +38,63 @@
 #ifndef FRONTEND
 #include "pgstat.h"
 #include "storage/fd.h"
+#endif
+
+#ifdef FRONTEND
+/*
+ * PGRAC MODIFICATIONS: native utility protection also exists in builds without
+ * cluster support. A regular compatibility pg_control is not an independent
+ * authority. Do not decode markers: corrupt, obsolete or nonregular entries
+ * must not reopen a destructive legacy path. No writes or authority decisions.
+ * Callers require exclusive offline ownership; this is not protection against
+ * an administrator concurrently replacing directories or deleting all markers.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+void
+reject_pgrac_legacy_operation(const char *DataDir)
+{
+	static const char *const markers[]
+		= { PGRAC_CONTROL_BINDING_NAME, "pgrac_control_root", "pgrac_control_root.bak" };
+	char path[MAXPGPATH];
+	struct stat st;
+	int len;
+
+	if (DataDir == NULL || DataDir[0] == '\0')
+		pg_fatal("PGRAC_CONTROL_GUARD_UNKNOWN: no data directory to inspect");
+	len = snprintf(path, sizeof(path), "%s/global", DataDir);
+	if (len < 0 || len >= sizeof(path))
+		pg_fatal("PGRAC_CONTROL_GUARD_UNKNOWN: data directory path is too long");
+	if (lstat(path, &st) != 0) {
+		if (errno == ENOENT)
+			return; /* Native initdb/version checks decide missing/empty inputs. */
+		pg_fatal("PGRAC_CONTROL_GUARD_UNKNOWN: could not inspect \"%s\": %m", path);
+	}
+	if (!S_ISDIR(st.st_mode))
+		pg_fatal("PGRAC_CONTROL_GUARD_UNKNOWN: \"%s\" is not a direct directory", path);
+
+	for (size_t i = 0; i < lengthof(markers); ++i) {
+		len = snprintf(path, sizeof(path), "%s/global/%s", DataDir, markers[i]);
+		if (len < 0 || len >= sizeof(path))
+			pg_fatal("PGRAC_CONTROL_GUARD_UNKNOWN: data directory path is too long");
+		if (lstat(path, &st) == 0)
+			pg_fatal("PGRAC_SHARED_CONTROL: native operation is not supported for a shared-control "
+					 "data directory");
+		if (errno != ENOENT)
+			pg_fatal("PGRAC_CONTROL_GUARD_UNKNOWN: could not inspect \"%s\": %m", path);
+	}
+	len = snprintf(path, sizeof(path), "%s/%s", DataDir, XLOG_CONTROL_FILE);
+	if (len < 0 || len >= sizeof(path))
+		pg_fatal("PGRAC_CONTROL_GUARD_UNKNOWN: data directory path is too long");
+	if (lstat(path, &st) == 0) {
+		if (S_ISLNK(st.st_mode))
+			pg_fatal("PGRAC_SHARED_CONTROL: \"%s\" is a symlink to a shared pg_control authority "
+					 "(pgrac cluster mode); native operation is not supported",
+					 path);
+		if (!S_ISREG(st.st_mode))
+			pg_fatal("PGRAC_CONTROL_GUARD_UNKNOWN: \"%s\" is not a regular control file", path);
+	} else if (errno != ENOENT)
+		pg_fatal("PGRAC_CONTROL_GUARD_UNKNOWN: could not inspect \"%s\": %m", path);
+}
 #endif
 
 /*
@@ -178,6 +236,13 @@ update_controlfile(const char *DataDir,
 	int			fd;
 	char		buffer[PG_CONTROL_FILE_SIZE];
 	char		ControlFilePath[MAXPGPATH];
+
+#ifdef FRONTEND
+	/* PGRAC: last write backstop; tools also check before earlier mutations.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	reject_pgrac_legacy_operation(DataDir);
+#endif
 
 	/* Update timestamp  */
 	ControlFile->time = (pg_time_t) time(NULL);

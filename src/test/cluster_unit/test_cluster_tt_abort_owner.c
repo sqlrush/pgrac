@@ -16,12 +16,6 @@ static int status_installs;
 static int hint_emits;
 bool cluster_enabled = true;
 
-int
-errhint(const char *fmt pg_attribute_unused(), ...)
-{
-	return 0;
-}
-
 ClusterJoinGateVerdict
 cluster_reconfig_self_join_gate_verdict(void)
 {
@@ -225,14 +219,82 @@ UT_TEST(test_post_wal_install_failure_preserves_unfinished_binding)
 	g_write_hdr_ok = true;
 }
 
+/*
+ * F-D-29: an ERROR between the commit stamp's stage and the commit record
+ * (e.g. the commit brake) leaves nothing on storage; the abort releases the
+ * stage and makes the ordinary abort durable.
+ */
+UT_TEST(test_abort_after_unwritten_commit_stage_aborts_durably)
+{
+	ClusterTTLocalBinding binding;
+	ClusterSemanticAdmissionToken admission = target_modifier_token();
+	UndoSegmentHeaderData *resident = (UndoSegmentHeaderData *)g_current_resident;
+	TTSlot staged;
+
+	reset_current_write_mock();
+	seed_current_exact_active(7, 100, 5);
+	seed_binding(&binding, CLUSTER_CANONICAL_TXN_PUBLISHED,
+				 CLUSTER_TT_LOCAL_TERMINAL_COMMIT_STAGED);
+	(void)cluster_tt_slot_durable_commit_stage(1, 4, 7, 100, 5, scn_encode(1, 42), &admission,
+											   &staged);
+	UT_ASSERT_EQ(g_write_hdr_calls, 0);
+	g_require_abort_flush_before_write = true;
+
+	UT_ASSERT(cluster_tt_local_preabort_durable_finish(100));
+
+	UT_ASSERT(!cluster_tt_slot_durable_commit_staged(1, 7, 100, 5));
+	UT_ASSERT_EQ(g_reservation_release_calls, 1);
+	UT_ASSERT_EQ(g_abort_exact_emit_calls, 1);
+	UT_ASSERT(g_abort_flush_seen);
+	UT_ASSERT_EQ(g_write_hdr_calls, 1);
+	UT_ASSERT_EQ(g_last_written_slot.status, TT_SLOT_ABORTED);
+	UT_ASSERT_EQ(resident->tt_slots[7].status, TT_SLOT_ABORTED);
+	UT_ASSERT_EQ(binding.terminal_state, CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE);
+	cluster_tt_local_record_abort(100);
+	UT_ASSERT_EQ(abort_marks, 1);
+	UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
+}
+
+/* A staged stamp of another slot is no proof for this binding. */
+UT_TEST(test_commit_staged_binding_without_its_own_stage_is_refused)
+{
+	ClusterTTLocalBinding binding;
+	ClusterSemanticAdmissionToken admission = target_modifier_token();
+	TTSlot staged;
+	volatile bool rejected = false;
+
+	reset_current_write_mock();
+	seed_current_exact_active(8, 100, 5);
+	seed_binding(&binding, CLUSTER_CANONICAL_TXN_PUBLISHED,
+				 CLUSTER_TT_LOCAL_TERMINAL_COMMIT_STAGED);
+	(void)cluster_tt_slot_durable_commit_stage(1, 4, 8, 100, 5, scn_encode(1, 42), &admission,
+											   &staged);
+	PG_TRY();
+	{
+		(void)cluster_tt_local_preabort_durable_finish(100);
+	}
+	PG_CATCH();
+	{
+		rejected = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(rejected);
+	UT_ASSERT(cluster_tt_slot_durable_commit_staged(1, 8, 100, 5));
+	UT_ASSERT_EQ(binding.terminal_state, CLUSTER_TT_LOCAL_TERMINAL_COMMIT_STAGED);
+	UT_ASSERT_EQ(g_abort_exact_emit_calls, 0);
+	cluster_tt_local_reset_binding();
+}
+
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(6);
 	UT_RUN(test_unproved_publication_cannot_skip_durable_abort);
 	UT_RUN(test_batch_rejected_before_any_hint_or_allocator_mutation);
 	UT_RUN(test_reservation_and_proved_abort_keep_existing_cleanup);
 	UT_RUN(test_post_wal_install_failure_preserves_unfinished_binding);
+	UT_RUN(test_abort_after_unwritten_commit_stage_aborts_durably);
+	UT_RUN(test_commit_staged_binding_without_its_own_stage_is_refused);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

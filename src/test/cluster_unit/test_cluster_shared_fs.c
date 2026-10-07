@@ -54,6 +54,16 @@
 #undef strerror_r
 
 #include "unit_test.h"
+#include "test_cluster_data_sync_policy.inc"
+#include "test_cluster_drop_work_unavailable.h"
+#include "storage/sync.h"
+
+bool
+RegisterSyncRequest(const FileTag *tag pg_attribute_unused(),
+					SyncRequestType type pg_attribute_unused(), bool retry pg_attribute_unused())
+{
+	return false;
+}
 
 
 /* ----------
@@ -73,6 +83,7 @@
 int cluster_shared_storage_backend = 0;
 bool cluster_smgr_user_relations = false;
 /* spec-6.14 D1: read by the shared_catalog startup vet in cluster_shared_fs_init. */
+bool enableFsync = true;
 bool cluster_shared_catalog = false;
 bool cluster_controlfile_shared_authority = false;
 bool cluster_merged_recovery = false; /* read by D1 startup vet (D9 amend dep) */
@@ -80,6 +91,7 @@ bool cluster_merged_recovery = false; /* read by D1 startup vet (D9 amend dep) *
 char *cluster_shared_data_dir = NULL;
 char *cluster_shared_storage_uuid = NULL;
 int cluster_node_id = 0;
+int io_direct_flags = 0;
 static const char *stub_block_device_storage_uuid;
 
 bool

@@ -71,10 +71,10 @@ ProcessingMode Mode = NormalProcessing;
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
 
-static char fake_state_storage[4096] pg_attribute_aligned(64);
-static char fake_lock_storage[sizeof(LWLockPadded)] pg_attribute_aligned(64);
-static char fake_hash_storage[4][256] pg_attribute_aligned(64);
-static char fake_hash_handle[64] pg_attribute_aligned(64);
+static pg_attribute_aligned(64) char fake_state_storage[4096];
+static pg_attribute_aligned(64) char fake_lock_storage[sizeof(LWLockPadded)];
+static pg_attribute_aligned(64) char fake_hash_storage[4][256];
+static pg_attribute_aligned(64) char fake_hash_handle[64];
 static bool fake_state_found;
 static bool fake_lock_found;
 static uint16 fake_hash_count;

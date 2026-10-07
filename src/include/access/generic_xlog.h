@@ -29,6 +29,21 @@
 struct GenericXLogState;
 typedef struct GenericXLogState GenericXLogState;
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: only existing internal cleanup owners may emit shared generic WAL. */
+#include "cluster/cluster_space_identity.h"
+typedef enum GenericXLogInternalOwner
+{
+	GENERIC_XLOG_ITL_FINISH = 1,
+	GENERIC_XLOG_CTRC_MX,
+	GENERIC_XLOG_CTRC_ITL
+} GenericXLogInternalOwner;
+extern GenericXLogState *GenericXLogStartInternal(bool is_logged,
+												GenericXLogInternalOwner owner);
+extern Page GenericXLogRegisterBufferVersioned(GenericXLogState *state, Buffer buffer,
+												 int flags, const ClusterSpaceIdentity *identity);
+#endif
+
 /* API for construction of generic xlog records */
 extern GenericXLogState *GenericXLogStart(Relation relation);
 extern GenericXLogState *GenericXLogStartLogged(bool is_logged);

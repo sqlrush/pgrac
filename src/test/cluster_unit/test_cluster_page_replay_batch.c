@@ -388,6 +388,13 @@ UT_TEST(test_two_targets_apply_then_install_as_one_proven_batch)
 	UT_ASSERT_EQ(test_case.fixture.promote_calls, 1);
 	UT_ASSERT_EQ(proof.step_count, 2);
 	UT_ASSERT(proof.detached_apply_complete && proof.install.postread_complete);
+	for (int i = 0; i < 2; i++) {
+		int origin = -1;
+		UT_ASSERT_EQ(PageGetLSN(test_case.fixture.disk[i].data),
+					 test_case.replay_records[i].identity.end_rec_ptr);
+		UT_ASSERT(PageGetLSNOrigin(test_case.fixture.disk[i].data, &origin));
+		UT_ASSERT_EQ(origin, test_case.replay_records[i].identity.origin_thread - 1);
+	}
 }
 
 UT_TEST(test_incomplete_sibling_plan_blocks_before_any_apply_or_target_read)
@@ -627,10 +634,24 @@ UT_TEST(test_exact_two_step_chain_reaches_terminal_version)
 	UT_ASSERT_EQ(proof.step_count, 2);
 }
 
+UT_TEST(test_source_origin_must_fit_page_coordinate)
+{
+	BatchCase test_case;
+	RfPageReplayBatchProofV1 proof;
+	init_case(&test_case, 1);
+	test_case.replay_records[0].identity.origin_thread = PGRAC_PAGE_LSN_ORIGIN_MAX + 2;
+	test_case.participants[0].failed_thread = PGRAC_PAGE_LSN_ORIGIN_MAX + 2;
+	UT_ASSERT_EQ(rf_page_replay_batch_execute_v1(&test_case.request, &proof),
+				 RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+	UT_ASSERT_EQ(apply_calls, 0);
+	UT_ASSERT_EQ(test_case.fixture.read_calls, 0);
+	UT_ASSERT_EQ(test_case.fixture.write_calls, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(test_two_targets_apply_then_install_as_one_proven_batch);
 	UT_RUN(test_incomplete_sibling_plan_blocks_before_any_apply_or_target_read);
 	UT_RUN(test_chain_gap_blocks_whole_batch_before_apply);
@@ -644,6 +665,7 @@ main(void)
 	UT_RUN(test_targets_must_be_strict_canonical_identity_order);
 	UT_RUN(test_oversized_step_count_is_rejected_before_indexing);
 	UT_RUN(test_exact_two_step_chain_reaches_terminal_version);
+	UT_RUN(test_source_origin_must_fit_page_coordinate);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

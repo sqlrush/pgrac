@@ -29,6 +29,12 @@
 /* XLOG gives us high 4 bits */
 #define XLOG_SMGR_CREATE	0x10
 #define XLOG_SMGR_TRUNCATE	0x20
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: typed SPACE lifecycle payload; never an ordinary block/FPI record. */
+#define XLOG_SMGR_SPACE_IDENTITY 0x30
+/* PGRAC: exact main-fork sequential ADVANCE, no structural action. */
+#define XLOG_SMGR_SPACE_RESERVATION 0x40
+#endif
 
 typedef struct xl_smgr_create
 {
@@ -53,6 +59,17 @@ typedef struct xl_smgr_truncate
 extern void log_smgrcreate(const RelFileLocator *rlocator, ForkNumber forkNum);
 
 extern void smgr_redo(XLogReaderState *record);
+/* PGRAC: native physical sequence; lsn is a local recovery coordinate. */
+extern void smgr_redo_truncate(XLogRecPtr lsn, const xl_smgr_truncate *xlrec);
+struct ClusterSpaceRecoveryBatchV1;
+#ifdef USE_PGRAC_CLUSTER
+/* Original cold SPACE batch supplies exact source and target authority.
+ * Refusal before shrink leaves the original structural owner in charge. */
+extern bool smgr_cold_truncate_preflight(const xl_smgr_truncate *xlrec,
+										 const struct ClusterSpaceRecoveryBatchV1 *batch);
+extern bool smgr_redo_cold_truncate(const xl_smgr_truncate *xlrec,
+								   const struct ClusterSpaceRecoveryBatchV1 *batch);
+#endif
 extern void smgr_desc(StringInfo buf, XLogReaderState *record);
 extern const char *smgr_identify(uint8 info);
 

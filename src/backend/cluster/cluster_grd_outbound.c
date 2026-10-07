@@ -35,6 +35,8 @@
  */
 #include "postgres.h"
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_control_retire.h"
+#include "cluster/cluster_wal_retention.h"
 
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_gcs_block.h"
@@ -737,6 +739,15 @@ cluster_grd_outbound_lmon_drain_send(void)
 		ClusterICSendResult rc;
 
 		scanned++;
+
+		/* PGRAC: the sole CONTROL sender fences abandoned acquisition
+		 * producers before either transport admission or refusal requeue.
+		 * Absence after exact retirement does not authorize an old frame.
+		 * Author: SqlRush <sqlrush@gmail.com> */
+		if (cluster_shared_config
+			&& !cluster_control_retire_outbound_allowed(slot.msg_type, slot.payload,
+														slot.payload_len))
+			continue;
 
 		if (slot.dest_node_id < CLUSTER_MAX_NODES && peer_blocked[slot.dest_node_id]) {
 			requeue_after_send_refusal(&slot);

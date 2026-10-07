@@ -53,6 +53,7 @@ typedef struct PgracFencedRejoinCoordinatorV1
 	PgracFencedRejoinContextV1 rejoin_context;
 	PgracFencedRejoinAsyncWorkerV1 worker;
 	int worker_owner;
+	uint32 cleanup_cursor;
 	uint32 client_count;
 	bool quiescing;
 	PgracFencedRejoinClientV1 clients[PGRAC_FENCED_REJOIN_MAX_CLIENTS];
@@ -62,6 +63,9 @@ extern bool pgrac_fenced_rejoin_coordinator_init(
 	PgracFencedRejoinCoordinatorV1 *coordinator,
 	PgracFencedOperationContextV1 *operation_context,
 	PgracFencedCoordinatorV1 *scalar_coordinator);
+extern bool pgrac_fenced_rejoin_coordinator_restore(
+	PgracFencedRejoinCoordinatorV1 *coordinator,
+	PgracFencedJournalReconcileState *pending);
 extern bool pgrac_fenced_rejoin_coordinator_accept_fd(
 	PgracFencedRejoinCoordinatorV1 *coordinator,
 	int client_fd,

@@ -14,8 +14,9 @@
 #    is feature #11).
 #
 #      L0   preflight: pg_relation_filepath identical on both nodes
-#           (else skip_all) + shared-root sentinel carries BOTH node
-#           ids as participants
+#           (the tables are created on the seed, so both catalogs
+#           share their files) + shared-root sentinel carries BOTH
+#           node ids as participants
 #      L13  torn/corrupt candidate WAL below the validated end ->
 #           merged recovery refused 53RA3 (never silent truncation);
 #           restore -> engages.  (Cursor xl_scn-vs-LSN ordering is
@@ -76,6 +77,16 @@
 #      L14  dump surface: recovery category = 39 keys; remote outcome
 #           counters live
 #
+#    Provisioning (2026-10-02): the pair comes from PgracColdPair, which
+#    uses only supported entries (initdb registry and HW seed options, a
+#    cluster-disabled seed for the shared tables, the seed's first
+#    clustered start publishing the shared control authority).  Nothing is
+#    skipped: a step the build cannot perform is a failed assertion that
+#    names the server's reason, and the run stops there.  Outside the shared
+#    profile (cluster.shared_config) a cold crash that needs a peer's
+#    thread is refused before replay (see t/247); the merge legs below are
+#    the shared-profile recovery target and fail until that path runs.
+#
 #    NB: this is a Perl TAP file -- never run clang-format on it.
 #
 #    Author: SqlRush <sqlrush@gmail.com>
@@ -92,7 +103,7 @@ use lib "$FindBin::RealBin/../lib";
 use PgracClusterNode;
 use PgracWalState qw(forge_slot_merge_recovered_lsn read_file_raw
   read_slot_raw write_file_raw);
-use PostgreSQL::Test::ClusterPair;
+use PgracColdPair qw(new_cold_pair);
 use PostgreSQL::Test::Utils;
 use Test::More;
 
@@ -243,6 +254,19 @@ sub make_single_node
 	close $fh;
 }
 
+# A start the build cannot perform stops the run as a failed assertion
+# (see run_legs) carrying the server's reason; never a harness bailout.
+sub start_or_die
+{
+	my ($node, $label) = @_;
+	my $off = -s $node->logfile // 0;
+	return 1 if $node->start(fail_ok => 1);
+	die "$label: start failed: "
+	  . join(' | ', grep { /FATAL|PANIC|DETAIL|HINT/ }
+		  split /\n/, PostgreSQL::Test::Utils::slurp_file($node->logfile, $off))
+	  . "\n";
+}
+
 # Wait until the postmaster of $node has fully exited.
 sub wait_postmaster_gone
 {
@@ -270,11 +294,18 @@ sub wait_postmaster_gone
 # bypass GCS).  The shared data root + WAL registry + sentinel are the
 # cross-node coupling the merge actually consumes.
 # ----------------------------------------------------------------
-my $pair = PostgreSQL::Test::ClusterPair->new_pair('sharedmerge',
-	quorum_voting_disks => 3,
-	wal_threads_root => 1,
-	shared_data      => 1,
-	extra_conf       => [
+my @tables = qw(t_a t_b t_pp t_doubt t_l4 t_slot);
+my $ddl = join('; ',
+	'CREATE TABLE t_a (v int)',
+	'CREATE TABLE t_b (v int)',
+	'CREATE TABLE t_pp (v int)',
+	'CREATE TABLE t_doubt (v int)',
+	'CREATE TABLE t_l4 (k int, v int)',
+	'CREATE TABLE t_slot (v int)');
+
+my $pair = new_cold_pair('sharedmerge',
+	seed_sql   => $ddl,
+	extra_conf => [
 		'autovacuum = off',
 		'restart_after_crash = off',
 		'cluster.merged_recovery = on',
@@ -291,22 +322,14 @@ my $nb        = $pair->node1;    # node_id 1, thread 2, instance 2
 make_single_node($na, 0, $pair->ic_port(0));
 make_single_node($nb, 1, $pair->ic_port(1));
 
-my @tables = qw(t_a t_b t_pp t_doubt t_l4 t_slot);
-my $ddl = join('; ',
-	'CREATE TABLE t_a (v int)',
-	'CREATE TABLE t_b (v int)',
-	'CREATE TABLE t_pp (v int)',
-	'CREATE TABLE t_doubt (v int)',
-	'CREATE TABLE t_l4 (k int, v int)',
-	'CREATE TABLE t_slot (v int)');
+eval {
 
 # ================================================================
 # Phase 1: node A alone -- own rows + L4b abort bait + L11 first write.
 # A checkpoints (its own data flushes to the shared root; A's own
 # recovery baseline) and then crashes.
 # ================================================================
-$na->start;
-$na->safe_psql('postgres', $ddl);
+start_or_die($na, 'phase 1 node A');
 
 my %relpath;
 $relpath{$_} = $na->safe_psql('postgres', "SELECT pg_relation_filepath('$_')")
@@ -331,23 +354,14 @@ $na->stop('immediate');
 # B commit replays during A's merge and its outcome is materialized),
 # and dies mid-commit on the in-doubt txn.
 # ================================================================
-$nb->start;
-$nb->safe_psql('postgres', $ddl);    # adopt A's relfiles (owner-agnostic create)
+start_or_die($nb, 'phase 2 node B');
 
-# L0 preflight: same DDL -> same relfilenode on both nodes.
-my $mismatch = 0;
+# L0 preflight: the seed's tables share their files on both nodes.
 for my $t (@tables)
 {
-	my $pb = $nb->safe_psql('postgres', "SELECT pg_relation_filepath('$t')");
-	$mismatch = 1 if $pb ne $relpath{$t};
+	is($nb->safe_psql('postgres', "SELECT pg_relation_filepath('$t')"),
+		$relpath{$t}, "L0 $t uses one shared relation file");
 }
-if ($mismatch)
-{
-	plan skip_all =>
-	  'same-DDL relfilepath coincidence does not hold on this build '
-	  . '(harness premise; production naming is feature #11)';
-}
-ok(1, 'L0 pg_relation_filepath identical on both nodes for all 5 tables');
 ok(-f "$dataroot/pgrac_shared.control", 'L0 shared-root sentinel exists');
 my $ids = read_sentinel("$dataroot/pgrac_shared.control");
 is_deeply([ sort { $a <=> $b } @$ids ], [ 0, 1 ],
@@ -487,7 +501,7 @@ write_file_raw($walfile, $savedwal);
 # orthogonal to which live node masters the block grant.
 # ----------------------------------------------------------------
 $log_off = -s $na->logfile;
-$na->start;
+start_or_die($na, 'node A');
 $log = PostgreSQL::Test::Utils::slurp_file($na->logfile, $log_off);
 like($log, qr/cluster merged recovery: engage decision PASSED/,
 	'L2 engage decision PASSED');
@@ -524,7 +538,7 @@ ok(@committed > 0,
 # ----------------------------------------------------------------
 make_single_node($nb, 1, $pair->ic_port(1));
 $log_off = -s $nb->logfile;
-$nb->start;
+start_or_die($nb, 'node B');
 $log = PostgreSQL::Test::Utils::slurp_file($nb->logfile, $log_off);
 is(query_retry($nb, 'SELECT count(*) FROM t_b'), '100',
 	'L12 retained own WAL replay leaves B own rows intact');
@@ -606,12 +620,12 @@ $na->stop;
 my $saved_xact = patch_local_pg_xact_aborted($na->data_dir, $kc);
 is(local_pg_xact_status_bits($na->data_dir, $kc), 2,
 	'L5 the falsified local pg_xact contains ABORTED bits (patch took)');
-$na->start;
+start_or_die($na, 'node A');
 is($na->safe_psql('postgres', 'SELECT v FROM t_l4 WHERE k = 1'), '11',
 	"L5 B's committed update stays visible: A's pg_xact is never consulted");
 $na->stop;
 write_file_raw($na->data_dir . '/pg_xact/0000', $saved_xact);
-$na->start;
+start_or_die($na, 'node A');
 
 # ----------------------------------------------------------------
 # L7: authority missing link -- materialized segment removed.
@@ -654,7 +668,7 @@ is(query_retry($na, 'SELECT count(*) FROM t_b'), '100',
 # B (single node too) writes a checkpoint-fenced DROP so A's re-merge
 # window contains only the drop commit (nrels>0).
 # ----------------------------------------------------------------
-$nb->start;
+start_or_die($nb, 'node B');
 $nb->safe_psql('postgres', 'CREATE TABLE drop_t (v int)');
 $nb->safe_psql('postgres', 'INSERT INTO drop_t VALUES (1)');
 $nb->safe_psql('postgres', 'CHECKPOINT');    # fence the CREATE out of the window
@@ -671,7 +685,7 @@ like($log, qr/foreign commit record carries an unsupported side effect/,
 	'L4c P1-1 53RA3: the DROP is never silently skipped');
 
 $na->adjust_conf('postgresql.conf', 'cluster.merged_recovery', 'off');
-$na->start;
+start_or_die($na, 'node A');
 is(query_retry($na, 'SELECT count(*) FROM t_a'), '100',
 	'L4c own-stream recovery completes with merged_recovery=off');
 is($na->safe_psql('postgres', 'SELECT count(*) FROM t_b'), '100',
@@ -716,5 +730,8 @@ ok(defined $ovf && $ovf =~ /ITL slot OVERFLOW/,
 is($na->safe_psql('postgres', 'SELECT count(*), sum(v) FROM t_slot'), '8|4036',
 	'L16 after the refused write every B row still reads by B authority (origin intact)');
 $pair->stop_pair;
+
+1;
+} or fail("248 stopped: $@");
 
 done_testing();

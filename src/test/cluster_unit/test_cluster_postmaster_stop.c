@@ -42,7 +42,7 @@ enum {
 static int Shutdown, pmState;
 static bool FatalError;
 bool IsUnderPostmaster, IsPostmasterEnvironment;
-bool cluster_enabled, cluster_lms_enabled, cluster_lmd_enabled;
+bool cluster_enabled, cluster_lms_enabled, cluster_lmd_enabled, cluster_shared_config;
 int cluster_node_id, cluster_lms_workers;
 static int configured_nodes = 4;
 static pid_t LmonPID, LckPID, LmdPID, CssdPID, QvotecPID, LmsPID, SinvalBcastPID, CheckpointerPID;
@@ -354,6 +354,7 @@ setup(void)
 	pmState = PM_RUN;
 	FatalError = false;
 	cluster_enabled = cluster_lms_enabled = cluster_lmd_enabled = true;
+	cluster_shared_config = false;
 	cluster_lms_workers = 8;
 	cluster_node_id = 1;
 	configured_nodes = 4;
@@ -784,10 +785,165 @@ UT_TEST(actual_intent_publication_failure_cannot_dispatch_legacy_checkpoint)
 	UT_ASSERT(failure != 0);
 }
 
+/* PRE2 retention is an actor-lifetime requirement, not a four-member R4
+ * authority. Exercise the real selector and state machine without supplying
+ * that old hint. The external closure fixture stays false until explicitly
+ * testing the existing completion consumer. */
+UT_TEST(shared_config_retains_original_services_without_legacy_formation_hint)
+{
+	const int counts[] = { 1, 2, 3, 4, 128 };
+
+	for (unsigned n = 0; n < lengthof(counts); n++) {
+		setup();
+		cluster_shared_config = true;
+		configured_nodes = counts[n];
+		retention_hint = false;
+		UT_ASSERT(NormalStopPostmasterPreselectReady());
+		UT_ASSERT(NormalStopPostmasterBegin());
+		UT_ASSERT(normal_stop_pm.selected);
+		UT_ASSERT_EQ(request_calls, 1);
+		UT_ASSERT_EQ(normal_stop_pm.expected, (1U << 22) - 1);
+		UT_ASSERT_EQ(normal_stop_pm.pids[9], 109);
+		UT_ASSERT_EQ(normal_stop_pm.pids[21], 121);
+		UT_ASSERT(!NormalStopPostmasterComplete());
+		UT_ASSERT_EQ(signal_count, 0);
+	}
+}
+
+UT_TEST(shared_config_preselection_rejects_missing_actors_without_poisoning)
+{
+	for (int fast = 0; fast < 2; fast++) {
+		setup();
+		cluster_shared_config = true;
+		configured_nodes = 2;
+		retention_hint = false;
+		Shutdown = NoShutdown;
+		child_count = 1;
+		status_writes = 0;
+		SinvalBcastPID = 0;
+		pending_pm_shutdown_request = true;
+		pending_pm_fast_shutdown_request = fast;
+		pending_pm_immediate_shutdown_request = false;
+		process_pm_shutdown_request();
+		UT_ASSERT_EQ(Shutdown, NoShutdown);
+		UT_ASSERT_EQ(pmState, PM_RUN);
+		UT_ASSERT(connsAllowed);
+		UT_ASSERT(!normal_stop_pm.selected);
+		UT_ASSERT_EQ(request_calls, 0);
+		UT_ASSERT_EQ(signal_count, 0);
+		UT_ASSERT_EQ(status_writes, 0);
+		UT_ASSERT_EQ(failure, CLUSTER_NORMAL_STOP_FAILURE_NONE);
+		if (ut_current_failed)
+			return;
+		actual_cluster_respawn_edges();
+		UT_ASSERT(SinvalBcastPID > 0);
+		pending_pm_shutdown_request = true;
+		pending_pm_fast_shutdown_request = fast;
+		process_pm_shutdown_request();
+		UT_ASSERT_EQ(Shutdown, fast ? FastShutdown : SmartShutdown);
+		UT_ASSERT(normal_stop_pm.selected);
+		UT_ASSERT_EQ(request_calls, 1);
+		UT_ASSERT_EQ(failure, CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	}
+}
+
+UT_TEST(shared_config_actual_shutdown_keeps_actors_until_protocol_completion)
+{
+	for (int mode = SmartShutdown; mode <= FastShutdown; mode++) {
+		setup();
+		cluster_shared_config = true;
+		configured_nodes = 2;
+		retention_hint = false;
+		Shutdown = mode;
+		UT_ASSERT(NormalStopPostmasterBegin());
+		if (ut_current_failed)
+			return;
+		pmState = PM_STOP_BACKENDS;
+		child_count = 1;
+		PostmasterStateMachine();
+		UT_ASSERT_EQ(pmState, PM_WAIT_BACKENDS);
+		UT_ASSERT_EQ(signal_count, 0);
+		UT_ASSERT_EQ(frontend_cut_calls, 0);
+		UT_ASSERT_EQ(legacy_candidate_calls, 0);
+		child_count = 0;
+		expected_signal = SIGUSR2;
+		PostmasterStateMachine();
+		UT_ASSERT_EQ(pmState, PM_SHUTDOWN);
+		UT_ASSERT_EQ(frontend_cut_calls, 1);
+		UT_ASSERT_EQ(signal_count, 1);
+		UT_ASSERT_EQ(signals[0], CheckpointerPID);
+		signal_count = 0;
+		expected_signal = SIGTERM;
+		UT_ASSERT(!NormalStopPostmasterRelease());
+		UT_ASSERT_EQ(signal_count, 0);
+		/* A zero checkpointer exit is still not protocol completion. */
+		NormalStopPostmasterReap(CheckpointerPID, 0);
+		CheckpointerPID = 0;
+		UT_ASSERT(!NormalStopPostmasterRelease());
+		UT_ASSERT_EQ(signal_count, 0);
+		UT_ASSERT(!NormalStopPostmasterComplete());
+	}
+}
+
+UT_TEST(shared_config_cannot_substitute_an_actor_or_skip_final_voting_clear)
+{
+	for (int replace = 0; replace < 2; replace++) {
+		setup();
+		cluster_shared_config = true;
+		configured_nodes = 4;
+		retention_hint = false;
+		UT_ASSERT(NormalStopPostmasterBegin());
+		if (ut_current_failed)
+			return;
+		if (replace) {
+			LmsPID = 900;
+			UT_ASSERT(!NormalStopPostmasterRosterMatches());
+			UT_ASSERT_EQ(normal_stop_pm.pids[1], 101);
+			UT_ASSERT(!NormalStopPostmasterRelease());
+			UT_ASSERT_EQ(signal_count, 0);
+			continue;
+		}
+		finish_checkpoint();
+		UT_ASSERT(NormalStopPostmasterRelease());
+		UT_ASSERT_EQ(signal_count, 22);
+		for (int i = 0; i < 22; i++) {
+			pid_t pid = normal_stop_pm.pids[i];
+			NormalStopPostmasterReap(pid, 0);
+			forget_pid(pid);
+		}
+		UT_ASSERT(!NormalStopPostmasterComplete());
+		clear_ok = true;
+		UT_ASSERT(NormalStopPostmasterComplete());
+	}
+}
+
+UT_TEST(shared_config_does_not_turn_abnormal_exit_into_normal_stop)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		setup();
+		cluster_shared_config = true;
+		configured_nodes = 2;
+		retention_hint = false;
+		if (fault == 0)
+			cluster_enabled = false;
+		if (fault == 1)
+			Shutdown = ImmediateShutdown;
+		if (fault == 2)
+			FatalError = true;
+		if (fault == 3)
+			IsUnderPostmaster = true;
+		if (fault == 4)
+			IsPostmasterEnvironment = false;
+		UT_ASSERT(!NormalStopPostmasterBegin());
+		UT_ASSERT(!normal_stop_pm.selected);
+		UT_ASSERT_EQ(request_calls, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(25);
 	UT_RUN(capture_is_once_and_does_not_authorize_checkpoint);
 	UT_RUN(configured_pool_is_frozen_not_surviving_pids);
 	UT_RUN(missing_extra_and_duplicate_actor_fail_without_shrinking);
@@ -808,6 +964,11 @@ main(void)
 	UT_RUN(actual_checkpoint_reaper_releases_exact_roster_only_after_proof);
 	UT_RUN(immediate_upgrade_keeps_native_abnormal_exit_not_normal_proof);
 	UT_RUN(actual_intent_publication_failure_cannot_dispatch_legacy_checkpoint);
+	UT_RUN(shared_config_retains_original_services_without_legacy_formation_hint);
+	UT_RUN(shared_config_preselection_rejects_missing_actors_without_poisoning);
+	UT_RUN(shared_config_actual_shutdown_keeps_actors_until_protocol_completion);
+	UT_RUN(shared_config_cannot_substitute_an_actor_or_skip_final_voting_clear);
+	UT_RUN(shared_config_does_not_turn_abnormal_exit_into_normal_stop);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

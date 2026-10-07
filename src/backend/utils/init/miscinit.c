@@ -49,6 +49,7 @@
 #include "access/parallel.h"
 #include "catalog/pg_authid.h"
 #include "common/file_perm.h"
+#include "common/pgrac_control_binding.h" /* PGRAC: startup downgrade protection */
 #include "libpq/libpq.h"
 #include "libpq/pqsignal.h"
 #include "mb/pg_wchar.h"
@@ -408,6 +409,68 @@ SetDatabasePath(const char *path)
 }
 
 /*
+ * PGRAC: native startup must not bypass an independently retained PRE2 binding
+ * merely because shared_config was omitted, damaged, or compiled out.  This
+ * guard protects even a corrupt marker. The initial postmaster's explicit new
+ * profile may continue only to the mandatory exact bootstrap reader, not to
+ * admission. No decode, authority inference or writes occur in this guard.
+ * Unlike destructive frontend tools, legacy pg_control symlinks/root names
+ * alone are not rejected here.  Normal PRE1 startup remains supported.
+ */
+static void
+check_pgrac_control_binding(void)
+{
+	char path[MAXPGPATH];
+	struct stat st;
+	int len;
+
+	len = snprintf(path, sizeof(path), "%s/global", DataDir);
+	if (len < 0 || len >= sizeof(path))
+		ereport(FATAL, (errcode(ERRCODE_NAME_TOO_LONG),
+						errmsg("PGRAC_CONTROL_BINDING_UNKNOWN: data directory path is too long")));
+	if (lstat(path, &st) != 0) {
+		if (errno == ENOENT)
+			return; /* Native bootstrap may be inspecting an empty directory. */
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("PGRAC_CONTROL_BINDING_UNKNOWN: could not inspect \"%s\": %m", path)));
+	}
+	/* Do not turn a dangling parent link into proof of marker absence. */
+	if (S_ISLNK(st.st_mode) && stat(path, &st) != 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("PGRAC_CONTROL_BINDING_UNKNOWN: could not inspect \"%s\": %m", path)));
+	if (!S_ISDIR(st.st_mode))
+		ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("PGRAC_CONTROL_BINDING_UNKNOWN: \"%s\" is not a directory", path)));
+	len = snprintf(path, sizeof(path), "%s/global/%s", DataDir, PGRAC_CONTROL_BINDING_NAME);
+	if (len < 0 || len >= sizeof(path))
+		ereport(FATAL, (errcode(ERRCODE_NAME_TOO_LONG),
+						errmsg("PGRAC_CONTROL_BINDING_UNKNOWN: data directory path is too long")));
+	if (lstat(path, &st) == 0) {
+#ifdef USE_PGRAC_CLUSTER
+		if (IsPostmasterEnvironment && !IsUnderPostmaster && !IsBootstrapProcessingMode()
+			&& !process_shared_preload_libraries_done) {
+			process_cluster_gucs();
+			if (cluster_shared_config)
+				return; /* Routing only: missing/corrupt inputs still fail in the reader. */
+		}
+#endif
+		ereport(
+			FATAL,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("PRE2 shared-control startup is not yet available"),
+			 errdetail("PGRAC_CONTROL_BINDING_REQUIRED: the data directory has a PRE2 binding."),
+			 errhint("Use a qualified root-bound startup adapter; disabling cluster settings "
+					 "does not make the compatibility control file authoritative.")));
+	}
+	if (errno != ENOENT)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("PGRAC_CONTROL_BINDING_UNKNOWN: could not inspect \"%s\": %m", path)));
+}
+
+/*
  * Validate the proposed data directory.
  *
  * Also initialize file and directory create modes and mode mask.
@@ -486,6 +549,9 @@ checkDataDir(void)
 	umask(pg_mode_mask);
 	data_directory_mode = pg_dir_create_mode;
 #endif
+
+	/* PGRAC: all native server entries pass here before data-lock/WAL writes. */
+	check_pgrac_control_binding();
 
 	/* Check for PG_VERSION */
 	ValidatePgVersion(DataDir);
@@ -1858,21 +1924,47 @@ load_libraries(const char *libraries, const char *gucname, bool restricted)
 	pfree(rawstring);
 }
 
+#ifdef USE_PGRAC_CLUSTER
 /*
- * process any libraries that should be preloaded at postmaster start
+ * PGRAC: bind cluster placeholders before control-file sizing.  This only
+ * registers parameters: library loading and cluster shmem registration stay
+ * in the ordinary preload phase.  Forked children inherit this process-local
+ * state; an EXEC_BACKEND process registers its own definitions once.
  *
- * PGRAC modifications by SqlRush:
- *	What changed:  When USE_PGRAC_CLUSTER is defined, register all pgrac
- *	               cluster custom GUCs (currently cluster_node_id) before
- *	               loading user shared_preload_libraries.
- *	Why:           PG forbids creating PGC_POSTMASTER custom GUCs outside
- *	               this phase (see add_guc_variable in guc.c).  Calling
- *	               cluster_init_guc() here piggybacks on the same flag and
- *	               makes the registration valid.  Loading order matters:
- *	               we register pgrac GUCs FIRST so user preload libraries
- *	               can read or override them if desired.
- *	               See docs/cluster-guc-design.md §2 and
- *	               specs/spec-0.13-guc-framework.md.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+void
+process_cluster_gucs(void)
+{
+	static bool registered = false;
+	bool saved_phase = process_shared_preload_libraries_in_progress;
+
+	if (registered)
+		return;
+	if (process_shared_preload_libraries_done)
+		ereport(FATAL, (errmsg("cluster parameters were not registered before preload completed")));
+
+	PG_TRY();
+	{
+		/* Native custom PGC_POSTMASTER definitions require this phase flag. */
+		process_shared_preload_libraries_in_progress = true;
+		cluster_init_guc();
+		registered = true;
+		process_shared_preload_libraries_in_progress = saved_phase;
+	}
+	PG_CATCH();
+	{
+		process_shared_preload_libraries_in_progress = saved_phase;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+#endif
+
+/*
+ * Process libraries preloaded at postmaster start.
+ * PGRAC: preserve cluster initialization before user preload libraries, with
+ * once-only GUC registration even if control sizing has already bound them.
  */
 void
 process_shared_preload_libraries(void)
@@ -1880,7 +1972,7 @@ process_shared_preload_libraries(void)
 	process_shared_preload_libraries_in_progress = true;
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: register cluster GUCs (PGC_POSTMASTER) before user preload libs. */
-	cluster_init_guc();
+	process_cluster_gucs();
 	/*
 	 * PGRAC (stage 1.3): cluster_init() now registers foundational shmem
 	 * regions (cluster_ctl + cluster_conf) into the cluster shmem

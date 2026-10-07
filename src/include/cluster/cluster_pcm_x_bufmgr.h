@@ -25,6 +25,7 @@
 #include "access/xlogdefs.h"
 #include "cluster/cluster_pcm_own.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_page_wal.h"
 #include "storage/buf_internals.h"
 
 /* Compiler-visible identities consumed by the Stage-8 closed-world AST gate.
@@ -244,6 +245,7 @@ typedef struct ResourceXCurrentImage {
 	SCN page_scn;
 	uint32 page_checksum;
 	uint32 image_length;
+	ClusterPageWalBindingV1 page_wal;
 } ResourceXCurrentImage;
 
 typedef enum ResourceXBufferActivationResult {
@@ -264,8 +266,8 @@ typedef enum ResourceXSidecarNeutralizeResult {
 	RESOURCE_X_SIDECAR_CORRUPT
 } ResourceXSidecarNeutralizeResult;
 
-StaticAssertDecl(sizeof(ResourceXCurrentImage) == 32,
-				 "ResourceXCurrentImage process-local layout must remain 32 bytes");
+StaticAssertDecl(sizeof(ResourceXCurrentImage) == 264,
+				 "ResourceXCurrentImage process-local layout must remain 264 bytes");
 
 static inline bool
 cluster_pcm_x_resource_x_t2_snapshot_exact(const ResourceXAcquisitionRef *ref,
@@ -328,7 +330,8 @@ typedef enum ClusterPcmOwnFinishRefusalReason {
 	CLUSTER_PCM_OWN_FINISH_REFUSAL_VM_FSM_PINNED,
 	CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS,
 	CLUSTER_PCM_OWN_FINISH_REFUSAL_LIVE_FLAGS,
-	CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK
+	CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK,
+	CLUSTER_PCM_OWN_FINISH_REFUSAL_DATA_IO_RETRY
 } ClusterPcmOwnFinishRefusalReason;
 
 typedef struct ClusterPcmOwnFinishRefusal {
@@ -801,7 +804,8 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 										 const ResourceXCurrentImage *image,
 										 ResourceXBufferInstallProof *out_proof);
 extern ResourceXBufferActivationResult cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
-	const ResourceXAcquisitionRef *ref, ResourceXBufferActivationProof *out_proof);
+	const ResourceXAcquisitionRef *ref, const ClusterPageWalBindingV1 *expected_wal,
+	bool remote_image, ResourceXBufferActivationProof *out_proof);
 /* Exact known-new TARGET adaptation.  These calls bind/clear only the
  * Resource-X sidecar around an already committed local X reservation; they
  * never install durable-storage bytes into the direct-init descriptor. */
@@ -829,6 +833,9 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_ex
  * source REVOKING lifecycle or retained PI+VALID descriptor is not. */
 extern bool cluster_bufmgr_pcm_x_content_write_permitted(BufferDesc *buf);
 extern bool cluster_bufmgr_pcm_x_ordinary_content_write_permitted(BufferDesc *buf);
+/* Caller continuously holds content X.  Shares MarkBufferDirty's exact
+ * activation/retention gate, including an already-admitted revoke predecessor. */
+extern bool cluster_bufmgr_pcm_x_content_holder_write_permitted(BufferDesc *buf);
 extern void cluster_bufmgr_pcm_own_republish_grant_pending_image(BufferDesc *buf);
 /* Called only after the requester has proved the exact remote master's S->N
  * RELEASE application ACK.  Atomically normalizes the matching descriptor
@@ -911,7 +918,7 @@ cluster_bufmgr_pcm_own_try_drain_drop_x_revoke(BufferDesc *buf,
 											   const ClusterPcmOwnSnapshot *expected_revoking);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
 	ClusterPcmOwnHeldXRevoke *held, XLogRecPtr expected_lsn, ClusterPcmOwnSnapshot *out_retained,
-	ClusterPcmOwnFinishRefusal *out_refusal);
+	ClusterPcmOwnFinishRefusal *out_refusal, const ResourceXSourceWalRetainedV1 *retained_wal);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(ClusterPcmOwnHeldXRevoke *held);
 
@@ -939,13 +946,15 @@ cluster_bufmgr_pcm_own_begin_s_revoke(BufferDesc *buf, const ClusterPcmOwnSnapsh
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_prepare_s_source_image(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s, SCN required_page_scn,
 	ClusterPcmOwnSnapshot *out_revoking, char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
-	uint64 *out_page_scn, ClusterPcmOwnSourcePrepareRefusal *out_refusal);
+	uint64 *out_page_scn, ClusterPcmOwnSourcePrepareRefusal *out_refusal,
+	ClusterPageWalBindingV1 *out_wal);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abort_s_revoke(BufferDesc *buf,
 									  const ClusterPcmOwnSnapshot *expected_revoking);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_revoke_retain(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking, XLogRecPtr expected_lsn,
-	ClusterPcmOwnSnapshot *out_retained, ClusterPcmOwnFinishRefusal *out_refusal);
+	ClusterPcmOwnSnapshot *out_retained, ClusterPcmOwnFinishRefusal *out_refusal,
+	const ResourceXSourceWalRetainedV1 *retained_wal);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(
 	const BufferTag *tag, uint64 source_generation, bool *release_applied_out);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,

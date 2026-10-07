@@ -19,6 +19,7 @@
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_wal_claim.h"
 #include "utils/resowner.h"
 
 #define CLUSTER_WAL_RETENTION_MAX_THREADS UINT16_C(128)
@@ -91,6 +92,10 @@ typedef struct ClusterWalFileObjectStamp {
 	uint32 reserved92;
 	ClusterWalFileIdentity parsed_identity;
 	XLogLongPageHeaderData long_header;
+	/* PGRAC: process-local exact generation proof, never an on-disk ABI.
+	 * Zero length denotes the legacy flat layout. Author: SqlRush <sqlrush@gmail.com> */
+	uint32 generation_claim_length;
+	uint8 generation_claim[CLUSTER_WAL_CLAIM_V2_BYTES];
 } ClusterWalFileObjectStamp;
 
 typedef struct ClusterWalrLock {
@@ -229,12 +234,17 @@ typedef enum ClusterWalrReleaseResult {
 
 typedef struct ClusterWalRetentionPin ClusterWalRetentionPin;
 typedef struct ClusterWalRootPublishGuard ClusterWalRootPublishGuard;
+typedef struct ClusterWalReadPinV1 ClusterWalReadPinV1;
 
 typedef struct ClusterWalRetentionPinThreadRequest {
 	const ClusterWalRetentionInterval *intervals;
 	uint32 nintervals;
 	ClusterRecoveryDutyKey duty;
 	ClusterControlRootReadToken root_read;
+	/* PGRAC: nonzero only for a pending initializer's whole-thread WALR-S.
+	 * That request has no fabricated checkpoint interval or ordinary token.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	ClusterControlPendingToken pending;
 	const ClusterFormationWitnessV1 *formation;
 	const PgracExternalFenceNeedSetV1 *needs;
 	const PgracExternalFenceAdmissionSetV1 *admissions;
@@ -326,6 +336,13 @@ cluster_wal_retention_interval_intersects_file(const ClusterWalRetentionInterval
 											   const ClusterWalFileIdentity *identity,
 											   int wal_segsz_bytes);
 extern bool cluster_wal_retention_resid_encode(uint16 thread_id, ClusterResId *out_resid);
+/* Read-only protection against WAL reuse. Callers qualify ROOT, claims,
+ * anchors and native flush cuts separately after acquiring these grants.
+ * This scope conveys no recovery, DATA or publication authority. */
+extern ClusterWalPinResult cluster_wal_read_pin_acquire_v1(const uint16 *threads, uint16 nthreads,
+														   ClusterWalReadPinV1 **out);
+extern bool cluster_wal_read_pin_covers_v1(ClusterWalReadPinV1 *pin, uint16 thread);
+extern ClusterWalrReleaseResult cluster_wal_read_pin_release_v1(ClusterWalReadPinV1 **pin);
 extern ClusterWalPinResult
 cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *requests,
 								  uint16 nthreads, ClusterWalRetentionPin **out_pin);
@@ -338,6 +355,15 @@ cluster_wal_retention_pin_bind_set(ClusterWalRetentionPin *pin,
 extern ClusterWalPinResult
 cluster_wal_retention_pin_preflight_revalidate_wait_v1(ClusterWalRetentionPin *pin);
 extern ClusterWalPinResult cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin);
+/* Borrow the current ResourceOwner's complete bound COLD_FORMED set. This
+ * neither acquires nor transfers ownership and cannot qualify DATA by itself.
+ * The consumer still checks its startup phase, exact ROOT/native source and
+ * namespace. A missing thread (including the founder) is never invented.
+ * On refusal all outputs stay unchanged; *out_pin must initially be NULL. */
+extern ClusterWalPinResult
+cluster_wal_retention_pin_borrow_cold_v1(ClusterWalRetentionPin **out_pin,
+										 ClusterRecoverySerialGuard **guards, uint16 capacity,
+										 uint16 *out_count);
 extern ClusterWalPinResult
 cluster_wal_retention_pin_seal_for_root_publish(ClusterWalRetentionPin *pin);
 extern ClusterWalPinResult cluster_wal_retention_pin_adopt_root_readback_v1(
@@ -346,12 +372,31 @@ extern ClusterWalPinResult cluster_wal_retention_pin_adopt_root_readback_v1(
 	const ClusterControlRootSnapshot *observed_snapshot,
 	const ClusterControlRootReadToken *observed_token);
 extern ClusterWalrReleaseResult cluster_wal_retention_pin_release(ClusterWalRetentionPin **pin);
+/* A required sealed pin is converted, after confirmed IR release, from S to
+ * X on its original holder with dontwait. This excludes every old DATA
+ * executor until CF/CAS/durable readback completes. End restores the original
+ * S ownership; unconfirmed conversion/release is cleanup-only. */
 extern ClusterWalPinResult
 cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken *expected_root,
 											   bool require_sealed_pin,
 											   ClusterWalRootPublishGuard **out_guard);
 extern ClusterWalrReleaseResult
 cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard);
+/* PGRAC: post-IR sealed-pin exclusive observation; no CF acquisition or new authority.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern bool
+cluster_wal_retention_root_publish_sealed_current(const ClusterWalRootPublishGuard *guard,
+												  const ClusterControlRootReadToken *expected_root);
+/* Pending publication borrows the same sealed pin after confirmed IR release;
+ * it cannot manufacture an ordinary checkpoint token or a new WALR grant. */
+extern ClusterWalPinResult
+cluster_wal_retention_pending_publish_begin(const ClusterRecoveryDutyKey *duty,
+											const ClusterControlPendingToken *expected,
+											ClusterWalRootPublishGuard **out_guard);
+extern bool
+cluster_wal_retention_pending_publish_current(const ClusterWalRootPublishGuard *guard,
+											  const ClusterRecoveryDutyKey *duty,
+											  const ClusterControlPendingToken *expected);
 extern ClusterWalReuseGuardResult
 cluster_wal_retention_e1_coarse_begin(ClusterWalRetentionE1Context *context, uint16 thread_id,
 									  ClusterWalRootFoldResult *out_fold_result,

@@ -296,7 +296,19 @@ typedef enum ClusterICMsgType {
 	PGRAC_IC_MSG_PCM_X_DRAIN_ACK = 62,
 	PGRAC_IC_MSG_PCM_X_RETIRE_UP_TO = 63,
 	PGRAC_IC_MSG_PCM_X_RETIRE_ACK = 64
-	/* values 66..255 available for future sub-spec; never reuse 0..65 */
+	/* 65 is the semantic-activation carrier below. */
+	,
+	/* PGRAC: CONTROL prior-exit observation, never admission. */
+	PGRAC_IC_MSG_STARTUP_EXIT = 66,
+	/* PGRAC: CONTROL member config observation, never DATA permission. */
+	PGRAC_IC_MSG_CONFIG_MEMBERS = 67,
+	/* Original-writer background reservation/Flush observations. CONTROL only. */
+	PGRAC_IC_MSG_WAL_CUT = 68,
+	/* GCS background holder write/completion. CONTROL routes; bgwriter does I/O. */
+	PGRAC_IC_MSG_PI_DATA = 69,
+	/* Master DATA notification and original physical PI acknowledgement. */
+	PGRAC_IC_MSG_PI_WRITEBACK = 70
+	/* values 71..254 available; 255 is the chunk carrier */
 } ClusterICMsgType;
 
 /* Spec-8.4C D13 full-member semantic-activation acknowledgement carrier. */

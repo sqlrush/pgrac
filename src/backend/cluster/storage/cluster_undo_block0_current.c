@@ -19,6 +19,7 @@
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_membership.h"
@@ -1798,6 +1799,12 @@ current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key, int t
 		}
 		if (cleanup.provision_held) {
 			XLogRecPtr init_lsn;
+
+			CLUSTER_INJECTION_POINT("cluster-undo-first-publication-deny");
+			if (cluster_injection_should_skip("cluster-undo-first-publication-deny")) {
+				result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+				goto ensure_done;
+			}
 
 			/* Only the explicit creator may initialize the still-private
 			 * frame. The publisher flushes INIT before exposing the final

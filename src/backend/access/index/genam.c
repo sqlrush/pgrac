@@ -20,6 +20,13 @@
 
 #include "postgres.h"
 
+/*
+ * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
+ *   Retain current-buffer ownership and a copied SPACE identity across the
+ *   native inplace begin/finish lifetime without storage I/O under its lock.
+ */
+
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/relscan.h"
@@ -38,6 +45,12 @@
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_space_storage.h"
+#include "cluster/storage/cluster_smgr.h"
+#endif
 
 
 /* ----------------------------------------------------------------
@@ -775,6 +788,11 @@ typedef struct SysInplaceUpdateState
 	HeapTupleData tuple;
 	Buffer		buffer;
 	bool		owns_pin;
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: value copy acquired before the scan/content-lock lifetime. */
+	bool		versioned;
+	ClusterSpaceIdentity identity;
+#endif
 } SysInplaceUpdateState;
 
 /* Called after content unlock, including before a conflicting-xid wait.
@@ -872,6 +890,17 @@ systable_inplace_update_begin(Relation relation,
 		if (retries++ > 10000)
 			elog(ERROR, "giving up after too many tries to overwrite row");
 
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: finish must not fetch SPACE while holding the heap lock. */
+		inplace->versioned = cluster_shared_config
+			&& relation->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+			&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1;
+		if (inplace->versioned
+			&& (!RelationNeedsWAL(relation)
+				|| !cluster_space_relation_get_identity(relation, &inplace->identity)))
+			elog(ERROR, "shared inplace update requires a live SPACE identity");
+#endif
+
 		memcpy(mutable_key, key, sizeof(ScanKeyData) * nkeys);
 		inplace->scan = systable_beginscan(relation, indexId, indexOK, snapshot,
 								  nkeys, mutable_key);
@@ -918,7 +947,11 @@ systable_inplace_update_finish(void *state, HeapTuple tuple)
 	SysInplaceUpdateState *inplace = state;
 
 	heap_inplace_update_and_unlock(inplace->scan->heap_rel, &inplace->tuple,
-								   tuple, inplace->buffer);
+								   tuple, inplace->buffer
+#ifdef USE_PGRAC_CLUSTER
+								   , inplace->versioned ? &inplace->identity : NULL
+#endif
+								   );
 	systable_inplace_update_release(inplace);
 	pfree(inplace);
 }

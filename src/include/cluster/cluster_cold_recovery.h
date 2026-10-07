@@ -1,0 +1,772 @@
+/*-------------------------------------------------------------------------
+ *
+ * cluster_cold_recovery.h
+ *	  Typed cold-crash replay plan over every retained writer generation.
+ *
+ *	  When every instance has failed, the founder replays all retained
+ *	  writer generations.  The retained physical prefix [lower, native redo)
+ *	  of each generation is history: it may only prove page ancestry and is
+ *	  never replayed.  This header is the pure planning core used by the
+ *	  first, read-only pass:
+ *
+ *	    - participants: exact (thread, owner incarnation) generations with
+ *	      their physical lower, native redo start and validated tail;
+ *	    - records: identity plus the ordinary-page PageVersion components
+ *	      (expected-before -> result) decoded from each WAL record;
+ *	    - seal: links every page's components into one exact version chain,
+ *	      places the observed DATA version on that chain, assigns one
+ *	      verdict per component and computes a deterministic dependency
+ *	      schedule.  Any missing ancestor, branch, cycle, incarnation
+ *	      mismatch, history gap or cross-generation deadlock is refused
+ *	      before the caller mutates anything.
+ *
+ *	  The second pass replays records in schedule order and consults the
+ *	  per-block verdicts.  Ordering never uses foreign LSNs or numeric
+ *	  mutation tokens; xl_scn is only a deterministic tie-break among
+ *	  records whose dependencies are already satisfied.
+ *
+ *	  This file holds no I/O, locks, authority or WAL access.  The backend
+ *	  adapter supplies decoded records and DATA observations and owns all
+ *	  isolation, retention and serialization.
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/include/cluster/cluster_cold_recovery.h
+ *
+ * NOTES
+ *	  This is a pgrac-original file (no derivation from PostgreSQL).
+ *	  Spec: spec-s9p2-05-instance-and-cluster-recovery.md
+ *	  Spec: spec-s9p2-03-shared-wal-and-checkpoint.md
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef CLUSTER_COLD_RECOVERY_H
+#define CLUSTER_COLD_RECOVERY_H
+
+#include "access/xlogrecord.h"
+#include "cluster/cluster_page_stable_base.h"
+#include "cluster/cluster_wal_source.h"
+
+#define CLUSTER_COLD_RECOVERY_INTERFACE_V1 1
+#define CLUSTER_COLD_MAX_PARTICIPANTS RF_PAGE_STABLE_MAX_PARTICIPANTS
+#define CLUSTER_COLD_MAX_COMPONENTS XLR_PAGE_VERSION_EDGE_MAX_ENTRIES
+#define CLUSTER_COLD_NO_INDEX UINT32_MAX
+
+typedef enum ClusterColdDetailV1 {
+	CLUSTER_COLD_OK = 0,
+	CLUSTER_COLD_INVALID_ARGUMENT = 1,
+	CLUSTER_COLD_PARTICIPANT_INVALID = 2, /* bad cut or repeated generation */
+	CLUSTER_COLD_SOURCE_GAP = 3,		  /* order, redo straddle, incomplete cut */
+	CLUSTER_COLD_COMPONENT_INVALID = 4,	  /* malformed PageVersion component */
+	CLUSTER_COLD_EDGE_BRANCH = 5,		  /* two successors of one version */
+	CLUSTER_COLD_EDGE_CYCLE = 6,		  /* a version is produced twice or loops */
+	CLUSTER_COLD_CHAIN_AMBIGUOUS = 7,	  /* second chain start at one address */
+	CLUSTER_COLD_ANCESTOR_MISSING = 8,	  /* DATA version not on the chain */
+	CLUSTER_COLD_INCARNATION_MISMATCH = 9,
+	CLUSTER_COLD_HISTORY_GAP = 10, /* DATA behind a never-replayed record */
+	CLUSTER_COLD_ANCHOR_MISSING = 11,
+	CLUSTER_COLD_OBSERVATION_FAILED = 12,
+	CLUSTER_COLD_DEADLOCK = 13,
+	CLUSTER_COLD_CAPACITY = 14,
+	CLUSTER_COLD_OOM = 15,
+	CLUSTER_COLD_STATE = 16,				  /* wrong phase or already failed */
+	CLUSTER_COLD_STRUCTURAL_UNSUPPORTED = 17, /* lifecycle record needs its owner */
+	CLUSTER_COLD_OPCODE_UNSUPPORTED = 18,	  /* outside the closed route registry */
+	CLUSTER_COLD_SIDE_OWNER_MISSING = 19,	  /* side effect without a cold owner */
+	CLUSTER_COLD_CONTENT_UNPROVEN = 20,		  /* unverified DATA and no anchor rebuilds it */
+	CLUSTER_COLD_SPACE_INVALID = 21,		  /* malformed or inconsistent SPACE effects */
+	CLUSTER_COLD_IDENTITY_MISSING = 22, /* no SPACE identity for a relation not created here */
+	CLUSTER_COLD_SPACE_REFUSED = 23		/* the SPACE owner refused a relation's effects */
+} ClusterColdDetailV1;
+
+/* Exact physical cut of one writer generation, all from one ROOT token. */
+typedef struct ClusterColdParticipantV1 {
+	uint16 thread_id;
+	uint16 reserved_zero;
+	TimeLineID timeline;
+	uint64 owner_incarnation;
+	XLogRecPtr physical_lower; /* first retained record, inclusive */
+	XLogRecPtr native_redo;	   /* native checkpoint redo of the same anchor */
+	XLogRecPtr tail_end;	   /* validated complete end, exclusive */
+} ClusterColdParticipantV1;
+
+/* One ordinary page component of a decoded record. */
+typedef struct ClusterColdComponentV1 {
+	RfPageIdentityV1 page;
+	uint8 block_id;
+	uint8 page_class;  /* RF_PAGE_CLASS_ORDINARY */
+	uint8 before_kind; /* RfPageStateKindV1 */
+	uint8 result_kind; /* RF_PAGE_STATE_PRESENT */
+	uint16 edge_flags; /* RF_PAGE_EDGE_* */
+	uint16 component_ordinal;
+	RfPageVersionV1 before;
+	RfPageVersionV1 result;
+} ClusterColdComponentV1;
+
+/*
+ * SPACE (relation storage identity) effect of a record.  CREATE and TRUNCATE
+ * give the relation a new incarnation, which the pages' versions carry.
+ * TRUNCATE also retires the blocks at or past nblocks and, as an object
+ * checkpoint, makes every earlier change of the relation durable.  DROP (a
+ * commit or abort that drops the relation) makes the dropped incarnation's
+ * changes irrelevant.  ADVANCE only moves the reservation.  payload is the
+ * exact input of the SPACE owner; feed copies it.
+ */
+typedef enum ClusterColdSpaceKindV1 {
+	CLUSTER_COLD_SPACE_CREATE = 1,
+	CLUSTER_COLD_SPACE_TRUNCATE = 2,
+	CLUSTER_COLD_SPACE_ADVANCE = 3,
+	CLUSTER_COLD_SPACE_DROP = 4
+} ClusterColdSpaceKindV1;
+
+typedef struct ClusterColdSpaceOpV1 {
+	uint8 kind; /* ClusterColdSpaceKindV1 */
+	uint8 reserved_zero[3];
+	BlockNumber nblocks; /* TRUNCATE: first retired block */
+	RelFileLocator locator;
+	uint8 before_incarnation[16]; /* TRUNCATE, DROP: the replaced or dropped one */
+	uint8 result_incarnation[16]; /* CREATE, TRUNCATE: the new one; ADVANCE: the live one */
+	const void *payload;
+	uint32 payload_length;
+} ClusterColdSpaceOpV1;
+
+/*
+ * Record flags set by the decoder.  STRUCTURAL marks a relation lifecycle
+ * change (truncate, drop, SPACE identity or reservation, database/tablespace,
+ * relation map) whose ordering against other generations' page records needs its own
+ * typed owner; it is refused after the native redo start and accepted as
+ * already-durable history before it.  UNSUPPORTED marks input outside the
+ * supported profile (prepared transactions) and is refused anywhere.
+ * SIDE_UNOWNED marks a non-page effect of another generation for which no
+ * typed cold owner exists yet (transaction outcomes, undo, SLRU); like
+ * STRUCTURAL it is refused after native redo and is never replayed as a
+ * no-op.  FOREIGN_CONTROL marks another generation's native control record
+ * (XLOG checkpoint, NEXTOID, parameter, FPW, timeline and segment records,
+ * standby records, logical messages): on the founder its typed effect is
+ * none, as in crash recovery -- they describe that writer's own control file
+ * and counters -- so it is consumed without native replay.
+ */
+#define CLUSTER_COLD_RECORD_STRUCTURAL UINT8_C(0x01)
+#define CLUSTER_COLD_RECORD_UNSUPPORTED UINT8_C(0x02)
+#define CLUSTER_COLD_RECORD_SIDE_UNOWNED UINT8_C(0x04)
+#define CLUSTER_COLD_RECORD_FOREIGN_CONTROL UINT8_C(0x08)
+#define CLUSTER_COLD_RECORD_KNOWN_FLAGS UINT8_C(0x0F)
+
+/* Every decoded record of a participant is fed, in its LSN order.  Records
+ * without ordinary page components only advance the participant cursor. */
+typedef struct ClusterColdRecordV1 {
+	XLogRecPtr read_rec_ptr;
+	XLogRecPtr end_rec_ptr;
+	XLogRecPtr prev_rec_ptr; /* xl_prev: must equal the previous fed read_rec_ptr */
+	uint64 scn;				 /* xl_scn; deterministic tie-break only */
+	uint32 record_crc;
+	uint8 rmid;
+	uint8 info;
+	uint8 record_flags; /* CLUSTER_COLD_RECORD_* */
+	uint8 reserved_zero;
+	uint16 component_count;
+	const ClusterColdComponentV1 *components;
+	uint32 space_count; /* a record has SPACE effects or page components, not both */
+	const ClusterColdSpaceOpV1 *space_ops;
+} ClusterColdRecordV1;
+
+typedef enum ClusterColdDataKindV1 {
+	CLUSTER_COLD_DATA_INVALID = 0, /* unreadable or failed verification */
+	CLUSTER_COLD_DATA_PRESENT = 1,
+	CLUSTER_COLD_DATA_UNFORMATTED = 2, /* all-zero page inside the file */
+	CLUSTER_COLD_DATA_ABSENT = 3	   /* block beyond EOF or no file */
+} ClusterColdDataKindV1;
+
+/* Observed shared DATA state of one page.  PRESENT carries the exact
+ * version; UNFORMATTED carries only the segment incarnation.  CONTENT_VERIFIED
+ * means the whole page was proven (page checksum, all-zero page or no
+ * block); without it only the header is known, and a torn write can leave
+ * that header over another version's body.  NO_IDENTITY marks a PRESENT page
+ * whose relation has no readable SPACE identity yet (zero incarnation); it is
+ * placed by its token only, and only when the relation was created after a
+ * native redo start. */
+typedef struct ClusterColdDataV1 {
+	uint8 kind;
+	uint8 flags; /* CLUSTER_COLD_DATA_FLAG_* */
+	uint8 reserved_zero[6];
+	RfPageVersionV1 version;
+} ClusterColdDataV1;
+
+#define CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED UINT8_C(0x01)
+#define CLUSTER_COLD_DATA_FLAG_NO_IDENTITY UINT8_C(0x02)
+#define CLUSTER_COLD_DATA_KNOWN_FLAGS UINT8_C(0x03)
+
+/* Read-only DATA observation.  False means the observation itself failed
+ * (I/O, identity); the plan then refuses instead of guessing. */
+typedef bool (*ClusterColdObserveV1)(void *arg, const RfPageIdentityV1 *page,
+									 ClusterColdDataV1 *out);
+
+typedef enum ClusterColdVerdictV1 {
+	CLUSTER_COLD_BLOCK_NONE = 0, /* block is not an ordinary page component */
+	CLUSTER_COLD_BLOCK_SKIP = 1, /* DATA already holds this result or a successor */
+	CLUSTER_COLD_BLOCK_APPLY_DELTA = 2,
+	CLUSTER_COLD_BLOCK_APPLY_IMAGE = 3,
+	CLUSTER_COLD_BLOCK_APPLY_INIT = 4
+} ClusterColdVerdictV1;
+
+/* expected_kind INVALID on an APPLY_IMAGE/APPLY_INIT block means the anchor
+ * replaces unreadable or unrelated DATA; otherwise the page must hold the
+ * exact expected_before state before the block is applied. */
+typedef struct ClusterColdBlockStepV1 {
+	uint8 verdict;
+	uint8 expected_kind; /* ClusterColdDataKindV1 */
+	uint8 reserved_zero[6];
+	RfPageVersionV1 expected_before;
+	RfPageVersionV1 result;
+} ClusterColdBlockStepV1;
+
+/* A scheduled step replays a page record, or hands a record's SPACE effects
+ * (a CREATE or TRUNCATE before the pages of the incarnation it makes, or a
+ * commit's relation drops) to the SPACE owner. */
+typedef enum ClusterColdStepKindV1 {
+	CLUSTER_COLD_STEP_PAGE = 0,
+	CLUSTER_COLD_STEP_SPACE = 1
+} ClusterColdStepKindV1;
+
+typedef struct ClusterColdStepV1 {
+	uint32 step_index;	/* position in the schedule */
+	uint32 participant; /* caller's participant index */
+	uint8 step_kind;	/* ClusterColdStepKindV1 */
+	uint8 space_kind;	/* SPACE step: CREATE, TRUNCATE or DROP */
+	uint16 reserved_zero;
+	uint32 space_count;	   /* SPACE step: effects (a commit may drop several) */
+	uint32 space_relation; /* SPACE step: first effect's relation (space_relation_v1) */
+	uint32 space_input;	   /* SPACE step: first effect's position among its inputs */
+	XLogRecPtr read_rec_ptr;
+	XLogRecPtr end_rec_ptr;
+	uint32 record_crc;
+	uint8 rmid;
+	uint8 info;
+	bool all_skip;
+	bool mixed;
+	ClusterColdBlockStepV1 blocks[XLR_MAX_BLOCK_ID + 1];
+} ClusterColdStepV1;
+
+typedef struct ClusterColdDiagV1 {
+	uint8 detail; /* ClusterColdDetailV1 */
+	bool has_record;
+	bool has_page;
+	bool has_dependency;
+	uint32 participant; /* caller's participant index */
+	XLogRecPtr read_rec_ptr;
+	RfPageIdentityV1 page;
+	RfPageVersionV1 version; /* offending DATA or expected version */
+	uint32 dependency_participant;
+	XLogRecPtr dependency_read_rec_ptr;
+} ClusterColdDiagV1;
+
+typedef struct ClusterColdPlanV1 ClusterColdPlanV1;
+
+/* Participants are copied and ordered canonically by (thread, owner
+ * incarnation), so input enumeration order never changes the schedule.
+ * memory_budget bounds every allocation owned by the plan. */
+extern ClusterColdDetailV1 cluster_cold_plan_create_v1(const ClusterColdParticipantV1 *participants,
+													   uint32 participant_count, Size memory_budget,
+													   ClusterColdPlanV1 **out_plan);
+
+/* Feed one decoded record of the participant at caller index `participant`.
+ * Records of one participant must arrive in increasing LSN order; a record
+ * straddling the native redo start is refused. */
+extern ClusterColdDetailV1 cluster_cold_plan_feed_v1(ClusterColdPlanV1 *plan, uint32 participant,
+													 const ClusterColdRecordV1 *record);
+
+/* Close the input, observe DATA for every page with a replayable component
+ * (in canonical page order, once each) and build the schedule.  On failure
+ * diag names the exact record, page and dependency; the plan stays failed. */
+extern ClusterColdDetailV1 cluster_cold_plan_seal_v1(ClusterColdPlanV1 *plan,
+													 ClusterColdObserveV1 observe, void *arg,
+													 ClusterColdDiagV1 *diag);
+
+/* Sealed schedule: non-history records with ordinary page components, in
+ * replay order.  Each participant's records keep their LSN order. */
+extern uint32 cluster_cold_plan_step_count_v1(const ClusterColdPlanV1 *plan);
+extern bool cluster_cold_plan_step_v1(const ClusterColdPlanV1 *plan, uint32 index,
+									  ClusterColdStepV1 *out);
+/* Relation and input position of one effect of a SPACE step. */
+extern bool cluster_cold_plan_step_space_v1(const ClusterColdPlanV1 *plan, uint32 index,
+											uint32 effect, uint32 *relation, uint32 *input);
+
+
+/* Records at or after the participant's native redo start (pass-2 input),
+ * page or not, as fed; pass 2 must consume exactly this many. */
+extern uint64 cluster_cold_plan_replay_record_count_v1(const ClusterColdPlanV1 *plan,
+													   uint32 participant);
+
+/* The highest xl_scn of every record the plan accepted, of every
+ * participant and history included: the founder's SCN must pass it. */
+extern uint64 cluster_cold_plan_max_scn_v1(const ClusterColdPlanV1 *plan);
+
+extern void cluster_cold_plan_destroy_v1(ClusterColdPlanV1 **plan);
+
+/*
+ * SPACE inputs for the SPACE owner: relations with SPACE effects after their
+ * participant's native redo start (as the owner receives them online), in
+ * canonical locator order; each relation's inputs in the order the SPACE
+ * owner's check returned.  Payloads are owned by the plan.  Pass 2 installs
+ * a relation's inputs through a SPACE step's position, never past a later
+ * CREATE, TRUNCATE or drop, and all of them at the end.
+ *
+ * A TRUNCATE shrank its relation's files before the instances failed, but a
+ * shrink is durable only once the file is synced.  shrink_forks names the
+ * forks for which nothing later proves it (no later TRUNCATE or DROP, whose
+ * preparation syncs every fork, and no change of the new incarnation in
+ * history, whose checkpoint synced the file): pass 2 shrinks them again at
+ * the TRUNCATE's step, whether or not the SPACE pages already hold it, and
+ * trusts no page of them past the size.  Every other fork keeps its files:
+ * shrinking again would remove pages whose changes are never replayed.
+ */
+#define CLUSTER_COLD_SHRINK_FORKS                                                                  \
+	((uint8)((1 << MAIN_FORKNUM) | (1 << FSM_FORKNUM) | (1 << VISIBILITYMAP_FORKNUM)))
+
+typedef struct ClusterColdSpaceInputV1 {
+	uint8 kind;			/* ClusterColdSpaceKindV1 */
+	uint8 shrink_forks; /* TRUNCATE: forks (1 << ForkNumber) to shrink at its step */
+	uint32 participant; /* caller index */
+	XLogRecPtr read_rec_ptr;
+	XLogRecPtr end_rec_ptr;
+	const void *payload;
+	uint32 payload_length;
+} ClusterColdSpaceInputV1;
+
+extern uint32 cluster_cold_plan_space_relation_count_v1(const ClusterColdPlanV1 *plan);
+extern bool cluster_cold_plan_space_relation_v1(const ClusterColdPlanV1 *plan, uint32 index,
+												RelFileLocator *locator, uint32 *input_count);
+extern bool cluster_cold_plan_space_input_v1(const ClusterColdPlanV1 *plan, uint32 relation,
+											 uint32 input, ClusterColdSpaceInputV1 *out);
+
+/*
+ * The SPACE owner's pass-1 check of one relation: its inputs (in canonical
+ * participant and LSN order) must form one chain from the relation's
+ * current SPACE pages.  order receives count input indexes in the owner's
+ * canonical order.  Required before seal when any relation has inputs; a
+ * refusal fails seal with SPACE_REFUSED before anything is modified.
+ */
+typedef bool (*ClusterColdSpaceCheckV1)(void *arg, const RelFileLocator *locator,
+										const ClusterColdSpaceInputV1 *inputs, uint32 count,
+										uint32 *order);
+
+extern ClusterColdDetailV1 cluster_cold_plan_set_space_check_v1(ClusterColdPlanV1 *plan,
+																ClusterColdSpaceCheckV1 check,
+																void *arg);
+
+/* Participants of a sealed plan; 0 unless seal() succeeded. */
+extern uint32 cluster_cold_plan_participant_count_v1(const ClusterColdPlanV1 *plan);
+
+/* Pass-2 action for one scheduled page record.  A fully skipped record of
+ * the founder's own thread still advances nextXid past its xid. */
+typedef enum ClusterColdPageActionV1 {
+	CLUSTER_COLD_PAGE_APPLY = 0,
+	CLUSTER_COLD_PAGE_SKIP = 1,
+	CLUSTER_COLD_PAGE_SKIP_ADVANCE_XID = 2,
+	CLUSTER_COLD_SPACE_STEP = 3 /* hand the step's SPACE effects to the SPACE owner */
+} ClusterColdPageActionV1;
+
+extern ClusterColdPageActionV1 cluster_cold_page_action_v1(const ClusterColdStepV1 *step, bool own);
+
+/*
+ * Pass-2 handling of a decoded record without a scheduled step.  SPACE
+ * effects are never replayed natively: the SPACE owner installs them, or the
+ * SPACE pages on disk already cover them.  Another generation's native
+ * control record is consumed without replay.  Page versions, refused flags
+ * or a commit's drops (always a step) mean pass 1 saw other input.
+ */
+typedef enum ClusterColdUnscheduledV1 {
+	CLUSTER_COLD_UNSCHEDULED_NATIVE = 0,
+	CLUSTER_COLD_UNSCHEDULED_SPACE_SKIP = 1,
+	CLUSTER_COLD_UNSCHEDULED_REFUSE = 2,
+	CLUSTER_COLD_UNSCHEDULED_FOREIGN_NOOP = 3
+} ClusterColdUnscheduledV1;
+
+extern ClusterColdUnscheduledV1 cluster_cold_unscheduled_v1(const ClusterColdRecordV1 *record);
+
+/*
+ * Pass-2 sequencer.  Drives every participant's reader through the sealed
+ * schedule: records before a scheduled page record replay as unscheduled
+ * records in stream order; the scheduled record must carry its pass-1
+ * identity; afterwards each participant is drained to its validated tail
+ * and must have consumed exactly its pass-1 record count.  The callbacks
+ * read and apply; the sequencer only decides order and proves the cut.
+ */
+typedef struct ClusterColdReplayRecordV1 {
+	XLogRecPtr read_rec_ptr;
+	XLogRecPtr end_rec_ptr;
+	uint32 record_crc;
+	uint8 rmid;
+	uint8 info;
+	uint8 reserved_zero[2];
+} ClusterColdReplayRecordV1;
+
+typedef enum ClusterColdReplayDetailV1 {
+	CLUSTER_COLD_REPLAY_OK = 0,
+	CLUSTER_COLD_REPLAY_INVALID_ARGUMENT = 1,
+	CLUSTER_COLD_REPLAY_STEP_UNUSABLE = 2, /* unreadable step or unknown participant */
+	CLUSTER_COLD_REPLAY_SOURCE_ENDED = 3,  /* stream ended or failed before the step */
+	CLUSTER_COLD_REPLAY_TARGET_PASSED = 4, /* the scheduled record start was passed */
+	CLUSTER_COLD_REPLAY_IDENTITY = 5,	   /* the scheduled record identity differs */
+	CLUSTER_COLD_REPLAY_PAST_TAIL = 6,	   /* a record lies past the validated tail */
+	CLUSTER_COLD_REPLAY_CUT_DIFFERS = 7,   /* end or record count differs from pass 1 */
+	CLUSTER_COLD_REPLAY_CALLBACK = 8	   /* a callback refused the record */
+} ClusterColdReplayDetailV1;
+
+typedef struct ClusterColdReplayOpsV1 {
+	/* Next record of a participant; false at end of stream or on failure. */
+	bool (*next)(void *arg, uint32 participant, ClusterColdReplayRecordV1 *out);
+	/* Replay the record just returned, which has no scheduled step. */
+	bool (*unscheduled)(void *arg, uint32 participant);
+	/* Consume the scheduled record just returned with its page action. */
+	bool (*scheduled)(void *arg, uint32 participant, const ClusterColdStepV1 *step,
+					  ClusterColdPageActionV1 action);
+	/* Install all inputs of one SPACE relation, after every participant was
+	 * drained; required when the plan has SPACE relations. */
+	bool (*space_final)(void *arg, uint32 relation);
+} ClusterColdReplayOpsV1;
+
+typedef struct ClusterColdReplayResultV1 {
+	uint8 detail;		/* ClusterColdReplayDetailV1 */
+	uint32 participant; /* where replay stopped */
+	XLogRecPtr rec_ptr; /* the target, offending record or reached end */
+	uint32 steps_done;
+	uint32 space_steps;
+	uint32 space_relations_finished;
+	uint64 pages_skipped;
+	uint64 pages_applied;
+	XLogRecPtr own_read; /* last consumed record of the own participant */
+	XLogRecPtr own_end;
+	/* Each participant's last consumed record: where its cut ended (zero
+	 * when nothing of it was replayed). */
+	XLogRecPtr last_read[CLUSTER_COLD_MAX_PARTICIPANTS];
+	XLogRecPtr last_end[CLUSTER_COLD_MAX_PARTICIPANTS];
+	uint32 last_crc[CLUSTER_COLD_MAX_PARTICIPANTS];
+} ClusterColdReplayResultV1;
+
+/* participants/participant_count must be the plan's caller-order cuts; own
+ * is the founder's caller index. */
+extern ClusterColdReplayDetailV1
+cluster_cold_replay_run_v1(const ClusterColdPlanV1 *plan,
+						   const ClusterColdParticipantV1 *participants, uint32 participant_count,
+						   uint32 own, const ClusterColdReplayOpsV1 *ops, void *arg,
+						   ClusterColdReplayResultV1 *result);
+
+#ifndef FRONTEND
+
+#include "utils/guc.h"
+
+/*
+ * cluster.cold_recovery_plan_memory (kB, PGC_POSTMASTER): everything one
+ * typed cold plan may own during pass 1 (records, page versions, seal
+ * scratch; never WAL payload).  Exhausting it refuses startup before any
+ * page is modified.
+ */
+#define CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB Min(4 * 1024 * 1024, MAX_KILOBYTES)
+#define CLUSTER_COLD_PLAN_MEMORY_MIN_KB 1024
+#define CLUSTER_COLD_PLAN_MEMORY_MAX_KB MAX_KILOBYTES
+
+extern PGDLLIMPORT int cluster_cold_recovery_plan_memory;
+
+struct XLogReaderState;
+
+/*
+ * One native record mapped to plan input by the shared closed route
+ * registry.  record.components points into components[] and
+ * record.space_ops into space_ops, whose payloads point into the reader's
+ * record; never copy a filled value, pass it by pointer.  Zero it before
+ * the first decode; space_ops grows as needed and is kept across decodes
+ * until cluster_cold_decoded_release_v1.
+ */
+typedef struct ClusterColdDecodedV1 {
+	ClusterColdRecordV1 record;
+	ClusterColdComponentV1 components[CLUSTER_COLD_MAX_COMPONENTS];
+	uint8 route_owner;	/* RfRecordRouteOwnerV1 */
+	uint8 route_detail; /* RfPageProofDetailV1 of a refused record */
+	ClusterColdSpaceOpV1 *space_ops;
+	uint32 space_capacity;
+} ClusterColdDecodedV1;
+
+/* Classify one decoded record of the exact source namespace.  Unsupported
+ * opcodes and routed side components fail with OPCODE_UNSUPPORTED; SPACE
+ * identity and reservation changes and a commit's relation drops become
+ * typed SPACE effects (SPACE_INVALID when malformed or of another
+ * namespace); other lifecycle, prepared-transaction and (for another
+ * generation, `foreign`) unowned side records are flagged for the plan to
+ * judge. */
+extern ClusterColdDetailV1 cluster_cold_recovery_decode_v1(struct XLogReaderState *reader,
+														   uint64 system_identifier,
+														   const uint8 storage_uuid[16],
+														   bool space_active, bool foreign,
+														   ClusterColdDecodedV1 *out);
+extern void cluster_cold_decoded_release_v1(ClusterColdDecodedV1 *decoded);
+
+/*
+ * Pass-2 reader over one ROOT-selected writer generation.  Segments are
+ * opened through the selected restart-input opener (claim, namespace and
+ * file identity); the native reader validates pages, records and xl_prev.
+ * Read-only and never authority: the caller compares every returned record
+ * with its pass-1 identity before applying it.
+ */
+typedef struct ClusterColdReaderV1 ClusterColdReaderV1;
+
+extern ClusterColdReaderV1 *cluster_cold_reader_open_v1(const ClusterWalSourceRef *source,
+														uint64 system_identifier, XLogRecPtr start);
+extern struct XLogReaderState *cluster_cold_reader_next_v1(ClusterColdReaderV1 *reader,
+														   char **errormsg);
+extern void cluster_cold_reader_close_v1(ClusterColdReaderV1 **reader);
+
+/*
+ * Read-only DATA observation for seal().  Reads storage directly, before any
+ * replay touches shared buffers, and resolves the segment incarnation from
+ * the relation's persisted SPACE identity; a page whose relation has none
+ * readable is reported with NO_IDENTITY.  arg is a ClusterColdObserverV1.
+ */
+typedef struct ClusterColdObserverV1 {
+	RelFileLocator cached_locator;
+	bool cached_valid;
+	bool cached_no_identity;
+	uint8 cached_incarnation[16];
+	uint64 pages_observed;
+	uint64 pages_invalid;
+	/* SPACE namespace of every participant (cluster_cold_space_check_v1). */
+	uint64 system_identifier;
+	uint64 database_incarnation;
+	uint8 storage_uuid[16];
+	uint64 space_relations_checked;
+} ClusterColdObserverV1;
+
+extern bool cluster_cold_observe_data_v1(void *arg, const RfPageIdentityV1 *page,
+										 ClusterColdDataV1 *out);
+
+/*
+ * Pass-1 SPACE check (ClusterColdSpaceCheckV1, arg a ClusterColdObserverV1):
+ * reads the relation's two SPACE pages directly from storage (zero pages
+ * when the SPACE fork or a block is absent) and has the SPACE owner's pure
+ * cluster_space_recovery_prepare prove and order the inputs against them.
+ */
+extern bool cluster_cold_space_check_v1(void *arg, const RelFileLocator *locator,
+										const ClusterColdSpaceInputV1 *inputs, uint32 count,
+										uint32 *order);
+
+/*
+ * Classify one block read from storage (the caller handles a missing block
+ * and fills the segment incarnation).  header_valid is the native page
+ * verification.  With data checksums the stored checksum is compared to the
+ * content here, whatever ignore_checksum_failure says: a mismatch is a torn
+ * or corrupt page (INVALID), a match proves the content.  False: a
+ * formatted page without a version token.
+ */
+extern bool cluster_cold_classify_page_v1(const char *page, BlockNumber blkno, bool header_valid,
+										  bool checksums, ClusterColdDataV1 *out);
+
+/* Operator hint for a pass-1 refusal. */
+extern const char *cluster_cold_refusal_hint_v1(ClusterColdDetailV1 detail);
+
+/* Pass-1 scan of one RECOVERY_REQUIRED root through the sealed recovery
+ * visitor, feeding the plan participant at caller index `participant`.
+ * Every visited record is provisional until the visit and the observed cut
+ * (complete end, record count) match the ROOT. */
+typedef struct ClusterColdScanResultV1 {
+	uint64 records;
+	int root_result; /* ClusterControlRootResult of the visit */
+	XLogRecPtr failed_read_rec_ptr;
+	uint8 route_detail;
+} ClusterColdScanResultV1;
+
+extern ClusterColdDetailV1 cluster_cold_scan_root_v1(ClusterColdPlanV1 *plan, uint32 participant,
+													 const ClusterControlRootSnapshot *root,
+													 const ClusterControlRootReadToken *token,
+													 bool space_active, bool foreign,
+													 ClusterColdScanResultV1 *result);
+
+/* Pass 2 consumed exactly the ROOT-sealed cut of replayed generation
+ * `participant`: replay finished every step, and its last record is the
+ * root's validated last record (start and CRC) ending at the validated
+ * tail.  Only then may the generation be published recovered. */
+extern bool cluster_cold_completion_proven_v1(const ClusterColdPlanV1 *plan,
+											  const ClusterControlRootSnapshot *root,
+											  const ClusterColdReplayResultV1 *result,
+											  uint32 participant);
+
+/*
+ * Relation forks whose files pass 2 changed (block references, relation
+ * creation and truncation of every replayed record, and every SPACE
+ * relation), kept sorted.  Before a replayed generation is published
+ * recovered they are made durable as PostgreSQL's end-of-recovery
+ * checkpoint would make them: their dirty buffers are written and each
+ * existing fork is fsynced.  A failed fsync raises an error.
+ */
+typedef struct ClusterColdTouchedRelV1 {
+	RelFileLocator locator;
+	uint32 forks; /* bit (1 << ForkNumber) */
+} ClusterColdTouchedRelV1;
+
+typedef struct ClusterColdTouchedV1 {
+	uint32 count;
+	uint32 capacity;
+	ClusterColdTouchedRelV1 *rels;
+} ClusterColdTouchedV1;
+
+extern void cluster_cold_touched_add_v1(ClusterColdTouchedV1 *touched,
+										const RelFileLocator *locator, ForkNumber fork);
+extern void cluster_cold_touched_add_record_v1(ClusterColdTouchedV1 *touched,
+											   struct XLogReaderState *record);
+extern void cluster_cold_durable_barrier_v1(const ClusterColdTouchedV1 *touched);
+
+/*
+ * Typed cold replay driver state (startup process).  prepare() runs pass 1
+ * with external admissions held and before the serial set is taken; refusal
+ * is returned in `refusal`/`refusal_detail` so the caller can release what
+ * it holds before failing startup.  Participants are the founder's crashed
+ * generation, the fence plan's origins, then every history-only generation
+ * of the participant census (cluster_cold_recovery_census.h); the census
+ * read scope is released before prepare() returns.
+ */
+struct ClusterRecoveryFencePlan;
+
+struct ClusterWalInputsV1;
+
+typedef struct ClusterColdTypedV1 {
+	MemoryContext context;
+	ClusterColdPlanV1 *plan;
+	ClusterColdDetailV1 refusal; /* CLUSTER_COLD_OK when sealed */
+	char refusal_detail[512];
+	uint32 participant_count;
+	uint32 replay_count; /* [0, replay_count): crashed; the rest history only */
+	uint32 own_participant;
+	struct ClusterWalInputsV1 *inputs;				   /* census read scope, released by pass 1 */
+	uint32 input_index[CLUSTER_COLD_MAX_PARTICIPANTS]; /* history: index in that scope */
+	uint64 system_identifier;
+	uint64 scanned_records;
+	ClusterColdObserverV1 observer;
+	ClusterColdParticipantV1 participants[CLUSTER_COLD_MAX_PARTICIPANTS];
+	ClusterWalSourceRef sources[CLUSTER_COLD_MAX_PARTICIPANTS];
+} ClusterColdTypedV1;
+
+extern ClusterColdTypedV1 *cluster_cold_typed_prepare_v1(struct ClusterRecoveryFencePlan *fence,
+														 uint16 own_thread, XLogRecPtr own_redo);
+extern void cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed);
+
+/*
+ * Before the fence plan publishes its origins recovered: each origin is a
+ * replayed participant (not the founder, the same owner incarnation) whose
+ * pass 2 ended exactly at its sealed tail (cluster_cold_completion_proven_v1),
+ * and every SPACE relation of the plan joins `touched`.  On refusal *thread
+ * names the origin (0 when none can be named).
+ */
+extern bool cluster_cold_completion_ready_v1(const ClusterColdTypedV1 *typed,
+											 const struct ClusterRecoveryFencePlan *fence,
+											 const ClusterColdReplayResultV1 *result,
+											 ClusterColdTouchedV1 *touched, uint16 *thread);
+
+/*
+ * Pass-2 SPACE install through the SPACE owner: bring one relation of the
+ * sealed plan through its input at position `through` (never further).  At
+ * that input's own SPACE step (`step`), a TRUNCATE's shrink_forks are also
+ * shrunk again.  False refuses; so does every call while this build has no
+ * cold SPACE install (cluster_cold_space_owner_v1, the handshake's
+ * space_owner).
+ */
+extern bool cluster_cold_space_owner_v1(void);
+extern bool cluster_cold_typed_space_install_v1(const ClusterColdTypedV1 *typed, uint32 relation,
+												uint32 through, bool step);
+
+/*
+ * Cold crash route.  The shared profile recovers an engaged multi-generation
+ * cold crash only through the typed plan; the unshared profile refuses it
+ * (the merge preflight already does so before any fence or claim action);
+ * everything else keeps native single-stream recovery.
+ */
+typedef enum ClusterColdRouteV1 {
+	CLUSTER_COLD_ROUTE_NATIVE = 0,
+	CLUSTER_COLD_ROUTE_TYPED = 1,
+	CLUSTER_COLD_ROUTE_REFUSE = 2
+} ClusterColdRouteV1;
+
+extern ClusterColdRouteV1 cluster_cold_route_v1(bool shared_config, bool merge_engaged);
+
+/*
+ * Consumers pass 2 needs from their owners: the per-block redo consultation
+ * (R-A2), the complete participant census (R-A4), typed owners for other
+ * generations' non-page effects and the XID/OID/MX/SCN bounds (R-A5),
+ * recovery completion publication (R-A7), a restartpoint owner that holds
+ * own-thread checkpoints inside the cold replay window (R-A9), and the cold
+ * SPACE install for relations with SPACE effects (R-A11).  Each flag is set
+ * only once that consumer exists.
+ */
+typedef struct ClusterColdHandshakeV1 {
+	bool redo_block_hook;
+	bool participant_census;
+	bool side_owners;
+	bool completion_publish;
+	bool restartpoint_hold;
+	bool space_owner; /* cold SPACE install (R-A11), needed when SPACE effects exist */
+} ClusterColdHandshakeV1;
+
+/* True only when every consumer exists; with no redo consultation, any page
+ * record that must be applied also refuses.  Decided after pass 1, before
+ * the serial set is taken, so a refusal mutates nothing. */
+extern bool cluster_cold_typed_ready_v1(const ClusterColdTypedV1 *typed,
+										const ClusterColdHandshakeV1 *handshake, char *reason,
+										Size reason_size);
+
+/*
+ * Typed cold replay window of the startup process (pass 2, from the first
+ * replayed record to completion).  The cold cut must not move while it is
+ * open, so the restartpoint owner does not adopt own-thread checkpoint
+ * records replayed inside it (handshake restartpoint_hold).
+ */
+extern void cluster_cold_replay_window_enter_v1(void);
+extern void cluster_cold_replay_window_leave_v1(void);
+extern bool cluster_cold_replay_window_active_v1(void);
+
+
+/*
+ * Per-block decision consumed by the typed cold redo consultation in
+ * XLogReadBufferForRedoExtended (whose owner also stamps the result
+ * version).  NATIVE outside a published step and for blocks without a
+ * PageVersion component; SKIP never reads the block; APPLY restores the
+ * image or redoes without LSN/SCN freshness checks after verifying
+ * expected_before.  False means the request does not match the published
+ * record and replay must stop.
+ */
+typedef enum ClusterColdRedoBlockActionV1 {
+	CLUSTER_COLD_REDO_NATIVE = 0,
+	CLUSTER_COLD_REDO_SKIP = 1,
+	CLUSTER_COLD_REDO_APPLY = 2
+} ClusterColdRedoBlockActionV1;
+
+typedef struct ClusterColdRedoBlockV1 {
+	ClusterColdRedoBlockActionV1 action;
+	uint8 expected_kind; /* ClusterColdDataKindV1; INVALID = any content */
+	uint8 reserved_zero[3];
+	RfPageVersionV1 expected_before;
+	RfPageVersionV1 result;
+} ClusterColdRedoBlockV1;
+
+extern void cluster_cold_redo_step_enter_v1(const ClusterColdStepV1 *step);
+extern void cluster_cold_redo_step_leave_v1(void);
+extern bool cluster_cold_redo_block_decision_v1(struct XLogReaderState *record, uint8 block_id,
+												ClusterColdRedoBlockV1 *out);
+
+/*
+ * Apply one scheduled page record inside its published step, bracketed by
+ * the native block consumer (cluster_page_cold_redo_begin_v1/end_v1), so
+ * every block the redo routine reads is decided by this record's verdicts
+ * and every applied block is proven dirty with its result version.
+ */
+typedef void (*ClusterColdApplyRecordV1)(struct XLogReaderState *record, void *arg);
+
+extern void cluster_cold_apply_step_v1(const ClusterColdStepV1 *step,
+									   struct XLogReaderState *record,
+									   ClusterColdApplyRecordV1 apply, void *arg);
+
+#endif /* !FRONTEND */
+
+#endif /* CLUSTER_COLD_RECOVERY_H */

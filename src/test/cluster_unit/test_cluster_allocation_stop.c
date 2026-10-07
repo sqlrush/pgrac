@@ -23,6 +23,7 @@ void unused_oid_authority_write(Oid value);
 
 UT_DEFINE_GLOBALS();
 bool IsUnderPostmaster;
+bool cluster_shared_config;
 BackendType MyBackendType = B_INVALID;
 int MaxBackends = 16;
 int cluster_ges_request_timeout_ms = 1000;
@@ -392,6 +393,7 @@ reset_fixture(void)
 	fixture_throws = false;
 	fixture_node_count = 4;
 	cluster_shared_data_dir = NULL;
+	cluster_shared_config = false;
 	stop_new_modifier_allowed = true;
 	stop_new_modifier_calls = hw_wal_calls = hw_flush_calls = hw_send_calls = 0;
 	hw_wal_end = 0;
@@ -578,6 +580,13 @@ UT_TEST(hw_original_remaster_status_and_snapshot_owner)
 	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_READY, hw_poll(NULL, NULL, NULL));
 	cluster_hw_remaster_set_result(CLUSTER_MAX_NODES - 1, CLUSTER_HW_REMASTER_BLOCKED_STRUCTURAL);
 	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_INVALID, hw_poll(NULL, NULL, NULL));
+	cluster_hw_remaster_set_result(
+		CLUSTER_MAX_NODES - 1, (ClusterHwRemasterResult)(CLUSTER_HW_REMASTER_NOT_APPLICABLE + 1));
+	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_INVALID, hw_poll(NULL, NULL, NULL));
+	cluster_shared_config = true;
+	cluster_hw_remaster_set_result(CLUSTER_MAX_NODES - 1, CLUSTER_HW_REMASTER_NOT_APPLICABLE);
+	cluster_hw_remaster_set_next_attempt_at(CLUSTER_MAX_NODES - 1, 0);
+	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_READY, hw_poll(NULL, NULL, NULL));
 }
 UT_TEST(hw_invalid_late_entry_overrides_pending)
 {
@@ -700,10 +709,33 @@ UT_TEST(hw_local_backend_and_existing_reply_keep_original_paths)
 	UT_ASSERT_EQ(stop_new_modifier_calls, 0);
 }
 
+UT_TEST(shared_profile_cannot_publish_legacy_counter_reservations)
+{
+	HwAllocRequest req = { 0 };
+	HwAllocReply reply;
+
+	reset_fixture();
+	cluster_shared_data_dir = "allocation-fixture";
+	pg_atomic_write_u32(&hw_state->cold_boot_mode, CLUSTER_HW_BOOT_EXISTING_RECOVERY);
+	cluster_shared_config = true;
+	req.request_id = 85;
+	req.spcOid = 1663;
+	req.dbOid = 5;
+	req.relNumber = 16385;
+	req.want = 2;
+	req.seed_nblocks = 17005;
+	cluster_hw_master_process(&req, &reply);
+	UT_ASSERT_EQ(reply.status, HW_ALLOC_REPLY_FAIL_NOT_READY);
+	UT_ASSERT_EQ(reply.granted, 0);
+	UT_ASSERT_EQ(hw_wal_calls + hw_flush_calls, 0);
+	UT_ASSERT_EQ(reply.request_id, req.request_id);
+	cluster_shared_config = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(owner_and_missing_regions);
 	UT_RUN(oid_original_refill_success_and_unused_grant);
 	UT_RUN(oid_original_exception_closes_refill);
@@ -715,6 +747,7 @@ main(void)
 	UT_RUN(lmon_post_send_observes_original_shared_owners);
 	UT_RUN(hw_remote_seal_precedes_original_advance_wal_and_reply);
 	UT_RUN(hw_local_backend_and_existing_reply_keep_original_paths);
+	UT_RUN(shared_profile_cannot_publish_legacy_counter_reservations);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

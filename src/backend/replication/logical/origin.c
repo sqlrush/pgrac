@@ -95,6 +95,9 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#endif
 
 /*
  * Replay progress of a single remote node.
@@ -181,6 +184,20 @@ static ReplicationState *session_replication_state = NULL;
 /* Magic for on disk files. */
 #define REPLICATION_STATE_MAGIC ((uint32) 0x1257DADE)
 
+/* PGRAC: origin writers are reachable even without logical decoding. Keep
+ * read-only inspection and ordinary non-shared replication unchanged. */
+static void
+replorigin_check_shared_write(void)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config || cluster_shared_catalog)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("replication origins are not supported in shared mode"),
+				 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=LOGICAL_WAL_UNSUPPORTED")));
+#endif
+}
+
 static void
 replorigin_check_prerequisites(bool check_slots, bool recoveryOK)
 {
@@ -259,6 +276,7 @@ replorigin_create(const char *roname)
 	SysScanDesc scan;
 	ScanKeyData key;
 
+	replorigin_check_shared_write();
 	roname_d = CStringGetTextDatum(roname);
 
 	Assert(IsTransactionState());
@@ -414,6 +432,7 @@ replorigin_drop_by_name(const char *name, bool missing_ok, bool nowait)
 	Relation	rel;
 	HeapTuple	tuple;
 
+	replorigin_check_shared_write();
 	Assert(IsTransactionState());
 
 	rel = table_open(ReplicationOriginRelationId, RowExclusiveLock);
@@ -893,6 +912,7 @@ replorigin_advance(RepOriginId node,
 	ReplicationState *replication_state = NULL;
 	ReplicationState *free_state = NULL;
 
+	replorigin_check_shared_write();
 	Assert(node != InvalidRepOriginId);
 
 	/* we don't track DoNotReplicateId */
@@ -1098,6 +1118,7 @@ replorigin_session_setup(RepOriginId node, int acquired_by)
 	int			i;
 	int			free_slot = -1;
 
+	replorigin_check_shared_write();
 	if (!registered_cleanup)
 	{
 		on_shmem_exit(ReplicationOriginExitCleanup, 0);

@@ -41,7 +41,11 @@
 #include "storage/proc.h"
 #include "utils/memutils.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_page_anchor_cache.h"
+#include "cluster/cluster_page_producer.h"
+#include "cluster/cluster_page_wal.h"
+#include "cluster/storage/cluster_smgr.h"
 #endif
 
 static bool
@@ -224,6 +228,7 @@ typedef struct
 	bool		apply_image_emitted;
 	bool		page_anchor_key_registered;
 	RfPageAnchorCacheKeyV1 page_anchor_key;
+	Buffer page_version_buffer;
 #endif
 	RelFileLocator rlocator;	/* identifies the relation and block */
 	ForkNumber	forkno;
@@ -275,6 +280,9 @@ static RfPageVersionEdgeEntryV1
  */
 static XLogRecData hdr_rdt;
 static char *hdr_scratch = NULL;
+#ifdef USE_PGRAC_CLUSTER
+static XLogRecPtr last_insert_record_end = InvalidXLogRecPtr;
+#endif
 
 #define SizeOfXlogOrigin	(sizeof(RepOriginId) + sizeof(char))
 #define SizeOfXLogTransactionId	(sizeof(TransactionId) + sizeof(char))
@@ -423,6 +431,9 @@ XLogResetInsertion(void)
 	registered_page_version_result_token = 0;
 	registered_page_version_entry_count = 0;
 	begininsert_called = false;
+#ifdef USE_PGRAC_CLUSTER
+	last_insert_record_end = InvalidXLogRecPtr;
+#endif
 }
 
 /*
@@ -454,6 +465,7 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->rdata_len = 0;
 #ifdef USE_PGRAC_CLUSTER
 	regbuf->page_anchor_key_registered = false;
+	regbuf->page_version_buffer = buffer;
 #endif
 
 	/*
@@ -510,6 +522,7 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->rdata_len = 0;
 #ifdef USE_PGRAC_CLUSTER
 	regbuf->page_anchor_key_registered = false;
+	regbuf->page_version_buffer = InvalidBuffer;
 #endif
 
 	/*
@@ -761,12 +774,61 @@ XLogInsert(RmgrId rmid, uint8 info)
 					true, rb->apply_image_emitted);
 		}
 	}
+	/* Keep the original generation, not just the page header's thread id.
+	 * Assembly retries publish nothing; only this actual successful record
+	 * may bind the registered resident result before ResetInsertion. */
+	if (cluster_shared_config && page_version_edge_registered) {
+		for (uint8 i = 0; i < registered_page_version_entry_count; i++) {
+			const RfPageVersionEdgeEntryV1 *edge = &registered_page_version_entries[i];
+			registered_buffer *rb;
+			ClusterPageWalCaptureResultV1 capture;
+
+			if (edge->page_class != RF_PAGE_CLASS_ORDINARY)
+				continue;
+			if (edge->block_id >= max_registered_block_id)
+				elog(PANIC, "versioned WAL lost its registered buffer");
+			rb = &registered_buffers[edge->block_id];
+			/* Private bulk/copy owners retain their WAL+DATA obligations.
+			 * A private-WAL/resident publisher binds after installing its
+			 * real bytes, through capture_published, still under content-X. */
+			if (!rb->in_use)
+				elog(PANIC, "versioned WAL lost its registered page");
+			if (rb->page_version_buffer == InvalidBuffer || BufferIsLocal(rb->page_version_buffer))
+				continue;
+			capture = cluster_page_wal_capture_native_v1(
+				rb->page_version_buffer, edge, registered_page_version_result_token, ProcLastRecPtr,
+				EndPos, ((XLogRecord *)hdr_scratch)->xl_crc, ((XLogRecord *)hdr_scratch)->xl_rmid,
+				((XLogRecord *)hdr_scratch)->xl_info);
+			if (capture != CLUSTER_PAGE_WAL_CAPTURED && capture != CLUSTER_PAGE_WAL_UNATTRIBUTED)
+				elog(PANIC, "versioned WAL lost its buffer mutation invariant");
+			if (capture == CLUSTER_PAGE_WAL_UNATTRIBUTED
+				&& !cluster_page_wal_forget_v1(rb->page_version_buffer))
+				elog(PANIC, "versioned WAL lost its buffer attribution owner");
+		}
+	}
 #endif
 
 	XLogResetInsertion();
+#ifdef USE_PGRAC_CLUSTER
+	last_insert_record_end = cluster_shared_config ? EndPos : InvalidXLogRecPtr;
+#endif
 
 	return EndPos;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+bool
+XLogGetLastInsertRecord(XLogRecPtr end, XLogRecPtr *start, XLogRecord *record)
+{
+	if (start == NULL || record == NULL || !cluster_shared_config || begininsert_called
+		|| hdr_scratch == NULL || end == InvalidXLogRecPtr || end != last_insert_record_end
+		|| end != XactLastRecEnd || ProcLastRecPtr == InvalidXLogRecPtr || ProcLastRecPtr >= end)
+		return false;
+	*record = *(XLogRecord *) hdr_scratch;
+	*start = ProcLastRecPtr;
+	return true;
+}
+#endif
 
 /*
  * Assemble a WAL record from the registered data and buffers into an
@@ -1392,6 +1454,25 @@ XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
 	XLogRecPtr	recptr = InvalidXLogRecPtr;
 	XLogRecPtr	lsn;
 	XLogRecPtr	RedoRecPtr;
+#ifdef USE_PGRAC_CLUSTER
+	bool rebuildable = false;
+	RfPageProducerBatchV1 hint_batch;
+
+	if (cluster_shared_config && !BufferIsLocal(buffer) && BufferIsPermanent(buffer))
+	{
+		RelFileLocator locator;
+		ForkNumber forknum;
+		BlockNumber block;
+
+		BufferGetTag(buffer, &locator, &forknum, &block);
+		if (cluster_smgr_which_for(locator, InvalidBackendId) == 1)
+		{
+			if (forknum != FSM_FORKNUM)
+				elog(ERROR, "shared page hint requires a prepared page version");
+			rebuildable = true;
+		}
+	}
+#endif
 
 	/*
 	 * Ensure no checkpoint can change our view of RedoRecPtr.
@@ -1420,6 +1501,19 @@ XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
 		ForkNumber	forkno;
 		BlockNumber blkno;
 
+#ifdef USE_PGRAC_CLUSTER
+		if (rebuildable)
+		{
+			RfPageProducerComponentV1 component = {0};
+
+			component.page_class = RF_PAGE_CLASS_REBUILDABLE_FSM;
+			component.before_kind = RF_PAGE_STATE_REBUILDABLE;
+			if (!rf_page_producer_prepare_v1(&component, 1, &hint_batch)
+				|| !rf_page_producer_stamp_v1(&hint_batch))
+				elog(ERROR, "cannot prepare rebuildable FSM hint component");
+		}
+#endif
+
 		/*
 		 * Copy buffer so we don't have to worry about concurrent hint bit or
 		 * lsn updates. We assume pd_lower/upper cannot be changed without an
@@ -1445,6 +1539,10 @@ XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
 
 		BufferGetTag(buffer, &rlocator, &forkno, &blkno);
 		XLogRegisterBlock(0, &rlocator, forkno, blkno, copied_buffer.data, flags);
+#ifdef USE_PGRAC_CLUSTER
+		if (rebuildable && !rf_page_producer_register_wal_v1(&hint_batch))
+			elog(ERROR, "cannot register rebuildable FSM hint component");
+#endif
 
 		recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI_FOR_HINT);
 	}

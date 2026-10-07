@@ -62,6 +62,10 @@ StaticAssertDecl(CLUSTER_IR_RESID_TYPE != CLUSTER_DL_RESID_TYPE,
  * full recovery-duty identity.  Invalid input preserves *out. */
 extern bool cluster_recovery_serial_resid_encode(const ClusterRecoveryDutyKey *duty,
 												 ClusterResId *out);
+/* PGRAC: explicit claim profile, unchanged IR wire/resource shape.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern bool cluster_recovery_serial_resid_encode_for_claim(const ClusterRecoveryDutyKey *duty,
+														   bool claim_v2, ClusterResId *out);
 
 #ifndef FRONTEND
 
@@ -73,7 +77,15 @@ typedef struct PgracExternalFenceAdmissionSetV1 PgracExternalFenceAdmissionSetV1
 
 typedef enum ClusterRecoverySerialMode {
 	CLUSTER_RECOVERY_SERIAL_ONLINE = 1,
-	CLUSTER_RECOVERY_SERIAL_COLD_FORMED = 2
+	CLUSTER_RECOVERY_SERIAL_COLD_FORMED = 2,
+	/* PGRAC: scan/publish input only, never page/side mutation authority.
+	 * Same IR resource; no disk, wire or shared-memory enum change.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	CLUSTER_RECOVERY_SERIAL_INPUT_SEAL = 3,
+	/* PGRAC: existing IR for exact pending initialization closure only.
+	 * No checkpoint substitution or ordinary page/side replay permission.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	CLUSTER_RECOVERY_SERIAL_INITIALIZER = 4
 } ClusterRecoverySerialMode;
 
 typedef enum ClusterRecoverySerialAcquireResult {
@@ -107,6 +119,7 @@ typedef struct ClusterRecoverySerialRequest {
 	ClusterRecoverySerialMode mode;
 	ClusterRecoveryDutyKey duty;
 	ClusterControlRootReadToken expected_root_token;
+	ClusterControlPendingToken pending;
 	const ClusterFormationWitnessV1 *formation;
 	const PgracExternalFenceNeedSetV1 *fence_need_set;
 	const PgracExternalFenceAdmissionSetV1 *fence_admission_set;
@@ -121,6 +134,7 @@ typedef struct ClusterRecoverySerialGuard {
 	ClusterResId resid;
 	ClusterRecoveryDutyKey duty;
 	ClusterControlRootReadToken root_read_token;
+	ClusterControlPendingToken pending;
 	const ClusterFormationWitnessV1 *formation;
 	const PgracExternalFenceNeedSetV1 *fence_need_set;
 	const PgracExternalFenceAdmissionSetV1 *fence_admission_set;
@@ -142,6 +156,10 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 								ClusterRecoverySerialGuard *guard);
 extern ClusterRecoverySerialRevalidateResult
 cluster_recovery_serial_revalidate(ClusterRecoverySerialGuard *guard);
+extern ClusterRecoverySerialRevalidateResult
+cluster_recovery_serial_input_revalidate(ClusterRecoverySerialGuard *guard);
+extern ClusterRecoverySerialRevalidateResult
+cluster_recovery_serial_initializer_revalidate(ClusterRecoverySerialGuard *guard);
 extern ClusterRecoverySerialReleaseResult
 cluster_recovery_serial_release(ClusterRecoverySerialGuard *guard);
 extern ClusterRecoverySerialAcquireResult

@@ -1,0 +1,796 @@
+/*-------------------------------------------------------------------------
+ *
+ * cluster_cold_recovery_startup.c
+ *	  Startup-process driver state for typed cold-crash replay.
+ *
+ *	  Pass 1 runs here, with every foreign origin's external admission held
+ *	  and before the serial set (retention pin, then IR), so its ROOT/CF
+ *	  reads and WAL scans never run under IR; the caller recommits the
+ *	  unchanged ROOT tokens under the serial set and pass 2 matches every
+ *	  record against pass 1.  Participants are the founder's own sealed
+ *	  generation (its restart input), every fenced origin and, from the
+ *	  participant census, every other generation with retained WAL as
+ *	  history.  Any refusal returns before the first mutation.
+ *
+ *	  Pass 2 runs in xlogrecovery.c; the per-block verdicts of the record
+ *	  it applies are published here for XLogReadBufferForRedoExtended.
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *	  src/backend/cluster/cluster_cold_recovery_startup.c
+ *
+ * NOTES
+ *	  This is a pgrac-original file (no derivation from PostgreSQL).
+ *	  Spec: spec-s9p2-05-instance-and-cluster-recovery.md
+ *	  Spec: spec-s9p2-03-shared-wal-and-checkpoint.md
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#ifdef USE_PGRAC_CLUSTER
+
+#include "access/xlogreader.h"
+#include "cluster/cluster_cold_recovery.h"
+#include "cluster/cluster_cold_recovery_census.h"
+#include "cluster/cluster_control_root.h"
+#include "cluster/cluster_page_cold_redo.h"
+#include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_wal_tail.h"
+#include "cluster/cluster_wal_thread.h"
+#include "storage/bufpage.h"
+#include "storage/checksum.h"
+#include "utils/memutils.h"
+
+/* cluster.cold_recovery_plan_memory, kB; registered with the cluster GUCs. */
+int cluster_cold_recovery_plan_memory = CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB;
+
+#define COLD_REQUIRED_ROOT_FLAGS                                                                   \
+	(CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID            \
+	 | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID)
+
+typedef struct ColdRoot {
+	ClusterControlRootSnapshot root;
+	ClusterControlRootReadToken token;
+} ColdRoot;
+
+static const char *
+cold_detail_name(ClusterColdDetailV1 detail)
+{
+	static const char *const names[] = {
+		"ok",
+		"invalid argument",
+		"participant invalid",
+		"source gap",
+		"component invalid",
+		"edge branch",
+		"edge cycle",
+		"chain ambiguous",
+		"ancestor missing",
+		"incarnation mismatch",
+		"history gap",
+		"anchor missing",
+		"observation failed",
+		"deadlock",
+		"capacity",
+		"out of memory",
+		"state",
+		"lifecycle record unsupported",
+		"opcode unsupported",
+		"side owner missing",
+		"page content unproven",
+		"SPACE effects invalid",
+		"SPACE identity missing",
+		"SPACE effects refused",
+	};
+
+	return (int)detail >= 0 && (Size)detail < lengthof(names) ? names[detail] : "unknown";
+}
+
+static void cold_refuse(ClusterColdTypedV1 *typed, ClusterColdDetailV1 detail, const char *format,
+						...) pg_attribute_printf(3, 4);
+
+static void
+cold_refuse(ClusterColdTypedV1 *typed, ClusterColdDetailV1 detail, const char *format, ...)
+{
+	va_list args;
+
+	typed->refusal = detail;
+	va_start(args, format);
+	(void)pg_vsnprintf(typed->refusal_detail, sizeof(typed->refusal_detail), format, args);
+	va_end(args);
+	if (detail == CLUSTER_COLD_CAPACITY) {
+		Size used = strlen(typed->refusal_detail);
+
+		(void)snprintf(typed->refusal_detail + used, sizeof(typed->refusal_detail) - used,
+					   " (cluster.cold_recovery_plan_memory is %d kB)",
+					   cluster_cold_recovery_plan_memory);
+	}
+}
+
+/* The founder's previous generation must be sealed like every peer. */
+static bool
+cold_own_root(ClusterColdTypedV1 *typed, uint16 own_thread, ColdRoot *out)
+{
+	ClusterControlRootIdentity identity;
+	ClusterControlRootResult result;
+
+	result = cluster_control_root_lookup_owner_by_node_runtime((int32)own_thread - 1, &identity,
+															   &out->root, &out->token);
+	if ((result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		 && result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		|| !cluster_recovery_duty_key_valid_v1(&identity) || identity.origin_thread_id != own_thread
+		|| cluster_recovery_duty_key_compare(&identity, &out->root.identity)
+			   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT) {
+		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+					"own thread %u root is unreadable (result %d)", (unsigned)own_thread,
+					(int)result);
+		return false;
+	}
+	if (out->root.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		|| (out->root.root_flags & COLD_REQUIRED_ROOT_FLAGS) != COLD_REQUIRED_ROOT_FLAGS) {
+		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+					"own thread %u previous generation is not sealed for recovery "
+					"(lifecycle %d, flags 0x%x)",
+					(unsigned)own_thread, (int)out->root.lifecycle, out->root.root_flags);
+		return false;
+	}
+	return true;
+}
+
+/* Exact source, native redo and cut of one sealed root, from its token. */
+static bool
+cold_participant(ClusterColdTypedV1 *typed, const ColdRoot *root, uint32 index)
+{
+	ClusterColdParticipantV1 *participant = &typed->participants[index];
+	ClusterControlRootResult result;
+	XLogRecPtr native_redo = InvalidXLogRecPtr;
+
+	result = cluster_control_root_recovery_source_v1(&root->root, &root->token,
+													 &typed->sources[index], &native_redo);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || native_redo < root->root.checkpoint_lower_lsn
+		|| native_redo > root->root.validated_tail_lsn_exclusive) {
+		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+					"thread %u native checkpoint input is unproven (result %d)",
+					(unsigned)root->root.identity.origin_thread_id, (int)result);
+		return false;
+	}
+	memset(participant, 0, sizeof(*participant));
+	participant->thread_id = root->root.identity.origin_thread_id;
+	participant->timeline = root->root.checkpoint_tli;
+	participant->owner_incarnation = root->root.identity.origin_owner_incarnation;
+	participant->physical_lower = root->root.checkpoint_lower_lsn;
+	participant->native_redo = native_redo;
+	participant->tail_end = root->root.validated_tail_lsn_exclusive;
+	return true;
+}
+
+/* The founder replays the generation it restarts from: the restart input
+ * its bootstrap validated names the claim of its sealed root, and native
+ * startup chose the same redo. */
+static bool
+cold_own_restart(ClusterColdTypedV1 *typed, uint16 own_thread, XLogRecPtr own_redo)
+{
+	const ClusterWalSourceRef *source = &typed->sources[typed->own_participant];
+	XLogRecPtr native_redo = typed->participants[typed->own_participant].native_redo;
+	ClusterWalSourceRef restart;
+
+	if (!cluster_wal_thread_restart_v2_ref(&restart)
+		|| memcmp(&restart.claim.identity, &source->claim.identity, sizeof(restart.claim.identity))
+			   != 0
+		|| memcmp(restart.claim.claim_sha256, source->claim.claim_sha256,
+				  sizeof(restart.claim.claim_sha256))
+			   != 0) {
+		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+					"own thread %u sealed generation is not this node's restart input",
+					(unsigned)own_thread);
+		return false;
+	}
+	if (native_redo != own_redo) {
+		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+					"own thread %u native redo %X/%X differs from the restart redo %X/%X",
+					(unsigned)own_thread, LSN_FORMAT_ARGS(native_redo), LSN_FORMAT_ARGS(own_redo));
+		return false;
+	}
+	return true;
+}
+
+static bool
+cold_collect_roots(ClusterColdTypedV1 *typed, ClusterRecoveryFencePlan *fence, uint16 own_thread,
+				   ColdRoot *roots)
+{
+	uint16 count = cluster_recovery_merge_fence_plan_origin_count(fence);
+	uint16 i;
+
+	if (count == 0 || (uint32)count + 1 > CLUSTER_COLD_MAX_PARTICIPANTS) {
+		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID, "fence plan names %u origins",
+					(unsigned)count);
+		return false;
+	}
+	if (!cold_own_root(typed, own_thread, &roots[0]))
+		return false;
+	for (i = 0; i < count; i++) {
+		uint16 thread = 0;
+
+		if (!cluster_recovery_merge_fence_plan_origin(fence, i, &thread, &roots[i + 1].root,
+													  &roots[i + 1].token)
+			|| thread == own_thread) {
+			cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID, "fence plan origin %u is unusable",
+						(unsigned)i);
+			return false;
+		}
+	}
+	typed->participant_count = (uint32)count + 1;
+	typed->own_participant = 0;
+	return true;
+}
+
+static void
+cold_refuse_diag(ClusterColdTypedV1 *typed, ClusterColdDetailV1 detail, const char *stage,
+				 const ClusterColdDiagV1 *diag)
+{
+	uint16 thread = diag->has_record && diag->participant < typed->participant_count
+						? typed->participants[diag->participant].thread_id
+						: 0;
+
+	cold_refuse(
+		typed, detail,
+		"%s refused: %s; thread %u record %X/%X; page %u/%u/%u fork %u block %u; "
+		"version token " UINT64_FORMAT "; waits for thread %u record %X/%X",
+		stage, cold_detail_name(detail), (unsigned)thread,
+		LSN_FORMAT_ARGS(diag->has_record ? diag->read_rec_ptr : InvalidXLogRecPtr),
+		diag->has_page ? diag->page.locator.spcOid : 0,
+		diag->has_page ? diag->page.locator.dbOid : 0,
+		diag->has_page ? diag->page.locator.relNumber : 0, diag->has_page ? diag->page.forknum : 0,
+		diag->has_page ? diag->page.blockno : 0, diag->version.mutation_token,
+		diag->has_dependency && diag->dependency_participant < typed->participant_count
+			? (unsigned)typed->participants[diag->dependency_participant].thread_id
+			: 0,
+		LSN_FORMAT_ARGS(diag->has_dependency ? diag->dependency_read_rec_ptr : InvalidXLogRecPtr));
+}
+
+/* SPACE effects are keyed by the namespace every participant must share:
+ * the cluster's identity and the database incarnation of their claims. */
+static bool
+cold_space_namespace(ClusterColdTypedV1 *typed)
+{
+	const ClusterWalSourceRef *own = &typed->sources[typed->own_participant];
+	ClusterColdObserverV1 *observer = &typed->observer;
+	uint32 i;
+
+	for (i = 0; i < typed->participant_count; i++) {
+		const ClusterWalSourceRef *source = &typed->sources[i];
+		bool other_storage
+			= memcmp(source->claim.identity.storage_uuid, own->claim.identity.storage_uuid, 16)
+			  != 0;
+
+		if (source->claim.database_incarnation != own->claim.database_incarnation
+			|| source->claim.identity.system_identifier != own->claim.identity.system_identifier
+			|| other_storage) {
+			cold_refuse(
+				typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+				"thread %u claims system " UINT64_FORMAT ", database incarnation " UINT64_FORMAT
+				"%s; thread %u claims system " UINT64_FORMAT ", database incarnation " UINT64_FORMAT
+				"; generations share no namespace",
+				(unsigned)typed->participants[i].thread_id,
+				source->claim.identity.system_identifier, source->claim.database_incarnation,
+				other_storage ? ", another storage uuid" : "",
+				(unsigned)typed->participants[typed->own_participant].thread_id,
+				own->claim.identity.system_identifier, own->claim.database_incarnation);
+			return false;
+		}
+	}
+	observer->system_identifier = own->claim.identity.system_identifier;
+	observer->database_incarnation = own->claim.database_incarnation;
+	memcpy(observer->storage_uuid, own->claim.identity.storage_uuid, 16);
+	return true;
+}
+
+static const char *
+cold_census_name(ClusterColdCensusDetailV1 detail)
+{
+	switch (detail) {
+	case CLUSTER_COLD_CENSUS_LIVE_WRITER:
+		return "a current generation is still OPEN";
+	case CLUSTER_COLD_CENSUS_LIFECYCLE:
+		return "unknown generation lifecycle";
+	case CLUSTER_COLD_CENSUS_TERMINAL:
+		return "initializer terminal with records";
+	case CLUSTER_COLD_CENSUS_RANGE:
+		return "retained range invalid";
+	case CLUSTER_COLD_CENSUS_UNCOVERED:
+		return "crashed generation missing from the fence plan";
+	case CLUSTER_COLD_CENSUS_ORIGIN_MISSING:
+		return "fence origin is not a crashed generation";
+	case CLUSTER_COLD_CENSUS_CAPACITY:
+		return "more generations than participants";
+	default:
+		return "invalid census input";
+	}
+}
+
+/* The census's crashed generations are exactly the roots already taken, with
+ * the same cut; append its history-only generations as participants. */
+static bool
+cold_census_take(ClusterColdTypedV1 *typed, const ColdRoot *roots,
+				 const ClusterColdCensusEntryV1 *entries, uint32 count)
+{
+	uint32 crashed = typed->participant_count;
+	uint32 i;
+	uint32 k;
+
+	for (i = 0; i < count; i++) {
+		const ClusterColdCensusEntryV1 *entry = &entries[i];
+
+		if (entry->role == CLUSTER_COLD_CENSUS_REPLAY) {
+			for (k = 0; k < crashed; k++)
+				if (cluster_control_root_identity_equal(&roots[k].root.identity, &entry->identity))
+					break;
+			if (k == crashed
+				|| memcmp(&typed->participants[k], &entry->cut, sizeof(entry->cut)) != 0) {
+				cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+							"thread %u census cut differs from its ROOT source (native redo %X/%X)",
+							(unsigned)entry->cut.thread_id,
+							LSN_FORMAT_ARGS(entry->cut.native_redo));
+				return false;
+			}
+			continue;
+		}
+		if (typed->participant_count >= CLUSTER_COLD_MAX_PARTICIPANTS) {
+			cold_refuse(typed, CLUSTER_COLD_CAPACITY, "more than %d retained generations",
+						CLUSTER_COLD_MAX_PARTICIPANTS);
+			return false;
+		}
+		typed->participants[typed->participant_count] = entry->cut;
+		typed->sources[typed->participant_count] = entry->source;
+		typed->input_index[typed->participant_count] = entry->input_index;
+		typed->participant_count++;
+	}
+	return true;
+}
+
+/* Complete participant census: every generation with retained WAL under one
+ * cold read scope, held until pass 1 has scanned the history-only ones. */
+static bool
+cold_census(ClusterColdTypedV1 *typed, const ColdRoot *roots)
+{
+	const ClusterControlRootIdentity *own = &roots[0].root.identity;
+	const ClusterWalInputV1 **inputs;
+	ClusterColdCensusEntryV1 *entries;
+	ClusterControlRootSnapshot *crashed;
+	ClusterControlRootResult result;
+	ClusterColdCensusDetailV1 detail;
+	uint32 count;
+	uint32 kept = 0;
+	uint32 bad = 0;
+	uint16 thread = 0;
+	uint32 i;
+	bool taken = false;
+
+	typed->replay_count = typed->participant_count;
+	result = cluster_wal_inputs_cold_begin_v1(own->storage_uuid, own->system_identifier,
+											  &typed->inputs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+					"participant census unavailable (root result %d)", (int)result);
+		return false;
+	}
+	count = cluster_wal_inputs_count_v1(typed->inputs);
+	inputs = (const ClusterWalInputV1 **)palloc0(sizeof(*inputs) * Max(count, 1));
+	entries = (ClusterColdCensusEntryV1 *)palloc0(sizeof(*entries) * CLUSTER_COLD_MAX_PARTICIPANTS);
+	crashed = (ClusterControlRootSnapshot *)palloc0(sizeof(*crashed) * typed->participant_count);
+	for (i = 0; i < count; i++)
+		inputs[i] = cluster_wal_inputs_at_v1(typed->inputs, i);
+	for (i = 0; i < typed->participant_count; i++)
+		crashed[i] = roots[i].root;
+	detail = cluster_cold_census_select_v1(inputs, count, entries, CLUSTER_COLD_MAX_PARTICIPANTS,
+										   &kept, &bad);
+	if (detail == CLUSTER_COLD_CENSUS_OK)
+		detail = cluster_cold_census_cover_v1(entries, kept, crashed, typed->participant_count,
+											  &thread);
+	if (detail != CLUSTER_COLD_CENSUS_OK)
+		cold_refuse(typed, CLUSTER_COLD_PARTICIPANT_INVALID,
+					"participant census refused: %s (input %u, thread %u)",
+					cold_census_name(detail), bad, (unsigned)thread);
+	else
+		taken = cold_census_take(typed, roots, entries, kept);
+	pfree(crashed);
+	pfree(entries);
+	pfree(inputs);
+	return taken;
+}
+
+/* The history-only generations, under the census scope; then release it. */
+static bool
+cold_scan_history(ClusterColdTypedV1 *typed)
+{
+	ClusterControlRootResult result;
+	uint32 i;
+
+	for (i = typed->replay_count; i < typed->participant_count; i++) {
+		ClusterColdScanResultV1 scan;
+		ClusterColdDetailV1 detail = cluster_cold_scan_input_v1(
+			typed->plan, i, typed->inputs, typed->input_index[i], false, true, &scan);
+
+		typed->scanned_records += scan.records;
+		if (detail != CLUSTER_COLD_OK) {
+			cold_refuse(typed, detail,
+						"pass-1 scan refused: %s; history thread %u record %X/%X (root result %d)",
+						cold_detail_name(detail), (unsigned)typed->participants[i].thread_id,
+						LSN_FORMAT_ARGS(scan.failed_read_rec_ptr), scan.root_result);
+			return false;
+		}
+	}
+	result = cluster_wal_inputs_revalidate_v1(typed->inputs);
+	cluster_wal_inputs_release_v1(&typed->inputs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		cold_refuse(typed, CLUSTER_COLD_SOURCE_GAP,
+					"participant census changed while it was scanned (root result %d)",
+					(int)result);
+		return false;
+	}
+	return true;
+}
+
+static bool
+cold_scan_and_seal(ClusterColdTypedV1 *typed, const ColdRoot *roots)
+{
+	ClusterColdDiagV1 diag;
+	ClusterColdDetailV1 detail;
+	uint32 i;
+
+	if (!cold_space_namespace(typed))
+		return false;
+	detail = cluster_cold_plan_set_space_check_v1(typed->plan, cluster_cold_space_check_v1,
+												  &typed->observer);
+	if (detail != CLUSTER_COLD_OK) {
+		cold_refuse(typed, detail, "SPACE check refused: %s", cold_detail_name(detail));
+		return false;
+	}
+
+	for (i = 0; i < typed->replay_count; i++) {
+		ClusterColdScanResultV1 scan;
+
+		detail = cluster_cold_scan_root_v1(typed->plan, i, &roots[i].root, &roots[i].token, false,
+										   i != typed->own_participant, &scan);
+		typed->scanned_records += scan.records;
+		if (detail != CLUSTER_COLD_OK) {
+			cold_refuse(typed, detail,
+						"pass-1 scan refused: %s; thread %u record %X/%X (root result %d, "
+						"route detail %u)",
+						cold_detail_name(detail), (unsigned)typed->participants[i].thread_id,
+						LSN_FORMAT_ARGS(scan.failed_read_rec_ptr), scan.root_result,
+						(unsigned)scan.route_detail);
+			return false;
+		}
+	}
+	if (!cold_scan_history(typed))
+		return false;
+	detail = cluster_cold_plan_seal_v1(typed->plan, cluster_cold_observe_data_v1, &typed->observer,
+									   &diag);
+	if (detail != CLUSTER_COLD_OK) {
+		cold_refuse_diag(typed, detail, "plan seal", &diag);
+		return false;
+	}
+	return true;
+}
+
+ClusterColdTypedV1 *
+cluster_cold_typed_prepare_v1(ClusterRecoveryFencePlan *fence, uint16 own_thread,
+							  XLogRecPtr own_redo)
+{
+	MemoryContext context;
+	MemoryContext old_context;
+	ClusterColdTypedV1 *typed;
+	ColdRoot *roots;
+	ClusterColdDetailV1 detail;
+
+	context = AllocSetContextCreate(TopMemoryContext, "cluster cold replay plan",
+									ALLOCSET_DEFAULT_SIZES);
+	old_context = MemoryContextSwitchTo(context);
+	typed = (ClusterColdTypedV1 *)palloc0(sizeof(*typed));
+	typed->context = context;
+	roots = (ColdRoot *)palloc0(sizeof(ColdRoot) * CLUSTER_COLD_MAX_PARTICIPANTS);
+	if (!cold_collect_roots(typed, fence, own_thread, roots))
+		goto done;
+	for (uint32 i = 0; i < typed->participant_count; i++)
+		if (!cold_participant(typed, &roots[i], i))
+			goto done;
+	if (!cold_own_restart(typed, own_thread, own_redo) || !cold_census(typed, roots))
+		goto done;
+	typed->system_identifier = roots[0].root.identity.system_identifier;
+	detail
+		= cluster_cold_plan_create_v1(typed->participants, typed->participant_count,
+									  (Size)cluster_cold_recovery_plan_memory * 1024, &typed->plan);
+	if (detail != CLUSTER_COLD_OK) {
+		cold_refuse(typed, detail, "plan creation refused: %s", cold_detail_name(detail));
+		goto done;
+	}
+	if (cold_scan_and_seal(typed, roots))
+		typed->refusal = CLUSTER_COLD_OK;
+
+done:
+	pfree(roots);
+	MemoryContextSwitchTo(old_context);
+	return typed;
+}
+
+void
+cluster_cold_typed_destroy_v1(ClusterColdTypedV1 **typed_address)
+{
+	ClusterColdTypedV1 *typed;
+
+	if (typed_address == NULL || *typed_address == NULL)
+		return;
+	typed = *typed_address;
+	*typed_address = NULL;
+	if (typed->inputs != NULL)
+		cluster_wal_inputs_release_v1(&typed->inputs);
+	if (typed->plan != NULL)
+		cluster_cold_plan_destroy_v1(&typed->plan);
+	MemoryContextDelete(typed->context);
+}
+
+ClusterColdRouteV1
+cluster_cold_route_v1(bool shared_config, bool merge_engaged)
+{
+	if (!merge_engaged)
+		return CLUSTER_COLD_ROUTE_NATIVE;
+	return shared_config ? CLUSTER_COLD_ROUTE_TYPED : CLUSTER_COLD_ROUTE_REFUSE;
+}
+
+static void
+cold_reason_append(char *reason, Size reason_size, const char *text)
+{
+	Size used = strlen(reason);
+
+	(void)snprintf(reason + used, reason_size - used, "%s%s", used > 0 ? "; " : "", text);
+}
+
+bool
+cluster_cold_typed_ready_v1(const ClusterColdTypedV1 *typed,
+							const ClusterColdHandshakeV1 *handshake, char *reason, Size reason_size)
+{
+	uint32 steps;
+	uint32 applied = 0;
+	uint32 i;
+
+	if (reason == NULL || reason_size == 0)
+		return false;
+	reason[0] = '\0';
+	if (typed == NULL || handshake == NULL || typed->refusal != CLUSTER_COLD_OK
+		|| typed->plan == NULL) {
+		cold_reason_append(reason, reason_size, "no sealed typed cold plan");
+		return false;
+	}
+	if (!handshake->redo_block_hook)
+		cold_reason_append(reason, reason_size, "no typed redo-block consultation (R-A2)");
+	if (!handshake->participant_census)
+		cold_reason_append(reason, reason_size, "no complete participant census (R-A4)");
+	if (!handshake->side_owners)
+		cold_reason_append(reason, reason_size,
+						   "no typed side owners or XID/OID/MX/SCN bound merge (R-A5)");
+	if (!handshake->completion_publish)
+		cold_reason_append(reason, reason_size, "no recovery completion publication (R-A7)");
+	if (!handshake->restartpoint_hold)
+		cold_reason_append(reason, reason_size,
+						   "no restartpoint hold while the cold cut is replayed (R-A9)");
+	if (cluster_cold_plan_space_relation_count_v1(typed->plan) > 0 && !handshake->space_owner) {
+		char text[96];
+
+		(void)snprintf(text, sizeof(text), "%u SPACE relations need the cold SPACE owner (R-A11)",
+					   cluster_cold_plan_space_relation_count_v1(typed->plan));
+		cold_reason_append(reason, reason_size, text);
+	}
+	steps = cluster_cold_plan_step_count_v1(typed->plan);
+	for (i = 0; i < steps; i++) {
+		ClusterColdStepV1 step;
+
+		if (!cluster_cold_plan_step_v1(typed->plan, i, &step)) {
+			cold_reason_append(reason, reason_size, "unusable plan step");
+			return false;
+		}
+		if (!step.all_skip)
+			applied++;
+	}
+	if (applied > 0 && !handshake->redo_block_hook) {
+		char text[96];
+
+		(void)snprintf(text, sizeof(text), "%u page records need the redo-block consultation",
+					   applied);
+		cold_reason_append(reason, reason_size, text);
+	}
+	return reason[0] == '\0';
+}
+
+static bool cold_replay_window = false;
+
+void
+cluster_cold_replay_window_enter_v1(void)
+{
+	cold_replay_window = true;
+}
+
+void
+cluster_cold_replay_window_leave_v1(void)
+{
+	cold_replay_window = false;
+}
+
+bool
+cluster_cold_replay_window_active_v1(void)
+{
+	return cold_replay_window;
+}
+
+/* Pass-2 verdicts of the one record being applied, startup process only. */
+static struct {
+	bool active;
+	XLogRecPtr read_rec_ptr;
+	ClusterColdStepV1 step;
+} cold_redo_step;
+
+void
+cluster_cold_redo_step_enter_v1(const ClusterColdStepV1 *step)
+{
+	Assert(!cold_redo_step.active);
+	cold_redo_step.step = *step;
+	cold_redo_step.read_rec_ptr = step->read_rec_ptr;
+	cold_redo_step.active = true;
+}
+
+void
+cluster_cold_redo_step_leave_v1(void)
+{
+	memset(&cold_redo_step, 0, sizeof(cold_redo_step));
+}
+
+bool
+cluster_cold_redo_block_decision_v1(XLogReaderState *record, uint8 block_id,
+									ClusterColdRedoBlockV1 *out)
+{
+	const ClusterColdBlockStepV1 *block;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->action = CLUSTER_COLD_REDO_NATIVE;
+	if (!cold_redo_step.active)
+		return true;
+	/* A different record inside the window is a driver bug; refuse it. */
+	if (record == NULL || record->ReadRecPtr != cold_redo_step.read_rec_ptr
+		|| block_id > XLR_MAX_BLOCK_ID)
+		return false;
+	block = &cold_redo_step.step.blocks[block_id];
+	switch (block->verdict) {
+	case CLUSTER_COLD_BLOCK_NONE:
+		return true; /* rebuildable FSM block: unchanged native path */
+	case CLUSTER_COLD_BLOCK_SKIP:
+		out->action = CLUSTER_COLD_REDO_SKIP;
+		break;
+	case CLUSTER_COLD_BLOCK_APPLY_DELTA:
+	case CLUSTER_COLD_BLOCK_APPLY_IMAGE:
+	case CLUSTER_COLD_BLOCK_APPLY_INIT:
+		out->action = CLUSTER_COLD_REDO_APPLY;
+		break;
+	default:
+		return false;
+	}
+	out->expected_kind = block->expected_kind;
+	out->expected_before = block->expected_before;
+	out->result = block->result;
+	return true;
+}
+
+static bool
+cold_page_all_zero(const char *page)
+{
+	Size i;
+
+	for (i = 0; i < BLCKSZ; i++)
+		if (page[i] != 0)
+			return false;
+	return true;
+}
+
+/* The stored data checksum matches the content (pg_checksum_page scratches
+ * pd_checksum, so it runs on a copy). */
+static bool
+cold_page_checksum_matches(const char *page, BlockNumber blkno)
+{
+	PGAlignedBlock copy;
+
+	memcpy(copy.data, page, BLCKSZ);
+	return pg_checksum_page(copy.data, blkno) == ((const PageHeaderData *)page)->pd_checksum;
+}
+
+bool
+cluster_cold_classify_page_v1(const char *page, BlockNumber blkno, bool header_valid,
+							  bool checksums, ClusterColdDataV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (PageIsNew((Page)page)) {
+		/* Only an entirely zero page is unformatted; anything else is torn. */
+		if (!cold_page_all_zero(page)) {
+			out->kind = CLUSTER_COLD_DATA_INVALID;
+			return true;
+		}
+		out->kind = CLUSTER_COLD_DATA_UNFORMATTED;
+		out->flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED;
+		return true;
+	}
+	if (!header_valid || (checksums && !cold_page_checksum_matches(page, blkno))) {
+		out->kind = CLUSTER_COLD_DATA_INVALID;
+		return true;
+	}
+	/* A formatted page without a version token cannot be placed on a chain;
+	 * refuse rather than treat it as replaceable. */
+	if (((const PageHeaderData *)page)->pd_block_scn == 0)
+		return false;
+	out->kind = CLUSTER_COLD_DATA_PRESENT;
+	out->version.mutation_token = (uint64)((const PageHeaderData *)page)->pd_block_scn;
+	if (checksums)
+		out->flags = CLUSTER_COLD_DATA_FLAG_CONTENT_VERIFIED;
+	return true;
+}
+
+const char *
+cluster_cold_refusal_hint_v1(ClusterColdDetailV1 detail)
+{
+	switch (detail) {
+	case CLUSTER_COLD_CONTENT_UNPROVEN:
+		return "Shared mode requires data checksums (initdb -k, or pgrac-init); without them "
+			   "the named page's content cannot be proven, and no full-page image after its "
+			   "last checkpointed change can rebuild it. Preserve all original thread WAL and "
+			   "DATA; do not force recovery.";
+	case CLUSTER_COLD_ANCHOR_MISSING:
+		return "The named page is unreadable or failed verification, and no full-page image "
+			   "after its last checkpointed change can rebuild it. Preserve all original "
+			   "thread WAL and DATA; do not force recovery.";
+	case CLUSTER_COLD_CAPACITY:
+		return "The typed cold plan did not fit cluster.cold_recovery_plan_memory. Nothing was "
+			   "modified; raise the parameter and restart.";
+	case CLUSTER_COLD_OOM:
+		return "The server could not allocate the typed cold plan. Nothing was modified; free "
+			   "memory on this host and restart.";
+	case CLUSTER_COLD_SPACE_INVALID:
+		return "The retained WAL holds malformed or contradictory SPACE changes at the named "
+			   "record. Nothing was modified; preserve all original thread WAL and DATA.";
+	case CLUSTER_COLD_SPACE_REFUSED:
+		return "The SPACE owner could not order the named record's relation changes from its "
+			   "current SPACE pages (a change is missing or branches, or the pages are "
+			   "unreadable). Nothing was modified; preserve all original thread WAL and DATA.";
+	case CLUSTER_COLD_IDENTITY_MISSING:
+		return "The named page's relation has no readable SPACE identity and was not created "
+			   "inside the replayed WAL. Nothing was modified; preserve all original thread WAL "
+			   "and DATA; do not force recovery.";
+	default:
+		return "Preserve all original thread WAL and shared configuration. Shared mode "
+			   "recovers every retained writer generation through the typed cold plan and "
+			   "never falls back to single-stream replay.";
+	}
+}
+
+/*
+ * The native consumer reads this record's verdicts when it begins and
+ * ends, so the step is published first and withdrawn last.  Any refusal
+ * inside ends the startup process; nothing here needs unwinding.
+ */
+void
+cluster_cold_apply_step_v1(const ClusterColdStepV1 *step, XLogReaderState *record,
+						   ClusterColdApplyRecordV1 apply, void *arg)
+{
+	cluster_cold_redo_step_enter_v1(step);
+	cluster_page_cold_redo_begin_v1(record);
+	apply(record, arg);
+	cluster_page_cold_redo_end_v1(record);
+	cluster_cold_redo_step_leave_v1();
+}
+
+#endif /* USE_PGRAC_CLUSTER */

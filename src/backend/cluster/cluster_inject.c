@@ -95,7 +95,7 @@ typedef struct ClusterInjectPoint {
  * See docs/error-injection-design.md §2.4 for the naming convention
  * and §5 for the Stage 1+ roadmap.
  */
-static ClusterInjectPoint cluster_injection_points[] = {
+static ClusterInjectPoint cluster_injection_registry[] = {
 	/* Stage 0.27 baseline + 0.30 sweep (14 entries) */
 	{ .name = "cluster-conf-load-success" },
 	{ .name = "cluster-conf-parse-fail" },
@@ -116,6 +116,8 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-shared-fs-backend-register" },
 	{ .name = "cluster-shared-fs-init-top" },
 	{ .name = "cluster-shared-fs-local-open" },
+	/* DROP cleanup must preserve caller holdoffs when truncation throws. */
+	{ .name = "cluster-shared-fs-local-truncate" },
 
 	/* Stage 1.2 cluster_smgr (3 entries) */
 	{ .name = "cluster-smgr-create-top" },
@@ -462,6 +464,9 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 *	  counter delta (L408), never a native CLOG answer.
 	 */
 	{ .name = "cluster-undo-authority-block0-prove" },
+	/* Refuse a live owner's first publication after its authority recheck,
+	 * before INIT WAL or the final pathname. Existing segments never hit it. */
+	{ .name = "cluster-undo-first-publication-deny" },
 	/*
 	 * spec-5.22d Hardening — dead-owner authority durable-segment ENUMERATION
 	 * fault injection.
@@ -976,7 +981,7 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-ctrc-stage-barrier" },
 };
 
-#define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_points)
+#define CLUSTER_INJECTION_COUNT lengthof(cluster_injection_registry)
 
 
 /*
@@ -1006,11 +1011,11 @@ cluster_injection_initialise(void)
 		return;
 
 	for (int i = 0; i < CLUSTER_INJECTION_COUNT; i++) {
-		pg_atomic_init_u64(&cluster_injection_points[i].hits, 0);
-		pg_atomic_init_u32(&cluster_injection_points[i].armed_type, CLUSTER_FAULT_NONE);
-		pg_atomic_init_u64(&cluster_injection_points[i].armed_param, 0);
-		pg_atomic_init_u32(&cluster_injection_points[i].skip_pending, 0);
-		pg_atomic_init_u32(&cluster_injection_points[i].skip_remaining, 0);
+		pg_atomic_init_u64(&cluster_injection_registry[i].hits, 0);
+		pg_atomic_init_u32(&cluster_injection_registry[i].armed_type, CLUSTER_FAULT_NONE);
+		pg_atomic_init_u64(&cluster_injection_registry[i].armed_param, 0);
+		pg_atomic_init_u32(&cluster_injection_registry[i].skip_pending, 0);
+		pg_atomic_init_u32(&cluster_injection_registry[i].skip_remaining, 0);
 	}
 	cluster_injection_initialised = true;
 }
@@ -1027,8 +1032,8 @@ cluster_injection_lookup(const char *name)
 		return NULL;
 
 	for (int i = 0; i < CLUSTER_INJECTION_COUNT; i++) {
-		if (strcmp(cluster_injection_points[i].name, name) == 0)
-			return &cluster_injection_points[i];
+		if (strcmp(cluster_injection_registry[i].name, name) == 0)
+			return &cluster_injection_registry[i];
 	}
 	return NULL;
 }
@@ -1385,7 +1390,7 @@ cluster_injection_get_state_at(int idx, const char **name_out, ClusterInjectFaul
 
 	cluster_injection_initialise();
 
-	p = &cluster_injection_points[idx];
+	p = &cluster_injection_registry[idx];
 
 	if (name_out != NULL)
 		*name_out = p->name;
@@ -1521,7 +1526,7 @@ cluster_injection_assign_hook(const char *newval, void *extra)
 			continue;
 		}
 		cluster_injection_arm_internal(p, arm_type, arm_param);
-		seen[p - cluster_injection_points] = true;
+		seen[p - cluster_injection_registry] = true;
 		(void)last_type; /* silence unused under -Wunused-variable on some builds */
 	}
 
@@ -1537,8 +1542,9 @@ cluster_injection_assign_hook(const char *newval, void *extra)
 	for (int i = 0; i < CLUSTER_INJECTION_COUNT; i++) {
 		if (seen[i])
 			continue;
-		if (pg_atomic_read_u32(&cluster_injection_points[i].armed_type) == CLUSTER_FAULT_WARNING) {
-			cluster_injection_arm_internal(&cluster_injection_points[i], CLUSTER_FAULT_NONE, 0);
+		if (pg_atomic_read_u32(&cluster_injection_registry[i].armed_type)
+			== CLUSTER_FAULT_WARNING) {
+			cluster_injection_arm_internal(&cluster_injection_registry[i], CLUSTER_FAULT_NONE, 0);
 		}
 	}
 }
@@ -1672,7 +1678,7 @@ cluster_get_injection_state(PG_FUNCTION_ARGS)
 		cluster_injection_initialise();
 
 		for (int i = 0; i < CLUSTER_INJECTION_COUNT; i++) {
-			ClusterInjectPoint *p = &cluster_injection_points[i];
+			ClusterInjectPoint *p = &cluster_injection_registry[i];
 			Datum values[4];
 			bool nulls[4] = { false, false, false, false };
 			uint32 t;

@@ -34,8 +34,10 @@
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_clean_leave.h" /* RF-ROOT P6: leaver write-refusal gate */
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_ges.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_lock_owner.h"
 #include "miscadmin.h" /* AmStartupProcess / AmCheckpointerProcess */
 #include "storage/fd.h"
 #include "storage/lock.h"
@@ -47,17 +49,24 @@
  * release can target the exact GRD holder + request_id the acquire
  * registered.  `coordinated` is false when the acquire returned OK_NATIVE
  * (cluster/LMS layer inactive): nothing was registered in the GRD, so the
- * release must not run S6 against a phantom holder.  There is one slot per
- * mode (X / S); CF is not reentrant within a backend for a given mode.
+ * release must not run S6 against a phantom holder.  `release_pending` revokes
+ * local authority before S6 can yield or throw, without forgetting a possibly
+ * live remote holder.  There is one slot per mode (X / S); CF is not reentrant
+ * within a backend for a given mode.
  */
 typedef struct CfHoldState {
 	bool held;
 	bool coordinated;
-	ClusterLockAcquireRequest req; /* resid + holder + request_id for release */
+	bool release_pending;
+	const void *caller;		/* Process-local task lifetime, never remote authority. */
+	ClusterLockOwner owner; /* Stable S5/reconstruction/S6 ownership. */
 } CfHoldState;
 
 static CfHoldState cf_hold_x;
 static CfHoldState cf_hold_s;
+static uint64 cf_retired_x, cf_retired_s;
+
+static ClusterCfReleaseResult cf_unlock(LOCKMODE mode, const void *caller);
 
 /*
  * spec-5.6: set while this process is the bootstrap single-node authority
@@ -115,12 +124,22 @@ cluster_cf_resid_encode(ClusterResId *dst)
 /*
  * cluster_cf_lock -- acquire the singleton CF lock in `mode` via GES.
  */
-bool
-cluster_cf_lock(LOCKMODE mode)
+static bool
+cf_lock(LOCKMODE mode, bool cooperative, const void *caller)
 {
-	ClusterLockAcquireRequest req;
 	ClusterLockAcquireResult r;
 	CfHoldState *slot = cf_slot(mode);
+	ClusterLockAcquireRequest *req = &slot->owner.request;
+	const ClusterGesTimeoutDetail *timeout;
+	bool resume;
+
+	/* Several duties share an auxiliary process. Only the initiating duty
+	 * may resume its pending request or drain its old hold. This check must
+	 * precede every poll/release, including the legacy stale-hold cleanup. */
+	if (slot->held && slot->caller != caller)
+		return false;
+	resume = cooperative && slot->held && slot->owner.cooperative_acquire
+			 && slot->owner.state == CLUSTER_LOCK_OWNER_ACQUIRING;
 
 	/*
 	 * RF-ROOT P6 (shutdown-handoff wiring, "stop new local CF requests"):
@@ -155,8 +174,8 @@ cluster_cf_lock(LOCKMODE mode)
 	 * (native) hold drains to NOT_HELD with the slot cleared, which is
 	 * equally safe to proceed from.
 	 */
-	if (slot->held) {
-		ClusterCfReleaseResult drain = cluster_cf_unlock_confirmed(mode);
+	if (slot->held && !resume) {
+		ClusterCfReleaseResult drain = cf_unlock(mode, caller);
 
 		if (drain == CLUSTER_CF_RELEASE_UNCONFIRMED) {
 			ereport(LOG, (errmsg("cluster CF acquire refused: stale held slot could "
@@ -165,23 +184,41 @@ cluster_cf_lock(LOCKMODE mode)
 			return false;
 		}
 	}
+	if (resume)
+		goto acquire;
 	Assert(!slot->held);
 
-	memset(&req, 0, sizeof(req));
-	cluster_cf_resid_encode(&req.resid);
+	memset(req, 0, sizeof(*req));
+	cluster_cf_resid_encode(&req->resid);
 	/* locktag left zeroed: not LOCKTAG_ADVISORY, so normal blocking semantics. */
-	req.lockmode = mode;
-	req.op = CLUSTER_LOCK_OP_REQUEST; /* CF never converts (X/S independent) */
-	req.current_mode = NoLock;
-	req.lockmethod_id = DEFAULT_LOCKMETHOD;
-	req.dontwait = false; /* block until granted or timeout */
-	req.sessionLock = false;
-	req.caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
+	req->lockmode = mode;
+	req->op = CLUSTER_LOCK_OP_REQUEST; /* CF never converts (X/S independent) */
+	req->current_mode = NoLock;
+	req->lockmethod_id = DEFAULT_LOCKMETHOD;
+	req->dontwait = false; /* block until granted or timeout */
+	req->sessionLock = false;
+	req->caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
 	/* spec-5.6 Dc4b: bound the CF acquire wait and label it ClusterCfEnqueueWait. */
-	req.timeout_ms = cluster_cf_enqueue_timeout_ms;
-	req.wait_event = WAIT_EVENT_CLUSTER_CF_ENQUEUE;
+	req->timeout_ms = cluster_cf_enqueue_timeout_ms;
+	req->wait_event = WAIT_EVENT_CLUSTER_CF_ENQUEUE;
 
-	r = cluster_lock_acquire_seven_step(&req);
+	/* Visible cleanup responsibility precedes every possible S3/S4 mutation;
+	 * usable authority still requires the owned S5 completion. */
+	slot->held = slot->coordinated = slot->release_pending = true;
+	slot->caller = caller;
+acquire:
+	PG_TRY();
+	{
+		r = cooperative ? cluster_lock_owner_acquire_poll(&slot->owner)
+						: cluster_lock_owner_acquire(&slot->owner);
+	}
+	PG_CATCH();
+	{
+		if (slot->owner.state == CLUSTER_LOCK_OWNER_EMPTY)
+			memset(slot, 0, sizeof(*slot));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	switch (r) {
 	case CLUSTER_LOCK_ACQUIRE_OK_NATIVE:
@@ -193,7 +230,7 @@ cluster_cf_lock(LOCKMODE mode)
 			 */
 		slot->held = true;
 		slot->coordinated = false;
-		slot->req = req;
+		slot->release_pending = false;
 		cluster_cf_counter_inc(mode == ExclusiveLock ? CLUSTER_CF_X_ACQUIRE : CLUSTER_CF_S_ACQUIRE);
 		return true;
 
@@ -201,23 +238,22 @@ cluster_cf_lock(LOCKMODE mode)
 	case CLUSTER_LOCK_ACQUIRE_OK_GRANTED:
 	case CLUSTER_LOCK_ACQUIRE_OK_CONVERTED:
 
-		/*
-			 * Granted at the cluster level.  CF has no PG-native heavyweight
-			 * lock to take, so run the S5 promote directly to turn the S3
-			 * reservation into a registered GRD holder (cross-node conflict
-			 * visibility).  S5 failure cancels the reservation (S7) and we
-			 * fail closed.
-			 */
-		if (cluster_lock_acquire_s5_promote(&req) != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
+		/* CF has no PG-native lock. Its stable owner already ran S5. */
+		if (!cluster_lock_owner_is_usable(&slot->owner)) {
 			cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
 			return false;
 		}
-		slot->held = true;
-		slot->coordinated = true;
-		slot->req = req; /* holder + request_id for the release */
+		slot->release_pending = false;
 		cluster_cf_counter_inc(mode == ExclusiveLock ? CLUSTER_CF_X_ACQUIRE : CLUSTER_CF_S_ACQUIRE);
 		return true;
 
+	case CLUSTER_LOCK_ACQUIRE_PENDING:
+		if (cooperative) {
+			if (slot->owner.state == CLUSTER_LOCK_OWNER_EMPTY)
+				memset(slot, 0, sizeof(*slot));
+			return false; /* Stable pending request, no new ID and no error. */
+		}
+		/* fall through */
 	default:
 
 		/*
@@ -226,9 +262,111 @@ cluster_cf_lock(LOCKMODE mode)
 			 * could not be proven held: fail closed.  The caller raises the
 			 * appropriate FATAL/ERROR (CF correctness).
 			 */
+		if (slot->owner.state == CLUSTER_LOCK_OWNER_EMPTY)
+			memset(slot, 0, sizeof(*slot));
 		cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
-		ereport(LOG, (errmsg("cluster CF acquire failed (mode %d, result %d)", (int)mode, (int)r)));
+		timeout = r == CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT ? cluster_ges_timeout_detail_get() : NULL;
+		ereport(
+			LOG,
+			(errmsg("cluster CF acquire failed (mode %d, result %d)", (int)mode, (int)r),
+			 errdetail("PGRAC_FAMILY=CF_ACQUIRE request=" UINT64_FORMAT " epoch=" UINT64_FORMAT
+					   " master_generation=" UINT64_FORMAT " owner_state=%d registration=%s"
+					   " timeout_source=%d timeout_master=%d elapsed_ms=%ld attempts=%d "
+					   "conflicts=%d timeout_ms=%d",
+					   req->request_id, req->holder.cluster_epoch, req->master_gen_snapshot,
+					   (int)slot->owner.state,
+					   req->registration_failure_reason != NULL ? req->registration_failure_reason
+																: "UNREPORTED",
+					   timeout != NULL ? (int)timeout->source : 0,
+					   timeout != NULL ? timeout->master_node : -1,
+					   timeout != NULL ? timeout->elapsed_ms : 0L,
+					   timeout != NULL ? timeout->attempts : 0,
+					   timeout != NULL ? timeout->conflict_holders : -1,
+					   timeout != NULL ? timeout->timeout_ms : 0)));
 		return false;
+	}
+}
+
+bool
+cluster_cf_lock(LOCKMODE mode)
+{
+	return cf_lock(mode, false, NULL);
+}
+
+bool
+cluster_cf_lock_poll(LOCKMODE mode)
+{
+	if (!cluster_shared_config || (MyBackendType != B_LMON && MyBackendType != B_LMS))
+		return false;
+	return cf_lock(mode, true, NULL);
+}
+
+bool
+cluster_cf_acquire_pending(LOCKMODE mode)
+{
+	CfHoldState *slot = cf_slot(mode);
+
+	return slot->held && slot->caller == NULL && slot->owner.cooperative_acquire
+		   && slot->owner.state == CLUSTER_LOCK_OWNER_ACQUIRING;
+}
+
+bool
+cluster_cf_lock_poll_owned(LOCKMODE mode, const void *caller)
+{
+	if (caller == NULL || !cluster_shared_config
+		|| (MyBackendType != B_LMON && MyBackendType != B_LMS))
+		return false;
+	return cf_lock(mode, true, caller);
+}
+
+bool
+cluster_cf_acquire_pending_owned(LOCKMODE mode, const void *caller)
+{
+	CfHoldState *slot = cf_slot(mode);
+
+	return caller != NULL && slot->held && slot->caller == caller && slot->owner.cooperative_acquire
+		   && slot->owner.state == CLUSTER_LOCK_OWNER_ACQUIRING;
+}
+
+bool
+cluster_cf_held_by(LOCKMODE mode, const void *caller)
+{
+	CfHoldState *slot = cf_slot(mode);
+
+	return caller != NULL && slot->held && slot->caller == caller;
+}
+
+ClusterCfReleaseResult
+cluster_cf_unlock_owned(LOCKMODE mode, const void *caller)
+{
+	return caller != NULL ? cf_unlock(mode, caller) : CLUSTER_CF_RELEASE_UNCONFIRMED;
+}
+
+uint64
+cluster_cf_owner_cookie(LOCKMODE mode)
+{
+	CfHoldState *slot = cf_slot(mode);
+
+	return slot->held && slot->coordinated && slot->owner.shared
+			   ? slot->owner.request.control_owner_id
+			   : 0;
+}
+
+bool
+cluster_cf_release_completed(LOCKMODE mode, uint64 cookie)
+{
+	Assert(mode == ShareLock || mode == ExclusiveLock);
+	return cookie != 0 && cookie == (mode == ShareLock ? cf_retired_s : cf_retired_x);
+}
+
+static void
+cf_note_retired(LOCKMODE mode, uint64 cookie)
+{
+	if (cookie != 0) {
+		if (mode == ShareLock)
+			cf_retired_s = cookie;
+		else
+			cf_retired_x = cookie;
 	}
 }
 
@@ -238,22 +376,17 @@ cluster_cf_lock(LOCKMODE mode)
 void
 cluster_cf_unlock(LOCKMODE mode)
 {
+	/* Legacy callers cannot consume a verdict, but must retain cleanup duty. */
+	(void)cluster_cf_unlock_confirmed(mode);
+}
+
+bool
+cluster_cf_held_is_usable(LOCKMODE mode)
+{
 	CfHoldState *slot = cf_slot(mode);
 
-	if (!slot->held)
-		return;
-
-	/*
-	 * Release the exact GRD holder the acquire registered, draining + waking
-	 * any blocked cross-node waiters (S6).  Use the captured request (CF
-	 * resid + holder + request_id) rather than cluster_lock_release(), which
-	 * re-derives the resid from a PG LOCKTAG that CF does not have.
-	 */
-	if (slot->coordinated)
-		(void)cluster_lock_acquire_s6_release(&slot->req);
-
-	slot->held = false;
-	slot->coordinated = false;
+	return slot->held && !slot->release_pending
+		   && (!slot->coordinated || cluster_lock_owner_is_usable(&slot->owner));
 }
 
 bool
@@ -261,34 +394,69 @@ cluster_cf_held_is_clusterwide(LOCKMODE mode)
 {
 	CfHoldState *slot = cf_slot(mode);
 
-	return slot->held && slot->coordinated;
+	return cluster_cf_held_is_usable(mode) && slot->coordinated;
 }
 
 ClusterCfReleaseResult
 cluster_cf_unlock_confirmed(LOCKMODE mode)
 {
+	return cf_unlock(mode, NULL);
+}
+
+static ClusterCfReleaseResult
+cf_unlock(LOCKMODE mode, const void *caller)
+{
 	CfHoldState *slot = cf_slot(mode);
-	ClusterLockAcquireResult result;
+	uint64 cookie = cluster_cf_owner_cookie(mode);
 
 	if (!slot->held)
 		return CLUSTER_CF_RELEASE_NOT_HELD;
+	if (slot->caller != caller)
+		return CLUSTER_CF_RELEASE_UNCONFIRMED;
 	if (!slot->coordinated) {
-		slot->held = false;
-		slot->coordinated = false;
+		memset(slot, 0, sizeof(*slot));
 		return CLUSTER_CF_RELEASE_NOT_HELD;
 	}
 
-	result = cluster_lock_acquire_s6_release(&slot->req);
-	if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
+	/* S6 may remove the remote holder then lose its reply, or unwind on error.
+	 * Neither case permits another read/write under this old request. Keep
+	 * the exact identity visible to retirement, lock-order and stop checks. */
+	slot->release_pending = true;
+	if (!cluster_lock_owner_release(&slot->owner))
 		return CLUSTER_CF_RELEASE_UNCONFIRMED;
 
-	slot->held = false;
-	slot->coordinated = false;
+	cf_note_retired(mode, cookie);
+	memset(slot, 0, sizeof(*slot));
 	return CLUSTER_CF_RELEASE_CONFIRMED;
 }
 
+/* PGRAC: complete only an explicitly abandoned/releasing private slot.
+ * Service loops never wait for their own CONTROL work; a still-usable hold
+ * or an in-flight acquisition must remain with its caller.
+ * Author: SqlRush <sqlrush@gmail.com> */
+void
+cluster_cf_retirement_poll(void)
+{
+	CfHoldState *slots[2] = { &cf_hold_s, &cf_hold_x };
+	unsigned i;
+
+	if (!cluster_shared_config)
+		return;
+	for (i = 0; i < lengthof(slots); ++i) {
+		CfHoldState *slot = slots[i];
+		uint64 cookie = slot->owner.request.control_owner_id;
+
+		if (slot->held && slot->coordinated && slot->release_pending
+			&& slot->owner.state == CLUSTER_LOCK_OWNER_RETIRING
+			&& cluster_lock_owner_release_poll(&slot->owner)) {
+			cf_note_retired(i == 0 ? ShareLock : ExclusiveLock, cookie);
+			memset(slot, 0, sizeof(*slot));
+		}
+	}
+}
+
 /*
- * cluster_cf_held -- does this backend hold the CF lock in `mode`?
+ * cluster_cf_held -- does this backend retain ownership/cleanup in `mode`?
  */
 bool
 cluster_cf_held(LOCKMODE mode)
@@ -312,7 +480,8 @@ cluster_cf_set_bootstrap_authority(bool on)
 bool
 cluster_cf_write_permitted(void)
 {
-	return cluster_cf_held(ExclusiveLock) || cf_bootstrap_authority || cf_owner_eor_authority;
+	return cluster_cf_held_is_usable(ExclusiveLock) || cf_bootstrap_authority
+		   || cf_owner_eor_authority;
 }
 
 /*

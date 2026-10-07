@@ -13,6 +13,9 @@
 #include "catalog/catalog.h"
 #include "catalog/pg_class.h"
 #include "cluster/cluster_multixact_current.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_space_storage.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -35,6 +38,8 @@ volatile uint32 InterruptHoldoffCount;
 volatile uint32 CritSectionCount;
 int NBuffers = 1;
 int NLocBuffer;
+bool cluster_shared_config;
+int wal_level = WAL_LEVEL_REPLICA;
 static PGAlignedBlock current_page, selected_bytes, moved_page;
 char *BufferBlocks = current_page.data;
 Block *LocalBufferBlockPointers;
@@ -51,6 +56,9 @@ static TM_Result first_verdict, later_verdict;
 static int change_on_lock;
 static bool expect_error;
 static int error_count, assertion_count;
+static ClusterSpaceIdentity space_identity;
+static int identity_reads;
+static bool identity_available;
 
 static HeapTupleHeader
 current_tuple(void)
@@ -367,15 +375,42 @@ cluster_current_mx_operation_finish(ClusterCurrentMxOperationState *operation)
 /* The unchanged WAL mutation implementation is an external seam; verify
  * that the real finish consumer supplies the current target and retained X. */
 void
-heap_inplace_update_and_unlock(Relation relation, HeapTuple old, HeapTuple updated, Buffer buffer)
+heap_inplace_update_and_unlock(Relation relation, HeapTuple old, HeapTuple updated, Buffer buffer,
+							   const ClusterSpaceIdentity *identity)
 {
 	UT_ASSERT(content_locked);
 	UT_ASSERT(old->t_data == current_tuple());
 	UT_ASSERT(updated->t_data != current_tuple());
 	UT_ASSERT_EQ(pins, 1);
+	if (cluster_shared_config) {
+		UT_ASSERT(identity != NULL);
+		UT_ASSERT_EQ(identity->operation, (uint64)identity_reads);
+		UT_ASSERT_EQ(identity->key.locator.relNumber, 1259);
+	} else
+		UT_ASSERT(identity == NULL);
 	set_payload(old->t_data, payload(updated->t_data));
 	finishes++;
 	heap_inplace_unlock(relation, old, buffer);
+}
+
+bool
+cluster_space_relation_get_identity(Relation relation, ClusterSpaceIdentity *out)
+{
+	UT_ASSERT(relation == &rel && !content_locked && !tuple_locked);
+	UT_ASSERT_EQ(pins, 0);
+	UT_ASSERT_EQ(identity_reads, scans);
+	identity_reads++;
+	space_identity.operation = identity_reads;
+	*out = space_identity;
+	return identity_available;
+}
+
+int
+cluster_smgr_which_for(RelFileLocator locator, BackendId backend)
+{
+	UT_ASSERT_EQ(locator.relNumber, 1259);
+	UT_ASSERT_EQ(backend, InvalidBackendId);
+	return 1;
 }
 
 #include "test_cluster_heap_inplace_consumer.inc"
@@ -392,6 +427,13 @@ reset_case(bool materialized)
 	memset(tuple.data, 0, sizeof(tuple.data));
 	rel.rd_rel = &relform;
 	rel.rd_id = 1259;
+	rel.rd_locator = (RelFileLocator){ 1663, 5, 1259 };
+	relform.relpersistence = RELPERSISTENCE_PERMANENT;
+	memset(&space_identity, 0, sizeof(space_identity));
+	space_identity.key.locator = rel.rd_locator;
+	identity_reads = 0;
+	identity_available = true;
+	cluster_shared_config = false;
 	PageInit(current_page.data, BLCKSZ, 0);
 	header->t_hoff = MAXALIGN(SizeofHeapTupleHeader);
 	HeapTupleHeaderSetXmin(header, 900);
@@ -623,10 +665,56 @@ UT_TEST(corrupt_page_is_not_a_retry)
 	UT_ASSERT_EQ(visibility_calls, 0);
 	UT_ASSERT_EQ(finishes, 0);
 }
+UT_TEST(shared_identity_is_copied_before_scan_and_retained_until_finish)
+{
+	HeapTuple copy = NULL;
+	void *state = NULL;
+	reset_case(true);
+	cluster_shared_config = true;
+	if (!begin_case(&copy, &state))
+		return;
+	UT_ASSERT_EQ(identity_reads, 1);
+	space_identity.operation = 999;
+	set_payload(copy->t_data, 33);
+	systable_inplace_update_finish(state, copy);
+	UT_ASSERT_EQ(identity_reads, 1);
+	heap_freetuple(copy);
+	assert_released();
+}
+UT_TEST(shared_retry_renews_identity_and_cancel_does_not_mutate)
+{
+	HeapTuple copy = NULL;
+	void *state = NULL;
+	reset_case(true);
+	cluster_shared_config = true;
+	first_verdict = TM_Updated;
+	if (!begin_case(&copy, &state))
+		return;
+	UT_ASSERT_EQ(identity_reads, 2);
+	systable_inplace_update_cancel(state);
+	UT_ASSERT_EQ(finishes, 0);
+	UT_ASSERT_EQ(payload(current_tuple()), 22);
+	heap_freetuple(copy);
+	assert_released();
+}
+UT_TEST(shared_missing_identity_refuses_before_scanning)
+{
+	HeapTuple copy = NULL;
+	void *state = NULL;
+	reset_case(true);
+	cluster_shared_config = expect_error = true;
+	identity_available = false;
+	UT_ASSERT(!begin_case(&copy, &state));
+	UT_ASSERT_EQ(identity_reads, 1);
+	UT_ASSERT_EQ(scans, 0);
+	UT_ASSERT_EQ(reads, 0);
+	UT_ASSERT_EQ(finishes, 0);
+	assert_released();
+}
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(16);
 	UT_RUN(native_pinned_finish);
 	UT_RUN(materialized_finish_uses_current_not_owned_bytes);
 	UT_RUN(materialized_cancel_preserves_current);
@@ -640,6 +728,9 @@ main(void)
 	UT_RUN(parallel_prohibition_retained);
 	UT_RUN(invisible_verdict_still_errors);
 	UT_RUN(corrupt_page_is_not_a_retry);
+	UT_RUN(shared_identity_is_copied_before_scan_and_retained_until_finish);
+	UT_RUN(shared_retry_renews_identity_and_cancel_does_not_mutate);
+	UT_RUN(shared_missing_identity_refuses_before_scanning);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

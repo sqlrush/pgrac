@@ -196,6 +196,7 @@
 #include "cluster/cluster_mrp.h"   /* cluster_mrp_should_start (spec-6.4 D1) */
 #include "cluster/cluster_rfs.h"   /* cluster_rfs_should_start (spec-6.4 D3) */
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_shared_config.h" /* native family delivery, no process census */
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_undo_cleaner.h"
 #endif
@@ -523,6 +524,7 @@ static void CloseServerPorts(int status, Datum arg);
 static void unlink_external_pid_file(int status, Datum arg);
 static void getInstallationPaths(const char *argv0);
 static void checkControlFile(void);
+static void checkPostmasterGucCombinations(void);
 static Port *ConnCreate(int serverFd);
 static void ConnFree(Port *port);
 static void handle_pm_pmsignal_signal(SIGNAL_ARGS);
@@ -694,7 +696,7 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartWalWriter() StartChildProcess(WalWriterProcess)
 #define StartWalReceiver() StartChildProcess(WalReceiverProcess)
 #ifdef USE_PGRAC_CLUSTER
-#define StartLmon() StartChildProcess(LmonProcess)
+static pid_t StartLmon(void);
 #define StartLck() StartChildProcess(LckProcess)
 #define StartDiag() StartChildProcess(DiagProcess)
 #define StartClusterStats() StartChildProcess(ClusterStatsProcess)
@@ -760,6 +762,22 @@ NormalStopPostmasterPids(pid_t pids[NORMAL_STOP_AUX_COUNT])
 
 static bool NormalStopPostmasterRosterMatches(void);
 
+/* PGRAC: PRE2 needs the original service owners through its own shutdown
+ * barriers. The old four-member R4 hint is neither a PRE2 admission test nor
+ * a reason to terminate those actors early. This predicate selects only a
+ * process roster; the actual protocol/thread/voting proofs still decide
+ * whether shutdown is clean. Postmaster must not acquire shared locks here.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+NormalStopPostmasterNeedsRetention(void)
+{
+	return cluster_enabled
+		   && (cluster_shared_config
+			   || (cluster_conf_node_count() == 4
+				   && cluster_semantic_normal_stop_needs_retention()));
+}
+
 /* Before accepting a normal request, a transiently absent actor is a
  * rejected attempt, not an immutable (and already poisoned) roster. The
  * original server loop may finish starting actors before a later request.
@@ -770,8 +788,7 @@ NormalStopPostmasterPreselectReady(void)
 	pid_t pids[NORMAL_STOP_AUX_COUNT];
 
 	if (normal_stop_pm.selected || IsUnderPostmaster || !IsPostmasterEnvironment || FatalError
-		|| !cluster_enabled || cluster_conf_node_count() != 4
-		|| !cluster_semantic_normal_stop_needs_retention())
+		|| !NormalStopPostmasterNeedsRetention())
 		return true;
 	if (cluster_lms_workers < 1 || cluster_lms_workers > 8 || !cluster_lms_enabled
 		|| LmsWorkerPIDs[0] != 0)
@@ -807,8 +824,7 @@ NormalStopPostmasterBegin(void)
 		(void)NormalStopPostmasterRosterMatches();
 		return true; /* failure does not select a different attempt */
 	}
-	if (!cluster_enabled || cluster_conf_node_count() != 4
-		|| !cluster_semantic_normal_stop_needs_retention())
+	if (!NormalStopPostmasterNeedsRetention())
 		return false;
 	normal_stop_pm.selected = true;
 	normal_stop_pm.lms_workers = cluster_lms_workers;
@@ -1241,26 +1257,28 @@ PostmasterMain(int argc, char *argv[])
 	/* Verify that DataDir looks reasonable */
 	checkDataDir();
 
-	/* Check that pg_control exists */
-	checkControlFile();
+	/* PGRAC: a new-profile compatibility projection is neither an input nor
+	 * a prerequisite for the exact root reader. Even opening a FIFO here can
+	 * block that reader. Ordinary startup retains its native presence check. */
+#ifdef USE_PGRAC_CLUSTER
+	process_cluster_gucs();
+	if (!cluster_shared_config)
+#endif
+		checkControlFile();
 
 	/* And switch working directory into it */
 	ChangeToDataDir();
 
 	/*
-	 * Check for invalid combinations of GUC settings.
+	 * PGRAC: preserve ordinary startup's check order. The new shared profile
+	 * must instead check effective common+instance settings after root-bound
+	 * application, before loading modules or sizing shared memory.
+	 * Author: SqlRush <sqlrush@gmail.com>
 	 */
-	if (SuperuserReservedConnections + ReservedConnections >= MaxConnections) {
-		write_stderr("%s: superuser_reserved_connections (%d) plus reserved_connections (%d) must "
-					 "be less than max_connections (%d)\n",
-					 progname, SuperuserReservedConnections, ReservedConnections, MaxConnections);
-		ExitPostmaster(1);
-	}
-	if (XLogArchiveMode > ARCHIVE_MODE_OFF && wal_level == WAL_LEVEL_MINIMAL)
-		ereport(ERROR, (errmsg("WAL archival cannot be enabled when wal_level is \"minimal\"")));
-	if (max_wal_senders > 0 && wal_level == WAL_LEVEL_MINIMAL)
-		ereport(ERROR, (errmsg("WAL streaming (max_wal_senders > 0) requires wal_level \"replica\" "
-							   "or \"logical\"")));
+#ifdef USE_PGRAC_CLUSTER
+	if (!cluster_shared_config)
+#endif
+		checkPostmasterGucCombinations();
 
 	/*
 	 * Other one-time internal sanity checks can go here, if they are fast.
@@ -1322,6 +1340,22 @@ PostmasterMain(int argc, char *argv[])
 	 */
 	LocalProcessControlFile(false);
 
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config)
+	{
+		checkPostmasterGucCombinations();
+
+		/*
+		 * PGRAC: refuse a change to a parameter that the root-selected control
+		 * file recorded at creation before shared memory and any cluster
+		 * startup work, so that a refused start writes no voting disk,
+		 * formation, ROOT, WAL or control file.  Author: SqlRush
+		 * <sqlrush@gmail.com>
+		 */
+		ClusterRequireRecordedParameters();
+	}
+#endif
+
 	/*
 	 * Register the apply launcher.  It's probably a good idea to call this
 	 * before any modules had a chance to take the background worker slots.
@@ -1345,6 +1379,8 @@ PostmasterMain(int argc, char *argv[])
 	 * (FATAL) on a per-node, foreign, or torn control file.  This runs once in
 	 * the postmaster, before the startup process is forked and writes the
 	 * control file.  A no-op unless the authority is enabled (default off).
+	 * The shared-config profile instead retains the early ROOT selection and
+	 * registers its read-only catalog source; it never runs legacy migration.
 	 */
 	cluster_cf_startup_prepare(DataDir);
 
@@ -1352,7 +1388,9 @@ PostmasterMain(int argc, char *argv[])
 	 * PGRAC: spec-6.14 D2.  With the shared pg_control authority established
 	 * above, seed the shared catalog authorities (OID high-water) from it when
 	 * cluster.shared_catalog is on.  Seed node creates them; join node adopts.
-	 * No-op when shared_catalog is off (default).
+	 * No-op when shared_catalog is off (default).  The shared-config profile
+	 * only verifies the original creator's ROOT-selected objects and rechecks
+	 * that selection; it cannot seed or adopt an authority during startup.
 	 */
 	cluster_catalog_startup_prepare();
 #endif
@@ -1416,6 +1454,12 @@ PostmasterMain(int argc, char *argv[])
 	 * normally choose the same IPC keys.  This helps ensure that we will
 	 * clean up dead IPC objects if the postmaster crashes and is restarted.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: detached logger shares only this ephemeral config carrier.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config)
+		cluster_shared_config_delivery_start();
+#endif
 	CreateSharedMemoryAndSemaphores();
 
 #ifdef USE_PGRAC_CLUSTER
@@ -1957,6 +2001,31 @@ checkControlFile(void)
 		ExitPostmaster(2);
 	}
 	FreeFile(fp);
+}
+
+/* PGRAC: unchanged native rules, also used after shared settings application. */
+static void
+checkPostmasterGucCombinations(void)
+{
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: also cover catalog-only startup without a selected config image. */
+	if ((cluster_shared_config || cluster_shared_catalog)
+		&& wal_level == WAL_LEVEL_LOGICAL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("wal_level=logical is not supported in shared mode")));
+#endif
+	if (SuperuserReservedConnections + ReservedConnections >= MaxConnections) {
+		write_stderr("%s: superuser_reserved_connections (%d) plus reserved_connections (%d) must "
+					 "be less than max_connections (%d)\n",
+					 progname, SuperuserReservedConnections, ReservedConnections, MaxConnections);
+		ExitPostmaster(1);
+	}
+	if (XLogArchiveMode > ARCHIVE_MODE_OFF && wal_level == WAL_LEVEL_MINIMAL)
+		ereport(ERROR, (errmsg("WAL archival cannot be enabled when wal_level is \"minimal\"")));
+	if (max_wal_senders > 0 && wal_level == WAL_LEVEL_MINIMAL)
+		ereport(ERROR, (errmsg("WAL streaming (max_wal_senders > 0) requires wal_level \"replica\" "
+							   "or \"logical\"")));
 }
 
 /*
@@ -3753,6 +3822,7 @@ process_pm_child_exit(void)
 		 * Spec: spec-1.11-lmon-skeleton.md Sprint A D5 + HC5.
 		 */
 		if (pid == LmonPID) {
+			cluster_shared_config_delivery_lmon_reaped(pid);
 			LmonPID = 0;
 			if (!EXIT_STATUS_0(exitstatus))
 				HandleChildCrash(pid, exitstatus, _("LMON process"));
@@ -6421,6 +6491,19 @@ StartAutovacuumWorker(void)
 }
 
 #ifdef USE_PGRAC_CLUSTER
+/* PGRAC: one fork boundary for initial and normally respawned LMON. The
+ * corresponding native waitpid branch retires the old delivery writer.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static pid_t
+StartLmon(void)
+{
+	pid_t pid = StartChildProcess(LmonProcess);
+	if (pid > 0)
+		cluster_shared_config_delivery_lmon_started(pid);
+	return pid;
+}
+
 /*
  * cluster_postmaster_start_lmon -- spawn the LMON aux process.
  *

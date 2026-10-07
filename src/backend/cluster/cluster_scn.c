@@ -60,9 +60,12 @@
 #include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D2 profiling */
 #include "access/xlog.h"				   /* GetFlushRecPtr (spec-7.4 D1 walwriter discharge) */
 #include "miscadmin.h"
+#include "common/pgrac_initdb_wal.h"
+#include "cluster/cluster_wal_thread.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/timestamp.h"
+#include "utils/memutils.h"
 
 
 /*
@@ -239,6 +242,8 @@ StaticAssertDecl(sizeof(TimestampTz) == sizeof(uint64),
 
 
 static ClusterScnSharedState *cluster_scn_state = NULL;
+static bool initdb_base_scn_active;
+static void scn_initialize_state(NodeId node);
 static SCN cluster_scn_backend_pending_commit_scn = InvalidScn;
 /* spec-7.4 D1: this backend's in-flight durable-pending commit SCN. */
 static SCN cluster_scn_backend_durable_pending_scn = InvalidScn;
@@ -419,6 +424,36 @@ scn_check_wraparound_watermark(uint64 current)
  * Public API
  * ============================================================
  */
+
+bool
+cluster_scn_initdb_base_begin(void)
+{
+	const PgracInitdbWalContext *context = cluster_wal_thread_initdb_context();
+
+	if (IsUnderPostmaster || context == NULL || context->base_fd < 3 || context->thread_id != 1
+		|| context->phase != PGRAC_INITDB_WAL_POSTBOOTSTRAP || initdb_base_scn_active)
+		return false;
+	/* Bootstrap has no cluster shared-memory region. The original standalone
+	 * creator uses the same allocator/state initialization in private memory;
+	 * it never attaches this state to an admitted instance. */
+	if (cluster_scn_state == NULL) {
+		cluster_scn_state = MemoryContextAllocZero(TopMemoryContext, sizeof(*cluster_scn_state));
+		scn_initialize_state(-1);
+	}
+	if (cluster_scn_state->node_id != -1
+		|| pg_atomic_read_u64(&cluster_scn_state->current_local_scn) != 0
+		|| pg_atomic_read_u64(&cluster_scn_state->max_observed_remote_scn) != 0)
+		return false;
+	cluster_scn_state->node_id = 0;
+	initdb_base_scn_active = true;
+	return true;
+}
+
+SCN
+cluster_scn_initdb_base_current(void)
+{
+	return initdb_base_scn_active ? cluster_scn_current() : InvalidScn;
+}
 
 /*
  * cluster_scn_advance -- bump local SCN by 1 and return encoded SCN.
@@ -2368,73 +2403,78 @@ cluster_scn_shmem_size(void)
 	return sizeof(ClusterScnSharedState);
 }
 
+static void
+scn_initialize_state(NodeId node)
+{
+	LWLockInitialize(&cluster_scn_state->lwlock, LWTRANCHE_CLUSTER_SCN);
+	cluster_scn_state->node_id = node; /* may be -1; advance() rejects */
+	/* spec-1.17: current_local_scn / max_observed_remote_scn now atomic */
+	pg_atomic_init_u64(&cluster_scn_state->current_local_scn, 0);
+	pg_atomic_init_u64(&cluster_scn_state->max_observed_remote_scn, 0);
+	pg_atomic_init_u64(&cluster_scn_state->total_advance_count, 0);
+	cluster_scn_state->initialized_at = GetCurrentTimestamp();
+	cluster_scn_state->last_advance_at = 0;
+	/* spec-1.16 counters */
+	pg_atomic_init_u64(&cluster_scn_state->commit_advance_count, 0);
+	pg_atomic_init_u64(&cluster_scn_state->abort_advance_count, 0);
+	pg_atomic_init_u64(&cluster_scn_state->observe_bump_count, 0);
+	/* spec-1.17 BOC sweep stats */
+	pg_atomic_init_u64(&cluster_scn_state->boc_sweep_count, 0);
+	cluster_scn_state->boc_last_sweep_at = 0;
+	pg_atomic_init_u64(&cluster_scn_state->boc_last_sweep_local_scn, 0);
+	pg_atomic_init_u64(&cluster_scn_state->boc_max_batch_size, 0);
+	pg_atomic_init_u64(&cluster_scn_state->boc_last_batch_size, 0);
+	pg_atomic_init_u64(&cluster_scn_state->boc_broadcast_fanout_count, 0);
+	/* spec-7.4 D4: event-vs-sweep balance counters. */
+	pg_atomic_init_u64(&cluster_scn_state->boc_event_publish_count, 0);
+	pg_atomic_init_u64(&cluster_scn_state->boc_sweep_fallback_count, 0);
+	/* spec-2.11 D3: init skeleton-phase commit_scn lookup defer counter. */
+	pg_atomic_init_u64(&cluster_scn_state->commit_lookup_defer_count, 0);
+	/* spec-2.12 D2 init zero (TimestampTz raw bits + atomic counter). */
+	pg_atomic_init_u64(&cluster_scn_state->last_observe_at_us, 0);
+	pg_atomic_init_u64(&cluster_scn_state->observed_max_observe_gap_ms, 0);
+	cluster_scn_state->adg_pending_count = 0;
+	cluster_scn_state->adg_pending_overflowed = false;
+	memset(cluster_scn_state->adg_pending, 0, sizeof(cluster_scn_state->adg_pending));
+	pg_atomic_init_u64(&cluster_scn_state->adg_pending_register_count, 0);
+	pg_atomic_init_u64(&cluster_scn_state->adg_pending_clear_count, 0);
+	pg_atomic_init_u64(&cluster_scn_state->adg_pending_overflow_count, 0);
+	/* spec-7.4 D1: durable_safe_scn frontier registry. */
+	cluster_scn_state->durable_pending_count = 0;
+	cluster_scn_state->durable_frozen = false;
+	memset(cluster_scn_state->durable_pending_scn, 0,
+		   sizeof(cluster_scn_state->durable_pending_scn));
+	memset(cluster_scn_state->durable_pending_lsn, 0,
+		   sizeof(cluster_scn_state->durable_pending_lsn));
+	cluster_scn_state->durable_last_allocated = InvalidScn;
+	pg_atomic_init_u64(&cluster_scn_state->durable_safe_scn, InvalidScn);
+	pg_atomic_init_u64(&cluster_scn_state->durable_overflow_count, 0);
+	pg_atomic_init_u64(&cluster_scn_state->durable_regression_count, 0);
+	/* spec-7.4 D1: per-origin remote frontier cache + payload counters. */
+	{
+		int i;
+
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+			pg_atomic_init_u32(&cluster_scn_state->remote_durable_seq[i], 0);
+			cluster_scn_state->remote_durable_epoch[i] = 0;
+			cluster_scn_state->remote_durable_scn[i] = InvalidScn;
+		}
+	}
+	pg_atomic_init_u64(&cluster_scn_state->boc_payload_accept_count, 0);
+	pg_atomic_init_u64(&cluster_scn_state->boc_payload_bad_length_count, 0);
+	pg_atomic_init_u64(&cluster_scn_state->boc_payload_node_mismatch_count, 0);
+	pg_atomic_init_u64(&cluster_scn_state->boc_payload_regression_count, 0);
+	pg_atomic_init_u32(&cluster_scn_state->boc_event_dirty, 0);
+}
+
 void
 cluster_scn_shmem_init(void)
 {
 	bool found;
 
 	cluster_scn_state = ShmemInitStruct("pgrac cluster scn", cluster_scn_shmem_size(), &found);
-	if (!found) {
-		LWLockInitialize(&cluster_scn_state->lwlock, LWTRANCHE_CLUSTER_SCN);
-		cluster_scn_state->node_id = cluster_node_id; /* may be -1; advance() rejects */
-		/* spec-1.17: current_local_scn / max_observed_remote_scn now atomic */
-		pg_atomic_init_u64(&cluster_scn_state->current_local_scn, 0);
-		pg_atomic_init_u64(&cluster_scn_state->max_observed_remote_scn, 0);
-		pg_atomic_init_u64(&cluster_scn_state->total_advance_count, 0);
-		cluster_scn_state->initialized_at = GetCurrentTimestamp();
-		cluster_scn_state->last_advance_at = 0;
-		/* spec-1.16 counters */
-		pg_atomic_init_u64(&cluster_scn_state->commit_advance_count, 0);
-		pg_atomic_init_u64(&cluster_scn_state->abort_advance_count, 0);
-		pg_atomic_init_u64(&cluster_scn_state->observe_bump_count, 0);
-		/* spec-1.17 BOC sweep stats */
-		pg_atomic_init_u64(&cluster_scn_state->boc_sweep_count, 0);
-		cluster_scn_state->boc_last_sweep_at = 0;
-		pg_atomic_init_u64(&cluster_scn_state->boc_last_sweep_local_scn, 0);
-		pg_atomic_init_u64(&cluster_scn_state->boc_max_batch_size, 0);
-		pg_atomic_init_u64(&cluster_scn_state->boc_last_batch_size, 0);
-		pg_atomic_init_u64(&cluster_scn_state->boc_broadcast_fanout_count, 0);
-		/* spec-7.4 D4: event-vs-sweep balance counters. */
-		pg_atomic_init_u64(&cluster_scn_state->boc_event_publish_count, 0);
-		pg_atomic_init_u64(&cluster_scn_state->boc_sweep_fallback_count, 0);
-		/* spec-2.11 D3: init skeleton-phase commit_scn lookup defer counter. */
-		pg_atomic_init_u64(&cluster_scn_state->commit_lookup_defer_count, 0);
-		/* spec-2.12 D2 init zero (TimestampTz raw bits + atomic counter). */
-		pg_atomic_init_u64(&cluster_scn_state->last_observe_at_us, 0);
-		pg_atomic_init_u64(&cluster_scn_state->observed_max_observe_gap_ms, 0);
-		cluster_scn_state->adg_pending_count = 0;
-		cluster_scn_state->adg_pending_overflowed = false;
-		memset(cluster_scn_state->adg_pending, 0, sizeof(cluster_scn_state->adg_pending));
-		pg_atomic_init_u64(&cluster_scn_state->adg_pending_register_count, 0);
-		pg_atomic_init_u64(&cluster_scn_state->adg_pending_clear_count, 0);
-		pg_atomic_init_u64(&cluster_scn_state->adg_pending_overflow_count, 0);
-		/* spec-7.4 D1: durable_safe_scn frontier registry. */
-		cluster_scn_state->durable_pending_count = 0;
-		cluster_scn_state->durable_frozen = false;
-		memset(cluster_scn_state->durable_pending_scn, 0,
-			   sizeof(cluster_scn_state->durable_pending_scn));
-		memset(cluster_scn_state->durable_pending_lsn, 0,
-			   sizeof(cluster_scn_state->durable_pending_lsn));
-		cluster_scn_state->durable_last_allocated = InvalidScn;
-		pg_atomic_init_u64(&cluster_scn_state->durable_safe_scn, InvalidScn);
-		pg_atomic_init_u64(&cluster_scn_state->durable_overflow_count, 0);
-		pg_atomic_init_u64(&cluster_scn_state->durable_regression_count, 0);
-		/* spec-7.4 D1: per-origin remote frontier cache + payload counters. */
-		{
-			int i;
-
-			for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-				pg_atomic_init_u32(&cluster_scn_state->remote_durable_seq[i], 0);
-				cluster_scn_state->remote_durable_epoch[i] = 0;
-				cluster_scn_state->remote_durable_scn[i] = InvalidScn;
-			}
-		}
-		pg_atomic_init_u64(&cluster_scn_state->boc_payload_accept_count, 0);
-		pg_atomic_init_u64(&cluster_scn_state->boc_payload_bad_length_count, 0);
-		pg_atomic_init_u64(&cluster_scn_state->boc_payload_node_mismatch_count, 0);
-		pg_atomic_init_u64(&cluster_scn_state->boc_payload_regression_count, 0);
-		pg_atomic_init_u32(&cluster_scn_state->boc_event_dirty, 0);
-	}
+	if (!found)
+		scn_initialize_state(cluster_node_id);
 }
 
 static const ClusterShmemRegion cluster_scn_region = {

@@ -7,6 +7,9 @@
  * Written by Peter Eisentraut <peter_e@gmx.net>.
  *
  * src/include/utils/guc.h
+ *
+ * PGRAC MODIFICATIONS: native FILE reset helpers for shared configuration.
+ * Author: SqlRush <sqlrush@gmail.com>
  *--------------------------------------------------------------------
  */
 #ifndef GUC_H
@@ -363,6 +366,19 @@ extern const char *GetConfigOption(const char *name, bool missing_ok,
 extern const char *GetConfigOptionResetString(const char *name);
 extern int	GetConfigOptionFlags(const char *name, bool missing_ok);
 extern void ProcessConfigFile(GucContext context);
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: process-local outcomes, never node/cluster application ACKs. */
+typedef enum
+{
+	GUC_FILE_RESET_FAILED = 0,
+	GUC_FILE_RESET_DONE,
+	GUC_FILE_RESET_PENDING_RESTART,
+	GUC_FILE_RESET_DEFERRED
+} GucFileResetResult;
+extern GucFileResetResult ClusterResetConfigFileSetting(const char *name);
+extern void ClusterRestoreConfigFileDefaults(void);
+extern void ClusterConfigFilePending(uint32 *restart, uint32 *deferred);
+#endif
 extern char *convert_GUC_name_for_parameter_acl(const char *name);
 extern bool check_GUC_name_for_parameter_acl(const char *name);
 extern void InitializeGUCOptions(void);

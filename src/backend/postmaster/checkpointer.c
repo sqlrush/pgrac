@@ -41,15 +41,24 @@
 #include "access/xlogrecovery.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_cf_enqueue.h"
+/* PGRAC: auxiliary control-owner census. Author: SqlRush <sqlrush@gmail.com> */
+#include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_clean_leave.h" /* shutdown handoff drain (RF-ROOT P6) */
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_recovery_duty.h" /* thread clean-close publish (RF-ROOT P6) */
 #include "cluster/cluster_wal_state.h"
+#include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_shared_config.h" /* PGRAC: idle common-value retry */
+#include "cluster/cluster_pi_writeback.h"
+#include "cluster/cluster_ko.h"
+#include "../cluster/cluster_control_root_private.h"
 #endif
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
+#include "postmaster/startup.h"
 #include "replication/syncrep.h"
 #include "storage/bufmgr.h"
 #include "storage/condition_variable.h"
@@ -110,13 +119,24 @@
  * the requests fields are protected by CheckpointerCommLock.
  *----------
  */
-typedef struct
+typedef struct CheckpointerRequest
 {
 	SyncRequestType type;		/* request type */
 	FileTag		ftag;			/* file identifier */
 } CheckpointerRequest;
 
-typedef struct
+#ifdef USE_PGRAC_CLUSTER
+typedef enum StartupSyncState
+{
+	STARTUP_SYNC_IDLE,
+	STARTUP_SYNC_REQUESTED,
+	STARTUP_SYNC_RUNNING,
+	STARTUP_SYNC_DONE,
+	STARTUP_SYNC_FAILED
+} StartupSyncState;
+#endif
+
+typedef struct CheckpointerShmemStruct
 {
 	pid_t		checkpointer_pid;	/* PID (0 if not started) */
 
@@ -131,6 +151,14 @@ typedef struct
 	ConditionVariable start_cv; /* signaled when ckpt_started advances */
 	ConditionVariable done_cv;	/* signaled when ckpt_done advances */
 
+#ifdef USE_PGRAC_CLUSTER
+	/* File-sync completion only; never advances the checkpoint counters. */
+	uint64 startup_sync_request;
+	pid_t startup_sync_requester;
+	pid_t startup_sync_checkpointer;
+	StartupSyncState startup_sync_state;
+#endif
+
 	uint32		num_backend_writes; /* counts user backend buffer writes */
 	uint32		num_backend_fsync;	/* counts user backend fsync calls */
 
@@ -140,6 +168,12 @@ typedef struct
 } CheckpointerShmemStruct;
 
 static CheckpointerShmemStruct *CheckpointerShmem;
+
+#ifdef USE_PGRAC_CLUSTER
+static uint64 startup_sync_active_request;
+static void CheckpointerStartupSyncFinish(bool success);
+static void CheckpointerStartupSyncPoll(void);
+#endif
 
 /* interval for calling AbsorbSyncRequests in CheckpointWriteDelay */
 #define WRITES_PER_ABSORB		1000
@@ -287,6 +321,9 @@ CheckpointerMain(void)
 		 * files.
 		 */
 		LWLockReleaseAll();
+#ifdef USE_PGRAC_CLUSTER
+		CheckpointerStartupSyncFinish(false);
+#endif
 		ConditionVariableCancelSleep();
 		pgstat_report_wait_end();
 		UnlockBuffers();
@@ -367,6 +404,9 @@ CheckpointerMain(void)
 		pg_time_t	now;
 		int			elapsed_secs;
 		int			cur_timeout;
+#ifdef USE_PGRAC_CLUSTER
+		bool pi_pending = false;
+#endif
 
 		/* Clear any already-pending wakeups */
 		ResetLatch(MyLatch);
@@ -376,6 +416,17 @@ CheckpointerMain(void)
 		 */
 		AbsorbSyncRequests();
 		HandleCheckpointerInterrupts();
+
+#ifdef USE_PGRAC_CLUSTER
+		CheckpointerStartupSyncPoll();
+		/* PGRAC: a latch-only idle checkpoint loop must also advance owned
+		 * control cleanup. Author: SqlRush <sqlrush@gmail.com> */
+		cluster_cf_retirement_poll();
+		cluster_lock_owners_service_poll();
+		pi_pending = cluster_ko_shared_native_poll_v2();
+		AbsorbSyncRequests();
+		pi_pending = cluster_pi_writeback_checkpointer_tick_v1() || pi_pending;
+#endif
 
 		/*
 		 * Detect a pending checkpoint request by checking whether the flags
@@ -411,6 +462,12 @@ CheckpointerMain(void)
 		{
 			bool		ckpt_performed = false;
 			bool		do_restartpoint;
+
+#ifdef USE_PGRAC_CLUSTER
+			/* Native checkpoint owns the next ROOT/WALR operation. */
+			cluster_pi_writeback_checkpointer_release_v1();
+			pi_pending = false;
+#endif
 
 			/* Check if we should perform a checkpoint or a restartpoint. */
 			do_restartpoint = RecoveryInProgress();
@@ -561,10 +618,14 @@ CheckpointerMain(void)
 			cur_timeout = Min(cur_timeout, XLogArchiveTimeout - elapsed_secs);
 		}
 
-		(void) WaitLatch(MyLatch,
-						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						 cur_timeout * 1000L /* convert to ms */ ,
-						 WAIT_EVENT_CHECKPOINTER_MAIN);
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+#ifdef USE_PGRAC_CLUSTER
+						cluster_enabled && cluster_shared_config
+							? Min(cur_timeout * 1000L, pi_pending ? 100L : 1000L)
+							:
+#endif
+							cur_timeout * 1000L /* convert to ms */,
+						WAIT_EVENT_CHECKPOINTER_MAIN);
 	}
 }
 
@@ -595,6 +656,14 @@ HandleCheckpointerInterrupts(void)
 		 */
 		UpdateSharedMemoryConfig();
 	}
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: checkpoint/restartpoint has returned, including native ERROR
+	 * cleanup. Reread the current accepted image, never a saved old target;
+	 * other retained owners still prevent common-value application.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config_delivery_retry_idle())
+		UpdateSharedMemoryConfig();
+#endif
 	if (ShutdownRequestPending)
 	{
 #ifdef USE_PGRAC_CLUSTER
@@ -604,6 +673,7 @@ HandleCheckpointerInterrupts(void)
 		ClusterNormalStopModuleObservation normal_stop_observation;
 		ClusterPhase1FullStopPrepareResult phase1_full_stop_prepare_result;
 		ClusterPhase1FullStopPlan phase1_full_stop_plan;
+		cluster_pi_writeback_checkpointer_release_v1();
 #endif
 
 		/*
@@ -624,6 +694,11 @@ HandleCheckpointerInterrupts(void)
 		memset(&phase1_full_stop_plan, 0, sizeof(phase1_full_stop_plan));
 		memset(&normal_stop_observation, 0, sizeof(normal_stop_observation));
 		phase1_full_stop_prepare_result = CLUSTER_PHASE1_FULL_STOP_NOT_APPLICABLE;
+		/* PGRAC: the old single-leave fallback may generate WAL after the
+		 * shutdown checkpoint. PRE2 needs its retained producer cut first.
+		 * Author: SqlRush <sqlrush@gmail.com> */
+		if (cluster_shared_config && !current_normal_stop)
+			ereport(PANIC, (errmsg("PRE2 shutdown has no retained producer cut")));
 		if (current_normal_stop) {
 			/* This attempt was selected by the postmaster, not by a failed
 			 * pristine probe. Keep every original owner alive until its
@@ -669,7 +744,28 @@ HandleCheckpointerInterrupts(void)
 		 * reaches STOPPED.  Checkpoint + STOPPED first keeps every
 		 * fence-gated write inside the still-valid pre-handoff authority.
 		 */
-		if (current_normal_stop && cluster_normal_stop_native_wal_mode()) {
+		if (cluster_shared_config) {
+			ClusterWalSourceRef ref;
+			ClusterControlRootSnapshot stopped;
+			ClusterControlRootFileToken token;
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			/* The checkpoint already published the sole durable evidence.
+			 * Do not write or infer STOPPED in the old flat WAL registry. */
+			if (cluster_wal_thread_current_v2_ref(&ref)) {
+				for (;;) {
+					CHECK_FOR_INTERRUPTS();
+					result = cluster_control_root_v3_shutdown_observe(&ref, &stopped, &token);
+					if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
+						break;
+					/* Same owner retry as native checkpoint publication. The
+					 * observer released all CF/WALR holds before this wait. */
+					(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+									WAIT_EVENT_CHECKPOINTER_MAIN);
+					ResetLatch(MyLatch);
+				}
+			}
+			wal_stopped_ok = result == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		} else if (current_normal_stop && cluster_normal_stop_native_wal_mode()) {
 			int64 native_started_at;
 			wal_stopped_ok = cluster_native_wal_shutdown_observe(true, &native_started_at);
 		} else
@@ -863,6 +959,42 @@ ImmediateCheckpointRequested(void)
 	return false;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: interval of the shared PI writeback batch during the write phase. */
+#define CLUSTER_CHECKPOINT_PI_TICK_MS 100
+
+/*
+ * ClusterCheckpointWritePiTick -- advance the shared PI writeback batch
+ *		while this checkpoint writes its buffers.
+ *
+ * A storage-sourced exclusive grant waits for the past images that the
+ * batch retires; between loop iterations of CheckpointerMain alone it would
+ * stall for the whole spread checkpoint.  CheckPointGuts releases the batch
+ * when the write phase ends, so it never spans the sync phase or the
+ * checkpoint's own ROOT/WAL operations.  Shutdown and end-of-recovery
+ * checkpoints keep their own cut.
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+ClusterCheckpointWritePiTick(int flags)
+{
+	static TimestampTz last_tick = 0;
+	TimestampTz now;
+
+	if (!cluster_enabled || !cluster_shared_config || ShutdownRequestPending
+		|| (flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY)) != 0)
+		return;
+	now = GetCurrentTimestamp();
+	/* A clock correction must not suspend PI retirement until it catches up. */
+	if (last_tick != 0 && now >= last_tick
+		&& !TimestampDifferenceExceeds(last_tick, now, CLUSTER_CHECKPOINT_PI_TICK_MS))
+		return;
+	last_tick = now;
+	(void) cluster_pi_writeback_checkpointer_tick_v1();
+}
+#endif
+
 /*
  * CheckpointWriteDelay -- control rate of checkpoint
  *
@@ -875,6 +1007,12 @@ ImmediateCheckpointRequested(void)
  *
  * 'progress' is an estimate of how much of the work has been done, as a
  * fraction between 0.0 meaning none, and 1.0 meaning all done.
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: with cluster.shared_config the shared PI writeback batch
+ * advances here too (ClusterCheckpointWritePiTick).
+ * Why: otherwise past images wait for the whole checkpoint to retire, and so
+ * does every storage-sourced exclusive grant behind them.
  */
 void
 CheckpointWriteDelay(int flags, double progress)
@@ -931,6 +1069,11 @@ CheckpointWriteDelay(int flags, double progress)
 		AbsorbSyncRequests();
 		absorb_counter = WRITES_PER_ABSORB;
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: keep retiring past images during the write phase. */
+	ClusterCheckpointWritePiTick(flags);
+#endif
 
 	/* Check for barrier events. */
 	if (ProcSignalBarrierPending)
@@ -1113,6 +1256,111 @@ CheckpointerShmemInit(void)
  *	CHECKPOINT_CAUSE_XLOG: checkpoint is requested due to xlog filling.
  *		(This affects logging, and in particular enables CheckPointWarning.)
  */
+#ifdef USE_PGRAC_CLUSTER
+/* Keep file-sync requests with their existing owner. Startup owns the WAL
+ * checkpoint and ROOT publication after this receipt, not this process.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+CheckpointerStartupSyncFinish(bool success)
+{
+	bool notify = false;
+	if (startup_sync_active_request == 0)
+		return;
+	SpinLockAcquire(&CheckpointerShmem->ckpt_lck);
+	if (CheckpointerShmem->startup_sync_request == startup_sync_active_request
+		&& CheckpointerShmem->startup_sync_checkpointer == MyProcPid
+		&& CheckpointerShmem->startup_sync_state == STARTUP_SYNC_RUNNING) {
+		CheckpointerShmem->startup_sync_state = success ? STARTUP_SYNC_DONE : STARTUP_SYNC_FAILED;
+		notify = true;
+	}
+	SpinLockRelease(&CheckpointerShmem->ckpt_lck);
+	startup_sync_active_request = 0;
+	if (notify)
+		ConditionVariableBroadcast(&CheckpointerShmem->done_cv);
+}
+
+static void
+CheckpointerStartupSyncPoll(void)
+{
+	if (!cluster_shared_config || !AmCheckpointerProcess())
+		return;
+	SpinLockAcquire(&CheckpointerShmem->ckpt_lck);
+	if (CheckpointerShmem->startup_sync_state == STARTUP_SYNC_REQUESTED
+		&& CheckpointerShmem->startup_sync_checkpointer == MyProcPid) {
+		startup_sync_active_request = CheckpointerShmem->startup_sync_request;
+		CheckpointerShmem->startup_sync_state = STARTUP_SYNC_RUNNING;
+	}
+	SpinLockRelease(&CheckpointerShmem->ckpt_lck);
+	if (startup_sync_active_request == 0)
+		return;
+	if (!RecoveryInProgress() || ShutdownRequestPending) {
+		CheckpointerStartupSyncFinish(false);
+		return;
+	}
+	/* This includes requests already absorbed by this checkpointer, plus
+	 * the native queue cut taken inside ProcessSyncRequests. Later requests
+	 * and unlinks keep their native next-checkpoint retirement rules. */
+	ProcessSyncRequests();
+	CheckpointerStartupSyncFinish(true);
+}
+
+bool
+RequestStartupSync(void)
+{
+	uint64 request;
+	pid_t server;
+	bool success = false;
+	if (!cluster_enabled || !cluster_shared_config || !IsUnderPostmaster
+		|| MyBackendType != B_STARTUP || !AmStartupProcess() || MyProcPid <= 0
+		|| ShutdownRequestPending
+		|| !RecoveryInProgress() || CheckpointerShmem == NULL)
+		return false;
+	HandleStartupProcInterrupts();
+	SpinLockAcquire(&CheckpointerShmem->ckpt_lck);
+	server = CheckpointerShmem->checkpointer_pid;
+	if (server <= 0 || CheckpointerShmem->startup_sync_state != STARTUP_SYNC_IDLE
+		|| CheckpointerShmem->startup_sync_request == UINT64_MAX) {
+		SpinLockRelease(&CheckpointerShmem->ckpt_lck);
+		return false;
+	}
+	request = ++CheckpointerShmem->startup_sync_request;
+	CheckpointerShmem->startup_sync_requester = MyProcPid;
+	CheckpointerShmem->startup_sync_checkpointer = server;
+	CheckpointerShmem->startup_sync_state = STARTUP_SYNC_REQUESTED;
+	SpinLockRelease(&CheckpointerShmem->ckpt_lck);
+	if (kill(server, SIGINT) != 0)
+		return false;
+	ConditionVariablePrepareToSleep(&CheckpointerShmem->done_cv);
+	for (;;) {
+		StartupSyncState state;
+		bool exact;
+		/* Startup's SIGTERM flag is distinct from ShutdownRequestPending.
+		 * Its original exit path also cancels this auxiliary process's CV. */
+		HandleStartupProcInterrupts();
+		SpinLockAcquire(&CheckpointerShmem->ckpt_lck);
+		exact = CheckpointerShmem->startup_sync_request == request
+			&& CheckpointerShmem->startup_sync_requester == MyProcPid
+			&& CheckpointerShmem->startup_sync_checkpointer == server
+			&& CheckpointerShmem->checkpointer_pid == server;
+		state = CheckpointerShmem->startup_sync_state;
+		if (exact && (state == STARTUP_SYNC_DONE || state == STARTUP_SYNC_FAILED)) {
+			success = state == STARTUP_SYNC_DONE;
+			CheckpointerShmem->startup_sync_state = STARTUP_SYNC_IDLE;
+		}
+		SpinLockRelease(&CheckpointerShmem->ckpt_lck);
+		if (!exact || state == STARTUP_SYNC_DONE || state == STARTUP_SYNC_FAILED
+			|| ShutdownRequestPending)
+			break;
+		/* The timeout rechecks the same owner. It never proves completion. */
+		(void) ConditionVariableTimedSleep(&CheckpointerShmem->done_cv, 100,
+										   WAIT_EVENT_CHECKPOINT_DONE);
+	}
+	ConditionVariableCancelSleep();
+	HandleStartupProcInterrupts();
+	return success && !ShutdownRequestPending;
+}
+#endif
+
 void
 RequestCheckpoint(int flags)
 {

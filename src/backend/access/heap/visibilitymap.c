@@ -119,6 +119,14 @@
 #include "storage/smgr.h"
 #include "utils/inval.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "catalog/pg_control.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_page_cold_redo.h"
+#include "cluster/storage/cluster_smgr.h"
+#endif
+
 
 
 /*#define TRACE_VISIBILITYMAP */
@@ -152,7 +160,11 @@ static Buffer vm_readbuf(Relation rel, BlockNumber blkno, bool extend);
 static Buffer vm_extend(Relation rel, BlockNumber vm_nblocks);
 static void visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 									 XLogRecPtr recptr, Buffer vmBuf, TransactionId cutoff_xid,
-									 uint8 flags);
+									 uint8 flags
+#ifdef USE_PGRAC_CLUSTER
+									 , const ClusterSpaceIdentity *identity
+#endif
+									 );
 
 
 /*
@@ -184,6 +196,217 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
 
 	return cleared;
+}
+
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: VM has no items, special area, or ITL. The bitmap fills the page. */
+static bool
+vm_redo_page_valid(Page page)
+{
+	PageHeader header = (PageHeader) page;
+
+	return PageGetPageSize(page) == BLCKSZ &&
+		PageGetPageLayoutVersion(page) == PG_PAGE_LAYOUT_VERSION &&
+		header->pd_lower == MAXALIGN(SizeOfPageHeaderData) &&
+		header->pd_upper == BLCKSZ && header->pd_special == BLCKSZ &&
+		header->pd_prune_xid == InvalidTransactionId &&
+		(header->pd_flags & ~(PD_CLUSTER_FORCE_FPI | PD_LSN_ORIGIN_VALID | PD_LSN_ORIGIN_MASK)) == 0 &&
+		((header->pd_flags & PD_LSN_ORIGIN_VALID) != 0 ||
+		 (header->pd_flags & PD_LSN_ORIGIN_MASK) == 0) &&
+		header->pd_block_scn != 0;
+}
+
+/* PGRAC: apply the already-selected VM edge, not a runtime mutation. Global
+ * recovery isolation/dependency selection remain the executor's obligation.
+ * No numeric token/foreign LSN comparison, new identity, token, or WAL. */
+static void
+vm_image_versioned_redo(XLogReaderState *record, RelFileLocator locator,
+						BlockNumber heapBlk, uint8 flags, bool setting)
+{
+	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
+	ClusterSpaceIdentity identity;
+	ClusterColdRedoBlockV1 decision;
+	bool cold = false;
+	const RfPageVersionEdgeV1 *edge;
+	const RfPageVersionEdgeEntryV1 *entry = NULL;
+	PGAlignedBlock image;
+	Buffer buffer;
+	Page page;
+	int block_id = -1;
+	int i;
+	uint8 mask = flags << HEAPBLK_TO_OFFSET(heapBlk);
+
+	for (i = 0; i <= XLogRecMaxBlockId(record); i++)
+	{
+		DecodedBkpBlock *block;
+
+		if (!XLogRecHasBlockRef(record, i))
+			continue;
+		block = XLogRecGetBlock(record, i);
+		if (block->forknum != VISIBILITYMAP_FORKNUM || block->blkno != mapBlock ||
+			!RelFileLocatorEquals(block->rlocator, locator))
+			continue;
+		if (block_id != -1)
+			elog(ERROR, "shared VM redo has duplicate target images");
+		block_id = i;
+	}
+	/* A heap record can carry only a heap edge. Conversely, a pinned VM can
+	 * have a new recorded version even when its bits were already clear. */
+	if (block_id < 0 && flags == 0)
+		return;
+	if (block_id >= 0) {
+		if (!cluster_cold_redo_block_decision_v1(record, block_id, &decision)
+			|| (decision.action != CLUSTER_COLD_REDO_NATIVE && !cluster_page_cold_redo_active_v1))
+			elog(FATAL, "shared VM redo has no matching cold consumer");
+		if (decision.action == CLUSTER_COLD_REDO_SKIP) {
+			if (XLogReadBufferForRedoExtended(record, block_id, RBM_NORMAL, false, &buffer)
+					!= BLK_NOTFOUND
+				|| BufferIsValid(buffer))
+				elog(FATAL, "shared VM cold skip returned a buffer");
+			return;
+		}
+		cold = decision.action == CLUSTER_COLD_REDO_APPLY;
+	}
+	if (!RecoveryInProgress() || !XLogRecHasPageVersionEdge(record)
+		|| XLogRecPtrIsInvalid(record->EndRecPtr)
+		|| (!cold && !cluster_space_relation_read_redo_identity(locator, &identity)))
+		elog(ERROR, "shared VM redo requires restart SPACE identity and version edge");
+	edge = XLogRecGetPageVersionEdge(record);
+	for (i = 0; i < edge->entry_count; i++)
+	{
+		if (edge->entries[i].block_id != block_id)
+			continue;
+		if (entry != NULL)
+			elog(ERROR, "shared VM redo has duplicate version edges");
+		entry = &edge->entries[i];
+	}
+	if (block_id < 0 || entry == NULL || entry->page_class != RF_PAGE_CLASS_ORDINARY
+		|| entry->before_kind != RF_PAGE_STATE_PRESENT
+		|| entry->result_kind != RF_PAGE_STATE_PRESENT
+		|| entry->edge_flags != (RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE)
+		|| entry->component_ordinal != XLogRecGetBlock(record, block_id)->component_ordinal
+		|| entry->before.mutation_token == 0 || edge->result_token == 0
+		|| entry->before.mutation_token == edge->result_token
+		|| memcmp(entry->before.segment_incarnation,
+				  cold ? decision.result.segment_incarnation : identity.incarnation, 16)
+			   != 0
+		|| memcmp(entry->result_incarnation,
+				  cold ? decision.result.segment_incarnation : identity.incarnation, 16)
+			   != 0
+		|| (cold && edge->result_token != decision.result.mutation_token)
+		|| !XLogRecHasBlockImage(record, block_id) || !XLogRecBlockImageApply(record, block_id)
+		|| (XLogRecGetBlock(record, block_id)->flags & BKPBLOCK_WILL_INIT) != 0
+		|| !RestoreBlockImage(record, block_id, image.data) || !vm_redo_page_valid(image.data)
+		|| ((PageHeader)image.data)->pd_block_scn != edge->result_token
+		|| (PageGetContents(image.data)[HEAPBLK_TO_MAPBYTE(heapBlk)] & mask)
+			   != (setting ? mask : 0))
+		elog(ERROR, "shared VM redo has no exact recorded result image");
+
+	if (cold) {
+		/* The first visit replaces the whole VM image. A second heap target
+		 * may name the same image; its bits were validated above as well. */
+		if (!cluster_page_cold_redo_vm_image_applied_v1(record, block_id)) {
+			if (XLogReadBufferForRedoExtended(record, block_id, RBM_NORMAL, false, &buffer)
+					!= BLK_RESTORED
+				|| !BufferIsValid(buffer))
+				elog(FATAL, "shared VM cold redo did not restore its selected image");
+			UnlockReleaseBuffer(buffer);
+		}
+		return;
+	}
+
+	/* Unlike XLogReadBufferForRedo, this cannot restore the FPI before checking
+	 * its predecessor. Missing/zero/torn bases require the separate recovery
+	 * base/initialization owner; do not invent one from a fake Relation. */
+	buffer = XLogReadBufferExtended(locator, VISIBILITYMAP_FORKNUM, mapBlock,
+								   RBM_NORMAL, InvalidBuffer);
+	if (!BufferIsValid(buffer))
+		elog(ERROR, "shared VM redo is missing its versioned predecessor");
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buffer);
+	if (!vm_redo_page_valid(page) ||
+		(((PageHeader) page)->pd_block_scn != entry->before.mutation_token &&
+		 ((PageHeader) page)->pd_block_scn != edge->result_token))
+	{
+		UnlockReleaseBuffer(buffer);
+		elog(ERROR, "shared VM redo predecessor version does not match");
+	}
+	if (((PageHeader) page)->pd_block_scn == edge->result_token)
+	{
+		/* LSN, origin and checksum can legitimately differ after replay/write;
+		 * a matching token with different bitmap bytes is not an idempotent hit. */
+		bool same = memcmp(PageGetContents(page), PageGetContents(image.data), MAPSIZE) == 0;
+
+		UnlockReleaseBuffer(buffer);
+		if (!same)
+			elog(ERROR, "shared VM redo result token has different contents");
+		return;
+	}
+	START_CRIT_SECTION();
+	memcpy(page, image.data, BLCKSZ);
+	PageSetLSN(page, record->EndRecPtr);
+	/* The legacy merged-recovery LSN hook must not replace the result token. */
+	((PageHeader) page)->pd_block_scn = edge->result_token;
+	MarkBufferDirty(buffer);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(buffer);
+}
+
+bool
+visibilitymap_set_versioned_redo(XLogReaderState *record, RelFileLocator locator,
+								 BlockNumber heapBlk, uint8 flags)
+{
+	const DecodedBkpBlock *heap;
+	const DecodedBkpBlock *vm;
+	xl_heap_visible rec;
+
+	if (!cluster_shared_config || cluster_smgr_which_for(locator, InvalidBackendId) != 1)
+		return false;
+	if (XLogRecGetRmid(record) != RM_HEAP2_ID ||
+		(XLogRecGetInfo(record) & ~XLR_INFO_MASK) != XLOG_HEAP2_VISIBLE ||
+		!XLogRecHasBlockRef(record, 0) || !XLogRecHasBlockRef(record, 1) ||
+		XLogRecGetData(record) == NULL || XLogRecGetDataLen(record) != SizeOfHeapVisible)
+		elog(ERROR, "shared VM visible redo has invalid record shape");
+	heap = XLogRecGetBlock(record, 1);
+	vm = XLogRecGetBlock(record, 0);
+	memcpy(&rec, XLogRecGetData(record), SizeOfHeapVisible);
+	if ((flags != VISIBILITYMAP_ALL_VISIBLE && flags != VISIBILITYMAP_VALID_BITS) ||
+		(rec.flags & ~VISIBILITYMAP_XLOG_VALID_BITS) != 0 ||
+		(rec.flags & VISIBILITYMAP_VALID_BITS) != flags ||
+		heap->forknum != MAIN_FORKNUM || heap->blkno != heapBlk ||
+		!RelFileLocatorEquals(heap->rlocator, locator) ||
+		vm->forknum != VISIBILITYMAP_FORKNUM || vm->blkno != HEAPBLK_TO_MAPBLOCK(heapBlk) ||
+		!RelFileLocatorEquals(vm->rlocator, locator))
+		elog(ERROR, "shared VM visible redo has invalid set flags");
+	vm_image_versioned_redo(record, locator, heapBlk, flags, true);
+	return true;
+}
+#endif
+
+void
+visibilitymap_clear_redo(XLogReaderState *record, RelFileLocator locator,
+						 BlockNumber heapBlk, uint8 flags)
+{
+	Relation rel;
+	Buffer buffer = InvalidBuffer;
+
+	Assert(RecoveryInProgress());
+	Assert(flags == 0 || flags == VISIBILITYMAP_VALID_BITS || flags == VISIBILITYMAP_ALL_FROZEN);
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config && cluster_smgr_which_for(locator, InvalidBackendId) == 1)
+	{
+		vm_image_versioned_redo(record, locator, heapBlk, flags, false);
+		return;
+	}
+#endif
+	if (flags == 0)
+		return;
+	/* Preserve the native unversioned profile's implicit, conservative clear. */
+	rel = CreateFakeRelcacheEntry(locator);
+	visibilitymap_pin(rel, heapBlk, &buffer);
+	visibilitymap_clear(rel, heapBlk, buffer, flags);
+	ReleaseBuffer(buffer);
+	FreeFakeRelcacheEntry(rel);
 }
 
 bool
@@ -261,7 +484,7 @@ visibilitymap_pin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 	/* Reuse the old pinned buffer if possible */
 	if (BufferIsValid(*vmbuf))
 	{
-		if (BufferGetBlockNumber(*vmbuf) == mapBlock)
+		if (visibilitymap_pin_ok(heapBlk, *vmbuf))
 			return;
 
 		ReleaseBuffer(*vmbuf);
@@ -291,6 +514,15 @@ visibilitymap_pin_recent(Relation rel, BlockNumber heapBlk, Buffer recent_buffer
 	if (!ReadRecentBuffer(RelationGetSmgr(rel)->smgr_rlocator.locator,
 						  VISIBILITYMAP_FORKNUM, mapBlock, recent_buffer))
 		return false;
+#ifdef USE_PGRAC_CLUSTER
+	/* A read-only zero page has no versioned write base yet. Do not do I/O
+	 * below the caller's heap content lock; return to the original pin path. */
+	if (cluster_shared_config && PageIsNew(BufferGetPage(recent_buffer)))
+	{
+		ReleaseBuffer(recent_buffer);
+		return false;
+	}
+#endif
 	*vmbuf = recent_buffer;
 	return true;
 }
@@ -308,7 +540,13 @@ visibilitymap_pin_ok(BlockNumber heapBlk, Buffer vmbuf)
 {
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 
-	return BufferIsValid(vmbuf) && BufferGetBlockNumber(vmbuf) == mapBlock;
+	if (!BufferIsValid(vmbuf) || BufferGetBlockNumber(vmbuf) != mapBlock)
+		return false;
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config && PageIsNew(BufferGetPage(vmbuf)))
+		return false;
+#endif
+	return true;
 }
 
 /*
@@ -324,8 +562,10 @@ visibilitymap_pin_ok(BlockNumber heapBlk, Buffer vmbuf)
  * when a page that is already all-visible is being marked all-frozen.
  *
  * Caller is expected to set the heap page's PD_ALL_VISIBLE bit before calling
- * this function. Except in recovery, caller should also pass the heap
- * buffer. When checksums are enabled and we're not in recovery, we must add
+ * this function, except that the PGRAC shared producer sets it together with
+ * the VM bit after capturing both page versions. Except in recovery, caller
+ * should also pass the heap buffer. When checksums are enabled and we're not
+ * in recovery, we must add
  * the heap buffer to the WAL chain to protect it from being torn.
  *
  * You must pass a buffer containing the correct map page to this function.
@@ -335,46 +575,76 @@ visibilitymap_pin_ok(BlockNumber heapBlk, Buffer vmbuf)
 void
 visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 				  XLogRecPtr recptr, Buffer vmBuf, TransactionId cutoff_xid,
-				  uint8 flags)
+				  uint8 flags
+#ifdef USE_PGRAC_CLUSTER
+				  , const ClusterSpaceIdentity *identity
+#endif
+				  )
 {
 	if (!BufferIsValid(vmBuf) || !visibilitymap_pin_ok(heapBlk, vmBuf))
 		elog(ERROR, "wrong VM buffer passed to visibilitymap_set");
 	LockBuffer(vmBuf, BUFFER_LOCK_EXCLUSIVE);
-	visibilitymap_set_locked(rel, heapBlk, heapBuf, recptr, vmBuf, cutoff_xid, flags);
+	visibilitymap_set_locked(rel, heapBlk, heapBuf, recptr, vmBuf, cutoff_xid, flags
+#ifdef USE_PGRAC_CLUSTER
+							 , identity
+#endif
+							 );
 	LockBuffer(vmBuf, BUFFER_LOCK_UNLOCK);
 }
 
 bool
 visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr,
 							  Buffer *vmbuf, TransactionId cutoff_xid, uint8 flags,
-							  struct ResourceXAuxiliaryAcquireContext *context)
+							  struct ResourceXAuxiliaryAcquireContext *context
+#ifdef USE_PGRAC_CLUSTER
+							  , const ClusterSpaceIdentity *identity
+#endif
+							  )
 {
 	Assert(vmbuf != NULL && context != NULL);
 	if (!BufferIsValid(*vmbuf) || !visibilitymap_pin_ok(heapBlk, *vmbuf))
 		elog(ERROR, "wrong VM buffer passed to visibilitymap_set_retry_aware");
 	if (!ClusterLockBufferExclusiveAuxiliaryAware(vmbuf, context))
 		return false;
-	visibilitymap_set_locked(rel, heapBlk, heapBuf, recptr, *vmbuf, cutoff_xid, flags);
+	visibilitymap_set_locked(rel, heapBlk, heapBuf, recptr, *vmbuf, cutoff_xid, flags
+#ifdef USE_PGRAC_CLUSTER
+							 , identity
+#endif
+							 );
 	LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
 	return true;
 }
 
 static void
 visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr,
-						 Buffer vmBuf, TransactionId cutoff_xid, uint8 flags)
+						 Buffer vmBuf, TransactionId cutoff_xid, uint8 flags
+#ifdef USE_PGRAC_CLUSTER
+						 , const ClusterSpaceIdentity *identity
+#endif
+						 )
 {
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	uint32		mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
 	uint8		mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
 	Page		page;
 	uint8	   *map;
+#ifdef USE_PGRAC_CLUSTER
+	bool		versioned = cluster_shared_config && !InRecovery
+		&& rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
+	RfPageProducerBatchV1 versions;
+#endif
 
 #ifdef TRACE_VISIBILITYMAP
 	elog(DEBUG1, "vm_set %s %d", RelationGetRelationName(rel), heapBlk);
 #endif
 
 	Assert(InRecovery || XLogRecPtrIsInvalid(recptr));
-	Assert(InRecovery || PageIsAllVisible((Page) BufferGetPage(heapBuf)));
+	Assert(InRecovery
+#ifdef USE_PGRAC_CLUSTER
+		   || versioned
+#endif
+		   || PageIsAllVisible((Page) BufferGetPage(heapBuf)));
 	Assert((flags & VISIBILITYMAP_VALID_BITS) == flags);
 
 	/* Must never set all_frozen bit without also setting all_visible bit */
@@ -391,10 +661,38 @@ visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLog
 	page = BufferGetPage(vmBuf);
 	map = (uint8 *)PageGetContents(page);
 
-	if (flags != (map[mapByte] >> mapOffset & VISIBILITYMAP_VALID_BITS))
+	if (flags != (map[mapByte] >> mapOffset & VISIBILITYMAP_VALID_BITS)
+#ifdef USE_PGRAC_CLUSTER
+		|| (versioned && !PageIsAllVisible((Page) BufferGetPage(heapBuf)))
+#endif
+		)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: no SPACE I/O or visible-bit publication before both exact
+		 * before versions are captured. The caller already holds the heap
+		 * content lock; the wrapper acquired the VM lock outside critical. */
+		if (versioned)
+		{
+			Buffer buffers[2] = {vmBuf, heapBuf};
+			uint8 ids[2] = {0, 1};
+
+			if (!RelationNeedsWAL(rel)
+				|| !cluster_space_prepare_buffer_versions(identity, buffers, ids, 2,
+														 &versions))
+				elog(ERROR, "shared VM visible cannot capture exact page versions");
+		}
+#endif
 		START_CRIT_SECTION();
 
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned)
+		{
+			if (!rf_page_producer_stamp_v1(&versions))
+				elog(PANIC, "shared VM visible page version changed before publication");
+			PageSetAllVisible((Page) BufferGetPage(heapBuf));
+			MarkBufferDirty(heapBuf);
+		}
+#endif
 		map[mapByte] |= (flags << mapOffset);
 		MarkBufferDirty(vmBuf);
 
@@ -403,7 +701,11 @@ visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLog
 			if (XLogRecPtrIsInvalid(recptr))
 			{
 				Assert(!InRecovery);
-				recptr = log_heap_visible(rel, heapBuf, vmBuf, cutoff_xid, flags);
+				recptr = log_heap_visible(rel, heapBuf, vmBuf, cutoff_xid, flags
+#ifdef USE_PGRAC_CLUSTER
+										 , versioned ? &versions : NULL
+#endif
+										 );
 
 				/*
 				 * If data checksums are enabled (or wal_log_hints=on), we
@@ -414,7 +716,13 @@ visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLog
 				 * WAL record inserted above, so it would be incorrect to
 				 * update the heap page's LSN.
 				 */
-				if (XLogHintBitIsNeeded())
+				/* PGRAC: versioned heap changes retain normal FPI eligibility
+				 * in log_heap_visible even when hints need no WAL. */
+				if (XLogHintBitIsNeeded()
+#ifdef USE_PGRAC_CLUSTER
+					|| versioned
+#endif
+					)
 				{
 					Page		heapPage = BufferGetPage(heapBuf);
 
@@ -595,6 +903,19 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 		Buffer		mapBuffer;
 		Page		page;
 		char	   *map;
+#ifdef USE_PGRAC_CLUSTER
+		ClusterSpaceIdentity identity;
+		RfPageProducerBatchV1 version_batch;
+		bool		versioned = !InRecovery && cluster_shared_config &&
+			RelationIsPermanent(rel) &&
+			cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
+
+		/* PGRAC: resolve once before VM pin/content lock, not inside WAL. */
+		if (versioned &&
+			(!RelationNeedsWAL(rel) ||
+			 !cluster_space_relation_get_identity(rel, &identity)))
+			elog(ERROR, "shared VM truncation requires a live SPACE identity");
+#endif
 
 		newnblocks = truncBlock + 1;
 
@@ -610,8 +931,40 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 
 		LockBuffer(mapBuffer, BUFFER_LOCK_EXCLUSIVE);
 
+#ifdef USE_PGRAC_CLUSTER
+		/* A real zero VM tail already represents no visible blocks. Recheck
+		 * under authority, but do not create an unversioned dirty header. */
+		if (cluster_shared_config && PageIsNew(page))
+		{
+			UnlockReleaseBuffer(mapBuffer);
+			goto check_vm_size;
+		}
+		if (versioned)
+		{
+			uint8		block_id = 0;
+			bool		changed = ((uint8) map[truncByte] &
+								   ~((1 << truncOffset) - 1)) != 0;
+
+			for (uint32 i = truncByte + 1; !changed && i < MAPSIZE; i++)
+				changed = map[i] != 0;
+			if (!changed)
+			{
+				UnlockReleaseBuffer(mapBuffer);
+				goto check_vm_size;
+			}
+			if (!cluster_space_prepare_buffer_versions(&identity, &mapBuffer,
+													   &block_id, 1, &version_batch))
+				elog(ERROR, "shared VM truncation requires an exact predecessor");
+		}
+#endif
+
 		/* NO EREPORT(ERROR) from here till changes are logged */
 		START_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_stamp_v1(&version_batch))
+			elog(PANIC, "shared VM truncation predecessor changed");
+#endif
 
 		/* Clear out the unwanted bytes. */
 		MemSet(&map[truncByte + 1], 0, MAPSIZE - (truncByte + 1));
@@ -637,6 +990,22 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 		 * during recovery.
 		 */
 		MarkBufferDirty(mapBuffer);
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: preserve the complete bitmap and its before/result edge,
+		 * including configurations that need no native hint FPI. */
+		if (versioned)
+		{
+			XLogRecPtr recptr;
+
+			XLogBeginInsert();
+			XLogRegisterBuffer(0, mapBuffer, REGBUF_FORCE_IMAGE);
+			if (!rf_page_producer_register_wal_v1(&version_batch))
+				elog(PANIC, "shared VM truncation version registration failed");
+			recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
+			PageSetLSN(page, recptr);
+		}
+		else
+#endif
 		if (!InRecovery && RelationNeedsWAL(rel) && XLogHintBitIsNeeded())
 			log_newpage_buffer(mapBuffer, false);
 
@@ -647,6 +1016,9 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 	else
 		newnblocks = truncBlock;
 
+#ifdef USE_PGRAC_CLUSTER
+check_vm_size:
+#endif
 	if (smgrnblocks(RelationGetSmgr(rel), VISIBILITYMAP_FORKNUM) <= newnblocks)
 	{
 		/* nothing to do, the file was already smaller than requested size */
@@ -655,6 +1027,62 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 
 	return newnblocks;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+bool
+visibilitymap_prepare_cold_truncate(Relation rel, BlockNumber nheapblocks,
+								   BlockNumber *newnblocks)
+{
+	static const PGAlignedBlock zero;
+	BlockNumber truncBlock, current, result;
+	uint32 truncByte;
+	uint8 truncOffset;
+	SMgrRelation smgr;
+
+	if (rel == NULL || newnblocks == NULL || nheapblocks == InvalidBlockNumber
+		|| !cluster_shared_config || !RecoveryInProgress() || !RelationIsPermanent(rel)
+		|| cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) != 1)
+		return false;
+	smgr = RelationGetSmgr(rel);
+	if (!smgrexists(smgr, VISIBILITYMAP_FORKNUM)) {
+		*newnblocks = InvalidBlockNumber;
+		return true;
+	}
+	current = smgrnblocks(smgr, VISIBILITYMAP_FORKNUM);
+	truncBlock = HEAPBLK_TO_MAPBLOCK(nheapblocks);
+	truncByte = HEAPBLK_TO_MAPBYTE(nheapblocks);
+	truncOffset = HEAPBLK_TO_OFFSET(nheapblocks);
+	result = truncBlock;
+	if (truncByte != 0 || truncOffset != 0) {
+		result++;
+		if (truncBlock < current) {
+			Buffer buffer;
+			Page page;
+			bool clear;
+
+			/* No runtime pin initializer and no ZERO_ON_ERROR: this check
+			 * qualifies existing bytes for the structural owner only. */
+			buffer = ReadBufferExtended(rel, VISIBILITYMAP_FORKNUM, truncBlock, RBM_NORMAL, NULL);
+			LockBuffer(buffer, BUFFER_LOCK_SHARE);
+			page = BufferGetPage(buffer);
+			if (PageIsNew(page))
+				clear = memcmp(page, zero.data, BLCKSZ) == 0;
+			else {
+				const unsigned char *map = (unsigned char *)PageGetContents(page);
+
+				clear = (map[truncByte] & ~((1 << truncOffset) - 1)) == 0;
+				for (uint32 i = truncByte + 1; clear && i < MAPSIZE; i++)
+					clear = map[i] == 0;
+			}
+			UnlockReleaseBuffer(buffer);
+			if (!clear)
+				return false;
+		}
+	}
+	*newnblocks = current <= result ? InvalidBlockNumber : result;
+	return true;
+}
+#endif
 
 /*
  * Read a visibility map page.
@@ -667,30 +1095,28 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 {
 	Buffer		buf;
 	SMgrRelation reln;
+	bool		versioned = false;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceIdentity identity;
+
+	versioned = cluster_shared_config && RelationIsPermanent(rel)
+		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
+	/* Cache miss can read SPACE; resolve before any VM pin/content lock. */
+	if (versioned && extend
+		&& (!RelationNeedsWAL(rel) || !cluster_space_relation_get_identity(rel, &identity)))
+		elog(ERROR, "shared VM initialization requires a live SPACE identity");
+#endif
 
 	/*
 	 * Caution: re-using this smgr pointer could fail if the relcache entry
 	 * gets closed.  It's safe as long as we only do smgr-level operations
 	 * between here and the last use of the pointer.
 	 */
-	reln = RelationGetSmgr(rel);
-
 	/*
-	 * If we haven't cached the size of the visibility map fork yet, check it
-	 * first.
-	 */
-	if (reln->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] == InvalidBlockNumber)
-	{
-		if (smgrexists(reln, VISIBILITYMAP_FORKNUM))
-			smgrnblocks(reln, VISIBILITYMAP_FORKNUM);
-		else
-			reln->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = 0;
-	}
-
-	/*
-	 * For reading we use ZERO_ON_ERROR mode, and initialize the page if
-	 * necessary. It's always safe to clear bits, so it's better to clear
-	 * corrupt pages than error out.
+	 * The native profile uses ZERO_ON_ERROR and initializes when necessary.
+	 * The versioned shared profile must preserve the actual predecessor:
+	 * corrupt storage refuses, while genuine zero pages stay read-only until
+	 * their write-pin owner records a versioned initialization.
 	 *
 	 * We use the same path below to initialize pages when extending the
 	 * relation, as a concurrent extension can end up with vm_extend()
@@ -698,6 +1124,16 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 	 */
 	for (;;)
 	{
+		/* The init wait can release the pin and invalidate SMgr; reacquire
+		 * the original relation's mapping on every retry. */
+		reln = RelationGetSmgr(rel);
+		if (reln->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] == InvalidBlockNumber)
+		{
+			if (smgrexists(reln, VISIBILITYMAP_FORKNUM))
+				smgrnblocks(reln, VISIBILITYMAP_FORKNUM);
+			else
+				reln->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = 0;
+		}
 		if (blkno >= reln->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM])
 		{
 			if (extend)
@@ -707,7 +1143,12 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 		}
 		else
 			buf = ReadBufferExtended(rel, VISIBILITYMAP_FORKNUM, blkno,
-									 RBM_ZERO_ON_ERROR, NULL);
+									 versioned ? RBM_NORMAL : RBM_ZERO_ON_ERROR, NULL);
+
+		/* Reads of a genuine zero page already return an all-clear bitmap;
+		 * they must not create an unlogged/unversioned initialization. */
+		if (versioned && !extend)
+			return buf;
 
 		/*
 		 * Initializing the page when needed is trickier than it looks, because
@@ -723,7 +1164,17 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 			if (!BufferIsValid(buf))
 				continue;
 			if (PageIsNew(BufferGetPage(buf)))
-				PageInit(BufferGetPage(buf), BLCKSZ, 0);
+			{
+#ifdef USE_PGRAC_CLUSTER
+				if (versioned)
+				{
+					if (!cluster_space_init_vm_buffer_wal(&identity, buf))
+						elog(ERROR, "shared VM initialization requires a zero version base");
+				}
+				else
+#endif
+					PageInit(BufferGetPage(buf), BLCKSZ, 0);
+			}
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 		}
 		return buf;
@@ -738,12 +1189,21 @@ static Buffer
 vm_extend(Relation rel, BlockNumber vm_nblocks)
 {
 	Buffer		buf;
+	ReadBufferMode mode = RBM_ZERO_ON_ERROR;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: a concurrent extension can return an existing target page.
+	 * Corruption there must not be converted into a fresh zero predecessor. */
+	if (cluster_shared_config && RelationIsPermanent(rel) &&
+		cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1)
+		mode = RBM_NORMAL;
+#endif
 
 	buf = ExtendBufferedRelTo(BMR_REL(rel), VISIBILITYMAP_FORKNUM, NULL,
 							  EB_CREATE_FORK_IF_NEEDED |
 							  EB_CLEAR_SIZE_CACHE,
 							  vm_nblocks,
-							  RBM_ZERO_ON_ERROR);
+							  mode);
 
 	/*
 	 * Send a shared-inval message to force other backends to close any smgr

@@ -28,6 +28,7 @@
 #include "catalog/pg_inherits.h"
 #include "catalog/toasting.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_semantic_activation.h"
 #endif
 #include "commands/alter.h"
@@ -78,6 +79,173 @@
 
 /* Hook for plugins to get control in ProcessUtility() */
 ProcessUtility_hook_type ProcessUtility_hook = NULL;
+
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: inspect the complete user command before event triggers or DDL writes.
+ * Internal btree rebuilds (for example TRUNCATE) do not use a ReindexStmt.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+CheckClusterSharedUtilitySupport(Node *statement)
+{
+	const char *unsupported = NULL;
+	ObjectType object_type = OBJECT_TABLE;
+	ListCell *lc;
+
+	if (statement == NULL || (!cluster_shared_config && !cluster_shared_catalog))
+		return;
+	check_stack_depth();
+	switch (nodeTag(statement))
+	{
+		case T_TransactionStmt:
+			/* Prepared transactions do not yet own a durable shared-catalog
+			 * publication obligation. Reject before prepare or finish work. */
+			if (((TransactionStmt *) statement)->kind == TRANS_STMT_PREPARE
+				|| ((TransactionStmt *) statement)->kind == TRANS_STMT_COMMIT_PREPARED
+				|| ((TransactionStmt *) statement)->kind == TRANS_STMT_ROLLBACK_PREPARED)
+				unsupported = "two-phase transactions";
+			break;
+		case T_ClusterStmt:
+			unsupported = "CLUSTER";
+			break;
+		case T_CreatedbStmt:
+		case T_DropdbStmt:
+			unsupported = "CREATE/DROP DATABASE";
+			break;
+		case T_CreateTableSpaceStmt:
+		case T_DropTableSpaceStmt:
+			unsupported = "CREATE/DROP TABLESPACE";
+			break;
+		case T_CreateExtensionStmt:
+			unsupported = "CREATE EXTENSION";
+			break;
+		case T_CompositeTypeStmt:
+		case T_CreateDomainStmt:
+		case T_CreateEnumStmt:
+		case T_CreateRangeStmt:
+		case T_AlterDomainStmt:
+		case T_AlterEnumStmt:
+		case T_AlterTypeStmt:
+			unsupported = "custom types";
+			break;
+		case T_CreateOpClassStmt:
+		case T_CreateOpFamilyStmt:
+		case T_AlterOpFamilyStmt:
+		case T_AlterOperatorStmt:
+			unsupported = "custom operators";
+			break;
+		case T_DefineStmt:
+			object_type = ((DefineStmt *) statement)->kind;
+			break;
+		case T_CreateSubscriptionStmt:
+			/* Creation itself persists a replication origin. */
+			unsupported = "logical subscriptions";
+			break;
+		case T_RefreshMatViewStmt:
+			unsupported = "materialized views";
+			break;
+		case T_AlterTableMoveAllStmt:
+			unsupported = "ALTER TABLE SET TABLESPACE";
+			break;
+		case T_VacuumStmt:
+			foreach(lc, ((VacuumStmt *) statement)->options)
+			{
+				DefElem *option = lfirst_node(DefElem, lc);
+
+				if (strcmp(option->defname, "full") == 0 && defGetBoolean(option))
+					unsupported = "VACUUM FULL";
+			}
+			break;
+		case T_CreateStmt:
+			if (((CreateStmt *) statement)->relation != NULL
+				&& ((CreateStmt *) statement)->relation->relpersistence == RELPERSISTENCE_UNLOGGED)
+				unsupported = "UNLOGGED tables";
+			else if (((CreateStmt *) statement)->inhRelations != NIL)
+				/* CREATE ... INHERITS / PARTITION OF also attaches a child. */
+				unsupported = "partition and inheritance attachment";
+			break;
+		case T_CreateTableAsStmt:
+			{
+				CreateTableAsStmt *stmt = (CreateTableAsStmt *) statement;
+
+				if (stmt->objtype == OBJECT_MATVIEW)
+					unsupported = "materialized views";
+				else if (stmt->into != NULL && stmt->into->rel != NULL
+						 && stmt->into->rel->relpersistence == RELPERSISTENCE_UNLOGGED)
+					unsupported = "UNLOGGED tables";
+			}
+			break;
+		case T_AlterTableStmt:
+			object_type = ((AlterTableStmt *) statement)->objtype;
+			if (((AlterTableStmt *) statement)->objtype == OBJECT_MATVIEW)
+				unsupported = "materialized views";
+			else
+				foreach(lc, ((AlterTableStmt *) statement)->cmds)
+					CheckClusterSharedUtilitySupport((Node *) lfirst(lc));
+			break;
+		case T_AlterTableCmd:
+			if (((AlterTableCmd *) statement)->subtype == AT_SetUnLogged)
+				unsupported = "UNLOGGED tables";
+			else if (((AlterTableCmd *) statement)->subtype == AT_SetTableSpace)
+				unsupported = "ALTER TABLE SET TABLESPACE";
+			else if (((AlterTableCmd *) statement)->subtype == AT_AddInherit
+					 || ((AlterTableCmd *) statement)->subtype == AT_DropInherit
+					 || ((AlterTableCmd *) statement)->subtype == AT_AttachPartition
+					 || ((AlterTableCmd *) statement)->subtype == AT_DetachPartition
+					 || ((AlterTableCmd *) statement)->subtype == AT_DetachPartitionFinalize)
+				unsupported = "partition and inheritance attachment or detachment";
+			break;
+		case T_DropStmt:
+			object_type = ((DropStmt *) statement)->removeType;
+			break;
+		case T_RenameStmt:
+			object_type = ((RenameStmt *) statement)->renameType;
+			if (((RenameStmt *) statement)->relationType == OBJECT_TYPE
+				|| object_type == OBJECT_DOMCONSTRAINT)
+				object_type = OBJECT_TYPE;
+			if (((RenameStmt *) statement)->renameType == OBJECT_MATVIEW
+				|| ((RenameStmt *) statement)->relationType == OBJECT_MATVIEW)
+				unsupported = "materialized views";
+			break;
+		case T_AlterObjectSchemaStmt:
+			object_type = ((AlterObjectSchemaStmt *) statement)->objectType;
+			break;
+		case T_AlterOwnerStmt:
+			object_type = ((AlterOwnerStmt *) statement)->objectType;
+			break;
+		case T_CreateSchemaStmt:
+			foreach(lc, ((CreateSchemaStmt *) statement)->schemaElts)
+				CheckClusterSharedUtilitySupport((Node *) lfirst(lc));
+			break;
+		default:
+			break;
+	}
+	switch (object_type)
+	{
+		case OBJECT_MATVIEW:
+			unsupported = "materialized views";
+			break;
+		case OBJECT_TYPE:
+		case OBJECT_DOMAIN:
+			unsupported = "custom types";
+			break;
+		case OBJECT_OPERATOR:
+		case OBJECT_OPCLASS:
+		case OBJECT_OPFAMILY:
+			unsupported = "custom operators";
+			break;
+		case OBJECT_EXTENSION:
+			unsupported = "CREATE/DROP EXTENSION";
+			break;
+		default:
+			break;
+	}
+	if (unsupported != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("%s is not supported in shared mode", unsupported),
+				 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED")));
+}
+#endif
 
 /* local function declarations */
 static int	ClassifyUtilityCommandAsReadOnly(Node *parsetree);
@@ -604,6 +772,15 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	if (readOnlyTree)
 		pstmt = copyObject(pstmt);
 	parsetree = pstmt->utilityStmt;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: reject unsupported index AMs/constraints before event triggers.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	CheckClusterSharedUtilitySupport(parsetree);
+	CheckClusterIndexSupport(parsetree);
+	if (IsA(parsetree, AlterTableStmt))
+		CheckClusterSharedAlterTable((AlterTableStmt *) parsetree, queryString);
+#endif
 
 	/* Prohibit read/write commands in read-only states. */
 	readonly_flags = ClassifyUtilityCommandAsReadOnly(parsetree);

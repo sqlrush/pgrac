@@ -131,6 +131,24 @@ init_libpq_conn(PGconn *conn)
 				 PQresultErrorMessage(res));
 	PQclear(res);
 
+	/* PGRAC: inspect names, not file contents or pg_stat_file (which follows
+	 * symlinks). Damaged/dangling markers must still block copying this source
+	 * through native rewind. Query failures are fatal, never marker absence.
+	 * This runs before the caller can recover or modify its target.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	str = run_simple_query(
+		conn,
+		"SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_ls_dir('global', false, false) AS f "
+		"WHERE f IN ('pgrac_control_binding', 'pgrac_control_root', 'pgrac_control_root.bak')) "
+		"OR COALESCE(pg_catalog.current_setting('cluster.shared_config', true)::boolean, false)");
+	if (strcmp(str, "t") == 0)
+		pg_fatal(
+			"PGRAC_SHARED_CONTROL: native rewind is not supported for a shared-control source");
+	if (strcmp(str, "f") != 0)
+		pg_fatal("PGRAC_CONTROL_GUARD_UNKNOWN: unexpected source control inspection result");
+	pg_free(str);
+
 	/*
 	 * Also check that full_page_writes is enabled.  We can get torn pages if
 	 * a page is modified while we read it with pg_read_binary_file(), and we

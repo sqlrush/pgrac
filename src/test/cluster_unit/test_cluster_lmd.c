@@ -105,6 +105,9 @@ ErrorContextCallback *error_context_stack;
 static sigjmp_buf test_main_exit;
 static bool test_main_running;
 static bool test_probe_waiting;
+/* Legacy stop-loop fixture; PRE2 roster qualification uses the actual
+ * production member-mask body in the normal-stop unit program. */
+bool cluster_shared_config = false;
 static int test_main_case, test_main_waits, test_main_polls, test_main_scans;
 static int test_main_coord_scans;
 static int test_main_exit_code, test_error_level;
@@ -1002,6 +1005,22 @@ UT_TEST(test_stop_cancel_queue_only_original_dequeue_retires_wrapped_items)
 	UT_ASSERT_EQ(cluster_lmd_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
 }
 
+UT_TEST(test_cancel_queue_preserves_full_parallel_group_request)
+{
+	GesRequestPayload request = { 0 };
+	ClusterLmdCancelItem item = { 0 };
+
+	test_stop_lmd_reset();
+	request.opcode = GES_REQ_OPCODE_CANCEL_PENDING;
+	request.holder_procno = 71;
+	request.lock_group_procno_plus_one = 41;
+	UT_ASSERT(cluster_lmd_cancel_queue_enqueue(1, &request, sizeof(request)));
+	UT_ASSERT(cluster_lmd_cancel_queue_dequeue(&item));
+	UT_ASSERT_EQ(item.payload_len, sizeof(request));
+	if (item.payload_len == sizeof(request))
+		UT_ASSERT_EQ(memcmp(item.payload, &request, sizeof(request)), 0);
+}
+
 UT_TEST(test_stop_victim_ack_retains_exact_marker_and_original_send)
 {
 	ClusterGrdHolderId victim = { 0, 1, 17, 33 };
@@ -1285,7 +1304,7 @@ UT_TEST(test_lmd_pending_zero_wait_seq_awaits_remote_revalidation_result)
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(22);
+	UT_PLAN(23);
 
 	UT_RUN(test_lmd_auxproc_and_backend_type_surface);
 	UT_RUN(test_lmd_shmem_size_init_idempotent);
@@ -1299,6 +1318,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_lmd_anti_thrash_recent_victim_ring);
 	UT_RUN(test_stop_lmd_observations_belong_to_actual_lmd);
 	UT_RUN(test_stop_cancel_queue_only_original_dequeue_retires_wrapped_items);
+	UT_RUN(test_cancel_queue_preserves_full_parallel_group_request);
 	UT_RUN(test_stop_victim_ack_retains_exact_marker_and_original_send);
 	UT_RUN(test_stop_pending_cancel_requires_full_ack_identity_and_terminal_status);
 	UT_RUN(test_stop_private_last_slot_invalid_not_hidden_by_pending);

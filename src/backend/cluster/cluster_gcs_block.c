@@ -51,6 +51,7 @@
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server park/fetch */
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_block_redeclare.h"
 #include "cluster/cluster_lms_shard.h" /* PGRAC: spec-7.3 D4 — tag->worker shard */
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_gcs_reqid.h"		 /* PGRAC: spec-6.14a D1 — id domains */
@@ -76,6 +77,7 @@
 #include "cluster/cluster_xnode_lever.h" /* spec-6.12a — downgrade counters */
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_pi_rebuild.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_itl.h" /* spec-5.2 D11 — active-ITL writer-transfer guard */
 #include "cluster/cluster_ic_envelope.h"
@@ -1656,7 +1658,7 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
 					tag, out_page_lsn, (char *)scratch, out_sf_dep_vec);
 			else
 				copied = cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, (char *)scratch,
-														   out_copy_refusal);
+														   out_copy_refusal, NULL, NULL, 0);
 			if (!copied) {
 				if (smart_fusion_reply && out_copy_refusal != NULL)
 					*out_copy_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_SMART_FUSION_UNCLASSIFIED;
@@ -1690,7 +1692,8 @@ gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
 		if (out_sf_dep_valid != NULL)
 			*out_sf_dep_valid = true;
 		gcs_block_note_scratch_copy();
-	} else if (!cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, copy_buf, out_copy_refusal))
+	} else if (!cluster_bufmgr_copy_block_for_gcs(tag, out_page_lsn, copy_buf, out_copy_refusal,
+												  NULL, NULL, 0))
 		return false;
 	else
 		gcs_block_note_scratch_copy();
@@ -3168,6 +3171,9 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 								  cluster_node_id)));
 	*out_retry_denied = false;
+	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config, transition_id))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("cluster_gcs_send_block_request_and_wait: NULL BufferDesc"),
@@ -6445,6 +6451,9 @@ cluster_gcs_local_master_x_transfer_and_wait(BufferDesc *buf, const PcmAuthority
 								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 								  cluster_node_id)));
 	*out_retry_denied = false;
+	if (cluster_shared_config)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared X ownership requires Resource-X")));
 	holder_node = expected->x_holder_node;
 	if (expected->state != PCM_STATE_X || holder_node < 0 || holder_node >= 32
 		|| holder_node == cluster_node_id || expected->s_holders_bitmap != 0
@@ -7881,6 +7890,7 @@ gcs_block_current_mx_origin_sample_held(GcsBlockR4TxOriginContext *context)
 		ClusterCtrcTxnKeyV1 ctrc_key;
 		ClusterCtrcTouchResult touch_result;
 		bool ctrc_physical_active = false;
+		bool precommit_retry = false;
 		uint32 ctrc_grant = 0;
 
 		memset(&final_root, 0, sizeof(final_root));
@@ -7902,7 +7912,7 @@ gcs_block_current_mx_origin_sample_held(GcsBlockR4TxOriginContext *context)
 		memset(&result, 0, sizeof(result));
 		if (!cluster_runtime_visibility_physical_locator_sample_held(
 				&context->current_mx_locators[i], &context->admission, &context->guard,
-				&context->tt_root, &key, &result, &ctrc_physical_active))
+				&context->tt_root, &key, &result, &ctrc_physical_active, &precommit_retry))
 			return false;
 		context->current_mx_sampled_keys[i] = key;
 		if (!cluster_multixact_current_resolve_origin_member_proof(
@@ -7912,8 +7922,17 @@ gcs_block_current_mx_origin_sample_held(GcsBlockR4TxOriginContext *context)
 			return false;
 		if (context->current_mx_proofs[i].state == CCM_ACTIVE
 			|| context->current_mx_proofs[i].state == CCM_SELF) {
-			if (!ctrc_physical_active)
+			if (!ctrc_physical_active) {
+				if (!precommit_retry)
+					return false;
+				/* Canonical precommit is retryable, never an ACTIVE grant.
+				 * The owner must finish the existing release before replying. */
+				context->current_mx_result = CMX_RESOLVE_RETRY;
+				context->current_mx_proof_count = 0;
+				memset(context->current_mx_proofs, 0, sizeof(context->current_mx_proofs));
+				memset(context->current_mx_ctrc_keys, 0, sizeof(context->current_mx_ctrc_keys));
 				return false;
+			}
 			if (cluster_undo_block0_current_sample_generation(&context->guard, &context->tt_root,
 															  &generation)
 					!= CLUSTER_UNDO_BLOCK0_OK
@@ -8372,8 +8391,10 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 			context->guard_active = false;
 			context->outcome = CLUSTER_TX_UNKNOWN;
 			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
-			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+				context->current_mx_result = CMX_RESOLVE_UNKNOWN;
 				context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_RELEASE;
+			}
 			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
 		}
 		break;
@@ -8402,8 +8423,10 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 			context->guard_active = false;
 			context->outcome = CLUSTER_TX_UNKNOWN;
 			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
-			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+				context->current_mx_result = CMX_RESOLVE_UNKNOWN;
 				context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_RELEASE;
+			}
 			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
 		}
 		break;
@@ -8478,6 +8501,10 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 			context->guard_active = false;
 			context->outcome = CLUSTER_TX_UNKNOWN;
 			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+				context->current_mx_result = CMX_RESOLVE_UNKNOWN;
+				context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_RELEASE;
+			}
 			memset(&context->resolution, 0, sizeof(context->resolution));
 			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
 		}
@@ -8497,6 +8524,10 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 			context->guard_active = false;
 			context->outcome = CLUSTER_TX_UNKNOWN;
 			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+				context->current_mx_result = CMX_RESOLVE_UNKNOWN;
+				context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_RELEASE;
+			}
 			memset(&context->resolution, 0, sizeof(context->resolution));
 			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
 		}
@@ -9184,7 +9215,7 @@ gcs_block_resource_x_payload_candidate(uint8 msg_type, uint32 payload_length)
 	if (msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_PROOF_V1_BYTES
-			   || payload_length == RESOURCE_X_IMAGE_V1_BYTES;
+			   || payload_length == RESOURCE_X_IMAGE_V2_BYTES;
 	if (msg_type == RESOURCE_X_MSG_BLOCK_TO_N)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			   || payload_length == RESOURCE_X_PROOF_V1_BYTES;
@@ -9246,6 +9277,7 @@ gcs_block_resource_x_stage_ready_tag(const BufferTag *tag)
 		return;
 	for (call = 0; call < 16; call++) {
 		ResourceXIntentSlot intent;
+		ClusterLmsEnqueueResult enqueue_result;
 		uint32 connection_generation = 0;
 		uint64 now_us;
 		uint64 timeout_us;
@@ -9266,8 +9298,10 @@ gcs_block_resource_x_stage_ready_tag(const BufferTag *tag)
 		worker_id = cluster_lms_shard_for_tag(tag, cluster_lms_workers);
 		timeout_us = (uint64)Max(cluster_gcs_reply_timeout_ms, 1) * UINT64_C(1000);
 		deadline_us = now_us > UINT64_MAX - timeout_us ? UINT64_MAX : now_us + timeout_us;
-		if (!cluster_lms_outbound_enqueue_resource_x_intent(worker_id, &intent,
-															connection_generation, deadline_us))
+		enqueue_result = cluster_lms_outbound_enqueue_resource_x_intent(
+			worker_id, &intent, connection_generation, deadline_us);
+		if (enqueue_result != CLUSTER_LMS_ENQUEUE_ADMITTED
+			&& enqueue_result != CLUSTER_LMS_ENQUEUE_NOT_DUE)
 			(void)cluster_pcm_lock_resource_x_outbound_intent_not_admitted_exact(&intent, now_us);
 	}
 }
@@ -9293,7 +9327,8 @@ gcs_block_resource_x_gate_session_snapshot_result(const BufferTag *tag,
 		|| gate.phase != RESOURCE_X_GATE_OPEN)
 		return PCM_X_SESSION_AUTH_INVALID;
 	master_node = cluster_gcs_lookup_master(*tag);
-	if (master_node < 0 || master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
+	if (master_node < 0 || master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| cluster_grd_pi_rebuild_blocked_v1(*tag))
 		return PCM_X_SESSION_AUTH_INVALID;
 	if (gate_out != NULL)
 		*gate_out = gate;
@@ -9479,31 +9514,12 @@ static ResourceXApplyResult
 gcs_block_resource_x_assert_stage_exact(int32 master_node, const ResourceXDecodedFrame *assertion,
 										const ResourceXDecodedFrame *local_proof)
 {
-	uint8 assertion_payload[RESOURCE_X_CONTROL_V1_BYTES];
-	uint8 proof_payload[RESOURCE_X_SHORT_V1_BYTES];
-	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint16 assertion_bytes = 0;
-	uint16 proof_bytes = 0;
-
-	if (master_node < 0 || master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || assertion == NULL
-		|| !cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, assertion, assertion_payload,
-										   sizeof(assertion_payload), &assertion_bytes, &reject)
-		|| assertion_bytes != RESOURCE_X_CONTROL_V1_BYTES)
-		return RESOURCE_X_APPLY_INVALID;
-	if (local_proof != NULL
-		&& (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, local_proof, proof_payload,
-											sizeof(proof_payload), &proof_bytes, &reject)
-			|| proof_bytes != RESOURCE_X_SHORT_V1_BYTES))
-		return RESOURCE_X_APPLY_INVALID;
-	if (!cluster_grd_outbound_enqueue_backend_msg(RESOURCE_X_MSG_ASSERT_X, master_node,
-												  assertion_payload, assertion_bytes))
-		return RESOURCE_X_APPLY_BAD_STATE;
-	if (local_proof == NULL)
-		return RESOURCE_X_APPLY_APPLIED;
-	return cluster_grd_outbound_enqueue_backend_msg(RESOURCE_X_MSG_ASSERT_X, master_node,
-													proof_payload, proof_bytes)
+	ClusterLmsEnqueueResult result
+		= cluster_lms_outbound_enqueue_resource_x_requester(master_node, assertion, local_proof);
+	return result == CLUSTER_LMS_ENQUEUE_ADMITTED || result == CLUSTER_LMS_ENQUEUE_NOT_DUE
 			   ? RESOURCE_X_APPLY_APPLIED
-			   : RESOURCE_X_APPLY_BAD_STATE;
+		   : result == CLUSTER_LMS_ENQUEUE_INVALID ? RESOURCE_X_APPLY_INVALID
+												   : RESOURCE_X_APPLY_BAD_STATE;
 }
 
 /* The kind-9 ASSERT keeps its wire-neutral observed mode, but an exact local
@@ -9734,18 +9750,13 @@ static bool
 gcs_block_resource_x_bootstrap_request_stage_exact(int32 master_node,
 												   const ResourceXDecodedFrame *request)
 {
-	uint8 payload[RESOURCE_X_CONTROL_V1_BYTES];
-	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint16 payload_bytes = 0;
-
+	ClusterLmsEnqueueResult result;
 	if (master_node < 0 || master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || request == NULL
-		|| gcs_block_resource_x_delivery_arm_exact(master_node, request) != RESOURCE_X_APPLY_APPLIED
-		|| !cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, request, payload,
-										   sizeof(payload), &payload_bytes, &reject)
-		|| payload_bytes != RESOURCE_X_CONTROL_V1_BYTES)
+		|| gcs_block_resource_x_delivery_arm_exact(master_node, request)
+			   != RESOURCE_X_APPLY_APPLIED)
 		return false;
-	return cluster_grd_outbound_enqueue_backend_msg(RESOURCE_X_MSG_ASSERT_X, (uint32)master_node,
-													payload, payload_bytes);
+	result = cluster_lms_outbound_enqueue_resource_x_requester(master_node, request, NULL);
+	return result == CLUSTER_LMS_ENQUEUE_ADMITTED || result == CLUSTER_LMS_ENQUEUE_NOT_DUE;
 }
 
 /* PGRAC adaptation: the master receipt API has already copied the exact ACK
@@ -9778,14 +9789,15 @@ static bool
 gcs_block_pcm_x_resource_x_build_source_frames(
 	const ResourceXDecodedFrame *block, const ClusterPcmOwnSnapshot *revoking,
 	const char page_bytes[BLCKSZ], XLogRecPtr page_lsn, uint64 page_scn,
-	uint32 requester_connection_generation, uint64 source_boot_incarnation, uint8 source_mode,
-	ResourceXDecodedFrame *status, ResourceXDecodedFrame *image)
+	const ClusterPageWalBindingV1 *page_wal, uint32 requester_connection_generation,
+	uint64 source_boot_incarnation, uint8 source_mode, ResourceXDecodedFrame *status,
+	ResourceXDecodedFrame *image)
 {
 	ResourceXDecodedFrame canonical_image;
 	ResourceXDecodedBlockedToN *blocked_body;
 	ResourceXDecodedImageEnvelope *image_body;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
-	uint8 encoded_image[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 encoded_image[RESOURCE_X_IMAGE_V2_BYTES];
 	uint16 encoded_bytes = 0;
 	uint64 source_carrier_generation;
 
@@ -9801,7 +9813,7 @@ gcs_block_pcm_x_resource_x_build_source_frames(
 	memset(image, 0, sizeof(*image));
 
 	image->kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
-	image->payload_bytes = RESOURCE_X_IMAGE_V1_BYTES;
+	image->payload_bytes = RESOURCE_X_IMAGE_V2_BYTES;
 	image->common = block->common;
 	image->common.action_node = block->common.logical_assertion.requester_node;
 	image->common.observed_mode = source_mode;
@@ -9836,10 +9848,14 @@ gcs_block_pcm_x_resource_x_build_source_frames(
 	image_body->image_length = BLCKSZ;
 	image_body->source_disposition = RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
 	image_body->proof_kind = RESOURCE_X_PROOF_REMOTE_CARRIER;
+	if (page_wal != NULL && page_wal->record_start != InvalidXLogRecPtr) {
+		image_body->image_flags = RESOURCE_X_IMAGE_HAS_WAL;
+		image_body->page_wal = *page_wal;
+	}
 	memcpy(image_body->page_bytes, page_bytes, BLCKSZ);
 	if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, image, encoded_image,
 										sizeof(encoded_image), &encoded_bytes, &reject)
-		|| encoded_bytes != RESOURCE_X_IMAGE_V1_BYTES
+		|| encoded_bytes != RESOURCE_X_IMAGE_V2_BYTES
 		|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, encoded_image,
 										   encoded_bytes, &canonical_image, &reject)
 		|| canonical_image.kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
@@ -9950,6 +9966,8 @@ gcs_block_resource_x_source_finish_owned(
 	MemoryContext error_context = CurrentMemoryContext;
 	ClusterPcmOwnFinishRefusal finish_refusal;
 	ClusterPcmOwnSnapshot retained;
+	ResourceXSourceWalRetainedV1 retained_wal;
+	const ResourceXSourceWalRetainedV1 *wal_proof = NULL;
 	ResourceXDecodedFrame status;
 	ResourceXDecodedFrame fault_image;
 	ResourceXApplyResult status_result;
@@ -9962,14 +9980,24 @@ gcs_block_resource_x_source_finish_owned(
 	memset(&retained, 0, sizeof(retained));
 	PG_TRY();
 	{
+		/* Read the original PENDING owner before taking any buffer locks.
+		 * Physical finish rechecks the descriptor, bytes and first itself. */
+		if (cluster_shared_config
+			&& (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0
+			&& cluster_pcm_lock_resource_x_holder_pair_wal_retained_exact(
+				block, authenticated_master_node, revoking.generation, &retained_wal)
+			&& retained_wal.page_checksum == image->body.image_envelope.page_checksum
+			&& cluster_page_wal_same_mutation_v1(&retained_wal.latest,
+												 &image->body.image_envelope.page_wal))
+			wal_proof = &retained_wal;
 		if (held_x_revoke_active) {
 			finish_result = cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
-				&held_x_revoke, page_lsn, &retained, &finish_refusal);
+				&held_x_revoke, page_lsn, &retained, &finish_refusal, wal_proof);
 			if (finish_result == CLUSTER_PCM_OWN_OK)
 				held_x_revoke_active = false;
 		} else
-			finish_result = cluster_bufmgr_pcm_own_finish_revoke_retain(buf, &revoking, page_lsn,
-																		&retained, &finish_refusal);
+			finish_result = cluster_bufmgr_pcm_own_finish_revoke_retain(
+				buf, &revoking, page_lsn, &retained, &finish_refusal, wal_proof);
 	}
 	PG_CATCH();
 	{
@@ -10023,12 +10051,13 @@ gcs_block_resource_x_source_finish_owned(
 	PG_END_TRY();
 	if (finish_result != CLUSTER_PCM_OWN_OK || retained.pcm_state != (uint8)PCM_STATE_N
 		|| retained.generation != image->body.image_envelope.source_carrier_generation) {
-		/* Only a proved, pre-mutation busy cause may hand the continuous
+		/* Only a proved, reversible refusal may hand the continuous
 		 * service pin to the exact shared owner. No callback cleanup may run
 		 * after APPLIED: a winning LMS claim can already own its release. */
 		if (finish_result == CLUSTER_PCM_OWN_BUSY
 			&& (finish_refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_CONTENT_LOCK
 				|| finish_refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_IO_IN_PROGRESS
+				|| finish_refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_DATA_IO_RETRY
 				|| (!tagless_target_x
 					&& finish_refusal.reason == CLUSTER_PCM_OWN_FINISH_REFUSAL_VM_FSM_PINNED))) {
 			if (held_x_revoke_active && target_revoke_owner_held
@@ -10128,6 +10157,11 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 											 uint64 r4_record_generation)
 {
 	PGAlignedBlock aligned_page;
+	ClusterPageWalBindingV1 page_wal = { 0 };
+	/* D S09 R-A22: owned first own record since the page was clean; moved
+	 * into the PENDING pair or released, including ERROR before its move.
+	 * The original reference must survive a wrapper longjmp after it is zeroed. */
+	volatile ClusterPageWalRefV1 page_first = { 0 };
 	BufferDesc *buf;
 	ClusterPcmOwnHeldXRevoke held_x_revoke;
 	ClusterPcmOwnResult own_result;
@@ -10398,7 +10432,7 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 		if (shared_s_source)
 			own_result = cluster_bufmgr_pcm_own_prepare_s_source_image(
 				buf, &current, (SCN)0, &revoking, aligned_page.data, &page_lsn, &page_scn,
-				&source_prepare_refusal);
+				&source_prepare_refusal, &page_wal);
 		else if (tagless_target_x) {
 			ResourceXApplyResult owner_result;
 
@@ -10559,39 +10593,79 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 	}
 	if (!semantic_retained) {
 		failure_stage = "source-copy";
+		/* Both the receiving current holder and the original master must
+		 * understand the complete PI obligation. Missing capability keeps
+		 * the existing DATA guard; these are local HELLO observations. */
+		if ((capability_word & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2) != 0) {
+			uint32 master_capabilities = cluster_ic_local_capability_word();
+			uint32 master_connection = 0;
+
+			if (resource_master_node != cluster_node_id
+				&& !cluster_sf_peer_capability_word_sample(
+					resource_master_node, PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2, &master_capabilities,
+					&master_connection))
+				master_capabilities = 0;
+			capability_word &= master_capabilities;
+		}
 		if (!shared_s_source
-			&& !cluster_bufmgr_copy_block_for_gcs(block->common.logical_assertion.resource,
-												  &page_lsn, aligned_page.data, NULL)) {
+			&& !cluster_bufmgr_copy_block_for_gcs(
+				block->common.logical_assertion.resource, &page_lsn, aligned_page.data, NULL,
+				&page_wal, (ClusterPageWalRefV1 *)&page_first, capability_word)) {
 			failure_result = RESOURCE_X_APPLY_BAD_STATE;
 			goto pre_retained_failure;
 		}
 		if (!shared_s_source)
 			page_scn = (uint64)((PageHeader)aligned_page.data)->pd_block_scn;
-		failure_stage = "source-frame-build";
-		if (!gcs_block_pcm_x_resource_x_build_source_frames(
-				block, &revoking, aligned_page.data, page_lsn, page_scn,
+	}
+	/* The copy still owns its source until the original wrapper moves it.
+	 * ERROR while building frames or preparing the pair must not strand that
+	 * reference. A completed move zeroes it, preserving the PENDING owner. */
+	PG_TRY();
+	{
+		bool frame_ready = true;
+
+		if (!semantic_retained) {
+			failure_stage = "source-frame-build";
+			frame_ready = gcs_block_pcm_x_resource_x_build_source_frames(
+				block, &revoking, aligned_page.data, page_lsn, page_scn, &page_wal,
 				requester_connection_generation, source_boot_incarnation, source_mode, &status,
-				&image)) {
-			failure_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-			goto pre_retained_failure;
+				&image);
+		}
+		if (!frame_ready)
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		else {
+			failure_stage = "retained-pair-apply";
+			/* A replay that did not copy again has no new sample (NULL first). */
+			if (shared_s_source && semantic_retained && !finish_required)
+				result = RESOURCE_X_APPLY_DUPLICATE;
+			else if (shared_s_source)
+				result = cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(
+					block, authenticated_master_node, &status, &image, &revoking, page_lsn,
+					page_scn, image.body.image_envelope.page_checksum);
+			else if (tagless_target_x && target_x_drop)
+				result = cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
+					block, authenticated_master_node, &status, &image, &revoking,
+					&target_revoke_owner,
+					semantic_retained ? NULL : (ClusterPageWalRefV1 *)&page_first);
+			else if (tagless_target_x && target_x_retain)
+				result = cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(
+					block, authenticated_master_node, &status, &image, &revoking,
+					&target_revoke_owner,
+					semantic_retained ? NULL : (ClusterPageWalRefV1 *)&page_first);
+			else
+				result = cluster_pcm_lock_resource_x_block_to_n_source_exact(
+					block, authenticated_master_node, &status, &image,
+					semantic_retained ? NULL : (ClusterPageWalRefV1 *)&page_first);
 		}
 	}
-	failure_stage = "retained-pair-apply";
-	if (shared_s_source && semantic_retained && !finish_required)
-		result = RESOURCE_X_APPLY_DUPLICATE;
-	else if (shared_s_source)
-		result = cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(
-			block, authenticated_master_node, &status, &image, &revoking, page_lsn, page_scn,
-			image.body.image_envelope.page_checksum);
-	else if (tagless_target_x && target_x_drop)
-		result = cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
-			block, authenticated_master_node, &status, &image, &revoking, &target_revoke_owner);
-	else if (tagless_target_x && target_x_retain)
-		result = cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(
-			block, authenticated_master_node, &status, &image, &revoking, &target_revoke_owner);
-	else
-		result = cluster_pcm_lock_resource_x_block_to_n_source_exact(
-			block, authenticated_master_node, &status, &image);
+	PG_CATCH();
+	{
+		(void)cluster_page_wal_ref_release_v1((ClusterPageWalRefV1 *)&page_first);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	/* Moved into the PENDING pair (zeroed) or still ours. */
+	(void)cluster_page_wal_ref_release_v1((ClusterPageWalRefV1 *)&page_first);
 	if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE) {
 		if (semantic_retained && carrier_superseded && result == RESOURCE_X_APPLY_STALE) {
 			pair_result = cluster_pcm_lock_resource_x_holder_pair_supersedes_exact(
@@ -10630,6 +10704,7 @@ gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
 		tagless_target_x, target_x_drop, result);
 
 pre_retained_failure:
+	(void)cluster_page_wal_ref_release_v1((ClusterPageWalRefV1 *)&page_first);
 	ereport(LOG,
 			(errmsg_internal("Resource-X type-17 holder diagnostic"),
 			 errdetail(
@@ -10690,6 +10765,7 @@ PGRAC_PCM_X_FENCE_DOMINATED(gcs_block_pcm_x_reserved_image_write_exact)
 		const ResourceXCurrentImage *image)
 {
 	PGAlignedBlock verified;
+	ClusterPageWalInstallV1 prepared_wal = { 0 };
 	ClusterPcmOwnSnapshot live;
 	ClusterPcmOwnResult own_result;
 	Page page;
@@ -10701,16 +10777,21 @@ PGRAC_PCM_X_FENCE_DOMINATED(gcs_block_pcm_x_reserved_image_write_exact)
 	memcpy(verified.data, image->page_bytes, BLCKSZ);
 	if (PageGetLSN((Page)verified.data) != image->page_lsn
 		|| ((PageHeader)verified.data)->pd_block_scn != image->page_scn
-		|| cluster_gcs_block_compute_checksum(verified.data) != image->page_checksum)
+		|| cluster_gcs_block_compute_checksum(verified.data) != image->page_checksum
+		|| (cluster_shared_config
+			&& !cluster_page_wal_prepare_install_v1(
+				BufferDescriptorGetBuffer(buf), &image->page_wal, verified.data, &prepared_wal)))
 		return CLUSTER_PCM_OWN_CORRUPT;
 	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
 	if (own_result != CLUSTER_PCM_OWN_OK)
-		return own_result;
-	if (!gcs_block_pcm_x_reserved_image_write_exact(&live, reservation_base, reservation_token))
-		return cluster_pcm_own_classify_live_flags(live.flags, live.reservation_token)
-					   == CLUSTER_PCM_OWN_CORRUPT
-				   ? CLUSTER_PCM_OWN_CORRUPT
-				   : CLUSTER_PCM_OWN_STALE;
+		goto done;
+	if (!gcs_block_pcm_x_reserved_image_write_exact(&live, reservation_base, reservation_token)) {
+		own_result = cluster_pcm_own_classify_live_flags(live.flags, live.reservation_token)
+							 == CLUSTER_PCM_OWN_CORRUPT
+						 ? CLUSTER_PCM_OWN_CORRUPT
+						 : CLUSTER_PCM_OWN_STALE;
+		goto done;
+	}
 
 	page = BufferGetPage(BufferDescriptorGetBuffer(buf));
 	memcpy(page, verified.data, BLCKSZ);
@@ -10721,16 +10802,21 @@ PGRAC_PCM_X_FENCE_DOMINATED(gcs_block_pcm_x_reserved_image_write_exact)
 																  reservation_token);
 	if (own_result != CLUSTER_PCM_OWN_OK) {
 		gcs_block_resource_x_fail_closed_current();
-		return CLUSTER_PCM_OWN_CORRUPT;
+		own_result = CLUSTER_PCM_OWN_CORRUPT;
+		goto done;
 	}
 	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
 	if (own_result != CLUSTER_PCM_OWN_OK
 		|| !gcs_block_pcm_x_reserved_image_write_exact(&live, reservation_base,
 													   reservation_token)) {
 		gcs_block_resource_x_fail_closed_current();
-		return CLUSTER_PCM_OWN_CORRUPT;
+		own_result = CLUSTER_PCM_OWN_CORRUPT;
 	}
-	return CLUSTER_PCM_OWN_OK;
+done:
+	/* This pre-grant copy is still non-authoritative. T2 subsequently
+	 * reserves/publishes the exact retained carrier with its activation. */
+	cluster_page_wal_release_install_v1(&prepared_wal);
+	return own_result;
 }
 
 static ResourceXBufferActivationResult
@@ -11031,6 +11117,9 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 				image_out->page_scn = ((PageHeader)aligned_page->data)->pd_block_scn;
 				image_out->page_checksum = cluster_gcs_block_compute_checksum(aligned_page->data);
 				image_out->image_length = BLCKSZ;
+				if (cluster_shared_config)
+					(void)cluster_page_wal_snapshot_v1(BufferDescriptorGetBuffer(buf),
+													   &image_out->page_wal);
 			}
 			*committed_generation_out = committed_generation;
 			result = RESOURCE_X_BUFFER_T2_INSTALLED;
@@ -11320,6 +11409,7 @@ gcs_block_pcm_x_resource_x_join_terminal_try(const ResourceXAssertion *assertion
 				joined_image.page_scn = ((PageHeader)aligned_image.data)->pd_block_scn;
 				joined_image.page_checksum = image_frame.body.image_envelope.page_checksum;
 				joined_image.image_length = BLCKSZ;
+				joined_image.page_wal = image_frame.body.image_envelope.page_wal;
 				if (image_frame.body.image_envelope.page_scn_lsn != (uint64)joined_image.page_scn) {
 					result = RESOURCE_X_APPLY_INVALID;
 					break;
@@ -11389,7 +11479,7 @@ gcs_block_pcm_x_resource_x_join_terminal_try(const ResourceXAssertion *assertion
 					&ref, committed_generation, direct_init_token, &activation_proof);
 			else
 				buffer_result = cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
-					&ref, &activation_proof);
+					&ref, &image.page_wal, remote_proof, &activation_proof);
 			if (buffer_result != RESOURCE_X_BUFFER_T2_INSTALLED
 				&& buffer_result != RESOURCE_X_BUFFER_ALREADY_INSTALLED) {
 				cluster_pcm_lock_resource_x_publish_no_progress_exact(
@@ -13476,12 +13566,13 @@ gcs_block_resource_x_requester_terminal_try(const ClusterICEnvelope *env,
 /* PGRAC adaptation: SourceSettlementV2 consumes only the exact retained
  * type-18/type-15 pair selected by the authenticated master.  Entry-lock
  * prepare/commit bracket, but never overlap, the BufferDesc release.  The
- * response is an ordinary unretained typed ACK; a full outbound queue is
- * healed by the master's still-retained kind-10 debt replay. */
+ * received request stays owned across BUSY, and the typed ACK uses the
+ * drained holder status send slot until transport completion. */
 static ResourceXApplyResult
-gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
-											   const ResourceXDecodedFrame *settlement,
-											   uint32 sender_connection_generation)
+gcs_block_resource_x_source_settlement_run(const ClusterICEnvelope *env,
+										   const ResourceXDecodedFrame *settlement,
+										   uint32 sender_connection_generation,
+										   volatile uint64 *claim)
 {
 	ResourceXDecodedFrame ack;
 	ResourceXSourceSettlementPlan plan;
@@ -13496,6 +13587,7 @@ gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
 	bool carrier_release_complete = false;
 	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
 	uint16 payload_bytes = 0;
+	uint64 acquired_claim = 0;
 
 	if (env == NULL || settlement == NULL
 		|| settlement->kind != RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
@@ -13505,8 +13597,12 @@ gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
 	memset(&plan, 0, sizeof(plan));
 	memset(&commit_observation, 0, sizeof(commit_observation));
 	memset(&prepare_observation, 0, sizeof(prepare_observation));
-	result = cluster_pcm_lock_resource_x_source_settlement_prepare_observed_exact(
-		settlement, (int32)env->source_node_id, &plan, &prepare_observation);
+	result = cluster_pcm_lock_resource_x_source_settlement_receive_begin_exact(
+		settlement, (int32)env->source_node_id, sender_connection_generation, &plan,
+		&prepare_observation, &acquired_claim);
+	*claim = acquired_claim;
+	if (result == RESOURCE_X_APPLY_DUPLICATE && acquired_claim == 0)
+		return result; /* The existing exact ACK still owns its send episode. */
 	if (result == RESOURCE_X_APPLY_APPLIED && !plan.valid) {
 		gcs_block_resource_x_source_settlement_failure_record(
 			settlement, &prepare_observation, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_PREPARE,
@@ -13597,8 +13693,12 @@ gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
 		gcs_block_resource_x_fail_closed_current();
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
-	ack_enqueued = cluster_grd_outbound_enqueue_backend_msg(
-		RESOURCE_X_MSG_BLOCKED_TO_N, env->source_node_id, payload, payload_bytes);
+	ack_enqueued = cluster_pcm_lock_resource_x_source_settlement_receive_end_exact(
+		&settlement->common.logical_assertion, *claim, &ack);
+	if (!ack_enqueued) {
+		gcs_block_resource_x_fail_closed_current();
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
 	if ((result == RESOURCE_X_APPLY_APPLIED || !ack_enqueued)
 		&& ((result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
 			|| !ack_enqueued
@@ -13613,6 +13713,78 @@ gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
 						   (unsigned long long)plan.source_generation, ack_enqueued ? 1U : 0U,
 						   sender_connection_generation)));
 	return result;
+}
+
+/* Only one ingress/tick owns physical release. Every unwind returns that
+ * local claim; it never drops the received request or the retained pair. */
+static ResourceXApplyResult
+gcs_block_resource_x_source_settlement_ingress_owned(const ClusterICEnvelope *env,
+													 const ResourceXDecodedFrame *settlement,
+													 uint32 sender_connection_generation,
+													 bool notify_busy)
+{
+	volatile uint64 claim = 0;
+	ResourceXApplyResult result;
+	PG_TRY();
+	{
+		result = gcs_block_resource_x_source_settlement_run(env, settlement,
+															sender_connection_generation, &claim);
+		if (notify_busy && result == RESOURCE_X_APPLY_BAD_STATE && claim != 0) {
+			ResourceXDecodedFrame busy = { 0 };
+			uint8 payload[RESOURCE_X_CONTROL_V1_BYTES];
+			uint16 length;
+			ResourceXWireReject reject;
+			busy.kind = RESOURCE_X_WIRE_BLOCKED_TO_N;
+			busy.common = settlement->common;
+			busy.common.outcome = RESOURCE_X_OUTCOME_RETRY;
+			busy.common.source_candidate = busy.common.retain_pi_if_dirty = 0;
+			busy.common.sender_connection_generation = sender_connection_generation;
+			if (cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &busy, payload,
+											   sizeof(payload), &length, &reject))
+				(void)cluster_grd_outbound_enqueue_backend_msg(
+					RESOURCE_X_MSG_BLOCKED_TO_N, env->source_node_id, payload, length);
+		}
+	}
+	PG_FINALLY();
+	{
+		if (claim != 0)
+			(void)cluster_pcm_lock_resource_x_source_settlement_receive_end_exact(
+				&settlement->common.logical_assertion, claim, NULL);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static ResourceXApplyResult
+gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
+											   const ResourceXDecodedFrame *settlement,
+											   uint32 sender_connection_generation)
+{
+	return gcs_block_resource_x_source_settlement_ingress_owned(env, settlement,
+																sender_connection_generation, true);
+}
+
+ResourceXApplyResult
+cluster_gcs_block_resource_x_source_settlement_tick(const ResourceXAcquisitionRef *ref)
+{
+	ResourceXDecodedFrame request;
+	ClusterICEnvelope env = { 0 };
+	int32 master;
+	uint32 received_generation, current_generation;
+	ResourceXApplyResult result;
+	if (MyBackendType != B_LMS)
+		return RESOURCE_X_APPLY_INVALID;
+	result = cluster_pcm_lock_resource_x_source_settlement_receive_snapshot_exact(
+		ref, &request, &master, &received_generation);
+	if (result != RESOURCE_X_APPLY_APPLIED)
+		return result;
+	if (!gcs_block_pcm_x_resource_x_peer_ready_exact(master, &current_generation)
+		|| current_generation != received_generation)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	env.source_node_id = master;
+	env.dest_node_id = cluster_node_id;
+	return gcs_block_resource_x_source_settlement_ingress_owned(&env, &request, current_generation,
+																false);
 }
 
 /* Consume the exact Resource-X subdomain before any reused legacy parser.
@@ -13703,6 +13875,15 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env, const void *payload
 			env, &frame, authenticated_capability_generation);
 		break;
 	case RESOURCE_X_WIRE_BLOCKED_TO_N:
+		if (frame.common.outcome == RESOURCE_X_OUTCOME_RETRY
+			&& frame.common.observed_mode == PCM_STATE_N
+			&& frame.common.target_mode == PCM_STATE_N) {
+			int channel = cluster_ic_tier1_my_data_channel();
+			result = cluster_pcm_lock_resource_x_source_settlement_busy_exact(
+				&frame, (int32)env->source_node_id, channel,
+				cluster_ic_tier1_resource_x_stream_generation(env->source_node_id, channel));
+			break;
+		}
 		result = cluster_pcm_lock_resource_x_blocked_to_n_exact(&frame, (int32)env->source_node_id,
 																&snapshot);
 		break;
@@ -15703,15 +15884,23 @@ gcs_block_resource_x_target_eviction_recheck_result(const BufferTag *tag,
 	return connection_sampled ? session_result : RESOURCE_X_APPLY_BAD_STATE;
 }
 
+void
+cluster_gcs_resource_x_target_evict_release_refs(ResourceXTargetEvictionPlan *plan)
+{
+	if (plan != NULL
+		&& (!cluster_page_wal_ref_release_v1(&plan->pi_refs[0])
+			|| !cluster_page_wal_ref_release_v1(&plan->pi_refs[1])))
+		elog(PANIC, "cached-X eviction lost its reserved WAL reference");
+}
+
 /* Freeze the existing kind-4 RELEASE_X while the descriptor is still the
  * exact X+REVOKING residency.  Entry-local EVICTING is lifecycle ownership,
  * never authority; every failure before local commit drops it exactly. */
 ResourceXApplyResult
-cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
-												  const ClusterPcmOwnSnapshot *exact_x,
-												  uint64 r4_record_generation,
-												  uint64 reservation_token,
-												  ResourceXTargetEvictionPlan *plan_out)
+cluster_gcs_resource_x_target_evict_prepare_exact(
+	const BufferTag *tag, const ClusterPcmOwnSnapshot *exact_x, uint64 r4_record_generation,
+	uint64 reservation_token, const ClusterPageWalBindingV1 *wal,
+	ResourceXTargetEvictionPlan *plan_out, const ClusterPageWalBindingV1 *first)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
@@ -15733,9 +15922,10 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 
 	if (plan_out != NULL)
 		memset(plan_out, 0, sizeof(*plan_out));
-	if (tag == NULL || exact_x == NULL || plan_out == NULL || !BufferTagsEqual(tag, &exact_x->tag)
-		|| exact_x->pcm_state != (uint8)PCM_STATE_X || exact_x->flags != PCM_OWN_FLAG_REVOKING
-		|| exact_x->generation == 0 || exact_x->generation == UINT64_MAX || reservation_token == 0
+	if ((first != NULL && wal == NULL) || tag == NULL || exact_x == NULL || plan_out == NULL
+		|| !BufferTagsEqual(tag, &exact_x->tag) || exact_x->pcm_state != (uint8)PCM_STATE_X
+		|| exact_x->flags != PCM_OWN_FLAG_REVOKING || exact_x->generation == 0
+		|| exact_x->generation == UINT64_MAX || reservation_token == 0
 		|| reservation_token == UINT64_MAX || exact_x->reservation_token != reservation_token
 		|| exact_x->writer_activation_token != 0 || exact_x->resource_x_activation_generation != 0
 		|| r4_record_generation == 0 || r4_record_generation == UINT64_MAX || MyProc == NULL)
@@ -15771,13 +15961,39 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 		else
 			result = gcs_block_resource_x_target_peer_result_exact(&admission, master_node,
 																   sender_connection_generation);
+		if (result == RESOURCE_X_APPLY_APPLIED && wal != NULL) {
+			ClusterPageWalBindingV1 flushed, flushed_first;
+			BufferTag first_tag;
+			BufferTag wal_tag;
+
+			if (first == NULL)
+				first = wal;
+			InitBufferTag(&first_tag, &first->identity.locator, first->identity.forknum,
+						  first->identity.blockno);
+
+			InitBufferTag(&wal_tag, &wal->identity.locator, wal->identity.forknum,
+						  wal->identity.blockno);
+			/* Native WAL confirmation may wait. No buffer or entry lock is held,
+			 * and the original descriptor remains X+REVOKING throughout. */
+			if (!cluster_shared_config || !BufferTagsEqual(tag, &wal_tag)
+				|| !BufferTagsEqual(tag, &first_tag)
+				|| wal->source.claim.database_incarnation
+					   != first->source.claim.database_incarnation
+				|| memcmp(wal->version.segment_incarnation, first->version.segment_incarnation, 16)
+					   != 0
+				|| !cluster_page_wal_flush_source_v1(wal, &flushed)
+				|| !cluster_page_wal_flush_source_v1(first, &flushed_first)
+				|| !cluster_page_wal_ref_retain_v1(&flushed_first, &plan_out->pi_refs[0])
+				|| !cluster_page_wal_ref_retain_v1(&flushed, &plan_out->pi_refs[1]))
+				result = RESOURCE_X_APPLY_BAD_STATE;
+		}
 		if (result == RESOURCE_X_APPLY_APPLIED)
 			result = cluster_pcm_lock_resource_x_target_evict_prepare_exact(
 				tag, master_node, gate.formation, master_session, r4_record_generation,
 				exact_x->generation, reservation_token, sender_connection_generation,
 				(int32)MyProc->pgprocno, &release, &owner);
 		if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE) {
-			memcpy((void *)&cleanup_owner, &owner, sizeof(owner));
+			cleanup_owner = owner;
 			owner_claimed = true;
 		}
 		if (owner_claimed
@@ -15812,10 +16028,11 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 	}
 	PG_CATCH();
 	{
+		cluster_gcs_resource_x_target_evict_release_refs(plan_out);
 		if (owner_claimed) {
 			ResourceXLocalOwnerHandle catch_owner;
 
-			memcpy(&catch_owner, (const void *)&cleanup_owner, sizeof(catch_owner));
+			catch_owner = cleanup_owner;
 			abort_result = cluster_pcm_lock_resource_x_target_evict_abort_exact(&catch_owner);
 			if (abort_result != RESOURCE_X_APPLY_APPLIED)
 				gcs_block_resource_x_fail_closed_current();
@@ -15825,6 +16042,8 @@ cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
 	}
 	PG_END_TRY();
 	cluster_semantic_activation_leave(&admission);
+	if (!plan_out->prepared)
+		cluster_gcs_resource_x_target_evict_release_refs(plan_out);
 	return result;
 }
 
@@ -15874,6 +16093,14 @@ cluster_gcs_resource_x_target_evict_publish_exact(ResourceXTargetEvictionPlan *p
 			plan->sender_connection_generation, &admission);
 		if (result == RESOURCE_X_APPLY_BAD_STATE)
 			*retry_pending_out = true;
+		if (result == RESOURCE_X_APPLY_APPLIED && !plan->pi_recorded) {
+			if (plan->pi_refs[0].source_flags != 0 || plan->pi_refs[1].source_flags != 0)
+				result = cluster_pcm_lock_resource_x_target_evict_record_pi_exact(plan);
+			else
+				plan->pi_recorded = true; /* No attributed source; no invented PI proof. */
+			if (result == RESOURCE_X_APPLY_APPLIED)
+				cluster_gcs_resource_x_target_evict_release_refs(plan);
+		}
 		if (result == RESOURCE_X_APPLY_APPLIED && !plan->release_admitted) {
 			if (plan->master_node == cluster_node_id)
 				result = cluster_pcm_lock_resource_x_release_x_exact(
@@ -15936,6 +16163,7 @@ cluster_gcs_resource_x_target_evict_abort_exact(ResourceXTargetEvictionPlan *pla
 		plan->prepared = false;
 		memset(&plan->owner, 0, sizeof(plan->owner));
 	}
+	cluster_gcs_resource_x_target_evict_release_refs(plan);
 	return result;
 }
 
@@ -16249,6 +16477,13 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		return;
 
 	req = (const GcsBlockRequestPayload *)payload;
+	/* Reject before dedup, image copy or pending-X authority changes. */
+	if (!cluster_pcm_legacy_transition_allowed(cluster_shared_config,
+											   (PcmLockTransition)req->transition_id)) {
+		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_VALIDATOR_REJECT,
+							 InvalidXLogRecPtr, NULL);
+		return;
+	}
 
 	/*
 	 * spec-5.16 D3b (r3 P1 + sr1-②, INV-R8/R14) — master-side hard gate, BEFORE
@@ -18167,6 +18402,10 @@ cluster_gcs_block_lmon_handle_direct_land_completion(int32 peer_node, uint64 wr_
 							  || status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
 							  || status == GCS_BLOCK_REPLY_DENIED_LOST_WRITE);
 	}
+	if (cluster_shared_config
+		&& (!cluster_pcm_legacy_transition_allowed(true, (PcmLockTransition)hdr->transition_id)
+			|| status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER))
+		identity_ok = false;
 	if (!identity_ok) {
 		gcs_block_direct_fail_slot(blk, slot, GCS_BLOCK_DIRECT_ABORT_BAD_IDENTITY, false, NULL);
 		return;
@@ -19068,6 +19307,11 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 		return;
 	}
 
+	if (cluster_shared_config && !GcsBlockReplyStatusIsR4((GcsBlockReplyStatus)hdr->status)
+		&& (!cluster_pcm_legacy_transition_allowed(true, (PcmLockTransition)hdr->transition_id)
+			|| hdr->status == GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER))
+		return;
+
 	/* HC80: direct index by requester_backend_id (1..MaxBackends → 0..MaxBackends-1). */
 	backend_idx = hdr->requester_backend_id - 1;
 	if (backend_idx < 0 || backend_idx >= MaxBackends)
@@ -19579,6 +19823,14 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	 * (e1 release-side) path untouched (§3.4b: never force the holder).
 	 * MUST branch before the ship-image copy below: a nudge ships nothing.
 	 */
+	if (cluster_shared_config
+		&& (GcsBlockForwardPayloadIsXTransfer(fwd)
+			|| !cluster_pcm_legacy_transition_allowed(true,
+													  (PcmLockTransition)fwd->transition_id))) {
+		gcs_block_forward_reply_immediate_deny(fwd);
+		return;
+	}
+
 	if (GcsBlockForwardPayloadIsBastNudge(fwd)) {
 		bool yielded = false;
 
@@ -22115,18 +22367,24 @@ static const ClusterICMsgTypeInfo gcs_block_invalidate_ack_info = {
 /*
  * cluster_gcs_block_send_redeclare -- spec-4.7 D2 survivor → master re-declare.
  *
- *	One fire-and-forget announce of a locally-held S/X buffer to the block's
- *	current (remastered) master.  Self-mastered blocks need no wire (their
- *	master state rebuilds locally — D3 lazy rebuild), so skip master == self.
+ * Shared mode waits for actual application by the frozen master, including
+ * self-master and physical PI declarations. Legacy mode retains its admitted
+ * transport semantics. False keeps the LMON census at this buffer.
  */
-void
+bool
 cluster_gcs_block_send_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn, SCN page_scn,
 								 uint64 cluster_epoch, int master_node)
 {
 	GcsBlockRedeclarePayload p;
+	ClusterICSendResult sent;
 
-	if (master_node < 0 || master_node == cluster_node_id)
-		return;
+	if (cluster_shared_config)
+		return cluster_block_redeclare_poll_v1(tag, held_mode, page_lsn, page_scn, cluster_epoch,
+											   master_node);
+	if (master_node < 0 || master_node >= 32)
+		return false;
+	if (master_node == cluster_node_id)
+		return true;
 
 	memset(&p, 0, sizeof(p));
 	p.cluster_epoch = cluster_epoch;
@@ -22137,11 +22395,11 @@ cluster_gcs_block_send_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page
 	p.held_mode = held_mode;
 	p.checksum = gcs_block_compute_redeclare_checksum(&p);
 
-	cluster_gcs_block_note_send_outcome(
-		GCS_BLOCK_SEND_FAMILY_INVALIDATE,
-		cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REDECLARE, master_node, &p, sizeof(p)));
+	sent = cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REDECLARE, master_node, &p, sizeof(p));
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_INVALIDATE, sent);
 	if (ClusterGcsBlock != NULL)
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->recovery_buffers_redeclared, 1);
+	return sent == CLUSTER_IC_SEND_DONE || sent == CLUSTER_IC_SEND_WOULD_BLOCK;
 }
 
 
@@ -22160,7 +22418,13 @@ cluster_gcs_handle_block_redeclare_envelope(const ClusterICEnvelope *env, const 
 	const GcsBlockRedeclarePayload *p = (const GcsBlockRedeclarePayload *)payload;
 	uint64 episode_epoch;
 
+	if (cluster_shared_config) {
+		cluster_block_redeclare_ingress_v1(env, payload);
+		return;
+	}
 	if (ClusterGcsBlock == NULL)
+		return;
+	if (env == NULL || payload == NULL || env->payload_length != sizeof(*p))
 		return;
 
 	if (p->checksum != gcs_block_compute_redeclare_checksum(p)) {

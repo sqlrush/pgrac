@@ -22,6 +22,11 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: actual detached logger configuration outcome, not signal receipt.
+ * Author: SqlRush <sqlrush@gmail.com> */
+#include "cluster/cluster_shared_config.h"
+#endif
 
 #include <fcntl.h>
 #include <limits.h>

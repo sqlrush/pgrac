@@ -38,6 +38,7 @@
 #define CLUSTER_CF_AUTHORITY_H
 
 #include "catalog/pg_control.h"
+#include "cluster/cluster_control_root.h"
 
 /*
  * Relative paths of the shared authority and its corruption-recovery
@@ -141,7 +142,11 @@ extern bool cluster_cf_bak_checkpoint_recoverable(const ControlFileData *bak);
  * the strictly-validated .bak.  Returns true and fills *out when a
  * trustworthy image was found; returns false (and leaves *out untouched)
  * when the read must fail-closed -- the caller raises FATAL/ERROR.  Does not
- * itself ereport, so it is safe on the bootstrap early-read path.
+ * itself ereport.  With cluster.shared_config off this retains the legacy
+ * early-read behavior.  With that profile on, it requires an already-held
+ * clusterwide CF-S/X and an exact live local thread owner, selects only the
+ * root-v2 view and never falls back; it is NOT an early bootstrap reader.
+ * Author: SqlRush <sqlrush@gmail.com>
  */
 extern bool cluster_cf_authority_read(ControlFileData *out);
 
@@ -150,8 +155,46 @@ extern bool cluster_cf_authority_read(ControlFileData *out);
  * .bak, write the new image to pg_control.tmp, fsync it, durable_rename it
  * over the primary and fsync the directory.  The caller must hold CF X and
  * is responsible for the lock; on I/O failure this PANICs (mirroring the
- * stock update_controlfile contract).
+ * stock update_controlfile contract).  The shared_config profile rejects this
+ * untyped write; its common/thread fields require purpose-bound root publishers.
+ * Author: SqlRush <sqlrush@gmail.com>
  */
 extern void cluster_cf_authority_write(const ControlFileData *cf);
+
+/* PGRAC: immutable control-image I/O.  These helpers do not publish a root or
+ * grant admission.  The publisher holds the SAME clusterwide CF-X from install
+ * through root CAS; the reader binds/revalidates its root-selected reference.
+ * The descriptor is process-owned memory, not a persistent/wire authority.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct ClusterCfImageStage {
+	uint64 generation;
+	uint64 system_identifier;
+	uint8 operation_uuid[16];
+	uint8 image_sha256[32];
+	uint64 object_dir_dev;
+	uint64 object_dir_ino;
+	uint64 staging_dir_dev;
+	uint64 staging_dir_ino;
+	uint64 file_dev;
+	uint64 file_ino;
+	uint32 owner_pid;
+	uint32 state;
+} ClusterCfImageStage;
+
+StaticAssertDecl(sizeof(ClusterCfImageStage) == 120, "control staging descriptor size");
+
+extern ClusterControlRootResult cluster_cf_control_image_encode(const ControlFileData *cf,
+																uint8 bytes[PG_CONTROL_FILE_SIZE]);
+extern ClusterControlRootResult cluster_cf_control_image_prepare(const ControlFileData *cf,
+																 uint64 generation,
+																 const uint8 operation_uuid[16],
+																 ClusterCfImageStage *out);
+extern ClusterControlRootResult cluster_cf_control_image_install(ClusterCfImageStage *stage);
+extern ClusterControlRootResult cluster_cf_control_image_discard(ClusterCfImageStage *stage);
+extern ClusterControlRootResult cluster_cf_control_image_read_locked(uint64 generation,
+																	 const uint8 sha256[32],
+																	 uint64 system_identifier,
+																	 ControlFileData *out);
 
 #endif /* CLUSTER_CF_AUTHORITY_H */

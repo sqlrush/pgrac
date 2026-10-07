@@ -56,6 +56,9 @@ extern bool XLogPageVersionImageRequiredV1(uint8 flags, bool do_page_writes,
 extern void XLogRegisterPageVersionEdge(uint64 result_token,
 	const RfPageVersionEdgeEntryV1 *entries, uint8 entry_count);
 #ifdef USE_PGRAC_CLUSTER
+/* Original native insertion identity, valid only until the next construction
+ * or reset. Read-only metadata; no flush, replay or DATA authority. */
+extern bool XLogGetLastInsertRecord(XLogRecPtr end, XLogRecPtr *start, XLogRecord *record);
 struct RfPageAnchorCacheKeyV1;
 extern void XLogRegisterPageVersionAnchorKey(uint8 block_id,
 	const struct RfPageAnchorCacheKeyV1 *key);

@@ -57,12 +57,16 @@
 #include "storage/shmem.h"
 #include "utils/errcodes.h" /* spec-5.2 D1: ERRCODE_CLUSTER_SINVAL_QUEUE_FULL */
 #include "utils/hsearch.h"
+#include "utils/memutils.h"
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_mrp.h" /* spec-6.4 INV-ADG5 — standby write gate */
+#include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_shmem.h"
-#include "cluster/cluster_sinval.h"		 /* spec-5.2 D1: relsize inval broadcast */
+#include "cluster/cluster_sinval.h" /* spec-5.2 D1: relsize inval broadcast */
+#include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_write_fence.h" /* spec-4.12 D5 — hot write-path fence gate */
 #include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -420,6 +424,16 @@ cluster_smgr_create(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 
 	state = cluster_smgr_state_lookup(reln, true);
 
+	/* An open handle is still an existing file, not a new CREATE's property.
+	 * Reject before the caller can log creation or register abort cleanup. */
+	if (cluster_shared_catalog && !isRedo && forknum == MAIN_FORKNUM
+		&& state->fork_handles[forknum] != NULL) {
+		errno = EEXIST;
+		ereport(ERROR, (errcode_for_file_access(),
+						errmsg("could not create shared relation %u: file already open",
+							   state->rlocator.locator.relNumber)));
+	}
+
 	/*
 	 * Sprint A 2026-05-02 (spec-1.X-cluster-smgr-hardening): use the
 	 * dedicated create() callback (was: implicit O_CREAT side effect
@@ -469,11 +483,214 @@ cluster_smgr_exists(SMgrRelation reln, ForkNumber forknum)
 }
 
 
+/* Keep MAIN's name reserved across every still-replayable DROP window.
+ * A different instance's new file contents are not in this instance's WAL.
+ * Normal commit uses the existing checkpoint cycle; online shared replay
+ * requires its recovery owner's durable closed-window qualification instead.
+ * Like mdunlink, a post-commit cleanup failure must only report WARNING.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+cluster_smgr_unlink_fork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
+{
+	bool shared_replay = isRedo && (cluster_shared_catalog || cluster_shared_config);
+
+	if ((!isRedo || shared_replay) && !IsBinaryUpgrade && forknum == MAIN_FORKNUM
+		&& !RelFileLocatorBackendIsTemp(rlocator)) {
+		ClusterSharedFsHandle *volatile handle = NULL;
+		MemoryContext oldcontext = CurrentMemoryContext;
+		const uint32 save_interrupt_holdoff = InterruptHoldoffCount;
+		const uint32 save_cancel_holdoff = QueryCancelHoldoffCount;
+		const uint32 save_crit_section = CritSectionCount;
+		volatile bool truncated = false;
+
+		/* An absent name is not an established replay reservation. The
+		 * recovery owner must qualify that case before any fork is deleted;
+		 * do not manufacture/adopt a possibly newer relation identity here. */
+		if (shared_replay && !cluster_shared_fs_exists(rlocator.locator, MAIN_FORKNUM))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("shared DROP replay requires a retained MAIN file"),
+					 errdetail("Relation %u/%u/%u has no qualified recovery-window reservation.",
+							   rlocator.locator.spcOid, rlocator.locator.dbOid,
+							   rlocator.locator.relNumber)));
+		PG_TRY();
+		{
+			if (shared_replay || cluster_shared_fs_exists(rlocator.locator, forknum)) {
+				ClusterSharedFsHandle *opened;
+
+				cluster_shared_fs_open_existing(rlocator.locator, forknum, &opened);
+				handle = opened;
+				cluster_shared_fs_truncate(handle, 0);
+				truncated = true;
+			}
+		}
+		PG_CATCH();
+		{
+			ErrorData *edata;
+
+			/* Online recovery must not advance after an unproven reservation.
+			 * Its owner retains the blocked window and retries or escalates. */
+			if (shared_replay) {
+				if (handle != NULL)
+					cluster_shared_fs_close(handle);
+				PG_RE_THROW();
+			}
+			MemoryContextSwitchTo(oldcontext);
+			edata = CopyErrorData();
+			FlushErrorState();
+			/* ERROR resets all three counters before longjmp. This warning
+			 * conversion must preserve the commit caller's HOLD_INTERRUPTS. */
+			InterruptHoldoffCount = save_interrupt_holdoff;
+			QueryCancelHoldoffCount = save_cancel_holdoff;
+			CritSectionCount = save_crit_section;
+			edata->elevel = WARNING;
+			ThrowErrorData(edata);
+			FreeErrorData(edata);
+		}
+		PG_END_TRY();
+		if (handle != NULL)
+			cluster_shared_fs_close(handle);
+		if (truncated && !shared_replay) {
+			FileTag tag;
+
+			cluster_smgr_init_filetag(&tag, rlocator.locator, forknum);
+			RegisterSyncRequest(&tag, SYNC_UNLINK_REQUEST, true);
+		}
+		/* Shared replay cannot use an ordinary local checkpoint as proof
+		 * that the failed thread's window will never run again. Until that
+		 * durable qualification is supplied, keep MAIN and enqueue nothing.
+		 * Normal cleanup failure likewise leaves the occupied name intact. */
+		return;
+	}
+
+	cluster_smgr_forget_fsync(rlocator.locator, forknum);
+	cluster_shared_fs_unlink(rlocator.locator, forknum);
+}
+
+
+/* Report only the original committed DROP's exact, durable physical result.
+ * Once that owner is found, failure must retain its responsibility and MAIN
+ * reservation, never fall through to unqualified per-fork cleanup. The KO
+ * consumer owns subsequent PI retirement; this function grants none.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+cluster_smgr_unlink_committed_drop(RelFileLocator locator)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+	const uint32 save_interrupt_holdoff = InterruptHoldoffCount;
+	const uint32 save_cancel_holdoff = QueryCancelHoldoffCount;
+	const uint32 save_crit_section = CritSectionCount;
+	volatile bool handled = false;
+
+	/* The original COMMIT tail transferred the work before any callback.
+	 * Only that original checkpointer work may start physical removal. */
+	if (cluster_ko_shared_native_drop_deferred_v2(locator))
+		return true;
+
+	PG_TRY();
+	{
+		ClusterKoCompletionV2 *completion = NULL;
+
+		if (cluster_ko_shared_pending_drop_v2(locator, &completion)) {
+			ClusterPageWalBindingV1 terminal;
+			ClusterSpaceStructureChange change;
+			uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+			const ClusterSharedFsOps *ops = cluster_shared_fs_get_active_ops();
+			bool completed = false;
+
+			handled = true;
+			if (completion != NULL && ops != NULL && ops->id == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS
+				&& cluster_ko_shared_space_observation_v2(completion, &terminal, wal, sizeof(wal))
+				&& cluster_space_structure_wal_decode(wal, sizeof(wal), &change)
+				&& change.identity.action == CLUSTER_SPACE_WAL_TOMBSTONE
+				&& RelFileLocatorEquals(change.identity.result.key.locator, locator)
+				&& RelFileLocatorEquals(terminal.identity.locator, locator)
+				&& change.identity.result.key.system_identifier
+					   == terminal.identity.system_identifier
+				&& change.identity.result.key.database_incarnation
+					   == terminal.source.claim.database_incarnation
+				&& memcmp(change.identity.result.key.storage_uuid, terminal.identity.storage_uuid,
+						  16)
+					   == 0
+				&& memcmp(change.identity.result.incarnation, terminal.version.segment_incarnation,
+						  16)
+					   == 0
+				&& change.identity.result_token == terminal.version.mutation_token) {
+				ForkNumber f;
+
+				/* Physical durability alone cannot release the MAIN reservation.
+				 * Structural retirement and closed recovery windows must also
+				 * be established by the original owner before reuse. */
+				for (f = MAIN_FORKNUM + 1; f <= MAX_FORKNUM; f++)
+					cluster_smgr_forget_fsync(locator, f);
+				if (cluster_shared_fs_sharedfs_drop_durable(&change.identity.result,
+															change.identity.result_token)
+					&& cluster_ko_shared_observe_drop_v2(completion))
+					completed = true;
+			}
+			if (!completed)
+				ereport(WARNING, (errmsg("could not establish the durable shared DROP result"),
+								  errdetail("Relation %u/%u/%u has no qualified physical "
+											"completion or relfilenumber reuse result.",
+											locator.spcOid, locator.dbOid, locator.relNumber)));
+		}
+	}
+	PG_CATCH();
+	{
+		ErrorData *edata;
+
+		/* An error may precede the borrow result; do not run legacy cleanup. */
+		handled = true;
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		FlushErrorState();
+		InterruptHoldoffCount = save_interrupt_holdoff;
+		QueryCancelHoldoffCount = save_cancel_holdoff;
+		CritSectionCount = save_crit_section;
+		edata->elevel = WARNING;
+		ThrowErrorData(edata);
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+	return handled;
+}
+
+/* One selected work per call; a failed physical attempt still advances the
+ * original cursor so it cannot starve other retained DROP obligations. */
+bool
+cluster_smgr_drop_work_poll(uint32 *cursor, bool *completed)
+{
+	static uint32 abandon_cursor;
+	ClusterKoDropWorkV2 *work = NULL;
+	const ClusterSharedFsOps *ops = cluster_shared_fs_get_active_ops();
+	bool failed;
+
+	if (cursor == NULL || completed == NULL || !cluster_shared_config || ops == NULL
+		|| ops->id != CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS)
+		return false;
+	/* One independently selected cleanup per tick, even when the execution cut
+	 * is no longer available. Unknown/transient admission is not abandonment.
+	 * Never report cleanup as physical cursor progress to the native caller. */
+	if (cluster_ko_shared_drop_work_abandon_next_v2(
+			&abandon_cursor, cluster_shared_fs_sharedfs_drop_work_size(), &work)) {
+		cluster_shared_fs_sharedfs_drop_work_abandon(work);
+		work = NULL;
+	} else
+		abandon_cursor = 0;
+	if (!cluster_ko_shared_drop_work_begin_v2(cursor, cluster_shared_fs_sharedfs_drop_work_size(),
+											  &work))
+		return false;
+	*completed = false;
+	if (cluster_shared_fs_sharedfs_drop_work(work, &failed))
+		*completed = cluster_ko_shared_drop_work_finish_v2(&work);
+	else if (failed)
+		cluster_shared_fs_sharedfs_drop_work_abandon(work);
+	return true;
+}
+
 void
 cluster_smgr_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
-	(void)isRedo;
-
 	/* spec-4.12 D5 (L240): reject before any handle close / physical unlink. */
 	cluster_write_fence_reject_if_fenced("unlink");
 	/* spec-6.4 INV-ADG5 (P0-1): an ADG standby write also needs the apply-master lease. */
@@ -502,18 +719,17 @@ cluster_smgr_unlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isR
 	if (forknum == InvalidForkNumber) {
 		ForkNumber f;
 
-		for (f = 0; f <= MAX_FORKNUM; f++) {
-			cluster_smgr_forget_fsync(rlocator.locator, f);
-			cluster_shared_fs_unlink(rlocator.locator, f);
-		}
+		if (!(cluster_shared_config && !isRedo && !IsBinaryUpgrade
+			  && !RelFileLocatorBackendIsTemp(rlocator)
+			  && cluster_smgr_unlink_committed_drop(rlocator.locator)))
+			for (f = 0; f <= MAX_FORKNUM; f++)
+				cluster_smgr_unlink_fork(rlocator, f, isRedo);
 
-		/* Drop the bypass state entry now that disk is gone. */
+		/* No backend handles remain, including the retained MAIN tombstone. */
 		if (cluster_smgr_relations != NULL)
 			hash_search(cluster_smgr_relations, &rlocator, HASH_REMOVE, NULL);
-	} else {
-		cluster_smgr_forget_fsync(rlocator.locator, forknum);
-		cluster_shared_fs_unlink(rlocator.locator, forknum);
-	}
+	} else
+		cluster_smgr_unlink_fork(rlocator, forknum, isRedo);
 }
 
 
@@ -721,10 +937,48 @@ cluster_smgr_syncfiletag(const FileTag *ftag, char *path)
 int
 cluster_smgr_unlinkfiletag(const FileTag *ftag, char *path)
 {
+	MemoryContext oldcontext = CurrentMemoryContext;
+	const uint32 save_interrupt_holdoff = InterruptHoldoffCount;
+	const uint32 save_cancel_holdoff = QueryCancelHoldoffCount;
+	const uint32 save_crit_section = CritSectionCount;
+	volatile int result = 0;
+	volatile int save_errno = 0;
+
 	snprintf(path, MAXPGPATH, "cluster_shared:%u/%u/%u fork %d", ftag->rlocator.spcOid,
 			 ftag->rlocator.dbOid, ftag->rlocator.relNumber, ftag->forknum);
-	cluster_shared_fs_unlink(ftag->rlocator, ftag->forknum);
-	return 0;
+	/* A checkpoint FileTag identifies only a pathname. It cannot establish
+	 * that PI structural responsibility is retired or every relevant recovery
+	 * window is durably closed, and must never remove a shared MAIN name.
+	 * SyncPostCheckpoint discards this best-effort entry even on error; this
+	 * refusal therefore grants no retry ownership or completion evidence. */
+	if (ftag->forknum == MAIN_FORKNUM && (cluster_shared_config || cluster_shared_catalog)) {
+		errno = EAGAIN;
+		return -1;
+	}
+	/* The vtable reports errors by throwing. SyncPostCheckpoint expects an
+	 * errno result so it can warn and retire this best-effort cleanup entry. */
+	PG_TRY();
+	{
+		cluster_shared_fs_unlink(ftag->rlocator, ftag->forknum);
+	}
+	PG_CATCH();
+	{
+		ErrorData *edata;
+
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		save_errno = edata->saved_errno != 0 ? edata->saved_errno : EIO;
+		FlushErrorState();
+		InterruptHoldoffCount = save_interrupt_holdoff;
+		QueryCancelHoldoffCount = save_cancel_holdoff;
+		CritSectionCount = save_crit_section;
+		FreeErrorData(edata);
+		result = -1;
+	}
+	PG_END_TRY();
+	if (result < 0)
+		errno = save_errno;
+	return result;
 }
 
 bool

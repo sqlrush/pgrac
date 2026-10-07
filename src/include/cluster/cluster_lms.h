@@ -90,6 +90,10 @@
 #include "cluster/cluster_lms_shard.h" /* CLUSTER_LMS_MAX_WORKERS (spec-7.3) */
 #include "cluster/cluster_pcm_own.h"
 
+struct ResourceXIntentSlot;
+extern void cluster_lms_outbound_resource_x_send_complete(const struct ResourceXIntentSlot *intent,
+														  bool sent);
+
 
 /*
  * ClusterLmsState -- HC2 4-state semantic SSOT.
@@ -170,7 +174,7 @@ typedef struct ClusterLmsNativeLockProbeSlot {
 	uint64 probe_id;				   /* monotonic per-shard id (HC36 epoch) */
 	LOCKTAG locktag;				   /* 16B PG LOCKTAG (RELATION / OBJECT) */
 	LOCKMODE lockmode;				   /* 4B PG LOCKMODE */
-	int32 origin_node_id;			   /* local cluster_node_id at acquire */
+	uint32 receiver_generation_lo;	   /* receiver-local enqueue cut, not wire origin */
 	int32 requester_procno;			   /* pgprocno of backend awaiting grant */
 	uint32 shard_master_generation_lo; /* spec-2.27 dedup carry for async grants */
 	ClusterGrdHolderId requester;	   /* HC32a exclude_holder identity */
@@ -459,7 +463,8 @@ typedef enum ClusterLmsEnqueueResult {
 	CLUSTER_LMS_ENQUEUE_ADMITTED = 0,
 	CLUSTER_LMS_ENQUEUE_FULL,
 	CLUSTER_LMS_ENQUEUE_INVALID,
-	CLUSTER_LMS_ENQUEUE_UNAVAILABLE
+	CLUSTER_LMS_ENQUEUE_UNAVAILABLE,
+	CLUSTER_LMS_ENQUEUE_NOT_DUE
 } ClusterLmsEnqueueResult;
 extern ClusterLmsEnqueueResult cluster_lms_outbound_try_enqueue(int worker_id, uint8 msg_type,
 																uint32 dest_node_id,
@@ -473,10 +478,17 @@ extern bool cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type
 												   uint32 connection_generation);
 struct ResourceXIntentSlot;
 struct ClusterPcmOwnSnapshot;
-extern bool cluster_lms_outbound_enqueue_resource_x_intent(int worker_id,
-														   const struct ResourceXIntentSlot *intent,
-														   uint32 connection_generation,
-														   uint64 deadline_us);
+/* NOT_DUE retains the owner and its attempt time; it owns no ring slot. */
+struct ResourceXDecodedFrame;
+extern ClusterLmsEnqueueResult
+cluster_lms_outbound_enqueue_resource_x_requester(int32 master,
+												  const struct ResourceXDecodedFrame *control,
+												  const struct ResourceXDecodedFrame *proof);
+
+extern ClusterLmsEnqueueResult
+cluster_lms_outbound_enqueue_resource_x_intent(int worker_id,
+											   const struct ResourceXIntentSlot *intent,
+											   uint32 connection_generation, uint64 deadline_us);
 
 /* Process-local handle for the current-slice remote-S holder adaptation.
  * It names one exact PENDING slot in the existing LMS DATA ring; none of

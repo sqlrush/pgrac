@@ -358,6 +358,11 @@ struct XLogReaderState
 	 * order; zero only as a stream prefix).  Reset by XLogBeginRead.
 	 */
 	uint64		cluster_last_scn;
+
+	/* Native CRC failure after a valid record header, for physical-tail
+	 * classification without matching translated error text.  This is not
+	 * proof of EOF: the caller must still check its known input bounds. */
+	bool		cluster_record_crc_failed;
 };
 
 /*

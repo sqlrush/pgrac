@@ -40,6 +40,9 @@
 #include "access/xlog_internal.h"
 #include "access/xlogprefetcher.h"
 #include "access/xlogutils.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_page_cold_redo.h"
+#endif
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/fd.h"
@@ -339,7 +342,8 @@ XLogReadBufferForRedo(XLogReaderState *record, uint8 block_id,
 
 /*
  * Pin and lock a buffer referenced by a WAL record, for the purpose of
- * re-initializing it.
+ * re-initializing it. Callers that may consume a typed cold SKIP or a
+ * restored image must use XLogReadBufferForRedoExtended and inspect its action.
  */
 Buffer
 XLogInitBufferForRedo(XLogReaderState *record, uint8 block_id)
@@ -358,7 +362,8 @@ XLogInitBufferForRedo(XLogReaderState *record, uint8 block_id)
  * In RBM_ZERO_* modes, if the page doesn't exist, the relation is extended
  * with all-zeroes pages up to the referenced block number.  In
  * RBM_ZERO_AND_LOCK and RBM_ZERO_AND_CLEANUP_LOCK modes, the return value
- * is always BLK_NEEDS_REDO.
+ * is BLK_NEEDS_REDO on the native path. Typed cold decisions can instead
+ * return BLK_NOTFOUND (with no buffer) or BLK_RESTORED.
  *
  * (The RBM_ZERO_AND_CLEANUP_LOCK mode is redundant with the get_cleanup_lock
  * parameter. Do not use an inconsistent combination!)
@@ -399,6 +404,15 @@ XLogReadBufferForRedoExtended(XLogReaderState *record,
 		elog(PANIC, "block with WILL_INIT flag in WAL record must be zeroed by redo routine");
 	if (!willinit && zeromode)
 		elog(PANIC, "block to be initialized in redo routine must be marked with WILL_INIT flag in the WAL record");
+
+#ifdef USE_PGRAC_CLUSTER
+	{
+		XLogRedoAction cold_action;
+		if (cluster_page_cold_redo_read_v1(record, block_id, mode, get_cleanup_lock,
+										 buf, &cold_action))
+			return cold_action;
+	}
+#endif
 
 	/* If it has a full-page image and it should be restored, do it. */
 	if (XLogRecBlockImageApply(record, block_id))

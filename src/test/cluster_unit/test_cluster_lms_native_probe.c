@@ -4,6 +4,8 @@
 #include "postgres.h"
 #include LMS_NATIVE_PROBE_SOURCE_PATH
 #include GES_DEDUP_SOURCE_PATH
+#include "cluster/cluster_ir.h"
+#include "cluster/cluster_wal_retention.h"
 #undef printf
 #include "unit_test.h"
 
@@ -43,6 +45,12 @@ static unsigned sends, grants, rejects, releases, wakes, sleeps, cv_cancels, pea
 static unsigned sleep_mode;
 static bool nested_completion;
 static uint64 epoch;
+static uint32 origin_generation;
+static uint64 admitted_receiver_generation;
+static int32 routing_master;
+static ClusterGrdShardPhase routing_phase;
+static unsigned converts;
+static uint64 convert_generation;
 static uint64 wire_ids[256];
 static ClusterGrdHolderId holders[128];
 static int n_holders;
@@ -55,6 +63,8 @@ static unsigned held_count;
 static bool stop_poll_in_completion;
 static bool stop_new_work_allowed = true;
 static unsigned stop_new_work_calls;
+static bool worker_pid_lock_busy;
+static unsigned postmaster_pid_reads, conditional_pid_reads;
 
 void
 hash_seq_init(HASH_SEQ_STATUS *scan, HTAB *table)
@@ -130,9 +140,25 @@ GetCurrentTimestamp(void)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	if (!IsUnderPostmaster) {
+		postmaster_pid_reads++;
+		/* Detect the forbidden postmaster queue before reading protected bytes. */
+		UT_ASSERT(!worker_pid_lock_busy);
+	}
 	if (held_count >= lengthof(held_locks) || LWLockHeldByMe(lock))
 		abort();
 	UT_ASSERT(mode == LW_SHARED || mode == LW_EXCLUSIVE);
+	held_locks[held_count++] = lock;
+	return true;
+}
+bool
+LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
+{
+	conditional_pid_reads++;
+	UT_ASSERT(mode == LW_SHARED);
+	if (worker_pid_lock_busy)
+		return false;
+	UT_ASSERT(held_count < lengthof(held_locks) && !LWLockHeldByMe(lock));
 	held_locks[held_count++] = lock;
 	return true;
 }
@@ -167,6 +193,25 @@ uint64
 cluster_epoch_get_current(void)
 {
 	return epoch;
+}
+int32
+cluster_grd_lookup_master_gen(const ClusterResId *resid, uint64 *generation)
+{
+	UT_ASSERT_EQ(resid->type, LOCKTAG_RELATION);
+	*generation = cluster_lms_get_shard_master_generation();
+	return routing_master;
+}
+uint32
+cluster_grd_shard_for_resource(const ClusterResId *resid)
+{
+	UT_ASSERT_EQ(resid->type, LOCKTAG_RELATION);
+	return 0;
+}
+ClusterGrdShardPhase
+cluster_grd_shard_phase(uint32 shard)
+{
+	UT_ASSERT_EQ(shard, 0);
+	return routing_phase;
 }
 void
 ProcessInterrupts(void)
@@ -315,12 +360,16 @@ cluster_grd_convert_grant_by_backend(const ClusterResId *id, int32 node, uint32 
 	(void)newmode;
 	(void)request;
 	(void)source;
-	(void)gen;
+	converts++;
+	convert_generation = gen;
 	return CLUSTER_GRD_CONVERT_GRANTED_INPLACE;
 }
 static void
 reset(void)
 {
+	IsUnderPostmaster = true;
+	worker_pid_lock_busy = false;
+	postmaster_pid_reads = conditional_pid_reads = 0;
 	UT_ASSERT_EQ(held_count, 0);
 	stop_new_work_allowed = true;
 	stop_new_work_calls = 0;
@@ -336,6 +385,12 @@ reset(void)
 	sleep_mode = 0;
 	nested_completion = false;
 	epoch = 9;
+	origin_generation = 7;
+	admitted_receiver_generation = (UINT64_C(9) << 32) | 7;
+	routing_master = 0;
+	routing_phase = GRD_SHARD_NORMAL;
+	converts = 0;
+	convert_generation = 0;
 	InterruptPending = 0;
 	memset(wire_ids, 0, sizeof(wire_ids));
 	memset(&dedup_state, 0, sizeof(dedup_state));
@@ -359,8 +414,8 @@ submit_exact(int procno, uint64 request_id, uint32 opcode)
 	holder.request_id = request_id;
 	holders[n_holders++] = holder;
 	return cluster_lms_native_probe_schedule_grant(
-		&id, ShareLock, &holder, 1, opcode, (UINT64_C(9) << 32) | 7,
-		opcode == GES_REQ_OPCODE_CONVERT ? AccessShareLock : NoLock);
+		&id, ShareLock, &holder, 1, opcode, (UINT64_C(9) << 32) | origin_generation,
+		admitted_receiver_generation, opcode == GES_REQ_OPCODE_CONVERT ? AccessShareLock : NoLock);
 }
 static bool
 submit_op(int procno, uint32 opcode)
@@ -659,6 +714,77 @@ UT_TEST(native_clear_completes_the_registered_nonzero_procno_receipt)
 	UT_ASSERT_EQ(occupied(), 0);
 }
 
+UT_TEST(async_origin_generation_is_not_receiver_authority)
+{
+	const uint32 opcodes[] = { GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_CONVERT };
+
+	for (unsigned i = 0; i < lengthof(opcodes); i++) {
+		ClusterGesDedupKey key = receipt_key(37, 1037);
+		GesReplyPayload reply = { 0 };
+
+		reset();
+		origin_generation = 47;
+		key.opcode = opcodes[i];
+		key.shard_master_generation = (UINT64_C(9) << 32) | 47;
+		UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+		UT_ASSERT(submit_op(37, opcodes[i]));
+		UT_ASSERT_EQ(sends, 1);
+		cluster_lms_native_probe_recv_reply(wire_ids[0], 1, CLUSTER_NATIVE_LOCK_PROBE_CLEAR);
+		cluster_lms_native_probe_retry_tick();
+		UT_ASSERT_EQ(grants, 1);
+		UT_ASSERT_EQ(rejects, 0);
+		UT_ASSERT_EQ(occupied(), 0);
+		UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_CACHED_REPLY);
+		UT_ASSERT_EQ(reply.opcode, GES_REPLY_OPCODE_GRANT);
+		UT_ASSERT_EQ(reply.reply_for_opcode, opcodes[i]);
+		UT_ASSERT_EQ(reply.holder_procno, 37);
+		if (opcodes[i] == GES_REQ_OPCODE_CONVERT) {
+			UT_ASSERT_EQ(converts, 1);
+			UT_ASSERT_EQ(convert_generation, (UINT64_C(9) << 32) | 47);
+		}
+	}
+}
+
+UT_TEST(async_changed_receiver_cut_cannot_grant)
+{
+	const uint32 opcodes[] = { GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_CONVERT };
+
+	for (unsigned i = 0; i < lengthof(opcodes); i++) {
+		for (int drift = 0; drift < 3; drift++) {
+			reset();
+			UT_ASSERT(submit_op(37, opcodes[i]));
+			UT_ASSERT_EQ(sends, 1);
+			if (drift == 2)
+				routing_phase = GRD_SHARD_REBUILDING;
+			else if (drift == 1)
+				routing_master = 1;
+			else
+				pg_atomic_write_u64(&state.lms_restart_generation, 8);
+			cluster_lms_native_probe_recv_reply(wire_ids[0], 1, CLUSTER_NATIVE_LOCK_PROBE_CLEAR);
+			UT_ASSERT_EQ(grants, 0);
+			UT_ASSERT_EQ(converts, 0);
+			UT_ASSERT_EQ(rejects, 1);
+			UT_ASSERT_EQ(occupied(), 0);
+			UT_ASSERT_EQ(releases, opcodes[i] == GES_REQ_OPCODE_CONVERT ? 0 : 1);
+		}
+	}
+}
+
+UT_TEST(async_dispatch_keeps_the_original_admitted_cut)
+{
+	reset();
+	/* The drain accepted receiver7. It must not be relabelled receiver8
+	 * merely because fanout starts after that local restart. */
+	pg_atomic_write_u64(&state.lms_restart_generation, 8);
+	UT_ASSERT(submit(37));
+	cluster_lms_native_probe_retry_tick();
+	UT_ASSERT_EQ(sends, 0);
+	UT_ASSERT_EQ(grants, 0);
+	UT_ASSERT_EQ(rejects, 1);
+	UT_ASSERT_EQ(releases, 1);
+	UT_ASSERT_EQ(occupied(), 0);
+}
+
 UT_TEST(native_timeout_completes_the_exact_reject_receipt)
 {
 	ClusterGesDedupKey key = receipt_key(37, 1037);
@@ -946,10 +1072,111 @@ UT_TEST(normal_stop_ges_invalid_overrides_pending_and_wrong_observer)
 	MyBackendType = B_LMS;
 }
 
+UT_TEST(ordered_control_retirement_removes_pending_and_complete_exact_receipts)
+{
+	ClusterGesDedupKey key = receipt_key(37, 1037);
+	ClusterGesDedupKey other = key;
+	GesReplyPayload reply = { 0 };
+	int i;
+
+	reset();
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+	for (i = 0; i < 4; i++) {
+		other = key;
+		if (i == 0)
+			other.origin_node_id++;
+		if (i == 1)
+			other.holder_procno++;
+		if (i == 2)
+			other.cluster_epoch++;
+		if (i == 3)
+			other.request_id++;
+		UT_ASSERT_EQ(lookup_receipt(&other, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+	}
+	other = key;
+	other.opcode = GES_REQ_OPCODE_REDECLARE;
+	other.shard_master_generation++;
+	UT_ASSERT_EQ(lookup_receipt(&other, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+	cluster_ges_dedup_record_reply(&other, (uint8 *)&reply, sizeof(reply));
+	UT_ASSERT(cluster_ges_dedup_retire_control_request(1, 37, 9, 1037));
+	UT_ASSERT_EQ(cluster_ges_dedup_entry_count(), 4);
+	UT_ASSERT(cluster_ges_dedup_retire_control_request(1, 37, 9, 1037));
+	UT_ASSERT_EQ(cluster_ges_dedup_entry_count(), 4);
+	cluster_ges_dedup_htab = NULL;
+	UT_ASSERT(!cluster_ges_dedup_retire_control_request(1, 37, 9, 1037));
+}
+
+UT_TEST(control_namespaces_have_no_native_probe_continuation)
+{
+	ClusterResId resid = { 0 };
+	const uint8 types[]
+		= { CLUSTER_CF_RESID_TYPE, CLUSTER_WAL_RETENTION_RESID_TYPE, CLUSTER_IR_RESID_TYPE };
+	unsigned i;
+	LOCKMODE mode;
+
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	for (i = 0; i < lengthof(types); ++i) {
+		resid.type = types[i];
+		resid.field1 = i == 0 ? 0 : 1;
+		resid.field2 = i == 2 ? 1 : 0;
+		for (mode = AccessShareLock; mode <= AccessExclusiveLock; ++mode)
+			UT_ASSERT(!cluster_lms_native_probe_required(&resid, mode));
+	}
+	resid.type = LOCKTAG_RELATION;
+	UT_ASSERT(cluster_lms_native_probe_required(&resid, ExclusiveLock));
+}
+
+UT_TEST(postmaster_serving_request_survives_contended_optional_wake)
+{
+	reset();
+	IsUnderPostmaster = false;
+	pg_atomic_write_u32(&state.lms_state, CLUSTER_LMS_STARTING);
+	pg_atomic_init_u64(&state.recovery_ready_generation, 7);
+	pg_atomic_init_u64(&state.serving_requested_generation, 0);
+	state.worker_pids[0] = MyProcPid;
+	worker_pid_lock_busy = true;
+	UT_ASSERT(cluster_lms_request_serving());
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state.serving_requested_generation), 7);
+	UT_ASSERT_EQ(postmaster_pid_reads, 0);
+	UT_ASSERT_EQ(conditional_pid_reads, 1);
+	UT_ASSERT_EQ(held_count, 0);
+	worker_pid_lock_busy = false;
+	UT_ASSERT_EQ(cluster_lms_get_worker_pid(0), MyProcPid);
+	UT_ASSERT_EQ(held_count, 0);
+	pg_atomic_write_u64(&state.recovery_ready_generation, 6);
+	pg_atomic_write_u64(&state.serving_requested_generation, 0);
+	UT_ASSERT(!cluster_lms_request_serving());
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state.serving_requested_generation), 0);
+	UT_ASSERT_EQ(conditional_pid_reads, 2);
+}
+
+UT_TEST(worker_pid_read_retains_child_locking_and_absence)
+{
+	reset();
+	state.worker_pids[0] = 42;
+	UT_ASSERT_EQ(cluster_lms_get_worker_pid(0), 42);
+	UT_ASSERT_EQ(conditional_pid_reads, 0);
+	UT_ASSERT_EQ(held_count, 0);
+	IsUnderPostmaster = false;
+	worker_pid_lock_busy = true;
+	UT_ASSERT_EQ(cluster_lms_get_worker_pid(0), 0);
+	UT_ASSERT_EQ(postmaster_pid_reads, 0);
+	UT_ASSERT_EQ(conditional_pid_reads, 1);
+	UT_ASSERT_EQ(cluster_lms_get_worker_pid(-1), 0);
+	UT_ASSERT_EQ(cluster_lms_get_worker_pid(CLUSTER_LMS_MAX_WORKERS), 0);
+	cluster_lms_state = NULL;
+	UT_ASSERT_EQ(cluster_lms_get_worker_pid(0), 0);
+	UT_ASSERT_EQ(conditional_pid_reads, 1);
+	IsUnderPostmaster = true;
+}
+
 int
 main(void)
 {
-	printf("1..30\n");
+	printf("1..37\n");
+	UT_RUN(async_origin_generation_is_not_receiver_authority);
+	UT_RUN(async_changed_receiver_cut_cannot_grant);
+	UT_RUN(async_dispatch_keeps_the_original_admitted_cut);
 	UT_RUN(normal_stop_probe_owner_and_original_slot_locks);
 	UT_RUN(normal_stop_probe_all_descriptors_and_invalid_priority);
 	UT_RUN(normal_stop_probe_original_finish_not_final_ready);
@@ -980,6 +1207,10 @@ main(void)
 	UT_RUN(native_completion_cannot_overwrite_another_backend_receipt);
 	UT_RUN(only_completed_exact_receipts_can_be_retired);
 	UT_RUN(native_grant_release_cycles_do_not_fill_the_receipt_table);
+	UT_RUN(ordered_control_retirement_removes_pending_and_complete_exact_receipts);
+	UT_RUN(control_namespaces_have_no_native_probe_continuation);
+	UT_RUN(postmaster_serving_request_survives_contended_optional_wake);
+	UT_RUN(worker_pid_read_retains_child_locking_and_absence);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

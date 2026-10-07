@@ -27770,6 +27770,13 @@ postgres=# SELECT '0/0'::pg_lsn + pd.segment_number * ps.setting::int + :offset 
            fork, if any, associated with the relation.
           </para>
          </listitem>
+         <!-- PGRAC: additional fork accepted only in cluster-enabled builds. -->
+         <listitem>
+          <para>
+           In a PGRAC cluster-enabled build, <literal>space</literal> returns
+           the size of the relation's persistent metadata fork, if present.
+          </para>
+         </listitem>
         </itemizedlist>
        </para></entry>
       </row>

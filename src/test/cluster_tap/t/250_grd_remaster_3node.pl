@@ -81,6 +81,7 @@ use lib "$FindBin::RealBin/../../perl";
 
 use PostgreSQL::Test::ClusterTriple;
 use Test::More;
+use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC);
 
 sub poll_query_until_timeout
 {
@@ -197,21 +198,6 @@ $sessB->query("SELECT pg_advisory_xact_lock($K_leak)");
 
 my $sessB_pid = $sessB->query_safe('SELECT pg_backend_pid()');
 
-# sessC (node0!) conflicts on K_un -> the REMOTE request path enqueues
-# a waiter on node2 under the OLD epoch (the local-master path never
-# queues waiters), then errors client-side at the bounded GES timeout.
-# The stale waiter entry stays queued on node2 — and node0 then dies
-# with its owner, so only the pop guard / P6 can clean it.
-my $sessC = $triple->node0->background_psql('postgres', on_error_stop => 0);
-$sessC->query_safe('BEGIN');
-$sessC->query("SELECT pg_advisory_xact_lock($K_un)");
-
-ok(poll_query_until_timeout($triple->node2, 'postgres',
-		qq{SELECT nwaiters >= 1 FROM pg_cluster_grd_entries
-		    WHERE type = 10 AND lockmethodid = 2 AND field4 = 1 AND field3 = $K_un},
-		't', 10, 'G2 stale waiter queued on node2'),
-	'G2 sessC (node0) queued as waiter on node2 under the old epoch');
-
 ok(poll_query_until_timeout($triple->node0, 'postgres',
 		qq{SELECT ngranted = 1 FROM pg_cluster_grd_entries
 		    WHERE type = 10 AND lockmethodid = 2 AND field4 = 1 AND field3 = $K_aff},
@@ -223,11 +209,36 @@ ok(poll_query_until_timeout($triple->node2, 'postgres',
 		't', 10, 'G2 leak-actor holder visible on node2'),
 	'G2 sessB holder on node2 (the future leak) visible in node2 GRD');
 
+# sessC (node0!) conflicts on K_un -> the REMOTE request path enqueues
+# a waiter on node2 under the OLD epoch (the local-master path never
+# queues waiters). Observe it while the request is still pending: a
+# completed timeout cancels the waiter and cannot establish this premise.
+# node0 then dies with the pending owner, exercising old-epoch cleanup.
+my $sessC = $triple->node0->background_psql('postgres', on_error_stop => 0);
+$sessC->query_safe('BEGIN');
+my $sessC_started_at = clock_gettime(CLOCK_MONOTONIC);
+$sessC->query_until(qr/sessC conflict issued/,
+	"\\echo 'sessC conflict issued'\nSELECT pg_advisory_xact_lock($K_un);\n");
+
+ok(poll_query_until_timeout($triple->node2, 'postgres',
+		qq{SELECT nwaiters >= 1 FROM pg_cluster_grd_entries
+		    WHERE type = 10 AND lockmethodid = 2 AND field4 = 1 AND field3 = $K_un},
+		't', 10, 'G2 stale waiter queued on node2'),
+	'G2 sessC (node0) queued as waiter on node2 under the old epoch')
+	or BAIL_OUT('pending waiter premise was not established');
+
+
+
 
 # ----------
 # G3: kill node0 -> reconfig on both survivors -> deterministic remaster.
 # ----------
 $triple->kill_node9(0);
+# Reject a scheduling-delayed sample: killing after the original 2000ms
+# request deadline cannot prove cleanup of a pending request.
+cmp_ok(clock_gettime(CLOCK_MONOTONIC) - $sessC_started_at, '<', 2,
+	'G3 requester killed before its original GES timeout')
+	or BAIL_OUT('fault arrived after the pending waiter budget');
 
 for my $i (1, 2)
 {

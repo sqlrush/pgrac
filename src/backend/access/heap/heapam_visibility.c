@@ -113,6 +113,7 @@
 #include "cluster/cluster_epoch.h"				/* cluster_epoch_get_current (spec-3.3 D10) */
 #include "cluster/cluster_guc.h"				/* cluster_enabled, cluster_node_id */
 #include "cluster/cluster_gcs_block.h"			/* current block write permission */
+#include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_itl.h"				/* cluster_itl_get_tt_ref */
 #include "cluster/cluster_itl_cleanout.h"		/* cluster_itl_cleanout_lazy (spec-3.4c D4) */
 #include "cluster/cluster_itl_slot.h"			/* CLUSTER_ITL_SLOT_UNALLOCATED */
@@ -242,6 +243,9 @@ static inline void
 SetHintBits(HeapTupleHeader tuple, Buffer buffer, uint16 infomask, TransactionId xid)
 {
 #ifdef USE_PGRAC_CLUSTER
+	RfPageProducerBatchV1 hint_batch;
+	ClusterSpaceHintResult hint_result = CLUSTER_SPACE_HINT_NATIVE;
+
 	/*
 	 * PGRAC: spec-6.15 D7 — never stamp a hint whose truth this node cannot
 	 * know: commit/abort bits for another node's xid class come from native
@@ -271,7 +275,21 @@ SetHintBits(HeapTupleHeader tuple, Buffer buffer, uint16 infomask, TransactionId
 		}
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config) {
+		if ((tuple->t_infomask & infomask) == infomask)
+			return;
+		hint_result = cluster_space_hint_begin(buffer, &hint_batch);
+		if (hint_result == CLUSTER_SPACE_HINT_SKIPPED)
+			return;
+	}
+#endif
 	tuple->t_infomask |= infomask;
+#ifdef USE_PGRAC_CLUSTER
+	if (hint_result == CLUSTER_SPACE_HINT_VERSIONED)
+		cluster_space_hint_finish(buffer, true, &hint_batch);
+	else
+#endif
 	MarkBufferDirtyHint(buffer, true);
 }
 
@@ -295,6 +313,9 @@ SetHintBits(HeapTupleHeader tuple, Buffer buffer, uint16 infomask, TransactionId
 void
 cluster_heap_stamp_released_xmax_invalid(HeapTupleHeader tuple, Buffer buffer)
 {
+	RfPageProducerBatchV1 hint_batch;
+	ClusterSpaceHintResult hint_result = CLUSTER_SPACE_HINT_NATIVE;
+
 	/* A proved terminal transaction is not itself permission to mutate a
 	 * retained/read image.  MarkBufferDirtyHint's refusal comes too late to
 	 * protect tuple bytes; check the existing writer gate before the store. */
@@ -305,7 +326,18 @@ cluster_heap_stamp_released_xmax_invalid(HeapTupleHeader tuple, Buffer buffer)
 								  "PGRAC_REASON=RELEASED_XMAX_WRITE_NOT_PERMITTED "
 								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0",
 								  cluster_node_id)));
+	if (tuple->t_infomask & HEAP_XMAX_INVALID)
+		return;
+	if (cluster_shared_config) {
+		hint_result = cluster_space_hint_begin(buffer, &hint_batch);
+		if (hint_result == CLUSTER_SPACE_HINT_SKIPPED)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("released xmax requires a pre-lock SPACE identity and content-X")));
+	}
 	tuple->t_infomask |= HEAP_XMAX_INVALID;
+	if (hint_result == CLUSTER_SPACE_HINT_VERSIONED)
+		cluster_space_hint_finish(buffer, true, &hint_batch);
+	else
 	MarkBufferDirtyHint(buffer, true);
 }
 #endif
@@ -2131,8 +2163,8 @@ cluster_heap_r4_trace_format(const ClusterR4ScratchTrace *trace, char *out, Size
  * HeapTupleSatisfiesMVCC(), CR, cleanout, hints, or SSI; the existing origin
  * service still owns its transaction-table/CLOG cross-checks.
  */
-bool
-HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
+static bool
+HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 							  const ClusterR4HotScratchTestContext *context)
 {
 #ifdef USE_PGRAC_CLUSTER
@@ -2191,9 +2223,12 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 
 	/* A frozen creator is already proved by the immutable tuple flags.
 	 * Its raw xmin is historical data; its former DATA slot may be reused.
+	 * BootstrapTransactionId is PG's permanently committed bootstrap creator
+	 * and likewise needs no DATA slot or transaction-table lookup.
 	 * This says nothing about xmax, which still has to be checked below. */
-	if (!HeapTupleHeaderXminFrozen(tuple)) {
-		raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
+	raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
+	if (!HeapTupleHeaderXminFrozen(tuple)
+		&& !TransactionIdEquals(raw_xmin, BootstrapTransactionId)) {
 		if (!TransactionIdIsNormal(raw_xmin))
 			cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin is not a normal xid");
 		creator_index = cluster_r4_scratch_creator_slot(page, tuple->t_itl_slot_idx, raw_xmin);
@@ -2322,6 +2357,31 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 #endif
 }
 
+/* Keep the actual evaluator separate from the ActiveSnapshot stack. */
+bool
+HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
+							  const ClusterR4HotScratchTestContext *context)
+{
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSnapshotReadScopeV1 scope;
+	bool result;
+
+	cluster_snapshot_read_enter_v1(&scope, snapshot);
+	PG_TRY();
+	{
+		result = HeapTupleSatisfiesMVCCScratchInternal(htup, snapshot, context);
+	}
+	PG_FINALLY();
+	{
+		cluster_snapshot_read_exit_v1(&scope);
+	}
+	PG_END_TRY();
+	return result;
+#else
+	return HeapTupleSatisfiesMVCCScratchInternal(htup, snapshot, context);
+#endif
+}
+
 /*
  * HeapTupleSatisfiesMVCC
  *		True iff heap tuple is valid for the given MVCC snapshot.
@@ -2345,7 +2405,7 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
  * and more contention on ProcArrayLock.
  */
 static bool
-HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
+HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 {
 	HeapTupleHeader tuple = htup->t_data;
 
@@ -2515,11 +2575,12 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 							   cluster_node_id)));
 
-		/* P0-27: VACUUM's exact FROZEN bit pair is already a durable
-		 * xmin-committed proof.  Do not turn that terminal cleanout back into
-		 * one origin verdict round per tuple.  The xmax half remains mandatory:
-		 * a frozen inserter says nothing about a later foreign deleter. */
-		if (!cluster_vis_xmin_needs_resolution(tuple->t_infomask)) {
+		/* VACUUM's exact FROZEN pair and PG's permanent bootstrap creator
+		 * already prove xmin committed. Neither needs a still-bound DATA slot.
+		 * The xmax half remains mandatory: creation proves nothing about a
+		 * later foreign deleter. */
+		if (!cluster_vis_xmin_needs_resolution(tuple->t_infomask)
+			|| TransactionIdEquals(raw_xmin, BootstrapTransactionId)) {
 			switch (cluster_remote_live_xmax_keeps_visible(buffer, tuple, snapshot)) {
 			case 1:
 				return true;
@@ -3074,6 +3135,31 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	return false;
 }
 
+
+static bool
+HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
+{
+#ifdef USE_PGRAC_CLUSTER
+	if (snapshot->cluster_source == SNAPSHOT_SOURCE_CLUSTER)
+	{
+		ClusterSnapshotReadScopeV1 scope;
+		bool result;
+
+		cluster_snapshot_read_enter_v1(&scope, snapshot);
+		PG_TRY();
+		{
+			result = HeapTupleSatisfiesMVCCInternal(htup, snapshot, buffer);
+		}
+		PG_FINALLY();
+		{
+			cluster_snapshot_read_exit_v1(&scope);
+		}
+		PG_END_TRY();
+		return result;
+	}
+#endif
+	return HeapTupleSatisfiesMVCCInternal(htup, snapshot, buffer);
+}
 
 #ifdef USE_CLUSTER_UNIT
 bool

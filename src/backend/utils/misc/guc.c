@@ -20,6 +20,12 @@
  * IDENTIFICATION
  *	  src/backend/utils/misc/guc.c
  *
+ * PGRAC MODIFICATIONS: share native FILE removal/default handling with the
+ * root-selected configuration consumer; ordinary PG file parsing is unchanged.
+ * Census cumulative shared FILE obligations, including removed settings.
+ * Revoke a fork-inheritance receipt before native parallel GUC restoration.
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *--------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -49,6 +55,10 @@
 #include "utils/guc_tables.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_shared_config.h"
+#include "cluster/cluster_guc.h"
+#endif
 
 
 #define CONFIG_FILENAME "postgresql.conf"
@@ -263,6 +273,101 @@ static bool call_string_check_hook(struct config_string *conf, char **newval,
 static bool call_enum_check_hook(struct config_enum *conf, int *newval,
 								 void **extra, GucSource source, int elevel);
 
+/* PGRAC: the same reset/stack operation for local and root-selected files.
+ * Caller has checked mutability and whether the selected entry was removed.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static int
+remove_config_file_setting(struct config_generic *gconf, GucContext context,
+						   int elevel)
+{
+	GucStack   *stack;
+
+	/* Reset FILE sources so the wired-in default can replace them. */
+	if (gconf->reset_source == PGC_S_FILE)
+		gconf->reset_source = PGC_S_DEFAULT;
+	if (gconf->source == PGC_S_FILE)
+		set_guc_source(gconf, PGC_S_DEFAULT);
+	for (stack = gconf->stack; stack; stack = stack->prev)
+	{
+		if (stack->source == PGC_S_FILE)
+			stack->source = PGC_S_DEFAULT;
+	}
+	return set_config_option(gconf->name, NULL, context, PGC_S_DEFAULT,
+							 GUC_ACTION_SET, true, elevel, false);
+}
+
+static void
+restore_config_file_defaults(void)
+{
+	InitializeGUCOptionsFromEnvironment();
+	pg_timezone_abbrev_initialize();
+	/* SQL_ASCII in processes not connected to a database. */
+	SetConfigOption("client_encoding", GetDatabaseEncodingName(),
+					PGC_BACKEND, PGC_S_DYNAMIC_DEFAULT);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: native process-local helpers, not shared configuration authority.
+ * Defer child-only settings BEFORE touching their sources/stack. The postmaster
+ * must separately consume them for future children; this is not its ACK.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+GucFileResetResult
+ClusterResetConfigFileSetting(const char *name)
+{
+	struct config_generic *gconf = find_option(name, false, true, DEBUG1);
+
+	if (gconf == NULL)
+		return GUC_FILE_RESET_FAILED;
+	if (gconf->context < PGC_SIGHUP || cluster_shared_config_restart_only(gconf))
+	{
+		gconf->status |= GUC_PENDING_RESTART;
+		return GUC_FILE_RESET_PENDING_RESTART;
+	}
+	if (IsUnderPostmaster &&
+		(gconf->context == PGC_BACKEND || gconf->context == PGC_SU_BACKEND))
+		return GUC_FILE_RESET_DEFERRED;
+	if (gconf->reset_source != PGC_S_FILE)
+		return GUC_FILE_RESET_DONE;
+	return remove_config_file_setting(gconf, PGC_SIGHUP, DEBUG1) != 0
+		? GUC_FILE_RESET_DONE : GUC_FILE_RESET_FAILED;
+}
+
+void
+ClusterRestoreConfigFileDefaults(void)
+{
+	restore_config_file_defaults();
+}
+
+/* PGRAC: process-local gauges, not latest-diff counts or application ACKs.
+ * Only the shared consumer marks these records. Native pending_restart stays
+ * authoritative even after a name disappears from subsequent selected images.
+ * Existing-child deferred state is deliberately not cleared by an unrelated
+ * reload or by session SET/RESET. No assignment, allocation or wait here.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+void
+ClusterConfigFilePending(uint32 *restart, uint32 *deferred)
+{
+	HASH_SEQ_STATUS status;
+	GUCHashEntry *hentry;
+
+	*restart = *deferred = 0;
+	hash_seq_init(&status, guc_hashtab);
+	while ((hentry = (GUCHashEntry *)hash_seq_search(&status)) != NULL) {
+		struct config_generic *gconf = hentry->gucvar;
+
+		if (!(gconf->status & GUC_SHARED_FILE))
+			continue;
+		if (gconf->status & GUC_PENDING_RESTART)
+			++*restart;
+		if (gconf->status & GUC_SHARED_DEFERRED)
+			++*deferred;
+	}
+}
+#endif
+
 
 /*
  * This function handles both actual config file (re)loads and execution of
@@ -447,7 +552,6 @@ ProcessConfigFileInternal(GucContext context, bool applySettings, int elevel)
 	while ((hentry = (GUCHashEntry *) hash_seq_search(&status)) != NULL)
 	{
 		struct config_generic *gconf = hentry->gucvar;
-		GucStack   *stack;
 
 		if (gconf->reset_source != PGC_S_FILE ||
 			(gconf->status & GUC_IS_IN_FILE))
@@ -472,24 +576,8 @@ ProcessConfigFileInternal(GucContext context, bool applySettings, int elevel)
 		if (!applySettings)
 			continue;
 
-		/*
-		 * Reset any "file" sources to "default", else set_config_option will
-		 * not override those settings.
-		 */
-		if (gconf->reset_source == PGC_S_FILE)
-			gconf->reset_source = PGC_S_DEFAULT;
-		if (gconf->source == PGC_S_FILE)
-			set_guc_source(gconf, PGC_S_DEFAULT);
-		for (stack = gconf->stack; stack; stack = stack->prev)
-		{
-			if (stack->source == PGC_S_FILE)
-				stack->source = PGC_S_DEFAULT;
-		}
-
-		/* Now we can re-apply the wired-in default (i.e., the boot_val) */
-		if (set_config_option(gconf->name, NULL,
-							  context, PGC_S_DEFAULT,
-							  GUC_ACTION_SET, true, 0, false) > 0)
+		/* PGRAC: factor the original operation, retaining native diagnostics. */
+		if (remove_config_file_setting(gconf, context, 0) > 0)
 		{
 			/* Log the change if appropriate */
 			if (context == PGC_SIGHUP)
@@ -513,13 +601,7 @@ ProcessConfigFileInternal(GucContext context, bool applySettings, int elevel)
 	 * could potentially have PGC_S_DYNAMIC_DEFAULT or PGC_S_ENV_VAR source.
 	 */
 	if (context == PGC_SIGHUP && applySettings)
-	{
-		InitializeGUCOptionsFromEnvironment();
-		pg_timezone_abbrev_initialize();
-		/* this selects SQL_ASCII in processes not connected to a database */
-		SetConfigOption("client_encoding", GetDatabaseEncodingName(),
-						PGC_BACKEND, PGC_S_DYNAMIC_DEFAULT);
-	}
+		restore_config_file_defaults();
 
 	/*
 	 * Now apply the values from the config file.
@@ -3384,7 +3466,15 @@ set_config_option_ext(const char *name, const char *value,
 	 * Check if the option can be set at this time. See guc.h for the precise
 	 * rules.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: common protocol values are persistent-only until cold restart.
+	 * Reuse native canonical comparison/pending bits without changing the
+	 * registry context used by the configuration profile ABI.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	switch (cluster_shared_config_restart_only(record) ? PGC_POSTMASTER : record->context)
+#else
 	switch (record->context)
+#endif
 	{
 		case PGC_INTERNAL:
 			if (context != PGC_INTERNAL)
@@ -4618,6 +4708,21 @@ AlterSystemSetConfigFile(AlterSystemStmt *altersysstmt)
 						 errmsg("parameter value for ALTER SYSTEM must not contain a newline")));
 		}
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: retain native privilege/value/audit checks, but never publish a
+	 * second local authority when this database uses root-selected defaults.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	if (cluster_shared_config)
+	{
+		InvokeObjectPostAlterHookArgStr(ParameterAclRelationId, name,
+										ACL_ALTER_SYSTEM,
+										altersysstmt->setstmt->kind, false);
+		cluster_shared_config_alter_system(resetall ? NULL : name, value);
+		return;
+	}
+#endif
 
 	/*
 	 * PG_AUTOCONF_FILENAME and its corresponding temporary file are always in
@@ -6086,6 +6191,12 @@ RestoreGUCState(void *gucstate)
 	Size		len;
 	dlist_mutable_iter iter;
 	ErrorContextCallback error_context_callback;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: the leader snapshot can predate this worker's PM defaults.
+	 * It cannot retain the inherited configuration application receipt. */
+	cluster_shared_config_process_parallel_restore();
+#endif
 
 	/*
 	 * First, ensure that all potentially-shippable GUCs are reset to their

@@ -232,6 +232,18 @@ cluster_multixact_remote_xmax_visibility_dispatch(const ClusterMultiXactSourceRe
 
 struct ClusterSideProjectionOperationV1;
 
+/* Native per-origin recovery storage; caller retains the original SIDE scope. */
+extern bool
+cluster_multixact_native_recovery_apply(int origin_node,
+										const struct ClusterSideProjectionOperationV1 *operation,
+										const uint8 *owned_payload, uint32 owned_payload_length,
+										XLogRecPtr source_lsn, XLogRecPtr source_end_lsn);
+extern bool
+cluster_multixact_native_recovery_verify(int origin_node,
+										 const struct ClusterSideProjectionOperationV1 *operation,
+										 const uint8 *owned_payload, uint32 owned_payload_length,
+										 XLogRecPtr source_lsn, XLogRecPtr source_end_lsn);
+
 /* RF-SIDE retained-redo rebuild path.  These callback-shaped APIs bypass the
  * R4 semantic-serving gate only to mutate/verify non-authoritative projection
  * metadata; they never grant terminal state, readiness or OPEN. */

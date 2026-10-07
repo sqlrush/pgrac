@@ -31,6 +31,22 @@
  *	    path) deliberately skipped -- only top-level abort decisions
  *	    advance SCN per Q4.
  *
+ *	What changed (F-D-29, Spec: spec-s9p2-05-instance-and-cluster-recovery.md):
+ *	  - RecordTransactionCommit(): the folded TT commit stamp is only staged
+ *	    before the commit record; it is written after our own XLogFlush,
+ *	    inside the commit critical section and before pg_xact is updated
+ *	    (cluster_tt_local_commit_durable_apply).  A commit carrying a staged
+ *	    stamp therefore always flushes its commit record, even when
+ *	    synchronous_commit is off.
+ *
+ *	What changed (PRE2 two-phase limitation, Spec:
+ *	spec-s9p2-05-instance-and-cluster-recovery.md):
+ *	  - PrepareTransaction(): with cluster mode on, PREPARE TRANSACTION is
+ *	    refused after PostgreSQL's own "cannot PREPARE" checks and before any
+ *	    prepare work, so the transaction rolls back and its block ends as for
+ *	    those checks.  COMMIT/ROLLBACK PREPARED still finish an existing
+ *	    prepared transaction.
+ *
  *	What changed (spec-7.4 D1):
  *	  - RecordTransactionCommit(): durable-frontier wiring.  LSN fill-in
  *	    after XactLogCommitRecord (crit-section-safe shmem write);  a
@@ -160,6 +176,7 @@
 #include "cluster/cluster_mode.h"		/* cluster_storage_mode_enabled */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_guc.h"		/* PGRAC: spec-2.6 cluster_enabled gate */
+#include "cluster/cluster_shared_config.h" /* PGRAC: delayed native configuration */
 #include "cluster/cluster_qvotec.h" /* PGRAC: spec-2.6 in_quorum lease check */
 #include "cluster/cluster_scn.h"
 #ifdef USE_PGRAC_CLUSTER
@@ -175,6 +192,8 @@
 #include "cluster/cluster_node_remove.h"		  /* PGRAC: spec-5.18 INV-LF9 self-demote gate */
 #include "cluster/cluster_reconfig.h"			  /* PGRAC: spec-5.15 §2.4 joiner write gate */
 #include "cluster/cluster_sf_dep.h"			  /* PGRAC: spec-6.2 Smart Fusion commit brake */
+#include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_xnode_profile.h"	  /* PGRAC: spec-7.4 D0 commit census probes */
 #include "cluster/storage/cluster_undo_xlog.h" /* PGRAC: spec-3.18 D4.1 TT fold redo stamp */
 #endif
@@ -1481,7 +1500,11 @@ RecordTransactionCommit(void)
 	SharedInvalidationMessage *invalMessages = NULL;
 	bool		RelcacheInitFileInval = false;
 	bool		wrote_xlog;
+	const char *space_drop_data = NULL;
+	uint32		space_drop_len = 0;
 #ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceDropState *space_drop = NULL;
+
 	/*
 	 * PGRAC (spec-3.3 D7 / R3 P1): hoist commit_scn from the inner else
 	 * block to function scope so the later cluster_tt_local_record_commit()
@@ -1490,6 +1513,9 @@ RecordTransactionCommit(void)
 	 * additional SCN allocation.
 	 */
 	SCN			tt_commit_scn = InvalidScn;
+	bool		tt_stamp_staged = false;	/* PGRAC: F-D-29 -- a folded TT
+											 * commit stamp waits for this
+											 * commit record's flush */
 	bool		commit_record_flushed = false;	/* PGRAC: spec-7.4 D1 -- set
 												 * inside the commit critical
 												 * section after our own
@@ -1689,6 +1715,7 @@ RecordTransactionCommit(void)
 				cluster_xp_begin(&commit_xps, CLXP_C_COMMIT_TT_STAMP);
 				has_tt_fold =
 					cluster_tt_local_precommit_durable_finish(xid, tt_commit_scn, &tt_fold);
+				tt_stamp_staged = has_tt_fold;
 				cluster_xp_end(&commit_xps);
 			}
 
@@ -1716,8 +1743,23 @@ RecordTransactionCommit(void)
 		PG_END_TRY();
 #endif
 
+		/* Retain LIVE bytes until the forced native COMMIT flush. Capture
+		 * before entering the critical section so refusal can still abort. */
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_shared_config && nrels > 0)
+		{
+			space_drop = cluster_space_drop_prepare(rels, nrels);
+			if (space_drop == NULL)
+				elog(ERROR, "cannot prepare exact SPACE deletion");
+			space_drop_data = cluster_space_drop_wal(space_drop, &space_drop_len);
+		}
+#endif
 		START_CRIT_SECTION();
 		MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+#ifdef USE_PGRAC_CLUSTER
+		if (space_drop != NULL)
+			cluster_space_drop_mark_dirty(space_drop);
+#endif
 
 		/*
 		 * Insert the commit XLOG record.
@@ -1730,7 +1772,8 @@ RecordTransactionCommit(void)
 							MyXactFlags,
 							InvalidTransactionId, NULL /* plain commit */ ,
 							commit_scn,		/* PGRAC: spec-1.18 */
-							has_tt_fold ? &tt_fold : NULL); /* PGRAC: spec-3.18 D4.1 */
+							has_tt_fold ? &tt_fold : NULL,
+							space_drop_data, space_drop_len);
 #ifdef USE_PGRAC_CLUSTER
 		cluster_backup_pending_commit_exit();
 		/* PGRAC: spec-7.4 D1 -- the commit record now exists;  record its
@@ -1791,7 +1834,13 @@ RecordTransactionCommit(void)
 	 */
 	if ((wrote_xlog && markXidCommitted &&
 		 synchronous_commit > SYNCHRONOUS_COMMIT_OFF) ||
-		forceSyncCommit || nrels > 0)
+		forceSyncCommit || nrels > 0
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: F-D-29 -- the staged TT stamp may only follow a flushed
+		 * commit record, and it must be written before pg_xact. */
+		|| tt_stamp_staged
+#endif
+		)
 		{
 #ifdef USE_PGRAC_CLUSTER
 			/* PGRAC: spec-7.4 D0 -- commit-record flush component (includes
@@ -1810,6 +1859,11 @@ RecordTransactionCommit(void)
 			 * after END_CRIT_SECTION (mini-plan v1.1 ruling #3: no publish
 			 * step may run inside the commit critical section). */
 			commit_record_flushed = true;
+			/* PGRAC: F-D-29 -- the TT stamp reaches storage only now, still
+			 * inside the critical section and before pg_xact, while
+			 * checkpoints wait for us (DELAY_CHKPT_START). */
+			if (tt_stamp_staged)
+				cluster_tt_local_commit_durable_apply(XactLastRecEnd);
 #endif
 
 			/*
@@ -1848,11 +1902,23 @@ RecordTransactionCommit(void)
 	 */
 	if (markXidCommitted)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		if (space_drop != NULL)
+		{
+			Assert(commit_record_flushed);
+			cluster_space_drop_publish(space_drop, XactLastRecEnd);
+		}
+#endif
 		MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
 		END_CRIT_SECTION();
 	}
 
 #ifdef USE_PGRAC_CLUSTER
+	if (space_drop != NULL)
+	{
+		cluster_space_drop_finish(space_drop);
+		space_drop = NULL;
+	}
 	if (markXidCommitted)
 	{
 		(void)cluster_scn_pending_commit_clear(tt_commit_scn);
@@ -2456,6 +2522,15 @@ StartTransaction(void)
 	/* check the current transaction state */
 	Assert(s->state == TRANS_DEFAULT);
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: the real transaction boundary also covers AND CHAIN and several
+	 * transactions in one frontend message. Never apply protocol defaults in
+	 * the old transaction's cleanup or after new resources have been acquired.
+	 * This retries existing local delivery only, not cluster DATA admission.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	(void) cluster_shared_config_delivery_retry_idle();
+#endif
+
 	/*
 	 * Set the current transaction state information appropriately during
 	 * start processing.  Note that once the transaction status is switched
@@ -2802,6 +2877,12 @@ CommitTransaction(void)
 	if (!is_parallel_worker)
 		PreCommit_CheckForSerializationFailure();
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: publication identity must be ready before the durable commit. */
+	if (!is_parallel_worker)
+		PreCommit_ClusterInval();
+#endif
+
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();
 
@@ -2848,6 +2929,9 @@ CommitTransaction(void)
 	ProcArrayEndTransaction(MyProc, latestXid);
 
 #ifdef USE_PGRAC_CLUSTER
+	/* Preserve committed structural work before any postcommit callback. */
+	if (!is_parallel_worker)
+		cluster_ko_shared_native_commit_v2();
 
 	/*
 	 * spec-6.14 D5 (INV-14-8): publish any staged relmap authority pending
@@ -2920,6 +3004,11 @@ CommitTransaction(void)
 	 * attempt to access affected files.
 	 */
 	smgrDoPendingDeletes(true);
+#ifdef USE_PGRAC_CLUSTER
+	/* Pending deletes may have handed physical work to the checkpointer.
+	 * This return is not durability; dispose only of the local handles. */
+	cluster_ko_shared_postcommit_cleanup_v2();
+#endif
 
 	/*
 	 * Send out notification signals to other backends (and do other
@@ -3114,6 +3203,27 @@ PrepareTransaction(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot PREPARE a transaction that has exported snapshots")));
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: a prepared finish writes its TT stamps under a WAL record of
+	 * their own, inserted just before the COMMIT/ROLLBACK PREPARED record; a
+	 * crash between the two can leave a transaction that is still prepared
+	 * while its TT slot already reads committed or aborted.  Until the finish
+	 * record itself carries the stamps, cluster mode prepares nothing (shared
+	 * mode already refuses two-phase statements at the utility entry).
+	 * Refusing here, like the checks above, rolls the transaction back and
+	 * ends its block; finishing an existing prepared transaction stays
+	 * possible, so none strands.
+	 */
+	if (cluster_enabled)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("two-phase transactions are not supported in cluster mode"),
+				 errdetail("PGRAC_FAMILY=CLUSTER_SCOPE PGRAC_REASON=OPERATION_UNSUPPORTED"),
+				 errhint("Use COMMIT or ROLLBACK instead.  COMMIT PREPARED and ROLLBACK PREPARED "
+						 "still finish an existing prepared transaction.")));
+#endif
 
 	/* Prevent cancel/die interrupt while cleaning up */
 	HOLD_INTERRUPTS();
@@ -6442,7 +6552,8 @@ XactLogCommitRecord(TimestampTz commit_time,
 					int xactflags, TransactionId twophase_xid,
 					const char *twophase_gid,
 					SCN commit_scn,		/* PGRAC: spec-1.18 */
-					const xl_xact_tt_commit *tt_commit)	/* PGRAC: spec-3.18 D4.1 */
+					const xl_xact_tt_commit *tt_commit,
+					const char *space_drop_data, uint32 space_drop_len)
 {
 	xl_xact_commit xlrec;
 	xl_xact_xinfo xl_xinfo;
@@ -6571,6 +6682,12 @@ XactLogCommitRecord(TimestampTz commit_time,
 		xl_xinfo.xinfo |= XACT_XINFO_HAS_TT_COMMIT;
 		xl_tt = *tt_commit;
 	}
+	if (space_drop_len != 0)
+	{
+		if (space_drop_data == NULL || nrels <= 0 || TransactionIdIsValid(twophase_xid))
+			elog(PANIC, "invalid native SPACE deletion commit payload");
+		xl_xinfo.xinfo |= XACT_XINFO_HAS_SPACE_DROP;
+	}
 
 	if (xl_xinfo.xinfo != 0)
 		info |= XLOG_XACT_HAS_INFO;
@@ -6643,6 +6760,8 @@ XactLogCommitRecord(TimestampTz commit_time,
 	 */
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_TT_COMMIT)
 		XLogRegisterData((char *) (&xl_tt), sizeof(xl_xact_tt_commit));
+	if (xl_xinfo.xinfo & XACT_XINFO_HAS_SPACE_DROP)
+		XLogRegisterData(unconstify(char *, space_drop_data), space_drop_len);
 
 	/* we allow filtering by xacts */
 	XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
@@ -6843,7 +6962,7 @@ XactLogAbortRecord(TimestampTz abort_time,
  * actions for which the order of execution is critical.
  */
 static void
-xact_redo_commit(xl_xact_parsed_commit *parsed,
+xact_redo_commit(XLogReaderState *record, xl_xact_parsed_commit *parsed,
 				 TransactionId xid,
 				 XLogRecPtr lsn,
 				 RepOriginId origin_id)
@@ -6854,6 +6973,10 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 	Assert(TransactionIdIsValid(xid));
 
 #ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config && (parsed->nrels != 0 || parsed->nspace_drops != 0)
+		&& !cluster_space_drop_replay_commit(record, xid))
+		elog(PANIC, "xact_redo: exact SPACE deletion commit refused");
+
 	/*
 	 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
 	 * What changed: spec-1.18 -- replay-side observe.  When the WAL
@@ -7138,8 +7261,9 @@ xact_redo(XLogReaderState *record)
 		xl_xact_commit *xlrec = (xl_xact_commit *) XLogRecGetData(record);
 		xl_xact_parsed_commit parsed;
 
-		ParseCommitRecord(XLogRecGetInfo(record), xlrec, &parsed);
-		xact_redo_commit(&parsed, XLogRecGetXid(record),
+		if (!ParseCommitRecord(XLogRecGetInfo(record), xlrec, XLogRecGetDataLen(record), &parsed))
+			elog(PANIC, "xact_redo: invalid commit payload");
+		xact_redo_commit(record, &parsed, XLogRecGetXid(record),
 						 record->EndRecPtr, XLogRecGetOrigin(record));
 	}
 	else if (info == XLOG_XACT_COMMIT_PREPARED)
@@ -7147,8 +7271,9 @@ xact_redo(XLogReaderState *record)
 		xl_xact_commit *xlrec = (xl_xact_commit *) XLogRecGetData(record);
 		xl_xact_parsed_commit parsed;
 
-		ParseCommitRecord(XLogRecGetInfo(record), xlrec, &parsed);
-		xact_redo_commit(&parsed, parsed.twophase_xid,
+		if (!ParseCommitRecord(XLogRecGetInfo(record), xlrec, XLogRecGetDataLen(record), &parsed))
+			elog(PANIC, "xact_redo: invalid prepared commit payload");
+		xact_redo_commit(record, &parsed, parsed.twophase_xid,
 						 record->EndRecPtr, XLogRecGetOrigin(record));
 #ifdef USE_PGRAC_CLUSTER
 		(void)cluster_tt_twophase_standby_commit_prepared(parsed.twophase_xid, parsed.scn);

@@ -3,6 +3,10 @@
  * cluster_catalog_bootstrap.c
  *	  Shared-catalog runtime bootstrap (spec-6.14 D2).
  *
+ *	  Shared-config startup only verifies the selected original inputs;
+ *	  it never seeds, adopts, or repairs an authority. The remaining legacy
+ *	  bootstrap helpers below retain their non-shared behavior.
+ *
  *	  cluster_catalog_startup_prepare() runs postmaster-once at startup.  When
  *	  cluster.shared_catalog is on it seeds the shared OID authority from the
  *	  shared pg_control's next-OID high-water (a value both seed and join nodes
@@ -42,6 +46,7 @@
 #include "catalog/pg_control.h"
 #include "cluster/cluster_catalog_bootstrap.h"
 #include "cluster/cluster_catalog_migrate.h"
+#include "cluster/cluster_catalog_startup.h"
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
@@ -372,6 +377,9 @@ cluster_catalog_startup_prepare(void)
 	/* Postmaster-once: only the postmaster seeds; forked backends inherit. */
 	if (IsUnderPostmaster)
 		return;
+	if (cluster_shared_config && !cluster_shared_catalog)
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("shared configuration requires cluster.shared_catalog=on")));
 
 	if (!cluster_shared_catalog) {
 		/*
@@ -383,7 +391,30 @@ cluster_catalog_startup_prepare(void)
 		return; /* off: stock per-node catalog */
 	}
 
+	/* Recheck after all settings have been applied, independent of GUC order.
+	 * Catalog-only routing must not use native minimal-WAL file creation. */
+	if (wal_level == WAL_LEVEL_MINIMAL)
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("shared catalogs require wal_level=replica")));
+	/* The legacy checkpoint redo advertisement can fail with WARNING.
+	 * OID reuse requires durable root publication before unlink cleanup. */
+	if (!cluster_shared_config)
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("shared catalogs require cluster.shared_config=on")));
 	cluster_catalog_vet_xid_striping_for_shared_catalog();
+	if (cluster_sinval_ack_mode == CLUSTER_SINVAL_ACK_MODE_NONE)
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("shared catalogs require acknowledged invalidation"),
+						errhint("Set cluster.sinval_ack_mode=peer_enqueued.")));
+	if (cluster_shared_config) {
+		if (!cluster_catalog_startup_shared_verify())
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+					 errmsg("selected shared catalog inputs are unavailable or inconsistent"),
+					 errhint("Use the verified shared bootstrap input source; startup cannot "
+							 "seed, adopt, or repair catalog authorities.")));
+		return;
+	}
 
 	/*
 	 * shared_catalog=on requires the shared pg_control authority (D1 vet), so
@@ -411,14 +442,15 @@ cluster_catalog_startup_prepare(void)
 		Oid oid_hw;
 
 		if (!cluster_oid_authority_read(&oid_hw) && cluster_oid_authority_present())
-			ereport(FATAL, (errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
-							errmsg("shared OID authority is present but corrupt"),
-							errdetail("Neither \"%s/global/pgrac_oid_authority\" nor its "
-									  ".bak fallback passes validation.",
-									  cluster_shared_data_dir),
-							errhint("Restore the shared OID authority files from a backup "
-									"of the shared tree; do not delete them (re-seeding "
-									"from a stale high-water can reissue leased OIDs).")));
+			ereport(
+				FATAL,
+				(errcode(ERRCODE_CLUSTER_CATALOG_AUTHORITY_UNAVAILABLE),
+				 errmsg("shared OID authority is present but corrupt"),
+				 errdetail("The current \"%s/global/pgrac_oid_authority\" fails validation; "
+						   "an older .bak cannot prove the issued high-water.",
+						   cluster_shared_data_dir),
+				 errhint("Recover the current issued high-water from verified durable evidence; "
+						 "do not restore an older .bak or re-seed from a stale checkpoint.")));
 	}
 	if (cluster_oid_authority_seed_if_absent(cf.checkPointCopy.nextOid))
 		elog(LOG, "cluster shared_catalog: seeded OID authority high-water at %u",

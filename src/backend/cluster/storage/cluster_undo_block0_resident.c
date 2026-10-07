@@ -47,6 +47,9 @@ typedef struct ClusterUndoBlock0SlotData {
 	ClusterUndoBlock0AuthorityProof proof;
 	uint32 frame_index;
 	XLogRecPtr last_wal_lsn;
+	/* Path intents whose header bytes reached the file without an fsync.
+	 * Independent of residency: eviction and refill leave it alone. */
+	pg_atomic_uint32 unsynced_header_intents;
 } ClusterUndoBlock0SlotData;
 
 typedef union ClusterUndoBlock0Slot {
@@ -356,6 +359,7 @@ cluster_undo_block0_shmem_init_region(void *address, Size size, uint32 frame_cou
 		pg_atomic_init_u32(&slot->pincount, 0);
 		slot->frame_index = CLUSTER_UNDO_BLOCK0_FRAME_INVALID;
 		slot->last_wal_lsn = InvalidXLogRecPtr;
+		pg_atomic_init_u32(&slot->unsynced_header_intents, 0);
 	}
 	return true;
 }
@@ -1794,6 +1798,115 @@ cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char *successor_
 	pin->observed_generation = successor_generation;
 	meta->last_wal_lsn = InvalidXLogRecPtr;
 	pg_atomic_write_u32(&meta->state, CLUSTER_UNDO_BLOCK0_SLOT_VALID_CLEAN);
+}
+
+
+/*
+ * Keep a locked pin's frame resident but release its content lock.  The
+ * caller relocks with cluster_undo_block0_lock_content() or drops the
+ * reservation with cluster_undo_block0_release_reservation().
+ */
+void
+cluster_undo_block0_pin_downgrade(ClusterUndoBlock0Pin *pin)
+{
+	ClusterUndoBlock0OwnedResource *owned;
+
+	if (Block0Ctl == NULL || pin == NULL || pin->slot < 0
+		|| pin->slot >= CLUSTER_UNDO_BLOCK0_SLOT_COUNT
+		|| (owned = block0_resource_find(pin, CLUSTER_UNDO_BLOCK0_OWNED_LOCKED_PIN)) == NULL)
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("undo block-zero pin to downgrade is not locked by this backend")));
+	block0_release_content_lock(&Block0Slots[pin->slot].data);
+	owned->kind = CLUSTER_UNDO_BLOCK0_OWNED_RESERVED_PIN;
+}
+
+
+/* Drop a reservation, if this backend still owns it.  Never throws. */
+void
+cluster_undo_block0_release_reservation(ClusterUndoBlock0Pin *pin)
+{
+	ClusterUndoBlock0OwnedResource *owned;
+	ClusterUndoBlock0SlotData *meta;
+
+	if (pin == NULL)
+		return;
+	if (Block0Ctl != NULL && pin->slot >= 0 && pin->slot < CLUSTER_UNDO_BLOCK0_SLOT_COUNT
+		&& (owned = block0_resource_find(pin, CLUSTER_UNDO_BLOCK0_OWNED_RESERVED_PIN)) != NULL) {
+		meta = &Block0Slots[pin->slot].data;
+		if (pg_atomic_read_u32(&meta->pincount) > 0)
+			pg_atomic_fetch_sub_u32(&meta->pincount, 1);
+		block0_resource_forget(owned);
+	}
+	block0_pin_clear(pin);
+}
+
+
+/*
+ * Record that header bytes of one segment reached its file without an fsync.
+ * Never throws, so a critical section may call it.  Only paths the
+ * checkpointer resolves on its own are accepted: this node's runtime undo and
+ * local materialized copies of other owners.  A recovery-scoped path resolves
+ * only inside its recoverer's process-private scope, so its writer must sync
+ * it there.  Returns false when the write is not accepted or there is no
+ * shared region to record into; the caller must then fsync itself.
+ */
+bool
+cluster_undo_block0_note_unsynced_header(uint32 segment_id, uint8 owner_instance,
+										 ClusterUndoPathIntent intent)
+{
+	ClusterUndoBlock0LogicalKey logical;
+	ClusterUndoBlock0SlotData *meta;
+	bool own_owner = cluster_node_id >= 0 && owner_instance == (uint8)(cluster_node_id + 1);
+	uint32 bit;
+	uint32 slotno;
+
+	logical.segment_id = segment_id;
+	logical.owner_instance = owner_instance;
+	if (Block0Ctl == NULL
+		|| !((intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED && own_owner)
+			 || (intent == CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL && !own_owner))
+		|| cluster_undo_block0_logical_slot(&logical, &slotno) != CLUSTER_UNDO_BLOCK0_OK)
+		return false;
+	meta = &Block0Slots[slotno].data;
+	bit = UINT32_C(1) << (uint32)intent;
+	if ((pg_atomic_read_u32(&meta->unsynced_header_intents) & bit) == 0)
+		pg_atomic_fetch_or_u32(&meta->unsynced_header_intents, bit);
+	return true;
+}
+
+
+/*
+ * Checkpoint coverage: hand out, and clear, the path intents whose header
+ * bytes of one logical slot reached the file without an fsync.  A writer
+ * that inserted its WAL record while holding the exclusive content lock
+ * marks before releasing it, so taking the lock first orders every such
+ * writer whose record precedes the checkpoint's redo pointer before this
+ * sample.  Returns 0 when there is nothing to sync.
+ */
+uint32
+cluster_undo_block0_take_unsynced_headers(uint32 slotno, uint32 *segment_id, uint8 *owner_instance)
+{
+	ClusterUndoBlock0SlotData *meta;
+	uint32 intents;
+
+	if (Block0Ctl == NULL || slotno >= CLUSTER_UNDO_BLOCK0_SLOT_COUNT)
+		return 0;
+	meta = &Block0Slots[slotno].data;
+	LWLockAcquire(&meta->content_lock, LW_SHARED);
+	intents = pg_atomic_exchange_u32(&meta->unsynced_header_intents, 0);
+	LWLockRelease(&meta->content_lock);
+	*segment_id = slotno + 1;
+	*owner_instance = (uint8)(slotno / CLUSTER_UNDO_BLOCK0_SLOTS_PER_OWNER + 1);
+	return intents;
+}
+
+
+/* Put back intents whose fsync failed, for the next checkpoint. */
+void
+cluster_undo_block0_return_unsynced_headers(uint32 slotno, uint32 intents)
+{
+	if (Block0Ctl != NULL && slotno < CLUSTER_UNDO_BLOCK0_SLOT_COUNT && intents != 0)
+		pg_atomic_fetch_or_u32(&Block0Slots[slotno].data.unsynced_header_intents, intents);
 }
 
 

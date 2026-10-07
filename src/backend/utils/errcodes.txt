@@ -942,6 +942,12 @@ Section: Class 55 - Object Not In Prerequisite State (pgrac extension)
 55R05    E    ERRCODE_CLUSTER_MASTER_CHANGED                                 cluster_master_changed
 55R06    E    ERRCODE_CLUSTER_BLOCK_MISSING_TEMPORARY                        cluster_block_missing_temporary
 
+# PGRAC: a parameter that the shared control file records at creation
+# (wal_level, max_connections and the other XLOG_PARAMETER_CHANGE fields)
+# cannot be changed in a shared cluster: ALTER SYSTEM refuses it, and a
+# start whose value differs is refused before its first durable write.
+55R07    E    ERRCODE_CLUSTER_SHARED_PARAMETER_FIXED                         cluster_shared_parameter_fixed
+
 Section: Class 57 - Operator Intervention
 
 # (class borrowed from DB2)

@@ -20,6 +20,8 @@
 
 UT_DEFINE_GLOBALS();
 
+bool cluster_shared_config = false;
+
 void
 ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
 {
@@ -71,6 +73,18 @@ static ClusterRecoverySerialRevalidateResult serial_result;
 #define DUTIES (duty_objects)
 
 bool
+rf_page_stable_base_proof_matches_sources_v1(
+	const RfPageStableBaseProofV1 *proof, const RfPageIdentityV1 *page_identity,
+	const RfPageVersionV1 *expected_result,
+	const struct ClusterThreadRecoveryAuthorityV1 *authorities, uint32 count,
+	const RfPagePinnedSourceV1 *source, const RfContributorVectorV1 *contributors)
+{
+	/* This fixture covers the legacy one-owner interface. Real multi-owner
+	 * proof/authority integration is in test_cluster_page_stable_base. */
+	return false;
+}
+
+bool
 rf_page_stable_base_proof_matches_v1(
 	const RfPageStableBaseProofV1 *proof, const RfPageIdentityV1 *page_identity,
 	const RfPageVersionV1 *expected_result, const ClusterRecoveryDutyKey *duties,
@@ -104,14 +118,25 @@ rf_page_stable_base_proof_matches_v1(
 }
 
 ClusterRecoveryDutyCompare
-cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *expected,
-								  const ClusterRecoveryDutyKey *observed)
+cluster_recovery_duty_key_compare_for_claim(const ClusterRecoveryDutyKey *expected,
+											const ClusterRecoveryDutyKey *observed, bool claim_v2)
 {
+	(void)claim_v2;
 	return expected == &DUTIES[0] && observed != NULL
 				   && observed->origin_thread_id == DUTIES[0].origin_thread_id
 				   && observed->root_lineage_seq == DUTIES[0].root_lineage_seq
 			   ? CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
 			   : CLUSTER_RECOVERY_DUTY_COMPARE_DIFFERENT;
+}
+
+bool
+rf_page_stable_base_proof_covers_version_v1(const RfPageStableBaseProofV1 *proof,
+											const RfPageIdentityV1 *identity,
+											const RfPageVersionV1 *version)
+{
+	return proof == (const RfPageStableBaseProofV1 *)&stable_proof_objects[0]
+		   && identity->blockno == 1 && version->mutation_token == 55
+		   && version->segment_incarnation[0] == 7;
 }
 
 ClusterRecoverySerialRevalidateResult
@@ -473,18 +498,34 @@ UT_TEST(test_install_adapter_runs_promote_publish_release)
 	ClusterRecoverySerialGuard serial;
 	RfPageAuthorityPreflightV1 *preflight = NULL;
 	RfPageInstallAuthorityAdapterV1 adapter;
+	RfPageVersionV1 ancestor;
 
 	init_case(&request, targets, &serial);
 	rf_page_guard_shmem_init_v1();
 	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight),
 				 RF_PAGE_AUTHORITY_OK);
 	UT_ASSERT(rf_page_install_authority_adapter_init_v1(preflight, &serial, &adapter));
+	ancestor = targets[0].expected_result;
+	ancestor.mutation_token = 55;
+	UT_ASSERT(adapter.ops.covers_version != NULL);
+	UT_ASSERT(!adapter.ops.covers_version(adapter.ops.arg, &targets[0].page_identity, &ancestor,
+										  &targets[0].expected_result));
 	UT_ASSERT(adapter.ops.validate_identity(adapter.ops.arg, &targets[0].page_identity,
 											targets[0].expected_result.segment_incarnation));
 	UT_ASSERT(adapter.ops.promote(adapter.ops.arg));
+	UT_ASSERT(adapter.ops.covers_version(adapter.ops.arg, &targets[0].page_identity, &ancestor,
+										 &targets[0].expected_result));
+	pin_current = false;
+	UT_ASSERT(!adapter.ops.covers_version(adapter.ops.arg, &targets[0].page_identity, &ancestor,
+										  &targets[0].expected_result));
+	pin_current = true;
+	UT_ASSERT(!adapter.ops.covers_version(adapter.ops.arg, &targets[0].page_identity, &ancestor,
+										  &ancestor));
 	UT_ASSERT(adapter.ops.publish(adapter.ops.arg));
 	UT_ASSERT(adapter.ops.release(adapter.ops.arg));
 	UT_ASSERT(adapter.guard == NULL && adapter.proof_published);
+	UT_ASSERT(!adapter.ops.covers_version(adapter.ops.arg, &targets[0].page_identity, &ancestor,
+										  &targets[0].expected_result));
 	rf_page_authority_preflight_destroy_v1(&preflight);
 }
 

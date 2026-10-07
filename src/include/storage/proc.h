@@ -9,6 +9,9 @@
  *
  * src/include/storage/proc.h
  *
+ * PGRAC MODIFICATIONS: exact native process configuration observation slots.
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef _PROC_H_
@@ -23,6 +26,8 @@
 #include "storage/lock.h"
 #include "storage/pg_sema.h"
 #include "storage/proclist_types.h"
+#ifdef USE_PGRAC_CLUSTER
+#endif
 
 /*
  * Each backend advertises up to PGPROC_MAX_CACHED_SUBXIDS TransactionIds
@@ -542,6 +547,9 @@ extern void SetStartupBufferPinWaitBufId(int bufid);
 extern int GetStartupBufferPinWaitBufId(void);
 
 extern bool HaveNFreeProcs(int n, int *nfree);
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: bounded native allocation snapshot; caller owns capacity entries. */
+#endif
 extern void ProcReleaseLocks(bool isCommit);
 
 extern ProcWaitStatus ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable);

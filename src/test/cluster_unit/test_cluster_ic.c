@@ -109,6 +109,7 @@ ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
  * !cluster_enabled early-return path (verified at TAP layer L12).
  */
 bool cluster_enabled = true;
+bool cluster_shared_config = false;
 
 /* spec-2.2 §3.9 D2 -- cluster_ic.c references MyBackendType for
  * the tier1 caller scope guard.  Stub here; unit test never invokes
@@ -1006,10 +1007,27 @@ UT_TEST(test_hello_build_truncates_long_name)
 }
 
 
+/* PGRAC: the new observer is advertised only by the shared-config profile.
+ * Existing HELLO bytes and capabilities remain unchanged otherwise.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_config_members_capability_profile)
+{
+	uint32 baseline = cluster_ic_local_capability_word();
+	UT_ASSERT_EQ(baseline & PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3, 0);
+	UT_ASSERT_EQ(baseline & PGRAC_IC_HELLO_CAP_KO_SHARED_V2, 0);
+	UT_ASSERT_EQ(baseline & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2, 0);
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2, 0);
+	UT_ASSERT_EQ(cluster_ic_local_capability_word(),
+				 baseline | PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3 | PGRAC_IC_HELLO_CAP_KO_SHARED_V2);
+	cluster_shared_config = false;
+	UT_ASSERT_EQ(cluster_ic_local_capability_word(), baseline);
+}
+
 int
 main(void)
 {
-	UT_PLAN(28); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
+	UT_PLAN(29); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
 	UT_RUN(test_ic_send_bytes_linkable);
 	UT_RUN(test_ic_recv_bytes_linkable);
 	UT_RUN(test_ic_init_linkable);
@@ -1033,6 +1051,7 @@ main(void)
 	UT_RUN(test_local_capability_word_is_hello_authority_with_ack_advertisement);
 	UT_RUN(test_current_mx_capability_is_advertised_without_reserved_bit_alias);
 	UT_RUN(test_control_root_v1_capability_is_advertised_without_reserved_bit_alias);
+	UT_RUN(test_config_members_capability_profile);
 	UT_RUN(test_hello_wire_data_plane_bytes);	/* spec-7.2 D2 */
 	UT_RUN(test_hello_worker_fields_roundtrip); /* spec-7.3 D3 */
 	UT_RUN(test_hello_smart_fusion_capability_gate);

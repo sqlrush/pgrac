@@ -82,7 +82,10 @@
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_lms.h"
+#include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
 
@@ -210,6 +213,68 @@ static int tier1_listener_fd = -1;
 static int tier1_peer_fds[CLUSTER_MAX_NODES];
 static bool tier1_peer_fds_initialised = false;
 
+/* A private native-owner lifetime, not shared diagnostic reconnect_count.
+ * A frame boundary consumer may retain this only in the same process.
+ * Exhaustion removes proof, not transport availability. */
+static pid_t tier1_stream_owner;
+static uint64 tier1_stream_next;
+static uint64 tier1_stream_serial[CLUSTER_MAX_NODES];
+static bool tier1_stream_exhausted;
+
+static void
+tier1_stream_bind(int32 peer)
+{
+	pid_t self = getpid();
+	if (tier1_stream_owner != self) {
+		/* Inherited parent descriptors/stamps are not this child's proof. */
+		tier1_stream_owner = self;
+		tier1_stream_next = 0;
+		tier1_stream_exhausted = false;
+		memset(tier1_stream_serial, 0, sizeof(tier1_stream_serial));
+	}
+	if (tier1_stream_next == PG_UINT64_MAX)
+		tier1_stream_exhausted = true;
+	tier1_stream_serial[peer] = tier1_stream_exhausted ? 0 : ++tier1_stream_next;
+	if (Tier1Shmem != NULL) {
+		uint64 generation
+			= pg_atomic_read_u64(&Tier1Shmem->peers[peer].resource_x_stream_generation);
+		/* One original owner per plane/channel. CONTROL terminal inquiries
+		 * also need a non-reusable lifetime, independent of diagnostics. */
+		if (generation != UINT64_MAX)
+			pg_atomic_write_u64(&Tier1Shmem->peers[peer].resource_x_stream_generation,
+								generation + 1);
+		pg_write_barrier(); /* publish the new lifetime before CONNECTED */
+	}
+}
+
+/* HELLO and close must name the same nonzero CONTROL lifetime. Diagnostic
+ * reconnect_count starts at zero and may wrap; it is not an identity.
+ * The existing capability ABI is uint32, so exhaustion removes its proof. */
+static uint32
+tier1_control_capability_generation(int32 peer)
+{
+	uint64 generation;
+
+	if (tier1_my_plane != CLUSTER_IC_PLANE_CONTROL || Tier1Shmem == NULL)
+		return 0;
+	generation = pg_atomic_read_u64(&Tier1Shmem->peers[peer].resource_x_stream_generation);
+	return generation > 0 && generation <= UINT32_MAX ? (uint32)generation : 0;
+}
+
+static void
+tier1_note_peer_capabilities(int32 peer, uint32 capabilities)
+{
+	uint32 generation;
+
+	if (tier1_my_plane != CLUSTER_IC_PLANE_CONTROL)
+		return;
+	generation = tier1_control_capability_generation(peer);
+	if (generation != 0)
+		cluster_sf_note_peer_hello_capabilities_gen(peer, capabilities, generation);
+	else
+		cluster_sf_note_peer_disconnected(peer);
+}
+
 /*
  * Per-peer recv buffer for accumulating partial ClusterMsgHeader frames
  * across multiple WL_SOCKET_READABLE wakeups.  TCP can deliver bytes
@@ -292,6 +357,75 @@ static int tier1_outbound_remaining[CLUSTER_MAX_NODES];
  * budget wall, the 56s stall root cause #1). */
 static int tier1_outbound_queued_total[CLUSTER_MAX_NODES];
 
+/* The DATA owner scopes this descriptor to one send_bytes invocation.
+ * A copy follows a partial tail or FIFO frame, never the peer queue as a whole. */
+static ResourceXIntentSlot tier1_resource_x_sending;
+static bool tier1_resource_x_send_captured;
+static ResourceXIntentSlot tier1_resource_x_tail[CLUSTER_MAX_NODES];
+
+static void
+tier1_resource_x_finish(ResourceXIntentSlot *owner, bool sent)
+{
+	ResourceXIntentSlot completed = *owner;
+	memset(owner, 0, sizeof(*owner));
+	if (completed.state == RESOURCE_X_INTENT_SLOT_STAGED)
+		cluster_lms_outbound_resource_x_send_complete(&completed, sent);
+}
+
+static void
+tier1_resource_x_capture(int32 peer, ResourceXIntentSlot *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA
+		&& tier1_resource_x_sending.state == RESOURCE_X_INTENT_SLOT_STAGED
+		&& tier1_resource_x_sending.destination_node == (uint32)peer) {
+		*out = tier1_resource_x_sending;
+		tier1_resource_x_send_captured = true;
+	}
+}
+
+ClusterICSendResult
+cluster_ic_tier1_send_resource_x_intent(uint8 msg_type, int32 dest_node_id, const void *payload,
+										uint32 payload_len, const ResourceXIntentSlot *intent)
+{
+	volatile ClusterICSendResult rc = CLUSTER_IC_SEND_NOT_ADMITTED;
+	if (intent == NULL || intent->state != RESOURCE_X_INTENT_SLOT_STAGED
+		|| intent->send_episode == 0 || dest_node_id < 0 || dest_node_id >= CLUSTER_MAX_NODES
+		|| intent->destination_node != (uint32)dest_node_id
+		|| tier1_resource_x_sending.state != RESOURCE_X_INTENT_SLOT_EMPTY)
+		return CLUSTER_IC_SEND_NOT_ADMITTED;
+	/* RDMA has one active ordinary SEND per peer. The owning LMS is its
+	 * sole writer: refuse BEFORE admission while that queue is busy, so
+	 * this frame is never parked without a completion descriptor. This is
+	 * backpressure, not a receipt inferred from another frame's queue depth.
+	 * With no pending SEND, the native provider returns DONE or HARD_ERROR;
+	 * a TCP fallback below still captures our exact descriptor. */
+	if (cluster_ic_rdma_pending_outbound(dest_node_id))
+		return CLUSTER_IC_SEND_NOT_ADMITTED;
+	tier1_resource_x_sending = *intent;
+	tier1_resource_x_send_captured = false;
+	PG_TRY();
+	{
+		rc = cluster_ic_send_envelope(msg_type, dest_node_id, payload, payload_len);
+		/* A queued send without a completion owner must never be declared sent
+		 * or retried. Other DATA transports need the same completion contract. */
+		if (rc == CLUSTER_IC_SEND_WOULD_BLOCK && !tier1_resource_x_send_captured)
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("Resource-X queued DATA send has no completion owner"),
+				 errhint(
+					 "Check the DATA transport completion contract before reopening service.")));
+	}
+	PG_FINALLY();
+	{
+		memset(&tier1_resource_x_sending, 0, sizeof(tier1_resource_x_sending));
+		tier1_resource_x_send_captured = false;
+	}
+	PG_END_TRY();
+	return rc;
+}
+
 /*
  * PGRAC: GCS serve-stall round-5 — per-peer bounded whole-frame outbound
  * FIFO behind the single in-flight tail.
@@ -319,6 +453,7 @@ static int tier1_outbound_queued_total[CLUSTER_MAX_NODES];
 typedef struct Tier1OutboundFrame {
 	struct Tier1OutboundFrame *next;
 	int len;
+	ResourceXIntentSlot resource_x_intent;
 	uint8 data[FLEXIBLE_ARRAY_MEMBER];
 } Tier1OutboundFrame;
 
@@ -480,6 +615,54 @@ cluster_ic_tier1_normal_stop_poll(int *peer_out, const char **reason_out)
 	/* Idle connections and unused buffer capacity remain open. Chunk state,
 	 * RDMA completions and caller-local batches have separate owning polls. */
 	return result;
+}
+
+bool
+cluster_ic_tier1_stream_capture(int32 peer, ClusterICTier1Stream *out)
+{
+	uint64 epoch;
+	int worker = AmLmsProcess()
+					 ? 0
+					 : (AmLmsWorkerProcess() ? ClusterLmsWorkerIdForType(MyAuxProcType) : -1);
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!IsUnderPostmaster || MyProcPid != getpid() || tier1_stream_owner != getpid()
+		|| tier1_stream_exhausted || peer < 0 || peer >= CLUSTER_MAX_NODES
+		|| !tier1_peer_fds_initialised
+		|| (AmLmonProcess() ? tier1_my_plane != CLUSTER_IC_PLANE_CONTROL
+							: (worker < 0 || tier1_my_plane != CLUSTER_IC_PLANE_DATA
+							   || tier1_my_data_channel != worker || tier1_my_n_workers <= worker
+							   || tier1_my_n_workers > CLUSTER_IC_TIER1_DATA_CHANNELS)))
+		return false;
+	if (Tier1Shmem == NULL
+		|| Tier1Shmem != Tier1ShmemSlots[tier1_slot_of(tier1_my_plane, tier1_my_data_channel)]
+		|| Tier1Shmem->magic != PGRAC_IC_TIER1_SHMEM_MAGIC || tier1_peer_fds[peer] < 0
+		|| tier1_stream_serial[peer] == 0
+		|| Tier1Shmem->peers[peer].state != CLUSTER_IC_PEER_CONNECTED
+		|| tier1_hello_send_remaining[peer] != 0)
+		return false;
+	epoch = cluster_epoch_get_current();
+	if (epoch == 0
+		|| (tier1_my_plane == CLUSTER_IC_PLANE_DATA && Tier1Shmem->peers[peer].conn_epoch != epoch))
+		return false;
+	out->serial = tier1_stream_serial[peer];
+	out->epoch = epoch;
+	out->owner_pid = MyProcPid;
+	out->peer = peer;
+	out->plane = tier1_my_plane;
+	out->channel = tier1_my_plane == CLUSTER_IC_PLANE_DATA ? tier1_my_data_channel : -1;
+	return true;
+}
+
+bool
+cluster_ic_tier1_stream_current(const ClusterICTier1Stream *stream)
+{
+	ClusterICTier1Stream current;
+	return stream != NULL && cluster_ic_tier1_stream_capture(stream->peer, &current)
+		   && current.serial == stream->serial && current.epoch == stream->epoch
+		   && current.owner_pid == stream->owner_pid && current.plane == stream->plane
+		   && current.channel == stream->channel;
 }
 
 
@@ -729,6 +912,7 @@ tier1_shmem_init(void)
 				pg_atomic_init_u64(&s->peers[i].epoch_observe_advance_count, 0);
 				/* spec-2.4 v1.0.1 F3: LMON-mediated close request flag. */
 				pg_atomic_init_u32(&s->peers[i].close_requested, 0);
+				pg_atomic_init_u64(&s->peers[i].resource_x_stream_generation, 0);
 				s->peers[i].conn_epoch = 0;
 			}
 		}
@@ -750,6 +934,8 @@ cluster_ic_tier1_set_my_plane(ClusterICPlane plane)
 	int slot;
 
 	Assert(plane >= 0 && plane < CLUSTER_IC_PLANE_N);
+	if (plane != tier1_my_plane)
+		memset(tier1_stream_serial, 0, sizeof(tier1_stream_serial));
 	tier1_my_plane = plane;
 	/* set_my_plane alone keeps the DATA channel at its current value (0 =
 	 * worker 0 by default);  set_my_data_channel selects a worker channel. */
@@ -773,6 +959,9 @@ cluster_ic_tier1_set_my_data_channel(int channel, int n_workers)
 	Assert(channel >= 0 && channel < CLUSTER_IC_TIER1_DATA_CHANNELS);
 	Assert(n_workers >= 1 && n_workers <= CLUSTER_IC_TIER1_DATA_CHANNELS);
 
+	if (tier1_my_plane != CLUSTER_IC_PLANE_DATA || tier1_my_data_channel != channel
+		|| tier1_my_n_workers != n_workers)
+		memset(tier1_stream_serial, 0, sizeof(tier1_stream_serial));
 	tier1_my_plane = CLUSTER_IC_PLANE_DATA;
 	tier1_my_data_channel = channel;
 	tier1_my_n_workers = n_workers;
@@ -998,6 +1187,7 @@ tier1_drain_pending(int32 target_node_id, int fd)
 			if (tier1_outbound_remaining[target_node_id] > 0)
 				return CLUSTER_IC_SEND_WOULD_BLOCK; /* still pending, defer new payload */
 			tier1_outbound_queued_total[target_node_id] = 0;
+			tier1_resource_x_finish(&tier1_resource_x_tail[target_node_id], true);
 		}
 
 		/* Tail is empty — promote the next queued whole frame, if any. */
@@ -1024,6 +1214,7 @@ tier1_drain_pending(int32 target_node_id, int fd)
 		memcpy(tier1_outbound_buf_dyn[target_node_id], frame->data, (size_t)frame->len);
 		tier1_outbound_remaining[target_node_id] = frame->len;
 		tier1_outbound_queued_total[target_node_id] = frame->len;
+		tier1_resource_x_tail[target_node_id] = frame->resource_x_intent;
 		pfree(frame);
 		if (Tier1Shmem != NULL)
 			pg_atomic_fetch_add_u64(&Tier1Shmem->fifo_promoted_count, 1);
@@ -1065,6 +1256,7 @@ tier1_fifo_admit(int32 target_node_id, const void *buf, size_t len)
 	MemoryContextSwitchTo(oldctx);
 	frame->next = NULL;
 	frame->len = (int)len;
+	tier1_resource_x_capture(target_node_id, &frame->resource_x_intent);
 	memcpy(frame->data, buf, len);
 
 	if (tier1_outbound_fifo_tail[target_node_id] != NULL)
@@ -1094,6 +1286,7 @@ tier1_fifo_reset(int32 peer_id)
 	while (frame != NULL) {
 		Tier1OutboundFrame *next = frame->next;
 
+		tier1_resource_x_finish(&frame->resource_x_intent, false);
 		pfree(frame);
 		frame = next;
 	}
@@ -1152,8 +1345,20 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 	}
 
 	fd = tier1_peer_fds[target_node_id];
-	if (fd < 0)
-		return CLUSTER_IC_SEND_HARD_ERROR; /* not connected */
+	if (fd < 0) {
+		/* PGRAC: no stream has admitted this new frame. A declared peer
+		 * awaiting connection leaves ownership with the caller, just as
+		 * HELLO-pending does below. Rejected or inconsistent peers remain
+		 * hard errors; draining an already admitted tail is unchanged. */
+		if (Tier1Shmem != NULL
+			&& (Tier1Shmem->peers[target_node_id].state == CLUSTER_IC_PEER_DOWN
+				|| Tier1Shmem->peers[target_node_id].state == CLUSTER_IC_PEER_CONNECTING)
+			&& peer_addr(target_node_id) != NULL) {
+			pg_atomic_fetch_add_u64(&Tier1Shmem->send_not_admitted_count, 1);
+			return CLUSTER_IC_SEND_NOT_ADMITTED;
+		}
+		return CLUSTER_IC_SEND_HARD_ERROR;
+	}
 
 	/*
 	 * spec-2.13 Hardening v1.0.2 root-cause fix (L66-family真根因):
@@ -1284,6 +1489,7 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 			/* Round-4c F1: stamp the queued tail length — the resume
 			 * cursor base (dyn_size is capacity, never a cursor base). */
 			tier1_outbound_queued_total[target_node_id] = (int)len;
+			tier1_resource_x_capture(target_node_id, &tier1_resource_x_tail[target_node_id]);
 
 			return CLUSTER_IC_SEND_WOULD_BLOCK;
 		}
@@ -1328,6 +1534,7 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 		/* Round-4c F1: stamp the queued tail length — the resume cursor
 		 * base (dyn_size is capacity, never a cursor base). */
 		tier1_outbound_queued_total[target_node_id] = (int)tail_len;
+		tier1_resource_x_capture(target_node_id, &tier1_resource_x_tail[target_node_id]);
 
 		if (Tier1Shmem != NULL && sent > 0) {
 			pg_atomic_add_fetch_u64(&Tier1Shmem->peers[target_node_id].bytes_send, (uint64)sent);
@@ -1613,6 +1820,7 @@ tier1_tier_shutdown(void)
 	int i;
 
 	peer_fds_lazy_init();
+	memset(tier1_stream_serial, 0, sizeof(tier1_stream_serial));
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (tier1_peer_fds[i] >= 0) {
@@ -1917,6 +2125,7 @@ cluster_ic_tier1_connect_one(int32 peer_id, int *out_peer_fd)
 	}
 
 	tier1_peer_fds[peer_id] = fd;
+	tier1_stream_bind(peer_id);
 	Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_CONNECTING;
 	if (out_peer_fd != NULL)
 		*out_peer_fd = fd;
@@ -2201,8 +2410,7 @@ tier1_peer_caps_reply_handler(const ClusterICEnvelope *env, const void *payload)
 		return;
 	}
 
-	cluster_sf_note_peer_hello_capabilities_gen(sender, cluster_ic_hello_capabilities(&msg),
-												Tier1Shmem->peers[sender].reconnect_count);
+	tier1_note_peer_capabilities(sender, cluster_ic_hello_capabilities(&msg));
 	elog(DEBUG1, "cluster_ic tier1 learned peer %d capabilities 0x%X via PEER_CAPS_REPLY", sender,
 		 cluster_ic_hello_capabilities(&msg));
 }
@@ -2338,6 +2546,7 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 	if (peer_id < 0) {
 		peer_id = msg.source_node_id;
 		tier1_peer_fds[peer_id] = peer_fd;
+		tier1_stream_bind(peer_id);
 	}
 
 	Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_CONNECTED;
@@ -2360,8 +2569,7 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 	 * cross-node write (t/360 L5.5).  CONTROL owns caps; DATA only reads them.
 	 */
 	if (tier1_my_plane == CLUSTER_IC_PLANE_CONTROL) {
-		cluster_sf_note_peer_hello_capabilities_gen(peer_id, cluster_ic_hello_capabilities(&msg),
-													Tier1Shmem->peers[peer_id].reconnect_count);
+		tier1_note_peer_capabilities(peer_id, cluster_ic_hello_capabilities(&msg));
 		tier1_maybe_send_caps_reply(peer_id, cluster_ic_hello_capabilities(&msg));
 	}
 
@@ -2559,6 +2767,7 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 	/* Bind learned peer_id; record state CONNECTED. */
 	learned = msg.source_node_id;
 	tier1_peer_fds[learned] = peer_fd;
+	tier1_stream_bind(learned);
 	if (Tier1Shmem != NULL) {
 		peer_record_error(learned, 0, "", "%s", ""); /* clear any prior */
 		Tier1Shmem->peers[learned].state = (int32)CLUSTER_IC_PEER_CONNECTED;
@@ -2570,9 +2779,7 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 		/* CONTROL owns caps lifecycle (see the named-peer path above); a
 		 * DATA-plane worker only reads the shared store. */
 		if (tier1_my_plane == CLUSTER_IC_PLANE_CONTROL) {
-			cluster_sf_note_peer_hello_capabilities_gen(learned,
-														cluster_ic_hello_capabilities(&msg),
-														Tier1Shmem->peers[learned].reconnect_count);
+			tier1_note_peer_capabilities(learned, cluster_ic_hello_capabilities(&msg));
 			tier1_maybe_send_caps_reply(learned, cluster_ic_hello_capabilities(&msg));
 		}
 	}
@@ -2903,6 +3110,8 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
 		return;
+	tier1_stream_serial[peer_id] = 0;
+	tier1_resource_x_finish(&tier1_resource_x_tail[peer_id], false);
 
 	if (tier1_peer_fds[peer_id] >= 0) {
 		(void)close(tier1_peer_fds[peer_id]);
@@ -2919,10 +3128,8 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 		 * and duplicate-connection tie-breaks where no established link
 		 * existed -- wiping the surviving connection's capabilities there
 		 * would zero them with no new HELLO to renote.  The generation of
-		 * the closing connection is the peer's reconnect_count BEFORE the
-		 * increment below (the same value the learn sites stamped while
-		 * this connection was established), so only the matching record is
-		 * invalidated.
+		 * the closing connection is the original owner's stream generation
+		 * (the same value stamped by HELLO), so only that record is invalidated.
 		 */
 		/*
 		 * spec-5.22e Hardening (RC#1 integration review): ONLY a CONTROL-plane
@@ -2936,9 +3143,9 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 		 * clears here as before (fail-closed preserved).
 		 */
 		if (tier1_my_plane == CLUSTER_IC_PLANE_CONTROL) {
-			if (Tier1Shmem != NULL)
-				cluster_sf_note_peer_disconnected_gen(peer_id,
-													  Tier1Shmem->peers[peer_id].reconnect_count);
+			uint32 generation = tier1_control_capability_generation(peer_id);
+			if (generation != 0)
+				cluster_sf_note_peer_disconnected_gen(peer_id, generation);
 			else
 				cluster_sf_note_peer_disconnected(peer_id);
 		}
@@ -3020,6 +3227,98 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 
 	if (reason != NULL)
 		ereport(LOG, (errmsg("cluster_ic tier1 peer %d closed: %s", peer_id, reason)));
+}
+
+uint64
+cluster_ic_tier1_resource_x_stream_generation(int32 peer, int channel)
+{
+	ClusterICTier1Shmem *shared;
+	uint64 generation;
+	if (peer < 0 || peer >= CLUSTER_MAX_NODES || channel < 0
+		|| channel >= CLUSTER_IC_TIER1_DATA_CHANNELS)
+		return 0;
+	if (peer == cluster_node_id)
+		return UINT64_C(1); /* Same-instance dispatch has no reconnect window. */
+	shared = Tier1ShmemSlots[tier1_slot_of(CLUSTER_IC_PLANE_DATA, channel)];
+	if (shared == NULL || shared->magic != PGRAC_IC_TIER1_SHMEM_MAGIC)
+		return 0;
+	generation = pg_atomic_read_u64(&shared->peers[peer].resource_x_stream_generation);
+	pg_read_barrier();
+	if (generation == 0 || generation == UINT64_MAX
+		|| shared->peers[peer].state != CLUSTER_IC_PEER_CONNECTED
+		|| shared->peers[peer].conn_epoch != cluster_epoch_get_current())
+		return 0;
+	pg_read_barrier();
+	return pg_atomic_read_u64(&shared->peers[peer].resource_x_stream_generation) == generation
+			   ? generation
+			   : 0;
+}
+
+/* Read-only backend observation of the actual plane owners. HELLO capability
+ * identity is checked separately by semantic activation; the CONTROL counter
+ * here must correspond to that same producer record. No diagnostics renew it.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static uint64
+tier1_terminal_stream_sample(int32 peer, ClusterICPlane plane, int channel, uint64 epoch,
+							 uint32 control_capability_generation)
+{
+	ClusterICTier1Shmem *shared = Tier1ShmemSlots[tier1_slot_of(plane, channel)];
+	const ClusterICPeerStateShmem *state;
+	uint64 serial;
+
+	if (shared == NULL || shared->magic != PGRAC_IC_TIER1_SHMEM_MAGIC)
+		return 0;
+	state = &shared->peers[peer];
+	serial = pg_atomic_read_u64(&state->resource_x_stream_generation);
+	pg_read_barrier();
+	if (serial == 0 || serial == UINT64_MAX || state->state != CLUSTER_IC_PEER_CONNECTED
+		|| pg_atomic_read_u32(&state->close_requested) != 0
+		|| (plane == CLUSTER_IC_PLANE_DATA && state->conn_epoch != epoch)
+		|| (plane == CLUSTER_IC_PLANE_CONTROL
+			&& (serial > UINT32_MAX || serial != control_capability_generation)))
+		return 0;
+	pg_read_barrier();
+	return pg_atomic_read_u64(&state->resource_x_stream_generation) == serial ? serial : 0;
+}
+
+bool
+cluster_ic_tier1_terminal_peer_sessions(int32 peer, uint64 epoch,
+										uint32 control_capability_generation, int data_channels,
+										ClusterICTerminalPeerSessions *out)
+{
+	ClusterICTerminalPeerSessions candidate;
+	int channel;
+
+	memset(&candidate, 0, sizeof(candidate));
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || cluster_interconnect_tier != CLUSTER_IC_TIER_1 || peer < 0
+		|| peer >= CLUSTER_MAX_NODES || peer == cluster_node_id
+		|| control_capability_generation == 0 || data_channels < 1
+		|| data_channels > CLUSTER_IC_TIER1_DATA_CHANNELS || cluster_epoch_get_current() != epoch)
+		return false;
+	candidate.control_stream_generation = tier1_terminal_stream_sample(
+		peer, CLUSTER_IC_PLANE_CONTROL, 0, epoch, control_capability_generation);
+	if (candidate.control_stream_generation == 0)
+		return false;
+	candidate.data_channels = (uint32)data_channels;
+	for (channel = 0; channel < data_channels; channel++) {
+		candidate.data_stream_generation[channel]
+			= tier1_terminal_stream_sample(peer, CLUSTER_IC_PLANE_DATA, channel, epoch, 0);
+		if (candidate.data_stream_generation[channel] == 0)
+			return false;
+	}
+	for (channel = 0; channel < data_channels; channel++)
+		if (candidate.data_stream_generation[channel]
+			!= tier1_terminal_stream_sample(peer, CLUSTER_IC_PLANE_DATA, channel, epoch, 0))
+			return false;
+	if (candidate.control_stream_generation
+			!= tier1_terminal_stream_sample(peer, CLUSTER_IC_PLANE_CONTROL, 0, epoch,
+											control_capability_generation)
+		|| cluster_epoch_get_current() != epoch)
+		return false;
+	*out = candidate;
+	return true;
 }
 
 const ClusterICPeerStateShmem *

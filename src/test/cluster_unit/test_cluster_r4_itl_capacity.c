@@ -32,6 +32,21 @@ static unsigned origin_calls;
 static unsigned active_publications;
 static int origin_fault;
 
+/* Nonshared hint publication in this fixture retains its native semantics. */
+ClusterSpaceHintResult
+cluster_space_hint_begin(Buffer buffer pg_attribute_unused(),
+						 RfPageProducerBatchV1 *batch pg_attribute_unused())
+{
+	UT_ASSERT(!cluster_shared_config);
+	return CLUSTER_SPACE_HINT_NATIVE;
+}
+void
+cluster_space_hint_finish(Buffer buffer pg_attribute_unused(), bool standard pg_attribute_unused(),
+						  const RfPageProducerBatchV1 *batch pg_attribute_unused())
+{
+	UT_ASSERT(false); /* No qualified shared hint producer exists in this suite. */
+}
+
 void
 cluster_runtime_visibility_ensure_exit_hooks(void)
 {}

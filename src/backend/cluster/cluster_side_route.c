@@ -38,7 +38,7 @@
  * D-SIDE-01 consumes the same exhaustive generated opcode manifest as
  * RF-PAGE.  This file owns only the SIDE disposition of a manifest row; it
  * never carries a second opcode list.  Therefore a source/manifest change
- * makes the shared 137-row census RED once, instead of letting PAGE and SIDE
+ * makes the shared exhaustive census RED once, instead of letting PAGE and SIDE
  * silently drift apart.
  */
 static bool

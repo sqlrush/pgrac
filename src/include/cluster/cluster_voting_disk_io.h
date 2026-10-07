@@ -170,6 +170,10 @@
 #define CLUSTER_VOTING_PGRD_FILE_BYTES_MIN                                                         \
 	((off_t)(8 * CLUSTER_MAX_NODES + 3) * CLUSTER_VOTING_SLOT_BYTES)
 
+/* PRE2 stripe history starts after every existing fixed region. Its caller
+ * checks node/index arithmetic and device capacity; no earlier offset moves. */
+#define CLUSTER_VOTING_STRIPE_HISTORY_BASE CLUSTER_VOTING_PGRD_FILE_BYTES_MIN
+
 /*
  * Payload-neutral read outcomes for the fixed append-only tail slot.  Unlike
  * the older marker helpers, callers must be able to distinguish a clean old
@@ -237,6 +241,15 @@ extern void cluster_voting_disk_io_set_timeout_ms(int timeout_ms);
  *	                                    disk_index mismatch (misroute)
  *	  CLUSTER_VOTING_DISK_IO_NOT_TRIED  caller set fd<0 (programming error)
  */
+/* Bounded contiguous reads preserve every slot's original validation. */
+extern void cluster_voting_disk_read_slots(int fd, int expected_disk_index, uint32 first_node,
+										   uint32 count, ClusterVotingSlot *out,
+										   ClusterVotingDiskIoState *states);
+extern ClusterVotingDiskIoState cluster_voting_disk_read_join_slots(int fd, uint32 first_node,
+																	uint32 count, void *out_slots);
+extern ClusterVotingDiskIoState
+cluster_voting_disk_read_formation_slots(int fd, uint32 first_node, uint32 count, void *out_slots);
+
 extern ClusterVotingDiskIoState cluster_voting_disk_read_slot(int fd, int expected_disk_index,
 															  uint32 node_id,
 															  ClusterVotingSlot *out);

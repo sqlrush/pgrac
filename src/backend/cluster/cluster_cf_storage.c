@@ -28,6 +28,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster_control_bootstrap_private.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -51,6 +52,7 @@
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
+#include "cluster_cf_contract_private.h"
 
 /* A node's local control path is always $PGDATA/global/pg_control. */
 #define CLUSTER_CF_LOCAL_REL "global/pg_control"
@@ -67,19 +69,6 @@ static const char cf_probe_nonce[] = "PGRAC_CF_RENAME_PROBE_v1";
  * and forces re-verification (fail-closed).  CRC-protected; a torn or corrupt
  * record reads as UNVERIFIED.
  */
-#define CLUSTER_CF_CONTRACT_MAGIC 0x43464354 /* 'CFCT' */
-#define CLUSTER_CF_CONTRACT_VERSION 2
-
-typedef struct ClusterCfContractRecord {
-	uint32 magic;
-	uint32 version;
-	uint64 authority_system_identifier; /* v2: this node's bound authority sysid */
-	char storage_uuid[CLUSTER_SHARED_UUID_LEN];
-	char _pad[3];  /* keep `state` 4-byte aligned */
-	uint32 state;  /* a ClusterCfContractState value */
-	pg_crc32c crc; /* over [0, offsetof(crc)) */
-} ClusterCfContractRecord;
-
 /*
  * cluster_cf_startup_verdict -- pure startup-gate decision.
  *
@@ -835,6 +824,13 @@ cluster_cf_startup_prepare(const char *pgdata)
 	ClusterCfStartupVerdict v;
 	ClusterCfIdentityVerdict idv;
 
+	/* PGRAC: exact early ROOT preparation feeds the read-only catalog entry.
+	 * Shared startup never migrates or adopts local control/catalog files.
+	 * The later physical qualification and formation gates remain mandatory. */
+	if (cluster_shared_config) {
+		cluster_control_bootstrap_catalog_prepare(pgdata);
+		return;
+	}
 	if (!cluster_controlfile_shared_authority)
 		return; /* off: stock per-node pg_control */
 

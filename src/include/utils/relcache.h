@@ -155,6 +155,10 @@ extern void AtEOSubXact_RelationCache(bool isCommit, SubTransactionId mySubid,
 extern bool RelationIdIsInInitFile(Oid relationId);
 extern void RelationCacheInitFilePreInvalidate(void);
 extern void RelationCacheInitFilePostInvalidate(void);
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: aux-process invalidation of local startup caches. */
+extern void RelationCacheInitFilePreInvalidateAll(void);
+#endif
 extern void RelationCacheInitFileRemove(void);
 
 /* should be used only by relcache.c and catcache.c */

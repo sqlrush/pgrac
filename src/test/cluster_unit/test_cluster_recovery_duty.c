@@ -30,6 +30,16 @@
 
 UT_DEFINE_GLOBALS();
 
+/* Postmaster-only shared startup is covered by test_cluster_formation_witness. */
+bool cluster_shared_config;
+struct PGPROC *MyProc;
+bool
+cluster_reconfig_read_formation_fence_snapshot(ClusterFenceAuthorityProof *out)
+{
+	memset(out, 0, sizeof(*out));
+	return false;
+}
+
 static ClusterControlRootResult ut_root_lookup_result;
 static ClusterControlRootResult ut_root_publish_result;
 static ClusterRecoveryOwnerImportResult ut_owner_read_result;
@@ -232,13 +242,19 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 	abort();
 }
 
+static bool classification_available;
+static ClusterFormationSnapshotV1 classification_snapshot;
+static ClusterFenceAuthorityCacheResult classification_cache = CLUSTER_FENCE_CACHE_INVALID;
+
 bool
 cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
 											   ClusterFormationSnapshotV1 *out)
 {
 	(void)origin_thread;
-	(void)out;
-	return false;
+	if (!classification_available)
+		return false;
+	*out = classification_snapshot;
+	return true;
 }
 
 ClusterFenceAuthorityReadResult
@@ -270,7 +286,7 @@ cluster_write_fence_revalidate_cached_nowait(const ClusterFenceMarker *expected,
 {
 	(void)expected;
 	(void)now_us;
-	return CLUSTER_FENCE_CACHE_INVALID;
+	return classification_cache;
 }
 
 /* RF-ROOT P6 (L4 admission / phase-3 gate diag refs): cluster_recovery_duty.o
@@ -1115,6 +1131,45 @@ UT_TEST(test_domain_separated_digest)
 	UT_ASSERT(memcmp(actual.bytes, expected, sizeof(expected)) == 0);
 }
 
+/* PGRAC: wire key version is independent of physical claim version. This
+ * tests serialization only; actual root/claim decoding is tested separately.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_v2_claim_key_keeps_encoding_and_legacy_refusal)
+{
+	ClusterRecoveryDutyKey key, other;
+	ClusterRecoveryDutyDigest digest, changed, legacy;
+	uint8 encoded[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES];
+	uint8 expected[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES];
+
+	build_valid_key(&key);
+	UT_ASSERT(cluster_recovery_duty_digest_v1(&key, &legacy));
+	UT_ASSERT(cluster_recovery_duty_digest_for_claim(&key, true, &digest));
+	UT_ASSERT_EQ(memcmp(&legacy, &digest, sizeof(digest)), 0);
+	for (int i = 0; i < 2; i++) {
+		key.thread_claim_crc32c = i == 0 ? 0 : UINT32_C(0x10203040);
+		build_expected_encoding(&key, expected);
+		UT_ASSERT(!cluster_recovery_duty_key_valid_v1(&key));
+		UT_ASSERT(!cluster_recovery_duty_key_encode_v1(&key, encoded));
+		UT_ASSERT(cluster_recovery_duty_key_encode_for_claim(&key, true, encoded));
+		UT_ASSERT_EQ(memcmp(encoded, expected, sizeof(encoded)), 0);
+		UT_ASSERT(cluster_recovery_duty_digest_for_claim(&key, true, &digest));
+		UT_ASSERT_EQ(cluster_recovery_duty_key_compare_for_claim(&key, &key, true),
+					 CLUSTER_RECOVERY_DUTY_COMPARE_EXACT);
+		other = key;
+		other.origin_owner_incarnation++;
+		UT_ASSERT_EQ(cluster_recovery_duty_key_compare_for_claim(&key, &other, true),
+					 CLUSTER_RECOVERY_DUTY_COMPARE_DIFFERENT);
+		UT_ASSERT(cluster_recovery_duty_digest_for_claim(&other, true, &changed));
+		UT_ASSERT_NE(memcmp(&digest, &changed, sizeof(digest)), 0);
+		other.reserved42 = 1;
+		UT_ASSERT(!cluster_recovery_duty_key_encode_for_claim(&other, true, encoded));
+		UT_ASSERT_EQ(cluster_recovery_duty_key_compare_for_claim(&key, &other, true),
+					 CLUSTER_RECOVERY_DUTY_COMPARE_INVALID);
+	}
+	key.thread_claim_created_at = -1;
+	UT_ASSERT(!cluster_recovery_duty_key_valid_for_claim(&key, true));
+}
+
 UT_TEST(test_full_key_compare_has_no_numeric_order)
 {
 	ClusterRecoveryDutyKey expected;
@@ -1290,12 +1345,39 @@ UT_TEST(test_formation_pending_owner_and_full_outage_fail_closed)
 				 CLUSTER_FORMATION_WITNESS_FULL_OUTAGE_UNRECOVERED);
 }
 
+UT_TEST(test_classification_expiry_is_distinct_from_identity_drift)
+{
+	ClusterFormationSnapshotV1 expected;
+	ClusterFenceAuthorityProof proof;
+
+	build_valid_formation(&expected, &proof, 4);
+	classification_snapshot = expected;
+	classification_available = true;
+	classification_cache = CLUSTER_FENCE_CACHE_EXPIRED;
+	UT_ASSERT_EQ(cluster_formation_classification_revalidate_nowait(4, &proof, &expected),
+				 CLUSTER_FORMATION_WITNESS_CACHE_EXPIRED);
+	classification_snapshot.local_epoch++;
+	UT_ASSERT_EQ(cluster_formation_classification_revalidate_nowait(4, &proof, &expected),
+				 CLUSTER_FORMATION_WITNESS_UNSTABLE);
+	classification_snapshot = expected;
+	classification_cache = CLUSTER_FENCE_CACHE_STALE;
+	UT_ASSERT_EQ(cluster_formation_classification_revalidate_nowait(4, &proof, &expected),
+				 CLUSTER_FORMATION_WITNESS_UNSTABLE);
+	classification_cache = CLUSTER_FENCE_CACHE_MATCH;
+	UT_ASSERT_EQ(cluster_formation_classification_revalidate_nowait(4, &proof, &expected),
+				 CLUSTER_FORMATION_WITNESS_READY);
+	classification_available = false;
+	classification_cache = CLUSTER_FENCE_CACHE_INVALID;
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(28);
+	UT_RUN(test_classification_expiry_is_distinct_from_identity_drift);
 	UT_RUN(test_exact_74_byte_encoding);
 	UT_RUN(test_domain_separated_digest);
+	UT_RUN(test_v2_claim_key_keeps_encoding_and_legacy_refusal);
 	UT_RUN(test_full_key_compare_has_no_numeric_order);
 	UT_RUN(test_zero_and_reserved_fields_are_invalid);
 	UT_RUN(test_thread_node_and_claim_binding_are_exact);

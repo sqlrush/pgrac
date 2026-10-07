@@ -9,17 +9,17 @@
  *	  COMMITTED but the on-page ItlSlotData has not been stamped) →
  *	  this helper tries to take an EXCLUSIVE content lock on the
  *	  buffer non-blocking; on success, stamps slot.commit_scn +
- *	  slot.flags = COMMITTED, then MarkBufferDirtyHint(buf, true).
+ *	  slot.flags = COMMITTED, then publishes the native hint image.
  *	  On any failure (lock would block, slot state changed, xid
  *	  mismatch, commit_scn mismatch) returns false immediately and
  *	  the reader proceeds with the overlay-derived decision.
  *
  *	  spec-3.4c F1 hint-style:  HeapTupleSatisfiesMVCC only has a
  *	  Buffer argument -- no Relation / RelationNeedsWAL() context --
- *	  so this helper MUST NOT emit generic WAL.  It marks the buffer
- *	  dirty as a hint (PG-standard reader-path mutation pattern,
- *	  same as HEAP_XMIN_COMMITTED hint bit).  PG may still emit a hint
- *	  FPI when checksums / wal_log_hints require it.  Crash may lose
+ *	  so this helper MUST NOT emit generic WAL. Shared permanent pages
+ *	  require a cached SPACE identity and content-X before mutation,
+ *	  then publish a versioned native hint FPI. Cache misses skip the
+ *	  optional stamp without I/O. Other profiles keep native hints. Crash may lose
  *	  the hint; the next reader will re-resolve via the TT status
  *	  overlay.  Correctness is guaranteed by the overlay path; this
  *	  helper is a perf optimization only.
@@ -80,8 +80,8 @@
  *	     FREE),
  *	     release lock + return false.
  *	  2. Otherwise: stamp slot.commit_scn = expected_commit_scn;
- *	     slot.flags = ITL_FLAG_COMMITTED; MarkBufferDirtyHint(buf, true)
- *	     (F1 hint-style, no WAL); release lock; return true.
+ *	     slot.flags = ITL_FLAG_COMMITTED; publish the native hint image
+ *	     release lock; return true.
  *
  *	Caller MUST NOT depend on cleanup success.  Visibility decision is
  *	already made via the overlay path before this helper is called.

@@ -34,9 +34,14 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_control_request.h"
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_ir.h"
+#include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_ges.h"	  /* GesRequestPayload / RELEASE cleanup payload */
 #include "cluster/cluster_ges_mode.h" /* spec-5.1b D1: ges_modes_compatible (frozen matrix) */
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_pi_rebuild.h"
 #include "cluster/cluster_grd_outbound.h" /* cluster_grd_outbound_enqueue_cleanup_release (D10) */
 #include "cluster/cluster_hw_remaster.h" /* spec-5.7 D3 S5d — HW authority rebuild launch + gate */
 #include "cluster/cluster_lmd.h"		 /* spec-2.24 D10 cleanup_*_count_inc */
@@ -52,6 +57,7 @@
 #include "cluster/cluster_signal.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_sinval.h"
 #include "cluster/cluster_cssd.h"			/* spec-2.16 D8 newly-dead bitmap diff */
 #include "cluster/cluster_ic_tier1.h"		/* cluster_ic_tier1_get_peer_fd (RF-ROOT P6 diag) */
 #include "cluster/cluster_epoch.h"			/* spec-4.6 D1 — accepted epoch reads */
@@ -84,6 +90,29 @@
 
 static ClusterGrdShared *cluster_grd_state = NULL;
 
+/* Process-local memo of an exactly checked completed JOIN cut. Every field
+ * is owned by an existing shared publisher; this is not a serving authority. */
+typedef struct GrdPiReadyKey {
+	uint64 publication;
+	uint64 membership;
+	uint64 epoch;
+	uint64 fence_epoch;
+	uint64 scope_epoch;
+	uint64 master_map_refresh;
+	uint64 redeclare_generation;
+	uint64 routing_generation;
+	uint64 self_boot;
+	uint64 event_id;
+	uint64 episode_epoch;
+	uint32 direction;
+	int32 node;
+} GrdPiReadyKey;
+
+static GrdPiReadyKey grd_pi_ready_key;
+static bool grd_pi_ready_valid;
+static bool grd_pi_ready_cached(void);
+
+
 /* spec-2.15 v0.3 P1.3:  Per-shard LWLock array (named tranche).  4096
  * LWLock managed by PG lwlock.c — cluster_grd_shmem_init only obtains
  * the array pointer; PG auto-initializes the lock objects. */
@@ -97,7 +126,9 @@ static HTAB *cluster_grd_entry_htab = NULL;
 
 static int cluster_grd_snapshot_entry_resids(ClusterResId **out_resids);
 static bool join_fence_is_recipient_for(int32 node_id, uint64 ref_epoch);
+static bool join_fence_is_affected_for(int32 node_id, uint64 ref_epoch);
 static void grd_recovery_authority_clear_seal(void);
+static bool grd_recovery_authority_request_current(uint64 request_generation);
 
 /* spec-2.15 v0.4 P1.1:  HTAB init size = Max(GUC, PGRAC_GRD_SHARD_COUNT)
  * — HASH_PARTITION=4096 forces dynahash nbuckets >= 4096 (nbuckets =
@@ -126,6 +157,7 @@ static Size cluster_grd_entries_alloc_bytes = 0;
 
 typedef struct ClusterGrdHolder {
 	int32 node_id;
+	uint32 lock_group_procno_plus_one;
 	uint32 procno;
 	uint64 cluster_epoch;
 	uint64 request_id;
@@ -140,8 +172,9 @@ typedef struct ClusterGrdWaiter {
 	 * (node_id, mode, wait_start);  the procno/request_id/request_opcode
 	 * + source_node_id additions are NEW for spec-2.23.
 	 */
-	int32 node_id;					/* legacy: equal to source_node_id; kept for binary compat */
-	int32 source_node_id;			/* node hosting the waiting backend */
+	int32 node_id;		  /* legacy: equal to source_node_id; kept for binary compat */
+	int32 source_node_id; /* node hosting the waiting backend */
+	uint32 lock_group_procno_plus_one;
 	uint32 procno;					/* PG ProcNumber of the waiting backend */
 	uint64 cluster_epoch;			/* epoch at waiter enqueue time */
 	uint64 request_id;				/* per-backend monotonic id (for 5-tuple reply key) */
@@ -240,6 +273,7 @@ struct ClusterGrdEntry {
 
 typedef struct GrdWfgHolderSnap {
 	int32 node_id;
+	uint32 lock_group_procno_plus_one;
 	uint32 procno;
 	uint64 cluster_epoch;
 	uint64 request_id;
@@ -248,6 +282,7 @@ typedef struct GrdWfgHolderSnap {
 
 typedef struct GrdWfgWaiterSnap {
 	int32 node_id;
+	uint32 lock_group_procno_plus_one;
 	uint32 procno;
 	uint64 cluster_epoch;
 	uint64 request_id;		  /* REQUEST waiter id, or convert_request_id for a convert */
@@ -269,6 +304,33 @@ typedef struct GrdWfgSnapshot {
 	GrdWfgWaiterSnap waiters[PGRAC_GRD_MAX_WAITERS + PGRAC_GRD_MAX_CONVERTS];
 } GrdWfgSnapshot;
 
+/* PG retains a leader's PROC slot until its last group member exits. An
+ * ungrouped original holder is its own leader, including a lock acquired
+ * before BecomeLockGroupLeader(). Node identity still separates instances. */
+static bool
+grd_same_lock_group(int32 anode, uint32 aproc, uint32 agroup, int32 bnode, uint32 bproc,
+					uint32 bgroup)
+{
+	return anode == bnode
+		   && (aproc == bproc
+			   || (uint64)(agroup ? agroup : (uint64)aproc + 1)
+					  == (uint64)(bgroup ? bgroup : (uint64)bproc + 1));
+}
+
+/* A queued request already blocked by this group's holder cannot in turn
+ * block a group member: the leader may be waiting for that worker to finish. */
+static bool
+grd_group_blocks_mode(const ClusterGrdEntry *entry, int32 node, uint32 proc, uint32 group,
+					  LOCKMODE queued_mode)
+{
+	for (int i = 0; i < entry->ngranted; i++)
+		if (grd_same_lock_group(entry->holders[i].node_id, entry->holders[i].procno,
+								entry->holders[i].lock_group_procno_plus_one, node, proc, group)
+			&& !ges_modes_compatible(entry->holders[i].mode, queued_mode))
+			return true;
+	return false;
+}
+
 /* spec-5.10 D4 — wrap-safe fair_queue_seq order (defined with the other
  * starvation helpers below; forward-declared here because the spec-5.8 WFG
  * refresh re-emits the FAIRNESS_BARRIER edge and needs the "earlier-than"
@@ -281,7 +343,7 @@ static inline bool grd_fair_seq_precedes(uint64 a, uint64 b);
  * metadata, threaded from the GES request / convert at enqueue time). */
 static void
 grd_wfg_make_vertex(int32 node_id, uint32 procno, uint64 cluster_epoch, uint64 request_id,
-					TransactionId xid, uint64 wait_seq, ClusterLmdVertex *out)
+					TransactionId xid, uint64 wait_seq, uint32 group, ClusterLmdVertex *out)
 {
 	memset(out, 0, sizeof(*out));
 	out->node_id = node_id;
@@ -291,6 +353,7 @@ grd_wfg_make_vertex(int32 node_id, uint32 procno, uint64 cluster_epoch, uint64 r
 	out->xid = xid;
 	out->local_start_ts_ms = 0;
 	out->wait_seq = wait_seq;
+	out->lock_group_procno_plus_one = group;
 }
 
 static bool
@@ -341,6 +404,7 @@ grd_wfg_snapshot_locked(const ClusterGrdEntry *entry, GrdWfgSnapshot *snap)
 		GrdWfgHolderSnap *h = &snap->holders[snap->n_holders++];
 
 		h->node_id = entry->holders[i].node_id;
+		h->lock_group_procno_plus_one = entry->holders[i].lock_group_procno_plus_one;
 		h->procno = entry->holders[i].procno;
 		h->cluster_epoch = entry->holders[i].cluster_epoch;
 		h->request_id = entry->holders[i].request_id;
@@ -354,6 +418,7 @@ grd_wfg_snapshot_locked(const ClusterGrdEntry *entry, GrdWfgSnapshot *snap)
 		GrdWfgWaiterSnap *w = &snap->waiters[snap->n_waiters++];
 
 		w->node_id = entry->waiters[i].node_id;
+		w->lock_group_procno_plus_one = entry->waiters[i].lock_group_procno_plus_one;
 		w->procno = entry->waiters[i].procno;
 		w->cluster_epoch = entry->waiters[i].cluster_epoch;
 		w->request_id = entry->waiters[i].request_id;
@@ -371,6 +436,7 @@ grd_wfg_snapshot_locked(const ClusterGrdEntry *entry, GrdWfgSnapshot *snap)
 		/* A pending convert blocks on its requested (target) mode; its vertex
 		 * id uses the convert's own reply key (convert_request_id). */
 		w->node_id = entry->converts[i].node_id;
+		w->lock_group_procno_plus_one = entry->converts[i].lock_group_procno_plus_one;
 		w->procno = entry->converts[i].procno;
 		w->cluster_epoch = entry->converts[i].cluster_epoch;
 		w->request_id = entry->converts[i].convert_request_id;
@@ -396,7 +462,7 @@ grd_wfg_cancel_snapshot_waiters(const GrdWfgSnapshot *snap)
 		ClusterLmdVertex waiter_v;
 
 		grd_wfg_make_vertex(w->node_id, w->procno, w->cluster_epoch, w->request_id, w->waiter_xid,
-							w->wait_seq, &waiter_v);
+							w->wait_seq, w->lock_group_procno_plus_one, &waiter_v);
 		cluster_lmd_cancel_wait_edge_real(&waiter_v);
 	}
 }
@@ -412,21 +478,24 @@ grd_wfg_refresh_waiter_edges(const GrdWfgSnapshot *snap, const GrdWfgWaiterSnap 
 	int i;
 
 	grd_wfg_make_vertex(w->node_id, w->procno, w->cluster_epoch, w->request_id, w->waiter_xid,
-						w->wait_seq, &waiter_v);
+						w->wait_seq, w->lock_group_procno_plus_one, &waiter_v);
 	cluster_lmd_cancel_wait_edge_real(&waiter_v); /* clear stale edges first */
 
 	for (i = 0; i < snap->n_holders; i++) {
 		ClusterLmdVertex blocker_v;
 
 		/* spec-5.1c D5 self-exclusion: a backend never blocks on its own hold. */
-		if (snap->holders[i].node_id == w->node_id && snap->holders[i].procno == w->procno)
+		if (grd_same_lock_group(snap->holders[i].node_id, snap->holders[i].procno,
+								snap->holders[i].lock_group_procno_plus_one, w->node_id, w->procno,
+								w->lock_group_procno_plus_one))
 			continue;
 		/* Only conflicting holders block the waiter (frozen 8x8 matrix). */
 		if (ges_modes_compatible(snap->holders[i].mode, w->mode))
 			continue;
 		grd_wfg_make_vertex(snap->holders[i].node_id, snap->holders[i].procno,
 							snap->holders[i].cluster_epoch, snap->holders[i].request_id,
-							InvalidTransactionId, 0, &blocker_v);
+							InvalidTransactionId, 0, snap->holders[i].lock_group_procno_plus_one,
+							&blocker_v);
 		(void)cluster_lmd_submit_wait_edge_real(&waiter_v, &blocker_v, w->request_id);
 	}
 
@@ -444,11 +513,21 @@ grd_wfg_refresh_waiter_edges(const GrdWfgSnapshot *snap, const GrdWfgWaiterSnap 
 
 		for (i = 0; i < snap->n_waiters; i++) {
 			const GrdWfgWaiterSnap *cand = &snap->waiters[i];
+			bool group_blocks = false;
+
+			for (int h = 0; h < snap->n_holders; h++)
+				if (grd_same_lock_group(snap->holders[h].node_id, snap->holders[h].procno,
+										snap->holders[h].lock_group_procno_plus_one, w->node_id,
+										w->procno, w->lock_group_procno_plus_one)
+					&& !ges_modes_compatible(snap->holders[h].mode, cand->mode))
+					group_blocks = true;
+			if (group_blocks)
+				continue;
 
 			if (!cand->boosted)
 				continue;
-			if (cand->node_id == w->node_id && cand->procno == w->procno
-				&& cand->cluster_epoch == w->cluster_epoch && cand->request_id == w->request_id)
+			if (grd_same_lock_group(cand->node_id, cand->procno, cand->lock_group_procno_plus_one,
+									w->node_id, w->procno, w->lock_group_procno_plus_one))
 				continue; /* a waiter never barriers itself */
 			if (ges_modes_compatible(cand->mode, w->mode))
 				continue; /* no conflict -> does not block R */
@@ -464,7 +543,7 @@ grd_wfg_refresh_waiter_edges(const GrdWfgSnapshot *snap, const GrdWfgWaiterSnap 
 			grd_wfg_make_vertex(snap->waiters[best].node_id, snap->waiters[best].procno,
 								snap->waiters[best].cluster_epoch, snap->waiters[best].request_id,
 								snap->waiters[best].waiter_xid, snap->waiters[best].wait_seq,
-								&blocker_v);
+								snap->waiters[best].lock_group_procno_plus_one, &blocker_v);
 			(void)cluster_lmd_submit_wait_edge_real(&waiter_v, &blocker_v, w->request_id);
 		}
 	}
@@ -493,7 +572,7 @@ grd_wfg_resync_entry(const ClusterResId *resid, const ClusterGrdHolderId *depart
 
 		grd_wfg_make_vertex((int32)departed[i].node_id, departed[i].procno,
 							departed[i].cluster_epoch, departed[i].request_id, InvalidTransactionId,
-							0, &v);
+							0, 0, &v);
 		cluster_lmd_cancel_wait_edge_real(&v);
 	}
 
@@ -797,6 +876,7 @@ cluster_grd_shmem_init(void)
 	bool found;
 	Size entry_alloc = grd_entries_estimate_bytes();
 
+	grd_pi_ready_valid = false; /* Never inherit a memo across shmem attach. */
 	cluster_grd_state = ShmemInitStruct("pgrac cluster grd", sizeof(ClusterGrdShared), &found);
 	if (!found) {
 		int i;
@@ -904,6 +984,12 @@ cluster_grd_shmem_init(void)
 		pg_atomic_init_u64(&cluster_grd_state->recovery_event_old_epoch, 0);
 		pg_atomic_init_u64(&cluster_grd_state->recovery_redeclare_generation, 0);
 		pg_atomic_init_u64(&cluster_grd_state->recovery_barrier_deadline, 0);
+		pg_atomic_init_u32(&cluster_grd_state->block_redeclare_cursor, 0);
+		pg_atomic_init_u32(&cluster_grd_state->local_pi_redeclare_cursor, 0);
+		pg_atomic_init_u64(&cluster_grd_state->block_redeclare_epoch, 0);
+		pg_atomic_init_u32(&cluster_grd_state->block_redeclare_done, 0);
+		pg_atomic_init_u64(&cluster_grd_state->block_redeclare_retries, 0);
+		pg_atomic_init_u64(&cluster_grd_state->local_pi_redeclare_retries, 0);
 		pg_atomic_init_u32(&cluster_grd_state->recovery_event_coordinator, 0);
 		pg_atomic_init_u64(&cluster_grd_state->recovery_done_epoch_at_accept, 0);
 		/* spec-4.6 P0#3 cluster gate — per-node barrier-done epochs. */
@@ -931,9 +1017,18 @@ cluster_grd_shmem_init(void)
 
 		/* spec-5.16 D2/D3b/D5 — online-join remaster fence + counters. */
 		pg_atomic_init_u64(&cluster_grd_state->join_pcm_fence_epoch, 0);
-		for (i = 0; i < CLUSTER_MAX_NODES; i++)
+		pg_atomic_init_u64(&cluster_grd_state->join_pcm_fence_scope_epoch, 0);
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 			pg_atomic_init_u64(&cluster_grd_state->join_pcm_fence_member_epoch[i], 0);
+			pg_atomic_init_u64(&cluster_grd_state->join_pcm_fence_excluded_epoch[i], 0);
+		}
 		pg_atomic_init_u32(&cluster_grd_state->recovery_direction, (uint32)GRD_REMASTER_DIR_NONE);
+		SpinLockInit(&cluster_grd_state->pi_rebuild_lock);
+		pg_atomic_init_u64(&cluster_grd_state->pi_rebuild_publication, 2);
+		pg_atomic_init_u64(&cluster_grd_state->pi_rebuild_side_blocked_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->pi_rebuild_apply_blocked_count, 0);
+		pg_atomic_init_u64(&cluster_grd_state->pi_rebuild_plan_blocked_count, 0);
+		memset(&cluster_grd_state->pi_rebuilt, 0, sizeof(cluster_grd_state->pi_rebuilt));
 		/* Shape A: off-path boot barrier starts UNDECIDED (fail-closed). */
 		pg_atomic_init_u32(&cluster_grd_state->offpath_boot_decided, 0);
 		pg_atomic_init_u64(&cluster_grd_state->join_remaster_started_count, 0);
@@ -1862,6 +1957,26 @@ cluster_grd_master_map_recompute_for_membership(const uint8 *active_member, uint
 	return moved;
 }
 
+/* Caller holds pi_rebuild_lock across scope/complete publication. Zero is
+ * sticky on exhaustion or an interrupted write, so a sequence cannot ABA. */
+static uint64
+grd_pi_publish_begin(void)
+{
+	uint64 prior = pg_atomic_read_u64(&cluster_grd_state->pi_rebuild_publication);
+	if (prior == 0 || (prior & 1) != 0 || prior > UINT64_MAX - 2)
+		prior = 0;
+	pg_atomic_write_u64(&cluster_grd_state->pi_rebuild_publication, prior ? prior + 1 : 0);
+	pg_write_barrier();
+	return prior;
+}
+
+static void
+grd_pi_publish_end(uint64 prior)
+{
+	pg_write_barrier();
+	pg_atomic_write_u64(&cluster_grd_state->pi_rebuild_publication, prior ? prior + 2 : 0);
+}
+
 /*
  * cluster_grd_arm_join_pcm_fence -- spec-5.16 D3b (INV-R13).
  *
@@ -1889,17 +2004,11 @@ cluster_grd_master_map_recompute_for_membership(const uint8 *active_member, uint
  *	keying fixes both the union (no under-fence) and the staleness (no cross-
  *	episode under-wait) with no reset race.
  */
-void
-cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set)
+static void
+grd_arm_join_pcm_fence_locked(const uint8 *rejoining_set, uint64 epoch)
 {
-	uint64 epoch;
 	uint64 prev;
 	int node;
-
-	if (cluster_grd_state == NULL || rejoining_set == NULL)
-		return;
-
-	epoch = cluster_epoch_get_current();
 
 	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
 		uint64 cur;
@@ -1926,6 +2035,53 @@ cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set)
 	pg_atomic_write_u32(&cluster_grd_state->recovery_direction, (uint32)GRD_REMASTER_DIR_JOIN);
 }
 
+void
+cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set)
+{
+	uint64 publication;
+	if (cluster_grd_state == NULL || rejoining_set == NULL)
+		return;
+	SpinLockAcquire(&cluster_grd_state->pi_rebuild_lock);
+	publication = grd_pi_publish_begin();
+	grd_arm_join_pcm_fence_locked(rejoining_set, cluster_epoch_get_current());
+	grd_pi_publish_end(publication);
+	SpinLockRelease(&cluster_grd_state->pi_rebuild_lock);
+}
+
+void
+cluster_grd_arm_join_pcm_fence_scope_v1(const uint8 *rejoining_set, const uint8 *excluded_set)
+{
+	uint64 epoch, prior, publication;
+	if (cluster_grd_state == NULL || rejoining_set == NULL || excluded_set == NULL)
+		return;
+	epoch = cluster_epoch_get_current();
+	if (epoch == 0)
+		return;
+	SpinLockAcquire(&cluster_grd_state->pi_rebuild_lock);
+	publication = grd_pi_publish_begin();
+	/* Same-epoch arms union without removing a home already fenced. A
+	 * newer epoch naturally ignores old stamps. Publish scope before the
+	 * original recipient fence, which is armed before MEMBER is visible. */
+	for (int i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (!(excluded_set[i / 8] & (1u << (i % 8))))
+			continue;
+		prior = pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_excluded_epoch[i]);
+		while (epoch > prior
+			   && !pg_atomic_compare_exchange_u64(
+				   &cluster_grd_state->join_pcm_fence_excluded_epoch[i], &prior, epoch))
+			;
+	}
+	pg_write_barrier();
+	prior = pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_scope_epoch);
+	while (epoch > prior
+		   && !pg_atomic_compare_exchange_u64(&cluster_grd_state->join_pcm_fence_scope_epoch,
+											  &prior, epoch))
+		;
+	grd_arm_join_pcm_fence_locked(rejoining_set, epoch);
+	grd_pi_publish_end(publication);
+	SpinLockRelease(&cluster_grd_state->pi_rebuild_lock);
+}
+
 /*
  * cluster_grd_join_remaster_in_progress -- spec-5.16 D2.  recovery_direction
  * == JOIN (observability + recompute selection; does not change the FSM).
@@ -1942,9 +2098,9 @@ cluster_grd_join_remaster_in_progress(void)
 /*
  * cluster_grd_join_remaster_active_for_shard -- spec-5.16 D3 (INV-R8).
  *
- *	True iff the block's STATIC PCM home (cluster_gcs_lookup_master_static) is a
- *	rejoining RECIPIENT of the CURRENT fence episode (member_epoch[home] ==
- *	join_pcm_fence_epoch).  Bound to online_join (the fence epoch is armed by
+ *	True iff the block's STATIC PCM home belongs to the CURRENT JOIN scope:
+ *	recipients plus remaining excluded homes whose live-set hash may change.
+ *	Bound to online_join (the fence epoch is armed by
  *	note_self_admitted / LMON P0-accept), INDEPENDENT of any GRD master[]
  *	movement — so join_remaster_enabled=off still fences (r2 P1-①, P1-A
  *	closure).  false when the fence is not armed or the home is a steady member
@@ -1966,7 +2122,7 @@ cluster_grd_join_remaster_active_for_shard(BufferTag tag)
 	home = cluster_gcs_lookup_master_static(tag);
 	if (home < 0 || home >= CLUSTER_MAX_NODES)
 		return false;
-	return pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_member_epoch[home]) == fence_epoch;
+	return join_fence_is_affected_for(home, fence_epoch);
 }
 
 /*
@@ -1979,9 +2135,9 @@ cluster_grd_join_remaster_active_for_shard(BufferTag tag)
  *	BEFORE the survivors finish re-declaring their held joiner-home blocks to
  *	it, so gating on recovery_done_epoch[joiner] alone would lift the fence
  *	early → the joiner cold-serves a block a survivor still holds X on → 8.A
- *	double-grant (Hardening v1.1, user-approved 2026-06-28).  The tag is
- *	vestigial (the barrier is per-fence-epoch, not per-block) but kept so
- *	call sites read uniformly with active_for_shard.
+ *	double-grant (Hardening v1.1, user-approved 2026-06-28). The protocol
+ *	barrier is per-fence-epoch; shared service additionally checks the tag's
+ *	new master's retained-contributor cut.
  *
  *	The barrier set is the CURRENT members (cluster_membership_is_member), NOT
  *	all declared nodes:  a node dead from a prior failure never re-declares, so
@@ -2010,6 +2166,21 @@ join_fence_is_recipient_for(int32 node_id, uint64 ref_epoch)
 		   == ref_epoch;
 }
 
+/* A routing exclusion is an affected home, never a recipient. Unknown
+ * scope on a shared join keeps service closed until the selected cut lands. */
+static bool
+join_fence_is_affected_for(int32 node_id, uint64 ref_epoch)
+{
+	if (cluster_grd_state == NULL || node_id < 0 || node_id >= CLUSTER_MAX_NODES || ref_epoch == 0)
+		return false;
+	if (cluster_shared_config
+		&& pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_scope_epoch) != ref_epoch)
+		return true;
+	return join_fence_is_recipient_for(node_id, ref_epoch)
+		   || pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_excluded_epoch[node_id])
+				  == ref_epoch;
+}
+
 bool
 cluster_grd_join_view_rebuilt(void)
 {
@@ -2021,6 +2192,9 @@ cluster_grd_join_view_rebuilt(void)
 	fence_epoch = pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch);
 	if (fence_epoch == 0)
 		return true; /* nothing fenced */
+	if (cluster_shared_config
+		&& pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_scope_epoch) != fence_epoch)
+		return false;
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (cluster_conf_lookup_node(i) == NULL)
@@ -2049,8 +2223,13 @@ cluster_grd_join_view_rebuilt(void)
 bool
 cluster_grd_block_view_rebuilt(BufferTag tag)
 {
-	(void)tag;
-	return cluster_grd_join_view_rebuilt();
+	if (grd_pi_ready_cached())
+		return true;
+	if (!cluster_grd_join_view_rebuilt())
+		return false;
+	/* Remote requesters may retry after the protocol barrier. The actual
+	 * master additionally waits for its own complete retained contributions. */
+	return !cluster_grd_pi_rebuild_blocked_v1(tag);
 }
 
 /*
@@ -2258,12 +2437,566 @@ cluster_grd_dead_bitmap_hash(const uint8 *dead_bitmap)
 	return hash_bytes_extended(dead_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES, 0);
 }
 
+/* A block census can only add obligations while its home is fenced.  The
+ * cross-node identity includes the accepted set: an epoch alone does not
+ * distinguish a growing dead set. Local generations are rechecked but must
+ * not be compared between instances.  This is no DATA/retirement authority. */
+int
+cluster_grd_block_redeclare_state_v1(BufferTag tag, uint64 epoch, uint64 *census_hash)
+{
+	uint8 bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint32 state, direction;
+	uint64 generation, refresh, event_id, hash;
+	bool active;
+	int home;
+
+	if (census_hash != NULL)
+		*census_hash = 0;
+	if (census_hash == NULL || !cluster_enabled || !cluster_shared_config
+		|| cluster_grd_state == NULL || epoch == 0 || cluster_epoch_get_current() != epoch
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| !cluster_membership_is_member(cluster_node_id) || !cluster_qvotec_in_quorum()
+		|| cluster_reconfig_has_pending_prebump_stage()
+		|| pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) == 0)
+		return -1;
+	state = pg_atomic_read_u32(&cluster_grd_state->recovery_state);
+	direction = pg_atomic_read_u32(&cluster_grd_state->recovery_direction);
+	generation = cluster_grd_redeclare_generation();
+	refresh = pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count);
+	event_id = pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id);
+	active = (state == GRD_RECOVERY_WAIT_BARRIER || state == GRD_RECOVERY_WAIT_CLUSTER)
+			 && cluster_grd_redeclare_episode_epoch() == epoch && generation != 0;
+	home = cluster_gcs_lookup_master_static(tag);
+	if (home < 0 || home >= CLUSTER_MAX_NODES)
+		return -1;
+	if (direction == GRD_REMASTER_DIR_FAIL) {
+		if (!active || event_id == 0)
+			return -1;
+		for (int i = 0; i < lengthof(cluster_grd_state->recovery_dead_bitmap); i++) {
+			uint64 word = pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[i]);
+			for (int j = 0; j < 8 && i * 8 + j < sizeof(bitmap); j++)
+				bitmap[i * 8 + j] = (uint8)(word >> (j * 8));
+		}
+		if (cluster_grd_dead_bitmap_hash(bitmap)
+			!= pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash))
+			return -1;
+	} else if (direction == GRD_REMASTER_DIR_JOIN) {
+		/* Fresh recipients have no local JOIN event. Their synchronous fence
+		 * admits declarations, but not service, before the survivor barrier. */
+		if (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch) != epoch
+			|| pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_scope_epoch) != epoch
+			|| (!active
+				&& !(state == GRD_RECOVERY_IDLE
+					 && join_fence_is_recipient_for(cluster_node_id, epoch)))
+			|| cluster_grd_join_view_rebuilt())
+			return -1;
+		for (int i = 0; i < CLUSTER_MAX_NODES; i++)
+			if (join_fence_is_affected_for(i, epoch))
+				bitmap[i / 8] |= (uint8)(1u << (i % 8));
+	} else
+		return -1;
+	hash = hash_bytes_extended(bitmap, sizeof(bitmap), direction);
+	if (hash == 0 || cluster_epoch_get_current() != epoch || !cluster_qvotec_in_quorum()
+		|| cluster_reconfig_has_pending_prebump_stage()
+		|| pg_atomic_read_u32(&cluster_grd_state->recovery_state) != state
+		|| pg_atomic_read_u32(&cluster_grd_state->recovery_direction) != direction
+		|| cluster_grd_redeclare_generation() != generation
+		|| pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count) != refresh
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id) != event_id)
+		return -1;
+	/* Bitmap writers publish only at an episode transition, except JOIN's
+	 * per-recipient monotone union, which needs its own exact second read. */
+	if (direction == GRD_REMASTER_DIR_JOIN) {
+		if (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch) != epoch)
+			return -1;
+		for (int i = 0; i < CLUSTER_MAX_NODES; i++)
+			if (join_fence_is_affected_for(i, epoch) != !!(bitmap[i / 8] & (1u << (i % 8))))
+				return -1;
+	}
+	*census_hash = hash;
+	return (bitmap[home / 8] & (1u << (home % 8))) != 0 ? 1 : 0;
+}
+
+/*
+ * PGRAC: observe the completed failure PROTOCOL barrier without passing P7's
+ * DATA-recovery gate. This does not acquire a control lock, retire any holder,
+ * certify external fencing, or authorize ordinary access. Consumers reobserve
+ * the whole cut after blocking work; grant/release admission is separate.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+bool
+cluster_grd_recovery_control_snapshot(uint16 origin_thread,
+									  ClusterGrdRecoveryControlSnapshotV1 *out)
+{
+	ClusterGrdRecoveryControlSnapshotV1 observed = { 0 };
+	ReconfigEvent event = { 0 };
+	ReconfigEvent after = { 0 };
+	uint64 dead[(CLUSTER_MAX_NODES + 63) / 64];
+	uint32 shard;
+	int32 origin_node;
+	int i;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES || !cluster_enabled
+		|| cluster_grd_state == NULL || cluster_grd_entry_htab == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES
+		|| pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) == 0
+		|| !cluster_qvotec_in_quorum() || cluster_reconfig_has_pending_prebump_stage())
+		return false;
+	origin_node = (int32)origin_thread - 1;
+	cluster_reconfig_get_last_event(&event);
+	observed.event_id = event.event_id;
+	/* A non-coordinator's event retains its pre-piggyback observation.
+	 * The GRD owner, not that historical observation, fixes this cut's epoch. */
+	observed.episode_epoch = pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch);
+	observed.dead_bitmap_hash = cluster_grd_dead_bitmap_hash(event.dead_bitmap);
+	observed.redeclare_generation
+		= pg_atomic_read_u64(&cluster_grd_state->recovery_redeclare_generation);
+	observed.master_map_refresh = pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count);
+	observed.routing_generation = cluster_lms_get_shard_master_generation();
+	memcpy(observed.dead_bitmap, event.dead_bitmap, sizeof(observed.dead_bitmap));
+	if (event.reconfig_kind != RECONFIG_KIND_FAIL_STOP || observed.event_id == 0
+		|| observed.episode_epoch == 0 || event.new_epoch == 0
+		|| event.new_epoch > observed.episode_epoch || observed.dead_bitmap_hash == 0
+		|| observed.redeclare_generation == 0 || observed.master_map_refresh == 0
+		|| observed.routing_generation == 0
+		|| (observed.dead_bitmap[origin_node / 8] & (1u << (origin_node % 8))) == 0
+		|| cluster_epoch_get_current() != observed.episode_epoch
+		|| pg_atomic_read_u32(&cluster_grd_state->recovery_state) != GRD_RECOVERY_WAIT_CLUSTER
+		|| pg_atomic_read_u32(&cluster_grd_state->recovery_direction) != GRD_REMASTER_DIR_FAIL
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id) != observed.event_id
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch) != observed.episode_epoch
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash)
+			   != observed.dead_bitmap_hash)
+		return false;
+	for (i = 0; i < lengthof(dead); i++)
+		dead[i] = pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[i]);
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		bool failed = (observed.dead_bitmap[i / 8] & (1u << (i % 8))) != 0;
+
+		if (((dead[i / 64] >> (i % 64)) & 1) != (uint64)failed)
+			return false;
+		if (cluster_conf_lookup_node(i) == NULL) {
+			if (failed)
+				return false;
+			continue;
+		}
+		if (failed)
+			continue;
+		if (!cluster_membership_is_member(i)
+			|| pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i])
+				   != observed.episode_epoch
+			|| pg_atomic_read_u64(&cluster_grd_state->recovery_done_bitmap_hash[i])
+				   != observed.dead_bitmap_hash)
+			return false;
+		observed.survivor_bitmap[i / 8] |= (uint8)(1u << (i % 8));
+	}
+	if ((observed.survivor_bitmap[cluster_node_id / 8] & (1u << (cluster_node_id % 8))) == 0)
+		return false;
+	for (shard = 0; shard < PGRAC_GRD_SHARD_COUNT; shard++) {
+		int32 master = (int32)pg_atomic_read_u32(&cluster_grd_state->master[shard]);
+		uint32 phase = pg_atomic_read_u32(&cluster_grd_state->shard_phase[shard]);
+
+		if (master < 0 || master >= CLUSTER_MAX_NODES
+			|| (observed.survivor_bitmap[master / 8] & (1u << (master % 8))) == 0
+			|| (phase != GRD_SHARD_NORMAL && phase != GRD_SHARD_REBUILDING))
+			return false;
+	}
+
+	/* No authority is minted by an observation assembled across a new cut. */
+	cluster_reconfig_get_last_event(&after);
+	if (after.event_id != observed.event_id || after.new_epoch != event.new_epoch
+		|| after.reconfig_kind != RECONFIG_KIND_FAIL_STOP
+		|| memcmp(after.dead_bitmap, observed.dead_bitmap, sizeof(observed.dead_bitmap)) != 0
+		|| cluster_epoch_get_current() != observed.episode_epoch || !cluster_qvotec_in_quorum()
+		|| cluster_reconfig_has_pending_prebump_stage()
+		|| pg_atomic_read_u32(&cluster_grd_state->recovery_state) != GRD_RECOVERY_WAIT_CLUSTER
+		|| pg_atomic_read_u32(&cluster_grd_state->recovery_direction) != GRD_REMASTER_DIR_FAIL
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id) != observed.event_id
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch) != observed.episode_epoch
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash)
+			   != observed.dead_bitmap_hash
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_redeclare_generation)
+			   != observed.redeclare_generation
+		|| pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count)
+			   != observed.master_map_refresh
+		|| cluster_lms_get_shard_master_generation() != observed.routing_generation)
+		return false;
+	*out = observed;
+	return true;
+}
+
 bool
 cluster_grd_recovery_in_progress(void)
 {
 	if (cluster_grd_state == NULL)
 		return false;
 	return pg_atomic_read_u32(&cluster_grd_state->recovery_state) != (uint32)GRD_RECOVERY_IDLE;
+}
+
+/* PGRAC: control requests must not race the census even on an unaffected
+ * NORMAL shard. The post-barrier exception admits only the frozen recovery
+ * control surface, not ordinary locks or DATA. Author: SqlRush <sqlrush@gmail.com> */
+static bool
+grd_control_namespace(const ClusterResId *resid)
+{
+	return resid != NULL
+		   && (resid->type == CLUSTER_CF_RESID_TYPE
+			   || resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE
+			   || resid->type == CLUSTER_IR_RESID_TYPE);
+}
+
+static bool
+grd_control_map_current(void)
+{
+	return cluster_enabled && cluster_grd_state != NULL && cluster_grd_entry_htab != NULL
+		   && pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) != 0
+		   && cluster_epoch_get_current() != 0 && cluster_qvotec_in_quorum()
+		   && !cluster_reconfig_has_pending_prebump_stage();
+}
+
+static bool
+grd_control_authority_pending(void)
+{
+	return pg_atomic_read_u64(&cluster_grd_state->recovery_authority_request_generation)
+		   > pg_atomic_read_u64(&cluster_grd_state->recovery_authority_terminal_generation);
+}
+
+/* Fixed-cost cache key. No membership scan or global lock on a hit.
+ * The generation brackets JOIN scope/complete publication, including a
+ * same-epoch scope union; membership has its own original owner sequence. */
+static bool
+grd_pi_ready_key_read(GrdPiReadyKey *key)
+{
+	memset(key, 0, sizeof(*key));
+	if (!cluster_shared_config || !grd_control_map_current() || cluster_node_id < 0
+		|| cluster_node_id >= 32)
+		return false;
+	key->publication = pg_atomic_read_u64(&cluster_grd_state->pi_rebuild_publication);
+	key->membership = cluster_membership_cut_generation();
+	if (key->publication == 0 || (key->publication & 1) || key->membership == 0)
+		return false;
+	pg_read_barrier();
+	if (pg_atomic_read_u32(&cluster_grd_state->recovery_state) != GRD_RECOVERY_IDLE)
+		return false;
+	key->epoch = cluster_epoch_get_current();
+	key->fence_epoch = pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch);
+	key->scope_epoch = pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_scope_epoch);
+	key->master_map_refresh = pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count);
+	key->redeclare_generation = cluster_grd_redeclare_generation();
+	key->routing_generation = cluster_lms_get_shard_master_generation();
+	key->self_boot = cluster_qvotec_get_self_incarnation();
+	key->event_id = pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id);
+	key->episode_epoch = pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch);
+	key->direction = pg_atomic_read_u32(&cluster_grd_state->recovery_direction);
+	key->node = cluster_node_id;
+	pg_read_barrier();
+	return key->fence_epoch == key->epoch && key->scope_epoch == key->epoch
+		   && key->master_map_refresh != 0 && key->routing_generation != 0 && key->self_boot != 0
+		   && (key->direction == GRD_REMASTER_DIR_JOIN || key->direction == GRD_REMASTER_DIR_NONE)
+		   && pg_atomic_read_u32(&cluster_grd_state->recovery_state) == GRD_RECOVERY_IDLE
+		   && key->epoch == cluster_epoch_get_current()
+		   && key->publication == pg_atomic_read_u64(&cluster_grd_state->pi_rebuild_publication)
+		   && cluster_membership_cut_generation_current(key->membership);
+}
+
+static bool
+grd_pi_ready_cached(void)
+{
+	GrdPiReadyKey now;
+	return grd_pi_ready_valid && grd_pi_ready_key_read(&now)
+		   && memcmp(&now, &grd_pi_ready_key, sizeof(now)) == 0;
+}
+
+/* Only a successful exact slow-path check may prime the memo. The member
+ * set/boots must also match a single locked Reconfig snapshot; two unlocked
+ * scans alone could observe a stable intermediate table between mutators. */
+static void
+grd_pi_ready_remember(const GrdPiReadyKey *before, const ClusterGrdPiRebuildCutV1 *cut)
+{
+	ClusterFormationSnapshotV1 formation;
+	GrdPiReadyKey after;
+	if (cut->direction != GRD_REMASTER_DIR_JOIN
+		|| !cluster_membership_cut_generation_current(before->membership)
+		|| !cluster_reconfig_capture_formation_snapshot_v1(cluster_node_id + 1, &formation)
+		|| formation.local_epoch != cut->epoch)
+		return;
+	for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
+		bool member = cluster_conf_lookup_node(node) != NULL
+					  && formation.membership.membership_state[node] == CLUSTER_MEMBER_MEMBER;
+		if (member != ((cut->members[node / 8] & (1u << (node % 8))) != 0)
+			|| (member
+				&& formation.membership.last_admitted_incarnation[node] != cut->member_boots[node]))
+			return;
+	}
+	if (!grd_pi_ready_key_read(&after) || memcmp(before, &after, sizeof(after)) != 0)
+		return;
+	grd_pi_ready_key = after;
+	grd_pi_ready_valid = true;
+}
+
+static int
+grd_pi_rebuild_cut(ClusterGrdPiRebuildCutV1 *out)
+{
+	ClusterGrdRecoveryControlSnapshotV1 failure;
+	uint32 state, direction;
+	int origin = -1;
+
+	memset(out, 0, sizeof(*out));
+	if (!cluster_enabled || !cluster_shared_config)
+		return 0;
+	if (!grd_control_map_current() || cluster_node_id < 0 || cluster_node_id >= 32)
+		return -1;
+	state = pg_atomic_read_u32(&cluster_grd_state->recovery_state);
+	direction = pg_atomic_read_u32(&cluster_grd_state->recovery_direction);
+	out->epoch = cluster_epoch_get_current();
+	if (state != GRD_RECOVERY_IDLE && direction == GRD_REMASTER_DIR_FAIL) {
+		if (state != GRD_RECOVERY_WAIT_CLUSTER)
+			return -1;
+		for (int i = 0; i < CLUSTER_MAX_NODES; i++)
+			if (pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[i / 64])
+				& (UINT64CONST(1) << (i % 64))) {
+				origin = i;
+				break;
+			}
+		if (origin < 0 || !cluster_grd_recovery_control_snapshot(origin + 1, &failure))
+			return -1;
+		out->direction = GRD_REMASTER_DIR_FAIL;
+		out->event_id = failure.event_id;
+		out->redeclare_generation = failure.redeclare_generation;
+		memcpy(out->affected, failure.dead_bitmap, sizeof(out->affected));
+		memcpy(out->members, failure.survivor_bitmap, sizeof(out->members));
+	} else if (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch) == out->epoch) {
+		bool needs_rebuild = join_fence_is_recipient_for(cluster_node_id, out->epoch);
+		if (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_scope_epoch) != out->epoch)
+			return -1;
+		for (int i = 0; i < CLUSTER_MAX_NODES; i++) {
+			if (join_fence_is_affected_for(i, out->epoch))
+				out->affected[i / 8] |= (uint8)(1u << (i % 8));
+			if (pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_excluded_epoch[i])
+				== out->epoch)
+				needs_rebuild = true; /* Rehash can choose any survivor. */
+			if (cluster_conf_lookup_node(i) != NULL && cluster_membership_is_member(i))
+				out->members[i / 8] |= (uint8)(1u << (i % 8));
+		}
+		if (!needs_rebuild)
+			return 0;
+		/* Finish the JOIN control protocol first: ROOT/native INSTALL may
+		 * need its normal CF owner before the retained WAL census can run. */
+		if (state != GRD_RECOVERY_IDLE || !cluster_grd_join_view_rebuilt())
+			return -1;
+		out->direction = GRD_REMASTER_DIR_JOIN;
+		out->redeclare_generation = cluster_grd_redeclare_generation();
+	} else
+		return 0;
+	out->master_map_refresh = pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count);
+	out->routing_generation = cluster_lms_get_shard_master_generation();
+	out->self_boot = cluster_qvotec_get_self_incarnation();
+	if (out->master_map_refresh == 0 || out->routing_generation == 0 || out->self_boot == 0
+		|| !(out->members[cluster_node_id / 8] & (1u << (cluster_node_id % 8))))
+		return -1;
+	for (int i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (!(out->members[i / 8] & (1u << (i % 8))))
+			continue;
+		if (i >= 32 || !cluster_membership_is_member(i)
+			|| (out->member_boots[i] = cluster_membership_get_last_admitted_incarnation(i)) == 0)
+			return -1;
+	}
+	return out->member_boots[cluster_node_id] == out->self_boot ? 1 : -1;
+}
+
+int
+cluster_grd_pi_rebuild_snapshot_v1(ClusterGrdPiRebuildCutV1 *out)
+{
+	ClusterGrdPiRebuildCutV1 before, after;
+	int state;
+	if (out == NULL)
+		return -1;
+	memset(out, 0, sizeof(*out));
+	state = grd_pi_rebuild_cut(&before);
+	pg_read_barrier();
+	if (state != grd_pi_rebuild_cut(&after)
+		|| (state == 1 && memcmp(&before, &after, sizeof(before)) != 0))
+		return -1;
+	if (state == 1)
+		*out = before;
+	return state;
+}
+
+bool
+cluster_grd_pi_rebuild_current_v1(const ClusterGrdPiRebuildCutV1 *cut)
+{
+	ClusterGrdPiRebuildCutV1 now;
+	return cut != NULL && cluster_grd_pi_rebuild_snapshot_v1(&now) == 1
+		   && memcmp(cut, &now, sizeof(now)) == 0;
+}
+
+bool
+cluster_grd_pi_rebuild_complete_v1(const ClusterGrdPiRebuildCutV1 *cut)
+{
+	uint64 publication;
+	if (MyBackendType != B_BG_WRITER || !cluster_grd_pi_rebuild_current_v1(cut))
+		return false;
+	SpinLockAcquire(&cluster_grd_state->pi_rebuild_lock);
+	publication = grd_pi_publish_begin();
+	cluster_grd_state->pi_rebuilt = *cut;
+	grd_pi_publish_end(publication);
+	SpinLockRelease(&cluster_grd_state->pi_rebuild_lock);
+	return cluster_grd_pi_rebuild_current_v1(cut);
+}
+
+bool
+cluster_grd_pi_rebuild_gate_v1(void)
+{
+	ClusterGrdPiRebuildCutV1 now, completed;
+	GrdPiReadyKey key;
+	bool cacheable;
+	int state;
+
+	if (grd_pi_ready_cached())
+		return false;
+	grd_pi_ready_valid = false;
+	cacheable = grd_pi_ready_key_read(&key);
+	state = cluster_grd_pi_rebuild_snapshot_v1(&now);
+	if (state != 1)
+		return state != 0;
+	SpinLockAcquire(&cluster_grd_state->pi_rebuild_lock);
+	completed = cluster_grd_state->pi_rebuilt;
+	SpinLockRelease(&cluster_grd_state->pi_rebuild_lock);
+	if (memcmp(&completed, &now, sizeof(now)) != 0 || !cluster_grd_pi_rebuild_current_v1(&now))
+		return true;
+	if (cacheable)
+		grd_pi_ready_remember(&key, &now);
+	return false;
+}
+
+void
+cluster_grd_inc_pi_rebuild_side_blocked(void)
+{
+	if (cluster_grd_state != NULL)
+		pg_atomic_fetch_add_u64(&cluster_grd_state->pi_rebuild_side_blocked_count, 1);
+}
+
+void
+cluster_grd_inc_pi_rebuild_apply_blocked(void)
+{
+	if (cluster_grd_state != NULL)
+		pg_atomic_fetch_add_u64(&cluster_grd_state->pi_rebuild_apply_blocked_count, 1);
+}
+
+void
+cluster_grd_inc_pi_rebuild_plan_blocked(void)
+{
+	if (cluster_grd_state != NULL)
+		pg_atomic_fetch_add_u64(&cluster_grd_state->pi_rebuild_plan_blocked_count, 1);
+}
+
+bool
+cluster_grd_pi_rebuild_blocked_v1(BufferTag tag)
+{
+	uint64 epoch;
+	uint32 state, direction;
+	int home, master;
+
+	if (grd_pi_ready_cached())
+		return false;
+	if (!cluster_enabled || !cluster_shared_config)
+		return false;
+	if (!grd_control_map_current())
+		return true;
+	master = cluster_gcs_lookup_master(tag);
+	if (master < 0 || master >= 32)
+		return true;
+	if (master != cluster_node_id)
+		return false;
+	home = cluster_gcs_lookup_master_static(tag);
+	if (home < 0 || home >= 32)
+		return true;
+	state = pg_atomic_read_u32(&cluster_grd_state->recovery_state);
+	direction = pg_atomic_read_u32(&cluster_grd_state->recovery_direction);
+	if (state != GRD_RECOVERY_IDLE && direction == GRD_REMASTER_DIR_FAIL
+		&& (pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[home / 64])
+			& (UINT64CONST(1) << (home % 64))))
+		return cluster_grd_pi_rebuild_gate_v1();
+	epoch = cluster_epoch_get_current();
+	return pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch) == epoch
+		   && join_fence_is_affected_for(home, epoch)
+		   && (!cluster_grd_join_view_rebuilt() || cluster_grd_pi_rebuild_gate_v1());
+}
+
+bool
+cluster_grd_control_recovery_ready(const ClusterResId *resid, LOCKMODE mode)
+{
+	ClusterGrdRecoveryControlSnapshotV1 snapshot;
+	ReconfigEvent event = { 0 };
+	bool allowed;
+	int node;
+
+	if (!cluster_shared_config || !grd_control_map_current() || resid == NULL
+		|| resid->lockmethodid != DEFAULT_LOCKMETHOD || resid->field4 != 0
+		|| grd_control_authority_pending())
+		return false;
+	allowed = (resid->type == CLUSTER_CF_RESID_TYPE && mode == ShareLock && resid->field1 == 0
+			   && resid->field2 == 0 && resid->field3 == 0)
+			  || (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE
+				  && (mode == ExclusiveLock || mode == ShareLock) && resid->field1 > 0
+				  && resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS && resid->field2 == 0
+				  && resid->field3 == 0)
+			  || (resid->type == CLUSTER_IR_RESID_TYPE && mode == ExclusiveLock && resid->field1 > 0
+				  && resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS
+				  && (resid->field2 != 0 || resid->field3 != 0));
+	if (!allowed)
+		return false;
+	cluster_reconfig_get_last_event(&event);
+	for (node = 0; node < CLUSTER_MAX_NODES; node++)
+		if ((event.dead_bitmap[node / 8] & (1u << (node % 8))) != 0)
+			return cluster_grd_recovery_control_snapshot((uint16)(node + 1), &snapshot);
+	return false;
+}
+
+bool
+cluster_grd_control_acquire_allowed(const ClusterResId *resid, LOCKMODE mode)
+{
+	uint64 epoch;
+	uint32 state;
+
+	if (!cluster_shared_config || !grd_control_namespace(resid))
+		return true; /* Other namespaces retain their existing admission. */
+	if (!grd_control_map_current() || grd_control_authority_pending())
+		return false;
+	epoch = cluster_epoch_get_current();
+	state = pg_atomic_read_u32(&cluster_grd_state->recovery_state);
+	if (state == GRD_RECOVERY_WAIT_CLUSTER)
+		return cluster_grd_control_recovery_ready(resid, mode);
+	return state == GRD_RECOVERY_IDLE
+		   && cluster_grd_shard_phase(cluster_grd_shard_for_resource(resid)) == GRD_SHARD_NORMAL
+		   && epoch == cluster_epoch_get_current()
+		   && pg_atomic_read_u32(&cluster_grd_state->recovery_state) == GRD_RECOVERY_IDLE
+		   && !grd_control_authority_pending();
+}
+
+bool
+cluster_grd_control_rebuild_frozen(uint64 epoch, uint64 generation)
+{
+	uint64 request;
+	uint32 state;
+	bool frozen;
+
+	if (!cluster_shared_config || !grd_control_map_current() || epoch == 0 || generation == 0
+		|| epoch != cluster_epoch_get_current() || generation != cluster_grd_redeclare_generation())
+		return false;
+	state = pg_atomic_read_u32(&cluster_grd_state->recovery_state);
+	request = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_request_generation);
+	/* A QUIESCED conversion owner prevents its local complete census, so
+	 * restoration belongs before local DONE, never after the common barrier. */
+	frozen = state == GRD_RECOVERY_WAIT_BARRIER
+			 && pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch) == epoch;
+	if (!frozen && state == GRD_RECOVERY_IDLE && grd_control_authority_pending())
+		frozen = grd_recovery_authority_request_current(request);
+	return frozen && epoch == cluster_epoch_get_current()
+		   && generation == cluster_grd_redeclare_generation()
+		   && pg_atomic_read_u32(&cluster_grd_state->recovery_state) == state;
 }
 
 /*
@@ -2384,6 +3117,11 @@ cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out)
 	memset(out, 0, sizeof(*out));
 	if (cluster_grd_state == NULL)
 		return;
+	out->local_pi_redeclare_cursor
+		= pg_atomic_read_u32(&cluster_grd_state->local_pi_redeclare_cursor);
+	out->block_redeclare_retries = pg_atomic_read_u64(&cluster_grd_state->block_redeclare_retries);
+	out->local_pi_redeclare_retries
+		= pg_atomic_read_u64(&cluster_grd_state->local_pi_redeclare_retries);
 	out->remaster_started = pg_atomic_read_u64(&cluster_grd_state->remaster_started_count);
 	out->remaster_done = pg_atomic_read_u64(&cluster_grd_state->remaster_done_count);
 	out->remaster_failed = pg_atomic_read_u64(&cluster_grd_state->remaster_failed_count);
@@ -2413,6 +3151,12 @@ cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out)
 		= pg_atomic_read_u64(&cluster_grd_state->join_block_views_rebuilt_count);
 	out->join_block_recovering_failclosed
 		= pg_atomic_read_u64(&cluster_grd_state->join_block_recovering_failclosed_count);
+	out->pi_rebuild_side_blocked
+		= pg_atomic_read_u64(&cluster_grd_state->pi_rebuild_side_blocked_count);
+	out->pi_rebuild_apply_blocked
+		= pg_atomic_read_u64(&cluster_grd_state->pi_rebuild_apply_blocked_count);
+	out->pi_rebuild_plan_blocked
+		= pg_atomic_read_u64(&cluster_grd_state->pi_rebuild_plan_blocked_count);
 }
 
 /*
@@ -2573,50 +3317,55 @@ cluster_grd_cleanup_stale_epoch_postbarrier(uint64 current_epoch)
 }
 
 /*
- * Broadcast PROCSIG_CLUSTER_GRD_REDECLARE to every live backend.
- * Pattern mirrors cluster_reconfig_broadcast_local_procsig.
+ * Wake every registered owner, including auxiliary processes and LMON.
+ * Auxiliary processes do not necessarily consume ProcSignal, so wake their
+ * service loop without sending a signal to an unregistered/custom handler.
+ * Their owner-side poll must reconstruct or release private control grants.
  */
 static int
 grd_recovery_broadcast_redeclare(void)
 {
-	int beid;
+	uint32 procno;
 	int signaled = 0;
-	pid_t self_pid = MyProcPid;
 
-	for (beid = 1; beid <= MaxBackends; beid++) {
-		PGPROC *proc = BackendIdGetProc((BackendId)beid);
+	if (ProcGlobal == NULL || ProcGlobal->allProcs == NULL)
+		return 0;
+	for (procno = 0; procno < ProcGlobal->allProcCount; procno++) {
+		PGPROC *proc = &ProcGlobal->allProcs[procno];
 		pid_t pid;
 
-		if (proc == NULL)
-			continue;
 		pid = proc->pid;
-		if (pid == 0 || pid == self_pid)
+		if (pid == 0 || pg_atomic_read_u32(&proc->cluster_grd_registered_count) == 0)
 			continue;
-		(void)SendProcSignal(pid, PROCSIG_CLUSTER_GRD_REDECLARE, (BackendId)beid);
+		SetLatch(&proc->procLatch);
+		if (pid != MyProcPid && proc->backendId != InvalidBackendId)
+			(void)SendProcSignal(pid, PROCSIG_CLUSTER_GRD_REDECLARE, proc->backendId);
 		signaled++;
 	}
 	return signaled;
 }
 
 /*
- * Barrier check:  every live backend has acked the redeclare
+ * Barrier check: every live registered owner has acked the redeclare
  * generation.  Backends born after the broadcast were seeded with the
  * current generation at InitProcess (they hold no stale-epoch grants);
- * backends that exited simply drop out of the scan (their leaked
- * master-side state is exactly what P6 sweeps).
+ * Legacy exited owners drop out for P6. PRE2 control requests instead retain
+ * explicit shared retirement ownership and must close BEFORE local DONE.
  */
 static bool
 grd_recovery_barrier_complete(uint64 gen, uint64 episode_epoch)
 {
-	int beid;
-	pid_t self_pid = MyProcPid;
+	uint32 procno;
+	uint64 control_version = 0;
 
-	for (beid = 1; beid <= MaxBackends; beid++) {
-		PGPROC *proc = BackendIdGetProc((BackendId)beid);
+	if (ProcGlobal == NULL || ProcGlobal->allProcs == NULL || ProcGlobal->allProcCount == 0)
+		return false;
+	if (cluster_shared_config && !cluster_control_request_census(episode_epoch, &control_version))
+		return false;
+	for (procno = 0; procno < ProcGlobal->allProcCount; procno++) {
+		PGPROC *proc = &ProcGlobal->allProcs[procno];
 
-		if (proc == NULL)
-			continue;
-		if (proc->pid == 0 || proc->pid == self_pid)
+		if (proc->pid == 0)
 			continue;
 
 		/*
@@ -2638,25 +3387,36 @@ grd_recovery_barrier_complete(uint64 gen, uint64 episode_epoch)
 		if (pg_atomic_read_u64(&proc->cluster_grd_redeclare_acked_epoch) != episode_epoch)
 			return false;
 	}
-	return true;
+	/* No registry lock crosses the PGPROC scan. An exit/ABA during it must
+	 * invalidate this observation, even when that PGPROC is now empty. */
+	return !cluster_shared_config
+		   || cluster_control_request_census_unchanged(episode_epoch, control_version);
 }
 
 static void
 grd_recovery_format_waiting_backend(uint64 gen, uint64 episode_epoch, char *buf, Size buflen)
 {
-	int beid;
-	pid_t self_pid = MyProcPid;
+	uint32 procno;
+	uint64 control_version;
 
 	if (buflen == 0)
 		return;
 	buf[0] = '\0';
-	for (beid = 1; beid <= MaxBackends; beid++) {
-		PGPROC *proc = BackendIdGetProc((BackendId)beid);
+	if (ProcGlobal == NULL || ProcGlobal->allProcs == NULL || ProcGlobal->allProcCount == 0) {
+		snprintf(buf, buflen, "proc_census_unavailable");
+		return;
+	}
+	if (cluster_shared_config && !cluster_control_request_census(episode_epoch, &control_version)) {
+		snprintf(buf, buflen, "control_request_census epoch=" UINT64_FORMAT, episode_epoch);
+		return;
+	}
+	for (procno = 0; procno < ProcGlobal->allProcCount; procno++) {
+		PGPROC *proc = &ProcGlobal->allProcs[procno];
 		uint32 registered;
 		uint64 acked;
 		uint64 acked_epoch;
 
-		if (proc == NULL || proc->pid == 0 || proc->pid == self_pid)
+		if (proc->pid == 0)
 			continue;
 		registered = pg_atomic_read_u32(&proc->cluster_grd_registered_count);
 		if (registered == 0)
@@ -2665,9 +3425,10 @@ grd_recovery_format_waiting_backend(uint64 gen, uint64 episode_epoch, char *buf,
 		acked_epoch = pg_atomic_read_u64(&proc->cluster_grd_redeclare_acked_epoch);
 		if (acked < gen || acked_epoch != episode_epoch) {
 			snprintf(buf, buflen,
-					 "beid=%d pid=%d registered=%u acked=" UINT64_FORMAT "/" UINT64_FORMAT
+					 "procno=%u beid=%d pid=%d registered=%u acked=" UINT64_FORMAT "/" UINT64_FORMAT
 					 " target=" UINT64_FORMAT "/" UINT64_FORMAT,
-					 beid, (int)proc->pid, registered, acked, acked_epoch, gen, episode_epoch);
+					 procno, (int)proc->backendId, (int)proc->pid, registered, acked, acked_epoch,
+					 gen, episode_epoch);
 			return;
 		}
 	}
@@ -2986,6 +3747,8 @@ grd_recovery_authority_publish_terminal(uint64 request_generation,
 void
 cluster_grd_recovery_authority_lmon_tick(void)
 {
+	static uint64 last_reported_request;
+	static TimestampTz last_reported_at;
 	uint64 request_generation;
 	uint64 epoch;
 	uint64 bitmap_hash;
@@ -3068,8 +3831,29 @@ cluster_grd_recovery_authority_lmon_tick(void)
 			break;
 		}
 	}
-	if (!all_done)
+	if (!all_done) {
+		TimestampTz now = GetCurrentTimestamp();
+
+		if (last_reported_request != request_generation || last_reported_at == 0
+			|| now - last_reported_at >= INT64CONST(5000000)) {
+			char waiting[160];
+
+			grd_recovery_format_waiting_backend(grd_recovery_authority_lmon_redeclare_generation,
+												epoch, waiting, sizeof(waiting));
+			ereport(
+				LOG,
+				(errmsg("cluster: recovery-authority barrier pending"),
+				 errdetail("formation_epoch=" UINT64_FORMAT " request_generation=" UINT64_FORMAT
+						   " redeclare_generation=" UINT64_FORMAT " lms_generation=" UINT64_FORMAT
+						   " local_wait=%s missing_done_node=%d bitmap_hash=" UINT64_FORMAT,
+						   epoch, request_generation,
+						   grd_recovery_authority_lmon_redeclare_generation, lms_generation,
+						   waiting, i, bitmap_hash)));
+			last_reported_request = request_generation;
+			last_reported_at = now;
+		}
 		return;
+	}
 
 	(void)cluster_grd_cleanup_stale_epoch_postbarrier(epoch);
 	if (!grd_recovery_authority_request_current(request_generation)) {
@@ -3132,7 +3916,8 @@ cluster_grd_recovery_authority_barrier_wait(const ClusterFormationSnapshotV1 *fo
 	 * until some UNRELATED reconfig lands.
 	 */
 	if ((epoch != formation->applied.new_epoch
-		 && !(formation->self_join_admitted && epoch > formation->applied.new_epoch))
+		 && !((formation->self_join_admitted || formation->startup_formation_generation != 0)
+			  && epoch > formation->applied.new_epoch))
 		|| epoch != cluster_epoch_get_current())
 		return false;
 
@@ -3484,16 +4269,20 @@ grd_recovery_wait_cluster_watchdog(const uint64 *dead, uint64 episode_epoch)
  */
 #define GRD_BLOCK_REDECLARE_CHUNK 256
 static int grd_block_redeclare_cursor = 0;
+static int grd_local_pi_redeclare_cursor = 0;
 static uint64 grd_block_redeclare_epoch = 0;
+static uint64 grd_block_redeclare_generation = 0;
+static bool grd_block_redeclare_buffers_done = false;
 static bool grd_block_redeclare_done = false;
 
-static void
+static bool
 grd_block_redeclare_cb(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn, SCN page_scn, void *arg)
 {
 	uint64 episode_epoch = *(const uint64 *)arg;
 	int master = cluster_gcs_lookup_master(tag);
 
-	cluster_gcs_block_send_redeclare(tag, held_mode, page_lsn, page_scn, episode_epoch, master);
+	return cluster_gcs_block_send_redeclare(tag, held_mode, page_lsn, page_scn, episode_epoch,
+											master);
 }
 
 /* Non-static (exposed via cluster_grd.h) so the unit test can drive the scan
@@ -3503,27 +4292,71 @@ void
 grd_block_redeclare_step(uint64 episode_epoch)
 {
 	int next;
+	uint64 generation = cluster_grd_redeclare_generation();
 
 	/* Re-arm to the start of the pool whenever a fresh episode locks a new
 	 * epoch (the previous episode's partial scan is abandoned — the new epoch
 	 * re-stamps every re-declare). */
-	if (grd_block_redeclare_epoch != episode_epoch) {
+	if (grd_block_redeclare_epoch != episode_epoch
+		|| grd_block_redeclare_generation != generation) {
 		grd_block_redeclare_epoch = episode_epoch;
+		grd_block_redeclare_generation = generation;
 		grd_block_redeclare_cursor = 0;
+		grd_local_pi_redeclare_cursor = 0;
+		grd_block_redeclare_buffers_done = false;
 		grd_block_redeclare_done = false;
 	}
 
 	if (grd_block_redeclare_done)
-		return;
+		goto publish_progress;
 
-	/* Bounded chunk;  scan_chunk caps the cursor at NBuffers and returns the
-	 * cursor unchanged once the whole pool has been scanned this episode. */
-	next
-		= cluster_bufmgr_redeclare_scan_chunk(grd_block_redeclare_cursor, GRD_BLOCK_REDECLARE_CHUNK,
-											  grd_block_redeclare_cb, &episode_epoch);
-	if (next == grd_block_redeclare_cursor)
-		grd_block_redeclare_done = true; /* reached NBuffers — whole pool scanned */
-	grd_block_redeclare_cursor = next;
+	if (!grd_block_redeclare_buffers_done) {
+		/* A busy buffer or unacknowledged declaration retains its position. */
+		next = cluster_bufmgr_redeclare_scan_chunk(grd_block_redeclare_cursor,
+												   GRD_BLOCK_REDECLARE_CHUNK,
+												   grd_block_redeclare_cb, &episode_epoch);
+		if (next < 0) {
+			grd_block_redeclare_cursor = -1 - next;
+			if (cluster_grd_state != NULL)
+				pg_atomic_fetch_add_u64(&cluster_grd_state->block_redeclare_retries, 1);
+			goto publish_progress;
+		}
+		if (next != grd_block_redeclare_cursor) {
+			grd_block_redeclare_cursor = next;
+			goto publish_progress;
+		}
+		grd_block_redeclare_buffers_done = true;
+	}
+	/* The last resident buffer may have disappeared while the source still
+	 * owes a PI. REDECLARE_DONE must include that detached responsibility. */
+	if (cluster_shared_config) {
+		next = cluster_pcm_local_pi_redeclare_scan_chunk(grd_local_pi_redeclare_cursor,
+														 GRD_BLOCK_REDECLARE_CHUNK, episode_epoch,
+														 grd_block_redeclare_cb, &episode_epoch);
+		if (next < 0) {
+			grd_local_pi_redeclare_cursor = -1 - next;
+			if (cluster_grd_state != NULL)
+				pg_atomic_fetch_add_u64(&cluster_grd_state->local_pi_redeclare_retries, 1);
+			goto publish_progress;
+		}
+		if (next != grd_local_pi_redeclare_cursor) {
+			grd_local_pi_redeclare_cursor = next;
+			goto publish_progress;
+		}
+	}
+	grd_block_redeclare_done = true;
+
+publish_progress:
+	/* LMON owns the scan, but dump runs in another backend. These independent
+	 * observations are diagnostic only; the service gate above still uses
+	 * the exact private episode/generation and completion state. */
+	if (cluster_grd_state != NULL) {
+		pg_atomic_write_u32(&cluster_grd_state->block_redeclare_cursor, grd_block_redeclare_cursor);
+		pg_atomic_write_u32(&cluster_grd_state->local_pi_redeclare_cursor,
+							grd_local_pi_redeclare_cursor);
+		pg_atomic_write_u64(&cluster_grd_state->block_redeclare_epoch, grd_block_redeclare_epoch);
+		pg_atomic_write_u32(&cluster_grd_state->block_redeclare_done, grd_block_redeclare_done);
+	}
 }
 
 /*
@@ -3540,25 +4373,31 @@ grd_block_redeclare_step(uint64 episode_epoch)
 bool
 grd_block_redeclare_scan_complete(uint64 episode_epoch)
 {
-	return grd_block_redeclare_epoch == episode_epoch && grd_block_redeclare_done;
+	return grd_block_redeclare_epoch == episode_epoch && grd_block_redeclare_done
+		   && grd_block_redeclare_generation == cluster_grd_redeclare_generation();
 }
 
 int
 cluster_grd_recovery_block_redeclare_cursor(void)
 {
-	return grd_block_redeclare_cursor;
+	return cluster_grd_state != NULL
+			   ? (int)pg_atomic_read_u32(&cluster_grd_state->block_redeclare_cursor)
+			   : 0;
 }
 
 uint64
 cluster_grd_recovery_block_redeclare_epoch(void)
 {
-	return grd_block_redeclare_epoch;
+	return cluster_grd_state != NULL ? pg_atomic_read_u64(&cluster_grd_state->block_redeclare_epoch)
+									 : 0;
 }
 
 bool
 cluster_grd_recovery_block_redeclare_done(void)
 {
-	return grd_block_redeclare_done;
+	return cluster_grd_state != NULL
+			   ? pg_atomic_read_u32(&cluster_grd_state->block_redeclare_done) != 0
+			   : 0;
 }
 
 void
@@ -3676,15 +4515,20 @@ cluster_grd_recovery_lmon_tick(void)
 		 * joiner-home PCM block fence on THIS node.  The joiner already armed it
 		 * synchronously before opening its write gate (note_self_admitted,
 		 * INV-R13);  this covers survivors and is an idempotent monotonic-max
-		 * re-arm on the joiner.  JOIN events carry the rejoiner set in
-		 * join_bitmap (dead_bitmap is empty), so the failure-path freeze/remaster
-		 * below is a structural no-op — only the block re-declare barrier runs,
-		 * which rebuilds the joiner's PCM block view.
+		 * re-arm on the joiner. JOIN events carry recipients in join_bitmap;
+		 * remaining dead and removed homes also participate because live-set
+		 * rehash can move their blocks between two survivors. These homes do
+		 * not exempt any survivor from the original re-declare barrier.
 		 */
 		if (evt.reconfig_kind == (uint8)RECONFIG_KIND_JOIN_COMMITTED) {
+			uint8 excluded[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+
 			pg_atomic_write_u32(&cluster_grd_state->recovery_direction,
 								(uint32)GRD_REMASTER_DIR_JOIN);
-			cluster_grd_arm_join_pcm_fence(evt.join_bitmap);
+			cluster_reconfig_snapshot_removed_bitmap(excluded);
+			for (int b = 0; b < sizeof(excluded); b++)
+				excluded[b] |= evt.dead_bitmap[b];
+			cluster_grd_arm_join_pcm_fence_scope_v1(evt.join_bitmap, excluded);
 			pg_atomic_fetch_add_u64(&cluster_grd_state->join_remaster_started_count, 1);
 		} else {
 			pg_atomic_write_u32(&cluster_grd_state->recovery_direction,
@@ -3965,7 +4809,12 @@ cluster_grd_recovery_lmon_tick(void)
 		 * just defers the announce until the whole pool is swept.
 		 */
 		if (grd_recovery_barrier_complete(gen, episode_epoch)
-			&& grd_block_redeclare_scan_complete(episode_epoch)) {
+			&& grd_block_redeclare_scan_complete(episode_epoch)
+			&& cluster_sinval_reconfig_reset_ready(episode_epoch)) {
+			/* Full SI RESET must be installed before this survivor's DONE
+			 * allows any master to discard failed holders and grant again.
+			 * Data-recovery completion has a separate final reset ticket.
+			 * Author: SqlRush <sqlrush@gmail.com> */
 			/*
 			 * Local rebind barrier complete:  announce to every survivor
 			 * (REDECLARE_DONE) and record self for the LOCKED episode
@@ -4164,7 +5013,9 @@ cluster_grd_recovery_lmon_tick(void)
 			 * master_generation).  Otherwise P7 would set the shard NORMAL while its
 			 * HWM is unknown, and a first HW_ALLOC could auto-create at block 0 over
 			 * an already-allocated range (R9, 8.A).  A NO-OP when the HW authority is
-			 * inactive, so the spec-4.6/4.7 unfreeze path is unchanged.
+			 * inactive, including canonical SPACE mode. That mode keeps the
+			 * preceding thread DATA barrier and per-resource GCS isolation;
+			 * it cannot be discharged by a legacy rebuilt-generation counter.
 			 */
 			if (cluster_hw_remaster_gate_unfreeze()) {
 				ereport(
@@ -4175,6 +5026,11 @@ cluster_grd_recovery_lmon_tick(void)
 						episode_epoch)));
 				return;
 			}
+			if (cluster_shared_config
+				&& pg_atomic_read_u32(&cluster_grd_state->recovery_direction)
+					   != GRD_REMASTER_DIR_JOIN
+				&& cluster_grd_pi_rebuild_gate_v1())
+				return;
 
 			/* P6 post-barrier global sweep (P0#3 + P0-1:  legal HERE and
 			 * coherent against the LOCKED episode epoch — holders rebound
@@ -4234,6 +5090,15 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 										  const ClusterGrdHolderId *new_holder,
 										  int32 source_node_id, int lockmode)
 {
+	return cluster_grd_entry_rebind_or_insert_holder_group(resid, new_holder, source_node_id,
+														   lockmode, 0);
+}
+
+ClusterGrdEntryResult
+cluster_grd_entry_rebind_or_insert_holder_group(const ClusterResId *resid,
+												const ClusterGrdHolderId *new_holder,
+												int32 source_node_id, int lockmode, uint32 group)
+{
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult er;
 	int i;
@@ -4255,6 +5120,7 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 
 			entry->holders[i].cluster_epoch = new_holder->cluster_epoch;
 			entry->holders[i].request_id = new_holder->request_id;
+			entry->holders[i].lock_group_procno_plus_one = group;
 			entry->generation++;
 			SpinLockRelease(&entry->lock);
 			pg_atomic_fetch_add_u64(&cluster_grd_state->holders_rebound_count, 1);
@@ -4270,8 +5136,9 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 
 	/* Defensive double-grant refusal (see header comment). */
 	for (i = 0; i < entry->ngranted; i++) {
-		if (((uint32)entry->holders[i].node_id != new_holder->node_id
-			 || entry->holders[i].procno != new_holder->procno)
+		if (!grd_same_lock_group(entry->holders[i].node_id, entry->holders[i].procno,
+								 entry->holders[i].lock_group_procno_plus_one, new_holder->node_id,
+								 new_holder->procno, group)
 			&& !ges_modes_compatible(entry->holders[i].mode,
 									 (LOCKMODE)lockmode)) { /* spec-5.1b D1: frozen matrix */
 			SpinLockRelease(&entry->lock);
@@ -4289,6 +5156,7 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 
 	entry->holders[entry->ngranted].node_id = (int32)new_holder->node_id;
 	entry->holders[entry->ngranted].procno = new_holder->procno;
+	entry->holders[entry->ngranted].lock_group_procno_plus_one = group;
 	entry->holders[entry->ngranted].cluster_epoch = new_holder->cluster_epoch;
 	entry->holders[entry->ngranted].request_id = new_holder->request_id;
 	entry->holders[entry->ngranted].mode = (LOCKMODE)lockmode;
@@ -4908,6 +5776,7 @@ cluster_grd_entry_grant_holder(ClusterGrdEntry *entry, const ClusterGrdHolderId 
 	slot = entry->ngranted++;
 	entry->holders[slot].node_id = (int32)holder->node_id;
 	entry->holders[slot].procno = holder->procno;
+	entry->holders[slot].lock_group_procno_plus_one = 0;
 	entry->holders[slot].cluster_epoch = holder->cluster_epoch;
 	entry->holders[slot].request_id = holder->request_id;
 	entry->holders[slot].mode = (LOCKMODE)mode;
@@ -4962,6 +5831,7 @@ cluster_grd_entry_add_waiter(ClusterGrdEntry *entry, const ClusterGrdHolderId *h
 	 */
 	entry->waiters[slot].source_node_id = (int32)holder->node_id;
 	entry->waiters[slot].procno = holder->procno;
+	entry->waiters[slot].lock_group_procno_plus_one = 0;
 	entry->waiters[slot].cluster_epoch = holder->cluster_epoch;
 	entry->waiters[slot].request_id = holder->request_id;
 	entry->waiters[slot].request_opcode = 1; /* GES_REQ_OPCODE_REQUEST default */
@@ -5315,14 +6185,17 @@ grd_starvation_account_skip_on_grant(ClusterGrdEntry *entry, LOCKMODE granted_mo
  * conflicts with a holder — Rule 8.A).  Caller holds entry->lock.
  */
 static bool
-grd_scan_holder_conflict(const ClusterGrdEntry *entry, uint32 node_id, uint32 procno, LOCKMODE mode)
+grd_scan_holder_conflict(const ClusterGrdEntry *entry, uint32 node_id, uint32 procno, uint32 group,
+						 LOCKMODE mode)
 {
 	int i;
 
 	for (i = 0; i < entry->ngranted; i++) {
 		if (ges_modes_compatible(entry->holders[i].mode, mode))
 			continue;
-		if ((uint32)entry->holders[i].node_id == node_id && entry->holders[i].procno == procno)
+		if (grd_same_lock_group(entry->holders[i].node_id, entry->holders[i].procno,
+								entry->holders[i].lock_group_procno_plus_one, node_id, procno,
+								group))
 			continue; /* spec-5.1c self-exclusion */
 		return true;
 	}
@@ -5341,11 +6214,16 @@ grd_scan_holder_conflict(const ClusterGrdEntry *entry, uint32 node_id, uint32 pr
  */
 static int
 grd_find_earliest_boosted_conflicting_waiter(const ClusterGrdEntry *entry, LOCKMODE mode,
-											 uint64 exclude_seq)
+											 uint64 exclude_seq, int32 node, uint32 proc,
+											 uint32 group)
 {
 	int i, best = -1;
 
 	for (i = 0; i < entry->nwaiters; i++) {
+		if (grd_same_lock_group(entry->waiters[i].node_id, entry->waiters[i].procno,
+								entry->waiters[i].lock_group_procno_plus_one, node, proc, group)
+			|| grd_group_blocks_mode(entry, node, proc, group, entry->waiters[i].mode))
+			continue;
 		if (!entry->waiters[i].boosted)
 			continue;
 		if (ges_modes_compatible(entry->waiters[i].mode, mode))
@@ -5373,7 +6251,8 @@ grd_capture_waiter_vertex(const ClusterGrdEntry *entry, int idx, ClusterLmdVerte
 {
 	grd_wfg_make_vertex(entry->waiters[idx].node_id, entry->waiters[idx].procno,
 						entry->waiters[idx].cluster_epoch, entry->waiters[idx].request_id,
-						entry->waiters[idx].waiter_xid, entry->waiters[idx].wait_seq, out);
+						entry->waiters[idx].waiter_xid, entry->waiters[idx].wait_seq,
+						entry->waiters[idx].lock_group_procno_plus_one, out);
 }
 
 /*
@@ -5387,8 +6266,10 @@ grd_waiter_is_barriered(const ClusterGrdEntry *entry, int widx)
 {
 	if (!cluster_grd_starvation_protection_enabled())
 		return false;
-	return grd_find_earliest_boosted_conflicting_waiter(entry, entry->waiters[widx].mode,
-														entry->waiters[widx].fair_queue_seq)
+	return grd_find_earliest_boosted_conflicting_waiter(
+			   entry, entry->waiters[widx].mode, entry->waiters[widx].fair_queue_seq,
+			   entry->waiters[widx].node_id, entry->waiters[widx].procno,
+			   entry->waiters[widx].lock_group_procno_plus_one)
 		   >= 0;
 }
 
@@ -5413,6 +6294,7 @@ grd_enqueue_waiter_locked(ClusterGrdEntry *entry, const ClusterGrdHolderId *hold
 	entry->waiters[slot].node_id = (int32)holder->node_id;
 	entry->waiters[slot].source_node_id = source_node_id;
 	entry->waiters[slot].procno = holder->procno;
+	entry->waiters[slot].lock_group_procno_plus_one = meta.lock_group_procno_plus_one;
 	entry->waiters[slot].cluster_epoch = holder->cluster_epoch;
 	entry->waiters[slot].request_id = request_id;
 	entry->waiters[slot].waiter_xid = meta.xid;	   /* spec-5.8 D1c */
@@ -5532,8 +6414,9 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 		 * change of the SAME hold -- is the spec-5.2 path and self-excludes
 		 * in cluster_grd_entry_request_convert.)
 		 */
-		if ((uint32)entry->holders[i].node_id == holder->node_id
-			&& entry->holders[i].procno == holder->procno)
+		if (grd_same_lock_group(entry->holders[i].node_id, entry->holders[i].procno,
+								entry->holders[i].lock_group_procno_plus_one, holder->node_id,
+								holder->procno, meta.lock_group_procno_plus_one))
 			continue;
 		if (conflict_holders_out != NULL && n_conflict < PGRAC_GRD_MAX_HOLDERS) {
 			conflict_holders_out[n_conflict].holder.node_id = entry->holders[i].node_id;
@@ -5578,7 +6461,9 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 			 * request that conflicts with a HOLDER never reaches here, so the
 			 * conflict matrix is never bypassed (Rule 8.A — no false grant).
 			 */
-			wi = grd_find_earliest_boosted_conflicting_waiter(entry, (LOCKMODE)lockmode, 0);
+			wi = grd_find_earliest_boosted_conflicting_waiter(entry, (LOCKMODE)lockmode, 0,
+															  holder->node_id, holder->procno,
+															  meta.lock_group_procno_plus_one);
 			if (wi >= 0) {
 				ClusterLmdVertex w_vertex, r_vertex;
 				bool published;
@@ -5603,7 +6488,8 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 				 */
 				grd_capture_waiter_vertex(entry, wi, &w_vertex);
 				grd_wfg_make_vertex((int32)holder->node_id, holder->procno, holder->cluster_epoch,
-									request_id, meta.xid, meta.wait_seq, &r_vertex);
+									request_id, meta.xid, meta.wait_seq,
+									meta.lock_group_procno_plus_one, &r_vertex);
 				SpinLockRelease(&entry->lock);
 
 				published
@@ -5619,8 +6505,11 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 				 */
 				if (published
 					&& !grd_scan_holder_conflict(entry, holder->node_id, holder->procno,
+												 meta.lock_group_procno_plus_one,
 												 (LOCKMODE)lockmode)
-					&& grd_find_earliest_boosted_conflicting_waiter(entry, (LOCKMODE)lockmode, 0)
+					&& grd_find_earliest_boosted_conflicting_waiter(entry, (LOCKMODE)lockmode, 0,
+																	holder->node_id, holder->procno,
+																	meta.lock_group_procno_plus_one)
 						   >= 0) {
 					if (grd_enqueue_waiter_locked(entry, holder, source_node_id, request_id,
 												  shard_master_generation, request_opcode,
@@ -5650,7 +6539,7 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 						&cluster_grd_state->starvation_barrier_publish_fail_count, 1);
 				SpinLockAcquire(&entry->lock);
 				if (grd_scan_holder_conflict(entry, holder->node_id, holder->procno,
-											 (LOCKMODE)lockmode)) {
+											 meta.lock_group_procno_plus_one, (LOCKMODE)lockmode)) {
 					if (conditional) {
 						SpinLockRelease(&entry->lock);
 						cluster_grd_entry_release(entry);
@@ -5683,6 +6572,7 @@ cluster_grd_entry_enqueue_or_grant_impl(const ClusterResId *resid, const Cluster
 		slot = entry->ngranted++;
 		entry->holders[slot].node_id = (int32)holder->node_id;
 		entry->holders[slot].procno = holder->procno;
+		entry->holders[slot].lock_group_procno_plus_one = meta.lock_group_procno_plus_one;
 		entry->holders[slot].cluster_epoch = holder->cluster_epoch;
 		entry->holders[slot].request_id = holder->request_id;
 		entry->holders[slot].mode = (LOCKMODE)lockmode;
@@ -5876,7 +6766,11 @@ cluster_grd_entry_release_and_pop_compatible_waiter(const ClusterResId *resid,
 
 			for (int h = 0; h < entry->ngranted; h++) {
 				/* spec-5.1b D1: frozen-matrix conflict check. */
-				if (!ges_modes_compatible(entry->holders[h].mode, entry->waiters[w].mode)) {
+				if (!grd_same_lock_group(entry->holders[h].node_id, entry->holders[h].procno,
+										 entry->holders[h].lock_group_procno_plus_one,
+										 entry->waiters[w].node_id, entry->waiters[w].procno,
+										 entry->waiters[w].lock_group_procno_plus_one)
+					&& !ges_modes_compatible(entry->holders[h].mode, entry->waiters[w].mode)) {
 					compatible = false;
 					break;
 				}
@@ -5906,6 +6800,8 @@ cluster_grd_entry_release_and_pop_compatible_waiter(const ClusterResId *resid,
 			int hslot = entry->ngranted++;
 
 			entry->holders[hslot].node_id = entry->waiters[chosen].node_id;
+			entry->holders[hslot].lock_group_procno_plus_one
+				= entry->waiters[chosen].lock_group_procno_plus_one;
 			entry->holders[hslot].procno = entry->waiters[chosen].procno;
 			entry->holders[hslot].cluster_epoch = entry->waiters[chosen].cluster_epoch;
 			entry->holders[hslot].request_id = entry->waiters[chosen].request_id;
@@ -5998,6 +6894,7 @@ cluster_grd_entry_request_convert_internal(ClusterGrdEntry *entry, const Cluster
 										   bool *out_drain_hint, bool dontwait)
 {
 	int hslot;
+	ClusterGrdConvert grouped;
 	ClusterGesConvertClass klass;
 
 	Assert(entry != NULL && req != NULL);
@@ -6016,6 +6913,10 @@ cluster_grd_entry_request_convert_internal(ClusterGrdEntry *entry, const Cluster
 		pg_atomic_fetch_add_u64(&cluster_grd_state->convert_illegal_count, 1);
 		return CLUSTER_GRD_CONVERT_ILLEGAL;
 	}
+
+	grouped = *req;
+	grouped.lock_group_procno_plus_one = entry->holders[hslot].lock_group_procno_plus_one;
+	req = &grouped;
 
 	klass = ges_mode_convert_class(entry->holders[hslot].mode, req->requested_mode);
 	switch (klass) {
@@ -6043,8 +6944,9 @@ cluster_grd_entry_request_convert_internal(ClusterGrdEntry *entry, const Cluster
 		 */
 		for (int i = 0; i < entry->ngranted; i++) {
 			if (i == hslot
-				|| (entry->holders[i].node_id == req->node_id
-					&& entry->holders[i].procno == req->procno))
+				|| grd_same_lock_group(entry->holders[i].node_id, entry->holders[i].procno,
+									   entry->holders[i].lock_group_procno_plus_one, req->node_id,
+									   req->procno, req->lock_group_procno_plus_one))
 				continue;
 			if (!ges_modes_compatible(entry->holders[i].mode, req->requested_mode)) {
 				if (dontwait)
@@ -6146,7 +7048,11 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 			if (!entry->waiters[w].boosted)
 				continue;
 			for (int h = 0; h < entry->ngranted; h++) {
-				if (!ges_modes_compatible(entry->holders[h].mode, entry->waiters[w].mode)) {
+				if (!grd_same_lock_group(entry->holders[h].node_id, entry->holders[h].procno,
+										 entry->holders[h].lock_group_procno_plus_one,
+										 entry->waiters[w].node_id, entry->waiters[w].procno,
+										 entry->waiters[w].lock_group_procno_plus_one)
+					&& !ges_modes_compatible(entry->holders[h].mode, entry->waiters[w].mode)) {
 					holder_ok = false;
 					break;
 				}
@@ -6156,8 +7062,16 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 			if (grd_waiter_is_barriered(entry, w))
 				continue; /* held behind an earlier boosted waiter */
 			for (int cc = 0; cc < entry->nconverts; cc++) {
-				if (!ges_modes_compatible(entry->converts[cc].requested_mode,
-										  entry->waiters[w].mode)) {
+				if (!grd_same_lock_group(entry->converts[cc].node_id, entry->converts[cc].procno,
+										 entry->converts[cc].lock_group_procno_plus_one,
+										 entry->waiters[w].node_id, entry->waiters[w].procno,
+										 entry->waiters[w].lock_group_procno_plus_one)
+					&& !grd_group_blocks_mode(entry, entry->waiters[w].node_id,
+											  entry->waiters[w].procno,
+											  entry->waiters[w].lock_group_procno_plus_one,
+											  entry->converts[cc].requested_mode)
+					&& !ges_modes_compatible(entry->converts[cc].requested_mode,
+											 entry->waiters[w].mode)) {
 					convert_blocked = true;
 					break;
 				}
@@ -6188,6 +7102,8 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 				int hs = entry->ngranted++;
 
 				entry->holders[hs].node_id = entry->waiters[w].node_id;
+				entry->holders[hs].lock_group_procno_plus_one
+					= entry->waiters[w].lock_group_procno_plus_one;
 				entry->holders[hs].procno = entry->waiters[w].procno;
 				entry->holders[hs].cluster_epoch = entry->waiters[w].cluster_epoch;
 				entry->holders[hs].request_id = entry->waiters[w].request_id;
@@ -6221,8 +7137,10 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 		}
 		for (int i = 0; i < entry->ngranted; i++) {
 			if (i == hslot
-				|| (entry->holders[i].node_id == cv->node_id
-					&& entry->holders[i].procno == cv->procno))
+				|| grd_same_lock_group(entry->holders[i].node_id, entry->holders[i].procno,
+									   entry->holders[i].lock_group_procno_plus_one, cv->node_id,
+									   cv->procno,
+									   entry->holders[hslot].lock_group_procno_plus_one))
 				continue;
 			if (!ges_modes_compatible(entry->holders[i].mode, cv->requested_mode)) {
 				compatible = false;
@@ -6277,14 +7195,26 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 			bool ok = true;
 
 			for (int h = 0; h < entry->ngranted; h++) {
-				if (!ges_modes_compatible(entry->holders[h].mode, entry->waiters[w].mode)) {
+				if (!grd_same_lock_group(entry->holders[h].node_id, entry->holders[h].procno,
+										 entry->holders[h].lock_group_procno_plus_one,
+										 entry->waiters[w].node_id, entry->waiters[w].procno,
+										 entry->waiters[w].lock_group_procno_plus_one)
+					&& !ges_modes_compatible(entry->holders[h].mode, entry->waiters[w].mode)) {
 					ok = false;
 					break;
 				}
 			}
 			for (int cc = 0; ok && cc < entry->nconverts; cc++) {
-				if (!ges_modes_compatible(entry->converts[cc].requested_mode,
-										  entry->waiters[w].mode)) {
+				if (!grd_same_lock_group(entry->converts[cc].node_id, entry->converts[cc].procno,
+										 entry->converts[cc].lock_group_procno_plus_one,
+										 entry->waiters[w].node_id, entry->waiters[w].procno,
+										 entry->waiters[w].lock_group_procno_plus_one)
+					&& !grd_group_blocks_mode(entry, entry->waiters[w].node_id,
+											  entry->waiters[w].procno,
+											  entry->waiters[w].lock_group_procno_plus_one,
+											  entry->converts[cc].requested_mode)
+					&& !ges_modes_compatible(entry->converts[cc].requested_mode,
+											 entry->waiters[w].mode)) {
 					ok = false;
 					break;
 				}
@@ -6316,6 +7246,8 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 				int hs = entry->ngranted++;
 
 				entry->holders[hs].node_id = entry->waiters[w].node_id;
+				entry->holders[hs].lock_group_procno_plus_one
+					= entry->waiters[w].lock_group_procno_plus_one;
 				entry->holders[hs].procno = entry->waiters[w].procno;
 				entry->holders[hs].cluster_epoch = entry->waiters[w].cluster_epoch;
 				entry->holders[hs].request_id = entry->waiters[w].request_id;
@@ -6519,10 +7451,13 @@ cluster_grd_convert_or_enqueue_meta(const ClusterResId *resid, int32 node_id, ui
 	 */
 	if (result == CLUSTER_GRD_CONVERT_ENQUEUED && conflict_holders_out != NULL) {
 		int nc = 0;
+		int hs = grd_find_holder_slot(entry, node_id, procno, current_mode);
+		uint32 group = hs < 0 ? 0 : entry->holders[hs].lock_group_procno_plus_one;
 
 		for (int i = 0; i < entry->ngranted && nc < PGRAC_GRD_MAX_HOLDERS; i++) {
-			if ((uint32)entry->holders[i].node_id == (uint32)node_id
-				&& entry->holders[i].procno == procno)
+			if (grd_same_lock_group(entry->holders[i].node_id, entry->holders[i].procno,
+									entry->holders[i].lock_group_procno_plus_one, node_id, procno,
+									group))
 				continue; /* spec-5.1c D5 self-exclude */
 			if (ges_modes_compatible(entry->holders[i].mode, requested_mode))
 				continue;
@@ -6680,6 +7615,32 @@ static bool cluster_grd_hashremove_if_still_empty(const ClusterResId *resid);
  *	CLUSTER_GRD_RELEASE_NOT_FOUND when the exact holder is absent and no release
  *	occurred, or CLUSTER_GRD_RELEASE_NOT_READY when GRD authority is unavailable.
  */
+/* PGRAC: shared-control CF has no conversion producer. A startup handoff
+ * may promote only its already-registered canonical REQUESTs, never use a
+ * malformed/future queue as permission to open a stronger lock. The caller
+ * owns readiness; this check runs under the entry lock without taking any
+ * other lock. Author: SqlRush <sqlrush@gmail.com> */
+static bool
+grd_shared_cf_queue_safe(const ClusterResId *resid, const ClusterGrdEntry *entry, uint64 epoch)
+{
+	if (!cluster_shared_config || resid->type != CLUSTER_CF_RESID_TYPE)
+		return true;
+	if (resid->field1 != 0 || resid->field2 != 0 || resid->field3 != 0 || resid->field4 != 0
+		|| resid->lockmethodid != DEFAULT_LOCKMETHOD || epoch == 0 || entry->nconverts != 0
+		|| entry->ngranted > PGRAC_GRD_MAX_HOLDERS || entry->nwaiters > PGRAC_GRD_MAX_WAITERS)
+		return false;
+	for (int i = 0; i < entry->ngranted; ++i)
+		if (entry->holders[i].cluster_epoch != epoch
+			|| (entry->holders[i].mode != ShareLock && entry->holders[i].mode != ExclusiveLock))
+			return false;
+	for (int i = 0; i < entry->nwaiters; ++i)
+		if (entry->waiters[i].cluster_epoch != epoch
+			|| entry->waiters[i].request_opcode != GES_REQ_OPCODE_REQUEST
+			|| (entry->waiters[i].mode != ShareLock && entry->waiters[i].mode != ExclusiveLock))
+			return false;
+	return true;
+}
+
 int
 cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderId *holder,
 							  ClusterGrdGrantIdentity *granted_out, int max_out)
@@ -6701,6 +7662,11 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 															: CLUSTER_GRD_RELEASE_NOT_READY;
 
 	SpinLockAcquire(&entry->lock);
+	if (!grd_shared_cf_queue_safe(resid, entry, cluster_epoch_get_current())) {
+		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
+		return CLUSTER_GRD_RELEASE_NOT_READY;
+	}
 
 	/* (1) Remove the releasing holder by full 4-tuple match (if present). */
 	for (int i = 0; i < entry->ngranted; i++) {
@@ -6813,6 +7779,152 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 	 * the resync path first removes departed edges by identity and then treats a
 	 * missing entry as "nothing left to refresh". */
 	grd_wfg_resync_after_grants(resid, granted_out, n);
+	return n;
+}
+
+/* PGRAC: whole-request table cleanup after the caller has closed its producers.
+ * This is deliberately separate from holder-only RELEASE. It cannot by itself
+ * certify that a wire request will never arrive again.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+grd_request_identity_matches(const ClusterGrdHolderId *id, int32 node, uint32 procno, uint64 epoch,
+							 uint64 request)
+{
+	return id->node_id == (uint32)node && id->procno == procno && id->cluster_epoch == epoch
+		   && id->request_id == request;
+}
+
+int
+cluster_grd_retire_request_and_drain(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+									 uint64 previous_request_id, LOCKMODE previous_mode,
+									 ClusterGrdGrantIdentity *granted_out, int max_out)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult lookup;
+	ClusterGrdHolderId departed[PGRAC_GRD_MAX_CONVERTS + 2];
+	bool restore = previous_request_id != 0;
+	bool removed = false;
+	bool may_drain;
+	int old_slot = -1, new_slot = -1;
+	int n = 0, i;
+	uint64 epoch;
+
+	if (resid == NULL || holder == NULL || max_out < 0 || (max_out > 0 && granted_out == NULL)
+		|| holder->node_id >= CLUSTER_MAX_NODES || holder->request_id == 0
+		|| holder->cluster_epoch == 0 || previous_request_id == holder->request_id
+		|| (restore ? previous_mode < GES_MODE_FIRST || previous_mode > GES_MODE_LAST
+					: previous_mode != NoLock))
+		return CLUSTER_GRD_RETIRE_INVALID;
+	lookup = cluster_grd_entry_lookup_or_create(resid, false, &entry);
+	if (lookup != CLUSTER_GRD_ENTRY_OK || entry == NULL) {
+		if (restore && lookup == CLUSTER_GRD_ENTRY_NOT_FOUND)
+			return CLUSTER_GRD_RETIRE_INVALID;
+		return lookup == CLUSTER_GRD_ENTRY_NOT_FOUND ? CLUSTER_GRD_RELEASE_NOT_FOUND
+													 : CLUSTER_GRD_RELEASE_NOT_READY;
+	}
+
+	SpinLockAcquire(&entry->lock);
+	/* Validate restoration before any destructive mutation. A request miss
+	 * is not permission to recreate its alleged former shared holder. */
+	for (i = 0; i < entry->ngranted; i++) {
+		const ClusterGrdHolder *h = &entry->holders[i];
+
+		if (grd_request_identity_matches(holder, h->node_id, h->procno, h->cluster_epoch,
+										 h->request_id))
+			new_slot = i;
+		if (restore && h->node_id == (int32)holder->node_id && h->procno == holder->procno
+			&& h->cluster_epoch == holder->cluster_epoch && h->request_id == previous_request_id
+			&& h->mode == previous_mode)
+			old_slot = i;
+	}
+	if (restore
+		&& ((old_slot < 0 && new_slot < 0) || (old_slot >= 0 && new_slot >= 0)
+			|| (new_slot >= 0
+				&& ges_mode_convert_class(previous_mode, entry->holders[new_slot].mode)
+					   != GES_CONVERT_UPGRADE))) {
+		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
+		return CLUSTER_GRD_RETIRE_INVALID;
+	}
+	for (i = 0; i < entry->nwaiters;) {
+		const ClusterGrdWaiter *w = &entry->waiters[i];
+
+		if (!grd_request_identity_matches(holder, w->node_id, w->procno, w->cluster_epoch,
+										  w->request_id)) {
+			i++;
+			continue;
+		}
+		entry->waiters[i] = entry->waiters[--entry->nwaiters];
+		memset(&entry->waiters[entry->nwaiters], 0, sizeof(entry->waiters[0]));
+		entry->generation++;
+		removed = true;
+	}
+	for (i = 0; i < entry->nconverts;) {
+		const ClusterGrdConvert *c = &entry->converts[i];
+
+		if (!grd_request_identity_matches(holder, c->node_id, c->procno, c->cluster_epoch,
+										  c->convert_request_id)) {
+			i++;
+			continue;
+		}
+		grd_convert_remove(entry, i);
+		removed = true;
+	}
+	for (i = 0; i < entry->nreservations;) {
+		const ClusterGrdHolderId *r = &entry->reservations[i].id;
+
+		if (!grd_request_identity_matches(holder, r->node_id, r->procno, r->cluster_epoch,
+										  r->request_id)) {
+			i++;
+			continue;
+		}
+		entry->reservations[i] = entry->reservations[--entry->nreservations];
+		memset(&entry->reservations[entry->nreservations], 0, sizeof(entry->reservations[0]));
+		entry->generation++;
+		removed = true;
+	}
+	if (new_slot >= 0) {
+		if (restore) {
+			entry->holders[new_slot].request_id = previous_request_id;
+			entry->holders[new_slot].mode = previous_mode;
+		} else {
+			entry->holders[new_slot] = entry->holders[--entry->ngranted];
+			memset(&entry->holders[entry->ngranted], 0, sizeof(entry->holders[0]));
+		}
+		entry->generation++;
+		removed = true;
+	}
+
+	/* Only the mutation owner calls this wrapper. Frozen or stale entries
+	 * may retire exact footprints, but must not publish a new grant. Unlike
+	 * the ordinary release sweep we do not delete any other epoch's state. */
+	epoch = cluster_epoch_get_current();
+	/* Ordinary RELEASE frees a slot before calling the legacy drain. A
+	 * cancel or downgrade need not; preserve the waiter at holder capacity. */
+	may_drain
+		= removed && max_out > 0 && entry->ngranted < PGRAC_GRD_MAX_HOLDERS
+		  && cluster_grd_shard_phase(cluster_grd_shard_for_resource(resid)) == GRD_SHARD_NORMAL
+		  && grd_shared_cf_queue_safe(resid, entry, epoch);
+	for (i = 0; may_drain && i < entry->ngranted; i++)
+		may_drain = entry->holders[i].cluster_epoch == epoch;
+	for (i = 0; may_drain && i < entry->nwaiters; i++)
+		may_drain = entry->waiters[i].cluster_epoch == epoch;
+	for (i = 0; may_drain && i < entry->nconverts; i++)
+		may_drain = entry->converts[i].cluster_epoch == epoch;
+	if (may_drain)
+		n = cluster_grd_entry_drain_converts_then_waiters(entry, granted_out,
+														  Min(max_out, PGRAC_GRD_MAX_CONVERTS + 1));
+	SpinLockRelease(&entry->lock);
+	cluster_grd_entry_release(entry);
+	if (!removed)
+		return restore && old_slot >= 0 ? 0 : CLUSTER_GRD_RELEASE_NOT_FOUND;
+
+	/* The canceled vertex and all newly granted vertices left the WFG.
+	 * Projection takes LWLocks, so it runs only after releasing entry/pin. */
+	departed[0] = *holder;
+	for (i = 0; i < n; i++)
+		departed[i + 1] = granted_out[i].holder;
+	grd_wfg_resync_entry(resid, departed, n + 1);
 	return n;
 }
 
@@ -7410,6 +8522,13 @@ cluster_grd_lmon_tick_dead_sweep(void)
 	uint64 newly_dead;
 	int peer_id;
 
+	/* Shared-catalog holders survive a heartbeat death until P6 has the
+	 * recovery/barrier proof. Sweeping before the epoch bump could grant
+	 * a failed DDL's lock before any survivor installed its RESET.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_catalog)
+		return;
+
 	/* Postmaster-only tick (single LMON consumer).  No LWLock needed
 	 * for static state. */
 	current_gen = cluster_cssd_get_dead_generation();
@@ -7470,6 +8589,19 @@ cluster_grd_alloc_generation(void)
 	if (cluster_grd_state == NULL)
 		return 0;
 	return pg_atomic_fetch_add_u64(&cluster_grd_state->next_generation, 1);
+}
+
+void
+cluster_grd_proc_initialize(PGPROC *proc)
+{
+	if (proc == NULL)
+		return;
+	proc->cluster_grd_generation = cluster_grd_alloc_generation();
+	proc->cluster_grd_bast_pending = false;
+	pg_atomic_write_u64(&proc->cluster_grd_redeclare_acked, cluster_grd_redeclare_generation());
+	pg_atomic_write_u64(&proc->cluster_grd_redeclare_acked_epoch,
+						cluster_grd_redeclare_episode_epoch());
+	pg_atomic_write_u32(&proc->cluster_grd_registered_count, 0);
 }
 
 

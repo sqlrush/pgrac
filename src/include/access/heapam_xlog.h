@@ -458,10 +458,18 @@ extern void heap2_desc(StringInfo buf, XLogReaderState *record);
 extern const char *heap2_identify(uint8 info);
 extern void heap_xlog_logical_rewrite(XLogReaderState *r);
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: one native VISIBLE record carries both exact page components. */
+struct RfPageProducerBatchV1;
+#endif
 extern XLogRecPtr log_heap_visible(Relation rel, Buffer heap_buffer,
 								   Buffer vm_buffer,
 								   TransactionId snapshotConflictHorizon,
-								   uint8 vmflags);
+								   uint8 vmflags
+#ifdef USE_PGRAC_CLUSTER
+								   , const struct RfPageProducerBatchV1 *versions
+#endif
+								   );
 
 #ifdef USE_PGRAC_CLUSTER
 

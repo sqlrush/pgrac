@@ -41,6 +41,11 @@ typedef struct RfSideXactOperationV1 {
 	bool has_tt_delta;
 	uint8 reserved49[7];
 	xl_xact_tt_commit tt_delta;
+	/* Native COMMIT with structural effects: retain the entire payload and
+	 * its typed tail. TT-only consumers cannot discharge these effects. */
+	uint32 completion_payload_length;
+	uint32 space_drop_count;
+	uint32 space_drop_offset;
 	uint8 prepare_binding[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
 	char prepare_gid[GIDSIZE];
 	uint16 prepared_record_version;
@@ -54,6 +59,9 @@ typedef struct RfSideXactOperationV1 {
 extern bool rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier,
 								   uint16 origin_thread, RfSideXactOperationV1 *out);
 extern bool rf_side_xact_structural_preflight_v1(const RfSideXactOperationV1 *operation);
+/* Every xinfo section of a COMMIT/ABORT lies within its main data and no
+ * unknown or misplaced section is present. */
+extern bool rf_side_xact_completion_shape_v1(XLogReaderState *record, bool commit);
 
 typedef enum RfSideXactApplyResultV1 {
 	RF_SIDE_XACT_APPLY_OK = 0,
@@ -97,6 +105,12 @@ typedef struct RfSideXactAbortPreparedRequirementsV1 {
 
 /* Apply one already-decoded operation.  This function never reads WAL. */
 extern RfSideXactApplyResultV1 rf_side_xact_apply_v1(const RfSideXactOperationV1 *operation);
+/* Reconstruct only the derived terminal projection after the original owner
+ * verifies this immutable COMMIT is covered by its durable canonical header. */
+typedef bool (*RfSideXactVerifyCommitCoverageV1)(void *arg, const RfSideXactOperationV1 *operation);
+extern RfSideXactApplyResultV1
+rf_side_xact_apply_covered_commit_v1(const RfSideXactOperationV1 *operation, void *arg,
+									 RfSideXactVerifyCommitCoverageV1 verify);
 extern RfSideXactApplyResultV1
 rf_side_xact_target_preflight_owned_v1(const RfSideXactOperationV1 *operation,
 									   const uint8 *owned_payload, uint32 owned_payload_length);

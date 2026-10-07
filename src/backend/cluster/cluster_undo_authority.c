@@ -106,6 +106,7 @@ cluster_undo_route_decide(int32 owner_node, uint64 reconfig_epoch,
 
 	r.reconfig_epoch = reconfig_epoch;
 	r.status = status;
+	r.reason = CLUSTER_UNDO_ROUTE_REASON_NONE;
 
 	switch (status) {
 	case CLUSTER_UNDO_AUTHORITY_OWNER_LIVE:

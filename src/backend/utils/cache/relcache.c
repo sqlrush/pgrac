@@ -315,7 +315,8 @@ static void IndexSupportInitialize(oidvector *indclass,
 								   AttrNumber maxAttributeNumber);
 static OpClassCacheEnt *LookupOpclassInfo(Oid operatorClassOid,
 										  StrategyNumber numSupport);
-static void RelationCacheInitFileRemoveInDir(const char *tblspcpath);
+static void RelationCacheInitFileRemoveAll(int elevel);
+static void RelationCacheInitFileRemoveInDir(const char *tblspcpath, int elevel);
 static void unlink_initfile(const char *initfilename, int elevel);
 
 
@@ -6772,6 +6773,27 @@ RelationCacheInitFilePostInvalidate(void)
 void
 RelationCacheInitFileRemove(void)
 {
+	RelationCacheInitFileRemoveAll(LOG);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC: invalidate every local database's startup cache before publishing
+ * remote SI messages. The broadcaster has no connected database. Serialize
+ * removal and SI insertion against concurrent init-file writers.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+void
+RelationCacheInitFilePreInvalidateAll(void)
+{
+	LWLockAcquire(RelCacheInitLock, LW_EXCLUSIVE);
+	RelationCacheInitFileRemoveAll(ERROR);
+}
+#endif
+
+static void
+RelationCacheInitFileRemoveAll(int elevel)
+{
 	const char *tblspcdir = "pg_tblspc";
 	DIR		   *dir;
 	struct dirent *de;
@@ -6779,22 +6801,22 @@ RelationCacheInitFileRemove(void)
 
 	snprintf(path, sizeof(path), "global/%s",
 			 RELCACHE_INIT_FILENAME);
-	unlink_initfile(path, LOG);
+	unlink_initfile(path, elevel);
 
 	/* Scan everything in the default tablespace */
-	RelationCacheInitFileRemoveInDir("base");
+	RelationCacheInitFileRemoveInDir("base", elevel);
 
 	/* Scan the tablespace link directory to find non-default tablespaces */
 	dir = AllocateDir(tblspcdir);
 
-	while ((de = ReadDirExtended(dir, tblspcdir, LOG)) != NULL)
+	while ((de = ReadDirExtended(dir, tblspcdir, elevel)) != NULL)
 	{
 		if (strspn(de->d_name, "0123456789") == strlen(de->d_name))
 		{
 			/* Scan the tablespace dir for per-database dirs */
 			snprintf(path, sizeof(path), "%s/%s/%s",
 					 tblspcdir, de->d_name, TABLESPACE_VERSION_DIRECTORY);
-			RelationCacheInitFileRemoveInDir(path);
+			RelationCacheInitFileRemoveInDir(path, elevel);
 		}
 	}
 
@@ -6803,7 +6825,7 @@ RelationCacheInitFileRemove(void)
 
 /* Process one per-tablespace directory for RelationCacheInitFileRemove */
 static void
-RelationCacheInitFileRemoveInDir(const char *tblspcpath)
+RelationCacheInitFileRemoveInDir(const char *tblspcpath, int elevel)
 {
 	DIR		   *dir;
 	struct dirent *de;
@@ -6812,14 +6834,14 @@ RelationCacheInitFileRemoveInDir(const char *tblspcpath)
 	/* Scan the tablespace directory to find per-database directories */
 	dir = AllocateDir(tblspcpath);
 
-	while ((de = ReadDirExtended(dir, tblspcpath, LOG)) != NULL)
+	while ((de = ReadDirExtended(dir, tblspcpath, elevel)) != NULL)
 	{
 		if (strspn(de->d_name, "0123456789") == strlen(de->d_name))
 		{
 			/* Try to remove the init file in each database */
 			snprintf(initfilename, sizeof(initfilename), "%s/%s/%s",
 					 tblspcpath, de->d_name, RELCACHE_INIT_FILENAME);
-			unlink_initfile(initfilename, LOG);
+			unlink_initfile(initfilename, elevel);
 		}
 	}
 

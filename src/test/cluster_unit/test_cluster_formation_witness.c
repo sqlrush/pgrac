@@ -5,6 +5,7 @@
 #include "postgres.h"
 
 #include <stdlib.h>
+#include <unistd.h>
 
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_semantic_activation.h" /* ACK stage enum (G3 stub) */
@@ -31,6 +32,26 @@ static ClusterFenceAuthorityReadResult durable_result;
 static bool cache_publish_ok;
 static ClusterFenceAuthorityCacheResult cache_result;
 static uint64 cache_sequence;
+static bool cache_drift_on_revalidation;
+
+bool cluster_shared_config;
+struct PGPROC *MyProc;
+static unsigned durable_reads;
+static unsigned reader_publications;
+static bool qvotec_proof_available;
+static unsigned qvotec_proof_reads;
+
+/* Original shared-memory producer boundary, never a test I/O fallback. */
+bool cluster_reconfig_read_formation_fence_snapshot(ClusterFenceAuthorityProof *out);
+bool
+cluster_reconfig_read_formation_fence_snapshot(ClusterFenceAuthorityProof *out)
+{
+	qvotec_proof_reads++;
+	if (!qvotec_proof_available)
+		return false;
+	*out = durable_proof;
+	return true;
+}
 
 /* Added to the product header by the GREEN; keep the RED link-exact rather
  * than relying on an implicit declaration. */
@@ -76,6 +97,9 @@ cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
 ClusterFenceAuthorityReadResult
 cluster_write_fence_read_durable_authority(ClusterFenceAuthorityProof *out)
 {
+	durable_reads++;
+	if (cluster_shared_config && MyProc == NULL)
+		usleep(2000);
 	if (durable_result == CLUSTER_FENCE_AUTHORITY_OK)
 		*out = durable_proof;
 	return durable_result;
@@ -89,6 +113,7 @@ cluster_write_fence_authority_cache_publish_if_unchanged(const ClusterFenceMarke
 	(void)marker;
 	(void)published_at_us;
 	(void)expected_sequence;
+	reader_publications++;
 	return cache_publish_ok;
 }
 
@@ -175,6 +200,8 @@ cluster_write_fence_revalidate_cached_nowait(const ClusterFenceMarker *expected,
 {
 	(void)expected;
 	(void)now_us;
+	if (cache_drift_on_revalidation)
+		cache_sequence += 2;
 	return cache_result;
 }
 
@@ -345,6 +372,11 @@ build_ready_fixture(void)
 	cache_publish_ok = true;
 	cache_result = CLUSTER_FENCE_CACHE_MATCH;
 	cache_sequence = 2;
+	cache_drift_on_revalidation = false;
+	cluster_shared_config = false;
+	MyProc = NULL;
+	durable_reads = reader_publications = qvotec_proof_reads = 0;
+	qvotec_proof_available = true;
 }
 
 UT_TEST(test_witness_bad_arguments_leave_null)
@@ -492,16 +524,197 @@ UT_TEST(test_recovery_control_witness_is_initial_only_and_survives_gate_open)
 	cluster_formation_witness_destroy(&witness);
 }
 
+/* PGRAC: the snapshot's marker binding is supplied by the real reconfig
+ * capture in its companion test; this exercises the actual witness consumer.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_cold_start_control_requires_exact_fence_and_stable_binding)
+{
+	ClusterFormationWitnessV1 *witness = NULL;
+	for (int bad = 0; bad < 6; ++bad) {
+		build_ready_fixture();
+		memset(snapshots, 0, sizeof(snapshots));
+		snapshots[0].local_epoch = 5;
+		snapshots[0].startup_formation_generation = bad == 1 ? 0 : 4;
+		snapshots[0].membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
+		snapshots[0].membership.last_admitted_incarnation[0] = 55;
+		if (bad == 4)
+			snapshots[0].pending_join_bitmap[0] = 2;
+		snapshots[1] = snapshots[0];
+		if (bad == 5)
+			snapshots[1].startup_formation_generation++;
+		memset(&durable_proof, 0, sizeof(durable_proof));
+		durable_proof.marker.magic = CLUSTER_FENCE_MARKER_MAGIC;
+		durable_proof.marker.version = CLUSTER_FENCE_MARKER_VERSION;
+		durable_proof.marker.issuer_node_id = CLUSTER_FENCE_BASELINE_INITIAL_ISSUER;
+		durable_proof.marker.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+		durable_proof.marker.fence_epoch = bad == 2 ? 4 : 5;
+		if (bad == 3)
+			durable_proof.marker.fenced_dead_bitmap[0] = 1;
+		durable_proof.agree_disk_count = 2;
+		durable_proof.total_disk_count = 3;
+		snapshot_call = 0;
+		UT_ASSERT_EQ(cluster_formation_witness_build_live_wait(1, 1, &witness),
+					 CLUSTER_FORMATION_WITNESS_UNSTABLE);
+		UT_ASSERT_NULL(witness);
+		snapshot_call = 0;
+		ClusterFormationWitnessResult result
+			= cluster_formation_witness_build_recovery_control_wait(1, 1, &witness);
+		if (bad == 0) {
+			UT_ASSERT_EQ(result, CLUSTER_FORMATION_WITNESS_READY);
+			UT_ASSERT_NOT_NULL(witness);
+		} else {
+			UT_ASSERT(result != CLUSTER_FORMATION_WITNESS_READY);
+			UT_ASSERT_NULL(witness);
+		}
+		cluster_formation_witness_destroy(&witness);
+	}
+}
+
+UT_TEST(test_recovery_control_failure_diagnostic_does_not_grant_a_witness)
+{
+	ClusterFormationWitnessV1 *witness = NULL;
+	ClusterFormationWitnessDiagnosticV1 sample;
+	const char *predicates[]
+		= { "recovery_control.initial_epoch", "origin.member_floor", "member.admitted_floor",
+			"fence.authority_read",			  "snapshot.first",		 "snapshot.changed",
+			"fence.cache_sequence",			  "fence.cache_publish" };
+	for (int fault = 0; fault < 8; fault++) {
+		ClusterFormationWitnessResult result;
+		build_ready_fixture();
+		memset(snapshots, 0, sizeof(snapshots));
+		snapshots[0].membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
+		snapshots[0].membership.last_admitted_incarnation[0] = 55;
+		memset(&durable_proof, 0, sizeof(durable_proof));
+		durable_proof.marker.magic = CLUSTER_FENCE_MARKER_MAGIC;
+		durable_proof.marker.version = CLUSTER_FENCE_MARKER_VERSION;
+		durable_proof.marker.issuer_node_id = CLUSTER_FENCE_BASELINE_INITIAL_ISSUER;
+		durable_proof.marker.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+		durable_proof.agree_disk_count = 2;
+		durable_proof.total_disk_count = 3;
+		if (fault == 0)
+			snapshots[0].local_epoch = 3;
+		if (fault == 1)
+			snapshots[0].membership.last_admitted_incarnation[0] = 0;
+		if (fault == 2)
+			snapshots[0].membership.membership_state[1] = CLUSTER_MEMBER_MEMBER;
+		if (fault == 3)
+			durable_result = CLUSTER_FENCE_AUTHORITY_NO_MAJORITY;
+		if (fault == 4)
+			snapshot_available = false;
+		if (fault == 6)
+			cache_sequence = 1;
+		if (fault == 7)
+			cache_publish_ok = false;
+		snapshots[1] = snapshots[0];
+		if (fault == 5)
+			snapshots[1].startup_formation_generation = 9;
+		snapshot_call = 0;
+		result = cluster_formation_witness_build_recovery_control_wait(1, 1, &witness);
+		UT_ASSERT(result != CLUSTER_FORMATION_WITNESS_READY);
+		UT_ASSERT_NULL(witness);
+		UT_ASSERT(cluster_formation_witness_last_diagnostic_v1(&sample));
+		UT_ASSERT_EQ(sample.result, result);
+		UT_ASSERT_EQ(sample.origin_thread, 1);
+		UT_ASSERT(strcmp(sample.predicate, predicates[fault]) == 0);
+		UT_ASSERT_EQ(sample.snapshot_captured, fault != 4 && fault != 6);
+		if (sample.snapshot_captured) {
+			UT_ASSERT_EQ(sample.formation_epoch, fault == 0 ? 3 : 0);
+			UT_ASSERT_EQ(sample.admitted_floor, fault == 1 ? 0 : 55);
+			UT_ASSERT_EQ(sample.fence_captured, fault != 3);
+			if (sample.fence_captured) {
+				UT_ASSERT_EQ(sample.fence_agree, 2);
+				UT_ASSERT_EQ(sample.fence_total, 3);
+			}
+		}
+		if (fault == 2)
+			UT_ASSERT_EQ(sample.missing_floor_node, 1);
+	}
+}
+
+static void
+build_initial_postmaster_fixture(void)
+{
+	build_ready_fixture();
+	memset(snapshots, 0, sizeof(snapshots));
+	snapshots[0].membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
+	snapshots[0].membership.last_admitted_incarnation[0] = UINT64_C(55);
+	snapshots[1] = snapshots[0];
+	memset(&durable_proof, 0, sizeof(durable_proof));
+	durable_proof.marker.magic = CLUSTER_FENCE_MARKER_MAGIC;
+	durable_proof.marker.version = CLUSTER_FENCE_MARKER_VERSION;
+	durable_proof.marker.issuer_node_id = CLUSTER_FENCE_BASELINE_INITIAL_ISSUER;
+	durable_proof.marker.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+	durable_proof.agree_disk_count = 2;
+	durable_proof.total_disk_count = 3;
+	cluster_shared_config = true;
+}
+
+UT_TEST(test_shared_postmaster_uses_published_proof_without_disk_or_renewal)
+{
+	for (int cold = 0; cold < 2; ++cold) {
+		ClusterFormationWitnessV1 *witness = NULL;
+		build_initial_postmaster_fixture();
+		if (cold) {
+			snapshots[0].local_epoch = 5;
+			snapshots[0].startup_formation_generation = 4;
+			snapshots[1] = snapshots[0];
+			durable_proof.marker.fence_epoch = 5;
+		}
+		UT_ASSERT_EQ(cluster_formation_witness_build_recovery_control_wait(1, 10, &witness),
+					 CLUSTER_FORMATION_WITNESS_READY);
+		UT_ASSERT_NOT_NULL(witness);
+		UT_ASSERT_EQ(durable_reads, 0);
+		UT_ASSERT_EQ(reader_publications, 0);
+		UT_ASSERT(qvotec_proof_reads > 0);
+		cluster_formation_witness_destroy(&witness);
+		cluster_shared_config = false;
+	}
+}
+
+UT_TEST(test_shared_postmaster_missing_or_expired_proof_has_no_io_fallback)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		ClusterFormationWitnessV1 *witness = NULL;
+		build_initial_postmaster_fixture();
+		cluster_shared_config = true;
+		if (fault == 0)
+			qvotec_proof_available = false;
+		else if (fault == 1)
+			cache_result = CLUSTER_FENCE_CACHE_EXPIRED;
+		else if (fault == 2)
+			cache_result = CLUSTER_FENCE_CACHE_STALE;
+		else if (fault == 3)
+			cache_drift_on_revalidation = true;
+		else if (fault == 4)
+			durable_proof.agree_disk_count = 1;
+		else if (fault == 5)
+			cache_result = CLUSTER_FENCE_CACHE_INVALID;
+		else
+			cache_result = CLUSTER_FENCE_CACHE_UNAVAILABLE;
+		UT_ASSERT(cluster_formation_witness_build_recovery_control_wait(1, 1, &witness)
+				  != CLUSTER_FORMATION_WITNESS_READY);
+		UT_ASSERT_NULL(witness);
+		UT_ASSERT_EQ(durable_reads, 0);
+		UT_ASSERT_EQ(reader_publications, 0);
+		cluster_formation_witness_destroy(&witness);
+		cluster_shared_config = false;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(10);
 	UT_RUN(test_witness_bad_arguments_leave_null);
 	UT_RUN(test_witness_ready_borrow_revalidate_destroy);
 	UT_RUN(test_witness_unstable_or_unavailable_never_installs_handle);
 	UT_RUN(test_witness_revalidate_maps_stale_and_unavailable);
 	UT_RUN(test_live_witness_requires_same_stable_member_formation);
 	UT_RUN(test_recovery_control_witness_is_initial_only_and_survives_gate_open);
+	UT_RUN(test_cold_start_control_requires_exact_fence_and_stable_binding);
+	UT_RUN(test_recovery_control_failure_diagnostic_does_not_grant_a_witness);
+	UT_RUN(test_shared_postmaster_uses_published_proof_without_disk_or_renewal);
+	UT_RUN(test_shared_postmaster_missing_or_expired_proof_has_no_io_fallback);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

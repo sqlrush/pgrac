@@ -21,6 +21,7 @@
 #define PGRAC_FENCED_UUID_BYTES 16
 #define PGRAC_FENCED_ADAPTER_DATA_MAX_BYTES 4096
 #define PGRAC_FENCED_CONFIG_DIGEST_BYTES 32
+#define PGRAC_FENCED_NATIVE_NAME_BYTES 64
 
 typedef enum PgracFencedConfigResult
 {
@@ -40,16 +41,29 @@ typedef enum PgracFencedConfigReloadDecision
 	PGRAC_FENCED_CONFIG_RELOAD_REJECT_INVALID = 4
 } PgracFencedConfigReloadDecision;
 
-typedef struct PgracFencedNodeConfigV1
-{
+typedef struct PgracFencedNodeConfigV1 {
 	bool present;
 	uint8 target_uuid[PGRAC_FENCED_UUID_BYTES];
 	uint16 adapter_data_len;
 	uint8 adapter_data[PGRAC_FENCED_ADAPTER_DATA_MAX_BYTES];
+	uint8 protected_set_digest[PGRAC_FENCED_CONFIG_DIGEST_BYTES];
 } PgracFencedNodeConfigV1;
+
+/* PGRAC: protected management expectations, never learned from observations. */
+typedef struct PgracFencedNativeConfigV1 {
+	bool present;
+	char resource[PGRAC_FENCED_NATIVE_NAME_BYTES];
+	uint8 cib_digest[32];
+	uint8 inventory_digest[32];
+	uint8 drain_public_key[32];
+	char bundle_directory[MAXPGPATH];
+	char client_config[MAXPGPATH];
+	char node_names[PGRAC_FENCED_MAX_NODES][PGRAC_FENCED_NATIVE_NAME_BYTES];
+} PgracFencedNativeConfigV1;
 
 typedef struct PgracFencedConfigV1
 {
+	/* In-memory configuration view; format_version selects the file grammar. */
 	uint32 format_version;
 	uint64 mapping_generation;
 	uint64 system_identifier;
@@ -60,11 +74,25 @@ typedef struct PgracFencedConfigV1
 	uint16 provider_id;
 	uint16 provider_abi;
 	uint16 node_count;
+	uint8 map_public_key[32];
 	PgracFencedNodeConfigV1 nodes[PGRAC_FENCED_MAX_NODES];
+	PgracFencedNativeConfigV1 native;
 } PgracFencedConfigV1;
 
-extern PgracFencedConfigResult pgrac_fenced_config_parse_v1(
-	const uint8 *bytes, size_t len, PgracFencedConfigV1 *out);
+struct PgracFencedCibPolicy;
+struct PgracFencedCibNode;
+/* Caller owns the node array; successful policy borrows it. No aliasing. */
+extern bool pgrac_fenced_config_cib_policy(const PgracFencedConfigV1 *config,
+										   struct PgracFencedCibPolicy *policy,
+										   struct PgracFencedCibNode *nodes, size_t capacity);
+
+extern PgracFencedConfigResult pgrac_fenced_config_parse_v1(const uint8 *bytes, size_t len,
+															PgracFencedConfigV1 *out);
+extern PgracFencedConfigResult pgrac_fenced_config_parse(const uint8 *bytes, size_t len,
+														 PgracFencedConfigV1 *out);
+extern bool
+pgrac_fenced_config_protected_set_digest(const PgracFencedConfigV1 *config, int32 node_id,
+										 uint8 digest[PGRAC_FENCED_CONFIG_DIGEST_BYTES]);
 extern bool pgrac_fenced_config_digest_v1(
 	const uint8 *bytes, size_t len,
 	uint8 out[PGRAC_FENCED_CONFIG_DIGEST_BYTES]);

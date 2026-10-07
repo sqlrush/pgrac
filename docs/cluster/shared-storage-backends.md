@@ -1,5 +1,30 @@
 # Shared-Storage Backends
 
+## Shared filesystem data I/O
+
+The `cluster_fs` backend supports PostgreSQL's `debug_io_direct='data'` startup
+setting. Include it in the cluster's common startup configuration and restart
+all instances with the same setting. Instance overrides and online changes are
+rejected. On Linux, relation files open with `O_DIRECT`; macOS uses PostgreSQL's
+`F_NOCACHE` path. `debug_io_direct='wal'` alone does not change relation data I/O.
+
+The setting applies to every relation fork, including FSM, VM and SPACE.
+Unaligned caller buffers are handled internally. Unsupported opens, short I/O
+and synchronization errors remain errors; there is no buffered fallback.
+Direct I/O does not replace `fsync`, WAL ordering, or storage qualification.
+Small shared-root control files retain their existing I/O behavior.
+
+NFS is not supported for PRE2 shared-mode data files. Use the qualified cluster
+filesystem. On Linux and macOS, retained DROP cleanup detects NFS before its
+first file modification and leaves the DROP obligation pending. Other platforms
+without this filesystem check also refuse this cleanup operation.
+
+Extension still writes an aligned zero block under the existing extension
+rules. The backend does not preallocate pages or advance logical EOF ahead of
+those writes. Direct I/O bypasses buffered prefetch/writeback requests, so
+measure both read-heavy workloads and extension as well as steady overwrites
+on the intended filesystem before choosing a deployment setting.
+
 ## spec-6.0a Implementation Notes
 
 spec-6.0a lands the `block_device` production shared-storage backend on top of the `ClusterSharedFsOps` provider framework. The CI-portable path uses a regular-file raw image with `cluster.block_device_use_odirect=off`; production deployments should use a persistent block-device path with direct I/O enabled.

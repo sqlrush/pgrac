@@ -286,6 +286,15 @@ main(int argc, char **argv)
 
 	umask(pg_mode_mask);
 
+	/* PGRAC: reject before restore-command evaluation, automatic recovery,
+	 * connecting to a source or copying any files. Local sources must not be
+	 * cloned from a shared-control projection either.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	reject_pgrac_legacy_operation(datadir_target);
+	if (datadir_source != NULL)
+		reject_pgrac_legacy_operation(datadir_source);
+
 	getRestoreCommand(argv[0]);
 
 	atexit(disconnect_atexit);

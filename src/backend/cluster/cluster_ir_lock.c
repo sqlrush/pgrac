@@ -28,6 +28,7 @@
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_lock_owner.h"
 #include "miscadmin.h" /* IsUnderPostmaster */
 #include "storage/lock.h"
 #include "storage/shmem.h"
@@ -157,32 +158,66 @@ cluster_recovery_serial_native_result_rejected_count(void)
 	return ir_state != NULL ? pg_atomic_read_u64(&ir_state->native_result_rejected_count) : 0;
 }
 
+/* PGRAC: INPUT_SEAL serializes physical scanning, not replay. A normal
+ * checkpoint tail is not a failed writer's final input. Keep replay callers
+ * ineligible until the purpose-bound publisher seals the actual WAL.
+ * Author: SqlRush <sqlrush@gmail.com> */
 static bool
-recovery_serial_root_token_matches_duty(const ClusterControlRootReadToken *token,
-										const ClusterRecoveryDutyKey *duty)
+recovery_serial_flags_valid(uint32 flags, ClusterRecoverySerialMode mode)
 {
 	uint32 required_flags
-		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
-		  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID;
 
+	if (mode == CLUSTER_RECOVERY_SERIAL_INPUT_SEAL)
+		return cluster_shared_config
+			   && (flags & ~CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF) == required_flags;
+	required_flags
+		|= CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+	return (flags & required_flags) == required_flags;
+}
+
+static bool
+recovery_serial_root_token_matches_duty(const ClusterControlRootReadToken *token,
+										const ClusterRecoveryDutyKey *duty,
+										ClusterRecoverySerialMode mode)
+{
 	return token != NULL && duty != NULL && token->origin_thread_id == duty->origin_thread_id
 		   && token->root_lineage_seq == duty->root_lineage_seq
 		   && memcmp(token->authority_uuid, duty->authority_uuid, sizeof(token->authority_uuid))
 				  == 0
 		   && token->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
 		   && token->reserved20 == 0 && token->reserved32 == 0 && token->file_txn_seq != 0
-		   && token->root_publish_seq != 0 && token->record_crc32c != 0
-		   && (token->root_flags & required_flags) == required_flags;
+		   && token->root_publish_seq != 0 && (cluster_shared_config || token->record_crc32c != 0)
+		   && recovery_serial_flags_valid(token->root_flags, mode);
+}
+
+static bool
+recovery_serial_pending_valid(const ClusterControlPendingToken *pending,
+							  const ClusterControlRootReadToken *ordinary,
+							  const ClusterRecoveryDutyKey *duty)
+{
+	const ClusterControlRootReadToken zero = { 0 };
+	return cluster_shared_config && cluster_control_pending_token_matches(pending, duty)
+		   && memcmp(ordinary, &zero, sizeof(zero)) == 0;
 }
 
 static bool
 recovery_serial_request_valid(const ClusterRecoverySerialRequest *request)
 {
+	const ClusterControlPendingToken zero = { 0 };
 	return request != NULL
 		   && (request->mode == CLUSTER_RECOVERY_SERIAL_ONLINE
-			   || request->mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED)
-		   && cluster_recovery_duty_key_valid_v1(&request->duty)
-		   && recovery_serial_root_token_matches_duty(&request->expected_root_token, &request->duty)
+			   || request->mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+			   || (cluster_shared_config
+				   && (request->mode == CLUSTER_RECOVERY_SERIAL_INPUT_SEAL
+					   || request->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER)))
+		   && cluster_recovery_duty_key_valid_for_claim(&request->duty, cluster_shared_config)
+		   && (request->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER
+				   ? recovery_serial_pending_valid(&request->pending, &request->expected_root_token,
+												   &request->duty)
+				   : memcmp(&request->pending, &zero, sizeof(zero)) == 0
+						 && recovery_serial_root_token_matches_duty(&request->expected_root_token,
+																	&request->duty, request->mode))
 		   && request->formation != NULL && request->fence_need_set != NULL
 		   && request->fence_admission_set != NULL && request->acquire_timeout_ms >= 1
 		   && request->acquire_timeout_ms <= 600000 && request->release_timeout_ms >= 1
@@ -193,14 +228,20 @@ static bool
 recovery_serial_release_guard_valid(const ClusterRecoverySerialGuard *guard)
 {
 	ClusterResId expected_resid;
+	const ClusterControlPendingToken zero = { 0 };
 
 	if (guard == NULL || !guard->held
 		|| (guard->mode != CLUSTER_RECOVERY_SERIAL_ONLINE
-			&& guard->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED)
+			&& guard->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED
+			&& !(cluster_shared_config
+				 && (guard->mode == CLUSTER_RECOVERY_SERIAL_INPUT_SEAL
+					 || guard->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER)))
 		|| guard->formation == NULL || guard->fence_need_set == NULL
 		|| guard->fence_admission_set == NULL || guard->release_timeout_ms < 1
-		|| guard->release_timeout_ms > 600000 || !cluster_recovery_duty_key_valid_v1(&guard->duty)
-		|| !cluster_recovery_serial_resid_encode(&guard->duty, &expected_resid)
+		|| guard->release_timeout_ms > 600000
+		|| !cluster_recovery_duty_key_valid_for_claim(&guard->duty, cluster_shared_config)
+		|| !cluster_recovery_serial_resid_encode_for_claim(&guard->duty, cluster_shared_config,
+														   &expected_resid)
 		|| memcmp(&guard->resid, &expected_resid, sizeof(expected_resid)) != 0
 		|| memcmp(&guard->lock_request.resid, &guard->resid, sizeof(guard->resid)) != 0
 		|| guard->lock_request.lockmode != ExclusiveLock
@@ -210,7 +251,12 @@ recovery_serial_release_guard_valid(const ClusterRecoverySerialGuard *guard)
 		|| guard->lock_request.sessionLock || guard->lock_request.request_id == 0
 		|| guard->lock_request.holder.request_id != guard->lock_request.request_id
 		|| guard->lock_request.holder.cluster_epoch == 0
-		|| !recovery_serial_root_token_matches_duty(&guard->root_read_token, &guard->duty))
+		|| !(guard->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER
+				 ? recovery_serial_pending_valid(&guard->pending, &guard->root_read_token,
+												 &guard->duty)
+				 : memcmp(&guard->pending, &zero, sizeof(zero)) == 0
+					   && recovery_serial_root_token_matches_duty(&guard->root_read_token,
+																  &guard->duty, guard->mode)))
 		return false;
 	return true;
 }
@@ -225,22 +271,31 @@ recovery_serial_preflight(const ClusterRecoverySerialRequest *request)
 	ClusterControlRootReadToken token;
 	ClusterControlRootResult root_result;
 	PgracExternalFenceDenyReason reason;
-	uint32 required_flags
-		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
-		  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
-
-	root_result
-		= cluster_control_root_read_canonical(request->duty.origin_thread_id, &request->duty,
-											  CLUSTER_CONTROL_ROOT_READ_STRONG, &snapshot, &token);
-	if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-		return CLUSTER_RECOVERY_SERIAL_ROOT_UNAVAILABLE;
-	if (cluster_recovery_duty_key_compare(&snapshot.identity, &request->duty)
-			!= CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
-		|| snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
-		|| (snapshot.root_flags & required_flags) != required_flags
-		|| memcmp(&token, &request->expected_root_token, sizeof(token)) != 0)
-		return CLUSTER_RECOVERY_SERIAL_STALE;
+	if (request->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER) {
+		ClusterControlRecoverySubject subject;
+		root_result = cluster_control_root_read_recovery_subject(request->duty.origin_thread_id,
+																 &request->duty, &subject);
+		if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return CLUSTER_RECOVERY_SERIAL_ROOT_UNAVAILABLE;
+		if (subject.kind != CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER
+			|| memcmp(&subject.duty, &request->duty, sizeof(request->duty)) != 0
+			|| memcmp(&subject.pending, &request->pending, sizeof(request->pending)) != 0)
+			return CLUSTER_RECOVERY_SERIAL_STALE;
+	} else {
+		root_result = cluster_control_root_read_canonical(
+			request->duty.origin_thread_id, &request->duty, CLUSTER_CONTROL_ROOT_READ_STRONG,
+			&snapshot, &token);
+		if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+			return CLUSTER_RECOVERY_SERIAL_ROOT_UNAVAILABLE;
+		if (cluster_recovery_duty_key_compare_for_claim(&snapshot.identity, &request->duty,
+														cluster_shared_config)
+				!= CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
+			|| snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+			|| !recovery_serial_flags_valid(snapshot.root_flags, request->mode)
+			|| memcmp(&token, &request->expected_root_token, sizeof(token)) != 0)
+			return CLUSTER_RECOVERY_SERIAL_STALE;
+	}
 	if (cluster_formation_witness_revalidate_nowait(request->formation)
 		!= CLUSTER_FORMATION_WITNESS_READY)
 		return CLUSTER_RECOVERY_SERIAL_STALE;
@@ -276,7 +331,8 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 			IR_BUMP(capability_denied_count);
 		return preflight;
 	}
-	if (!cluster_recovery_serial_resid_encode(&request->duty, &resid))
+	if (!cluster_recovery_serial_resid_encode_for_claim(&request->duty, cluster_shared_config,
+														&resid))
 		return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
 
 	memset(&lock_request, 0, sizeof(lock_request));
@@ -291,7 +347,9 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 	lock_request.caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
 	lock_request.timeout_ms = Min(request->acquire_timeout_ms, ir_base_timeout_ms);
 	lock_request.wait_event = WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
-	lock_result = cluster_lock_acquire_seven_step(&lock_request);
+	lock_result = cluster_shared_config
+					  ? cluster_lock_owner_request_acquire(&lock_request, NULL, NULL)
+					  : cluster_lock_acquire_seven_step(&lock_request);
 
 	if (lock_result == CLUSTER_LOCK_ACQUIRE_NOT_AVAIL) {
 		IR_BUMP(busy_count);
@@ -302,7 +360,7 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 		IR_BUMP(retry_count);
 		return CLUSTER_RECOVERY_SERIAL_RETRY;
 	}
-	if (lock_result == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK)
+	if (!cluster_shared_config && lock_result == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK)
 		lock_result = cluster_lock_acquire_s5_promote(&lock_request);
 	if (lock_result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED
 		&& lock_result != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
@@ -316,6 +374,7 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 	guard->resid = resid;
 	guard->duty = request->duty;
 	guard->root_read_token = request->expected_root_token;
+	guard->pending = request->pending;
 	guard->formation = request->formation;
 	guard->fence_need_set = request->fence_need_set;
 	guard->fence_admission_set = request->fence_admission_set;
@@ -349,8 +408,9 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 	return CLUSTER_RECOVERY_SERIAL_GRANTED;
 }
 
-ClusterRecoverySerialRevalidateResult
-cluster_recovery_serial_revalidate(ClusterRecoverySerialGuard *guard)
+static ClusterRecoverySerialRevalidateResult
+recovery_serial_revalidate_purpose(ClusterRecoverySerialGuard *guard,
+								   ClusterRecoverySerialMode purpose)
 {
 	if (guard != NULL && guard->release_uncertain) {
 		IR_BUMP(revalidate_reject_count);
@@ -358,6 +418,16 @@ cluster_recovery_serial_revalidate(ClusterRecoverySerialGuard *guard)
 	}
 	if (guard == NULL || !guard->held)
 		return CLUSTER_RECOVERY_SERIAL_NOT_HELD;
+	if (cluster_shared_config && !cluster_lock_owner_request_usable(&guard->lock_request)) {
+		IR_BUMP(revalidate_reject_count);
+		return CLUSTER_RECOVERY_SERIAL_MEMBERSHIP_STALE;
+	}
+	if ((purpose == CLUSTER_RECOVERY_SERIAL_ONLINE && guard->mode != CLUSTER_RECOVERY_SERIAL_ONLINE
+		 && guard->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED)
+		|| (purpose != CLUSTER_RECOVERY_SERIAL_ONLINE && guard->mode != purpose)) {
+		IR_BUMP(revalidate_reject_count);
+		return CLUSTER_RECOVERY_SERIAL_CAPABILITY_STALE;
+	}
 	if (!recovery_serial_release_guard_valid(guard)) {
 		IR_BUMP(revalidate_reject_count);
 		return CLUSTER_RECOVERY_SERIAL_FENCE_STALE;
@@ -380,6 +450,24 @@ cluster_recovery_serial_revalidate(ClusterRecoverySerialGuard *guard)
 	return CLUSTER_RECOVERY_SERIAL_CURRENT;
 }
 
+ClusterRecoverySerialRevalidateResult
+cluster_recovery_serial_revalidate(ClusterRecoverySerialGuard *guard)
+{
+	return recovery_serial_revalidate_purpose(guard, CLUSTER_RECOVERY_SERIAL_ONLINE);
+}
+
+ClusterRecoverySerialRevalidateResult
+cluster_recovery_serial_input_revalidate(ClusterRecoverySerialGuard *guard)
+{
+	return recovery_serial_revalidate_purpose(guard, CLUSTER_RECOVERY_SERIAL_INPUT_SEAL);
+}
+
+ClusterRecoverySerialRevalidateResult
+cluster_recovery_serial_initializer_revalidate(ClusterRecoverySerialGuard *guard)
+{
+	return recovery_serial_revalidate_purpose(guard, CLUSTER_RECOVERY_SERIAL_INITIALIZER);
+}
+
 ClusterRecoverySerialAcquireResult
 cluster_recovery_serial_acquire_set(const ClusterRecoverySerialRequest *requests, uint16 count,
 									int overall_acquire_timeout_ms,
@@ -399,6 +487,8 @@ cluster_recovery_serial_acquire_set(const ClusterRecoverySerialRequest *requests
 		return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
 	for (i = 0; i < count; i++) {
 		if (!recovery_serial_request_valid(&requests[i])
+			|| requests[i].mode == CLUSTER_RECOVERY_SERIAL_INPUT_SEAL
+			|| requests[i].mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER
 			|| (i > 0 && requests[i - 1].duty.origin_thread_id >= requests[i].duty.origin_thread_id)
 			|| (i > 0 && requests[i - 1].release_timeout_ms != requests[i].release_timeout_ms))
 			return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
@@ -466,7 +556,8 @@ recovery_serial_release_with_timeout(ClusterRecoverySerialGuard *guard, int time
 
 	release_request = guard->lock_request;
 	release_request.timeout_ms = Min(timeout_ms, ir_base_timeout_ms);
-	result = cluster_lock_acquire_s6_release(&release_request);
+	result = cluster_shared_config ? cluster_lock_owner_request_release(&release_request)
+								   : cluster_lock_acquire_s6_release(&release_request);
 	if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
 		guard->release_uncertain = true;
 		IR_BUMP(release_unconfirmed_count);

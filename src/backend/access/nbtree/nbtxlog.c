@@ -7,6 +7,8 @@
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * PGRAC MODIFICATIONS: honor qualified redo buffer initialization results.
+ *
  * IDENTIFICATION
  *	  src/backend/access/nbtree/nbtxlog.c
  *
@@ -92,7 +94,12 @@ _bt_restore_meta(XLogReaderState *record, uint8 block_id)
 	char	   *ptr;
 	Size		len;
 
-	metabuf = XLogInitBufferForRedo(record, block_id);
+	if (XLogReadBufferForRedoExtended(record, block_id, RBM_ZERO_AND_LOCK, false, &metabuf)
+		!= BLK_NEEDS_REDO) {
+		if (BufferIsValid(metabuf))
+			UnlockReleaseBuffer(metabuf);
+		return;
+	}
 	ptr = XLogRecGetBlockData(record, block_id, &len);
 
 	Assert(len == sizeof(xl_btree_metadata));
@@ -287,23 +294,25 @@ btree_xlog_split(bool newitemonleft, XLogReaderState *record)
 		_bt_clear_incomplete_split(record, 3);
 
 	/* Reconstruct right (new) sibling page from scratch */
-	rbuf = XLogInitBufferForRedo(record, 1);
-	datapos = XLogRecGetBlockData(record, 1, &datalen);
-	rpage = (Page) BufferGetPage(rbuf);
+	if (XLogReadBufferForRedoExtended(record, 1, RBM_ZERO_AND_LOCK, false, &rbuf)
+		== BLK_NEEDS_REDO) {
+		datapos = XLogRecGetBlockData(record, 1, &datalen);
+		rpage = (Page)BufferGetPage(rbuf);
 
-	_bt_pageinit(rpage, BufferGetPageSize(rbuf));
-	ropaque = BTPageGetOpaque(rpage);
+		_bt_pageinit(rpage, BufferGetPageSize(rbuf));
+		ropaque = BTPageGetOpaque(rpage);
 
-	ropaque->btpo_prev = origpagenumber;
-	ropaque->btpo_next = spagenumber;
-	ropaque->btpo_level = xlrec->level;
-	ropaque->btpo_flags = isleaf ? BTP_LEAF : 0;
-	ropaque->btpo_cycleid = 0;
+		ropaque->btpo_prev = origpagenumber;
+		ropaque->btpo_next = spagenumber;
+		ropaque->btpo_level = xlrec->level;
+		ropaque->btpo_flags = isleaf ? BTP_LEAF : 0;
+		ropaque->btpo_cycleid = 0;
 
-	_bt_restore_page(rpage, datapos, datalen);
+		_bt_restore_page(rpage, datapos, datalen);
 
-	PageSetLSN(rpage, lsn);
-	MarkBufferDirty(rbuf);
+		PageSetLSN(rpage, lsn);
+		MarkBufferDirty(rbuf);
+	}
 
 	/* Now reconstruct original page (left half of split) */
 	if (XLogReadBufferForRedo(record, 0, &buf) == BLK_NEEDS_REDO)
@@ -457,7 +466,8 @@ btree_xlog_split(bool newitemonleft, XLogReaderState *record)
 	 * Finally, release the remaining buffers.  sbuf, rbuf, and buf must be
 	 * released together, so that readers cannot observe inconsistencies.
 	 */
-	UnlockReleaseBuffer(rbuf);
+	if (BufferIsValid(rbuf))
+		UnlockReleaseBuffer(rbuf);
 	if (BufferIsValid(buf))
 		UnlockReleaseBuffer(buf);
 }
@@ -766,7 +776,12 @@ btree_xlog_mark_page_halfdead(uint8 info, XLogReaderState *record)
 		UnlockReleaseBuffer(buffer);
 
 	/* Rewrite the leaf page as a halfdead page */
-	buffer = XLogInitBufferForRedo(record, 0);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &buffer)
+		!= BLK_NEEDS_REDO) {
+		if (BufferIsValid(buffer))
+			UnlockReleaseBuffer(buffer);
+		return;
+	}
 	page = (Page) BufferGetPage(buffer);
 
 	_bt_pageinit(page, BufferGetPageSize(buffer));
@@ -846,22 +861,24 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
 		leftbuf = InvalidBuffer;
 
 	/* Rewrite target page as empty deleted page */
-	target = XLogInitBufferForRedo(record, 0);
-	page = (Page) BufferGetPage(target);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &target)
+		== BLK_NEEDS_REDO) {
+		page = (Page)BufferGetPage(target);
 
-	_bt_pageinit(page, BufferGetPageSize(target));
-	pageop = BTPageGetOpaque(page);
+		_bt_pageinit(page, BufferGetPageSize(target));
+		pageop = BTPageGetOpaque(page);
 
-	pageop->btpo_prev = leftsib;
-	pageop->btpo_next = rightsib;
-	pageop->btpo_level = level;
-	BTPageSetDeleted(page, safexid);
-	if (isleaf)
-		pageop->btpo_flags |= BTP_LEAF;
-	pageop->btpo_cycleid = 0;
+		pageop->btpo_prev = leftsib;
+		pageop->btpo_next = rightsib;
+		pageop->btpo_level = level;
+		BTPageSetDeleted(page, safexid);
+		if (isleaf)
+			pageop->btpo_flags |= BTP_LEAF;
+		pageop->btpo_cycleid = 0;
 
-	PageSetLSN(page, lsn);
-	MarkBufferDirty(target);
+		PageSetLSN(page, lsn);
+		MarkBufferDirty(target);
+	}
 
 	/* Fix left-link of right sibling */
 	if (XLogReadBufferForRedo(record, 2, &rightbuf) == BLK_NEEDS_REDO)
@@ -881,7 +898,8 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
 		UnlockReleaseBuffer(rightbuf);
 
 	/* Release target */
-	UnlockReleaseBuffer(target);
+	if (BufferIsValid(target))
+		UnlockReleaseBuffer(target);
 
 	/*
 	 * If we deleted a parent of the targeted leaf page, instead of the leaf
@@ -904,30 +922,33 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
 
 		Assert(!isleaf);
 
-		leafbuf = XLogInitBufferForRedo(record, 3);
-		page = (Page) BufferGetPage(leafbuf);
+		if (XLogReadBufferForRedoExtended(record, 3, RBM_ZERO_AND_LOCK, false, &leafbuf)
+			== BLK_NEEDS_REDO) {
+			page = (Page)BufferGetPage(leafbuf);
 
-		_bt_pageinit(page, BufferGetPageSize(leafbuf));
-		pageop = BTPageGetOpaque(page);
+			_bt_pageinit(page, BufferGetPageSize(leafbuf));
+			pageop = BTPageGetOpaque(page);
 
-		pageop->btpo_flags = BTP_HALF_DEAD | BTP_LEAF;
-		pageop->btpo_prev = xlrec->leafleftsib;
-		pageop->btpo_next = xlrec->leafrightsib;
-		pageop->btpo_level = 0;
-		pageop->btpo_cycleid = 0;
+			pageop->btpo_flags = BTP_HALF_DEAD | BTP_LEAF;
+			pageop->btpo_prev = xlrec->leafleftsib;
+			pageop->btpo_next = xlrec->leafrightsib;
+			pageop->btpo_level = 0;
+			pageop->btpo_cycleid = 0;
 
-		/* Add a dummy hikey item */
-		MemSet(&trunctuple, 0, sizeof(IndexTupleData));
-		trunctuple.t_info = sizeof(IndexTupleData);
-		BTreeTupleSetTopParent(&trunctuple, xlrec->leaftopparent);
+			/* Add a dummy hikey item */
+			MemSet(&trunctuple, 0, sizeof(IndexTupleData));
+			trunctuple.t_info = sizeof(IndexTupleData);
+			BTreeTupleSetTopParent(&trunctuple, xlrec->leaftopparent);
 
-		if (PageAddItem(page, (Item) &trunctuple, sizeof(IndexTupleData), P_HIKEY,
-						false, false) == InvalidOffsetNumber)
-			elog(ERROR, "could not add dummy high key to half-dead page");
+			if (PageAddItem(page, (Item)&trunctuple, sizeof(IndexTupleData), P_HIKEY, false, false)
+				== InvalidOffsetNumber)
+				elog(ERROR, "could not add dummy high key to half-dead page");
 
-		PageSetLSN(page, lsn);
-		MarkBufferDirty(leafbuf);
-		UnlockReleaseBuffer(leafbuf);
+			PageSetLSN(page, lsn);
+			MarkBufferDirty(leafbuf);
+		}
+		if (BufferIsValid(leafbuf))
+			UnlockReleaseBuffer(leafbuf);
 	}
 
 	/* Update metapage if needed */
@@ -945,32 +966,38 @@ btree_xlog_newroot(XLogReaderState *record)
 	BTPageOpaque pageop;
 	char	   *ptr;
 	Size		len;
+	XLogRedoAction action;
 
-	buffer = XLogInitBufferForRedo(record, 0);
-	page = (Page) BufferGetPage(buffer);
+	action = XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &buffer);
+	if (action == BLK_NEEDS_REDO) {
+		page = (Page)BufferGetPage(buffer);
 
-	_bt_pageinit(page, BufferGetPageSize(buffer));
-	pageop = BTPageGetOpaque(page);
+		_bt_pageinit(page, BufferGetPageSize(buffer));
+		pageop = BTPageGetOpaque(page);
 
-	pageop->btpo_flags = BTP_ROOT;
-	pageop->btpo_prev = pageop->btpo_next = P_NONE;
-	pageop->btpo_level = xlrec->level;
-	if (xlrec->level == 0)
-		pageop->btpo_flags |= BTP_LEAF;
-	pageop->btpo_cycleid = 0;
+		pageop->btpo_flags = BTP_ROOT;
+		pageop->btpo_prev = pageop->btpo_next = P_NONE;
+		pageop->btpo_level = xlrec->level;
+		if (xlrec->level == 0)
+			pageop->btpo_flags |= BTP_LEAF;
+		pageop->btpo_cycleid = 0;
 
-	if (xlrec->level > 0)
-	{
-		ptr = XLogRecGetBlockData(record, 0, &len);
-		_bt_restore_page(page, ptr, len);
-
+		if (xlrec->level > 0) {
+			ptr = XLogRecGetBlockData(record, 0, &len);
+			_bt_restore_page(page, ptr, len);
+		}
+	}
+	if (xlrec->level > 0) {
 		/* Clear the incomplete-split flag in left child */
 		_bt_clear_incomplete_split(record, 1);
 	}
 
-	PageSetLSN(page, lsn);
-	MarkBufferDirty(buffer);
-	UnlockReleaseBuffer(buffer);
+	if (action == BLK_NEEDS_REDO) {
+		PageSetLSN(page, lsn);
+		MarkBufferDirty(buffer);
+	}
+	if (BufferIsValid(buffer))
+		UnlockReleaseBuffer(buffer);
 
 	_bt_restore_meta(record, 2);
 }

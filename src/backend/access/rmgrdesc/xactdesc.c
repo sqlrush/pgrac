@@ -63,10 +63,102 @@
  * duplication would be bothersome.
  */
 
-void
-ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, xl_xact_parsed_commit *parsed)
+static bool
+xact_commit_take(const char **cursor, Size *left, Size bytes)
 {
-	char	   *data = ((char *) xlrec) + MinSizeOfXactCommit;
+	if (bytes > *left)
+		return false;
+	*cursor += bytes;
+	*left -= bytes;
+	return true;
+}
+
+static bool
+xact_commit_array(const char **cursor, Size *left, Size element)
+{
+	int count;
+
+	if (*left < sizeof(count))
+		return false;
+	memcpy(&count, *cursor, sizeof(count));
+	return xact_commit_take(cursor, left, sizeof(count)) && count >= 0
+		&& (Size)count <= *left / element
+		&& xact_commit_take(cursor, left, (Size)count * element);
+}
+
+static bool
+xact_commit_shape(uint8 info, const void *bytes, Size len)
+{
+	const char *cursor = bytes;
+	uint32 xinfo = 0;
+	const uint32 known = XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SUBXACTS
+		| XACT_XINFO_HAS_RELFILELOCATORS | XACT_XINFO_HAS_INVALS | XACT_XINFO_HAS_TWOPHASE
+		| XACT_XINFO_HAS_ORIGIN | XACT_XINFO_HAS_AE_LOCKS | XACT_XINFO_HAS_GID
+		| XACT_XINFO_HAS_DROPPED_STATS | XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT
+		| XACT_XINFO_HAS_SPACE_DROP | XACT_COMPLETION_APPLY_FEEDBACK
+		| XACT_COMPLETION_UPDATE_RELCACHE_FILE | XACT_COMPLETION_FORCE_SYNC_COMMIT;
+
+	if (bytes == NULL || !xact_commit_take(&cursor, &len, MinSizeOfXactCommit))
+		return false;
+	if (info & XLOG_XACT_HAS_INFO) {
+		if (len < sizeof(xinfo))
+			return false;
+		memcpy(&xinfo, cursor, sizeof(xinfo));
+		(void)xact_commit_take(&cursor, &len, sizeof(xinfo));
+	}
+	if ((xinfo & ~known) != 0
+		|| ((xinfo & XACT_XINFO_HAS_GID) && !(xinfo & XACT_XINFO_HAS_TWOPHASE)))
+		return false;
+	if ((xinfo & XACT_XINFO_HAS_DBINFO) && !xact_commit_take(&cursor, &len, sizeof(xl_xact_dbinfo)))
+		return false;
+	if ((xinfo & XACT_XINFO_HAS_SUBXACTS) && !xact_commit_array(&cursor, &len, sizeof(TransactionId)))
+		return false;
+	if ((xinfo & XACT_XINFO_HAS_RELFILELOCATORS) && !xact_commit_array(&cursor, &len, sizeof(RelFileLocator)))
+		return false;
+	if ((xinfo & XACT_XINFO_HAS_DROPPED_STATS) && !xact_commit_array(&cursor, &len, sizeof(xl_xact_stats_item)))
+		return false;
+	if ((xinfo & XACT_XINFO_HAS_INVALS) && !xact_commit_array(&cursor, &len, sizeof(SharedInvalidationMessage)))
+		return false;
+	if (xinfo & XACT_XINFO_HAS_TWOPHASE) {
+		if (!xact_commit_take(&cursor, &len, sizeof(xl_xact_twophase)))
+			return false;
+		if (xinfo & XACT_XINFO_HAS_GID) {
+			const char *end = memchr(cursor, '\0', Min((Size)GIDSIZE, len));
+
+			if (end == NULL || !xact_commit_take(&cursor, &len, end - cursor + 1))
+				return false;
+		}
+	}
+	if ((xinfo & XACT_XINFO_HAS_ORIGIN) && !xact_commit_take(&cursor, &len, sizeof(xl_xact_origin)))
+		return false;
+	if ((xinfo & XACT_XINFO_HAS_SCN) && !xact_commit_take(&cursor, &len, sizeof(xl_xact_scn)))
+		return false;
+	if ((xinfo & XACT_XINFO_HAS_TT_COMMIT) && !xact_commit_take(&cursor, &len, sizeof(xl_xact_tt_commit)))
+		return false;
+	if (xinfo & XACT_XINFO_HAS_SPACE_DROP) {
+		uint32 count;
+
+		if ((info & XLOG_XACT_OPMASK) != XLOG_XACT_COMMIT
+			|| !(xinfo & XACT_XINFO_HAS_RELFILELOCATORS)
+			|| (xinfo & XACT_XINFO_HAS_TWOPHASE) || len < sizeof(count))
+			return false;
+		memcpy(&count, cursor, sizeof(count));
+		(void)xact_commit_take(&cursor, &len, sizeof(count));
+		if (count == 0 || count > len / XACT_SPACE_DROP_RECORD_BYTES
+			|| !xact_commit_take(&cursor, &len, (Size)count * XACT_SPACE_DROP_RECORD_BYTES))
+			return false;
+	}
+	return len == 0;
+}
+
+bool
+ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, Size len, xl_xact_parsed_commit *parsed)
+{
+	char	   *data;
+
+	if (parsed == NULL || !xact_commit_shape(info, xlrec, len))
+		return false;
+	data = ((char *) xlrec) + MinSizeOfXactCommit;
 
 	memset(parsed, 0, sizeof(*parsed));
 
@@ -198,6 +290,12 @@ ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, xl_xact_parsed_commit *pars
 
 		data += sizeof(xl_xact_tt_commit);
 	}
+	if (parsed->xinfo & XACT_XINFO_HAS_SPACE_DROP)
+	{
+		memcpy(&parsed->nspace_drops, data, sizeof(parsed->nspace_drops));
+		parsed->space_drops = data + sizeof(parsed->nspace_drops);
+	}
+	return true;
 }
 
 void
@@ -408,11 +506,15 @@ xact_desc_stats(StringInfo buf, const char *label,
 }
 
 static void
-xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, RepOriginId origin_id)
+xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, Size len, RepOriginId origin_id)
 {
 	xl_xact_parsed_commit parsed;
 
-	ParseCommitRecord(info, xlrec, &parsed);
+	if (!ParseCommitRecord(info, xlrec, len, &parsed))
+	{
+		appendStringInfoString(buf, "invalid commit payload");
+		return;
+	}
 
 	/* If this is a prepared xact, show the xid of the original xact */
 	if (TransactionIdIsValid(parsed.twophase_xid))
@@ -421,6 +523,8 @@ xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, RepOriginId 
 	appendStringInfoString(buf, timestamptz_to_str(xlrec->xact_time));
 
 	xact_desc_relations(buf, "rels", parsed.nrels, parsed.xlocators);
+	if (parsed.nspace_drops != 0)
+		appendStringInfo(buf, "; space drops: %u", parsed.nspace_drops);
 	xact_desc_subxacts(buf, parsed.nsubxacts, parsed.subxacts);
 	xact_desc_stats(buf, "", parsed.nstats, parsed.stats);
 
@@ -546,7 +650,7 @@ xact_desc(StringInfo buf, XLogReaderState *record)
 	{
 		xl_xact_commit *xlrec = (xl_xact_commit *) rec;
 
-		xact_desc_commit(buf, XLogRecGetInfo(record), xlrec,
+		xact_desc_commit(buf, XLogRecGetInfo(record), xlrec, XLogRecGetDataLen(record),
 						 XLogRecGetOrigin(record));
 	}
 	else if (info == XLOG_XACT_ABORT || info == XLOG_XACT_ABORT_PREPARED)

@@ -46,6 +46,7 @@
 #include "cluster/cluster_gcs_block.h"		 /* spec-5.2a D4 — backend eager flush */
 #include "cluster/cluster_guc.h"			 /* spec-5.4 — cluster.sequence_* GUCs */
 #include "cluster/cluster_sequence.h"		 /* spec-5.4 — SQ instance cache + refill */
+#include "cluster/cluster_space_storage.h" /* PGRAC: exact sequence page versions */
 #include "cluster/storage/cluster_smgr.h"	 /* spec-5.4 — shared-storage activation gate */
 #include "cluster/cluster_mode.h"			 /* spec-2.41 D4 — cluster_storage_mode_enabled */
 #include "cluster/cluster_scn.h"				 /* spec-2.41 D4 — cluster_scn_advance / SCN */
@@ -65,16 +66,6 @@
  * crash we can lose (skip over) as many values as we pre-logged.
  */
 #define SEQ_LOG_VALS	32
-
-/*
- * The "special area" of a sequence's buffer page looks like this.
- */
-#define SEQ_MAGIC	  0x1717
-
-typedef struct sequence_magic
-{
-	uint32		magic;
-} sequence_magic;
 
 /*
  * We store a SeqTable item for every sequence we have touched in the current
@@ -173,14 +164,48 @@ cluster_sq_compute_write_scn(Relation seqrel)
 	return (uint64) InvalidScn;
 }
 
+/* PGRAC: acquire the cached relation identity before any sequence page lock. */
+static bool
+cluster_seq_version_identity(Relation rel, ClusterSpaceIdentity *identity)
+{
+	if (!cluster_shared_config ||
+		rel->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT ||
+		cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) != 1)
+		return false;
+	if (!cluster_space_relation_get_identity(rel, identity))
+		elog(ERROR, "shared sequence has no current SPACE identity");
+	return true;
+}
+
+/* PGRAC: memory-only capture; the original sequence owner holds buffer X. */
+static void
+cluster_seq_prepare_version(const ClusterSpaceIdentity *identity, Buffer buffer,
+							bool new_page, RfPageProducerBatchV1 *batch)
+{
+	RfPageProducerComponentV1 component;
+	static const char zero_page[BLCKSZ] = {0};
+
+	if (BufferGetBlockNumber(buffer) != 0 ||
+		!cluster_space_buffer_version_component(identity, buffer, 0, 0, &component))
+		elog(ERROR, "invalid shared sequence page version identity");
+	if (new_page)
+	{
+		if (memcmp(component.page, zero_page, BLCKSZ) != 0)
+			elog(ERROR, "shared sequence initialization requires a zero predecessor");
+		component.before_kind = RF_PAGE_STATE_UNFORMATTED;
+	}
+	if (!rf_page_producer_prepare_v1(&component, 1, batch))
+		elog(ERROR, "cannot capture shared sequence page version");
+}
+
 /*
  * PGRAC: spec-5.4 (v2.0 Q2-B, option B) — cluster sequence disposition.
  *
- *	CLSQ_NATIVE       not a cluster-managed sequence (single node / no peers /
- *	                  cluster off / a system or temp sequence) -> the PG-native
- *	                  nextval path is correct and unchanged.
- *	CLSQ_MANAGED      a user sequence on cluster shared storage in an active
- *	                  multi-node cluster -> the shared page is the single
+ *	CLSQ_NATIVE       not a shared-profile sequence and no active cluster,
+ *	                  or a nonshared system/temp sequence -> PG-native.
+ *	CLSQ_MANAGED      a permanent shared-profile sequence (also without peers),
+ *	                  or a shared user sequence in an active legacy cluster;
+ *	                  the shared page is the single
  *	                  cross-node allocation boundary; *resid is filled.
  *	CLSQ_UNSUPPORTED  a user sequence in an active multi-node cluster that is
  *	                  NOT on shared storage -> cross-node uniqueness cannot be
@@ -197,14 +222,20 @@ typedef enum ClusterSqDisposition
 static ClusterSqDisposition
 cluster_sq_classify(Relation seqrel, ClusterResId *resid)
 {
-	/* Single node / no peers / cluster disabled -> PG-native (no cross-node). */
-	if (!cluster_pcm_is_active())
+	/* PGRAC: temporary sequences never participate in shared reservation. */
+	if (RelationUsesLocalBuffers(seqrel))
 		return CLSQ_NATIVE;
 
-	/* System catalog or temp sequence -> not cross-node shared -> PG-native. */
-	if (seqrel->rd_locator.relNumber < FirstNormalObjectId
-		|| RelationUsesLocalBuffers(seqrel))
-		return CLSQ_NATIVE;
+	/* PGRAC: peer count must not change a shared sequence's allocation owner.
+	 * A durable node segment also amortizes CACHE 1 in the no-peer case. */
+	if (!(cluster_shared_config &&
+		  seqrel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT &&
+		  cluster_smgr_which_for(seqrel->rd_locator, InvalidBackendId) == 1))
+	{
+		if (!cluster_pcm_is_active() ||
+			seqrel->rd_locator.relNumber < FirstNormalObjectId)
+			return CLSQ_NATIVE;
+	}
 
 	/* User sequence in an active multi-node cluster: it must live on shared
 	 * storage so the single sequence page is the cross-node boundary. */
@@ -231,7 +262,7 @@ cluster_sq_classify(Relation seqrel, ClusterResId *resid)
  */
 static void
 cluster_sq_refill_page(Relation seqrel, int64 incby, int64 minv, int64 maxv,
-					   int64 cache, int64 *out_start, int64 *out_end)
+					   int64 cache, bool cycle, int64 *out_start, int64 *out_end)
 {
 	Buffer		buf;
 	HeapTupleData seqtuple;
@@ -243,12 +274,26 @@ cluster_sq_refill_page(Relation seqrel, int64 incby, int64 minv, int64 maxv,
 				new_boundary;
 	ClusterSqAllocStatus st;
 	uint64		cluster_write_scn;	/* spec-2.41 D4 — pd_block_scn stamp */
+	ClusterSpaceIdentity identity;
+	RfPageProducerBatchV1 versions;
+	bool		versioned = cluster_seq_version_identity(seqrel, &identity);
+
+	/* PGRAC: the extra PG prelog allowance is a real durable reservation here,
+	 * not a WAL tuple ahead of the page carrying the same result token. */
+	if (versioned)
+		cache += Min((int64) SEQ_LOG_VALS, PG_INT64_MAX - cache);
 
 	seq = read_seq_tuple(seqrel, &buf, &seqtuple);
 	page = BufferGetPage(buf);
 
 	st = cluster_sq_alloc_segment(seq->last_value, seq->is_called, incby, minv, maxv,
 								  cache, &gstart, &gend, &gcount, &new_boundary);
+	/* PGRAC: preserve no-peer CYCLE, without wrapping inside a cached segment.
+	 * Active-cluster CYCLE remains rejected by the original caller gate. */
+	if (st == CLUSTER_SQ_ALLOC_EXHAUSTED && cycle)
+		st = cluster_sq_alloc_segment(incby > 0 ? minv : maxv, false,
+									 incby, minv, maxv, cache,
+									 &gstart, &gend, &gcount, &new_boundary);
 	if (st == CLUSTER_SQ_ALLOC_EXHAUSTED)
 	{
 		UnlockReleaseBuffer(buf);
@@ -266,18 +311,23 @@ cluster_sq_refill_page(Relation seqrel, int64 incby, int64 minv, int64 maxv,
 
 	/* Acquire an xid outside the critical section so commit triggers a WAL
 	 * flush + syncrep wait (mirror nextval_internal). */
-	if (RelationNeedsWAL(seqrel))
+	if (RelationNeedsWAL(seqrel) || versioned)
 		GetTopTransactionId();
 
 	/* PGRAC: spec-2.41 D4 — version the refilled page.  A managed sequence is
 	 * always cluster-storage + tracked, so this returns a valid SCN.  Taken
 	 * OUTSIDE the critical section (cluster_scn_advance(), Rule 16). */
-	cluster_write_scn = cluster_sq_compute_write_scn(seqrel);
+	if (versioned)
+		cluster_seq_prepare_version(&identity, buf, false, &versions);
+	cluster_write_scn = versioned ? versions.result_token :
+		cluster_sq_compute_write_scn(seqrel);
 
 	START_CRIT_SECTION();
+	if (versioned && !rf_page_producer_stamp_v1(&versions))
+		elog(PANIC, "shared sequence changed before refill");
 	MarkBufferDirty(buf);
 
-	if (RelationNeedsWAL(seqrel))
+	if (RelationNeedsWAL(seqrel) || versioned)
 	{
 		xl_seq_rec	xlrec;
 		XLogRecPtr	recptr;
@@ -301,6 +351,8 @@ cluster_sq_refill_page(Relation seqrel, int64 incby, int64 minv, int64 maxv,
 			((PageHeader) page)->pd_block_scn = (SCN) cluster_write_scn;
 		XLogRegisterData((char *) &xlrec, sizeof(xl_seq_rec));
 		XLogRegisterData((char *) seqtuple.t_data, seqtuple.t_len);
+		if (versioned && !rf_page_producer_register_wal_v1(&versions))
+			elog(PANIC, "shared sequence refill version changed before WAL");
 
 		recptr = XLogInsert(RM_SEQ_ID, XLOG_SEQ_LOG);
 		PageSetLSN(page, recptr);
@@ -311,6 +363,13 @@ cluster_sq_refill_page(Relation seqrel, int64 incby, int64 minv, int64 maxv,
 	seq->log_cnt = 0;
 
 	END_CRIT_SECTION();
+
+	/* PGRAC: a different backend can commit a cache hit before the refill
+	 * transaction commits. Its commit cannot flush our WAL, so make the grant
+	 * durable before publishing it even with no peer or asynchronous commit.
+	 * The legacy DATA guard below is peer-gated, not this reservation proof. */
+	if (versioned)
+		XLogFlush(PageGetLSN(page));
 
 	/* WAL-before-grant + storage-current for the cross-node transfer. */
 	cluster_seq_flush_if_shared(seqrel, buf);
@@ -333,7 +392,7 @@ cluster_sq_refill_page(Relation seqrel, int64 incby, int64 minv, int64 maxv,
  */
 static int64
 cluster_sq_nextval(Relation seqrel, const ClusterResId *resid,
-				   int64 incby, int64 minv, int64 maxv, int64 cache)
+				   int64 incby, int64 minv, int64 maxv, int64 cache, bool cycle)
 {
 	int64		v = 0;
 	int64		gstart = 0,
@@ -378,7 +437,7 @@ cluster_sq_nextval(Relation seqrel, const ClusterResId *resid,
 	/* This backend won the refill: advance the shared page, then publish. */
 	PG_TRY();
 	{
-		cluster_sq_refill_page(seqrel, incby, minv, maxv, cache, &gstart, &gend);
+		cluster_sq_refill_page(seqrel, incby, minv, maxv, cache, cycle, &gstart, &gend);
 	}
 	PG_CATCH();
 	{
@@ -680,8 +739,15 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 	sequence_magic *sm;
 	OffsetNumber offnum;
 	uint64		cluster_write_scn = 0;	/* spec-2.41 D4 — pd_block_scn (InvalidScn on non-cluster) */
+	bool		versioned = false;	/* PGRAC: exact shared versions always need WAL */
 
 #ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceIdentity identity;
+	RfPageProducerBatchV1 versions;
+	Page		private_page = NULL;
+
+	versioned = cluster_seq_version_identity(rel, &identity);
+
 	/*
 	 * PGRAC: spec-5.2a D5a — shared-storage sequence DDL idempotency.
 	 *
@@ -755,6 +821,15 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 
 	page = BufferGetPage(buf);
 
+#ifdef USE_PGRAC_CLUSTER
+	if (versioned)
+	{
+		cluster_seq_prepare_version(&identity, buf, true, &versions);
+		/* Preserve the actual zero predecessor until critical publication. */
+		private_page = palloc0(BLCKSZ);
+		page = private_page;
+	}
+#endif
 	PageInit(page, BufferGetPageSize(buf), sizeof(sequence_magic));
 	sm = (sequence_magic *) PageGetSpecialPointer(page);
 	sm->magic = SEQ_MAGIC;
@@ -776,17 +851,28 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 	ItemPointerSet(&tuple->t_data->t_ctid, 0, FirstOffsetNumber);
 
 	/* check the comment above nextval_internal()'s equivalent call. */
-	if (RelationNeedsWAL(rel))
+	if (RelationNeedsWAL(rel) || versioned)
 		GetTopTransactionId();
 
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: spec-2.41 D4 — version the freshly initialised page (CREATE /
 	 * init producer).  Outside the critical section (Rule 16). */
-	cluster_write_scn = cluster_sq_compute_write_scn(rel);
+	cluster_write_scn = versioned ? versions.result_token :
+		cluster_sq_compute_write_scn(rel);
 #endif
 
 	START_CRIT_SECTION();
 
+#ifdef USE_PGRAC_CLUSTER
+	if (versioned)
+	{
+		if (!rf_page_producer_stamp_v1(&versions))
+			elog(PANIC, "shared sequence changed before initialization");
+		((PageHeader) private_page)->pd_block_scn = versions.result_token;
+		page = BufferGetPage(buf);
+		memcpy(page, private_page, BLCKSZ);
+	}
+#endif
 	MarkBufferDirty(buf);
 
 	offnum = PageAddItem(page, (Item) tuple->t_data, tuple->t_len,
@@ -795,7 +881,7 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 		elog(ERROR, "failed to add sequence tuple to page");
 
 	/* XLOG stuff */
-	if (RelationNeedsWAL(rel) || forkNum == INIT_FORKNUM)
+	if (RelationNeedsWAL(rel) || versioned || forkNum == INIT_FORKNUM)
 	{
 		xl_seq_rec	xlrec;
 		XLogRecPtr	recptr;
@@ -814,6 +900,11 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 		XLogRegisterData((char *) &xlrec, sizeof(xl_seq_rec));
 		XLogRegisterData((char *) tuple->t_data, tuple->t_len);
 
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_register_wal_v1(&versions))
+			elog(PANIC, "shared sequence init version changed before WAL");
+#endif
+
 		recptr = XLogInsert(RM_SEQ_ID, XLOG_SEQ_LOG);
 
 		PageSetLSN(page, recptr);
@@ -822,6 +913,8 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 	END_CRIT_SECTION();
 
 #ifdef USE_PGRAC_CLUSTER
+	if (private_page != NULL)
+		pfree(private_page);
 	cluster_seq_flush_if_shared(rel, buf);	/* spec-5.2a D4 — durable on shared storage */
 #endif
 
@@ -1046,7 +1139,12 @@ nextval_internal(Oid relid, bool check_permissions)
 				rescnt = 0;
 	bool		cycle;
 	bool		logit = false;
+	bool		versioned = false;	/* PGRAC: exact shared versions always need WAL */
 	uint64		cluster_write_scn = 0;	/* spec-2.41 D4 — pd_block_scn (InvalidScn on non-cluster) */
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceIdentity identity;
+	RfPageProducerBatchV1 versions;
+#endif
 
 	/* open and lock sequence */
 	init_sequence(relid, &elm, &seqrel);
@@ -1124,7 +1222,7 @@ nextval_internal(Oid relid, bool check_permissions)
 
 			/* Cluster CYCLE forward (spec §3.8 AL4): cross-node value reuse
 			 * conflicts with the uniqueness guarantee. */
-			if (cycle)
+			if (cycle && cluster_pcm_is_active())
 			{
 				cluster_sq_bump_cycle_rejected();
 				ereport(ERROR,
@@ -1135,7 +1233,7 @@ nextval_internal(Oid relid, bool check_permissions)
 								 "recreate the sequence with NO CYCLE.")));
 			}
 
-			sq_val = cluster_sq_nextval(seqrel, &sq_resid, incby, minv, maxv, cache);
+			sq_val = cluster_sq_nextval(seqrel, &sq_resid, incby, minv, maxv, cache, cycle);
 
 			elm->increment = incby;
 			elm->last = sq_val;
@@ -1147,6 +1245,7 @@ nextval_internal(Oid relid, bool check_permissions)
 			return sq_val;
 		}
 	}
+	versioned = cluster_seq_version_identity(seqrel, &identity);
 #endif
 
 	/* lock page' buffer and read tuple */
@@ -1208,6 +1307,16 @@ nextval_internal(Oid relid, bool check_permissions)
 	if (cluster_pcm_is_active()
 		&& seqrel->rd_locator.relNumber >= FirstNormalObjectId)
 		logit = true;
+	/*
+	 * PGRAC: one physical version must have one exact tuple result. Keep
+	 * backend caching, but do not WAL-prelog beyond its actual allocation
+	 * boundary in the shared no-peer fallback. Nonshared prelogging stays.
+	 */
+	if (versioned)
+	{
+		fetch = log = cache - rescnt;
+		logit = true;
+	}
 #endif
 
 	while (fetch)				/* try to fetch cache [+ log ] numbers */
@@ -1268,13 +1377,6 @@ nextval_internal(Oid relid, bool check_permissions)
 	log -= fetch;				/* adjust for any unfetched numbers */
 	Assert(log >= 0);
 
-	/* save info in local cache */
-	elm->last = result;			/* last returned number */
-	elm->cached = last;			/* last fetched number */
-	elm->last_valid = true;
-
-	last_used_seq = elm;
-
 	/*
 	 * If something needs to be WAL logged, acquire an xid, so this
 	 * transaction's commit will trigger a WAL flush and wait for syncrep.
@@ -1282,20 +1384,35 @@ nextval_internal(Oid relid, bool check_permissions)
 	 * to assign xids subxacts, that'll already trigger an appropriate wait.
 	 * (Have to do that here, so we're outside the critical section)
 	 */
-	if (logit && RelationNeedsWAL(seqrel))
+	if (logit && (RelationNeedsWAL(seqrel) || versioned))
 		GetTopTransactionId();
 
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: spec-2.41 D4 — version the page only when this nextval emits a
 	 * WAL record (logit); a cached fetch does not change the durable page, so
 	 * its pd_block_scn must not advance.  Outside the critical section. */
-	if (logit && RelationNeedsWAL(seqrel))
-		cluster_write_scn = cluster_sq_compute_write_scn(seqrel);
+	if (logit && (RelationNeedsWAL(seqrel) || versioned))
+	{
+		if (versioned)
+			cluster_seq_prepare_version(&identity, buf, false, &versions);
+		cluster_write_scn = versioned ? versions.result_token :
+			cluster_sq_compute_write_scn(seqrel);
+	}
 #endif
+
+	/* PGRAC: never cache a boundary rejected by before-version validation. */
+	elm->last = result;			/* last returned number */
+	elm->cached = last;			/* last fetched number */
+	elm->last_valid = true;
+	last_used_seq = elm;
 
 	/* ready to change the on-disk (or really, in-buffer) tuple */
 	START_CRIT_SECTION();
 
+#ifdef USE_PGRAC_CLUSTER
+	if (versioned && !rf_page_producer_stamp_v1(&versions))
+		elog(PANIC, "shared sequence changed before backend refill");
+#endif
 	/*
 	 * We must mark the buffer dirty before doing XLogInsert(); see notes in
 	 * SyncOneBuffer().  However, we don't apply the desired changes just yet.
@@ -1308,7 +1425,7 @@ nextval_internal(Oid relid, bool check_permissions)
 	MarkBufferDirty(buf);
 
 	/* XLOG stuff */
-	if (logit && RelationNeedsWAL(seqrel))
+	if (logit && (RelationNeedsWAL(seqrel) || versioned))
 	{
 		xl_seq_rec	xlrec;
 		XLogRecPtr	recptr;
@@ -1337,6 +1454,11 @@ nextval_internal(Oid relid, bool check_permissions)
 
 		XLogRegisterData((char *) &xlrec, sizeof(xl_seq_rec));
 		XLogRegisterData((char *) seqdatatuple.t_data, seqdatatuple.t_len);
+
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_register_wal_v1(&versions))
+			elog(PANIC, "shared sequence backend refill version changed before WAL");
+#endif
 
 		recptr = XLogInsert(RM_SEQ_ID, XLOG_SEQ_LOG);
 
@@ -1453,6 +1575,11 @@ do_setval(Oid relid, int64 next, bool iscalled)
 	int64		maxv,
 				minv;
 	uint64		cluster_write_scn = 0;	/* spec-2.41 D4 — pd_block_scn (InvalidScn on non-cluster) */
+	bool		versioned = false;	/* PGRAC: exact shared versions always need WAL */
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceIdentity identity;
+	RfPageProducerBatchV1 versions;
+#endif
 
 	/* open and lock sequence */
 	init_sequence(relid, &elm, &seqrel);
@@ -1482,6 +1609,9 @@ do_setval(Oid relid, int64 next, bool iscalled)
 	 */
 	PreventCommandIfParallelMode("setval()");
 
+#ifdef USE_PGRAC_CLUSTER
+	versioned = cluster_seq_version_identity(seqrel, &identity);
+#endif
 	/* lock page' buffer and read tuple */
 	seq = read_seq_tuple(seqrel, &buf, &seqdatatuple);
 
@@ -1492,6 +1622,20 @@ do_setval(Oid relid, int64 next, bool iscalled)
 						(long long) next, RelationGetRelationName(seqrel),
 						(long long) minv, (long long) maxv)));
 
+	/* check the comment above nextval_internal()'s equivalent call. */
+	if (RelationNeedsWAL(seqrel) || versioned)
+		GetTopTransactionId();
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: spec-2.41 D4 — version the page on setval (a tracked sequence
+	 * page write).  Outside the critical section (Rule 16). */
+	if (versioned)
+		cluster_seq_prepare_version(&identity, buf, false, &versions);
+	cluster_write_scn = versioned ? versions.result_token :
+		cluster_sq_compute_write_scn(seqrel);
+#endif
+
+	/* PGRAC: publish local state only after fallible before validation. */
 	/* Set the currval() state only if iscalled = true */
 	if (iscalled)
 	{
@@ -1502,19 +1646,13 @@ do_setval(Oid relid, int64 next, bool iscalled)
 	/* In any case, forget any future cached numbers */
 	elm->cached = elm->last;
 
-	/* check the comment above nextval_internal()'s equivalent call. */
-	if (RelationNeedsWAL(seqrel))
-		GetTopTransactionId();
-
-#ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: spec-2.41 D4 — version the page on setval (a tracked sequence
-	 * page write).  Outside the critical section (Rule 16). */
-	cluster_write_scn = cluster_sq_compute_write_scn(seqrel);
-#endif
-
 	/* ready to change the on-disk (or really, in-buffer) tuple */
 	START_CRIT_SECTION();
 
+#ifdef USE_PGRAC_CLUSTER
+	if (versioned && !rf_page_producer_stamp_v1(&versions))
+		elog(PANIC, "shared sequence changed before setval");
+#endif
 	seq->last_value = next;		/* last fetched number */
 	seq->is_called = iscalled;
 	seq->log_cnt = 0;
@@ -1522,7 +1660,7 @@ do_setval(Oid relid, int64 next, bool iscalled)
 	MarkBufferDirty(buf);
 
 	/* XLOG stuff */
-	if (RelationNeedsWAL(seqrel))
+	if (RelationNeedsWAL(seqrel) || versioned)
 	{
 		xl_seq_rec	xlrec;
 		XLogRecPtr	recptr;
@@ -1541,6 +1679,11 @@ do_setval(Oid relid, int64 next, bool iscalled)
 
 		XLogRegisterData((char *) &xlrec, sizeof(xl_seq_rec));
 		XLogRegisterData((char *) seqdatatuple.t_data, seqdatatuple.t_len);
+
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_register_wal_v1(&versions))
+			elog(PANIC, "shared sequence setval version changed before WAL");
+#endif
 
 		recptr = XLogInsert(RM_SEQ_ID, XLOG_SEQ_LOG);
 
@@ -1773,6 +1916,14 @@ read_seq_tuple(Relation rel, Buffer *buf, HeapTuple seqdatatuple)
 	Assert(!(seqdatatuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI));
 	if (HeapTupleHeaderGetRawXmax(seqdatatuple->t_data) != InvalidTransactionId)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		/* Shared storage admits only freshly initialized sequence tuples;
+		 * a legacy xmax is not an authorized page-repair input. */
+		if (cluster_shared_config && RelationIsPermanent(rel)
+			&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1)
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("shared sequence contains an unexpected legacy xmax")));
+#endif
 		HeapTupleHeaderSetXmax(seqdatatuple->t_data, InvalidTransactionId);
 		seqdatatuple->t_data->t_infomask &= ~HEAP_XMAX_COMMITTED;
 		seqdatatuple->t_data->t_infomask |= HEAP_XMAX_INVALID;
@@ -2397,7 +2548,12 @@ seq_redo(XLogReaderState *record)
 	if (info != XLOG_SEQ_LOG)
 		elog(PANIC, "seq_redo: unknown op code %u", info);
 
-	buffer = XLogInitBufferForRedo(record, 0);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &buffer)
+		!= BLK_NEEDS_REDO) {
+		if (BufferIsValid(buffer))
+			UnlockReleaseBuffer(buffer);
+		return;
+	}
 	page = (Page) BufferGetPage(buffer);
 
 	/*

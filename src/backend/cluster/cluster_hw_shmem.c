@@ -350,6 +350,12 @@ cluster_hw_try_advance(const ClusterResId *resid, uint32 want, BlockNumber seed_
 	Assert(resid != NULL && first != NULL && granted != NULL && new_hwm != NULL);
 	Assert(want > 0);
 
+	/* Shared reservations come from the exact SPACE current page, including
+	 * after restart/remaster. No old READY state or FileSize seed may grant. */
+	if (cluster_shared_config) {
+		cluster_hw_bump_not_ready();
+		return CLUSTER_HW_NOT_READY;
+	}
 	if (hw_htab == NULL)
 		return CLUSTER_HW_FULL; /* shmem absent: caller fails closed */
 	boot_mode = cluster_hw_cold_boot_mode();
@@ -611,17 +617,20 @@ cluster_hw_remaster_recoverable(void)
  * ============================================================ */
 
 /*
- * cluster_hw_authority_active -- is multi-node HW allocation in play?
+ * cluster_hw_authority_active -- is the legacy multi-node HW cache in play?
  * Only in a multi-node cluster backed by shared storage: that is the
  * only configuration where a relation extend is globalized (D2) and where a
  * survivor must read a dead master's snapshot.  Normal seed metadata has its
  * own gate, independent of node count; existing recovery retains this gate.
+ * Canonical SPACE uses the HW enqueue but never this allocator/snapshot
+ * authority. Its original thread recovery and SPACE GCS owners retain the
+ * DATA/isolation duties; no fabricated legacy rebuilt generation is needed.
  */
 bool
 cluster_hw_authority_active(void)
 {
-	return cluster_shared_data_dir != NULL && cluster_shared_data_dir[0] != '\0'
-		   && cluster_conf_node_count() > 1;
+	return !cluster_shared_config && cluster_shared_data_dir != NULL
+		   && cluster_shared_data_dir[0] != '\0' && cluster_conf_node_count() > 1;
 }
 
 bool
@@ -763,6 +772,28 @@ hw_normal_snapshot_load(XLogRecPtr own_redo, const char **failure_out)
 	return success;
 }
 
+/*
+ * D S09 R-A15: crash recovery of a root-backed node whose multi-node
+ * authority is not active loads its own checkpoint snapshot like a normal
+ * boot, before redo replays the HW_RESERVE tail on top.  The rebuilt table
+ * lets this lifetime's checkpoints keep the snapshot bound to their redo, so
+ * the next clean boot finds it.  Without an exact snapshot the original
+ * recovery contract stands: recovery proceeds, nothing is rewritten in this
+ * lifetime, and the next normal boot still refuses a stale snapshot.
+ */
+static bool
+hw_recovery_snapshot_load(XLogRecPtr own_redo)
+{
+	const char *failure = NULL;
+
+	if (XLogRecPtrIsInvalid(own_redo) || hw_normal_snapshot_load(own_redo, &failure))
+		return true;
+	ereport(LOG, (errmsg("cluster HW snapshot not rebuilt for crash recovery; it is not rewritten "
+						 "until a normal boot"),
+				  errdetail("reason=%s", failure != NULL ? failure : "UNCLASSIFIED")));
+	return true;
+}
+
 bool
 cluster_hw_startup_prepare(bool in_recovery, bool own_clean_shutdown, XLogRecPtr own_redo,
 						   const char **failure_out)
@@ -774,7 +805,7 @@ cluster_hw_startup_prepare(bool in_recovery, bool own_clean_shutdown, XLogRecPtr
 	if (failure_out == NULL)
 		return false;
 	*failure_out = "STARTUP_ROLE_OR_REGION";
-	if (!has_root && hw_state == NULL)
+	if (!cluster_shared_config && !has_root && hw_state == NULL)
 		return true; /* Non-cluster startup with no HW region. */
 	if (hw_state == NULL || hw_htab == NULL || (has_root && !AmStartupProcess()))
 		return false;
@@ -782,14 +813,27 @@ cluster_hw_startup_prepare(bool in_recovery, bool own_clean_shutdown, XLogRecPtr
 		*failure_out = "METADATA_IDENTITY";
 		return false;
 	}
-	mode = !has_root	 ? CLUSTER_HW_BOOT_DISABLED
-		   : in_recovery ? CLUSTER_HW_BOOT_EXISTING_RECOVERY
-						 : CLUSTER_HW_BOOT_NORMAL_SELF;
+	if (cluster_shared_config
+		&& (!has_root
+			|| (!in_recovery && (!own_clean_shutdown || XLogRecPtrIsInvalid(own_redo))))) {
+		*failure_out = "CANONICAL_SPACE_STARTUP_INPUT";
+		return false;
+	}
+	/* Native startup already owns the exact selected generation. This only
+	 * selects the reservation representation; it grants no SPACE access and
+	 * never publishes legacy cache READY. Buffer checkpoint/recovery owners
+	 * must still close canonical SPACE before allocation can resume. */
+	mode = cluster_shared_config ? CLUSTER_HW_BOOT_CANONICAL_SPACE
+		   : !has_root			 ? CLUSTER_HW_BOOT_DISABLED
+		   : in_recovery		 ? CLUSTER_HW_BOOT_EXISTING_RECOVERY
+								 : CLUSTER_HW_BOOT_NORMAL_SELF;
 	if (!pg_atomic_compare_exchange_u32(&hw_state->cold_boot_mode, &expected, mode)) {
 		*failure_out = "BOOT_MODE_ALREADY_SELECTED";
 		return false;
 	}
 	*failure_out = NULL;
+	if (mode == CLUSTER_HW_BOOT_EXISTING_RECOVERY && !cluster_hw_authority_active())
+		return hw_recovery_snapshot_load(own_redo);
 	if (mode != CLUSTER_HW_BOOT_NORMAL_SELF)
 		return true;
 	if (!own_clean_shutdown || XLogRecPtrIsInvalid(own_redo)) {
@@ -808,6 +852,14 @@ cluster_hw_startup_complete(const char **failure_out)
 	if (failure_out == NULL)
 		return false;
 	*failure_out = NULL;
+	if (cluster_shared_config) {
+		if (!AmStartupProcess() || !cluster_hw_metadata_configured()
+			|| mode != CLUSTER_HW_BOOT_CANONICAL_SPACE) {
+			*failure_out = "CANONICAL_SPACE_STARTUP_MODE";
+			return false;
+		}
+		return true;
+	}
 	if (mode == CLUSTER_HW_BOOT_DISABLED || (hw_state == NULL && !cluster_hw_metadata_configured()))
 		return true;
 	if (!AmStartupProcess() || !cluster_hw_metadata_configured()) {
@@ -888,11 +940,17 @@ cluster_hw_snapshot_checkpoint_write(XLogRecPtr redo_lsn)
 {
 	ClusterHwColdBootMode mode;
 	ClusterHwColdBootState state;
+	/* Shared reservations are already in the ordinary SPACE buffer/WAL
+	 * checkpoint domain. An empty master cache snapshot proves nothing. */
+	if (cluster_shared_config)
+		return;
 	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')
 		return;
 	mode = cluster_hw_cold_boot_mode();
 	state = cluster_hw_cold_boot_state();
-	if (mode == CLUSTER_HW_BOOT_EXISTING_RECOVERY && !cluster_hw_authority_active())
+	/* D S09 R-A15: a recovery that rebuilt snapshot+tail keeps it current. */
+	if (mode == CLUSTER_HW_BOOT_EXISTING_RECOVERY && !cluster_hw_authority_active()
+		&& state != CLUSTER_HW_REBUILT && state != CLUSTER_HW_READY)
 		return;
 	if (!cluster_hw_metadata_configured() || hw_state == NULL || hw_htab == NULL
 		|| (mode != CLUSTER_HW_BOOT_EXISTING_RECOVERY
@@ -921,6 +979,8 @@ cluster_hw_snapshot_checkpoint_write(XLogRecPtr redo_lsn)
 void
 cluster_hw_snapshot_adoption_write(void)
 {
+	if (cluster_shared_config)
+		return;
 	hw_snapshot_capture_and_write(CLUSTER_HW_SNAPSHOT_ADOPTION, GetXLogInsertRecPtr(),
 								  (uint32)cluster_epoch_get_current());
 }
@@ -948,7 +1008,7 @@ cluster_hw_snapshot_recovery_load(void)
 	ClusterHwSnapshotValidity v;
 	uint32 self;
 
-	if (hw_htab == NULL || !cluster_hw_authority_active())
+	if (cluster_shared_config || hw_htab == NULL || !cluster_hw_authority_active())
 		return;
 
 	self = (uint32)cluster_node_id;

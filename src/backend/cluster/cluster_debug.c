@@ -55,6 +55,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "access/xlog.h"
 
 #include "fmgr.h"
 #include "funcapi.h"
@@ -102,6 +103,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D7: undo buffer counters */
 #include "cluster/cluster_cr.h"				  /* cluster_cr_* counter accessors (spec-3.9 D8) */
 #include "cluster/cluster_r4_observe.h"
+#include "cluster/cluster_control_observe.h"
 #include "cluster/cluster_cr_pool.h"	   /* cluster_cr_pool_* counters (spec-5.51 D9) */
 #include "cluster/cluster_cr_admit.h"	   /* cluster_cr_admit_stat_* counters (spec-5.52 D9) */
 #include "cluster/cluster_cr_tuple.h"	   /* cluster_cr_tuple_stat_* counters (spec-5.54 D5) */
@@ -119,6 +121,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_pending.h"
 #include "cluster/cluster_grd_work_queue.h"
+#include "cluster/cluster_pi_writeback.h"
 #include "cluster/cluster_cssd.h"  /* cluster_cssd_status (spec-2.5 D12) */
 #include "cluster/cluster_stats.h" /* cluster_stats_status (spec-1.14 D12) */
 #include "cluster/cluster_undo_cleaner.h"
@@ -1375,6 +1378,7 @@ static void
 dump_grd_recovery(ReturnSetInfo *rsinfo)
 {
 	ClusterGrdRecoveryCounters c;
+	ClusterPiWritebackRejectionsV1 wb;
 	uint32 state;
 
 	cluster_grd_recovery_counters_snapshot(&c);
@@ -1395,6 +1399,12 @@ dump_grd_recovery(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_grd_recovery_done_bitmap_hash_for(cluster_node_id)));
 	emit_row(rsinfo, "grd_recovery", "block_redeclare_cursor",
 			 fmt_int32((int32)cluster_grd_recovery_block_redeclare_cursor()));
+	emit_row(rsinfo, "grd_recovery", "local_pi_redeclare_cursor",
+			 fmt_int32((int32)c.local_pi_redeclare_cursor));
+	emit_row(rsinfo, "grd_recovery", "block_redeclare_retries",
+			 fmt_int64((int64)c.block_redeclare_retries));
+	emit_row(rsinfo, "grd_recovery", "local_pi_redeclare_retries",
+			 fmt_int64((int64)c.local_pi_redeclare_retries));
 	emit_row(rsinfo, "grd_recovery", "block_redeclare_epoch",
 			 fmt_int64((int64)cluster_grd_recovery_block_redeclare_epoch()));
 	emit_row(rsinfo, "grd_recovery", "block_redeclare_done",
@@ -1430,6 +1440,30 @@ dump_grd_recovery(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)c.join_block_views_rebuilt));
 	emit_row(rsinfo, "grd_recovery", "join_block_recovering_failclosed",
 			 fmt_int64((int64)c.join_block_recovering_failclosed));
+	emit_row(rsinfo, "grd_recovery", "pi_rebuild_side_blocked",
+			 fmt_int64((int64)c.pi_rebuild_side_blocked));
+	emit_row(rsinfo, "grd_recovery", "pi_rebuild_apply_blocked",
+			 fmt_int64((int64)c.pi_rebuild_apply_blocked));
+	emit_row(rsinfo, "grd_recovery", "pi_rebuild_plan_blocked",
+			 fmt_int64((int64)c.pi_rebuild_plan_blocked));
+	if (cluster_pi_writeback_rejections_v1(&wb)) {
+		static const char *const keys[] = {
+			"pi_writeback_data_proof_rejected",		 "pi_writeback_local_ack_rejected",
+			"pi_writeback_remote_ack_rejected",		 "pi_writeback_master_cut_rejected",
+			"pi_writeback_peer_physical_rejected",	 "pi_writeback_recovery_proof_rejected",
+			"pi_writeback_structure_owner_rejected", "pi_writeback_contribution_plan_rejected"
+		};
+		StaticAssertDecl(lengthof(keys) == CLUSTER_PI_WRITEBACK_REJECTION_COUNT,
+						 "every PI rejection requires a dump key");
+		for (unsigned i = 0; i < lengthof(keys); i++)
+			emit_row(rsinfo, "grd_recovery", keys[i], psprintf(UINT64_FORMAT, wb.attempts[i]));
+		emit_row(rsinfo, "grd_recovery", "pi_writeback_rejection_logs",
+				 psprintf(UINT64_FORMAT, wb.log_events));
+		emit_row(rsinfo, "grd_recovery", "pi_writeback_last_plan_result",
+				 psprintf("%u", wb.last_plan_result));
+		emit_row(rsinfo, "grd_recovery", "pi_writeback_last_plan_detail",
+				 psprintf("%u", wb.last_plan_detail));
+	}
 	/* Shape A (crash-rejoin re-declare barrier): off-path crash-rejoin fence-arm
 	 * events (standalone counter, not part of the snapshot struct). */
 	emit_row(rsinfo, "grd_recovery", "offpath_crash_rejoin_fenced",
@@ -3705,6 +3739,44 @@ dump_wal_thread(ReturnSetInfo *rsinfo)
 		emit_row(rsinfo, "wal_thread", "registry_highest_scn",
 				 (ready && v == CLUSTER_WAL_SLOT_OK) ? fmt_int64((int64)slot.highest_scn) : "-");
 	}
+	/* Local immutable writer + last successfully published native checkpoint.
+	 * No CF/claim I/O, WAL scan, or recovery/retention permission is involved.
+	 * Logical byte spans are not allocated files or other generations' WAL. */
+	{
+		ClusterWalSourceRef ref;
+		ClusterWalThreadCheckpointSampleV1 sample;
+		bool writer = cluster_wal_thread_current_v2_ref(&ref);
+		bool observed = writer && cluster_wal_thread_checkpoint_sample_v1(&sample);
+		TimeLineID timeline = 0;
+		XLogRecPtr flushed = writer ? GetFlushRecPtr(&timeline) : InvalidXLogRecPtr;
+		bool current_flush = writer && timeline == ref.timeline && flushed != InvalidXLogRecPtr;
+		bool span = observed && current_flush && flushed >= sample.validated_tail;
+
+		emit_row(rsinfo, "wal_thread", "writer_node_id",
+				 writer ? fmt_int32(ref.claim.identity.origin_node_id) : "-");
+		emit_row(rsinfo, "wal_thread", "writer_boot_incarnation",
+				 writer ? fmt_uint64(ref.claim.identity.origin_owner_incarnation) : "-");
+		emit_row(rsinfo, "wal_thread", "writer_root_lineage",
+				 writer ? fmt_uint64(ref.claim.identity.root_lineage_seq) : "-");
+		emit_row(rsinfo, "wal_thread", "writer_config_ceiling",
+				 writer ? fmt_uint64(ref.claim.max_config_generation) : "-");
+		emit_row(rsinfo, "wal_thread", "observed_root_publish_seq",
+				 observed ? fmt_uint64(sample.root_publish_seq) : "-");
+		emit_row(rsinfo, "wal_thread", "observed_checkpoint_at_usec",
+				 observed ? fmt_int64(sample.published_at_usec) : "-");
+		emit_row(rsinfo, "wal_thread", "observed_retained_lower_lsn",
+				 observed ? fmt_uint64_hex(sample.retained_lower) : "-");
+		emit_row(rsinfo, "wal_thread", "observed_native_redo_lsn",
+				 observed ? fmt_uint64_hex(sample.native_redo) : "-");
+		emit_row(rsinfo, "wal_thread", "observed_validated_tail_lsn",
+				 observed ? fmt_uint64_hex(sample.validated_tail) : "-");
+		emit_row(rsinfo, "wal_thread", "native_flush_lsn",
+				 current_flush ? fmt_uint64_hex(flushed) : "-");
+		emit_row(rsinfo, "wal_thread", "observed_retained_history_bytes",
+				 observed ? fmt_uint64(sample.native_redo - sample.retained_lower) : "-");
+		emit_row(rsinfo, "wal_thread", "observed_to_flush_retained_bytes",
+				 span ? fmt_uint64(flushed - sample.retained_lower) : "-");
+	}
 }
 
 /*
@@ -4348,6 +4420,12 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		 */
 		dump_shmem(rsinfo);
 		dump_normal_start(rsinfo);
+		{
+			char *writer = cluster_control_observe_writer_json();
+			emit_row(rsinfo, "lifecycle", "native_writer", writer != NULL ? writer : "unavailable");
+			if (writer != NULL)
+				pfree(writer);
+		}
 		dump_guc(rsinfo);
 		dump_ic(rsinfo);
 		dump_inject(rsinfo);

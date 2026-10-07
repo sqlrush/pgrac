@@ -39,10 +39,13 @@
 
 #include "cluster/cluster_gcs_block.h" /* GcsBlockRequestPayload (pre-send hook) */
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_membership.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -68,7 +71,9 @@ typedef enum ClusterLmsOutboundKind {
 	CLUSTER_LMS_OUTBOUND_RESOURCE_X_INTENT = 3,
 	CLUSTER_LMS_OUTBOUND_RESOURCE_X_REMOTE_S_STATUS_PENDING = 4,
 	CLUSTER_LMS_OUTBOUND_RESOURCE_X_REMOTE_S_STATUS_READY = 5,
-	CLUSTER_LMS_OUTBOUND_RESOURCE_X_REMOTE_S_STATUS_CANCELLED = 6
+	CLUSTER_LMS_OUTBOUND_RESOURCE_X_REMOTE_S_STATUS_CANCELLED = 6,
+	CLUSTER_LMS_OUTBOUND_RESOURCE_X_REQUESTER = 7,
+	CLUSTER_LMS_OUTBOUND_BLOCK_REQUEST = 8
 } ClusterLmsOutboundKind;
 
 typedef struct ClusterLmsOutboundSlot {
@@ -83,12 +88,16 @@ typedef struct ClusterLmsOutboundSlot {
 	uint64 local_slot_cookie;
 	uint64 local_own_generation;
 	uint64 local_reservation_token;
+	/* Qualification of an unadmitted frame/request, never a wire proof. */
+	uint64 frame_epoch;
+	uint64 request_membership_generation;
+	uint64 request_stream_generation;
 	uint8 payload[PGRAC_LMS_OUTBOUND_PAYLOAD_MAX];
 } ClusterLmsOutboundSlot;
 
 StaticAssertDecl(PGRAC_LMS_OUTBOUND_PAYLOAD_MAX >= RESOURCE_X_PROOF_V1_BYTES,
 				 "LMS outbound slot must hold a Resource-X proof ACK");
-StaticAssertDecl(sizeof(ClusterLmsOutboundSlot) == 384,
+StaticAssertDecl(sizeof(ClusterLmsOutboundSlot) == 408,
 				 "LMS outbound slot capability guard layout changed");
 
 typedef struct ClusterLmsZeroBlockReplyWire {
@@ -103,6 +112,7 @@ typedef struct ClusterLmsOutboundState {
 	uint32 head; /* next slot to fill */
 	uint32 tail; /* next slot to drain */
 	uint32 count;
+	uint32 draining; /* reserved until this consumer returns retained frames */
 	uint64 next_remote_s_cookie;
 	ClusterLmsOutboundSlot ring[PGRAC_LMS_OUTBOUND_CAPACITY];
 } ClusterLmsOutboundState;
@@ -217,6 +227,10 @@ lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id
 	ClusterLmsOutboundState *ring;
 	LWLock *lock;
 	ClusterLmsOutboundSlot *slot;
+	bool block_request = false;
+	uint64 frame_epoch = 0;
+	uint64 membership_generation = 0;
+	uint64 stream_generation = 0;
 
 	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
 		return CLUSTER_LMS_ENQUEUE_INVALID;
@@ -224,19 +238,67 @@ lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id
 		return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
 	if (payload_len > PGRAC_LMS_OUTBOUND_PAYLOAD_MAX)
 		return CLUSTER_LMS_ENQUEUE_INVALID;
+	/* A PRE2 local request may precede the first DATA HELLO. Bind the
+	 * membership owner's non-reusable cut now, including both admitted
+	 * incarnations; an unknown cut cannot qualify a delayed physical send.
+	 * Forwarded requests and other transports keep their existing owners. */
+	if (cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1
+		&& msg_type == PGRAC_IC_MSG_GCS_BLOCK_REQUEST
+		&& payload_len == sizeof(GcsBlockRequestPayload) && payload != NULL
+		&& (int32)dest_node_id != cluster_node_id) {
+		GcsBlockRequestPayload request;
+
+		memcpy(&request, payload, sizeof(request));
+		if (request.sender_node == cluster_node_id) {
+			membership_generation = cluster_membership_cut_generation();
+			if (dest_node_id >= CLUSTER_MAX_NODES || request.request_id == 0
+				|| request.requester_backend_id <= 0 || membership_generation == 0
+				|| request.epoch != cluster_epoch_get_current()
+				|| cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER
+				|| cluster_membership_get_state((int32)dest_node_id) != CLUSTER_MEMBER_MEMBER
+				|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) == 0
+				|| cluster_membership_get_last_admitted_incarnation((int32)dest_node_id) == 0)
+				return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
+			stream_generation
+				= cluster_ic_tier1_resource_x_stream_generation((int32)dest_node_id, worker_id);
+			if (!cluster_membership_cut_generation_current(membership_generation)
+				|| request.epoch != cluster_epoch_get_current())
+				return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
+			block_request = true;
+		}
+	}
+	/* A plain DATA payload is wrapped only at send time. Keep its original
+	 * execution cut here so a reconnect cannot restamp a retained old frame
+	 * with a later epoch. INITIAL epoch zero is valid within the same cut. */
+	if (!block_request && cluster_shared_config && cluster_interconnect_tier == CLUSTER_IC_TIER_1) {
+		frame_epoch = cluster_epoch_get_current();
+		membership_generation = cluster_membership_cut_generation();
+		if (membership_generation == 0)
+			return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
+		if (dest_node_id < CLUSTER_MAX_NODES)
+			stream_generation
+				= cluster_ic_tier1_resource_x_stream_generation((int32)dest_node_id, worker_id);
+		if (!cluster_membership_cut_generation_current(membership_generation)
+			|| frame_epoch != cluster_epoch_get_current())
+			return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
+	}
 
 	ring = OB_RING(worker_id);
 	lock = OB_LOCK(worker_id);
 
 	LWLockAcquire(lock, LW_EXCLUSIVE);
-	if (ring->count >= PGRAC_LMS_OUTBOUND_CAPACITY) {
+	if (ring->count + ring->draining >= PGRAC_LMS_OUTBOUND_CAPACITY) {
 		LWLockRelease(lock);
 		return CLUSTER_LMS_ENQUEUE_FULL;
 	}
 	slot = &ring->ring[ring->head];
 	slot->dest_node_id = dest_node_id;
 	slot->msg_type = msg_type;
-	slot->kind = (uint8)CLUSTER_LMS_OUTBOUND_FRAME;
+	slot->kind = block_request ? (uint8)CLUSTER_LMS_OUTBOUND_BLOCK_REQUEST
+							   : (uint8)CLUSTER_LMS_OUTBOUND_FRAME;
+	slot->frame_epoch = frame_epoch;
+	slot->request_membership_generation = membership_generation;
+	slot->request_stream_generation = stream_generation;
 	slot->payload_len = payload_len;
 	slot->required_capability = required_capability;
 	slot->connection_generation = connection_generation;
@@ -300,7 +362,7 @@ cluster_lms_outbound_stage_resource_x_remote_s_status_exact(
 	lock = OB_LOCK(worker_id);
 
 	LWLockAcquire(lock, LW_EXCLUSIVE);
-	if (ring->count >= PGRAC_LMS_OUTBOUND_CAPACITY) {
+	if (ring->count + ring->draining >= PGRAC_LMS_OUTBOUND_CAPACITY) {
 		LWLockRelease(lock);
 		return CLUSTER_PCM_OWN_BUSY;
 	}
@@ -474,11 +536,12 @@ lms_outbound_resource_x_intent_valid(const ResourceXIntentSlot *intent)
 	case RESOURCE_X_INTENT_OWNER_HOLDER_STATUS:
 		return (intent->payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
 				|| intent->payload_bytes == RESOURCE_X_PROOF_V1_BYTES)
-			   && intent->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+			   && (intent->kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+				   || intent->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
 			   && intent->body.owner_generation == intent->logical_generation
 			   && intent->body.owner_index == 0;
 	case RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE:
-		return intent->payload_bytes == RESOURCE_X_IMAGE_V1_BYTES
+		return intent->payload_bytes == RESOURCE_X_IMAGE_V2_BYTES
 			   && intent->kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE
 			   && intent->body.assertion.requester_node == (int32)intent->destination_node
 			   && intent->body.owner_generation == intent->logical_generation
@@ -516,6 +579,7 @@ lms_outbound_resource_x_intent_msg_type(const ResourceXIntentSlot *intent)
 	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2:
 		return RESOURCE_X_MSG_BLOCK_TO_N;
 	case RESOURCE_X_WIRE_BLOCKED_TO_N:
+	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2:
 		return RESOURCE_X_MSG_BLOCKED_TO_N;
 	case RESOURCE_X_WIRE_AUTHORITY_GRANT:
 	case RESOURCE_X_WIRE_IMAGE_ENVELOPE:
@@ -539,7 +603,7 @@ lms_outbound_resource_x_intent_identity_equal(const ResourceXIntentSlot *left,
 		   && memcmp(&left->body, &right->body, sizeof(left->body)) == 0;
 }
 
-bool
+ClusterLmsEnqueueResult
 cluster_lms_outbound_enqueue_resource_x_intent(int worker_id, const ResourceXIntentSlot *intent,
 											   uint32 connection_generation, uint64 deadline_us)
 {
@@ -551,21 +615,21 @@ cluster_lms_outbound_enqueue_resource_x_intent(int worker_id, const ResourceXInt
 	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS || connection_generation == 0
 		|| deadline_us == 0 || !lms_outbound_resource_x_intent_valid(intent)
 		|| cluster_lms_outbound_rings == NULL || OB_LOCK(worker_id) == NULL)
-		return false;
+		return CLUSTER_LMS_ENQUEUE_INVALID;
 	ring = OB_RING(worker_id);
 	lock = OB_LOCK(worker_id);
 	now_us = lms_outbound_monotonic_us();
 	if (now_us == 0)
-		return false;
+		return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
 
 	/* Publish the ring slot only after the exact semantic owner changes to
 	 * STAGED.  Holding the ring lock across that owner mutation prevents a
 	 * concurrently polling destination worker from consuming an ARMED slot
 	 * before the transition becomes visible. */
 	LWLockAcquire(lock, LW_EXCLUSIVE);
-	if (ring->count >= PGRAC_LMS_OUTBOUND_CAPACITY) {
+	if (ring->count + ring->draining >= PGRAC_LMS_OUTBOUND_CAPACITY) {
 		LWLockRelease(lock);
-		return false;
+		return CLUSTER_LMS_ENQUEUE_FULL;
 	}
 	slot = &ring->ring[ring->head];
 	memset(slot, 0, sizeof(*slot));
@@ -579,33 +643,135 @@ cluster_lms_outbound_enqueue_resource_x_intent(int worker_id, const ResourceXInt
 	memcpy(slot->payload, intent, sizeof(*intent));
 	if (!lms_outbound_resource_x_transport_mutation_mark()) {
 		LWLockRelease(lock);
-		return false;
+		return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
 	}
 	{
 		ResourceXIntentResult stage_result;
+		ResourceXIntentSlot staged;
 
-		stage_result = cluster_pcm_lock_resource_x_outbound_intent_stage_exact(intent, now_us);
+		stage_result = cluster_pcm_lock_resource_x_outbound_intent_stage_capture_exact(
+			intent, now_us, &staged);
 		if (stage_result != RESOURCE_X_INTENT_STAGED) {
 			memset(slot, 0, sizeof(*slot));
 			LWLockRelease(lock);
-			return false;
+			return stage_result == RESOURCE_X_INTENT_NOT_DUE ? CLUSTER_LMS_ENQUEUE_NOT_DUE
+															 : CLUSTER_LMS_ENQUEUE_INVALID;
 		}
+		/* The ring carries the acquired episode, not the pre-stage snapshot. */
+		memcpy(slot->payload, &staged, sizeof(staged));
 	}
 	ring->head = (ring->head + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
 	ring->count++;
 	LWLockRelease(lock);
 	cluster_lms_wakeup(worker_id);
-	return true;
+	return CLUSTER_LMS_ENQUEUE_ADMITTED;
+}
+
+/* Reserve both ASSERT and optional LOCAL_PROOF before publishing either.
+ * The descriptor shares SD-90's exact tail/FIFO callbacks but is not a
+ * retained authority intent. The semantic round owns reconstruction. */
+ClusterLmsEnqueueResult
+cluster_lms_outbound_enqueue_resource_x_requester(int32 master,
+												  const ResourceXDecodedFrame *control,
+												  const ResourceXDecodedFrame *proof)
+{
+	uint8 payload[2][RESOURCE_X_SHORT_V1_BYTES];
+	uint16 length[2] = { 0, 0 };
+	ResourceXWireReject reject;
+	ResourceXIntentSlot ticket;
+	ResourceXIntentResult result;
+	ClusterLmsOutboundState *ring;
+	LWLock *lock;
+	uint32 count = proof == NULL ? 1 : 2;
+	uint64 now_us = lms_outbound_monotonic_us();
+	int worker;
+	if (master < 0 || master >= RESOURCE_X_PROTOCOL_NODE_LIMIT || control == NULL
+		|| (control->kind != RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP
+			&& control->kind != RESOURCE_X_WIRE_ASSERT_X)
+		|| (proof != NULL
+			&& (control->kind != RESOURCE_X_WIRE_ASSERT_X
+				|| proof->kind != RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION))
+		|| !cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, control, payload[0],
+										   sizeof(payload[0]), &length[0], &reject)
+		|| length[0] != RESOURCE_X_CONTROL_V1_BYTES
+		|| (proof != NULL
+			&& (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, proof, payload[1],
+												sizeof(payload[1]), &length[1], &reject)
+				|| length[1] != RESOURCE_X_SHORT_V1_BYTES)))
+		return CLUSTER_LMS_ENQUEUE_INVALID;
+	if (proof != NULL) {
+		ResourceXDecodedCommon expected = control->common, actual = proof->common;
+		expected.observed_mode = actual.observed_mode;
+		expected.outcome = RESOURCE_X_OUTCOME_OK;
+		expected.semantic_crc32c = actual.semantic_crc32c = 0;
+		if (memcmp(&expected, &actual, sizeof(expected)) != 0)
+			return CLUSTER_LMS_ENQUEUE_INVALID;
+	}
+	worker = cluster_lms_shard_for_tag(&control->common.logical_assertion.resource,
+									   cluster_lms_workers);
+	if (worker < 0 || worker >= CLUSTER_LMS_MAX_WORKERS || cluster_lms_outbound_rings == NULL
+		|| OB_LOCK(worker) == NULL || now_us == 0 || now_us == UINT64_MAX)
+		return CLUSTER_LMS_ENQUEUE_INVALID;
+	lock = OB_LOCK(worker);
+	ring = OB_RING(worker);
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+	if (ring->count + ring->draining > PGRAC_LMS_OUTBOUND_CAPACITY - count) {
+		LWLockRelease(lock);
+		return CLUSTER_LMS_ENQUEUE_FULL;
+	}
+	if (!lms_outbound_resource_x_transport_mutation_mark()) {
+		LWLockRelease(lock);
+		return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
+	}
+	result = cluster_pcm_lock_resource_x_requester_send_begin_exact(control, master, count, now_us,
+																	&ticket);
+	if (result != RESOURCE_X_INTENT_STAGED) {
+		LWLockRelease(lock);
+		return result == RESOURCE_X_INTENT_NOT_DUE ? CLUSTER_LMS_ENQUEUE_NOT_DUE
+												   : CLUSTER_LMS_ENQUEUE_INVALID;
+	}
+	for (uint32 i = 0; i < count; i++) {
+		ClusterLmsOutboundSlot *slot = &ring->ring[ring->head];
+		memset(slot, 0, sizeof(*slot));
+		ticket.body.owner_index = i;
+		ticket.payload_bytes = length[i];
+		slot->kind = CLUSTER_LMS_OUTBOUND_RESOURCE_X_REQUESTER;
+		slot->msg_type = RESOURCE_X_MSG_ASSERT_X;
+		slot->dest_node_id = master;
+		slot->payload_len = sizeof(ticket) + length[i];
+		slot->required_capability = PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+		slot->connection_generation = control->common.sender_connection_generation;
+		memcpy(slot->payload, &ticket, sizeof(ticket));
+		memcpy(slot->payload + sizeof(ticket), payload[i], length[i]);
+		ring->head = (ring->head + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
+		ring->count++;
+	}
+	LWLockRelease(lock);
+	cluster_lms_wakeup(worker);
+	return CLUSTER_LMS_ENQUEUE_ADMITTED;
+}
+
+void
+cluster_lms_outbound_resource_x_send_complete(const ResourceXIntentSlot *intent, bool sent)
+{
+	if (sent && intent != NULL && intent->state == RESOURCE_X_INTENT_SLOT_STAGED
+		&& intent->send_episode != 0 && intent->last_send_us != 0)
+		cluster_pcm_rx_metric_note(PCM_RX_RESEND);
+	if (intent != NULL && intent->body.owner_kind == RESOURCE_X_INTENT_OWNER_REQUESTER_SEND)
+		(void)cluster_pcm_lock_resource_x_requester_send_complete_exact(
+			intent, sent, lms_outbound_monotonic_us());
+	else
+		(void)cluster_pcm_lock_resource_x_outbound_transport_complete_exact(
+			intent, sent, lms_outbound_monotonic_us());
 }
 
 int
 cluster_lms_outbound_resource_x_intent_pump(void)
 {
 	ResourceXIntentSlot intent;
-	uint8 payload[RESOURCE_X_IMAGE_V1_BYTES];
+	uint8 payload[RESOURCE_X_IMAGE_V2_BYTES];
 	int staged = 0;
 	int call;
-	bool scan_more = false;
 
 	Assert(MyBackendType == B_LMS);
 	for (call = 0; call < PGRAC_LMS_RESOURCE_X_CALLS_PER_TICK; call++) {
@@ -617,7 +783,7 @@ cluster_lms_outbound_resource_x_intent_pump(void)
 		uint64 now_us;
 		uint64 timeout_us;
 		int worker_id;
-		bool enqueued;
+		ClusterLmsEnqueueResult enqueue_result;
 		ResourceXAcquisitionRef delivery;
 
 		probe_result = cluster_pcm_lock_resource_x_outbound_work_probe_exact(
@@ -628,15 +794,16 @@ cluster_lms_outbound_resource_x_intent_pump(void)
 			break;
 		if (probe_result == RESOURCE_X_INTENT_PROBE_CORRUPT)
 			break;
-		if (probe_result == RESOURCE_X_INTENT_PROBE_MORE) {
-			scan_more = true;
+		if (probe_result == RESOURCE_X_INTENT_PROBE_MORE)
 			continue;
-		}
-		scan_more = false;
 		if (probe_result == RESOURCE_X_INTENT_PROBE_DELIVERY) {
 			/* A local callback is not a packet and consumes the same bounded
 			 * call budget. BUSY waits for the existing event-loop tick. */
 			(void)cluster_gcs_block_resource_x_delivery_tick(&delivery);
+			continue;
+		}
+		if (probe_result == RESOURCE_X_INTENT_PROBE_SOURCE_SETTLEMENT) {
+			(void)cluster_gcs_block_resource_x_source_settlement_tick(&delivery);
 			continue;
 		}
 		if (probe_result == RESOURCE_X_INTENT_PROBE_SOURCE_FINISH) {
@@ -671,17 +838,17 @@ cluster_lms_outbound_resource_x_intent_pump(void)
 		 * new Resource-X operation timeout or runtime policy. */
 		timeout_us = (uint64)Max(cluster_gcs_reply_timeout_ms, 1) * UINT64_C(1000);
 		deadline_us = now_us > UINT64_MAX - timeout_us ? UINT64_MAX : now_us + timeout_us;
-		enqueued = cluster_lms_outbound_enqueue_resource_x_intent(
+		enqueue_result = cluster_lms_outbound_enqueue_resource_x_intent(
 			worker_id, &intent, connection_generation, deadline_us);
-		if (enqueued)
+		if (enqueue_result == CLUSTER_LMS_ENQUEUE_ADMITTED)
 			staged++;
-		else
+		else if (enqueue_result != CLUSTER_LMS_ENQUEUE_NOT_DUE)
 			(void)cluster_pcm_lock_resource_x_outbound_intent_not_admitted_exact(&intent, now_us);
 	}
-	/* Preserve the frozen 4-probe/call and 16-call/iteration bounds without
-	 * turning a truthful MORE cursor into an artificial 100ms idle period.
-	 * The existing LMS latch schedules only the next bounded iteration. */
-	if (scan_more)
+	/* Resume an exhausted scan even when its last probe found work.  A
+	 * terminal probe ends the scan without a continuation wake, including
+	 * after BUSY callbacks.  Each iteration keeps the same 4/16 bounds. */
+	if (call == PGRAC_LMS_RESOURCE_X_CALLS_PER_TICK)
 		cluster_lms_wakeup(0);
 	return staged;
 }
@@ -740,7 +907,7 @@ lms_outbound_enqueue_zero_block_reply_internal(int worker_id, uint32 dest_node_i
 	ring = OB_RING(worker_id);
 	lock = OB_LOCK(worker_id);
 	LWLockAcquire(lock, LW_EXCLUSIVE);
-	if (ring->count >= PGRAC_LMS_OUTBOUND_CAPACITY) {
+	if (ring->count + ring->draining >= PGRAC_LMS_OUTBOUND_CAPACITY) {
 		LWLockRelease(lock);
 		return false;
 	}
@@ -783,6 +950,62 @@ cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(int worker_id, uint32 de
 		return false;
 	return lms_outbound_enqueue_zero_block_reply_internal(
 		worker_id, dest_node_id, header, false, required_capability, connection_generation);
+}
+
+/* A missing first DATA stream leaves the logical request owned by this ring.
+ * Once a stream has been sampled, even an unadmitted frame cannot be rebound
+ * across its loss/replacement. A changed membership cut also invalidates any
+ * old boot, including a request that never had a DATA stream. These checks
+ * qualify a send only; all original serving and receive-side gates remain. */
+static bool
+lms_outbound_frame_current(ClusterLmsOutboundSlot *slot, int worker)
+{
+	uint64 stream;
+
+	if (!cluster_shared_config || cluster_interconnect_tier != CLUSTER_IC_TIER_1)
+		return true;
+	if (slot->dest_node_id >= CLUSTER_MAX_NODES || slot->frame_epoch != cluster_epoch_get_current()
+		|| !cluster_membership_cut_generation_current(slot->request_membership_generation))
+		return false;
+	stream = cluster_ic_tier1_resource_x_stream_generation((int32)slot->dest_node_id, worker);
+	if ((slot->request_stream_generation != 0 && slot->request_stream_generation != stream)
+		|| slot->frame_epoch != cluster_epoch_get_current()
+		|| !cluster_membership_cut_generation_current(slot->request_membership_generation))
+		return false;
+	/* An unbound first connection may become usable; an observed connection
+	 * loss or replacement may not inherit the old queue entry. */
+	if (stream != 0)
+		slot->request_stream_generation = stream;
+	return true;
+}
+
+static bool
+lms_outbound_block_request_current(ClusterLmsOutboundSlot *slot, int worker, bool *wait_peer)
+{
+	GcsBlockRequestPayload request;
+	uint64 stream;
+
+	*wait_peer = false;
+	if (slot->msg_type != PGRAC_IC_MSG_GCS_BLOCK_REQUEST || slot->payload_len != sizeof(request)
+		|| slot->dest_node_id >= CLUSTER_MAX_NODES || (int32)slot->dest_node_id == cluster_node_id)
+		return false;
+	memcpy(&request, slot->payload, sizeof(request));
+	if (request.sender_node != cluster_node_id || request.request_id == 0
+		|| request.requester_backend_id <= 0 || request.epoch != cluster_epoch_get_current()
+		|| !cluster_membership_cut_generation_current(slot->request_membership_generation)
+		|| cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER
+		|| cluster_membership_get_state((int32)slot->dest_node_id) != CLUSTER_MEMBER_MEMBER)
+		return false;
+	stream = cluster_ic_tier1_resource_x_stream_generation((int32)slot->dest_node_id, worker);
+	if ((slot->request_stream_generation != 0 && slot->request_stream_generation != stream)
+		|| !cluster_membership_cut_generation_current(slot->request_membership_generation)
+		|| request.epoch != cluster_epoch_get_current())
+		return false;
+	if (stream == 0)
+		*wait_peer = true;
+	else
+		slot->request_stream_generation = stream;
+	return true;
 }
 
 /*
@@ -843,12 +1066,13 @@ cluster_lms_outbound_drain_send(int worker_id)
 		ResourceXIntentSlot resource_x_intent;
 		ResourceXIntentSlot resource_x_current;
 		ResourceXWireReject resource_x_reject = RESOURCE_X_WIRE_REJECT_NONE;
-		uint8 resource_x_payload[RESOURCE_X_IMAGE_V1_BYTES];
+		uint8 resource_x_payload[RESOURCE_X_IMAGE_V2_BYTES];
 		const void *send_payload;
 		uint32 send_payload_len;
 		ClusterICSendResult rc;
 		uint64 now_us;
 		bool resource_x_slot = false;
+		bool requester_slot = false;
 		bool remote_s_pending_slot = false;
 		bool remote_s_status_slot = false;
 		bool remote_s_cancelled_slot = false;
@@ -865,14 +1089,17 @@ cluster_lms_outbound_drain_send(int worker_id)
 				= slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_RESOURCE_X_REMOTE_S_STATUS_READY;
 			remote_s_cancelled_slot
 				= slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_RESOURCE_X_REMOTE_S_STATUS_CANCELLED;
-			resource_x_owned_slot = slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_RESOURCE_X_INTENT;
+			resource_x_owned_slot
+				= slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_RESOURCE_X_INTENT
+				  || slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_RESOURCE_X_REQUESTER;
 			if (!remote_s_pending_slot && !remote_s_status_slot) {
 				if (resource_x_owned_slot && !lms_outbound_resource_x_transport_mutation_mark()) {
 					LWLockRelease(lock);
-					return sent;
+					goto finish_batch;
 				}
 				ring->tail = (ring->tail + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
 				ring->count--;
+				ring->draining++;
 			}
 			got = true;
 		}
@@ -886,6 +1113,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 			continue;
 		memset(&resource_x_intent, 0, sizeof(resource_x_intent));
 		resource_x_slot = slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_RESOURCE_X_INTENT;
+		requester_slot = slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_RESOURCE_X_REQUESTER;
 		if (remote_s_status_slot
 			&& (slot.msg_type != RESOURCE_X_MSG_BLOCKED_TO_N
 				|| slot.payload_len != RESOURCE_X_CONTROL_V1_BYTES
@@ -897,6 +1125,18 @@ cluster_lms_outbound_drain_send(int worker_id)
 			memcpy(&resource_x_intent, slot.payload, sizeof(resource_x_intent));
 			if (slot.msg_type != lms_outbound_resource_x_intent_msg_type(&resource_x_intent))
 				continue;
+		}
+		if (requester_slot) {
+			if (slot.payload_len < sizeof(resource_x_intent))
+				continue;
+			memcpy(&resource_x_intent, slot.payload, sizeof(resource_x_intent));
+			if (slot.msg_type != RESOURCE_X_MSG_ASSERT_X
+				|| resource_x_intent.body.owner_kind != RESOURCE_X_INTENT_OWNER_REQUESTER_SEND
+				|| slot.payload_len != sizeof(resource_x_intent) + resource_x_intent.payload_bytes
+				|| !cluster_pcm_lock_resource_x_requester_send_current_exact(&resource_x_intent)) {
+				cluster_lms_outbound_resource_x_send_complete(&resource_x_intent, false);
+				continue;
+			}
 		}
 		/* Wire-version-sensitive slots are valid only for the exact
 		 * connection generation whose HELLO advertised the required bit.
@@ -911,7 +1151,9 @@ cluster_lms_outbound_drain_send(int worker_id)
 						(int32)slot.dest_node_id, slot.required_capability,
 						slot.connection_generation)))) {
 			cluster_lms_obs_note_outbound_cap_guard_drop(worker_id);
-			if (resource_x_slot) {
+			if (requester_slot)
+				cluster_lms_outbound_resource_x_send_complete(&resource_x_intent, false);
+			else if (resource_x_slot) {
 				(void)cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
 					&resource_x_intent, lms_outbound_monotonic_us());
 			}
@@ -931,6 +1173,8 @@ cluster_lms_outbound_drain_send(int worker_id)
 					sizeof(resource_x_payload))
 					!= RESOURCE_X_APPLY_APPLIED
 				|| resource_x_current.state != RESOURCE_X_INTENT_SLOT_STAGED
+				|| resource_x_current.send_episode != resource_x_intent.send_episode
+				|| resource_x_current.last_attempt_us != resource_x_intent.last_attempt_us
 				|| !lms_outbound_resource_x_intent_identity_equal(&resource_x_intent,
 																  &resource_x_current))
 				continue;
@@ -947,6 +1191,9 @@ cluster_lms_outbound_drain_send(int worker_id)
 					&resource_x_intent, lms_outbound_monotonic_us());
 				continue;
 			}
+		} else if (requester_slot) {
+			send_payload = slot.payload + sizeof(resource_x_intent);
+			send_payload_len = resource_x_intent.payload_bytes;
 		} else if (remote_s_status_slot) {
 			uint32 capability_word = 0;
 			uint32 connection_generation = 0;
@@ -995,16 +1242,36 @@ cluster_lms_outbound_drain_send(int worker_id)
 			zero_reply.header.checksum = cluster_gcs_block_compute_checksum(zero_reply.block_data);
 			send_payload = &zero_reply;
 			send_payload_len = sizeof(zero_reply);
-		} else if (slot.kind != (uint8)CLUSTER_LMS_OUTBOUND_FRAME) {
+		} else if (slot.kind != (uint8)CLUSTER_LMS_OUTBOUND_FRAME
+				   && slot.kind != (uint8)CLUSTER_LMS_OUTBOUND_BLOCK_REQUEST) {
 			rc = CLUSTER_IC_SEND_HARD_ERROR;
 			goto handle_send_result;
 		}
+		if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_BLOCK_REQUEST) {
+			bool wait_peer;
+
+			if (!lms_outbound_block_request_current(&slot, worker_id, &wait_peer))
+				continue;
+			if (wait_peer) {
+				/* No physical send or direct receive arm before HELLO. The
+				 * ordinary DATA event loop will revisit this exact slot. */
+				rc = CLUSTER_IC_SEND_NOT_ADMITTED;
+				goto handle_send_result;
+			}
+		}
+		if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_FRAME
+			&& !lms_outbound_frame_current(&slot, worker_id))
+			continue;
 
 		/* A peer that refused a frame this batch keeps its later frames
 		 * queued BEHIND the refused one (per-peer order). */
 		if (slot.dest_node_id < CLUSTER_MAX_NODES && peer_blocked[slot.dest_node_id]) {
 			if (remote_s_status_slot)
 				break;
+			if (requester_slot) {
+				cluster_lms_outbound_resource_x_send_complete(&resource_x_intent, false);
+				continue;
+			}
 			if (resource_x_slot) {
 				(void)cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
 					&resource_x_intent, lms_outbound_monotonic_us());
@@ -1042,7 +1309,11 @@ cluster_lms_outbound_drain_send(int worker_id)
 				rc = CLUSTER_IC_SEND_DONE;
 			else
 				rc = CLUSTER_IC_SEND_HARD_ERROR;
-		} else
+		} else if (resource_x_slot || requester_slot)
+			rc = cluster_ic_tier1_send_resource_x_intent(slot.msg_type, (int32)slot.dest_node_id,
+														 send_payload, send_payload_len,
+														 &resource_x_intent);
+		else
 			rc = cluster_ic_send_envelope(slot.msg_type, (int32)slot.dest_node_id, send_payload,
 										  send_payload_len);
 
@@ -1057,23 +1328,19 @@ cluster_lms_outbound_drain_send(int worker_id)
 		case CLUSTER_IC_SEND_DONE:
 		case CLUSTER_IC_SEND_WOULD_BLOCK:
 			/* On the wire or admitted (transport owns a copy). */
-			if (resource_x_slot) {
-				if (resource_x_intent.body.owner_kind == RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE)
-					(void)cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
-						&resource_x_intent, lms_outbound_monotonic_us());
-				else
-					(void)cluster_pcm_lock_resource_x_outbound_intent_complete_exact(
-						&resource_x_intent);
-			}
+			/* WB is still owned by the exact tier1 tail/FIFO.  It completes
+			 * through the same callback only after all bytes leave that owner. */
+			if ((resource_x_slot || requester_slot) && rc == CLUSTER_IC_SEND_DONE)
+				cluster_lms_outbound_resource_x_send_complete(&resource_x_intent, true);
 			if (remote_s_status_slot) {
 				LWLockAcquire(lock, LW_EXCLUSIVE);
 				if (ring->count == 0 || memcmp(&ring->ring[ring->tail], &slot, sizeof(slot)) != 0) {
 					LWLockRelease(lock);
-					return sent;
+					goto finish_batch;
 				}
 				if (!lms_outbound_resource_x_transport_mutation_mark()) {
 					LWLockRelease(lock);
-					return sent;
+					goto finish_batch;
 				}
 				memset(&ring->ring[ring->tail], 0, sizeof(ring->ring[ring->tail]));
 				ring->tail = (ring->tail + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
@@ -1090,7 +1357,9 @@ cluster_lms_outbound_drain_send(int worker_id)
 			}
 			if (slot.dest_node_id < CLUSTER_MAX_NODES)
 				peer_blocked[slot.dest_node_id] = true;
-			if (resource_x_slot)
+			if (requester_slot)
+				cluster_lms_outbound_resource_x_send_complete(&resource_x_intent, false);
+			else if (resource_x_slot)
 				(void)cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
 					&resource_x_intent, lms_outbound_monotonic_us());
 			else {
@@ -1107,7 +1376,9 @@ cluster_lms_outbound_drain_send(int worker_id)
 				stop_after_remote_s = true;
 				break;
 			}
-			if (resource_x_slot)
+			if (requester_slot)
+				cluster_lms_outbound_resource_x_send_complete(&resource_x_intent, false);
+			else if (resource_x_slot)
 				(void)cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
 					&resource_x_intent, lms_outbound_monotonic_us());
 			break;
@@ -1116,15 +1387,15 @@ cluster_lms_outbound_drain_send(int worker_id)
 			break;
 	}
 
-	/* Put retained frames back at the head, original order preserved
-	 * (reverse-order head pushes).  count can only have grown from
-	 * producers since the dequeues above, so a full ring is possible:
-	 * count the drop — the retransmit machinery self-heals, but the S3
-	 * gate treats a nonzero delta as a capacity red flag. */
-	if (n_retained > 0) {
+finish_batch:
+	/* Producers cannot reuse this batch's reserved capacity before its
+	 * unadmitted frames return. Restore per-peer order before releasing
+	 * that capacity; a first request must not disappear on concurrent refill. */
+	{
 		int i;
 
 		LWLockAcquire(lock, LW_EXCLUSIVE);
+		Assert(n_retained <= (int)ring->draining);
 		for (i = n_retained - 1; i >= 0; i--) {
 			if (ring->count >= PGRAC_LMS_OUTBOUND_CAPACITY) {
 				cluster_lms_obs_note_outbound_requeue_drop(worker_id);
@@ -1135,6 +1406,7 @@ cluster_lms_outbound_drain_send(int worker_id)
 			ring->ring[ring->tail] = retained[i];
 			ring->count++;
 		}
+		ring->draining = 0;
 		LWLockRelease(lock);
 	}
 
@@ -1155,7 +1427,7 @@ cluster_lms_outbound_depth(int worker_id)
 	ring = OB_RING(worker_id);
 	lock = OB_LOCK(worker_id);
 	LWLockAcquire(lock, LW_SHARED);
-	depth = ring->count;
+	depth = ring->count + ring->draining;
 	LWLockRelease(lock);
 	return depth;
 }
@@ -1195,10 +1467,11 @@ cluster_lms_outbound_normal_stop_poll(int *worker_out, uint32 *slot_out, const c
 		uint32 bad_slot = UINT32_MAX;
 
 		if (ring->head >= PGRAC_LMS_OUTBOUND_CAPACITY || ring->tail >= PGRAC_LMS_OUTBOUND_CAPACITY
-			|| ring->count > PGRAC_LMS_OUTBOUND_CAPACITY
+			|| ring->count > PGRAC_LMS_OUTBOUND_CAPACITY || ring->draining > 64
+			|| ring->count + ring->draining > PGRAC_LMS_OUTBOUND_CAPACITY
 			|| (ring->tail + ring->count) % PGRAC_LMS_OUTBOUND_CAPACITY != ring->head)
 			invalid_reason = "OUTBOUND_RING_GEOMETRY";
-		else if (worker >= cluster_lms_workers && ring->count != 0)
+		else if (worker >= cluster_lms_workers && (ring->count != 0 || ring->draining != 0))
 			invalid_reason = "OUTBOUND_INACTIVE_RING";
 		else {
 			for (uint32 offset = 0; offset < ring->count; offset++) {
@@ -1206,7 +1479,7 @@ cluster_lms_outbound_normal_stop_poll(int *worker_out, uint32 *slot_out, const c
 				const ClusterLmsOutboundSlot *slot = &ring->ring[index];
 
 				if (slot->dest_node_id >= CLUSTER_MAX_NODES
-					|| slot->kind > CLUSTER_LMS_OUTBOUND_RESOURCE_X_REMOTE_S_STATUS_CANCELLED
+					|| slot->kind > CLUSTER_LMS_OUTBOUND_BLOCK_REQUEST
 					|| slot->payload_len > PGRAC_LMS_OUTBOUND_PAYLOAD_MAX) {
 					invalid_reason = "OUTBOUND_FRAME_INVALID";
 					bad_slot = index;
@@ -1221,7 +1494,7 @@ cluster_lms_outbound_normal_stop_poll(int *worker_out, uint32 *slot_out, const c
 			result = CLUSTER_NORMAL_STOP_INVALID;
 			break;
 		}
-		if (ring->count != 0 && result == CLUSTER_NORMAL_STOP_READY) {
+		if ((ring->count != 0 || ring->draining != 0) && result == CLUSTER_NORMAL_STOP_READY) {
 			*worker_out = worker;
 			*slot_out = ring->tail;
 			*reason_out = "OUTBOUND_FRAME_PENDING";
@@ -1288,6 +1561,7 @@ cluster_lms_outbound_resource_x_transport_snapshot(ClusterLmsResourceXTransportS
 				= &ring->ring[(ring->tail + offset) % PGRAC_LMS_OUTBOUND_CAPACITY];
 
 			if (slot->kind == (uint8)CLUSTER_LMS_OUTBOUND_RESOURCE_X_INTENT
+				|| slot->kind == (uint8)CLUSTER_LMS_OUTBOUND_RESOURCE_X_REQUESTER
 				|| slot->kind == (uint8)CLUSTER_LMS_OUTBOUND_RESOURCE_X_REMOTE_S_STATUS_PENDING
 				|| slot->kind == (uint8)CLUSTER_LMS_OUTBOUND_RESOURCE_X_REMOTE_S_STATUS_READY)
 				out->staged_count++;

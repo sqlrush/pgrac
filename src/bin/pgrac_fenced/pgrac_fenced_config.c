@@ -12,7 +12,11 @@
 #include <unistd.h>
 
 #include "common/cryptohash.h"
+#include "common/pgrac_external_fence_protocol.h"
+#include "common/pgrac_fence_map.h"
 #include "pgrac_fenced_config.h"
+#include "pgrac_fenced_provider.h"
+#include "pgrac_fenced_cib.h"
 
 #define PGRAC_FENCED_CONFIG_MAX_LINE (8192 + 64)
 
@@ -272,9 +276,101 @@ done:
 	return config_fd;
 }
 
-PgracFencedConfigResult
-pgrac_fenced_config_parse_v1(const uint8 *bytes, size_t len,
-						 PgracFencedConfigV1 *out)
+static bool
+parse_digest(const ConfigLine *line, uint8 digest[32])
+{
+	size_t decoded = 0;
+
+	return line->value_len == 64
+		&& parse_hex(line->value, line->value_len, digest, 32, &decoded, true)
+		&& decoded == 32;
+}
+
+static bool
+native_name_valid(const uint8 *text, size_t length)
+{
+	if (length == 0 || length >= PGRAC_FENCED_NATIVE_NAME_BYTES)
+		return false;
+	for (size_t n = 0; n < length; n++) {
+		uint8 ch = text[n];
+		bool alnum
+			= (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
+		if (!alnum && (n == 0 || (ch != '-' && ch != '_' && ch != '.')))
+			return false;
+	}
+	return true;
+}
+
+static bool
+native_path_valid(const uint8 *text, size_t length)
+{
+	size_t start = 1;
+	if (length < 2 || length >= MAXPGPATH || text[0] != '/' || text[length - 1] == '/')
+		return false;
+	for (size_t n = 1; n <= length; n++) {
+		uint8 ch = n == length ? '/' : text[n];
+		if (ch == '/') {
+			size_t component = n - start;
+			if (component == 0 || (component == 1 && text[start] == '.')
+				|| (component == 2 && text[start] == '.' && text[start + 1] == '.'))
+				return false;
+			start = n + 1;
+		} else if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')
+					 || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.'))
+			return false;
+	}
+	return true;
+}
+
+static bool
+native_text(const ConfigLine *line, char *out, bool path)
+{
+	if (!(path ? native_path_valid(line->value, line->value_len)
+			   : native_name_valid(line->value, line->value_len)))
+		return false;
+	memcpy(out, line->value, line->value_len);
+	out[line->value_len] = '\0';
+	return true;
+}
+
+/* Optional only as a whole, and never positive admission when absent. All
+ * bytes remain covered by the daemon's original semantic configuration hash.
+ */
+static bool
+parse_native_fields(const uint8 *bytes, size_t len, size_t *offset, PgracFencedNativeConfigV1 *out)
+{
+	static const char *const keys[]
+		= { "pacemaker_resource",	   "pacemaker_configuration_digest", "target_inventory_digest",
+			"target_drain_public_key", "target_bundle_directory",		 "target_client_config" };
+	size_t cursor = *offset;
+	ConfigLine line;
+	if (!next_line(bytes, len, &cursor, &line))
+		return false;
+	if (!key_equal(&line, keys[0]))
+		return true;
+	if (!native_text(&line, out->resource, false))
+		return false;
+	for (unsigned n = 1; n < lengthof(keys); n++) {
+		if (!next_line(bytes, len, &cursor, &line) || !key_equal(&line, keys[n]))
+			return false;
+		if (n <= 3) {
+			uint8 *value = n == 1 ? out->cib_digest
+								  : (n == 2 ? out->inventory_digest : out->drain_public_key);
+			if (!parse_digest(&line, value))
+				return false;
+		} else if (!native_text(&line, n == 4 ? out->bundle_directory : out->client_config, true))
+			return false;
+	}
+	if (!pgrac_fence_ed25519_key_acceptable(out->drain_public_key))
+		return false;
+	out->present = true;
+	*offset = cursor;
+	return true;
+}
+
+static PgracFencedConfigResult
+parse_global_fields(const uint8 *bytes, size_t len, size_t *offset,
+	uint32 version, PgracFencedConfigV1 *out)
 {
 	static const char *const global_keys[] = {
 		"format_version", "mapping_generation", "system_identifier",
@@ -282,20 +378,12 @@ pgrac_fenced_config_parse_v1(const uint8 *bytes, size_t len,
 		"allowed_db_gid", "provider_id", "provider_abi"
 	};
 	uint64 values[9];
-	size_t offset = 0;
 	ConfigLine line;
-	uint32 last_node = 0;
-	bool have_last_node = false;
 	int i;
 
-	if (bytes == NULL || out == NULL || len == 0)
-		return PGRAC_FENCED_CONFIG_BAD_ARGUMENT;
-	memset(out, 0, sizeof(*out));
-	if (len > PGRAC_FENCED_CONFIG_MAX_BYTES)
-		return PGRAC_FENCED_CONFIG_TOO_LARGE;
 	for (i = 0; i < 9; i++)
 	{
-		if (!next_line(bytes, len, &offset, &line) ||
+		if (!next_line(bytes, len, offset, &line) ||
 			!key_equal(&line, global_keys[i]))
 			return PGRAC_FENCED_CONFIG_NONCANONICAL;
 		if (i == 4)
@@ -308,11 +396,14 @@ pgrac_fenced_config_parse_v1(const uint8 *bytes, size_t len,
 						 &values[i]))
 			return PGRAC_FENCED_CONFIG_VALUE_INVALID;
 	}
-	if (values[0] != 1 || values[1] == 0 || values[2] == 0 ||
+	if (values[0] != version || values[1] == 0 || values[2] == 0 ||
 		(values[3] != 2 && values[3] != 3) ||
 		values[5] > UINT32_MAX || values[6] > UINT32_MAX ||
 		values[7] > UINT16_MAX || values[7] == UINT16_MAX ||
 		values[8] != 1)
+		return PGRAC_FENCED_CONFIG_VALUE_INVALID;
+	if ((version == 2) != (values[7] == PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1)
+		|| (version == 2 && values[3] != 3))
 		return PGRAC_FENCED_CONFIG_VALUE_INVALID;
 	out->format_version = (uint32) values[0];
 	out->mapping_generation = values[1];
@@ -322,24 +413,53 @@ pgrac_fenced_config_parse_v1(const uint8 *bytes, size_t len,
 	out->allowed_db_gid = values[6];
 	out->provider_id = (uint16) values[7];
 	out->provider_abi = (uint16) values[8];
+	if (version == 2
+		&& (!next_line(bytes, len, offset, &line) || !key_equal(&line, "map_public_key")
+			|| !parse_digest(&line, out->map_public_key)))
+		return PGRAC_FENCED_CONFIG_VALUE_INVALID;
+	if (version == 2 && !parse_native_fields(bytes, len, offset, &out->native))
+		return PGRAC_FENCED_CONFIG_VALUE_INVALID;
+	return PGRAC_FENCED_CONFIG_OK;
+}
+
+static PgracFencedConfigResult
+parse_node_fields(const uint8 *bytes, size_t len, size_t offset, PgracFencedConfigV1 *out)
+{
+	uint32 last_node = 0;
+	bool have_last_node = false;
 
 	while (offset < len)
 	{
+		ConfigLine line;
 		ConfigLine adapter;
 		uint8 target_uuid[PGRAC_FENCED_UUID_BYTES];
 		uint32 node_id;
 		uint32 adapter_node_id;
 		uint32 prior_node;
 		size_t adapter_len = 0;
+		uint8 digest[32];
 
 		if (!next_line(bytes, len, &offset, &line) ||
 			!parse_node_key(&line, ".target_uuid", &node_id) ||
-			!next_line(bytes, len, &offset, &adapter) ||
-			!parse_node_key(&adapter, ".adapter_data", &adapter_node_id) ||
-			adapter_node_id != node_id ||
 			(have_last_node && node_id <= last_node) ||
 			out->nodes[node_id].present ||
-			!parse_uuid(&line, target_uuid) ||
+			!parse_uuid(&line, target_uuid))
+			return PGRAC_FENCED_CONFIG_NONCANONICAL;
+		if (out->native.present &&
+			(!next_line(bytes, len, &offset, &line) ||
+			 !parse_node_key(&line, ".pacemaker_name", &adapter_node_id) ||
+			 adapter_node_id != node_id ||
+			 !native_text(&line, out->native.node_names[node_id], false)))
+			return PGRAC_FENCED_CONFIG_NONCANONICAL;
+		if (out->format_version == 2
+			&& (!next_line(bytes, len, &offset, &line)
+				|| !parse_node_key(&line, ".protected_set_digest", &adapter_node_id)
+				|| adapter_node_id != node_id
+				|| !parse_digest(&line, out->nodes[node_id].protected_set_digest)))
+			return PGRAC_FENCED_CONFIG_NONCANONICAL;
+		if (!next_line(bytes, len, &offset, &adapter) ||
+			!parse_node_key(&adapter, ".adapter_data", &adapter_node_id) ||
+			adapter_node_id != node_id ||
 			!parse_hex(adapter.value, adapter.value_len,
 					   out->nodes[node_id].adapter_data,
 					   PGRAC_FENCED_ADAPTER_DATA_MAX_BYTES,
@@ -349,14 +469,19 @@ pgrac_fenced_config_parse_v1(const uint8 *bytes, size_t len,
 			 prior_node++)
 		{
 			if (out->nodes[prior_node].present &&
-				memcmp(out->nodes[prior_node].target_uuid, target_uuid,
-					   sizeof(target_uuid)) == 0)
+				(memcmp(out->nodes[prior_node].target_uuid, target_uuid,
+					   sizeof(target_uuid)) == 0 ||
+				 (out->native.present && strcmp(out->native.node_names[node_id],
+					out->native.node_names[prior_node]) == 0)))
 				return PGRAC_FENCED_CONFIG_VALUE_INVALID;
 		}
 		memcpy(out->nodes[node_id].target_uuid, target_uuid,
 			   sizeof(target_uuid));
 		out->nodes[node_id].adapter_data_len = (uint16) adapter_len;
 		out->nodes[node_id].present = true;
+		if (out->format_version == 2
+			&& !pgrac_fenced_config_protected_set_digest(out, node_id, digest))
+			return PGRAC_FENCED_CONFIG_VALUE_INVALID;
 		out->node_count++;
 		last_node = node_id;
 		have_last_node = true;
@@ -364,4 +489,131 @@ pgrac_fenced_config_parse_v1(const uint8 *bytes, size_t len,
 	if (out->node_count == 0)
 		return PGRAC_FENCED_CONFIG_VALUE_INVALID;
 	return PGRAC_FENCED_CONFIG_OK;
+}
+
+static PgracFencedConfigResult
+parse_config(const uint8 *bytes, size_t len, uint32 version, PgracFencedConfigV1 *out)
+{
+	PgracFencedConfigResult result;
+	size_t offset = 0;
+
+	if (out == NULL)
+		return PGRAC_FENCED_CONFIG_BAD_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (bytes == NULL || len == 0)
+		return PGRAC_FENCED_CONFIG_BAD_ARGUMENT;
+	if (len > PGRAC_FENCED_CONFIG_MAX_BYTES)
+		return PGRAC_FENCED_CONFIG_TOO_LARGE;
+	result = parse_global_fields(bytes, len, &offset, version, out);
+	if (result == PGRAC_FENCED_CONFIG_OK)
+		result = parse_node_fields(bytes, len, offset, out);
+	if (result != PGRAC_FENCED_CONFIG_OK)
+		memset(out, 0, sizeof(*out));
+	return result;
+}
+
+PgracFencedConfigResult
+pgrac_fenced_config_parse_v1(const uint8 *bytes, size_t len, PgracFencedConfigV1 *out)
+{
+	return parse_config(bytes, len, 1, out);
+}
+
+PgracFencedConfigResult
+pgrac_fenced_config_parse(const uint8 *bytes, size_t len, PgracFencedConfigV1 *out)
+{
+	static const char v2_prefix[] = "format_version=2\n";
+	uint32 version = 1;
+
+	if (bytes != NULL && len >= sizeof(v2_prefix) - 1
+		&& memcmp(bytes, v2_prefix, sizeof(v2_prefix) - 1) == 0)
+		version = 2;
+	return parse_config(bytes, len, version, out);
+}
+
+bool
+pgrac_fenced_config_protected_set_digest(const PgracFencedConfigV1 *config,
+	int32 node_id, uint8 digest[32])
+{
+	PgracFenceMapExpectedV2 expected;
+	PgracProtectedSetDecodedV2 decoded;
+	const PgracFencedNodeConfigV1 *node;
+
+	if (digest == NULL)
+		return false;
+	memset(digest, 0, PGRAC_FENCED_CONFIG_DIGEST_BYTES);
+	if (config == NULL || node_id < 0 || node_id >= PGRAC_FENCED_MAX_NODES
+		|| !config->nodes[node_id].present)
+		return false;
+	if (config->format_version == 1
+		&& config->provider_id != PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1)
+		return pgrac_external_fence_protected_set_digest_v1(config->storage_backend_id,
+			config->storage_uuid, digest);
+	if (config->format_version != 2 || config->storage_backend_id != 3
+		|| config->provider_id != PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1)
+		return false;
+	node = &config->nodes[node_id];
+	if (node->adapter_data_len > sizeof(node->adapter_data))
+		return false;
+	memset(&expected, 0, sizeof(expected));
+	expected.system_identifier = config->system_identifier;
+	expected.victim_node_id = node_id;
+	expected.mapping_generation = config->mapping_generation;
+	memcpy(expected.protected_set_digest, node->protected_set_digest, 32);
+	if (pgrac_fence_map_v2_verify(node->adapter_data, node->adapter_data_len,
+		config->map_public_key, &expected, &decoded) != PGRAC_FENCE_MAP_OK
+		|| memcmp(decoded.set.guest_uuid, node->target_uuid, 16) != 0
+		|| memcmp(decoded.set.storage_uuid, config->storage_uuid, 16) != 0)
+		return false;
+	memcpy(digest, expected.protected_set_digest, 32);
+	return true;
+}
+
+bool
+pgrac_fenced_config_cib_policy(const PgracFencedConfigV1 *config, PgracFencedCibPolicy *policy,
+							   PgracFencedCibNode *nodes, size_t capacity)
+{
+	PgracFencedCibPolicy candidate = { 0 };
+	uint8 digest[32];
+	static const uint8 zero[32] = { 0 };
+	StaticAssertDecl(PGRAC_FENCED_NATIVE_NAME_BYTES == PGRAC_CIB_NAME_BYTES,
+					 "native policy name sizes must match");
+	if (policy == NULL)
+		return false;
+	memset(policy, 0, sizeof(*policy));
+	if (nodes == NULL || capacity == 0 || capacity > PGRAC_CIB_POLICY_MAX_NODES)
+		return false;
+	memset(nodes, 0, capacity * sizeof(*nodes));
+	if (config == NULL || config->format_version != 2 || !config->native.present
+		|| config->node_count == 0 || config->node_count > capacity
+		|| !native_name_valid((const uint8 *)config->native.resource,
+							  strnlen(config->native.resource, sizeof(config->native.resource)))
+		|| memcmp(config->native.cib_digest, zero, sizeof(zero)) == 0)
+		return false;
+	for (unsigned n = 0; n < PGRAC_FENCED_MAX_NODES; n++) {
+		const char *name = config->native.node_names[n];
+		size_t length = strnlen(name, PGRAC_FENCED_NATIVE_NAME_BYTES);
+		if (!config->nodes[n].present)
+			continue;
+		if (candidate.node_count >= config->node_count
+			|| !native_name_valid((const uint8 *)name, length)
+			|| !pgrac_fenced_config_protected_set_digest(config, n, digest))
+			goto fail;
+		for (unsigned prior = 0; prior < candidate.node_count; prior++)
+			if (strcmp(name, nodes[prior].name) == 0
+				|| memcmp(config->nodes[n].target_uuid, nodes[prior].guest_uuid, 16) == 0)
+				goto fail;
+		memcpy(nodes[candidate.node_count].name, name, length + 1);
+		memcpy(nodes[candidate.node_count].guest_uuid, config->nodes[n].target_uuid, 16);
+		candidate.node_count++;
+	}
+	if (candidate.node_count != config->node_count)
+		goto fail;
+	memcpy(candidate.resource, config->native.resource, sizeof(candidate.resource));
+	memcpy(candidate.configuration_digest, config->native.cib_digest, 32);
+	candidate.nodes = nodes;
+	*policy = candidate;
+	return true;
+fail:
+	memset(nodes, 0, capacity * sizeof(*nodes));
+	return false;
 }

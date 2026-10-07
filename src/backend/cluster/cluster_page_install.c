@@ -233,6 +233,16 @@ rf_page_storage_install_execute_v1(const RfPageStorageInstallRequestV1 *request,
 			write_required[i] = true;
 			continue;
 		}
+		if (authority->covers_version != NULL && token != 0) {
+			RfPageVersionV1 observed = component->expected_result;
+
+			observed.mutation_token = token;
+			if (authority->covers_version(authority->arg, &component->page_identity, &observed,
+										  &component->expected_result)) {
+				write_required[i] = true;
+				continue;
+			}
+		}
 		detail = release_after_failure(authority, RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH);
 		goto done;
 	}
@@ -307,7 +317,8 @@ struct RfPageSmgrPreopenV1 {
 
 typedef struct RfPageSmgrAuthorityContextV1 {
 	const RfPageInstallAuthorityOpsV1 *delegate;
-	bool promoted;
+	/* Read after the PG_TRY longjmp when storage or post-read throws. */
+	volatile bool promoted;
 } RfPageSmgrAuthorityContextV1;
 
 static SMgrRelation
@@ -428,6 +439,16 @@ page_smgr_authority_release(void *arg)
 	return true;
 }
 
+static bool
+page_smgr_authority_covers_version(void *arg, const RfPageIdentityV1 *identity,
+								   const RfPageVersionV1 *version, const RfPageVersionV1 *result)
+{
+	RfPageSmgrAuthorityContextV1 *context = (RfPageSmgrAuthorityContextV1 *)arg;
+
+	return context->promoted && context->delegate->covers_version != NULL
+		   && context->delegate->covers_version(context->delegate->arg, identity, version, result);
+}
+
 RfPageProofDetailV1
 rf_page_storage_smgr_preopen_v1(const RfPageStorageInstallRequestV1 *request,
 								RfPageSmgrPreopenV1 **out_preopen)
@@ -497,6 +518,8 @@ rf_page_storage_install_smgr_preopened_v1(const RfPageStorageInstallRequestV1 *r
 	authority.promote = page_smgr_authority_promote;
 	authority.publish = page_smgr_authority_publish;
 	authority.release = page_smgr_authority_release;
+	if (request->authority->covers_version != NULL)
+		authority.covers_version = page_smgr_authority_covers_version;
 	smgr_request = *request;
 	smgr_request.storage = &storage;
 	smgr_request.authority = &authority;

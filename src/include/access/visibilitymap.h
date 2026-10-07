@@ -18,6 +18,7 @@
 #include "access/xlogdefs.h"
 #include "storage/block.h"
 #include "storage/buf.h"
+#include "storage/relfilelocator.h"
 #include "utils/relcache.h"
 
 /* Macros for visibilitymap test */
@@ -28,6 +29,10 @@
 
 extern bool visibilitymap_clear(Relation rel, BlockNumber heapBlk,
 								Buffer vmbuf, uint8 flags);
+/* PGRAC: original heap WAL consumers; never use runtime version initialization. */
+struct XLogReaderState;
+extern void visibilitymap_clear_redo(struct XLogReaderState *record,
+									 RelFileLocator locator, BlockNumber heapBlk, uint8 flags);
 /* PGRAC: in-crit variant, map page content lock held by the caller. */
 extern bool visibilitymap_clear_locked(Relation rel, BlockNumber heapBlk,
 									   Buffer vmbuf, uint8 flags);
@@ -36,9 +41,21 @@ extern void visibilitymap_pin(Relation rel, BlockNumber heapBlk,
 extern bool visibilitymap_pin_recent(Relation rel, BlockNumber heapBlk,
 								 Buffer recent_buffer, Buffer *vmbuf);
 extern bool visibilitymap_pin_ok(BlockNumber heapBlk, Buffer vmbuf);
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: callers copy this identity before acquiring page content locks. */
+struct ClusterSpaceIdentity;
+/* True only after exact shared VM replay; false selects native nonshared redo. */
+extern bool visibilitymap_set_versioned_redo(struct XLogReaderState *record,
+											RelFileLocator locator, BlockNumber heapBlk,
+											uint8 flags);
+#endif
 extern void visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 							  XLogRecPtr recptr, Buffer vmBuf, TransactionId cutoff_xid,
-							  uint8 flags);
+							  uint8 flags
+#ifdef USE_PGRAC_CLUSTER
+							  , const struct ClusterSpaceIdentity *identity
+#endif
+							  );
 struct ResourceXAuxiliaryAcquireContext;
 /* False means not executed; caller releases/requalifies its outer heap proof.
  * InvalidBuffer means the lower handoff already released the old pin. */
@@ -49,10 +66,20 @@ extern bool visibilitymap_clear_retry_aware(Relation rel, BlockNumber heapBlk, B
 extern bool visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 										  XLogRecPtr recptr, Buffer *vmbuf,
 										  TransactionId cutoff_xid, uint8 flags,
-										  struct ResourceXAuxiliaryAcquireContext *context);
+										  struct ResourceXAuxiliaryAcquireContext *context
+#ifdef USE_PGRAC_CLUSTER
+										  , const struct ClusterSpaceIdentity *identity
+#endif
+										  );
 extern uint8 visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *vmbuf);
 extern void visibilitymap_count(Relation rel, BlockNumber *all_visible, BlockNumber *all_frozen);
 extern BlockNumber visibilitymap_prepare_truncate(Relation rel,
 												  BlockNumber nheapblocks);
+#ifdef USE_PGRAC_CLUSTER
+/* Read-only cold structural preparation. A surviving tail must already be
+ * clear; never initialize or mutate it. Output is unchanged on refusal. */
+extern bool visibilitymap_prepare_cold_truncate(Relation rel, BlockNumber nheapblocks,
+											  BlockNumber *newnblocks);
+#endif
 
 #endif							/* VISIBILITYMAP_H */

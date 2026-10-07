@@ -299,6 +299,8 @@ UT_TEST(actual_hio_disabled_local_and_cancellation_boundaries)
 static BlockNumber hio_target;
 static int hio_data_reads, hio_extensions, hio_fsm_calls, hio_dirties;
 static bool hio_extension_unlock;
+static unsigned hio_identity_reads, hio_versioned_inits;
+static bool hio_identity_missing;
 
 static void
 hio_assert_no_vm_wait(void)
@@ -334,11 +336,13 @@ hio_fsm(void)
 }
 
 static Buffer
-hio_extend(Relation relation, BulkInsertState state, int num_pages, bool use_fsm, bool *unlocked)
+hio_extend(Relation relation, BulkInsertState state, int num_pages, bool use_fsm, bool *unlocked,
+		   const struct ClusterSpaceIdentity *identity)
 {
 	PageHeader page = (PageHeader)hio_pages[1].data;
 
 	hio_assert_no_vm_wait();
+	UT_ASSERT((identity != NULL) == cluster_shared_config);
 	hio_extensions++;
 	hio_refs[1]++;
 	page->pd_upper = page->pd_special = BLCKSZ;
@@ -357,6 +361,31 @@ hio_init(Page page, Size size, Size special)
 
 	header->pd_lower = SizeOfPageHeaderData;
 	header->pd_upper = header->pd_special = size - special;
+}
+
+static bool
+hio_identity_read(Relation relation, ClusterSpaceIdentity *out)
+{
+	hio_assert_no_vm_wait();
+	UT_ASSERT(relation == &relation_data);
+	hio_identity_reads++;
+	if (hio_identity_missing)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->key.locator = relation->rd_locator;
+	return true;
+}
+
+static bool
+hio_versioned_init(const ClusterSpaceIdentity *identity, Buffer buffer)
+{
+	UT_ASSERT(hio_locks[buffer - 1] && hio_refs[buffer - 1] > 0);
+	UT_ASSERT(RelFileLocatorEquals(identity->key.locator, relation_data.rd_locator));
+	hio_versioned_inits++;
+	hio_init(hio_pages[buffer - 1].data, BLCKSZ, 0);
+	((PageHeader)hio_pages[buffer - 1].data)->pd_block_scn = 91;
+	hio_dirties++;
+	return true;
 }
 
 static void
@@ -384,6 +413,11 @@ hio_unlock_release(Buffer buffer)
 #define RecordPageWithFreeSpace(relation, block, size) ((void)hio_fsm())
 #define RelationGetNumberOfBlocks(relation) 2
 #define RelationAddBlocks hio_extend
+#define cluster_smgr_which_for(locator, backend) 1
+#define cluster_space_relation_get_identity hio_identity_read
+#define cluster_space_init_heap_buffer_wal hio_versioned_init
+#undef RelationNeedsWAL
+#define RelationNeedsWAL(relation) true
 #define cluster_hw_lease_active() false
 #define cluster_hio_lease_target_block(relation) InvalidBlockNumber
 #define BufferGetPageSize(buffer) BLCKSZ
@@ -397,6 +431,60 @@ hio_unlock_release(Buffer buffer)
 Buffer hio_allocate(Relation relation, Size len, Buffer other, int options, BulkInsertState state,
 					Buffer *vm, Buffer *other_vm, int num_pages);
 #include "test_cluster_heap_hio_allocate.inc"
+
+UT_TEST(actual_shared_hio_reads_identity_before_locks_and_versions_existing_zero)
+{
+	Buffer vm = 3, other_vm = 3, result;
+
+	hio_reset(false);
+	cluster_shared_config = true;
+	hio_identity_reads = hio_versioned_inits = 0;
+	hio_identity_missing = false;
+	hio_target = 1;
+	hio_data_reads = hio_extensions = hio_fsm_calls = hio_dirties = 0;
+	hio_refs[0] = 1;
+	hio_refs[2] = 2;
+	memset(hio_pages[1].data, 0, BLCKSZ);
+	result = hio_allocate(&relation_data, 80, 1, 0, NULL, &vm, &other_vm, 1);
+	UT_ASSERT_EQ(result, 2);
+	UT_ASSERT_EQ(hio_identity_reads, 1);
+	UT_ASSERT_EQ(hio_versioned_inits, 1);
+	UT_ASSERT_EQ(hio_extensions, 0);
+	UT_ASSERT_EQ(hio_dirties, 1);
+	UT_ASSERT_EQ(((PageHeader)hio_pages[1].data)->pd_block_scn, 91);
+	UT_ASSERT(hio_locks[0] && hio_locks[1]);
+	UT_ASSERT_EQ(hio_wait_pin_conflicts, 0);
+	cluster_shared_config = false;
+}
+
+UT_TEST(actual_shared_hio_missing_identity_stops_before_page_access)
+{
+	Buffer vm = 3, other_vm = 3;
+	PGAlignedBlock saved;
+
+	hio_reset(false);
+	cluster_shared_config = true;
+	hio_identity_reads = hio_versioned_inits = 0;
+	hio_identity_missing = true;
+	hio_target = 1;
+	hio_data_reads = hio_extensions = hio_fsm_calls = hio_dirties = 0;
+	hio_refs[0] = 1;
+	hio_refs[2] = 2;
+	saved = hio_pages[1];
+	if (sigsetjmp(failure_jump, 0) == 0) {
+		(void)hio_allocate(&relation_data, 80, 1, 0, NULL, &vm, &other_vm, 1);
+		UT_ASSERT(false);
+	}
+	UT_ASSERT_EQ(hio_identity_reads, 1);
+	UT_ASSERT_EQ(hio_versioned_inits + hio_data_reads + hio_extensions + hio_dirties, 0);
+	UT_ASSERT(!hio_locks[0] && !hio_locks[1]);
+	UT_ASSERT_EQ(hio_refs[2], 0);
+	UT_ASSERT_EQ(vm, InvalidBuffer);
+	UT_ASSERT_EQ(other_vm, InvalidBuffer);
+	UT_ASSERT(memcmp(saved.data, hio_pages[1].data, BLCKSZ) == 0);
+	hio_identity_missing = false;
+	cluster_shared_config = false;
+}
 
 UT_TEST(actual_hio_allocation_reads_and_locks_without_incoming_vm_pins)
 {

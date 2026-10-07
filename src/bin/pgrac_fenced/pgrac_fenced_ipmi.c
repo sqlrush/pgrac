@@ -911,6 +911,29 @@ ipmi_fd_prepare(int fd, bool nonblocking)
 	return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
+/* Match the original fork session, or report only an observed disappearance.
+ * The latter is not success: the parent must still collect the exact child's
+ * exit status, as after the original ESRCH branch.  No other error qualifies.
+ */
+static bool
+ipmi_group_already_exact(pid_t pid, pid_t session, bool *vanished)
+{
+	pid_t observed;
+
+	if (vanished != NULL)
+		*vanished = false;
+	observed = getpgid(pid);
+	if (observed == pid)
+	{
+		observed = getsid(pid);
+		if (observed == session)
+			return true;
+	}
+	if (vanished != NULL && observed < 0 && errno == ESRCH)
+		*vanished = true;
+	return false;
+}
+
 static bool
 ipmi_pipe_drain(int *fd, uint8 *destination, size_t *used, bool *overflow)
 {
@@ -963,19 +986,22 @@ pgrac_fenced_ipmi_command_run_fd(
 	int stderr_pipe[2] = {-1, -1};
 	int status = 0;
 	bool child_done = false;
+	bool child_reaped_early = false;
 	bool owns_process_group;
 	bool overflow = false;
 	bool ok = false;
 	uint64 now;
 	pid_t pid = -1;
+	pid_t session;
 
 	if (out == NULL)
 		return false;
 	memset(out, 0, sizeof(*out));
 	out->exit_code = -1;
+	session = getsid(0);
 	owns_process_group =
 		pgrac_fenced_provider_callback_deadline_mono_ns() == 0;
-	if (executable_fd < 0 || invocation == NULL || invocation->argc != 16 ||
+	if (session <= 0 || executable_fd < 0 || invocation == NULL || invocation->argc != 16 ||
 		invocation->argv[0] == NULL || invocation->argv[16] != NULL ||
 		(!owns_process_group &&
 		 pgrac_fenced_provider_callback_deadline_mono_ns() !=
@@ -996,7 +1022,9 @@ pgrac_fenced_ipmi_command_run_fd(
 	{
 		(void) close(stdout_pipe[0]);
 		(void) close(stderr_pipe[0]);
-		if ((owns_process_group ? setpgid(0, 0) != 0 :
+		if ((owns_process_group ?
+			 (setpgid(0, 0) != 0 &&
+			  !(errno == EPERM && ipmi_group_already_exact(getpid(), session, NULL))) :
 			 getpgrp() != getppid()) ||
 			dup2(stdout_pipe[1], STDOUT_FILENO) < 0 ||
 			dup2(stderr_pipe[1], STDERR_FILENO) < 0)
@@ -1008,7 +1036,28 @@ pgrac_fenced_ipmi_command_run_fd(
 	}
 	if (owns_process_group && setpgid(pid, pid) != 0 && errno != EACCES &&
 		errno != ESRCH)
-		goto done;
+	{
+		bool vanished;
+		pid_t waited;
+
+		if (errno != EPERM)
+			goto done;
+		if (!ipmi_group_already_exact(pid, session, &vanished))
+		{
+			/* A fast command can exit before the parent's redundant setpgid.
+			 * The unreaped child still pins its PID.  Do not infer completion
+			 * from ESRCH: collect that exact child without waiting. */
+			if (!vanished)
+				goto done;
+			do
+			{
+				waited = waitpid(pid, &status, WNOHANG);
+			} while (waited < 0 && errno == EINTR);
+			if (waited != pid)
+				goto done;
+			child_reaped_early = true;
+		}
+	}
 	(void) close(stdout_pipe[1]);
 	stdout_pipe[1] = -1;
 	(void) close(stderr_pipe[1]);
@@ -1020,10 +1069,18 @@ pgrac_fenced_ipmi_command_run_fd(
 		int poll_rc;
 		int timeout_ms;
 
-		do
+		if (child_reaped_early)
 		{
-			waited = waitpid(pid, &status, WNOHANG);
-		} while (waited < 0 && errno == EINTR);
+			waited = pid;
+			child_reaped_early = false;
+		}
+		else
+		{
+			do
+			{
+				waited = waitpid(pid, &status, WNOHANG);
+			} while (waited < 0 && errno == EINTR);
+		}
 		if (waited == pid)
 			child_done = true;
 		else if (waited < 0)

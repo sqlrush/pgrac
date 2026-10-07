@@ -654,6 +654,8 @@ LZ4
 UUID_LIBS
 LDAP_LIBS_BE
 LDAP_LIBS_FE
+PACEMAKER_LIBS
+PACEMAKER_CFLAGS
 with_ssl
 PTHREAD_CFLAGS
 PTHREAD_LIBS
@@ -698,7 +700,6 @@ LDFLAGS_EX
 ZSTD_LIBS
 ZSTD_CFLAGS
 with_zstd
-with_rdma
 LZ4_LIBS
 LZ4_CFLAGS
 with_lz4
@@ -770,6 +771,8 @@ GENHTML
 LCOV
 GCOV
 enable_injection_points
+with_pacemaker
+with_rdma
 enable_cluster
 enable_debug
 enable_rpath
@@ -840,6 +843,8 @@ enable_spinlocks
 enable_atomics
 enable_debug
 enable_cluster
+with_rdma
+with_pacemaker
 enable_injection_points
 enable_profiling
 enable_coverage
@@ -877,7 +882,6 @@ with_system_tzdata
 with_zlib
 with_lz4
 with_zstd
-with_rdma
 with_ssl
 with_openssl
 enable_largefile
@@ -912,6 +916,8 @@ LDFLAGS_EX
 LDFLAGS_SL
 PERL
 PYTHON
+PACEMAKER_CFLAGS
+PACEMAKER_LIBS
 MSGFMT
 TCLSH'
 
@@ -1559,6 +1565,9 @@ Optional Packages:
   --with-libraries=DIRS   look for additional libraries in DIRS
   --with-libs=DIRS        alternative spelling of --with-libraries
   --with-pgport=PORTNUM   set default port number [5432]
+  --with-rdma             build with RDMA interconnect support
+  --with-pacemaker        build the native Pacemaker fencing client (Linux
+                          only)
   --with-blocksize=BLOCKSIZE
                           set table block size in kB [8]
   --with-segsize=SEGSIZE  set table segment size in GB [1]
@@ -1594,7 +1603,6 @@ Optional Packages:
   --without-zlib          do not use Zlib
   --with-lz4              build with LZ4 support
   --with-zstd             build with ZSTD support
-  --with-rdma             build with RDMA interconnect support
   --with-ssl=LIB          use LIB for SSL/TLS support (openssl)
   --with-openssl          obsolete spelling of --with-ssl=openssl
 
@@ -1629,6 +1637,10 @@ Some influential environment variables:
   LDFLAGS_SL  extra linker flags for linking shared libraries only
   PERL        Perl program
   PYTHON      Python program
+  PACEMAKER_CFLAGS
+              C compiler flags for PACEMAKER, overriding pkg-config
+  PACEMAKER_LIBS
+              linker flags for PACEMAKER, overriding pkg-config
   MSGFMT      msgfmt program for NLS
   TCLSH       Tcl interpreter program (tclsh)
 
@@ -3403,9 +3415,11 @@ fi
 
 
 
+
 #
 # PGRAC: --with-rdma (optional RDMA interconnect provider)
 #
+
 
 
 # Check whether --with-rdma was given.
@@ -3431,6 +3445,33 @@ fi
 
 
 
+# PGRAC: optional native fencing client; no implicit dependency or CLI fallback.
+
+
+
+# Check whether --with-pacemaker was given.
+if test "${with_pacemaker+set}" = set; then :
+  withval=$with_pacemaker;
+  case $withval in
+    yes)
+      :
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --with-pacemaker option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  with_pacemaker=no
+
+fi
+
+
+
+
 #
 # PGRAC: --enable-injection-points (build test-only visibility injection)
 #
@@ -3439,6 +3480,7 @@ fi
 # keeps production binaries inert while allowing TAP/perf workflows to opt
 # into the test-only D5b visibility path.
 #
+
 
 # Check whether --enable-injection-points was given.
 if test "${enable_injection_points+set}" = set; then :
@@ -3461,6 +3503,7 @@ else
   enable_injection_points=no
 
 fi
+
 
 
 
@@ -13251,6 +13294,152 @@ elif test "$with_ssl" != no ; then
 fi
 
 
+# PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+# Keep the privileged frontend dependency separate from postgres/libpq linkage.
+if test "$with_pacemaker" = yes ; then
+  if test "$PORTNAME" != linux -o "$enable_cluster" != yes -o "$with_ssl" != openssl ; then
+    as_fn_error $? "--with-pacemaker requires Linux, --enable-cluster and --with-ssl=openssl" "$LINENO" 5
+  fi
+
+pkg_failed=no
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking for pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6" >&5
+$as_echo_n "checking for pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6... " >&6; }
+
+if test -n "$PACEMAKER_CFLAGS"; then
+    pkg_cv_PACEMAKER_CFLAGS="$PACEMAKER_CFLAGS"
+ elif test -n "$PKG_CONFIG"; then
+    if test -n "$PKG_CONFIG" && \
+    { { $as_echo "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6\""; } >&5
+  ($PKG_CONFIG --exists --print-errors "pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6") 2>&5
+  ac_status=$?
+  $as_echo "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
+  test $ac_status = 0; }; then
+  pkg_cv_PACEMAKER_CFLAGS=`$PKG_CONFIG --cflags "pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6" 2>/dev/null`
+		      test "x$?" != "x0" && pkg_failed=yes
+else
+  pkg_failed=yes
+fi
+ else
+    pkg_failed=untried
+fi
+if test -n "$PACEMAKER_LIBS"; then
+    pkg_cv_PACEMAKER_LIBS="$PACEMAKER_LIBS"
+ elif test -n "$PKG_CONFIG"; then
+    if test -n "$PKG_CONFIG" && \
+    { { $as_echo "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6\""; } >&5
+  ($PKG_CONFIG --exists --print-errors "pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6") 2>&5
+  ac_status=$?
+  $as_echo "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
+  test $ac_status = 0; }; then
+  pkg_cv_PACEMAKER_LIBS=`$PKG_CONFIG --libs "pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6" 2>/dev/null`
+		      test "x$?" != "x0" && pkg_failed=yes
+else
+  pkg_failed=yes
+fi
+ else
+    pkg_failed=untried
+fi
+
+
+
+if test $pkg_failed = yes; then
+        { $as_echo "$as_me:${as_lineno-$LINENO}: result: no" >&5
+$as_echo "no" >&6; }
+
+if $PKG_CONFIG --atleast-pkgconfig-version 0.20; then
+        _pkg_short_errors_supported=yes
+else
+        _pkg_short_errors_supported=no
+fi
+        if test $_pkg_short_errors_supported = yes; then
+	        PACEMAKER_PKG_ERRORS=`$PKG_CONFIG --short-errors --print-errors --cflags --libs "pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6" 2>&1`
+        else
+	        PACEMAKER_PKG_ERRORS=`$PKG_CONFIG --print-errors --cflags --libs "pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6" 2>&1`
+        fi
+	# Put the nasty error message in config.log where it belongs
+	echo "$PACEMAKER_PKG_ERRORS" >&5
+
+	as_fn_error $? "Package requirements (pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6) were not met:
+
+$PACEMAKER_PKG_ERRORS
+
+Consider adjusting the PKG_CONFIG_PATH environment variable if you
+installed software in a non-standard prefix.
+
+Alternatively, you may set the environment variables PACEMAKER_CFLAGS
+and PACEMAKER_LIBS to avoid the need to call pkg-config.
+See the pkg-config man page for more details." "$LINENO" 5
+elif test $pkg_failed = untried; then
+        { $as_echo "$as_me:${as_lineno-$LINENO}: result: no" >&5
+$as_echo "no" >&6; }
+	{ { $as_echo "$as_me:${as_lineno-$LINENO}: error: in \`$ac_pwd':" >&5
+$as_echo "$as_me: error: in \`$ac_pwd':" >&2;}
+as_fn_error $? "The pkg-config script could not be found or is too old.  Make sure it
+is in your PATH or set the PKG_CONFIG environment variable to the full
+path to pkg-config.
+
+Alternatively, you may set the environment variables PACEMAKER_CFLAGS
+and PACEMAKER_LIBS to avoid the need to call pkg-config.
+See the pkg-config man page for more details.
+
+To get pkg-config, see <http://pkg-config.freedesktop.org/>.
+See \`config.log' for more details" "$LINENO" 5; }
+else
+	PACEMAKER_CFLAGS=$pkg_cv_PACEMAKER_CFLAGS
+	PACEMAKER_LIBS=$pkg_cv_PACEMAKER_LIBS
+        { $as_echo "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+$as_echo "yes" >&6; }
+
+fi
+  pgrac_fence_saved_CPPFLAGS="$CPPFLAGS"
+  pgrac_fence_saved_LIBS="$LIBS"
+  CPPFLAGS="$CPPFLAGS $PACEMAKER_CFLAGS"
+  LIBS="$PACEMAKER_LIBS $LIBS"
+  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for the native Pacemaker fencing API and Ed25519" >&5
+$as_echo_n "checking for the native Pacemaker fencing API and Ed25519... " >&6; }
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+#include <crm/stonith-ng.h>
+#include <crm/cib.h>
+#include <libxml/c14n.h>
+#include <openssl/evp.h>
+int
+main ()
+{
+
+    stonith_t *st = stonith_api_new();
+    cib_t *cib = cib_native_new();
+    xmlChar *canonical = 0;
+    int algorithm = EVP_PKEY_ED25519;
+    if (st != 0) {
+      int (*fence)(stonith_t *, int, const char *, const char *, int, int) = st->cmds->fence;
+      (void) fence;
+      stonith_api_delete(st);
+    }
+    if (cib != 0)
+      cib_delete(cib);
+    (void) xmlC14NDocDumpMemory(0, 0, XML_C14N_1_0, 0, 0, &canonical);
+    return algorithm == 0;
+
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"; then :
+  { $as_echo "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+$as_echo "yes" >&6; }
+else
+  as_fn_error $? "native Pacemaker API and OpenSSL Ed25519 support are required" "$LINENO" 5
+fi
+rm -f core conftest.err conftest.$ac_objext \
+    conftest$ac_exeext conftest.$ac_ext
+  CPPFLAGS="$pgrac_fence_saved_CPPFLAGS"
+  LIBS="$pgrac_fence_saved_LIBS"
+
+$as_echo "#define USE_PACEMAKER 1" >>confdefs.h
+
+fi
+
 if test "$with_pam" = yes ; then
   { $as_echo "$as_me:${as_lineno-$LINENO}: checking for pam_start in -lpam" >&5
 $as_echo_n "checking for pam_start in -lpam... " >&6; }
@@ -14295,6 +14484,8 @@ fi
 fi
 
 if test "$with_rdma" = yes; then
+  for ac_header in infiniband/verbs.h
+do :
   ac_fn_c_check_header_mongrel "$LINENO" "infiniband/verbs.h" "ac_cv_header_infiniband_verbs_h" "$ac_includes_default"
 if test "x$ac_cv_header_infiniband_verbs_h" = xyes; then :
   cat >>confdefs.h <<_ACEOF
@@ -14305,7 +14496,10 @@ else
   as_fn_error $? "infiniband/verbs.h header file is required for RDMA" "$LINENO" 5
 fi
 
+done
 
+  for ac_header in rdma/rdma_cma.h
+do :
   ac_fn_c_check_header_mongrel "$LINENO" "rdma/rdma_cma.h" "ac_cv_header_rdma_rdma_cma_h" "$ac_includes_default"
 if test "x$ac_cv_header_rdma_rdma_cma_h" = xyes; then :
   cat >>confdefs.h <<_ACEOF
@@ -14316,14 +14510,16 @@ else
   as_fn_error $? "rdma/rdma_cma.h header file is required for RDMA" "$LINENO" 5
 fi
 
+done
 
+  for ac_header in infiniband/mlx5dv.h
+do :
   ac_fn_c_check_header_mongrel "$LINENO" "infiniband/mlx5dv.h" "ac_cv_header_infiniband_mlx5dv_h" "$ac_includes_default"
 if test "x$ac_cv_header_infiniband_mlx5dv_h" = xyes; then :
   cat >>confdefs.h <<_ACEOF
 #define HAVE_INFINIBAND_MLX5DV_H 1
 _ACEOF
-
-  { $as_echo "$as_me:${as_lineno-$LINENO}: checking for mlx5dv_query_device in -lmlx5" >&5
+ { $as_echo "$as_me:${as_lineno-$LINENO}: checking for mlx5dv_query_device in -lmlx5" >&5
 $as_echo_n "checking for mlx5dv_query_device in -lmlx5... " >&6; }
 if ${ac_cv_lib_mlx5_mlx5dv_query_device+:} false; then :
   $as_echo_n "(cached) " >&6
@@ -14363,12 +14559,12 @@ if test "x$ac_cv_lib_mlx5_mlx5dv_query_device" = xyes; then :
 
 $as_echo "#define HAVE_MLX5DV 1" >>confdefs.h
 
-  LIBS="-lmlx5 $LIBS"
-
+                                 LIBS="-lmlx5 $LIBS"
 fi
 
 fi
 
+done
 
 fi
 
@@ -15645,7 +15841,7 @@ else
     We can't simply define LARGE_OFF_T to be 9223372036854775807,
     since some C++ compilers masquerading as C compilers
     incorrectly reject 9223372036854775807.  */
-#define LARGE_OFF_T (((off_t) 1 << 62) - 1 + ((off_t) 1 << 62))
+#define LARGE_OFF_T ((((off_t) 1 << 31) << 31) - 1 + (((off_t) 1 << 31) << 31))
   int off_t_is_large[(LARGE_OFF_T % 2147483629 == 721
 		       && LARGE_OFF_T % 2147483647 == 1)
 		      ? 1 : -1];
@@ -15691,7 +15887,7 @@ else
     We can't simply define LARGE_OFF_T to be 9223372036854775807,
     since some C++ compilers masquerading as C compilers
     incorrectly reject 9223372036854775807.  */
-#define LARGE_OFF_T (((off_t) 1 << 62) - 1 + ((off_t) 1 << 62))
+#define LARGE_OFF_T ((((off_t) 1 << 31) << 31) - 1 + (((off_t) 1 << 31) << 31))
   int off_t_is_large[(LARGE_OFF_T % 2147483629 == 721
 		       && LARGE_OFF_T % 2147483647 == 1)
 		      ? 1 : -1];
@@ -15715,7 +15911,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
     We can't simply define LARGE_OFF_T to be 9223372036854775807,
     since some C++ compilers masquerading as C compilers
     incorrectly reject 9223372036854775807.  */
-#define LARGE_OFF_T (((off_t) 1 << 62) - 1 + ((off_t) 1 << 62))
+#define LARGE_OFF_T ((((off_t) 1 << 31) << 31) - 1 + (((off_t) 1 << 31) << 31))
   int off_t_is_large[(LARGE_OFF_T % 2147483629 == 721
 		       && LARGE_OFF_T % 2147483647 == 1)
 		      ? 1 : -1];
@@ -15760,7 +15956,7 @@ else
     We can't simply define LARGE_OFF_T to be 9223372036854775807,
     since some C++ compilers masquerading as C compilers
     incorrectly reject 9223372036854775807.  */
-#define LARGE_OFF_T (((off_t) 1 << 62) - 1 + ((off_t) 1 << 62))
+#define LARGE_OFF_T ((((off_t) 1 << 31) << 31) - 1 + (((off_t) 1 << 31) << 31))
   int off_t_is_large[(LARGE_OFF_T % 2147483629 == 721
 		       && LARGE_OFF_T % 2147483647 == 1)
 		      ? 1 : -1];
@@ -15784,7 +15980,7 @@ rm -f core conftest.err conftest.$ac_objext conftest.$ac_ext
     We can't simply define LARGE_OFF_T to be 9223372036854775807,
     since some C++ compilers masquerading as C compilers
     incorrectly reject 9223372036854775807.  */
-#define LARGE_OFF_T (((off_t) 1 << 62) - 1 + ((off_t) 1 << 62))
+#define LARGE_OFF_T ((((off_t) 1 << 31) << 31) - 1 + (((off_t) 1 << 31) << 31))
   int off_t_is_large[(LARGE_OFF_T % 2147483629 == 721
 		       && LARGE_OFF_T % 2147483647 == 1)
 		      ? 1 : -1];

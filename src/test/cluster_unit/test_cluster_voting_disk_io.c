@@ -44,6 +44,7 @@
 #include <unistd.h>
 
 #include "cluster/cluster_voting_disk_io.h"
+#include "cluster/cluster_storage_quorum.h"
 
 #undef printf
 #undef fprintf
@@ -59,6 +60,19 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+bool cluster_shared_config;
+int cluster_node_id = 1;
+static bool storage_permitted;
+static unsigned storage_checks;
+
+bool
+cluster_storage_quorum_allows_node(int node)
+{
+	UT_ASSERT_EQ(node, cluster_node_id);
+	storage_checks++;
+	return storage_permitted;
+}
 
 
 /*
@@ -133,7 +147,7 @@ UT_TEST(test_io_2_crc_mismatch_returns_torn)
 	int fd;
 	ClusterVotingSlot slot;
 	ClusterVotingDiskIoState rc;
-	uint8 garbage = 0xFF;
+	uint8 sector[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
 
 	fd = cluster_voting_disk_open(path, /*create*/ true);
 	UT_ASSERT(fd >= 0);
@@ -153,8 +167,10 @@ UT_TEST(test_io_2_crc_mismatch_returns_torn)
 
 	/* Corrupt one byte in the middle of slot 1's data area to simulate
 	 * a torn write — CRC should now mismatch. */
-	(void)pwrite(fd, &garbage, 1, /* offset */ 1 * 512 + 100);
-	(void)fsync(fd);
+	UT_ASSERT_EQ(pread(fd, sector, sizeof(sector), CLUSTER_VOTING_SLOT_OFFSET(1)), sizeof(sector));
+	sector[100] ^= 0xff;
+	UT_ASSERT_EQ(pwrite(fd, sector, sizeof(sector), CLUSTER_VOTING_SLOT_OFFSET(1)), sizeof(sector));
+	UT_ASSERT_EQ(fsync(fd), 0);
 
 	rc = cluster_voting_disk_read_slot(fd, /*expected_disk_index*/ 0, 1, &slot);
 	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_TORN);
@@ -205,7 +221,7 @@ UT_TEST(test_io_4_node_id_mismatch_failed)
 {
 	char *path = make_temp_path("nid");
 	int fd;
-	ClusterVotingSlot slot;
+	ClusterVotingSlot slot __attribute__((aligned(512)));
 	ClusterVotingDiskIoState rc;
 
 	fd = cluster_voting_disk_open(path, /*create*/ true);
@@ -465,7 +481,7 @@ UT_TEST(test_io_12_raw_tail_write_lazily_extends_old_file)
 	char *path = make_temp_path("raw_tail_write");
 	uint8 prior[CLUSTER_VOTING_SLOT_BYTES];
 	uint8 in[CLUSTER_VOTING_SLOT_BYTES];
-	uint8 out[CLUSTER_VOTING_SLOT_BYTES];
+	uint8 out[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
 	struct stat st;
 	int fd;
 	int setup_fd;
@@ -809,10 +825,156 @@ UT_TEST(test_io_22_pgrd_authority_bounds_nonlinux_development_file)
 }
 
 
+UT_TEST(test_storage_loss_rejects_every_write_and_preserves_raw_history)
+{
+	char *path = make_temp_path("storage_gate");
+	int fd = cluster_voting_disk_open(path, true);
+	ClusterVotingSlot slot = { 0 }, observed;
+	char payload[CLUSTER_VOTING_SLOT_BYTES];
+	char *before, *after;
+	struct stat st;
+	Size size = CLUSTER_VOTING_PGRD_FILE_BYTES_MIN;
+
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(cluster_voting_disk_format(fd, 4, 0), CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(ftruncate(fd, size), 0);
+	slot.magic = CLUSTER_VOTING_SLOT_MAGIC;
+	slot.version = CLUSTER_VOTING_SLOT_VERSION;
+	slot.node_id = 1;
+	slot.flags = CLUSTER_VOTING_SLOT_FLAG_ALIVE;
+	slot.generation = 8;
+	UT_ASSERT_EQ(cluster_voting_disk_write_slot(fd, &slot), CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(posix_memalign((void **)&before, 512, size), 0);
+	UT_ASSERT_EQ(posix_memalign((void **)&after, 512, size), 0);
+	UT_ASSERT_EQ(pread(fd, before, size, 0), size);
+	memset(payload, 0x5a, sizeof(payload));
+	storage_permitted = false;
+	storage_checks = 0;
+	cluster_shared_config = true;
+	slot.generation++;
+	UT_ASSERT_EQ(cluster_voting_disk_write_slot(fd, &slot), CLUSTER_VOTING_DISK_IO_FAILED);
+	UT_ASSERT_EQ(cluster_voting_disk_write_leave_slot(fd, 1, payload),
+				 CLUSTER_VOTING_DISK_IO_FAILED);
+	UT_ASSERT_EQ(cluster_voting_disk_write_join_slot(fd, 2, payload),
+				 CLUSTER_VOTING_DISK_IO_FAILED);
+	UT_ASSERT_EQ(cluster_voting_disk_write_formation_slot(fd, 2, payload),
+				 CLUSTER_VOTING_DISK_IO_FAILED);
+	UT_ASSERT_EQ(cluster_voting_disk_write_apply_lease_global_slot(fd, payload),
+				 CLUSTER_VOTING_DISK_IO_FAILED);
+	UT_ASSERT_EQ(cluster_voting_disk_write_stripe_slot(fd, 1, payload),
+				 CLUSTER_VOTING_DISK_IO_FAILED);
+	UT_ASSERT_EQ(cluster_voting_disk_write_stripe_activation(fd, payload),
+				 CLUSTER_VOTING_DISK_IO_FAILED);
+	UT_ASSERT_EQ(cluster_voting_disk_write_raw_tail_slot(fd, payload),
+				 CLUSTER_VOTING_DISK_IO_FAILED);
+	UT_ASSERT_EQ(
+		cluster_voting_disk_write_raw_slot_at(fd, CLUSTER_VOTING_STRIPE_SLOT_OFFSET(0), payload),
+		CLUSTER_VOTING_DISK_IO_FAILED);
+	UT_ASSERT_EQ(cluster_voting_disk_write_epoch_ballot_slot(fd, 1, payload),
+				 CLUSTER_VOTING_DISK_IO_FAILED);
+	UT_ASSERT_EQ(cluster_voting_disk_format(fd, 4, 0), CLUSTER_VOTING_DISK_IO_FAILED);
+	UT_ASSERT(storage_checks >= 11);
+	UT_ASSERT_EQ(fstat(fd, &st), 0);
+	UT_ASSERT_EQ(st.st_size, size);
+	UT_ASSERT_EQ(pread(fd, after, size, 0), size);
+	UT_ASSERT_EQ(memcmp(before, after, size), 0);
+	/* Ineligibility does not erase the old writer's ALIVE evidence. */
+	UT_ASSERT_EQ(cluster_voting_disk_read_slot(fd, 0, 1, &observed), CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(observed.generation, 8);
+	UT_ASSERT_EQ(observed.flags, CLUSTER_VOTING_SLOT_FLAG_ALIVE);
+	storage_permitted = true;
+	UT_ASSERT_EQ(cluster_voting_disk_write_slot(fd, &slot), CLUSTER_VOTING_DISK_IO_OK);
+	cluster_shared_config = false;
+	free(before);
+	free(after);
+	cluster_voting_disk_close(fd);
+	(void)unlink(path);
+	free(path);
+}
+
+/* Batch reads must retain the scalar reader's per-slot refusal polarity,
+ * including a bad undeclared slot between healthy neighbors. */
+UT_TEST(test_batch_slots_validate_every_header_and_crc)
+{
+	char *path = make_temp_path("batch");
+	int fd = cluster_voting_disk_open(path, true);
+	ClusterVotingSlot slots[CLUSTER_MAX_NODES];
+	ClusterVotingDiskIoState states[CLUSTER_MAX_NODES];
+	UT_ASSERT(fd >= 0);
+	for (int fault = 0; fault < 5; ++fault) {
+		ClusterVotingSlot bad __attribute__((aligned(512)));
+		UT_ASSERT_EQ(cluster_voting_disk_format(fd, CLUSTER_MAX_NODES, 0),
+					 CLUSTER_VOTING_DISK_IO_OK);
+		UT_ASSERT_EQ(cluster_voting_disk_read_slot(fd, 0, 71, &bad), CLUSTER_VOTING_DISK_IO_OK);
+		if (fault == 0)
+			bad.magic++;
+		if (fault == 1)
+			bad.version++;
+		if (fault == 2)
+			bad.node_id++;
+		if (fault == 3)
+			bad.disk_index++;
+		bad.crc32c = cluster_voting_disk_compute_crc32c(&bad);
+		if (fault == 4)
+			bad.crc32c++;
+		UT_ASSERT_EQ(pwrite(fd, &bad, sizeof(bad), CLUSTER_VOTING_SLOT_OFFSET(71)), sizeof(bad));
+		cluster_voting_disk_read_slots(fd, 0, 0, CLUSTER_MAX_NODES, slots, states);
+		for (int node = 0; node < CLUSTER_MAX_NODES; ++node)
+			UT_ASSERT_EQ(states[node], node != 71	? CLUSTER_VOTING_DISK_IO_OK
+									   : fault == 4 ? CLUSTER_VOTING_DISK_IO_TORN
+													: CLUSTER_VOTING_DISK_IO_FAILED);
+	}
+	cluster_voting_disk_close(fd);
+	unlink(path);
+	free(path);
+}
+
+UT_TEST(test_batch_short_io_bounds_and_raw_regions)
+{
+	char *path = make_temp_path("batch_raw");
+	int fd = cluster_voting_disk_open(path, true);
+	ClusterVotingSlot slots[2];
+	ClusterVotingDiskIoState states[2];
+	uint8 raw[2 * CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	uint8 observed[sizeof(raw)];
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(cluster_voting_disk_format(fd, CLUSTER_MAX_NODES, 0), CLUSTER_VOTING_DISK_IO_OK);
+	cluster_voting_disk_read_slots(fd, 0, CLUSTER_MAX_NODES - 1, 2, slots, states);
+	UT_ASSERT_EQ(states[0], CLUSTER_VOTING_DISK_IO_FAILED);
+	UT_ASSERT_EQ(states[1], CLUSTER_VOTING_DISK_IO_FAILED);
+	cluster_voting_disk_read_slots(-1, 0, 0, 2, slots, states);
+	UT_ASSERT_EQ(states[0], CLUSTER_VOTING_DISK_IO_NOT_TRIED);
+	UT_ASSERT_EQ(states[1], CLUSTER_VOTING_DISK_IO_NOT_TRIED);
+	UT_ASSERT_EQ(ftruncate(fd, 2 * CLUSTER_VOTING_SLOT_BYTES - 1), 0);
+	cluster_voting_disk_read_slots(fd, 0, 0, 2, slots, states);
+	UT_ASSERT_EQ(states[0], CLUSTER_VOTING_DISK_IO_FAILED);
+	UT_ASSERT_EQ(states[1], CLUSTER_VOTING_DISK_IO_FAILED);
+	for (int region = 0; region < 2; ++region) {
+		off_t offset = region == 0 ? CLUSTER_VOTING_JOIN_SLOT_OFFSET(126)
+								   : CLUSTER_VOTING_FORMATION_SLOT_OFFSET(126);
+		ClusterVotingDiskIoState (*read_range)(int, uint32, uint32, void *)
+			= region == 0 ? cluster_voting_disk_read_join_slots
+						  : cluster_voting_disk_read_formation_slots;
+		memset(raw, region + 1, sizeof(raw));
+		UT_ASSERT_EQ(pwrite(fd, raw, sizeof(raw), offset), sizeof(raw));
+		UT_ASSERT_EQ(read_range(fd, 126, 2, observed), CLUSTER_VOTING_DISK_IO_OK);
+		UT_ASSERT_EQ(memcmp(raw, observed, sizeof(raw)), 0);
+		UT_ASSERT_EQ(read_range(fd, 127, 2, observed), CLUSTER_VOTING_DISK_IO_FAILED);
+		UT_ASSERT_EQ(read_range(fd, UINT32_MAX, 2, observed), CLUSTER_VOTING_DISK_IO_FAILED);
+		UT_ASSERT_EQ(read_range(fd, 126, 0, observed), CLUSTER_VOTING_DISK_IO_FAILED);
+		UT_ASSERT_EQ(read_range(fd, 126, 2, NULL), CLUSTER_VOTING_DISK_IO_FAILED);
+		UT_ASSERT_EQ(ftruncate(fd, offset + sizeof(raw) - 1), 0);
+		UT_ASSERT_EQ(read_range(fd, 126, 2, observed), CLUSTER_VOTING_DISK_IO_FAILED);
+	}
+	cluster_voting_disk_close(fd);
+	unlink(path);
+	free(path);
+}
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(25);
 	UT_RUN(test_io_1_round_trip);
 	UT_RUN(test_io_2_crc_mismatch_returns_torn);
 	UT_RUN(test_io_3_magic_mismatch_failed);
@@ -835,6 +997,9 @@ main(void)
 	UT_RUN(test_io_20_pgrd_offsets_round_trip_without_aliasing);
 	UT_RUN(test_io_21_offset_raw_slot_distinguishes_short_and_io_failure);
 	UT_RUN(test_io_22_pgrd_authority_bounds_nonlinux_development_file);
+	UT_RUN(test_storage_loss_rejects_every_write_and_preserves_raw_history);
+	UT_RUN(test_batch_slots_validate_every_header_and_crc);
+	UT_RUN(test_batch_short_io_bounds_and_raw_regions);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

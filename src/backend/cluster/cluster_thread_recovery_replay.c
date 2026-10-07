@@ -234,9 +234,10 @@ cluster_thread_recovery_touched_free(ClusterThreadTouchedRels *touched)
 
 /*
  * Deferred missing-relfile set (spec-6.14 D9).  Under cluster.shared_catalog a
- * relation file legitimately vanishes mid-stream: the dead origin dropped it
- * (a terminal record later in this SAME thread) and completed the unlink
- * before dying.  The engine cannot know that at the page record -- PG redo has
+ * relation file can be absent or have a retained zero-length MAIN: the dead
+ * origin dropped it in a terminal record later in this SAME thread. The
+ * storage owner controls physical removal and locator reuse. The engine
+ * cannot prove the later DROP at the page record -- PG redo has
  * the same problem and solves it with the invalid-pages table
  * (log_invalid_page / forget_invalid_pages).  Mirror that protocol: remember
  * the locator, skip the block (a missing file is never written around), forget
@@ -288,7 +289,9 @@ missing_forget_dropped(ClusterThreadMissingRels *missing, XLogReaderState *reade
 	int i;
 
 	if (info == XLOG_XACT_COMMIT || info == XLOG_XACT_COMMIT_PREPARED) {
-		ParseCommitRecord(XLogRecGetInfo(reader), (xl_xact_commit *)XLogRecGetData(reader), &pc);
+		if (!ParseCommitRecord(XLogRecGetInfo(reader), (xl_xact_commit *)XLogRecGetData(reader),
+							   XLogRecGetDataLen(reader), &pc))
+			elog(ERROR, "thread recovery: invalid commit payload");
 		locs = pc.xlocators;
 		nlocs = pc.nrels;
 	} else if (info == XLOG_XACT_ABORT || info == XLOG_XACT_ABORT_PREPARED) {
@@ -583,13 +586,15 @@ replay_one_block(XLogReaderState *reader, uint8 block_id, char *page, SCN window
 	nblocks = rel_exists ? smgrnblocks(reln, forknum) : 0;
 	cls = cluster_thread_replay_classify_block(1, rel_exists, blocknum, nblocks);
 	if (cls == CLUSTER_THREADREPLAY_BLK_BLOCKED) {
-		if (!rel_exists && missing != NULL) {
+		if (missing != NULL && (!rel_exists || (forknum == MAIN_FORKNUM && nblocks == 0))) {
 			/*
 			 * spec-6.14 D9: defer the verdict (see ClusterThreadMissingRels).
 			 * The block apply is skipped entirely and the drive stays honest:
 			 * end of drive fails closed unless a later terminal record in
-			 * this stream dropped the relfilenode.  Beyond-EOF (rel_exists)
-			 * keeps the immediate fail-closed below.
+			 * this stream dropped the exact relfilenode. A zero-length MAIN
+			 * can be the storage owner's retained DROP placeholder on retry;
+			 * its existence is not permission to restore old page bytes.
+			 * Nonempty beyond-EOF and empty auxiliary forks stay blocked.
 			 */
 			missing_add(missing, &rl);
 			st->blocks_missing_deferred++;
@@ -607,9 +612,11 @@ replay_one_block(XLogReaderState *reader, uint8 block_id, char *page, SCN window
 	/*
 	 * PGRAC: spec-6.12h D-h3c — Past Image recovery base (see the function
 	 * header).  Probe is cheap (BufTable lookup); every uncertain outcome
-	 * discards the PI and falls through to the storage path below.
+	 * discards the PI and falls through to the storage path below. Canonical
+	 * shared PI requires an exact master/DATA retirement, so this legacy
+	 * tag-only shortcut cannot consume or discard it across replay records.
 	 */
-	if (cluster_past_image) {
+	if (cluster_past_image && !cluster_shared_config) {
 		BufferTag tag;
 		SCN ship_scn;
 

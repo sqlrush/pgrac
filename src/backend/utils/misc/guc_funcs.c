@@ -31,6 +31,12 @@
 #include "utils/guc_tables.h"
 #include "utils/snapmgr.h"
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: expose the effective static context of managed common values.
+ * Author: SqlRush <sqlrush@gmail.com> */
+#include "cluster/cluster_shared_config.h"
+#endif
+
 static char *flatten_set_variable_args(const char *name, List *args);
 static void ShowGUCConfigOption(const char *name, DestReceiver *dest);
 static void ShowAllGUCConfig(DestReceiver *dest);
@@ -616,7 +622,12 @@ GetConfigOptionValues(struct config_generic *conf, const char **values)
 	values[5] = conf->long_desc != NULL ? _(conf->long_desc) : NULL;
 
 	/* context */
+#ifdef USE_PGRAC_CLUSTER
+	values[6] = GucContext_Names[cluster_shared_config_restart_only(conf)
+								   ? PGC_POSTMASTER : conf->context];
+#else
 	values[6] = GucContext_Names[conf->context];
+#endif
 
 	/* vartype */
 	values[7] = config_type_names[conf->vartype];

@@ -1,0 +1,641 @@
+/*-------------------------------------------------------------------------
+ * test_cluster_control_walr.c -- actual WALR wrappers and stable owners.
+ * Portions Copyright (c) 2026, pgrac contributors
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * WALR bodies are extracted verbatim at build time. Stable owner/registry
+ * objects are production C. Native lock, S1-S5 and transport remain explicit
+ * fixture boundaries; this is not a network integration test.
+ *-------------------------------------------------------------------------
+ */
+#define PGRAC_CONTROL_CF_EMBEDDED
+#include "test_cluster_cf_enqueue.c"
+
+static unsigned native_refs[MAX_LOCKMODES];
+static LockAcquireResult native_result = LOCKACQUIRE_OK;
+static bool native_two_actors;
+static unsigned native_actor;
+static unsigned actor_refs[2][MAX_LOCKMODES];
+
+bool
+errstart_cold(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	abort(); /* No FATAL/ERROR path is silently accepted. */
+	return false;
+}
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+LockAcquireResult
+LockAcquire(const LOCKTAG *tag, LOCKMODE mode, bool session pg_attribute_unused(), bool dontwait)
+{
+	UT_ASSERT_EQ(tag->locktag_type, LOCKTAG_USERLOCK);
+	if (native_two_actors) {
+		unsigned other = 1 - native_actor;
+		UT_ASSERT(dontwait);
+		if (actor_refs[other][ExclusiveLock] != 0
+			|| (mode == ExclusiveLock && actor_refs[other][ShareLock] != 0))
+			return LOCKACQUIRE_NOT_AVAIL;
+	}
+	if (native_result != LOCKACQUIRE_NOT_AVAIL) {
+		native_refs[mode]++;
+		if (native_two_actors)
+			actor_refs[native_actor][mode]++;
+	}
+	return native_result;
+}
+bool
+LockRelease(const LOCKTAG *tag, LOCKMODE mode, bool session pg_attribute_unused())
+{
+	UT_ASSERT_EQ(tag->locktag_type, LOCKTAG_USERLOCK);
+	UT_ASSERT(native_refs[mode] > 0);
+	if (native_refs[mode] == 0)
+		return false;
+	native_refs[mode]--;
+	if (native_two_actors) {
+		UT_ASSERT(actor_refs[native_actor][mode] > 0);
+		actor_refs[native_actor][mode]--;
+	}
+	return true;
+}
+ClusterLockAcquireResult
+cluster_lock_acquire_s7_cleanup(const ClusterLockAcquireRequest *request pg_attribute_unused())
+{
+	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+}
+
+#include "test_cluster_control_walr.inc"
+
+static ClusterLockAcquireRequest
+walr_fixture_request(void)
+{
+	ClusterLockAcquireRequest request = { 0 };
+
+	request.resid.type = CLUSTER_WAL_RETENTION_RESID_TYPE;
+	request.resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	request.resid.field1 = 2;
+	request.lockmode = ShareLock;
+	request.op = CLUSTER_LOCK_OP_REQUEST;
+	request.dontwait = true;
+	request.timeout_ms = 1;
+	g_next_request_id++;
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	return request;
+}
+
+UT_TEST(native_s_is_kept_until_exact_retirement)
+{
+	ClusterLockAcquireRequest request = walr_fixture_request();
+
+	UT_ASSERT_EQ(walr_request_acquire_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(native_refs[ShareLock], 1);
+	UT_ASSERT(cluster_lock_owner_request_usable(&request));
+	UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT_EQ(native_refs[ShareLock], 1);
+	UT_ASSERT(!cluster_lock_owner_request_usable(&request));
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(native_refs[ShareLock], 0);
+}
+
+UT_TEST(failed_native_publication_keeps_only_owned_cleanup)
+{
+	ClusterLockAcquireRequest request = walr_fixture_request();
+	ClusterControlRequestView view;
+	uint32 cursor = 0;
+	uint64 enumerated;
+	unsigned abandoned = 0;
+
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	UT_ASSERT_EQ(walr_request_acquire_actual(&request), CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT_EQ(native_refs[ShareLock], 0);
+	memset(&request, 0, sizeof(request));
+	while (cluster_control_request_next(&cursor, &view)) {
+		UT_ASSERT_EQ(view.state, CLUSTER_CONTROL_REQUEST_ABANDONED);
+		abandoned++;
+	}
+	UT_ASSERT_EQ(abandoned, 1);
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT(cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT_EQ(enumerated, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+}
+
+UT_TEST(upgrade_uses_new_attempt_and_downgrade_keeps_confirmed_identity)
+{
+	ClusterLockAcquireRequest share = walr_fixture_request(), exclusive, down;
+	bool cleanup = false;
+
+	UT_ASSERT_EQ(walr_request_acquire_actual(&share), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	exclusive = share;
+	exclusive.op = CLUSTER_LOCK_OP_CONVERT;
+	exclusive.lockmode = ExclusiveLock;
+	exclusive.current_mode = ShareLock;
+	exclusive.convert_old_request_id = share.request_id;
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
+	UT_ASSERT_EQ(walr_request_convert_actual(&exclusive, 0, &cleanup),
+				 CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
+	UT_ASSERT(!cleanup);
+	UT_ASSERT(exclusive.request_id != share.request_id);
+	UT_ASSERT_EQ(exclusive.control_owner_id, share.control_owner_id);
+	UT_ASSERT(cluster_lock_owner_request_usable(&exclusive));
+	UT_ASSERT(!cluster_lock_owner_request_usable(&share));
+	UT_ASSERT(acknowledge_retirements());
+	down = exclusive;
+	down.lockmode = ShareLock;
+	down.current_mode = ExclusiveLock;
+	down.convert_old_request_id = 0;
+	UT_ASSERT_EQ(walr_request_convert_actual(&down, exclusive.request_id, &cleanup),
+				 CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
+	UT_ASSERT_EQ(down.request_id, exclusive.request_id);
+	UT_ASSERT(!cluster_lock_owner_request_usable(&exclusive));
+	UT_ASSERT(cluster_lock_owner_request_usable(&down));
+	/* Mirror the actual pin consumer: remove temporary native X and S. */
+	walr_native_lock_release_or_fatal(&exclusive);
+	walr_native_lock_release_or_fatal(&down);
+	UT_ASSERT_EQ(native_refs[ShareLock], 1);
+	UT_ASSERT_EQ(native_refs[ExclusiveLock], 0);
+	UT_ASSERT_EQ(walr_request_release_actual(&down), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(walr_request_release_actual(&down), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(native_refs[ShareLock], 0);
+}
+
+UT_TEST(failed_upgrade_waits_for_restore_proof_before_old_pin_is_usable)
+{
+	ClusterLockAcquireRequest share = walr_fixture_request(), exclusive;
+	uint64 enumerated;
+	bool cleanup;
+
+	UT_ASSERT_EQ(walr_request_acquire_actual(&share), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	exclusive = share;
+	exclusive.op = CLUSTER_LOCK_OP_CONVERT;
+	exclusive.current_mode = ShareLock;
+	exclusive.lockmode = ExclusiveLock;
+	exclusive.convert_old_request_id = share.request_id;
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
+	UT_ASSERT_EQ(walr_request_convert_actual(&exclusive, 0, &cleanup),
+				 CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT(!cleanup);
+	UT_ASSERT_EQ(native_refs[ShareLock], 1);
+	UT_ASSERT_EQ(native_refs[ExclusiveLock], 0);
+	UT_ASSERT(!cluster_lock_owner_request_usable(&share));
+	UT_ASSERT(!cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT(cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT(cluster_lock_owner_request_usable(&share));
+	UT_ASSERT_EQ(walr_request_release_actual(&share), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(walr_request_release_actual(&share), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+}
+
+UT_TEST(failed_downgrade_never_reconstructs_x_and_keeps_native_refs_exact)
+{
+	ClusterLockAcquireRequest share = walr_fixture_request(), exclusive, down;
+	bool cleanup;
+
+	UT_ASSERT_EQ(walr_request_acquire_actual(&share), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	exclusive = share;
+	exclusive.op = CLUSTER_LOCK_OP_CONVERT;
+	exclusive.current_mode = ShareLock;
+	exclusive.lockmode = ExclusiveLock;
+	exclusive.convert_old_request_id = share.request_id;
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
+	UT_ASSERT_EQ(walr_request_convert_actual(&exclusive, 0, &cleanup),
+				 CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
+	down = exclusive;
+	down.lockmode = ShareLock;
+	down.current_mode = ExclusiveLock;
+	down.convert_old_request_id = 0;
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	UT_ASSERT_EQ(walr_request_convert_actual(&down, exclusive.request_id, &cleanup),
+				 CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT(!cluster_lock_owner_request_usable(&exclusive));
+	UT_ASSERT(!cluster_lock_owner_request_usable(&down));
+	UT_ASSERT_EQ(native_refs[ShareLock], 1);
+	UT_ASSERT_EQ(native_refs[ExclusiveLock], 1);
+	UT_ASSERT_EQ(walr_request_release_actual(&exclusive), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(walr_request_release_actual(&exclusive), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	/* Error cleanup drops the original pin's native S separately. */
+	walr_native_lock_release_or_fatal(&share);
+	UT_ASSERT_EQ(native_refs[ShareLock], 0);
+	UT_ASSERT_EQ(native_refs[ExclusiveLock], 0);
+}
+
+UT_TEST(failed_upgrade_cross_cut_retires_x_before_redeclaring_known_s)
+{
+	ClusterLockAcquireRequest share = walr_fixture_request(), exclusive;
+	ClusterControlRequestView view;
+	uint64 enumerated;
+	uint32 cursor;
+	bool cleanup;
+	unsigned polls = owner_poll_count;
+
+	UT_ASSERT_EQ(walr_request_acquire_actual(&share), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	exclusive = share;
+	exclusive.op = CLUSTER_LOCK_OP_CONVERT;
+	exclusive.current_mode = ShareLock;
+	exclusive.lockmode = ExclusiveLock;
+	exclusive.convert_old_request_id = share.request_id;
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
+	UT_ASSERT_EQ(walr_request_convert_actual(&exclusive, 0, &cleanup),
+				 CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	owner_epoch++;
+	owner_generation++;
+	owner_rebuild_frozen = false;
+	UT_ASSERT(!cluster_lock_owners_redeclare(&enumerated));
+	cursor = 0;
+	while (cluster_control_request_next(&cursor, &view))
+		if (view.mode == ExclusiveLock)
+			UT_ASSERT_EQ(view.message.previous_request, share.request_id);
+	/* LMON can run first: the new empty master cannot restore old S. */
+	cursor = 0;
+	while (cluster_control_request_next(&cursor, &view)) {
+		ClusterControlRequestCut cut;
+		ClusterControlRetireMessage reply;
+
+		if (view.mode != ExclusiveLock)
+			continue;
+		control_cut(&cut);
+		UT_ASSERT(cluster_control_request_claim(&view.handle, retire_driver, &cut, &reply));
+		reply.verb = CLUSTER_CONTROL_RETIRE_INVALID;
+		UT_ASSERT(cluster_control_request_ack(&reply, cut.master, retire_driver, &cut));
+	}
+	UT_ASSERT(!cluster_lock_owners_redeclare(&enumerated)); /* No freeze, no reset. */
+	owner_rebuild_frozen = true;
+	UT_ASSERT(!cluster_lock_owners_redeclare(&enumerated));
+	cursor = 0;
+	while (cluster_control_request_next(&cursor, &view))
+		if (view.mode == ExclusiveLock)
+			UT_ASSERT_EQ(view.message.previous_request, 0);
+	UT_ASSERT_EQ(owner_poll_count, polls); /* No pretend S before X retirement. */
+	UT_ASSERT(!cluster_lock_owner_request_usable(&share));
+	UT_ASSERT(acknowledge_retirements());
+	(void)cluster_lock_owners_redeclare(&enumerated);
+	UT_ASSERT(!cluster_lock_owner_request_usable(&share));
+	owner_reply = CLUSTER_GES_REDECLARE_CONFIRMED;
+	UT_ASSERT(!cluster_lock_owners_redeclare(&enumerated)); /* New S + old S debt. */
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT(cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT(cluster_lock_owner_request_usable(&share));
+	UT_ASSERT(cluster_lock_owner_request_refresh(&share));
+	UT_ASSERT_EQ(share.holder.cluster_epoch, owner_epoch);
+	UT_ASSERT_EQ(native_refs[ShareLock], 1);
+	UT_ASSERT_EQ(walr_request_release_actual(&share), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(walr_request_release_actual(&share), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	owner_rebuild_frozen = false;
+}
+
+UT_TEST(rebound_x_downgrade_refreshes_the_stable_owners_identity)
+{
+	ClusterLockAcquireRequest share = walr_fixture_request(), exclusive, down;
+	ClusterLockAcquireResult result;
+	uint64 enumerated, old_request;
+	bool cleanup;
+
+	UT_ASSERT_EQ(walr_request_acquire_actual(&share), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	exclusive = share;
+	exclusive.op = CLUSTER_LOCK_OP_CONVERT;
+	exclusive.current_mode = ShareLock;
+	exclusive.lockmode = ExclusiveLock;
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
+	UT_ASSERT_EQ(walr_request_convert_actual(&exclusive, 0, &cleanup),
+				 CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT(cluster_lock_owners_redeclare(&enumerated)); /* Consume old S at its cut. */
+	owner_epoch++;
+	owner_generation++;
+	owner_reply = CLUSTER_GES_REDECLARE_CONFIRMED;
+	UT_ASSERT(!cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT(cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT(cluster_lock_owner_request_usable(&exclusive));
+	old_request = exclusive.request_id;
+	down = exclusive; /* Consumer still carries its pre-rebuild guard. */
+	down.current_mode = ExclusiveLock;
+	down.lockmode = ShareLock;
+	down.convert_old_request_id = 0;
+	UT_ASSERT_EQ(walr_request_convert_actual(&down, old_request + 1, &cleanup),
+				 CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT(cluster_lock_owner_request_usable(&exclusive));
+	result = walr_request_convert_actual(&down, old_request, &cleanup);
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
+	if (result == CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
+		UT_ASSERT(down.request_id != old_request);
+		UT_ASSERT_EQ(down.holder.cluster_epoch, owner_epoch);
+		walr_native_lock_release_or_fatal(&exclusive);
+		walr_native_lock_release_or_fatal(&down);
+		UT_ASSERT_EQ(walr_request_release_actual(&down), CLUSTER_LOCK_ACQUIRE_PENDING);
+		UT_ASSERT(acknowledge_retirements());
+		UT_ASSERT_EQ(walr_request_release_actual(&down), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	} else {
+		(void)walr_request_release_actual(&exclusive);
+		UT_ASSERT(acknowledge_retirements());
+		(void)walr_request_release_actual(&exclusive);
+		walr_native_lock_release_or_fatal(&share);
+	}
+	UT_ASSERT_EQ(native_refs[ShareLock], 0);
+	UT_ASSERT_EQ(native_refs[ExclusiveLock], 0);
+}
+
+UT_TEST(error_in_upgrade_surrenders_both_remote_holds_without_native_leak)
+{
+	ClusterLockAcquireRequest share = walr_fixture_request(), exclusive;
+	ClusterControlRequestView view;
+	uint32 cursor = 0;
+	bool cleanup;
+	volatile bool caught = false;
+
+	UT_ASSERT_EQ(walr_request_acquire_actual(&share), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	exclusive = share;
+	exclusive.op = CLUSTER_LOCK_OP_CONVERT;
+	exclusive.current_mode = ShareLock;
+	exclusive.lockmode = ExclusiveLock;
+	exclusive.convert_old_request_id = share.request_id;
+	throw_during_install = true;
+	PG_TRY();
+	{
+		(void)walr_request_convert_actual(&exclusive, 0, &cleanup);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	throw_during_install = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(native_refs[ShareLock], 1);
+	UT_ASSERT_EQ(native_refs[ExclusiveLock], 0);
+	while (cluster_control_request_next(&cursor, &view)) {
+		UT_ASSERT_EQ(view.state, CLUSTER_CONTROL_REQUEST_ABANDONED);
+		UT_ASSERT_EQ(view.message.previous_request, 0);
+	}
+	UT_ASSERT_EQ(walr_request_release_actual(&share), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(walr_request_release_actual(&share), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(native_refs[ShareLock], 0);
+}
+
+UT_TEST(two_recoverers_cannot_write_across_exclusive_completion)
+{
+	ClusterLockAcquireRequest a = walr_fixture_request(), b, x, down, newcomer;
+	bool cleanup;
+	unsigned published = 0, b_writes = 0;
+	uint64 enumerated;
+	/* Actual stable owners and WALR acquisition/conversion bodies, with an
+	 * explicit two-process native-lock fixture. IR/DATA/ROOT are scheduling
+	 * markers here; their consumer gates are tested by wal_retention/ROOT. */
+	native_two_actors = true;
+	native_actor = 0;
+	memset(actor_refs, 0, sizeof(actor_refs));
+	UT_ASSERT_EQ(walr_request_acquire_actual(&a), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	native_actor = 1;
+	b = walr_fixture_request();
+	UT_ASSERT_EQ(walr_request_acquire_actual(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	/* A has confirmed IR release; B acquired IR using its earlier root read. */
+	native_actor = 0;
+	x = a;
+	x.op = CLUSTER_LOCK_OP_CONVERT;
+	x.current_mode = ShareLock;
+	x.lockmode = ExclusiveLock;
+	x.convert_old_request_id = a.request_id;
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
+	UT_ASSERT(walr_request_convert_actual(&x, 0, &cleanup) != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
+	UT_ASSERT_EQ(native_refs[ExclusiveLock], 0);
+	UT_ASSERT_EQ(published, 0);
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT(cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT(cluster_lock_owner_request_usable(&a));
+	native_actor = 1;
+	UT_ASSERT(cluster_lock_owner_request_usable(&b));
+	b_writes++; /* B can finish DATA while A's completion remains blocked. */
+	UT_ASSERT_EQ(walr_request_release_actual(&b), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(walr_request_release_actual(&b), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT(!cluster_lock_owner_request_usable(&b));
+	native_actor = 0;
+	x = a;
+	x.op = CLUSTER_LOCK_OP_CONVERT;
+	x.current_mode = ShareLock;
+	x.lockmode = ExclusiveLock;
+	x.convert_old_request_id = a.request_id;
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
+	UT_ASSERT_EQ(walr_request_convert_actual(&x, 0, &cleanup), CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
+	UT_ASSERT(cluster_lock_owner_request_usable(&x));
+	UT_ASSERT(acknowledge_retirements());
+	native_actor = 1;
+	newcomer = walr_fixture_request();
+	UT_ASSERT(walr_request_acquire_actual(&newcomer) != CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT(!cluster_lock_owner_request_usable(&newcomer));
+	UT_ASSERT_EQ(actor_refs[1][ShareLock], 0);
+	UT_ASSERT(acknowledge_retirements());
+	native_actor = 0;
+	UT_ASSERT(cluster_lock_owner_request_usable(&x));
+	published++; /* CF/CAS/durable readback all occur inside this X interval. */
+	UT_ASSERT_EQ(b_writes, 1);
+	down = x;
+	down.lockmode = ShareLock;
+	down.current_mode = ExclusiveLock;
+	down.convert_old_request_id = 0;
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
+	UT_ASSERT_EQ(walr_request_convert_actual(&down, x.request_id, &cleanup),
+				 CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
+	walr_native_lock_release_or_fatal(&x);
+	walr_native_lock_release_or_fatal(&down);
+	UT_ASSERT_EQ(published, 1);
+	UT_ASSERT_EQ(walr_request_release_actual(&down), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(walr_request_release_actual(&down), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(native_refs[ShareLock] + native_refs[ExclusiveLock], 0);
+	native_two_actors = false;
+}
+
+UT_TEST(error_in_acquire_cannot_leave_an_unpublished_native_ref)
+{
+	ClusterLockAcquireRequest request = walr_fixture_request();
+	volatile bool caught = false;
+	uint64 enumerated;
+
+	throw_during_install = true;
+	PG_TRY();
+	{
+		(void)walr_request_acquire_actual(&request);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	throw_during_install = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(native_refs[ShareLock], 0);
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT(cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT_EQ(enumerated, 0);
+}
+
+UT_TEST(foreground_release_waits_but_lmon_never_waits_on_itself)
+{
+	ClusterLockAcquireRequest request = walr_fixture_request();
+	unsigned before = owner_wait_calls;
+
+	UT_ASSERT_EQ(walr_request_acquire_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	owner_clock_step = 1;
+	owner_ack_on_wait = true;
+	MyBackendType = B_BACKEND;
+	UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(owner_wait_calls, before + 1);
+	UT_ASSERT_EQ(native_refs[ShareLock], 0);
+	owner_ack_on_wait = false;
+	owner_clock_step = 60000000;
+	/* A missing ACK on LMON must return to its ordinary CONTROL loop. */
+	MyBackendType = B_LMON;
+	request = walr_fixture_request();
+	UT_ASSERT_EQ(walr_request_acquire_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	before = owner_wait_calls;
+	UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT_EQ(owner_wait_calls, before);
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(shared_nowait_keeps_transport_and_retirement_budget)
+{
+	ClusterLockAcquireRequest request = walr_fixture_request(), convert;
+	ClusterLockAcquireResult released;
+	unsigned before = owner_wait_calls;
+	int saved_timeout = cluster_ges_request_timeout_ms;
+	bool cleanup = false;
+
+	cluster_ges_request_timeout_ms = 1000;
+	MyBackendType = B_STARTUP;
+	UT_ASSERT_EQ(walr_request_acquire_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT(request.dontwait);
+	UT_ASSERT_EQ(request.timeout_ms, 0);
+	/* A real registry ACK after the first scheduling turn; two milliseconds
+	 * already elapse before WaitLatch. NOWAIT only rejects lock conflicts. */
+	owner_clock_step = 2000;
+	owner_ack_on_wait = true;
+	released = walr_request_release_actual(&request);
+	UT_ASSERT_EQ(released, CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(owner_wait_calls, before + 1);
+	if (released != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
+		UT_ASSERT(acknowledge_retirements());
+		UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	}
+	UT_ASSERT_EQ(native_refs[ShareLock], 0);
+	owner_ack_on_wait = false;
+
+	request = walr_fixture_request();
+	UT_ASSERT_EQ(walr_request_acquire_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	convert = request;
+	convert.op = CLUSTER_LOCK_OP_CONVERT;
+	convert.current_mode = ShareLock;
+	convert.lockmode = ExclusiveLock;
+	convert.convert_old_request_id = request.request_id;
+	convert.timeout_ms = 1; /* Existing manual conversion producers. */
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
+	UT_ASSERT_EQ(walr_request_convert_actual(&convert, 0, &cleanup),
+				 CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
+	UT_ASSERT(!cleanup && convert.dontwait);
+	UT_ASSERT_EQ(convert.timeout_ms, 0);
+	UT_ASSERT(acknowledge_retirements());
+	/* Exhausting the configured exchange budget is still not retirement. */
+	cluster_ges_request_timeout_ms = 1;
+	before = owner_wait_calls;
+	UT_ASSERT_EQ(walr_request_release_actual(&convert), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT_EQ(owner_wait_calls, before);
+	UT_ASSERT_EQ(native_refs[ExclusiveLock], 1);
+	UT_ASSERT(!cluster_lock_owner_request_usable(&convert));
+	UT_ASSERT(acknowledge_retirements());
+	UT_ASSERT_EQ(walr_request_release_actual(&convert), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	walr_native_lock_release_or_fatal(&request);
+	UT_ASSERT_EQ(native_refs[ExclusiveLock], 0);
+	UT_ASSERT_EQ(native_refs[ShareLock], 0);
+	cluster_ges_request_timeout_ms = saved_timeout;
+	owner_clock_step = 60000000;
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(startup_shutdown_interrupts_retirement_without_forgetting_owner)
+{
+	int saved_timeout = cluster_ges_request_timeout_ms;
+
+	for (int perpetual = 0; perpetual < 2; perpetual++) {
+		ClusterLockAcquireRequest request = walr_fixture_request();
+		volatile bool exited = false;
+		unsigned before = owner_wait_calls;
+
+		cluster_ges_request_timeout_ms = perpetual ? -1 : 60000;
+		MyBackendType = B_STARTUP;
+		MyAuxProcType = StartupProcess;
+		UT_ASSERT_EQ(walr_request_acquire_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+		owner_clock_step = 1;
+		owner_shutdown_on_wait = 2;
+		startup_fixture_armed = true;
+		if (sigsetjmp(startup_fixture_exit, 1) == 0)
+			(void)walr_request_release_actual(&request);
+		else
+			exited = true;
+		UT_ASSERT(exited);
+		UT_ASSERT_EQ(startup_fixture_exit_code, 1);
+		UT_ASSERT_EQ(owner_wait_calls, before + 1);
+		UT_ASSERT_EQ(native_refs[ShareLock], 1);
+		UT_ASSERT(!cluster_lock_owner_request_usable(&request));
+		if (exited) {
+			/* proc_exit cleanup must poll, never recursively consume Startup's
+			 * still-set shutdown flag or wait for a peer that may have exited. */
+			before = owner_wait_calls;
+			UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_PENDING);
+			UT_ASSERT_EQ(owner_wait_calls, before);
+			UT_ASSERT_EQ(native_refs[ShareLock], 1);
+			UT_ASSERT(acknowledge_retirements());
+			proc_exit_inprogress = false;
+			shutdown_requested = false;
+			UT_ASSERT_EQ(walr_request_release_actual(&request), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+		}
+		startup_fixture_armed = false;
+		owner_shutdown_on_wait = 0;
+		proc_exit_inprogress = false;
+		shutdown_requested = false;
+	}
+	owner_clock_step = 60000000;
+	cluster_ges_request_timeout_ms = saved_timeout;
+	MyBackendType = B_INVALID;
+	MyAuxProcType = NotAnAuxProcess;
+}
+
+int
+main(void)
+{
+	MyProcPid = 4002;
+	owner_proc.pgprocno = 42;
+	pg_atomic_init_u32(&owner_proc.cluster_grd_registered_count, 0);
+	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked, 0);
+	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
+	cluster_control_request_shmem_init();
+	retire_driver = cluster_control_request_driver_start();
+	cluster_shared_config = true;
+	UT_PLAN(13);
+	UT_RUN(native_s_is_kept_until_exact_retirement);
+	UT_RUN(failed_native_publication_keeps_only_owned_cleanup);
+	UT_RUN(upgrade_uses_new_attempt_and_downgrade_keeps_confirmed_identity);
+	UT_RUN(failed_upgrade_waits_for_restore_proof_before_old_pin_is_usable);
+	UT_RUN(failed_downgrade_never_reconstructs_x_and_keeps_native_refs_exact);
+	UT_RUN(failed_upgrade_cross_cut_retires_x_before_redeclaring_known_s);
+	UT_RUN(rebound_x_downgrade_refreshes_the_stable_owners_identity);
+	UT_RUN(error_in_upgrade_surrenders_both_remote_holds_without_native_leak);
+	UT_RUN(two_recoverers_cannot_write_across_exclusive_completion);
+	UT_RUN(error_in_acquire_cannot_leave_an_unpublished_native_ref);
+	UT_RUN(foreground_release_waits_but_lmon_never_waits_on_itself);
+	UT_RUN(shared_nowait_keeps_transport_and_retirement_budget);
+	UT_RUN(startup_shutdown_interrupts_retirement_without_forgetting_owner);
+	UT_DONE();
+	return ut_failed_count != 0;
+}

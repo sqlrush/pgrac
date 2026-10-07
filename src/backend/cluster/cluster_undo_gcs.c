@@ -99,7 +99,8 @@ cluster_undo_path_uses_shared_root(ClusterUndoPathIntent intent, bool peer_mode,
 	 * returned above; any other value is a caller bug.
 	 */
 	Assert(intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED
-		   || intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0);
+		   || intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0
+		   || intent == CLUSTER_UNDO_PATH_RECOVERY_SHARED);
 
 	/*
 	 * The shared migration is armed only under a declared multi-node

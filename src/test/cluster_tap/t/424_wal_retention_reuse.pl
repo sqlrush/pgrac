@@ -29,14 +29,15 @@ use PostgreSQL::Test::RecursiveCopy;
 use PostgreSQL::Test::ClusterVotingDisk qw(format_voting_file);
 
 my $root = abs_path("$FindBin::RealBin/../../../..");
-my $unit_dir = "$root/src/test/cluster_unit";
+my $build_root = $ENV{top_builddir} // $root;
+my $unit_dir = "$build_root/src/test/cluster_unit";
 my $wal_fixture = "$unit_dir/test_cluster_wal_retention";
 my $root_fixture = "$unit_dir/test_cluster_control_root";
 my ($build_out, $build_err) = ('', '');
 
 # macOS strips DYLD_* while launching the system prove/perl.  Restore the
 # temp-install library root before PostgreSQL::Test::Cluster spawns binaries.
-$ENV{DYLD_LIBRARY_PATH} = "$root/tmp_install/usr/local/pgsql/lib"
+$ENV{DYLD_LIBRARY_PATH} = "$build_root/tmp_install/usr/local/pgsql/lib"
 	if $^O eq 'darwin';
 
 IPC::Run::run(

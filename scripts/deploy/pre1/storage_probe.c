@@ -151,17 +151,24 @@ open_parent(const char *root)
 }
 
 static int
-owned_file(int directory, const char *name, int flags)
+owned_file_links(int directory, const char *name, int flags, unsigned int max_links)
 {
 	struct stat st;
 	int fd
 		= (int)checked("openat", openat(directory, name, flags | O_NOFOLLOW | O_NONBLOCK, 0600), 0);
 
 	checked("fstat", fstat(fd, &st), 0);
-	if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 1
+	if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink < 1
+		|| st.st_nlink > max_links
 		|| (st.st_mode & 0077) != 0 || st.st_size > MAX_BYTES)
 		fail("scratch-file-identity", EINVAL, 1);
 	return fd;
+}
+
+static int
+owned_file(int directory, const char *name, int flags)
+{
+	return owned_file_links(directory, name, flags, 1);
 }
 
 static void
@@ -344,6 +351,53 @@ lock_case(int directory)
 	request.l_type = F_UNLCK;
 	checked(use_fcntl ? "fcntl-unlock" : "flock-unlock",
 			use_fcntl ? fcntl(fd, F_SETLK, &request) : flock(fd, LOCK_UN), length);
+	close_fd(fd);
+}
+
+/* Installation never replaces an existing name. Only this read-only witness
+ * accepts two links; ordinary write/resize probes still reject hard links.
+ * The source payload proves this scratch token before any new link is made.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+link_case(int directory)
+{
+	int fd = owned_file_links(directory, "data", O_RDONLY, 2);
+	int target;
+	struct stat source_st;
+	struct stat target_st;
+
+	verify_fd(fd);
+	if (strcmp(probe_case, "link-install") == 0) {
+		int result;
+		int error;
+
+		checked("fstat", fstat(fd, &source_st), 0);
+		/* An existing second link is legitimate only for our exact pair.
+		 * Reject external aliases before changing their inode link count. */
+		if (source_st.st_nlink == 2
+			&& (fstatat(directory, "next", &target_st, AT_SYMLINK_NOFOLLOW) != 0
+				|| !S_ISREG(target_st.st_mode) || source_st.st_dev != target_st.st_dev
+				|| source_st.st_ino != target_st.st_ino || target_st.st_nlink != 2))
+			fail("link-source-alias", EINVAL, 1);
+		result = linkat(directory, "data", directory, "next", 0);
+		error = result < 0 ? errno : 0;
+
+		event("linkat", result, error, 0, 0,
+			  error == EEXIST ? "CONFLICT" : result < 0 ? "FAIL" : "OK");
+		if (result < 0)
+			exit(error == EEXIST ? 4 : 1);
+		sync_fd(directory);
+	}
+	target = owned_file_links(directory, "next", O_RDONLY, 2);
+	checked("fstat", fstat(fd, &source_st), 0);
+	checked("fstat", fstat(target, &target_st), 0);
+	if (source_st.st_dev != target_st.st_dev || source_st.st_ino != target_st.st_ino
+		|| source_st.st_nlink != 2 || target_st.st_nlink != 2)
+		fail("link-inode-identity", EIO, 1);
+	verify_fd(target);
+	event("link-inode-identity", 1, 0, 0, 0, "OK");
+	close_fd(target);
 	close_fd(fd);
 }
 
@@ -579,7 +633,7 @@ main(int argc, char **argv)
 		= { "init",		 "write",		 "read",		  "resize",		   "rename",
 			"unlink",	 "cache-reader", "rename-reader", "unlink-reader", "flock-hold",
 			"flock-try", "flock-exit",	 "fcntl-hold",	  "fcntl-try",	   "fence-writer",
-			"observe",	 "capacity-fill" };
+			"observe",	 "capacity-fill", "link-install", "link-read" };
 	const char *root = NULL;
 	const char *case_arg = NULL;
 	const char *token_arg = NULL;
@@ -670,6 +724,8 @@ main(int argc, char **argv)
 		fail("arguments", EINVAL, 2);
 	if (strstr(probe_case, "-reader") != NULL && length < 8 + TOKEN_BYTES)
 		fail("arguments", EINVAL, 2);
+	if (strncmp(probe_case, "link-", 5) == 0 && length != PAGE_BYTES)
+		fail("arguments", EINVAL, 2);
 	if (strstr(probe_case, "fcntl") != NULL && (length == 0 || length + offset > MAX_BYTES))
 		fail("arguments", EINVAL, 2);
 	if ((seen & 256) != 0 && strcmp(probe_case, "fence-writer") != 0)
@@ -686,6 +742,8 @@ main(int argc, char **argv)
 		fence_writer(directory);
 	else if (strcmp(probe_case, "observe") == 0)
 		observe_case(directory);
+	else if (strncmp(probe_case, "link-", 5) == 0)
+		link_case(directory);
 	else if (strncmp(probe_case, "flock", 5) == 0 || strncmp(probe_case, "fcntl", 5) == 0)
 		lock_case(directory);
 	else if (strcmp(probe_case, "init") != 0)

@@ -241,9 +241,14 @@ UNIT_STUB_SUPP=(
 echo "## cppcheck $(cppcheck --version)"
 echo "Scanning: ${CLUSTER_DIRS[*]}"
 
+# Missing generated test bodies otherwise look like dead local inputs. Use the
+# actual unit recipes and fail if extraction fails; never synthesize stubs here.
+make -C src/test/cluster_unit generated-analysis-inputs
+
 # The scanner writes all findings first; the strict baseline comparison
 # below determines the final exit status without losing the XML artifact.
 cppcheck \
+  --library=scripts/ci/cppcheck-pg.cfg \
   --enable=warning,style,performance,portability \
   "${GLOBAL_SUPP[@]}" \
   "${CLUSTER_ABI_SUPP[@]}" \

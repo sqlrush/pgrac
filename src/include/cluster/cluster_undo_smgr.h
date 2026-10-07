@@ -93,6 +93,29 @@ extern bool cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 s
 /* Register the per-backend fd-cache cleanup before temporary exit hooks. */
 extern void cluster_undo_smgr_ensure_exit_hook(void);
 
+/* Private recovery observation, not persisted authority. All entries require
+ * the active qualified RECOVERY_SHARED scope. Short files are distinct from
+ * I/O errors; the full-image caller may restore size before publishing block0. */
+typedef struct ClusterUndoSmgrRecoveryFileV1 {
+	uint64 device;
+	uint64 inode;
+	uint64 size;
+	bool exists;
+} ClusterUndoSmgrRecoveryFileV1;
+
+extern bool cluster_undo_smgr_recovery_probe_v1(uint32 segment, uint8 instance,
+												ClusterUndoSmgrRecoveryFileV1 *file,
+												char block0[BLCKSZ]);
+extern bool cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 instance, uint32 block,
+													 const ClusterUndoSmgrRecoveryFileV1 *expected,
+													 char out[BLCKSZ]);
+/* Only a source-proved INIT/REUSE owner may call materialize. It preserves all
+ * existing bytes through the target size and does not publish a new header. */
+extern bool cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
+													  const ClusterUndoSmgrRecoveryFileV1 *expected,
+													  const char block0[BLCKSZ],
+													  const char final_header[BLCKSZ]);
+
 
 /*
  * cluster_undo_smgr_read_header_bytes / _write_header_bytes (spec-3.11 D2)
@@ -100,10 +123,14 @@ extern void cluster_undo_smgr_ensure_exit_hook(void);
  *	Targeted read/write of a byte range within segment header block 0 (e.g. one
  *	32-byte TTSlot at offset 112 + slot*32).  Lock-free per-slot durable TT
  *	writes (each xact owns a distinct slot = non-overlapping range).  The write
- *	does NOT fsync (WAL-protected by XLOG_UNDO_TT_SLOT_COMMIT; torn write
- *	recovered by redo -- spec-3.11 C10).  offset+len must be within BLCKSZ.
- *	Returns true on success, false on bad args / I/O error / short transfer.
- *	NOT critical-section safe.
+ *	does not fsync a path the checkpointer resolves itself (own runtime undo,
+ *	local materialized copy): the caller's WAL record protects it until the
+ *	next checkpoint fsyncs it (cluster_undo_buf_flush_all).  A recovery-scoped
+ *	path is fsynced before returning, inside the caller's scope.  The caller must have
+ *	inserted that record either while holding the segment's exclusive
+ *	block-zero content lock or inside a DELAY_CHKPT_START window.  offset+len
+ *	must be within BLCKSZ.  Returns true on success, false on bad args / I/O
+ *	error / short transfer.  NOT critical-section safe.
  */
 extern bool cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent, uint32 segment_id,
 												uint8 owner_instance, uint32 offset, char *buf,
@@ -111,6 +138,33 @@ extern bool cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent, ui
 extern bool cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent, uint32 segment_id,
 												 uint8 owner_instance, uint32 offset,
 												 const char *buf, uint32 len);
+
+/*
+ * Header writer for a critical section: _open resolves and opens a private
+ * descriptor beforehand (returns -1 on failure); _write performs the same
+ * write and checkpoint bookkeeping as cluster_undo_smgr_write_header_bytes
+ * without path resolution, allocation or ERROR; _close never throws.
+ */
+extern int cluster_undo_smgr_header_writer_open(ClusterUndoPathIntent intent, uint32 segment_id,
+												uint8 owner_instance);
+extern bool cluster_undo_smgr_header_writer_write(int fd, ClusterUndoPathIntent intent,
+												  uint32 segment_id, uint8 owner_instance,
+												  uint32 offset, const char *buf, uint32 len);
+extern void cluster_undo_smgr_header_writer_close(int fd);
+
+/*
+ * Redo: block zero already shows a replayed TT record's effect (or a newer
+ * state), but those bytes may still be only in the page cache of a crashed
+ * predecessor while shared memory -- and the checkpoint's record of unsynced
+ * header writes -- was rebuilt.  Record them for the next checkpoint like a
+ * fresh write, or fsync them now.  Returns false on failure.
+ */
+extern bool cluster_undo_smgr_header_unchanged_durable(ClusterUndoPathIntent intent,
+													   uint32 segment_id, uint8 owner_instance);
+
+/* Checkpoint: fsync one segment file through the intent its header used. */
+extern bool cluster_undo_smgr_fsync_header(ClusterUndoPathIntent intent, uint32 segment_id,
+										   uint8 owner_instance);
 
 
 /*

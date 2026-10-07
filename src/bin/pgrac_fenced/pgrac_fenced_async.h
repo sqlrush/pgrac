@@ -28,6 +28,10 @@ typedef struct PgracFencedAsyncWorkerV1
 	int wait_status;
 	uint16 last_record_kind;
 	bool active;
+	/* PGRAC: parent-owned execution identity, never a reused client pointer. */
+	PgracFencedJournalRecordV1 accepted_record;
+	PgracFencedJournalRecordV1 last_record;
+	uint64 proof_generation;
 } PgracFencedAsyncWorkerV1;
 
 extern bool pgrac_fenced_async_start(

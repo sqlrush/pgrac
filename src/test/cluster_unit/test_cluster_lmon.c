@@ -43,15 +43,27 @@
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_storage_quorum.h"
+#include "cluster/cluster_ko.h"
+#include "cluster/cluster_control_retire.h"
+#include "cluster/cluster_lock_owner.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_thread_recovery.h"
+#include "cluster/cluster_pi_data.h"
+#include "cluster/cluster_pi_writeback.h"
+#include "cluster/cluster_wal_cut.h"
 #include "cluster/cluster_tt_status_hint.h"
 #include "cluster/cluster_sf_dep.h"
 #include "storage/proc.h"
 #include "storage/ipc.h"
 #include "postmaster/auxprocess.h"
 #include "utils/elog.h"
+#include "cluster/cluster_config_members.h"
+#include "cluster/cluster_shared_config.h"
 
 #undef printf
 #undef fprintf
@@ -106,10 +118,73 @@ static bool test_stop_on, test_stop_transport;
 static int test_stop_case, test_stop_exit_code, test_stop_error_level;
 static unsigned test_stop_duties, test_stop_events, test_stop_polls, test_stop_frees;
 static char test_stop_last_detail[256];
+static char test_stop_control_detail[4096];
+static char test_stop_heartbeat_detail[1024];
+static unsigned test_stop_control_logs;
+
+void
+cluster_qvotec_diagnostic_format(char *out, size_t size)
+{
+	snprintf(out, size, "qvotec_fixture=passive");
+}
+void
+cluster_storage_quorum_diagnostic_format(char *out, size_t size)
+{
+	snprintf(out, size, "storage_fixture=passive token_rx=unobserved");
+}
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	return 17;
+}
+uint64
+cluster_epoch_get_current(void)
+{
+	return 3;
+}
+
 static TimestampTz test_stop_now;
 static LWLock *test_stop_locks[8];
 static unsigned test_stop_lock_depth;
-static ClusterNormalStopPollResult test_stop_observation[20];
+static ClusterNormalStopPollResult test_stop_observation[25];
+bool cluster_shared_config;
+static unsigned test_control_owner_polls;
+
+/* Configuration coordination has separate real driver/channel tests. This
+ * original-stop fixture has no selected image or channel command. */
+void
+cluster_config_members_register(void)
+{}
+void
+cluster_shared_config_delivery_lmon_tick(void)
+{}
+void
+cluster_shared_config_delivery_lmon_cancel(void)
+{}
+
+void
+cluster_cf_retirement_poll(void)
+{}
+void
+cluster_control_retire_lmon_start(void)
+{}
+void
+cluster_control_retire_lmon_tick(void)
+{}
+/* PRE2 final-send fencing is exercised with the actual outbound/registry/TCP
+ * in test_cluster_control_transport, not this stop-loop fixture. */
+bool
+cluster_control_retire_outbound_allowed(uint8 type pg_attribute_unused(),
+										const void *payload pg_attribute_unused(),
+										uint16 len pg_attribute_unused())
+{
+	return true;
+}
+void
+cluster_lock_owners_service_poll(void)
+{
+	test_control_owner_polls++;
+}
 static void test_stop_work(bool event);
 static int test_stop_wait(WaitEvent *events);
 #include "test_cluster_lmon_stop_service.inc"
@@ -211,6 +286,19 @@ errdetail(const char *f, ...)
 	if (test_stop_on && strstr(f, "domain=%s") != NULL)
 		vsnprintf(test_stop_last_detail, sizeof(test_stop_last_detail), f, args);
 	va_end(args);
+	if (test_stop_on && strstr(f, "lmon_duty_started_mono_us=") != NULL) {
+		UT_ASSERT_EQ(test_stop_lock_depth, 0);
+		test_stop_control_logs++;
+		va_start(args, f);
+		vsnprintf(test_stop_control_detail, sizeof(test_stop_control_detail), f, args);
+		va_end(args);
+	}
+	if (test_stop_on && strstr(f, "hb_tx_done_calls=") != NULL) {
+		UT_ASSERT_EQ(test_stop_lock_depth, 0);
+		va_start(args, f);
+		vsnprintf(test_stop_heartbeat_detail, sizeof(test_stop_heartbeat_detail), f, args);
+		va_end(args);
+	}
 	return 0;
 }
 int
@@ -484,6 +572,8 @@ cluster_ic_tier1_connect_one(int32 peer_id, int *out_peer_fd)
 {
 	if (test_liveness_case() && peer_id == 1) {
 		*out_peer_fd = test_liveness_fd = 43;
+		pg_atomic_write_u64(&test_liveness_peer.heartbeat_send_count, 17);
+		pg_atomic_write_u64(&test_liveness_peer.heartbeat_recv_count, 13);
 		return true;
 	}
 	return false;
@@ -705,8 +795,25 @@ cluster_ic_tier1_peer_get(int32 peer_id)
  * with cluster_ic_router.  Stub the register API so this address-only
  * link test passes without pulling in the whole router. */
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_startup_exit.h"
 static bool test_semantic_ack_registered;
 static ClusterICMsgTypeInfo test_semantic_ack_registration;
+
+/* PGRAC: this fixture does not certify startup evidence or CONTROL ingress;
+ * the actual registration/handler is tested by test_cluster_startup_exit.
+ * Author: SqlRush <sqlrush@gmail.com> */
+void
+cluster_startup_exit_register(void)
+{}
+
+/* Mailbox/collector bodies are exercised by test_cluster_startup_exit. */
+void
+cluster_startup_exit_shmem_register(void)
+{}
+
+void
+cluster_startup_exit_lmon_tick(void)
+{}
 
 void
 cluster_ic_register_msg_type(const ClusterICMsgTypeInfo *info)
@@ -1334,6 +1441,8 @@ UT_TEST(test_lmon_completed_duty_records_one_exact_timed_pair)
 	UT_ASSERT_EQ((long long)cluster_lmon_main_loop_iters(), 1LL);
 	UT_ASSERT_EQ(test_lmon_clock_calls, 2);
 	UT_ASSERT_EQ(test_lmon_wait_calls, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&test_lmon_state.diagnostic_duty_started_mono_us), 500);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&test_lmon_state.diagnostic_duty_finished_mono_us), 2000);
 
 	cluster_lmon_timed_duty_pair(&sample_count, &total_us);
 	UT_ASSERT_EQ((unsigned long long)sample_count, 1ULL);
@@ -1463,6 +1572,67 @@ test_stop_poll(unsigned module)
 	UT_ASSERT_EQ(test_stop_frees, 0);
 	test_stop_polls++;
 	return test_stop_observation[module];
+}
+/* Mailbox owners are explicit observations here; their actual transport and
+ * physical consumers have dedicated DATA/writeback/WAL-cut suites. */
+void
+cluster_pi_data_register_v1(void)
+{}
+void
+cluster_pi_data_shmem_register_v1(void)
+{}
+void
+cluster_pi_data_lmon_tick_v1(void)
+{}
+void
+cluster_pi_writeback_register_v1(void)
+{}
+void
+cluster_pi_writeback_shmem_register_v1(void)
+{}
+void
+cluster_pi_writeback_lmon_tick_v1(void)
+{}
+void
+cluster_ko_lmon_tick_v2(void)
+{}
+void
+cluster_wal_cut_register_v1(void)
+{}
+void
+cluster_wal_cut_shmem_register_v1(void)
+{}
+void
+cluster_wal_cut_lmon_tick_v1(void)
+{}
+ClusterNormalStopPollResult
+cluster_pi_data_normal_stop_poll_v1(const char **reason)
+{
+	*reason = "FIXTURE_PI_DATA";
+	return test_stop_poll(21);
+}
+ClusterNormalStopPollResult
+cluster_pi_writeback_normal_stop_poll_v1(const char **reason)
+{
+	*reason = "FIXTURE_PI_WRITEBACK";
+	return test_stop_poll(22);
+}
+ClusterNormalStopPollResult
+cluster_ko_shared_normal_stop_poll_v2(const char **reason)
+{
+	*reason = "FIXTURE_SHARED_KO";
+	return test_stop_poll(24);
+}
+ClusterNormalStopPollResult
+cluster_wal_cut_normal_stop_poll_v1(const char **reason)
+{
+	*reason = "FIXTURE_WAL_CUT";
+	return test_stop_poll(23);
+}
+bool
+cluster_control_request_empty(void)
+{
+	return test_stop_poll(20) == CLUSTER_NORMAL_STOP_READY;
 }
 ClusterNormalStopPollResult
 cluster_grd_work_queue_normal_stop_poll(uint32 *slot, const char **reason)
@@ -1667,6 +1837,7 @@ test_stop_work(bool event)
 		UT_ASSERT_EQ(cluster_normal_stop_service_idle(CLUSTER_NORMAL_STOP_READY),
 					 CLUSTER_NORMAL_STOP_PENDING);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_idle_mask), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&test_lmon_state.diagnostic_duty_finished_mono_us), 0);
 	}
 	if ((test_stop_case == 4 && !event) || (test_stop_case == 5 && event)) {
 		LWLockAcquire(&test_lmon_state.lwlock, LW_EXCLUSIVE);
@@ -1727,7 +1898,9 @@ test_stop_wait(WaitEvent *events)
 					  || test_stop_case == 15 || test_stop_case == 17 || test_stop_case == 19
 					  || test_stop_case == 21 || test_stop_case == 23 || test_stop_case == 25
 					  || test_stop_case == 27 || test_stop_case == 29 || test_stop_case == 31
-					  || test_stop_case == 33 || test_stop_case == 35 || test_stop_case == 37)
+					  || test_stop_case == 33 || test_stop_case == 35 || test_stop_case == 37
+					  || test_stop_case == 48
+					  || (test_stop_case >= 49 && test_stop_case <= 56 && test_stop_case % 2))
 							 && test_lmon_wait_calls == 1
 						 ? 0
 						 : 1);
@@ -1735,6 +1908,15 @@ test_stop_wait(WaitEvent *events)
 	if (test_stop_case == 1 && test_lmon_wait_calls == 1) {
 		test_stop_observation[0] = CLUSTER_NORMAL_STOP_READY;
 		return 0; /* real owner becomes idle only in the following pass */
+	}
+	if (test_stop_case == 48 && test_lmon_wait_calls == 1) {
+		test_stop_observation[20] = CLUSTER_NORMAL_STOP_READY;
+		return 0; /* Exact cleanup consumer, not observer, discharges debt. */
+	}
+	if (test_stop_case >= 49 && test_stop_case <= 56 && test_stop_case % 2
+		&& test_lmon_wait_calls == 1) {
+		test_stop_observation[21 + (test_stop_case - 49) / 2] = CLUSTER_NORMAL_STOP_READY;
+		return 0; /* Simulated original mailbox consumer, not its stop observer. */
 	}
 	if (test_stop_case == 11 && test_lmon_wait_calls == 1) {
 		test_stop_observation[6] = CLUSTER_NORMAL_STOP_READY;
@@ -1843,7 +2025,12 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 	test_stop_transport = transport;
 	test_stop_exit_code = -1;
 	test_stop_duties = test_stop_events = test_stop_polls = test_stop_frees = 0;
+	test_control_owner_polls = 0;
+	cluster_shared_config = scenario >= 48 && scenario <= 56;
 	test_stop_last_detail[0] = '\0';
+	test_stop_control_detail[0] = '\0';
+	test_stop_control_logs = 0;
+	test_stop_heartbeat_detail[0] = '\0';
 	test_stop_lock_depth = 0;
 	test_lmon_wait_calls = 0;
 	test_stop_exit_callback = NULL;
@@ -1851,6 +2038,11 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 	error_context_stack = NULL;
 	for (unsigned i = 0; i < lengthof(test_stop_observation); i++)
 		test_stop_observation[i] = CLUSTER_NORMAL_STOP_READY;
+	if (scenario == 48)
+		test_stop_observation[20] = CLUSTER_NORMAL_STOP_PENDING;
+	if (scenario >= 49 && scenario <= 56)
+		test_stop_observation[21 + (scenario - 49) / 2]
+			= scenario % 2 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID;
 	if (scenario == 1 || scenario == 6)
 		test_stop_observation[0] = CLUSTER_NORMAL_STOP_PENDING;
 	if (scenario == 6)
@@ -1905,12 +2097,26 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 	if (setjmp(test_lmon_exit_jump) == 0)
 		LmonMain();
 	test_stop_on = test_lmon_exit_armed = false;
+	cluster_shared_config = false;
 	PG_exception_stack = NULL;
 	error_context_stack = NULL;
 	UT_ASSERT_EQ(test_stop_lock_depth, 0);
 	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
 	IsUnderPostmaster = false;
 	cluster_node_id = saved_node_id;
+}
+
+UT_TEST(test_stop_real_lmon_pi_wal_and_ko_mailboxes_block_until_original_consumer)
+{
+	for (int mode = 0; mode < 2; mode++)
+		for (unsigned scenario = 49; scenario <= 56; scenario += 2) {
+			test_run_normal_stop_lmon(mode, scenario);
+			UT_ASSERT_EQ(test_stop_exit_code, 0);
+			UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+			test_run_normal_stop_lmon(mode, scenario + 1);
+			UT_ASSERT_EQ(test_stop_exit_code, 1);
+			UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		}
 }
 
 UT_TEST(test_stop_real_lmon_both_modes_work_wait_exit)
@@ -1958,6 +2164,7 @@ UT_TEST(test_stop_real_lmon_both_error_segments_unwind)
 	}
 	test_run_normal_stop_lmon(true, 5);
 	UT_ASSERT_EQ(test_stop_exit_code, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&test_lmon_state.diagnostic_dispatch_finished_mono_us), 0);
 	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
 }
 UT_TEST(test_stop_real_lmon_late_invalid_overrides_pending)
@@ -1965,7 +2172,9 @@ UT_TEST(test_stop_real_lmon_late_invalid_overrides_pending)
 	for (int mode = 0; mode < 2; mode++) {
 		test_run_normal_stop_lmon(mode, 6);
 		UT_ASSERT_EQ(test_stop_exit_code, 1);
-		UT_ASSERT_EQ(test_stop_polls, lengthof(test_stop_observation));
+		/* The native profile skips the shared-config registry and the four
+		 * shared PI/DATA/WAL/KO mailbox owners. */
+		UT_ASSERT_EQ(test_stop_polls, lengthof(test_stop_observation) - 5);
 		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
 	}
 }
@@ -2198,6 +2407,10 @@ UT_TEST(test_liveness_recent_heartbeat_keeps_normal_receive_schedule)
 	test_run_normal_stop_lmon(true, 42);
 	UT_ASSERT_EQ(test_liveness_closes, 0);
 	UT_ASSERT_EQ(test_liveness_reads, 0);
+	UT_ASSERT(strstr(test_stop_heartbeat_detail, "hb_tx_done_calls=17") != NULL);
+	UT_ASSERT(strstr(test_stop_heartbeat_detail, "hb_rx_verified=13") != NULL);
+	UT_ASSERT(strstr(test_stop_heartbeat_detail, "hb_queued_completion=unobserved") != NULL);
+	UT_ASSERT(strstr(test_stop_heartbeat_detail, "token_rx=unobserved") != NULL);
 }
 
 UT_TEST(test_stop_drains_late_durability_before_each_idle_observation)
@@ -2243,10 +2456,33 @@ UT_TEST(test_stop_drains_dispatch_created_work_before_post_dispatch_idle)
 	UT_ASSERT_EQ(test_outbound_admitted, 3);
 }
 
+UT_TEST(test_stop_control_debt_survives_until_service_completion)
+{
+	for (int mode = 0; mode < 2; ++mode) {
+		test_run_normal_stop_lmon(mode, 48);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+		UT_ASSERT(test_control_owner_polls >= 2);
+	}
+}
+
+/* A READY stop still needs a timeline while checkpointer retains control. */
+UT_TEST(test_normal_stop_control_diagnostic_does_not_change_ready)
+{
+	test_run_normal_stop_lmon(false, 0);
+	UT_ASSERT_EQ(test_stop_exit_code, 0);
+	UT_ASSERT(strstr(test_stop_control_detail, "lmon_duty_started_mono_us=") != NULL);
+	UT_ASSERT(strstr(test_stop_control_detail, "lmon_duty_finished_mono_us=") != NULL);
+	UT_ASSERT(strstr(test_stop_control_detail, "token_rx=unobserved") != NULL);
+	UT_ASSERT_EQ(test_stop_control_logs, 2); /* One periodic sample, one final sample. */
+	UT_ASSERT(strstr(test_stop_control_detail, "incarnation=17 epoch=3 stop_result=2") != NULL);
+	cl_normal_stop = NULL; /* Do not leak this stop into later non-stop duties. */
+}
+
 int
 main(void)
 {
-	UT_PLAN(41);
+	UT_PLAN(44);
 	UT_RUN(test_lmon_status_enum_values_frozen);
 	UT_RUN(test_lmon_shared_state_size_under_4kb);
 	UT_RUN(test_lmon_status_to_string_lookup);
@@ -2255,12 +2491,14 @@ main(void)
 	UT_RUN(test_lmon_iteration_counters_null_safe);
 	UT_RUN(test_lmon_registers_semantic_ack_control_handler_without_broadcast);
 	UT_RUN(test_lmon_completed_duty_records_one_exact_timed_pair);
+	UT_RUN(test_normal_stop_control_diagnostic_does_not_change_ready);
 	UT_RUN(test_lmon_zero_elapsed_is_still_one_completed_sample);
 	UT_RUN(test_lmon_timed_pair_saturates_without_wrapping);
 	UT_RUN(test_lmon_runs_pcm_reclaim_once_per_duty);
 	UT_RUN(test_lmon_duty_lazy_truth_table);
 	UT_RUN(test_lmon_pid_no_pgproc_never_uses_blocking_lwlock);
 	UT_RUN(test_stop_real_lmon_both_modes_work_wait_exit);
+	UT_RUN(test_stop_real_lmon_pi_wal_and_ko_mailboxes_block_until_original_consumer);
 	UT_RUN(test_stop_real_lmon_request_during_outer_pass);
 	UT_RUN(test_stop_real_lmon_early_and_last_cut_refuse_exit);
 	UT_RUN(test_stop_real_lmon_both_error_segments_unwind);
@@ -2288,6 +2526,7 @@ main(void)
 	UT_RUN(test_stop_late_accepted_transport_tail_still_blocks_idle);
 	UT_RUN(test_online_late_publication_keeps_existing_drain_schedule);
 	UT_RUN(test_stop_drains_dispatch_created_work_before_post_dispatch_idle);
+	UT_RUN(test_stop_control_debt_survives_until_service_completion);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

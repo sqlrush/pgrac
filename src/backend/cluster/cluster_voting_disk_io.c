@@ -43,6 +43,8 @@
 #include "postgres.h"
 
 #include "cluster/cluster_voting_disk_io.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_storage_quorum.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -54,6 +56,25 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+/* Every voting authority writer, including queued mailbox work, must still
+ * belong to the live storage component at the actual I/O boundary. Raw reads
+ * remain available so an ineligible writer's old leases are never concealed. */
+static bool
+voting_disk_writer_allowed(void)
+{
+	return !cluster_shared_config || cluster_storage_quorum_allows_node(cluster_node_id);
+}
+
+static ssize_t
+voting_disk_pwrite(int fd, const void *buffer, size_t count, off_t offset)
+{
+	if (!voting_disk_writer_allowed()) {
+		errno = EACCES;
+		return -1;
+	}
+	return pwrite(fd, buffer, count, offset);
+}
 
 #ifdef __linux__
 #include <linux/fs.h>
@@ -300,6 +321,75 @@ cluster_voting_disk_read_slot(int fd, int expected_disk_index, uint32 node_id,
 	return CLUSTER_VOTING_DISK_IO_OK;
 }
 
+/* A batch is a transport optimization, not a vote or a commit proof. The
+ * caller still validates raw marker payloads and applies its original quorum.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterVotingDiskIoState
+voting_disk_read_range(int fd, off_t offset, uint32 count, void *out)
+{
+	char aligned[CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	size_t bytes;
+	ssize_t nread;
+	if (fd < 0)
+		return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+	if (out == NULL || count == 0 || count > CLUSTER_MAX_NODES)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	bytes = (size_t)count * CLUSTER_VOTING_SLOT_BYTES;
+	voting_disk_io_arm_timeout();
+	nread = pread(fd, aligned, bytes, offset);
+	voting_disk_io_disarm_timeout();
+	if (nread != (ssize_t)bytes)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	memcpy(out, aligned, bytes);
+	return CLUSTER_VOTING_DISK_IO_OK;
+}
+
+void
+cluster_voting_disk_read_slots(int fd, int expected_disk_index, uint32 first_node, uint32 count,
+							   ClusterVotingSlot *out, ClusterVotingDiskIoState *states)
+{
+	ClusterVotingDiskIoState rc;
+	/* A bounded output must be unambiguously failed even for bad arguments. */
+	if (states != NULL && count <= CLUSTER_MAX_NODES)
+		for (uint32 i = 0; i < count; ++i)
+			states[i] = CLUSTER_VOTING_DISK_IO_FAILED;
+	if (out == NULL || states == NULL || first_node >= CLUSTER_MAX_NODES || count == 0
+		|| count > CLUSTER_MAX_NODES - first_node)
+		return;
+	memset(out, 0, (size_t)count * sizeof(*out));
+	rc = voting_disk_read_range(fd, CLUSTER_VOTING_SLOT_OFFSET(first_node), count, out);
+	for (uint32 i = 0; i < count; ++i) {
+		ClusterVotingSlot *slot = &out[i];
+		states[i] = rc;
+		if (rc != CLUSTER_VOTING_DISK_IO_OK)
+			continue;
+		if (slot->crc32c != cluster_voting_disk_compute_crc32c(slot))
+			states[i] = CLUSTER_VOTING_DISK_IO_TORN;
+		else if (slot->magic != CLUSTER_VOTING_SLOT_MAGIC
+				 || slot->version != CLUSTER_VOTING_SLOT_VERSION || slot->node_id != first_node + i
+				 || (expected_disk_index >= 0 && slot->disk_index != (uint32)expected_disk_index))
+			states[i] = CLUSTER_VOTING_DISK_IO_FAILED;
+	}
+}
+
+ClusterVotingDiskIoState
+cluster_voting_disk_read_join_slots(int fd, uint32 first_node, uint32 count, void *out_slots)
+{
+	if (first_node >= CLUSTER_MAX_NODES || count == 0 || count > CLUSTER_MAX_NODES - first_node)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	return voting_disk_read_range(fd, CLUSTER_VOTING_JOIN_SLOT_OFFSET(first_node), count,
+								  out_slots);
+}
+
+ClusterVotingDiskIoState
+cluster_voting_disk_read_formation_slots(int fd, uint32 first_node, uint32 count, void *out_slots)
+{
+	if (first_node >= CLUSTER_MAX_NODES || count == 0 || count > CLUSTER_MAX_NODES - first_node)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	return voting_disk_read_range(fd, CLUSTER_VOTING_FORMATION_SLOT_OFFSET(first_node), count,
+								  out_slots);
+}
+
 
 /* ============================================================
  * cluster_voting_disk_write_slot
@@ -339,8 +429,8 @@ cluster_voting_disk_write_slot(int fd, ClusterVotingSlot *slot)
 	 * a stuck disk and the deadline applies to the full write attempt. */
 	voting_disk_io_arm_timeout();
 
-	nwritten = pwrite(fd, aligned.bytes, CLUSTER_VOTING_SLOT_BYTES,
-					  CLUSTER_VOTING_SLOT_OFFSET(slot->node_id));
+	nwritten = voting_disk_pwrite(fd, aligned.bytes, CLUSTER_VOTING_SLOT_BYTES,
+								  CLUSTER_VOTING_SLOT_OFFSET(slot->node_id));
 	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
 		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;
@@ -408,7 +498,8 @@ cluster_voting_disk_format(int fd, uint32 max_nodes, uint32 disk_index)
 	 * heartbeat-only file ended early.  Payload slots remain all-zero until
 	 * their sole writers publish canonical records.
 	 */
-	if (ftruncate(fd, CLUSTER_VOTING_FILE_BYTES_MIN) != 0 || fdatasync(fd) != 0)
+	if (!voting_disk_writer_allowed() || ftruncate(fd, CLUSTER_VOTING_FILE_BYTES_MIN) != 0
+		|| fdatasync(fd) != 0)
 		return CLUSTER_VOTING_DISK_IO_FAILED;
 
 	/*
@@ -480,8 +571,8 @@ cluster_voting_disk_write_leave_slot(int fd, uint32 node_id, const void *in_slot
 	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
 
 	voting_disk_io_arm_timeout();
-	nwritten
-		= pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_LEAVE_SLOT_OFFSET(node_id));
+	nwritten = voting_disk_pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
+								  CLUSTER_VOTING_LEAVE_SLOT_OFFSET(node_id));
 	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
 		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;
@@ -536,8 +627,8 @@ cluster_voting_disk_write_join_slot(int fd, uint32 node_id, const void *in_slot5
 	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
 
 	voting_disk_io_arm_timeout();
-	nwritten
-		= pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_JOIN_SLOT_OFFSET(node_id));
+	nwritten = voting_disk_pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
+								  CLUSTER_VOTING_JOIN_SLOT_OFFSET(node_id));
 	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
 		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;
@@ -595,8 +686,8 @@ cluster_voting_disk_write_formation_slot(int fd, uint32 node_id, const void *in_
 	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
 
 	voting_disk_io_arm_timeout();
-	nwritten = pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
-					  CLUSTER_VOTING_FORMATION_SLOT_OFFSET(node_id));
+	nwritten = voting_disk_pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
+								  CLUSTER_VOTING_FORMATION_SLOT_OFFSET(node_id));
 	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
 		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;
@@ -652,8 +743,8 @@ cluster_voting_disk_write_apply_lease_slot(int fd, uint32 node_id, const void *i
 	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
 
 	voting_disk_io_arm_timeout();
-	nwritten = pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
-					  CLUSTER_VOTING_APPLY_LEASE_SLOT_OFFSET(node_id));
+	nwritten = voting_disk_pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
+								  CLUSTER_VOTING_APPLY_LEASE_SLOT_OFFSET(node_id));
 	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
 		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;
@@ -746,8 +837,8 @@ cluster_voting_disk_write_stripe_slot_ex(int fd, uint32 node_id, const void *in_
 	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
 
 	voting_disk_io_arm_timeout();
-	nwritten = pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
-					  CLUSTER_VOTING_STRIPE_SLOT_OFFSET(node_id));
+	nwritten = voting_disk_pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
+								  CLUSTER_VOTING_STRIPE_SLOT_OFFSET(node_id));
 	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
 		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;
@@ -797,8 +888,8 @@ cluster_voting_disk_write_stripe_activation(int fd, const void *in_slot512)
 	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
 
 	voting_disk_io_arm_timeout();
-	nwritten
-		= pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_STRIPE_ACTIVATION_OFFSET);
+	nwritten = voting_disk_pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
+								  CLUSTER_VOTING_STRIPE_ACTIVATION_OFFSET);
 	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
 		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;
@@ -851,7 +942,8 @@ cluster_voting_disk_write_raw_tail_slot(int fd, const void *in_slot512)
 
 	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
 	voting_disk_io_arm_timeout();
-	nwritten = pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_PGSA_SLOT_OFFSET);
+	nwritten = voting_disk_pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
+								  CLUSTER_VOTING_PGSA_SLOT_OFFSET);
 	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
 		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;
@@ -904,7 +996,7 @@ cluster_voting_disk_write_raw_slot_at(int fd, off_t offset, const void *in_slot5
 
 	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
 	voting_disk_io_arm_timeout();
-	nwritten = pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, offset);
+	nwritten = voting_disk_pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, offset);
 	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
 		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;
@@ -955,8 +1047,8 @@ cluster_voting_disk_write_epoch_ballot_slot(int fd, uint32 proposer_node_id, con
 		return CLUSTER_VOTING_DISK_IO_FAILED;
 
 	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
-	nwritten = pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
-					  CLUSTER_VOTING_EPOCH_BALLOT_SLOT_OFFSET(proposer_node_id));
+	nwritten = voting_disk_pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
+								  CLUSTER_VOTING_EPOCH_BALLOT_SLOT_OFFSET(proposer_node_id));
 	if (nwritten != CLUSTER_VOTING_SLOT_BYTES)
 		return CLUSTER_VOTING_DISK_IO_FAILED;
 	if (fdatasync(fd) != 0)

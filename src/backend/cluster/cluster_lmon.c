@@ -63,6 +63,9 @@
 #include "cluster/cluster_clean_leave.h" /* cluster_clean_leave_register_ic_msg_types (spec-5.13 D8) */
 #include "cluster/cluster_node_remove.h" /* cluster_node_remove_lmon_tick + register (spec-5.18 D9/D10) */
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_control_retire.h"
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_cssd.h"	   /* cluster_cssd_outbound_slots (spec-2.5 D2.6) */
 #include "cluster/cluster_fence.h"	   /* cluster_fence_lmon_tick (spec-2.28 D5) */
 #include "cluster/cluster_gcs.h"	   /* cluster_gcs_register_msg_types (spec-2.32 D4) */
@@ -74,6 +77,13 @@
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_lmon_tick (spec-2.29 Step 2 D3) */
+#include "cluster/cluster_startup_exit.h"
+#include "cluster/cluster_wal_cut.h"
+#include "cluster/cluster_pi_data.h"
+#include "cluster/cluster_pi_writeback.h"
+#include "cluster/cluster_shared_config.h"
+#include "cluster/cluster_service_observe.h"
+#include "cluster/cluster_config_members.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw.h" /* cluster_hw_register_ic_msg_types (spec-5.7 D1) */
@@ -97,6 +107,9 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_storage_quorum.h"
 #include "cluster/cluster_shmem.h"
 
 
@@ -190,6 +203,10 @@ cluster_lmon_shmem_init(void)
 		LWLockInitialize(&cluster_lmon_state->lwlock, LWTRANCHE_CLUSTER_LMON);
 		cluster_lmon_state->status = CLUSTER_LMON_NOT_STARTED;
 		pg_atomic_init_u32(&cluster_lmon_state->lazy_duty_dirty, 0);
+		pg_atomic_init_u64(&cluster_lmon_state->diagnostic_duty_started_mono_us, 0);
+		pg_atomic_init_u64(&cluster_lmon_state->diagnostic_duty_finished_mono_us, 0);
+		pg_atomic_init_u64(&cluster_lmon_state->diagnostic_dispatch_started_mono_us, 0);
+		pg_atomic_init_u64(&cluster_lmon_state->diagnostic_dispatch_finished_mono_us, 0);
 	}
 
 	/*
@@ -214,6 +231,15 @@ cluster_lmon_shmem_init(void)
 		};
 
 		cluster_ic_register_msg_type(&heartbeat_info);
+		/* PGRAC: homogeneous shared-control startup only; observations do not
+		 * admit writers. Author: SqlRush <sqlrush@gmail.com> */
+		if (cluster_shared_config) {
+			cluster_startup_exit_register();
+			cluster_wal_cut_register_v1();
+			cluster_pi_data_register_v1();
+			cluster_pi_writeback_register_v1();
+			cluster_config_members_register();
+		}
 		heartbeat_registered = true;
 	}
 
@@ -520,6 +546,12 @@ void
 cluster_lmon_shmem_register(void)
 {
 	cluster_shmem_register_region(&cluster_lmon_region);
+	if (cluster_shared_config) {
+		cluster_startup_exit_shmem_register();
+		cluster_wal_cut_shmem_register_v1();
+		cluster_pi_data_shmem_register_v1();
+		cluster_pi_writeback_shmem_register_v1();
+	}
 }
 
 
@@ -987,6 +1019,10 @@ lmon_publish_status(ClusterLmonStatus status)
 		cluster_lmon_state->slow_iter_count = 0;
 		cluster_lmon_state->timed_duty_sample_count = 0;
 		cluster_lmon_state->total_iter_us = 0;
+		pg_atomic_write_u64(&cluster_lmon_state->diagnostic_duty_started_mono_us, 0);
+		pg_atomic_write_u64(&cluster_lmon_state->diagnostic_duty_finished_mono_us, 0);
+		pg_atomic_write_u64(&cluster_lmon_state->diagnostic_dispatch_started_mono_us, 0);
+		pg_atomic_write_u64(&cluster_lmon_state->diagnostic_dispatch_finished_mono_us, 0);
 		cluster_lmon_state->lmon_latch = NULL;
 	} else if (status == CLUSTER_LMON_READY) {
 		cluster_lmon_state->ready_at = now;
@@ -1053,6 +1089,8 @@ lmon_record_iteration(instr_time iter_started_at)
 	static TimestampTz last_slow_log_at = 0;
 
 	INSTR_TIME_SET_CURRENT(iter_finished_at);
+	pg_atomic_write_u64(&cluster_lmon_state->diagnostic_duty_finished_mono_us,
+						INSTR_TIME_GET_MICROSEC(iter_finished_at));
 	INSTR_TIME_SUBTRACT(iter_finished_at, iter_started_at);
 	elapsed_us = (uint64)INSTR_TIME_GET_MICROSEC(iter_finished_at);
 	now = GetCurrentTimestamp();
@@ -1094,107 +1132,33 @@ static ClusterNormalStopPollResult
 lmon_normal_stop_observe(bool final_observation)
 {
 	static TimestampTz last_pending_log;
-	ClusterNormalStopPollResult aggregate = CLUSTER_NORMAL_STOP_READY;
-	const char *first_domain = "NONE", *first_reason = "NONE";
-	int first_slot = -1;
-	uint64 first_key = 0;
+	ClusterNormalStopPollResult aggregate;
+	ClusterServiceObservation observation;
 
 	if (!cluster_normal_stop_requested())
 		return CLUSTER_NORMAL_STOP_READY;
 	/* Original owners only, never under the leave lock or after transport
 	 * close. The close-control sender may inspect its own private owners
 	 * inside a duty; this does not sign that the outer work segment is idle. */
-	for (int module = 0; module < 20; module++) {
-		ClusterNormalStopPollResult result;
-		const char *domain = "NONE", *reason = "NONE";
-		int slot = -1;
-		uint32 position = 0;
-		uint64 key = 0;
-
-		switch (module) {
-		case 0:
-			domain = "GRD_WORK";
-			result = cluster_grd_work_queue_normal_stop_poll(&position, &reason);
-			slot = (int)position;
-			break;
-		case 1:
-			domain = "GRD_OUTBOUND";
-			result = cluster_grd_outbound_normal_stop_poll(&position, &reason);
-			slot = (int)position;
-			break;
-		case 2:
-			domain = "CR";
-			result = cluster_cr_server_normal_stop_poll(&slot, &reason);
-			break;
-		case 3:
-			domain = "NATIVE_PROBE";
-			result = cluster_lms_native_probe_normal_stop_poll(&slot, &reason);
-			break;
-		case 4:
-			domain = "GCS_LOCAL";
-			result = cluster_gcs_block_normal_stop_local_poll(&slot, &reason);
-			break;
-		case 5:
-			result = cluster_ic_normal_stop_poll(&domain, &slot, &position, &reason);
-			break;
-		case 6:
-			result = cluster_semantic_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 7:
-			result = cluster_scn_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 8:
-			result = cluster_reconfig_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 9:
-			domain = "CLOSE_CONTROL";
-			result = cluster_clean_leave_normal_stop_local_poll(&slot, &reason);
-			break;
-		case 10:
-			result = cluster_node_remove_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 11:
-			result = cluster_fence_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 12:
-			result = cluster_write_fence_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 13:
-			domain = "CF";
-			/* Own holds are strict for LMON. The node-wide join hint is
-			 * consumed by the original checkpoint and checked by its post
-			 * census, not prematurely required before that checkpoint. */
-			result = cluster_cf_normal_stop_poll(false, &reason);
-			break;
-		case 14:
-			result = cluster_recovery_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 15:
-			result = cluster_backup_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 16:
-			result = cluster_mrp_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 17:
-			result = cluster_gcs_dedup_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 18:
-			result = cluster_ges_dedup_normal_stop_poll(&domain, &key, &reason);
-			break;
-		default:
-			domain = "LMD_PROBE";
-			result = cluster_lmd_probe_normal_stop_poll(&key, &reason);
-			break;
+	aggregate = cluster_service_normal_stop_observe(&observation);
+	if (aggregate == CLUSTER_NORMAL_STOP_READY && cluster_shared_config) {
+		aggregate = cluster_pi_data_normal_stop_poll_v1(&observation.reason);
+		observation.domain = "current-holder-data";
+		if (aggregate == CLUSTER_NORMAL_STOP_READY) {
+			aggregate = cluster_wal_cut_normal_stop_poll_v1(&observation.reason);
+			observation.domain = "native-wal-cut";
 		}
-		if (result != CLUSTER_NORMAL_STOP_READY && result != CLUSTER_NORMAL_STOP_PENDING)
-			result = CLUSTER_NORMAL_STOP_INVALID;
-		if ((result == CLUSTER_NORMAL_STOP_INVALID && aggregate != CLUSTER_NORMAL_STOP_INVALID)
-			|| (result == CLUSTER_NORMAL_STOP_PENDING && aggregate == CLUSTER_NORMAL_STOP_READY)) {
-			aggregate = result;
-			first_domain = domain;
-			first_reason = reason;
-			first_slot = slot;
-			first_key = key;
+		if (aggregate == CLUSTER_NORMAL_STOP_READY) {
+			aggregate = cluster_pi_writeback_normal_stop_poll_v1(&observation.reason);
+			observation.domain = "physical-pi-writeback";
+		}
+		if (aggregate == CLUSTER_NORMAL_STOP_READY) {
+			aggregate = cluster_ko_shared_normal_stop_poll_v2(&observation.reason);
+			observation.domain = "shared-object-flush";
+		}
+		if (aggregate != CLUSTER_NORMAL_STOP_READY) {
+			observation.slot = -1;
+			observation.key = 0;
 		}
 	}
 	if (aggregate == CLUSTER_NORMAL_STOP_PENDING) {
@@ -1203,15 +1167,17 @@ lmon_normal_stop_observe(bool final_observation)
 			|| now - last_pending_log >= INT64CONST(1000000)) {
 			last_pending_log = now;
 			ereport(LOG, (errmsg_internal("LMON normal-stop responsibility pending"),
-						  errdetail("domain=%s slot=%d key=%llu reason=%s", first_domain,
-									first_slot, (unsigned long long)first_key, first_reason)));
+						  errdetail("domain=%s slot=%d key=%llu reason=%s", observation.domain,
+									observation.slot, (unsigned long long)observation.key,
+									observation.reason)));
 		}
 	}
 	if (aggregate == CLUSTER_NORMAL_STOP_INVALID) {
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
 		ereport(LOG, (errmsg_internal("LMON normal-stop responsibility invalid"),
-					  errdetail("domain=%s slot=%d key=%llu reason=%s", first_domain, first_slot,
-								(unsigned long long)first_key, first_reason)));
+					  errdetail("domain=%s slot=%d key=%llu reason=%s", observation.domain,
+								observation.slot, (unsigned long long)observation.key,
+								observation.reason)));
 	}
 	return aggregate;
 }
@@ -1222,10 +1188,84 @@ cluster_lmon_normal_stop_poll(void)
 	return lmon_normal_stop_observe(false);
 }
 
+/* Read-only S17 timeline on the existing one-second stop diagnostic cadence.
+ * Inputs: original aggregate and final-observation flag. No provider, queue,
+ * admission, disk or lock operation; fields are evidence, never permission.
+ * Heartbeat DONE counters omit queued-tail completions; recv time includes
+ * stale-epoch liveness, unlike the verified receive count. Neither implies a
+ * Corosync token receipt. Author: SqlRush <sqlrush@gmail.com> */
+static void
+lmon_normal_stop_diagnostic(bool final, ClusterNormalStopPollResult result)
+{
+	static TimestampTz last_log;
+	TimestampTz now;
+	instr_time observed;
+	char qvotec[1024];
+	char storage[1536];
+
+	if (!cluster_normal_stop_requested() || cluster_lmon_state == NULL)
+		return;
+	now = GetCurrentTimestamp();
+	if (!final && last_log != 0 && now >= last_log && now - last_log < INT64CONST(1000000))
+		return;
+	last_log = now;
+	INSTR_TIME_SET_CURRENT(observed);
+	cluster_qvotec_diagnostic_format(qvotec, sizeof(qvotec));
+	cluster_storage_quorum_diagnostic_format(storage, sizeof(storage));
+	ereport(LOG, (errmsg_internal("LMON normal-stop control timeline"),
+				  errdetail(
+					  "node=%d pid=%d procno=%d incarnation=%llu epoch=%llu stop_result=%d "
+					  "observed_pg_us=%lld observed_mono_us=%llu clock_lmon=INSTR_TIME clock_id=%d "
+					  "lmon_duty_started_mono_us=%llu lmon_duty_finished_mono_us=%llu "
+					  "lmon_dispatch_started_mono_us=%llu lmon_dispatch_finished_mono_us=%llu "
+					  "completed_duties=%llu wait_event=%u %s %s",
+					  cluster_node_id, MyProcPid, MyProc != NULL ? MyProc->pgprocno : -1,
+					  (unsigned long long)cluster_qvotec_get_self_incarnation(),
+					  (unsigned long long)cluster_epoch_get_current(), result, (long long)now,
+					  (unsigned long long)INSTR_TIME_GET_MICROSEC(observed), (int)PG_INSTR_CLOCK,
+					  (unsigned long long)pg_atomic_read_u64(
+						  &cluster_lmon_state->diagnostic_duty_started_mono_us),
+					  (unsigned long long)pg_atomic_read_u64(
+						  &cluster_lmon_state->diagnostic_duty_finished_mono_us),
+					  (unsigned long long)pg_atomic_read_u64(
+						  &cluster_lmon_state->diagnostic_dispatch_started_mono_us),
+					  (unsigned long long)pg_atomic_read_u64(
+						  &cluster_lmon_state->diagnostic_dispatch_finished_mono_us),
+					  (unsigned long long)cluster_lmon_state->timed_duty_sample_count,
+					  MyProc != NULL ? MyProc->wait_event_info : 0, qvotec, storage)));
+	for (int peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		const ClusterICPeerStateShmem *p = cluster_ic_tier1_peer_get(peer);
+
+		if (peer == cluster_node_id || p == NULL || cluster_conf_lookup_node(peer) == NULL)
+			continue;
+		ereport(LOG,
+				(errmsg_internal("LMON normal-stop tier1 CONTROL heartbeat timeline"),
+				 errdetail(
+					 "node=%d pid=%d peer=%d state=%d observed_pg_us=%lld "
+					 "hb_tx_done_calls=%llu hb_tx_done_pg_us=%lld "
+					 "hb_rx_verified=%llu hb_rx_liveness_pg_us=%lld "
+					 "transport_tx_bytes=%llu transport_rx_bytes=%llu "
+					 "hb_queued_completion=unobserved clock_heartbeat=wall token_rx=unobserved",
+					 cluster_node_id, MyProcPid, peer, p->state, (long long)now,
+					 (unsigned long long)pg_atomic_read_u64(
+						 (pg_atomic_uint64 *)&p->heartbeat_send_count),
+					 (long long)p->last_heartbeat_sent_at,
+					 (unsigned long long)pg_atomic_read_u64(
+						 (pg_atomic_uint64 *)&p->heartbeat_recv_count),
+					 (long long)p->last_heartbeat_recv_at,
+					 (unsigned long long)pg_atomic_read_u64((pg_atomic_uint64 *)&p->bytes_send),
+					 (unsigned long long)pg_atomic_read_u64((pg_atomic_uint64 *)&p->bytes_recv))));
+	}
+}
+
 static ClusterNormalStopPollResult
 lmon_normal_stop_idle(void)
 {
-	return cluster_normal_stop_service_idle(cluster_lmon_normal_stop_poll());
+	ClusterNormalStopPollResult result
+		= cluster_normal_stop_service_idle(cluster_lmon_normal_stop_poll());
+
+	lmon_normal_stop_diagnostic(false, result);
+	return result;
 }
 
 static void
@@ -1255,6 +1295,7 @@ lmon_normal_stop_before_exit(void)
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
 		ereport(FATAL, (errmsg_internal("LMON transport still owns normal-stop work")));
 	}
+	lmon_normal_stop_diagnostic(true, CLUSTER_NORMAL_STOP_READY);
 	lmon_normal_stop_exit_verified = true;
 }
 
@@ -1274,6 +1315,8 @@ LmonMain(void)
 	Assert(IsUnderPostmaster);
 
 	MyBackendType = B_LMON;
+	if (cluster_shared_config)
+		cluster_control_retire_lmon_start();
 	lmon_normal_stop_exit_verified = false;
 	before_shmem_exit(lmon_normal_stop_exit_callback, 0);
 	init_ps_display(NULL);
@@ -1454,6 +1497,7 @@ LmonMain(void)
 			}
 
 			if (ShutdownRequestPending || cluster_lmon_shutdown_requested_public()) {
+				cluster_shared_config_delivery_lmon_cancel();
 				break;
 			}
 
@@ -1463,6 +1507,13 @@ LmonMain(void)
 			{
 				duty_started_at = GetCurrentTimestamp();
 				INSTR_TIME_SET_CURRENT(iter_started_at);
+				pg_atomic_write_u64(&cluster_lmon_state->diagnostic_duty_started_mono_us,
+									INSTR_TIME_GET_MICROSEC(iter_started_at));
+
+				/* PGRAC: service-owned control work must progress on latch wake,
+				 * not depend on a client ProcSignal handler. Author: SqlRush <sqlrush@gmail.com> */
+				cluster_cf_retirement_poll();
+				cluster_lock_owners_service_poll();
 
 				/*
 			 * PGRAC: spec-7.2 D1 -- >= 1 Hz floor for the lazy duty
@@ -1540,6 +1591,15 @@ LmonMain(void)
 				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GES_WORK_QUEUE,
 												 force_all_duties))
 					cluster_ges_lmon_drain_work_queue();
+				if (cluster_shared_config) {
+					cluster_control_retire_lmon_tick();
+					cluster_startup_exit_lmon_tick();
+					cluster_wal_cut_lmon_tick_v1();
+					cluster_pi_data_lmon_tick_v1();
+					cluster_pi_writeback_lmon_tick_v1();
+					cluster_ko_lmon_tick_v2();
+					cluster_shared_config_delivery_lmon_tick();
+				}
 				/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
 			 * constructed them; only LMON owns the IC connections). */
 				if (!cluster_gcs_block_family_on_data_plane()
@@ -2049,6 +2109,11 @@ LmonMain(void)
 			work_completed = false;
 			PG_TRY();
 			{
+				instr_time dispatch_sample;
+
+				INSTR_TIME_SET_CURRENT(dispatch_sample);
+				pg_atomic_write_u64(&cluster_lmon_state->diagnostic_dispatch_started_mono_us,
+									INSTR_TIME_GET_MICROSEC(dispatch_sample));
 				for (i = 0; i < n_events; i++) {
 					intptr_t tag = (intptr_t)ev[i].user_data;
 
@@ -2213,6 +2278,9 @@ LmonMain(void)
 				/* Dispatch can create outbound replies after the duty drain. */
 				if (cluster_normal_stop_requested())
 					(void)cluster_grd_outbound_lmon_drain_send();
+				INSTR_TIME_SET_CURRENT(dispatch_sample);
+				pg_atomic_write_u64(&cluster_lmon_state->diagnostic_dispatch_finished_mono_us,
+									INSTR_TIME_GET_MICROSEC(dispatch_sample));
 				work_completed = true;
 			}
 			PG_FINALLY();
@@ -2260,6 +2328,7 @@ LmonMain(void)
 			}
 
 			if (ShutdownRequestPending || cluster_lmon_shutdown_requested_public()) {
+				cluster_shared_config_delivery_lmon_cancel();
 				break;
 			}
 
@@ -2269,8 +2338,12 @@ LmonMain(void)
 			{
 				duty_started_at = GetCurrentTimestamp();
 				INSTR_TIME_SET_CURRENT(iter_started_at);
+				pg_atomic_write_u64(&cluster_lmon_state->diagnostic_duty_started_mono_us,
+									INSTR_TIME_GET_MICROSEC(iter_started_at));
 
 				/* PGRAC: spec-7.2 D1 — >= 1 Hz floor (see the TIER_1 loop). */
+				cluster_cf_retirement_poll();
+				cluster_lock_owners_service_poll();
 				dnow = duty_started_at;
 				force_all_duties = (dnow >= next_duty_floor_at);
 				if (force_all_duties)
@@ -2342,6 +2415,15 @@ LmonMain(void)
 				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GES_WORK_QUEUE,
 												 force_all_duties))
 					cluster_ges_lmon_drain_work_queue();
+				if (cluster_shared_config) {
+					cluster_control_retire_lmon_tick();
+					cluster_startup_exit_lmon_tick();
+					cluster_wal_cut_lmon_tick_v1();
+					cluster_pi_data_lmon_tick_v1();
+					cluster_pi_writeback_lmon_tick_v1();
+					cluster_ko_lmon_tick_v2();
+					cluster_shared_config_delivery_lmon_tick();
+				}
 				(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
 				/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
 			 * constructed them; only LMON owns the IC connections). */

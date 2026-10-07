@@ -122,6 +122,7 @@
 #include "catalog/catalog.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/storage.h"
+#include "common/relmap.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "storage/fd.h"
@@ -155,30 +156,6 @@
  */
 #define RELMAPPER_FILENAME		"pg_filenode.map"
 #define RELMAPPER_TEMP_FILENAME	"pg_filenode.map.tmp"
-
-#define RELMAPPER_FILEMAGIC		0x592717	/* version ID value */
-
-/*
- * There's no need for this constant to have any particular value, and we
- * can raise it as necessary if we end up with more mapped relations. For
- * now, we just pick a round number that is modestly larger than the expected
- * number of mappings.
- */
-#define MAX_MAPPINGS			64
-
-typedef struct RelMapping
-{
-	Oid			mapoid;			/* OID of a catalog */
-	RelFileNumber mapfilenumber;	/* its rel file number */
-} RelMapping;
-
-typedef struct RelMapFile
-{
-	int32		magic;			/* always RELMAPPER_FILEMAGIC */
-	int32		num_mappings;	/* number of valid RelMapping entries */
-	RelMapping	mappings[MAX_MAPPINGS];
-	pg_crc32c	crc;			/* CRC of all above */
-} RelMapFile;
 
 /*
  * State for serializing local and shared relmappings for parallel workers

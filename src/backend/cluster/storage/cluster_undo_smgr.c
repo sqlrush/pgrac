@@ -32,6 +32,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_recovery.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -39,6 +40,7 @@
 #include <unistd.h>
 
 #include "miscadmin.h"
+#include "common/file_perm.h"
 #include "storage/fd.h"
 #include "storage/ipc.h" /* before_shmem_exit (fd cache cleanup) */
 #include "utils/elog.h"
@@ -48,6 +50,7 @@
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/storage/cluster_undo_alloc.h"
+#include "cluster/storage/cluster_undo_block0.h"
 
 
 /*
@@ -76,6 +79,8 @@ static bool cached_fd_exit_registered = false;
 static uint64 provision_temp_counter = 0;
 
 static bool provision_fsync_parent(const char *final_path);
+static bool header_write_recorded(int fd, ClusterUndoPathIntent intent, uint32 segment_id,
+								  uint8 owner_instance);
 
 #define PGRD_MIRROR_NAME "pgrac_undo_root.control"
 #define PGRD_MIRROR_TEMP_MARKER ".pgrac-rdtmp."
@@ -197,6 +202,17 @@ get_segment_fd(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 {
 	char path[MAXPGPATH];
 	int fd;
+	bool resolved = false;
+
+	/* A cached descriptor carries no recovery authority. */
+	if (intent == CLUSTER_UNDO_PATH_RECOVERY_SHARED) {
+		if (cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path))
+			!= 0) {
+			fd_cache_close();
+			return -1;
+		}
+		resolved = true;
+	}
 
 	if (cached_fd >= 0 && cached_fd_segment == segment_id && cached_fd_owner == owner_instance
 		&& cached_fd_intent == intent)
@@ -204,7 +220,8 @@ get_segment_fd(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 
 	fd_cache_close(); /* miss: drop the stale fd first */
 
-	if (cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path)) != 0)
+	if (!resolved
+		&& cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path)) != 0)
 		return -1;
 	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
 	if (fd < 0)
@@ -227,6 +244,173 @@ void
 cluster_undo_smgr_fd_cache_reset(void)
 {
 	fd_cache_close();
+}
+
+static bool
+undo_recovery_file_stat(int fd, ClusterUndoSmgrRecoveryFileV1 *file)
+{
+	struct stat st;
+
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0)
+		return false;
+	memset(file, 0, sizeof(*file));
+	file->exists = true;
+	file->device = st.st_dev;
+	file->inode = st.st_ino;
+	file->size = st.st_size;
+	return true;
+}
+
+static bool
+undo_recovery_file_same(const ClusterUndoSmgrRecoveryFileV1 *a,
+						const ClusterUndoSmgrRecoveryFileV1 *b)
+{
+	return a->exists == b->exists && a->device == b->device && a->inode == b->inode
+		   && a->size == b->size;
+}
+
+static bool
+undo_recovery_read(int fd, uint64 size, uint32 block, char out[BLCKSZ])
+{
+	uint64 offset = (uint64)block * BLCKSZ;
+	Size length = size <= offset ? 0 : Min(size - offset, BLCKSZ);
+
+	memset(out, 0, BLCKSZ);
+	if (length == 0)
+		return true;
+	/* Known EOF is zero extension. An unexpected short/error read is not. */
+	return pg_pread(fd, out, length, (off_t)offset) == (ssize_t)length;
+}
+
+bool
+cluster_undo_smgr_recovery_probe_v1(uint32 segment, uint8 instance,
+									ClusterUndoSmgrRecoveryFileV1 *file, char block0[BLCKSZ])
+{
+	ClusterUndoSmgrRecoveryFileV1 observed = { 0 };
+	PGAlignedBlock page = { 0 };
+	char path[MAXPGPATH];
+	int flags = O_RDONLY | PG_BINARY;
+	int fd;
+	bool ok;
+
+	if (file == NULL || block0 == NULL
+		|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, instance, segment, path,
+									 sizeof(path))
+			   != 0)
+		return false;
+#ifdef O_NOFOLLOW
+	flags |= O_NOFOLLOW;
+#endif
+	fd = BasicOpenFile(path, flags);
+	if (fd < 0) {
+		if (errno != ENOENT)
+			return false;
+	} else {
+		ok = undo_recovery_file_stat(fd, &observed)
+			 && undo_recovery_read(fd, observed.size, 0, page.data);
+		if (close(fd) != 0)
+			ok = false;
+		if (!ok)
+			return false;
+	}
+	*file = observed;
+	memcpy(block0, page.data, BLCKSZ);
+	return true;
+}
+
+bool
+cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 instance, uint32 block,
+										 const ClusterUndoSmgrRecoveryFileV1 *expected,
+										 char out[BLCKSZ])
+{
+	ClusterUndoSmgrRecoveryFileV1 observed;
+	PGAlignedBlock page;
+	char path[MAXPGPATH];
+	int flags = O_RDONLY | PG_BINARY;
+	int fd;
+	bool ok;
+
+	if (expected == NULL || out == NULL || block >= UNDO_BLOCKS_PER_SEGMENT
+		|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, instance, segment, path,
+									 sizeof(path))
+			   != 0)
+		return false;
+#ifdef O_NOFOLLOW
+	flags |= O_NOFOLLOW;
+#endif
+	fd = BasicOpenFile(path, flags);
+	if (fd < 0) {
+		if (errno != ENOENT || expected->exists)
+			return false;
+		memset(out, 0, BLCKSZ);
+		return true;
+	}
+	ok = undo_recovery_file_stat(fd, &observed) && undo_recovery_file_same(expected, &observed)
+		 && undo_recovery_read(fd, observed.size, block, page.data);
+	if (close(fd) != 0)
+		ok = false;
+	if (ok)
+		memcpy(out, page.data, BLCKSZ);
+	return ok;
+}
+
+bool
+cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
+										  const ClusterUndoSmgrRecoveryFileV1 *expected,
+										  const char block0[BLCKSZ],
+										  const char final_header[BLCKSZ])
+{
+	ClusterUndoSmgrRecoveryFileV1 observed;
+	PGAlignedBlock page;
+	char path[MAXPGPATH], checked[MAXPGPATH], parent[MAXPGPATH];
+	int flags = O_RDWR | PG_BINARY;
+	int fd;
+	bool ok;
+
+	if (expected == NULL || block0 == NULL || final_header == NULL
+		|| !cluster_undo_segment_header_identity_ok(final_header, segment, instance)
+		|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, instance, segment, path,
+									 sizeof(path))
+			   != 0)
+		return false;
+	fd_cache_close();
+	strlcpy(parent, path, sizeof(parent));
+	get_parent_directory(parent);
+	if (!expected->exists) {
+		/* The canonical undo root already exists; create only this instance's
+		 * native directory, never an alternative local root. */
+		if (mkdir(parent, pg_dir_create_mode) != 0 && errno != EEXIST)
+			return false;
+		flags |= O_CREAT | O_EXCL;
+	}
+#ifdef O_NOFOLLOW
+	flags |= O_NOFOLLOW;
+#endif
+	if (cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, instance, segment, checked,
+								  sizeof(checked))
+			!= 0
+		|| strcmp(path, checked) != 0)
+		return false;
+	fd = BasicOpenFile(path, flags);
+	if (fd < 0)
+		return false;
+	ok = undo_recovery_file_stat(fd, &observed);
+	if (ok && expected->exists)
+		ok = undo_recovery_file_same(expected, &observed)
+			 && undo_recovery_read(fd, observed.size, 0, page.data)
+			 && memcmp(page.data, block0, BLCKSZ) == 0;
+	if (ok)
+		ok = cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED, instance, segment,
+									   checked, sizeof(checked))
+				 == 0
+			 && strcmp(path, checked) == 0;
+	if (ok)
+		ok = ftruncate(fd, UNDO_SEGMENT_SIZE_BYTES) == 0 && pg_fsync(fd) == 0;
+	if (close(fd) != 0)
+		ok = false;
+	/* Sync both the file name and the possibly newly created instance dir.
+	 * Do this on retries too: a previous directory sync may have failed. */
+	return ok && provision_fsync_parent(path) && provision_fsync_parent(parent);
 }
 
 
@@ -294,8 +478,11 @@ cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment_id, u
  *   pwrite to disjoint ranges is safe; lifecycle writes the header prefix at
  *   offset 32-111, also disjoint from the slot array).  The write does NOT
  *   fsync: the durable TT commit is WAL-protected (XLOG_UNDO_TT_SLOT_COMMIT),
- *   so a torn data-file write is recovered by redo (spec-3.11 C10).  offset+len
- *   must stay inside block 0 (BLCKSZ).
+ *   so a torn data-file write is recovered by redo (spec-3.11 C10).  That
+ *   holds only until a checkpoint moves the redo pointer past the record, so
+ *   a write to a path the checkpointer resolves itself is recorded for its
+ *   fsync; any other write (a recovery-scoped path, or no block-zero region)
+ *   is fsynced here.  offset+len must stay inside block 0 (BLCKSZ).
  */
 bool
 cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent, uint32 segment_id,
@@ -333,8 +520,70 @@ cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent, uint32 segmen
 
 	nwritten = pg_pwrite(fd, buf, len, (off_t)offset);
 	cluster_undo_record_note_smgr_pwrite();
-	/* No fsync: WAL-protected (spec-3.11 C10). */
-	return (nwritten == (ssize_t)len);
+	if (nwritten != (ssize_t)len)
+		return false;
+	return header_write_recorded(fd, intent, segment_id, owner_instance);
+}
+
+/* Leave a written header range to the checkpoint's fsync, or fsync it now
+ * through the descriptor this process resolved (for a recovery-scoped path,
+ * inside the recoverer's scope). */
+static bool
+header_write_recorded(int fd, ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance)
+{
+	if (cluster_undo_block0_note_unsynced_header(segment_id, owner_instance, intent))
+		return true;
+	return pg_fsync(fd) == 0;
+}
+
+int
+cluster_undo_smgr_header_writer_open(ClusterUndoPathIntent intent, uint32 segment_id,
+									 uint8 owner_instance)
+{
+	int fd = get_segment_fd(intent, segment_id, owner_instance);
+
+	return fd < 0 ? -1 : dup(fd);
+}
+
+bool
+cluster_undo_smgr_header_writer_write(int fd, ClusterUndoPathIntent intent, uint32 segment_id,
+									  uint8 owner_instance, uint32 offset, const char *buf,
+									  uint32 len)
+{
+	ssize_t nwritten;
+
+	if (fd < 0 || buf == NULL || len == 0 || (uint64)offset + (uint64)len > (uint64)BLCKSZ)
+		return false;
+	nwritten = pg_pwrite(fd, buf, len, (off_t)offset);
+	cluster_undo_record_note_smgr_pwrite();
+	if (nwritten != (ssize_t)len)
+		return false;
+	return header_write_recorded(fd, intent, segment_id, owner_instance);
+}
+
+void
+cluster_undo_smgr_header_writer_close(int fd)
+{
+	if (fd >= 0)
+		(void)close(fd);
+}
+
+bool
+cluster_undo_smgr_header_unchanged_durable(ClusterUndoPathIntent intent, uint32 segment_id,
+										   uint8 owner_instance)
+{
+	int fd = get_segment_fd(intent, segment_id, owner_instance);
+
+	return fd >= 0 && header_write_recorded(fd, intent, segment_id, owner_instance);
+}
+
+bool
+cluster_undo_smgr_fsync_header(ClusterUndoPathIntent intent, uint32 segment_id,
+							   uint8 owner_instance)
+{
+	int fd = get_segment_fd(intent, segment_id, owner_instance);
+
+	return fd >= 0 && pg_fsync(fd) == 0;
 }
 
 
@@ -820,7 +1069,8 @@ cluster_undo_smgr_fsync_segment_file(uint32 segment_id, uint8 owner_instance)
 {
 	int fd;
 
-	fd = get_segment_fd(cluster_undo_intent_for_owner(owner_instance), segment_id, owner_instance);
+	fd = get_segment_fd(cluster_undo_recovery_intent_for_owner(owner_instance), segment_id,
+						owner_instance);
 	if (fd < 0)
 		return false;
 

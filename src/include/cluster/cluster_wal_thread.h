@@ -191,6 +191,70 @@ cluster_wal_thread_dir_name(uint16 thread_id, char *buf, size_t buflen)
 
 #ifndef FRONTEND
 
+#include "cluster/cluster_wal_source.h"
+
+/* Root-selected writer routing reference, not write/flush/recovery authority.
+ * False until the exact initializer completes INSTALL and publishes the new
+ * reference, or outside PRE2. Callers still need their runtime gates. */
+extern bool cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out);
+/* Exact never-served input qualification, available only after actual INSTALL
+ * and only in its original formation epoch. Does not grant runtime authority. */
+extern bool cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *expected,
+														  uint64 epoch);
+/* Exact CLEAN qualification from collective exit evidence and actual INSTALL.
+ * It is not the never-served input and does not replace live runtime gates. */
+extern bool cluster_wal_thread_clean_writer_matches(const ClusterWalSourceRef *expected,
+													uint64 epoch);
+/* Immutable restart input, independent of the ordinary writer reference.
+ * Reading this mirror never authorizes WAL insertion or serving. */
+extern bool cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out);
+
+/* Read-only native Startup observation of its selected CLEAN input, before
+ * WAL binding or INSTALL. The root owner revalidates the complete formation
+ * and durable fence. This value does not authorize serving or mutation. */
+typedef struct ClusterWalStartupCleanInputV1 {
+	ClusterControlRootIdentity predecessor;
+	uint8 predecessor_claim_sha256[32];
+	ClusterWalThreadClaimV2 successor;
+	uint64 formation_epoch;
+	uint64 config_generation;
+	uint64 predecessor_root_sequence;
+	uint8 predecessor_root_sha256[32];
+	uint8 exit_evidence_sha256[32];
+	uint8 operation_uuid[16];
+	uint64 operation_generation;
+	XLogRecPtr checkpoint_lsn;
+	XLogRecPtr checkpoint_end;
+	uint32 checkpoint_crc32c;
+	TimeLineID timeline;
+} ClusterWalStartupCleanInputV1;
+
+/* Refusal clears out; never substitutes a caller flag or installed writer
+ * for the original selected input. Implemented by the native xlog owner. */
+extern ClusterControlRootResult
+cluster_wal_startup_clean_input_v1(ClusterWalStartupCleanInputV1 *out);
+
+/* Last successful native checkpoint observation, never retention authority.
+ * Byte intervals derived from these LSNs exclude other writer generations,
+ * preallocation and filesystem allocation. Unknown until first publication. */
+typedef struct ClusterWalThreadCheckpointSampleV1 {
+	uint64 root_publish_seq;
+	XLogRecPtr retained_lower;
+	XLogRecPtr native_redo;
+	XLogRecPtr validated_tail;
+	int64 published_at_usec;
+} ClusterWalThreadCheckpointSampleV1;
+
+extern void cluster_wal_thread_checkpoint_observed_v1(const ClusterControlRootSnapshot *record,
+													  XLogRecPtr native_redo);
+extern bool cluster_wal_thread_checkpoint_sample_v1(ClusterWalThreadCheckpointSampleV1 *out);
+struct ClusterWalStartupImage;
+/* StartupProcess-only INSTALL plus exact route check, then once-only shared
+ * writer-reference publication. This never overwrites the restart input and
+ * does not admit serving. Refuses conflicting or partially published state. */
+extern ClusterControlRootResult
+cluster_wal_thread_install_startup(const struct ClusterWalStartupImage *expected);
+
 /*
  * cluster_wal_thread_id -- this instance's WAL thread identity.
  *
@@ -234,6 +298,13 @@ extern uint16 cluster_wal_thread_stamp(void);
  *	     or validated against this node's identity
  */
 extern void cluster_wal_thread_init(void);
+
+/* Original initdb children only; no GUC or online writer identity is installed. */
+extern void cluster_wal_thread_initdb_accept(bool bootstrap);
+struct PgracInitdbWalContext;
+extern const struct PgracInitdbWalContext *cluster_wal_thread_initdb_context(void);
+extern uint64 cluster_wal_thread_initdb_system_identifier(void);
+extern uint16 cluster_wal_thread_initdb_stamp(void);
 
 /* L206 five-step shmem region registration ("pgrac wal thread"). */
 extern void cluster_wal_thread_shmem_register(void);

@@ -78,8 +78,15 @@ extern void cluster_cf_resid_encode(ClusterResId *dst);
  *
  *	cluster_cf_unlock releases the previously-held lock, draining and waking
  *	any blocked cross-node waiters (via S6 release).  A no-op if not held.
+ *	An unconfirmed release retains the exact cleanup record, not authority.
+ *	Use cluster_cf_unlock_confirmed when the caller must consume the verdict.
  */
 extern bool cluster_cf_lock(LOCKMODE mode);
+extern bool cluster_cf_lock_poll(LOCKMODE mode);
+extern bool cluster_cf_acquire_pending(LOCKMODE mode);
+extern uint64 cluster_cf_owner_cookie(LOCKMODE mode);
+extern bool cluster_cf_release_completed(LOCKMODE mode, uint64 cookie);
+extern void cluster_cf_retirement_poll(void);
 extern void cluster_cf_unlock(LOCKMODE mode);
 
 typedef enum ClusterCfReleaseResult {
@@ -88,20 +95,35 @@ typedef enum ClusterCfReleaseResult {
 	CLUSTER_CF_RELEASE_UNCONFIRMED = 2
 } ClusterCfReleaseResult;
 
-extern bool cluster_cf_held_is_clusterwide(LOCKMODE mode);
 extern ClusterCfReleaseResult cluster_cf_unlock_confirmed(LOCKMODE mode);
 
+/* Auxiliary tasks share the process CF slot, not each other's request.
+ * caller is a stable, non-NULL process-lifetime address, never a wire or
+ * authority identity. Another caller (including untagged APIs) cannot poll
+ * or retire this slot. Existing background retirement owns abandoned holds.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+extern bool cluster_cf_lock_poll_owned(LOCKMODE mode, const void *caller);
+extern bool cluster_cf_acquire_pending_owned(LOCKMODE mode, const void *caller);
+extern bool cluster_cf_held_by(LOCKMODE mode, const void *caller);
+extern ClusterCfReleaseResult cluster_cf_unlock_owned(LOCKMODE mode, const void *caller);
+
 /*
- * cluster_cf_held -- true if this backend currently holds the CF lock in the
- * given mode.  Used by the write path to Assert the caller-level CF X is held
- * before an authority write (spec-5.6).
+ * cluster_cf_held -- retained ownership, including an unconfirmed release.
+ * Use for lock-order, reentry and shutdown checks, never as positive proof
+ * of permission to read or write. Only exact retirement clears this record.
  */
 extern bool cluster_cf_held(LOCKMODE mode);
+
+/* Positive authority ends before the first release attempt can yield/throw.
+ * The usable predicate includes native holds; clusterwide also requires GES. */
+extern bool cluster_cf_held_is_usable(LOCKMODE mode);
+extern bool cluster_cf_held_is_clusterwide(LOCKMODE mode);
 
 /*
  * cluster_cf_write_permitted -- true if a shared-authority control-file write
  * is currently allowed by one of three process-local facts: this backend holds
- * CF X, Startup owns the bootstrap single-node window, or the EOR checkpointer
+ * usable CF X, Startup owns the bootstrap single-node window, or the EOR checkpointer
  * consumed that exact OWNER handoff.  Shared phase alone never grants a write.
  */
 extern bool cluster_cf_write_permitted(void);

@@ -7,6 +7,8 @@
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * PGRAC MODIFICATIONS: honor qualified redo buffer initialization results.
+ *
  * IDENTIFICATION
  *			 src/backend/access/gin/ginxlog.c
  *-------------------------------------------------------------------------
@@ -44,12 +46,17 @@ static void
 ginRedoCreatePTree(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	ginxlogCreatePostingTree *data = (ginxlogCreatePostingTree *) XLogRecGetData(record);
-	char	   *ptr;
+	const ginxlogCreatePostingTree *data = (ginxlogCreatePostingTree *) XLogRecGetData(record);
+	const char	   *ptr;
 	Buffer		buffer;
 	Page		page;
 
-	buffer = XLogInitBufferForRedo(record, 0);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &buffer)
+		!= BLK_NEEDS_REDO) {
+		if (BufferIsValid(buffer))
+			UnlockReleaseBuffer(buffer);
+		return;
+	}
 	page = (Page) BufferGetPage(buffer);
 
 	GinInitBuffer(buffer, GIN_DATA | GIN_LEAF | GIN_COMPRESSED);
@@ -528,7 +535,7 @@ static void
 ginRedoUpdateMetapage(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	ginxlogUpdateMeta *data = (ginxlogUpdateMeta *) XLogRecGetData(record);
+	const ginxlogUpdateMeta *data = (ginxlogUpdateMeta *) XLogRecGetData(record);
 	Buffer		metabuffer;
 	Page		metapage;
 	Buffer		buffer;
@@ -538,14 +545,16 @@ ginRedoUpdateMetapage(XLogReaderState *record)
 	 * image, so restore the metapage unconditionally without looking at the
 	 * LSN, to avoid torn page hazards.
 	 */
-	metabuffer = XLogInitBufferForRedo(record, 0);
-	Assert(BufferGetBlockNumber(metabuffer) == GIN_METAPAGE_BLKNO);
-	metapage = BufferGetPage(metabuffer);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &metabuffer)
+		== BLK_NEEDS_REDO) {
+		Assert(BufferGetBlockNumber(metabuffer) == GIN_METAPAGE_BLKNO);
+		metapage = BufferGetPage(metabuffer);
 
-	GinInitMetabuffer(metabuffer);
-	memcpy(GinPageGetMeta(metapage), &data->metadata, sizeof(GinMetaPageData));
-	PageSetLSN(metapage, lsn);
-	MarkBufferDirty(metabuffer);
+		GinInitMetabuffer(metabuffer);
+		memcpy(GinPageGetMeta(metapage), &data->metadata, sizeof(GinMetaPageData));
+		PageSetLSN(metapage, lsn);
+		MarkBufferDirty(metabuffer);
+	}
 
 	if (data->ntuples > 0)
 	{
@@ -557,7 +566,6 @@ ginRedoUpdateMetapage(XLogReaderState *record)
 			Page		page = BufferGetPage(buffer);
 			OffsetNumber off;
 			int			i;
-			Size		tupsize;
 			char	   *payload;
 			IndexTuple	tuples;
 			Size		totaltupsize;
@@ -572,6 +580,8 @@ ginRedoUpdateMetapage(XLogReaderState *record)
 
 			for (i = 0; i < data->ntuples; i++)
 			{
+				Size		tupsize;
+
 				tupsize = IndexTupleSize(tuples);
 
 				if (PageAddItem(page, (Item) tuples, tupsize, off,
@@ -593,7 +603,8 @@ ginRedoUpdateMetapage(XLogReaderState *record)
 			MarkBufferDirty(buffer);
 		}
 		if (BufferIsValid(buffer))
-			UnlockReleaseBuffer(buffer);
+			if (BufferIsValid(buffer))
+				UnlockReleaseBuffer(buffer);
 	}
 	else if (data->prevTail != InvalidBlockNumber)
 	{
@@ -610,29 +621,34 @@ ginRedoUpdateMetapage(XLogReaderState *record)
 			MarkBufferDirty(buffer);
 		}
 		if (BufferIsValid(buffer))
-			UnlockReleaseBuffer(buffer);
+			if (BufferIsValid(buffer))
+				UnlockReleaseBuffer(buffer);
 	}
 
-	UnlockReleaseBuffer(metabuffer);
+	if (BufferIsValid(metabuffer))
+		UnlockReleaseBuffer(metabuffer);
 }
 
 static void
 ginRedoInsertListPage(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	ginxlogInsertListPage *data = (ginxlogInsertListPage *) XLogRecGetData(record);
+	const ginxlogInsertListPage *data = (ginxlogInsertListPage *) XLogRecGetData(record);
 	Buffer		buffer;
 	Page		page;
-	OffsetNumber l,
-				off = FirstOffsetNumber;
-	int			i,
-				tupsize;
+	OffsetNumber off = FirstOffsetNumber;
+	int			i;
 	char	   *payload;
 	IndexTuple	tuples;
 	Size		totaltupsize;
 
 	/* We always re-initialize the page. */
-	buffer = XLogInitBufferForRedo(record, 0);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &buffer)
+		!= BLK_NEEDS_REDO) {
+		if (BufferIsValid(buffer))
+			UnlockReleaseBuffer(buffer);
+		return;
+	}
 	page = BufferGetPage(buffer);
 
 	GinInitBuffer(buffer, GIN_LIST);
@@ -653,6 +669,9 @@ ginRedoInsertListPage(XLogReaderState *record)
 	tuples = (IndexTuple) payload;
 	for (i = 0; i < data->ntuples; i++)
 	{
+		OffsetNumber l;
+		int			tupsize;
+
 		tupsize = IndexTupleSize(tuples);
 
 		l = PageAddItem(page, (Item) tuples, tupsize, off, false, false);
@@ -675,20 +694,22 @@ static void
 ginRedoDeleteListPages(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	ginxlogDeleteListPages *data = (ginxlogDeleteListPages *) XLogRecGetData(record);
+	const ginxlogDeleteListPages *data = (ginxlogDeleteListPages *) XLogRecGetData(record);
 	Buffer		metabuffer;
 	Page		metapage;
 	int			i;
 
-	metabuffer = XLogInitBufferForRedo(record, 0);
-	Assert(BufferGetBlockNumber(metabuffer) == GIN_METAPAGE_BLKNO);
-	metapage = BufferGetPage(metabuffer);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &metabuffer)
+		== BLK_NEEDS_REDO) {
+		Assert(BufferGetBlockNumber(metabuffer) == GIN_METAPAGE_BLKNO);
+		metapage = BufferGetPage(metabuffer);
 
-	GinInitMetabuffer(metabuffer);
+		GinInitMetabuffer(metabuffer);
 
-	memcpy(GinPageGetMeta(metapage), &data->metadata, sizeof(GinMetaPageData));
-	PageSetLSN(metapage, lsn);
-	MarkBufferDirty(metabuffer);
+		memcpy(GinPageGetMeta(metapage), &data->metadata, sizeof(GinMetaPageData));
+		PageSetLSN(metapage, lsn);
+		MarkBufferDirty(metabuffer);
+	}
 
 	/*
 	 * In normal operation, shiftList() takes exclusive lock on all the
@@ -708,18 +729,23 @@ ginRedoDeleteListPages(XLogReaderState *record)
 	for (i = 0; i < data->ndeleted; i++)
 	{
 		Buffer		buffer;
-		Page		page;
 
-		buffer = XLogInitBufferForRedo(record, i + 1);
-		page = BufferGetPage(buffer);
-		GinInitBuffer(buffer, GIN_DELETED);
+		if (XLogReadBufferForRedoExtended(record, i + 1, RBM_ZERO_AND_LOCK, false, &buffer)
+			== BLK_NEEDS_REDO) {
+			Page		page;
 
-		PageSetLSN(page, lsn);
-		MarkBufferDirty(buffer);
+			page = BufferGetPage(buffer);
+			GinInitBuffer(buffer, GIN_DELETED);
 
-		UnlockReleaseBuffer(buffer);
+			PageSetLSN(page, lsn);
+			MarkBufferDirty(buffer);
+		}
+
+		if (BufferIsValid(buffer))
+			UnlockReleaseBuffer(buffer);
 	}
-	UnlockReleaseBuffer(metabuffer);
+	if (BufferIsValid(metabuffer))
+		UnlockReleaseBuffer(metabuffer);
 }
 
 void

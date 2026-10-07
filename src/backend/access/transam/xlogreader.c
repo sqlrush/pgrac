@@ -788,6 +788,7 @@ XLogDecodeNextRecord(XLogReaderState *state, bool nonblocking)
 
 	/* reset error state */
 	state->errormsg_buf[0] = '\0';
+	state->cluster_record_crc_failed = false;
 	decoded = NULL;
 
 	state->abortedRecPtr = InvalidXLogRecPtr;
@@ -1027,8 +1028,16 @@ restart:
 			pageHeaderSize = XLogPageHeaderSize(pageHeader);
 
 			if (readOff < pageHeaderSize)
+			{
 				readOff = ReadPageInternal(state, targetPagePtr,
 										   pageHeaderSize);
+				/* PGRAC: a short long-header page may fail this second read.
+				 * Never consume stale buffer bytes after failure or deferral. */
+				if (readOff == XLREAD_WOULDBLOCK)
+					return XLREAD_WOULDBLOCK;
+				else if (readOff < 0)
+					goto err;
+			}
 
 			Assert(pageHeaderSize <= readOff);
 
@@ -1038,8 +1047,16 @@ restart:
 				len = pageHeader->xlp_rem_len;
 
 			if (readOff < pageHeaderSize + len)
+			{
 				readOff = ReadPageInternal(state, targetPagePtr,
 										   pageHeaderSize + len);
+				/* PGRAC: the long-header continuation may need more bytes
+				 * than the short-header-sized read above actually supplied. */
+				if (readOff == XLREAD_WOULDBLOCK)
+					return XLREAD_WOULDBLOCK;
+				else if (readOff < 0)
+					goto err;
+			}
 
 			memcpy(buffer, (char *) contdata, len);
 			buffer += len;
@@ -1490,6 +1507,7 @@ ValidXLogRecord(XLogReaderState *state, XLogRecord *record, XLogRecPtr recptr)
 
 	if (!EQ_CRC32C(record->xl_crc, crc))
 	{
+		state->cluster_record_crc_failed = true;
 		report_invalid_record(state,
 							  "incorrect resource manager data checksum in record at %X/%X",
 							  LSN_FORMAT_ARGS(recptr));
@@ -1690,6 +1708,7 @@ XLogReaderResetError(XLogReaderState *state)
 {
 	state->errormsg_buf[0] = '\0';
 	state->errormsg_deferred = false;
+	state->cluster_record_crc_failed = false;
 }
 
 /*
@@ -1941,6 +1960,7 @@ ResetDecoder(XLogReaderState *state)
 	/* Clear error state. */
 	state->errormsg_buf[0] = '\0';
 	state->errormsg_deferred = false;
+	state->cluster_record_crc_failed = false;
 }
 
 /*

@@ -48,6 +48,8 @@
 #include "cluster/cluster_ic_envelope.h" /* spec-2.9 D4:  ClusterICEnvelope + PGRAC_IC_MSG_BOC_BROADCAST */
 #include "cluster/cluster_ic_router.h" /* spec-2.9 D4: ClusterICFanoutResult */
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_wal_thread.h"
+#include "utils/memutils.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D2 stub — profiling gate */
 #include "port/atomics.h"
@@ -77,6 +79,19 @@
  */
 
 bool IsUnderPostmaster = false;
+MemoryContext TopMemoryContext;
+/* No original initdb creator in this runtime fixture. */
+const struct PgracInitdbWalContext *
+cluster_wal_thread_initdb_context(void)
+{
+	return NULL;
+}
+void *
+MemoryContextAllocZero(MemoryContext context, Size size)
+{
+	abort();
+}
+
 static unsigned test_scn_lock_depth;
 
 /* spec-5.59 D2 stubs: cluster_scn.o now carries GUC-gated profiling probes
@@ -1281,6 +1296,7 @@ UT_TEST(test_a148_scn_stop_original_zero_time_frontier_is_pending)
 int
 main(void)
 {
+	UT_PLAN(34);
 	UT_RUN(test_a148_scn_stop_missing_and_wrong_owner_not_empty);
 	/* Spec-7.4 D1 durable_safe_scn frontier registry (9) --
 	 * T-scn-74-1a..1i.  Cumulative shmem state;  overflow test last. */

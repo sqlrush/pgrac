@@ -61,6 +61,7 @@
 #include "cluster/cluster_lmd_wait_state.h" /* spec-5.8 D1d — per-proc wait-state */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_cancel_token.h" /* spec-5.9 D3 cluster_cancel_token_consume */
 #include "cluster/cluster_signal.h"		  /* cluster_ges_cancel_pending sig_atomic_t */
@@ -170,7 +171,8 @@ cluster_lock_acquire_s1_entry(const ClusterLockAcquireRequest *req)
 
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
-
+	if (!cluster_grd_control_acquire_allowed(&req->resid, req->lockmode))
+		return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
 
 	/* RF-ROOT P6 Scheme A: a formed boot is always fail-closed unless it
 	 * holds one of the two explicit readiness proofs.  Recovery readiness
@@ -264,6 +266,16 @@ cluster_lock_acquire_is_relation_request(const ClusterLockAcquireRequest *req)
 		   && req->current_mode == NoLock;
 }
 
+static bool
+cluster_lock_acquire_is_cf_request(const ClusterLockAcquireRequest *req)
+{
+	return req->resid.type == CLUSTER_CF_RESID_TYPE && req->op == CLUSTER_LOCK_OP_REQUEST
+		   && req->current_mode == NoLock && !req->dontwait
+		   && (req->lockmode == ShareLock || req->lockmode == ExclusiveLock);
+}
+
+static bool cluster_lock_acquire_is_hw_request(const ClusterLockAcquireRequest *req);
+
 /*
  * S3 partition + reservation — spec-2.17 §1.4 Q6 F3 race window 防御。
  *
@@ -293,9 +305,13 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	if (!cluster_grd_control_acquire_allowed(&req->resid, req->lockmode))
+		return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
 
 	mut = (ClusterLockAcquireRequest *)req;
 	fill_request_holder(mut);
+	if (!cluster_lock_owner_request_prepare(mut))
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
 	er = cluster_grd_try_reserve(&req->resid, &req->holder, (int)req->lockmode, self_node,
 								 cluster_local_fast_path_enabled ? &fast_path : NULL,
@@ -307,10 +323,13 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 
 	mut->master_gen_snapshot = gen_snapshot;
 	pg_atomic_fetch_add_u64(&stub_s3_reservation_count, 1);
-	/* A relation's compatible siblings may mutate the entry while PG-native
-	 * acquisition runs.  Use the existing local/remote master in S4, not an
-	 * optimistic entry revision as a second grant authority. */
-	if (cluster_lock_acquire_is_relation_request(req))
+	/* Compatible siblings may mutate the entry while acquisition runs.  Use
+	 * the existing local/remote master in S4, not an optimistic entry revision
+	 * as a second grant authority. CF has no PG-native lock; HW acquires its
+	 * native relation-extension lock only after this global handoff, so local
+	 * HW reservations can overlap here too. */
+	if (cluster_lock_acquire_is_relation_request(req) || cluster_lock_acquire_is_cf_request(req)
+		|| cluster_lock_acquire_is_hw_request(req))
 		return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 
 	if (cluster_local_fast_path_enabled && fast_path) {
@@ -348,6 +367,20 @@ cluster_lock_acquire_is_hw_request(const ClusterLockAcquireRequest *req)
 		   && req->op == CLUSTER_LOCK_OP_REQUEST && req->current_mode == NoLock && !req->dontwait;
 }
 
+static bool
+cluster_lock_acquire_retained_grant_is_current(const ClusterLockAcquireRequest *req)
+{
+	if (cluster_lock_acquire_is_relation_request(req))
+		return cluster_ges_relation_grant_is_current(&req->hw_grant, &req->resid, &req->holder,
+													 req->request_id, req->lockmode, req->dontwait);
+	if (cluster_lock_acquire_is_cf_request(req))
+		return cluster_ges_cf_grant_is_current(&req->hw_grant, &req->resid, &req->holder,
+											   req->request_id, req->lockmode);
+	return cluster_lock_acquire_is_hw_request(req)
+		   && cluster_ges_hw_grant_is_current(&req->hw_grant, &req->resid, &req->holder,
+											  req->request_id);
+}
+
 ClusterLockAcquireResult
 cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req)
 {
@@ -361,6 +394,8 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
 	dontwait = req->dontwait;
+	if (req->resid.type == CLUSTER_CF_RESID_TYPE && !cluster_lock_acquire_is_cf_request(req))
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	is_advisory = (req->locktag.locktag_type == LOCKTAG_ADVISORY);
 
 	pg_atomic_fetch_add_u64(&stub_s4_remote_count, 1);
@@ -419,6 +454,11 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 					&req->resid, (uint32)req->lockmode, &req->holder, req->request_id,
 					req->timeout_ms, req->wait_event, false,
 					&((ClusterLockAcquireRequest *)req)->hw_grant);
+			else if (cluster_lock_acquire_is_cf_request(req))
+				reject = cluster_ges_send_cf_request_and_wait(
+					&req->resid, (uint32)req->lockmode, &req->holder, req->request_id,
+					req->timeout_ms, req->wait_event,
+					&((ClusterLockAcquireRequest *)req)->hw_grant);
 			else
 				reject = cluster_ges_send_request_and_wait(&req->resid, (uint32)req->lockmode,
 														   &req->holder, req->request_id,
@@ -429,7 +469,8 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 			if (ws != NULL)
 				cluster_lmd_wait_state_clear(ws);
 			if (cluster_lock_acquire_is_hw_request(req)
-				|| cluster_lock_acquire_is_relation_request(req)) {
+				|| cluster_lock_acquire_is_relation_request(req)
+				|| cluster_lock_acquire_is_cf_request(req)) {
 				ConditionVariableCancelSleep();
 				(void)cluster_lock_acquire_s7_cleanup(req);
 			}
@@ -616,14 +657,19 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	if (!cluster_grd_control_acquire_allowed(&req->resid, req->lockmode))
+		return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
 	mut->registration_failure_reason = NULL;
 
-	/* Retained HW/relation GRANT owns its exact registration, not the S3
+	/* Retained HW/relation/CF GRANT owns its exact registration, not the S3
 	 * mutation snapshot.  Unmodified legacy classes keep their old path. */
 	if (req->hw_grant.key.request_id != 0) {
 		ClusterGesHwGrant *grant = &((ClusterLockAcquireRequest *)req)->hw_grant;
 		volatile bool promoted = false;
-		bool relation = cluster_lock_acquire_is_relation_request(req);
+		bool mode_aware
+			= cluster_lock_acquire_is_relation_request(req)
+			  || cluster_lock_acquire_is_cf_request(req)
+			  || (cluster_lock_acquire_is_hw_request(req) && grant->master == cluster_node_id);
 
 		if (grant->consumed) {
 			mut->registration_failure_reason = "GRANT_ALREADY_CONSUMED";
@@ -632,17 +678,12 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 		PG_TRY();
 		{
 			mut->registration_failure_reason = "GRANT_IDENTITY_NOT_CURRENT";
-			if (relation ? cluster_ges_relation_grant_is_current(grant, &req->resid, &req->holder,
-																 req->request_id, req->lockmode,
-																 req->dontwait)
-						 : (cluster_lock_acquire_is_hw_request(req)
-							&& cluster_ges_hw_grant_is_current(grant, &req->resid, &req->holder,
-															   req->request_id))) {
+			if (cluster_lock_acquire_retained_grant_is_current(req)) {
 				mut->registration_failure_reason = "EXACT_RESERVATION_OR_HOLDER_MISSING";
-				if (relation && grant->master == cluster_node_id)
+				if (mode_aware && grant->master == cluster_node_id)
 					er = cluster_grd_confirm_local_grant_exact(&req->resid, &req->holder,
 															   req->lockmode);
-				else if (relation)
+				else if (mode_aware)
 					er = cluster_grd_promote_remote_grant_mode_exact(&req->resid, &req->holder,
 																	 req->lockmode);
 				else
@@ -651,11 +692,7 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 					= er == CLUSTER_GRD_ENTRY_OK && grant->master != cluster_node_id;
 				if (er == CLUSTER_GRD_ENTRY_OK) {
 					mut->registration_failure_reason = "GRANT_CHANGED_DURING_REGISTRATION";
-					promoted = relation ? cluster_ges_relation_grant_is_current(
-											  grant, &req->resid, &req->holder, req->request_id,
-											  req->lockmode, req->dontwait)
-										: cluster_ges_hw_grant_is_current(
-											  grant, &req->resid, &req->holder, req->request_id);
+					promoted = cluster_lock_acquire_retained_grant_is_current(req);
 				}
 				if (promoted) {
 					grant->consumed = true;
@@ -677,7 +714,7 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 		pg_atomic_fetch_add_u64(&stub_s5_promote_count, 1);
 		return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 	}
-	if (cluster_lock_acquire_is_relation_request(req)) {
+	if (cluster_lock_acquire_is_relation_request(req) || req->resid.type == CLUSTER_CF_RESID_TYPE) {
 		mut->registration_failure_reason = "NO_RETAINED_MASTER_GRANT";
 		(void)cluster_lock_acquire_s7_cleanup(req);
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
@@ -719,6 +756,7 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 {
 	int32 master;
 	uint32 release_result;
+	uint64 epoch;
 
 	ensure_counter_initialized();
 
@@ -732,6 +770,7 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 	 * not confirmation, and the local path must return an actual exact-holder
 	 * removal verdict rather than assuming a void drain succeeded.
 	 */
+	epoch = cluster_epoch_get_current();
 	master = cluster_grd_lookup_master(&req->resid);
 	if (master < 0)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
@@ -761,6 +800,13 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 		if (release_result != GES_REJECT_REASON_NONE)
 			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	}
+
+	/* The lower release may reobserve routing after this S6 choice. A local
+	 * absence in a newly selected master is not the old remote holder's ACK.
+	 * Keep the caller's cleanup identity on every changed cut.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_epoch_get_current() != epoch || cluster_grd_lookup_master(&req->resid) != master)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
 	pg_atomic_fetch_add_u64(&stub_s6_release_count, 1);
 	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
@@ -928,8 +974,7 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 
 	/* S1 entry — HC1 fail-closed。*/
 	r = cluster_lock_acquire_s1_entry(req);
-	if (r == CLUSTER_LOCK_ACQUIRE_OK_NATIVE || r == CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE
-		|| r == CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL)
+	if (r != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
 		return r;
 
 	/* S2 identity。*/
@@ -966,7 +1011,8 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 		bool ir_bootstrap_bypass
 			= (req->recovery_bootstrap && req->resid.type == CLUSTER_IR_RESID_TYPE);
 
-		if (!ir_bootstrap_bypass && cluster_grd_shard_phase(gate_shard) != GRD_SHARD_NORMAL) {
+		if (!ir_bootstrap_bypass && cluster_grd_shard_phase(gate_shard) != GRD_SHARD_NORMAL
+			&& !cluster_grd_control_recovery_ready(&req->resid, req->lockmode)) {
 			TimestampTz gate_deadline;
 
 			if (req->dontwait)
@@ -975,7 +1021,8 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 			gate_deadline
 				= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), cluster_grd_remaster_wait_ms);
 			for (;;) {
-				if (cluster_grd_shard_phase(gate_shard) == GRD_SHARD_NORMAL)
+				if (cluster_grd_shard_phase(gate_shard) == GRD_SHARD_NORMAL
+					|| cluster_grd_control_recovery_ready(&req->resid, req->lockmode))
 					break;
 				if (GetCurrentTimestamp() >= gate_deadline)
 					return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
@@ -999,6 +1046,8 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 		ClusterLockAcquireRequest *mut = (ClusterLockAcquireRequest *)req;
 
 		fill_request_holder(mut);
+		if (!cluster_lock_owner_request_prepare(mut))
+			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 		return CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
 	}
 
@@ -1302,6 +1351,9 @@ cluster_grd_redeclare_all_registered(void)
 {
 	uint64 gen;
 	uint64 cur_epoch;
+	uint64 enumerated_count = 0;
+	uint64 private_count = 0;
+	uint32 registered_count;
 	HTAB *locallocks;
 	HASH_SEQ_STATUS status;
 	LOCALLOCK *locallock;
@@ -1326,10 +1378,12 @@ cluster_grd_redeclare_all_registered(void)
 	gen = cluster_grd_redeclare_generation();
 	if (gen == 0)
 		return; /* no barrier ever armed */
-	if (pg_atomic_read_u64(&MyProc->cluster_grd_redeclare_acked) >= gen)
-		return; /* already acked this generation */
-
 	cur_epoch = cluster_epoch_get_current();
+	if (pg_atomic_read_u64(&MyProc->cluster_grd_redeclare_acked) == gen
+		&& pg_atomic_read_u64(&MyProc->cluster_grd_redeclare_acked_epoch) == cur_epoch)
+		return; /* already acked this exact reconstruction cut */
+
+	registered_count = pg_atomic_read_u32(&MyProc->cluster_grd_registered_count);
 	locallocks = GetLockMethodLocalHash();
 	if (locallocks != NULL) {
 		hash_seq_init(&status, locallocks);
@@ -1343,6 +1397,7 @@ cluster_grd_redeclare_all_registered(void)
 
 			if (!locallock->cluster_registered)
 				continue;
+			enumerated_count++;
 
 			/*
 			 * Release-in-flight guard:  the lock.c cluster release hook
@@ -1372,8 +1427,9 @@ cluster_grd_redeclare_all_registered(void)
 			if (master == cluster_node_id) {
 				/* Local master (incl. shard just remastered TO this
 				 * node):  direct insert-or-rebind, no wire. */
-				ok = (cluster_grd_entry_rebind_or_insert_holder(
-						  &resid, &new_holder, cluster_node_id, (int)locallock->tag.mode)
+				ok = (cluster_grd_entry_rebind_or_insert_holder_group(
+						  &resid, &new_holder, cluster_node_id, (int)locallock->tag.mode,
+						  cluster_ges_current_lock_group(&new_holder))
 					  == CLUSTER_GRD_ENTRY_OK);
 			} else if (master >= 0) {
 				ok = (cluster_ges_send_redeclare_and_wait(&resid, (uint32)locallock->tag.mode,
@@ -1392,15 +1448,23 @@ cluster_grd_redeclare_all_registered(void)
 		}
 	}
 
+	/* Manual CF/WALR-style holders do not have a native LOCALLOCK.  Their
+	 * stable process-owned records participate in the very same ACK. */
+	if (!cluster_lock_owners_redeclare(&private_count))
+		all_ok = false;
+	enumerated_count += private_count;
+
 	/*
-	 * P0-1 epoch coherence:  ack ONLY if the epoch did not move while we
-	 * walked.  If it did, the holders we just stamped are already stale;
-	 * leaving this proc un-acked makes LMON's barrier wait, and the next
-	 * generation (re-broadcast under the new episode epoch) re-walks us.
-	 * We publish the ack EPOCH alongside the generation so the barrier
-	 * can reject an ack that pre-dates a mid-episode epoch bump.
+	 * Missing registered records are not an empty census.  The complete
+	 * owner count, generation and epoch must also survive any blocking
+	 * re-declaration; otherwise the next broadcast must walk us again.
+	 * Count release-in-flight records too, without rebinding them above.
+	 * Publish epoch before generation so the barrier can reject an ACK
+	 * that pre-dates a mid-episode epoch bump.
 	 */
-	if (all_ok && cluster_epoch_get_current() == cur_epoch) {
+	if (all_ok && enumerated_count == registered_count
+		&& pg_atomic_read_u32(&MyProc->cluster_grd_registered_count) == registered_count
+		&& cluster_epoch_get_current() == cur_epoch && cluster_grd_redeclare_generation() == gen) {
 		pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked_epoch, cur_epoch);
 		pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked, gen);
 	}

@@ -24,7 +24,8 @@
  *	  DDL path (RelationDropStorage / RelationTruncate), while the dropping node
  *	  already holds the cross-node AccessExclusiveLock (spec-5.3 TM) on the
  *	  relation -- so no peer can re-dirty the relfilenode after the flush.  The
- *	  peer FLUSHES dirty buffers to shared storage and THEN invalidates them
+ *	  peer FLUSHES dirty buffers to shared storage, synchronizes existing shared
+ *	  forks, and THEN invalidates them
  *	  (flush-then-invalidate, not pure discard): if the dropping transaction
  *	  rolls back the relation survives intact and peers re-read from storage with
  *	  no data loss, while ereport(ERROR 53RAA) is still able to abort the
@@ -79,6 +80,47 @@ StaticAssertDecl(CLUSTER_KO_RESID_TYPE != CLUSTER_DL_RESID_TYPE,
  */
 extern void cluster_ko_resid_encode(RelFileLocator rloc, ClusterResId *dst);
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_space_identity.h"
+
+#define CLUSTER_KO_SHARED_V2_BYTES 160
+#define CLUSTER_KO_SHARED_CONTEXT_LIMIT_V2 64
+#define CLUSTER_KO_SHARED_MEMBER_BYTES 16
+#define CLUSTER_KO_SHARED_REQUEST 1
+#define CLUSTER_KO_SHARED_ACK 2
+#define CLUSTER_KO_SHARED_REQUEST_STATUS 0
+#define CLUSTER_KO_SHARED_DONE 1
+#define CLUSTER_KO_SHARED_FAILED 2
+
+/* Values only, never a wire struct. The codec validates representation, not
+ * membership, physical flush completion or permission to retire a PI.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterKoSharedMessageV2 {
+	uint16 verb;
+	uint16 status;
+	uint64 batch_id;
+	uint64 epoch;
+	uint64 origin_boot;
+	uint64 peer_boot;
+	ClusterSpaceIdentityKey key;
+	uint8 incarnation[16];
+	uint16 origin_node;
+	uint16 peer_node;
+	uint8 members[CLUSTER_KO_SHARED_MEMBER_BYTES];
+	uint8 member_digest[32];
+} ClusterKoSharedMessageV2;
+
+/* Exact length, little-endian, unaligned buffers accepted. Refusal preserves
+ * output; overlapping input and output is refused. Nonshared legacy payloads
+ * below remain separate and are never accepted by these shared codecs. */
+extern bool cluster_ko_shared_encode_v2(const ClusterKoSharedMessageV2 *message, void *bytes,
+										size_t length);
+extern bool cluster_ko_shared_decode_v2(const void *bytes, size_t length,
+										ClusterKoSharedMessageV2 *out);
+extern bool cluster_ko_shared_ack_matches_v2(const ClusterKoSharedMessageV2 *request,
+											 const ClusterKoSharedMessageV2 *ack);
+#endif
+
 #ifndef FRONTEND
 
 #include "cluster/cluster_ic_envelope.h" /* ClusterICEnvelope */
@@ -91,7 +133,7 @@ extern void cluster_ko_resid_encode(RelFileLocator rloc, ClusterResId *dst);
  * KO_FLUSH_ACK only AFTER the drop completes (apply-after-drop, KO-M6).
  *
  *   batch_id     -- ack_wait correlation id (shared 2.39 allocator, KO-B2)
- *   epoch        -- HC100 stale-reply guard (reconfig fences old barriers)
+ *   epoch        -- exact request configuration, retained through peer I/O
  *   db/rel/spc   -- the relfilenode triple to drop
  *   source_node  -- the dropping node (where to send KO_FLUSH_ACK)
  */
@@ -120,7 +162,9 @@ typedef enum KoFlushAckStatus {
 
 /*
  * KoFlushAckHeader -- PGRAC_IC_MSG_KO_FLUSH_ACK payload (peer -> dropping node).
- * Sent ONLY after the peer has really dropped the relfilenode's buffers.
+ * Sent ONLY after the peer has really dropped the relfilenode's buffers;
+ * shared forks must first be synchronized.  The epoch echoes the request,
+ * and a reconfiguration during the work prevents a successful ACK.
  */
 typedef struct KoFlushAckHeader {
 	uint64 batch_id;  /*  8B [ 0,  8) echo of the KO_FLUSH batch_id */
@@ -159,6 +203,205 @@ StaticAssertDecl(sizeof(KoFlushAckHeader) == 24, "spec-5.7 D6 KoFlushAckHeader w
  */
 extern void cluster_ko_flush_and_wait_ack(RelFileLocator rlocator, char relpersistence);
 
+#ifdef USE_PGRAC_CLUSTER
+/* Original barrier's process/ResourceOwner-local completion. The caller still
+ * holds exclusive relation lifecycle authority. Only a successful original
+ * barrier can construct this handle; raw ACK bytes cannot. Release before its
+ * owner ends, on every exit. These APIs certify only the KO scope, never a
+ * commit, a durable structural effect, an ancestor chain or PI retirement.
+ * Direct begin binds CurrentResourceOwner. The native shared DDL wrapper
+ * retains its completion with CurTransactionResourceOwner for SPACE. */
+typedef struct ClusterKoCompletionV2 ClusterKoCompletionV2;
+/* Successful subtransaction cleanup transfers this original handle to its
+ * parent ResourceOwner. Native observed handles span top-level commit's
+ * pending deletes; all others end at the original ResourceOwner cleanup.
+ * Neither is a persistent or background structural-retirement certificate. */
+extern bool cluster_ko_shared_begin_v2(RelFileLocator rlocator, char relpersistence,
+									   ClusterKoCompletionV2 **out);
+/* Original native DDL -> SPACE owner, before its first structural change.
+ * Takes an existing native-wrapper completion exactly once in that exact
+ * transaction (including its portal owners). No allocation, page I/O or
+ * second barrier. Refusal leaves out unchanged. */
+extern bool cluster_ko_shared_claim_v2(const ClusterSpaceIdentityKey *key,
+									   const uint8 incarnation[16], ClusterKoCompletionV2 **out);
+struct ClusterPageWalBindingV1;
+/* Original SPACE finish, after both pages have an exact durable observation.
+ * Saves only that observation in the already reserved native handle. This is
+ * not COMMIT, durable unlink, per-PI ancestry or retirement authority. */
+extern bool cluster_ko_shared_observe_space_v2(ClusterKoCompletionV2 *completion,
+											   const struct ClusterPageWalBindingV1 *terminal,
+											   const void *wal, Size wal_length);
+extern bool cluster_ko_shared_space_observation_v2(const ClusterKoCompletionV2 *completion,
+												   struct ClusterPageWalBindingV1 *terminal,
+												   void *wal, Size wal_length);
+/* Original native TRUNCATE finish only, after the inherited base and every
+ * physical shrink have been synced and the SPACE observation is saved.
+ * This records a local physical effect, not COMMIT or PI retirement. DROP
+ * needs its separate post-commit storage owner and cannot use this entry. */
+extern bool cluster_ko_shared_observe_truncate_v2(ClusterKoCompletionV2 *completion);
+extern bool cluster_ko_shared_truncate_observation_v2(const ClusterKoCompletionV2 *completion,
+													  struct ClusterPageWalBindingV1 *terminal,
+													  void *wal, Size wal_length);
+/* Original postcommit pending-delete storage owner only, after durable MAIN
+ * reservation, auxiliary-fork removal and directory sync for this exact
+ * TOMBSTONE. Records one local physical result in the original opaque handle;
+ * it grants neither PI retirement nor a new lifetime. */
+extern bool cluster_ko_shared_observe_drop_v2(ClusterKoCompletionV2 *completion);
+struct ClusterPiWritebackFactV2;
+/* Project a completed native TRUNCATE or durable postcommit DROP for its
+ * original peer. This relation offer contains no page/master cut and grants
+ * no retirement. The original transaction still owns and cleans the handle;
+ * a raw value cannot extend that lifetime. Each action needs its original
+ * physical owner observation; a SPACE-only result is never sufficient. */
+extern bool cluster_ko_shared_structure_offer_v2(const ClusterKoCompletionV2 *completion,
+												 int32 peer, struct ClusterPiWritebackFactV2 *out);
+/* Transfer the actual committed native result from its preallocated original
+ * owner into the bounded KO region (or its still-reserved direct-API slot).
+ * Full preserves the handle and every proof for retry; success consumes it.
+ * Transaction/backend exit must then preserve the shared obligation. No caller
+ * activates this until the producer preserves retries and the original
+ * background consumer can finish every page responsibility. */
+extern bool cluster_ko_shared_structure_handoff_v2(ClusterKoCompletionV2 **completion);
+struct ClusterPiWritebackNoticeV1;
+/* Accept only the original authenticated relation-offer notice. A positive
+ * result means the original KO region owns the responsibility, not that any
+ * page, PI, retained WAL or locator may be retired. Full/conflicting slots
+ * refuse without replacing an existing obligation; exact retries are idempotent. */
+extern bool cluster_ko_shared_structure_accept_v2(const struct ClusterPiWritebackNoticeV1 *notice,
+												  uint32 index);
+/* Read an exact local/imported result's original peer scope. The page owner
+ * must separately prove its sealed ancestry and current master cut. */
+extern bool cluster_ko_shared_structure_peer_v2(uint32 slot, uint64 serial, int32 peer,
+												ClusterKoSharedMessageV2 *out);
+/* Original background owner, including a one-member cohort. Exact slot and
+ * serial name an already handed-off result, never a raw receipt constructor.
+ * Refusal preserves both outputs; no peer request is fabricated. */
+extern bool cluster_ko_shared_structure_observation_v2(uint32 slot, uint64 serial,
+													   struct ClusterPageWalBindingV1 *terminal,
+													   void *wal, Size wal_length);
+/* Bounded original-owner scan for local page work, including imported
+ * results and a one-member cohort. Success advances cursor to slot + 1;
+ * the serial/terminal are observations, never page or retirement proofs.
+ * Refusal leaves every output and every shared obligation unchanged. */
+extern bool cluster_ko_shared_structure_next_v2(uint32 *cursor, uint64 *serial,
+												struct ClusterPageWalBindingV1 *terminal);
+typedef enum ClusterKoStructurePollV2 {
+	CLUSTER_KO_STRUCTURE_INVALID,
+	CLUSTER_KO_STRUCTURE_PENDING,
+	CLUSTER_KO_STRUCTURE_PROGRESS,
+	CLUSTER_KO_STRUCTURE_RELEASED
+} ClusterKoStructurePollV2;
+/* Native COMMIT tail only. Uses the continuation reserved before the original
+ * SPACE modification; consumes the private handle without allocation, I/O or
+ * an active-slot wait. An undurable DROP is retained but cannot emit receipts.
+ * Stale committed proof is retained, never made current by this transfer.
+ * Native callers remain unactivated until the original physical owner and
+ * postcommit cleanup are connected in the same delivery. */
+extern bool cluster_ko_shared_native_handoff_v2(ClusterKoCompletionV2 **completion);
+/* Native irreversible COMMIT only, before callbacks and resource cleanup.
+ * Transfer preallocated work while retaining the original pending-delete
+ * handle. Disabled until the full structural protocol is advertised. */
+extern void cluster_ko_shared_native_commit_v2(void);
+/* Native smgr only, after DropRelationsAllBuffers returns for this locator.
+ * Releases only the original local-buffer gate, never physical durability. */
+extern void cluster_ko_shared_native_drop_buffers_released_v2(RelFileLocator locator);
+/* True suppresses the backend's obsolete pathname operation, even with a
+ * now-stale cut. It conveys no physical completion or reuse permission. */
+extern bool cluster_ko_shared_native_drop_deferred_v2(RelFileLocator locator);
+/* One original checkpointer step into the existing bounded active region.
+ * INVALID/stale and PENDING/full retain all work. RELEASED means no pending
+ * native continuation, not completion of active work, PI or recovery windows. */
+extern ClusterKoStructurePollV2 cluster_ko_shared_native_promote_v2(void);
+/* One checkpointer tick: at most one promotion and one physical attempt.
+ * True is actual progress, not permission to ignore any remaining work. */
+extern bool cluster_ko_shared_native_poll_v2(void);
+/* Original checkpointer only. One process-bound work item for an already
+ * committed, promoted DROP. The bounded cursor skips other active work.
+ * storage_bytes reserves the storage consumer's fixed fd/inode/stage carrier
+ * before its first I/O; retries must request the same size. Neither begin nor
+ * state creates a physical completion. Failed calls preserve all outputs. */
+typedef struct ClusterKoDropWorkV2 ClusterKoDropWorkV2;
+extern bool cluster_ko_shared_drop_work_begin_v2(uint32 *cursor, Size storage_bytes,
+												 ClusterKoDropWorkV2 **out);
+extern void *cluster_ko_shared_drop_work_state_v2(const ClusterKoDropWorkV2 *work,
+												  Size storage_bytes);
+extern bool cluster_ko_shared_drop_work_read_v2(const ClusterKoDropWorkV2 *work,
+												struct ClusterPageWalBindingV1 *terminal, void *wal,
+												Size wal_length);
+/* Revalidate immediately before each physical step. State survives a failed
+ * step and ordinary ResourceOwner cleanup; a different executor cannot adopt
+ * unknown partial I/O. Process loss remains the retained-WAL recovery owner's
+ * responsibility, never a reason to treat a missing path as completed. */
+extern bool cluster_ko_shared_drop_work_revalidate_v2(const ClusterKoDropWorkV2 *work);
+/* Irreversible cleanup-only access for the original PID/ResourceOwner, even
+ * after its cut is lost. The caller may close only the already retained raw
+ * resources; no pathname operation, sync or physical-success publication.
+ * The local state and shared pending/executor remain retained for recovery.
+ * An exact unchanged shared context receives only a negative diagnostic:
+ * normal-stop must fail for recovery instead of waiting for impossible work.
+ * An abandoned work can never read, revalidate or finish again. */
+extern void *cluster_ko_shared_drop_work_abandon_v2(ClusterKoDropWorkV2 *work, Size storage_bytes);
+/* One original work whose context/epoch/boot was positively replaced, or
+ * which is already abandoned. Transient admission failure does not qualify.
+ * Success abandons the work and advances the bounded cursor. Refusal leaves
+ * outputs unchanged; use abandon_v2 to access its cleanup-only carrier. */
+extern bool cluster_ko_shared_drop_work_abandon_next_v2(uint32 *cursor, Size storage_bytes,
+														ClusterKoDropWorkV2 **out);
+/* Only the original storage consumer's durable-success branch may call this:
+ * MAIN reservation, auxiliary removals and directory sync must be complete,
+ * exact identities checked, and successful physical resources closed. A
+ * failed call keeps that same result carrier for retry, without repeating
+ * pathname operations. Success consumes the work, admits the original
+ * structural PI consumer, and grants no MAIN/WAL reclamation authority. */
+extern bool cluster_ko_shared_drop_work_finish_v2(ClusterKoDropWorkV2 **work);
+/* End only this node's original background work, after its complete local
+ * responsibility scan and, for an origin, all peer ownership handoffs.
+ * Other accepted owners retain their own work. No global retirement or
+ * WAL/locator reclamation certificate is produced. */
+extern ClusterKoStructurePollV2 cluster_ko_shared_structure_finish_local_v2(uint32 slot,
+																			uint64 serial);
+/* Bounded read-only background scan, starting at *cursor (initially zero).
+ * On success cursor becomes selected slot + 1 and serial identifies that
+ * original slot lifetime. Only an actual remote peer gets a wire offer.
+ * Refusal preserves all outputs and never cancels a stale obligation. No
+ * acknowledgement, PI retirement or GC authority is returned here. */
+extern bool cluster_ko_shared_structure_offer_next_v2(uint32 *cursor, int32 peer, uint64 *serial,
+													  struct ClusterPiWritebackFactV2 *out);
+struct ClusterPiWritebackJobV1;
+/* Record only a peer's acceptance from the original completed opaque job.
+ * The exact shared slot remains owned; this is neither per-page retirement
+ * nor permission to release a KO slot, retained WAL or a locator. */
+extern bool
+cluster_ko_shared_structure_offer_complete_v2(uint32 slot, uint64 serial,
+											  const struct ClusterPiWritebackJobV1 *job);
+/* Reproject an original request inside its unchanged member/boot cut for a
+ * background recipient. Sending back to the origin retains the original
+ * origin -> master request, never a self request. This only returns wire
+ * values: it cannot create a completion, an authenticated notice or PI/GC
+ * authority. Refusal leaves out unchanged and performs no page or network I/O. */
+extern bool cluster_ko_shared_peer_projection_v2(const ClusterKoSharedMessageV2 *request,
+												 int32 peer, ClusterKoSharedMessageV2 *out);
+/* Read-only full cohort/namespace/peer-cut check, also usable by a third
+ * member serving as the page master. This grants no KO completion, notice,
+ * disposal or GC authority and does not relax KO ingress endpoint checks. */
+extern bool cluster_ko_shared_cut_current_v2(const ClusterKoSharedMessageV2 *request);
+/* Borrow the original native COMMIT-DROP owner after the top commit callback
+ * and before pending-delete cleanup ends. This is not a physical deletion or
+ * PI certificate.
+ * Refusal preserves out. The original transaction tail cancels these local
+ * handles; no background lifetime is activated by this interface. */
+extern bool cluster_ko_shared_pending_drop_v2(RelFileLocator locator, ClusterKoCompletionV2 **out);
+extern void cluster_ko_shared_postcommit_cleanup_v2(void);
+extern bool cluster_ko_shared_covers_v2(const ClusterKoCompletionV2 *completion,
+										const ClusterSpaceIdentityKey *key,
+										const uint8 incarnation[16]);
+/* Only actual remote members have a wire projection; a one-member barrier
+ * has a local completion but cannot fabricate a peer request or ACK. */
+extern bool cluster_ko_shared_read_v2(const ClusterKoCompletionV2 *completion, int32 peer,
+									  ClusterKoSharedMessageV2 *out);
+extern void cluster_ko_shared_release_v2(ClusterKoCompletionV2 **completion);
+#endif
+
 /* ---- shmem region (counters + the SPSC peer inbound ring) ---------- */
 extern Size cluster_ko_shmem_size(void);
 extern void cluster_ko_shmem_init(void);
@@ -177,6 +420,8 @@ extern void cluster_ko_flush_ack_handler(const ClusterICEnvelope *env, const voi
  * full buffer-pool scan.
  */
 extern void cluster_ko_drain_inbound_and_apply(void);
+/* Original LMON drains the shared-only fixed frame queue, outside locks. */
+extern void cluster_ko_lmon_tick_v2(void);
 
 /* ---- observability counters (dump_ko; surfaced by pg_cluster_state) - */
 extern uint64 cluster_ko_flush_count(void);		   /* barriers initiated (enqueuer) */

@@ -25,6 +25,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_storage_quorum.h"
 
 #include "cluster/cluster_guc.h" /* cluster_node_id (spec-5.22e D5-8) */
 #include "cluster/cluster_membership.h"
@@ -45,6 +46,7 @@
  */
 static ClusterMembershipTable LocalMembershipTable;
 static ClusterMembershipTable *MembershipTable = &LocalMembershipTable;
+static pg_atomic_uint64 *MembershipCutGeneration;
 
 /*
  * cluster_membership_attach
@@ -57,6 +59,67 @@ void
 cluster_membership_attach(ClusterMembershipTable *table)
 {
 	MembershipTable = (table != NULL) ? table : &LocalMembershipTable;
+	MembershipCutGeneration = NULL;
+}
+
+
+void
+cluster_membership_attach_cut_generation(pg_atomic_uint64 *generation)
+{
+	MembershipCutGeneration = MembershipTable != &LocalMembershipTable ? generation : NULL;
+}
+
+uint64
+cluster_membership_cut_generation(void)
+{
+	uint64 generation;
+
+	if (MembershipCutGeneration == NULL)
+		return 0;
+	generation = pg_atomic_read_u64(MembershipCutGeneration);
+	pg_read_barrier();
+	return generation != 0 && (generation & 1) == 0 ? generation : 0;
+}
+
+bool
+cluster_membership_cut_generation_current(uint64 expected)
+{
+	pg_read_barrier();
+	return expected != 0 && cluster_membership_cut_generation() == expected;
+}
+
+/* Original Reconfig lock serializes writers. An incomplete publication is
+ * sticky: another mutator may update the table but cannot reopen caching.
+ * This is a cache generation, never a membership or recovery authority. */
+static uint64
+membership_cut_write_begin(void)
+{
+	uint64 generation;
+
+	if (MembershipCutGeneration == NULL)
+		return 0;
+	generation = pg_atomic_read_u64(MembershipCutGeneration);
+	if (generation == 0 || (generation & 1) != 0 || generation >= UINT64_MAX - 1) {
+		pg_atomic_write_u64(MembershipCutGeneration, UINT64_MAX);
+		pg_write_barrier();
+		return 0;
+	}
+	pg_atomic_write_u64(MembershipCutGeneration, generation + 1);
+	pg_write_barrier();
+	return generation;
+}
+
+static void
+membership_cut_write_end(uint64 generation)
+{
+	if (MembershipCutGeneration == NULL)
+		return;
+	pg_write_barrier();
+	if (generation == 0 || pg_atomic_read_u64(MembershipCutGeneration) != generation + 1) {
+		pg_atomic_write_u64(MembershipCutGeneration, UINT64_MAX);
+		return;
+	}
+	pg_atomic_write_u64(MembershipCutGeneration, generation + 2);
 }
 
 /* node_id is a declared-topology index in [0, CLUSTER_MAX_NODES) */
@@ -64,6 +127,100 @@ static inline bool
 node_id_in_range(int32 node_id)
 {
 	return node_id >= 0 && node_id < CLUSTER_MAX_NODES;
+}
+
+bool
+cluster_membership_request_valid(const ClusterMembershipRequest *request)
+{
+	static const uint8 empty_uuid[16] = { 0 };
+
+	if (request == NULL || request->expected_formation == 0 || request->operation_generation == 0
+		|| request->expected_old_incarnation == 0 || !node_id_in_range(request->target_node)
+		|| memcmp(request->guest_uuid, empty_uuid, sizeof(empty_uuid)) == 0)
+		return false;
+	switch ((ClusterMembershipOperationKind)request->operation_kind) {
+	case CLUSTER_MEMBERSHIP_LEAVE:
+	case CLUSTER_MEMBERSHIP_REMOVE:
+		return request->reserved_new_incarnation == 0;
+	case CLUSTER_MEMBERSHIP_REJOIN:
+		return request->reserved_new_incarnation > request->expected_old_incarnation;
+	default:
+		return false; /* fresh online JOIN and unknown operations are not admitted */
+	}
+}
+
+bool
+cluster_membership_request_same(const ClusterMembershipRequest *a,
+								const ClusterMembershipRequest *b)
+{
+	return cluster_membership_request_valid(a) && cluster_membership_request_valid(b)
+		   && a->expected_formation == b->expected_formation
+		   && a->operation_generation == b->operation_generation
+		   && a->expected_old_incarnation == b->expected_old_incarnation
+		   && a->reserved_new_incarnation == b->reserved_new_incarnation
+		   && a->target_node == b->target_node && a->operation_kind == b->operation_kind
+		   && memcmp(a->guest_uuid, b->guest_uuid, sizeof(a->guest_uuid)) == 0;
+}
+
+static bool
+membership_operation_valid(const ClusterMembershipOperation *operation)
+{
+	static const ClusterMembershipRequest empty_request = { 0 };
+
+	if (operation == NULL || operation->phase < CLUSTER_MEMBERSHIP_OP_EMPTY
+		|| operation->phase > CLUSTER_MEMBERSHIP_OP_CANCELLED_UNPUBLISHED)
+		return false;
+	if (operation->phase == CLUSTER_MEMBERSHIP_OP_EMPTY)
+		return memcmp(&operation->request, &empty_request, sizeof(empty_request)) == 0;
+	return cluster_membership_request_valid(&operation->request);
+}
+
+/* The existing coordinator owns this slot; the caller's connection and its
+ * cancellation have no bearing on its lifetime. Never mutate on a rejection.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterMembershipRequestResult
+cluster_membership_operation_reserve(ClusterMembershipOperation *operation,
+									 const ClusterMembershipRequest *request,
+									 uint64 current_formation, uint64 next_generation)
+{
+	if (!membership_operation_valid(operation) || !cluster_membership_request_valid(request))
+		return CLUSTER_MEMBERSHIP_REQUEST_INVALID;
+	if (operation->phase != CLUSTER_MEMBERSHIP_OP_EMPTY) {
+		if (cluster_membership_request_same(&operation->request, request))
+			return CLUSTER_MEMBERSHIP_REQUEST_RETRY;
+		if (operation->phase == CLUSTER_MEMBERSHIP_OP_RESERVED
+			|| operation->phase == CLUSTER_MEMBERSHIP_OP_RUNNING)
+			return CLUSTER_MEMBERSHIP_REQUEST_CONFLICT;
+		if (request->operation_generation <= operation->request.operation_generation)
+			return CLUSTER_MEMBERSHIP_REQUEST_STALE;
+	}
+	if (request->expected_formation != current_formation
+		|| request->operation_generation != next_generation)
+		return CLUSTER_MEMBERSHIP_REQUEST_STALE;
+	operation->request = *request;
+	operation->phase = CLUSTER_MEMBERSHIP_OP_RESERVED;
+	return CLUSTER_MEMBERSHIP_REQUEST_ACCEPTED;
+}
+
+bool
+cluster_membership_operation_advance(ClusterMembershipOperation *operation,
+									 const ClusterMembershipRequest *request,
+									 ClusterMembershipOperationPhase expected,
+									 ClusterMembershipOperationPhase next)
+{
+	if (!membership_operation_valid(operation) || operation->phase != expected
+		|| !cluster_membership_request_same(&operation->request, request))
+		return false;
+	if (expected == next)
+		return true;
+	if ((expected == CLUSTER_MEMBERSHIP_OP_RESERVED
+		 && (next == CLUSTER_MEMBERSHIP_OP_RUNNING
+			 || next == CLUSTER_MEMBERSHIP_OP_CANCELLED_UNPUBLISHED))
+		|| (expected == CLUSTER_MEMBERSHIP_OP_RUNNING && next == CLUSTER_MEMBERSHIP_OP_FINISHED)) {
+		operation->phase = next;
+		return true;
+	}
+	return false;
 }
 
 static inline uint32
@@ -367,7 +524,7 @@ cluster_membership_vet_joiner(int32 node_id, uint64 presented_incarnation, uint6
 	 * gates on quorum before vetting, but keeping the check here makes vet
 	 * self-contained and fail-closed regardless of caller.
 	 */
-	if (!cluster_qvotec_in_quorum())
+	if (!cluster_qvotec_in_quorum() || !cluster_storage_quorum_allows_node(node_id))
 		return CLUSTER_JOIN_REJECT_QUORUM;
 
 	/*
@@ -403,8 +560,11 @@ cluster_membership_record_admitted(int32 node_id, uint64 incarnation)
 	if (!node_id_in_range(node_id))
 		return;
 	if (incarnation > MembershipTable->last_admitted_incarnation[node_id]) {
+		uint64 generation = membership_cut_write_begin();
+
 		cluster_write_fence_authority_cache_invalidate();
 		MembershipTable->last_admitted_incarnation[node_id] = incarnation;
+		membership_cut_write_end(generation);
 	}
 }
 
@@ -425,9 +585,13 @@ cluster_membership_set_state(int32 node_id, ClusterMembershipState state)
 	if (!node_id_in_range(node_id))
 		return;
 	prev = (ClusterMembershipState)MembershipTable->membership_state[node_id];
-	if (prev != state)
+	if (prev != state) {
+		uint64 generation = membership_cut_write_begin();
+
 		cluster_write_fence_authority_cache_invalidate();
-	MembershipTable->membership_state[node_id] = (uint8)state;
+		MembershipTable->membership_state[node_id] = (uint8)state;
+		membership_cut_write_end(generation);
+	}
 
 	/*
 	 * spec-5.22e D5-8: capture the exact epoch at which THIS node becomes
@@ -485,12 +649,16 @@ cluster_membership_shrink_to_removed(int32 node_id, uint64 last_incarnation)
 	if (!node_id_in_range(node_id))
 		return;
 	if (last_incarnation > MembershipTable->last_admitted_incarnation[node_id]
-		|| MembershipTable->membership_state[node_id] != CLUSTER_MEMBER_REMOVED)
+		|| MembershipTable->membership_state[node_id] != CLUSTER_MEMBER_REMOVED) {
+		uint64 generation = membership_cut_write_begin();
+
 		cluster_write_fence_authority_cache_invalidate();
-	/* raise the floor first (monotone) so re-admit must exceed the removed incarnation */
-	if (last_incarnation > MembershipTable->last_admitted_incarnation[node_id])
-		MembershipTable->last_admitted_incarnation[node_id] = last_incarnation;
-	MembershipTable->membership_state[node_id] = (uint8)CLUSTER_MEMBER_REMOVED;
+		/* Publish the raised floor and removal as one cut change. */
+		if (last_incarnation > MembershipTable->last_admitted_incarnation[node_id])
+			MembershipTable->last_admitted_incarnation[node_id] = last_incarnation;
+		MembershipTable->membership_state[node_id] = (uint8)CLUSTER_MEMBER_REMOVED;
+		membership_cut_write_end(generation);
+	}
 }
 
 

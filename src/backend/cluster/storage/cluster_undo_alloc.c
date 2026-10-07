@@ -45,6 +45,7 @@
 #include "cluster/cluster_scn.h"	  /* SCN_MAX_VALID_NODE_ID */
 #include "cluster/cluster_undo_gcs.h" /* path intent + shared-root decision */
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_record_api.h" /* reuse counter note (3.13) */
 #include "cluster/cluster_undo_smgr.h"
@@ -93,6 +94,8 @@ cluster_undo_path_resolve(ClusterUndoPathIntent intent, uint8 owner_instance, ui
 
 	if (buf == NULL || buf_size == 0)
 		return -1;
+	if (intent == CLUSTER_UNDO_PATH_RECOVERY_SHARED)
+		return cluster_undo_recovery_path_resolve_v1(owner_instance, segment_id, buf, buf_size);
 	Assert(owner_instance >= 1 && owner_instance <= UNDO_OWNER_INSTANCE_MAX);
 
 	/*
@@ -220,28 +223,7 @@ bool
 cluster_undo_segment_header_identity_ok(const char *blockbuf, uint32 segment_id,
 										uint8 owner_instance)
 {
-	PageHeader ph = (PageHeader)blockbuf;
-	const UndoSegmentHeaderData *hdr = (const UndoSegmentHeaderData *)blockbuf;
-
-	if ((ph->pd_flags & PD_UNDO_SEG_HEADER) == 0)
-		return false;
-	if (PageGetPageSize((Page)blockbuf) != BLCKSZ
-		|| PageGetPageLayoutVersion((Page)blockbuf) != PG_PAGE_LAYOUT_VERSION)
-		return false;
-
-	if (hdr->segment_id != segment_id || hdr->segment_size_bytes != UNDO_SEGMENT_SIZE_BYTES
-		|| hdr->owner_instance != owner_instance || hdr->tt_slots_count != TT_SLOTS_PER_SEGMENT)
-		return false;
-
-	switch (hdr->segment_state) {
-	case SEGMENT_ALLOCATED:
-	case SEGMENT_ACTIVE:
-	case SEGMENT_COMMITTED:
-	case SEGMENT_RECYCLABLE:
-		return true;
-	default:
-		return false;
-	}
+	return UndoSegmentHeader_identity_matches(blockbuf, segment_id, owner_instance);
 }
 
 
@@ -1014,8 +996,8 @@ cluster_undo_segment_file_exists(uint8 owner_instance, uint32 segment_id)
 
 	if (owner_instance < 1 || owner_instance > UNDO_OWNER_INSTANCE_MAX)
 		return false;
-	if (cluster_undo_path_resolve(cluster_undo_intent_for_owner(owner_instance), owner_instance,
-								  segment_id, path, sizeof(path))
+	if (cluster_undo_path_resolve(cluster_undo_recovery_intent_for_owner(owner_instance),
+								  owner_instance, segment_id, path, sizeof(path))
 		!= 0)
 		return false;
 	return access(path, F_OK) == 0;

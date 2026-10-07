@@ -59,13 +59,19 @@
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lwlock.h"
+#include "storage/condition_variable.h"
+#include "storage/pmsignal.h"
 #include "storage/shmem.h"
 #include "utils/elog.h"
+#include "utils/wait_event.h"
 #include "utils/timestamp.h" /* GetCurrentTimestamp (retire bounded wait) */
 
 /* Cross-check the pure-layer literal against the real slot size. */
 StaticAssertDecl(sizeof(ClusterXidStripeSlotRecord) <= CLUSTER_VOTING_SLOT_BYTES,
 				 "stripe slot record must fit a voting slot");
+StaticAssertDecl(sizeof(ClusterXidStripeSlotRecord) == 96
+					 && offsetof(ClusterXidStripeSlotRecord, crc32c) == 92,
+				 "PGXS version 3 layout");
 StaticAssertDecl(sizeof(ClusterXidStripeActivationRecord) <= CLUSTER_VOTING_SLOT_BYTES,
 				 "stripe activation record must fit a voting slot");
 StaticAssertDecl(CLUSTER_PGXM_SLOT_OFFSET + sizeof(ClusterMxidStripeExtensionRecord)
@@ -83,12 +89,25 @@ typedef enum StripeMailboxOp {
 	STRIPE_OP_RETIRE /* 5.18: mark target's region-4 slot retired */
 } StripeMailboxOp;
 
+/* QVOTEC publishes limit only after its range is majority durable. */
+typedef struct ClusterXidStripeLease {
+	pg_atomic_uint64 floor_full;
+	pg_atomic_uint64 limit_full;
+	pg_atomic_uint32 failed;
+	ConditionVariable changed;
+	uint64 publisher_incarnation; /* QVOTEC-only; zero on a fresh shmem boot */
+	uint64 claim_owner;
+	uint64 claim_floor;
+	uint64 claim_epoch;
+} ClusterXidStripeLease;
+
 /*
  * Shared state.  All fields are guarded by lock except the mailbox
  * seqs (write barrier between payload and request seq).
  */
 typedef struct ClusterXidStripeBootShmem {
 	LWLock lock;
+	ClusterXidStripeLease lease;
 
 	/* region-5 publication */
 	uint32 disk_state; /* ClusterXidStripeDiskState */
@@ -157,6 +176,7 @@ typedef struct ClusterXidStripeBootShmem {
 } ClusterXidStripeBootShmem;
 
 static ClusterXidStripeBootShmem *StripeBootShmem = NULL;
+static ClusterXidStripeLease *StripeLease = NULL;
 
 /* process-local: lazy latch ran (one-way, per process) */
 static bool stripe_latch_done = false;
@@ -175,10 +195,15 @@ cluster_xid_stripe_shmem_init(void)
 
 	StripeBootShmem = (ClusterXidStripeBootShmem *)ShmemInitStruct(
 		"pgrac cluster xid stripe", cluster_xid_stripe_shmem_size(), &found);
+	StripeLease = &StripeBootShmem->lease;
 
 	if (!found) {
 		memset(StripeBootShmem, 0, sizeof(ClusterXidStripeBootShmem));
 		LWLockInitialize(&StripeBootShmem->lock, LWTRANCHE_CLUSTER_XID_STRIPE);
+		pg_atomic_init_u64(&StripeLease->floor_full, 0);
+		pg_atomic_init_u64(&StripeLease->limit_full, 0);
+		pg_atomic_init_u32(&StripeLease->failed, 0);
+		ConditionVariableInit(&StripeLease->changed);
 		StripeBootShmem->disk_state = CLUSTER_XID_STRIPE_DISK_UNKNOWN;
 		StripeBootShmem->slot_state = CLUSTER_XID_STRIPE_SLOT_UNKNOWN;
 		pg_atomic_init_u64(&StripeBootShmem->req_seq, 0);
@@ -213,6 +238,12 @@ typedef enum StripeSlotReadClass {
 	STRIPE_READ_CORRUPT,
 	STRIPE_READ_UNREADABLE
 } StripeSlotReadClass;
+
+typedef enum StripeSlotReadPurpose {
+	STRIPE_READ_EVIDENCE,
+	STRIPE_READ_UPDATE,
+	STRIPE_READ_REPAIR_CLAIM
+} StripeSlotReadPurpose;
 
 static bool
 buffer_is_all_zeros(const char *buf, Size len)
@@ -280,6 +311,157 @@ stripe_read_activation_one(int fd, ClusterXidStripeActivationRecord *out, uint32
 	return STRIPE_READ_VALID;
 }
 
+/* Each prior boot occupies its own sector in this same voting authority.
+ * There is no wrap/reuse and no dependence on native struct size for offsets. */
+static bool
+stripe_history_offset(int32 node, uint64 generation, off_t *out)
+{
+	uint64 base = (uint64)CLUSTER_VOTING_STRIPE_HISTORY_BASE;
+	uint64 maximum = (PG_INT64_MAX - base - CLUSTER_VOTING_SLOT_BYTES) / CLUSTER_VOTING_SLOT_BYTES;
+
+	if (node < 0 || node >= CLUSTER_XID_STRIDE || generation == 0
+		|| generation - 1 > (maximum - node) / CLUSTER_XID_STRIDE)
+		return false;
+	*out = (off_t)(base
+				   + ((generation - 1) * CLUSTER_XID_STRIDE + node) * CLUSTER_VOTING_SLOT_BYTES);
+	return true;
+}
+
+static StripeSlotReadClass
+stripe_history_read_one(int fd, int32 node, uint64 generation, ClusterXidStripeSlotRecord *out)
+{
+	uint8 bytes[CLUSTER_VOTING_SLOT_BYTES];
+	ClusterVotingDiskRawReadState state;
+	off_t offset;
+	struct stat st;
+
+	if (!stripe_history_offset(node, generation, &offset))
+		return STRIPE_READ_CORRUPT;
+	state = cluster_voting_disk_read_raw_slot_at(fd, offset, bytes);
+	if (state == CLUSTER_VOTING_DISK_RAW_READ_CLEAN_EOF)
+		return fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size <= offset
+				   ? STRIPE_READ_ABSENT
+				   : STRIPE_READ_UNREADABLE;
+	if (state == CLUSTER_VOTING_DISK_RAW_READ_SHORT)
+		return STRIPE_READ_CORRUPT;
+	if (state != CLUSTER_VOTING_DISK_RAW_READ_FULL)
+		return STRIPE_READ_UNREADABLE;
+	if (buffer_is_all_zeros((char *)bytes, sizeof(bytes)))
+		return STRIPE_READ_ABSENT;
+	memcpy(out, bytes, sizeof(*out));
+	if (!cluster_xid_stripe_slot_record_valid(out, node) || out->lease_incarnation == 0
+		|| out->history_generation != generation - 1
+		|| !buffer_is_all_zeros((char *)bytes + sizeof(*out), sizeof(bytes) - sizeof(*out)))
+		return STRIPE_READ_CORRUPT;
+	return STRIPE_READ_VALID;
+}
+
+/* Before the first reservation, prove that its future history sector exists
+ * (a zero sector on a device) or can grow (EOF only on a regular file). */
+static int
+stripe_history_initial_capacity(const int *fds, int n_disks, int32 node)
+{
+	int available = 0;
+	for (int d = 0; d < n_disks; d++) {
+		ClusterXidStripeSlotRecord unused;
+		StripeSlotReadClass state = stripe_history_read_one(fds[d], node, 1, &unused);
+
+		if (state == STRIPE_READ_CORRUPT || state == STRIPE_READ_VALID)
+			return -1;
+		if (state == STRIPE_READ_ABSENT)
+			available++;
+	}
+	return available >= n_disks / 2 + 1;
+}
+
+/* The current record binds the immutable predecessor's index and CRC. A
+ * readable majority must agree (empty lagging copies are allowed); a matching
+ * image supplies the bytes. Missing replicas never create a different history. */
+static StripeSlotReadClass
+stripe_history_read_all(const int *fds, int n_disks, const ClusterXidStripeSlotRecord *current,
+						ClusterXidStripeSlotRecord *out)
+{
+	ClusterXidStripeSlotRecord chosen;
+	bool found = false;
+	int readable = 0;
+
+	for (int d = 0; d < n_disks; d++) {
+		ClusterXidStripeSlotRecord prior;
+		StripeSlotReadClass result = stripe_history_read_one(fds[d], current->node_id,
+															 current->history_generation, &prior);
+
+		if (result == STRIPE_READ_CORRUPT)
+			return result;
+		if (result == STRIPE_READ_VALID) {
+			if (prior.crc32c != current->history_crc32c
+				|| prior.owner_incarnation != current->owner_incarnation
+				|| prior.floor_full != current->floor_full
+				|| prior.stride_mode_epoch != current->stride_mode_epoch
+				|| prior.generation >= current->generation
+				|| prior.lease_incarnation >= current->lease_incarnation
+				|| prior.issued_limit_full > current->lease_floor_full
+				|| (found && memcmp(&prior, &chosen, sizeof(prior)) != 0))
+				return STRIPE_READ_CORRUPT;
+			chosen = prior;
+			found = true;
+			readable++;
+		} else if (result == STRIPE_READ_ABSENT)
+			readable++;
+	}
+	if (!found || readable < n_disks / 2 + 1)
+		return STRIPE_READ_UNREADABLE;
+	*out = chosen;
+	return STRIPE_READ_VALID;
+}
+
+/* 1 = durable, 0 = retry exact bytes, -1 = conflicting/corrupt evidence.
+ * Read all destinations before writing; never overwrite a nonempty history. */
+static int
+stripe_history_archive(const int *fds, int n_disks, const ClusterXidStripeSlotRecord *record)
+{
+	StripeSlotReadClass states[CLUSTER_MAX_VOTING_DISKS];
+	uint8 bytes[CLUSTER_VOTING_SLOT_BYTES] = { 0 };
+	ClusterXidStripeSlotRecord seen;
+	off_t offset;
+	int readable = 0, durable = 0, source_durable = 0;
+
+	if (record->history_generation == UINT64_MAX
+		|| !stripe_history_offset(record->node_id, record->history_generation + 1, &offset))
+		return -1;
+	memcpy(bytes, record, sizeof(*record));
+	for (int d = 0; d < n_disks; d++) {
+		states[d] = stripe_history_read_one(fds[d], record->node_id, record->history_generation + 1,
+											&seen);
+		if (states[d] == STRIPE_READ_CORRUPT
+			|| (states[d] == STRIPE_READ_VALID && memcmp(&seen, record, sizeof(seen)) != 0))
+			return -1;
+		if (states[d] == STRIPE_READ_VALID) {
+			readable++;
+		} else if (states[d] == STRIPE_READ_ABSENT)
+			readable++;
+	}
+	if (readable < n_disks / 2 + 1)
+		return 0;
+	/* Tracking HWM updates need not have reached a majority. Persist this
+	 * exact source first, so a restart cannot select an older source after
+	 * losing its originally newest copy while the archive is already durable.
+	 * The outer herding writer remains frozen until lease activation. */
+	for (int d = 0; d < n_disks; d++)
+		if (cluster_voting_disk_write_stripe_slot_ex(fds[d], record->node_id, bytes, true)
+			== CLUSTER_VOTING_DISK_IO_OK)
+			source_durable++;
+	if (source_durable < n_disks / 2 + 1)
+		return 0;
+	for (int d = 0; d < n_disks; d++)
+		/* A visible prior write is not a successful fsync receipt. Reissue
+		 * only identical bytes and obtain a fresh durable majority. */
+		if ((states[d] == STRIPE_READ_ABSENT || states[d] == STRIPE_READ_VALID)
+			&& cluster_voting_disk_write_raw_slot_at(fds[d], offset, bytes)
+				   == CLUSTER_VOTING_DISK_IO_OK)
+			durable++;
+	return durable >= n_disks / 2 + 1;
+}
+
 /* Same classification for a region-4 per-node slot record. */
 static StripeSlotReadClass
 stripe_read_slot_one(int fd, int32 node, ClusterXidStripeSlotRecord *out, bool *out_retired)
@@ -291,11 +473,17 @@ stripe_read_slot_one(int fd, int32 node, ClusterXidStripeSlotRecord *out, bool *
 	rc = cluster_voting_disk_read_stripe_slot(fd, (uint32)node, slot);
 	if (rc != CLUSTER_VOTING_DISK_IO_OK) {
 		struct stat st;
+		off_t offset = CLUSTER_VOTING_STRIPE_SLOT_OFFSET(node);
 
-		if (fstat(fd, &st) == 0
-			&& (off_t)st.st_size
-				   < CLUSTER_VOTING_STRIPE_SLOT_OFFSET(node) + CLUSTER_VOTING_SLOT_BYTES)
-			return STRIPE_READ_ABSENT;
+		/* Only a regular file ending before this slot proves absence.
+		 * A partial sector may contain a reservation; a device reporting
+		 * st_size=0 does not turn an I/O failure into an empty slot. */
+		if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+			if (st.st_size <= offset)
+				return STRIPE_READ_ABSENT;
+			if (st.st_size < offset + CLUSTER_VOTING_SLOT_BYTES)
+				return STRIPE_READ_CORRUPT;
+		}
 		return STRIPE_READ_UNREADABLE;
 	}
 
@@ -312,18 +500,31 @@ stripe_read_slot_one(int fd, int32 node, ClusterXidStripeSlotRecord *out, bool *
 }
 
 /*
- * Read one region-4 slot across all disks with newest-generation-wins
- * adoption.  Returns the aggregate class; on VALID, *out holds the
- * winning record.  Shared by the self-slot scan and the RETIRE
- * read-modify-write.
+ * Read one region-4 slot across all disks.  A newer generation may advance
+ * this claim's hwm or retire it; it cannot replace the claim identity or
+ * resurrect a retired claim.  Equal generations must have identical payloads.
+ * A nonempty unsupported/damaged copy is not proof of an absent reservation.
+ * On VALID, *out holds the newest compatible record. Writers require a read
+ * majority, intersecting every previously durable reservation; readers may
+ * select evidence from fewer copies. Neither result is a durable write ACK.
+ * Author: SqlRush <sqlrush@gmail.com>
  */
 static StripeSlotReadClass
-stripe_read_slot_all(const int *fds, int n_disks, int32 node, ClusterXidStripeSlotRecord *out)
+stripe_read_slot_all(const int *fds, int n_disks, int32 node, ClusterXidStripeSlotRecord *out,
+					 StripeSlotReadPurpose purpose)
 {
 	bool have_valid = false;
-	bool have_corrupt = false;
 	bool have_readable = false;
+	ClusterXidStripeSlotRecord seen[CLUSTER_MAX_VOTING_DISKS];
+	int count = 0;
+	int absent = 0;
+	int best = 0;
 	int i;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || fds == NULL || n_disks <= 0 || n_disks > CLUSTER_MAX_VOTING_DISKS)
+		return STRIPE_READ_UNREADABLE;
 
 	for (i = 0; i < n_disks; i++) {
 		ClusterXidStripeSlotRecord rec;
@@ -331,30 +532,286 @@ stripe_read_slot_all(const int *fds, int n_disks, int32 node, ClusterXidStripeSl
 		switch (stripe_read_slot_one(fds[i], node, &rec, NULL)) {
 		case STRIPE_READ_VALID:
 			have_readable = true;
-			if (!have_valid || rec.generation > out->generation) {
-				*out = rec;
-				have_valid = true;
+			for (int j = 0; j < count; j++) {
+				const ClusterXidStripeSlotRecord *older = &seen[j];
+				const ClusterXidStripeSlotRecord *newer = &rec;
+
+				if (rec.owner_incarnation != seen[j].owner_incarnation
+					|| rec.floor_full != seen[j].floor_full
+					|| rec.stride_mode_epoch != seen[j].stride_mode_epoch)
+					return STRIPE_READ_CORRUPT;
+				if (rec.generation == seen[j].generation
+					&& memcmp(&rec, &seen[j], offsetof(ClusterXidStripeSlotRecord, crc32c)) != 0)
+					return STRIPE_READ_CORRUPT;
+				if (rec.generation < seen[j].generation) {
+					older = &rec;
+					newer = &seen[j];
+				}
+				if (newer->next_xid_hwm_full < older->next_xid_hwm_full
+					|| newer->retired < older->retired
+					|| newer->history_generation < older->history_generation
+					|| newer->issued_limit_full < older->issued_limit_full)
+					return STRIPE_READ_CORRUPT;
+				if (newer->lease_incarnation == older->lease_incarnation
+						? (newer->lease_floor_full != older->lease_floor_full
+						   || newer->history_generation != older->history_generation)
+						: (newer->lease_floor_full < older->issued_limit_full
+						   || (older->lease_incarnation != 0
+							   && (newer->lease_incarnation <= older->lease_incarnation
+								   || newer->history_generation <= older->history_generation))))
+					return STRIPE_READ_CORRUPT;
 			}
+			seen[count] = rec;
+			if (!have_valid || rec.generation > seen[best].generation)
+				best = count;
+			count++;
+			have_valid = true;
 			break;
 		case STRIPE_READ_ABSENT:
 			have_readable = true;
+			absent++;
 			break;
 		case STRIPE_READ_CORRUPT:
-			have_readable = true;
-			have_corrupt = true;
-			break;
+			return STRIPE_READ_CORRUPT;
 		case STRIPE_READ_UNREADABLE:
 			break;
 		}
 	}
 
-	if (have_valid)
+	if (have_valid) {
+		if (seen[best].history_generation != 0) {
+			ClusterXidStripeSlotRecord prior;
+			StripeSlotReadClass history
+				= stripe_history_read_all(fds, n_disks, &seen[best], &prior);
+
+			if (history != STRIPE_READ_VALID)
+				return history;
+		}
+		if (purpose == STRIPE_READ_REPAIR_CLAIM) {
+			/* Only a never-issued first claim can be copied into proven
+			 * empty peers. This grants no range and preserves its exact bytes. */
+			const ClusterXidStripeSlotRecord *claim = &seen[best];
+
+			if (count + absent < n_disks / 2 + 1 || claim->generation != 1 || claim->retired
+				|| claim->next_xid_hwm_full != claim->floor_full || claim->issued_limit_full != 0
+				|| claim->lease_incarnation != 0 || claim->lease_floor_full != 0)
+				return STRIPE_READ_UNREADABLE;
+		} else if (purpose == STRIPE_READ_UPDATE && count < n_disks / 2 + 1)
+			return STRIPE_READ_UNREADABLE;
+		*out = seen[best];
 		return STRIPE_READ_VALID;
-	if (have_corrupt)
-		return STRIPE_READ_CORRUPT;
-	if (have_readable)
+	}
+	if (have_readable && (purpose == STRIPE_READ_EVIDENCE || absent >= n_disks / 2 + 1))
 		return STRIPE_READ_ABSENT;
 	return STRIPE_READ_UNREADABLE;
+}
+
+bool
+cluster_xid_stripe_lookup_incarnation_fds(const int *fds, int n_disks, FullTransactionId xid,
+										  uint64 *out_incarnation)
+{
+	ClusterXidStripeSlotRecord record, previous;
+	uint64 value = U64FromFullTransactionId(xid);
+	int node = value % CLUSTER_XID_STRIDE;
+
+	if (out_incarnation == NULL || n_disks <= 0 || n_disks > CLUSTER_MAX_VOTING_DISKS
+		|| (n_disks % 2) == 0 || !TransactionIdIsNormal(XidFromFullTransactionId(xid))
+		|| stripe_read_slot_all(fds, n_disks, node, &record, STRIPE_READ_UPDATE)
+			   != STRIPE_READ_VALID)
+		return false;
+	for (;;) {
+		if (record.lease_incarnation != 0 && value >= record.lease_floor_full
+			&& value < record.issued_limit_full) {
+			*out_incarnation = record.lease_incarnation;
+			return true;
+		}
+		if (record.history_generation == 0 || value >= record.issued_limit_full
+			|| stripe_history_read_all(fds, n_disks, &record, &previous) != STRIPE_READ_VALID)
+			return false;
+		record = previous;
+	}
+}
+
+static void
+stripe_lease_fail(void)
+{
+	pg_atomic_write_u32(&StripeLease->failed, 1);
+	pg_atomic_write_u64(&StripeLease->limit_full, 0);
+	ConditionVariableBroadcast(&StripeLease->changed);
+}
+
+bool
+cluster_xid_stripe_lease_ready(FullTransactionId candidate)
+{
+	uint64 limit, floor, value = U64FromFullTransactionId(candidate);
+
+	if (!cluster_enabled || !cluster_shared_catalog || !cluster_xid_striping)
+		return true;
+	if (StripeLease == NULL || pg_atomic_read_u32(&StripeLease->failed) != 0
+		|| !cluster_qvotec_in_quorum())
+		return false;
+	limit = pg_atomic_read_u64(&StripeLease->limit_full);
+	pg_read_barrier();
+	floor = pg_atomic_read_u64(&StripeLease->floor_full);
+	return floor != 0 && value >= floor && value < limit;
+}
+
+/* Sole writer: the existing QVOTEC poll. A failed partial write retains the
+ * exact proposed interval; a new process burns it instead of reissuing it.
+ * The caller supplies its latest native/herding minimum, never a grant.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+stripe_lease_tick(const int *fds, int n_disks, uint64 minimum)
+{
+	static uint64 pending_incarnation, pending_floor, pending_limit;
+	ClusterXidStripeSlotRecord rec;
+	StripeSlotReadClass state;
+	uint64 incarnation, limit, base;
+	char bytes[CLUSTER_VOTING_SLOT_BYTES] = { 0 };
+	int written = 0;
+	bool fresh;
+
+	if (!cluster_enabled || !cluster_shared_catalog || !cluster_xid_striping || StripeLease == NULL
+		|| pg_atomic_read_u32(&StripeLease->failed) != 0 || !cluster_qvotec_in_quorum())
+		return;
+	incarnation = cluster_qvotec_self_incarnation_value();
+	if (incarnation == 0)
+		return;
+	fresh = StripeLease->publisher_incarnation != incarnation;
+	limit = pg_atomic_read_u64(&StripeLease->limit_full);
+	if (fresh)
+		pg_atomic_write_u64(&StripeLease->limit_full, 0);
+	state = stripe_read_slot_all(fds, n_disks, cluster_node_id, &rec, STRIPE_READ_UPDATE);
+	if (state == STRIPE_READ_UNREADABLE) {
+		/* A partial first CLAIM may already have published MINE. Complete
+		 * its exact original record before the next poll can reserve XIDs. */
+		if (StripeLease->publisher_incarnation == 0 && StripeLease->claim_owner == 0
+			&& stripe_read_slot_all(fds, n_disks, cluster_node_id, &rec, STRIPE_READ_REPAIR_CLAIM)
+				   == STRIPE_READ_VALID) {
+			memcpy(bytes, &rec, sizeof(rec));
+			for (int i = 0; i < n_disks; i++)
+				(void)cluster_voting_disk_write_stripe_slot(fds[i], cluster_node_id, bytes);
+		}
+		return;
+	}
+	if (state != STRIPE_READ_VALID || rec.retired || rec.generation == UINT64_MAX
+		|| (!fresh
+			&& (rec.lease_incarnation != incarnation
+				|| rec.lease_floor_full != pg_atomic_read_u64(&StripeLease->floor_full)
+				|| rec.issued_limit_full < limit))
+		|| (StripeLease->claim_owner != 0
+			&& (rec.owner_incarnation != StripeLease->claim_owner
+				|| rec.floor_full != StripeLease->claim_floor
+				|| rec.stride_mode_epoch != StripeLease->claim_epoch))) {
+		stripe_lease_fail();
+		return;
+	}
+	StripeLease->claim_owner = rec.owner_incarnation;
+	StripeLease->claim_floor = rec.floor_full;
+	StripeLease->claim_epoch = rec.stride_mode_epoch;
+	/* Check authority even while the already durable range has space. */
+	if (!fresh && limit > CLUSTER_XID_STRIPE_LEASE_SPAN / 2
+		&& minimum < limit - CLUSTER_XID_STRIPE_LEASE_SPAN / 2)
+		return;
+	if (pending_incarnation != incarnation) {
+		pending_incarnation = incarnation;
+		pending_limit = 0;
+	}
+	if (pending_limit == 0) {
+		base = Max(minimum, rec.next_xid_hwm_full);
+		base = Max(base, rec.issued_limit_full);
+		if (base > UINT64_MAX - CLUSTER_XID_STRIPE_LEASE_SPAN - CLUSTER_XID_STRIDE) {
+			stripe_lease_fail();
+			return;
+		}
+		base = U64FromFullTransactionId(
+			cluster_xid_next_striped_full(FullTransactionIdFromU64(base), cluster_node_id));
+		pending_floor = fresh ? base : rec.lease_floor_full;
+		pending_limit = base + CLUSTER_XID_STRIPE_LEASE_SPAN;
+	}
+	if (pending_limit < rec.issued_limit_full
+		|| (rec.lease_incarnation == incarnation && rec.lease_floor_full != pending_floor)) {
+		stripe_lease_fail();
+		return;
+	}
+	if (rec.lease_incarnation != incarnation || rec.issued_limit_full != pending_limit) {
+		if (rec.lease_incarnation == 0) {
+			int capacity = stripe_history_initial_capacity(fds, n_disks, rec.node_id);
+
+			if (capacity < 0)
+				stripe_lease_fail();
+			if (capacity <= 0)
+				return;
+		}
+		if (rec.lease_incarnation != 0 && rec.lease_incarnation != incarnation) {
+			int archived;
+
+			if (incarnation <= rec.lease_incarnation) {
+				stripe_lease_fail();
+				return;
+			}
+			archived = stripe_history_archive(fds, n_disks, &rec);
+			if (archived < 0)
+				stripe_lease_fail();
+			if (archived <= 0)
+				return;
+			rec.history_crc32c = rec.crc32c;
+			rec.history_generation++;
+		}
+		rec.lease_incarnation = incarnation;
+		rec.lease_floor_full = pending_floor;
+		rec.issued_limit_full = pending_limit;
+		rec.generation++;
+		cluster_xid_stripe_slot_record_compute_crc(&rec);
+	}
+	memcpy(bytes, &rec, sizeof(rec));
+	for (int i = 0; i < n_disks; i++)
+		if (cluster_voting_disk_write_stripe_slot(fds[i], cluster_node_id, bytes)
+			== CLUSTER_VOTING_DISK_IO_OK)
+			written++;
+	if (written < n_disks / 2 + 1)
+		return;
+	pg_atomic_write_u64(&StripeLease->floor_full, pending_floor);
+	pg_write_barrier();
+	pg_atomic_write_u64(&StripeLease->limit_full, pending_limit);
+	StripeLease->publisher_incarnation = incarnation;
+	pending_limit = 0;
+	ConditionVariableBroadcast(&StripeLease->changed);
+}
+
+void
+cluster_xid_stripe_wait_lease(FullTransactionId candidate)
+{
+	if (StripeLease == NULL)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+						errmsg("cluster xid reservation authority is unavailable")));
+	ConditionVariablePrepareToSleep(&StripeLease->changed);
+	PG_TRY();
+	{
+		for (;;) {
+			uint64 limit, floor;
+
+			CHECK_FOR_INTERRUPTS();
+			if (IsUnderPostmaster && !PostmasterIsAlive())
+				ereport(FATAL,
+						(errmsg("postmaster exited while waiting for a cluster xid reservation")));
+			if (pg_atomic_read_u32(&StripeLease->failed) != 0 || !cluster_qvotec_in_quorum())
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE),
+								errmsg("cluster xid reservation authority is unavailable")));
+			limit = pg_atomic_read_u64(&StripeLease->limit_full);
+			pg_read_barrier();
+			floor = pg_atomic_read_u64(&StripeLease->floor_full);
+			/* A candidate below a new boot's floor must be rederived too. */
+			if (limit > floor && U64FromFullTransactionId(candidate) < limit)
+				break;
+			(void)ConditionVariableTimedSleep(&StripeLease->changed, 1000, PG_WAIT_EXTENSION);
+		}
+	}
+	PG_FINALLY();
+	{
+		ConditionVariableCancelSleep();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -505,7 +962,7 @@ cluster_xid_stripe_scan_disks(const int *fds, int n_disks)
 		ClusterXidStripeSlotRecord mine;
 
 		memset(&mine, 0, sizeof(mine));
-		switch (stripe_read_slot_all(fds, n_disks, cluster_node_id, &mine)) {
+		switch (stripe_read_slot_all(fds, n_disks, cluster_node_id, &mine, STRIPE_READ_EVIDENCE)) {
 		case STRIPE_READ_VALID:
 			LWLockAcquire(&StripeBootShmem->lock, LW_EXCLUSIVE);
 			if (mine.retired) {
@@ -737,6 +1194,9 @@ stripe_service_claim(const int *fds, int n_disks)
 	cluster_xid_stripe_scan_disks(fds, n_disks);
 	if (cluster_xid_stripe_slot_state() != CLUSTER_XID_STRIPE_SLOT_ABSENT)
 		return 1; /* resolved some other way; the gate re-reads it */
+	if (stripe_read_slot_all(fds, n_disks, cluster_node_id, &rec, STRIPE_READ_UPDATE)
+		!= STRIPE_READ_ABSENT)
+		return 0; /* no read majority proves this claim is still absent */
 
 	memset(&rec, 0, sizeof(rec));
 	rec.magic = CLUSTER_PGXS_MAGIC;
@@ -801,12 +1261,16 @@ stripe_service_retire(const int *fds, int n_disks, int32 target, uint64 hint)
 		return 0;
 
 	memset(&rec, 0, sizeof(rec));
-	switch (stripe_read_slot_all(fds, n_disks, target, &rec)) {
+	switch (stripe_read_slot_all(fds, n_disks, target, &rec, STRIPE_READ_UPDATE)) {
 	case STRIPE_READ_VALID:
-		if (rec.retired)
-			return 1; /* already retired (idempotent) */
-		rec.retired = 1;
-		rec.generation += 1;
+		/* A newest tombstone may exist on only one disk after a partial
+		 * write. Retry the same bytes until a majority fsyncs them. */
+		if (!rec.retired) {
+			if (rec.generation == UINT64_MAX)
+				return 0;
+			rec.retired = 1;
+			rec.generation += 1;
+		}
 		break;
 	case STRIPE_READ_ABSENT: {
 		uint64 floor = 0;
@@ -1266,6 +1730,20 @@ cluster_xid_stripe_herding_tick(const int *fds, int n_disks)
 		return;
 	if (!cluster_enabled || !cluster_xid_striping)
 		return;
+	if (cluster_shared_catalog && StripeLease != NULL
+		&& (cluster_xid_stripe_slot_state() == CLUSTER_XID_STRIPE_SLOT_MINE
+			|| StripeLease->claim_owner != 0)) {
+		uint64 minimum = Max(U64FromFullTransactionId(ReadNextFullTransactionId()),
+							 pg_atomic_read_u64(&StripeBootShmem->herding_floor_full));
+
+		stripe_lease_tick(fds, n_disks, minimum);
+		/* A partial archive fixes the old image. Do not let the tracking
+		 * writer change its HWM/CRC until the new incarnation is durable. */
+		if (pg_atomic_read_u32(&StripeLease->failed) != 0
+			|| StripeLease->publisher_incarnation != cluster_qvotec_self_incarnation_value()
+			|| pg_atomic_read_u64(&StripeLease->limit_full) == 0 || !cluster_qvotec_in_quorum())
+			return;
+	}
 	if (cluster_xid_stripe_disk_state() != CLUSTER_XID_STRIPE_DISK_PUBLISHED
 		|| cluster_xid_stripe_slot_state() != CLUSTER_XID_STRIPE_SLOT_MINE)
 		return;
@@ -1289,7 +1767,8 @@ cluster_xid_stripe_herding_tick(const int *fds, int n_disks)
 		if (cluster_conf_lookup_node(slot) == NULL)
 			continue;
 		memset(&rec, 0, sizeof(rec));
-		if (stripe_read_slot_all(fds, n_disks, slot, &rec) != STRIPE_READ_VALID)
+		if (stripe_read_slot_all(fds, n_disks, slot, &rec, STRIPE_READ_EVIDENCE)
+			!= STRIPE_READ_VALID)
 			continue;
 		if (rec.retired)
 			continue;
@@ -1316,21 +1795,26 @@ cluster_xid_stripe_herding_tick(const int *fds, int n_disks)
 		target = max_hwm - (uint64)cluster_xid_herding_slack; /* observe-and-jump */
 	if (floor_full > target)
 		target = floor_full;
+	if (cluster_shared_catalog && StripeLease != NULL)
+		target = Max(target, pg_atomic_read_u64(&StripeLease->floor_full));
 	target = U64FromFullTransactionId(
 		cluster_xid_next_striped_full(FullTransactionIdFromU64(target), cluster_node_id));
 
 	if (target > promised) {
 		ClusterXidStripeSlotRecord rec;
 		char slotbuf[CLUSTER_VOTING_SLOT_BYTES];
-		bool is_jump = target > local_next;
+		bool is_jump;
 		int disks_ok = 0;
 		int i;
 
 		/* read-modify-write our own record (sole writer). */
 		memset(&rec, 0, sizeof(rec));
-		if (stripe_read_slot_all(fds, n_disks, cluster_node_id, &rec) != STRIPE_READ_VALID
-			|| rec.retired)
+		if (stripe_read_slot_all(fds, n_disks, cluster_node_id, &rec, STRIPE_READ_UPDATE)
+				!= STRIPE_READ_VALID
+			|| rec.retired || rec.generation == UINT64_MAX)
 			return; /* face shifted under us; next tick re-evaluates */
+		target = Max(target, rec.next_xid_hwm_full);
+		is_jump = target > local_next;
 		rec.next_xid_hwm_full = target;
 		rec.generation += 1;
 		cluster_xid_stripe_slot_record_compute_crc(&rec);
@@ -1391,6 +1875,8 @@ cluster_xid_stripe_herding_floor(void)
 	if (StripeBootShmem == NULL)
 		return InvalidFullTransactionId;
 	v = pg_atomic_read_u64(&StripeBootShmem->herding_floor_full);
+	if (cluster_shared_catalog && StripeLease != NULL)
+		v = Max(v, pg_atomic_read_u64(&StripeLease->floor_full));
 	return v == 0 ? InvalidFullTransactionId : FullTransactionIdFromU64(v);
 }
 

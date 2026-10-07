@@ -9,6 +9,7 @@
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_page_wal.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "miscadmin.h"
 #include "storage/proc.h"
@@ -29,6 +30,7 @@ static int installs;
 static int publishes;
 static int leaves;
 int cluster_node_id;
+bool cluster_shared_config;
 static int kind9_requests;
 static int ack_sends;
 static int assert_sends;
@@ -1515,6 +1517,160 @@ UT_TEST(test_actual_peer_observation_gap_keeps_delivery_and_ingress_owned)
 	reset_delivery_fixture();
 }
 
+/* Actual copy/frame/PENDING glue; boundary doubles account for references,
+ * while test_cluster_pcm_lock exercises the real first-reference move. */
+static int first_error_step, first_private_refs, first_pending_refs, first_releases;
+static uint32 first_requester_caps, first_master_caps, first_copied_caps;
+static bool first_master_sample_ok;
+
+static bool
+first_master_capability_sample(int32 node, uint32 required, uint32 *word, uint32 *generation)
+{
+	UT_ASSERT_EQ(node, cluster_node_id + 1);
+	UT_ASSERT_EQ(required, PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2);
+	*word = first_master_caps;
+	*generation = 71;
+	return first_master_sample_ok;
+}
+
+static bool
+first_capture_fixture(ClusterPageWalRefV1 *first)
+{
+	first->source_flags = 1;
+	first_private_refs++;
+	return true;
+}
+
+static bool
+first_frame_fixture(void)
+{
+	if (first_error_step == 1)
+		pg_re_throw();
+	return first_error_step != 4;
+}
+
+static ResourceXApplyResult
+first_pair_fixture(ClusterPageWalRefV1 *first)
+{
+	if (first_error_step == 2)
+		pg_re_throw();
+	if (first_error_step == 5)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (first != NULL && first->source_flags != 0) {
+		first_private_refs--;
+		first_pending_refs++;
+		memset(first, 0, sizeof(*first));
+	}
+	if (first_error_step == 3)
+		pg_re_throw();
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
+static bool
+first_release_fixture(ClusterPageWalRefV1 *first)
+{
+	if (first->source_flags != 0) {
+		first_private_refs--;
+		first_releases++;
+		memset(first, 0, sizeof(*first));
+	}
+	return true;
+}
+
+static ResourceXApplyResult
+run_actual_source_first_cleanup(int route, bool semantic_retained)
+{
+	volatile ClusterPageWalRefV1 page_first = { 0 };
+	PGAlignedBlock aligned_page = { { 0 } };
+	uint64 page_scn pg_attribute_unused();
+	bool shared_s_source = route == 3;
+	bool finish_required = true;
+	bool tagless_target_x = route == 1 || route == 2;
+	bool target_x_drop = route == 1, target_x_retain = route == 2;
+	ResourceXApplyResult result, failure_result;
+	const char *failure_stage pg_attribute_unused();
+	uint32 capability_word = first_requester_caps;
+	int32 resource_master_node = cluster_node_id + 1;
+
+#define cluster_bufmgr_copy_block_for_gcs(tag, lsn, page, refusal, wal, first, peer_caps)          \
+	(first_copied_caps = (peer_caps), first_capture_fixture((ClusterPageWalRefV1 *)(first)))
+#define cluster_sf_peer_capability_word_sample first_master_capability_sample
+#define gcs_block_pcm_x_resource_x_build_source_frames(...) first_frame_fixture()
+#define cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(...) first_pair_fixture(NULL)
+#define cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(a, b, c, d, e, f, first)        \
+	first_pair_fixture((ClusterPageWalRefV1 *)(first))
+#define cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(a, b, c, d, e, f, first)    \
+	first_pair_fixture((ClusterPageWalRefV1 *)(first))
+#define cluster_pcm_lock_resource_x_block_to_n_source_exact(a, b, c, d, first)                     \
+	first_pair_fixture((ClusterPageWalRefV1 *)(first))
+#define cluster_page_wal_ref_release_v1(first) first_release_fixture((ClusterPageWalRefV1 *)(first))
+#include "test_cluster_resource_x_source_first_cleanup.inc"
+	return result;
+pre_retained_failure:
+	(void)cluster_page_wal_ref_release_v1(&page_first);
+	return failure_result;
+#undef cluster_bufmgr_copy_block_for_gcs
+#undef cluster_sf_peer_capability_word_sample
+#undef gcs_block_pcm_x_resource_x_build_source_frames
+#undef cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact
+#undef cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact
+#undef cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact
+#undef cluster_pcm_lock_resource_x_block_to_n_source_exact
+#undef cluster_page_wal_ref_release_v1
+}
+
+UT_TEST(test_actual_source_first_ref_is_released_across_errors)
+{
+	for (int route = 0; route < 4; route++) {
+		for (int step = 0; step < 6; step++) {
+			volatile bool caught = false;
+			ResourceXApplyResult result = RESOURCE_X_APPLY_INVALID;
+			bool moved = route != 3 && (step == 0 || step == 3);
+
+			first_error_step = step;
+			first_private_refs = first_pending_refs = first_releases = 0;
+			PG_TRY();
+			{
+				result = run_actual_source_first_cleanup(route, false);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+			}
+			PG_END_TRY();
+			UT_ASSERT_EQ(caught, step >= 1 && step <= 3);
+			UT_ASSERT_EQ(first_private_refs, 0);
+			UT_ASSERT_EQ(first_pending_refs, moved ? 1 : 0);
+			UT_ASSERT_EQ(first_releases, route != 3 && !moved ? 1 : 0);
+			if (!caught)
+				UT_ASSERT_EQ(result, step == 0	 ? RESOURCE_X_APPLY_APPLIED
+									 : step == 4 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+												 : RESOURCE_X_APPLY_BAD_STATE);
+			if (ut_current_failed)
+				printf("# source first cleanup route=%d step=%d\n", route, step);
+		}
+	}
+	first_error_step = first_private_refs = first_pending_refs = first_releases = 0;
+	UT_ASSERT_EQ(run_actual_source_first_cleanup(0, true), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(first_private_refs + first_pending_refs + first_releases, 0);
+}
+
+UT_TEST(test_actual_source_copy_requires_requester_and_master_pi_capability)
+{
+	for (int variant = 0; variant < 4; variant++) {
+		first_requester_caps = variant == 1 ? 0 : PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		first_master_caps = variant == 2 ? 0 : PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2;
+		first_master_sample_ok = variant != 3;
+		first_copied_caps = UINT32_MAX;
+		first_error_step = first_private_refs = first_pending_refs = first_releases = 0;
+		UT_ASSERT_EQ(run_actual_source_first_cleanup(1, false), RESOURCE_X_APPLY_APPLIED);
+		UT_ASSERT_EQ(first_copied_caps, variant == 0 ? PGRAC_IC_HELLO_CAP_PI_STRUCTURAL_V2 : 0);
+		UT_ASSERT_EQ(first_private_refs, 0);
+		UT_ASSERT_EQ(first_pending_refs, 1);
+	}
+	first_requester_caps = first_master_caps = 0;
+}
+
 static ResourceXApplyResult
 run_actual_source_final_gate(bool semantic_retained)
 {
@@ -1813,6 +1969,61 @@ static int evict_claims, evict_aborts, evict_commits, evict_enqueues;
 static bool evict_after_prepare_gap, evict_after_enqueue_gap, evict_queue_full;
 static ResourceXApplyResult evict_abort_result, evict_commit_result;
 
+static int evict_refs, evict_retains, evict_pi_records, evict_wal_case;
+static bool evict_requires_pi;
+static XLogRecPtr evict_first_end;
+
+bool
+cluster_page_wal_flush_source_v1(const ClusterPageWalBindingV1 *wal, ClusterPageWalBindingV1 *out)
+{
+	UT_ASSERT_EQ(evict_claims, 0);
+	UT_ASSERT(wal->record_end == 200
+			  || (evict_first_end != 0 && wal->record_end == evict_first_end));
+	if (evict_wal_case == 1)
+		return false;
+	*out = *wal;
+	out->flags = CLUSTER_PAGE_WAL_NATIVE_FLUSHED;
+	return true;
+}
+
+bool
+cluster_page_wal_ref_retain_v1(const ClusterPageWalBindingV1 *wal, ClusterPageWalRefV1 *out)
+{
+	UT_ASSERT_EQ(wal->flags, CLUSTER_PAGE_WAL_NATIVE_FLUSHED);
+	UT_ASSERT_EQ(out->source_flags, 0);
+	evict_retains++;
+	if (evict_wal_case == 2 && evict_retains == 2)
+		return false;
+	out->source_flags = 1;
+	out->start = wal->record_start;
+	evict_refs++;
+	return true;
+}
+
+bool
+cluster_page_wal_ref_release_v1(ClusterPageWalRefV1 *ref)
+{
+	if (ref->source_flags) {
+		UT_ASSERT(evict_refs > 0);
+		evict_refs--;
+		memset(ref, 0, sizeof(*ref));
+	}
+	return true;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_target_evict_record_pi_exact(ResourceXTargetEvictionPlan *plan)
+{
+	UT_ASSERT(plan->local_n_committed && plan->prepared && !plan->release_admitted);
+	UT_ASSERT_EQ(evict_enqueues, 0);
+	UT_ASSERT_EQ(evict_refs, 2);
+	UT_ASSERT(cluster_page_wal_ref_release_v1(&plan->pi_refs[0]));
+	UT_ASSERT(cluster_page_wal_ref_release_v1(&plan->pi_refs[1]));
+	plan->pi_recorded = true;
+	evict_pi_records++;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
 ResourceXApplyResult
 cluster_pcm_lock_resource_x_target_evict_prepare_exact(const BufferTag *tag, int32 node,
 													   uint64 formation, uint64 session, uint64 r4,
@@ -1871,6 +2082,8 @@ evict_encode(uint8 kind, const ResourceXDecodedFrame *frame, void *payload, uint
 	UT_ASSERT_EQ(kind, RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE);
 	UT_ASSERT_EQ(frame->kind, RESOURCE_X_WIRE_RELEASE_X);
 	UT_ASSERT_EQ(capacity, RESOURCE_X_CONTROL_V1_BYTES);
+	if (evict_wal_case == 3)
+		pg_re_throw();
 	*bytes = capacity;
 	*reject = RESOURCE_X_WIRE_REJECT_NONE;
 	memset(payload, 0xa5, capacity);
@@ -1884,6 +2097,8 @@ evict_enqueue(uint8 kind, uint32 destination, const void *payload, uint16 bytes)
 	UT_ASSERT_EQ(destination, 1);
 	UT_ASSERT_EQ(bytes, RESOURCE_X_CONTROL_V1_BYTES);
 	UT_ASSERT_EQ(((const uint8 *)payload)[0], 0xa5);
+	if (evict_requires_pi)
+		UT_ASSERT_EQ(evict_pi_records, 1);
 	if (evict_queue_full)
 		return false;
 	evict_enqueues++;
@@ -1928,6 +2143,8 @@ evict_fixture(ResourceXTargetEvictionPlan *plan)
 	terminal_identity_conflict = terminal_pending_remaining = 0;
 	eviction_admission_closed = false;
 	evict_claims = evict_aborts = evict_commits = evict_enqueues = 0;
+	evict_refs = evict_retains = evict_pi_records = evict_wal_case = 0;
+	evict_requires_pi = cluster_shared_config = false;
 	evict_after_prepare_gap = evict_after_enqueue_gap = evict_queue_full = false;
 	evict_abort_result = evict_commit_result = RESOURCE_X_APPLY_APPLIED;
 	memset(plan, 0, sizeof(*plan));
@@ -2034,14 +2251,123 @@ UT_TEST(test_actual_eviction_prepare_pending_proves_exact_reversible_cleanup)
 		evict_after_prepare_gap = leg != 0;
 		if (leg == 2)
 			evict_abort_result = RESOURCE_X_APPLY_STALE;
-		UT_ASSERT_EQ(
-			cluster_gcs_resource_x_target_evict_prepare_exact(&exact.tag, &exact, 77, 9, &plan),
-			leg == 2 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED : RESOURCE_X_APPLY_BAD_STATE);
+		UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_prepare_exact(&exact.tag, &exact, 77, 9,
+																	   NULL, &plan, NULL),
+					 leg == 2 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED : RESOURCE_X_APPLY_BAD_STATE);
 		UT_ASSERT(!plan.prepared);
 		UT_ASSERT_EQ(evict_aborts, leg == 0 ? 0 : 1);
 		UT_ASSERT_EQ(evict_claims, leg == 0 ? 0 : 1);
 	}
 	session_gap = false;
+}
+
+UT_TEST(test_eviction_reserves_before_n_and_registers_before_release)
+{
+	for (int leg = 0; leg < 6; leg++) {
+		static ResourceXTargetEvictionPlan storage;
+		ResourceXTargetEvictionPlan *const plan = &storage;
+		ClusterPcmOwnSnapshot exact = { 0 };
+		ClusterPageWalBindingV1 wal = { 0 };
+		volatile ResourceXApplyResult prepared = RESOURCE_X_APPLY_INVALID;
+		volatile bool caught = false;
+		bool retry = false;
+		evict_fixture(plan);
+		cluster_shared_config = evict_requires_pi = true;
+		exact.tag = plan->tag;
+		exact.generation = 7;
+		exact.reservation_token = 9;
+		exact.flags = PCM_OWN_FLAG_REVOKING;
+		exact.pcm_state = PCM_STATE_X;
+		wal.identity.locator = BufTagGetRelFileLocator(&exact.tag);
+		wal.identity.forknum = exact.tag.forkNum;
+		wal.identity.blockno = exact.tag.blockNum;
+		wal.record_end = 200;
+		evict_wal_case = leg;
+		evict_after_prepare_gap = leg == 4;
+		PG_TRY();
+		{
+			prepared = cluster_gcs_resource_x_target_evict_prepare_exact(&exact.tag, &exact, 77, 9,
+																		 &wal, plan, NULL);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, leg == 3);
+		UT_ASSERT_EQ(evict_pi_records, 0);
+		UT_ASSERT_EQ(evict_enqueues, 0);
+		if (leg == 0 || leg == 5) {
+			UT_ASSERT_EQ(prepared, RESOURCE_X_APPLY_APPLIED);
+			UT_ASSERT_EQ(evict_refs, 2);
+			UT_ASSERT(!plan->local_n_committed);
+			if (leg == 5) {
+				UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_abort_exact(plan),
+							 RESOURCE_X_APPLY_APPLIED);
+			} else {
+				plan->local_n_committed = true;
+				evict_queue_full = true;
+				UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_publish_exact(plan, &retry),
+							 RESOURCE_X_APPLY_BAD_STATE);
+				UT_ASSERT(retry && plan->pi_recorded && !plan->release_admitted);
+				evict_queue_full = false;
+				UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_publish_exact(plan, &retry),
+							 RESOURCE_X_APPLY_APPLIED);
+				UT_ASSERT_EQ(evict_pi_records, 1);
+				UT_ASSERT_EQ(evict_enqueues, 1);
+			}
+		} else {
+			if (leg != 3)
+				UT_ASSERT_EQ(prepared, RESOURCE_X_APPLY_BAD_STATE);
+			UT_ASSERT(!plan->prepared);
+			UT_ASSERT_EQ(evict_aborts, leg == 3 || leg == 4 ? 1 : 0);
+		}
+		UT_ASSERT_EQ(evict_refs, 0);
+	}
+	cluster_shared_config = evict_requires_pi = false;
+}
+
+UT_TEST(test_eviction_retains_first_separately_from_latest)
+{
+	for (int variant = 0; variant < 3; variant++) {
+		ResourceXTargetEvictionPlan plan;
+		ClusterPcmOwnSnapshot exact = { 0 };
+		ClusterPageWalBindingV1 wal = { 0 }, first;
+
+		evict_fixture(&plan);
+		cluster_shared_config = true;
+		exact.tag = plan.tag;
+		exact.generation = 7;
+		exact.reservation_token = 9;
+		exact.flags = PCM_OWN_FLAG_REVOKING;
+		exact.pcm_state = PCM_STATE_X;
+		wal.identity.locator = BufTagGetRelFileLocator(&exact.tag);
+		wal.identity.forknum = exact.tag.forkNum;
+		wal.identity.blockno = exact.tag.blockNum;
+		wal.record_start = 150;
+		wal.record_end = 200;
+		wal.version.segment_incarnation[0] = 13;
+		first = wal;
+		first.record_start = variant == 1 ? 450 : 50;
+		first.record_end = evict_first_end = variant == 1 ? 500 : 100;
+		if (variant == 1)
+			first.source.claim.identity.origin_thread_id = 2;
+		if (variant == 2)
+			first.identity.blockno++;
+		UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_prepare_exact(&exact.tag, &exact, 77, 9,
+																	   &wal, &plan, &first),
+					 variant == 2 ? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_APPLIED);
+		if (variant != 2) {
+			UT_ASSERT_EQ(plan.pi_refs[0].start, first.record_start);
+			UT_ASSERT_EQ(plan.pi_refs[1].start, wal.record_start);
+			UT_ASSERT_EQ(evict_refs, 2);
+			UT_ASSERT_EQ(cluster_gcs_resource_x_target_evict_abort_exact(&plan),
+						 RESOURCE_X_APPLY_APPLIED);
+		}
+		UT_ASSERT_EQ(evict_refs, 0);
+	}
+	evict_first_end = 0;
+	cluster_shared_config = false;
 }
 
 static ClusterPcmOwnSnapshot failed_round_live;
@@ -2179,7 +2505,7 @@ UT_TEST(test_actual_failed_round_observation_retries_only_exact_predecessor_shap
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(28);
 	UT_RUN(test_actual_terminal_ingress_keeps_master_and_physical_source_distinct);
 	UT_RUN(test_actual_kind9_ingress_does_not_send_ack_for_fused_admission);
 	UT_RUN(test_actual_fused_admission_notifies_ready_resource_without_registry_tick);
@@ -2191,6 +2517,8 @@ main(void)
 	UT_RUN(test_actual_terminal_gate_rejects_proved_identity_or_admission_change);
 	UT_RUN(test_actual_delivery_observation_gap_retains_owner_then_finishes);
 	UT_RUN(test_actual_image_ingress_yields_before_join_and_after_t3);
+	UT_RUN(test_actual_source_first_ref_is_released_across_errors);
+	UT_RUN(test_actual_source_copy_requires_requester_and_master_pi_capability);
 	UT_RUN(test_actual_source_gate_never_rolls_back_armed_pair_for_sample_gap);
 	UT_RUN(test_actual_source_before_mutation_waits_without_exporting_session);
 	UT_RUN(test_actual_foreground_retained_and_predecessor_wait_reobserve_without_fuse);
@@ -2203,6 +2531,8 @@ main(void)
 	UT_RUN(test_actual_eviction_publication_pending_preserves_one_frozen_release);
 	UT_RUN(test_actual_eviction_hard_refusal_and_capacity_have_distinct_retry_cause);
 	UT_RUN(test_actual_eviction_prepare_pending_proves_exact_reversible_cleanup);
+	UT_RUN(test_eviction_reserves_before_n_and_registers_before_release);
+	UT_RUN(test_eviction_retains_first_separately_from_latest);
 	UT_RUN(test_actual_failed_round_observation_retries_only_exact_predecessor_shape);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -55,6 +55,7 @@ LockBuffer(Buffer buffer, int mode)
 
 bool cluster_cr_mvcc_gate = true;
 bool cluster_cr_tuple_level_fastpath = false;
+bool cluster_shared_config = false;
 
 /* Same explicit origin-service fixture as the real resolver tests. */
 bool
@@ -334,10 +335,67 @@ UT_TEST(real_cleanout_positive_control_does_mutate_exact_creator)
 	UT_ASSERT_EQ(ut_hint_mutations, 1);
 }
 
+static void
+opaque_page_gate_case(bool shared, uint64 page_token, SCN read_scn, SCN write_scn,
+					  TransactionId creator, unsigned origin_checks)
+{
+	HeapTupleData tuple = { 0 };
+	SnapshotData snapshot = { 0 };
+	Page page = ut_visibility_page.data;
+	ClusterItlSlotData *slot;
+	PGAlignedBlock before;
+	bool visible = true;
+
+	ut_reset(CLUSTER_TT_STATUS_UNKNOWN, InvalidScn);
+	cluster_shared_config = shared;
+	memset(page, 0, BLCKSZ);
+	((PageHeader)page)->pd_flags = PD_HAS_ITL;
+	((PageHeader)page)->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	((PageHeader)page)->pd_block_scn = page_token;
+	tuple.t_data = (HeapTupleHeader)(page + 1024);
+	tuple.t_data->t_itl_slot_idx = 0;
+	HeapTupleHeaderSetXmin(tuple.t_data, creator);
+	slot = ClusterPageGetItlSlots(page);
+	slot->xid = UT_RAW_XID;
+	slot->flags = ITL_FLAG_ACTIVE;
+	slot->write_scn = write_scn;
+	slot->undo_segment_head = uba_encode(UT_PEER_NODE * 256 + 1, 1, 1, 1);
+	snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	snapshot.read_scn = read_scn;
+	memcpy(before.data, page, BLCKSZ);
+	UT_ASSERT_EQ(cluster_cr_satisfies_mvcc(&tuple, &snapshot, 1, &visible),
+				 CLUSTER_CR_NOT_APPLICABLE);
+	/* Existing origin authority refuses this non-materialized peer. Reaching
+	 * that check is not permission to manufacture visibility or use local CLOG. */
+	UT_ASSERT_EQ(ut_calls.durable, origin_checks);
+	UT_ASSERT_EQ(ut_native_calls, 0);
+	UT_ASSERT(visible);
+	UT_ASSERT(memcmp(before.data, page, BLCKSZ) == 0);
+	cluster_shared_config = false;
+}
+
+UT_TEST(shared_cr_gate_does_not_order_opaque_token_against_snapshot)
+{
+	opaque_page_gate_case(true, 5, UT_READ_SCN, UT_READ_SCN + 1, UT_RAW_XID, 1);
+	opaque_page_gate_case(true, 0, UT_READ_SCN, UT_READ_SCN + 1, UT_RAW_XID, 1);
+	opaque_page_gate_case(true, UT_READ_SCN + 2, UT_READ_SCN, UT_READ_SCN + 1, UT_RAW_XID, 1);
+}
+
+UT_TEST(shared_cr_gate_keeps_snapshot_creator_and_itl_rejections)
+{
+	opaque_page_gate_case(true, 5, InvalidScn, UT_READ_SCN + 1, UT_RAW_XID, 0);
+	opaque_page_gate_case(true, 5, UT_READ_SCN, UT_READ_SCN + 1, UT_RAW_XID + 1, 0);
+	opaque_page_gate_case(true, 5, UT_READ_SCN, UT_READ_SCN - 1, UT_RAW_XID, 0);
+	opaque_page_gate_case(false, 5, UT_READ_SCN, UT_READ_SCN + 1, UT_RAW_XID, 0);
+	opaque_page_gate_case(false, UT_READ_SCN + 2, UT_READ_SCN, UT_READ_SCN + 1, UT_RAW_XID, 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(12);
+	UT_RUN(shared_cr_gate_does_not_order_opaque_token_against_snapshot);
+	UT_RUN(shared_cr_gate_keeps_snapshot_creator_and_itl_rejections);
 	UT_RUN(reused_lock_carrier_uses_real_mvcc_origin_authority);
 	UT_RUN(reused_data_carrier_uses_real_mvcc_origin_authority);
 	UT_RUN(unproved_origin_still_errors_not_silent_invisible);
@@ -348,6 +406,7 @@ main(void)
 	UT_RUN(nonnormal_creator_does_not_authorize_native_status);
 	UT_RUN(original_master_switch_and_local_snapshot_stay_dormant);
 	UT_RUN(real_cleanout_positive_control_does_mutate_exact_creator);
+	UT_ASSERT(ut_snapshot_scope == NULL);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -9,6 +9,9 @@
  *
  *	  src/include/utils/guc_tables.h
  *
+ * PGRAC MODIFICATIONS: process-local shared FILE application status bits.
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef GUC_TABLES_H
@@ -190,6 +193,12 @@ struct config_generic
  */
 #define GUC_PENDING_RESTART 0x0002	/* changed value cannot be applied yet */
 #define GUC_NEEDS_REPORT	0x0004	/* new value must be reported to client */
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: not durable/wire state or a generation ACK. Keep removed names in
+ * the registry census; a later unrelated diff cannot erase their obligations. */
+#define GUC_SHARED_FILE 0x0008
+#define GUC_SHARED_DEFERRED 0x0010
+#endif
 
 
 /* GUC records for specific variable types */

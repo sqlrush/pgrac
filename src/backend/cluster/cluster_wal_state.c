@@ -216,14 +216,18 @@ cluster_wal_state_update_own(const ClusterWalStateUpdate *update, ClusterWalStat
 
 	if (cf_mode == CLUSTER_WAL_STATE_CF_ACQUIRE_X) {
 		/* Do not trip cluster_cf_lock's deliberate non-reentrant Assert. */
-		if (cluster_cf_held(ExclusiveLock) || !cluster_cf_lock(ExclusiveLock))
-			return CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE;
+		if (cluster_cf_held(ExclusiveLock) || !cluster_cf_lock(ExclusiveLock)) {
+			result = CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE;
+			goto out;
+		}
 		acquired_here = true;
-	} else if (!cluster_cf_held(ExclusiveLock))
-		return CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE;
+	} else if (!cluster_cf_held_is_usable(ExclusiveLock)) {
+		result = CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE;
+		goto out;
+	}
 
 	/* Re-prove the derived predicates together with the successful held state. */
-	if (!cluster_cf_held(ExclusiveLock) || !wal_state_cf_prerequisites_ready()) {
+	if (!cluster_cf_held_is_usable(ExclusiveLock) || !wal_state_cf_prerequisites_ready()) {
 		result = CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE;
 		goto out;
 	}

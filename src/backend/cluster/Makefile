@@ -39,6 +39,15 @@ include $(top_builddir)/src/Makefile.global
 ifeq ($(enable_pgrac_cluster), yes)
 OBJS = \
 	cluster.o \
+	cluster_initdb_base.o \
+	cluster_initdb_config.o \
+	cluster_initdb_cohort.o \
+	cluster_initdb_tree.o \
+	cluster_initdb_common.o \
+	cluster_initdb_catalog.o \
+	cluster_initdb_origin.o \
+	cluster_initdb_side.o \
+	cluster_initdb_wal.o \
 	cluster_adg.o \
 	cluster_adg_xlog.o \
 	cluster_apply_master_election.o \
@@ -49,11 +58,28 @@ OBJS = \
 	cluster_backup.o \
 	cluster_backup_manifest.o \
 	cluster_cf_authority.o \
+	cluster_shared_config.o \
+	cluster_shared_config_guc.o \
+	cluster_shared_config_delivery.o \
+	cluster_shared_config_lmon.o \
+	cluster_config_members.o \
+	cluster_service_observe.o \
 	cluster_control_root.o \
+	cluster_control_observe.o \
+	cluster_wal_history.o \
+	cluster_wal_tail.o \
+	cluster_control_bootstrap.o \
+	cluster_control_bootstrap_read.o \
+	cluster_control_bootstrap_native.o \
+	cluster_control_catalog_read.o \
 	cluster_formation_marker.o \
 	cluster_page_version.o \
+	cluster_page_cold_redo.o \
 	cluster_page_rmgr.o \
 	cluster_page_producer.o \
+	cluster_page_wal.o \
+	cluster_space_storage.o \
+	cluster_space_recovery.o \
 	cluster_page_anchor_cache.o \
 	cluster_page_detached.o \
 	cluster_page_guard.o \
@@ -78,8 +104,22 @@ OBJS = \
 	cluster_side_projection.o \
 	cluster_side_space.o \
 	cluster_side_stats.o \
+	cluster_cold_recovery_plan.o \
+	cluster_cold_recovery_plan_store.o \
+	cluster_cold_recovery_plan_seal.o \
+	cluster_cold_recovery_plan_space.o \
+	cluster_cold_recovery_plan_schedule.o \
+	cluster_cold_recovery_decode.o \
+	cluster_cold_recovery_io.o \
+	cluster_cold_recovery_space.o \
+	cluster_cold_recovery_startup.o \
+	cluster_cold_recovery_replay.o \
 	cluster_recovery_duty.o \
 	cluster_cf_enqueue.o \
+	cluster_lock_owner.o \
+	cluster_control_request.o \
+	cluster_control_retire.o \
+	cluster_startup_exit.o \
 	cluster_cf_phase2.o \
 	cluster_cf_stats.o \
 	cluster_cf_storage.o \
@@ -126,6 +166,7 @@ OBJS = \
 	cluster_recovery_anchor.o \
 	cluster_block_apply.o \
 	cluster_block_apply_heap.o \
+	cluster_block_apply_btree.o \
 	cluster_block_apply_srf.o \
 	cluster_block_recovery.o \
 	cluster_block_recovery_srf.o \
@@ -209,9 +250,13 @@ OBJS = \
 	cluster_pi_shadow.o \
 	cluster_quorum_decision.o \
 	cluster_qvotec.o \
+	cluster_storage_quorum.o \
+	cluster_storage_quorum_backend.o \
+	cluster_storage_quorum_corosync.o \
 	cluster_scn.o \
 	cluster_semantic_activation.o \
 	cluster_catalog_bootstrap.o \
+	cluster_catalog_startup_input.o \
 	cluster_catalog_migrate.o \
 	cluster_catalog_stats.o \
 	cluster_oid_lease.o \
@@ -238,11 +283,15 @@ OBJS = \
 	cluster_visibility_verdict.o \
 	cluster_writer_chain.o \
 	cluster_wal_retention.o \
+	cluster_wal_retained_cut.o \
+	cluster_wal_retained_side.o \
+	cluster_wal_retained_generation.o \
 	cluster_undo_record.o \
 	cluster_undo_resid.o \
 	cluster_undo_authority.o \
 	cluster_undo_authority_snapshot.o \
 	cluster_undo_gcs.o \
+	cluster_undo_recovery.o \
 	cluster_undo_gcs_grant.o \
 	cluster_undo_gcs_stat.o \
 	cluster_undo_horizon.o \
@@ -290,6 +339,17 @@ OBJS = \
 	cluster_stats.o \
 	cluster_version.o \
 	cluster_views.o \
+	cluster_wal_claim.o \
+	cluster_wal_inputs.o \
+	cluster_pi_contribution_stream.o \
+	cluster_wal_cut.o \
+	cluster_pi_data.o \
+	cluster_pi_writeback.o \
+	cluster_heap_horizon.o \
+	cluster_block_redeclare.o \
+	cluster_pi_rebuild.o \
+	cluster_wal_restart_read.o \
+	cluster_wal_writer.o \
 	cluster_wal_state.o \
 	cluster_wal_thread.o \
 	cluster_xid_authority.o \
@@ -343,4 +403,51 @@ OBJS = cluster_conf.o cluster_debug.o cluster_ic.o cluster_inject.o cluster_undo
 # SQL symbols; --disable-cluster bodies raise ERRCODE_FEATURE_NOT_SUPPORTED.
 endif
 
+# PGRAC: private recovery carriers are shared across actual consumers. Keep
+# incremental builds coherent even without compiler-generated dependencies.
+# Author: SqlRush <sqlrush@gmail.com>
+cluster_control_root.o cluster_control_bootstrap_read.o cluster_wal_history.o \
+cluster_clean_leave.o cluster_cf_authority.o cluster_recovery_duty.o \
+cluster_thread_recovery_finalize.o cluster_thread_recovery_worker.o \
+cluster_wal_thread.o cluster_wal_writer.o cluster_wal_retention.o: \
+	$(srcdir)/cluster_control_root_private.h
+
+cluster_control_bootstrap.o cluster_control_bootstrap_read.o cluster_control_root.o \
+cluster_wal_tail.o: $(top_srcdir)/src/include/cluster/cluster_wal_tail.h
+cluster_wal_inputs.o: $(top_srcdir)/src/include/cluster/cluster_wal_inputs.h \
+	$(srcdir)/cluster_control_root_private.h $(srcdir)/cluster_recovery_anchor_private.h
+cluster_wal_cut.o: $(top_srcdir)/src/include/cluster/cluster_wal_cut.h \
+	$(top_srcdir)/src/include/cluster/cluster_wal_writer.h
+cluster_pi_data.o cluster_pi_writeback.o: $(srcdir)/cluster_pi_data_wire.h \
+	$(top_srcdir)/src/include/cluster/cluster_pi_writeback.h
+
+cluster_reconfig.o cluster_thread_recovery_worker.o: \
+	$(top_srcdir)/src/include/cluster/cluster_thread_recovery.h
+
+cluster_page_authority.o cluster_ir_lock.o cluster_recovery_merge.o \
+cluster_wal_retention.o cluster_thread_recovery_worker.o cluster_control_root.o \
+cluster_thread_recovery_authority.o cluster_thread_recovery_finalize.o: \
+	$(top_srcdir)/src/include/cluster/cluster_ir.h
+
+cluster_wal_retention.o cluster_thread_recovery_authority.o \
+cluster_thread_recovery_worker.o cluster_thread_recovery_finalize.o: \
+	$(top_srcdir)/src/include/cluster/cluster_wal_retention.h
+
 include $(top_srcdir)/src/backend/common.mk
+
+# PGRAC: physical origin inspection shares native startup byte predicates.
+# Author: SqlRush <sqlrush@gmail.com>
+cluster_control_bootstrap_read.o: $(top_srcdir)/src/include/cluster/cluster_native_startup.h \
+	$(top_srcdir)/src/include/cluster/cluster_xid_authority.h
+cluster_control_root.o cluster_control_bootstrap.o cluster_control_bootstrap_read.o \
+cluster_wal_history.o cluster_thread_recovery_worker.o cluster_control_observe.o \
+cluster_control_bootstrap_native.o cluster_control_catalog_read.o cluster_cf_storage.o cluster_wal_thread.o: \
+	$(srcdir)/cluster_control_bootstrap_private.h
+cluster_control_root.o cluster_recovery_anchor.o: $(srcdir)/cluster_recovery_anchor_private.h
+
+# Both original creation processes use the same exact native record reader.
+cluster_initdb_wal.o: $(top_srcdir)/src/bin/initdb/pgrac_wal.c $(top_srcdir)/src/bin/initdb/pgrac_wal.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
+
+cluster_initdb_side.o: $(top_srcdir)/src/bin/initdb/pgrac_side.c $(top_srcdir)/src/bin/initdb/pgrac_side.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@

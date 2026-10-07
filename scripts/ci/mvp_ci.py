@@ -38,7 +38,16 @@ def load_policy():
             raise ValueError(f"missing retained TAP test: {name}")
     if not (ROOT / ".github/workflows" / policy["historical_workflow"]).is_file():
         raise ValueError("missing historical workflow")
+    smoke_selection(policy, native=True)
     return policy
+
+
+def smoke_selection(policy, *, native):
+    selected = policy['native_smoke_tests']
+    if (not selected or len(selected) != len(set(selected))
+            or not set(selected).issubset(policy['smoke_tests'])):
+        raise ValueError('invalid native MVP smoke selection')
+    return [name for name in policy['smoke_tests'] if (name in selected) == native]
 
 
 def latest_run(runs, sha):
@@ -103,6 +112,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--smoke", action="store_true")
+    mode.add_argument("--smoke-local", action="store_true")
+    mode.add_argument("--smoke-native", action="store_true")
     mode.add_argument("--verify-release", action="store_true")
     parser.add_argument("--repository")
     parser.add_argument("--sha")
@@ -111,6 +122,8 @@ def main():
         policy = load_policy()
         if args.smoke:
             print(" ".join(policy["smoke_tests"]))
+        elif args.smoke_local or args.smoke_native:
+            print(' '.join(smoke_selection(policy, native=args.smoke_native)))
         else:
             print(json.dumps(verify_release(args.repository, args.sha, policy), indent=2))
     except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:

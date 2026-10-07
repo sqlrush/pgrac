@@ -35,9 +35,10 @@
 #define CLUSTER_CATALOG_BOOTSTRAP_H
 
 /*
- * cluster_catalog_startup_prepare -- postmaster-once.  No-op unless
- *	cluster.shared_catalog is on.  Seeds the shared OID authority from the
- *	shared pg_control high-water (seed node), or adopts it (join node).
+ * cluster_catalog_startup_prepare -- postmaster-once. Shared-config mode
+ *	requires the verified input source in cluster_catalog_startup.h and
+ *	only validates original inputs and current authorities. It never seeds,
+ *	adopts, or repairs. The non-shared off-mode check remains unchanged.
  *	Fail-closed FATAL (53RB0) when the shared authority the feature depends on
  *	is unavailable.
  */

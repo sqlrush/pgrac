@@ -4,7 +4,7 @@
 #    End-to-end regression for the PCM lock framework surface.  This
 #    started as the stage-1.7 scaffolding test, but spec-2.30 activates
 #    the local PCM state machine; the current active diagnostic surface
-#    is 110 rows in the measured R1 diagnostic surface.
+#    is 312 rows in the measured R1 diagnostic surface.
 #
 #    Verifies the SQL surface backed by spec-1.7 Deliverable 4 (pcm
 #    category) + Deliverable 5 (4 PCM inject points, registry 24->28)
@@ -55,14 +55,14 @@ $node->start;
 
 
 # ----------
-# L1: pg_cluster_state.pcm category has 110 keys in the measured R1 diagnostic surface.
+# L1: pg_cluster_state.pcm category has 312 keys in the measured R1 diagnostic surface.
 # activates the state-machine diagnostics.
 # ----------
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='pcm'}),
-	'110',
-	'L1 pg_cluster_state.pcm category has 110 keys (measured R1 diagnostic surface)');
+	'312',
+	'L1 pg_cluster_state.pcm category has 312 keys (measured R1 diagnostic surface)');
 
 
 # ----------
@@ -162,8 +162,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 			'postgres',
 			'SELECT count(*) FROM pg_stat_cluster_injections'),
-	   '186',
-	   'L6a pg_stat_cluster_injections has 186 entries (matches t/015 registry authority)');
+	   '187',
+	   'L6a pg_stat_cluster_injections has 187 entries (matches t/015 registry authority)');
 
 is($node->safe_psql(
 		'postgres',
@@ -189,8 +189,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '58',
-   'L7b pg_cluster_state has 56 distinct categories (spec-2.29a adds reconfig marker telemetry; spec-6.15 adds xid_stripe; spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever; spec-6.14 adds catalog)');
+   '70',
+   'L7b pg_cluster_state has 70 distinct categories (spec-2.29a adds reconfig marker telemetry; spec-6.15 adds xid_stripe; spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever; spec-6.14 adds catalog)');
 
 
 # ----------
@@ -209,7 +209,7 @@ is($node->safe_psql(
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '58', 'L9 cluster_smoke surface integrates pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + undo_record + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion + reconfig categories (58 categories; spec-2.29a adds reconfig marker telemetry; spec-6.15 adds xid_stripe; spec-6.14 adds catalog)');
+is($smoke_categories, '70', 'L9 cluster_smoke surface integrates pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + undo_record + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion + reconfig categories (70 categories; spec-2.29a adds reconfig marker telemetry; spec-6.15 adds xid_stripe; spec-6.14 adds catalog)');
 
 
 # ----------

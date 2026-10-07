@@ -124,6 +124,7 @@
 #define BUFPAGE_H
 
 #include "access/xlogdefs.h"
+#include "common/relpath.h"
 #include "storage/block.h"
 #include "storage/item.h"
 #include "storage/off.h"
@@ -356,7 +357,9 @@ typedef PageHeaderData *PageHeader;
 #define PD_LSN_ORIGIN_SHIFT 7
 #define PD_LSN_ORIGIN_MASK 0x0780
 #define PGRAC_PAGE_LSN_ORIGIN_MAX 15
-#define PD_VALID_FLAG_BITS 0x07FF /* OR of all valid pd_flags bits */
+/* PGRAC: SPACE is disjoint from ITL, undo-header and qualified LSN bits. */
+#define PD_SPACE_METADATA 0x0800
+#define PD_VALID_FLAG_BITS 0x0FFF /* OR of all valid pd_flags bits */
 #else
 #define PD_VALID_FLAG_BITS 0x0007 /* OR of all valid pd_flags bits */
 #endif
@@ -633,6 +636,7 @@ extern bool cluster_recmerge_window_active;
 extern uint64 cluster_recmerge_window_scn;
 extern uint64 cluster_recmerge_window_own_lsn;
 extern bool cluster_recmerge_apply_foreign;
+extern bool cluster_shared_config;
 extern int cluster_node_id;
 #endif
 
@@ -646,7 +650,7 @@ PageSetLSN(Page page, XLogRecPtr lsn)
 	 * clamp the materialized page's pd_lsn to the own recovery redo
 	 * (durable, comparable).  Otherwise the end-of-recovery checkpoint's
 	 * FlushBuffer would demand an unsatisfiable XLogFlush of the peer's
-	 * LSN.  pd_block_scn (below) stays the window's freshness authority.
+	 * LSN.  The shared profile's pd_block_scn remains its opaque version.
 	 */
 	if (cluster_recmerge_window_active && cluster_recmerge_apply_foreign)
 		lsn = (XLogRecPtr) cluster_recmerge_window_own_lsn;
@@ -660,14 +664,15 @@ PageSetLSN(Page page, XLogRecPtr lsn)
 		PageClearLSNOrigin(page);
 
 	/*
-	 * Inside the merged-replay window every applied record stamps its SCN
-	 * as the page's freshness watermark.  Cross-thread pd_lsn values are
+	 * In the legacy profile, every applied record stamps its SCN as the
+	 * page's freshness watermark.  Cross-thread pd_lsn values are
 	 * incomparable, so pd_block_scn is the window's ordering authority
 	 * (XLogReadBufferForRedoExtended judges BLK_DONE/BLK_NEEDS_REDO by it
 	 * inside the window); the stamp also survives a window crash-rerun,
-	 * making re-applied records skip.
+	 * making re-applied records skip.  The shared profile instead retains
+	 * the exact PageVersion token installed by its producer/replay owner.
 	 */
-	if (cluster_recmerge_window_active)
+	if (cluster_recmerge_window_active && !cluster_shared_config)
 		((PageHeader)page)->pd_block_scn = (SCN)cluster_recmerge_window_scn;
 #endif
 }
@@ -923,6 +928,9 @@ PageIsUndoSegmentHeader(Page page)
 }
 #endif
 extern bool PageIsVerifiedExtended(Page page, BlockNumber blkno, int flags);
+/* PGRAC: bind the page type to its actual storage fork on read. */
+extern bool PageIsVerifiedForFork(Page page, ForkNumber forknum,
+								  BlockNumber blkno, int flags);
 extern OffsetNumber PageAddItemExtended(Page page, Item item, Size size, OffsetNumber offsetNumber,
 										int flags);
 extern Page PageGetTempPage(Page page);

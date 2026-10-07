@@ -239,6 +239,9 @@ typedef struct SavedTransactionCharacteristics
 /* PGRAC (spec-3.18 D4.1): bit 10 -- durable TT-slot commit section
  * (xl_xact_tt_commit), folded in from the standalone 0x30 WAL record. */
 #define XACT_XINFO_HAS_TT_COMMIT		(1U << 10)
+/* Atomic native COMMIT deletion payload: uint32 count, then fixed typed pairs. */
+#define XACT_XINFO_HAS_SPACE_DROP		(1U << 11)
+#define XACT_SPACE_DROP_RECORD_BYTES	656
 
 /*
  * Also stored in xinfo, these indicating a variety of additional actions that
@@ -492,6 +495,8 @@ typedef struct xl_xact_parsed_commit
 	SCN			scn;			/* PGRAC (spec-1.18): InvalidScn if !HAS_SCN */
 	bool		has_tt_commit;	/* PGRAC (spec-3.18 D4.1): XACT_XINFO_HAS_TT_COMMIT set */
 	xl_xact_tt_commit tt_commit;	/* PGRAC (spec-3.18 D4.1): valid iff has_tt_commit */
+	uint32		nspace_drops;
+	const char *space_drops;		/* unaligned fixed typed pairs in this record */
 } xl_xact_parsed_commit;
 
 typedef xl_xact_parsed_commit xl_xact_parsed_prepare;
@@ -605,7 +610,8 @@ extern XLogRecPtr XactLogCommitRecord(TimestampTz commit_time,
 									  TransactionId twophase_xid,
 									  const char *twophase_gid,
 									  SCN commit_scn,	/* PGRAC: spec-1.18 */
-									  const xl_xact_tt_commit *tt_commit);	/* PGRAC: spec-3.18 D4.1 */
+									  const xl_xact_tt_commit *tt_commit,
+									  const char *space_drop_data, uint32 space_drop_len);
 
 extern XLogRecPtr XactLogAbortRecord(TimestampTz abort_time,
 									 int nsubxacts, TransactionId *subxacts,
@@ -622,7 +628,9 @@ extern void xact_desc(StringInfo buf, XLogReaderState *record);
 extern const char *xact_identify(uint8 info);
 
 /* also in xactdesc.c, so they can be shared between front/backend code */
-extern void ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, xl_xact_parsed_commit *parsed);
+/* Refusal leaves parsed unchanged; callers must reject malformed input. */
+extern bool ParseCommitRecord(uint8 info, xl_xact_commit *xlrec, Size len,
+							  xl_xact_parsed_commit *parsed);
 extern void ParseAbortRecord(uint8 info, xl_xact_abort *xlrec, xl_xact_parsed_abort *parsed);
 extern void ParsePrepareRecord(uint8 info, xl_xact_prepare *xlrec, xl_xact_parsed_prepare *parsed);
 

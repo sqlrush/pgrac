@@ -70,6 +70,32 @@
 #include "lib/ilist.h"
 #include "port/atomics.h"
 #include "storage/lock.h" /* LOCKTAG */
+#include "storage/spin.h"
+
+/* Local frozen directory identity, never a DATA or retirement proof. */
+typedef struct ClusterGrdPiRebuildCutV1 {
+	uint64 epoch;
+	uint64 event_id;
+	uint64 redeclare_generation;
+	uint64 master_map_refresh;
+	uint64 routing_generation;
+	uint64 self_boot;
+	uint32 direction;
+	uint32 reserved_zero;
+	uint8 affected[CLUSTER_MAX_NODES / 8];
+	uint8 members[CLUSTER_MAX_NODES / 8];
+	uint64 member_boots[CLUSTER_MAX_NODES];
+} ClusterGrdPiRebuildCutV1;
+
+/* 0: no local takeover, -1: not yet a complete protocol cut, 1: frozen cut.
+ * The common protocol barrier remains distinct from PI/DATA completion. */
+extern int cluster_grd_pi_rebuild_snapshot_v1(ClusterGrdPiRebuildCutV1 *out);
+extern bool cluster_grd_pi_rebuild_current_v1(const ClusterGrdPiRebuildCutV1 *cut);
+extern bool cluster_grd_pi_rebuild_complete_v1(const ClusterGrdPiRebuildCutV1 *cut);
+extern bool cluster_grd_pi_rebuild_gate_v1(void);
+extern void cluster_grd_inc_pi_rebuild_side_blocked(void);
+extern void cluster_grd_inc_pi_rebuild_apply_blocked(void);
+extern void cluster_grd_inc_pi_rebuild_plan_blocked(void);
 
 typedef struct ClusterFormationSnapshotV1 ClusterFormationSnapshotV1;
 
@@ -297,6 +323,13 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint64 recovery_event_old_epoch;
 	pg_atomic_uint64 recovery_redeclare_generation;
 	pg_atomic_uint64 recovery_barrier_deadline;
+	/* Observational mirrors published by LMON. Never used as service proof. */
+	pg_atomic_uint32 block_redeclare_cursor;
+	pg_atomic_uint32 local_pi_redeclare_cursor;
+	pg_atomic_uint64 block_redeclare_epoch;
+	pg_atomic_uint32 block_redeclare_done;
+	pg_atomic_uint64 block_redeclare_retries;
+	pg_atomic_uint64 local_pi_redeclare_retries;
 	pg_atomic_uint32 recovery_event_coordinator;
 	pg_atomic_uint64 recovery_done_epoch_at_accept;
 
@@ -418,7 +451,18 @@ typedef struct ClusterGrdShared {
 	 */
 	pg_atomic_uint64 join_pcm_fence_epoch;
 	pg_atomic_uint64 join_pcm_fence_member_epoch[CLUSTER_MAX_NODES];
+	/* PGRAC: a remaining dead/removed home may change survivor master on
+	 * JOIN. These homes are not recipients and never waive survivor DONE. */
+	pg_atomic_uint64 join_pcm_fence_excluded_epoch[CLUSTER_MAX_NODES];
+	pg_atomic_uint64 join_pcm_fence_scope_epoch;
 	pg_atomic_uint32 recovery_direction;
+	slock_t pi_rebuild_lock;
+	/* Scope/complete publication sequence; zero disables the local ready memo. */
+	pg_atomic_uint64 pi_rebuild_publication;
+	ClusterGrdPiRebuildCutV1 pi_rebuilt;
+	pg_atomic_uint64 pi_rebuild_side_blocked_count;
+	pg_atomic_uint64 pi_rebuild_apply_blocked_count;
+	pg_atomic_uint64 pi_rebuild_plan_blocked_count;
 
 	/*
 	 * TT lane / crash-rejoin re-declare barrier (Shape A) — off-path boot
@@ -447,6 +491,10 @@ typedef struct ClusterGrdShared {
 
 /* spec-2.17 D28b — extern atomic generation alloc helper(InitProcess hook). */
 extern uint64 cluster_grd_alloc_generation(void);
+
+struct PGPROC;
+/* Reset per-owner GRD identity when a backend or auxiliary slot is assigned. */
+extern void cluster_grd_proc_initialize(struct PGPROC *proc);
 
 /* spec-2.17 D14-D18 — deadlock detector(skeleton phase;Step 5/8 真激活
  * vertex dict + Tarjan + victim selection). */
@@ -640,6 +688,10 @@ extern uint32 cluster_grd_master_map_recompute_for_membership(const uint8 *activ
  *	in cluster_gcs_block.h (BufferTag is in scope there).
  */
 extern void cluster_grd_arm_join_pcm_fence(const uint8 *rejoining_set /* [16] */);
+/* Same accepted epoch, before MEMBER. Excluded homes are routing scope,
+ * never recipient/barrier exemptions or dead-writer retirement authority. */
+extern void cluster_grd_arm_join_pcm_fence_scope_v1(const uint8 *rejoining_set,
+													const uint8 *excluded_set);
 extern bool cluster_grd_join_remaster_in_progress(void);
 
 /*
@@ -696,6 +748,28 @@ extern uint32 cluster_grd_recovery_event_coordinator(void);
 extern uint64 cluster_grd_recovery_done_epoch_for(int32 node);
 extern uint64 cluster_grd_recovery_done_bitmap_hash_for(int32 node);
 extern uint64 cluster_grd_recovery_event_bitmap_hash_value(void);
+/* PGRAC: an observation of the failure protocol barrier, not a data or lock
+ * admission. Process-local only; callers reobserve across blocking work.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterGrdRecoveryControlSnapshotV1 {
+	uint64 event_id;
+	uint64 episode_epoch;
+	uint64 dead_bitmap_hash;
+	uint64 redeclare_generation;
+	uint64 master_map_refresh;
+	uint64 routing_generation;
+	uint8 dead_bitmap[(CLUSTER_MAX_NODES + 7) / 8];
+	uint8 survivor_bitmap[(CLUSTER_MAX_NODES + 7) / 8];
+} ClusterGrdRecoveryControlSnapshotV1;
+
+extern bool cluster_grd_recovery_control_snapshot(uint16 origin_thread,
+												  ClusterGrdRecoveryControlSnapshotV1 *out);
+/* PGRAC: shared-control acquisitions use the same reconstruction barrier at
+ * requester, master and installation. These predicates never thaw DATA.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern bool cluster_grd_control_acquire_allowed(const ClusterResId *resid, LOCKMODE mode);
+extern bool cluster_grd_control_recovery_ready(const ClusterResId *resid, LOCKMODE mode);
+extern bool cluster_grd_control_rebuild_frozen(uint64 epoch, uint64 generation);
 /* Amendment v1.2 (R2): the cross-node DONE key — hash over the dead bitmap
  * ALONE (no dead_generation fold; same kernel as the event_id hash). */
 extern uint64 cluster_grd_dead_bitmap_hash(const uint8 *dead_bitmap);
@@ -738,6 +812,9 @@ extern uint64 cluster_grd_offpath_crash_rejoin_fenced_count(void);
 /* spec-4.6 D5 — bulk snapshot of the 13 grd_recovery counters for the
  * pg_cluster_state dump (category 'grd_recovery';  one t/249 leg each). */
 typedef struct ClusterGrdRecoveryCounters {
+	uint32 local_pi_redeclare_cursor;
+	uint64 block_redeclare_retries;
+	uint64 local_pi_redeclare_retries;
 	uint64 remaster_started;
 	uint64 remaster_done;
 	uint64 remaster_failed;
@@ -761,6 +838,9 @@ typedef struct ClusterGrdRecoveryCounters {
 	uint64 join_shards_remastered;
 	uint64 join_block_views_rebuilt;
 	uint64 join_block_recovering_failclosed;
+	uint64 pi_rebuild_side_blocked;
+	uint64 pi_rebuild_apply_blocked;
+	uint64 pi_rebuild_plan_blocked;
 } ClusterGrdRecoveryCounters;
 
 extern void cluster_grd_recovery_counters_snapshot(ClusterGrdRecoveryCounters *out);
@@ -790,6 +870,10 @@ extern ClusterGrdEntryResult
 cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 										  const struct ClusterGrdHolderId *new_holder,
 										  int32 source_node_id, int lockmode);
+
+extern ClusterGrdEntryResult cluster_grd_entry_rebind_or_insert_holder_group(
+	const ClusterResId *resid, const struct ClusterGrdHolderId *new_holder, int32 source_node_id,
+	int lockmode, uint32 lock_group_procno_plus_one);
 
 /* spec-4.6 D3 — backend-side cooperative rebind walker (defined in
  * cluster_lock_acquire.c;  runs at CFI from cluster_grd_check_pending_
@@ -971,6 +1055,7 @@ StaticAssertDecl(sizeof(ClusterGrdHolderId) == 24, "ClusterGrdHolderId 4-tuple A
 typedef struct ClusterGrdWaiterMeta {
 	TransactionId xid;
 	uint64 wait_seq;
+	uint32 lock_group_procno_plus_one;
 } ClusterGrdWaiterMeta;
 
 /*
@@ -1378,18 +1463,19 @@ extern int cluster_grd_entry_release_and_pop_compatible_waiter(
  *	convert's own reply key (≠ the old grant request_id).
  */
 typedef struct ClusterGrdConvert {
-	int32 node_id;					/* node holding the lock being converted */
-	int32 source_node_id;			/* node that initiated the convert (reply routing) */
-	uint32 procno;					/* PG ProcNumber of the holder */
-	uint64 cluster_epoch;			/* epoch at enqueue (stale-epoch sweep) */
-	LOCKMODE current_mode;			/* locator: (node,procno,current_mode)+resid */
-	LOCKMODE requested_mode;		/* target mode */
-	uint64 convert_request_id;		/* convert's own reply key (≠ old grant id) */
-	uint64 shard_master_generation; /* spec-2.27 dedup key carry */
-	uint32 request_opcode;			/* = GES_REQ_OPCODE_CONVERT */
-	TransactionId waiter_xid;		/* spec-5.8 D1c — converter's xid (former pad slot) */
-	TimestampTz wait_start;			/* enqueue timestamp (timeout / observability) */
-	uint64 wait_seq;				/* spec-5.8 D1e — converter's D1d wait-state seq */
+	int32 node_id;					   /* node holding the lock being converted */
+	int32 source_node_id;			   /* node that initiated the convert (reply routing) */
+	uint32 procno;					   /* PG ProcNumber of the holder */
+	uint32 lock_group_procno_plus_one; /* compatibility only; derived from holder */
+	uint64 cluster_epoch;			   /* epoch at enqueue (stale-epoch sweep) */
+	LOCKMODE current_mode;			   /* locator: (node,procno,current_mode)+resid */
+	LOCKMODE requested_mode;		   /* target mode */
+	uint64 convert_request_id;		   /* convert's own reply key (≠ old grant id) */
+	uint64 shard_master_generation;	   /* spec-2.27 dedup key carry */
+	uint32 request_opcode;			   /* = GES_REQ_OPCODE_CONVERT */
+	TransactionId waiter_xid;		   /* spec-5.8 D1c — converter's xid (former pad slot) */
+	TimestampTz wait_start;			   /* enqueue timestamp (timeout / observability) */
+	uint64 wait_seq;				   /* spec-5.8 D1e — converter's D1d wait-state seq */
 	/*
 	 * spec-5.10 D1 — GES enqueue lock-starvation fairness state, mirroring the
 	 * private ClusterGrdWaiter fields.  Master-local + shmem-only (NEVER on the
@@ -1578,6 +1664,21 @@ cluster_grd_convert_grant_by_backend(const ClusterResId *resid, int32 node_id, u
 extern int cluster_grd_release_and_drain(const ClusterResId *resid,
 										 const ClusterGrdHolderId *holder,
 										 ClusterGrdGrantIdentity *granted_out, int max_out);
+
+/* PGRAC: atomic table-side retirement, not a network terminal certificate.
+ * The caller first fences the exact producer and validates current master/cut.
+ * Remove its waiter, convert, reservation and holder under one entry lock.
+ * A converting caller supplies its original request/mode to restore an already
+ * granted upgrade; zero/NoLock means discard this identity. Frozen shards never
+ * drain. Negative results use RELEASE_NOT_FOUND/NOT_READY, or RETIRE_INVALID
+ * for an unprovable restore. Other identities are never removed. max_out=0
+ * forbids draining and permits a NULL output; use this for requester shadows.
+ * Author: SqlRush <sqlrush@gmail.com> */
+#define CLUSTER_GRD_RETIRE_INVALID (-3)
+extern int cluster_grd_retire_request_and_drain(const ClusterResId *resid,
+												const ClusterGrdHolderId *holder,
+												uint64 previous_request_id, LOCKMODE previous_mode,
+												ClusterGrdGrantIdentity *granted_out, int max_out);
 
 /*
  * opcode-14 CONVERT_ROLLBACK (§3.1a T4): strict inverse of the convert — locate

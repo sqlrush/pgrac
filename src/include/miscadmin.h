@@ -736,6 +736,12 @@ extern void AddToDataDirLockFile(int target_line, const char *str);
 extern bool RecheckDataDirLockFile(void);
 extern void ValidatePgVersion(const char *path);
 extern void process_shared_preload_libraries(void);
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: once-only registration before early control sizing, no shmem/library
+ * initialization. Author: SqlRush <sqlrush@gmail.com>
+ */
+extern void process_cluster_gucs(void);
+#endif
 extern void process_session_preload_libraries(void);
 extern void process_shmem_requests(void);
 extern void pg_bindtextdomain(const char *domain);

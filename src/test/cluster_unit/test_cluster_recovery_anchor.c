@@ -51,6 +51,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
@@ -62,9 +63,12 @@
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_write_fence.h"
+#include "common/cryptohash.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
 #include "utils/elog.h"
+
+#include "../../backend/cluster/cluster_recovery_anchor_private.h"
 
 #undef printf
 #undef fprintf
@@ -89,12 +93,16 @@ char *cluster_shared_data_dir = NULL;
 int cluster_node_id = 3;
 bool cluster_enabled = true;
 bool cluster_controlfile_shared_authority = true;
+bool enableFsync = true;
+static int test_fsync_calls;
+static int test_fsync_fail_at;
 static ClusterMembershipState test_membership_state = CLUSTER_MEMBER_MEMBER;
 static uint64 test_self_incarnation = UINT64_C(77);
 static uint64 test_admitted_incarnation = UINT64_C(77);
 static bool test_owner_eor_active;
 static bool test_exactly_one_declared_node = true;
 static bool test_cf_local_x_held = true;
+static bool test_cf_retiring;
 static int test_write_fence_calls;
 static ClusterStartupPhase test_startup_phase = CLUSTER_PHASE_RUNNING;
 static TimestampTz test_phase4_started_at = 1000;
@@ -207,6 +215,12 @@ bool
 cluster_cf_held(LOCKMODE mode)
 {
 	return mode == ExclusiveLock && test_cf_local_x_held;
+}
+
+bool
+cluster_cf_held_is_usable(LOCKMODE mode)
+{
+	return mode == ExclusiveLock && test_cf_local_x_held && !test_cf_retiring;
 }
 
 bool
@@ -327,6 +341,11 @@ CloseTransientFile(int fd)
 int
 pg_fsync(int fd)
 {
+	test_fsync_calls++;
+	if (test_fsync_calls == test_fsync_fail_at) {
+		errno = EIO;
+		return -1;
+	}
 	return fsync(fd);
 }
 
@@ -392,6 +411,7 @@ wipe_anchor_files(void)
 	cluster_controlfile_shared_authority = true;
 	test_exactly_one_declared_node = true;
 	test_cf_local_x_held = true;
+	test_cf_retiring = false;
 	test_write_fence_calls = 0;
 	test_startup_phase = CLUSTER_PHASE_RUNNING;
 	test_phase4_started_at = 1000;
@@ -851,6 +871,10 @@ UT_TEST(test_checkpoint_publish_native_seed_proof_is_exact)
 	assert_phase4_publish_rejected_before_io(&cp);
 
 	configure_exact_native_seed_publisher();
+	test_cf_retiring = true;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_native_seed_publisher();
 	test_self_incarnation = UINT64_C(77);
 	assert_phase4_publish_rejected_before_io(&cp);
 
@@ -1025,12 +1049,1002 @@ UT_TEST(test_load_adoption)
 	UT_ASSERT_EQ(cluster_recovery_anchor_get()->node_id, cluster_node_id);
 }
 
+/* PGRAC: independent LE fixtures for exact root-selected anchor v2. These
+ * tests link the production codec/reader; no fixture calls its encoder to
+ * construct decoder input. Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+v2_put(uint8 *bytes, size_t offset, uint64 value, size_t width)
+{
+	size_t i;
+
+	for (i = 0; i < width; ++i)
+		bytes[offset + i] = (uint8)(value >> (8 * i));
+}
+
+static bool
+v2_zero(const void *ptr, size_t size)
+{
+	const uint8 *bytes = ptr;
+	size_t i;
+
+	for (i = 0; i < size; ++i)
+		if (bytes[i] != 0)
+			return false;
+	return true;
+}
+
+static void
+v2_fix_crc_hash(uint8 bytes[512], ClusterRecoveryAnchorRefV2 *ref)
+{
+	pg_crc32c crc;
+	pg_cryptohash_ctx *ctx;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, bytes, 508);
+	FIN_CRC32C(crc);
+	v2_put(bytes, 508, crc, 4);
+	ctx = pg_cryptohash_create(PG_SHA256);
+	UT_ASSERT(ctx != NULL);
+	UT_ASSERT_EQ(pg_cryptohash_init(ctx), 0);
+	UT_ASSERT_EQ(pg_cryptohash_update(ctx, bytes, 512), 0);
+	UT_ASSERT_EQ(pg_cryptohash_final(ctx, ref->anchor_sha256, 32), 0);
+	pg_cryptohash_free(ctx);
+}
+
+static void
+v2_fixture(uint8 bytes[512], ClusterRecoveryAnchorRefV2 *ref)
+{
+	size_t i;
+
+	memset(bytes, 0, 512);
+	memset(ref, 0, sizeof(*ref));
+	ref->identity.system_identifier = TEST_SYSID;
+	ref->identity.origin_node_id = 3;
+	ref->identity.origin_thread_id = 4;
+	ref->identity.thread_claim_created_at = 9001;
+	ref->identity.thread_claim_crc32c = 0xa1b2c3d4;
+	ref->identity.origin_owner_incarnation = 77;
+	ref->identity.root_lineage_seq = 13;
+	ref->database_incarnation = 19;
+	ref->max_config_generation = 8;
+	ref->anchor_generation = 23;
+	for (i = 0; i < 16; ++i) {
+		ref->identity.storage_uuid[i] = i + 1;
+		ref->identity.authority_uuid[i] = i + 33;
+	}
+	for (i = 0; i < 32; ++i)
+		ref->claim_sha256[i] = i + 65;
+	v2_put(bytes, 0, CLUSTER_RECOVERY_ANCHOR_MAGIC, 4);
+	v2_put(bytes, 4, 2, 2);
+	v2_put(bytes, 8, 3, 4);
+	v2_put(bytes, 12, DB_SHUTDOWNED, 4);
+	v2_put(bytes, 16, TEST_SYSID, 8);
+	v2_put(bytes, 24, UINT64_C(0x1234567890), 8);
+	v2_put(bytes, 32, 1001, 8);
+	v2_put(bytes, 40, UINT64_C(0x1234567000), 8);
+	v2_put(bytes, 48, 7, 4);
+	v2_put(bytes, 52, 6, 4);
+	bytes[56] = 1;
+	v2_put(bytes, 64, UINT64_C(0x1200000034), 8);
+	for (i = 0; i < 7; ++i)
+		v2_put(bytes, 72 + 4 * i, 101 + i, 4);
+	v2_put(bytes, 104, 1002, 8);
+	v2_put(bytes, 112, 201, 4);
+	v2_put(bytes, 116, 202, 4);
+	v2_put(bytes, 120, 203, 4);
+	v2_put(bytes, 128, UINT64_C(0x4500000067), 8);
+	v2_put(bytes, 136, 19, 8);
+	v2_put(bytes, 144, 77, 8);
+	memcpy(bytes + 152, ref->identity.storage_uuid, 16);
+	memcpy(bytes + 168, ref->identity.authority_uuid, 16);
+	v2_put(bytes, 184, 13, 8);
+	v2_put(bytes, 192, 5, 8);
+	v2_put(bytes, 200, 23, 8);
+	v2_put(bytes, 208, 4, 2);
+	v2_put(bytes, 212, UINT64_C(0x01020304), 4);
+	memcpy(bytes + 216, ref->claim_sha256, 32);
+	v2_put(bytes, 248, 9001, 8);
+	v2_put(bytes, 256, UINT64_C(0xa1b2c3d4), 4);
+	v2_put(bytes, 260, UINT64_C(0x1234568800), 8);
+	v2_put(bytes, 268, 7, 4);
+	bytes[289] = 1;
+	v2_put(bytes, 292, 2, 4);
+	v2_put(bytes, 296, 311, 4);
+	v2_put(bytes, 300, 24, 4);
+	v2_put(bytes, 304, 12, 4);
+	v2_put(bytes, 308, 11, 4);
+	v2_put(bytes, 312, 129, 4);
+	v2_fix_crc_hash(bytes, ref);
+}
+
+static void
+v2_common(ControlFileData *cf)
+{
+	memset(cf, 0, sizeof(*cf));
+	cf->system_identifier = TEST_SYSID;
+	cf->pg_control_version = PG_CONTROL_VERSION;
+	cf->catalog_version_no = CATALOG_VERSION_NO;
+	cf->state = DB_IN_PRODUCTION;
+	cf->time = 999;
+	cf->checkPoint = 888;
+	cf->checkPointCopy.redo = 777;
+	cf->checkPointCopy.ThisTimeLineID = 22;
+	cf->checkPointCopy.PrevTimeLineID = 21;
+	cf->checkPointCopy.nextXid = FullTransactionIdFromU64(UINT64_C(0x3400000056));
+	cf->checkPointCopy.nextOid = 3001;
+	cf->checkPointCopy.nextMulti = 3002;
+	cf->checkPointCopy.nextMultiOffset = 3003;
+	cf->checkPointCopy.oldestXid = 3004;
+	cf->checkPointCopy.oldestXidDB = 3005;
+	cf->checkPointCopy.oldestMulti = 3006;
+	cf->checkPointCopy.oldestMultiDB = 3007;
+	cf->checkPointCopy.oldestActiveXid = 3008;
+	cf->MaxConnections = 200;
+	cf->wal_level = 1;
+	cf->max_worker_processes = 16;
+	cf->max_wal_senders = 10;
+	cf->max_locks_per_xact = 128;
+	cf->track_commit_timestamp = true;
+	cf->blcksz = BLCKSZ;
+	cf->xlog_blcksz = XLOG_BLCKSZ;
+	memset(cf->mock_authentication_nonce, 0x5b, MOCK_AUTH_NONCE_LEN);
+	INIT_CRC32C(cf->crc);
+	COMP_CRC32C(cf->crc, cf, offsetof(ControlFileData, crc));
+	FIN_CRC32C(cf->crc);
+}
+
+UT_TEST(test_v2_exact_fields_and_canonical_roundtrip)
+{
+	uint8 bytes[512], encoded[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterRecoveryAnchorV2 out;
+
+	v2_fixture(bytes, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out), 0);
+	UT_ASSERT_EQ(out.identity.system_identifier, TEST_SYSID);
+	UT_ASSERT_EQ(out.identity.origin_node_id, 3);
+	UT_ASSERT_EQ(out.identity.origin_thread_id, 4);
+	UT_ASSERT_EQ(out.database_incarnation, 19);
+	UT_ASSERT_EQ(out.config_generation, 5);
+	UT_ASSERT_EQ(out.anchor_generation, 23);
+	UT_ASSERT_EQ(out.state, DB_SHUTDOWNED);
+	UT_ASSERT_EQ(out.checkpoint, UINT64_C(0x1234567890));
+	UT_ASSERT_EQ(out.write_time, 1001);
+	UT_ASSERT_EQ(out.checkpoint_copy.redo, UINT64_C(0x1234567000));
+	UT_ASSERT_EQ(out.checkpoint_copy.ThisTimeLineID, 7);
+	UT_ASSERT_EQ(out.checkpoint_copy.PrevTimeLineID, 6);
+	UT_ASSERT(out.checkpoint_copy.fullPageWrites);
+	UT_ASSERT_EQ(U64FromFullTransactionId(out.checkpoint_copy.nextXid), UINT64_C(0x1200000034));
+	UT_ASSERT_EQ(out.checkpoint_copy.nextOid, 101);
+	UT_ASSERT_EQ(out.checkpoint_copy.nextMulti, 102);
+	UT_ASSERT_EQ(out.checkpoint_copy.nextMultiOffset, 103);
+	UT_ASSERT_EQ(out.checkpoint_copy.oldestXid, 104);
+	UT_ASSERT_EQ(out.checkpoint_copy.oldestXidDB, 105);
+	UT_ASSERT_EQ(out.checkpoint_copy.oldestMulti, 106);
+	UT_ASSERT_EQ(out.checkpoint_copy.oldestMultiDB, 107);
+	UT_ASSERT_EQ(out.checkpoint_copy.time, 1002);
+	UT_ASSERT_EQ(out.checkpoint_copy.oldestCommitTsXid, 201);
+	UT_ASSERT_EQ(out.checkpoint_copy.newestCommitTsXid, 202);
+	UT_ASSERT_EQ(out.checkpoint_copy.oldestActiveXid, 203);
+	UT_ASSERT_EQ(out.unlogged_lsn, UINT64_C(0x4500000067));
+	UT_ASSERT_EQ(out.min_recovery_point, UINT64_C(0x1234568800));
+	UT_ASSERT_EQ(out.min_recovery_tli, 7);
+	UT_ASSERT_EQ(out.backup_start, 0);
+	UT_ASSERT_EQ(out.backup_end, 0);
+	UT_ASSERT(!out.backup_end_required);
+	UT_ASSERT(out.wal_log_hints);
+	UT_ASSERT(!out.track_commit_timestamp);
+	UT_ASSERT_EQ(out.wal_level, 2);
+	UT_ASSERT_EQ(out.max_connections, 311);
+	UT_ASSERT_EQ(out.max_worker_processes, 24);
+	UT_ASSERT_EQ(out.max_wal_senders, 12);
+	UT_ASSERT_EQ(out.max_prepared_xacts, 11);
+	UT_ASSERT_EQ(out.max_locks_per_xact, 129);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_encode(&out, encoded), 0);
+	UT_ASSERT(memcmp(bytes, encoded, 512) == 0);
+	/* Logical struct padding must not become part of the persistent image. */
+	memset((uint8 *)&out.checkpoint_copy + 17, 0xfe, 7);
+	memset((uint8 *)&out.checkpoint_copy + 60, 0xfe, 4);
+	memset((uint8 *)&out.checkpoint_copy + 84, 0xfe, 4);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_encode(&out, encoded), 0);
+	UT_ASSERT(memcmp(bytes, encoded, 512) == 0);
+}
+
+UT_TEST(test_v2_reserved_and_booleans)
+{
+	const size_t offsets[] = { 6, 7, 57, 63, 100, 103, 124, 127, 210, 211, 291, 316, 507 };
+	uint8 bytes[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterRecoveryAnchorV2 out;
+	size_t i;
+
+	for (i = 0; i < lengthof(offsets); ++i) {
+		v2_fixture(bytes, &ref);
+		bytes[offsets[i]] = 1;
+		v2_fix_crc_hash(bytes, &ref);
+		memset(&out, 0xfe, sizeof(out));
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out),
+					 CLUSTER_CONTROL_ROOT_BAD_RESERVED);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+	}
+	for (i = 0; i < 2; ++i) {
+		v2_fixture(bytes, &ref);
+		bytes[i == 0 ? 56 : 288] = 2;
+		v2_fix_crc_hash(bytes, &ref);
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out),
+					 CLUSTER_CONTROL_ROOT_BAD_RESERVED);
+	}
+}
+
+UT_TEST(test_v2_identity_and_hash_refuse)
+{
+	const size_t offsets[] = { 8, 16, 136, 144, 152, 168, 184, 200, 208, 216, 248, 256 };
+	uint8 bytes[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterRecoveryAnchorV2 out;
+	size_t i;
+
+	for (i = 0; i < lengthof(offsets); ++i) {
+		v2_fixture(bytes, &ref);
+		bytes[offsets[i]] ^= 1;
+		v2_fix_crc_hash(bytes, &ref);
+		memset(&out, 0xfe, sizeof(out));
+		UT_ASSERT(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out) != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+	}
+	v2_fixture(bytes, &ref);
+	ref.anchor_sha256[0] ^= 1;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out),
+				 CLUSTER_CONTROL_ROOT_HASH_MISMATCH);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+}
+
+UT_TEST(test_v2_size_crc_version_endian)
+{
+	uint8 bytes[513];
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterRecoveryAnchorV2 out;
+
+	v2_fixture(bytes, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 511, &ref, &out),
+				 CLUSTER_CONTROL_ROOT_BAD_SIZE);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 513, &ref, &out),
+				 CLUSTER_CONTROL_ROOT_BAD_SIZE);
+	bytes[40] ^= 1;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out),
+				 CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
+	v2_fixture(bytes, &ref);
+	bytes[4] = 1;
+	v2_fix_crc_hash(bytes, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out),
+				 CLUSTER_CONTROL_ROOT_BAD_VERSION);
+	v2_fixture(bytes, &ref);
+	bytes[212] ^= 1;
+	v2_fix_crc_hash(bytes, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out),
+				 CLUSTER_CONTROL_ROOT_BAD_ENDIAN);
+	v2_fixture(bytes, &ref);
+	bytes[0] ^= 1;
+	v2_fix_crc_hash(bytes, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out),
+				 CLUSTER_CONTROL_ROOT_BAD_MAGIC);
+}
+
+UT_TEST(test_v2_config_history_and_invalid_inputs)
+{
+	uint8 bytes[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterRecoveryAnchorV2 out;
+
+	v2_fixture(bytes, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out), 0);
+	ref.max_config_generation = 5;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out), 0);
+	ref.max_config_generation = 4;
+	UT_ASSERT(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out) != 0);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	v2_fixture(bytes, &ref);
+	v2_put(bytes, 192, 0, 8);
+	v2_fix_crc_hash(bytes, &ref);
+	UT_ASSERT(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out) != 0);
+	v2_fixture(bytes, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out), 0);
+	out.identity.reserved42 = 1;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_encode(&out, bytes), CLUSTER_CONTROL_ROOT_BAD_RESERVED);
+	UT_ASSERT(v2_zero(bytes, 512));
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(NULL, 512, &ref, &out),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_encode(NULL, bytes),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(v2_zero(bytes, 512));
+}
+
+UT_TEST(test_v2_projection_field_ownership)
+{
+	uint8 bytes[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ControlFileData common, projected, expected;
+
+	v2_fixture(bytes, &ref);
+	v2_common(&common);
+	expected = common;
+	expected.state = DB_SHUTDOWNED;
+	expected.time = 1001;
+	expected.checkPoint = UINT64_C(0x1234567890);
+	expected.checkPointCopy.redo = UINT64_C(0x1234567000);
+	expected.checkPointCopy.ThisTimeLineID = 7;
+	expected.checkPointCopy.PrevTimeLineID = 6;
+	expected.checkPointCopy.fullPageWrites = true;
+	expected.checkPointCopy.time = 1002;
+	expected.checkPointCopy.oldestCommitTsXid = 201;
+	expected.checkPointCopy.newestCommitTsXid = 202;
+	expected.unloggedLSN = UINT64_C(0x4500000067);
+	expected.minRecoveryPoint = UINT64_C(0x1234568800);
+	expected.minRecoveryPointTLI = 7;
+	expected.wal_log_hints = true;
+	expected.track_commit_timestamp = false;
+	expected.wal_level = 2;
+	expected.MaxConnections = 311;
+	expected.max_worker_processes = 24;
+	expected.max_wal_senders = 12;
+	expected.max_prepared_xacts = 11;
+	expected.max_locks_per_xact = 129;
+	INIT_CRC32C(expected.crc);
+	COMP_CRC32C(expected.crc, &expected, offsetof(ControlFileData, crc));
+	FIN_CRC32C(expected.crc);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_project(bytes, 512, &ref, &common, &projected), 0);
+	UT_ASSERT(memcmp(&projected, &expected, sizeof(expected)) == 0);
+	common.system_identifier++;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_project(bytes, 512, &ref, &common, &projected),
+				 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+	UT_ASSERT(v2_zero(&projected, sizeof(projected)));
+	v2_common(&common);
+	common.MaxConnections++;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_project(bytes, 512, &ref, &common, &projected),
+				 CLUSTER_CONTROL_ROOT_BAD_BODY_CRC);
+	UT_ASSERT(v2_zero(&projected, sizeof(projected)));
+}
+
+UT_TEST(test_v2_current_thread_state_matrix_preserves_other_fields)
+{
+	/* Literal expected PG16 DBState, columns DB_STARTUP..DB_IN_PRODUCTION;
+	 * -1 means no supported current-thread projection. */
+	static const int expected[5][7] = { { -1, 6, -1, 6, -1, -1, 6 },
+										{ -1, 4, -1, 4, 4, -1, 4 },
+										{ -1, 4, -1, 4, 4, -1, 4 },
+										{ -1, 1, -1, -1, -1, -1, -1 },
+										{ -1, -1, -1, -1, -1, -1, -1 } };
+	uint8 bytes[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterControlRootSnapshot record;
+	ControlFileData common, input, view, want;
+	v2_fixture(bytes, &ref);
+	v2_common(&common);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_project(bytes, 512, &ref, &common, &input), 0);
+	memset(&record, 0, sizeof(record));
+	record.identity = ref.identity;
+	record.checkpoint_lower_lsn = input.checkPointCopy.redo;
+	record.checkpoint_tli = input.checkPointCopy.ThisTimeLineID;
+	record.validated_tail_lsn_exclusive = input.checkPointCopy.redo + 8192;
+	input.minRecoveryPoint = 0;
+	input.minRecoveryPointTLI = 0;
+	for (int life = 1; life <= 5; ++life) {
+		for (int state = 0; state <= 6; ++state) {
+			record.lifecycle = life;
+			input.state = (DBState)state;
+			INIT_CRC32C(input.crc);
+			COMP_CRC32C(input.crc, &input, offsetof(ControlFileData, crc));
+			FIN_CRC32C(input.crc);
+			view = input;
+			if (expected[life - 1][state] < 0) {
+				UT_ASSERT_EQ(cluster_recovery_anchor_v2_thread_state(&ref, &record, &view),
+							 CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+				UT_ASSERT(v2_zero(&view, sizeof(view)));
+			} else {
+				UT_ASSERT_EQ(cluster_recovery_anchor_v2_thread_state(&ref, &record, &view), 0);
+				want = input;
+				want.state = (DBState)expected[life - 1][state];
+				INIT_CRC32C(want.crc);
+				COMP_CRC32C(want.crc, &want, offsetof(ControlFileData, crc));
+				FIN_CRC32C(want.crc);
+				UT_ASSERT(memcmp(&want, &view, sizeof(view)) == 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_v2_current_thread_state_rejects_wrong_identity_or_crc)
+{
+	for (int fault = 0; fault < 8; ++fault) {
+		uint8 bytes[512];
+		ClusterRecoveryAnchorRefV2 ref;
+		ClusterControlRootSnapshot record;
+		ControlFileData common, view;
+		v2_fixture(bytes, &ref);
+		v2_common(&common);
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_project(bytes, 512, &ref, &common, &view), 0);
+		memset(&record, 0, sizeof(record));
+		record.identity = ref.identity;
+		record.checkpoint_lower_lsn = view.checkPointCopy.redo;
+		record.checkpoint_tli = view.checkPointCopy.ThisTimeLineID;
+		record.validated_tail_lsn_exclusive = view.checkPointCopy.redo + 8192;
+		record.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+		if (fault == 0)
+			record.identity.origin_owner_incarnation++;
+		if (fault == 1)
+			record.checkpoint_tli++;
+		if (fault == 2)
+			record.checkpoint_lower_lsn++;
+		if (fault == 3)
+			view.system_identifier++;
+		if (fault == 4)
+			view.crc ^= 1;
+		if (fault == 5)
+			record.lifecycle = 0;
+		UT_ASSERT(cluster_recovery_anchor_v2_thread_state(fault == 6 ? NULL : &ref,
+														  fault == 7 ? NULL : &record, &view)
+				  != 0);
+		UT_ASSERT(v2_zero(&view, sizeof(view)));
+	}
+}
+
+UT_TEST(test_v2_retained_lower_preserves_native_checkpoint_and_bounded_identity)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		uint8 bytes[512];
+		ClusterRecoveryAnchorRefV2 ref;
+		ClusterControlRootSnapshot record = { 0 };
+		ControlFileData common, input, view;
+		v2_fixture(bytes, &ref);
+		v2_common(&common);
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_project(bytes, 512, &ref, &common, &input), 0);
+		record.identity = ref.identity;
+		record.checkpoint_lower_lsn = input.checkPointCopy.redo - 8;
+		record.checkpoint_tli = input.checkPointCopy.ThisTimeLineID;
+		record.tail_tli = record.checkpoint_tli;
+		record.root_flags = CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID;
+		record.validated_tail_lsn_exclusive = input.checkPointCopy.redo + 8192;
+		record.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+		if (fault == 1)
+			record.checkpoint_lower_lsn = 0;
+		if (fault == 2)
+			record.checkpoint_lower_lsn = input.checkPointCopy.redo + 1;
+		if (fault == 3)
+			record.validated_tail_lsn_exclusive = input.checkPointCopy.redo - 1;
+		if (fault == 4)
+			record.checkpoint_tli++;
+		if (fault == 5)
+			record.root_flags = 0;
+		if (fault == 6)
+			record.tail_tli++;
+		view = input;
+		if (fault == 0) {
+			UT_ASSERT_EQ(cluster_recovery_anchor_v2_thread_state(&ref, &record, &view), 0);
+			UT_ASSERT_EQ(view.checkPointCopy.redo, input.checkPointCopy.redo);
+			UT_ASSERT_EQ(view.checkPoint, input.checkPoint);
+		} else {
+			UT_ASSERT_EQ(cluster_recovery_anchor_v2_thread_state(&ref, &record, &view),
+						 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+			UT_ASSERT(v2_zero(&view, sizeof(view)));
+		}
+	}
+}
+
+UT_TEST(test_v2_projection_backup_and_state_refuse)
+{
+	const size_t offsets[] = { 272, 280, 288 };
+	uint8 bytes[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ControlFileData common, projected;
+	size_t i;
+
+	v2_common(&common);
+	for (i = 0; i < lengthof(offsets); ++i) {
+		v2_fixture(bytes, &ref);
+		bytes[offsets[i]] = 1;
+		v2_fix_crc_hash(bytes, &ref);
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_project(bytes, 512, &ref, &common, &projected),
+					 CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+		UT_ASSERT(v2_zero(&projected, sizeof(projected)));
+	}
+	v2_fixture(bytes, &ref);
+	v2_put(bytes, 12, DB_IN_PRODUCTION + 1, 4);
+	v2_fix_crc_hash(bytes, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_project(bytes, 512, &ref, &common, &projected),
+				 CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+	UT_ASSERT(v2_zero(&projected, sizeof(projected)));
+}
+
+static void
+v2_selected_file(const uint8 bytes[512], const ClusterRecoveryAnchorRefV2 *ref,
+				 char path[MAXPGPATH], char directory[MAXPGPATH])
+{
+	char hash[65];
+	size_t i;
+	int fd;
+
+	for (i = 0; i < 32; ++i)
+		snprintf(hash + 2 * i, 3, "%02x", ref->anchor_sha256[i]);
+	snprintf(directory, MAXPGPATH, "%s/global/anchor_images", cluster_shared_data_dir);
+	UT_ASSERT(mkdir(directory, 0700) == 0 || errno == EEXIST);
+	snprintf(directory, MAXPGPATH, "%s/global/anchor_images/thread_4", cluster_shared_data_dir);
+	UT_ASSERT(mkdir(directory, 0700) == 0 || errno == EEXIST);
+	snprintf(directory, MAXPGPATH, "%s/global/anchor_images/thread_4/generation_77",
+			 cluster_shared_data_dir);
+	UT_ASSERT(mkdir(directory, 0700) == 0 || errno == EEXIST);
+	snprintf(path, MAXPGPATH, "%s/anchor_23-%s.bin", directory, hash);
+	fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(write(fd, bytes, 512), 512);
+	UT_ASSERT_EQ(close(fd), 0);
+}
+
+UT_TEST(test_v2_read_selected_object_only)
+{
+	uint8 bytes[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ControlFileData common, out;
+	char path[MAXPGPATH], directory[MAXPGPATH];
+	ClusterRecoveryAnchor legacy;
+
+	v2_fixture(bytes, &ref);
+	v2_common(&common);
+	test_cf_x_held = true;
+	v2_selected_file(bytes, &ref, path, directory);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_read_locked(&ref, &common, &out), 0);
+	UT_ASSERT_EQ(out.checkPoint, UINT64_C(0x1234567890));
+	test_cf_x_held = false;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_read_locked(&ref, &common, &out),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	test_cf_x_held = true;
+	UT_ASSERT_EQ(unlink(path), 0);
+	build_anchor(&legacy, UINT64_C(0x1234567890));
+	cluster_recovery_anchor_write(&legacy);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_read_locked(&ref, &common, &out),
+				 CLUSTER_CONTROL_ROOT_ABSENT);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	/* Same generation, different hash is not a selected object. */
+	bytes[32]++;
+	v2_fix_crc_hash(bytes, &ref);
+	v2_selected_file(bytes, &ref, path, directory);
+	v2_fixture(bytes, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_read_locked(&ref, &common, &out),
+				 CLUSTER_CONTROL_ROOT_ABSENT);
+	UT_ASSERT_EQ(unlink(path), 0);
+}
+
+UT_TEST(test_v2_object_type_size_and_permissions)
+{
+	uint8 bytes[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ControlFileData common, out;
+	char path[MAXPGPATH], directory[MAXPGPATH];
+	int fd;
+
+	v2_fixture(bytes, &ref);
+	v2_common(&common);
+	v2_selected_file(bytes, &ref, path, directory);
+	UT_ASSERT_EQ(chmod(path, 0660), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_read_locked(&ref, &common, &out),
+				 CLUSTER_CONTROL_ROOT_IO_ERROR);
+	UT_ASSERT_EQ(chmod(path, 0600), 0);
+	UT_ASSERT_EQ(chmod(directory, 0770), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_read_locked(&ref, &common, &out),
+				 CLUSTER_CONTROL_ROOT_IO_ERROR);
+	UT_ASSERT_EQ(chmod(directory, 0700), 0);
+	fd = open(path, O_WRONLY | O_APPEND);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(write(fd, bytes, 1), 1);
+	UT_ASSERT_EQ(close(fd), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_read_locked(&ref, &common, &out),
+				 CLUSTER_CONTROL_ROOT_BAD_SIZE);
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_EQ(symlink(cluster_recovery_anchor_path(), path), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_read_locked(&ref, &common, &out),
+				 CLUSTER_CONTROL_ROOT_IO_ERROR);
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_EQ(mkfifo(path, 0600), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_read_locked(&ref, &common, &out),
+				 CLUSTER_CONTROL_ROOT_IO_ERROR);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	UT_ASSERT_EQ(unlink(path), 0);
+}
+
+/* PGRAC: actual immutable-anchor lifecycle including durability cuts.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+v2_stage_fixture(ClusterRecoveryAnchorV2 *anchor, uint8 uuid[16], ControlFileData *common)
+{
+	static uint64 ordinal = 100;
+	uint8 bytes[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	char path[MAXPGPATH];
+	const char *dirs[] = { "global/anchor_images", "global/anchor_images/thread_4",
+						   "global/anchor_images/thread_4/generation_77",
+						   "global/anchor_images/thread_4/generation_77/.staging" };
+	size_t i;
+
+	v2_fixture(bytes, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, anchor), 0);
+	anchor->anchor_generation = ++ordinal;
+	anchor->write_time += ordinal;
+	memset(uuid, 0, 16);
+	v2_put(uuid, 0, ordinal, 4);
+	uuid[6] = 0x40;
+	uuid[8] = 0x80;
+	v2_common(common);
+	for (i = 0; i < lengthof(dirs); ++i) {
+		snprintf(path, sizeof(path), "%s/%s", cluster_shared_data_dir, dirs[i]);
+		UT_ASSERT(mkdir(path, 0700) == 0 || errno == EEXIST);
+	}
+	test_fsync_calls = test_fsync_fail_at = 0;
+	enableFsync = true;
+	test_cf_x_held = false;
+}
+
+static void
+v2_stage_paths(const ClusterRecoveryAnchorStageV2 *stage, char final[MAXPGPATH],
+			   char temp[MAXPGPATH])
+{
+	char hash[65], uuid[33];
+	size_t i;
+
+	for (i = 0; i < 32; ++i)
+		snprintf(hash + 2 * i, 3, "%02x", stage->ref.anchor_sha256[i]);
+	for (i = 0; i < 16; ++i)
+		snprintf(uuid + 2 * i, 3, "%02x", stage->operation_uuid[i]);
+	snprintf(final, MAXPGPATH,
+			 "%s/global/anchor_images/thread_%u/generation_" UINT64_FORMAT "/anchor_" UINT64_FORMAT
+			 "-%s.bin",
+			 cluster_shared_data_dir, stage->ref.identity.origin_thread_id,
+			 stage->ref.identity.origin_owner_incarnation, stage->ref.anchor_generation, hash);
+	snprintf(temp, MAXPGPATH,
+			 "%s/global/anchor_images/thread_%u/generation_" UINT64_FORMAT "/.staging/%s.tmp",
+			 cluster_shared_data_dir, stage->ref.identity.origin_thread_id,
+			 stage->ref.identity.origin_owner_incarnation, uuid);
+}
+
+UT_TEST(test_v2_stage_install_read_and_discard)
+{
+	ClusterRecoveryAnchorV2 anchor;
+	ClusterRecoveryAnchorStageV2 stage;
+	ClusterRecoveryAnchorRefV2 ref;
+	ControlFileData common, out;
+	uint8 uuid[16];
+	char final[MAXPGPATH], temp[MAXPGPATH];
+
+	v2_stage_fixture(&anchor, uuid, &common);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&anchor, uuid, &stage), 0);
+	UT_ASSERT_EQ(stage.owner_pid, getpid());
+	UT_ASSERT_EQ(test_fsync_calls, 2);
+	v2_stage_paths(&stage, final, temp);
+	UT_ASSERT_EQ(access(temp, F_OK), 0);
+	UT_ASSERT(access(final, F_OK) != 0);
+	test_cf_x_held = true;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), 0);
+	UT_ASSERT_EQ(access(final, F_OK), 0);
+	UT_ASSERT(access(temp, F_OK) != 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_read_locked(&stage.ref, &common, &out), 0);
+	UT_ASSERT_EQ(out.checkPoint, anchor.checkpoint);
+	ref = stage.ref;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_discard(&stage), 0);
+	UT_ASSERT(v2_zero(&stage, sizeof(stage)));
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_read_locked(&ref, &common, &out), 0);
+}
+
+UT_TEST(test_v2_same_generation_no_overwrite_and_exact_reuse)
+{
+	ClusterRecoveryAnchorV2 first, second;
+	ClusterRecoveryAnchorStageV2 a, b, reuse;
+	ControlFileData common, out;
+	uint8 uuid[16];
+
+	v2_stage_fixture(&first, uuid, &common);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&first, uuid, &a), 0);
+	second = first;
+	second.write_time++;
+	uuid[0]++;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&second, uuid, &b), 0);
+	UT_ASSERT(memcmp(a.ref.anchor_sha256, b.ref.anchor_sha256, 32) != 0);
+	test_cf_x_held = true;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&a), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&b), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_read_locked(&a.ref, &common, &out), 0);
+	UT_ASSERT_EQ(out.time, first.write_time);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_read_locked(&b.ref, &common, &out), 0);
+	UT_ASSERT_EQ(out.time, second.write_time);
+	test_cf_x_held = false;
+	uuid[0]++;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&first, uuid, &reuse), 0);
+	test_cf_x_held = true;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&reuse), 0);
+	UT_ASSERT(memcmp(a.ref.anchor_sha256, reuse.ref.anchor_sha256, 32) == 0);
+}
+
+UT_TEST(test_v2_install_refuses_corrupt_existing_destination)
+{
+	ClusterRecoveryAnchorV2 anchor;
+	ClusterRecoveryAnchorStageV2 stage;
+	ControlFileData common;
+	uint8 uuid[16], bytes[512];
+	char final[MAXPGPATH], temp[MAXPGPATH];
+	int fd;
+
+	v2_stage_fixture(&anchor, uuid, &common);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&anchor, uuid, &stage), 0);
+	v2_stage_paths(&stage, final, temp);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_encode(&anchor, bytes), 0);
+	bytes[40] ^= 1;
+	fd = open(final, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(write(fd, bytes, 512), 512);
+	UT_ASSERT_EQ(close(fd), 0);
+	test_cf_x_held = true;
+	UT_ASSERT(cluster_recovery_anchor_v2_install(&stage) != 0);
+	UT_ASSERT_EQ(access(temp, F_OK), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_discard(&stage), 0);
+	UT_ASSERT_EQ(access(final, F_OK), 0);
+	UT_ASSERT_EQ(unlink(final), 0);
+}
+
+UT_TEST(test_v2_prepare_and_install_fsync_cuts)
+{
+	ClusterRecoveryAnchorV2 anchor;
+	ClusterRecoveryAnchorStageV2 stage;
+	ControlFileData common, out;
+	uint8 uuid[16];
+	int cut;
+
+	for (cut = 1; cut <= 2; ++cut) {
+		v2_stage_fixture(&anchor, uuid, &common);
+		test_fsync_fail_at = cut;
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&anchor, uuid, &stage),
+					 CLUSTER_CONTROL_ROOT_IO_ERROR);
+		UT_ASSERT(v2_zero(&stage, sizeof(stage)));
+	}
+	for (cut = 1; cut <= 2; ++cut) {
+		v2_stage_fixture(&anchor, uuid, &common);
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&anchor, uuid, &stage), 0);
+		test_cf_x_held = true;
+		test_fsync_calls = 0;
+		test_fsync_fail_at = cut;
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), CLUSTER_CONTROL_ROOT_IO_ERROR);
+		test_fsync_fail_at = 0;
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), 0);
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_read_locked(&stage.ref, &common, &out), 0);
+	}
+}
+
+UT_TEST(test_v2_discard_sync_retry_cannot_resurrect)
+{
+	ClusterRecoveryAnchorV2 anchor;
+	ClusterRecoveryAnchorStageV2 stage;
+	ControlFileData common;
+	uint8 uuid[16];
+	char final[MAXPGPATH], temp[MAXPGPATH];
+
+	v2_stage_fixture(&anchor, uuid, &common);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&anchor, uuid, &stage), 0);
+	v2_stage_paths(&stage, final, temp);
+	test_fsync_calls = 0;
+	test_fsync_fail_at = 1;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_discard(&stage), CLUSTER_CONTROL_ROOT_IO_ERROR);
+	test_cf_x_held = true;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(access(final, F_OK) != 0);
+	UT_ASSERT(access(temp, F_OK) != 0);
+	test_fsync_fail_at = 0;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_discard(&stage), 0);
+	UT_ASSERT(v2_zero(&stage, sizeof(stage)));
+
+	/* Cancel an install that linked its object but failed the last sync. */
+	v2_stage_fixture(&anchor, uuid, &common);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&anchor, uuid, &stage), 0);
+	v2_stage_paths(&stage, final, temp);
+	test_cf_x_held = true;
+	test_fsync_calls = 0;
+	test_fsync_fail_at = 2;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), CLUSTER_CONTROL_ROOT_IO_ERROR);
+	test_fsync_calls = 0;
+	test_fsync_fail_at = 1;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_discard(&stage), CLUSTER_CONTROL_ROOT_IO_ERROR);
+	test_fsync_fail_at = 0;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(access(final, F_OK), 0);
+	UT_ASSERT(access(temp, F_OK) != 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_discard(&stage), 0);
+	UT_ASSERT(v2_zero(&stage, sizeof(stage)));
+	UT_ASSERT_EQ(access(final, F_OK), 0);
+}
+
+UT_TEST(test_v2_stage_owner_and_inode_are_exact)
+{
+	ClusterRecoveryAnchorV2 anchor;
+	ClusterRecoveryAnchorStageV2 stage;
+	ControlFileData common;
+	uint8 uuid[16], bytes[512];
+	char final[MAXPGPATH], temp[MAXPGPATH], saved[MAXPGPATH];
+	int fd;
+
+	v2_stage_fixture(&anchor, uuid, &common);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&anchor, uuid, &stage), 0);
+	test_cf_x_held = true;
+	stage.owner_pid++;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	stage.owner_pid--;
+	v2_stage_paths(&stage, final, temp);
+	snprintf(saved, sizeof(saved), "%s.saved", temp);
+	UT_ASSERT_EQ(rename(temp, saved), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_encode(&anchor, bytes), 0);
+	fd = open(temp, O_CREAT | O_WRONLY | O_EXCL, 0600);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(write(fd, bytes, 512), 512);
+	UT_ASSERT_EQ(close(fd), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_discard(&stage), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT_EQ(access(temp, F_OK), 0);
+	UT_ASSERT_EQ(unlink(temp), 0);
+	UT_ASSERT_EQ(rename(saved, temp), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_discard(&stage), 0);
+}
+
+UT_TEST(test_v2_stage_directory_replaced_or_symlinked)
+{
+	ClusterRecoveryAnchorV2 anchor;
+	ClusterRecoveryAnchorStageV2 stage, refused;
+	ControlFileData common;
+	uint8 uuid[16];
+	char dir[MAXPGPATH], saved[MAXPGPATH];
+
+	v2_stage_fixture(&anchor, uuid, &common);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&anchor, uuid, &stage), 0);
+	snprintf(dir, sizeof(dir), "%s/global/anchor_images/thread_4/generation_77/.staging",
+			 cluster_shared_data_dir);
+	snprintf(saved, sizeof(saved), "%s.saved", dir);
+	UT_ASSERT_EQ(rename(dir, saved), 0);
+	UT_ASSERT_EQ(mkdir(dir, 0700), 0);
+	test_cf_x_held = true;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT_EQ(rmdir(dir), 0);
+	UT_ASSERT_EQ(symlink(".staging.saved", dir), 0);
+	uuid[0]++;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&anchor, uuid, &refused),
+				 CLUSTER_CONTROL_ROOT_IO_ERROR);
+	UT_ASSERT(v2_zero(&refused, sizeof(refused)));
+	UT_ASSERT_EQ(unlink(dir), 0);
+	UT_ASSERT_EQ(rename(saved, dir), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), 0);
+}
+
+UT_TEST(test_v2_stage_requires_fsync_and_clusterwide_x)
+{
+	ClusterRecoveryAnchorV2 anchor;
+	ClusterRecoveryAnchorStageV2 stage, refused;
+	ControlFileData common;
+	uint8 uuid[16], zero[16] = { 0 };
+
+	v2_stage_fixture(&anchor, uuid, &common);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&anchor, zero, &refused),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	enableFsync = false;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&anchor, uuid, &refused),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(v2_zero(&refused, sizeof(refused)));
+	enableFsync = true;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_prepare(&anchor, uuid, &stage), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	test_cf_x_held = true;
+	enableFsync = false;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	enableFsync = true;
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), 0);
+}
+
+/* PGRAC: historical requirements belong to the selected WAL thread, not the
+ * current common configuration. Literal offsets are independent of the codec.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+v2_parameter_bytes(uint8 bytes[512], ClusterRecoveryAnchorRefV2 *ref)
+{
+	v2_fixture(bytes, ref);
+	bytes[289] = 1;
+	bytes[290] = 0;
+	v2_put(bytes, 292, 2, 4);
+	v2_put(bytes, 296, 811, 4);
+	v2_put(bytes, 300, 28, 4);
+	v2_put(bytes, 304, 19, 4);
+	v2_put(bytes, 308, 13, 4);
+	v2_put(bytes, 312, 259, 4);
+	v2_fix_crc_hash(bytes, ref);
+}
+
+UT_TEST(test_v2_historical_parameters_not_current_common)
+{
+	uint8 bytes[512], encoded[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterRecoveryAnchorV2 anchor;
+	ControlFileData common, out;
+	ClusterControlRootResult result;
+
+	v2_parameter_bytes(bytes, &ref);
+	v2_common(&common);
+	result = cluster_recovery_anchor_v2_project(bytes, 512, &ref, &common, &out);
+	UT_ASSERT_EQ(result, 0);
+	if (result != 0)
+		return;
+	UT_ASSERT_EQ(out.wal_level, 2);
+	UT_ASSERT(out.wal_log_hints);
+	UT_ASSERT(!out.track_commit_timestamp);
+	UT_ASSERT_EQ(out.MaxConnections, 811);
+	UT_ASSERT_EQ(out.max_worker_processes, 28);
+	UT_ASSERT_EQ(out.max_wal_senders, 19);
+	UT_ASSERT_EQ(out.max_prepared_xacts, 13);
+	UT_ASSERT_EQ(out.max_locks_per_xact, 259);
+	UT_ASSERT_EQ(out.checkPointCopy.nextOid, common.checkPointCopy.nextOid);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &anchor), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_encode(&anchor, encoded), 0);
+	UT_ASSERT(memcmp(bytes, encoded, 512) == 0);
+}
+
+UT_TEST(test_v2_parameter_encoding_cannot_be_absent_or_overflow)
+{
+	uint8 bytes[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterRecoveryAnchorV2 out;
+	const size_t capacities[] = { 296, 300, 304, 308, 312 };
+
+	v2_fixture(bytes, &ref);
+	memset(bytes + 289, 0, 27);
+	v2_fix_crc_hash(bytes, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out),
+				 CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	for (size_t i = 0; i < lengthof(capacities); ++i) {
+		v2_parameter_bytes(bytes, &ref);
+		v2_put(bytes, capacities[i], UINT32_C(0x80000000), 4);
+		v2_fix_crc_hash(bytes, &ref);
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out),
+					 CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+	}
+	for (int fault = 0; fault < 3; ++fault) {
+		v2_parameter_bytes(bytes, &ref);
+		v2_put(bytes, fault == 0 ? 292 : fault == 1 ? 296 : 312, fault == 0 ? 3 : 0, 4);
+		v2_fix_crc_hash(bytes, &ref);
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out),
+					 CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+	}
+}
+
+UT_TEST(test_v2_parameter_boolean_and_reserved_bytes)
+{
+	uint8 bytes[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterRecoveryAnchorV2 out;
+	const size_t offsets[] = { 289, 290, 291, 316, 507 };
+
+	for (size_t i = 0; i < lengthof(offsets); ++i) {
+		v2_parameter_bytes(bytes, &ref);
+		bytes[offsets[i]] = 2;
+		v2_fix_crc_hash(bytes, &ref);
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out),
+					 CLUSTER_CONTROL_ROOT_BAD_RESERVED);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+	}
+}
+
 int
 main(void)
 {
 	setup_shared_root();
 
-	UT_PLAN(13);
+	UT_PLAN(36);
 	UT_RUN(test_layout);
 	UT_RUN(test_write_read_roundtrip);
 	UT_RUN(test_classify);
@@ -1044,6 +2058,29 @@ main(void)
 	UT_RUN(test_checkpoint_publish_phase4_boot_proof_is_exact);
 	UT_RUN(test_refresh_state);
 	UT_RUN(test_load_adoption);
+	UT_RUN(test_v2_exact_fields_and_canonical_roundtrip);
+	UT_RUN(test_v2_reserved_and_booleans);
+	UT_RUN(test_v2_identity_and_hash_refuse);
+	UT_RUN(test_v2_size_crc_version_endian);
+	UT_RUN(test_v2_config_history_and_invalid_inputs);
+	UT_RUN(test_v2_projection_field_ownership);
+	UT_RUN(test_v2_current_thread_state_matrix_preserves_other_fields);
+	UT_RUN(test_v2_current_thread_state_rejects_wrong_identity_or_crc);
+	UT_RUN(test_v2_retained_lower_preserves_native_checkpoint_and_bounded_identity);
+	UT_RUN(test_v2_projection_backup_and_state_refuse);
+	UT_RUN(test_v2_read_selected_object_only);
+	UT_RUN(test_v2_object_type_size_and_permissions);
+	UT_RUN(test_v2_stage_install_read_and_discard);
+	UT_RUN(test_v2_same_generation_no_overwrite_and_exact_reuse);
+	UT_RUN(test_v2_install_refuses_corrupt_existing_destination);
+	UT_RUN(test_v2_prepare_and_install_fsync_cuts);
+	UT_RUN(test_v2_discard_sync_retry_cannot_resurrect);
+	UT_RUN(test_v2_stage_owner_and_inode_are_exact);
+	UT_RUN(test_v2_stage_directory_replaced_or_symlinked);
+	UT_RUN(test_v2_stage_requires_fsync_and_clusterwide_x);
+	UT_RUN(test_v2_historical_parameters_not_current_common);
+	UT_RUN(test_v2_parameter_encoding_cannot_be_absent_or_overflow);
+	UT_RUN(test_v2_parameter_boolean_and_reserved_bytes);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

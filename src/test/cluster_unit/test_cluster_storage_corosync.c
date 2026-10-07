@@ -1,0 +1,654 @@
+/*-------------------------------------------------------------------------
+ *
+ * test_cluster_storage_corosync.c
+ *    Check the storage adapter at the external Corosync C API.
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *    src/test/cluster_unit/test_cluster_storage_corosync.c
+ *
+ * NOTES
+ *    PGRAC-original unit tests; product symbols retain the cluster_ prefix.
+ *    Spec: spec-s9p2-06-online-membership.md
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+#include "utils/guc_tables.h"
+#include <time.h>
+static uint64 fixture_now = 1000000;
+static int fixture_clock_gettime(clockid_t id, struct timespec *out);
+#define clock_gettime fixture_clock_gettime
+#include "../../backend/cluster/cluster_storage_quorum_corosync.c"
+#include "../../backend/cluster/cluster_storage_quorum.c"
+#undef clock_gettime
+#undef printf
+#include "unit_test.h"
+
+UT_DEFINE_GLOBALS();
+bool cluster_shared_config = true;
+int cluster_node_id = 0;
+char *cluster_storage_quorum_nodes = "0:11,1:12";
+char *cluster_storage_quorum_cluster = "quorum-fixture";
+static ClusterConf conf;
+ClusterConf *ClusterConfShmem = &conf;
+static ClusterNodeInfo nodes[2];
+static StorageCorosyncModel callbacks;
+static int observed_quorate, notified_quorate, finalize_count, track_count;
+static bool notify_enabled, api_failed, changed_after_notify;
+static bool tracking_enabled;
+static unsigned missing_notifications, dispatch_count, poll_dispatch_count;
+static bool pair_on_second_dispatch, remove_peer, remove_self, negative_then_ready;
+static unsigned notification_mismatch;
+static bool inspect_pending_sample;
+static int failing_api_step;
+static const char *bad_key;
+static struct config_generic shared_settings[2];
+
+static int
+fixture_clock_gettime(clockid_t id, struct timespec *out)
+{
+	Assert(id == CLOCK_MONOTONIC);
+	out->tv_sec = fixture_now / 1000000;
+	out->tv_nsec = (fixture_now % 1000000) * 1000;
+	return 0;
+}
+
+struct config_generic *
+find_option(const char *name, bool create_placeholders, bool skip_errors, int elevel)
+{
+	Size i;
+
+	Assert(!create_placeholders && skip_errors);
+	for (i = 0; i < lengthof(shared_settings); i++)
+		if (strcmp(name, shared_settings[i].name) == 0)
+			return &shared_settings[i];
+	return NULL;
+}
+
+void
+ExceptionalCondition(const char *condition, const char *file, int line)
+{
+	abort();
+}
+
+const ClusterNodeInfo *
+cluster_conf_lookup_node(int32 node_id)
+{
+	return node_id >= 0 && node_id < 2 ? &nodes[node_id] : NULL;
+}
+
+/* Public Corosync initialize ABI requires a mutable void * context. */
+static int
+// cppcheck-suppress constParameterCallback
+fixture_initialize(uint64 *handle, int model, const void *data, uint32 *type, void *context)
+{
+	Assert(model == 1 && context == NULL);
+	callbacks = *(const StorageCorosyncModel *)data;
+	Assert(callbacks.model == model);
+	*handle = 123;
+	*type = 1;
+	return STORAGE_CS_OK;
+}
+
+static int
+fixture_cmap_initialize(uint64 *handle)
+{
+	*handle = 456;
+	return STORAGE_CS_OK;
+}
+
+static int
+fixture_finalize(uint64 handle)
+{
+	Assert(handle == 123 || handle == 456);
+	if (handle == 123)
+		tracking_enabled = false;
+	finalize_count++;
+	return STORAGE_CS_OK;
+}
+
+static int
+fixture_track(uint64 handle, unsigned int flags)
+{
+	Assert(handle == 123 && (flags & 1) != 0);
+	track_count++;
+	poll_dispatch_count = 0;
+	if (api_failed)
+		return 2;
+	/* The upstream service rejects a second trackstart after CHANGES. */
+	if (tracking_enabled)
+		return 14; /* CS_ERR_EXIST */
+	tracking_enabled = (flags & 2) != 0;
+	return STORAGE_CS_OK;
+}
+
+static int
+fixture_quorate(uint64 handle, int *out)
+{
+	Assert(handle == 123);
+	if (failing_api_step == CLUSTER_STORAGE_PROVIDER_GETQUORATE)
+		return 3;
+	*out = observed_quorate;
+	return STORAGE_CS_OK;
+}
+
+static int
+fixture_dispatch(uint64 handle, int flags)
+{
+	StorageCorosyncRing ring = { 11, 8 };
+	uint32 members[] = { 11, 12 };
+
+	if (inspect_pending_sample) {
+		ClusterStorageQuorumState saved;
+		char evidence[1536];
+
+		memcpy(&saved, storage_state, sizeof(saved));
+		cluster_storage_quorum_diagnostic_format(evidence, sizeof(evidence));
+		UT_ASSERT(strstr(evidence, "sample_finished_mono_us=0") != NULL);
+		UT_ASSERT(strstr(evidence, "sample_outcome=0") != NULL);
+		UT_ASSERT_EQ(memcmp(&saved, storage_state, sizeof(saved)), 0);
+	}
+	dispatch_count++;
+	poll_dispatch_count++;
+	Assert(handle == 123 && flags == STORAGE_CS_DISPATCH_ALL);
+	if (failing_api_step == CLUSTER_STORAGE_PROVIDER_DISPATCH)
+		return 4;
+	if (notify_enabled) {
+		StorageCorosyncRing member_ring = ring;
+		uint32 member_count = remove_peer || remove_self ? 1 : 2;
+		uint32 quorum_count = member_count;
+
+		if (remove_self)
+			ring.node = member_ring.node = members[0] = 12;
+
+		if (notification_mismatch & 1)
+			member_ring.sequence++;
+		if (notification_mismatch & 2)
+			member_count = 1;
+		if (notification_mismatch & 4)
+			member_ring.node = 13;
+		if (!(missing_notifications & 1) && (!pair_on_second_dispatch || poll_dispatch_count == 1))
+			callbacks.members_notify(handle, member_ring, member_count, members, 0, NULL, 0, NULL);
+		if (negative_then_ready)
+			callbacks.quorum_notify(handle, 0, ring, quorum_count, members);
+		if (!(missing_notifications & 2) && (!pair_on_second_dispatch || poll_dispatch_count == 2))
+			callbacks.quorum_notify(handle, notified_quorate, ring, quorum_count, members);
+	}
+	if (changed_after_notify) {
+		ring.sequence++;
+		callbacks.members_notify(handle, ring, 1, members, 0, NULL, 1, members + 1);
+	}
+	return STORAGE_CS_OK;
+}
+
+static int
+fixture_cmap_get(uint64 handle, const char *key, void *out, size_t *size, int *type)
+{
+	static const char *strings[][2] = {
+		{ "totem.cluster_name", "quorum-fixture" }, { "quorum.provider", "corosync_votequorum" },
+		{ "quorum.device.model", "net" },			{ "quorum.device.net.algorithm", "lms" },
+		{ "quorum.device.net.tls", "required" },
+	};
+	uint32 number = 0;
+	Size i;
+
+	Assert(handle == 456);
+	if (bad_key != NULL && strcmp(key, bad_key) == 0)
+		return 2;
+	for (i = 0; i < lengthof(strings); i++) {
+		if (strcmp(key, strings[i][0]) == 0) {
+			Size length = strlen(strings[i][1]) + 1;
+
+			Assert(*size >= length);
+			memcpy(out, strings[i][1], length);
+			*size = length;
+			*type = STORAGE_CMAP_STRING;
+			return STORAGE_CS_OK;
+		}
+	}
+	if (strcmp(key, "runtime.votequorum.this_node_id") == 0
+		|| strcmp(key, "nodelist.node.0.nodeid") == 0)
+		number = 11;
+	else if (strcmp(key, "nodelist.node.1.nodeid") == 0)
+		number = 12;
+	else
+		return STORAGE_CS_NOT_EXIST;
+	Assert(*size >= sizeof(number));
+	memcpy(out, &number, sizeof(number));
+	*size = sizeof(number);
+	*type = STORAGE_CMAP_UINT32;
+	return STORAGE_CS_OK;
+}
+
+static void
+reset_fixture(void)
+{
+	memset(&storage_api, 0, sizeof(storage_api));
+	storage_api.initialize = fixture_initialize;
+	storage_api.finalize = fixture_finalize;
+	storage_api.trackstart = fixture_track;
+	storage_api.dispatch = fixture_dispatch;
+	storage_api.getquorate = fixture_quorate;
+	storage_api.cmap_initialize = fixture_cmap_initialize;
+	storage_api.cmap_finalize = fixture_finalize;
+	storage_api.cmap_get = fixture_cmap_get;
+	storage_connected = false;
+	storage_quorum_handle = storage_cmap_handle = 0;
+	memset(&storage_notified, 0, sizeof(storage_notified));
+	cluster_storage_quorum_nodes = "0:11,1:12";
+	cluster_storage_quorum_cluster = "quorum-fixture";
+	observed_quorate = notified_quorate = 1;
+	notify_enabled = true;
+	tracking_enabled = false;
+	missing_notifications = dispatch_count = poll_dispatch_count = 0;
+	pair_on_second_dispatch = remove_peer = remove_self = negative_then_ready = false;
+	fixture_now = 1000000;
+	api_failed = changed_after_notify = false;
+	notification_mismatch = 0;
+	failing_api_step = 0;
+	bad_key = NULL;
+	finalize_count = track_count = 0;
+	memset(shared_settings, 0, sizeof(shared_settings));
+	shared_settings[0].name = "cluster.storage_quorum_nodes";
+	shared_settings[1].name = "cluster.storage_quorum_cluster";
+	shared_settings[0].vartype = shared_settings[1].vartype = PGC_STRING;
+	shared_settings[0].status = shared_settings[1].status = GUC_SHARED_FILE;
+}
+
+UT_TEST(test_exact_profile_and_current_component)
+{
+	ClusterStorageQuorumView view;
+
+	reset_fixture();
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_READY);
+	UT_ASSERT_EQ(view.ring_sequence, 8);
+	UT_ASSERT_EQ(view.members[0], 3);
+	UT_ASSERT_EQ(track_count, 1);
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_READY);
+	UT_ASSERT_EQ(track_count, 2);
+}
+
+UT_TEST(test_cached_callback_cannot_renew_current_permission)
+{
+	ClusterStorageQuorumView view;
+
+	reset_fixture();
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_READY);
+	notify_enabled = false;
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_INCOMPLETE);
+	UT_ASSERT_EQ(view.members[0], 0);
+}
+
+UT_TEST(test_loss_disconnects_without_retaining_success)
+{
+	ClusterStorageQuorumView view;
+
+	reset_fixture();
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_READY);
+	api_failed = true;
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_UNAVAILABLE);
+	UT_ASSERT_EQ(finalize_count, 2);
+	UT_ASSERT(!storage_connected);
+	api_failed = false;
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_READY);
+}
+
+UT_TEST(test_both_quorum_observations_and_matching_ring_are_required)
+{
+	ClusterStorageQuorumView view;
+
+	reset_fixture();
+	observed_quorate = 0;
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_NOT_QUORATE);
+	observed_quorate = 1;
+	notified_quorate = 0;
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_NOT_QUORATE);
+	notified_quorate = 1;
+	changed_after_notify = true;
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_INCOMPLETE);
+	UT_ASSERT_EQ(view.members[0], 1);
+}
+
+UT_TEST(test_configuration_failure_revokes_previously_valid_observation)
+{
+	const char *keys[] = { "totem.cluster_name",
+						   "quorum.provider",
+						   "quorum.device.model",
+						   "quorum.device.net.algorithm",
+						   "quorum.device.net.tls",
+						   "quorum.device.votes",
+						   "quorum.expected_votes",
+						   "quorum.two_node",
+						   "quorum.auto_tie_breaker",
+						   "quorum.last_man_standing",
+						   "runtime.votequorum.this_node_id",
+						   "nodelist.node.1.nodeid",
+						   "nodelist.node.0.quorum_votes" };
+	Size i;
+
+	for (i = 0; i < lengthof(keys); i++) {
+		ClusterStorageQuorumView view;
+
+		reset_fixture();
+		cluster_storage_corosync_sample(&view);
+		UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_READY);
+		bad_key = keys[i];
+		cluster_storage_corosync_sample(&view);
+		UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_CONFIGURATION);
+		UT_ASSERT_EQ(view.members[0], 0);
+		UT_ASSERT(!storage_connected);
+	}
+}
+
+UT_TEST(test_local_settings_cannot_supply_storage_authority)
+{
+	Size i;
+
+	for (i = 0; i < lengthof(shared_settings); i++) {
+		ClusterStorageQuorumView view;
+
+		reset_fixture();
+		cluster_storage_corosync_sample(&view);
+		UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_READY);
+		shared_settings[i].status = 0;
+		cluster_storage_corosync_sample(&view);
+		UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_CONFIGURATION);
+		UT_ASSERT_EQ(view.members[0], 0);
+		UT_ASSERT(!storage_connected);
+	}
+}
+
+UT_TEST(test_old_quorum_after_new_nodelist_cannot_renew_permission)
+{
+	ClusterStorageQuorumView view;
+	ClusterStorageQuorumState state;
+	unsigned mismatch;
+
+	reset_fixture();
+	cluster_storage_quorum_attach(&state, true);
+	for (mismatch = 1; mismatch <= 3; mismatch++) {
+		notification_mismatch = 0;
+		cluster_storage_quorum_refresh(cluster_storage_quorum_now_us(), 1000000);
+		UT_ASSERT(cluster_storage_quorum_allows_node(1));
+		notification_mismatch = mismatch;
+		cluster_storage_corosync_sample(&view);
+		UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_INCOMPLETE);
+		UT_ASSERT_EQ(view.members[0], (mismatch & 2) ? 1 : 3);
+		cluster_storage_quorum_refresh(cluster_storage_quorum_now_us(), 1000000);
+		if (mismatch == 1) {
+			/* Same membership, unfinished ring pair: no renewal. */
+			UT_ASSERT(cluster_storage_quorum_allows_node(0));
+			UT_ASSERT(cluster_storage_quorum_allows_node(1));
+			fixture_now += 1000000;
+			UT_ASSERT(!cluster_storage_quorum_allows_node(0));
+			UT_ASSERT(!cluster_storage_quorum_allows_node(1));
+		} else {
+			UT_ASSERT(!cluster_storage_quorum_allows_node(0));
+			UT_ASSERT(!cluster_storage_quorum_allows_node(1));
+		}
+	}
+	notification_mismatch = 0;
+	cluster_storage_quorum_refresh(cluster_storage_quorum_now_us(), 1000000);
+	UT_ASSERT(cluster_storage_quorum_allows_members(3, 0));
+	cluster_storage_quorum_attach(NULL, false);
+}
+
+UT_TEST(test_provider_failure_step_cannot_retain_success_detail)
+{
+	const int stages[] = { CLUSTER_STORAGE_PROVIDER_TRACK_CURRENT,
+						   CLUSTER_STORAGE_PROVIDER_GETQUORATE, CLUSTER_STORAGE_PROVIDER_DISPATCH };
+	const int errors[] = { 2, 3, 4 };
+	Size i;
+
+	for (i = 0; i < lengthof(stages); i++) {
+		ClusterStorageQuorumView view;
+
+		reset_fixture();
+		cluster_storage_corosync_sample(&view);
+		UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_READY);
+		api_failed = stages[i] == CLUSTER_STORAGE_PROVIDER_TRACK_CURRENT;
+		failing_api_step = stages[i];
+		cluster_storage_corosync_sample(&view);
+		UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_UNAVAILABLE);
+		UT_ASSERT_EQ(view.members[0], 0);
+		UT_ASSERT_EQ(view.provider_diagnostic,
+					 CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(stages[i], errors[i]));
+		UT_ASSERT(!storage_connected);
+		api_failed = false;
+		failing_api_step = 0;
+		cluster_storage_corosync_sample(&view);
+		UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_READY);
+		UT_ASSERT_EQ(view.provider_diagnostic, CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
+												   CLUSTER_STORAGE_PROVIDER_READY, STORAGE_CS_OK));
+	}
+}
+
+UT_TEST(test_provider_notification_refusal_detail_is_exact)
+{
+	ClusterStorageQuorumView view;
+
+	reset_fixture();
+	notify_enabled = false;
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_INCOMPLETE);
+	UT_ASSERT_EQ(view.provider_diagnostic, CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
+											   CLUSTER_STORAGE_PROVIDER_NOTIFICATION_MISSING, 0));
+	notify_enabled = true;
+	notification_mismatch = 1;
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_INCOMPLETE);
+	UT_ASSERT_EQ(view.provider_diagnostic, CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
+											   CLUSTER_STORAGE_PROVIDER_NOTIFICATION_MISMATCH, 0));
+	notification_mismatch = 4;
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_CONFIGURATION);
+	UT_ASSERT_EQ(view.provider_diagnostic, CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(
+											   CLUSTER_STORAGE_PROVIDER_NOTIFICATION_INVALID, 0));
+	notification_mismatch = 0;
+	bad_key = "totem.cluster_name";
+	cluster_storage_corosync_sample(&view);
+	UT_ASSERT_EQ(view.reason, CLUSTER_STORAGE_QUORUM_CONFIGURATION);
+	UT_ASSERT_EQ(view.provider_diagnostic,
+				 CLUSTER_STORAGE_PROVIDER_DIAGNOSTIC(CLUSTER_STORAGE_PROVIDER_PROFILE, 0));
+}
+
+
+UT_TEST(test_pending_pair_preserves_only_the_original_unexpired_view)
+{
+	unsigned missing;
+
+	for (missing = 1; missing <= 3; missing++) {
+		ClusterStorageQuorumState state;
+		ClusterStorageQuorumView before, after;
+
+		reset_fixture();
+		cluster_storage_quorum_attach(&state, true);
+		cluster_storage_quorum_refresh(fixture_now, 100);
+		UT_ASSERT(cluster_storage_quorum_snapshot(&before));
+		missing_notifications = missing;
+		fixture_now += 50;
+		cluster_storage_quorum_refresh(fixture_now, 100);
+		UT_ASSERT(cluster_storage_quorum_allows_members(3, 0));
+		UT_ASSERT(cluster_storage_quorum_snapshot(&after));
+		UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+		UT_ASSERT_EQ(poll_dispatch_count, 2);
+		fixture_now = before.expires_us;
+		UT_ASSERT(!cluster_storage_quorum_allows_node(0));
+		cluster_storage_quorum_refresh(fixture_now, 100);
+		UT_ASSERT(!cluster_storage_quorum_allows_node(0));
+		cluster_storage_quorum_attach(NULL, false);
+	}
+}
+
+UT_TEST(test_ring_skew_does_not_revoke_or_renew_unchanged_members)
+{
+	ClusterStorageQuorumState state;
+	ClusterStorageQuorumView before, after;
+
+	reset_fixture();
+	cluster_storage_quorum_attach(&state, true);
+	cluster_storage_quorum_refresh(fixture_now, 100);
+	UT_ASSERT(cluster_storage_quorum_snapshot(&before));
+	notification_mismatch = 1;
+	fixture_now++;
+	cluster_storage_quorum_refresh(fixture_now, 100);
+	UT_ASSERT(cluster_storage_quorum_allows_members(3, 0));
+	UT_ASSERT(cluster_storage_quorum_snapshot(&after));
+	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	UT_ASSERT_EQ(poll_dispatch_count, 2);
+	fixture_now = before.expires_us;
+	UT_ASSERT(!cluster_storage_quorum_allows_node(1));
+	notification_mismatch = 0;
+	cluster_storage_quorum_refresh(fixture_now, 100);
+	UT_ASSERT(cluster_storage_quorum_allows_members(3, 0));
+	cluster_storage_quorum_attach(NULL, false);
+}
+
+UT_TEST(test_current_pair_can_finish_on_one_bounded_second_dispatch)
+{
+	ClusterStorageQuorumState state;
+
+	reset_fixture();
+	pair_on_second_dispatch = true;
+	cluster_storage_quorum_attach(&state, true);
+	cluster_storage_quorum_refresh(fixture_now, 100);
+	UT_ASSERT(cluster_storage_quorum_allows_members(3, 0));
+	UT_ASSERT_EQ(track_count, 1);
+	UT_ASSERT_EQ(dispatch_count, 2);
+	cluster_storage_quorum_attach(NULL, false);
+}
+
+UT_TEST(test_actual_member_change_and_negative_evidence_revoke_immediately)
+{
+	unsigned scenario;
+
+	for (scenario = 0; scenario < 7; scenario++) {
+		ClusterStorageQuorumState state;
+
+		reset_fixture();
+		cluster_storage_quorum_attach(&state, true);
+		cluster_storage_quorum_refresh(fixture_now, 100);
+		UT_ASSERT(cluster_storage_quorum_allows_members(3, 0));
+		switch (scenario) {
+		case 0:
+			remove_peer = true;
+			break;
+		case 1:
+			remove_peer = true;
+			missing_notifications = 2;
+			break;
+		case 2:
+			remove_self = true;
+			missing_notifications = 2;
+			break;
+		case 3:
+			observed_quorate = 0;
+			missing_notifications = 3;
+			break;
+		case 4:
+			notification_mismatch = 4;
+			break;
+		case 5:
+			negative_then_ready = true;
+			break;
+		case 6:
+			bad_key = "totem.cluster_name";
+			break;
+		}
+		fixture_now++;
+		cluster_storage_quorum_refresh(fixture_now, 100);
+		UT_ASSERT(!cluster_storage_quorum_allows_node(1));
+		UT_ASSERT(!cluster_storage_quorum_allows_members(3, 0));
+		if (scenario == 0)
+			UT_ASSERT(cluster_storage_quorum_allows_node(0));
+		else
+			UT_ASSERT(!cluster_storage_quorum_allows_node(0));
+		/* An incomplete later poll cannot undo any revoked membership. */
+		missing_notifications = 3;
+		remove_peer = remove_self = negative_then_ready = false;
+		notification_mismatch = 0;
+		observed_quorate = 1;
+		bad_key = NULL;
+		fixture_now++;
+		cluster_storage_quorum_refresh(fixture_now, 100);
+		UT_ASSERT(!cluster_storage_quorum_allows_node(1));
+		if (scenario != 0)
+			UT_ASSERT(!cluster_storage_quorum_allows_node(0));
+		cluster_storage_quorum_attach(NULL, false);
+	}
+}
+
+UT_TEST(test_stop_diagnostic_keeps_raw_poll_separate_from_retained_authority)
+{
+	ClusterStorageQuorumState state, saved;
+	char evidence[1536];
+	unsigned calls;
+
+	reset_fixture();
+	cluster_storage_quorum_attach(&state, true);
+	cluster_storage_quorum_refresh(fixture_now, 100);
+	notification_mismatch = 1;
+	fixture_now++;
+	inspect_pending_sample = true;
+	cluster_storage_quorum_refresh(fixture_now, 100);
+	inspect_pending_sample = false;
+	memcpy(&saved, &state, sizeof(saved));
+	calls = dispatch_count;
+	cluster_storage_quorum_diagnostic_format(evidence, sizeof(evidence));
+	UT_ASSERT(strstr(evidence, "storage_view_stable=1") != NULL);
+	UT_ASSERT(strstr(evidence, "raw_reason=4") != NULL);
+	UT_ASSERT(strstr(evidence, "sample_outcome=2") != NULL);
+	UT_ASSERT(strstr(evidence, "quorum_callback_mono_us=1000001") != NULL);
+	UT_ASSERT(strstr(evidence, "members_callback_mono_us=1000001") != NULL);
+	UT_ASSERT(strstr(evidence, "token_rx=unobserved") != NULL);
+	UT_ASSERT_EQ(dispatch_count, calls);
+	UT_ASSERT_EQ(memcmp(&saved, &state, sizeof(saved)), 0);
+	UT_ASSERT(cluster_storage_quorum_allows_node(0));
+
+	/* An interrupted view publication must not spin or become a negative vote. */
+	pg_atomic_fetch_add_u32(&state.sequence, 1);
+	memcpy(&saved, &state, sizeof(saved));
+	cluster_storage_quorum_diagnostic_format(evidence, sizeof(evidence));
+	UT_ASSERT(strstr(evidence, "storage_view_stable=0") != NULL);
+	UT_ASSERT_EQ(dispatch_count, calls);
+	UT_ASSERT_EQ(memcmp(&saved, &state, sizeof(saved)), 0);
+	cluster_storage_quorum_attach(NULL, false);
+}
+
+int
+main(void)
+{
+	UT_PLAN(14);
+	UT_RUN(test_stop_diagnostic_keeps_raw_poll_separate_from_retained_authority);
+	UT_RUN(test_pending_pair_preserves_only_the_original_unexpired_view);
+	UT_RUN(test_ring_skew_does_not_revoke_or_renew_unchanged_members);
+	UT_RUN(test_current_pair_can_finish_on_one_bounded_second_dispatch);
+	UT_RUN(test_actual_member_change_and_negative_evidence_revoke_immediately);
+	UT_RUN(test_exact_profile_and_current_component);
+	UT_RUN(test_cached_callback_cannot_renew_current_permission);
+	UT_RUN(test_loss_disconnects_without_retaining_success);
+	UT_RUN(test_both_quorum_observations_and_matching_ring_are_required);
+	UT_RUN(test_configuration_failure_revokes_previously_valid_observation);
+	UT_RUN(test_local_settings_cannot_supply_storage_authority);
+	UT_RUN(test_old_quorum_after_new_nodelist_cannot_renew_permission);
+	UT_RUN(test_provider_failure_step_cannot_retain_success_detail);
+	UT_RUN(test_provider_notification_refusal_detail_is_exact);
+	UT_DONE();
+	return ut_failed_count ? 1 : 0;
+}

@@ -23,12 +23,16 @@
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_wal_retention.h"
+#include "cluster/cluster_wal_source.h"
+#include "common/cryptohash.h"
 #include "storage/lock.h"
 #include "utils/resowner.h"
 
 #include "unit_test.h"
+#include "../../backend/cluster/cluster_control_root_private.h"
 
 UT_DEFINE_GLOBALS();
 
@@ -39,7 +43,65 @@ UT_DEFINE_GLOBALS();
 int MyProcPid = 42;
 int wal_segment_size = TEST_WAL_SEG_SIZE;
 char *cluster_wal_threads_dir;
+bool cluster_shared_config;
+static bool fake_control_owner_current = true;
+static LOCKMODE fake_control_owner_mode = NoLock;
+static uint16 fake_control_owner_stale_thread;
+bool
+cluster_lock_owner_request_usable(const ClusterLockAcquireRequest *request)
+{
+	return fake_control_owner_current && request->resid.field1 != fake_control_owner_stale_thread
+		   && (fake_control_owner_mode == NoLock || request->lockmode == fake_control_owner_mode);
+}
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+
+/* PGRAC: this legacy geometry/guard suite retains its S1-S6 fixture boundary.
+ * Actual PRE2 ownership/native unwind is test_cluster_control_walr, not these
+ * scalar fixtures. Author: SqlRush <sqlrush@gmail.com> */
+ClusterLockAcquireResult
+cluster_lock_owner_request_acquire(ClusterLockAcquireRequest *request,
+								   ClusterControlNativeFinish finish, void *argument)
+{
+	ClusterLockAcquireResult result = cluster_lock_acquire_seven_step(request);
+
+	if (request->control_owner_id == 0)
+		request->control_owner_id = request->request_id;
+	return result == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK ? finish(request, argument) : result;
+}
+ClusterLockAcquireResult
+cluster_lock_owner_request_convert(ClusterLockAcquireRequest *request, uint64 preserve_request_id,
+								   ClusterControlNativeFinish finish, void *argument)
+{
+	if (preserve_request_id != 0)
+		request->request_id = request->holder.request_id = preserve_request_id;
+	return cluster_lock_owner_request_acquire(request, finish, argument);
+}
+ClusterLockAcquireResult
+cluster_lock_owner_request_release(const ClusterLockAcquireRequest *request)
+{
+	return cluster_lock_acquire_s6_release(request);
+}
+static bool fake_v2_ref_ready;
+static ClusterWalSourceRef fake_v2_ref;
 ResourceOwner CurrentResourceOwner = (ResourceOwner)(uintptr_t)0x1;
+
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!fake_v2_ref_ready)
+		return false;
+	*out = fake_v2_ref;
+	return true;
+}
 
 static ResourceReleaseCallback fake_resource_release_callback;
 static void *fake_resource_release_arg;
@@ -47,6 +109,7 @@ static void *fake_resource_release_arg;
 static ClusterLockAcquireResult fake_acquire_results[4];
 static int fake_acquire_result_count;
 static int fake_acquire_call_count;
+static int fake_acquire_error_at;
 static ClusterLockAcquireRequest fake_acquire_requests[4];
 static ClusterLockAcquireResult fake_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 static int fake_release_call_count;
@@ -68,7 +131,9 @@ static PgracExternalFenceWriterSetDigest fake_need_digest;
 static PgracExternalFenceWriterSetDigest fake_admission_digest;
 static ClusterControlRootSnapshot fake_preflight_root;
 static ClusterControlRootReadToken fake_preflight_token;
+static ClusterControlRecoverySubject fake_pending_subject;
 static bool fake_preflight_root_ready;
+static bool fake_terminal_history_blocked;
 static bool fake_extra_configured_thread;
 static PgracExternalFenceNeedSetResult fake_need_build_result = PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
 static ClusterRecoverySerialRevalidateResult fake_serial_result = CLUSTER_RECOVERY_SERIAL_CURRENT;
@@ -132,6 +197,8 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *request)
 	if (fake_acquire_call_count < fake_acquire_result_count)
 		result = fake_acquire_results[fake_acquire_call_count];
 	fake_acquire_call_count++;
+	if (fake_acquire_call_count == fake_acquire_error_at)
+		pg_re_throw();
 	if (result == CLUSTER_LOCK_ACQUIRE_OK_GRANTED
 		|| result == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK) {
 		mutable_request->request_id = (uint64)fake_acquire_call_count;
@@ -157,7 +224,10 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *request)
 		mutable_request->holder.cluster_epoch = 1;
 		mutable_request->holder.request_id = mutable_request->request_id;
 	}
-	return fake_s5_result;
+	return fake_s5_result == CLUSTER_LOCK_ACQUIRE_OK_GRANTED
+				   && request->op == CLUSTER_LOCK_OP_CONVERT
+			   ? CLUSTER_LOCK_ACQUIRE_OK_CONVERTED
+			   : fake_s5_result;
 }
 
 ClusterLockAcquireResult
@@ -209,12 +279,24 @@ cluster_control_root_revalidate(const ClusterControlRootReadToken *token,
 }
 
 ClusterControlRootResult
+cluster_control_root_read_recovery_subject(uint16 thread,
+										   const ClusterControlRootIdentity *expected,
+										   ClusterControlRecoverySubject *out)
+{
+	UT_ASSERT(thread == fake_pending_subject.duty.origin_thread_id && expected != NULL);
+	*out = fake_pending_subject;
+	return fake_root_current ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+ClusterControlRootResult
 cluster_control_root_read_canonical(uint16 origin_thread_id,
 									const ClusterControlRootIdentity *expected_identity,
 									ClusterControlRootReadMode mode,
 									ClusterControlRootSnapshot *out_snapshot,
 									ClusterControlRootReadToken *out_token)
 {
+	if (cluster_shared_config)
+		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
 	if (!fake_preflight_root_ready || origin_thread_id != 1)
 		return CLUSTER_CONTROL_ROOT_ABSENT;
 	if (mode == CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE && expected_identity == NULL) {
@@ -228,6 +310,33 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
 	*out_snapshot = fake_preflight_root;
 	if (out_token != NULL)
 		*out_token = fake_preflight_token;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+/* The root reader's real filesystem/authority body is tested by the root
+ * suite. Here it is the explicit authority seam for the real retention .o. */
+ClusterControlRootResult
+cluster_control_root_v3_read_retention_current(const ClusterControlRootIdentity *self,
+											   ClusterControlRootSnapshot *out,
+											   ClusterControlRootReadToken *token)
+{
+	memset(out, 0, sizeof(*out));
+	memset(token, 0, sizeof(*token));
+	if (!fake_preflight_root_ready || !fake_root_current || self == NULL
+		|| memcmp(self, &fake_preflight_root.identity, sizeof(*self)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	*out = fake_preflight_root;
+	*token = fake_preflight_token;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_terminal_history_blocked(
+	const ClusterControlRootIdentity *expected_identity, bool *out_blocked)
+{
+	(void)expected_identity;
+	if (out_blocked != NULL)
+		*out_blocked = fake_terminal_history_blocked;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -353,6 +462,14 @@ cluster_external_fence_admission_set_release(PgracExternalFenceAdmissionSetV1 **
 }
 
 ClusterRecoverySerialRevalidateResult
+cluster_recovery_serial_initializer_revalidate(ClusterRecoverySerialGuard *guard)
+{
+	return guard->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER
+			   ? fake_serial_result
+			   : CLUSTER_RECOVERY_SERIAL_CAPABILITY_STALE;
+}
+
+ClusterRecoverySerialRevalidateResult
 cluster_recovery_serial_revalidate(ClusterRecoverySerialGuard *guard pg_attribute_unused())
 {
 	return fake_serial_result;
@@ -368,11 +485,18 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 static void
 reset_pin_fakes(void)
 {
+	cluster_shared_config = false;
+	fake_control_owner_current = true;
+	fake_control_owner_mode = NoLock;
+	fake_control_owner_stale_thread = 0;
+	fake_v2_ref_ready = false;
+	memset(&fake_v2_ref, 0, sizeof(fake_v2_ref));
 	memset(fake_acquire_results, 0, sizeof(fake_acquire_results));
 	memset(fake_acquire_requests, 0, sizeof(fake_acquire_requests));
 	memset(fake_release_threads, 0, sizeof(fake_release_threads));
 	fake_acquire_result_count = 0;
 	fake_acquire_call_count = 0;
+	fake_acquire_error_at = 0;
 	fake_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 	fake_release_call_count = 0;
 	fake_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
@@ -393,6 +517,7 @@ reset_pin_fakes(void)
 	memset(&fake_preflight_root, 0, sizeof(fake_preflight_root));
 	memset(&fake_preflight_token, 0, sizeof(fake_preflight_token));
 	fake_preflight_root_ready = false;
+	fake_terminal_history_blocked = false;
 	fake_extra_configured_thread = false;
 	fake_need_build_result = PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
 	fake_serial_result = CLUSTER_RECOVERY_SERIAL_CURRENT;
@@ -497,6 +622,464 @@ write_test_wal_segment(const char *directory, TimeLineID tli, XLogSegNo segno, c
 	header.xlp_xlog_blcksz = XLOG_BLCKSZ;
 	UT_ASSERT_EQ(pwrite(fd, &header, sizeof(header), 0), sizeof(header));
 	close(fd);
+}
+
+/* PGRAC: actual retention object + real files; authority is the existing
+ * fixture seam, not a claim that root-v2 GC admission is implemented.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct V2ReuseFixture {
+	char root[MAXPGPATH];
+	char thread[MAXPGPATH];
+	char generation[MAXPGPATH];
+	char claim[MAXPGPATH];
+	char flat_wal[MAXPGPATH];
+	char generation_wal[MAXPGPATH];
+	uint8 claim_bytes[CLUSTER_WAL_CLAIM_V2_BYTES];
+	ClusterWalReuseGuardRequest request;
+} V2ReuseFixture;
+
+static void
+v2_reuse_fixture(V2ReuseFixture *f)
+{
+	ClusterWalThreadClaimV2 claim;
+	pg_cryptohash_ctx *hash;
+	int fd;
+
+	reset_pin_fakes();
+	memset(f, 0, sizeof(*f));
+	strlcpy(f->root, "/tmp/pgrac-wal-reuse-v2-XXXXXX", sizeof(f->root));
+	UT_ASSERT_NOT_NULL(mkdtemp(f->root));
+	snprintf(f->thread, sizeof(f->thread), "%s/thread_1", f->root);
+	snprintf(f->generation, sizeof(f->generation), "%s/generation_11", f->thread);
+	snprintf(f->claim, sizeof(f->claim), "%s/pgrac_thread.claim", f->generation);
+	UT_ASSERT_EQ(mkdir(f->thread, 0700), 0);
+	UT_ASSERT_EQ(mkdir(f->generation, 0700), 0);
+	write_test_wal_segment(f->thread, 1, 1, f->flat_wal, sizeof(f->flat_wal));
+	write_test_wal_segment(f->generation, 1, 1, f->generation_wal, sizeof(f->generation_wal));
+	memset(&claim, 0, sizeof(claim));
+	claim.identity = make_duty(1);
+	claim.identity.thread_claim_crc32c = 0;
+	claim.database_incarnation = 7;
+	claim.config_generation = 3;
+	claim.claim_generation = 1;
+	UT_ASSERT_EQ(cluster_wal_claim_v2_encode(&claim, f->claim_bytes),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	claim.identity.thread_claim_crc32c
+		= (uint32)f->claim_bytes[104] | ((uint32)f->claim_bytes[105] << 8)
+		  | ((uint32)f->claim_bytes[106] << 16) | ((uint32)f->claim_bytes[107] << 24);
+	fd = open(f->claim, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(write(fd, f->claim_bytes, sizeof(f->claim_bytes)), sizeof(f->claim_bytes));
+	UT_ASSERT_EQ(close(fd), 0);
+	fake_v2_ref.claim.identity = claim.identity;
+	fake_v2_ref.claim.database_incarnation = claim.database_incarnation;
+	fake_v2_ref.claim.max_config_generation = claim.config_generation;
+	fake_v2_ref.timeline = 1;
+	hash = pg_cryptohash_create(PG_SHA256);
+	UT_ASSERT_NOT_NULL(hash);
+	UT_ASSERT_EQ(pg_cryptohash_init(hash), 0);
+	UT_ASSERT_EQ(pg_cryptohash_update(hash, f->claim_bytes, sizeof(f->claim_bytes)), 0);
+	UT_ASSERT_EQ(pg_cryptohash_final(hash, fake_v2_ref.claim.claim_sha256, 32), 0);
+	pg_cryptohash_free(hash);
+	fake_v2_ref_ready = true;
+	cluster_shared_config = true;
+	cluster_wal_threads_dir = f->root;
+	f->request.file.thread_id = 1;
+	f->request.file.kind = CLUSTER_WAL_FILE_NORMAL;
+	f->request.file.tli = 1;
+	f->request.file.segno = 1;
+	f->request.entry = CLUSTER_WAL_REUSE_E1_CHECKPOINT_RESTARTPOINT;
+	f->request.action = CLUSTER_WAL_ACTION_RETIRE_RECYCLE_OR_REMOVE;
+	f->request.duty = claim.identity;
+	f->request.root_read = make_root_token(&claim.identity);
+	f->request.root_read.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	f->request.formation = (const ClusterFormationWitnessV1 *)(uintptr_t)0x1000;
+	fake_preflight_root.identity = claim.identity;
+	fake_preflight_root.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	fake_preflight_root.root_flags = f->request.root_read.root_flags;
+	fake_preflight_root.root_publish_seq = 1;
+	fake_preflight_root.checkpoint_tli = fake_preflight_root.tail_tli = 1;
+	fake_preflight_root.checkpoint_lower_lsn = TEST_WAL_SEG_SIZE * 4;
+	fake_preflight_root.validated_tail_lsn_exclusive = TEST_WAL_SEG_SIZE * 5;
+	fake_preflight_token = f->request.root_read;
+	fake_preflight_root_ready = true;
+}
+
+static void
+v2_reuse_fixture_cleanup(V2ReuseFixture *f)
+{
+	UT_ASSERT_EQ(unlink(f->flat_wal), 0);
+	UT_ASSERT_EQ(unlink(f->generation_wal), 0);
+	UT_ASSERT_EQ(unlink(f->claim), 0);
+	UT_ASSERT_EQ(rmdir(f->generation), 0);
+	UT_ASSERT_EQ(rmdir(f->thread), 0);
+	UT_ASSERT_EQ(rmdir(f->root), 0);
+	cluster_wal_threads_dir = NULL;
+	reset_pin_fakes();
+}
+
+UT_TEST(test_v2_reuse_selects_exact_generation_not_flat_decoy)
+{
+	V2ReuseFixture f;
+	ClusterWalReuseActionGuard guard = { 0 };
+	ClusterWalReuseDenyReason reason;
+	ClusterWalTerminalOutcome outcome;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+	struct stat selected;
+
+	v2_reuse_fixture(&f);
+	UT_ASSERT_EQ(stat(f.generation_wal, &selected), 0);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &f.request, &needs, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(guard.pre_action_stamp.file_id_lo, selected.st_ino);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+				 CLUSTER_WALR_RELEASE_NOT_HELD);
+	UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_UNCHANGED);
+	v2_reuse_fixture_cleanup(&f);
+}
+
+/* PRE2: a selected checkpoint-less terminal remains a physical retention
+ * input until a typed consumer closes it; a new reservation must not prune it
+ * merely because the current root is otherwise reusable. */
+UT_TEST(test_v2_reuse_terminal_history_blocks_until_consumer_closes)
+{
+	V2ReuseFixture f;
+	ClusterWalReuseActionGuard guard = { 0 };
+	ClusterWalReuseDenyReason reason;
+	ClusterWalTerminalOutcome outcome;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+
+	v2_reuse_fixture(&f);
+	fake_terminal_history_blocked = true;
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &f.request, &needs, &reason),
+				 CLUSTER_WAL_GUARD_BLOCKED);
+	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_ROOT_REQUIRED);
+	UT_ASSERT_NULL(needs);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+				 CLUSTER_WALR_RELEASE_NOT_HELD);
+	UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_UNCHANGED);
+	v2_reuse_fixture_cleanup(&f);
+}
+
+UT_TEST(test_v2_e1_consumes_current_root_and_preserves_exact_floor)
+{
+	V2ReuseFixture f;
+	ClusterWalRetentionE1Context context = { 0 };
+	ClusterWalRootFoldResult fold;
+	ClusterWalReuseDenyReason reason;
+	XLogSegNo floor;
+
+	v2_reuse_fixture(&f);
+	UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_begin(&context, 1, &fold, &floor, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(fold, CLUSTER_WAL_FOLD_BOUNDED);
+	UT_ASSERT_EQ(floor, 4);
+	UT_ASSERT(context.coarse_walr.held);
+	if (context.coarse_walr.held)
+		UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_release(&context, &reason),
+					 CLUSTER_WALR_RELEASE_CONFIRMED);
+	cluster_wal_retention_e1_finish(&context);
+	UT_ASSERT_EQ(context.magic, 0);
+	v2_reuse_fixture_cleanup(&f);
+}
+
+UT_TEST(test_v2_reuse_missing_native_ref_cannot_fallback_flat)
+{
+	V2ReuseFixture f;
+	ClusterWalReuseActionGuard guard = { 0 };
+	ClusterWalReuseDenyReason reason;
+	ClusterWalTerminalOutcome outcome;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+
+	v2_reuse_fixture(&f);
+	fake_v2_ref_ready = false;
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &f.request, &needs, &reason),
+				 CLUSTER_WAL_GUARD_BLOCKED);
+	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_OBJECT_STALE);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+				 CLUSTER_WALR_RELEASE_NOT_HELD);
+	v2_reuse_fixture_cleanup(&f);
+}
+
+UT_TEST(test_v2_retention_zero_crc_is_not_absent_authority)
+{
+	V2ReuseFixture f;
+	ClusterWalRetentionE1Context context = { 0 };
+	ClusterWalRootFoldResult fold;
+	ClusterWalReuseDenyReason reason;
+	ClusterWalRootPublishGuard *publish = NULL;
+	XLogSegNo floor;
+
+	v2_reuse_fixture(&f);
+	fake_preflight_token.record_crc32c = 0;
+	UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_begin(&context, 1, &fold, &floor, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(floor, 4);
+	if (context.coarse_walr.held)
+		UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_release(&context, &reason),
+					 CLUSTER_WALR_RELEASE_CONFIRMED);
+	cluster_wal_retention_e1_finish(&context);
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&fake_preflight_token, false, &publish),
+		CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publish), CLUSTER_WALR_RELEASE_CONFIRMED);
+	v2_reuse_fixture_cleanup(&f);
+}
+
+UT_TEST(test_v2_retention_refuses_checkpoint_future_and_wrong_purpose)
+{
+	for (int which = 0; which < 6; ++which) {
+		V2ReuseFixture f;
+		ClusterWalReuseActionGuard guard = { 0 };
+		ClusterWalReuseDenyReason reason;
+		ClusterWalTerminalOutcome outcome;
+		PgracExternalFenceNeedSetV1 *needs = NULL;
+		char extra[MAXPGPATH];
+
+		v2_reuse_fixture(&f);
+		if (which < 2) {
+			f.request.file.segno = which == 0 ? 4 : 9;
+			write_test_wal_segment(f.generation, 1, f.request.file.segno, extra, sizeof(extra));
+		} else if (which == 2)
+			f.request.entry = CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH;
+		else if (which == 3)
+			f.request.root_read.file_txn_seq++;
+		else if (which == 4)
+			fake_preflight_root.validated_tail_lsn_exclusive
+				= fake_preflight_root.checkpoint_lower_lsn;
+		else
+			fake_preflight_root.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+		UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+		UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &f.request, &needs, &reason),
+					 CLUSTER_WAL_GUARD_BLOCKED);
+		UT_ASSERT_EQ(reason, which == 2	  ? CLUSTER_WAL_DENY_THREAD_SCOPE
+							 : which == 3 ? CLUSTER_WAL_DENY_ROOT_STALE
+										  : CLUSTER_WAL_DENY_ROOT_REQUIRED);
+		UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+					 CLUSTER_WALR_RELEASE_NOT_HELD);
+		UT_ASSERT_EQ(access(f.generation_wal, F_OK), 0);
+		if (which < 2)
+			UT_ASSERT_EQ(unlink(extra), 0);
+		v2_reuse_fixture_cleanup(&f);
+	}
+}
+
+UT_TEST(test_v2_retention_revalidates_root_after_walr_x)
+{
+	V2ReuseFixture f;
+	ClusterWalReuseActionGuard guard = { 0 };
+	ClusterWalReuseDenyReason reason;
+	ClusterWalTerminalOutcome outcome;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+
+	v2_reuse_fixture(&f);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &f.request, &needs, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(&guard, NULL, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	fake_acquire_result_count = 1;
+	fake_acquire_results[0] = CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
+	fake_preflight_token.root_publish_seq++;
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, NULL, NULL, &reason),
+				 CLUSTER_WAL_GUARD_BLOCKED);
+	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_ROOT_STALE);
+	UT_ASSERT_FALSE(guard.walr.held);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+				 CLUSTER_WALR_RELEASE_NOT_HELD);
+	UT_ASSERT_EQ(access(f.generation_wal, F_OK), 0);
+	v2_reuse_fixture_cleanup(&f);
+}
+
+static void
+v2_reuse_write_claim(const V2ReuseFixture *f, const uint8 *bytes)
+{
+	int fd = open(f->claim, O_WRONLY | O_TRUNC | O_CREAT, 0600);
+
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(write(fd, bytes, CLUSTER_WAL_CLAIM_V2_BYTES), CLUSTER_WAL_CLAIM_V2_BYTES);
+	UT_ASSERT_EQ(close(fd), 0);
+}
+
+UT_TEST(test_v2_reuse_rejects_unproven_namespace_and_claim)
+{
+	for (int which = 0; which < 9; ++which) {
+		V2ReuseFixture f;
+		ClusterWalReuseActionGuard guard = { 0 };
+		ClusterWalReuseDenyReason reason;
+		ClusterWalTerminalOutcome outcome;
+		PgracExternalFenceNeedSetV1 *needs = NULL;
+		char held[MAXPGPATH];
+		uint8 changed[CLUSTER_WAL_CLAIM_V2_BYTES];
+
+		v2_reuse_fixture(&f);
+		memcpy(changed, f.claim_bytes, sizeof(changed));
+		changed[0] ^= 1;
+		snprintf(held, sizeof(held), "%s.held", which == 3 ? f.generation : f.claim);
+		switch (which) {
+		case 0:
+			fake_v2_ref.claim.identity.origin_owner_incarnation++;
+			break;
+		case 1:
+			fake_v2_ref.claim.claim_sha256[0] ^= 1;
+			break;
+		case 2:
+			v2_reuse_write_claim(&f, changed);
+			break;
+		case 3:
+			UT_ASSERT_EQ(rename(f.generation, held), 0);
+			UT_ASSERT_EQ(symlink(held, f.generation), 0);
+			break;
+		case 4:
+			UT_ASSERT_EQ(rename(f.claim, held), 0);
+			UT_ASSERT_EQ(symlink(held, f.claim), 0);
+			break;
+		case 5:
+			UT_ASSERT_EQ(unlink(f.claim), 0);
+			UT_ASSERT_EQ(mkfifo(f.claim, 0600), 0);
+			break;
+		case 6:
+			UT_ASSERT_EQ(unlink(f.generation_wal), 0);
+			UT_ASSERT_EQ(mkfifo(f.generation_wal, 0600), 0);
+			break;
+		case 7:
+			UT_ASSERT_EQ(chmod(f.generation, 0770), 0);
+			break;
+		case 8:
+			fake_v2_ref.timeline++;
+			break;
+		}
+		UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+		alarm(10); /* Test-only watchdog: malformed filesystem input cannot hang. */
+		UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &f.request, &needs, &reason),
+					 CLUSTER_WAL_GUARD_BLOCKED);
+		alarm(0);
+		UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_OBJECT_STALE);
+		UT_ASSERT_EQ(guard.source_dir_handle, -1);
+		UT_ASSERT_EQ(guard.source_handle, -1);
+		UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+					 CLUSTER_WALR_RELEASE_NOT_HELD);
+		UT_ASSERT_EQ(access(f.flat_wal, F_OK), 0);
+		if (which == 3) {
+			UT_ASSERT_EQ(unlink(f.generation), 0);
+			UT_ASSERT_EQ(rename(held, f.generation), 0);
+		} else if (which == 4) {
+			UT_ASSERT_EQ(unlink(f.claim), 0);
+			UT_ASSERT_EQ(rename(held, f.claim), 0);
+		} else if (which == 5) {
+			UT_ASSERT_EQ(unlink(f.claim), 0);
+			v2_reuse_write_claim(&f, f.claim_bytes);
+		} else if (which == 7)
+			UT_ASSERT_EQ(chmod(f.generation, 0700), 0);
+		v2_reuse_fixture_cleanup(&f);
+	}
+}
+
+static void
+v2_reuse_arm(V2ReuseFixture *f, ClusterWalReuseActionGuard *guard)
+{
+	ClusterWalReuseDenyReason reason;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(guard, &f->request, &needs, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(guard->pre_action_stamp.generation_claim_length, CLUSTER_WAL_CLAIM_V2_BYTES);
+	UT_ASSERT(
+		memcmp(guard->pre_action_stamp.generation_claim, f->claim_bytes, sizeof(f->claim_bytes))
+		== 0);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(guard, NULL, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	fake_acquire_result_count = 1;
+	fake_acquire_results[0] = CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(guard, NULL, NULL, &reason), CLUSTER_WAL_GUARD_OK);
+}
+
+UT_TEST(test_v2_reuse_claim_change_blocks_every_physical_recheck)
+{
+	for (int which = 0; which < 4; ++which) {
+		V2ReuseFixture f;
+		ClusterWalReuseActionGuard guard = { 0 };
+		ClusterWalReuseDenyReason reason;
+		ClusterWalTerminalOutcome outcome;
+		ClusterWalFileIdentity destination;
+		ClusterWalReusePhysicalAction physical
+			= which == 2 ? CLUSTER_WAL_PHYSICAL_RECYCLE : CLUSTER_WAL_PHYSICAL_REMOVE;
+		uint8 changed[CLUSTER_WAL_CLAIM_V2_BYTES];
+
+		v2_reuse_fixture(&f);
+		v2_reuse_arm(&f, &guard);
+		if (which != 0)
+			UT_ASSERT_EQ(cluster_wal_reuse_guard_l3_begin(&guard, physical, &reason),
+						 CLUSTER_WAL_GUARD_OK);
+		memcpy(changed, f.claim_bytes, sizeof(changed));
+		changed[32] ^= 1;
+		v2_reuse_write_claim(&f, changed);
+		if (which == 0)
+			UT_ASSERT_EQ(cluster_wal_reuse_guard_l3_begin(&guard, physical, &reason),
+						 CLUSTER_WAL_GUARD_BLOCKED);
+		else if (which == 1)
+			UT_ASSERT_EQ(cluster_wal_reuse_guard_remove(&guard, &reason),
+						 CLUSTER_WAL_GUARD_BLOCKED);
+		else if (which == 2) {
+			destination = f.request.file;
+			destination.segno = 8;
+			UT_ASSERT_EQ(cluster_wal_reuse_guard_recycle(&guard, &destination, &reason),
+						 CLUSTER_WAL_GUARD_BLOCKED);
+		} else
+			UT_ASSERT_EQ(cluster_wal_reuse_guard_confirm_zero_mutation(&guard, physical, &reason),
+						 CLUSTER_WAL_GUARD_BLOCKED);
+		UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_OBJECT_STALE);
+		UT_ASSERT_EQ(access(f.generation_wal, F_OK), 0);
+		UT_ASSERT_EQ(access(f.flat_wal, F_OK), 0);
+		v2_reuse_write_claim(&f, f.claim_bytes);
+		if (which != 0)
+			UT_ASSERT_EQ(cluster_wal_reuse_guard_confirm_zero_mutation(&guard, physical, &reason),
+						 CLUSTER_WAL_GUARD_OK);
+		UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+					 CLUSTER_WALR_RELEASE_CONFIRMED);
+		UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_UNCHANGED);
+		v2_reuse_fixture_cleanup(&f);
+	}
+}
+
+UT_TEST(test_v2_reuse_removes_only_held_generation_object)
+{
+	V2ReuseFixture f;
+	ClusterWalReuseActionGuard guard = { 0 };
+	ClusterWalReuseDenyReason reason;
+	ClusterWalTerminalOutcome outcome;
+	char held[MAXPGPATH], held_wal[MAXPGPATH], held_claim[MAXPGPATH];
+	char wal_name[MAXFNAMELEN];
+
+	v2_reuse_fixture(&f);
+	v2_reuse_arm(&f, &guard);
+	XLogFileName(wal_name, 1, 1, TEST_WAL_SEG_SIZE);
+	snprintf(held, sizeof(held), "%s.held", f.generation);
+	snprintf(held_wal, sizeof(held_wal), "%s/%s", held, wal_name);
+	snprintf(held_claim, sizeof(held_claim), "%s/pgrac_thread.claim", held);
+	UT_ASSERT_EQ(rename(f.generation, held), 0);
+	UT_ASSERT_EQ(mkdir(f.generation, 0700), 0);
+	write_test_wal_segment(f.generation, 1, 1, f.generation_wal, sizeof(f.generation_wal));
+	v2_reuse_write_claim(&f, f.claim_bytes);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_l3_begin(&guard, CLUSTER_WAL_PHYSICAL_REMOVE, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_remove(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(access(held_wal, F_OK), -1);
+	UT_ASSERT_EQ(errno, ENOENT);
+	UT_ASSERT_EQ(access(f.generation_wal, F_OK), 0);
+	UT_ASSERT_EQ(access(f.flat_wal, F_OK), 0);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_bookkeep(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_REMOVED);
+	UT_ASSERT_EQ(unlink(held_claim), 0);
+	UT_ASSERT_EQ(rmdir(held), 0);
+	v2_reuse_fixture_cleanup(&f);
 }
 
 static bool
@@ -833,6 +1416,150 @@ UT_TEST(test_walr_resource_encoding_refuses_invalid_thread)
 	UT_ASSERT_FALSE(cluster_wal_retention_resid_encode(1, NULL));
 }
 
+/* PGRAC: a v2 claim CRC does not prove a usable retention pin. Actual root
+ * revalidation remains required after the grant. Author: SqlRush. */
+UT_TEST(test_v2_pin_key_preserves_root_revalidation)
+{
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterWalRetentionPin *pin = NULL;
+
+	request.duty.thread_claim_crc32c = 0;
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_NOT_NULL(pin);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	fake_root_current = false;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_NULL(pin);
+	cluster_shared_config = false;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_NULL(pin);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_v2_pin_and_borrowed_publisher_refuse_rebuilding_walr)
+{
+	for (int sealed = 0; sealed < 2; sealed++) {
+		ClusterWalRetentionInterval interval = { .thread_id = 1,
+												 .tli = 1,
+												 .start_lsn = TEST_WAL_SEG_SIZE,
+												 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+		ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+		ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+		ClusterWalRetentionPin *pin = NULL;
+		ClusterWalRootPublishGuard *publisher = NULL;
+
+		reset_pin_fakes();
+		cluster_shared_config = true;
+		UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+		if (sealed)
+			UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+		fake_control_owner_current = false;
+		if (sealed) {
+			UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(&request.root_read, true,
+																		&publisher),
+						 CLUSTER_WAL_PIN_STALE);
+			if (publisher != NULL)
+				(void)cluster_wal_retention_root_publish_end(&publisher);
+		} else
+			UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_STALE);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	}
+	reset_pin_fakes();
+}
+
+UT_TEST(test_v2_physical_reuse_requires_current_walr_not_held_boolean)
+{
+	V2ReuseFixture f;
+	ClusterWalReuseActionGuard guard = { 0 };
+	ClusterWalReuseDenyReason reason;
+	ClusterWalTerminalOutcome outcome;
+	ClusterWalReuseGuardResult l3_result;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+
+	v2_reuse_fixture(&f);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &f.request, &needs, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(&guard, NULL, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, NULL, NULL, &reason), CLUSTER_WAL_GUARD_OK);
+	fake_control_owner_current = false;
+	l3_result = cluster_wal_reuse_guard_l3_begin(&guard, CLUSTER_WAL_PHYSICAL_REMOVE, &reason);
+	UT_ASSERT_EQ(l3_result, CLUSTER_WAL_GUARD_BLOCKED);
+	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_GES_UNAVAILABLE);
+	UT_ASSERT_EQ(access(f.generation_wal, F_OK), 0);
+	if (l3_result == CLUSTER_WAL_GUARD_OK)
+		(void)cluster_wal_reuse_guard_confirm_zero_mutation(&guard, CLUSTER_WAL_PHYSICAL_REMOVE,
+															&reason);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	v2_reuse_fixture_cleanup(&f);
+}
+
+UT_TEST(test_v2_upgraded_pin_requires_its_exact_current_x_owner)
+{
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+	ClusterWalRetentionPin *pin = NULL;
+	ClusterWalReuseActionGuard guard;
+	ClusterWalReuseDenyReason reason;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	prepare_bound_recovery_guard(&guard, &request);
+	fake_s5_result = CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, &serial, pin, &reason), CLUSTER_WAL_GUARD_OK);
+	fake_control_owner_mode = ExclusiveLock;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_OK);
+	guard.walr.acquire_request.control_owner_id++;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_STALE);
+	guard.walr.acquire_request.control_owner_id--;
+	if (fake_resource_release_callback != NULL)
+		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+									   fake_resource_release_arg);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_root_publisher_requires_resource_owner)
+{
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterWalRootPublishGuard *publisher = NULL;
+	ResourceOwner saved_owner = CurrentResourceOwner;
+
+	reset_pin_fakes();
+	CurrentResourceOwner = NULL;
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, false, &publisher),
+		CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_NULL(publisher);
+	UT_ASSERT_EQ(fake_acquire_call_count, 0);
+	CurrentResourceOwner = saved_owner;
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, false, &publisher),
+		CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_NOT_NULL(publisher);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_NULL(publisher);
+}
+
 UT_TEST(test_pin_one_thread_acquire_and_confirmed_release)
 {
 	ClusterWalRetentionInterval interval = { .thread_id = 1,
@@ -1000,6 +1727,135 @@ UT_TEST(test_unbound_pin_has_pre_ir_slow_revalidation_only)
 	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 }
 
+UT_TEST(test_cold_borrow_returns_original_complete_set_without_acquiring)
+{
+	for (uint16 n = 1; n <= 2; n++) {
+		ClusterWalRetentionInterval intervals[2]
+			= { { 1, 0, 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2 },
+				{ 2, 0, 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2 } };
+		ClusterWalRetentionPinThreadRequest requests[2]
+			= { make_pin_request(1, &intervals[0], 1), make_pin_request(2, &intervals[1], 1) };
+		ClusterRecoverySerialGuardSet set = { 0 };
+		ClusterRecoverySerialGuard *borrowed[2] = { NULL, NULL };
+		ClusterWalRetentionPin *pin = NULL, *borrowed_pin = NULL;
+		uint16 count = 77;
+
+		reset_pin_fakes();
+		cluster_shared_config = true;
+		set.count = n;
+		for (uint16 i = 0; i < n; i++) {
+			set.guards[i] = make_serial_guard(&requests[i]);
+			set.guards[i].mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		}
+		UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(requests, n, &pin), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(n == 1 ? cluster_wal_retention_pin_bind_one(pin, &set.guards[0])
+							: cluster_wal_retention_pin_bind_set(pin, &set),
+					 CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_borrow_cold_v1(&borrowed_pin, borrowed, 2, &count),
+					 CLUSTER_WAL_PIN_OK);
+		UT_ASSERT(borrowed_pin == pin);
+		UT_ASSERT_EQ(count, n);
+		for (uint16 i = 0; i < n; i++)
+			UT_ASSERT(borrowed[i] == &set.guards[i]);
+		UT_ASSERT_EQ(fake_acquire_call_count, n);
+		UT_ASSERT_EQ(fake_release_call_count, 0);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+		UT_ASSERT_EQ(fake_release_call_count, n);
+		/* Borrowing never owns or releases the original IR guards. */
+		UT_ASSERT(set.guards[0].held);
+	}
+}
+
+UT_TEST(test_cold_borrow_never_exports_a_partial_or_stale_set)
+{
+	for (int variant = 0; variant < 6; variant++) {
+		ClusterWalRetentionInterval intervals[2]
+			= { { 1, 0, 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2 },
+				{ 2, 0, 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2 } };
+		ClusterWalRetentionPinThreadRequest requests[2]
+			= { make_pin_request(1, &intervals[0], 1), make_pin_request(2, &intervals[1], 1) };
+		ClusterRecoverySerialGuardSet set = { 0 };
+		ClusterRecoverySerialGuard *borrowed[2] = { NULL, NULL };
+		ClusterWalRetentionPin *pin = NULL, *borrowed_pin = NULL;
+		uint16 count = 77;
+
+		reset_pin_fakes();
+		cluster_shared_config = true;
+		set.count = 2;
+		for (uint16 i = 0; i < 2; i++) {
+			set.guards[i] = make_serial_guard(&requests[i]);
+			set.guards[i].mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		}
+		UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(requests, 2, &pin), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_bind_set(pin, &set), CLUSTER_WAL_PIN_OK);
+		if (variant == 0)
+			set.guards[1].held = false;
+		if (variant == 1)
+			set.guards[1].mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+		if (variant == 2)
+			set.guards[1].root_read_token.record_crc32c++;
+		if (variant == 3)
+			fake_serial_result = CLUSTER_RECOVERY_SERIAL_FENCE_STALE;
+		if (variant == 4)
+			fake_control_owner_stale_thread = 2;
+		if (variant == 5)
+			set.count = 1;
+		UT_ASSERT(cluster_wal_retention_pin_borrow_cold_v1(&borrowed_pin, borrowed, 2, &count)
+				  != CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_NULL(borrowed_pin);
+		UT_ASSERT_NULL(borrowed[0]);
+		UT_ASSERT_NULL(borrowed[1]);
+		UT_ASSERT_EQ(count, 77);
+		UT_ASSERT_EQ(fake_acquire_call_count, 2);
+		UT_ASSERT_EQ(fake_release_call_count, 0);
+		fake_serial_result = CLUSTER_RECOVERY_SERIAL_CURRENT;
+		fake_control_owner_stale_thread = 0;
+		UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	}
+}
+
+UT_TEST(test_cold_borrow_preserves_the_original_owner_and_closed_phase)
+{
+	for (int variant = 0; variant < 7; variant++) {
+		ClusterWalRetentionInterval interval
+			= { 1, 0, 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2 };
+		ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+		ClusterRecoverySerialGuard guard = make_serial_guard(&request), *borrowed = NULL;
+		ClusterWalRetentionPin *pin = NULL, *borrowed_pin = NULL;
+		ResourceOwner owner;
+		uint16 count = 77;
+
+		reset_pin_fakes();
+		cluster_shared_config = true;
+		owner = CurrentResourceOwner;
+		guard.mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
+		UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+		if (variant != 0)
+			UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &guard), CLUSTER_WAL_PIN_OK);
+		if (variant == 1)
+			UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+		if (variant == 2)
+			CurrentResourceOwner = (ResourceOwner)(uintptr_t)0x2222;
+		if (variant == 3)
+			MyProcPid++;
+		if (variant == 4)
+			UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+		if (variant == 6)
+			cluster_shared_config = false;
+		UT_ASSERT(cluster_wal_retention_pin_borrow_cold_v1(&borrowed_pin, &borrowed,
+														   variant == 5 ? 0 : 1, &count)
+				  != CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_NULL(borrowed_pin);
+		UT_ASSERT_NULL(borrowed);
+		UT_ASSERT_EQ(count, 77);
+		CurrentResourceOwner = owner;
+		if (variant == 3)
+			MyProcPid--;
+		if (pin != NULL)
+			UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	}
+}
+
 UT_TEST(test_pin_revalidation_drift_poisoned_until_release)
 {
 	ClusterWalRetentionInterval interval = { .thread_id = 1,
@@ -1043,6 +1899,7 @@ UT_TEST(test_sealed_pin_root_publish_requires_whole_root_token)
 	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(&drifted_root, true, &publisher),
 				 CLUSTER_WAL_PIN_STALE);
 	UT_ASSERT_NULL(publisher);
+	serial.held = false;
 	UT_ASSERT_EQ(
 		cluster_wal_retention_root_publish_begin_exact(&request.root_read, true, &publisher),
 		CLUSTER_WAL_PIN_OK);
@@ -1072,6 +1929,235 @@ make_pin_root_snapshot(const ClusterWalRetentionPinThreadRequest *request,
 	root.tail_last_record_lsn = interval->end_lsn - 64;
 	root.tail_last_record_crc32c = 12;
 	return root;
+}
+
+UT_TEST(test_sealed_publisher_revalidates_only_after_exact_ir_release)
+{
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+	ClusterWalRetentionPin *pin = NULL;
+	ClusterWalRootPublishGuard *publisher = NULL;
+	ClusterControlRootReadToken drifted = request.root_read;
+	reset_pin_fakes();
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, true, &publisher),
+		CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_NULL(publisher);
+	UT_ASSERT_EQ(fake_acquire_call_count, 1); /* never try X while IR is held */
+	if (publisher != NULL)
+		(void)cluster_wal_retention_root_publish_end(&publisher);
+	serial.held = false;
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, true, &publisher),
+		CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(fake_acquire_call_count, 2);
+	UT_ASSERT_EQ(fake_acquire_requests[1].op, CLUSTER_LOCK_OP_CONVERT);
+	UT_ASSERT_EQ(fake_acquire_requests[1].current_mode, ShareLock);
+	UT_ASSERT_EQ(fake_acquire_requests[1].lockmode, ExclusiveLock);
+	UT_ASSERT(fake_acquire_requests[1].dontwait);
+	UT_ASSERT_TRUE(
+		cluster_wal_retention_root_publish_sealed_current(publisher, &request.root_read));
+	serial.release_uncertain = true;
+	UT_ASSERT_FALSE(
+		cluster_wal_retention_root_publish_sealed_current(publisher, &request.root_read));
+	serial.release_uncertain = false;
+	drifted.file_txn_seq++;
+	UT_ASSERT_FALSE(cluster_wal_retention_root_publish_sealed_current(publisher, &drifted));
+	UT_ASSERT_FALSE(cluster_wal_retention_root_publish_sealed_current(NULL, &request.root_read));
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(fake_acquire_call_count, 3);
+	UT_ASSERT_EQ(fake_acquire_requests[2].lockmode, ShareLock);
+	UT_ASSERT_EQ(fake_native_release_call_count, 2); /* temporary X and extra S */
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+}
+
+UT_TEST(test_sealed_shared_publisher_requires_its_exact_converted_owner)
+{
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+	ClusterWalRetentionPin *pin = NULL;
+	ClusterWalRootPublishGuard *publisher = NULL;
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+	serial.held = false;
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, true, &publisher),
+		CLUSTER_WAL_PIN_OK);
+	fake_control_owner_mode = ExclusiveLock; /* the old S identity is no longer usable */
+	UT_ASSERT(cluster_wal_retention_root_publish_sealed_current(publisher, &request.root_read));
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_INVALID);
+	UT_ASSERT_EQ(fake_release_call_count, 0);
+	fake_control_owner_current = false;
+	UT_ASSERT_FALSE(
+		cluster_wal_retention_root_publish_sealed_current(publisher, &request.root_read));
+	fake_control_owner_current = true;
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	fake_control_owner_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(fake_release_call_count, 1);
+	UT_ASSERT_EQ(fake_native_release_call_count, 3);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_sealed_publish_contention_preserves_pin_and_retries_original_holder)
+{
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+	ClusterWalRetentionPin *pin = NULL;
+	ClusterWalRootPublishGuard *publisher = NULL;
+	reset_pin_fakes();
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+	serial.held = false;
+	/* Model B retaining S across DATA after A releases IR. The actual
+	 * stable-owner/native exclusion interleaving is in control_walr. */
+	fake_native_acquire_result = LOCKACQUIRE_NOT_AVAIL;
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, true, &publisher),
+		CLUSTER_WAL_PIN_UNAVAILABLE);
+	UT_ASSERT_NULL(publisher);
+	UT_ASSERT_EQ(fake_native_acquire_call_count, 2);
+	UT_ASSERT_EQ(fake_release_call_count, 0);
+	if (publisher != NULL)
+		(void)cluster_wal_retention_root_publish_end(&publisher);
+	fake_native_acquire_result = LOCKACQUIRE_OK;
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, true, &publisher),
+		CLUSTER_WAL_PIN_OK);
+	UT_ASSERT(cluster_wal_retention_root_publish_sealed_current(publisher, &request.root_read));
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(fake_release_call_count, 1); /* same coordinated holder */
+	UT_ASSERT_EQ(fake_native_release_call_count, 3);
+}
+
+UT_TEST(test_sealed_publish_error_cleanup_owns_conversion_and_pin)
+{
+	for (int after_x = 0; after_x < 2; after_x++) {
+		ClusterWalRetentionInterval interval = { .thread_id = 1,
+												 .tli = 1,
+												 .start_lsn = TEST_WAL_SEG_SIZE,
+												 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+		ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+		ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+		ClusterWalRetentionPin *pin = NULL;
+		ClusterWalRootPublishGuard *publisher = NULL;
+		volatile bool caught = false;
+		reset_pin_fakes();
+		UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+		serial.held = false;
+		fake_acquire_error_at = after_x ? 0 : 2;
+		PG_TRY();
+		{
+			UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(&request.root_read, true,
+																		&publisher),
+						 CLUSTER_WAL_PIN_OK);
+			if (after_x)
+				pg_re_throw(); /* CF/CAS/readback ERROR after the exclusive handoff */
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+									   fake_resource_release_arg);
+		UT_ASSERT_FALSE(cluster_wal_retention_active_pin_present());
+		UT_ASSERT_EQ(fake_release_call_count, 1);
+		UT_ASSERT_EQ(fake_native_release_call_count, after_x ? 2 : 1);
+	}
+}
+
+UT_TEST(test_sealed_publish_uncertain_downgrade_is_cleanup_only)
+{
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+	ClusterWalRetentionPin *pin = NULL;
+	ClusterWalRootPublishGuard *publisher = NULL;
+	reset_pin_fakes();
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+	serial.held = false;
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, true, &publisher),
+		CLUSTER_WAL_PIN_OK);
+	fake_native_acquire_result = LOCKACQUIRE_NOT_AVAIL;
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_UNCONFIRMED);
+	UT_ASSERT_NOT_NULL(publisher);
+	UT_ASSERT_FALSE(
+		cluster_wal_retention_root_publish_sealed_current(publisher, &request.root_read));
+	fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+								   fake_resource_release_arg);
+	UT_ASSERT_FALSE(cluster_wal_retention_active_pin_present());
+	UT_ASSERT_EQ(fake_release_call_count, 1);
+	UT_ASSERT_EQ(fake_native_release_call_count, 2);
+}
+
+UT_TEST(test_sealed_publisher_rechecks_formation_and_fence_without_cf)
+{
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+	ClusterWalRetentionPin *pin = NULL;
+	ClusterWalRootPublishGuard *publisher = NULL;
+	reset_pin_fakes();
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+	serial.held = false;
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, true, &publisher),
+		CLUSTER_WAL_PIN_OK);
+	fake_root_current = false; /* The caller holds CF; no nested root read allowed. */
+	UT_ASSERT_TRUE(
+		cluster_wal_retention_root_publish_sealed_current(publisher, &request.root_read));
+	fake_formation_current = false;
+	UT_ASSERT_FALSE(
+		cluster_wal_retention_root_publish_sealed_current(publisher, &request.root_read));
+	fake_formation_current = true;
+	fake_admission_current = false;
+	UT_ASSERT_FALSE(
+		cluster_wal_retention_root_publish_sealed_current(publisher, &request.root_read));
+	fake_admission_current = true;
+	UT_ASSERT_TRUE(
+		cluster_wal_retention_root_publish_sealed_current(publisher, &request.root_read));
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 }
 
 UT_TEST(test_sealed_pin_adopts_same_immutable_root_readback)
@@ -2084,14 +3170,412 @@ UT_TEST(test_fold_empty_open_interval_is_not_bounded)
 	UT_ASSERT_EQ(fold.nintervals, 0);
 }
 
+static ClusterWalRetentionPinThreadRequest
+make_pending_pin_request(void)
+{
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, NULL, 0);
+	cluster_shared_config = true;
+	memset(&request.root_read, 0, sizeof(request.root_read));
+	request.pending.file.system_identifier = request.duty.system_identifier;
+	memcpy(request.pending.file.authority_uuid, request.duty.authority_uuid, 16);
+	request.pending.file.format_version = 3;
+	request.pending.file.record_count = 128;
+	request.pending.file.activation_state = CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE;
+	request.pending.file.file_txn_seq = 77;
+	memset(request.pending.file.image_sha256, 0x21, 32);
+	request.pending.generation = 76;
+	memset(request.pending.sha256, 0x31, 32);
+	memset(request.pending.operation_uuid, 0x41, 16);
+	memset(&fake_pending_subject, 0, sizeof(fake_pending_subject));
+	fake_pending_subject.kind = CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER;
+	fake_pending_subject.duty = request.duty;
+	fake_pending_subject.pending = request.pending;
+	return request;
+}
+
+UT_TEST(test_pending_pin_protects_input_without_fake_checkpoint_interval)
+{
+	ClusterWalRetentionPinThreadRequest request;
+	ClusterWalRetentionPin *pin = NULL;
+	ClusterRecoverySerialGuard serial;
+	ClusterWalRootPublishGuard *publisher = NULL;
+	reset_pin_fakes();
+	request = make_pending_pin_request();
+	serial = make_serial_guard(&request);
+	serial.mode = CLUSTER_RECOVERY_SERIAL_INITIALIZER;
+	serial.pending = request.pending;
+	serial.lock_request.request_id = 1234;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(fake_acquire_call_count, 1);
+	if (pin != NULL) {
+		UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_pending_publish_begin(&request.duty, &request.pending,
+																 &publisher),
+					 CLUSTER_WAL_PIN_STALE);
+		serial.held = false;
+		serial.release_uncertain = true;
+		UT_ASSERT_EQ(cluster_wal_retention_pending_publish_begin(&request.duty, &request.pending,
+																 &publisher),
+					 CLUSTER_WAL_PIN_STALE);
+		serial.release_uncertain = false;
+		UT_ASSERT_EQ(cluster_wal_retention_pending_publish_begin(&request.duty, &request.pending,
+																 &publisher),
+					 CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_TRUE(cluster_wal_retention_pending_publish_current(publisher, &request.duty,
+																	 &request.pending));
+		UT_ASSERT_EQ(fake_acquire_call_count, 1);
+		request.pending.operation_uuid[0] ^= 1;
+		UT_ASSERT_FALSE(cluster_wal_retention_pending_publish_current(publisher, &request.duty,
+																	  &request.pending));
+		request.pending.operation_uuid[0] ^= 1;
+		fake_control_owner_current = false;
+		UT_ASSERT_FALSE(cluster_wal_retention_pending_publish_current(publisher, &request.duty,
+																	  &request.pending));
+		fake_control_owner_current = true;
+		fake_admission_current = false;
+		UT_ASSERT_FALSE(cluster_wal_retention_pending_publish_current(publisher, &request.duty,
+																	  &request.pending));
+		fake_admission_current = true;
+		UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+					 CLUSTER_WALR_RELEASE_CONFIRMED);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pending_pin_refuses_stale_or_mixed_inputs_before_retaining_owner)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		ClusterWalRetentionPinThreadRequest request;
+		ClusterWalRetentionPin *pin = NULL;
+		reset_pin_fakes();
+		request = make_pending_pin_request();
+		switch (fault) {
+		case 0:
+			request.root_read.file_txn_seq = 1;
+			break;
+		case 1:
+			request.nintervals = 1;
+			break;
+		case 2:
+			request.pending.operation_uuid[0] ^= 1;
+			break;
+		case 3:
+			fake_pending_subject.kind = CLUSTER_CONTROL_RECOVERY_CURRENT_CHECKPOINT;
+			break;
+		case 4:
+			fake_pending_subject.duty.origin_owner_incarnation++;
+			break;
+		case 5:
+			fake_pending_subject.pending.file.image_sha256[0] ^= 1;
+			break;
+		case 6:
+			fake_formation_current = false;
+			break;
+		case 7:
+			fake_admission_current = false;
+			break;
+		}
+		UT_ASSERT(cluster_wal_retention_pin_acquire(&request, 1, &pin) != CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_NULL(pin);
+		UT_ASSERT_EQ(fake_acquire_call_count, fault < 2 ? 0 : 1);
+		UT_ASSERT_EQ(fake_release_call_count, fake_acquire_call_count);
+		UT_ASSERT_FALSE(cluster_wal_retention_active_pin_present());
+		cluster_shared_config = false;
+	}
+}
+
+UT_TEST(test_read_pin_covers_sorted_threads_without_recovery_authority)
+{
+	uint16 threads[] = { 1, 3 };
+	ClusterWalReadPinV1 *pin = NULL;
+
+	reset_pin_fakes();
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_INVALID);
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_NOT_NULL(pin);
+	UT_ASSERT_EQ(fake_acquire_call_count, 2);
+	UT_ASSERT_EQ(fake_native_acquire_call_count, 2);
+	UT_ASSERT_EQ(fake_acquire_requests[0].resid.field1, 1);
+	UT_ASSERT_EQ(fake_acquire_requests[1].resid.field1, 3);
+	UT_ASSERT_EQ(fake_acquire_requests[1].lockmode, ShareLock);
+	UT_ASSERT(fake_acquire_requests[1].dontwait);
+	UT_ASSERT(cluster_wal_read_pin_covers_v1(pin, 1));
+	UT_ASSERT(cluster_wal_read_pin_covers_v1(pin, 3));
+	UT_ASSERT_FALSE(cluster_wal_read_pin_covers_v1(pin, 2));
+	UT_ASSERT_FALSE(cluster_wal_retention_active_pin_present());
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_NULL(pin);
+	UT_ASSERT_EQ(fake_release_call_count, 2);
+	UT_ASSERT_EQ(fake_release_threads[0], 3);
+	UT_ASSERT_EQ(fake_release_threads[1], 1);
+	UT_ASSERT_EQ(fake_native_release_call_count, 2);
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_NOT_HELD);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_released_read_census_allows_real_e1_gc_owner_to_progress)
+{
+	V2ReuseFixture f;
+	uint16 threads[] = { 1, 3 };
+	v2_reuse_fixture(&f);
+	for (int retry = 0; retry < 10; retry++) {
+		ClusterWalReadPinV1 *pin = NULL;
+		ClusterWalRetentionE1Context context = { 0 };
+		ClusterWalRootFoldResult fold;
+		ClusterWalReuseDenyReason reason;
+		XLogSegNo floor;
+		UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_begin(&context, 1, &fold, &floor, &reason),
+					 CLUSTER_WAL_GUARD_INVALID);
+		UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_GUARD_STATE);
+		UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+		UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_begin(&context, 1, &fold, &floor, &reason),
+					 CLUSTER_WAL_GUARD_OK);
+		UT_ASSERT(context.coarse_walr.held && context.coarse_walr.mode == ExclusiveLock);
+		UT_ASSERT_EQ(fold, CLUSTER_WAL_FOLD_BOUNDED);
+		UT_ASSERT_EQ(floor, 4);
+		UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_release(&context, &reason),
+					 CLUSTER_WALR_RELEASE_CONFIRMED);
+		cluster_wal_retention_e1_finish(&context);
+	}
+	v2_reuse_fixture_cleanup(&f);
+}
+
+UT_TEST(test_read_pin_rejects_bad_shape_and_rolls_back_partial_grants)
+{
+	uint16 threads[] = { 1, 3 };
+	const uint16 invalid[][2] = { { 0, 3 }, { 3, 1 }, { 1, 1 }, { 1, 129 } };
+	ClusterWalReadPinV1 *pin = NULL;
+	ResourceOwner saved = CurrentResourceOwner;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	for (int i = 0; i < lengthof(invalid); i++)
+		UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(invalid[i], 2, &pin), CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(NULL, 2, &pin), CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 0, &pin), CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 129, &pin), CLUSTER_WAL_PIN_INVALID);
+	CurrentResourceOwner = NULL;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_INVALID);
+	CurrentResourceOwner = saved;
+	UT_ASSERT_EQ(fake_acquire_call_count, 0);
+	fake_acquire_result_count = 2;
+	fake_acquire_results[0] = CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
+	fake_acquire_results[1] = CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_UNAVAILABLE);
+	UT_ASSERT_NULL(pin);
+	UT_ASSERT_EQ(fake_release_call_count, 1);
+	UT_ASSERT_EQ(fake_native_release_call_count, 1);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_read_pin_uncertain_release_is_cleanup_only)
+{
+	uint16 threads[] = { 1, 3 };
+	ClusterWalReadPinV1 *pin = NULL;
+	ClusterWalReadPinV1 *other = NULL;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	fake_acquire_result_count = 2;
+	fake_acquire_results[0] = CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
+	fake_acquire_results[1] = CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin),
+				 CLUSTER_WAL_PIN_RELEASE_UNCERTAIN);
+	UT_ASSERT_NOT_NULL(pin);
+	UT_ASSERT_FALSE(cluster_wal_read_pin_covers_v1(pin, 1));
+	UT_ASSERT_EQ(fake_native_release_call_count, 0);
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &other), CLUSTER_WAL_PIN_CAPACITY);
+	UT_ASSERT_NULL(other);
+	fake_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_NULL(pin);
+	UT_ASSERT_EQ(fake_native_release_call_count, 1);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_read_pin_checks_every_actual_owner_and_never_revives)
+{
+	uint16 threads[] = { 1, 3 };
+	ClusterWalReadPinV1 *pin = NULL;
+	ResourceOwner saved = CurrentResourceOwner;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_OK);
+	CurrentResourceOwner = (ResourceOwner)(uintptr_t)2;
+	UT_ASSERT_FALSE(cluster_wal_read_pin_covers_v1(pin, 1));
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_INVALID);
+	CurrentResourceOwner = saved;
+	fake_control_owner_stale_thread = 3;
+	UT_ASSERT_FALSE(cluster_wal_read_pin_covers_v1(pin, 1));
+	fake_control_owner_stale_thread = 0;
+	UT_ASSERT_FALSE(cluster_wal_read_pin_covers_v1(pin, 1));
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	fake_control_owner_current = false;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_NULL(pin);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_read_pin_exact_publisher_borrow_cannot_release_or_seal_scope)
+{
+	uint16 threads[] = { 1, 3 };
+	ClusterWalReadPinV1 *pin = NULL;
+	ClusterWalRootPublishGuard *publisher = NULL;
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterControlRootReadToken token = request.root_read;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(&token, true, &publisher),
+				 CLUSTER_WAL_PIN_STALE);
+	token.origin_thread_id = 2;
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(&token, false, &publisher),
+				 CLUSTER_WAL_PIN_STALE);
+	token = request.root_read;
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(&token, false, &publisher),
+				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(fake_acquire_call_count, 2);
+	UT_ASSERT_FALSE(cluster_wal_retention_root_publish_sealed_current(publisher, &token));
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_INVALID);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(fake_release_call_count, 0);
+	UT_ASSERT(cluster_wal_read_pin_covers_v1(pin, 1));
+	fake_control_owner_stale_thread = 3;
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(&token, false, &publisher),
+				 CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_NULL(publisher);
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_read_pin_cannot_overlap_other_retention_owners)
+{
+	uint16 thread = 1;
+	ClusterWalReadPinV1 *pin = NULL;
+	ClusterWalRetentionPin *recovery = NULL;
+	ClusterWalRootPublishGuard *publisher = NULL;
+	ClusterWalRetentionE1Context e1 = { 0 };
+	ClusterWalRootFoldResult fold;
+	XLogSegNo floor;
+	ClusterWalReuseDenyReason reason;
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &recovery), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(&thread, 1, &pin), CLUSTER_WAL_PIN_CAPACITY);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&recovery), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, false, &publisher),
+		CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(&thread, 1, &pin), CLUSTER_WAL_PIN_CAPACITY);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(&thread, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &recovery),
+				 CLUSTER_WAL_PIN_CAPACITY);
+	UT_ASSERT_NULL(recovery);
+	UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_begin(&e1, 1, &fold, &floor, &reason),
+				 CLUSTER_WAL_GUARD_INVALID);
+	UT_ASSERT_EQ(fake_acquire_call_count, 3);
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_read_pin_resource_owner_cleans_error_and_publisher_borrow)
+{
+	uint16 threads[] = { 1, 3 };
+	ClusterWalReadPinV1 *pin = NULL;
+	ClusterWalRootPublishGuard *publisher = NULL;
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	volatile bool caught = false;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	fake_acquire_error_at = 2;
+	PG_TRY();
+	{
+		(void)cluster_wal_read_pin_acquire_v1(threads, 2, &pin);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_NOT_NULL(fake_resource_release_callback);
+	fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+								   fake_resource_release_arg);
+	UT_ASSERT_EQ(fake_release_call_count, 1);
+	UT_ASSERT_EQ(fake_native_release_call_count, 1);
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, false, &publisher),
+		CLUSTER_WAL_PIN_OK);
+	fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true, false,
+								   fake_resource_release_arg);
+	UT_ASSERT_EQ(fake_release_call_count, 2);
+	UT_ASSERT_EQ(fake_native_release_call_count, 2);
+	/* Abort cleanup owns the released objects; caller copies cannot revive them. */
+	UT_ASSERT_FALSE(cluster_wal_read_pin_covers_v1(pin, 1));
+	pin = NULL;
+	UT_ASSERT_EQ(cluster_wal_read_pin_acquire_v1(threads, 2, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_read_pin_release_v1(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	reset_pin_fakes();
+}
+
 int
 main(int argc, char **argv)
 {
+	setvbuf(stdout, NULL, _IONBF, 0);
 	if (argc > 1 && strcmp(argv[1], "--fixture-wal") == 0)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(39);
+	UT_PLAN(73);
+	UT_RUN(test_cold_borrow_returns_original_complete_set_without_acquiring);
+	UT_RUN(test_cold_borrow_never_exports_a_partial_or_stale_set);
+	UT_RUN(test_cold_borrow_preserves_the_original_owner_and_closed_phase);
+	UT_RUN(test_released_read_census_allows_real_e1_gc_owner_to_progress);
+	UT_RUN(test_read_pin_covers_sorted_threads_without_recovery_authority);
+	UT_RUN(test_read_pin_rejects_bad_shape_and_rolls_back_partial_grants);
+	UT_RUN(test_read_pin_uncertain_release_is_cleanup_only);
+	UT_RUN(test_read_pin_checks_every_actual_owner_and_never_revives);
+	UT_RUN(test_read_pin_exact_publisher_borrow_cannot_release_or_seal_scope);
+	UT_RUN(test_read_pin_cannot_overlap_other_retention_owners);
+	UT_RUN(test_read_pin_resource_owner_cleans_error_and_publisher_borrow);
+	UT_RUN(test_v2_e1_consumes_current_root_and_preserves_exact_floor);
+	UT_RUN(test_v2_retention_zero_crc_is_not_absent_authority);
+	UT_RUN(test_v2_retention_refuses_checkpoint_future_and_wrong_purpose);
+	UT_RUN(test_v2_retention_revalidates_root_after_walr_x);
+	UT_RUN(test_v2_reuse_selects_exact_generation_not_flat_decoy);
+	UT_RUN(test_v2_reuse_terminal_history_blocks_until_consumer_closes);
+	UT_RUN(test_v2_reuse_missing_native_ref_cannot_fallback_flat);
+	UT_RUN(test_v2_reuse_rejects_unproven_namespace_and_claim);
+	UT_RUN(test_v2_reuse_claim_change_blocks_every_physical_recheck);
+	UT_RUN(test_v2_reuse_removes_only_held_generation_object);
 	UT_RUN(test_layout_contracts);
 	UT_RUN(test_thread_directory_exact_parse);
 	UT_RUN(test_wal_basename_exact_parse);
@@ -2103,12 +3587,23 @@ main(int argc, char **argv)
 	UT_RUN(test_walr_resource_encoding_refuses_invalid_thread);
 	UT_RUN(test_reuse_guard_preflight_stamps_folds_and_builds_needset);
 	UT_RUN(test_pin_one_thread_acquire_and_confirmed_release);
+	UT_RUN(test_root_publisher_requires_resource_owner);
+	UT_RUN(test_v2_pin_key_preserves_root_revalidation);
+	UT_RUN(test_v2_pin_and_borrowed_publisher_refuse_rebuilding_walr);
+	UT_RUN(test_v2_physical_reuse_requires_current_walr_not_held_boolean);
+	UT_RUN(test_v2_upgraded_pin_requires_its_exact_current_x_owner);
 	UT_RUN(test_pin_acquire_is_sorted_all_or_none);
 	UT_RUN(test_pin_uncertain_rollback_remains_cleanup_only);
 	UT_RUN(test_pin_bind_revalidate_and_seal_closed_fsm);
 	UT_RUN(test_unbound_pin_has_pre_ir_slow_revalidation_only);
 	UT_RUN(test_pin_revalidation_drift_poisoned_until_release);
 	UT_RUN(test_sealed_pin_root_publish_requires_whole_root_token);
+	UT_RUN(test_sealed_publisher_revalidates_only_after_exact_ir_release);
+	UT_RUN(test_sealed_shared_publisher_requires_its_exact_converted_owner);
+	UT_RUN(test_sealed_publish_contention_preserves_pin_and_retries_original_holder);
+	UT_RUN(test_sealed_publish_error_cleanup_owns_conversion_and_pin);
+	UT_RUN(test_sealed_publish_uncertain_downgrade_is_cleanup_only);
+	UT_RUN(test_sealed_publisher_rechecks_formation_and_fence_without_cf);
 	UT_RUN(test_sealed_pin_adopts_same_immutable_root_readback);
 	UT_RUN(test_sealed_pin_rejects_immutable_root_drift);
 	UT_RUN(test_pin_resource_owner_abort_releases_live_grant);
@@ -2131,6 +3626,8 @@ main(int argc, char **argv)
 	UT_RUN(test_fold_terminal_lifecycles_contribute_nothing);
 	UT_RUN(test_fold_refuses_invalid_root_shape);
 	UT_RUN(test_fold_empty_open_interval_is_not_bounded);
+	UT_RUN(test_pending_pin_protects_input_without_fake_checkpoint_interval);
+	UT_RUN(test_pending_pin_refuses_stale_or_mixed_inputs_before_retaining_owner);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

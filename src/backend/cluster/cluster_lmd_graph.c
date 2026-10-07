@@ -343,7 +343,8 @@ static bool
 vertex_metadata_equal(const ClusterLmdVertex *a, const ClusterLmdVertex *b)
 {
 	return a->xid == b->xid && a->local_start_ts_ms == b->local_start_ts_ms
-		   && a->wait_seq == b->wait_seq;
+		   && a->wait_seq == b->wait_seq
+		   && a->lock_group_procno_plus_one == b->lock_group_procno_plus_one;
 }
 
 /*

@@ -55,6 +55,24 @@
 #include "../../backend/access/heap/heapam_r4_private.h"
 
 #include "unit_test.h"
+#include "cluster_snapshot_test_stubs.h"
+#include "cluster/cluster_space_storage.h"
+#include "test_cluster_native_prehistory_proof.inc"
+
+/* The resolver fixture never enters the shared hint writer. Link the current
+ * visibility caller without manufacturing a successful SPACE mutation.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterSpaceHintResult
+cluster_space_hint_begin(Buffer buffer, RfPageProducerBatchV1 *batch)
+{
+	abort();
+}
+
+void
+cluster_space_hint_finish(Buffer buffer, bool standard, const RfPageProducerBatchV1 *batch)
+{
+	abort();
+}
 
 /* Exercise the real lossy-hint sender/receiver alongside the real resolver.
  * Function sections discard unrelated registration/shmem entry points. */
@@ -64,12 +82,17 @@ UT_DEFINE_GLOBALS();
 
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
+static sigjmp_buf ut_error_jump;
+static bool ut_error_armed;
 
 void
 pg_re_throw(void)
 {
 	if (PG_exception_stack != NULL)
 		siglongjmp(*PG_exception_stack, 1);
+	/* The outer fixture catch remains active after product PG_FINALLY. */
+	if (ut_error_armed)
+		siglongjmp(ut_error_jump, 1);
 	abort();
 }
 
@@ -168,6 +191,13 @@ static ClusterTouchKind ut_stamped_kind;
 static bool ut_memo_saw_resolve_scope;
 static bool ut_memo_hit;
 static bool ut_native_prehistory_armed;
+static bool ut_native_scratch;
+static bool ut_native_disable_at_lock;
+static bool ut_native_epoch_drift;
+static uint64 ut_native_hw;
+static uint64 ut_native_next;
+static XidStatus ut_native_status;
+static ClusterTxOutcome ut_native_deleter;
 static bool ut_slotless_bound_armed;
 static bool ut_overlay_hit;
 static ClusterTTStatus ut_overlay_status;
@@ -218,8 +248,6 @@ static uint64 ut_current_epoch;
 static int ut_native_calls;
 static int ut_hint_mutations;
 static int ut_live_cr_gate_calls;
-static sigjmp_buf ut_error_jump;
-static bool ut_error_armed;
 static int ut_error_level;
 static int ut_error_code;
 static char ut_error_detail[512];
@@ -336,6 +364,7 @@ ut_exact_peer_ref(void)
 static void
 ut_reset(ClusterTTStatus status, SCN scn)
 {
+	UT_ASSERT(ut_snapshot_scope == NULL);
 	cluster_vis_resolve_abort_reset();
 	cluster_page_scn_shortcut = false;
 	MyProc = NULL;
@@ -365,6 +394,13 @@ ut_reset(ClusterTTStatus status, SCN scn)
 	ClusterXnodeProfileCtl = NULL;
 	ut_memo_hit = true;
 	ut_native_prehistory_armed = false;
+	ut_native_scratch = false;
+	ut_native_disable_at_lock = false;
+	ut_native_epoch_drift = false;
+	ut_native_hw = UT_NATIVE_HW;
+	ut_native_next = UT_NEXT_FULL_XID;
+	ut_native_status = TRANSACTION_STATUS_COMMITTED;
+	ut_native_deleter = CLUSTER_TX_UNKNOWN;
 	ut_slotless_bound_armed = false;
 	ut_overlay_hit = false;
 	ut_overlay_status = CLUSTER_TT_STATUS_UNKNOWN;
@@ -538,6 +574,8 @@ cluster_undo_verdict_resolve(int origin_node pg_attribute_unused(),
 {
 	ut_calls.wire++;
 	ut_origin_asks++;
+	if (ut_native_scratch)
+		return ut_origin_verdict; /* No TT authority for the native creator. */
 	if (ut_full_scratch_fixture && ut_full_scratch_scenario >= 30) {
 		UT_ASSERT(cluster_vis_resolve_in_flight());
 		UT_ASSERT_EQ(origin_node, ut_history_origin);
@@ -636,6 +674,8 @@ int
 cluster_xid_origin_slot(TransactionId xid pg_attribute_unused())
 {
 	ut_calls.wire++;
+	if (ut_native_scratch && xid != UT_RAW_XID)
+		return -1; /* Native prehistory has no cluster-era stripe origin. */
 	if (ut_full_scratch_fixture && ut_full_scratch_scenario >= 30) {
 		UT_ASSERT_EQ(xid, UT_RAW_XID);
 		return ut_full_scratch_scenario == 39 ? -1 : ut_history_origin;
@@ -689,10 +729,13 @@ TransactionIdGetStatus(TransactionId xid pg_attribute_unused(), XLogRecPtr *lsn)
 {
 	ut_calls.clog++;
 	ut_calls.prehistory_status++;
+	UT_ASSERT_EQ(ut_calls.prehistory_lock, ut_calls.prehistory_unlock + 1);
+	UT_ASSERT_EQ(ut_calls.truncation_lock, ut_calls.truncation_unlock + 1);
+	if (ut_native_epoch_drift)
+		ut_current_epoch++;
 	if (lsn != NULL)
 		*lsn = InvalidXLogRecPtr;
-	return ut_native_prehistory_armed ? TRANSACTION_STATUS_COMMITTED
-									  : TRANSACTION_STATUS_IN_PROGRESS;
+	return ut_native_prehistory_armed ? ut_native_status : TRANSACTION_STATUS_IN_PROGRESS;
 }
 
 bool
@@ -700,21 +743,21 @@ TransactionIdPrecedes(TransactionId id1 pg_attribute_unused(),
 					  TransactionId id2 pg_attribute_unused())
 {
 	ut_calls.clog++;
-	return false;
+	return (int32)(id1 - id2) < 0;
 }
 
 FullTransactionId
 ReadNextFullTransactionId(void)
 {
 	ut_calls.clog++;
-	return FullTransactionIdFromU64(UT_NEXT_FULL_XID);
+	return FullTransactionIdFromU64(ut_native_next);
 }
 
 uint64
 cluster_cr_native_prehistory_covered_hw(void)
 {
 	ut_calls.prehistory_probe++;
-	return ut_native_prehistory_armed ? UT_NATIVE_HW : 0;
+	return ut_native_prehistory_armed ? ut_native_hw : 0;
 }
 
 void
@@ -722,6 +765,8 @@ cluster_cr_native_prehistory_reader_lock(void)
 {
 	ut_calls.clog++;
 	ut_calls.prehistory_lock++;
+	if (ut_native_disable_at_lock)
+		ut_native_prehistory_armed = false;
 }
 
 void
@@ -729,16 +774,6 @@ cluster_cr_native_prehistory_reader_unlock(void)
 {
 	ut_calls.clog++;
 	ut_calls.prehistory_unlock++;
-}
-
-bool
-cluster_xid_native_prehistory_provable_full(uint64 next_full_xid pg_attribute_unused(),
-											uint64 covered_hw_full pg_attribute_unused(),
-											TransactionId xid pg_attribute_unused())
-{
-	ut_calls.clog++;
-	return ut_native_prehistory_armed && next_full_xid == UT_NEXT_FULL_XID
-		   && covered_hw_full == UT_NATIVE_HW && xid == UT_NATIVE_XID;
 }
 
 bool
@@ -764,6 +799,10 @@ LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_u
 {
 	ut_calls.clog++;
 	ut_calls.truncation_lock++;
+	if (ut_native_scratch || ut_native_prehistory_armed) {
+		UT_ASSERT(lock == XactTruncationLock);
+		UT_ASSERT_EQ(mode, LW_SHARED);
+	}
 	return true;
 }
 
@@ -772,6 +811,8 @@ LWLockRelease(LWLock *lock pg_attribute_unused())
 {
 	ut_calls.clog++;
 	ut_calls.truncation_unlock++;
+	if (ut_native_scratch || ut_native_prehistory_armed)
+		UT_ASSERT(lock == XactTruncationLock);
 }
 
 /* Materialized/durable authority alternatives: also forbidden here. */
@@ -838,6 +879,16 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator pg_attribute_unused(),
 						 ClusterTxResolveReason *reason_out)
 {
 	ut_calls.exact_resolve++;
+	if (ut_native_scratch) {
+		memset(out, 0, sizeof(*out));
+		out->outcome = locator->xid == UT_RAW_XID ? ut_native_deleter : CLUSTER_TX_UNKNOWN;
+		out->proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+		out->commit_scn = out->outcome == CLUSTER_TX_COMMITTED ? UT_COMMIT_SCN : InvalidScn;
+		out->locator_echo = *locator;
+		out->locator_echo.tt_wrap = 7;
+		*reason_out = CLUSTER_TX_RESOLVE_NONE;
+		return out->outcome;
+	}
 	if (ut_full_scratch_fixture && ut_full_scratch_scenario >= 12) {
 		memset(out, 0, sizeof(*out));
 		UT_ASSERT(cluster_vis_resolve_in_flight());
@@ -978,13 +1029,13 @@ cluster_tx_locator_from_itl(Page page, uint8 index, ClusterTxLocator *out,
 	memset(out, 0, sizeof(*out));
 	out->xid = UT_RAW_XID;
 	out->tt_wrap = 7;
-	if (ut_full_scratch_fixture) {
+	if (ut_full_scratch_fixture || ut_native_scratch) {
 		const ClusterItlSlotData *slot = ClusterPageGetItlSlots(page);
 
 		out->uba = slot->undo_segment_head;
 		out->itl_kind = slot->flags;
 		out->itl_slot_index = index;
-		if (ut_full_scratch_scenario >= 30)
+		if (ut_full_scratch_scenario >= 30 || ut_native_scratch)
 			out->xid = slot->xid;
 	}
 	*reason = CLUSTER_TX_RESOLVE_NONE;
@@ -1238,6 +1289,91 @@ UT_TEST(test_incomplete_live_proof_keeps_cr_and_authority_refusal)
 {
 	ut_complete_frozen_live_case(HEAP_XMIN_COMMITTED | HEAP_XMAX_INVALID, 0, false);
 	ut_complete_frozen_live_case(HEAP_XMIN_FROZEN, 0, false);
+}
+
+static void
+ut_bootstrap_live_case(TransactionId xmin, int leg, bool expect_error, bool expect_visible)
+{
+	HeapTupleData tuple = { 0 };
+	SnapshotData snapshot = { 0 };
+	HeapTupleHeader header;
+	PGAlignedBlock before;
+	volatile bool caught = false;
+	volatile bool visible = false;
+
+	ut_reset(leg == 3	? CLUSTER_TT_STATUS_ABORTED
+			 : leg == 4 ? CLUSTER_TT_STATUS_UNKNOWN
+						: CLUSTER_TT_STATUS_COMMITTED,
+			 leg == 2 ? UT_READ_SCN + 1 : UT_COMMIT_SCN);
+	ut_exit_fixture = true;
+	ut_exit_ref = ut_exact_peer_ref();
+	cluster_crossnode_runtime_visibility = true;
+	memset(ut_visibility_page.data, 0, BLCKSZ);
+	((PageHeader)ut_visibility_page.data)->pd_flags = PD_HAS_ITL;
+	((PageHeader)ut_visibility_page.data)->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	((PageHeader)ut_visibility_page.data)->pd_upper = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	((PageHeader)ut_visibility_page.data)->pd_lower = SizeOfPageHeaderData;
+	((PageHeader)ut_visibility_page.data)->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	PageSetLSN(ut_visibility_page.data, UT_ANCHOR_LSN);
+	header = (HeapTupleHeader)(ut_visibility_page.data + 1024);
+	header->t_hoff = SizeofHeapTupleHeader;
+	header->t_itl_slot_idx = leg == 6 ? CLUSTER_ITL_SLOT_UNALLOCATED : 0;
+	header->t_infomask = leg == 0 || leg >= 5 ? HEAP_XMAX_INVALID : 0;
+	HeapTupleHeaderSetXmin(header, xmin);
+	HeapTupleHeaderSetXmax(header, leg == 0 || leg >= 5 ? InvalidTransactionId : UT_RAW_XID);
+	ItemPointerSet(&tuple.t_self, 0, 1);
+	header->t_ctid = tuple.t_self;
+	tuple.t_data = header;
+	tuple.t_len = SizeofHeapTupleHeader;
+	tuple.t_tableOid = FirstNormalObjectId;
+	snapshot.snapshot_type = SNAPSHOT_MVCC;
+	snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	snapshot.read_epoch = UT_CLUSTER_EPOCH + (leg == 5 ? (UINT64_C(1) << 32) : 0);
+	snapshot.read_scn = UT_READ_SCN;
+	memcpy(before.data, ut_visibility_page.data, BLCKSZ);
+	ut_error_armed = true;
+	if (sigsetjmp(ut_error_jump, 0) == 0)
+		visible = cluster_heap_test_satisfies_mvcc(&tuple, &snapshot, 1);
+	else
+		caught = true;
+	ut_error_armed = false;
+	UT_ASSERT_EQ(caught, expect_error);
+	UT_ASSERT_EQ(visible, expect_visible);
+	UT_ASSERT_EQ(ut_live_cr_gate_calls, 1);
+	if (!expect_error) {
+		UT_ASSERT_EQ(ut_calls.memo_probe, leg >= 1 && leg <= 4 ? 1 : 0);
+		UT_ASSERT_EQ(ut_calls.peer_stamp, leg >= 1 && leg <= 4 ? 1 : 0);
+	}
+	UT_ASSERT_EQ(ut_native_calls, 0);
+	UT_ASSERT_EQ(ut_hint_mutations, 0);
+	UT_ASSERT_EQ(memcmp(before.data, ut_visibility_page.data, BLCKSZ), 0);
+	ut_exit_fixture = false;
+}
+
+UT_TEST(test_live_bootstrap_creator_needs_no_old_slot)
+{
+	ut_bootstrap_live_case(BootstrapTransactionId, 0, false, true);
+	ut_bootstrap_live_case(BootstrapTransactionId, 6, false, true);
+}
+
+UT_TEST(test_live_bootstrap_creator_keeps_exact_deleter_verdict)
+{
+	for (int leg = 1; leg <= 3; leg++)
+		ut_bootstrap_live_case(BootstrapTransactionId, leg, false, leg != 1);
+	ut_bootstrap_live_case(BootstrapTransactionId, 4, true, false);
+}
+
+UT_TEST(test_live_bootstrap_creator_keeps_epoch_fence)
+{
+	ut_bootstrap_live_case(BootstrapTransactionId, 5, true, false);
+	UT_ASSERT(strstr(ut_error_message, "snapshot stale across reconfig") != NULL);
+}
+
+UT_TEST(test_live_bootstrap_does_not_admit_invalid_or_unknown_creator)
+{
+	ut_bootstrap_live_case(InvalidTransactionId, 0, true, false);
+	ut_bootstrap_live_case(FrozenTransactionId, 0, true, false);
+	ut_bootstrap_live_case(UT_RAW_XID + 1, 0, true, false);
 }
 
 UT_TEST(test_three_real_visibility_exits_route_recycle_and_unproven)
@@ -2331,10 +2467,244 @@ UT_TEST(test_full_scratch_trace_formatter_reports_truncation_without_overrun)
 	UT_ASSERT(!cluster_heap_r4_trace_format(&trace, NULL, 10));
 }
 
+static void
+ut_native_scratch_setup(bool local_origin, bool recycled)
+{
+	PageHeader header;
+	ClusterItlSlotData *slot;
+	HeapTupleHeader tuple;
+
+	ut_reset(CLUSTER_TT_STATUS_UNKNOWN, InvalidScn);
+	ut_exit_fixture = ut_native_scratch = ut_native_prehistory_armed = true;
+	ut_memo_hit = false;
+	cluster_crossnode_runtime_visibility = true;
+	ut_exit_ref = ut_exact_peer_ref();
+	ut_exit_ref.origin_node_id = local_origin ? UT_SELF_NODE : UT_PEER_NODE;
+	ut_exit_ref.local_xid = recycled ? UT_RAW_XID : UT_NATIVE_XID;
+	memset(ut_visibility_page.data, 0, BLCKSZ);
+	header = (PageHeader)ut_visibility_page.data;
+	header->pd_flags = PD_HAS_ITL;
+	header->pd_lower = SizeOfPageHeaderData;
+	header->pd_upper = 1024;
+	header->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	header->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	PageSetLSN(ut_visibility_page.data, UT_ANCHOR_LSN);
+	slot = ClusterPageGetItlSlots(ut_visibility_page.data);
+	slot->flags = ITL_FLAG_ACTIVE;
+	slot->xid = ut_exit_ref.local_xid;
+	slot->wrap = 7;
+	slot->undo_segment_head.raw[0] = UINT64_C(0x1234010203040506);
+	slot->undo_segment_head.raw[1] = UINT64_C(0x0708090a0b0c0d0e);
+	tuple = (HeapTupleHeader)(ut_visibility_page.data + 1024);
+	tuple->t_hoff = SizeofHeapTupleHeader;
+	tuple->t_itl_slot_idx = 0;
+	tuple->t_infomask = HEAP_XMAX_INVALID;
+	HeapTupleHeaderSetXmin(tuple, UT_NATIVE_XID);
+	HeapTupleHeaderSetXmax(tuple, InvalidTransactionId);
+	ItemPointerSet(&tuple->t_ctid, 0, 1);
+}
+
+static void
+ut_native_scratch_check(bool expected_error, bool expected_visible)
+{
+	HeapTupleData tuple = { 0 };
+	SnapshotData snapshot = { 0 };
+	ClusterR4HotScratchTestContext context = { 0 };
+	ClusterR4ScratchTrace trace = { 0 };
+	PGAlignedBlock before;
+	volatile bool caught = false;
+	volatile bool visible = false;
+
+	tuple.t_data = (HeapTupleHeader)(ut_visibility_page.data + 1024);
+	tuple.t_len = SizeofHeapTupleHeader;
+	tuple.t_tableOid = FirstNormalObjectId;
+	ItemPointerSet(&tuple.t_self, 0, 1);
+	snapshot.snapshot_type = SNAPSHOT_MVCC;
+	snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	snapshot.read_epoch = UT_CLUSTER_EPOCH;
+	snapshot.read_scn = UT_READ_SCN;
+	context.scratch_page = ut_visibility_page.data;
+	context.already_full = true;
+	context.read_scn = UT_READ_SCN;
+	context.logical_root = tuple.t_self;
+	context.visibility_trace = &trace;
+	memcpy(before.data, ut_visibility_page.data, BLCKSZ);
+	ut_error_armed = true;
+	PG_TRY();
+	{
+		visible = HeapTupleSatisfiesMVCCScratch(&tuple, &snapshot, &context);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	ut_error_armed = false;
+	UT_ASSERT_EQ(caught, expected_error);
+	if (!caught) {
+		const ClusterR4ScratchVerdict *creator = &trace.items[0].creator;
+
+		UT_ASSERT_EQ(visible, expected_visible);
+		UT_ASSERT(trace.items[0].complete && creator->sampled);
+		UT_ASSERT_EQ(creator->evidence, CLUSTER_VIS_EVIDENCE_REMOTE);
+		UT_ASSERT_EQ(creator->status, ut_native_status == TRANSACTION_STATUS_COMMITTED
+										  ? CLUSTER_TT_STATUS_COMMITTED
+										  : CLUSTER_TT_STATUS_ABORTED);
+		UT_ASSERT_EQ(creator->is_bound, ut_native_status == TRANSACTION_STATUS_COMMITTED);
+		UT_ASSERT_EQ(creator->commit_scn,
+					 ut_native_status == TRANSACTION_STATUS_COMMITTED ? (SCN)1 : InvalidScn);
+	} else
+		UT_ASSERT_EQ(ut_error_code, ERRCODE_CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT_EQ(ut_calls.prehistory_lock, ut_calls.prehistory_unlock);
+	UT_ASSERT_EQ(ut_calls.truncation_lock, ut_calls.truncation_unlock);
+	UT_ASSERT_EQ(ut_calls.memo_install, 0);
+	UT_ASSERT_EQ(ut_native_calls, 0);
+	UT_ASSERT_EQ(ut_hint_mutations, 0);
+	UT_ASSERT_EQ(memcmp(before.data, ut_visibility_page.data, BLCKSZ), 0);
+	UT_ASSERT(!cluster_vis_resolve_in_flight());
+	UT_ASSERT(PG_exception_stack == NULL);
+}
+
+UT_TEST(test_native_scratch_proof_covers_both_origins_and_slot_reuse)
+{
+	for (int local = 0; local < 2; local++)
+		for (int recycled = 0; recycled < 2; recycled++) {
+			ut_native_scratch_setup(local, recycled);
+			ut_native_scratch_check(false, true);
+			UT_ASSERT_EQ(ut_calls.prehistory_status, 1);
+			UT_ASSERT_EQ(ut_calls.exact_resolve + ut_origin_asks + ut_calls.overlay, 0);
+		}
+}
+
+UT_TEST(test_native_scratch_sealed_status_alphabet)
+{
+	const XidStatus statuses[] = { TRANSACTION_STATUS_ABORTED, TRANSACTION_STATUS_IN_PROGRESS,
+								   TRANSACTION_STATUS_SUB_COMMITTED, 255 };
+
+	for (int i = 0; i < lengthof(statuses); i++) {
+		ut_native_scratch_setup(true, true);
+		ut_native_status = statuses[i];
+		ut_native_scratch_check(i >= 2, false);
+		UT_ASSERT_EQ(ut_calls.prehistory_status, 1);
+	}
+}
+
+UT_TEST(test_native_scratch_coverage_widening_and_truncation_refuse)
+{
+	for (int scenario = 0; scenario < 8; scenario++) {
+		ut_native_scratch_setup(true, true);
+		switch (scenario) {
+		case 0:
+			ut_native_prehistory_armed = false;
+			break;
+		case 1:
+			ut_native_disable_at_lock = true;
+			break;
+		case 2:
+			ut_native_next = (UINT64_C(1) << 32) + UT_NEXT_FULL_XID;
+			break;
+		case 3:
+			ut_native_next = UINT32_MAX;
+			break;
+		case 4:
+			ut_native_hw = UT_NATIVE_XID;
+			break;
+		case 5:
+			ut_native_hw = UT_NATIVE_XID - 1;
+			break;
+		case 6:
+			ut_variable_cache.oldestClogXid = UT_NATIVE_XID + 1;
+			break;
+		case 7:
+			ut_native_next = 0;
+			break;
+		}
+		ut_native_scratch_check(true, false);
+		UT_ASSERT_EQ(ut_calls.prehistory_status, 0);
+	}
+}
+
+UT_TEST(test_native_scratch_proof_does_not_rescue_malformed_input)
+{
+	for (int scenario = 0; scenario < 6; scenario++) {
+		ClusterItlSlotData *slot;
+		HeapTupleHeader tuple;
+
+		ut_native_scratch_setup(true, true);
+		slot = ClusterPageGetItlSlots(ut_visibility_page.data);
+		tuple = (HeapTupleHeader)(ut_visibility_page.data + 1024);
+		switch (scenario) {
+		case 0:
+			memset(&slot->undo_segment_head, 0, sizeof(UBA));
+			break;
+		case 1:
+			ut_exit_ref.tt_slot_id = 0;
+			break;
+		case 2:
+			ut_exit_ref.local_xid++;
+			break;
+		case 3:
+			slot->flags = ITL_FLAG_FREE;
+			break;
+		case 4:
+			HeapTupleHeaderSetXmin(tuple, InvalidTransactionId);
+			break;
+		case 5:
+			HeapTupleHeaderSetXmin(tuple, FrozenTransactionId);
+			break;
+		}
+		ut_native_scratch_check(true, false);
+		UT_ASSERT_EQ(ut_calls.prehistory_status, 0);
+	}
+}
+
+UT_TEST(test_native_scratch_proof_keeps_epoch_check)
+{
+	for (int local = 0; local < 2; local++)
+		for (int recycled = 0; recycled < 2; recycled++)
+			for (int scenario = 0; scenario < 3; scenario++) {
+				ut_native_scratch_setup(local, recycled);
+				if (scenario == 0)
+					ut_exit_ref.cluster_epoch--;
+				else if (scenario == 1)
+					ut_native_epoch_drift = true;
+				else
+					ut_current_epoch = UINT64_C(1) << 32;
+				ut_native_scratch_check(true, false);
+			}
+}
+
+UT_TEST(test_native_scratch_creator_keeps_independent_deleter)
+{
+	const ClusterTxOutcome outcomes[]
+		= { CLUSTER_TX_COMMITTED, CLUSTER_TX_ABORTED, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_UNKNOWN,
+			CLUSTER_TX_PREPARED };
+
+	for (int local = 0; local < 2; local++)
+		for (int i = 0; i < lengthof(outcomes); i++) {
+			HeapTupleHeader tuple;
+
+			ut_native_scratch_setup(local, true);
+			ut_native_deleter = outcomes[i];
+			tuple = (HeapTupleHeader)(ut_visibility_page.data + 1024);
+			tuple->t_infomask &= ~HEAP_XMAX_INVALID;
+			HeapTupleHeaderSetXmax(tuple, UT_RAW_XID);
+			ut_native_scratch_check(i >= 3, i == 1 || i == 2);
+			UT_ASSERT_EQ(ut_calls.prehistory_status, 1);
+			UT_ASSERT_EQ(ut_calls.exact_resolve, 1);
+		}
+}
+
 int
 main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(53);
+	UT_RUN(test_native_scratch_proof_covers_both_origins_and_slot_reuse);
+	UT_RUN(test_native_scratch_sealed_status_alphabet);
+	UT_RUN(test_native_scratch_coverage_widening_and_truncation_refuse);
+	UT_RUN(test_native_scratch_proof_does_not_rescue_malformed_input);
+	UT_RUN(test_native_scratch_proof_keeps_epoch_check);
+	UT_RUN(test_native_scratch_creator_keeps_independent_deleter);
 	UT_RUN(test_full_scratch_trace_wrap_keeps_last_decisions_without_io);
 	UT_RUN(test_full_scratch_trace_formatter_reports_truncation_without_overrun);
 	UT_RUN(test_full_scratch_recycled_lock_roles_use_only_original_terminal_proof);
@@ -2366,6 +2736,10 @@ main(void)
 	UT_RUN(test_complete_frozen_live_proof_precedes_legacy_cr);
 	UT_RUN(test_complete_frozen_live_proof_keeps_full_epoch_check);
 	UT_RUN(test_incomplete_live_proof_keeps_cr_and_authority_refusal);
+	UT_RUN(test_live_bootstrap_creator_needs_no_old_slot);
+	UT_RUN(test_live_bootstrap_creator_keeps_exact_deleter_verdict);
+	UT_RUN(test_live_bootstrap_creator_keeps_epoch_fence);
+	UT_RUN(test_live_bootstrap_does_not_admit_invalid_or_unknown_creator);
 	UT_RUN(test_full_scratch_remote_xmax_retains_exact_data_locator);
 	UT_RUN(test_full_scratch_remote_xmin_retains_exact_data_locator);
 	UT_RUN(test_full_scratch_local_xmax_uses_exact_origin_not_native_clog);
@@ -2378,6 +2752,7 @@ main(void)
 	UT_RUN(test_full_scratch_retained_scn_both_origins_and_tuple_sides);
 	UT_RUN(test_full_scratch_retained_unknown_malformed_missing_and_epoch_change);
 	UT_RUN(test_full_scratch_retained_pair_error_unwinds_then_exact_live_works);
+	UT_ASSERT(ut_snapshot_scope == NULL);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

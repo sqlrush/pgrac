@@ -46,9 +46,11 @@
  */
 #include "postgres.h"
 
+#include <limits.h>
 #include <stdarg.h>
 #include <sys/un.h>
 
+#include "access/xlog.h"
 #include "common/relpath.h"
 #include "cluster/cluster_conf.h" /* ClusterConf type for the D2b latch stub */
 #include "cluster/cluster_guc.h"
@@ -85,8 +87,19 @@
  * ----------
  */
 #include "utils/guc.h"
+#include "cluster/cluster_cold_recovery.h"
 
 extern int cluster_undo_buffers;
+char *DataDir = NULL;
+
+/* Storage belongs to the startup owner; this fixture tests registration. */
+int cluster_cold_recovery_plan_memory = CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB;
+static int *cold_plan_value_addr = NULL;
+static int cold_plan_boot_value = -1;
+static int cold_plan_min_value = -1;
+static int cold_plan_max_value = -1;
+static GucContext cold_plan_context = PGC_INTERNAL;
+static int cold_plan_flags = 0;
 
 static int *undo_buffers_value_addr = NULL;
 static int undo_buffers_boot_value = -1;
@@ -156,6 +169,13 @@ DefineCustomIntVariable(const char *name, const char *short_desc pg_attribute_un
 		external_fence_timeout_max_value = maxValue;
 		external_fence_timeout_context = context;
 		external_fence_timeout_flags = flags;
+	} else if (strcmp(name, "cluster.cold_recovery_plan_memory") == 0) {
+		cold_plan_value_addr = valueAddr;
+		cold_plan_boot_value = bootValue;
+		cold_plan_min_value = minValue;
+		cold_plan_max_value = maxValue;
+		cold_plan_context = context;
+		cold_plan_flags = flags;
 	}
 }
 
@@ -216,6 +236,7 @@ DefineCustomStringVariable(const char *name, const char *short_desc pg_attribute
 }
 
 static GucBoolCheckHook smart_fusion_check_hook = NULL;
+int wal_level = WAL_LEVEL_REPLICA;
 static bool *smart_fusion_value_addr = NULL;
 static bool smart_fusion_boot_value = true;
 static GucContext smart_fusion_context = PGC_INTERNAL;
@@ -271,15 +292,41 @@ pg_snprintf(char *str, size_t count, const char *fmt, ...)
 	return ret;
 }
 
+static int last_reported_level;
+static sigjmp_buf expected_fatal_jmp;
+static bool expect_fatal;
+
 bool
-errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart(int elevel, const char *domain pg_attribute_unused())
 {
+	last_reported_level = elevel;
+	if (elevel >= FATAL) {
+		if (expect_fatal)
+			siglongjmp(expected_fatal_jmp, 1);
+		abort();
+	}
 	return false; /* never starts an ereport in this test */
+}
+
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
 }
 void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
 {}
+int
+errcode(int sqlerrcode pg_attribute_unused())
+{
+	return 0;
+}
+int
+errcode_for_file_access(void)
+{
+	return 0;
+}
 int
 errmsg(const char *fmt pg_attribute_unused(), ...)
 {
@@ -572,15 +619,20 @@ UT_TEST(test_external_fence_guc_contract)
 UT_TEST(test_pcm_x_retain_flush_error_target_guc_contract)
 {
 	static const char *const invalid_targets[]
-		= { "0/5/12345/0/0",		  "1663/0/12345/0/0",		   "1663/5/0/0/0",
-			"1663/5/12345/0",		  "1663//12345/0/0",		   "1663/5//0/0",
-			"1663/5/12345//0",		  "1663/5/12345/0/",		   "1663/5/12345/0/0/1",
-			" 1663/5/12345/0/0",	  "1663/5/12345/0/0 ",		   "1663/ 5/12345/0/0",
-			"+1663/5/12345/0/0",	  "-1663/5/12345/0/0",		   "0x67f/5/12345/0/0",
-			"1663/5/12x45/0/0",		  "1663/5/12345/0/0suffix",	   "1663/5/12345/0/0\n",
-			"4294967296/5/12345/0/0", "1663/4294967296/12345/0/0", "1663/5/4294967296/0/0",
-			"1663/5/12345/4/0",		  "1663/5/12345/0/4294967295" };
+		= { "0/5/12345/0/0",		  "1663/0/12345/0/0",
+			"1663/5/0/0/0",			  "1663/5/12345/0",
+			"1663//12345/0/0",		  "1663/5//0/0",
+			"1663/5/12345//0",		  "1663/5/12345/0/",
+			"1663/5/12345/0/0/1",	  " 1663/5/12345/0/0",
+			"1663/5/12345/0/0 ",	  "1663/ 5/12345/0/0",
+			"+1663/5/12345/0/0",	  "-1663/5/12345/0/0",
+			"0x67f/5/12345/0/0",	  "1663/5/12x45/0/0",
+			"1663/5/12345/0/0suffix", "1663/5/12345/0/0\n",
+			"4294967296/5/12345/0/0", "1663/4294967296/12345/0/0",
+			"1663/5/4294967296/0/0",  "1663/5/12345/0/4294967295" };
 	char *value;
+	char max_target[128];
+	char invalid_fork_target[128];
 	void *extra;
 	int i;
 
@@ -638,7 +690,9 @@ UT_TEST(test_pcm_x_retain_flush_error_target_guc_contract)
 	UT_ASSERT(!cluster_pcm_x_retain_flush_error_target_matches(1663, 5, 12345, 0, 1));
 
 	/* The greatest legal components survive parsing without narrowing. */
-	value = "4294967295/4294967295/4294967295/3/4294967294";
+	snprintf(max_target, sizeof(max_target), "4294967295/4294967295/4294967295/%d/4294967294",
+			 MAX_FORKNUM);
+	value = max_target;
 	extra = NULL;
 	UT_ASSERT(pcm_x_retain_flush_error_target_check_hook(&value, &extra, PGC_S_TEST));
 	UT_ASSERT_NOT_NULL(extra);
@@ -668,14 +722,81 @@ UT_TEST(test_pcm_x_retain_flush_error_target_guc_contract)
 			free(extra);
 		UT_ASSERT(cluster_pcm_x_retain_flush_error_target_matches(1663, 5, 12345, 0, 0));
 	}
+	snprintf(invalid_fork_target, sizeof(invalid_fork_target), "1663/5/12345/%d/0",
+			 MAX_FORKNUM + 1);
+	value = invalid_fork_target;
+	extra = NULL;
+	last_guc_check_errcode = 0;
+	UT_ASSERT(!pcm_x_retain_flush_error_target_check_hook(&value, &extra, PGC_S_TEST));
+	UT_ASSERT_EQ(last_guc_check_errcode, ERRCODE_INVALID_PARAMETER_VALUE);
+	if (extra != NULL)
+		free(extra);
+	UT_ASSERT(cluster_pcm_x_retain_flush_error_target_matches(1663, 5, 12345, 0, 0));
 }
 #endif
 
 
+UT_TEST(test_cold_plan_memory_guc_bounds_and_startup_owner)
+{
+	cluster_init_guc();
+	UT_ASSERT(cold_plan_value_addr == &cluster_cold_recovery_plan_memory);
+	UT_ASSERT_EQ(cold_plan_boot_value, CLUSTER_COLD_PLAN_MEMORY_DEFAULT_KB);
+	UT_ASSERT_EQ(cold_plan_min_value, 1024);
+	UT_ASSERT_EQ(cold_plan_max_value, MAX_KILOBYTES);
+	UT_ASSERT_EQ(cold_plan_context, PGC_POSTMASTER);
+	UT_ASSERT_EQ(cold_plan_flags, GUC_UNIT_KB);
+}
+
+UT_TEST(test_shared_catalog_requires_wal_for_new_files)
+{
+	wal_level = WAL_LEVEL_MINIMAL;
+	cluster_shared_catalog = true;
+	last_reported_level = 0;
+	expect_fatal = true;
+	if (sigsetjmp(expected_fatal_jmp, 1) == 0) {
+		cluster_init_guc();
+		UT_ASSERT(false);
+	}
+	expect_fatal = false;
+	UT_ASSERT_EQ(last_reported_level, FATAL);
+	cluster_shared_catalog = false;
+	last_reported_level = 0;
+	cluster_init_guc();
+	UT_ASSERT_EQ(last_reported_level, 0);
+	wal_level = WAL_LEVEL_REPLICA;
+	cluster_shared_catalog = true;
+	cluster_shared_config = true;
+	last_reported_level = 0;
+	cluster_init_guc();
+	UT_ASSERT_EQ(last_reported_level, 0);
+	cluster_shared_catalog = false;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_shared_catalog_requires_durable_checkpoint_publication)
+{
+	wal_level = WAL_LEVEL_REPLICA;
+	cluster_shared_config = false;
+	cluster_shared_catalog = true;
+	last_reported_level = 0;
+	expect_fatal = true;
+	if (sigsetjmp(expected_fatal_jmp, 1) == 0) {
+		cluster_init_guc();
+		UT_ASSERT(false);
+	}
+	expect_fatal = false;
+	UT_ASSERT_EQ(last_reported_level, FATAL);
+	cluster_shared_catalog = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+#ifdef ENABLE_INJECTION
+	UT_PLAN(12);
+#else
+	UT_PLAN(11);
+#endif
 	UT_RUN(test_cluster_node_id_default_is_minus_one);
 	UT_RUN(test_cluster_node_id_address_stable);
 	UT_RUN(test_cluster_init_guc_symbol_is_linkable);
@@ -684,6 +805,9 @@ main(void)
 	UT_RUN(test_undo_buffers_guc_describes_both_r4a_banks_and_inactive_zero);
 	UT_RUN(test_smart_fusion_guc_is_guarded_failclosed);
 	UT_RUN(test_external_fence_guc_contract);
+	UT_RUN(test_cold_plan_memory_guc_bounds_and_startup_owner);
+	UT_RUN(test_shared_catalog_requires_wal_for_new_files);
+	UT_RUN(test_shared_catalog_requires_durable_checkpoint_publication);
 #ifdef ENABLE_INJECTION
 	UT_RUN(test_pcm_x_retain_flush_error_target_guc_contract);
 #endif

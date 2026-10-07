@@ -18,14 +18,19 @@
 #include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_write_fence.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_control_root.h" /* bit22 (G3 accessor test) */
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_replacement_wire.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_terminal_ref_census.h"
+#include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_writer.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 
@@ -38,7 +43,7 @@ extern bool cluster_semantic_activation_resolve_shared_undo_root_live_owner_sour
 
 #define TEST_SEMANTIC_GATE_SHMEM_BYTES 1104
 #define TEST_SEMANTIC_UTILITY_MAILBOX_BYTES 80
-#define TEST_SEMANTIC_ACK_TABLE_BYTES 16496
+#define TEST_SEMANTIC_ACK_TABLE_BYTES 16528
 #define TEST_SEMANTIC_PGRD_SNAPSHOT_BYTES 528
 /* RF-ROOT P7 (contract §B): ClusterR4Bit22CutoverLatchShmem = u32+u32+u64+u64 */
 #define TEST_SEMANTIC_BIT22_LATCH_BYTES 24
@@ -97,7 +102,20 @@ typedef struct TestSemanticSourceCloseStorage {
 static TestSemanticSourceCloseStorage test_semantic_source_close;
 static TestSemanticBit22SeamStorage test_semantic_bit22_seam;
 static pg_atomic_uint32 test_semantic_clean_start;
-static TestSemanticShmemStorage test_normal_start_completion;
+static union {
+	pg_atomic_uint64 align;
+	uint8 bytes[1568];
+} test_normal_start_completion;
+static TestSemanticShmemStorage test_serving_completion;
+static bool test_serving_found;
+static bool test_serving_formation_valid;
+static uint64 test_serving_formation;
+static ClusterControlRootResult test_serving_result;
+static ClusterControlRootFileToken test_serving_token;
+static unsigned test_serving_calls, test_serving_cancels;
+static ClusterSemanticActivationRecord test_serving_open;
+static uint8 test_serving_root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+static void (*test_serving_hook)(void);
 static bool test_normal_guard_owned;
 static bool test_normal_start_found;
 static Size test_normal_start_requested_size;
@@ -135,13 +153,60 @@ static uint32 test_peer_capability_word;
 static uint32 test_peer_capability_generation;
 static int test_peer_capability_sample_calls[CLUSTER_MAX_NODES];
 static int test_capability_missing_peer = -1;
+static uint64 test_capability_missing_bitmap;
+static bool test_capture_activation_log;
+static unsigned test_activation_diag_logs;
+static char test_activation_last_diag[512];
 static bool test_terminal_peer_record_enabled;
 static bool test_terminal_peer_eligible;
 static ClusterSfPeerCap test_terminal_peer_record;
 static ClusterSemanticActivationRecord test_terminal_peer_open;
 static uint8 test_terminal_peer_root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
 static bool test_stop_real_observation;
+bool cluster_shared_config;
+static ClusterWalSourceRef test_first_writer;
+static bool test_first_writer_installed, test_first_writer_initialized;
+static uint64 test_first_writer_epoch;
+static int test_first_live_checks;
+static ClusterControlRootResult test_first_live_result;
+
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
+{
+	if (!test_first_writer_installed)
+		return false;
+	*out = test_first_writer;
+	return true;
+}
+
+bool
+cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *expected, uint64 epoch)
+{
+	return test_first_writer_installed && test_first_writer_initialized
+		   && epoch == test_first_writer_epoch
+		   && memcmp(expected, &test_first_writer, sizeof(*expected)) == 0;
+}
+
+ClusterControlRootResult
+cluster_wal_writer_ready(TimeLineID timeline)
+{
+	/* The postmaster adapter must never enter this live worker check. */
+	Assert(IsUnderPostmaster);
+	++test_first_live_checks;
+	return timeline == test_first_writer.timeline ? test_first_live_result
+												  : CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+}
 static int test_stop_not_fresh_peer = -1;
+static bool test_stop_storage_quorum = true;
+static uint64 test_terminal_membership_cut = 2;
+static bool test_terminal_fenced, test_terminal_prebump, test_terminal_join, test_terminal_stop;
+static bool test_terminal_sessions_ok = true;
+static int test_terminal_qv_status = CLUSTER_QVOTEC_READY;
+static int test_terminal_nonmember = -1;
+static ClusterICTerminalPeerSessions test_terminal_sessions;
+static unsigned test_terminal_session_calls, test_terminal_session_hook_at;
+static void (*test_terminal_session_hook)(void);
+
 static bool test_capability_store_missing;
 static uint32 test_local_capability_word;
 static bool test_ctrc_shmem_is_ready = true;
@@ -286,6 +351,12 @@ cluster_pcm_lock_resource_x_cutover_current_proof_digest_exact(bool thawed,
 void *
 ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 {
+	if (strcmp(name, "pgrac semantic ROOT serving completion") == 0) {
+		if (size > sizeof(test_serving_completion))
+			abort();
+		*foundPtr = test_serving_found;
+		return test_serving_completion.bytes;
+	}
 	if (strcmp(name, "pgrac normal clean start completion") == 0) {
 		test_normal_start_requested_size = size;
 		*foundPtr = test_normal_start_found;
@@ -601,7 +672,8 @@ cluster_sf_peer_capability_record_snapshot(int32 peer_id, ClusterSfPeerCap *out)
 		return true;
 	}
 	test_peer_capability_sample_calls[peer_id]++;
-	out->valid = test_peer_capability_word_sample_ok && peer_id != test_capability_missing_peer;
+	out->valid = test_peer_capability_word_sample_ok && peer_id != test_capability_missing_peer
+				 && (test_capability_missing_bitmap & (UINT64_C(1) << peer_id)) == 0;
 	out->bits = test_peer_capability_word;
 	out->generation = test_peer_capability_generation;
 	return true;
@@ -684,7 +756,7 @@ cluster_membership_member_count(void)
 bool
 cluster_membership_is_member(int32 node_id)
 {
-	return node_id >= 0 && node_id < 4;
+	return node_id >= 0 && node_id < 4 && node_id != test_terminal_nonmember;
 }
 
 ClusterMembershipState
@@ -717,7 +789,7 @@ cluster_reconfig_get_observed_epoch(int32 node_id)
 int
 cluster_qvotec_get_status(void)
 {
-	return CLUSTER_QVOTEC_READY;
+	return test_terminal_qv_status;
 }
 
 const ClusterNodeInfo *
@@ -733,6 +805,13 @@ cluster_reconfig_get_observed_fresh_alive(int32 node_id)
 	return node_id >= 0 && node_id < 4 && node_id != test_stop_not_fresh_peer;
 }
 
+bool
+cluster_storage_quorum_allows_members(uint64 lo, uint64 hi)
+{
+	return test_stop_storage_quorum && lo == test_membership_snapshot_lo
+		   && hi == test_membership_snapshot_hi;
+}
+
 #include "test_cluster_stop_membership_observation.inc"
 
 static bool
@@ -746,8 +825,122 @@ test_stop_observation_current(const ClusterSemanticActivationRecord *open, const
 	for (int node = 0; node < 4; node++)
 		candidate.admitted_incarnation[node]
 			= cluster_membership_get_last_admitted_incarnation(node);
-	return cluster_reconfig_r4_membership_observations_current(&candidate, true, open, root)
-		   && cluster_reconfig_r4_membership_observations_current(&candidate, false, open, root);
+	return cluster_reconfig_r4_membership_observations_current(&candidate, true, open, root, -1)
+		   && cluster_reconfig_r4_membership_observations_current(&candidate, false, open, root,
+																  -1);
+}
+
+/* Real coherent membership acquisition is tested in test_cluster_reconfig.
+ * This boundary still executes the original observed-slot predicate. */
+bool
+cluster_reconfig_terminal_peer_membership(int32 peer, ClusterR4MembershipSnapshot *out)
+{
+	ClusterR4MembershipSnapshot candidate = { 0 };
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || !test_membership_snapshot_valid || peer < 0 || peer >= 4
+		|| peer == cluster_node_id || !cluster_membership_is_member(peer)
+		|| (test_membership_snapshot_lo & (UINT64_C(1) << peer)) == 0)
+		return false;
+	candidate.formation_epoch = test_membership_snapshot_epoch;
+	candidate.admitted_members_lo = test_membership_snapshot_lo;
+	candidate.admitted_members_hi = test_membership_snapshot_hi;
+	candidate.local_self_boot_incarnation = cluster_qvotec_get_self_incarnation();
+	for (int node = 0; node < 4; node++)
+		candidate.admitted_incarnation[node]
+			= cluster_membership_get_last_admitted_incarnation(node);
+	if (!cluster_reconfig_r4_membership_observations_current(&candidate, true, NULL, NULL, peer)
+		|| !cluster_reconfig_r4_membership_observations_current(&candidate, false, NULL, NULL,
+																peer))
+		return false;
+	*out = candidate;
+	return true;
+}
+uint64
+cluster_membership_cut_generation(void)
+{
+	return test_terminal_membership_cut;
+}
+bool
+cluster_membership_cut_generation_current(uint64 cut)
+{
+	return cut != 0 && cut == test_terminal_membership_cut;
+}
+bool
+cluster_write_fence_allowed(void)
+{
+	return !test_terminal_fenced;
+}
+bool
+cluster_reconfig_has_pending_prebump_stage(void)
+{
+	return test_terminal_prebump;
+}
+bool
+cluster_reconfig_join_in_progress(void)
+{
+	return test_terminal_join;
+}
+bool
+cluster_normal_stop_requested(void)
+{
+	return test_terminal_stop;
+}
+static bool test_clean_admitted = true;
+
+bool
+cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
+											   ClusterFormationSnapshotV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!test_serving_formation_valid || origin_thread != cluster_node_id + 1)
+		return false;
+	out->startup_formation_generation = test_serving_formation;
+	out->local_epoch = test_current_epoch;
+	out->self_join_admitted = test_clean_admitted ? 1 : 0;
+	for (int node = 0; node < 4; node++) {
+		out->membership.membership_state[node]
+			= (test_membership_snapshot_lo & (UINT64_C(1) << node)) ? CLUSTER_MEMBER_MEMBER
+																	: CLUSTER_MEMBER_ABSENT;
+		out->membership.last_admitted_incarnation[node]
+			= cluster_membership_get_last_admitted_incarnation(node);
+	}
+	return true;
+}
+ClusterControlRootResult
+cluster_control_root_v3_serving_poll(const ClusterSemanticActivationRecord *open, const uint8 *root,
+									 ClusterControlRootFileToken *out)
+{
+	test_serving_calls++;
+	test_serving_open = *open;
+	memcpy(test_serving_root, root, sizeof(test_serving_root));
+	memset(out, 0, sizeof(*out));
+	if (test_serving_hook != NULL)
+		test_serving_hook();
+	if (test_serving_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = test_serving_token;
+	return test_serving_result;
+}
+void
+cluster_control_root_v3_serving_cancel(void)
+{
+	test_serving_cancels++;
+}
+bool
+cluster_ic_tier1_terminal_peer_sessions(int32 peer, uint64 epoch, uint32 cap, int channels,
+										ClusterICTerminalPeerSessions *out)
+{
+	memset(out, 0, sizeof(*out));
+	test_terminal_session_calls++;
+	if (test_terminal_session_calls == test_terminal_session_hook_at
+		&& test_terminal_session_hook != NULL)
+		test_terminal_session_hook();
+	if (!test_terminal_sessions_ok || peer < 0 || peer >= 4 || epoch != test_current_epoch
+		|| cap != test_peer_capability_generation
+		|| channels != (int)test_terminal_sessions.data_channels)
+		return false;
+	*out = test_terminal_sessions;
+	return true;
 }
 
 bool
@@ -956,9 +1149,9 @@ test_read_barrier(void)
 #define pg_read_barrier() test_read_barrier()
 
 bool
-errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart(int elevel, const char *domain pg_attribute_unused())
 {
-	return false;
+	return test_capture_activation_log && elevel == LOG;
 }
 
 bool
@@ -979,7 +1172,20 @@ errcode(int sqlerrcode pg_attribute_unused())
 }
 
 int
-errmsg(const char *fmt pg_attribute_unused(), ...)
+errmsg(const char *fmt, ...)
+{
+	va_list args;
+	if (test_capture_activation_log && strstr(fmt, "semantic activation round") != NULL) {
+		test_activation_diag_logs++;
+		va_start(args, fmt);
+		vsnprintf(test_activation_last_diag, sizeof(test_activation_last_diag), fmt, args);
+		va_end(args);
+	}
+	return 0;
+}
+
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
@@ -1045,8 +1251,20 @@ test_gate_inflight(ClusterSemanticAdmissionSide side, int feature_index)
 static void
 test_gate_reset(void)
 {
+	cluster_shared_config = false;
+	test_capture_activation_log = false;
+	test_activation_diag_logs = 0;
+	test_activation_last_diag[0] = '\0';
+	test_capability_missing_bitmap = 0;
 	memset(&test_normal_start_completion, 0, sizeof(test_normal_start_completion));
 	test_normal_start_found = false;
+	test_serving_found = false;
+	test_serving_formation_valid = false;
+	test_serving_formation = 2;
+	test_serving_result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	test_serving_calls = test_serving_cancels = 0;
+	test_serving_hook = NULL;
+	memset(&test_serving_token, 0, sizeof(test_serving_token));
 	test_normal_start_requested_size = 0;
 	test_normal_pgrd_state = CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
 	test_normal_pgrd_hook = NULL;
@@ -1167,6 +1385,15 @@ test_gate_reset(void)
 	test_qvotec_in_quorum = true;
 	test_stop_real_observation = false;
 	test_stop_not_fresh_peer = -1;
+	test_stop_storage_quorum = true;
+	test_terminal_membership_cut = 2;
+	test_terminal_fenced = test_terminal_prebump = test_terminal_join = test_terminal_stop = false;
+	test_terminal_sessions_ok = true;
+	test_terminal_qv_status = CLUSTER_QVOTEC_READY;
+	test_terminal_nonmember = -1;
+	memset(&test_terminal_sessions, 0, sizeof(test_terminal_sessions));
+	test_terminal_session_calls = test_terminal_session_hook_at = 0;
+	test_terminal_session_hook = NULL;
 	test_qvotec_self_incarnation = UINT64_C(0x445566778899aabb);
 	test_last_admitted_incarnation = UINT64_C(0x445566778899aabb);
 	memset(test_remote_admitted_incarnations, 0, sizeof(test_remote_admitted_incarnations));
@@ -2862,7 +3089,8 @@ UT_TEST(test_93da0_exact_refusal_completes_active_utility_as_deferred)
 	test_gate_reset();
 }
 
-UT_TEST(test_93da1_member_retains_sample_ack_until_exact_request_arrives)
+static void
+test_member_early_sample_ack(int observation_gap)
 {
 	const uint64 system_identifier = UINT64_C(0x8070605040302010);
 	ClusterSemanticActivationAckTableV1 table;
@@ -2936,16 +3164,65 @@ UT_TEST(test_93da1_member_retains_sample_ack_until_exact_request_arrives)
 	cluster_semantic_activation_lmon_tick();
 	UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(0));
 
-	test_gate_publish(4, 0, 0, test_current_epoch, false);
+	if (observation_gap >= 4 && observation_gap != 5)
+		test_gate_publish(4, 0, 0, CLUSTER_EPOCH_INITIAL, true);
+	else if (observation_gap == 5)
+		test_gate_publish(4, 0, 0, test_current_epoch, true);
+	else
+		test_gate_publish(4, 0, 0, test_current_epoch, false);
+	if (observation_gap == 6) {
+		/* A stale frame ahead of the live ACK may be consumed in the same
+		 * drain; readiness must be checked again before taking the next. */
+		UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
+		cluster_semantic_activation_ack_handler(&envelope, payload);
+	}
 	message.record_generation = 1;
 	message.round_nonce = UINT64_C(78);
 	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
 	cluster_semantic_activation_ack_handler(&envelope, payload);
+	if (observation_gap == 1)
+		test_membership_snapshot_valid = false;
+	else if (observation_gap == 2)
+		test_membership_snapshot_fail_at_call = test_membership_snapshot_calls + 2;
 	cluster_semantic_activation_lmon_tick();
+	if (observation_gap >= 4) {
+		/* The original stage-ahead owner keeps the exact frame while the
+		 * local gate catches up; no row exists before the exact request. */
+		UT_ASSERT_EQ(
+			semantic_activation_ack_ingress_pending(&semantic_activation_ack_local_ingress),
+			UINT32_C(0));
+		UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(1));
+		UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
+		UT_ASSERT_EQ(table.observed_members_lo, UINT64_C(0));
+		if (observation_gap == 13) {
+			cluster_semantic_activation_ack_handler(&envelope, payload);
+			cluster_semantic_activation_lmon_tick();
+			UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(1));
+		}
+		test_gate_publish(6, 0, 0, test_current_epoch, false);
+		cluster_semantic_activation_lmon_tick();
+	}
+	if (observation_gap == 1 || observation_gap == 2) {
+		UT_ASSERT_EQ(
+			semantic_activation_ack_ingress_pending(&semantic_activation_ack_local_ingress),
+			UINT32_C(1));
+		UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(0));
+		UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
+		UT_ASSERT_EQ(table.expected_members_lo, UINT64_C(0));
+		test_membership_snapshot_valid = true;
+		test_membership_snapshot_fail_at_call = 0;
+		cluster_semantic_activation_lmon_tick();
+	}
 
 	UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(1));
 	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
 	UT_ASSERT_EQ(table.expected_members_lo, UINT64_C(0));
+	if (observation_gap == 3) {
+		test_membership_snapshot_valid = false;
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(1));
+		test_membership_snapshot_valid = true;
+	}
 
 	memset(&message, 0, sizeof(message));
 	message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
@@ -2958,6 +3235,32 @@ UT_TEST(test_93da1_member_retains_sample_ack_until_exact_request_arrives)
 	message.round_nonce = UINT64_C(78);
 	message.target_feature_bitmap = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
 	message.admitted_members_lo = UINT64_C(0x0f);
+	switch (observation_gap) {
+	case 7:
+		message.round_nonce++;
+		break;
+	case 8:
+		message.record_generation++;
+		break;
+	case 9:
+		test_current_epoch++;
+		message.transition_epoch = test_current_epoch;
+		envelope.epoch = test_current_epoch;
+		test_gate_publish(8, 0, 0, test_current_epoch, false);
+		break;
+	case 10:
+		test_terminal_nonmember = 1;
+		break;
+	case 11:
+		test_remote_admitted_incarnations[1]++;
+		break;
+	case 12:
+		test_peer_capability_generation++;
+		test_capability_missing_peer = 1; /* old peer generation no longer matches */
+		break;
+	default:
+		break;
+	}
 	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
 	envelope.source_node_id = 0;
 	cluster_semantic_activation_ack_handler(&envelope, payload);
@@ -2965,6 +3268,13 @@ UT_TEST(test_93da1_member_retains_sample_ack_until_exact_request_arrives)
 
 	UT_ASSERT_EQ(semantic_activation_ack_local_stage_ahead.count, UINT32_C(0));
 	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
+	if (observation_gap >= 7 && observation_gap <= 12) {
+		UT_ASSERT_EQ(table.observed_members_lo & UINT64_C(2), UINT64_C(0));
+		UT_ASSERT_EQ(table.flags & CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE, 0);
+		test_capability_missing_peer = -1;
+		test_gate_reset();
+		return;
+	}
 	UT_ASSERT_EQ(table.stage, CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
 	UT_ASSERT_EQ(table.observed_members_lo, UINT64_C(0x0a));
 	UT_ASSERT(semantic_activation_ack_matches(
@@ -2979,6 +3289,52 @@ UT_TEST(test_93da1_member_retains_sample_ack_until_exact_request_arrives)
 								.record_generation = 1,
 							}));
 	test_gate_reset();
+}
+
+UT_TEST(test_93da1_member_retains_sample_ack_until_exact_request_arrives)
+{
+	test_member_early_sample_ack(0);
+}
+
+UT_TEST(test_early_sample_ack_waits_for_coherent_authority)
+{
+	test_member_early_sample_ack(1);
+}
+
+UT_TEST(test_early_sample_ack_survives_second_authority_read_gap)
+{
+	test_member_early_sample_ack(2);
+}
+
+UT_TEST(test_staged_sample_ack_survives_idle_authority_gap)
+{
+	test_member_early_sample_ack(3);
+}
+
+UT_TEST(test_sample_ack_waits_for_local_gate_epoch)
+{
+	test_member_early_sample_ack(4);
+}
+
+UT_TEST(test_sample_ack_waits_for_local_empty_gate_proof)
+{
+	test_member_early_sample_ack(5);
+}
+
+UT_TEST(test_sample_ack_waits_after_stale_head_frame)
+{
+	test_member_early_sample_ack(6);
+}
+
+UT_TEST(test_retained_sample_ack_rechecks_round_and_peer_identity)
+{
+	for (int fault = 7; fault <= 12; fault++)
+		test_member_early_sample_ack(fault);
+}
+
+UT_TEST(test_retained_sample_ack_duplicate_during_gate_wait)
+{
+	test_member_early_sample_ack(13);
 }
 
 UT_TEST(test_93da2_member_retains_next_round_sample_ack_until_exact_request_arrives)
@@ -5273,7 +5629,8 @@ UT_TEST(test_99_shared_gate_layout_and_bootstrap_are_fail_closed)
 					 + MAXALIGN(TEST_SEMANTIC_BIT22_LATCH_BYTES)
 					 + MAXALIGN(TEST_SEMANTIC_BIT22_SEAM_BYTES)
 					 + MAXALIGN(TEST_SEMANTIC_BIT22_SOURCE_CLOSE_BYTES)
-					 + MAXALIGN(sizeof(pg_atomic_uint32)) + MAXALIGN(1104));
+					 + MAXALIGN(sizeof(SemanticServingCompletion))
+					 + MAXALIGN(sizeof(pg_atomic_uint32)) + MAXALIGN(1568));
 	UT_ASSERT(!cluster_r4_bit22_cutover_active());
 	UT_ASSERT(SemanticActivationAckTable
 			  == (ClusterSemanticActivationAckTableV1 *)test_semantic_ack_table.bytes);
@@ -5323,11 +5680,11 @@ UT_TEST(test_100a_modifier_bootstrap_source_requires_ordinary_write_gate)
 	test_gate_reset();
 	test_gate_publish(2, 0, 0, test_current_epoch, true);
 	UT_ASSERT_EQ(cluster_semantic_activation_modifier_enter(true, &token),
-				 CLUSTER_SEMANTIC_ADMISSION_OK);
-	UT_ASSERT(token.entered);
-	UT_ASSERT(cluster_semantic_activation_modifier_recheck(&token, true));
-	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 1);
-	cluster_semantic_activation_leave(&token);
+				 CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+	UT_ASSERT(!token.entered);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 0);
+	if (token.entered)
+		cluster_semantic_activation_leave(&token);
 }
 
 UT_TEST(test_100b_modifier_bootstrap_source_refuses_replacement_closed_member)
@@ -5460,11 +5817,52 @@ UT_TEST(test_106_exit_hook_drains_both_side_ledgers)
 	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 												   CLUSTER_SEMANTIC_TARGET_SIDE, &target_token),
 				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(cluster_semantic_activation_backend_has_admission());
 	UT_ASSERT_NOT_NULL(test_exit_callback);
 	if (test_exit_callback != NULL)
 		test_exit_callback(0, test_exit_callback_arg);
 	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_TARGET_SIDE, 0)), 0);
+	UT_ASSERT(!cluster_semantic_activation_backend_has_admission());
+}
+
+/* PGRAC: configuration reload consumes this local predicate for auxiliary
+ * owners too. Epoch drift or one token's release is not complete retirement;
+ * another process's shared debt is not this process's private ownership.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+UT_TEST(test_local_admission_observation_tracks_actual_auxiliary_lifetime)
+{
+	AuxProcType roles[] = { LmsProcess, LmsWorker1Process, UndoCleanerProcess, LmonProcess };
+	for (size_t role = 0; role < lengthof(roles); role++)
+		for (int side = CLUSTER_SEMANTIC_SOURCE_SIDE; side <= CLUSTER_SEMANTIC_TARGET_SIDE;
+			 side++) {
+			ClusterSemanticAdmissionToken first, second;
+			test_gate_reset();
+			MyAuxProcType = roles[role];
+			test_gate_publish(
+				2,
+				side == CLUSTER_SEMANTIC_TARGET_SIDE ? CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1 : 0,
+				17, test_current_epoch, false);
+			UT_ASSERT(!cluster_semantic_activation_backend_has_admission());
+			UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+														   side, &first),
+						 CLUSTER_SEMANTIC_ADMISSION_OK);
+			UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+														   side, &second),
+						 CLUSTER_SEMANTIC_ADMISSION_OK);
+			UT_ASSERT(cluster_semantic_activation_backend_has_admission());
+			test_current_epoch++;
+			UT_ASSERT(!cluster_semantic_activation_recheck(&first));
+			UT_ASSERT(cluster_semantic_activation_backend_has_admission());
+			cluster_semantic_activation_leave(&first);
+			UT_ASSERT(cluster_semantic_activation_backend_has_admission());
+			cluster_semantic_activation_leave(&second);
+			UT_ASSERT(!cluster_semantic_activation_backend_has_admission());
+			pg_atomic_write_u32(test_gate_inflight(side, 0), 1);
+			UT_ASSERT(!cluster_semantic_activation_backend_has_admission());
+		}
+	test_gate_reset();
 }
 
 UT_TEST(test_107_odd_snapshot_is_bounded_closed_without_debt)
@@ -5529,6 +5927,10 @@ UT_TEST(test_109a_lmon_publishes_source_open_only_after_majority_legacy_zero)
 	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 0);
 	UT_ASSERT_EQ(test_membership_snapshot_calls, 1);
 	UT_ASSERT_EQ(cluster_semantic_activation_modifier_enter(true, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+	UT_ASSERT(!token.entered);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_SOURCE_SIDE, &token),
 				 CLUSTER_SEMANTIC_ADMISSION_OK);
 	cluster_semantic_activation_leave(&token);
 }
@@ -7608,6 +8010,8 @@ ut_resource_x_open_carrier_setup(ClusterSemanticAdmissionToken *token)
 	ut_resource_x_open_carrier_setup_at_epoch(token, 7);
 }
 
+#include "test_cluster_terminal_peer.inc"
+
 /* The ordinary cutover retains R4 in its current target bitmap.  Its exact
  * complete OPEN_APPLIED image is not a recovery OPEN_PROOF image: a read-only
  * R4 consumer must accept the same current formation without rewriting it. */
@@ -8399,6 +8803,8 @@ ut_a142_setup(int node)
 	test_pgrd_candidate_state = CLUSTER_UNDO_SMGR_ROOT_MIRROR_EXACT;
 }
 
+static void test_clean_ready_for_node(int node);
+
 static void
 ut_a142_open_bytes(uint8 *bytes, int fault)
 {
@@ -8407,6 +8813,7 @@ ut_a142_open_bytes(uint8 *bytes, int fault)
 	memset(&open, 0, sizeof(open));
 	open.phase = fault == 1 ? CLUSTER_SEMANTIC_PHASE_COMMIT : CLUSTER_SEMANTIC_PHASE_OPEN;
 	open.record_generation = 6;
+	open.transition_epoch = cluster_shared_config ? 1 : 0;
 	open.source_feature_bitmap = 1;
 	open.target_feature_bitmap = 1025;
 	open.admitted_members_lo = fault == 2 ? 7 : 15;
@@ -8822,7 +9229,7 @@ UT_TEST(test_normal_start_separate_record_and_own_checkpoint_capture)
 	const char *failure;
 
 	ut_normal_start_setup();
-	UT_ASSERT_EQ(test_normal_start_requested_size, 1104);
+	UT_ASSERT_EQ(test_normal_start_requested_size, 1568);
 	UT_ASSERT_NOT_NULL(NormalStartCompletion);
 	if (NormalStartCompletion == NULL)
 		return;
@@ -8994,10 +9401,8 @@ UT_TEST(test_normal_start_bootstrap_requires_strict_source_at_entry_and_recheck)
 		ut_normal_start_setup();
 		pg_atomic_write_u32(&NormalStartCompletion->state, state);
 		UT_ASSERT_EQ(cluster_semantic_activation_modifier_enter(true, &token),
-					 state == 2 ? CLUSTER_SEMANTIC_ADMISSION_OK
-								: CLUSTER_SEMANTIC_ADMISSION_CLOSED);
-		UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)),
-					 state == 2 ? 1 : 0);
+					 CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+		UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 0);
 		if (token.entered)
 			cluster_semantic_activation_leave(&token);
 	}
@@ -9006,27 +9411,37 @@ UT_TEST(test_normal_start_bootstrap_requires_strict_source_at_entry_and_recheck)
 	memset(test_r4fsm_bootstrap_bytes, 0, 512);
 	UT_ASSERT(cluster_semantic_normal_start_prepare(true, 0, &failure));
 	UT_ASSERT_EQ(cluster_semantic_activation_modifier_enter(true, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+	if (token.entered)
+		cluster_semantic_activation_leave(&token);
+	/* A real SOURCE read may still enter, but it is never a modifier token. */
+	test_gate_publish(2, 0, 0, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_SOURCE_SIDE, &token),
 				 CLUSTER_SEMANTIC_ADMISSION_OK);
-	UT_ASSERT(cluster_semantic_activation_modifier_recheck(&token, true));
+	UT_ASSERT(!cluster_semantic_activation_modifier_recheck(&token, true));
 	pg_atomic_write_u32(&NormalStartCompletion->state, 5);
 	UT_ASSERT(!cluster_semantic_activation_modifier_recheck(&token, true));
 	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 1);
 	cluster_semantic_activation_leave(&token);
 }
 
-UT_TEST(test_normal_start_bootstrap_after_debt_change_releases_only_its_debt)
+UT_TEST(test_normal_start_zero_modifier_refusal_preserves_read_debt)
 {
-	ClusterSemanticAdmissionToken token;
+	ClusterSemanticAdmissionToken token, reader;
 	ut_normal_start_setup();
 	pg_atomic_write_u32(&NormalStartCompletion->state, 2);
-	test_read_barrier_count = 0;
-	test_fail_normal_on_read_barrier = 3; /* Real helper's second snapshot, after ++debt. */
-	UT_ASSERT_EQ(semantic_activation_modifier_enter_bootstrap(true, &token),
-				 CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED);
+	test_gate_publish(2, 0, 0, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_SOURCE_SIDE, &reader),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(cluster_semantic_activation_modifier_enter(true, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_CLOSED);
 	UT_ASSERT(!token.entered);
-	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 1);
 	if (token.entered)
 		cluster_semantic_activation_leave(&token);
+	cluster_semantic_activation_leave(&reader);
 }
 
 UT_TEST(test_normal_start_closed_modes_block_regular_and_terminal_census)
@@ -9110,6 +9525,10 @@ ut_a142_frame(int source, bool ack, uint64 nonce, uint64 incarnation)
 	message.target_feature_bitmap = 1025;
 	message.admitted_members_lo = 15;
 	message.capability_sample_digest = UINT64_C(0xabc123);
+	if (cluster_shared_config) {
+		message.transition_epoch = NormalStartCompletion->epoch;
+		memcpy(message.restart_binding, NormalStartCompletion->restart_binding, 32);
+	}
 	if (ack) {
 		message.boot_id = incarnation;
 		message.admitted_incarnation = incarnation;
@@ -9121,6 +9540,7 @@ ut_a142_frame(int source, bool ack, uint64 nonce, uint64 incarnation)
 	envelope.source_node_id = source;
 	envelope.dest_node_id = cluster_node_id;
 	envelope.payload_length = sizeof(payload);
+	envelope.epoch = message.transition_epoch;
 	cluster_semantic_activation_ack_handler(&envelope, payload);
 	semantic_activation_ack_lmon_drain();
 }
@@ -9281,6 +9701,433 @@ UT_TEST(test_normal_start_pending_self_ack_rechecks_completion_at_actual_send)
 	UT_ASSERT_EQ(test_send_calls[0], sent);
 	UT_ASSERT((semantic_activation_ack_local_pending_send.pending_members_lo & 1) != 0);
 	test_gate_reset();
+}
+
+UT_TEST(test_clean_restart_missing_fanout_peer_retries_before_open)
+{
+	for (int shared = 0; shared <= 1; shared++) {
+		ClusterSemanticActivationRecord open;
+		ClusterSemanticActivationReadRequest read;
+		uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+		uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+		uint64 incarnations[4], generation;
+		const char *reason;
+
+		if (shared)
+			test_clean_ready_for_node(3);
+		else {
+			ut_a142_setup(3);
+			ut_a148_ready_input();
+		}
+		cluster_semantic_activation_lmon_tick();
+		(void)ut_a142_complete_open_read(0);
+		ut_a142_frame(0, false, 23, 0);
+		test_capability_missing_peer = 1;
+		ut_a142_local_root(false);
+		UT_ASSERT(semantic_activation_restart.local_ready);
+		UT_ASSERT(!semantic_activation_restart.failed);
+		UT_ASSERT(!semantic_activation_ack_local_pending_send.invalidated);
+		UT_ASSERT((semantic_activation_ack_local_pending_send.pending_members_lo & 2) != 0);
+		if (semantic_activation_restart.failed) {
+			test_gate_reset();
+			continue;
+		}
+		for (int tick = 0; tick < 3; tick++) {
+			cluster_semantic_activation_lmon_tick();
+			UT_ASSERT_EQ(test_send_calls[1], 0);
+			UT_ASSERT(!semantic_activation_restart.failed);
+			UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 1);
+		}
+		/* Missing evidence cannot manufacture the identity needed to stop. */
+		MyAuxProcType = LmonProcess;
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&open, root, incarnations, &reason),
+					 CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT_STR_EQ(reason, "SEMANTIC_STOP_READ_INVALID");
+
+		test_capability_missing_peer = -1;
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT_EQ(test_send_calls[0], 1); /* no duplicate delivery to the ready peer */
+		UT_ASSERT_EQ(test_send_calls[1], 1);
+		UT_ASSERT_EQ(test_send_calls[2], 1);
+		UT_ASSERT_EQ(semantic_activation_ack_local_pending_send.pending_members_lo, 0);
+		for (int peer = 0; peer < 3; peer++)
+			ut_a142_frame(peer, true, 23, UINT64_C(0x100) + peer);
+		UT_ASSERT_EQ(SemanticActivationAckTable->observed_members_lo, 15);
+		cluster_semantic_activation_lmon_tick();
+		(void)ut_a142_complete_open_read(0);
+		UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation),
+					 RESOURCE_X_WRITER_CLOSED);
+		test_resource_x_cutover_digest_valid = true;
+		test_resource_x_cutover_digest = 99;
+		test_resource_x_cutover_token.old_formation = 1;
+		test_resource_x_cutover_token.new_formation = 2;
+		test_resource_x_cutover_token.freeze_generation = 1;
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation),
+					 RESOURCE_X_WRITER_CLOSED);
+		test_resource_x_cutover_thawed = true;
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation),
+					 RESOURCE_X_WRITER_TARGET);
+		UT_ASSERT_EQ(generation, 6);
+		UT_ASSERT(semantic_activation_restart.opened);
+
+		/* The unchanged stop reader can now prove OPEN through its own read. */
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&open, root, incarnations, &reason),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT(cluster_semantic_activation_qvotec_poll_record_read(&read));
+		ut_a142_open_bytes(bytes, 0);
+		UT_ASSERT(cluster_semantic_activation_qvotec_complete_record_read(
+			read.request_seq, CLUSTER_SEMANTIC_ACTIVATION_OK, false, bytes));
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&open, root, incarnations, &reason),
+					 CLUSTER_NORMAL_STOP_READY);
+		if (shared)
+			ut_cold_cleanup();
+		else
+			test_gate_reset();
+	}
+}
+
+UT_TEST(test_clean_restart_missing_request_peer_retains_same_round)
+{
+	uint64 nonce;
+	ut_a142_setup(0);
+	ut_a148_ready_input();
+	test_send_results[1] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	cluster_semantic_activation_lmon_tick();
+	nonce = ut_a142_complete_open_read(0);
+	UT_ASSERT(semantic_activation_restart.requested);
+	UT_ASSERT_EQ(test_send_calls[1], 1);
+	test_capability_missing_peer = 1;
+	for (int tick = 0; tick < 3; tick++) {
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT(!semantic_activation_restart.failed);
+		UT_ASSERT(semantic_activation_ack_local_request_origin.active);
+		UT_ASSERT_EQ(test_send_calls[1], 1);
+		UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 1);
+	}
+	test_capability_missing_peer = -1;
+	test_send_results[1] = CLUSTER_IC_SEND_DONE;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(test_send_calls[1], 2);
+	UT_ASSERT_EQ(test_send_calls[2], 1);
+	UT_ASSERT_EQ(test_send_calls[3], 1);
+	UT_ASSERT_EQ(semantic_activation_ack_local_request_origin.unsent_members_lo, 0);
+	UT_ASSERT_EQ(SemanticActivationAckTable->round_nonce, nonce);
+	UT_ASSERT(!semantic_activation_restart.failed);
+	test_gate_reset();
+}
+
+/* Same real restart owner/ACK machinery as the clean-boot acceptance above. */
+static void
+ut_s17_waiting_ack(void)
+{
+	ut_a142_setup(3);
+	MyAuxProcType = LmonProcess;
+	ut_a148_ready_input();
+	cluster_semantic_activation_lmon_tick();
+	(void)ut_a142_complete_open_read(0);
+	ut_a142_frame(0, false, 23, 0);
+	test_capability_missing_bitmap = 6;
+	test_capture_activation_log = true;
+	ut_a142_local_root(false);
+}
+
+UT_TEST(test_restart_wait_diagnostic_tracks_current_peer_and_logs_once)
+{
+	const char *domain, *reason;
+	uint64 key, pending;
+	ut_s17_waiting_ack();
+	pending = semantic_activation_ack_local_pending_send.pending_members_lo;
+	for (int tick = 0; tick < 12; tick++) {
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_STR_EQ(domain, "R4_ACK_SEND");
+		UT_ASSERT_STR_EQ(reason, "SEMANTIC_ACK_PEER_CAPABILITY_PENDING");
+		UT_ASSERT_EQ(key, 1);
+		UT_ASSERT_EQ(SemanticActivationAckTable->round_nonce, 23);
+		UT_ASSERT_EQ(semantic_activation_ack_local_pending_send.pending_members_lo, pending);
+		UT_ASSERT(!semantic_activation_restart.opened);
+	}
+	UT_ASSERT_EQ(test_activation_diag_logs, 1);
+	UT_ASSERT(strstr(test_activation_last_diag, "nonce=23") != NULL);
+	UT_ASSERT(strstr(test_activation_last_diag, "epoch=0") != NULL);
+	UT_ASSERT(strstr(test_activation_last_diag, "phase=5") != NULL);
+	test_capability_missing_bitmap = 4;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_STR_EQ(reason, "SEMANTIC_ACK_PEER_CAPABILITY_PENDING");
+	UT_ASSERT_EQ(key, 2);
+	UT_ASSERT_EQ(test_activation_diag_logs, 1);
+	test_capability_missing_bitmap = 0;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(semantic_activation_ack_local_pending_send.pending_members_lo, 0);
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(reason, "SEMANTIC_ACK_PEER_CAPABILITY_PENDING") != 0);
+	UT_ASSERT(!semantic_activation_restart.opened); /* clearing text proves nothing */
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "SEMANTIC_STOP_OWNER_OR_SHARED_STATE_INVALID");
+	test_gate_reset();
+}
+
+UT_TEST(test_restart_initial_record_failure_has_original_read_diagnostic)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		ClusterSemanticActivationReadRequest read;
+		ClusterSemanticActivationRecord open;
+		uint8 bytes[512], root[512];
+		const char *domain, *reason;
+		uint64 key;
+		const char *expected = fault == 0 ? "SEMANTIC_RESTART_RECORD_INVALID"
+										  : "SEMANTIC_RESTART_RECORD_IDENTITY_INVALID";
+
+		ut_a142_setup(0);
+		MyAuxProcType = LmonProcess;
+		ut_a148_ready_input();
+		test_capture_activation_log = true;
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT(cluster_semantic_activation_qvotec_poll_record_read(&read));
+		ut_a142_open_bytes(bytes, fault);
+		UT_ASSERT(cluster_semantic_activation_qvotec_complete_record_read(
+			read.request_seq, CLUSTER_SEMANTIC_ACTIVATION_OK, false, bytes));
+		if (fault == 0)
+			SemanticActivationShmem->record_cas_desired_bytes[511] ^= 1;
+		for (int tick = 0; tick < 3; tick++) {
+			cluster_semantic_activation_lmon_tick();
+			UT_ASSERT(semantic_activation_restart.failed);
+			UT_ASSERT(!semantic_activation_restart.requested);
+			UT_ASSERT(!semantic_activation_restart.opened);
+			UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+						 CLUSTER_NORMAL_STOP_INVALID);
+			UT_ASSERT_STR_EQ(domain, "R4_RESTART");
+			UT_ASSERT_STR_EQ(reason, expected);
+			UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&open, root, NULL, &reason),
+						 CLUSTER_NORMAL_STOP_INVALID);
+			UT_ASSERT_STR_EQ(reason, expected);
+		}
+		UT_ASSERT_EQ(semantic_activation_restart.diagnostic.nonce, read.request_seq);
+		UT_ASSERT_EQ(test_activation_diag_logs, 1);
+		UT_ASSERT_EQ(test_send_calls[1] + test_send_calls[2] + test_send_calls[3], 0);
+		test_gate_reset();
+	}
+}
+
+UT_TEST(test_restart_diagnostic_preserves_unrelated_stop_obligation)
+{
+	for (int invalid = 0; invalid < 2; invalid++) {
+		const char *domain, *reason;
+		uint64 key;
+		ut_s17_waiting_ack();
+		if (invalid) {
+			test_capability_missing_bitmap = 0;
+			test_send_results[1] = CLUSTER_IC_SEND_HARD_ERROR;
+			cluster_semantic_activation_lmon_tick();
+			UT_ASSERT(semantic_activation_restart.failed);
+			semantic_activation_local_inflight[1][5] = 2;
+		}
+		pg_atomic_write_u32(&SemanticActivationShmem->inflight[1][5], 1);
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+					 invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_STR_EQ(domain, "R4_ADMISSION");
+		UT_ASSERT_STR_EQ(reason, invalid ? "SEMANTIC_STOP_LOCAL_DEBT_EXCEEDS_SHARED"
+										 : "SEMANTIC_STOP_ADMISSION_PENDING");
+		UT_ASSERT_EQ(key, 69);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&SemanticActivationShmem->inflight[1][5]), 1);
+		test_gate_reset();
+	}
+}
+
+UT_TEST(test_restart_authority_diagnostic_uses_restart_domain)
+{
+	const char *domain, *reason;
+	uint64 key;
+	ut_s17_waiting_ack();
+	test_initial_clean_snapshot_valid = false;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_STR_EQ(domain, "R4_RESTART");
+	UT_ASSERT_STR_EQ(reason, "SEMANTIC_RESTART_AUTHORITY_PENDING");
+	UT_ASSERT(!semantic_activation_restart.opened);
+	test_gate_reset();
+}
+
+UT_TEST(test_restart_diagnostic_does_not_hide_invalid_stop_reader)
+{
+	const char *reason;
+	uint8 root[512];
+	ut_s17_waiting_ack();
+	test_current_epoch++;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT(semantic_activation_restart.diagnostic.invalid);
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(NULL, root, NULL, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "SEMANTIC_STOP_READ_INVALID");
+	test_gate_reset();
+}
+
+UT_TEST(test_restart_epoch_change_retires_the_old_missing_peer_diagnostic)
+{
+	const char *domain, *reason;
+	uint64 key;
+	ut_s17_waiting_ack();
+	test_capability_missing_bitmap = 0;
+	test_current_epoch++;
+	for (int tick = 0; tick < 3; tick++) {
+		cluster_semantic_activation_lmon_tick();
+		/* The original restart owner waits here. Diagnostics do not turn its
+		 * verdict into either INVALID or READY. */
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_STR_EQ(reason, "SEMANTIC_RESTART_EPOCH_CHANGED");
+		UT_ASSERT_STR_EQ(domain, "R4_RESTART");
+		UT_ASSERT_EQ(key, 3);
+		UT_ASSERT(!semantic_activation_restart.opened);
+	}
+	UT_ASSERT_EQ(test_activation_diag_logs, 2);
+	test_gate_reset();
+}
+
+UT_TEST(test_restart_final_record_contradiction_retains_first_diagnostic)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		const char *reason;
+		ClusterSemanticActivationRecord open;
+		uint8 root[512];
+		ut_s17_waiting_ack();
+		test_capability_missing_bitmap = 0;
+		cluster_semantic_activation_lmon_tick();
+		if (fault == 0) {
+			SemanticActivationAckTable->record_generation++;
+			cluster_semantic_activation_lmon_tick();
+		} else {
+			for (int peer = 0; peer < 3; peer++)
+				ut_a142_frame(peer, true, 23, UINT64_C(0x100) + peer);
+			cluster_semantic_activation_lmon_tick();
+			(void)ut_a142_complete_open_read(1); /* valid, different PGSA */
+		}
+		UT_ASSERT(semantic_activation_restart.failed);
+		for (int tick = 0; tick < 3; tick++) {
+			cluster_semantic_activation_lmon_tick();
+			UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(NULL, NULL, &reason),
+						 CLUSTER_NORMAL_STOP_INVALID);
+			UT_ASSERT_STR_EQ(reason, "SEMANTIC_RESTART_RECORD_CHANGED");
+			UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&open, root, NULL, &reason),
+						 CLUSTER_NORMAL_STOP_INVALID);
+			UT_ASSERT_STR_EQ(reason, "SEMANTIC_RESTART_RECORD_CHANGED");
+		}
+		UT_ASSERT_EQ(test_activation_diag_logs, 2);
+		UT_ASSERT(!semantic_activation_restart.opened);
+		test_gate_reset();
+	}
+}
+
+UT_TEST(test_restart_invalidation_keeps_first_reason_through_normal_stop)
+{
+	const char *expected[]
+		= { "SEMANTIC_ACK_CAPABILITY_INVALID", "SEMANTIC_RESTART_READY_IDENTITY_INVALID",
+			"SEMANTIC_RESTART_READY_IDENTITY_INVALID", "SEMANTIC_ACK_SEND_FAILED",
+			"SEMANTIC_ACK_PEER_IDENTITY_INVALID" };
+	for (int fault = 0; fault < 5; fault++) {
+		const char *domain, *reason;
+		uint64 key;
+		ClusterSemanticActivationRecord open;
+		uint8 root[512];
+		ut_s17_waiting_ack();
+		test_capability_missing_bitmap = 0;
+		switch (fault) {
+		case 0:
+			test_peer_capability_word &= ~PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+			break;
+		case 1:
+			NormalStartCompletion->boot_incarnation++;
+			break;
+		case 2:
+			NormalStartCompletion->pgrd[511] ^= 1;
+			break;
+		case 3:
+			test_send_results[1] = CLUSTER_IC_SEND_HARD_ERROR;
+			break;
+		case 4:
+			ut_a142_frame(0, true, 23, UINT64_C(0x999));
+			break;
+		}
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT(semantic_activation_restart.failed);
+		for (int tick = 0; tick < 3; tick++) {
+			cluster_semantic_activation_lmon_tick();
+			UT_ASSERT_EQ(cluster_semantic_normal_stop_poll(&domain, &key, &reason),
+						 CLUSTER_NORMAL_STOP_INVALID);
+			UT_ASSERT_STR_EQ(reason, expected[fault]);
+			UT_ASSERT_EQ(cluster_semantic_normal_stop_read_identity(&open, root, NULL, &reason),
+						 CLUSTER_NORMAL_STOP_INVALID);
+			UT_ASSERT_STR_EQ(reason, expected[fault]);
+			UT_ASSERT(!semantic_activation_restart.opened);
+		}
+		UT_ASSERT_EQ(test_activation_diag_logs, 2); /* first wait, first invalid */
+		test_gate_reset();
+	}
+}
+
+UT_TEST(test_clean_restart_proven_capability_contradiction_still_invalidates)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		ut_a142_setup(3);
+		ut_a148_ready_input();
+		cluster_semantic_activation_lmon_tick();
+		(void)ut_a142_complete_open_read(0);
+		ut_a142_frame(0, false, 23, 0);
+		test_send_results[1] = CLUSTER_IC_SEND_NOT_ADMITTED;
+		ut_a142_local_root(false);
+		UT_ASSERT(!semantic_activation_restart.failed);
+		if (fault == 0)
+			test_peer_capability_word &= ~PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+		else
+			test_peer_capability_generation = 0;
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT(semantic_activation_restart.failed);
+		UT_ASSERT(semantic_activation_ack_local_pending_send.invalidated);
+		UT_ASSERT_EQ(test_send_calls[1], 1);
+		UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 1);
+		test_gate_reset();
+	}
+}
+
+UT_TEST(test_clean_restart_delayed_peer_cannot_restore_old_identity)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		ut_a142_setup(3);
+		ut_a148_ready_input();
+		cluster_semantic_activation_lmon_tick();
+		(void)ut_a142_complete_open_read(0);
+		ut_a142_frame(0, false, 23, 0);
+		test_capability_missing_peer = 1;
+		ut_a142_local_root(false);
+		test_capability_missing_peer = -1;
+		if (fault == 0)
+			test_current_epoch++;
+		else if (fault == 1)
+			NormalStartCompletion->pgrd[511] ^= 1;
+		else {
+			test_peer_capability_generation++;
+			test_peer_capability_matches = false; /* old ingress connection no longer current */
+		}
+		cluster_semantic_activation_lmon_tick();
+		for (int peer = 0; peer < 3; peer++)
+			ut_a142_frame(peer, true, 23, UINT64_C(0x100) + peer);
+		cluster_semantic_activation_lmon_tick();
+		UT_ASSERT(!semantic_activation_restart.opened);
+		UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 1);
+		UT_ASSERT_EQ(SemanticActivationAckTable->observed_members_lo & 7, 0);
+		if (fault < 2)
+			UT_ASSERT_EQ(test_send_calls[1], 0);
+		test_gate_reset();
+	}
 }
 
 UT_TEST(test_normal_start_local_ack_binds_full_payload_and_current_identity)
@@ -9746,6 +10593,40 @@ UT_TEST(test_a148_stop_identity_matches_full_record_root_and_current_members)
 	test_gate_reset();
 }
 
+UT_TEST(test_pre2_semantic_stop_accepts_exact_declared_pair)
+{
+	const uint64 sets[] = { 3, 9 };
+	for (unsigned i = 0; i < lengthof(sets); i++) {
+		ClusterSemanticActivationRecord open;
+		uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+		uint64 incarnations[4];
+		ut_a148_stop_identity(&open, root, 7);
+		cluster_shared_config = true;
+		open.admitted_members_lo = test_membership_snapshot_lo = sets[i];
+		SemanticActivationAckTable->expected_members_lo = sets[i];
+		SemanticActivationAckTable->observed_members_lo = sets[i];
+		for (int node = 0; node < 4; node++)
+			if ((sets[i] & (UINT64_C(1) << node)) == 0) {
+				memset(&SemanticActivationAckTable->expected[node], 0,
+					   sizeof(SemanticActivationAckTable->expected[node]));
+				memset(&SemanticActivationAckTable->observed[node], 0,
+					   sizeof(SemanticActivationAckTable->observed[node]));
+				test_remote_admitted_incarnations[node] = 0;
+			}
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, incarnations, NULL),
+					 CLUSTER_NORMAL_STOP_READY);
+		for (int node = 0; node < 4; node++)
+			UT_ASSERT_EQ(incarnations[node],
+						 SemanticActivationAckTable->expected[node].admitted_incarnation);
+		/* Losing a declared peer is not permission to shrink the round. */
+		test_membership_snapshot_lo = 1;
+		UT_ASSERT(cluster_semantic_normal_stop_match(&open, root, incarnations, NULL)
+				  != CLUSTER_NORMAL_STOP_READY);
+		cluster_shared_config = false;
+		test_gate_reset();
+	}
+}
+
 UT_TEST(test_a148_stop_identity_rejects_record_and_namespace_contradictions)
 {
 	ClusterSemanticActivationRecord open, bad;
@@ -9944,6 +10825,10 @@ UT_TEST(test_stop_real_observation_survives_terminal_peer_alive_clear)
 	test_stop_real_observation = true;
 	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, incarnations, NULL),
 				 CLUSTER_NORMAL_STOP_READY);
+	test_stop_storage_quorum = false;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, incarnations, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	test_stop_storage_quorum = true;
 	test_terminal_peer_open = open;
 	memcpy(test_terminal_peer_root, root, sizeof(root));
 	test_terminal_peer_record_enabled = test_terminal_peer_eligible = true;
@@ -10532,17 +11417,61 @@ UT_TEST(test_a148_stop_poll_includes_original_phase3_handoff)
 }
 
 #include "test_cluster_normal_cold_startup.h"
+static void test_serving_setup(bool restart);
+static void test_serving_finish_root(void);
+#include "test_cluster_first_open.h"
+#include "test_cluster_serving_admission.h"
+#include "test_cluster_sample_ack_handoff.h"
+#include "test_cluster_clean_restart_formation.h"
 
 int
 main(void)
 {
-	UT_PLAN(308);
+	UT_PLAN(378);
+	UT_RUN(test_barrier_waits_for_both_late_peer_samples_in_either_order);
+	UT_RUN(test_staged_sample_ack_survives_idle_authority_gap);
+	UT_RUN(test_sample_ack_waits_for_local_gate_epoch);
+	UT_RUN(test_sample_ack_waits_for_local_empty_gate_proof);
+	UT_RUN(test_sample_ack_waits_after_stale_head_frame);
+	UT_RUN(test_retained_sample_ack_rechecks_round_and_peer_identity);
+	UT_RUN(test_retained_sample_ack_duplicate_during_gate_wait);
+	UT_RUN(test_sample_observable_drift_still_invalidates_retained_proof);
+	UT_RUN(test_early_sample_ack_waits_for_coherent_authority);
+	UT_RUN(test_early_sample_ack_survives_second_authority_read_gap);
+	UT_RUN(test_sample_barrier_preserves_partial_proof_during_observation_gap);
+	UT_RUN(test_sample_barrier_preserves_partial_proof_at_second_read_gap);
+	UT_RUN(test_sample_fanout_finishes_before_barrier_replaces_owner);
+	UT_RUN(test_first_open_authority_submit_notifies_after_exact_publication);
+	UT_RUN(test_first_open_authority_completion_notifies_after_exact_publication);
+	UT_RUN(test_first_open_barrier_waits_for_last_sample_ack);
+	UT_RUN(test_first_open_barrier_rejects_changed_authority);
+	UT_RUN(test_first_open_requires_installed_original_input);
+	UT_RUN(test_first_open_request_cannot_publish_admission);
+	UT_RUN(test_first_open_foreign_mailbox_is_not_consumed);
+	UT_RUN(test_first_open_exact_reply_is_not_open_proof);
+	UT_RUN(test_first_open_epoch_or_writer_drift_cannot_rebind);
+	UT_RUN(test_first_open_requires_both_real_admission_gates);
+	UT_RUN(test_first_start_sql_waits_for_root_serving);
+	UT_RUN(test_clean_restart_sql_waits_for_root_serving);
+	UT_RUN(test_serving_owner_waits_for_exact_root_release_and_frees_mailbox);
+	UT_RUN(test_serving_rejects_failed_or_empty_completion);
+	UT_RUN(test_serving_retries_transient_root_conflict_without_ready);
+	UT_RUN(test_serving_transient_retry_still_rejects_changed_epoch);
+	UT_RUN(test_serving_identity_mismatch_stays_terminal_for_same_cut);
+	UT_RUN(test_serving_old_result_rejected_after_cut_changes);
+	UT_RUN(test_serving_rechecks_identity_after_root_poll);
+	UT_RUN(test_serving_only_original_lmon_consumes_complete_open);
+	UT_RUN(test_serving_releases_read_before_rejecting_invalid_durable_input);
+	UT_RUN(test_serving_respects_other_mailbox_owner_and_cancels_on_stop);
+	UT_RUN(test_serving_drift_does_not_orphan_inflight_authority_read);
+	UT_RUN(test_first_open_lmon_rechecks_live_writer);
+	UT_RUN(test_first_open_request_drives_original_sample_consumer);
 	UT_RUN(test_normal_actual_finish_preserves_unconfigured_native_startup);
 	UT_RUN(test_normal_start_pending_ack_does_not_reuse_root_after_valid_mirror_drift);
 	UT_RUN(test_normal_start_confirmed_new_root_permanently_rejects_old_completion);
 	UT_RUN(test_normal_actual_own_wal_capture_not_peer_control);
 	UT_RUN(test_normal_actual_prepare_uses_all_original_clean_inputs);
-	UT_RUN(test_normal_actual_postjobs_skip_only_classified_normal_target);
+	UT_RUN(test_normal_actual_postjobs_exclude_shared_legacy_page_rollback);
 	UT_RUN(test_normal_actual_finish_requires_cf_and_hw_and_keeps_disk_history);
 	UT_RUN(test_normal_actual_finish_failure_is_fatal_not_ready);
 	UT_RUN(test_01_feature_bit_is_one);
@@ -10713,6 +11642,7 @@ main(void)
 	UT_RUN(test_104_close_invalidates_recheck_and_leave_balances_once);
 	UT_RUN(test_105_pid_change_discards_inherited_local_ledger_only);
 	UT_RUN(test_106_exit_hook_drains_both_side_ledgers);
+	UT_RUN(test_local_admission_observation_tracks_actual_auxiliary_lifetime);
 	UT_RUN(test_107_odd_snapshot_is_bounded_closed_without_debt);
 	UT_RUN(test_108_nonregistered_feature_is_closed_without_debt);
 	UT_RUN(test_109_lmon_without_validated_majority_remains_closed);
@@ -10769,6 +11699,11 @@ main(void)
 	UT_RUN(test_145e_restore_open_proof_is_idempotent);
 	UT_RUN(test_145f_restore_open_proof_requires_active_latch);
 	UT_RUN(test_145g_peer_open_matches_consumes_open_proof);
+	UT_RUN(test_terminal_peer_stale_origin_has_only_inquiry_qualification);
+	UT_RUN(test_terminal_peer_missing_authority_clears_output);
+	UT_RUN(test_terminal_peer_aba_invalidates_original_snapshot);
+	UT_RUN(test_terminal_peer_mid_sample_drift_is_refused);
+	UT_RUN(test_terminal_peer_uses_actual_recovered_open_carrier);
 	UT_RUN(test_r4_peer_accepts_completed_ordinary_cutover_without_recovery_flag);
 	UT_RUN(test_ordinary_open_reaches_real_master_route_and_stale_peer_does_not);
 	UT_RUN(test_r4_peer_ordinary_open_rechecks_every_member_and_feature);
@@ -10790,6 +11725,20 @@ main(void)
 	UT_RUN(test_145u_cas_binding_copy_contradiction_cannot_retain_utility);
 	UT_RUN(test_a142_clean_restart_requests_fresh_open_while_closed);
 	UT_RUN(test_normal_start_separate_record_and_own_checkpoint_capture);
+	UT_RUN(test_clean_formation_old_pgsa_classifies_loading_at_current_epoch);
+	UT_RUN(test_clean_formation_missing_original_input_cannot_classify_ready);
+	UT_RUN(test_clean_formation_bridge_contradictions_fail_before_loading);
+	UT_RUN(test_clean_formation_actual_loader_requires_exact_installed_claim);
+	UT_RUN(test_clean_formation_ready_enters_original_restart_read_owner);
+	UT_RUN(test_clean_restart_rejects_previous_ack_wire_version);
+	UT_RUN(test_clean_formation_all_nodes_reach_current_open_without_rewriting_pgsa);
+	UT_RUN(test_clean_formation_current_epoch_refuses_changed_bridge_and_carriers);
+	UT_RUN(test_clean_formation_early_late_duplicate_ack_keeps_exact_round);
+	UT_RUN(test_clean_formation_binding_ack_cannot_be_reused_for_another_root);
+	UT_RUN(test_clean_formation_first_request_survives_membership_observation_gap);
+	UT_RUN(test_clean_formation_preinstall_input_does_not_borrow_final_admission);
+	UT_RUN(test_clean_formation_stop_terminal_receipt_is_not_partial_open);
+
 	UT_RUN(test_normal_census_full_owner_namespace_retains_terminal_history);
 	UT_RUN(test_normal_census_sparse_and_zero_are_complete_not_cursor_based);
 	UT_RUN(test_normal_census_refuses_active_invalid_short_and_wrong_owner_without_writes);
@@ -10804,6 +11753,18 @@ main(void)
 	UT_RUN(test_normal_start_local_ack_binds_full_payload_and_current_identity);
 	UT_RUN(test_normal_start_final_open_rechecks_full_ready_bytes);
 	UT_RUN(test_normal_start_pending_self_ack_rechecks_completion_at_actual_send);
+	UT_RUN(test_clean_restart_missing_fanout_peer_retries_before_open);
+	UT_RUN(test_clean_restart_missing_request_peer_retains_same_round);
+	UT_RUN(test_restart_wait_diagnostic_tracks_current_peer_and_logs_once);
+	UT_RUN(test_restart_initial_record_failure_has_original_read_diagnostic);
+	UT_RUN(test_restart_diagnostic_preserves_unrelated_stop_obligation);
+	UT_RUN(test_restart_authority_diagnostic_uses_restart_domain);
+	UT_RUN(test_restart_diagnostic_does_not_hide_invalid_stop_reader);
+	UT_RUN(test_restart_epoch_change_retires_the_old_missing_peer_diagnostic);
+	UT_RUN(test_restart_final_record_contradiction_retains_first_diagnostic);
+	UT_RUN(test_restart_invalidation_keeps_first_reason_through_normal_stop);
+	UT_RUN(test_clean_restart_proven_capability_contradiction_still_invalidates);
+	UT_RUN(test_clean_restart_delayed_peer_cannot_restore_old_identity);
 	UT_RUN(test_normal_start_only_strict_zero_is_source);
 	UT_RUN(test_normal_start_bad_identity_and_debt_never_load);
 	UT_RUN(test_normal_start_incomplete_or_changed_root_is_sticky);
@@ -10811,7 +11772,7 @@ main(void)
 	UT_RUN(test_normal_start_capture_drift_and_wrong_writer_refuse);
 	UT_RUN(test_normal_start_identity_rechecked_after_real_root_read);
 	UT_RUN(test_normal_start_bootstrap_requires_strict_source_at_entry_and_recheck);
-	UT_RUN(test_normal_start_bootstrap_after_debt_change_releases_only_its_debt);
+	UT_RUN(test_normal_start_zero_modifier_refusal_preserves_read_debt);
 	UT_RUN(test_normal_start_closed_modes_block_regular_and_terminal_census);
 	UT_RUN(test_normal_start_publish_and_legacy_sync_cannot_bypass_mode);
 	UT_RUN(test_a142_clean_start_observation_is_not_rearmable);
@@ -10826,6 +11787,7 @@ main(void)
 	UT_RUN(test_a142_early_ack_duplicate_is_idempotent_but_conflict_refuses);
 	UT_RUN(test_a142_current_member_change_prevents_native_projection);
 	UT_RUN(test_a148_stop_identity_matches_full_record_root_and_current_members);
+	UT_RUN(test_pre2_semantic_stop_accepts_exact_declared_pair);
 	UT_RUN(test_a148_stop_identity_rejects_record_and_namespace_contradictions);
 	UT_RUN(test_a148_stop_identity_observation_gaps_do_not_publish_partial_identity);
 	UT_RUN(test_terminal_peer_disconnect_allows_only_normal_stop_receipt_observation);

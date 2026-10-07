@@ -32,6 +32,10 @@
 #include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_writer.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tx_enqueue.h"
 #include "cluster/cluster_tx_resolve.h"
@@ -74,6 +78,32 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 
 /* Exercise the real product-local policy helpers without exporting a test API. */
 #include "../../backend/cluster/cluster_semantic_activation.c"
+
+/* This lock-policy fixture does not install a native startup writer or
+ * run its CLEAN formation owner. Retained ELF sections must still link. */
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+
+bool
+cluster_write_fence_allowed(void)
+{
+	abort();
+}
+
+bool
+cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread pg_attribute_unused(),
+											   ClusterFormationSnapshotV1 *out
+												   pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_wal_thread_initialized_writer_matches(const ClusterWalSourceRef *ref pg_attribute_unused(),
+											  uint64 epoch pg_attribute_unused())
+{
+	abort();
+}
+
 #include "../../backend/cluster/cluster_uba.c"
 
 #undef printf
@@ -81,10 +111,12 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 #undef snprintf
 
 #include "unit_test.h"
+#include "cluster_snapshot_test_stubs.h"
 
 UT_DEFINE_GLOBALS();
 
 static bool ut_capture_error;
+bool cluster_shared_config;
 static bool ut_capture_miss_log;
 static bool ut_finishing_miss_log;
 static int ut_miss_log_count;
@@ -712,8 +744,33 @@ BufferGetLSNAtomic(Buffer buffer pg_attribute_unused())
 bool
 BufferIsPermanent(Buffer buffer pg_attribute_unused())
 {
+	if (cluster_shared_config)
+		return true;
 	UT_ASSERT(false);
 	return false;
+}
+
+/* This fixture supplies SPACE through its existing pre-lock I/O seam. The
+ * backend cache/hint producer is exercised by test_cluster_space_cache. */
+void
+hash_seq_init(HASH_SEQ_STATUS *scan, HTAB *table)
+{
+	abort();
+}
+void *
+hash_seq_search(HASH_SEQ_STATUS *scan)
+{
+	abort();
+}
+void
+hash_seq_term(HASH_SEQ_STATUS *scan)
+{
+	abort();
+}
+bool
+LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
+{
+	return mode == LW_EXCLUSIVE && LWLockHeldByMe(lock);
 }
 
 bool
@@ -737,6 +794,12 @@ cluster_bufmgr_block_write_permitted(Buffer buffer)
 	UT_ASSERT(ut_hot_content_lock_held);
 	ut_update_write_gate_calls++;
 	return ut_update_write_permitted;
+}
+
+bool
+cluster_bufmgr_pcm_x_content_holder_write_permitted(BufferDesc *buf)
+{
+	return cluster_bufmgr_block_write_permitted(BufferDescriptorGetBuffer(buf));
 }
 
 bool
@@ -1998,6 +2061,78 @@ bool cluster_enable_adg = false;
 bool cluster_undo_retention_horizon_enabled = true;
 int cluster_lmon_main_loop_interval = 1000;
 
+/* SPACE read is the I/O seam; the actual component/batch helpers are linked. */
+static bool ut_prune_identity_ready;
+static unsigned ut_prune_identity_reads, ut_prune_version_edges;
+static uint64 ut_prune_version_token;
+static RfPageVersionEdgeEntryV1 ut_prune_version_edge;
+bool ut_prune_get_identity(Relation relation, ClusterSpaceIdentity *out);
+
+bool
+ut_prune_get_identity(Relation relation, ClusterSpaceIdentity *out)
+{
+	UT_ASSERT(ut_prune_fixture_active && cluster_shared_config);
+	UT_ASSERT(!ut_hot_content_lock_held);
+	ut_prune_identity_reads++;
+	if (!ut_prune_identity_ready)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->key.system_identifier = 11;
+	out->key.database_incarnation = 12;
+	memset(out->key.storage_uuid, 13, 16);
+	out->key.locator = relation->rd_locator;
+	memset(out->incarnation, 30, 16);
+	out->sequence = 1;
+	out->operation = 40;
+	out->state = CLUSTER_SPACE_IDENTITY_LIVE;
+	return true;
+}
+int
+cluster_smgr_which_for(RelFileLocator locator, BackendId backend)
+{
+	UT_ASSERT(ut_prune_fixture_active && cluster_shared_config);
+	UT_ASSERT_EQ(locator.relNumber, ut_hot_product_fixture->expected_tag.relNumber);
+	UT_ASSERT_EQ(backend, InvalidBackendId);
+	return 1;
+}
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalSourceRef *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->claim.identity.system_identifier = 11;
+	out->claim.database_incarnation = 12;
+	memset(out->claim.identity.storage_uuid, 13, 16);
+	return true;
+}
+bool
+cluster_wal_thread_restart_v2_ref(ClusterWalSourceRef *out)
+{
+	(void)out;
+	abort();
+}
+ClusterControlRootResult
+cluster_wal_writer_ready(TimeLineID timeline pg_attribute_unused())
+{
+	/* Native first-start INSTALL is outside this lock-order fixture. */
+	abort();
+}
+SCN
+cluster_scn_advance(void)
+{
+	UT_ASSERT(ut_prune_fixture_active && ut_hot_content_lock_held);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	return 101;
+}
+void
+XLogRegisterPageVersionEdge(uint64 token, const RfPageVersionEdgeEntryV1 *edges, uint8 count)
+{
+	UT_ASSERT(ut_prune_fixture_active && ut_hot_content_lock_held);
+	UT_ASSERT_EQ(count, 1);
+	ut_prune_version_edge = edges[0];
+	ut_prune_version_token = token;
+	ut_prune_version_edges++;
+}
+
 bool
 ActiveSnapshotSet(void)
 {
@@ -2995,16 +3130,16 @@ UT_TEST(test_local_matching_creator_uses_statement_scn_not_native_membership)
 /* Frozen creation is a tuple proof, not a claim that its old page slot still
  * names xmin.  Keep the real scratch evaluator and trap all live-page paths. */
 static void
-ut_scratch_frozen_case(uint16 xmin_bits, uint8 itl_index, int xmax_leg, bool expect_error,
-					   bool expect_visible)
+ut_scratch_creator_case(TransactionId xmin, uint16 xmin_bits, uint8 itl_index, int xmax_leg,
+						bool expect_error, bool expect_visible)
 {
 	PGAlignedBlock scratch;
 	PGAlignedBlock before;
 	HeapTupleData tuple = { 0 };
 	SnapshotData snapshot = { 0 };
 	ClusterR4HotScratchTestContext context = { 0 };
-	Page page = ut_r4_hot_build_page(scratch.data, (TransactionId)4195504, 1,
-									 (TransactionId)4207696, 4, UT_HOT_PAYLOAD);
+	Page page
+		= ut_r4_hot_build_page(scratch.data, xmin, 1, (TransactionId)4207696, 4, UT_HOT_PAYLOAD);
 	HeapTupleHeader header = ut_r4_hot_tuple_at(page, UT_HOT_ROOT_OFF);
 	volatile bool caught = false;
 	volatile bool visible = false;
@@ -3054,6 +3189,10 @@ ut_scratch_frozen_case(uint16 xmin_bits, uint8 itl_index, int xmax_leg, bool exp
 			context.already_full = false;
 		if (xmax_leg == 13)
 			context.tag.blockNum++;
+		if (xmax_leg == 14)
+			context.read_scn++;
+		if (xmax_leg == 15)
+			tuple.t_len = 0;
 	}
 	memcpy(before.data, page, BLCKSZ);
 	ut_capture_error = true;
@@ -3078,6 +3217,52 @@ ut_scratch_frozen_case(uint16 xmin_bits, uint8 itl_index, int xmax_leg, bool exp
 	UT_ASSERT_EQ(ut_scratch_cr_calls, 0);
 	UT_ASSERT_EQ(ut_scratch_hint_calls, 0);
 	UT_ASSERT_EQ(ut_scratch_dirty_calls, 0);
+}
+
+static void
+ut_scratch_frozen_case(uint16 xmin_bits, uint8 itl_index, int xmax_leg, bool expect_error,
+					   bool expect_visible)
+{
+	ut_scratch_creator_case((TransactionId)4195504, xmin_bits, itl_index, xmax_leg, expect_error,
+							expect_visible);
+}
+
+UT_TEST(test_scratch_bootstrap_creator_needs_no_data_slot)
+{
+	for (int hint = 0; hint < 2; hint++) {
+		uint16 bits = hint ? HEAP_XMIN_COMMITTED : 0;
+
+		ut_scratch_creator_case(BootstrapTransactionId, bits, 1, 0, false, true);
+		ut_scratch_creator_case(BootstrapTransactionId, bits, CLUSTER_ITL_SLOT_UNALLOCATED, 0,
+								false, true);
+	}
+}
+
+UT_TEST(test_scratch_bootstrap_creation_preserves_exact_xmax_verdict)
+{
+	for (int leg = 1; leg <= 5; leg++)
+		ut_scratch_creator_case(BootstrapTransactionId, 0, 1, leg, false, leg != 1);
+	ut_scratch_creator_case(BootstrapTransactionId, 0, CLUSTER_ITL_SLOT_UNALLOCATED, 1, true,
+							false);
+}
+
+UT_TEST(test_scratch_bootstrap_creation_keeps_xmax_and_context_refusals)
+{
+	for (int leg = 6; leg <= 15; leg++)
+		ut_scratch_creator_case(BootstrapTransactionId, 0, 1, leg, true, false);
+}
+
+UT_TEST(test_scratch_bootstrap_does_not_admit_other_unproved_creators)
+{
+	const TransactionId refused[] = { InvalidTransactionId, FrozenTransactionId, 4195504 };
+
+	for (unsigned i = 0; i < lengthof(refused); i++) {
+		ut_scratch_creator_case(refused[i], 0, 1, 0, true, false);
+		ut_scratch_creator_case(refused[i], HEAP_XMIN_COMMITTED, 1, 0, true, false);
+	}
+	/* Even an exact ordinary creator reference cannot turn UNKNOWN into commit. */
+	ut_scratch_creator_case((TransactionId)4207696, 0, 1, 9, true, false);
+	UT_ASSERT_EQ(ut_scratch_exact_resolve_calls, 1);
 }
 
 UT_TEST(test_scratch_frozen_xmin_survives_recycled_data_slot)
@@ -6475,9 +6660,49 @@ static void
 ut_prune_end(void)
 {
 	UT_ASSERT(!ut_hot_content_lock_held);
+	cluster_shared_config = false;
 	ut_prune_fixture_active = false;
 	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_EXCLUSIVE);
 	ut_itl_census_end();
+}
+
+UT_TEST(test_shared_hot_prune_captures_identity_before_cleanup)
+{
+	for (int ready = 0; ready <= 1; ready++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		RelationData relation;
+		FormData_pg_class form;
+		PGAlignedBlock before;
+		Page page;
+
+		ut_prune_begin(&fixture, &hot, &relation, &form);
+		cluster_shared_config = true;
+		ut_prune_identity_ready = ready;
+		ut_prune_identity_reads = ut_prune_version_edges = 0;
+		ut_prune_version_token = 0;
+		relation.rd_locator
+			= (RelFileLocator){ fixture.expected_tag.spcOid, fixture.expected_tag.dbOid,
+								fixture.expected_tag.relNumber };
+		page = (Page)fixture.live_page;
+		((PageHeader)page)->pd_block_scn = 20;
+		memcpy(before.data, page, BLCKSZ);
+		heap_page_prune_opt(&relation, UT_HOT_BUFFER);
+		UT_ASSERT_EQ(ut_prune_identity_reads, 1);
+		UT_ASSERT_EQ(ut_prune_version_edges, ready);
+		UT_ASSERT_EQ(ut_prune_wal_records, ready);
+		if (ready) {
+			UT_ASSERT_EQ(ut_prune_reclaimed, 2);
+			UT_ASSERT_EQ(ut_prune_version_token, 101);
+			UT_ASSERT_EQ(ut_prune_version_edge.before.mutation_token, 20);
+			UT_ASSERT_EQ(((PageHeader)page)->pd_block_scn, 101);
+			UT_ASSERT_EQ(ItemIdGetRedirect(PageGetItemId(page, 1)), 3);
+		} else {
+			UT_ASSERT_EQ(ut_prune_cleanup_calls, 0);
+			UT_ASSERT(memcmp(before.data, page, BLCKSZ) == 0);
+		}
+		ut_prune_end();
+	}
 }
 
 UT_TEST(test_proved_hot_prune_reclaims_real_space_and_preserves_root_and_tail)
@@ -6983,7 +7208,8 @@ UT_TEST(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement)
 int
 main(void)
 {
-	UT_PLAN(139);
+	UT_PLAN(144);
+	UT_RUN(test_shared_hot_prune_captures_identity_before_cleanup);
 	UT_RUN(test_live_miss_evidence_preserves_result_and_rejects_unreadable_metadata);
 	UT_RUN(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement);
 	UT_RUN(test_real_hot_full_three_versions_preserve_statement_scn_polarity);
@@ -7005,6 +7231,10 @@ main(void)
 	UT_RUN(test_incomplete_creation_flags_keep_real_hot_full_route);
 	UT_RUN(test_frozen_creator_does_not_bypass_data_lock_or_multi_xmax_full);
 	UT_RUN(test_scratch_frozen_creation_keeps_data_and_context_negatives);
+	UT_RUN(test_scratch_bootstrap_creator_needs_no_data_slot);
+	UT_RUN(test_scratch_bootstrap_creation_preserves_exact_xmax_verdict);
+	UT_RUN(test_scratch_bootstrap_creation_keeps_xmax_and_context_refusals);
+	UT_RUN(test_scratch_bootstrap_does_not_admit_other_unproved_creators);
 	UT_RUN(test_scratch_frozen_xmin_survives_recycled_data_slot);
 	UT_RUN(test_scratch_frozen_xmin_needs_no_creator_slot);
 	UT_RUN(test_scratch_frozen_creation_does_not_hide_deleting_xmax);
@@ -7123,6 +7353,7 @@ main(void)
 	UT_RUN(test_lock_only_writer_routes_to_unlocked_exact_owner);
 	UT_RUN(test_successor_wait_canonicalizes_and_rejects_unproved_wakes);
 	UT_RUN(test_successor_perpetual_wait_reaches_exact_target_and_preserves_mode);
+	UT_ASSERT(ut_snapshot_scope == NULL);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

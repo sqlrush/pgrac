@@ -779,14 +779,16 @@ undo_cleaner_run_pass(bool *out_work_remaining)
 				floor_retry_needed = true;
 				cluster_undo_horizon_note_pass_abort();
 			} else if (batch == 0
-					   && (stats.segments_marked_recyclable > 0 || stats.shmem_tt_slots_gcd > 0
-						   || stats.header_tt_slots_below_horizon > 0)) {
+					   && (stats.segments_marked_recyclable > 0 || stats.shmem_tt_slots_gcd > 0)) {
 				/*
 				 * H2 continuous mode: the batch budget ran out while
 				 * recycle progress was still being made -- more eligible
 				 * inventory is waiting than one batch covers.  Ask the
 				 * caller to re-run now rather than let a write storm
 				 * outrun the interval cadence.
+				 * Header inventory is scan-only: the same retained or already
+				 * recyclable TT slots may be observed on every pass. It cannot
+				 * prove progress or keep an otherwise idle cleaner running.
 				 */
 				*out_work_remaining = true;
 			}
@@ -993,6 +995,12 @@ UndoCleanerMain(void)
 			if (timeout_ms <= 0 || retry_ms < timeout_ms)
 				timeout_ms = retry_ms;
 		}
+		/* A DRAIN wake is not proof that the terminal census can succeed
+		 * in that pass. Retry retained responsibilities within the original
+		 * shutdown budget, including pressure-only (interval=0) mode. The
+		 * park and completion checks above remain the sole exit authority. */
+		if (cluster_normal_stop_requested() && (timeout_ms <= 0 || timeout_ms > 200))
+			timeout_ms = 200;
 		rc = WaitLatch(
 			MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | (timeout_ms > 0 ? WL_TIMEOUT : 0),
 			timeout_ms > 0 ? timeout_ms : -1L, WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP);

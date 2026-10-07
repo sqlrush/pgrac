@@ -58,8 +58,8 @@ typedef struct ClusterSfDepEntry {
  * Per-peer HELLO capability record (spec-2.2 additive amendment; spec-5.22e
  * D5 prereq).  Capability state is a property of the CONNECTION that carried
  * the HELLO / PEER_CAPS_REPLY, so the record binds the learned bits to the
- * transport connection generation (tier1: the peer's reconnect_count while
- * that connection was established).  A clear only applies when the caller's
+ * transport connection generation (tier1: the CONTROL owner's nonzero stream
+ * lifetime).  A clear only applies when the caller's
  * generation matches the recorded one: a defensive close of a failed dial or
  * of an OLDER connection can never wipe the surviving connection's record
  * (forward hazard for the 7.3 multi-channel plane).  The helpers are pure so
@@ -75,13 +75,8 @@ typedef struct ClusterSfPeerCap {
 static inline void
 cluster_sf_peer_cap_note(ClusterSfPeerCap *cap, uint32 bits, uint32 generation)
 {
-	/* RF-ROOT P9 verification (implementation): the generation is the peer's tier1
-	 * reconnect_count, which starts at 0 for the FIRST verified connection
-	 * (no reconnect happened yet).  The semantic-activation gates require
-	 * a NONZERO capability generation (0 = no verified record); map the
-	 * first verified connection to generation 1 so a fresh first-open
-	 * cluster satisfies the constraint.  Reconnects keep their natural
-	 * count (>0 already). */
+	/* The legacy/RDMA producer uses zero. Tier1 publishes an original-owner
+	 * nonzero stream lifetime and refuses capability ABI exhaustion. */
 	cap->bits = bits;
 	cap->generation = generation == 0 ? 1 : generation;
 	cap->valid = true;

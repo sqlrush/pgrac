@@ -341,7 +341,9 @@ typedef enum ClusterLeaveProducerKind {
 /* Stage 8 phase-1 coordinated full-cluster clean stop.  The accepted harness
  * topology is exactly nodes 0..3.  The plan itself is checkpointer-stack-only;
  * the matching runtime proof is bounded, volatile and per-round, and no
- * phase-1 identity can survive process exit. */
+ * phase-1 identity can survive process exit. PRE2 reuses this slot capacity,
+ * not its cardinality: its normal-stop participants are the frozen declared
+ * OPEN/formation/root serving set. Unused slots carry zero incarnation. */
 #define CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT 4
 typedef enum ClusterPhase1FullStopPrepareResult {
 	CLUSTER_PHASE1_FULL_STOP_NOT_APPLICABLE = 0,
@@ -374,7 +376,16 @@ typedef struct ClusterPhase1FullStopPlan {
 	uint64 absolute_deadline_us;
 	int64 own_wal_started_at;
 	uint64 member_incarnations[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+	/* PGRAC: per-poll selected-root observations, not shared or wire state.
+	 * Consumers recheck formation before using them; a new poll rereads root.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	bool pre2_root_observed;
+	uint8 pre2_member_phase[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
 } ClusterPhase1FullStopPlan;
+
+/* Process-local ownership of the actual durable-close call. A supplied
+ * plan alone is not authority; the controller must have run its census. */
+extern bool cluster_normal_stop_durable_close_owned(const ClusterPhase1FullStopPlan *plan);
 
 typedef enum ClusterNormalStopPhase {
 	CLUSTER_NORMAL_STOP_IDLE = 0,
@@ -740,6 +751,7 @@ extern ClusterNormalStopPollResult cluster_gcs_block_normal_stop_poll(bool post_
 																	  const char **reason_out);
 extern ClusterNormalStopPollResult
 cluster_gcs_block_normal_stop_local_poll(int *slot_out, const char **reason_out);
+extern ClusterNormalStopPollResult cluster_ko_shared_normal_stop_poll_v2(const char **reason);
 extern ClusterNormalStopPollResult cluster_ko_normal_stop_poll(uint32 *slot_out,
 															   const char **reason_out);
 extern ClusterNormalStopPollResult
@@ -756,6 +768,9 @@ extern ClusterNormalStopPollResult cluster_lmd_probe_normal_stop_poll(uint64 *pr
 																	  const char **reason);
 extern ClusterNormalStopPollResult
 cluster_clean_leave_normal_stop_local_poll(int *peer_out, const char **reason_out);
+/* Online original LMON observation; never initiates or acknowledges shutdown. */
+extern ClusterNormalStopPollResult cluster_clean_leave_service_poll(int *peer_out,
+																	const char **reason_out);
 extern ClusterNormalStopPollResult cluster_sf_dep_normal_stop_poll(bool post_checkpoint,
 																   int *slot_out, int *origin_out,
 																   const char **reason_out);
@@ -780,6 +795,12 @@ extern ClusterNormalStopPollResult cluster_semantic_normal_stop_match(
 	const ClusterSemanticActivationRecord *open_record,
 	const uint8 root_descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
 	uint64 member_incarnations_out[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT], const char **reason_out);
+/* Read-only semantic precheck for the original ROOT publisher and stop owner.
+ * Does not depend on ROOT serving publication; does not authorize I/O or stop.
+ * A non-READY result always clears epoch_out. */
+extern ClusterNormalStopPollResult cluster_semantic_normal_stop_current_epoch(
+	const ClusterSemanticActivationRecord *open_record,
+	const uint8 root_descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES], uint64 *epoch_out);
 /* LMON only: nonblocking original QVOTEC read, then full live revalidation.
  * No identity output escapes before READY; no admission/drain is implied. */
 extern ClusterNormalStopPollResult cluster_semantic_normal_stop_read_identity(

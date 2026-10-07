@@ -61,7 +61,7 @@ jobs:
   # ====================================================================
   validate:
     name: Validate (comment headers + format + tidy + commit msg)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       code_changed: ${{ steps.changes.outputs.code_changed }}
@@ -158,7 +158,9 @@ jobs:
         run: python3 scripts/ci/test_scan_build.py
 
       - name: Check MVP release evidence contract
-        run: python3 scripts/ci/test_mvp_ci.py
+        run: |
+          python3 scripts/ci/test_mvp_ci.py
+          python3 -B scripts/ci/test_native_smoke.py
 
       - name: Check deployment preflight safety contract
         run: python3 -B -m unittest discover -s scripts/deploy/pre1/tests -v
@@ -195,8 +197,9 @@ jobs:
     name: Linux enable-cluster (unit + regress + smoke TAP)
     needs: validate
     if: needs.validate.outputs.code_changed == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 12
+    runs-on: ubuntu-24.04
+    # Full unit compilation precedes the unchanged 20-minute native controller.
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -251,12 +254,45 @@ jobs:
 
       - name: Run current MVP smoke TAP subset
         run: |
-          # Scope is explicit, shared with macOS, and validated before use.
-          # Former mixed 2PC/recovery/raw-device deployment cases still run
-          # unchanged in legacy-extended.yml; no failure is converted to PASS.
-          SMOKE="$(python3 scripts/ci/mvp_ci.py --smoke)"
+          # The same six-case selection is split by its real environment.
+          # 031 uses the native four-member quorum in the following step.
+          SMOKE="$(python3 scripts/ci/mvp_ci.py --smoke-local)"
           make -C src/test/cluster_tap check \
             PROVE_TESTS="$SMOKE"
+
+      - name: Install native quorum fixture dependencies
+        run: |
+          sudo systemctl mask --runtime corosync.service corosync-qdevice.service corosync-qnetd.service
+          sudo apt-get install -y --no-install-recommends corosync corosync-qdevice corosync-qnetd libnss3-tools iproute2
+          sudo modprobe loop
+
+      - name: Run native four-member undo refusal TAP
+        run: |
+          sudo python3 -B scripts/ci/run_native_smoke.py \
+            --source "$GITHUB_WORKSPACE" --install "$HOME/pgrac-install" \
+            --output "$RUNNER_TEMP/pgrac-native-smoke" --vendor / \
+            --uid "$(id -u)" --gid "$(id -g)" --commit "$GITHUB_SHA"
+
+      - name: Archive native smoke evidence
+        if: always()
+        run: |
+          # NSS databases belong to root. Archive after fixture cleanup so
+          # upload-artifact need not traverse privileged directories.
+          if [ -d "$RUNNER_TEMP/pgrac-native-smoke" ]; then
+            sudo tar --exclude='*/nssdb' --exclude='*/authkey' \
+              -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/pgrac-native-smoke.tar.gz" \
+              -- pgrac-native-smoke
+            sudo chmod 0644 "$RUNNER_TEMP/pgrac-native-smoke.tar.gz"
+          fi
+
+      - name: Upload native smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-native-smoke
+          path: ${{ runner.temp }}/pgrac-native-smoke.tar.gz
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload regression diffs on failure
         if: failure()
@@ -285,7 +321,7 @@ jobs:
     name: Linux --disable-cluster regression
     needs: validate
     if: needs.validate.outputs.code_changed == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -408,8 +444,9 @@ jobs:
     name: Security (cppcheck + scan-build)
     needs: validate
     if: needs.validate.outputs.code_changed == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
+    runs-on: ubuntu-24.04
+    # Keep the complete scan-build set within the job's infrastructure budget.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4

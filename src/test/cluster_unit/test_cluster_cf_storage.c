@@ -40,6 +40,7 @@
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_xid_authority.h" /* epoch-witness stub signature (review F3) */
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_cf_phase2.h"
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_cf_storage.h"
 #include "cluster/cluster_recovery_anchor.h"
@@ -50,6 +51,9 @@
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
 #include "utils/elog.h"
+#include <sys/wait.h>
+#include "../../backend/cluster/cluster_control_root_private.h"
+#include "../../backend/cluster/cluster_control_bootstrap_private.h"
 
 #undef printf
 #undef fprintf
@@ -68,6 +72,32 @@ UT_DEFINE_GLOBALS();
 
 char *cluster_shared_data_dir = NULL;
 bool cluster_controlfile_shared_authority = false;
+bool cluster_shared_config = false;
+static bool runtime_guard_error_expected;
+static bool runtime_guard_message_matched;
+
+ClusterControlRootResult
+cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out pg_attribute_unused())
+{
+	abort(); /* Legacy migration must never invoke the v2 runtime reader. */
+}
+ClusterControlRootResult
+cluster_control_root_v3_read_runtime_local_locked(ControlFileData *out pg_attribute_unused())
+{
+	abort(); /* The PRE2 startup refusal also precedes the v3 reader. */
+}
+/* PGRAC: immutable image helpers are linked, but not exercised by this legacy
+ * migration test. Never grant their clusterwide authority here.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+bool enableFsync = true;
+
+bool
+cluster_cf_held_is_clusterwide(LOCKMODE mode pg_attribute_unused())
+{
+	return false;
+}
+
 char *DataDir = NULL;					   /* storage.o's bootstrap orchestrator refs it */
 int cluster_cf_enqueue_timeout_ms = 30000; /* orchestrator liveness wait */
 
@@ -83,6 +113,8 @@ bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
 	if (elevel >= ERROR) {
+		if (runtime_guard_error_expected)
+			return true;
 		printf("# unexpected ereport(elevel=%d) -- aborting\n", elevel);
 		abort();
 	}
@@ -98,7 +130,10 @@ errstart_cold(int elevel, const char *domain)
 void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
-{}
+{
+	if (runtime_guard_error_expected)
+		_exit(runtime_guard_message_matched ? 90 : 91);
+}
 
 int
 errcode(int sqlerrcode pg_attribute_unused())
@@ -111,8 +146,11 @@ errcode_for_file_access(void)
 	return 0;
 }
 int
-errmsg(const char *fmt pg_attribute_unused(), ...)
+errmsg(const char *fmt, ...)
 {
+	if (runtime_guard_error_expected)
+		runtime_guard_message_matched
+			= strcmp(fmt, "catalog startup has no exact ROOT bootstrap preparation") == 0;
 	return 0;
 }
 int
@@ -828,10 +866,46 @@ UT_TEST(test_bootstrap_role)
 				 CLUSTER_CF_ROLE_FAILCLOSED);
 }
 
+/* This routing fixture has no early postmaster preparation. */
+void
+cluster_control_bootstrap_catalog_prepare(const char *pgdata)
+{
+	if (pgdata != NULL)
+		abort();
+	ereport(FATAL, (errmsg("catalog startup has no exact ROOT bootstrap preparation")));
+}
+
+UT_TEST(test_shared_config_startup_cannot_use_legacy_migration)
+{
+	/* The mode must reject even with old shared authority off, before any
+	 * migration, bootstrap authority creation or source file mutation.
+	 */
+	for (int enabled = 0; enabled < 2; ++enabled) {
+		pid_t child;
+		int status = 0;
+
+		fflush(NULL);
+		child = fork();
+		UT_ASSERT(child >= 0);
+		if (child == 0) {
+			cluster_shared_config = true;
+			cluster_controlfile_shared_authority = enabled != 0;
+			runtime_guard_error_expected = true;
+			cluster_cf_startup_prepare(NULL);
+			_exit(0);
+		}
+		if (child > 0) {
+			UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+			UT_ASSERT(WIFEXITED(status));
+			UT_ASSERT_EQ(WEXITSTATUS(status), 90);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(test_write_allowed);
 	UT_RUN(test_symlink_status);
 	UT_RUN(test_probe_local);
@@ -847,6 +921,7 @@ main(void)
 	UT_RUN(test_bind_storage_uuid);
 	UT_RUN(test_assess_liveness);
 	UT_RUN(test_bootstrap_role);
+	UT_RUN(test_shared_config_startup_cannot_use_legacy_migration);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

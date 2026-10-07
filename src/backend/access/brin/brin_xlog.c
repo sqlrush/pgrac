@@ -5,6 +5,8 @@
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
+ * PGRAC MODIFICATIONS: honor qualified redo buffer initialization results.
+ *
  * IDENTIFICATION
  *	  src/backend/access/brin/brin_xlog.c
  */
@@ -24,18 +26,24 @@ static void
 brin_xlog_createidx(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	xl_brin_createidx *xlrec = (xl_brin_createidx *) XLogRecGetData(record);
+	const xl_brin_createidx *xlrec = (xl_brin_createidx *) XLogRecGetData(record);
 	Buffer		buf;
 	Page		page;
 
 	/* create the index' metapage */
-	buf = XLogInitBufferForRedo(record, 0);
+	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &buf)
+		!= BLK_NEEDS_REDO) {
+		if (BufferIsValid(buf))
+			UnlockReleaseBuffer(buf);
+		return;
+	}
 	Assert(BufferIsValid(buf));
 	page = (Page) BufferGetPage(buf);
 	brin_metapage_init(page, xlrec->pagesPerRange, xlrec->version);
 	PageSetLSN(page, lsn);
 	MarkBufferDirty(buf);
-	UnlockReleaseBuffer(buf);
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
 }
 
 /*
@@ -44,7 +52,7 @@ brin_xlog_createidx(XLogReaderState *record)
  */
 static void
 brin_xlog_insert_update(XLogReaderState *record,
-						xl_brin_insert *xlrec)
+						const xl_brin_insert *xlrec)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
 	Buffer		buffer;
@@ -58,10 +66,11 @@ brin_xlog_insert_update(XLogReaderState *record,
 	 */
 	if (XLogRecGetInfo(record) & XLOG_BRIN_INIT_PAGE)
 	{
-		buffer = XLogInitBufferForRedo(record, 0);
-		page = BufferGetPage(buffer);
-		brin_page_init(page, BRIN_PAGETYPE_REGULAR);
-		action = BLK_NEEDS_REDO;
+		action = XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_LOCK, false, &buffer);
+		if (action == BLK_NEEDS_REDO) {
+			page = BufferGetPage(buffer);
+			brin_page_init(page, BRIN_PAGETYPE_REGULAR);
+		}
 	}
 	else
 	{
@@ -69,7 +78,7 @@ brin_xlog_insert_update(XLogReaderState *record,
 	}
 
 	/* need this page's blkno to store in revmap */
-	regpgno = BufferGetBlockNumber(buffer);
+	XLogRecGetBlockTag(record, 0, NULL, NULL, &regpgno);
 
 	/* insert the index item into the page */
 	if (action == BLK_NEEDS_REDO)
@@ -208,10 +217,9 @@ static void
 brin_xlog_revmap_extend(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
-	xl_brin_revmap_extend *xlrec;
+	const xl_brin_revmap_extend *xlrec;
 	Buffer		metabuf;
 	Buffer		buf;
-	Page		page;
 	BlockNumber targetBlk;
 	XLogRedoAction action;
 
@@ -253,14 +261,19 @@ brin_xlog_revmap_extend(XLogReaderState *record)
 	 * image here.
 	 */
 
-	buf = XLogInitBufferForRedo(record, 1);
-	page = (Page) BufferGetPage(buf);
-	brin_page_init(page, BRIN_PAGETYPE_REVMAP);
+	if (XLogReadBufferForRedoExtended(record, 1, RBM_ZERO_AND_LOCK, false, &buf)
+		== BLK_NEEDS_REDO) {
+		Page		page;
 
-	PageSetLSN(page, lsn);
-	MarkBufferDirty(buf);
+		page = (Page)BufferGetPage(buf);
+		brin_page_init(page, BRIN_PAGETYPE_REVMAP);
 
-	UnlockReleaseBuffer(buf);
+		PageSetLSN(page, lsn);
+		MarkBufferDirty(buf);
+	}
+
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
 	if (BufferIsValid(metabuf))
 		UnlockReleaseBuffer(metabuf);
 }

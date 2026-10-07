@@ -24,6 +24,8 @@ subdir('test_lfind')
 subdir('test_misc')
 subdir('test_oat_hooks')
 subdir('test_pgrac_r4_native_tx')
+# PGRAC: real native GUC policy tests. Author: SqlRush <sqlrush@gmail.com>
+subdir('test_pgrac_shared_config')
 subdir('test_parser')
 subdir('test_pg_dump')
 subdir('test_predtest')

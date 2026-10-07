@@ -3771,8 +3771,14 @@ GcsBlockMasterDirectCopyRefusalStatus(ClusterBufmgrGcsCopyRefusal refusal)
 }
 
 extern const char *cluster_bufmgr_gcs_copy_refusal_name(ClusterBufmgrGcsCopyRefusal refusal);
+/* out_first (D S09 R-A22, NULL to skip): an owned reference to the flushed
+ * first own record since the page was clean, or zero; the caller moves or
+ * releases it. */
 extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
-											  ClusterBufmgrGcsCopyRefusal *out_refusal);
+											  ClusterBufmgrGcsCopyRefusal *out_refusal,
+											  ClusterPageWalBindingV1 *out_wal,
+											  ClusterPageWalRefV1 *out_first,
+											  uint32 peer_capabilities);
 extern bool cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag, SCN expected_page_scn,
 												XLogRecPtr *page_lsn_out, SCN *page_scn_out,
 												char *dst,
@@ -4008,15 +4014,26 @@ extern bool cluster_bufmgr_block_write_permitted(Buffer buffer);
 extern uint32 cluster_bufmgr_flush_and_release_x_for_leave(void);
 
 /* PGRAC: spec-4.7 D2 (Q6-A' worker-centric) — bounded chunked scan of the
- * shared buffer pool that re-declares each locally-held S/X buffer.  The
- * callback receives (tag, held_mode, page_lsn, arg) per qualifying buffer;
+ * shared buffer pool that re-declares each locally-held S/X buffer and,
+ * in shared mode, every N-state physical PI. Callback false retains that
+ * position until actual acknowledgement. A busy/pending position i returns
+ * -1-i; nonnegative results retain the original end-of-scan convention.
  * cluster_bufmgr_redeclare_scan_chunk returns the next cursor (== NBuffers
  * once the whole pool has been scanned) so the LMON reconfig tick can drive
  * it in bounded chunks without blocking the heartbeat. */
-typedef void (*ClusterGcsRedeclareCallback)(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn,
+typedef bool (*ClusterGcsRedeclareCallback)(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn,
 											SCN page_scn, void *arg); /* spec-2.41 D3 +page_scn */
 extern int cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
 											   ClusterGcsRedeclareCallback cb, void *arg);
+
+/* LMON's second census cursor, over the original PCM registry. Logical PI
+ * responsibility survives buffer eviction. Declare only affected, nonempty
+ * entries as N with zero numeric watermarks; their retained typed sources are
+ * ancestry evidence, not comparable LSN/SCN floors. Same -1-position retry
+ * convention; callbacks run without directory locks or retained entry refs.
+ * This adds obligations, never replaces the retained-WAL recovery census. */
+extern int cluster_pcm_local_pi_redeclare_scan_chunk(int start, int max_scan, uint64 epoch,
+													 ClusterGcsRedeclareCallback cb, void *arg);
 
 
 /* ============================================================
@@ -4148,6 +4165,9 @@ extern ClusterGcsBlockPhase cluster_gcs_block_phase_for_tag(BufferTag tag);
  */
 extern bool cluster_grd_join_remaster_active_for_shard(BufferTag tag);
 extern bool cluster_grd_block_view_rebuilt(BufferTag tag);
+/* Frozen census observation only: -1 unknown/stale, 0 preserved master,
+ * 1 a resource requiring survivor reconstruction. Never grants access. */
+extern int cluster_grd_block_redeclare_state_v1(BufferTag tag, uint64 epoch, uint64 *census_hash);
 
 /*
  * spec-4.7 D5 — redo-before-unfreeze gate (Q5):  true iff the dead origin's
@@ -4166,7 +4186,7 @@ extern bool cluster_gcs_block_redo_lsn_covered(int dead_origin, XLogRecPtr requi
  *		minimal block-resource view via
  *		cluster_gcs_block_master_rebuild_from_redeclare (cluster_pcm_lock.c).
  */
-extern void cluster_gcs_block_send_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn,
+extern bool cluster_gcs_block_send_redeclare(BufferTag tag, uint8 held_mode, XLogRecPtr page_lsn,
 											 SCN page_scn, uint64 cluster_epoch, int master_node);
 extern void cluster_gcs_handle_block_redeclare_envelope(const struct ClusterICEnvelope *env,
 														const void *payload);
@@ -4500,7 +4520,9 @@ typedef struct ResourceXTargetEvictionPlan {
 	bool prepared;
 	bool local_n_committed;
 	bool release_admitted;
-	uint8 reserved[3];
+	bool pi_recorded;
+	uint8 reserved[2];
+	ClusterPageWalRefV1 pi_refs[2];
 	uint8 release_payload[RESOURCE_X_CONTROL_V1_BYTES];
 } ResourceXTargetEvictionPlan;
 
@@ -4543,7 +4565,9 @@ extern ResourceXApplyResult cluster_gcs_resource_x_target_acquire_reobserve_exac
 	ResourceXAuxiliaryAcquireContext *context, ResourceXAcquisitionRef *ref_out);
 extern ResourceXApplyResult cluster_gcs_resource_x_target_evict_prepare_exact(
 	const BufferTag *tag, const ClusterPcmOwnSnapshot *exact_x, uint64 r4_record_generation,
-	uint64 reservation_token, ResourceXTargetEvictionPlan *plan_out);
+	uint64 reservation_token, const ClusterPageWalBindingV1 *wal,
+	ResourceXTargetEvictionPlan *plan_out, const ClusterPageWalBindingV1 *first);
+extern void cluster_gcs_resource_x_target_evict_release_refs(ResourceXTargetEvictionPlan *plan);
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_evict_publish_exact(ResourceXTargetEvictionPlan *plan,
 												  bool *retry_pending_out);
@@ -4590,6 +4614,8 @@ cluster_gcs_resource_x_target_itl_recycle_cancel_exact(const ResourceXLocalOwner
  * ============================================================ */
 extern void cluster_gcs_block_on_epoch_advance(uint64 new_epoch);
 extern void cluster_gcs_block_on_epoch_advance_exact(uint64 new_epoch, const uint8 *dead_bitmap);
+extern ResourceXApplyResult
+cluster_gcs_block_resource_x_source_settlement_tick(const ResourceXAcquisitionRef *ref);
 extern bool cluster_gcs_block_resource_x_cutover_tick(void);
 extern bool cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch);
 extern void cluster_gcs_ctrc_dispatch_batch(const ClusterCtrcCloseDispatch *dispatches, Size count);

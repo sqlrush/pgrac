@@ -276,26 +276,50 @@ cluster_thread_recovery_reap_decide(BgwHandleStatus handle_status, bool slot_rea
 
 typedef struct ClusterThreadRecLaunchEligibility {
 	uint16 origin_thread;
+	uint16 subject_kind;
+	uint32 reserved;
 	uint64 attempt_stamp;
 	ClusterRecoveryDutyKey duty;
+	/* PGRAC: pending root seal fits the native 128-byte carrier. The worker
+	 * re-reads the full selected subject; this hash is never a grant.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	uint8 selected_root_sha256[32];
 } ClusterThreadRecLaunchEligibility;
 
 /* The registration payload is only a one-shot carrier.  Before the worker can
  * acquire any authority it must match the exact main argument and the live
  * REPLAYING slot/stamp, and it must still carry a valid full duty identity. */
 static inline bool
-cluster_thread_recovery_worker_start_valid(const ClusterThreadRecLaunchEligibility *eligibility,
-										   uint16 main_thread, bool slot_read,
-										   ClusterThreadRecReplayState slot_state,
-										   uint64 slot_stamp)
+cluster_thread_recovery_worker_start_valid_for_claim(
+	const ClusterThreadRecLaunchEligibility *eligibility, uint16 main_thread, bool slot_read,
+	ClusterThreadRecReplayState slot_state, uint64 slot_stamp, bool claim_v2)
 {
+	uint8 digest = 0;
+	if (eligibility != NULL)
+		for (unsigned i = 0; i < sizeof(eligibility->selected_root_sha256); i++)
+			digest |= eligibility->selected_root_sha256[i];
 	return eligibility != NULL && main_thread >= XLP_THREAD_ID_FIRST_REAL
 		   && main_thread <= CLUSTER_WAL_THREAD_MAX && eligibility->origin_thread == main_thread
 		   && eligibility->attempt_stamp != 0 && slot_read
 		   && slot_state == CLUSTER_THREADREC_REPLAY_REPLAYING
 		   && slot_stamp == eligibility->attempt_stamp
-		   && cluster_recovery_duty_key_valid_v1(&eligibility->duty)
-		   && eligibility->duty.origin_thread_id == main_thread;
+		   && cluster_recovery_duty_key_valid_for_claim(&eligibility->duty, claim_v2)
+		   && eligibility->duty.origin_thread_id == main_thread && eligibility->reserved == 0
+		   && ((eligibility->subject_kind == CLUSTER_CONTROL_RECOVERY_CURRENT_CHECKPOINT
+				&& digest == 0)
+			   || (claim_v2
+				   && eligibility->subject_kind == CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER
+				   && digest != 0));
+}
+
+static inline bool
+cluster_thread_recovery_worker_start_valid(const ClusterThreadRecLaunchEligibility *eligibility,
+										   uint16 main_thread, bool slot_read,
+										   ClusterThreadRecReplayState slot_state,
+										   uint64 slot_stamp)
+{
+	return cluster_thread_recovery_worker_start_valid_for_claim(eligibility, main_thread, slot_read,
+																slot_state, slot_stamp, false);
 }
 
 extern bool

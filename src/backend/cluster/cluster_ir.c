@@ -28,11 +28,12 @@
 #include "cluster/cluster_recovery_duty.h"
 
 bool
-cluster_recovery_serial_resid_encode(const ClusterRecoveryDutyKey *duty, ClusterResId *out)
+cluster_recovery_serial_resid_encode_for_claim(const ClusterRecoveryDutyKey *duty, bool claim_v2,
+											   ClusterResId *out)
 {
 	ClusterResId encoded;
 
-	if (out == NULL || !cluster_recovery_duty_key_valid_v1(duty))
+	if (out == NULL || !cluster_recovery_duty_key_valid_for_claim(duty, claim_v2))
 		return false;
 	memset(&encoded, 0, sizeof(encoded));
 	encoded.field1 = (uint32)duty->origin_thread_id;
@@ -42,4 +43,10 @@ cluster_recovery_serial_resid_encode(const ClusterRecoveryDutyKey *duty, Cluster
 	encoded.lockmethodid = DEFAULT_LOCKMETHOD;
 	*out = encoded;
 	return true;
+}
+
+bool
+cluster_recovery_serial_resid_encode(const ClusterRecoveryDutyKey *duty, ClusterResId *out)
+{
+	return cluster_recovery_serial_resid_encode_for_claim(duty, false, out);
 }

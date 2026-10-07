@@ -24,9 +24,16 @@
  *
  * src/backend/access/transam/subtrans.c
  *
+ * PGRAC: shared-origin clean startup preserves retained parentage instead of
+ * applying the single-instance page reset. It does not grant retention or
+ * mutation authority. Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_native_startup.h"
+#endif
 
 #include "access/slru.h"
 #include "access/subtrans.h"
@@ -34,6 +41,11 @@
 #include "pg_trace.h"
 #include "utils/snapmgr.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "access/xlogutils.h"
+#include "cluster/cluster_guc.h"
+#include "miscadmin.h"
+#endif
 
 /*
  * Defines for SubTrans page sizes.  A page is the same BLCKSZ as is used
@@ -50,6 +62,11 @@
 
 /* We need four bytes per xact */
 #define SUBTRANS_XACTS_PER_PAGE (BLCKSZ / sizeof(TransactionId))
+
+#ifdef USE_PGRAC_CLUSTER
+StaticAssertDecl(SUBTRANS_XACTS_PER_PAGE == CLUSTER_NATIVE_SUBTRANS_PER_PAGE,
+				 "native SUBTRANS inspection geometry");
+#endif
 
 #define TransactionIdToPage(xid) ((xid) / (TransactionId) SUBTRANS_XACTS_PER_PAGE)
 #define TransactionIdToEntry(xid) ((xid) % (TransactionId) SUBTRANS_XACTS_PER_PAGE)
@@ -190,10 +207,17 @@ SUBTRANSShmemSize(void)
 void
 SUBTRANSShmemInit(void)
 {
+	SyncRequestHandler handler = SYNC_HANDLER_NONE;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Retained parentage is durable input, unlike native ephemeral SUBTRANS.
+	 * Use the same queued-fsync/fallback mechanism as the other SLRUs. */
+	if (cluster_shared_config)
+		handler = SYNC_HANDLER_CLUSTER_SUBTRANS;
+#endif
 	SubTransCtl->PagePrecedes = SubTransPagePrecedes;
-	SimpleLruInit(SubTransCtl, "Subtrans", NUM_SUBTRANS_BUFFERS, 0,
-				  SubtransSLRULock, "pg_subtrans",
-				  LWTRANCHE_SUBTRANS_BUFFER, SYNC_HANDLER_NONE);
+	SimpleLruInit(SubTransCtl, "Subtrans", NUM_SUBTRANS_BUFFERS, 0, SubtransSLRULock, "pg_subtrans",
+				  LWTRANCHE_SUBTRANS_BUFFER, handler);
 	SlruPagePrecedesUnitTests(SubTransCtl, SUBTRANS_XACTS_PER_PAGE);
 }
 
@@ -252,6 +276,36 @@ StartupSUBTRANS(TransactionId oldestActiveXID)
 	int			startPage;
 	int			endPage;
 
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config) {
+		TransactionId next = XidFromFullTransactionId(ShmemVariableCache->nextXid);
+
+		/* Failed-origin replay must finish before this clean-successor cut.
+		 * Prepared transactions and hot standby cannot borrow it. InRecovery
+		 * must also be false so a missing SLRU page is not read as all zeroes. */
+		if (MyBackendType != B_STARTUP || InRecovery || !TransactionIdIsNormal(next)
+			|| !TransactionIdEquals(oldestActiveXID, next))
+			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("shared SUBTRANS startup requires a completed recovery input")));
+		LWLockAcquire(SubtransSLRULock, LW_EXCLUSIVE);
+		endPage = TransactionIdToPage(next);
+		SubTransCtl->shared->latest_page_number = endPage;
+		if (TransactionIdToEntry(next) != 0) {
+			int slotno = SimpleLruReadPage(SubTransCtl, endPage, false, next);
+			if (!cluster_native_subtrans_suffix_unused(SubTransCtl->shared->page_buffer[slotno],
+													   next)) {
+				LWLockRelease(SubtransSLRULock);
+				ereport(FATAL, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("shared SUBTRANS startup has parentage beyond nextXid")));
+			}
+		}
+		/* At a page boundary the allocator will perform the first allocation.
+		 * Startup does not create or overwrite even an existing boundary page. */
+		LWLockRelease(SubtransSLRULock);
+		return;
+	}
+#endif
+
 	/*
 	 * Since we don't expect pg_subtrans to be valid across crashes, we
 	 * initialize the currently-active page(s) to zeroes during startup.
@@ -289,11 +343,23 @@ CheckPointSUBTRANS(void)
 	 * This is not actually necessary from a correctness point of view. We do
 	 * it merely to improve the odds that writing of dirty pages is done by
 	 * the checkpoint process and not by backends.
+	 * PGRAC shared origins are the exception: their registered sync handler
+	 * makes these writes part of the retained-input checkpoint obligation.
 	 */
 	TRACE_POSTGRESQL_SUBTRANS_CHECKPOINT_START(true);
 	SimpleLruWriteAll(SubTransCtl, true);
 	TRACE_POSTGRESQL_SUBTRANS_CHECKPOINT_DONE(true);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: exact own-origin route is fixed by startup qualification. The native
+ * sync consumer propagates I/O failure; no successful checkpoint on error. */
+int
+subtranssyncfiletag(const FileTag *ftag, char *path)
+{
+	return SlruSyncFileTag(SubTransCtl, ftag, path);
+}
+#endif
 
 
 /*
