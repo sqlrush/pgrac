@@ -510,6 +510,8 @@ cluster_ctrc_stat_name(ClusterCtrcStatId stat)
 		[CTRC_STAT_PENDING_OBSERVED_AGE_MS] = "pending_observed_age_ms",
 		[CTRC_STAT_OBSERVED_AT_US] = "observed_at_monotonic_us",
 		[CTRC_STAT_OBSERVATION_AGE_MS] = "observation_age_ms",
+		[CTRC_STAT_RECEIPT_PREPARE_REFUSED] = "receipt_prepare_refused_count",
+		[CTRC_STAT_RECEIPT_NAMESPACE_REFUSED] = "receipt_namespace_refused_count",
 	};
 
 	return stat >= 0 && stat < CTRC_STAT_COUNT ? names[stat] : NULL;
