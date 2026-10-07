@@ -263,8 +263,7 @@ UT_TEST(test_member_commit_request_waits_for_real_predecessor_receipts)
 	cluster_semantic_activation_lmon_tick();
 	UT_ASSERT(semantic_activation_ack_local_request_ahead.valid);
 	UT_ASSERT_EQ(semantic_activation_lmon_record_read_seq, 0);
-	UT_ASSERT_EQ(SemanticActivationAckTable->stage,
-				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED);
+	UT_ASSERT_EQ(SemanticActivationAckTable->stage, CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED);
 	test_commit_carrier_deliver(&request, 0); /* one retained owner for duplicates */
 	test_membership_snapshot_valid = false;
 	cluster_semantic_activation_lmon_tick();

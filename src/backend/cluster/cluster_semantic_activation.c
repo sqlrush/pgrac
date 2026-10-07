@@ -3541,8 +3541,22 @@ semantic_activation_ack_carrier_not_contradicted(
 		if (snapshot->record_generation == UINT64_MAX
 			|| snapshot->record_generation + 1 != image->record_generation)
 			return false;
-	} else if (snapshot->record_generation != image->record_generation)
-		return false;
+	} else if (snapshot->record_generation != image->record_generation) {
+		/* A member accepts the COMMIT REQUEST before its original majority
+		 * read completes.  The table is then one generation ahead of the
+		 * closed PREPARE projection, with no local COMMIT ACK yet.  Retain
+		 * only that exact pending carrier; this does not prove the read or
+		 * permit an ACK, projection advance, or admission. */
+		if (image->stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED
+			|| cluster_node_id == (int32)image->coordinator_node
+			|| !semantic_activation_ack_member_present(image->expected_members_lo,
+													   image->expected_members_hi, cluster_node_id)
+			|| semantic_activation_ack_member_present(image->observed_members_lo,
+													  image->observed_members_hi, cluster_node_id)
+			|| snapshot->record_generation == 0 || snapshot->record_generation == UINT64_MAX
+			|| snapshot->record_generation + 1 != image->record_generation)
+			return false;
+	}
 
 	all_observed = image->observed_members_lo == image->expected_members_lo;
 	if (image->flags
@@ -3583,8 +3597,8 @@ semantic_activation_ack_carrier_not_contradicted(
 	}
 
 	/* The coordinator additionally owns the exact utility/CAS lineage.  A
-	 * member has no process-local CAS sequence; its closed gate plus the same
-	 * durable generation is the corresponding local proof. */
+	 * member has no process-local CAS sequence; its exact closed projection
+	 * and stage relation above permit retention, never admission. */
 	if (cluster_node_id == (int32)image->coordinator_node
 		&& (semantic_activation_lmon_prepare_cas_seq == 0
 			|| semantic_activation_lmon_prepare_cas_utility_request_seq != image->round_nonce))
@@ -3687,6 +3701,8 @@ semantic_activation_ack_lmon_drain(void)
 	uint64 publication_seq;
 	int32 current_coordinator_node;
 	uint32 consumed = 0;
+	bool closed_image_valid;
+	bool closed_snapshot_valid;
 
 	/* The original bounded ingress retains early current-boot frames until
 	 * Startup has classified and loaded its own input. Peers may finish their
@@ -3776,8 +3792,10 @@ semantic_activation_ack_lmon_drain(void)
 			&& cluster_epoch_get_current() == terminal_snapshot.formation_epoch
 			&& semantic_activation_ack_terminal_identity_not_contradicted(&terminal_image))
 			return;
-		if (semantic_activation_ack_table_snapshot(&closed_image)
-			&& semantic_activation_snapshot(&closed_snapshot)
+		closed_image_valid = semantic_activation_ack_table_snapshot(&closed_image);
+		closed_snapshot_valid
+			= closed_image_valid && semantic_activation_snapshot(&closed_snapshot);
+		if (closed_snapshot_valid
 			&& semantic_activation_ack_carrier_not_contradicted(&closed_image, &closed_snapshot,
 																false))
 			return;
@@ -3788,13 +3806,39 @@ semantic_activation_ack_lmon_drain(void)
 		/* Transport has already handed these positive frames to this LMON.
 		 * Keep the original bounded ingress copy until it can be validated;
 		 * retaining it neither installs a row nor acknowledges a stage. */
-		if (semantic_activation_ack_table_snapshot(&closed_image)
-			&& closed_image.expected_members_lo == 0 && closed_image.expected_members_hi == 0
+		if (semantic_activation_ack_table_snapshot(&terminal_image)
+			&& terminal_image.expected_members_lo == 0 && terminal_image.expected_members_hi == 0
 			&& semantic_activation_ack_ingress_peek(&semantic_activation_ack_local_ingress, &item)
 			&& item.message.kind == CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK
 			&& item.message.result == CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK
 			&& item.message.transition_epoch == cluster_epoch_get_current())
 			return;
+		/* Report the exact samples used by the failed retention check, before
+		 * clearing the carrier.  These observations do not grant authority. */
+		if (closed_image_valid
+			&& (closed_image.expected_members_lo != 0 || closed_image.expected_members_hi != 0))
+			ereport(
+				LOG,
+				(errmsg("semantic activation carrier invalidation (node %d)", cluster_node_id),
+				 errdetail(
+					 "reason=AUTHORITY_UNAVAILABLE_RETENTION_REJECTED stage=%u "
+					 "nonce=%llu epoch=%llu generation=%llu expected=%llu/%llu "
+					 "observed=%llu/%llu gate_valid=%d gate_epoch=%llu "
+					 "gate_generation=%llu gate_closed=%d read_request=%llu",
+					 (unsigned)closed_image.stage, (unsigned long long)closed_image.round_nonce,
+					 (unsigned long long)closed_image.transition_epoch,
+					 (unsigned long long)closed_image.record_generation,
+					 (unsigned long long)closed_image.expected_members_lo,
+					 (unsigned long long)closed_image.expected_members_hi,
+					 (unsigned long long)closed_image.observed_members_lo,
+					 (unsigned long long)closed_image.observed_members_hi,
+					 (int)closed_snapshot_valid,
+					 (unsigned long long)(closed_snapshot_valid ? closed_snapshot.formation_epoch
+																: 0),
+					 (unsigned long long)(closed_snapshot_valid ? closed_snapshot.record_generation
+																: 0),
+					 closed_snapshot_valid ? (int)closed_snapshot.transition_closed : -1,
+					 (unsigned long long)semantic_activation_lmon_record_read_seq)));
 		semantic_activation_ack_lmon_invalidate_active();
 		if ((semantic_activation_ack_local_pending_send.pending_members_lo != 0
 			 || semantic_activation_ack_local_pending_send.pending_members_hi != 0)
@@ -3867,8 +3911,17 @@ semantic_activation_ack_lmon_drain(void)
 			SemanticActivationAckConsumeResult result;
 			uint32 local_capability_word = cluster_ic_local_capability_word();
 
-			if (!semantic_activation_snapshot(&snapshot))
+			if (!semantic_activation_snapshot(&snapshot)) {
+				ereport(LOG,
+						(errmsg("semantic activation REQUEST snapshot unavailable (node %d)",
+								cluster_node_id),
+						 errdetail("stage=%u src=%d nonce=%llu epoch=%llu generation=%llu",
+								   (unsigned)item.message.stage, item.authenticated_source_node_id,
+								   (unsigned long long)item.message.round_nonce,
+								   (unsigned long long)item.message.transition_epoch,
+								   (unsigned long long)item.message.record_generation)));
 				continue;
+			}
 			/* The next REQUEST can overtake this member's earlier ACK to a
 			 * different peer. Retain it under the existing exact request owner
 			 * until the previous fanout has transferred every destination. */
@@ -3950,6 +4003,19 @@ semantic_activation_ack_lmon_drain(void)
 					acc = semantic_activation_ack_lmon_accept_current_commit_applied_request(
 						&item, &snapshot, current_members_lo, current_members_hi, current_epoch,
 						current_coordinator_node, local_capability_word);
+				if (item.message.stage == CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED)
+					ereport(LOG,
+							(errmsg("semantic activation COMMIT REQUEST consumed (node %d)",
+									cluster_node_id),
+							 errdetail("src=%d nonce=%llu epoch=%llu generation=%llu result=%d "
+									   "gate_epoch=%llu gate_generation=%llu gate_closed=%d",
+									   item.authenticated_source_node_id,
+									   (unsigned long long)item.message.round_nonce,
+									   (unsigned long long)item.message.transition_epoch,
+									   (unsigned long long)item.message.record_generation, (int)acc,
+									   (unsigned long long)snapshot.formation_epoch,
+									   (unsigned long long)snapshot.record_generation,
+									   (int)snapshot.transition_closed)));
 				if (acc == SEMANTIC_ACTIVATION_ACK_CONSUME_REJECTED) {
 					acc = semantic_activation_ack_lmon_retain_request_ahead(
 						&item, &snapshot, current_members_lo, current_members_hi, current_epoch,
