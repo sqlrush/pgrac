@@ -2575,11 +2575,12 @@ HeapTupleSatisfiesMVCCInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 							   cluster_node_id)));
 
-		/* P0-27: VACUUM's exact FROZEN bit pair is already a durable
-		 * xmin-committed proof.  Do not turn that terminal cleanout back into
-		 * one origin verdict round per tuple.  The xmax half remains mandatory:
-		 * a frozen inserter says nothing about a later foreign deleter. */
-		if (!cluster_vis_xmin_needs_resolution(tuple->t_infomask)) {
+		/* VACUUM's exact FROZEN pair and PG's permanent bootstrap creator
+		 * already prove xmin committed. Neither needs a still-bound DATA slot.
+		 * The xmax half remains mandatory: creation proves nothing about a
+		 * later foreign deleter. */
+		if (!cluster_vis_xmin_needs_resolution(tuple->t_infomask)
+			|| TransactionIdEquals(raw_xmin, BootstrapTransactionId)) {
 			switch (cluster_remote_live_xmax_keeps_visible(buffer, tuple, snapshot)) {
 			case 1:
 				return true;

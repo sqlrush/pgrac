@@ -536,7 +536,7 @@ UT_TEST(test_mvcc_frozen_xmin_bypasses_remote_resolve_but_keeps_xmax_gate)
 	mvcc = strstr(source, "if (cluster_enabled && BufferIsValid(buffer)");
 	frozen = mvcc == NULL
 				 ? NULL
-				 : strstr(mvcc, "if (!cluster_vis_xmin_needs_resolution(tuple->t_infomask))");
+				 : strstr(mvcc, "if (!cluster_vis_xmin_needs_resolution(tuple->t_infomask)\n");
 	xmax_gate
 		= frozen == NULL
 			  ? NULL
@@ -854,6 +854,7 @@ UT_TEST(test_writer_proof_entry_excludes_native_inplace_and_keyshare_shortcuts)
 int
 main(void)
 {
+	UT_PLAN(24);
 	UT_RUN(test_t1_undo_tt_slot_ref_sizeof_32);
 	UT_RUN(test_t2_ref_field_offsets);
 	UT_RUN(test_t3_placeholder_ref_sentinel);

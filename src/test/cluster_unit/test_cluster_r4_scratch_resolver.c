@@ -1261,6 +1261,91 @@ UT_TEST(test_incomplete_live_proof_keeps_cr_and_authority_refusal)
 	ut_complete_frozen_live_case(HEAP_XMIN_FROZEN, 0, false);
 }
 
+static void
+ut_bootstrap_live_case(TransactionId xmin, int leg, bool expect_error, bool expect_visible)
+{
+	HeapTupleData tuple = { 0 };
+	SnapshotData snapshot = { 0 };
+	HeapTupleHeader header;
+	PGAlignedBlock before;
+	volatile bool caught = false;
+	volatile bool visible = false;
+
+	ut_reset(leg == 3	? CLUSTER_TT_STATUS_ABORTED
+			 : leg == 4 ? CLUSTER_TT_STATUS_UNKNOWN
+						: CLUSTER_TT_STATUS_COMMITTED,
+			 leg == 2 ? UT_READ_SCN + 1 : UT_COMMIT_SCN);
+	ut_exit_fixture = true;
+	ut_exit_ref = ut_exact_peer_ref();
+	cluster_crossnode_runtime_visibility = true;
+	memset(ut_visibility_page.data, 0, BLCKSZ);
+	((PageHeader)ut_visibility_page.data)->pd_flags = PD_HAS_ITL;
+	((PageHeader)ut_visibility_page.data)->pd_special = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	((PageHeader)ut_visibility_page.data)->pd_upper = BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE;
+	((PageHeader)ut_visibility_page.data)->pd_lower = SizeOfPageHeaderData;
+	((PageHeader)ut_visibility_page.data)->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	PageSetLSN(ut_visibility_page.data, UT_ANCHOR_LSN);
+	header = (HeapTupleHeader)(ut_visibility_page.data + 1024);
+	header->t_hoff = SizeofHeapTupleHeader;
+	header->t_itl_slot_idx = leg == 6 ? CLUSTER_ITL_SLOT_UNALLOCATED : 0;
+	header->t_infomask = leg == 0 || leg >= 5 ? HEAP_XMAX_INVALID : 0;
+	HeapTupleHeaderSetXmin(header, xmin);
+	HeapTupleHeaderSetXmax(header, leg == 0 || leg >= 5 ? InvalidTransactionId : UT_RAW_XID);
+	ItemPointerSet(&tuple.t_self, 0, 1);
+	header->t_ctid = tuple.t_self;
+	tuple.t_data = header;
+	tuple.t_len = SizeofHeapTupleHeader;
+	tuple.t_tableOid = FirstNormalObjectId;
+	snapshot.snapshot_type = SNAPSHOT_MVCC;
+	snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	snapshot.read_epoch = UT_CLUSTER_EPOCH + (leg == 5 ? (UINT64_C(1) << 32) : 0);
+	snapshot.read_scn = UT_READ_SCN;
+	memcpy(before.data, ut_visibility_page.data, BLCKSZ);
+	ut_error_armed = true;
+	if (sigsetjmp(ut_error_jump, 0) == 0)
+		visible = cluster_heap_test_satisfies_mvcc(&tuple, &snapshot, 1);
+	else
+		caught = true;
+	ut_error_armed = false;
+	UT_ASSERT_EQ(caught, expect_error);
+	UT_ASSERT_EQ(visible, expect_visible);
+	UT_ASSERT_EQ(ut_live_cr_gate_calls, 1);
+	if (!expect_error) {
+		UT_ASSERT_EQ(ut_calls.memo_probe, leg >= 1 && leg <= 4 ? 1 : 0);
+		UT_ASSERT_EQ(ut_calls.peer_stamp, leg >= 1 && leg <= 4 ? 1 : 0);
+	}
+	UT_ASSERT_EQ(ut_native_calls, 0);
+	UT_ASSERT_EQ(ut_hint_mutations, 0);
+	UT_ASSERT_EQ(memcmp(before.data, ut_visibility_page.data, BLCKSZ), 0);
+	ut_exit_fixture = false;
+}
+
+UT_TEST(test_live_bootstrap_creator_needs_no_old_slot)
+{
+	ut_bootstrap_live_case(BootstrapTransactionId, 0, false, true);
+	ut_bootstrap_live_case(BootstrapTransactionId, 6, false, true);
+}
+
+UT_TEST(test_live_bootstrap_creator_keeps_exact_deleter_verdict)
+{
+	for (int leg = 1; leg <= 3; leg++)
+		ut_bootstrap_live_case(BootstrapTransactionId, leg, false, leg != 1);
+	ut_bootstrap_live_case(BootstrapTransactionId, 4, true, false);
+}
+
+UT_TEST(test_live_bootstrap_creator_keeps_epoch_fence)
+{
+	ut_bootstrap_live_case(BootstrapTransactionId, 5, true, false);
+	UT_ASSERT(strstr(ut_error_message, "snapshot stale across reconfig") != NULL);
+}
+
+UT_TEST(test_live_bootstrap_does_not_admit_invalid_or_unknown_creator)
+{
+	ut_bootstrap_live_case(InvalidTransactionId, 0, true, false);
+	ut_bootstrap_live_case(FrozenTransactionId, 0, true, false);
+	ut_bootstrap_live_case(UT_RAW_XID + 1, 0, true, false);
+}
+
 UT_TEST(test_three_real_visibility_exits_route_recycle_and_unproven)
 {
 	static const char *exits[] = { "VIS_RECYCLED_XMIN", "VIS_RECYCLED_XMAX", "VIS_RECYCLED_XID" };
@@ -2355,7 +2440,7 @@ UT_TEST(test_full_scratch_trace_formatter_reports_truncation_without_overrun)
 int
 main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(47);
 	UT_RUN(test_full_scratch_trace_wrap_keeps_last_decisions_without_io);
 	UT_RUN(test_full_scratch_trace_formatter_reports_truncation_without_overrun);
 	UT_RUN(test_full_scratch_recycled_lock_roles_use_only_original_terminal_proof);
@@ -2387,6 +2472,10 @@ main(void)
 	UT_RUN(test_complete_frozen_live_proof_precedes_legacy_cr);
 	UT_RUN(test_complete_frozen_live_proof_keeps_full_epoch_check);
 	UT_RUN(test_incomplete_live_proof_keeps_cr_and_authority_refusal);
+	UT_RUN(test_live_bootstrap_creator_needs_no_old_slot);
+	UT_RUN(test_live_bootstrap_creator_keeps_exact_deleter_verdict);
+	UT_RUN(test_live_bootstrap_creator_keeps_epoch_fence);
+	UT_RUN(test_live_bootstrap_does_not_admit_invalid_or_unknown_creator);
 	UT_RUN(test_full_scratch_remote_xmax_retains_exact_data_locator);
 	UT_RUN(test_full_scratch_remote_xmin_retains_exact_data_locator);
 	UT_RUN(test_full_scratch_local_xmax_uses_exact_origin_not_native_clog);
