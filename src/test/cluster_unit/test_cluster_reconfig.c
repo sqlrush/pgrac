@@ -7842,6 +7842,59 @@ UT_TEST(test_pre2_cold_control_sparse_and_torn_observation)
 	cluster_shared_config = false;
 }
 
+/* Capture an accepted cohort through the original cold-formation driver.
+ * Only native install/stripe completion are fixture boundary inputs.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterReconfigState *
+ut_serving_formation_fixture(void)
+{
+	ClusterReconfigState *state = pre2_cold_fixture(0);
+
+	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
+	for (int i = 0; i < 3; ++i)
+		pre2_cold_tick();
+	ut_recovery_in_progress = false;
+	ut_startup_writer_installed = true;
+	pre2_cold_tick();
+	return state;
+}
+
+/* The serving consumer needs the original identity even if a later provider
+ * read would not complete. The legacy capture currently projects it to zero;
+ * the new same-observation entry must preserve it without a second sample.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_serving_formation_keeps_identity_when_storage_observation_moves)
+{
+	ClusterReconfigState *state = ut_serving_formation_fixture();
+	ClusterFormationSnapshotV1 snapshot;
+	bool captured;
+
+	UT_ASSERT_EQ(state->self_join_admitted, 1);
+	UT_ASSERT(cluster_reconfig_capture_formation_snapshot_v1(2, &snapshot));
+	UT_ASSERT_EQ(snapshot.startup_formation_generation, 4);
+	ut_storage_members[0] = 0;
+	captured = cluster_reconfig_capture_formation_snapshot_v1(2, &snapshot);
+	pre2_initial_restore();
+	UT_ASSERT(captured);
+	UT_ASSERT_EQ(snapshot.startup_formation_generation, 4);
+}
+
+UT_TEST(test_serving_formation_keeps_identity_during_quorum_publication)
+{
+	ClusterReconfigState *state = ut_serving_formation_fixture();
+	ClusterFormationSnapshotV1 snapshot;
+	bool captured;
+
+	UT_ASSERT_EQ(state->self_join_admitted, 1);
+	UT_ASSERT(cluster_reconfig_capture_formation_snapshot_v1(2, &snapshot));
+	UT_ASSERT_EQ(snapshot.startup_formation_generation, 4);
+	ut_in_quorum_value = false;
+	captured = cluster_reconfig_capture_formation_snapshot_v1(2, &snapshot);
+	pre2_initial_restore();
+	UT_ASSERT(captured);
+	UT_ASSERT_EQ(snapshot.startup_formation_generation, 4);
+}
+
 UT_TEST(test_initial_clean_snapshot_requires_exact_four_node_marker_and_empty_replacement)
 {
 	ClusterReconfigState *state;
@@ -8180,7 +8233,7 @@ UT_TEST(test_membership_cut_generation_uses_original_shmem_owner)
 int
 main(void)
 {
-	UT_PLAN(152);
+	UT_PLAN(154);
 	UT_RUN(test_stop_membership_terminal_peer_is_not_online_admission);
 	UT_RUN(test_stop_membership_preserves_all_nonliveness_requirements);
 	UT_RUN(test_stop_reconfig_shared_owners);
@@ -8369,6 +8422,8 @@ main(void)
 	UT_RUN(test_pre2_restart_snapshot_expiry_owner_drift_and_unknown_io_stay_closed);
 	UT_RUN(test_pre2_published_fence_snapshot_is_readonly_and_bound_to_owner);
 	UT_RUN(test_pre2_control_keeps_disk_proof_refresh_until_startup_finishes);
+	UT_RUN(test_serving_formation_keeps_identity_when_storage_observation_moves);
+	UT_RUN(test_serving_formation_keeps_identity_during_quorum_publication);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
