@@ -635,10 +635,165 @@ UT_TEST(resource_x_cssd_busy_yields_before_admission_and_never_hides_loss)
 	UT_ASSERT(!pending);
 }
 
+/* Only the surrounding request is a fixture: reaching true represents the
+ * first slot/send action. A pending observation must return to the existing
+ * exact reservation abort/rearm owner before either action is possible. */
+static bool
+authority_requester_gate(bool *out_retry_denied)
+{
+	*out_retry_denied = false;
+#include "test_cluster_gcs_serving_gate.inc"
+	return true;
+}
+
+static int
+authority_requester_result(bool *retry)
+{
+	volatile int result;
+
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		result = authority_requester_gate(retry) ? 1 : 0;
+	else
+		result = -1;
+	phase4_capture_fatal = false;
+	return result;
+}
+
+UT_TEST(gcs_requester_publication_overlap_yields_without_sql_error)
+{
+	for (int owner = 0; owner < 2; owner++) {
+		bool retry = false;
+
+		authority_storage_setup(true);
+		if (owner == 0)
+			pg_atomic_fetch_add_u32(&authority_storage.sequence, 1);
+		else {
+			authority_continuity_invalid = true;
+			authority_continuity_pending = true;
+		}
+		UT_ASSERT_EQ(authority_requester_result(&retry), 0);
+		UT_ASSERT(retry);
+		UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_SERVING_READY);
+		if (owner == 0)
+			pg_atomic_fetch_add_u32(&authority_storage.sequence, 1);
+		else {
+			authority_continuity_invalid = false;
+			authority_continuity_pending = false;
+		}
+		UT_ASSERT_EQ(authority_requester_result(&retry), 1);
+		UT_ASSERT(!retry);
+	}
+}
+
+UT_TEST(gcs_requester_does_not_reinterpret_pending_with_a_later_sample)
+{
+	bool retry = false;
+
+	authority_storage_setup(true);
+	pg_atomic_fetch_add_u32(&authority_storage.sequence, 1);
+	restore_publication_after_false = true;
+	UT_ASSERT_EQ(authority_requester_result(&retry), 0);
+	UT_ASSERT(retry);
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_SERVING_READY);
+	UT_ASSERT_EQ(authority_requester_result(&retry), 1);
+	UT_ASSERT(!retry);
+}
+
+UT_TEST(gcs_requester_pending_never_hides_identity_or_proven_loss)
+{
+	for (int variant = 0; variant < 8; variant++) {
+		bool retry = false;
+
+		authority_storage_setup(true);
+		authority_continuity_invalid = true;
+		authority_continuity_pending = variant != 0;
+		switch (variant) {
+		case 1:
+			phase_test_lms_generation++;
+			break;
+		case 2:
+			phase_test_cssd_status = CLUSTER_CSSD_DOWN;
+			break;
+		case 3:
+			phase_test_formation_epoch++;
+			break;
+		case 4:
+			phase_test_membership_member = false;
+			break;
+		case 5:
+			phase_test_last_admitted_incarnation++;
+			break;
+		case 6:
+			phase_test_grd_authority_ok = false;
+			break;
+		case 7:
+			phase_test_self_incarnation++;
+			break;
+		}
+		UT_ASSERT_EQ(authority_requester_result(&retry), -1);
+		UT_ASSERT(!retry);
+	}
+}
+
+UT_TEST(gcs_requester_wait_cannot_renew_an_expired_owner_or_rebind_a_loss)
+{
+	bool retry = false;
+
+	authority_storage_setup(true);
+	authority_continuity_invalid = true;
+	authority_continuity_pending = true;
+	for (int i = 0; i < 3; i++) {
+		UT_ASSERT_EQ(authority_requester_result(&retry), 0);
+		UT_ASSERT(retry);
+	}
+	/* The original admission owner's expiry/refusal wins even when its
+	 * publication remains busy. Waiting never renews that owner's lease. */
+	phase4_test_in_quorum = false;
+	UT_ASSERT_EQ(authority_requester_result(&retry), -1);
+	UT_ASSERT(!retry);
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_OFF);
+	phase4_test_in_quorum = true;
+	authority_continuity_invalid = false;
+	authority_continuity_pending = false;
+	UT_ASSERT_EQ(authority_requester_result(&retry), -1);
+	UT_ASSERT(!retry);
+}
+
+UT_TEST(gcs_requester_failure_diagnostic_uses_the_original_predicate)
+{
+	bool pending;
+	const char *predicate;
+
+	authority_storage_setup(true);
+	authority_continuity_invalid = true;
+	authority_continuity_pending = true;
+	UT_ASSERT(!cluster_serving_ready_check(&pending, &predicate));
+	UT_ASSERT(pending);
+	UT_ASSERT(strcmp(predicate, "QUORUM_OBSERVATION_PENDING") == 0);
+	phase_test_formation_epoch++;
+	UT_ASSERT(!cluster_serving_ready_check(&pending, &predicate));
+	UT_ASSERT(!pending);
+	UT_ASSERT(strcmp(predicate, "FORMATION_CHANGED") == 0);
+	phase_test_cssd_status = CLUSTER_CSSD_DOWN;
+	UT_ASSERT(!cluster_serving_ready_check(&pending, &predicate));
+	UT_ASSERT(!pending);
+	UT_ASSERT(strcmp(predicate, "CSSD_NOT_READY") == 0);
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_OFF);
+	UT_ASSERT(!cluster_serving_ready_check(&pending, &predicate));
+	UT_ASSERT(!pending);
+	UT_ASSERT(strcmp(predicate, "BINDING_ABSENT") == 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(30);
+	UT_RUN(gcs_requester_publication_overlap_yields_without_sql_error);
+	UT_RUN(gcs_requester_does_not_reinterpret_pending_with_a_later_sample);
+	UT_RUN(gcs_requester_pending_never_hides_identity_or_proven_loss);
+	UT_RUN(gcs_requester_wait_cannot_renew_an_expired_owner_or_rebind_a_loss);
+	UT_RUN(gcs_requester_failure_diagnostic_uses_the_original_predicate);
 	UT_RUN(resource_x_same_sample_never_crosses_the_original_serving_loss_cut);
 	UT_RUN(resource_x_pending_requires_the_same_serving_identity);
 	UT_RUN(resource_x_continuity_never_blocks_or_hides_a_known_refusal);

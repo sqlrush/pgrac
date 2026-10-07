@@ -619,6 +619,13 @@ extern bool cluster_grd_recovery_authority_barrier_wait(const ClusterFormationSn
 extern void cluster_grd_recovery_authority_lmon_tick(void);
 extern bool cluster_grd_recovery_authority_is_current(uint64 boot_incarnation,
 													  uint64 lms_generation);
+struct ClusterQvotecAdmissionCheck;
+/* SERVING only: consume this call's admission sample and the original GRD
+ * seal. Pending never grants authority and never hides a changed seal. */
+extern bool
+cluster_grd_recovery_authority_for_admission(uint64 boot_incarnation, uint64 lms_generation,
+											 const struct ClusterQvotecAdmissionCheck *check,
+											 bool *pending);
 extern bool cluster_grd_serving_authority_rebind_lmon(const ClusterFormationSnapshotV1 *formation,
 													  uint64 boot_incarnation,
 													  uint64 lms_generation);

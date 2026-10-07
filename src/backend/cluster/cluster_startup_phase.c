@@ -456,14 +456,26 @@ cluster_authority_binding_preseal_identity_current(const ClusterAuthorityBinding
 /* A sealed serving generation must continue to match the live formation, but
  * must not consume the finite IR-held recovery-duty fence cache.  The GRD seal,
  * QVOTEC incarnation and LMS generation are checked by the caller. */
-static bool
-cluster_serving_formation_current(const ClusterAuthorityBindingLocal *binding)
+static const char *
+cluster_serving_formation_failure(const ClusterAuthorityBindingLocal *binding)
 {
 	ClusterFormationSnapshotV1 current;
 
-	return binding != NULL && cluster_reconfig_self_join_admitted()
-		   && cluster_reconfig_capture_formation_snapshot_v1(binding->origin_thread, &current)
-		   && cluster_formation_snapshot_matches_v1(&binding->formation, &current);
+	if (binding == NULL)
+		return "BINDING_ABSENT";
+	if (!cluster_reconfig_self_join_admitted())
+		return "JOIN_NOT_ADMITTED";
+	if (!cluster_reconfig_capture_formation_snapshot_v1(binding->origin_thread, &current))
+		return "FORMATION_CAPTURE";
+	if (!cluster_formation_snapshot_matches_v1(&binding->formation, &current))
+		return "FORMATION_CHANGED";
+	return NULL;
+}
+
+static bool
+cluster_serving_formation_current(const ClusterAuthorityBindingLocal *binding)
+{
+	return cluster_serving_formation_failure(binding) == NULL;
 }
 
 /* The formation and GRD seal may be replaced only by LMON after the ordinary
@@ -505,33 +517,52 @@ cluster_serving_generation_current(const ClusterAuthorityBindingLocal *binding)
  * deliberately NOT part of this predicate so callers can distinguish "the
  * allowlist phase gate rejected this request" from "the binding itself is
  * stale". */
-static bool
-cluster_authority_binding_components_identity_current(const ClusterAuthorityBindingLocal *binding,
+static const char *
+cluster_authority_binding_components_identity_failure(const ClusterAuthorityBindingLocal *binding,
 													  bool serving, bool require_seal,
 													  bool require_member,
 													  bool refresh_identity_only)
 {
 	ClusterFormationWitnessResult formation_result;
 
-	if (binding == NULL || binding->boot_incarnation == 0 || binding->lms_generation == 0
-		|| cluster_cssd_get_status() != CLUSTER_CSSD_READY
-		|| cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY
-		|| cluster_qvotec_get_self_incarnation() != binding->boot_incarnation
-		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-			   != binding->boot_incarnation
-		|| cluster_lms_get_lms_restart_generation() != binding->lms_generation
-		|| (require_member && !cluster_membership_is_member(cluster_node_id))
-		|| (require_seal
-			&& !cluster_grd_recovery_authority_is_current(binding->boot_incarnation,
-														  binding->lms_generation)))
-		return false;
+	if (binding == NULL || binding->boot_incarnation == 0 || binding->lms_generation == 0)
+		return "BINDING_IDENTITY";
+	if (cluster_cssd_get_status() != CLUSTER_CSSD_READY)
+		return "CSSD_NOT_READY";
+	if (cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY)
+		return "QVOTEC_NOT_READY";
+	if (cluster_qvotec_get_self_incarnation() != binding->boot_incarnation)
+		return "BOOT_CHANGED";
+	if (cluster_membership_get_last_admitted_incarnation(cluster_node_id)
+		!= binding->boot_incarnation)
+		return "ADMITTED_BOOT_CHANGED";
+	if (cluster_lms_get_lms_restart_generation() != binding->lms_generation)
+		return "LMS_GENERATION_CHANGED";
+	if (require_member && !cluster_membership_is_member(cluster_node_id))
+		return "NOT_MEMBER";
+	if (require_seal
+		&& !cluster_grd_recovery_authority_is_current(binding->boot_incarnation,
+													  binding->lms_generation))
+		return "GRD_SEAL_CHANGED";
 	if (serving)
-		return cluster_serving_formation_current(binding);
+		return cluster_serving_formation_failure(binding);
 	formation_result = cluster_formation_classification_revalidate_nowait(
 		binding->origin_thread, &binding->authority, &binding->formation);
-	return formation_result == CLUSTER_FORMATION_WITNESS_READY
-		   || (refresh_identity_only
-			   && formation_result == CLUSTER_FORMATION_WITNESS_CACHE_EXPIRED);
+	if (formation_result == CLUSTER_FORMATION_WITNESS_READY
+		|| (refresh_identity_only && formation_result == CLUSTER_FORMATION_WITNESS_CACHE_EXPIRED))
+		return NULL;
+	return "RECOVERY_FORMATION";
+}
+
+static bool
+cluster_authority_binding_components_identity_current(const ClusterAuthorityBindingLocal *binding,
+													  bool serving, bool require_seal,
+													  bool require_member,
+													  bool refresh_identity_only)
+{
+	return cluster_authority_binding_components_identity_failure(
+			   binding, serving, require_seal, require_member, refresh_identity_only)
+		   == NULL;
 }
 
 static bool
@@ -553,19 +584,33 @@ cluster_authority_binding_components_current(const ClusterAuthorityBindingLocal 
 																 false);
 }
 
+static const char *
+cluster_authority_binding_external_identity_failure(const ClusterAuthorityBindingLocal *binding,
+													bool serving)
+{
+	ClusterStartupPhase phase = cluster_current_phase();
+	const char *failure;
+
+	failure = cluster_authority_binding_components_identity_failure(binding, serving, true, true,
+																	false);
+	if (failure != NULL)
+		return failure;
+	if (serving) {
+		if (binding->state != CLUSTER_AUTHORITY_SERVING_READY || phase < CLUSTER_PHASE_4_NORMAL
+			|| phase >= CLUSTER_PHASE_SHUTDOWN)
+			return "SERVING_PHASE";
+		return cluster_lms_is_ready() ? NULL : "LMS_NOT_READY";
+	}
+	if (binding->state != CLUSTER_AUTHORITY_RECOVERY_READY || phase != CLUSTER_PHASE_3_RECOVERY)
+		return "RECOVERY_PHASE";
+	return cluster_lms_is_recovery_ready() ? NULL : "LMS_RECOVERY_NOT_READY";
+}
+
 static bool
 cluster_authority_binding_external_identity_current(const ClusterAuthorityBindingLocal *binding,
 													bool serving)
 {
-	ClusterStartupPhase phase = cluster_current_phase();
-
-	if (!cluster_authority_binding_components_identity_current(binding, serving, true, true, false))
-		return false;
-	if (serving)
-		return binding->state == CLUSTER_AUTHORITY_SERVING_READY && phase >= CLUSTER_PHASE_4_NORMAL
-			   && phase < CLUSTER_PHASE_SHUTDOWN && cluster_lms_is_ready();
-	return binding->state == CLUSTER_AUTHORITY_RECOVERY_READY && phase == CLUSTER_PHASE_3_RECOVERY
-		   && cluster_lms_is_recovery_ready();
+	return cluster_authority_binding_external_identity_failure(binding, serving) == NULL;
 }
 
 static bool
@@ -1141,20 +1186,37 @@ cluster_authority_readiness_publish_serving(void)
 }
 
 bool
-cluster_serving_ready_is_current(void)
+cluster_serving_ready_check(bool *pending, const char **failed_predicate)
 {
 	ClusterAuthorityBindingLocal binding;
 	ClusterAuthorityQuorumState quorum;
+	const char *failure;
 	bool identity_current;
 	bool current;
 
+	if (pending != NULL)
+		*pending = false;
+	if (failed_predicate != NULL)
+		*failed_predicate = "BINDING_ABSENT";
 	if (!cluster_authority_binding_copy(&binding))
 		return false;
-	if (binding.state != CLUSTER_AUTHORITY_SERVING_READY)
+	if (binding.state != CLUSTER_AUTHORITY_SERVING_READY) {
+		if (failed_predicate != NULL)
+			*failed_predicate = "NOT_SERVING";
 		return false;
+	}
 	quorum = cluster_authority_quorum_current(&binding);
-	identity_current = cluster_authority_binding_external_identity_current(&binding, true);
+	failure = cluster_authority_binding_external_identity_failure(&binding, true);
+	identity_current = failure == NULL;
 	current = identity_current && quorum == CLUSTER_AUTHORITY_QUORUM_CURRENT;
+	if (pending != NULL)
+		*pending = identity_current && quorum == CLUSTER_AUTHORITY_QUORUM_PENDING;
+	if (failed_predicate != NULL)
+		*failed_predicate = failure != NULL							  ? failure
+							: quorum == CLUSTER_AUTHORITY_QUORUM_LOST ? "QUORUM_CONTINUITY_LOST"
+							: quorum == CLUSTER_AUTHORITY_QUORUM_PENDING
+								? "QUORUM_OBSERVATION_PENDING"
+								: "CURRENT";
 	/* A current boot/LMS generation whose formation moved stays unavailable,
 	 * but keeps its immutable binding so the survivor LMON can replace it only
 	 * after the existing GRD recovery/re-declare barrier closes.  Every data-
@@ -1166,6 +1228,12 @@ cluster_serving_ready_is_current(void)
 				|| cluster_serving_formation_current(&binding))))
 		cluster_authority_clear_matching_quorum(&binding, "serving_ready_stale", quorum);
 	return current;
+}
+
+bool
+cluster_serving_ready_is_current(void)
+{
+	return cluster_serving_ready_check(NULL, NULL);
 }
 
 /* Read only the original managed boot baseline. Resource-X may call while

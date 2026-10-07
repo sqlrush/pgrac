@@ -3180,12 +3180,25 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
 								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 								  cluster_node_id)));
-	if (cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()) {
-		ereport(ERROR, (errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
-						errmsg("GCS block service is not serving-ready"),
-						errhint("Complete StartupXLOG and publish SERVING_READY before "
-								"requesting cache-fusion data.")));
-		return false;
+	if (cluster_authority_readiness_managed()) {
+		const char *failed_predicate;
+		bool pending;
+
+		if (!cluster_serving_ready_check(&pending, &failed_predicate)) {
+			/* Before any slot/send: the original bufmgr owner aborts its
+			 * exact reservation and waits off content locks, then rechecks
+			 * the complete identity. No later sample relabels this refusal. */
+			if (pending) {
+				*out_retry_denied = true;
+				return false;
+			}
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
+							errmsg("GCS block service is not serving-ready"),
+							errdetail("node=%d predicate=%s", cluster_node_id, failed_predicate),
+							errhint("Complete StartupXLOG and publish SERVING_READY before "
+									"requesting cache-fusion data.")));
+			return false;
+		}
 	}
 
 	/*

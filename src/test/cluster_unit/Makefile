@@ -4260,12 +4260,22 @@ test_cluster_startup_phase: test_cluster_startup_phase.c unit_test.h test_cluste
 test_cluster_authority_storage: test_cluster_authority_storage.c test_cluster_startup_phase.c \
 		unit_test.h test_cluster_config_s1_native.inc test_cluster_config_ges_native.inc \
 		test_cluster_startup_walr_native.inc test_cluster_startup_snapshot_native.inc \
+		test_cluster_gcs_serving_gate.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_storage_quorum.c \
 		$(CLUSTER_VERSION_O) $(CLUSTER_STARTUP_PHASE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		-DSTARTUP_PHASE_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_startup_phase.c"' \
 		-DSTORAGE_QUORUM_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_storage_quorum.c"' \
 		$(CLUSTER_VERSION_O) $(CLUSTER_STARTUP_PHASE_O) -o $@
+
+# Exercise the actual pre-send gate with the real authority/storage consumer.
+test_cluster_gcs_serving_gate.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^cluster_gcs_send_block_request_and_wait\(/ { requester=1 } \
+	     requester && /^\tif \(cluster_authority_readiness_managed\(\)/ { emit=1; begin++ } \
+	     emit && /^\t\/\*$$/ { emit=0; requester=0; end++ } \
+	     emit { print } \
+	     END { if (begin != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 # test_cluster_lmon links cluster_lmon.o standalone (spec-1.11 Sprint A).
 # cluster_lmon.c references shmem / lwlock / pqsignal / latch / proc /

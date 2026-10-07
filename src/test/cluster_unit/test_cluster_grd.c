@@ -6831,6 +6831,76 @@ UT_TEST(test_recovery_authority_done_echo_is_bounded_per_requester)
 	cluster_enabled = false;
 }
 
+static void
+setup_serving_seal_sample_fixture(ClusterQvotecAdmissionCheck *check)
+{
+	ClusterFormationSnapshotV1 formation;
+
+	setup_recovery_authority_singleton_fixture(&formation);
+	ut_drive_authority_lmon_tick = true;
+	cluster_enabled = true;
+	UT_ASSERT(cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 10));
+	ut_drive_authority_lmon_tick = false;
+	cluster_enabled = false;
+	memset(check, 0, sizeof(*check));
+	check->result = CLUSTER_QVOTEC_ADMISSION_ALLOWED;
+	check->continuity_valid = true;
+	check->continuity.quorum_generation = 1;
+	check->continuity.storage_generation = 1;
+	ut_storage_admission_reads = 0;
+	ut_storage_count_legacy = true;
+	cluster_shared_config = true;
+}
+
+UT_TEST(test_serving_seal_uses_one_admission_sample)
+{
+	ClusterQvotecAdmissionCheck check;
+	bool pending = true;
+
+	setup_serving_seal_sample_fixture(&check);
+	ut_qvotec_quorum = false; /* The next observation differs; do not take it. */
+	UT_ASSERT(cluster_grd_recovery_authority_for_admission(11, 7, &check, &pending));
+	UT_ASSERT(!pending);
+	UT_ASSERT_EQ(ut_storage_admission_reads, 0);
+	ut_storage_count_legacy = false;
+	ut_qvotec_quorum = true;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_serving_seal_pending_never_grants_or_hides_drift)
+{
+	ClusterQvotecAdmissionCheck check;
+	bool pending = false;
+
+	setup_serving_seal_sample_fixture(&check);
+	check.result = CLUSTER_QVOTEC_ADMISSION_STORAGE;
+	check.storage.result = CLUSTER_STORAGE_CHECK_UNSTABLE;
+	check.storage.snapshot_stop = CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT;
+	UT_ASSERT(!cluster_grd_recovery_authority_for_admission(11, 7, &check, &pending));
+	UT_ASSERT(pending);
+	UT_ASSERT_EQ(ut_storage_admission_reads, 0);
+	ut_mock_epoch++;
+	UT_ASSERT(!cluster_grd_recovery_authority_for_admission(11, 7, &check, &pending));
+	UT_ASSERT(!pending);
+	UT_ASSERT_EQ(ut_storage_admission_reads, 0);
+	ut_storage_count_legacy = false;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_serving_seal_cannot_replace_a_refusal_with_ready)
+{
+	ClusterQvotecAdmissionCheck check;
+	bool pending = true;
+
+	setup_serving_seal_sample_fixture(&check);
+	check.result = CLUSTER_QVOTEC_ADMISSION_DB_STATE;
+	UT_ASSERT(!cluster_grd_recovery_authority_for_admission(11, 7, &check, &pending));
+	UT_ASSERT(!pending);
+	UT_ASSERT_EQ(ut_storage_admission_reads, 0);
+	ut_storage_count_legacy = false;
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_recovery_authority_postmaster_cannot_execute_blocking_barrier)
 {
 	ClusterFormationSnapshotV1 formation;
@@ -7758,7 +7828,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(165);
+	UT_PLAN(168);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 	UT_RUN(test_parallel_group_worker_cannot_wait_behind_blocked_ddl);
 	UT_RUN(test_parallel_group_convert_uses_original_holder_group);
@@ -7953,6 +8023,9 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_startup_cf_handoff_rejects_noncanonical_queue);
 	UT_RUN(test_join_routing_excludes_unadmitted_alive_peers);
 	UT_RUN(test_join_census_covers_dead_home_rerouted_between_survivors);
+	UT_RUN(test_serving_seal_uses_one_admission_sample);
+	UT_RUN(test_serving_seal_pending_never_grants_or_hides_drift);
+	UT_RUN(test_serving_seal_cannot_replace_a_refusal_with_ready);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

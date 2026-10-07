@@ -335,6 +335,10 @@ extern bool cluster_configuration_read_transport_is_current(const ClusterResId *
 															LOCKMODE mode);
 extern bool cluster_startup_control_transport_is_current(const ClusterResId *resid, LOCKMODE mode);
 extern bool cluster_serving_ready_is_current(void);
+/* The same serving observation, including the exact refusal predicate. Only
+ * a publishing quorum with otherwise current identity sets pending; it grants
+ * nothing. The original request owner must yield and revalidate from scratch. */
+extern bool cluster_serving_ready_check(bool *pending, const char **failed_predicate);
 struct ClusterQvotecAdmissionCheck;
 /* Same-sample continuity against the original managed serving boot. No
  * resampling, admission renewal, or replacement of a lost baseline. */

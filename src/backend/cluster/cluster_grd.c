@@ -1413,8 +1413,9 @@ cluster_grd_authority_map_is_current(uint64 refresh, uint64 members_lo, uint64 m
 	return pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count) == refresh;
 }
 
-bool
-cluster_grd_recovery_authority_is_current(uint64 boot_incarnation, uint64 lms_generation)
+static bool
+cluster_grd_recovery_authority_current_internal(uint64 boot_incarnation, uint64 lms_generation,
+												bool sample_quorum)
 {
 	uint64 refresh;
 	uint64 epoch;
@@ -1428,7 +1429,8 @@ cluster_grd_recovery_authority_is_current(uint64 boot_incarnation, uint64 lms_ge
 			   != boot_incarnation
 		|| pg_atomic_read_u64(&cluster_grd_state->recovery_authority_lms_generation)
 			   != lms_generation
-		|| !cluster_qvotec_in_quorum() || cluster_qvotec_get_self_incarnation() != boot_incarnation
+		|| (sample_quorum && !cluster_qvotec_in_quorum())
+		|| cluster_qvotec_get_self_incarnation() != boot_incarnation
 		|| !cluster_membership_is_member(cluster_node_id)
 		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != boot_incarnation)
 		return false;
@@ -1450,6 +1452,34 @@ cluster_grd_recovery_authority_is_current(uint64 boot_incarnation, uint64 lms_ge
 			return false;
 	}
 	return true;
+}
+
+bool
+cluster_grd_recovery_authority_is_current(uint64 boot_incarnation, uint64 lms_generation)
+{
+	return cluster_grd_recovery_authority_current_internal(boot_incarnation, lms_generation, true);
+}
+
+bool
+cluster_grd_recovery_authority_for_admission(uint64 boot_incarnation, uint64 lms_generation,
+											 const ClusterQvotecAdmissionCheck *check,
+											 bool *pending)
+{
+	bool admission_pending = false;
+	bool admitted;
+
+	if (pending == NULL)
+		return false;
+	*pending = false;
+	if (!cluster_shared_config || check == NULL)
+		return false;
+	admitted = cluster_authority_serving_admission_current_v1(check, &admission_pending);
+	if ((!admitted && !admission_pending)
+		|| !cluster_grd_recovery_authority_current_internal(boot_incarnation, lms_generation,
+															false))
+		return false;
+	*pending = admission_pending;
+	return admitted;
 }
 
 /* P04 bounded fast-rejoin deviation: once the ordinary LMON recovery FSM has

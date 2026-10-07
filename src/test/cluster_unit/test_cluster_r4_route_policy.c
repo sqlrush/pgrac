@@ -209,6 +209,13 @@ cluster_serving_ready_is_current(void)
 	return true;
 }
 bool
+cluster_serving_ready_check(bool *pending, const char **failed_predicate)
+{
+	*pending = false;
+	*failed_predicate = "CURRENT";
+	return cluster_serving_ready_is_current();
+}
+bool
 cluster_clean_leave_block_serve_gate_allows(void)
 {
 	return true;
