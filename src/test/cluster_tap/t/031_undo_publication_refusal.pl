@@ -72,6 +72,43 @@ for my $attempt (1 .. 2)
 
 unlike(slurp_file($node->logfile), qr/TRAP:|PANIC:|terminated by signal/,
 	'error cleanup does not crash a backend');
+
+# Global catalogs use the native global-tablespace/database-zero address.
+# Exercise independent existing rows too: a failed CREATE must not hide an
+# ALTER or shared-description failure behind a missing test role.
+for my $case (
+	[ 'CREATE ROLE ctrc_namespace_role NOLOGIN', 'CREATE ROLE' ],
+	[ 'ALTER ROLE CURRENT_USER NOINHERIT', 'ALTER ROLE' ],
+	[ "COMMENT ON DATABASE postgres IS 'ctrc namespace insert'", 'shared catalog insert' ],
+	[ "COMMENT ON DATABASE postgres IS 'ctrc namespace update'", 'shared catalog update' ])
+{
+	my ($out, $err);
+	my $rc = $creator->psql('postgres', $case->[0],
+		stdout => \$out, stderr => \$err,
+		extra_params => [ '-v', 'VERBOSITY=verbose' ], timeout => 15);
+	is($rc, 0, "$case->[1] accepts the native shared catalog address");
+	diag($err) if $rc;
+}
+for my $member ($cluster->nodes)
+{
+	is($member->safe_psql('postgres',
+		"SELECT count(*) FROM pg_roles WHERE rolname='ctrc_namespace_role' AND NOT rolcanlogin"),
+		'1', $member->name . ' observes CREATE ROLE');
+	is($member->safe_psql('postgres',
+		'SELECT rolinherit FROM pg_roles WHERE rolname=current_user'),
+		'f', $member->name . ' observes ALTER ROLE');
+	is($member->safe_psql('postgres',
+		"SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname='postgres'"),
+		'ctrc namespace update', $member->name . ' observes shared catalog update');
+}
+for my $sql ('DROP ROLE IF EXISTS ctrc_namespace_role',
+	'ALTER ROLE CURRENT_USER INHERIT', 'COMMENT ON DATABASE postgres IS NULL')
+{
+	my ($out, $err);
+	my $rc = $creator->psql('postgres', $sql, stdout => \$out, stderr => \$err, timeout => 15);
+	is($rc, 0, 'shared catalog cleanup succeeds');
+	diag($err) if $rc;
+}
 # Each armed INSERT connection has exited; no other backend was armed.
 $cluster->stop_cluster;
 done_testing();

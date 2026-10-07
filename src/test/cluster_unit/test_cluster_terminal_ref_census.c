@@ -550,6 +550,122 @@ UT_TEST(test_ctrc_epoch_zero_identity_is_present_and_exact)
 								   "(expected_epoch == 0 && cluster_conf_node_count() != 4)"));
 }
 
+/* Native global catalogs are database-zero; database-local relations are
+ * never database-zero. Both receipt target families retain the same rule
+ * through prepare, exact apply, discharge and relation removal. */
+UT_TEST(test_ctrc_native_namespace_prepare_and_exact_apply)
+{
+	static const struct {
+		uint32 spc;
+		uint32 db;
+		bool valid;
+	} addresses[] = { { 1663, 5, true },  { 1664, 0, true }, { 1663, 0, false },
+					  { 1664, 5, false }, { 0, 5, false },	 { 0, 0, false } };
+	for (int kind = 0; kind < 2; kind++) {
+		for (Size i = 0; i < lengthof(addresses); i++) {
+			ClusterCtrcTxnKeyV1 key = test_key();
+			ClusterCtrcParticipantIdentity identity = test_participant_identity(2);
+			ClusterCtrcParticipantEntry participant = { 0 };
+			ClusterCtrcPublicationIdV1 publication = test_publication(
+				82, kind ? CTRC_REF_RECOMPOSED_SURVIVOR : CTRC_REF_HEAP_ITL_UBA,
+				kind ? CTRC_TARGET_PAGE_PENDING_OFFNUM : CTRC_TARGET_PAGE_PENDING_ITL_SLOT);
+			ClusterCtrcTargetV1 pending
+				= kind ? test_pending_offnum_target(publication.descriptor_hash)
+					   : test_pending_itl_target();
+			ClusterCtrcTargetV1 exact = kind ? test_exact_tid_target(publication.descriptor_hash)
+											 : test_exact_itl_target();
+			ClusterCtrcReceipt receipts[3] = { 0 };
+			uint8 probes[3] = { 0 };
+			uint64 index = UINT64_MAX;
+			ClusterCtrcApplyToken token = { 0 };
+			ClusterCtrcDurability durability = { 0 };
+			ClusterCtrcLocalReleaseAckV1 ack;
+			ClusterCtrcPrepareResult result;
+
+			pending.spc_oid = exact.spc_oid = addresses[i].spc;
+			pending.db_oid = exact.db_oid = addresses[i].db;
+			result = cluster_ctrc_receipt_prepare_table_locked(
+				&participant, &key, &identity, TEST_GRANT, &publication, &pending, receipts, probes,
+				lengthof(receipts), 101, &index, NULL);
+			UT_ASSERT_EQ(result, addresses[i].valid ? CLUSTER_CTRC_PREPARE_READY
+													: CLUSTER_CTRC_PREPARE_REFUSED);
+			if (!addresses[i].valid) {
+				UT_ASSERT_EQ(participant.receipt_count, 0);
+				UT_ASSERT_EQ(index, UINT64_MAX);
+				UT_ASSERT(!cluster_ctrc_relation_removal_ready_from_snapshot(
+					NULL, 0, addresses[i].spc, addresses[i].db, pending.rel_number));
+				continue;
+			}
+			if (result != CLUSTER_CTRC_PREPARE_READY)
+				continue;
+			/* An otherwise exact successor cannot cross the namespace. */
+			exact.db_oid = addresses[i].db ? 0 : 5;
+			UT_ASSERT_EQ(
+				cluster_ctrc_receipt_apply_prepared(&participant, &receipts[index], &exact, &token),
+				CLUSTER_CTRC_APPLY_FAIL_CLOSED);
+			UT_ASSERT(!token.valid);
+			exact.db_oid = addresses[i].db;
+			UT_ASSERT_EQ(
+				cluster_ctrc_receipt_apply_prepared(&participant, &receipts[index], &exact, &token),
+				CLUSTER_CTRC_APPLY_APPLIED);
+			UT_ASSERT(token.valid);
+			UT_ASSERT(!cluster_ctrc_relation_removal_ready_from_snapshot(
+				receipts, lengthof(receipts), pending.spc_oid, pending.db_oid, pending.rel_number));
+			durability.highest_local_lsn = durability.local_flush_lsn = 300;
+			if (kind)
+				UT_ASSERT_EQ(cluster_ctrc_receipt_discharge_current_mx(
+								 &participant, &receipts[index], &exact,
+								 CTRC_CLEANED_TERMINAL_REWRITE, &durability),
+							 CLUSTER_CTRC_DISCHARGE_CLEANED);
+			else
+				UT_ASSERT_EQ(cluster_ctrc_receipt_discharge_itl(&participant, &receipts[index],
+																CTRC_ITL_TERMINAL_INDEPENDENT,
+																&durability),
+							 CLUSTER_CTRC_DISCHARGE_CLEANED);
+			UT_ASSERT(cluster_ctrc_relation_removal_ready_from_snapshot(
+				receipts, lengthof(receipts), pending.spc_oid, pending.db_oid, pending.rel_number));
+			UT_ASSERT_EQ(
+				cluster_ctrc_participant_close(&participant, &identity, TEST_GRANT, TEST_SEAL),
+				CLUSTER_CTRC_CLOSE_ACK_READY);
+			UT_ASSERT_EQ(cluster_ctrc_participant_ack_from_snapshot(&participant, &receipts[index],
+																	1, &durability, &ack),
+						 CLUSTER_CTRC_ACK_RELEASED);
+		}
+	}
+}
+
+UT_TEST(test_ctrc_prepare_refusals_are_counted_once)
+{
+	ClusterCtrcTargetV1 target = test_pending_itl_target();
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcStatId total = CTRC_STAT_COUNT, address = CTRC_STAT_COUNT;
+	uint64 before_total, before_address;
+
+	for (int i = 0; i < CTRC_STAT_COUNT; i++) {
+		if (strcmp(cluster_ctrc_stat_name(i), "receipt_prepare_refused_count") == 0)
+			total = i;
+		if (strcmp(cluster_ctrc_stat_name(i), "receipt_namespace_refused_count") == 0)
+			address = i;
+	}
+	UT_ASSERT(total < CTRC_STAT_COUNT && address < CTRC_STAT_COUNT);
+	if (total == CTRC_STAT_COUNT || address == CTRC_STAT_COUNT)
+		return;
+	before_total = cluster_ctrc_stat_get(total);
+	before_address = cluster_ctrc_stat_get(address);
+	for (int variant = 0; variant < 3; variant++) {
+		target.spc_oid = 1664;
+		target.db_oid = variant == 0 ? 5 : 0;
+		MemSet(&handle, 0x7f, sizeof(handle));
+		/* The standalone shared runtime is unavailable. A legal namespace
+		 * must still be refused and counted, not turned into fake admission. */
+		UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_shared(NULL, NULL, 0, NULL,
+														 variant == 2 ? NULL : &target, &handle),
+					 CLUSTER_CTRC_PREPARE_REFUSED);
+		UT_ASSERT_EQ(cluster_ctrc_stat_get(total), before_total + variant + 1);
+		UT_ASSERT_EQ(cluster_ctrc_stat_get(address), before_address + 1);
+	}
+}
+
 /* MXA-T15: a proof delayed beyond OPEN must never publish the old grant. */
 UT_TEST(test_ctrc_delayed_positive_proof_revalidates_open_grant)
 {
@@ -3109,6 +3225,8 @@ UT_TEST(test_ctrc_observability_names_are_closed_and_total)
 		"pending_observed_age_ms",
 		"observed_at_monotonic_us",
 		"observation_age_ms",
+		"receipt_prepare_refused_count",
+		"receipt_namespace_refused_count",
 	};
 	static const char *const reason_names[] = {
 		"NONE",			  "PREPARED_DRAIN",	 "RESOURCE_X",		   "PAGE_REVALIDATE",
@@ -3150,6 +3268,8 @@ main(void)
 		CTRC_TEST_ENTRY(test_ctrc_active_grant_records_touched_node_before_positive_proof),
 		CTRC_TEST_ENTRY(test_ctrc_epoch_zero_identity_is_present_and_exact),
 		CTRC_TEST_ENTRY(test_ctrc_delayed_positive_proof_revalidates_open_grant),
+		CTRC_TEST_ENTRY(test_ctrc_native_namespace_prepare_and_exact_apply),
+		CTRC_TEST_ENTRY(test_ctrc_prepare_refusals_are_counted_once),
 		CTRC_TEST_ENTRY(test_ctrc_receipt_prepare_apply_full_identity_cross_product),
 		CTRC_TEST_ENTRY(test_cancelled_child_attempt_cannot_alias_its_replacement),
 		CTRC_TEST_ENTRY(test_ctrc_unpublished_itl_apply_accepts_forward_page_version),
