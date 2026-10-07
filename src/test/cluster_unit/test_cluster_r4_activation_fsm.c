@@ -11423,11 +11423,17 @@ static void test_serving_finish_root(void);
 #include "test_cluster_serving_admission.h"
 #include "test_cluster_sample_ack_handoff.h"
 #include "test_cluster_clean_restart_formation.h"
+#include "test_cluster_commit_carrier.h"
 
 int
 main(void)
 {
-	UT_PLAN(378);
+	UT_PLAN(383);
+	UT_RUN(test_member_commit_read_preserves_carrier_during_observation_gap);
+	UT_RUN(test_member_commit_resumes_original_read_after_observation_gap);
+	UT_RUN(test_member_commit_retention_rejects_observable_contradictions);
+	UT_RUN(test_member_commit_original_read_still_requires_exact_durable_proof);
+	UT_RUN(test_member_commit_control_without_observation_gap);
 	UT_RUN(test_barrier_waits_for_both_late_peer_samples_in_either_order);
 	UT_RUN(test_staged_sample_ack_survives_idle_authority_gap);
 	UT_RUN(test_sample_ack_waits_for_local_gate_epoch);
