@@ -144,6 +144,19 @@ static ClNormalStopFrontInbox cl_normal_stop_front_inbox[CLUSTER_PHASE1_FULL_STO
 static bool cl_normal_stop_front_read_pending;
 static bool cl_normal_stop_post_read_pending;
 
+/* Checkpointer call-stack progress only. A completed observation survives
+ * waits in this stage, never the shutdown checkpoint or a new invocation.
+ * Owner censuses and live identity checks are not cached. */
+typedef struct ClNormalStopCheckpointProgress {
+	bool after_checkpoint;
+	bool identity_ready;
+	ClusterPhase1FullStopPlan identity;
+	bool post_barrier_seen;
+	bool waiting_for_release;
+	bool all_closed;
+	uint32 release_seen;
+} ClNormalStopCheckpointProgress;
+
 static void cl_normal_stop_fronts_lmon_tick(void);
 static void cl_normal_stop_post_lmon_tick(void);
 static ClusterNormalStopPollResult cl_normal_stop_release_observe(ClusterPhase1FullStopPlan *out,
@@ -1293,6 +1306,29 @@ done:
 	return result;
 }
 
+static ClusterNormalStopPollResult
+cl_normal_stop_stage_identity(bool post_checkpoint, ClNormalStopCheckpointProgress *progress,
+							  ClusterPhase1FullStopPlan *out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result;
+
+	if (!cluster_shared_config)
+		return cl_normal_stop_identity_poll(post_checkpoint, out, reason_out);
+	if (progress->after_checkpoint != post_checkpoint) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	if (progress->identity_ready)
+		return cl_normal_stop_identity_recheck(post_checkpoint, &progress->identity, out,
+											   reason_out);
+	result = cl_normal_stop_identity_poll(post_checkpoint, out, reason_out);
+	if (result == CLUSTER_NORMAL_STOP_READY) {
+		progress->identity = *out;
+		progress->identity_ready = true;
+	}
+	return result;
+}
+
 bool
 cluster_normal_stop_protocol_closed(void)
 {
@@ -2075,11 +2111,14 @@ cl_normal_stop_post_arm_state_locked(const ClusterPhase1FullStopPlan *plan, uint
 	return cl_normal_stop_post_state_locked(plan, phase, now, expected_services, false);
 }
 
-ClusterNormalStopPollResult
-cluster_normal_stop_post_checkpoint_arm(ClusterPhase1FullStopPlan *plan,
-										ClusterNormalStopModuleObservation *observation)
+static ClusterNormalStopPollResult
+cl_normal_stop_post_checkpoint_arm(ClusterPhase1FullStopPlan *plan,
+								   ClusterNormalStopModuleObservation *observation,
+								   ClNormalStopCheckpointProgress *progress)
 {
 	ClusterNormalStopModuleObservation ignored;
+	ClusterPhase1FullStopPlan observed;
+	const ClusterPhase1FullStopPlan *current_observation = NULL;
 	ClusterNormalStopPollResult result;
 	uint32 phase;
 	uint64 now, next_nonce;
@@ -2119,9 +2158,15 @@ cluster_normal_stop_post_checkpoint_arm(ClusterPhase1FullStopPlan *plan,
 	LWLockRelease(&cl_state->lock);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
+	if (cluster_shared_config) {
+		result = cl_normal_stop_stage_identity(true, progress, &observed, &observation->reason);
+		if (result != CLUSTER_NORMAL_STOP_READY)
+			return result;
+		current_observation = &observed;
+	}
 	/* Actual own STOPPED, dirty/IO and every other post-checkpoint owner
 	 * remain mandatory. PI is retired only AFTER all peers prove this cut. */
-	result = cl_normal_stop_modules_poll(true, false, observation, NULL);
+	result = cl_normal_stop_modules_poll(true, false, observation, current_observation);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
 	now = (uint64)GetCurrentTimestamp();
@@ -2156,6 +2201,15 @@ cluster_normal_stop_post_checkpoint_arm(ClusterPhase1FullStopPlan *plan,
 	if (wake)
 		cluster_lmon_wakeup();
 	return result;
+}
+
+ClusterNormalStopPollResult
+cluster_normal_stop_post_checkpoint_arm(ClusterPhase1FullStopPlan *plan,
+										ClusterNormalStopModuleObservation *observation)
+{
+	ClNormalStopCheckpointProgress progress = { 0 };
+	progress.after_checkpoint = true;
+	return cl_normal_stop_post_checkpoint_arm(plan, observation, &progress);
 }
 
 static bool
@@ -2660,7 +2714,8 @@ cluster_normal_stop_durable_close_owned(const ClusterPhase1FullStopPlan *plan)
 static ClusterNormalStopPollResult
 cl_normal_stop_durable_close(const ClusterPhase1FullStopPlan *plan,
 							 const ClusterPhase1FullStopPlan *current_observation,
-							 ClusterNormalStopModuleObservation *observation)
+							 ClusterNormalStopModuleObservation *observation,
+							 ClNormalStopCheckpointProgress *progress)
 {
 	ClusterControlRootResult published;
 	ClusterPhase1FullStopPlan current;
@@ -2700,8 +2755,11 @@ cl_normal_stop_durable_close(const ClusterPhase1FullStopPlan *plan,
 	}
 	PG_END_TRY();
 	cl_durable_close_owner = NULL;
-	if (published == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	if (published == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		progress->all_closed = all_closed;
+		progress->waiting_for_release = !all_closed;
 		return all_closed ? CLUSTER_NORMAL_STOP_READY : CLUSTER_NORMAL_STOP_PENDING;
+	}
 	if (published == CLUSTER_CONTROL_ROOT_CAS_CONFLICT
 		|| published == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
 		return CLUSTER_NORMAL_STOP_PENDING;
@@ -2710,15 +2768,16 @@ cl_normal_stop_durable_close(const ClusterPhase1FullStopPlan *plan,
 	return CLUSTER_NORMAL_STOP_INVALID;
 }
 
-ClusterNormalStopPollResult
-cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
-							   ClusterNormalStopModuleObservation *observation)
+static ClusterNormalStopPollResult
+cl_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
+						  ClusterNormalStopModuleObservation *observation,
+						  ClNormalStopCheckpointProgress *progress)
 {
 	ClusterNormalStopModuleObservation ignored;
 	ClusterPhase1FullStopPlan observed;
 	const ClusterPhase1FullStopPlan *current_observation = NULL;
 	ClusterNormalStopPollResult result;
-	bool armed, valid, wake = false;
+	bool armed, valid, post_complete, wake = false;
 	uint32 expected, peers;
 	if (observation == NULL)
 		observation = &ignored;
@@ -2735,22 +2794,51 @@ cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 	armed = pg_atomic_read_u32(&cl_state->phase1_release_pending) != 0;
 	valid = cl_normal_stop_release_state_locked(plan, expected, armed);
+	post_complete = cl_state->ack_bitmap[0] == peers
+					&& cl_state->phase1_post_stopped_reply_sent[0] == peers
+					&& cl_state->phase1_post_stopped_reply_pending[0] == 0;
 	LWLockRelease(&cl_state->lock);
 	if (!valid)
 		return CLUSTER_NORMAL_STOP_INVALID;
+	if (cluster_shared_config && !armed) {
+		/* A missing peer checkpoint reply cannot be supplied by another
+		 * ROOT read. Leave CF available to that peer's original owners. */
+		if (!post_complete) {
+			if (progress->post_barrier_seen) {
+				cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
+				return CLUSTER_NORMAL_STOP_INVALID;
+			}
+			observation->reason = "NORMAL_STOP_ALL_CHECKPOINTS_OR_ACTOR_CUT_PENDING";
+			return CLUSTER_NORMAL_STOP_PENDING;
+		}
+		progress->post_barrier_seen = true;
+	}
 	if (cluster_shared_config) {
-		/* A second async CF read would restart control work just drained by
-		 * the owner census. Keep one completed observation on this stack;
-		 * each consumer still rechecks the live formation/semantic identity. */
-		result = cl_normal_stop_identity_poll(true, &observed, &observation->reason);
+		result = cl_normal_stop_stage_identity(true, progress, &observed, &observation->reason);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return result;
 		current_observation = &observed;
 	}
-	result = cl_normal_stop_modules_poll(true, armed, observation, current_observation);
+	result = cl_normal_stop_modules_poll(
+		true, armed || progress->waiting_for_release || progress->all_closed, observation,
+		current_observation);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
-	if (!armed) {
+	if (!armed && progress->waiting_for_release) {
+		uint32 seen;
+		LWLockAcquire(&cl_state->lock, LW_SHARED);
+		seen = cl_state->phase1_release_request_seen[0];
+		LWLockRelease(&cl_state->lock);
+		if ((seen & ~progress->release_seen) == 0) {
+			observation->module = "CONTROL_ROOT";
+			observation->reason = "NORMAL_STOP_DURABLE_CLOSE_AWAIT_RELEASE";
+			return CLUSTER_NORMAL_STOP_PENDING;
+		}
+		/* A notification schedules a fresh publisher check; it is never
+		 * evidence that every thread is durably CLOSED. */
+		progress->waiting_for_release = false;
+	}
+	if (!armed && !progress->all_closed) {
 		bool idle;
 		/* Drain actors that could have accepted a pre-cut PI hint before
 		 * owner retirement. New hints now observe the immutable durable cut. */
@@ -2779,10 +2867,13 @@ cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
 			idle = cl_state->ack_bitmap[0] == peers
 				   && cl_state->phase1_post_stopped_reply_sent[0] == peers
 				   && cl_state->phase1_post_stopped_reply_pending[0] == 0;
+			/* Sample before publication so an in-flight RELEASE is retained
+			 * even when it arrives before the publisher returns. */
+			progress->release_seen = cl_state->phase1_release_request_seen[0];
 			LWLockRelease(&cl_state->lock);
 			if (!idle)
 				return CLUSTER_NORMAL_STOP_PENDING;
-			result = cl_normal_stop_durable_close(plan, current_observation, observation);
+			result = cl_normal_stop_durable_close(plan, current_observation, observation, progress);
 			if (result != CLUSTER_NORMAL_STOP_READY)
 				return result;
 			/* The actual publication's locks must have retired; independently
@@ -2823,6 +2914,15 @@ cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
 	if (wake)
 		cluster_lmon_wakeup();
 	return result;
+}
+
+ClusterNormalStopPollResult
+cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
+							   ClusterNormalStopModuleObservation *observation)
+{
+	ClNormalStopCheckpointProgress progress = { 0 };
+	progress.after_checkpoint = true;
+	return cl_normal_stop_close_poll(plan, observation, &progress);
 }
 
 static bool
@@ -3327,9 +3427,10 @@ cl_normal_stop_checkpoint_state_locked(uint32 expected_services, uint32 phase, u
 	return cluster_normal_stop_failure() == CLUSTER_NORMAL_STOP_FAILURE_NONE;
 }
 
-ClusterNormalStopPollResult
-cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullStopPlan *plan_out,
-									ClusterNormalStopModuleObservation *observation)
+static ClusterNormalStopPollResult
+cl_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullStopPlan *plan_out,
+							   ClusterNormalStopModuleObservation *observation,
+							   ClNormalStopCheckpointProgress *progress)
 {
 	ClusterNormalStopModuleObservation ignored;
 	ClusterPhase1FullStopPlan observed;
@@ -3358,11 +3459,16 @@ cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullS
 	}
 	cl_normal_stop_expected_services = expected_services;
 	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
-	if (phase <= CLUSTER_NORMAL_STOP_DRAIN) {
+	if (phase <= CLUSTER_NORMAL_STOP_DRAIN
+		&& (!cluster_shared_config || !progress->identity_ready)) {
 		result = cluster_normal_stop_fronts_poll(&observed, &observation->reason);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return result;
 		phase = CLUSTER_NORMAL_STOP_DRAIN;
+		if (cluster_shared_config) {
+			progress->identity = observed;
+			progress->identity_ready = true;
+		}
 	}
 	now = (uint64)GetCurrentTimestamp();
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
@@ -3385,12 +3491,11 @@ cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullS
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
 	if (cluster_shared_config) {
-		result = cl_normal_stop_identity_poll(false, &observed, &observation->reason);
+		result = cl_normal_stop_stage_identity(false, progress, &observed, &observation->reason);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return result;
-		/* One confirmed CF observation belongs to this synchronous call.
-		 * Each census and the final cut recheck its live identity, without
-		 * dispatching new control work AFTER observing those owners idle. */
+		/* The stage's completed observation survives owner-drain waits.
+		 * Every census and final cut still checks its live identity. */
 		current_observation = &observed;
 	}
 	result = cl_normal_stop_modules_poll(false, true, observation, current_observation);
@@ -3470,6 +3575,14 @@ cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullS
 	return result;
 }
 
+ClusterNormalStopPollResult
+cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullStopPlan *plan_out,
+									ClusterNormalStopModuleObservation *observation)
+{
+	ClNormalStopCheckpointProgress progress = { 0 };
+	return cl_normal_stop_checkpoint_poll(expected_services, plan_out, observation, &progress);
+}
+
 /* Read-only diagnostics, never permission to progress the shutdown. */
 static bool
 cl_normal_stop_wait_snapshot(char *out, Size out_size)
@@ -3506,9 +3619,11 @@ cl_normal_stop_checkpoint_run(ClusterPhase1FullStopPlan *plan,
 							  bool after_checkpoint)
 {
 	ClusterNormalStopModuleObservation ignored;
+	ClNormalStopCheckpointProgress progress = { 0 };
 	unsigned step = after_checkpoint ? 1 : 0;
 	uint32 expected = cl_normal_stop_config_service_mask();
 	uint64 last_diagnostic_us = 0;
+	progress.after_checkpoint = after_checkpoint;
 	if (observation == NULL)
 		observation = &ignored;
 	memset(observation, 0, sizeof(*observation));
@@ -3526,11 +3641,11 @@ cl_normal_stop_checkpoint_run(ClusterPhase1FullStopPlan *plan,
 		 * checkpoint or a new post-STOPPED nonce. */
 		ResetLatch(MyLatch);
 		if (step == 0)
-			result = cluster_normal_stop_checkpoint_poll(expected, plan, observation);
+			result = cl_normal_stop_checkpoint_poll(expected, plan, observation, &progress);
 		else if (step == 1)
-			result = cluster_normal_stop_post_checkpoint_arm(plan, observation);
+			result = cl_normal_stop_post_checkpoint_arm(plan, observation, &progress);
 		else
-			result = cluster_normal_stop_close_poll(plan, observation);
+			result = cl_normal_stop_close_poll(plan, observation, &progress);
 		if (result != CLUSTER_NORMAL_STOP_READY) {
 			char snapshot[256];
 			uint64 diagnostic_now = (uint64)GetCurrentTimestamp();
@@ -3569,8 +3684,8 @@ cl_normal_stop_checkpoint_run(ClusterPhase1FullStopPlan *plan,
 			return false;
 		}
 		timeout_ms = (long)Min((deadline - now + UINT64_C(999)) / UINT64_C(1000), (uint64)INT_MAX);
-		/* Root publication by a peer has no normal-stop wire notification.
-		 * Reuse the shutdown observer cadence within the original deadline. */
+		/* Continue original owner/transport censuses within the same budget;
+		 * durable own-close waits do not start another CF observation. */
 		if (cluster_shared_config && step == 2)
 			timeout_ms = Min(timeout_ms, 20L);
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, timeout_ms,
