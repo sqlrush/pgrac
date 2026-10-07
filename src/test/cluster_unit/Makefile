@@ -4294,7 +4294,22 @@ test_cluster_serving_sample.inc: $(top_srcdir)/src/backend/cluster/cluster_qvote
 	     $(top_srcdir)/src/backend/cluster/cluster_grd.c >> $@.tmp
 	mv $@.tmp $@
 
+# Exercise the complete original send gates with the real serving sampler.
+test_cluster_serving_send.inc: $(top_srcdir)/src/backend/cluster/cluster_ic_router.c \
+		$(top_srcdir)/src/backend/cluster/cluster_ic_rdma.c \
+		$(top_srcdir)/src/backend/cluster/cluster_ic_chunk.c Makefile
+	awk '/^static const ClusterICEnvelope \*data_dispatch_envelope;/ { print; scope++ } \
+	     /^cluster_ic_data_send_admission\(/ { print "bool"; emit=1; n++ } \
+	     /^#define CLUSTER_IC_RDMA_MAX_SGE / { print; limit++ } \
+	     /^rdma_sum_sge_lengths\(/ { print "static uint32"; emit=1; n++ } \
+	     /^rdma_release_sge_callbacks\(/ { print "static void"; emit=1; n++ } \
+	     /^cluster_ic_rdma_send_envelope_sge\(/ { print "ClusterICSendResult"; emit=1; n++ } \
+	     /^cluster_ic_send_envelope_chunked\(/ { print "bool"; emit=1; n++ } \
+	     emit { print } /^}/ { emit=0 } END { if (n != 5 || limit != 1 || scope != 1 || emit) exit 1 }' $(filter %.c,$^) > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_serving_sample: test_cluster_serving_sample.c test_cluster_serving_sample.inc \
+		test_cluster_serving_send.inc \
 		test_cluster_startup_phase.c unit_test.h test_cluster_config_s1_native.inc \
 		test_cluster_config_ges_native.inc test_cluster_startup_walr_native.inc \
 		test_cluster_startup_snapshot_native.inc \

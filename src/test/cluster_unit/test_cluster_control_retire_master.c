@@ -10,6 +10,17 @@
 #include "test_cluster_hw_handoff.c"
 #include "cluster/cluster_control_retire.h"
 
+Latch *MyLatch;
+void
+ResetLatch(Latch *latch pg_attribute_unused())
+{}
+int
+WaitLatch(Latch *latch pg_attribute_unused(), int events pg_attribute_unused(),
+		  long timeout pg_attribute_unused(), uint32 event pg_attribute_unused())
+{
+	abort(); /* This retirement fixture never injects a pending observation. */
+}
+
 static bool receipt_table_ready = true;
 
 bool

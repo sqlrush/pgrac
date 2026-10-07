@@ -2405,12 +2405,15 @@ cluster_ic_rdma_send_envelope_sge(uint8 msg_type, int32 dest_node_id,
 						errmsg("cluster_ic msg_type %u (\"%s\") not allowed from BackendType %d",
 							   msg_type, info->name, (int)MyBackendType)));
 
-	if ((ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA
-		&& cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()) {
-		rdma_release_sge_callbacks(payload_sge, n_sge);
-		ereport(ERROR, (errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
-						errmsg("cluster IC RDMA data plane is not serving-ready")));
-		return CLUSTER_IC_SEND_HARD_ERROR;
+	if ((ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA) {
+		bool pending = false;
+
+		if (!cluster_ic_data_send_admission(&pending)) {
+			/* No bytes were admitted. Release the borrowed SGE, leaving the
+			 * original request/reply owner to retry its unchanged frame. */
+			rdma_release_sge_callbacks(payload_sge, n_sge);
+			return pending ? CLUSTER_IC_SEND_NOT_ADMITTED : CLUSTER_IC_SEND_HARD_ERROR;
+		}
 	}
 
 	if (dest_node_id == cluster_node_id) {

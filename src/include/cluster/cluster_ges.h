@@ -536,6 +536,7 @@ typedef struct ClusterGesHwGrant {
 	uint64 master_generation;
 	bool cleanup_pending;
 	bool grant_observed;
+	/* Exact requester registration, including local-master confirmation. */
 	bool local_promoted;
 	bool consumed;
 } ClusterGesHwGrant;
@@ -580,6 +581,7 @@ typedef enum ClusterGesAcquireResult {
 	CLUSTER_GES_ACQUIRE_INVALID
 } ClusterGesAcquireResult;
 
+struct ClusterResId;
 extern ClusterGesAcquireResult cluster_ges_cf_request_poll(ClusterGesAcquireAttempt *attempt,
 														   const struct ClusterResId *resid,
 														   uint32 mode,
@@ -661,6 +663,12 @@ extern uint32 cluster_ges_send_hw_request_and_wait(const struct ClusterResId *re
 												   const struct ClusterGrdHolderId *holder,
 												   uint64 request_id, int timeout_ms,
 												   uint32 wait_event, ClusterGesHwGrant *grant);
+/* Pending retains the caller's granted owner for another S5 pass. */
+extern bool cluster_ges_retained_grant_check(const ClusterGesHwGrant *grant,
+											 const struct ClusterResId *resid,
+											 const struct ClusterGrdHolderId *holder,
+											 uint64 request_id, uint32 mode, bool dontwait,
+											 bool *pending);
 extern bool cluster_ges_hw_grant_is_current(const ClusterGesHwGrant *grant,
 											const struct ClusterResId *resid,
 											const struct ClusterGrdHolderId *holder,
@@ -718,6 +726,9 @@ extern uint32 cluster_ges_send_release_and_wait(const struct ClusterResId *resid
  * confirmed absence. An absent holder drains no waiters; unavailable authority
  * is not absence. Recovery-only release also leaves ordinary waiters frozen.
  */
+/* Transfers pending cleanup to the original reliable local RELEASE owner. */
+extern void cluster_ges_release_and_drain_local_deferred(const struct ClusterResId *resid,
+														 const struct ClusterGrdHolderId *holder);
 extern uint32 cluster_ges_release_and_drain_local(const struct ClusterResId *resid,
 												  const struct ClusterGrdHolderId *holder);
 

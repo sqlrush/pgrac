@@ -232,7 +232,7 @@ extern ClusterICSendResult cluster_ic_send_envelope(uint8 msg_type, int32 dest_n
  *         terminate LMON (postmaster crash recovery restarts).
  *
  *   Returns DONE after consuming the frame (including a known refusal),
- *   REJECTED for peer failure, or PENDING before invoking any handler.
+ *   REJECTED for peer failure, or PENDING before authority mutation or transfer.
  *   PENDING leaves ownership with the caller; it must retain the frame.
  */
 /*
@@ -264,6 +264,10 @@ cluster_ic_dispatch_send_result(ClusterICDispatchResult result)
 
 /* Only the currently executing DATA handler can consume this same-call proof. */
 extern bool cluster_ic_dispatch_data_admitted(const ClusterICEnvelope *env);
+/* Reuse only the active DATA handler observation; outside it, sample normally. */
+extern bool cluster_ic_data_send_admission(bool *pending);
+/* Call only for the current frame, before mutation or ownership transfer. */
+extern void cluster_ic_dispatch_defer(const ClusterICEnvelope *env);
 
 extern ClusterICDispatchResult cluster_ic_dispatch_envelope(const ClusterICEnvelope *env,
 															const void *payload, int32 peer_id);

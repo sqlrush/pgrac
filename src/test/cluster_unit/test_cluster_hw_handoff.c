@@ -394,6 +394,13 @@ cluster_lms_inc_priority_starvation_observed(void)
 /* Formation is an explicit fixture precondition, not tested by this probe.
  * Recovery, native-probe, convert, cancellation, and cache-eviction paths
  * are not driven here; an unexpected entry must fail instead of grant. */
+void
+cluster_ic_dispatch_defer(const ClusterICEnvelope *env)
+{
+	(void)env;
+	HW_CHECK(false); /* No injected ingress publication overlap in this fixture. */
+}
+
 bool
 cluster_authority_readiness_managed(void)
 {
@@ -415,10 +422,20 @@ cluster_serving_ready_is_current(void)
 	}
 	return !cooperative_case || cf_case;
 }
+static const ClusterGesHwGrant *pending_s5_grant;
+static unsigned pending_s5_after = 1;
+static unsigned pending_s5_checks;
+
 bool
 cluster_serving_ready_check(bool *pending, const char **predicate)
 {
-	/* This fixture controls readiness, not concurrent publication. */
+	/* Formation is a boundary. The owner/GRD/S4/S5 chain remains real. */
+	if (pending_s5_grant != NULL && pending_s5_grant->grant_observed
+		&& ++pending_s5_checks >= pending_s5_after) {
+		if (pending != NULL)
+			*pending = true;
+		return false;
+	}
 	if (pending != NULL)
 		*pending = false;
 	if (predicate != NULL)
@@ -652,7 +669,8 @@ cluster_grd_outbound_enqueue_cleanup_release(uint32 destination, const void *pay
 {
 	char command = 'R';
 	if ((relation_case || cf_case || hw_local_case) && master_child < 0
-		&& destination == (uint32)cluster_node_id) {
+		&& (destination == (uint32)cluster_node_id
+			|| (cooperative_case && cf_case && destination == 3))) {
 		HW_CHECK(length == sizeof(local_cleanup_release));
 		HW_CHECK(((const GesRequestPayload *)payload)->opcode == GES_REQ_OPCODE_RELEASE);
 		HW_CHECK(((const GesRequestPayload *)payload)->holder_request_id_lo == 201

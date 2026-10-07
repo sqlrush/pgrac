@@ -229,11 +229,11 @@ cluster_ic_send_envelope_chunked(uint8 inner_msg_type, int32 dest_node_id, const
 								   "does not allow BROADCAST destination",
 								   inner_msg_type, inner_info->name)));
 
-		if ((ClusterICPlane)inner_info->plane == CLUSTER_IC_PLANE_DATA
-			&& cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()) {
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
-							errmsg("cluster IC chunked data plane is not serving-ready")));
-			return false;
+		if ((ClusterICPlane)inner_info->plane == CLUSTER_IC_PLANE_DATA) {
+			bool pending = false;
+
+			if (!cluster_ic_data_send_admission(&pending))
+				return false; /* Caller retains the entire unadmitted payload. */
 		}
 	}
 

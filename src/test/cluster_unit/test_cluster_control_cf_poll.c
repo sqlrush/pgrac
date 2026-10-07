@@ -11,6 +11,20 @@
 #include "test_cluster_hw_handoff.c"
 #include "storage/ipc.h"
 
+static unsigned cf_latch_waits;
+Latch *MyLatch;
+void
+ResetLatch(Latch *latch)
+{}
+int
+WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event)
+{
+	cf_latch_waits++;
+	/* A blocking regression completes once, then fails the no-wait assertion. */
+	pending_s5_grant = NULL;
+	return WL_TIMEOUT;
+}
+
 bool cluster_lms_enabled = true;
 bool
 cluster_lms_is_ready(void)
@@ -29,7 +43,7 @@ void
 before_shmem_exit(pg_on_exit_callback callback pg_attribute_unused(),
 				  Datum arg pg_attribute_unused())
 {
-	HW_CHECK(false); /* The stable-owner stage is a separate composition. */
+	/* Process callback registration only; owners below retain real state. */
 }
 bool
 cluster_recovery_transport_components_current(void)
@@ -243,16 +257,117 @@ UT_TEST(initial_shared_formation_uses_real_empty_control_census)
 	cluster_shared_config = false;
 }
 
+UT_TEST(cf_owner_poll_retains_grant_when_s5_observation_is_pending)
+{
+	ClusterLockAcquireRequest req;
+	static ClusterLockOwner owner;
+	unsigned waits = cf_latch_waits;
+	uint64 request_id;
+
+	cf_poll_setup(&req, true);
+	UT_ASSERT_EQ(cluster_grd_cancel_reservation_by_id(&req.resid, &req.holder),
+				 CLUSTER_GRD_ENTRY_OK);
+	cluster_enabled = cluster_shared_config = true;
+	cluster_control_request_shmem_init();
+	memset(&owner, 0, sizeof(owner));
+	owner.request = req;
+	owner.request.request_id = 0;
+	memset(&owner.request.holder, 0, sizeof(owner.request.holder));
+	owner.request.control_owner_id = 0;
+	MyProcPid = 7001;
+	MyBackendType = B_LMON;
+	pending_s5_grant = &owner.request.hw_grant;
+	UT_ASSERT_EQ(cluster_lock_owner_acquire_poll(&owner), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT_EQ(cf_latch_waits, waits);
+	UT_ASSERT_EQ(cooperative_sleeps, 0);
+	UT_ASSERT_EQ(owner.state, CLUSTER_LOCK_OWNER_ACQUIRING);
+	UT_ASSERT(owner.request.hw_grant.grant_observed);
+	UT_ASSERT(owner.request.hw_grant.cleanup_pending);
+	UT_ASSERT(!owner.request.hw_grant.consumed);
+	request_id = owner.request.request_id;
+	/* LMS has the same cooperative ownership contract. */
+	MyBackendType = B_LMS;
+	UT_ASSERT_EQ(cluster_lock_owner_acquire_poll(&owner), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT_EQ(cf_latch_waits, waits);
+	UT_ASSERT_EQ(owner.request.request_id, request_id);
+	pending_s5_grant = NULL;
+	UT_ASSERT_EQ(cluster_lock_owner_acquire_poll(&owner), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT(cluster_lock_owner_is_usable(&owner));
+	UT_ASSERT(owner.request.hw_grant.consumed);
+	UT_ASSERT_EQ(cf_latch_waits, waits);
+	/* Keep the acquired owner alive through process teardown, as in service. */
+	cooperative_case = cf_case = false;
+}
+
+UT_TEST(cf_s5_second_observation_pending_retains_exact_registration)
+{
+	/* Remote promotion, local confirmation, and cancellation after promotion. */
+	for (int leg = 0; leg < 3; leg++) {
+		ClusterLockAcquireRequest req;
+		ClusterGesAcquireAttempt attempt = { 0 };
+		GesReplyPayload reply = { 0 };
+		ClusterICEnvelope env = { 0 };
+		LOCKMODE mode;
+		unsigned waits = cf_latch_waits;
+
+		cluster_shared_config = false;
+		cf_poll_setup(&req, leg == 1);
+		if (leg != 1) {
+			UT_ASSERT_EQ(cluster_ges_cf_request_poll(&attempt, &req.resid, req.lockmode,
+													 &req.holder, &req.hw_grant),
+						 CLUSTER_GES_ACQUIRE_PENDING);
+			reply.opcode = GES_REPLY_OPCODE_GRANT;
+			reply.reply_for_opcode = GES_REQ_OPCODE_REQUEST;
+			reply.holder_node_id = req.holder.node_id;
+			reply.holder_procno = req.holder.procno;
+			reply.holder_cluster_epoch_lo = req.holder.cluster_epoch;
+			reply.holder_request_id_lo = req.holder.request_id;
+			memcpy(reply.resid, &req.resid, sizeof(req.resid));
+			env.source_node_id = 3;
+			env.epoch = 1;
+			cluster_ges_reply_handler(&env, &reply);
+		}
+		UT_ASSERT_EQ(cluster_ges_cf_request_poll(&attempt, &req.resid, req.lockmode, &req.holder,
+												 &req.hw_grant),
+					 CLUSTER_GES_ACQUIRE_GRANTED);
+		pending_s5_grant = &req.hw_grant;
+		pending_s5_after = 2;
+		pending_s5_checks = 0;
+		MyBackendType = B_LMON;
+		UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&req), CLUSTER_LOCK_ACQUIRE_PENDING);
+		UT_ASSERT(cluster_grd_holder_mode_by_id(&req.resid, &req.holder, &mode));
+		UT_ASSERT_EQ(mode, req.lockmode);
+		UT_ASSERT(!req.hw_grant.consumed);
+		UT_ASSERT(req.hw_grant.cleanup_pending);
+		pending_s5_grant = NULL;
+		if (leg == 2) {
+			(void)cluster_lock_acquire_s7_cleanup(&req);
+			UT_ASSERT(!cluster_grd_holder_mode_by_id(&req.resid, &req.holder, NULL));
+		} else {
+			UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+			UT_ASSERT(req.hw_grant.consumed);
+			UT_ASSERT(cluster_grd_holder_mode_by_id(&req.resid, &req.holder, &mode));
+			UT_ASSERT_EQ(mode, req.lockmode);
+		}
+		UT_ASSERT_EQ(cf_latch_waits, waits);
+		cooperative_case = cf_case = false;
+	}
+	pending_s5_after = 1;
+	pending_s5_checks = 0;
+}
+
 int
 main(void)
 {
 	MyBackendType = B_LMON;
-	UT_PLAN(5);
+	UT_PLAN(7);
 	UT_RUN(cf_poll_yields_until_remote_exact_grant);
 	UT_RUN(cf_poll_local_conflict_does_not_wait_for_its_own_drain);
 	UT_RUN(cf_poll_cut_change_keeps_the_original_attempt);
 	UT_RUN(cf_request_common_barrier_blocks_every_entry_then_admits_control_only);
 	UT_RUN(initial_shared_formation_uses_real_empty_control_census);
+	UT_RUN(cf_owner_poll_retains_grant_when_s5_observation_is_pending);
+	UT_RUN(cf_s5_second_observation_pending_retains_exact_registration);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

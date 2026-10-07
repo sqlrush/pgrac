@@ -2761,7 +2761,8 @@ cl_normal_stop_durable_close(const ClusterPhase1FullStopPlan *plan,
 		return all_closed ? CLUSTER_NORMAL_STOP_READY : CLUSTER_NORMAL_STOP_PENDING;
 	}
 	if (published == CLUSTER_CONTROL_ROOT_CAS_CONFLICT
-		|| published == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
+		|| published == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+		|| published == CLUSTER_CONTROL_ROOT_ADMISSION_PENDING)
 		return CLUSTER_NORMAL_STOP_PENDING;
 	snprintf(observation->object, sizeof(observation->object), "root_result=%d", (int)published);
 	cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);

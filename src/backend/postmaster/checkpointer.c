@@ -755,7 +755,8 @@ HandleCheckpointerInterrupts(void)
 				for (;;) {
 					CHECK_FOR_INTERRUPTS();
 					result = cluster_control_root_v3_shutdown_observe(&ref, &stopped, &token);
-					if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
+					if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+						&& result != CLUSTER_CONTROL_ROOT_ADMISSION_PENDING)
 						break;
 					/* Same owner retry as native checkpoint publication. The
 					 * observer released all CF/WALR holds before this wait. */

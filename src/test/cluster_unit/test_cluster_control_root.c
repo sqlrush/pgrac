@@ -122,6 +122,7 @@ static unsigned test_throw_epoch_read;
 static bool test_capture_error_level;
 static int test_last_error_level;
 static bool test_serving, test_fence, test_prebump, test_wal_validated;
+static bool test_serving_pending;
 static ClusterMembershipState test_member_state;
 static XLogRecPtr test_flush;
 static XLogRecPtr test_insert;
@@ -389,7 +390,17 @@ cluster_serving_ready_is_current(void)
 {
 	if (!test_checkpoint_mode)
 		abort();
-	return test_serving;
+	return test_serving && !test_serving_pending;
+}
+
+bool
+cluster_serving_ready_check(bool *pending, const char **predicate)
+{
+	if (pending != NULL)
+		*pending = test_serving && test_serving_pending;
+	if (predicate != NULL)
+		*predicate = NULL;
+	return cluster_serving_ready_is_current();
 }
 
 bool
@@ -7697,6 +7708,58 @@ UT_TEST(test_v2_checkpoint_cas_and_epoch_races_do_not_overwrite)
 				 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
 	v2_assert_primary_unchanged(before);
 	v2_assert_anchor_staging_empty();
+}
+
+static void
+v2_checkpoint_admission_pending(void)
+{
+	test_serving_pending = true;
+}
+
+static void
+v2_checkpoint_admission_lost(void)
+{
+	test_serving = false;
+}
+
+UT_TEST(test_checkpoint_pending_is_not_loss_or_new_admission)
+{
+	uint8 before[66048];
+	ClusterControlRootIdentity self;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootFileToken token;
+	ControlFileData candidate;
+	int locks;
+
+	v2_checkpoint_fixture(before, &self, &candidate);
+	test_serving_pending = true;
+	locks = test_cf_lock_calls;
+	UT_ASSERT_EQ(v2_checkpoint_publish(&self, &candidate, &out, &token),
+				 CLUSTER_CONTROL_ROOT_ADMISSION_PENDING);
+	UT_ASSERT_EQ(test_cf_lock_calls, locks);
+	v2_assert_primary_unchanged(before);
+	test_serving_pending = false;
+	/* Refresh overlap within an already admitted owner is not a new grant.
+	 * Exercise both pre-publication and post-durable refresh boundaries. */
+	for (int after = 0; after < 2; after++) {
+		v2_checkpoint_fixture(before, &self, &candidate);
+		if (after)
+			test_checkpoint_published_hook = v2_checkpoint_admission_pending;
+		else
+			test_checkpoint_x_hook = v2_checkpoint_admission_pending;
+		UT_ASSERT_EQ(v2_checkpoint_publish(&self, &candidate, &out, &token),
+					 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(out.tail_last_record_lsn, candidate.checkPoint);
+		UT_ASSERT_EQ(test_cf_mode, NoLock);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		test_serving_pending = false;
+	}
+	v2_checkpoint_fixture(before, &self, &candidate);
+	test_checkpoint_x_hook = v2_checkpoint_admission_lost;
+	UT_ASSERT_EQ(v2_checkpoint_publish(&self, &candidate, &out, &token),
+				 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	v2_assert_primary_unchanged(before);
+	test_serving = true;
 }
 
 UT_TEST(test_v2_checkpoint_boundaries_refuse_without_mutation)
@@ -22429,7 +22492,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(443);
+	UT_PLAN(444);
 	UT_RUN(test_clean_restart_without_provider_keeps_collective_exit_and_actual_install);
 	UT_RUN(test_clean_restart_without_provider_refuses_missing_exit_formation_and_fence);
 	UT_RUN(test_serving_clean_restart_keeps_old_open_with_current_epoch);
@@ -22776,6 +22839,7 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_checkpoint_rejects_non_owner_facts_before_io);
 	UT_RUN(test_v2_checkpoint_rejects_unflushed_wrong_tli_and_bad_inputs);
 	UT_RUN(test_v2_checkpoint_cas_and_epoch_races_do_not_overwrite);
+	UT_RUN(test_checkpoint_pending_is_not_loss_or_new_admission);
 	UT_RUN(test_v2_checkpoint_boundaries_refuse_without_mutation);
 	UT_RUN(test_v2_checkpoint_root_io_failure_keeps_old_selection);
 	UT_RUN(test_v2_checkpoint_postwrite_failure_keeps_fact_but_no_success);

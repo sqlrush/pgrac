@@ -123,6 +123,85 @@ cluster_conf_lookup_node(int32 node)
 
 #include "test_cluster_serving_sample.inc"
 
+/* These are transport boundaries only; admission below runs through the
+ * production QVOTEC, formation, GRD and SERVING functions above. */
+#include "cluster/cluster_ic_chunk.h"
+#include "cluster/cluster_ic_rdma.h"
+#include "cluster/cluster_ic_router.h"
+#undef HAVE_LIBIBVERBS
+#undef HAVE_LIBRDMACM
+#undef HAVE_RDMA_RDMA_CMA_H
+static unsigned sample_sends;
+static unsigned sample_releases;
+int cluster_interconnect_payload_max_bytes = PGRAC_IC_PAYLOAD_MAX_DEFAULT;
+static void rdma_release_sge_callbacks(const ClusterICSge *sge, int count);
+
+void *
+palloc(Size bytes)
+{
+	return malloc(bytes);
+}
+void
+pfree(void *allocation)
+{
+	free(allocation);
+}
+const ClusterICMsgTypeInfo *
+cluster_ic_get_msg_type_info(uint8 type)
+{
+	static const ClusterICMsgTypeInfo info = { .msg_type = 8,
+											   .name = "serving-send",
+											   .allowed_producer_mask = (1u << B_INVALID),
+											   .plane = CLUSTER_IC_PLANE_DATA };
+	return &info;
+}
+
+bool
+cluster_ic_envelope_build(ClusterICEnvelope *env, uint8 type, uint32 source, uint32 destination,
+						  const void *payload, uint32 bytes)
+{
+	memset(env, 0, sizeof(*env));
+	return true;
+}
+bool
+cluster_ic_rdma_block_sge_supported(const char **reason)
+{
+	return false;
+}
+ClusterICPeerTransport
+cluster_ic_mux_peer_transport(int32 peer)
+{
+	return CLUSTER_IC_PEER_TRANSPORT_TCP;
+}
+void
+cluster_ic_rdma_stats_note_fallback(int32 peer, const char *reason)
+{}
+static uint32
+rdma_compute_sge_crc(ClusterICEnvelope *env, const ClusterICSge *sge, int count)
+{
+	return 1;
+}
+static ClusterICSendResult
+rdma_send_envelope_sge_fallback(const ClusterICEnvelope *env, int32 peer, const ClusterICSge *sge,
+								int count, uint32 bytes)
+{
+	sample_sends++;
+	rdma_release_sge_callbacks(sge, count);
+	return CLUSTER_IC_SEND_DONE;
+}
+ClusterICSendResult
+cluster_ic_send_envelope(uint8 type, int32 peer, const void *payload, uint32 bytes)
+{
+	sample_sends++;
+	return CLUSTER_IC_SEND_DONE;
+}
+static void
+sample_release(void *arg)
+{
+	sample_releases++;
+}
+#include "test_cluster_serving_send.inc"
+
 static void
 sample_setup(void)
 {
@@ -307,13 +386,87 @@ UT_TEST(lock_entry_keeps_real_serving_deadline_pending)
 	UT_ASSERT_EQ(phase4_quorum_check_calls, 0);
 }
 
+static void
+sample_send_pending_case(bool rdma)
+{
+	PGPROC sender = { 0 };
+	uint32 bytes = 71;
+	ClusterICSge sge = { .addr = &bytes, .len = sizeof(bytes), .release_cb = sample_release };
+	volatile bool raised = false;
+	volatile int result = -1;
+
+	sample_setup();
+	MyProc = &sender;
+	MyBackendType = B_INVALID;
+	sample_sends = sample_releases = 0;
+	/* The real conditional formation/GRD lock boundary cannot be captured. */
+	phase_lwlock_conditional_result = false;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		result = rdma ? (int)cluster_ic_rdma_send_envelope_sge(8, 1, &sge, 1, sizeof(bytes))
+					  : (int)cluster_ic_send_envelope_chunked(8, 1, &bytes, sizeof(bytes));
+	else
+		raised = true;
+	phase4_capture_fatal = false;
+	phase_lwlock_conditional_result = true;
+	MyProc = NULL;
+	UT_ASSERT(!raised);
+	UT_ASSERT_EQ(result, rdma ? CLUSTER_IC_SEND_NOT_ADMITTED : false);
+	UT_ASSERT_EQ(sample_sends, 0);
+	UT_ASSERT_EQ(bytes, 71);
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_SERVING_READY);
+	/* The exact caller retries after publication; no admission was invented. */
+	result = rdma ? (int)cluster_ic_rdma_send_envelope_sge(8, 1, &sge, 1, sizeof(bytes))
+				  : (int)cluster_ic_send_envelope_chunked(8, 1, &bytes, sizeof(bytes));
+	UT_ASSERT_EQ(result, rdma ? CLUSTER_IC_SEND_DONE : true);
+	UT_ASSERT_EQ(sample_sends, 1);
+	UT_ASSERT_EQ(phase4_quorum_check_calls, 0);
+}
+
+UT_TEST(rdma_send_waits_for_real_formation_lock_without_error)
+{
+	sample_send_pending_case(true);
+}
+UT_TEST(chunk_send_waits_for_real_formation_lock_without_error)
+{
+	sample_send_pending_case(false);
+}
+
+UT_TEST(real_loss_still_refuses_transport_sends)
+{
+	for (int rdma = 0; rdma < 2; rdma++) {
+		uint32 bytes = 71;
+		ClusterICSge sge = { .addr = &bytes, .len = sizeof(bytes), .release_cb = sample_release };
+		volatile bool raised = false;
+		volatile int result = -1;
+
+		sample_setup();
+		MyBackendType = B_INVALID;
+		sample_sends = sample_releases = 0;
+		pg_atomic_write_u32(&QvotecShmem->quorum_state, CLUSTER_QVOTEC_QUORUM_LOST);
+		phase4_capture_fatal = true;
+		if (setjmp(phase4_fatal_jump) == 0)
+			result = rdma ? (int)cluster_ic_rdma_send_envelope_sge(8, 1, &sge, 1, sizeof(bytes))
+						  : (int)cluster_ic_send_envelope_chunked(8, 1, &bytes, sizeof(bytes));
+		else
+			raised = true;
+		phase4_capture_fatal = false;
+		UT_ASSERT(raised || result == (rdma ? CLUSTER_IC_SEND_HARD_ERROR : false));
+		UT_ASSERT_EQ(sample_sends, 0);
+		UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_OFF);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(3);
+	UT_PLAN(6);
 	UT_RUN(deadline_projects_pending_through_real_formation_and_grd);
 	UT_RUN(serving_deadline_preserves_binding_until_proven_loss_or_identity_drift);
 	UT_RUN(lock_entry_keeps_real_serving_deadline_pending);
+	UT_RUN(rdma_send_waits_for_real_formation_lock_without_error);
+	UT_RUN(chunk_send_waits_for_real_formation_lock_without_error);
+	UT_RUN(real_loss_still_refuses_transport_sends);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

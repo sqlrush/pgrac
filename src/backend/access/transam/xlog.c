@@ -8692,12 +8692,16 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 				 errmsg("root-v3 checkpoint publication requires its native owner")));
 	for (;;)
 	{
+		bool pending = false;
+		bool serving;
+
 		CHECK_FOR_INTERRUPTS();
+		serving = cluster_serving_ready_check(&pending, NULL);
 		if (cluster_epoch_get_current() != epoch || cluster_reconfig_has_pending_prebump_stage()
 			|| (!cluster_external_fence_runtime_active()
 				&& !cluster_wal_thread_initialized_writer_matches(&ref, epoch)
 				&& !cluster_wal_thread_clean_writer_matches(&ref, epoch))
-			|| !cluster_serving_ready_is_current() || !cluster_write_fence_allowed())
+			|| (!serving && !pending) || !cluster_write_fence_allowed())
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 					 errmsg("checkpoint authority changed before control-root publication")));
@@ -8705,15 +8709,18 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 		 * This publishes evidence only, not CLOSED or a serving-set change.
 		 * A pending shutdown signal alone cannot reclassify an online candidate.
 		 * Author: SqlRush <sqlrush@gmail.com> */
-		if (candidate->state == DB_SHUTDOWNED)
+		if (pending)
+			result = CLUSTER_CONTROL_ROOT_ADMISSION_PENDING;
+		else if (candidate->state == DB_SHUTDOWNED)
 			result = cluster_control_root_v3_shutdown_checkpoint_publish(
 				&ref.claim.identity, candidate, end, &published, &token, &selected);
 		else
 			result = cluster_control_root_v3_checkpoint_publish(&ref.claim.identity, candidate, end,
 																&published, &token, &selected);
-		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
+		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+			&& result != CLUSTER_CONTROL_ROOT_ADMISSION_PENDING)
 			break;
-		/* A peer won the whole-file CAS. All CF/WALR holds and own staging
+		/* A peer won the CAS, or initial admission is pending. All holds and staging
 		 * are released before this interruptible owner wait and reobservation.
 		 * STALE identity/namespace and uncertain I/O are not this retry class. */
 		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

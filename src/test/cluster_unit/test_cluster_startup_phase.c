@@ -2003,16 +2003,19 @@ UT_TEST(test_native_initializer_walr_share_nowait_reaches_all_startup_gates)
 	UT_ASSERT(req.dontwait);
 	grant.mode = req.lockmode;
 	grant.request_opcode = GES_REQ_OPCODE_REQUEST_NOWAIT;
-	UT_ASSERT(ges_readiness_allows_early_opcode(grant.request_opcode));
+	UT_ASSERT(ges_readiness_allows_early_opcode(grant.request_opcode,
+												cluster_serving_ready_is_current()));
 	UT_ASSERT(cluster_recovery_authority_request_allowed(&req.resid, req.lockmode, true));
 	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT(ges_readiness_allows_local_origin(grant.request_opcode, &req.resid, req.lockmode,
+												NoLock, cluster_serving_ready_is_current()));
+	UT_ASSERT(ges_readiness_allows_protocol_request(grant.request_opcode, &req.resid, req.lockmode,
+													cluster_serving_ready_is_current()));
+	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid, cluster_serving_ready_is_current()));
 	UT_ASSERT(
-		ges_readiness_allows_local_origin(grant.request_opcode, &req.resid, req.lockmode, NoLock));
-	UT_ASSERT(
-		ges_readiness_allows_protocol_request(grant.request_opcode, &req.resid, req.lockmode));
-	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid));
-	UT_ASSERT(ges_readiness_allows_local_release_origin(&req.resid));
-	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &req.resid, NoLock));
+		ges_readiness_allows_local_release_origin(&req.resid, cluster_serving_ready_is_current()));
+	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &req.resid, NoLock,
+													cluster_serving_ready_is_current()));
 	UT_ASSERT(!cluster_serving_ready_is_current());
 	MyProc = NULL;
 	IsUnderPostmaster = false;
@@ -2046,8 +2049,8 @@ UT_TEST(test_native_initializer_walr_share_cannot_borrow_another_role_or_generat
 	req.resid.field2 = 0;
 	phase_test_grd_authority_ok = false;
 	UT_ASSERT(!cluster_recovery_authority_request_allowed(&req.resid, ShareLock, true));
-	UT_ASSERT(!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST_NOWAIT, &req.resid,
-													 ShareLock));
+	UT_ASSERT(!ges_readiness_allows_protocol_request(
+		GES_REQ_OPCODE_REQUEST_NOWAIT, &req.resid, ShareLock, cluster_serving_ready_is_current()));
 	MyProc = NULL;
 	IsUnderPostmaster = false;
 	reset_phase_service_fixture(true);
@@ -2078,21 +2081,26 @@ UT_TEST(test_slow_startup_control_crosses_remote_master_phase4)
 		UT_ASSERT(cluster_recovery_authority_request_allowed(&resid, mode, true));
 		grant.mode = mode;
 		grant.request_opcode = opcode;
-		UT_ASSERT(ges_readiness_allows_protocol_request(opcode, &resid, mode));
-		UT_ASSERT(ges_readiness_allows_grant(&grant, &resid));
+		UT_ASSERT(ges_readiness_allows_protocol_request(opcode, &resid, mode,
+														cluster_serving_ready_is_current()));
+		UT_ASSERT(ges_readiness_allows_grant(&grant, &resid, cluster_serving_ready_is_current()));
 		IsUnderPostmaster = false;
 		cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
 		IsUnderPostmaster = true;
 		UT_ASSERT(!cluster_recovery_authority_request_allowed(&resid, mode, true));
 		MyBackendType = B_LMON;
 		MyAuxProcType = NotAnAuxProcess;
-		UT_ASSERT(ges_readiness_allows_early_opcode(opcode));
-		UT_ASSERT(ges_readiness_allows_protocol_request(opcode, &resid, mode));
-		UT_ASSERT(ges_readiness_allows_grant(&grant, &resid));
-		UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &resid, NoLock));
+		UT_ASSERT(ges_readiness_allows_early_opcode(opcode, cluster_serving_ready_is_current()));
+		UT_ASSERT(ges_readiness_allows_protocol_request(opcode, &resid, mode,
+														cluster_serving_ready_is_current()));
+		UT_ASSERT(ges_readiness_allows_grant(&grant, &resid, cluster_serving_ready_is_current()));
+		UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &resid, NoLock,
+														cluster_serving_ready_is_current()));
 		UT_ASSERT(!cluster_serving_ready_is_current());
-		UT_ASSERT(!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_CONVERT, &resid, mode));
-		UT_ASSERT(!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REDECLARE, &resid, mode));
+		UT_ASSERT(!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_CONVERT, &resid, mode,
+														 cluster_serving_ready_is_current()));
+		UT_ASSERT(!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REDECLARE, &resid, mode,
+														 cluster_serving_ready_is_current()));
 		if (ut_current_failed)
 			printf("# startup control kind %d\n", kind);
 		MyProc = NULL;
@@ -2155,8 +2163,9 @@ UT_TEST(test_phase4_startup_control_keeps_identity_and_namespace_refusals)
 			cluster_shared_config = false;
 			break;
 		}
-		UT_ASSERT(!ges_readiness_allows_protocol_request(grant.request_opcode, &resid, grant.mode));
-		UT_ASSERT(!ges_readiness_allows_grant(&grant, &resid));
+		UT_ASSERT(!ges_readiness_allows_protocol_request(grant.request_opcode, &resid, grant.mode,
+														 cluster_serving_ready_is_current()));
+		UT_ASSERT(!ges_readiness_allows_grant(&grant, &resid, cluster_serving_ready_is_current()));
 		UT_ASSERT(!cluster_serving_ready_is_current());
 		if (ut_current_failed)
 			printf("# startup control refusal %d\n", variant);
@@ -2176,7 +2185,8 @@ UT_TEST(test_expired_cache_refuses_control_without_destroying_refresh_identity)
 	UT_ASSERT(!cluster_recovery_authority_is_current());
 	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_RECOVERY_READY);
 	UT_ASSERT(!cluster_configuration_read_transport_is_current(&cf, ShareLock));
-	UT_ASSERT(!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &cf, ShareLock));
+	UT_ASSERT(!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &cf, ShareLock,
+													 cluster_serving_ready_is_current()));
 	UT_ASSERT(!cluster_serving_ready_is_current());
 	phase_test_lms_generation++;
 	UT_ASSERT(!cluster_recovery_authority_is_current());
@@ -2243,38 +2253,44 @@ UT_TEST(test_config_read_crosses_real_s1_and_ges_admission_before_serving)
 	grant.mode = ShareLock;
 	grant.request_opcode = GES_REQ_OPCODE_REQUEST;
 	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT(ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock,
+												NoLock, cluster_serving_ready_is_current()));
+	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock,
+													cluster_serving_ready_is_current()));
+	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid, cluster_serving_ready_is_current()));
 	UT_ASSERT(
-		ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock, NoLock));
-	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock));
-	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid));
-	UT_ASSERT(ges_readiness_allows_local_release_origin(&req.resid));
-	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &req.resid, NoLock));
+		ges_readiness_allows_local_release_origin(&req.resid, cluster_serving_ready_is_current()));
+	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &req.resid, NoLock,
+													cluster_serving_ready_is_current()));
 	UT_ASSERT(!cluster_serving_ready_is_current());
 	req.lockmode = ExclusiveLock;
 	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
 	UT_ASSERT(!ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ExclusiveLock,
-												 NoLock));
+												 NoLock, cluster_serving_ready_is_current()));
 	IsUnderPostmaster = false;
 	cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
 	IsUnderPostmaster = true;
 	req.lockmode = ShareLock;
 	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT(ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock,
+												NoLock, cluster_serving_ready_is_current()));
+	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock,
+													cluster_serving_ready_is_current()));
+	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid, cluster_serving_ready_is_current()));
 	UT_ASSERT(
-		ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock, NoLock));
-	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock));
-	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid));
-	UT_ASSERT(ges_readiness_allows_local_release_origin(&req.resid));
-	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &req.resid, NoLock));
+		ges_readiness_allows_local_release_origin(&req.resid, cluster_serving_ready_is_current()));
+	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &req.resid, NoLock,
+													cluster_serving_ready_is_current()));
 	/* Local LMON still cannot request CF-X, but the master must finish a
 	 * remote Startup's original CF-X protocol after its own phase change. */
 	req.lockmode = ExclusiveLock;
 	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
 	UT_ASSERT(!ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ExclusiveLock,
-												 NoLock));
-	UT_ASSERT(
-		ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &req.resid, ExclusiveLock));
+												 NoLock, cluster_serving_ready_is_current()));
+	UT_ASSERT(ges_readiness_allows_protocol_request(
+		GES_REQ_OPCODE_REQUEST, &req.resid, ExclusiveLock, cluster_serving_ready_is_current()));
 	grant.mode = ExclusiveLock;
-	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid));
+	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid, cluster_serving_ready_is_current()));
 	MyProc = NULL;
 	IsUnderPostmaster = false;
 	reset_phase_service_fixture(true);

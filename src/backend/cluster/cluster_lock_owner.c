@@ -543,6 +543,8 @@ cluster_lock_owner_request_release(const ClusterLockAcquireRequest *request)
 			   : CLUSTER_LOCK_ACQUIRE_PENDING;
 }
 
+static ClusterLockAcquireResult lock_owner_install_result(ClusterLockOwner *owner);
+
 static ClusterLockAcquireResult
 lock_owner_cf_poll_step(ClusterLockOwner *owner)
 {
@@ -574,9 +576,13 @@ lock_owner_cf_poll_step(ClusterLockOwner *owner)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_STALE_GENERATION;
 	if (cluster_cancel_token_consume())
 		return CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK;
-	exchange = cluster_ges_cf_request_poll(&owner->acquisition, &owner->request.resid,
-										   owner->request.lockmode, &owner->request.holder,
-										   &owner->request.hw_grant);
+	/* A pending S5 retains this grant, including any exact local promotion.
+	 * Do not reconstruct/zero it through another S4 result. */
+	exchange = owner->request.hw_grant.grant_observed
+				   ? CLUSTER_GES_ACQUIRE_GRANTED
+				   : cluster_ges_cf_request_poll(&owner->acquisition, &owner->request.resid,
+												 owner->request.lockmode, &owner->request.holder,
+												 &owner->request.hw_grant);
 	if (exchange == CLUSTER_GES_ACQUIRE_PENDING)
 		return CLUSTER_LOCK_ACQUIRE_PENDING;
 	if (exchange != CLUSTER_GES_ACQUIRE_GRANTED)
@@ -584,8 +590,7 @@ lock_owner_cf_poll_step(ClusterLockOwner *owner)
 				   ? CLUSTER_LOCK_ACQUIRE_FAIL_STALE_GENERATION
 				   : CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
-	return cluster_lock_owner_install(owner) ? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
-											 : CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	return lock_owner_install_result(owner);
 }
 
 ClusterLockAcquireResult
@@ -679,8 +684,8 @@ cluster_lock_owner_acquire(ClusterLockOwner *owner)
 
 /* The scope precedes S5 publication, including any CFI inside S5.  A longjmp
  * retains a retiring owner, rather than a pointer into the caller's stack. */
-bool
-cluster_lock_owner_install(ClusterLockOwner *owner)
+static ClusterLockAcquireResult
+lock_owner_install_result(ClusterLockOwner *owner)
 {
 	uint64 epoch = cluster_epoch_get_current();
 	uint64 generation;
@@ -689,7 +694,7 @@ cluster_lock_owner_install(ClusterLockOwner *owner)
 	if (owner == NULL || MyProc == NULL
 		|| (owner->state != CLUSTER_LOCK_OWNER_EMPTY
 			&& owner->state != CLUSTER_LOCK_OWNER_ACQUIRING))
-		return false;
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	if (owner->request.holder.cluster_epoch != epoch
 		|| owner->request.holder.node_id != cluster_node_id
 		|| owner->request.holder.procno != (uint32)MyProc->pgprocno
@@ -697,12 +702,12 @@ cluster_lock_owner_install(ClusterLockOwner *owner)
 		|| owner->request.holder.request_id != owner->request.request_id) {
 		if (owner->state == CLUSTER_LOCK_OWNER_ACQUIRING)
 			lock_owner_abandon(owner);
-		return false;
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	}
 	if (owner->state == CLUSTER_LOCK_OWNER_EMPTY) {
 		/* PRE2 requires the owner/attempt before S3, not a post-grant claim. */
 		if (cluster_shared_config || !lock_owner_register(owner, CLUSTER_LOCK_OWNER_INSTALLING))
-			return false;
+			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	} else
 		owner->state = CLUSTER_LOCK_OWNER_INSTALLING;
 	generation = owner->generation;
@@ -716,6 +721,10 @@ cluster_lock_owner_install(ClusterLockOwner *owner)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	if (result == CLUSTER_LOCK_ACQUIRE_PENDING) {
+		owner->state = CLUSTER_LOCK_OWNER_ACQUIRING;
+		return result;
+	}
 	owner->state = CLUSTER_LOCK_OWNER_RETIRING;
 	owner->reconstructable = result == CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 	if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED || owner->request.holder.cluster_epoch != epoch
@@ -725,10 +734,16 @@ cluster_lock_owner_install(ClusterLockOwner *owner)
 									 owner->request.lockmode))) {
 		if (owner->shared)
 			lock_owner_abandon(owner);
-		return false;
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	}
 	owner->state = CLUSTER_LOCK_OWNER_HELD;
-	return true;
+	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+}
+
+bool
+cluster_lock_owner_install(ClusterLockOwner *owner)
+{
+	return lock_owner_install_result(owner) == CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 }
 
 bool

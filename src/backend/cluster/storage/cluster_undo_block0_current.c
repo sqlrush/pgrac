@@ -539,7 +539,7 @@ current_stage_pending_cleanup(ClusterUndoBlock0CurrentGuardData *data, bool exit
 		current_reply_delete(data, GES_REQ_OPCODE_REQUEST);
 		if (data->request_dispatched) {
 			(void)cluster_grd_cancel_waiter_by_id_seq(&data->resid, &data->holder, 0);
-			cluster_ges_release_and_drain_local(&data->resid, &data->holder);
+			cluster_ges_release_and_drain_local_deferred(&data->resid, &data->holder);
 		}
 	}
 	if (data->reservation_held) {
@@ -566,7 +566,7 @@ current_stage_no_wait_cleanup(ClusterUndoBlock0CurrentGuardData *data, bool exit
 			current_stage_remote_release(data);
 			(void)cluster_grd_release_holder_by_id(&data->resid, &data->holder);
 		} else
-			cluster_ges_release_and_drain_local(&data->resid, &data->holder);
+			cluster_ges_release_and_drain_local_deferred(&data->resid, &data->holder);
 		break;
 	case CLUSTER_UNDO_BLOCK0_CURRENT_RELEASE_WAIT:
 		if (data->remote_master) {
@@ -574,7 +574,7 @@ current_stage_no_wait_cleanup(ClusterUndoBlock0CurrentGuardData *data, bool exit
 			current_stage_remote_release(data);
 			(void)cluster_grd_release_holder_by_id(&data->resid, &data->holder);
 		} else
-			cluster_ges_release_and_drain_local(&data->resid, &data->holder);
+			cluster_ges_release_and_drain_local_deferred(&data->resid, &data->holder);
 		break;
 	case CLUSTER_UNDO_BLOCK0_CURRENT_UNUSED:
 	case CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP:
@@ -1296,7 +1296,7 @@ cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard,
 	data->reply_wait_repoll_pending = false;
 	data->reserved[CURRENT_RETRY_REPORTED_INDEX] = 0;
 	if (!data->remote_master) {
-		cluster_ges_release_and_drain_local(&data->resid, &data->holder);
+		cluster_ges_release_and_drain_local_deferred(&data->resid, &data->holder);
 		data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP;
 		current_active_unlink(data);
 		if (data->admission.entered && !current_admission_borrowed(data))

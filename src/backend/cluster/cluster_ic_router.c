@@ -81,6 +81,34 @@
 
 static ClusterICMsgTypeInfo dispatch_table[CLUSTER_IC_MSG_TYPE_MAX];
 
+static const ClusterICEnvelope *data_dispatch_envelope;
+typedef struct ClusterICDispatchScope {
+	const ClusterICEnvelope *envelope;
+	volatile bool pending;
+} ClusterICDispatchScope;
+static ClusterICDispatchScope *dispatch_scope;
+
+/* A handler may defer only before transferring the frame or mutating its
+ * authority. The original receive owner retains the complete frame. */
+void
+cluster_ic_dispatch_defer(const ClusterICEnvelope *env)
+{
+	if (dispatch_scope != NULL && env == dispatch_scope->envelope)
+		dispatch_scope->pending = true;
+}
+
+/* A reply produced inside the admitted DATA handler belongs to that same
+ * observation. Independent sends retain an unfinished caller-owned frame. */
+bool
+cluster_ic_data_send_admission(bool *pending)
+{
+	if (pending != NULL)
+		*pending = false;
+	if (!cluster_authority_readiness_managed() || data_dispatch_envelope != NULL)
+		return true;
+	return cluster_serving_ready_check(pending, NULL);
+}
+
 /*
  * "registered" predicate: a slot is occupied iff name != NULL.
  * (handler may be NULL for send-only msg_types per the API
@@ -205,7 +233,7 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 		&& cluster_authority_readiness_managed()) {
 		bool pending = false;
 
-		if (!cluster_serving_ready_check(&pending, NULL))
+		if (!cluster_ic_data_send_admission(&pending))
 			return pending ? CLUSTER_IC_SEND_NOT_ADMITTED : CLUSTER_IC_SEND_HARD_ERROR;
 	}
 
@@ -300,7 +328,6 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
  * Dispatch path (LMON recv).
  * ============================================================ */
 
-static const ClusterICEnvelope *data_dispatch_envelope;
 
 bool
 cluster_ic_dispatch_data_admitted(const ClusterICEnvelope *env)
@@ -316,6 +343,8 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	MemoryContext dispatch_ctx;
 	ClusterXpScope xps; /* PGRAC: spec-5.59 D6 profiling */
 	const ClusterICEnvelope *previous_data_envelope = data_dispatch_envelope;
+	ClusterICDispatchScope scope = { env, false };
+	ClusterICDispatchScope *previous_scope = dispatch_scope;
 
 	if (env == NULL)
 		return false;
@@ -417,15 +446,19 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	cluster_xp_begin(&xps, CLXP_IC_INBOUND_DISPATCH);
 	PG_TRY();
 	{
+		dispatch_scope = &scope;
 		data_dispatch_envelope = (ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA ? env : NULL;
 		info->handler(env, payload);
 		data_dispatch_envelope = previous_data_envelope;
+		dispatch_scope = previous_scope;
 	}
 	PG_CATCH();
 	{
 		ErrorData *err;
 
 		data_dispatch_envelope = previous_data_envelope;
+		dispatch_scope = previous_scope;
+		scope.pending = false;
 
 		/* Switch BACK to old_ctx before CopyErrorData so the copy lives
 		 * in caller (LMON) memory, not in dispatch_ctx (about to be
@@ -445,7 +478,7 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	MemoryContextSwitchTo(old_ctx);
 	MemoryContextDelete(dispatch_ctx);
 
-	return true;
+	return scope.pending ? CLUSTER_IC_DISPATCH_PENDING : CLUSTER_IC_DISPATCH_DONE;
 }
 
 

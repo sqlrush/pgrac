@@ -375,18 +375,16 @@ cluster_lock_acquire_is_hw_request(const ClusterLockAcquireRequest *req)
 }
 
 static bool
-cluster_lock_acquire_retained_grant_is_current(const ClusterLockAcquireRequest *req)
+cluster_lock_acquire_retained_grant_is_current(const ClusterLockAcquireRequest *req, bool *pending)
 {
-	if (cluster_lock_acquire_is_relation_request(req))
-		return cluster_ges_relation_grant_is_current(&req->hw_grant, &req->resid, &req->holder,
-													 req->request_id, req->lockmode, req->dontwait);
-	if (cluster_lock_acquire_is_cf_request(req))
-		return cluster_ges_cf_grant_is_current(&req->hw_grant, &req->resid, &req->holder,
-											   req->request_id, req->lockmode);
-	return cluster_lock_acquire_is_hw_request(req)
-		   && cluster_ges_hw_grant_is_current(&req->hw_grant, &req->resid, &req->holder,
-											  req->request_id);
+	*pending = false;
+	return (cluster_lock_acquire_is_relation_request(req) || cluster_lock_acquire_is_cf_request(req)
+			|| cluster_lock_acquire_is_hw_request(req))
+		   && cluster_ges_retained_grant_check(&req->hw_grant, &req->resid, &req->holder,
+											   req->request_id, req->lockmode, req->dontwait,
+											   pending);
 }
+
 
 ClusterLockAcquireResult
 cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req)
@@ -653,8 +651,8 @@ cluster_lock_acquire_s5_convert(const ClusterLockAcquireRequest *req)
 /*
  * spec-2.21 D4 P2.3 — S5 promote with revalidate;失败 5-step backout.
  */
-ClusterLockAcquireResult
-cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
+static ClusterLockAcquireResult
+cluster_lock_acquire_s5_promote_once(const ClusterLockAcquireRequest *req)
 {
 	ClusterGrdEntryResult er;
 	int32 self_node = cluster_node_id;
@@ -673,6 +671,7 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 	if (req->hw_grant.key.request_id != 0) {
 		ClusterGesHwGrant *grant = &((ClusterLockAcquireRequest *)req)->hw_grant;
 		volatile bool promoted = false;
+		bool pending = false;
 		bool mode_aware
 			= cluster_lock_acquire_is_relation_request(req)
 			  || cluster_lock_acquire_is_cf_request(req)
@@ -685,9 +684,19 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 		PG_TRY();
 		{
 			mut->registration_failure_reason = "GRANT_IDENTITY_NOT_CURRENT";
-			if (cluster_lock_acquire_retained_grant_is_current(req)) {
+			if (cluster_lock_acquire_retained_grant_is_current(req, &pending)) {
 				mut->registration_failure_reason = "EXACT_RESERVATION_OR_HOLDER_MISSING";
-				if (mode_aware && grant->master == cluster_node_id)
+				if (grant->local_promoted) {
+					LOCKMODE registered_mode = NoLock;
+
+					/* A previous pass already consumed this reservation.
+					 * Retain its cleanup responsibility and verify that exact
+					 * holder, never promote a second time. */
+					er = cluster_grd_holder_mode_by_id(&req->resid, &req->holder, &registered_mode)
+								 && registered_mode == req->lockmode
+							 ? CLUSTER_GRD_ENTRY_OK
+							 : CLUSTER_GRD_ENTRY_NOT_FOUND;
+				} else if (mode_aware && grant->master == cluster_node_id)
 					er = cluster_grd_confirm_local_grant_exact(&req->resid, &req->holder,
 															   req->lockmode);
 				else if (mode_aware)
@@ -695,11 +704,11 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 																	 req->lockmode);
 				else
 					er = cluster_grd_promote_remote_grant_exact(&req->resid, &req->holder);
-				grant->local_promoted
-					= er == CLUSTER_GRD_ENTRY_OK && grant->master != cluster_node_id;
+				if (er == CLUSTER_GRD_ENTRY_OK)
+					grant->local_promoted = true;
 				if (er == CLUSTER_GRD_ENTRY_OK) {
 					mut->registration_failure_reason = "GRANT_CHANGED_DURING_REGISTRATION";
-					promoted = cluster_lock_acquire_retained_grant_is_current(req);
+					promoted = cluster_lock_acquire_retained_grant_is_current(req, &pending);
 				}
 				if (promoted) {
 					grant->consumed = true;
@@ -707,7 +716,7 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 					mut->registration_failure_reason = NULL;
 				}
 			}
-			if (!promoted)
+			if (!promoted && !pending)
 				(void)cluster_lock_acquire_s7_cleanup(req);
 		}
 		PG_CATCH();
@@ -716,6 +725,8 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
+		if (pending)
+			return CLUSTER_LOCK_ACQUIRE_PENDING;
 		if (!promoted)
 			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 		pg_atomic_fetch_add_u64(&stub_s5_promote_count, 1);
@@ -752,6 +763,26 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 
 	pg_atomic_fetch_add_u64(&stub_s5_promote_count, 1);
 	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+}
+
+
+/* Cooperative owners retain S5 across passes. Ordinary backends keep their
+ * existing native lock and exact grant while waiting outside GRD LWLocks. */
+ClusterLockAcquireResult
+cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
+{
+	ClusterLockAcquireResult result;
+
+	for (;;) {
+		result = cluster_lock_acquire_s5_promote_once(req);
+		if (result != CLUSTER_LOCK_ACQUIRE_PENDING || MyBackendType == B_LMON
+			|| MyBackendType == B_LMS)
+			return result;
+		CHECK_FOR_INTERRUPTS();
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 10,
+						WAIT_EVENT_CLUSTER_GES_REPLY_WAIT);
+		ResetLatch(MyLatch);
+	}
 }
 
 

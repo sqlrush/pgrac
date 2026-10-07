@@ -855,6 +855,19 @@ cluster_ges_cf_grant_is_current(const ClusterGesHwGrant *grant pg_attribute_unus
 	return owner_promote_result == CLUSTER_GRD_ENTRY_OK;
 }
 
+bool
+cluster_ges_retained_grant_check(const ClusterGesHwGrant *grant, const ClusterResId *resid,
+								 const ClusterGrdHolderId *holder, uint64 request_id, uint32 mode,
+								 bool dontwait, bool *pending)
+{
+	*pending = false;
+	if (resid->type == CLUSTER_CF_RESID_TYPE)
+		return cluster_ges_cf_grant_is_current(grant, resid, holder, request_id, mode);
+	if (resid->type == CLUSTER_HW_RESID_TYPE)
+		return cluster_ges_hw_grant_is_current(grant, resid, holder, request_id);
+	return cluster_ges_relation_grant_is_current(grant, resid, holder, request_id, mode, dontwait);
+}
+
 ClusterGrdEntryResult
 cluster_grd_confirm_local_grant_exact(const ClusterResId *resid pg_attribute_unused(),
 									  const ClusterGrdHolderId *holder pg_attribute_unused(),
@@ -868,6 +881,15 @@ cluster_grd_promote_remote_grant_mode_exact(const ClusterResId *resid pg_attribu
 											const ClusterGrdHolderId *holder pg_attribute_unused(),
 											LOCKMODE mode pg_attribute_unused())
 {
+	abort();
+}
+
+bool
+cluster_grd_holder_mode_by_id(const ClusterResId *resid pg_attribute_unused(),
+							  const ClusterGrdHolderId *holder pg_attribute_unused(),
+							  LOCKMODE *mode pg_attribute_unused())
+{
+	/* Pending S5 reentry uses real GRD in test_cluster_control_cf_poll. */
 	abort();
 }
 
