@@ -3861,6 +3861,28 @@ cluster_grd_recovery_authority_is_current(uint64 boot_incarnation pg_attribute_u
 	return false;
 }
 
+/* The diagnostic fixture owns no serving identity or completed GRD seal. */
+bool
+cluster_grd_recovery_authority_for_admission(
+	uint64 boot_incarnation pg_attribute_unused(), uint64 lms_generation pg_attribute_unused(),
+	const ClusterQvotecAdmissionCheck *check pg_attribute_unused(), bool *pending)
+{
+	*pending = false;
+	return false;
+}
+
+ClusterServingFormationResult
+cluster_reconfig_capture_serving_formation_v1(
+	uint16 origin_thread pg_attribute_unused(),
+	const ClusterQvotecAdmissionCheck *check pg_attribute_unused(), ClusterFormationSnapshotV1 *out,
+	bool *snapshot_valid, const char **predicate)
+{
+	memset(out, 0, sizeof(*out));
+	*snapshot_valid = false;
+	*predicate = "formation.unavailable";
+	return CLUSTER_SERVING_FORMATION_REFUSED;
+}
+
 bool
 cluster_grd_serving_authority_rebind_lmon(
 	const ClusterFormationSnapshotV1 *formation pg_attribute_unused(),
