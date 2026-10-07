@@ -1309,6 +1309,7 @@ cluster_normal_stop_fronts_poll(ClusterPhase1FullStopPlan *plan_out, const char 
 	const char *reason = "NORMAL_STOP_FRONTS_STATE_INVALID";
 	uint64 now, nonce, deadline;
 	uint32 phase, own_bit, peer_bits;
+	bool wake_cleaners = false;
 	int peer;
 
 	if (plan_out != NULL)
@@ -1408,6 +1409,7 @@ cluster_normal_stop_fronts_poll(ClusterPhase1FullStopPlan *plan_out, const char 
 			pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_WAIT_PEER_FRONTS);
 		if (cl_normal_stop->peer_requests_seen == cl_normal_stop_member_mask()
 			&& cl_normal_stop->peer_request_sent == peer_bits) {
+			wake_cleaners = phase != CLUSTER_NORMAL_STOP_DRAIN;
 			pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_DRAIN);
 			observed.valid = true;
 			observed.attempt_nonce = nonce;
@@ -1421,6 +1423,12 @@ cluster_normal_stop_fronts_poll(ClusterPhase1FullStopPlan *plan_out, const char 
 done:
 	if (cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
 		result = CLUSTER_NORMAL_STOP_INVALID;
+	/* Terminal publication can wake the cleaner before the committing
+	 * backend leaves ProcArray. Once all frontends have actually gone,
+	 * re-arm its original census outside the leave lock. This is neither
+	 * terminal proof nor permission to park, and repeated polls do not wake. */
+	if (wake_cleaners && result == CLUSTER_NORMAL_STOP_READY)
+		cluster_undo_cleaner_wakeup();
 	if (reason_out != NULL)
 		*reason_out = reason;
 	return result;

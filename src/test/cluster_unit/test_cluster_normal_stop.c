@@ -1028,6 +1028,8 @@ static unsigned main_passes, main_waits, main_bindings;
 static int main_exit_code, main_error_level;
 static bool main_early_shutdown, main_pass_failure;
 static bool main_progress;
+static bool main_drain_probe, main_probe_without_stop, main_probe_floor_retry;
+static long main_observed_timeout;
 static bool sinval_main_test;
 static bool lms_main_test;
 static int test_lms_wait(void);
@@ -1164,6 +1166,19 @@ int
 WaitLatch(Latch *latch pg_attribute_unused(), int events, long timeout pg_attribute_unused(),
 		  uint32 event pg_attribute_unused())
 {
+	if (main_drain_probe) {
+		UT_ASSERT_EQ(lock_holds, 0);
+		UT_ASSERT(!modifier_held);
+		UT_ASSERT_EQ(main_passes, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesced_mask), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 0);
+		UT_ASSERT_EQ((events & WL_TIMEOUT) != 0, timeout > 0);
+		main_observed_timeout = timeout;
+		main_waits++;
+		/* Observe the real loop's wait without pretending that its pending
+		 * census completed, or waiting for the wall-clock shutdown deadline. */
+		siglongjmp(main_exit, 1);
+	}
 	if (checkpoint_wait_action != NULL) {
 		UT_ASSERT(AmCheckpointerProcess());
 		UT_ASSERT_EQ(lock_holds, 0);
@@ -1257,6 +1272,13 @@ undo_cleaner_run_pass(bool *work_remaining)
 {
 	modifier_held = true;
 	main_passes++;
+	if (main_drain_probe) {
+		/* A terminal sample can still refuse after a wakeup; the original
+		 * owner must get another pass, without signing park or completion. */
+		modifier_held = false;
+		*work_remaining = false;
+		return main_probe_floor_retry;
+	}
 	if (main_pass_failure)
 		proc_exit(1);
 	/* The real controller's publication occurs concurrently with this pass. */
@@ -1285,6 +1307,8 @@ run_actual_cleaner_main(unsigned worker, bool request_before, bool progress, boo
 {
 	sinval_main_test = false;
 	seed_drain_boundary();
+	if (main_drain_probe && main_probe_without_stop)
+		pg_atomic_write_u32(&cl_normal_stop->requested, 0);
 	MyAuxProcType = ClusterUndoCleanerTypeForWorker(worker);
 	if (request_before) {
 		pg_atomic_write_u32(&test_region.normal_stop.phase, CLUSTER_NORMAL_STOP_QUIESCE);
@@ -1335,6 +1359,46 @@ UT_TEST(test_actual_main_early_exit_or_failed_pass_never_signs_clean_shutdown)
 	UT_ASSERT_EQ(pg_atomic_read_u32(&test_region.normal_stop.cleaner_quiesced_mask), 0);
 	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_CLEANER);
 	modifier_held = false; /* The simulated dying process never resumes a pass. */
+}
+
+UT_TEST(test_actual_cleaner_pending_stop_retries_before_recycle_interval)
+{
+	static const int intervals[] = { 0, 30000, 60000, 50 };
+	int saved_interval = cluster_undo_cleaner_interval_ms;
+
+	main_drain_probe = true;
+	main_probe_without_stop = false;
+	for (unsigned worker = 0; worker < CLUSTER_UNDO_CLEANER_WORKER_TYPES; worker += 7)
+		for (unsigned i = 0; i < lengthof(intervals); i++) {
+			cluster_undo_cleaner_interval_ms = intervals[i];
+			main_probe_floor_retry = worker == 0;
+			main_observed_timeout = -2;
+			run_actual_cleaner_main(worker, false, false, false, false);
+			UT_ASSERT(main_observed_timeout > 0 && main_observed_timeout <= 200);
+			if (intervals[i] > 0)
+				UT_ASSERT(main_observed_timeout <= intervals[i]);
+			UT_ASSERT_EQ(main_waits, 1);
+			UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+		}
+	main_drain_probe = main_probe_floor_retry = false;
+	cluster_undo_cleaner_interval_ms = saved_interval;
+}
+
+UT_TEST(test_actual_cleaner_without_stop_preserves_idle_cadence)
+{
+	static const int intervals[] = { 0, 30000, 50 };
+	int saved_interval = cluster_undo_cleaner_interval_ms;
+
+	main_drain_probe = main_probe_without_stop = true;
+	for (unsigned i = 0; i < lengthof(intervals); i++) {
+		cluster_undo_cleaner_interval_ms = intervals[i];
+		main_observed_timeout = -2;
+		run_actual_cleaner_main(7, false, false, false, false);
+		UT_ASSERT_EQ(main_observed_timeout, intervals[i] > 0 ? intervals[i] : -1);
+		UT_ASSERT_EQ(main_waits, 1);
+	}
+	main_drain_probe = main_probe_without_stop = false;
+	cluster_undo_cleaner_interval_ms = saved_interval;
 }
 
 /* Complete SI Main is extracted from the production source, not rewritten.
@@ -3033,6 +3097,7 @@ UT_TEST(test_front_cut_waits_for_real_local_and_all_peer_fronts_not_ack)
 	MyAuxProcType = CheckpointerProcess;
 	UT_ASSERT_EQ(cluster_normal_stop_fronts_poll(&out, NULL), CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_WAIT_PEER_FRONTS);
+	UT_ASSERT_EQ(cleaner_wakes, 0);
 	UT_ASSERT_EQ(cl_normal_stop->peer_requests_seen, 4);
 	front_peer_request(0, 1001);
 	front_peer_request(1, 1002);
@@ -3055,6 +3120,12 @@ UT_TEST(test_front_cut_waits_for_real_local_and_all_peer_fronts_not_ack)
 	UT_ASSERT_EQ(front_last_request[0].leave_nonce, nonce);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->preflight_pending), 0);
 	UT_ASSERT(!cluster_normal_stop_protocol_closed());
+	UT_ASSERT_EQ(cleaner_wakes, 1);
+	/* Repeated observations neither restart the deadline nor wake a busy
+	 * cleaner on every coordinator tick. */
+	UT_ASSERT_EQ(cluster_normal_stop_fronts_poll(&out, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(out.absolute_deadline_us, deadline);
+	UT_ASSERT_EQ(cleaner_wakes, 1);
 }
 
 UT_TEST(test_front_early_transport_ownership_survives_identity_gap)
@@ -3647,7 +3718,8 @@ UT_TEST(test_checkpoint_cut_requires_each_owner_park_seal_send_and_ack)
 				 CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT(!plan.valid);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_QUIESCE);
-	UT_ASSERT_EQ(cleaner_wakes, 1);
+	/* First DRAIN wake runs retained work; the second requests park. */
+	UT_ASSERT_EQ(cleaner_wakes, 2);
 	if (pg_atomic_read_u32(&cl_normal_stop->phase) != CLUSTER_NORMAL_STOP_QUIESCE)
 		return;
 	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
@@ -3737,7 +3809,9 @@ UT_TEST(test_checkpoint_cannot_park_cleaners_while_private_actor_has_not_signed_
 				 CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_DRAIN);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesce_requested), 0);
-	UT_ASSERT_EQ(cleaner_wakes, 0);
+	/* Waking a retained producer must not be confused with parking it. */
+	UT_ASSERT_EQ(cleaner_wakes, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesced_mask), 0);
 }
 
 UT_TEST(test_checkpoint_seal_must_recheck_debt_created_after_pre_seal_census)
@@ -5663,7 +5737,9 @@ UT_TEST(test_pre2_pair_rejects_nondeclared_release_reply_even_after_seal)
 int
 main(void)
 {
-	UT_PLAN(139);
+	UT_PLAN(141);
+	UT_RUN(test_actual_cleaner_pending_stop_retries_before_recycle_interval);
+	UT_RUN(test_actual_cleaner_without_stop_preserves_idle_cadence);
 	UT_RUN(test_pre2_stop_clean_restart_binds_current_epoch_and_original_record);
 	UT_RUN(test_pre2_stop_refuses_unqualified_or_changed_current_epoch);
 	UT_RUN(test_clean_restart_terminal_receipt_uses_saved_current_epoch_without_recursion);

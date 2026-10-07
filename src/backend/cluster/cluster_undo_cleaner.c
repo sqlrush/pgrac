@@ -995,6 +995,12 @@ UndoCleanerMain(void)
 			if (timeout_ms <= 0 || retry_ms < timeout_ms)
 				timeout_ms = retry_ms;
 		}
+		/* A DRAIN wake is not proof that the terminal census can succeed
+		 * in that pass. Retry retained responsibilities within the original
+		 * shutdown budget, including pressure-only (interval=0) mode. The
+		 * park and completion checks above remain the sole exit authority. */
+		if (cluster_normal_stop_requested() && (timeout_ms <= 0 || timeout_ms > 200))
+			timeout_ms = 200;
 		rc = WaitLatch(
 			MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | (timeout_ms > 0 ? WL_TIMEOUT : 0),
 			timeout_ms > 0 ? timeout_ms : -1L, WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP);
