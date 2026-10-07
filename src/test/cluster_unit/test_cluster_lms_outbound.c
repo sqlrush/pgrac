@@ -722,6 +722,7 @@ static UtSentRec ut_sent_log[1024];
 static int ut_sent_n = 0;
 static ClusterICSendResult ut_peer_rc[CLUSTER_MAX_NODES];
 static int ut_local_dispatch_count = 0;
+static bool ut_local_dispatch_pending;
 static uint8 ut_local_dispatch_marker = 0;
 static int ut_direct_zero_reply_count = 0;
 static GcsBlockReplyHeader ut_direct_zero_reply_header;
@@ -763,13 +764,15 @@ cluster_ic_envelope_build(ClusterICEnvelope *out_env, uint8 msg_type, uint32 sou
 	return true;
 }
 
-bool
+ClusterICDispatchResult
 cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
 {
 	UT_ASSERT(env != NULL);
 	UT_ASSERT_EQ((int32)env->source_node_id, cluster_node_id);
 	UT_ASSERT_EQ((int32)env->dest_node_id, cluster_node_id);
 	UT_ASSERT_EQ(peer_id, cluster_node_id);
+	if (ut_local_dispatch_pending)
+		return CLUSTER_IC_DISPATCH_PENDING;
 	ut_local_dispatch_count++;
 	ut_local_dispatch_marker = env->payload_length > 0 ? *(const uint8 *)payload : 0;
 	return true;
@@ -1142,6 +1145,12 @@ UT_TEST(test_self_frame_dispatches_on_owning_worker)
 	ut_reset_log();
 
 	UT_ASSERT(ut_enqueue_marker(5, cluster_node_id, 0xE1));
+	ut_local_dispatch_pending = true;
+	(void)cluster_lms_outbound_drain_send(5);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(5), 1);
+	UT_ASSERT_EQ(ut_local_dispatch_count, 0);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+	ut_local_dispatch_pending = false;
 	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(5), 1);
 	UT_ASSERT_EQ(cluster_lms_outbound_depth(5), 0);
 	UT_ASSERT_EQ(ut_sent_n, 0);

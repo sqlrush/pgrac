@@ -1526,68 +1526,89 @@ rdma_process_recv_completion(ClusterICRdmaPeer *peer, uint32 byte_len)
 
 	rdma_inbound_enqueue(peer->peer_id, peer->recv_buf, byte_len);
 	cluster_ic_rdma_stats_note_recv(peer->peer_id, byte_len, true);
-	if (!rdma_post_peer_recv(peer))
-		rdma_peer_fail_or_fallback(peer->peer_id, RdmaUnavailableReason != NULL
-													  ? RdmaUnavailableReason
-													  : "RDMA recv repost failed");
+	/* The original single receive credit belongs to this frame until dispatch.
+	 * Keeping it spent on PENDING bounds retained input to one frame per peer.
+	 * The connection's existing retry/RNR configuration is unchanged. */
 }
 
 static void
 rdma_dispatch_pending_frames(void)
 {
-	for (;;) {
+	ClusterICRdmaInboundFrame *scan;
+	size_t remaining = 0;
+
+	for (scan = RdmaInboundHead; scan != NULL; scan = scan->next)
+		remaining++;
+	while (RdmaInboundHead != NULL && remaining-- != 0) {
+		ClusterICRdmaInboundFrame *frame = RdmaInboundHead;
 		ClusterICEnvelope env;
-		int32 sender = -1;
-		size_t got = 0;
 		uint8 *payload = NULL;
+		int32 sender = frame->peer_id;
+		struct rdma_cm_id *connection = RdmaPeers[sender].id;
+		bool replenish = false;
 		ClusterICEnvelopeVerifyResult vrc;
+		ClusterICDispatchResult dispatched = CLUSTER_IC_DISPATCH_DONE;
 
-		if (!cluster_ic_recv_exact(&sender, &env, sizeof(env), &got))
-			return;
-		if (got == 0)
-			return;
-		if (got != sizeof(env)) {
-			cluster_ic_rdma_stats_note_error(sender, "08P01", "short RDMA envelope");
-			rdma_peer_fail_or_fallback(sender, "short RDMA envelope");
-			return;
+		/* One completion owns one whole envelope, also for the SGE sender.
+		 * Detach before callbacks (which may close a peer), but do not consume
+		 * its bytes until dispatch. PENDING retains the exact frame and receive
+		 * credit, while allowing other peers to advance in this original pass. */
+		RdmaInboundHead = frame->next;
+		if (RdmaInboundTail == frame)
+			RdmaInboundTail = NULL;
+		if (frame->consumed != 0 || frame->len < sizeof(env)) {
+			rdma_peer_fail_or_fallback(sender, "short or partially consumed RDMA envelope");
+			goto consumed;
 		}
-		if (env.payload_length > PGRAC_IC_PAYLOAD_MAX) {
-			cluster_ic_rdma_stats_note_error(sender, "08P01", "oversized RDMA envelope payload");
-			rdma_peer_fail_or_fallback(sender, "oversized RDMA envelope payload");
-			return;
+		memcpy(&env, frame->data, sizeof(env));
+		if (env.payload_length > PGRAC_IC_PAYLOAD_MAX
+			|| frame->len != sizeof(env) + (size_t)env.payload_length) {
+			rdma_peer_fail_or_fallback(sender, "invalid RDMA envelope payload length");
+			goto consumed;
 		}
-		if (env.payload_length > 0) {
-			payload = (uint8 *)palloc(env.payload_length);
-			if (!cluster_ic_recv_exact(&sender, payload, env.payload_length, &got)) {
-				pfree(payload);
-				return;
-			}
-			if (got != env.payload_length) {
-				pfree(payload);
-				cluster_ic_rdma_stats_note_error(sender, "08P01", "short RDMA payload");
-				rdma_peer_fail_or_fallback(sender, "short RDMA payload");
-				return;
-			}
+		/* The wire header is packed. Preserve the original aligned payload
+		 * contract for handlers that read native 64-bit fields. */
+		if (env.payload_length != 0) {
+			payload = palloc(env.payload_length);
+			memcpy(payload, frame->data + sizeof(env), env.payload_length);
 		}
-
 		vrc = cluster_ic_envelope_verify(&env, payload, env.payload_length, (uint32)cluster_node_id,
 										 sender);
 		if (vrc == CLUSTER_IC_ENVELOPE_OK) {
-			if (!cluster_ic_dispatch_envelope(&env, payload, sender)) {
-				cluster_ic_rdma_stats_note_error(sender, "08P01",
-												 "RDMA envelope dispatch rejected msg_type");
-				rdma_peer_fail_or_fallback(sender, "RDMA envelope dispatch rejected msg_type");
+			dispatched = cluster_ic_dispatch_envelope(&env, payload, sender);
+			if (dispatched == CLUSTER_IC_DISPATCH_PENDING) {
+				frame->next = NULL;
+				if (RdmaInboundTail != NULL)
+					RdmaInboundTail->next = frame;
+				else
+					RdmaInboundHead = frame;
+				RdmaInboundTail = frame;
+				if (payload != NULL)
+					pfree(payload);
+				continue;
 			}
+			if (dispatched == CLUSTER_IC_DISPATCH_REJECTED)
+				rdma_peer_fail_or_fallback(sender, "RDMA envelope dispatch rejected msg_type");
+			else
+				replenish = true;
 		} else if (vrc == CLUSTER_IC_ENVELOPE_DROP_NO_CLOSE) {
 			cluster_ic_rdma_stats_note_error(sender, "53R20",
 											 "RDMA envelope dropped by epoch guard");
-		} else {
-			cluster_ic_rdma_stats_note_error(sender, "08P01", "RDMA envelope verification failed");
+			replenish = true;
+		} else
 			rdma_peer_fail_or_fallback(sender, "RDMA envelope verification failed");
-		}
-
+	consumed:
 		if (payload != NULL)
 			pfree(payload);
+		pfree(frame->data);
+		pfree(frame);
+		/* Initial receives precede ESTABLISHED, so connected is not a credit
+		 * condition. A handler may close the peer: require its original live id. */
+		if (replenish && connection != NULL && RdmaPeers[sender].id == connection
+			&& !rdma_post_peer_recv(&RdmaPeers[sender]))
+			rdma_peer_fail_or_fallback(sender, RdmaUnavailableReason != NULL
+												   ? RdmaUnavailableReason
+												   : "RDMA recv repost failed");
 	}
 }
 
@@ -3178,6 +3199,14 @@ rdma_process_polled_completions(ClusterICWc *wc, int n)
 #endif
 }
 #endif
+
+void
+cluster_ic_rdma_retry_dispatch(void)
+{
+#if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
+	rdma_dispatch_pending_frames();
+#endif
+}
 
 void
 cluster_ic_rdma_lmon_handle_completion_events(void)

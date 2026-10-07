@@ -374,6 +374,7 @@ cstring_to_text(const char *s)
  * the test never receives an envelope, so these are vacuous. */
 bool cluster_ic_suppress_caps_reply = false;
 static uint64 ut_dispatch_count = 0;
+static bool ut_dispatch_pending;
 static bool ut_hello_valid;
 static ClusterSfPeerCap ut_peer_cap[CLUSTER_MAX_NODES];
 static ClusterICHelloMsg ut_hello;
@@ -412,14 +413,16 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 	return CLUSTER_IC_SEND_DONE;
 }
 
-bool
+ClusterICDispatchResult
 cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
 {
 	(void)env;
 	(void)payload;
 	(void)peer_id;
+	if (ut_dispatch_pending)
+		return CLUSTER_IC_DISPATCH_PENDING;
 	ut_dispatch_count++;
-	return true;
+	return CLUSTER_IC_DISPATCH_DONE;
 }
 
 ClusterICEnvelopeVerifyResult
@@ -977,6 +980,41 @@ UT_TEST(test_recv_drain_yields_after_bounded_frames)
 
 	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
 	UT_ASSERT_EQ(ut_dispatch_count, 66);
+}
+
+UT_TEST(test_pending_receive_retains_original_frame_until_next_pass)
+{
+	struct {
+		ClusterICEnvelope env;
+		char bytes[16];
+	} frame;
+	fd_set rfds;
+	struct timeval tv = { 5, 0 };
+	uint64 before = ut_dispatch_count;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.env.msg_type = 44;
+	frame.env.source_node_id = UT_PEER_ID;
+	frame.env.dest_node_id = cluster_node_id;
+	frame.env.payload_length = sizeof(frame.bytes);
+	memset(frame.bytes, 0xa7, sizeof(frame.bytes));
+	UT_ASSERT_EQ(send(ut_rx_fd, &frame, sizeof(frame), 0), sizeof(frame));
+	FD_ZERO(&rfds);
+	FD_SET(ut_tx_fd, &rfds);
+	UT_ASSERT_EQ(select(ut_tx_fd + 1, &rfds, NULL, NULL, &tv), 1);
+	ut_dispatch_pending = true;
+	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
+	UT_ASSERT_EQ(ut_dispatch_count, before);
+	UT_ASSERT_EQ(tier1_recv_buf_len[UT_PEER_ID], PGRAC_IC_ENVELOPE_BYTES);
+	UT_ASSERT_EQ(tier1_recv_payload_filled[UT_PEER_ID], sizeof(frame.bytes));
+	UT_ASSERT(memcmp(tier1_recv_payload_buf_dyn[UT_PEER_ID], frame.bytes, sizeof(frame.bytes))
+			  == 0);
+	ut_dispatch_pending = false;
+	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
+	UT_ASSERT_EQ(ut_dispatch_count, before + 1);
+	UT_ASSERT_EQ(tier1_recv_buf_len[UT_PEER_ID], 0);
+	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
+	UT_ASSERT_EQ(ut_dispatch_count, before + 1);
 }
 
 UT_TEST(test_stream_reconnect_is_not_same_epoch_or_diagnostic_identity)
@@ -1809,7 +1847,7 @@ int
 main(void)
 {
 	MyProcPid = getpid();
-	UT_PLAN(32);
+	UT_PLAN(33);
 
 	UT_RUN(test_stop_poll_requires_initialized_actual_plane_owner);
 	UT_RUN(test_connect_registers_peer_fd);
@@ -1826,6 +1864,7 @@ main(void)
 	UT_RUN(test_reconnect_after_close);
 	UT_RUN(test_stream_reconnect_is_not_same_epoch_or_diagnostic_identity);
 	UT_RUN(test_recv_drain_yields_after_bounded_frames);
+	UT_RUN(test_pending_receive_retains_original_frame_until_next_pass);
 	UT_RUN(test_empty_and_partial_receive_do_not_renew_heartbeat);
 	UT_RUN(test_stop_poll_real_partial_envelope_and_payload);
 	UT_RUN(test_stop_poll_malformed_state_overrides_earlier_pending);

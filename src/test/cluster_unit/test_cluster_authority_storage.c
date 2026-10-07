@@ -54,6 +54,7 @@ static bool authority_pending_identity_lost;
 static ClusterStorageSnapshotStop authority_forced_snapshot_stop;
 static bool authority_continuity_invalid;
 static bool authority_continuity_pending;
+static unsigned authority_admission_calls;
 
 void
 pg_usleep(long microsec)
@@ -77,6 +78,7 @@ cluster_qvotec_check_admission(ClusterQvotecAdmissionCheck *out)
 {
 	bool allowed;
 
+	authority_admission_calls++;
 	memset(out, 0, sizeof(*out));
 	if (!authority_busy_started && authority_busy_stage != AUTHORITY_BUSY_NONE
 		&& phase_test_recovery_control_formation_calls > 0
@@ -785,10 +787,37 @@ UT_TEST(gcs_requester_failure_diagnostic_uses_the_original_predicate)
 	UT_ASSERT(strcmp(predicate, "BINDING_ABSENT") == 0);
 }
 
+UT_TEST(serving_uses_one_admission_and_unknown_formation_does_not_clear_binding)
+{
+	bool pending = false;
+	const char *predicate = NULL;
+
+	authority_storage_setup(true);
+	authority_admission_calls = 0;
+	UT_ASSERT(cluster_serving_ready_check(&pending, &predicate));
+	UT_ASSERT_EQ(authority_admission_calls, 1);
+	phase_test_serving_formation_busy = true;
+	authority_admission_calls = 0;
+	UT_ASSERT(!cluster_serving_ready_check(&pending, &predicate));
+	UT_ASSERT(pending);
+	UT_ASSERT_EQ(authority_admission_calls, 1);
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_SERVING_READY);
+	phase_test_serving_formation_busy = false;
+	UT_ASSERT(cluster_serving_ready_check(&pending, &predicate));
+	UT_ASSERT(!pending);
+	/* A known invalid GRD seal beats an unavailable formation sample. */
+	phase_test_serving_formation_busy = true;
+	phase_test_grd_authority_ok = false;
+	UT_ASSERT(!cluster_serving_ready_check(&pending, &predicate));
+	UT_ASSERT(!pending);
+	UT_ASSERT_STR_EQ(predicate, "GRD_SEAL_CHANGED");
+	phase_test_serving_formation_busy = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(31);
 	UT_RUN(gcs_requester_publication_overlap_yields_without_sql_error);
 	UT_RUN(gcs_requester_does_not_reinterpret_pending_with_a_later_sample);
 	UT_RUN(gcs_requester_pending_never_hides_identity_or_proven_loss);
@@ -820,6 +849,7 @@ main(void)
 	UT_RUN(clock_failure_is_not_a_recoverable_publication_wait);
 	UT_RUN(stable_continuity_failure_retires_serving_but_publication_overlap_does_not);
 	UT_RUN(resource_x_cssd_busy_yields_before_admission_and_never_hides_loss);
+	UT_RUN(serving_uses_one_admission_and_unknown_formation_does_not_clear_binding);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

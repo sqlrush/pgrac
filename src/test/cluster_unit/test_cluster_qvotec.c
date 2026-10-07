@@ -499,6 +499,7 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPt
 #include <time.h>
 static TimestampTz mock_now = 1700000000000000LL;
 static void (*admission_sample_interleave)(void);
+static void (*admission_sleep_interleave)(void);
 static void (*storage_clock_interleave)(void);
 static uint64 fence_mock_monotonic_us;
 static uint64 fence_mock_storage_us;
@@ -627,6 +628,12 @@ pg_usleep(long microsec)
 {
 	injected_sleeps++;
 	injected_sleep_us = microsec;
+	if (admission_sleep_interleave != NULL) {
+		void (*callback)(void) = admission_sleep_interleave;
+
+		admission_sleep_interleave = NULL;
+		callback();
+	}
 	if (storage_sleep_overshoots)
 		fence_mock_storage_us = (uint64)mock_now + 2000;
 }
@@ -4965,7 +4972,8 @@ UT_TEST(test_admission_continuity_rejects_interleaved_owner_publication)
 	admission_sample_interleave = admission_publish_loss_then_ready;
 	UT_ASSERT(cluster_qvotec_check_admission(&during));
 	UT_ASSERT_EQ(during.result, CLUSTER_QVOTEC_ADMISSION_ALLOWED);
-	UT_ASSERT(!during.continuity_valid);
+	UT_ASSERT(during.continuity_valid);
+	UT_ASSERT(during.continuity.quorum_generation > first.continuity.quorum_generation);
 	UT_ASSERT(cluster_qvotec_check_admission(&after));
 	UT_ASSERT(after.continuity_valid);
 	UT_ASSERT(after.continuity.quorum_generation > first.continuity.quorum_generation);
@@ -5208,12 +5216,13 @@ UT_TEST(test_interleaved_timely_renewal_is_not_a_published_lease_loss)
 	UT_ASSERT(cluster_qvotec_check_admission(&first));
 	UT_ASSERT(first.continuity_valid);
 	wall_clock_renewal_deadline = first.lease_expire_us;
-	/* The original getter may reject its old lease after a timely concurrent
-	 * renewal. Its mixed publication must not poison other callers' history. */
+	/* Reread the whole mixed publication. A timely renewal does not create
+	 * a loss, and the returned complete sample must retain the old lineage. */
 	admission_sample_interleave = admission_renew_before_old_wall_clock_deadline;
-	UT_ASSERT(!cluster_qvotec_check_admission(&during));
-	UT_ASSERT_EQ(during.result, CLUSTER_QVOTEC_ADMISSION_LEASE);
-	UT_ASSERT(!during.continuity_valid);
+	UT_ASSERT(cluster_qvotec_check_admission(&during));
+	UT_ASSERT_EQ(during.result, CLUSTER_QVOTEC_ADMISSION_ALLOWED);
+	UT_ASSERT(during.continuity_valid);
+	UT_ASSERT_EQ(during.continuity.quorum_generation, first.continuity.quorum_generation);
 	UT_ASSERT(admission_sample_interleave == NULL);
 	UT_ASSERT(cluster_qvotec_check_admission(&after));
 	UT_ASSERT(after.continuity_valid);
@@ -5228,10 +5237,69 @@ UT_TEST(test_interleaved_timely_renewal_is_not_a_published_lease_loss)
 	fence_mock_storage_us = saved_storage_clock;
 }
 
+static void
+admission_complete_odd_publication(void)
+{
+	pg_atomic_uint64 *sequence
+		= (pg_atomic_uint64 *)(shmem_storage + CLUSTER_QVOTEC_SHMEM_STORAGE_OFFSET
+							   + CLUSTER_STORAGE_QUORUM_STATE_BYTES + sizeof(pg_atomic_uint64));
+
+	pg_atomic_write_u64(sequence, pg_atomic_read_u64(sequence) + 1);
+}
+
+UT_TEST(test_whole_admission_waits_for_publication_without_extending_lease)
+{
+	ClusterQvotecAdmissionCheck first, after;
+	bool saved_shared = cluster_shared_config;
+	pg_atomic_uint64 *sequence
+		= (pg_atomic_uint64 *)(shmem_storage + CLUSTER_QVOTEC_SHMEM_STORAGE_OFFSET
+							   + CLUSTER_STORAGE_QUORUM_STATE_BYTES + sizeof(pg_atomic_uint64));
+
+	admission_fixture_ready();
+	UT_ASSERT(cluster_qvotec_check_admission(&first));
+	pg_atomic_write_u64(sequence, pg_atomic_read_u64(sequence) + 1);
+	admission_sleep_interleave = admission_complete_odd_publication;
+	injected_sleeps = 0;
+	UT_ASSERT(cluster_qvotec_check_admission(&after));
+	UT_ASSERT(after.continuity_valid && !after.continuity_pending);
+	UT_ASSERT_EQ(injected_sleeps, 1);
+	UT_ASSERT_EQ(after.lease_expire_us, first.lease_expire_us);
+	UT_ASSERT_EQ(after.continuity.quorum_generation, first.continuity.quorum_generation);
+	admission_sleep_interleave = NULL;
+	cluster_shared_config = saved_shared;
+}
+
+UT_TEST(test_whole_admission_has_one_wait_budget_and_keeps_real_loss)
+{
+	ClusterQvotecAdmissionCheck check;
+	bool saved_shared = cluster_shared_config;
+	ClusterStorageQuorumState *storage
+		= (ClusterStorageQuorumState *)(shmem_storage + CLUSTER_QVOTEC_SHMEM_STORAGE_OFFSET);
+	pg_atomic_uint64 *sequence
+		= (pg_atomic_uint64 *)((char *)storage + CLUSTER_STORAGE_QUORUM_STATE_BYTES
+							   + sizeof(pg_atomic_uint64));
+
+	admission_fixture_ready();
+	pg_atomic_write_u64(sequence, pg_atomic_read_u64(sequence) + 1);
+	pg_atomic_write_u32(&storage->sequence, 1);
+	injected_sleeps = 0;
+	UT_ASSERT(!cluster_qvotec_check_admission(&check));
+	UT_ASSERT_EQ(injected_sleeps, 10);
+	UT_ASSERT(!check.continuity_valid);
+	UT_ASSERT_EQ(check.storage.snapshot_stop, CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT);
+	cluster_qvotec_test_publish_quorum_state(CLUSTER_QVOTEC_QUORUM_LOST);
+	injected_sleeps = 0;
+	UT_ASSERT(!cluster_qvotec_check_admission(&check));
+	UT_ASSERT_EQ(check.result, CLUSTER_QVOTEC_ADMISSION_DB_STATE);
+	UT_ASSERT_EQ(check.quorum_state, CLUSTER_QVOTEC_QUORUM_LOST);
+	UT_ASSERT_EQ(injected_sleeps, 0);
+	cluster_shared_config = saved_shared;
+}
+
 int
 main(void)
 {
-	UT_PLAN(103);
+	UT_PLAN(105);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -5335,6 +5403,8 @@ main(void)
 	UT_RUN(test_wall_clock_only_lease_loss_survives_rollback_and_reattach);
 	UT_RUN(test_final_continuity_clock_failure_cannot_revive_the_old_generation);
 	UT_RUN(test_interleaved_timely_renewal_is_not_a_published_lease_loss);
+	UT_RUN(test_whole_admission_waits_for_publication_without_extending_lease);
+	UT_RUN(test_whole_admission_has_one_wait_budget_and_keeps_real_loss);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

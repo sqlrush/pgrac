@@ -57,6 +57,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_inject.h" /* PGRAC: spec-7.2 D6 injection points */
 #include "cluster/cluster_lms.h"
 #include "miscadmin.h"
@@ -452,6 +453,21 @@ cluster_lms_data_plane_tick(long timeout_ms)
 					dp_track[pi].connect_started_at = 0;
 					dp_wes_dirty = true;
 				}
+			}
+		}
+
+		cluster_ic_rdma_retry_dispatch();
+
+		/* A pending complete frame no longer makes the socket readable.
+		 * Revisit the original receive owner before the ordinary event wait. */
+		for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+			if (dp_track[pi].fd >= 0 && dp_track[pi].substate == LMS_DP_CONNECTED
+				&& cluster_ic_tier1_recv_dispatch_pending(pi)
+				&& !cluster_ic_tier1_recv_heartbeat_drain(pi, dp_track[pi].fd)) {
+				cluster_ic_tier1_close_peer(pi, "data-plane retained frame rejected");
+				dp_track[pi].fd = -1;
+				dp_track[pi].substate = LMS_DP_DOWN;
+				dp_wes_dirty = true;
 			}
 		}
 

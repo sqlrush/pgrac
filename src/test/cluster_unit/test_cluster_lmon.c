@@ -672,6 +672,10 @@ cluster_ic_rdma_lmon_handle_cm_events(void)
 {}
 
 void
+cluster_ic_rdma_retry_dispatch(void)
+{}
+
+void
 cluster_ic_rdma_lmon_handle_completion_events(void)
 {}
 

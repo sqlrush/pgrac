@@ -160,6 +160,7 @@ extern void cluster_storage_quorum_refresh(uint64 now_us, uint64 duration_us);
 extern bool cluster_storage_quorum_snapshot(ClusterStorageQuorumView *out);
 extern bool cluster_storage_quorum_allows_node(int node_id);
 extern bool cluster_storage_quorum_check_node(int node_id, ClusterStorageQuorumCheck *out);
+extern bool cluster_storage_quorum_check_node_once(int node_id, ClusterStorageQuorumCheck *out);
 extern bool cluster_storage_quorum_allows_members(uint64 members_lo, uint64 members_hi);
 extern void cluster_storage_corosync_sample(ClusterStorageQuorumView *out);
 /* Passive diagnostics never invoke the provider, wait, or supply permission. */

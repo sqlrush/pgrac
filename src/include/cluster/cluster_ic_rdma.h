@@ -223,6 +223,7 @@ extern int cluster_ic_rdma_lmon_completion_fd(void);
 extern void cluster_ic_rdma_lmon_start(void);
 extern void cluster_ic_rdma_lmon_stop(void);
 extern void cluster_ic_rdma_lmon_handle_cm_events(void);
+extern void cluster_ic_rdma_retry_dispatch(void);
 extern void cluster_ic_rdma_lmon_handle_completion_events(void);
 extern bool cluster_ic_rdma_drain_recv(int32 *out_sender_node_id, void *buf, size_t bufsize,
 									   size_t *out_received_len);

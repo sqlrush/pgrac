@@ -1801,9 +1801,8 @@ cr_server_r4_ship_terminal(uint32 slot_index)
 									   sizeof(frame)))
 			send_result = CLUSTER_IC_SEND_HARD_ERROR;
 		else
-			send_result = cluster_ic_dispatch_envelope(&envelope, frame, cluster_node_id)
-							  ? CLUSTER_IC_SEND_DONE
-							  : CLUSTER_IC_SEND_HARD_ERROR;
+			send_result = cluster_ic_dispatch_send_result(
+				cluster_ic_dispatch_envelope(&envelope, frame, cluster_node_id));
 	} else
 		send_result = cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, slot->requester_node,
 											   frame, sizeof(frame));

@@ -754,6 +754,34 @@ cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
 	return true;
 }
 
+static bool phase_test_serving_formation_busy;
+
+ClusterServingFormationResult
+cluster_reconfig_capture_serving_formation_v1(uint16 origin_thread,
+											  const ClusterQvotecAdmissionCheck *check,
+											  ClusterFormationSnapshotV1 *snapshot,
+											  bool *snapshot_valid, const char **predicate)
+{
+	bool pending = (check->result == CLUSTER_QVOTEC_ADMISSION_ALLOWED && check->continuity_pending)
+				   || (check->result == CLUSTER_QVOTEC_ADMISSION_STORAGE
+					   && check->storage.result == CLUSTER_STORAGE_CHECK_UNSTABLE
+					   && (check->storage.snapshot_stop == CLUSTER_STORAGE_SNAPSHOT_DEADLINE
+						   || check->storage.snapshot_stop == CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT));
+	bool admitted = check->result == CLUSTER_QVOTEC_ADMISSION_ALLOWED && check->continuity_valid;
+
+	*predicate = "FIXTURE_FORMATION";
+	*snapshot_valid = false;
+	memset(snapshot, 0, sizeof(*snapshot));
+	if (!admitted && !pending)
+		return CLUSTER_SERVING_FORMATION_REFUSED;
+	if (phase_test_serving_formation_busy)
+		return CLUSTER_SERVING_FORMATION_PENDING;
+	*snapshot_valid = cluster_reconfig_capture_formation_snapshot_v1(origin_thread, snapshot);
+	if (!*snapshot_valid)
+		return CLUSTER_SERVING_FORMATION_REFUSED;
+	return pending ? CLUSTER_SERVING_FORMATION_PENDING : CLUSTER_SERVING_FORMATION_CURRENT;
+}
+
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
@@ -794,6 +822,17 @@ cluster_grd_recovery_authority_is_current(uint64 boot_incarnation, uint64 lms_ge
 {
 	return phase_test_grd_authority_ok && boot_incarnation == 11
 		   && lms_generation == phase_test_lms_generation;
+}
+
+bool
+cluster_grd_recovery_authority_for_admission(uint64 boot_incarnation, uint64 lms_generation,
+											 const ClusterQvotecAdmissionCheck *check,
+											 bool *pending)
+{
+	*pending = false;
+	if (!cluster_grd_recovery_authority_is_current(boot_incarnation, lms_generation))
+		return false;
+	return cluster_authority_serving_admission_current_v1(check, pending);
 }
 
 /* PGRAC: this startup consumer fixture has no real control census. Preserve

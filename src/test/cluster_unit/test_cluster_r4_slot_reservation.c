@@ -681,7 +681,7 @@ cluster_ic_envelope_build(ClusterICEnvelope *out_env, uint8 msg_type, uint32 sou
 	return true;
 }
 
-bool
+ClusterICDispatchResult
 cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
 {
 	ut_local_dispatch_calls++;

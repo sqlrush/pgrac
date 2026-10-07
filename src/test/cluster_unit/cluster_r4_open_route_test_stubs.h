@@ -203,7 +203,7 @@ cluster_ic_envelope_build(ClusterICEnvelope *out pg_attribute_unused(),
 	return false;
 }
 
-bool
+ClusterICDispatchResult
 cluster_ic_dispatch_envelope(const ClusterICEnvelope *env pg_attribute_unused(),
 							 const void *payload pg_attribute_unused(),
 							 int32 peer pg_attribute_unused())

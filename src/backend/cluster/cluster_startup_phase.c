@@ -161,6 +161,21 @@ cluster_authority_quorum_pending(const ClusterQvotecAdmissionCheck *check)
 }
 
 static ClusterAuthorityQuorumState
+cluster_authority_quorum_from_sample(const ClusterAuthorityBindingLocal *binding,
+									 const ClusterQvotecAdmissionCheck *check, bool allowed)
+{
+	if (cluster_authority_quorum_pending(check))
+		return CLUSTER_AUTHORITY_QUORUM_PENDING;
+	if (!allowed || !check->continuity_valid || binding == NULL || binding->quorum_generation == 0
+		|| binding->storage_generation == 0
+		|| binding->quorum_generation != check->continuity.quorum_generation
+		|| binding->storage_generation != check->continuity.storage_generation)
+		return CLUSTER_AUTHORITY_QUORUM_LOST;
+	return CLUSTER_AUTHORITY_QUORUM_CURRENT;
+}
+
+
+static ClusterAuthorityQuorumState
 cluster_authority_quorum_current(const ClusterAuthorityBindingLocal *binding)
 {
 	ClusterQvotecAdmissionCheck check = { 0 };
@@ -170,14 +185,7 @@ cluster_authority_quorum_current(const ClusterAuthorityBindingLocal *binding)
 		return cluster_qvotec_in_quorum() ? CLUSTER_AUTHORITY_QUORUM_CURRENT
 										  : CLUSTER_AUTHORITY_QUORUM_LOST;
 	allowed = cluster_qvotec_check_admission(&check);
-	if (cluster_authority_quorum_pending(&check))
-		return CLUSTER_AUTHORITY_QUORUM_PENDING;
-	if (!allowed || !check.continuity_valid || binding == NULL || binding->quorum_generation == 0
-		|| binding->storage_generation == 0
-		|| binding->quorum_generation != check.continuity.quorum_generation
-		|| binding->storage_generation != check.continuity.storage_generation)
-		return CLUSTER_AUTHORITY_QUORUM_LOST;
-	return CLUSTER_AUTHORITY_QUORUM_CURRENT;
+	return cluster_authority_quorum_from_sample(binding, &check, allowed);
 }
 
 
@@ -1185,6 +1193,65 @@ cluster_authority_readiness_publish_serving(void)
 	return valid;
 }
 
+/* All serving consumers share this call's DB/storage observation. Unknown
+ * formation output is not a zero-generation replacement; known identity drift
+ * still wins over any pending observation. */
+static const char *
+cluster_serving_identity_for_admission(const ClusterAuthorityBindingLocal *binding,
+									   const ClusterQvotecAdmissionCheck *check, bool *pending,
+									   bool *formation_current, bool *generation_current)
+{
+	ClusterFormationSnapshotV1 formation;
+	ClusterServingFormationResult result;
+	ClusterStartupPhase phase = cluster_current_phase();
+	const char *predicate = NULL;
+	bool snapshot_valid = false;
+	bool grd_pending = false;
+
+	*pending = false;
+	*formation_current = false;
+	*generation_current = false;
+	if (binding->boot_incarnation == 0 || binding->lms_generation == 0)
+		return "BINDING_IDENTITY";
+	if (cluster_cssd_get_status() != CLUSTER_CSSD_READY)
+		return "CSSD_NOT_READY";
+	if (cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY)
+		return "QVOTEC_NOT_READY";
+	if (cluster_qvotec_get_self_incarnation() != binding->boot_incarnation)
+		return "BOOT_CHANGED";
+	if (cluster_membership_get_last_admitted_incarnation(cluster_node_id)
+		!= binding->boot_incarnation)
+		return "ADMITTED_BOOT_CHANGED";
+	if (cluster_lms_get_lms_restart_generation() != binding->lms_generation)
+		return "LMS_GENERATION_CHANGED";
+	if (phase < CLUSTER_PHASE_4_NORMAL || phase >= CLUSTER_PHASE_SHUTDOWN)
+		return "SERVING_PHASE";
+	if (!cluster_lms_is_ready())
+		return "LMS_NOT_READY";
+	*generation_current = true;
+	if (!cluster_membership_is_member(cluster_node_id))
+		return "NOT_MEMBER";
+	if (!cluster_reconfig_self_join_admitted())
+		return "JOIN_NOT_ADMITTED";
+	result = cluster_reconfig_capture_serving_formation_v1(binding->origin_thread, check,
+														   &formation, &snapshot_valid, &predicate);
+	if (snapshot_valid) {
+		*formation_current = cluster_formation_snapshot_matches_v1(&binding->formation, &formation);
+		if (!*formation_current)
+			return "FORMATION_CHANGED";
+	}
+	if (result == CLUSTER_SERVING_FORMATION_REFUSED)
+		return predicate != NULL ? predicate : "FORMATION_CAPTURE";
+	if (result == CLUSTER_SERVING_FORMATION_CURRENT && !snapshot_valid)
+		return "FORMATION_CAPTURE";
+	if (!cluster_grd_recovery_authority_for_admission(binding->boot_incarnation,
+													  binding->lms_generation, check, &grd_pending)
+		&& !grd_pending)
+		return "GRD_SEAL_CHANGED";
+	*pending = result == CLUSTER_SERVING_FORMATION_PENDING || grd_pending;
+	return NULL;
+}
+
 bool
 cluster_serving_ready_check(bool *pending, const char **failed_predicate)
 {
@@ -1193,6 +1260,9 @@ cluster_serving_ready_check(bool *pending, const char **failed_predicate)
 	const char *failure;
 	bool identity_current;
 	bool current;
+	bool identity_pending = false;
+	bool formation_current = false;
+	bool generation_current = false;
 
 	if (pending != NULL)
 		*pending = false;
@@ -1205,27 +1275,40 @@ cluster_serving_ready_check(bool *pending, const char **failed_predicate)
 			*failed_predicate = "NOT_SERVING";
 		return false;
 	}
-	quorum = cluster_authority_quorum_current(&binding);
-	failure = cluster_authority_binding_external_identity_failure(&binding, true);
+	if (cluster_shared_config) {
+		ClusterQvotecAdmissionCheck check;
+		bool allowed = cluster_qvotec_check_admission(&check);
+
+		quorum = cluster_authority_quorum_from_sample(&binding, &check, allowed);
+		failure = cluster_serving_identity_for_admission(&binding, &check, &identity_pending,
+														 &formation_current, &generation_current);
+	} else {
+		quorum = cluster_authority_quorum_current(&binding);
+		failure = cluster_authority_binding_external_identity_failure(&binding, true);
+	}
 	identity_current = failure == NULL;
-	current = identity_current && quorum == CLUSTER_AUTHORITY_QUORUM_CURRENT;
+	current = identity_current && !identity_pending && quorum == CLUSTER_AUTHORITY_QUORUM_CURRENT;
 	if (pending != NULL)
-		*pending = identity_current && quorum == CLUSTER_AUTHORITY_QUORUM_PENDING;
+		*pending = identity_current && quorum != CLUSTER_AUTHORITY_QUORUM_LOST
+				   && (identity_pending || quorum == CLUSTER_AUTHORITY_QUORUM_PENDING);
 	if (failed_predicate != NULL)
 		*failed_predicate = failure != NULL							  ? failure
 							: quorum == CLUSTER_AUTHORITY_QUORUM_LOST ? "QUORUM_CONTINUITY_LOST"
-							: quorum == CLUSTER_AUTHORITY_QUORUM_PENDING
+							: (identity_pending || quorum == CLUSTER_AUTHORITY_QUORUM_PENDING)
 								? "QUORUM_OBSERVATION_PENDING"
 								: "CURRENT";
 	/* A current boot/LMS generation whose formation moved stays unavailable,
 	 * but keeps its immutable binding so the survivor LMON can replace it only
 	 * after the existing GRD recovery/re-declare barrier closes.  Every data-
 	 * plane caller still observes false during that interval.  A same-formation
-	 * GRD loss is not a reconfig transition and remains terminal for this boot. */
+	 * GRD loss is not a reconfig transition and remains terminal for this boot.
+	 * Shared-mode clearing uses only this call's classified observation; a
+	 * second identity read must not reinterpret an incomplete admission cut. */
 	if (quorum == CLUSTER_AUTHORITY_QUORUM_LOST
 		|| (!identity_current
-			&& (!cluster_serving_generation_identity_current(&binding)
-				|| cluster_serving_formation_current(&binding))))
+			&& (cluster_shared_config ? !generation_current || formation_current
+									  : (!cluster_serving_generation_identity_current(&binding)
+										 || cluster_serving_formation_current(&binding)))))
 		cluster_authority_clear_matching_quorum(&binding, "serving_ready_stale", quorum);
 	return current;
 }

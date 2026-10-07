@@ -1414,7 +1414,7 @@ qvotec_admission_sample(ClusterQvotecAdmissionCheck *out, uint64 sequence)
 	}
 
 	/* Storage membership narrows admission without replacing disk evidence. */
-	storage_allowed = cluster_storage_quorum_check_node(cluster_node_id, &storage_check);
+	storage_allowed = cluster_storage_quorum_check_node_once(cluster_node_id, &storage_check);
 	storage_pending = storage_check.result == CLUSTER_STORAGE_CHECK_UNSTABLE
 					  && (storage_check.snapshot_stop == CLUSTER_STORAGE_SNAPSHOT_DEADLINE
 						  || storage_check.snapshot_stop == CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT);
@@ -1436,9 +1436,18 @@ qvotec_admission_sample(ClusterQvotecAdmissionCheck *out, uint64 sequence)
 		/* Record only a refusal sampled from one stable publication. A timely
 		 * renewal interleaved with this old getter can cause its original bool
 		 * to reject, but is not evidence of a published qualification gap. */
+		uint64 after;
+
 		pg_read_barrier();
-		if ((sequence & 1) == 0 && sequence == pg_atomic_read_u64(&QvotecShmem->admission_sequence))
+		after = pg_atomic_read_u64(&QvotecShmem->admission_sequence);
+		if ((sequence & 1) == 0 && sequence == after)
 			pg_atomic_write_u64(&QvotecShmem->admission_lease_loss_reported, 1);
+		else if (cluster_shared_config && out != NULL && sequence != UINT64_MAX
+				 && after != UINT64_MAX) {
+			out->result = CLUSTER_QVOTEC_ADMISSION_ALLOWED;
+			out->continuity_pending = true;
+			return false;
+		}
 		return qvotec_admission_denied(6, "LEASE_EXPIRED", q, lease_expire, now_us);
 	}
 	/* An unfinished bounded observation does not establish storage loss, but
@@ -1448,7 +1457,7 @@ qvotec_admission_sample(ClusterQvotecAdmissionCheck *out, uint64 sequence)
 	if (storage_pending) {
 		if (out != NULL)
 			out->result = CLUSTER_QVOTEC_ADMISSION_STORAGE;
-		return qvotec_storage_admission_denied(q, &storage_check, true);
+		return false; /* Only the complete bounded attempt reports pending. */
 	}
 
 	if (out != NULL)
@@ -1457,8 +1466,8 @@ qvotec_admission_sample(ClusterQvotecAdmissionCheck *out, uint64 sequence)
 }
 
 
-bool
-cluster_qvotec_check_admission(ClusterQvotecAdmissionCheck *out)
+static bool
+qvotec_check_admission_once(ClusterQvotecAdmissionCheck *out)
 {
 	uint64 sequence = UINT64_MAX;
 	uint64 generation = 0;
@@ -1506,6 +1515,104 @@ cluster_qvotec_check_admission(ClusterQvotecAdmissionCheck *out)
 		}
 	}
 	return allowed;
+}
+
+/* Match storage's four fast reads and ten 100us yields, with one 1ms
+ * monotonic budget for the entire sample. The inner storage copy never waits.
+ * No lease, request deadline, transport budget or owner state is extended. */
+bool
+cluster_qvotec_check_admission(ClusterQvotecAdmissionCheck *out)
+{
+	ClusterQvotecAdmissionCheck check;
+	uint64 started = 0;
+	uint64 last = 0;
+	uint64 sampled = 0;
+	uint32 attempts = 0;
+	uint32 waits = 0;
+	ClusterStorageSnapshotStop stop = CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT;
+	bool allowed = false;
+	int attempt;
+
+	if (!cluster_shared_config)
+		return qvotec_check_admission_once(out);
+	memset(&check, 0, sizeof(check));
+	for (attempt = 0; attempt < 14; attempt++) {
+		bool pending;
+
+		if (attempt >= 4) {
+			sampled = cluster_storage_quorum_now_us();
+			if (sampled == 0 || sampled < last)
+				goto clock_failure;
+			if (started == 0)
+				started = sampled;
+			last = sampled;
+			if (sampled - started >= 1000)
+				goto deadline;
+			waits++;
+			pg_usleep((long)Min(UINT64_C(100), 1000 - (sampled - started)));
+			sampled = cluster_storage_quorum_now_us();
+			if (sampled == 0 || sampled < last)
+				goto clock_failure;
+			last = sampled;
+			if (sampled - started >= 1000)
+				goto deadline;
+		}
+		attempts++;
+		allowed = qvotec_check_admission_once(&check);
+		pending = check.continuity_pending
+				  || (check.result == CLUSTER_QVOTEC_ADMISSION_STORAGE
+					  && check.storage.result == CLUSTER_STORAGE_CHECK_UNSTABLE
+					  && check.storage.snapshot_stop == CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT);
+		/* A known loss wins even if a publication was unfinished earlier. */
+		if (!pending) {
+			if (started != 0 && allowed) {
+				sampled = cluster_storage_quorum_now_us();
+				if (sampled == 0 || sampled < last || sampled < check.storage.now_us)
+					goto clock_failure;
+				if (sampled - started >= 1000) {
+					check.continuity_pending = true;
+					goto deadline;
+				}
+			}
+			if (out != NULL)
+				*out = check;
+			return allowed;
+		}
+	}
+	goto pending_or_unknown;
+
+deadline:
+	stop = CLUSTER_STORAGE_SNAPSHOT_DEADLINE;
+	goto pending_or_unknown;
+clock_failure:
+	/* A failed or reversed clock is not contention. Keep its loss history
+	 * sticky until the original publisher acknowledges it. */
+	stop = sampled == 0 ? CLUSTER_STORAGE_SNAPSHOT_CLOCK_UNAVAILABLE
+						: CLUSTER_STORAGE_SNAPSHOT_CLOCK_REGRESSED;
+	if (QvotecShmem != NULL)
+		pg_atomic_write_u64(&QvotecShmem->admission_lease_loss_reported, 1);
+	if (check.result != CLUSTER_QVOTEC_ADMISSION_STORAGE)
+		check.result = CLUSTER_QVOTEC_ADMISSION_LEASE;
+	check.continuity_pending = false;
+pending_or_unknown:
+	check.continuity_valid = false;
+	memset(&check.continuity, 0, sizeof(check.continuity));
+	if (check.result == CLUSTER_QVOTEC_ADMISSION_STORAGE
+		&& check.storage.result == CLUSTER_STORAGE_CHECK_UNSTABLE) {
+		/* The outer owner made these single-copy storage attempts. */
+		check.storage.attempts = attempts;
+		check.storage.wait_count = waits;
+		check.storage.wait_started_us = started;
+		check.storage.wait_sampled_us = sampled;
+		check.storage.snapshot_stop = stop;
+	}
+	if (check.result == CLUSTER_QVOTEC_ADMISSION_STORAGE
+		&& (stop == CLUSTER_STORAGE_SNAPSHOT_DEADLINE
+			|| stop == CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT))
+		(void)qvotec_storage_admission_denied(check.quorum_state, &check.storage, true);
+	if (out != NULL)
+		*out = check;
+	return false;
 }
 
 bool

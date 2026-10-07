@@ -202,8 +202,12 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 	/* Scheme A service split: DATA is an ordinary serving capability, not
 	 * implied by CSSD ALIVE, quorum, MEMBER, or recovery LMS transport. */
 	if (!is_chunk_wrap && (ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA
-		&& cluster_authority_readiness_managed() && !cluster_serving_ready_is_current())
-		return CLUSTER_IC_SEND_HARD_ERROR;
+		&& cluster_authority_readiness_managed()) {
+		bool pending = false;
+
+		if (!cluster_serving_ready_check(&pending, NULL))
+			return pending ? CLUSTER_IC_SEND_NOT_ADMITTED : CLUSTER_IC_SEND_HARD_ERROR;
+	}
 
 	/* (3) dest = self -- short-circuit no-op success.  spec-2.2 stub
 	 * tier preserves this; non-LMON callers in spec-2.3 are gated by
@@ -296,13 +300,22 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
  * Dispatch path (LMON recv).
  * ============================================================ */
 
+static const ClusterICEnvelope *data_dispatch_envelope;
+
 bool
+cluster_ic_dispatch_data_admitted(const ClusterICEnvelope *env)
+{
+	return env != NULL && env == data_dispatch_envelope;
+}
+
+ClusterICDispatchResult
 cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
 {
 	const ClusterICMsgTypeInfo *info;
 	MemoryContext old_ctx;
 	MemoryContext dispatch_ctx;
 	ClusterXpScope xps; /* PGRAC: spec-5.59 D6 profiling */
+	const ClusterICEnvelope *previous_data_envelope = data_dispatch_envelope;
 
 	if (env == NULL)
 		return false;
@@ -369,12 +382,16 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 		return true;
 	}
 
-	/* Independent ingress belt for every GCS/PCM/DATA handler.  Return true
-	 * because the authenticated peer connection is healthy; only the frame's
-	 * serving capability is absent. */
+	/* Independent ingress belt for every GCS/PCM/DATA handler. Known loss
+	 * consumes a refused frame; unfinished observation leaves the exact frame
+	 * with its original receive owner and never marks the peer unhealthy. */
 	if ((ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA
-		&& cluster_authority_readiness_managed() && !cluster_serving_ready_is_current())
-		return true;
+		&& cluster_authority_readiness_managed()) {
+		bool pending = false;
+
+		if (!cluster_serving_ready_check(&pending, NULL))
+			return pending ? CLUSTER_IC_DISPATCH_PENDING : CLUSTER_IC_DISPATCH_DONE;
+	}
 
 	/*
 	 * spec-2.3 §3.5 + Q14 + R3 防御层: PG_TRY/PG_CATCH wrap.  Catches
@@ -400,11 +417,15 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	cluster_xp_begin(&xps, CLXP_IC_INBOUND_DISPATCH);
 	PG_TRY();
 	{
+		data_dispatch_envelope = (ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA ? env : NULL;
 		info->handler(env, payload);
+		data_dispatch_envelope = previous_data_envelope;
 	}
 	PG_CATCH();
 	{
 		ErrorData *err;
+
+		data_dispatch_envelope = previous_data_envelope;
 
 		/* Switch BACK to old_ctx before CopyErrorData so the copy lives
 		 * in caller (LMON) memory, not in dispatch_ctx (about to be

@@ -6998,9 +6998,8 @@ gcs_block_send_envelope_or_loopback(uint8 msg_type, int32 dest_node, const void 
 		|| !cluster_ic_envelope_build(&envelope, msg_type, (uint32)cluster_node_id,
 									  (uint32)cluster_node_id, payload, payload_len))
 		return CLUSTER_IC_SEND_HARD_ERROR;
-	return cluster_ic_dispatch_envelope(&envelope, payload, cluster_node_id)
-			   ? CLUSTER_IC_SEND_DONE
-			   : CLUSTER_IC_SEND_HARD_ERROR;
+	return cluster_ic_dispatch_send_result(
+		cluster_ic_dispatch_envelope(&envelope, payload, cluster_node_id));
 }
 
 static bool
@@ -16486,7 +16485,9 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	cluster_sf_dep_vec_reset(&sf_dep_vec);
 	memset(&s_barrier_authority_before, 0, sizeof(s_barrier_authority_before));
 	memset(&s_barrier_authority_after, 0, sizeof(s_barrier_authority_after));
-	if (cluster_authority_readiness_managed() && !cluster_serving_ready_is_current())
+	/* The router sampled serving admission before dispatch and retains the
+	 * frame on PENDING. Do not resample halfway through this same handler. */
+	if (cluster_authority_readiness_managed() && !cluster_ic_dispatch_data_admitted(env))
 		return;
 	if (gcs_block_try_resource_x_frame(env, payload))
 		return;
@@ -16518,7 +16519,9 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	 * steady state (every node is an in-quorum MEMBER, no fence armed).  Reply
 	 * DENIED_RESOURCE_RECOVERING -> sender maps to 53R9L (retry-safe).
 	 */
-	master_gate_in_quorum = cluster_qvotec_in_quorum();
+	master_gate_in_quorum = cluster_authority_readiness_managed()
+								? cluster_ic_dispatch_data_admitted(env)
+								: cluster_qvotec_in_quorum();
 	master_gate_member = cluster_membership_is_member(cluster_node_id);
 	master_gate_join_active = cluster_grd_join_remaster_active_for_shard(req->tag);
 	master_gate_join_rebuilt = !master_gate_join_active || cluster_grd_block_view_rebuilt(req->tag);

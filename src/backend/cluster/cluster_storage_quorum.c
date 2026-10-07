@@ -384,7 +384,7 @@ storage_snapshot_time_valid(StorageSnapshotWait *wait, uint64 now)
 /* Obtain one stable view. Neither a wait nor a reader extends its expiry. */
 static bool
 storage_snapshot(ClusterStorageQuorumView *out, ClusterStorageQuorumCheck *check,
-				 StorageSnapshotWait *wait)
+				 StorageSnapshotWait *wait, bool allow_wait)
 {
 	int retry;
 
@@ -393,7 +393,9 @@ storage_snapshot(ClusterStorageQuorumView *out, ClusterStorageQuorumCheck *check
 	memset(out, 0, sizeof(*out));
 	if (storage_state == NULL)
 		return false;
-	for (retry = 0; retry < STORAGE_SNAPSHOT_FAST_READS + STORAGE_SNAPSHOT_MAX_WAITS; retry++) {
+	for (retry = 0;
+		 retry < (allow_wait ? STORAGE_SNAPSHOT_FAST_READS + STORAGE_SNAPSHOT_MAX_WAITS : 1);
+		 retry++) {
 		uint32 before;
 		uint32 after;
 
@@ -457,7 +459,7 @@ cluster_storage_quorum_snapshot(ClusterStorageQuorumView *out)
 {
 	StorageSnapshotWait wait = { 0 };
 
-	return storage_snapshot(out, NULL, &wait);
+	return storage_snapshot(out, NULL, &wait, true);
 }
 
 static ClusterStorageCheckResult
@@ -488,8 +490,8 @@ cluster_storage_quorum_allows_node(int node_id)
 
 /* The optional output captures the same bounded snapshot attempt and predicate
  * inputs; it adds no resampling or authority. Diagnostics never change the verdict. */
-bool
-cluster_storage_quorum_check_node(int node_id, ClusterStorageQuorumCheck *out)
+static bool
+storage_check_node(int node_id, ClusterStorageQuorumCheck *out, bool allow_wait)
 {
 	ClusterStorageQuorumView view;
 	ClusterStorageCheckResult result;
@@ -509,7 +511,7 @@ cluster_storage_quorum_check_node(int node_id, ClusterStorageQuorumCheck *out)
 		result = CLUSTER_STORAGE_CHECK_INVALID_TARGET;
 		goto done;
 	}
-	if (!storage_snapshot(&view, out, &wait)) {
+	if (!storage_snapshot(&view, out, &wait, allow_wait)) {
 		result = storage_state == NULL ? CLUSTER_STORAGE_CHECK_UNATTACHED
 									   : CLUSTER_STORAGE_CHECK_UNSTABLE;
 		goto done;
@@ -540,6 +542,19 @@ done:
 }
 
 bool
+cluster_storage_quorum_check_node(int node_id, ClusterStorageQuorumCheck *out)
+{
+	return storage_check_node(node_id, out, true);
+}
+
+/* QVOTEC owns the wait budget for its complete DB/storage observation. */
+bool
+cluster_storage_quorum_check_node_once(int node_id, ClusterStorageQuorumCheck *out)
+{
+	return storage_check_node(node_id, out, false);
+}
+
+bool
 cluster_storage_quorum_allows_members(uint64 members_lo, uint64 members_hi)
 {
 	ClusterStorageQuorumView view;
@@ -548,7 +563,7 @@ cluster_storage_quorum_allows_members(uint64 members_lo, uint64 members_hi)
 
 	if (!cluster_shared_config)
 		return true;
-	if ((members_lo | members_hi) == 0 || !storage_snapshot(&view, NULL, &wait))
+	if ((members_lo | members_hi) == 0 || !storage_snapshot(&view, NULL, &wait, true))
 		return false;
 	now = cluster_storage_quorum_now_us();
 	if (wait.started_us != 0 && !storage_snapshot_time_valid(&wait, now))

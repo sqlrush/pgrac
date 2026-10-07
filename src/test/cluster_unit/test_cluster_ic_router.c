@@ -209,7 +209,7 @@ const ClusterICOps *ClusterICOps_Active = NULL;
  * called from cluster_ic_router.c msg_type=255 fast path.  Router
  * unit tests don't invoke chunked frames, but link must resolve.
  */
-bool
+ClusterICDispatchResult
 cluster_ic_chunk_dispatch_frame(const ClusterICEnvelope *env pg_attribute_unused(),
 								const void *payload pg_attribute_unused(),
 								int32 peer_id pg_attribute_unused())
@@ -321,6 +321,7 @@ static ClusterICPlane router_test_my_plane = CLUSTER_IC_PLANE_CONTROL;
 static uint64 router_test_misroute_count = 0;
 static bool router_test_authority_managed = false;
 static bool router_test_serving_ready = false;
+static bool router_test_serving_pending = false;
 
 bool
 cluster_authority_readiness_managed(void)
@@ -331,6 +332,16 @@ cluster_authority_readiness_managed(void)
 bool
 cluster_serving_ready_is_current(void)
 {
+	return router_test_serving_ready;
+}
+
+bool
+cluster_serving_ready_check(bool *pending, const char **predicate)
+{
+	if (pending != NULL)
+		*pending = router_test_serving_pending;
+	if (predicate != NULL)
+		*predicate = "TEST";
 	return router_test_serving_ready;
 }
 
@@ -536,6 +547,10 @@ u22_no_op_handler(const ClusterICEnvelope *env pg_attribute_unused(),
 				  const void *payload pg_attribute_unused())
 {
 	u22_handler_call_count++;
+	if (router_test_my_plane == CLUSTER_IC_PLANE_DATA) {
+		UT_ASSERT(cluster_ic_dispatch_data_admitted(env));
+		UT_ASSERT(!cluster_ic_dispatch_data_admitted(NULL));
+	}
 }
 
 UT_TEST(test_u22_dispatch_rejects_broadcast_when_not_allowed)
@@ -630,9 +645,17 @@ UT_TEST(test_scheme_a_data_plane_requires_serving_ready)
 	UT_ASSERT_EQ(send_result, CLUSTER_IC_SEND_HARD_ERROR);
 	UT_ASSERT_EQ(test_send_bytes_call_count, 0);
 
+	router_test_serving_pending = true;
+	/* Pending retains the original frame and never calls the handler. */
+	UT_ASSERT_EQ(cluster_ic_dispatch_envelope(&env, NULL, 1), CLUSTER_IC_DISPATCH_PENDING);
+	UT_ASSERT_EQ(u22_handler_call_count, 0);
+	UT_ASSERT_EQ(cluster_ic_send_envelope(44, 6, NULL, 0), CLUSTER_IC_SEND_NOT_ADMITTED);
+	UT_ASSERT_EQ(test_send_bytes_call_count, 0);
+	router_test_serving_pending = false;
 	router_test_serving_ready = true;
 	UT_ASSERT(cluster_ic_dispatch_envelope(&env, NULL, 1));
 	UT_ASSERT_EQ(u22_handler_call_count, 1);
+	UT_ASSERT(!cluster_ic_dispatch_data_admitted(&env));
 	send_result = cluster_ic_send_envelope(44, 6, NULL, 0);
 	UT_ASSERT_EQ(send_result, CLUSTER_IC_SEND_DONE);
 	UT_ASSERT_EQ(test_send_bytes_call_count, 1);

@@ -299,7 +299,7 @@ cluster_ic_send_envelope_chunked(uint8 inner_msg_type, int32 dest_node_id, const
  * Receive path.
  * ============================================================ */
 
-bool
+ClusterICDispatchResult
 cluster_ic_chunk_dispatch_frame(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
 {
 	ClusterICChunkHeader hdr;
@@ -428,7 +428,7 @@ cluster_ic_chunk_dispatch_frame(const ClusterICEnvelope *env, const void *payloa
 		 * does NOT clobber our per-peer reassembly_ctx.
 		 */
 		ClusterICEnvelope inner;
-		bool dispatched;
+		ClusterICDispatchResult dispatched;
 
 		if (!cluster_ic_envelope_build(&inner, st->inner_msg_type, (uint32)st->source_node_id,
 									   (uint32)cluster_node_id, st->buf, st->total_payload_len)) {
@@ -436,6 +436,12 @@ cluster_ic_chunk_dispatch_frame(const ClusterICEnvelope *env, const void *payloa
 			return false;
 		}
 		dispatched = cluster_ic_dispatch_envelope(&inner, st->buf, -1);
+		if (dispatched == CLUSTER_IC_DISPATCH_PENDING) {
+			/* The receive owner retains this last frame. Keep the original
+			 * assembly and deadline; recopying the final chunk is idempotent. */
+			st->seq_next--;
+			return dispatched;
+		}
 		cluster_ic_chunk_reset_peer(peer_id);
 		return dispatched;
 	}
