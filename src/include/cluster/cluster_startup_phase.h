@@ -285,6 +285,10 @@ typedef struct ClusterPhaseSharedState {
 	uint16 authority_origin_thread;
 	uint64 authority_boot_incarnation;
 	uint64 authority_lms_generation;
+	/* First qualified admission cut for this managed boot. These survive a
+	 * readiness clear, so a later READY cannot erase an intervening loss. */
+	uint64 authority_quorum_generation;
+	uint64 authority_storage_generation;
 	ClusterFenceAuthorityProof authority_fence;
 	ClusterFormationSnapshotV1 authority_formation;
 } ClusterPhaseSharedState;
@@ -331,6 +335,12 @@ extern bool cluster_configuration_read_transport_is_current(const ClusterResId *
 															LOCKMODE mode);
 extern bool cluster_startup_control_transport_is_current(const ClusterResId *resid, LOCKMODE mode);
 extern bool cluster_serving_ready_is_current(void);
+struct ClusterQvotecAdmissionCheck;
+/* Same-sample continuity against the original managed serving boot. No
+ * resampling, admission renewal, or replacement of a lost baseline. */
+extern bool
+cluster_authority_serving_admission_current_v1(const struct ClusterQvotecAdmissionCheck *check,
+											   bool *pending);
 extern bool cluster_authority_serving_rebind_lmon(void);
 /* RF-ROOT P6 (L5 shutdown handoff): the committed LEAVER's serving rebind
  * (no local episode closes for its own departure; re-stamps from its own

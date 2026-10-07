@@ -164,6 +164,7 @@ cluster_storage_quorum_attach(ClusterStorageQuorumState *state, bool initialize)
 	pg_atomic_init_u64(&state->sampled_us, 0);
 	pg_atomic_init_u64(&state->expires_us, 0);
 	pg_atomic_init_u64(&state->generation, 0);
+	pg_atomic_init_u64(&state->loss_generation, 1);
 	for (int i = 0; i < CLUSTER_STORAGE_DIAG_FIELDS; i++)
 		pg_atomic_init_u64(&state->diagnostic[i], 0);
 }
@@ -179,7 +180,12 @@ void
 cluster_storage_quorum_refresh(uint64 now_us, uint64 duration_us)
 {
 	ClusterStorageQuorumView view;
+	ClusterStorageQuorumView previous;
 	uint64 generation;
+	uint64 loss_generation;
+	uint64 published_at;
+	bool had_previous;
+	bool lost;
 
 	if (!cluster_shared_config || storage_state == NULL)
 		return;
@@ -223,8 +229,27 @@ cluster_storage_quorum_refresh(uint64 now_us, uint64 duration_us)
 		view.sampled_us = now_us;
 		view.expires_us = now_us + duration_us;
 	}
+	view.generation = generation == UINT64_MAX ? generation : generation + 1;
+	/* A later READY must not hide a negative or an expired previous lease.
+	 * Qualified membership changes are a new observation, not local loss;
+	 * the membership/formation gates still validate that new cut separately.
+	 * The owner alone writes, and this field shares the view's publication. */
+	had_previous = cluster_storage_quorum_snapshot(&previous);
 	pg_atomic_fetch_add_u32(&storage_state->sequence, 1);
 	pg_write_barrier();
+	/* Read the clock after excluding readers of the old view: otherwise a
+	 * descheduled writer could overwrite a stably observed EXPIRED with READY. */
+	published_at = cluster_storage_quorum_now_us();
+	lost = !had_previous
+		   || storage_view_result(&previous, published_at) != CLUSTER_STORAGE_CHECK_ALLOWED
+		   || storage_view_result(&view, published_at) != CLUSTER_STORAGE_CHECK_ALLOWED
+		   || now_us < previous.sampled_us || now_us >= previous.expires_us;
+	loss_generation = pg_atomic_read_u64(&storage_state->loss_generation);
+	if (!had_previous || loss_generation == 0)
+		loss_generation = UINT64_MAX;
+	else if (lost && loss_generation != UINT64_MAX)
+		loss_generation++;
+	pg_atomic_write_u64(&storage_state->loss_generation, loss_generation);
 	pg_atomic_write_u32(&storage_state->reason, view.reason);
 	pg_atomic_write_u32(&storage_state->ring_node, view.ring_node);
 	pg_atomic_write_u32(&storage_state->provider_diagnostic, view.provider_diagnostic);
@@ -233,8 +258,7 @@ cluster_storage_quorum_refresh(uint64 now_us, uint64 duration_us)
 	pg_atomic_write_u64(&storage_state->members[1], view.members[1]);
 	pg_atomic_write_u64(&storage_state->sampled_us, view.sampled_us);
 	pg_atomic_write_u64(&storage_state->expires_us, view.expires_us);
-	pg_atomic_write_u64(&storage_state->generation,
-						generation == UINT64_MAX ? generation : generation + 1);
+	pg_atomic_write_u64(&storage_state->generation, view.generation);
 	pg_write_barrier();
 	pg_atomic_fetch_add_u32(&storage_state->sequence, 1);
 	pg_atomic_write_u64(&storage_state->diagnostic[CLUSTER_STORAGE_DIAG_OUTCOME], 1);
@@ -317,9 +341,50 @@ cluster_storage_quorum_diagnostic_format(char *out, size_t size)
 #undef DIAG_VALUE
 }
 
-/* Obtain one stable view. The expiry is never extended by readers. */
+/* Four fast reads cover an uncontended publication. On overlap, yield at most
+ * ten times for 100us, also bounded by 1ms of monotonic elapsed time. The sole
+ * writer's odd section takes no locks and never waits for a reader, including
+ * callers that already hold a reconfiguration lock or have no PGPROC. */
+#define STORAGE_SNAPSHOT_FAST_READS 4
+#define STORAGE_SNAPSHOT_MAX_WAITS 10
+#define STORAGE_SNAPSHOT_WAIT_US 100
+
+typedef struct StorageSnapshotWait {
+	uint64 started_us;
+	uint64 last_us;
+	uint64 sampled_us;
+	uint32 count;
+	ClusterStorageSnapshotStop stop;
+} StorageSnapshotWait;
+
+/* Keep all samples from one bounded read ordered, including the caller's
+ * final qualification sample. A regression above the start is still unknown. */
 static bool
-storage_snapshot(ClusterStorageQuorumView *out, ClusterStorageQuorumCheck *check)
+storage_snapshot_time_valid(StorageSnapshotWait *wait, uint64 now)
+{
+	wait->sampled_us = now;
+	if (now == 0) {
+		wait->stop = CLUSTER_STORAGE_SNAPSHOT_CLOCK_UNAVAILABLE;
+		return false;
+	}
+	if (now < wait->last_us) {
+		wait->stop = CLUSTER_STORAGE_SNAPSHOT_CLOCK_REGRESSED;
+		return false;
+	}
+	if (wait->started_us == 0)
+		wait->started_us = now;
+	if (now - wait->started_us >= STORAGE_SNAPSHOT_MAX_WAITS * STORAGE_SNAPSHOT_WAIT_US) {
+		wait->stop = CLUSTER_STORAGE_SNAPSHOT_DEADLINE;
+		return false;
+	}
+	wait->last_us = now;
+	return true;
+}
+
+/* Obtain one stable view. Neither a wait nor a reader extends its expiry. */
+static bool
+storage_snapshot(ClusterStorageQuorumView *out, ClusterStorageQuorumCheck *check,
+				 StorageSnapshotWait *wait)
 {
 	int retry;
 
@@ -328,10 +393,26 @@ storage_snapshot(ClusterStorageQuorumView *out, ClusterStorageQuorumCheck *check
 	memset(out, 0, sizeof(*out));
 	if (storage_state == NULL)
 		return false;
-	for (retry = 0; retry < 4; retry++) {
-		uint32 before = pg_atomic_read_u32(&storage_state->sequence);
+	for (retry = 0; retry < STORAGE_SNAPSHOT_FAST_READS + STORAGE_SNAPSHOT_MAX_WAITS; retry++) {
+		uint32 before;
 		uint32 after;
 
+		if (retry >= STORAGE_SNAPSHOT_FAST_READS) {
+			uint64 now = cluster_storage_quorum_now_us();
+			uint64 budget = STORAGE_SNAPSHOT_MAX_WAITS * STORAGE_SNAPSHOT_WAIT_US;
+
+			if (!storage_snapshot_time_valid(wait, now))
+				break;
+			wait->count++;
+			pg_usleep(
+				(long)Min((uint64)STORAGE_SNAPSHOT_WAIT_US, budget - (now - wait->started_us)));
+			/* Scheduling can oversleep, and a failed/reversed clock cannot
+			 * make a completed publisher evidence within this wait budget. */
+			now = cluster_storage_quorum_now_us();
+			if (!storage_snapshot_time_valid(wait, now))
+				break;
+		}
+		before = pg_atomic_read_u32(&storage_state->sequence);
 		if (check != NULL) {
 			check->attempts = retry + 1;
 			check->sequence_before = check->sequence_after = before;
@@ -347,14 +428,26 @@ storage_snapshot(ClusterStorageQuorumView *out, ClusterStorageQuorumCheck *check
 		out->sampled_us = pg_atomic_read_u64(&storage_state->sampled_us);
 		out->expires_us = pg_atomic_read_u64(&storage_state->expires_us);
 		out->generation = pg_atomic_read_u64(&storage_state->generation);
+		out->loss_generation = pg_atomic_read_u64(&storage_state->loss_generation);
 		out->provider_diagnostic = pg_atomic_read_u32(&storage_state->provider_diagnostic);
 		pg_read_barrier();
 		after = pg_atomic_read_u32(&storage_state->sequence);
 		if (check != NULL)
 			check->sequence_after = after;
-		if (before == after)
+		if (before == after) {
+			/* A reader descheduled during the copy must also respect the
+			 * same deadline; the uncontended fast path needs no extra clock. */
+			if (retry >= STORAGE_SNAPSHOT_FAST_READS) {
+				uint64 now = cluster_storage_quorum_now_us();
+
+				if (!storage_snapshot_time_valid(wait, now))
+					break;
+			}
 			return true;
+		}
 	}
+	if (wait->stop == CLUSTER_STORAGE_SNAPSHOT_COMPLETE)
+		wait->stop = CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT;
 	memset(out, 0, sizeof(*out));
 	return false;
 }
@@ -362,7 +455,9 @@ storage_snapshot(ClusterStorageQuorumView *out, ClusterStorageQuorumCheck *check
 bool
 cluster_storage_quorum_snapshot(ClusterStorageQuorumView *out)
 {
-	return storage_snapshot(out, NULL);
+	StorageSnapshotWait wait = { 0 };
+
+	return storage_snapshot(out, NULL, &wait);
 }
 
 static ClusterStorageCheckResult
@@ -384,13 +479,6 @@ storage_view_result(const ClusterStorageQuorumView *view, uint64 now)
 	return CLUSTER_STORAGE_CHECK_ALLOWED;
 }
 
-static bool
-storage_view_current(const ClusterStorageQuorumView *view)
-{
-	return storage_view_result(view, cluster_storage_quorum_now_us())
-		   == CLUSTER_STORAGE_CHECK_ALLOWED;
-}
-
 /* No new authority is created here: this only narrows existing DB admission. */
 bool
 cluster_storage_quorum_allows_node(int node_id)
@@ -398,13 +486,14 @@ cluster_storage_quorum_allows_node(int node_id)
 	return cluster_storage_quorum_check_node(node_id, NULL);
 }
 
-/* The optional output captures the same predicate inputs, with no resample,
- * extra retry, or authority. Provider diagnostics never affect the verdict. */
+/* The optional output captures the same bounded snapshot attempt and predicate
+ * inputs; it adds no resampling or authority. Diagnostics never change the verdict. */
 bool
 cluster_storage_quorum_check_node(int node_id, ClusterStorageQuorumCheck *out)
 {
 	ClusterStorageQuorumView view;
 	ClusterStorageCheckResult result;
+	StorageSnapshotWait wait = { 0 };
 	uint64 now;
 
 	if (out != NULL) {
@@ -420,12 +509,16 @@ cluster_storage_quorum_check_node(int node_id, ClusterStorageQuorumCheck *out)
 		result = CLUSTER_STORAGE_CHECK_INVALID_TARGET;
 		goto done;
 	}
-	if (!storage_snapshot(&view, out)) {
+	if (!storage_snapshot(&view, out, &wait)) {
 		result = storage_state == NULL ? CLUSTER_STORAGE_CHECK_UNATTACHED
 									   : CLUSTER_STORAGE_CHECK_UNSTABLE;
 		goto done;
 	}
 	now = cluster_storage_quorum_now_us();
+	if (wait.started_us != 0 && !storage_snapshot_time_valid(&wait, now)) {
+		result = CLUSTER_STORAGE_CHECK_UNSTABLE;
+		goto done;
+	}
 	if (out != NULL) {
 		out->stable = true;
 		out->now_us = now;
@@ -436,8 +529,13 @@ cluster_storage_quorum_check_node(int node_id, ClusterStorageQuorumCheck *out)
 		&& (view.members[node_id / 64] & (UINT64_C(1) << (node_id % 64))) == 0)
 		result = CLUSTER_STORAGE_CHECK_TARGET_ABSENT;
 done:
-	if (out != NULL)
+	if (out != NULL) {
 		out->result = result;
+		out->snapshot_stop = wait.stop;
+		out->wait_count = wait.count;
+		out->wait_started_us = wait.started_us;
+		out->wait_sampled_us = wait.sampled_us;
+	}
 	return result == CLUSTER_STORAGE_CHECK_ALLOWED || result == CLUSTER_STORAGE_CHECK_NATIVE;
 }
 
@@ -445,10 +543,16 @@ bool
 cluster_storage_quorum_allows_members(uint64 members_lo, uint64 members_hi)
 {
 	ClusterStorageQuorumView view;
+	StorageSnapshotWait wait = { 0 };
+	uint64 now;
 
 	if (!cluster_shared_config)
 		return true;
-	return (members_lo | members_hi) != 0 && cluster_storage_quorum_snapshot(&view)
-		   && storage_view_current(&view) && (members_lo & ~view.members[0]) == 0
-		   && (members_hi & ~view.members[1]) == 0;
+	if ((members_lo | members_hi) == 0 || !storage_snapshot(&view, NULL, &wait))
+		return false;
+	now = cluster_storage_quorum_now_us();
+	if (wait.started_us != 0 && !storage_snapshot_time_valid(&wait, now))
+		return false;
+	return storage_view_result(&view, now) == CLUSTER_STORAGE_CHECK_ALLOWED
+		   && (members_lo & ~view.members[0]) == 0 && (members_hi & ~view.members[1]) == 0;
 }

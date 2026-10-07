@@ -110,7 +110,8 @@ typedef struct GrdPiReadyKey {
 
 static GrdPiReadyKey grd_pi_ready_key;
 static bool grd_pi_ready_valid;
-static bool grd_pi_ready_cached(void);
+typedef struct GrdPiQuorumObservation GrdPiQuorumObservation;
+static bool grd_pi_ready_cached(GrdPiQuorumObservation *observation);
 
 
 /* spec-2.15 v0.3 P1.3:  Per-shard LWLock array (named tranche).  4096
@@ -2223,7 +2224,7 @@ cluster_grd_join_view_rebuilt(void)
 bool
 cluster_grd_block_view_rebuilt(BufferTag tag)
 {
-	if (grd_pi_ready_cached())
+	if (grd_pi_ready_cached(NULL))
 		return true;
 	if (!cluster_grd_join_view_rebuilt())
 		return false;
@@ -2647,13 +2648,41 @@ grd_control_namespace(const ClusterResId *resid)
 			   || resid->type == CLUSTER_IR_RESID_TYPE);
 }
 
+struct GrdPiQuorumObservation {
+	bool pending;
+	bool refused;
+};
+
+/* Keep the original sample's refusal with its caller. A later successful
+ * read cannot explain an earlier failure, and pending is never authority. */
+static bool
+grd_control_map_sample(GrdPiQuorumObservation *observation)
+{
+	ClusterQvotecAdmissionCheck check;
+	bool allowed;
+
+	if (observation != NULL && (observation->pending || observation->refused))
+		return false;
+	if (!cluster_enabled || cluster_grd_state == NULL || cluster_grd_entry_htab == NULL
+		|| pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) == 0
+		|| cluster_epoch_get_current() == 0 || cluster_reconfig_has_pending_prebump_stage()) {
+		if (observation != NULL)
+			observation->refused = true;
+		return false;
+	}
+	if (observation == NULL || !cluster_shared_config)
+		return cluster_qvotec_in_quorum();
+	(void)cluster_qvotec_check_admission(&check);
+	allowed = cluster_authority_serving_admission_current_v1(&check, &observation->pending);
+	if (!allowed)
+		observation->refused = !observation->pending;
+	return allowed;
+}
+
 static bool
 grd_control_map_current(void)
 {
-	return cluster_enabled && cluster_grd_state != NULL && cluster_grd_entry_htab != NULL
-		   && pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) != 0
-		   && cluster_epoch_get_current() != 0 && cluster_qvotec_in_quorum()
-		   && !cluster_reconfig_has_pending_prebump_stage();
+	return grd_control_map_sample(NULL);
 }
 
 static bool
@@ -2667,10 +2696,10 @@ grd_control_authority_pending(void)
  * The generation brackets JOIN scope/complete publication, including a
  * same-epoch scope union; membership has its own original owner sequence. */
 static bool
-grd_pi_ready_key_read(GrdPiReadyKey *key)
+grd_pi_ready_key_read(GrdPiReadyKey *key, GrdPiQuorumObservation *observation)
 {
 	memset(key, 0, sizeof(*key));
-	if (!cluster_shared_config || !grd_control_map_current() || cluster_node_id < 0
+	if (!cluster_shared_config || !grd_control_map_sample(observation) || cluster_node_id < 0
 		|| cluster_node_id >= 32)
 		return false;
 	key->publication = pg_atomic_read_u64(&cluster_grd_state->pi_rebuild_publication);
@@ -2702,10 +2731,10 @@ grd_pi_ready_key_read(GrdPiReadyKey *key)
 }
 
 static bool
-grd_pi_ready_cached(void)
+grd_pi_ready_cached(GrdPiQuorumObservation *observation)
 {
 	GrdPiReadyKey now;
-	return grd_pi_ready_valid && grd_pi_ready_key_read(&now)
+	return grd_pi_ready_valid && grd_pi_ready_key_read(&now, observation)
 		   && memcmp(&now, &grd_pi_ready_key, sizeof(now)) == 0;
 }
 
@@ -2713,7 +2742,8 @@ grd_pi_ready_cached(void)
  * set/boots must also match a single locked Reconfig snapshot; two unlocked
  * scans alone could observe a stable intermediate table between mutators. */
 static void
-grd_pi_ready_remember(const GrdPiReadyKey *before, const ClusterGrdPiRebuildCutV1 *cut)
+grd_pi_ready_remember(const GrdPiReadyKey *before, const ClusterGrdPiRebuildCutV1 *cut,
+					  GrdPiQuorumObservation *observation)
 {
 	ClusterFormationSnapshotV1 formation;
 	GrdPiReadyKey after;
@@ -2730,14 +2760,14 @@ grd_pi_ready_remember(const GrdPiReadyKey *before, const ClusterGrdPiRebuildCutV
 				&& formation.membership.last_admitted_incarnation[node] != cut->member_boots[node]))
 			return;
 	}
-	if (!grd_pi_ready_key_read(&after) || memcmp(before, &after, sizeof(after)) != 0)
+	if (!grd_pi_ready_key_read(&after, observation) || memcmp(before, &after, sizeof(after)) != 0)
 		return;
 	grd_pi_ready_key = after;
 	grd_pi_ready_valid = true;
 }
 
 static int
-grd_pi_rebuild_cut(ClusterGrdPiRebuildCutV1 *out)
+grd_pi_rebuild_cut(ClusterGrdPiRebuildCutV1 *out, GrdPiQuorumObservation *observation)
 {
 	ClusterGrdRecoveryControlSnapshotV1 failure;
 	uint32 state, direction;
@@ -2746,7 +2776,7 @@ grd_pi_rebuild_cut(ClusterGrdPiRebuildCutV1 *out)
 	memset(out, 0, sizeof(*out));
 	if (!cluster_enabled || !cluster_shared_config)
 		return 0;
-	if (!grd_control_map_current() || cluster_node_id < 0 || cluster_node_id >= 32)
+	if (!grd_control_map_sample(observation) || cluster_node_id < 0 || cluster_node_id >= 32)
 		return -1;
 	state = pg_atomic_read_u32(&cluster_grd_state->recovery_state);
 	direction = pg_atomic_read_u32(&cluster_grd_state->recovery_direction);
@@ -2806,22 +2836,38 @@ grd_pi_rebuild_cut(ClusterGrdPiRebuildCutV1 *out)
 	return out->member_boots[cluster_node_id] == out->self_boot ? 1 : -1;
 }
 
-int
-cluster_grd_pi_rebuild_snapshot_v1(ClusterGrdPiRebuildCutV1 *out)
+static int
+grd_pi_rebuild_snapshot(ClusterGrdPiRebuildCutV1 *out, GrdPiQuorumObservation *observation)
 {
 	ClusterGrdPiRebuildCutV1 before, after;
 	int state;
 	if (out == NULL)
 		return -1;
 	memset(out, 0, sizeof(*out));
-	state = grd_pi_rebuild_cut(&before);
+	state = grd_pi_rebuild_cut(&before, observation);
+	if (state < 0)
+		return -1;
 	pg_read_barrier();
-	if (state != grd_pi_rebuild_cut(&after)
+	if (state != grd_pi_rebuild_cut(&after, observation)
 		|| (state == 1 && memcmp(&before, &after, sizeof(before)) != 0))
 		return -1;
 	if (state == 1)
 		*out = before;
 	return state;
+}
+
+int
+cluster_grd_pi_rebuild_snapshot_v1(ClusterGrdPiRebuildCutV1 *out)
+{
+	return grd_pi_rebuild_snapshot(out, NULL);
+}
+
+static bool
+grd_pi_rebuild_current(const ClusterGrdPiRebuildCutV1 *cut, GrdPiQuorumObservation *observation)
+{
+	ClusterGrdPiRebuildCutV1 now;
+	return cut != NULL && grd_pi_rebuild_snapshot(&now, observation) == 1
+		   && memcmp(cut, &now, sizeof(now)) == 0;
 }
 
 bool
@@ -2846,29 +2892,39 @@ cluster_grd_pi_rebuild_complete_v1(const ClusterGrdPiRebuildCutV1 *cut)
 	return cluster_grd_pi_rebuild_current_v1(cut);
 }
 
-bool
-cluster_grd_pi_rebuild_gate_v1(void)
+static bool
+grd_pi_rebuild_gate(GrdPiQuorumObservation *observation)
 {
 	ClusterGrdPiRebuildCutV1 now, completed;
 	GrdPiReadyKey key;
 	bool cacheable;
 	int state;
 
-	if (grd_pi_ready_cached())
+	if (grd_pi_ready_cached(observation))
 		return false;
+	if (observation != NULL && (observation->pending || observation->refused))
+		return true;
 	grd_pi_ready_valid = false;
-	cacheable = grd_pi_ready_key_read(&key);
-	state = cluster_grd_pi_rebuild_snapshot_v1(&now);
+	cacheable = grd_pi_ready_key_read(&key, observation);
+	if (observation != NULL && (observation->pending || observation->refused))
+		return true;
+	state = grd_pi_rebuild_snapshot(&now, observation);
 	if (state != 1)
 		return state != 0;
 	SpinLockAcquire(&cluster_grd_state->pi_rebuild_lock);
 	completed = cluster_grd_state->pi_rebuilt;
 	SpinLockRelease(&cluster_grd_state->pi_rebuild_lock);
-	if (memcmp(&completed, &now, sizeof(now)) != 0 || !cluster_grd_pi_rebuild_current_v1(&now))
+	if (memcmp(&completed, &now, sizeof(now)) != 0 || !grd_pi_rebuild_current(&now, observation))
 		return true;
 	if (cacheable)
-		grd_pi_ready_remember(&key, &now);
-	return false;
+		grd_pi_ready_remember(&key, &now, observation);
+	return observation != NULL && (observation->pending || observation->refused);
+}
+
+bool
+cluster_grd_pi_rebuild_gate_v1(void)
+{
+	return grd_pi_rebuild_gate(NULL);
 }
 
 void
@@ -2892,18 +2948,20 @@ cluster_grd_inc_pi_rebuild_plan_blocked(void)
 		pg_atomic_fetch_add_u64(&cluster_grd_state->pi_rebuild_plan_blocked_count, 1);
 }
 
-bool
-cluster_grd_pi_rebuild_blocked_v1(BufferTag tag)
+static bool
+grd_pi_rebuild_blocked(BufferTag tag, GrdPiQuorumObservation *observation)
 {
 	uint64 epoch;
 	uint32 state, direction;
 	int home, master;
 
-	if (grd_pi_ready_cached())
+	if (grd_pi_ready_cached(observation))
 		return false;
+	if (observation != NULL && (observation->pending || observation->refused))
+		return true;
 	if (!cluster_enabled || !cluster_shared_config)
 		return false;
-	if (!grd_control_map_current())
+	if (!grd_control_map_sample(observation))
 		return true;
 	master = cluster_gcs_lookup_master(tag);
 	if (master < 0 || master >= 32)
@@ -2918,11 +2976,28 @@ cluster_grd_pi_rebuild_blocked_v1(BufferTag tag)
 	if (state != GRD_RECOVERY_IDLE && direction == GRD_REMASTER_DIR_FAIL
 		&& (pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[home / 64])
 			& (UINT64CONST(1) << (home % 64))))
-		return cluster_grd_pi_rebuild_gate_v1();
+		return grd_pi_rebuild_gate(observation);
 	epoch = cluster_epoch_get_current();
 	return pg_atomic_read_u64(&cluster_grd_state->join_pcm_fence_epoch) == epoch
 		   && join_fence_is_affected_for(home, epoch)
-		   && (!cluster_grd_join_view_rebuilt() || cluster_grd_pi_rebuild_gate_v1());
+		   && (!cluster_grd_join_view_rebuilt() || grd_pi_rebuild_gate(observation));
+}
+
+bool
+cluster_grd_pi_rebuild_blocked_v1(BufferTag tag)
+{
+	return grd_pi_rebuild_blocked(tag, NULL);
+}
+
+bool
+cluster_grd_pi_rebuild_blocked_sample_v1(BufferTag tag, bool *pending)
+{
+	GrdPiQuorumObservation observation = { 0 };
+	bool blocked = grd_pi_rebuild_blocked(tag, &observation);
+
+	if (pending != NULL)
+		*pending = blocked && observation.pending && !observation.refused;
+	return blocked;
 }
 
 bool

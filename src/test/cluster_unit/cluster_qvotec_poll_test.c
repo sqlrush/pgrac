@@ -37,3 +37,11 @@ cluster_qvotec_test_poll_once(const int *fds, int n_disks, uint64 incarnation)
 	Assert(qvotec_slot_matrix != NULL);
 	qvotec_poll_once();
 }
+
+extern void cluster_qvotec_test_publish_quorum_state(uint32 state);
+
+void
+cluster_qvotec_test_publish_quorum_state(uint32 state)
+{
+	qvotec_publish_quorum_state(state);
+}

@@ -58,6 +58,7 @@
 #include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_pi_rebuild.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_hw.h" /* spec-4.6a HW remaster watchdog stubs */
@@ -507,11 +508,48 @@ cluster_reconfig_capture_formation_snapshot_v1(uint16 thread, ClusterFormationSn
 		ut_membership_generation += 2;
 	return true;
 }
+static ClusterQvotecAdmissionCheck ut_storage_admission;
+static bool ut_storage_admission_override;
+static unsigned ut_storage_admission_reads;
+static unsigned ut_storage_admission_after;
+static bool ut_storage_count_legacy;
 bool
 cluster_qvotec_in_quorum(void)
 {
+	if (ut_storage_count_legacy) {
+		ut_storage_admission_reads++;
+		if (ut_storage_admission_override
+			&& ut_storage_admission_reads >= ut_storage_admission_after)
+			return ut_storage_admission.result == CLUSTER_QVOTEC_ADMISSION_ALLOWED;
+	}
 	return ut_qvotec_quorum;
 }
+bool
+cluster_qvotec_check_admission(ClusterQvotecAdmissionCheck *out)
+{
+	ut_storage_admission_reads++;
+	if (ut_storage_admission_override && ut_storage_admission_reads >= ut_storage_admission_after) {
+		*out = ut_storage_admission;
+		return out->result == CLUSTER_QVOTEC_ADMISSION_ALLOWED;
+	}
+	memset(out, 0, sizeof(*out));
+	out->result
+		= ut_qvotec_quorum ? CLUSTER_QVOTEC_ADMISSION_ALLOWED : CLUSTER_QVOTEC_ADMISSION_DB_STATE;
+	return ut_qvotec_quorum;
+}
+/* The real managed boot/continuity owner is exercised by authority_storage;
+ * this boundary fixture supplies only the same-sample result to GRD. */
+bool
+cluster_authority_serving_admission_current_v1(const ClusterQvotecAdmissionCheck *check,
+											   bool *pending)
+{
+	*pending = check->result == CLUSTER_QVOTEC_ADMISSION_STORAGE
+			   && check->storage.result == CLUSTER_STORAGE_CHECK_UNSTABLE
+			   && (check->storage.snapshot_stop == CLUSTER_STORAGE_SNAPSHOT_DEADLINE
+				   || check->storage.snapshot_stop == CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT);
+	return check->result == CLUSTER_QVOTEC_ADMISSION_ALLOWED;
+}
+
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
@@ -6084,6 +6122,116 @@ pi_ready_finish(void)
 	finish_recovery_control_fixture();
 }
 
+UT_TEST(test_pi_gate_preserves_exact_pending_without_second_sample)
+{
+	ClusterGrdPiRebuildCutV1 cut;
+	BufferTag tag = { 0 };
+	bool pending;
+
+	for (int cached = 0; cached < 2; cached++) {
+		pi_ready_fixture(&cut);
+		if (!cached)
+			ut_membership_generation += 2;
+		for (int stop = CLUSTER_STORAGE_SNAPSHOT_DEADLINE;
+			 stop <= CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT; stop++) {
+			memset(&ut_storage_admission, 0, sizeof(ut_storage_admission));
+			ut_storage_admission.result = CLUSTER_QVOTEC_ADMISSION_STORAGE;
+			ut_storage_admission.storage.result = CLUSTER_STORAGE_CHECK_UNSTABLE;
+			ut_storage_admission.storage.snapshot_stop = stop;
+			ut_storage_admission_override = true;
+			ut_qvotec_quorum = false;
+			ut_storage_admission_reads = 0;
+			UT_ASSERT(cluster_grd_pi_rebuild_blocked_sample_v1(tag, &pending));
+			UT_ASSERT(pending);
+			UT_ASSERT_EQ(ut_storage_admission_reads, 1);
+			/* A bool caller still refuses. Only a new full observation can
+			 * make progress; the pending sample exports no authority. */
+			UT_ASSERT(cluster_grd_pi_rebuild_blocked_v1(tag));
+			ut_storage_admission_override = false;
+			ut_qvotec_quorum = true;
+			UT_ASSERT(!cluster_grd_pi_rebuild_blocked_sample_v1(tag, &pending));
+			UT_ASSERT(!pending);
+		}
+		pi_ready_finish();
+	}
+}
+
+UT_TEST(test_pi_gate_never_retries_known_loss_or_bad_clock_as_storage_wait)
+{
+	ClusterGrdPiRebuildCutV1 cut;
+	BufferTag tag = { 0 };
+	bool pending;
+
+	for (int variant = 0; variant < 6; variant++) {
+		pi_ready_fixture(&cut);
+		memset(&ut_storage_admission, 0, sizeof(ut_storage_admission));
+		ut_storage_admission.result = CLUSTER_QVOTEC_ADMISSION_STORAGE;
+		ut_storage_admission.storage.result = CLUSTER_STORAGE_CHECK_UNSTABLE;
+		ut_storage_admission.storage.snapshot_stop = CLUSTER_STORAGE_SNAPSHOT_DEADLINE;
+		if (variant == 0)
+			ut_storage_admission.storage.snapshot_stop = CLUSTER_STORAGE_SNAPSHOT_CLOCK_UNAVAILABLE;
+		else if (variant == 1)
+			ut_storage_admission.storage.snapshot_stop = CLUSTER_STORAGE_SNAPSHOT_CLOCK_REGRESSED;
+		else if (variant == 2)
+			ut_storage_admission.result = CLUSTER_QVOTEC_ADMISSION_LEASE;
+		else if (variant == 3)
+			ut_storage_admission.result = CLUSTER_QVOTEC_ADMISSION_DB_STATE;
+		else if (variant == 4)
+			ut_storage_admission.result = CLUSTER_QVOTEC_ADMISSION_FROZEN;
+		else
+			ut_storage_admission.storage.result = CLUSTER_STORAGE_CHECK_EXPIRED;
+		ut_storage_admission_override = true;
+		ut_qvotec_quorum = false;
+		pending = true;
+		UT_ASSERT(cluster_grd_pi_rebuild_blocked_sample_v1(tag, &pending));
+		UT_ASSERT(!pending);
+		ut_storage_admission_override = false;
+		ut_qvotec_quorum = true;
+		pi_ready_finish();
+	}
+}
+
+UT_TEST(test_pi_gate_carries_the_first_failed_sample_through_nested_checks)
+{
+	ClusterGrdPiRebuildCutV1 cut;
+	BufferTag tag = { 0 };
+	bool pending;
+	unsigned reads;
+
+	pi_ready_fixture(&cut);
+	ut_membership_generation += 2;
+	ut_storage_count_legacy = true;
+	ut_storage_admission_reads = 0;
+	UT_ASSERT(!cluster_grd_pi_rebuild_blocked_sample_v1(tag, &pending));
+	reads = ut_storage_admission_reads;
+	UT_ASSERT(reads > 1);
+	ut_storage_count_legacy = false;
+	pi_ready_finish();
+	for (unsigned at = 1; at <= reads; at++) {
+		for (int lost = 0; lost < 2; lost++) {
+			pi_ready_fixture(&cut);
+			ut_membership_generation += 2;
+			memset(&ut_storage_admission, 0, sizeof(ut_storage_admission));
+			ut_storage_admission.result = CLUSTER_QVOTEC_ADMISSION_STORAGE;
+			ut_storage_admission.storage.result = CLUSTER_STORAGE_CHECK_UNSTABLE;
+			ut_storage_admission.storage.snapshot_stop
+				= lost ? CLUSTER_STORAGE_SNAPSHOT_CLOCK_REGRESSED
+					   : CLUSTER_STORAGE_SNAPSHOT_READ_LIMIT;
+			ut_storage_admission_override = true;
+			ut_storage_admission_after = at;
+			ut_storage_count_legacy = true;
+			ut_storage_admission_reads = 0;
+			UT_ASSERT(cluster_grd_pi_rebuild_blocked_sample_v1(tag, &pending));
+			UT_ASSERT(pending == !lost);
+			UT_ASSERT_EQ(ut_storage_admission_reads, at);
+			ut_storage_admission_override = false;
+			ut_storage_admission_after = 0;
+			ut_storage_count_legacy = false;
+			pi_ready_finish();
+		}
+	}
+}
+
 UT_TEST(test_completed_join_pi_gate_has_constant_cost)
 {
 	ClusterGrdPiRebuildCutV1 cut;
@@ -7610,7 +7758,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(162);
+	UT_PLAN(165);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 	UT_RUN(test_parallel_group_worker_cannot_wait_behind_blocked_ddl);
 	UT_RUN(test_parallel_group_convert_uses_original_holder_group);
@@ -7759,6 +7907,9 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_redeclare_fresh_join_recipient_accepts_only_its_fence);
 	UT_RUN(test_canonical_space_dead_node_returns_grd_to_normal_after_data_recovery);
 	UT_RUN(test_join_protocol_completes_before_local_pi_service_and_new_cut_invalidates);
+	UT_RUN(test_pi_gate_preserves_exact_pending_without_second_sample);
+	UT_RUN(test_pi_gate_never_retries_known_loss_or_bad_clock_as_storage_wait);
+	UT_RUN(test_pi_gate_carries_the_first_failed_sample_through_nested_checks);
 	UT_RUN(test_completed_join_pi_gate_has_constant_cost);
 	UT_RUN(test_completed_join_pi_cache_does_not_acquire_pi_lock);
 	UT_RUN(test_completed_join_pi_cache_invalidates_on_scope_and_original_owners);

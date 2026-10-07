@@ -421,6 +421,7 @@ static bool phase_test_witness_control = false;
 static bool phase_test_grd_authority_ok = true;
 static bool phase_test_lms_recovery_ready_ok = true;
 static uint64 phase_test_lms_generation = 7;
+static uint64 phase_test_self_incarnation = 11;
 static int phase_test_lms_start_calls = 0;
 static int phase_test_lms_pid = 0;
 static uint8 phase_test_formation_epoch = 1;
@@ -558,6 +559,13 @@ cluster_cssd_get_status(void)
 {
 	return phase_test_cssd_status;
 }
+static bool phase_test_cssd_status_busy;
+ClusterCssdStatus
+cluster_cssd_get_status_nowait(bool *busy)
+{
+	*busy = phase_test_cssd_status_busy;
+	return *busy ? CLUSTER_CSSD_STARTING : phase_test_cssd_status;
+}
 pid_t
 cluster_cssd_get_pid(void)
 {
@@ -600,6 +608,21 @@ cluster_qvotec_in_quorum(void)
 	if (phase4_quorum_check_calls == 1)
 		record_phase4_event('V');
 	return phase4_test_in_quorum;
+}
+
+bool
+cluster_qvotec_check_admission(ClusterQvotecAdmissionCheck *out)
+{
+	bool allowed = cluster_qvotec_in_quorum();
+
+	memset(out, 0, sizeof(*out));
+	out->result = allowed ? CLUSTER_QVOTEC_ADMISSION_ALLOWED : CLUSTER_QVOTEC_ADMISSION_DB_STATE;
+	if (allowed) {
+		out->continuity.quorum_generation = 1;
+		out->continuity.storage_generation = 1;
+		out->continuity_valid = true;
+	}
+	return allowed;
 }
 
 uint16
@@ -734,7 +757,7 @@ cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
-	return 11;
+	return phase_test_self_incarnation;
 }
 
 uint64
@@ -1027,6 +1050,7 @@ reset_phase_service_fixture(bool formed_registry)
 	phase_test_grd_authority_ok = true;
 	phase_test_lms_recovery_ready_ok = true;
 	phase_test_lms_generation = 7;
+	phase_test_self_incarnation = 11;
 	phase_test_lms_start_calls = 0;
 	phase_test_lms_pid = 0;
 	phase_test_formation_epoch = 1;
@@ -1580,10 +1604,12 @@ UT_TEST(test_rf_a2_serving_does_not_consume_recovery_duty_cache)
 UT_TEST(test_authority_clear_reports_original_identity_once_outside_lock)
 {
 	reset_phase_service_fixture(true);
+	/* Shared configuration is fixed before the boot binds authority. */
+	cluster_shared_config = true;
+	test_mount_result = CLUSTER_CONFIG_MOUNT_MATCH;
 	cluster_run_startup_sequence();
 	cluster_run_phase4_sequence();
 	UT_ASSERT(cluster_serving_ready_is_current());
-	cluster_shared_config = true;
 	phase_lwlock_depth = 0;
 	authority_clear_logs = 0;
 	authority_clear_under_lock = false;
@@ -1623,10 +1649,12 @@ static void
 setup_survivor_protocol_fixture(void)
 {
 	reset_phase_service_fixture(true);
+	/* Shared configuration is fixed before the boot binds authority. */
+	cluster_shared_config = true;
+	test_mount_result = CLUSTER_CONFIG_MOUNT_MATCH;
 	cluster_run_startup_sequence();
 	cluster_run_phase4_sequence();
 	UT_ASSERT(cluster_serving_ready_is_current());
-	cluster_shared_config = true;
 	phase_test_formation_epoch = 2;
 	phase_test_episode_epoch = 2;
 	phase_test_grd_authority_ok = false;
@@ -1780,9 +1808,9 @@ UT_TEST(test_pre2_survivor_reconstruction_rechecks_event)
 UT_TEST(test_static_common_blocks_serving_without_destroying_recovery)
 {
 	reset_phase_service_fixture(true);
+	cluster_shared_config = true;
 	cluster_run_startup_sequence();
 	cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
-	cluster_shared_config = true;
 	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_RECOVERY_READY);
 	test_mount_result = CLUSTER_CONFIG_MOUNT_UNPROVEN;
 	UT_ASSERT(!cluster_authority_readiness_publish_serving());
@@ -1841,7 +1869,10 @@ UT_TEST(test_pre2_startup_cf_x_needs_sealed_owner)
 	cf.lockmethodid = DEFAULT_LOCKMETHOD;
 	UT_ASSERT(!cluster_recovery_authority_resid_mode_allowed(&cf, ExclusiveLock));
 	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	/* Exercise the distinct shared boot, without changing a live GUC. */
+	reset_phase_service_fixture(true);
 	cluster_shared_config = true;
+	cluster_run_startup_sequence();
 	phase_test_control_acquire_ready = true;
 	UT_ASSERT(cluster_recovery_authority_resid_mode_allowed(&cf, ExclusiveLock));
 	UT_ASSERT(cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
@@ -1868,8 +1899,8 @@ UT_TEST(test_config_lmon_can_read_before_startup_and_cannot_write)
 	static PGPROC lmon_proc;
 
 	reset_phase_service_fixture(true);
-	cluster_run_startup_sequence();
 	cluster_shared_config = true;
+	cluster_run_startup_sequence();
 	phase_test_control_acquire_ready = true;
 	IsUnderPostmaster = true;
 	MyBackendType = B_LMON;
@@ -1921,8 +1952,8 @@ UT_TEST(test_native_initializer_walr_share_nowait_reaches_all_startup_gates)
 	static PGPROC startup_proc;
 
 	reset_phase_service_fixture(true);
-	cluster_run_startup_sequence();
 	cluster_shared_config = true;
+	cluster_run_startup_sequence();
 	phase_test_control_acquire_ready = true;
 	IsUnderPostmaster = true;
 	MyBackendType = B_STARTUP;
@@ -1955,8 +1986,8 @@ UT_TEST(test_native_initializer_walr_share_cannot_borrow_another_role_or_generat
 	static PGPROC startup_proc;
 
 	reset_phase_service_fixture(true);
-	cluster_run_startup_sequence();
 	cluster_shared_config = true;
+	cluster_run_startup_sequence();
 	phase_test_control_acquire_ready = true;
 	IsUnderPostmaster = true;
 	MyBackendType = B_STARTUP;
@@ -1996,8 +2027,8 @@ UT_TEST(test_slow_startup_control_crosses_remote_master_phase4)
 		LOCKMODE mode = kind % 2 == 0 ? ShareLock : ExclusiveLock;
 
 		reset_phase_service_fixture(true);
-		cluster_run_startup_sequence();
 		cluster_shared_config = true;
+		cluster_run_startup_sequence();
 		phase_test_control_acquire_ready = true;
 		resid.type = kind < 2 ? CLUSTER_CF_RESID_TYPE : CLUSTER_WAL_RETENTION_RESID_TYPE;
 		resid.field1 = kind < 2 ? 0 : 4;
@@ -2040,8 +2071,8 @@ UT_TEST(test_phase4_startup_control_keeps_identity_and_namespace_refusals)
 		ClusterGrdGrantIdentity grant
 			= { .mode = ShareLock, .request_opcode = GES_REQ_OPCODE_REQUEST_NOWAIT };
 		reset_phase_service_fixture(true);
-		cluster_run_startup_sequence();
 		cluster_shared_config = true;
+		cluster_run_startup_sequence();
 		phase_test_control_acquire_ready = true;
 		cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
 		switch (variant) {
@@ -2099,8 +2130,8 @@ UT_TEST(test_expired_cache_refuses_control_without_destroying_refresh_identity)
 	ClusterResId cf = { .type = CLUSTER_CF_RESID_TYPE, .lockmethodid = DEFAULT_LOCKMETHOD };
 
 	reset_phase_service_fixture(true);
-	cluster_run_startup_sequence();
 	cluster_shared_config = true;
+	cluster_run_startup_sequence();
 	phase_test_control_acquire_ready = true;
 	phase_test_fence_cache_expired = true;
 	UT_ASSERT(!cluster_recovery_authority_is_current());
@@ -2119,8 +2150,8 @@ UT_TEST(test_startup_refresh_requires_exact_owner_and_fresh_unchanged_proof)
 	static PGPROC startup_proc;
 
 	reset_phase_service_fixture(true);
-	cluster_run_startup_sequence();
 	cluster_shared_config = true;
+	cluster_run_startup_sequence();
 	phase_test_control_acquire_ready = true;
 	IsUnderPostmaster = true;
 	MyBackendType = B_STARTUP;
@@ -2161,8 +2192,8 @@ UT_TEST(test_config_read_crosses_real_s1_and_ges_admission_before_serving)
 	static PGPROC lmon_proc;
 
 	reset_phase_service_fixture(true);
-	cluster_run_startup_sequence();
 	cluster_shared_config = true;
+	cluster_run_startup_sequence();
 	phase_test_control_acquire_ready = true;
 	IsUnderPostmaster = true;
 	MyBackendType = B_LMON;
@@ -2217,8 +2248,8 @@ UT_TEST(test_pre2_startup_cf_x_cannot_use_components_only)
 	ClusterFormationSnapshotV1 formation = { 0 };
 
 	reset_phase_service_fixture(true);
-	cluster_run_startup_sequence();
 	cluster_shared_config = true;
+	cluster_run_startup_sequence();
 	phase_test_control_acquire_ready = true;
 	cf.type = CLUSTER_CF_RESID_TYPE;
 	cf.lockmethodid = DEFAULT_LOCKMETHOD;
@@ -2580,8 +2611,8 @@ UT_TEST(test_shared_phase4_waits_for_actual_semantic_open)
 	phase_lwlock_conditional_result = true;
 	cluster_allow_single_node = false;
 	cluster_voting_disks = "disk1,disk2,disk3";
-	cluster_run_startup_sequence();
 	cluster_shared_config = true;
+	cluster_run_startup_sequence();
 	test_mount_result = CLUSTER_CONFIG_MOUNT_MATCH;
 	phase_test_control_acquire_ready = true;
 	phase_test_semantic_ready_after = 3;
@@ -2610,8 +2641,8 @@ UT_TEST(test_shared_phase4_cannot_publish_running_without_semantic_open)
 	phase_lwlock_conditional_result = true;
 	cluster_allow_single_node = false;
 	cluster_voting_disks = "disk1,disk2,disk3";
-	cluster_run_startup_sequence();
 	cluster_shared_config = true;
+	cluster_run_startup_sequence();
 	test_mount_result = CLUSTER_CONFIG_MOUNT_MATCH;
 	phase_test_control_acquire_ready = true;
 	phase_test_semantic_ready_after = 0;

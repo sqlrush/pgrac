@@ -65,6 +65,7 @@ BackendType MyBackendType = B_LMON;
 #include "cluster/cluster_ges_mode.h"	 /* spec-5.1b — frozen matrix + convert classification */
 #include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_hw.h"				 /* spec-4.6a HW remaster watchdog stubs */
 #include "cluster/cluster_lmd.h"			 /* spec-5.8 D1b — WFG vertex + submit/cancel edge */
 #include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — ReconfigEvent stub type */
@@ -1042,6 +1043,20 @@ cluster_membership_get_last_admitted_incarnation(int32 node_id pg_attribute_unus
 bool
 cluster_qvotec_in_quorum(void)
 {
+	return false;
+}
+bool
+cluster_authority_serving_admission_current_v1(const ClusterQvotecAdmissionCheck *check,
+											   bool *pending)
+{
+	*pending = false;
+	return false;
+}
+bool
+cluster_qvotec_check_admission(ClusterQvotecAdmissionCheck *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->result = CLUSTER_QVOTEC_ADMISSION_NO_SHMEM;
 	return false;
 }
 

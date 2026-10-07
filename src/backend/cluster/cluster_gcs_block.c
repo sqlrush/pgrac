@@ -9316,6 +9316,7 @@ gcs_block_resource_x_gate_session_snapshot_result(const BufferTag *tag,
 	PcmXSessionAuthResult session_result;
 	uint64 master_session = 0;
 	int32 master_node;
+	bool storage_pending = false;
 
 	if (gate_out != NULL)
 		memset(gate_out, 0, sizeof(*gate_out));
@@ -9327,13 +9328,15 @@ gcs_block_resource_x_gate_session_snapshot_result(const BufferTag *tag,
 		|| gate.phase != RESOURCE_X_GATE_OPEN)
 		return PCM_X_SESSION_AUTH_INVALID;
 	master_node = cluster_gcs_lookup_master(*tag);
-	if (master_node < 0 || master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-		|| cluster_grd_pi_rebuild_blocked_v1(*tag))
+	if (master_node < 0 || master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
 		return PCM_X_SESSION_AUTH_INVALID;
 	if (gate_out != NULL)
 		*gate_out = gate;
 	if (master_node_out != NULL)
 		*master_node_out = master_node;
+	if (cluster_grd_pi_rebuild_blocked_sample_v1(*tag, &storage_pending))
+		return storage_pending ? PCM_X_SESSION_AUTH_ADMISSION_NOT_READY
+							   : PCM_X_SESSION_AUTH_INVALID;
 	session_result = gcs_block_pcm_x_authenticated_session_result(
 		master_node, cluster_epoch_get_current(), &master_session, NULL);
 	if (session_result != PCM_X_SESSION_AUTH_OK)
@@ -14526,6 +14529,10 @@ gcs_block_resource_x_target_acquire_internal_trace_impl(
 				}
 
 			preflight_membership_wait:
+				if (!cluster_semantic_activation_recheck(&admission)) {
+					result = RESOURCE_X_APPLY_STALE;
+					break;
+				}
 				diagnostic_stage = "preflight-membership-wait";
 				gcs_block_resource_x_requester_wait_note(&wait_diagnostic, PCM_RX_WAIT_PREFLIGHT);
 				now_us = gcs_block_pcm_x_monotonic_us();

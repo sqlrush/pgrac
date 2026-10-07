@@ -581,7 +581,8 @@ typedef enum PcmXSessionAuthResult {
 	PCM_X_SESSION_AUTH_FRESH_NOT_READY,
 	PCM_X_SESSION_AUTH_SLOT_TORN,
 	PCM_X_SESSION_AUTH_EPOCH_TORN,
-	PCM_X_SESSION_AUTH_CONNECTION_TORN
+	PCM_X_SESSION_AUTH_CONNECTION_TORN,
+	PCM_X_SESSION_AUTH_ADMISSION_NOT_READY
 } PcmXSessionAuthResult;
 
 static inline PcmXSessionAuthResult
@@ -621,8 +622,9 @@ cluster_gcs_pcm_x_auth_sample_classify(const ClusterGcsPcmXAuthSample *sample,
 static inline bool
 cluster_gcs_pcm_x_auth_result_retryable(PcmXSessionAuthResult result)
 {
-	return result >= PCM_X_SESSION_AUTH_CONNECTION_NOT_READY
-		   && result <= PCM_X_SESSION_AUTH_CONNECTION_TORN;
+	return (result >= PCM_X_SESSION_AUTH_CONNECTION_NOT_READY
+			&& result <= PCM_X_SESSION_AUTH_CONNECTION_TORN)
+		   || result == PCM_X_SESSION_AUTH_ADMISSION_NOT_READY;
 }
 
 /* ============================================================
