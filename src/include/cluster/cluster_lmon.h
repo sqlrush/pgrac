@@ -162,6 +162,11 @@ typedef struct ClusterLmonSharedState {
 	 * at >= 1 Hz (cluster.ic_duty_lazy = off restores run-every-iteration).
 	 */
 	pg_atomic_uint32 lazy_duty_dirty;
+	/* Passive INSTR_TIME clock samples; a started duty is not a completion. */
+	pg_atomic_uint64 diagnostic_duty_started_mono_us;
+	pg_atomic_uint64 diagnostic_duty_finished_mono_us;
+	pg_atomic_uint64 diagnostic_dispatch_started_mono_us;
+	pg_atomic_uint64 diagnostic_dispatch_finished_mono_us;
 } ClusterLmonSharedState;
 
 /*

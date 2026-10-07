@@ -106,6 +106,7 @@ storage_quorum_notify(uint64 handle, uint32 quorate, StorageCorosyncRing ring, u
 {
 	if (handle != storage_quorum_handle)
 		return;
+	cluster_storage_quorum_note_notification(true, ring.node, ring.sequence);
 	(void)cluster_storage_quorum_decode_component(&storage_notified, ring.node, ring.sequence,
 												  quorate, members, count, storage_local_id,
 												  cluster_node_id, storage_node_map);
@@ -123,6 +124,7 @@ storage_members_notify(uint64 handle, StorageCorosyncRing ring, uint32 count, co
 {
 	if (handle != storage_quorum_handle)
 		return;
+	cluster_storage_quorum_note_notification(false, ring.node, ring.sequence);
 	(void)cluster_storage_quorum_decode_component(
 		&storage_members_notified, ring.node, ring.sequence, 1, members, count, storage_local_id,
 		cluster_node_id, storage_node_map);

@@ -20,7 +20,25 @@
 #include "cluster/cluster_conf.h"
 #include "port/atomics.h"
 
-#define CLUSTER_STORAGE_QUORUM_STATE_BYTES 64
+/* Volatile observation suffix; not part of the authority view or disk ABI. */
+typedef enum ClusterStorageDiagnosticField {
+	CLUSTER_STORAGE_DIAG_STARTED,
+	CLUSTER_STORAGE_DIAG_FINISHED,
+	CLUSTER_STORAGE_DIAG_RESULT,
+	CLUSTER_STORAGE_DIAG_OUTCOME,
+	CLUSTER_STORAGE_DIAG_QUORUM_NOTIFY,
+	CLUSTER_STORAGE_DIAG_MEMBERS_NOTIFY,
+	CLUSTER_STORAGE_DIAG_QUORUM_RING,
+	CLUSTER_STORAGE_DIAG_MEMBERS_RING,
+	CLUSTER_STORAGE_DIAG_QUORUM_NODE,
+	CLUSTER_STORAGE_DIAG_MEMBERS_NODE,
+	CLUSTER_STORAGE_DIAG_QUORUM_COUNT,
+	CLUSTER_STORAGE_DIAG_MEMBERS_COUNT,
+	CLUSTER_STORAGE_DIAG_FIELDS
+} ClusterStorageDiagnosticField;
+
+#define CLUSTER_STORAGE_QUORUM_STATE_BYTES                                                         \
+	(64 + CLUSTER_STORAGE_DIAG_FIELDS * sizeof(pg_atomic_uint64))
 
 typedef enum ClusterStorageQuorumReason {
 	CLUSTER_STORAGE_QUORUM_UNAVAILABLE = 0,
@@ -76,6 +94,7 @@ typedef struct ClusterStorageQuorumState {
 	pg_atomic_uint64 sampled_us;
 	pg_atomic_uint64 expires_us;
 	pg_atomic_uint64 generation;
+	pg_atomic_uint64 diagnostic[CLUSTER_STORAGE_DIAG_FIELDS];
 } ClusterStorageQuorumState;
 
 StaticAssertDecl(sizeof(ClusterStorageQuorumState) == CLUSTER_STORAGE_QUORUM_STATE_BYTES,
@@ -126,6 +145,10 @@ extern bool cluster_storage_quorum_allows_node(int node_id);
 extern bool cluster_storage_quorum_check_node(int node_id, ClusterStorageQuorumCheck *out);
 extern bool cluster_storage_quorum_allows_members(uint64 members_lo, uint64 members_hi);
 extern void cluster_storage_corosync_sample(ClusterStorageQuorumView *out);
+/* Passive diagnostics never invoke the provider, wait, or supply permission. */
+extern void cluster_storage_quorum_diagnostic_format(char *out, size_t size);
+extern void cluster_storage_quorum_note_notification(bool quorum, uint32 ring_node,
+													 uint64 ring_sequence);
 extern void cluster_storage_quorum_check_sql(void);
 extern void cluster_storage_quorum_check_interrupts(void);
 

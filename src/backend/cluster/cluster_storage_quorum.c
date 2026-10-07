@@ -164,6 +164,8 @@ cluster_storage_quorum_attach(ClusterStorageQuorumState *state, bool initialize)
 	pg_atomic_init_u64(&state->sampled_us, 0);
 	pg_atomic_init_u64(&state->expires_us, 0);
 	pg_atomic_init_u64(&state->generation, 0);
+	for (int i = 0; i < CLUSTER_STORAGE_DIAG_FIELDS; i++)
+		pg_atomic_init_u64(&state->diagnostic[i], 0);
 }
 
 /*
@@ -181,8 +183,15 @@ cluster_storage_quorum_refresh(uint64 now_us, uint64 duration_us)
 
 	if (!cluster_shared_config || storage_state == NULL)
 		return;
+	/* Independent diagnostic fields: OUTCOME=0 and FINISHED=0 mean in flight.
+	 * None of these timestamps participate in a lease or continuity check. */
+	pg_atomic_write_u64(&storage_state->diagnostic[CLUSTER_STORAGE_DIAG_OUTCOME], 0);
+	pg_atomic_write_u64(&storage_state->diagnostic[CLUSTER_STORAGE_DIAG_FINISHED], 0);
+	pg_atomic_write_u64(&storage_state->diagnostic[CLUSTER_STORAGE_DIAG_STARTED], now_us);
 	memset(&view, 0, sizeof(view));
 	cluster_storage_corosync_sample(&view);
+	pg_atomic_write_u64(&storage_state->diagnostic[CLUSTER_STORAGE_DIAG_RESULT],
+						((uint64)view.provider_diagnostic << 32) | (uint32)view.reason);
 	generation = pg_atomic_read_u64(&storage_state->generation);
 	if (now_us == 0 || duration_us == 0 || now_us > UINT64_MAX - duration_us
 		|| generation == UINT64_MAX)
@@ -199,8 +208,12 @@ cluster_storage_quorum_refresh(uint64 now_us, uint64 duration_us)
 			&& now_us >= current.sampled_us && now_us < current.expires_us
 			&& ((view.members[0] == 0 && view.members[1] == 0)
 				|| ((current.members[0] & ~view.members[0]) == 0
-					&& (current.members[1] & ~view.members[1]) == 0)))
+					&& (current.members[1] & ~view.members[1]) == 0))) {
+			pg_atomic_write_u64(&storage_state->diagnostic[CLUSTER_STORAGE_DIAG_OUTCOME], 2);
+			pg_atomic_write_u64(&storage_state->diagnostic[CLUSTER_STORAGE_DIAG_FINISHED],
+								cluster_storage_quorum_now_us());
 			return;
+		}
 	}
 	if (view.reason != CLUSTER_STORAGE_QUORUM_READY) {
 		view.members[0] = view.members[1] = 0;
@@ -224,6 +237,84 @@ cluster_storage_quorum_refresh(uint64 now_us, uint64 duration_us)
 						generation == UINT64_MAX ? generation : generation + 1);
 	pg_write_barrier();
 	pg_atomic_fetch_add_u32(&storage_state->sequence, 1);
+	pg_atomic_write_u64(&storage_state->diagnostic[CLUSTER_STORAGE_DIAG_OUTCOME], 1);
+	pg_atomic_write_u64(&storage_state->diagnostic[CLUSTER_STORAGE_DIAG_FINISHED],
+						cluster_storage_quorum_now_us());
+}
+
+/* Record an original libquorum callback, never a Corosync token receipt.
+ * The poll owner alone writes this diagnostic suffix. Author: SqlRush <sqlrush@gmail.com> */
+void
+cluster_storage_quorum_note_notification(bool quorum, uint32 ring_node, uint64 ring_sequence)
+{
+	int time_field
+		= quorum ? CLUSTER_STORAGE_DIAG_QUORUM_NOTIFY : CLUSTER_STORAGE_DIAG_MEMBERS_NOTIFY;
+	int ring_field = quorum ? CLUSTER_STORAGE_DIAG_QUORUM_RING : CLUSTER_STORAGE_DIAG_MEMBERS_RING;
+	int node_field = quorum ? CLUSTER_STORAGE_DIAG_QUORUM_NODE : CLUSTER_STORAGE_DIAG_MEMBERS_NODE;
+	int count_field
+		= quorum ? CLUSTER_STORAGE_DIAG_QUORUM_COUNT : CLUSTER_STORAGE_DIAG_MEMBERS_COUNT;
+
+	if (storage_state == NULL)
+		return;
+	pg_atomic_write_u64(&storage_state->diagnostic[time_field], cluster_storage_quorum_now_us());
+	pg_atomic_write_u64(&storage_state->diagnostic[ring_field], ring_sequence);
+	pg_atomic_write_u64(&storage_state->diagnostic[node_field], ring_node);
+	pg_atomic_fetch_add_u64(&storage_state->diagnostic[count_field], 1);
+}
+
+/* Bounded, passive evidence: one attempt, no retry/clock/lock/provider call.
+ * A torn view is explicitly unknown, not loss of eligibility. The suffix
+ * fields are independent observations, not an atomic tuple or permission.
+ * Author: SqlRush <sqlrush@gmail.com> */
+void
+cluster_storage_quorum_diagnostic_format(char *out, size_t size)
+{
+	ClusterStorageQuorumView view = { 0 };
+	uint64 diag[CLUSTER_STORAGE_DIAG_FIELDS] = { 0 };
+	uint32 before = 0, after = 0;
+	bool stable = false;
+
+	if (storage_state != NULL) {
+		before = pg_atomic_read_u32(&storage_state->sequence);
+		if ((before & 1) == 0) {
+			pg_read_barrier();
+			view.reason = pg_atomic_read_u32(&storage_state->reason);
+			view.ring_node = pg_atomic_read_u32(&storage_state->ring_node);
+			view.ring_sequence = pg_atomic_read_u64(&storage_state->ring_sequence);
+			view.members[0] = pg_atomic_read_u64(&storage_state->members[0]);
+			view.members[1] = pg_atomic_read_u64(&storage_state->members[1]);
+			view.sampled_us = pg_atomic_read_u64(&storage_state->sampled_us);
+			view.expires_us = pg_atomic_read_u64(&storage_state->expires_us);
+			view.generation = pg_atomic_read_u64(&storage_state->generation);
+			pg_read_barrier();
+			after = pg_atomic_read_u32(&storage_state->sequence);
+			stable = before == after;
+		} else
+			after = before;
+		if (!stable)
+			memset(&view, 0, sizeof(view));
+		for (int i = 0; i < CLUSTER_STORAGE_DIAG_FIELDS; i++)
+			diag[i] = pg_atomic_read_u64(&storage_state->diagnostic[i]);
+	}
+#define DIAG_VALUE(field) (unsigned long long)diag[CLUSTER_STORAGE_DIAG_##field]
+	snprintf(out, size,
+			 "storage_view_stable=%d storage_seq=%u/%u reason=%u generation=%llu loss=unobserved "
+			 "ring=%u/%llu members=%016llx/%016llx clock_storage=MONOTONIC "
+			 "sampled_mono_us=%llu expiry_mono_us=%llu sample_started_mono_us=%llu "
+			 "sample_finished_mono_us=%llu raw_reason=%u raw_provider=%u sample_outcome=%llu "
+			 "quorum_callback_mono_us=%llu members_callback_mono_us=%llu "
+			 "quorum_callback_ring=%llu/%llu members_callback_ring=%llu/%llu "
+			 "quorum_callback_count=%llu members_callback_count=%llu token_rx=unobserved",
+			 stable, before, after, (unsigned)view.reason, (unsigned long long)view.generation,
+			 view.ring_node, (unsigned long long)view.ring_sequence,
+			 (unsigned long long)view.members[0], (unsigned long long)view.members[1],
+			 (unsigned long long)view.sampled_us, (unsigned long long)view.expires_us,
+			 DIAG_VALUE(STARTED), DIAG_VALUE(FINISHED), (uint32)diag[CLUSTER_STORAGE_DIAG_RESULT],
+			 (uint32)(diag[CLUSTER_STORAGE_DIAG_RESULT] >> 32), DIAG_VALUE(OUTCOME),
+			 DIAG_VALUE(QUORUM_NOTIFY), DIAG_VALUE(MEMBERS_NOTIFY), DIAG_VALUE(QUORUM_NODE),
+			 DIAG_VALUE(QUORUM_RING), DIAG_VALUE(MEMBERS_NODE), DIAG_VALUE(MEMBERS_RING),
+			 DIAG_VALUE(QUORUM_COUNT), DIAG_VALUE(MEMBERS_COUNT));
+#undef DIAG_VALUE
 }
 
 /* Obtain one stable view. The expiry is never extended by readers. */

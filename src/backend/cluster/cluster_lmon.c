@@ -107,6 +107,9 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_storage_quorum.h"
 #include "cluster/cluster_shmem.h"
 
 
@@ -200,6 +203,10 @@ cluster_lmon_shmem_init(void)
 		LWLockInitialize(&cluster_lmon_state->lwlock, LWTRANCHE_CLUSTER_LMON);
 		cluster_lmon_state->status = CLUSTER_LMON_NOT_STARTED;
 		pg_atomic_init_u32(&cluster_lmon_state->lazy_duty_dirty, 0);
+		pg_atomic_init_u64(&cluster_lmon_state->diagnostic_duty_started_mono_us, 0);
+		pg_atomic_init_u64(&cluster_lmon_state->diagnostic_duty_finished_mono_us, 0);
+		pg_atomic_init_u64(&cluster_lmon_state->diagnostic_dispatch_started_mono_us, 0);
+		pg_atomic_init_u64(&cluster_lmon_state->diagnostic_dispatch_finished_mono_us, 0);
 	}
 
 	/*
@@ -1012,6 +1019,10 @@ lmon_publish_status(ClusterLmonStatus status)
 		cluster_lmon_state->slow_iter_count = 0;
 		cluster_lmon_state->timed_duty_sample_count = 0;
 		cluster_lmon_state->total_iter_us = 0;
+		pg_atomic_write_u64(&cluster_lmon_state->diagnostic_duty_started_mono_us, 0);
+		pg_atomic_write_u64(&cluster_lmon_state->diagnostic_duty_finished_mono_us, 0);
+		pg_atomic_write_u64(&cluster_lmon_state->diagnostic_dispatch_started_mono_us, 0);
+		pg_atomic_write_u64(&cluster_lmon_state->diagnostic_dispatch_finished_mono_us, 0);
 		cluster_lmon_state->lmon_latch = NULL;
 	} else if (status == CLUSTER_LMON_READY) {
 		cluster_lmon_state->ready_at = now;
@@ -1078,6 +1089,8 @@ lmon_record_iteration(instr_time iter_started_at)
 	static TimestampTz last_slow_log_at = 0;
 
 	INSTR_TIME_SET_CURRENT(iter_finished_at);
+	pg_atomic_write_u64(&cluster_lmon_state->diagnostic_duty_finished_mono_us,
+						INSTR_TIME_GET_MICROSEC(iter_finished_at));
 	INSTR_TIME_SUBTRACT(iter_finished_at, iter_started_at);
 	elapsed_us = (uint64)INSTR_TIME_GET_MICROSEC(iter_finished_at);
 	now = GetCurrentTimestamp();
@@ -1175,10 +1188,84 @@ cluster_lmon_normal_stop_poll(void)
 	return lmon_normal_stop_observe(false);
 }
 
+/* Read-only S17 timeline on the existing one-second stop diagnostic cadence.
+ * Inputs: original aggregate and final-observation flag. No provider, queue,
+ * admission, disk or lock operation; fields are evidence, never permission.
+ * Heartbeat DONE counters omit queued-tail completions; recv time includes
+ * stale-epoch liveness, unlike the verified receive count. Neither implies a
+ * Corosync token receipt. Author: SqlRush <sqlrush@gmail.com> */
+static void
+lmon_normal_stop_diagnostic(bool final, ClusterNormalStopPollResult result)
+{
+	static TimestampTz last_log;
+	TimestampTz now;
+	instr_time observed;
+	char qvotec[1024];
+	char storage[1536];
+
+	if (!cluster_normal_stop_requested() || cluster_lmon_state == NULL)
+		return;
+	now = GetCurrentTimestamp();
+	if (!final && last_log != 0 && now >= last_log && now - last_log < INT64CONST(1000000))
+		return;
+	last_log = now;
+	INSTR_TIME_SET_CURRENT(observed);
+	cluster_qvotec_diagnostic_format(qvotec, sizeof(qvotec));
+	cluster_storage_quorum_diagnostic_format(storage, sizeof(storage));
+	ereport(LOG, (errmsg_internal("LMON normal-stop control timeline"),
+				  errdetail(
+					  "node=%d pid=%d procno=%d incarnation=%llu epoch=%llu stop_result=%d "
+					  "observed_pg_us=%lld observed_mono_us=%llu clock_lmon=INSTR_TIME clock_id=%d "
+					  "lmon_duty_started_mono_us=%llu lmon_duty_finished_mono_us=%llu "
+					  "lmon_dispatch_started_mono_us=%llu lmon_dispatch_finished_mono_us=%llu "
+					  "completed_duties=%llu wait_event=%u %s %s",
+					  cluster_node_id, MyProcPid, MyProc != NULL ? MyProc->pgprocno : -1,
+					  (unsigned long long)cluster_qvotec_get_self_incarnation(),
+					  (unsigned long long)cluster_epoch_get_current(), result, (long long)now,
+					  (unsigned long long)INSTR_TIME_GET_MICROSEC(observed), (int)PG_INSTR_CLOCK,
+					  (unsigned long long)pg_atomic_read_u64(
+						  &cluster_lmon_state->diagnostic_duty_started_mono_us),
+					  (unsigned long long)pg_atomic_read_u64(
+						  &cluster_lmon_state->diagnostic_duty_finished_mono_us),
+					  (unsigned long long)pg_atomic_read_u64(
+						  &cluster_lmon_state->diagnostic_dispatch_started_mono_us),
+					  (unsigned long long)pg_atomic_read_u64(
+						  &cluster_lmon_state->diagnostic_dispatch_finished_mono_us),
+					  (unsigned long long)cluster_lmon_state->timed_duty_sample_count,
+					  MyProc != NULL ? MyProc->wait_event_info : 0, qvotec, storage)));
+	for (int peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		const ClusterICPeerStateShmem *p = cluster_ic_tier1_peer_get(peer);
+
+		if (peer == cluster_node_id || p == NULL || cluster_conf_lookup_node(peer) == NULL)
+			continue;
+		ereport(LOG,
+				(errmsg_internal("LMON normal-stop tier1 CONTROL heartbeat timeline"),
+				 errdetail(
+					 "node=%d pid=%d peer=%d state=%d observed_pg_us=%lld "
+					 "hb_tx_done_calls=%llu hb_tx_done_pg_us=%lld "
+					 "hb_rx_verified=%llu hb_rx_liveness_pg_us=%lld "
+					 "transport_tx_bytes=%llu transport_rx_bytes=%llu "
+					 "hb_queued_completion=unobserved clock_heartbeat=wall token_rx=unobserved",
+					 cluster_node_id, MyProcPid, peer, p->state, (long long)now,
+					 (unsigned long long)pg_atomic_read_u64(
+						 (pg_atomic_uint64 *)&p->heartbeat_send_count),
+					 (long long)p->last_heartbeat_sent_at,
+					 (unsigned long long)pg_atomic_read_u64(
+						 (pg_atomic_uint64 *)&p->heartbeat_recv_count),
+					 (long long)p->last_heartbeat_recv_at,
+					 (unsigned long long)pg_atomic_read_u64((pg_atomic_uint64 *)&p->bytes_send),
+					 (unsigned long long)pg_atomic_read_u64((pg_atomic_uint64 *)&p->bytes_recv))));
+	}
+}
+
 static ClusterNormalStopPollResult
 lmon_normal_stop_idle(void)
 {
-	return cluster_normal_stop_service_idle(cluster_lmon_normal_stop_poll());
+	ClusterNormalStopPollResult result
+		= cluster_normal_stop_service_idle(cluster_lmon_normal_stop_poll());
+
+	lmon_normal_stop_diagnostic(false, result);
+	return result;
 }
 
 static void
@@ -1208,6 +1295,7 @@ lmon_normal_stop_before_exit(void)
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
 		ereport(FATAL, (errmsg_internal("LMON transport still owns normal-stop work")));
 	}
+	lmon_normal_stop_diagnostic(true, CLUSTER_NORMAL_STOP_READY);
 	lmon_normal_stop_exit_verified = true;
 }
 
@@ -1419,6 +1507,8 @@ LmonMain(void)
 			{
 				duty_started_at = GetCurrentTimestamp();
 				INSTR_TIME_SET_CURRENT(iter_started_at);
+				pg_atomic_write_u64(&cluster_lmon_state->diagnostic_duty_started_mono_us,
+									INSTR_TIME_GET_MICROSEC(iter_started_at));
 
 				/* PGRAC: service-owned control work must progress on latch wake,
 				 * not depend on a client ProcSignal handler. Author: SqlRush <sqlrush@gmail.com> */
@@ -2019,6 +2109,11 @@ LmonMain(void)
 			work_completed = false;
 			PG_TRY();
 			{
+				instr_time dispatch_sample;
+
+				INSTR_TIME_SET_CURRENT(dispatch_sample);
+				pg_atomic_write_u64(&cluster_lmon_state->diagnostic_dispatch_started_mono_us,
+									INSTR_TIME_GET_MICROSEC(dispatch_sample));
 				for (i = 0; i < n_events; i++) {
 					intptr_t tag = (intptr_t)ev[i].user_data;
 
@@ -2183,6 +2278,9 @@ LmonMain(void)
 				/* Dispatch can create outbound replies after the duty drain. */
 				if (cluster_normal_stop_requested())
 					(void)cluster_grd_outbound_lmon_drain_send();
+				INSTR_TIME_SET_CURRENT(dispatch_sample);
+				pg_atomic_write_u64(&cluster_lmon_state->diagnostic_dispatch_finished_mono_us,
+									INSTR_TIME_GET_MICROSEC(dispatch_sample));
 				work_completed = true;
 			}
 			PG_FINALLY();
@@ -2240,6 +2338,8 @@ LmonMain(void)
 			{
 				duty_started_at = GetCurrentTimestamp();
 				INSTR_TIME_SET_CURRENT(iter_started_at);
+				pg_atomic_write_u64(&cluster_lmon_state->diagnostic_duty_started_mono_us,
+									INSTR_TIME_GET_MICROSEC(iter_started_at));
 
 				/* PGRAC: spec-7.2 D1 — >= 1 Hz floor (see the TIER_1 loop). */
 				cluster_cf_retirement_poll();

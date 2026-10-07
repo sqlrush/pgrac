@@ -184,6 +184,10 @@ typedef struct ClusterQvotecShmem {
 	ClusterQvotecPriorExitObservation prior_exit;
 	ClusterStorageQuorumState storage_quorum;
 	pg_atomic_uint64 wakeup_latch;
+	/* Volatile diagnostics, excluded from every permission predicate. */
+	pg_atomic_uint64 diagnostic_cycle_started_mono_us;
+	pg_atomic_uint64 diagnostic_cycle_finished_mono_us;
+	pg_atomic_uint64 diagnostic_phase_started_mono_us;
 } ClusterQvotecShmem;
 
 StaticAssertDecl(sizeof(ClusterQvotecShmem) == CLUSTER_QVOTEC_SHMEM_BYTES,
@@ -278,7 +282,8 @@ typedef enum QvotecDiagnosticPhase {
 	QVOTEC_DIAG_FORMATION,
 	QVOTEC_DIAG_BOOTSTRAP,
 	QVOTEC_DIAG_IDLE,
-	QVOTEC_DIAG_SHUTDOWN
+	QVOTEC_DIAG_SHUTDOWN,
+	QVOTEC_DIAG_STORAGE_QUORUM
 } QvotecDiagnosticPhase;
 
 static const char *const qvotec_diagnostic_phase_names[]
@@ -288,33 +293,40 @@ static const char *const qvotec_diagnostic_phase_names[]
 		"SELF_WRITE",	 "ACK_READBACK",   "STRIPE_SCAN",
 		"STRIPE_SEED",	 "STRIPE_HERD",	   "STATE_PUBLISH",
 		"FORMATION",	 "BOOTSTRAP",	   "IDLE",
-		"SHUTDOWN" };
+		"SHUTDOWN",		 "STORAGE_QUORUM" };
 
 static void
 qvotec_diagnostic_phase_enter(QvotecDiagnosticPhase phase)
 {
 	uint32 seq;
 	uint64 identity;
+	instr_time sampled;
 
 	/* Only the existing poll owner writes; observation cannot drive it. */
 	if (QvotecShmem == NULL || MyBackendType != B_QVOTEC)
 		return;
 	identity = ((uint64)(uint32)MyProcPid << 32)
 			   | (MyProc != NULL ? (uint32)MyProc->pgprocno : UINT32_MAX);
+	INSTR_TIME_SET_CURRENT(sampled);
 	seq = pg_atomic_read_u32(&QvotecShmem->diagnostic_phase_seq);
 	pg_atomic_write_u32(&QvotecShmem->diagnostic_phase_seq, seq | 1u);
 	pg_write_barrier();
 	pg_atomic_write_u64(&QvotecShmem->diagnostic_phase_started_us, (uint64)GetCurrentTimestamp());
+	pg_atomic_write_u64(&QvotecShmem->diagnostic_phase_started_mono_us,
+						INSTR_TIME_GET_MICROSEC(sampled));
 	pg_atomic_write_u64(&QvotecShmem->diagnostic_owner_identity, identity);
 	pg_atomic_write_u32(&QvotecShmem->diagnostic_phase, (uint32)phase);
 	pg_write_barrier();
 	pg_atomic_write_u32(&QvotecShmem->diagnostic_phase_seq, (seq | 1u) + 1u);
 }
 
-static void
-qvotec_diagnostic_format(char *out, size_t size)
+void
+cluster_qvotec_diagnostic_format(char *out, size_t size)
 {
 	uint64 phase_started = 0;
+	uint64 phase_started_mono = 0;
+	uint64 cycle_started_mono = 0;
+	uint64 cycle_finished_mono = 0;
 	uint64 identity = 0;
 	uint64 sampled_now = (uint64)GetCurrentTimestamp();
 	uint64 cycle_started = 0;
@@ -332,6 +344,7 @@ qvotec_diagnostic_format(char *out, size_t size)
 		for (attempt = 0; attempt < 3; attempt++) {
 			uint32 observed_phase;
 			uint64 observed_started;
+			uint64 observed_started_mono;
 			uint64 observed_identity;
 
 			seq = pg_atomic_read_u32(&QvotecShmem->diagnostic_phase_seq);
@@ -340,6 +353,8 @@ qvotec_diagnostic_format(char *out, size_t size)
 			pg_read_barrier();
 			observed_phase = pg_atomic_read_u32(&QvotecShmem->diagnostic_phase);
 			observed_started = pg_atomic_read_u64(&QvotecShmem->diagnostic_phase_started_us);
+			observed_started_mono
+				= pg_atomic_read_u64(&QvotecShmem->diagnostic_phase_started_mono_us);
 			observed_identity = pg_atomic_read_u64(&QvotecShmem->diagnostic_owner_identity);
 			pg_read_barrier();
 			if (seq != pg_atomic_read_u32(&QvotecShmem->diagnostic_phase_seq))
@@ -348,6 +363,7 @@ qvotec_diagnostic_format(char *out, size_t size)
 				&& observed_phase < lengthof(qvotec_diagnostic_phase_names)) {
 				phase = observed_phase;
 				phase_started = observed_started;
+				phase_started_mono = observed_started_mono;
 				identity = observed_identity;
 				stable = true;
 			}
@@ -358,6 +374,8 @@ qvotec_diagnostic_format(char *out, size_t size)
 		cycle_finished = pg_atomic_read_u64(&QvotecShmem->diagnostic_cycle_finished_us);
 		cycle_duration = pg_atomic_read_u64(&QvotecShmem->diagnostic_cycle_duration_us);
 		cycle_count = pg_atomic_read_u32(&QvotecShmem->poll_cycle_count);
+		cycle_started_mono = pg_atomic_read_u64(&QvotecShmem->diagnostic_cycle_started_mono_us);
+		cycle_finished_mono = pg_atomic_read_u64(&QvotecShmem->diagnostic_cycle_finished_mono_us);
 	}
 
 	if (stable && (uint32)(identity >> 32) > 0 && (uint32)(identity >> 32) <= INT_MAX
@@ -382,11 +400,16 @@ qvotec_diagnostic_format(char *out, size_t size)
 			 "owner_snapshot_stable=%d owner_phase=%s owner_phase_started_us=%llu "
 			 "owner_pid=%u owner_procno=%u owner_pid_matches=%d owner_wait_event=%u "
 			 "owner_sampled_us=%llu diag_cycle_started_us=%llu diag_cycle_finished_us=%llu "
-			 "diag_cycle_duration_us=%llu diag_cycle_count=%u",
+			 "diag_cycle_duration_us=%llu diag_cycle_count=%u "
+			 "clock_pg=wall clock_diag=INSTR_TIME clock_id=%d "
+			 "owner_phase_started_mono_us=%llu diag_cycle_started_mono_us=%llu "
+			 "diag_cycle_finished_mono_us=%llu",
 			 stable, qvotec_diagnostic_phase_names[phase], (unsigned long long)phase_started,
 			 (uint32)(identity >> 32), stable ? (uint32)identity : UINT32_MAX, owner_matches,
 			 wait_event, (unsigned long long)sampled_now, (unsigned long long)cycle_started,
-			 (unsigned long long)cycle_finished, (unsigned long long)cycle_duration, cycle_count);
+			 (unsigned long long)cycle_finished, (unsigned long long)cycle_duration, cycle_count,
+			 (int)PG_INSTR_CLOCK, (unsigned long long)phase_started_mono,
+			 (unsigned long long)cycle_started_mono, (unsigned long long)cycle_finished_mono);
 }
 
 /*
@@ -841,6 +864,9 @@ cluster_qvotec_shmem_init(void)
 		QvotecShmem->prior_exit_pad = 0;
 		memset(&QvotecShmem->prior_exit, 0, sizeof(QvotecShmem->prior_exit));
 		pg_atomic_init_u64(&QvotecShmem->wakeup_latch, 0);
+		pg_atomic_init_u64(&QvotecShmem->diagnostic_cycle_started_mono_us, 0);
+		pg_atomic_init_u64(&QvotecShmem->diagnostic_cycle_finished_mono_us, 0);
+		pg_atomic_init_u64(&QvotecShmem->diagnostic_phase_started_mono_us, 0);
 	}
 	cluster_storage_quorum_attach(&QvotecShmem->storage_quorum, !found);
 }
@@ -1197,10 +1223,10 @@ qvotec_admission_denied(unsigned int diagnostic_bit, const char *reason, uint32 
 	static uint32 reported_reasons;
 
 	if ((reported_reasons & (UINT32_C(1) << diagnostic_bit)) == 0) {
-		char owner_evidence[640];
+		char owner_evidence[1024];
 
 		reported_reasons |= UINT32_C(1) << diagnostic_bit;
-		qvotec_diagnostic_format(owner_evidence, sizeof(owner_evidence));
+		cluster_qvotec_diagnostic_format(owner_evidence, sizeof(owner_evidence));
 		ereport(LOG, (errmsg_internal(
 						 "PGRAC_FAMILY=QUORUM_ADMISSION PGRAC_REASON=%s node=%d "
 						 "sampled_state=%u sampled_expiry_us=%llu sampled_now_us=%llu %s",
@@ -2577,7 +2603,7 @@ cluster_qvotec_test_diagnostic_phase_enter(uint32 phase)
 void
 cluster_qvotec_test_diagnostic_format(char *out, size_t size)
 {
-	qvotec_diagnostic_format(out, size);
+	cluster_qvotec_diagnostic_format(out, size);
 }
 
 void
@@ -3209,6 +3235,7 @@ qvotec_poll_once(void)
 		qvotec_initial_trace_previous_poll();
 		memset(&qvotec_initial_trace, 0, sizeof(qvotec_initial_trace));
 	}
+	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_STORAGE_QUORUM);
 	cluster_storage_quorum_refresh(cluster_storage_quorum_now_us(),
 								   (uint64)cluster_quorum_poll_interval_ms * 30 * 1000ULL);
 
@@ -4767,12 +4794,16 @@ ClusterQvotecMain(void)
 		 * matrix, decide quorum, publish shmem.  Counter bumps live
 		 * inside qvotec_poll_once. */
 		INSTR_TIME_SET_CURRENT(cycle_started);
+		pg_atomic_write_u64(&QvotecShmem->diagnostic_cycle_started_mono_us,
+							INSTR_TIME_GET_MICROSEC(cycle_started));
 		pg_atomic_write_u64(&QvotecShmem->diagnostic_cycle_started_us,
 							(uint64)GetCurrentTimestamp());
 		qvotec_diagnostic_phase_enter(QVOTEC_DIAG_PRE_INJECTION);
 		qvotec_poll_pre_injection();
 		qvotec_poll_once();
 		INSTR_TIME_SET_CURRENT(cycle_finished);
+		pg_atomic_write_u64(&QvotecShmem->diagnostic_cycle_finished_mono_us,
+							INSTR_TIME_GET_MICROSEC(cycle_finished));
 		INSTR_TIME_SUBTRACT(cycle_finished, cycle_started);
 		pg_atomic_write_u64(&QvotecShmem->diagnostic_cycle_duration_us,
 							INSTR_TIME_GET_MICROSEC(cycle_finished));
@@ -5014,6 +5045,12 @@ cluster_get_voting_disks(PG_FUNCTION_ARGS)
 void
 cluster_qvotec_wakeup(void)
 {}
+
+void
+cluster_qvotec_diagnostic_format(char *out, size_t size)
+{
+	snprintf(out, size, "owner_snapshot_stable=0 owner_phase=DISABLED");
+}
 
 void
 cluster_qvotec_observe(ClusterQvotecObservation *out)

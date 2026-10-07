@@ -43,6 +43,9 @@
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_storage_quorum.h"
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_control_retire.h"
 #include "cluster/cluster_lock_owner.h"
@@ -115,6 +118,31 @@ static bool test_stop_on, test_stop_transport;
 static int test_stop_case, test_stop_exit_code, test_stop_error_level;
 static unsigned test_stop_duties, test_stop_events, test_stop_polls, test_stop_frees;
 static char test_stop_last_detail[256];
+static char test_stop_control_detail[4096];
+static char test_stop_heartbeat_detail[1024];
+static unsigned test_stop_control_logs;
+
+void
+cluster_qvotec_diagnostic_format(char *out, size_t size)
+{
+	snprintf(out, size, "qvotec_fixture=passive");
+}
+void
+cluster_storage_quorum_diagnostic_format(char *out, size_t size)
+{
+	snprintf(out, size, "storage_fixture=passive token_rx=unobserved");
+}
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	return 17;
+}
+uint64
+cluster_epoch_get_current(void)
+{
+	return 3;
+}
+
 static TimestampTz test_stop_now;
 static LWLock *test_stop_locks[8];
 static unsigned test_stop_lock_depth;
@@ -258,6 +286,19 @@ errdetail(const char *f, ...)
 	if (test_stop_on && strstr(f, "domain=%s") != NULL)
 		vsnprintf(test_stop_last_detail, sizeof(test_stop_last_detail), f, args);
 	va_end(args);
+	if (test_stop_on && strstr(f, "lmon_duty_started_mono_us=") != NULL) {
+		UT_ASSERT_EQ(test_stop_lock_depth, 0);
+		test_stop_control_logs++;
+		va_start(args, f);
+		vsnprintf(test_stop_control_detail, sizeof(test_stop_control_detail), f, args);
+		va_end(args);
+	}
+	if (test_stop_on && strstr(f, "hb_tx_done_calls=") != NULL) {
+		UT_ASSERT_EQ(test_stop_lock_depth, 0);
+		va_start(args, f);
+		vsnprintf(test_stop_heartbeat_detail, sizeof(test_stop_heartbeat_detail), f, args);
+		va_end(args);
+	}
 	return 0;
 }
 int
@@ -531,6 +572,8 @@ cluster_ic_tier1_connect_one(int32 peer_id, int *out_peer_fd)
 {
 	if (test_liveness_case() && peer_id == 1) {
 		*out_peer_fd = test_liveness_fd = 43;
+		pg_atomic_write_u64(&test_liveness_peer.heartbeat_send_count, 17);
+		pg_atomic_write_u64(&test_liveness_peer.heartbeat_recv_count, 13);
 		return true;
 	}
 	return false;
@@ -1398,6 +1441,8 @@ UT_TEST(test_lmon_completed_duty_records_one_exact_timed_pair)
 	UT_ASSERT_EQ((long long)cluster_lmon_main_loop_iters(), 1LL);
 	UT_ASSERT_EQ(test_lmon_clock_calls, 2);
 	UT_ASSERT_EQ(test_lmon_wait_calls, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&test_lmon_state.diagnostic_duty_started_mono_us), 500);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&test_lmon_state.diagnostic_duty_finished_mono_us), 2000);
 
 	cluster_lmon_timed_duty_pair(&sample_count, &total_us);
 	UT_ASSERT_EQ((unsigned long long)sample_count, 1ULL);
@@ -1792,6 +1837,7 @@ test_stop_work(bool event)
 		UT_ASSERT_EQ(cluster_normal_stop_service_idle(CLUSTER_NORMAL_STOP_READY),
 					 CLUSTER_NORMAL_STOP_PENDING);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_idle_mask), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&test_lmon_state.diagnostic_duty_finished_mono_us), 0);
 	}
 	if ((test_stop_case == 4 && !event) || (test_stop_case == 5 && event)) {
 		LWLockAcquire(&test_lmon_state.lwlock, LW_EXCLUSIVE);
@@ -1982,6 +2028,9 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 	test_control_owner_polls = 0;
 	cluster_shared_config = scenario >= 48 && scenario <= 56;
 	test_stop_last_detail[0] = '\0';
+	test_stop_control_detail[0] = '\0';
+	test_stop_control_logs = 0;
+	test_stop_heartbeat_detail[0] = '\0';
 	test_stop_lock_depth = 0;
 	test_lmon_wait_calls = 0;
 	test_stop_exit_callback = NULL;
@@ -2115,6 +2164,7 @@ UT_TEST(test_stop_real_lmon_both_error_segments_unwind)
 	}
 	test_run_normal_stop_lmon(true, 5);
 	UT_ASSERT_EQ(test_stop_exit_code, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&test_lmon_state.diagnostic_dispatch_finished_mono_us), 0);
 	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
 }
 UT_TEST(test_stop_real_lmon_late_invalid_overrides_pending)
@@ -2357,6 +2407,10 @@ UT_TEST(test_liveness_recent_heartbeat_keeps_normal_receive_schedule)
 	test_run_normal_stop_lmon(true, 42);
 	UT_ASSERT_EQ(test_liveness_closes, 0);
 	UT_ASSERT_EQ(test_liveness_reads, 0);
+	UT_ASSERT(strstr(test_stop_heartbeat_detail, "hb_tx_done_calls=17") != NULL);
+	UT_ASSERT(strstr(test_stop_heartbeat_detail, "hb_rx_verified=13") != NULL);
+	UT_ASSERT(strstr(test_stop_heartbeat_detail, "hb_queued_completion=unobserved") != NULL);
+	UT_ASSERT(strstr(test_stop_heartbeat_detail, "token_rx=unobserved") != NULL);
 }
 
 UT_TEST(test_stop_drains_late_durability_before_each_idle_observation)
@@ -2412,10 +2466,23 @@ UT_TEST(test_stop_control_debt_survives_until_service_completion)
 	}
 }
 
+/* A READY stop still needs a timeline while checkpointer retains control. */
+UT_TEST(test_normal_stop_control_diagnostic_does_not_change_ready)
+{
+	test_run_normal_stop_lmon(false, 0);
+	UT_ASSERT_EQ(test_stop_exit_code, 0);
+	UT_ASSERT(strstr(test_stop_control_detail, "lmon_duty_started_mono_us=") != NULL);
+	UT_ASSERT(strstr(test_stop_control_detail, "lmon_duty_finished_mono_us=") != NULL);
+	UT_ASSERT(strstr(test_stop_control_detail, "token_rx=unobserved") != NULL);
+	UT_ASSERT_EQ(test_stop_control_logs, 2); /* One periodic sample, one final sample. */
+	UT_ASSERT(strstr(test_stop_control_detail, "incarnation=17 epoch=3 stop_result=2") != NULL);
+	cl_normal_stop = NULL; /* Do not leak this stop into later non-stop duties. */
+}
+
 int
 main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(44);
 	UT_RUN(test_lmon_status_enum_values_frozen);
 	UT_RUN(test_lmon_shared_state_size_under_4kb);
 	UT_RUN(test_lmon_status_to_string_lookup);
@@ -2424,6 +2491,7 @@ main(void)
 	UT_RUN(test_lmon_iteration_counters_null_safe);
 	UT_RUN(test_lmon_registers_semantic_ack_control_handler_without_broadcast);
 	UT_RUN(test_lmon_completed_duty_records_one_exact_timed_pair);
+	UT_RUN(test_normal_stop_control_diagnostic_does_not_change_ready);
 	UT_RUN(test_lmon_zero_elapsed_is_still_one_completed_sample);
 	UT_RUN(test_lmon_timed_pair_saturates_without_wrapping);
 	UT_RUN(test_lmon_runs_pcm_reclaim_once_per_duty);

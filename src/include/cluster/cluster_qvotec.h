@@ -150,7 +150,7 @@
 #define CLUSTER_QVOTEC_SHMEM_STORAGE_OFFSET (448 + 8 + 16 + 512 * CLUSTER_MAX_VOTING_DISKS)
 #define CLUSTER_QVOTEC_SHMEM_BYTES                                                                 \
 	(CLUSTER_QVOTEC_SHMEM_STORAGE_OFFSET + CLUSTER_STORAGE_QUORUM_STATE_BYTES                      \
-	 + sizeof(pg_atomic_uint64))
+	 + 4 * sizeof(pg_atomic_uint64))
 #define CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES 128
 #define CLUSTER_QVOTEC_BALLOT_BYTES 32
 #define CLUSTER_QVOTEC_CONFIGURED_DISK_MASK UINT8_C(0x7f)
@@ -436,6 +436,8 @@ typedef struct ClusterQvotecObservation {
 } ClusterQvotecObservation;
 
 extern void cluster_qvotec_observe(ClusterQvotecObservation *out);
+/* Passive bounded copy; never waits for the poll owner or reads a disk. */
+extern void cluster_qvotec_diagnostic_format(char *out, size_t size);
 
 /*
  * spec-5.15A §2.1A.4 local SPSC handoff.  LMON is the sole submit/poll-

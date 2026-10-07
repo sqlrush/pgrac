@@ -45,6 +45,7 @@ static bool tracking_enabled;
 static unsigned missing_notifications, dispatch_count, poll_dispatch_count;
 static bool pair_on_second_dispatch, remove_peer, remove_self, negative_then_ready;
 static unsigned notification_mismatch;
+static bool inspect_pending_sample;
 static int failing_api_step;
 static const char *bad_key;
 static struct config_generic shared_settings[2];
@@ -143,6 +144,16 @@ fixture_dispatch(uint64 handle, int flags)
 	StorageCorosyncRing ring = { 11, 8 };
 	uint32 members[] = { 11, 12 };
 
+	if (inspect_pending_sample) {
+		ClusterStorageQuorumState saved;
+		char evidence[1536];
+
+		memcpy(&saved, storage_state, sizeof(saved));
+		cluster_storage_quorum_diagnostic_format(evidence, sizeof(evidence));
+		UT_ASSERT(strstr(evidence, "sample_finished_mono_us=0") != NULL);
+		UT_ASSERT(strstr(evidence, "sample_outcome=0") != NULL);
+		UT_ASSERT_EQ(memcmp(&saved, storage_state, sizeof(saved)), 0);
+	}
 	dispatch_count++;
 	poll_dispatch_count++;
 	Assert(handle == 123 && flags == STORAGE_CS_DISPATCH_ALL);
@@ -583,10 +594,48 @@ UT_TEST(test_actual_member_change_and_negative_evidence_revoke_immediately)
 	}
 }
 
+UT_TEST(test_stop_diagnostic_keeps_raw_poll_separate_from_retained_authority)
+{
+	ClusterStorageQuorumState state, saved;
+	char evidence[1536];
+	unsigned calls;
+
+	reset_fixture();
+	cluster_storage_quorum_attach(&state, true);
+	cluster_storage_quorum_refresh(fixture_now, 100);
+	notification_mismatch = 1;
+	fixture_now++;
+	inspect_pending_sample = true;
+	cluster_storage_quorum_refresh(fixture_now, 100);
+	inspect_pending_sample = false;
+	memcpy(&saved, &state, sizeof(saved));
+	calls = dispatch_count;
+	cluster_storage_quorum_diagnostic_format(evidence, sizeof(evidence));
+	UT_ASSERT(strstr(evidence, "storage_view_stable=1") != NULL);
+	UT_ASSERT(strstr(evidence, "raw_reason=4") != NULL);
+	UT_ASSERT(strstr(evidence, "sample_outcome=2") != NULL);
+	UT_ASSERT(strstr(evidence, "quorum_callback_mono_us=1000001") != NULL);
+	UT_ASSERT(strstr(evidence, "members_callback_mono_us=1000001") != NULL);
+	UT_ASSERT(strstr(evidence, "token_rx=unobserved") != NULL);
+	UT_ASSERT_EQ(dispatch_count, calls);
+	UT_ASSERT_EQ(memcmp(&saved, &state, sizeof(saved)), 0);
+	UT_ASSERT(cluster_storage_quorum_allows_node(0));
+
+	/* An interrupted view publication must not spin or become a negative vote. */
+	pg_atomic_fetch_add_u32(&state.sequence, 1);
+	memcpy(&saved, &state, sizeof(saved));
+	cluster_storage_quorum_diagnostic_format(evidence, sizeof(evidence));
+	UT_ASSERT(strstr(evidence, "storage_view_stable=0") != NULL);
+	UT_ASSERT_EQ(dispatch_count, calls);
+	UT_ASSERT_EQ(memcmp(&saved, &state, sizeof(saved)), 0);
+	cluster_storage_quorum_attach(NULL, false);
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
+	UT_RUN(test_stop_diagnostic_keeps_raw_poll_separate_from_retained_authority);
 	UT_RUN(test_pending_pair_preserves_only_the_original_unexpired_view);
 	UT_RUN(test_ring_skew_does_not_revoke_or_renew_unchanged_members);
 	UT_RUN(test_current_pair_can_finish_on_one_bounded_second_dispatch);

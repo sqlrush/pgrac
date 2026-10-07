@@ -1596,8 +1596,9 @@ UT_TEST(test_qvotec_preserves_replacement_request_per_disk_fail_closed)
 UT_TEST(test_qvotec_shmem_and_mailbox_layout)
 {
 	UT_ASSERT_EQ(CLUSTER_QVOTEC_SHMEM_STORAGE_OFFSET, 4056);
-	UT_ASSERT_EQ(sizeof(ClusterStorageQuorumState), 64);
-	UT_ASSERT_EQ(cluster_qvotec_shmem_size(), 4128); /* Added volatile wakeup pointer. */
+	UT_ASSERT_EQ(sizeof(ClusterStorageQuorumState), 160);
+	UT_ASSERT_EQ(offsetof(ClusterStorageQuorumState, diagnostic), 64);
+	UT_ASSERT_EQ(cluster_qvotec_shmem_size(), 4248); /* Volatile diagnostics; mailbox unchanged. */
 	UT_ASSERT_EQ(sizeof(ClusterQvotecPriorExitObservation), 3600);
 	UT_ASSERT_EQ(sizeof(ClusterQvotecMailbox), 320);
 	UT_ASSERT_EQ(offsetof(ClusterQvotecMailbox, request_seq), 0);
@@ -2019,6 +2020,10 @@ UT_TEST(test_quorum_owner_phase_is_read_only_and_rejects_missing_or_recycled_own
 	UT_ASSERT(strstr(evidence, "owner_phase_started_us=2000000") != NULL);
 	UT_ASSERT(strstr(evidence, "owner_pid=4321 owner_procno=1 owner_pid_matches=1") != NULL);
 	UT_ASSERT(strstr(evidence, "owner_wait_event=16777217") != NULL);
+	/* Shutdown evidence must distinguish monotonic completion from lease input. */
+	UT_ASSERT(strstr(evidence, "clock_pg=wall clock_diag=") != NULL);
+	UT_ASSERT(strstr(evidence, "owner_phase_started_mono_us=2000000") != NULL);
+	UT_ASSERT(strstr(evidence, "diag_cycle_finished_mono_us=") != NULL);
 	UT_ASSERT_EQ(memcmp(before, shmem_storage, sizeof(before)), 0);
 
 	owner[1].pid = 8765;
