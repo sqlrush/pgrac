@@ -66,6 +66,7 @@ static ClusterWalSourceRef initialized_ref;
 static uint64 initialized_epoch;
 static uint64 epoch;
 static unsigned root_calls, waits, local_updates, reads, releases;
+static unsigned serving_pending_reads, serving_reads;
 static unsigned native_writes, shutdown_calls;
 static int native_error_level;
 static ClusterControlRootResult returns[4];
@@ -290,6 +291,20 @@ bool
 cluster_serving_ready_is_current(void)
 {
 	return serving_ok;
+}
+bool
+cluster_serving_ready_check(bool *pending, const char **failed_predicate)
+{
+	bool unavailable = serving_pending_reads > 0;
+
+	serving_reads++;
+	if (unavailable)
+		serving_pending_reads--;
+	if (pending)
+		*pending = unavailable;
+	if (failed_predicate)
+		*failed_predicate = unavailable ? "FORMATION_PENDING" : serving_ok ? NULL : "LOST";
+	return !unavailable && serving_ok;
 }
 bool
 cluster_reconfig_has_pending_prebump_stage(void)
@@ -604,6 +619,7 @@ reset_fixture(void)
 	MyAuxProcType = CheckpointerProcess;
 	MyBackendType = B_CHECKPOINTER;
 	root_calls = waits = local_updates = reads = releases = 0;
+	serving_pending_reads = serving_reads = 0;
 	native_writes = shutdown_calls = 0;
 	native_error_level = 0;
 	cluster_shared_config = cluster_enabled = cluster_controlfile_shared_authority = true;
@@ -784,6 +800,40 @@ UT_TEST(publish_does_not_retry_safety_or_io_refusal)
 		UT_ASSERT_EQ(waits, 0);
 		UT_ASSERT_EQ(current.checkPoint, 100);
 		UT_ASSERT_EQ(local_updates, 0);
+	}
+}
+UT_TEST(publish_waits_for_pending_admission_outside_locks)
+{
+	for (unsigned shutdown = 0; shutdown < 2; shutdown++) {
+		reset_fixture();
+		ShutdownRequestPending = shutdown != 0;
+		candidate.state = shutdown ? DB_SHUTDOWNED : DB_IN_PRODUCTION;
+		serving_pending_reads = 2;
+		returns[0] = CLUSTER_CONTROL_ROOT_ADMISSION_PENDING;
+		UT_ASSERT(publish());
+		UT_ASSERT_EQ(serving_reads, 4);
+		UT_ASSERT_EQ(root_calls, 2);
+		UT_ASSERT_EQ(shutdown_calls, shutdown ? 2 : 0);
+		UT_ASSERT_EQ(waits, 3);
+		UT_ASSERT_EQ(local_updates, 1);
+		UT_ASSERT_EQ(current.checkPoint, 200);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+	}
+}
+UT_TEST(publish_pending_still_refuses_loss_cancel_and_epoch_change)
+{
+	for (unsigned fault = 0; fault < 3; fault++) {
+		reset_fixture();
+		serving_pending_reads = 1;
+		serving_ok = fault != 0;
+		cancel_on_wait = fault == 1;
+		change_epoch_on_wait = fault == 2;
+		UT_ASSERT(!publish());
+		UT_ASSERT_EQ(waits, 1);
+		UT_ASSERT_EQ(root_calls, 0);
+		UT_ASSERT_EQ(local_updates, 0);
+		UT_ASSERT_EQ(current.checkPoint, 100);
+		UT_ASSERT_EQ(cf_mode, NoLock);
 	}
 }
 UT_TEST(publish_cancel_and_changed_authority_stop_owned_retry)
@@ -1896,7 +1946,7 @@ UT_TEST(native_startup_insert_has_no_link_or_page_from_predecessor)
 int
 main(void)
 {
-	UT_PLAN(49);
+	UT_PLAN(51);
 	UT_RUN(clean_input_observation_preserves_exact_old_and_new_owners);
 	UT_RUN(clean_input_observation_rejects_other_input_kinds);
 	UT_RUN(clean_input_observation_rejects_wrong_owner_phase_and_lock_context);
@@ -1922,6 +1972,8 @@ main(void)
 	UT_RUN(initialized_checkpoint_cannot_borrow_other_input_epoch_or_writer);
 	UT_RUN(publish_retries_only_root_competition_before_projection);
 	UT_RUN(publish_does_not_retry_safety_or_io_refusal);
+	UT_RUN(publish_waits_for_pending_admission_outside_locks);
+	UT_RUN(publish_pending_still_refuses_loss_cancel_and_epoch_change);
 	UT_RUN(publish_cancel_and_changed_authority_stop_owned_retry);
 	UT_RUN(publish_installs_root_selected_common_fields);
 	UT_RUN(native_candidate_is_private_until_publication);
