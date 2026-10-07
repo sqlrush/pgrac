@@ -2223,9 +2223,12 @@ HeapTupleSatisfiesMVCCScratchInternal(HeapTuple htup, Snapshot snapshot,
 
 	/* A frozen creator is already proved by the immutable tuple flags.
 	 * Its raw xmin is historical data; its former DATA slot may be reused.
+	 * BootstrapTransactionId is PG's permanently committed bootstrap creator
+	 * and likewise needs no DATA slot or transaction-table lookup.
 	 * This says nothing about xmax, which still has to be checked below. */
-	if (!HeapTupleHeaderXminFrozen(tuple)) {
-		raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
+	raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
+	if (!HeapTupleHeaderXminFrozen(tuple)
+		&& !TransactionIdEquals(raw_xmin, BootstrapTransactionId)) {
 		if (!TransactionIdIsNormal(raw_xmin))
 			cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin is not a normal xid");
 		creator_index = cluster_r4_scratch_creator_slot(page, tuple->t_itl_slot_idx, raw_xmin);

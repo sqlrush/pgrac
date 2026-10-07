@@ -3130,16 +3130,16 @@ UT_TEST(test_local_matching_creator_uses_statement_scn_not_native_membership)
 /* Frozen creation is a tuple proof, not a claim that its old page slot still
  * names xmin.  Keep the real scratch evaluator and trap all live-page paths. */
 static void
-ut_scratch_frozen_case(uint16 xmin_bits, uint8 itl_index, int xmax_leg, bool expect_error,
-					   bool expect_visible)
+ut_scratch_creator_case(TransactionId xmin, uint16 xmin_bits, uint8 itl_index, int xmax_leg,
+						bool expect_error, bool expect_visible)
 {
 	PGAlignedBlock scratch;
 	PGAlignedBlock before;
 	HeapTupleData tuple = { 0 };
 	SnapshotData snapshot = { 0 };
 	ClusterR4HotScratchTestContext context = { 0 };
-	Page page = ut_r4_hot_build_page(scratch.data, (TransactionId)4195504, 1,
-									 (TransactionId)4207696, 4, UT_HOT_PAYLOAD);
+	Page page
+		= ut_r4_hot_build_page(scratch.data, xmin, 1, (TransactionId)4207696, 4, UT_HOT_PAYLOAD);
 	HeapTupleHeader header = ut_r4_hot_tuple_at(page, UT_HOT_ROOT_OFF);
 	volatile bool caught = false;
 	volatile bool visible = false;
@@ -3189,6 +3189,10 @@ ut_scratch_frozen_case(uint16 xmin_bits, uint8 itl_index, int xmax_leg, bool exp
 			context.already_full = false;
 		if (xmax_leg == 13)
 			context.tag.blockNum++;
+		if (xmax_leg == 14)
+			context.read_scn++;
+		if (xmax_leg == 15)
+			tuple.t_len = 0;
 	}
 	memcpy(before.data, page, BLCKSZ);
 	ut_capture_error = true;
@@ -3213,6 +3217,52 @@ ut_scratch_frozen_case(uint16 xmin_bits, uint8 itl_index, int xmax_leg, bool exp
 	UT_ASSERT_EQ(ut_scratch_cr_calls, 0);
 	UT_ASSERT_EQ(ut_scratch_hint_calls, 0);
 	UT_ASSERT_EQ(ut_scratch_dirty_calls, 0);
+}
+
+static void
+ut_scratch_frozen_case(uint16 xmin_bits, uint8 itl_index, int xmax_leg, bool expect_error,
+					   bool expect_visible)
+{
+	ut_scratch_creator_case((TransactionId)4195504, xmin_bits, itl_index, xmax_leg, expect_error,
+							expect_visible);
+}
+
+UT_TEST(test_scratch_bootstrap_creator_needs_no_data_slot)
+{
+	for (int hint = 0; hint < 2; hint++) {
+		uint16 bits = hint ? HEAP_XMIN_COMMITTED : 0;
+
+		ut_scratch_creator_case(BootstrapTransactionId, bits, 1, 0, false, true);
+		ut_scratch_creator_case(BootstrapTransactionId, bits, CLUSTER_ITL_SLOT_UNALLOCATED, 0,
+								false, true);
+	}
+}
+
+UT_TEST(test_scratch_bootstrap_creation_preserves_exact_xmax_verdict)
+{
+	for (int leg = 1; leg <= 5; leg++)
+		ut_scratch_creator_case(BootstrapTransactionId, 0, 1, leg, false, leg != 1);
+	ut_scratch_creator_case(BootstrapTransactionId, 0, CLUSTER_ITL_SLOT_UNALLOCATED, 1, true,
+							false);
+}
+
+UT_TEST(test_scratch_bootstrap_creation_keeps_xmax_and_context_refusals)
+{
+	for (int leg = 6; leg <= 15; leg++)
+		ut_scratch_creator_case(BootstrapTransactionId, 0, 1, leg, true, false);
+}
+
+UT_TEST(test_scratch_bootstrap_does_not_admit_other_unproved_creators)
+{
+	const TransactionId refused[] = { InvalidTransactionId, FrozenTransactionId, 4195504 };
+
+	for (unsigned i = 0; i < lengthof(refused); i++) {
+		ut_scratch_creator_case(refused[i], 0, 1, 0, true, false);
+		ut_scratch_creator_case(refused[i], HEAP_XMIN_COMMITTED, 1, 0, true, false);
+	}
+	/* Even an exact ordinary creator reference cannot turn UNKNOWN into commit. */
+	ut_scratch_creator_case((TransactionId)4207696, 0, 1, 9, true, false);
+	UT_ASSERT_EQ(ut_scratch_exact_resolve_calls, 1);
 }
 
 UT_TEST(test_scratch_frozen_xmin_survives_recycled_data_slot)
@@ -7158,7 +7208,7 @@ UT_TEST(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement)
 int
 main(void)
 {
-	UT_PLAN(140);
+	UT_PLAN(144);
 	UT_RUN(test_shared_hot_prune_captures_identity_before_cleanup);
 	UT_RUN(test_live_miss_evidence_preserves_result_and_rejects_unreadable_metadata);
 	UT_RUN(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement);
@@ -7181,6 +7231,10 @@ main(void)
 	UT_RUN(test_incomplete_creation_flags_keep_real_hot_full_route);
 	UT_RUN(test_frozen_creator_does_not_bypass_data_lock_or_multi_xmax_full);
 	UT_RUN(test_scratch_frozen_creation_keeps_data_and_context_negatives);
+	UT_RUN(test_scratch_bootstrap_creator_needs_no_data_slot);
+	UT_RUN(test_scratch_bootstrap_creation_preserves_exact_xmax_verdict);
+	UT_RUN(test_scratch_bootstrap_creation_keeps_xmax_and_context_refusals);
+	UT_RUN(test_scratch_bootstrap_does_not_admit_other_unproved_creators);
 	UT_RUN(test_scratch_frozen_xmin_survives_recycled_data_slot);
 	UT_RUN(test_scratch_frozen_xmin_needs_no_creator_slot);
 	UT_RUN(test_scratch_frozen_creation_does_not_hide_deleting_xmax);
