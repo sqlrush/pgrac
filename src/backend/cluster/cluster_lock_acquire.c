@@ -180,6 +180,9 @@ cluster_lock_acquire_s1_entry(const ClusterLockAcquireRequest *req)
 	 * ordinary exact-LMS predicate.  In particular, lms_enabled=off is not a
 	 * native escape once this lifecycle is managed. */
 	if (cluster_authority_readiness_managed()) {
+		bool pending = false;
+		bool serving;
+
 		if (!cluster_lms_enabled)
 			return CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE;
 		/*
@@ -194,9 +197,13 @@ cluster_lock_acquire_s1_entry(const ClusterLockAcquireRequest *req)
 		if (cluster_recovery_authority_request_allowed(&req->resid, req->lockmode,
 													   AmStartupProcess()))
 			return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
-		if (cluster_serving_ready_is_current())
+		serving = cluster_shared_config ? cluster_serving_ready_check(&pending, NULL)
+										: cluster_serving_ready_is_current();
+		if (serving)
 			return cluster_lms_is_ready() ? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
 										  : CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE;
+		if (pending)
+			return CLUSTER_LOCK_ACQUIRE_PENDING;
 		/*
 		 * RF-ROOT P6 (reverted 2026-08-17): the recovery lock admission is
 		 * StartupProcess-only per frozen AD-023 §4 and STOP-01 I1 (the
@@ -972,8 +979,25 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK;
 	}
 
-	/* S1 entry — HC1 fail-closed。*/
-	r = cluster_lock_acquire_s1_entry(req);
+	/* A pending observation owns no reservation, message, or grant. Keep
+	 * the original caller here until it can observe authority or real loss;
+	 * no remote request deadline/retransmit budget has started at S1.
+	 * Cooperative service owners return to their pass instead of sleeping.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	for (;;) {
+		r = cluster_lock_acquire_s1_entry(req);
+		if (r != CLUSTER_LOCK_ACQUIRE_PENDING)
+			break;
+		if (req->dontwait)
+			return CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
+		if (MyProc == NULL || MyBackendType == B_LMON || MyBackendType == B_LMS)
+			return CLUSTER_LOCK_ACQUIRE_PENDING;
+		CHECK_FOR_INTERRUPTS();
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 10,
+						req->wait_event ? req->wait_event : WAIT_EVENT_CLUSTER_GES_REPLY_WAIT);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
 	if (r != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
 		return r;
 

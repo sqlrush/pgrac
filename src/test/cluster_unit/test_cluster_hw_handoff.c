@@ -415,6 +415,16 @@ cluster_serving_ready_is_current(void)
 	}
 	return !cooperative_case || cf_case;
 }
+bool
+cluster_serving_ready_check(bool *pending, const char **predicate)
+{
+	/* This fixture controls readiness, not concurrent publication. */
+	if (pending != NULL)
+		*pending = false;
+	if (predicate != NULL)
+		*predicate = NULL;
+	return cluster_serving_ready_is_current();
+}
 ClusterAuthorityReadiness
 cluster_authority_readiness_get(void)
 {

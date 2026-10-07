@@ -214,6 +214,13 @@ bool cluster_lmd_enabled = true;
 static bool stub_lms_ready_for_test = true;
 static bool stub_authority_managed_for_test = false;
 static bool stub_serving_ready_for_test = false;
+static bool stub_serving_pending_for_test;
+static int stub_admission_waits;
+static int stub_admission_finish_after;
+static bool stub_admission_becomes_ready;
+static bool stub_admission_interrupt;
+static int stub_reserve_calls;
+static const ClusterLockAcquireRequest *stub_admission_request;
 static bool stub_recovery_ready_for_test = false;
 static int32 stub_master_node = -1;
 static uint32 stub_local_release_result = GES_REJECT_REASON_NONE;
@@ -233,6 +240,16 @@ cluster_authority_readiness_managed(void)
 bool
 cluster_serving_ready_is_current(void)
 {
+	return stub_serving_ready_for_test;
+}
+
+bool
+cluster_serving_ready_check(bool *pending, const char **predicate)
+{
+	if (pending != NULL)
+		*pending = stub_serving_pending_for_test;
+	if (predicate != NULL)
+		*predicate = stub_serving_pending_for_test ? "QUORUM_OBSERVATION_PENDING" : "TEST_LOST";
 	return stub_serving_ready_for_test;
 }
 
@@ -448,6 +465,16 @@ int
 WaitLatch(struct Latch *latch pg_attribute_unused(), int wakeEvents pg_attribute_unused(),
 		  long timeout pg_attribute_unused(), uint32 wait_event_info pg_attribute_unused())
 {
+	if (stub_admission_request != NULL) {
+		UT_ASSERT_EQ(stub_admission_request->request_id, 0);
+		stub_admission_waits++;
+		if (stub_admission_interrupt)
+			InterruptPending = 1;
+		else if (stub_admission_waits == stub_admission_finish_after) {
+			stub_serving_pending_for_test = false;
+			stub_serving_ready_for_test = stub_admission_becomes_ready;
+		}
+	}
 	return 0;
 }
 
@@ -457,7 +484,13 @@ ResetLatch(struct Latch *latch pg_attribute_unused())
 
 void
 ProcessInterrupts(void)
-{}
+{
+	if (stub_admission_interrupt) {
+		InterruptPending = 0;
+		UT_ASSERT_NOT_NULL(PG_exception_stack);
+		siglongjmp(*PG_exception_stack, 1);
+	}
+}
 
 uint64
 cluster_grd_redeclare_generation(void)
@@ -672,6 +705,7 @@ cluster_grd_try_reserve(const ClusterResId *resid pg_attribute_unused(),
 						int mode pg_attribute_unused(), int32 self_node_id pg_attribute_unused(),
 						bool *fast_path_out, uint64 *gen_snapshot_out)
 {
+	stub_reserve_calls++;
 	if (fast_path_out)
 		*fast_path_out = false;
 	if (gen_snapshot_out)
@@ -1790,13 +1824,117 @@ UT_TEST(test_auxiliary_native_walr_does_not_redeclare_or_wait)
 	reset_redeclare_walk();
 }
 
+static void
+pending_entry_setup(ClusterLockAcquireRequest *req, PGPROC *proc)
+{
+	memset(req, 0, sizeof(*req));
+	memset(proc, 0, sizeof(*proc));
+	MyProc = proc;
+	MyBackendType = B_BACKEND;
+	cluster_shared_config = true;
+	cluster_lms_enabled = true;
+	stub_authority_managed_for_test = true;
+	stub_lms_ready_for_test = true;
+	stub_recovery_ready_for_test = false;
+	stub_serving_ready_for_test = false;
+	stub_serving_pending_for_test = true;
+	stub_admission_waits = 0;
+	stub_admission_finish_after = 2;
+	stub_admission_becomes_ready = true;
+	stub_admission_interrupt = false;
+	stub_reserve_calls = 0;
+	stub_admission_request = req;
+}
+
+static void
+pending_entry_reset(void)
+{
+	MyProc = NULL;
+	MyBackendType = B_BACKEND;
+	cluster_shared_config = false;
+	stub_authority_managed_for_test = false;
+	stub_serving_pending_for_test = false;
+	stub_serving_ready_for_test = false;
+	stub_admission_interrupt = false;
+	stub_admission_request = NULL;
+	InterruptPending = 0;
+}
+
+UT_TEST(test_pending_entry_recovers_before_any_reservation)
+{
+	ClusterLockAcquireRequest req;
+	PGPROC proc;
+	uint64 before_cleanup = cluster_lock_acquire_s7_cleanup_count();
+
+	pending_entry_setup(&req, &proc);
+	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT_EQ(cluster_lock_acquire_seven_step(&req), CLUSTER_LOCK_ACQUIRE_FAIL_GRD_NOT_READY);
+	UT_ASSERT_EQ(stub_admission_waits, 2);
+	UT_ASSERT_EQ(stub_reserve_calls, 1);
+	UT_ASSERT_EQ(cluster_lock_acquire_s7_cleanup_count(), before_cleanup);
+	pending_entry_reset();
+}
+
+UT_TEST(test_pending_entry_nowait_background_and_proven_loss)
+{
+	ClusterLockAcquireRequest req;
+	PGPROC proc;
+
+	pending_entry_setup(&req, &proc);
+	req.dontwait = true;
+	UT_ASSERT_EQ(cluster_lock_acquire_seven_step(&req), CLUSTER_LOCK_ACQUIRE_NOT_AVAIL);
+	UT_ASSERT_EQ(stub_admission_waits, 0);
+	req.dontwait = false;
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(cluster_lock_acquire_seven_step(&req), CLUSTER_LOCK_ACQUIRE_PENDING);
+	MyBackendType = B_LMS;
+	UT_ASSERT_EQ(cluster_lock_acquire_seven_step(&req), CLUSTER_LOCK_ACQUIRE_PENDING);
+	MyBackendType = B_BACKEND;
+	MyProc = NULL;
+	UT_ASSERT_EQ(cluster_lock_acquire_seven_step(&req), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT_EQ(stub_admission_waits, 0);
+	MyProc = &proc;
+	stub_admission_becomes_ready = false;
+	UT_ASSERT_EQ(cluster_lock_acquire_seven_step(&req), CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
+	UT_ASSERT_EQ(stub_admission_waits, 2);
+	UT_ASSERT_EQ(stub_reserve_calls, 0);
+	UT_ASSERT_EQ(req.request_id, 0);
+	pending_entry_reset();
+}
+
+UT_TEST(test_pending_entry_cancel_keeps_no_request_or_reservation)
+{
+	ClusterLockAcquireRequest req;
+	PGPROC proc;
+	volatile bool caught = false;
+	uint64 before_cleanup = cluster_lock_acquire_s7_cleanup_count();
+
+	pending_entry_setup(&req, &proc);
+	stub_admission_interrupt = true;
+	PG_TRY();
+	{
+		(void)cluster_lock_acquire_seven_step(&req);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(stub_admission_waits, 1);
+	UT_ASSERT_EQ(stub_reserve_calls, 0);
+	UT_ASSERT_EQ(req.request_id, 0);
+	UT_ASSERT_EQ(cluster_lock_acquire_s7_cleanup_count(), before_cleanup);
+	pending_entry_reset();
+}
+
 UT_DEFINE_GLOBALS();
 
 
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(26);
+	UT_PLAN(29);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
@@ -1824,6 +1962,9 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_redeclare_walk_release_in_flight_keeps_old_identity);
 	UT_RUN(test_redeclare_walk_includes_actual_private_owner);
 	UT_RUN(test_auxiliary_native_walr_does_not_redeclare_or_wait);
+	UT_RUN(test_pending_entry_recovers_before_any_reservation);
+	UT_RUN(test_pending_entry_nowait_background_and_proven_loss);
+	UT_RUN(test_pending_entry_cancel_keeps_no_request_or_reservation);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

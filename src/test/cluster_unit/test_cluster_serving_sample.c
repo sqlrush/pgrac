@@ -285,12 +285,35 @@ UT_TEST(serving_deadline_preserves_binding_until_proven_loss_or_identity_drift)
 	UT_ASSERT_EQ(phase4_quorum_check_calls, 0);
 }
 
+UT_TEST(lock_entry_keeps_real_serving_deadline_pending)
+{
+	ClusterLockAcquireRequest req = { 0 };
+
+	sample_setup();
+	/* OBJECT does not belong to the CF/WALR reconstruction gate. */
+	phase_test_control_acquire_ready = true;
+	cluster_lms_enabled = true;
+	req.resid.type = LOCKTAG_OBJECT;
+	req.lockmode = ExclusiveLock;
+	pg_atomic_fetch_add_u32(&QvotecShmem->storage_quorum.sequence, 1);
+	sample_oversleep = true;
+	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_PENDING);
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_SERVING_READY);
+	pg_atomic_fetch_add_u32(&QvotecShmem->storage_quorum.sequence, 1);
+	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	pg_atomic_write_u32(&QvotecShmem->quorum_state, CLUSTER_QVOTEC_QUORUM_LOST);
+	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_OFF);
+	UT_ASSERT_EQ(phase4_quorum_check_calls, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(2);
+	UT_PLAN(3);
 	UT_RUN(deadline_projects_pending_through_real_formation_and_grd);
 	UT_RUN(serving_deadline_preserves_binding_until_proven_loss_or_identity_drift);
+	UT_RUN(lock_entry_keeps_real_serving_deadline_pending);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

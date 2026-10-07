@@ -253,8 +253,7 @@ UT_TEST(storage_publication_busy_preserves_serving_identity_for_retry)
 	authority_storage_setup(true);
 	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&authority_cf), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
 	pg_atomic_fetch_add_u32(&authority_storage.sequence, 1);
-	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&authority_cf),
-				 CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
+	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&authority_cf), CLUSTER_LOCK_ACQUIRE_PENDING);
 	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_SERVING_READY);
 	pg_atomic_fetch_add_u32(&authority_storage.sequence, 1);
 	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&authority_cf), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
