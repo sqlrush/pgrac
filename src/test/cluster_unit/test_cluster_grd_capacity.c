@@ -111,6 +111,7 @@ capacity_setup(ClusterLockAcquireRequest *request, ClusterGrdHolderId *lmon_hold
 
 	queued_cut_case = true;
 	hw_bast_observe = NULL;
+	hw_reply_observe = NULL;
 	queued_cut_prepare(GES_REQ_OPCODE_REQUEST, false, 0, request, lmon_holder);
 	ut_wfg_reset();
 	request->resid = (ClusterResId){ .field1 = 5,
@@ -1016,13 +1017,157 @@ UT_TEST(pool_full_never_orphans_reservation_and_release_reuses_bytes)
 	capacity_pool_exhaustion(CAPACITY_POOL_RESERVATION);
 }
 
+typedef struct CapacityReply {
+	uint32 destination;
+	GesReplyPayload payload;
+} CapacityReply;
+
+static CapacityReply capacity_replies[64];
+static int capacity_reply_count;
+
+static void
+capacity_observe_reply(uint32 destination, const GesReplyPayload *payload)
+{
+	if (capacity_reply_count < lengthof(capacity_replies)) {
+		capacity_replies[capacity_reply_count].destination = destination;
+		capacity_replies[capacity_reply_count].payload = *payload;
+	}
+	capacity_reply_count++;
+}
+
+static void
+capacity_expect_grant_reply(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+							uint32 request_opcode)
+{
+	int matches = 0;
+
+	for (int i = 0; i < capacity_reply_count && i < lengthof(capacity_replies); i++) {
+		const CapacityReply *reply = &capacity_replies[i];
+		const GesReplyPayload *p = &reply->payload;
+		ClusterGrdHolderId observed;
+
+		observed.node_id = p->holder_node_id;
+		observed.procno = p->holder_procno;
+		observed.cluster_epoch
+			= ((uint64)p->holder_cluster_epoch_hi << 32) | p->holder_cluster_epoch_lo;
+		observed.request_id = ((uint64)p->holder_request_id_hi << 32) | p->holder_request_id_lo;
+		if (capacity_same_holder(&observed, holder)) {
+			matches++;
+			UT_ASSERT_EQ(reply->destination, holder->node_id);
+			UT_ASSERT_EQ(p->opcode, GES_REPLY_OPCODE_GRANT);
+			UT_ASSERT_EQ(p->reply_for_opcode, request_opcode);
+			UT_ASSERT_EQ(p->reject_reason, GES_REJECT_REASON_NONE);
+			UT_ASSERT(memcmp(p->resid, resid, sizeof(*resid)) == 0);
+		}
+	}
+	UT_ASSERT_EQ(matches, 1);
+}
+
+static void
+capacity_lmon_release_converts(int count)
+{
+	const int32 remote_nodes[] = { 0, 2, 3 };
+	ClusterLockAcquireRequest request;
+	ClusterGrdHolderId blocker, holders[32], converts[32];
+	int queued = 0;
+	int promoted = 0;
+
+	HW_CHECK(count > 0 && count <= lengthof(holders));
+	capacity_setup(&request, &blocker);
+	blocker.node_id = 2;
+	blocker.request_id += UINT64CONST(0x300000000);
+	UT_ASSERT_EQ(capacity_acquire(&request.resid, &blocker), CLUSTER_GRD_GRANT_NOW);
+	/* All original AccessShare owners coexist with RowExclusive. Their Share
+	 * upgrades wait only for that blocker and can all be granted on its release. */
+	for (int i = 0; i < count; i++) {
+		holders[i] = capacity_holder(i);
+		holders[i].node_id = remote_nodes[i % lengthof(remote_nodes)];
+		holders[i].request_id += UINT64CONST(0x100000000);
+		UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(
+						 &request.resid, &holders[i], holders[i].node_id, holders[i].request_id, 9,
+						 GES_REQ_OPCODE_REQUEST, AccessShareLock, NULL, NULL),
+					 CLUSTER_GRD_GRANT_NOW);
+	}
+	for (int i = 0; i < count; i++) {
+		ClusterGrdWaiterMeta meta = { 0 };
+
+		converts[i] = holders[i];
+		converts[i].request_id += UINT64CONST(0x100000000);
+		meta.wait_seq = 15000 + i;
+		if (cluster_grd_convert_or_enqueue_meta(&request.resid, converts[i].node_id,
+												converts[i].procno, converts[i].cluster_epoch,
+												AccessShareLock, ShareLock, converts[i].request_id,
+												converts[i].node_id, 9, meta, NULL, NULL)
+			== CLUSTER_GRD_CONVERT_ENQUEUED)
+			queued++;
+		UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &converts[i], NULL));
+	}
+	UT_ASSERT_EQ(queued, count);
+	capacity_expect_queues(1, count + 1, 0, count);
+	master_request.opcode = GES_REQ_OPCODE_RELEASE;
+	master_request.lockmode = RowExclusiveLock;
+	master_request.holder_node_id = blocker.node_id;
+	master_request.holder_procno = blocker.procno;
+	master_request.holder_cluster_epoch_lo = (uint32)blocker.cluster_epoch;
+	master_request.holder_cluster_epoch_hi = (uint32)(blocker.cluster_epoch >> 32);
+	master_request.holder_request_id_lo = (uint32)blocker.request_id;
+	master_request.holder_request_id_hi = (uint32)(blocker.request_id >> 32);
+	memset(capacity_replies, 0, sizeof(capacity_replies));
+	capacity_reply_count = 0;
+	master_reply_count = 0;
+	hw_reply_observe = capacity_observe_reply;
+	stage_master_work();
+	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+	UT_ASSERT_EQ(capacity_reply_count, count + 1);
+	UT_ASSERT_EQ(master_reply_count, count + 1);
+	capacity_expect_grant_reply(&request.resid, &blocker, GES_REQ_OPCODE_RELEASE);
+	UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &blocker, NULL));
+	for (int i = 0; i < count; i++) {
+		LOCKMODE mode = NoLock;
+
+		capacity_expect_grant_reply(&request.resid, &converts[i], GES_REQ_OPCODE_CONVERT);
+		UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &holders[i], NULL));
+		if (cluster_grd_holder_mode_by_id(&request.resid, &converts[i], &mode))
+			promoted++;
+		UT_ASSERT_EQ(mode, ShareLock);
+	}
+	printf("# lmon_release converts=%d queued=%d promoted=%d replies=%d expected=%d\n", count,
+		   queued, promoted, capacity_reply_count, count + 1);
+	UT_ASSERT_EQ(promoted, count);
+	capacity_expect_queues(1, count, 0, 0);
+	hw_reply_observe = NULL;
+	/* Clean both actual outcomes after RED; an unpromoted original owner or
+	 * pending convert must never be mistaken for a delivered GRANT. */
+	for (int i = 0; i < count; i++) {
+		(void)cluster_grd_cancel_convert_by_id(&request.resid, &converts[i], 15000 + i);
+		capacity_release_present(&request.resid, &converts[i]);
+		capacity_release_present(&request.resid, &holders[i]);
+	}
+	capacity_release_present(&request.resid, &blocker);
+	capacity_expect_counts(0, 0);
+	capacity_expect_stop(CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(ut_grd_pool_used, 0);
+	UT_ASSERT_EQ(ut_wfg_n, 0);
+	MyProc = NULL;
+}
+
+UT_TEST(real_lmon_release_delivers_all_16_compatible_convert_grants)
+{
+	capacity_lmon_release_converts(16);
+}
+
+UT_TEST(real_lmon_release_delivers_all_32_compatible_convert_grants)
+{
+	capacity_lmon_release_converts(32);
+}
+
 int
 main(void)
 {
 	MyBackendType = B_BACKEND;
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Same standalone watchdog; no product deadline is changed. */
-	UT_PLAN(20);
+	UT_PLAN(22);
 	UT_RUN(first_grd_attach_preserves_temporary_error_cleanup_scope);
 	UT_RUN(compatible_16_control_releases_exact_owners);
 	UT_RUN(compatible_17_owners_are_all_granted);
@@ -1043,6 +1188,8 @@ main(void)
 	UT_RUN(pool_full_never_partially_enqueues_waiter_and_release_reuses_bytes);
 	UT_RUN(pool_full_keeps_convert_original_holder_and_release_reuses_bytes);
 	UT_RUN(pool_full_never_orphans_reservation_and_release_reuses_bytes);
+	UT_RUN(real_lmon_release_delivers_all_16_compatible_convert_grants);
+	UT_RUN(real_lmon_release_delivers_all_32_compatible_convert_grants);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
