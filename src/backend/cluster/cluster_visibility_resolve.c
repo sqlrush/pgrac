@@ -39,6 +39,7 @@
 #include "storage/bufpage.h"
 #include "storage/lwlock.h" /* GCS-race round-3b: XactTruncationLock CLOG gate */
 #include "storage/proc.h"
+#include "utils/snapmgr.h"
 #include "utils/wait_event.h" /* spec-6.14 D10b ClusterCatalogVisResolve */
 
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b counters */
@@ -136,6 +137,75 @@ static struct {
 	ClusterUndoTTSlotRef ref;
 } vis_snapshot_bound;
 
+/* One terminal proof for the actual retained scratch evaluator. This is
+ * metadata only, not a CR page cache or a replacement for read admission.
+ * Full physical DATA identity is retained even when canonical TT was reused. */
+typedef struct VisScratchProofKey {
+	uint64 snapshot_identity;
+	uint64 epoch;
+	SCN read_scn;
+	ResourceOwner owner;
+	ClusterTxLocator locator;
+	ClusterUndoTTSlotRef ref;
+	LocalTransactionId lxid;
+	uint16 itl_wrap;
+	uint8 itl_flags;
+	uint8 reserved;
+} VisScratchProofKey;
+
+static struct {
+	VisScratchProofKey key;
+	SCN commit_scn;
+	uint8 status;
+	bool is_bound;
+	bool valid;
+} vis_scratch_proof;
+
+StaticAssertDecl(sizeof(VisScratchProofKey) == 96, "scratch proof key size");
+StaticAssertDecl(sizeof(vis_scratch_proof) == 112, "scratch proof metadata size");
+
+static bool
+vis_scratch_proof_key(const ClusterUndoTTSlotRef *ref, const ClusterTxLocator *locator,
+					  const ClusterItlSlotData *slot, SCN read_scn, VisScratchProofKey *key)
+{
+	Snapshot actual;
+	SCN retained_floor;
+	const char *reason;
+	uint64 identity;
+
+	if (!cluster_shared_config || !cluster_page_scn_shortcut || MyProc == NULL
+		|| !LocalTransactionIdIsValid(MyProc->lxid) || CurrentResourceOwner == NULL
+		|| ref->origin_node_id != cluster_node_id || ref->cluster_epoch == 0
+		|| ref->cluster_epoch != cluster_epoch_get_current()
+		|| !cluster_snapshot_read_evidence_v1(read_scn, &actual, &retained_floor, &reason)
+		|| !cluster_snapshot_cr_identity_v1(actual, &identity))
+		return false;
+
+	/* No implicit padding in either fixed-layout locator/ref. Canonicalize
+	 * the ref's explicit unused bytes before exact key comparison. */
+	memset(key, 0, sizeof(*key));
+	key->snapshot_identity = identity;
+	key->epoch = ref->cluster_epoch;
+	key->read_scn = read_scn;
+	key->owner = CurrentResourceOwner;
+	key->locator = *locator;
+	key->ref = *ref;
+	memset(key->ref._padding, 0, sizeof(key->ref._padding));
+	key->lxid = MyProc->lxid;
+	key->itl_wrap = slot->wrap;
+	key->itl_flags = slot->flags;
+	return true;
+}
+
+static bool
+vis_scratch_proof_terminal(const ClusterVisResolve *out, SCN read_scn)
+{
+	return out->evidence == CLUSTER_VIS_EVIDENCE_REMOTE
+		   && ((out->status == CLUSTER_TT_STATUS_ABORTED && !out->commit_scn_is_bound)
+			   || (out->status == CLUSTER_TT_STATUS_COMMITTED && SCN_VALID(out->commit_scn)
+				   && (!out->commit_scn_is_bound || scn_time_cmp(out->commit_scn, read_scn) <= 0)));
+}
+
 static bool
 vis_snapshot_bound_context(const ClusterUndoTTSlotRef *ref, SCN read_scn)
 {
@@ -228,6 +298,7 @@ cluster_vis_resolve_abort_reset(void)
 {
 	cluster_vis_resolve_depth = 0;
 	vis_snapshot_bound.valid = false;
+	vis_scratch_proof.valid = false;
 }
 
 
@@ -1213,6 +1284,20 @@ cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionI
 	out->diagnostic_reason = NULL;
 	classify_ref(raw_xid, &ref, PageGetLSN(page), read_scn, &locator, out);
 	if (out->evidence == CLUSTER_VIS_EVIDENCE_LOCAL) {
+		VisScratchProofKey before;
+		VisScratchProofKey after;
+		bool eligible = vis_scratch_proof_key(&ref, &locator, slot, read_scn, &before);
+
+		if (eligible && vis_scratch_proof.valid
+			&& memcmp(&before, &vis_scratch_proof.key, sizeof(before)) == 0) {
+			out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+			out->status = vis_scratch_proof.status;
+			out->commit_scn = vis_scratch_proof.commit_scn;
+			out->commit_scn_is_bound = vis_scratch_proof.is_bound;
+			return;
+		}
+		/* An ERROR or unknown verdict must not resurrect the previous item. */
+		vis_scratch_proof.valid = false;
 		/* LOCAL normally delegates to native tuple visibility. That is not
 		 * a valid fallback for a foreign-produced immutable scratch image.
 		 * The same exact origin service also handles our own DATA records. */
@@ -1276,6 +1361,15 @@ cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionI
 			cluster_vis_resolve_depth--;
 		}
 		PG_END_TRY();
+		if (eligible && vis_scratch_proof_terminal(out, read_scn)
+			&& vis_scratch_proof_key(&ref, &locator, slot, read_scn, &after)
+			&& memcmp(&before, &after, sizeof(before)) == 0) {
+			vis_scratch_proof.key = before;
+			vis_scratch_proof.status = out->status;
+			vis_scratch_proof.commit_scn = out->commit_scn;
+			vis_scratch_proof.is_bound = out->commit_scn_is_bound;
+			vis_scratch_proof.valid = true;
+		}
 	}
 }
 

@@ -145,6 +145,34 @@ bool cluster_crossnode_runtime_visibility = false;
 bool cluster_crossnode_write_write = false;
 bool cluster_cf_terminal_authority = false;
 bool cluster_page_scn_shortcut = false;
+bool cluster_shared_config = false;
+ResourceOwner CurrentResourceOwner;
+static SnapshotData ut_scratch_snapshot;
+static bool ut_scratch_retained;
+static bool ut_scratch_identity_valid;
+static bool ut_scratch_drift_after_proof;
+
+/* Explicit snapshot/retention boundary. Real native lifecycle is covered by
+ * test_cluster_snapshot_admission; absent evidence never enables this memo. */
+bool
+cluster_snapshot_read_evidence_v1(SCN read_scn, Snapshot *actual, SCN *floor, const char **reason)
+{
+	*actual = &ut_scratch_snapshot;
+	*floor = ut_scratch_retained ? read_scn : InvalidScn;
+	*reason = ut_scratch_retained ? NULL : "unretained fixture";
+	return ut_scratch_retained && read_scn == ut_scratch_snapshot.read_scn;
+}
+
+bool
+cluster_snapshot_cr_identity_v1(Snapshot actual, uint64 *identity)
+{
+	if (!ut_scratch_retained || !ut_scratch_identity_valid || actual != &ut_scratch_snapshot
+		|| actual->read_epoch != cluster_epoch_get_current())
+		return false;
+	*identity = actual->cluster_cr_identity;
+	return *identity != 0;
+}
+
 static PGPROC ut_bound_proc;
 PGPROC *MyProc = NULL;
 static bool ut_bound_fixture;
@@ -367,6 +395,11 @@ ut_reset(ClusterTTStatus status, SCN scn)
 	UT_ASSERT(ut_snapshot_scope == NULL);
 	cluster_vis_resolve_abort_reset();
 	cluster_page_scn_shortcut = false;
+	cluster_shared_config = false;
+	CurrentResourceOwner = NULL;
+	ut_scratch_retained = ut_scratch_identity_valid = false;
+	ut_scratch_drift_after_proof = false;
+	memset(&ut_scratch_snapshot, 0, sizeof(ut_scratch_snapshot));
 	MyProc = NULL;
 	ut_bound_fixture = false;
 	ut_bound_epoch_drift = false;
@@ -606,6 +639,8 @@ cluster_undo_verdict_resolve_freshref_c1b_pair(int origin_node, uint32 undo_segm
 {
 	ut_calls.wire++;
 	ut_calls.pair_resolve++;
+	if (ut_scratch_drift_after_proof)
+		ut_scratch_snapshot.cluster_cr_identity++;
 	if (ut_bound_fixture) {
 		UT_ASSERT_EQ(origin_node, ut_bound_ref.origin_node_id);
 		UT_ASSERT_EQ(undo_segment_id, ut_bound_ref.undo_segment_id);
@@ -2695,10 +2730,209 @@ UT_TEST(test_native_scratch_creator_keeps_independent_deleter)
 		}
 }
 
+static void
+ut_scratch_memo_setup(int scenario)
+{
+	ut_full_scratch_exact_case(false, true, scenario);
+	memset(&ut_calls, 0, sizeof(ut_calls));
+	cluster_shared_config = cluster_page_scn_shortcut = true;
+	CurrentResourceOwner = (ResourceOwner)&ut_bound_proc;
+	ut_bound_proc.lxid = 42;
+	MyProc = &ut_bound_proc;
+	ut_exit_ref.cluster_epoch = ut_current_epoch = UT_CLUSTER_EPOCH;
+	ut_scratch_snapshot.snapshot_type = SNAPSHOT_MVCC;
+	ut_scratch_snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	ut_scratch_snapshot.read_scn = UT_READ_SCN;
+	ut_scratch_snapshot.read_epoch = UT_CLUSTER_EPOCH;
+	ut_scratch_snapshot.cluster_cr_identity = 100;
+	ut_scratch_retained = ut_scratch_identity_valid = true;
+}
+
+static ClusterVisResolve
+ut_scratch_memo_resolve(void)
+{
+	ClusterVisResolve out;
+
+	cluster_visibility_resolve_scratch_scn(ut_visibility_page.data, 0, UT_RAW_XID,
+										   ut_scratch_snapshot.read_scn, &out);
+	return out;
+}
+
+UT_TEST(test_local_scratch_exact_proof_reused_with_full_identity)
+{
+	ut_scratch_memo_setup(12);
+	for (int i = 0; i < 100; i++) {
+		ClusterVisResolve out = ut_scratch_memo_resolve();
+		UT_ASSERT_EQ(out.evidence, CLUSTER_VIS_EVIDENCE_REMOTE);
+		UT_ASSERT_EQ(out.status, CLUSTER_TT_STATUS_COMMITTED);
+		UT_ASSERT_EQ(out.commit_scn, UT_COMMIT_SCN);
+		UT_ASSERT(!out.commit_scn_is_bound);
+	}
+	UT_ASSERT_EQ(ut_calls.pair_resolve, 1);
+	UT_ASSERT_EQ(ut_calls.memo_install, 0);
+}
+
+UT_TEST(test_local_scratch_bound_proof_is_never_upgraded_to_exact)
+{
+	ut_scratch_memo_setup(16);
+	for (int i = 0; i < 100; i++) {
+		ClusterVisResolve out = ut_scratch_memo_resolve();
+		UT_ASSERT_EQ(out.status, CLUSTER_TT_STATUS_COMMITTED);
+		UT_ASSERT_EQ(out.commit_scn, UT_COMMIT_SCN);
+		UT_ASSERT(out.commit_scn_is_bound);
+	}
+	UT_ASSERT_EQ(ut_calls.pair_resolve, 1);
+	UT_ASSERT_EQ(ut_calls.memo_install, 0);
+}
+
+UT_TEST(test_local_scratch_aborted_proof_reuses_exact_origin_resolution)
+{
+	ut_scratch_memo_setup(1);
+	for (int i = 0; i < 100; i++) {
+		ClusterVisResolve out = ut_scratch_memo_resolve();
+		UT_ASSERT_EQ(out.status, CLUSTER_TT_STATUS_ABORTED);
+		UT_ASSERT(!out.commit_scn_is_bound);
+	}
+	UT_ASSERT_EQ(ut_calls.exact_resolve, 1);
+}
+
+UT_TEST(test_local_scratch_unknown_active_prepared_and_bad_bounds_not_cached)
+{
+	const int scenarios[] = { 2, 4, 5, 6, 13, 14, 15, 21, 25 };
+	for (int i = 0; i < lengthof(scenarios); i++) {
+		ut_scratch_memo_setup(scenarios[i]);
+		(void)ut_scratch_memo_resolve();
+		(void)ut_scratch_memo_resolve();
+		UT_ASSERT(ut_calls.exact_resolve + ut_calls.pair_resolve >= 2);
+	}
+}
+
+UT_TEST(test_local_scratch_key_or_retention_change_cannot_rescue_unknown)
+{
+	for (int which = 0; which < 19; which++) {
+		ClusterItlSlotData *slot;
+		ClusterVisResolve out;
+
+		ut_scratch_memo_setup(12);
+		(void)ut_scratch_memo_resolve();
+		slot = ClusterPageGetItlSlots(ut_visibility_page.data);
+		switch (which) {
+		case 0:
+			ut_scratch_snapshot.cluster_cr_identity++;
+			break;
+		case 1:
+			ut_scratch_snapshot.read_scn++;
+			break;
+		case 2:
+			ut_current_epoch++;
+			ut_exit_ref.cluster_epoch++;
+			break;
+		case 3:
+			ut_scratch_retained = false;
+			break;
+		case 4:
+			ut_scratch_identity_valid = false;
+			break;
+		case 5:
+			CurrentResourceOwner = (ResourceOwner)&ut_scratch_snapshot;
+			break;
+		case 6:
+			ut_bound_proc.lxid++;
+			break;
+		case 7:
+			slot->undo_segment_head.raw[0]++;
+			break;
+		case 8:
+			slot->undo_segment_head.raw[1]++;
+			break;
+		case 9:
+			slot->wrap++;
+			break;
+		case 10:
+			slot->flags = ITL_FLAG_ACTIVE;
+			break;
+		case 11:
+			ut_exit_ref.tt_slot_id++;
+			break;
+		case 12:
+			ut_exit_ref.undo_segment_id++;
+			break;
+		case 13:
+			ut_exit_ref.cached_commit_scn++;
+			break;
+		case 14:
+			ut_exit_ref.has_cached_status = false;
+			break;
+		case 15:
+			cluster_vis_resolve_abort_reset();
+			break;
+		case 16:
+			cluster_shared_config = false;
+			break;
+		case 17:
+			cluster_page_scn_shortcut = false;
+			break;
+		case 18:
+			MyProc = NULL;
+			break;
+		}
+		ut_bound_fixture = true;
+		ut_bound_ref = ut_exit_ref;
+		ut_bound_read_scn = ut_scratch_snapshot.read_scn;
+		ut_pair_verdict.kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+		out = ut_scratch_memo_resolve();
+		UT_ASSERT_EQ(out.status, CLUSTER_TT_STATUS_UNKNOWN);
+		UT_ASSERT(ut_calls.pair_resolve + ut_calls.exact_resolve > 1);
+	}
+}
+
+UT_TEST(test_local_scratch_late_proof_cannot_install_under_new_snapshot)
+{
+	ut_scratch_memo_setup(12);
+	ut_scratch_drift_after_proof = true;
+	(void)ut_scratch_memo_resolve();
+	ut_scratch_drift_after_proof = false;
+	ut_pair_verdict.kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+	UT_ASSERT_EQ(ut_scratch_memo_resolve().status, CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT_EQ(ut_calls.pair_resolve, 2);
+}
+
+UT_TEST(test_local_scratch_error_retires_previous_proof)
+{
+	ClusterItlSlotData *slot;
+	volatile bool caught = false;
+
+	ut_scratch_memo_setup(12);
+	(void)ut_scratch_memo_resolve();
+	slot = ClusterPageGetItlSlots(ut_visibility_page.data);
+	slot->wrap++;
+	ut_full_scratch_scenario = 20;
+	ut_error_armed = true;
+	if (sigsetjmp(ut_error_jump, 0) == 0)
+		(void)ut_scratch_memo_resolve();
+	else
+		caught = true;
+	ut_error_armed = false;
+	UT_ASSERT(caught);
+	UT_ASSERT(!cluster_vis_resolve_in_flight());
+	slot->wrap--;
+	ut_full_scratch_scenario = 12;
+	ut_pair_verdict.kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+	UT_ASSERT_EQ(ut_scratch_memo_resolve().status, CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT_EQ(ut_calls.pair_resolve, 3);
+}
+
 int
 main(void)
 {
-	UT_PLAN(53);
+	UT_PLAN(60);
+	UT_RUN(test_local_scratch_error_retires_previous_proof);
+	UT_RUN(test_local_scratch_exact_proof_reused_with_full_identity);
+	UT_RUN(test_local_scratch_bound_proof_is_never_upgraded_to_exact);
+	UT_RUN(test_local_scratch_aborted_proof_reuses_exact_origin_resolution);
+	UT_RUN(test_local_scratch_unknown_active_prepared_and_bad_bounds_not_cached);
+	UT_RUN(test_local_scratch_key_or_retention_change_cannot_rescue_unknown);
+	UT_RUN(test_local_scratch_late_proof_cannot_install_under_new_snapshot);
 	UT_RUN(test_native_scratch_proof_covers_both_origins_and_slot_reuse);
 	UT_RUN(test_native_scratch_sealed_status_alphabet);
 	UT_RUN(test_native_scratch_coverage_widening_and_truncation_refuse);
