@@ -4974,7 +4974,8 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 			 * broken traversed edge. The outer caller still revalidates its
 			 * current input or continuous scan scope, and never marks this
 			 * index entry all-dead. */
-			if (at_chain_start && !ItemIdIsUsed(lp)
+			if (at_chain_start
+				&& (!ItemIdIsUsed(lp) || (scoped_full && ItemIdIsDead(lp)))
 				&& ItemIdGetOffset(lp) == 0 && ItemIdGetLength(lp) == 0)
 				return false;
 			if (ItemIdIsRedirected(lp) && at_chain_start)
@@ -5009,6 +5010,18 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 				prev_xmax, HeapTupleHeaderGetXmin(result->tuple.t_data)))
 			heap_hot_r4_unknown("HOT predecessor identity does not match xmin");
 
+		/* This optional cache has no current authority for MultiXact I/O.
+		 * Return to the original visibility owner before evaluating this
+		 * known unsupported shape; actual UNKNOWN outcomes still throw. */
+		if (scoped_full
+			&& (result->tuple.t_data->t_infomask & HEAP_XMAX_IS_MULTI) != 0
+			&& (result->tuple.t_data->t_infomask & HEAP_XMAX_INVALID) == 0
+			&& !HEAP_XMAX_IS_LOCKED_ONLY(result->tuple.t_data->t_infomask))
+		{
+			result->cr_unsupported = true;
+			return false;
+		}
+
 		if (HeapTupleSatisfiesMVCCScratch(&result->tuple, snapshot, &context))
 			return true;
 
@@ -5018,7 +5031,14 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 			|| ItemPointerGetBlockNumber(&result->tuple.t_data->t_ctid) != blkno)
 			heap_hot_r4_unknown("HOT chain crosses the reconstructed block");
 		if ((result->tuple.t_data->t_infomask & HEAP_XMAX_IS_MULTI) != 0)
+		{
+			if (scoped_full)
+			{
+				result->cr_unsupported = true;
+				return false;
+			}
 			heap_hot_r4_unknown("scratch HOT predecessor requires MultiXact I/O");
+		}
 
 		offnum = ItemPointerGetOffsetNumber(&result->tuple.t_data->t_ctid);
 		at_chain_start = false;
@@ -5267,11 +5287,10 @@ heap_index_fetch_cr_result(IndexFetchHeapData *hscan, ItemPointer tid,
 	ClusterSemanticAdmissionResult admission_result;
 	ClusterSnapshotReadScopeV1 read_scope;
 	BufferCrKey key;
-	Buffer volatile reservation = InvalidBuffer;
 	ItemPointerData logical_root = *tid;
 	uint64 snapshot_id;
 	bool found;
-	bool hit;
+	bool handled = false;
 
 	if (!heap_index_cr_eligible(hscan, snapshot))
 	{
@@ -5319,39 +5338,24 @@ heap_index_fetch_cr_result(IndexFetchHeapData *hscan, ItemPointer tid,
 			key.read_scn = snapshot->read_scn;
 			key.read_epoch = snapshot->read_epoch;
 			memset(result, 0, sizeof(*result));
-			hit = cluster_bufmgr_cr_copy_v1(&key, result->scratch_page);
-			if (!hit)
+			if (cluster_bufmgr_cr_copy_v1(&key, result->scratch_page))
 			{
-				ClusterCrBuildResult build_result;
-				ClusterCrBuildReason build_reason = CLUSTER_CR_BUILD_PROTOCOL;
-
-				reservation = cluster_bufmgr_cr_reserve_v1();
 				heap_index_cr_recheck(hscan, snapshot, &admission);
-				build_result = cluster_gcs_block_cr_fetch_and_wait(
-					key.tag, key.read_scn, result->scratch_page, &build_reason);
-				if (build_result != CLUSTER_CR_BUILD_FULL
-					|| build_reason != CLUSTER_CR_BUILD_NONE)
-					heap_hot_r4_full_failure(key.read_scn, build_result, build_reason);
-			}
-			heap_index_cr_recheck(hscan, snapshot, &admission);
-			found = heap_hot_r4_search_scratch(&key.tag, &logical_root,
-												hscan->xs_base.rel, snapshot, result, true);
-			heap_index_cr_recheck(hscan, snapshot, &admission);
-			if (!hit)
-			{
-				(void) cluster_bufmgr_cr_publish_v1(reservation, &key,
-													   result->scratch_page);
+				found = heap_hot_r4_search_scratch(&key.tag, &logical_root,
+												 hscan->xs_base.rel, snapshot, result, true);
 				heap_index_cr_recheck(hscan, snapshot, &admission);
+				handled = !result->cr_unsupported;
+				result->kind = found ? HEAP_HOT_SEARCH_OWNED_SCRATCH
+									 : HEAP_HOT_SEARCH_NOT_FOUND;
+				if (found)
+					*tid = result->tuple.t_self;
 			}
-			result->kind = found ? HEAP_HOT_SEARCH_OWNED_SCRATCH
-								 : HEAP_HOT_SEARCH_NOT_FOUND;
-			if (found)
-				*tid = result->tuple.t_self;
+			/* A miss must acquire current S through the original owner.
+			 * In particular, do not enter holder-moved retry with no holder,
+			 * or force FULL for tuples the live path can already decide. */
 		}
 		PG_FINALLY();
 		{
-			if (BufferIsValid(reservation))
-				ReleaseBuffer(reservation);
 			cluster_snapshot_read_exit_v1(&read_scope);
 			cluster_semantic_activation_leave(&admission);
 		}
@@ -5363,8 +5367,85 @@ heap_index_fetch_cr_result(IndexFetchHeapData *hscan, ItemPointer tid,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	return handled;
+}
+/* Inspect once per publication, not once per tuple hit. Unsupported pages
+ * stay with the original current/FULL consumer and are never installed. */
+static bool
+heap_index_cr_page_supported(Page page)
+{
+	PageHeader header = (PageHeader) page;
+	OffsetNumber offnum;
+
+	if (!heap_hot_r4_scratch_page_valid(page))
+		return false;
+	for (offnum = FirstOffsetNumber; offnum <= PageGetMaxOffsetNumber(page); offnum++)
+	{
+		ItemId lp = PageGetItemId(page, offnum);
+		Size offset = ItemIdGetOffset(lp);
+		Size length = ItemIdGetLength(lp);
+		HeapTupleHeader tuple;
+
+		if (!ItemIdIsNormal(lp))
+			continue;
+		if (length < SizeofHeapTupleHeader || offset < header->pd_upper
+			|| offset > header->pd_special || length > header->pd_special - offset)
+			return false;
+		tuple = (HeapTupleHeader) ((char *) page + offset);
+		if (tuple->t_hoff < SizeofHeapTupleHeader || tuple->t_hoff > length)
+			return false;
+		if ((tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0
+			&& (tuple->t_infomask & HEAP_XMAX_INVALID) == 0
+			&& (!HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask)
+				|| (tuple->t_infomask2 & HEAP_HOT_UPDATED) != 0))
+			return false;
+	}
 	return true;
 }
+
+/* Called after current SHARE is released, only for an original, revalidated
+ * FULL result. Neither a selected current tuple nor a failed build qualifies. */
+void
+heap_index_publish_cr_result(IndexFetchHeapData *hscan, BlockNumber block,
+							 Snapshot snapshot, const HeapHotSearchResult *result)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterSnapshotReadScopeV1 read_scope;
+	BufferCrKey key;
+	Buffer volatile reservation = InvalidBuffer;
+
+	if (!result->cr_full_page || hscan->cr_scope.scan_id == 0
+		|| !heap_index_cr_page_supported((Page) result->scratch_page))
+		return;
+	if (cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+										 CLUSTER_SEMANTIC_TARGET_SIDE, &admission)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		heap_hot_r4_unknown("read-only FULL publication TARGET admission refused");
+	cluster_snapshot_read_enter_v1(&read_scope, snapshot);
+	PG_TRY();
+	{
+		heap_index_cr_recheck(hscan, snapshot, &admission);
+		memset(&key, 0, sizeof(key));
+		InitBufferTag(&key.tag, &hscan->cr_scope.locator, MAIN_FORKNUM, block);
+		key.scan_identity = hscan->cr_scope.scan_id;
+		key.snapshot_identity = hscan->cr_scope.snapshot_id;
+		key.read_scn = hscan->cr_scope.read_scn;
+		key.read_epoch = hscan->cr_scope.read_epoch;
+		reservation = cluster_bufmgr_cr_reserve_v1();
+		heap_index_cr_recheck(hscan, snapshot, &admission);
+		(void) cluster_bufmgr_cr_publish_v1(reservation, &key, result->scratch_page);
+		heap_index_cr_recheck(hscan, snapshot, &admission);
+	}
+	PG_FINALLY();
+	{
+		if (BufferIsValid(reservation))
+			ReleaseBuffer(reservation);
+		cluster_snapshot_read_exit_v1(&read_scope);
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+}
+
 #endif
 
 #ifdef USE_CLUSTER_UNIT
@@ -5517,6 +5598,7 @@ restart_live_search:
 										 build_reason);
 				if (outcome == HEAP_HOT_R4_CYCLE_FOUND)
 				{
+					result->cr_full_page = true;
 					*tid = result->tuple.t_self;
 					if (all_dead)
 						*all_dead = false;
@@ -5524,6 +5606,7 @@ restart_live_search:
 				}
 				if (outcome == HEAP_HOT_R4_CYCLE_NOT_FOUND)
 				{
+					result->cr_full_page = true;
 					if (all_dead)
 						*all_dead = false;
 					heap_hot_r4_log_miss(relation, buffer, snapshot, &logical_root,

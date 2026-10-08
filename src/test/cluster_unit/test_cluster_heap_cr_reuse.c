@@ -62,7 +62,9 @@ static PGAlignedBlock stored_page;
 static HeapHotSearchResult result;
 static ItemPointerData tid;
 static unsigned native_reads, native_locks, native_searches, slot_stores, frees;
-static bool current_pin;
+static bool current_pin, content_share;
+static unsigned native_mode; /* 0 original FULL, 1 live tuple, 2 live absence */
+static PGAlignedBlock full_page;
 static TupleTableSlot test_slot = { .tts_ops = &TTSOpsBufferHeapTuple };
 
 const TupleTableSlotOps TTSOpsBufferHeapTuple = { 0 };
@@ -175,6 +177,7 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 Buffer
 cluster_bufmgr_cr_reserve_v1(void)
 {
+	UT_ASSERT(!content_share);
 	reserves++;
 	pins++;
 	return 1;
@@ -231,7 +234,9 @@ ClusterCrBuildResult
 cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN scn, char *page,
 									ClusterCrBuildReason *reason)
 {
-	UT_ASSERT_EQ(pins, 1);
+	UT_ASSERT_EQ(pins, 0);
+	UT_ASSERT(current_pin && !content_share);
+	UT_ASSERT(native_reads > 0 && native_locks > 0);
 	UT_ASSERT_EQ(admission_depth, 1);
 	UT_ASSERT_EQ(tag.blockNum, 7);
 	UT_ASSERT_EQ(scn, snapshot.read_scn);
@@ -252,7 +257,7 @@ cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN scn, char *page,
 		target = false;
 	if (fault == 9)
 		CurrentResourceOwner = (ResourceOwner)(uintptr_t)2;
-	build_page(page);
+	memcpy(page, full_page.data, BLCKSZ);
 	*reason = build_reason;
 	return build_result;
 }
@@ -318,6 +323,7 @@ LockBuffer(Buffer buffer pg_attribute_unused(), int mode)
 {
 	if (mode == BUFFER_LOCK_SHARE)
 		native_locks++;
+	content_share = mode == BUFFER_LOCK_SHARE;
 }
 bool
 ClusterLockBufferShareBarrierAware(Buffer buffer)
@@ -326,17 +332,52 @@ ClusterLockBufferShareBarrierAware(Buffer buffer)
 	return true;
 }
 
+/* The original current/FULL implementation has its own production-body
+ * lock-order suite. Here its output boundary models FULL vs live, and the
+ * actual handler/cache owner must never turn a live result into a FULL. */
 HeapHotSearchResultKind
-heap_hot_search_buffer_result(ItemPointer root pg_attribute_unused(),
-							  Relation rel pg_attribute_unused(),
-							  Buffer buffer pg_attribute_unused(),
-							  Snapshot snap pg_attribute_unused(), HeapHotSearchResult *out,
-							  bool *all_dead, bool first pg_attribute_unused())
+heap_hot_search_buffer_result(ItemPointer root, Relation rel, Buffer buffer, Snapshot snap,
+							  HeapHotSearchResult *out, bool *all_dead,
+							  bool first pg_attribute_unused())
 {
+	ClusterSemanticAdmissionToken admission;
+	ClusterSnapshotReadScopeV1 read_scope;
+	BufferTag tag;
+	ClusterCrBuildReason reason;
+	ClusterCrBuildResult rc;
+	bool found = false;
+
+	UT_ASSERT(current_pin && content_share);
 	native_searches++;
+	memset(out, 0, sizeof(*out));
 	if (all_dead != NULL)
-		*all_dead = true;
-	out->kind = HEAP_HOT_SEARCH_NOT_FOUND;
+		*all_dead = native_mode == 2;
+	if (native_mode != 0) {
+		out->kind = native_mode == 1 ? HEAP_HOT_SEARCH_OWNED_CURRENT : HEAP_HOT_SEARCH_NOT_FOUND;
+		return out->kind;
+	}
+	InitBufferTag(&tag, &rel->rd_locator, MAIN_FORKNUM, ItemPointerGetBlockNumber(root));
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_TARGET_SIDE, &admission),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	cluster_snapshot_read_enter_v1(&read_scope, snap);
+	PG_TRY();
+	{
+		rc = cluster_gcs_block_cr_fetch_and_wait(tag, snap->read_scn, out->scratch_page, &reason);
+		if (rc != CLUSTER_CR_BUILD_FULL || reason != CLUSTER_CR_BUILD_NONE)
+			heap_hot_r4_full_failure(snap->read_scn, rc, reason);
+		found = heap_hot_r4_search_scratch(&tag, root, rel, snap, out, false);
+		out->cr_full_page = true;
+	}
+	PG_FINALLY();
+	{
+		cluster_snapshot_read_exit_v1(&read_scope);
+		cluster_semantic_activation_leave(&admission);
+		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	}
+	PG_END_TRY();
+	out->kind = found ? HEAP_HOT_SEARCH_OWNED_SCRATCH : HEAP_HOT_SEARCH_NOT_FOUND;
 	return out->kind;
 }
 
@@ -349,8 +390,8 @@ heapam_store_hot_search_result(HeapHotSearchResult *out, TupleTableSlot *slot pg
 	slot_stores++;
 	if (fault == 13)
 		pg_re_throw();
-	if (out->kind == HEAP_HOT_SEARCH_OWNED_SCRATCH)
-		UT_ASSERT_EQ(buffer, InvalidBuffer);
+	UT_ASSERT(buffer == InvalidBuffer || buffer == 2);
+	result = *out;
 	*call_again = false;
 	return out->kind == HEAP_HOT_SEARCH_NOT_FOUND ? TABLE_INDEX_FETCH_NOT_FOUND
 												  : TABLE_INDEX_FETCH_FOUND;
@@ -397,7 +438,9 @@ setup(void)
 	admission_depth = snapshot_depth = pins = 0;
 	copies = reserves = fetches = publishes = searches = releases = fault = 0;
 	native_reads = native_locks = native_searches = slot_stores = frees = 0;
-	current_pin = false;
+	current_pin = content_share = false;
+	native_mode = 0;
+	build_page(full_page.data);
 	build_result = CLUSTER_CR_BUILD_FULL;
 	build_reason = CLUSTER_CR_BUILD_NONE;
 	entry_result = CLUSTER_SEMANTIC_ADMISSION_OK;
@@ -420,13 +463,62 @@ call_throws(void)
 	return threw;
 }
 
+/* Seed an existing version without asking the miss path to construct one. */
+static void
+seed_cached_page(void)
+{
+	HeapReadOnlyCrScope *scope = &scan.cr_scope;
+	scope->relation = &relation;
+	scope->owner = CurrentResourceOwner;
+	scope->locator = relation.rd_locator;
+	scope->relation_oid = relation.rd_id;
+	scope->command_id = snapshot.curcid;
+	scope->snapshot_id = snapshot_identity;
+	scope->read_scn = snapshot.read_scn;
+	scope->read_epoch = snapshot.read_epoch;
+	scope->scan_id = ++next_scope;
+	memset(&stored_key, 0, sizeof(stored_key));
+	InitBufferTag(&stored_key.tag, &scope->locator, MAIN_FORKNUM, 7);
+	stored_key.scan_identity = scope->scan_id;
+	stored_key.snapshot_identity = snapshot_identity;
+	stored_key.read_scn = snapshot.read_scn;
+	stored_key.read_epoch = snapshot.read_epoch;
+	build_page(stored_page.data);
+	stored = true;
+}
+
+static TableIndexFetchTupleResult
+handler_fetch(void)
+{
+	bool again = false, dead = true;
+	return heapam_index_fetch_tuple_internal(&scan.xs_base, &tid, &snapshot, &test_slot, &again,
+											 &dead, false, NULL, NULL);
+}
+
+static bool
+handler_throws(void)
+{
+	volatile bool threw = false;
+	PG_TRY();
+	{
+		(void)handler_fetch();
+	}
+	PG_CATCH();
+	{
+		threw = true;
+	}
+	PG_END_TRY();
+	return threw;
+}
+
 UT_TEST(miss_full_then_same_scan_hit_keeps_original_visibility)
 {
 	setup();
-	UT_ASSERT(heap_index_fetch_cr_result(&scan, &tid, &snapshot, &result));
+	UT_ASSERT_EQ(handler_fetch(), TABLE_INDEX_FETCH_FOUND);
 	UT_ASSERT_EQ(result.kind, HEAP_HOT_SEARCH_OWNED_SCRATCH);
 	UT_ASSERT_EQ(fetches, 1);
 	UT_ASSERT_EQ(publishes, 1);
+	UT_ASSERT_EQ(native_reads, 1);
 	UT_ASSERT_EQ(scan.cr_scope.scan_id, next_scope);
 	UT_ASSERT(heap_index_fetch_cr_result(&scan, &tid, &snapshot, &result));
 	UT_ASSERT_EQ(fetches, 1);
@@ -442,7 +534,7 @@ UT_TEST(scope_changes_never_reuse_the_previous_image)
 	for (unsigned change = 0; change < 6; change++) {
 		uint64 old;
 		setup();
-		UT_ASSERT(heap_index_fetch_cr_result(&scan, &tid, &snapshot, &result));
+		seed_cached_page();
 		old = scan.cr_scope.scan_id;
 		if (change == 0)
 			snapshot_identity++;
@@ -456,9 +548,9 @@ UT_TEST(scope_changes_never_reuse_the_previous_image)
 			CurrentResourceOwner = (ResourceOwner)(uintptr_t)2;
 		if (change == 5)
 			memset(&scan.cr_scope, 0, sizeof(scan.cr_scope));
-		UT_ASSERT(heap_index_fetch_cr_result(&scan, &tid, &snapshot, &result));
+		UT_ASSERT(!heap_index_fetch_cr_result(&scan, &tid, &snapshot, &result));
 		UT_ASSERT(scan.cr_scope.scan_id != old);
-		UT_ASSERT_EQ(fetches, 2);
+		UT_ASSERT_EQ(fetches + publishes + searches, 0);
 	}
 }
 
@@ -467,7 +559,7 @@ UT_TEST(late_full_or_error_cannot_publish_or_keep_scope)
 	for (unsigned injection = 1; injection <= 12; injection++) {
 		setup();
 		fault = injection;
-		UT_ASSERT(call_throws());
+		UT_ASSERT(handler_throws());
 		UT_ASSERT_EQ(scan.cr_scope.scan_id, 0);
 		UT_ASSERT_EQ(pins + admission_depth + snapshot_depth, 0);
 		UT_ASSERT_EQ(publishes, injection == 12 ? 1 : 0);
@@ -499,8 +591,9 @@ UT_TEST(nonfull_or_nonpositive_result_never_becomes_cached)
 			build_result = CLUSTER_CR_BUILD_FAIL_CLOSED;
 		if (invalid == 2)
 			build_reason = CLUSTER_CR_BUILD_PROTOCOL;
-		UT_ASSERT(call_throws());
+		UT_ASSERT(handler_throws());
 		UT_ASSERT_EQ(publishes, 0);
+		UT_ASSERT_EQ(scan.cr_scope.scan_id, 0);
 		UT_ASSERT_EQ(pins + admission_depth + snapshot_depth, 0);
 	}
 }
@@ -564,7 +657,7 @@ UT_TEST(full_invisible_root_preserves_not_found)
 {
 	setup();
 	visible = false;
-	UT_ASSERT(heap_index_fetch_cr_result(&scan, &tid, &snapshot, &result));
+	UT_ASSERT_EQ(handler_fetch(), TABLE_INDEX_FETCH_NOT_FOUND);
 	UT_ASSERT_EQ(result.kind, HEAP_HOT_SEARCH_NOT_FOUND);
 	UT_ASSERT_EQ(publishes, 1);
 	UT_ASSERT_EQ(pins + admission_depth + snapshot_depth, 0);
@@ -574,17 +667,15 @@ UT_TEST(native_handler_hits_before_current_read_or_share)
 {
 	bool again = false, dead = true;
 	setup();
-	UT_ASSERT_EQ(heapam_index_fetch_tuple_internal(&scan.xs_base, &tid, &snapshot, &test_slot,
-												   &again, &dead, false, NULL, NULL),
-				 TABLE_INDEX_FETCH_FOUND);
+	seed_cached_page();
 	UT_ASSERT_EQ(heapam_index_fetch_tuple_internal(&scan.xs_base, &tid, &snapshot, &test_slot,
 												   &again, &dead, true, NULL, NULL),
 				 TABLE_INDEX_FETCH_FOUND);
-	UT_ASSERT_EQ(fetches, 1);
-	UT_ASSERT_EQ(searches, 2);
+	UT_ASSERT_EQ(fetches, 0);
+	UT_ASSERT_EQ(searches, 1);
 	UT_ASSERT_EQ(native_reads + native_locks + native_searches, 0);
 	UT_ASSERT(!again && !dead);
-	UT_ASSERT_EQ(slot_stores, 2);
+	UT_ASSERT_EQ(slot_stores, 1);
 	UT_ASSERT_EQ(scan.xs_cbuf, InvalidBuffer);
 	UT_ASSERT_EQ(sizeof(HeapReadOnlyCrScope), 72);
 }
@@ -607,21 +698,9 @@ UT_TEST(original_reset_and_end_retire_scope_and_current_pin)
 
 UT_TEST(slot_error_retires_scope_after_reservation_has_been_released)
 {
-	bool again = false, dead = true;
-	volatile bool threw = false;
 	setup();
 	fault = 13;
-	PG_TRY();
-	{
-		(void)heapam_index_fetch_tuple_internal(&scan.xs_base, &tid, &snapshot, &test_slot, &again,
-												&dead, false, NULL, NULL);
-	}
-	PG_CATCH();
-	{
-		threw = true;
-	}
-	PG_END_TRY();
-	UT_ASSERT(threw);
+	UT_ASSERT(handler_throws());
 	UT_ASSERT_EQ(scan.cr_scope.scan_id, 0);
 	UT_ASSERT_EQ(pins + admission_depth + snapshot_depth, 0);
 	UT_ASSERT_EQ(releases, 1);
@@ -629,12 +708,10 @@ UT_TEST(slot_error_retires_scope_after_reservation_has_been_released)
 
 UT_TEST(ordinary_noneligible_handler_preserves_current_path)
 {
-	bool again = false, dead = true;
 	setup();
 	own_xid = 88;
-	UT_ASSERT_EQ(heapam_index_fetch_tuple_internal(&scan.xs_base, &tid, &snapshot, &test_slot,
-												   &again, &dead, false, NULL, NULL),
-				 TABLE_INDEX_FETCH_NOT_FOUND);
+	native_mode = 2;
+	UT_ASSERT_EQ(handler_fetch(), TABLE_INDEX_FETCH_NOT_FOUND);
 	UT_ASSERT_EQ(native_reads, 1);
 	UT_ASSERT_EQ(native_locks, 1);
 	UT_ASSERT_EQ(native_searches, 1);
@@ -647,6 +724,7 @@ UT_TEST(cached_invisible_result_never_marks_index_entry_dead)
 {
 	bool again = false, dead = true;
 	setup();
+	seed_cached_page();
 	visible = false;
 	UT_ASSERT_EQ(heapam_index_fetch_tuple_internal(&scan.xs_base, &tid, &snapshot, &test_slot,
 												   &again, &dead, false, NULL, NULL),
@@ -658,23 +736,21 @@ UT_TEST(cached_invisible_result_never_marks_index_entry_dead)
 UT_TEST(cached_page_before_concurrent_insert_ignores_new_index_root)
 {
 	setup();
-	UT_ASSERT(heap_index_fetch_cr_result(&scan, &tid, &snapshot, &result));
-	UT_ASSERT_EQ(PageGetMaxOffsetNumber((Page)stored_page.data), 1);
+	seed_cached_page();
 	ItemPointerSetOffsetNumber(&tid, 2);
 	UT_ASSERT(!call_throws());
 	UT_ASSERT_EQ(result.kind, HEAP_HOT_SEARCH_NOT_FOUND);
-	UT_ASSERT_EQ(fetches, 1);
-	UT_ASSERT_EQ(searches, 1);
+	UT_ASSERT_EQ(fetches + searches, 0);
 	UT_ASSERT_EQ(pins + admission_depth + snapshot_depth, 0);
 }
 
 UT_TEST(cached_page_still_refuses_broken_hot_edges_and_invalid_roots)
 {
-	for (unsigned invalid = 0; invalid < 5; invalid++) {
+	for (unsigned invalid = 0; invalid < 6; invalid++) {
 		Page page;
 		HeapTupleHeader tuple;
 		setup();
-		UT_ASSERT(heap_index_fetch_cr_result(&scan, &tid, &snapshot, &result));
+		seed_cached_page();
 		page = (Page)stored_page.data;
 		tuple = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 1));
 		visible = false;
@@ -692,11 +768,116 @@ UT_TEST(cached_page_still_refuses_broken_hot_edges_and_invalid_roots)
 			ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn = snapshot.read_scn + 1;
 		if (invalid == 4)
 			((PageHeader)page)->pd_pagesize_version = 0;
+		if (invalid == 5) {
+			((PageHeader)page)->pd_lower += sizeof(ItemIdData);
+			ItemIdSetDead(PageGetItemId(page, 2));
+			ItemIdSetRedirect(PageGetItemId(page, 1), 2);
+		}
 		UT_ASSERT(call_throws());
 		UT_ASSERT_EQ(scan.cr_scope.scan_id, 0);
-		UT_ASSERT_EQ(fetches, 1);
+		UT_ASSERT_EQ(fetches, 0);
 		UT_ASSERT_EQ(pins + admission_depth + snapshot_depth, 0);
 	}
+}
+
+UT_TEST(miss_without_current_holder_returns_to_native_acquisition)
+{
+	/* Cold/evicted and ambiguous holder both lack a usable FULL source.
+	 * Cache miss must reach current acquisition without consulting that source. */
+	for (unsigned state = 0; state < 2; state++) {
+		setup();
+		build_result = CLUSTER_CR_BUILD_RETRYABLE;
+		native_mode = state == 0 ? 1 : 2;
+		UT_ASSERT(!call_throws());
+		UT_ASSERT_EQ(fetches + reserves + publishes, 0);
+		UT_ASSERT(!heap_index_fetch_cr_result(&scan, &tid, &snapshot, &result));
+		UT_ASSERT_EQ(handler_fetch(),
+					 state == 0 ? TABLE_INDEX_FETCH_FOUND : TABLE_INDEX_FETCH_NOT_FOUND);
+		UT_ASSERT_EQ(native_reads, 1);
+		UT_ASSERT_EQ(native_searches, 1);
+		UT_ASSERT_EQ(fetches + reserves + publishes, 0);
+	}
+}
+
+UT_TEST(cached_dead_root_is_not_found)
+{
+	bool again = false, dead = true;
+	setup();
+	seed_cached_page();
+	ItemIdSetDead(PageGetItemId((Page)stored_page.data, 1));
+	UT_ASSERT(!call_throws());
+	UT_ASSERT_EQ(result.kind, HEAP_HOT_SEARCH_NOT_FOUND);
+	UT_ASSERT_EQ(heapam_index_fetch_tuple_internal(&scan.xs_base, &tid, &snapshot, &test_slot,
+												   &again, &dead, false, NULL, NULL),
+				 TABLE_INDEX_FETCH_NOT_FOUND);
+	UT_ASSERT(!dead && !again);
+	UT_ASSERT_EQ(searches + fetches + publishes + native_reads, 0);
+}
+
+UT_TEST(cached_effective_multixact_returns_to_original_visibility)
+{
+	HeapTupleHeader tuple;
+	setup();
+	seed_cached_page();
+	tuple = (HeapTupleHeader)PageGetItem((Page)stored_page.data,
+										 PageGetItemId((Page)stored_page.data, 1));
+	tuple->t_infomask = HEAP_XMAX_IS_MULTI;
+	HeapTupleHeaderSetXmax(tuple, 45);
+	UT_ASSERT(!heap_index_fetch_cr_result(&scan, &tid, &snapshot, &result));
+	UT_ASSERT_EQ(searches + fetches + publishes, 0);
+	native_mode = 1;
+	UT_ASSERT_EQ(handler_fetch(), TABLE_INDEX_FETCH_FOUND);
+	UT_ASSERT_EQ(native_searches, 1);
+	UT_ASSERT_EQ(searches + fetches + publishes, 0);
+}
+
+UT_TEST(live_point_fetch_and_rescan_add_no_full_or_publication)
+{
+	setup();
+	native_mode = 1;
+	for (unsigned i = 0; i < 3; i++) {
+		UT_ASSERT_EQ(handler_fetch(), TABLE_INDEX_FETCH_FOUND);
+		heapam_index_fetch_reset(&scan.xs_base);
+	}
+	UT_ASSERT_EQ(native_reads, 3);
+	UT_ASSERT_EQ(fetches + publishes + reserves, 0);
+}
+
+UT_TEST(lock_only_multixact_cache_remains_eligible)
+{
+	HeapTupleHeader tuple;
+	setup();
+	seed_cached_page();
+	tuple = (HeapTupleHeader)PageGetItem((Page)stored_page.data,
+										 PageGetItemId((Page)stored_page.data, 1));
+	tuple->t_infomask = HEAP_XMAX_IS_MULTI | HEAP_XMAX_LOCK_ONLY;
+	UT_ASSERT(heap_index_fetch_cr_result(&scan, &tid, &snapshot, &result));
+	UT_ASSERT_EQ(result.kind, HEAP_HOT_SEARCH_OWNED_SCRATCH);
+	UT_ASSERT_EQ(searches, 1);
+	UT_ASSERT_EQ(fetches + native_reads, 0);
+}
+
+UT_TEST(full_with_unsupported_other_tuple_is_not_published)
+{
+	Page page;
+	PageHeader header;
+	HeapTupleHeader tuple;
+	Size length = MAXALIGN(SizeofHeapTupleHeader + 1);
+	setup();
+	page = (Page)full_page.data;
+	header = (PageHeader)page;
+	header->pd_lower += sizeof(ItemIdData);
+	header->pd_upper -= length;
+	ItemIdSetNormal(PageGetItemId(page, 2), header->pd_upper, length);
+	tuple = (HeapTupleHeader)(full_page.data + header->pd_upper);
+	tuple->t_hoff = SizeofHeapTupleHeader;
+	tuple->t_infomask = HEAP_XMAX_IS_MULTI;
+	HeapTupleHeaderSetXmin(tuple, 99);
+	HeapTupleHeaderSetXmax(tuple, 45);
+	UT_ASSERT_EQ(handler_fetch(), TABLE_INDEX_FETCH_FOUND);
+	UT_ASSERT_EQ(fetches, 1);
+	UT_ASSERT_EQ(publishes + reserves, 0);
+	UT_ASSERT(!stored);
 }
 
 int
@@ -718,7 +899,13 @@ main(void)
 	UT_RUN(cached_invisible_result_never_marks_index_entry_dead);
 	UT_RUN(cached_page_before_concurrent_insert_ignores_new_index_root);
 	UT_RUN(cached_page_still_refuses_broken_hot_edges_and_invalid_roots);
-	printf("1..16\n");
+	UT_RUN(miss_without_current_holder_returns_to_native_acquisition);
+	UT_RUN(cached_dead_root_is_not_found);
+	UT_RUN(cached_effective_multixact_returns_to_original_visibility);
+	UT_RUN(live_point_fetch_and_rescan_add_no_full_or_publication);
+	UT_RUN(lock_only_multixact_cache_remains_eligible);
+	UT_RUN(full_with_unsupported_other_tuple_is_not_published);
+	printf("1..22\n");
 	UT_DONE();
 	return ut_failed_count != 0;
 }

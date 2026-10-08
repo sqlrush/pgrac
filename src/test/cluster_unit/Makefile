@@ -8780,17 +8780,18 @@ test_cluster_heap_cr_reuse: test_cluster_heap_cr_reuse.c unit_test.h test_cluste
 
 
 test_cluster_heap_cr_reuse_owner.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
-	awk '/^(heap_index_cr_eligible|heap_index_cr_scope_matches)\(/ { print "static bool"; emit=1; found++ } \
+	awk '/^(heap_index_cr_eligible|heap_index_cr_scope_matches|heap_index_cr_page_supported)\(/ { print "static bool"; emit=1; found++ } \
 	     /^heap_index_cr_recheck\(/ { print "static void"; emit=1; found++ } \
 	     /^heap_index_fetch_cr_result\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
+	     /^heap_index_publish_cr_result\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 6) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 
 test_cluster_heap_cr_reuse_handler.inc: $(top_srcdir)/src/backend/access/heap/heapam_handler.c Makefile
 	awk '/^(heapam_index_fetch_reset|heapam_index_fetch_end)\(/ { print "static void"; emit=1; found++ } \
-	     /^heapam_index_fetch_tuple_internal\(/ { print "static TableIndexFetchTupleResult"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	     /^heapam_index_fetch_tuple_internal(_impl)?\(/ { print "static TableIndexFetchTupleResult"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 

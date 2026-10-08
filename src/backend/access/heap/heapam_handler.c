@@ -237,7 +237,7 @@ heapam_index_fetch_end(IndexFetchTableData *scan)
  * when bufmgr proves an exact barrier refusal.
  */
 static TableIndexFetchTupleResult
-heapam_index_fetch_tuple_internal(struct IndexFetchTableData *scan,
+heapam_index_fetch_tuple_internal_impl(struct IndexFetchTableData *scan,
 								  ItemPointer tid,
 								  Snapshot snapshot,
 								  TupleTableSlot *slot,
@@ -260,28 +260,13 @@ heapam_index_fetch_tuple_internal(struct IndexFetchTableData *scan,
 	 * The result stays scratch-owned until the original slot consumer copies it. */
 	if (!*call_again)
 	{
-		bool volatile handled = false;
-		TableIndexFetchTupleResult volatile cr_result = TABLE_INDEX_FETCH_NOT_FOUND;
-
-		PG_TRY();
+		if (heap_index_fetch_cr_result(hscan, tid, snapshot, &hot_result))
 		{
-			handled = heap_index_fetch_cr_result(hscan, tid, snapshot, &hot_result);
-			if (handled)
-			{
-				if (all_dead != NULL)
-					*all_dead = false;
-				cr_result = heapam_store_hot_search_result(&hot_result, slot,
-															 InvalidBuffer, call_again, all_dead);
-			}
+			if (all_dead != NULL)
+				*all_dead = false;
+			return heapam_store_hot_search_result(&hot_result, slot,
+												 InvalidBuffer, call_again, all_dead);
 		}
-		PG_CATCH();
-		{
-			memset(&hscan->cr_scope, 0, sizeof(hscan->cr_scope));
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-		if (handled)
-			return cr_result;
 	}
 #endif
 
@@ -326,6 +311,9 @@ heapam_index_fetch_tuple_internal(struct IndexFetchTableData *scan,
 											 !*call_again);
 	LockBuffer(hscan->xs_cbuf, BUFFER_LOCK_UNLOCK);
 #ifdef USE_PGRAC_CLUSTER
+	if (!*call_again)
+		heap_index_publish_cr_result(hscan, ItemPointerGetBlockNumber(tid),
+									 snapshot, &hot_result);
 	if (hot_result.remote_xmax_wait)
 	{
 		if (!barrier_aware || remote_xmax_wait == NULL
@@ -347,6 +335,36 @@ heapam_index_fetch_tuple_internal(struct IndexFetchTableData *scan,
 		*call_again = true;
 
 	return got_heap_tuple ? TABLE_INDEX_FETCH_FOUND : TABLE_INDEX_FETCH_NOT_FOUND;
+}
+
+/* ERROR anywhere in the original current path retires this optional scope. */
+static TableIndexFetchTupleResult
+heapam_index_fetch_tuple_internal(struct IndexFetchTableData *scan,
+								  ItemPointer tid, Snapshot snapshot, TupleTableSlot *slot,
+								  bool *call_again, bool *all_dead, bool barrier_aware,
+								  bool *remote_xmax_wait,
+								  struct ClusterTxLocator *remote_wait_locator)
+{
+#ifdef USE_PGRAC_CLUSTER
+	TableIndexFetchTupleResult result;
+
+	PG_TRY();
+	{
+		result = heapam_index_fetch_tuple_internal_impl(scan, tid, snapshot, slot,
+			call_again, all_dead, barrier_aware, remote_xmax_wait, remote_wait_locator);
+	}
+	PG_CATCH();
+	{
+		memset(&((IndexFetchHeapData *) scan)->cr_scope, 0,
+			   sizeof(((IndexFetchHeapData *) scan)->cr_scope));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
+#else
+	return heapam_index_fetch_tuple_internal_impl(scan, tid, snapshot, slot,
+		call_again, all_dead, barrier_aware, remote_xmax_wait, remote_wait_locator);
+#endif
 }
 
 static bool
