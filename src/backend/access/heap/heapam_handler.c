@@ -211,6 +211,9 @@ heapam_index_fetch_reset(IndexFetchTableData *scan)
 {
 	IndexFetchHeapData *hscan = (IndexFetchHeapData *) scan;
 
+#ifdef USE_PGRAC_CLUSTER
+	memset(&hscan->cr_scope, 0, sizeof(hscan->cr_scope));
+#endif
 	if (BufferIsValid(hscan->xs_cbuf))
 	{
 		ReleaseBuffer(hscan->xs_cbuf);
@@ -253,6 +256,33 @@ heapam_index_fetch_tuple_internal(struct IndexFetchTableData *scan,
 #ifdef USE_PGRAC_CLUSTER
 	if (remote_wait_locator != NULL)
 		memset(remote_wait_locator, 0, sizeof(*remote_wait_locator));
+	/* The native MVCC scan scope can answer before any current S acquisition.
+	 * The result stays scratch-owned until the original slot consumer copies it. */
+	if (!*call_again)
+	{
+		bool volatile handled = false;
+		TableIndexFetchTupleResult volatile cr_result = TABLE_INDEX_FETCH_NOT_FOUND;
+
+		PG_TRY();
+		{
+			handled = heap_index_fetch_cr_result(hscan, tid, snapshot, &hot_result);
+			if (handled)
+			{
+				if (all_dead != NULL)
+					*all_dead = false;
+				cr_result = heapam_store_hot_search_result(&hot_result, slot,
+															 InvalidBuffer, call_again, all_dead);
+			}
+		}
+		PG_CATCH();
+		{
+			memset(&hscan->cr_scope, 0, sizeof(hscan->cr_scope));
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		if (handled)
+			return cr_result;
+	}
 #endif
 
 	/* We can skip the buffer-switching logic if we're in mid-HOT chain. */

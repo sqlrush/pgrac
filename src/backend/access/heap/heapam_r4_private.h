@@ -178,6 +178,11 @@ typedef struct HeapHotSearchResult
 	char scratch_page[BLCKSZ] pg_attribute_aligned(MAXIMUM_ALIGNOF);
 } HeapHotSearchResult;
 
+#ifdef USE_PGRAC_CLUSTER
+extern bool heap_index_fetch_cr_result(IndexFetchHeapData *hscan, ItemPointer tid,
+									  Snapshot snapshot, HeapHotSearchResult *result);
+#endif
+
 typedef struct ClusterR4HotScratchTestContext
 {
 	Page scratch_page;

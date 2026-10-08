@@ -4901,7 +4901,7 @@ static bool
 heap_hot_r4_search_scratch(const BufferTag *tag,
 						   const ItemPointerData *logical_root,
 						   Relation relation, Snapshot snapshot,
-						   HeapHotSearchResult *result)
+						   HeapHotSearchResult *result, bool scoped_full)
 {
 	ClusterR4HotScratchTestContext context;
 	Page		page = (Page) result->scratch_page;
@@ -4950,7 +4950,16 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 
 		if (offnum < FirstOffsetNumber
 			|| offnum > PageGetMaxOffsetNumber(page))
+		{
+			/* A later index insertion may name a new root beyond this older
+			 * snapshot-complete page. Only the continuous scan/snapshot owner
+			 * proves that absence; a traversed HOT/redirect edge never does. */
+			if (scoped_full && at_chain_start
+				&& offnum > PageGetMaxOffsetNumber(page)
+				&& offnum <= MaxHeapTuplesPerPage)
+				return false;
 			heap_hot_r4_unknown("HOT offset is absent from the FULL page");
+		}
 		if (offnum > MaxHeapTuplesPerPage || visited[offnum])
 			heap_hot_r4_unknown("HOT chain contains a cycle");
 		if (++depth > MaxHeapTuplesPerPage)
@@ -4962,8 +4971,9 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 		{
 			/* The completed CR producer removes versions born after the
 			 * statement SCN.  An absent first index root is invisible, not a
-			 * broken traversed edge.  The outer caller still revalidates its
-			 * current input and never marks this index entry all-dead. */
+			 * broken traversed edge. The outer caller still revalidates its
+			 * current input or continuous scan scope, and never marks this
+			 * index entry all-dead. */
 			if (at_chain_start && !ItemIdIsUsed(lp)
 				&& ItemIdGetOffset(lp) == 0 && ItemIdGetLength(lp) == 0)
 				return false;
@@ -5153,7 +5163,7 @@ heap_hot_r4_full_cycle(Buffer buffer, const BufferTag *tag,
 			&& build_reason == CLUSTER_CR_BUILD_NONE)
 		{
 			if (heap_hot_r4_search_scratch(tag, logical_root, relation,
-										 snapshot, result))
+										 snapshot, result, false))
 				result->kind = HEAP_HOT_SEARCH_OWNED_SCRATCH;
 		}
 	}
@@ -5189,6 +5199,171 @@ heap_hot_r4_full_failure(SCN read_scn, ClusterCrBuildResult build_result,
 							  cluster_node_id, (int)build_result,
 							  cluster_cr_build_reason_name(build_reason))));
 	pg_unreachable();
+}
+
+/* The original transaction AS and active Relation protect this scan's locator.
+ * This is deliberately not a cross-scan or catalog relation-identity proof. */
+static bool
+heap_index_cr_eligible(IndexFetchHeapData *hscan, Snapshot snapshot)
+{
+	Relation relation = hscan->xs_base.rel;
+
+	return cluster_shared_config && cluster_shared_catalog
+		&& cluster_storage_mode_enabled()
+		&& relation != NULL && relation->rd_refcnt > 0
+		&& RelationIsPermanent(relation) && !relation->rd_rel->relisshared
+		&& !IsCatalogRelation(relation)
+		&& (relation->rd_rel->relkind == RELKIND_RELATION
+			|| relation->rd_rel->relkind == RELKIND_MATVIEW)
+		&& snapshot != NULL && snapshot->snapshot_type == SNAPSHOT_MVCC
+		&& snapshot->cluster_source == SNAPSHOT_SOURCE_CLUSTER
+		&& !TransactionIdIsValid(GetTopTransactionIdIfAny())
+		&& !IsolationIsSerializable()
+		&& CurrentResourceOwner != NULL
+		&& CheckRelationLockedByMe(relation, AccessShareLock, true);
+}
+
+static bool
+heap_index_cr_scope_matches(IndexFetchHeapData *hscan, Snapshot snapshot,
+							uint64 snapshot_id)
+{
+	const HeapReadOnlyCrScope *scope = &hscan->cr_scope;
+	Relation relation = hscan->xs_base.rel;
+
+	return scope->scan_id != 0 && scope->reserved == 0
+		&& scope->relation == relation && scope->owner == CurrentResourceOwner
+		&& scope->relation_oid == RelationGetRelid(relation)
+		&& RelFileLocatorEquals(scope->locator, relation->rd_locator)
+		&& scope->command_id == snapshot->curcid
+		&& scope->snapshot_id == snapshot_id
+		&& scope->read_scn == snapshot->read_scn
+		&& scope->read_epoch == snapshot->read_epoch;
+}
+
+static void
+heap_index_cr_recheck(IndexFetchHeapData *hscan, Snapshot snapshot,
+					  const ClusterSemanticAdmissionToken *admission)
+{
+	uint64 snapshot_id;
+
+	if (!heap_index_cr_eligible(hscan, snapshot)
+		|| !cluster_snapshot_cr_identity_v1(snapshot, &snapshot_id)
+		|| !heap_index_cr_scope_matches(hscan, snapshot, snapshot_id)
+		|| !cluster_semantic_activation_recheck(admission))
+		heap_hot_r4_unknown("read-only scan or TARGET identity changed");
+}
+
+/*
+ * One native index-fetch owner can reuse its immutable FULL versions before
+ * taking current S. The key is not authority: actual retained snapshot and
+ * fresh TARGET admission cover every hit, the original scratch resolver and
+ * publication. No buffer/content/mapping lock is held during R4 or TT work.
+ */
+bool
+heap_index_fetch_cr_result(IndexFetchHeapData *hscan, ItemPointer tid,
+						  Snapshot snapshot, HeapHotSearchResult *result)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionResult admission_result;
+	ClusterSnapshotReadScopeV1 read_scope;
+	BufferCrKey key;
+	Buffer volatile reservation = InvalidBuffer;
+	ItemPointerData logical_root = *tid;
+	uint64 snapshot_id;
+	bool found;
+	bool hit;
+
+	if (!heap_index_cr_eligible(hscan, snapshot))
+	{
+		memset(&hscan->cr_scope, 0, sizeof(hscan->cr_scope));
+		return false;
+	}
+	admission_result = cluster_semantic_activation_enter(
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
+	{
+		memset(&hscan->cr_scope, 0, sizeof(hscan->cr_scope));
+		if (admission_result == CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED)
+			return false;
+		heap_hot_r4_unknown("read-only scan TARGET admission refused");
+	}
+	cluster_snapshot_read_enter_v1(&read_scope, snapshot);
+	PG_TRY();
+	{
+		PG_TRY();
+		{
+			if (!cluster_snapshot_cr_identity_v1(snapshot, &snapshot_id))
+				heap_hot_r4_unknown("read-only scan has no retained snapshot identity");
+			if (!heap_index_cr_scope_matches(hscan, snapshot, snapshot_id))
+			{
+				HeapReadOnlyCrScope *scope = &hscan->cr_scope;
+
+				memset(scope, 0, sizeof(*scope));
+				if (!BufTableNewCRScope(&scope->scan_id))
+					heap_hot_r4_unknown("read-only scan identity is exhausted");
+				scope->relation = hscan->xs_base.rel;
+				scope->owner = CurrentResourceOwner;
+				scope->locator = scope->relation->rd_locator;
+				scope->relation_oid = RelationGetRelid(scope->relation);
+				scope->command_id = snapshot->curcid;
+				scope->snapshot_id = snapshot_id;
+				scope->read_scn = snapshot->read_scn;
+				scope->read_epoch = snapshot->read_epoch;
+			}
+			memset(&key, 0, sizeof(key));
+			InitBufferTag(&key.tag, &hscan->cr_scope.locator, MAIN_FORKNUM,
+						  ItemPointerGetBlockNumber(&logical_root));
+			key.scan_identity = hscan->cr_scope.scan_id;
+			key.snapshot_identity = snapshot_id;
+			key.read_scn = snapshot->read_scn;
+			key.read_epoch = snapshot->read_epoch;
+			memset(result, 0, sizeof(*result));
+			hit = cluster_bufmgr_cr_copy_v1(&key, result->scratch_page);
+			if (!hit)
+			{
+				ClusterCrBuildResult build_result;
+				ClusterCrBuildReason build_reason = CLUSTER_CR_BUILD_PROTOCOL;
+
+				reservation = cluster_bufmgr_cr_reserve_v1();
+				heap_index_cr_recheck(hscan, snapshot, &admission);
+				build_result = cluster_gcs_block_cr_fetch_and_wait(
+					key.tag, key.read_scn, result->scratch_page, &build_reason);
+				if (build_result != CLUSTER_CR_BUILD_FULL
+					|| build_reason != CLUSTER_CR_BUILD_NONE)
+					heap_hot_r4_full_failure(key.read_scn, build_result, build_reason);
+			}
+			heap_index_cr_recheck(hscan, snapshot, &admission);
+			found = heap_hot_r4_search_scratch(&key.tag, &logical_root,
+												hscan->xs_base.rel, snapshot, result, true);
+			heap_index_cr_recheck(hscan, snapshot, &admission);
+			if (!hit)
+			{
+				(void) cluster_bufmgr_cr_publish_v1(reservation, &key,
+													   result->scratch_page);
+				heap_index_cr_recheck(hscan, snapshot, &admission);
+			}
+			result->kind = found ? HEAP_HOT_SEARCH_OWNED_SCRATCH
+								 : HEAP_HOT_SEARCH_NOT_FOUND;
+			if (found)
+				*tid = result->tuple.t_self;
+		}
+		PG_FINALLY();
+		{
+			if (BufferIsValid(reservation))
+				ReleaseBuffer(reservation);
+			cluster_snapshot_read_exit_v1(&read_scope);
+			cluster_semantic_activation_leave(&admission);
+		}
+		PG_END_TRY();
+	}
+	PG_CATCH();
+	{
+		memset(&hscan->cr_scope, 0, sizeof(hscan->cr_scope));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return true;
 }
 #endif
 
