@@ -28,13 +28,6 @@ WaitLatch(Latch *latch pg_attribute_unused(), int events pg_attribute_unused(),
 	abort();
 }
 
-void
-before_shmem_exit(pg_on_exit_callback callback pg_attribute_unused(),
-				  Datum arg pg_attribute_unused())
-{
-	abort();
-}
-
 bool
 cluster_recovery_transport_components_current(void)
 {
@@ -117,6 +110,7 @@ capacity_setup(ClusterLockAcquireRequest *request, ClusterGrdHolderId *lmon_hold
 	bool found;
 
 	queued_cut_case = true;
+	hw_bast_observe = NULL;
 	queued_cut_prepare(GES_REQ_OPCODE_REQUEST, false, 0, request, lmon_holder);
 	ut_wfg_reset();
 	request->resid = (ClusterResId){ .field1 = 5,
@@ -317,24 +311,24 @@ UT_TEST(conflict_snapshot_and_wfg_include_all_32_owners)
 {
 	ClusterLockAcquireRequest request;
 	ClusterGrdHolderId waiter, holders[32];
-	ClusterGrdConflictHolder conflicts[256];
+	ClusterGrdConflictHolder *conflicts = NULL;
 	int count = -1;
 
 	capacity_setup(&request, &waiter);
 	capacity_seed(&request.resid, holders, lengthof(holders));
-	memset(conflicts, 0, sizeof(conflicts));
 	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&request.resid, &waiter, waiter.node_id,
 													waiter.request_id, 9, GES_REQ_OPCODE_REQUEST,
-													AccessExclusiveLock, conflicts, &count),
+													AccessExclusiveLock, &conflicts, &count),
 				 CLUSTER_GRD_ENQUEUED_WAITER);
 	UT_ASSERT_EQ(count, 32);
+	UT_ASSERT(conflicts != NULL);
 	UT_ASSERT_EQ(
 		ut_wfg_count_waiter(waiter.node_id, waiter.procno, waiter.cluster_epoch, waiter.request_id),
 		32);
 	for (int i = 0; i < lengthof(holders); i++) {
 		int matches = 0;
 
-		for (int j = 0; j < count && j < lengthof(conflicts); j++) {
+		for (int j = 0; conflicts != NULL && j < count && j < 32; j++) {
 			if (capacity_same_holder(&conflicts[j].holder, &holders[i])) {
 				matches++;
 				UT_ASSERT_EQ(conflicts[j].source_node_id, holders[i].node_id);
@@ -346,6 +340,8 @@ UT_TEST(conflict_snapshot_and_wfg_include_all_32_owners)
 								  waiter.request_id, holders[i].node_id, holders[i].procno,
 								  holders[i].cluster_epoch, holders[i].request_id));
 	}
+	if (conflicts != NULL)
+		pfree(conflicts);
 	capacity_expect_queues(1, 32, 1, 0);
 	capacity_expect_stop(CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT_EQ(cluster_grd_cancel_waiter_by_id(&request.resid, &waiter), CLUSTER_GRD_ENTRY_OK);
@@ -616,13 +612,312 @@ UT_TEST(reservations_32_survive_s3_s5_and_exact_s7_cancel)
 	MyProc = NULL;
 }
 
+typedef struct CapacityBast {
+	uint32 destination;
+	GesRequestPayload payload;
+} CapacityBast;
+
+static CapacityBast capacity_basts[256];
+static int capacity_bast_count;
+
+static void
+capacity_observe_bast(uint32 destination, const GesRequestPayload *payload)
+{
+	if (capacity_bast_count < lengthof(capacity_basts)) {
+		capacity_basts[capacity_bast_count].destination = destination;
+		capacity_basts[capacity_bast_count].payload = *payload;
+	}
+	capacity_bast_count++;
+}
+
+static void
+capacity_lmon_basts(int count, bool nowait, bool compatible_tail)
+{
+	const int32 remote_nodes[] = { 0, 2, 3 };
+	ClusterLockAcquireRequest request;
+	ClusterGrdHolderId waiter, holders[32];
+	int granted = 0;
+	int expected = nowait ? 0 : count - (compatible_tail ? 1 : 0);
+
+	HW_CHECK(count > 0 && count <= lengthof(holders));
+	capacity_setup(&request, &waiter);
+	for (int i = 0; i < count; i++) {
+		LOCKMODE mode = compatible_tail && i == count - 1 ? AccessShareLock : RowExclusiveLock;
+
+		holders[i] = capacity_holder(i);
+		holders[i].node_id = remote_nodes[i % lengthof(remote_nodes)];
+		holders[i].request_id += UINT64CONST(0x100000000);
+		if (cluster_grd_entry_enqueue_or_grant(&request.resid, &holders[i], holders[i].node_id,
+											   holders[i].request_id, 9, GES_REQ_OPCODE_REQUEST,
+											   mode, NULL, NULL)
+			== CLUSTER_GRD_GRANT_NOW)
+			granted++;
+	}
+	UT_ASSERT_EQ(granted, count);
+	memset(capacity_basts, 0, sizeof(capacity_basts));
+	capacity_bast_count = 0;
+	hw_bast_observe = capacity_observe_bast;
+	/* Share conflicts with RowExclusive but not AccessShare. All seeded
+	 * holders are remote; local ProcSignal delivery is a separate boundary. */
+	master_request.lockmode = ShareLock;
+	master_request.opcode = nowait ? GES_REQ_OPCODE_REQUEST_NOWAIT : GES_REQ_OPCODE_REQUEST;
+	stage_master_work();
+	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+	printf("# lmon_bast holders=%d nowait=%d expected=%d observed=%d\n", count, nowait, expected,
+		   capacity_bast_count);
+	UT_ASSERT_EQ(capacity_bast_count, expected);
+	UT_ASSERT(!cluster_grd_holder_mode_by_id(&request.resid, &waiter, NULL));
+	for (int i = 0; i < count; i++) {
+		int matches = 0;
+
+		for (int j = 0; j < capacity_bast_count && j < lengthof(capacity_basts); j++) {
+			const CapacityBast *bast = &capacity_basts[j];
+			const GesRequestPayload *p = &bast->payload;
+			ClusterGrdHolderId observed;
+
+			observed.node_id = p->holder_node_id;
+			observed.procno = p->holder_procno;
+			observed.cluster_epoch
+				= ((uint64)p->holder_cluster_epoch_hi << 32) | p->holder_cluster_epoch_lo;
+			observed.request_id = ((uint64)p->holder_request_id_hi << 32) | p->holder_request_id_lo;
+			if (capacity_same_holder(&observed, &holders[i])) {
+				matches++;
+				UT_ASSERT_EQ(bast->destination, holders[i].node_id);
+				UT_ASSERT_EQ(p->opcode, GES_REQ_OPCODE_BAST);
+				UT_ASSERT_EQ(p->lockmode, ShareLock);
+				UT_ASSERT(memcmp(p->resid, &request.resid, sizeof(request.resid)) == 0);
+			}
+		}
+		UT_ASSERT_EQ(matches, nowait || (compatible_tail && i == count - 1) ? 0 : 1);
+	}
+	if (nowait) {
+		UT_ASSERT_EQ(master_reply_count, 1);
+		UT_ASSERT_EQ(master_reply.opcode, GES_REPLY_OPCODE_REJECT);
+		UT_ASSERT_EQ(master_reply.reject_reason, GES_REJECT_REASON_LOCK_CONFLICT);
+		UT_ASSERT_EQ(cluster_grd_cancel_waiter_by_id(&request.resid, &waiter),
+					 CLUSTER_GRD_ENTRY_NOT_FOUND);
+		UT_ASSERT_EQ(ut_wfg_n, 0);
+		capacity_expect_counts(1, count);
+	} else {
+		UT_ASSERT_EQ(master_reply_count, 0);
+		capacity_expect_queues(1, count, 1, 0);
+		UT_ASSERT_EQ(cluster_grd_cancel_waiter_by_id(&request.resid, &waiter),
+					 CLUSTER_GRD_ENTRY_OK);
+	}
+	hw_bast_observe = NULL;
+	for (int i = 0; i < count; i++)
+		capacity_release_present(&request.resid, &holders[i]);
+	capacity_expect_counts(0, 0);
+	capacity_expect_stop(CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(ut_grd_pool_used, 0);
+	MyProc = NULL;
+}
+
+UT_TEST(real_lmon_bast_16_control)
+{
+	capacity_lmon_basts(16, false, false);
+}
+
+UT_TEST(real_lmon_bast_reaches_all_32_exact_remote_owners)
+{
+	capacity_lmon_basts(32, false, false);
+}
+
+UT_TEST(real_lmon_nowait_sends_no_bast)
+{
+	capacity_lmon_basts(32, true, false);
+}
+
+UT_TEST(real_lmon_bast_excludes_compatible_owner)
+{
+	capacity_lmon_basts(16, false, true);
+}
+
+typedef enum CapacityPoolKind {
+	CAPACITY_POOL_HOLDER,
+	CAPACITY_POOL_WAITER,
+	CAPACITY_POOL_CONVERT,
+	CAPACITY_POOL_RESERVATION
+} CapacityPoolKind;
+
+/* Return success only for the requested responsibility. No allocator call or
+ * result is substituted here: the product reaches A's bounded DSA boundary. */
+static bool
+capacity_pool_attempt(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+					  CapacityPoolKind kind, uint64 sequence, int *result)
+{
+	ClusterGrdWaiterMeta meta = { 0 };
+	uint64 generation;
+
+	meta.wait_seq = sequence;
+	if (kind == CAPACITY_POOL_CONVERT) {
+		*result = cluster_grd_convert_or_enqueue_meta(
+			resid, holder->node_id, holder->procno, holder->cluster_epoch, RowExclusiveLock,
+			AccessExclusiveLock, holder->request_id, holder->node_id, 9, meta, NULL, NULL);
+		return *result == CLUSTER_GRD_CONVERT_ENQUEUED;
+	}
+	if (kind == CAPACITY_POOL_RESERVATION) {
+		*result = cluster_grd_try_reserve(resid, holder, RowExclusiveLock, cluster_node_id, NULL,
+										  &generation);
+		return *result == CLUSTER_GRD_ENTRY_OK;
+	}
+	*result = cluster_grd_entry_enqueue_or_grant_meta(
+		resid, holder, holder->node_id, holder->request_id, meta, 9, GES_REQ_OPCODE_REQUEST,
+		kind == CAPACITY_POOL_WAITER ? AccessExclusiveLock : RowExclusiveLock, NULL, NULL);
+	return *result
+		   == (kind == CAPACITY_POOL_WAITER ? CLUSTER_GRD_ENQUEUED_WAITER : CLUSTER_GRD_GRANT_NOW);
+}
+
+static void
+capacity_pool_exhaustion(CapacityPoolKind kind)
+{
+	ClusterLockAcquireRequest request;
+	ClusterGrdHolderId blocker, occupied[128], holders[13], probes[64];
+	ClusterResId subject;
+	ClusterGrdShared *shared;
+	CapacityCounts before = { 0 }, after = { 0 };
+	int saved_max_backends = MaxBackends;
+	int attempted = 0;
+	int rejected = -1;
+	int result = -1;
+	int count = kind == CAPACITY_POOL_CONVERT ? 12 : lengthof(probes);
+	Size budget = 0;
+	bool found;
+
+	/* All proc numbers below fit this explicit startup configuration. */
+	MaxBackends = 256;
+	capacity_setup(&request, &blocker);
+	capacity_seed(&request.resid, occupied, lengthof(occupied));
+	UT_ASSERT(ut_grd_pool_used > 0);
+	subject = request.resid;
+	subject.field2++;
+	shared = retained_grd_shmem("pgrac cluster grd", sizeof(*shared), &found);
+	HW_CHECK(found && shared != NULL);
+	pg_atomic_write_u32(&shared->master[cluster_grd_shard_for_resource(&subject)], 1);
+	if (kind == CAPACITY_POOL_WAITER)
+		UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(
+						 &subject, &blocker, blocker.node_id, blocker.request_id, 9,
+						 GES_REQ_OPCODE_REQUEST, AccessExclusiveLock, NULL, NULL),
+					 CLUSTER_GRD_GRANT_NOW);
+	if (kind == CAPACITY_POOL_CONVERT) {
+		for (int i = 0; i < lengthof(holders); i++) {
+			holders[i] = capacity_holder(i);
+			holders[i].request_id += 20000;
+			UT_ASSERT_EQ(capacity_acquire(&subject, &holders[i]), CLUSTER_GRD_GRANT_NOW);
+		}
+	}
+	/* Freeze an actually occupied byte budget. The first resource's release
+	 * must make a later allocation possible without raising this limit. */
+	budget = ut_grd_pool_used;
+	UT_ASSERT(budget > 0);
+	if (budget == 0)
+		goto cleanup;
+	ut_grd_pool_limit = budget;
+	for (int i = 0; i < count; i++) {
+		memset(&before, 0, sizeof(before));
+		cluster_grd_entries_walk(capacity_count_row, &before);
+		probes[i] = kind == CAPACITY_POOL_CONVERT ? holders[i] : capacity_holder(i);
+		probes[i].request_id += 40000;
+		attempted++;
+		if (!capacity_pool_attempt(&subject, &probes[i], kind, 9000 + i, &result)) {
+			rejected = i;
+			break;
+		}
+	}
+	printf("# pool kind=%d budget=%zu used=%zu admitted=%d result=%d\n", kind, (size_t)budget,
+		   (size_t)ut_grd_pool_used, rejected >= 0 ? rejected : attempted, result);
+	UT_ASSERT(rejected >= 0);
+	UT_ASSERT_EQ(ut_grd_pool_used, budget);
+	if (rejected >= 0) {
+		UT_ASSERT_EQ(result, kind == CAPACITY_POOL_CONVERT		 ? CLUSTER_GRD_CONVERT_QUEUE_FULL
+							 : kind == CAPACITY_POOL_RESERVATION ? CLUSTER_GRD_ENTRY_FULL
+																 : CLUSTER_GRD_WAIT_QUEUE_FULL);
+		cluster_grd_entries_walk(capacity_count_row, &after);
+		UT_ASSERT_EQ(after.entries, before.entries);
+		UT_ASSERT_EQ(after.holders, before.holders);
+		UT_ASSERT_EQ(after.waiters, before.waiters);
+		UT_ASSERT_EQ(after.converts, before.converts);
+		UT_ASSERT(!cluster_grd_holder_mode_by_id(&subject, &probes[rejected], NULL));
+		if (kind == CAPACITY_POOL_WAITER)
+			UT_ASSERT_EQ(
+				cluster_grd_cancel_waiter_by_id_seq(&subject, &probes[rejected], 9000 + rejected),
+				CLUSTER_GRD_ENTRY_NOT_FOUND);
+		if (kind == CAPACITY_POOL_CONVERT) {
+			LOCKMODE mode = NoLock;
+
+			UT_ASSERT_EQ(
+				cluster_grd_cancel_convert_by_id(&subject, &probes[rejected], 9000 + rejected),
+				CLUSTER_GRD_ENTRY_NOT_FOUND);
+			UT_ASSERT(cluster_grd_holder_mode_by_id(&subject, &holders[rejected], &mode));
+			UT_ASSERT_EQ(mode, RowExclusiveLock);
+		}
+		if (kind == CAPACITY_POOL_RESERVATION)
+			UT_ASSERT_EQ(cluster_grd_cancel_reservation_by_id(&subject, &probes[rejected]),
+						 CLUSTER_GRD_ENTRY_NOT_FOUND);
+		capacity_expect_stop(CLUSTER_NORMAL_STOP_PENDING);
+		for (int i = 0; i < lengthof(occupied); i++)
+			capacity_release_present(&request.resid, &occupied[i]);
+		UT_ASSERT(ut_grd_pool_used < budget);
+		UT_ASSERT_EQ(ut_grd_pool_limit, budget);
+		UT_ASSERT(
+			capacity_pool_attempt(&subject, &probes[rejected], kind, 9000 + rejected, &result));
+		UT_ASSERT(ut_grd_pool_used <= budget);
+		printf("# pool kind=%d exact_retry_result=%d used=%zu unchanged_budget=%zu\n", kind, result,
+			   (size_t)ut_grd_pool_used, (size_t)ut_grd_pool_limit);
+	}
+
+cleanup:
+	for (int i = 0; i < attempted; i++) {
+		if (kind == CAPACITY_POOL_WAITER)
+			(void)cluster_grd_cancel_waiter_by_id_seq(&subject, &probes[i], 9000 + i);
+		if (kind == CAPACITY_POOL_CONVERT)
+			(void)cluster_grd_cancel_convert_by_id(&subject, &probes[i], 9000 + i);
+		if (kind == CAPACITY_POOL_RESERVATION)
+			(void)cluster_grd_cancel_reservation_by_id(&subject, &probes[i]);
+		capacity_release_present(&subject, &probes[i]);
+	}
+	if (kind == CAPACITY_POOL_CONVERT)
+		for (int i = 0; i < lengthof(holders); i++)
+			capacity_release_present(&subject, &holders[i]);
+	capacity_release_present(&subject, &blocker);
+	for (int i = 0; i < lengthof(occupied); i++)
+		capacity_release_present(&request.resid, &occupied[i]);
+	capacity_expect_counts(0, 0);
+	capacity_expect_stop(CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(ut_grd_pool_used, 0);
+	UT_ASSERT_EQ(ut_wfg_n, 0);
+	ut_grd_pool_limit = 0;
+	MaxBackends = saved_max_backends;
+	MyProc = NULL;
+}
+
+UT_TEST(pool_full_never_partially_grants_holder_and_release_reuses_bytes)
+{
+	capacity_pool_exhaustion(CAPACITY_POOL_HOLDER);
+}
+
+UT_TEST(pool_full_never_partially_enqueues_waiter_and_release_reuses_bytes)
+{
+	capacity_pool_exhaustion(CAPACITY_POOL_WAITER);
+}
+
+UT_TEST(pool_full_keeps_convert_original_holder_and_release_reuses_bytes)
+{
+	capacity_pool_exhaustion(CAPACITY_POOL_CONVERT);
+}
+
+UT_TEST(pool_full_never_orphans_reservation_and_release_reuses_bytes)
+{
+	capacity_pool_exhaustion(CAPACITY_POOL_RESERVATION);
+}
+
 int
 main(void)
 {
 	MyBackendType = B_BACKEND;
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Same standalone watchdog; no product deadline is changed. */
-	UT_PLAN(11);
+	UT_PLAN(19);
 	UT_RUN(compatible_16_control_releases_exact_owners);
 	UT_RUN(compatible_17_owners_are_all_granted);
 	UT_RUN(compatible_32_owners_are_all_granted);
@@ -634,6 +929,14 @@ main(void)
 	UT_RUN(waiters_32_keep_fifo_after_exact_cancellation);
 	UT_RUN(converts_12_keep_drain_priority_after_exact_cancel);
 	UT_RUN(reservations_32_survive_s3_s5_and_exact_s7_cancel);
+	UT_RUN(real_lmon_bast_16_control);
+	UT_RUN(real_lmon_bast_reaches_all_32_exact_remote_owners);
+	UT_RUN(real_lmon_nowait_sends_no_bast);
+	UT_RUN(real_lmon_bast_excludes_compatible_owner);
+	UT_RUN(pool_full_never_partially_grants_holder_and_release_reuses_bytes);
+	UT_RUN(pool_full_never_partially_enqueues_waiter_and_release_reuses_bytes);
+	UT_RUN(pool_full_keeps_convert_original_holder_and_release_reuses_bytes);
+	UT_RUN(pool_full_never_orphans_reservation_and_release_reuses_bytes);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
