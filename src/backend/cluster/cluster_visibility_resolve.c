@@ -55,6 +55,7 @@
 #include "cluster/cluster_tt_durable.h"			/* spec-4.8 D2 remote_active_failclosed counter */
 #include "cluster/cluster_tt_status.h"			/* lookup_exact / Key / Result */
 #include "cluster/cluster_touched_peers.h"		/* spec-5.14 D2 class 4 */
+#include "cluster/cluster_undo_horizon.h"		/* Fresh admission for historical proof reuse. */
 #include "cluster/cluster_tx_resolve.h"			/* exact DATA->canonical TT fallback */
 #include "cluster/cluster_visibility_resolve.h"
 #include "cluster/cluster_wal_state.h"	   /* CLUSTER_WAL_STATE_SLOT_COUNT */
@@ -165,8 +166,8 @@ StaticAssertDecl(sizeof(VisScratchProofKey) == 96, "scratch proof key size");
 StaticAssertDecl(sizeof(vis_scratch_proof) == 112, "scratch proof metadata size");
 
 static bool
-vis_scratch_proof_key(const ClusterUndoTTSlotRef *ref, const ClusterTxLocator *locator,
-					  const ClusterItlSlotData *slot, SCN read_scn, VisScratchProofKey *key)
+vis_scratch_proof_context_key(const ClusterUndoTTSlotRef *ref, const ClusterTxLocator *locator,
+							  const ClusterItlSlotData *slot, SCN read_scn, VisScratchProofKey *key)
 {
 	Snapshot actual;
 	SCN retained_floor;
@@ -175,8 +176,7 @@ vis_scratch_proof_key(const ClusterUndoTTSlotRef *ref, const ClusterTxLocator *l
 
 	if (!cluster_shared_config || !cluster_page_scn_shortcut || MyProc == NULL
 		|| !LocalTransactionIdIsValid(MyProc->lxid) || CurrentResourceOwner == NULL
-		|| ref->origin_node_id != cluster_node_id || ref->cluster_epoch == 0
-		|| ref->cluster_epoch != cluster_epoch_get_current()
+		|| ref->cluster_epoch == 0 || ref->cluster_epoch != cluster_epoch_get_current()
 		|| !cluster_snapshot_read_evidence_v1(read_scn, &actual, &retained_floor, &reason)
 		|| !cluster_snapshot_cr_identity_v1(actual, &identity))
 		return false;
@@ -195,6 +195,81 @@ vis_scratch_proof_key(const ClusterUndoTTSlotRef *ref, const ClusterTxLocator *l
 	key->itl_wrap = slot->wrap;
 	key->itl_flags = slot->flags;
 	return true;
+}
+
+static bool
+vis_scratch_proof_key(const ClusterUndoTTSlotRef *ref, const ClusterTxLocator *locator,
+					  const ClusterItlSlotData *slot, SCN read_scn, VisScratchProofKey *key)
+{
+	return ref->origin_node_id == cluster_node_id
+		   && vis_scratch_proof_context_key(ref, locator, slot, read_scn, key);
+}
+
+/* Historical xid and its original origin are distinct from the recycled
+ * DATA carrier. Never use that carrier's terminal stamp for the old xid. */
+typedef struct VisScratchHistoryKey {
+	VisScratchProofKey carrier;
+	TransactionId xid;
+	int32 origin;
+} VisScratchHistoryKey;
+
+typedef struct VisScratchHistoryProof {
+	VisScratchHistoryKey key;
+	SCN commit_scn;
+	uint8 status;
+	bool is_bound;
+	bool valid;
+} VisScratchHistoryProof;
+
+static VisScratchHistoryProof vis_scratch_history[CLUSTER_ITL_INITRANS_DEFAULT];
+static uint32 vis_scratch_history_next;
+
+StaticAssertDecl(sizeof(VisScratchHistoryKey) == 104, "historical scratch proof key size");
+StaticAssertDecl(sizeof(VisScratchHistoryProof) == 120, "historical scratch proof size");
+
+static void
+vis_scratch_history_reset(void)
+{
+	memset(vis_scratch_history, 0, sizeof(vis_scratch_history));
+	vis_scratch_history_next = 0;
+}
+
+static bool
+vis_scratch_history_key(const ClusterUndoTTSlotRef *ref, const ClusterTxLocator *locator,
+						const ClusterItlSlotData *slot, TransactionId xid, int origin, SCN read_scn,
+						VisScratchHistoryKey *key)
+{
+	memset(key, 0, sizeof(*key));
+	if (!cluster_crossnode_runtime_visibility || origin < 0 || origin >= CLUSTER_MAX_NODES
+		|| !vis_scratch_proof_context_key(ref, locator, slot, read_scn, &key->carrier))
+		return false;
+	key->xid = xid;
+	key->origin = origin;
+	return true;
+}
+
+/* A context change retires the old statement's metadata. Different DATA
+ * carriers or tuple sides within that same retained statement may coexist. */
+static const VisScratchHistoryProof *
+vis_scratch_history_probe(const VisScratchHistoryKey *key)
+{
+	for (int i = 0; i < lengthof(vis_scratch_history); i++) {
+		const VisScratchHistoryProof *proof = &vis_scratch_history[i];
+		const VisScratchProofKey *old = &proof->key.carrier;
+		const VisScratchProofKey *now = &key->carrier;
+
+		if (!proof->valid)
+			continue;
+		if (old->snapshot_identity != now->snapshot_identity || old->epoch != now->epoch
+			|| old->read_scn != now->read_scn || old->owner != now->owner
+			|| old->lxid != now->lxid) {
+			vis_scratch_history_reset();
+			return NULL;
+		}
+		if (memcmp(&proof->key, key, sizeof(*key)) == 0)
+			return proof;
+	}
+	return NULL;
 }
 
 static bool
@@ -299,6 +374,7 @@ cluster_vis_resolve_abort_reset(void)
 	cluster_vis_resolve_depth = 0;
 	vis_snapshot_bound.valid = false;
 	vis_scratch_proof.valid = false;
+	vis_scratch_history_reset();
 }
 
 
@@ -1225,41 +1301,92 @@ cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionI
 	if (ref.local_xid != raw_xid) {
 		uint64 epoch = cluster_epoch_get_current();
 		int origin = cluster_xid_origin_slot(raw_xid);
+		VisScratchHistoryKey before;
+		VisScratchHistoryKey after;
+		VisScratchHistoryProof cached = { 0 };
+		bool eligible
+			= vis_scratch_history_key(&ref, &locator, slot, raw_xid, origin, read_scn, &before);
+		const VisScratchHistoryProof *saved = eligible ? vis_scratch_history_probe(&before) : NULL;
 		ClusterUndoVerdictResult historical = {
 			.kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED,
 			.commit_scn = InvalidScn,
 		};
 
-		/* A recycled last-writer ref is not this transaction's identity.
-		 * Derive the original origin, keep its stripe self-check, and ask
-		 * only for a terminal outcome. Never create a live physical binding
-		 * or route our own scratch xid into native tuple visibility. */
+		if (saved != NULL)
+			cached = *saved;
+		if (!eligible)
+			vis_scratch_history_reset();
+
+		/* A recycled last-writer ref is only a historical route hint. Ask
+		 * the original origin for a terminal outcome, then reuse only that
+		 * proof under the same actual retained evaluator and full carrier.
+		 * Native CLOG, current ownership and page stamps are not substitutes. */
 		out->ref = ref;
 		out->diagnostic_reason = "RECYCLED_AUTHORITY_UNPROVABLE";
 		if (origin >= 0 && origin < CLUSTER_MAX_NODES && epoch <= UINT32_MAX
 			&& ref.cluster_epoch == (uint32)epoch) {
+			volatile bool completed = false;
+
 			cluster_vis_resolve_depth++;
 			PG_TRY();
 			{
 				if (origin != cluster_node_id)
 					cluster_touched_peers_stamp(origin, CLUSTER_TOUCH_VISIBILITY);
-				cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ORIGIN_ASK);
-				historical = cluster_undo_verdict_resolve(origin, ref.undo_segment_id, raw_xid, 0,
-														  read_scn, false);
-				if (cluster_epoch_get_current() == epoch
-					&& (historical.kind == CLUSTER_UNDO_VERDICT_ABORTED
-						|| (historical.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
-							&& SCN_VALID(historical.commit_scn))
-						|| (historical.kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND
-							&& SCN_VALID(historical.commit_scn)
-							&& scn_time_cmp(historical.commit_scn, read_scn) <= 0)))
-					(void)cluster_vis_from_undo_verdict(historical, out);
+				if (cached.valid) {
+					/* A memo does not retain admission. The foreign consumer
+					 * keeps the same member/capability/retention gate as a miss. */
+					if ((origin == cluster_node_id
+						 || cluster_undo_horizon_read_admission_enforce(read_scn))
+						&& vis_scratch_history_key(&ref, &locator, slot, raw_xid,
+												   cluster_xid_origin_slot(raw_xid), read_scn,
+												   &after)
+						&& memcmp(&before, &after, sizeof(before)) == 0) {
+						out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+						out->status = cached.status;
+						out->commit_scn = cached.commit_scn;
+						out->commit_scn_is_bound = cached.is_bound;
+					}
+				} else {
+					cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ORIGIN_ASK);
+					historical = cluster_undo_verdict_resolve(origin, ref.undo_segment_id, raw_xid,
+															  0, read_scn, false);
+					if (cluster_epoch_get_current() == epoch
+						&& (historical.kind == CLUSTER_UNDO_VERDICT_ABORTED
+							|| (historical.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
+								&& SCN_VALID(historical.commit_scn))
+							|| (historical.kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND
+								&& SCN_VALID(historical.commit_scn)
+								&& scn_time_cmp(historical.commit_scn, read_scn) <= 0)))
+						(void)cluster_vis_from_undo_verdict(historical, out);
+				}
+				completed = true;
 			}
 			PG_FINALLY();
 			{
 				cluster_vis_resolve_depth--;
+				if (!completed)
+					vis_scratch_history_reset();
 			}
 			PG_END_TRY();
+		}
+		if (eligible && vis_scratch_proof_terminal(out, read_scn)
+			&& vis_scratch_history_key(&ref, &locator, slot, raw_xid,
+									   cluster_xid_origin_slot(raw_xid), read_scn, &after)
+			&& memcmp(&before, &after, sizeof(before)) == 0) {
+			if (!cached.valid) {
+				VisScratchHistoryProof *proof = &vis_scratch_history[vis_scratch_history_next];
+
+				proof->valid = false;
+				proof->key = before;
+				proof->status = out->status;
+				proof->commit_scn = out->commit_scn;
+				proof->is_bound = out->commit_scn_is_bound;
+				proof->valid = true;
+				vis_scratch_history_next
+					= (vis_scratch_history_next + 1) % lengthof(vis_scratch_history);
+			}
+		} else {
+			vis_scratch_history_reset();
 		}
 		if (out->evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
 			out->diagnostic_reason = "RECYCLED_TERMINAL_PROVEN";

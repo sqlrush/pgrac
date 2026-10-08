@@ -272,6 +272,10 @@ static bool ut_exit_exact_proof;
 static bool ut_full_scratch_fixture;
 static int ut_full_scratch_scenario;
 static int ut_history_origin;
+static bool ut_history_memo_fixture;
+static TransactionId ut_history_memo_xid;
+static bool ut_history_read_admitted;
+static int ut_history_read_admission_calls;
 static uint64 ut_current_epoch;
 static int ut_native_calls;
 static int ut_hint_mutations;
@@ -450,6 +454,10 @@ ut_reset(ClusterTTStatus status, SCN scn)
 	ut_full_scratch_fixture = false;
 	ut_full_scratch_scenario = 0;
 	ut_history_origin = UT_PEER_NODE;
+	ut_history_memo_fixture = false;
+	ut_history_memo_xid = UT_RAW_XID;
+	ut_history_read_admitted = true;
+	ut_history_read_admission_calls = 0;
 	ut_current_epoch = UT_CLUSTER_EPOCH;
 	ut_native_calls = 0;
 	ut_hint_mutations = 0;
@@ -613,15 +621,19 @@ cluster_undo_verdict_resolve(int origin_node pg_attribute_unused(),
 		UT_ASSERT(cluster_vis_resolve_in_flight());
 		UT_ASSERT_EQ(origin_node, ut_history_origin);
 		UT_ASSERT(origin_node != ut_exit_ref.origin_node_id);
-		UT_ASSERT_EQ(raw_xid, UT_RAW_XID);
-		UT_ASSERT_EQ(undo_segment_id, UT_UNDO_SEGMENT);
+		UT_ASSERT_EQ(raw_xid, ut_history_memo_fixture ? ut_history_memo_xid : UT_RAW_XID);
+		UT_ASSERT_EQ(undo_segment_id,
+					 ut_history_memo_fixture ? ut_exit_ref.undo_segment_id : UT_UNDO_SEGMENT);
 		UT_ASSERT_EQ(expected_tt_slot_id, 0);
-		UT_ASSERT_EQ(read_scn, UT_READ_SCN);
+		UT_ASSERT_EQ(read_scn,
+					 ut_history_memo_fixture ? ut_scratch_snapshot.read_scn : UT_READ_SCN);
 		UT_ASSERT(!authoritative);
 		if (ut_full_scratch_scenario == 38)
 			ut_current_epoch++;
 		if (ut_full_scratch_scenario == 40)
 			pg_re_throw();
+		if (ut_history_memo_fixture && ut_scratch_drift_after_proof)
+			ut_scratch_snapshot.cluster_cr_identity++;
 		return ut_origin_verdict;
 	}
 	UT_ASSERT_EQ(origin_node, UT_PEER_NODE);
@@ -712,10 +724,21 @@ cluster_xid_origin_slot(TransactionId xid pg_attribute_unused())
 	if (ut_native_scratch && xid != UT_RAW_XID)
 		return -1; /* Native prehistory has no cluster-era stripe origin. */
 	if (ut_full_scratch_fixture && ut_full_scratch_scenario >= 30) {
-		UT_ASSERT_EQ(xid, UT_RAW_XID);
+		UT_ASSERT_EQ(xid, ut_history_memo_fixture ? ut_history_memo_xid : UT_RAW_XID);
 		return ut_full_scratch_scenario == 39 ? -1 : ut_history_origin;
 	}
 	return UT_PEER_NODE;
+}
+
+/* Existing foreign undo admission is a fixture boundary, not a terminal
+ * verdict. Cached historical outcomes must still visit it. */
+bool
+cluster_undo_horizon_read_admission_enforce(SCN read_scn)
+{
+	UT_ASSERT(ut_history_memo_fixture);
+	UT_ASSERT_EQ(read_scn, ut_scratch_snapshot.read_scn);
+	ut_history_read_admission_calls++;
+	return ut_history_read_admitted;
 }
 
 void
@@ -2922,10 +2945,233 @@ UT_TEST(test_local_scratch_error_retires_previous_proof)
 	UT_ASSERT_EQ(ut_calls.pair_resolve, 3);
 }
 
+
+/* Keep the producer's terminal decision scripted; the real scratch resolver
+ * owns identity, retention, terminal eligibility and reuse. */
+static void
+ut_history_memo_setup(bool local_origin, int scenario)
+{
+	ut_full_scratch_exact_case(false, local_origin, scenario);
+	memset(&ut_calls, 0, sizeof(ut_calls));
+	ut_origin_asks = 0;
+	ut_history_memo_fixture = true;
+	cluster_shared_config = cluster_page_scn_shortcut = true;
+	cluster_crossnode_runtime_visibility = true;
+	CurrentResourceOwner = (ResourceOwner)&ut_bound_proc;
+	ut_bound_proc.lxid = 42;
+	MyProc = &ut_bound_proc;
+	ut_scratch_snapshot.snapshot_type = SNAPSHOT_MVCC;
+	ut_scratch_snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	ut_scratch_snapshot.read_scn = UT_READ_SCN;
+	ut_scratch_snapshot.read_epoch = ut_current_epoch;
+	ut_scratch_snapshot.cluster_cr_identity = 100;
+	ut_scratch_retained = ut_scratch_identity_valid = true;
+}
+
+static ClusterVisResolve
+ut_history_memo_resolve(void)
+{
+	ClusterVisResolve out;
+
+	cluster_visibility_resolve_scratch_scn(ut_visibility_page.data, 0, ut_history_memo_xid,
+										   ut_scratch_snapshot.read_scn, &out);
+	return out;
+}
+
+UT_TEST(test_history_terminal_reuses_same_retained_identity_for_both_origins)
+{
+	const int scenarios[] = { 30, 32, 33 };
+
+	for (int local = 0; local < 2; local++)
+		for (int n = 0; n < lengthof(scenarios); n++) {
+			ut_history_memo_setup(local, scenarios[n]);
+			for (int i = 0; i < 100; i++) {
+				ClusterVisResolve out = ut_history_memo_resolve();
+
+				UT_ASSERT_EQ(out.evidence, CLUSTER_VIS_EVIDENCE_REMOTE);
+				UT_ASSERT_EQ(out.status, scenarios[n] == 32 ? CLUSTER_TT_STATUS_ABORTED
+															: CLUSTER_TT_STATUS_COMMITTED);
+				UT_ASSERT_EQ(out.commit_scn_is_bound, scenarios[n] == 33);
+			}
+			UT_ASSERT_EQ(ut_origin_asks, 1);
+			UT_ASSERT_EQ(ut_calls.memo_install, 0);
+		}
+}
+
+UT_TEST(test_history_alternating_tuple_sides_preserve_distinct_proofs)
+{
+	ut_history_memo_setup(false, 30);
+	for (int i = 0; i < 100; i++) {
+		ut_history_memo_xid = UT_RAW_XID + (i % 2);
+		UT_ASSERT_EQ(ut_history_memo_resolve().status, CLUSTER_TT_STATUS_COMMITTED);
+	}
+	UT_ASSERT_EQ(ut_origin_asks, 2);
+}
+
+UT_TEST(test_history_changed_key_or_retention_never_rescues_unknown)
+{
+	for (int which = 0; which < 22; which++) {
+		ClusterItlSlotData *slot;
+
+		ut_history_memo_setup(false, 30);
+		(void)ut_history_memo_resolve();
+		slot = ClusterPageGetItlSlots(ut_visibility_page.data);
+		switch (which) {
+		case 0:
+			ut_history_memo_xid++;
+			break;
+		case 1:
+			ut_history_origin++;
+			break;
+		case 2:
+			ut_scratch_snapshot.cluster_cr_identity++;
+			break;
+		case 3:
+			ut_scratch_snapshot.read_scn++;
+			break;
+		case 4:
+			CurrentResourceOwner = (ResourceOwner)&ut_scratch_snapshot;
+			break;
+		case 5:
+			ut_bound_proc.lxid++;
+			break;
+		case 6:
+			ut_scratch_retained = false;
+			break;
+		case 7:
+			ut_scratch_identity_valid = false;
+			break;
+		case 8:
+			slot->undo_segment_head.raw[0]++;
+			break;
+		case 9:
+			slot->undo_segment_head.raw[1]++;
+			break;
+		case 10:
+			slot->wrap++;
+			break;
+		case 11:
+			slot->flags = ITL_FLAG_ACTIVE;
+			break;
+		case 12:
+			ut_exit_ref.tt_slot_id++;
+			break;
+		case 13:
+			ut_exit_ref.undo_segment_id++;
+			break;
+		case 14:
+			ut_exit_ref.cached_commit_scn++;
+			break;
+		case 15:
+			ut_exit_ref.has_cached_status = !ut_exit_ref.has_cached_status;
+			break;
+		case 16:
+			ut_current_epoch++;
+			break;
+		case 17:
+			cluster_shared_config = false;
+			break;
+		case 18:
+			cluster_page_scn_shortcut = false;
+			break;
+		case 19:
+			cluster_crossnode_runtime_visibility = false;
+			break;
+		case 20:
+			MyProc = NULL;
+			break;
+		case 21:
+			cluster_vis_resolve_abort_reset();
+			break;
+		}
+		ut_origin_verdict.kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+		UT_ASSERT_EQ(ut_history_memo_resolve().status, CLUSTER_TT_STATUS_UNKNOWN);
+	}
+}
+
+UT_TEST(test_history_nonterminal_unknown_and_bad_bound_not_cached)
+{
+	const int scenarios[] = { 34, 35, 36, 37, 47 };
+
+	for (int n = 0; n < lengthof(scenarios); n++) {
+		ut_history_memo_setup(false, scenarios[n]);
+		(void)ut_history_memo_resolve();
+		(void)ut_history_memo_resolve();
+		UT_ASSERT_EQ(ut_origin_asks, 2);
+	}
+}
+
+UT_TEST(test_history_late_terminal_proof_is_not_installed)
+{
+	ut_history_memo_setup(false, 30);
+	ut_scratch_drift_after_proof = true;
+	(void)ut_history_memo_resolve();
+	ut_scratch_drift_after_proof = false;
+	ut_origin_verdict.kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+	UT_ASSERT_EQ(ut_history_memo_resolve().status, CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT_EQ(ut_origin_asks, 2);
+}
+
+UT_TEST(test_history_error_retires_all_previous_proofs)
+{
+	volatile bool caught = false;
+
+	ut_history_memo_setup(false, 30);
+	(void)ut_history_memo_resolve();
+	ut_history_memo_xid++;
+	ut_full_scratch_scenario = 40;
+	ut_error_armed = true;
+	if (sigsetjmp(ut_error_jump, 0) == 0)
+		(void)ut_history_memo_resolve();
+	else
+		caught = true;
+	ut_error_armed = false;
+	UT_ASSERT(caught);
+	UT_ASSERT(!cluster_vis_resolve_in_flight());
+	ut_history_memo_xid--;
+	ut_full_scratch_scenario = 30;
+	ut_origin_verdict.kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+	UT_ASSERT_EQ(ut_history_memo_resolve().status, CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT_EQ(ut_origin_asks, 3);
+}
+
+UT_TEST(test_history_foreign_hit_keeps_read_admission)
+{
+	ut_history_memo_setup(false, 30);
+	(void)ut_history_memo_resolve();
+	ut_history_read_admitted = false;
+	ut_origin_verdict.kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+	UT_ASSERT_EQ(ut_history_memo_resolve().status, CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT(ut_history_read_admission_calls > 0);
+	ut_history_read_admitted = true;
+	UT_ASSERT_EQ(ut_history_memo_resolve().status, CLUSTER_TT_STATUS_UNKNOWN);
+}
+
+UT_TEST(test_history_bounded_capacity_evicts_to_original_proof)
+{
+	ut_history_memo_setup(false, 30);
+	for (int i = 0; i <= CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		ut_history_memo_xid = UT_RAW_XID + (i + 8);
+		(void)ut_history_memo_resolve();
+	}
+	ut_history_memo_xid = UT_RAW_XID + 8;
+	ut_origin_verdict.kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+	UT_ASSERT_EQ(ut_history_memo_resolve().status, CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT_EQ(ut_origin_asks, CLUSTER_ITL_INITRANS_DEFAULT + 2);
+}
+
 int
 main(void)
 {
-	UT_PLAN(60);
+	UT_PLAN(68);
+	UT_RUN(test_history_terminal_reuses_same_retained_identity_for_both_origins);
+	UT_RUN(test_history_alternating_tuple_sides_preserve_distinct_proofs);
+	UT_RUN(test_history_changed_key_or_retention_never_rescues_unknown);
+	UT_RUN(test_history_nonterminal_unknown_and_bad_bound_not_cached);
+	UT_RUN(test_history_late_terminal_proof_is_not_installed);
+	UT_RUN(test_history_error_retires_all_previous_proofs);
+	UT_RUN(test_history_foreign_hit_keeps_read_admission);
+	UT_RUN(test_history_bounded_capacity_evicts_to_original_proof);
 	UT_RUN(test_local_scratch_error_retires_previous_proof);
 	UT_RUN(test_local_scratch_exact_proof_reused_with_full_identity);
 	UT_RUN(test_local_scratch_bound_proof_is_never_upgraded_to_exact);
